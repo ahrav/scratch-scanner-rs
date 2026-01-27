@@ -60,6 +60,9 @@ pub struct AsyncIoConfig {
     /// Maximum number of files to scan from a path walk.
     pub max_files: usize,
     /// Total byte capacity reserved for path storage (0 = auto).
+    ///
+    /// On Unix this is the fixed-size path arena budget; on non-Unix it is
+    /// ignored. Exceeding the arena is treated as a configuration bug.
     pub path_bytes_cap: usize,
     /// Submission queue depth (io_uring) / read-ahead depth (macOS AIO).
     pub queue_depth: u32,
@@ -100,6 +103,10 @@ fn max_aligned_chunk_size(overlap: usize) -> usize {
     align_down(max_chunk, BUFFER_ALIGN)
 }
 
+/// Writes a path to the output stream.
+///
+/// On Unix we write raw bytes to avoid UTF-8 validation and allocation; output
+/// may not be valid UTF-8 for unusual paths.
 fn write_path<W: Write>(out: &mut W, path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -111,6 +118,7 @@ fn write_path<W: Write>(out: &mut W, path: &Path) -> io::Result<()> {
     }
 }
 
+/// Fixed-size stack buffer limit for Unix C-path conversions.
 #[cfg(unix)]
 const PATH_MAX: usize = 4096;
 
@@ -147,6 +155,10 @@ fn set_errno(value: libc::c_int) {
     }
 }
 
+/// Calls `f` with a NUL-terminated copy of `path` in a fixed stack buffer.
+///
+/// Rejects paths containing NUL or longer than `PATH_MAX` to avoid heap
+/// allocation when invoking libc APIs.
 #[cfg(unix)]
 fn with_c_path<T>(
     path: &Path,
@@ -339,8 +351,11 @@ impl Walker {
 
 #[cfg(unix)]
 struct DirState {
+    /// DIR* opened via fdopendir; closed in Drop.
     dirp: *mut libc::DIR,
+    /// Raw fd backing `dirp`, used for openat/fstatat.
     fd: RawFd,
+    /// Path span for this directory in the file table arena.
     path: PathSpan,
 }
 
@@ -354,11 +369,15 @@ impl Drop for DirState {
 }
 
 /// Unix walker that avoids per-entry heap allocations.
+///
+/// Paths are stored in the `FileTable` arena and assembled with `openat` +
+/// `readdir`, so the hot path stays allocation-free after startup.
 #[cfg(unix)]
 struct Walker {
     stack: ScratchVec<DirState>,
     done: bool,
     max_files: usize,
+    // Root file staged until the caller drains it.
     pending: Option<FileId>,
 }
 

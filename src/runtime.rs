@@ -24,9 +24,14 @@ pub const FILE_FLAG_SKIPPED: u32 = 1 << 1;
 
 /// Columnar file metadata store used by the pipeline.
 ///
-/// Uses parallel vectors (SoA) to keep memory note simple and allow stable
+/// Uses parallel vectors (SoA) to keep memory usage simple and allow stable
 /// indexing via [`FileId`]. On Unix, paths are stored in a fixed-capacity
-/// byte arena to avoid per-file heap allocation after startup.
+/// byte arena referenced by [`PathSpan`] to avoid per-file heap allocation
+/// after startup. The arena never grows; capacity overruns are treated as
+/// configuration bugs and will panic.
+///
+/// On Unix, [`FileTable::path`] returns a `Path` backed by the arena. Those
+/// borrows are only valid until the table is cleared for the next scan.
 pub struct FileTable {
     #[cfg(unix)]
     path_spans: Vec<PathSpan>,
@@ -47,6 +52,10 @@ impl FileTable {
     }
 
     /// Creates a table with explicit capacity for path storage.
+    ///
+    /// `path_bytes_cap` is the total byte budget for the Unix path arena; it is
+    /// ignored on non-Unix platforms. The arena stores raw bytes (not
+    /// NUL-terminated) and must fit within `u32::MAX`.
     pub fn with_capacity_and_path_bytes(cap: usize, path_bytes_cap: usize) -> Self {
         #[cfg(unix)]
         {
@@ -114,6 +123,10 @@ impl FileTable {
     }
 
     /// Reserves space for a path and returns its span (Unix only).
+    ///
+    /// Bytes are appended verbatim to the arena (no separators inserted).
+    /// Panics if the arena would overflow; callers should pre-size
+    /// `path_bytes_cap` for worst-case scans.
     #[cfg(unix)]
     pub(crate) fn alloc_path_span(&mut self, bytes: &[u8]) -> PathSpan {
         let start = self.path_bytes.len();
@@ -131,6 +144,10 @@ impl FileTable {
     }
 
     /// Appends `parent` + "/" + `name` into the path arena (Unix only).
+    ///
+    /// This mirrors `Path::join` without normalization: it inserts a `/` only
+    /// when `parent` is non-empty and does not already end with `/`.
+    /// Panics if the arena would overflow.
     #[cfg(unix)]
     pub(crate) fn join_path_span(&mut self, parent: PathSpan, name: &[u8]) -> PathSpan {
         let parent_start = parent.offset as usize;
@@ -176,6 +193,8 @@ impl FileTable {
     }
 
     /// Inserts a new file record using a previously allocated span (Unix only).
+    ///
+    /// `span` must refer to bytes in this table's path arena.
     #[cfg(unix)]
     pub(crate) fn push_span(
         &mut self,
@@ -207,6 +226,8 @@ impl FileTable {
     }
 
     /// Clears all tracked files while retaining allocated capacity.
+    ///
+    /// On Unix, this invalidates any `Path`/`PathSpan` references into the arena.
     pub fn clear(&mut self) {
         #[cfg(unix)]
         {
@@ -228,6 +249,9 @@ impl FileTable {
     }
 
     /// Returns the path for a given file id.
+    ///
+    /// On Unix, the returned `Path` borrows from the internal arena and may
+    /// contain non-UTF8 bytes. It is only valid until the next `clear`.
     pub fn path(&self, id: FileId) -> &Path {
         #[cfg(unix)]
         {
@@ -262,6 +286,11 @@ impl Default for FileTable {
     }
 }
 
+/// Byte span into the Unix path arena stored by [`FileTable`].
+///
+/// `offset` and `len` are byte indices into the arena; the bytes are not
+/// NUL-terminated and may be non-UTF8. Spans are only valid until the table
+/// is cleared for reuse.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PathSpan {

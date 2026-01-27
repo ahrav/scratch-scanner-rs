@@ -321,6 +321,11 @@ impl<T> ScratchVec<T> {
     /// This is useful for building new data from previous bytes without
     /// allocating intermediate buffers. The source range may overlap with
     /// the destination (memmove semantics).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `start + len` exceeds the current length or if the new
+    /// length would exceed capacity.
     pub fn extend_from_self_range(&mut self, start: usize, len: usize)
     where
         T: Copy,
