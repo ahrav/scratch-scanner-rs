@@ -38,7 +38,16 @@ pub const PIPE_OUT_RING_CAP: usize = 8192;
 pub const PIPE_POOL_CAP: usize = PIPE_CHUNK_RING_CAP + 8;
 
 /// Default maximum number of files to scan.
-pub const PIPE_MAX_FILES: usize = 1_000_000;
+///
+/// This bounds the `FileTable` allocation. Increase for very large scans;
+/// decrease if memory is constrained.
+pub const PIPE_MAX_FILES: usize = 100_000;
+
+/// Maximum depth for the DFS walker stack.
+///
+/// Filesystem paths are bounded by depth (~255 components on most systems),
+/// NOT by file count. 1024 handles any realistic directory tree.
+const WALKER_STACK_CAP: usize = 1024;
 
 /// Configuration for the high-level pipeline scanner.
 #[derive(Clone, Debug)]
@@ -134,7 +143,10 @@ struct Walker {
 
 impl Walker {
     fn new(root: PathBuf, max_files: usize) -> Self {
-        let mut stack = Vec::with_capacity(max_files.max(1));
+        // Stack depth is bounded by directory depth, not file count.
+        // Using max_files here was a misprediction: a 1M-file scan doesn't
+        // need a 1M-entry stack; it needs ~depth entries (usually < 100).
+        let mut stack = Vec::with_capacity(WALKER_STACK_CAP);
         stack.push(WalkEntry::Path(root));
         Self {
             stack,

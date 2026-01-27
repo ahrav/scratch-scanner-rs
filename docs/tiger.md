@@ -10,13 +10,10 @@ If you want TigerStyle compliance, this is the first gate. Right now it fails.
 * Path cloning allocates per file open:
 
   * `let path = files.path(file_id).clone();` (pipeline.rs:296)
-* FileTable grows dynamically because capacity is only 1024 or less:
+* FileTable capacity is now set to `max_files` (default 100k), preallocated at startup.
 
-  * `FileTable::with_capacity(self.config.max_files.min(1024))` (pipeline.rs:474)
-  * `FileTable` stores `Vec<PathBuf>` and `push` will reallocate when capacity exceeded (lib.rs:268-295)
-* Walker stack grows dynamically:
-
-  * `stack: Vec<WalkEntry>` with pushes during traversal (pipeline.rs:106-118, 154-155, 178-180)
+* Walker stack uses a fixed capacity (`WALKER_STACK_CAP = 1024`) based on directory depth, not file count.
+  DFS stack depth is bounded by tree depth (~255 path components max), so 1024 is generous.
 
 This is not “edge case”. On any non-trivial tree it allocates.
 
