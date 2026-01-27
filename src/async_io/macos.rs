@@ -1,11 +1,128 @@
 use super::*;
 use crate::{BufferPool, Chunk, Engine, FindingRec, ScanScratch};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::mem;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::ptr;
 use std::sync::Arc;
+
+mod aio {
+    use super::*;
+    use std::io;
+    use std::ptr;
+
+    #[cfg(test)]
+    use std::cell::Cell;
+    #[cfg(test)]
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[cfg(test)]
+    thread_local! {
+        static READ_EAGAIN_COUNT: Cell<usize> = const { Cell::new(0) };
+        static SUSPEND_EINTR_COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    #[cfg(test)]
+    static RETURN_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    pub(super) fn read(cb: &mut libc::aiocb) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            let injected = READ_EAGAIN_COUNT.with(|count| {
+                let remaining = count.get();
+                if remaining > 0 {
+                    count.set(remaining - 1);
+                    true
+                } else {
+                    false
+                }
+            });
+            if injected {
+                return Err(io::Error::from_raw_os_error(libc::EAGAIN));
+            }
+        }
+
+        // SAFETY: caller guarantees `cb` is valid and fully initialized.
+        let ret = unsafe { libc::aio_read(cb) };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub(super) fn error(cb: &libc::aiocb) -> io::Result<i32> {
+        // SAFETY: caller guarantees `cb` is valid and still in scope.
+        let err = unsafe { libc::aio_error(cb) };
+        if err == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(err)
+    }
+
+    pub(super) fn ret(cb: &mut libc::aiocb) -> io::Result<isize> {
+        // SAFETY: caller guarantees the request has completed.
+        let res = unsafe { libc::aio_return(cb) };
+        #[cfg(test)]
+        {
+            RETURN_CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+        if res < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(res)
+    }
+
+    pub(super) fn suspend(list: &[*const libc::aiocb]) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            let injected = SUSPEND_EINTR_COUNT.with(|count| {
+                let remaining = count.get();
+                if remaining > 0 {
+                    count.set(remaining - 1);
+                    true
+                } else {
+                    false
+                }
+            });
+            if injected {
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+        }
+
+        // SAFETY: all aiocb pointers are valid for the duration of the call.
+        let ret = unsafe { libc::aio_suspend(list.as_ptr(), list.len() as i32, ptr::null()) };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub(super) fn cancel(fd: RawFd, cb: &libc::aiocb) -> io::Result<i32> {
+        // SAFETY: caller guarantees `cb` is valid and still in scope. The
+        // kernel treats the aiocb as read-only for cancellation.
+        let ret = unsafe { libc::aio_cancel(fd, cb as *const libc::aiocb as *mut libc::aiocb) };
+        if ret == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(ret)
+    }
+
+    #[cfg(test)]
+    pub(super) fn inject_read_eagain(count: usize) {
+        READ_EAGAIN_COUNT.with(|cell| cell.set(count));
+    }
+
+    #[cfg(test)]
+    pub(super) fn inject_suspend_eintr(count: usize) {
+        SUSPEND_EINTR_COUNT.with(|cell| cell.set(count));
+    }
+
+    #[cfg(test)]
+    pub(super) fn return_call_count() -> usize {
+        RETURN_CALLS.load(Ordering::SeqCst)
+    }
+}
 
 // --------------------------
 // macOS AIO design notes
@@ -242,10 +359,7 @@ impl AioSlot {
 
         // SAFETY: `self.cb` lives until completion, and `payload_ptr` remains
         // valid because `handle` owns the buffer until we emit the chunk.
-        let ret = unsafe { libc::aio_read(&mut self.cb) };
-        if ret != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        aio::read(&mut self.cb)?;
 
         self.handle = Some(handle);
         self.offset = offset;
@@ -264,20 +378,21 @@ impl AioSlot {
 
         // Non-blocking completion check.
         // SAFETY: `self.cb` was initialized by submit() and has not been freed.
-        let err = unsafe { libc::aio_error(&self.cb) };
+        let err = aio::error(&self.cb)?;
         if err == libc::EINPROGRESS {
             return Ok(false);
         }
+
         if err != 0 {
+            // Ensure the kernel reaps the request even on error.
+            let _ = aio::ret(&mut self.cb);
+            self.read_len = 0;
+            self.state = AioSlotState::Completed;
             return Err(io::Error::from_raw_os_error(err));
         }
 
         // SAFETY: aio_return is called once after completion.
-        let res = unsafe { libc::aio_return(&mut self.cb) };
-        if res < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
+        let res = aio::ret(&mut self.cb)?;
         self.read_len = res as usize;
         self.state = AioSlotState::Completed;
         Ok(true)
@@ -310,6 +425,8 @@ struct AioFileReader {
     tail: Vec<u8>,
     tail_len: usize,
     slots: Vec<AioSlot>,
+    free_slots: Vec<usize>,
+    completed: HashMap<u64, usize>,
     next_offset: u64,
     next_seq: u64,
     next_emit_seq: u64,
@@ -349,6 +466,9 @@ impl AioFileReader {
             return Err(io::Error::other("buffer pool too small for payload layout"));
         }
 
+        let slots: Vec<AioSlot> = (0..queue_depth).map(|_| AioSlot::new()).collect();
+        let free_slots: Vec<usize> = (0..queue_depth).rev().collect();
+
         Ok(Self {
             file_id,
             file,
@@ -359,7 +479,9 @@ impl AioFileReader {
             payload_off,
             tail: vec![0u8; overlap],
             tail_len: 0,
-            slots: (0..queue_depth).map(|_| AioSlot::new()).collect(),
+            slots,
+            free_slots,
+            completed: HashMap::with_capacity(queue_depth),
             next_offset: 0,
             next_seq: 0,
             next_emit_seq: 0,
@@ -373,37 +495,64 @@ impl AioFileReader {
         self.next_emit_seq >= self.end_seq && self.next_seq >= self.end_seq && slots_empty
     }
 
+    fn is_retryable_submit_error(err: &io::Error) -> bool {
+        matches!(
+            err.raw_os_error(),
+            Some(code)
+                if code == libc::EAGAIN
+                    || code == libc::EWOULDBLOCK
+                    || code == libc::ENOMEM
+                    || code == libc::EINTR
+        )
+    }
+
     fn submit_reads(&mut self, pool: &BufferPool) -> io::Result<bool> {
         let mut progressed = false;
 
         while self.next_seq < self.end_seq {
-            let slot = match self.slots.iter_mut().find(|slot| slot.is_empty()) {
-                Some(slot) => slot,
-                None => break,
+            let Some(slot_idx) = self.free_slots.pop() else {
+                break;
             };
 
             let remaining = self.file_len.saturating_sub(self.next_offset);
             if remaining == 0 {
                 self.end_seq = self.next_seq;
+                self.free_slots.push(slot_idx);
                 break;
             }
             let req_len = remaining.min(self.chunk_size as u64) as usize;
 
             let handle = match pool.try_acquire() {
                 Some(handle) => handle,
-                None => break,
+                None => {
+                    self.free_slots.push(slot_idx);
+                    break;
+                }
             };
 
             // Submit in increasing file offset order. Each submission gets a
             // strictly increasing sequence number so we can emit in order.
-            slot.submit(
+            let slot = &mut self.slots[slot_idx];
+            debug_assert!(slot.is_empty());
+            match slot.submit(
                 self.fd,
                 handle,
                 self.payload_off,
                 self.next_offset,
                 req_len,
                 self.next_seq,
-            )?;
+            ) {
+                Ok(()) => {}
+                Err(err) if Self::is_retryable_submit_error(&err) => {
+                    // Back off on transient resource exhaustion and retry after completions.
+                    self.free_slots.push(slot_idx);
+                    break;
+                }
+                Err(err) => {
+                    self.free_slots.push(slot_idx);
+                    return Err(err);
+                }
+            }
 
             self.next_offset = self.next_offset.saturating_add(req_len as u64);
             self.next_seq = self.next_seq.saturating_add(1);
@@ -416,11 +565,12 @@ impl AioFileReader {
     fn poll_completions(&mut self) -> io::Result<bool> {
         let mut progressed = false;
 
-        for slot in &mut self.slots {
+        for (idx, slot) in self.slots.iter_mut().enumerate() {
             if !slot.is_in_flight() {
                 continue;
             }
             if slot.poll_complete()? {
+                self.completed.insert(slot.seq, idx);
                 progressed = true;
             }
         }
@@ -435,9 +585,11 @@ impl AioFileReader {
             return;
         }
 
-        for slot in &mut self.slots {
+        for (idx, slot) in self.slots.iter_mut().enumerate() {
             if slot.is_completed() && slot.seq >= self.end_seq {
+                self.completed.remove(&slot.seq);
                 slot.reset();
+                self.free_slots.push(idx);
             }
         }
     }
@@ -454,18 +606,71 @@ impl AioFileReader {
             return Ok(());
         }
 
-        // SAFETY: all aiocb pointers are valid while slots remain in flight.
-        let ret = unsafe {
-            libc::aio_suspend(
-                self.wait_list.as_ptr(),
-                self.wait_list.len() as i32,
-                ptr::null(),
-            )
-        };
-        if ret != 0 {
-            return Err(io::Error::last_os_error());
+        loop {
+            match aio::suspend(&self.wait_list) {
+                Ok(()) => return Ok(()),
+                Err(err)
+                    if err.kind() == io::ErrorKind::Interrupted
+                        || err.raw_os_error() == Some(libc::EINTR) =>
+                {
+                    continue;
+                }
+                Err(err) => return Err(err),
+            }
         }
-        Ok(())
+    }
+
+    fn drain_in_flight(&mut self) {
+        if !self.slots.iter().any(|slot| slot.is_in_flight()) {
+            return;
+        }
+
+        // Best-effort cancellation to trigger completion and release resources.
+        for slot in &self.slots {
+            if slot.is_in_flight() {
+                let _ = aio::cancel(self.fd, &slot.cb);
+            }
+        }
+
+        loop {
+            self.wait_list.clear();
+            for slot in &self.slots {
+                if slot.is_in_flight() {
+                    self.wait_list.push(&slot.cb as *const libc::aiocb);
+                }
+            }
+
+            if self.wait_list.is_empty() {
+                break;
+            }
+
+            // Drain completions without spinning; EINTR is safe to retry.
+            loop {
+                match aio::suspend(&self.wait_list) {
+                    Ok(()) => break,
+                    Err(err)
+                        if err.kind() == io::ErrorKind::Interrupted
+                            || err.raw_os_error() == Some(libc::EINTR) =>
+                    {
+                        continue;
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            for slot in &mut self.slots {
+                if !slot.is_in_flight() {
+                    continue;
+                }
+                match aio::error(&slot.cb) {
+                    Ok(libc::EINPROGRESS) => continue,
+                    Ok(_) | Err(_) => {
+                        let _ = aio::ret(&mut slot.cb);
+                        slot.reset();
+                    }
+                }
+            }
+        }
     }
 
     fn emit_ready(&mut self) -> io::Result<Option<Chunk>> {
@@ -473,15 +678,12 @@ impl AioFileReader {
             return Ok(None);
         }
 
-        let slot_idx = self
-            .slots
-            .iter()
-            .position(|slot| slot.is_completed() && slot.seq == self.next_emit_seq);
-        let Some(idx) = slot_idx else {
+        let Some(idx) = self.completed.remove(&self.next_emit_seq) else {
             return Ok(None);
         };
 
         let slot = &mut self.slots[idx];
+        debug_assert!(slot.is_completed());
         let read_len = slot.read_len;
         let req_len = slot.req_len;
         let offset = slot.offset;
@@ -491,6 +693,7 @@ impl AioFileReader {
             .take()
             .expect("completed slot must hold a buffer");
         slot.reset();
+        self.free_slots.push(idx);
 
         if read_len == 0 {
             self.end_seq = self.end_seq.min(seq);
@@ -556,6 +759,13 @@ impl AioFileReader {
                 self.wait_for_completion()?;
             }
         }
+    }
+}
+
+impl Drop for AioFileReader {
+    fn drop(&mut self) {
+        // Ensure aiocb buffers stay alive until each request is reaped.
+        self.drain_in_flight();
     }
 }
 
@@ -655,6 +865,123 @@ mod tests {
         }
 
         assert_eq!(chunks, expected);
+
+        Ok(())
+    }
+
+    #[test]
+    fn aio_reader_retries_suspend_on_eintr() -> io::Result<()> {
+        let tmp = make_temp_dir("scanner_async_reader_eintr")?;
+        let path = tmp.path().join("sample.bin");
+        let data = vec![0x5Au8; 1024 * 1024];
+        std::fs::write(&path, &data)?;
+
+        let engine = Arc::new(crate::demo_engine());
+        let config = AsyncIoConfig {
+            chunk_size: 64 * 1024,
+            queue_depth: 2,
+            ..AsyncIoConfig::default()
+        };
+
+        let scanner = MacosAioScanner::new(engine, config)?;
+        let mut reader = AioFileReader::new(
+            &scanner.pool,
+            FileId(0),
+            &path,
+            data.len() as u64,
+            scanner.payload_off,
+            scanner.overlap,
+            scanner.config.chunk_size,
+            scanner.config.queue_depth,
+        )?;
+
+        assert!(reader.submit_reads(&scanner.pool)?);
+        assert!(reader.slots.iter().any(|slot| slot.is_in_flight()));
+
+        aio::inject_suspend_eintr(1);
+        reader.wait_for_completion()?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn aio_reader_backoffs_on_submit_eagain() -> io::Result<()> {
+        let tmp = make_temp_dir("scanner_async_reader_eagain")?;
+        let path = tmp.path().join("sample.bin");
+        let data = vec![0xC3u8; 128 * 1024];
+        std::fs::write(&path, &data)?;
+
+        let engine = Arc::new(crate::demo_engine());
+        let config = AsyncIoConfig {
+            chunk_size: 32 * 1024,
+            queue_depth: 2,
+            ..AsyncIoConfig::default()
+        };
+
+        let scanner = MacosAioScanner::new(engine, config)?;
+        let mut reader = AioFileReader::new(
+            &scanner.pool,
+            FileId(0),
+            &path,
+            data.len() as u64,
+            scanner.payload_off,
+            scanner.overlap,
+            scanner.config.chunk_size,
+            scanner.config.queue_depth,
+        )?;
+
+        aio::inject_read_eagain(1);
+        let progressed = reader.submit_reads(&scanner.pool)?;
+        assert!(!progressed);
+        assert_eq!(reader.next_seq, 0);
+        assert_eq!(reader.next_offset, 0);
+        assert!(reader.slots.iter().all(|slot| slot.is_empty()));
+
+        aio::inject_read_eagain(0);
+        assert!(reader.submit_reads(&scanner.pool)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn aio_reader_drop_reaps_in_flight() -> io::Result<()> {
+        let tmp = make_temp_dir("scanner_async_reader_drop")?;
+        let path = tmp.path().join("sample.bin");
+        let data = vec![0xA5u8; 256 * 1024];
+        std::fs::write(&path, &data)?;
+
+        let engine = Arc::new(crate::demo_engine());
+        let config = AsyncIoConfig {
+            chunk_size: 64 * 1024,
+            queue_depth: 2,
+            ..AsyncIoConfig::default()
+        };
+
+        let scanner = MacosAioScanner::new(engine, config)?;
+        let mut reader = AioFileReader::new(
+            &scanner.pool,
+            FileId(0),
+            &path,
+            data.len() as u64,
+            scanner.payload_off,
+            scanner.overlap,
+            scanner.config.chunk_size,
+            scanner.config.queue_depth,
+        )?;
+
+        assert!(reader.submit_reads(&scanner.pool)?);
+        let in_flight = reader
+            .slots
+            .iter()
+            .filter(|slot| slot.is_in_flight())
+            .count();
+        assert!(in_flight > 0);
+
+        let before = aio::return_call_count();
+        drop(reader);
+        let after = aio::return_call_count();
+
+        assert!(after >= before + in_flight);
 
         Ok(())
     }
