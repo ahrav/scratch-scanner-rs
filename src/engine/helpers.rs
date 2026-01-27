@@ -205,7 +205,7 @@ pub(super) fn decode_utf16le_to_vec(
     max_out: usize,
 ) -> Result<Vec<u8>, Utf16DecodeError> {
     let mut out = Vec::new();
-    decode_utf16_to_buf(input, max_out, true, &mut out)?;
+    decode_utf16_to_vec_inner(input, max_out, true, &mut out)?;
     Ok(out)
 }
 
@@ -214,27 +214,11 @@ pub(super) fn decode_utf16be_to_vec(
     max_out: usize,
 ) -> Result<Vec<u8>, Utf16DecodeError> {
     let mut out = Vec::new();
-    decode_utf16_to_buf(input, max_out, false, &mut out)?;
+    decode_utf16_to_vec_inner(input, max_out, false, &mut out)?;
     Ok(out)
 }
 
-pub(super) fn decode_utf16le_to_buf(
-    input: &[u8],
-    max_out: usize,
-    out: &mut Vec<u8>,
-) -> Result<(), Utf16DecodeError> {
-    decode_utf16_to_buf(input, max_out, true, out)
-}
-
-pub(super) fn decode_utf16be_to_buf(
-    input: &[u8],
-    max_out: usize,
-    out: &mut Vec<u8>,
-) -> Result<(), Utf16DecodeError> {
-    decode_utf16_to_buf(input, max_out, false, out)
-}
-
-fn decode_utf16_to_buf(
+fn decode_utf16_to_vec_inner(
     input: &[u8],
     max_out: usize,
     le: bool,
@@ -258,6 +242,57 @@ fn decode_utf16_to_buf(
         let mut buf = [0u8; 4];
         let s = ch.encode_utf8(&mut buf);
         if out.len() + s.len() > max_out {
+            return Err(Utf16DecodeError::OutputTooLarge);
+        }
+        out.extend_from_slice(s.as_bytes());
+    }
+    Ok(())
+}
+
+pub(super) fn decode_utf16le_to_buf(
+    input: &[u8],
+    max_out: usize,
+    out: &mut ScratchVec<u8>,
+) -> Result<(), Utf16DecodeError> {
+    decode_utf16_to_buf(input, max_out, true, out)
+}
+
+pub(super) fn decode_utf16be_to_buf(
+    input: &[u8],
+    max_out: usize,
+    out: &mut ScratchVec<u8>,
+) -> Result<(), Utf16DecodeError> {
+    decode_utf16_to_buf(input, max_out, false, out)
+}
+
+fn decode_utf16_to_buf(
+    input: &[u8],
+    max_out: usize,
+    le: bool,
+    out: &mut ScratchVec<u8>,
+) -> Result<(), Utf16DecodeError> {
+    // Ignore a trailing odd byte; it cannot form a full UTF-16 code unit.
+    let n = input.len() / 2;
+    let iter = (0..n).map(|i| {
+        let b0 = input[2 * i];
+        let b1 = input[2 * i + 1];
+        if le {
+            u16::from_le_bytes([b0, b1])
+        } else {
+            u16::from_be_bytes([b0, b1])
+        }
+    });
+
+    out.clear();
+    for r in std::char::decode_utf16(iter) {
+        let ch = r.unwrap_or('\u{FFFD}');
+        let mut buf = [0u8; 4];
+        let s = ch.encode_utf8(&mut buf);
+        if out.len() + s.len() > max_out {
+            return Err(Utf16DecodeError::OutputTooLarge);
+        }
+        // Check capacity before extending to avoid panic.
+        if out.len() + s.len() > out.capacity() {
             return Err(Utf16DecodeError::OutputTooLarge);
         }
         out.extend_from_slice(s.as_bytes());

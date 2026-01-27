@@ -287,6 +287,129 @@ impl<T> ScratchVec<T> {
     pub fn as_mut_slice(&mut self) -> &mut [T] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr().cast::<T>(), self.len) }
     }
+
+    /// Appends all elements from `slice` to the vector.
+    ///
+    /// This is the fixed-capacity equivalent of `Vec::extend_from_slice`. Unlike
+    /// `Vec`, this method panics if the resulting length would exceed capacity,
+    /// making capacity overruns immediately visible during development.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self.len() + slice.len() > self.capacity()`.
+    pub fn extend_from_slice(&mut self, slice: &[T])
+    where
+        T: Copy,
+    {
+        let new_len = self.len.saturating_add(slice.len());
+        assert!(
+            new_len <= self.cap,
+            "scratch vec capacity exceeded on extend_from_slice"
+        );
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                slice.as_ptr(),
+                self.ptr.as_ptr().add(self.len).cast::<T>(),
+                slice.len(),
+            );
+        }
+        self.len = new_len;
+    }
+
+    /// Removes and returns the last element, or `None` if empty.
+    ///
+    /// This is the fixed-capacity equivalent of `Vec::pop`. The capacity remains
+    /// unchanged; only the logical length decreases.
+    pub fn pop(&mut self) -> Option<T> {
+        if self.len == 0 {
+            return None;
+        }
+        self.len -= 1;
+        // SAFETY: We just confirmed len > 0, so self.len (now decremented) is a valid index.
+        // The element is initialized; we read and return it without dropping (caller owns it).
+        unsafe { Some(self.ptr.as_ptr().add(self.len).cast::<T>().read()) }
+    }
+
+    /// Returns a reference to the element at `index`, or `None` if out of bounds.
+    pub fn get(&self, index: usize) -> Option<&T> {
+        if index < self.len {
+            // SAFETY: index is in bounds and element is initialized.
+            unsafe { Some(&*self.ptr.as_ptr().add(index).cast::<T>()) }
+        } else {
+            None
+        }
+    }
+
+    /// Returns a mutable reference to the element at `index`, or `None` if out of bounds.
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        if index < self.len {
+            // SAFETY: index is in bounds and element is initialized.
+            unsafe { Some(&mut *self.ptr.as_ptr().add(index).cast::<T>()) }
+        } else {
+            None
+        }
+    }
+
+    /// Creates a draining iterator that removes and yields elements in order.
+    ///
+    /// After the iterator is dropped (or fully consumed), the vector is empty.
+    /// This is the fixed-capacity equivalent of `Vec::drain(..)`.
+    pub fn drain(&mut self) -> Drain<'_, T> {
+        let len = self.len;
+        // Set length to 0 immediately; Drain owns the elements and will drop
+        // any remaining on its own drop.
+        self.len = 0;
+        Drain {
+            ptr: self.ptr.cast::<T>(),
+            idx: 0,
+            len,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+/// Draining iterator for [`ScratchVec`].
+///
+/// Yields elements by value and drops any remaining elements when the iterator
+/// is dropped. After iteration completes (or the iterator is dropped), the
+/// source `ScratchVec` is empty.
+pub struct Drain<'a, T> {
+    ptr: NonNull<T>,
+    idx: usize,
+    len: usize,
+    _marker: std::marker::PhantomData<&'a mut T>,
+}
+
+impl<'a, T> Iterator for Drain<'a, T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.idx >= self.len {
+            return None;
+        }
+        // SAFETY: idx < len, so the element is valid and initialized.
+        let val = unsafe { self.ptr.as_ptr().add(self.idx).read() };
+        self.idx += 1;
+        Some(val)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.len.saturating_sub(self.idx);
+        (remaining, Some(remaining))
+    }
+}
+
+impl<'a, T> ExactSizeIterator for Drain<'a, T> {}
+
+impl<'a, T> Drop for Drain<'a, T> {
+    fn drop(&mut self) {
+        // Drop any remaining elements that were not yielded.
+        for i in self.idx..self.len {
+            unsafe {
+                std::ptr::drop_in_place(self.ptr.as_ptr().add(i));
+            }
+        }
+    }
 }
 
 impl<T> std::ops::Index<usize> for ScratchVec<T> {
@@ -345,6 +468,100 @@ mod tests {
         vec.clear();
         assert!(vec.is_empty());
     }
+
+    #[test]
+    fn scratch_vec_extend_from_slice() {
+        let mut vec = ScratchVec::<u8>::with_capacity(10).unwrap();
+        vec.extend_from_slice(&[1, 2, 3]);
+        assert_eq!(vec.as_slice(), &[1, 2, 3]);
+        vec.extend_from_slice(&[4, 5]);
+        assert_eq!(vec.as_slice(), &[1, 2, 3, 4, 5]);
+        vec.clear();
+        vec.extend_from_slice(&[]);
+        assert!(vec.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "scratch vec capacity exceeded")]
+    fn scratch_vec_extend_from_slice_overflow() {
+        let mut vec = ScratchVec::<u8>::with_capacity(3).unwrap();
+        vec.extend_from_slice(&[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn scratch_vec_pop() {
+        let mut vec = ScratchVec::<u32>::with_capacity(4).unwrap();
+        assert_eq!(vec.pop(), None);
+        vec.push(10);
+        vec.push(20);
+        vec.push(30);
+        assert_eq!(vec.pop(), Some(30));
+        assert_eq!(vec.pop(), Some(20));
+        assert_eq!(vec.as_slice(), &[10]);
+        assert_eq!(vec.pop(), Some(10));
+        assert_eq!(vec.pop(), None);
+        assert!(vec.is_empty());
+    }
+
+    #[test]
+    fn scratch_vec_get() {
+        let mut vec = ScratchVec::<u32>::with_capacity(4).unwrap();
+        vec.push(10);
+        vec.push(20);
+        assert_eq!(vec.get(0), Some(&10));
+        assert_eq!(vec.get(1), Some(&20));
+        assert_eq!(vec.get(2), None);
+        assert_eq!(vec.get(100), None);
+    }
+
+    #[test]
+    fn scratch_vec_get_mut() {
+        let mut vec = ScratchVec::<u32>::with_capacity(4).unwrap();
+        vec.push(10);
+        vec.push(20);
+        if let Some(v) = vec.get_mut(0) {
+            *v = 100;
+        }
+        assert_eq!(vec.as_slice(), &[100, 20]);
+        assert!(vec.get_mut(5).is_none());
+    }
+
+    #[test]
+    fn scratch_vec_drain() {
+        let mut vec = ScratchVec::<u32>::with_capacity(4).unwrap();
+        vec.push(1);
+        vec.push(2);
+        vec.push(3);
+
+        let drained: Vec<u32> = vec.drain().collect();
+        assert_eq!(drained, vec![1, 2, 3]);
+        assert!(vec.is_empty());
+        assert_eq!(vec.capacity(), 4);
+    }
+
+    #[test]
+    fn scratch_vec_drain_partial() {
+        let mut vec = ScratchVec::<u32>::with_capacity(4).unwrap();
+        vec.push(1);
+        vec.push(2);
+        vec.push(3);
+
+        {
+            let mut drain = vec.drain();
+            assert_eq!(drain.next(), Some(1));
+            // Drop without consuming all - remaining should be dropped
+        }
+
+        assert!(vec.is_empty());
+    }
+
+    #[test]
+    fn scratch_vec_drain_empty() {
+        let mut vec = ScratchVec::<u32>::with_capacity(4).unwrap();
+        let drained: Vec<u32> = vec.drain().collect();
+        assert!(drained.is_empty());
+        assert!(vec.is_empty());
+    }
 }
 
 #[cfg(all(test, feature = "stdx-proptest"))]
@@ -357,15 +574,21 @@ mod proptests {
     #[derive(Clone, Debug)]
     enum Op {
         Push(u32),
+        Pop,
         Truncate(usize),
         Clear,
+        ExtendFromSlice(Vec<u32>),
+        Drain,
     }
 
     fn op_strategy() -> impl Strategy<Value = Op> {
         prop_oneof![
             any::<u32>().prop_map(Op::Push),
+            Just(Op::Pop),
             (0usize..128).prop_map(Op::Truncate),
             Just(Op::Clear),
+            prop::collection::vec(any::<u32>(), 0..8).prop_map(Op::ExtendFromSlice),
+            Just(Op::Drain),
         ]
     }
 
@@ -390,6 +613,11 @@ mod proptests {
                             shadow.push(v);
                         }
                     }
+                    Op::Pop => {
+                        let s = scratch.pop();
+                        let v = shadow.pop();
+                        prop_assert_eq!(s, v);
+                    }
                     Op::Truncate(n) => {
                         let new_len = n.min(scratch.len());
                         scratch.truncate(new_len);
@@ -398,6 +626,17 @@ mod proptests {
                     Op::Clear => {
                         scratch.clear();
                         shadow.clear();
+                    }
+                    Op::ExtendFromSlice(slice) => {
+                        if scratch.len().saturating_add(slice.len()) <= scratch.capacity() {
+                            scratch.extend_from_slice(&slice);
+                            shadow.extend_from_slice(&slice);
+                        }
+                    }
+                    Op::Drain => {
+                        let s: Vec<_> = scratch.drain().collect();
+                        let v: Vec<_> = std::mem::take(&mut shadow);
+                        prop_assert_eq!(s, v);
                     }
                 }
 

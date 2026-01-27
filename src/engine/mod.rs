@@ -323,8 +323,17 @@ impl HitAccumulator {
 /// The tail length is `max_anchor_pat_len - 1`, which is the minimum overlap
 /// required to avoid missing an anchor that straddles two decode chunks.
 struct GateScratch {
-    tail: Vec<u8>,
-    scratch: Vec<u8>,
+    /// Preserved suffix from prior decode chunk.
+    ///
+    /// Length is `max_anchor_pat_len - 1` to ensure any anchor straddling
+    /// chunk boundaries is detected.
+    tail: ScratchVec<u8>,
+
+    /// Current decode window under gate evaluation.
+    ///
+    /// Sized to hold `tail` plus one decode chunk (1024 bytes), ensuring
+    /// the sliding window never requires reallocation.
+    scratch: ScratchVec<u8>,
 }
 
 impl GateScratch {
@@ -350,9 +359,13 @@ struct StepNode {
 ///
 /// This is append-only and reset between scans. `StepId` values are only valid
 /// while this arena is alive and not reset.
-#[derive(Default)]
 struct StepArena {
-    nodes: Vec<StepNode>,
+    /// Parent-linked decode step nodes.
+    ///
+    /// Each node records a single decode operation (transform ID, span) and
+    /// points to its parent step. This compact representation enables sharing
+    /// provenance across multiple findings from the same decoded buffer.
+    nodes: ScratchVec<StepNode>,
 }
 
 impl StepArena {
@@ -367,7 +380,7 @@ impl StepArena {
     }
 
     /// Reconstructs the step chain from root to leaf.
-    fn materialize(&self, mut id: StepId, out: &mut Vec<DecodeStep>) {
+    fn materialize(&self, mut id: StepId, out: &mut ScratchVec<DecodeStep>) {
         out.clear();
         while id != STEP_ROOT {
             let cur = id;
@@ -375,7 +388,11 @@ impl StepArena {
             out.push(node.step.clone());
             id = node.parent;
         }
-        out.reverse();
+        // Reverse in place
+        let len = out.len();
+        for i in 0..len / 2 {
+            out.as_mut_slice().swap(i, len - 1 - i);
+        }
     }
 }
 
@@ -487,10 +504,21 @@ impl EntropyScratch {
 /// accumulation, decode slabs, and work queues. It is not thread-safe and should
 /// be used by a single worker at a time.
 pub struct ScanScratch {
-    out: Vec<FindingRec>,             // Hot-path findings (bounded by max_findings).
-    max_findings: usize,              // Per-chunk cap from tuning.
-    findings_dropped: usize,          // Overflow counter when cap is exceeded.
-    work_q: Vec<WorkItem>,            // Scan queue over root + decoded buffers.
+    /// Per-chunk finding records awaiting materialization.
+    ///
+    /// Compact records are stored here during scanning; they are expanded into
+    /// full `Finding` structs with provenance during materialization. Fixed
+    /// capacity prevents allocation in the hot path; overflow increments
+    /// `findings_dropped` instead of reallocating.
+    out: ScratchVec<FindingRec>,
+    max_findings: usize,     // Per-chunk cap from tuning.
+    findings_dropped: usize, // Overflow counter when cap is exceeded.
+    /// Work queue for breadth-first buffer traversal.
+    ///
+    /// Contains the root buffer plus any decoded buffers from transforms.
+    /// Fixed capacity ensures no allocations during the scan loop; the tuning
+    /// parameter `max_work_items` determines the upper bound.
+    work_q: ScratchVec<WorkItem>,
     work_head: usize,                 // Cursor into work_q.
     slab: DecodeSlab,                 // Decoded output storage.
     seen: FixedSet128,                // Dedupe for decoded buffers.
@@ -503,11 +531,31 @@ pub struct ScanScratch {
     windows: ScratchVec<SpanU32>,     // Merged windows for a pair.
     expanded: ScratchVec<SpanU32>,    // Expanded windows for two-phase rules.
     spans: ScratchVec<SpanU32>,       // Transform span candidates.
-    gate: GateScratch,                // Streaming gate scratch buffers.
-    step_arena: StepArena,            // Decode provenance arena.
-    utf16_buf: Vec<u8>,               // UTF-16 decode output buffer.
-    entropy_scratch: EntropyScratch,  // Entropy histogram scratch.
-    steps_buf: Vec<DecodeStep>,       // Materialization scratch.
+    /// Streaming gate scratch buffers.
+    ///
+    /// Used by the base64 decoded-content gate to maintain a sliding window
+    /// across chunk boundaries. `tail` preserves the suffix of the prior decode
+    /// chunk; `scratch` holds the current window being checked.
+    gate: GateScratch,
+    /// Decode provenance arena.
+    ///
+    /// Stores parent-linked decode steps so findings can reconstruct their
+    /// full transform chain without per-finding allocation. Fixed capacity
+    /// bounds memory usage; the arena is reset between chunks.
+    step_arena: StepArena,
+    /// UTF-16 to UTF-8 transcoding buffer.
+    ///
+    /// Used when scanning UTF-16LE/BE variants of the input buffer. Fixed
+    /// capacity sized to the maximum window size ensures no allocation during
+    /// variant scanning.
+    utf16_buf: ScratchVec<u8>,
+    entropy_scratch: EntropyScratch, // Entropy histogram scratch.
+    /// Scratch buffer for materializing decode step chains.
+    ///
+    /// When a finding is emitted, its `StepId` is traced through the arena to
+    /// reconstruct the full decode path. This buffer holds the reversed chain
+    /// during materialization. Capacity is bounded by `max_transform_depth`.
+    steps_buf: ScratchVec<DecodeStep>,
     #[cfg(feature = "b64-stats")]
     base64_stats: Base64DecodeStats, // Base64 decode/gate instrumentation.
 }
@@ -543,10 +591,11 @@ impl ScanScratch {
         );
 
         Self {
-            out: Vec::with_capacity(max_findings),
+            out: ScratchVec::with_capacity(max_findings).expect("scratch out allocation failed"),
             max_findings,
             findings_dropped: 0,
-            work_q: Vec::with_capacity(engine.tuning.max_work_items.saturating_add(1)),
+            work_q: ScratchVec::with_capacity(engine.tuning.max_work_items.saturating_add(1))
+                .expect("scratch work_q allocation failed"),
             work_head: 0,
             slab: DecodeSlab::with_limit(engine.tuning.max_total_decode_output_bytes),
             seen: FixedSet128::with_pow2(seen_cap),
@@ -563,15 +612,22 @@ impl ScanScratch {
                 .expect("scratch expanded allocation failed"),
             spans: ScratchVec::with_capacity(max_spans).expect("scratch spans allocation failed"),
             gate: GateScratch {
-                tail: Vec::with_capacity(tail_keep),
-                scratch: Vec::with_capacity(tail_keep.saturating_add(1024)),
+                tail: ScratchVec::with_capacity(tail_keep)
+                    .expect("scratch gate.tail allocation failed"),
+                scratch: ScratchVec::with_capacity(tail_keep.saturating_add(1024))
+                    .expect("scratch gate.scratch allocation failed"),
             },
             step_arena: StepArena {
-                nodes: Vec::with_capacity(max_steps),
+                nodes: ScratchVec::with_capacity(max_steps)
+                    .expect("scratch step_arena.nodes allocation failed"),
             },
-            utf16_buf: Vec::with_capacity(engine.tuning.max_utf16_decoded_bytes_per_window),
+            utf16_buf: ScratchVec::with_capacity(engine.tuning.max_utf16_decoded_bytes_per_window)
+                .expect("scratch utf16_buf allocation failed"),
             entropy_scratch: EntropyScratch::new(),
-            steps_buf: Vec::with_capacity(engine.tuning.max_transform_depth.saturating_add(1)),
+            steps_buf: ScratchVec::with_capacity(
+                engine.tuning.max_transform_depth.saturating_add(1),
+            )
+            .expect("scratch steps_buf allocation failed"),
             #[cfg(feature = "b64-stats")]
             base64_stats: Base64DecodeStats::default(),
         }
@@ -647,8 +703,42 @@ impl ScanScratch {
             self.max_findings = engine.tuning.max_findings_per_chunk;
         }
         if self.out.capacity() < self.max_findings {
-            self.out
-                .reserve(self.max_findings.saturating_sub(self.out.capacity()));
+            self.out = ScratchVec::with_capacity(self.max_findings)
+                .expect("scratch out allocation failed");
+        }
+        if self.work_q.capacity() < engine.tuning.max_work_items.saturating_add(1) {
+            self.work_q = ScratchVec::with_capacity(engine.tuning.max_work_items.saturating_add(1))
+                .expect("scratch work_q allocation failed");
+        }
+        let max_steps = engine.tuning.max_work_items.saturating_add(
+            engine
+                .rules
+                .len()
+                .saturating_mul(2 * engine.tuning.max_windows_per_rule_variant),
+        );
+        if self.step_arena.nodes.capacity() < max_steps {
+            self.step_arena.nodes = ScratchVec::with_capacity(max_steps)
+                .expect("scratch step_arena.nodes allocation failed");
+        }
+        if self.utf16_buf.capacity() < engine.tuning.max_utf16_decoded_bytes_per_window {
+            self.utf16_buf =
+                ScratchVec::with_capacity(engine.tuning.max_utf16_decoded_bytes_per_window)
+                    .expect("scratch utf16_buf allocation failed");
+        }
+        let steps_buf_cap = engine.tuning.max_transform_depth.saturating_add(1);
+        if self.steps_buf.capacity() < steps_buf_cap {
+            self.steps_buf = ScratchVec::with_capacity(steps_buf_cap)
+                .expect("scratch steps_buf allocation failed");
+        }
+        let tail_keep = engine.max_anchor_pat_len.saturating_sub(1);
+        if self.gate.tail.capacity() < tail_keep {
+            self.gate.tail =
+                ScratchVec::with_capacity(tail_keep).expect("scratch gate.tail allocation failed");
+        }
+        let gate_scratch_cap = tail_keep.saturating_add(1024);
+        if self.gate.scratch.capacity() < gate_scratch_cap {
+            self.gate.scratch = ScratchVec::with_capacity(gate_scratch_cap)
+                .expect("scratch gate.scratch allocation failed");
         }
     }
 
@@ -660,13 +750,13 @@ impl ScanScratch {
 
     /// Drains accumulated findings and returns them.
     pub fn drain_findings(&mut self) -> Vec<FindingRec> {
-        self.out.split_off(0)
+        self.out.drain().collect()
     }
 
     /// Moves all findings into `out`, reusing its allocation.
     pub fn drain_findings_into(&mut self, out: &mut Vec<FindingRec>) {
         out.clear();
-        out.append(&mut self.out);
+        out.extend(self.out.drain());
     }
 
     /// Drops findings that are fully contained in a chunk prefix.
@@ -674,7 +764,24 @@ impl ScanScratch {
         if new_bytes_start == 0 {
             return;
         }
-        self.out.retain(|rec| rec.root_hint_end > new_bytes_start);
+        // Compact in place: keep only findings where root_hint_end > new_bytes_start.
+        let mut write_idx = 0;
+        let len = self.out.len();
+        for read_idx in 0..len {
+            if self.out[read_idx].root_hint_end > new_bytes_start {
+                if write_idx != read_idx {
+                    // Move the element to the write position.
+                    // SAFETY: Both indices are in bounds and non-overlapping.
+                    let src = &self.out[read_idx] as *const FindingRec;
+                    let dst = &mut self.out[write_idx] as *mut FindingRec;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(src, dst, 1);
+                    }
+                }
+                write_idx += 1;
+            }
+        }
+        self.out.truncate(write_idx);
     }
 
     fn mark_touched(&mut self, rule_id: usize, variant: Variant) {
@@ -685,7 +792,7 @@ impl ScanScratch {
 
     /// Returns a shared view of accumulated finding records.
     pub fn findings(&self) -> &[FindingRec] {
-        &self.out
+        self.out.as_slice()
     }
 
     pub fn dropped_findings(&self) -> usize {
@@ -1245,7 +1352,7 @@ impl Engine {
 
     /// Drains compact findings from scratch and materializes provenance.
     pub fn drain_findings_materialized(&self, scratch: &mut ScanScratch, out: &mut Vec<Finding>) {
-        for rec in scratch.out.drain(..) {
+        for rec in scratch.out.drain() {
             let rule = &self.rules[rec.rule_id as usize];
             scratch
                 .step_arena
@@ -1254,7 +1361,7 @@ impl Engine {
                 rule: rule.name,
                 span: (rec.span_start as usize)..(rec.span_end as usize),
                 root_span_hint: u64_to_usize(rec.root_hint_start)..u64_to_usize(rec.root_hint_end),
-                decode_steps: scratch.steps_buf.clone(),
+                decode_steps: scratch.steps_buf.as_slice().to_vec(),
             });
         }
     }
@@ -1567,7 +1674,7 @@ impl Engine {
                     return;
                 }
 
-                let decoded = &scratch.utf16_buf;
+                let decoded = scratch.utf16_buf.as_slice();
                 if decoded.is_empty() {
                     return;
                 }
@@ -1697,20 +1804,25 @@ impl Engine {
 
             // Sliding decoded window: tail (prev chunk) + current chunk.
             scratch.gate.scratch.clear();
-            scratch.gate.scratch.extend_from_slice(&scratch.gate.tail);
+            scratch
+                .gate
+                .scratch
+                .extend_from_slice(scratch.gate.tail.as_slice());
             scratch.gate.scratch.extend_from_slice(chunk);
 
-            if !hit && self.ac_anchors.is_match(&scratch.gate.scratch) {
+            if !hit && self.ac_anchors.is_match(scratch.gate.scratch.as_slice()) {
                 hit = true;
             }
 
             if tail_keep > 0 {
-                let keep = tail_keep.min(scratch.gate.scratch.len());
+                let scratch_len = scratch.gate.scratch.len();
+                let keep = tail_keep.min(scratch_len);
+                let start = scratch_len - keep;
                 scratch.gate.tail.clear();
                 scratch
                     .gate
                     .tail
-                    .extend_from_slice(&scratch.gate.scratch[scratch.gate.scratch.len() - keep..]);
+                    .extend_from_slice(&scratch.gate.scratch.as_slice()[start..]);
             }
 
             ControlFlow::Continue(())

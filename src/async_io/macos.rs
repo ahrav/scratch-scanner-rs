@@ -1,6 +1,5 @@
 use super::*;
 use crate::{BufferPool, Chunk, Engine, FindingRec, ScanScratch};
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::mem;
@@ -425,8 +424,14 @@ struct AioFileReader {
     tail: Vec<u8>,
     tail_len: usize,
     slots: Vec<AioSlot>,
+    // Free slot indices held in a fixed-capacity stack. Capacity is `queue_depth`,
+    // so push/pop never reallocates after initialization.
     free_slots: Vec<usize>,
-    completed: HashMap<u64, usize>,
+    // Ready table keyed by `seq % queue_depth` so we can find the next emit in O(1).
+    // This avoids hashing while preserving out-of-order completion handling.
+    // The table is fixed-size and mutated in place; no hot-path allocations.
+    ready_seq: Vec<u64>,
+    ready_slot: Vec<usize>,
     next_offset: u64,
     next_seq: u64,
     next_emit_seq: u64,
@@ -468,6 +473,8 @@ impl AioFileReader {
 
         let slots: Vec<AioSlot> = (0..queue_depth).map(|_| AioSlot::new()).collect();
         let free_slots: Vec<usize> = (0..queue_depth).rev().collect();
+        let ready_seq = vec![u64::MAX; queue_depth];
+        let ready_slot = vec![0; queue_depth];
 
         Ok(Self {
             file_id,
@@ -481,7 +488,8 @@ impl AioFileReader {
             tail_len: 0,
             slots,
             free_slots,
-            completed: HashMap::with_capacity(queue_depth),
+            ready_seq,
+            ready_slot,
             next_offset: 0,
             next_seq: 0,
             next_emit_seq: 0,
@@ -564,13 +572,21 @@ impl AioFileReader {
 
     fn poll_completions(&mut self) -> io::Result<bool> {
         let mut progressed = false;
+        let ready_len = self.ready_seq.len();
 
         for (idx, slot) in self.slots.iter_mut().enumerate() {
             if !slot.is_in_flight() {
                 continue;
             }
             if slot.poll_complete()? {
-                self.completed.insert(slot.seq, idx);
+                let pos = (slot.seq as usize) % ready_len;
+                debug_assert!(
+                    self.ready_seq[pos] == u64::MAX,
+                    "ready ring collision for seq {}",
+                    slot.seq
+                );
+                self.ready_seq[pos] = slot.seq;
+                self.ready_slot[pos] = idx;
                 progressed = true;
             }
         }
@@ -585,9 +601,13 @@ impl AioFileReader {
             return;
         }
 
+        let ready_len = self.ready_seq.len();
         for (idx, slot) in self.slots.iter_mut().enumerate() {
             if slot.is_completed() && slot.seq >= self.end_seq {
-                self.completed.remove(&slot.seq);
+                let pos = (slot.seq as usize) % ready_len;
+                if self.ready_seq[pos] == slot.seq {
+                    self.ready_seq[pos] = u64::MAX;
+                }
                 slot.reset();
                 self.free_slots.push(idx);
             }
@@ -678,9 +698,14 @@ impl AioFileReader {
             return Ok(None);
         }
 
-        let Some(idx) = self.completed.remove(&self.next_emit_seq) else {
+        let ready_len = self.ready_seq.len();
+        let pos = (self.next_emit_seq as usize) % ready_len;
+        if self.ready_seq[pos] != self.next_emit_seq {
             return Ok(None);
-        };
+        }
+
+        let idx = self.ready_slot[pos];
+        self.ready_seq[pos] = u64::MAX;
 
         let slot = &mut self.slots[idx];
         debug_assert!(slot.is_completed());
@@ -982,6 +1007,51 @@ mod tests {
         let after = aio::return_call_count();
 
         assert!(after >= before + in_flight);
+
+        Ok(())
+    }
+
+    #[test]
+    fn aio_reader_hot_path_does_not_grow_buffers() -> io::Result<()> {
+        let tmp = make_temp_dir("scanner_async_reader_allocs")?;
+        let path = tmp.path().join("sample.bin");
+        let data = vec![0x11u8; 512 * 1024];
+        std::fs::write(&path, &data)?;
+
+        let engine = Arc::new(crate::demo_engine());
+        let config = AsyncIoConfig {
+            chunk_size: 64 * 1024,
+            queue_depth: 4,
+            ..AsyncIoConfig::default()
+        };
+
+        let scanner = MacosAioScanner::new(engine, config)?;
+        let mut reader = AioFileReader::new(
+            &scanner.pool,
+            FileId(0),
+            &path,
+            data.len() as u64,
+            scanner.payload_off,
+            scanner.overlap,
+            scanner.config.chunk_size,
+            scanner.config.queue_depth,
+        )?;
+
+        let caps = (
+            reader.free_slots.capacity(),
+            reader.ready_seq.capacity(),
+            reader.ready_slot.capacity(),
+            reader.wait_list.capacity(),
+            reader.tail.capacity(),
+        );
+
+        while let Some(_chunk) = reader.next_chunk(&scanner.pool)? {}
+
+        assert_eq!(reader.free_slots.capacity(), caps.0);
+        assert_eq!(reader.ready_seq.capacity(), caps.1);
+        assert_eq!(reader.ready_slot.capacity(), caps.2);
+        assert_eq!(reader.wait_list.capacity(), caps.3);
+        assert_eq!(reader.tail.capacity(), caps.4);
 
         Ok(())
     }

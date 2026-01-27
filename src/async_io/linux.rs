@@ -114,7 +114,7 @@ impl UringScanner {
     #[allow(clippy::too_many_arguments)]
     // Keep scan dependencies explicit so the hot path has no hidden state
     // and the call site shows all mutable resources.
-    fn scan_file(
+    fn scan_file<W: Write>(
         &mut self,
         engine: &Engine,
         scratch: &mut ScanScratch,
@@ -122,7 +122,7 @@ impl UringScanner {
         file_id: FileId,
         path: &Path,
         file_size: u64,
-        out: &mut BufWriter<io::Stdout>,
+        out: &mut W,
         stats: &mut PipelineStats,
     ) -> io::Result<()> {
         let mut reader = UringFileReader::new(
@@ -159,6 +159,10 @@ impl UringScanner {
             scratch.drop_prefix_findings(new_bytes_start);
             scratch.drain_findings_into(pending);
 
+            // Reap the next chunk before any fallible output so we never drop a
+            // reader that still has a kernel read in flight.
+            let next = if submitted { reader.wait_next()? } else { None };
+
             let path_display = path.display();
             for rec in pending.drain(..) {
                 let rule = engine.rule_name(rec.rule_id);
@@ -170,11 +174,7 @@ impl UringScanner {
                 stats.findings += 1;
             }
 
-            if !submitted {
-                break;
-            }
-
-            match reader.wait_next()? {
+            match next {
                 Some(next) => current = next,
                 None => break,
             }
@@ -433,6 +433,21 @@ impl<'a> UringFileReader<'a> {
     }
 }
 
+#[cfg(test)]
+impl<'a> Drop for UringFileReader<'a> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            // Avoid double-panics in tests; we only want to flag clean drops
+            // that leave an in-flight read behind.
+            return;
+        }
+        assert!(
+            self.in_flight.is_none(),
+            "io_uring reader dropped with an in-flight read; drain before returning"
+        );
+    }
+}
+
 fn open_direct(path: &Path) -> io::Result<File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true)
@@ -445,4 +460,130 @@ fn is_direct_unsupported(err: &io::Error) -> bool {
         err.raw_os_error(),
         Some(libc::EINVAL) | Some(libc::EOPNOTSUPP) | Some(libc::ENOTTY)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::{AnchorPolicy, RuleSpec, ValidatorKind};
+    use crate::demo::demo_tuning;
+    use crate::engine::Engine;
+    use regex::bytes::Regex;
+    use std::fs;
+    use std::io;
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    struct TempFile {
+        path: PathBuf,
+    }
+
+    impl TempFile {
+        fn new(bytes: &[u8]) -> io::Result<Self> {
+            let mut path = std::env::temp_dir();
+            path.push(format!(
+                "scratch-scanner-uring-test-{}-{}.bin",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            fs::write(&path, bytes)?;
+            Ok(Self { path })
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+
+    struct FailingWriter {
+        writes: usize,
+    }
+
+    impl FailingWriter {
+        fn new() -> Self {
+            Self { writes: 0 }
+        }
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "simulated output failure",
+            ))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn scan_file_does_not_drop_in_flight_on_output_error() -> io::Result<()> {
+        // Build a tiny engine that will definitely emit a finding in the
+        // first chunk so we exercise the output path.
+        const ANCHOR: &[&[u8]] = &[b"SECRET"];
+        let rule = RuleSpec {
+            name: "test-secret",
+            anchors: ANCHOR,
+            radius: 16,
+            validator: ValidatorKind::None,
+            two_phase: None,
+            must_contain: None,
+            keywords_any: None,
+            entropy: None,
+            re: Regex::new("SECRET").unwrap(),
+        };
+        let engine = Arc::new(Engine::new_with_anchor_policy(
+            vec![rule],
+            Vec::new(),
+            demo_tuning(),
+            AnchorPolicy::ManualOnly,
+        ));
+
+        let mut config = AsyncIoConfig::default();
+        config.chunk_size = BUFFER_ALIGN;
+        config.queue_depth = 2;
+        config.max_files = 1;
+        config.use_o_direct = false;
+
+        let mut scanner = UringScanner::new(Arc::clone(&engine), config)?;
+
+        let mut bytes = vec![b'a'; BUFFER_ALIGN * 2];
+        bytes[..ANCHOR[0].len()].copy_from_slice(ANCHOR[0]);
+        let temp = TempFile::new(&bytes)?;
+
+        let mut scratch = engine.new_scratch();
+        let mut pending = Vec::with_capacity(engine.tuning.max_findings_per_chunk);
+        let mut stats = PipelineStats::default();
+        let mut writer = FailingWriter::new();
+
+        let err = scanner
+            .scan_file(
+                &engine,
+                &mut scratch,
+                &mut pending,
+                FileId(0),
+                temp.path(),
+                bytes.len() as u64,
+                &mut writer,
+                &mut stats,
+            )
+            .expect_err("expected writer failure");
+
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert!(writer.writes > 0, "writer should be invoked at least once");
+        Ok(())
+    }
 }
