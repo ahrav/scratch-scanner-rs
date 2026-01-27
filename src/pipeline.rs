@@ -124,6 +124,10 @@ impl<T, const N: usize> SpscRing<T, N> {
     fn pop(&mut self) -> Option<T> {
         self.ring.pop_front()
     }
+
+    fn clear(&mut self) {
+        while self.pop().is_some() {}
+    }
 }
 
 enum WalkEntry {
@@ -142,17 +146,18 @@ struct Walker {
 }
 
 impl Walker {
-    fn new(root: PathBuf, max_files: usize) -> Self {
-        // Stack depth is bounded by directory depth, not file count.
-        // Using max_files here was a misprediction: a 1M-file scan doesn't
-        // need a 1M-entry stack; it needs ~depth entries (usually < 100).
-        let mut stack = Vec::with_capacity(WALKER_STACK_CAP);
-        stack.push(WalkEntry::Path(root));
+    fn new(max_files: usize) -> Self {
         Self {
-            stack,
-            done: false,
+            stack: Vec::with_capacity(WALKER_STACK_CAP),
+            done: true,
             max_files,
         }
+    }
+
+    fn reset(&mut self, root: &Path) {
+        self.stack.clear();
+        self.stack.push(WalkEntry::Path(root.to_path_buf()));
+        self.done = false;
     }
 
     fn is_done(&self) -> bool {
@@ -324,6 +329,11 @@ impl ReaderStage {
         }
     }
 
+    fn reset(&mut self) {
+        self.active = None;
+        self.tail_len = 0;
+    }
+
     fn is_idle(&self) -> bool {
         self.active.is_none()
     }
@@ -411,6 +421,11 @@ impl ScanStage {
             pending: Vec::with_capacity(engine.tuning.max_findings_per_chunk),
             pending_idx: 0,
         }
+    }
+
+    fn reset(&mut self) {
+        self.pending.clear();
+        self.pending_idx = 0;
     }
 
     fn has_pending(&self) -> bool {
@@ -530,6 +545,14 @@ pub struct Pipeline<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP
     config: PipelineConfig,
     overlap: usize,
     pool: BufferPool,
+    files: FileTable,
+    file_ring: SpscRing<FileId, FILE_CAP>,
+    chunk_ring: SpscRing<Chunk, CHUNK_CAP>,
+    out_ring: SpscRing<FindingRec, OUT_CAP>,
+    walker: Walker,
+    reader: ReaderStage,
+    scanner: ScanStage,
+    output: OutputStage,
 }
 
 impl<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize>
@@ -553,56 +576,71 @@ impl<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize>
         let buf_len = overlap.saturating_add(config.chunk_size);
         assert!(buf_len <= BUFFER_LEN_MAX);
 
+        let chunk_size = config.chunk_size;
+        let max_files = config.max_files;
+        let scanner = ScanStage::new(&engine);
         let pool = BufferPool::new(PIPE_POOL_CAP);
         Self {
             engine,
             config,
             overlap,
             pool,
+            files: FileTable::with_capacity(max_files),
+            file_ring: SpscRing::new(),
+            chunk_ring: SpscRing::new(),
+            out_ring: SpscRing::new(),
+            walker: Walker::new(max_files),
+            reader: ReaderStage::new(overlap, chunk_size),
+            scanner,
+            output: OutputStage::new(),
         }
     }
 
     /// Scans a path (file or directory) and returns summary stats.
-    pub fn scan_path(&self, path: &Path) -> io::Result<PipelineStats> {
+    pub fn scan_path(&mut self, path: &Path) -> io::Result<PipelineStats> {
         let mut stats = PipelineStats::default();
 
-        let mut files = FileTable::with_capacity(self.config.max_files);
-        let mut file_ring: SpscRing<FileId, FILE_CAP> = SpscRing::new();
-        let mut chunk_ring: SpscRing<Chunk, CHUNK_CAP> = SpscRing::new();
-        let mut out_ring: SpscRing<FindingRec, OUT_CAP> = SpscRing::new();
-
-        let mut walker = Walker::new(path.to_path_buf(), self.config.max_files);
-        let mut reader = ReaderStage::new(self.overlap, self.config.chunk_size);
-        let mut scanner = ScanStage::new(&self.engine);
-        let mut output = OutputStage::new();
+        self.files.clear();
+        self.file_ring.clear();
+        self.chunk_ring.clear();
+        self.out_ring.clear();
+        self.walker.reset(path);
+        self.reader.reset();
+        self.scanner.reset();
 
         loop {
             let mut progressed = false;
 
-            progressed |= output.pump(&self.engine, &files, &mut out_ring, &mut stats)?;
-            progressed |= scanner.pump(&self.engine, &mut chunk_ring, &mut out_ring, &mut stats);
-            progressed |= reader.pump(
-                &mut file_ring,
-                &mut chunk_ring,
+            progressed |= self
+                .output
+                .pump(&self.engine, &self.files, &mut self.out_ring, &mut stats)?;
+            progressed |=
+                self.scanner
+                    .pump(&self.engine, &mut self.chunk_ring, &mut self.out_ring, &mut stats);
+            progressed |= self.reader.pump(
+                &mut self.file_ring,
+                &mut self.chunk_ring,
                 &self.pool,
-                &files,
+                &self.files,
                 &mut stats,
             )?;
-            progressed |= walker.pump(&mut files, &mut file_ring, &mut stats)?;
+            progressed |=
+                self.walker
+                    .pump(&mut self.files, &mut self.file_ring, &mut stats)?;
 
-            let done = walker.is_done()
-                && reader.is_idle()
-                && file_ring.is_empty()
-                && chunk_ring.is_empty()
-                && !scanner.has_pending()
-                && out_ring.is_empty();
+            let done = self.walker.is_done()
+                && self.reader.is_idle()
+                && self.file_ring.is_empty()
+                && self.chunk_ring.is_empty()
+                && !self.scanner.has_pending()
+                && self.out_ring.is_empty();
 
             if done {
                 break;
             }
 
             if !progressed {
-                if reader.is_waiting() {
+                if self.reader.is_waiting() {
                     // Reader backend has in-flight IO; yield to avoid a tight
                     // spin loop while the kernel completes requests.
                     std::thread::yield_now();
@@ -615,14 +653,14 @@ impl<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize>
             }
         }
 
-        output.flush()?;
+        self.output.flush()?;
         Ok(stats)
     }
 }
 
 /// Convenience wrapper using pipeline defaults and fixed ring capacities.
 pub fn scan_path_default(path: &Path, engine: Arc<Engine>) -> io::Result<PipelineStats> {
-    let pipeline: Pipeline<PIPE_FILE_RING_CAP, PIPE_CHUNK_RING_CAP, PIPE_OUT_RING_CAP> =
+    let mut pipeline: Pipeline<PIPE_FILE_RING_CAP, PIPE_CHUNK_RING_CAP, PIPE_OUT_RING_CAP> =
         Pipeline::new(engine, PipelineConfig::default());
     pipeline.scan_path(path)
 }
@@ -712,7 +750,7 @@ mod tests {
         let _file_guard = RestorePerm::new(unreadable, 0o600)?;
 
         let engine = Arc::new(crate::demo_engine());
-        let pipeline: Pipeline<PIPE_FILE_RING_CAP, PIPE_CHUNK_RING_CAP, PIPE_OUT_RING_CAP> =
+        let mut pipeline: Pipeline<PIPE_FILE_RING_CAP, PIPE_CHUNK_RING_CAP, PIPE_OUT_RING_CAP> =
             Pipeline::new(engine, PipelineConfig::default());
 
         let stats = pipeline.scan_path(tmp.path())?;
