@@ -11,8 +11,11 @@ use crate::scratch_memory::ScratchVec;
 use crate::{FileId, FileTable, BUFFER_ALIGN, BUFFER_LEN_MAX};
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
@@ -31,6 +34,8 @@ pub const ASYNC_DEFAULT_QUEUE_DEPTH: u32 = 2;
 
 /// Default maximum number of files to scan.
 pub const ASYNC_MAX_FILES: usize = crate::pipeline::PIPE_MAX_FILES;
+/// Default per-file path byte budget for async scanners.
+pub const ASYNC_PATH_BYTES_PER_FILE: usize = 256;
 
 /// Maximum depth for the DFS walker stack.
 ///
@@ -45,6 +50,8 @@ pub struct AsyncIoConfig {
     pub chunk_size: usize,
     /// Maximum number of files to scan from a path walk.
     pub max_files: usize,
+    /// Total byte capacity reserved for path storage (0 = auto).
+    pub path_bytes_cap: usize,
     /// Submission queue depth (io_uring) / read-ahead depth (macOS AIO).
     pub queue_depth: u32,
     /// Enable O_DIRECT for the aligned portion of reads on Linux.
@@ -53,9 +60,11 @@ pub struct AsyncIoConfig {
 
 impl Default for AsyncIoConfig {
     fn default() -> Self {
+        let max_files = ASYNC_MAX_FILES;
         Self {
             chunk_size: ASYNC_DEFAULT_CHUNK_SIZE,
-            max_files: ASYNC_MAX_FILES,
+            max_files,
+            path_bytes_cap: max_files.saturating_mul(ASYNC_PATH_BYTES_PER_FILE),
             queue_depth: ASYNC_DEFAULT_QUEUE_DEPTH,
             use_o_direct: true,
         }
@@ -80,6 +89,17 @@ fn align_down_u64(value: u64, align: u64) -> u64 {
 fn max_aligned_chunk_size(overlap: usize) -> usize {
     let max_chunk = BUFFER_LEN_MAX.saturating_sub(overlap);
     align_down(max_chunk, BUFFER_ALIGN)
+}
+
+fn write_path<W: Write>(out: &mut W, path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        out.write_all(path.as_os_str().as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        write!(out, "{}", path.display())
+    }
 }
 
 // --------------------------

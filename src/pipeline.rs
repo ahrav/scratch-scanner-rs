@@ -20,6 +20,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
 /// Default chunk size used by the pipeline (bytes).
@@ -42,6 +44,8 @@ pub const PIPE_POOL_CAP: usize = PIPE_CHUNK_RING_CAP + 8;
 /// This bounds the `FileTable` allocation. Increase for very large scans;
 /// decrease if memory is constrained.
 pub const PIPE_MAX_FILES: usize = 100_000;
+/// Default per-file path byte budget for the pipeline.
+pub const PIPE_PATH_BYTES_PER_FILE: usize = 256;
 
 /// Maximum depth for the DFS walker stack.
 ///
@@ -56,13 +60,17 @@ pub struct PipelineConfig {
     pub chunk_size: usize,
     /// Maximum number of files to queue.
     pub max_files: usize,
+    /// Total byte capacity reserved for path storage (0 = auto).
+    pub path_bytes_cap: usize,
 }
 
 impl Default for PipelineConfig {
     fn default() -> Self {
+        let max_files = PIPE_MAX_FILES;
         Self {
             chunk_size: DEFAULT_CHUNK_SIZE,
-            max_files: PIPE_MAX_FILES,
+            max_files,
+            path_bytes_cap: max_files.saturating_mul(PIPE_PATH_BYTES_PER_FILE),
         }
     }
 }
@@ -495,6 +503,17 @@ impl ScanStage {
     }
 }
 
+fn write_path<W: Write>(out: &mut W, path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        out.write_all(path.as_os_str().as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        write!(out, "{}", path.display())
+    }
+}
+
 /// Stage that formats findings to stdout.
 struct OutputStage {
     out: BufWriter<io::Stdout>,
@@ -519,14 +538,13 @@ impl OutputStage {
         while let Some(rec) = out_ring.pop() {
             let path = files.path(rec.file_id);
             let rule = engine.rule_name(rec.rule_id);
-            writeln!(
+            write_path(&mut self.out, path)?;
+            write!(
                 self.out,
-                "{}:{}-{} {}",
-                path.display(),
-                rec.root_hint_start,
-                rec.root_hint_end,
-                rule
+                ":{}-{} {}",
+                rec.root_hint_start, rec.root_hint_end, rule
             )?;
+            self.out.write_all(b"\n")?;
             stats.findings += 1;
             progressed = true;
         }
@@ -572,12 +590,16 @@ impl<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize>
             assert!(max_chunk > 0, "overlap exceeds buffer size");
             config.chunk_size = max_chunk;
         }
+        if config.path_bytes_cap == 0 {
+            config.path_bytes_cap = config.max_files.saturating_mul(PIPE_PATH_BYTES_PER_FILE);
+        }
 
         let buf_len = overlap.saturating_add(config.chunk_size);
         assert!(buf_len <= BUFFER_LEN_MAX);
 
         let chunk_size = config.chunk_size;
         let max_files = config.max_files;
+        let path_bytes_cap = config.path_bytes_cap;
         let scanner = ScanStage::new(&engine);
         let pool = BufferPool::new(PIPE_POOL_CAP);
         Self {
@@ -585,7 +607,7 @@ impl<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize>
             config,
             overlap,
             pool,
-            files: FileTable::with_capacity(max_files),
+            files: FileTable::with_capacity_and_path_bytes(max_files, path_bytes_cap),
             file_ring: SpscRing::new(),
             chunk_ring: SpscRing::new(),
             out_ring: SpscRing::new(),
@@ -611,12 +633,15 @@ impl<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize>
         loop {
             let mut progressed = false;
 
-            progressed |= self
-                .output
-                .pump(&self.engine, &self.files, &mut self.out_ring, &mut stats)?;
             progressed |=
-                self.scanner
-                    .pump(&self.engine, &mut self.chunk_ring, &mut self.out_ring, &mut stats);
+                self.output
+                    .pump(&self.engine, &self.files, &mut self.out_ring, &mut stats)?;
+            progressed |= self.scanner.pump(
+                &self.engine,
+                &mut self.chunk_ring,
+                &mut self.out_ring,
+                &mut stats,
+            );
             progressed |= self.reader.pump(
                 &mut self.file_ring,
                 &mut self.chunk_ring,
@@ -624,9 +649,9 @@ impl<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize>
                 &self.files,
                 &mut stats,
             )?;
-            progressed |=
-                self.walker
-                    .pump(&mut self.files, &mut self.file_ring, &mut stats)?;
+            progressed |= self
+                .walker
+                .pump(&mut self.files, &mut self.file_ring, &mut stats)?;
 
             let done = self.walker.is_done()
                 && self.reader.is_idle()

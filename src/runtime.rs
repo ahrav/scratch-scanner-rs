@@ -1,6 +1,8 @@
 use crate::api::{FileId, Finding};
 use crate::engine::{Engine, ScanScratch};
 use crate::pool::NodePoolType;
+#[cfg(unix)]
+use crate::scratch_memory::ScratchVec;
 use std::cell::{Cell, UnsafeCell};
 use std::fs::File;
 use std::io::{self, Read};
@@ -23,9 +25,14 @@ pub const FILE_FLAG_SKIPPED: u32 = 1 << 1;
 /// Columnar file metadata store used by the pipeline.
 ///
 /// Uses parallel vectors (SoA) to keep memory note simple and allow stable
-/// indexing via [`FileId`].
-#[derive(Default)]
+/// indexing via [`FileId`]. On Unix, paths are stored in a fixed-capacity
+/// byte arena to avoid per-file heap allocation after startup.
 pub struct FileTable {
+    #[cfg(unix)]
+    path_spans: Vec<PathSpan>,
+    #[cfg(unix)]
+    path_bytes: ScratchVec<u8>,
+    #[cfg(not(unix))]
     paths: Vec<PathBuf>,
     sizes: Vec<u64>,
     dev_inodes: Vec<(u64, u64)>,
@@ -35,19 +42,69 @@ pub struct FileTable {
 impl FileTable {
     /// Creates a table with capacity hints for the parallel arrays.
     pub fn with_capacity(cap: usize) -> Self {
-        Self {
-            paths: Vec::with_capacity(cap),
-            sizes: Vec::with_capacity(cap),
-            dev_inodes: Vec::with_capacity(cap),
-            flags: Vec::with_capacity(cap),
+        let path_bytes_cap = cap.saturating_mul(FILETABLE_PATH_BYTES_PER_FILE_DEFAULT);
+        Self::with_capacity_and_path_bytes(cap, path_bytes_cap)
+    }
+
+    /// Creates a table with explicit capacity for path storage.
+    pub fn with_capacity_and_path_bytes(cap: usize, path_bytes_cap: usize) -> Self {
+        #[cfg(unix)]
+        {
+            assert!(
+                path_bytes_cap <= u32::MAX as usize,
+                "path byte capacity exceeds u32::MAX"
+            );
+            let path_bytes = ScratchVec::with_capacity(path_bytes_cap)
+                .expect("file table path bytes allocation failed");
+            Self {
+                path_spans: Vec::with_capacity(cap),
+                path_bytes,
+                sizes: Vec::with_capacity(cap),
+                dev_inodes: Vec::with_capacity(cap),
+                flags: Vec::with_capacity(cap),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path_bytes_cap;
+            Self {
+                paths: Vec::with_capacity(cap),
+                sizes: Vec::with_capacity(cap),
+                dev_inodes: Vec::with_capacity(cap),
+                flags: Vec::with_capacity(cap),
+            }
         }
     }
 
     /// Inserts a new file record and returns its [`FileId`].
     pub fn push(&mut self, path: PathBuf, size: u64, dev_inode: (u64, u64), flags: u32) -> FileId {
-        assert!(self.paths.len() < u32::MAX as usize);
-        let id = FileId(self.paths.len() as u32);
-        self.paths.push(path);
+        assert!(
+            self.sizes.len() < self.sizes.capacity(),
+            "file table capacity exceeded"
+        );
+        assert!(self.sizes.len() < u32::MAX as usize);
+        let id = FileId(self.sizes.len() as u32);
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let bytes = path.as_os_str().as_bytes();
+            let start = self.path_bytes.len();
+            let new_len = start.saturating_add(bytes.len());
+            assert!(
+                new_len <= self.path_bytes.capacity(),
+                "path arena exhausted"
+            );
+            assert!(new_len <= u32::MAX as usize, "path bytes overflow u32");
+            self.path_bytes.extend_from_slice(bytes);
+            self.path_spans.push(PathSpan {
+                offset: start as u32,
+                len: bytes.len() as u32,
+            });
+        }
+        #[cfg(not(unix))]
+        {
+            self.paths.push(path);
+        }
         self.sizes.push(size);
         self.dev_inodes.push(dev_inode);
         self.flags.push(flags);
@@ -56,12 +113,20 @@ impl FileTable {
 
     /// Returns the number of tracked files.
     pub fn len(&self) -> usize {
-        self.paths.len()
+        self.sizes.len()
     }
 
     /// Clears all tracked files while retaining allocated capacity.
     pub fn clear(&mut self) {
-        self.paths.clear();
+        #[cfg(unix)]
+        {
+            self.path_spans.clear();
+            self.path_bytes.clear();
+        }
+        #[cfg(not(unix))]
+        {
+            self.paths.clear();
+        }
         self.sizes.clear();
         self.dev_inodes.clear();
         self.flags.clear();
@@ -69,12 +134,25 @@ impl FileTable {
 
     /// Returns true when the table is empty.
     pub fn is_empty(&self) -> bool {
-        self.paths.is_empty()
+        self.sizes.is_empty()
     }
 
     /// Returns the path for a given file id.
-    pub fn path(&self, id: FileId) -> &PathBuf {
-        &self.paths[id.0 as usize]
+    pub fn path(&self, id: FileId) -> &Path {
+        #[cfg(unix)]
+        {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+            let span = self.path_spans[id.0 as usize];
+            let start = span.offset as usize;
+            let end = start + span.len as usize;
+            let bytes = &self.path_bytes.as_slice()[start..end];
+            Path::new(OsStr::from_bytes(bytes))
+        }
+        #[cfg(not(unix))]
+        {
+            &self.paths[id.0 as usize]
+        }
     }
 
     /// Returns the file size for a given file id.
@@ -87,6 +165,22 @@ impl FileTable {
         self.flags[id.0 as usize]
     }
 }
+
+impl Default for FileTable {
+    fn default() -> Self {
+        Self::with_capacity_and_path_bytes(0, 0)
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+struct PathSpan {
+    offset: u32,
+    len: u32,
+}
+
+/// Default path byte budget per file for `FileTable::with_capacity`.
+const FILETABLE_PATH_BYTES_PER_FILE_DEFAULT: usize = 256;
 
 /// A chunk of file data plus its overlap prefix.
 ///

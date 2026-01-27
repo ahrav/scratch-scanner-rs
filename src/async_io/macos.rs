@@ -163,6 +163,11 @@ impl MacosAioScanner {
                 "queue_depth must be >= 2 for overlapped reads",
             ));
         }
+        if config.path_bytes_cap == 0 {
+            config.path_bytes_cap = config
+                .max_files
+                .saturating_mul(super::ASYNC_PATH_BYTES_PER_FILE);
+        }
 
         let overlap = engine.required_overlap();
         if config.chunk_size == 0 {
@@ -182,7 +187,8 @@ impl MacosAioScanner {
         let pool = BufferPool::new(config.queue_depth as usize + 1);
         let scratch = engine.new_scratch();
         let pending = Vec::with_capacity(engine.tuning.max_findings_per_chunk);
-        let files = FileTable::with_capacity(config.max_files);
+        let files =
+            FileTable::with_capacity_and_path_bytes(config.max_files, config.path_bytes_cap);
         let walker = Walker::new(config.max_files)?;
         let out = BufWriter::new(io::stdout());
 
@@ -287,14 +293,15 @@ fn scan_file(
         scratch.drop_prefix_findings(new_bytes_start);
         scratch.drain_findings_into(pending);
 
-        let path_display = path.display();
         for rec in pending.drain(..) {
             let rule = engine.rule_name(rec.rule_id);
-            writeln!(
+            write_path(out, path)?;
+            write!(
                 out,
-                "{}:{}-{} {}",
-                path_display, rec.root_hint_start, rec.root_hint_end, rule
+                ":{}-{} {}",
+                rec.root_hint_start, rec.root_hint_end, rule
             )?;
+            out.write_all(b"\n")?;
             stats.findings += 1;
         }
     }
