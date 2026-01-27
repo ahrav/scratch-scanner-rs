@@ -126,6 +126,8 @@ flowchart TB
     Validate --> Transforms["transform loop (optional)"]
     Transforms --> Spans["find_spans_into()"]
     Spans --> Gate{ "gate == AnchorsInDecoded?" }
+    B64Note["Base64 adds an encoded-space pre-gate before decoded gating"]
+    B64Note -.-> Gate
     Gate -- "yes" --> GateScan["gate_stream_contains_anchor()"]
     GateScan -- "no" --> Transforms
     GateScan -- "yes" --> Decode

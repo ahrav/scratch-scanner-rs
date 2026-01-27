@@ -4,6 +4,11 @@
 //! enables a single node to participate in multiple queues simultaneously by using
 //! different tags for each link.
 //!
+//! Why intrusive?
+//! - No per-node allocation: links live inside the node.
+//! - Stable addresses: queue operations are just pointer rewrites.
+//! - Clear ownership: the queue never owns nodes, it only links them.
+//!
 //! # Safety
 //!
 //! This is an intrusive data structure using raw pointers. Callers must ensure:

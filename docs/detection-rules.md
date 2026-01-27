@@ -171,6 +171,20 @@ This enables detection in:
 - UTF-16LE encoded files (Windows default)
 - UTF-16BE encoded files (some network protocols)
 
+## Why Anchors and Radii Matter
+
+Anchors are not just a convenience; they are the primary cost control mechanism.
+The scanner only runs regex validation inside windows around anchor hits. The
+radius determines how wide those windows are:
+
+- **Too small**: you may miss matches where the anchor and the full pattern are
+  farther apart than expected.
+- **Too large**: you increase regex work and can hurt performance on noisy inputs.
+
+Anchors should be short but distinctive, and radii should match the expected
+distance from anchor to full token. This is why rules like private keys use
+two-phase validation: a cheap anchor + confirm narrows the expensive regex work.
+
 ## Transform Detection
 
 Secrets may be encoded. The demo engine handles:

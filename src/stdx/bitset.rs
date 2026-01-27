@@ -3,6 +3,9 @@
 //!
 //! Both implementations store bits in `u64` words and guarantee that padding bits
 //! (indices beyond the logical capacity) remain zero.
+//!
+//! Keeping padding bits zero avoids "phantom" set bits when iterating or counting
+//! and makes the bitset safe to serialize or hash without masking.
 
 /// Computes the number of `u64` words needed to store `N` bits.
 pub const fn words_for_bits(n: usize) -> usize {

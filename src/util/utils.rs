@@ -1,4 +1,8 @@
 //! Low-level byte manipulation and alignment utilities.
+//!
+//! These helpers are intentionally explicit about safety and layout assumptions.
+//! We avoid external "bytemuck"-style dependencies here so the invariants are
+//! visible at the call site and easy to audit.
 
 use core::mem::{align_of, size_of};
 use core::ptr::NonNull;
@@ -8,12 +12,14 @@ use std::alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout};
 /// # Safety
 ///
 /// Implementers guarantee the type has no padding bytes and all bytes are
-/// initialized for any valid value.
+/// initialized for any valid value. This makes it safe to treat the value as
+/// a raw byte slice for hashing, serialization, or I/O.
 pub unsafe trait Pod: Copy {}
 
 /// # Safety
 ///
-/// Implementers guarantee the all-zero byte pattern is a valid value.
+/// Implementers guarantee the all-zero byte pattern is a valid value. This is
+/// stronger than `Default` and is required for zeroed allocation APIs below.
 pub unsafe trait Zeroable {}
 
 unsafe impl Pod for bool {}

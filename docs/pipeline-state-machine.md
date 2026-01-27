@@ -153,6 +153,9 @@ loop {
 }
 ```
 
+This check prevents a silent busy loop when rings are full/empty in a way that
+should not be possible. It surfaces deadlocks early during development.
+
 ## Stall Detection
 
 A stall occurs when:

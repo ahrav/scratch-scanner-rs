@@ -32,6 +32,9 @@ pub trait NodePool {
 pub struct NodePoolType<const NODE_SIZE: usize, const NODE_ALIGNMENT: usize> {
     buffer: NonNull<u8>,
     len: usize,
+    // Bitset of free slots. A set bit means "available".
+    // This is inverted from typical "in-use" tracking because it makes
+    // "find first free" a fast "find first set" operation.
     free: DynamicBitSet,
 }
 
