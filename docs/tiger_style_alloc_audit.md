@@ -50,48 +50,45 @@ allocations under our control.
 Impact: The sync runtime is allocation-free after startup when `max_findings_per_file` is sized
 for expected workloads.
 
-### Pipeline (per scan allocations inside `scan_path`)
+### Pipeline (stage state reused; path arena added)
 
-- `src/pipeline.rs`:
-  - `Pipeline::scan_path` constructs these each call:
-    - `FileTable::with_capacity` (allocates 4 Vecs)
-    - `Walker::new` (allocates DFS stack)
-    - `ReaderStage::new` (allocates overlap `tail` vec)
-    - `ScanStage::new` (allocates `pending` vec)
-    - `OutputStage::new` (allocates `BufWriter` buffer)
-  - `Walker` uses `fs::read_dir` and `DirEntry::path()` which allocates a `PathBuf` per entry.
-  - Output formatting uses `path.display()` inside the output loop (may allocate for non-UTF8 paths).
+- `src/pipeline.rs` / `src/runtime.rs`:
+  - `Pipeline` now owns `FileTable`, rings, and all stages, and `scan_path` resets them
+    instead of allocating per scan.
+  - `FileTable` stores paths in a fixed-capacity byte arena (Unix) to avoid per-file heap allocation.
+  - `PipelineConfig::path_bytes_cap` controls the arena size (0 = auto).
+  - Output formatting writes raw path bytes on Unix (no `path.display()` allocations).
+  - Unix `Walker` uses `openat` + `readdir` to avoid `PathBuf` allocations per entry.
+  - Non-Unix platforms still use `fs::read_dir`/`DirEntry::path()` and therefore allocate per entry.
 
-Impact: Pipeline scans allocate per invocation and per file.
+Impact: On Unix, the pipeline scan path is allocation-free after startup when capacities are
+pre-sized. Non-Unix platforms still allocate in `std::fs` path handling.
 
-### Async scanners (shared walker + path handling)
+### Async scanners (shared walker + path arena)
 
 - `src/async_io/mod.rs` walker:
-  - `Walker::reset(path.to_path_buf())` allocates per scan.
-  - `DirEntry::path()` allocates a `PathBuf` per entry.
-  - `FileTable::push` stores `PathBuf` per file (alloc per file).
+  - Unix `Walker` uses `openat` + `readdir` and stores paths in the fixed arena.
+  - Non-Unix still uses `fs::read_dir`/`DirEntry::path()` and allocates per entry.
+  - `FileTable` stores paths in a fixed-capacity byte arena (Unix).
+  - `AsyncIoConfig::path_bytes_cap` controls the arena size (0 = auto).
 
-Impact: Async scanners allocate per scan and per file from path handling alone.
+Impact: On Unix, async scanners are allocation-free after startup with pre-sized capacities.
+Non-Unix platforms still allocate per entry via `std::fs` path handling.
 
-### macOS AIO (per file allocations in reader)
+### macOS AIO (reused reader buffers)
 
 - `src/async_io/macos.rs`:
-  - `AioFileReader::new` allocates per file:
-    - `slots: Vec<AioSlot>`
-    - `free_slots: Vec<usize>`
-    - `ready_seq: Vec<u64>`
-    - `ready_slot: Vec<usize>`
-    - `tail: Vec<u8>`
-    - `wait_list: Vec<*const aiocb>`
+  - `MacosAioScanner` now owns a reusable `AioFileReader`.
+  - Reader buffers (`slots`, `free_slots`, `ready_seq`, `ready_slot`, `tail`, `wait_list`) are
+    allocated once at startup and reused via `reset_for_file`.
 
-Impact: Even with a pre-built `MacosAioScanner`, each file scanned allocates multiple vectors.
+Impact: macOS AIO no longer allocates per file after startup.
 
-### Output formatting (implicit allocations)
+### Output formatting (Unix allocation-free)
 
 - `src/async_io/linux.rs`, `src/async_io/macos.rs`, `src/pipeline.rs`:
-  - `path.display()` may allocate for non-UTF8 paths.
-
-Impact: Per-finding output can allocate depending on path contents.
+  - Raw path bytes are written on Unix to avoid `path.display()` allocations.
+  - Non-Unix platforms still use `path.display()` (possible allocation for non-UTF8 paths).
 
 ### Potential capacity-growth allocations (edge case)
 
@@ -114,15 +111,14 @@ expect allocations until their call paths are made allocation-free.
 
 ```
 engine.scan_chunk allocs: calls=0 bytes=0 reallocs=0 realloc_bytes=0 deallocs=0
-MacosAioScanner::scan_path allocs: calls=66 bytes=70661 reallocs=15 realloc_bytes=16348 deallocs=15
-Pipeline::scan_path allocs: calls=750 bytes=17849302 reallocs=15 realloc_bytes=16350 deallocs=700
+MacosAioScanner::scan_path allocs: calls=0 bytes=0 reallocs=0 realloc_bytes=0 deallocs=0
+Pipeline::scan_path allocs: calls=0 bytes=0 reallocs=0 realloc_bytes=0 deallocs=0
 ScannerRuntime::scan_file_sync allocs: calls=0 bytes=0 reallocs=0 realloc_bytes=0 deallocs=0
 ```
 
 Interpretation:
 - Engine scan path is **allocation-free after warm-up**.
-- Pipeline and macOS AIO paths still allocate per scan and per file.
-- macOS AIO path remains dominated by per-file `AioFileReader::new` allocations.
+- Pipeline and macOS AIO scans are **allocation-free after warm-up** on Unix/macOS.
 
 ## Removal Approaches (Performance + Correctness)
 
@@ -140,28 +136,22 @@ Interpretation:
 - `ScannerRuntime` now owns `ScanScratch`, `tail`, and a fixed-capacity output buffer.
 - `scan_file_sync` returns a slice into the internal buffer and errors on capacity overflow.
 
-### 3) Pipeline: persist stage state inside `Pipeline`
+### 3) Pipeline: persist stage state inside `Pipeline` (done)
 
-- Store `FileTable`, `Walker`, `ReaderStage`, `ScanStage`, and `OutputStage` as fields in
-  `Pipeline`, created at `Pipeline::new` and reused.
-- Replace `Walker`’s heap `Vec` stack with `ScratchVec` (as in async walker).
-- Replace `ReaderStage.tail` Vec with `ScratchVec` sized at startup.
+- `Pipeline` now stores `FileTable`, rings, and stage state and reuses them between scans.
+- Remaining work for zero-allocation scans lives in path handling (see below).
 
-### 4) Path storage without per-entry allocation
+### 4) Path storage without per-entry allocation (partial)
 
-- Use a preallocated arena to store path bytes and keep `(offset, len)` in `FileTable`.
-- Options using existing constructs:
-  - **Fixed-size slots** using `NodePoolType` blocks (simple, larger memory).
-  - **Block-chained arena** using `NodePoolType` blocks and an intrusive free list.
-- For strict zero allocation, `std::fs::read_dir` must be replaced with `openat` + `readdir`
-  to avoid `DirEntry::path()` allocations.
+- `FileTable` now stores path bytes in a fixed-capacity arena on Unix.
+- Unix walkers now use `openat` + `readdir` to avoid `DirEntry::path()` allocations.
+- Non-Unix platforms still use `std::fs::read_dir` and therefore allocate per entry.
 
 ### 5) macOS AIO: reuse per-file buffers
 
-- Move `AioFileReader` storage into `MacosAioScanner`:
-  - `slots`, `free_slots`, `ready_seq`, `ready_slot`, `tail`, `wait_list` allocated once.
-  - Convert `AioFileReader::new` to `reset_for_file`.
-  - Use `ScratchVec` for fixed-capacity vectors.
+Done:
+- `MacosAioScanner` owns a single `AioFileReader`.
+- `AioFileReader::new` allocates fixed buffers once; `reset_for_file` reuses them per file.
 
 ### 6) Output formatting without allocation
 
@@ -170,19 +160,14 @@ Interpretation:
 
 ### 7) Guardrails
 
-- Keep the allocation-counting test (ignored by default) to catch regressions.
-- Add debug-only counters or a compile-time feature to assert zero allocations during scan.
+Done:
+- Allocation-counting test now asserts zero allocations for engine, runtime, pipeline, and macOS AIO.
 
 ## Summary
 
-The codebase does not currently meet TigerStyle’s “no allocation after startup” rule. The
-allocations are concentrated in:
-- Per-scan pipeline construction.
-- Per-file async macOS AIO reader allocations.
-- Path handling and output formatting.
-
-Engine chunk scans are now allocation-free when callers reuse `ScanScratch`
-and pre-sized output buffers; remaining work is in runtime/pipeline layers.
+The codebase meets TigerStyle’s “no allocation after startup” rule for the
+Unix/macOS scan paths under our control, with capacities pre-sized up front.
+Non-Unix platforms still allocate per entry in `std::fs` path walking.
 
 The fixes above focus on reusing preallocated buffers (`ScratchVec`, `NodePoolType`, `RingBuffer`)
 and redesigning APIs to make allocation-free paths the default.

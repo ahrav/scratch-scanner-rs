@@ -5,6 +5,10 @@
 //! across transforms and UTF-16 variants.
 
 use super::*;
+use crate::tiger_harness::{
+    check_oracle_covered, correctness_engine, scan_chunked_records, scan_one_chunk_records,
+    ChunkPattern, ChunkPlan,
+};
 use proptest::prelude::*;
 use std::collections::HashSet;
 use std::ops::Range;
@@ -1304,6 +1308,143 @@ proptest! {
         let chunked_keys = recs_to_keys(&chunked);
 
         prop_assert!(chunked_keys.is_superset(&full_keys));
+    }
+}
+
+// --------------------------
+// Tiger-style chunking nondeterminism harness
+// --------------------------
+
+proptest! {
+    // Keep this relatively small: each case runs multiple chunking plans.
+    #![proptest_config(ProptestConfig {
+        cases: 32,
+        .. ProptestConfig::default()
+    })]
+
+    #[test]
+    fn prop_tiger_chunk_plans_cover_oracle(
+        case in input_case_strategy(),
+        seed in any::<u64>(),
+    ) {
+        let engine = correctness_engine();
+        let oracle = scan_one_chunk_records(&engine, &case.buf);
+
+        // A small set of "interesting" sizes that tends to shake out edge cases.
+        const SIZES: &[usize] = &[
+            1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 255, 256,
+        ];
+
+        let pick = |shift: u32| -> usize { SIZES[((seed >> shift) as usize) % SIZES.len()] };
+
+        let s0 = pick(0);
+        let s1 = pick(8);
+        let s2 = pick(16);
+        let s3 = pick(24);
+
+        // Force at least one plan where the chunk size exceeds required overlap.
+        // Otherwise very small chunks can overlap the whole previous chunk, which
+        // is correct but less stressful.
+        let overlap = engine.required_overlap();
+        let big = overlap.saturating_add(1).saturating_add(seed as usize % 512);
+
+        // Shift boundaries by making the first chunk a different size.
+        let first_shift = 1 + ((seed >> 32) as usize % 64);
+
+        let plans: Vec<ChunkPlan> = vec![
+            ChunkPlan::fixed(s0),
+            ChunkPlan::fixed_shifted(s0, first_shift),
+            ChunkPlan::alternating(s1, s2),
+            ChunkPlan::random_range(seed, 1, s3.max(1)).with_first_chunk(first_shift),
+            ChunkPlan {
+                pattern: ChunkPattern::Sequence(vec![1, s0, 2, s1, 3, s2, 5, s3]),
+                seed: 0,
+                first_chunk_len: None,
+            },
+            ChunkPlan::fixed(big).with_first_chunk(first_shift),
+        ];
+
+        for plan in plans {
+            let plan_dbg = format!("{plan:?}");
+            let chunked = scan_chunked_records(&engine, &case.buf, plan);
+            if let Err(msg) = check_oracle_covered(&engine, &oracle, &chunked) {
+                prop_assert!(false, "plan={}: {}", plan_dbg, msg);
+            }
+        }
+    }
+}
+
+proptest! {
+    // Focused boundary-alignment property: ensure a secret instance that
+    // straddles a chunk boundary is still reported.
+    #![proptest_config(ProptestConfig {
+        cases: 32,
+        .. ProptestConfig::default()
+    })]
+
+    #[test]
+    fn prop_tiger_boundary_crossing_not_dropped(
+        token_case in token_strategy(),
+        base in base_encoding_strategy(),
+        chain in transform_chain_strategy(),
+        seed in any::<u64>(),
+    ) {
+        let engine = correctness_engine();
+        let overlap = engine.required_overlap();
+
+        // Build an encoded secret instance with safe surrounding bytes so
+        // word-boundary + delimiter validators are more likely to pass.
+        let mut token = token_case.token;
+        if requires_trailing_delimiter(token_case.rule_name) {
+            token.push(b' ');
+        }
+
+        let encoded = apply_encoding(&token, base, chain);
+        prop_assume!(encoded.len() >= 2);
+
+        // Choose a chunk size > overlap so we are testing the contract
+        // "overlap is sufficient", not the degenerate case where overlap equals
+        // the whole previous chunk.
+        let chunk_size = overlap.saturating_add(1).saturating_add(seed as usize % 256);
+
+        let k_max = overlap.min(encoded.len() - 1);
+        prop_assume!(k_max >= 1);
+
+        // Try a handful of k alignments that hit:
+        // - base64 quanta boundaries (mod 4)
+        // - url-percent triplets (mod 3)
+        // - utf16 odd/even boundaries (mod 2)
+        let ks = [1usize, 2, 3, 4, 7, 8, 15];
+
+        for &k in ks.iter() {
+            if k > k_max {
+                continue;
+            }
+
+            // Place the token so that it starts `k` bytes before the boundary at
+            // `chunk_size`. That makes the token start within the overlap prefix
+            // of chunk 2, and finish in its payload.
+            let start = chunk_size - k;
+
+            let mut buf = vec![b'A'; start];
+            // Force a non-word byte right before the secret; this satisfies rules with
+            // require_word_boundary_before=true more often than random bytes.
+            if start > 0 {
+                buf[start - 1] = b' ';
+            }
+
+            buf.extend_from_slice(&encoded);
+            buf.push(b' ');
+            buf.extend_from_slice(b"ZZZ");
+
+            let oracle = scan_one_chunk_records(&engine, &buf);
+            prop_assume!(!oracle.is_empty());
+
+            let chunked = scan_chunked_records(&engine, &buf, ChunkPlan::fixed(chunk_size));
+            if let Err(msg) = check_oracle_covered(&engine, &oracle, &chunked) {
+                prop_assert!(false, "chunk_size={} k={}: {}", chunk_size, k, msg);
+            }
+        }
     }
 }
 
