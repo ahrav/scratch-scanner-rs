@@ -1,8 +1,12 @@
 #![allow(dead_code)]
 //! Single-threaded staged pipeline for scanning file trees.
 //!
-//! Stages are executed in a tight suggest/pump loop using fixed-capacity rings
-//! to enforce backpressure and keep memory usage bounded:
+//! Why a staged pipeline in a single thread?
+//! - It makes backpressure explicit (rings are fixed-capacity).
+//! - It keeps memory usage bounded and easy to reason about.
+//! - It cleanly separates IO, scanning, and output without allocations.
+//!
+//! Stages are executed in a tight suggest/pump loop using fixed-capacity rings:
 //! Walker -> Reader -> Scanner -> Output.
 
 use crate::stdx::RingBuffer;
@@ -73,6 +77,10 @@ pub struct PipelineStats {
 }
 
 /// Simple single-producer, single-consumer ring wrapper.
+///
+/// We keep the pipeline single-threaded, but the SPSC abstraction still helps:
+/// - It makes backpressure explicit (capacity is a hard bound).
+/// - It separates stage responsibilities cleanly without allocation.
 struct SpscRing<T, const N: usize> {
     ring: RingBuffer<T, N>,
 }
@@ -212,6 +220,10 @@ impl Walker {
 }
 
 /// Stateful reader for a single file, preserving overlap across chunks.
+///
+/// The overlap is sized by `Engine::required_overlap()` so any anchor window
+/// (including UTF-16 and two-phase expansion) can straddle chunk boundaries
+/// without missed matches.
 struct FileReader {
     file_id: FileId,
     file: File,
@@ -409,6 +421,8 @@ impl ScanStage {
         let mut progressed = false;
 
         if self.has_pending() {
+            // Backpressure: if output is full, we keep draining pending findings
+            // before scanning another chunk. This prevents unbounded buffering.
             return self.flush_pending(out_ring);
         }
 
@@ -546,6 +560,9 @@ impl<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize>
             }
 
             if !progressed {
+                // No stage made progress and we're not done: this indicates a
+                // logic bug (e.g., a ring is full/empty deadlock). Fail fast so
+                // it is visible rather than silently spinning.
                 return Err(io::Error::other("pipeline stalled"));
             }
         }

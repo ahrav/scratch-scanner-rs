@@ -1,4 +1,9 @@
 //! Fixed-capacity dedupe sets with O(1) reset via generation counters.
+//!
+//! The key trick is "epoch tagging": each slot stores a generation number
+//! indicating when it was last written. Reset is just `cur += 1`, so the table
+//! becomes logically empty without clearing memory. On rare wraparound, we pay
+//! a full clear once to re-establish the invariant.
 
 /// Fixed-capacity hash set for deduplication (64-bit keys).
 ///
@@ -6,6 +11,9 @@
 /// - Reset is O(1) by advancing a generation counter.
 /// - Insert returns `true` on first insertion, `false` for duplicates.
 /// - When the table is full, insert returns `true` for new keys (best-effort dedupe).
+///
+/// This "best-effort when full" behavior is intentional for dedupe: it keeps
+/// the scanner moving under load without panicking or allocating.
 pub struct FixedSet64 {
     keys: Vec<u64>,
     gen: Vec<u32>,
@@ -54,7 +62,8 @@ impl FixedSet64 {
 /// Fixed-capacity hash set for deduplication (128-bit keys).
 ///
 /// Same design as [`FixedSet64`] but with 128-bit keys for collision-resistant
-/// hashes. Uses upper 64 bits for slot selection via linear probing.
+/// hashes. We use the upper 64 bits for initial slot selection to better spread
+/// values when the lower bits have patterns (common with some hash functions).
 pub struct FixedSet128 {
     keys: Vec<u128>,
     gen: Vec<u32>,

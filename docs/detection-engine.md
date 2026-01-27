@@ -179,6 +179,21 @@ for rm in rule.re.find_iter(&decoded) {
 }
 ```
 
+## Transform Gating (URL/Base64)
+
+After raw/UTF-16 scanning, the engine may generate derived buffers by decoding
+URL-percent or Base64 spans. These transforms are expensive, so they are gated:
+
+- **Decoded-space gate**: stream-decode and check for any anchor in the decoded
+  bytes. If no anchor is found, the transform is skipped. This is conservative
+  and avoids a full decode when the span is irrelevant.
+- **Base64 pre-gate (encoded-space)**: Base64 uses an additional, cheaper prefilter
+  that runs on the encoded bytes. It uses YARA-style base64 permutations of the
+  anchors to cheaply reject spans that cannot possibly decode to an anchor. The
+  decoded-space gate still runs afterward to preserve correctness.
+
+See `docs/transform-chain.md` for diagrams and the gating sequence.
+
 ## Tuning Parameters
 
 | Parameter | Default | Purpose |

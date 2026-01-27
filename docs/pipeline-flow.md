@@ -155,3 +155,18 @@ PIPE_POOL_CAP = PIPE_CHUNK_RING_CAP + 8
 ```
 
 The pool is sized to allow the chunk ring to be full plus a small headroom for in-flight reads.
+
+## Design Rationale
+
+The pipeline is intentionally staged and bounded, even though it runs in a
+single thread:
+
+- **Explicit backpressure**: fixed-capacity rings make it obvious when a stage
+  is producing faster than the next stage can consume.
+- **Deterministic memory**: the ring sizes and buffer pool define a hard ceiling
+  on in-flight data. This makes memory usage predictable for large repos.
+- **Clear ownership**: chunks own their buffers via `BufferHandle`, and drop
+  returns them to the pool. This keeps lifetimes and reuse unambiguous.
+
+These choices trade some peak throughput for debuggability and predictable
+resource usage, which matters for a scanner that may run on arbitrary inputs.

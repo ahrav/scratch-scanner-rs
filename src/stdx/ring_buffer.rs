@@ -16,9 +16,14 @@ fn index(i: u32) -> usize {
 
 /// Fixed-capacity ring buffer backed by stack-allocated storage.
 ///
-/// Values are stored in-place using `MaybeUninit` so no heap allocation is
-/// required. Capacity is a const generic known at compile time; insertion past
-/// capacity is a logic error unless handled via `push_back`.
+/// Design intent:
+/// - Explicit, compile-time capacity so backpressure is deterministic.
+/// - Zero heap allocations in the hot path (storage is `[MaybeUninit<T>; N]`).
+/// - Simple head/len bookkeeping so operations are branch-light and predictable.
+///
+/// This is a single-producer/single-consumer style queue in the pipeline, but
+/// the implementation itself is not synchronized; it relies on single-threaded
+/// usage. Insertion past capacity is a logic error unless handled via `push_back`.
 pub struct RingBuffer<T, const N: usize> {
     buf: [MaybeUninit<T>; N],
     head: u32,

@@ -224,6 +224,9 @@ impl<T> ScratchVec<T> {
         let size = cap
             .checked_mul(elem_size)
             .ok_or(ScratchMemoryError::InvalidLayout)?;
+        // Page alignment keeps allocations predictable and makes it safe to
+        // reuse scratch buffers for SIMD-friendly workloads without worrying
+        // about alignment faults.
         let align = ScratchMemory::PAGE_SIZE_MIN.max(align_of::<T>());
         let layout =
             Layout::from_size_align(size, align).map_err(|_| ScratchMemoryError::InvalidLayout)?;

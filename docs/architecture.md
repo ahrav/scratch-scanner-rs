@@ -49,6 +49,8 @@ Key details:
   smaller seed window, then expand to the full window.
 - Transform decoding is gated by anchor checks in decoded output to avoid
   expensive full decodes when no anchors exist.
+- Base64 adds an **encoded-space pre-gate** (YARA-style permutations) so spans
+  that cannot possibly decode to an anchor are skipped before decoding.
 - Budgets cap recursion depth, decoded bytes, and work items to prevent DoS.
 
 ## Core Data Structures

@@ -102,3 +102,13 @@ graph TB
 4. **Scanner**: Runs Engine on each chunk, produces FindingRecs
 5. **Output**: Formats and writes findings to stdout
 6. **Memory**: Buffers flow through pool acquire/release lifecycle
+
+## Design Principles
+
+- **Anchor-first**: anchors keep regex work bounded to likely windows.
+- **Deterministic memory**: fixed-capacity pools and rings make memory usage
+  explicit and predictable.
+- **Streaming decode**: transforms decode incrementally with budgets, so a
+  single file cannot blow up CPU or memory.
+- **Correctness over cleverness**: gates may allow false positives, but they
+  never skip possible true matches; correctness is preserved by design.

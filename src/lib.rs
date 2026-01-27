@@ -5,6 +5,7 @@
 //! - Anchor-based windowing (Aho-Corasick) to limit regex work.
 //! - Optional two-phase confirmation for noisy rules.
 //! - Transform decoding (URL percent, Base64) with streaming gates and budgets.
+//! - Base64 encoded-space pre-gate (YARA-style) to skip wasteful decodes.
 //! - Fixed-capacity scratch buffers to avoid per-chunk allocation churn.
 //!
 //! High-level flow (single chunk):
@@ -24,6 +25,7 @@ pub mod pool;
 pub mod regex2anchor;
 pub mod scratch_memory;
 pub mod stdx;
+pub mod b64_yara_gate;
 #[cfg(test)]
 pub mod test_utils;
 pub mod util;
@@ -448,8 +450,13 @@ const _: () = {
 };
 
 /// Shared pool state with interior mutability for allocation-free chunk buffers.
+///
+/// This is intentionally single-threaded: we use `Rc` + `Cell` + `UnsafeCell`
+/// for zero-overhead access. If/when the pipeline becomes multi-threaded, this
+/// must be replaced with a thread-safe pool or per-thread pools.
 struct BufferPoolInner {
     pool: UnsafeCell<NodePoolType<BUFFER_LEN_MAX, BUFFER_ALIGN>>,
+    // Fast-path availability check to avoid touching the bitset on empty pools.
     available: Cell<u32>,
     capacity: u32,
 }
@@ -553,7 +560,12 @@ impl Drop for BufferHandle {
 
 /// Reads a file in fixed-size chunks, preserving overlap between chunks.
 ///
-/// Overlap ensures rules with windows that cross chunk boundaries still match.
+/// The overlap allows anchor windows to extend across chunk boundaries without
+/// missing matches. Each emitted `Chunk` includes:
+/// - `prefix_len`: bytes copied from the previous chunk tail
+/// - `base_offset`: file offset where the chunk *starts* in the original file
+///
+/// This makes span reporting consistent even when a match begins in the overlap.
 pub fn read_file_chunks(
     file_id: FileId,
     path: &Path,
@@ -869,6 +881,13 @@ impl SpanU32 {
 ///
 /// When hit counts exceed configured limits, this switches to a single merged
 /// window to cap memory growth.
+/// Accumulates raw anchor hit windows for a single (rule, variant).
+///
+/// This starts as a simple append-only list of windows. If the number of hits
+/// exceeds a configured cap, it switches to a single "coalesced" window that
+/// covers the union of all hits seen so far. That fallback is deliberately
+/// conservative: it may make the window larger than necessary, but it prevents
+/// unbounded memory growth and guarantees we still scan any true matches.
 struct HitAccumulator {
     windows: ScratchVec<SpanU32>,
     coalesced: Option<SpanU32>,
@@ -886,6 +905,8 @@ impl HitAccumulator {
     fn push(&mut self, start: usize, end: usize, max_hits: usize) {
         let r = SpanU32::new(start, end);
         if let Some(c) = self.coalesced.as_mut() {
+            // Once coalesced, we only widen the single window. This ensures
+            // correctness (superset) while bounding per-rule memory.
             c.start = c.start.min(r.start);
             c.end = c.end.max(r.end);
             return;
@@ -897,6 +918,7 @@ impl HitAccumulator {
         }
 
         // Switch to coalesced fallback once we exceed the hit cap.
+        // This trades precision for deterministic memory usage.
         let mut c = self.windows[0];
         let win_len = self.windows.len();
         for i in 1..win_len {
@@ -938,6 +960,9 @@ impl HitAccumulator {
 ///
 /// `tail` preserves a small suffix of the prior chunk, and `scratch` holds the
 /// current decode window so we can test anchors without full decoding.
+///
+/// The tail length is `max_anchor_pat_len - 1`, which is the minimum overlap
+/// required to avoid missing an anchor that straddles two decode chunks.
 struct GateScratch {
     tail: Vec<u8>,
     scratch: Vec<u8>,
@@ -957,6 +982,12 @@ struct StepNode {
 }
 
 /// Arena for decode steps so findings store compact `StepId` references.
+///
+/// Why an arena?
+/// - Decoding is recursive; each derived buffer adds provenance.
+/// - Storing full `Vec<DecodeStep>` per finding would allocate and clone heavily.
+/// - A parent-linked arena lets us store provenance once and share it across
+///   findings, with O(length) reconstruction only when materializing output.
 ///
 /// This is append-only and reset between scans. `StepId` values are only valid
 /// while this arena is alive and not reset.
@@ -991,9 +1022,13 @@ impl StepArena {
 
 /// Contiguous decoded-byte slab for derived buffers.
 ///
-/// Appends decoded spans and returns ranges, enabling zero-copy work items.
-/// Capacity is fixed to the global decode budget, so ranges remain valid
-/// until the slab is reset.
+/// This is a monotonic append-only buffer:
+/// - Decoders append into the slab and receive a `Range<usize>` back.
+/// - Work items carry those ranges instead of owning new allocations.
+/// - The slab never reallocates (capacity == global decode budget), so the
+///   returned ranges remain valid for the lifetime of a scan.
+///
+/// The slab is cleared between scans, which invalidates all ranges at once.
 struct DecodeSlab {
     buf: Vec<u8>,
     limit: usize,
@@ -1311,7 +1346,13 @@ pub struct Engine {
     ac_anchors: AhoCorasick,
     pat_targets: Vec<Target>,
     pat_offsets: Vec<u32>,
-    // Base64 pre-decode gate (YARA-style permutations over anchors).
+    // Base64 pre-decode gate built from anchor patterns.
+    //
+    // This runs in *encoded space* and is deliberately conservative:
+    // if a decoded buffer contains an anchor, at least one YARA-style base64
+    // permutation of that anchor must appear in the encoded stream. We still
+    // perform the decoded-space gate for correctness; this pre-gate exists
+    // purely to skip wasteful decodes when no anchor could possibly appear.
     b64_gate: Option<Base64YaraGate>,
 
     // Residue gates for rules without anchors (pass 2).
@@ -1456,6 +1497,13 @@ impl Engine {
         let (anchor_patterns, pat_targets, pat_offsets) = map_to_patterns(pat_map);
         let max_anchor_pat_len = anchor_patterns.iter().map(|p| p.len()).max().unwrap_or(0);
 
+        // Build the base64 pre-gate from the same anchor universe as the decoded gate:
+        // raw anchors plus UTF-16 variants. This keeps the pre-gate *sound* with
+        // respect to anchor presence in decoded bytes, while allowing false positives.
+        //
+        // Padding/whitespace policy mirrors our span detection/decoder behavior:
+        // - Stop at '=' (treat padding as end-of-span)
+        // - Ignore RFC4648 whitespace (space is only allowed if the span finder allows it)
         let b64_gate = if anchor_patterns.is_empty() {
             None
         } else {
@@ -1531,6 +1579,14 @@ impl Engine {
         base_offset: u64,
         scratch: &mut ScanScratch,
     ) {
+        // High-level flow:
+        // 1) Scan anchors in the current buffer and build windows.
+        // 2) Run regex validation inside those windows (raw + UTF-16 variants).
+        // 3) Optionally decode transforms into derived buffers (gated + deduped),
+        //    enqueueing them into a work queue for recursive scanning.
+        //
+        // Budgets (decode bytes, work items, depth) are enforced on the fly so
+        // no single input can force unbounded work.
         scratch.reset_for_scan(self);
         scratch.work_q.push(WorkItem {
             buf: BufRef::Root,
@@ -1540,6 +1596,8 @@ impl Engine {
         });
 
         while scratch.work_head < scratch.work_q.len() {
+            // Work-queue traversal avoids recursion and makes transform depth
+            // and total work item budgets explicit and enforceable.
             if scratch.total_decode_output_bytes >= self.tuning.max_total_decode_output_bytes {
                 break;
             }
@@ -1612,6 +1670,10 @@ impl Engine {
 
                     let enc = &cur_buf[enc_span.clone()];
                     if tc.id == TransformId::Base64 {
+                        // Base64-only prefilter: cheap encoded-space gate.
+                        // This is only used when the decoded gate is enabled, and it never
+                        // replaces the decoded check. It exists to avoid paying decode cost
+                        // when a span cannot possibly contain any anchor after decoding.
                         #[cfg(feature = "b64-stats")]
                         {
                             scratch.base64_stats.spans =
@@ -1829,6 +1891,9 @@ impl Engine {
             return;
         }
 
+        // Only process (rule, variant) pairs that were actually touched by an
+        // anchor hit in this buffer. This avoids O(rules * variants) work when
+        // nothing matched, which is critical once rule counts grow.
         const VARIANTS: [Variant; 3] = [Variant::Raw, Variant::Utf16Le, Variant::Utf16Be];
         scratch.touched_pairs.clear();
         for pair in scratch.touched.iter_set() {
@@ -2074,6 +2139,11 @@ impl Engine {
         let mut truncated = false;
         let mut hit = false;
 
+        // Decode once while checking for anchors. If no anchors appear in the decoded
+        // stream, the slab append is rolled back and the transform is skipped.
+        //
+        // We keep a small tail window so anchors that straddle decode chunk boundaries
+        // are still detected without re-decoding or buffering the entire output.
         #[cfg(feature = "b64-stats")]
         if is_b64 {
             scratch.base64_stats.decode_attempts =
@@ -2258,6 +2328,11 @@ fn map_to_patterns(map: AHashMap<Vec<u8>, Vec<Target>>) -> (Vec<Vec<u8>>, Vec<Ta
 // --------------------------
 
 // Assumes `ranges` is already sorted by start.
+//
+// The `gap` parameter allows "soft merging": ranges that are within `gap` bytes
+// are merged into a single window. This intentionally widens windows to reduce
+// the count of regex runs, trading a small amount of extra scanning for fewer
+// window boundaries.
 fn merge_ranges_with_gap_sorted(ranges: &mut ScratchVec<SpanU32>, gap: u32) {
     if ranges.len() <= 1 {
         return;
@@ -2284,6 +2359,11 @@ fn merge_ranges_with_gap_sorted(ranges: &mut ScratchVec<SpanU32>, gap: u32) {
 }
 
 // Assumes `ranges` is already sorted and preferably already merged with a small gap.
+//
+// This is a pressure valve for adversarial inputs that trigger too many anchor
+// hits. It increases the merge gap exponentially until the window count fits
+// within `max_windows`, and as a last resort collapses to one window. The result
+// is always a superset of the original windows, so correctness is preserved.
 fn coalesce_under_pressure_sorted(
     ranges: &mut ScratchVec<SpanU32>,
     hay_len: u32,
@@ -2501,7 +2581,10 @@ impl SpanSink for ScratchVec<SpanU32> {
 }
 
 // FIX: include unescaped prefix by scanning URL-ish runs, not starting at first '%'.
-// Requires at least one '%' (and optionally '+' if plus_to_space).
+//
+// We intentionally scan the entire URL-ish run so decoded output retains any
+// plain-text prefix (e.g., "token=" before "%3D"). We still require at least
+// one percent-escape (and optionally '+') to avoid decoding every plain word.
 fn find_url_spans(
     hay: &[u8],
     min_len: usize,
@@ -2660,7 +2743,13 @@ fn is_b64_or_ws(b: u8, allow_space: bool) -> bool {
 }
 
 // Simple span finder. It is permissive by design.
-// Tighten via min_len, max_spans_per_buffer, max_encoded_len, and budgets.
+//
+// Why permissive?
+// - We want to avoid false negatives at this stage.
+// - Tightening is handled by length caps, span limits, and decode gating.
+//
+// This keeps the span finder cheap and predictable, while later stages enforce
+// cost limits and correctness.
 fn find_base64_spans(
     hay: &[u8],
     min_chars: usize,
@@ -2722,6 +2811,12 @@ fn stream_decode_base64(
     input: &[u8],
     mut on_bytes: impl FnMut(&[u8]) -> ControlFlow<()>,
 ) -> Result<(), Base64DecodeError> {
+    // Streaming decoder that accepts both standard and URL-safe alphabets and
+    // ignores whitespace. It validates padding rules and allows an unpadded tail
+    // (2 or 3 bytes in the final quantum) because real-world data often omits '='.
+    //
+    // This is used for both actual decode and decoded-gate streaming, so we
+    // keep it branch-light and bounded in memory (fixed 1KB output buffer).
     fn flush_buf(
         out: &mut [u8],
         out_len: &mut usize,
@@ -2883,7 +2978,7 @@ fn transform_quick_trigger(tc: &TransformConfig, buf: &[u8]) -> bool {
             }
             false
         }
-        TransformId::Base64 => true, // span finder is the real filter
+        TransformId::Base64 => true, // span finder is the real filter; keep trigger cheap
     }
 }
 
@@ -2936,10 +3031,15 @@ fn decode_to_vec(tc: &TransformConfig, input: &[u8], max_out: usize) -> Result<V
 
 /// Collision-resistant 128-bit hash using AEGIS-128L.
 ///
-/// AEGIS-128L is a hardware-accelerated authenticated cipher (AES-NI).
-/// With a fixed zero key and nonce, it becomes a fast, collision-resistant
-/// hash function suitable for deduplication. We encrypt an empty message
-/// and pass `bytes` as associated data to get a 128-bit authentication tag.
+/// Design intent:
+/// - We need a *fast* but *low-collision* fingerprint for decoded buffers.
+/// - SipHash is strong but slower; non-crypto hashes are fast but risky.
+/// - AEGIS-128L uses AES-NI on modern CPUs and yields a 128-bit MAC.
+///
+/// By fixing key/nonce to zero and authenticating `bytes` as associated data,
+/// we get a deterministic 128-bit tag that behaves like a PRF. This is not a
+/// general-purpose cryptographic hash, but it is collision-resistant enough
+/// for in-process deduplication and avoids an extra dependency.
 fn hash128(bytes: &[u8]) -> u128 {
     use aegis::aegis128l::Aegis128L;
     let key = [0u8; 16];

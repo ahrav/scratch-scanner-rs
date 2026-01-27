@@ -35,8 +35,10 @@ flowchart TB
     end
 
     subgraph Gating["Gate Policy"]
+        CheckB64{{"transform == Base64?"}}
+        PreGate["b64_yara_gate.hits()<br/>(YARA-style encoded prefilter)"]
         Gate{{"gate == AnchorsInDecoded?"}}
-        StreamGate["gate_stream_contains_anchor()"]
+        StreamGate["decoded anchor gate<br/>stream_decode + AC"]
         ACMatch["ac_anchors.is_match()"]
     end
 
@@ -68,7 +70,11 @@ flowchart TB
     URL --> Spans
     B64 --> Spans
 
-    Spans --> Gate
+    Spans --> CheckB64
+    CheckB64 --> |"yes"| PreGate
+    CheckB64 --> |"no"| Gate
+    PreGate --> |"pass"| Gate
+    PreGate --> |"fail"| ForTransform
     Gate --> |"yes"| StreamGate
     StreamGate --> ACMatch
     ACMatch --> |"no anchor"| ForTransform
@@ -156,19 +162,46 @@ graph LR
 - Handles both standard and URL-safe alphabets
 - Minimum length: 32 characters
 
+### Base64 Pre-Decode Gate (YARA-style)
+
+Base64 spans can be long, and decoding them just to discover "no anchor present"
+is expensive. To avoid that, Base64 transforms add a **pre-gate** that runs on
+the *encoded* bytes before any decoding.
+
+**Core idea**: a decoded anchor can appear at any of three byte offsets inside a
+base64 quantum. YARA documents this by generating three encoded permutations
+and stripping the unstable prefix/suffix characters. We do the same and then
+search the encoded stream with Aho-Corasick.
+
+**Why this is safe**:
+- It is **conservative**: if decoded bytes contain an anchor, at least one of
+  the derived base64 permutations must appear in the encoded bytes.
+- False positives are fine because the decoded gate still confirms anchors
+  before accepting the transform.
+
+**Normalization rules**:
+- Ignore RFC4648 whitespace (space is only ignored if the span finder allows it).
+- Treat URL-safe `-`/`_` as `+`/`/`.
+- Stop scanning at `=` padding to avoid cross-span false matches.
+
 ## Gate Policy: AnchorsInDecoded
 
-The gate policy avoids expensive full decodes by streaming and checking for anchors:
+The decoded gate avoids expensive full decodes by streaming and checking for anchors.
+For Base64 spans, there is **also** an encoded-space pre-gate that runs first:
 
 ```mermaid
 sequenceDiagram
     participant Transform as Transform
-    participant Gate as gate_stream_contains_anchor()
+    participant Pre as b64_yara_gate (encoded prefilter)
+    participant Gate as decoded gate
     participant Stream as stream_decode()
     participant AC as AhoCorasick
     participant Budget as total_decode_output_bytes
 
-    Transform->>Gate: Check span
+    Note over Transform,Pre: Base64 only
+    Transform->>Pre: Encoded pre-gate
+    Pre-->>Transform: pass/fail
+    Transform->>Gate: Decoded gate (if enabled)
     Gate->>Stream: Start streaming decode
 
     loop Each chunk

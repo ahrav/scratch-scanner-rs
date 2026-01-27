@@ -146,6 +146,20 @@ DynamicBitSet (136 bits = 3 u64 words):
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+## Rationale
+
+The pool is deliberately large and aligned:
+
+- **Fixed allocation**: all buffers are allocated up front so scanning never
+  allocates on the hot path. This avoids allocator jitter and makes worst-case
+  memory consumption explicit.
+- **Alignment**: 4KB alignment keeps buffers page-aligned, which improves cache
+  behavior and keeps the door open for direct I/O or SIMD-friendly access.
+- **Predictable reclamation**: `BufferHandle` is RAII; dropping the chunk is the
+  only way to return a buffer. This makes lifecycle bugs easy to spot.
+
+If you need a smaller footprint, see `docs/perf.md` for sizing trade-offs.
+
 ## Constants
 
 ```rust
@@ -198,6 +212,18 @@ impl Chunk {
     }
 }
 ```
+
+## DecodeSlab and Scratch Buffers
+
+Scanning derived buffers (URL/Base64 decode) uses a fixed-capacity slab:
+
+- **DecodeSlab** is append-only and sized to the global decode budget. It never
+  reallocates, so ranges returned to work items stay valid for the scan.
+- **ScanScratch** owns the slab and all other hot-path buffers; it is reused
+  across chunks to avoid per-chunk allocations.
+
+This is the core "no allocations during scan" mechanism: the scanner either
+fits within the configured limits or it skips work.
 
 ## Overlap Preservation
 
