@@ -247,7 +247,7 @@ pub enum ValidatorKind {
         tail_len: u16,
         /// Character class used for each tail byte.
         tail: TailCharset,
-        /// Require an ASCII `\b` word boundary before the prefix.
+        /// Require a `regex::bytes` word boundary (`\b`) before the prefix.
         require_word_boundary_before: bool,
         /// Optional delimiter check after the tail.
         delim_after: DelimAfter,
@@ -265,7 +265,7 @@ pub enum ValidatorKind {
         max_tail: u16,
         /// Character class used for each tail byte.
         tail: TailCharset,
-        /// Require an ASCII `\b` word boundary before the prefix.
+        /// Require a `regex::bytes` word boundary (`\b`) before the prefix.
         require_word_boundary_before: bool,
         /// Optional delimiter check after the tail.
         delim_after: DelimAfter,

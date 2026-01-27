@@ -38,8 +38,9 @@ mod runtime;
 #[cfg(feature = "b64-stats")]
 pub use api::Base64DecodeStats;
 pub use api::{
-    AnchorPolicy, DecodeStep, EntropySpec, FileId, Finding, FindingRec, Gate, RuleSpec, StepId,
-    TransformConfig, TransformId, TransformMode, Tuning, TwoPhaseSpec, Utf16Endianness,
+    AnchorPolicy, DecodeStep, DelimAfter, EntropySpec, FileId, Finding, FindingRec, Gate, RuleSpec,
+    StepId, TailCharset, TransformConfig, TransformId, TransformMode, Tuning, TwoPhaseSpec,
+    Utf16Endianness, ValidatorKind,
 };
 
 pub use demo::{demo_engine, demo_engine_with_anchor_mode, AnchorMode};
