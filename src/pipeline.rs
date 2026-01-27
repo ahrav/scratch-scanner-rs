@@ -557,6 +557,17 @@ pub fn scan_path_default(path: &Path, engine: Arc<Engine>) -> io::Result<Pipelin
     pipeline.scan_path(path)
 }
 
+fn dev_inode(meta: &std::fs::Metadata) -> (u64, u64) {
+    #[cfg(unix)]
+    {
+        (meta.dev(), meta.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        (0, 0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,16 +652,5 @@ mod tests {
         assert!(stats.errors >= stats.walk_errors + stats.open_errors);
 
         Ok(())
-    }
-}
-
-fn dev_inode(meta: &std::fs::Metadata) -> (u64, u64) {
-    #[cfg(unix)]
-    {
-        (meta.dev(), meta.ino())
-    }
-    #[cfg(not(unix))]
-    {
-        (0, 0)
     }
 }

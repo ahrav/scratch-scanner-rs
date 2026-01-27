@@ -1510,12 +1510,6 @@ impl Engine {
 
                     let enc = &cur_buf[enc_span.clone()];
 
-                    if tc.gate == Gate::AnchorsInDecoded
-                        && !self.gate_stream_contains_anchor(tc, enc, scratch)
-                    {
-                        continue;
-                    }
-
                     let remaining = self
                         .tuning
                         .max_total_decode_output_bytes
@@ -1525,15 +1519,22 @@ impl Engine {
                     }
                     let max_out = tc.max_decoded_bytes.min(remaining);
 
-                    let decoded_range = match scratch.slab.append_stream_decode(
-                        tc,
-                        enc,
-                        max_out,
-                        &mut scratch.total_decode_output_bytes,
-                        self.tuning.max_total_decode_output_bytes,
-                    ) {
-                        Ok(r) => r,
-                        Err(_) => continue,
+                    let decoded_range = if tc.gate == Gate::AnchorsInDecoded {
+                        match self.decode_stream_gated_into_slab(tc, enc, max_out, scratch) {
+                            Some(r) => r,
+                            None => continue,
+                        }
+                    } else {
+                        match scratch.slab.append_stream_decode(
+                            tc,
+                            enc,
+                            max_out,
+                            &mut scratch.total_decode_output_bytes,
+                            self.tuning.max_total_decode_output_bytes,
+                        ) {
+                            Ok(r) => r,
+                            Err(_) => continue,
+                        }
                     };
 
                     let decoded = scratch.slab.slice(decoded_range.clone());
@@ -1906,47 +1907,57 @@ impl Engine {
         }
     }
 
-    fn gate_stream_contains_anchor(
+    fn decode_stream_gated_into_slab(
         &self,
         tc: &TransformConfig,
         encoded: &[u8],
+        max_out: usize,
         scratch: &mut ScanScratch,
-    ) -> bool {
+    ) -> Option<Range<usize>> {
+        if max_out == 0 {
+            return None;
+        }
+
         // Keep enough bytes to detect anchors that straddle decode chunk boundaries.
         let tail_keep = self.max_anchor_pat_len.saturating_sub(1);
         scratch.gate.reset();
 
+        let start_len = scratch.slab.buf.len();
         let mut local_out = 0usize;
-        let local_limit = tc.max_decoded_bytes.min(
-            self.tuning
-                .max_total_decode_output_bytes
-                .saturating_sub(scratch.total_decode_output_bytes),
-        );
-
-        if local_limit == 0 {
-            return false;
-        }
-
+        let mut truncated = false;
         let mut hit = false;
 
-        let _ = stream_decode(tc, encoded, |chunk| {
-            // Budgeting: count gate decoded output bytes too.
-            if local_out.saturating_add(chunk.len()) > local_limit {
+        let res = stream_decode(tc, encoded, |chunk| {
+            if local_out.saturating_add(chunk.len()) > max_out {
+                truncated = true;
                 return ControlFlow::Break(());
             }
+            if scratch
+                .total_decode_output_bytes
+                .saturating_add(chunk.len())
+                > self.tuning.max_total_decode_output_bytes
+            {
+                truncated = true;
+                return ControlFlow::Break(());
+            }
+            if scratch.slab.buf.len().saturating_add(chunk.len()) > scratch.slab.limit {
+                truncated = true;
+                return ControlFlow::Break(());
+            }
+
+            scratch.slab.buf.extend_from_slice(chunk);
+            local_out = local_out.saturating_add(chunk.len());
             scratch.total_decode_output_bytes = scratch
                 .total_decode_output_bytes
                 .saturating_add(chunk.len());
-            local_out = local_out.saturating_add(chunk.len());
 
             // Sliding decoded window: tail (prev chunk) + current chunk.
             scratch.gate.scratch.clear();
             scratch.gate.scratch.extend_from_slice(&scratch.gate.tail);
             scratch.gate.scratch.extend_from_slice(chunk);
 
-            if self.ac_anchors.is_match(&scratch.gate.scratch) {
+            if !hit && self.ac_anchors.is_match(&scratch.gate.scratch) {
                 hit = true;
-                return ControlFlow::Break(());
             }
 
             if tail_keep > 0 {
@@ -1961,7 +1972,17 @@ impl Engine {
             ControlFlow::Continue(())
         });
 
-        hit
+        if res.is_err() || truncated || local_out == 0 || local_out > max_out {
+            scratch.slab.buf.truncate(start_len);
+            return None;
+        }
+
+        if !hit {
+            scratch.slab.buf.truncate(start_len);
+            return None;
+        }
+
+        Some(start_len..(start_len + local_out))
     }
 }
 
@@ -4247,8 +4268,8 @@ mod tests {
                     }
                     (None, None) => {
                         prop_assert_eq!(acc.windows.len(), ref_windows.len());
-                        for i in 0..ref_windows.len() {
-                            prop_assert_eq!(acc.windows[i], ref_windows[i]);
+                        for (i, expected) in ref_windows.iter().enumerate() {
+                            prop_assert_eq!(acc.windows[i], *expected);
                         }
                     }
                     _ => {
