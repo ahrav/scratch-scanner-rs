@@ -15,6 +15,9 @@ regex-syntax = "0.8"
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.6"
 
+[target.'cfg(all(target_os = "linux", not(any(target_arch = "x86", target_arch = "x86_64"))))'.dependencies]
+aegis = { version = "0.9", features = ["pure-rust"] }
+
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 aegis = { version = "0.9", features = ["pure-rust"] }
 
@@ -22,10 +25,25 @@ aegis = { version = "0.9", features = ["pure-rust"] }
 stdx-proptest = []
 kgram-gate = []
 b64-stats = []
+bench = []
 
 [dev-dependencies]
 base64 = "0.22"
 proptest = "1.4"
+criterion = "0.5"
+
+[[bench]]
+name = "scan"
+harness = false
+
+[[bench]]
+name = "structures"
+harness = false
+
+[[bench]]
+name = "hotspots"
+harness = false
+required-features = ["bench"]
 
 [profile.dev]
 opt-level = 1

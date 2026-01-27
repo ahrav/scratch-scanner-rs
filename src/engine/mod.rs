@@ -6,8 +6,8 @@ use crate::regex2anchor::{
 use crate::scratch_memory::ScratchVec;
 use crate::stdx::{DynamicBitSet, FixedSet128};
 use ahash::AHashMap;
-use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
-use memchr::memmem;
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder, AhoCorasickKind};
+use memchr::{memchr, memmem};
 use regex::bytes::Regex;
 use std::ops::{ControlFlow, Range};
 
@@ -860,10 +860,16 @@ pub struct Engine {
     // Log2 lookup table for entropy gating.
     entropy_log2: Vec<f32>,
 
-    // Anchors AC (raw + UTF16 variants), deduped patterns.
-    ac_anchors: AhoCorasick,
-    pat_targets: Vec<Target>,
-    pat_offsets: Vec<u32>,
+    // Anchors ACs split by variant, with per-AC pattern maps.
+    ac_anchors_raw: AhoCorasick,
+    ac_anchors_utf16le: Option<AhoCorasick>,
+    ac_anchors_utf16be: Option<AhoCorasick>,
+    pat_targets_raw: Vec<Target>,
+    pat_offsets_raw: Vec<u32>,
+    pat_targets_utf16le: Vec<Target>,
+    pat_offsets_utf16le: Vec<u32>,
+    pat_targets_utf16be: Vec<Target>,
+    pat_offsets_utf16be: Vec<u32>,
     // Base64 pre-decode gate built from anchor patterns.
     //
     // This runs in *encoded space* and is deliberately conservative:
@@ -931,7 +937,11 @@ impl Engine {
         let entropy_log2 = build_log2_table(max_entropy_len);
 
         // Build deduped anchor patterns: pattern -> targets
-        let mut pat_map: AHashMap<Vec<u8>, Vec<Target>> =
+        let mut pat_map_raw: AHashMap<Vec<u8>, Vec<Target>> =
+            AHashMap::with_capacity(rules.len().saturating_mul(3).max(16));
+        let mut pat_map_utf16le: AHashMap<Vec<u8>, Vec<Target>> =
+            AHashMap::with_capacity(rules.len().saturating_mul(3).max(16));
+        let mut pat_map_utf16be: AHashMap<Vec<u8>, Vec<Target>> =
             AHashMap::with_capacity(rules.len().saturating_mul(3).max(16));
         let mut residue_rules: Vec<(usize, ResidueGatePlan)> = Vec::with_capacity(rules.len());
         let mut unfilterable_rules: Vec<(usize, UnfilterableReason)> =
@@ -961,52 +971,56 @@ impl Engine {
                 }
             };
             let mut manual_used = false;
-            let mut add_manual = |pat_map: &mut AHashMap<Vec<u8>, Vec<Target>>| {
-                if !allow_manual {
-                    return;
-                }
-                if manual_used || r.anchors.is_empty() {
-                    return;
-                }
-                manual_used = true;
-                anchor_plan_stats.manual_rules = anchor_plan_stats.manual_rules.saturating_add(1);
-                for &a in r.anchors {
-                    let keyword_implied = keyword_implied_for_anchor(a);
-                    add_pat_raw(
-                        pat_map,
-                        a,
-                        Target::new(
-                            rid_u32,
-                            Variant::Raw,
-                            validator_match_start,
-                            keyword_implied,
-                        ),
-                    );
-                    add_pat_owned(
-                        pat_map,
-                        utf16le_bytes(a),
-                        Target::new(
-                            rid_u32,
-                            Variant::Utf16Le,
-                            validator_match_start,
-                            keyword_implied,
-                        ),
-                    );
-                    add_pat_owned(
-                        pat_map,
-                        utf16be_bytes(a),
-                        Target::new(
-                            rid_u32,
-                            Variant::Utf16Be,
-                            validator_match_start,
-                            keyword_implied,
-                        ),
-                    );
-                }
-            };
+            let mut add_manual =
+                |pat_map_raw: &mut AHashMap<Vec<u8>, Vec<Target>>,
+                 pat_map_utf16le: &mut AHashMap<Vec<u8>, Vec<Target>>,
+                 pat_map_utf16be: &mut AHashMap<Vec<u8>, Vec<Target>>| {
+                    if !allow_manual {
+                        return;
+                    }
+                    if manual_used || r.anchors.is_empty() {
+                        return;
+                    }
+                    manual_used = true;
+                    anchor_plan_stats.manual_rules =
+                        anchor_plan_stats.manual_rules.saturating_add(1);
+                    for &a in r.anchors {
+                        let keyword_implied = keyword_implied_for_anchor(a);
+                        add_pat_raw(
+                            pat_map_raw,
+                            a,
+                            Target::new(
+                                rid_u32,
+                                Variant::Raw,
+                                validator_match_start,
+                                keyword_implied,
+                            ),
+                        );
+                        add_pat_owned(
+                            pat_map_utf16le,
+                            utf16le_bytes(a),
+                            Target::new(
+                                rid_u32,
+                                Variant::Utf16Le,
+                                validator_match_start,
+                                keyword_implied,
+                            ),
+                        );
+                        add_pat_owned(
+                            pat_map_utf16be,
+                            utf16be_bytes(a),
+                            Target::new(
+                                rid_u32,
+                                Variant::Utf16Be,
+                                validator_match_start,
+                                keyword_implied,
+                            ),
+                        );
+                    }
+                };
 
             if !allow_derive {
-                add_manual(&mut pat_map);
+                add_manual(&mut pat_map_raw, &mut pat_map_utf16le, &mut pat_map_utf16be);
                 continue;
             }
 
@@ -1016,7 +1030,7 @@ impl Engine {
                     unfilterable_rules.push((rid, UnfilterableReason::UnsupportedRegexFeatures));
                     anchor_plan_stats.unfilterable_rules =
                         anchor_plan_stats.unfilterable_rules.saturating_add(1);
-                    add_manual(&mut pat_map);
+                    add_manual(&mut pat_map_raw, &mut pat_map_utf16le, &mut pat_map_utf16be);
                     continue;
                 }
             };
@@ -1028,17 +1042,17 @@ impl Engine {
                     for anchor in anchors {
                         let keyword_implied = keyword_implied_for_anchor(&anchor);
                         add_pat_raw(
-                            &mut pat_map,
+                            &mut pat_map_raw,
                             &anchor,
                             Target::new(rid_u32, Variant::Raw, false, keyword_implied),
                         );
                         add_pat_owned(
-                            &mut pat_map,
+                            &mut pat_map_utf16le,
                             utf16le_bytes(&anchor),
                             Target::new(rid_u32, Variant::Utf16Le, false, keyword_implied),
                         );
                         add_pat_owned(
-                            &mut pat_map,
+                            &mut pat_map_utf16be,
                             utf16be_bytes(&anchor),
                             Target::new(rid_u32, Variant::Utf16Be, false, keyword_implied),
                         );
@@ -1048,19 +1062,29 @@ impl Engine {
                     residue_rules.push((rid, gate));
                     anchor_plan_stats.residue_rules =
                         anchor_plan_stats.residue_rules.saturating_add(1);
-                    add_manual(&mut pat_map);
+                    add_manual(&mut pat_map_raw, &mut pat_map_utf16le, &mut pat_map_utf16be);
                 }
                 TriggerPlan::Unfilterable { reason } => {
                     unfilterable_rules.push((rid, reason));
                     anchor_plan_stats.unfilterable_rules =
                         anchor_plan_stats.unfilterable_rules.saturating_add(1);
-                    add_manual(&mut pat_map);
+                    add_manual(&mut pat_map_raw, &mut pat_map_utf16le, &mut pat_map_utf16be);
                 }
             }
         }
 
-        let (anchor_patterns, pat_targets, pat_offsets) = map_to_patterns(pat_map);
-        let max_anchor_pat_len = anchor_patterns.iter().map(|p| p.len()).max().unwrap_or(0);
+        let (anchor_patterns_raw, pat_targets_raw, pat_offsets_raw) = map_to_patterns(pat_map_raw);
+        let (anchor_patterns_utf16le, pat_targets_utf16le, pat_offsets_utf16le) =
+            map_to_patterns(pat_map_utf16le);
+        let (anchor_patterns_utf16be, pat_targets_utf16be, pat_offsets_utf16be) =
+            map_to_patterns(pat_map_utf16be);
+        let max_anchor_pat_len = anchor_patterns_raw
+            .iter()
+            .map(|p| p.len())
+            .chain(anchor_patterns_utf16le.iter().map(|p| p.len()))
+            .chain(anchor_patterns_utf16be.iter().map(|p| p.len()))
+            .max()
+            .unwrap_or(0);
 
         // Build the base64 pre-gate from the same anchor universe as the decoded gate:
         // raw anchors plus UTF-16 variants. This keeps the pre-gate *sound* with
@@ -1069,11 +1093,18 @@ impl Engine {
         // Padding/whitespace policy mirrors our span detection/decoder behavior:
         // - Stop at '=' (treat padding as end-of-span)
         // - Ignore RFC4648 whitespace (space is only allowed if the span finder allows it)
-        let b64_gate = if anchor_patterns.is_empty() {
+        let b64_gate = if anchor_patterns_raw.is_empty()
+            && anchor_patterns_utf16le.is_empty()
+            && anchor_patterns_utf16be.is_empty()
+        {
             None
         } else {
             Some(Base64YaraGate::build(
-                anchor_patterns.iter().map(|p| p.as_slice()),
+                anchor_patterns_raw
+                    .iter()
+                    .chain(anchor_patterns_utf16le.iter())
+                    .chain(anchor_patterns_utf16be.iter())
+                    .map(|p| p.as_slice()),
                 Base64YaraGateConfig {
                     min_pattern_len: 0,
                     padding_policy: PaddingPolicy::StopAndHalt,
@@ -1082,10 +1113,66 @@ impl Engine {
             ))
         };
 
-        let ac_anchors = AhoCorasickBuilder::new()
-            .prefilter(true)
-            .build(anchor_patterns.iter().map(|p| p.as_slice()))
-            .expect("build anchors AC");
+        let build_anchor_ac = |patterns: &[Vec<u8>], label: &'static str| {
+            let mut builder = AhoCorasickBuilder::new();
+            builder.prefilter(true);
+            if let Some(depth) = tuning.ac_dense_depth {
+                builder.dense_depth(depth);
+            }
+            if let Some(yes) = tuning.ac_byte_classes {
+                builder.byte_classes(yes);
+            }
+
+            match tuning.ac_kind {
+                AnchorAcKind::Auto => {
+                    builder.kind(None);
+                    builder
+                        .build(patterns.iter().map(|p| p.as_slice()))
+                        .unwrap_or_else(|err| panic!("build {label} anchors AC: {err}"))
+                }
+                AnchorAcKind::DFA => {
+                    builder.kind(Some(AhoCorasickKind::DFA));
+                    match builder.build(patterns.iter().map(|p| p.as_slice())) {
+                        Ok(ac) => ac,
+                        Err(err) => {
+                            // Safe fallback if DFA build fails (e.g., too large).
+                            builder.kind(None);
+                            builder
+                                .build(patterns.iter().map(|p| p.as_slice()))
+                                .unwrap_or_else(|auto_err| {
+                                    panic!(
+                                        "build {label} anchors AC: forced DFA failed: {err}; auto failed: {auto_err}"
+                                    )
+                                })
+                        }
+                    }
+                }
+                AnchorAcKind::ContiguousNFA => {
+                    builder.kind(Some(AhoCorasickKind::ContiguousNFA));
+                    builder
+                        .build(patterns.iter().map(|p| p.as_slice()))
+                        .unwrap_or_else(|err| panic!("build {label} anchors AC: {err}"))
+                }
+                AnchorAcKind::NoncontiguousNFA => {
+                    builder.kind(Some(AhoCorasickKind::NoncontiguousNFA));
+                    builder
+                        .build(patterns.iter().map(|p| p.as_slice()))
+                        .unwrap_or_else(|err| panic!("build {label} anchors AC: {err}"))
+                }
+            }
+        };
+
+        let ac_anchors_raw = build_anchor_ac(&anchor_patterns_raw, "raw");
+        let ac_anchors_utf16le = if anchor_patterns_utf16le.is_empty() {
+            None
+        } else {
+            Some(build_anchor_ac(&anchor_patterns_utf16le, "utf16le"))
+        };
+        let ac_anchors_utf16be = if anchor_patterns_utf16be.is_empty() {
+            None
+        } else {
+            Some(build_anchor_ac(&anchor_patterns_utf16be, "utf16be"))
+        };
 
         // Warm regex and AC caches at startup to avoid lazy allocations later.
         // `find_iter` always constructs the per-regex cache, so a tiny buffer
@@ -1095,7 +1182,13 @@ impl Engine {
             let mut it = rule.re.find_iter(&warm);
             let _ = it.next();
         }
-        let _ = ac_anchors.is_match(&warm);
+        let _ = ac_anchors_raw.is_match(&warm);
+        if let Some(ac) = &ac_anchors_utf16le {
+            let _ = ac.is_match(&warm);
+        }
+        if let Some(ac) = &ac_anchors_utf16be {
+            let _ = ac.is_match(&warm);
+        }
 
         let mut max_window_diameter_bytes = 0usize;
         for r in &rules {
@@ -1115,9 +1208,15 @@ impl Engine {
             transforms,
             tuning,
             entropy_log2,
-            ac_anchors,
-            pat_targets,
-            pat_offsets,
+            ac_anchors_raw,
+            ac_anchors_utf16le,
+            ac_anchors_utf16be,
+            pat_targets_raw,
+            pat_offsets_raw,
+            pat_targets_utf16le,
+            pat_offsets_utf16le,
+            pat_targets_utf16be,
+            pat_offsets_utf16be,
             b64_gate,
             residue_rules,
             unfilterable_rules,
@@ -1433,28 +1532,24 @@ impl Engine {
         }
     }
 
-    fn scan_rules_on_buffer(
+    #[allow(clippy::too_many_arguments)]
+    fn scan_anchor_matches(
         &self,
         buf: &[u8],
+        ac: &AhoCorasick,
+        pat_targets: &[Target],
+        pat_offsets: &[u32],
         step_id: StepId,
-        root_hint: Option<Range<usize>>,
+        root_hint: &Option<Range<usize>>,
         base_offset: u64,
         file_id: FileId,
         scratch: &mut ScanScratch,
     ) {
-        assert!(buf.len() <= u32::MAX as usize);
-        assert!(self.tuning.merge_gap <= u32::MAX as usize);
-        assert!(self.tuning.pressure_gap_start <= u32::MAX as usize);
-        let hay_len = buf.len() as u32;
-        let merge_gap = self.tuning.merge_gap as u32;
-        let pressure_gap_start = self.tuning.pressure_gap_start as u32;
-
-        // L1: anchor scan (raw + utf16 variants), fanout to rules via pat_targets.
-        for m in self.ac_anchors.find_overlapping_iter(buf) {
+        for m in ac.find_overlapping_iter(buf) {
             let pid = m.pattern().as_usize();
-            let start = self.pat_offsets[pid] as usize;
-            let end = self.pat_offsets[pid + 1] as usize;
-            let targets = &self.pat_targets[start..end];
+            let start = pat_offsets[pid] as usize;
+            let end = pat_offsets[pid + 1] as usize;
+            let targets = &pat_targets[start..end];
 
             for &t in targets {
                 let rule_id = t.rule_id();
@@ -1493,7 +1588,8 @@ impl Engine {
                             }
                         }
 
-                        let root_span_hint = root_hint.clone().unwrap_or_else(|| span.clone());
+                        let root_span_hint =
+                            root_hint.as_ref().cloned().unwrap_or_else(|| span.clone());
                         scratch.push_finding(FindingRec {
                             file_id,
                             rule_id: rule_id as u32,
@@ -1526,6 +1622,65 @@ impl Engine {
                     self.tuning.max_anchor_hits_per_rule_variant,
                 );
                 scratch.mark_touched(rule_id, variant);
+            }
+        }
+    }
+
+    fn scan_rules_on_buffer(
+        &self,
+        buf: &[u8],
+        step_id: StepId,
+        root_hint: Option<Range<usize>>,
+        base_offset: u64,
+        file_id: FileId,
+        scratch: &mut ScanScratch,
+    ) {
+        assert!(buf.len() <= u32::MAX as usize);
+        assert!(self.tuning.merge_gap <= u32::MAX as usize);
+        assert!(self.tuning.pressure_gap_start <= u32::MAX as usize);
+        let hay_len = buf.len() as u32;
+        let merge_gap = self.tuning.merge_gap as u32;
+        let pressure_gap_start = self.tuning.pressure_gap_start as u32;
+
+        // L1: anchor scan (raw always; UTF-16 variants gated behind NUL check).
+        self.scan_anchor_matches(
+            buf,
+            &self.ac_anchors_raw,
+            &self.pat_targets_raw,
+            &self.pat_offsets_raw,
+            step_id,
+            &root_hint,
+            base_offset,
+            file_id,
+            scratch,
+        );
+
+        if self.tuning.scan_utf16_variants && memchr(0, buf).is_some() {
+            if let Some(ac) = &self.ac_anchors_utf16le {
+                self.scan_anchor_matches(
+                    buf,
+                    ac,
+                    &self.pat_targets_utf16le,
+                    &self.pat_offsets_utf16le,
+                    step_id,
+                    &root_hint,
+                    base_offset,
+                    file_id,
+                    scratch,
+                );
+            }
+            if let Some(ac) = &self.ac_anchors_utf16be {
+                self.scan_anchor_matches(
+                    buf,
+                    ac,
+                    &self.pat_targets_utf16be,
+                    &self.pat_offsets_utf16be,
+                    step_id,
+                    &root_hint,
+                    base_offset,
+                    file_id,
+                    scratch,
+                );
             }
         }
 
@@ -1882,8 +2037,29 @@ impl Engine {
                 .extend_from_slice(scratch.gate.tail.as_slice());
             scratch.gate.scratch.extend_from_slice(chunk);
 
-            if !hit && self.ac_anchors.is_match(scratch.gate.scratch.as_slice()) {
+            if !hit
+                && self
+                    .ac_anchors_raw
+                    .is_match(scratch.gate.scratch.as_slice())
+            {
                 hit = true;
+            }
+            if self.tuning.scan_utf16_variants
+                && !hit
+                && memchr(0, scratch.gate.scratch.as_slice()).is_some()
+            {
+                if let Some(ac) = &self.ac_anchors_utf16le {
+                    if ac.is_match(scratch.gate.scratch.as_slice()) {
+                        hit = true;
+                    }
+                }
+                if !hit {
+                    if let Some(ac) = &self.ac_anchors_utf16be {
+                        if ac.is_match(scratch.gate.scratch.as_slice()) {
+                            hit = true;
+                        }
+                    }
+                }
             }
 
             if tail_keep > 0 {
@@ -2048,6 +2224,18 @@ fn map_to_patterns(map: AHashMap<Vec<u8>, Vec<Target>>) -> (Vec<Vec<u8>>, Vec<Ta
     }
 
     (patterns, flat, offsets)
+}
+
+#[cfg(feature = "bench")]
+pub fn bench_find_spans_into(tc: &TransformConfig, buf: &[u8], out: &mut Vec<Range<usize>>) {
+    find_spans_into(tc, buf, out);
+}
+
+#[cfg(feature = "bench")]
+impl Engine {
+    pub fn bench_ac_anchors(&self) -> &AhoCorasick {
+        &self.ac_anchors_raw
+    }
 }
 
 #[cfg(test)]

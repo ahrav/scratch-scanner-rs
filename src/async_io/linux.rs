@@ -245,6 +245,7 @@ struct UringFileReader<'a> {
 }
 
 impl<'a> UringFileReader<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         ring: &'a mut IoUring,
         pool: &'a BufferPool,
@@ -582,11 +583,13 @@ mod tests {
             AnchorPolicy::ManualOnly,
         ));
 
-        let mut config = AsyncIoConfig::default();
-        config.chunk_size = BUFFER_ALIGN;
-        config.queue_depth = 2;
-        config.max_files = 1;
-        config.use_o_direct = false;
+        let config = AsyncIoConfig {
+            chunk_size: BUFFER_ALIGN,
+            queue_depth: 2,
+            max_files: 1,
+            use_o_direct: false,
+            ..Default::default()
+        };
 
         let mut scanner = UringScanner::new(Arc::clone(&engine), config)?;
 

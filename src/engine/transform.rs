@@ -6,7 +6,7 @@
 use super::SpanU32;
 use crate::api::{TransformConfig, TransformId};
 use crate::scratch_memory::ScratchVec;
-use memchr::memchr;
+use memchr::{memchr, memchr2};
 use std::ops::{ControlFlow, Range};
 
 // --------------------------
@@ -31,19 +31,77 @@ fn hex_val(b: u8) -> u8 {
     }
 }
 
+const URLISH: u8 = 1 << 0;
+const B64_CHAR: u8 = 1 << 1;
+const B64_WS: u8 = 1 << 2;
+const B64_WS_SPACE: u8 = 1 << 3;
+
+const fn build_byte_class() -> [u8; 256] {
+    let mut table = [0u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        let b = i as u8;
+        let mut flags = 0u8;
+
+        // URL-ish: RFC3986 unreserved + reserved + '%' and '+' (scanner-specific).
+        if (b >= b'A' && b <= b'Z')
+            || (b >= b'a' && b <= b'z')
+            || (b >= b'0' && b <= b'9')
+            || matches!(
+                b,
+                b'%' | b'+'
+                    | b'-'
+                    | b'_'
+                    | b'.'
+                    | b'~'
+                    | b':'
+                    | b'/'
+                    | b'?'
+                    | b'#'
+                    | b'['
+                    | b']'
+                    | b'@'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b','
+                    | b';'
+                    | b'='
+            )
+        {
+            flags |= URLISH;
+        }
+
+        // Base64 alphabet (standard + URL-safe) + padding.
+        if (b >= b'A' && b <= b'Z')
+            || (b >= b'a' && b <= b'z')
+            || (b >= b'0' && b <= b'9')
+            || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_')
+        {
+            flags |= B64_CHAR;
+        }
+
+        match b {
+            b'\n' | b'\r' | b'\t' => flags |= B64_WS,
+            b' ' => flags |= B64_WS_SPACE,
+            _ => {}
+        }
+
+        table[i] = flags;
+        i += 1;
+    }
+    table
+}
+
+static BYTE_CLASS: [u8; 256] = build_byte_class();
+
+#[inline]
 fn is_urlish(b: u8) -> bool {
-    // Conservative "URL-ish" run for span detection.
-    matches!(
-        b,
-        b'A'..=b'Z'
-            | b'a'..=b'z'
-            | b'0'..=b'9'
-            | b'%' | b'+'
-            | b'-' | b'_' | b'.' | b'~'
-            | b':' | b'/' | b'?' | b'#' | b'[' | b']' | b'@'
-            | b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*'
-            | b',' | b';' | b'='
-    )
+    (BYTE_CLASS[b as usize] & URLISH) != 0
 }
 
 /// Target for span collection, allowing reuse of `Vec` or `ScratchVec`.
@@ -109,14 +167,26 @@ pub(super) fn find_url_spans_into(
     spans: &mut impl SpanSink,
 ) {
     assert!(max_len >= min_len);
+    // Fast reject: URL spans require at least one '%' (or '+' when plus_to_space is enabled).
+    // Note: the engine already applies this prefilter via transform_quick_trigger(),
+    // but direct callers (e.g., microbench) can reach here without that guard.
+    let has_trigger = if plus_to_space {
+        memchr2(b'%', b'+', hay).is_some()
+    } else {
+        memchr(b'%', hay).is_some()
+    };
     // Include unescaped prefixes by scanning URL-ish runs, not starting at the first '%'.
     // We still require at least one percent-escape (and optionally '+') to avoid
     // decoding every plain word.
     spans.clear();
+    if !has_trigger {
+        return;
+    }
     let mut i = 0usize;
 
     while i < hay.len() && spans.len() < max_spans {
-        if !is_urlish(hay[i]) {
+        let flags = BYTE_CLASS[hay[i] as usize];
+        if (flags & URLISH) == 0 {
             i += 1;
             continue;
         }
@@ -124,8 +194,12 @@ pub(super) fn find_url_spans_into(
         let start = i;
         let mut triggers = 0usize;
 
-        while i < hay.len() && is_urlish(hay[i]) && (i - start) < max_len {
+        while i < hay.len() && (i - start) < max_len {
             let b = hay[i];
+            let flags = BYTE_CLASS[b as usize];
+            if (flags & URLISH) == 0 {
+                break;
+            }
             if b == b'%' || (plus_to_space && b == b'+') {
                 triggers += 1;
             }
@@ -236,23 +310,101 @@ enum Base64DecodeError {
     OutputTooLarge,
 }
 
+#[inline]
 fn is_b64_char(b: u8) -> bool {
-    matches!(
-        b,
-        b'A'..=b'Z'
-            | b'a'..=b'z'
-            | b'0'..=b'9'
-            | b'+' | b'/' | b'='
-            | b'-' | b'_'
-    )
+    (BYTE_CLASS[b as usize] & B64_CHAR) != 0
 }
 
+#[inline]
 fn is_b64_ws(b: u8, allow_space: bool) -> bool {
-    matches!(b, b'\n' | b'\r' | b'\t') || (allow_space && b == b' ')
+    let flags = BYTE_CLASS[b as usize];
+    if allow_space {
+        (flags & (B64_WS | B64_WS_SPACE)) != 0
+    } else {
+        (flags & B64_WS) != 0
+    }
 }
 
 fn is_b64_or_ws(b: u8, allow_space: bool) -> bool {
     is_b64_char(b) || is_b64_ws(b, allow_space)
+}
+
+#[inline]
+fn find_b64ish_start(hay: &[u8], i: usize, allow_space: bool) -> usize {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        find_b64ish_start_neon(hay, i, allow_space)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mut i = i;
+        while i < hay.len() && !is_b64_or_ws(hay[i], allow_space) {
+            i += 1;
+        }
+        i
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn find_b64ish_start_neon(hay: &[u8], mut i: usize, allow_space: bool) -> usize {
+    use std::arch::aarch64::{
+        vandq_u8, vceqq_u8, vcgeq_u8, vcleq_u8, vdupq_n_u8, vld1q_u8, vmaxvq_u8, vorrq_u8,
+    };
+
+    let len = hay.len();
+    let ptr = hay.as_ptr();
+
+    let a = vdupq_n_u8(b'A');
+    let z = vdupq_n_u8(b'Z');
+    let aa = vdupq_n_u8(b'a');
+    let zz = vdupq_n_u8(b'z');
+    let zero = vdupq_n_u8(b'0');
+    let nine = vdupq_n_u8(b'9');
+
+    let plus = vdupq_n_u8(b'+');
+    let slash = vdupq_n_u8(b'/');
+    let eq = vdupq_n_u8(b'=');
+    let dash = vdupq_n_u8(b'-');
+    let underscore = vdupq_n_u8(b'_');
+
+    let lf = vdupq_n_u8(b'\n');
+    let cr = vdupq_n_u8(b'\r');
+    let tab = vdupq_n_u8(b'\t');
+    let space = vdupq_n_u8(b' ');
+
+    while i + 16 <= len {
+        let v = vld1q_u8(ptr.add(i));
+
+        let upper = vandq_u8(vcgeq_u8(v, a), vcleq_u8(v, z));
+        let lower = vandq_u8(vcgeq_u8(v, aa), vcleq_u8(v, zz));
+        let digit = vandq_u8(vcgeq_u8(v, zero), vcleq_u8(v, nine));
+
+        let sym = vorrq_u8(
+            vorrq_u8(vceqq_u8(v, plus), vceqq_u8(v, slash)),
+            vorrq_u8(
+                vceqq_u8(v, eq),
+                vorrq_u8(vceqq_u8(v, dash), vceqq_u8(v, underscore)),
+            ),
+        );
+
+        let mut ws = vorrq_u8(vceqq_u8(v, lf), vceqq_u8(v, cr));
+        ws = vorrq_u8(ws, vceqq_u8(v, tab));
+        if allow_space {
+            ws = vorrq_u8(ws, vceqq_u8(v, space));
+        }
+
+        let b64ish = vorrq_u8(sym, vorrq_u8(upper, vorrq_u8(lower, vorrq_u8(digit, ws))));
+        if vmaxvq_u8(b64ish) != 0 {
+            break;
+        }
+        i += 16;
+    }
+
+    while i < len && !is_b64_or_ws(hay[i], allow_space) {
+        i += 1;
+    }
+    i
 }
 
 // Simple span finder. It is permissive by design.
@@ -279,19 +431,28 @@ pub(super) fn find_base64_spans_into(
     assert!(max_len >= min_chars);
     spans.clear();
     let mut i = 0usize;
+    let allow_mask = if allow_space_ws {
+        B64_CHAR | B64_WS | B64_WS_SPACE
+    } else {
+        B64_CHAR | B64_WS
+    };
 
     while i < hay.len() && spans.len() < max_spans {
-        if !is_b64_or_ws(hay[i], allow_space_ws) {
-            i += 1;
-            continue;
+        i = find_b64ish_start(hay, i, allow_space_ws);
+        if i >= hay.len() {
+            break;
         }
 
         let start = i;
         let mut b64_chars = 0usize;
         let mut last_b64 = None::<usize>;
 
-        while i < hay.len() && is_b64_or_ws(hay[i], allow_space_ws) && (i - start) < max_len {
-            if is_b64_char(hay[i]) {
+        while i < hay.len() && (i - start) < max_len {
+            let flags = BYTE_CLASS[hay[i] as usize];
+            if (flags & allow_mask) == 0 {
+                break;
+            }
+            if (flags & B64_CHAR) != 0 {
                 b64_chars += 1;
                 last_b64 = Some(i);
             }

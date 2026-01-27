@@ -508,6 +508,32 @@ pub struct Tuning {
 
     /// Hard cap on findings per buffer/chunk.
     pub max_findings_per_chunk: usize,
+
+    /// Whether to scan UTF-16 anchor variants at all.
+    ///
+    /// When false, only raw anchors are scanned (UTF-16 is skipped even if NULs
+    /// are present). This is useful for modes that avoid binary/UTF-16 content.
+    pub scan_utf16_variants: bool,
+
+    /// Aho-Corasick automaton kind for anchor scans.
+    pub ac_kind: AnchorAcKind,
+
+    /// Optional depth for dense transition tables in the NFA.
+    /// When `None`, the crate default is used.
+    pub ac_dense_depth: Option<usize>,
+
+    /// Optional byte-class setting for the NFA.
+    /// When `None`, the crate default is used.
+    pub ac_byte_classes: Option<bool>,
+}
+
+/// Anchor automaton kind selection for the Aho-Corasick builder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnchorAcKind {
+    Auto,
+    DFA,
+    ContiguousNFA,
+    NoncontiguousNFA,
 }
 
 impl Tuning {

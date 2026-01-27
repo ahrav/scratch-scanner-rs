@@ -412,8 +412,28 @@ fn reference_scan_keys(engine: &Engine, rules: &[RuleSpec], buf: &[u8]) -> HashS
                     break;
                 }
 
-                if tc.gate == Gate::AnchorsInDecoded && !engine.ac_anchors.is_match(&decoded) {
-                    continue;
+                if tc.gate == Gate::AnchorsInDecoded {
+                    let mut hit = engine.ac_anchors_raw.is_match(&decoded);
+                    if engine.tuning.scan_utf16_variants
+                        && !hit
+                        && memchr::memchr(0, &decoded).is_some()
+                    {
+                        if let Some(ac) = &engine.ac_anchors_utf16le {
+                            if ac.is_match(&decoded) {
+                                hit = true;
+                            }
+                        }
+                        if !hit {
+                            if let Some(ac) = &engine.ac_anchors_utf16be {
+                                if ac.is_match(&decoded) {
+                                    hit = true;
+                                }
+                            }
+                        }
+                    }
+                    if !hit {
+                        continue;
+                    }
                 }
 
                 let h = hash128(&decoded);
