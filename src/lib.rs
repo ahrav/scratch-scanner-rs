@@ -1831,12 +1831,18 @@ impl Engine {
                     };
 
                     let decoded = scratch.slab.slice(decoded_range.clone());
+                    // If we discard the decoded buffer (empty or duplicate), roll back
+                    // the slab to its pre-append length. `decoded_range.start` is the
+                    // slab length before this append, so truncation is safe and keeps
+                    // memory and decode-budget accounting tight.
                     if decoded.is_empty() {
+                        scratch.slab.buf.truncate(decoded_range.start);
                         continue;
                     }
 
                     let h = hash128(decoded);
                     if !scratch.seen.insert(h) {
+                        scratch.slab.buf.truncate(decoded_range.start);
                         continue;
                     }
 
@@ -2750,11 +2756,25 @@ enum UrlDecodeError {
     OutputTooLarge,
 }
 
-fn is_hex(b: u8) -> bool {
+// Byte classification LUTs (256-entry tables).
+//
+// These are used in the hottest span-detection loops. The behavior is identical
+// to the prior `matches!` checks, but the implementation is a single indexed
+// load instead of multiple comparisons. The tables are `const`, so they live in
+// `.rodata` and incur no runtime initialization cost.
+//
+// Semantics:
+// - `HEX_IS_LUT[b] != 0` iff `b` is ASCII hex.
+// - `HEX_VAL_LUT[b]` returns the nibble value for ASCII hex bytes, and 0 for
+//   non-hex bytes (non-hex inputs are always guarded by `is_hex` first).
+// - `URLISH_LUT[b] != 0` iff `b` is part of the conservative "URL-ish" class
+//   used by the percent-decoder span finder.
+
+const fn is_hex_const(b: u8) -> bool {
     b.is_ascii_hexdigit()
 }
 
-fn hex_val(b: u8) -> u8 {
+const fn hex_val_const(b: u8) -> u8 {
     match b {
         b'0'..=b'9' => b - b'0',
         b'a'..=b'f' => b - b'a' + 10,
@@ -2763,7 +2783,30 @@ fn hex_val(b: u8) -> u8 {
     }
 }
 
-fn is_urlish(b: u8) -> bool {
+const fn build_hex_is_lut() -> [u8; 256] {
+    let mut lut = [0u8; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let b = i as u8;
+        if is_hex_const(b) {
+            lut[i] = 1;
+        }
+        i += 1;
+    }
+    lut
+}
+
+const fn build_hex_val_lut() -> [u8; 256] {
+    let mut lut = [0u8; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        lut[i] = hex_val_const(i as u8);
+        i += 1;
+    }
+    lut
+}
+
+const fn is_urlish_const(b: u8) -> bool {
     // Conservative "URL-ish" run for span detection.
     matches!(
         b,
@@ -2776,6 +2819,36 @@ fn is_urlish(b: u8) -> bool {
             | b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*'
             | b',' | b';' | b'='
     )
+}
+
+const fn build_urlish_lut() -> [u8; 256] {
+    let mut lut = [0u8; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let b = i as u8;
+        if is_urlish_const(b) {
+            lut[i] = 1;
+        }
+        i += 1;
+    }
+    lut
+}
+
+const HEX_IS_LUT: [u8; 256] = build_hex_is_lut();
+const HEX_VAL_LUT: [u8; 256] = build_hex_val_lut();
+const URLISH_LUT: [u8; 256] = build_urlish_lut();
+
+fn is_hex(b: u8) -> bool {
+    HEX_IS_LUT[b as usize] != 0
+}
+
+fn hex_val(b: u8) -> u8 {
+    HEX_VAL_LUT[b as usize]
+}
+
+fn is_urlish(b: u8) -> bool {
+    // Conservative "URL-ish" run for span detection.
+    URLISH_LUT[b as usize] != 0
 }
 
 trait SpanSink {
@@ -2969,7 +3042,17 @@ enum Base64DecodeError {
     OutputTooLarge,
 }
 
-fn is_b64_char(b: u8) -> bool {
+// Base64 classification + decode LUTs.
+//
+// The span finder and decoder are both hot paths. We use lookup tables to:
+// - classify bytes as base64 characters and/or whitespace with a single load
+//   (span detection still uses `allow_space_ws` to mirror caller policy), and
+// - decode bytes to sextet values with a single load in the streaming decoder.
+//
+// The decoder accepts RFC4648 whitespace unconditionally (including space),
+// matching the previous behavior. The `allow_space_ws` flag only affects span
+// detection, not decoding.
+const fn is_b64_char_const(b: u8) -> bool {
     matches!(
         b,
         b'A'..=b'Z'
@@ -2980,12 +3063,105 @@ fn is_b64_char(b: u8) -> bool {
     )
 }
 
-fn is_b64_ws(b: u8, allow_space: bool) -> bool {
+const fn is_b64_ws_const(b: u8, allow_space: bool) -> bool {
     matches!(b, b'\n' | b'\r' | b'\t') || (allow_space && b == b' ')
 }
 
+const fn build_b64_char_lut() -> [u8; 256] {
+    let mut lut = [0u8; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        if is_b64_char_const(i as u8) {
+            lut[i] = 1;
+        }
+        i += 1;
+    }
+    lut
+}
+
+const fn build_b64_ws_lut(allow_space: bool) -> [u8; 256] {
+    let mut lut = [0u8; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        if is_b64_ws_const(i as u8, allow_space) {
+            lut[i] = 1;
+        }
+        i += 1;
+    }
+    lut
+}
+
+const fn build_b64_or_ws_lut(allow_space: bool) -> [u8; 256] {
+    let mut lut = [0u8; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let b = i as u8;
+        if is_b64_char_const(b) || is_b64_ws_const(b, allow_space) {
+            lut[i] = 1;
+        }
+        i += 1;
+    }
+    lut
+}
+
+// Base64 decode LUT. We use `i8` so we can encode sentinel values alongside
+// the 0..=64 sextet domain:
+// - -1 = invalid byte (hard error)
+// - -2 = whitespace (skip)
+// - 0..=63 = sextet value
+// - 64 = '=' padding marker
+const fn build_b64_decode_lut() -> [i8; 256] {
+    let mut lut = [-1i8; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let b = i as u8;
+        lut[i] = if matches!(b, b' ' | b'\n' | b'\r' | b'\t') {
+            -2
+        } else if b == b'=' {
+            64
+        } else if b.is_ascii_uppercase() {
+            (b - b'A') as i8
+        } else if b.is_ascii_lowercase() {
+            (b - b'a' + 26) as i8
+        } else if b.is_ascii_digit() {
+            (b - b'0' + 52) as i8
+        } else if matches!(b, b'+' | b'-') {
+            62
+        } else if matches!(b, b'/' | b'_') {
+            63
+        } else {
+            -1
+        };
+        i += 1;
+    }
+    lut
+}
+
+const B64_CHAR_LUT: [u8; 256] = build_b64_char_lut();
+const B64_WS_NO_SPACE_LUT: [u8; 256] = build_b64_ws_lut(false);
+const B64_WS_SPACE_LUT: [u8; 256] = build_b64_ws_lut(true);
+const B64_OR_WS_NO_SPACE_LUT: [u8; 256] = build_b64_or_ws_lut(false);
+const B64_OR_WS_SPACE_LUT: [u8; 256] = build_b64_or_ws_lut(true);
+const B64_DECODE_LUT: [i8; 256] = build_b64_decode_lut();
+
+fn is_b64_char(b: u8) -> bool {
+    B64_CHAR_LUT[b as usize] != 0
+}
+
+fn is_b64_ws(b: u8, allow_space: bool) -> bool {
+    if allow_space {
+        B64_WS_SPACE_LUT[b as usize] != 0
+    } else {
+        B64_WS_NO_SPACE_LUT[b as usize] != 0
+    }
+}
+
 fn is_b64_or_ws(b: u8, allow_space: bool) -> bool {
-    is_b64_char(b) || is_b64_ws(b, allow_space)
+    if allow_space {
+        B64_OR_WS_SPACE_LUT[b as usize] != 0
+    } else {
+        B64_OR_WS_NO_SPACE_LUT[b as usize] != 0
+    }
 }
 
 // Simple span finder. It is permissive by design.
@@ -3084,21 +3260,15 @@ fn stream_decode_base64(
     let mut out_len = 0usize;
 
     for &b in input {
-        // ignore whitespace broadly
-        if matches!(b, b' ' | b'\n' | b'\r' | b'\t') {
-            continue;
-        }
-
-        let v = match b {
-            b'A'..=b'Z' => Some(b - b'A'),
-            b'a'..=b'z' => Some(b - b'a' + 26),
-            b'0'..=b'9' => Some(b - b'0' + 52),
-            b'+' | b'-' => Some(62),
-            b'/' | b'_' => Some(63),
-            b'=' => Some(64),
-            _ => None,
-        }
-        .ok_or(Base64DecodeError::InvalidByte(b))?;
+        // Classify via LUT:
+        // - whitespace is skipped
+        // - invalid bytes are rejected
+        // - base64 chars map to 0..=63 (and '=' maps to 64)
+        let v = match B64_DECODE_LUT[b as usize] {
+            -2 => continue,
+            -1 => return Err(Base64DecodeError::InvalidByte(b)),
+            v => v as u8,
+        };
 
         if seen_pad {
             return Err(Base64DecodeError::InvalidPadding);
