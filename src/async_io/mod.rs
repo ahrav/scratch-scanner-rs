@@ -7,8 +7,10 @@
 //! Both backends keep the scan loop single-threaded while overlapping IO.
 
 use crate::pipeline::PipelineStats;
+use crate::scratch_memory::ScratchVec;
 use crate::{FileId, FileTable, BUFFER_ALIGN, BUFFER_LEN_MAX};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
@@ -29,6 +31,12 @@ pub const ASYNC_DEFAULT_QUEUE_DEPTH: u32 = 2;
 
 /// Default maximum number of files to scan.
 pub const ASYNC_MAX_FILES: usize = crate::pipeline::PIPE_MAX_FILES;
+
+/// Maximum depth for the DFS walker stack.
+///
+/// Filesystem paths are bounded by depth (~255 components on most systems),
+/// NOT by file count. 1024 handles any realistic directory tree.
+const WALKER_STACK_CAP: usize = 1024;
 
 /// Configuration shared by async backends.
 #[derive(Clone, Debug)]
@@ -88,27 +96,37 @@ enum WalkEntry {
 /// This mirrors the pipeline walk behavior but exposes a `next_file` iterator
 /// for sequential async scanners.
 struct Walker {
-    stack: Vec<WalkEntry>,
+    stack: ScratchVec<WalkEntry>,
     done: bool,
     max_files: usize,
 }
 
 impl Walker {
-    fn new(root: PathBuf, max_files: usize) -> Self {
-        let mut stack = Vec::with_capacity(1024);
-        stack.push(WalkEntry::Path(root));
-        Self {
+    fn new(max_files: usize) -> io::Result<Self> {
+        let stack = ScratchVec::with_capacity(WALKER_STACK_CAP)
+            .map_err(|_| io::Error::other("async walker stack allocation failed"))?;
+        Ok(Self {
             stack,
             done: false,
             max_files,
-        }
+        })
+    }
+
+    fn reset(&mut self, root: PathBuf) -> io::Result<()> {
+        self.stack.clear();
+        self.done = false;
+        self.push_entry(WalkEntry::Path(root))
     }
 
     fn is_done(&self) -> bool {
         self.done
     }
 
-    fn next_file(&mut self, files: &mut FileTable, stats: &mut PipelineStats) -> Option<FileId> {
+    fn next_file(
+        &mut self,
+        files: &mut FileTable,
+        stats: &mut PipelineStats,
+    ) -> io::Result<Option<FileId>> {
         while let Some(entry) = self.stack.pop() {
             match entry {
                 WalkEntry::Path(path) => {
@@ -128,7 +146,7 @@ impl Walker {
 
                     if ty.is_dir() {
                         match fs::read_dir(&path) {
-                            Ok(rd) => self.stack.push(WalkEntry::Dir(rd)),
+                            Ok(rd) => self.push_entry(WalkEntry::Dir(rd))?,
                             Err(_) => {
                                 stats.walk_errors += 1;
                                 stats.errors += 1;
@@ -143,24 +161,24 @@ impl Walker {
 
                     if files.len() >= self.max_files {
                         self.done = true;
-                        return None;
+                        return Ok(None);
                     }
 
                     let size = meta.len();
                     let dev_inode = dev_inode(&meta);
                     let id = files.push(path, size, dev_inode, 0);
                     stats.files += 1;
-                    return Some(id);
+                    return Ok(Some(id));
                 }
                 WalkEntry::Dir(mut rd) => match rd.next() {
                     Some(Ok(entry)) => {
-                        self.stack.push(WalkEntry::Dir(rd));
-                        self.stack.push(WalkEntry::Path(entry.path()));
+                        self.push_entry(WalkEntry::Dir(rd))?;
+                        self.push_entry(WalkEntry::Path(entry.path()))?;
                     }
                     Some(Err(_)) => {
                         stats.walk_errors += 1;
                         stats.errors += 1;
-                        self.stack.push(WalkEntry::Dir(rd));
+                        self.push_entry(WalkEntry::Dir(rd))?;
                     }
                     None => {}
                 },
@@ -168,7 +186,15 @@ impl Walker {
         }
 
         self.done = true;
-        None
+        Ok(None)
+    }
+
+    fn push_entry(&mut self, entry: WalkEntry) -> io::Result<()> {
+        if self.stack.len() >= self.stack.capacity() {
+            return Err(io::Error::other("async walker stack overflow"));
+        }
+        self.stack.push(entry);
+        Ok(())
     }
 }
 

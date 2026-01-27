@@ -59,6 +59,14 @@ impl FileTable {
         self.paths.len()
     }
 
+    /// Clears all tracked files while retaining allocated capacity.
+    pub fn clear(&mut self) {
+        self.paths.clear();
+        self.sizes.clear();
+        self.dev_inodes.clear();
+        self.flags.clear();
+    }
+
     /// Returns true when the table is empty.
     pub fn is_empty(&self) -> bool {
         self.paths.is_empty()

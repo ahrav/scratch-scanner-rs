@@ -148,6 +148,11 @@ pub struct MacosAioScanner {
     overlap: usize,
     payload_off: usize,
     pool: BufferPool,
+    scratch: ScanScratch,
+    pending: Vec<FindingRec>,
+    files: FileTable,
+    walker: Walker,
+    out: BufWriter<io::Stdout>,
 }
 
 impl MacosAioScanner {
@@ -175,6 +180,11 @@ impl MacosAioScanner {
         }
 
         let pool = BufferPool::new(config.queue_depth as usize + 1);
+        let scratch = engine.new_scratch();
+        let pending = Vec::with_capacity(engine.tuning.max_findings_per_chunk);
+        let files = FileTable::with_capacity(config.max_files);
+        let walker = Walker::new(config.max_files)?;
+        let out = BufWriter::new(io::stdout());
 
         Ok(Self {
             engine,
@@ -182,36 +192,43 @@ impl MacosAioScanner {
             overlap,
             payload_off,
             pool,
+            scratch,
+            pending,
+            files,
+            walker,
+            out,
         })
     }
 
     /// Scans a path (file or directory) using POSIX AIO reads.
     pub fn scan_path(&mut self, path: &Path) -> io::Result<PipelineStats> {
         let mut stats = PipelineStats::default();
-        let mut files = FileTable::with_capacity(self.config.max_files);
-        let mut walker = Walker::new(path.to_path_buf(), self.config.max_files);
-        let mut out = BufWriter::new(io::stdout());
-
         let engine = Arc::clone(&self.engine);
-        let mut scratch = engine.new_scratch();
-        let mut pending: Vec<FindingRec> = Vec::with_capacity(engine.tuning.max_findings_per_chunk);
+        self.files.clear();
+        self.pending.clear();
+        self.walker.reset(path.to_path_buf())?;
 
-        while !walker.is_done() {
-            let Some(file_id) = walker.next_file(&mut files, &mut stats) else {
+        while !self.walker.is_done() {
+            let Some(file_id) = self.walker.next_file(&mut self.files, &mut stats)? else {
                 continue;
             };
 
-            let file_path = files.path(file_id);
-            let file_size = files.size(file_id);
+            let file_path = self.files.path(file_id);
+            let file_size = self.files.size(file_id);
 
-            match self.scan_file(
+            match scan_file(
+                &self.pool,
+                self.payload_off,
+                self.overlap,
+                self.config.chunk_size,
+                self.config.queue_depth,
                 &engine,
-                &mut scratch,
-                &mut pending,
+                &mut self.scratch,
+                &mut self.pending,
                 file_id,
                 file_path,
                 file_size,
-                &mut out,
+                &mut self.out,
                 &mut stats,
             ) {
                 Ok(()) => {}
@@ -226,59 +243,63 @@ impl MacosAioScanner {
             }
         }
 
-        out.flush()?;
+        self.out.flush()?;
         Ok(stats)
     }
+}
 
-    #[allow(clippy::too_many_arguments)]
-    // Keep scan dependencies explicit so the hot path has no hidden state
-    // and the call site shows all mutable resources.
-    fn scan_file(
-        &mut self,
-        engine: &Engine,
-        scratch: &mut ScanScratch,
-        pending: &mut Vec<FindingRec>,
-        file_id: FileId,
-        path: &Path,
-        file_size: u64,
-        out: &mut BufWriter<io::Stdout>,
-        stats: &mut PipelineStats,
-    ) -> io::Result<()> {
-        let mut reader = AioFileReader::new(
-            &self.pool,
-            file_id,
-            path,
-            file_size,
-            self.payload_off,
-            self.overlap,
-            self.config.chunk_size,
-            self.config.queue_depth,
-        )?;
+#[allow(clippy::too_many_arguments)]
+// Keep scan dependencies explicit so the hot path has no hidden state
+// and the call site shows all mutable resources.
+fn scan_file(
+    pool: &BufferPool,
+    payload_off: usize,
+    overlap: usize,
+    chunk_size: usize,
+    queue_depth: u32,
+    engine: &Engine,
+    scratch: &mut ScanScratch,
+    pending: &mut Vec<FindingRec>,
+    file_id: FileId,
+    path: &Path,
+    file_size: u64,
+    out: &mut BufWriter<io::Stdout>,
+    stats: &mut PipelineStats,
+) -> io::Result<()> {
+    let mut reader = AioFileReader::new(
+        pool,
+        file_id,
+        path,
+        file_size,
+        payload_off,
+        overlap,
+        chunk_size,
+        queue_depth,
+    )?;
 
-        while let Some(chunk) = reader.next_chunk(&self.pool)? {
-            let payload_len = chunk.len.saturating_sub(chunk.prefix_len) as u64;
-            stats.bytes_scanned = stats.bytes_scanned.saturating_add(payload_len);
-            stats.chunks += 1;
+    while let Some(chunk) = reader.next_chunk(pool)? {
+        let payload_len = chunk.len.saturating_sub(chunk.prefix_len) as u64;
+        stats.bytes_scanned = stats.bytes_scanned.saturating_add(payload_len);
+        stats.chunks += 1;
 
-            engine.scan_chunk_into(chunk.data(), chunk.file_id, chunk.base_offset, scratch);
-            let new_bytes_start = chunk.base_offset + chunk.prefix_len as u64;
-            scratch.drop_prefix_findings(new_bytes_start);
-            scratch.drain_findings_into(pending);
+        engine.scan_chunk_into(chunk.data(), chunk.file_id, chunk.base_offset, scratch);
+        let new_bytes_start = chunk.base_offset + chunk.prefix_len as u64;
+        scratch.drop_prefix_findings(new_bytes_start);
+        scratch.drain_findings_into(pending);
 
-            let path_display = path.display();
-            for rec in pending.drain(..) {
-                let rule = engine.rule_name(rec.rule_id);
-                writeln!(
-                    out,
-                    "{}:{}-{} {}",
-                    path_display, rec.root_hint_start, rec.root_hint_end, rule
-                )?;
-                stats.findings += 1;
-            }
+        let path_display = path.display();
+        for rec in pending.drain(..) {
+            let rule = engine.rule_name(rec.rule_id);
+            writeln!(
+                out,
+                "{}:{}-{} {}",
+                path_display, rec.root_hint_start, rec.root_hint_end, rule
+            )?;
+            stats.findings += 1;
         }
-
-        Ok(())
     }
+
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -20,6 +20,11 @@ pub struct UringScanner {
     payload_off: usize,
     pool: BufferPool,
     ring: IoUring,
+    scratch: ScanScratch,
+    pending: Vec<FindingRec>,
+    files: FileTable,
+    walker: Walker,
+    out: BufWriter<io::Stdout>,
 }
 
 impl UringScanner {
@@ -55,6 +60,11 @@ impl UringScanner {
 
         let pool = BufferPool::new(config.queue_depth as usize);
         let ring = IoUring::new(config.queue_depth)?;
+        let scratch = engine.new_scratch();
+        let pending = Vec::with_capacity(engine.tuning.max_findings_per_chunk);
+        let files = FileTable::with_capacity(config.max_files);
+        let walker = Walker::new(config.max_files)?;
+        let out = BufWriter::new(io::stdout());
 
         Ok(Self {
             engine,
@@ -63,36 +73,44 @@ impl UringScanner {
             payload_off,
             pool,
             ring,
+            scratch,
+            pending,
+            files,
+            walker,
+            out,
         })
     }
 
     /// Scans a path (file or directory) using io_uring reads.
     pub fn scan_path(&mut self, path: &Path) -> io::Result<PipelineStats> {
         let mut stats = PipelineStats::default();
-        let mut files = FileTable::with_capacity(self.config.max_files);
-        let mut walker = Walker::new(path.to_path_buf(), self.config.max_files);
-        let mut out = BufWriter::new(io::stdout());
-
         let engine = Arc::clone(&self.engine);
-        let mut scratch = engine.new_scratch();
-        let mut pending: Vec<FindingRec> = Vec::with_capacity(engine.tuning.max_findings_per_chunk);
+        self.files.clear();
+        self.pending.clear();
+        self.walker.reset(path.to_path_buf())?;
 
-        while !walker.is_done() {
-            let Some(file_id) = walker.next_file(&mut files, &mut stats) else {
+        while !self.walker.is_done() {
+            let Some(file_id) = self.walker.next_file(&mut self.files, &mut stats)? else {
                 continue;
             };
 
-            let file_path = files.path(file_id);
-            let file_size = files.size(file_id);
+            let file_path = self.files.path(file_id);
+            let file_size = self.files.size(file_id);
 
-            match self.scan_file(
+            match scan_file(
+                &mut self.ring,
+                &self.pool,
+                self.payload_off,
+                self.overlap,
+                self.config.chunk_size,
+                self.config.use_o_direct,
                 &engine,
-                &mut scratch,
-                &mut pending,
+                &mut self.scratch,
+                &mut self.pending,
                 file_id,
                 file_path,
                 file_size,
-                &mut out,
+                &mut self.out,
                 &mut stats,
             ) {
                 Ok(()) => {}
@@ -107,81 +125,87 @@ impl UringScanner {
             }
         }
 
-        out.flush()?;
+        self.out.flush()?;
         Ok(stats)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    // Keep scan dependencies explicit so the hot path has no hidden state
-    // and the call site shows all mutable resources.
-    fn scan_file<W: Write>(
-        &mut self,
-        engine: &Engine,
-        scratch: &mut ScanScratch,
-        pending: &mut Vec<FindingRec>,
-        file_id: FileId,
-        path: &Path,
-        file_size: u64,
-        out: &mut W,
-        stats: &mut PipelineStats,
-    ) -> io::Result<()> {
-        let mut reader = UringFileReader::new(
-            &mut self.ring,
-            &self.pool,
-            file_id,
-            path,
-            file_size,
-            self.payload_off,
-            self.overlap,
-            self.config.chunk_size,
-            self.config.use_o_direct,
-        )?;
+}
 
-        let mut current = match reader.read_first()? {
-            Some(chunk) => chunk,
-            None => return Ok(()),
-        };
+#[allow(clippy::too_many_arguments)]
+// Keep scan dependencies explicit so the hot path has no hidden state
+// and the call site shows all mutable resources.
+fn scan_file<W: Write>(
+    ring: &mut IoUring,
+    pool: &BufferPool,
+    payload_off: usize,
+    overlap: usize,
+    chunk_size: usize,
+    use_o_direct: bool,
+    engine: &Engine,
+    scratch: &mut ScanScratch,
+    pending: &mut Vec<FindingRec>,
+    file_id: FileId,
+    path: &Path,
+    file_size: u64,
+    out: &mut W,
+    stats: &mut PipelineStats,
+) -> io::Result<()> {
+    let mut reader = UringFileReader::new(
+        ring,
+        pool,
+        file_id,
+        path,
+        file_size,
+        payload_off,
+        overlap,
+        chunk_size,
+        use_o_direct,
+    )?;
 
-        loop {
-            let submitted = reader.submit_next_from_current(&current)?;
+    let mut current = match reader.read_first()? {
+        Some(chunk) => chunk,
+        None => return Ok(()),
+    };
 
-            let payload_len = current.len.saturating_sub(current.prefix_len) as u64;
-            stats.bytes_scanned = stats.bytes_scanned.saturating_add(payload_len);
-            stats.chunks += 1;
+    loop {
+        let submitted = reader.submit_next_from_current(&current)?;
 
-            engine.scan_chunk_into(
-                current.data(),
-                current.file_id,
-                current.base_offset,
-                scratch,
-            );
-            let new_bytes_start = current.base_offset + current.prefix_len as u64;
-            scratch.drop_prefix_findings(new_bytes_start);
-            scratch.drain_findings_into(pending);
+        let payload_len = current.len.saturating_sub(current.prefix_len) as u64;
+        stats.bytes_scanned = stats.bytes_scanned.saturating_add(payload_len);
+        stats.chunks += 1;
 
-            // Reap the next chunk before any fallible output so we never drop a
-            // reader that still has a kernel read in flight.
-            let next = if submitted { reader.wait_next()? } else { None };
+        engine.scan_chunk_into(
+            current.data(),
+            current.file_id,
+            current.base_offset,
+            scratch,
+        );
+        let new_bytes_start = current.base_offset + current.prefix_len as u64;
+        scratch.drop_prefix_findings(new_bytes_start);
+        scratch.drain_findings_into(pending);
 
-            let path_display = path.display();
-            for rec in pending.drain(..) {
-                let rule = engine.rule_name(rec.rule_id);
-                writeln!(
-                    out,
-                    "{}:{}-{} {}",
-                    path_display, rec.root_hint_start, rec.root_hint_end, rule
-                )?;
-                stats.findings += 1;
-            }
+        // Reap the next chunk before any fallible output so we never drop a
+        // reader that still has a kernel read in flight.
+        let next = if submitted { reader.wait_next()? } else { None };
 
-            match next {
-                Some(next) => current = next,
-                None => break,
-            }
+        let path_display = path.display();
+        for rec in pending.drain(..) {
+            let rule = engine.rule_name(rec.rule_id);
+            writeln!(
+                out,
+                "{}:{}-{} {}",
+                path_display, rec.root_hint_start, rec.root_hint_end, rule
+            )?;
+            stats.findings += 1;
         }
 
-        Ok(())
+        match next {
+            Some(next) => current = next,
+            None => break,
+        }
     }
+
+    Ok(())
 }
 
 struct ReadPlan {
@@ -569,18 +593,23 @@ mod tests {
         let mut stats = PipelineStats::default();
         let mut writer = FailingWriter::new();
 
-        let err = scanner
-            .scan_file(
-                &engine,
-                &mut scratch,
-                &mut pending,
-                FileId(0),
-                temp.path(),
-                bytes.len() as u64,
-                &mut writer,
-                &mut stats,
-            )
-            .expect_err("expected writer failure");
+        let err = scan_file(
+            &mut scanner.ring,
+            &scanner.pool,
+            scanner.payload_off,
+            scanner.overlap,
+            scanner.config.chunk_size,
+            scanner.config.use_o_direct,
+            &engine,
+            &mut scratch,
+            &mut pending,
+            FileId(0),
+            temp.path(),
+            bytes.len() as u64,
+            &mut writer,
+            &mut stats,
+        )
+        .expect_err("expected writer failure");
 
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
         assert!(writer.writes > 0, "writer should be invoked at least once");

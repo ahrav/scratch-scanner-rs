@@ -33,6 +33,7 @@ pub mod util;
 
 mod api;
 mod demo;
+mod gitleaks_rules;
 mod engine;
 mod runtime;
 
