@@ -90,19 +90,26 @@ pub struct Chunk {
     pub len: u32,
     pub prefix_len: u32,
     pub buf: BufferHandle,
+    /// Starting offset into `buf` where the chunk data begins.
+    ///
+    /// This is usually zero for buffered reads. For O_DIRECT reads with an
+    /// aligned payload offset, it can be non-zero so the overlap prefix
+    /// remains contiguous without scanning alignment padding.
+    pub buf_offset: u32,
 }
 
 impl Chunk {
     /// Full data slice, including the overlap prefix.
     pub fn data(&self) -> &[u8] {
-        let end = self.len as usize;
-        &self.buf.as_slice()[..end]
+        let start = self.buf_offset as usize;
+        let end = start + self.len as usize;
+        &self.buf.as_slice()[start..end]
     }
 
     /// Payload slice excluding the overlap prefix.
     pub fn payload(&self) -> &[u8] {
-        let start = self.prefix_len as usize;
-        let end = self.len as usize;
+        let start = self.buf_offset as usize + self.prefix_len as usize;
+        let end = self.buf_offset as usize + self.len as usize;
         &self.buf.as_slice()[start..end]
     }
 }
@@ -282,6 +289,7 @@ pub fn read_file_chunks(
             len: total_len as u32,
             prefix_len: tail_len as u32,
             buf: handle,
+            buf_offset: 0,
         };
 
         if let ControlFlow::Break(()) = emit(chunk) {

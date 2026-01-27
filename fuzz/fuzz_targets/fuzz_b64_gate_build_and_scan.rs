@@ -44,10 +44,15 @@ fn ref_yara_perm(anchor: &[u8], offset: usize, min_len: usize) -> Option<Vec<u8>
     Some(pat)
 }
 
-fn oracle_hits(patterns: &[Vec<u8>], encoded: &[u8]) -> bool {
+fn oracle_hits(
+    patterns: &[Vec<u8>],
+    encoded: &[u8],
+    padding_policy: scanner_rs::b64_yara_gate::PaddingPolicy,
+    whitespace_policy: scanner_rs::b64_yara_gate::WhitespacePolicy,
+) -> bool {
     let mut cur: Vec<u8> = Vec::new();
 
-    let mut check_seg = |seg: &[u8]| -> bool {
+    let check_seg = |seg: &[u8]| -> bool {
         for pat in patterns {
             if pat.is_empty() {
                 return true;
@@ -60,11 +65,29 @@ fn oracle_hits(patterns: &[Vec<u8>], encoded: &[u8]) -> bool {
     };
 
     for &b in encoded {
-        if matches!(b, b' ' | b'\n' | b'\r' | b'\t') {
+        let is_ws = match whitespace_policy {
+            scanner_rs::b64_yara_gate::WhitespacePolicy::Rfc4648 => {
+                matches!(b, b' ' | b'\n' | b'\r' | b'\t')
+            }
+            scanner_rs::b64_yara_gate::WhitespacePolicy::AsciiWhitespace => b.is_ascii_whitespace(),
+        };
+
+        if is_ws {
             continue;
         }
         if b == b'=' {
-            break;
+            if !cur.is_empty() && check_seg(&cur) {
+                return true;
+            }
+            cur.clear();
+            match padding_policy {
+                scanner_rs::b64_yara_gate::PaddingPolicy::StopAndHalt => {
+                    return false;
+                }
+                scanner_rs::b64_yara_gate::PaddingPolicy::ResetAndContinue => {
+                    continue;
+                }
+            }
         }
 
         match b {
@@ -119,13 +142,12 @@ fuzz_target!(|data: &[u8]| {
 
     // Build gate from anchors
     let anchor_slices: Vec<&[u8]> = anchors.iter().map(|a| a.as_slice()).collect();
-    let gate = Base64YaraGate::build(
-        anchor_slices.iter().copied(),
-        Base64YaraGateConfig {
-            min_pattern_len: min_len,
-            ..Default::default()
-        },
-    );
+    let cfg = Base64YaraGateConfig {
+        min_pattern_len: min_len,
+        ..Default::default()
+    };
+
+    let gate = Base64YaraGate::build(anchor_slices.iter().copied(), cfg.clone());
 
     // Build reference patterns from the same anchors using base64 crate oracle
     let mut set: BTreeSet<Vec<u8>> = BTreeSet::new();
@@ -139,6 +161,6 @@ fuzz_target!(|data: &[u8]| {
     let patterns: Vec<Vec<u8>> = set.into_iter().collect();
 
     let ours = gate.hits(encoded);
-    let ref_oracle = oracle_hits(&patterns, encoded);
+    let ref_oracle = oracle_hits(&patterns, encoded, cfg.padding_policy, cfg.whitespace_policy);
     assert_eq!(ours, ref_oracle);
 });

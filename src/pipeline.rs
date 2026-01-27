@@ -292,6 +292,7 @@ impl FileReader {
             len: total_len as u32,
             prefix_len: *tail_len as u32,
             buf: handle,
+            buf_offset: 0,
         };
 
         *tail_len = next_tail_len;
@@ -323,6 +324,12 @@ impl ReaderStage {
 
     fn is_idle(&self) -> bool {
         self.active.is_none()
+    }
+
+    fn is_waiting(&self) -> bool {
+        // Sync reader never has in-flight IO. Async backends can override this
+        // to signal "waiting on completion" without tripping the stall detector.
+        false
     }
 
     fn pump<const FILE_CAP: usize, const CHUNK_CAP: usize>(
@@ -591,6 +598,12 @@ impl<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize>
             }
 
             if !progressed {
+                if reader.is_waiting() {
+                    // Reader backend has in-flight IO; yield to avoid a tight
+                    // spin loop while the kernel completes requests.
+                    std::thread::yield_now();
+                    continue;
+                }
                 // No stage made progress and we're not done: this indicates a
                 // logic bug (e.g., a ring is full/empty deadlock). Fail fast so
                 // it is visible rather than silently spinning.

@@ -308,6 +308,7 @@ struct RefWorkItem {
 
 fn reference_scan_keys(engine: &Engine, rules: &[RuleSpec], buf: &[u8]) -> HashSet<FindingKey> {
     let mut out = HashSet::new();
+    let mut entropy_scratch = EntropyScratch::new();
     let mut work_q = Vec::new();
     work_q.push(RefWorkItem {
         buf: buf.to_vec(),
@@ -331,6 +332,7 @@ fn reference_scan_keys(engine: &Engine, rules: &[RuleSpec], buf: &[u8]) -> HashS
             &item.steps,
             &mut out,
             &mut total_decode_output_bytes,
+            &mut entropy_scratch,
         );
 
         if item.depth >= engine.tuning.max_transform_depth {
@@ -426,6 +428,7 @@ fn scan_rules_reference(
     steps: &[StepKind],
     out: &mut HashSet<FindingKey>,
     total_decode_output_bytes: &mut usize,
+    entropy_scratch: &mut EntropyScratch,
 ) -> bool {
     let mut found_any = false;
 
@@ -441,6 +444,22 @@ fn scan_rules_reference(
                     for w in windows {
                         let window = &buf[w.clone()];
                         for rm in rule.re.find_iter(window) {
+                            if let Some(spec) = rule.entropy.as_ref() {
+                                let ent = EntropyCompiled {
+                                    min_bits_per_byte: spec.min_bits_per_byte,
+                                    min_len: spec.min_len,
+                                    max_len: spec.max_len,
+                                };
+                                let mbytes = &window[rm.start()..rm.end()];
+                                if !entropy_gate_passes(
+                                    &ent,
+                                    mbytes,
+                                    entropy_scratch,
+                                    &engine.entropy_log2,
+                                ) {
+                                    continue;
+                                }
+                            }
                             let span = (w.start + rm.start())..(w.start + rm.end());
                             out.insert(FindingKey {
                                 rule: rule.name,
@@ -498,6 +517,23 @@ fn scan_rules_reference(
                         });
 
                         for rm in rule.re.find_iter(&decoded) {
+                            if let Some(spec) = rule.entropy.as_ref() {
+                                let ent = EntropyCompiled {
+                                    min_bits_per_byte: spec.min_bits_per_byte,
+                                    min_len: spec.min_len,
+                                    max_len: spec.max_len,
+                                };
+                                let span = rm.start()..rm.end();
+                                let mbytes = &decoded[span.clone()];
+                                if !entropy_gate_passes(
+                                    &ent,
+                                    mbytes,
+                                    entropy_scratch,
+                                    &engine.entropy_log2,
+                                ) {
+                                    continue;
+                                }
+                            }
                             let span = rm.start()..rm.end();
                             out.insert(FindingKey {
                                 rule: rule.name,

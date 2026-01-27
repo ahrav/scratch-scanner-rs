@@ -20,6 +20,7 @@
 //!
 //! For a longer design walkthrough, see `docs/architecture.md`.
 
+pub mod async_io;
 pub mod b64_yara_gate;
 pub mod pipeline;
 pub mod pool;
@@ -46,6 +47,14 @@ pub use api::{
 pub use demo::{demo_engine, demo_engine_with_anchor_mode, AnchorMode};
 
 pub use engine::{AnchorPlanStats, Engine, ScanScratch};
+
+pub use async_io::AsyncIoConfig;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use async_io::AsyncScanner;
+#[cfg(target_os = "linux")]
+pub use async_io::UringScanner;
+#[cfg(target_os = "macos")]
+pub use async_io::{DispatchScanner, MacosAioScanner};
 
 pub use runtime::{
     read_file_chunks, BufferHandle, BufferPool, Chunk, FileTable, ScannerConfig, ScannerRuntime,

@@ -1,18 +1,36 @@
 #![allow(dead_code, unused_imports, unused_variables)]
 
 use scanner_rs::pipeline::scan_path_default;
-use scanner_rs::{demo_engine_with_anchor_mode, AnchorMode};
+use scanner_rs::{demo_engine_with_anchor_mode, AnchorMode, AsyncIoConfig};
 use std::env;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+enum IoBackend {
+    /// Choose the platform async backend (no sync fallback).
+    Auto,
+    /// Force synchronous IO.
+    Sync,
+    /// Force Linux io_uring.
+    Uring,
+    /// Force macOS POSIX AIO.
+    Dispatch,
+}
+
+impl IoBackend {
+    fn default_for_platform() -> Self {
+        IoBackend::Auto
+    }
+}
+
 fn main() -> io::Result<()> {
     let mut args = env::args_os();
     let exe = args.next().unwrap_or_else(|| "scanner-rs".into());
     let mut anchor_mode = AnchorMode::Manual;
     let mut path: Option<PathBuf> = None;
+    let mut io_backend = IoBackend::default_for_platform();
 
     for arg in args {
         if let Some(flag) = arg.to_str() {
@@ -25,9 +43,25 @@ fn main() -> io::Result<()> {
                     anchor_mode = AnchorMode::Derived;
                     continue;
                 }
+                "--io=sync" => {
+                    io_backend = IoBackend::Sync;
+                    continue;
+                }
+                "--io=auto" => {
+                    io_backend = IoBackend::Auto;
+                    continue;
+                }
+                "--io=uring" => {
+                    io_backend = IoBackend::Uring;
+                    continue;
+                }
+                "--io=dispatch" | "--io=aio" => {
+                    io_backend = IoBackend::Dispatch;
+                    continue;
+                }
                 "--help" | "-h" => {
                     eprintln!(
-                        "usage: {} [--anchors=manual|derived] <path>",
+                        "usage: {} [--anchors=manual|derived] [--io=auto|sync|uring|aio|dispatch] <path>",
                         exe.to_string_lossy()
                     );
                     std::process::exit(0);
@@ -35,7 +69,7 @@ fn main() -> io::Result<()> {
                 _ if flag.starts_with("--") => {
                     eprintln!("unknown flag: {}", flag);
                     eprintln!(
-                        "usage: {} [--anchors=manual|derived] <path>",
+                        "usage: {} [--anchors=manual|derived] [--io=auto|sync|uring|aio|dispatch] <path>",
                         exe.to_string_lossy()
                     );
                     std::process::exit(2);
@@ -56,7 +90,7 @@ fn main() -> io::Result<()> {
 
     let Some(path) = path else {
         eprintln!(
-            "usage: {} [--anchors=manual|derived] <path>",
+            "usage: {} [--anchors=manual|derived] [--io=auto|sync|uring|aio|dispatch] <path>",
             exe.to_string_lossy()
         );
         std::process::exit(2);
@@ -64,7 +98,67 @@ fn main() -> io::Result<()> {
 
     let engine = Arc::new(demo_engine_with_anchor_mode(anchor_mode));
     let start = Instant::now();
-    let stats = scan_path_default(&path, engine)?;
+    let stats = match io_backend {
+        IoBackend::Sync => scan_path_default(&path, Arc::clone(&engine))?,
+        IoBackend::Auto => {
+            #[cfg(target_os = "linux")]
+            {
+                match scanner_rs::UringScanner::new(Arc::clone(&engine), AsyncIoConfig::default()) {
+                    Ok(mut scanner) => scanner.scan_path(&path)?,
+                    Err(err) => {
+                        eprintln!("io_uring unavailable ({}); use --io=sync to override", err);
+                        std::process::exit(2);
+                    }
+                }
+            }
+            #[cfg(target_os = "macos")]
+            {
+                match scanner_rs::DispatchScanner::new(
+                    Arc::clone(&engine),
+                    AsyncIoConfig::default(),
+                ) {
+                    Ok(mut scanner) => scanner.scan_path(&path)?,
+                    Err(err) => {
+                        eprintln!("POSIX AIO unavailable ({}); use --io=sync to override", err);
+                        std::process::exit(2);
+                    }
+                }
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                eprintln!("async IO not supported on this platform; use --io=sync to override");
+                std::process::exit(2);
+            }
+        }
+        IoBackend::Uring => {
+            #[cfg(target_os = "linux")]
+            {
+                let mut scanner =
+                    scanner_rs::UringScanner::new(Arc::clone(&engine), AsyncIoConfig::default())?;
+                scanner.scan_path(&path)?
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                eprintln!("--io=uring is only supported on Linux");
+                std::process::exit(2);
+            }
+        }
+        IoBackend::Dispatch => {
+            #[cfg(target_os = "macos")]
+            {
+                let mut scanner = scanner_rs::DispatchScanner::new(
+                    Arc::clone(&engine),
+                    AsyncIoConfig::default(),
+                )?;
+                scanner.scan_path(&path)?
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                eprintln!("--io=aio/--io=dispatch is only supported on macOS");
+                std::process::exit(2);
+            }
+        }
+    };
     let elapsed = start.elapsed();
     let elapsed_secs = elapsed.as_secs_f64();
     let throughput_mib = if elapsed_secs > 0.0 {
