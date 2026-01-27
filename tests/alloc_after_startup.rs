@@ -63,8 +63,8 @@ unsafe impl GlobalAlloc for CountingAlloc {
 #[global_allocator]
 static GLOBAL: CountingAlloc = CountingAlloc;
 
-#[derive(Clone, Copy, Debug)]
 /// Snapshot of allocation counters for reporting.
+#[derive(Clone, Copy, Debug)]
 struct Counts {
     alloc_calls: usize,
     alloc_bytes: usize,

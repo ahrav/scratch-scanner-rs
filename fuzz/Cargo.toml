@@ -16,6 +16,7 @@ memchr = "2"
 
 [dependencies.scanner-rs]
 path = ".."
+features = ["tiger-harness"]
 
 # Prevent this from interfering with workspaces
 [workspace]
@@ -48,6 +49,13 @@ bench = false
 [[bin]]
 name = "fuzz_anchor_soundness"
 path = "fuzz_targets/fuzz_anchor_soundness.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_tiger_chunking"
+path = "fuzz_targets/fuzz_tiger_chunking.rs"
 test = false
 doc = false
 bench = false

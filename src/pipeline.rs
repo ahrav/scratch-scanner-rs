@@ -73,6 +73,9 @@ pub struct PipelineConfig {
     /// Maximum number of files to queue.
     pub max_files: usize,
     /// Total byte capacity reserved for path storage (0 = auto).
+    ///
+    /// On Unix this is the fixed-size path arena budget; on non-Unix it is
+    /// ignored. Exceeding the arena is treated as a configuration bug.
     pub path_bytes_cap: usize,
 }
 
@@ -274,8 +277,11 @@ impl Walker {
 
 #[cfg(unix)]
 struct DirState {
+    /// DIR* opened via fdopendir; closed in Drop.
     dirp: *mut libc::DIR,
+    /// Raw fd backing `dirp`, used for openat/fstatat.
     fd: RawFd,
+    /// Path span for this directory in the file table arena.
     path: PathSpan,
 }
 
@@ -294,6 +300,7 @@ struct Walker {
     stack: ScratchVec<DirState>,
     done: bool,
     max_files: usize,
+    // Root file staged until the file ring has capacity.
     pending: Option<FileId>,
 }
 
@@ -717,6 +724,10 @@ impl ScanStage {
     }
 }
 
+/// Writes a path to the output stream.
+///
+/// On Unix we write raw bytes to avoid UTF-8 validation and allocation; output
+/// may not be valid UTF-8 for unusual paths.
 fn write_path<W: Write>(out: &mut W, path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -833,6 +844,10 @@ impl<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize>
     }
 
     /// Scans a path (file or directory) and returns summary stats.
+    ///
+    /// The pipeline reuses internal buffers and stage state across scans.
+    /// Capacity limits are hard bounds; the Unix path arena will panic if
+    /// exhausted rather than allocating.
     pub fn scan_path(&mut self, path: &Path) -> io::Result<PipelineStats> {
         let mut stats = PipelineStats::default();
 
@@ -904,6 +919,7 @@ pub fn scan_path_default(path: &Path, engine: Arc<Engine>) -> io::Result<Pipelin
     pipeline.scan_path(path)
 }
 
+/// Fixed-size stack buffer limit for Unix C-path conversions.
 #[cfg(unix)]
 const PATH_MAX: usize = 4096;
 
@@ -940,6 +956,10 @@ fn set_errno(value: libc::c_int) {
     }
 }
 
+/// Calls `f` with a NUL-terminated copy of `path` in a fixed stack buffer.
+///
+/// Rejects paths containing NUL or longer than `PATH_MAX` to avoid heap
+/// allocation when invoking libc APIs.
 #[cfg(unix)]
 fn with_c_path<T>(
     path: &Path,

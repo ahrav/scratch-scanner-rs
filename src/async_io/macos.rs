@@ -141,7 +141,8 @@ mod aio {
 /// macOS async scanner powered by POSIX AIO.
 ///
 /// The scanner stays single-threaded and uses a fixed read-ahead depth
-/// to overlap IO and scanning without unbounded buffering.
+/// to overlap IO and scanning without unbounded buffering. Per-file reader
+/// buffers are allocated once and reused across files.
 pub struct MacosAioScanner {
     engine: Arc<Engine>,
     config: AsyncIoConfig,
@@ -435,6 +436,7 @@ impl AioSlot {
 /// - keeps a fixed number of in-flight reads (read-ahead window)
 /// - preserves overlap across chunks without payload copies
 /// - emits chunks strictly in order
+/// - allocates its buffers once and reuses them via `reset_for_file`
 struct AioFileReader {
     file_id: FileId,
     file: Option<File>,
@@ -510,6 +512,10 @@ impl AioFileReader {
         })
     }
 
+    /// Prepares the reader to scan a new file without reallocating buffers.
+    ///
+    /// Any in-flight requests from the previous file are drained so that the
+    /// kernel releases them before we reuse slots and buffers.
     fn reset_for_file(&mut self, file_id: FileId, path: &Path, file_len: u64) -> io::Result<()> {
         if self.slots.iter().any(|slot| slot.is_in_flight()) {
             self.drain_in_flight();
@@ -860,6 +866,10 @@ impl AioFileReader {
         Ok(Some(chunk))
     }
 
+    /// Returns the next in-order chunk, submitting read-ahead as needed.
+    ///
+    /// This may block in `aio_suspend` when there is no immediate progress,
+    /// but does not allocate on the hot path.
     fn next_chunk(&mut self, pool: &BufferPool) -> io::Result<Option<Chunk>> {
         loop {
             let mut progressed = false;
