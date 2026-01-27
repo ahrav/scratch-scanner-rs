@@ -93,7 +93,7 @@ impl UringScanner {
         let engine = Arc::clone(&self.engine);
         self.files.clear();
         self.pending.clear();
-        self.walker.reset(path.to_path_buf())?;
+        self.walker.reset(path, &mut self.files, &mut stats)?;
 
         while !self.walker.is_done() {
             let Some(file_id) = self.walker.next_file(&mut self.files, &mut stats)? else {

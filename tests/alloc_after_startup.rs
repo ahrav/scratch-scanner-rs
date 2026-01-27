@@ -230,9 +230,10 @@ fn allocs_after_startup_in_pipeline_scan_path() -> io::Result<()> {
         counts.dealloc_calls
     );
 
-    assert!(
-        counts.total_alloc_calls() > 0,
-        "expected allocations after startup during pipeline scan"
+    assert_eq!(
+        counts.total_alloc_calls(),
+        0,
+        "expected zero allocations after warm-up during pipeline scan"
     );
 
     Ok(())
@@ -248,6 +249,9 @@ fn allocs_after_startup_in_macos_aio_scan_path() -> io::Result<()> {
     let engine = Arc::new(demo_engine());
     let mut scanner = scanner_rs::AioScanner::new(engine, scanner_rs::AsyncIoConfig::default())?;
 
+    // Warm up external caches before counting allocations.
+    let _ = scanner.scan_path(tmp.path())?;
+
     reset_counts();
     let _ = scanner.scan_path(tmp.path())?;
     let counts = snapshot_counts();
@@ -261,9 +265,10 @@ fn allocs_after_startup_in_macos_aio_scan_path() -> io::Result<()> {
         counts.dealloc_calls
     );
 
-    assert!(
-        counts.total_alloc_calls() > 0,
-        "expected allocations after startup during macOS AIO scan"
+    assert_eq!(
+        counts.total_alloc_calls(),
+        0,
+        "expected zero allocations after warm-up during macOS AIO scan"
     );
 
     Ok(())

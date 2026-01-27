@@ -9,20 +9,32 @@
 //! Stages are executed in a tight suggest/pump loop using fixed-capacity rings:
 //! Walker -> Reader -> Scanner -> Output.
 
+#[cfg(unix)]
+use crate::runtime::PathSpan;
+#[cfg(unix)]
+use crate::scratch_memory::ScratchVec;
 use crate::stdx::RingBuffer;
 use crate::{
     BufferPool, Chunk, Engine, FileId, FileTable, FindingRec, ScanScratch, BUFFER_ALIGN,
     BUFFER_LEN_MAX,
 };
-use std::fs::{self, File};
+#[cfg(not(unix))]
+use std::fs;
+use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(not(unix))]
+use std::path::PathBuf;
 use std::sync::Arc;
 
+#[cfg(unix)]
+use std::ffi::CStr;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
+use std::os::unix::io::RawFd;
 
 /// Default chunk size used by the pipeline (bytes).
 ///
@@ -138,6 +150,7 @@ impl<T, const N: usize> SpscRing<T, N> {
     }
 }
 
+#[cfg(not(unix))]
 enum WalkEntry {
     Path(PathBuf),
     Dir(fs::ReadDir),
@@ -147,12 +160,14 @@ enum WalkEntry {
 ///
 /// DFS keeps memory proportional to directory depth rather than total file count,
 /// and it naturally yields paths in a locality-friendly order for disk reads.
+#[cfg(not(unix))]
 struct Walker {
     stack: Vec<WalkEntry>,
     done: bool,
     max_files: usize,
 }
 
+#[cfg(not(unix))]
 impl Walker {
     fn new(max_files: usize) -> Self {
         Self {
@@ -162,10 +177,16 @@ impl Walker {
         }
     }
 
-    fn reset(&mut self, root: &Path) {
+    fn reset(
+        &mut self,
+        root: &Path,
+        _files: &mut FileTable,
+        _stats: &mut PipelineStats,
+    ) -> io::Result<()> {
         self.stack.clear();
         self.stack.push(WalkEntry::Path(root.to_path_buf()));
         self.done = false;
+        Ok(())
     }
 
     fn is_done(&self) -> bool {
@@ -244,6 +265,199 @@ impl Walker {
                     }
                     None => {}
                 },
+            }
+        }
+
+        Ok(progressed)
+    }
+}
+
+#[cfg(unix)]
+struct DirState {
+    dirp: *mut libc::DIR,
+    fd: RawFd,
+    path: PathSpan,
+}
+
+#[cfg(unix)]
+impl Drop for DirState {
+    fn drop(&mut self) {
+        unsafe {
+            libc::closedir(self.dirp);
+        }
+    }
+}
+
+/// Depth-first directory walker that feeds the file ring (Unix, allocation-free).
+#[cfg(unix)]
+struct Walker {
+    stack: ScratchVec<DirState>,
+    done: bool,
+    max_files: usize,
+    pending: Option<FileId>,
+}
+
+#[cfg(unix)]
+impl Walker {
+    fn new(max_files: usize) -> Self {
+        let stack = ScratchVec::with_capacity(WALKER_STACK_CAP)
+            .expect("pipeline walker stack allocation failed");
+        Self {
+            stack,
+            done: true,
+            max_files,
+            pending: None,
+        }
+    }
+
+    fn reset(
+        &mut self,
+        root: &Path,
+        files: &mut FileTable,
+        stats: &mut PipelineStats,
+    ) -> io::Result<()> {
+        self.stack.clear();
+        self.pending = None;
+        self.done = false;
+
+        let root_bytes = root.as_os_str().as_bytes();
+        if root_bytes.is_empty() {
+            self.done = true;
+            return Ok(());
+        }
+
+        let root_span = files.alloc_path_span(root_bytes);
+        let st = with_c_path(root, |c_path| unsafe {
+            let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if libc::lstat(c_path, st.as_mut_ptr()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(st.assume_init())
+        })?;
+
+        let mode = st.st_mode & libc::S_IFMT;
+        if mode == libc::S_IFLNK {
+            self.done = true;
+            return Ok(());
+        }
+
+        if mode == libc::S_IFDIR {
+            let dir_state = with_c_path(root, |c_path| open_dir(c_path, root_span))?;
+            self.stack.push(dir_state);
+            return Ok(());
+        }
+
+        if mode == libc::S_IFREG {
+            if files.len() >= self.max_files {
+                self.done = true;
+                return Ok(());
+            }
+            let id = files.push_span(root_span, st.st_size as u64, dev_inode_from_stat(&st), 0);
+            stats.files += 1;
+            self.pending = Some(id);
+            return Ok(());
+        }
+
+        self.done = true;
+        Ok(())
+    }
+
+    fn is_done(&self) -> bool {
+        self.done
+    }
+
+    fn pump<const FILE_CAP: usize>(
+        &mut self,
+        files: &mut FileTable,
+        file_ring: &mut SpscRing<FileId, FILE_CAP>,
+        stats: &mut PipelineStats,
+    ) -> io::Result<bool> {
+        let mut progressed = false;
+
+        if let Some(id) = self.pending {
+            if file_ring.is_full() {
+                return Ok(progressed);
+            }
+            self.pending = None;
+            file_ring.push_assume_capacity(id);
+            progressed = true;
+        }
+
+        while !file_ring.is_full() {
+            let Some(top) = self.stack.len().checked_sub(1) else {
+                self.done = true;
+                break;
+            };
+
+            let (dirp, dirfd, dir_path) = {
+                let entry = self.stack.get(top).expect("walker stack entry");
+                (entry.dirp, entry.fd, entry.path)
+            };
+
+            unsafe {
+                set_errno(0);
+                let ent = libc::readdir(dirp);
+                if ent.is_null() {
+                    let err = io::Error::last_os_error();
+                    if err.raw_os_error().unwrap_or(0) != 0 {
+                        stats.walk_errors += 1;
+                        stats.errors += 1;
+                    }
+                    self.stack.pop();
+                    continue;
+                }
+
+                let name = CStr::from_ptr((*ent).d_name.as_ptr());
+                let name_bytes = name.to_bytes();
+                if is_dot_or_dotdot(name_bytes) {
+                    continue;
+                }
+
+                let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+                if libc::fstatat(
+                    dirfd,
+                    name.as_ptr(),
+                    st.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                ) != 0
+                {
+                    stats.walk_errors += 1;
+                    stats.errors += 1;
+                    continue;
+                }
+                let st = st.assume_init();
+                let mode = st.st_mode & libc::S_IFMT;
+                if mode == libc::S_IFLNK {
+                    continue;
+                }
+
+                if mode == libc::S_IFDIR {
+                    let child_span = files.join_path_span(dir_path, name_bytes);
+                    let child = open_dir_at(dirfd, name.as_ptr(), child_span);
+                    match child {
+                        Ok(child) => self.stack.push(child),
+                        Err(_) => {
+                            stats.walk_errors += 1;
+                            stats.errors += 1;
+                        }
+                    }
+                    continue;
+                }
+
+                if mode != libc::S_IFREG {
+                    continue;
+                }
+
+                if files.len() >= self.max_files {
+                    self.done = true;
+                    break;
+                }
+
+                let file_span = files.join_path_span(dir_path, name_bytes);
+                let id = files.push_span(file_span, st.st_size as u64, dev_inode_from_stat(&st), 0);
+                file_ring.push_assume_capacity(id);
+                stats.files += 1;
+                progressed = true;
             }
         }
 
@@ -626,7 +840,7 @@ impl<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize>
         self.file_ring.clear();
         self.chunk_ring.clear();
         self.out_ring.clear();
-        self.walker.reset(path);
+        self.walker.reset(path, &mut self.files, &mut stats)?;
         self.reader.reset();
         self.scanner.reset();
 
@@ -690,6 +904,108 @@ pub fn scan_path_default(path: &Path, engine: Arc<Engine>) -> io::Result<Pipelin
     pipeline.scan_path(path)
 }
 
+#[cfg(unix)]
+const PATH_MAX: usize = 4096;
+
+#[cfg(unix)]
+fn is_dot_or_dotdot(name: &[u8]) -> bool {
+    name == b"." || name == b".."
+}
+
+#[cfg(unix)]
+fn dev_inode_from_stat(st: &libc::stat) -> (u64, u64) {
+    (st.st_dev as u64, st.st_ino)
+}
+
+#[cfg(unix)]
+fn errno_ptr() -> *mut libc::c_int {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::__error()
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::__errno_location()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    unsafe {
+        libc::__errno_location()
+    }
+}
+
+#[cfg(unix)]
+fn set_errno(value: libc::c_int) {
+    unsafe {
+        *errno_ptr() = value;
+    }
+}
+
+#[cfg(unix)]
+fn with_c_path<T>(
+    path: &Path,
+    f: impl FnOnce(*const libc::c_char) -> io::Result<T>,
+) -> io::Result<T> {
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.contains(&0) {
+        return Err(io::Error::other("path contains NUL"));
+    }
+    if bytes.len() >= PATH_MAX {
+        return Err(io::Error::other("path too long"));
+    }
+
+    let mut buf = [0u8; PATH_MAX + 1];
+    buf[..bytes.len()].copy_from_slice(bytes);
+    buf[bytes.len()] = 0;
+    let ptr = buf.as_ptr().cast::<libc::c_char>();
+    f(ptr)
+}
+
+#[cfg(unix)]
+fn open_dir(path: *const libc::c_char, span: PathSpan) -> io::Result<DirState> {
+    unsafe {
+        let fd = libc::open(path, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC);
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let dirp = libc::fdopendir(fd);
+        if dirp.is_null() {
+            let err = io::Error::last_os_error();
+            libc::close(fd);
+            return Err(err);
+        }
+        Ok(DirState {
+            dirp,
+            fd,
+            path: span,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn open_dir_at(dirfd: RawFd, name: *const libc::c_char, span: PathSpan) -> io::Result<DirState> {
+    unsafe {
+        let fd = libc::openat(
+            dirfd,
+            name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        );
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let dirp = libc::fdopendir(fd);
+        if dirp.is_null() {
+            let err = io::Error::last_os_error();
+            libc::close(fd);
+            return Err(err);
+        }
+        Ok(DirState {
+            dirp,
+            fd,
+            path: span,
+        })
+    }
+}
+
 fn dev_inode(meta: &std::fs::Metadata) -> (u64, u64) {
     #[cfg(unix)]
     {
@@ -704,11 +1020,11 @@ fn dev_inode(meta: &std::fs::Metadata) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
+    use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TempDir {
         path: PathBuf,

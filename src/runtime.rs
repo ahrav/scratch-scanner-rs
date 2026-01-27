@@ -78,33 +78,123 @@ impl FileTable {
 
     /// Inserts a new file record and returns its [`FileId`].
     pub fn push(&mut self, path: PathBuf, size: u64, dev_inode: (u64, u64), flags: u32) -> FileId {
-        assert!(
-            self.sizes.len() < self.sizes.capacity(),
-            "file table capacity exceeded"
-        );
-        assert!(self.sizes.len() < u32::MAX as usize);
-        let id = FileId(self.sizes.len() as u32);
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
             let bytes = path.as_os_str().as_bytes();
-            let start = self.path_bytes.len();
-            let new_len = start.saturating_add(bytes.len());
-            assert!(
-                new_len <= self.path_bytes.capacity(),
-                "path arena exhausted"
-            );
-            assert!(new_len <= u32::MAX as usize, "path bytes overflow u32");
-            self.path_bytes.extend_from_slice(bytes);
-            self.path_spans.push(PathSpan {
-                offset: start as u32,
-                len: bytes.len() as u32,
-            });
+            self.push_path_bytes(bytes, size, dev_inode, flags)
         }
         #[cfg(not(unix))]
         {
+            assert!(
+                self.sizes.len() < self.sizes.capacity(),
+                "file table capacity exceeded"
+            );
+            assert!(self.sizes.len() < u32::MAX as usize);
+            let id = FileId(self.sizes.len() as u32);
             self.paths.push(path);
+            self.sizes.push(size);
+            self.dev_inodes.push(dev_inode);
+            self.flags.push(flags);
+            id
         }
+    }
+
+    /// Inserts a new file record from raw path bytes (Unix only).
+    #[cfg(unix)]
+    pub(crate) fn push_path_bytes(
+        &mut self,
+        bytes: &[u8],
+        size: u64,
+        dev_inode: (u64, u64),
+        flags: u32,
+    ) -> FileId {
+        let span = self.alloc_path_span(bytes);
+        self.push_span(span, size, dev_inode, flags)
+    }
+
+    /// Reserves space for a path and returns its span (Unix only).
+    #[cfg(unix)]
+    pub(crate) fn alloc_path_span(&mut self, bytes: &[u8]) -> PathSpan {
+        let start = self.path_bytes.len();
+        let new_len = start.saturating_add(bytes.len());
+        assert!(
+            new_len <= self.path_bytes.capacity(),
+            "path arena exhausted"
+        );
+        assert!(new_len <= u32::MAX as usize, "path bytes overflow u32");
+        self.path_bytes.extend_from_slice(bytes);
+        PathSpan {
+            offset: start as u32,
+            len: bytes.len() as u32,
+        }
+    }
+
+    /// Appends `parent` + "/" + `name` into the path arena (Unix only).
+    #[cfg(unix)]
+    pub(crate) fn join_path_span(&mut self, parent: PathSpan, name: &[u8]) -> PathSpan {
+        let parent_start = parent.offset as usize;
+        let parent_len = parent.len as usize;
+        assert!(
+            parent_start.saturating_add(parent_len) <= self.path_bytes.len(),
+            "parent path span out of bounds"
+        );
+
+        let need_sep = if parent_len == 0 {
+            false
+        } else {
+            let last = *self
+                .path_bytes
+                .get(parent_start + parent_len - 1)
+                .expect("parent path span empty");
+            last != b'/'
+        };
+
+        let start = self.path_bytes.len();
+        let extra = if need_sep { 1 } else { 0 };
+        let new_len = start
+            .saturating_add(parent_len)
+            .saturating_add(extra)
+            .saturating_add(name.len());
+        assert!(
+            new_len <= self.path_bytes.capacity(),
+            "path arena exhausted"
+        );
+        assert!(new_len <= u32::MAX as usize, "path bytes overflow u32");
+
+        self.path_bytes
+            .extend_from_self_range(parent_start, parent_len);
+        if need_sep {
+            self.path_bytes.push(b'/');
+        }
+        self.path_bytes.extend_from_slice(name);
+
+        PathSpan {
+            offset: start as u32,
+            len: (parent_len + extra + name.len()) as u32,
+        }
+    }
+
+    /// Inserts a new file record using a previously allocated span (Unix only).
+    #[cfg(unix)]
+    pub(crate) fn push_span(
+        &mut self,
+        span: PathSpan,
+        size: u64,
+        dev_inode: (u64, u64),
+        flags: u32,
+    ) -> FileId {
+        assert!(
+            self.sizes.len() < self.sizes.capacity(),
+            "file table capacity exceeded"
+        );
+        assert!(
+            self.path_spans.len() < self.path_spans.capacity(),
+            "file table path span capacity exceeded"
+        );
+        assert!(self.sizes.len() < u32::MAX as usize);
+        let id = FileId(self.sizes.len() as u32);
+        self.path_spans.push(span);
         self.sizes.push(size);
         self.dev_inodes.push(dev_inode);
         self.flags.push(flags);
@@ -174,7 +264,7 @@ impl Default for FileTable {
 
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
-struct PathSpan {
+pub(crate) struct PathSpan {
     offset: u32,
     len: u32,
 }

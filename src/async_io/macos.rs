@@ -148,6 +148,7 @@ pub struct MacosAioScanner {
     overlap: usize,
     payload_off: usize,
     pool: BufferPool,
+    reader: AioFileReader,
     scratch: ScanScratch,
     pending: Vec<FindingRec>,
     files: FileTable,
@@ -185,6 +186,13 @@ impl MacosAioScanner {
         }
 
         let pool = BufferPool::new(config.queue_depth as usize + 1);
+        let reader = AioFileReader::new(
+            &pool,
+            payload_off,
+            overlap,
+            config.chunk_size,
+            config.queue_depth,
+        )?;
         let scratch = engine.new_scratch();
         let pending = Vec::with_capacity(engine.tuning.max_findings_per_chunk);
         let files =
@@ -198,6 +206,7 @@ impl MacosAioScanner {
             overlap,
             payload_off,
             pool,
+            reader,
             scratch,
             pending,
             files,
@@ -212,7 +221,7 @@ impl MacosAioScanner {
         let engine = Arc::clone(&self.engine);
         self.files.clear();
         self.pending.clear();
-        self.walker.reset(path.to_path_buf())?;
+        self.walker.reset(path, &mut self.files, &mut stats)?;
 
         while !self.walker.is_done() {
             let Some(file_id) = self.walker.next_file(&mut self.files, &mut stats)? else {
@@ -223,12 +232,9 @@ impl MacosAioScanner {
             let file_size = self.files.size(file_id);
 
             match scan_file(
+                &mut self.reader,
                 &self.pool,
-                self.payload_off,
-                self.overlap,
-                self.config.chunk_size,
-                self.config.queue_depth,
-                &engine,
+                engine.as_ref(),
                 &mut self.scratch,
                 &mut self.pending,
                 file_id,
@@ -258,11 +264,8 @@ impl MacosAioScanner {
 // Keep scan dependencies explicit so the hot path has no hidden state
 // and the call site shows all mutable resources.
 fn scan_file(
+    reader: &mut AioFileReader,
     pool: &BufferPool,
-    payload_off: usize,
-    overlap: usize,
-    chunk_size: usize,
-    queue_depth: u32,
     engine: &Engine,
     scratch: &mut ScanScratch,
     pending: &mut Vec<FindingRec>,
@@ -272,16 +275,7 @@ fn scan_file(
     out: &mut BufWriter<io::Stdout>,
     stats: &mut PipelineStats,
 ) -> io::Result<()> {
-    let mut reader = AioFileReader::new(
-        pool,
-        file_id,
-        path,
-        file_size,
-        payload_off,
-        overlap,
-        chunk_size,
-        queue_depth,
-    )?;
+    reader.reset_for_file(file_id, path, file_size)?;
 
     while let Some(chunk) = reader.next_chunk(pool)? {
         let payload_len = chunk.len.saturating_sub(chunk.prefix_len) as u64;
@@ -435,7 +429,7 @@ impl AioSlot {
     }
 }
 
-/// File-local AIO reader with read-ahead and ordered chunk emission.
+/// Reusable file-local AIO reader with read-ahead and ordered chunk emission.
 ///
 /// This reader:
 /// - keeps a fixed number of in-flight reads (read-ahead window)
@@ -443,12 +437,13 @@ impl AioSlot {
 /// - emits chunks strictly in order
 struct AioFileReader {
     file_id: FileId,
-    file: File,
+    file: Option<File>,
     fd: RawFd,
     file_len: u64,
     chunk_size: usize,
     overlap: usize,
     payload_off: usize,
+    queue_depth: usize,
     tail: Vec<u8>,
     tail_len: usize,
     slots: Vec<AioSlot>,
@@ -469,31 +464,19 @@ struct AioFileReader {
 
 impl AioFileReader {
     #[allow(clippy::too_many_arguments)]
-    // The reader constructor is intentionally explicit to keep call sites
-    // obvious and avoid bundling transient values into an extra struct.
+    // The reader constructor is intentionally explicit to keep capacity and
+    // layout decisions visible at the call site.
     fn new(
         pool: &BufferPool,
-        file_id: FileId,
-        path: &Path,
-        file_len: u64,
         payload_off: usize,
         overlap: usize,
         chunk_size: usize,
         queue_depth: u32,
     ) -> io::Result<Self> {
-        let file = File::open(path)?;
-        let fd = file.as_raw_fd();
-
         let queue_depth = queue_depth as usize;
         if queue_depth == 0 {
             return Err(io::Error::other("queue_depth must be > 0"));
         }
-
-        let total_chunks = if file_len == 0 {
-            0
-        } else {
-            file_len.saturating_add(chunk_size as u64 - 1) / chunk_size as u64
-        };
 
         if pool.buf_len() < payload_off + chunk_size {
             return Err(io::Error::other("buffer pool too small for payload layout"));
@@ -505,13 +488,14 @@ impl AioFileReader {
         let ready_slot = vec![0; queue_depth];
 
         Ok(Self {
-            file_id,
-            file,
-            fd,
-            file_len,
+            file_id: FileId(0),
+            file: None,
+            fd: -1,
+            file_len: 0,
             chunk_size,
             overlap,
             payload_off,
+            queue_depth,
             tail: vec![0u8; overlap],
             tail_len: 0,
             slots,
@@ -521,9 +505,54 @@ impl AioFileReader {
             next_offset: 0,
             next_seq: 0,
             next_emit_seq: 0,
-            end_seq: total_chunks,
+            end_seq: 0,
             wait_list: Vec::with_capacity(queue_depth),
         })
+    }
+
+    fn reset_for_file(&mut self, file_id: FileId, path: &Path, file_len: u64) -> io::Result<()> {
+        if self.slots.iter().any(|slot| slot.is_in_flight()) {
+            self.drain_in_flight();
+        }
+
+        self.file = None;
+        self.fd = -1;
+
+        let file = File::open(path)?;
+        let fd = file.as_raw_fd();
+
+        self.file = Some(file);
+        self.fd = fd;
+        self.file_id = file_id;
+        self.file_len = file_len;
+        self.tail_len = 0;
+        self.next_offset = 0;
+        self.next_seq = 0;
+        self.next_emit_seq = 0;
+        self.end_seq = if file_len == 0 {
+            0
+        } else {
+            file_len.saturating_add(self.chunk_size as u64 - 1) / self.chunk_size as u64
+        };
+
+        for slot in &mut self.slots {
+            slot.reset();
+        }
+
+        self.free_slots.clear();
+        for idx in (0..self.queue_depth).rev() {
+            assert!(
+                self.free_slots.len() < self.free_slots.capacity(),
+                "free slot stack capacity exceeded"
+            );
+            self.free_slots.push(idx);
+        }
+
+        self.ready_seq.fill(u64::MAX);
+        self.ready_slot.fill(0);
+        self.wait_list.clear();
+
+        Ok(())
     }
 
     fn is_done(&self) -> bool {
@@ -543,6 +572,7 @@ impl AioFileReader {
     }
 
     fn submit_reads(&mut self, pool: &BufferPool) -> io::Result<bool> {
+        debug_assert!(self.fd >= 0, "submit_reads called without open file");
         let mut progressed = false;
 
         while self.next_seq < self.end_seq {
@@ -553,6 +583,10 @@ impl AioFileReader {
             let remaining = self.file_len.saturating_sub(self.next_offset);
             if remaining == 0 {
                 self.end_seq = self.next_seq;
+                assert!(
+                    self.free_slots.len() < self.free_slots.capacity(),
+                    "free slot stack capacity exceeded"
+                );
                 self.free_slots.push(slot_idx);
                 break;
             }
@@ -561,6 +595,10 @@ impl AioFileReader {
             let handle = match pool.try_acquire() {
                 Some(handle) => handle,
                 None => {
+                    assert!(
+                        self.free_slots.len() < self.free_slots.capacity(),
+                        "free slot stack capacity exceeded"
+                    );
                     self.free_slots.push(slot_idx);
                     break;
                 }
@@ -581,10 +619,18 @@ impl AioFileReader {
                 Ok(()) => {}
                 Err(err) if Self::is_retryable_submit_error(&err) => {
                     // Back off on transient resource exhaustion and retry after completions.
+                    assert!(
+                        self.free_slots.len() < self.free_slots.capacity(),
+                        "free slot stack capacity exceeded"
+                    );
                     self.free_slots.push(slot_idx);
                     break;
                 }
                 Err(err) => {
+                    assert!(
+                        self.free_slots.len() < self.free_slots.capacity(),
+                        "free slot stack capacity exceeded"
+                    );
                     self.free_slots.push(slot_idx);
                     return Err(err);
                 }
@@ -637,16 +683,26 @@ impl AioFileReader {
                     self.ready_seq[pos] = u64::MAX;
                 }
                 slot.reset();
-                self.free_slots.push(idx);
+                let free_slots = &mut self.free_slots;
+                assert!(
+                    free_slots.len() < free_slots.capacity(),
+                    "free slot stack capacity exceeded"
+                );
+                free_slots.push(idx);
             }
         }
     }
 
     fn wait_for_completion(&mut self) -> io::Result<()> {
         self.wait_list.clear();
+        let wait_list = &mut self.wait_list;
         for slot in &self.slots {
             if slot.is_in_flight() {
-                self.wait_list.push(&slot.cb as *const libc::aiocb);
+                assert!(
+                    wait_list.len() < wait_list.capacity(),
+                    "wait list capacity exceeded"
+                );
+                wait_list.push(&slot.cb as *const libc::aiocb);
             }
         }
 
@@ -672,6 +728,7 @@ impl AioFileReader {
         if !self.slots.iter().any(|slot| slot.is_in_flight()) {
             return;
         }
+        debug_assert!(self.fd >= 0, "drain_in_flight called without open file");
 
         // Best-effort cancellation to trigger completion and release resources.
         for slot in &self.slots {
@@ -682,9 +739,14 @@ impl AioFileReader {
 
         loop {
             self.wait_list.clear();
+            let wait_list = &mut self.wait_list;
             for slot in &self.slots {
                 if slot.is_in_flight() {
-                    self.wait_list.push(&slot.cb as *const libc::aiocb);
+                    assert!(
+                        wait_list.len() < wait_list.capacity(),
+                        "wait list capacity exceeded"
+                    );
+                    wait_list.push(&slot.cb as *const libc::aiocb);
                 }
             }
 
@@ -746,6 +808,10 @@ impl AioFileReader {
             .take()
             .expect("completed slot must hold a buffer");
         slot.reset();
+        assert!(
+            self.free_slots.len() < self.free_slots.capacity(),
+            "free slot stack capacity exceeded"
+        );
         self.free_slots.push(idx);
 
         if read_len == 0 {
@@ -880,14 +946,12 @@ mod tests {
 
         let mut reader = AioFileReader::new(
             &scanner.pool,
-            file_id,
-            &path,
-            data.len() as u64,
             scanner.payload_off,
             scanner.overlap,
             scanner.config.chunk_size,
             scanner.config.queue_depth,
         )?;
+        reader.reset_for_file(file_id, &path, data.len() as u64)?;
 
         let mut chunks = Vec::new();
         let start = std::time::Instant::now();
@@ -941,14 +1005,12 @@ mod tests {
         let scanner = MacosAioScanner::new(engine, config)?;
         let mut reader = AioFileReader::new(
             &scanner.pool,
-            FileId(0),
-            &path,
-            data.len() as u64,
             scanner.payload_off,
             scanner.overlap,
             scanner.config.chunk_size,
             scanner.config.queue_depth,
         )?;
+        reader.reset_for_file(FileId(0), &path, data.len() as u64)?;
 
         assert!(reader.submit_reads(&scanner.pool)?);
         assert!(reader.slots.iter().any(|slot| slot.is_in_flight()));
@@ -976,14 +1038,12 @@ mod tests {
         let scanner = MacosAioScanner::new(engine, config)?;
         let mut reader = AioFileReader::new(
             &scanner.pool,
-            FileId(0),
-            &path,
-            data.len() as u64,
             scanner.payload_off,
             scanner.overlap,
             scanner.config.chunk_size,
             scanner.config.queue_depth,
         )?;
+        reader.reset_for_file(FileId(0), &path, data.len() as u64)?;
 
         aio::inject_read_eagain(1);
         let progressed = reader.submit_reads(&scanner.pool)?;
@@ -1015,14 +1075,12 @@ mod tests {
         let scanner = MacosAioScanner::new(engine, config)?;
         let mut reader = AioFileReader::new(
             &scanner.pool,
-            FileId(0),
-            &path,
-            data.len() as u64,
             scanner.payload_off,
             scanner.overlap,
             scanner.config.chunk_size,
             scanner.config.queue_depth,
         )?;
+        reader.reset_for_file(FileId(0), &path, data.len() as u64)?;
 
         assert!(reader.submit_reads(&scanner.pool)?);
         let in_flight = reader
@@ -1058,14 +1116,12 @@ mod tests {
         let scanner = MacosAioScanner::new(engine, config)?;
         let mut reader = AioFileReader::new(
             &scanner.pool,
-            FileId(0),
-            &path,
-            data.len() as u64,
             scanner.payload_off,
             scanner.overlap,
             scanner.config.chunk_size,
             scanner.config.queue_depth,
         )?;
+        reader.reset_for_file(FileId(0), &path, data.len() as u64)?;
 
         let caps = (
             reader.free_slots.capacity(),

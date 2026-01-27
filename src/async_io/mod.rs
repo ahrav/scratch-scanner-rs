@@ -9,15 +9,24 @@
 use crate::pipeline::PipelineStats;
 use crate::scratch_memory::ScratchVec;
 use crate::{FileId, FileTable, BUFFER_ALIGN, BUFFER_LEN_MAX};
+#[cfg(not(unix))]
 use std::fs;
 use std::io;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(not(unix))]
+use std::path::PathBuf;
 
+#[cfg(unix)]
+use crate::runtime::PathSpan;
+#[cfg(unix)]
+use std::ffi::CStr;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
+use std::os::unix::io::RawFd;
 
 /// Default chunk size for async IO scanners (bytes).
 ///
@@ -102,10 +111,113 @@ fn write_path<W: Write>(out: &mut W, path: &Path) -> io::Result<()> {
     }
 }
 
+#[cfg(unix)]
+const PATH_MAX: usize = 4096;
+
+#[cfg(unix)]
+fn is_dot_or_dotdot(name: &[u8]) -> bool {
+    name == b"." || name == b".."
+}
+
+#[cfg(unix)]
+fn dev_inode_from_stat(st: &libc::stat) -> (u64, u64) {
+    (st.st_dev as u64, st.st_ino)
+}
+
+#[cfg(unix)]
+fn errno_ptr() -> *mut libc::c_int {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::__error()
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::__errno_location()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    unsafe {
+        libc::__errno_location()
+    }
+}
+
+#[cfg(unix)]
+fn set_errno(value: libc::c_int) {
+    unsafe {
+        *errno_ptr() = value;
+    }
+}
+
+#[cfg(unix)]
+fn with_c_path<T>(
+    path: &Path,
+    f: impl FnOnce(*const libc::c_char) -> io::Result<T>,
+) -> io::Result<T> {
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.contains(&0) {
+        return Err(io::Error::other("path contains NUL"));
+    }
+    if bytes.len() >= PATH_MAX {
+        return Err(io::Error::other("path too long"));
+    }
+
+    let mut buf = [0u8; PATH_MAX + 1];
+    buf[..bytes.len()].copy_from_slice(bytes);
+    buf[bytes.len()] = 0;
+    let ptr = buf.as_ptr().cast::<libc::c_char>();
+    f(ptr)
+}
+
+#[cfg(unix)]
+fn open_dir(path: *const libc::c_char, span: PathSpan) -> io::Result<DirState> {
+    unsafe {
+        let fd = libc::open(path, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC);
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let dirp = libc::fdopendir(fd);
+        if dirp.is_null() {
+            let err = io::Error::last_os_error();
+            libc::close(fd);
+            return Err(err);
+        }
+        Ok(DirState {
+            dirp,
+            fd,
+            path: span,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn open_dir_at(dirfd: RawFd, name: *const libc::c_char, span: PathSpan) -> io::Result<DirState> {
+    unsafe {
+        let fd = libc::openat(
+            dirfd,
+            name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        );
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let dirp = libc::fdopendir(fd);
+        if dirp.is_null() {
+            let err = io::Error::last_os_error();
+            libc::close(fd);
+            return Err(err);
+        }
+        Ok(DirState {
+            dirp,
+            fd,
+            path: span,
+        })
+    }
+}
+
 // --------------------------
 // Path walking (async)
 // --------------------------
 
+#[cfg(not(unix))]
 enum WalkEntry {
     Path(PathBuf),
     Dir(fs::ReadDir),
@@ -115,12 +227,14 @@ enum WalkEntry {
 ///
 /// This mirrors the pipeline walk behavior but exposes a `next_file` iterator
 /// for sequential async scanners.
+#[cfg(not(unix))]
 struct Walker {
     stack: ScratchVec<WalkEntry>,
     done: bool,
     max_files: usize,
 }
 
+#[cfg(not(unix))]
 impl Walker {
     fn new(max_files: usize) -> io::Result<Self> {
         let stack = ScratchVec::with_capacity(WALKER_STACK_CAP)
@@ -132,10 +246,15 @@ impl Walker {
         })
     }
 
-    fn reset(&mut self, root: PathBuf) -> io::Result<()> {
+    fn reset(
+        &mut self,
+        root: &Path,
+        _files: &mut FileTable,
+        _stats: &mut PipelineStats,
+    ) -> io::Result<()> {
         self.stack.clear();
         self.done = false;
-        self.push_entry(WalkEntry::Path(root))
+        self.push_entry(WalkEntry::Path(root.to_path_buf()))
     }
 
     fn is_done(&self) -> bool {
@@ -215,6 +334,187 @@ impl Walker {
         }
         self.stack.push(entry);
         Ok(())
+    }
+}
+
+#[cfg(unix)]
+struct DirState {
+    dirp: *mut libc::DIR,
+    fd: RawFd,
+    path: PathSpan,
+}
+
+#[cfg(unix)]
+impl Drop for DirState {
+    fn drop(&mut self) {
+        unsafe {
+            libc::closedir(self.dirp);
+        }
+    }
+}
+
+/// Unix walker that avoids per-entry heap allocations.
+#[cfg(unix)]
+struct Walker {
+    stack: ScratchVec<DirState>,
+    done: bool,
+    max_files: usize,
+    pending: Option<FileId>,
+}
+
+#[cfg(unix)]
+impl Walker {
+    fn new(max_files: usize) -> io::Result<Self> {
+        let stack = ScratchVec::with_capacity(WALKER_STACK_CAP)
+            .map_err(|_| io::Error::other("async walker stack allocation failed"))?;
+        Ok(Self {
+            stack,
+            done: true,
+            max_files,
+            pending: None,
+        })
+    }
+
+    fn reset(
+        &mut self,
+        root: &Path,
+        files: &mut FileTable,
+        stats: &mut PipelineStats,
+    ) -> io::Result<()> {
+        self.stack.clear();
+        self.pending = None;
+        self.done = false;
+
+        let root_bytes = root.as_os_str().as_bytes();
+        if root_bytes.is_empty() {
+            self.done = true;
+            return Ok(());
+        }
+
+        let root_span = files.alloc_path_span(root_bytes);
+        let st = with_c_path(root, |c_path| unsafe {
+            let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if libc::lstat(c_path, st.as_mut_ptr()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(st.assume_init())
+        })?;
+
+        let mode = st.st_mode & libc::S_IFMT;
+        if mode == libc::S_IFLNK {
+            self.done = true;
+            return Ok(());
+        }
+
+        if mode == libc::S_IFDIR {
+            let dir_state = with_c_path(root, |c_path| open_dir(c_path, root_span))?;
+            self.stack.push(dir_state);
+            return Ok(());
+        }
+
+        if mode == libc::S_IFREG {
+            if files.len() >= self.max_files {
+                self.done = true;
+                return Ok(());
+            }
+            let id = files.push_span(root_span, st.st_size as u64, dev_inode_from_stat(&st), 0);
+            stats.files += 1;
+            self.pending = Some(id);
+            return Ok(());
+        }
+
+        self.done = true;
+        Ok(())
+    }
+
+    fn is_done(&self) -> bool {
+        self.done
+    }
+
+    fn next_file(
+        &mut self,
+        files: &mut FileTable,
+        stats: &mut PipelineStats,
+    ) -> io::Result<Option<FileId>> {
+        if let Some(id) = self.pending {
+            self.pending = None;
+            return Ok(Some(id));
+        }
+
+        while let Some(top) = self.stack.len().checked_sub(1) {
+            let (dirp, dirfd, dir_path) = {
+                let entry = self.stack.get(top).expect("walker stack entry");
+                (entry.dirp, entry.fd, entry.path)
+            };
+
+            unsafe {
+                set_errno(0);
+                let ent = libc::readdir(dirp);
+                if ent.is_null() {
+                    let err = io::Error::last_os_error();
+                    if err.raw_os_error().unwrap_or(0) != 0 {
+                        stats.walk_errors += 1;
+                        stats.errors += 1;
+                    }
+                    self.stack.pop();
+                    continue;
+                }
+
+                let name = CStr::from_ptr((*ent).d_name.as_ptr());
+                let name_bytes = name.to_bytes();
+                if is_dot_or_dotdot(name_bytes) {
+                    continue;
+                }
+
+                let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+                if libc::fstatat(
+                    dirfd,
+                    name.as_ptr(),
+                    st.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                ) != 0
+                {
+                    stats.walk_errors += 1;
+                    stats.errors += 1;
+                    continue;
+                }
+                let st = st.assume_init();
+                let mode = st.st_mode & libc::S_IFMT;
+                if mode == libc::S_IFLNK {
+                    continue;
+                }
+
+                if mode == libc::S_IFDIR {
+                    let child_span = files.join_path_span(dir_path, name_bytes);
+                    let child = open_dir_at(dirfd, name.as_ptr(), child_span);
+                    match child {
+                        Ok(child) => self.stack.push(child),
+                        Err(_) => {
+                            stats.walk_errors += 1;
+                            stats.errors += 1;
+                        }
+                    }
+                    continue;
+                }
+
+                if mode != libc::S_IFREG {
+                    continue;
+                }
+
+                if files.len() >= self.max_files {
+                    self.done = true;
+                    return Ok(None);
+                }
+
+                let file_span = files.join_path_span(dir_path, name_bytes);
+                let id = files.push_span(file_span, st.st_size as u64, dev_inode_from_stat(&st), 0);
+                stats.files += 1;
+                return Ok(Some(id));
+            }
+        }
+
+        self.done = true;
+        Ok(None)
     }
 }
 

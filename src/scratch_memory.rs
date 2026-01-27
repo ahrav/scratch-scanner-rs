@@ -316,6 +316,35 @@ impl<T> ScratchVec<T> {
         self.len = new_len;
     }
 
+    /// Appends a range from this vector's existing contents.
+    ///
+    /// This is useful for building new data from previous bytes without
+    /// allocating intermediate buffers. The source range may overlap with
+    /// the destination (memmove semantics).
+    pub fn extend_from_self_range(&mut self, start: usize, len: usize)
+    where
+        T: Copy,
+    {
+        assert!(start <= self.len, "scratch vec range start out of bounds");
+        assert!(
+            start.saturating_add(len) <= self.len,
+            "scratch vec range end out of bounds"
+        );
+        let new_len = self.len.saturating_add(len);
+        assert!(
+            new_len <= self.cap,
+            "scratch vec capacity exceeded on extend_from_self_range"
+        );
+        unsafe {
+            std::ptr::copy(
+                self.ptr.as_ptr().add(start).cast::<T>(),
+                self.ptr.as_ptr().add(self.len).cast::<T>(),
+                len,
+            );
+        }
+        self.len = new_len;
+    }
+
     /// Removes and returns the last element, or `None` if empty.
     ///
     /// This is the fixed-capacity equivalent of `Vec::pop`. The capacity remains
