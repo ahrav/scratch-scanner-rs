@@ -31,6 +31,7 @@ pub mod util;
 use crate::regex2anchor::{
     compile_trigger_plan, AnchorDeriveConfig, ResidueGatePlan, TriggerPlan, UnfilterableReason,
 };
+use crate::b64_yara_gate::{Base64YaraGate, Base64YaraGateConfig, PaddingPolicy, WhitespacePolicy};
 use ahash::AHashMap;
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use memchr::memchr;
@@ -1164,6 +1165,8 @@ impl ScanScratch {
         self.gate.reset();
         self.step_arena.reset();
         self.utf16_buf.clear();
+        #[cfg(feature = "b64-stats")]
+        self.base64_stats.reset();
         self.touched_pairs.clear();
         self.touched_any = false;
         self.windows.clear();
