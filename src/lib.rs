@@ -1274,6 +1274,15 @@ impl Engine {
 
         // Build deduped anchor patterns: pattern -> targets
         let mut pat_map: AHashMap<Vec<u8>, Vec<Target>> = AHashMap::new();
+        let mut residue_rules: Vec<(usize, ResidueGatePlan)> = Vec::new();
+        let mut unfilterable_rules: Vec<(usize, UnfilterableReason)> = Vec::new();
+        let mut anchor_plan_stats = AnchorPlanStats::default();
+        let derive_cfg = AnchorDeriveConfig {
+            utf8: false,
+            ..AnchorDeriveConfig::default()
+        };
+        let allow_manual = matches!(policy, AnchorPolicy::ManualOnly | AnchorPolicy::PreferDerived);
+        let allow_derive = matches!(policy, AnchorPolicy::DerivedOnly | AnchorPolicy::PreferDerived);
 
         for (rid, r) in rules.iter().enumerate() {
             debug_assert!(rid <= u32::MAX as usize);
