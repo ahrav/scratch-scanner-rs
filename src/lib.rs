@@ -3688,8 +3688,8 @@ mod tests {
     fn url_span_includes_prefix_and_finds_ghp() {
         let eng = demo_engine();
         // ghp_ + 36 chars
-        let token = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let url = token.replace("_", "%5F"); // ghp%5Faaaa...
+        let token = "ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8";
+        let url = token.replace("_", "%5F"); // ghp%5F...
         let hay = format!("token={}", url).into_bytes();
 
         let hits = eng.scan_chunk(&hay);
@@ -3825,8 +3825,8 @@ mod tests {
         let eng = demo_engine();
 
         // URL-encoded underscore inside base64.
-        let token = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let url = token.replace("_", "%5F"); // ghp%5Faaaa...
+        let token = "ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8";
+        let url = token.replace("_", "%5F"); // ghp%5F...
         let b64 = b64_encode(url.as_bytes());
 
         let hay = format!("X{}Y", b64).into_bytes();
