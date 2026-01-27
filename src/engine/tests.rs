@@ -1148,13 +1148,14 @@ fn token_strategy_covers_demo_rules() {
 #[test]
 fn scan_file_sync_materializes_provenance_across_chunks() -> std::io::Result<()> {
     let engine = Arc::new(demo_engine());
-    let runtime = ScannerRuntime::new(
+    let mut runtime = ScannerRuntime::new(
         engine.clone(),
         ScannerConfig {
             chunk_size: 32,
             io_queue: 2,
             reader_threads: 1,
             scan_threads: 1,
+            max_findings_per_file: 1024,
         },
     );
 
@@ -1170,7 +1171,7 @@ fn scan_file_sync_materializes_provenance_across_chunks() -> std::io::Result<()>
     let findings = runtime.scan_file_sync(FileId(0), tmp.path())?;
 
     assert!(findings.iter().any(|f| f.rule == "aws-access-token"));
-    if let Err(msg) = validate_findings(&engine, &buf, &findings) {
+    if let Err(msg) = validate_findings(&engine, &buf, findings) {
         panic!("{}", msg);
     }
 
@@ -1192,13 +1193,14 @@ fn scan_file_sync_drops_prefix_duplicates() -> std::io::Result<()> {
         re: Regex::new("X").unwrap(),
     }];
     let engine = Arc::new(Engine::new(rules, Vec::new(), demo_tuning()));
-    let runtime = ScannerRuntime::new(
+    let mut runtime = ScannerRuntime::new(
         engine,
         ScannerConfig {
             chunk_size: 4,
             io_queue: 1,
             reader_threads: 1,
             scan_threads: 1,
+            max_findings_per_file: 64,
         },
     );
 

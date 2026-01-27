@@ -794,6 +794,8 @@ impl AioFileReader {
             progressed |= self.poll_completions()?;
 
             if let Some(chunk) = self.emit_ready()? {
+                // Keep the read-ahead window full while the caller scans this chunk.
+                let _ = self.submit_reads(pool)?;
                 return Ok(Some(chunk));
             }
 
@@ -815,8 +817,8 @@ impl Drop for AioFileReader {
     }
 }
 
-/// Back-compat alias: `--io=dispatch` maps to the POSIX AIO backend.
-pub type DispatchScanner = MacosAioScanner;
+/// Preferred alias for the macOS POSIX AIO scanner.
+pub type AioScanner = MacosAioScanner;
 
 #[cfg(test)]
 mod tests {

@@ -1,5 +1,5 @@
 use crate::api::{FileId, Finding};
-use crate::engine::Engine;
+use crate::engine::{Engine, ScanScratch};
 use crate::pool::NodePoolType;
 use std::cell::{Cell, UnsafeCell};
 use std::fs::File;
@@ -259,19 +259,25 @@ impl Drop for BufferHandle {
 /// - `base_offset`: file offset where the chunk *starts* in the original file
 ///
 /// This makes span reporting consistent even when a match begins in the overlap.
+///
+/// The caller provides the overlap `tail` buffer to avoid per-scan allocations.
 pub fn read_file_chunks(
     file_id: FileId,
     path: &Path,
     pool: &BufferPool,
     chunk_size: usize,
     overlap: usize,
+    tail: &mut [u8],
     mut emit: impl FnMut(Chunk) -> ControlFlow<()>,
 ) -> io::Result<()> {
     assert!(chunk_size > 0);
     assert!(chunk_size.saturating_add(overlap) <= BUFFER_LEN_MAX);
+    assert!(
+        overlap <= tail.len(),
+        "overlap exceeds provided tail buffer"
+    );
     let mut file = File::open(path)?;
     let mut tail_len = 0usize;
-    let mut tail = vec![0u8; overlap];
     let mut offset = 0u64;
 
     loop {
@@ -330,6 +336,8 @@ pub struct ScannerConfig {
     pub reader_threads: usize,
     /// Scan thread count used by the caller (for pool sizing).
     pub scan_threads: usize,
+    /// Maximum number of findings retained per file.
+    pub max_findings_per_file: usize,
 }
 
 impl ScannerConfig {
@@ -350,6 +358,9 @@ pub struct ScannerRuntime {
     config: ScannerConfig,
     overlap: usize,
     pool: BufferPool,
+    scratch: ScanScratch,
+    out: Vec<Finding>,
+    tail: Vec<u8>,
 }
 
 impl ScannerRuntime {
@@ -362,40 +373,55 @@ impl ScannerRuntime {
             "chunk_size + overlap exceeds BUFFER_LEN_MAX"
         );
         let pool = BufferPool::new(config.pool_capacity());
+        let scratch = engine.new_scratch();
+        let out = Vec::with_capacity(config.max_findings_per_file);
+        let tail = vec![0u8; overlap];
         Self {
             engine,
             config,
             overlap,
             pool,
+            scratch,
+            out,
+            tail,
         }
     }
 
     /// Scans a single file synchronously, returning findings with provenance.
-    pub fn scan_file_sync(&self, file_id: FileId, path: &Path) -> io::Result<Vec<Finding>> {
-        let mut scratch = self.engine.new_scratch();
-        let mut out = Vec::new();
+    ///
+    /// Findings are stored in an internal fixed-capacity buffer sized at
+    /// startup. If the capacity is exceeded, an error is returned.
+    pub fn scan_file_sync(&mut self, file_id: FileId, path: &Path) -> io::Result<&[Finding]> {
+        self.out.clear();
+        let mut overflow = false;
 
-        read_file_chunks(
-            file_id,
-            path,
-            &self.pool,
-            self.config.chunk_size,
-            self.overlap,
-            |chunk| {
-                self.engine.scan_chunk_into(
-                    chunk.data(),
-                    chunk.file_id,
-                    chunk.base_offset,
-                    &mut scratch,
-                );
-                let new_bytes_start = chunk.base_offset + chunk.prefix_len as u64;
-                scratch.drop_prefix_findings(new_bytes_start);
-                self.engine
-                    .drain_findings_materialized(&mut scratch, &mut out);
-                ControlFlow::Continue(())
-            },
-        )?;
+        let engine = &self.engine;
+        let pool = &self.pool;
+        let chunk_size = self.config.chunk_size;
+        let overlap = self.overlap;
+        let tail = &mut self.tail;
+        let scratch = &mut self.scratch;
+        let out = &mut self.out;
 
-        Ok(out)
+        read_file_chunks(file_id, path, pool, chunk_size, overlap, tail, |chunk| {
+            engine.scan_chunk_into(chunk.data(), chunk.file_id, chunk.base_offset, scratch);
+            let new_bytes_start = chunk.base_offset + chunk.prefix_len as u64;
+            scratch.drop_prefix_findings(new_bytes_start);
+
+            let pending = scratch.pending_findings_len();
+            if out.len().saturating_add(pending) > out.capacity() {
+                overflow = true;
+                return ControlFlow::Break(());
+            }
+
+            engine.drain_findings_materialized(scratch, out);
+            ControlFlow::Continue(())
+        })?;
+
+        if overflow {
+            return Err(io::Error::from(io::ErrorKind::Other));
+        }
+
+        Ok(self.out.as_slice())
     }
 }

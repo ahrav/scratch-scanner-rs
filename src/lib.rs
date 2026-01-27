@@ -55,7 +55,7 @@ pub use async_io::AsyncScanner;
 #[cfg(target_os = "linux")]
 pub use async_io::UringScanner;
 #[cfg(target_os = "macos")]
-pub use async_io::{DispatchScanner, MacosAioScanner};
+pub use async_io::{AioScanner, MacosAioScanner};
 
 pub use runtime::{
     read_file_chunks, BufferHandle, BufferPool, Chunk, FileTable, ScannerConfig, ScannerRuntime,

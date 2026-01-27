@@ -229,4 +229,4 @@ pub type AsyncScanner = macos::MacosAioScanner;
 pub use linux::UringScanner;
 
 #[cfg(target_os = "macos")]
-pub use macos::{DispatchScanner, MacosAioScanner};
+pub use macos::{AioScanner, MacosAioScanner};

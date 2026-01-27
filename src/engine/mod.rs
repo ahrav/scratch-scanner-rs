@@ -761,6 +761,11 @@ impl ScanScratch {
         out.extend(self.out.drain());
     }
 
+    /// Returns the number of pending compact findings.
+    pub fn pending_findings_len(&self) -> usize {
+        self.out.len()
+    }
+
     /// Moves all findings into `out`, reusing its allocation.
     ///
     /// See [`ScanScratch::drain_findings`] for capacity requirements.
