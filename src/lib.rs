@@ -20,20 +20,20 @@
 //!
 //! For a longer design walkthrough, see `docs/architecture.md`.
 
+pub mod b64_yara_gate;
 pub mod pipeline;
 pub mod pool;
 pub mod regex2anchor;
 pub mod scratch_memory;
 pub mod stdx;
-pub mod b64_yara_gate;
 #[cfg(test)]
 pub mod test_utils;
 pub mod util;
 
+use crate::b64_yara_gate::{Base64YaraGate, Base64YaraGateConfig, PaddingPolicy, WhitespacePolicy};
 use crate::regex2anchor::{
     compile_trigger_plan, AnchorDeriveConfig, ResidueGatePlan, TriggerPlan, UnfilterableReason,
 };
-use crate::b64_yara_gate::{Base64YaraGate, Base64YaraGateConfig, PaddingPolicy, WhitespacePolicy};
 use ahash::AHashMap;
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use memchr::memchr;
@@ -303,8 +303,40 @@ pub struct RuleSpec {
     /// Optional cheap byte-substring check before running regex.
     pub must_contain: Option<&'static [u8]>,
 
+    /// Optional keyword gate (any-of) checked inside the same validation window.
+    ///
+    /// Keywords are *local context* gates: at least one must appear in the same
+    /// window where the regex is evaluated. This keeps correctness aligned with
+    /// single-pass, chunked scanning (no global context) while filtering noisy
+    /// windows cheaply via memmem.
+    ///
+    /// Keywords are compiled into raw + UTF-16LE/BE variants the same way anchors
+    /// are, so the gate works consistently across encodings.
+    pub keywords_any: Option<&'static [&'static [u8]]>,
+
+    /// Optional entropy gate evaluated on each regex match.
+    ///
+    /// This is a *post-regex* filter applied to the match bytes. It is useful for
+    /// secret-like tokens that should be high-entropy; low-entropy matches are
+    /// likely false positives. Entropy is bounded by min/max length to keep cost
+    /// predictable and avoid noisy small-sample statistics.
+    pub entropy: Option<EntropySpec>,
+
     /// Final check. Bytes regex (no UTF-8 assumption).
     pub re: Regex,
+}
+
+/// Shannon-entropy gate configuration.
+///
+/// - Entropy is computed over the matched byte slice (full regex match).
+/// - Threshold is bits/byte in [0.0, 8.0].
+/// - Matches shorter than `min_len` pass (entropy is noisy on tiny samples).
+/// - Matches longer than `max_len` are capped for cost control.
+#[derive(Clone, Debug)]
+pub struct EntropySpec {
+    pub min_bits_per_byte: f32,
+    pub min_len: usize,
+    pub max_len: usize,
 }
 
 /// Engine tuning knobs for performance and DoS protection.
@@ -838,6 +870,22 @@ struct TwoPhaseCompiled {
     confirm: [PackedPatterns; 3],
 }
 
+#[derive(Clone, Debug)]
+struct KeywordsCompiled {
+    // Raw / Utf16Le / Utf16Be variants packed for fast memmem gating.
+    // This mirrors anchor variant handling so keyword gating behaves consistently
+    // across encodings and avoids per-window UTF-16 conversions.
+    any: [PackedPatterns; 3],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct EntropyCompiled {
+    // Prevalidated config stored in compiled rules to avoid repeated lookups.
+    min_bits_per_byte: f32,
+    min_len: usize,
+    max_len: usize,
+}
+
 /// Compiled rule representation used during scanning.
 ///
 /// This keeps precompiled regexes and optional two-phase data to minimize
@@ -847,6 +895,8 @@ struct RuleCompiled {
     name: &'static str,
     radius: usize,
     must_contain: Option<&'static [u8]>,
+    keywords: Option<KeywordsCompiled>,
+    entropy: Option<EntropyCompiled>,
     re: Regex,
     two_phase: Option<TwoPhaseCompiled>,
 }
@@ -1093,6 +1143,35 @@ impl DecodeSlab {
     }
 }
 
+#[derive(Clone, Copy)]
+struct EntropyScratch {
+    // Histogram for byte frequencies (256 bins).
+    counts: [u32; 256],
+    // List of "touched" byte values so we can reset in O(distinct) instead of O(256).
+    used: [u8; 256],
+    used_len: u16,
+}
+
+impl EntropyScratch {
+    fn new() -> Self {
+        Self {
+            counts: [0u32; 256],
+            used: [0u8; 256],
+            used_len: 0,
+        }
+    }
+
+    #[inline]
+    fn reset(&mut self) {
+        let used_len = self.used_len as usize;
+        for i in 0..used_len {
+            let b = self.used[i] as usize;
+            self.counts[b] = 0;
+        }
+        self.used_len = 0;
+    }
+}
+
 /// Per-scan scratch state reused across chunks.
 ///
 /// This is the main allocation amortization vehicle: it owns buffers for window
@@ -1118,9 +1197,10 @@ pub struct ScanScratch {
     gate: GateScratch,                // Streaming gate scratch buffers.
     step_arena: StepArena,            // Decode provenance arena.
     utf16_buf: Vec<u8>,               // UTF-16 decode output buffer.
+    entropy_scratch: EntropyScratch,  // Entropy histogram scratch.
     steps_buf: Vec<DecodeStep>,       // Materialization scratch.
     #[cfg(feature = "b64-stats")]
-    base64_stats: Base64DecodeStats,  // Base64 decode/gate instrumentation.
+    base64_stats: Base64DecodeStats, // Base64 decode/gate instrumentation.
 }
 
 impl ScanScratch {
@@ -1181,6 +1261,7 @@ impl ScanScratch {
                 nodes: Vec::with_capacity(max_steps),
             },
             utf16_buf: Vec::with_capacity(engine.tuning.max_utf16_decoded_bytes_per_window),
+            entropy_scratch: EntropyScratch::new(),
             steps_buf: Vec::with_capacity(engine.tuning.max_transform_depth.saturating_add(1)),
             #[cfg(feature = "b64-stats")]
             base64_stats: Base64DecodeStats::default(),
@@ -1200,6 +1281,7 @@ impl ScanScratch {
         self.gate.reset();
         self.step_arena.reset();
         self.utf16_buf.clear();
+        self.entropy_scratch.reset();
         #[cfg(feature = "b64-stats")]
         self.base64_stats.reset();
         self.touched_pairs.clear();
@@ -1342,6 +1424,9 @@ pub struct Engine {
     transforms: Vec<TransformConfig>,
     tuning: Tuning,
 
+    // Log2 lookup table for entropy gating.
+    entropy_log2: Vec<f32>,
+
     // Anchors AC (raw + UTF16 variants), deduped patterns.
     ac_anchors: AhoCorasick,
     pat_targets: Vec<Target>,
@@ -1398,6 +1483,12 @@ impl Engine {
         policy: AnchorPolicy,
     ) -> Self {
         let rules_compiled = rules.iter().map(compile_rule).collect::<Vec<_>>();
+        let max_entropy_len = rules_compiled
+            .iter()
+            .filter_map(|r| r.entropy.map(|e| e.max_len))
+            .max()
+            .unwrap_or(0);
+        let entropy_log2 = build_log2_table(max_entropy_len);
 
         // Build deduped anchor patterns: pattern -> targets
         let mut pat_map: AHashMap<Vec<u8>, Vec<Target>> = AHashMap::new();
@@ -1539,6 +1630,7 @@ impl Engine {
             rules: rules_compiled,
             transforms,
             tuning,
+            entropy_log2,
             ac_anchors,
             pat_targets,
             pat_offsets,
@@ -1687,18 +1779,14 @@ impl Engine {
                             if let Some(gate) = &self.b64_gate {
                                 #[cfg(feature = "b64-stats")]
                                 {
-                                    scratch.base64_stats.pre_gate_checks = scratch
-                                        .base64_stats
-                                        .pre_gate_checks
-                                        .saturating_add(1);
+                                    scratch.base64_stats.pre_gate_checks =
+                                        scratch.base64_stats.pre_gate_checks.saturating_add(1);
                                 }
                                 if !gate.hits(enc) {
                                     #[cfg(feature = "b64-stats")]
                                     {
-                                        scratch.base64_stats.pre_gate_skip = scratch
-                                            .base64_stats
-                                            .pre_gate_skip
-                                            .saturating_add(1);
+                                        scratch.base64_stats.pre_gate_skip =
+                                            scratch.base64_stats.pre_gate_skip.saturating_add(1);
                                         scratch.base64_stats.pre_gate_skip_bytes = scratch
                                             .base64_stats
                                             .pre_gate_skip_bytes
@@ -1708,10 +1796,8 @@ impl Engine {
                                 }
                                 #[cfg(feature = "b64-stats")]
                                 {
-                                    scratch.base64_stats.pre_gate_pass = scratch
-                                        .base64_stats
-                                        .pre_gate_pass
-                                        .saturating_add(1);
+                                    scratch.base64_stats.pre_gate_pass =
+                                        scratch.base64_stats.pre_gate_pass.saturating_add(1);
                                 }
                             }
                         }
@@ -2020,7 +2106,30 @@ impl Engine {
                     }
                 }
 
+                if let Some(kws) = &rule.keywords {
+                    // Keyword gate is a cheap pre-regex filter: if none of the
+                    // keywords appear in this window, the regex cannot be relevant.
+                    if !contains_any_memmem(window, &kws.any[Variant::Raw.idx()]) {
+                        return;
+                    }
+                }
+
+                let entropy = rule.entropy;
                 for rm in rule.re.find_iter(window) {
+                    if let Some(ent) = entropy {
+                        let mbytes = &window[rm.start()..rm.end()];
+                        // Entropy is evaluated on the *matched* bytes, not the whole window.
+                        // This keeps the signal tied to the candidate token itself.
+                        if !entropy_gate_passes(
+                            &ent,
+                            mbytes,
+                            &mut scratch.entropy_scratch,
+                            &self.entropy_log2,
+                        ) {
+                            continue;
+                        }
+                    }
+
                     let span_in_buf = (w.start + rm.start())..(w.start + rm.end());
                     let root_span_hint = root_hint.clone().unwrap_or_else(|| span_in_buf.clone());
 
@@ -2044,6 +2153,17 @@ impl Engine {
                     .saturating_sub(scratch.total_decode_output_bytes);
                 if remaining == 0 {
                     return;
+                }
+
+                if let Some(kws) = &rule.keywords {
+                    // For UTF-16 variants, apply the keyword gate on the raw UTF-16 bytes
+                    // *before* decoding to avoid spending decode budget on windows that
+                    // could never pass the keyword check.
+                    let raw_win = &buf[w.clone()];
+                    let vidx = variant.idx();
+                    if !contains_any_memmem(raw_win, &kws.any[vidx]) {
+                        return;
+                    }
                 }
 
                 let max_out = self
@@ -2094,8 +2214,23 @@ impl Engine {
                 let max_findings = scratch.max_findings;
                 let out = &mut scratch.out;
                 let dropped = &mut scratch.findings_dropped;
+                let entropy = rule.entropy;
                 for rm in rule.re.find_iter(decoded) {
                     let span = rm.start()..rm.end();
+
+                    if let Some(ent) = entropy {
+                        let mbytes = &decoded[span.clone()];
+                        // Entropy gate runs on UTF-8 decoded bytes because the regex
+                        // is evaluated there; this keeps thresholds consistent.
+                        if !entropy_gate_passes(
+                            &ent,
+                            mbytes,
+                            &mut scratch.entropy_scratch,
+                            &self.entropy_log2,
+                        ) {
+                            continue;
+                        }
+                    }
 
                     let root_span_hint = root_hint.clone().unwrap_or_else(|| w.clone());
 
@@ -2275,10 +2410,36 @@ fn compile_rule(spec: &RuleSpec) -> RuleCompiled {
         }
     });
 
+    let keywords = spec.keywords_any.map(|kws| {
+        let count = kws.len();
+        let raw_bytes = kws.iter().map(|p| p.len()).sum::<usize>();
+        let utf16_bytes = raw_bytes.saturating_mul(2);
+
+        let mut raw = PackedPatterns::with_capacity(count, raw_bytes);
+        let mut le = PackedPatterns::with_capacity(count, utf16_bytes);
+        let mut be = PackedPatterns::with_capacity(count, utf16_bytes);
+
+        for &p in kws {
+            raw.push_raw(p);
+            le.push_utf16le(p);
+            be.push_utf16be(p);
+        }
+
+        KeywordsCompiled { any: [raw, le, be] }
+    });
+
+    let entropy = spec.entropy.as_ref().map(|e| EntropyCompiled {
+        min_bits_per_byte: e.min_bits_per_byte,
+        min_len: e.min_len,
+        max_len: e.max_len,
+    });
+
     RuleCompiled {
         name: spec.name,
         radius: spec.radius,
         must_contain: spec.must_contain,
+        keywords,
+        entropy,
         re: spec.re.clone(),
         two_phase,
     }
@@ -2407,6 +2568,91 @@ fn contains_any_memmem(hay: &[u8], needles: &PackedPatterns) -> bool {
         }
     }
     false
+}
+
+// --------------------------
+// Entropy helpers
+// --------------------------
+
+// Precompute log2 values to avoid repeated `log2` calls in the hot path.
+// The table is sized to the maximum entropy window length across rules.
+fn build_log2_table(max: usize) -> Vec<f32> {
+    let len = max.saturating_add(1).max(2);
+    let mut t = vec![0.0f32; len];
+    for (i, val) in t.iter_mut().enumerate().skip(1) {
+        *val = (i as f32).log2();
+    }
+    t
+}
+
+#[inline]
+fn log2_lookup(table: &[f32], n: usize) -> f32 {
+    if n < table.len() {
+        table[n]
+    } else {
+        (n as f32).log2()
+    }
+}
+
+#[inline]
+fn shannon_entropy_bits_per_byte(
+    bytes: &[u8],
+    scratch: &mut EntropyScratch,
+    log2_table: &[f32],
+) -> f32 {
+    let n = bytes.len();
+    if n == 0 {
+        return 0.0;
+    }
+
+    // Build a histogram using a "touched list" so reset cost is proportional
+    // to the number of distinct byte values, not 256.
+    for &b in bytes {
+        let idx = b as usize;
+        let c = scratch.counts[idx];
+        if c == 0 {
+            let used_len = scratch.used_len as usize;
+            if used_len < scratch.used.len() {
+                scratch.used[used_len] = b;
+                scratch.used_len = (used_len + 1) as u16;
+            }
+        }
+        scratch.counts[idx] = c + 1;
+    }
+
+    // Shannon entropy: H = log2(n) - (1/n) * sum(c_i * log2(c_i))
+    // This rearrangement avoids repeated divisions.
+    let log2_n = log2_lookup(log2_table, n);
+    let mut sum_c_log2_c = 0.0f32;
+
+    let used_len = scratch.used_len as usize;
+    for i in 0..used_len {
+        let idx = scratch.used[i] as usize;
+        let c = scratch.counts[idx] as usize;
+        sum_c_log2_c += (c as f32) * log2_lookup(log2_table, c);
+    }
+
+    scratch.reset();
+
+    log2_n - (sum_c_log2_c / (n as f32))
+}
+
+#[inline]
+fn entropy_gate_passes(
+    spec: &EntropyCompiled,
+    bytes: &[u8],
+    scratch: &mut EntropyScratch,
+    log2_table: &[f32],
+) -> bool {
+    let len = bytes.len();
+    if len < spec.min_len {
+        // For tiny samples entropy is noisy; let them pass rather than
+        // discarding true positives.
+        return true;
+    }
+    let capped = len.min(spec.max_len);
+    let e = shannon_entropy_bits_per_byte(&bytes[..capped], scratch, log2_table);
+    e >= spec.min_bits_per_byte
 }
 
 // --------------------------
@@ -3141,6 +3387,12 @@ fn demo_rules() -> Vec<RuleSpec> {
             radius: 64,
             two_phase: None,
             must_contain: None,
+            keywords_any: Some(AWS_ACCESS_TOKEN_ANCHORS),
+            entropy: Some(EntropySpec {
+                min_bits_per_byte: 3.0,
+                min_len: 16,
+                max_len: 256,
+            }),
             re: Regex::new(r"(A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}").unwrap(),
         },
         RuleSpec {
@@ -3149,6 +3401,12 @@ fn demo_rules() -> Vec<RuleSpec> {
             radius: 96,
             two_phase: None,
             must_contain: None,
+            keywords_any: Some(GITHUB_PAT_ANCHORS),
+            entropy: Some(EntropySpec {
+                min_bits_per_byte: 3.0,
+                min_len: 16,
+                max_len: 256,
+            }),
             re: Regex::new(r"ghp_[0-9a-zA-Z]{36}").unwrap(),
         },
         RuleSpec {
@@ -3157,6 +3415,12 @@ fn demo_rules() -> Vec<RuleSpec> {
             radius: 96,
             two_phase: None,
             must_contain: None,
+            keywords_any: Some(GITHUB_OAUTH_ANCHORS),
+            entropy: Some(EntropySpec {
+                min_bits_per_byte: 3.0,
+                min_len: 16,
+                max_len: 256,
+            }),
             re: Regex::new(r"gho_[0-9a-zA-Z]{36}").unwrap(),
         },
         RuleSpec {
@@ -3165,6 +3429,12 @@ fn demo_rules() -> Vec<RuleSpec> {
             radius: 96,
             two_phase: None,
             must_contain: None,
+            keywords_any: Some(GITHUB_APP_ANCHORS),
+            entropy: Some(EntropySpec {
+                min_bits_per_byte: 3.0,
+                min_len: 16,
+                max_len: 256,
+            }),
             re: Regex::new(r"(ghu|ghs)_[0-9a-zA-Z]{36}").unwrap(),
         },
         RuleSpec {
@@ -3173,6 +3443,12 @@ fn demo_rules() -> Vec<RuleSpec> {
             radius: 64,
             two_phase: None,
             must_contain: None,
+            keywords_any: Some(GITLAB_PAT_ANCHORS),
+            entropy: Some(EntropySpec {
+                min_bits_per_byte: 3.0,
+                min_len: 16,
+                max_len: 256,
+            }),
             re: Regex::new(r"glpat-[0-9a-zA-Z\-\_]{20}").unwrap(),
         },
         RuleSpec {
@@ -3181,6 +3457,12 @@ fn demo_rules() -> Vec<RuleSpec> {
             radius: 96,
             two_phase: None,
             must_contain: None,
+            keywords_any: Some(SLACK_TOKEN_ANCHORS),
+            entropy: Some(EntropySpec {
+                min_bits_per_byte: 2.0,
+                min_len: 16,
+                max_len: 256,
+            }),
             re: Regex::new(r"xox[baprs]-([0-9a-zA-Z]{10,48})").unwrap(),
         },
         RuleSpec {
@@ -3189,6 +3471,8 @@ fn demo_rules() -> Vec<RuleSpec> {
             radius: 160,
             two_phase: None,
             must_contain: None,
+            keywords_any: Some(SLACK_WEBHOOK_ANCHORS),
+            entropy: None,
             re: Regex::new(r"https:\/\/hooks.slack.com\/services\/[A-Za-z0-9+\/]{44,46}").unwrap(),
         },
         RuleSpec {
@@ -3197,6 +3481,12 @@ fn demo_rules() -> Vec<RuleSpec> {
             radius: 96,
             two_phase: None,
             must_contain: None,
+            keywords_any: Some(STRIPE_TOKEN_ANCHORS),
+            entropy: Some(EntropySpec {
+                min_bits_per_byte: 2.0,
+                min_len: 16,
+                max_len: 256,
+            }),
             re: Regex::new(r"(?:sk|rk)_(?:test|live|prod)_[a-zA-Z0-9]{10,99}").unwrap(),
         },
         RuleSpec {
@@ -3205,6 +3495,12 @@ fn demo_rules() -> Vec<RuleSpec> {
             radius: 128,
             two_phase: None,
             must_contain: None,
+            keywords_any: Some(SENDGRID_TOKEN_ANCHORS),
+            entropy: Some(EntropySpec {
+                min_bits_per_byte: 2.0,
+                min_len: 16,
+                max_len: 256,
+            }),
             re: Regex::new(
                 r#"(?i)\b(SG\.(?i)[a-z0-9=_\-\.]{66})(?:['|\"|\n|\r|\s|\x60]|$)"#,
             )
@@ -3216,6 +3512,12 @@ fn demo_rules() -> Vec<RuleSpec> {
             radius: 96,
             two_phase: None,
             must_contain: None,
+            keywords_any: Some(NPM_TOKEN_ANCHORS),
+            entropy: Some(EntropySpec {
+                min_bits_per_byte: 2.0,
+                min_len: 16,
+                max_len: 256,
+            }),
             re: Regex::new(r#"(?i)\b(npm_[a-z0-9]{36})(?:['|\"|\n|\r|\s|\x60]|$)"#).unwrap(),
         },
         RuleSpec {
@@ -3224,6 +3526,12 @@ fn demo_rules() -> Vec<RuleSpec> {
             radius: 96,
             two_phase: None,
             must_contain: None,
+            keywords_any: Some(DATABRICKS_TOKEN_ANCHORS),
+            entropy: Some(EntropySpec {
+                min_bits_per_byte: 3.0,
+                min_len: 16,
+                max_len: 256,
+            }),
             re: Regex::new(r#"(?i)\b(dapi[a-h0-9]{32})(?:['|\"|\n|\r|\s|\x60]|$)"#).unwrap(),
         },
         RuleSpec {
@@ -3236,6 +3544,8 @@ fn demo_rules() -> Vec<RuleSpec> {
                 confirm_any: PRIVATE_KEY_CONFIRM,
             }),
             must_contain: None,
+            keywords_any: None,
+            entropy: None,
             // Require a complete BEGIN..END block for "PRIVATE KEY" to avoid ultra-noisy partial matches.
             re: Regex::new(
                 r"(?is)-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY-----.*?-----END[ A-Z0-9_-]{0,100}PRIVATE KEY-----",
@@ -3401,6 +3711,69 @@ mod tests {
     }
 
     #[test]
+    fn keyword_gate_filters_without_keyword() {
+        const ANCHORS: &[&[u8]] = &[b"ANCH"];
+        const KEYWORDS: &[&[u8]] = &[b"kw"];
+        let rule = RuleSpec {
+            name: "keyword-gate",
+            anchors: ANCHORS,
+            radius: 16,
+            two_phase: None,
+            must_contain: None,
+            keywords_any: Some(KEYWORDS),
+            entropy: None,
+            re: Regex::new("secret").unwrap(),
+        };
+        let eng = Engine::new_with_anchor_policy(
+            vec![rule],
+            Vec::new(),
+            demo_tuning(),
+            AnchorPolicy::ManualOnly,
+        );
+
+        let hay = b"ANCHsecret";
+        let hits = eng.scan_chunk(hay);
+        assert!(!hits.iter().any(|h| h.rule == "keyword-gate"));
+
+        let hay = b"ANCHkwsecret";
+        let hits = eng.scan_chunk(hay);
+        assert!(hits.iter().any(|h| h.rule == "keyword-gate"));
+    }
+
+    #[test]
+    fn entropy_gate_filters_low_entropy_matches() {
+        const ANCHORS: &[&[u8]] = &[b"TOK_"];
+        let rule = RuleSpec {
+            name: "entropy-gate",
+            anchors: ANCHORS,
+            radius: 8,
+            two_phase: None,
+            must_contain: None,
+            keywords_any: None,
+            entropy: Some(EntropySpec {
+                min_bits_per_byte: 3.0,
+                min_len: 8,
+                max_len: 32,
+            }),
+            re: Regex::new(r"TOK_[A-Za-z0-9]{8}").unwrap(),
+        };
+        let eng = Engine::new_with_anchor_policy(
+            vec![rule],
+            Vec::new(),
+            demo_tuning(),
+            AnchorPolicy::ManualOnly,
+        );
+
+        let low = b"TOK_AAAAAAAA";
+        let hits = eng.scan_chunk(low);
+        assert!(!hits.iter().any(|h| h.rule == "entropy-gate"));
+
+        let high = b"TOK_A1b2C3d4";
+        let hits = eng.scan_chunk(high);
+        assert!(hits.iter().any(|h| h.rule == "entropy-gate"));
+    }
+
+    #[test]
     fn anchor_policy_prefers_derived_over_manual() {
         const MANUAL: &[&[u8]] = &[b"bar"];
         let rule = RuleSpec {
@@ -3409,6 +3782,8 @@ mod tests {
             radius: 0,
             two_phase: None,
             must_contain: None,
+            keywords_any: None,
+            entropy: None,
             re: Regex::new("foo").unwrap(),
         };
 
@@ -3430,6 +3805,8 @@ mod tests {
             radius: 0,
             two_phase: None,
             must_contain: None,
+            keywords_any: None,
+            entropy: None,
             re: Regex::new(".*").unwrap(),
         };
 
@@ -4367,6 +4744,8 @@ mod tests {
             radius: 0,
             two_phase: None,
             must_contain: None,
+            keywords_any: None,
+            entropy: None,
             re: Regex::new("X").unwrap(),
         }];
         let engine = Arc::new(Engine::new(rules, Vec::new(), demo_tuning()));
@@ -4400,6 +4779,8 @@ mod tests {
             radius: 12,
             two_phase: None,
             must_contain: None,
+            keywords_any: None,
+            entropy: None,
             re: Regex::new(r"aaatok_[0-9]{8}bbbb").unwrap(),
         };
         let engine = Engine::new_with_anchor_policy(

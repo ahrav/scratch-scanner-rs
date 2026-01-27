@@ -450,8 +450,8 @@ impl Ac64 {
             }
             let mut s = 0usize;
             for &ch in pat {
-                let sym = sym_from_pattern_byte(ch)
-                    .expect("pattern contains non-base64 character") as usize;
+                let sym = sym_from_pattern_byte(ch).expect("pattern contains non-base64 character")
+                    as usize;
                 let nxt = nodes[s].next[sym];
                 if nxt == NONE {
                     let new_idx = u32::try_from(nodes.len()).expect("AC too large for u32 state");
@@ -756,9 +756,18 @@ mod tests {
         let p1 = yara_base64_perm(a, 1, 0).unwrap();
         let p2 = yara_base64_perm(a, 2, 0).unwrap();
 
-        assert_eq!(std::str::from_utf8(&p0).unwrap(), "VGhpcyBwcm9ncmFtIGNhbm5vd");
-        assert_eq!(std::str::from_utf8(&p1).unwrap(), "RoaXMgcHJvZ3JhbSBjYW5ub3");
-        assert_eq!(std::str::from_utf8(&p2).unwrap(), "UaGlzIHByb2dyYW0gY2Fubm90");
+        assert_eq!(
+            std::str::from_utf8(&p0).unwrap(),
+            "VGhpcyBwcm9ncmFtIGNhbm5vd"
+        );
+        assert_eq!(
+            std::str::from_utf8(&p1).unwrap(),
+            "RoaXMgcHJvZ3JhbSBjYW5ub3"
+        );
+        assert_eq!(
+            std::str::from_utf8(&p2).unwrap(),
+            "UaGlzIHByb2dyYW0gY2Fubm90"
+        );
     }
 
     #[test]
@@ -1024,7 +1033,11 @@ mod tests {
             let one = gate.hits(s);
             for ch in &chunkings {
                 let st = stream_scan_many_chunks(&gate, s, ch);
-                assert_eq!(one, st, "chunking mismatch for sample {:?} chunks {:?}", s, ch);
+                assert_eq!(
+                    one, st,
+                    "chunking mismatch for sample {:?} chunks {:?}",
+                    s, ch
+                );
             }
         }
     }
@@ -1107,7 +1120,7 @@ mod tests {
             b"AAAA=dGVzdA",
             b"YWJj",
             b"YW\0Jj",
-            b"____", // urlsafe for "////"
+            b"____",                 // urlsafe for "////"
             b"\xff\xff\xff\xff\xff", // hostile
             b"",
         ];
@@ -1141,7 +1154,9 @@ mod tests {
         let mut data = vec![0u8; 256 * 1024];
         for (i, b) in data.iter_mut().enumerate() {
             // Deterministic pseudo-noise (no RNG dep here)
-            let v = (i as u32).wrapping_mul(1103515245u32).wrapping_add(12345u32);
+            let v = (i as u32)
+                .wrapping_mul(1103515245u32)
+                .wrapping_add(12345u32);
             *b = v as u8;
         }
         // Add a base64-ish island with whitespace + urlsafe.

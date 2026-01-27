@@ -119,6 +119,9 @@ enum WalkEntry {
 }
 
 /// Depth-first directory walker that feeds the file ring.
+///
+/// DFS keeps memory proportional to directory depth rather than total file count,
+/// and it naturally yields paths in a locality-friendly order for disk reads.
 struct Walker {
     stack: Vec<WalkEntry>,
     done: bool,

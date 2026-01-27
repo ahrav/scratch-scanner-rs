@@ -6,12 +6,12 @@
 use memchr::memmem;
 use proptest::prelude::*;
 use regex::bytes::Regex;
+#[cfg(feature = "kgram-gate")]
+use scanner_rs::regex2anchor::PositionHint;
 use scanner_rs::regex2anchor::{
     compile_trigger_plan, derive_anchors_from_pattern, AnchorDeriveConfig, AnchorDeriveError,
     Boundary, ResidueGatePlan, RunLengthGate, TriggerPlan, UnfilterableReason,
 };
-#[cfg(feature = "kgram-gate")]
-use scanner_rs::regex2anchor::PositionHint;
 
 // =============================================================================
 // Constants
@@ -32,7 +32,7 @@ const EXHAUSTIVE_MAX_LEN: usize = 6;
 /// Compile a regex with safety limits to prevent pathological inputs.
 fn compile_bytes_regex(pattern: &str) -> Option<Regex> {
     regex::bytes::RegexBuilder::new(pattern)
-        .size_limit(1 << 20)  // 1MB compiled size limit
+        .size_limit(1 << 20) // 1MB compiled size limit
         .dfa_size_limit(1 << 20)
         .build()
         .ok()
@@ -48,7 +48,9 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 
 /// Check if any anchor is present in the haystack.
 fn anchors_cover_match(haystack: &[u8], anchors: &[Vec<u8>]) -> bool {
-    anchors.iter().any(|anchor| contains_subslice(haystack, anchor))
+    anchors
+        .iter()
+        .any(|anchor| contains_subslice(haystack, anchor))
 }
 
 #[inline]
@@ -111,10 +113,7 @@ fn run_length_gate_triggers(haystack: &[u8], gate: &RunLengthGate) -> bool {
 /// Exhaustively search the bounded domain for a counterexample.
 /// Returns Some(haystack) if the soundness invariant is violated:
 ///   regex matches haystack BUT no anchor is present.
-fn find_counterexample_exhaustive(
-    regex: &Regex,
-    anchors: &[Vec<u8>],
-) -> Option<Vec<u8>> {
+fn find_counterexample_exhaustive(regex: &Regex, anchors: &[Vec<u8>]) -> Option<Vec<u8>> {
     // Enumerate all strings of length 0..=EXHAUSTIVE_MAX_LEN over ALPHABET
     let mut stack: Vec<Vec<u8>> = vec![vec![]];
 
@@ -171,7 +170,10 @@ fn assert_anchor_invariants(anchors: &[Vec<u8>], cfg: &AnchorDeriveConfig) {
         anchors.iter().all(|a| a.len() >= cfg.min_anchor_len),
         "All anchors must meet min_anchor_len={}: {:?}",
         cfg.min_anchor_len,
-        anchors.iter().map(|a| (String::from_utf8_lossy(a).to_string(), a.len())).collect::<Vec<_>>()
+        anchors
+            .iter()
+            .map(|a| (String::from_utf8_lossy(a).to_string(), a.len()))
+            .collect::<Vec<_>>()
     );
 
     // No duplicates
@@ -216,7 +218,10 @@ fn regression_min_anchor_len_must_not_break_or_coverage() {
             assert!(
                 anchors_cover_match(b"d", &anchors),
                 "Soundness violation: 'd' matches pattern but no anchor found. Anchors: {:?}",
-                anchors.iter().map(|a| String::from_utf8_lossy(a)).collect::<Vec<_>>()
+                anchors
+                    .iter()
+                    .map(|a| String::from_utf8_lossy(a))
+                    .collect::<Vec<_>>()
             );
         }
         Err(AnchorDeriveError::OnlyWeakAnchors) | Err(AnchorDeriveError::Unanchorable) => {
@@ -232,16 +237,16 @@ fn regression_min_anchor_len_must_not_break_or_coverage() {
 #[test]
 fn patterns_that_match_empty_must_be_rejected() {
     let patterns = vec![
-        "",      // empty pattern
-        "a*",    // zero or more a
-        "(?:)",  // non-capturing empty group
-        "^",     // start anchor only
-        "$",     // end anchor only
-        r"\b",   // word boundary only
-        "()*",   // empty repeated
-        "|a",    // empty alternative
-        "a|",    // empty alternative
-        "a?",    // optional single char
+        "",     // empty pattern
+        "a*",   // zero or more a
+        "(?:)", // non-capturing empty group
+        "^",    // start anchor only
+        "$",    // end anchor only
+        r"\b",  // word boundary only
+        "()*",  // empty repeated
+        "|a",   // empty alternative
+        "a|",   // empty alternative
+        "a?",   // optional single char
     ];
 
     let cfg = AnchorDeriveConfig {
@@ -260,7 +265,10 @@ fn patterns_that_match_empty_must_be_rejected() {
                     result.is_err(),
                     "Pattern '{}' matches empty string but derivation succeeded with {:?}",
                     pattern,
-                    result.ok().map(|a| a.iter().map(|x| String::from_utf8_lossy(x).to_string()).collect::<Vec<_>>())
+                    result.ok().map(|a| a
+                        .iter()
+                        .map(|x| String::from_utf8_lossy(x).to_string())
+                        .collect::<Vec<_>>())
                 );
             }
         }
@@ -293,7 +301,7 @@ fn exhaustive_soundness_over_small_alphabet() {
     ];
 
     let cfg = AnchorDeriveConfig {
-        min_anchor_len: 1,  // Lower threshold for more test coverage
+        min_anchor_len: 1, // Lower threshold for more test coverage
         ..Default::default()
     };
 
@@ -313,7 +321,10 @@ fn exhaustive_soundness_over_small_alphabet() {
                          Regex matches: {}\n\
                          Anchors present: {}",
                         pattern,
-                        anchors.iter().map(|a| String::from_utf8_lossy(a).to_string()).collect::<Vec<_>>(),
+                        anchors
+                            .iter()
+                            .map(|a| String::from_utf8_lossy(a).to_string())
+                            .collect::<Vec<_>>(),
                         counterexample,
                         String::from_utf8_lossy(&counterexample),
                         regex.is_match(&counterexample),
@@ -334,8 +345,8 @@ fn exhaustive_alternation_variants() {
         ("ab|cd", 2),
         ("abc|abd", 3),
         ("abcd|abdc", 4),
-        ("a|ab|abc", 1),  // overlapping with different lengths
-        ("abc|bc|c", 1),  // suffix overlap
+        ("a|ab|abc", 1), // overlapping with different lengths
+        ("abc|bc|c", 1), // suffix overlap
     ];
 
     for (pattern, min_len) in alternation_patterns {
@@ -358,7 +369,10 @@ fn exhaustive_alternation_variants() {
                          Counterexample: '{}'",
                         pattern,
                         min_len,
-                        anchors.iter().map(|a| String::from_utf8_lossy(a).to_string()).collect::<Vec<_>>(),
+                        anchors
+                            .iter()
+                            .map(|a| String::from_utf8_lossy(a).to_string())
+                            .collect::<Vec<_>>(),
                         String::from_utf8_lossy(&counterexample)
                     );
                 }
@@ -399,9 +413,9 @@ fn simple_pattern_strategy() -> impl Strategy<Value = String> {
 /// Strategy to generate more complex patterns.
 fn complex_pattern_strategy() -> impl Strategy<Value = String> {
     simple_pattern_strategy().prop_recursive(
-        3,   // depth
-        32,  // desired size
-        4,   // items per collection
+        3,  // depth
+        32, // desired size
+        4,  // items per collection
         |inner| {
             prop_oneof![
                 // Concatenation
@@ -606,7 +620,10 @@ fn test_nested_alternation_exhaustive() {
                          Anchors: {:?}\n\
                          Counterexample: {:?}",
                         pattern,
-                        anchors.iter().map(|a| String::from_utf8_lossy(a).to_string()).collect::<Vec<_>>(),
+                        anchors
+                            .iter()
+                            .map(|a| String::from_utf8_lossy(a).to_string())
+                            .collect::<Vec<_>>(),
                         String::from_utf8_lossy(&counterexample)
                     );
                 }
@@ -642,7 +659,10 @@ fn test_repetition_bounds_exhaustive() {
                          Anchors: {:?}\n\
                          Counterexample: {:?}",
                         pattern,
-                        anchors.iter().map(|a| String::from_utf8_lossy(a).to_string()).collect::<Vec<_>>(),
+                        anchors
+                            .iter()
+                            .map(|a| String::from_utf8_lossy(a).to_string())
+                            .collect::<Vec<_>>(),
                         String::from_utf8_lossy(&counterexample)
                     );
                 }
@@ -658,12 +678,7 @@ fn test_concatenation_with_class_exhaustive() {
         ..Default::default()
     };
 
-    let patterns = vec![
-        "[ab][cd]",
-        "a[bc]d",
-        "[ab]c[de]",
-        "[abc][abc]",
-    ];
+    let patterns = vec!["[ab][cd]", "a[bc]d", "[ab]c[de]", "[abc][abc]"];
 
     for pattern in patterns {
         if let Ok(anchors) = derive_anchors_from_pattern(pattern, &cfg) {
@@ -677,7 +692,10 @@ fn test_concatenation_with_class_exhaustive() {
                          Anchors: {:?}\n\
                          Counterexample: {:?}",
                         pattern,
-                        anchors.iter().map(|a| String::from_utf8_lossy(a).to_string()).collect::<Vec<_>>(),
+                        anchors
+                            .iter()
+                            .map(|a| String::from_utf8_lossy(a).to_string())
+                            .collect::<Vec<_>>(),
                         String::from_utf8_lossy(&counterexample)
                     );
                 }
@@ -706,7 +724,10 @@ fn test_inline_case_insensitive_flags_soundness() {
             assert!(
                 anchors_cover_match(haystack, &anchors),
                 "Case-insensitive pattern derived anchors that don't match: {:?}",
-                anchors.iter().map(|a| String::from_utf8_lossy(a).to_string()).collect::<Vec<_>>()
+                anchors
+                    .iter()
+                    .map(|a| String::from_utf8_lossy(a).to_string())
+                    .collect::<Vec<_>>()
             );
         }
     }
@@ -728,7 +749,10 @@ fn test_inline_case_insensitive_group_soundness() {
             assert!(
                 anchors_cover_match(haystack, &anchors),
                 "Case-insensitive alternation anchors don't match: {:?}",
-                anchors.iter().map(|a| String::from_utf8_lossy(a).to_string()).collect::<Vec<_>>()
+                anchors
+                    .iter()
+                    .map(|a| String::from_utf8_lossy(a).to_string())
+                    .collect::<Vec<_>>()
             );
         }
     }
@@ -752,7 +776,10 @@ fn test_bytes_mode_hex_escape_soundness() {
         assert!(
             anchors_cover_match(haystack, &anchors),
             "Byte-mode anchor missing for \\xFF: {:?}",
-            anchors.iter().map(|a| String::from_utf8_lossy(a).to_string()).collect::<Vec<_>>()
+            anchors
+                .iter()
+                .map(|a| String::from_utf8_lossy(a).to_string())
+                .collect::<Vec<_>>()
         );
     }
 }
@@ -775,7 +802,10 @@ fn test_bytes_mode_nul_escape_soundness() {
         assert!(
             anchors_cover_match(haystack, &anchors),
             "Byte-mode anchor missing for \\x00: {:?}",
-            anchors.iter().map(|a| String::from_utf8_lossy(a).to_string()).collect::<Vec<_>>()
+            anchors
+                .iter()
+                .map(|a| String::from_utf8_lossy(a).to_string())
+                .collect::<Vec<_>>()
         );
     }
 }
@@ -871,7 +901,10 @@ fn test_repetition_of_alternation_soundness() {
                         anchors_cover_match(h, &anchors),
                         "Repetition alternation anchors missing for {:?}: {:?}",
                         h,
-                        anchors.iter().map(|a| String::from_utf8_lossy(a).to_string()).collect::<Vec<_>>()
+                        anchors
+                            .iter()
+                            .map(|a| String::from_utf8_lossy(a).to_string())
+                            .collect::<Vec<_>>()
                     );
                 }
             }
@@ -994,7 +1027,7 @@ fn trigger_plan_run_length_gate_or_alternation() {
 fn trigger_plan_kgram_gate_enabled() {
     let cfg = AnchorDeriveConfig {
         min_anchor_len: 3,
-        max_class_expansion: 4,   // Force anchors to degrade
+        max_class_expansion: 4, // Force anchors to degrade
         kgram_k: 3,
         max_kgram_set: 1024,
         max_kgram_alphabet: 8,

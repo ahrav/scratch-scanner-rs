@@ -194,6 +194,23 @@ URL-percent or Base64 spans. These transforms are expensive, so they are gated:
 
 See `docs/transform-chain.md` for diagrams and the gating sequence.
 
+## Keyword + Entropy Gates
+
+Some rules benefit from additional semantic filters beyond anchors + regex:
+
+- **Keyword gate (any-of)**: at least one keyword must appear inside the same
+  validation window as the regex. This is a cheap memmem filter that reduces
+  false positives without requiring global context.
+- **Entropy gate**: after a regex match, compute Shannon entropy (bits/byte)
+  of the matched bytes. Low-entropy matches are rejected as likely false
+  positives (e.g., repeated characters or structured IDs).
+
+These gates are designed to be **local and bounded**:
+- Keywords are checked *before* regex, and for UTF-16 windows the check happens
+  **before decoding** to avoid wasting decode budget.
+- Entropy runs only on the regex match and is capped by `max_len` to keep cost
+  predictable.
+
 ## Tuning Parameters
 
 | Parameter | Default | Purpose |

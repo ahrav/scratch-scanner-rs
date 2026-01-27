@@ -95,8 +95,9 @@ fn main() -> io::Result<()> {
         } else {
             0.0
         };
-        let pre_gate_total_encoded =
-            b64.pre_gate_skip_bytes.saturating_add(b64.decode_attempt_bytes);
+        let pre_gate_total_encoded = b64
+            .pre_gate_skip_bytes
+            .saturating_add(b64.decode_attempt_bytes);
         let pre_gate_skip_pct_of_total_encoded = if pre_gate_total_encoded > 0 {
             (b64.pre_gate_skip_bytes as f64) * 100.0 / (pre_gate_total_encoded as f64)
         } else {
