@@ -233,6 +233,80 @@ pub struct TwoPhaseSpec {
     pub confirm_any: &'static [&'static [u8]],
 }
 
+/// Fast-path validator used to confirm common token-like rules directly at
+/// anchor hits, bypassing window accumulation and regex evaluation.
+///
+/// Validators assume the anchor match is **match-start aligned** in the raw
+/// representation (i.e., `anchor_start` is the regex match start). If this
+/// cannot be guaranteed for a rule, set [`ValidatorKind::None`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ValidatorKind {
+    /// Prefix + fixed-length tail + optional boundary/terminator checks.
+    PrefixFixed {
+        /// Number of bytes in the tail immediately following the anchor.
+        tail_len: u16,
+        /// Character class used for each tail byte.
+        tail: TailCharset,
+        /// Require an ASCII `\b` word boundary before the prefix.
+        require_word_boundary_before: bool,
+        /// Optional delimiter check after the tail.
+        delim_after: DelimAfter,
+    },
+
+    /// Prefix + bounded-length tail + optional boundary/terminator checks.
+    ///
+    /// The validator is greedy (matches the longest tail within bounds) and,
+    /// when `delim_after` is required, it backtracks to the longest tail that
+    /// is immediately followed by a valid delimiter or end-of-input.
+    PrefixBounded {
+        /// Minimum number of bytes in the tail.
+        min_tail: u16,
+        /// Maximum number of bytes in the tail.
+        max_tail: u16,
+        /// Character class used for each tail byte.
+        tail: TailCharset,
+        /// Require an ASCII `\b` word boundary before the prefix.
+        require_word_boundary_before: bool,
+        /// Optional delimiter check after the tail.
+        delim_after: DelimAfter,
+    },
+
+    /// Special-case validator for AWS access key IDs (A3T... / AKIA...).
+    AwsAccessKey,
+
+    /// No validator; always use the regex/window path.
+    None,
+}
+
+/// Post-match delimiter requirement for token-like rules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DelimAfter {
+    /// No delimiter requirement; the match may be followed by any byte or end.
+    None,
+    /// Gitleaks-style token terminator:
+    /// `['"|\n|\r|\\s|\\x60]` or end-of-input.
+    GitleaksTokenTerminator,
+}
+
+/// Tail character class for validator checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TailCharset {
+    /// `[A-Z0-9]`
+    UpperAlnum,
+    /// `[A-Za-z0-9]`
+    Alnum,
+    /// `[a-z0-9]`
+    LowerAlnum,
+    /// `[A-Za-z0-9_-]`
+    AlnumDashUnderscore,
+    /// `[A-Za-z0-9=_\\-.]` (case-insensitive)
+    Sendgrid66Set,
+    /// `[a-h0-9]` (case-insensitive)
+    DatabricksSet,
+    /// `[A-Za-z0-9+/]` (standard base64 alphabet, no padding)
+    Base64Std,
+}
+
 /// Rule configuration for anchor scan + regex validation.
 #[derive(Clone, Debug)]
 pub struct RuleSpec {
@@ -244,6 +318,14 @@ pub struct RuleSpec {
 
     /// Radius in bytes around an anchor hit (raw representation).
     pub radius: usize,
+
+    /// Optional fast validator for token-like rules.
+    ///
+    /// When set to something other than [`ValidatorKind::None`], anchors are
+    /// expected to be match-start aligned in raw bytes. The engine will attempt
+    /// to validate at each anchor hit and may skip window/regex work entirely
+    /// when the validator is authoritative.
+    pub validator: ValidatorKind,
 
     /// Optional two-phase confirm + expand configuration.
     pub two_phase: Option<TwoPhaseSpec>,

@@ -14,9 +14,11 @@ use std::ops::{ControlFlow, Range};
 
 mod helpers;
 mod transform;
+mod validator;
 
 use self::helpers::*;
 use self::transform::*;
+use self::validator::*;
 
 #[cfg(test)]
 use crate::demo::*;
@@ -70,16 +72,29 @@ impl Variant {
 /// flat `pat_targets` array. A `Target` is a compact (rule_id, variant) pair
 /// packed into `u32` to keep the fanout table cache-friendly and avoid extra
 /// pointer chasing.
+///
+/// Flags encoded in the low bits record whether the anchor is match-start
+/// aligned (required by fast validators) and whether keyword gates are implied
+/// by this specific anchor (so the validator can remain authoritative).
 #[derive(Clone, Copy, Debug)]
 struct Target(u32);
 
 impl Target {
     const VARIANT_MASK: u32 = 0b11;
-    const VARIANT_SHIFT: u32 = 2;
+    const MATCH_START_MASK: u32 = 1 << 2;
+    const KEYWORD_IMPLIED_MASK: u32 = 1 << 3;
+    const VARIANT_SHIFT: u32 = 4;
 
-    fn new(rule_id: u32, variant: Variant) -> Self {
+    fn new(rule_id: u32, variant: Variant, match_start: bool, keyword_implied: bool) -> Self {
         debug_assert!(rule_id <= (u32::MAX >> Self::VARIANT_SHIFT));
-        Self((rule_id << Self::VARIANT_SHIFT) | variant.idx() as u32)
+        let mut v = (rule_id << Self::VARIANT_SHIFT) | variant.idx() as u32;
+        if match_start {
+            v |= Self::MATCH_START_MASK;
+        }
+        if keyword_implied {
+            v |= Self::KEYWORD_IMPLIED_MASK;
+        }
+        Self(v)
     }
 
     fn rule_id(self) -> usize {
@@ -93,6 +108,14 @@ impl Target {
             2 => Variant::Utf16Be,
             _ => unreachable!("invalid variant tag"),
         }
+    }
+
+    fn match_start_aligned(self) -> bool {
+        (self.0 & Self::MATCH_START_MASK) != 0
+    }
+
+    fn keyword_implied(self) -> bool {
+        (self.0 & Self::KEYWORD_IMPLIED_MASK) != 0
     }
 }
 
@@ -179,6 +202,7 @@ struct EntropyCompiled {
 struct RuleCompiled {
     name: &'static str,
     radius: usize,
+    validator: ValidatorKind,
     must_contain: Option<&'static [u8]>,
     keywords: Option<KeywordsCompiled>,
     entropy: Option<EntropyCompiled>,
@@ -785,6 +809,13 @@ impl Engine {
         for (rid, r) in rules.iter().enumerate() {
             debug_assert!(rid <= u32::MAX as usize);
             let rid_u32 = rid as u32;
+            let validator_match_start = r.validator != ValidatorKind::None;
+            let keyword_implied_for_anchor = |anchor: &[u8]| -> bool {
+                match r.keywords_any {
+                    None => true,
+                    Some(kws) => kws.contains(&anchor),
+                }
+            };
             let mut manual_used = false;
             let mut add_manual = |pat_map: &mut AHashMap<Vec<u8>, Vec<Target>>| {
                 if !allow_manual {
@@ -796,16 +827,36 @@ impl Engine {
                 manual_used = true;
                 anchor_plan_stats.manual_rules = anchor_plan_stats.manual_rules.saturating_add(1);
                 for &a in r.anchors {
-                    add_pat_raw(pat_map, a, Target::new(rid_u32, Variant::Raw));
+                    let keyword_implied = keyword_implied_for_anchor(a);
+                    add_pat_raw(
+                        pat_map,
+                        a,
+                        Target::new(
+                            rid_u32,
+                            Variant::Raw,
+                            validator_match_start,
+                            keyword_implied,
+                        ),
+                    );
                     add_pat_owned(
                         pat_map,
                         utf16le_bytes(a),
-                        Target::new(rid_u32, Variant::Utf16Le),
+                        Target::new(
+                            rid_u32,
+                            Variant::Utf16Le,
+                            validator_match_start,
+                            keyword_implied,
+                        ),
                     );
                     add_pat_owned(
                         pat_map,
                         utf16be_bytes(a),
-                        Target::new(rid_u32, Variant::Utf16Be),
+                        Target::new(
+                            rid_u32,
+                            Variant::Utf16Be,
+                            validator_match_start,
+                            keyword_implied,
+                        ),
                     );
                 }
             };
@@ -831,16 +882,21 @@ impl Engine {
                     anchor_plan_stats.derived_rules =
                         anchor_plan_stats.derived_rules.saturating_add(1);
                     for anchor in anchors {
-                        add_pat_raw(&mut pat_map, &anchor, Target::new(rid_u32, Variant::Raw));
+                        let keyword_implied = keyword_implied_for_anchor(&anchor);
+                        add_pat_raw(
+                            &mut pat_map,
+                            &anchor,
+                            Target::new(rid_u32, Variant::Raw, false, keyword_implied),
+                        );
                         add_pat_owned(
                             &mut pat_map,
                             utf16le_bytes(&anchor),
-                            Target::new(rid_u32, Variant::Utf16Le),
+                            Target::new(rid_u32, Variant::Utf16Le, false, keyword_implied),
                         );
                         add_pat_owned(
                             &mut pat_map,
                             utf16be_bytes(&anchor),
-                            Target::new(rid_u32, Variant::Utf16Be),
+                            Target::new(rid_u32, Variant::Utf16Be, false, keyword_implied),
                         );
                     }
                 }
@@ -1230,6 +1286,52 @@ impl Engine {
                 let rule_id = t.rule_id();
                 let variant = t.variant();
                 let rule = &self.rules[rule_id];
+
+                // Fast validator path:
+                // If the rule declares a match-start validator and this anchor hit is
+                // match-start aligned, attempt to validate and emit immediately.
+                //
+                // We only take this path when any keyword gate is implied by the
+                // matched anchor and no `must_contain` filter is required, so the
+                // validator remains authoritative.
+                //
+                // On failure we skip window accumulation for this anchor hit,
+                // avoiding regex work.
+                if variant == Variant::Raw
+                    && t.match_start_aligned()
+                    && rule.validator.is_enabled()
+                    && rule.must_contain.is_none()
+                    && t.keyword_implied()
+                {
+                    if let Some(span) =
+                        rule.validator
+                            .validate_raw_at_anchor(buf, m.start(), m.end())
+                    {
+                        if let Some(ent) = rule.entropy {
+                            let mbytes = &buf[span.clone()];
+                            if !entropy_gate_passes(
+                                &ent,
+                                mbytes,
+                                &mut scratch.entropy_scratch,
+                                &self.entropy_log2,
+                            ) {
+                                continue;
+                            }
+                        }
+
+                        let root_span_hint = root_hint.clone().unwrap_or_else(|| span.clone());
+                        scratch.push_finding(FindingRec {
+                            file_id,
+                            rule_id: rule_id as u32,
+                            span_start: span.start as u32,
+                            span_end: span.end as u32,
+                            root_hint_start: base_offset + root_span_hint.start as u64,
+                            root_hint_end: base_offset + root_span_hint.end as u64,
+                            step_id,
+                        });
+                    }
+                    continue;
+                }
 
                 // Seed radius depends on whether two-phase is used.
                 let seed_r = if let Some(tp) = &rule.two_phase {
@@ -1716,6 +1818,7 @@ fn compile_rule(spec: &RuleSpec) -> RuleCompiled {
     RuleCompiled {
         name: spec.name,
         radius: spec.radius,
+        validator: spec.validator,
         must_contain: spec.must_contain,
         keywords,
         entropy,
