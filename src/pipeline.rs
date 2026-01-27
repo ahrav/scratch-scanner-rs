@@ -11,7 +11,8 @@
 
 use crate::stdx::RingBuffer;
 use crate::{
-    BufferPool, Chunk, Engine, FileId, FileTable, FindingRec, ScanScratch, BUFFER_LEN_MAX,
+    BufferPool, Chunk, Engine, FileId, FileTable, FindingRec, ScanScratch, BUFFER_ALIGN,
+    BUFFER_LEN_MAX,
 };
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
@@ -22,7 +23,10 @@ use std::sync::Arc;
 use std::os::unix::fs::MetadataExt;
 
 /// Default chunk size used by the pipeline (bytes).
-pub const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024;
+///
+/// A value of 0 means "auto", resolved to the maximum buffer size minus overlap
+/// (aligned down to `BUFFER_ALIGN`).
+pub const DEFAULT_CHUNK_SIZE: usize = 0;
 
 /// Default file ring capacity.
 pub const PIPE_FILE_RING_CAP: usize = 1024;
@@ -39,7 +43,7 @@ pub const PIPE_MAX_FILES: usize = 1_000_000;
 /// Configuration for the high-level pipeline scanner.
 #[derive(Clone, Debug)]
 pub struct PipelineConfig {
-    /// Bytes read per chunk (excluding overlap).
+    /// Bytes read per chunk (excluding overlap). Use 0 for the maximum size.
     pub chunk_size: usize,
     /// Maximum number of files to queue.
     pub max_files: usize,
@@ -508,9 +512,21 @@ pub struct Pipeline<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP
 impl<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize>
     Pipeline<FILE_CAP, CHUNK_CAP, OUT_CAP>
 {
+    fn max_aligned_chunk_size(overlap: usize) -> usize {
+        let max_chunk = BUFFER_LEN_MAX.saturating_sub(overlap);
+        max_chunk & !(BUFFER_ALIGN - 1)
+    }
+
     /// Creates a pipeline with a fixed-capacity buffer pool and overlap settings.
     pub fn new(engine: Arc<Engine>, config: PipelineConfig) -> Self {
         let overlap = engine.required_overlap();
+        let mut config = config;
+        if config.chunk_size == 0 {
+            let max_chunk = Self::max_aligned_chunk_size(overlap);
+            assert!(max_chunk > 0, "overlap exceeds buffer size");
+            config.chunk_size = max_chunk;
+        }
+
         let buf_len = overlap.saturating_add(config.chunk_size);
         assert!(buf_len <= BUFFER_LEN_MAX);
 
