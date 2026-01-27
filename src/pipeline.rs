@@ -67,6 +67,9 @@ pub struct PipelineStats {
     pub open_errors: u64,
     /// Errors encountered while reading files.
     pub errors: u64,
+    /// Base64 decode/gate instrumentation.
+    #[cfg(feature = "b64-stats")]
+    pub base64: crate::Base64DecodeStats,
 }
 
 /// Simple single-producer, single-consumer ring wrapper.
@@ -422,6 +425,8 @@ impl ScanStage {
         );
         let new_bytes_start = chunk.base_offset + chunk.prefix_len as u64;
         self.scratch.drop_prefix_findings(new_bytes_start);
+        #[cfg(feature = "b64-stats")]
+        stats.base64.add(&self.scratch.base64_stats());
         self.scratch.drain_findings_into(&mut self.pending);
         progressed = true;
 

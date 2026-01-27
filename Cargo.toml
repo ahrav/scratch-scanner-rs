@@ -17,8 +17,10 @@ aegis = { version = "0.9", features = ["pure-rust"] }
 [features]
 stdx-proptest = []
 kgram-gate = []
+b64-stats = []
 
 [dev-dependencies]
+base64 = "0.22"
 proptest = "1.4"
 
 [profile.dev]

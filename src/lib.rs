@@ -131,6 +131,79 @@ pub struct TransformConfig {
     pub base64_allow_space_ws: bool,
 }
 
+/// Base64 decode/gate instrumentation counters.
+#[cfg(feature = "b64-stats")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Base64DecodeStats {
+    /// Number of base64 spans considered (after span caps).
+    pub spans: u64,
+    /// Total encoded bytes across considered spans.
+    pub span_bytes: u64,
+
+    /// Number of spans checked by the pre-decode base64 gate.
+    pub pre_gate_checks: u64,
+    /// Spans that passed the pre-decode base64 gate.
+    pub pre_gate_pass: u64,
+    /// Spans skipped by the pre-decode base64 gate.
+    pub pre_gate_skip: u64,
+    /// Encoded bytes skipped by the pre-decode base64 gate.
+    pub pre_gate_skip_bytes: u64,
+
+    /// Number of spans actually sent to the base64 decoder.
+    pub decode_attempts: u64,
+    /// Total encoded bytes sent to the base64 decoder.
+    pub decode_attempt_bytes: u64,
+    /// Number of decode attempts that failed/truncated/empty.
+    pub decode_errors: u64,
+
+    /// Total decoded bytes produced by the decoder (even if discarded).
+    pub decoded_bytes_total: u64,
+    /// Decoded bytes kept (anchor hit).
+    pub decoded_bytes_kept: u64,
+    /// Decoded bytes discarded due to no anchor hit.
+    pub decoded_bytes_wasted_no_anchor: u64,
+    /// Decoded bytes discarded due to decode errors/truncation.
+    pub decoded_bytes_wasted_error: u64,
+}
+
+#[cfg(feature = "b64-stats")]
+impl Base64DecodeStats {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn add(&mut self, other: &Self) {
+        self.spans = self.spans.saturating_add(other.spans);
+        self.span_bytes = self.span_bytes.saturating_add(other.span_bytes);
+
+        self.pre_gate_checks = self.pre_gate_checks.saturating_add(other.pre_gate_checks);
+        self.pre_gate_pass = self.pre_gate_pass.saturating_add(other.pre_gate_pass);
+        self.pre_gate_skip = self.pre_gate_skip.saturating_add(other.pre_gate_skip);
+        self.pre_gate_skip_bytes = self
+            .pre_gate_skip_bytes
+            .saturating_add(other.pre_gate_skip_bytes);
+
+        self.decode_attempts = self.decode_attempts.saturating_add(other.decode_attempts);
+        self.decode_attempt_bytes = self
+            .decode_attempt_bytes
+            .saturating_add(other.decode_attempt_bytes);
+        self.decode_errors = self.decode_errors.saturating_add(other.decode_errors);
+
+        self.decoded_bytes_total = self
+            .decoded_bytes_total
+            .saturating_add(other.decoded_bytes_total);
+        self.decoded_bytes_kept = self
+            .decoded_bytes_kept
+            .saturating_add(other.decoded_bytes_kept);
+        self.decoded_bytes_wasted_no_anchor = self
+            .decoded_bytes_wasted_no_anchor
+            .saturating_add(other.decoded_bytes_wasted_no_anchor);
+        self.decoded_bytes_wasted_error = self
+            .decoded_bytes_wasted_error
+            .saturating_add(other.decoded_bytes_wasted_error);
+    }
+}
+
 /// UTF-16 endianness used when validating UTF-16 anchor hits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Utf16Endianness {
@@ -1010,6 +1083,8 @@ pub struct ScanScratch {
     step_arena: StepArena,            // Decode provenance arena.
     utf16_buf: Vec<u8>,               // UTF-16 decode output buffer.
     steps_buf: Vec<DecodeStep>,       // Materialization scratch.
+    #[cfg(feature = "b64-stats")]
+    base64_stats: Base64DecodeStats,  // Base64 decode/gate instrumentation.
 }
 
 impl ScanScratch {
@@ -1071,6 +1146,8 @@ impl ScanScratch {
             },
             utf16_buf: Vec::with_capacity(engine.tuning.max_utf16_decoded_bytes_per_window),
             steps_buf: Vec::with_capacity(engine.tuning.max_transform_depth.saturating_add(1)),
+            #[cfg(feature = "b64-stats")]
+            base64_stats: Base64DecodeStats::default(),
         }
     }
 
@@ -1144,6 +1221,12 @@ impl ScanScratch {
             self.out
                 .reserve(self.max_findings.saturating_sub(self.out.capacity()));
         }
+    }
+
+    /// Returns per-scan base64 decode/gate stats.
+    #[cfg(feature = "b64-stats")]
+    pub fn base64_stats(&self) -> Base64DecodeStats {
+        self.base64_stats
     }
 
     /// Drains accumulated findings and returns them.
@@ -1225,6 +1308,8 @@ pub struct Engine {
     ac_anchors: AhoCorasick,
     pat_targets: Vec<Target>,
     pat_offsets: Vec<u32>,
+    // Base64 pre-decode gate (YARA-style permutations over anchors).
+    b64_gate: Option<Base64YaraGate>,
 
     // Residue gates for rules without anchors (pass 2).
     residue_rules: Vec<(usize, ResidueGatePlan)>,
@@ -1368,6 +1453,19 @@ impl Engine {
         let (anchor_patterns, pat_targets, pat_offsets) = map_to_patterns(pat_map);
         let max_anchor_pat_len = anchor_patterns.iter().map(|p| p.len()).max().unwrap_or(0);
 
+        let b64_gate = if anchor_patterns.is_empty() {
+            None
+        } else {
+            Some(Base64YaraGate::build(
+                anchor_patterns.iter().map(|p| p.as_slice()),
+                Base64YaraGateConfig {
+                    min_pattern_len: 0,
+                    padding_policy: PaddingPolicy::StopAndHalt,
+                    whitespace_policy: WhitespacePolicy::Rfc4648,
+                },
+            ))
+        };
+
         let ac_anchors = AhoCorasickBuilder::new()
             .prefilter(true)
             .build(anchor_patterns.iter().map(|p| p.as_slice()))
@@ -1393,6 +1491,7 @@ impl Engine {
             ac_anchors,
             pat_targets,
             pat_offsets,
+            b64_gate,
             residue_rules,
             unfilterable_rules,
             anchor_plan_stats,
@@ -1509,6 +1608,49 @@ impl Engine {
                     }
 
                     let enc = &cur_buf[enc_span.clone()];
+                    if tc.id == TransformId::Base64 {
+                        #[cfg(feature = "b64-stats")]
+                        {
+                            scratch.base64_stats.spans =
+                                scratch.base64_stats.spans.saturating_add(1);
+                            scratch.base64_stats.span_bytes = scratch
+                                .base64_stats
+                                .span_bytes
+                                .saturating_add(enc.len() as u64);
+                        }
+                        if tc.gate == Gate::AnchorsInDecoded {
+                            if let Some(gate) = &self.b64_gate {
+                                #[cfg(feature = "b64-stats")]
+                                {
+                                    scratch.base64_stats.pre_gate_checks = scratch
+                                        .base64_stats
+                                        .pre_gate_checks
+                                        .saturating_add(1);
+                                }
+                                if !gate.hits(enc) {
+                                    #[cfg(feature = "b64-stats")]
+                                    {
+                                        scratch.base64_stats.pre_gate_skip = scratch
+                                            .base64_stats
+                                            .pre_gate_skip
+                                            .saturating_add(1);
+                                        scratch.base64_stats.pre_gate_skip_bytes = scratch
+                                            .base64_stats
+                                            .pre_gate_skip_bytes
+                                            .saturating_add(enc.len() as u64);
+                                    }
+                                    continue;
+                                }
+                                #[cfg(feature = "b64-stats")]
+                                {
+                                    scratch.base64_stats.pre_gate_pass = scratch
+                                        .base64_stats
+                                        .pre_gate_pass
+                                        .saturating_add(1);
+                                }
+                            }
+                        }
+                    }
 
                     let remaining = self
                         .tuning
@@ -1917,6 +2059,8 @@ impl Engine {
         if max_out == 0 {
             return None;
         }
+        #[cfg(feature = "b64-stats")]
+        let is_b64 = tc.id == TransformId::Base64;
 
         // Keep enough bytes to detect anchors that straddle decode chunk boundaries.
         let tail_keep = self.max_anchor_pat_len.saturating_sub(1);
@@ -1926,6 +2070,16 @@ impl Engine {
         let mut local_out = 0usize;
         let mut truncated = false;
         let mut hit = false;
+
+        #[cfg(feature = "b64-stats")]
+        if is_b64 {
+            scratch.base64_stats.decode_attempts =
+                scratch.base64_stats.decode_attempts.saturating_add(1);
+            scratch.base64_stats.decode_attempt_bytes = scratch
+                .base64_stats
+                .decode_attempt_bytes
+                .saturating_add(encoded.len() as u64);
+        }
 
         let res = stream_decode(tc, encoded, |chunk| {
             if local_out.saturating_add(chunk.len()) > max_out {
@@ -1973,13 +2127,49 @@ impl Engine {
         });
 
         if res.is_err() || truncated || local_out == 0 || local_out > max_out {
+            #[cfg(feature = "b64-stats")]
+            if is_b64 {
+                scratch.base64_stats.decode_errors =
+                    scratch.base64_stats.decode_errors.saturating_add(1);
+                scratch.base64_stats.decoded_bytes_total = scratch
+                    .base64_stats
+                    .decoded_bytes_total
+                    .saturating_add(local_out as u64);
+                scratch.base64_stats.decoded_bytes_wasted_error = scratch
+                    .base64_stats
+                    .decoded_bytes_wasted_error
+                    .saturating_add(local_out as u64);
+            }
             scratch.slab.buf.truncate(start_len);
             return None;
         }
 
         if !hit {
+            #[cfg(feature = "b64-stats")]
+            if is_b64 {
+                scratch.base64_stats.decoded_bytes_total = scratch
+                    .base64_stats
+                    .decoded_bytes_total
+                    .saturating_add(local_out as u64);
+                scratch.base64_stats.decoded_bytes_wasted_no_anchor = scratch
+                    .base64_stats
+                    .decoded_bytes_wasted_no_anchor
+                    .saturating_add(local_out as u64);
+            }
             scratch.slab.buf.truncate(start_len);
             return None;
+        }
+
+        #[cfg(feature = "b64-stats")]
+        if is_b64 {
+            scratch.base64_stats.decoded_bytes_total = scratch
+                .base64_stats
+                .decoded_bytes_total
+                .saturating_add(local_out as u64);
+            scratch.base64_stats.decoded_bytes_kept = scratch
+                .base64_stats
+                .decoded_bytes_kept
+                .saturating_add(local_out as u64);
         }
 
         Some(start_len..(start_len + local_out))

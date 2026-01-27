@@ -1,0 +1,53 @@
+[package]
+name = "scanner-rs-fuzz"
+version = "0.0.0"
+authors = ["Automatically generated"]
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+base64 = "0.22"
+regex = { version = "1", features = ["std"] }
+memchr = "2"
+
+[dependencies.scanner-rs]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "fuzz_b64_gate_determinism"
+path = "fuzz_targets/fuzz_b64_gate_determinism.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_b64_gate_differential"
+path = "fuzz_targets/fuzz_b64_gate_differential.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_b64_gate_build_and_scan"
+path = "fuzz_targets/fuzz_b64_gate_build_and_scan.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_anchor_soundness"
+path = "fuzz_targets/fuzz_anchor_soundness.rs"
+test = false
+doc = false
+bench = false
