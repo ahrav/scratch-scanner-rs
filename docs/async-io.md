@@ -124,7 +124,7 @@ thread-backed under the hood.
 ### Notes
 
 - POSIX AIO is still implemented via system threads on macOS.
-- Dispatch I/O could be explored later, but it does not expose buffer reuse.
+- Dispatch I/O (GCD) could be explored later, but it does not expose buffer reuse.
 
 ---
 
@@ -132,7 +132,7 @@ thread-backed under the hood.
 
 Each worker is **self-contained**:
 
-- Owns its **io_uring** (Linux) or dispatch queue (macOS).
+- Owns its **io_uring** (Linux) or POSIX AIO state (macOS).
 - Owns its **BufferPool** and **ScanScratch**.
 - Reads and scans files **without sharing buffers**.
 

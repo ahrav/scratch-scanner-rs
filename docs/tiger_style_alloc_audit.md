@@ -37,14 +37,18 @@ allocations that occur inside regex internals (e.g., cache growth) are treated a
 external and out of scope. We warm caches once before measurement to focus on
 allocations under our control.
 
-### Sync runtime (per scan and per file allocations)
+### Sync runtime (allocation-free after startup)
 
 - `src/runtime.rs`:
-  - `ScannerRuntime::scan_file_sync` constructs a new `ScanScratch` and a `Vec<Finding>` every call.
-  - `read_file_chunks` allocates `tail: Vec<u8>` per call via `vec![0u8; overlap]`.
+  - `ScannerRuntime` now owns `ScanScratch`, an output buffer, and the overlap `tail` buffer.
+  - `ScannerRuntime::scan_file_sync` takes `&mut self` and returns a slice into the internal
+    output buffer.
+  - `read_file_chunks` now uses a caller-provided `tail` buffer to avoid per-scan allocation.
+  - `ScannerConfig::max_findings_per_file` bounds the output buffer size; the scan returns an
+    error if capacity is exceeded.
 
-Impact: The sync API violates the no-allocation rule by default, even when using a pre-built
-`ScannerRuntime`.
+Impact: The sync runtime is allocation-free after startup when `max_findings_per_file` is sized
+for expected workloads.
 
 ### Pipeline (per scan allocations inside `scan_path`)
 
@@ -112,12 +116,12 @@ expect allocations until their call paths are made allocation-free.
 engine.scan_chunk allocs: calls=0 bytes=0 reallocs=0 realloc_bytes=0 deallocs=0
 MacosAioScanner::scan_path allocs: calls=66 bytes=70661 reallocs=15 realloc_bytes=16348 deallocs=15
 Pipeline::scan_path allocs: calls=750 bytes=17849302 reallocs=15 realloc_bytes=16350 deallocs=700
-ScannerRuntime::scan_file_sync allocs: calls=683 bytes=12284149 reallocs=0 realloc_bytes=0 deallocs=683
+ScannerRuntime::scan_file_sync allocs: calls=0 bytes=0 reallocs=0 realloc_bytes=0 deallocs=0
 ```
 
 Interpretation:
 - Engine scan path is **allocation-free after warm-up**.
-- Pipeline, runtime, and macOS AIO paths still allocate per scan and per file.
+- Pipeline and macOS AIO paths still allocate per scan and per file.
 - macOS AIO path remains dominated by per-file `AioFileReader::new` allocations.
 
 ## Removal Approaches (Performance + Correctness)
@@ -131,12 +135,10 @@ Interpretation:
 - Remaining: ensure callers reuse `ScanScratch` and pre-size output `Vec<Finding>` when using
   `scan_chunk_materialized`.
 
-### 2) Sync runtime: hoist buffers into the runtime
+### 2) Sync runtime: hoist buffers into the runtime (done)
 
-- Move `ScanScratch`, `Vec<Finding>`, and overlap `tail` into `ScannerRuntime`.
-- Add `scan_file_sync_into(&mut self, out: &mut Vec<Finding>)` or similar to reuse buffers.
-- Replace per-call `tail: Vec<u8>` with `ScratchVec<u8>` or a fixed `[u8; MAX]` buffer sized
-  at startup (using `BUFFER_LEN_MAX`).
+- `ScannerRuntime` now owns `ScanScratch`, `tail`, and a fixed-capacity output buffer.
+- `scan_file_sync` returns a slice into the internal buffer and errors on capacity overflow.
 
 ### 3) Pipeline: persist stage state inside `Pipeline`
 
@@ -175,7 +177,7 @@ Interpretation:
 
 The codebase does not currently meet TigerStyle’s “no allocation after startup” rule. The
 allocations are concentrated in:
-- Per-scan runtime and pipeline construction.
+- Per-scan pipeline construction.
 - Per-file async macOS AIO reader allocations.
 - Path handling and output formatting.
 
