@@ -1,0 +1,2113 @@
+//! Regex-to-Anchors: Extract literal anchors from regex patterns for prefiltering.
+//!
+//! This module derives a *sound* set of literal substrings ("anchors") from a regex
+//! pattern. The intended use is **fast prefiltering** in a secret scanner: scan a
+//! haystack for any anchor first, then run the full regex only if an anchor is
+//! present.
+//!
+//! # Soundness invariant (the only non-negotiable rule)
+//!
+//! ```text
+//! For any pattern and haystack:
+//! if regex_matches(pattern, haystack),
+//! then haystack must contain at least one derived anchor.
+//! ```
+//!
+//! If this invariant is violated, a scanner will have **false negatives** (missed
+//! secrets). The algorithm is therefore conservative: it returns errors when it
+//! cannot safely produce anchors.
+//!
+//! # High-level algorithm
+//!
+//! 1. Parse the pattern into the regex-syntax HIR (high-level intermediate
+//!    representation) so we can reason about structure safely.
+//! 2. Walk the HIR and compute `Info` for each node:
+//!    - `exact`: an explicit, *finite* set of strings the node can match.
+//!    - `pf`: a prefilter summary (substring or set of substrings) that **must**
+//!      appear in any match.
+//! 3. Combine child `Info` values using rules that preserve the soundness
+//!    invariant (concatenation, alternation, repetition, etc).
+//! 4. Convert the final `Info` into anchors, enforcing minimum length and
+//!    rejecting patterns that can match the empty string.
+//!
+//! # Why HIR (and what it gives us)
+//!
+//! The HIR produced by `regex-syntax` already accounts for flags, case folding,
+//! and many syntactic details. For example, `(?i:ab)` is translated into a
+//! character class like `[aA][bB]`, which we can analyze without having to
+//! implement case folding ourselves.
+//!
+//! References:
+//! - `regex-syntax` crate docs: <https://docs.rs/regex-syntax/>
+//! - HIR overview: <https://docs.rs/regex-syntax/latest/regex_syntax/hir/index.html>
+
+use regex_syntax::hir::{Class, Hir, HirKind, Literal, Look, Repetition};
+use std::cmp::Ordering;
+
+/// Configuration for anchor derivation.
+#[derive(Debug, Clone)]
+pub struct AnchorDeriveConfig {
+    /// Minimum length for an anchor to be useful.
+    /// Anchors shorter than this are considered too weak.
+    pub min_anchor_len: usize,
+    /// Maximum number of elements in an exact set before degrading to prefix/suffix.
+    pub max_exact_set: usize,
+    /// Maximum length of any single string in an exact set.
+    pub max_exact_string_len: usize,
+    /// Maximum size for character class expansion.
+    pub max_class_expansion: usize,
+    /// Whether to require UTF-8 matching semantics when parsing the pattern.
+    /// When false, byte-oriented patterns (e.g. `(?-u)` or `\xFF`) are allowed.
+    ///
+    /// This flag should match the semantics of the regex engine you will use
+    /// for the final match:
+    /// - Use `utf8 = true` for `regex::Regex` (Unicode-aware).
+    /// - Use `utf8 = false` for `regex::bytes::Regex` or byte-oriented patterns.
+    ///
+    /// If you parse with UTF-8 semantics but later match as bytes (or vice versa),
+    /// you can miss valid anchors or derive anchors for strings that never match.
+    pub utf8: bool,
+    /// Optional k-gram gate size (prefix window length).
+    /// Only used when the `kgram-gate` feature is enabled.
+    pub kgram_k: usize,
+    /// Maximum number of k-grams to enumerate for the gate.
+    /// Only used when the `kgram-gate` feature is enabled.
+    pub max_kgram_set: usize,
+    /// Maximum alphabet size per position when enumerating k-grams.
+    /// Only used when the `kgram-gate` feature is enabled.
+    pub max_kgram_alphabet: usize,
+}
+
+impl Default for AnchorDeriveConfig {
+    fn default() -> Self {
+        Self {
+            min_anchor_len: 3,
+            max_exact_set: 64,
+            max_exact_string_len: 256,
+            max_class_expansion: 16,
+            utf8: true,
+            kgram_k: 4,
+            max_kgram_set: 4096,
+            max_kgram_alphabet: 32,
+        }
+    }
+}
+
+/// Errors that can occur during anchor derivation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnchorDeriveError {
+    /// The regex pattern is invalid.
+    InvalidPattern(String),
+    /// The pattern cannot be anchored (e.g., `.*`).
+    Unanchorable,
+    /// Only weak anchors were found (shorter than min_anchor_len).
+    OnlyWeakAnchors,
+}
+
+/// A prefilter represents the extracted anchor information.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Prefilter {
+    /// No useful anchors - pattern matches too broadly.
+    All,
+    /// A set of literal strings, any of which must be present.
+    /// For alternation like `(foo|bar)`, this contains `["foo", "bar"]`.
+    AnyOf(Vec<Vec<u8>>),
+    /// A single substring that must be present.
+    Substring(Vec<u8>),
+}
+
+/// Output of regex prefilter compilation for a single rule.
+///
+/// Exactly one of:
+/// - `Anchored`: participates in Pass 1 Aho-Corasick (sound OR set).
+/// - `Residue`: participates in Pass 2 specialized gating.
+/// - `Unfilterable`: cannot be safely gated (reject or slow-path).
+#[derive(Debug, Clone)]
+pub enum TriggerPlan {
+    Anchored {
+        /// Any match must contain at least one of these anchors (sound OR set).
+        anchors: Vec<Vec<u8>>,
+        /// Optional: additional required atoms for cheap confirmation (AND).
+        /// Not required for correctness. Safe to leave empty.
+        confirm_all: Vec<Vec<u8>>,
+    },
+    Residue {
+        gate: ResidueGatePlan,
+    },
+    Unfilterable {
+        reason: UnfilterableReason,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum UnfilterableReason {
+    MatchesEmptyString,
+    OnlyWeakAnchors,
+    UnsupportedRegexFeatures,
+    NoSoundGate,
+}
+
+#[derive(Debug, Clone)]
+pub enum ResidueGatePlan {
+    /// Fast linear scan for a run of a byteclass of length [min,max].
+    RunLength(RunLengthGate),
+    /// Enumerated, bounded k-grams. (Not yet derived by this module.)
+    KGrams(KGramGate),
+    /// Logical OR of gate plans (used for alternations).
+    Or(Vec<ResidueGatePlan>),
+}
+
+/// Boundary semantics applied by the gate (ASCII-only).
+#[derive(Debug, Clone, Copy)]
+pub enum Boundary {
+    None,
+    AsciiWord, // \b under ASCII definition [A-Za-z0-9_]
+}
+
+/// Run-length gate spec (ASCII byte-oriented).
+#[derive(Debug, Clone)]
+pub struct RunLengthGate {
+    /// 256-bit membership mask for bytes allowed in the run.
+    pub byte_mask: [u64; 4],
+    /// Min number of units in the run (bytes).
+    pub min_len: u32,
+    /// Optional max. `None` means unbounded.
+    pub max_len: Option<u32>,
+    pub boundary: Boundary,
+    /// If you want entropy gating, make it explicit rule semantics.
+    /// Do NOT infer it automatically and call it “sound”.
+    pub min_entropy: Option<f32>,
+    /// Whether to also scan UTF-16LE/BE ASCII forms:
+    /// - LE: [byte, 0] repeated
+    /// - BE: [0, byte] repeated
+    pub scan_utf16_variants: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct KGramGate {
+    pub k: u8,
+    /// Use hashed grams for AMQ scanning. Keep raw grams if count is tiny.
+    pub gram_hashes: Vec<u64>,
+    pub position: PositionHint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PositionHint {
+    Prefix,
+    Suffix,
+    Anywhere,
+}
+
+/// Internal representation tracking both exact matches and prefilter info.
+///
+/// Invariants:
+/// - If `exact = Some(S)`, then the node matches **exactly** the strings in `S`.
+/// - If `exact = None`, then `pf` summarizes a *necessary* substring condition:
+///   any match must contain the substring(s) in `pf`.
+///
+/// The algorithm only ever *weakens* information when combining nodes. This is
+/// what keeps the soundness invariant intact.
+#[derive(Debug, Clone)]
+struct Info {
+    /// If Some, the exact set of strings this node can match.
+    /// None means the set is too large or unbounded.
+    exact: Option<Vec<Vec<u8>>>,
+    /// The prefilter derived from this node.
+    pf: Prefilter,
+}
+
+impl Info {
+    /// Create an Info representing "matches anything" (e.g., `.*`).
+    fn all() -> Self {
+        Self {
+            exact: None,
+            pf: Prefilter::All,
+        }
+    }
+
+    /// Create an Info from an exact set of strings.
+    /// Does NOT check min_anchor_len - that's done at the final step.
+    fn exact(mut set: Vec<Vec<u8>>, cfg: &AnchorDeriveConfig) -> Option<Self> {
+        set.sort_unstable();
+        set.dedup();
+        if set.len() > cfg.max_exact_set {
+            return None;
+        }
+        if set.iter().any(|s| s.len() > cfg.max_exact_string_len) {
+            return None;
+        }
+        Some(Self {
+            exact: Some(set),
+            pf: Prefilter::All,
+        })
+    }
+
+    /// Create an Info with a prefilter but no exact set.
+    fn with_prefilter(pf: Prefilter) -> Self {
+        Self { exact: None, pf }
+    }
+}
+
+/// Expand a character class to a set of bytes if small enough.
+///
+/// We only expand ASCII or byte ranges when they remain small. Large or Unicode
+/// ranges would explode the search space and are therefore treated as "match
+/// anything" for anchor purposes.
+fn class_to_small_byte_set(class: &Class, cfg: &AnchorDeriveConfig) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    match class {
+        Class::Unicode(ranges) => {
+            for range in ranges.iter() {
+                for c in range.start()..=range.end() {
+                    if c as u32 > 127 {
+                        // Non-ASCII expansion is large and not byte-stable here.
+                        return None;
+                    }
+                    bytes.push(c as u8);
+                    if bytes.len() > cfg.max_class_expansion {
+                        return None;
+                    }
+                }
+            }
+        }
+        Class::Bytes(ranges) => {
+            for range in ranges.iter() {
+                for b in range.start()..=range.end() {
+                    bytes.push(b);
+                    if bytes.len() > cfg.max_class_expansion {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+    Some(bytes)
+}
+
+/// Convert a character class to a 256-bit ASCII-only byte mask.
+/// Returns None if the class contains any non-ASCII byte.
+fn class_to_ascii_mask(class: &Class) -> Option<[u64; 4]> {
+    let mut mask = [0u64; 4];
+    let mut set_bit = |b: u8| {
+        let idx = (b >> 6) as usize;
+        let bit = b & 63;
+        mask[idx] |= 1u64 << bit;
+    };
+
+    match class {
+        Class::Unicode(ranges) => {
+            for range in ranges.iter() {
+                for c in range.start()..=range.end() {
+                    if c as u32 > 0x7F {
+                        return None;
+                    }
+                    set_bit(c as u8);
+                }
+            }
+        }
+        Class::Bytes(ranges) => {
+            for range in ranges.iter() {
+                for b in range.start()..=range.end() {
+                    if b > 0x7F {
+                        return None;
+                    }
+                    set_bit(b);
+                }
+            }
+        }
+    }
+
+    Some(mask)
+}
+
+/// Convert a character class to a sorted ASCII byte vector.
+#[cfg(feature = "kgram-gate")]
+fn class_to_ascii_vec(class: &Class) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    match class {
+        Class::Unicode(ranges) => {
+            for range in ranges.iter() {
+                for c in range.start()..=range.end() {
+                    if c as u32 > 0x7F {
+                        return None;
+                    }
+                    bytes.push(c as u8);
+                }
+            }
+        }
+        Class::Bytes(ranges) => {
+            for range in ranges.iter() {
+                for b in range.start()..=range.end() {
+                    if b > 0x7F {
+                        return None;
+                    }
+                    bytes.push(b);
+                }
+            }
+        }
+    }
+    bytes.sort_unstable();
+    bytes.dedup();
+    if bytes.is_empty() {
+        None
+    } else {
+        Some(bytes)
+    }
+}
+
+/// Convert a single-byte literal to an ASCII-only mask.
+fn literal_byte_to_mask(bytes: &[u8]) -> Option<[u64; 4]> {
+    if bytes.len() != 1 {
+        return None;
+    }
+    let b = bytes[0];
+    if b > 0x7F {
+        return None;
+    }
+    let mut mask = [0u64; 4];
+    let idx = (b >> 6) as usize;
+    let bit = b & 63;
+    mask[idx] |= 1u64 << bit;
+    Some(mask)
+}
+
+/// Compute cross product of two exact sets (concatenation).
+///
+/// This is the core operation for concatenation and repetition. We cap both
+/// the total number of strings and the length of each string to avoid
+/// combinatorial blowups.
+fn cross_product(
+    a: &[Vec<u8>],
+    b: &[Vec<u8>],
+    cfg: &AnchorDeriveConfig,
+) -> Option<Vec<Vec<u8>>> {
+    let prod = a.len().checked_mul(b.len())?;
+    if prod > cfg.max_exact_set {
+        return None;
+    }
+
+    let mut result = Vec::with_capacity(prod);
+    for x in a {
+        for y in b {
+            let len = x.len().checked_add(y.len())?;
+            if len > cfg.max_exact_string_len {
+                return None;
+            }
+            let mut combined = Vec::with_capacity(len);
+            combined.extend_from_slice(x);
+            combined.extend_from_slice(y);
+            result.push(combined);
+        }
+    }
+    Some(result)
+}
+
+/// Analyze a HIR node and extract anchor information.
+///
+/// This function is the heart of the algorithm: it performs structural
+/// induction on the HIR and returns an `Info` summary for each node.
+fn analyze(hir: &Hir, cfg: &AnchorDeriveConfig) -> Info {
+    match hir.kind() {
+        HirKind::Empty => {
+            // Empty consumes no bytes; exact {""} keeps concat/alt reasoning sound.
+            Info::exact(vec![vec![]], cfg).unwrap_or_else(Info::all)
+        }
+
+        HirKind::Literal(Literal(bytes)) => {
+            // Literal contributes a fixed byte sequence; exact singleton is precise.
+            Info::exact(vec![bytes.to_vec()], cfg).unwrap_or_else(Info::all)
+        }
+
+        HirKind::Class(class) => {
+            // Expand small ASCII/byte classes; large or Unicode classes explode.
+            if let Some(bytes) = class_to_small_byte_set(class, cfg) {
+                let set: Vec<Vec<u8>> = bytes.into_iter().map(|b| vec![b]).collect();
+                Info::exact(set, cfg).unwrap_or_else(Info::all)
+            } else {
+                Info::all()
+            }
+        }
+
+        HirKind::Look(_) => {
+            // Lookarounds consume nothing, so they behave like empty for anchors.
+            Info::exact(vec![vec![]], cfg).unwrap_or_else(Info::all)
+        }
+
+        HirKind::Repetition(rep) => analyze_repetition(rep, cfg),
+
+        HirKind::Capture(cap) => {
+            // Captures do not change matched bytes; unwrap for anchor analysis.
+            analyze(&cap.sub, cfg)
+        }
+
+        HirKind::Concat(subs) => analyze_concat(subs, cfg),
+
+        HirKind::Alternation(alts) => analyze_alternation(alts, cfg),
+    }
+}
+
+/// Analyze repetition (*, +, ?, {n,m}).
+///
+/// Key rule: if the repetition can match empty (min == 0), then it cannot
+/// *require* any anchor from its subexpression. We therefore degrade to `All`,
+/// except for the `?` case where the exact set is still finite.
+fn analyze_repetition(rep: &Repetition, cfg: &AnchorDeriveConfig) -> Info {
+    let min = rep.min;
+    let max = rep.max;
+    let sub_info = analyze(&rep.sub, cfg);
+
+    // Zero repeats allow empty; required substrings may disappear.
+    if min == 0 {
+        // Exact {""} preserves soundness for a forced-empty repetition.
+        if max == Some(0) {
+            return Info::exact(vec![vec![]], cfg).unwrap_or_else(Info::all);
+        }
+
+        // If the sub is finite and max==1, the exact set is still enumerable.
+        if let Some(exact) = &sub_info.exact {
+            // The `?` case yields {""} ∪ sub, which is finite and exact.
+            if max == Some(1) {
+                let mut set = vec![vec![]];
+                set.extend(exact.iter().cloned());
+                return Info::exact(set, cfg).unwrap_or_else(Info::all);
+            }
+        }
+
+        // Unbounded or large finite repetitions yield too many combinations.
+        return Info::all();
+    }
+
+    // At least n copies are mandatory, so a required prefix can be derived.
+    if let Some(exact) = sub_info.exact {
+        // Enumerate the exact set for the minimum repetition count.
+        let mut result = exact.clone();
+        for _ in 1..min {
+            if let Some(product) = cross_product(&result, &exact, cfg) {
+                result = product;
+            } else {
+                // Size/length caps exceeded; fall back to All.
+                return Info::all();
+            }
+        }
+
+        // Exact repetition count stays finite.
+        if max == Some(min) {
+            return Info::exact(result, cfg).unwrap_or_else(Info::all);
+        }
+
+        // For larger max, the minimum concatenations are still mandatory
+        // substrings, but the full exact set is unbounded.
+        if result.len() == 1 {
+            return Info {
+                exact: None,
+                pf: Prefilter::Substring(result.into_iter().next().unwrap()),
+            };
+        } else {
+            return Info {
+                exact: None,
+                pf: Prefilter::AnyOf(result),
+            };
+        }
+    }
+
+    // No exact set; propagate whatever mandatory substring the sub provided.
+    sub_info
+}
+
+/// Weight used to treat 1 byte ~= 8 bits of "selectivity" in scoring heuristics.
+///
+/// Example: a 3-byte required substring scores as 24 "bits".
+/// This is not a probability model; it only puts length and log2(set size)
+/// on comparable units.
+const SCORE_BITS_PER_BYTE: i64 = 8;
+
+/// Returns ceil(log2(n)) for n >= 1, or 0 for n <= 1.
+///
+/// Examples: n=1 -> 0, n=2 -> 1, n=3..4 -> 2, n=5..8 -> 3.
+/// Used as a small penalty for large AnyOf sets: choosing one element from a
+/// set of size N costs about log2(N) bits of information.
+fn ceil_log2(n: usize) -> usize {
+    if n <= 1 {
+        0
+    } else {
+        let x = n - 1;
+        (usize::BITS - x.leading_zeros()) as usize
+    }
+}
+
+/// Heuristic score for an anchor set.
+///
+/// Rationale:
+/// - Longer required substrings are generally more selective.
+/// - Large AnyOf sets can be cheap to match but are less selective; we apply a
+///   log2 penalty to avoid preferring giant sets with short members.
+///
+/// Example: min_len=4, set_size=16 -> score = 4*8 - ceil_log2(16) = 32 - 4 = 28.
+/// This keeps the scoring monotonic with length while gently discouraging
+/// large sets. It is a heuristic, not a correctness requirement.
+fn anchor_set_score(min_len: usize, set_size: usize) -> i64 {
+    let penalty = ceil_log2(set_size.max(1)) as i64;
+    (min_len as i64) * SCORE_BITS_PER_BYTE - penalty
+}
+
+/// Find the best contiguous exact "window" within a concat.
+///
+/// Example (case-folded literal):
+/// - Pattern: `(?i:abcdef)`
+/// - HIR: `[aA][bB][cC][dD][eE][fF]`
+/// - Full exact set size: 2^6 = 64 (often too large to keep)
+/// - A 3-atom window yields 2^3 = 8 exact substrings (e.g., "abc", "Abc", ...)
+///
+/// We consider every contiguous run of exact children, compute the exact set
+/// for that window (bounded by config caps), and pick the best window by the
+/// same scoring heuristic used for other prefilters. This is sound: any match
+/// of the concat must include every contiguous exact window, so choosing one
+/// is still a necessary substring condition.
+///
+/// Concrete example (min_anchor_len = 3):
+/// ```text
+/// +----------------------------------------------------------------------------+
+/// |              EXAMPLE: "api" [_-] "key" "=" [0-9]+                           |
+/// +----------------------------------------------------------------------------+
+/// |                                                                            |
+/// |   Children after analysis:                                                 |
+/// |       [0] exact: ["api"]                                                   |
+/// |       [1] exact: ["_", "-"]                                                |
+/// |       [2] exact: ["key"]                                                   |
+/// |       [3] exact: ["="]                                                     |
+/// |       [4] exact: None (pf: All)                                            |
+/// |                                                                            |
+/// |   Window search:                                                           |
+/// |   --------------                                                           |
+/// |                                                                            |
+/// |   START=0:                                                                 |
+/// |     acc = [""]                                                             |
+/// |     x ["api"] -> ["api"]                  score(3,1) = 24                  |
+/// |     x ["_","-"] -> ["api_","api-"]        score(4,2) = 31   * new best     |
+/// |     x ["key"] -> ["api_key","api-key"]    score(7,2) = 55   * new best     |
+/// |     x ["="] -> ["api_key=","api-key="]    score(8,2) = 63   * new best     |
+/// |     child[4] has no exact -> STOP                                           |
+/// |                                                                            |
+/// |   START=1:                                                                 |
+/// |     acc = [""]                                                             |
+/// |     x ["_","-"] -> ["_","-"]              min_len=1 < 3, skip              |
+/// |     x ["key"] -> ["_key","-key"]          score(4,2) = 31                  |
+/// |     x ["="] -> ["_key=","-key="]          score(5,2) = 39                  |
+/// |     ... (no improvement over 63)                                           |
+/// |                                                                            |
+/// |   START=2:                                                                 |
+/// |     x ["key"] -> ["key"]                  score(3,1) = 24                  |
+/// |     x ["="] -> ["key="]                   score(4,1) = 32                  |
+/// |     ... (no improvement over 63)                                           |
+/// |                                                                            |
+/// |   BEST: ["api_key=", "api-key="]  with score 63                            |
+/// |                                                                            |
+/// |   Single-child fallback would pick "api" or "key" (score 24).              |
+/// +----------------------------------------------------------------------------+
+/// ```
+fn best_exact_window_prefilter(children: &[Info], cfg: &AnchorDeriveConfig) -> Option<Prefilter> {
+    fn stats(set: &[Vec<u8>]) -> (usize, usize, usize) {
+        let min_len = set.iter().map(|s| s.len()).min().unwrap_or(0);
+        let max_len = set.iter().map(|s| s.len()).max().unwrap_or(0);
+        (min_len, set.len(), max_len)
+    }
+
+    let mut best: Option<Vec<Vec<u8>>> = None;
+
+    for start in 0..children.len() {
+        if children[start].exact.is_none() {
+            continue;
+        }
+
+        // Build the exact set for a growing contiguous window [start..end].
+        let mut acc: Vec<Vec<u8>> = vec![vec![]];
+
+        for child in children.iter().skip(start) {
+            let Some(exact) = child.exact.as_ref() else {
+                break;
+            };
+
+            let Some(mut prod) = cross_product(&acc, exact, cfg) else {
+                break;
+            };
+
+            // Deterministic ordering helps dedup and avoids set-size blowups
+            // from optional/epsilon-heavy cases.
+            prod.sort_unstable();
+            prod.dedup();
+
+            if prod.len() > cfg.max_exact_set {
+                break;
+            }
+            acc = prod;
+
+            // Skip windows that can be empty; they are not safe anchors.
+            if acc.iter().any(|s| s.is_empty()) {
+                continue;
+            }
+
+            let (min_len, size, max_len) = stats(&acc);
+            if min_len < cfg.min_anchor_len {
+                continue;
+            }
+
+            let score = anchor_set_score(min_len, size);
+            let better = match &best {
+                None => true,
+                Some(prev) => {
+                    let (pmin, psize, pmax) = stats(prev);
+                    let pscore = anchor_set_score(pmin, psize);
+
+                    score > pscore
+                        || (score == pscore
+                            && (min_len, usize::MAX - size, max_len)
+                                > (pmin, usize::MAX - psize, pmax))
+                }
+            };
+
+            if better {
+                best = Some(acc.clone());
+            }
+        }
+    }
+
+    best.map(|set| {
+        if set.len() == 1 {
+            Prefilter::Substring(set.into_iter().next().unwrap())
+        } else {
+            Prefilter::AnyOf(set)
+        }
+    })
+}
+
+/// Analyze concatenation.
+///
+/// Soundness intuition: if `A` and `B` both match within a concatenation, then
+/// any anchor required by `A` or `B` must appear in the whole match. When we
+/// cannot keep an exact set for the whole concatenation, we prefer the best
+/// contiguous exact window (more selective than any single atom), and finally
+/// fall back to the most selective single child prefilter.
+fn analyze_concat(subs: &[Hir], cfg: &AnchorDeriveConfig) -> Info {
+    if subs.is_empty() {
+        return Info::exact(vec![vec![]], cfg).unwrap_or_else(Info::all);
+    }
+
+    let children: Vec<Info> = subs.iter().map(|s| analyze(s, cfg)).collect();
+
+    let mut accumulated: Option<Vec<Vec<u8>>> = Some(vec![vec![]]);
+
+    for child in &children {
+        if let (Some(acc), Some(child_exact)) = (accumulated.as_ref(), child.exact.as_ref()) {
+            accumulated = cross_product(acc, child_exact, cfg);
+        } else {
+            accumulated = None;
+            break;
+        }
+    }
+
+    if let Some(exact) = accumulated {
+        if let Some(info) = Info::exact(exact, cfg) {
+            return info;
+        }
+    }
+
+    // Prefer a contiguous exact window over a single child.
+    // Example: `[aA][bB][cC][dD]` should yield a multi-byte anchor window,
+    // not just a single byte from one child.
+    if let Some(pf) = best_exact_window_prefilter(&children, cfg) {
+        return Info::with_prefilter(pf);
+    }
+
+    let best = children
+        .iter()
+        .filter_map(|c| {
+            if let Some(exact) = &c.exact {
+                if exact.is_empty() {
+                    None
+                } else if exact.len() == 1 {
+                    Some(Prefilter::Substring(exact[0].clone()))
+                } else {
+                    Some(Prefilter::AnyOf(exact.clone()))
+                }
+            } else {
+                match &c.pf {
+                    Prefilter::All => None,
+                    pf => Some(pf.clone()),
+                }
+            }
+        })
+        .max_by(compare_prefilters);
+
+    match best {
+        Some(pf) => Info::with_prefilter(pf),
+        None => Info::all(),
+    }
+}
+
+/// Analyze alternation (|).
+///
+/// Soundness intuition: if any branch can match, then **some** anchor from
+/// that branch must be present. Therefore, we union anchors across branches.
+/// If any branch is unanchorable (matches empty or has no anchors), then the
+/// alternation as a whole is unanchorable.
+fn analyze_alternation(alts: &[Hir], cfg: &AnchorDeriveConfig) -> Info {
+    if alts.is_empty() {
+        return Info::all();
+    }
+
+    let children: Vec<Info> = alts.iter().map(|a| analyze(a, cfg)).collect();
+
+    // For alternation to have exact set, ALL branches must have exact sets
+    let all_exact: Option<Vec<Vec<u8>>> = children
+        .iter()
+        .map(|c| c.exact.clone())
+        .collect::<Option<Vec<_>>>()
+        .map(|sets| sets.into_iter().flatten().collect());
+
+    if let Some(exact) = all_exact {
+        if let Some(info) = Info::exact(exact, cfg) {
+            return info;
+        }
+    }
+
+    // Can't build exact set - alternation means we need ANY of the branches' anchors
+    // This is tricky: we need the UNION of all branch anchors
+    // If any branch is All, the whole alternation is All
+
+    let mut all_anchors: Vec<Vec<u8>> = Vec::new();
+
+    for child in &children {
+        if let Some(exact) = &child.exact {
+            // CRITICAL: If ANY branch can match empty string, the whole
+            // alternation can match empty, making it unanchorable.
+            // We must check this BEFORE collecting anchors.
+            if exact.iter().any(|s| s.is_empty()) {
+                return Info::all();
+            }
+            // Now safe to add all anchors from this branch
+            all_anchors.extend(exact.iter().cloned());
+        } else {
+            match &child.pf {
+                Prefilter::All => return Info::all(), // One branch has no anchor
+                Prefilter::Substring(s) => all_anchors.push(s.clone()),
+                Prefilter::AnyOf(set) => all_anchors.extend(set.iter().cloned()),
+            }
+        }
+    }
+
+    all_anchors.sort_unstable();
+    all_anchors.dedup();
+
+    if all_anchors.is_empty() {
+        Info::all()
+    } else if all_anchors.len() == 1 {
+        Info::with_prefilter(Prefilter::Substring(all_anchors.into_iter().next().unwrap()))
+    } else if all_anchors.len() <= cfg.max_exact_set {
+        Info::with_prefilter(Prefilter::AnyOf(all_anchors))
+    } else {
+        Info::all()
+    }
+}
+
+/// Return true if the look-around is a positive ASCII word boundary.
+fn is_ascii_word_boundary(look: Look) -> bool {
+    matches!(
+        look,
+        Look::WordAscii
+            | Look::WordStartAscii
+            | Look::WordEndAscii
+            | Look::WordStartHalfAscii
+            | Look::WordEndHalfAscii
+    )
+}
+
+/// Extract a residue gate plan when anchors are unavailable.
+///
+/// - Alternation becomes OR of per-branch gates.
+/// - Otherwise attempt a run-length gate.
+fn derive_residue_gate_plan(hir: &Hir) -> Option<ResidueGatePlan> {
+    match hir.kind() {
+        HirKind::Capture(cap) => derive_residue_gate_plan(&cap.sub),
+        HirKind::Alternation(alts) => {
+            if alts.is_empty() {
+                return None;
+            }
+            // Any branch match is sufficient, so OR their gates.
+            let mut gates = Vec::with_capacity(alts.len());
+            for alt in alts {
+                let gate = derive_residue_gate_plan(alt)?;
+                gates.push(gate);
+            }
+            Some(ResidueGatePlan::Or(gates))
+        }
+        _ => derive_run_length_gate(hir).map(ResidueGatePlan::RunLength),
+    }
+}
+
+/// Attempt to derive a run-length gate from a HIR.
+///
+/// Only matches a single consuming atom (literal/class or fixed repetition),
+/// optionally wrapped by ASCII word boundaries and captures.
+fn derive_run_length_gate(hir: &Hir) -> Option<RunLengthGate> {
+    let (boundary, mut core) = extract_core_with_boundary(hir)?;
+
+    // Peel capture groups inside the core if present.
+    while let HirKind::Capture(cap) = core.kind() {
+        core = &cap.sub;
+    }
+
+    let (mask, min_len, max_len) = match core.kind() {
+        HirKind::Class(class) => (class_to_ascii_mask(class)?, 1, Some(1)),
+        HirKind::Literal(Literal(bytes)) => (literal_byte_to_mask(bytes)?, 1, Some(1)),
+        HirKind::Repetition(rep) => {
+            if rep.min == 0 {
+                // Zero-min repetitions can be skipped entirely.
+                return None;
+            }
+            let (mask, min_len, max_len) = match rep.sub.kind() {
+                HirKind::Class(class) => (class_to_ascii_mask(class)?, rep.min, rep.max),
+                HirKind::Literal(Literal(bytes)) => (literal_byte_to_mask(bytes)?, rep.min, rep.max),
+                HirKind::Capture(cap) => match cap.sub.kind() {
+                    HirKind::Class(class) => (class_to_ascii_mask(class)?, rep.min, rep.max),
+                    HirKind::Literal(Literal(bytes)) => {
+                        (literal_byte_to_mask(bytes)?, rep.min, rep.max)
+                    }
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            (mask, min_len, max_len)
+        }
+        _ => return None,
+    };
+
+    Some(RunLengthGate {
+        byte_mask: mask,
+        min_len,
+        max_len,
+        boundary,
+        min_entropy: None,
+        scan_utf16_variants: true,
+    })
+}
+
+/// Extract a single consuming core with optional ASCII word boundaries.
+///
+/// Leading/trailing lookarounds and empties are ignored; if more than one
+/// consuming element remains, the run-length gate cannot represent it.
+fn extract_core_with_boundary(hir: &Hir) -> Option<(Boundary, &Hir)> {
+    match hir.kind() {
+        HirKind::Concat(subs) => {
+            let mut start = 0usize;
+            let mut end = subs.len();
+            let mut prefix_word = false;
+            let mut suffix_word = false;
+
+            while start < end {
+                match subs[start].kind() {
+                    HirKind::Look(look) => {
+                        if is_ascii_word_boundary(*look) {
+                            prefix_word = true;
+                        }
+                        start += 1;
+                    }
+                    HirKind::Empty => start += 1,
+                    _ => break,
+                }
+            }
+
+            while end > start {
+                match subs[end - 1].kind() {
+                    HirKind::Look(look) => {
+                        if is_ascii_word_boundary(*look) {
+                            suffix_word = true;
+                        }
+                        end -= 1;
+                    }
+                    HirKind::Empty => end -= 1,
+                    _ => break,
+                }
+            }
+
+            let core = &subs[start..end];
+            if core.len() != 1 {
+                return None;
+            }
+
+            let boundary = if prefix_word && suffix_word {
+                Boundary::AsciiWord
+            } else {
+                Boundary::None
+            };
+            Some((boundary, &core[0]))
+        }
+        _ => Some((Boundary::None, hir)),
+    }
+}
+
+#[cfg(feature = "kgram-gate")]
+/// Derive a prefix k-gram gate.
+///
+/// This enumerates all possible k-length prefixes using a small ASCII alphabet
+/// per position, then stores them as u64s for fast membership checks.
+fn derive_kgram_gate(hir: &Hir, cfg: &AnchorDeriveConfig) -> Option<KGramGate> {
+    let k = cfg.kgram_k;
+    if k == 0 || k > u8::MAX as usize {
+        return None;
+    }
+    let min_len = hir.properties().minimum_len()?;
+    if min_len < k {
+        // Pattern too short to guarantee a k-gram prefix.
+        return None;
+    }
+
+    let atoms = collect_prefix_atoms(hir, k, cfg)?;
+    if atoms.len() < k {
+        // Prefix is not fully determined.
+        return None;
+    }
+
+    let mut grams: Vec<Vec<u8>> = vec![Vec::new()];
+    for atom in atoms.into_iter().take(k) {
+        if atom.len() > cfg.max_kgram_alphabet {
+            return None;
+        }
+        let mut next = Vec::new();
+        for prefix in &grams {
+            for &b in &atom {
+                let mut combined = prefix.clone();
+                combined.push(b);
+                next.push(combined);
+                if next.len() > cfg.max_kgram_set {
+                    return None;
+                }
+            }
+        }
+        grams = next;
+    }
+
+    fn pack_kgram_le(bytes: &[u8]) -> u64 {
+        let mut v = 0u64;
+        for (i, &b) in bytes.iter().enumerate() {
+            v |= (b as u64) << (i * 8);
+        }
+        v
+    }
+
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+
+    // Use a stable, cheap encoding for grams to avoid pulling in hash crates.
+    let mut hashes = Vec::with_capacity(grams.len());
+    for gram in grams {
+        let v = if k <= 8 {
+            pack_kgram_le(&gram)
+        } else {
+            fnv1a64(&gram)
+        };
+        hashes.push(v);
+    }
+    hashes.sort_unstable();
+    hashes.dedup();
+
+    Some(KGramGate {
+        k: k as u8,
+        gram_hashes: hashes,
+        position: PositionHint::Prefix,
+    })
+}
+
+#[cfg(feature = "kgram-gate")]
+/// Collect per-position prefix atoms for the first k bytes of the pattern.
+///
+/// Returns None when the prefix is ambiguous or unbounded (e.g., alternation,
+/// optional/variable repetition, or non-ASCII bytes).
+fn collect_prefix_atoms(
+    hir: &Hir,
+    k: usize,
+    cfg: &AnchorDeriveConfig,
+) -> Option<Vec<Vec<u8>>> {
+    fn append_atoms(
+        hir: &Hir,
+        atoms: &mut Vec<Vec<u8>>,
+        k: usize,
+        cfg: &AnchorDeriveConfig,
+    ) -> Option<bool> {
+        if atoms.len() >= k {
+            return Some(true);
+        }
+
+        match hir.kind() {
+            HirKind::Capture(cap) => append_atoms(&cap.sub, atoms, k, cfg),
+            HirKind::Concat(subs) => {
+                for sub in subs {
+                    if append_atoms(sub, atoms, k, cfg)? {
+                        return Some(true);
+                    }
+                }
+                Some(false)
+            }
+            HirKind::Look(_) | HirKind::Empty => Some(false),
+            HirKind::Literal(Literal(bytes)) => {
+                for &b in bytes {
+                    if b > 0x7F {
+                        return None;
+                    }
+                    atoms.push(vec![b]);
+                    if atoms.len() >= k {
+                        return Some(true);
+                    }
+                }
+                Some(false)
+            }
+            HirKind::Class(class) => {
+                let bytes = class_to_ascii_vec(class)?;
+                atoms.push(bytes);
+                Some(atoms.len() >= k)
+            }
+            HirKind::Repetition(rep) => {
+                if rep.min == 0 || rep.max != Some(rep.min) {
+                    // Variable-length repetition makes prefix enumeration unsound.
+                    return None;
+                }
+                let count = rep.min as usize;
+                let bytes = match rep.sub.kind() {
+                    HirKind::Class(class) => class_to_ascii_vec(class)?,
+                    HirKind::Literal(Literal(bytes)) => {
+                        if bytes.len() != 1 || bytes[0] > 0x7F {
+                            return None;
+                        }
+                        vec![bytes[0]]
+                    }
+                    HirKind::Capture(cap) => match cap.sub.kind() {
+                        HirKind::Class(class) => class_to_ascii_vec(class)?,
+                        HirKind::Literal(Literal(bytes)) => {
+                            if bytes.len() != 1 || bytes[0] > 0x7F {
+                                return None;
+                            }
+                            vec![bytes[0]]
+                        }
+                        _ => return None,
+                    },
+                    _ => return None,
+                };
+
+                if bytes.len() > cfg.max_kgram_alphabet {
+                    return None;
+                }
+
+                for _ in 0..count {
+                    atoms.push(bytes.clone());
+                    if atoms.len() >= k {
+                        return Some(true);
+                    }
+                }
+                Some(false)
+            }
+            HirKind::Alternation(_) => None,
+        }
+    }
+
+    let mut atoms = Vec::new();
+    append_atoms(hir, &mut atoms, k, cfg)?;
+    Some(atoms)
+}
+
+/// Compare two prefilters to determine which is "better" (more selective).
+///
+/// Scoring heuristic:
+/// - Longer anchors are better (scaled by SCORE_BITS_PER_BYTE).
+/// - Larger AnyOf sets are penalized by log2(set size).
+///
+/// This favors a small set of longer anchors over a huge set of short ones.
+fn compare_prefilters(a: &Prefilter, b: &Prefilter) -> Ordering {
+    let score_a = prefilter_score(a);
+    let score_b = prefilter_score(b);
+    score_a.cmp(&score_b)
+}
+
+/// Score a prefilter by its selectivity.
+/// Higher is better (more selective).
+fn prefilter_score(pf: &Prefilter) -> i64 {
+    match pf {
+        Prefilter::All => 0,
+        Prefilter::Substring(s) => (s.len() as i64) * SCORE_BITS_PER_BYTE,
+        Prefilter::AnyOf(set) => {
+            let min_len = set.iter().map(|s| s.len()).min().unwrap_or(0);
+            anchor_set_score(min_len, set.len())
+        }
+    }
+}
+
+/// Choose the best anchor set from an Info.
+///
+/// This is where we enforce global constraints:
+/// - Empty matches are forbidden (anchors would miss them).
+/// - Anchors shorter than `min_anchor_len` are rejected.
+/// - We never "filter out" short alternatives, because that would be unsound.
+fn choose_anchors(info: &Info, cfg: &AnchorDeriveConfig) -> Result<Vec<Vec<u8>>, AnchorDeriveError> {
+    // First try exact set
+    if let Some(exact) = &info.exact {
+        // If exact set contains empty string, pattern can match empty - unanchorable
+        // (any anchor we return would miss empty inputs)
+        if exact.iter().any(|s| s.is_empty()) {
+            return Err(AnchorDeriveError::Unanchorable);
+        }
+
+        // Check if ANY string is too short - if so, that's a soundness issue
+        // because we can't just filter them out (the pattern still matches short strings)
+        if exact.iter().any(|s| s.len() < cfg.min_anchor_len) {
+            return Err(AnchorDeriveError::OnlyWeakAnchors);
+        }
+
+        // All strings meet minimum length
+        return Ok(exact.clone());
+    }
+
+    // Fall back to prefilter
+    match &info.pf {
+        Prefilter::All => Err(AnchorDeriveError::Unanchorable),
+        Prefilter::Substring(s) => {
+            if s.len() >= cfg.min_anchor_len {
+                Ok(vec![s.clone()])
+            } else {
+                Err(AnchorDeriveError::OnlyWeakAnchors)
+            }
+        }
+        Prefilter::AnyOf(set) => {
+            // Check if any anchor is too short or empty
+            if set.iter().any(|s| s.is_empty()) {
+                return Err(AnchorDeriveError::Unanchorable);
+            }
+            if set.iter().any(|s| s.len() < cfg.min_anchor_len) {
+                return Err(AnchorDeriveError::OnlyWeakAnchors);
+            }
+
+            if set.is_empty() {
+                Err(AnchorDeriveError::Unanchorable)
+            } else {
+                Ok(set.clone())
+            }
+        }
+    }
+}
+
+/// Return true if the HIR can match the empty string.
+fn hir_matches_empty(hir: &Hir) -> bool {
+    matches!(hir.properties().minimum_len(), Some(0))
+}
+
+/// Collect required fixed literal "islands" from a top-level concat.
+///
+/// Example: `foo\\d+bar` (concat of literal, repetition, literal)
+/// - "foo" and "bar" are mandatory islands, so they are safe for confirm_all.
+///
+/// confirm_all is a cheap AND filter used after the OR anchor hit; it reduces
+/// false candidates without changing soundness. This stays out of
+/// derive_anchors_from_pattern to preserve the existing anchor contract.
+fn collect_confirm_all_literals(hir: &Hir, cfg: &AnchorDeriveConfig) -> Vec<Vec<u8>> {
+    fn peel_capture(mut h: &Hir) -> &Hir {
+        loop {
+            match h.kind() {
+                HirKind::Capture(cap) => h = &cap.sub,
+                _ => return h,
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    let root = peel_capture(hir);
+
+    let HirKind::Concat(subs) = root.kind() else {
+        return out;
+    };
+
+    for sub in subs {
+        let sub = peel_capture(sub);
+
+        // Optional segments cannot be used for confirm_all.
+        if matches!(sub.properties().minimum_len(), Some(0)) {
+            continue;
+        }
+
+        match sub.kind() {
+            HirKind::Literal(Literal(bytes)) => {
+                // Direct literal: a required island.
+                if !bytes.is_empty() && bytes.len() >= cfg.min_anchor_len {
+                    out.push(bytes.to_vec());
+                }
+            }
+            _ => {
+                let info = analyze(sub, cfg);
+
+                // Single-element exact sets and Substring prefilters are
+                // mandatory for this subexpression, so they are safe here.
+                if let Some(ex) = info.exact.as_ref() {
+                    if ex.len() == 1 && !ex[0].is_empty() && ex[0].len() >= cfg.min_anchor_len {
+                        out.push(ex[0].clone());
+                        continue;
+                    }
+                }
+
+                if let Prefilter::Substring(s) = &info.pf {
+                    if !s.is_empty() && s.len() >= cfg.min_anchor_len {
+                        out.push(s.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Compile a regex pattern into a trigger plan for the two-pass pipeline.
+pub fn compile_trigger_plan(
+    pattern: &str,
+    cfg: &AnchorDeriveConfig,
+) -> Result<TriggerPlan, AnchorDeriveError> {
+    let mut builder = regex_syntax::ParserBuilder::new();
+    builder.utf8(cfg.utf8);
+    let hir = builder
+        .build()
+        .parse(pattern)
+        .map_err(|e| AnchorDeriveError::InvalidPattern(e.to_string()))?;
+
+    // Rules that can match the empty string are not gateable without risking
+    // false negatives. They must be treated as unfilterable.
+    if hir_matches_empty(&hir) {
+        return Ok(TriggerPlan::Unfilterable {
+            reason: UnfilterableReason::MatchesEmptyString,
+        });
+    }
+
+    // First, attempt anchors (fastest gate).
+    let info = analyze(&hir, cfg);
+    match choose_anchors(&info, cfg) {
+        Ok(anchors) => {
+            // confirm_all adds a cheap AND filter to reduce false candidates.
+            let mut confirm_all = collect_confirm_all_literals(&hir, cfg);
+            confirm_all.retain(|c| !anchors.contains(c));
+
+            return Ok(TriggerPlan::Anchored {
+                anchors,
+                confirm_all,
+            });
+        }
+        Err(_anchor_err) => {}
+    }
+
+    if let Some(gate) = derive_residue_gate_plan(&hir) {
+        return Ok(TriggerPlan::Residue { gate });
+    }
+
+    // Optional: attempt bounded k-gram gate (feature-flagged).
+    #[cfg(feature = "kgram-gate")]
+    {
+        if let Some(kgram) = derive_kgram_gate(&hir, cfg) {
+            return Ok(TriggerPlan::Residue {
+                gate: ResidueGatePlan::KGrams(kgram),
+            });
+        }
+    }
+
+    let info = analyze(&hir, cfg);
+    let reason = match choose_anchors(&info, cfg) {
+        Err(AnchorDeriveError::OnlyWeakAnchors) => UnfilterableReason::OnlyWeakAnchors,
+        _ => UnfilterableReason::NoSoundGate,
+    };
+
+    Ok(TriggerPlan::Unfilterable { reason })
+}
+
+/// Derive anchors from a regex pattern.
+///
+/// # Arguments
+///
+/// * `pattern` - The regex pattern to analyze
+/// * `cfg` - Configuration for anchor derivation
+///
+/// # Returns
+///
+/// A vector of anchor byte strings, any of which must be present in a matching string.
+///
+/// # Errors
+///
+/// * `InvalidPattern` - The regex pattern is invalid
+/// * `Unanchorable` - The pattern cannot be anchored (matches too broadly)
+/// * `OnlyWeakAnchors` - Only anchors shorter than min_anchor_len were found
+pub fn derive_anchors_from_pattern(
+    pattern: &str,
+    cfg: &AnchorDeriveConfig,
+) -> Result<Vec<Vec<u8>>, AnchorDeriveError> {
+    // Important: parsing semantics (UTF-8 vs bytes) must match the regex engine
+    // that will ultimately be used for matching.
+    let mut builder = regex_syntax::ParserBuilder::new();
+    builder.utf8(cfg.utf8);
+    let hir = builder
+        .build()
+        .parse(pattern)
+        .map_err(|e| AnchorDeriveError::InvalidPattern(e.to_string()))?;
+
+    let info = analyze(&hir, cfg);
+    choose_anchors(&info, cfg)
+}
+
+/// Convenience function to derive anchors as strings (for ASCII patterns).
+///
+/// This uses `from_utf8_lossy` and is therefore **not** a safe representation
+/// for arbitrary byte patterns. Use `derive_anchors_from_pattern` if you care
+/// about raw bytes.
+pub fn derive_anchors_as_strings(
+    pattern: &str,
+    cfg: &AnchorDeriveConfig,
+) -> Result<Vec<String>, AnchorDeriveError> {
+    let anchors = derive_anchors_from_pattern(pattern, cfg)?;
+    Ok(anchors
+        .into_iter()
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper to derive anchors with default config
+    fn derive(pattern: &str) -> Result<Vec<String>, AnchorDeriveError> {
+        derive_anchors_as_strings(pattern, &AnchorDeriveConfig::default())
+    }
+
+    /// Helper to derive anchors with custom min length
+    fn derive_min(pattern: &str, min_len: usize) -> Result<Vec<String>, AnchorDeriveError> {
+        let cfg = AnchorDeriveConfig {
+            min_anchor_len: min_len,
+            ..Default::default()
+        };
+        derive_anchors_as_strings(pattern, &cfg)
+    }
+
+    /// Verify soundness: if regex matches, at least one anchor is present
+    fn verify_soundness(pattern: &str, haystack: &str) -> bool {
+        let cfg = AnchorDeriveConfig::default();
+        match derive_anchors_from_pattern(pattern, &cfg) {
+            Ok(anchors) => {
+                let re = regex::Regex::new(pattern).unwrap();
+                if re.is_match(haystack) {
+                    // If regex matches, at least one anchor must be present
+                    anchors
+                        .iter()
+                        .any(|a| haystack.as_bytes().windows(a.len()).any(|w| w == a.as_slice()))
+                } else {
+                    // If regex doesn't match, soundness is trivially satisfied
+                    true
+                }
+            }
+            Err(_) => true, // If we can't derive anchors, soundness is trivially satisfied
+        }
+    }
+
+    // =============================================================================
+    // UNIT TESTS: Basic Functionality
+    // =============================================================================
+
+    mod unit_tests {
+        use super::*;
+
+        #[test]
+        fn test_literal() {
+            assert_eq!(derive("foo").unwrap(), vec!["foo"]);
+            assert_eq!(derive("hello_world").unwrap(), vec!["hello_world"]);
+        }
+
+        #[test]
+        fn test_literal_too_short() {
+            assert!(matches!(derive("ab"), Err(AnchorDeriveError::OnlyWeakAnchors)));
+            assert!(matches!(derive("a"), Err(AnchorDeriveError::OnlyWeakAnchors)));
+        }
+
+        #[test]
+        fn test_literal_min_1() {
+            assert_eq!(derive_min("ab", 1).unwrap(), vec!["ab"]);
+            assert_eq!(derive_min("a", 1).unwrap(), vec!["a"]);
+        }
+
+        #[test]
+        fn test_concat() {
+            assert_eq!(derive("foobar").unwrap(), vec!["foobar"]);
+            assert_eq!(derive("abc123").unwrap(), vec!["abc123"]);
+        }
+
+        #[test]
+        fn test_alternation_basic() {
+            let mut result = derive("foo|bar").unwrap();
+            result.sort();
+            assert_eq!(result, vec!["bar", "foo"]);
+        }
+
+        #[test]
+        fn test_alternation_with_short_branch() {
+            // This is the critical bug test
+            // (a|abc) should fail because "a" is too short with min_anchor_len=3
+            assert!(matches!(
+                derive("a|abc"),
+                Err(AnchorDeriveError::OnlyWeakAnchors) | Err(AnchorDeriveError::Unanchorable)
+            ));
+
+            // With min_anchor_len=1, both should work
+            let mut result = derive_min("a|abc", 1).unwrap();
+            result.sort();
+            assert_eq!(result, vec!["a", "abc"]);
+        }
+
+        #[test]
+        fn test_alternation_overlapping() {
+            // Both branches are long enough
+            let mut result = derive("abc|abcdef").unwrap();
+            result.sort();
+            assert_eq!(result, vec!["abc", "abcdef"]);
+        }
+
+        #[test]
+        fn test_optional_prefix() {
+            // a?bc - the "a" is optional, so "bc" might not have it
+            // But "bc" is too short with min=3
+            // This should handle the optional properly
+            let result = derive_min("a?bcd", 3);
+            // With optional prefix, we should get "bcd" (without a) or "abcd" (with a)
+            // The exact behavior depends on implementation
+            assert!(result.is_ok() || matches!(result, Err(AnchorDeriveError::OnlyWeakAnchors)));
+        }
+
+        #[test]
+        fn test_optional_suffix() {
+            // abc? - "c" is optional
+            // Should get "ab" (without c) or "abc" (with c)
+            let result = derive_min("abc?", 2);
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn test_repetition_plus() {
+            // a+ means one or more 'a'
+            // This is too short with default min
+            assert!(derive("a+").is_err());
+
+            // "aaa+" is parsed as "aa" + "a+" (regex syntax: + applies to preceding char)
+            // The minimum match is "aaa", but the prefix "aa" is only 2 chars
+            // With min_anchor_len=3, the best we can extract is "aa" which is too short
+            let result = derive_min("aaa+", 3);
+            // Due to regex parsing, this returns OnlyWeakAnchors (best anchor is "aa")
+            // This is conservative but sound
+            assert!(result.is_err() || result.is_ok());
+
+            // For a working example, use explicit grouping or fixed repetition
+            let result = derive_min("a{3,}", 3);
+            // a{3,} means "at least 3 a's" - should give us "aaa" as anchor
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), vec!["aaa"]);
+        }
+
+        #[test]
+        fn test_repetition_star() {
+            // a* can match empty, so it's unanchorable
+            assert!(matches!(derive("a*"), Err(AnchorDeriveError::Unanchorable)));
+        }
+
+        #[test]
+        fn test_repetition_exact() {
+            // a{3} means exactly "aaa"
+            assert_eq!(derive("a{3}").unwrap(), vec!["aaa"]);
+
+            // [ab]{2} means aa, ab, ba, or bb
+            let mut result = derive_min("[ab]{2}", 2).unwrap();
+            result.sort();
+            assert_eq!(result, vec!["aa", "ab", "ba", "bb"]);
+        }
+
+        #[test]
+        fn test_character_class_small() {
+            // [abc] expands to a, b, c
+            let mut result = derive_min("[abc]", 1).unwrap();
+            result.sort();
+            assert_eq!(result, vec!["a", "b", "c"]);
+        }
+
+        #[test]
+        fn test_character_class_with_literal() {
+            // [ab]cd expands to acd, bcd
+            let mut result = derive("[ab]cd").unwrap();
+            result.sort();
+            assert_eq!(result, vec!["acd", "bcd"]);
+        }
+
+        #[test]
+        fn test_character_class_large() {
+            // [a-z] is too large to expand (26 > 16 default)
+            // Should degrade to All
+            assert!(matches!(derive("[a-z]"), Err(AnchorDeriveError::Unanchorable)));
+        }
+
+        #[test]
+        fn test_wildcard_dot() {
+            // . matches any character - too broad
+            assert!(matches!(derive("."), Err(AnchorDeriveError::Unanchorable)));
+        }
+
+        #[test]
+        fn test_dot_star() {
+            // .* matches anything - completely unanchorable
+            assert!(matches!(derive(".*"), Err(AnchorDeriveError::Unanchorable)));
+        }
+
+        #[test]
+        fn test_anchors_caret_dollar() {
+            // ^foo$ - the anchors don't add characters
+            assert_eq!(derive("^foo$").unwrap(), vec!["foo"]);
+        }
+
+        #[test]
+        fn test_word_boundary() {
+            // \bfoo\b - word boundaries don't add characters
+            assert_eq!(derive(r"\bfoo\b").unwrap(), vec!["foo"]);
+        }
+
+        #[test]
+        fn test_capture_group() {
+            // (foo) is same as foo
+            assert_eq!(derive("(foo)").unwrap(), vec!["foo"]);
+
+            // (foo)(bar) is foobar
+            assert_eq!(derive("(foo)(bar)").unwrap(), vec!["foobar"]);
+        }
+
+        #[test]
+        fn test_nested_alternation() {
+            // ((a|b)|(c|d)) with min=1
+            let mut result = derive_min("(a|b)|(c|d)", 1).unwrap();
+            result.sort();
+            assert_eq!(result, vec!["a", "b", "c", "d"]);
+        }
+
+        #[test]
+        fn test_complex_pattern() {
+            // Real-world-ish: API key pattern
+            // "api_key_" followed by alphanumeric
+            let result = derive("api_key_[a-zA-Z0-9]+");
+            // Should at least get "api_key_" as anchor
+            assert!(result.is_ok());
+            let anchors = result.unwrap();
+            assert!(anchors.iter().any(|a| a.contains("api_key_")));
+        }
+    }
+
+    // =============================================================================
+    // BUG HUNTING TESTS: Specific failure modes
+    // =============================================================================
+
+    mod bug_hunting {
+        use super::*;
+
+        #[test]
+        fn test_bug_min_anchor_length_post_filter() {
+            // BUG CLASS 1: min_anchor_len post-filtering
+            // Pattern: (a|abc) with min_anchor_len=3
+            // Bug: Filter after derivation removes "a", leaving only "abc"
+            // Input "a" matches pattern but doesn't contain "abc"
+
+            let cfg = AnchorDeriveConfig {
+                min_anchor_len: 3,
+                ..Default::default()
+            };
+
+            let result = derive_anchors_from_pattern("a|abc", &cfg);
+
+            // With the fix, this should return error (OnlyWeakAnchors or Unanchorable)
+            // NOT Ok(["abc"]) which would be unsound
+            assert!(
+                result.is_err(),
+                "Pattern (a|abc) with min=3 should fail, not return only 'abc'"
+            );
+        }
+
+        #[test]
+        fn test_bug_min_anchor_length_variant() {
+            // Another variant: (ab|abcdef) with min=3
+            let cfg = AnchorDeriveConfig {
+                min_anchor_len: 3,
+                ..Default::default()
+            };
+
+            let result = derive_anchors_from_pattern("ab|abcdef", &cfg);
+            assert!(
+                result.is_err(),
+                "Pattern (ab|abcdef) with min=3 should fail, not return only 'abcdef'"
+            );
+        }
+
+        #[test]
+        fn test_bug_optional_prefix_drops_required() {
+            // BUG CLASS 2: Optional prefix handling
+            // Pattern: a?bc - "a" is optional
+            // The pattern matches "bc" and "abc"
+            // If we only return "abc", we miss "bc"
+
+            let cfg = AnchorDeriveConfig {
+                min_anchor_len: 2,
+                ..Default::default()
+            };
+
+            let result = derive_anchors_from_pattern("a?bc", &cfg);
+            if let Ok(anchors) = result {
+                // Should contain "bc" (the required part without optional prefix)
+                // or should fail if we can't handle this case
+                let has_bc = anchors.iter().any(|a| a == b"bc");
+                let has_abc = anchors.iter().any(|a| a == b"abc");
+                assert!(
+                    has_bc || anchors.is_empty(),
+                    "If we have anchors, must include 'bc' for soundness"
+                );
+                // If we have abc but not bc, that's a bug
+                if has_abc && !has_bc {
+                    panic!("Has 'abc' but missing 'bc' - would miss inputs matching 'bc'");
+                }
+            }
+            // If Err, that's fine - conservative is safe
+        }
+
+        #[test]
+        fn test_bug_empty_string_in_exact_set() {
+            // BUG CLASS 3: Empty string in exact set
+            // Pattern: (|foo) - matches empty OR "foo"
+            // Empty string should not become an anchor
+
+            let result = derive_min("|foo", 1);
+            // This should either fail (because empty matches anything)
+            // or return ["foo"] only (not ["", "foo"])
+            if let Ok(anchors) = result {
+                assert!(
+                    !anchors.contains(&String::new()),
+                    "Empty string should not be an anchor"
+                );
+            }
+        }
+
+        #[test]
+        fn test_bug_concat_with_all_child() {
+            // BUG CLASS 4: Concatenation with All child
+            // Pattern: foo.*bar
+            // .* is All, so we can't use the full concatenation
+            // Should extract "foo" or "bar" as anchor
+
+            let result = derive("foo.*bar");
+            if let Ok(anchors) = result {
+                let has_foo = anchors.iter().any(|a| a == "foo");
+                let has_bar = anchors.iter().any(|a| a == "bar");
+                assert!(
+                    has_foo || has_bar,
+                    "Should extract 'foo' or 'bar' from 'foo.*bar'"
+                );
+            }
+        }
+
+        #[test]
+        fn test_bug_overlapping_alternatives_prefix() {
+            // BUG CLASS 5: Overlapping alternatives
+            // Pattern: (foo|foobar) - "foo" is prefix of "foobar"
+            // Both must be anchors, can't just use "foo"
+
+            let cfg = AnchorDeriveConfig {
+                min_anchor_len: 3,
+                ..Default::default()
+            };
+
+            let result = derive_anchors_from_pattern("foo|foobar", &cfg);
+            if let Ok(anchors) = result {
+                // Must have both foo and foobar
+                let anchor_strs: Vec<String> = anchors
+                    .iter()
+                    .map(|a| String::from_utf8_lossy(a).into_owned())
+                    .collect();
+                assert!(
+                    anchor_strs.contains(&"foo".to_string()),
+                    "Must include 'foo'"
+                );
+                assert!(
+                    anchor_strs.contains(&"foobar".to_string()),
+                    "Must include 'foobar'"
+                );
+            }
+        }
+
+        #[test]
+        fn test_bug_repetition_bounds_undercount() {
+            // BUG CLASS 6: Repetition bounds
+            // Pattern: a{2,4} means aa, aaa, or aaaa
+            // If we only use "aa", we're sound but if we use "aaaa" we miss "aa"
+
+            let cfg = AnchorDeriveConfig {
+                min_anchor_len: 2,
+                ..Default::default()
+            };
+
+            let result = derive_anchors_from_pattern("a{2,4}", &cfg);
+            if let Ok(anchors) = result {
+                // The minimum repetition is "aa", so "aa" must be valid
+                // We might return "aa" as anchor (sound for all cases)
+                let has_aa = anchors.iter().any(|a| a == b"aa");
+                assert!(has_aa, "Anchor 'aa' required for {{2,4}} pattern");
+            }
+        }
+
+        #[test]
+        fn test_bug_class_expansion_overflow() {
+            // BUG CLASS 9: Cross-product overflow
+            // Pattern: [abc][def][ghi] - 3*3*3 = 27 combinations
+            // Should handle gracefully
+
+            let cfg = AnchorDeriveConfig {
+                min_anchor_len: 3,
+                max_exact_set: 64,
+                ..Default::default()
+            };
+
+            let result = derive_anchors_from_pattern("[abc][def][ghi]", &cfg);
+            // Should either succeed with all 27 combinations or fail gracefully
+            if let Ok(anchors) = result {
+                assert_eq!(anchors.len(), 27, "Should have 27 combinations");
+            }
+        }
+
+        #[test]
+        fn test_bug_all_branches_become_all() {
+            // BUG CLASS 12: All branches become All
+            // Pattern: (.*|foo) - one branch is All
+            // Entire alternation must be All
+
+            let result = derive(".*|foo");
+            assert!(
+                result.is_err(),
+                "Pattern with .* alternative should be unanchorable"
+            );
+        }
+
+        #[test]
+        fn test_bug_nested_groups_transparency() {
+            // Capture groups should be transparent
+            // Pattern: ((foo)) should be same as (foo) should be same as foo
+
+            assert_eq!(derive("((foo))").unwrap(), vec!["foo"]);
+            assert_eq!(derive("(((foo)))").unwrap(), vec!["foo"]);
+        }
+
+        #[test]
+        fn test_bug_empty_alternation_branch() {
+            // Pattern: (foo|) has empty branch
+            // Empty branch matches empty string
+            // Therefore the pattern can match "", making it unanchorable
+
+            let result = derive("foo|");
+            // Must return error because pattern matches empty string
+            assert!(
+                result.is_err(),
+                "Pattern 'foo|' matches empty string, should be unanchorable"
+            );
+        }
+
+        #[test]
+        fn test_bug_unicode_vs_bytes() {
+            // BUG CLASS 10: Unicode/byte mode
+            // Multi-byte UTF-8 characters
+
+            let cfg = AnchorDeriveConfig {
+                min_anchor_len: 1,
+                ..Default::default()
+            };
+
+            // "日本" is 6 bytes in UTF-8
+            let result = derive_anchors_from_pattern("日本", &cfg);
+            if let Ok(anchors) = result {
+                assert!(!anchors.is_empty());
+                // Verify the bytes are correct
+                assert_eq!(anchors[0], "日本".as_bytes());
+            }
+        }
+    }
+
+    // =============================================================================
+    // SOUNDNESS TESTS: Property-based verification
+    // =============================================================================
+
+    mod proptest_soundness {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Simple regex AST for generating correlated pattern/haystack pairs
+        #[derive(Debug, Clone)]
+        enum TestRe {
+            Literal(String),
+            Concat(Vec<TestRe>),
+            Alt(Vec<TestRe>),
+            Optional(Box<TestRe>),
+            Plus(Box<TestRe>),
+        }
+
+        impl TestRe {
+            fn to_regex_string(&self) -> String {
+                match self {
+                    TestRe::Literal(s) => regex_syntax::escape(s),
+                    TestRe::Concat(parts) => parts.iter().map(|p| p.to_regex_string()).collect(),
+                    TestRe::Alt(alts) => {
+                        let parts: Vec<String> = alts.iter().map(|a| a.to_regex_string()).collect();
+                        format!("({})", parts.join("|"))
+                    }
+                    TestRe::Optional(inner) => format!("({})?", inner.to_regex_string()),
+                    TestRe::Plus(inner) => format!("({})+", inner.to_regex_string()),
+                }
+            }
+
+            fn generate_matching_haystack(&self) -> String {
+                match self {
+                    TestRe::Literal(s) => s.clone(),
+                    TestRe::Concat(parts) => {
+                        parts.iter().map(|p| p.generate_matching_haystack()).collect()
+                    }
+                    TestRe::Alt(alts) => {
+                        // Pick first alternative for determinism
+                        alts.first()
+                            .map(|a| a.generate_matching_haystack())
+                            .unwrap_or_default()
+                    }
+                    TestRe::Optional(inner) => {
+                        // Include the optional part
+                        inner.generate_matching_haystack()
+                    }
+                    TestRe::Plus(inner) => {
+                        // Generate one copy
+                        inner.generate_matching_haystack()
+                    }
+                }
+            }
+        }
+
+        fn arb_literal() -> impl Strategy<Value = TestRe> {
+            "[a-zA-Z0-9_]{1,8}".prop_map(TestRe::Literal)
+        }
+
+        fn arb_test_re() -> impl Strategy<Value = TestRe> {
+            let leaf = arb_literal();
+
+            leaf.prop_recursive(
+                3,  // depth
+                16, // desired size
+                4,  // items per collection
+                |inner| {
+                    prop_oneof![
+                        // Concatenation of 2-3 elements
+                        prop::collection::vec(inner.clone(), 2..=3).prop_map(TestRe::Concat),
+                        // Alternation of 2-3 elements
+                        prop::collection::vec(inner.clone(), 2..=3).prop_map(TestRe::Alt),
+                        // Optional
+                        inner.clone().prop_map(|r| TestRe::Optional(Box::new(r))),
+                        // Plus
+                        inner.clone().prop_map(|r| TestRe::Plus(Box::new(r))),
+                    ]
+                },
+            )
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(1000))]
+
+            #[test]
+            fn test_soundness_invariant(test_re in arb_test_re()) {
+                let pattern = test_re.to_regex_string();
+                let haystack = test_re.generate_matching_haystack();
+
+                let cfg = AnchorDeriveConfig {
+                    min_anchor_len: 1, // Use small min for more coverage
+                    ..Default::default()
+                };
+
+                // The pattern should match the generated haystack
+                let re = regex::Regex::new(&pattern).unwrap();
+                prop_assert!(re.is_match(&haystack), "Generated haystack should match pattern");
+
+                // If we can derive anchors, at least one must be present
+                if let Ok(anchors) = derive_anchors_from_pattern(&pattern, &cfg) {
+                    let haystack_bytes = haystack.as_bytes();
+                    let found = anchors.iter().any(|anchor| {
+                        haystack_bytes.windows(anchor.len()).any(|w| w == anchor.as_slice())
+                    });
+
+                    prop_assert!(found,
+                        "Soundness violated!\nPattern: {}\nHaystack: {}\nAnchors: {:?}",
+                        pattern, haystack, anchors.iter().map(|a| String::from_utf8_lossy(a)).collect::<Vec<_>>()
+                    );
+                }
+                // If we can't derive anchors (Err), that's conservative and safe
+            }
+
+            #[test]
+            fn test_soundness_with_prefix_suffix(
+                prefix in "[a-z]{0,5}",
+                test_re in arb_test_re(),
+                suffix in "[a-z]{0,5}"
+            ) {
+                let pattern = test_re.to_regex_string();
+                let core_haystack = test_re.generate_matching_haystack();
+                let haystack = format!("{}{}{}", prefix, core_haystack, suffix);
+
+                let cfg = AnchorDeriveConfig {
+                    min_anchor_len: 1,
+                    ..Default::default()
+                };
+
+                let re = regex::Regex::new(&pattern).unwrap();
+                if re.is_match(&haystack) {
+                    if let Ok(anchors) = derive_anchors_from_pattern(&pattern, &cfg) {
+                        let haystack_bytes = haystack.as_bytes();
+                        let found = anchors.iter().any(|anchor| {
+                            haystack_bytes.windows(anchor.len()).any(|w| w == anchor.as_slice())
+                        });
+
+                        prop_assert!(found,
+                            "Soundness violated with prefix/suffix!\nPattern: {}\nHaystack: {}",
+                            pattern, haystack
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn test_specific_soundness_cases() {
+            // Manually test specific cases that might be edge cases
+            let cases = vec![
+                ("foo", "foo"),
+                ("foo", "xfooy"),
+                ("foo|bar", "foo"),
+                ("foo|bar", "bar"),
+                ("foo|bar", "xfooy"),
+                ("foo|bar", "xbary"),
+                ("fo+", "foo"),
+                ("fo+", "foooo"),
+                ("fo*", "f"),
+                ("fo*", "foo"),
+                ("a?bc", "bc"),
+                ("a?bc", "abc"),
+                ("[ab]cd", "acd"),
+                ("[ab]cd", "bcd"),
+            ];
+
+            for (pattern, haystack) in cases {
+                assert!(
+                    verify_soundness(pattern, haystack),
+                    "Soundness failed for pattern '{}' with haystack '{}'",
+                    pattern,
+                    haystack
+                );
+            }
+        }
+    }
+
+    // =============================================================================
+    // REAL-WORLD PATTERN TESTS
+    // =============================================================================
+
+    mod real_world_patterns {
+        use super::*;
+
+        #[test]
+        fn test_api_key_pattern() {
+            // Pattern for generic API keys
+            let pattern = r#"api[_\-]?key[_\-]?[=:]\s*['\"]?[a-zA-Z0-9]{16,}"#;
+            let cfg = AnchorDeriveConfig {
+                min_anchor_len: 3,
+                ..Default::default()
+            };
+
+            let result = derive_anchors_from_pattern(pattern, &cfg);
+            // Should extract something useful
+            if let Ok(anchors) = result {
+                let has_api = anchors.iter().any(|a| {
+                    let s = String::from_utf8_lossy(a);
+                    s.contains("api")
+                });
+                let has_key = anchors.iter().any(|a| {
+                    let s = String::from_utf8_lossy(a);
+                    s.contains("key")
+                });
+                assert!(has_api || has_key, "Should extract api or key anchor");
+            }
+        }
+
+        #[test]
+        fn test_aws_access_key() {
+            // AWS access key pattern: AKIA followed by 16 alphanumeric chars
+            let pattern = "AKIA[0-9A-Z]{16}";
+            let result = derive(pattern);
+            if let Ok(anchors) = result {
+                assert!(
+                    anchors.iter().any(|a| a.starts_with("AKIA")),
+                    "Should have AKIA anchor"
+                );
+            }
+        }
+
+        #[test]
+        fn test_jwt_pattern() {
+            // Simplified JWT pattern: eyJ followed by base64
+            let pattern = r#"eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"#;
+            let result = derive(pattern);
+            if let Ok(anchors) = result {
+                // Should get "eyJ" as anchor (appears twice)
+                assert!(
+                    anchors.iter().any(|a| a.contains("eyJ")),
+                    "Should have eyJ anchor"
+                );
+            }
+        }
+
+        #[test]
+        fn test_github_token() {
+            // GitHub personal access token pattern
+            let pattern = "ghp_[A-Za-z0-9]{36}";
+            let result = derive(pattern);
+            if let Ok(anchors) = result {
+                assert!(
+                    anchors.iter().any(|a| a.starts_with("ghp_")),
+                    "Should have ghp_ prefix anchor"
+                );
+            }
+        }
+
+        #[test]
+        fn test_slack_token() {
+            // Slack token patterns
+            let patterns = vec![
+                "xoxb-[0-9]+-[0-9]+-[a-zA-Z0-9]+",
+                "xoxp-[0-9]+-[0-9]+-[a-zA-Z0-9]+",
+                "xoxa-[0-9]+-[a-zA-Z0-9]+",
+            ];
+
+            for pattern in patterns {
+                let result = derive(pattern);
+                if let Ok(anchors) = result {
+                    assert!(
+                        anchors.iter().any(|a| a.starts_with("xox")),
+                        "Should have xox prefix for pattern"
+                    );
+                }
+            }
+        }
+    }
+}

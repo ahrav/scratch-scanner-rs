@@ -401,6 +401,7 @@ impl ScanStage {
         engine: &Engine,
         chunk_ring: &mut SpscRing<Chunk, CHUNK_CAP>,
         out_ring: &mut SpscRing<FindingRec, OUT_CAP>,
+        stats: &mut PipelineStats,
     ) -> bool {
         let mut progressed = false;
 
@@ -518,7 +519,7 @@ impl<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize>
             let mut progressed = false;
 
             progressed |= output.pump(&self.engine, &files, &mut out_ring, &mut stats)?;
-            progressed |= scanner.pump(&self.engine, &mut chunk_ring, &mut out_ring);
+            progressed |= scanner.pump(&self.engine, &mut chunk_ring, &mut out_ring, &mut stats);
             progressed |= reader.pump(
                 &mut file_ring,
                 &mut chunk_ring,

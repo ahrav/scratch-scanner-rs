@@ -1,6 +1,6 @@
 #![allow(dead_code, unused_imports, unused_variables)]
 
-use scanner_rs::demo_engine;
+use scanner_rs::{demo_engine_with_anchor_mode, AnchorMode};
 use scanner_rs::pipeline::scan_path_default;
 use std::env;
 use std::io;
@@ -11,17 +11,58 @@ use std::time::Instant;
 fn main() -> io::Result<()> {
     let mut args = env::args_os();
     let exe = args.next().unwrap_or_else(|| "scanner-rs".into());
-    let Some(path) = args.next() else {
-        eprintln!("usage: {} <path>", exe.to_string_lossy());
+    let mut anchor_mode = AnchorMode::Manual;
+    let mut path: Option<PathBuf> = None;
+
+    for arg in args {
+        if let Some(flag) = arg.to_str() {
+            match flag {
+                "--anchors=manual" => {
+                    anchor_mode = AnchorMode::Manual;
+                    continue;
+                }
+                "--anchors=derived" | "--derive-anchors" => {
+                    anchor_mode = AnchorMode::Derived;
+                    continue;
+                }
+                "--help" | "-h" => {
+                    eprintln!(
+                        "usage: {} [--anchors=manual|derived] <path>",
+                        exe.to_string_lossy()
+                    );
+                    std::process::exit(0);
+                }
+                _ if flag.starts_with("--") => {
+                    eprintln!("unknown flag: {}", flag);
+                    eprintln!(
+                        "usage: {} [--anchors=manual|derived] <path>",
+                        exe.to_string_lossy()
+                    );
+                    std::process::exit(2);
+                }
+                _ => {}
+            }
+        }
+
+        if path.is_some() {
+            eprintln!(
+                "usage: {} [--anchors=manual|derived] <path>",
+                exe.to_string_lossy()
+            );
+            std::process::exit(2);
+        }
+        path = Some(PathBuf::from(arg));
+    }
+
+    let Some(path) = path else {
+        eprintln!(
+            "usage: {} [--anchors=manual|derived] <path>",
+            exe.to_string_lossy()
+        );
         std::process::exit(2);
     };
 
-    if args.next().is_some() {
-        eprintln!("usage: {} <path>", exe.to_string_lossy());
-        std::process::exit(2);
-    }
-
-    let engine = Arc::new(demo_engine());
+    let engine = Arc::new(demo_engine_with_anchor_mode(anchor_mode));
     let start = Instant::now();
     let stats = scan_path_default(&PathBuf::from(path), engine)?;
     let elapsed = start.elapsed();

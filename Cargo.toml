@@ -9,12 +9,14 @@ aho-corasick = "1.1"
 ahash = "0.8"
 memchr = "2.6"
 regex = "1.10"
+regex-syntax = "0.8"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 aegis = { version = "0.9", features = ["pure-rust"] }
 
 [features]
 stdx-proptest = []
+kgram-gate = []
 
 [dev-dependencies]
 proptest = "1.4"

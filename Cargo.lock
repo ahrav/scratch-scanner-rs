@@ -310,6 +310,7 @@ dependencies = [
  "memchr",
  "proptest",
  "regex",
+ "regex-syntax",
 ]
 
 [[package]]

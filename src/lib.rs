@@ -21,6 +21,7 @@
 
 pub mod pipeline;
 pub mod pool;
+pub mod regex2anchor;
 pub mod scratch_memory;
 pub mod stdx;
 #[cfg(test)]
@@ -31,6 +32,10 @@ use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use memchr::memchr;
 use memchr::memmem;
 use regex::bytes::Regex;
+use crate::regex2anchor::{
+    compile_trigger_plan, AnchorDeriveConfig, ResidueGatePlan, TriggerPlan,
+    UnfilterableReason,
+};
 use std::cell::{Cell, UnsafeCell};
 use ahash::AHashMap;
 use std::fs::File;
@@ -1183,6 +1188,7 @@ impl ScanScratch {
             self.findings_dropped = self.findings_dropped.saturating_add(1);
         }
     }
+
 }
 
 /// Reference to a buffer being scanned.
@@ -1222,33 +1228,127 @@ pub struct Engine {
     pat_targets: Vec<Target>,
     pat_offsets: Vec<u32>,
 
+    // Residue gates for rules without anchors (pass 2).
+    residue_rules: Vec<(usize, ResidueGatePlan)>,
+    unfilterable_rules: Vec<(usize, UnfilterableReason)>,
+    anchor_plan_stats: AnchorPlanStats,
+
     max_anchor_pat_len: usize,
     max_window_diameter_bytes: usize,
+}
+
+/// Summary of anchor derivation choices during engine build.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AnchorPlanStats {
+    pub manual_rules: usize,
+    pub derived_rules: usize,
+    pub residue_rules: usize,
+    pub unfilterable_rules: usize,
+}
+
+/// Policy for selecting anchors during engine compilation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnchorPolicy {
+    /// Prefer derived anchors, falling back to manual anchors if derivation fails.
+    PreferDerived,
+    /// Only use manual anchors; skip derivation.
+    ManualOnly,
+    /// Only use derived anchors; ignore manual anchors entirely.
+    DerivedOnly,
 }
 
 impl Engine {
     /// Compiles rule specs into an engine with prebuilt anchor automata.
     pub fn new(rules: Vec<RuleSpec>, transforms: Vec<TransformConfig>, tuning: Tuning) -> Self {
+        Self::new_with_anchor_policy(rules, transforms, tuning, AnchorPolicy::PreferDerived)
+    }
+
+    /// Compiles rule specs into an engine with a specific anchor policy.
+    pub fn new_with_anchor_policy(
+        rules: Vec<RuleSpec>,
+        transforms: Vec<TransformConfig>,
+        tuning: Tuning,
+        policy: AnchorPolicy,
+    ) -> Self {
         let rules_compiled = rules.iter().map(compile_rule).collect::<Vec<_>>();
 
         // Build deduped anchor patterns: pattern -> targets
         let mut pat_map: AHashMap<Vec<u8>, Vec<Target>> = AHashMap::new();
 
         for (rid, r) in rules.iter().enumerate() {
-            for &a in r.anchors {
-                debug_assert!(rid <= u32::MAX as usize);
-                let rid_u32 = rid as u32;
-                add_pat_raw(&mut pat_map, a, Target::new(rid_u32, Variant::Raw));
-                add_pat_owned(
-                    &mut pat_map,
-                    utf16le_bytes(a),
-                    Target::new(rid_u32, Variant::Utf16Le),
-                );
-                add_pat_owned(
-                    &mut pat_map,
-                    utf16be_bytes(a),
-                    Target::new(rid_u32, Variant::Utf16Be),
-                );
+            debug_assert!(rid <= u32::MAX as usize);
+            let rid_u32 = rid as u32;
+            let mut manual_used = false;
+            let mut add_manual = |pat_map: &mut AHashMap<Vec<u8>, Vec<Target>>| {
+                if !allow_manual {
+                    return;
+                }
+                if manual_used || r.anchors.is_empty() {
+                    return;
+                }
+                manual_used = true;
+                anchor_plan_stats.manual_rules = anchor_plan_stats.manual_rules.saturating_add(1);
+                for &a in r.anchors {
+                    add_pat_raw(pat_map, a, Target::new(rid_u32, Variant::Raw));
+                    add_pat_owned(
+                        pat_map,
+                        utf16le_bytes(a),
+                        Target::new(rid_u32, Variant::Utf16Le),
+                    );
+                    add_pat_owned(
+                        pat_map,
+                        utf16be_bytes(a),
+                        Target::new(rid_u32, Variant::Utf16Be),
+                    );
+                }
+            };
+
+            if !allow_derive {
+                add_manual(&mut pat_map);
+                continue;
+            }
+
+            let plan = match compile_trigger_plan(r.re.as_str(), &derive_cfg) {
+                Ok(plan) => plan,
+                Err(_) => {
+                    unfilterable_rules.push((rid, UnfilterableReason::UnsupportedRegexFeatures));
+                    anchor_plan_stats.unfilterable_rules =
+                        anchor_plan_stats.unfilterable_rules.saturating_add(1);
+                    add_manual(&mut pat_map);
+                    continue;
+                }
+            };
+
+            match plan {
+                TriggerPlan::Anchored { anchors, .. } => {
+                    anchor_plan_stats.derived_rules =
+                        anchor_plan_stats.derived_rules.saturating_add(1);
+                    for anchor in anchors {
+                        add_pat_raw(&mut pat_map, &anchor, Target::new(rid_u32, Variant::Raw));
+                        add_pat_owned(
+                            &mut pat_map,
+                            utf16le_bytes(&anchor),
+                            Target::new(rid_u32, Variant::Utf16Le),
+                        );
+                        add_pat_owned(
+                            &mut pat_map,
+                            utf16be_bytes(&anchor),
+                            Target::new(rid_u32, Variant::Utf16Be),
+                        );
+                    }
+                }
+                TriggerPlan::Residue { gate } => {
+                    residue_rules.push((rid, gate));
+                    anchor_plan_stats.residue_rules =
+                        anchor_plan_stats.residue_rules.saturating_add(1);
+                    add_manual(&mut pat_map);
+                }
+                TriggerPlan::Unfilterable { reason } => {
+                    unfilterable_rules.push((rid, reason));
+                    anchor_plan_stats.unfilterable_rules =
+                        anchor_plan_stats.unfilterable_rules.saturating_add(1);
+                    add_manual(&mut pat_map);
+                }
             }
         }
 
@@ -1280,9 +1380,22 @@ impl Engine {
             ac_anchors,
             pat_targets,
             pat_offsets,
+            residue_rules,
+            unfilterable_rules,
+            anchor_plan_stats,
             max_anchor_pat_len,
             max_window_diameter_bytes,
         }
+    }
+
+    /// Returns a summary of how anchors were chosen during compilation.
+    pub fn anchor_plan_stats(&self) -> AnchorPlanStats {
+        self.anchor_plan_stats
+    }
+
+    /// Rules that could not be given a sound gate from their regex pattern.
+    pub fn unfilterable_rules(&self) -> &[(usize, UnfilterableReason)] {
+        &self.unfilterable_rules
     }
 
     /// Single-buffer scan helper (allocates scratch per call).
@@ -2629,9 +2742,27 @@ fn u64_to_usize(v: u64) -> usize {
 // Demo engine (rules + transforms)
 // --------------------------
 
+/// Anchor selection mode for demo rules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnchorMode {
+    /// Use the hand-curated anchors on each rule.
+    Manual,
+    /// Derive anchors from regex patterns (empty anchors trigger derivation).
+    Derived,
+}
+
 /// Builds a demo engine with a representative subset of secret rules.
 pub fn demo_engine() -> Engine {
     Engine::new(demo_rules(), demo_transforms(), demo_tuning())
+}
+
+/// Builds a demo engine with either manual or derived anchors.
+pub fn demo_engine_with_anchor_mode(mode: AnchorMode) -> Engine {
+    let policy = match mode {
+        AnchorMode::Manual => AnchorPolicy::ManualOnly,
+        AnchorMode::Derived => AnchorPolicy::DerivedOnly,
+    };
+    Engine::new_with_anchor_policy(demo_rules(), demo_transforms(), demo_tuning(), policy)
 }
 
 fn demo_rules() -> Vec<RuleSpec> {
@@ -2661,7 +2792,14 @@ fn demo_rules() -> Vec<RuleSpec> {
     const SLACK_TOKEN_ANCHORS: &[&[u8]] = &[b"xoxb-", b"xoxa-", b"xoxp-", b"xoxr-", b"xoxs-"];
     const SLACK_WEBHOOK_ANCHORS: &[&[u8]] = &[b"hooks.slack.com/services/"];
 
-    const STRIPE_TOKEN_ANCHORS: &[&[u8]] = &[b"sk_test_", b"sk_live_", b"pk_test_", b"pk_live_"];
+    const STRIPE_TOKEN_ANCHORS: &[&[u8]] = &[
+        b"sk_test_",
+        b"sk_live_",
+        b"sk_prod_",
+        b"rk_test_",
+        b"rk_live_",
+        b"rk_prod_",
+    ];
 
     const SENDGRID_TOKEN_ANCHORS: &[&[u8]] = &[b"SG.", b"sg."];
 
@@ -2735,7 +2873,7 @@ fn demo_rules() -> Vec<RuleSpec> {
             radius: 96,
             two_phase: None,
             must_contain: None,
-            re: Regex::new(r"(?i)(sk|pk)_(test|live)_[0-9a-z]{10,32}").unwrap(),
+            re: Regex::new(r"(?:sk|rk)_(?:test|live|prod)_[a-zA-Z0-9]{10,99}").unwrap(),
         },
         RuleSpec {
             name: "sendgrid-api-token",
@@ -2936,6 +3074,49 @@ mod tests {
         let hits = eng.scan_chunk(&hay);
 
         assert!(hits.iter().any(|h| h.rule == "aws-access-token"));
+    }
+
+    #[test]
+    fn anchor_policy_prefers_derived_over_manual() {
+        const MANUAL: &[&[u8]] = &[b"bar"];
+        let rule = RuleSpec {
+            name: "derived-prefers",
+            anchors: MANUAL,
+            radius: 0,
+            two_phase: None,
+            must_contain: None,
+            re: Regex::new("foo").unwrap(),
+        };
+
+        let eng = Engine::new(vec![rule], Vec::new(), demo_tuning());
+        let stats = eng.anchor_plan_stats();
+        assert_eq!(stats.derived_rules, 1);
+        assert_eq!(stats.manual_rules, 0);
+
+        let hits = eng.scan_chunk(b"barfoo");
+        assert!(hits.iter().any(|h| h.rule == "derived-prefers"));
+    }
+
+    #[test]
+    fn anchor_policy_falls_back_to_manual_on_unfilterable() {
+        const MANUAL: &[&[u8]] = &[b"Z"];
+        let rule = RuleSpec {
+            name: "manual-fallback",
+            anchors: MANUAL,
+            radius: 0,
+            two_phase: None,
+            must_contain: None,
+            re: Regex::new(".*").unwrap(),
+        };
+
+        let eng = Engine::new(vec![rule], Vec::new(), demo_tuning());
+        let stats = eng.anchor_plan_stats();
+        assert_eq!(stats.manual_rules, 1);
+        assert_eq!(stats.derived_rules, 0);
+        assert_eq!(stats.unfilterable_rules, 1);
+
+        let hits = eng.scan_chunk(b"Z");
+        assert!(hits.iter().any(|h| h.rule == "manual-fallback"));
     }
 
     #[test]
@@ -3897,7 +4078,12 @@ mod tests {
             must_contain: None,
             re: Regex::new(r"aaatok_[0-9]{8}bbbb").unwrap(),
         };
-        let engine = Engine::new(vec![rule], Vec::new(), demo_tuning());
+        let engine = Engine::new_with_anchor_policy(
+            vec![rule],
+            Vec::new(),
+            demo_tuning(),
+            AnchorPolicy::ManualOnly,
+        );
 
         let anchor_len_utf16 = b"tok_".len() * 2;
         let radius = 12usize;
