@@ -77,10 +77,10 @@ impl ValidatorKind {
 
 #[inline]
 fn is_word_byte(b: u8) -> bool {
-    // `regex::bytes` treats non-ASCII bytes as word characters for `\b` checks.
-    // This mirrors the engine's boundary semantics and avoids false positives
-    // in mixed binary/text inputs.
-    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
+    // `regex::bytes` defines word bytes as ASCII `[A-Za-z0-9_]`. Non-ASCII
+    // bytes are treated as non-word, so we mirror that here to keep the
+    // fast validator path consistent with regex semantics.
+    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 #[inline]
