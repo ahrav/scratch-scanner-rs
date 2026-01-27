@@ -1,4 +1,6 @@
-use crate::api::{AnchorPolicy, Gate, RuleSpec, TransformConfig, TransformId, TransformMode, Tuning};
+use crate::api::{
+    AnchorPolicy, Gate, RuleSpec, TransformConfig, TransformId, TransformMode, Tuning,
+};
 use crate::engine::Engine;
 use crate::gitleaks_rules::gitleaks_rules;
 

@@ -128,7 +128,6 @@ impl UringScanner {
         self.out.flush()?;
         Ok(stats)
     }
-
 }
 
 #[allow(clippy::too_many_arguments)]

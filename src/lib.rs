@@ -33,8 +33,8 @@ pub mod util;
 
 mod api;
 mod demo;
-mod gitleaks_rules;
 mod engine;
+mod gitleaks_rules;
 mod runtime;
 
 #[cfg(feature = "b64-stats")]
