@@ -135,12 +135,19 @@ impl<'a, T> ScratchSlice<'a, T> {
         self.len
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     /// View as uninitialized elements (safe).
     pub fn as_mut_uninit(&mut self) -> &mut [MaybeUninit<T>] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 
     /// View as initialized `T` (unsafe -- caller must guarantee full initialization).
+    ///
+    /// # Safety
+    /// All elements in the slice must be fully initialized before calling this.
     pub unsafe fn assume_init_mut(&mut self) -> &mut [T] {
         std::slice::from_raw_parts_mut(self.ptr.as_ptr().cast::<T>(), self.len)
     }
@@ -218,8 +225,8 @@ impl<T> ScratchVec<T> {
             .checked_mul(elem_size)
             .ok_or(ScratchMemoryError::InvalidLayout)?;
         let align = ScratchMemory::PAGE_SIZE_MIN.max(align_of::<T>());
-        let layout = Layout::from_size_align(size, align)
-            .map_err(|_| ScratchMemoryError::InvalidLayout)?;
+        let layout =
+            Layout::from_size_align(size, align).map_err(|_| ScratchMemoryError::InvalidLayout)?;
 
         // SAFETY: layout is valid and has non-zero size.
         let raw = unsafe { alloc(layout) };

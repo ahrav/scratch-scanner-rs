@@ -376,11 +376,7 @@ fn literal_byte_to_mask(bytes: &[u8]) -> Option<[u64; 4]> {
 /// This is the core operation for concatenation and repetition. We cap both
 /// the total number of strings and the length of each string to avoid
 /// combinatorial blowups.
-fn cross_product(
-    a: &[Vec<u8>],
-    b: &[Vec<u8>],
-    cfg: &AnchorDeriveConfig,
-) -> Option<Vec<Vec<u8>>> {
+fn cross_product(a: &[Vec<u8>], b: &[Vec<u8>], cfg: &AnchorDeriveConfig) -> Option<Vec<Vec<u8>>> {
     let prod = a.len().checked_mul(b.len())?;
     if prod > cfg.max_exact_set {
         return None;
@@ -801,7 +797,9 @@ fn analyze_alternation(alts: &[Hir], cfg: &AnchorDeriveConfig) -> Info {
     if all_anchors.is_empty() {
         Info::all()
     } else if all_anchors.len() == 1 {
-        Info::with_prefilter(Prefilter::Substring(all_anchors.into_iter().next().unwrap()))
+        Info::with_prefilter(Prefilter::Substring(
+            all_anchors.into_iter().next().unwrap(),
+        ))
     } else if all_anchors.len() <= cfg.max_exact_set {
         Info::with_prefilter(Prefilter::AnyOf(all_anchors))
     } else {
@@ -866,7 +864,9 @@ fn derive_run_length_gate(hir: &Hir) -> Option<RunLengthGate> {
             }
             let (mask, min_len, max_len) = match rep.sub.kind() {
                 HirKind::Class(class) => (class_to_ascii_mask(class)?, rep.min, rep.max),
-                HirKind::Literal(Literal(bytes)) => (literal_byte_to_mask(bytes)?, rep.min, rep.max),
+                HirKind::Literal(Literal(bytes)) => {
+                    (literal_byte_to_mask(bytes)?, rep.min, rep.max)
+                }
                 HirKind::Capture(cap) => match cap.sub.kind() {
                     HirKind::Class(class) => (class_to_ascii_mask(class)?, rep.min, rep.max),
                     HirKind::Literal(Literal(bytes)) => {
@@ -1028,11 +1028,7 @@ fn derive_kgram_gate(hir: &Hir, cfg: &AnchorDeriveConfig) -> Option<KGramGate> {
 ///
 /// Returns None when the prefix is ambiguous or unbounded (e.g., alternation,
 /// optional/variable repetition, or non-ASCII bytes).
-fn collect_prefix_atoms(
-    hir: &Hir,
-    k: usize,
-    cfg: &AnchorDeriveConfig,
-) -> Option<Vec<Vec<u8>>> {
+fn collect_prefix_atoms(hir: &Hir, k: usize, cfg: &AnchorDeriveConfig) -> Option<Vec<Vec<u8>>> {
     fn append_atoms(
         hir: &Hir,
         atoms: &mut Vec<Vec<u8>>,
@@ -1151,7 +1147,10 @@ fn prefilter_score(pf: &Prefilter) -> i64 {
 /// - Empty matches are forbidden (anchors would miss them).
 /// - Anchors shorter than `min_anchor_len` are rejected.
 /// - We never "filter out" short alternatives, because that would be unsound.
-fn choose_anchors(info: &Info, cfg: &AnchorDeriveConfig) -> Result<Vec<Vec<u8>>, AnchorDeriveError> {
+fn choose_anchors(
+    info: &Info,
+    cfg: &AnchorDeriveConfig,
+) -> Result<Vec<Vec<u8>>, AnchorDeriveError> {
     // First try exact set
     if let Some(exact) = &info.exact {
         // If exact set contains empty string, pattern can match empty - unanchorable
@@ -1403,9 +1402,12 @@ mod tests {
                 let re = regex::Regex::new(pattern).unwrap();
                 if re.is_match(haystack) {
                     // If regex matches, at least one anchor must be present
-                    anchors
-                        .iter()
-                        .any(|a| haystack.as_bytes().windows(a.len()).any(|w| w == a.as_slice()))
+                    anchors.iter().any(|a| {
+                        haystack
+                            .as_bytes()
+                            .windows(a.len())
+                            .any(|w| w == a.as_slice())
+                    })
                 } else {
                     // If regex doesn't match, soundness is trivially satisfied
                     true
@@ -1430,8 +1432,14 @@ mod tests {
 
         #[test]
         fn test_literal_too_short() {
-            assert!(matches!(derive("ab"), Err(AnchorDeriveError::OnlyWeakAnchors)));
-            assert!(matches!(derive("a"), Err(AnchorDeriveError::OnlyWeakAnchors)));
+            assert!(matches!(
+                derive("ab"),
+                Err(AnchorDeriveError::OnlyWeakAnchors)
+            ));
+            assert!(matches!(
+                derive("a"),
+                Err(AnchorDeriveError::OnlyWeakAnchors)
+            ));
         }
 
         #[test]
@@ -1553,7 +1561,10 @@ mod tests {
         fn test_character_class_large() {
             // [a-z] is too large to expand (26 > 16 default)
             // Should degrade to All
-            assert!(matches!(derive("[a-z]"), Err(AnchorDeriveError::Unanchorable)));
+            assert!(matches!(
+                derive("[a-z]"),
+                Err(AnchorDeriveError::Unanchorable)
+            ));
         }
 
         #[test]
@@ -1877,9 +1888,10 @@ mod tests {
             fn generate_matching_haystack(&self) -> String {
                 match self {
                     TestRe::Literal(s) => s.clone(),
-                    TestRe::Concat(parts) => {
-                        parts.iter().map(|p| p.generate_matching_haystack()).collect()
-                    }
+                    TestRe::Concat(parts) => parts
+                        .iter()
+                        .map(|p| p.generate_matching_haystack())
+                        .collect(),
                     TestRe::Alt(alts) => {
                         // Pick first alternative for determinism
                         alts.first()

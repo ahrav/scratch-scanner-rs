@@ -1,7 +1,7 @@
 #![allow(dead_code, unused_imports, unused_variables)]
 
-use scanner_rs::{demo_engine_with_anchor_mode, AnchorMode};
 use scanner_rs::pipeline::scan_path_default;
+use scanner_rs::{demo_engine_with_anchor_mode, AnchorMode};
 use std::env;
 use std::io;
 use std::path::PathBuf;
@@ -64,7 +64,7 @@ fn main() -> io::Result<()> {
 
     let engine = Arc::new(demo_engine_with_anchor_mode(anchor_mode));
     let start = Instant::now();
-    let stats = scan_path_default(&PathBuf::from(path), engine)?;
+    let stats = scan_path_default(&path, engine)?;
     let elapsed = start.elapsed();
     let elapsed_secs = elapsed.as_secs_f64();
     let throughput_mib = if elapsed_secs > 0.0 {

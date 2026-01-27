@@ -28,16 +28,15 @@ pub mod stdx;
 pub mod test_utils;
 pub mod util;
 
+use crate::regex2anchor::{
+    compile_trigger_plan, AnchorDeriveConfig, ResidueGatePlan, TriggerPlan, UnfilterableReason,
+};
+use ahash::AHashMap;
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use memchr::memchr;
 use memchr::memmem;
 use regex::bytes::Regex;
-use crate::regex2anchor::{
-    compile_trigger_plan, AnchorDeriveConfig, ResidueGatePlan, TriggerPlan,
-    UnfilterableReason,
-};
 use std::cell::{Cell, UnsafeCell};
-use ahash::AHashMap;
 use std::fs::File;
 use std::io::{self, Read};
 use std::ops::{ControlFlow, Range};
@@ -610,7 +609,8 @@ impl ScannerRuntime {
                 );
                 let new_bytes_start = chunk.base_offset + chunk.prefix_len as u64;
                 scratch.drop_prefix_findings(new_bytes_start);
-                self.engine.drain_findings_materialized(&mut scratch, &mut out);
+                self.engine
+                    .drain_findings_materialized(&mut scratch, &mut out);
                 ControlFlow::Continue(())
             },
         )?;
@@ -990,26 +990,26 @@ impl DecodeSlab {
 /// accumulation, decode slabs, and work queues. It is not thread-safe and should
 /// be used by a single worker at a time.
 pub struct ScanScratch {
-    out: Vec<FindingRec>,              // Hot-path findings (bounded by max_findings).
-    max_findings: usize,               // Per-chunk cap from tuning.
-    findings_dropped: usize,           // Overflow counter when cap is exceeded.
-    work_q: Vec<WorkItem>,             // Scan queue over root + decoded buffers.
-    work_head: usize,                  // Cursor into work_q.
-    slab: DecodeSlab,                  // Decoded output storage.
-    seen: FixedSet128,                 // Dedupe for decoded buffers.
-    total_decode_output_bytes: usize,  // Global decode budget tracker.
-    work_items_enqueued: usize,        // Work queue budget tracker.
-    accs: Vec<[HitAccumulator; 3]>,    // Per (rule, variant) hit accumulators.
-    touched_pairs: ScratchVec<u32>,    // Scratch list of touched pairs.
-    touched: DynamicBitSet,            // Bitset for touched pairs.
-    touched_any: bool,                 // Fast path for "none touched".
-    windows: ScratchVec<SpanU32>,      // Merged windows for a pair.
-    expanded: ScratchVec<SpanU32>,     // Expanded windows for two-phase rules.
-    spans: ScratchVec<SpanU32>,        // Transform span candidates.
-    gate: GateScratch,                 // Streaming gate scratch buffers.
-    step_arena: StepArena,             // Decode provenance arena.
-    utf16_buf: Vec<u8>,                // UTF-16 decode output buffer.
-    steps_buf: Vec<DecodeStep>,        // Materialization scratch.
+    out: Vec<FindingRec>,             // Hot-path findings (bounded by max_findings).
+    max_findings: usize,              // Per-chunk cap from tuning.
+    findings_dropped: usize,          // Overflow counter when cap is exceeded.
+    work_q: Vec<WorkItem>,            // Scan queue over root + decoded buffers.
+    work_head: usize,                 // Cursor into work_q.
+    slab: DecodeSlab,                 // Decoded output storage.
+    seen: FixedSet128,                // Dedupe for decoded buffers.
+    total_decode_output_bytes: usize, // Global decode budget tracker.
+    work_items_enqueued: usize,       // Work queue budget tracker.
+    accs: Vec<[HitAccumulator; 3]>,   // Per (rule, variant) hit accumulators.
+    touched_pairs: ScratchVec<u32>,   // Scratch list of touched pairs.
+    touched: DynamicBitSet,           // Bitset for touched pairs.
+    touched_any: bool,                // Fast path for "none touched".
+    windows: ScratchVec<SpanU32>,     // Merged windows for a pair.
+    expanded: ScratchVec<SpanU32>,    // Expanded windows for two-phase rules.
+    spans: ScratchVec<SpanU32>,       // Transform span candidates.
+    gate: GateScratch,                // Streaming gate scratch buffers.
+    step_arena: StepArena,            // Decode provenance arena.
+    utf16_buf: Vec<u8>,               // UTF-16 decode output buffer.
+    steps_buf: Vec<DecodeStep>,       // Materialization scratch.
 }
 
 impl ScanScratch {
@@ -1061,8 +1061,7 @@ impl ScanScratch {
                 .expect("scratch windows allocation failed"),
             expanded: ScratchVec::with_capacity(engine.tuning.max_windows_per_rule_variant)
                 .expect("scratch expanded allocation failed"),
-            spans: ScratchVec::with_capacity(max_spans)
-                .expect("scratch spans allocation failed"),
+            spans: ScratchVec::with_capacity(max_spans).expect("scratch spans allocation failed"),
             gate: GateScratch {
                 tail: Vec::with_capacity(tail_keep),
                 scratch: Vec::with_capacity(tail_keep.saturating_add(1024)),
@@ -1130,13 +1129,13 @@ impl ScanScratch {
                 ScratchVec::with_capacity(max_spans).expect("scratch spans allocation failed");
         }
         if self.windows.capacity() < engine.tuning.max_anchor_hits_per_rule_variant {
-            self.windows = ScratchVec::with_capacity(engine.tuning.max_anchor_hits_per_rule_variant)
-                .expect("scratch windows allocation failed");
+            self.windows =
+                ScratchVec::with_capacity(engine.tuning.max_anchor_hits_per_rule_variant)
+                    .expect("scratch windows allocation failed");
         }
         if self.expanded.capacity() < engine.tuning.max_windows_per_rule_variant {
-            self.expanded =
-                ScratchVec::with_capacity(engine.tuning.max_windows_per_rule_variant)
-                    .expect("scratch expanded allocation failed");
+            self.expanded = ScratchVec::with_capacity(engine.tuning.max_windows_per_rule_variant)
+                .expect("scratch expanded allocation failed");
         }
         if self.max_findings != engine.tuning.max_findings_per_chunk {
             self.max_findings = engine.tuning.max_findings_per_chunk;
@@ -1188,7 +1187,6 @@ impl ScanScratch {
             self.findings_dropped = self.findings_dropped.saturating_add(1);
         }
     }
-
 }
 
 /// Reference to a buffer being scanned.
@@ -1281,8 +1279,14 @@ impl Engine {
             utf8: false,
             ..AnchorDeriveConfig::default()
         };
-        let allow_manual = matches!(policy, AnchorPolicy::ManualOnly | AnchorPolicy::PreferDerived);
-        let allow_derive = matches!(policy, AnchorPolicy::DerivedOnly | AnchorPolicy::PreferDerived);
+        let allow_manual = matches!(
+            policy,
+            AnchorPolicy::ManualOnly | AnchorPolicy::PreferDerived
+        );
+        let allow_derive = matches!(
+            policy,
+            AnchorPolicy::DerivedOnly | AnchorPolicy::PreferDerived
+        );
 
         for (rid, r) in rules.iter().enumerate() {
             debug_assert!(rid <= u32::MAX as usize);
@@ -1610,11 +1614,7 @@ impl Engine {
     }
 
     /// Drains compact findings from scratch and materializes provenance.
-    pub fn drain_findings_materialized(
-        &self,
-        scratch: &mut ScanScratch,
-        out: &mut Vec<Finding>,
-    ) {
+    pub fn drain_findings_materialized(&self, scratch: &mut ScanScratch, out: &mut Vec<Finding>) {
         for rec in scratch.out.drain(..) {
             let rule = &self.rules[rec.rule_id as usize];
             scratch
@@ -1670,8 +1670,11 @@ impl Engine {
                 let lo = m.start().saturating_sub(seed_radius_bytes);
                 let hi = (m.end() + seed_radius_bytes).min(buf.len());
 
-                scratch.accs[rule_id][variant.idx()]
-                    .push(lo, hi, self.tuning.max_anchor_hits_per_rule_variant);
+                scratch.accs[rule_id][variant.idx()].push(
+                    lo,
+                    hi,
+                    self.tuning.max_anchor_hits_per_rule_variant,
+                );
                 scratch.mark_touched(rule_id, variant);
             }
         }
@@ -2013,9 +2016,7 @@ fn add_pat_owned(map: &mut AHashMap<Vec<u8>, Vec<Target>>, pat: Vec<u8>, target:
     }
 }
 
-fn map_to_patterns(
-    map: AHashMap<Vec<u8>, Vec<Target>>,
-) -> (Vec<Vec<u8>>, Vec<Target>, Vec<u32>) {
+fn map_to_patterns(map: AHashMap<Vec<u8>, Vec<Target>>) -> (Vec<Vec<u8>>, Vec<Target>, Vec<u32>) {
     let mut patterns: Vec<Vec<u8>> = Vec::with_capacity(map.len());
     let mut flat: Vec<Target> = Vec::new();
     let mut offsets: Vec<u32> = Vec::with_capacity(map.len().saturating_add(1));
@@ -4116,13 +4117,15 @@ mod tests {
 
         let bad = scan_in_chunks_with_overlap(&engine, &buf, chunk_size, old_overlap);
         assert!(
-            !bad.iter().any(|rec| engine.rule_name(rec.rule_id) == "utf16-boundary"),
+            !bad.iter()
+                .any(|rec| engine.rule_name(rec.rule_id) == "utf16-boundary"),
             "expected miss with undersized overlap"
         );
 
         let good = scan_in_chunks(&engine, &buf, chunk_size);
         assert!(
-            good.iter().any(|rec| engine.rule_name(rec.rule_id) == "utf16-boundary"),
+            good.iter()
+                .any(|rec| engine.rule_name(rec.rule_id) == "utf16-boundary"),
             "expected match with required_overlap"
         );
     }
