@@ -7,7 +7,6 @@ use crate::scratch_memory::ScratchVec;
 use crate::stdx::{DynamicBitSet, FixedSet128};
 use ahash::AHashMap;
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
-use memchr::memchr;
 use memchr::memmem;
 use regex::bytes::Regex;
 use std::ops::{ControlFlow, Range};
@@ -18,7 +17,6 @@ mod validator;
 
 use self::helpers::*;
 use self::transform::*;
-use self::validator::*;
 
 #[cfg(test)]
 use crate::demo::*;
@@ -86,7 +84,7 @@ impl Target {
     const VARIANT_SHIFT: u32 = 4;
 
     fn new(rule_id: u32, variant: Variant, match_start: bool, keyword_implied: bool) -> Self {
-        debug_assert!(rule_id <= (u32::MAX >> Self::VARIANT_SHIFT));
+        assert!(rule_id <= (u32::MAX >> Self::VARIANT_SHIFT));
         let mut v = (rule_id << Self::VARIANT_SHIFT) | variant.idx() as u32;
         if match_start {
             v |= Self::MATCH_START_MASK;
@@ -142,7 +140,7 @@ impl PackedPatterns {
 
     fn push_raw(&mut self, pat: &[u8]) {
         self.bytes.extend_from_slice(pat);
-        debug_assert!(self.bytes.len() <= u32::MAX as usize);
+        assert!(self.bytes.len() <= u32::MAX as usize);
         self.offsets.push(self.bytes.len() as u32);
     }
 
@@ -151,7 +149,7 @@ impl PackedPatterns {
             self.bytes.push(b);
             self.bytes.push(0);
         }
-        debug_assert!(self.bytes.len() <= u32::MAX as usize);
+        assert!(self.bytes.len() <= u32::MAX as usize);
         self.offsets.push(self.bytes.len() as u32);
     }
 
@@ -160,7 +158,7 @@ impl PackedPatterns {
             self.bytes.push(0);
             self.bytes.push(b);
         }
-        debug_assert!(self.bytes.len() <= u32::MAX as usize);
+        assert!(self.bytes.len() <= u32::MAX as usize);
         self.offsets.push(self.bytes.len() as u32);
     }
 }
@@ -222,9 +220,9 @@ struct SpanU32 {
 
 impl SpanU32 {
     fn new(start: usize, end: usize) -> Self {
-        debug_assert!(start <= end);
-        debug_assert!(start <= u32::MAX as usize);
-        debug_assert!(end <= u32::MAX as usize);
+        assert!(start <= end);
+        assert!(start <= u32::MAX as usize);
+        assert!(end <= u32::MAX as usize);
         Self {
             start: start as u32,
             end: end as u32,
@@ -254,6 +252,7 @@ struct HitAccumulator {
 
 impl HitAccumulator {
     fn with_capacity(cap: usize) -> Self {
+        assert!(cap > 0, "hit accumulator capacity must be > 0");
         Self {
             windows: ScratchVec::with_capacity(cap)
                 .expect("scratch hit accumulator allocation failed"),
@@ -262,6 +261,7 @@ impl HitAccumulator {
     }
 
     fn push(&mut self, start: usize, end: usize, max_hits: usize) {
+        assert!(max_hits > 0, "max_hits must be > 0");
         let r = SpanU32::new(start, end);
         if let Some(c) = self.coalesced.as_mut() {
             // Once coalesced, we only widen the single window. This ensures
@@ -748,15 +748,24 @@ impl ScanScratch {
         self.base64_stats
     }
 
-    /// Drains accumulated findings and returns them.
-    pub fn drain_findings(&mut self) -> Vec<FindingRec> {
-        self.out.drain().collect()
+    /// Moves all findings into `out` without allocating.
+    ///
+    /// # Panics
+    /// Panics if `out.capacity()` is smaller than the number of findings.
+    pub fn drain_findings(&mut self, out: &mut Vec<FindingRec>) {
+        out.clear();
+        assert!(
+            out.capacity() >= self.out.len(),
+            "output capacity too small"
+        );
+        out.extend(self.out.drain());
     }
 
     /// Moves all findings into `out`, reusing its allocation.
+    ///
+    /// See [`ScanScratch::drain_findings`] for capacity requirements.
     pub fn drain_findings_into(&mut self, out: &mut Vec<FindingRec>) {
-        out.clear();
-        out.extend(self.out.drain());
+        self.drain_findings(out);
     }
 
     /// Drops findings that are fully contained in a chunk prefix.
@@ -791,6 +800,9 @@ impl ScanScratch {
     }
 
     /// Returns a shared view of accumulated finding records.
+    ///
+    /// The slice is invalidated by the next scan or any call that drains
+    /// or mutates the scratch buffers.
     pub fn findings(&self) -> &[FindingRec] {
         self.out.as_slice()
     }
@@ -876,17 +888,35 @@ pub struct AnchorPlanStats {
 
 impl Engine {
     /// Compiles rule specs into an engine with prebuilt anchor automata.
+    ///
+    /// # Panics
+    /// Panics if any rule, transform, or tuning invariants are violated.
     pub fn new(rules: Vec<RuleSpec>, transforms: Vec<TransformConfig>, tuning: Tuning) -> Self {
         Self::new_with_anchor_policy(rules, transforms, tuning, AnchorPolicy::PreferDerived)
     }
 
     /// Compiles rule specs into an engine with a specific anchor policy.
+    ///
+    /// # Panics
+    /// Panics if any rule, transform, or tuning invariants are violated.
     pub fn new_with_anchor_policy(
         rules: Vec<RuleSpec>,
         transforms: Vec<TransformConfig>,
         tuning: Tuning,
         policy: AnchorPolicy,
     ) -> Self {
+        tuning.assert_valid();
+        assert!(
+            tuning.max_transform_depth.saturating_add(1) <= MAX_DECODE_STEPS,
+            "max_transform_depth exceeds MAX_DECODE_STEPS"
+        );
+        for r in &rules {
+            r.assert_valid();
+        }
+        for tc in &transforms {
+            tc.assert_valid();
+        }
+
         let rules_compiled = rules.iter().map(compile_rule).collect::<Vec<_>>();
         let max_entropy_len = rules_compiled
             .iter()
@@ -896,9 +926,11 @@ impl Engine {
         let entropy_log2 = build_log2_table(max_entropy_len);
 
         // Build deduped anchor patterns: pattern -> targets
-        let mut pat_map: AHashMap<Vec<u8>, Vec<Target>> = AHashMap::new();
-        let mut residue_rules: Vec<(usize, ResidueGatePlan)> = Vec::new();
-        let mut unfilterable_rules: Vec<(usize, UnfilterableReason)> = Vec::new();
+        let mut pat_map: AHashMap<Vec<u8>, Vec<Target>> =
+            AHashMap::with_capacity(rules.len().saturating_mul(3).max(16));
+        let mut residue_rules: Vec<(usize, ResidueGatePlan)> = Vec::with_capacity(rules.len());
+        let mut unfilterable_rules: Vec<(usize, UnfilterableReason)> =
+            Vec::with_capacity(rules.len());
         let mut anchor_plan_stats = AnchorPlanStats::default();
         let derive_cfg = AnchorDeriveConfig {
             utf8: false,
@@ -914,7 +946,7 @@ impl Engine {
         );
 
         for (rid, r) in rules.iter().enumerate() {
-            debug_assert!(rid <= u32::MAX as usize);
+            assert!(rid <= u32::MAX as usize);
             let rid_u32 = rid as u32;
             let validator_match_start = r.validator != ValidatorKind::None;
             let keyword_implied_for_anchor = |anchor: &[u8]| -> bool {
@@ -1050,6 +1082,16 @@ impl Engine {
             .build(anchor_patterns.iter().map(|p| p.as_slice()))
             .expect("build anchors AC");
 
+        // Warm regex and AC caches at startup to avoid lazy allocations later.
+        // `find_iter` always constructs the per-regex cache, so a tiny buffer
+        // is sufficient here.
+        let warm = [0u8; 1];
+        for rule in &rules_compiled {
+            let mut it = rule.re.find_iter(&warm);
+            let _ = it.next();
+        }
+        let _ = ac_anchors.is_match(&warm);
+
         let mut max_window_diameter_bytes = 0usize;
         for r in &rules {
             let base = if let Some(tp) = &r.two_phase {
@@ -1090,11 +1132,33 @@ impl Engine {
         &self.unfilterable_rules
     }
 
-    /// Single-buffer scan helper (allocates scratch per call).
-    pub fn scan_chunk(&self, hay: &[u8]) -> Vec<Finding> {
-        let mut scratch = ScanScratch::new(self);
-        self.scan_chunk_into(hay, FileId(0), 0, &mut scratch);
-        self.materialize_findings(&mut scratch)
+    /// Single-buffer scan helper (allocation-free after startup).
+    ///
+    /// Findings are stored in `scratch` and returned as a shared slice. The
+    /// returned slice is valid until `scratch` is reused for another scan.
+    pub fn scan_chunk<'a>(&self, hay: &[u8], scratch: &'a mut ScanScratch) -> &'a [FindingRec] {
+        self.scan_chunk_into(hay, FileId(0), 0, scratch);
+        scratch.findings()
+    }
+
+    /// Single-buffer scan helper that materializes findings into `out`.
+    ///
+    /// `out` must have enough capacity to hold all findings; otherwise this will panic.
+    /// Use `Vec::with_capacity(self.tuning.max_findings_per_chunk)` to pre-size.
+    ///
+    /// # Panics
+    /// Panics if `out.capacity()` is smaller than the number of findings.
+    pub fn scan_chunk_materialized(
+        &self,
+        hay: &[u8],
+        scratch: &mut ScanScratch,
+        out: &mut Vec<Finding>,
+    ) {
+        self.scan_chunk_into(hay, FileId(0), 0, scratch);
+        let expected = scratch.findings().len();
+        assert!(out.capacity() >= expected, "output capacity too small");
+        out.clear();
+        self.drain_findings_materialized(scratch, out);
     }
 
     /// Scans a buffer and appends findings into the provided scratch state.
@@ -1138,7 +1202,7 @@ impl Engine {
             let (buf_ptr, buf_len) = match item.buf {
                 BufRef::Root => (root_buf.as_ptr(), root_buf.len()),
                 BufRef::Slab(range) => unsafe {
-                    debug_assert!(range.end <= scratch.slab.buf.len());
+                    assert!(range.end <= scratch.slab.buf.len());
                     let ptr = scratch.slab.buf.as_ptr().add(range.start);
                     (ptr, range.end.saturating_sub(range.start))
                 },
@@ -1310,16 +1374,18 @@ impl Engine {
         }
     }
 
-    /// Scans a buffer and returns finding records.
-    pub fn scan_chunk_records(
+    /// Scans a buffer and returns a shared view of finding records.
+    ///
+    /// The returned slice is valid until `scratch` is reused for another scan.
+    pub fn scan_chunk_records<'a>(
         &self,
         buf: &[u8],
         file_id: FileId,
         base_offset: u64,
-        scratch: &mut ScanScratch,
-    ) -> Vec<FindingRec> {
+        scratch: &'a mut ScanScratch,
+    ) -> &'a [FindingRec] {
         self.scan_chunk_into(buf, file_id, base_offset, scratch);
-        scratch.drain_findings()
+        scratch.findings()
     }
 
     /// Returns the required overlap between chunks for correctness.
@@ -1344,12 +1410,6 @@ impl Engine {
         ScanScratch::new(self)
     }
 
-    fn materialize_findings(&self, scratch: &mut ScanScratch) -> Vec<Finding> {
-        let mut out = Vec::with_capacity(scratch.out.len());
-        self.drain_findings_materialized(scratch, &mut out);
-        out
-    }
-
     /// Drains compact findings from scratch and materializes provenance.
     pub fn drain_findings_materialized(&self, scratch: &mut ScanScratch, out: &mut Vec<Finding>) {
         for rec in scratch.out.drain() {
@@ -1357,11 +1417,13 @@ impl Engine {
             scratch
                 .step_arena
                 .materialize(rec.step_id, &mut scratch.steps_buf);
+            let mut steps = DecodeSteps::new();
+            steps.extend_from_slice(scratch.steps_buf.as_slice());
             out.push(Finding {
                 rule: rule.name,
                 span: (rec.span_start as usize)..(rec.span_end as usize),
                 root_span_hint: u64_to_usize(rec.root_hint_start)..u64_to_usize(rec.root_hint_end),
-                decode_steps: scratch.steps_buf.as_slice().to_vec(),
+                decode_steps: steps,
             });
         }
     }
@@ -1375,9 +1437,9 @@ impl Engine {
         file_id: FileId,
         scratch: &mut ScanScratch,
     ) {
-        debug_assert!(buf.len() <= u32::MAX as usize);
-        debug_assert!(self.tuning.merge_gap <= u32::MAX as usize);
-        debug_assert!(self.tuning.pressure_gap_start <= u32::MAX as usize);
+        assert!(buf.len() <= u32::MAX as usize);
+        assert!(self.tuning.merge_gap <= u32::MAX as usize);
+        assert!(self.tuning.pressure_gap_start <= u32::MAX as usize);
         let hay_len = buf.len() as u32;
         let merge_gap = self.tuning.merge_gap as u32;
         let pressure_gap_start = self.tuning.pressure_gap_start as u32;
@@ -1692,10 +1754,15 @@ impl Engine {
                     }
                 }
 
+                let endianness = match variant {
+                    Variant::Utf16Le => Utf16Endianness::Le,
+                    Variant::Utf16Be => Utf16Endianness::Be,
+                    Variant::Raw => unreachable!("raw variant in UTF-16 branch"),
+                };
                 let utf16_step_id = scratch.step_arena.push(
                     step_id,
                     DecodeStep::Utf16Window {
-                        endianness: variant.utf16_endianness().unwrap(),
+                        endianness,
                         parent_span: w.clone(),
                     },
                 );
@@ -1970,7 +2037,7 @@ fn map_to_patterns(map: AHashMap<Vec<u8>, Vec<Target>>) -> (Vec<Vec<u8>>, Vec<Ta
     for (p, ts) in map {
         patterns.push(p);
         flat.extend(ts);
-        debug_assert!(flat.len() <= u32::MAX as usize);
+        assert!(flat.len() <= u32::MAX as usize);
         // Prefix-sum offsets: each pattern id maps to flat[start..end].
         offsets.push(flat.len() as u32);
     }

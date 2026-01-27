@@ -1,3 +1,4 @@
+use crate::stdx::FixedVec;
 use regex::bytes::Regex;
 use std::ops::Range;
 
@@ -15,6 +16,12 @@ pub struct FileId(pub u32);
 /// reconstructed without cloning vectors on the hot path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct StepId(pub(crate) u32);
+
+/// Hard cap on decode-step chains stored per finding.
+///
+/// Must be at least `Tuning::max_transform_depth + 1` (root + transforms);
+/// enforced at engine build time. Raising this increases per-finding storage.
+pub const MAX_DECODE_STEPS: usize = 8;
 
 pub(crate) const STEP_ROOT: StepId = StepId(u32::MAX);
 
@@ -40,6 +47,7 @@ pub enum TransformMode {
 
     /// Correctness trade (explicit).
     /// Skips this transform if this buffer already produced any findings.
+    /// This can miss findings that only appear in nested encodings.
     IfNoFindingsInThisBuffer,
 }
 
@@ -80,6 +88,29 @@ pub struct TransformConfig {
 
     /// Base64 option: allow space as whitespace during span detection.
     pub base64_allow_space_ws: bool,
+}
+
+impl TransformConfig {
+    /// Internal invariant checks used at engine build time.
+    pub(crate) fn assert_valid(&self) {
+        assert!(
+            self.max_encoded_len >= self.min_len,
+            "transform {:?} max_encoded_len < min_len",
+            self.id
+        );
+        if self.mode != TransformMode::Disabled {
+            assert!(
+                self.max_spans_per_buffer > 0,
+                "transform {:?} max_spans_per_buffer must be > 0 when enabled",
+                self.id
+            );
+            assert!(
+                self.max_decoded_bytes > 0,
+                "transform {:?} max_decoded_bytes must be > 0 when enabled",
+                self.id
+            );
+        }
+    }
 }
 
 /// Base64 decode/gate instrumentation counters.
@@ -179,6 +210,11 @@ pub enum DecodeStep {
     },
 }
 
+/// Fixed-capacity decode-step chain stored inline in [`Finding`].
+///
+/// Length is bounded by [`MAX_DECODE_STEPS`]; pushing past capacity panics.
+pub type DecodeSteps = FixedVec<DecodeStep, MAX_DECODE_STEPS>;
+
 /// High-level finding with provenance and root-span hint.
 #[derive(Clone, Debug)]
 pub struct Finding {
@@ -197,7 +233,8 @@ pub struct Finding {
     pub root_span_hint: Range<usize>,
 
     /// Decode steps from root buffer to the representation where `span` applies.
-    pub decode_steps: Vec<DecodeStep>,
+    /// Stored inline with a fixed capacity to avoid per-finding allocations.
+    pub decode_steps: DecodeSteps,
 }
 
 /// Compact finding record stored during scanning.
@@ -231,6 +268,20 @@ pub struct TwoPhaseSpec {
     pub full_radius: usize,
     /// Patterns that must appear within the seed window to confirm.
     pub confirm_any: &'static [&'static [u8]],
+}
+
+impl TwoPhaseSpec {
+    /// Internal invariant checks used at engine build time.
+    pub(crate) fn assert_valid(&self) {
+        assert!(
+            self.seed_radius <= self.full_radius,
+            "two_phase seed_radius must be <= full_radius"
+        );
+        assert!(
+            !self.confirm_any.is_empty(),
+            "two_phase confirm_any must not be empty"
+        );
+    }
 }
 
 /// Fast-path validator used to confirm common token-like rules directly at
@@ -276,6 +327,24 @@ pub enum ValidatorKind {
 
     /// No validator; always use the regex/window path.
     None,
+}
+
+impl ValidatorKind {
+    /// Internal invariant checks used at engine build time.
+    pub(crate) fn assert_valid(self) {
+        match self {
+            ValidatorKind::PrefixFixed { .. } => {}
+            ValidatorKind::PrefixBounded {
+                min_tail, max_tail, ..
+            } => {
+                assert!(
+                    min_tail <= max_tail,
+                    "validator min_tail must be <= max_tail"
+                );
+            }
+            ValidatorKind::AwsAccessKey | ValidatorKind::None => {}
+        }
+    }
 }
 
 /// Post-match delimiter requirement for token-like rules.
@@ -356,6 +425,26 @@ pub struct RuleSpec {
     pub re: Regex,
 }
 
+impl RuleSpec {
+    /// Internal invariant checks used at engine build time.
+    pub(crate) fn assert_valid(&self) {
+        assert!(!self.name.is_empty(), "rule name must not be empty");
+        self.validator.assert_valid();
+        if let Some(tp) = &self.two_phase {
+            tp.assert_valid();
+        }
+        if let Some(needle) = self.must_contain {
+            assert!(!needle.is_empty(), "must_contain must not be empty");
+        }
+        if let Some(kws) = self.keywords_any {
+            assert!(!kws.is_empty(), "keywords_any must not be empty");
+        }
+        if let Some(ent) = &self.entropy {
+            ent.assert_valid();
+        }
+    }
+}
+
 /// Shannon-entropy gate configuration.
 ///
 /// - Entropy is computed over the matched byte slice (full regex match).
@@ -367,6 +456,24 @@ pub struct EntropySpec {
     pub min_bits_per_byte: f32,
     pub min_len: usize,
     pub max_len: usize,
+}
+
+impl EntropySpec {
+    /// Internal invariant checks used at engine build time.
+    pub(crate) fn assert_valid(&self) {
+        assert!(
+            self.min_bits_per_byte >= 0.0,
+            "entropy min_bits_per_byte must be >= 0"
+        );
+        assert!(
+            self.min_bits_per_byte <= 8.0,
+            "entropy min_bits_per_byte must be <= 8"
+        );
+        assert!(
+            self.min_len <= self.max_len,
+            "entropy min_len must be <= max_len"
+        );
+    }
 }
 
 /// Engine tuning knobs for performance and DoS protection.
@@ -387,6 +494,7 @@ pub struct Tuning {
     pub max_utf16_decoded_bytes_per_window: usize,
 
     /// Max transform depth (number of decode steps) per work item chain.
+    /// Must be <= `MAX_DECODE_STEPS - 1`; enforced at engine build time.
     pub max_transform_depth: usize,
 
     /// Counts ALL decoded output bytes:
@@ -400,6 +508,20 @@ pub struct Tuning {
 
     /// Hard cap on findings per buffer/chunk.
     pub max_findings_per_chunk: usize,
+}
+
+impl Tuning {
+    /// Internal invariant checks used at engine build time.
+    pub(crate) fn assert_valid(&self) {
+        assert!(
+            self.max_anchor_hits_per_rule_variant > 0,
+            "max_anchor_hits_per_rule_variant must be > 0"
+        );
+        assert!(
+            self.pressure_gap_start > 0,
+            "pressure_gap_start must be > 0 to avoid infinite coalesce loops"
+        );
+    }
 }
 
 /// Policy for selecting anchors during engine compilation.

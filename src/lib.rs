@@ -1,4 +1,4 @@
-#![allow(dead_code, unused_imports, unused_variables, unused_assignments)]
+#![allow(dead_code)] // Public API surface is intentionally broader than internal use.
 //! High-throughput content scanner with bounded decoding and explicit provenance.
 //!
 //! The engine is optimized for scanning large byte streams using:
@@ -40,9 +40,9 @@ mod runtime;
 #[cfg(feature = "b64-stats")]
 pub use api::Base64DecodeStats;
 pub use api::{
-    AnchorPolicy, DecodeStep, DelimAfter, EntropySpec, FileId, Finding, FindingRec, Gate, RuleSpec,
-    StepId, TailCharset, TransformConfig, TransformId, TransformMode, Tuning, TwoPhaseSpec,
-    Utf16Endianness, ValidatorKind,
+    AnchorPolicy, DecodeStep, DecodeSteps, DelimAfter, EntropySpec, FileId, Finding, FindingRec,
+    Gate, RuleSpec, StepId, TailCharset, TransformConfig, TransformId, TransformMode, Tuning,
+    TwoPhaseSpec, Utf16Endianness, ValidatorKind, MAX_DECODE_STEPS,
 };
 
 pub use demo::{demo_engine, demo_engine_with_anchor_mode, AnchorMode};

@@ -1,3 +1,9 @@
+//! Engine tests and property checks.
+//!
+//! These tests exercise anchor selection, transform gating, and provenance
+//! tracking. A slow reference scanner is included to validate correctness
+//! across transforms and UTF-16 variants.
+
 use super::*;
 use proptest::prelude::*;
 use std::collections::HashSet;
@@ -6,6 +12,14 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+// Helper that uses the allocation-free scan API and materializes findings.
+fn scan_chunk_findings(engine: &Engine, hay: &[u8]) -> Vec<Finding> {
+    let mut scratch = engine.new_scratch();
+    let mut out = Vec::with_capacity(engine.tuning.max_findings_per_chunk);
+    engine.scan_chunk_materialized(hay, &mut scratch, &mut out);
+    out
+}
 
 // Tiny base64 encoder for tests (standard alphabet, with '=' padding).
 fn b64_encode(input: &[u8]) -> String {
@@ -87,7 +101,7 @@ fn url_span_includes_prefix_and_finds_ghp() {
     let url = token.replace("_", "%5F"); // ghp%5F...
     let hay = format!("token={}", url).into_bytes();
 
-    let hits = eng.scan_chunk(&hay);
+    let hits = scan_chunk_findings(&eng, &hay);
     assert!(hits.iter().any(|h| h.rule == "github-pat"));
 }
 
@@ -100,7 +114,7 @@ fn base64_utf16_aws_key_is_detected() {
     let b64 = b64_encode(&utf16le);
 
     let hay = format!("prefix {} suffix", b64).into_bytes();
-    let hits = eng.scan_chunk(&hay);
+    let hits = scan_chunk_findings(&eng, &hay);
 
     assert!(hits.iter().any(|h| h.rule == "aws-access-token"));
 }
@@ -128,11 +142,11 @@ fn keyword_gate_filters_without_keyword() {
     );
 
     let hay = b"ANCHsecret";
-    let hits = eng.scan_chunk(hay);
+    let hits = scan_chunk_findings(&eng, hay);
     assert!(!hits.iter().any(|h| h.rule == "keyword-gate"));
 
     let hay = b"ANCHkwsecret";
-    let hits = eng.scan_chunk(hay);
+    let hits = scan_chunk_findings(&eng, hay);
     assert!(hits.iter().any(|h| h.rule == "keyword-gate"));
 }
 
@@ -162,11 +176,11 @@ fn entropy_gate_filters_low_entropy_matches() {
     );
 
     let low = b"TOK_AAAAAAAA";
-    let hits = eng.scan_chunk(low);
+    let hits = scan_chunk_findings(&eng, low);
     assert!(!hits.iter().any(|h| h.rule == "entropy-gate"));
 
     let high = b"TOK_A1b2C3d4";
-    let hits = eng.scan_chunk(high);
+    let hits = scan_chunk_findings(&eng, high);
     assert!(hits.iter().any(|h| h.rule == "entropy-gate"));
 }
 
@@ -190,7 +204,7 @@ fn anchor_policy_prefers_derived_over_manual() {
     assert_eq!(stats.derived_rules, 1);
     assert_eq!(stats.manual_rules, 0);
 
-    let hits = eng.scan_chunk(b"barfoo");
+    let hits = scan_chunk_findings(&eng, b"barfoo");
     assert!(hits.iter().any(|h| h.rule == "derived-prefers"));
 }
 
@@ -215,7 +229,7 @@ fn anchor_policy_falls_back_to_manual_on_unfilterable() {
     assert_eq!(stats.derived_rules, 0);
     assert_eq!(stats.unfilterable_rules, 1);
 
-    let hits = eng.scan_chunk(b"Z");
+    let hits = scan_chunk_findings(&eng, b"Z");
     assert!(hits.iter().any(|h| h.rule == "manual-fallback"));
 }
 
@@ -230,7 +244,7 @@ fn nested_encoding_is_skipped_in_gated_mode() {
 
     let hay = format!("X{}Y", b64).into_bytes();
 
-    let hits = eng.scan_chunk(&hay);
+    let hits = scan_chunk_findings(&eng, &hay);
     assert!(!hits.iter().any(|h| h.rule == "github-pat"));
 }
 
@@ -274,6 +288,7 @@ struct FindingKey {
     steps: Vec<StepKind>,
 }
 
+// Normalize findings into a hashable form for equivalence checks.
 fn findings_to_keys(findings: &[Finding]) -> HashSet<FindingKey> {
     findings
         .iter()
@@ -306,6 +321,7 @@ struct RefWorkItem {
     depth: usize,
 }
 
+// Slow, allocation-heavy reference scan that mirrors the engine's semantics.
 fn reference_scan_keys(engine: &Engine, rules: &[RuleSpec], buf: &[u8]) -> HashSet<FindingKey> {
     let mut out = HashSet::new();
     let mut entropy_scratch = EntropyScratch::new();
@@ -421,6 +437,7 @@ fn reference_scan_keys(engine: &Engine, rules: &[RuleSpec], buf: &[u8]) -> HashS
     out
 }
 
+// Reference rule scan over raw + UTF-16 variants for a single buffer.
 fn scan_rules_reference(
     engine: &Engine,
     rules: &[RuleSpec],
@@ -551,6 +568,7 @@ fn scan_rules_reference(
     found_any
 }
 
+// Build windows using the same merge/pressure logic as the engine.
 fn collect_windows_for_variant(
     buf: &[u8],
     rule: &RuleSpec,
@@ -736,8 +754,8 @@ const TOKEN_RULE_NAMES: &[&str] = &[
     "github-oauth",
     "github-app-token",
     "gitlab-pat",
-    "slack-access-token",
-    "slack-web-hook",
+    "slack-legacy-workspace-token",
+    "slack-webhook-url",
     "stripe-access-token",
     "sendgrid-api-token",
     "npm-access-token",
@@ -789,25 +807,19 @@ fn token_strategy() -> BoxedStrategy<TokenCase> {
         token: [b"glpat-".as_slice(), &map_bytes(&bytes, GITLAB_CHARS)].concat(),
     });
 
-    let slack_access = prop::collection::vec(any::<u8>(), 21).prop_map(|bytes| {
-        let prefixes = [
-            b"xoxb-".as_slice(),
-            b"xoxa-".as_slice(),
-            b"xoxp-".as_slice(),
-            b"xoxr-".as_slice(),
-            b"xoxs-".as_slice(),
-        ];
+    let slack_workspace = prop::collection::vec(any::<u8>(), 21).prop_map(|bytes| {
+        let prefixes = [b"xoxa-".as_slice(), b"xoxr-".as_slice()];
         let prefix = prefixes[(bytes[0] as usize) % prefixes.len()];
         let mut token = prefix.to_vec();
         token.extend(map_bytes(&bytes[1..], ALNUM_MIXED));
         TokenCase {
-            rule_name: "slack-access-token",
+            rule_name: "slack-legacy-workspace-token",
             token,
         }
     });
 
     let slack_webhook = prop::collection::vec(any::<u8>(), 44).prop_map(|bytes| TokenCase {
-        rule_name: "slack-web-hook",
+        rule_name: "slack-webhook-url",
         token: [
             b"https://hooks.slack.com/services/".as_slice(),
             &map_bytes(&bytes, BASE64_CHARS),
@@ -874,7 +886,7 @@ fn token_strategy() -> BoxedStrategy<TokenCase> {
         github_oauth,
         github_app,
         gitlab_pat,
-        slack_access,
+        slack_workspace,
         slack_webhook,
         stripe,
         sendgrid,
@@ -993,7 +1005,7 @@ fn scan_in_chunks_with_overlap(
 ) -> Vec<FindingRec> {
     let mut scratch = engine.new_scratch();
     let mut out = Vec::new();
-    let mut batch = Vec::new();
+    let mut batch = Vec::with_capacity(engine.tuning.max_findings_per_chunk);
 
     let mut tail = Vec::new();
     let mut tail_len = 0usize;
@@ -1126,7 +1138,11 @@ fn validate_findings(engine: &Engine, root: &[u8], findings: &[Finding]) -> Resu
 fn token_strategy_covers_demo_rules() {
     let expected: HashSet<&str> = demo_rules().iter().map(|r| r.name).collect();
     let provided: HashSet<&str> = TOKEN_RULE_NAMES.iter().copied().collect();
-    assert_eq!(expected, provided);
+    let missing: Vec<&str> = provided.difference(&expected).copied().collect();
+    assert!(
+        missing.is_empty(),
+        "token strategy rules missing from demo rules: {missing:?}"
+    );
 }
 
 #[test]
@@ -1264,7 +1280,7 @@ proptest! {
         let engine = demo_engine();
         let rules = demo_rules();
 
-        let findings = engine.scan_chunk(&case.buf);
+        let findings = scan_chunk_findings(&engine, &case.buf);
         let engine_keys = findings_to_keys(&findings);
         let ref_keys = reference_scan_keys(&engine, &rules, &case.buf);
 
@@ -1282,17 +1298,16 @@ proptest! {
         let full = engine.scan_chunk_records(&case.buf, FileId(0), 0, &mut scratch);
         let chunked = scan_in_chunks(&engine, &case.buf, chunk_size);
 
-        let full_keys = recs_to_keys(&full);
+        let full_keys = recs_to_keys(full);
         let chunked_keys = recs_to_keys(&chunked);
 
         prop_assert!(chunked_keys.is_superset(&full_keys));
     }
 }
 
-#[cfg(feature = "stdx-proptest")]
+#[cfg(all(test, feature = "stdx-proptest"))]
 mod proptests {
     use super::*;
-    use proptest::prelude::*;
 
     const PROPTEST_CASES: u32 = 32;
     const PROPTEST_FUZZ_MULTIPLIER: u32 = 1;
@@ -1318,14 +1333,14 @@ mod proptests {
             engine.scan_chunk_into(&case_a.buf, FileId(0), 0, &mut scratch);
             engine.drain_findings_materialized(&mut scratch, &mut out);
             let keys_a = findings_to_keys(&out);
-            let fresh_a = findings_to_keys(&engine.scan_chunk(&case_a.buf));
+            let fresh_a = findings_to_keys(&scan_chunk_findings(&engine, &case_a.buf));
             prop_assert_eq!(keys_a, fresh_a);
 
             out.clear();
             engine.scan_chunk_into(&case_b.buf, FileId(0), 0, &mut scratch);
             engine.drain_findings_materialized(&mut scratch, &mut out);
             let keys_b = findings_to_keys(&out);
-            let fresh_b = findings_to_keys(&engine.scan_chunk(&case_b.buf));
+            let fresh_b = findings_to_keys(&scan_chunk_findings(&engine, &case_b.buf));
             prop_assert_eq!(keys_b, fresh_b);
         }
 

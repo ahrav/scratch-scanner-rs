@@ -1,3 +1,8 @@
+//! Transform span detection and streaming decode helpers.
+//!
+//! Span finders are intentionally permissive: they prioritize recall, while
+//! downstream gating and budgets bound cost and enforce correctness.
+
 use super::SpanU32;
 use crate::api::{TransformConfig, TransformId};
 use crate::scratch_memory::ScratchVec;
@@ -41,6 +46,7 @@ fn is_urlish(b: u8) -> bool {
     )
 }
 
+/// Target for span collection, allowing reuse of `Vec` or `ScratchVec`.
 pub(super) trait SpanSink {
     fn clear(&mut self);
     fn len(&self) -> usize;
@@ -89,23 +95,11 @@ impl SpanSink for ScratchVec<SpanU32> {
     }
 }
 
-// FIX: include unescaped prefix by scanning URL-ish runs, not starting at first '%'.
-//
-// We intentionally scan the entire URL-ish run so decoded output retains any
-// plain-text prefix (e.g., "token=" before "%3D"). We still require at least
-// one percent-escape (and optionally '+') to avoid decoding every plain word.
-fn find_url_spans(
-    hay: &[u8],
-    min_len: usize,
-    max_len: usize,
-    max_spans: usize,
-    plus_to_space: bool,
-) -> Vec<Range<usize>> {
-    let mut spans = Vec::new();
-    find_url_spans_into(hay, min_len, max_len, max_spans, plus_to_space, &mut spans);
-    spans
-}
-
+/// Finds URL-encoded spans within `hay` and appends them to `spans`.
+///
+/// Spans are drawn from URL-ish runs that contain at least one escape (or `+`
+/// when `plus_to_space` is enabled). The run is bounded by `max_len`, and runs
+/// shorter than `min_len` are discarded.
 pub(super) fn find_url_spans_into(
     hay: &[u8],
     min_len: usize,
@@ -114,6 +108,10 @@ pub(super) fn find_url_spans_into(
     plus_to_space: bool,
     spans: &mut impl SpanSink,
 ) {
+    assert!(max_len >= min_len);
+    // Include unescaped prefixes by scanning URL-ish runs, not starting at the first '%'.
+    // We still require at least one percent-escape (and optionally '+') to avoid
+    // decoding every plain word.
     spans.clear();
     let mut i = 0usize;
 
@@ -141,6 +139,11 @@ pub(super) fn find_url_spans_into(
     }
 }
 
+/// Streaming URL-percent decoder.
+///
+/// Decodes `%HH` escapes and optionally converts `+` to space. Invalid or
+/// incomplete escapes are passed through verbatim. The `on_bytes` callback may
+/// stop decoding early by returning `ControlFlow::Break(())`.
 fn stream_decode_url_percent(
     input: &[u8],
     plus_to_space: bool,
@@ -197,6 +200,7 @@ fn stream_decode_url_percent(
     }
 }
 
+#[cfg(test)]
 fn decode_url_percent_to_vec(
     input: &[u8],
     plus_to_space: bool,
@@ -259,25 +263,11 @@ fn is_b64_or_ws(b: u8, allow_space: bool) -> bool {
 //
 // This keeps the span finder cheap and predictable, while later stages enforce
 // cost limits and correctness.
-fn find_base64_spans(
-    hay: &[u8],
-    min_chars: usize,
-    max_len: usize,
-    max_spans: usize,
-    allow_space_ws: bool,
-) -> Vec<Range<usize>> {
-    let mut spans = Vec::new();
-    find_base64_spans_into(
-        hay,
-        min_chars,
-        max_len,
-        max_spans,
-        allow_space_ws,
-        &mut spans,
-    );
-    spans
-}
-
+/// Finds base64-ish spans within `hay` and appends them to `spans`.
+///
+/// The scan is permissive by design and relies on downstream decoding gates
+/// for correctness. Trailing whitespace is trimmed so spans end at the last
+/// base64 byte observed.
 pub(super) fn find_base64_spans_into(
     hay: &[u8],
     min_chars: usize,
@@ -286,6 +276,7 @@ pub(super) fn find_base64_spans_into(
     allow_space_ws: bool,
     spans: &mut impl SpanSink,
 ) {
+    assert!(max_len >= min_chars);
     spans.clear();
     let mut i = 0usize;
 
@@ -316,6 +307,11 @@ pub(super) fn find_base64_spans_into(
     }
 }
 
+/// Streaming base64 decoder that accepts std + URL-safe alphabets.
+///
+/// Whitespace is ignored. Padding is validated, but an unpadded tail
+/// (2 or 3 bytes in the final quantum) is accepted. The `on_bytes` callback
+/// may stop decoding early by returning `ControlFlow::Break(())`.
 fn stream_decode_base64(
     input: &[u8],
     mut on_bytes: impl FnMut(&[u8]) -> ControlFlow<()>,
@@ -453,6 +449,7 @@ fn stream_decode_base64(
     }
 }
 
+#[cfg(test)]
 fn decode_base64_to_vec(input: &[u8], max_out: usize) -> Result<Vec<u8>, Base64DecodeError> {
     let mut out = Vec::with_capacity((input.len() * 3) / 4);
     let mut too_large = false;
@@ -525,6 +522,7 @@ pub(super) fn stream_decode(
     }
 }
 
+#[cfg(test)]
 pub(super) fn decode_to_vec(
     tc: &TransformConfig,
     input: &[u8],

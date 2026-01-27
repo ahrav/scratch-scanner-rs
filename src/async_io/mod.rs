@@ -63,17 +63,17 @@ impl Default for AsyncIoConfig {
 }
 
 fn align_up(value: usize, align: usize) -> usize {
-    debug_assert!(align.is_power_of_two());
+    assert!(align.is_power_of_two());
     (value + (align - 1)) & !(align - 1)
 }
 
 fn align_down(value: usize, align: usize) -> usize {
-    debug_assert!(align.is_power_of_two());
+    assert!(align.is_power_of_two());
     value & !(align - 1)
 }
 
 fn align_down_u64(value: u64, align: u64) -> u64 {
-    debug_assert!(align.is_power_of_two());
+    assert!(align.is_power_of_two());
     value & !(align - 1)
 }
 

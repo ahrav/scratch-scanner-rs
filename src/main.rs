@@ -1,7 +1,7 @@
-#![allow(dead_code, unused_imports, unused_variables)]
-
 use scanner_rs::pipeline::scan_path_default;
-use scanner_rs::{demo_engine_with_anchor_mode, AnchorMode, AsyncIoConfig};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use scanner_rs::AsyncIoConfig;
+use scanner_rs::{demo_engine_with_anchor_mode, AnchorMode};
 use std::env;
 use std::io;
 use std::path::PathBuf;

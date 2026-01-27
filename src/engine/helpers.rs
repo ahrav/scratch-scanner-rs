@@ -1,3 +1,5 @@
+//! Helper routines for window merging, entropy gating, UTF-16 decode, and hashing.
+
 use super::{EntropyCompiled, EntropyScratch, PackedPatterns, SpanU32};
 use crate::scratch_memory::ScratchVec;
 use memchr::memmem;
@@ -23,7 +25,7 @@ pub(super) fn merge_ranges_with_gap_sorted(ranges: &mut ScratchVec<SpanU32>, gap
 
     for i in 1..len {
         let r = ranges[i];
-        debug_assert!(r.start >= cur.start);
+        assert!(r.start >= cur.start);
         if r.start <= cur.end.saturating_add(gap) {
             cur.end = cur.end.max(r.end);
         } else {
@@ -80,7 +82,7 @@ pub(super) fn contains_any_memmem(hay: &[u8], needles: &PackedPatterns) -> bool 
     for i in 0..count {
         let start = needles.offsets[i] as usize;
         let end = needles.offsets[i + 1] as usize;
-        debug_assert!(end <= needles.bytes.len());
+        assert!(end <= needles.bytes.len());
         if memmem::find(hay, &needles.bytes[start..end]).is_some() {
             return true;
         }
@@ -200,6 +202,7 @@ pub(super) enum Utf16DecodeError {
     OutputTooLarge,
 }
 
+#[cfg(test)]
 pub(super) fn decode_utf16le_to_vec(
     input: &[u8],
     max_out: usize,
@@ -209,6 +212,7 @@ pub(super) fn decode_utf16le_to_vec(
     Ok(out)
 }
 
+#[cfg(test)]
 pub(super) fn decode_utf16be_to_vec(
     input: &[u8],
     max_out: usize,
@@ -218,6 +222,7 @@ pub(super) fn decode_utf16be_to_vec(
     Ok(out)
 }
 
+#[cfg(test)]
 fn decode_utf16_to_vec_inner(
     input: &[u8],
     max_out: usize,
@@ -304,25 +309,23 @@ fn decode_utf16_to_buf(
 // Hashing (decoded buffer dedupe)
 // --------------------------
 
-/// Collision-resistant 128-bit hash using AEGIS-128L.
+/// Collision-resistant 128-bit hash using AEGIS-128L MAC.
 ///
 /// Design intent:
 /// - We need a *fast* but *low-collision* fingerprint for decoded buffers.
 /// - SipHash is strong but slower; non-crypto hashes are fast but risky.
 /// - AEGIS-128L uses AES-NI on modern CPUs and yields a 128-bit MAC.
 ///
-/// By fixing key/nonce to zero and authenticating `bytes` as associated data,
-/// we get a deterministic 128-bit tag that behaves like a PRF. This is not a
-/// general-purpose cryptographic hash, but it is collision-resistant enough
-/// for in-process deduplication and avoids an extra dependency.
+/// By fixing the key to zero and authenticating `bytes` as the message, we get
+/// a deterministic 128-bit tag that behaves like a PRF. This is not a general-
+/// purpose cryptographic hash, but it is collision-resistant enough for
+/// in-process deduplication and avoids an extra dependency.
 pub(super) fn hash128(bytes: &[u8]) -> u128 {
-    use aegis::aegis128l::Aegis128L;
+    use aegis::aegis128l::Aegis128LMac;
     let key = [0u8; 16];
-    let nonce = [0u8; 16];
-    let aegis = Aegis128L::new(&key, &nonce);
-    // Encrypt empty message, authenticate `bytes` as associated data.
-    let (_ciphertext, tag) = aegis.encrypt(&[], bytes);
-    u128::from_le_bytes(tag)
+    let mut mac = Aegis128LMac::<16>::new(&key);
+    mac.update(bytes);
+    u128::from_le_bytes(mac.finalize())
 }
 
 pub(super) fn pow2_at_least(v: usize) -> usize {

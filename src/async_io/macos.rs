@@ -356,11 +356,11 @@ impl AioSlot {
         req_len: usize,
         seq: u64,
     ) -> io::Result<()> {
-        debug_assert!(self.is_empty());
-        debug_assert!(req_len > 0);
+        assert!(self.is_empty());
+        assert!(req_len > 0);
 
         let buf = handle.as_mut_slice();
-        debug_assert!(buf.len() >= payload_off + req_len);
+        assert!(buf.len() >= payload_off + req_len);
 
         // Read payload into the fixed payload offset. The overlap prefix is
         // stitched in after completion so we can submit read-ahead without
@@ -562,7 +562,7 @@ impl AioFileReader {
             // Submit in increasing file offset order. Each submission gets a
             // strictly increasing sequence number so we can emit in order.
             let slot = &mut self.slots[slot_idx];
-            debug_assert!(slot.is_empty());
+            assert!(slot.is_empty());
             match slot.submit(
                 self.fd,
                 handle,
@@ -601,7 +601,7 @@ impl AioFileReader {
             }
             if slot.poll_complete()? {
                 let pos = (slot.seq as usize) % ready_len;
-                debug_assert!(
+                assert!(
                     self.ready_seq[pos] == u64::MAX,
                     "ready ring collision for seq {}",
                     slot.seq
@@ -729,7 +729,7 @@ impl AioFileReader {
         self.ready_seq[pos] = u64::MAX;
 
         let slot = &mut self.slots[idx];
-        debug_assert!(slot.is_completed());
+        assert!(slot.is_completed());
         let read_len = slot.read_len;
         let req_len = slot.req_len;
         let offset = slot.offset;

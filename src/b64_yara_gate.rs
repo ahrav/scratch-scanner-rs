@@ -223,7 +223,7 @@ impl Base64YaraGate {
 // -----------------------------
 
 fn yara_base64_perm(anchor: &[u8], offset: usize, min_pat_len: usize) -> Option<Vec<u8>> {
-    debug_assert!(offset < 3);
+    assert!(offset < 3);
     if anchor.is_empty() {
         return None;
     }

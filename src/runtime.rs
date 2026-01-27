@@ -152,6 +152,8 @@ impl BufferPoolInner {
         let avail = self.available.get();
         assert!(avail > 0, "buffer pool exhausted");
 
+        // SAFETY: BufferPoolInner is single-threaded; this is the only
+        // mutable access to the underlying pool for this call.
         let ptr = unsafe { (&mut *self.pool.get()).acquire() };
         self.available.set(avail - 1);
 
@@ -159,6 +161,8 @@ impl BufferPoolInner {
     }
 
     fn release_slot(&self, ptr: NonNull<u8>) {
+        // SAFETY: BufferPoolInner is single-threaded; `ptr` was obtained
+        // from this pool and is not aliased after the handle drop.
         unsafe { (&mut *self.pool.get()).release(ptr) };
 
         let avail = self.available.get();
@@ -223,11 +227,14 @@ pub struct BufferHandle {
 impl BufferHandle {
     /// Returns a shared view over the entire buffer.
     pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: `ptr` points to a `BUFFER_LEN_MAX`-byte allocation owned
+        // by the pool and is valid for the lifetime of this handle.
         unsafe { slice::from_raw_parts(self.ptr.as_ptr(), BUFFER_LEN_MAX) }
     }
 
     /// Returns a mutable view over the entire buffer.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: `ptr` is uniquely borrowed via `&mut self` for this call.
         unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), BUFFER_LEN_MAX) }
     }
 
@@ -270,7 +277,8 @@ pub fn read_file_chunks(
     loop {
         let mut handle = pool.acquire();
         let buf = handle.as_mut_slice();
-        debug_assert!(buf.len() >= tail_len + chunk_size);
+        assert!(tail_len <= tail.len());
+        assert!(buf.len() >= tail_len + chunk_size);
 
         if tail_len > 0 {
             buf[..tail_len].copy_from_slice(&tail[..tail_len]);
