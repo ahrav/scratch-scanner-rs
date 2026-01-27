@@ -1,7 +1,7 @@
 # Async IO Design (Max Perf, O_DIRECT, Per-Worker IO+Scan)
 
 This doc captures the design for async file IO on Linux (io_uring) and macOS
-(Dispatch I/O) with a **single-thread** implementation first, and a clean path
+(POSIX AIO) with a **single-thread** implementation first, and a clean path
 to **per-worker IO+scan** for multi-core scaling. The focus is theoretical max
 throughput, not "good enough."
 
@@ -107,22 +107,24 @@ We should implement option (1) explicitly for correctness.
 
 ---
 
-## macOS: Dispatch I/O (Async, Thread-Backed)
+## macOS: POSIX AIO (Async, Thread-Backed)
 
-macOS has no io_uring. The best async file IO path is `dispatch_io_read`,
-which uses system threads under the hood.
+macOS has no io_uring. The most direct async file IO path available without
+private APIs is POSIX AIO (`aio_read`, `aio_error`, `aio_return`), which is
+thread-backed under the hood.
 
 ### Design
 
-- Each worker owns a dispatch queue and a `dispatch_io_t` per file.
-- Reads return `dispatch_data_t` chunks; we scan directly on mapped bytes.
-- Keep the data alive until scan completes (retain `dispatch_data_t`).
+- Each worker owns a small fixed read-ahead window (AIO slots).
+- Reads land into our preallocated buffers; overlap prefix is stitched
+  in after completion so we can submit read-ahead without waiting.
+- Completions are polled and ordered by sequence number to preserve
+  deterministic chunk emission.
 
 ### Notes
 
-- We cannot supply our own `BufferPool` to `dispatch_io_read`.
-- This path will allocate and manage memory internally; treat it as
-  a platform-specific trade-off.
+- POSIX AIO is still implemented via system threads on macOS.
+- Dispatch I/O could be explored later, but it does not expose buffer reuse.
 
 ---
 
@@ -217,7 +219,7 @@ We should treat benchmark configs as first-class artifacts.
 ## Integration Plan (Phased)
 
 1) **Single-thread Linux io_uring** with split-buffer overlap + O_DIRECT.
-2) **macOS Dispatch IO** backend with async completion integration.
+2) **macOS POSIX AIO** backend with async completion integration.
 3) **Per-worker runtime** (multi-core ready) with per-worker IO+scan.
 4) Bench and tune the knobs; lock in defaults.
 
@@ -226,6 +228,7 @@ We should treat benchmark configs as first-class artifacts.
 ## Open Questions
 
 - Do we require strict "no allocations after init" on macOS?
-  (Dispatch IO likely violates this.)
+  (POSIX AIO can keep allocations low, but completion polling still allocates
+   unless we pre-size all internal buffers.)
 - How to handle very small files where O_DIRECT overhead dominates?
 - Should we support fallback to buffered IO on Linux for the final tail only?
