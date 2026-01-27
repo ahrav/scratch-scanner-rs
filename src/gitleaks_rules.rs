@@ -1,18 +1,21 @@
 use crate::api::{EntropySpec, RuleSpec, TwoPhaseSpec, ValidatorKind};
 use regex::bytes::Regex;
 
-const REGEX_SIZE_LIMIT: usize = 32 * 1024 * 1024;
+const REGEX_SIZE_LIMITS: &[usize] = &[32 * 1024 * 1024, 128 * 1024 * 1024, 512 * 1024 * 1024];
 
 fn build_regex(pattern: &str) -> Regex {
-    match Regex::new(pattern) {
-        Ok(re) => re,
-        Err(regex::Error::CompiledTooBig(_)) => regex::bytes::RegexBuilder::new(pattern)
-            .size_limit(REGEX_SIZE_LIMIT)
-            .dfa_size_limit(REGEX_SIZE_LIMIT)
-            .build()
-            .unwrap(),
-        Err(err) => panic!("failed to compile regex: {err}"),
+    for &limit in REGEX_SIZE_LIMITS {
+        let mut builder = regex::bytes::RegexBuilder::new(pattern);
+        builder.unicode(false);
+        builder.size_limit(limit);
+        builder.dfa_size_limit(limit);
+        match builder.build() {
+            Ok(re) => return re,
+            Err(regex::Error::CompiledTooBig(_)) => continue,
+            Err(err) => panic!("failed to compile regex: {err}"),
+        }
     }
+    panic!("regex compiled too big even at {} bytes: {pattern}", REGEX_SIZE_LIMITS[REGEX_SIZE_LIMITS.len() - 1]);
 }
 pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
     const PRIVATE_KEY_CONFIRM: &[&[u8]] = &[b"PRIVATE KEY"];
