@@ -22,10 +22,13 @@ aegis = { version = "0.9", features = ["pure-rust"] }
 stdx-proptest = []
 kgram-gate = []
 b64-stats = []
+tiger-harness = []
 
 [dev-dependencies]
 base64 = "0.22"
 proptest = "1.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 [profile.dev]
 opt-level = 1

@@ -29,8 +29,8 @@ pub mod scratch_memory;
 pub mod stdx;
 #[cfg(test)]
 pub mod test_utils;
-#[cfg(test)]
-mod tiger_harness;
+#[cfg(any(test, feature = "tiger-harness"))]
+pub mod tiger_harness;
 pub mod util;
 
 mod api;

@@ -53,6 +53,21 @@ jobs:
           key: ubuntu-22.04
       - run: cargo test --features stdx-proptest
 
+  test-full-harness:
+    name: Test (Scheduled, Full Harness)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-22.04
+    env:
+      PROPTEST_CASES: "64"
+      PROPTEST_FUZZ_MULTIPLIER: "4"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ubuntu-22.04
+      - run: cargo test --all-targets --features stdx-proptest,tiger-harness
+
   fuzz-linux:
     name: Fuzz (Scheduled, Nightly Only, Linux)
     if: github.event_name == 'schedule'

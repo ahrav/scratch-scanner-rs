@@ -6,8 +6,8 @@
 
 use super::*;
 use crate::tiger_harness::{
-    check_oracle_covered, correctness_engine, scan_chunked_records, scan_one_chunk_records,
-    ChunkPattern, ChunkPlan,
+    check_oracle_covered, correctness_engine, load_regressions_from_dir, maybe_write_regression,
+    scan_chunked_records, scan_one_chunk_records, ChunkPattern, ChunkPlan,
 };
 use proptest::prelude::*;
 use std::collections::HashSet;
@@ -1366,8 +1366,16 @@ proptest! {
 
         for plan in plans {
             let plan_dbg = format!("{plan:?}");
+            // Preserve the exact plan for regression capture before it is consumed.
+            let plan_for_regression = plan.clone();
             let chunked = scan_chunked_records(&engine, &case.buf, plan);
             if let Err(msg) = check_oracle_covered(&engine, &oracle, &chunked) {
+                maybe_write_regression(
+                    "tiger_chunk_plans_cover_oracle",
+                    seed,
+                    &plan_for_regression,
+                    &case.buf,
+                );
                 prop_assert!(false, "plan={}: {}", plan_dbg, msg);
             }
         }
@@ -1442,9 +1450,150 @@ proptest! {
 
             let chunked = scan_chunked_records(&engine, &buf, ChunkPlan::fixed(chunk_size));
             if let Err(msg) = check_oracle_covered(&engine, &oracle, &chunked) {
+                let plan = ChunkPlan::fixed(chunk_size);
+                maybe_write_regression(
+                    "tiger_boundary_crossing_not_dropped",
+                    seed,
+                    &plan,
+                    &buf,
+                );
                 prop_assert!(false, "chunk_size={} k={}: {}", chunk_size, k, msg);
             }
         }
+    }
+}
+
+#[test]
+fn tiger_regressions_replay() {
+    // Replays any captured regressions to keep failures sticky and reproducible.
+    // The directory is optional so CI can run even when no regressions exist.
+    let dir = Path::new("tests/regressions/tiger_chunking");
+    let cases = match load_regressions_from_dir(dir) {
+        Ok(cases) => cases,
+        Err(err) => panic!("failed to load tiger regressions: {}", err),
+    };
+
+    if cases.is_empty() {
+        return;
+    }
+
+    let engine = correctness_engine();
+    for case in cases {
+        let oracle = scan_one_chunk_records(&engine, &case.input);
+        let chunked = scan_chunked_records(&engine, &case.input, case.plan.clone());
+        if let Err(msg) = check_oracle_covered(&engine, &oracle, &chunked) {
+            panic!(
+                "regression {:?} ({:?}) failed: {}",
+                case.path, case.label, msg
+            );
+        }
+    }
+}
+
+#[test]
+fn tiger_boundary_percent_triplet_split() {
+    // Explicitly split a `%AB` percent triplet so '%' ends a chunk and the
+    // two hex digits begin the next chunk. This exercises URL-percent decoding
+    // across chunk boundaries.
+    let engine = correctness_engine();
+    let overlap = engine.required_overlap();
+
+    let token = b"ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8";
+    let encoded = url_percent_encode_all(token);
+    assert_eq!(encoded.first(), Some(&b'%'));
+
+    let chunk_size = overlap.saturating_add(1);
+    let start = chunk_size.saturating_sub(1);
+
+    let mut buf = vec![b'A'; start];
+    if start > 0 {
+        buf[start - 1] = b' ';
+    }
+    buf.extend_from_slice(&encoded);
+    buf.push(b' ');
+    buf.extend_from_slice(b"ZZZ");
+
+    assert_eq!(buf[chunk_size - 1], b'%');
+
+    let oracle = scan_one_chunk_records(&engine, &buf);
+    assert!(!oracle.is_empty(), "oracle empty for percent triplet split");
+
+    let chunked = scan_chunked_records(&engine, &buf, ChunkPlan::fixed(chunk_size));
+    if let Err(msg) = check_oracle_covered(&engine, &oracle, &chunked) {
+        panic!("percent triplet split failed: {}", msg);
+    }
+}
+
+#[test]
+fn tiger_boundary_base64_padding_split() {
+    // Ensure base64 '=' padding is split across the chunk boundary so the
+    // decoder must carry padding state across chunks.
+    let engine = correctness_engine();
+    let overlap = engine.required_overlap();
+
+    let token = b"ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8";
+    let encoded = b64_encode(token).into_bytes();
+    assert!(encoded.len() >= 2);
+    assert_eq!(&encoded[encoded.len() - 2..], b"==");
+
+    let mut chunk_size = overlap.saturating_add(1);
+    if chunk_size < encoded.len() {
+        chunk_size = encoded.len();
+    }
+    let start = chunk_size.saturating_sub(encoded.len().saturating_sub(1));
+
+    let mut buf = vec![b'A'; start];
+    if start > 0 {
+        buf[start - 1] = b' ';
+    }
+    buf.extend_from_slice(&encoded);
+    buf.push(b' ');
+    buf.extend_from_slice(b"ZZZ");
+
+    assert!(buf.len() > chunk_size);
+    assert_eq!(buf[chunk_size - 1], b'=');
+    assert_eq!(buf[chunk_size], b'=');
+
+    let oracle = scan_one_chunk_records(&engine, &buf);
+    assert!(!oracle.is_empty(), "oracle empty for base64 padding split");
+
+    let chunked = scan_chunked_records(&engine, &buf, ChunkPlan::fixed(chunk_size));
+    if let Err(msg) = check_oracle_covered(&engine, &oracle, &chunked) {
+        panic!("base64 padding split failed: {}", msg);
+    }
+}
+
+#[test]
+fn tiger_boundary_utf16_odd_byte_split() {
+    // Split a UTF-16LE encoded anchor on an odd byte boundary so the decoder
+    // must reconstruct code units across chunks.
+    let engine = correctness_engine();
+    let overlap = engine.required_overlap();
+
+    let token = b"AKIAIOSFODNN7EXAMPLE";
+    let encoded = utf16le_bytes(token);
+    assert!(encoded.len() >= 2);
+
+    let chunk_size = overlap.saturating_add(1);
+    let start = chunk_size.saturating_sub(1);
+
+    let mut buf = vec![0u8; start];
+    if start > 0 {
+        buf[start - 1] = b' ';
+    }
+    buf.extend_from_slice(&encoded);
+    buf.extend_from_slice(&[b' ', 0]);
+    buf.extend_from_slice(b"ZZZ");
+
+    assert_eq!(buf[chunk_size - 1], encoded[0]);
+    assert_eq!(buf[chunk_size], encoded[1]);
+
+    let oracle = scan_one_chunk_records(&engine, &buf);
+    assert!(!oracle.is_empty(), "oracle empty for utf16 odd-byte split");
+
+    let chunked = scan_chunked_records(&engine, &buf, ChunkPlan::fixed(chunk_size));
+    if let Err(msg) = check_oracle_covered(&engine, &oracle, &chunked) {
+        panic!("utf16 odd-byte split failed: {}", msg);
     }
 }
 
