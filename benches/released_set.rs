@@ -88,8 +88,9 @@ fn bench_load_factor(c: &mut Criterion) {
                 b.iter(|| {
                     set.clear_retaining_capacity();
                     for &key in *keys {
-                        black_box(set.insert(black_box(key)));
+                        set.insert(black_box(key));
                     }
+                    black_box(());
                 })
             },
         );
