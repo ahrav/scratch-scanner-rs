@@ -116,8 +116,9 @@ fn bench_duplicates(c: &mut Criterion) {
         b.iter(|| {
             set.clear_retaining_capacity();
             for &key in &unique_keys {
-                black_box(set.insert(black_box(key)));
+                set.insert(black_box(key));
             }
+            black_box(());
         })
     });
 
@@ -128,8 +129,9 @@ fn bench_duplicates(c: &mut Criterion) {
         b.iter(|| {
             set.clear_retaining_capacity();
             for &key in &half_dup_keys {
-                black_box(set.insert(black_box(key)));
+                set.insert(black_box(key));
             }
+            black_box(());
         })
     });
 
@@ -140,8 +142,9 @@ fn bench_duplicates(c: &mut Criterion) {
         b.iter(|| {
             set.clear_retaining_capacity();
             for &key in &high_dup_keys {
-                black_box(set.insert(black_box(key)));
+                set.insert(black_box(key));
             }
+            black_box(());
         })
     });
 
@@ -153,8 +156,9 @@ fn bench_duplicates(c: &mut Criterion) {
             set.clear_retaining_capacity();
             set.insert(same_key);
             for _ in 1..OPS_PER_ITER {
-                black_box(set.insert(black_box(same_key)));
+                set.insert(black_box(same_key));
             }
+            black_box(());
         })
     });
 
@@ -213,8 +217,8 @@ fn bench_pop(c: &mut Criterion) {
     let sizes = [100, 1_000, 10_000];
 
     for &size in &sizes {
-        let keys = make_keys(size, 0xface_cafe);
-        group.throughput(Throughput::Elements(size as u64));
+        let keys = make_keys(size as usize, 0xface_cafe);
+        group.throughput(Throughput::Elements(size));
 
         group.bench_with_input(BenchmarkId::new("drain", size), &keys, |b, keys| {
             let mut set = ReleasedSet::with_capacity(size + 100);
