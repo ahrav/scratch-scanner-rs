@@ -12,10 +12,12 @@ use regex::bytes::Regex;
 use std::ops::{ControlFlow, Range};
 
 mod helpers;
+mod prefilter;
 mod transform;
 mod validator;
 
 use self::helpers::*;
+use self::prefilter::*;
 use self::transform::*;
 
 #[cfg(test)]
@@ -117,15 +119,17 @@ impl Target {
     }
 }
 
-/// Anchor automaton plus pattern->target fanout table.
+/// Anchor automaton plus prefilter and pattern->target fanout table.
 ///
 /// The Aho-Corasick automaton yields pattern ids. `pat_offsets` slices into
 /// `pat_targets` so each pattern id can fan out to multiple (rule, variant)
-/// targets without per-pattern allocations.
+/// targets without per-pattern allocations. `prefilter` stores a byteset-based
+/// accelerator derived from the same pattern universe.
 struct AnchorIndex {
     ac: AhoCorasick,
     pat_targets: Vec<Target>,
     pat_offsets: Vec<u32>,
+    prefilter: AnchorPrefilterPlan,
 }
 
 /// Anchor indexes used to select between raw-only and combined scans.
@@ -153,7 +157,8 @@ impl Anchors {
 ///
 /// `bytes` stores all patterns back-to-back, and `offsets` is a prefix-sum
 /// table with length `patterns + 1`. This avoids a `Vec<Vec<u8>>` and keeps
-/// confirm-any patterns contiguous for cache-friendly memmem checks.
+/// confirm patterns contiguous for cache-friendly memmem checks (both ANY and
+/// ALL gates).
 #[derive(Clone, Debug)]
 struct PackedPatterns {
     bytes: Vec<u8>,
@@ -216,6 +221,19 @@ struct KeywordsCompiled {
     any: [PackedPatterns; 3],
 }
 
+/// Derived "confirm all" gate from mandatory literal islands.
+///
+/// Design intent:
+/// - The longest literal is checked first as a single memmem search.
+/// - The remaining literals are checked with AND semantics using PackedPatterns.
+/// - UTF-16 variants are encoded the same way as anchors/keywords so we can
+///   reject windows before decoding.
+#[derive(Clone, Debug)]
+struct ConfirmAllCompiled {
+    primary: [Option<Vec<u8>>; 3],
+    rest: [PackedPatterns; 3],
+}
+
 #[derive(Clone, Copy, Debug)]
 struct EntropyCompiled {
     // Prevalidated config stored in compiled rules to avoid repeated lookups.
@@ -234,6 +252,8 @@ struct RuleCompiled {
     radius: usize,
     validator: ValidatorKind,
     must_contain: Option<&'static [u8]>,
+    // Derived AND gate: all literals must appear in the window before regex.
+    confirm_all: Option<ConfirmAllCompiled>,
     keywords: Option<KeywordsCompiled>,
     entropy: Option<EntropyCompiled>,
     re: Regex,
@@ -551,18 +571,19 @@ pub struct ScanScratch {
     /// Fixed capacity ensures no allocations during the scan loop; the tuning
     /// parameter `max_work_items` determines the upper bound.
     work_q: ScratchVec<WorkItem>,
-    work_head: usize,                 // Cursor into work_q.
-    slab: DecodeSlab,                 // Decoded output storage.
-    seen: FixedSet128,                // Dedupe for decoded buffers.
-    total_decode_output_bytes: usize, // Global decode budget tracker.
-    work_items_enqueued: usize,       // Work queue budget tracker.
-    accs: Vec<[HitAccumulator; 3]>,   // Per (rule, variant) hit accumulators.
-    touched_pairs: ScratchVec<u32>,   // Scratch list of touched pairs.
-    touched: DynamicBitSet,           // Bitset for touched pairs.
-    touched_any: bool,                // Fast path for "none touched".
-    windows: ScratchVec<SpanU32>,     // Merged windows for a pair.
-    expanded: ScratchVec<SpanU32>,    // Expanded windows for two-phase rules.
-    spans: ScratchVec<SpanU32>,       // Transform span candidates.
+    work_head: usize,                       // Cursor into work_q.
+    slab: DecodeSlab,                       // Decoded output storage.
+    seen: FixedSet128,                      // Dedupe for decoded buffers.
+    total_decode_output_bytes: usize,       // Global decode budget tracker.
+    work_items_enqueued: usize,             // Work queue budget tracker.
+    accs: Vec<[HitAccumulator; 3]>,         // Per (rule, variant) hit accumulators.
+    touched_pairs: ScratchVec<u32>,         // Scratch list of touched pairs.
+    touched: DynamicBitSet,                 // Bitset for touched pairs.
+    touched_any: bool,                      // Fast path for "none touched".
+    prefilter_windows: ScratchVec<SpanU32>, // Anchor prefilter scan windows.
+    windows: ScratchVec<SpanU32>,           // Merged windows for a pair.
+    expanded: ScratchVec<SpanU32>,          // Expanded windows for two-phase rules.
+    spans: ScratchVec<SpanU32>,             // Transform span candidates.
     /// Streaming gate scratch buffers.
     ///
     /// Used by the base64 decoded-content gate to maintain a sliding window
@@ -638,6 +659,10 @@ impl ScanScratch {
                 .expect("scratch touched_pairs allocation failed"),
             touched: DynamicBitSet::empty(rules_len.saturating_mul(3)),
             touched_any: false,
+            prefilter_windows: ScratchVec::with_capacity(
+                engine.tuning.max_anchor_hits_per_rule_variant,
+            )
+            .expect("scratch prefilter_windows allocation failed"),
             windows: ScratchVec::with_capacity(engine.tuning.max_anchor_hits_per_rule_variant)
                 .expect("scratch windows allocation failed"),
             expanded: ScratchVec::with_capacity(engine.tuning.max_windows_per_rule_variant)
@@ -683,6 +708,7 @@ impl ScanScratch {
         self.base64_stats.reset();
         self.touched_pairs.clear();
         self.touched_any = false;
+        self.prefilter_windows.clear();
         self.windows.clear();
         self.expanded.clear();
         self.spans.clear();
@@ -726,6 +752,11 @@ impl ScanScratch {
             self.windows =
                 ScratchVec::with_capacity(engine.tuning.max_anchor_hits_per_rule_variant)
                     .expect("scratch windows allocation failed");
+        }
+        if self.prefilter_windows.capacity() < engine.tuning.max_anchor_hits_per_rule_variant {
+            self.prefilter_windows =
+                ScratchVec::with_capacity(engine.tuning.max_anchor_hits_per_rule_variant)
+                    .expect("scratch prefilter_windows allocation failed");
         }
         if self.expanded.capacity() < engine.tuning.max_windows_per_rule_variant {
             self.expanded = ScratchVec::with_capacity(engine.tuning.max_windows_per_rule_variant)
@@ -906,19 +937,63 @@ pub struct Engine {
     // Residue gates for rules without anchors (pass 2).
     residue_rules: Vec<(usize, ResidueGatePlan)>,
     unfilterable_rules: Vec<(usize, UnfilterableReason)>,
+    #[cfg(feature = "stats")]
     anchor_plan_stats: AnchorPlanStats,
 
     max_anchor_pat_len: usize,
     max_window_diameter_bytes: usize,
 }
 
+/// Build-time statistics about anchor prefilters for a single pattern universe.
+#[cfg(feature = "stats")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AnchorPrefilterStats {
+    /// Number of deduped patterns used to build the anchor automaton.
+    pub pattern_count: usize,
+    /// Length of the longest pattern (bytes).
+    pub max_pattern_len: usize,
+    /// Distinct starting bytes (start-byte prefilter cardinality).
+    pub start_bytes: usize,
+    /// Distinct bytes selected for the rare-byte prefilter.
+    pub rare_bytes: usize,
+    /// Maximum rewind offset across rare-byte assignments.
+    pub rare_max_offset: usize,
+    /// Maximum window span across rare-byte assignments.
+    pub rare_max_span: usize,
+    /// Whether a start-byte prefilter was built.
+    pub start_available: bool,
+    /// Whether a rare-byte prefilter was built.
+    pub rare_available: bool,
+}
+
 /// Summary of anchor derivation choices during engine build.
+#[cfg(feature = "stats")]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AnchorPlanStats {
     pub manual_rules: usize,
     pub derived_rules: usize,
     pub residue_rules: usize,
     pub unfilterable_rules: usize,
+    /// Prefilter stats for raw-only anchors.
+    pub prefilter_raw: AnchorPrefilterStats,
+    /// Prefilter stats for raw + UTF-16 anchors.
+    pub prefilter_all: AnchorPrefilterStats,
+}
+
+#[cfg(feature = "stats")]
+impl From<AnchorPrefilterStatsInternal> for AnchorPrefilterStats {
+    fn from(stats: AnchorPrefilterStatsInternal) -> Self {
+        Self {
+            pattern_count: stats.pattern_count,
+            max_pattern_len: stats.max_pattern_len,
+            start_bytes: stats.start_bytes,
+            rare_bytes: stats.rare_bytes,
+            rare_max_offset: stats.rare_max_offset,
+            rare_max_span: stats.rare_max_span,
+            start_available: stats.start_available,
+            rare_available: stats.rare_available,
+        }
+    }
 }
 
 impl Engine {
@@ -952,7 +1027,7 @@ impl Engine {
             tc.assert_valid();
         }
 
-        let rules_compiled = rules.iter().map(compile_rule).collect::<Vec<_>>();
+        let mut rules_compiled = rules.iter().map(compile_rule).collect::<Vec<_>>();
         let max_entropy_len = rules_compiled
             .iter()
             .filter_map(|r| r.entropy.map(|e| e.max_len))
@@ -968,6 +1043,7 @@ impl Engine {
         let mut residue_rules: Vec<(usize, ResidueGatePlan)> = Vec::with_capacity(rules.len());
         let mut unfilterable_rules: Vec<(usize, UnfilterableReason)> =
             Vec::with_capacity(rules.len());
+        #[cfg(feature = "stats")]
         let mut anchor_plan_stats = AnchorPlanStats::default();
         let derive_cfg = AnchorDeriveConfig {
             utf8: false,
@@ -1003,8 +1079,11 @@ impl Engine {
                         return;
                     }
                     manual_used = true;
-                    anchor_plan_stats.manual_rules =
-                        anchor_plan_stats.manual_rules.saturating_add(1);
+                    #[cfg(feature = "stats")]
+                    {
+                        anchor_plan_stats.manual_rules =
+                            anchor_plan_stats.manual_rules.saturating_add(1);
+                    }
                     for &a in r.anchors {
                         let keyword_implied = keyword_implied_for_anchor(a);
                         add_pat_raw(
@@ -1059,17 +1138,32 @@ impl Engine {
                 Ok(plan) => plan,
                 Err(_) => {
                     unfilterable_rules.push((rid, UnfilterableReason::UnsupportedRegexFeatures));
-                    anchor_plan_stats.unfilterable_rules =
-                        anchor_plan_stats.unfilterable_rules.saturating_add(1);
+                    #[cfg(feature = "stats")]
+                    {
+                        anchor_plan_stats.unfilterable_rules =
+                            anchor_plan_stats.unfilterable_rules.saturating_add(1);
+                    }
                     add_manual(&mut pat_map_raw, &mut pat_map_all);
                     continue;
                 }
             };
 
             match plan {
-                TriggerPlan::Anchored { anchors, .. } => {
-                    anchor_plan_stats.derived_rules =
-                        anchor_plan_stats.derived_rules.saturating_add(1);
+                TriggerPlan::Anchored {
+                    anchors,
+                    mut confirm_all,
+                } => {
+                    if let Some(needle) = r.must_contain {
+                        confirm_all.retain(|c| c.as_slice() != needle);
+                    }
+                    if let Some(compiled) = compile_confirm_all(confirm_all) {
+                        rules_compiled[rid].confirm_all = Some(compiled);
+                    }
+                    #[cfg(feature = "stats")]
+                    {
+                        anchor_plan_stats.derived_rules =
+                            anchor_plan_stats.derived_rules.saturating_add(1);
+                    }
                     for anchor in anchors {
                         let keyword_implied = keyword_implied_for_anchor(&anchor);
                         add_pat_raw(
@@ -1096,14 +1190,20 @@ impl Engine {
                 }
                 TriggerPlan::Residue { gate } => {
                     residue_rules.push((rid, gate));
-                    anchor_plan_stats.residue_rules =
-                        anchor_plan_stats.residue_rules.saturating_add(1);
+                    #[cfg(feature = "stats")]
+                    {
+                        anchor_plan_stats.residue_rules =
+                            anchor_plan_stats.residue_rules.saturating_add(1);
+                    }
                     add_manual(&mut pat_map_raw, &mut pat_map_all);
                 }
                 TriggerPlan::Unfilterable { reason } => {
                     unfilterable_rules.push((rid, reason));
-                    anchor_plan_stats.unfilterable_rules =
-                        anchor_plan_stats.unfilterable_rules.saturating_add(1);
+                    #[cfg(feature = "stats")]
+                    {
+                        anchor_plan_stats.unfilterable_rules =
+                            anchor_plan_stats.unfilterable_rules.saturating_add(1);
+                    }
                     add_manual(&mut pat_map_raw, &mut pat_map_all);
                 }
             }
@@ -1116,6 +1216,14 @@ impl Engine {
             .map(|p| p.len())
             .max()
             .unwrap_or(0);
+
+        let prefilter_raw = AnchorPrefilterPlan::build(&anchor_patterns_raw);
+        let prefilter_all = AnchorPrefilterPlan::build(&anchor_patterns_all);
+        #[cfg(feature = "stats")]
+        {
+            anchor_plan_stats.prefilter_raw = prefilter_raw.stats().into();
+            anchor_plan_stats.prefilter_all = prefilter_all.stats().into();
+        }
 
         // Build the base64 pre-gate from the same anchor universe as the decoded gate:
         // raw anchors plus UTF-16 variants. This keeps the pre-gate *sound* with
@@ -1223,16 +1331,19 @@ impl Engine {
                     ac: ac_anchors_raw,
                     pat_targets: pat_targets_raw,
                     pat_offsets: pat_offsets_raw,
+                    prefilter: prefilter_raw,
                 },
                 all: AnchorIndex {
                     ac: ac_anchors_all,
                     pat_targets: pat_targets_all,
                     pat_offsets: pat_offsets_all,
+                    prefilter: prefilter_all,
                 },
             },
             b64_gate,
             residue_rules,
             unfilterable_rules,
+            #[cfg(feature = "stats")]
             anchor_plan_stats,
             max_anchor_pat_len,
             max_window_diameter_bytes,
@@ -1240,6 +1351,7 @@ impl Engine {
     }
 
     /// Returns a summary of how anchors were chosen during compilation.
+    #[cfg(feature = "stats")]
     pub fn anchor_plan_stats(&self) -> AnchorPlanStats {
         self.anchor_plan_stats
     }
@@ -1548,7 +1660,9 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     fn scan_anchor_matches(
         &self,
-        buf: &[u8],
+        full_buf: &[u8],
+        scan_slice: &[u8],
+        slice_offset: usize,
         ac: &AhoCorasick,
         pat_targets: &[Target],
         pat_offsets: &[u32],
@@ -1558,11 +1672,17 @@ impl Engine {
         file_id: FileId,
         scratch: &mut ScanScratch,
     ) {
-        for m in ac.find_overlapping_iter(buf) {
+        debug_assert!(slice_offset <= full_buf.len());
+        debug_assert!(slice_offset + scan_slice.len() <= full_buf.len());
+
+        for m in ac.find_overlapping_iter(scan_slice) {
             let pid = m.pattern().as_usize();
             let start = pat_offsets[pid] as usize;
             let end = pat_offsets[pid + 1] as usize;
             let targets = &pat_targets[start..end];
+
+            let m_start = slice_offset.saturating_add(m.start());
+            let m_end = slice_offset.saturating_add(m.end());
 
             for &t in targets {
                 let rule_id = t.rule_id();
@@ -1574,8 +1694,8 @@ impl Engine {
                 // match-start aligned, attempt to validate and emit immediately.
                 //
                 // We only take this path when any keyword gate is implied by the
-                // matched anchor and no `must_contain` filter is required, so the
-                // validator remains authoritative.
+                // matched anchor and no `must_contain`/confirm-all filter is
+                // required, so the validator remains authoritative.
                 //
                 // On failure we skip window accumulation for this anchor hit,
                 // avoiding regex work.
@@ -1583,14 +1703,15 @@ impl Engine {
                     && t.match_start_aligned()
                     && rule.validator.is_enabled()
                     && rule.must_contain.is_none()
+                    && rule.confirm_all.is_none()
                     && t.keyword_implied()
                 {
-                    if let Some(span) =
-                        rule.validator
-                            .validate_raw_at_anchor(buf, m.start(), m.end())
+                    if let Some(span) = rule
+                        .validator
+                        .validate_raw_at_anchor(full_buf, m_start, m_end)
                     {
                         if let Some(ent) = rule.entropy {
-                            let mbytes = &buf[span.clone()];
+                            let mbytes = &full_buf[span.clone()];
                             if !entropy_gate_passes(
                                 &ent,
                                 mbytes,
@@ -1626,8 +1747,8 @@ impl Engine {
                 let scale = variant.scale();
                 let seed_radius_bytes = seed_r.saturating_mul(scale);
 
-                let lo = m.start().saturating_sub(seed_radius_bytes);
-                let hi = (m.end() + seed_radius_bytes).min(buf.len());
+                let lo = m_start.saturating_sub(seed_radius_bytes);
+                let hi = (m_end + seed_radius_bytes).min(full_buf.len());
 
                 scratch.accs[rule_id][variant.idx()].push(
                     lo,
@@ -1661,17 +1782,56 @@ impl Engine {
         // automaton in that case. Otherwise we scan a combined raw+UTF-16 index
         // to avoid multiple full passes on binary-heavy buffers.
         let anchors = self.anchors.select(buf, self.tuning.scan_utf16_variants);
-        self.scan_anchor_matches(
-            buf,
-            &anchors.ac,
-            &anchors.pat_targets,
-            &anchors.pat_offsets,
-            step_id,
-            &root_hint,
-            base_offset,
-            file_id,
-            scratch,
-        );
+        // Prefilter selection is adaptive: we sample the head of the buffer
+        // and skip prefiltering when the candidate density is too high.
+        let mut scanned = false;
+        if let Some(prefilter) = anchors.prefilter.pick(buf) {
+            match prefilter.collect_windows(buf, &mut scratch.prefilter_windows) {
+                PrefilterOutcome::NoCandidates => return,
+                PrefilterOutcome::Windows => {
+                    let win_len = scratch.prefilter_windows.len();
+                    for i in 0..win_len {
+                        let win = scratch.prefilter_windows[i];
+                        let start = win.start as usize;
+                        let end = win.end as usize;
+                        if start >= end || end > buf.len() {
+                            continue;
+                        }
+                        self.scan_anchor_matches(
+                            buf,
+                            &buf[start..end],
+                            start,
+                            &anchors.ac,
+                            &anchors.pat_targets,
+                            &anchors.pat_offsets,
+                            step_id,
+                            &root_hint,
+                            base_offset,
+                            file_id,
+                            scratch,
+                        );
+                    }
+                    scanned = true;
+                }
+                PrefilterOutcome::FullScan => {}
+            }
+        }
+
+        if !scanned {
+            self.scan_anchor_matches(
+                buf,
+                buf,
+                0,
+                &anchors.ac,
+                &anchors.pat_targets,
+                &anchors.pat_offsets,
+                step_id,
+                &root_hint,
+                base_offset,
+                file_id,
+                scratch,
+            );
+        }
 
         if !scratch.touched_any {
             return;
@@ -1806,6 +1966,18 @@ impl Engine {
                     }
                 }
 
+                if let Some(confirm) = &rule.confirm_all {
+                    let vidx = Variant::Raw.idx();
+                    if let Some(primary) = &confirm.primary[vidx] {
+                        if memmem::find(window, primary).is_none() {
+                            return;
+                        }
+                    }
+                    if !contains_all_memmem(window, &confirm.rest[vidx]) {
+                        return;
+                    }
+                }
+
                 if let Some(kws) = &rule.keywords {
                     // Keyword gate is a cheap pre-regex filter: if none of the
                     // keywords appear in this window, the regex cannot be relevant.
@@ -1853,6 +2025,21 @@ impl Engine {
                     .saturating_sub(scratch.total_decode_output_bytes);
                 if remaining == 0 {
                     return;
+                }
+
+                if let Some(confirm) = &rule.confirm_all {
+                    // Confirm-all literals are encoded like anchors/keywords so we can
+                    // cheaply reject UTF-16 windows before decoding.
+                    let raw_win = &buf[w.clone()];
+                    let vidx = variant.idx();
+                    if let Some(primary) = &confirm.primary[vidx] {
+                        if memmem::find(raw_win, primary).is_none() {
+                            return;
+                        }
+                    }
+                    if !contains_all_memmem(raw_win, &confirm.rest[vidx]) {
+                        return;
+                    }
                 }
 
                 if let Some(kws) = &rule.keywords {
@@ -2152,11 +2339,43 @@ fn compile_rule(spec: &RuleSpec) -> RuleCompiled {
         radius: spec.radius,
         validator: spec.validator,
         must_contain: spec.must_contain,
+        confirm_all: None,
         keywords,
         entropy,
         re: spec.re.clone(),
         two_phase,
     }
+}
+
+fn compile_confirm_all(mut confirm_all: Vec<Vec<u8>>) -> Option<ConfirmAllCompiled> {
+    if confirm_all.is_empty() {
+        return None;
+    }
+
+    // Sort longest-first so the primary literal is maximally selective.
+    confirm_all.sort_unstable_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    let primary = confirm_all.remove(0);
+    let primary_raw = Some(primary.clone());
+    let primary_le = Some(utf16le_bytes(&primary));
+    let primary_be = Some(utf16be_bytes(&primary));
+
+    let count = confirm_all.len();
+    let raw_bytes = confirm_all.iter().map(|p| p.len()).sum::<usize>();
+    let utf16_bytes = raw_bytes.saturating_mul(2);
+    let mut raw = PackedPatterns::with_capacity(count, raw_bytes);
+    let mut le = PackedPatterns::with_capacity(count, utf16_bytes);
+    let mut be = PackedPatterns::with_capacity(count, utf16_bytes);
+
+    for p in confirm_all {
+        raw.push_raw(&p);
+        le.push_utf16le(&p);
+        be.push_utf16be(&p);
+    }
+
+    Some(ConfirmAllCompiled {
+        primary: [primary_raw, primary_le, primary_be],
+        rest: [raw, le, be],
+    })
 }
 
 fn add_pat_raw(map: &mut AHashMap<Vec<u8>, Vec<Target>>, pat: &[u8], target: Target) {

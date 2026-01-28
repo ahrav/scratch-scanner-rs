@@ -257,4 +257,6 @@ Guidelines:
 2. **Radius**: 2x expected token length is usually safe
 3. **Two-phase**: Use for anchors that appear in non-sensitive contexts
 4. **must_contain**: Fast filter if token has additional required substrings
-5. **Regex**: Should be anchored (no `.*` prefix) for performance
+5. **Derived anchors**: When anchor derivation is enabled, mandatory literal
+   islands in the regex are compiled into a `confirm_all` AND gate.
+6. **Regex**: Should be anchored (no `.*` prefix) for performance

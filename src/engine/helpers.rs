@@ -90,6 +90,19 @@ pub(super) fn contains_any_memmem(hay: &[u8], needles: &PackedPatterns) -> bool 
     false
 }
 
+pub(super) fn contains_all_memmem(hay: &[u8], needles: &PackedPatterns) -> bool {
+    let count = needles.offsets.len().saturating_sub(1);
+    for i in 0..count {
+        let start = needles.offsets[i] as usize;
+        let end = needles.offsets[i + 1] as usize;
+        assert!(end <= needles.bytes.len());
+        if memmem::find(hay, &needles.bytes[start..end]).is_none() {
+            return false;
+        }
+    }
+    true
+}
+
 // --------------------------
 // Entropy helpers
 // --------------------------

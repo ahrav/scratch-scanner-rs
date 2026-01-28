@@ -12,12 +12,16 @@
   * The actual first defense is **anchors** (they decide which windows even exist).
   * Inside a window, keyword gating is a **pre-regex gate**.
   * For UTF-16 windows, keyword gating should happen **before decoding** to avoid spending decode budget on windows that cannot pass.
+  * Derived `confirm_all` literals (mandatory islands) are also applied inside the window; for UTF-16
+    variants they are encoded like anchors so they can be checked before decoding.
 
-* **Why keyword check goes after `must_contain`**
+* **Why keyword check goes after `must_contain` and confirm-all**
 
   * `must_contain` is a single `memmem` search.
+  * `confirm_all` (derived from mandatory literal islands) uses the longest literal
+    as a single fast check, then requires the rest with AND semantics.
   * `keywords_any` is N `memmem` searches.
-  * Running the 1-search gate first is strictly cheaper and often similarly selective.
+  * Running the 1-search gates first is strictly cheaper and often similarly selective.
   * If you later want to get fancy, you can order gates by estimated selectivity, but don’t start there.
 
 ---
@@ -102,6 +106,7 @@ struct RuleCompiled {
     must_contain: Option<&'static [u8]>,
 
     // NEW
+    confirm_all: Option<ConfirmAllCompiled>,
     keywords: Option<KeywordsCompiled>,
     entropy: Option<EntropyCompiled>,
 

@@ -125,13 +125,13 @@ fn main() -> io::Result<()> {
         None => demo_engine_with_anchor_mode(anchor_mode),
     });
     let start = Instant::now();
-    let stats = match io_backend {
-        IoBackend::Sync => scan_path_default(&path, Arc::clone(&engine))?,
+    let run_scan = || match io_backend {
+        IoBackend::Sync => scan_path_default(&path, Arc::clone(&engine)),
         IoBackend::Auto => {
             #[cfg(target_os = "linux")]
             {
                 match scanner_rs::UringScanner::new(Arc::clone(&engine), AsyncIoConfig::default()) {
-                    Ok(mut scanner) => scanner.scan_path(&path)?,
+                    Ok(mut scanner) => scanner.scan_path(&path),
                     Err(err) => {
                         eprintln!("io_uring unavailable ({}); use --io=sync to override", err);
                         std::process::exit(2);
@@ -141,7 +141,7 @@ fn main() -> io::Result<()> {
             #[cfg(target_os = "macos")]
             {
                 match scanner_rs::AioScanner::new(Arc::clone(&engine), AsyncIoConfig::default()) {
-                    Ok(mut scanner) => scanner.scan_path(&path)?,
+                    Ok(mut scanner) => scanner.scan_path(&path),
                     Err(err) => {
                         eprintln!("POSIX AIO unavailable ({}); use --io=sync to override", err);
                         std::process::exit(2);
@@ -159,7 +159,7 @@ fn main() -> io::Result<()> {
             {
                 let mut scanner =
                     scanner_rs::UringScanner::new(Arc::clone(&engine), AsyncIoConfig::default())?;
-                scanner.scan_path(&path)?
+                scanner.scan_path(&path)
             }
             #[cfg(not(target_os = "linux"))]
             {
@@ -172,7 +172,7 @@ fn main() -> io::Result<()> {
             {
                 let mut scanner =
                     scanner_rs::AioScanner::new(Arc::clone(&engine), AsyncIoConfig::default())?;
-                scanner.scan_path(&path)?
+                scanner.scan_path(&path)
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -181,26 +181,40 @@ fn main() -> io::Result<()> {
             }
         }
     };
+
+    #[cfg(feature = "stats")]
+    let stats = run_scan()?;
+    #[cfg(not(feature = "stats"))]
+    run_scan()?;
     let elapsed = start.elapsed();
-    let elapsed_secs = elapsed.as_secs_f64();
-    let throughput_mib = if elapsed_secs > 0.0 {
-        (stats.bytes_scanned as f64 / (1024.0 * 1024.0)) / elapsed_secs
-    } else {
-        0.0
-    };
 
-    eprintln!(
-        "files={} chunks={} bytes={} findings={} errors={} elapsed_ms={} throughput_mib_s={:.2}",
-        stats.files,
-        stats.chunks,
-        stats.bytes_scanned,
-        stats.findings,
-        stats.errors,
-        elapsed.as_millis(),
-        throughput_mib
-    );
+    #[cfg(feature = "stats")]
+    {
+        let elapsed_secs = elapsed.as_secs_f64();
+        let throughput_mib = if elapsed_secs > 0.0 {
+            (stats.bytes_scanned as f64 / (1024.0 * 1024.0)) / elapsed_secs
+        } else {
+            0.0
+        };
 
-    #[cfg(feature = "b64-stats")]
+        eprintln!(
+            "files={} chunks={} bytes={} findings={} errors={} elapsed_ms={} throughput_mib_s={:.2}",
+            stats.files,
+            stats.chunks,
+            stats.bytes_scanned,
+            stats.findings,
+            stats.errors,
+            elapsed.as_millis(),
+            throughput_mib
+        );
+    }
+
+    #[cfg(not(feature = "stats"))]
+    {
+        eprintln!("elapsed_ms={}", elapsed.as_millis());
+    }
+
+    #[cfg(all(feature = "stats", feature = "b64-stats"))]
     {
         let b64 = stats.base64;
         let decoded_wasted = b64

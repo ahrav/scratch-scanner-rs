@@ -360,7 +360,10 @@ impl Walker {
                 return Ok(());
             }
             let id = files.push_span(root_span, st.st_size as u64, dev_inode_from_stat(&st), 0);
-            stats.files += 1;
+            #[cfg(feature = "stats")]
+            {
+                stats.files += 1;
+            }
             self.pending = Some(id);
             return Ok(());
         }
@@ -407,8 +410,11 @@ impl Walker {
                 if ent.is_null() {
                     let err = io::Error::last_os_error();
                     if err.raw_os_error().unwrap_or(0) != 0 {
-                        stats.walk_errors += 1;
-                        stats.errors += 1;
+                        #[cfg(feature = "stats")]
+                        {
+                            stats.walk_errors += 1;
+                            stats.errors += 1;
+                        }
                     }
                     self.stack.pop();
                     continue;
@@ -428,8 +434,11 @@ impl Walker {
                     libc::AT_SYMLINK_NOFOLLOW,
                 ) != 0
                 {
-                    stats.walk_errors += 1;
-                    stats.errors += 1;
+                    #[cfg(feature = "stats")]
+                    {
+                        stats.walk_errors += 1;
+                        stats.errors += 1;
+                    }
                     continue;
                 }
                 let st = st.assume_init();
@@ -441,9 +450,11 @@ impl Walker {
                 if mode == libc::S_IFDIR {
                     let child_span = files.join_path_span(dir_path, name_bytes);
                     let child = open_dir_at(dirfd, name.as_ptr(), child_span);
-                    match child {
-                        Ok(child) => self.stack.push(child),
-                        Err(_) => {
+                    if let Ok(child) = child {
+                        self.stack.push(child);
+                    } else {
+                        #[cfg(feature = "stats")]
+                        {
                             stats.walk_errors += 1;
                             stats.errors += 1;
                         }
@@ -463,7 +474,10 @@ impl Walker {
                 let file_span = files.join_path_span(dir_path, name_bytes);
                 let id = files.push_span(file_span, st.st_size as u64, dev_inode_from_stat(&st), 0);
                 file_ring.push_assume_capacity(id);
-                stats.files += 1;
+                #[cfg(feature = "stats")]
+                {
+                    stats.files += 1;
+                }
                 progressed = true;
             }
         }
@@ -600,8 +614,11 @@ impl ReaderStage {
                 let file = match File::open(path) {
                     Ok(file) => file,
                     Err(_) => {
-                        stats.open_errors += 1;
-                        stats.errors += 1;
+                        #[cfg(feature = "stats")]
+                        {
+                            stats.open_errors += 1;
+                            stats.errors += 1;
+                        }
                         continue;
                     }
                 };
@@ -620,9 +637,15 @@ impl ReaderStage {
             )? {
                 Some(chunk) => {
                     let new_bytes = u64::from(chunk.len.saturating_sub(chunk.prefix_len));
-                    stats.bytes_scanned = stats.bytes_scanned.saturating_add(new_bytes);
+                    #[cfg(feature = "stats")]
+                    {
+                        stats.bytes_scanned = stats.bytes_scanned.saturating_add(new_bytes);
+                    }
                     chunk_ring.push_assume_capacity(chunk);
-                    stats.chunks += 1;
+                    #[cfg(feature = "stats")]
+                    {
+                        stats.chunks += 1;
+                    }
                     progressed = true;
                 }
                 None => {
@@ -770,7 +793,10 @@ impl OutputStage {
                 rec.root_hint_start, rec.root_hint_end, rule
             )?;
             self.out.write_all(b"\n")?;
-            stats.findings += 1;
+            #[cfg(feature = "stats")]
+            {
+                stats.findings += 1;
+            }
             progressed = true;
         }
 
@@ -843,44 +869,37 @@ impl<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize>
         }
     }
 
-    /// Scans a path (file or directory) and returns summary stats.
-    ///
-    /// The pipeline reuses internal buffers and stage state across scans.
-    /// Capacity limits are hard bounds; the Unix path arena will panic if
-    /// exhausted rather than allocating.
-    pub fn scan_path(&mut self, path: &Path) -> io::Result<PipelineStats> {
-        let mut stats = PipelineStats::default();
-
+    fn scan_path_inner(&mut self, path: &Path, stats: &mut PipelineStats) -> io::Result<()> {
         self.files.clear();
         self.file_ring.clear();
         self.chunk_ring.clear();
         self.out_ring.clear();
-        self.walker.reset(path, &mut self.files, &mut stats)?;
+        self.walker.reset(path, &mut self.files, stats)?;
         self.reader.reset();
         self.scanner.reset();
 
         loop {
             let mut progressed = false;
 
-            progressed |=
-                self.output
-                    .pump(&self.engine, &self.files, &mut self.out_ring, &mut stats)?;
+            progressed |= self
+                .output
+                .pump(&self.engine, &self.files, &mut self.out_ring, stats)?;
             progressed |= self.scanner.pump(
                 &self.engine,
                 &mut self.chunk_ring,
                 &mut self.out_ring,
-                &mut stats,
+                stats,
             );
             progressed |= self.reader.pump(
                 &mut self.file_ring,
                 &mut self.chunk_ring,
                 &self.pool,
                 &self.files,
-                &mut stats,
+                stats,
             )?;
             progressed |= self
                 .walker
-                .pump(&mut self.files, &mut self.file_ring, &mut stats)?;
+                .pump(&mut self.files, &mut self.file_ring, stats)?;
 
             let done = self.walker.is_done()
                 && self.reader.is_idle()
@@ -908,7 +927,26 @@ impl<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize>
         }
 
         self.output.flush()?;
-        Ok(stats)
+        Ok(())
+    }
+
+    /// Scans a path (file or directory) and returns summary stats.
+    ///
+    /// The pipeline reuses internal buffers and stage state across scans.
+    /// Capacity limits are hard bounds; the Unix path arena will panic if
+    /// exhausted rather than allocating.
+    pub fn scan_path(&mut self, path: &Path) -> io::Result<PipelineStats> {
+        #[cfg(feature = "stats")]
+        {
+            let mut stats = PipelineStats::default();
+            self.scan_path_inner(path, &mut stats)?;
+            Ok(stats)
+        }
+        #[cfg(not(feature = "stats"))]
+        {
+            self.scan_path_inner(path, &mut ())?;
+            Ok(())
+        }
     }
 }
 
@@ -1100,6 +1138,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    #[cfg(feature = "stats")]
     fn pipeline_counts_walk_and_open_errors() -> io::Result<()> {
         let tmp = make_temp_dir("scanner_walk_err")?;
         let denied = tmp.path().join("denied");

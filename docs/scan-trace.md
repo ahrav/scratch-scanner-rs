@@ -227,15 +227,17 @@ Key structures:
 - `ScratchVec<T>`: fixed-capacity vector that never reallocates (panics on
   overflow to make caps explicit).
 - `DynamicBitSet`: records touched (rule, variant) pairs with O(1) reset.
-- `PackedPatterns`: contiguous confirm-any patterns for two-phase rules, used
-  in memmem checks without `Vec<Vec<u8>>` overhead.
+- `PackedPatterns`: contiguous confirm patterns (ANY/ALL) for two-phase, keyword,
+  and confirm-all gates, used in memmem checks without `Vec<Vec<u8>>` overhead.
 
 ### 3) run_rule_on_window (validation)
 
 What it does:
 
-- For Raw: optionally checks `must_contain`, then runs regex on the window.
-- For UTF-16: decodes the window to UTF-8, then runs the same checks.
+- For Raw: optionally checks `must_contain`, then `confirm_all`, then runs regex
+  on the window (keywords are a pre-regex gate as well).
+- For UTF-16: applies confirm/keyword gates on raw UTF-16 bytes, decodes to UTF-8,
+  then runs the same checks.
 - Emits `FindingRec` with span, root_hint, and provenance step id.
 
 Why:

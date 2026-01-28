@@ -24,7 +24,8 @@ aegis = { version = "0.9", features = ["pure-rust"] }
 [features]
 stdx-proptest = []
 kgram-gate = []
-b64-stats = []
+stats = []
+b64-stats = ["stats"]
 bench = []
 tiger-harness = []
 

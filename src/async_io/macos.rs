@@ -1,3 +1,5 @@
+#![cfg_attr(not(feature = "stats"), allow(unused_variables))]
+
 use super::*;
 use crate::{BufferPool, Chunk, Engine, FindingRec, ScanScratch};
 use std::fs::File;
@@ -217,15 +219,14 @@ impl MacosAioScanner {
     }
 
     /// Scans a path (file or directory) using POSIX AIO reads.
-    pub fn scan_path(&mut self, path: &Path) -> io::Result<PipelineStats> {
-        let mut stats = PipelineStats::default();
+    fn scan_path_inner(&mut self, path: &Path, stats: &mut PipelineStats) -> io::Result<()> {
         let engine = Arc::clone(&self.engine);
         self.files.clear();
         self.pending.clear();
-        self.walker.reset(path, &mut self.files, &mut stats)?;
+        self.walker.reset(path, &mut self.files, stats)?;
 
         while !self.walker.is_done() {
-            let Some(file_id) = self.walker.next_file(&mut self.files, &mut stats)? else {
+            let Some(file_id) = self.walker.next_file(&mut self.files, stats)? else {
                 continue;
             };
 
@@ -242,13 +243,16 @@ impl MacosAioScanner {
                 file_path,
                 file_size,
                 &mut self.out,
-                &mut stats,
+                stats,
             ) {
                 Ok(()) => {}
                 Err(err) => {
                     if err.kind() == io::ErrorKind::NotFound {
-                        stats.open_errors += 1;
-                        stats.errors += 1;
+                        #[cfg(feature = "stats")]
+                        {
+                            stats.open_errors += 1;
+                            stats.errors += 1;
+                        }
                         continue;
                     }
                     return Err(err);
@@ -257,7 +261,21 @@ impl MacosAioScanner {
         }
 
         self.out.flush()?;
-        Ok(stats)
+        Ok(())
+    }
+
+    pub fn scan_path(&mut self, path: &Path) -> io::Result<PipelineStats> {
+        #[cfg(feature = "stats")]
+        {
+            let mut stats = PipelineStats::default();
+            self.scan_path_inner(path, &mut stats)?;
+            Ok(stats)
+        }
+        #[cfg(not(feature = "stats"))]
+        {
+            self.scan_path_inner(path, &mut ())?;
+            Ok(())
+        }
     }
 }
 
@@ -280,8 +298,11 @@ fn scan_file(
 
     while let Some(chunk) = reader.next_chunk(pool)? {
         let payload_len = chunk.len.saturating_sub(chunk.prefix_len) as u64;
-        stats.bytes_scanned = stats.bytes_scanned.saturating_add(payload_len);
-        stats.chunks += 1;
+        #[cfg(feature = "stats")]
+        {
+            stats.bytes_scanned = stats.bytes_scanned.saturating_add(payload_len);
+            stats.chunks += 1;
+        }
 
         engine.scan_chunk_into(chunk.data(), chunk.file_id, chunk.base_offset, scratch);
         let new_bytes_start = chunk.base_offset + chunk.prefix_len as u64;
@@ -297,7 +318,10 @@ fn scan_file(
                 rec.root_hint_start, rec.root_hint_end, rule
             )?;
             out.write_all(b"\n")?;
-            stats.findings += 1;
+            #[cfg(feature = "stats")]
+            {
+                stats.findings += 1;
+            }
         }
     }
 

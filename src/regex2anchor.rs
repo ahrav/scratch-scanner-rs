@@ -1208,8 +1208,10 @@ fn hir_matches_empty(hir: &Hir) -> bool {
 /// - "foo" and "bar" are mandatory islands, so they are safe for confirm_all.
 ///
 /// confirm_all is a cheap AND filter used after the OR anchor hit; it reduces
-/// false candidates without changing soundness. This stays out of
-/// derive_anchors_from_pattern to preserve the existing anchor contract.
+/// false candidates without changing soundness. The engine checks the longest
+/// literal first, then requires all remaining literals inside the same window.
+/// This stays out of derive_anchors_from_pattern to preserve the existing
+/// anchor contract.
 fn collect_confirm_all_literals(hir: &Hir, cfg: &AnchorDeriveConfig) -> Vec<Vec<u8>> {
     fn peel_capture(mut h: &Hir) -> &Hir {
         loop {
@@ -1726,6 +1728,40 @@ mod tests {
                     has_foo || has_bar,
                     "Should extract 'foo' or 'bar' from 'foo.*bar'"
                 );
+            }
+        }
+
+        #[test]
+        fn test_compile_trigger_plan_confirm_all_islands() {
+            let cfg = AnchorDeriveConfig {
+                min_anchor_len: 3,
+                ..Default::default()
+            };
+
+            let plan = compile_trigger_plan(r"foo\d+bar", &cfg).unwrap();
+            match plan {
+                TriggerPlan::Anchored {
+                    anchors,
+                    confirm_all,
+                } => {
+                    for a in &anchors {
+                        assert!(
+                            !confirm_all.contains(a),
+                            "confirm_all should not duplicate anchors"
+                        );
+                    }
+
+                    let has_foo = anchors
+                        .iter()
+                        .chain(confirm_all.iter())
+                        .any(|a| a.as_slice() == b"foo");
+                    let has_bar = anchors
+                        .iter()
+                        .chain(confirm_all.iter())
+                        .any(|a| a.as_slice() == b"bar");
+                    assert!(has_foo && has_bar, "mandatory islands must be preserved");
+                }
+                other => panic!("expected anchored plan, got {other:?}"),
             }
         }
 
