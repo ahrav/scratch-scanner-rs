@@ -3,33 +3,26 @@
 //! The anchor scanner uses a full Aho-Corasick pass to find every anchor hit
 //! (overlapping matches required). Aho-Corasick's built-in prefilters are not
 //! available for overlapping searches, so we implement a separate, sound
-#![cfg_attr(not(feature = "stats"), allow(unused_variables))]
 //! prefilter layer that can cheaply skip large buffers when anchors are
 //! implausible.
 //!
-//! Prefilters are **sound**: they must never skip a buffer that contains an
-//! anchor. We achieve this by building bytesets that are a *hitting set* for the
-//! pattern universe: every pattern contains at least one byte in the set.
+//! # Invariants
+//! - Prefilters are sound: they must never skip a buffer that contains an anchor.
+//! - Every pattern contributes at least one byte to the byteset (a hitting set).
+//! - Candidate windows must fully cover all possible matches of assigned patterns.
 //!
-//! Two prefilter families are supported:
+//! # Algorithm
+//! - Build a byteset from the pattern universe.
+//! - For each byte in the set, record conservative window offsets and tails.
+//! - At scan time, convert byte hits into windows and merge overlaps.
+//! - Disable prefiltering when a sample is too dense to avoid overlap storms.
 //!
-//! - **Start-byte prefilter**: uses the distinct first byte of each pattern.
-//!   It has zero rewind (offset is always 0) and a predictable window span.
-//! - **Rare-byte prefilter**: picks a small set of rare bytes and assigns each
-//!   pattern to exactly one byte. For each byte we store:
-//!   - `offsets[b]`: the maximum offset of `b` across assigned patterns
-//!   - `tails[b]`: the maximum tail length (`len - min_offset`) across assigned
-//!     patterns
-//!
-//! When scanning, every occurrence of a byte in the set yields a candidate
-//! window `[pos - offsets[b], pos + tails[b])`. The union of these windows is
-//! guaranteed to contain every possible match of any assigned pattern. Windows
-//! are merged to avoid duplicate scans.
-//!
-//! A light **density gate** samples the head of the buffer and disables the
-//! prefilter when the hit rate is too high, preventing overlap storms on
-//! code-like inputs. This makes the prefilter adaptive without requiring a
-//! perfect global frequency model.
+//! # Design Notes
+//! - Two families are supported: start-byte (cheap, predictable) and rare-byte
+//!   (smaller byteset, better selectivity).
+//! - When prefiltering cannot be kept small or selective, we fall back to full
+//!   scanning instead of risking false negatives.
+#![cfg_attr(not(feature = "stats"), allow(unused_variables))]
 
 use super::helpers::merge_ranges_with_gap_sorted;
 use super::SpanU32;
@@ -78,6 +71,10 @@ enum PrefilterKind {
 }
 
 /// A compact set of bytes with O(1) membership checks.
+///
+/// # Invariants
+/// - `table[b] != 0` if and only if `b` is present in `bytes`.
+/// - `bytes` is kept sorted after `finalize()`.
 #[derive(Clone, Debug)]
 struct ByteSet {
     table: [u8; 256],
@@ -85,6 +82,7 @@ struct ByteSet {
 }
 
 impl ByteSet {
+    /// Creates an empty byteset.
     fn empty() -> Self {
         Self {
             table: [0u8; 256],
@@ -92,6 +90,7 @@ impl ByteSet {
         }
     }
 
+    /// Inserts a byte if it is not already present.
     fn insert(&mut self, b: u8) {
         let idx = b as usize;
         if self.table[idx] == 0 {
@@ -100,22 +99,27 @@ impl ByteSet {
         }
     }
 
+    /// Returns true when the byte is present in the set.
     fn contains(&self, b: u8) -> bool {
         self.table[b as usize] != 0
     }
 
+    /// Returns the number of distinct bytes in the set.
     fn len(&self) -> usize {
         self.bytes.len()
     }
 
+    /// Returns true when the set is empty.
     fn is_empty(&self) -> bool {
         self.bytes.is_empty()
     }
 
+    /// Sorts the byte list for stable iteration and reproducibility.
     fn finalize(&mut self) {
         self.bytes.sort_unstable();
     }
 
+    /// Counts how many bytes in `hay` are members of this set.
     fn count_hits(&self, hay: &[u8]) -> usize {
         let mut hits = 0usize;
         for &b in hay {
@@ -127,6 +131,11 @@ impl ByteSet {
     }
 }
 
+/// A byteset-based prefilter with conservative window metadata.
+///
+/// # Invariants
+/// - `offsets[b]` and `tails[b]` are zero for bytes not in `set`.
+/// - `max_span` is the maximum of `offsets[b] + tails[b]` for bytes in `set`.
 #[derive(Clone, Debug)]
 pub(super) struct ByteSetPrefilter {
     kind: PrefilterKind,
@@ -140,6 +149,9 @@ pub(super) struct ByteSetPrefilter {
 }
 
 impl ByteSetPrefilter {
+    /// Estimates the hit rate using a fixed-size prefix sample.
+    ///
+    /// The sample is intentionally small to keep the gate cheap.
     fn sample_hit_rate(&self, hay: &[u8]) -> f32 {
         let sample_len = hay.len().min(PREFILTER_SAMPLE_BYTES);
         if sample_len == 0 {
@@ -149,6 +161,15 @@ impl ByteSetPrefilter {
         hits as f32 / sample_len as f32
     }
 
+    /// Collects candidate windows that must include any possible match.
+    ///
+    /// # Effects
+    /// - Clears and fills `out` with merged windows when a prefilter is used.
+    ///
+    /// # Returns
+    /// - `Windows` when `out` contains candidate spans.
+    /// - `NoCandidates` when the byteset never hit.
+    /// - `FullScan` when the prefilter is disabled for safety or density.
     pub(super) fn collect_windows(
         &self,
         hay: &[u8],
@@ -164,6 +185,7 @@ impl ByteSetPrefilter {
                 continue;
             }
             if out.len() >= out.capacity() {
+                // Too many windows to be useful; fall back to full scan.
                 out.clear();
                 return PrefilterOutcome::FullScan;
             }
@@ -196,9 +218,13 @@ impl ByteSetPrefilter {
     }
 }
 
+/// Result of collecting prefilter windows.
 pub(super) enum PrefilterOutcome {
+    /// No byteset hits were observed; skip the buffer safely.
     NoCandidates,
+    /// Candidate windows are available in the output buffer.
     Windows,
+    /// Prefiltering is disabled; caller should scan the full buffer.
     FullScan,
 }
 
@@ -219,6 +245,9 @@ pub(super) struct AnchorPrefilterStatsInternal {
 pub(super) type AnchorPrefilterStatsInternal = ();
 
 /// The compiled prefilter plan for a single anchor universe.
+///
+/// The plan may include both start-byte and rare-byte prefilters; selection is
+/// made at runtime based on sample density.
 #[derive(Clone, Debug)]
 pub(super) struct AnchorPrefilterPlan {
     start: Option<ByteSetPrefilter>,
@@ -228,6 +257,10 @@ pub(super) struct AnchorPrefilterPlan {
 }
 
 impl AnchorPrefilterPlan {
+    /// Builds a prefilter plan from the full pattern universe.
+    ///
+    /// # Returns
+    /// - A plan with zero, one, or two prefilters depending on eligibility.
     pub(super) fn build(patterns: &[Vec<u8>]) -> Self {
         #[cfg(feature = "stats")]
         {
@@ -280,6 +313,7 @@ impl AnchorPrefilterPlan {
     }
 }
 
+/// Per-pattern candidate byte data used by the rare-byte assignment.
 #[derive(Clone, Copy, Debug)]
 struct PatternByteInfo {
     byte: u8,
@@ -290,6 +324,9 @@ struct PatternByteInfo {
     score: u32,
 }
 
+/// Builds a start-byte prefilter from the first byte of each pattern.
+///
+/// Returns `None` when any pattern is empty or when no bytes are available.
 fn build_start_prefilter(
     patterns: &[Vec<u8>],
     stats: &mut AnchorPrefilterStatsInternal,
@@ -340,6 +377,11 @@ fn build_start_prefilter(
     })
 }
 
+/// Builds a rare-byte prefilter by assigning one byte per pattern.
+///
+/// The assignment is greedy and bounded by `RARE_MAX_BYTES_*`. If the byteset
+/// would grow too large or the resulting windows are too wide, this returns
+/// `None` and disables the rare prefilter.
 fn build_rare_prefilter(
     patterns: &[Vec<u8>],
     stats: &mut AnchorPrefilterStatsInternal,
@@ -500,6 +542,11 @@ fn build_rare_prefilter(
     })
 }
 
+/// Greedily assigns one candidate byte per pattern under a size budget.
+///
+/// # Effects
+/// - Clears and repopulates `set` and `assignments`.
+/// - Returns `false` if the byteset would exceed `max_bytes`.
 fn try_assign(
     pattern_info: &[Vec<PatternByteInfo>],
     order: &[usize],
