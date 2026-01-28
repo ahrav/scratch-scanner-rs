@@ -65,7 +65,7 @@ fn inject_token(buf: &mut [u8], token: &[u8], stride: usize) {
     if token.is_empty() || stride == 0 || buf.len() < token.len() {
         return;
     }
-    let mut i = 0usize;
+    let mut i = 1usize;
     while i + token.len() <= buf.len() {
         buf[i..i + token.len()].copy_from_slice(token);
         i = i.saturating_add(stride);
@@ -85,6 +85,14 @@ fn make_datasets() -> Vec<Dataset> {
     inject_token(&mut ascii_hits, aws, 4 * 1024);
     inject_token(&mut ascii_hits, ghp, 16 * 1024);
 
+    let mut utf16le_hits = make_utf16_text(ENGINE_BUF_LEN, 0x1111_2222_3333_4444, false);
+    inject_token_utf16(&mut utf16le_hits, aws, 4 * 1024, false);
+    inject_token_utf16(&mut utf16le_hits, ghp, 16 * 1024, false);
+
+    let mut utf16be_hits = make_utf16_text(ENGINE_BUF_LEN, 0x5555_6666_7777_8888, true);
+    inject_token_utf16(&mut utf16be_hits, aws, 4 * 1024, true);
+    inject_token_utf16(&mut utf16be_hits, ghp, 16 * 1024, true);
+
     let encoded = B64_STD.encode(aws);
     let mut b64_hits = Vec::with_capacity(ENGINE_BUF_LEN);
     while b64_hits.len() + encoded.len() < ENGINE_BUF_LEN {
@@ -102,10 +110,81 @@ fn make_datasets() -> Vec<Dataset> {
             buf: ascii_hits,
         },
         Dataset {
+            name: "utf16le_hits",
+            buf: utf16le_hits,
+        },
+        Dataset {
+            name: "utf16be_hits",
+            buf: utf16be_hits,
+        },
+        Dataset {
             name: "base64_hits",
             buf: b64_hits,
         },
     ]
+}
+
+fn encode_utf16_bytes(input: &[u8], be: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len() * 2);
+    for &b in input {
+        if be {
+            out.push(0);
+            out.push(b);
+        } else {
+            out.push(b);
+            out.push(0);
+        }
+    }
+    out
+}
+
+fn make_utf16_text(len: usize, seed: u64, be: bool) -> Vec<u8> {
+    let mut out = vec![0u8; len];
+    let mut rng = XorShift64::new(seed);
+    let code_units = len / 2;
+    for i in 0..code_units {
+        let v = (rng.next_u64() & 0xff) as u8;
+        let letter = b'a' + (v % 26);
+        let idx = i * 2;
+        if be {
+            out[idx] = 0;
+            out[idx + 1] = letter;
+        } else {
+            out[idx] = letter;
+            out[idx + 1] = 0;
+        }
+    }
+
+    if out.len() >= 2 {
+        if be {
+            out[0] = 0xFE;
+            out[1] = 0xFF;
+        } else {
+            out[0] = 0xFF;
+            out[1] = 0xFE;
+        }
+    }
+
+    out
+}
+
+fn inject_token_utf16(buf: &mut [u8], token: &[u8], stride_bytes: usize, be: bool) {
+    let stride_units = (stride_bytes / 2).max(1);
+    let encoded = encode_utf16_bytes(token, be);
+    if encoded.is_empty() || buf.len() < encoded.len() {
+        return;
+    }
+
+    let mut i = 0usize;
+    let max_units = buf.len() / 2;
+    while i + token.len() <= max_units {
+        let byte_idx = i * 2;
+        if byte_idx + encoded.len() > buf.len() {
+            break;
+        }
+        buf[byte_idx..byte_idx + encoded.len()].copy_from_slice(&encoded);
+        i = i.saturating_add(stride_units);
+    }
 }
 
 fn bench_engine_scan(c: &mut Criterion) {

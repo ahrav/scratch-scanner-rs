@@ -97,6 +97,13 @@ targets = pat_targets[pat_offsets[pid] .. pat_offsets[pid + 1]]
 where `pid` is the Aho-Corasick pattern id and each `Target` is a packed
 `(rule_id, variant)` entry for fast fanout.
 
+Selection note:
+
+- The engine keeps two anchor automatons: raw-only and combined (raw + UTF-16).
+- If the scanned slice has no NUL bytes, UTF-16 variants cannot match, so the
+  raw-only automaton is used. Otherwise the combined automaton is used to keep
+  a single pass on NUL-heavy buffers.
+
 ## Mermaid diagrams
 
 ### Flow (single chunk, contained secret)
@@ -266,7 +273,8 @@ Key structures:
 
 - `ScratchVec<SpanU32>`: fixed-capacity span list for candidate encoded regions.
 - `GateScratch`: keeps a small tail buffer for streaming gate checks across
-  decode chunk boundaries.
+  decode chunk boundaries. Anchor selection for the gate is based on the
+  tail+chunk window so UTF-16 matches that straddle boundaries are not missed.
 - `DecodeSlab`: pre-allocated contiguous buffer for decoded output slices.
 - `FixedSet128`: generation-based hash set for deduping decoded buffers.
 - `hash128`: 128-bit AEGIS tag used to avoid adversarial collisions.

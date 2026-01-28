@@ -192,6 +192,12 @@ URL-percent or Base64 spans. These transforms are expensive, so they are gated:
   anchors to cheaply reject spans that cannot possibly decode to an anchor. The
   decoded-space gate still runs afterward to preserve correctness.
 
+Selection detail:
+- The decoded-space gate chooses between a raw-only and a combined (raw + UTF-16)
+  anchor automaton based on whether the decoded window contains any NUL bytes.
+  This avoids UTF-16 overhead on NUL-free data while keeping a single pass on
+  NUL-heavy buffers.
+
 See `docs/transform-chain.md` for diagrams and the gating sequence.
 
 ## Keyword + Entropy Gates

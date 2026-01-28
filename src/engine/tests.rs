@@ -417,25 +417,10 @@ fn reference_scan_keys(engine: &Engine, rules: &[RuleSpec], buf: &[u8]) -> HashS
                 }
 
                 if tc.gate == Gate::AnchorsInDecoded {
-                    let mut hit = engine.ac_anchors_raw.is_match(&decoded);
-                    if engine.tuning.scan_utf16_variants
-                        && !hit
-                        && memchr::memchr(0, &decoded).is_some()
-                    {
-                        if let Some(ac) = &engine.ac_anchors_utf16le {
-                            if ac.is_match(&decoded) {
-                                hit = true;
-                            }
-                        }
-                        if !hit {
-                            if let Some(ac) = &engine.ac_anchors_utf16be {
-                                if ac.is_match(&decoded) {
-                                    hit = true;
-                                }
-                            }
-                        }
-                    }
-                    if !hit {
+                    let anchors = engine
+                        .anchors
+                        .select(&decoded, engine.tuning.scan_utf16_variants);
+                    if !anchors.ac.is_match(&decoded) {
                         continue;
                     }
                 }
@@ -1581,6 +1566,59 @@ fn tiger_boundary_base64_padding_split() {
     if let Err(msg) = check_oracle_covered(&engine, &oracle, &chunked) {
         panic!("base64 padding split failed: {}", msg);
     }
+}
+
+#[test]
+fn base64_gate_utf16be_anchor_straddles_stream_boundary() {
+    // The base64 stream decoder flushes output in ~1KB chunks (1020 bytes),
+    // so we place a UTF-16BE anchor so its final byte lands in a 1-byte tail
+    // chunk. The gate must inspect tail+chunk to see the NULs and match.
+    let rule = RuleSpec {
+        name: "utf16be-gate-boundary",
+        anchors: &[b"TOK"],
+        radius: 0,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        re: Regex::new("TOK").unwrap(),
+    };
+
+    let tc = TransformConfig {
+        id: TransformId::Base64,
+        mode: TransformMode::Always,
+        gate: Gate::AnchorsInDecoded,
+        min_len: 8,
+        max_spans_per_buffer: 8,
+        max_encoded_len: 8 * 1024,
+        max_decoded_bytes: 8 * 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    };
+
+    let mut tuning = demo_tuning();
+    tuning.max_total_decode_output_bytes = tuning.max_total_decode_output_bytes.max(8 * 1024);
+    tuning.scan_utf16_variants = true;
+
+    let engine =
+        Engine::new_with_anchor_policy(vec![rule], vec![tc], tuning, AnchorPolicy::ManualOnly);
+
+    let utf16 = utf16be_bytes(b"TOK");
+    let flush_len = 1020usize; // stream_decode_base64 flush threshold
+    let prefix_len = flush_len - (utf16.len().saturating_sub(1));
+
+    let mut decoded = vec![b'A'; prefix_len];
+    decoded.extend_from_slice(&utf16);
+    assert_eq!(decoded.len(), flush_len + 1);
+
+    let encoded = b64_encode(&decoded).into_bytes();
+    let hits = scan_chunk_findings(&engine, &encoded);
+
+    assert!(
+        hits.iter().any(|h| h.rule == "utf16be-gate-boundary"),
+        "expected utf16be match to survive base64 gate boundary"
+    );
 }
 
 #[test]
