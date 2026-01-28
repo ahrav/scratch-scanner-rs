@@ -1,3 +1,23 @@
+//! Core scanning engine: rule compilation, anchor indexes, and scan execution.
+//!
+//! # Pipeline overview
+//! 1. Compile rules into anchor patterns and fast gates (keywords/confirm-all).
+//! 2. Scan input buffers for anchor hits and build candidate windows.
+//! 3. Run validators, gates, and regexes inside those windows.
+//! 4. Optionally decode transform spans into derived buffers and repeat (BFS).
+//!
+//! # Budgets and invariants
+//! - All per-scan work is bounded by tuning limits: windows, hits, findings,
+//!   decode output bytes, transform depth, and work items.
+//! - Scratch buffers are reused across scans and must be reset between scans.
+//! - `SpanU32` and `BufRef::Slab` ranges are only valid until the next reset.
+//! - UTF-16 anchors always contain at least one NUL byte, enabling a raw-only
+//!   fast path for NUL-free buffers.
+//!
+//! # Trade-offs
+//! The engine favors predictable cost over perfect precision: span/anchor
+//! selection is permissive, while validation and gates enforce correctness.
+
 use crate::api::*;
 use crate::b64_yara_gate::{Base64YaraGate, Base64YaraGateConfig, PaddingPolicy, WhitespacePolicy};
 use crate::regex2anchor::{
@@ -286,17 +306,12 @@ impl SpanU32 {
     }
 }
 
-/// Accumulates anchor hit windows with optional coalesced fallback.
+/// Accumulates anchor hit windows for a single (rule, variant).
 ///
-/// When hit counts exceed configured limits, this switches to a single merged
-/// window to cap memory growth.
-/// Accumulates raw anchor hit windows for a single (rule, variant).
-///
-/// This starts as a simple append-only list of windows. If the number of hits
-/// exceeds a configured cap, it switches to a single "coalesced" window that
-/// covers the union of all hits seen so far. That fallback is deliberately
-/// conservative: it may make the window larger than necessary, but it prevents
-/// unbounded memory growth and guarantees we still scan any true matches.
+/// Starts as an append-only list. If the hit count exceeds the configured cap,
+/// it switches to a single "coalesced" window that covers the union of all hits
+/// seen so far. The fallback is conservative (may over-expand) but guarantees
+/// correctness while bounding memory growth.
 struct HitAccumulator {
     windows: ScratchVec<SpanU32>,
     coalesced: Option<SpanU32>,
@@ -554,7 +569,8 @@ impl EntropyScratch {
 ///
 /// This is the main allocation amortization vehicle: it owns buffers for window
 /// accumulation, decode slabs, and work queues. It is not thread-safe and should
-/// be used by a single worker at a time.
+/// be used by a single worker at a time. Scratch contents are only valid until
+/// the next call to `reset_for_scan` or any draining/mutation method.
 pub struct ScanScratch {
     /// Per-chunk finding records awaiting materialization.
     ///
@@ -891,6 +907,7 @@ impl ScanScratch {
 /// Reference to a buffer being scanned.
 ///
 /// `Root` points to the input chunk. `Slab(range)` points into `DecodeSlab`.
+/// Slab ranges are only valid until the slab is reset or truncated.
 #[derive(Default)]
 enum BufRef {
     #[default]
@@ -901,7 +918,7 @@ enum BufRef {
 /// Work item in the transform/scan queue.
 ///
 /// Carries the decode provenance (StepId) and a root-span hint for reporting.
-/// Depth enforces the transform recursion limit.
+/// Depth enforces the transform recursion limit and keeps traversal iterative.
 #[derive(Default)]
 struct WorkItem {
     buf: BufRef,
@@ -915,6 +932,8 @@ struct WorkItem {
 // --------------------------
 
 /// Compiled scanning engine with anchor patterns, rules, and transforms.
+///
+/// Build once, then reuse with per-scan scratch buffers to avoid allocations.
 pub struct Engine {
     rules: Vec<RuleCompiled>,
     transforms: Vec<TransformConfig>,
@@ -2144,6 +2163,11 @@ impl Engine {
         }
     }
 
+    /// Decode into the slab while requiring at least one decoded-anchor hit.
+    ///
+    /// Returns the slab range only if decoding succeeds, stays within budgets,
+    /// and an anchor match is observed in the decoded stream. On failure or
+    /// no-hit, the slab is rolled back to its pre-call length.
     fn decode_stream_gated_into_slab(
         &self,
         tc: &TransformConfig,

@@ -11,5 +11,6 @@ pub mod ring_buffer;
 pub use bitset::{words_for_bits, BitSet, BitSetIterator, DynamicBitSet, DynamicBitSetIterator};
 pub use fixed_set::FixedSet128;
 pub use fixed_vec::FixedVec;
+pub use queue::{Queue, QueueLink, QueueNode};
 pub use released_set::ReleasedSet;
 pub use ring_buffer::RingBuffer;

@@ -1,7 +1,20 @@
 //! Transform span detection and streaming decode helpers.
 //!
-//! Span finders are intentionally permissive: they prioritize recall, while
-//! downstream gating and budgets bound cost and enforce correctness.
+//! # Overview
+//! This module implements the "transform" stage of the scanner for URL-percent
+//! and Base64 payloads. Each transform has two pieces:
+//! - a permissive span finder that favors recall over strict validation
+//! - a streaming decoder that enforces correctness with bounded memory
+//!
+//! # Invariants and guarantees
+//! - Span finders are single-pass and capped by `max_len` and `max_spans`.
+//! - Spans are byte ranges into the original buffer, produced in ascending order.
+//! - Decoders do not allocate based on input size; they emit chunks via callbacks.
+//!
+//! # Trade-offs
+//! These components intentionally trade precision for cheap scanning. Strict
+//! validation happens in decode/gating, while span finders bias toward not
+//! missing possible payloads.
 
 use super::SpanU32;
 use crate::api::{TransformConfig, TransformId};
@@ -13,6 +26,7 @@ use std::ops::{ControlFlow, Range};
 // Transform: URL percent
 // --------------------------
 
+/// Internal error used to signal output-size violations in tests.
 #[derive(Debug)]
 enum UrlDecodeError {
     OutputTooLarge,
@@ -22,6 +36,7 @@ fn is_hex(b: u8) -> bool {
     b.is_ascii_hexdigit()
 }
 
+// Caller must check `is_hex` first; non-hex bytes map to 0.
 fn hex_val(b: u8) -> u8 {
     match b {
         b'0'..=b'9' => b - b'0',
@@ -31,6 +46,7 @@ fn hex_val(b: u8) -> u8 {
     }
 }
 
+// Byte-class table used by both URL and Base64 scanners.
 const URLISH: u8 = 1 << 0;
 const B64_CHAR: u8 = 1 << 1;
 const B64_WS: u8 = 1 << 2;
@@ -105,6 +121,10 @@ fn is_urlish(b: u8) -> bool {
 }
 
 /// Target for span collection, allowing reuse of `Vec` or `ScratchVec`.
+///
+/// Spans are byte ranges into the input buffer. Implementations are expected
+/// to preserve the order they are pushed and tolerate being cleared and reused
+/// across scans.
 pub(super) trait SpanSink {
     fn clear(&mut self);
     fn len(&self) -> usize;
@@ -157,7 +177,8 @@ impl SpanSink for ScratchVec<SpanU32> {
 ///
 /// Spans are drawn from URL-ish runs that contain at least one escape (or `+`
 /// when `plus_to_space` is enabled). The run is bounded by `max_len`, and runs
-/// shorter than `min_len` are discarded.
+/// shorter than `min_len` are discarded. `min_len`/`max_len` are measured in
+/// input bytes, not decoded output.
 pub(super) fn find_url_spans_into(
     hay: &[u8],
     min_len: usize,
@@ -216,8 +237,9 @@ pub(super) fn find_url_spans_into(
 /// Streaming URL-percent decoder.
 ///
 /// Decodes `%HH` escapes and optionally converts `+` to space. Invalid or
-/// incomplete escapes are passed through verbatim. The `on_bytes` callback may
-/// stop decoding early by returning `ControlFlow::Break(())`.
+/// incomplete escapes are passed through verbatim. Output is emitted in
+/// bounded chunks (1KB scratch buffer), and the `on_bytes` callback may stop
+/// decoding early by returning `ControlFlow::Break(())`.
 fn stream_decode_url_percent(
     input: &[u8],
     plus_to_space: bool,
@@ -260,6 +282,7 @@ fn stream_decode_url_percent(
         out[n] = decoded;
         n += 1;
 
+        // Leave headroom so we can always write the next decoded byte.
         if n >= out.len() - 4 {
             match flush_buf(&mut out, &mut n, &mut on_bytes) {
                 ControlFlow::Continue(()) => {}
@@ -302,6 +325,7 @@ fn decode_url_percent_to_vec(
 // Transform: Base64 (urlsafe + std alph, ignores whitespace)
 // --------------------------
 
+/// Internal error used to signal decode failures in tests.
 #[derive(Debug)]
 enum Base64DecodeError {
     InvalidByte(u8),
@@ -326,8 +350,11 @@ enum Base64DecodeError {
 /// - Spans end at the last base64 byte; trailing whitespace is trimmed.
 /// - Runs are split at `max_len` to bound worst-case work.
 ///
-/// The scan is intentionally permissive and relies on downstream decode gates
-/// for strict validation.
+/// Notes:
+/// - `min_chars` counts base64 alphabet characters only; whitespace does not
+///   contribute to the minimum.
+/// - The scan is intentionally permissive and relies on downstream decode gates
+///   for strict validation.
 pub(super) fn find_base64_spans_into(
     hay: &[u8],
     min_chars: usize,
@@ -416,8 +443,9 @@ pub(super) fn find_base64_spans_into(
 /// Streaming base64 decoder that accepts std + URL-safe alphabets.
 ///
 /// Whitespace is ignored. Padding is validated, but an unpadded tail
-/// (2 or 3 bytes in the final quantum) is accepted. The `on_bytes` callback
-/// may stop decoding early by returning `ControlFlow::Break(())`.
+/// (2 or 3 bytes in the final quantum) is accepted. Output is emitted in
+/// bounded chunks (1KB scratch buffer). The `on_bytes` callback may stop
+/// decoding early by returning `ControlFlow::Break(())`.
 fn stream_decode_base64(
     input: &[u8],
     mut on_bytes: impl FnMut(&[u8]) -> ControlFlow<()>,
@@ -465,6 +493,7 @@ fn stream_decode_base64(
         }
         .ok_or(Base64DecodeError::InvalidByte(b))?;
 
+        // Once padding is seen, only trailing whitespace is allowed.
         if seen_pad {
             return Err(Base64DecodeError::InvalidPadding);
         }
@@ -515,6 +544,7 @@ fn stream_decode_base64(
 
         qn = 0;
 
+        // Leave headroom so a full quantum (3 bytes) always fits.
         if out_len >= out.len() - 4 {
             match flush_buf(&mut out, &mut out_len, &mut on_bytes) {
                 ControlFlow::Continue(()) => {}
@@ -523,7 +553,7 @@ fn stream_decode_base64(
         }
     }
 
-    // Handle unpadded tail
+    // Handle unpadded tail.
     if qn == 1 {
         return Err(Base64DecodeError::TruncatedQuantum);
     } else if qn == 2 {
@@ -579,6 +609,7 @@ fn decode_base64_to_vec(input: &[u8], max_out: usize) -> Result<Vec<u8>, Base64D
 // Transform dispatch
 // --------------------------
 
+/// Quick prefilter to avoid running span scans when no trigger bytes are present.
 pub(super) fn transform_quick_trigger(tc: &TransformConfig, buf: &[u8]) -> bool {
     match tc.id {
         TransformId::UrlPercent => {
@@ -594,6 +625,7 @@ pub(super) fn transform_quick_trigger(tc: &TransformConfig, buf: &[u8]) -> bool 
     }
 }
 
+/// Dispatch to the appropriate span finder for the configured transform.
 pub(super) fn find_spans_into(tc: &TransformConfig, buf: &[u8], out: &mut impl SpanSink) {
     match tc.id {
         TransformId::UrlPercent => find_url_spans_into(
@@ -615,6 +647,7 @@ pub(super) fn find_spans_into(tc: &TransformConfig, buf: &[u8], out: &mut impl S
     }
 }
 
+/// Dispatch to the appropriate streaming decoder, erasing the error type.
 pub(super) fn stream_decode(
     tc: &TransformConfig,
     input: &[u8],
@@ -628,6 +661,7 @@ pub(super) fn stream_decode(
     }
 }
 
+/// Decode into a `Vec` with output-size protection (tests only).
 #[cfg(test)]
 pub(super) fn decode_to_vec(
     tc: &TransformConfig,

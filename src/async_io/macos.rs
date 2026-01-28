@@ -1,3 +1,19 @@
+//! macOS async I/O scanning using POSIX AIO.
+//!
+//! # Overview
+//! This module implements a single-threaded scanner that overlaps read-ahead
+//! with scanning using a fixed-depth queue of POSIX AIO requests. Overlap bytes
+//! are stitched into each buffer so the scanner always sees a contiguous
+//! prefix+payload slice without redundant rescans.
+//!
+//! # Invariants and trade-offs
+//! - Queue depth must be >= 2 to overlap read/scan.
+//! - Buffers are fixed-size; `payload_off + chunk_size` must fit in
+//!   `BUFFER_LEN_MAX`.
+//! - Requests are emitted in file order even if completions arrive out of order.
+//! - AIO is best-effort; transient submit errors are retried, and EINTR is
+//!   handled by retrying `aio_suspend`.
+
 use super::*;
 use crate::{BufferPool, Chunk, Engine, FindingRec, ScanScratch};
 use std::fs::File;
@@ -143,6 +159,9 @@ mod aio {
 /// The scanner stays single-threaded and uses a fixed read-ahead depth
 /// to overlap IO and scanning without unbounded buffering. Per-file reader
 /// buffers are allocated once and reused across files.
+///
+/// This wrapper owns its reader, buffers, and scratch state; reuse the same
+/// instance for multiple scans to avoid allocations.
 pub struct MacosAioScanner {
     engine: Arc<Engine>,
     config: AsyncIoConfig,
@@ -267,6 +286,9 @@ impl MacosAioScanner {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Scan a single file using POSIX AIO reads.
+///
+/// Keeps the AIO queue filled while scanning, preserving ordering and overlap.
 // Keep scan dependencies explicit so the hot path has no hidden state
 // and the call site shows all mutable resources.
 fn scan_file(
@@ -317,6 +339,9 @@ enum AioSlotState {
 }
 
 /// One in-flight AIO request slot.
+///
+/// The buffer handle is retained until the request completes so the kernel
+/// never reads into freed memory.
 struct AioSlot {
     cb: libc::aiocb,
     state: AioSlotState,

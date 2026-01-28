@@ -5,6 +5,13 @@
 //! - macOS POSIX AIO with read-ahead and overlap preservation.
 //!
 //! Both backends keep the scan loop single-threaded while overlapping IO.
+//!
+//! # Invariants and budgets
+//! - `chunk_size` is aligned and sized to leave room for overlap in
+//!   `BUFFER_LEN_MAX`.
+//! - Queue depth must be >= 2 to overlap read/scan without stalling.
+//! - Unix path storage uses a fixed-size arena; overruns are treated as
+//!   configuration errors to keep allocation predictable.
 
 use crate::pipeline::PipelineStats;
 use crate::scratch_memory::ScratchVec;
@@ -56,13 +63,17 @@ const WALKER_STACK_CAP: usize = 1024;
 #[derive(Clone, Debug)]
 pub struct AsyncIoConfig {
     /// Bytes read per chunk (excluding overlap). Use 0 for the maximum size.
+    ///
+    /// A value of 0 is resolved to the largest aligned chunk that fits after
+    /// reserving overlap bytes.
     pub chunk_size: usize,
     /// Maximum number of files to scan from a path walk.
     pub max_files: usize,
     /// Total byte capacity reserved for path storage (0 = auto).
     ///
     /// On Unix this is the fixed-size path arena budget; on non-Unix it is
-    /// ignored. Exceeding the arena is treated as a configuration bug.
+    /// ignored. Exceeding the arena is treated as a configuration bug and will
+    /// fail fast rather than allocate.
     pub path_bytes_cap: usize,
     /// Submission queue depth (io_uring) / read-ahead depth (macOS AIO).
     pub queue_depth: u32,
@@ -373,6 +384,7 @@ impl Drop for DirState {
 ///
 /// Paths are stored in the `FileTable` arena and assembled with `openat` +
 /// `readdir`, so the hot path stays allocation-free after startup.
+/// The walker emits files in a DFS order and stops once `max_files` is reached.
 #[cfg(unix)]
 struct Walker {
     stack: ScratchVec<DirState>,

@@ -1,4 +1,13 @@
 //! Helper routines for window merging, entropy gating, UTF-16 decode, and hashing.
+//!
+//! # Invariants
+//! - Window merge helpers expect input ranges sorted by `start`.
+//! - Prefilter and entropy helpers must never drop true positives.
+//!
+//! # Design Notes
+//! - Window merging widens spans to trade small extra scanning for fewer passes.
+//! - Entropy gating is conservative: short samples always pass.
+//! - UTF-16 decoding uses replacement characters and enforces output limits.
 
 use super::{EntropyCompiled, EntropyScratch, PackedPatterns, SpanU32};
 use crate::scratch_memory::ScratchVec;
@@ -8,12 +17,21 @@ use memchr::memmem;
 // Window merge / coalesce (no repeated sorting)
 // --------------------------
 
-// Assumes `ranges` is already sorted by start.
-//
-// The `gap` parameter allows "soft merging": ranges that are within `gap` bytes
-// are merged into a single window. This intentionally widens windows to reduce
-// the count of regex runs, trading a small amount of extra scanning for fewer
-// window boundaries.
+/// Merges sorted ranges in-place, allowing a soft merge gap.
+///
+/// # Preconditions
+/// - `ranges` must be sorted by `start` ascending.
+///
+/// # Effects
+/// - Adjacent ranges within `gap` bytes are merged into a single window.
+/// - Output remains sorted and non-overlapping.
+///
+/// # Design Notes
+/// - The soft gap reduces the number of regex runs at the cost of slightly
+///   wider windows.
+///
+/// # Complexity
+/// - O(n) time, O(1) extra space.
 pub(super) fn merge_ranges_with_gap_sorted(ranges: &mut ScratchVec<SpanU32>, gap: u32) {
     if ranges.len() <= 1 {
         return;
@@ -39,12 +57,19 @@ pub(super) fn merge_ranges_with_gap_sorted(ranges: &mut ScratchVec<SpanU32>, gap
     ranges.truncate(write);
 }
 
-// Assumes `ranges` is already sorted and preferably already merged with a small gap.
-//
-// This is a pressure valve for adversarial inputs that trigger too many anchor
-// hits. It increases the merge gap exponentially until the window count fits
-// within `max_windows`, and as a last resort collapses to one window. The result
-// is always a superset of the original windows, so correctness is preserved.
+/// Coalesces windows until their count is below a cap.
+///
+/// # Preconditions
+/// - `ranges` must be sorted by `start` ascending.
+/// - `ranges` should already be lightly merged with a small gap when possible.
+///
+/// # Effects
+/// - Expands the merge gap exponentially to reduce the window count.
+/// - If still over the cap, collapses to a single window.
+/// - The final ranges are a superset of the original windows.
+///
+/// # Complexity
+/// - O(n log G) where G is the number of gap doublings, O(1) extra space.
 pub(super) fn coalesce_under_pressure_sorted(
     ranges: &mut ScratchVec<SpanU32>,
     hay_len: u32,
@@ -77,6 +102,11 @@ pub(super) fn coalesce_under_pressure_sorted(
 // Confirm helpers
 // --------------------------
 
+/// Returns true if any packed needle exists in the haystack.
+///
+/// # Preconditions
+/// - `needles.offsets` indexes into `needles.bytes` and is monotonically
+///   increasing. Each interval denotes one pattern.
 pub(super) fn contains_any_memmem(hay: &[u8], needles: &PackedPatterns) -> bool {
     let count = needles.offsets.len().saturating_sub(1);
     for i in 0..count {
@@ -90,6 +120,11 @@ pub(super) fn contains_any_memmem(hay: &[u8], needles: &PackedPatterns) -> bool 
     false
 }
 
+/// Returns true only if every packed needle exists in the haystack.
+///
+/// # Preconditions
+/// - `needles.offsets` indexes into `needles.bytes` and is monotonically
+///   increasing. Each interval denotes one pattern.
 pub(super) fn contains_all_memmem(hay: &[u8], needles: &PackedPatterns) -> bool {
     let count = needles.offsets.len().saturating_sub(1);
     for i in 0..count {
@@ -107,8 +142,10 @@ pub(super) fn contains_all_memmem(hay: &[u8], needles: &PackedPatterns) -> bool 
 // Entropy helpers
 // --------------------------
 
-// Precompute log2 values to avoid repeated `log2` calls in the hot path.
-// The table is sized to the maximum entropy window length across rules.
+/// Precomputes log2 values for entropy calculations.
+///
+/// The table is sized to the maximum entropy window length across rules.
+/// Index 0 is unused; index 1 is log2(1) = 0.
 pub(super) fn build_log2_table(max: usize) -> Vec<f32> {
     let len = max.saturating_add(1).max(2);
     let mut t = vec![0.0f32; len];
@@ -127,6 +164,13 @@ fn log2_lookup(table: &[f32], n: usize) -> f32 {
     }
 }
 
+/// Computes Shannon entropy in bits per byte for the given slice.
+///
+/// # Effects
+/// - Uses and resets `scratch` for histogram bookkeeping.
+///
+/// # Returns
+/// - 0.0 for empty input.
 #[inline]
 fn shannon_entropy_bits_per_byte(
     bytes: &[u8],
@@ -170,6 +214,11 @@ fn shannon_entropy_bits_per_byte(
     log2_n - (sum_c_log2_c / (n as f32))
 }
 
+/// Returns true when the entropy gate allows a buffer to proceed.
+///
+/// # Behavior
+/// - Buffers shorter than `spec.min_len` always pass (entropy is noisy).
+/// - Longer buffers are capped at `spec.max_len` for the computation.
 #[inline]
 pub(super) fn entropy_gate_passes(
     spec: &EntropyCompiled,
@@ -192,6 +241,7 @@ pub(super) fn entropy_gate_passes(
 // UTF-16 helpers
 // --------------------------
 
+/// Produces the UTF-16LE byte sequence for a UTF-8 anchor.
 pub(super) fn utf16le_bytes(anchor: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(anchor.len() * 2);
     for &b in anchor {
@@ -201,6 +251,7 @@ pub(super) fn utf16le_bytes(anchor: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Produces the UTF-16BE byte sequence for a UTF-8 anchor.
 pub(super) fn utf16be_bytes(anchor: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(anchor.len() * 2);
     for &b in anchor {
@@ -212,10 +263,12 @@ pub(super) fn utf16be_bytes(anchor: &[u8]) -> Vec<u8> {
 
 #[derive(Debug)]
 pub(super) enum Utf16DecodeError {
+    /// Output would exceed the configured maximum or buffer capacity.
     OutputTooLarge,
 }
 
 #[cfg(test)]
+/// Decodes UTF-16LE into a UTF-8 `Vec`, enforcing a maximum output size.
 pub(super) fn decode_utf16le_to_vec(
     input: &[u8],
     max_out: usize,
@@ -226,6 +279,7 @@ pub(super) fn decode_utf16le_to_vec(
 }
 
 #[cfg(test)]
+/// Decodes UTF-16BE into a UTF-8 `Vec`, enforcing a maximum output size.
 pub(super) fn decode_utf16be_to_vec(
     input: &[u8],
     max_out: usize,
@@ -267,6 +321,10 @@ fn decode_utf16_to_vec_inner(
     Ok(())
 }
 
+/// Decodes UTF-16LE into the provided scratch buffer.
+///
+/// # Errors
+/// - `OutputTooLarge` if the result would exceed `max_out` or buffer capacity.
 pub(super) fn decode_utf16le_to_buf(
     input: &[u8],
     max_out: usize,
@@ -275,6 +333,10 @@ pub(super) fn decode_utf16le_to_buf(
     decode_utf16_to_buf(input, max_out, true, out)
 }
 
+/// Decodes UTF-16BE into the provided scratch buffer.
+///
+/// # Errors
+/// - `OutputTooLarge` if the result would exceed `max_out` or buffer capacity.
 pub(super) fn decode_utf16be_to_buf(
     input: &[u8],
     max_out: usize,
@@ -283,6 +345,11 @@ pub(super) fn decode_utf16be_to_buf(
     decode_utf16_to_buf(input, max_out, false, out)
 }
 
+/// Decodes UTF-16 into a scratch buffer, using replacement characters for
+/// invalid sequences.
+///
+/// # Errors
+/// - `OutputTooLarge` if the result would exceed `max_out` or buffer capacity.
 fn decode_utf16_to_buf(
     input: &[u8],
     max_out: usize,
@@ -341,10 +408,12 @@ pub(super) fn hash128(bytes: &[u8]) -> u128 {
     u128::from_le_bytes(mac.finalize())
 }
 
+/// Returns the smallest power of two greater than or equal to `v`.
 pub(super) fn pow2_at_least(v: usize) -> usize {
     v.next_power_of_two()
 }
 
+/// Converts a `u64` to `usize` with saturation on overflow.
 pub(super) fn u64_to_usize(v: u64) -> usize {
     if v > (usize::MAX as u64) {
         usize::MAX

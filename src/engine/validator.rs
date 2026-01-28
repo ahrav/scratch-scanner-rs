@@ -1,18 +1,40 @@
+//! Fast validators for anchor hits.
+//!
+//! # Scope
+//! These helpers validate candidate matches directly against the raw byte
+//! buffer when an anchor automaton reports a hit. The fast path can emit a
+//! finding without building windows or running the full regex engine.
+//!
+//! # Invariants
+//! - `anchor_start` and `anchor_end` are raw byte indices with
+//!   `anchor_start <= anchor_end <= buf.len()`.
+//! - The anchor hit is match-start aligned in the raw representation (the
+//!   regex match starts at `anchor_start`).
+//! - Validation never reads outside `buf`; any out-of-bounds access yields
+//!   `None`.
+//!
+//! # Semantics
+//! - Word boundaries and character classes mirror `regex::bytes`: ASCII-only
+//!   word bytes and ASCII classes, with non-ASCII treated as non-word.
+//! - Tail bytes are constrained by `TailCharset`.
+//! - `DelimAfter::GitleaksTokenTerminator` requires a terminator byte (or
+//!   end-of-input). When present, the returned span includes the terminator.
+//!
+//! # Algorithm sketch
+//! - Fixed-length tails: optional word-boundary check, exact-length tail scan,
+//!   optional delimiter check.
+//! - Bounded tails: scan forward to the longest run within `max_tail`; ensure
+//!   `min_tail`, then (if a delimiter is required) backtrack to the longest tail
+//!   followed by a terminator, mirroring regex backtracking behavior.
+//! - AWS access keys: verify the known prefixes and that the 16-byte tail is
+//!   uppercase alphanumeric, yielding a 20-byte match.
+//!
+//! # Performance
+//! - Work is linear in the scanned tail length; bounded validation can add a
+//!   second linear backtrack when a delimiter is required.
+
 use crate::api::{DelimAfter, TailCharset, ValidatorKind};
 use std::ops::Range;
-
-// --------------------------
-// Fast validator helpers
-// --------------------------
-//
-// The validator fast-path is invoked directly on anchor hits. It assumes that
-// the anchor is match-start aligned in the raw representation (i.e., the anchor
-// start equals the regex match start). When enabled, it can emit findings
-// without building windows or running the regex engine.
-//
-// All checks mirror `regex::bytes` semantics (ASCII word boundaries, ASCII
-// character classes). The validator never expands its view beyond the input
-// slice; any out-of-bounds access is treated as a non-match.
 
 impl ValidatorKind {
     /// Returns true if this validator is enabled (i.e., not `None`).
@@ -83,6 +105,10 @@ fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// Returns true if there is an ASCII word boundary immediately before `start`.
+///
+/// `start == 0` is treated as a boundary (even for empty buffers). Other
+/// out-of-range positions (`start > 0 && start >= buf.len()`) yield `false`.
 #[inline]
 fn has_word_boundary_before(buf: &[u8], start: usize) -> bool {
     if start == 0 || start >= buf.len() {
@@ -93,12 +119,17 @@ fn has_word_boundary_before(buf: &[u8], start: usize) -> bool {
     is_word_byte(prev) != is_word_byte(cur)
 }
 
+/// Returns true for bytes that terminate gitleaks-style tokens.
 #[inline]
 fn is_gitleaks_token_terminator(b: u8) -> bool {
     matches!(b, b'\'' | b'"' | b'|' | b'`')
         || matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0B' | b'\x0C')
 }
 
+/// Apply delimiter rules and return the match end.
+///
+/// When a gitleaks terminator is required and present, the returned end
+/// includes the terminator byte (`tail_end + 1`).
 #[inline]
 fn match_end_with_delim(buf: &[u8], tail_end: usize, delim: DelimAfter) -> Option<usize> {
     match delim {
@@ -135,6 +166,7 @@ fn tail_matches_charset(b: u8, charset: TailCharset) -> bool {
     }
 }
 
+/// Shared configuration for prefix-based validators.
 #[derive(Clone, Copy, Debug)]
 struct PrefixChecks {
     tail: TailCharset,
@@ -142,6 +174,11 @@ struct PrefixChecks {
     delim_after: DelimAfter,
 }
 
+/// Validate a fixed-length tail immediately following the anchor.
+///
+/// Returns the matched span on success. This enforces an optional word boundary
+/// before the anchor, validates that the tail length is exactly `tail_len`, and
+/// applies any delimiter requirement after the tail.
 fn validate_prefix_fixed(
     buf: &[u8],
     anchor_start: usize,
@@ -168,6 +205,12 @@ fn validate_prefix_fixed(
     Some(anchor_start..match_end)
 }
 
+/// Validate a bounded-length tail following the anchor.
+///
+/// The tail is scanned up to `max_tail`, and the run must be at least
+/// `min_tail` bytes. When a delimiter is required, this backtracks to the
+/// longest tail that is immediately followed by a terminator or end-of-input,
+/// mirroring regex backtracking semantics.
 fn validate_prefix_bounded(
     buf: &[u8],
     anchor_start: usize,
@@ -188,7 +231,6 @@ fn validate_prefix_bounded(
         return None;
     }
 
-    // Scan the tail until we hit a non-matching byte or the maximum length.
     let mut run_len = 0usize;
     while run_len < max_tail {
         let idx = tail_start + run_len;
@@ -222,6 +264,10 @@ fn validate_prefix_bounded(
     }
 }
 
+/// Validate an AWS access key anchored at a known prefix.
+///
+/// The anchor length determines which prefixes are allowed (3-byte or 4-byte),
+/// and the total match length must be exactly 20 bytes.
 fn validate_aws_access_key(
     buf: &[u8],
     anchor_start: usize,

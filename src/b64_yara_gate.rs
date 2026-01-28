@@ -1,30 +1,42 @@
-//! YARA-style base64 gate:
-//! - YARA searches *three permutations* of a string in base64 form. The YARA docs show this for
-//!   "This program cannot" (3 base64 permutations), and also note that YARA strips leading/trailing
-//!   characters after base64 encoding, which can cause false positives/collisions.
-//!   See: https://yara.readthedocs.io/en/stable/writingrules.html
+//! YARA-style base64 gate.
 //!
-//! - Sigma's `base64offset` modifier describes the same underlying reason: there are 3 variants
-//!   for shifts by 0..2 bytes and a static middle part that can be recognized.
+//! # Problem
+//! Base64 decoding shifts data into 3-byte blocks. A raw anchor can therefore
+//! appear at offsets 0, 1, or 2 within a block, producing three base64
+//! permutations. YARA documents this for "This program cannot" and notes that
+//! leading/trailing base64 characters can be unstable because they depend on
+//! adjacent bytes. See: https://yara.readthedocs.io/en/stable/writingrules.html
 //!
-//! This implementation:
-//! - At build time, for each anchor bytes `A` and each offset o=0,1,2:
-//!     - base64_encode([0; o] + A) using standard alphabet
-//!     - strip left:  o=0 -> 0, o=1 -> 2, o=2 -> 3  (matches YARA's documented example)
-//!     - strip right based on (len([0;o]+A) % 3): rem=0->0, rem=1->3, rem=2->2
-//!     - keep the resulting substring as a gate pattern (optionally require min length)
-//! - At runtime, scan base64-ish bytes:
-//!     - ignore whitespace (policy-controlled)
-//!     - normalize '-' -> '+', '_' -> '/'
-//!     - treat '=' (padding) per policy (stop-and-halt or reset-and-continue)
-//!     - run a dense Aho-Corasick automaton over the 64-symbol base64 alphabet
+//! Sigma's `base64offset` modifier describes the same underlying reason: there
+//! are 3 variants for shifts by 0..2 bytes and a static middle part that can be
+//! recognized.
 //!
-//! Goal: very fast "possibly contains anchor after decode?" gate.
-//! False positives are expected/acceptable; misses depend on how aggressively you drop short patterns.
+//! # Approach
+//! Build time (per anchor `A` and each offset o=0,1,2):
+//! - base64_encode([0; o] + A) using the standard alphabet
+//! - strip unstable prefix: o=0 -> 0, o=1 -> 2, o=2 -> 3 (matches YARA example)
+//! - strip unstable suffix based on (len([0;o]+A) % 3): rem=0->0, rem=1->3, rem=2->2
+//! - keep the resulting substring as a gate pattern (optionally require min length)
+//!
+//! Runtime:
+//! - ignore whitespace (policy-controlled)
+//! - normalize '-' -> '+', '_' -> '/'
+//! - handle '=' per policy (stop-and-halt or reset-and-continue)
+//! - run a dense Aho-Corasick automaton over the 64-symbol base64 alphabet
+//!
+//! # Semantics
+//! - The gate is lossy: false positives are expected and acceptable.
+//! - Misses are possible when short patterns are dropped via `min_pattern_len`.
+//! - Matches never span invalid bytes or padding boundaries.
+//!
+//! # Performance
+//! - Scan time is O(1) per byte with a dense transition table.
+//! - Memory is O(states * 64), trading space for predictable latency.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
+/// How to treat base64 padding during scanning.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PaddingPolicy {
     /// Stop scanning at the first '=' and keep this "halted" state across
@@ -34,6 +46,7 @@ pub enum PaddingPolicy {
     ResetAndContinue,
 }
 
+/// Which whitespace characters are ignored while scanning.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WhitespacePolicy {
     /// Ignore only SP, TAB, CR, LF (common decoder behavior).
@@ -42,6 +55,10 @@ pub enum WhitespacePolicy {
     AsciiWhitespace,
 }
 
+/// Configuration for building a base64 gate.
+///
+/// This controls how aggressively patterns are dropped and how input is
+/// canonicalized at scan time.
 #[derive(Clone, Debug)]
 pub struct Base64YaraGateConfig {
     /// Drop generated base64-permutation patterns shorter than this.
@@ -66,13 +83,15 @@ impl Default for Base64YaraGateConfig {
     }
 }
 
-/// Streaming state if you want to feed encoded bytes incrementally across chunks.
+/// Streaming state for incremental scans across chunks.
 ///
 /// Semantics:
 /// - Tracks the Aho-Corasick automaton state across chunks.
 /// - When `PaddingPolicy::StopAndHalt` is used, once '=' (padding) is observed,
 ///   scanning is halted for the remainder of the span (sticky across subsequent
 ///   `scan_with_state()` calls) until `reset()` is invoked.
+/// - The state is only valid for the gate that produced it. If it is reused
+///   across gates, scanning falls back to the root state instead of panicking.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GateState {
     // Index into the AC node array. Stored as u32 to keep GateState small and copyable.
@@ -82,6 +101,7 @@ pub struct GateState {
 }
 
 impl GateState {
+    /// Reset to the root state and clear any padding halt.
     #[inline]
     pub fn reset(&mut self) {
         self.state = 0;
@@ -89,6 +109,9 @@ impl GateState {
     }
 }
 
+/// Immutable base64 gate backed by a dense Aho-Corasick automaton.
+///
+/// Cloning this struct is cheap; the automaton is reference-counted.
 #[derive(Clone, Debug)]
 pub struct Base64YaraGate {
     ac: Arc<Ac64>,
@@ -98,8 +121,11 @@ pub struct Base64YaraGate {
 }
 
 impl Base64YaraGate {
-    /// Build the gate from a list of raw anchor byte patterns (include UTF-16 variants
-    /// upstream if you want them gated too).
+    /// Build the gate from raw anchor byte patterns.
+    ///
+    /// Anchors are treated as raw bytes (include UTF-16 variants upstream if you
+    /// want them gated too). Generated base64 permutations are deduplicated to
+    /// keep the automaton compact and deterministic.
     pub fn build<'a, I>(anchors: I, cfg: Base64YaraGateConfig) -> Self
     where
         I: IntoIterator<Item = &'a [u8]>,
@@ -130,15 +156,17 @@ impl Base64YaraGate {
         }
     }
 
+    /// Number of unique base64 patterns compiled into the gate.
+    ///
+    /// The count reflects deduplication across anchors and offsets.
     pub fn pattern_count(&self) -> usize {
-        // Count reflects deduped patterns across anchors and offsets.
         self.pattern_count
     }
 
     /// One-shot scan of an encoded base64-ish span.
-    /// - Ignores whitespace per `whitespace_policy`
-    /// - Normalizes urlsafe '-'/'_' to '+'/'/'
-    /// - Padding handling is controlled by `padding_policy`
+    ///
+    /// Returns true if any compiled pattern is observed after canonicalization.
+    /// This is a gate only: it can return false positives but should be fast.
     #[inline]
     pub fn hits(&self, encoded: &[u8]) -> bool {
         // Allocate a fresh streaming state so callers do not need to manage it.
@@ -147,11 +175,12 @@ impl Base64YaraGate {
     }
 
     /// Incremental scan. Useful if your base64 span crosses chunk boundaries.
+    ///
     /// Caller must reset state between independent spans/runs.
     ///
-    /// Important: with `PaddingPolicy::StopAndHalt`, stopping at '=' is sticky across chunks.
-    /// Once '=' is seen, this returns false for subsequent calls until `GateState::reset()`
-    /// is invoked.
+    /// With `PaddingPolicy::StopAndHalt`, stopping at '=' is sticky across
+    /// chunks. Once '=' is seen, this returns false for subsequent calls until
+    /// `GateState::reset()` is invoked.
     #[inline]
     pub fn scan_with_state(&self, encoded: &[u8], st: &mut GateState) -> bool {
         // Sticky stop across calls for the same span.
