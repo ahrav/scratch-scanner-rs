@@ -29,6 +29,7 @@ flowchart TB
 
     subgraph Phase4["Phase 4: Regex Confirmation"]
         MustContain["must_contain check<br/>(optional)"]
+        ConfirmAll["confirm_all check<br/>(optional)"]
         Regex["rule.re.find_iter()"]
         UTF16Dec["UTF-16 Decode<br/>(for UTF-16 variants)"]
     end
@@ -57,7 +58,8 @@ flowchart TB
     Coalesce --> |"if !two_phase"| Phase4
 
     Phase4 --> MustContain
-    MustContain --> Regex
+    MustContain --> ConfirmAll
+    ConfirmAll --> Regex
     Regex --> |"Raw variant"| FindingRec
 
     Regex --> |"UTF-16 variant"| UTF16Dec

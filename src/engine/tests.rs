@@ -25,6 +25,17 @@ fn scan_chunk_findings(engine: &Engine, hay: &[u8]) -> Vec<Finding> {
     out
 }
 
+fn unpack_patterns(pats: &PackedPatterns) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let count = pats.offsets.len().saturating_sub(1);
+    for i in 0..count {
+        let start = pats.offsets[i] as usize;
+        let end = pats.offsets[i + 1] as usize;
+        out.push(pats.bytes[start..end].to_vec());
+    }
+    out
+}
+
 // Tiny base64 encoder for tests (standard alphabet, with '=' padding).
 fn b64_encode(input: &[u8]) -> String {
     const ALPH: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -255,6 +266,64 @@ fn keyword_gate_filters_without_keyword() {
 }
 
 #[test]
+fn derived_confirm_all_is_compiled() {
+    let rule = RuleSpec {
+        name: "confirm-all",
+        anchors: &[],
+        radius: 16,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        re: Regex::new(r"foo\d+bar").unwrap(),
+    };
+
+    let eng = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::DerivedOnly,
+    );
+
+    let derive_cfg = AnchorDeriveConfig {
+        utf8: false,
+        ..AnchorDeriveConfig::default()
+    };
+    let expected = match compile_trigger_plan(r"foo\d+bar", &derive_cfg).unwrap() {
+        TriggerPlan::Anchored { confirm_all, .. } => confirm_all,
+        other => panic!("expected anchored plan, got {other:?}"),
+    };
+
+    let compiled = &eng.rules[0];
+    let compiled_confirm = compiled.confirm_all.as_ref();
+    if expected.is_empty() {
+        assert!(
+            compiled_confirm.is_none(),
+            "confirm_all should be omitted when no extra literals are required"
+        );
+    } else {
+        let confirm = compiled_confirm.expect("confirm_all should be compiled");
+        let primary = confirm.primary[Variant::Raw.idx()]
+            .as_ref()
+            .expect("confirm_all primary must be set");
+        let mut literals = vec![primary.clone()];
+        literals.extend(unpack_patterns(&confirm.rest[Variant::Raw.idx()]));
+
+        let expected_set: HashSet<Vec<u8>> = expected.into_iter().collect();
+        let actual_set: HashSet<Vec<u8>> = literals.into_iter().collect();
+        assert_eq!(
+            actual_set, expected_set,
+            "confirm_all literals should match"
+        );
+    }
+
+    let hay = b"zzzfoo123barzzz";
+    let hits = scan_chunk_findings(&eng, hay);
+    assert!(hits.iter().any(|h| h.rule == "confirm-all"));
+}
+
+#[test]
 fn entropy_gate_filters_low_entropy_matches() {
     const ANCHORS: &[&[u8]] = &[b"TOK_"];
     let rule = RuleSpec {
@@ -304,9 +373,12 @@ fn anchor_policy_prefers_derived_over_manual() {
     };
 
     let eng = Engine::new(vec![rule], Vec::new(), demo_tuning());
-    let stats = eng.anchor_plan_stats();
-    assert_eq!(stats.derived_rules, 1);
-    assert_eq!(stats.manual_rules, 0);
+    #[cfg(feature = "stats")]
+    {
+        let stats = eng.anchor_plan_stats();
+        assert_eq!(stats.derived_rules, 1);
+        assert_eq!(stats.manual_rules, 0);
+    }
 
     let hits = scan_chunk_findings(&eng, b"barfoo");
     assert!(hits.iter().any(|h| h.rule == "derived-prefers"));
@@ -328,10 +400,13 @@ fn anchor_policy_falls_back_to_manual_on_unfilterable() {
     };
 
     let eng = Engine::new(vec![rule], Vec::new(), demo_tuning());
-    let stats = eng.anchor_plan_stats();
-    assert_eq!(stats.manual_rules, 1);
-    assert_eq!(stats.derived_rules, 0);
-    assert_eq!(stats.unfilterable_rules, 1);
+    #[cfg(feature = "stats")]
+    {
+        let stats = eng.anchor_plan_stats();
+        assert_eq!(stats.manual_rules, 1);
+        assert_eq!(stats.derived_rules, 0);
+        assert_eq!(stats.unfilterable_rules, 1);
+    }
 
     let hits = scan_chunk_findings(&eng, b"Z");
     assert!(hits.iter().any(|h| h.rule == "manual-fallback"));

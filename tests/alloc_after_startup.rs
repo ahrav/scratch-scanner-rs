@@ -215,10 +215,10 @@ fn allocs_after_startup_in_pipeline_scan_path() -> io::Result<()> {
         Pipeline::new(engine, PipelineConfig::default());
 
     // Warm up external caches before counting allocations.
-    let _ = pipeline.scan_path(tmp.path())?;
+    pipeline.scan_path(tmp.path())?;
 
     reset_counts();
-    let _ = pipeline.scan_path(tmp.path())?;
+    pipeline.scan_path(tmp.path())?;
     let counts = snapshot_counts();
 
     eprintln!(
@@ -250,10 +250,10 @@ fn allocs_after_startup_in_macos_aio_scan_path() -> io::Result<()> {
     let mut scanner = scanner_rs::AioScanner::new(engine, scanner_rs::AsyncIoConfig::default())?;
 
     // Warm up external caches before counting allocations.
-    let _ = scanner.scan_path(tmp.path())?;
+    scanner.scan_path(tmp.path())?;
 
     reset_counts();
-    let _ = scanner.scan_path(tmp.path())?;
+    scanner.scan_path(tmp.path())?;
     let counts = snapshot_counts();
 
     eprintln!(

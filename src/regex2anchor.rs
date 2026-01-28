@@ -17,6 +17,11 @@
 //! secrets). The algorithm is therefore conservative: it returns errors when it
 //! cannot safely produce anchors.
 //!
+//! # Invariants
+//! - Returned anchors are sufficient for a sound OR prefilter.
+//! - Patterns that can match the empty string are never anchored.
+//! - `AnchorDeriveConfig::utf8` must match the regex engine semantics.
+//!
 //! # High-level algorithm
 //!
 //! 1. Parse the pattern into the regex-syntax HIR (high-level intermediate
@@ -45,6 +50,11 @@ use regex_syntax::hir::{Class, Hir, HirKind, Literal, Look, Repetition};
 use std::cmp::Ordering;
 
 /// Configuration for anchor derivation.
+///
+/// # Semantics
+/// - Length and size limits are enforced at selection time to preserve soundness.
+/// - `utf8` must match the regex engine used for the final match.
+/// - k-gram fields only apply when the `kgram-gate` feature is enabled.
 #[derive(Debug, Clone)]
 pub struct AnchorDeriveConfig {
     /// Minimum length for an anchor to be useful.
@@ -105,6 +115,9 @@ pub enum AnchorDeriveError {
 }
 
 /// A prefilter represents the extracted anchor information.
+///
+/// # Invariants
+/// - `Substring`/`AnyOf` describe substrings that must appear in any match.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Prefilter {
     /// No useful anchors - pattern matches too broadly.
@@ -122,6 +135,10 @@ pub enum Prefilter {
 /// - `Anchored`: participates in Pass 1 Aho-Corasick (sound OR set).
 /// - `Residue`: participates in Pass 2 specialized gating.
 /// - `Unfilterable`: cannot be safely gated (reject or slow-path).
+///
+/// # Soundness
+/// - `Anchored` guarantees at least one anchor is present in any match.
+/// - `Residue` provides a conservative gate when anchors are unavailable.
 #[derive(Debug, Clone)]
 pub enum TriggerPlan {
     Anchored {
@@ -139,14 +156,22 @@ pub enum TriggerPlan {
     },
 }
 
+/// Reasons an anchor or gate could not be produced safely.
 #[derive(Debug, Clone)]
 pub enum UnfilterableReason {
+    /// Pattern can match the empty string.
     MatchesEmptyString,
+    /// All required anchors are shorter than `min_anchor_len`.
     OnlyWeakAnchors,
+    /// Uses features this module does not model safely.
     UnsupportedRegexFeatures,
+    /// No sound gate could be derived under the configured limits.
     NoSoundGate,
 }
 
+/// Secondary gating plan when anchors are unavailable.
+///
+/// These gates are conservative and may fall back to full scanning.
 #[derive(Debug, Clone)]
 pub enum ResidueGatePlan {
     /// Fast linear scan for a run of a byteclass of length [min,max].
@@ -165,6 +190,10 @@ pub enum Boundary {
 }
 
 /// Run-length gate spec (ASCII byte-oriented).
+///
+/// # Semantics
+/// - The gate scans for runs of bytes contained in `byte_mask`.
+/// - Boundaries are ASCII-only and applied around the run when requested.
 #[derive(Debug, Clone)]
 pub struct RunLengthGate {
     /// 256-bit membership mask for bytes allowed in the run.
@@ -173,6 +202,7 @@ pub struct RunLengthGate {
     pub min_len: u32,
     /// Optional max. `None` means unbounded.
     pub max_len: Option<u32>,
+    /// ASCII boundary handling applied around the run.
     pub boundary: Boundary,
     /// If you want entropy gating, make it explicit rule semantics.
     /// Do NOT infer it automatically and call it “sound”.
@@ -183,14 +213,18 @@ pub struct RunLengthGate {
     pub scan_utf16_variants: bool,
 }
 
+/// K-gram gate spec for prefix scanning.
 #[derive(Debug, Clone)]
 pub struct KGramGate {
+    /// Prefix length (k) used for the gate.
     pub k: u8,
     /// Use hashed grams for AMQ scanning. Keep raw grams if count is tiny.
     pub gram_hashes: Vec<u64>,
+    /// Where the k-gram is guaranteed to appear.
     pub position: PositionHint,
 }
 
+/// Hint for where a k-gram must appear within the match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PositionHint {
     Prefix,
@@ -253,6 +287,10 @@ impl Info {
 /// We only expand ASCII or byte ranges when they remain small. Large or Unicode
 /// ranges would explode the search space and are therefore treated as "match
 /// anything" for anchor purposes.
+///
+/// # Returns
+/// - `Some(bytes)` for small ASCII/byte ranges.
+/// - `None` when the expansion is large or non-ASCII.
 fn class_to_small_byte_set(class: &Class, cfg: &AnchorDeriveConfig) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     match class {
@@ -285,7 +323,10 @@ fn class_to_small_byte_set(class: &Class, cfg: &AnchorDeriveConfig) -> Option<Ve
 }
 
 /// Convert a character class to a 256-bit ASCII-only byte mask.
-/// Returns None if the class contains any non-ASCII byte.
+///
+/// # Returns
+/// - `Some(mask)` for classes entirely within ASCII.
+/// - `None` if the class contains any non-ASCII byte.
 fn class_to_ascii_mask(class: &Class) -> Option<[u64; 4]> {
     let mut mask = [0u64; 4];
     let mut set_bit = |b: u8| {
@@ -321,6 +362,10 @@ fn class_to_ascii_mask(class: &Class) -> Option<[u64; 4]> {
 }
 
 /// Convert a character class to a sorted ASCII byte vector.
+///
+/// # Returns
+/// - `Some(bytes)` when the class is ASCII-only.
+/// - `None` when the class contains non-ASCII bytes.
 #[cfg(feature = "kgram-gate")]
 fn class_to_ascii_vec(class: &Class) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
@@ -356,6 +401,10 @@ fn class_to_ascii_vec(class: &Class) -> Option<Vec<u8>> {
 }
 
 /// Convert a single-byte literal to an ASCII-only mask.
+///
+/// # Returns
+/// - `Some(mask)` for single-byte ASCII literals.
+/// - `None` for multi-byte or non-ASCII literals.
 fn literal_byte_to_mask(bytes: &[u8]) -> Option<[u64; 4]> {
     if bytes.len() != 1 {
         return None;
@@ -376,6 +425,10 @@ fn literal_byte_to_mask(bytes: &[u8]) -> Option<[u64; 4]> {
 /// This is the core operation for concatenation and repetition. We cap both
 /// the total number of strings and the length of each string to avoid
 /// combinatorial blowups.
+///
+/// # Returns
+/// - `Some(product)` when within size/length limits.
+/// - `None` when caps or size overflows are hit.
 fn cross_product(a: &[Vec<u8>], b: &[Vec<u8>], cfg: &AnchorDeriveConfig) -> Option<Vec<Vec<u8>>> {
     let prod = a.len().checked_mul(b.len())?;
     if prod > cfg.max_exact_set {
@@ -402,6 +455,13 @@ fn cross_product(a: &[Vec<u8>], b: &[Vec<u8>], cfg: &AnchorDeriveConfig) -> Opti
 ///
 /// This function is the heart of the algorithm: it performs structural
 /// induction on the HIR and returns an `Info` summary for each node.
+///
+/// # Soundness
+/// - Information is only ever weakened, never strengthened.
+///
+/// # Returns
+/// - An `Info` with an exact set when finite and within caps.
+/// - Otherwise a conservative prefilter that preserves the invariant.
 fn analyze(hir: &Hir, cfg: &AnchorDeriveConfig) -> Info {
     match hir.kind() {
         HirKind::Empty => {
@@ -447,6 +507,9 @@ fn analyze(hir: &Hir, cfg: &AnchorDeriveConfig) -> Info {
 /// Key rule: if the repetition can match empty (min == 0), then it cannot
 /// *require* any anchor from its subexpression. We therefore degrade to `All`,
 /// except for the `?` case where the exact set is still finite.
+///
+/// # Soundness
+/// - When `min == 0`, required substrings may disappear, so anchors are dropped.
 fn analyze_repetition(rep: &Repetition, cfg: &AnchorDeriveConfig) -> Info {
     let min = rep.min;
     let max = rep.max;
@@ -683,6 +746,11 @@ fn best_exact_window_prefilter(children: &[Info], cfg: &AnchorDeriveConfig) -> O
 /// cannot keep an exact set for the whole concatenation, we prefer the best
 /// contiguous exact window (more selective than any single atom), and finally
 /// fall back to the most selective single child prefilter.
+///
+/// # Strategy
+/// - Prefer full exact concatenation when finite and within caps.
+/// - Otherwise, pick the most selective exact window.
+/// - Finally, fall back to the best child prefilter.
 fn analyze_concat(subs: &[Hir], cfg: &AnchorDeriveConfig) -> Info {
     if subs.is_empty() {
         return Info::exact(vec![vec![]], cfg).unwrap_or_else(Info::all);
@@ -746,6 +814,9 @@ fn analyze_concat(subs: &[Hir], cfg: &AnchorDeriveConfig) -> Info {
 /// that branch must be present. Therefore, we union anchors across branches.
 /// If any branch is unanchorable (matches empty or has no anchors), then the
 /// alternation as a whole is unanchorable.
+///
+/// # Soundness
+/// - A single empty-string branch makes the whole alternation unanchorable.
 fn analyze_alternation(alts: &[Hir], cfg: &AnchorDeriveConfig) -> Info {
     if alts.is_empty() {
         return Info::all();
@@ -823,6 +894,10 @@ fn is_ascii_word_boundary(look: Look) -> bool {
 ///
 /// - Alternation becomes OR of per-branch gates.
 /// - Otherwise attempt a run-length gate.
+///
+/// # Returns
+/// - `Some(gate)` when a conservative gate can be derived.
+/// - `None` when no sound residue gate exists.
 fn derive_residue_gate_plan(hir: &Hir) -> Option<ResidueGatePlan> {
     match hir.kind() {
         HirKind::Capture(cap) => derive_residue_gate_plan(&cap.sub),
@@ -846,6 +921,10 @@ fn derive_residue_gate_plan(hir: &Hir) -> Option<ResidueGatePlan> {
 ///
 /// Only matches a single consuming atom (literal/class or fixed repetition),
 /// optionally wrapped by ASCII word boundaries and captures.
+///
+/// # Returns
+/// - `Some(gate)` for ASCII-only, fixed-shape patterns.
+/// - `None` for variable-length or multi-atom patterns.
 fn derive_run_length_gate(hir: &Hir) -> Option<RunLengthGate> {
     let (boundary, mut core) = extract_core_with_boundary(hir)?;
 
@@ -895,6 +974,10 @@ fn derive_run_length_gate(hir: &Hir) -> Option<RunLengthGate> {
 ///
 /// Leading/trailing lookarounds and empties are ignored; if more than one
 /// consuming element remains, the run-length gate cannot represent it.
+///
+/// # Returns
+/// - `(boundary, core)` when exactly one consuming element remains.
+/// - `None` when the core has multiple consuming elements.
 fn extract_core_with_boundary(hir: &Hir) -> Option<(Boundary, &Hir)> {
     match hir.kind() {
         HirKind::Concat(subs) => {
@@ -950,6 +1033,10 @@ fn extract_core_with_boundary(hir: &Hir) -> Option<(Boundary, &Hir)> {
 ///
 /// This enumerates all possible k-length prefixes using a small ASCII alphabet
 /// per position, then stores them as u64s for fast membership checks.
+///
+/// # Returns
+/// - `Some(gate)` when the prefix is fixed and enumerable.
+/// - `None` when the prefix is ambiguous or too large.
 fn derive_kgram_gate(hir: &Hir, cfg: &AnchorDeriveConfig) -> Option<KGramGate> {
     let k = cfg.kgram_k;
     if k == 0 || k > u8::MAX as usize {
@@ -1028,6 +1115,10 @@ fn derive_kgram_gate(hir: &Hir, cfg: &AnchorDeriveConfig) -> Option<KGramGate> {
 ///
 /// Returns None when the prefix is ambiguous or unbounded (e.g., alternation,
 /// optional/variable repetition, or non-ASCII bytes).
+///
+/// # Returns
+/// - `Some(atoms)` where each entry is the byte alphabet for that position.
+/// - `None` when the prefix cannot be enumerated soundly.
 fn collect_prefix_atoms(hir: &Hir, k: usize, cfg: &AnchorDeriveConfig) -> Option<Vec<Vec<u8>>> {
     fn append_atoms(
         hir: &Hir,
@@ -1147,6 +1238,10 @@ fn prefilter_score(pf: &Prefilter) -> i64 {
 /// - Empty matches are forbidden (anchors would miss them).
 /// - Anchors shorter than `min_anchor_len` are rejected.
 /// - We never "filter out" short alternatives, because that would be unsound.
+///
+/// # Errors
+/// - `Unanchorable` when the pattern can match empty or no anchors exist.
+/// - `OnlyWeakAnchors` when any required anchor is shorter than the minimum.
 fn choose_anchors(
     info: &Info,
     cfg: &AnchorDeriveConfig,
@@ -1208,8 +1303,14 @@ fn hir_matches_empty(hir: &Hir) -> bool {
 /// - "foo" and "bar" are mandatory islands, so they are safe for confirm_all.
 ///
 /// confirm_all is a cheap AND filter used after the OR anchor hit; it reduces
-/// false candidates without changing soundness. This stays out of
-/// derive_anchors_from_pattern to preserve the existing anchor contract.
+/// false candidates without changing soundness. The engine checks the longest
+/// literal first, then requires all remaining literals inside the same window.
+/// This stays out of derive_anchors_from_pattern to preserve the existing
+/// anchor contract.
+///
+/// # Semantics
+/// - Only considers mandatory subexpressions from the top-level concatenation.
+/// - Optional/empty-matching segments are excluded.
 fn collect_confirm_all_literals(hir: &Hir, cfg: &AnchorDeriveConfig) -> Vec<Vec<u8>> {
     fn peel_capture(mut h: &Hir) -> &Hir {
         loop {
@@ -1269,6 +1370,15 @@ fn collect_confirm_all_literals(hir: &Hir, cfg: &AnchorDeriveConfig) -> Vec<Vec<
 }
 
 /// Compile a regex pattern into a trigger plan for the two-pass pipeline.
+///
+/// # Strategy
+/// - Prefer anchors (fastest, most selective gate).
+/// - Fall back to residue gates when anchors are unavailable.
+/// - Optionally fall back to a k-gram gate when enabled.
+/// - Otherwise mark the pattern as unfilterable.
+///
+/// # Soundness
+/// - Patterns that can match the empty string are always unfilterable.
 pub fn compile_trigger_plan(
     pattern: &str,
     cfg: &AnchorDeriveConfig,
@@ -1329,20 +1439,16 @@ pub fn compile_trigger_plan(
 
 /// Derive anchors from a regex pattern.
 ///
-/// # Arguments
-///
-/// * `pattern` - The regex pattern to analyze
-/// * `cfg` - Configuration for anchor derivation
-///
 /// # Returns
+/// - A vector of anchor byte strings; any match must contain at least one.
 ///
-/// A vector of anchor byte strings, any of which must be present in a matching string.
+/// # Soundness
+/// - Returns an error rather than guessing when a sound anchor set is impossible.
 ///
 /// # Errors
-///
-/// * `InvalidPattern` - The regex pattern is invalid
-/// * `Unanchorable` - The pattern cannot be anchored (matches too broadly)
-/// * `OnlyWeakAnchors` - Only anchors shorter than min_anchor_len were found
+/// - `InvalidPattern` when the regex fails to parse.
+/// - `Unanchorable` when the pattern matches too broadly (including empty).
+/// - `OnlyWeakAnchors` when any required anchor is shorter than `min_anchor_len`.
 pub fn derive_anchors_from_pattern(
     pattern: &str,
     cfg: &AnchorDeriveConfig,
@@ -1726,6 +1832,40 @@ mod tests {
                     has_foo || has_bar,
                     "Should extract 'foo' or 'bar' from 'foo.*bar'"
                 );
+            }
+        }
+
+        #[test]
+        fn test_compile_trigger_plan_confirm_all_islands() {
+            let cfg = AnchorDeriveConfig {
+                min_anchor_len: 3,
+                ..Default::default()
+            };
+
+            let plan = compile_trigger_plan(r"foo\d+bar", &cfg).unwrap();
+            match plan {
+                TriggerPlan::Anchored {
+                    anchors,
+                    confirm_all,
+                } => {
+                    for a in &anchors {
+                        assert!(
+                            !confirm_all.contains(a),
+                            "confirm_all should not duplicate anchors"
+                        );
+                    }
+
+                    let has_foo = anchors
+                        .iter()
+                        .chain(confirm_all.iter())
+                        .any(|a| a.as_slice() == b"foo");
+                    let has_bar = anchors
+                        .iter()
+                        .chain(confirm_all.iter())
+                        .any(|a| a.as_slice() == b"bar");
+                    assert!(has_foo && has_bar, "mandatory islands must be preserved");
+                }
+                other => panic!("expected anchored plan, got {other:?}"),
             }
         }
 

@@ -8,6 +8,13 @@
 //!
 //! Stages are executed in a tight suggest/pump loop using fixed-capacity rings:
 //! Walker -> Reader -> Scanner -> Output.
+//!
+//! # Invariants and budgets
+//! - Rings are fixed-capacity; every stage must tolerate backpressure.
+//! - Chunk overlap is set to `Engine::required_overlap()` to avoid missed
+//!   matches across chunk boundaries.
+//! - On Unix, path storage is a fixed-size arena; exceeding it is a hard error.
+//! - The pipeline is single-threaded and not Sync/Send by design.
 
 #[cfg(unix)]
 use crate::runtime::PathSpan;
@@ -69,13 +76,17 @@ const WALKER_STACK_CAP: usize = 1024;
 #[derive(Clone, Debug)]
 pub struct PipelineConfig {
     /// Bytes read per chunk (excluding overlap). Use 0 for the maximum size.
+    ///
+    /// A value of 0 is resolved to the largest aligned chunk that fits within
+    /// `BUFFER_LEN_MAX` after accounting for overlap.
     pub chunk_size: usize,
     /// Maximum number of files to queue.
     pub max_files: usize,
     /// Total byte capacity reserved for path storage (0 = auto).
     ///
     /// On Unix this is the fixed-size path arena budget; on non-Unix it is
-    /// ignored. Exceeding the arena is treated as a configuration bug.
+    /// ignored. Exceeding the arena is treated as a configuration bug and will
+    /// fail fast rather than allocate.
     pub path_bytes_cap: usize,
 }
 
@@ -91,6 +102,10 @@ impl Default for PipelineConfig {
 }
 
 /// Summary counters for a pipeline run.
+///
+/// These counters are always compiled in for lightweight performance and health
+/// reporting (throughput, error rates) and are monotonic within a run.
+/// `errors` is an aggregate that includes `walk_errors` and `open_errors`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PipelineStats {
     /// Number of files enqueued.
@@ -107,7 +122,7 @@ pub struct PipelineStats {
     pub open_errors: u64,
     /// Errors encountered while reading files.
     pub errors: u64,
-    /// Base64 decode/gate instrumentation.
+    /// Optional Base64 decode/gate instrumentation (feature: `b64-stats`).
     #[cfg(feature = "b64-stats")]
     pub base64: crate::Base64DecodeStats,
 }
@@ -295,6 +310,9 @@ impl Drop for DirState {
 }
 
 /// Depth-first directory walker that feeds the file ring (Unix, allocation-free).
+///
+/// Uses a fixed-capacity stack and a path arena in the `FileTable` to avoid
+/// per-entry allocations.
 #[cfg(unix)]
 struct Walker {
     stack: ScratchVec<DirState>,
@@ -441,12 +459,11 @@ impl Walker {
                 if mode == libc::S_IFDIR {
                     let child_span = files.join_path_span(dir_path, name_bytes);
                     let child = open_dir_at(dirfd, name.as_ptr(), child_span);
-                    match child {
-                        Ok(child) => self.stack.push(child),
-                        Err(_) => {
-                            stats.walk_errors += 1;
-                            stats.errors += 1;
-                        }
+                    if let Ok(child) = child {
+                        self.stack.push(child);
+                    } else {
+                        stats.walk_errors += 1;
+                        stats.errors += 1;
                     }
                     continue;
                 }
@@ -500,10 +517,12 @@ impl FileReader {
         tail: &mut [u8],
         tail_len: &mut usize,
     ) -> io::Result<Option<Chunk>> {
-        assert!(*tail_len <= tail.len());
-        assert!(overlap == tail.len());
+        // `tail`/`tail_len` preserve the suffix of the previous chunk so the
+        // resulting buffer is `[overlap bytes][new bytes]`.
+        debug_assert!(*tail_len <= tail.len());
+        debug_assert!(overlap == tail.len());
         let buf = handle.as_mut_slice();
-        assert!(buf.len() >= *tail_len + chunk_size);
+        debug_assert!(buf.len() >= *tail_len + chunk_size);
 
         if *tail_len > 0 {
             buf[..*tail_len].copy_from_slice(&tail[..*tail_len]);
@@ -521,6 +540,7 @@ impl FileReader {
         let start = total_len - next_tail_len;
         tail[..next_tail_len].copy_from_slice(&buf[start..total_len]);
 
+        // `base_offset` points to the logical start of the chunk including overlap.
         let base_offset = self.offset.saturating_sub(*tail_len as u64);
         let chunk = Chunk {
             file_id: self.file_id,
@@ -539,6 +559,9 @@ impl FileReader {
 }
 
 /// Stage that turns file ids into buffered chunks.
+///
+/// Maintains a single active reader and a fixed overlap tail to keep IO
+/// sequential and memory bounded.
 struct ReaderStage {
     overlap: usize,
     chunk_size: usize,
@@ -637,6 +660,9 @@ impl ReaderStage {
 }
 
 /// Stage that scans chunks and buffers findings for output.
+///
+/// Findings are buffered in `pending` to honor output backpressure without
+/// stalling chunk consumption permanently.
 struct ScanStage {
     scratch: ScanScratch,
     pending: Vec<FindingRec>,
@@ -740,6 +766,8 @@ fn write_path<W: Write>(out: &mut W, path: &Path) -> io::Result<()> {
 }
 
 /// Stage that formats findings to stdout.
+///
+/// Output format: `path:start-end rule` (one finding per line).
 struct OutputStage {
     out: BufWriter<io::Stdout>,
 }
@@ -783,6 +811,9 @@ impl OutputStage {
 }
 
 /// Pipeline scanner with fixed ring capacities for files, chunks, and findings.
+///
+/// This is single-threaded; all backpressure is handled via ring fullness and
+/// the scan loop's stall detection.
 pub struct Pipeline<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize> {
     engine: Arc<Engine>,
     config: PipelineConfig,
@@ -843,44 +874,37 @@ impl<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize>
         }
     }
 
-    /// Scans a path (file or directory) and returns summary stats.
-    ///
-    /// The pipeline reuses internal buffers and stage state across scans.
-    /// Capacity limits are hard bounds; the Unix path arena will panic if
-    /// exhausted rather than allocating.
-    pub fn scan_path(&mut self, path: &Path) -> io::Result<PipelineStats> {
-        let mut stats = PipelineStats::default();
-
+    fn scan_path_inner(&mut self, path: &Path, stats: &mut PipelineStats) -> io::Result<()> {
         self.files.clear();
         self.file_ring.clear();
         self.chunk_ring.clear();
         self.out_ring.clear();
-        self.walker.reset(path, &mut self.files, &mut stats)?;
+        self.walker.reset(path, &mut self.files, stats)?;
         self.reader.reset();
         self.scanner.reset();
 
         loop {
             let mut progressed = false;
 
-            progressed |=
-                self.output
-                    .pump(&self.engine, &self.files, &mut self.out_ring, &mut stats)?;
+            progressed |= self
+                .output
+                .pump(&self.engine, &self.files, &mut self.out_ring, stats)?;
             progressed |= self.scanner.pump(
                 &self.engine,
                 &mut self.chunk_ring,
                 &mut self.out_ring,
-                &mut stats,
+                stats,
             );
             progressed |= self.reader.pump(
                 &mut self.file_ring,
                 &mut self.chunk_ring,
                 &self.pool,
                 &self.files,
-                &mut stats,
+                stats,
             )?;
             progressed |= self
                 .walker
-                .pump(&mut self.files, &mut self.file_ring, &mut stats)?;
+                .pump(&mut self.files, &mut self.file_ring, stats)?;
 
             let done = self.walker.is_done()
                 && self.reader.is_idle()
@@ -908,11 +932,24 @@ impl<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize>
         }
 
         self.output.flush()?;
+        Ok(())
+    }
+
+    /// Scans a path (file or directory) and returns summary stats.
+    ///
+    /// The pipeline reuses internal buffers and stage state across scans.
+    /// Capacity limits are hard bounds; the Unix path arena will panic if
+    /// exhausted rather than allocating.
+    pub fn scan_path(&mut self, path: &Path) -> io::Result<PipelineStats> {
+        let mut stats = PipelineStats::default();
+        self.scan_path_inner(path, &mut stats)?;
         Ok(stats)
     }
 }
 
 /// Convenience wrapper using pipeline defaults and fixed ring capacities.
+///
+/// This allocates a fresh pipeline and runs a single scan.
 pub fn scan_path_default(path: &Path, engine: Arc<Engine>) -> io::Result<PipelineStats> {
     let mut pipeline: Pipeline<PIPE_FILE_RING_CAP, PIPE_CHUNK_RING_CAP, PIPE_OUT_RING_CAP> =
         Pipeline::new(engine, PipelineConfig::default());
@@ -1100,6 +1137,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    #[cfg(feature = "stats")]
     fn pipeline_counts_walk_and_open_errors() -> io::Result<()> {
         let tmp = make_temp_dir("scanner_walk_err")?;
         let denied = tmp.path().join("denied");

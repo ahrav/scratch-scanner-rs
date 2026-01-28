@@ -1,3 +1,19 @@
+//! macOS async I/O scanning using POSIX AIO.
+//!
+//! # Overview
+//! This module implements a single-threaded scanner that overlaps read-ahead
+//! with scanning using a fixed-depth queue of POSIX AIO requests. Overlap bytes
+//! are stitched into each buffer so the scanner always sees a contiguous
+//! prefix+payload slice without redundant rescans.
+//!
+//! # Invariants and trade-offs
+//! - Queue depth must be >= 2 to overlap read/scan.
+//! - Buffers are fixed-size; `payload_off + chunk_size` must fit in
+//!   `BUFFER_LEN_MAX`.
+//! - Requests are emitted in file order even if completions arrive out of order.
+//! - AIO is best-effort; transient submit errors are retried, and EINTR is
+//!   handled by retrying `aio_suspend`.
+
 use super::*;
 use crate::{BufferPool, Chunk, Engine, FindingRec, ScanScratch};
 use std::fs::File;
@@ -143,6 +159,9 @@ mod aio {
 /// The scanner stays single-threaded and uses a fixed read-ahead depth
 /// to overlap IO and scanning without unbounded buffering. Per-file reader
 /// buffers are allocated once and reused across files.
+///
+/// This wrapper owns its reader, buffers, and scratch state; reuse the same
+/// instance for multiple scans to avoid allocations.
 pub struct MacosAioScanner {
     engine: Arc<Engine>,
     config: AsyncIoConfig,
@@ -217,15 +236,14 @@ impl MacosAioScanner {
     }
 
     /// Scans a path (file or directory) using POSIX AIO reads.
-    pub fn scan_path(&mut self, path: &Path) -> io::Result<PipelineStats> {
-        let mut stats = PipelineStats::default();
+    fn scan_path_inner(&mut self, path: &Path, stats: &mut PipelineStats) -> io::Result<()> {
         let engine = Arc::clone(&self.engine);
         self.files.clear();
         self.pending.clear();
-        self.walker.reset(path, &mut self.files, &mut stats)?;
+        self.walker.reset(path, &mut self.files, stats)?;
 
         while !self.walker.is_done() {
-            let Some(file_id) = self.walker.next_file(&mut self.files, &mut stats)? else {
+            let Some(file_id) = self.walker.next_file(&mut self.files, stats)? else {
                 continue;
             };
 
@@ -242,7 +260,7 @@ impl MacosAioScanner {
                 file_path,
                 file_size,
                 &mut self.out,
-                &mut stats,
+                stats,
             ) {
                 Ok(()) => {}
                 Err(err) => {
@@ -257,11 +275,20 @@ impl MacosAioScanner {
         }
 
         self.out.flush()?;
+        Ok(())
+    }
+
+    pub fn scan_path(&mut self, path: &Path) -> io::Result<PipelineStats> {
+        let mut stats = PipelineStats::default();
+        self.scan_path_inner(path, &mut stats)?;
         Ok(stats)
     }
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Scan a single file using POSIX AIO reads.
+///
+/// Keeps the AIO queue filled while scanning, preserving ordering and overlap.
 // Keep scan dependencies explicit so the hot path has no hidden state
 // and the call site shows all mutable resources.
 fn scan_file(
@@ -312,6 +339,9 @@ enum AioSlotState {
 }
 
 /// One in-flight AIO request slot.
+///
+/// The buffer handle is retained until the request completes so the kernel
+/// never reads into freed memory.
 struct AioSlot {
     cb: libc::aiocb,
     state: AioSlotState,
@@ -358,11 +388,11 @@ impl AioSlot {
         req_len: usize,
         seq: u64,
     ) -> io::Result<()> {
-        assert!(self.is_empty());
-        assert!(req_len > 0);
+        debug_assert!(self.is_empty());
+        debug_assert!(req_len > 0);
 
         let buf = handle.as_mut_slice();
-        assert!(buf.len() >= payload_off + req_len);
+        debug_assert!(buf.len() >= payload_off + req_len);
 
         // Read payload into the fixed payload offset. The overlap prefix is
         // stitched in after completion so we can submit read-ahead without
@@ -547,7 +577,7 @@ impl AioFileReader {
 
         self.free_slots.clear();
         for idx in (0..self.queue_depth).rev() {
-            assert!(
+            debug_assert!(
                 self.free_slots.len() < self.free_slots.capacity(),
                 "free slot stack capacity exceeded"
             );
@@ -589,7 +619,7 @@ impl AioFileReader {
             let remaining = self.file_len.saturating_sub(self.next_offset);
             if remaining == 0 {
                 self.end_seq = self.next_seq;
-                assert!(
+                debug_assert!(
                     self.free_slots.len() < self.free_slots.capacity(),
                     "free slot stack capacity exceeded"
                 );
@@ -601,7 +631,7 @@ impl AioFileReader {
             let handle = match pool.try_acquire() {
                 Some(handle) => handle,
                 None => {
-                    assert!(
+                    debug_assert!(
                         self.free_slots.len() < self.free_slots.capacity(),
                         "free slot stack capacity exceeded"
                     );
@@ -613,7 +643,7 @@ impl AioFileReader {
             // Submit in increasing file offset order. Each submission gets a
             // strictly increasing sequence number so we can emit in order.
             let slot = &mut self.slots[slot_idx];
-            assert!(slot.is_empty());
+            debug_assert!(slot.is_empty());
             match slot.submit(
                 self.fd,
                 handle,
@@ -625,7 +655,7 @@ impl AioFileReader {
                 Ok(()) => {}
                 Err(err) if Self::is_retryable_submit_error(&err) => {
                     // Back off on transient resource exhaustion and retry after completions.
-                    assert!(
+                    debug_assert!(
                         self.free_slots.len() < self.free_slots.capacity(),
                         "free slot stack capacity exceeded"
                     );
@@ -633,7 +663,7 @@ impl AioFileReader {
                     break;
                 }
                 Err(err) => {
-                    assert!(
+                    debug_assert!(
                         self.free_slots.len() < self.free_slots.capacity(),
                         "free slot stack capacity exceeded"
                     );
@@ -660,7 +690,7 @@ impl AioFileReader {
             }
             if slot.poll_complete()? {
                 let pos = (slot.seq as usize) % ready_len;
-                assert!(
+                debug_assert!(
                     self.ready_seq[pos] == u64::MAX,
                     "ready ring collision for seq {}",
                     slot.seq
@@ -690,7 +720,7 @@ impl AioFileReader {
                 }
                 slot.reset();
                 let free_slots = &mut self.free_slots;
-                assert!(
+                debug_assert!(
                     free_slots.len() < free_slots.capacity(),
                     "free slot stack capacity exceeded"
                 );
@@ -704,7 +734,7 @@ impl AioFileReader {
         let wait_list = &mut self.wait_list;
         for slot in &self.slots {
             if slot.is_in_flight() {
-                assert!(
+                debug_assert!(
                     wait_list.len() < wait_list.capacity(),
                     "wait list capacity exceeded"
                 );
@@ -748,7 +778,7 @@ impl AioFileReader {
             let wait_list = &mut self.wait_list;
             for slot in &self.slots {
                 if slot.is_in_flight() {
-                    assert!(
+                    debug_assert!(
                         wait_list.len() < wait_list.capacity(),
                         "wait list capacity exceeded"
                     );
@@ -804,7 +834,7 @@ impl AioFileReader {
         self.ready_seq[pos] = u64::MAX;
 
         let slot = &mut self.slots[idx];
-        assert!(slot.is_completed());
+        debug_assert!(slot.is_completed());
         let read_len = slot.read_len;
         let req_len = slot.req_len;
         let offset = slot.offset;
@@ -814,7 +844,7 @@ impl AioFileReader {
             .take()
             .expect("completed slot must hold a buffer");
         slot.reset();
-        assert!(
+        debug_assert!(
             self.free_slots.len() < self.free_slots.capacity(),
             "free slot stack capacity exceeded"
         );

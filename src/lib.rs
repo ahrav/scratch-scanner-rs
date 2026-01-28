@@ -3,6 +3,7 @@
 //!
 //! The engine is optimized for scanning large byte streams using:
 //! - Anchor-based windowing (Aho-Corasick) to limit regex work.
+//! - Byteset prefilters derived from anchors with density gating.
 //! - Optional two-phase confirmation for noisy rules.
 //! - Transform decoding (URL percent, Base64) with streaming gates and budgets.
 //! - Base64 encoded-space pre-gate (YARA-style) to skip wasteful decodes.
@@ -54,7 +55,9 @@ pub use demo::{
 
 #[cfg(feature = "bench")]
 pub use engine::bench_find_spans_into;
-pub use engine::{AnchorPlanStats, Engine, ScanScratch};
+#[cfg(feature = "stats")]
+pub use engine::{AnchorPlanStats, AnchorPrefilterStats};
+pub use engine::{Engine, ScanScratch};
 
 pub use async_io::AsyncIoConfig;
 #[cfg(any(target_os = "linux", target_os = "macos"))]

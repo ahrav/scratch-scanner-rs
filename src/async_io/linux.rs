@@ -1,3 +1,18 @@
+//! Linux async I/O scanning using io_uring.
+//!
+//! # Overview
+//! This module implements a single-threaded, overlapped read/scan pipeline.
+//! It keeps one read in flight while scanning the previous chunk, preserving
+//! overlap bytes so the scanner always sees a contiguous window.
+//!
+//! # Invariants and trade-offs
+//! - Queue depth must be >= 2 to overlap read/scan without stalling.
+//! - Buffers are aligned and sized so `payload_off + chunk_size <= BUFFER_LEN_MAX`.
+//! - Overlap bytes are copied into the next buffer before submission, so the
+//!   scan slice is contiguous without rescanning overlap.
+//! - O_DIRECT is used only for the aligned prefix of the file; the tail is
+//!   read via buffered IO to avoid short reads and alignment traps.
+
 use super::*;
 use crate::{BufferPool, Chunk, Engine, FindingRec, ScanScratch};
 use io_uring::{opcode, types, IoUring};
@@ -13,6 +28,9 @@ use std::sync::Arc;
 /// scanned, the next payload read is in flight. Overlap bytes are copied
 /// into the next buffer before submission so the scanner sees a contiguous
 /// slice without redundant overlap scanning.
+///
+/// The scanner is single-threaded and owns its io_uring instance, buffer pool,
+/// and scratch state. It reuses these across scans to avoid allocations.
 pub struct UringScanner {
     engine: Arc<Engine>,
     config: AsyncIoConfig,
@@ -137,6 +155,11 @@ impl UringScanner {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Scan a single file using overlapped io_uring reads.
+///
+/// Keeps one read in flight while scanning the previous chunk to overlap IO
+/// and compute. The function drains pending findings before switching chunks
+/// so buffers are not dropped while the kernel owns them.
 // Keep scan dependencies explicit so the hot path has no hidden state
 // and the call site shows all mutable resources.
 fn scan_file<W: Write>(
@@ -214,12 +237,14 @@ fn scan_file<W: Write>(
     Ok(())
 }
 
+/// Read plan for a single payload read submission.
 struct ReadPlan {
     fd: RawFd,
     offset: u64,
     len: usize,
 }
 
+/// Pending in-flight read plus metadata to construct a `Chunk`.
 struct PendingRead {
     handle: crate::BufferHandle,
     prefix_len: usize,
@@ -229,6 +254,10 @@ struct PendingRead {
 }
 
 /// File-local io_uring reader with aligned payload offsets and overlap prefixing.
+///
+/// Uses O_DIRECT for the aligned prefix when configured, then falls back to
+/// buffered reads for the unaligned tail. Ensures only one read is in flight
+/// at a time to keep ownership simple.
 struct UringFileReader<'a> {
     ring: &'a mut IoUring,
     pool: &'a BufferPool,
@@ -341,6 +370,9 @@ impl<'a> UringFileReader<'a> {
             handle.as_mut_slice()[start..end].copy_from_slice(prefix);
         }
 
+        // SAFETY: `payload_off + len` is bounded by BUFFER_LEN_MAX and aligned
+        // by construction; the buffer is owned by this handle for the duration
+        // of the in-flight read.
         let ptr = unsafe { handle.as_mut_slice().as_mut_ptr().add(self.payload_off) };
         let entry = opcode::Read::new(types::Fd(plan.fd), ptr, plan.len as u32)
             .offset(plan.offset)

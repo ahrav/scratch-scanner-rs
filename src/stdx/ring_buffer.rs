@@ -1,5 +1,16 @@
 #![allow(dead_code)] // API is exercised in tests; main wiring is pending.
 
+//! Fixed-capacity ring buffer with stack-allocated storage and `MaybeUninit<T>`.
+//!
+//! # Invariants
+//! - `N` is a power of 2 and fits in `u32` (validated at compile time).
+//! - `head < capacity` and `len <= capacity`.
+//! - Slots in the logical range `[head, head + len)` (wrapping by mask) are
+//!   initialized; all other slots are uninitialized.
+//!
+//! # Threading
+//! This type is not synchronized; it assumes single-threaded usage.
+
 use std::mem::MaybeUninit;
 
 // Compile-time proof that u32 -> usize is safe on this platform.
@@ -21,15 +32,25 @@ fn index(i: u32) -> usize {
 /// - Zero heap allocations in the hot path (storage is `[MaybeUninit<T>; N]`).
 /// - Simple head/len bookkeeping so operations are branch-light and predictable.
 ///
+/// **Performance note**: Capacity `N` must be a power of 2. This enables
+/// single-cycle bitwise AND for index calculation instead of expensive
+/// division/modulo operations.
+///
 /// This is a single-producer/single-consumer style queue in the pipeline, but
 /// the implementation itself is not synchronized; it relies on single-threaded
 /// usage. Insertion past capacity is a logic error unless handled via `push_back`.
+///
+/// # Invariants
+/// - `head` always indexes the logical front.
+/// - `len` tracks the number of initialized elements.
+/// - The element at logical index `i` lives at `(head + i) & MASK`.
 pub struct RingBuffer<T, const N: usize> {
     buf: [MaybeUninit<T>; N],
     head: u32,
     len: u32,
 }
 
+/// Create an uninitialized `[MaybeUninit<T>; N]` without running any constructors.
 fn uninit_array<T, const N: usize>() -> [MaybeUninit<T>; N] {
     // SAFETY: An uninitialized MaybeUninit<T> is valid.
     unsafe { MaybeUninit::<[MaybeUninit<T>; N]>::uninit().assume_init() }
@@ -38,6 +59,7 @@ fn uninit_array<T, const N: usize>() -> [MaybeUninit<T>; N] {
 impl<T, const N: usize> RingBuffer<T, N> {
     const CAPACITY: u32 = {
         assert!(N > 0, "RingBuffer capacity must be > 0");
+        assert!(N & (N - 1) == 0, "RingBuffer capacity must be power of 2");
         assert!(
             N <= u32::MAX as usize / 2,
             "N must fit in u32 and not risk overflow"
@@ -45,8 +67,10 @@ impl<T, const N: usize> RingBuffer<T, N> {
         N as u32
     };
 
-    /// Constructs an empty ring buffer with capacity `N` without heap
-    /// allocation.
+    /// Bitmask for power-of-2 modulo: (head + len) & MASK == (head + len) % CAPACITY
+    const MASK: u32 = Self::CAPACITY - 1;
+
+    /// Constructs an empty ring buffer with capacity `N` without heap allocation.
     pub fn new() -> Self {
         let _ = Self::CAPACITY;
 
@@ -56,8 +80,8 @@ impl<T, const N: usize> RingBuffer<T, N> {
             len: 0,
         };
 
-        assert!(ring.len == 0);
-        assert!(ring.head == 0);
+        debug_assert!(ring.len == 0);
+        debug_assert!(ring.head == 0);
 
         ring
     }
@@ -90,6 +114,7 @@ impl<T, const N: usize> RingBuffer<T, N> {
     ///
     /// This keeps ownership with the caller on overflow instead of dropping
     /// silently.
+    #[inline]
     pub fn push_back(&mut self, value: T) -> Result<(), T> {
         if self.is_full() {
             return Err(value);
@@ -102,129 +127,169 @@ impl<T, const N: usize> RingBuffer<T, N> {
     ///
     /// # Panics
     ///
-    /// Panics (debug-asserts) if the buffer is full. Use `push_back` when the
+    /// Panics in debug builds if the buffer is full. Use `push_back` when the
     /// caller cannot guarantee capacity.
+    #[inline]
     pub fn push_back_assume_capacity(&mut self, value: T) {
-        assert!(self.len < Self::CAPACITY);
-        assert!(self.head < Self::CAPACITY);
+        debug_assert!(
+            self.len < Self::CAPACITY,
+            "push_back_assume_capacity called on full buffer"
+        );
+        debug_assert!(self.head < Self::CAPACITY, "head out of bounds");
 
-        let tail = (self.head + self.len) % Self::CAPACITY;
+        // PERF: Uses bitwise AND instead of modulo for power-of-2 capacity.
+        // This compiles to a single AND instruction vs expensive div/mul sequence.
+        let tail = (self.head + self.len) & Self::MASK;
 
-        assert!(tail < Self::CAPACITY);
-        assert!(self.len < Self::CAPACITY);
+        debug_assert!(tail < Self::CAPACITY, "tail out of bounds");
 
-        self.buf[index(tail)].write(value);
+        // SAFETY: tail < CAPACITY guaranteed by mask operation on power-of-2 capacity.
+        // The mask ensures the result is always in [0, CAPACITY).
+        unsafe { self.buf.get_unchecked_mut(index(tail)).write(value) };
         self.len += 1;
 
-        assert!(self.len <= Self::CAPACITY);
-        assert!(self.len > 0);
+        debug_assert!(self.len <= Self::CAPACITY);
     }
 
     /// Removes and returns the oldest element, or `None` when empty.
+    #[inline]
     pub fn pop_front(&mut self) -> Option<T> {
         if self.is_empty() {
             return None;
         }
 
-        assert!(self.len > 0);
-        assert!(self.head <= Self::CAPACITY);
+        debug_assert!(self.len > 0);
+        debug_assert!(self.head < Self::CAPACITY, "head out of bounds");
 
         let idx = self.head;
-        assert!(idx < Self::CAPACITY);
 
-        // SAFETY: idx < CAPACITY proven, element initialized because len > 0
-        let value = unsafe { self.buf[index(idx)].as_ptr().read() };
+        // SAFETY: idx < CAPACITY proven by invariant, element initialized because len > 0
+        let value = unsafe { self.buf.get_unchecked(index(idx)).as_ptr().read() };
 
-        self.head = (self.head + 1) % Self::CAPACITY;
+        // PERF: Uses bitwise AND instead of modulo.
+        self.head = (self.head + 1) & Self::MASK;
         self.len -= 1;
 
-        assert!(self.head < Self::CAPACITY);
+        debug_assert!(self.head < Self::CAPACITY);
 
         Some(value)
     }
 
     /// Borrows the oldest element without removal.
+    #[inline]
     pub fn front(&self) -> Option<&T> {
         if self.is_empty() {
             return None;
         }
 
-        assert!(self.len > 0);
-        assert!(self.head <= Self::CAPACITY);
+        debug_assert!(self.len > 0);
+        debug_assert!(self.head < Self::CAPACITY, "head out of bounds");
 
         let idx = self.head;
-        assert!(idx < Self::CAPACITY);
 
-        // SAFETY: idx < CAPACITY proven, element initialized because len > 0
-        Some(unsafe { &*self.buf[index(idx)].as_ptr() })
+        // SAFETY: idx < CAPACITY proven by invariant, element initialized because len > 0
+        Some(unsafe { &*self.buf.get_unchecked(index(idx)).as_ptr() })
     }
 
     /// Mutably borrows the oldest element without removal.
     ///
     /// Useful for in-place updates while preserving position.
+    #[inline]
     pub fn front_mut(&mut self) -> Option<&mut T> {
         if self.is_empty() {
             return None;
         }
 
-        assert!(self.len > 0);
-        assert!(self.head <= Self::CAPACITY);
+        debug_assert!(self.len > 0);
+        debug_assert!(self.head < Self::CAPACITY, "head out of bounds");
 
         let idx = self.head;
-        assert!(idx < Self::CAPACITY);
 
-        // SAFETY: idx < CAPACITY proven, element initialized because len > 0
-        Some(unsafe { &mut *self.buf[index(idx)].as_mut_ptr() })
+        // SAFETY: idx < CAPACITY proven by invariant, element initialized because len > 0
+        Some(unsafe { &mut *self.buf.get_unchecked_mut(index(idx)).as_mut_ptr() })
     }
 
     /// Returns a reference to the element at logical index `logical_idx`.
     ///
     /// Index `0` refers to the current front; indices grow toward the back,
     /// even after wraparound.
+    #[inline]
     pub fn get(&self, logical_idx: u32) -> Option<&T> {
         if logical_idx >= self.len {
             return None;
         }
 
-        assert!(logical_idx < self.len);
-        assert!(self.head < Self::CAPACITY);
-        assert!(self.len <= Self::CAPACITY);
+        debug_assert!(logical_idx < self.len);
+        debug_assert!(self.head < Self::CAPACITY);
+        debug_assert!(self.len <= Self::CAPACITY);
 
-        let idx = (self.head + logical_idx) % Self::CAPACITY;
-        assert!(idx < Self::CAPACITY);
+        // PERF: Uses bitwise AND instead of modulo.
+        let idx = (self.head + logical_idx) & Self::MASK;
+        debug_assert!(idx < Self::CAPACITY);
 
-        // SAFETY: idx < CAPACITY proven, element initialized because len > 0
-        Some(unsafe { &*self.buf[index(idx)].as_ptr() })
+        // SAFETY: idx < CAPACITY proven by mask, element initialized because logical_idx < len
+        Some(unsafe { &*self.buf.get_unchecked(index(idx)).as_ptr() })
     }
 
     /// Returns a mutable reference to the element at logical index `logical_idx`.
     ///
     /// Indexing semantics mirror `get`; callers can update values in place
     /// without changing ordering.
+    #[inline]
     pub fn get_mut(&mut self, logical_idx: u32) -> Option<&mut T> {
         if logical_idx >= self.len {
             return None;
         }
 
-        assert!(logical_idx < self.len);
-        assert!(self.head < Self::CAPACITY);
-        assert!(self.len <= Self::CAPACITY);
+        debug_assert!(logical_idx < self.len);
+        debug_assert!(self.head < Self::CAPACITY);
+        debug_assert!(self.len <= Self::CAPACITY);
 
-        let idx = (self.head + logical_idx) % Self::CAPACITY;
-        assert!(idx < Self::CAPACITY);
+        // PERF: Uses bitwise AND instead of modulo.
+        let idx = (self.head + logical_idx) & Self::MASK;
+        debug_assert!(idx < Self::CAPACITY);
 
-        // SAFETY: idx < CAPACITY proven, element initialized because len > 0
-        Some(unsafe { &mut *self.buf[index(idx)].as_mut_ptr() })
+        // SAFETY: idx < CAPACITY proven by mask, element initialized because logical_idx < len
+        Some(unsafe { &mut *self.buf.get_unchecked_mut(index(idx)).as_mut_ptr() })
     }
 
     /// Removes all elements, dropping them in FIFO order.
     ///
-    /// Buffer remains usable afterwards without reallocating.
+    /// Buffer remains usable afterwards without reallocating. The drop path
+    /// walks either one contiguous region or two wrapped regions to preserve
+    /// FIFO order.
     pub fn clear(&mut self) {
-        while self.pop_front().is_some() {}
+        if self.len == 0 {
+            return;
+        }
 
-        assert!(self.len == 0);
-        assert!(self.is_empty());
+        let head = self.head as usize;
+        let len = self.len as usize;
+
+        if head + len <= N {
+            // Contiguous region: [head..head+len]
+            for i in head..head + len {
+                // SAFETY: All elements in [head, head+len) are initialized.
+                unsafe { self.buf.get_unchecked_mut(i).assume_init_drop() };
+            }
+        } else {
+            // Wrapped region: [head..N] + [0..wrap_len]
+            let wrap_len = (head + len) - N;
+
+            for i in head..N {
+                // SAFETY: Elements in [head, N) are initialized.
+                unsafe { self.buf.get_unchecked_mut(i).assume_init_drop() };
+            }
+            for i in 0..wrap_len {
+                // SAFETY: Elements in [0, wrap_len) are initialized.
+                unsafe { self.buf.get_unchecked_mut(i).assume_init_drop() };
+            }
+        }
+
+        self.head = 0;
+        self.len = 0;
+
+        debug_assert!(self.is_empty());
     }
 }
 
@@ -237,7 +302,7 @@ impl<T, const N: usize> Default for RingBuffer<T, N> {
 impl<T, const N: usize> Drop for RingBuffer<T, N> {
     fn drop(&mut self) {
         self.clear();
-        assert!(self.len == 0);
+        debug_assert!(self.len == 0);
     }
 }
 
@@ -319,28 +384,33 @@ mod tests {
 
     #[test]
     fn wraparound() {
-        let mut rb: RingBuffer<i32, 3> = RingBuffer::new();
+        // Using power-of-2 capacity
+        let mut rb: RingBuffer<i32, 4> = RingBuffer::new();
         rb.push_back_assume_capacity(1);
         rb.push_back_assume_capacity(2);
         assert_eq!(rb.pop_front(), Some(1));
         rb.push_back_assume_capacity(3);
         rb.push_back_assume_capacity(4);
-        // Now buffer is full: contents [2,3,4]
-        assert_eq!(rb.len(), 3);
+        rb.push_back_assume_capacity(5);
+        // Now buffer is full: contents [2,3,4,5]
+        assert_eq!(rb.len(), 4);
         assert_eq!(rb.front(), Some(&2));
         assert_eq!(rb.get(0), Some(&2));
         assert_eq!(rb.get(1), Some(&3));
         assert_eq!(rb.get(2), Some(&4));
+        assert_eq!(rb.get(3), Some(&5));
     }
 
     #[test]
     fn get_mut_wraparound_updates_correct_slot() {
-        let mut rb: RingBuffer<i32, 3> = RingBuffer::new();
+        // Using power-of-2 capacity
+        let mut rb: RingBuffer<i32, 4> = RingBuffer::new();
         rb.push_back_assume_capacity(10);
         rb.push_back_assume_capacity(20);
         assert_eq!(rb.pop_front(), Some(10));
         rb.push_back_assume_capacity(30);
         rb.push_back_assume_capacity(40);
+        rb.push_back_assume_capacity(50);
 
         if let Some(elem) = rb.get_mut(1) {
             *elem += 1;
@@ -349,6 +419,7 @@ mod tests {
         assert_eq!(rb.get(0), Some(&20));
         assert_eq!(rb.get(1), Some(&31));
         assert_eq!(rb.get(2), Some(&40));
+        assert_eq!(rb.get(3), Some(&50));
     }
 
     #[test]
@@ -370,7 +441,8 @@ mod tests {
     fn clear_drops_elements_and_allows_reuse() {
         let drops = Rc::new(Cell::new(0));
         {
-            let mut rb: RingBuffer<DropTracker, 3> = RingBuffer::new();
+            // Using power-of-2 capacity
+            let mut rb: RingBuffer<DropTracker, 4> = RingBuffer::new();
             rb.push_back_assume_capacity(DropTracker::new(1, Rc::clone(&drops)));
             rb.push_back_assume_capacity(DropTracker::new(2, Rc::clone(&drops)));
             rb.push_back_assume_capacity(DropTracker::new(3, Rc::clone(&drops)));
@@ -411,34 +483,37 @@ mod tests {
     fn drop_with_buffer_in_wrapped_state() {
         let drops = Rc::new(Cell::new(0));
         {
-            let mut rb: RingBuffer<DropTracker, 3> = RingBuffer::new();
+            // Using power-of-2 capacity
+            let mut rb: RingBuffer<DropTracker, 4> = RingBuffer::new();
 
-            // Fill: physical [1, 2, 3], head=0, len=3
+            // Fill: physical [1, 2, 3, 4], head=0, len=4
             rb.push_back_assume_capacity(DropTracker::new(1, Rc::clone(&drops)));
             rb.push_back_assume_capacity(DropTracker::new(2, Rc::clone(&drops)));
             rb.push_back_assume_capacity(DropTracker::new(3, Rc::clone(&drops)));
+            rb.push_back_assume_capacity(DropTracker::new(4, Rc::clone(&drops)));
 
-            // Pop two: physical [_, _, 3], head=2, len=1
+            // Pop two: physical [_, _, 3, 4], head=2, len=2
             rb.pop_front(); // drops 1
             rb.pop_front(); // drops 2
 
-            // Push two: physical [4, 5, 3], head=2, len=3 (WRAPPED: tail < head)
-            rb.push_back_assume_capacity(DropTracker::new(4, Rc::clone(&drops)));
+            // Push two: physical [5, 6, 3, 4], head=2, len=4 (WRAPPED: tail < head)
             rb.push_back_assume_capacity(DropTracker::new(5, Rc::clone(&drops)));
+            rb.push_back_assume_capacity(DropTracker::new(6, Rc::clone(&drops)));
 
             assert_eq!(drops.get(), 2); // Only 1 and 2 dropped so far
             assert!(rb.is_full());
 
-            // Verify logical order is [3, 4, 5]
+            // Verify logical order is [3, 4, 5, 6]
             assert_eq!(rb.get(0).map(|t| t.value), Some(3));
             assert_eq!(rb.get(1).map(|t| t.value), Some(4));
             assert_eq!(rb.get(2).map(|t| t.value), Some(5));
+            assert_eq!(rb.get(3).map(|t| t.value), Some(6));
 
-            // Buffer drops here - must correctly drop 3, 4, 5
+            // Buffer drops here - must correctly drop 3, 4, 5, 6
         }
 
-        // All 5 elements should have been dropped exactly once
-        assert_eq!(drops.get(), 5);
+        // All 6 elements should have been dropped exactly once
+        assert_eq!(drops.get(), 6);
     }
 
     #[derive(Debug)]
@@ -463,13 +538,14 @@ mod tests {
     fn drops_occur_in_fifo_order() {
         let order = Rc::new(std::cell::RefCell::new(Vec::new()));
         {
-            let mut rb: RingBuffer<OrderTracker, 3> = RingBuffer::new();
+            // Using power-of-2 capacity
+            let mut rb: RingBuffer<OrderTracker, 4> = RingBuffer::new();
             rb.push_back_assume_capacity(OrderTracker::new(1, Rc::clone(&order)));
             rb.push_back_assume_capacity(OrderTracker::new(2, Rc::clone(&order)));
             rb.push_back_assume_capacity(OrderTracker::new(3, Rc::clone(&order)));
             // rb drops here via Drop trait
         }
-        // clear() uses pop_front() which should drop in FIFO order
+        // clear() drops in FIFO order via optimized bulk drop
         assert_eq!(*order.borrow(), vec![1, 2, 3]);
     }
 
@@ -477,16 +553,18 @@ mod tests {
     fn drops_occur_in_fifo_order_wrapped() {
         let order = Rc::new(std::cell::RefCell::new(Vec::new()));
         {
-            let mut rb: RingBuffer<OrderTracker, 3> = RingBuffer::new();
+            // Using power-of-2 capacity
+            let mut rb: RingBuffer<OrderTracker, 4> = RingBuffer::new();
             rb.push_back_assume_capacity(OrderTracker::new(1, Rc::clone(&order)));
             rb.push_back_assume_capacity(OrderTracker::new(2, Rc::clone(&order)));
             rb.pop_front(); // drops 1
             rb.push_back_assume_capacity(OrderTracker::new(3, Rc::clone(&order)));
             rb.push_back_assume_capacity(OrderTracker::new(4, Rc::clone(&order)));
-            // Buffer is wrapped: logical [2, 3, 4]
+            rb.push_back_assume_capacity(OrderTracker::new(5, Rc::clone(&order)));
+            // Buffer is wrapped: logical [2, 3, 4, 5]
         }
-        // Should drop in FIFO order: 1 (from pop), then 2, 3, 4 (from Drop)
-        assert_eq!(*order.borrow(), vec![1, 2, 3, 4]);
+        // Should drop in FIFO order: 1 (from pop), then 2, 3, 4, 5 (from Drop)
+        assert_eq!(*order.borrow(), vec![1, 2, 3, 4, 5]);
     }
 
     #[derive(Debug, Clone)]

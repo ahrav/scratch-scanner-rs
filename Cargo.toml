@@ -24,7 +24,8 @@ aegis = { version = "0.9", features = ["pure-rust"] }
 [features]
 stdx-proptest = []
 kgram-gate = []
-b64-stats = []
+stats = []
+b64-stats = ["stats"]
 bench = []
 tiger-harness = []
 
@@ -48,8 +49,33 @@ name = "hotspots"
 harness = false
 required-features = ["bench"]
 
+[[bench]]
+name = "ring_buffer"
+harness = false
+
+[[bench]]
+name = "fixed_set"
+harness = false
+
+[[bench]]
+name = "fixed_vec"
+harness = false
+
+[[bench]]
+name = "queue"
+harness = false
+
+[[bench]]
+name = "released_set"
+harness = false
+
 [profile.dev]
 opt-level = 1
 
 [profile.release]
 opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+inherits = "release"

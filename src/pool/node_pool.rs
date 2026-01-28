@@ -1,8 +1,23 @@
 //! Pre-allocated fixed-size node pool for LSM tree structures.
 //!
-//! Avoids per-node allocation overhead by pre-allocating a contiguous buffer and
-//! tracking free slots via bitset. This gives O(1) acquire/release and enables
-//! memory budgeting upfront. Panics on drop if nodes are leaked to catch bugs early.
+//! # Scope
+//! This module provides a contiguous buffer of fixed-size nodes and a compact
+//! free-list implemented as a bitset. It is intended for performance-critical
+//! LSM internals where allocation must be predictable and bounded.
+//!
+//! # Invariants
+//! - Each acquired pointer is aligned to `NODE_ALIGNMENT` and sized for
+//!   `NODE_SIZE` bytes.
+//! - Every acquired node must be released exactly once back to the same pool.
+//! - `reset`, `deinit`, and `drop` invalidate all outstanding node pointers.
+//! - The bitset tracks *free* nodes (set bit means available).
+//!
+//! # Semantics
+//! - `acquire` returns raw, uninitialized storage.
+//! - `release` only accepts pointers previously returned by `acquire` that are
+//!   still outstanding. Violating this is a logic error and may corrupt pool
+//!   state in release builds.
+//! - `drop` panics if any nodes are leaked to catch bugs early.
 
 use std::{
     alloc::{alloc, dealloc, handle_alloc_error, Layout},
@@ -13,8 +28,9 @@ use crate::stdx::DynamicBitSet;
 
 /// Fixed-size node memory pool.
 ///
-/// Acquired nodes must be released exactly once. Panics on exhaustion or double-free
-/// rather than returning errors - memory issues in LSM structures are fatal.
+/// Implementations must return properly aligned raw storage and enforce that
+/// each acquired node is released exactly once. The API is intentionally
+/// fail-fast: exhaustion or double-free is treated as a fatal bug.
 pub trait NodePool {
     /// Node size in bytes. Must be power of two and multiple of `NODE_ALIGNMENT`.
     const NODE_SIZE: usize;
@@ -25,10 +41,11 @@ pub trait NodePool {
     fn release(&mut self, node: NonNull<u8>);
 }
 
-/// Pre-allocated node pool backed by contiguous buffer and bitset.
+/// Pre-allocated node pool backed by a contiguous buffer and bitset.
 ///
-/// Uses a bitset where set bits indicate free nodes, enabling O(1) first-fit allocation.
-/// Panics on drop if any nodes weren't released - intentional leak detection.
+/// The bitset tracks free slots (set bit = available), enabling O(1)
+/// first-fit allocation via "find first set". `drop` panics if any nodes
+/// weren't released, providing leak detection during development.
 pub struct NodePoolType<const NODE_SIZE: usize, const NODE_ALIGNMENT: usize> {
     buffer: NonNull<u8>,
     len: usize,
@@ -42,10 +59,15 @@ impl<const NODE_SIZE: usize, const NODE_ALIGNMENT: usize> NodePoolType<NODE_SIZE
     pub const NODE_SIZE: usize = NODE_SIZE;
     pub const NODE_ALIGNMENT: usize = NODE_ALIGNMENT;
 
-    /// Creates pool with capacity for `node_count` nodes.
+    /// Creates a pool with capacity for `node_count` nodes.
     ///
-    /// All memory is allocated upfront to enable budgeting and avoid runtime allocation
-    /// failures during critical operations.
+    /// All memory is allocated upfront to enable budgeting and avoid runtime
+    /// allocation failures during critical operations.
+    ///
+    /// # Panics
+    /// - `node_count == 0`.
+    /// - `NODE_SIZE`/`NODE_ALIGNMENT` violate the layout invariants.
+    /// - The computed buffer size overflows or the allocator fails.
     pub fn init(node_count: u32) -> Self {
         assert!(node_count > 0);
         Self::assert_layout();
@@ -72,30 +94,37 @@ impl<const NODE_SIZE: usize, const NODE_ALIGNMENT: usize> NodePoolType<NODE_SIZE
 
     /// Explicitly deallocates the pool. Idempotent.
     ///
-    /// Panics if nodes weren't released - this catches leaks during development.
+    /// # Panics
+    /// Panics if any nodes remain outstanding. This catches leaks during
+    /// development and mirrors `drop` behavior.
     pub fn deinit(&mut self) {
         self.deinit_internal(true);
     }
 
     /// Marks all nodes as free without deallocating the buffer.
     ///
-    /// Useful for bulk reset scenarios. Invalidates all outstanding node pointers.
+    /// Useful for bulk reset scenarios. Invalidates all outstanding node
+    /// pointers. The underlying memory is not cleared.
     pub fn reset(&mut self) {
         Self::set_all(&mut self.free);
     }
 
     /// Returns pointer to an uninitialized node.
     ///
-    /// Panics on exhaustion rather than returning an error - running out of nodes
-    /// indicates a configuration issue that should fail fast.
+    /// The pointer is valid until `release`, `reset`, `deinit`, or `drop`. The
+    /// caller must initialize the memory before use.
+    ///
+    /// # Panics
+    /// Panics on exhaustion rather than returning an error; running out of
+    /// nodes indicates a configuration issue that should fail fast.
     pub fn acquire(&mut self) -> NonNull<u8> {
         let node_index = Self::find_first_set(&self.free)
             .unwrap_or_else(|| panic!("node pool exhausted; increase pool capacity"));
-        assert!(self.free.is_set(node_index));
+        debug_assert!(self.free.is_set(node_index));
         self.free.unset(node_index);
 
         let offset = node_index * NODE_SIZE;
-        assert!(offset + NODE_SIZE <= self.len);
+        debug_assert!(offset + NODE_SIZE <= self.len);
 
         // SAFETY: Offset bounds verified by assertion above.
         unsafe { NonNull::new_unchecked(self.buffer.as_ptr().add(offset)) }
@@ -103,20 +132,24 @@ impl<const NODE_SIZE: usize, const NODE_ALIGNMENT: usize> NodePoolType<NODE_SIZE
 
     /// Returns a node to the pool.
     ///
-    /// Validates the pointer came from this pool and wasn't already released.
-    /// These checks catch use-after-free and double-free bugs immediately.
+    /// # Preconditions
+    /// - `node` must have been returned by `acquire` on this pool.
+    /// - It must still be outstanding (not already released).
+    ///
+    /// These checks are debug-only; violating the preconditions in release
+    /// builds is a logic error that can corrupt the pool state.
     pub fn release(&mut self, node: NonNull<u8>) {
         let base = self.buffer.as_ptr() as usize;
         let ptr = node.as_ptr() as usize;
 
-        assert!(ptr >= base);
-        assert!(ptr + NODE_SIZE <= base + self.len);
+        debug_assert!(ptr >= base);
+        debug_assert!(ptr + NODE_SIZE <= base + self.len);
 
         let node_offset = ptr - base;
-        assert!(node_offset.is_multiple_of(NODE_SIZE));
+        debug_assert!(node_offset.is_multiple_of(NODE_SIZE));
 
         let node_index = node_offset / NODE_SIZE;
-        assert!(!self.free.is_set(node_index));
+        debug_assert!(!self.free.is_set(node_index));
         self.free.set(node_index);
     }
 

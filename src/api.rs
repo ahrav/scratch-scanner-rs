@@ -1,12 +1,32 @@
+//! Public API data types for configuring the scanner and reporting results.
+//!
+//! # Invariants
+//! - `FileId` and `StepId` are opaque indices; they are only valid for the table/arena
+//!   that created them.
+//! - `DecodeSteps` is bounded by `MAX_DECODE_STEPS`, which must cover the root step plus
+//!   the maximum transform depth.
+//! - `RuleSpec`, `TransformConfig`, and `Tuning` are validated at engine build time;
+//!   invalid combinations panic during construction.
+//!
+//! # Algorithm
+//! - Findings are accumulated as compact `FindingRec` values on the hot path.
+//! - `FindingRec` is later materialized into `Finding` by expanding the decode-step chain.
+//! - Optional transform decoding is bounded by per-rule and global budgets.
+//!
+//! # Design Notes
+//! - Types here are intentionally lightweight and `Copy` where possible to keep scans
+//!   allocation-free on the hot path.
+//! - Some budget caps are hard limits and can drop work when exceeded; tune for your
+//!   desired balance of throughput and completeness.
+
 use crate::stdx::FixedVec;
 use regex::bytes::Regex;
 use std::ops::Range;
 
-// --------------------------
-// Public API types
-// --------------------------
-
 /// Opaque file identifier used to index into [`FileTable`].
+///
+/// # Invariants
+/// - Only valid for the `FileTable` that produced it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FileId(pub u32);
 
@@ -14,6 +34,9 @@ pub struct FileId(pub u32);
 ///
 /// Steps are chained from the root buffer to derived buffers so findings can be
 /// reconstructed without cloning vectors on the hot path.
+///
+/// # Invariants
+/// - Only valid while the originating decode-step arena is alive and not reset.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct StepId(pub(crate) u32);
 
@@ -23,6 +46,7 @@ pub struct StepId(pub(crate) u32);
 /// enforced at engine build time. Raising this increases per-finding storage.
 pub const MAX_DECODE_STEPS: usize = 8;
 
+/// Sentinel step id that marks the root of a provenance chain.
 pub(crate) const STEP_ROOT: StepId = StepId(u32::MAX);
 
 impl Default for StepId {
@@ -34,7 +58,9 @@ impl Default for StepId {
 /// Identifies a supported transform used for derived-buffer scanning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TransformId {
+    /// URL percent decoding (optionally treating `+` as space).
     UrlPercent,
+    /// Base64 decoding (with optional whitespace allowances).
     Base64,
     // Add more: JsonUnescape, HtmlUnescape, Gzip, Zlib, Brotli, etc.
 }
@@ -42,7 +68,9 @@ pub enum TransformId {
 /// Controls when a transform is applied during scanning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransformMode {
+    /// Never apply this transform.
     Disabled,
+    /// Always apply this transform, subject to span and budget caps.
     Always,
 
     /// Correctness trade (explicit).
@@ -54,6 +82,7 @@ pub enum TransformMode {
 /// Gate policy for expensive transform decoding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Gate {
+    /// No gate; decode all candidate spans (subject to caps).
     None,
 
     /// Stream-decode and proceed only if decoded bytes contain any anchor variant
@@ -62,6 +91,14 @@ pub enum Gate {
 }
 
 /// Configuration for a single transform stage.
+///
+/// # Invariants
+/// - `max_encoded_len >= min_len`.
+/// - When `mode` is not `Disabled`, `max_spans_per_buffer` and `max_decoded_bytes` are > 0.
+///
+/// # Performance
+/// - Span detection and decoding are capped per buffer to keep worst-case work bounded.
+/// - `gate` can skip costly decodes when anchors are absent in decoded output.
 #[derive(Clone, Debug)]
 pub struct TransformConfig {
     /// Transform kind.
@@ -114,6 +151,8 @@ impl TransformConfig {
 }
 
 /// Base64 decode/gate instrumentation counters.
+///
+/// Counters saturate on overflow.
 #[cfg(feature = "b64-stats")]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Base64DecodeStats {
@@ -194,6 +233,10 @@ pub enum Utf16Endianness {
 }
 
 /// A single decode step in the provenance chain for a finding.
+///
+/// # Invariants
+/// - `parent_span` is a byte range in the parent representation (half-open).
+/// - `Transform::transform_idx` indexes into `Engine::transforms`.
 #[derive(Clone, Debug)]
 pub enum DecodeStep {
     /// Transform step is deterministic via transform_idx (index into Engine.transforms).
@@ -213,9 +256,14 @@ pub enum DecodeStep {
 /// Fixed-capacity decode-step chain stored inline in [`Finding`].
 ///
 /// Length is bounded by [`MAX_DECODE_STEPS`]; pushing past capacity panics.
+/// Steps are ordered from root to leaf when materialized.
 pub type DecodeSteps = FixedVec<DecodeStep, MAX_DECODE_STEPS>;
 
 /// High-level finding with provenance and root-span hint.
+///
+/// # Guarantees
+/// - `span` and `root_span_hint` are half-open byte ranges.
+/// - `decode_steps` describes how to reach the representation where `span` applies.
 #[derive(Clone, Debug)]
 pub struct Finding {
     /// Rule name that produced this finding.
@@ -240,6 +288,11 @@ pub struct Finding {
 /// Compact finding record stored during scanning.
 ///
 /// This is later materialized into [`Finding`] by expanding the decode-step chain.
+///
+/// # Invariants
+/// - `span_start..span_end` is a half-open range in the current buffer.
+/// - `root_hint_start..root_hint_end` is a half-open range in the root file buffer.
+/// - `step_id` is only valid while the originating scratch arena is alive and not reset.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FindingRec {
     /// Source file id for the finding.
@@ -260,6 +313,10 @@ pub struct FindingRec {
 }
 
 /// Two-phase rule specification: confirm in a smaller seed window, then expand.
+///
+/// # Invariants
+/// - `seed_radius <= full_radius`.
+/// - `confirm_any` must be non-empty.
 #[derive(Clone, Debug)]
 pub struct TwoPhaseSpec {
     /// Radius for the seed window used for confirm checks.
@@ -290,6 +347,9 @@ impl TwoPhaseSpec {
 /// Validators assume the anchor match is **match-start aligned** in the raw
 /// representation (i.e., `anchor_start` is the regex match start). If this
 /// cannot be guaranteed for a rule, set [`ValidatorKind::None`].
+///
+/// # Preconditions
+/// - Only use fast validators when anchors are match-start aligned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ValidatorKind {
     /// Prefix + fixed-length tail + optional boundary/terminator checks.
@@ -377,6 +437,19 @@ pub enum TailCharset {
 }
 
 /// Rule configuration for anchor scan + regex validation.
+///
+/// # Invariants
+/// - `name` must be non-empty.
+/// - `two_phase`, `must_contain`, `keywords_any`, and `entropy` must be valid when present.
+///
+/// # Design Notes
+/// - Anchors should be ASCII-ish; UTF-16 variants are derived automatically.
+/// - `radius` is in bytes and should be large enough to cover the regex match window.
+/// - `re` is a bytes regex; no UTF-8 assumptions are made.
+///
+/// # Performance
+/// - Smaller `radius` values reduce regex work but can miss matches if too small.
+/// - `must_contain`, `keywords_any`, and `entropy` act as progressively cheaper filters.
 #[derive(Clone, Debug)]
 pub struct RuleSpec {
     /// Rule name used for reporting.
@@ -450,7 +523,7 @@ impl RuleSpec {
 /// - Entropy is computed over the matched byte slice (full regex match).
 /// - Threshold is bits/byte in [0.0, 8.0].
 /// - Matches shorter than `min_len` pass (entropy is noisy on tiny samples).
-/// - Matches longer than `max_len` are capped for cost control.
+/// - Matches longer than `max_len` are capped for cost control (first `max_len` bytes).
 #[derive(Clone, Debug)]
 pub struct EntropySpec {
     pub min_bits_per_byte: f32,
@@ -477,6 +550,11 @@ impl EntropySpec {
 }
 
 /// Engine tuning knobs for performance and DoS protection.
+///
+/// # Trade-offs
+/// - Window coalescing limits bound CPU cost but may widen validation windows.
+/// - Decode/work-item caps can skip derived buffers when exceeded.
+/// - `max_findings_per_chunk` is a hard cap; excess findings are dropped.
 #[derive(Clone, Debug)]
 pub struct Tuning {
     /// Window merge gap (bytes) when coalescing adjacent anchor hits.
@@ -528,6 +606,8 @@ pub struct Tuning {
 }
 
 /// Anchor automaton kind selection for the Aho-Corasick builder.
+///
+/// Controls the automaton type used for anchor scanning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnchorAcKind {
     Auto,
@@ -551,6 +631,8 @@ impl Tuning {
 }
 
 /// Policy for selecting anchors during engine compilation.
+///
+/// Determines whether to derive anchors from regexes, use manual anchors, or both.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnchorPolicy {
     /// Prefer derived anchors, falling back to manual anchors if derivation fails.

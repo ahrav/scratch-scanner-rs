@@ -1,5 +1,6 @@
 //! Page-aligned, fixed-capacity scratch storage for hot paths.
 //!
+//! # Scope
 //! This module makes allocation behavior explicit and predictable in tight
 //! loops. Regular `Vec` growth can allocate at unpredictable points, so we
 //! provide:
@@ -8,6 +9,18 @@
 //!
 //! The goal is not general-purpose convenience. It is deterministic memory
 //! usage with clear failure modes when capacity is exceeded.
+//!
+//! # Invariants
+//! - `ScratchMemory` owns exactly one allocation and enforces at most one live
+//!   slice at a time.
+//! - `ScratchVec` has a hard capacity; exceeding it is a logic error and will
+//!   panic in debug builds.
+//! - Memory is page-aligned (minimum 4 KiB) to keep alignment predictable.
+//!
+//! # Failure modes
+//! - Capacity overruns are treated as bugs (debug assertions).
+//! - Allocation failures and invalid layouts are reported via
+//!   `ScratchMemoryError`.
 
 use std::alloc::{alloc, dealloc, Layout};
 use std::cell::Cell;
@@ -20,10 +33,14 @@ enum State {
     Busy,
 }
 
+/// Errors returned by scratch allocators.
 #[derive(Debug)]
 pub enum ScratchMemoryError {
+    /// Size or element size was zero where a non-zero allocation is required.
     SizeZero,
+    /// The requested layout was invalid (overflow or bad alignment).
     InvalidLayout,
+    /// The allocator returned null.
     OutOfMemory,
 }
 
@@ -42,9 +59,17 @@ pub struct ScratchMemory {
 
 impl ScratchMemory {
     /// Minimum page size for alignment.
-    /// If you target a platform with a larger minimum page size, adjust this constant.
+    ///
+    /// This constant is not queried from the OS. If you target a platform with
+    /// a larger minimum page size, adjust it accordingly.
     pub const PAGE_SIZE_MIN: usize = 4096;
 
+    /// Allocate a page-aligned scratch buffer of `size` bytes.
+    ///
+    /// # Errors
+    /// - `SizeZero` if `size == 0`.
+    /// - `InvalidLayout` if the alignment/size is not representable.
+    /// - `OutOfMemory` if the allocator returns null.
     pub fn init(size: usize) -> Result<Self, ScratchMemoryError> {
         if size == 0 {
             return Err(ScratchMemoryError::SizeZero);
@@ -66,7 +91,9 @@ impl ScratchMemory {
     }
 
     /// Explicit deinit that asserts the buffer is not in use.
-    /// In normal Rust code you can just let Drop run instead.
+    ///
+    /// In normal Rust code you can just let `Drop` run instead. `Drop` does
+    /// not assert the state to avoid panicking during unwinding.
     pub fn deinit(self) {
         assert_eq!(self.state.get(), State::Free);
     }
@@ -80,6 +107,11 @@ impl ScratchMemory {
     /// Returns a guard that derefs to `[MaybeUninit<T>]`.
     /// - Use `.write(...)` to initialize each element.
     /// - If you fully initialized the region, you may call `unsafe { assume_init_mut() }`.
+    ///
+    /// # Panics
+    /// - If `align_of::<T>() >= PAGE_SIZE_MIN` (unsupported alignment).
+    /// - If `count * size_of::<T>()` overflows or exceeds the buffer length.
+    /// - If another scratch slice is already active.
     pub fn acquire<T>(&self, count: usize) -> ScratchSlice<'_, T> {
         assert!(align_of::<T>() < Self::PAGE_SIZE_MIN);
 
@@ -106,6 +138,7 @@ impl ScratchMemory {
         drop(slice);
     }
 
+    /// Total capacity in bytes of the backing allocation.
     pub fn capacity_bytes(&self) -> usize {
         self.len
     }
@@ -131,10 +164,12 @@ pub struct ScratchSlice<'a, T> {
 }
 
 impl<'a, T> ScratchSlice<'a, T> {
+    /// Number of elements reserved in this slice.
     pub fn len(&self) -> usize {
         self.len
     }
 
+    /// True if the slice is empty.
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -153,6 +188,8 @@ impl<'a, T> ScratchSlice<'a, T> {
     }
 
     /// Explicit release; dropping does the same thing.
+    ///
+    /// This is a no-op convenience method.
     pub fn release(self) {}
 }
 
@@ -196,7 +233,13 @@ impl<'a, T> Drop for ScratchSlice<'a, T> {
 ///
 /// This is a `Vec`-like API with a hard capacity. It never reallocates, so
 /// once constructed it is safe to use in hot loops without risking
-/// allocations. Capacity overruns are treated as bugs and panic.
+/// allocations.
+///
+/// # Invariants
+/// - `len <= cap` at all times.
+/// - Elements in `0..len` are initialized; elements in `len..cap` are not.
+///
+/// Capacity overruns are treated as bugs and only checked in debug builds.
 pub struct ScratchVec<T> {
     ptr: NonNull<MaybeUninit<T>>,
     len: usize,
@@ -205,6 +248,16 @@ pub struct ScratchVec<T> {
 }
 
 impl<T> ScratchVec<T> {
+    /// Allocate a fixed-capacity scratch vector.
+    ///
+    /// # Errors
+    /// - `SizeZero` if `T` has zero size and `cap > 0`.
+    /// - `InvalidLayout` if `cap * size_of::<T>()` overflows or alignment is invalid.
+    /// - `OutOfMemory` if allocation fails.
+    ///
+    /// # Notes
+    /// - `cap == 0` returns a dangling allocation with zero length/capacity.
+    ///   Pushing into a zero-capacity vector is a logic error.
     pub fn with_capacity(cap: usize) -> Result<Self, ScratchMemoryError> {
         if cap == 0 {
             return Ok(Self {
@@ -259,8 +312,13 @@ impl<T> ScratchVec<T> {
         self.truncate(0);
     }
 
+    /// Push a value onto the end of the vector.
+    ///
+    /// # Panics (debug builds)
+    /// Panics if `self.len() == self.capacity()`. In release builds this is a
+    /// logic error that can write out of bounds.
     pub fn push(&mut self, value: T) {
-        assert!(self.len < self.cap, "scratch vec capacity exceeded");
+        debug_assert!(self.len < self.cap, "scratch vec capacity exceeded");
         unsafe {
             self.ptr
                 .as_ptr()
@@ -270,8 +328,13 @@ impl<T> ScratchVec<T> {
         self.len += 1;
     }
 
+    /// Shorten the vector to `new_len`, dropping elements above the new length.
+    ///
+    /// # Panics (debug builds)
+    /// Panics if `new_len > self.len()`. In release builds this is a logic
+    /// error that can leave the vector with uninitialized elements.
     pub fn truncate(&mut self, new_len: usize) {
-        assert!(new_len <= self.len);
+        debug_assert!(new_len <= self.len, "scratch vec truncate out of bounds");
         unsafe {
             for i in new_len..self.len {
                 std::ptr::drop_in_place(self.ptr.as_ptr().add(i).cast::<T>());
@@ -291,18 +354,19 @@ impl<T> ScratchVec<T> {
     /// Appends all elements from `slice` to the vector.
     ///
     /// This is the fixed-capacity equivalent of `Vec::extend_from_slice`. Unlike
-    /// `Vec`, this method panics if the resulting length would exceed capacity,
-    /// making capacity overruns immediately visible during development.
+    /// `Vec`, this method debug-asserts if the resulting length would exceed
+    /// capacity, making capacity overruns immediately visible during development.
     ///
-    /// # Panics
+    /// # Panics (debug builds)
     ///
-    /// Panics if `self.len() + slice.len() > self.capacity()`.
+    /// Panics if `self.len() + slice.len() > self.capacity()`. In release builds
+    /// this is a logic error that can write out of bounds.
     pub fn extend_from_slice(&mut self, slice: &[T])
     where
         T: Copy,
     {
         let new_len = self.len.saturating_add(slice.len());
-        assert!(
+        debug_assert!(
             new_len <= self.cap,
             "scratch vec capacity exceeded on extend_from_slice"
         );
@@ -322,21 +386,22 @@ impl<T> ScratchVec<T> {
     /// allocating intermediate buffers. The source range may overlap with
     /// the destination (memmove semantics).
     ///
-    /// # Panics
+    /// # Panics (debug builds)
     ///
     /// Panics if `start + len` exceeds the current length or if the new
-    /// length would exceed capacity.
+    /// length would exceed capacity. In release builds, violating these
+    /// preconditions can corrupt memory.
     pub fn extend_from_self_range(&mut self, start: usize, len: usize)
     where
         T: Copy,
     {
-        assert!(start <= self.len, "scratch vec range start out of bounds");
-        assert!(
+        debug_assert!(start <= self.len, "scratch vec range start out of bounds");
+        debug_assert!(
             start.saturating_add(len) <= self.len,
             "scratch vec range end out of bounds"
         );
         let new_len = self.len.saturating_add(len);
-        assert!(
+        debug_assert!(
             new_len <= self.cap,
             "scratch vec capacity exceeded on extend_from_self_range"
         );

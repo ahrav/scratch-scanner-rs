@@ -1,3 +1,19 @@
+//! Runtime utilities for scanning: file tables, buffer pools, and chunk readers.
+//!
+//! # Scope
+//! This module provides the single-threaded building blocks used by the
+//! pipeline and synchronous scanner: a columnar file table, a fixed-size buffer
+//! pool, and helpers to read files into overlap-preserving chunks.
+//!
+//! # Invariants and trade-offs
+//! - Buffers are fixed-size and aligned; chunk + overlap must fit in
+//!   `BUFFER_LEN_MAX`.
+//! - The buffer pool is intentionally single-threaded (`Rc` + `UnsafeCell`).
+//! - On Unix, paths live in a fixed-capacity byte arena; overflow is a hard
+//!   error to keep allocations predictable.
+//! - `Chunk::base_offset` always refers to the start of the chunk including
+//!   overlap, which keeps span reporting consistent across boundaries.
+
 use crate::api::{FileId, Finding};
 use crate::engine::{Engine, ScanScratch};
 use crate::pool::NodePoolType;
@@ -363,7 +379,7 @@ struct BufferPoolInner {
 impl BufferPoolInner {
     fn acquire_slot(&self) -> NonNull<u8> {
         let avail = self.available.get();
-        assert!(avail > 0, "buffer pool exhausted");
+        debug_assert!(avail > 0, "buffer pool exhausted");
 
         // SAFETY: BufferPoolInner is single-threaded; this is the only
         // mutable access to the underlying pool for this call.
@@ -380,7 +396,7 @@ impl BufferPoolInner {
 
         let avail = self.available.get();
         let new_avail = avail + 1;
-        assert!(new_avail <= self.capacity);
+        debug_assert!(new_avail <= self.capacity);
         self.available.set(new_avail);
     }
 }
@@ -496,8 +512,8 @@ pub fn read_file_chunks(
     loop {
         let mut handle = pool.acquire();
         let buf = handle.as_mut_slice();
-        assert!(tail_len <= tail.len());
-        assert!(buf.len() >= tail_len + chunk_size);
+        debug_assert!(tail_len <= tail.len());
+        debug_assert!(buf.len() >= tail_len + chunk_size);
 
         if tail_len > 0 {
             buf[..tail_len].copy_from_slice(&tail[..tail_len]);
@@ -542,6 +558,8 @@ pub fn read_file_chunks(
 /// Configuration for synchronous, in-process scanning.
 pub struct ScannerConfig {
     /// Bytes per chunk read from disk (excluding overlap).
+    ///
+    /// Must be > 0 and sized so `chunk_size + overlap <= BUFFER_LEN_MAX`.
     pub chunk_size: usize,
     /// Number of in-flight I/O buffers.
     pub io_queue: usize,
@@ -555,6 +573,9 @@ pub struct ScannerConfig {
 
 impl ScannerConfig {
     /// Computes the backing buffer pool capacity needed for this configuration.
+    ///
+    /// The formula reserves enough buffers for IO + scan staging and avoids
+    /// allocations during steady-state scanning.
     pub fn pool_capacity(&self) -> usize {
         self.io_queue
             .saturating_add(self.scan_threads.saturating_mul(2))
@@ -565,7 +586,8 @@ impl ScannerConfig {
 /// Single-process scanner that reuses buffers and scratch state.
 ///
 /// This runtime uses `Rc`-backed pools internally and is intended for
-/// single-threaded use.
+/// single-threaded use. Results are stored in an internal buffer with a fixed
+/// capacity set at construction time.
 pub struct ScannerRuntime {
     engine: Arc<Engine>,
     config: ScannerConfig,
@@ -603,7 +625,8 @@ impl ScannerRuntime {
     /// Scans a single file synchronously, returning findings with provenance.
     ///
     /// Findings are stored in an internal fixed-capacity buffer sized at
-    /// startup. If the capacity is exceeded, an error is returned.
+    /// startup. If the capacity is exceeded, scanning stops early and an error
+    /// is returned; callers should treat the results as incomplete.
     pub fn scan_file_sync(&mut self, file_id: FileId, path: &Path) -> io::Result<&[Finding]> {
         self.out.clear();
         let mut overflow = false;
