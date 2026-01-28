@@ -1,13 +1,22 @@
 //! Bitset implementations: fixed-size [`BitSet`] with compile-time capacity and
 //! heap-allocated [`DynamicBitSet`] for runtime-determined sizes.
 //!
-//! Both implementations store bits in `u64` words and guarantee that padding bits
-//! (indices beyond the logical capacity) remain zero.
+//! # Invariants
+//! - Bits are stored in `u64` words; padding bits beyond the logical capacity are zero.
+//! - `BitSet` uses `WORDS == words_for_bits(N)`; `DynamicBitSet` uses
+//!   `words.len() == words_for_bits(bit_length)`.
 //!
 //! Keeping padding bits zero avoids "phantom" set bits when iterating or counting
 //! and makes the bitset safe to serialize or hash without masking.
+//!
+//! # Performance
+//! - `is_set`, `set`, `unset`, `set_value` are O(1).
+//! - `count`, `is_empty`, `is_full` are O(WORDS).
+//! - Iteration is O(WORDS + set bits).
 
-/// Computes the number of `u64` words needed to store `N` bits.
+/// Computes the number of `u64` words needed to store `n` bits.
+///
+/// Rounds up to the next word boundary; returns 0 when `n == 0`.
 pub const fn words_for_bits(n: usize) -> usize {
     n.div_ceil(64)
 }
@@ -16,6 +25,10 @@ pub const fn words_for_bits(n: usize) -> usize {
 ///
 /// The const parameter `N` is the bit capacity, and `WORDS` is the number of `u64` words.
 /// Use `WORDS = words_for_bits(N)` to get the correct value.
+///
+/// # Invariants
+/// - Bits in the range `[0, N)` are addressable.
+/// - Padding bits in the last word (if any) are always zero.
 ///
 /// All indexing operations panic when `idx >= N`. Use `iter` to traverse set bits
 /// in ascending order without allocation.
@@ -57,7 +70,9 @@ impl<const N: usize, const WORDS: usize> BitSet<N, WORDS> {
     /// Returns a mutable view into the backing words.
     ///
     /// # Safety
-    /// Callers must ensure all padding bits above `N` remain zero.
+    /// Callers must ensure all padding bits above `N` remain zero. Violating this
+    /// breaks iteration, equality, and any operation that assumes a canonical
+    /// representation.
     #[inline]
     pub unsafe fn words_mut(&mut self) -> &mut [u64; WORDS] {
         &mut self.words
@@ -322,6 +337,9 @@ impl<const N: usize, const WORDS: usize> BitSet<N, WORDS> {
     }
 
     /// Iterates over set bits in ascending order using a snapshot of the current state.
+    ///
+    /// The iterator copies the backing words, so subsequent mutations to `self`
+    /// are not observed by the iterator.
     #[inline]
     pub const fn iter(&self) -> BitSetIterator<N, WORDS> {
         BitSetIterator {
@@ -333,6 +351,8 @@ impl<const N: usize, const WORDS: usize> BitSet<N, WORDS> {
 }
 
 /// Iterator over set bit indices in ascending order, produced by `BitSet::iter`.
+///
+/// Ignores padding bits by checking indices against `N`.
 #[derive(Clone, Copy)]
 pub struct BitSetIterator<const N: usize, const WORDS: usize> {
     words: [u64; WORDS],
@@ -376,6 +396,10 @@ impl<const N: usize, const WORDS: usize> Iterator for BitSetIterator<N, WORDS> {
 /// Unlike [`BitSet`], which has a compile-time fixed capacity `N`, `DynamicBitSet`
 /// allows the capacity to be determined at runtime. It is useful when the number
 /// of bits is not known at compile time or varies per instance.
+///
+/// # Invariants
+/// - `words.len() == words_for_bits(bit_length)`.
+/// - Padding bits in the last word (if any) are always zero.
 ///
 /// The implementation ensures that unused bits in the last word (if `bit_length`
 /// is not a multiple of 64) are always zero. This invariant is critical for
@@ -447,50 +471,56 @@ impl DynamicBitSet {
     ///
     /// # Safety
     ///
-    /// Callers must ensure that any padding bits in the last word (indices `>= bit_length`)
-    /// remain zero.
+    /// Callers must ensure that any padding bits in the last word (indices
+    /// `>= bit_length`) remain zero. Violating this breaks equality and can
+    /// cause iteration/counting to observe phantom bits.
     #[inline]
     pub unsafe fn words_mut(&mut self) -> &mut [u64] {
         &mut self.words
     }
 
     /// Counts set bits; never exceeds `bit_length`.
+    ///
+    /// Optimized: splits the loop to avoid per-iteration branch on last word.
+    #[inline]
     pub fn count(&self) -> usize {
         if self.words.is_empty() {
             return 0;
         }
 
-        let last = self.words.len() - 1;
+        let len = self.words.len();
         let mut total = 0usize;
-        for (i, &word) in self.words.iter().enumerate() {
-            let word = if i == last {
-                word & self.last_word_mask()
-            } else {
-                word
-            };
+
+        // Process all words except the last one - no masking needed
+        for &word in &self.words[..len - 1] {
             total += word.count_ones() as usize;
         }
+
+        // Process the last word with mask
+        total += (self.words[len - 1] & self.last_word_mask()).count_ones() as usize;
         total
     }
 
     /// Returns `true` when no bits are set.
+    ///
+    /// Optimized: branchless OR-folding avoids data-dependent branches.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         if self.words.is_empty() {
             return true;
         }
 
-        let last = self.words.len() - 1;
-        for (i, &word) in self.words.iter().enumerate() {
-            let word = if i == last {
-                word & self.last_word_mask()
-            } else {
-                word
-            };
-            if word != 0 {
-                return false;
-            }
+        let len = self.words.len();
+
+        // OR-fold all words except the last - any set bit propagates
+        let mut acc = 0u64;
+        for &word in &self.words[..len - 1] {
+            acc |= word;
         }
-        true
+
+        // OR in the last word with mask applied
+        acc |= self.words[len - 1] & self.last_word_mask();
+        acc == 0
     }
 
     /// Returns whether `idx` is set.
@@ -615,6 +645,7 @@ impl DynamicBitSet {
 /// Iterator over set bit indices in ascending order, produced by [`DynamicBitSet::iter_set`].
 ///
 /// Yields each index where the corresponding bit is set, from lowest to highest.
+/// Padding bits in the final word are masked out.
 pub struct DynamicBitSetIterator<'a> {
     words: &'a [u64],
     word_idx: usize,
