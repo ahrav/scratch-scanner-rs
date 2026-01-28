@@ -550,6 +550,11 @@ impl EntropySpec {
 }
 
 /// Engine tuning knobs for performance and DoS protection.
+///
+/// # Trade-offs
+/// - Window coalescing limits bound CPU cost but may widen validation windows.
+/// - Decode/work-item caps can skip derived buffers when exceeded.
+/// - `max_findings_per_chunk` is a hard cap; excess findings are dropped.
 #[derive(Clone, Debug)]
 pub struct Tuning {
     /// Window merge gap (bytes) when coalescing adjacent anchor hits.

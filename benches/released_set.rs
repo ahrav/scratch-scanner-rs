@@ -53,8 +53,9 @@ fn bench_insert(c: &mut Criterion) {
         b.iter(|| {
             set.clear_retaining_capacity();
             for &key in &keys {
-                black_box(set.insert(black_box(key)));
+                set.insert(black_box(key));
             }
+            black_box(());
         })
     });
 
@@ -286,16 +287,20 @@ fn bench_clear(c: &mut Criterion) {
         // Fill to 50% capacity before clearing
         let keys = make_keys(cap / 2, 0x7777_8888);
 
-        group.bench_with_input(BenchmarkId::new("filled_50%", cap), &(cap, &keys), |b, (cap, keys)| {
-            let mut set = ReleasedSet::with_capacity(*cap);
-            b.iter(|| {
-                for &key in *keys {
-                    set.insert(key);
-                }
-                set.clear_retaining_capacity();
-                black_box(());
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::new("filled_50%", cap),
+            &(cap, &keys),
+            |b, (cap, keys)| {
+                let mut set = ReleasedSet::with_capacity(*cap);
+                b.iter(|| {
+                    for &key in *keys {
+                        set.insert(key);
+                    }
+                    set.clear_retaining_capacity();
+                    black_box(());
+                })
+            },
+        );
     }
 
     group.finish();

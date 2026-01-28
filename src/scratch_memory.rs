@@ -334,10 +334,7 @@ impl<T> ScratchVec<T> {
     /// Panics if `new_len > self.len()`. In release builds this is a logic
     /// error that can leave the vector with uninitialized elements.
     pub fn truncate(&mut self, new_len: usize) {
-        debug_assert!(
-            new_len <= self.len,
-            "scratch vec truncate out of bounds"
-        );
+        debug_assert!(new_len <= self.len, "scratch vec truncate out of bounds");
         unsafe {
             for i in new_len..self.len {
                 std::ptr::drop_in_place(self.ptr.as_ptr().add(i).cast::<T>());
