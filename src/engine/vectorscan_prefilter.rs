@@ -104,27 +104,11 @@ pub(crate) struct VsAnchorDb {
     max_hits_per_rule_variant: usize,
 }
 
-pub(crate) struct VsGateDb {
-    db: *mut vs::hs_database_t,
-}
-
 // Safe because hs_database_t is immutable after compilation, and we require per-thread scratch.
 unsafe impl Send for VsAnchorDb {}
 unsafe impl Sync for VsAnchorDb {}
-unsafe impl Send for VsGateDb {}
-unsafe impl Sync for VsGateDb {}
 
 impl Drop for VsAnchorDb {
-    fn drop(&mut self) {
-        unsafe {
-            if !self.db.is_null() {
-                vs::hs_free_database(self.db);
-            }
-        }
-    }
-}
-
-impl Drop for VsGateDb {
     fn drop(&mut self) {
         unsafe {
             if !self.db.is_null() {
@@ -349,128 +333,6 @@ impl VsAnchorDb {
             Ok(())
         } else {
             Err(format!("hs_scan failed: rc={rc}"))
-        }
-    }
-}
-
-impl VsGateDb {
-    pub(crate) fn try_new_gate(patterns: &[Vec<u8>]) -> Result<Self, String> {
-        if patterns.is_empty() {
-            return Err("no anchor patterns for gate db".to_string());
-        }
-        if patterns.iter().any(|p| p.is_empty()) {
-            return Err("empty anchor pattern; gate db disabled".to_string());
-        }
-
-        let mut c_patterns: Vec<CString> = Vec::with_capacity(patterns.len());
-        let mut expr_ptrs: Vec<*const c_char> = Vec::with_capacity(patterns.len());
-        let mut flags: Vec<c_uint> = Vec::with_capacity(patterns.len());
-        let mut ids: Vec<c_uint> = Vec::with_capacity(patterns.len());
-
-        let mut next_id: u32 = 0;
-        for pat in patterns {
-            let mut expr = String::with_capacity(pat.len().saturating_mul(4));
-            for &b in pat {
-                use std::fmt::Write;
-                let _ = write!(expr, "\\x{b:02X}");
-            }
-            let c_pat = CString::new(expr)
-                .map_err(|_| "gate pattern contains unexpected NUL".to_string())?;
-            c_patterns.push(c_pat);
-            expr_ptrs.push(c_patterns.last().unwrap().as_ptr());
-            flags.push(vs::HS_FLAG_SINGLEMATCH as c_uint);
-            ids.push(next_id as c_uint);
-            next_id = next_id.saturating_add(1);
-        }
-
-        let mut platform = MaybeUninit::<vs::hs_platform_info_t>::zeroed();
-        unsafe {
-            let _ = vs::hs_populate_platform(platform.as_mut_ptr());
-        }
-        let platform = unsafe { platform.assume_init() };
-
-        let mut db: *mut vs::hs_database_t = ptr::null_mut();
-        let mut compile_err: *mut vs::hs_compile_error_t = ptr::null_mut();
-
-        let rc = unsafe {
-            vs::hs_compile_multi(
-                expr_ptrs.as_ptr(),
-                flags.as_ptr(),
-                ids.as_ptr(),
-                expr_ptrs.len() as c_uint,
-                vs::HS_MODE_BLOCK as c_uint,
-                &platform as *const vs::hs_platform_info_t,
-                &mut db as *mut *mut vs::hs_database_t,
-                &mut compile_err as *mut *mut vs::hs_compile_error_t,
-            )
-        };
-
-        if rc != vs::HS_SUCCESS as c_int {
-            let msg = unsafe {
-                if compile_err.is_null() {
-                    "hs_compile_multi failed (no error message)".to_string()
-                } else {
-                    let s = if (*compile_err).message.is_null() {
-                        "hs_compile_multi failed (null error message)".to_string()
-                    } else {
-                        let cstr = std::ffi::CStr::from_ptr((*compile_err).message);
-                        format!(
-                            "hs_compile_multi failed at expression {}: {}",
-                            (*compile_err).expression,
-                            cstr.to_string_lossy()
-                        )
-                    };
-                    vs::hs_free_compile_error(compile_err);
-                    s
-                }
-            };
-            return Err(msg);
-        }
-
-        Ok(Self { db })
-    }
-
-    pub(crate) fn alloc_scratch(&self) -> Result<VsScratch, String> {
-        let mut scratch: *mut vs::hs_scratch_t = ptr::null_mut();
-        let rc =
-            unsafe { vs::hs_alloc_scratch(self.db, &mut scratch as *mut *mut vs::hs_scratch_t) };
-        if rc != vs::HS_SUCCESS as c_int {
-            return Err(format!("hs_alloc_scratch failed: rc={rc}"));
-        }
-        Ok(VsScratch {
-            scratch,
-            db: self.db,
-        })
-    }
-
-    #[inline]
-    pub(crate) fn db_ptr(&self) -> *mut vs::hs_database_t {
-        self.db
-    }
-
-    pub(crate) fn scan_gate(&self, hay: &[u8], vs_scratch: &mut VsScratch) -> Result<bool, String> {
-        let len_u32: c_uint = hay
-            .len()
-            .try_into()
-            .map_err(|_| format!("buffer too large for hs_scan: {} bytes", hay.len()))?;
-
-        let mut ctx = VsGateMatchCtx { matched: false };
-        let rc = unsafe {
-            vs::hs_scan(
-                self.db,
-                hay.as_ptr().cast::<c_char>(),
-                len_u32,
-                0,
-                vs_scratch.scratch,
-                Some(vs_gate_on_match),
-                (&mut ctx as *mut VsGateMatchCtx).cast::<c_void>(),
-            )
-        };
-
-        match rc {
-            x if x == vs::HS_SUCCESS as c_int => Ok(ctx.matched),
-            x if x == vs::HS_SCAN_TERMINATED as c_int => Ok(ctx.matched),
-            _ => Err(format!("hs_scan failed: rc={rc}")),
         }
     }
 }
@@ -703,23 +565,6 @@ struct VsAnchorMatchCtx {
     pat_count: u32,
     hay_len: u32,
     max_hits: usize,
-}
-
-#[repr(C)]
-struct VsGateMatchCtx {
-    matched: bool,
-}
-
-extern "C" fn vs_gate_on_match(
-    _id: c_uint,
-    _from: u64,
-    _to: u64,
-    _flags: c_uint,
-    ctx: *mut c_void,
-) -> c_int {
-    let c = unsafe { &mut *(ctx as *mut VsGateMatchCtx) };
-    c.matched = true;
-    1
 }
 
 extern "C" fn vs_on_match(

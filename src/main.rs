@@ -206,7 +206,7 @@ fn main() -> io::Result<()> {
     if std::env::var_os("SCANNER_VS_STATS").is_some() {
         let vs = engine.vectorscan_stats();
         eprintln!(
-            "vectorscan db_built={} scans_attempted={} scans_ok={} scans_err={} utf16_db_built={} utf16_scans_attempted={} utf16_scans_ok={} utf16_scans_err={} gate_db_built={} gate_scans_attempted={} gate_scans_ok={} gate_scans_err={} anchor_only={} anchor_after_vs={} anchor_skipped={}",
+            "vectorscan db_built={} scans_attempted={} scans_ok={} scans_err={} utf16_db_built={} utf16_scans_attempted={} utf16_scans_ok={} utf16_scans_err={} anchor_only={} anchor_after_vs={} anchor_skipped={}",
             vs.db_built,
             vs.scans_attempted,
             vs.scans_ok,
@@ -215,10 +215,6 @@ fn main() -> io::Result<()> {
             vs.utf16_scans_attempted,
             vs.utf16_scans_ok,
             vs.utf16_scans_err,
-            vs.gate_db_built,
-            vs.gate_scans_attempted,
-            vs.gate_scans_ok,
-            vs.gate_scans_err,
             vs.anchor_only,
             vs.anchor_after_vs,
             vs.anchor_skipped
