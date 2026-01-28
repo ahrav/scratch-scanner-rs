@@ -91,6 +91,7 @@ impl ReleasedSet {
     }
 
     /// Returns the number of elements in the set.
+    #[inline]
     pub fn len(&self) -> usize {
         self.stack.len()
     }
@@ -102,6 +103,7 @@ impl ReleasedSet {
     }
 
     /// Returns `true` if the set contains no elements.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.stack.is_empty()
     }
@@ -120,6 +122,7 @@ impl ReleasedSet {
     ///
     /// This operation is O(1) on average, with worst-case O(n) if the table
     /// has many collisions (unlikely given the 0.5 load factor constraint).
+    #[inline]
     pub fn contains(&self, key: u64) -> bool {
         let mut idx = (released_set_hash(key) as usize) & self.mask;
 
@@ -144,6 +147,7 @@ impl ReleasedSet {
     ///
     /// Panics if the set is full (capacity exceeded). This design is intentional for
     /// deterministic systems where resource limits must be explicitly modeled and respected.
+    #[inline]
     pub fn insert(&mut self, key: u64) {
         let mut idx = (released_set_hash(key) as usize) & self.mask;
 
@@ -175,6 +179,7 @@ impl ReleasedSet {
     /// but this should not be relied upon.
     ///
     /// Uses the internal stack to locate an element in O(1).
+    #[inline]
     pub fn pop(&mut self) -> Option<u64> {
         let key = self.stack.pop()?;
         // We must remove from the table as well to keep `contains` consistent.
@@ -189,6 +194,7 @@ impl ReleasedSet {
     /// Internal removal from the linear-probing table.
     ///
     /// Returns `true` if the key was present and removed.
+    #[inline]
     fn remove(&mut self, key: u64) -> bool {
         let mut idx = (released_set_hash(key) as usize) & self.mask;
 
@@ -212,6 +218,7 @@ impl ReleasedSet {
     /// any elements that collided and were stored in subsequent slots.
     /// This function moves such elements "back" to fill the `hole`, ensuring that
     /// all remaining elements are still reachable from their native hash index.
+    #[inline]
     fn backshift_delete(&mut self, mut hole: usize) {
         let mut i = (hole + 1) & self.mask;
 

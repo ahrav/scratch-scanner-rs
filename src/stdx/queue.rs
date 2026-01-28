@@ -66,7 +66,7 @@ impl<T, Tag> QueueLink<T, Tag> {
         self.next = None;
         self.linked = false;
 
-        assert!(self.is_unlinked());
+        debug_assert!(self.is_unlinked());
     }
 
     /// Internal: clear link state when popped.
@@ -75,7 +75,7 @@ impl<T, Tag> QueueLink<T, Tag> {
         self.next = None;
         self.linked = false;
 
-        assert!(self.is_unlinked());
+        debug_assert!(self.is_unlinked());
     }
 }
 
@@ -133,16 +133,16 @@ where
     pub fn is_empty(&self) -> bool {
         let empty = self.head.is_none();
 
-        assert!(empty == (self.tail.is_none()));
-        assert!(empty == (self.len == 0));
+        debug_assert!(empty == (self.tail.is_none()));
+        debug_assert!(empty == (self.len == 0));
 
         empty
     }
 
     #[inline]
     pub fn len(&self) -> u32 {
-        assert!((self.len == 0) == self.tail.is_none());
-        assert!((self.len == 0) == self.head.is_none());
+        debug_assert!((self.len == 0) == self.tail.is_none());
+        debug_assert!((self.len == 0) == self.head.is_none());
 
         self.len
     }
@@ -154,19 +154,13 @@ where
     }
 
     /// Transfer all nodes to a new queue, leaving `self` empty.
+    #[inline]
     pub fn take_all(&mut self) -> Self {
-        let old_len = self.len;
-        let old_head = self.head;
-
         let taken = core::mem::take(self);
 
-        assert!(self.is_empty());
-        assert!(self.len == 0);
-        assert!(self.head.is_none());
-        assert!(self.tail.is_none());
-
-        assert!(taken.len() == old_len);
-        assert!(taken.head == old_head);
+        debug_assert!(self.is_empty());
+        debug_assert!(self.head.is_none());
+        debug_assert!(self.tail.is_none());
 
         taken
     }
@@ -176,12 +170,11 @@ where
     /// # Warning
     /// Does **not** clear node links. Caller must call [`QueueLink::reset`] on
     /// each node before reuse, or nodes will panic on re-push.
+    #[inline]
     pub fn reset(&mut self) {
         *self = Self::init();
 
-        assert!(self.is_empty());
-
-        assert!(self.len == 0);
+        debug_assert!(self.is_empty());
     }
 
     /// Add a node to the back of the queue.
@@ -189,14 +182,14 @@ where
     /// # Panics
     /// - If `node` is already in a queue (linked)
     /// - If queue length would overflow `u32::MAX`
+    #[inline]
     pub fn push(&mut self, node: &mut T) {
-        let old_len = self.len;
-
+        // Safety checks - keep as assert!
         assert!(
             node.queue_link_ref().is_unlinked(),
             "pushing already-linked node"
         );
-        assert!(old_len < u32::MAX, "queue length overflow");
+        assert!(self.len < u32::MAX, "queue length overflow");
 
         let node_ptr = NonNull::from(&mut *node);
         let link = node.queue_link();
@@ -205,20 +198,19 @@ where
 
         match self.tail {
             None => {
-                assert!(self.head.is_none());
-                assert!(self.len == 0);
+                debug_assert!(self.head.is_none());
+                debug_assert!(self.len == 0);
 
                 self.head = Some(node_ptr);
                 self.tail = Some(node_ptr);
             }
             Some(mut tail_ptr) => {
-                assert!(self.head.is_some());
-                assert!(self.len > 0);
+                debug_assert!(self.head.is_some());
+                debug_assert!(self.len > 0);
 
                 unsafe {
                     let tail = tail_ptr.as_mut();
-                    // Tail's next should be None (it's the end of the queue)
-                    assert!(tail.queue_link_ref().next.is_none());
+                    debug_assert!(tail.queue_link_ref().next.is_none());
 
                     tail.queue_link().next = Some(node_ptr);
                 }
@@ -228,19 +220,18 @@ where
 
         self.len += 1;
 
-        assert!(self.len == old_len + 1);
-        assert!(self.tail == Some(node_ptr));
-        assert!(!self.is_empty());
+        debug_assert!(self.tail == Some(node_ptr));
+        debug_assert!(!self.is_empty());
     }
 
     /// Remove and return the front node, or `None` if empty.
     ///
     /// The returned node is unlinked and safe to re-push.
+    #[inline]
     pub fn pop(&mut self) -> Option<NonNull<T>> {
         let mut head_ptr = self.head?;
-        let old_len = self.len;
 
-        assert!(old_len > 0);
+        debug_assert!(self.len > 0);
 
         let next = unsafe { head_ptr.as_ref().queue_link_ref().next };
         self.head = next;
@@ -256,14 +247,14 @@ where
         // Clear the node's link state
         unsafe { head_ptr.as_mut().queue_link().unlink() }
 
-        assert!(self.len == old_len - 1);
-        assert!(self.is_empty() == (self.len == 0));
-        assert!((self.head.is_none()) == (self.tail.is_none()));
+        debug_assert!(self.is_empty() == (self.len == 0));
+        debug_assert!((self.head.is_none()) == (self.tail.is_none()));
 
         Some(head_ptr)
     }
 
     /// O(n) search for `node`. Intended for debugging/assertions.
+    #[cold]
     pub fn contains(&self, node: &T) -> bool {
         let target = node as *const T;
         let mut current = self.head;
