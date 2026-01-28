@@ -1,7 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use scanner_rs::{
-    bench_find_spans_into, demo_engine_with_anchor_mode, AnchorMode, Gate, TransformConfig,
-    TransformId, TransformMode,
+    bench_find_spans_into, bench_stream_decode_base64, bench_stream_decode_url,
+    demo_engine_with_anchor_mode, AnchorMode, Gate, TransformConfig, TransformId, TransformMode,
 };
 use std::time::Duration;
 
@@ -323,10 +323,153 @@ fn bench_size_sweep(c: &mut Criterion) {
     ac_group.finish();
 }
 
+fn bench_decode_url(c: &mut Criterion) {
+    // URL-encoded data with varying escape densities
+    let dense_escapes = {
+        // Every 3 bytes: %XX pattern (100% escape density)
+        let mut buf = vec![0u8; BUF_LEN];
+        let hex_chars = b"0123456789ABCDEF";
+        let mut i = 0;
+        let mut h = 0u8;
+        while i + 2 < buf.len() {
+            buf[i] = b'%';
+            buf[i + 1] = hex_chars[(h >> 4) as usize];
+            buf[i + 2] = hex_chars[(h & 0x0F) as usize];
+            h = h.wrapping_add(1);
+            i += 3;
+        }
+        buf
+    };
+
+    let sparse_escapes = {
+        // One escape every 64 bytes (typical URL path)
+        let mut buf = vec![b'a'; BUF_LEN];
+        let mut i = 0;
+        while i + 2 < buf.len() {
+            buf[i] = b'%';
+            buf[i + 1] = b'2';
+            buf[i + 2] = b'F';
+            i += 64;
+        }
+        buf
+    };
+
+    let mixed_plus = {
+        // Mix of %XX and + characters
+        let mut buf = vec![b'a'; BUF_LEN];
+        let mut i = 0;
+        while i + 3 < buf.len() {
+            buf[i] = b'%';
+            buf[i + 1] = b'2';
+            buf[i + 2] = b'0';
+            buf[i + 3] = b'+';
+            i += 32;
+        }
+        buf
+    };
+
+    let mut group = c.benchmark_group("decode_url");
+
+    group.throughput(Throughput::Bytes(dense_escapes.len() as u64));
+    group.bench_function("dense_escapes", |b| {
+        b.iter(|| {
+            let decoded = bench_stream_decode_url(black_box(&dense_escapes), false);
+            black_box(decoded);
+        })
+    });
+
+    group.throughput(Throughput::Bytes(sparse_escapes.len() as u64));
+    group.bench_function("sparse_escapes", |b| {
+        b.iter(|| {
+            let decoded = bench_stream_decode_url(black_box(&sparse_escapes), false);
+            black_box(decoded);
+        })
+    });
+
+    group.throughput(Throughput::Bytes(mixed_plus.len() as u64));
+    group.bench_function("mixed_plus", |b| {
+        b.iter(|| {
+            let decoded = bench_stream_decode_url(black_box(&mixed_plus), true);
+            black_box(decoded);
+        })
+    });
+
+    group.finish();
+}
+
+fn bench_decode_b64(c: &mut Criterion) {
+    let mut rng = XorShift64::new(0xdead_beef_cafe_babe);
+
+    // Valid base64 data (no whitespace)
+    let valid_b64 = {
+        let mut buf = vec![0u8; BUF_LEN];
+        rng.fill_base64(&mut buf);
+        buf
+    };
+
+    // Base64 with embedded newlines (MIME-style, 76 chars per line)
+    let mime_b64 = {
+        let mut buf = Vec::with_capacity(BUF_LEN + BUF_LEN / 76);
+        let mut tmp = vec![0u8; BUF_LEN];
+        rng.fill_base64(&mut tmp);
+        for chunk in tmp.chunks(76) {
+            buf.extend_from_slice(chunk);
+            buf.push(b'\n');
+        }
+        buf
+    };
+
+    // Base64 with padding
+    let padded_b64 = {
+        // Generate valid base64 with proper padding
+        let mut buf = vec![0u8; BUF_LEN];
+        rng.fill_base64(&mut buf);
+        // Ensure proper 4-byte alignment with padding
+        let aligned_len = (buf.len() / 4) * 4;
+        buf.truncate(aligned_len);
+        // Add some padding cases
+        if aligned_len >= 4 {
+            buf[aligned_len - 1] = b'=';
+            buf[aligned_len - 2] = b'=';
+        }
+        buf
+    };
+
+    let mut group = c.benchmark_group("decode_b64");
+
+    group.throughput(Throughput::Bytes(valid_b64.len() as u64));
+    group.bench_function("valid_continuous", |b| {
+        b.iter(|| {
+            let decoded = bench_stream_decode_base64(black_box(&valid_b64));
+            black_box(decoded);
+        })
+    });
+
+    group.throughput(Throughput::Bytes(mime_b64.len() as u64));
+    group.bench_function("mime_with_newlines", |b| {
+        b.iter(|| {
+            let decoded = bench_stream_decode_base64(black_box(&mime_b64));
+            black_box(decoded);
+        })
+    });
+
+    group.throughput(Throughput::Bytes(padded_b64.len() as u64));
+    group.bench_function("with_padding", |b| {
+        b.iter(|| {
+            let decoded = bench_stream_decode_base64(black_box(&padded_b64));
+            black_box(decoded);
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_transform_spans,
     bench_ac_anchors,
-    bench_size_sweep
+    bench_size_sweep,
+    bench_decode_url,
+    bench_decode_b64
 );
 criterion_main!(benches);

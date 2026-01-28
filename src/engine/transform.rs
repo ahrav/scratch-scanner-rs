@@ -115,6 +115,37 @@ const fn build_byte_class() -> [u8; 256] {
 
 static BYTE_CLASS: [u8; 256] = build_byte_class();
 
+/// Sentinel value indicating an invalid base64 byte in B64_DECODE table.
+const B64_INVALID: u8 = 0xFF;
+/// Sentinel value indicating padding ('=') in B64_DECODE table.
+const B64_PAD: u8 = 64;
+
+/// Lookup table for base64 decoding: 0-63 for valid chars, B64_PAD (64) for '=',
+/// B64_INVALID (0xFF) for invalid bytes.
+/// Accepts both standard (+/) and URL-safe (-_) alphabets.
+const fn build_b64_decode_table() -> [u8; 256] {
+    let mut table = [B64_INVALID; 256];
+    let mut i = 0u8;
+    loop {
+        table[i as usize] = match i {
+            b'A'..=b'Z' => i - b'A',
+            b'a'..=b'z' => i - b'a' + 26,
+            b'0'..=b'9' => i - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' => B64_PAD,
+            _ => B64_INVALID,
+        };
+        if i == 255 {
+            break;
+        }
+        i += 1;
+    }
+    table
+}
+
+static B64_DECODE: [u8; 256] = build_b64_decode_table();
+
 #[inline]
 fn is_urlish(b: u8) -> bool {
     (BYTE_CLASS[b as usize] & URLISH) != 0
@@ -482,16 +513,12 @@ fn stream_decode_base64(
             continue;
         }
 
-        let v = match b {
-            b'A'..=b'Z' => Some(b - b'A'),
-            b'a'..=b'z' => Some(b - b'a' + 26),
-            b'0'..=b'9' => Some(b - b'0' + 52),
-            b'+' | b'-' => Some(62),
-            b'/' | b'_' => Some(63),
-            b'=' => Some(64),
-            _ => None,
+        // Single-lookup decode via B64_DECODE table: 0-63 valid, B64_PAD (64) for '=',
+        // B64_INVALID (0xFF) for invalid bytes. Eliminates the match-per-byte overhead.
+        let v = B64_DECODE[b as usize];
+        if v == B64_INVALID {
+            return Err(Base64DecodeError::InvalidByte(b));
         }
-        .ok_or(Base64DecodeError::InvalidByte(b))?;
 
         // Once padding is seen, only trailing whitespace is allowed.
         if seen_pad {
@@ -510,24 +537,24 @@ fn stream_decode_base64(
         let c = quad[2];
         let d = quad[3];
 
-        if a == 64 || b == 64 {
+        if a == B64_PAD || b == B64_PAD {
             return Err(Base64DecodeError::InvalidPadding);
         }
 
         let b0 = (a << 2) | (b >> 4);
 
-        if c == 64 && d != 64 {
+        if c == B64_PAD && d != B64_PAD {
             return Err(Base64DecodeError::InvalidPadding);
         }
 
-        if c == 64 && d == 64 {
+        if c == B64_PAD && d == B64_PAD {
             out[out_len] = b0;
             out_len += 1;
             seen_pad = true;
         } else {
             let b1 = ((b & 0x0F) << 4) | (c >> 2);
 
-            if d == 64 {
+            if d == B64_PAD {
                 out[out_len] = b0;
                 out[out_len + 1] = b1;
                 out_len += 2;
@@ -559,7 +586,7 @@ fn stream_decode_base64(
     } else if qn == 2 {
         let a = quad[0];
         let b = quad[1];
-        if a == 64 || b == 64 {
+        if a == B64_PAD || b == B64_PAD {
             return Err(Base64DecodeError::InvalidPadding);
         }
         let b0 = (a << 2) | (b >> 4);
@@ -569,7 +596,7 @@ fn stream_decode_base64(
         let a = quad[0];
         let b = quad[1];
         let c = quad[2];
-        if a == 64 || b == 64 || c == 64 {
+        if a == B64_PAD || b == B64_PAD || c == B64_PAD {
             return Err(Base64DecodeError::InvalidPadding);
         }
         let b0 = (a << 2) | (b >> 4);
@@ -674,4 +701,32 @@ pub(super) fn decode_to_vec(
         }
         TransformId::Base64 => decode_base64_to_vec(input, max_out).map_err(|_| ()),
     }
+}
+
+// --------------------------
+// Benchmark helpers (bench feature only)
+// --------------------------
+
+/// Benchmark helper: stream decode URL percent-encoding, discarding output.
+/// Returns bytes successfully decoded.
+#[cfg(feature = "bench")]
+pub fn bench_stream_decode_url(input: &[u8], plus_to_space: bool) -> usize {
+    let mut decoded_bytes = 0usize;
+    let _ = stream_decode_url_percent(input, plus_to_space, |chunk| {
+        decoded_bytes += chunk.len();
+        ControlFlow::Continue(())
+    });
+    decoded_bytes
+}
+
+/// Benchmark helper: stream decode Base64, discarding output.
+/// Returns bytes successfully decoded.
+#[cfg(feature = "bench")]
+pub fn bench_stream_decode_base64(input: &[u8]) -> usize {
+    let mut decoded_bytes = 0usize;
+    let _ = stream_decode_base64(input, |chunk| {
+        decoded_bytes += chunk.len();
+        ControlFlow::Continue(())
+    });
+    decoded_bytes
 }
