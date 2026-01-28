@@ -31,6 +31,20 @@ pub fn demo_engine_with_anchor_mode(mode: AnchorMode) -> Engine {
     Engine::new_with_anchor_policy(demo_rules(), demo_transforms(), demo_tuning(), policy)
 }
 
+/// Builds a demo engine with the specified anchor mode and transform depth cap.
+pub fn demo_engine_with_anchor_mode_and_max_transform_depth(
+    mode: AnchorMode,
+    max_transform_depth: usize,
+) -> Engine {
+    let policy = match mode {
+        AnchorMode::Manual => AnchorPolicy::ManualOnly,
+        AnchorMode::Derived => AnchorPolicy::DerivedOnly,
+    };
+    let mut tuning = demo_tuning();
+    tuning.max_transform_depth = max_transform_depth;
+    Engine::new_with_anchor_policy(demo_rules(), demo_transforms(), tuning, policy)
+}
+
 pub(crate) fn demo_rules() -> Vec<RuleSpec> {
     gitleaks_rules()
 }
@@ -74,5 +88,9 @@ pub(crate) fn demo_tuning() -> Tuning {
         max_total_decode_output_bytes: 512 * 1024,
         max_work_items: 256,
         max_findings_per_chunk: 8192,
+        scan_utf16_variants: true,
+        ac_kind: crate::api::AnchorAcKind::DFA,
+        ac_dense_depth: None,
+        ac_byte_classes: None,
     }
 }

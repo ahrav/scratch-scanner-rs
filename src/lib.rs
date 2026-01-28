@@ -42,13 +42,18 @@ mod runtime;
 #[cfg(feature = "b64-stats")]
 pub use api::Base64DecodeStats;
 pub use api::{
-    AnchorPolicy, DecodeStep, DecodeSteps, DelimAfter, EntropySpec, FileId, Finding, FindingRec,
-    Gate, RuleSpec, StepId, TailCharset, TransformConfig, TransformId, TransformMode, Tuning,
-    TwoPhaseSpec, Utf16Endianness, ValidatorKind, MAX_DECODE_STEPS,
+    AnchorAcKind, AnchorPolicy, DecodeStep, DecodeSteps, DelimAfter, EntropySpec, FileId, Finding,
+    FindingRec, Gate, RuleSpec, StepId, TailCharset, TransformConfig, TransformId, TransformMode,
+    Tuning, TwoPhaseSpec, Utf16Endianness, ValidatorKind, MAX_DECODE_STEPS,
 };
 
-pub use demo::{demo_engine, demo_engine_with_anchor_mode, AnchorMode};
+pub use demo::{
+    demo_engine, demo_engine_with_anchor_mode,
+    demo_engine_with_anchor_mode_and_max_transform_depth, AnchorMode,
+};
 
+#[cfg(feature = "bench")]
+pub use engine::bench_find_spans_into;
 pub use engine::{AnchorPlanStats, Engine, ScanScratch};
 
 pub use async_io::AsyncIoConfig;

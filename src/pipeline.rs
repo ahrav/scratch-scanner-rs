@@ -929,6 +929,7 @@ fn is_dot_or_dotdot(name: &[u8]) -> bool {
 }
 
 #[cfg(unix)]
+#[allow(clippy::unnecessary_cast)]
 fn dev_inode_from_stat(st: &libc::stat) -> (u64, u64) {
     (st.st_dev as u64, st.st_ino)
 }

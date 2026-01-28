@@ -1,0 +1,332 @@
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use scanner_rs::{
+    bench_find_spans_into, demo_engine_with_anchor_mode, AnchorMode, Gate, TransformConfig,
+    TransformId, TransformMode,
+};
+use std::time::Duration;
+
+const BUF_LEN: usize = 4 * 1024 * 1024; // 4 MiB
+
+struct XorShift64 {
+    state: u64,
+}
+
+impl XorShift64 {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.state = x;
+        x
+    }
+
+    fn fill_bytes(&mut self, buf: &mut [u8]) {
+        let mut i = 0;
+        while i < buf.len() {
+            let mut v = self.next_u64();
+            let take = (buf.len() - i).min(8);
+            for j in 0..take {
+                buf[i + j] = (v & 0xff) as u8;
+                v >>= 8;
+            }
+            i += take;
+        }
+    }
+
+    fn fill_base64(&mut self, buf: &mut [u8]) {
+        const ALPH: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for b in buf.iter_mut() {
+            let v = (self.next_u64() & 0x3f) as usize;
+            *b = ALPH[v];
+        }
+    }
+}
+
+struct Dataset {
+    name: &'static str,
+    buf: Vec<u8>,
+}
+
+struct SizeSweep {
+    size: usize,
+    random: Vec<u8>,
+    urlish: Vec<u8>,
+    base64_noise: Vec<u8>,
+    anchors_hits: Vec<u8>,
+}
+
+fn make_random(len: usize, seed: u64) -> Vec<u8> {
+    let mut buf = vec![0u8; len];
+    let mut rng = XorShift64::new(seed);
+    rng.fill_bytes(&mut buf);
+    buf
+}
+
+fn make_base64(len: usize, seed: u64) -> Vec<u8> {
+    let mut buf = vec![0u8; len];
+    let mut rng = XorShift64::new(seed);
+    rng.fill_base64(&mut buf);
+    buf
+}
+
+fn make_urlish(len: usize) -> Vec<u8> {
+    let mut buf = vec![b'a'; len];
+    let stride = 64;
+    let max = len.saturating_sub(3);
+    let mut i = 0usize;
+    while i < max {
+        buf[i] = b'%';
+        buf[i + 1] = b'2';
+        buf[i + 2] = b'F';
+        i = i.saturating_add(stride);
+    }
+    buf
+}
+
+fn make_anchor_hits(len: usize) -> Vec<u8> {
+    let anchors: [&[u8]; 5] = [b"AKIA", b"ghp_", b"xoxb-", b"glpat-", b"sk_test_"];
+    let mut buf = vec![b'a'; len];
+    let stride = 4096;
+    let mut i = 0usize;
+    let mut idx = 0usize;
+    while i < buf.len() {
+        let a = anchors[idx % anchors.len()];
+        if i + a.len() > buf.len() {
+            break;
+        }
+        buf[i..i + a.len()].copy_from_slice(a);
+        i = i.saturating_add(stride);
+        idx += 1;
+    }
+    buf
+}
+
+fn make_size_sweep(sizes: &[usize]) -> Vec<SizeSweep> {
+    sizes
+        .iter()
+        .enumerate()
+        .map(|(idx, &size)| SizeSweep {
+            size,
+            random: make_random(size, 0x1234_5678_9abc_def0 ^ (idx as u64)),
+            urlish: make_urlish(size),
+            base64_noise: make_base64(size, 0x0f0e_0d0c_0b0a_0908 ^ (idx as u64)),
+            anchors_hits: make_anchor_hits(size),
+        })
+        .collect()
+}
+
+fn url_config(max_spans: usize) -> TransformConfig {
+    TransformConfig {
+        id: TransformId::UrlPercent,
+        mode: TransformMode::Always,
+        gate: Gate::AnchorsInDecoded,
+        min_len: 16,
+        max_spans_per_buffer: max_spans,
+        max_encoded_len: 64 * 1024,
+        max_decoded_bytes: 64 * 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    }
+}
+
+fn b64_config(max_spans: usize) -> TransformConfig {
+    TransformConfig {
+        id: TransformId::Base64,
+        mode: TransformMode::Always,
+        gate: Gate::AnchorsInDecoded,
+        min_len: 32,
+        max_spans_per_buffer: max_spans,
+        max_encoded_len: 64 * 1024,
+        max_decoded_bytes: 64 * 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    }
+}
+
+fn bench_transform_spans(c: &mut Criterion) {
+    let random = Dataset {
+        name: "random",
+        buf: make_random(BUF_LEN, 0x1234_5678_9abc_def0),
+    };
+    let urlish = Dataset {
+        name: "urlish",
+        buf: make_urlish(BUF_LEN),
+    };
+    let b64_noise = Dataset {
+        name: "base64_noise",
+        buf: make_base64(BUF_LEN, 0x0f0e_0d0c_0b0a_0908),
+    };
+
+    let url_cfg_limited = url_config(8);
+    let url_cfg_unbounded = url_config(1024);
+    let b64_cfg_limited = b64_config(8);
+    let b64_cfg_unbounded = b64_config(1024);
+
+    let mut spans = Vec::with_capacity(2048);
+
+    let mut url_group = c.benchmark_group("transform_spans_url");
+    for ds in [&random, &urlish] {
+        url_group.throughput(Throughput::Bytes(ds.buf.len() as u64));
+        url_group.bench_with_input(BenchmarkId::new("limited", ds.name), ds, |b, ds| {
+            b.iter(|| {
+                bench_find_spans_into(&url_cfg_limited, black_box(&ds.buf), &mut spans);
+                black_box(spans.len());
+            })
+        });
+        url_group.bench_with_input(BenchmarkId::new("unbounded", ds.name), ds, |b, ds| {
+            b.iter(|| {
+                bench_find_spans_into(&url_cfg_unbounded, black_box(&ds.buf), &mut spans);
+                black_box(spans.len());
+            })
+        });
+    }
+    url_group.finish();
+
+    let mut b64_group = c.benchmark_group("transform_spans_b64");
+    for ds in [&random, &b64_noise] {
+        b64_group.throughput(Throughput::Bytes(ds.buf.len() as u64));
+        b64_group.bench_with_input(BenchmarkId::new("limited", ds.name), ds, |b, ds| {
+            b.iter(|| {
+                bench_find_spans_into(&b64_cfg_limited, black_box(&ds.buf), &mut spans);
+                black_box(spans.len());
+            })
+        });
+        b64_group.bench_with_input(BenchmarkId::new("unbounded", ds.name), ds, |b, ds| {
+            b.iter(|| {
+                bench_find_spans_into(&b64_cfg_unbounded, black_box(&ds.buf), &mut spans);
+                black_box(spans.len());
+            })
+        });
+    }
+    b64_group.finish();
+}
+
+fn bench_ac_anchors(c: &mut Criterion) {
+    let engine = demo_engine_with_anchor_mode(AnchorMode::Manual);
+    let ac = engine.bench_ac_anchors();
+
+    let random = Dataset {
+        name: "random",
+        buf: make_random(BUF_LEN, 0xfeed_face_cafe_beef),
+    };
+    let hits = Dataset {
+        name: "anchors_hits",
+        buf: make_anchor_hits(BUF_LEN),
+    };
+
+    let mut group = c.benchmark_group("ac_anchors");
+    for ds in [&random, &hits] {
+        group.throughput(Throughput::Bytes(ds.buf.len() as u64));
+        group.bench_with_input(
+            BenchmarkId::new("find_overlapping", ds.name),
+            ds,
+            |b, ds| {
+                b.iter(|| {
+                    let mut count = 0usize;
+                    for _ in ac.find_overlapping_iter(black_box(&ds.buf)) {
+                        count += 1;
+                    }
+                    black_box(count);
+                })
+            },
+        );
+    }
+    group.finish();
+}
+
+fn bench_size_sweep(c: &mut Criterion) {
+    let sizes = [
+        64 * 1024,
+        256 * 1024,
+        1024 * 1024,
+        4 * 1024 * 1024,
+        16 * 1024 * 1024,
+        64 * 1024 * 1024,
+    ];
+    let data = make_size_sweep(&sizes);
+
+    let url_cfg = url_config(4096);
+    let b64_cfg = b64_config(4096);
+    let mut spans = Vec::with_capacity(2048);
+
+    let mut url_group = c.benchmark_group("size_sweep_url");
+    url_group.sample_size(10);
+    url_group.measurement_time(Duration::from_secs(3));
+    for ds in &data {
+        url_group.throughput(Throughput::Bytes(ds.size as u64));
+        url_group.bench_with_input(BenchmarkId::new("random", ds.size), ds, |b, ds| {
+            b.iter(|| {
+                bench_find_spans_into(&url_cfg, black_box(&ds.random), &mut spans);
+                black_box(spans.len());
+            })
+        });
+        url_group.bench_with_input(BenchmarkId::new("urlish", ds.size), ds, |b, ds| {
+            b.iter(|| {
+                bench_find_spans_into(&url_cfg, black_box(&ds.urlish), &mut spans);
+                black_box(spans.len());
+            })
+        });
+    }
+    url_group.finish();
+
+    let mut b64_group = c.benchmark_group("size_sweep_b64");
+    b64_group.sample_size(10);
+    b64_group.measurement_time(Duration::from_secs(3));
+    for ds in &data {
+        b64_group.throughput(Throughput::Bytes(ds.size as u64));
+        b64_group.bench_with_input(BenchmarkId::new("random", ds.size), ds, |b, ds| {
+            b.iter(|| {
+                bench_find_spans_into(&b64_cfg, black_box(&ds.random), &mut spans);
+                black_box(spans.len());
+            })
+        });
+        b64_group.bench_with_input(BenchmarkId::new("base64_noise", ds.size), ds, |b, ds| {
+            b.iter(|| {
+                bench_find_spans_into(&b64_cfg, black_box(&ds.base64_noise), &mut spans);
+                black_box(spans.len());
+            })
+        });
+    }
+    b64_group.finish();
+
+    let engine = demo_engine_with_anchor_mode(AnchorMode::Manual);
+    let ac = engine.bench_ac_anchors();
+    let mut ac_group = c.benchmark_group("size_sweep_ac");
+    ac_group.sample_size(10);
+    ac_group.measurement_time(Duration::from_secs(3));
+    for ds in &data {
+        ac_group.throughput(Throughput::Bytes(ds.size as u64));
+        ac_group.bench_with_input(BenchmarkId::new("random", ds.size), ds, |b, ds| {
+            b.iter(|| {
+                let mut count = 0usize;
+                for _ in ac.find_overlapping_iter(black_box(&ds.random)) {
+                    count += 1;
+                }
+                black_box(count);
+            })
+        });
+        ac_group.bench_with_input(BenchmarkId::new("anchors_hits", ds.size), ds, |b, ds| {
+            b.iter(|| {
+                let mut count = 0usize;
+                for _ in ac.find_overlapping_iter(black_box(&ds.anchors_hits)) {
+                    count += 1;
+                }
+                black_box(count);
+            })
+        });
+    }
+    ac_group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_transform_spans,
+    bench_ac_anchors,
+    bench_size_sweep
+);
+criterion_main!(benches);

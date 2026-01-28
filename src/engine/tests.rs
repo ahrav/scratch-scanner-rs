@@ -64,6 +64,66 @@ fn b64_encode(input: &[u8]) -> String {
     out
 }
 
+fn is_b64_char_ref(b: u8) -> bool {
+    matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' | b'=' | b'-' | b'_')
+}
+
+fn is_b64_ws_ref(b: u8, allow_space_ws: bool) -> bool {
+    matches!(b, b'\n' | b'\r' | b'\t') || (allow_space_ws && b == b' ')
+}
+
+fn is_b64_or_ws_ref(b: u8, allow_space_ws: bool) -> bool {
+    is_b64_char_ref(b) || is_b64_ws_ref(b, allow_space_ws)
+}
+
+fn find_base64_spans_reference(
+    hay: &[u8],
+    min_chars: usize,
+    max_len: usize,
+    max_spans: usize,
+    allow_space_ws: bool,
+) -> Vec<Range<usize>> {
+    assert!(max_len >= min_chars);
+    let mut spans: Vec<Range<usize>> = Vec::new();
+    if max_spans == 0 {
+        return spans;
+    }
+
+    let mut i = 0usize;
+    while i < hay.len() && spans.len() < max_spans {
+        while i < hay.len() && !is_b64_or_ws_ref(hay[i], allow_space_ws) {
+            i += 1;
+        }
+        if i >= hay.len() {
+            break;
+        }
+
+        let start = i;
+        let mut b64_chars = 0usize;
+        let mut last_b64 = None::<usize>;
+
+        while i < hay.len() && (i - start) < max_len {
+            let b = hay[i];
+            if !is_b64_or_ws_ref(b, allow_space_ws) {
+                break;
+            }
+            if is_b64_char_ref(b) {
+                b64_chars += 1;
+                last_b64 = Some(i);
+            }
+            i += 1;
+        }
+
+        if b64_chars >= min_chars {
+            if let Some(last) = last_b64 {
+                spans.push(start..(last + 1));
+            }
+        }
+    }
+
+    spans
+}
+
 #[test]
 fn hash128_deterministic() {
     let data = b"hello world";
@@ -121,6 +181,46 @@ fn base64_utf16_aws_key_is_detected() {
     let hits = scan_chunk_findings(&eng, &hay);
 
     assert!(hits.iter().any(|h| h.rule == "aws-access-token"));
+}
+
+#[test]
+fn base64_span_trims_trailing_space_when_allowed() {
+    let hay = b"AAAA   ";
+    let mut spans = Vec::new();
+    find_base64_spans_into(hay, 2, 32, 8, true, &mut spans);
+    assert_eq!(spans, vec![0..4]);
+}
+
+#[test]
+fn base64_span_includes_leading_space_when_allowed() {
+    let hay = b"  AAAA";
+    let mut spans = Vec::new();
+    find_base64_spans_into(hay, 2, 32, 8, true, &mut spans);
+    assert_eq!(spans, vec![0..6]);
+}
+
+#[test]
+fn base64_span_disallows_space_when_flag_false() {
+    let hay = b"AA AA";
+    let mut spans = Vec::new();
+    find_base64_spans_into(hay, 1, 32, 8, false, &mut spans);
+    assert_eq!(spans, vec![0..2, 3..5]);
+}
+
+#[test]
+fn base64_span_respects_min_chars() {
+    let hay = b"A \tA";
+    let mut spans = Vec::new();
+    find_base64_spans_into(hay, 3, 32, 8, true, &mut spans);
+    assert!(spans.is_empty());
+}
+
+#[test]
+fn base64_span_respects_max_len() {
+    let hay = b"AAAAAAAAAA";
+    let mut spans = Vec::new();
+    find_base64_spans_into(hay, 1, 4, 8, false, &mut spans);
+    assert_eq!(spans, vec![0..4, 4..8, 8..10]);
 }
 
 #[test]
@@ -416,8 +516,13 @@ fn reference_scan_keys(engine: &Engine, rules: &[RuleSpec], buf: &[u8]) -> HashS
                     break;
                 }
 
-                if tc.gate == Gate::AnchorsInDecoded && !engine.ac_anchors.is_match(&decoded) {
-                    continue;
+                if tc.gate == Gate::AnchorsInDecoded {
+                    let anchors = engine
+                        .anchors
+                        .select(&decoded, engine.tuning.scan_utf16_variants);
+                    if !anchors.ac.is_match(&decoded) {
+                        continue;
+                    }
                 }
 
                 let h = hash128(&decoded);
@@ -1564,6 +1669,59 @@ fn tiger_boundary_base64_padding_split() {
 }
 
 #[test]
+fn base64_gate_utf16be_anchor_straddles_stream_boundary() {
+    // The base64 stream decoder flushes output in ~1KB chunks (1020 bytes),
+    // so we place a UTF-16BE anchor so its final byte lands in a 1-byte tail
+    // chunk. The gate must inspect tail+chunk to see the NULs and match.
+    let rule = RuleSpec {
+        name: "utf16be-gate-boundary",
+        anchors: &[b"TOK"],
+        radius: 0,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        re: Regex::new("TOK").unwrap(),
+    };
+
+    let tc = TransformConfig {
+        id: TransformId::Base64,
+        mode: TransformMode::Always,
+        gate: Gate::AnchorsInDecoded,
+        min_len: 8,
+        max_spans_per_buffer: 8,
+        max_encoded_len: 8 * 1024,
+        max_decoded_bytes: 8 * 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    };
+
+    let mut tuning = demo_tuning();
+    tuning.max_total_decode_output_bytes = tuning.max_total_decode_output_bytes.max(8 * 1024);
+    tuning.scan_utf16_variants = true;
+
+    let engine =
+        Engine::new_with_anchor_policy(vec![rule], vec![tc], tuning, AnchorPolicy::ManualOnly);
+
+    let utf16 = utf16be_bytes(b"TOK");
+    let flush_len = 1020usize; // stream_decode_base64 flush threshold
+    let prefix_len = flush_len - (utf16.len().saturating_sub(1));
+
+    let mut decoded = vec![b'A'; prefix_len];
+    decoded.extend_from_slice(&utf16);
+    assert_eq!(decoded.len(), flush_len + 1);
+
+    let encoded = b64_encode(&decoded).into_bytes();
+    let hits = scan_chunk_findings(&engine, &encoded);
+
+    assert!(
+        hits.iter().any(|h| h.rule == "utf16be-gate-boundary"),
+        "expected utf16be match to survive base64 gate boundary"
+    );
+}
+
+#[test]
 fn tiger_boundary_utf16_odd_byte_split() {
     // Split a UTF-16LE encoded anchor on an odd byte boundary so the decoder
     // must reconstruct code units across chunks.
@@ -1738,6 +1896,36 @@ mod proptests {
                 &mut scratch_out,
             );
             prop_assert_eq!(vec_out.as_slice(), scratch_out.as_slice());
+        }
+
+        #[test]
+        fn prop_base64_spans_match_reference(
+            buf in prop::collection::vec(any::<u8>(), 0..256),
+            min_len in 1usize..32,
+            max_len in 1usize..96,
+            max_spans in 0usize..32,
+            allow_space_ws in any::<bool>(),
+        ) {
+            let max_len = max_len.max(min_len);
+            let mut actual = Vec::new();
+            find_base64_spans_into(
+                &buf,
+                min_len,
+                max_len,
+                max_spans,
+                allow_space_ws,
+                &mut actual,
+            );
+
+            let expected = find_base64_spans_reference(
+                &buf,
+                min_len,
+                max_len,
+                max_spans,
+                allow_space_ws,
+            );
+
+            prop_assert_eq!(actual.as_slice(), expected.as_slice());
         }
     }
 }

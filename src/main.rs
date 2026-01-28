@@ -1,7 +1,9 @@
 use scanner_rs::pipeline::scan_path_default;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use scanner_rs::AsyncIoConfig;
-use scanner_rs::{demo_engine_with_anchor_mode, AnchorMode};
+use scanner_rs::{
+    demo_engine_with_anchor_mode, demo_engine_with_anchor_mode_and_max_transform_depth, AnchorMode,
+};
 use std::env;
 use std::io;
 use std::path::PathBuf;
@@ -31,9 +33,31 @@ fn main() -> io::Result<()> {
     let mut anchor_mode = AnchorMode::Manual;
     let mut path: Option<PathBuf> = None;
     let mut io_backend = IoBackend::default_for_platform();
+    let mut max_transform_depth: Option<usize> = None;
 
     for arg in args {
         if let Some(flag) = arg.to_str() {
+            if let Some(value) = flag.strip_prefix("--max-transform-depth=") {
+                max_transform_depth = Some(value.parse().unwrap_or_else(|_| {
+                    eprintln!("invalid --max-transform-depth value: {}", value);
+                    std::process::exit(2);
+                }));
+                continue;
+            }
+            if let Some(value) = flag.strip_prefix("--decode-depth=") {
+                max_transform_depth = Some(value.parse().unwrap_or_else(|_| {
+                    eprintln!("invalid --decode-depth value: {}", value);
+                    std::process::exit(2);
+                }));
+                continue;
+            }
+            if let Some(value) = flag.strip_prefix("--max-decode-depth=") {
+                max_transform_depth = Some(value.parse().unwrap_or_else(|_| {
+                    eprintln!("invalid --max-decode-depth value: {}", value);
+                    std::process::exit(2);
+                }));
+                continue;
+            }
             match flag {
                 "--anchors=manual" => {
                     anchor_mode = AnchorMode::Manual;
@@ -61,7 +85,7 @@ fn main() -> io::Result<()> {
                 }
                 "--help" | "-h" => {
                     eprintln!(
-                        "usage: {} [--anchors=manual|derived] [--io=auto|sync|uring|aio] <path>",
+                        "usage: {} [--anchors=manual|derived] [--io=auto|sync|uring|aio] [--max-transform-depth=<N>|--decode-depth=<N>] <path>",
                         exe.to_string_lossy()
                     );
                     std::process::exit(0);
@@ -69,7 +93,7 @@ fn main() -> io::Result<()> {
                 _ if flag.starts_with("--") => {
                     eprintln!("unknown flag: {}", flag);
                     eprintln!(
-                        "usage: {} [--anchors=manual|derived] [--io=auto|sync|uring|aio] <path>",
+                        "usage: {} [--anchors=manual|derived] [--io=auto|sync|uring|aio] [--max-transform-depth=<N>|--decode-depth=<N>] <path>",
                         exe.to_string_lossy()
                     );
                     std::process::exit(2);
@@ -90,13 +114,16 @@ fn main() -> io::Result<()> {
 
     let Some(path) = path else {
         eprintln!(
-            "usage: {} [--anchors=manual|derived] [--io=auto|sync|uring|aio] <path>",
+            "usage: {} [--anchors=manual|derived] [--io=auto|sync|uring|aio] [--max-transform-depth=<N>|--decode-depth=<N>] <path>",
             exe.to_string_lossy()
         );
         std::process::exit(2);
     };
 
-    let engine = Arc::new(demo_engine_with_anchor_mode(anchor_mode));
+    let engine = Arc::new(match max_transform_depth {
+        Some(depth) => demo_engine_with_anchor_mode_and_max_transform_depth(anchor_mode, depth),
+        None => demo_engine_with_anchor_mode(anchor_mode),
+    });
     let start = Instant::now();
     let stats = match io_backend {
         IoBackend::Sync => scan_path_default(&path, Arc::clone(&engine))?,
