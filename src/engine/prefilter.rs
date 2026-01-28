@@ -210,6 +210,7 @@ impl ByteSetPrefilter {
             covered = covered.saturating_add((span.end - span.start) as usize);
         }
         if covered as f32 / hay.len().max(1) as f32 >= PREFILTER_MAX_COVERAGE {
+            // Window coverage is too high; the prefilter would not be selective.
             out.clear();
             return PrefilterOutcome::FullScan;
         }
