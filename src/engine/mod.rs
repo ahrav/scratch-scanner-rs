@@ -1,4 +1,8 @@
-//! Core scanning engine: rule compilation, anchor indexes, and scan execution.
+//! Core scanning engine: rule compilation, anchor indexes, optional prefilters,
+//! and scan execution.
+//!
+//! Purpose: compile rule specs into anchors and gates, then scan buffers with
+//! bounded work and reuse scratch allocations.
 //!
 //! # Pipeline overview
 //! 1. Compile rules into anchor patterns and fast gates (keywords/confirm-all).
@@ -13,10 +17,14 @@
 //! - `SpanU32` and `BufRef::Slab` ranges are only valid until the next reset.
 //! - UTF-16 anchors always contain at least one NUL byte, enabling a raw-only
 //!   fast path for NUL-free buffers.
+//! - Vectorscan prefiltering is enabled by default, but best-effort; if the
+//!   prefilter DB fails to compile, we fall back to anchor scanning.
 //!
 //! # Trade-offs
 //! The engine favors predictable cost over perfect precision: span/anchor
 //! selection is permissive, while validation and gates enforce correctness.
+//! Prefilters (bytesets, Vectorscan, base64 pre-gate) are conservative: they
+//! may admit false positives but must not drop true matches.
 
 use crate::api::*;
 use crate::b64_yara_gate::{Base64YaraGate, Base64YaraGateConfig, PaddingPolicy, WhitespacePolicy};
@@ -29,16 +37,20 @@ use ahash::AHashMap;
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, AhoCorasickKind};
 use memchr::{memchr, memmem};
 use regex::bytes::Regex;
+#[cfg(feature = "stats")]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::ops::{ControlFlow, Range};
 
 mod helpers;
 mod prefilter;
 mod transform;
 mod validator;
+mod vectorscan_prefilter;
 
 use self::helpers::*;
 use self::prefilter::*;
 use self::transform::*;
+use self::vectorscan_prefilter::{VsAnchorDb, VsPrefilterDb, VsScratch};
 
 #[cfg(test)]
 use crate::demo::*;
@@ -160,6 +172,7 @@ struct AnchorIndex {
 struct Anchors {
     raw: AnchorIndex,
     all: AnchorIndex,
+    utf16: AnchorIndex,
 }
 
 impl Anchors {
@@ -170,6 +183,20 @@ impl Anchors {
         } else {
             &self.all
         }
+    }
+
+    #[inline]
+    fn select_with_has_nul(&self, hay_has_nul: bool, scan_utf16_variants: bool) -> &AnchorIndex {
+        if scan_utf16_variants && hay_has_nul {
+            &self.all
+        } else {
+            &self.raw
+        }
+    }
+
+    #[inline]
+    fn utf16_only(&self) -> &AnchorIndex {
+        &self.utf16
     }
 }
 
@@ -625,6 +652,13 @@ pub struct ScanScratch {
     /// reconstruct the full decode path. This buffer holds the reversed chain
     /// during materialization. Capacity is bounded by `max_transform_depth`.
     steps_buf: ScratchVec<DecodeStep>,
+
+    /// Per-thread Vectorscan scratch space (present when the prefilter DB is active).
+    ///
+    /// Vectorscan requires each scanning thread to have its own scratch memory.
+    vs_scratch: Option<VsScratch>,
+    /// Per-thread Vectorscan scratch space for UTF-16 anchor prefiltering.
+    vs_utf16_scratch: Option<VsScratch>,
     #[cfg(feature = "b64-stats")]
     base64_stats: Base64DecodeStats, // Base64 decode/gate instrumentation.
 }
@@ -701,6 +735,14 @@ impl ScanScratch {
                 engine.tuning.max_transform_depth.saturating_add(1),
             )
             .expect("scratch steps_buf allocation failed"),
+            vs_scratch: engine
+                .vs
+                .as_ref()
+                .map(|db| db.alloc_scratch().expect("vectorscan scratch allocation failed")),
+            vs_utf16_scratch: engine
+                .vs_utf16
+                .as_ref()
+                .map(|db| db.alloc_scratch().expect("vectorscan utf16 scratch allocation failed")),
             #[cfg(feature = "b64-stats")]
             base64_stats: Base64DecodeStats::default(),
         }
@@ -722,6 +764,42 @@ impl ScanScratch {
         self.entropy_scratch.reset();
         #[cfg(feature = "b64-stats")]
         self.base64_stats.reset();
+
+        match engine.vs.as_ref() {
+            Some(db) => {
+                let need_alloc = match self.vs_scratch.as_ref() {
+                    Some(s) => s.bound_db_ptr() != db.db_ptr(),
+                    None => true,
+                };
+                if need_alloc {
+                    self.vs_scratch = Some(
+                        db.alloc_scratch()
+                            .expect("vectorscan scratch allocation failed"),
+                    );
+                }
+            }
+            None => {
+                // Drop scratch if the engine no longer has vectorscan enabled.
+                self.vs_scratch = None;
+            }
+        }
+        match engine.vs_utf16.as_ref() {
+            Some(db) => {
+                let need_alloc = match self.vs_utf16_scratch.as_ref() {
+                    Some(s) => s.bound_db_ptr() != db.db_ptr(),
+                    None => true,
+                };
+                if need_alloc {
+                    self.vs_utf16_scratch = Some(
+                        db.alloc_scratch()
+                            .expect("vectorscan utf16 scratch allocation failed"),
+                    );
+                }
+            }
+            None => {
+                self.vs_utf16_scratch = None;
+            }
+        }
         self.touched_pairs.clear();
         self.touched_any = false;
         self.prefilter_windows.clear();
@@ -891,6 +969,7 @@ impl ScanScratch {
         self.out.as_slice()
     }
 
+    /// Returns the number of findings dropped due to the per-chunk cap.
     pub fn dropped_findings(&self) -> usize {
         self.findings_dropped
     }
@@ -944,6 +1023,18 @@ pub struct Engine {
 
     // Anchor indexes for raw-only and combined (raw + UTF-16) scans.
     anchors: Anchors,
+
+    // Vectorscan/Hyperscan prefilter DB for raw scanning.
+    //
+    // Built by default, but stored as `None` when the prefilter DB fails to
+    // compile (unsupported patterns, expression-info failures, etc.).
+    // When present, this seeds candidate windows in a single `hs_scan` pass.
+    // UTF-16 variants still use the anchor scanner.
+    vs: Option<VsPrefilterDb>,
+    // Optional Vectorscan DB for UTF-16 anchor scanning.
+    //
+    // When present, this prefilters UTF-16 variants using literal anchors.
+    vs_utf16: Option<VsAnchorDb>,
     // Base64 pre-decode gate built from anchor patterns.
     //
     // This runs in *encoded space* and is deliberately conservative:
@@ -958,6 +1049,8 @@ pub struct Engine {
     unfilterable_rules: Vec<(usize, UnfilterableReason)>,
     #[cfg(feature = "stats")]
     anchor_plan_stats: AnchorPlanStats,
+    #[cfg(feature = "stats")]
+    vs_stats: VectorscanCounters,
 
     max_anchor_pat_len: usize,
     max_window_diameter_bytes: usize,
@@ -997,6 +1090,67 @@ pub struct AnchorPlanStats {
     pub prefilter_raw: AnchorPrefilterStats,
     /// Prefilter stats for raw + UTF-16 anchors.
     pub prefilter_all: AnchorPrefilterStats,
+}
+
+/// Vectorscan usage counters for a scan run (feature: `stats`).
+#[cfg(feature = "stats")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VectorscanStats {
+    /// Whether the Vectorscan DB compiled successfully.
+    pub db_built: bool,
+    /// Whether the UTF-16 Vectorscan DB compiled successfully.
+    pub utf16_db_built: bool,
+    /// Number of buffers where a Vectorscan scan was attempted.
+    pub scans_attempted: u64,
+    /// Number of Vectorscan scans that completed successfully.
+    pub scans_ok: u64,
+    /// Number of Vectorscan scans that errored.
+    pub scans_err: u64,
+    /// Number of buffers where a UTF-16 Vectorscan scan was attempted.
+    pub utf16_scans_attempted: u64,
+    /// Number of UTF-16 Vectorscan scans that completed successfully.
+    pub utf16_scans_ok: u64,
+    /// Number of UTF-16 Vectorscan scans that errored.
+    pub utf16_scans_err: u64,
+    /// Buffers scanned only by anchors (no Vectorscan used).
+    pub anchor_only: u64,
+    /// Buffers that used Vectorscan but still required anchor scan (UTF-16 path).
+    pub anchor_after_vs: u64,
+    /// Buffers where Vectorscan was used and anchor scan was skipped.
+    pub anchor_skipped: u64,
+}
+
+#[cfg(feature = "stats")]
+#[derive(Default)]
+struct VectorscanCounters {
+    scans_attempted: AtomicU64,
+    scans_ok: AtomicU64,
+    scans_err: AtomicU64,
+    utf16_scans_attempted: AtomicU64,
+    utf16_scans_ok: AtomicU64,
+    utf16_scans_err: AtomicU64,
+    anchor_only: AtomicU64,
+    anchor_after_vs: AtomicU64,
+    anchor_skipped: AtomicU64,
+}
+
+#[cfg(feature = "stats")]
+impl VectorscanCounters {
+    fn snapshot(&self, db_built: bool, utf16_db_built: bool) -> VectorscanStats {
+        VectorscanStats {
+            db_built,
+            utf16_db_built,
+            scans_attempted: self.scans_attempted.load(Ordering::Relaxed),
+            scans_ok: self.scans_ok.load(Ordering::Relaxed),
+            scans_err: self.scans_err.load(Ordering::Relaxed),
+            utf16_scans_attempted: self.utf16_scans_attempted.load(Ordering::Relaxed),
+            utf16_scans_ok: self.utf16_scans_ok.load(Ordering::Relaxed),
+            utf16_scans_err: self.utf16_scans_err.load(Ordering::Relaxed),
+            anchor_only: self.anchor_only.load(Ordering::Relaxed),
+            anchor_after_vs: self.anchor_after_vs.load(Ordering::Relaxed),
+            anchor_skipped: self.anchor_skipped.load(Ordering::Relaxed),
+        }
+    }
 }
 
 #[cfg(feature = "stats")]
@@ -1054,11 +1208,30 @@ impl Engine {
             .unwrap_or(0);
         let entropy_log2 = build_log2_table(max_entropy_len);
 
+        let utf16_seed_radius_bytes = rules
+            .iter()
+            .map(|r| {
+                let seed = if let Some(tp) = &r.two_phase {
+                    tp.seed_radius
+                } else {
+                    r.radius
+                };
+                let bytes = seed.saturating_mul(2);
+                if bytes > u32::MAX as usize {
+                    u32::MAX
+                } else {
+                    bytes as u32
+                }
+            })
+            .collect::<Vec<_>>();
+
         // Build deduped anchor patterns: pattern -> targets
         let mut pat_map_raw: AHashMap<Vec<u8>, Vec<Target>> =
             AHashMap::with_capacity(rules.len().saturating_mul(3).max(16));
         let mut pat_map_all: AHashMap<Vec<u8>, Vec<Target>> =
             AHashMap::with_capacity(rules.len().saturating_mul(3).max(16));
+        let mut pat_map_utf16: AHashMap<Vec<u8>, Vec<Target>> =
+            AHashMap::with_capacity(rules.len().saturating_mul(2).max(16));
         let mut residue_rules: Vec<(usize, ResidueGatePlan)> = Vec::with_capacity(rules.len());
         let mut unfilterable_rules: Vec<(usize, UnfilterableReason)> =
             Vec::with_capacity(rules.len());
@@ -1090,7 +1263,8 @@ impl Engine {
             let mut manual_used = false;
             let mut add_manual =
                 |pat_map_raw: &mut AHashMap<Vec<u8>, Vec<Target>>,
-                 pat_map_all: &mut AHashMap<Vec<u8>, Vec<Target>>| {
+                 pat_map_all: &mut AHashMap<Vec<u8>, Vec<Target>>,
+                 pat_map_utf16: &mut AHashMap<Vec<u8>, Vec<Target>>| {
                     if !allow_manual {
                         return;
                     }
@@ -1145,11 +1319,31 @@ impl Engine {
                                 keyword_implied,
                             ),
                         );
+                        add_pat_owned(
+                            pat_map_utf16,
+                            utf16le_bytes(a),
+                            Target::new(
+                                rid_u32,
+                                Variant::Utf16Le,
+                                validator_match_start,
+                                keyword_implied,
+                            ),
+                        );
+                        add_pat_owned(
+                            pat_map_utf16,
+                            utf16be_bytes(a),
+                            Target::new(
+                                rid_u32,
+                                Variant::Utf16Be,
+                                validator_match_start,
+                                keyword_implied,
+                            ),
+                        );
                     }
                 };
 
             if !allow_derive {
-                add_manual(&mut pat_map_raw, &mut pat_map_all);
+                add_manual(&mut pat_map_raw, &mut pat_map_all, &mut pat_map_utf16);
                 continue;
             }
 
@@ -1162,7 +1356,7 @@ impl Engine {
                         anchor_plan_stats.unfilterable_rules =
                             anchor_plan_stats.unfilterable_rules.saturating_add(1);
                     }
-                    add_manual(&mut pat_map_raw, &mut pat_map_all);
+                    add_manual(&mut pat_map_raw, &mut pat_map_all, &mut pat_map_utf16);
                     continue;
                 }
             };
@@ -1205,6 +1399,16 @@ impl Engine {
                             utf16be_bytes(&anchor),
                             Target::new(rid_u32, Variant::Utf16Be, false, keyword_implied),
                         );
+                        add_pat_owned(
+                            &mut pat_map_utf16,
+                            utf16le_bytes(&anchor),
+                            Target::new(rid_u32, Variant::Utf16Le, false, keyword_implied),
+                        );
+                        add_pat_owned(
+                            &mut pat_map_utf16,
+                            utf16be_bytes(&anchor),
+                            Target::new(rid_u32, Variant::Utf16Be, false, keyword_implied),
+                        );
                     }
                 }
                 TriggerPlan::Residue { gate } => {
@@ -1214,7 +1418,7 @@ impl Engine {
                         anchor_plan_stats.residue_rules =
                             anchor_plan_stats.residue_rules.saturating_add(1);
                     }
-                    add_manual(&mut pat_map_raw, &mut pat_map_all);
+                    add_manual(&mut pat_map_raw, &mut pat_map_all, &mut pat_map_utf16);
                 }
                 TriggerPlan::Unfilterable { reason } => {
                     unfilterable_rules.push((rid, reason));
@@ -1223,13 +1427,15 @@ impl Engine {
                         anchor_plan_stats.unfilterable_rules =
                             anchor_plan_stats.unfilterable_rules.saturating_add(1);
                     }
-                    add_manual(&mut pat_map_raw, &mut pat_map_all);
+                    add_manual(&mut pat_map_raw, &mut pat_map_all, &mut pat_map_utf16);
                 }
             }
         }
 
         let (anchor_patterns_raw, pat_targets_raw, pat_offsets_raw) = map_to_patterns(pat_map_raw);
         let (anchor_patterns_all, pat_targets_all, pat_offsets_all) = map_to_patterns(pat_map_all);
+        let (anchor_patterns_utf16, pat_targets_utf16, pat_offsets_utf16) =
+            map_to_patterns(pat_map_utf16);
         let max_anchor_pat_len = anchor_patterns_all
             .iter()
             .map(|p| p.len())
@@ -1238,6 +1444,7 @@ impl Engine {
 
         let prefilter_raw = AnchorPrefilterPlan::build(&anchor_patterns_raw);
         let prefilter_all = AnchorPrefilterPlan::build(&anchor_patterns_all);
+        let prefilter_utf16 = AnchorPrefilterPlan::build(&anchor_patterns_utf16);
         #[cfg(feature = "stats")]
         {
             anchor_plan_stats.prefilter_raw = prefilter_raw.stats().into();
@@ -1315,6 +1522,7 @@ impl Engine {
 
         let ac_anchors_raw = build_anchor_ac(&anchor_patterns_raw, "raw");
         let ac_anchors_all = build_anchor_ac(&anchor_patterns_all, "all");
+        let ac_anchors_utf16 = build_anchor_ac(&anchor_patterns_utf16, "utf16");
 
         // Warm regex and AC caches at startup to avoid lazy allocations later.
         // `find_iter` always constructs the per-regex cache, so a tiny buffer
@@ -1326,6 +1534,7 @@ impl Engine {
         }
         let _ = ac_anchors_raw.is_match(&warm);
         let _ = ac_anchors_all.is_match(&warm);
+        let _ = ac_anchors_utf16.is_match(&warm);
 
         let mut max_window_diameter_bytes = 0usize;
         for r in &rules {
@@ -1339,6 +1548,29 @@ impl Engine {
                 max_window_diameter_bytes = max_window_diameter_bytes.max(diameter);
             }
         }
+
+        // Optional optimization. If the DB can't be built (e.g. regex syntax
+        // incompatibility), fall back to anchor scanning.
+        let vs = VsPrefilterDb::try_new(&rules, &tuning).ok();
+        let vs_utf16 = if anchor_patterns_utf16.is_empty() {
+            None
+        } else {
+            match VsAnchorDb::try_new_utf16(
+                &anchor_patterns_utf16,
+                &pat_targets_utf16,
+                &pat_offsets_utf16,
+                &utf16_seed_radius_bytes,
+                &tuning,
+            ) {
+                Ok(db) => Some(db),
+                Err(err) => {
+                    if std::env::var_os("SCANNER_VS_UTF16_DEBUG").is_some() {
+                        eprintln!("vectorscan utf16 db build failed: {err}");
+                    }
+                    None
+                }
+            }
+        };
 
         Self {
             rules: rules_compiled,
@@ -1358,12 +1590,22 @@ impl Engine {
                     pat_offsets: pat_offsets_all,
                     prefilter: prefilter_all,
                 },
+                utf16: AnchorIndex {
+                    ac: ac_anchors_utf16,
+                    pat_targets: pat_targets_utf16,
+                    pat_offsets: pat_offsets_utf16,
+                    prefilter: prefilter_utf16,
+                },
             },
+            vs,
+            vs_utf16,
             b64_gate,
             residue_rules,
             unfilterable_rules,
             #[cfg(feature = "stats")]
             anchor_plan_stats,
+            #[cfg(feature = "stats")]
+            vs_stats: VectorscanCounters::default(),
             max_anchor_pat_len,
             max_window_diameter_bytes,
         }
@@ -1373,6 +1615,13 @@ impl Engine {
     #[cfg(feature = "stats")]
     pub fn anchor_plan_stats(&self) -> AnchorPlanStats {
         self.anchor_plan_stats
+    }
+
+    /// Returns Vectorscan usage counters (feature: `stats`).
+    #[cfg(feature = "stats")]
+    pub fn vectorscan_stats(&self) -> VectorscanStats {
+        self.vs_stats
+            .snapshot(self.vs.is_some(), self.vs_utf16.is_some())
     }
 
     /// Rules that could not be given a sound gate from their regex pattern.
@@ -1413,6 +1662,8 @@ impl Engine {
     ///
     /// The scratch is reset before use and reuses its buffers to avoid per-call
     /// allocations. Findings are stored as compact [`FindingRec`] entries.
+    /// When the per-chunk finding cap is exceeded, extra findings are dropped
+    /// and counted in [`ScanScratch::dropped_findings`].
     pub fn scan_chunk_into(
         &self,
         root_buf: &[u8],
@@ -1795,61 +2046,195 @@ impl Engine {
         let merge_gap = self.tuning.merge_gap as u32;
         let pressure_gap_start = self.tuning.pressure_gap_start as u32;
 
-        // L1: anchor scan.
+        // L1: prefilter + anchor scan.
         //
-        // NUL-free buffers cannot match UTF-16 patterns, so we select a raw-only
-        // automaton in that case. Otherwise we scan a combined raw+UTF-16 index
-        // to avoid multiple full passes on binary-heavy buffers.
-        let anchors = self.anchors.select(buf, self.tuning.scan_utf16_variants);
-        // Prefilter selection is adaptive: we sample the head of the buffer
-        // and skip prefiltering when the candidate density is too high.
-        let mut scanned = false;
-        if let Some(prefilter) = anchors.prefilter.pick(buf) {
-            match prefilter.collect_windows(buf, &mut scratch.prefilter_windows) {
-                PrefilterOutcome::NoCandidates => return,
-                PrefilterOutcome::Windows => {
-                    let win_len = scratch.prefilter_windows.len();
-                    for i in 0..win_len {
-                        let win = scratch.prefilter_windows[i];
-                        let start = win.start as usize;
-                        let end = win.end as usize;
-                        if start >= end || end > buf.len() {
-                            continue;
-                        }
-                        self.scan_anchor_matches(
-                            buf,
-                            &buf[start..end],
-                            start,
-                            &anchors.ac,
-                            &anchors.pat_targets,
-                            &anchors.pat_offsets,
-                            step_id,
-                            &root_hint,
-                            base_offset,
-                            file_id,
-                            scratch,
-                        );
+        // When the optional Vectorscan prefilter is enabled, we run a single
+        // `hs_scan` pass over raw bytes to seed candidate windows for raw rules.
+        // UTF-16 variants still rely on the anchor scanner.
+        let mut used_vectorscan = false;
+        let mut saw_nul = false;
+
+        if let Some(vs) = self.vs.as_ref() {
+            if let Some(mut vs_scratch) = scratch.vs_scratch.take() {
+                #[cfg(feature = "stats")]
+                self.vs_stats
+                    .scans_attempted
+                    .fetch_add(1, Ordering::Relaxed);
+                let result = vs.scan_raw(buf, scratch, &mut vs_scratch);
+                scratch.vs_scratch = Some(vs_scratch);
+                match result {
+                    Ok(nul) => {
+                        used_vectorscan = true;
+                        saw_nul = nul;
+                        #[cfg(feature = "stats")]
+                        self.vs_stats.scans_ok.fetch_add(1, Ordering::Relaxed);
                     }
-                    scanned = true;
+                    Err(_err) => {
+                        #[cfg(feature = "stats")]
+                        self.vs_stats.scans_err.fetch_add(1, Ordering::Relaxed);
+                        // If Vectorscan fails for any reason, roll back any partial
+                        // accumulator/touched state so the anchor path can run with
+                        // its usual sorted-window invariants.
+                        if scratch.touched_any {
+                            scratch.touched_pairs.clear();
+                            for pair in scratch.touched.iter_set() {
+                                scratch.touched_pairs.push(pair as u32);
+                            }
+                            scratch.touched.clear();
+                            scratch.touched_any = false;
+                            let touched_len = scratch.touched_pairs.len();
+                            for i in 0..touched_len {
+                                let pair = scratch.touched_pairs[i] as usize;
+                                let rid = pair / 3;
+                                let vidx = pair % 3;
+                                scratch.accs[rid][vidx].reset();
+                            }
+                            scratch.touched_pairs.clear();
+                        }
+                    }
                 }
-                PrefilterOutcome::FullScan => {}
             }
         }
 
-        if !scanned {
-            self.scan_anchor_matches(
-                buf,
-                buf,
-                0,
-                &anchors.ac,
-                &anchors.pat_targets,
-                &anchors.pat_offsets,
-                step_id,
-                &root_hint,
-                base_offset,
-                file_id,
-                scratch,
-            );
+        // Decide whether we need the UTF-16 anchor scan.
+        //
+        // If Vectorscan ran, we avoid an extra full memchr pass by using the
+        // NUL sentinel result from the same `hs_scan`.
+        let need_utf16_anchor_scan = self.tuning.scan_utf16_variants
+            && if used_vectorscan {
+                saw_nul
+            } else {
+                memchr(0, buf).is_some()
+            };
+
+        let mut used_vectorscan_utf16 = false;
+        let mut vs_utf16_ok = false;
+
+        if used_vectorscan && need_utf16_anchor_scan {
+            if let Some(vs_utf16) = self.vs_utf16.as_ref() {
+                if let Some(mut vs_scratch) = scratch.vs_utf16_scratch.take() {
+                    #[cfg(feature = "stats")]
+                    self.vs_stats
+                        .utf16_scans_attempted
+                        .fetch_add(1, Ordering::Relaxed);
+                    let result = vs_utf16.scan_utf16(buf, scratch, &mut vs_scratch);
+                    scratch.vs_utf16_scratch = Some(vs_scratch);
+                    used_vectorscan_utf16 = true;
+                    match result {
+                        Ok(()) => {
+                            vs_utf16_ok = true;
+                            #[cfg(feature = "stats")]
+                            self.vs_stats
+                                .utf16_scans_ok
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(_err) => {
+                            #[cfg(feature = "stats")]
+                            self.vs_stats
+                                .utf16_scans_err
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }
+
+        let do_anchor_scan = if !used_vectorscan {
+            true
+        } else if need_utf16_anchor_scan {
+            !vs_utf16_ok
+        } else {
+            false
+        };
+
+        #[cfg(feature = "stats")]
+        {
+            if used_vectorscan {
+                if do_anchor_scan {
+                    self.vs_stats
+                        .anchor_after_vs
+                        .fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.vs_stats
+                        .anchor_skipped
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                self.vs_stats
+                    .anchor_only
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        // Anchor scan is required when Vectorscan isn't available, or when we
+        // need UTF-16 variant scanning and the UTF-16 Vectorscan path fails.
+        if do_anchor_scan {
+            // NUL-free buffers cannot match UTF-16 patterns, so we select a raw-only
+            // automaton in that case. Otherwise we scan a combined raw+UTF-16 index.
+            let anchors = if used_vectorscan {
+                // Raw anchors already ran via Vectorscan, so only scan UTF-16 anchors.
+                self.anchors.utf16_only()
+            } else {
+                self.anchors.select(buf, self.tuning.scan_utf16_variants)
+            };
+
+            // Prefilter selection is adaptive: we sample the head of the buffer
+            // and skip prefiltering when the candidate density is too high.
+            let mut scanned = false;
+            if let Some(prefilter) = anchors.prefilter.pick(buf) {
+                match prefilter.collect_windows(buf, &mut scratch.prefilter_windows) {
+                    PrefilterOutcome::NoCandidates => {
+                        // Sound early exit for anchor scanning. Only return early
+                        // if we also have no Vectorscan candidates.
+                        if !scratch.touched_any {
+                            return;
+                        }
+                        scanned = true;
+                    }
+                    PrefilterOutcome::Windows => {
+                        let win_len = scratch.prefilter_windows.len();
+                        for i in 0..win_len {
+                            let win = scratch.prefilter_windows[i];
+                            let start = win.start as usize;
+                            let end = win.end as usize;
+                            if start >= end || end > buf.len() {
+                                continue;
+                            }
+                            self.scan_anchor_matches(
+                                buf,
+                                &buf[start..end],
+                                start,
+                                &anchors.ac,
+                                &anchors.pat_targets,
+                                &anchors.pat_offsets,
+                                step_id,
+                                &root_hint,
+                                base_offset,
+                                file_id,
+                                scratch,
+                            );
+                        }
+                        scanned = true;
+                    }
+                    PrefilterOutcome::FullScan => {}
+                }
+            }
+
+            if !scanned {
+                self.scan_anchor_matches(
+                    buf,
+                    buf,
+                    0,
+                    &anchors.ac,
+                    &anchors.pat_targets,
+                    &anchors.pat_offsets,
+                    step_id,
+                    &root_hint,
+                    base_offset,
+                    file_id,
+                    scratch,
+                );
+            }
         }
 
         if !scratch.touched_any {
@@ -1880,6 +2265,20 @@ impl Engine {
             }
             if scratch.windows.is_empty() {
                 continue;
+            }
+
+            // Anchor scans push windows in non-decreasing order of match positions.
+            // Vectorscan callbacks are not guaranteed to be ordered, so we must
+            // sort the raw variant windows when Vectorscan ran.
+            if (used_vectorscan && variant == Variant::Raw && scratch.windows.len() > 1)
+                || (used_vectorscan_utf16
+                    && matches!(variant, Variant::Utf16Le | Variant::Utf16Be)
+                    && scratch.windows.len() > 1)
+            {
+                scratch
+                    .windows
+                    .as_mut_slice()
+                    .sort_unstable_by_key(|s| s.start);
             }
 
             // Windows are pushed in non-decreasing order of anchor match positions.
@@ -2445,6 +2844,9 @@ fn map_to_patterns(map: AHashMap<Vec<u8>, Vec<Target>>) -> (Vec<Vec<u8>>, Vec<Ta
 pub fn bench_find_spans_into(tc: &TransformConfig, buf: &[u8], out: &mut Vec<Range<usize>>) {
     find_spans_into(tc, buf, out);
 }
+
+#[cfg(feature = "bench")]
+pub use self::transform::{bench_stream_decode_base64, bench_stream_decode_url};
 
 #[cfg(feature = "bench")]
 impl Engine {

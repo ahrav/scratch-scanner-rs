@@ -54,9 +54,9 @@ pub use demo::{
 };
 
 #[cfg(feature = "bench")]
-pub use engine::bench_find_spans_into;
+pub use engine::{bench_find_spans_into, bench_stream_decode_base64, bench_stream_decode_url};
 #[cfg(feature = "stats")]
-pub use engine::{AnchorPlanStats, AnchorPrefilterStats};
+pub use engine::{AnchorPlanStats, AnchorPrefilterStats, VectorscanStats};
 pub use engine::{Engine, ScanScratch};
 
 pub use async_io::AsyncIoConfig;

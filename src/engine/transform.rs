@@ -6,10 +6,24 @@
 //! - a permissive span finder that favors recall over strict validation
 //! - a streaming decoder that enforces correctness with bounded memory
 //!
+//! ## URL percent-encoding
+//! - The span finder scans URL-ish runs (RFC3986 unreserved/reserved plus '%' and '+')
+//!   and keeps runs that contain at least one escape (and optionally '+' when
+//!   `plus_to_space` is enabled).
+//! - The decoder converts `%HH` escapes and optional `+` to space; invalid or
+//!   incomplete escapes pass through unchanged.
+//!
+//! ## Base64 (standard + URL-safe)
+//! - The span finder scans runs of base64 alphabet plus allowed whitespace.
+//!   `min_len` counts alphabet characters only; whitespace does not contribute.
+//! - The decoder ignores whitespace, validates padding, and accepts an unpadded
+//!   tail (2 or 3 characters in the final quantum).
+//!
 //! # Invariants and guarantees
 //! - Span finders are single-pass and capped by `max_len` and `max_spans`.
 //! - Spans are byte ranges into the original buffer, produced in ascending order.
-//! - Decoders do not allocate based on input size; they emit chunks via callbacks.
+//! - Long runs are split at `max_len` boundaries to bound worst-case work.
+//! - Decoders are single-pass and O(1) memory; they emit bounded chunks via callbacks.
 //!
 //! # Trade-offs
 //! These components intentionally trade precision for cheap scanning. Strict
@@ -153,9 +167,9 @@ fn is_urlish(b: u8) -> bool {
 
 /// Target for span collection, allowing reuse of `Vec` or `ScratchVec`.
 ///
-/// Spans are byte ranges into the input buffer. Implementations are expected
-/// to preserve the order they are pushed and tolerate being cleared and reused
-/// across scans.
+/// Spans are half-open byte ranges (`start..end`) into the input buffer.
+/// Implementations are expected to preserve insertion order and tolerate
+/// being cleared and reused across scans.
 pub(super) trait SpanSink {
     fn clear(&mut self);
     fn len(&self) -> usize;
@@ -190,6 +204,7 @@ impl SpanSink for ScratchVec<Range<usize>> {
     }
 }
 
+// SpanU32 stores offsets as u32; callers must ensure spans fit in u32.
 impl SpanSink for ScratchVec<SpanU32> {
     fn clear(&mut self) {
         ScratchVec::clear(self);
@@ -210,6 +225,12 @@ impl SpanSink for ScratchVec<SpanU32> {
 /// when `plus_to_space` is enabled). The run is bounded by `max_len`, and runs
 /// shorter than `min_len` are discarded. `min_len`/`max_len` are measured in
 /// input bytes, not decoded output.
+///
+/// Notes:
+/// - "URL-ish" includes RFC3986 unreserved/reserved bytes plus '%' and '+'.
+/// - Runs longer than `max_len` are split at the boundary to keep scans bounded.
+/// - When `plus_to_space` is false, '+' is allowed in runs but does not trigger
+///   a span by itself.
 pub(super) fn find_url_spans_into(
     hay: &[u8],
     min_len: usize,
@@ -270,7 +291,11 @@ pub(super) fn find_url_spans_into(
 /// Decodes `%HH` escapes and optionally converts `+` to space. Invalid or
 /// incomplete escapes are passed through verbatim. Output is emitted in
 /// bounded chunks (1KB scratch buffer), and the `on_bytes` callback may stop
-/// decoding early by returning `ControlFlow::Break(())`.
+/// decoding early by returning `ControlFlow::Break(())` (treated as success).
+///
+/// # Errors
+/// Currently infallible; the error type is reserved for test helpers that
+/// enforce maximum output size.
 fn stream_decode_url_percent(
     input: &[u8],
     plus_to_space: bool,
@@ -365,14 +390,6 @@ enum Base64DecodeError {
     OutputTooLarge,
 }
 
-// Simple span finder. It is permissive by design.
-//
-// Why permissive?
-// - We want to avoid false negatives at this stage.
-// - Tightening is handled by length caps, span limits, and decode gating.
-//
-// This keeps the span finder cheap and predictable, while later stages enforce
-// cost limits and correctness.
 /// Finds base64-ish spans within `hay` and appends them to `spans`.
 ///
 /// Guarantees / invariants:
@@ -384,6 +401,9 @@ enum Base64DecodeError {
 /// Notes:
 /// - `min_chars` counts base64 alphabet characters only; whitespace does not
 ///   contribute to the minimum.
+/// - `max_len` counts all bytes in the run, including whitespace.
+/// - `allow_space_ws` adds ASCII space to the allowed whitespace set (in
+///   addition to `\r`, `\n`, `\t`).
 /// - The scan is intentionally permissive and relies on downstream decode gates
 ///   for strict validation.
 pub(super) fn find_base64_spans_into(
@@ -476,17 +496,20 @@ pub(super) fn find_base64_spans_into(
 /// Whitespace is ignored. Padding is validated, but an unpadded tail
 /// (2 or 3 bytes in the final quantum) is accepted. Output is emitted in
 /// bounded chunks (1KB scratch buffer). The `on_bytes` callback may stop
-/// decoding early by returning `ControlFlow::Break(())`.
+/// decoding early by returning `ControlFlow::Break(())` (treated as success).
+///
+/// # Errors
+/// - `InvalidByte`: a non-base64, non-whitespace byte was encountered.
+/// - `InvalidPadding`: padding appeared in an invalid position or after data.
+/// - `TruncatedQuantum`: the input ends with a single leftover base64 char.
+///
+/// # Notes
+/// Used both for full decode and decoded-gate streaming, so it is kept
+/// branch-light and bounded in memory.
 fn stream_decode_base64(
     input: &[u8],
     mut on_bytes: impl FnMut(&[u8]) -> ControlFlow<()>,
 ) -> Result<(), Base64DecodeError> {
-    // Streaming decoder that accepts both standard and URL-safe alphabets and
-    // ignores whitespace. It validates padding rules and allows an unpadded tail
-    // (2 or 3 bytes in the final quantum) because real-world data often omits '='.
-    //
-    // This is used for both actual decode and decoded-gate streaming, so we
-    // keep it branch-light and bounded in memory (fixed 1KB output buffer).
     fn flush_buf(
         out: &mut [u8],
         out_len: &mut usize,
