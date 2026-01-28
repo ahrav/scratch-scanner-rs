@@ -2,6 +2,7 @@
 //! Small, self-contained data structures used across the project.
 
 pub mod bitset;
+pub mod fastrange;
 pub mod fixed_set;
 pub mod fixed_vec;
 pub mod queue;
