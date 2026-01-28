@@ -1213,6 +1213,7 @@ impl VectorscanCounters {
         VectorscanStats {
             db_built,
             utf16_db_built,
+            gate_db_built,
             scans_attempted: self.scans_attempted.load(Ordering::Relaxed),
             scans_ok: self.scans_ok.load(Ordering::Relaxed),
             scans_err: self.scans_err.load(Ordering::Relaxed),
