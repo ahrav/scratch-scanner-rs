@@ -243,8 +243,8 @@ fn bench_pop(c: &mut Criterion) {
 fn bench_pop_clustered(c: &mut Criterion) {
     let mut group = c.benchmark_group("released_set/pop_clustered");
 
-    let size = 1000;
-    group.throughput(Throughput::Elements(size as u64));
+    let size = 1000u64;
+    group.throughput(Throughput::Elements(size));
 
     // Sequential keys (may cluster based on hash distribution)
     let sequential_keys: Vec<u64> = (0..size).collect();

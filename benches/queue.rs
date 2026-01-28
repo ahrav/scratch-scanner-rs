@@ -480,8 +480,7 @@ fn bench_steady_state(c: &mut Criterion) {
             &window_size,
             |b, &window_size| {
                 let total_nodes = window_size + OPS_PER_ITER;
-                let mut nodes: Vec<SmallNode> =
-                    (0..total_nodes).map(|i| SmallNode::new(i)).collect();
+                let mut nodes: Vec<SmallNode> = (0..total_nodes).map(SmallNode::new).collect();
                 b.iter(|| {
                     let mut q: Queue<SmallNode, BenchTag> = Queue::init();
                     // Fill to window size
@@ -489,8 +488,12 @@ fn bench_steady_state(c: &mut Criterion) {
                         q.push(node);
                     }
                     // Steady state: push one, pop one
-                    for i in window_size as usize..total_nodes as usize {
-                        q.push(&mut nodes[i]);
+                    for node in nodes
+                        .iter_mut()
+                        .take(total_nodes as usize)
+                        .skip(window_size as usize)
+                    {
+                        q.push(node);
                         black_box(q.pop());
                     }
                     // Drain
@@ -513,7 +516,7 @@ fn bench_vs_vecdeque(c: &mut Criterion) {
 
     // Intrusive queue push/pop cycle
     group.bench_function("intrusive/push_pop", |b| {
-        let mut nodes: Vec<SmallNode> = (0..OPS_PER_ITER).map(|i| SmallNode::new(i)).collect();
+        let mut nodes: Vec<SmallNode> = (0..OPS_PER_ITER).map(SmallNode::new).collect();
         b.iter(|| {
             let mut q: Queue<SmallNode, BenchTag> = Queue::init();
             for node in &mut nodes {
@@ -547,7 +550,7 @@ fn bench_vs_vecdeque(c: &mut Criterion) {
 
     // Alternating push/pop - intrusive
     group.bench_function("intrusive/alternating", |b| {
-        let mut nodes: Vec<SmallNode> = (0..OPS_PER_ITER).map(|i| SmallNode::new(i)).collect();
+        let mut nodes: Vec<SmallNode> = (0..OPS_PER_ITER).map(SmallNode::new).collect();
         b.iter(|| {
             let mut q: Queue<SmallNode, BenchTag> = Queue::init();
             for node in &mut nodes {
@@ -583,7 +586,7 @@ fn bench_cache_pressure(c: &mut Criterion) {
     let l1_count = 1_000u64;
     group.throughput(Throughput::Elements(l1_count * 10)); // 10 iterations
     group.bench_function("l1_fit", |b| {
-        let mut nodes: Vec<SmallNode> = (0..l1_count).map(|i| SmallNode::new(i)).collect();
+        let mut nodes: Vec<SmallNode> = (0..l1_count).map(SmallNode::new).collect();
         b.iter(|| {
             let mut q: Queue<SmallNode, BenchTag> = Queue::init();
             for _ in 0..10 {
@@ -600,7 +603,7 @@ fn bench_cache_pressure(c: &mut Criterion) {
     let l2_count = 2_000u64;
     group.throughput(Throughput::Elements(l2_count * 5));
     group.bench_function("l2_fit", |b| {
-        let mut nodes: Vec<MediumNode> = (0..l2_count).map(|i| MediumNode::new(i)).collect();
+        let mut nodes: Vec<MediumNode> = (0..l2_count).map(MediumNode::new).collect();
         b.iter(|| {
             let mut q: Queue<MediumNode, BenchTag> = Queue::init();
             for _ in 0..5 {
@@ -617,7 +620,7 @@ fn bench_cache_pressure(c: &mut Criterion) {
     let l3_count = 20_000u64;
     group.throughput(Throughput::Elements(l3_count));
     group.bench_function("l3_pressure", |b| {
-        let mut nodes: Vec<LargeNode> = (0..l3_count).map(|i| LargeNode::new(i)).collect();
+        let mut nodes: Vec<LargeNode> = (0..l3_count).map(LargeNode::new).collect();
         b.iter(|| {
             let mut q: Queue<LargeNode, BenchTag> = Queue::init();
             for node in &mut nodes {
@@ -645,7 +648,7 @@ fn bench_assertion_overhead(c: &mut Criterion) {
     // Compare release vs debug builds to see the full impact.
 
     group.bench_function("push_with_assertions", |b| {
-        let mut nodes: Vec<SmallNode> = (0..OPS_PER_ITER).map(|i| SmallNode::new(i)).collect();
+        let mut nodes: Vec<SmallNode> = (0..OPS_PER_ITER).map(SmallNode::new).collect();
         b.iter(|| {
             let mut q: Queue<SmallNode, BenchTag> = Queue::init();
             for node in &mut nodes {
@@ -656,7 +659,7 @@ fn bench_assertion_overhead(c: &mut Criterion) {
     });
 
     group.bench_function("pop_with_assertions", |b| {
-        let mut nodes: Vec<SmallNode> = (0..OPS_PER_ITER).map(|i| SmallNode::new(i)).collect();
+        let mut nodes: Vec<SmallNode> = (0..OPS_PER_ITER).map(SmallNode::new).collect();
         b.iter(|| {
             let mut q: Queue<SmallNode, BenchTag> = Queue::init();
             for node in &mut nodes {
@@ -704,7 +707,7 @@ fn bench_multi_tag(c: &mut Criterion) {
 
     // Single node in two queues simultaneously
     group.bench_function("dual_queue_push_pop", |b| {
-        let mut nodes: Vec<DualTagNode> = (0..OPS_PER_ITER).map(|i| DualTagNode::new(i)).collect();
+        let mut nodes: Vec<DualTagNode> = (0..OPS_PER_ITER).map(DualTagNode::new).collect();
         b.iter(|| {
             let mut q1: Queue<DualTagNode, Tag1> = Queue::init();
             let mut q2: Queue<DualTagNode, Tag2> = Queue::init();
@@ -723,7 +726,7 @@ fn bench_multi_tag(c: &mut Criterion) {
 
     // Alternating between two queues
     group.bench_function("dual_queue_alternating", |b| {
-        let mut nodes: Vec<DualTagNode> = (0..OPS_PER_ITER).map(|i| DualTagNode::new(i)).collect();
+        let mut nodes: Vec<DualTagNode> = (0..OPS_PER_ITER).map(DualTagNode::new).collect();
         b.iter(|| {
             let mut q1: Queue<DualTagNode, Tag1> = Queue::init();
             let mut q2: Queue<DualTagNode, Tag2> = Queue::init();
@@ -751,7 +754,7 @@ fn bench_scaling(c: &mut Criterion) {
         group.throughput(Throughput::Elements(count));
 
         group.bench_with_input(BenchmarkId::new("push_pop", count), &count, |b, &count| {
-            let mut nodes: Vec<SmallNode> = (0..count).map(|i| SmallNode::new(i)).collect();
+            let mut nodes: Vec<SmallNode> = (0..count).map(SmallNode::new).collect();
             b.iter(|| {
                 let mut q: Queue<SmallNode, BenchTag> = Queue::init();
                 for node in &mut nodes {
@@ -777,7 +780,7 @@ fn bench_bulk_ops(c: &mut Criterion) {
         group.throughput(Throughput::Elements(count));
 
         group.bench_with_input(BenchmarkId::new("reset", count), &count, |b, &count| {
-            let mut nodes: Vec<SmallNode> = (0..count).map(|i| SmallNode::new(i)).collect();
+            let mut nodes: Vec<SmallNode> = (0..count).map(SmallNode::new).collect();
             b.iter(|| {
                 let mut q: Queue<SmallNode, BenchTag> = Queue::init();
                 for node in &mut nodes {
@@ -793,7 +796,7 @@ fn bench_bulk_ops(c: &mut Criterion) {
         });
 
         group.bench_with_input(BenchmarkId::new("take_all", count), &count, |b, &count| {
-            let mut nodes: Vec<SmallNode> = (0..count).map(|i| SmallNode::new(i)).collect();
+            let mut nodes: Vec<SmallNode> = (0..count).map(SmallNode::new).collect();
             b.iter(|| {
                 let mut q: Queue<SmallNode, BenchTag> = Queue::init();
                 for node in &mut nodes {
@@ -822,7 +825,7 @@ fn bench_contains(c: &mut Criterion) {
 
         // Lookup at head (O(1) best case)
         group.bench_with_input(BenchmarkId::new("head", count), &count, |b, &count| {
-            let mut nodes: Vec<SmallNode> = (0..count).map(|i| SmallNode::new(i)).collect();
+            let mut nodes: Vec<SmallNode> = (0..count).map(SmallNode::new).collect();
             let mut q: Queue<SmallNode, BenchTag> = Queue::init();
             for node in &mut nodes {
                 q.push(node);
@@ -834,7 +837,7 @@ fn bench_contains(c: &mut Criterion) {
 
         // Lookup at tail (O(n) worst case)
         group.bench_with_input(BenchmarkId::new("tail", count), &count, |b, &count| {
-            let mut nodes: Vec<SmallNode> = (0..count).map(|i| SmallNode::new(i)).collect();
+            let mut nodes: Vec<SmallNode> = (0..count).map(SmallNode::new).collect();
             let mut q: Queue<SmallNode, BenchTag> = Queue::init();
             for node in &mut nodes {
                 q.push(node);
@@ -847,7 +850,7 @@ fn bench_contains(c: &mut Criterion) {
 
         // Lookup of non-existent node
         group.bench_with_input(BenchmarkId::new("not_found", count), &count, |b, &count| {
-            let mut nodes: Vec<SmallNode> = (0..count).map(|i| SmallNode::new(i)).collect();
+            let mut nodes: Vec<SmallNode> = (0..count).map(SmallNode::new).collect();
             let not_in_queue = SmallNode::new(999_999);
             let mut q: Queue<SmallNode, BenchTag> = Queue::init();
             for node in &mut nodes {
