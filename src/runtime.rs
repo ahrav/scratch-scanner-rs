@@ -363,7 +363,7 @@ struct BufferPoolInner {
 impl BufferPoolInner {
     fn acquire_slot(&self) -> NonNull<u8> {
         let avail = self.available.get();
-        assert!(avail > 0, "buffer pool exhausted");
+        debug_assert!(avail > 0, "buffer pool exhausted");
 
         // SAFETY: BufferPoolInner is single-threaded; this is the only
         // mutable access to the underlying pool for this call.
@@ -380,7 +380,7 @@ impl BufferPoolInner {
 
         let avail = self.available.get();
         let new_avail = avail + 1;
-        assert!(new_avail <= self.capacity);
+        debug_assert!(new_avail <= self.capacity);
         self.available.set(new_avail);
     }
 }
@@ -496,8 +496,8 @@ pub fn read_file_chunks(
     loop {
         let mut handle = pool.acquire();
         let buf = handle.as_mut_slice();
-        assert!(tail_len <= tail.len());
-        assert!(buf.len() >= tail_len + chunk_size);
+        debug_assert!(tail_len <= tail.len());
+        debug_assert!(buf.len() >= tail_len + chunk_size);
 
         if tail_len > 0 {
             buf[..tail_len].copy_from_slice(&tail[..tail_len]);

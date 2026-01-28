@@ -260,7 +260,7 @@ impl<T> ScratchVec<T> {
     }
 
     pub fn push(&mut self, value: T) {
-        assert!(self.len < self.cap, "scratch vec capacity exceeded");
+        debug_assert!(self.len < self.cap, "scratch vec capacity exceeded");
         unsafe {
             self.ptr
                 .as_ptr()
@@ -271,7 +271,7 @@ impl<T> ScratchVec<T> {
     }
 
     pub fn truncate(&mut self, new_len: usize) {
-        assert!(new_len <= self.len);
+        debug_assert!(new_len <= self.len);
         unsafe {
             for i in new_len..self.len {
                 std::ptr::drop_in_place(self.ptr.as_ptr().add(i).cast::<T>());
@@ -302,7 +302,7 @@ impl<T> ScratchVec<T> {
         T: Copy,
     {
         let new_len = self.len.saturating_add(slice.len());
-        assert!(
+        debug_assert!(
             new_len <= self.cap,
             "scratch vec capacity exceeded on extend_from_slice"
         );
@@ -330,13 +330,13 @@ impl<T> ScratchVec<T> {
     where
         T: Copy,
     {
-        assert!(start <= self.len, "scratch vec range start out of bounds");
-        assert!(
+        debug_assert!(start <= self.len, "scratch vec range start out of bounds");
+        debug_assert!(
             start.saturating_add(len) <= self.len,
             "scratch vec range end out of bounds"
         );
         let new_len = self.len.saturating_add(len);
-        assert!(
+        debug_assert!(
             new_len <= self.cap,
             "scratch vec capacity exceeded on extend_from_self_range"
         );

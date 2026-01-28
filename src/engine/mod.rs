@@ -272,9 +272,9 @@ struct SpanU32 {
 
 impl SpanU32 {
     fn new(start: usize, end: usize) -> Self {
-        assert!(start <= end);
-        assert!(start <= u32::MAX as usize);
-        assert!(end <= u32::MAX as usize);
+        debug_assert!(start <= end);
+        debug_assert!(start <= u32::MAX as usize);
+        debug_assert!(end <= u32::MAX as usize);
         Self {
             start: start as u32,
             end: end as u32,
@@ -313,7 +313,7 @@ impl HitAccumulator {
     }
 
     fn push(&mut self, start: usize, end: usize, max_hits: usize) {
-        assert!(max_hits > 0, "max_hits must be > 0");
+        debug_assert!(max_hits > 0, "max_hits must be > 0");
         let r = SpanU32::new(start, end);
         if let Some(c) = self.coalesced.as_mut() {
             // Once coalesced, we only widen the single window. This ensures
@@ -1431,7 +1431,7 @@ impl Engine {
             let (buf_ptr, buf_len) = match item.buf {
                 BufRef::Root => (root_buf.as_ptr(), root_buf.len()),
                 BufRef::Slab(range) => unsafe {
-                    assert!(range.end <= scratch.slab.buf.len());
+                    debug_assert!(range.end <= scratch.slab.buf.len());
                     let ptr = scratch.slab.buf.as_ptr().add(range.start);
                     (ptr, range.end.saturating_sub(range.start))
                 },
@@ -1769,9 +1769,9 @@ impl Engine {
         file_id: FileId,
         scratch: &mut ScanScratch,
     ) {
-        assert!(buf.len() <= u32::MAX as usize);
-        assert!(self.tuning.merge_gap <= u32::MAX as usize);
-        assert!(self.tuning.pressure_gap_start <= u32::MAX as usize);
+        debug_assert!(buf.len() <= u32::MAX as usize);
+        debug_assert!(self.tuning.merge_gap <= u32::MAX as usize);
+        debug_assert!(self.tuning.pressure_gap_start <= u32::MAX as usize);
         let hay_len = buf.len() as u32;
         let merge_gap = self.tuning.merge_gap as u32;
         let pressure_gap_start = self.tuning.pressure_gap_start as u32;

@@ -502,25 +502,23 @@ impl DynamicBitSet {
     }
 
     /// Returns `true` when no bits are set.
-    ///
-    /// Optimized: branchless OR-folding avoids data-dependent branches.
     #[inline]
     pub fn is_empty(&self) -> bool {
         if self.words.is_empty() {
             return true;
         }
-
-        let len = self.words.len();
-
-        // OR-fold all words except the last - any set bit propagates
-        let mut acc = 0u64;
-        for &word in &self.words[..len - 1] {
-            acc |= word;
+        let last = self.words.len() - 1;
+        for (i, &word) in self.words.iter().enumerate() {
+            let word = if i == last {
+                word & self.last_word_mask()
+            } else {
+                word
+            };
+            if word != 0 {
+                return false;
+            }
         }
-
-        // OR in the last word with mask applied
-        acc |= self.words[len - 1] & self.last_word_mask();
-        acc == 0
+        true
     }
 
     /// Returns whether `idx` is set.
@@ -528,7 +526,7 @@ impl DynamicBitSet {
     /// Panics if `idx >= bit_length`.
     #[inline]
     pub fn is_set(&self, idx: usize) -> bool {
-        assert!(idx < self.bit_length, "bit index out of bounds");
+        debug_assert!(idx < self.bit_length, "bit index out of bounds");
         let word_idx = idx / 64;
         let bit_idx = idx % 64;
         (self.words[word_idx] & (1u64 << bit_idx)) != 0
@@ -539,7 +537,7 @@ impl DynamicBitSet {
     /// Panics if `idx >= bit_length`.
     #[inline]
     pub fn set(&mut self, idx: usize) {
-        assert!(idx < self.bit_length, "bit index out of bounds");
+        debug_assert!(idx < self.bit_length, "bit index out of bounds");
         let word_idx = idx / 64;
         let bit_idx = idx % 64;
         self.words[word_idx] |= 1u64 << bit_idx;
@@ -550,7 +548,7 @@ impl DynamicBitSet {
     /// Panics if `idx >= bit_length`.
     #[inline]
     pub fn unset(&mut self, idx: usize) {
-        assert!(idx < self.bit_length, "bit index out of bounds");
+        debug_assert!(idx < self.bit_length, "bit index out of bounds");
         let word_idx = idx / 64;
         let bit_idx = idx % 64;
         self.words[word_idx] &= !(1u64 << bit_idx);
@@ -561,7 +559,7 @@ impl DynamicBitSet {
     /// Panics if `idx >= bit_length`.
     #[inline]
     pub fn set_value(&mut self, idx: usize, value: bool) {
-        assert!(idx < self.bit_length, "bit index out of bounds");
+        debug_assert!(idx < self.bit_length, "bit index out of bounds");
         let word_idx = idx / 64;
         let bit_idx = idx % 64;
         let bit_mask = 1u64 << bit_idx;

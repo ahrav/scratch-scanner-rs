@@ -166,7 +166,7 @@ pub(super) fn find_url_spans_into(
     plus_to_space: bool,
     spans: &mut impl SpanSink,
 ) {
-    assert!(max_len >= min_len);
+    debug_assert!(max_len >= min_len);
     // Fast reject: URL spans require at least one '%' (or '+' when plus_to_space is enabled).
     // Note: the engine already applies this prefilter via transform_quick_trigger(),
     // but direct callers (e.g., microbench) can reach here without that guard.
@@ -336,7 +336,7 @@ pub(super) fn find_base64_spans_into(
     allow_space_ws: bool,
     spans: &mut impl SpanSink,
 ) {
-    assert!(max_len >= min_chars);
+    debug_assert!(max_len >= min_chars);
     spans.clear();
     if max_spans == 0 {
         return;

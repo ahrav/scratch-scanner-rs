@@ -91,11 +91,11 @@ impl<const NODE_SIZE: usize, const NODE_ALIGNMENT: usize> NodePoolType<NODE_SIZE
     pub fn acquire(&mut self) -> NonNull<u8> {
         let node_index = Self::find_first_set(&self.free)
             .unwrap_or_else(|| panic!("node pool exhausted; increase pool capacity"));
-        assert!(self.free.is_set(node_index));
+        debug_assert!(self.free.is_set(node_index));
         self.free.unset(node_index);
 
         let offset = node_index * NODE_SIZE;
-        assert!(offset + NODE_SIZE <= self.len);
+        debug_assert!(offset + NODE_SIZE <= self.len);
 
         // SAFETY: Offset bounds verified by assertion above.
         unsafe { NonNull::new_unchecked(self.buffer.as_ptr().add(offset)) }
@@ -109,14 +109,14 @@ impl<const NODE_SIZE: usize, const NODE_ALIGNMENT: usize> NodePoolType<NODE_SIZE
         let base = self.buffer.as_ptr() as usize;
         let ptr = node.as_ptr() as usize;
 
-        assert!(ptr >= base);
-        assert!(ptr + NODE_SIZE <= base + self.len);
+        debug_assert!(ptr >= base);
+        debug_assert!(ptr + NODE_SIZE <= base + self.len);
 
         let node_offset = ptr - base;
-        assert!(node_offset.is_multiple_of(NODE_SIZE));
+        debug_assert!(node_offset.is_multiple_of(NODE_SIZE));
 
         let node_index = node_offset / NODE_SIZE;
-        assert!(!self.free.is_set(node_index));
+        debug_assert!(!self.free.is_set(node_index));
         self.free.set(node_index);
     }
 

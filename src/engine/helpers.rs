@@ -25,7 +25,7 @@ pub(super) fn merge_ranges_with_gap_sorted(ranges: &mut ScratchVec<SpanU32>, gap
 
     for i in 1..len {
         let r = ranges[i];
-        assert!(r.start >= cur.start);
+        debug_assert!(r.start >= cur.start);
         if r.start <= cur.end.saturating_add(gap) {
             cur.end = cur.end.max(r.end);
         } else {
@@ -82,7 +82,7 @@ pub(super) fn contains_any_memmem(hay: &[u8], needles: &PackedPatterns) -> bool 
     for i in 0..count {
         let start = needles.offsets[i] as usize;
         let end = needles.offsets[i + 1] as usize;
-        assert!(end <= needles.bytes.len());
+        debug_assert!(end <= needles.bytes.len());
         if memmem::find(hay, &needles.bytes[start..end]).is_some() {
             return true;
         }
@@ -95,7 +95,7 @@ pub(super) fn contains_all_memmem(hay: &[u8], needles: &PackedPatterns) -> bool 
     for i in 0..count {
         let start = needles.offsets[i] as usize;
         let end = needles.offsets[i + 1] as usize;
-        assert!(end <= needles.bytes.len());
+        debug_assert!(end <= needles.bytes.len());
         if memmem::find(hay, &needles.bytes[start..end]).is_none() {
             return false;
         }

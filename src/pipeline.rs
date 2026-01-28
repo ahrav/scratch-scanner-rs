@@ -502,10 +502,10 @@ impl FileReader {
         tail: &mut [u8],
         tail_len: &mut usize,
     ) -> io::Result<Option<Chunk>> {
-        assert!(*tail_len <= tail.len());
-        assert!(overlap == tail.len());
+        debug_assert!(*tail_len <= tail.len());
+        debug_assert!(overlap == tail.len());
         let buf = handle.as_mut_slice();
-        assert!(buf.len() >= *tail_len + chunk_size);
+        debug_assert!(buf.len() >= *tail_len + chunk_size);
 
         if *tail_len > 0 {
             buf[..*tail_len].copy_from_slice(&tail[..*tail_len]);

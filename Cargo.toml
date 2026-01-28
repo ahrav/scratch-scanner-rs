@@ -53,6 +53,10 @@ required-features = ["bench"]
 name = "ring_buffer"
 harness = false
 
+[[bench]]
+name = "fixed_set"
+harness = false
+
 [profile.dev]
 opt-level = 1
 

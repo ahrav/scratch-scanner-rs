@@ -363,11 +363,11 @@ impl AioSlot {
         req_len: usize,
         seq: u64,
     ) -> io::Result<()> {
-        assert!(self.is_empty());
-        assert!(req_len > 0);
+        debug_assert!(self.is_empty());
+        debug_assert!(req_len > 0);
 
         let buf = handle.as_mut_slice();
-        assert!(buf.len() >= payload_off + req_len);
+        debug_assert!(buf.len() >= payload_off + req_len);
 
         // Read payload into the fixed payload offset. The overlap prefix is
         // stitched in after completion so we can submit read-ahead without
@@ -552,7 +552,7 @@ impl AioFileReader {
 
         self.free_slots.clear();
         for idx in (0..self.queue_depth).rev() {
-            assert!(
+            debug_assert!(
                 self.free_slots.len() < self.free_slots.capacity(),
                 "free slot stack capacity exceeded"
             );
@@ -594,7 +594,7 @@ impl AioFileReader {
             let remaining = self.file_len.saturating_sub(self.next_offset);
             if remaining == 0 {
                 self.end_seq = self.next_seq;
-                assert!(
+                debug_assert!(
                     self.free_slots.len() < self.free_slots.capacity(),
                     "free slot stack capacity exceeded"
                 );
@@ -606,7 +606,7 @@ impl AioFileReader {
             let handle = match pool.try_acquire() {
                 Some(handle) => handle,
                 None => {
-                    assert!(
+                    debug_assert!(
                         self.free_slots.len() < self.free_slots.capacity(),
                         "free slot stack capacity exceeded"
                     );
@@ -618,7 +618,7 @@ impl AioFileReader {
             // Submit in increasing file offset order. Each submission gets a
             // strictly increasing sequence number so we can emit in order.
             let slot = &mut self.slots[slot_idx];
-            assert!(slot.is_empty());
+            debug_assert!(slot.is_empty());
             match slot.submit(
                 self.fd,
                 handle,
@@ -630,7 +630,7 @@ impl AioFileReader {
                 Ok(()) => {}
                 Err(err) if Self::is_retryable_submit_error(&err) => {
                     // Back off on transient resource exhaustion and retry after completions.
-                    assert!(
+                    debug_assert!(
                         self.free_slots.len() < self.free_slots.capacity(),
                         "free slot stack capacity exceeded"
                     );
@@ -638,7 +638,7 @@ impl AioFileReader {
                     break;
                 }
                 Err(err) => {
-                    assert!(
+                    debug_assert!(
                         self.free_slots.len() < self.free_slots.capacity(),
                         "free slot stack capacity exceeded"
                     );
@@ -665,7 +665,7 @@ impl AioFileReader {
             }
             if slot.poll_complete()? {
                 let pos = (slot.seq as usize) % ready_len;
-                assert!(
+                debug_assert!(
                     self.ready_seq[pos] == u64::MAX,
                     "ready ring collision for seq {}",
                     slot.seq
@@ -695,7 +695,7 @@ impl AioFileReader {
                 }
                 slot.reset();
                 let free_slots = &mut self.free_slots;
-                assert!(
+                debug_assert!(
                     free_slots.len() < free_slots.capacity(),
                     "free slot stack capacity exceeded"
                 );
@@ -709,7 +709,7 @@ impl AioFileReader {
         let wait_list = &mut self.wait_list;
         for slot in &self.slots {
             if slot.is_in_flight() {
-                assert!(
+                debug_assert!(
                     wait_list.len() < wait_list.capacity(),
                     "wait list capacity exceeded"
                 );
@@ -753,7 +753,7 @@ impl AioFileReader {
             let wait_list = &mut self.wait_list;
             for slot in &self.slots {
                 if slot.is_in_flight() {
-                    assert!(
+                    debug_assert!(
                         wait_list.len() < wait_list.capacity(),
                         "wait list capacity exceeded"
                     );
@@ -809,7 +809,7 @@ impl AioFileReader {
         self.ready_seq[pos] = u64::MAX;
 
         let slot = &mut self.slots[idx];
-        assert!(slot.is_completed());
+        debug_assert!(slot.is_completed());
         let read_len = slot.read_len;
         let req_len = slot.req_len;
         let offset = slot.offset;
@@ -819,7 +819,7 @@ impl AioFileReader {
             .take()
             .expect("completed slot must hold a buffer");
         slot.reset();
-        assert!(
+        debug_assert!(
             self.free_slots.len() < self.free_slots.capacity(),
             "free slot stack capacity exceeded"
         );
