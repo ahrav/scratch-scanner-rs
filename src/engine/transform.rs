@@ -310,103 +310,6 @@ enum Base64DecodeError {
     OutputTooLarge,
 }
 
-#[inline]
-fn is_b64_char(b: u8) -> bool {
-    (BYTE_CLASS[b as usize] & B64_CHAR) != 0
-}
-
-#[inline]
-fn is_b64_ws(b: u8, allow_space: bool) -> bool {
-    let flags = BYTE_CLASS[b as usize];
-    if allow_space {
-        (flags & (B64_WS | B64_WS_SPACE)) != 0
-    } else {
-        (flags & B64_WS) != 0
-    }
-}
-
-fn is_b64_or_ws(b: u8, allow_space: bool) -> bool {
-    is_b64_char(b) || is_b64_ws(b, allow_space)
-}
-
-#[inline]
-fn find_b64ish_start(hay: &[u8], i: usize, allow_space: bool) -> usize {
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        find_b64ish_start_neon(hay, i, allow_space)
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let mut i = i;
-        while i < hay.len() && !is_b64_or_ws(hay[i], allow_space) {
-            i += 1;
-        }
-        i
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline]
-unsafe fn find_b64ish_start_neon(hay: &[u8], mut i: usize, allow_space: bool) -> usize {
-    use std::arch::aarch64::{
-        vandq_u8, vceqq_u8, vcgeq_u8, vcleq_u8, vdupq_n_u8, vld1q_u8, vmaxvq_u8, vorrq_u8,
-    };
-
-    let len = hay.len();
-    let ptr = hay.as_ptr();
-
-    let a = vdupq_n_u8(b'A');
-    let z = vdupq_n_u8(b'Z');
-    let aa = vdupq_n_u8(b'a');
-    let zz = vdupq_n_u8(b'z');
-    let zero = vdupq_n_u8(b'0');
-    let nine = vdupq_n_u8(b'9');
-
-    let plus = vdupq_n_u8(b'+');
-    let slash = vdupq_n_u8(b'/');
-    let eq = vdupq_n_u8(b'=');
-    let dash = vdupq_n_u8(b'-');
-    let underscore = vdupq_n_u8(b'_');
-
-    let lf = vdupq_n_u8(b'\n');
-    let cr = vdupq_n_u8(b'\r');
-    let tab = vdupq_n_u8(b'\t');
-    let space = vdupq_n_u8(b' ');
-
-    while i + 16 <= len {
-        let v = vld1q_u8(ptr.add(i));
-
-        let upper = vandq_u8(vcgeq_u8(v, a), vcleq_u8(v, z));
-        let lower = vandq_u8(vcgeq_u8(v, aa), vcleq_u8(v, zz));
-        let digit = vandq_u8(vcgeq_u8(v, zero), vcleq_u8(v, nine));
-
-        let sym = vorrq_u8(
-            vorrq_u8(vceqq_u8(v, plus), vceqq_u8(v, slash)),
-            vorrq_u8(
-                vceqq_u8(v, eq),
-                vorrq_u8(vceqq_u8(v, dash), vceqq_u8(v, underscore)),
-            ),
-        );
-
-        let mut ws = vorrq_u8(vceqq_u8(v, lf), vceqq_u8(v, cr));
-        ws = vorrq_u8(ws, vceqq_u8(v, tab));
-        if allow_space {
-            ws = vorrq_u8(ws, vceqq_u8(v, space));
-        }
-
-        let b64ish = vorrq_u8(sym, vorrq_u8(upper, vorrq_u8(lower, vorrq_u8(digit, ws))));
-        if vmaxvq_u8(b64ish) != 0 {
-            break;
-        }
-        i += 16;
-    }
-
-    while i < len && !is_b64_or_ws(hay[i], allow_space) {
-        i += 1;
-    }
-    i
-}
-
 // Simple span finder. It is permissive by design.
 //
 // Why permissive?
@@ -417,9 +320,14 @@ unsafe fn find_b64ish_start_neon(hay: &[u8], mut i: usize, allow_space: bool) ->
 // cost limits and correctness.
 /// Finds base64-ish spans within `hay` and appends them to `spans`.
 ///
-/// The scan is permissive by design and relies on downstream decoding gates
-/// for correctness. Trailing whitespace is trimmed so spans end at the last
-/// base64 byte observed.
+/// Guarantees / invariants:
+/// - Each byte is classified at most once (single-pass scan).
+/// - Spans contain only base64 chars + allowed whitespace.
+/// - Spans end at the last base64 byte; trailing whitespace is trimmed.
+/// - Runs are split at `max_len` to bound worst-case work.
+///
+/// The scan is intentionally permissive and relies on downstream decode gates
+/// for strict validation.
 pub(super) fn find_base64_spans_into(
     hay: &[u8],
     min_chars: usize,
@@ -430,41 +338,78 @@ pub(super) fn find_base64_spans_into(
 ) {
     assert!(max_len >= min_chars);
     spans.clear();
-    let mut i = 0usize;
+    if max_spans == 0 {
+        return;
+    }
+
     let allow_mask = if allow_space_ws {
         B64_CHAR | B64_WS | B64_WS_SPACE
     } else {
         B64_CHAR | B64_WS
     };
+    let mut span_count = 0usize;
 
-    while i < hay.len() && spans.len() < max_spans {
-        i = find_b64ish_start(hay, i, allow_space_ws);
-        if i >= hay.len() {
-            break;
+    // Current run state.
+    let mut in_run = false;
+    let mut start = 0usize;
+    let mut run_len = 0usize;
+    let mut b64_chars = 0usize;
+    let mut have_b64 = false;
+    let mut last_b64 = 0usize;
+
+    let mut i = 0usize;
+    while i < hay.len() {
+        let flags = BYTE_CLASS[hay[i] as usize];
+        let allowed = (flags & allow_mask) != 0;
+
+        if !in_run {
+            if !allowed {
+                i += 1;
+                continue;
+            }
+            in_run = true;
+            start = i;
+            run_len = 0;
+            b64_chars = 0;
+            have_b64 = false;
         }
 
-        let start = i;
-        let mut b64_chars = 0usize;
-        let mut last_b64 = None::<usize>;
-
-        while i < hay.len() && (i - start) < max_len {
-            let flags = BYTE_CLASS[hay[i] as usize];
-            if (flags & allow_mask) == 0 {
-                break;
-            }
+        if allowed {
+            run_len += 1;
             if (flags & B64_CHAR) != 0 {
                 b64_chars += 1;
-                last_b64 = Some(i);
+                last_b64 = i;
+                have_b64 = true;
             }
             i += 1;
-        }
 
-        if b64_chars >= min_chars {
-            if let Some(last) = last_b64 {
-                // Trim trailing whitespace by ending at the last base64 byte.
-                spans.push(start..(last + 1));
+            if run_len >= max_len {
+                // Split long runs eagerly; the next iteration starts fresh at `i`.
+                if have_b64 && b64_chars >= min_chars {
+                    spans.push(start..(last_b64 + 1));
+                    span_count += 1;
+                    if span_count >= max_spans {
+                        return;
+                    }
+                }
+                in_run = false;
             }
+        } else {
+            // Disallowed byte ends the run; consume it so we don't recheck it.
+            if have_b64 && b64_chars >= min_chars {
+                spans.push(start..(last_b64 + 1));
+                span_count += 1;
+                if span_count >= max_spans {
+                    return;
+                }
+            }
+            in_run = false;
+            i += 1;
         }
+    }
+
+    if in_run && have_b64 && b64_chars >= min_chars && span_count < max_spans {
+        spans.push(start..(last_b64 + 1));
     }
 }
 
