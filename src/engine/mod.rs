@@ -10,6 +10,14 @@
 //! 3. Run validators, gates, and regexes inside those windows.
 //! 4. Optionally decode transform spans into derived buffers and repeat (BFS).
 //!
+//! # Data model and lifetimes
+//! - The engine is immutable after construction; all mutable scan state lives in
+//!   [`ScanScratch`], which is single-threaded and reused across scans.
+//! - Decoded buffers are stored in an append-only slab; ranges and `StepId`
+//!   references are only valid until the next `ScanScratch::reset_for_scan`.
+//! - Offsets stored in hot paths use `u32`; callers must chunk inputs so buffer
+//!   lengths fit in `u32`.
+//!
 //! # Budgets and invariants
 //! - All per-scan work is bounded by tuning limits: windows, hits, findings,
 //!   decode output bytes, transform depth, and work items.
@@ -108,6 +116,8 @@ impl Variant {
 /// Flags encoded in the low bits record whether the anchor is match-start
 /// aligned (required by fast validators) and whether keyword gates are implied
 /// by this specific anchor (so the validator can remain authoritative).
+///
+/// Layout (low bits): [variant (2)] [match_start] [keyword_implied] [rule_id...]
 #[derive(Clone, Copy, Debug)]
 struct Target(u32);
 
@@ -157,6 +167,9 @@ impl Target {
 /// `pat_targets` so each pattern id can fan out to multiple (rule, variant)
 /// targets without per-pattern allocations. `prefilter` stores a byteset-based
 /// accelerator derived from the same pattern universe.
+///
+/// Invariant: `pat_offsets.len() == patterns + 1`, and each pattern id maps to
+/// `pat_targets[pat_offsets[i]..pat_offsets[i + 1]]`.
 struct AnchorIndex {
     ac: AhoCorasick,
     pat_targets: Vec<Target>,
@@ -169,6 +182,9 @@ struct AnchorIndex {
 /// Invariant: every UTF-16 pattern contains at least one NUL byte, so a NUL-free
 /// slice cannot match UTF-16LE/BE variants. This allows a fast raw-only path
 /// for NUL-free buffers and a single-pass combined scan for NUL-heavy buffers.
+///
+/// `raw` contains only raw anchors, `all` contains raw + UTF-16 anchors, and
+/// `utf16` contains UTF-16-only anchors for the "raw already scanned" path.
 struct Anchors {
     raw: AnchorIndex,
     all: AnchorIndex,
@@ -206,6 +222,8 @@ impl Anchors {
 /// table with length `patterns + 1`. This avoids a `Vec<Vec<u8>>` and keeps
 /// confirm patterns contiguous for cache-friendly memmem checks (both ANY and
 /// ALL gates).
+///
+/// Invariant: `offsets[0] == 0` and `bytes.len() <= u32::MAX`.
 #[derive(Clone, Debug)]
 struct PackedPatterns {
     bytes: Vec<u8>,
@@ -284,6 +302,7 @@ struct ConfirmAllCompiled {
 #[derive(Clone, Copy, Debug)]
 struct EntropyCompiled {
     // Prevalidated config stored in compiled rules to avoid repeated lookups.
+    // Lengths are measured in bytes of the candidate match.
     min_bits_per_byte: f32,
     min_len: usize,
     max_len: usize,
@@ -310,7 +329,8 @@ struct RuleCompiled {
 /// Compact span used in hot paths.
 ///
 /// Uses `u32` offsets to reduce memory footprint and improve cache density.
-/// Valid only for buffers whose length fits in `u32`.
+/// Valid only for buffers whose length fits in `u32`. Spans are half-open
+/// ranges (`start..end`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SpanU32 {
     start: u32,
@@ -339,6 +359,10 @@ impl SpanU32 {
 /// it switches to a single "coalesced" window that covers the union of all hits
 /// seen so far. The fallback is conservative (may over-expand) but guarantees
 /// correctness while bounding memory growth.
+///
+/// Windows are pushed in non-decreasing order for anchor scans. When switching
+/// to coalesced mode, ordering is no longer meaningful; downstream code must
+/// not assume sorted windows unless it explicitly sorts them.
 struct HitAccumulator {
     windows: ScratchVec<SpanU32>,
     coalesced: Option<SpanU32>,
@@ -518,6 +542,11 @@ impl DecodeSlab {
         &self.buf[r]
     }
 
+    /// Append decoded bytes into the slab while enforcing per-transform and
+    /// global decode budgets.
+    ///
+    /// On decode error, truncation, or zero output, the slab is rolled back to
+    /// its pre-call length and `Err(())` is returned.
     fn append_stream_decode(
         &mut self,
         tc: &TransformConfig,
@@ -659,6 +688,8 @@ pub struct ScanScratch {
     vs_scratch: Option<VsScratch>,
     /// Per-thread Vectorscan scratch space for UTF-16 anchor prefiltering.
     vs_utf16_scratch: Option<VsScratch>,
+    /// Per-thread Vectorscan scratch space for decoded-stream gating.
+    vs_gate_scratch: Option<VsScratch>,
     #[cfg(feature = "b64-stats")]
     base64_stats: Base64DecodeStats, // Base64 decode/gate instrumentation.
 }
@@ -743,12 +774,19 @@ impl ScanScratch {
                 db.alloc_scratch()
                     .expect("vectorscan utf16 scratch allocation failed")
             }),
+            vs_gate_scratch: engine.vs_gate.as_ref().map(|db| {
+                db.alloc_scratch()
+                    .expect("vectorscan gate scratch allocation failed")
+            }),
             #[cfg(feature = "b64-stats")]
             base64_stats: Base64DecodeStats::default(),
         }
     }
 
     /// Clears per-scan state and revalidates scratch capacities against the engine.
+    ///
+    /// This may reallocate scratch buffers if the engine's tuning or rule set
+    /// grew since the last scan.
     fn reset_for_scan(&mut self, engine: &Engine) {
         self.out.clear();
         self.findings_dropped = 0;
@@ -798,6 +836,23 @@ impl ScanScratch {
             }
             None => {
                 self.vs_utf16_scratch = None;
+            }
+        }
+        match engine.vs_gate.as_ref() {
+            Some(db) => {
+                let need_alloc = match self.vs_gate_scratch.as_ref() {
+                    Some(s) => s.bound_db_ptr() != db.db_ptr(),
+                    None => true,
+                };
+                if need_alloc {
+                    self.vs_gate_scratch = Some(
+                        db.alloc_scratch()
+                            .expect("vectorscan gate scratch allocation failed"),
+                    );
+                }
+            }
+            None => {
+                self.vs_gate_scratch = None;
             }
         }
         self.touched_pairs.clear();
@@ -931,6 +986,9 @@ impl ScanScratch {
     }
 
     /// Drops findings that are fully contained in a chunk prefix.
+    ///
+    /// `new_bytes_start` is the absolute byte offset where the new, non-overlap
+    /// region begins (typically `base_offset + prefix_len`).
     pub fn drop_prefix_findings(&mut self, new_bytes_start: u64) {
         if new_bytes_start == 0 {
             return;
@@ -1104,6 +1162,8 @@ pub struct VectorscanStats {
     pub db_built: bool,
     /// Whether the UTF-16 Vectorscan DB compiled successfully.
     pub utf16_db_built: bool,
+    /// Whether the decode gate Vectorscan DB compiled successfully.
+    pub gate_db_built: bool,
     /// Number of buffers where a Vectorscan scan was attempted.
     pub scans_attempted: u64,
     /// Number of Vectorscan scans that completed successfully.
@@ -1116,6 +1176,12 @@ pub struct VectorscanStats {
     pub utf16_scans_ok: u64,
     /// Number of UTF-16 Vectorscan scans that errored.
     pub utf16_scans_err: u64,
+    /// Number of decode-gate Vectorscan scans attempted.
+    pub gate_scans_attempted: u64,
+    /// Number of decode-gate Vectorscan scans that completed successfully.
+    pub gate_scans_ok: u64,
+    /// Number of decode-gate Vectorscan scans that errored.
+    pub gate_scans_err: u64,
     /// Buffers scanned only by anchors (no Vectorscan used).
     pub anchor_only: u64,
     /// Buffers that used Vectorscan but still required anchor scan (UTF-16 path).
@@ -1133,6 +1199,9 @@ struct VectorscanCounters {
     utf16_scans_attempted: AtomicU64,
     utf16_scans_ok: AtomicU64,
     utf16_scans_err: AtomicU64,
+    gate_scans_attempted: AtomicU64,
+    gate_scans_ok: AtomicU64,
+    gate_scans_err: AtomicU64,
     anchor_only: AtomicU64,
     anchor_after_vs: AtomicU64,
     anchor_skipped: AtomicU64,
@@ -1140,7 +1209,7 @@ struct VectorscanCounters {
 
 #[cfg(feature = "stats")]
 impl VectorscanCounters {
-    fn snapshot(&self, db_built: bool, utf16_db_built: bool) -> VectorscanStats {
+    fn snapshot(&self, db_built: bool, utf16_db_built: bool, gate_db_built: bool) -> VectorscanStats {
         VectorscanStats {
             db_built,
             utf16_db_built,
@@ -1150,6 +1219,9 @@ impl VectorscanCounters {
             utf16_scans_attempted: self.utf16_scans_attempted.load(Ordering::Relaxed),
             utf16_scans_ok: self.utf16_scans_ok.load(Ordering::Relaxed),
             utf16_scans_err: self.utf16_scans_err.load(Ordering::Relaxed),
+            gate_scans_attempted: self.gate_scans_attempted.load(Ordering::Relaxed),
+            gate_scans_ok: self.gate_scans_ok.load(Ordering::Relaxed),
+            gate_scans_err: self.gate_scans_err.load(Ordering::Relaxed),
             anchor_only: self.anchor_only.load(Ordering::Relaxed),
             anchor_after_vs: self.anchor_after_vs.load(Ordering::Relaxed),
             anchor_skipped: self.anchor_skipped.load(Ordering::Relaxed),
@@ -1575,6 +1647,19 @@ impl Engine {
                 }
             }
         };
+        let vs_gate = if std::env::var_os("SCANNER_VS_DECODE_GATE").is_some() {
+            match VsGateDb::try_new_gate(&anchor_patterns_all) {
+                Ok(db) => Some(db),
+                Err(err) => {
+                    if std::env::var_os("SCANNER_VS_GATE_DEBUG").is_some() {
+                        eprintln!("vectorscan decode gate db build failed: {err}");
+                    }
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         Self {
             rules: rules_compiled,
@@ -1603,6 +1688,7 @@ impl Engine {
             },
             vs,
             vs_utf16,
+            vs_gate,
             b64_gate,
             residue_rules,
             unfilterable_rules,
@@ -1625,7 +1711,7 @@ impl Engine {
     #[cfg(feature = "stats")]
     pub fn vectorscan_stats(&self) -> VectorscanStats {
         self.vs_stats
-            .snapshot(self.vs.is_some(), self.vs_utf16.is_some())
+            .snapshot(self.vs.is_some(), self.vs_utf16.is_some(), self.vs_gate.is_some())
     }
 
     /// Rules that could not be given a sound gate from their regex pattern.
@@ -1668,6 +1754,9 @@ impl Engine {
     /// allocations. Findings are stored as compact [`FindingRec`] entries.
     /// When the per-chunk finding cap is exceeded, extra findings are dropped
     /// and counted in [`ScanScratch::dropped_findings`].
+    ///
+    /// `base_offset` is the absolute byte offset of `root_buf` within the file
+    /// or stream and is used to compute `root_hint_*` fields for findings.
     pub fn scan_chunk_into(
         &self,
         root_buf: &[u8],
@@ -2565,6 +2654,9 @@ impl Engine {
     /// Returns the slab range only if decoding succeeds, stays within budgets,
     /// and an anchor match is observed in the decoded stream. On failure or
     /// no-hit, the slab is rolled back to its pre-call length.
+    ///
+    /// The gate prefers Vectorscan when available, falling back to the anchor
+    /// automaton on the decoded window.
     fn decode_stream_gated_into_slab(
         &self,
         tc: &TransformConfig,
@@ -2636,9 +2728,40 @@ impl Engine {
 
             if !hit {
                 let window = scratch.gate.scratch.as_slice();
-                let anchors = self.anchors.select(window, self.tuning.scan_utf16_variants);
-                if anchors.ac.is_match(window) {
-                    hit = true;
+                let mut gate_ok = false;
+                if let (Some(vs_gate), Some(vs_scratch)) =
+                    (self.vs_gate.as_ref(), scratch.vs_gate_scratch.as_mut())
+                {
+                    #[cfg(feature = "stats")]
+                    {
+                        self.vs_stats
+                            .gate_scans_attempted
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    match vs_gate.scan_gate(window, vs_scratch) {
+                        Ok(matched) => {
+                            gate_ok = true;
+                            if matched {
+                                hit = true;
+                            }
+                            #[cfg(feature = "stats")]
+                            {
+                                self.vs_stats.gate_scans_ok.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        Err(_) => {
+                            #[cfg(feature = "stats")]
+                            {
+                                self.vs_stats.gate_scans_err.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+                if !gate_ok {
+                    let anchors = self.anchors.select(window, self.tuning.scan_utf16_variants);
+                    if anchors.ac.is_match(window) {
+                        hit = true;
+                    }
                 }
             }
 

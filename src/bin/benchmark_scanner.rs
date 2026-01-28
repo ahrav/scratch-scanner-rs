@@ -1,5 +1,14 @@
 //! Benchmark suite for scanner engine performance.
 //!
+//! This binary is a self-contained harness that:
+//! - Builds synthetic datasets (random noise plus injected "hits").
+//! - Runs scanner engines across size sweeps and dataset mixes.
+//! - Collects timing statistics and (optionally) Linux perf counters.
+//!
+//! The datasets are deterministic by design so repeated runs are comparable.
+//! Hardware counters are best-effort and can be multiplexed or unavailable on
+//! some systems; when counters are missing, metrics fall back to zero.
+//!
 //! # Usage
 //!
 //! ```bash
@@ -23,8 +32,11 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
 use std::{fs, path::Path};
 
+/// Timed iterations per benchmark.
 const DEFAULT_ITERATIONS: usize = 12;
+/// Warmup iterations to stabilize caches and branch predictors.
 const DEFAULT_WARMUPS: usize = 2;
+/// Buffer size (MiB) for dataset-mix benchmarks.
 const DEFAULT_BUF_MIB: usize = 4;
 const SIZE_SWEEP: &[usize] = &[
     256 * 1024,
@@ -35,10 +47,15 @@ const SIZE_SWEEP: &[usize] = &[
     8 * 1024 * 1024,
 ];
 
+/// Fake tokens used to seed deterministic "hits" in datasets.
 const AWS_TOKEN: &[u8] = b"AKIAIOSFODNN7EXAMPLE";
 const GHP_TOKEN: &[u8] = b"ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8";
 const AWS_B64: &[u8] = b"QUtJQUlPU0ZPRE5ON0VYQU1QTEU=";
 
+/// Small deterministic PRNG for reproducible benchmark data.
+///
+/// This is not cryptographically secure; it is only used to generate stable
+/// random-looking input buffers.
 struct XorShift64 {
     state: u64,
 }
@@ -57,6 +74,7 @@ impl XorShift64 {
         x
     }
 
+    /// Fill a buffer with pseudo-random bytes.
     fn fill_bytes(&mut self, buf: &mut [u8]) {
         let mut i = 0;
         while i < buf.len() {
@@ -70,6 +88,7 @@ impl XorShift64 {
         }
     }
 
+    /// Fill a buffer with pseudo-random lowercase ASCII letters.
     fn fill_ascii(&mut self, buf: &mut [u8]) {
         for b in buf.iter_mut() {
             let v = (self.next_u64() & 0xff) as u8;
@@ -80,6 +99,9 @@ impl XorShift64 {
 }
 
 #[derive(Clone, Copy)]
+/// Dataset categories used by the benchmarks.
+///
+/// Each variant stresses a different encoding or hit distribution.
 enum DatasetKind {
     Random,
     AsciiHits,
@@ -107,6 +129,7 @@ impl DatasetKind {
         }
     }
 
+    /// Build a dataset buffer of the requested length.
     fn build(self, len: usize) -> Vec<u8> {
         match self {
             DatasetKind::Random => make_random(len, 0x1234_5678_9abc_def0),
@@ -118,11 +141,13 @@ impl DatasetKind {
     }
 }
 
+/// Dataset instance with a friendly name and backing bytes.
 struct Dataset {
     name: &'static str,
     buf: Vec<u8>,
 }
 
+/// Deterministic random bytes used for the size-scaling benchmark.
 fn make_random(len: usize, seed: u64) -> Vec<u8> {
     let mut buf = vec![0u8; len];
     let mut rng = XorShift64::new(seed);
@@ -130,6 +155,7 @@ fn make_random(len: usize, seed: u64) -> Vec<u8> {
     buf
 }
 
+/// ASCII letter corpus with injected fake tokens at fixed strides.
 fn make_ascii_hits(len: usize) -> Vec<u8> {
     let mut buf = vec![0u8; len];
     let mut rng = XorShift64::new(0x1111_2222_3333_4444);
@@ -139,6 +165,7 @@ fn make_ascii_hits(len: usize) -> Vec<u8> {
     buf
 }
 
+/// UTF-16LE/BE corpus with injected fake tokens encoded as UTF-16 bytes.
 fn make_utf16_hits(len: usize, be: bool) -> Vec<u8> {
     let mut buf = make_utf16_text(
         len,
@@ -154,6 +181,7 @@ fn make_utf16_hits(len: usize, be: bool) -> Vec<u8> {
     buf
 }
 
+/// Base64-like corpus that repeats an encoded token with newlines.
 fn make_base64_hits(len: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(len);
     while out.len() + AWS_B64.len() < len {
@@ -167,10 +195,12 @@ fn make_base64_hits(len: usize) -> Vec<u8> {
     out
 }
 
+/// Inject a token repeatedly, leaving a short prefix of non-token bytes.
 fn inject_token(buf: &mut [u8], token: &[u8], stride: usize) {
     if token.is_empty() || stride == 0 || buf.len() < token.len() {
         return;
     }
+    // Start at offset 1 to preserve a non-token prefix at the beginning.
     let mut i = 1usize;
     while i + token.len() <= buf.len() {
         buf[i..i + token.len()].copy_from_slice(token);
@@ -178,6 +208,10 @@ fn inject_token(buf: &mut [u8], token: &[u8], stride: usize) {
     }
 }
 
+/// Encode ASCII bytes as UTF-16 code units (zero-extended).
+///
+/// This is sufficient for the ASCII tokens used in benchmarks and avoids
+/// full Unicode encoding overhead.
 fn encode_utf16_bytes(input: &[u8], be: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len() * 2);
     for &b in input {
@@ -192,6 +226,9 @@ fn encode_utf16_bytes(input: &[u8], be: bool) -> Vec<u8> {
     out
 }
 
+/// Generate a UTF-16 text buffer filled with lowercase ASCII letters.
+///
+/// The buffer begins with a BOM when length permits.
 fn make_utf16_text(len: usize, seed: u64, be: bool) -> Vec<u8> {
     let mut out = vec![0u8; len];
     let mut rng = XorShift64::new(seed);
@@ -222,6 +259,7 @@ fn make_utf16_text(len: usize, seed: u64, be: bool) -> Vec<u8> {
     out
 }
 
+/// Inject a UTF-16 encoded token every `stride_bytes` in the buffer.
 fn inject_token_utf16(buf: &mut [u8], token: &[u8], stride_bytes: usize, be: bool) {
     let stride_units = (stride_bytes / 2).max(1);
     let encoded = encode_utf16_bytes(token, be);
@@ -241,11 +279,17 @@ fn inject_token_utf16(buf: &mut [u8], token: &[u8], stride_bytes: usize, be: boo
     }
 }
 
+/// Named engine variant under test.
 struct EngineVariant {
     name: &'static str,
     engine: Engine,
 }
 
+/// Aggregated results for a single benchmark case.
+///
+/// Times are recorded in milliseconds; percentiles are computed with linear
+/// interpolation in the sorted sample. Hardware counters are a point-in-time
+/// snapshot taken from a single measured scan.
 struct BenchmarkResult {
     test_name: String,
     dataset_name: String,
@@ -309,6 +353,9 @@ impl BenchmarkResult {
     }
 }
 
+/// Basic statistical helpers for timing samples.
+///
+/// Note: timings are expected to be finite. If NaNs appear, sorting will panic.
 struct StatisticalAnalysis;
 
 impl StatisticalAnalysis {
@@ -332,6 +379,7 @@ impl StatisticalAnalysis {
         variance.sqrt()
     }
 
+    /// Median with linear interpolation for even-length samples.
     fn median(values: &[f64]) -> f64 {
         if values.is_empty() {
             return 0.0;
@@ -346,6 +394,7 @@ impl StatisticalAnalysis {
         }
     }
 
+    /// Percentile in [0.0, 1.0], using linear interpolation between samples.
     fn percentile(values: &[f64], p: f64) -> f64 {
         if values.is_empty() {
             return 0.0;
@@ -407,8 +456,10 @@ struct HardwareCounters {
 
 #[cfg(target_os = "linux")]
 impl HardwareCounters {
-    /// Opens available hardware counters. Returns disabled instance if `enable` is false
-    /// or no counters can be opened (permission denied, unsupported CPU).
+    /// Opens available hardware counters.
+    ///
+    /// Returns a disabled instance if `enable` is false or no counters can be
+    /// opened (permission denied, unsupported CPU).
     fn new(enable: bool) -> Self {
         if !enable {
             return Self::disabled();
@@ -760,6 +811,7 @@ const PERF_EVENT_IOC_RESET: libc::c_ulong = io(b'$' as u64, 3) as libc::c_ulong;
 /// Opens a perf event counter. Returns fd on success, -1 on failure.
 #[cfg(target_os = "linux")]
 fn perf_event_open(attr: &PerfEventAttr) -> RawFd {
+    // Safety: syscall reads the pointed-to perf_event_attr; it is valid for the call.
     let ret = unsafe {
         libc::syscall(
             libc::SYS_perf_event_open,
@@ -780,6 +832,7 @@ fn perf_event_open(attr: &PerfEventAttr) -> RawFd {
 #[cfg(target_os = "linux")]
 fn close_fd(fd: &mut RawFd) {
     if *fd >= 0 {
+        // Safety: closing an owned file descriptor is safe; errors are ignored.
         unsafe {
             libc::close(*fd);
         }
@@ -790,6 +843,7 @@ fn close_fd(fd: &mut RawFd) {
 #[cfg(target_os = "linux")]
 fn reset_and_enable_fd(fd: RawFd) {
     if fd >= 0 {
+        // Safety: ioctl on a valid perf_event fd is safe; errors are ignored.
         unsafe {
             libc::ioctl(fd, PERF_EVENT_IOC_RESET, 0);
             libc::ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
@@ -800,6 +854,7 @@ fn reset_and_enable_fd(fd: RawFd) {
 #[cfg(target_os = "linux")]
 fn disable_fd(fd: RawFd) {
     if fd >= 0 {
+        // Safety: ioctl on a valid perf_event fd is safe; errors are ignored.
         unsafe {
             libc::ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
         }
@@ -825,6 +880,7 @@ fn read_scaled_counter(fd: RawFd) -> u64 {
         time_enabled: 0,
         time_running: 0,
     };
+    // Safety: read writes into a properly sized stack buffer.
     let bytes = unsafe {
         libc::read(
             fd,
@@ -977,6 +1033,7 @@ fn open_pmu_event_by_name_list(names: &[&str], base_attr: &PerfEventAttr) -> Raw
     -1
 }
 
+/// Executes a benchmark case and produces timing and counter metrics.
 struct BenchmarkRunner {
     enable_hardware_counters: bool,
 }
@@ -996,6 +1053,10 @@ impl BenchmarkRunner {
         };
     }
 
+    /// Run a benchmark with optional setup, warmups, and timed iterations.
+    ///
+    /// Hardware counters are sampled once around a single measured run to
+    /// avoid overhead in the timed loop.
     fn run_benchmark<S, B>(
         &self,
         test_name: &str,
@@ -1044,6 +1105,7 @@ impl BenchmarkRunner {
             0.0
         };
 
+        // Extra unmeasured passes to reduce post-counter perturbation.
         for _ in 0..2 {
             bench_fn();
         }
@@ -1067,6 +1129,7 @@ impl BenchmarkRunner {
     }
 }
 
+/// Orchestrates all benchmark cases and aggregates results.
 struct BenchmarkSuite {
     runner: BenchmarkRunner,
     results: Vec<BenchmarkResult>,
@@ -1116,6 +1179,7 @@ impl BenchmarkSuite {
         self.runner.set_enable_hardware_counters(effective);
     }
 
+    /// Filter by exact match or substring when `--filter` is provided.
     fn should_run_test(&self, test_name: &str) -> bool {
         if self.filter.is_empty() {
             return true;
@@ -1230,6 +1294,7 @@ impl BenchmarkSuite {
         }
     }
 
+    /// Run a scan benchmark against a dataset using the given engine variant.
     fn run_scan_benchmark(
         &self,
         test_name: &str,
@@ -1369,6 +1434,7 @@ impl BenchmarkSuite {
     }
 }
 
+/// Convert a Duration to milliseconds as f64.
 fn duration_to_ms(dur: Duration) -> f64 {
     dur.as_secs_f64() * 1000.0
 }
