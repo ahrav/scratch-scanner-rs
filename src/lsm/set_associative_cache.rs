@@ -1124,8 +1124,8 @@ where
 
         let filler = tag.wrapping_add(1);
         let mut tmp = [filler; 16];
-        for i in 0..N {
-            tmp[i] = *tags.add(i);
+        for (i, slot) in tmp.iter_mut().enumerate().take(N) {
+            *slot = *tags.add(i);
         }
         let vec = _mm_loadu_si128(tmp.as_ptr() as *const __m128i);
         let needle = _mm_set1_epi8(tag as i8);
@@ -1158,8 +1158,8 @@ where
 
         let filler = tag.wrapping_add(1);
         let mut tmp = [filler; 8];
-        for i in 0..N {
-            tmp[i] = *tags.add(i);
+        for (i, slot) in tmp.iter_mut().enumerate().take(N) {
+            *slot = *tags.add(i);
         }
         let vec = _mm_loadu_si128(tmp.as_ptr() as *const __m128i);
         let needle = _mm_set1_epi16(tag as i16);
@@ -1201,8 +1201,8 @@ where
 
         let filler = tag.wrapping_add(1);
         let mut tmp = [filler; 16];
-        for i in 0..N {
-            tmp[i] = *tags.add(i);
+        for (i, slot) in tmp.iter_mut().enumerate().take(N) {
+            *slot = *tags.add(i);
         }
         let vec = _mm_loadu_si128(tmp.as_ptr() as *const __m128i);
         let needle = _mm_set1_epi8(tag as i8);
@@ -1235,8 +1235,8 @@ where
 
         let filler = tag.wrapping_add(1);
         let mut tmp = [filler; 8];
-        for i in 0..N {
-            tmp[i] = *tags.add(i);
+        for (i, slot) in tmp.iter_mut().enumerate().take(N) {
+            *slot = *tags.add(i);
         }
         let vec = _mm_loadu_si128(tmp.as_ptr() as *const __m128i);
         let needle = _mm_set1_epi16(tag as i16);
