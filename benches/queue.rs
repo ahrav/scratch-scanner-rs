@@ -109,6 +109,7 @@ impl QueueNode<BenchTag> for LargeNode {
 /// Node with two queue links for multi-tag benchmarks.
 #[derive(Debug)]
 struct DualTagNode {
+    #[allow(dead_code)]
     value: u64,
     link1: QueueLink<Self, Tag1>,
     link2: QueueLink<Self, Tag2>,
@@ -152,7 +153,7 @@ fn bench_push(c: &mut Criterion) {
 
     // Small nodes
     group.bench_function("small_16B", |b| {
-        let mut nodes: Vec<SmallNode> = (0..OPS_PER_ITER).map(|i| SmallNode::new(i)).collect();
+        let mut nodes: Vec<SmallNode> = (0..OPS_PER_ITER).map(SmallNode::new).collect();
         b.iter(|| {
             let mut q: Queue<SmallNode, BenchTag> = Queue::init();
             for node in &mut nodes {
@@ -165,7 +166,7 @@ fn bench_push(c: &mut Criterion) {
 
     // Medium nodes
     group.bench_function("medium_64B", |b| {
-        let mut nodes: Vec<MediumNode> = (0..OPS_PER_ITER).map(|i| MediumNode::new(i)).collect();
+        let mut nodes: Vec<MediumNode> = (0..OPS_PER_ITER).map(MediumNode::new).collect();
         b.iter(|| {
             let mut q: Queue<MediumNode, BenchTag> = Queue::init();
             for node in &mut nodes {
@@ -177,7 +178,7 @@ fn bench_push(c: &mut Criterion) {
 
     // Large nodes
     group.bench_function("large_256B", |b| {
-        let mut nodes: Vec<LargeNode> = (0..OPS_PER_ITER).map(|i| LargeNode::new(i)).collect();
+        let mut nodes: Vec<LargeNode> = (0..OPS_PER_ITER).map(LargeNode::new).collect();
         b.iter(|| {
             let mut q: Queue<LargeNode, BenchTag> = Queue::init();
             for node in &mut nodes {
@@ -201,7 +202,7 @@ fn bench_pop(c: &mut Criterion) {
     // Small nodes - measure pop in isolation
     // Use same pattern as push: push all, then pop all in each iteration
     group.bench_function("small_16B", |b| {
-        let mut nodes: Vec<SmallNode> = (0..OPS_PER_ITER).map(|i| SmallNode::new(i)).collect();
+        let mut nodes: Vec<SmallNode> = (0..OPS_PER_ITER).map(SmallNode::new).collect();
         b.iter(|| {
             let mut q: Queue<SmallNode, BenchTag> = Queue::init();
             // Setup: push all nodes (not measured as primary)
@@ -217,7 +218,7 @@ fn bench_pop(c: &mut Criterion) {
 
     // Medium nodes
     group.bench_function("medium_64B", |b| {
-        let mut nodes: Vec<MediumNode> = (0..OPS_PER_ITER).map(|i| MediumNode::new(i)).collect();
+        let mut nodes: Vec<MediumNode> = (0..OPS_PER_ITER).map(MediumNode::new).collect();
         b.iter(|| {
             let mut q: Queue<MediumNode, BenchTag> = Queue::init();
             for node in &mut nodes {
@@ -231,7 +232,7 @@ fn bench_pop(c: &mut Criterion) {
 
     // Large nodes
     group.bench_function("large_256B", |b| {
-        let mut nodes: Vec<LargeNode> = (0..OPS_PER_ITER).map(|i| LargeNode::new(i)).collect();
+        let mut nodes: Vec<LargeNode> = (0..OPS_PER_ITER).map(LargeNode::new).collect();
         b.iter(|| {
             let mut q: Queue<LargeNode, BenchTag> = Queue::init();
             for node in &mut nodes {
@@ -278,7 +279,7 @@ fn bench_peek(c: &mut Criterion) {
 
     // Peek on large queue (10K elements)
     group.bench_function("large_10k", |b| {
-        let mut nodes: Vec<SmallNode> = (0..10_000).map(|i| SmallNode::new(i)).collect();
+        let mut nodes: Vec<SmallNode> = (0..10_000).map(SmallNode::new).collect();
         let mut q: Queue<SmallNode, BenchTag> = Queue::init();
         for node in &mut nodes {
             q.push(node);
@@ -335,7 +336,7 @@ fn bench_metadata(c: &mut Criterion) {
 
     // len on large queue
     group.bench_function("len/large_10k", |b| {
-        let mut nodes: Vec<SmallNode> = (0..10_000).map(|i| SmallNode::new(i)).collect();
+        let mut nodes: Vec<SmallNode> = (0..10_000).map(SmallNode::new).collect();
         let mut q: Queue<SmallNode, BenchTag> = Queue::init();
         for node in &mut nodes {
             q.push(node);
@@ -361,7 +362,7 @@ fn bench_fill_drain(c: &mut Criterion) {
         group.throughput(Throughput::Elements(count));
 
         group.bench_with_input(BenchmarkId::new("small", count), &count, |b, &count| {
-            let mut nodes: Vec<SmallNode> = (0..count).map(|i| SmallNode::new(i)).collect();
+            let mut nodes: Vec<SmallNode> = (0..count).map(SmallNode::new).collect();
             b.iter(|| {
                 let mut q: Queue<SmallNode, BenchTag> = Queue::init();
                 // Fill
@@ -374,7 +375,7 @@ fn bench_fill_drain(c: &mut Criterion) {
         });
 
         group.bench_with_input(BenchmarkId::new("medium", count), &count, |b, &count| {
-            let mut nodes: Vec<MediumNode> = (0..count).map(|i| MediumNode::new(i)).collect();
+            let mut nodes: Vec<MediumNode> = (0..count).map(MediumNode::new).collect();
             b.iter(|| {
                 let mut q: Queue<MediumNode, BenchTag> = Queue::init();
                 for node in &mut nodes {
@@ -385,7 +386,7 @@ fn bench_fill_drain(c: &mut Criterion) {
         });
 
         group.bench_with_input(BenchmarkId::new("large", count), &count, |b, &count| {
-            let mut nodes: Vec<LargeNode> = (0..count).map(|i| LargeNode::new(i)).collect();
+            let mut nodes: Vec<LargeNode> = (0..count).map(LargeNode::new).collect();
             b.iter(|| {
                 let mut q: Queue<LargeNode, BenchTag> = Queue::init();
                 for node in &mut nodes {
@@ -409,7 +410,7 @@ fn bench_alternating(c: &mut Criterion) {
 
     // 1:1 ratio - push then pop
     group.bench_function("ratio_1_1", |b| {
-        let mut nodes: Vec<SmallNode> = (0..OPS_PER_ITER).map(|i| SmallNode::new(i)).collect();
+        let mut nodes: Vec<SmallNode> = (0..OPS_PER_ITER).map(SmallNode::new).collect();
         b.iter(|| {
             let mut q: Queue<SmallNode, BenchTag> = Queue::init();
             for node in &mut nodes {
@@ -422,7 +423,7 @@ fn bench_alternating(c: &mut Criterion) {
     // 2:1 ratio - push push pop
     group.bench_function("ratio_2_1", |b| {
         let count = OPS_PER_ITER / 2;
-        let mut nodes: Vec<SmallNode> = (0..count * 2).map(|i| SmallNode::new(i)).collect();
+        let mut nodes: Vec<SmallNode> = (0..count * 2).map(SmallNode::new).collect();
         b.iter(|| {
             let mut q: Queue<SmallNode, BenchTag> = Queue::init();
             let mut idx = 0;
@@ -441,7 +442,7 @@ fn bench_alternating(c: &mut Criterion) {
     // 1:2 ratio - push pop pop (on pre-filled queue)
     group.bench_function("ratio_1_2", |b| {
         let count = OPS_PER_ITER / 3;
-        let mut nodes: Vec<SmallNode> = (0..count * 3).map(|i| SmallNode::new(i)).collect();
+        let mut nodes: Vec<SmallNode> = (0..count * 3).map(SmallNode::new).collect();
         b.iter(|| {
             let mut q: Queue<SmallNode, BenchTag> = Queue::init();
             // Pre-fill with 2*count nodes
