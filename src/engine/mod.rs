@@ -2883,6 +2883,12 @@ pub fn bench_find_spans_into(tc: &TransformConfig, buf: &[u8], out: &mut Vec<Ran
 pub use self::transform::{bench_stream_decode_base64, bench_stream_decode_url};
 
 #[cfg(feature = "bench")]
+pub use self::validator::{
+    bench_is_word_byte, bench_tail_matches_charset, bench_validate_aws_access_key,
+    bench_validate_prefix_bounded, bench_validate_prefix_fixed,
+};
+
+#[cfg(feature = "bench")]
 impl Engine {
     pub fn bench_ac_anchors(&self) -> &AhoCorasick {
         &self.anchors.raw.ac
