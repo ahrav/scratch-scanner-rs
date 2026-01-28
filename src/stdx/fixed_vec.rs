@@ -1,4 +1,14 @@
 //! Fixed-capacity, stack-allocated vector for small, bounded collections.
+//!
+//! # Invariants
+//! - `len <= N` at all times.
+//! - Elements in `0..len` are initialized and valid.
+//! - Elements in `len..N` are uninitialized and must never be read or dropped.
+//!
+//! # Design Notes
+//! - Uses `MaybeUninit` to avoid `T: Default` and to skip zeroing.
+//! - Overflow panics instead of allocating, keeping hot paths allocation-free.
+//! - All internal `unsafe` blocks rely on the invariants above.
 
 use std::fmt;
 use std::mem::MaybeUninit;
@@ -6,9 +16,30 @@ use std::ops::{Deref, DerefMut, Index};
 
 /// Fixed-capacity vector backed by an inline array.
 ///
-/// Invariant: elements in `0..len` are initialized and valid; `len <= N`.
-/// The remaining slots are uninitialized and must never be read or dropped.
-/// Pushing past capacity panics to keep the container allocation-free.
+/// # Guarantees
+/// - Capacity is always `N`; this type never reallocates.
+/// - Elements are stored contiguously and in insertion order.
+///
+/// # Invariants
+/// - `len` tracks the initialized prefix; `len <= N`.
+/// - Only `0..len` is initialized; `len..N` is uninitialized storage.
+///
+/// # Panics
+/// - `push` and `extend_from_slice` panic if they would exceed capacity.
+///
+/// # Performance
+/// - `push` is O(1); `extend_from_slice` is O(m) for `m` appended elements.
+/// - `clear` is O(len) if `T: Drop`, otherwise O(1).
+///
+/// # Examples
+/// ```
+/// use scanner_rs::stdx::FixedVec;
+///
+/// let mut v: FixedVec<u8, 4> = FixedVec::new();
+/// v.push(1);
+/// v.extend_from_slice(&[2, 3]);
+/// assert_eq!(v.as_slice(), &[1, 2, 3]);
+/// ```
 pub struct FixedVec<T, const N: usize> {
     // Number of initialized elements in `buf`.
     len: usize,
@@ -17,7 +48,8 @@ pub struct FixedVec<T, const N: usize> {
 }
 
 fn uninit_array<T, const N: usize>() -> [MaybeUninit<T>; N] {
-    // SAFETY: An uninitialized MaybeUninit<T> is valid.
+    // SAFETY: An uninitialized `MaybeUninit<T>` is always valid, and the array
+    // only contains `MaybeUninit` values.
     unsafe { MaybeUninit::<[MaybeUninit<T>; N]>::uninit().assume_init() }
 }
 
@@ -28,6 +60,9 @@ impl<T, const N: usize> FixedVec<T, N> {
     }
 
     /// Creates an empty `FixedVec` with all slots uninitialized.
+    ///
+    /// # Performance
+    /// - O(1), no allocation and no element initialization.
     pub fn new() -> Self {
         Self {
             len: 0,
@@ -46,42 +81,71 @@ impl<T, const N: usize> FixedVec<T, N> {
     }
 
     /// Drops all initialized elements, leaving capacity unchanged.
+    ///
+    /// # Effects
+    /// - `len` becomes 0.
+    /// - The old elements are dropped if `T: Drop`.
+    ///
+    /// # Performance
+    /// - O(len) when `T: Drop`, otherwise O(1).
     pub fn clear(&mut self) {
-        // SAFETY: only the first `len` elements are initialized.
-        unsafe {
-            for i in 0..self.len {
-                std::ptr::drop_in_place(self.buf[i].as_mut_ptr());
+        // Skip drop loop for types that don't need it (e.g., DecodeStep).
+        // needs_drop is a const fn, so this branch is eliminated at compile time.
+        if std::mem::needs_drop::<T>() {
+            // SAFETY: only the first `len` elements are initialized.
+            unsafe {
+                for i in 0..self.len {
+                    std::ptr::drop_in_place(self.buf[i].as_mut_ptr());
+                }
             }
         }
         self.len = 0;
     }
 
-    /// Appends a new value, panicking if the capacity is exceeded.
+    /// Appends a new value to the end of the vector.
+    ///
+    /// # Panics
+    /// - Panics if the vector is already at capacity.
     pub fn push(&mut self, value: T) {
-        assert!(self.len < N, "FixedVec capacity exceeded");
+        debug_assert!(self.len < N, "FixedVec capacity exceeded");
         self.buf[self.len].write(value);
         self.len += 1;
     }
 
-    /// Appends cloned elements from `slice`, panicking if capacity is exceeded.
+    /// Appends cloned elements from `slice`.
+    ///
+    /// # Panics
+    /// - Panics if `self.len() + slice.len() > N`. No elements are written
+    ///   in that case.
+    ///
+    /// # Complexity
+    /// - O(m) for `m = slice.len()`.
     pub fn extend_from_slice(&mut self, slice: &[T])
     where
         T: Clone,
     {
         let new_len = self.len + slice.len();
         assert!(new_len <= N, "FixedVec capacity exceeded");
-        for item in slice {
-            self.push(item.clone());
+        // Write directly to buffer, avoiding redundant capacity checks in push().
+        for (i, item) in slice.iter().enumerate() {
+            self.buf[self.len + i].write(item.clone());
         }
+        self.len = new_len;
     }
 
     /// Returns a shared slice of the initialized prefix.
+    ///
+    /// # Complexity
+    /// - O(1).
     pub fn as_slice(&self) -> &[T] {
         // SAFETY: `0..len` is initialized and contiguous.
         unsafe { std::slice::from_raw_parts(self.buf.as_ptr().cast::<T>(), self.len) }
     }
 
     /// Returns a mutable slice of the initialized prefix.
+    ///
+    /// # Complexity
+    /// - O(1).
     pub fn as_mut_slice(&mut self) -> &mut [T] {
         // SAFETY: `0..len` is initialized and contiguous.
         unsafe { std::slice::from_raw_parts_mut(self.buf.as_mut_ptr().cast::<T>(), self.len) }
