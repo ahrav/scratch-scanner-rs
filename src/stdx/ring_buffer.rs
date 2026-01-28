@@ -158,8 +158,8 @@ impl<T, const N: usize> RingBuffer<T, N> {
             return None;
         }
 
-        assert!(self.len > 0);
-        assert!(self.head <= Self::CAPACITY);
+        debug_assert!(self.len > 0);
+        debug_assert!(self.head < Self::CAPACITY, "head out of bounds");
 
         let idx = self.head;
 
@@ -200,8 +200,8 @@ impl<T, const N: usize> RingBuffer<T, N> {
             return None;
         }
 
-        assert!(self.len > 0);
-        assert!(self.head <= Self::CAPACITY);
+        debug_assert!(self.len > 0);
+        debug_assert!(self.head < Self::CAPACITY, "head out of bounds");
 
         let idx = self.head;
 
