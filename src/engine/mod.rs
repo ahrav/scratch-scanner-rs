@@ -37,9 +37,9 @@ use ahash::AHashMap;
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, AhoCorasickKind};
 use memchr::{memchr, memmem};
 use regex::bytes::Regex;
+use std::ops::{ControlFlow, Range};
 #[cfg(feature = "stats")]
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::ops::{ControlFlow, Range};
 
 mod helpers;
 mod prefilter;
@@ -50,7 +50,7 @@ mod vectorscan_prefilter;
 use self::helpers::*;
 use self::prefilter::*;
 use self::transform::*;
-use self::vectorscan_prefilter::{VsAnchorDb, VsPrefilterDb, VsScratch};
+use self::vectorscan_prefilter::{VsAnchorDb, VsGateDb, VsPrefilterDb, VsScratch};
 
 #[cfg(test)]
 use crate::demo::*;
@@ -735,14 +735,14 @@ impl ScanScratch {
                 engine.tuning.max_transform_depth.saturating_add(1),
             )
             .expect("scratch steps_buf allocation failed"),
-            vs_scratch: engine
-                .vs
-                .as_ref()
-                .map(|db| db.alloc_scratch().expect("vectorscan scratch allocation failed")),
-            vs_utf16_scratch: engine
-                .vs_utf16
-                .as_ref()
-                .map(|db| db.alloc_scratch().expect("vectorscan utf16 scratch allocation failed")),
+            vs_scratch: engine.vs.as_ref().map(|db| {
+                db.alloc_scratch()
+                    .expect("vectorscan scratch allocation failed")
+            }),
+            vs_utf16_scratch: engine.vs_utf16.as_ref().map(|db| {
+                db.alloc_scratch()
+                    .expect("vectorscan utf16 scratch allocation failed")
+            }),
             #[cfg(feature = "b64-stats")]
             base64_stats: Base64DecodeStats::default(),
         }
@@ -1035,6 +1035,10 @@ pub struct Engine {
     //
     // When present, this prefilters UTF-16 variants using literal anchors.
     vs_utf16: Option<VsAnchorDb>,
+    // Optional Vectorscan DB for decoded-stream gating (presence of any anchor).
+    //
+    // When present, this is used in the decode gate instead of Aho-Corasick.
+    vs_gate: Option<VsGateDb>,
     // Base64 pre-decode gate built from anchor patterns.
     //
     // This runs in *encoded space* and is deliberately conservative:
@@ -2124,9 +2128,7 @@ impl Engine {
                         Ok(()) => {
                             vs_utf16_ok = true;
                             #[cfg(feature = "stats")]
-                            self.vs_stats
-                                .utf16_scans_ok
-                                .fetch_add(1, Ordering::Relaxed);
+                            self.vs_stats.utf16_scans_ok.fetch_add(1, Ordering::Relaxed);
                         }
                         Err(_err) => {
                             #[cfg(feature = "stats")]
@@ -2155,14 +2157,10 @@ impl Engine {
                         .anchor_after_vs
                         .fetch_add(1, Ordering::Relaxed);
                 } else {
-                    self.vs_stats
-                        .anchor_skipped
-                        .fetch_add(1, Ordering::Relaxed);
+                    self.vs_stats.anchor_skipped.fetch_add(1, Ordering::Relaxed);
                 }
             } else {
-                self.vs_stats
-                    .anchor_only
-                    .fetch_add(1, Ordering::Relaxed);
+                self.vs_stats.anchor_only.fetch_add(1, Ordering::Relaxed);
             }
         }
 

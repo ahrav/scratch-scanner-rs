@@ -17,9 +17,9 @@ use std::env;
 use std::fs::File;
 use std::hint::black_box;
 use std::io::{self, Write};
-use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
 use std::os::unix::io::RawFd;
+use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
 use std::{fs, path::Path};
 
@@ -140,7 +140,15 @@ fn make_ascii_hits(len: usize) -> Vec<u8> {
 }
 
 fn make_utf16_hits(len: usize, be: bool) -> Vec<u8> {
-    let mut buf = make_utf16_text(len, if be { 0x5555_6666_7777_8888 } else { 0x9999_aaaa_bbbb_cccc }, be);
+    let mut buf = make_utf16_text(
+        len,
+        if be {
+            0x5555_6666_7777_8888
+        } else {
+            0x9999_aaaa_bbbb_cccc
+        },
+        be,
+    );
     inject_token_utf16(&mut buf, AWS_TOKEN, 4 * 1024, be);
     inject_token_utf16(&mut buf, GHP_TOKEN, 16 * 1024, be);
     buf
@@ -762,7 +770,11 @@ fn perf_event_open(attr: &PerfEventAttr) -> RawFd {
             0 as libc::c_ulong,
         )
     };
-    if ret < 0 { -1 } else { ret as RawFd }
+    if ret < 0 {
+        -1
+    } else {
+        ret as RawFd
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1229,18 +1241,16 @@ impl BenchmarkSuite {
 
         let setup = || {};
         let bench = || {
-            let hits = variant.engine.scan_chunk(black_box(&dataset.buf), &mut scratch);
+            let hits = variant
+                .engine
+                .scan_chunk(black_box(&dataset.buf), &mut scratch);
             last_hits = hits.len();
             black_box(last_hits);
         };
 
-        let mut result = self.runner.run_benchmark(
-            test_name,
-            setup,
-            bench,
-            self.iterations,
-            self.warmups,
-        );
+        let mut result =
+            self.runner
+                .run_benchmark(test_name, setup, bench, self.iterations, self.warmups);
 
         result.dataset_name = dataset.name.to_string();
         result.engine_name = variant.name.to_string();
@@ -1321,15 +1331,9 @@ impl BenchmarkSuite {
                 r.l3_cache_misses
             ));
             out.push_str(&format!("      \"tlbMisses\": {},\n", r.tlb_misses));
-            out.push_str(&format!(
-                "      \"branchMisses\": {},\n",
-                r.branch_misses
-            ));
+            out.push_str(&format!("      \"branchMisses\": {},\n", r.branch_misses));
             out.push_str(&format!("      \"cpuCycles\": {},\n", r.cpu_cycles));
-            out.push_str(&format!(
-                "      \"instructions\": {},\n",
-                r.instructions
-            ));
+            out.push_str(&format!("      \"instructions\": {},\n", r.instructions));
             out.push_str(&format!(
                 "      \"stalledCyclesFrontend\": {},\n",
                 r.stalled_cycles_frontend
@@ -1398,7 +1402,9 @@ fn print_usage(program: &str) {
     eprintln!("  --list-tests           List all available tests");
     eprintln!("  --iterations <count>   Timed iterations per test (default: {DEFAULT_ITERATIONS})");
     eprintln!("  --warmups <count>      Warmup iterations per test (default: {DEFAULT_WARMUPS})");
-    eprintln!("  --buf-mib <mib>         Buffer size for dataset mix (default: {DEFAULT_BUF_MIB} MiB)");
+    eprintln!(
+        "  --buf-mib <mib>         Buffer size for dataset mix (default: {DEFAULT_BUF_MIB} MiB)"
+    );
     eprintln!("  --disable-hw-counters  Disable hardware counters (Linux only)");
     eprintln!("  --help, -h             Show this help");
 }
