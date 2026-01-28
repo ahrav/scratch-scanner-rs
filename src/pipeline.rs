@@ -91,6 +91,9 @@ impl Default for PipelineConfig {
 }
 
 /// Summary counters for a pipeline run.
+///
+/// These counters are always compiled in for lightweight performance and health
+/// reporting (throughput, error rates) and are monotonic within a run.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PipelineStats {
     /// Number of files enqueued.
@@ -107,7 +110,7 @@ pub struct PipelineStats {
     pub open_errors: u64,
     /// Errors encountered while reading files.
     pub errors: u64,
-    /// Base64 decode/gate instrumentation.
+    /// Optional Base64 decode/gate instrumentation (feature: `b64-stats`).
     #[cfg(feature = "b64-stats")]
     pub base64: crate::Base64DecodeStats,
 }
