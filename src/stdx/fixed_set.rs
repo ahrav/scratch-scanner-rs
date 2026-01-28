@@ -27,21 +27,11 @@
 /// - Keeping the fields adjacent favors single-line fetches in practice.
 /// - Explicit padding fixes the layout to a 24-byte slot.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct Slot128 {
     key: u128, // 16 bytes
     gen: u32,  // 4 bytes
     _pad: u32, // 4 bytes - align to 24 bytes total
-}
-
-impl Default for Slot128 {
-    fn default() -> Self {
-        Self {
-            key: 0,
-            gen: 0,
-            _pad: 0,
-        }
-    }
 }
 
 /// Fixed-capacity hash set for deduplication (128-bit keys).

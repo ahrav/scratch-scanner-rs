@@ -57,8 +57,17 @@ harness = false
 name = "fixed_set"
 harness = false
 
+[[bench]]
+name = "fixed_vec"
+harness = false
+
 [profile.dev]
 opt-level = 1
 
 [profile.release]
 opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+inherits = "release"
