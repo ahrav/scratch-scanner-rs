@@ -330,9 +330,10 @@ fn bench_vs_hashset(c: &mut Criterion) {
             for _ in 0..iterations {
                 set.clear_retaining_capacity();
                 for &key in &keys {
-                    black_box(set.insert(black_box(key)));
+                    set.insert(black_box(key));
                 }
             }
+            black_box(());
         })
     });
 
@@ -343,9 +344,10 @@ fn bench_vs_hashset(c: &mut Criterion) {
             for _ in 0..iterations {
                 set.clear();
                 for &key in &keys {
-                    black_box(set.insert(black_box(key)));
+                    set.insert(black_box(key));
                 }
             }
+            black_box(());
         })
     });
 
@@ -409,8 +411,9 @@ fn bench_scaling(c: &mut Criterion) {
                 b.iter(|| {
                     set.clear_retaining_capacity();
                     for &key in *keys {
-                        black_box(set.insert(black_box(key)));
+                        set.insert(black_box(key));
                     }
+                    black_box(());
                 })
             },
         );
@@ -436,8 +439,9 @@ fn bench_hash_quality(c: &mut Criterion) {
         b.iter(|| {
             set.clear_retaining_capacity();
             for &key in &sequential_keys {
-                black_box(set.insert(black_box(key)));
+                set.insert(black_box(key));
             }
+            black_box(());
         })
     });
 
@@ -448,8 +452,9 @@ fn bench_hash_quality(c: &mut Criterion) {
         b.iter(|| {
             set.clear_retaining_capacity();
             for &key in &strided_keys {
-                black_box(set.insert(black_box(key)));
+                set.insert(black_box(key));
             }
+            black_box(());
         })
     });
 
@@ -460,8 +465,9 @@ fn bench_hash_quality(c: &mut Criterion) {
         b.iter(|| {
             set.clear_retaining_capacity();
             for &key in &pot_keys {
-                black_box(set.insert(black_box(key)));
+                set.insert(black_box(key));
             }
+            black_box(());
         })
     });
 
@@ -472,8 +478,9 @@ fn bench_hash_quality(c: &mut Criterion) {
         b.iter(|| {
             set.clear_retaining_capacity();
             for &key in &random_keys {
-                black_box(set.insert(black_box(key)));
+                set.insert(black_box(key));
             }
+            black_box(());
         })
     });
 
@@ -524,8 +531,9 @@ fn bench_mixed_workload(c: &mut Criterion) {
                 set.insert(key);
             }
             for &key in &duplicate_keys {
-                black_box(set.insert(black_box(key)));
+                set.insert(black_box(key));
             }
+            black_box(());
         })
     });
 
@@ -600,8 +608,9 @@ fn bench_worst_case(c: &mut Criterion) {
         b.iter(|| {
             set.clear_retaining_capacity();
             for &key in &keys {
-                black_box(set.insert(black_box(key)));
+                set.insert(black_box(key));
             }
+            black_box(());
         })
     });
 
