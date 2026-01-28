@@ -360,10 +360,7 @@ impl Walker {
                 return Ok(());
             }
             let id = files.push_span(root_span, st.st_size as u64, dev_inode_from_stat(&st), 0);
-            #[cfg(feature = "stats")]
-            {
-                stats.files += 1;
-            }
+            stats.files += 1;
             self.pending = Some(id);
             return Ok(());
         }
@@ -410,11 +407,8 @@ impl Walker {
                 if ent.is_null() {
                     let err = io::Error::last_os_error();
                     if err.raw_os_error().unwrap_or(0) != 0 {
-                        #[cfg(feature = "stats")]
-                        {
-                            stats.walk_errors += 1;
-                            stats.errors += 1;
-                        }
+                        stats.walk_errors += 1;
+                        stats.errors += 1;
                     }
                     self.stack.pop();
                     continue;
@@ -434,11 +428,8 @@ impl Walker {
                     libc::AT_SYMLINK_NOFOLLOW,
                 ) != 0
                 {
-                    #[cfg(feature = "stats")]
-                    {
-                        stats.walk_errors += 1;
-                        stats.errors += 1;
-                    }
+                    stats.walk_errors += 1;
+                    stats.errors += 1;
                     continue;
                 }
                 let st = st.assume_init();
@@ -453,11 +444,8 @@ impl Walker {
                     if let Ok(child) = child {
                         self.stack.push(child);
                     } else {
-                        #[cfg(feature = "stats")]
-                        {
-                            stats.walk_errors += 1;
-                            stats.errors += 1;
-                        }
+                        stats.walk_errors += 1;
+                        stats.errors += 1;
                     }
                     continue;
                 }
@@ -474,10 +462,7 @@ impl Walker {
                 let file_span = files.join_path_span(dir_path, name_bytes);
                 let id = files.push_span(file_span, st.st_size as u64, dev_inode_from_stat(&st), 0);
                 file_ring.push_assume_capacity(id);
-                #[cfg(feature = "stats")]
-                {
-                    stats.files += 1;
-                }
+                stats.files += 1;
                 progressed = true;
             }
         }
@@ -614,11 +599,8 @@ impl ReaderStage {
                 let file = match File::open(path) {
                     Ok(file) => file,
                     Err(_) => {
-                        #[cfg(feature = "stats")]
-                        {
-                            stats.open_errors += 1;
-                            stats.errors += 1;
-                        }
+                        stats.open_errors += 1;
+                        stats.errors += 1;
                         continue;
                     }
                 };
@@ -637,15 +619,9 @@ impl ReaderStage {
             )? {
                 Some(chunk) => {
                     let new_bytes = u64::from(chunk.len.saturating_sub(chunk.prefix_len));
-                    #[cfg(feature = "stats")]
-                    {
-                        stats.bytes_scanned = stats.bytes_scanned.saturating_add(new_bytes);
-                    }
+                    stats.bytes_scanned = stats.bytes_scanned.saturating_add(new_bytes);
                     chunk_ring.push_assume_capacity(chunk);
-                    #[cfg(feature = "stats")]
-                    {
-                        stats.chunks += 1;
-                    }
+                    stats.chunks += 1;
                     progressed = true;
                 }
                 None => {
@@ -793,10 +769,7 @@ impl OutputStage {
                 rec.root_hint_start, rec.root_hint_end, rule
             )?;
             self.out.write_all(b"\n")?;
-            #[cfg(feature = "stats")]
-            {
-                stats.findings += 1;
-            }
+            stats.findings += 1;
             progressed = true;
         }
 
@@ -936,17 +909,9 @@ impl<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize>
     /// Capacity limits are hard bounds; the Unix path arena will panic if
     /// exhausted rather than allocating.
     pub fn scan_path(&mut self, path: &Path) -> io::Result<PipelineStats> {
-        #[cfg(feature = "stats")]
-        {
-            let mut stats = PipelineStats::default();
-            self.scan_path_inner(path, &mut stats)?;
-            Ok(stats)
-        }
-        #[cfg(not(feature = "stats"))]
-        {
-            self.scan_path_inner(path, &mut ())?;
-            Ok(())
-        }
+        let mut stats = PipelineStats::default();
+        self.scan_path_inner(path, &mut stats)?;
+        Ok(stats)
     }
 }
 

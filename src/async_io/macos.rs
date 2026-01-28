@@ -1,5 +1,3 @@
-#![cfg_attr(not(feature = "stats"), allow(unused_variables))]
-
 use super::*;
 use crate::{BufferPool, Chunk, Engine, FindingRec, ScanScratch};
 use std::fs::File;
@@ -248,11 +246,8 @@ impl MacosAioScanner {
                 Ok(()) => {}
                 Err(err) => {
                     if err.kind() == io::ErrorKind::NotFound {
-                        #[cfg(feature = "stats")]
-                        {
-                            stats.open_errors += 1;
-                            stats.errors += 1;
-                        }
+                        stats.open_errors += 1;
+                        stats.errors += 1;
                         continue;
                     }
                     return Err(err);
@@ -265,17 +260,9 @@ impl MacosAioScanner {
     }
 
     pub fn scan_path(&mut self, path: &Path) -> io::Result<PipelineStats> {
-        #[cfg(feature = "stats")]
-        {
-            let mut stats = PipelineStats::default();
-            self.scan_path_inner(path, &mut stats)?;
-            Ok(stats)
-        }
-        #[cfg(not(feature = "stats"))]
-        {
-            self.scan_path_inner(path, &mut ())?;
-            Ok(())
-        }
+        let mut stats = PipelineStats::default();
+        self.scan_path_inner(path, &mut stats)?;
+        Ok(stats)
     }
 }
 
@@ -298,11 +285,8 @@ fn scan_file(
 
     while let Some(chunk) = reader.next_chunk(pool)? {
         let payload_len = chunk.len.saturating_sub(chunk.prefix_len) as u64;
-        #[cfg(feature = "stats")]
-        {
-            stats.bytes_scanned = stats.bytes_scanned.saturating_add(payload_len);
-            stats.chunks += 1;
-        }
+        stats.bytes_scanned = stats.bytes_scanned.saturating_add(payload_len);
+        stats.chunks += 1;
 
         engine.scan_chunk_into(chunk.data(), chunk.file_id, chunk.base_offset, scratch);
         let new_bytes_start = chunk.base_offset + chunk.prefix_len as u64;
@@ -318,10 +302,7 @@ fn scan_file(
                 rec.root_hint_start, rec.root_hint_end, rule
             )?;
             out.write_all(b"\n")?;
-            #[cfg(feature = "stats")]
-            {
-                stats.findings += 1;
-            }
+            stats.findings += 1;
         }
     }
 

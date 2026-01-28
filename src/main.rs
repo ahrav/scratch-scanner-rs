@@ -182,39 +182,27 @@ fn main() -> io::Result<()> {
         }
     };
 
-    #[cfg(feature = "stats")]
     let stats = run_scan()?;
-    #[cfg(not(feature = "stats"))]
-    run_scan()?;
     let elapsed = start.elapsed();
+    let elapsed_secs = elapsed.as_secs_f64();
+    let throughput_mib = if elapsed_secs > 0.0 {
+        (stats.bytes_scanned as f64 / (1024.0 * 1024.0)) / elapsed_secs
+    } else {
+        0.0
+    };
 
-    #[cfg(feature = "stats")]
-    {
-        let elapsed_secs = elapsed.as_secs_f64();
-        let throughput_mib = if elapsed_secs > 0.0 {
-            (stats.bytes_scanned as f64 / (1024.0 * 1024.0)) / elapsed_secs
-        } else {
-            0.0
-        };
+    eprintln!(
+        "files={} chunks={} bytes={} findings={} errors={} elapsed_ms={} throughput_mib_s={:.2}",
+        stats.files,
+        stats.chunks,
+        stats.bytes_scanned,
+        stats.findings,
+        stats.errors,
+        elapsed.as_millis(),
+        throughput_mib
+    );
 
-        eprintln!(
-            "files={} chunks={} bytes={} findings={} errors={} elapsed_ms={} throughput_mib_s={:.2}",
-            stats.files,
-            stats.chunks,
-            stats.bytes_scanned,
-            stats.findings,
-            stats.errors,
-            elapsed.as_millis(),
-            throughput_mib
-        );
-    }
-
-    #[cfg(not(feature = "stats"))]
-    {
-        eprintln!("elapsed_ms={}", elapsed.as_millis());
-    }
-
-    #[cfg(all(feature = "stats", feature = "b64-stats"))]
+    #[cfg(feature = "b64-stats")]
     {
         let b64 = stats.base64;
         let decoded_wasted = b64

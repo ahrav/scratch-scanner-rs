@@ -1,5 +1,3 @@
-#![cfg_attr(not(feature = "stats"), allow(unused_variables))]
-
 use super::*;
 use crate::{BufferPool, Chunk, Engine, FindingRec, ScanScratch};
 use io_uring::{opcode, types, IoUring};
@@ -124,11 +122,8 @@ impl UringScanner {
                 Ok(()) => {}
                 Err(err) => {
                     if err.kind() == io::ErrorKind::NotFound {
-                        #[cfg(feature = "stats")]
-                        {
-                            stats.open_errors += 1;
-                            stats.errors += 1;
-                        }
+                        stats.open_errors += 1;
+                        stats.errors += 1;
                         continue;
                     }
                     return Err(err);
@@ -181,11 +176,8 @@ fn scan_file<W: Write>(
         let submitted = reader.submit_next_from_current(&current)?;
 
         let payload_len = current.len.saturating_sub(current.prefix_len) as u64;
-        #[cfg(feature = "stats")]
-        {
-            stats.bytes_scanned = stats.bytes_scanned.saturating_add(payload_len);
-            stats.chunks += 1;
-        }
+        stats.bytes_scanned = stats.bytes_scanned.saturating_add(payload_len);
+        stats.chunks += 1;
 
         engine.scan_chunk_into(
             current.data(),
@@ -210,10 +202,7 @@ fn scan_file<W: Write>(
                 rec.root_hint_start, rec.root_hint_end, rule
             )?;
             out.write_all(b"\n")?;
-            #[cfg(feature = "stats")]
-            {
-                stats.findings += 1;
-            }
+            stats.findings += 1;
         }
 
         match next {

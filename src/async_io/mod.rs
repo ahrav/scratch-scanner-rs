@@ -3,7 +3,6 @@
 //! This module provides:
 //! - Linux io_uring with aligned payload offsets (O_DIRECT-ready).
 //! - macOS POSIX AIO with read-ahead and overlap preservation.
-#![cfg_attr(not(feature = "stats"), allow(unused_variables))]
 //!
 //! Both backends keep the scan loop single-threaded while overlapping IO.
 
@@ -286,11 +285,8 @@ impl Walker {
                     let meta = match fs::symlink_metadata(&path) {
                         Ok(meta) => meta,
                         Err(_) => {
-                            #[cfg(feature = "stats")]
-                            {
-                                stats.walk_errors += 1;
-                                stats.errors += 1;
-                            }
+                            stats.walk_errors += 1;
+                            stats.errors += 1;
                             continue;
                         }
                     };
@@ -304,11 +300,8 @@ impl Walker {
                         match fs::read_dir(&path) {
                             Ok(rd) => self.push_entry(WalkEntry::Dir(rd))?,
                             Err(_) => {
-                                #[cfg(feature = "stats")]
-                                {
-                                    stats.walk_errors += 1;
-                                    stats.errors += 1;
-                                }
+                                stats.walk_errors += 1;
+                                stats.errors += 1;
                             }
                         }
                         continue;
@@ -326,10 +319,7 @@ impl Walker {
                     let size = meta.len();
                     let dev_inode = dev_inode(&meta);
                     let id = files.push(path, size, dev_inode, 0);
-                    #[cfg(feature = "stats")]
-                    {
-                        stats.files += 1;
-                    }
+                    stats.files += 1;
                     return Ok(Some(id));
                 }
                 WalkEntry::Dir(mut rd) => match rd.next() {
@@ -338,11 +328,8 @@ impl Walker {
                         self.push_entry(WalkEntry::Path(entry.path()))?;
                     }
                     Some(Err(_)) => {
-                        #[cfg(feature = "stats")]
-                        {
-                            stats.walk_errors += 1;
-                            stats.errors += 1;
-                        }
+                        stats.walk_errors += 1;
+                        stats.errors += 1;
                         self.push_entry(WalkEntry::Dir(rd))?;
                     }
                     None => {}
@@ -451,10 +438,7 @@ impl Walker {
                 return Ok(());
             }
             let id = files.push_span(root_span, st.st_size as u64, dev_inode_from_stat(&st), 0);
-            #[cfg(feature = "stats")]
-            {
-                stats.files += 1;
-            }
+            stats.files += 1;
             self.pending = Some(id);
             return Ok(());
         }
@@ -489,11 +473,8 @@ impl Walker {
                 if ent.is_null() {
                     let err = io::Error::last_os_error();
                     if err.raw_os_error().unwrap_or(0) != 0 {
-                        #[cfg(feature = "stats")]
-                        {
-                            stats.walk_errors += 1;
-                            stats.errors += 1;
-                        }
+                        stats.walk_errors += 1;
+                        stats.errors += 1;
                     }
                     self.stack.pop();
                     continue;
@@ -513,11 +494,8 @@ impl Walker {
                     libc::AT_SYMLINK_NOFOLLOW,
                 ) != 0
                 {
-                    #[cfg(feature = "stats")]
-                    {
-                        stats.walk_errors += 1;
-                        stats.errors += 1;
-                    }
+                    stats.walk_errors += 1;
+                    stats.errors += 1;
                     continue;
                 }
                 let st = st.assume_init();
@@ -532,11 +510,8 @@ impl Walker {
                     if let Ok(child) = child {
                         self.stack.push(child);
                     } else {
-                        #[cfg(feature = "stats")]
-                        {
-                            stats.walk_errors += 1;
-                            stats.errors += 1;
-                        }
+                        stats.walk_errors += 1;
+                        stats.errors += 1;
                     }
                     continue;
                 }
@@ -552,10 +527,7 @@ impl Walker {
 
                 let file_span = files.join_path_span(dir_path, name_bytes);
                 let id = files.push_span(file_span, st.st_size as u64, dev_inode_from_stat(&st), 0);
-                #[cfg(feature = "stats")]
-                {
-                    stats.files += 1;
-                }
+                stats.files += 1;
                 return Ok(Some(id));
             }
         }
