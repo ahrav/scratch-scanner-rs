@@ -10,12 +10,15 @@
 //!   `anchor_start <= anchor_end <= buf.len()`.
 //! - The anchor hit is match-start aligned in the raw representation (the
 //!   regex match starts at `anchor_start`).
+//! - Prefix bytes are already validated by the anchor automaton; these
+//!   validators only check tail bytes and delimiter semantics.
 //! - Validation never reads outside `buf`; any out-of-bounds access yields
 //!   `None`.
 //!
 //! # Semantics
 //! - Word boundaries and character classes mirror `regex::bytes`: ASCII-only
 //!   word bytes and ASCII classes, with non-ASCII treated as non-word.
+//! - Tail charset checks are ASCII-only; non-ASCII bytes never match.
 //! - Tail bytes are constrained by `TailCharset`.
 //! - `DelimAfter::GitleaksTokenTerminator` requires a terminator byte (or
 //!   end-of-input). When present, the returned span includes the terminator.
@@ -33,6 +36,12 @@
 //! - Character classification uses a 256-byte LUT for O(1) lookup.
 //! - Work is linear in the scanned tail length; bounded validation can add a
 //!   second linear backtrack when a delimiter is required.
+//!
+//! # Failure modes
+//! - Returns `None` when anchor indices are invalid or out of bounds.
+//! - Returns `None` when the tail violates charset or length constraints.
+//! - Bounded validation returns `None` when `anchor_end == buf.len()` (no tail).
+//! - Missing required delimiters cause validation to fail.
 
 use crate::api::{DelimAfter, TailCharset, ValidatorKind};
 use std::ops::Range;
@@ -223,6 +232,10 @@ fn is_gitleaks_token_terminator(b: u8) -> bool {
 
 /// Apply delimiter rules and return the match end.
 ///
+/// `tail_end` is the end of the validated tail (not including any delimiter).
+/// For delimiter checks that read `buf`, out-of-range indices yield `None`.
+/// When `delim` is `None`, the caller is responsible for `tail_end <= buf.len()`.
+///
 /// When a gitleaks terminator is required and present, the returned end
 /// includes the terminator byte (`tail_end + 1`).
 #[inline]
@@ -241,6 +254,9 @@ fn match_end_with_delim(buf: &[u8], tail_end: usize, delim: DelimAfter) -> Optio
     }
 }
 
+/// Returns true if `b` is in `charset` under ASCII-only semantics.
+///
+/// Non-ASCII bytes never match any charset.
 #[inline]
 fn tail_matches_charset(b: u8, charset: TailCharset) -> bool {
     // LUT-based classification: single lookup + bitwise operations.
@@ -272,8 +288,11 @@ fn tail_matches_charset(b: u8, charset: TailCharset) -> bool {
 /// Shared configuration for prefix-based validators.
 #[derive(Clone, Copy, Debug)]
 struct PrefixChecks {
+    /// Character set to apply to tail bytes immediately after the anchor.
     tail: TailCharset,
+    /// Whether an ASCII word boundary must appear at `anchor_start`.
     require_word_boundary_before: bool,
+    /// Optional delimiter rule applied at the end of the tail.
     delim_after: DelimAfter,
 }
 
@@ -282,6 +301,12 @@ struct PrefixChecks {
 /// Returns the matched span on success. This enforces an optional word boundary
 /// before the anchor, validates that the tail length is exactly `tail_len`, and
 /// applies any delimiter requirement after the tail.
+///
+/// Guarantees / invariants:
+/// - `anchor_start <= anchor_end <= buf.len()`.
+/// - The prefix bytes were already matched by the anchor automaton.
+///
+/// Complexity: O(`tail_len`) in the length of the tail.
 fn validate_prefix_fixed(
     buf: &[u8],
     anchor_start: usize,
@@ -314,6 +339,14 @@ fn validate_prefix_fixed(
 /// `min_tail` bytes. When a delimiter is required, this backtracks to the
 /// longest tail that is immediately followed by a terminator or end-of-input,
 /// mirroring regex backtracking semantics.
+///
+/// Guarantees / invariants:
+/// - `anchor_start <= anchor_end <= buf.len()`.
+/// - The prefix bytes were already matched by the anchor automaton.
+/// - Empty tails are not accepted: `anchor_end == buf.len()` always fails.
+///
+/// Complexity: O(`max_tail`) for the scan, plus O(`max_tail`) backtracking when
+/// a delimiter is required.
 fn validate_prefix_bounded(
     buf: &[u8],
     anchor_start: usize,
@@ -377,7 +410,15 @@ fn is_upper_alnum(b: u8) -> bool {
 /// Validate an AWS access key anchored at a known prefix.
 ///
 /// The anchor length determines which prefixes are allowed (3-byte or 4-byte),
-/// and the total match length must be exactly 20 bytes.
+/// and the total match length must be exactly 20 bytes. The prefix bytes are
+/// assumed to be validated by the anchor automaton; this function verifies the
+/// tail bytes are uppercase alphanumeric.
+///
+/// Guarantees / invariants:
+/// - `anchor_start <= anchor_end <= buf.len()`.
+/// - The anchor slice corresponds to a valid AWS prefix pattern.
+///
+/// Complexity: O(20) with a fixed-sized byte scan.
 fn validate_aws_access_key(
     buf: &[u8],
     anchor_start: usize,
