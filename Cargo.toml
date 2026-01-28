@@ -49,6 +49,10 @@ name = "hotspots"
 harness = false
 required-features = ["bench"]
 
+[[bench]]
+name = "ring_buffer"
+harness = false
+
 [profile.dev]
 opt-level = 1
 
