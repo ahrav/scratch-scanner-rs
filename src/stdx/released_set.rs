@@ -147,7 +147,6 @@ impl ReleasedSet {
     ///
     /// Panics if the set is full (capacity exceeded). This design is intentional for
     /// deterministic systems where resource limits must be explicitly modeled and respected.
-    #[inline]
     pub fn insert(&mut self, key: u64) {
         let mut idx = (released_set_hash(key) as usize) & self.mask;
 
