@@ -214,14 +214,14 @@ fn bench_pop(c: &mut Criterion) {
     let mut group = c.benchmark_group("released_set/pop");
 
     // Test pop at various set sizes
-    let sizes = [100, 1_000, 10_000];
+    let sizes: [u64; 3] = [100, 1_000, 10_000];
 
     for &size in &sizes {
         let keys = make_keys(size as usize, 0xface_cafe);
         group.throughput(Throughput::Elements(size));
 
         group.bench_with_input(BenchmarkId::new("drain", size), &keys, |b, keys| {
-            let mut set = ReleasedSet::with_capacity(size + 100);
+            let mut set = ReleasedSet::with_capacity(size as usize + 100);
             b.iter(|| {
                 for &key in keys {
                     set.insert(key);
