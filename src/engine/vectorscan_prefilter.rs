@@ -1,25 +1,30 @@
-//! Vectorscan/Hyperscan prefilter integration for raw-byte scanning.
+//! Vectorscan/Hyperscan prefilter integration for raw-byte and decoded-stream scanning.
 //!
-//! Purpose: use `hs_scan` to seed candidate windows for raw variants, reducing
-//! anchor work on large buffers while keeping correctness in the main engine.
+//! Purpose: run Vectorscan in prefilter mode to seed candidate windows for the
+//! main engine. Prefiltering is conservative: it may add extra windows but must
+//! never drop true matches.
 //!
 //! Invariants and safety:
 //! - The compiled database is immutable after creation and can be shared.
 //! - Each scanning thread must use its own `hs_scratch_t` (`VsScratch`).
-//! - The match callback must never panic or unwind across the FFI boundary.
-//! - Prefiltering is conservative: it may add extra windows but must not drop
-//!   true matches.
+//! - Match callbacks must never panic or unwind across the FFI boundary.
+//! - Pointers carried through `ctx` are valid only for the duration of a scan.
 //!
 //! High-level flow:
-//! 1. Compile each rule regex with `HS_FLAG_PREFILTER`.
-//! 2. Use `hs_expression_info` to bound match width and derive window math.
-//! 3. On match, compute [end - lo_pad, end + seed] and seed raw windows.
-//! 4. Optionally include a NUL sentinel expression to detect UTF-16 need.
+//! 1. Compile each rule regex with `HS_FLAG_PREFILTER` (block or stream mode).
+//! 2. Use `hs_expression_info` to estimate `max_width` for window math.
+//! 3. On a match ending at `to`, compute `lo = to - (max_width + seed)` and
+//!    `hi = to + seed`, clamped to the haystack length.
+//! 4. For unbounded widths, treat the rule as "whole-buffer on hit" and cap
+//!    callbacks with `HS_FLAG_SINGLEMATCH`.
+//! 5. Optionally include a NUL sentinel expression to decide whether to run
+//!    UTF-16 anchor scanning without a separate memchr pass.
 //!
 //! Design choices:
-//! - If match width or seed math overflows `u32`, mark the rule as
-//!   "whole-buffer on hit" and cap callbacks with `HS_FLAG_SINGLEMATCH`.
-//! - UTF-16 scanning always uses the anchor scanner; Vectorscan only gates raw.
+//! - If window math overflows `u32`, mark the rule as "whole-buffer on hit" and
+//!   cap callbacks with `HS_FLAG_SINGLEMATCH`.
+//! - UTF-16 scanning always uses the anchor scanner; Vectorscan only gates raw
+//!   and decoded-stream variants.
 use crate::api::{RuleSpec, Tuning};
 use libc::{c_char, c_int, c_uint, c_void};
 use std::ffi::CString;
@@ -32,12 +37,13 @@ use super::{ScanScratch, Target, Variant};
 
 /// Packed per-rule metadata for the Vectorscan prefilter callback.
 ///
-/// Hot-path math:
+/// Hot-path math (clamped to the haystack length):
 /// - `lo = end - lo_pad` (saturating)
 /// - `hi = min(end + seed, hay_len)`
 ///
 /// Sentinel:
 /// - `seed == u32::MAX` means "whole-buffer on hit".
+/// - `lo_pad` is set to `u32::MAX` in that case and ignored.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct VsRuleMeta {
@@ -45,7 +51,7 @@ pub(crate) struct VsRuleMeta {
     pub(crate) seed: u32,
 }
 
-/// Compiled Vectorscan database plus per-rule window metadata.
+/// Compiled Vectorscan database plus per-rule window metadata for raw-byte scanning.
 ///
 /// The database is immutable after compilation and can be shared across
 /// threads, but each thread must allocate its own `VsScratch`.
@@ -60,6 +66,9 @@ pub(crate) struct VsPrefilterDb {
 }
 
 /// Per-rule metadata for stream-mode window seeding.
+///
+/// `max_width` is derived from `hs_expression_info` and may be capped; `radius`
+/// comes from rule tuning and expands windows around the match end.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct VsStreamMeta {
@@ -70,7 +79,7 @@ pub(crate) struct VsStreamMeta {
 /// Compiled Vectorscan database for stream-mode scanning.
 ///
 /// This is used for decoded-stream prefiltering; matches are converted into
-/// candidate windows in the caller.
+/// candidate windows in the caller using `VsStreamMeta` indexed by rule id.
 pub(crate) struct VsStreamDb {
     db: *mut vs::hs_database_t,
     meta: Vec<VsStreamMeta>,
@@ -107,7 +116,8 @@ impl Drop for VsPrefilterDb {
 /// Per-thread Vectorscan scratch space bound to a specific database.
 ///
 /// This must only be used with the database it was allocated for and must not
-/// be used concurrently from multiple threads.
+/// be used concurrently from multiple threads. Dropping it releases the
+/// underlying `hs_scratch_t`.
 pub(crate) struct VsScratch {
     scratch: *mut vs::hs_scratch_t,
     db: *mut vs::hs_database_t,
@@ -122,12 +132,17 @@ impl VsScratch {
 }
 
 /// Opaque stream handle for stream-mode scanning.
+///
+/// Must be closed with `close_stream` to flush end-of-stream matches.
 pub(crate) struct VsStream {
     stream: *mut vs::hs_stream_t,
 }
 
 impl VsStreamDb {
     /// Build a stream-mode database for decoded-byte scanning.
+    ///
+    /// Uses `hs_expression_info` to estimate match width; a zero width is
+    /// treated as unbounded and capped by `max_decoded_cap` when provided.
     pub(crate) fn try_new_stream(
         rules: &[RuleSpec],
         max_decoded_cap: usize,
@@ -239,6 +254,7 @@ impl VsStreamDb {
         self.db
     }
 
+    /// Opens a new stream handle bound to this database.
     pub(crate) fn open_stream(&self) -> Result<VsStream, String> {
         let mut stream: *mut vs::hs_stream_t = ptr::null_mut();
         let rc = unsafe { vs::hs_open_stream(self.db, 0, &mut stream) };
@@ -248,6 +264,10 @@ impl VsStreamDb {
         Ok(VsStream { stream })
     }
 
+    /// Scans a stream chunk and delivers matches to `on_event`.
+    ///
+    /// `scratch` must be allocated for this database; `ctx` must remain valid
+    /// for the duration of the call.
     pub(crate) fn scan_stream(
         &self,
         stream: &mut VsStream,
@@ -278,6 +298,10 @@ impl VsStreamDb {
         }
     }
 
+    /// Closes a stream, flushing end-of-stream matches via `on_event`.
+    ///
+    /// `scratch` must be allocated for this database; `ctx` must remain valid
+    /// for the duration of the call.
     pub(crate) fn close_stream(
         &self,
         stream: VsStream,
@@ -295,6 +319,8 @@ impl VsStreamDb {
 }
 
 /// Stream match event used by decoded-byte scanning.
+///
+/// `lo`/`hi` bound the candidate window that should be verified by the caller.
 #[repr(C)]
 pub(crate) struct VsStreamWindow {
     pub(crate) rule_id: u32,
@@ -302,6 +328,11 @@ pub(crate) struct VsStreamWindow {
     pub(crate) hi: u64,
 }
 
+/// Callback context for stream-mode scans.
+///
+/// Safety invariants:
+/// - `pending` points to a live `Vec<VsStreamWindow>` for the duration of the scan.
+/// - `meta` points to an array of `meta_len` entries indexed by rule id.
 #[repr(C)]
 pub(crate) struct VsStreamMatchCtx {
     pub(crate) pending: *mut Vec<VsStreamWindow>,
@@ -311,7 +342,8 @@ pub(crate) struct VsStreamMatchCtx {
 
 /// Stream-mode match callback. Pushes window seeds into `pending`.
 ///
-/// Safety: must not panic or unwind across the FFI boundary.
+/// Safety: `ctx` must point to a valid `VsStreamMatchCtx`, and this callback
+/// must never panic or unwind across the FFI boundary.
 unsafe extern "C" fn vs_on_stream_match(
     id: c_uint,
     _from: u64,
@@ -345,6 +377,7 @@ pub(crate) fn stream_match_callback() -> vs::match_event_handler {
     Some(vs_on_stream_match)
 }
 
+/// Mapping from UTF-16 anchor patterns to rule/variant targets.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct VsAnchorTarget {
@@ -353,6 +386,10 @@ struct VsAnchorTarget {
     seed_radius_bytes: u32,
 }
 
+/// Vectorscan database for UTF-16 anchor prefiltering.
+///
+/// Patterns are literal bytes (encoded as `\xNN` regexes); matches are expanded
+/// into rule/variant windows using the `targets` mapping.
 pub(crate) struct VsAnchorDb {
     db: *mut vs::hs_database_t,
     targets: Vec<VsAnchorTarget>,
@@ -376,6 +413,10 @@ impl Drop for VsAnchorDb {
 }
 
 impl VsAnchorDb {
+    /// Builds the UTF-16 anchor database and mapping tables.
+    ///
+    /// Empty patterns are filtered out; offsets are compacted accordingly.
+    /// Each remaining pattern is compiled as a literal byte regex.
     pub(crate) fn try_new_utf16(
         patterns: &[Vec<u8>],
         pat_targets: &[Target],
@@ -553,6 +594,9 @@ impl VsAnchorDb {
         self.db
     }
 
+    /// Scans raw bytes for UTF-16 anchor hits and seeds per-variant windows.
+    ///
+    /// The callback performs window math using the precomputed target mapping.
     pub(crate) fn scan_utf16(
         &self,
         hay: &[u8],
@@ -834,6 +878,14 @@ struct VsMatchCtx {
 }
 
 #[repr(C)]
+/// Callback context for UTF-16 anchor scans.
+///
+/// Safety invariants:
+/// - `scratch` points to a live `ScanScratch` for the duration of the scan.
+/// - `targets` points to `pat_offsets[pat_count]` entries indexed by pattern id.
+/// - `pat_offsets` has length `pat_count + 1` and is monotonically increasing.
+/// - `pat_lens` has length `pat_count`.
+/// - `hay_len` matches the length passed to `hs_scan`.
 struct VsAnchorMatchCtx {
     scratch: *mut ScanScratch,
     targets: *const VsAnchorTarget,
@@ -844,6 +896,10 @@ struct VsAnchorMatchCtx {
     max_hits: usize,
 }
 
+/// Prefilter match callback for raw-byte scanning.
+///
+/// Seeds per-rule raw windows in `ScanScratch` based on the match end offset.
+/// Must never panic or unwind across the FFI boundary.
 extern "C" fn vs_on_match(
     id: c_uint,
     _from: u64,
@@ -868,7 +924,7 @@ extern "C" fn vs_on_match(
     // SAFETY: `scratch` is valid for the duration of the scan and is not used concurrently.
     let scratch = unsafe { &mut *c.scratch };
 
-    const RAW_IDX: usize = 0;
+    const RAW_IDX: usize = 0; // Raw variant is always index 0.
 
     // Whole-buffer on hit sentinel.
     if meta.seed == u32::MAX {
@@ -895,6 +951,10 @@ extern "C" fn vs_on_match(
     0
 }
 
+/// UTF-16 anchor match callback.
+///
+/// Expands each anchor match into windows for all rule/variant targets tied to
+/// the matched pattern. Must never panic or unwind across the FFI boundary.
 extern "C" fn vs_anchor_on_match(
     id: c_uint,
     _from: u64,
@@ -946,6 +1006,7 @@ extern "C" fn vs_anchor_on_match(
 /// Returns `(max_width, c_pattern)` for use in prefilter compilation.
 ///
 /// Errors if the pattern contains NUL bytes or if `hs_expression_info` fails.
+/// A reported `max_width` of zero is treated as "unbounded" by callers.
 fn expression_info_prefilter_max_width(pattern: &str) -> Result<(u32, CString), String> {
     let c_pat = CString::new(pattern).map_err(|_| "pattern contains NUL byte".to_string())?;
 

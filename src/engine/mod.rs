@@ -1699,12 +1699,14 @@ impl Engine {
                         BufRef::Root => (root_buf.as_ptr(), root_buf.len(), 0usize),
                         BufRef::Slab(range) => unsafe {
                             debug_assert!(range.end <= scratch.slab.buf.len());
+                            // SAFETY: `range` is sourced from decode output and stays in-bounds.
                             let ptr = scratch.slab.buf.as_ptr().add(range.start);
                             (ptr, range.end.saturating_sub(range.start), range.start)
                         },
                     };
 
-                    // SAFETY: slab buffer never reallocates (capacity fixed to limit), and we only append.
+                    // SAFETY: `buf_ptr` points into `root_buf` or the decode slab. The slab does
+                    // not reallocate during a scan, and `buf_len` is bounded by the checked range.
                     let cur_buf = unsafe { std::slice::from_raw_parts(buf_ptr, buf_len) };
 
                     self.scan_rules_on_buffer(
@@ -1860,6 +1862,7 @@ impl Engine {
                     let (enc_ptr, enc_len) = match enc_ref {
                         EncRef::Root(r) => {
                             if r.end <= root_buf.len() {
+                                // SAFETY: bounds are checked against `root_buf`.
                                 let ptr = unsafe { root_buf.as_ptr().add(r.start) };
                                 (ptr, r.end - r.start)
                             } else {
@@ -1868,7 +1871,8 @@ impl Engine {
                         }
                         EncRef::Slab(r) => {
                             if r.end <= scratch.slab.buf.len() {
-                                // SAFETY: slab buffer never reallocates and we only append.
+                                // SAFETY: bounds are checked against the slab; it does not
+                                // reallocate during a scan.
                                 let ptr = unsafe { scratch.slab.buf.as_ptr().add(r.start) };
                                 (ptr, r.end - r.start)
                             } else {
@@ -1876,6 +1880,8 @@ impl Engine {
                             }
                         }
                     };
+                    // SAFETY: `enc_ptr` points into `root_buf` or the decode slab. Both remain
+                    // valid for the duration of this scan and are not reallocated.
                     let enc = unsafe { std::slice::from_raw_parts(enc_ptr, enc_len) };
 
                     if let Some(vs_stream) = self.vs_stream.as_ref() {
