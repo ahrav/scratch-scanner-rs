@@ -55,8 +55,22 @@ pub const PIPE_FILE_RING_CAP: usize = 1024;
 pub const PIPE_CHUNK_RING_CAP: usize = 128;
 /// Default output ring capacity.
 pub const PIPE_OUT_RING_CAP: usize = 8192;
-/// Default buffer pool capacity for the pipeline.
-pub const PIPE_POOL_CAP: usize = PIPE_CHUNK_RING_CAP + 8;
+/// Target aggregate bytes for the pipeline buffer pool.
+///
+/// Pool capacity is derived from this budget and `BUFFER_LEN_MAX`, so larger
+/// buffers automatically reduce the number of pooled slots.
+pub const PIPE_POOL_TARGET_BYTES: usize = 256 * 1024 * 1024;
+/// Minimum buffer pool capacity for the pipeline.
+pub const PIPE_POOL_MIN: usize = 16;
+
+fn default_pool_capacity() -> usize {
+    let mut cap = PIPE_POOL_TARGET_BYTES / BUFFER_LEN_MAX;
+    if cap == 0 {
+        cap = 1;
+    }
+    cap = cap.min(PIPE_CHUNK_RING_CAP + 8);
+    cap.max(PIPE_POOL_MIN)
+}
 
 /// Default maximum number of files to scan.
 ///
@@ -857,7 +871,7 @@ impl<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize>
         let max_files = config.max_files;
         let path_bytes_cap = config.path_bytes_cap;
         let scanner = ScanStage::new(&engine);
-        let pool = BufferPool::new(PIPE_POOL_CAP);
+        let pool = BufferPool::new(default_pool_capacity());
         Self {
             engine,
             config,

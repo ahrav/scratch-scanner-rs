@@ -2352,20 +2352,12 @@ impl Engine {
 
         if let Some(vs) = self.vs.as_ref() {
             if !vs.raw_missing_rules().is_empty() {
-                let max_hits = self.tuning.max_anchor_hits_per_rule_variant;
-                for &rid in vs.raw_missing_rules() {
-                    let rid = rid as usize;
-                    scratch.accs[rid][Variant::Raw.idx()].push(0, hay_len as usize, max_hits);
-                    scratch.mark_touched(rid, Variant::Raw);
-                }
+                panic!(
+                    "vectorscan raw db missing {} rule patterns (fallback disabled)",
+                    vs.raw_missing_rules().len()
+                );
             }
         }
-
-        let raw_missing_rules = self
-            .vs
-            .as_ref()
-            .map(|db| db.raw_missing_rules())
-            .unwrap_or(&[]);
 
         if let Some(vs) = self.vs.as_ref() {
             if used_vectorscan && self.tuning.vs_direct_raw_regex && vs.supports_som() {
@@ -2460,12 +2452,14 @@ impl Engine {
                 self.tuning.max_windows_per_rule_variant,
             );
 
-            let allow_two_phase =
-                if used_vectorscan && self.tuning.vs_direct_raw_regex && variant == Variant::Raw {
-                    raw_missing_rules.contains(&(rid as u32))
-                } else {
-                    true
-                };
+            let allow_two_phase = !(used_vectorscan
+                && self.tuning.vs_direct_raw_regex
+                && variant == Variant::Raw
+                && self
+                    .vs
+                    .as_ref()
+                    .map(|db| db.supports_som())
+                    .unwrap_or(false));
             if allow_two_phase {
                 if let Some(tp) = &rule.two_phase {
                     // Two-phase: confirm in seed windows, then expand.
