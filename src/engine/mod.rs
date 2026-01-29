@@ -2816,7 +2816,7 @@ impl Engine {
     /// Validates a raw decoded-space window and appends findings into `scratch.tmp_findings`.
     ///
     /// # Preconditions
-    /// - `window_start` is the decoded-space offset for `window[0]`.
+    /// - `window_start` is the decoded-stream offset for `window[0]`.
     ///
     /// # Effects
     /// - Sets `found_any` when any match passes gates.
@@ -2904,7 +2904,7 @@ impl Engine {
     /// [`DecodeStep::Utf16Window`] records the raw UTF-16 parent span.
     ///
     /// # Preconditions
-    /// - `window_start` is the decoded-space offset for `raw_win[0]`.
+    /// - `window_start` is the decoded-stream offset for `raw_win[0]`.
     ///
     /// # Effects
     /// - Sets `found_any` when any match passes gates.

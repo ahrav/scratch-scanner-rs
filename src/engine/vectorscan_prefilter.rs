@@ -328,7 +328,12 @@ impl VsStreamDb {
     /// Scans a stream chunk and delivers matches to `on_event`.
     ///
     /// `scratch` must be allocated for this database; `ctx` must remain valid
-    /// for the duration of the call.
+    /// for the duration of the call. `HS_SCAN_TERMINATED` is treated as success to
+    /// allow early termination in callbacks.
+    ///
+    /// `scratch` must be allocated for this database; `ctx` must remain valid
+    /// for the duration of the call. `HS_SCAN_TERMINATED` is treated as success to
+    /// allow early termination in callbacks.
     pub(crate) fn scan_stream(
         &self,
         stream: &mut VsStream,
@@ -385,6 +390,8 @@ impl VsStreamDb {
 /// `[lo, hi)`) to verify.
 /// `variant_idx` matches `Variant::idx()`. `force_full` asks the caller to
 /// fall back to a full decode scan and ignore `lo`/`hi`.
+/// `lo`/`hi` are not clamped to the current stream length; callers must clamp
+/// when materializing decode work.
 #[repr(C)]
 pub(crate) struct VsStreamWindow {
     pub(crate) rule_id: u32,
@@ -415,6 +422,7 @@ pub(crate) struct VsStreamMatchCtx {
 /// - `pending` is not accessed concurrently while the scan runs.
 /// - `targets`/`pat_offsets`/`pat_lens` describe the UTF-16 anchor mapping tables.
 /// - `pat_offsets` has length `pat_count + 1` and is monotonically increasing.
+/// - `pat_offsets[pat_count]` equals the number of `targets` entries.
 /// - `pat_lens` has length `pat_count`.
 /// - `base_offset` converts stream-local match offsets into absolute decoded offsets.
 #[repr(C)]
@@ -561,6 +569,7 @@ pub(crate) fn utf16_stream_match_callback() -> vs::match_event_handler {
 ///
 /// `seed_radius_bytes` is the extra padding (raw bytes, in the UTF-16 byte
 /// stream) applied around the matched anchor when seeding windows.
+/// `variant_idx` matches `Variant::idx()` (0=raw, 1=utf16-le, 2=utf16-be).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct VsAnchorTarget {
@@ -574,6 +583,12 @@ pub(crate) struct VsAnchorTarget {
 /// `patterns` holds raw UTF-16 byte patterns. `pat_targets` is a flat list of
 /// rule/variant targets, and `pat_offsets` is a prefix-sum table mapping each
 /// pattern to its target slice. `seed_radius_bytes` is indexed by rule id.
+///
+/// Expected shape (defensively validated):
+/// - `pat_offsets.len()` should be `patterns.len() + 1`, with the last offset
+///   equal to `pat_targets.len()`.
+/// - Out-of-range offsets are treated as empty ranges.
+/// - Missing `seed_radius_bytes` entries default to zero padding.
 pub(crate) struct Utf16AnchorInput<'a> {
     pub(crate) patterns: &'a [Vec<u8>],
     pub(crate) pat_targets: &'a [Target],
@@ -591,7 +606,9 @@ struct Utf16AnchorData {
 /// Builds the filtered pattern table and target mappings for UTF-16 anchors.
 ///
 /// Empty patterns are dropped, offsets are compacted, and out-of-range target
-/// ranges are ignored. When `debug` is true, basic pattern stats are logged.
+/// ranges are ignored. Each surviving pattern is encoded as a `\\xNN` literal
+/// byte regex so Vectorscan treats it as a raw-byte match. When `debug` is
+/// true, basic pattern stats are logged.
 ///
 /// # Errors
 /// Returns an error if no non-empty patterns remain or if pattern encoding fails.
@@ -868,7 +885,9 @@ impl VsAnchorDb {
     ///
     /// The callback performs window math using the precomputed target mapping.
     /// `vs_scratch` must be allocated for this database and not shared across
-    /// threads; `scratch` must not be accessed concurrently.
+    /// threads; `scratch` must not be accessed concurrently. Window ends are
+    /// clamped to the haystack length, and per-(rule, variant) hits are capped to
+    /// `max_hits_per_rule_variant`.
     pub(crate) fn scan_utf16(
         &self,
         hay: &[u8],
@@ -1490,6 +1509,7 @@ impl VsPrefilterDb {
 
         let raw_rule_ids: Vec<u32> = raw_kept.iter().map(|p| p.rule_id).collect();
         let raw_seed_radius: Vec<u32> = raw_kept.iter().map(|p| p.seed_radius).collect();
+        let raw_match_widths: Vec<u32> = raw_kept.iter().map(|p| p.max_width).collect();
         let raw_rule_count = raw_kept.len() as u32;
 
         let (utf16_id_base, utf16_pat_count, utf16_targets, utf16_pat_offsets, utf16_pat_lens) =
@@ -1577,7 +1597,9 @@ impl VsPrefilterDb {
     /// present in the database) seed UTF-16 windows.
     ///
     /// `vs_scratch` must be allocated for this database and not shared across
-    /// threads; `scratch` must not be accessed concurrently.
+    /// threads; `scratch` must not be accessed concurrently. Per-(rule, variant)
+    /// hits are capped to `max_hits_per_rule_variant` and may coalesce when the cap
+    /// is exceeded.
     ///
     /// Returns `Ok(true)` if any UTF-16 anchor hit was observed.
     pub(crate) fn scan_raw(
