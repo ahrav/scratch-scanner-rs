@@ -3,7 +3,8 @@
 //! This module derives a *sound* set of literal substrings ("anchors") from a regex
 //! pattern. The intended use is **fast prefiltering** in a secret scanner: scan a
 //! haystack for any anchor first, then run the full regex only if an anchor is
-//! present.
+//! present. Anchors are byte substrings (not necessarily valid UTF-8); all length
+//! limits in this module are measured in bytes.
 //!
 //! # Soundness invariant (the only non-negotiable rule)
 //!
@@ -21,8 +22,9 @@
 //! - Returned anchors are sufficient for a sound OR prefilter.
 //! - Patterns that can match the empty string are never anchored.
 //! - `AnchorDeriveConfig::utf8` must match the regex engine semantics.
+//! - Length limits are in bytes, not Unicode scalar values.
 //!
-//! # High-level algorithm
+//! # Algorithm
 //!
 //! 1. Parse the pattern into the regex-syntax HIR (high-level intermediate
 //!    representation) so we can reason about structure safely.
@@ -35,7 +37,7 @@
 //! 4. Convert the final `Info` into anchors, enforcing minimum length and
 //!    rejecting patterns that can match the empty string.
 //!
-//! # Limitations and trade-offs
+//! # Design notes and limitations
 //!
 //! - This module never guesses: if it cannot *prove* a required substring, it
 //!   returns an error or an unfilterable plan rather than risk false negatives.
@@ -61,10 +63,20 @@ use std::cmp::Ordering;
 
 /// Configuration for anchor derivation.
 ///
-/// # Semantics
-/// - Length and size limits are enforced at selection time to preserve soundness.
+/// # Guarantees
+/// - Enumeration caps bound exact-set growth; exceeding them degrades to broader
+///   summaries or errors instead of returning unsound anchors.
+/// - `min_anchor_len` is enforced at selection time; shorter required strings
+///   yield `AnchorDeriveError::OnlyWeakAnchors`.
+///
+/// # Invariants
+/// - All lengths are in bytes.
 /// - `utf8` must match the regex engine used for the final match.
 /// - k-gram fields only apply when the `kgram-gate` feature is enabled.
+///
+/// # Performance
+/// - Larger caps increase enumeration cost; smaller caps increase the chance of
+///   falling back to broader prefilters or `Unfilterable` results.
 #[derive(Debug, Clone)]
 pub struct AnchorDeriveConfig {
     /// Minimum length for an anchor to be useful.
@@ -114,6 +126,13 @@ impl Default for AnchorDeriveConfig {
 }
 
 /// Errors that can occur during anchor derivation.
+///
+/// # Notes
+/// - These errors are conservative: they indicate no sound anchor set exists
+///   under the current configuration.
+/// - `compile_trigger_plan` may map `Unanchorable`/`OnlyWeakAnchors` into
+///   `UnfilterableReason` after attempting residue gates. `InvalidPattern`
+///   is returned directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnchorDeriveError {
     /// The regex pattern is invalid.
@@ -127,7 +146,8 @@ pub enum AnchorDeriveError {
 /// A prefilter represents the extracted anchor information.
 ///
 /// # Invariants
-/// - `Substring`/`AnyOf` describe substrings that must appear in any match.
+/// - `Substring`/`AnyOf` describe byte substrings that must appear in any match.
+/// - `All` means no required substring can be proven.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Prefilter {
     /// No useful anchors - pattern matches too broadly.
@@ -141,10 +161,10 @@ pub enum Prefilter {
 
 /// Output of regex prefilter compilation for a single rule.
 ///
-/// Exactly one of:
-/// - `Anchored`: participates in Pass 1 prefiltering (sound OR set).
-/// - `Residue`: participates in Pass 2 specialized gating.
-/// - `Unfilterable`: cannot be safely gated (reject or slow-path).
+/// # Semantics
+/// - `Anchored`: OR over `anchors`, optional AND over `confirm_all`.
+/// - `Residue`: conservative ASCII-only gates used when anchors are unavailable.
+/// - `Unfilterable`: no safe gate; caller must run the full regex or skip.
 ///
 /// # Soundness
 /// - `Anchored` guarantees at least one anchor is present in any match.
@@ -154,8 +174,9 @@ pub enum TriggerPlan {
     Anchored {
         /// Any match must contain at least one of these anchors (sound OR set).
         anchors: Vec<Vec<u8>>,
-        /// Optional: additional required atoms for cheap confirmation (AND).
-        /// Not required for correctness. Safe to leave empty.
+        /// Optional AND filter of mandatory literal islands.
+        /// Each entry must appear in any match; used to reduce false positives
+        /// after an anchor hit. Safe to leave empty.
         confirm_all: Vec<Vec<u8>>,
     },
     Residue {
@@ -167,6 +188,10 @@ pub enum TriggerPlan {
 }
 
 /// Reasons an anchor or gate could not be produced safely.
+///
+/// # Notes
+/// - `UnsupportedRegexFeatures` is set by higher-level validation when the
+///   regex engine accepts constructs this module does not model.
 #[derive(Debug, Clone)]
 pub enum UnfilterableReason {
     /// Pattern can match the empty string.
@@ -181,7 +206,8 @@ pub enum UnfilterableReason {
 
 /// Secondary gating plan when anchors are unavailable.
 ///
-/// These gates are conservative and may fall back to full scanning.
+/// These gates are conservative, ASCII-only summaries. They should be treated
+/// as prefilters and may still require a full regex match.
 #[derive(Debug, Clone)]
 pub enum ResidueGatePlan {
     /// Fast linear scan for a run of a byteclass of length [min,max].
@@ -206,9 +232,13 @@ pub enum Boundary {
 
 /// Run-length gate spec (ASCII byte-oriented).
 ///
-/// # Semantics
-/// - The gate scans for runs of bytes contained in `byte_mask`.
-/// - Boundaries are ASCII-only and applied around the run when requested.
+/// # Guarantees
+/// - When produced by this module, any match contains a run that satisfies
+///   this gate.
+///
+/// # Invariants
+/// - The gate scans for runs of bytes contained in `byte_mask` (ASCII only).
+/// - `min_len`/`max_len` are measured in bytes.
 /// - `boundary = AsciiWord` means require word boundaries on both sides.
 #[derive(Debug, Clone)]
 pub struct RunLengthGate {
@@ -230,6 +260,9 @@ pub struct RunLengthGate {
 }
 
 /// K-gram gate spec for prefix scanning.
+///
+/// `gram_hashes` is sorted and deduplicated. For `k <= 8`, grams are packed
+/// little-endian into a `u64`; longer grams use FNV-1a hashing.
 #[derive(Debug, Clone)]
 pub struct KGramGate {
     /// Prefix length (k) used for the gate.
@@ -241,6 +274,9 @@ pub struct KGramGate {
 }
 
 /// Hint for where a k-gram must appear within the match.
+///
+/// `Prefix` means the k-gram is guaranteed at the start of the match, `Suffix`
+/// at the end, and `Anywhere` indicates only presence somewhere in the match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PositionHint {
     Prefix,
@@ -250,13 +286,10 @@ pub enum PositionHint {
 
 /// Internal representation tracking both exact matches and prefilter info.
 ///
-/// Invariants:
-/// - If `exact = Some(S)`, then the node matches **exactly** the strings in `S`.
-/// - If `exact = None`, then `pf` summarizes a *necessary* substring condition:
-///   any match must contain the substring(s) in `pf`.
-///
-/// The algorithm only ever *weakens* information when combining nodes. This is
-/// what keeps the soundness invariant intact.
+/// # Invariants
+/// - If `exact = Some(S)`, the node matches **exactly** the byte strings in `S`.
+/// - If `exact = None`, `pf` summarizes a *necessary* substring condition.
+/// - Combining nodes only ever weakens information, never strengthens it.
 #[derive(Debug, Clone)]
 struct Info {
     /// If Some, the exact set of strings this node can match.
@@ -1269,7 +1302,6 @@ fn choose_anchors(
     info: &Info,
     cfg: &AnchorDeriveConfig,
 ) -> Result<Vec<Vec<u8>>, AnchorDeriveError> {
-    // First try exact set
     if let Some(exact) = &info.exact {
         // If exact set contains empty string, pattern can match empty - unanchorable
         // (any anchor we return would miss empty inputs)
@@ -1287,7 +1319,6 @@ fn choose_anchors(
         return Ok(exact.clone());
     }
 
-    // Fall back to prefilter
     match &info.pf {
         Prefilter::All => Err(AnchorDeriveError::Unanchorable),
         Prefilter::Substring(s) => {
@@ -1470,7 +1501,7 @@ pub fn compile_trigger_plan(
 ///
 /// # Examples
 /// ```rust
-/// # use crate::regex2anchor::{AnchorDeriveConfig, derive_anchors_from_pattern};
+/// # use scanner_rs::regex2anchor::{AnchorDeriveConfig, derive_anchors_from_pattern};
 /// let cfg = AnchorDeriveConfig::default();
 /// let anchors = derive_anchors_from_pattern("foo[0-9]+bar", &cfg).unwrap();
 /// assert!(anchors.contains(&b"foo".to_vec()) || anchors.contains(&b"bar".to_vec()));
@@ -1508,7 +1539,7 @@ pub fn derive_anchors_from_pattern(
 ///
 /// # Examples
 /// ```rust
-/// # use crate::regex2anchor::{AnchorDeriveConfig, derive_anchors_as_strings};
+/// # use scanner_rs::regex2anchor::{AnchorDeriveConfig, derive_anchors_as_strings};
 /// let cfg = AnchorDeriveConfig::default();
 /// let anchors = derive_anchors_as_strings("api[_-]?key", &cfg).unwrap();
 /// assert!(anchors.iter().any(|s| s.contains("api")));
