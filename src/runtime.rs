@@ -411,7 +411,7 @@ impl Chunk {
 }
 
 /// Maximum chunk buffer length (bytes).
-pub const BUFFER_LEN_MAX: usize = 2 * 1024 * 1024;
+pub const BUFFER_LEN_MAX: usize = 8 * 1024 * 1024;
 /// Alignment for pooled buffers (bytes).
 pub const BUFFER_ALIGN: usize = 4096;
 
