@@ -36,9 +36,11 @@
 //!   that bound.
 //!
 //! # Window seeding
-//! 1. Compile each rule regex in block mode (exact matches, no prefilter flags).
+//! 1. Compile each rule regex in block mode with `HS_FLAG_PREFILTER` to get
+//!    conservative hits.
 //! 2. Use `hs_expression_info` to estimate `max_width` for overlap sizing.
-//! 3. On a match, seed a window using the reported match span.
+//! 3. On a match, seed a window around the match end (or match span when SOM
+//!    is enabled).
 //! 4. Optionally include UTF-16 anchor patterns in the same database to avoid
 //!    a second scan pass.
 //!
@@ -52,7 +54,7 @@
 //! - Scan APIs accept `u32` lengths; we return errors when a haystack exceeds
 //!   that bound.
 //! - If multi-compile fails for raw rules, we fall back to per-rule compilation
-//!   and drop unsupported patterns; `raw_missing_rules` exposes the dropped ids.
+//!   to pinpoint rejects; any rejected pattern returns an error.
 //! - Empty UTF-16/gate pattern sets return an error early.
 use crate::api::{RuleSpec, Tuning};
 use libc::{c_char, c_int, c_uint, c_void};
@@ -69,9 +71,9 @@ use super::{RawHsMatch, ScanScratch, Target, Variant};
 /// The database is immutable after compilation and can be shared across
 /// threads, but each thread must allocate its own `VsScratch`.
 ///
-/// Raw pattern ids follow compile order and may be a filtered subset of rules;
-/// `raw_rule_ids` maps expression index -> rule id and `raw_missing_rules`
-/// records rules rejected by Vectorscan. Optional UTF-16 anchor patterns are
+/// Raw pattern ids follow compile order; `raw_rule_ids` maps expression index
+/// -> rule id. If we fall back to per-rule compilation, `raw_missing_rules`
+/// records rejected rules (and the build fails). Optional UTF-16 anchor patterns are
 /// appended after raw patterns and resolved via the `utf16_*` mapping tables.
 pub(crate) struct VsPrefilterDb {
     db: *mut vs::hs_database_t,
@@ -326,10 +328,6 @@ impl VsStreamDb {
     }
 
     /// Scans a stream chunk and delivers matches to `on_event`.
-    ///
-    /// `scratch` must be allocated for this database; `ctx` must remain valid
-    /// for the duration of the call. `HS_SCAN_TERMINATED` is treated as success to
-    /// allow early termination in callbacks.
     ///
     /// `scratch` must be allocated for this database; `ctx` must remain valid
     /// for the duration of the call. `HS_SCAN_TERMINATED` is treated as success to
@@ -606,7 +604,7 @@ struct Utf16AnchorData {
 /// Builds the filtered pattern table and target mappings for UTF-16 anchors.
 ///
 /// Empty patterns are dropped, offsets are compacted, and out-of-range target
-/// ranges are ignored. Each surviving pattern is encoded as a `\\xNN` literal
+/// ranges are ignored. Each surviving pattern is encoded as a `\xNN` literal
 /// byte regex so Vectorscan treats it as a raw-byte match. When `debug` is
 /// true, basic pattern stats are logged.
 ///
@@ -1063,6 +1061,11 @@ impl VsUtf16StreamDb {
         Ok(VsStream { stream })
     }
 
+    /// Scans a decoded stream chunk for UTF-16 anchor hits.
+    ///
+    /// `scratch` must be allocated for this database; `ctx` must remain valid
+    /// for the duration of the call. `HS_SCAN_TERMINATED` is treated as success to
+    /// allow early termination in callbacks.
     pub(crate) fn scan_stream(
         &self,
         stream: &mut VsStream,
@@ -1224,6 +1227,10 @@ impl VsGateDb {
     }
 
     /// Scans a stream chunk and delivers matches to `on_event`.
+    ///
+    /// `scratch` must be allocated for this database; `ctx` must remain valid
+    /// for the duration of the call. `HS_SCAN_TERMINATED` is treated as success to
+    /// allow early termination in callbacks.
     pub(crate) fn scan_stream(
         &self,
         stream: &mut VsStream,
@@ -1282,10 +1289,11 @@ impl Drop for VsScratch {
 }
 
 impl VsPrefilterDb {
-    /// Builds a Vectorscan DB for exact raw regex matches and optional UTF-16 anchor hits.
+    /// Builds a Vectorscan DB for raw regex prefilter matches and optional UTF-16 anchor hits.
     ///
     /// Returns an error if the database cannot be compiled or if any rule
-    /// pattern is rejected by `hs_expression_info`.
+    /// pattern is rejected by `hs_expression_info`. If multi-compile fails, we
+    /// recompile patterns individually to surface the specific rule errors.
     pub(crate) fn try_new(
         rules: &[RuleSpec],
         tuning: &Tuning,
@@ -1593,7 +1601,7 @@ impl VsPrefilterDb {
 
     /// Scan raw bytes and seed per-rule candidate windows.
     ///
-    /// Exact regex matches seed raw windows; UTF-16 anchor patterns (when
+    /// Prefilter matches seed raw windows; UTF-16 anchor patterns (when
     /// present in the database) seed UTF-16 windows.
     ///
     /// `vs_scratch` must be allocated for this database and not shared across
