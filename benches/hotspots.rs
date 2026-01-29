@@ -1,7 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use scanner_rs::{
-    bench_find_spans_into, bench_stream_decode_base64, bench_stream_decode_url,
-    demo_engine_with_anchor_mode, AnchorMode, Gate, TransformConfig, TransformId, TransformMode,
+    bench_find_spans_into, bench_stream_decode_base64, bench_stream_decode_url, Gate,
+    TransformConfig, TransformId, TransformMode,
 };
 use std::time::Duration;
 
@@ -57,7 +57,6 @@ struct SizeSweep {
     random: Vec<u8>,
     urlish: Vec<u8>,
     base64_noise: Vec<u8>,
-    anchors_hits: Vec<u8>,
 }
 
 fn make_random(len: usize, seed: u64) -> Vec<u8> {
@@ -88,24 +87,6 @@ fn make_urlish(len: usize) -> Vec<u8> {
     buf
 }
 
-fn make_anchor_hits(len: usize) -> Vec<u8> {
-    let anchors: [&[u8]; 5] = [b"AKIA", b"ghp_", b"xoxb-", b"glpat-", b"sk_test_"];
-    let mut buf = vec![b'a'; len];
-    let stride = 4096;
-    let mut i = 0usize;
-    let mut idx = 0usize;
-    while i < buf.len() {
-        let a = anchors[idx % anchors.len()];
-        if i + a.len() > buf.len() {
-            break;
-        }
-        buf[i..i + a.len()].copy_from_slice(a);
-        i = i.saturating_add(stride);
-        idx += 1;
-    }
-    buf
-}
-
 fn make_size_sweep(sizes: &[usize]) -> Vec<SizeSweep> {
     sizes
         .iter()
@@ -115,7 +96,6 @@ fn make_size_sweep(sizes: &[usize]) -> Vec<SizeSweep> {
             random: make_random(size, 0x1234_5678_9abc_def0 ^ (idx as u64)),
             urlish: make_urlish(size),
             base64_noise: make_base64(size, 0x0f0e_0d0c_0b0a_0908 ^ (idx as u64)),
-            anchors_hits: make_anchor_hits(size),
         })
         .collect()
 }
@@ -206,39 +186,6 @@ fn bench_transform_spans(c: &mut Criterion) {
     b64_group.finish();
 }
 
-fn bench_ac_anchors(c: &mut Criterion) {
-    let engine = demo_engine_with_anchor_mode(AnchorMode::Manual);
-    let ac = engine.bench_ac_anchors();
-
-    let random = Dataset {
-        name: "random",
-        buf: make_random(BUF_LEN, 0xfeed_face_cafe_beef),
-    };
-    let hits = Dataset {
-        name: "anchors_hits",
-        buf: make_anchor_hits(BUF_LEN),
-    };
-
-    let mut group = c.benchmark_group("ac_anchors");
-    for ds in [&random, &hits] {
-        group.throughput(Throughput::Bytes(ds.buf.len() as u64));
-        group.bench_with_input(
-            BenchmarkId::new("find_overlapping", ds.name),
-            ds,
-            |b, ds| {
-                b.iter(|| {
-                    let mut count = 0usize;
-                    for _ in ac.find_overlapping_iter(black_box(&ds.buf)) {
-                        count += 1;
-                    }
-                    black_box(count);
-                })
-            },
-        );
-    }
-    group.finish();
-}
-
 fn bench_size_sweep(c: &mut Criterion) {
     let sizes = [
         64 * 1024,
@@ -294,33 +241,6 @@ fn bench_size_sweep(c: &mut Criterion) {
     }
     b64_group.finish();
 
-    let engine = demo_engine_with_anchor_mode(AnchorMode::Manual);
-    let ac = engine.bench_ac_anchors();
-    let mut ac_group = c.benchmark_group("size_sweep_ac");
-    ac_group.sample_size(10);
-    ac_group.measurement_time(Duration::from_secs(3));
-    for ds in &data {
-        ac_group.throughput(Throughput::Bytes(ds.size as u64));
-        ac_group.bench_with_input(BenchmarkId::new("random", ds.size), ds, |b, ds| {
-            b.iter(|| {
-                let mut count = 0usize;
-                for _ in ac.find_overlapping_iter(black_box(&ds.random)) {
-                    count += 1;
-                }
-                black_box(count);
-            })
-        });
-        ac_group.bench_with_input(BenchmarkId::new("anchors_hits", ds.size), ds, |b, ds| {
-            b.iter(|| {
-                let mut count = 0usize;
-                for _ in ac.find_overlapping_iter(black_box(&ds.anchors_hits)) {
-                    count += 1;
-                }
-                black_box(count);
-            })
-        });
-    }
-    ac_group.finish();
 }
 
 fn bench_decode_url(c: &mut Criterion) {
@@ -467,7 +387,6 @@ fn bench_decode_b64(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_transform_spans,
-    bench_ac_anchors,
     bench_size_sweep,
     bench_decode_url,
     bench_decode_b64

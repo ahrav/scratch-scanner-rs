@@ -674,7 +674,6 @@ version = "0.1.0"
 dependencies = [
  "aegis",
  "ahash",
- "aho-corasick",
  "base64",
  "criterion",
  "io-uring",

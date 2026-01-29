@@ -29,6 +29,12 @@
 //! These components intentionally trade precision for cheap scanning. Strict
 //! validation happens in decode/gating, while span finders bias toward not
 //! missing possible payloads.
+//!
+//! # Streaming usage
+//! The `*SpanStream` scanners accept chunked input via `feed(chunk, base_offset, ...)`,
+//! where `base_offset` is the absolute byte offset of `chunk[0]` in the original
+//! buffer. Call `finish(end_offset, ...)` once at end-of-stream to flush a trailing
+//! run; after `on_span` returns `false`, the stream becomes inert until `reset()`.
 
 use super::SpanU32;
 use crate::api::{TransformConfig, TransformId};
@@ -170,10 +176,268 @@ fn is_urlish(b: u8) -> bool {
 /// Spans are half-open byte ranges (`start..end`) into the input buffer.
 /// Implementations are expected to preserve insertion order and tolerate
 /// being cleared and reused across scans.
+/// Callers are responsible for ensuring `start <= end` and that spans are
+/// within the input buffer.
 pub(super) trait SpanSink {
     fn clear(&mut self);
     fn len(&self) -> usize;
     fn push(&mut self, span: Range<usize>);
+}
+
+/// Stateful URL-ish span detector for chunked input.
+///
+/// The scan is permissive: any URL-ish run containing at least one escape (or
+/// `+` when `plus_to_space` is enabled) can produce a span. Runs are split at
+/// `max_len` boundaries to cap worst-case work; each split segment must still
+/// satisfy the trigger and `min_len` requirements to be emitted.
+pub(super) struct UrlSpanStream {
+    min_len: usize,
+    max_len: usize,
+    plus_to_space: bool,
+    in_run: bool,
+    start: u64,
+    run_len: usize,
+    triggers: usize,
+    done: bool,
+}
+
+impl UrlSpanStream {
+    pub(super) fn new(tc: &TransformConfig) -> Self {
+        Self {
+            min_len: tc.min_len,
+            max_len: tc.max_encoded_len,
+            plus_to_space: tc.plus_to_space,
+            in_run: false,
+            start: 0,
+            run_len: 0,
+            triggers: 0,
+            done: false,
+        }
+    }
+
+    pub(super) fn reset(&mut self) {
+        self.in_run = false;
+        self.start = 0;
+        self.run_len = 0;
+        self.triggers = 0;
+        self.done = false;
+    }
+
+    /// Feed the next chunk of bytes into the scanner.
+    ///
+    /// `base_offset` must be the absolute offset of `chunk[0]` in the original
+    /// buffer. Spans are reported as half-open absolute ranges. Returning
+    /// `false` from `on_span` stops the scan early; the stream must be `reset()`
+    /// before reuse.
+    pub(super) fn feed<F>(&mut self, chunk: &[u8], base_offset: u64, mut on_span: F)
+    where
+        F: FnMut(u64, u64) -> bool,
+    {
+        if self.done || chunk.is_empty() {
+            return;
+        }
+
+        let mut i = 0usize;
+        while i < chunk.len() {
+            let b = chunk[i];
+            let flags = BYTE_CLASS[b as usize];
+            let urlish = (flags & URLISH) != 0;
+            let abs = base_offset + i as u64;
+
+            if !self.in_run {
+                if !urlish {
+                    i += 1;
+                    continue;
+                }
+                self.in_run = true;
+                self.start = abs;
+                self.run_len = 0;
+                self.triggers = 0;
+            }
+
+            if urlish {
+                self.run_len = self.run_len.saturating_add(1);
+                if b == b'%' || (self.plus_to_space && b == b'+') {
+                    self.triggers = self.triggers.saturating_add(1);
+                }
+                i += 1;
+
+                if self.run_len >= self.max_len {
+                    if self.triggers > 0 && self.run_len >= self.min_len {
+                        let end = self.start.saturating_add(self.run_len as u64);
+                        if !on_span(self.start, end) {
+                            self.done = true;
+                            return;
+                        }
+                    }
+                    self.in_run = false;
+                }
+            } else {
+                if self.triggers > 0 && self.run_len >= self.min_len {
+                    let end = abs;
+                    if !on_span(self.start, end) {
+                        self.done = true;
+                        return;
+                    }
+                }
+                self.in_run = false;
+                i += 1;
+            }
+        }
+    }
+
+    /// Flush a trailing run at end-of-stream.
+    ///
+    /// `end_offset` should be the absolute offset immediately after the last
+    /// input byte. No spans are emitted if the current run lacks a trigger or
+    /// is shorter than `min_len`.
+    pub(super) fn finish<F>(&mut self, end_offset: u64, mut on_span: F)
+    where
+        F: FnMut(u64, u64) -> bool,
+    {
+        if self.done || !self.in_run {
+            return;
+        }
+        if self.triggers > 0 && self.run_len >= self.min_len && !on_span(self.start, end_offset)
+        {
+            self.done = true;
+        }
+        self.in_run = false;
+    }
+}
+
+/// Stateful base64-ish span detector for chunked input.
+///
+/// Runs may include allowed whitespace, but spans are trimmed to the last base64
+/// alphabet byte. `min_chars` counts alphabet characters only; whitespace does
+/// not contribute. Runs are split at `max_len` boundaries to keep scanning bounded.
+pub(super) struct Base64SpanStream {
+    min_chars: usize,
+    max_len: usize,
+    allow_space_ws: bool,
+    in_run: bool,
+    start: u64,
+    run_len: usize,
+    b64_chars: usize,
+    have_b64: bool,
+    last_b64: u64,
+    done: bool,
+}
+
+impl Base64SpanStream {
+    pub(super) fn new(tc: &TransformConfig) -> Self {
+        Self {
+            min_chars: tc.min_len,
+            max_len: tc.max_encoded_len,
+            allow_space_ws: tc.base64_allow_space_ws,
+            in_run: false,
+            start: 0,
+            run_len: 0,
+            b64_chars: 0,
+            have_b64: false,
+            last_b64: 0,
+            done: false,
+        }
+    }
+
+    pub(super) fn reset(&mut self) {
+        self.in_run = false;
+        self.start = 0;
+        self.run_len = 0;
+        self.b64_chars = 0;
+        self.have_b64 = false;
+        self.last_b64 = 0;
+        self.done = false;
+    }
+
+    /// Feed the next chunk of bytes into the scanner.
+    ///
+    /// `base_offset` must be the absolute offset of `chunk[0]` in the original
+    /// buffer. Spans are reported as half-open absolute ranges trimmed to the
+    /// last base64 byte. Returning `false` from `on_span` stops the scan early;
+    /// the stream must be `reset()` before reuse.
+    pub(super) fn feed<F>(&mut self, chunk: &[u8], base_offset: u64, mut on_span: F)
+    where
+        F: FnMut(u64, u64) -> bool,
+    {
+        if self.done || chunk.is_empty() {
+            return;
+        }
+
+        let allow_mask = if self.allow_space_ws {
+            B64_CHAR | B64_WS | B64_WS_SPACE
+        } else {
+            B64_CHAR | B64_WS
+        };
+
+        let mut i = 0usize;
+        while i < chunk.len() {
+            let b = chunk[i];
+            let flags = BYTE_CLASS[b as usize];
+            let allowed = (flags & allow_mask) != 0;
+            let abs = base_offset + i as u64;
+
+            if !self.in_run {
+                if !allowed {
+                    i += 1;
+                    continue;
+                }
+                self.in_run = true;
+                self.start = abs;
+                self.run_len = 0;
+                self.b64_chars = 0;
+                self.have_b64 = false;
+            }
+
+            if allowed {
+                self.run_len = self.run_len.saturating_add(1);
+                if (flags & B64_CHAR) != 0 {
+                    self.b64_chars = self.b64_chars.saturating_add(1);
+                    self.last_b64 = abs;
+                    self.have_b64 = true;
+                }
+                i += 1;
+
+                if self.run_len >= self.max_len {
+                    if self.have_b64 && self.b64_chars >= self.min_chars {
+                        let end = self.last_b64.saturating_add(1);
+                        if !on_span(self.start, end) {
+                            self.done = true;
+                            return;
+                        }
+                    }
+                    self.in_run = false;
+                }
+            } else {
+                if self.have_b64 && self.b64_chars >= self.min_chars {
+                    let end = self.last_b64.saturating_add(1);
+                    if !on_span(self.start, end) {
+                        self.done = true;
+                        return;
+                    }
+                }
+                self.in_run = false;
+                i += 1;
+            }
+        }
+    }
+
+    /// Flush a trailing run at end-of-stream, trimming trailing whitespace.
+    pub(super) fn finish<F>(&mut self, _end_offset: u64, mut on_span: F)
+    where
+        F: FnMut(u64, u64) -> bool,
+    {
+        if self.done || !self.in_run {
+            return;
+        }
+        if self.have_b64 && self.b64_chars >= self.min_chars {
+            let end = self.last_b64.saturating_add(1);
+            if !on_span(self.start, end) {
+                self.done = true;
+            }
+        }
+        self.in_run = false;
+    }
 }
 
 impl SpanSink for Vec<Range<usize>> {
@@ -226,11 +490,14 @@ impl SpanSink for ScratchVec<SpanU32> {
 /// shorter than `min_len` are discarded. `min_len`/`max_len` are measured in
 /// input bytes, not decoded output.
 ///
+/// `spans` is cleared before results are appended.
+///
 /// Notes:
 /// - "URL-ish" includes RFC3986 unreserved/reserved bytes plus '%' and '+'.
 /// - Runs longer than `max_len` are split at the boundary to keep scans bounded.
 /// - When `plus_to_space` is false, '+' is allowed in runs but does not trigger
 ///   a span by itself.
+/// - Scanning stops after `max_spans` spans are appended.
 pub(super) fn find_url_spans_into(
     hay: &[u8],
     min_len: usize,
@@ -397,6 +664,7 @@ enum Base64DecodeError {
 /// - Spans contain only base64 chars + allowed whitespace.
 /// - Spans end at the last base64 byte; trailing whitespace is trimmed.
 /// - Runs are split at `max_len` to bound worst-case work.
+/// - Scanning stops after `max_spans` spans are appended.
 ///
 /// Notes:
 /// - `min_chars` counts base64 alphabet characters only; whitespace does not

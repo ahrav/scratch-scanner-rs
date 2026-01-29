@@ -1,12 +1,11 @@
-//! Core scanning engine: rule compilation, anchor indexes, optional prefilters,
-//! and scan execution.
+//! Core scanning engine: rule compilation, prefilters, and scan execution.
 //!
 //! Purpose: compile rule specs into anchors and gates, then scan buffers with
 //! bounded work and reuse scratch allocations.
 //!
 //! # Pipeline overview
 //! 1. Compile rules into anchor patterns and fast gates (keywords/confirm-all).
-//! 2. Scan input buffers for anchor hits and build candidate windows.
+//! 2. Prefilter input buffers and build candidate windows.
 //! 3. Run validators, gates, and regexes inside those windows.
 //! 4. Optionally decode transform spans into derived buffers and repeat (BFS).
 //!
@@ -26,13 +25,13 @@
 //! - UTF-16 anchors always contain at least one NUL byte, enabling a raw-only
 //!   fast path for NUL-free buffers.
 //! - Vectorscan prefiltering is enabled by default, but best-effort; if the
-//!   prefilter DB fails to compile, we fall back to anchor scanning.
+//!   prefilter DB fails to compile, we fall back to full-buffer windows.
 //!
 //! # Trade-offs
 //! The engine favors predictable cost over perfect precision: span/anchor
 //! selection is permissive, while validation and gates enforce correctness.
-//! Prefilters (bytesets, Vectorscan, base64 pre-gate) are conservative: they
-//! may admit false positives but must not drop true matches.
+//! Prefilters (Vectorscan, base64 pre-gate) are conservative: they may admit
+//! false positives but must not drop true matches.
 
 use crate::api::*;
 use crate::b64_yara_gate::{Base64YaraGate, Base64YaraGateConfig, PaddingPolicy, WhitespacePolicy};
@@ -40,25 +39,26 @@ use crate::regex2anchor::{
     compile_trigger_plan, AnchorDeriveConfig, ResidueGatePlan, TriggerPlan, UnfilterableReason,
 };
 use crate::scratch_memory::ScratchVec;
-use crate::stdx::{DynamicBitSet, FixedSet128};
+use crate::stdx::{ByteRing, DynamicBitSet, FixedSet128};
 use ahash::AHashMap;
-use aho_corasick::{AhoCorasick, AhoCorasickBuilder, AhoCorasickKind};
 use memchr::{memchr, memmem};
 use regex::bytes::Regex;
 use std::ops::{ControlFlow, Range};
+use std::collections::BinaryHeap;
 #[cfg(feature = "stats")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod helpers;
-mod prefilter;
 mod transform;
 mod validator;
 mod vectorscan_prefilter;
 
 use self::helpers::*;
-use self::prefilter::*;
 use self::transform::*;
-use self::vectorscan_prefilter::{VsAnchorDb, VsPrefilterDb, VsScratch};
+use self::vectorscan_prefilter::{
+    stream_match_callback, VsAnchorDb, VsPrefilterDb, VsScratch, VsStreamDb,
+    VsStreamMatchCtx, VsStreamWindow,
+};
 
 #[cfg(test)]
 use crate::demo::*;
@@ -107,11 +107,11 @@ impl Variant {
 
 /// Mapping entry from an anchor pattern id to a rule/variant accumulator.
 ///
-/// Anchor patterns are deduped in the Aho-Corasick automaton. Each pattern id
-/// can fan out to multiple rules and variants; `pat_offsets` slices into the
-/// flat `pat_targets` array. A `Target` is a compact (rule_id, variant) pair
-/// packed into `u32` to keep the fanout table cache-friendly and avoid extra
-/// pointer chasing.
+/// Anchor patterns are deduped in a shared pattern table. Each pattern id can
+/// fan out to multiple rules and variants; `pat_offsets` slices into the flat
+/// `pat_targets` array. A `Target` is a compact (rule_id, variant) pair packed
+/// into `u32` to keep the fanout table cache-friendly and avoid extra pointer
+/// chasing.
 ///
 /// Flags encoded in the low bits record whether the anchor is match-start
 /// aligned (required by fast validators) and whether keyword gates are implied
@@ -161,60 +161,7 @@ impl Target {
     }
 }
 
-/// Anchor automaton plus prefilter and pattern->target fanout table.
-///
-/// The Aho-Corasick automaton yields pattern ids. `pat_offsets` slices into
-/// `pat_targets` so each pattern id can fan out to multiple (rule, variant)
-/// targets without per-pattern allocations. `prefilter` stores a byteset-based
-/// accelerator derived from the same pattern universe.
-///
-/// Invariant: `pat_offsets.len() == patterns + 1`, and each pattern id maps to
-/// `pat_targets[pat_offsets[i]..pat_offsets[i + 1]]`.
-struct AnchorIndex {
-    ac: AhoCorasick,
-    pat_targets: Vec<Target>,
-    pat_offsets: Vec<u32>,
-    prefilter: AnchorPrefilterPlan,
-}
-
-/// Anchor indexes used to select between raw-only and combined scans.
-///
-/// Invariant: every UTF-16 pattern contains at least one NUL byte, so a NUL-free
-/// slice cannot match UTF-16LE/BE variants. This allows a fast raw-only path
-/// for NUL-free buffers and a single-pass combined scan for NUL-heavy buffers.
-///
-/// `raw` contains only raw anchors, `all` contains raw + UTF-16 anchors, and
-/// `utf16` contains UTF-16-only anchors for the "raw already scanned" path.
-struct Anchors {
-    raw: AnchorIndex,
-    all: AnchorIndex,
-    utf16: AnchorIndex,
-}
-
-impl Anchors {
-    #[inline]
-    fn select(&self, hay: &[u8], scan_utf16_variants: bool) -> &AnchorIndex {
-        if !scan_utf16_variants || memchr(0, hay).is_none() {
-            &self.raw
-        } else {
-            &self.all
-        }
-    }
-
-    #[inline]
-    fn select_with_has_nul(&self, hay_has_nul: bool, scan_utf16_variants: bool) -> &AnchorIndex {
-        if scan_utf16_variants && hay_has_nul {
-            &self.all
-        } else {
-            &self.raw
-        }
-    }
-
-    #[inline]
-    fn utf16_only(&self) -> &AnchorIndex {
-        &self.utf16
-    }
-}
+// Anchor scanning is handled by Vectorscan prefilters and UTF-16 anchor DBs.
 
 /// Packed byte patterns with an offset table.
 ///
@@ -433,34 +380,6 @@ impl HitAccumulator {
     }
 }
 
-/// Scratch buffers used by the streaming gate to detect anchors across boundaries.
-///
-/// `tail` preserves a small suffix of the prior chunk, and `scratch` holds the
-/// current decode window so we can test anchors without full decoding.
-///
-/// The tail length is `max_anchor_pat_len - 1`, which is the minimum overlap
-/// required to avoid missing an anchor that straddles two decode chunks.
-struct GateScratch {
-    /// Preserved suffix from prior decode chunk.
-    ///
-    /// Length is `max_anchor_pat_len - 1` to ensure any anchor straddling
-    /// chunk boundaries is detected.
-    tail: ScratchVec<u8>,
-
-    /// Current decode window under gate evaluation.
-    ///
-    /// Sized to hold `tail` plus one decode chunk (1024 bytes), ensuring
-    /// the sliding window never requires reallocation.
-    scratch: ScratchVec<u8>,
-}
-
-impl GateScratch {
-    fn reset(&mut self) {
-        self.tail.clear();
-        self.scratch.clear();
-    }
-}
-
 /// Node in the decode-step arena, linking to its parent step.
 struct StepNode {
     parent: StepId,
@@ -648,20 +567,27 @@ pub struct ScanScratch {
     seen: FixedSet128,                      // Dedupe for decoded buffers.
     total_decode_output_bytes: usize,       // Global decode budget tracker.
     work_items_enqueued: usize,             // Work queue budget tracker.
+    /// Streaming decoded-byte ring buffer for window capture.
+    decode_ring: ByteRing,
+    /// Temporary buffer for materializing decoded windows from the ring.
+    window_bytes: Vec<u8>,
+    /// Pending window heap (min-heap by `hi`) for decoded stream verification.
+    pending_windows: BinaryHeap<PendingWindow>,
+    /// Match windows produced by the Vectorscan stream callback.
+    vs_stream_matches: Vec<VsStreamWindow>,
+    /// Pending decode spans captured during streaming decode.
+    pending_spans: Vec<PendingDecodeSpan>,
+    /// Span detectors for nested transforms in decoded streams.
+    span_streams: Vec<SpanStreamEntry>,
+    /// Temporary findings buffer for a decoded stream (dedupe-aware).
+    tmp_findings: Vec<FindingRec>,
     accs: Vec<[HitAccumulator; 3]>,         // Per (rule, variant) hit accumulators.
     touched_pairs: ScratchVec<u32>,         // Scratch list of touched pairs.
     touched: DynamicBitSet,                 // Bitset for touched pairs.
     touched_any: bool,                      // Fast path for "none touched".
-    prefilter_windows: ScratchVec<SpanU32>, // Anchor prefilter scan windows.
     windows: ScratchVec<SpanU32>,           // Merged windows for a pair.
     expanded: ScratchVec<SpanU32>,          // Expanded windows for two-phase rules.
     spans: ScratchVec<SpanU32>,             // Transform span candidates.
-    /// Streaming gate scratch buffers.
-    ///
-    /// Used by the base64 decoded-content gate to maintain a sliding window
-    /// across chunk boundaries. `tail` preserves the suffix of the prior decode
-    /// chunk; `scratch` holds the current window being checked.
-    gate: GateScratch,
     /// Decode provenance arena.
     ///
     /// Stores parent-linked decode steps so findings can reconstruct their
@@ -688,6 +614,8 @@ pub struct ScanScratch {
     vs_scratch: Option<VsScratch>,
     /// Per-thread Vectorscan scratch space for UTF-16 anchor prefiltering.
     vs_utf16_scratch: Option<VsScratch>,
+    /// Per-thread Vectorscan scratch space for stream-mode scanning.
+    vs_stream_scratch: Option<VsScratch>,
     #[cfg(feature = "b64-stats")]
     base64_stats: Base64DecodeStats, // Base64 decode/gate instrumentation.
 }
@@ -712,7 +640,6 @@ impl ScanScratch {
         let max_steps = engine.tuning.max_work_items.saturating_add(
             rules_len.saturating_mul(2 * engine.tuning.max_windows_per_rule_variant),
         );
-        let tail_keep = engine.max_anchor_pat_len.saturating_sub(1);
         let seen_cap = pow2_at_least(
             engine
                 .tuning
@@ -721,6 +648,7 @@ impl ScanScratch {
                 .saturating_mul(2)
                 .max(1024),
         );
+        let pending_cap = engine.tuning.max_windows_per_rule_variant.max(16);
 
         Self {
             out: ScratchVec::with_capacity(max_findings).expect("scratch out allocation failed"),
@@ -733,26 +661,23 @@ impl ScanScratch {
             seen: FixedSet128::with_pow2(seen_cap),
             total_decode_output_bytes: 0,
             work_items_enqueued: 0,
+            decode_ring: ByteRing::with_capacity(engine.stream_ring_bytes),
+            window_bytes: Vec::with_capacity(engine.stream_ring_bytes),
+            pending_windows: BinaryHeap::with_capacity(pending_cap),
+            vs_stream_matches: Vec::with_capacity(pending_cap),
+            pending_spans: Vec::with_capacity(max_spans.max(16)),
+            span_streams: Vec::with_capacity(engine.transforms.len()),
+            tmp_findings: Vec::with_capacity(max_findings),
             accs,
             touched_pairs: ScratchVec::with_capacity(rules_len.saturating_mul(3))
                 .expect("scratch touched_pairs allocation failed"),
             touched: DynamicBitSet::empty(rules_len.saturating_mul(3)),
             touched_any: false,
-            prefilter_windows: ScratchVec::with_capacity(
-                engine.tuning.max_anchor_hits_per_rule_variant,
-            )
-            .expect("scratch prefilter_windows allocation failed"),
             windows: ScratchVec::with_capacity(engine.tuning.max_anchor_hits_per_rule_variant)
                 .expect("scratch windows allocation failed"),
             expanded: ScratchVec::with_capacity(engine.tuning.max_windows_per_rule_variant)
                 .expect("scratch expanded allocation failed"),
             spans: ScratchVec::with_capacity(max_spans).expect("scratch spans allocation failed"),
-            gate: GateScratch {
-                tail: ScratchVec::with_capacity(tail_keep)
-                    .expect("scratch gate.tail allocation failed"),
-                scratch: ScratchVec::with_capacity(tail_keep.saturating_add(1024))
-                    .expect("scratch gate.scratch allocation failed"),
-            },
             step_arena: StepArena {
                 nodes: ScratchVec::with_capacity(max_steps)
                     .expect("scratch step_arena.nodes allocation failed"),
@@ -772,6 +697,10 @@ impl ScanScratch {
                 db.alloc_scratch()
                     .expect("vectorscan utf16 scratch allocation failed")
             }),
+            vs_stream_scratch: engine.vs_stream.as_ref().map(|db| {
+                db.alloc_scratch()
+                    .expect("vectorscan stream scratch allocation failed")
+            }),
             #[cfg(feature = "b64-stats")]
             base64_stats: Base64DecodeStats::default(),
         }
@@ -790,7 +719,13 @@ impl ScanScratch {
         self.seen.reset();
         self.total_decode_output_bytes = 0;
         self.work_items_enqueued = 0;
-        self.gate.reset();
+        self.decode_ring.reset();
+        self.window_bytes.clear();
+        self.pending_windows.clear();
+        self.vs_stream_matches.clear();
+        self.pending_spans.clear();
+        self.span_streams.clear();
+        self.tmp_findings.clear();
         self.step_arena.reset();
         self.utf16_buf.clear();
         self.entropy_scratch.reset();
@@ -832,9 +767,25 @@ impl ScanScratch {
                 self.vs_utf16_scratch = None;
             }
         }
+        match engine.vs_stream.as_ref() {
+            Some(db) => {
+                let need_alloc = match self.vs_stream_scratch.as_ref() {
+                    Some(s) => s.bound_db_ptr() != db.db_ptr(),
+                    None => true,
+                };
+                if need_alloc {
+                    self.vs_stream_scratch = Some(
+                        db.alloc_scratch()
+                            .expect("vectorscan stream scratch allocation failed"),
+                    );
+                }
+            }
+            None => {
+                self.vs_stream_scratch = None;
+            }
+        }
         self.touched_pairs.clear();
         self.touched_any = false;
-        self.prefilter_windows.clear();
         self.windows.clear();
         self.expanded.clear();
         self.spans.clear();
@@ -879,11 +830,6 @@ impl ScanScratch {
                 ScratchVec::with_capacity(engine.tuning.max_anchor_hits_per_rule_variant)
                     .expect("scratch windows allocation failed");
         }
-        if self.prefilter_windows.capacity() < engine.tuning.max_anchor_hits_per_rule_variant {
-            self.prefilter_windows =
-                ScratchVec::with_capacity(engine.tuning.max_anchor_hits_per_rule_variant)
-                    .expect("scratch prefilter_windows allocation failed");
-        }
         if self.expanded.capacity() < engine.tuning.max_windows_per_rule_variant {
             self.expanded = ScratchVec::with_capacity(engine.tuning.max_windows_per_rule_variant)
                 .expect("scratch expanded allocation failed");
@@ -919,15 +865,30 @@ impl ScanScratch {
             self.steps_buf = ScratchVec::with_capacity(steps_buf_cap)
                 .expect("scratch steps_buf allocation failed");
         }
-        let tail_keep = engine.max_anchor_pat_len.saturating_sub(1);
-        if self.gate.tail.capacity() < tail_keep {
-            self.gate.tail =
-                ScratchVec::with_capacity(tail_keep).expect("scratch gate.tail allocation failed");
+        if self.decode_ring.capacity() < engine.stream_ring_bytes {
+            self.decode_ring = ByteRing::with_capacity(engine.stream_ring_bytes);
         }
-        let gate_scratch_cap = tail_keep.saturating_add(1024);
-        if self.gate.scratch.capacity() < gate_scratch_cap {
-            self.gate.scratch = ScratchVec::with_capacity(gate_scratch_cap)
-                .expect("scratch gate.scratch allocation failed");
+        if self.window_bytes.capacity() < engine.stream_ring_bytes {
+            self.window_bytes
+                .reserve(engine.stream_ring_bytes - self.window_bytes.capacity());
+        }
+        let pending_cap = engine.tuning.max_windows_per_rule_variant.max(16);
+        if self.pending_windows.capacity() < pending_cap {
+            self.pending_windows = BinaryHeap::with_capacity(pending_cap);
+        }
+        if self.vs_stream_matches.capacity() < pending_cap {
+            self.vs_stream_matches.reserve(pending_cap - self.vs_stream_matches.capacity());
+        }
+        if self.pending_spans.capacity() < max_spans.max(16) {
+            self.pending_spans
+                .reserve(max_spans.max(16) - self.pending_spans.capacity());
+        }
+        if self.span_streams.capacity() < engine.transforms.len() {
+            self.span_streams.reserve(engine.transforms.len() - self.span_streams.capacity());
+        }
+        if self.tmp_findings.capacity() < self.max_findings {
+            self.tmp_findings
+                .reserve(self.max_findings - self.tmp_findings.capacity());
         }
     }
 
@@ -1022,30 +983,104 @@ impl ScanScratch {
 ///
 /// `Root` points to the input chunk. `Slab(range)` points into `DecodeSlab`.
 /// Slab ranges are only valid until the slab is reset or truncated.
-#[derive(Default)]
+#[derive(Default, Clone)]
 enum BufRef {
     #[default]
     Root,
     Slab(Range<usize>),
 }
 
+/// Reference to an encoded span to decode.
+#[derive(Clone)]
+enum EncRef {
+    Root(Range<usize>),
+    Slab(Range<usize>),
+}
+
+/// Pending decode span captured during streaming decode.
+#[derive(Clone)]
+struct PendingDecodeSpan {
+    transform_idx: usize,
+    range: Range<usize>,
+    step_id: StepId,
+    root_hint: Option<Range<usize>>,
+    depth: usize,
+}
+
+#[derive(Eq, PartialEq)]
+struct PendingWindow {
+    hi: u64,
+    lo: u64,
+    rule_id: u32,
+    variant: Variant,
+}
+
+impl Ord for PendingWindow {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .hi
+            .cmp(&self.hi)
+            .then_with(|| other.lo.cmp(&self.lo))
+            .then_with(|| other.rule_id.cmp(&self.rule_id))
+            .then_with(|| (other.variant.idx()).cmp(&self.variant.idx()))
+    }
+}
+
+impl PartialOrd for PendingWindow {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+enum SpanStreamState {
+    Url(UrlSpanStream),
+    Base64(Base64SpanStream),
+}
+
+struct SpanStreamEntry {
+    transform_idx: usize,
+    mode: TransformMode,
+    state: SpanStreamState,
+    spans_emitted: usize,
+    max_spans: usize,
+}
+
 /// Work item in the transform/scan queue.
 ///
 /// Carries the decode provenance (StepId) and a root-span hint for reporting.
 /// Depth enforces the transform recursion limit and keeps traversal iterative.
-#[derive(Default)]
-struct WorkItem {
-    buf: BufRef,
-    step_id: StepId,
-    root_hint: Option<Range<usize>>, // None for root buffer; Some for derived buffers
-    depth: usize,
+enum WorkItem {
+    ScanBuf {
+        buf: BufRef,
+        step_id: StepId,
+        root_hint: Option<Range<usize>>, // None for root buffer; Some for derived buffers
+        depth: usize,
+    },
+    DecodeSpan {
+        transform_idx: usize,
+        enc_ref: EncRef,
+        step_id: StepId,
+        root_hint: Option<Range<usize>>,
+        depth: usize,
+    },
+}
+
+impl Default for WorkItem {
+    fn default() -> Self {
+        WorkItem::ScanBuf {
+            buf: BufRef::Root,
+            step_id: STEP_ROOT,
+            root_hint: None,
+            depth: 0,
+        }
+    }
 }
 
 // --------------------------
 // Engine
 // --------------------------
 
-/// Compiled scanning engine with anchor patterns, rules, and transforms.
+/// Compiled scanning engine with derived anchors, rules, and transforms.
 ///
 /// Build once, then reuse with per-scan scratch buffers to avoid allocations.
 pub struct Engine {
@@ -1056,20 +1091,18 @@ pub struct Engine {
     // Log2 lookup table for entropy gating.
     entropy_log2: Vec<f32>,
 
-    // Anchor indexes for raw-only and combined (raw + UTF-16) scans.
-    anchors: Anchors,
-
     // Vectorscan/Hyperscan prefilter DB for raw scanning.
     //
     // Built by default, but stored as `None` when the prefilter DB fails to
     // compile (unsupported patterns, expression-info failures, etc.).
     // When present, this seeds candidate windows in a single `hs_scan` pass.
-    // UTF-16 variants still use the anchor scanner.
     vs: Option<VsPrefilterDb>,
     // Optional Vectorscan DB for UTF-16 anchor scanning.
     //
     // When present, this prefilters UTF-16 variants using literal anchors.
     vs_utf16: Option<VsAnchorDb>,
+    // Vectorscan stream-mode DB for decoded-byte scanning.
+    vs_stream: Option<VsStreamDb>,
     // Base64 pre-decode gate built from anchor patterns.
     //
     // This runs in *encoded space* and is deliberately conservative:
@@ -1088,29 +1121,10 @@ pub struct Engine {
     vs_stats: VectorscanCounters,
 
     max_anchor_pat_len: usize,
+    has_utf16_anchors: bool,
     max_window_diameter_bytes: usize,
-}
-
-/// Build-time statistics about anchor prefilters for a single pattern universe.
-#[cfg(feature = "stats")]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct AnchorPrefilterStats {
-    /// Number of deduped patterns used to build the anchor automaton.
-    pub pattern_count: usize,
-    /// Length of the longest pattern (bytes).
-    pub max_pattern_len: usize,
-    /// Distinct starting bytes (start-byte prefilter cardinality).
-    pub start_bytes: usize,
-    /// Distinct bytes selected for the rare-byte prefilter.
-    pub rare_bytes: usize,
-    /// Maximum rewind offset across rare-byte assignments.
-    pub rare_max_offset: usize,
-    /// Maximum window span across rare-byte assignments.
-    pub rare_max_span: usize,
-    /// Whether a start-byte prefilter was built.
-    pub start_available: bool,
-    /// Whether a rare-byte prefilter was built.
-    pub rare_available: bool,
+    max_prefilter_width: usize,
+    stream_ring_bytes: usize,
 }
 
 /// Summary of anchor derivation choices during engine build.
@@ -1121,10 +1135,6 @@ pub struct AnchorPlanStats {
     pub derived_rules: usize,
     pub residue_rules: usize,
     pub unfilterable_rules: usize,
-    /// Prefilter stats for raw-only anchors.
-    pub prefilter_raw: AnchorPrefilterStats,
-    /// Prefilter stats for raw + UTF-16 anchors.
-    pub prefilter_all: AnchorPrefilterStats,
 }
 
 /// Vectorscan usage counters for a scan run (feature: `stats`).
@@ -1147,11 +1157,11 @@ pub struct VectorscanStats {
     pub utf16_scans_ok: u64,
     /// Number of UTF-16 Vectorscan scans that errored.
     pub utf16_scans_err: u64,
-    /// Buffers scanned only by anchors (no Vectorscan used).
+    /// Buffers scanned without the raw Vectorscan prefilter (full-buffer fallback).
     pub anchor_only: u64,
-    /// Buffers that used Vectorscan but still required anchor scan (UTF-16 path).
+    /// Buffers that used raw Vectorscan and also ran a UTF-16 anchor scan.
     pub anchor_after_vs: u64,
-    /// Buffers where Vectorscan was used and anchor scan was skipped.
+    /// Buffers where raw Vectorscan was used and UTF-16 scan was skipped.
     pub anchor_skipped: u64,
 }
 
@@ -1188,24 +1198,9 @@ impl VectorscanCounters {
     }
 }
 
-#[cfg(feature = "stats")]
-impl From<AnchorPrefilterStatsInternal> for AnchorPrefilterStats {
-    fn from(stats: AnchorPrefilterStatsInternal) -> Self {
-        Self {
-            pattern_count: stats.pattern_count,
-            max_pattern_len: stats.max_pattern_len,
-            start_bytes: stats.start_bytes,
-            rare_bytes: stats.rare_bytes,
-            rare_max_offset: stats.rare_max_offset,
-            rare_max_span: stats.rare_max_span,
-            start_available: stats.start_available,
-            rare_available: stats.rare_available,
-        }
-    }
-}
 
 impl Engine {
-    /// Compiles rule specs into an engine with prebuilt anchor automata.
+    /// Compiles rule specs into an engine with Vectorscan prefilters and gates.
     ///
     /// # Panics
     /// Panics if any rule, transform, or tuning invariants are violated.
@@ -1467,8 +1462,10 @@ impl Engine {
             }
         }
 
-        let (anchor_patterns_raw, pat_targets_raw, pat_offsets_raw) = map_to_patterns(pat_map_raw);
-        let (anchor_patterns_all, pat_targets_all, pat_offsets_all) = map_to_patterns(pat_map_all);
+        let (_anchor_patterns_raw, _pat_targets_raw, _pat_offsets_raw) =
+            map_to_patterns(pat_map_raw);
+        let (anchor_patterns_all, _pat_targets_all, _pat_offsets_all) =
+            map_to_patterns(pat_map_all);
         let (anchor_patterns_utf16, pat_targets_utf16, pat_offsets_utf16) =
             map_to_patterns(pat_map_utf16);
         let max_anchor_pat_len = anchor_patterns_all
@@ -1476,15 +1473,6 @@ impl Engine {
             .map(|p| p.len())
             .max()
             .unwrap_or(0);
-
-        let prefilter_raw = AnchorPrefilterPlan::build(&anchor_patterns_raw);
-        let prefilter_all = AnchorPrefilterPlan::build(&anchor_patterns_all);
-        let prefilter_utf16 = AnchorPrefilterPlan::build(&anchor_patterns_utf16);
-        #[cfg(feature = "stats")]
-        {
-            anchor_plan_stats.prefilter_raw = prefilter_raw.stats().into();
-            anchor_plan_stats.prefilter_all = prefilter_all.stats().into();
-        }
 
         // Build the base64 pre-gate from the same anchor universe as the decoded gate:
         // raw anchors plus UTF-16 variants. This keeps the pre-gate *sound* with
@@ -1506,60 +1494,7 @@ impl Engine {
             ))
         };
 
-        let build_anchor_ac = |patterns: &[Vec<u8>], label: &'static str| {
-            let mut builder = AhoCorasickBuilder::new();
-            builder.prefilter(true);
-            if let Some(depth) = tuning.ac_dense_depth {
-                builder.dense_depth(depth);
-            }
-            if let Some(yes) = tuning.ac_byte_classes {
-                builder.byte_classes(yes);
-            }
-
-            match tuning.ac_kind {
-                AnchorAcKind::Auto => {
-                    builder.kind(None);
-                    builder
-                        .build(patterns.iter().map(|p| p.as_slice()))
-                        .unwrap_or_else(|err| panic!("build {label} anchors AC: {err}"))
-                }
-                AnchorAcKind::DFA => {
-                    builder.kind(Some(AhoCorasickKind::DFA));
-                    match builder.build(patterns.iter().map(|p| p.as_slice())) {
-                        Ok(ac) => ac,
-                        Err(err) => {
-                            // Safe fallback if DFA build fails (e.g., too large).
-                            builder.kind(None);
-                            builder
-                                .build(patterns.iter().map(|p| p.as_slice()))
-                                .unwrap_or_else(|auto_err| {
-                                    panic!(
-                                        "build {label} anchors AC: forced DFA failed: {err}; auto failed: {auto_err}"
-                                    )
-                                })
-                        }
-                    }
-                }
-                AnchorAcKind::ContiguousNFA => {
-                    builder.kind(Some(AhoCorasickKind::ContiguousNFA));
-                    builder
-                        .build(patterns.iter().map(|p| p.as_slice()))
-                        .unwrap_or_else(|err| panic!("build {label} anchors AC: {err}"))
-                }
-                AnchorAcKind::NoncontiguousNFA => {
-                    builder.kind(Some(AhoCorasickKind::NoncontiguousNFA));
-                    builder
-                        .build(patterns.iter().map(|p| p.as_slice()))
-                        .unwrap_or_else(|err| panic!("build {label} anchors AC: {err}"))
-                }
-            }
-        };
-
-        let ac_anchors_raw = build_anchor_ac(&anchor_patterns_raw, "raw");
-        let ac_anchors_all = build_anchor_ac(&anchor_patterns_all, "all");
-        let ac_anchors_utf16 = build_anchor_ac(&anchor_patterns_utf16, "utf16");
-
-        // Warm regex and AC caches at startup to avoid lazy allocations later.
+        // Warm regex caches at startup to avoid lazy allocations later.
         // `find_iter` always constructs the per-regex cache, so a tiny buffer
         // is sufficient here.
         let warm = [0u8; 1];
@@ -1567,9 +1502,6 @@ impl Engine {
             let mut it = rule.re.find_iter(&warm);
             let _ = it.next();
         }
-        let _ = ac_anchors_raw.is_match(&warm);
-        let _ = ac_anchors_all.is_match(&warm);
-        let _ = ac_anchors_utf16.is_match(&warm);
 
         let mut max_window_diameter_bytes = 0usize;
         for r in &rules {
@@ -1584,10 +1516,47 @@ impl Engine {
             }
         }
 
+        let max_decoded_cap = transforms
+            .iter()
+            .map(|tc| tc.max_decoded_bytes)
+            .max()
+            .unwrap_or(0);
+        let max_encoded_len = transforms
+            .iter()
+            .map(|tc| tc.max_encoded_len)
+            .max()
+            .unwrap_or(0);
+
         // Optional optimization. If the DB can't be built (e.g. regex syntax
-        // incompatibility), fall back to anchor scanning.
+        // incompatibility), fall back to full-buffer raw windows.
         let vs = VsPrefilterDb::try_new(&rules, &tuning).ok();
-        let vs_utf16 = if anchor_patterns_utf16.is_empty() {
+        let max_prefilter_width = vs
+            .as_ref()
+            .and_then(|db| db.max_match_width_bounded())
+            .map(|w| w as usize)
+            .unwrap_or(max_anchor_pat_len);
+        let vs_stream = VsStreamDb::try_new_stream(&rules, max_decoded_cap).ok();
+        let max_stream_window_bytes = vs_stream
+            .as_ref()
+            .and_then(|db| {
+                db.meta()
+                    .iter()
+                    .map(|m| {
+                        let maxw = m.max_width as usize;
+                        let rad = m.radius as usize;
+                        maxw.saturating_add(rad.saturating_mul(2))
+                    })
+                    .max()
+            })
+            .unwrap_or(0);
+        let max_anchor_window_bytes = max_window_diameter_bytes
+            .saturating_add(max_anchor_pat_len);
+        let stream_ring_bytes = max_stream_window_bytes
+            .max(max_encoded_len)
+            .max(max_anchor_window_bytes)
+            .max(1);
+        let has_utf16_anchors = !anchor_patterns_utf16.is_empty();
+        let vs_utf16 = if !has_utf16_anchors {
             None
         } else {
             match VsAnchorDb::try_new_utf16(
@@ -1611,28 +1580,9 @@ impl Engine {
             transforms,
             tuning,
             entropy_log2,
-            anchors: Anchors {
-                raw: AnchorIndex {
-                    ac: ac_anchors_raw,
-                    pat_targets: pat_targets_raw,
-                    pat_offsets: pat_offsets_raw,
-                    prefilter: prefilter_raw,
-                },
-                all: AnchorIndex {
-                    ac: ac_anchors_all,
-                    pat_targets: pat_targets_all,
-                    pat_offsets: pat_offsets_all,
-                    prefilter: prefilter_all,
-                },
-                utf16: AnchorIndex {
-                    ac: ac_anchors_utf16,
-                    pat_targets: pat_targets_utf16,
-                    pat_offsets: pat_offsets_utf16,
-                    prefilter: prefilter_utf16,
-                },
-            },
             vs,
             vs_utf16,
+            vs_stream,
             b64_gate,
             residue_rules,
             unfilterable_rules,
@@ -1641,7 +1591,10 @@ impl Engine {
             #[cfg(feature = "stats")]
             vs_stats: VectorscanCounters::default(),
             max_anchor_pat_len,
+            has_utf16_anchors,
             max_window_diameter_bytes,
+            max_prefilter_width,
+            stream_ring_bytes,
         }
     }
 
@@ -1709,7 +1662,7 @@ impl Engine {
         scratch: &mut ScanScratch,
     ) {
         // High-level flow:
-        // 1) Scan anchors in the current buffer and build windows.
+        // 1) Prefilter the current buffer and build windows.
         // 2) Run regex validation inside those windows (raw + UTF-16 variants).
         // 3) Optionally decode transforms into derived buffers (gated + deduped),
         //    enqueueing them into a work queue for recursive scanning.
@@ -1717,7 +1670,7 @@ impl Engine {
         // Budgets (decode bytes, work items, depth) are enforced on the fly so
         // no single input can force unbounded work.
         scratch.reset_for_scan(self);
-        scratch.work_q.push(WorkItem {
+        scratch.work_q.push(WorkItem::ScanBuf {
             buf: BufRef::Root,
             step_id: STEP_ROOT,
             root_hint: None,
@@ -1734,177 +1687,223 @@ impl Engine {
             let item = std::mem::take(&mut scratch.work_q[scratch.work_head]);
             scratch.work_head += 1;
 
-            let before = scratch.out.len();
-            let (buf_ptr, buf_len) = match item.buf {
-                BufRef::Root => (root_buf.as_ptr(), root_buf.len()),
-                BufRef::Slab(range) => unsafe {
-                    debug_assert!(range.end <= scratch.slab.buf.len());
-                    let ptr = scratch.slab.buf.as_ptr().add(range.start);
-                    (ptr, range.end.saturating_sub(range.start))
-                },
-            };
+            match item {
+                WorkItem::ScanBuf {
+                    buf,
+                    step_id,
+                    root_hint,
+                    depth,
+                } => {
+                    let before = scratch.out.len();
+                    let (buf_ptr, buf_len, buf_offset) = match &buf {
+                        BufRef::Root => (root_buf.as_ptr(), root_buf.len(), 0usize),
+                        BufRef::Slab(range) => unsafe {
+                            debug_assert!(range.end <= scratch.slab.buf.len());
+                            let ptr = scratch.slab.buf.as_ptr().add(range.start);
+                            (ptr, range.end.saturating_sub(range.start), range.start)
+                        },
+                    };
 
-            // SAFETY: slab buffer never reallocates (capacity fixed to limit), and we only append.
-            let cur_buf = unsafe { std::slice::from_raw_parts(buf_ptr, buf_len) };
+                    // SAFETY: slab buffer never reallocates (capacity fixed to limit), and we only append.
+                    let cur_buf = unsafe { std::slice::from_raw_parts(buf_ptr, buf_len) };
 
-            self.scan_rules_on_buffer(
-                cur_buf,
-                item.step_id,
-                item.root_hint.clone(),
-                base_offset,
-                file_id,
-                scratch,
-            );
-            let found_any_in_this_buf = scratch.out.len() > before;
+                    self.scan_rules_on_buffer(
+                        cur_buf,
+                        step_id,
+                        root_hint.clone(),
+                        base_offset,
+                        file_id,
+                        scratch,
+                    );
+                    let found_any_in_this_buf = scratch.out.len() > before;
 
-            if item.depth >= self.tuning.max_transform_depth {
-                continue;
-            }
-            if scratch.work_items_enqueued >= self.tuning.max_work_items {
-                continue;
-            }
-
-            for (tidx, tc) in self.transforms.iter().enumerate() {
-                if tc.mode == TransformMode::Disabled {
-                    continue;
-                }
-                if tc.mode == TransformMode::IfNoFindingsInThisBuffer && found_any_in_this_buf {
-                    continue;
-                }
-
-                if cur_buf.len() < tc.min_len {
-                    continue;
-                }
-
-                if !transform_quick_trigger(tc, cur_buf) {
-                    continue;
-                }
-
-                find_spans_into(tc, cur_buf, &mut scratch.spans);
-                if scratch.spans.is_empty() {
-                    continue;
-                }
-
-                let span_len = scratch.spans.len().min(tc.max_spans_per_buffer);
-                for i in 0..span_len {
-                    let enc_span = scratch.spans[i].to_range();
-                    if scratch.work_items_enqueued >= self.tuning.max_work_items {
-                        break;
+                    if depth >= self.tuning.max_transform_depth {
+                        continue;
                     }
+                    if scratch.work_items_enqueued >= self.tuning.max_work_items {
+                        continue;
+                    }
+
+                    for (tidx, tc) in self.transforms.iter().enumerate() {
+                        if tc.mode == TransformMode::Disabled {
+                            continue;
+                        }
+                        if tc.mode == TransformMode::IfNoFindingsInThisBuffer
+                            && found_any_in_this_buf
+                        {
+                            continue;
+                        }
+                        if cur_buf.len() < tc.min_len {
+                            continue;
+                        }
+                        if !transform_quick_trigger(tc, cur_buf) {
+                            continue;
+                        }
+
+                        find_spans_into(tc, cur_buf, &mut scratch.spans);
+                        if scratch.spans.is_empty() {
+                            continue;
+                        }
+
+                        let span_len = scratch.spans.len().min(tc.max_spans_per_buffer);
+                        for i in 0..span_len {
+                            if scratch.work_items_enqueued >= self.tuning.max_work_items {
+                                break;
+                            }
+                            if scratch.total_decode_output_bytes
+                                >= self.tuning.max_total_decode_output_bytes
+                            {
+                                break;
+                            }
+
+                            let enc_span = scratch.spans[i].to_range();
+                            let enc = &cur_buf[enc_span.clone()];
+                            if tc.id == TransformId::Base64 {
+                                // Base64-only prefilter: cheap encoded-space gate.
+                                // This is only used when the decoded gate is enabled, and it never
+                                // replaces the decoded check. It exists to avoid paying decode cost
+                                // when a span cannot possibly contain any anchor after decoding.
+                                #[cfg(feature = "b64-stats")]
+                                {
+                                    scratch.base64_stats.spans =
+                                        scratch.base64_stats.spans.saturating_add(1);
+                                    scratch.base64_stats.span_bytes = scratch
+                                        .base64_stats
+                                        .span_bytes
+                                        .saturating_add(enc.len() as u64);
+                                }
+                                if tc.gate == Gate::AnchorsInDecoded {
+                                    if let Some(gate) = &self.b64_gate {
+                                        #[cfg(feature = "b64-stats")]
+                                        {
+                                            scratch.base64_stats.pre_gate_checks = scratch
+                                                .base64_stats
+                                                .pre_gate_checks
+                                                .saturating_add(1);
+                                        }
+                                        if !gate.hits(enc) {
+                                            #[cfg(feature = "b64-stats")]
+                                            {
+                                                scratch.base64_stats.pre_gate_skip = scratch
+                                                    .base64_stats
+                                                    .pre_gate_skip
+                                                    .saturating_add(1);
+                                                scratch.base64_stats.pre_gate_skip_bytes = scratch
+                                                    .base64_stats
+                                                    .pre_gate_skip_bytes
+                                                    .saturating_add(enc.len() as u64);
+                                            }
+                                            continue;
+                                        }
+                                        #[cfg(feature = "b64-stats")]
+                                        {
+                                            scratch.base64_stats.pre_gate_pass = scratch
+                                                .base64_stats
+                                                .pre_gate_pass
+                                                .saturating_add(1);
+                                        }
+                                    }
+                                }
+                            }
+
+                            let child_step_id = scratch.step_arena.push(
+                                step_id,
+                                DecodeStep::Transform {
+                                    transform_idx: tidx,
+                                    parent_span: enc_span.clone(),
+                                },
+                            );
+
+                            let child_root_hint = if root_hint.is_none() {
+                                Some(enc_span.clone())
+                            } else {
+                                root_hint.clone()
+                            };
+
+                            let enc_ref = match &buf {
+                                BufRef::Root => EncRef::Root(enc_span.clone()),
+                                BufRef::Slab(_) => {
+                                    let start = buf_offset.saturating_add(enc_span.start);
+                                    let end = buf_offset.saturating_add(enc_span.end);
+                                    EncRef::Slab(start..end)
+                                }
+                            };
+
+                            scratch.work_q.push(WorkItem::DecodeSpan {
+                                transform_idx: tidx,
+                                enc_ref,
+                                step_id: child_step_id,
+                                root_hint: child_root_hint,
+                                depth: depth + 1,
+                            });
+                            scratch.work_items_enqueued += 1;
+                        }
+                    }
+                }
+                WorkItem::DecodeSpan {
+                    transform_idx,
+                    enc_ref,
+                    step_id,
+                    root_hint,
+                    depth,
+                } => {
                     if scratch.total_decode_output_bytes
                         >= self.tuning.max_total_decode_output_bytes
                     {
-                        break;
+                        continue;
+                    }
+                    let tc = &self.transforms[transform_idx];
+                    if tc.mode == TransformMode::Disabled {
+                        continue;
                     }
 
-                    let enc = &cur_buf[enc_span.clone()];
-                    if tc.id == TransformId::Base64 {
-                        // Base64-only prefilter: cheap encoded-space gate.
-                        // This is only used when the decoded gate is enabled, and it never
-                        // replaces the decoded check. It exists to avoid paying decode cost
-                        // when a span cannot possibly contain any anchor after decoding.
-                        #[cfg(feature = "b64-stats")]
-                        {
-                            scratch.base64_stats.spans =
-                                scratch.base64_stats.spans.saturating_add(1);
-                            scratch.base64_stats.span_bytes = scratch
-                                .base64_stats
-                                .span_bytes
-                                .saturating_add(enc.len() as u64);
-                        }
-                        if tc.gate == Gate::AnchorsInDecoded {
-                            if let Some(gate) = &self.b64_gate {
-                                #[cfg(feature = "b64-stats")]
-                                {
-                                    scratch.base64_stats.pre_gate_checks =
-                                        scratch.base64_stats.pre_gate_checks.saturating_add(1);
-                                }
-                                if !gate.hits(enc) {
-                                    #[cfg(feature = "b64-stats")]
-                                    {
-                                        scratch.base64_stats.pre_gate_skip =
-                                            scratch.base64_stats.pre_gate_skip.saturating_add(1);
-                                        scratch.base64_stats.pre_gate_skip_bytes = scratch
-                                            .base64_stats
-                                            .pre_gate_skip_bytes
-                                            .saturating_add(enc.len() as u64);
-                                    }
-                                    continue;
-                                }
-                                #[cfg(feature = "b64-stats")]
-                                {
-                                    scratch.base64_stats.pre_gate_pass =
-                                        scratch.base64_stats.pre_gate_pass.saturating_add(1);
-                                }
+                    let (enc_ptr, enc_len) = match enc_ref {
+                        EncRef::Root(r) => {
+                            if r.end <= root_buf.len() {
+                                let ptr = unsafe { root_buf.as_ptr().add(r.start) };
+                                (ptr, r.end - r.start)
+                            } else {
+                                continue;
                             }
                         }
-                    }
-
-                    let remaining = self
-                        .tuning
-                        .max_total_decode_output_bytes
-                        .saturating_sub(scratch.total_decode_output_bytes);
-                    if remaining == 0 {
-                        break;
-                    }
-                    let max_out = tc.max_decoded_bytes.min(remaining);
-
-                    let decoded_range = if tc.gate == Gate::AnchorsInDecoded {
-                        match self.decode_stream_gated_into_slab(tc, enc, max_out, scratch) {
-                            Some(r) => r,
-                            None => continue,
+                        EncRef::Slab(r) => {
+                            if r.end <= scratch.slab.buf.len() {
+                                // SAFETY: slab buffer never reallocates and we only append.
+                                let ptr = unsafe { scratch.slab.buf.as_ptr().add(r.start) };
+                                (ptr, r.end - r.start)
+                            } else {
+                                continue;
+                            }
                         }
-                    } else {
-                        match scratch.slab.append_stream_decode(
+                    };
+                    let enc = unsafe { std::slice::from_raw_parts(enc_ptr, enc_len) };
+
+                    if let Some(vs_stream) = self.vs_stream.as_ref() {
+                        self.decode_stream_and_scan(
+                            vs_stream,
                             tc,
+                            transform_idx,
                             enc,
-                            max_out,
-                            &mut scratch.total_decode_output_bytes,
-                            self.tuning.max_total_decode_output_bytes,
-                        ) {
-                            Ok(r) => r,
-                            Err(_) => continue,
-                        }
-                    };
-
-                    let decoded = scratch.slab.slice(decoded_range.clone());
-                    // If we discard the decoded buffer (empty or duplicate), roll back
-                    // the slab to its pre-append length. `decoded_range.start` is the
-                    // slab length before this append, so truncation is safe and keeps
-                    // memory and decode-budget accounting tight.
-                    if decoded.is_empty() {
-                        scratch.slab.buf.truncate(decoded_range.start);
-                        continue;
-                    }
-
-                    let h = hash128(decoded);
-                    if !scratch.seen.insert(h) {
-                        scratch.slab.buf.truncate(decoded_range.start);
-                        continue;
-                    }
-
-                    let child_step_id = scratch.step_arena.push(
-                        item.step_id,
-                        DecodeStep::Transform {
-                            transform_idx: tidx,
-                            parent_span: enc_span.clone(),
-                        },
-                    );
-
-                    let child_root_hint = if item.root_hint.is_none() {
-                        Some(enc_span.clone())
+                            step_id,
+                            root_hint,
+                            depth,
+                            base_offset,
+                            file_id,
+                            scratch,
+                        );
                     } else {
-                        item.root_hint.clone()
-                    };
-
-                    scratch.work_q.push(WorkItem {
-                        buf: BufRef::Slab(decoded_range),
-                        step_id: child_step_id,
-                        root_hint: child_root_hint,
-                        depth: item.depth + 1,
-                    });
-
-                    scratch.work_items_enqueued += 1;
+                        self.decode_span_fallback(
+                            tc,
+                            transform_idx,
+                            enc,
+                            step_id,
+                            root_hint,
+                            depth,
+                            base_offset,
+                            file_id,
+                            scratch,
+                        );
+                    }
                 }
             }
         }
@@ -1926,11 +1925,11 @@ impl Engine {
 
     /// Returns the required overlap between chunks for correctness.
     ///
-    /// This ensures anchor windows (including two-phase expansions) fit across
-    /// chunk boundaries.
+    /// This ensures verification windows (including two-phase expansions) fit
+    /// across chunk boundaries.
     pub fn required_overlap(&self) -> usize {
         self.max_window_diameter_bytes
-            .saturating_add(self.max_anchor_pat_len.saturating_sub(1))
+            .saturating_add(self.max_prefilter_width.saturating_sub(1))
     }
 
     /// Returns the rule name for a rule id used in [`FindingRec`].
@@ -1964,109 +1963,6 @@ impl Engine {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn scan_anchor_matches(
-        &self,
-        full_buf: &[u8],
-        scan_slice: &[u8],
-        slice_offset: usize,
-        ac: &AhoCorasick,
-        pat_targets: &[Target],
-        pat_offsets: &[u32],
-        step_id: StepId,
-        root_hint: &Option<Range<usize>>,
-        base_offset: u64,
-        file_id: FileId,
-        scratch: &mut ScanScratch,
-    ) {
-        debug_assert!(slice_offset <= full_buf.len());
-        debug_assert!(slice_offset + scan_slice.len() <= full_buf.len());
-
-        for m in ac.find_overlapping_iter(scan_slice) {
-            let pid = m.pattern().as_usize();
-            let start = pat_offsets[pid] as usize;
-            let end = pat_offsets[pid + 1] as usize;
-            let targets = &pat_targets[start..end];
-
-            let m_start = slice_offset.saturating_add(m.start());
-            let m_end = slice_offset.saturating_add(m.end());
-
-            for &t in targets {
-                let rule_id = t.rule_id();
-                let variant = t.variant();
-                let rule = &self.rules[rule_id];
-
-                // Fast validator path:
-                // If the rule declares a match-start validator and this anchor hit is
-                // match-start aligned, attempt to validate and emit immediately.
-                //
-                // We only take this path when any keyword gate is implied by the
-                // matched anchor and no `must_contain`/confirm-all filter is
-                // required, so the validator remains authoritative.
-                //
-                // On failure we skip window accumulation for this anchor hit,
-                // avoiding regex work.
-                if variant == Variant::Raw
-                    && t.match_start_aligned()
-                    && rule.validator.is_enabled()
-                    && rule.must_contain.is_none()
-                    && rule.confirm_all.is_none()
-                    && t.keyword_implied()
-                {
-                    if let Some(span) = rule
-                        .validator
-                        .validate_raw_at_anchor(full_buf, m_start, m_end)
-                    {
-                        if let Some(ent) = rule.entropy {
-                            let mbytes = &full_buf[span.clone()];
-                            if !entropy_gate_passes(
-                                &ent,
-                                mbytes,
-                                &mut scratch.entropy_scratch,
-                                &self.entropy_log2,
-                            ) {
-                                continue;
-                            }
-                        }
-
-                        let root_span_hint =
-                            root_hint.as_ref().cloned().unwrap_or_else(|| span.clone());
-                        scratch.push_finding(FindingRec {
-                            file_id,
-                            rule_id: rule_id as u32,
-                            span_start: span.start as u32,
-                            span_end: span.end as u32,
-                            root_hint_start: base_offset + root_span_hint.start as u64,
-                            root_hint_end: base_offset + root_span_hint.end as u64,
-                            step_id,
-                        });
-                    }
-                    continue;
-                }
-
-                // Seed radius depends on whether two-phase is used.
-                let seed_r = if let Some(tp) = &rule.two_phase {
-                    tp.seed_radius
-                } else {
-                    rule.radius
-                };
-
-                let scale = variant.scale();
-                let seed_radius_bytes = seed_r.saturating_mul(scale);
-
-                let lo = m_start.saturating_sub(seed_radius_bytes);
-                let hi = (m_end + seed_radius_bytes).min(full_buf.len());
-
-                scratch.accs[rule_id][variant.idx()].push(
-                    lo,
-                    hi,
-                    self.tuning.max_anchor_hits_per_rule_variant,
-                );
-                scratch.mark_touched(rule_id, variant);
-            }
-        }
-    }
-
     fn scan_rules_on_buffer(
         &self,
         buf: &[u8],
@@ -2083,11 +1979,7 @@ impl Engine {
         let merge_gap = self.tuning.merge_gap as u32;
         let pressure_gap_start = self.tuning.pressure_gap_start as u32;
 
-        // L1: prefilter + anchor scan.
-        //
-        // When the optional Vectorscan prefilter is enabled, we run a single
-        // `hs_scan` pass over raw bytes to seed candidate windows for raw rules.
-        // UTF-16 variants still rely on the anchor scanner.
+        // Stage 1: Vectorscan prefilter on raw bytes (best-effort).
         let mut used_vectorscan = false;
         let mut saw_nul = false;
 
@@ -2109,9 +2001,7 @@ impl Engine {
                     Err(_err) => {
                         #[cfg(feature = "stats")]
                         self.vs_stats.scans_err.fetch_add(1, Ordering::Relaxed);
-                        // If Vectorscan fails for any reason, roll back any partial
-                        // accumulator/touched state so the anchor path can run with
-                        // its usual sorted-window invariants.
+                        // Roll back partial accumulator state on error.
                         if scratch.touched_any {
                             scratch.touched_pairs.clear();
                             for pair in scratch.touched.iter_set() {
@@ -2133,6 +2023,15 @@ impl Engine {
             }
         }
 
+        if !used_vectorscan {
+            // Fallback: seed a full-buffer window for raw variants.
+            let max_hits = self.tuning.max_anchor_hits_per_rule_variant;
+            for rid in 0..self.rules.len() {
+                scratch.accs[rid][Variant::Raw.idx()].push(0, hay_len as usize, max_hits);
+                scratch.mark_touched(rid, Variant::Raw);
+            }
+        }
+
         // Decide whether we need the UTF-16 anchor scan.
         //
         // If Vectorscan ran, we avoid an extra full memchr pass by using the
@@ -2145,9 +2044,8 @@ impl Engine {
             };
 
         let mut used_vectorscan_utf16 = false;
-        let mut vs_utf16_ok = false;
 
-        if used_vectorscan && need_utf16_anchor_scan {
+        if need_utf16_anchor_scan {
             if let Some(vs_utf16) = self.vs_utf16.as_ref() {
                 if let Some(mut vs_scratch) = scratch.vs_utf16_scratch.take() {
                     #[cfg(feature = "stats")]
@@ -2159,7 +2057,6 @@ impl Engine {
                     used_vectorscan_utf16 = true;
                     match result {
                         Ok(()) => {
-                            vs_utf16_ok = true;
                             #[cfg(feature = "stats")]
                             self.vs_stats.utf16_scans_ok.fetch_add(1, Ordering::Relaxed);
                         }
@@ -2174,18 +2071,10 @@ impl Engine {
             }
         }
 
-        let do_anchor_scan = if !used_vectorscan {
-            true
-        } else if need_utf16_anchor_scan {
-            !vs_utf16_ok
-        } else {
-            false
-        };
-
         #[cfg(feature = "stats")]
         {
             if used_vectorscan {
-                if do_anchor_scan {
+                if used_vectorscan_utf16 {
                     self.vs_stats
                         .anchor_after_vs
                         .fetch_add(1, Ordering::Relaxed);
@@ -2197,84 +2086,13 @@ impl Engine {
             }
         }
 
-        // Anchor scan is required when Vectorscan isn't available, or when we
-        // need UTF-16 variant scanning and the UTF-16 Vectorscan path fails.
-        if do_anchor_scan {
-            // NUL-free buffers cannot match UTF-16 patterns, so we select a raw-only
-            // automaton in that case. Otherwise we scan a combined raw+UTF-16 index.
-            let anchors = if used_vectorscan {
-                // Raw anchors already ran via Vectorscan, so only scan UTF-16 anchors.
-                self.anchors.utf16_only()
-            } else {
-                self.anchors.select(buf, self.tuning.scan_utf16_variants)
-            };
-
-            // Prefilter selection is adaptive: we sample the head of the buffer
-            // and skip prefiltering when the candidate density is too high.
-            let mut scanned = false;
-            if let Some(prefilter) = anchors.prefilter.pick(buf) {
-                match prefilter.collect_windows(buf, &mut scratch.prefilter_windows) {
-                    PrefilterOutcome::NoCandidates => {
-                        // Sound early exit for anchor scanning. Only return early
-                        // if we also have no Vectorscan candidates.
-                        if !scratch.touched_any {
-                            return;
-                        }
-                        scanned = true;
-                    }
-                    PrefilterOutcome::Windows => {
-                        let win_len = scratch.prefilter_windows.len();
-                        for i in 0..win_len {
-                            let win = scratch.prefilter_windows[i];
-                            let start = win.start as usize;
-                            let end = win.end as usize;
-                            if start >= end || end > buf.len() {
-                                continue;
-                            }
-                            self.scan_anchor_matches(
-                                buf,
-                                &buf[start..end],
-                                start,
-                                &anchors.ac,
-                                &anchors.pat_targets,
-                                &anchors.pat_offsets,
-                                step_id,
-                                &root_hint,
-                                base_offset,
-                                file_id,
-                                scratch,
-                            );
-                        }
-                        scanned = true;
-                    }
-                    PrefilterOutcome::FullScan => {}
-                }
-            }
-
-            if !scanned {
-                self.scan_anchor_matches(
-                    buf,
-                    buf,
-                    0,
-                    &anchors.ac,
-                    &anchors.pat_targets,
-                    &anchors.pat_offsets,
-                    step_id,
-                    &root_hint,
-                    base_offset,
-                    file_id,
-                    scratch,
-                );
-            }
-        }
-
         if !scratch.touched_any {
             return;
         }
 
-        // Only process (rule, variant) pairs that were actually touched by an
-        // anchor hit in this buffer. This avoids O(rules * variants) work when
-        // nothing matched, which is critical once rule counts grow.
+        // Only process (rule, variant) pairs that were actually touched by a
+        // prefilter hit in this buffer. This avoids O(rules * variants) work
+        // when nothing matched, which is critical once rule counts grow.
         const VARIANTS: [Variant; 3] = [Variant::Raw, Variant::Utf16Le, Variant::Utf16Be];
         scratch.touched_pairs.clear();
         for pair in scratch.touched.iter_set() {
@@ -2312,7 +2130,7 @@ impl Engine {
                     .sort_unstable_by_key(|s| s.start);
             }
 
-            // Windows are pushed in non-decreasing order of anchor match positions.
+            // Windows are pushed in non-decreasing order of match positions.
             merge_ranges_with_gap_sorted(&mut scratch.windows, merge_gap);
             coalesce_under_pressure_sorted(
                 &mut scratch.windows,
@@ -2593,43 +2411,439 @@ impl Engine {
         }
     }
 
-    /// Decode into the slab while requiring at least one decoded-anchor hit.
-    ///
-    /// Returns the slab range only if decoding succeeds, stays within budgets,
-    /// and an anchor match is observed in the decoded stream. On failure or
-    /// no-hit, the slab is rolled back to its pre-call length.
-    ///
-    /// The gate prefers Vectorscan when available, falling back to the anchor
-    /// automaton on the decoded window.
-    fn decode_stream_gated_into_slab(
+    #[allow(clippy::too_many_arguments)]
+    fn run_rule_on_raw_window_into(
+        &self,
+        rule_id: u32,
+        rule: &RuleCompiled,
+        window: &[u8],
+        window_start: u64,
+        step_id: StepId,
+        root_hint: &Option<Range<usize>>,
+        base_offset: u64,
+        file_id: FileId,
+        scratch: &mut ScanScratch,
+        dropped: &mut usize,
+        found_any: &mut bool,
+    ) {
+        if let Some(needle) = rule.must_contain {
+            if memmem::find(window, needle).is_none() {
+                return;
+            }
+        }
+
+        if let Some(confirm) = &rule.confirm_all {
+            let vidx = Variant::Raw.idx();
+            if let Some(primary) = &confirm.primary[vidx] {
+                if memmem::find(window, primary).is_none() {
+                    return;
+                }
+            }
+            if !contains_all_memmem(window, &confirm.rest[vidx]) {
+                return;
+            }
+        }
+
+        if let Some(kws) = &rule.keywords {
+            if !contains_any_memmem(window, &kws.any[Variant::Raw.idx()]) {
+                return;
+            }
+        }
+
+        let max_findings = scratch.max_findings;
+        let out = &mut scratch.tmp_findings;
+        let entropy = rule.entropy;
+        for rm in rule.re.find_iter(window) {
+            if let Some(ent) = entropy {
+                let mbytes = &window[rm.start()..rm.end()];
+                if !entropy_gate_passes(
+                    &ent,
+                    mbytes,
+                    &mut scratch.entropy_scratch,
+                    &self.entropy_log2,
+                ) {
+                    continue;
+                }
+            }
+
+            *found_any = true;
+            let span_start = window_start.saturating_add(rm.start() as u64) as usize;
+            let span_end = window_start.saturating_add(rm.end() as u64) as usize;
+            let span_in_buf = span_start..span_end;
+            let root_span_hint = root_hint.clone().unwrap_or_else(|| span_in_buf.clone());
+
+            if out.len() < max_findings {
+                out.push(FindingRec {
+                    file_id,
+                    rule_id,
+                    span_start: span_in_buf.start as u32,
+                    span_end: span_in_buf.end as u32,
+                    root_hint_start: base_offset + root_span_hint.start as u64,
+                    root_hint_end: base_offset + root_span_hint.end as u64,
+                    step_id,
+                });
+            } else {
+                *dropped = dropped.saturating_add(1);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_rule_on_utf16_window_into(
+        &self,
+        rule_id: u32,
+        rule: &RuleCompiled,
+        variant: Variant,
+        raw_win: &[u8],
+        window_start: u64,
+        step_id: StepId,
+        root_hint: &Option<Range<usize>>,
+        base_offset: u64,
+        file_id: FileId,
+        scratch: &mut ScanScratch,
+        dropped: &mut usize,
+        found_any: &mut bool,
+    ) {
+        // Decode this window as UTF-16 and run the same validators on UTF-8 output.
+        let remaining = self
+            .tuning
+            .max_total_decode_output_bytes
+            .saturating_sub(scratch.total_decode_output_bytes);
+        if remaining == 0 {
+            return;
+        }
+
+        if let Some(confirm) = &rule.confirm_all {
+            let vidx = variant.idx();
+            if let Some(primary) = &confirm.primary[vidx] {
+                if memmem::find(raw_win, primary).is_none() {
+                    return;
+                }
+            }
+            if !contains_all_memmem(raw_win, &confirm.rest[vidx]) {
+                return;
+            }
+        }
+
+        if let Some(kws) = &rule.keywords {
+            let vidx = variant.idx();
+            if !contains_any_memmem(raw_win, &kws.any[vidx]) {
+                return;
+            }
+        }
+
+        let max_out = self
+            .tuning
+            .max_utf16_decoded_bytes_per_window
+            .min(remaining);
+
+        let decoded = match variant {
+            Variant::Utf16Le => decode_utf16le_to_buf(raw_win, max_out, &mut scratch.utf16_buf),
+            Variant::Utf16Be => decode_utf16be_to_buf(raw_win, max_out, &mut scratch.utf16_buf),
+            Variant::Raw => unreachable!("raw variant in utf16 path"),
+        };
+        if decoded.is_err() {
+            return;
+        }
+
+        let decoded = scratch.utf16_buf.as_slice();
+        if decoded.is_empty() {
+            return;
+        }
+
+        scratch.total_decode_output_bytes = scratch
+            .total_decode_output_bytes
+            .saturating_add(decoded.len());
+        if scratch.total_decode_output_bytes > self.tuning.max_total_decode_output_bytes {
+            return;
+        }
+
+        if let Some(needle) = rule.must_contain {
+            if memmem::find(decoded, needle).is_none() {
+                return;
+            }
+        }
+
+        let endianness = match variant {
+            Variant::Utf16Le => Utf16Endianness::Le,
+            Variant::Utf16Be => Utf16Endianness::Be,
+            Variant::Raw => unreachable!("raw variant in utf16 path"),
+        };
+        let parent_span =
+            window_start as usize..window_start.saturating_add(raw_win.len() as u64) as usize;
+        let utf16_step_id = scratch.step_arena.push(
+            step_id,
+            DecodeStep::Utf16Window {
+                endianness,
+                parent_span: parent_span.clone(),
+            },
+        );
+
+        let max_findings = scratch.max_findings;
+        let out = &mut scratch.tmp_findings;
+        let entropy = rule.entropy;
+        for rm in rule.re.find_iter(decoded) {
+            let span = rm.start()..rm.end();
+
+            if let Some(ent) = entropy {
+                let mbytes = &decoded[span.clone()];
+                if !entropy_gate_passes(
+                    &ent,
+                    mbytes,
+                    &mut scratch.entropy_scratch,
+                    &self.entropy_log2,
+                ) {
+                    continue;
+                }
+            }
+
+            *found_any = true;
+            let root_span_hint = root_hint.clone().unwrap_or_else(|| parent_span.clone());
+
+            if out.len() < max_findings {
+                out.push(FindingRec {
+                    file_id,
+                    rule_id,
+                    span_start: span.start as u32,
+                    span_end: span.end as u32,
+                    root_hint_start: base_offset + root_span_hint.start as u64,
+                    root_hint_end: base_offset + root_span_hint.end as u64,
+                    step_id: utf16_step_id,
+                });
+            } else {
+                *dropped = dropped.saturating_add(1);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_span_fallback(
         &self,
         tc: &TransformConfig,
-        encoded: &[u8],
-        max_out: usize,
+        transform_idx: usize,
+        enc: &[u8],
+        step_id: StepId,
+        root_hint: Option<Range<usize>>,
+        depth: usize,
+        base_offset: u64,
+        file_id: FileId,
         scratch: &mut ScanScratch,
-    ) -> Option<Range<usize>> {
-        if max_out == 0 {
-            return None;
+    ) {
+        if enc.len() < tc.min_len {
+            return;
         }
+
+        if tc.id == TransformId::Base64 && tc.gate == Gate::AnchorsInDecoded {
+            if let Some(gate) = &self.b64_gate {
+                if !gate.hits(enc) {
+                    return;
+                }
+            }
+        }
+
+        let remaining = self
+            .tuning
+            .max_total_decode_output_bytes
+            .saturating_sub(scratch.total_decode_output_bytes);
+        if remaining == 0 {
+            return;
+        }
+        let max_out = tc.max_decoded_bytes.min(remaining);
+
+        let decoded_range = match scratch.slab.append_stream_decode(
+            tc,
+            enc,
+            max_out,
+            &mut scratch.total_decode_output_bytes,
+            self.tuning.max_total_decode_output_bytes,
+        ) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+
+        let decoded = scratch.slab.slice(decoded_range.clone());
+        if decoded.is_empty() {
+            scratch.slab.buf.truncate(decoded_range.start);
+            return;
+        }
+
+        let h = hash128(decoded);
+        if !scratch.seen.insert(h) {
+            scratch.slab.buf.truncate(decoded_range.start);
+            return;
+        }
+
+        scratch.work_q.push(WorkItem::ScanBuf {
+            buf: BufRef::Slab(decoded_range),
+            step_id,
+            root_hint,
+            depth,
+        });
+        scratch.work_items_enqueued = scratch.work_items_enqueued.saturating_add(1);
+
+        let _ = (base_offset, file_id, transform_idx);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_stream_and_scan(
+        &self,
+        vs_stream: &VsStreamDb,
+        tc: &TransformConfig,
+        transform_idx: usize,
+        encoded: &[u8],
+        step_id: StepId,
+        root_hint: Option<Range<usize>>,
+        depth: usize,
+        base_offset: u64,
+        file_id: FileId,
+        scratch: &mut ScanScratch,
+    ) {
+        if encoded.is_empty() {
+            return;
+        }
+
+        let remaining = self
+            .tuning
+            .max_total_decode_output_bytes
+            .saturating_sub(scratch.total_decode_output_bytes);
+        if remaining == 0 {
+            return;
+        }
+        let max_out = tc.max_decoded_bytes.min(remaining);
+        if max_out == 0 {
+            return;
+        }
+
         #[cfg(feature = "b64-stats")]
-        let is_b64 = tc.id == TransformId::Base64;
+        let is_b64_gate = tc.id == TransformId::Base64 && tc.gate == Gate::AnchorsInDecoded;
 
-        // Keep enough bytes to detect anchors that straddle decode chunk boundaries.
-        let tail_keep = self.max_anchor_pat_len.saturating_sub(1);
-        scratch.gate.reset();
+        scratch.decode_ring.reset();
+        scratch.window_bytes.clear();
+        scratch.pending_windows.clear();
+        scratch.vs_stream_matches.clear();
+        scratch.pending_spans.clear();
+        scratch.span_streams.clear();
+        scratch.tmp_findings.clear();
 
-        let start_len = scratch.slab.buf.len();
         let mut local_out = 0usize;
         let mut truncated = false;
-        let mut hit = false;
+        let mut saw_gate_hit = false;
+        let mut found_any = false;
+        let mut local_dropped = 0usize;
 
-        // Decode once while checking for anchors. If no anchors appear in the decoded
-        // stream, the slab append is rolled back and the transform is skipped.
-        //
-        // We keep a small tail window so anchors that straddle decode chunk boundaries
-        // are still detected without re-decoding or buffering the entire output.
+        let slab_start = scratch.slab.buf.len();
+        let want_utf16_scan = self.tuning.scan_utf16_variants && self.has_utf16_anchors;
+        let decoded_full_start = slab_start;
+        let mut decoded_full_len = 0usize;
+        let mut decoded_has_nul = false;
+
+        let process_window = |win: PendingWindow,
+                              hi: u64,
+                              scratch: &mut ScanScratch,
+                              found_any: &mut bool,
+                              local_dropped: &mut usize| {
+            let lo = win.lo;
+            if hi <= lo {
+                return;
+            }
+            scratch.window_bytes.clear();
+            if !scratch
+                .decode_ring
+                .extend_range_to(lo, hi, &mut scratch.window_bytes)
+            {
+                return;
+            }
+            let (bytes_ptr, bytes_len) = {
+                let bytes = &scratch.window_bytes;
+                (bytes.as_ptr(), bytes.len())
+            };
+            // SAFETY: `bytes_ptr` comes from `scratch.window_bytes`. We materialize the slice
+            // from a raw pointer to avoid borrowing `scratch` across calls that mutate other
+            // scratch fields. `window_bytes` is not mutated until after this slice is consumed.
+            let bytes = unsafe { std::slice::from_raw_parts(bytes_ptr, bytes_len) };
+            let rule = &self.rules[win.rule_id as usize];
+            match win.variant {
+                Variant::Raw => {
+                    self.run_rule_on_raw_window_into(
+                        win.rule_id,
+                        rule,
+                        bytes,
+                        lo,
+                        step_id,
+                        &root_hint,
+                        base_offset,
+                        file_id,
+                        scratch,
+                        local_dropped,
+                        found_any,
+                    );
+                }
+                Variant::Utf16Le | Variant::Utf16Be => {
+                    self.run_rule_on_utf16_window_into(
+                        win.rule_id,
+                        rule,
+                        win.variant,
+                        bytes,
+                        lo,
+                        step_id,
+                        &root_hint,
+                        base_offset,
+                        file_id,
+                        scratch,
+                        local_dropped,
+                        found_any,
+                    );
+                }
+            }
+        };
+
+        if depth < self.tuning.max_transform_depth {
+            for (tidx, tcfg) in self.transforms.iter().enumerate() {
+                if tcfg.mode == TransformMode::Disabled {
+                    continue;
+                }
+                let state = match tcfg.id {
+                    TransformId::UrlPercent => SpanStreamState::Url(UrlSpanStream::new(tcfg)),
+                    TransformId::Base64 => SpanStreamState::Base64(Base64SpanStream::new(tcfg)),
+                };
+                scratch.span_streams.push(SpanStreamEntry {
+                    transform_idx: tidx,
+                    mode: tcfg.mode,
+                    state,
+                    spans_emitted: 0,
+                    max_spans: tcfg.max_spans_per_buffer,
+                });
+            }
+        }
+
+        let mut vs_scratch = match scratch.vs_stream_scratch.take() {
+            Some(s) => s,
+            None => match vs_stream.alloc_scratch() {
+                Ok(s) => s,
+                Err(_) => return,
+            },
+        };
+
+        let mut stream = match vs_stream.open_stream() {
+            Ok(s) => s,
+            Err(_) => {
+                scratch.vs_stream_scratch = Some(vs_scratch);
+                return;
+            }
+        };
+
+        let mut ctx = VsStreamMatchCtx {
+            pending: &mut scratch.vs_stream_matches as *mut Vec<VsStreamWindow>,
+            meta: vs_stream.meta().as_ptr(),
+            meta_len: vs_stream.meta().len() as u32,
+        };
+
+        let mut decoded_offset: u64 = 0;
+        let key = [0u8; 16];
+        let mut mac = aegis::aegis128l::Aegis128LMac::<16>::new(&key);
+
         #[cfg(feature = "b64-stats")]
-        if is_b64 {
+        if is_b64_gate {
             scratch.base64_stats.decode_attempts =
                 scratch.base64_stats.decode_attempts.saturating_add(1);
             scratch.base64_stats.decode_attempt_bytes = scratch
@@ -2651,50 +2865,233 @@ impl Engine {
                 truncated = true;
                 return ControlFlow::Break(());
             }
-            if scratch.slab.buf.len().saturating_add(chunk.len()) > scratch.slab.limit {
-                truncated = true;
-                return ControlFlow::Break(());
+
+            if want_utf16_scan {
+                if scratch.slab.buf.len().saturating_add(chunk.len()) > scratch.slab.limit {
+                    truncated = true;
+                    return ControlFlow::Break(());
+                }
+                scratch.slab.buf.extend_from_slice(chunk);
+                decoded_full_len = decoded_full_len.saturating_add(chunk.len());
+                if !decoded_has_nul && memchr(0, chunk).is_some() {
+                    decoded_has_nul = true;
+                }
             }
 
-            scratch.slab.buf.extend_from_slice(chunk);
             local_out = local_out.saturating_add(chunk.len());
             scratch.total_decode_output_bytes = scratch
                 .total_decode_output_bytes
                 .saturating_add(chunk.len());
 
-            // Sliding decoded window: tail (prev chunk) + current chunk.
-            scratch.gate.scratch.clear();
-            scratch
-                .gate
-                .scratch
-                .extend_from_slice(scratch.gate.tail.as_slice());
-            scratch.gate.scratch.extend_from_slice(chunk);
+            mac.update(chunk);
+            scratch.decode_ring.push(chunk);
 
-            if !hit {
-                let window = scratch.gate.scratch.as_slice();
-                let anchors = self.anchors.select(window, self.tuning.scan_utf16_variants);
-                if anchors.ac.is_match(window) {
-                    hit = true;
+            if vs_stream
+                .scan_stream(
+                    &mut stream,
+                    chunk,
+                    &mut vs_scratch,
+                    stream_match_callback(),
+                    (&mut ctx as *mut VsStreamMatchCtx).cast(),
+                )
+                .is_err()
+            {
+                truncated = true;
+                return ControlFlow::Break(());
+            }
+
+            if !scratch.vs_stream_matches.is_empty() {
+                saw_gate_hit = true;
+                for win in scratch.vs_stream_matches.drain(..) {
+                    scratch.pending_windows.push(PendingWindow {
+                        hi: win.hi,
+                        lo: win.lo,
+                        rule_id: win.rule_id,
+                        variant: Variant::Raw,
+                    });
                 }
             }
 
-            if tail_keep > 0 {
-                let scratch_len = scratch.gate.scratch.len();
-                let keep = tail_keep.min(scratch_len);
-                let start = scratch_len - keep;
-                scratch.gate.tail.clear();
-                scratch
-                    .gate
-                    .tail
-                    .extend_from_slice(&scratch.gate.scratch.as_slice()[start..]);
+            decoded_offset = decoded_offset.saturating_add(chunk.len() as u64);
+
+            loop {
+                let hi = match scratch.pending_windows.peek() {
+                    Some(top) if top.hi <= decoded_offset => top.hi,
+                    _ => break,
+                };
+                let win = scratch.pending_windows.pop().expect("pending window");
+                process_window(win, hi, scratch, &mut found_any, &mut local_dropped);
+            }
+
+            let chunk_start = decoded_offset.saturating_sub(chunk.len() as u64);
+            if depth < self.tuning.max_transform_depth {
+                for entry in scratch.span_streams.iter_mut() {
+                    if entry.spans_emitted >= entry.max_spans {
+                        continue;
+                    }
+                    let tcfg = &self.transforms[entry.transform_idx];
+                    let mut on_span = |lo: u64, hi: u64| -> bool {
+                        if entry.spans_emitted >= entry.max_spans {
+                            return false;
+                        }
+                        if scratch.work_items_enqueued + scratch.pending_spans.len()
+                            >= self.tuning.max_work_items
+                        {
+                            return false;
+                        }
+                        if hi <= lo {
+                            return true;
+                        }
+                        if !scratch.decode_ring.has_range(lo, hi) {
+                            return true;
+                        }
+
+                        let span_start = scratch.slab.buf.len();
+                        if !scratch
+                            .decode_ring
+                            .extend_range_to(lo, hi, &mut scratch.slab.buf)
+                        {
+                            scratch.slab.buf.truncate(span_start);
+                            return true;
+                        }
+                        let range = span_start..scratch.slab.buf.len();
+
+                        if tcfg.id == TransformId::Base64 && tcfg.gate == Gate::AnchorsInDecoded {
+                            if let Some(gate) = &self.b64_gate {
+                                if !gate.hits(&scratch.slab.buf[range.clone()]) {
+                                    scratch.slab.buf.truncate(span_start);
+                                    return true;
+                                }
+                            }
+                        }
+
+                        let parent_span = lo as usize..hi as usize;
+                        let child_step_id = scratch.step_arena.push(
+                            step_id,
+                            DecodeStep::Transform {
+                                transform_idx: entry.transform_idx,
+                                parent_span: parent_span.clone(),
+                            },
+                        );
+                        let child_root_hint = root_hint.clone().unwrap_or(parent_span);
+
+                        scratch.pending_spans.push(PendingDecodeSpan {
+                            transform_idx: entry.transform_idx,
+                            range,
+                            step_id: child_step_id,
+                            root_hint: Some(child_root_hint),
+                            depth: depth + 1,
+                        });
+                        entry.spans_emitted = entry.spans_emitted.saturating_add(1);
+                        true
+                    };
+
+                    match &mut entry.state {
+                        SpanStreamState::Url(state) => state.feed(chunk, chunk_start, &mut on_span),
+                        SpanStreamState::Base64(state) => {
+                            state.feed(chunk, chunk_start, &mut on_span)
+                        }
+                    }
+                }
             }
 
             ControlFlow::Continue(())
         });
 
+        let _ = vs_stream.close_stream(
+            stream,
+            &mut vs_scratch,
+            stream_match_callback(),
+            (&mut ctx as *mut VsStreamMatchCtx).cast(),
+        );
+        scratch.vs_stream_scratch = Some(vs_scratch);
+
+        if res.is_ok() {
+            if !scratch.vs_stream_matches.is_empty() {
+                saw_gate_hit = true;
+                for win in scratch.vs_stream_matches.drain(..) {
+                    scratch.pending_windows.push(PendingWindow {
+                        hi: win.hi,
+                        lo: win.lo,
+                        rule_id: win.rule_id,
+                        variant: Variant::Raw,
+                    });
+                }
+            }
+
+            for entry in scratch.span_streams.iter_mut() {
+                let end_offset = decoded_offset;
+                let mut on_span = |lo: u64, hi: u64| -> bool {
+                    if entry.spans_emitted >= entry.max_spans {
+                        return false;
+                    }
+                    if scratch.work_items_enqueued + scratch.pending_spans.len()
+                        >= self.tuning.max_work_items
+                    {
+                        return false;
+                    }
+                    if hi <= lo {
+                        return true;
+                    }
+                    if !scratch.decode_ring.has_range(lo, hi) {
+                        return true;
+                    }
+                    let span_start = scratch.slab.buf.len();
+                    if !scratch
+                        .decode_ring
+                        .extend_range_to(lo, hi, &mut scratch.slab.buf)
+                    {
+                        scratch.slab.buf.truncate(span_start);
+                        return true;
+                    }
+                    let range = span_start..scratch.slab.buf.len();
+                    let tcfg = &self.transforms[entry.transform_idx];
+                    if tcfg.id == TransformId::Base64 && tcfg.gate == Gate::AnchorsInDecoded {
+                        if let Some(gate) = &self.b64_gate {
+                            if !gate.hits(&scratch.slab.buf[range.clone()]) {
+                                scratch.slab.buf.truncate(span_start);
+                                return true;
+                            }
+                        }
+                    }
+                    let parent_span = lo as usize..hi as usize;
+                    let child_step_id = scratch.step_arena.push(
+                        step_id,
+                        DecodeStep::Transform {
+                            transform_idx: entry.transform_idx,
+                            parent_span: parent_span.clone(),
+                        },
+                    );
+                    let child_root_hint = root_hint.clone().unwrap_or(parent_span);
+                    scratch.pending_spans.push(PendingDecodeSpan {
+                        transform_idx: entry.transform_idx,
+                        range,
+                        step_id: child_step_id,
+                        root_hint: Some(child_root_hint),
+                        depth: depth + 1,
+                    });
+                    entry.spans_emitted = entry.spans_emitted.saturating_add(1);
+                    true
+                };
+
+                match &mut entry.state {
+                    SpanStreamState::Url(state) => state.finish(end_offset, &mut on_span),
+                    SpanStreamState::Base64(state) => state.finish(end_offset, &mut on_span),
+                }
+            }
+        }
+
+        if res.is_ok() {
+            let final_offset = decoded_offset;
+            while let Some(win) = scratch.pending_windows.pop() {
+                let hi = win.hi.min(final_offset);
+                process_window(win, hi, scratch, &mut found_any, &mut local_dropped);
+            }
+        }
+
         if res.is_err() || truncated || local_out == 0 || local_out > max_out {
             #[cfg(feature = "b64-stats")]
-            if is_b64 {
+            if is_b64_gate {
                 scratch.base64_stats.decode_errors =
                     scratch.base64_stats.decode_errors.saturating_add(1);
                 scratch.base64_stats.decoded_bytes_total = scratch
@@ -2706,13 +3103,198 @@ impl Engine {
                     .decoded_bytes_wasted_error
                     .saturating_add(local_out as u64);
             }
-            scratch.slab.buf.truncate(start_len);
-            return None;
+            scratch.slab.buf.truncate(slab_start);
+            return;
         }
 
-        if !hit {
+        if want_utf16_scan && decoded_has_nul && decoded_full_len > 0 {
+            if let Some(vs_utf16) = self.vs_utf16.as_ref() {
+                if let Some(mut vs_utf16_scratch) = scratch.vs_utf16_scratch.take() {
+                    #[cfg(feature = "stats")]
+                    self.vs_stats
+                        .utf16_scans_attempted
+                        .fetch_add(1, Ordering::Relaxed);
+
+                    scratch.touched.clear();
+                    scratch.touched_pairs.clear();
+                    scratch.touched_any = false;
+
+                    let decoded_end = decoded_full_start.saturating_add(decoded_full_len);
+                    let (decoded_ptr, decoded_len) = {
+                        let decoded = &scratch.slab.buf[decoded_full_start..decoded_end];
+                        (decoded.as_ptr(), decoded.len())
+                    };
+                    // SAFETY: `decoded_ptr` points to a slab range appended above. The slab does
+                    // not reallocate during this scan, and we do not mutate the slab while
+                    // `decoded` is in use.
+                    let decoded = unsafe { std::slice::from_raw_parts(decoded_ptr, decoded_len) };
+                    let result = vs_utf16.scan_utf16(decoded, scratch, &mut vs_utf16_scratch);
+                    scratch.vs_utf16_scratch = Some(vs_utf16_scratch);
+
+                    let used_vectorscan_utf16 = result.is_ok();
+                    match result {
+                        Ok(()) => {
+                            #[cfg(feature = "stats")]
+                            self.vs_stats
+                                .utf16_scans_ok
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(_) => {
+                            #[cfg(feature = "stats")]
+                            self.vs_stats
+                                .utf16_scans_err
+                                .fetch_add(1, Ordering::Relaxed);
+
+                            if scratch.touched_any {
+                                scratch.touched_pairs.clear();
+                                for pair in scratch.touched.iter_set() {
+                                    scratch.touched_pairs.push(pair as u32);
+                                }
+                                scratch.touched.clear();
+                                scratch.touched_any = false;
+                                let touched_len = scratch.touched_pairs.len();
+                                for i in 0..touched_len {
+                                    let pair = scratch.touched_pairs[i] as usize;
+                                    let rid = pair / 3;
+                                    let vidx = pair % 3;
+                                    scratch.accs[rid][vidx].reset();
+                                }
+                                scratch.touched_pairs.clear();
+                            }
+                            // Skip UTF-16 scan on error.
+                        }
+                    }
+
+                    if scratch.touched_any {
+                        const VARIANTS: [Variant; 3] =
+                            [Variant::Raw, Variant::Utf16Le, Variant::Utf16Be];
+                        scratch.touched_pairs.clear();
+                        for pair in scratch.touched.iter_set() {
+                            scratch.touched_pairs.push(pair as u32);
+                        }
+                        scratch.touched.clear();
+                        scratch.touched_any = false;
+                        let touched_len = scratch.touched_pairs.len();
+                        let hay_len = decoded_len as u32;
+                        let merge_gap = self.tuning.merge_gap as u32;
+                        let pressure_gap_start = self.tuning.pressure_gap_start as u32;
+
+                        for i in 0..touched_len {
+                            let pair = scratch.touched_pairs[i] as usize;
+                            let rid = pair / 3;
+                            let vidx = pair % 3;
+                            let variant = VARIANTS[vidx];
+                            if variant == Variant::Raw {
+                                continue;
+                            }
+                            let rule = &self.rules[rid];
+
+                            {
+                                let acc = &mut scratch.accs[rid][vidx];
+                                acc.take_into(&mut scratch.windows);
+                            }
+                            if scratch.windows.is_empty() {
+                                continue;
+                            }
+
+                            if used_vectorscan_utf16 && scratch.windows.len() > 1 {
+                                scratch
+                                    .windows
+                                    .as_mut_slice()
+                                    .sort_unstable_by_key(|s| s.start);
+                            }
+
+                            merge_ranges_with_gap_sorted(&mut scratch.windows, merge_gap);
+                            coalesce_under_pressure_sorted(
+                                &mut scratch.windows,
+                                hay_len,
+                                pressure_gap_start,
+                                self.tuning.max_windows_per_rule_variant,
+                            );
+
+                            if let Some(tp) = &rule.two_phase {
+                                let seed_radius_bytes = tp.seed_radius.saturating_mul(variant.scale());
+                                let full_radius_bytes = tp.full_radius.saturating_mul(variant.scale());
+                                let extra = full_radius_bytes.saturating_sub(seed_radius_bytes);
+
+                                scratch.expanded.clear();
+                                let windows_len = scratch.windows.len();
+                                for i in 0..windows_len {
+                                    let seed = scratch.windows[i];
+                                    let seed_range = seed.to_range();
+                                    let win = &decoded[seed_range.clone()];
+                                    if !contains_any_memmem(win, &tp.confirm[vidx]) {
+                                        continue;
+                                    }
+
+                                    let lo = seed_range.start.saturating_sub(extra);
+                                    let hi = (seed_range.end + extra).min(decoded.len());
+                                    scratch.expanded.push(SpanU32::new(lo, hi));
+                                }
+
+                                if scratch.expanded.is_empty() {
+                                    continue;
+                                }
+
+                                merge_ranges_with_gap_sorted(&mut scratch.expanded, merge_gap);
+                                coalesce_under_pressure_sorted(
+                                    &mut scratch.expanded,
+                                    hay_len,
+                                    pressure_gap_start,
+                                    self.tuning.max_windows_per_rule_variant,
+                                );
+
+                                let expanded_len = scratch.expanded.len();
+                                for i in 0..expanded_len {
+                                    let w = scratch.expanded[i].to_range();
+                                    let win = &decoded[w.clone()];
+                                    self.run_rule_on_utf16_window_into(
+                                        rid as u32,
+                                        rule,
+                                        variant,
+                                        win,
+                                        w.start as u64,
+                                        step_id,
+                                        &root_hint,
+                                        base_offset,
+                                        file_id,
+                                        scratch,
+                                        &mut local_dropped,
+                                        &mut found_any,
+                                    );
+                                }
+                            } else {
+                                let win_len = scratch.windows.len();
+                                for i in 0..win_len {
+                                    let w = scratch.windows[i].to_range();
+                                    let win = &decoded[w.clone()];
+                                    self.run_rule_on_utf16_window_into(
+                                        rid as u32,
+                                        rule,
+                                        variant,
+                                        win,
+                                        w.start as u64,
+                                        step_id,
+                                        &root_hint,
+                                        base_offset,
+                                        file_id,
+                                        scratch,
+                                        &mut local_dropped,
+                                        &mut found_any,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let enforce_gate = tc.gate == Gate::AnchorsInDecoded
+            && (!self.tuning.scan_utf16_variants || !self.has_utf16_anchors);
+        if enforce_gate && !saw_gate_hit {
             #[cfg(feature = "b64-stats")]
-            if is_b64 {
+            if is_b64_gate {
                 scratch.base64_stats.decoded_bytes_total = scratch
                     .base64_stats
                     .decoded_bytes_total
@@ -2722,12 +3304,12 @@ impl Engine {
                     .decoded_bytes_wasted_no_anchor
                     .saturating_add(local_out as u64);
             }
-            scratch.slab.buf.truncate(start_len);
-            return None;
+            scratch.slab.buf.truncate(slab_start);
+            return;
         }
 
         #[cfg(feature = "b64-stats")]
-        if is_b64 {
+        if is_b64_gate {
             scratch.base64_stats.decoded_bytes_total = scratch
                 .base64_stats
                 .decoded_bytes_total
@@ -2738,8 +3320,47 @@ impl Engine {
                 .saturating_add(local_out as u64);
         }
 
-        Some(start_len..(start_len + local_out))
+        let h = u128::from_le_bytes(mac.finalize());
+        if !scratch.seen.insert(h) {
+            scratch.slab.buf.truncate(slab_start);
+            return;
+        }
+
+        if local_dropped > 0 {
+            scratch.findings_dropped =
+                scratch.findings_dropped.saturating_add(local_dropped);
+        }
+        let mut tmp_findings = std::mem::take(&mut scratch.tmp_findings);
+        for rec in tmp_findings.drain(..) {
+            scratch.push_finding(rec);
+        }
+        scratch.tmp_findings = tmp_findings;
+
+        let found_any_in_buf = found_any;
+        let mut enqueued = 0usize;
+        for pending in scratch.pending_spans.drain(..) {
+            let mode = self.transforms[pending.transform_idx].mode;
+            if mode == TransformMode::IfNoFindingsInThisBuffer && found_any_in_buf {
+                continue;
+            }
+            if scratch.work_items_enqueued >= self.tuning.max_work_items {
+                break;
+            }
+            scratch.work_q.push(WorkItem::DecodeSpan {
+                transform_idx: pending.transform_idx,
+                enc_ref: EncRef::Slab(pending.range),
+                step_id: pending.step_id,
+                root_hint: pending.root_hint,
+                depth: pending.depth,
+            });
+            scratch.work_items_enqueued += 1;
+            enqueued += 1;
+        }
+
+        let _ = enqueued;
+        let _ = (transform_idx, base_offset, file_id);
     }
+
 }
 // --------------------------
 // Compile helpers
@@ -2890,9 +3511,6 @@ pub use self::validator::{
 
 #[cfg(feature = "bench")]
 impl Engine {
-    pub fn bench_ac_anchors(&self) -> &AhoCorasick {
-        &self.anchors.raw.ac
-    }
 }
 
 #[cfg(test)]

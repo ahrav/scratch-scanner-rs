@@ -55,6 +55,39 @@ pub(crate) struct VsPrefilterDb {
     max_hits_per_rule_variant: usize,
     nul_sentinel_id: u32,
     has_nul_sentinel: bool,
+    max_width: u32,
+    unbounded: bool,
+}
+
+/// Per-rule metadata for stream-mode window seeding.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct VsStreamMeta {
+    pub(crate) max_width: u32,
+    pub(crate) radius: u32,
+}
+
+/// Compiled Vectorscan database for stream-mode scanning.
+///
+/// This is used for decoded-stream prefiltering; matches are converted into
+/// candidate windows in the caller.
+pub(crate) struct VsStreamDb {
+    db: *mut vs::hs_database_t,
+    meta: Vec<VsStreamMeta>,
+}
+
+// Safe because hs_database_t is immutable after compilation, and we require per-thread scratch.
+unsafe impl Send for VsStreamDb {}
+unsafe impl Sync for VsStreamDb {}
+
+impl Drop for VsStreamDb {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.db.is_null() {
+                vs::hs_free_database(self.db);
+            }
+        }
+    }
 }
 
 // Safe because hs_database_t is immutable after compilation, and we require per-thread scratch.
@@ -86,6 +119,230 @@ impl VsScratch {
     pub(crate) fn bound_db_ptr(&self) -> *mut vs::hs_database_t {
         self.db
     }
+}
+
+/// Opaque stream handle for stream-mode scanning.
+pub(crate) struct VsStream {
+    stream: *mut vs::hs_stream_t,
+}
+
+impl VsStreamDb {
+    /// Build a stream-mode database for decoded-byte scanning.
+    pub(crate) fn try_new_stream(
+        rules: &[RuleSpec],
+        max_decoded_cap: usize,
+    ) -> Result<Self, String> {
+        let mut c_patterns: Vec<CString> = Vec::with_capacity(rules.len());
+        let mut expr_ptrs: Vec<*const c_char> = Vec::with_capacity(rules.len());
+        let mut flags: Vec<c_uint> = Vec::with_capacity(rules.len());
+        let mut ids: Vec<c_uint> = Vec::with_capacity(rules.len());
+        let mut meta: Vec<VsStreamMeta> = Vec::with_capacity(rules.len());
+
+        for (rid, r) in rules.iter().enumerate() {
+            let radius = if let Some(tp) = &r.two_phase {
+                tp.full_radius
+            } else {
+                r.radius
+            };
+
+            let radius_u32 = usize_to_u32_saturating(radius);
+            let (mut max_width_u32, c_pat) = expression_info_prefilter_max_width(r.re.as_str())?;
+            if max_width_u32 == 0 {
+                max_width_u32 = u32::MAX;
+            }
+            if max_width_u32 == u32::MAX {
+                let cap = usize_to_u32_saturating(max_decoded_cap);
+                if cap > 0 {
+                    max_width_u32 = cap;
+                }
+            }
+
+            meta.push(VsStreamMeta {
+                max_width: max_width_u32,
+                radius: radius_u32,
+            });
+
+            c_patterns.push(c_pat);
+            expr_ptrs.push(c_patterns.last().unwrap().as_ptr());
+            flags.push(vs::HS_FLAG_PREFILTER as c_uint);
+            ids.push(rid as c_uint);
+        }
+
+        let mut platform = MaybeUninit::<vs::hs_platform_info_t>::zeroed();
+        unsafe {
+            let _ = vs::hs_populate_platform(platform.as_mut_ptr());
+        }
+        let platform = unsafe { platform.assume_init() };
+
+        let mut db: *mut vs::hs_database_t = ptr::null_mut();
+        let mut compile_err: *mut vs::hs_compile_error_t = ptr::null_mut();
+        let rc = unsafe {
+            vs::hs_compile_multi(
+                expr_ptrs.as_ptr(),
+                flags.as_ptr(),
+                ids.as_ptr(),
+                expr_ptrs.len() as c_uint,
+                vs::HS_MODE_STREAM as c_uint,
+                &platform as *const vs::hs_platform_info_t,
+                &mut db as *mut *mut vs::hs_database_t,
+                &mut compile_err as *mut *mut vs::hs_compile_error_t,
+            )
+        };
+
+        if rc != vs::HS_SUCCESS as c_int {
+            let msg = unsafe {
+                if compile_err.is_null() {
+                    "hs_compile_multi failed (no error message)".to_string()
+                } else {
+                    let s = if (*compile_err).message.is_null() {
+                        "hs_compile_multi failed (null error message)".to_string()
+                    } else {
+                        let cstr = std::ffi::CStr::from_ptr((*compile_err).message);
+                        format!(
+                            "hs_compile_multi failed at expression {}: {}",
+                            (*compile_err).expression,
+                            cstr.to_string_lossy()
+                        )
+                    };
+                    vs::hs_free_compile_error(compile_err);
+                    s
+                }
+            };
+            return Err(msg);
+        }
+
+        Ok(Self { db, meta })
+    }
+
+    /// Allocates a new scratch space bound to this database.
+    pub(crate) fn alloc_scratch(&self) -> Result<VsScratch, String> {
+        let mut scratch: *mut vs::hs_scratch_t = ptr::null_mut();
+        let rc =
+            unsafe { vs::hs_alloc_scratch(self.db, &mut scratch as *mut *mut vs::hs_scratch_t) };
+        if rc != vs::HS_SUCCESS as c_int {
+            return Err(format!("hs_alloc_scratch failed: rc={rc}"));
+        }
+        Ok(VsScratch {
+            scratch,
+            db: self.db,
+        })
+    }
+
+    #[inline]
+    pub(crate) fn meta(&self) -> &[VsStreamMeta] {
+        &self.meta
+    }
+
+    /// Returns the raw database pointer for scratch binding checks.
+    #[inline]
+    pub(crate) fn db_ptr(&self) -> *mut vs::hs_database_t {
+        self.db
+    }
+
+    pub(crate) fn open_stream(&self) -> Result<VsStream, String> {
+        let mut stream: *mut vs::hs_stream_t = ptr::null_mut();
+        let rc = unsafe { vs::hs_open_stream(self.db, 0, &mut stream) };
+        if rc != vs::HS_SUCCESS as c_int {
+            return Err(format!("hs_open_stream failed: rc={rc}"));
+        }
+        Ok(VsStream { stream })
+    }
+
+    pub(crate) fn scan_stream(
+        &self,
+        stream: &mut VsStream,
+        data: &[u8],
+        scratch: &mut VsScratch,
+        on_event: vs::match_event_handler,
+        ctx: *mut c_void,
+    ) -> Result<(), String> {
+        let len_u32: c_uint = data
+            .len()
+            .try_into()
+            .map_err(|_| format!("buffer too large for hs_scan_stream: {} bytes", data.len()))?;
+        let rc = unsafe {
+            vs::hs_scan_stream(
+                stream.stream,
+                data.as_ptr().cast::<c_char>(),
+                len_u32,
+                0,
+                scratch.scratch,
+                on_event,
+                ctx,
+            )
+        };
+        if rc == vs::HS_SUCCESS as c_int || rc == vs::HS_SCAN_TERMINATED as c_int {
+            Ok(())
+        } else {
+            Err(format!("hs_scan_stream failed: rc={rc}"))
+        }
+    }
+
+    pub(crate) fn close_stream(
+        &self,
+        stream: VsStream,
+        scratch: &mut VsScratch,
+        on_event: vs::match_event_handler,
+        ctx: *mut c_void,
+    ) -> Result<(), String> {
+        let rc = unsafe { vs::hs_close_stream(stream.stream, scratch.scratch, on_event, ctx) };
+        if rc == vs::HS_SUCCESS as c_int {
+            Ok(())
+        } else {
+            Err(format!("hs_close_stream failed: rc={rc}"))
+        }
+    }
+}
+
+/// Stream match event used by decoded-byte scanning.
+#[repr(C)]
+pub(crate) struct VsStreamWindow {
+    pub(crate) rule_id: u32,
+    pub(crate) lo: u64,
+    pub(crate) hi: u64,
+}
+
+#[repr(C)]
+pub(crate) struct VsStreamMatchCtx {
+    pub(crate) pending: *mut Vec<VsStreamWindow>,
+    pub(crate) meta: *const VsStreamMeta,
+    pub(crate) meta_len: u32,
+}
+
+/// Stream-mode match callback. Pushes window seeds into `pending`.
+///
+/// Safety: must not panic or unwind across the FFI boundary.
+unsafe extern "C" fn vs_on_stream_match(
+    id: c_uint,
+    _from: u64,
+    to: u64,
+    _flags: c_uint,
+    ctx: *mut c_void,
+) -> c_int {
+    if ctx.is_null() {
+        return 0;
+    }
+    let c = &mut *(ctx as *mut VsStreamMatchCtx);
+    if id >= c.meta_len {
+        return 0;
+    }
+    let meta = *c.meta.add(id as usize);
+    let max_width = meta.max_width as u64;
+    let radius = meta.radius as u64;
+    let lo = to.saturating_sub(max_width.saturating_add(radius));
+    let hi = to.saturating_add(radius);
+
+    let pending = &mut *c.pending;
+    pending.push(VsStreamWindow {
+        rule_id: id,
+        lo,
+        hi,
+    });
+    0
+}
+
+pub(crate) fn stream_match_callback() -> vs::match_event_handler {
+    Some(vs_on_stream_match)
 }
 
 #[repr(C)]
@@ -358,6 +615,8 @@ impl VsPrefilterDb {
         let mut flags: Vec<c_uint> = Vec::with_capacity(rules.len().saturating_add(1));
         let mut ids: Vec<c_uint> = Vec::with_capacity(rules.len().saturating_add(1));
         let mut meta: Vec<VsRuleMeta> = Vec::with_capacity(rules.len());
+        let mut max_width = 0u32;
+        let mut unbounded = false;
 
         for (rid, r) in rules.iter().enumerate() {
             let seed_radius = if let Some(tp) = &r.two_phase {
@@ -367,7 +626,14 @@ impl VsPrefilterDb {
             };
 
             let seed_u32 = usize_to_u32_saturating(seed_radius);
-            let (max_width_u32, c_pat) = expression_info_prefilter_max_width(r.re.as_str())?;
+            let (mut max_width_u32, c_pat) = expression_info_prefilter_max_width(r.re.as_str())?;
+            if max_width_u32 == 0 {
+                max_width_u32 = u32::MAX;
+            }
+            if max_width_u32 == u32::MAX {
+                unbounded = true;
+            }
+            max_width = max_width.max(max_width_u32);
 
             // Whole-buffer on hit:
             // - Unbounded max width (or effectively unbounded for our u32 buffers).
@@ -463,7 +729,18 @@ impl VsPrefilterDb {
             max_hits_per_rule_variant: tuning.max_anchor_hits_per_rule_variant,
             nul_sentinel_id,
             has_nul_sentinel,
+            max_width,
+            unbounded,
         })
+    }
+
+    /// Returns the maximum bounded match width across all rules.
+    pub(crate) fn max_match_width_bounded(&self) -> Option<u32> {
+        if self.unbounded {
+            None
+        } else {
+            Some(self.max_width)
+        }
     }
 
     /// Allocates a new scratch space bound to this database.

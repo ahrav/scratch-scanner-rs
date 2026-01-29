@@ -35,6 +35,16 @@
 //! 4. Convert the final `Info` into anchors, enforcing minimum length and
 //!    rejecting patterns that can match the empty string.
 //!
+//! # Limitations and trade-offs
+//!
+//! - This module never guesses: if it cannot *prove* a required substring, it
+//!   returns an error or an unfilterable plan rather than risk false negatives.
+//! - Look-around assertions are treated as zero-width for anchor derivation.
+//!   Only ASCII word boundaries are used by residue gates.
+//! - Character classes are expanded only when small and ASCII/byte-only.
+//!   Large or non-ASCII classes are treated as "match anything" for anchors.
+//! - Repetitions that can match empty drop required substrings entirely.
+//!
 //! # Why HIR (and what it gives us)
 //!
 //! The HIR produced by `regex-syntax` already accounts for flags, case folding,
@@ -132,7 +142,7 @@ pub enum Prefilter {
 /// Output of regex prefilter compilation for a single rule.
 ///
 /// Exactly one of:
-/// - `Anchored`: participates in Pass 1 Aho-Corasick (sound OR set).
+/// - `Anchored`: participates in Pass 1 prefiltering (sound OR set).
 /// - `Residue`: participates in Pass 2 specialized gating.
 /// - `Unfilterable`: cannot be safely gated (reject or slow-path).
 ///
@@ -175,6 +185,7 @@ pub enum UnfilterableReason {
 #[derive(Debug, Clone)]
 pub enum ResidueGatePlan {
     /// Fast linear scan for a run of a byteclass of length [min,max].
+    /// Only sound for patterns that reduce to a single consuming atom.
     RunLength(RunLengthGate),
     /// Enumerated, bounded k-grams. (Not yet derived by this module.)
     KGrams(KGramGate),
@@ -186,7 +197,11 @@ pub enum ResidueGatePlan {
 #[derive(Debug, Clone, Copy)]
 pub enum Boundary {
     None,
-    AsciiWord, // \b under ASCII definition [A-Za-z0-9_]
+    /// \b under ASCII definition [A-Za-z0-9_].
+    ///
+    /// This is only used when both leading and trailing word boundaries are
+    /// present. A single-sided boundary is ignored to avoid false negatives.
+    AsciiWord,
 }
 
 /// Run-length gate spec (ASCII byte-oriented).
@@ -194,6 +209,7 @@ pub enum Boundary {
 /// # Semantics
 /// - The gate scans for runs of bytes contained in `byte_mask`.
 /// - Boundaries are ASCII-only and applied around the run when requested.
+/// - `boundary = AsciiWord` means require word boundaries on both sides.
 #[derive(Debug, Clone)]
 pub struct RunLengthGate {
     /// 256-bit membership mask for bytes allowed in the run.
@@ -425,6 +441,8 @@ fn literal_byte_to_mask(bytes: &[u8]) -> Option<[u64; 4]> {
 /// This is the core operation for concatenation and repetition. We cap both
 /// the total number of strings and the length of each string to avoid
 /// combinatorial blowups.
+///
+/// Complexity is O(|A| * |B|) strings plus concatenation cost.
 ///
 /// # Returns
 /// - `Some(product)` when within size/length limits.
@@ -895,6 +913,9 @@ fn is_ascii_word_boundary(look: Look) -> bool {
 /// - Alternation becomes OR of per-branch gates.
 /// - Otherwise attempt a run-length gate.
 ///
+/// This is intentionally narrow: residue gates only cover a small subset of
+/// patterns, and always remain conservative.
+///
 /// # Returns
 /// - `Some(gate)` when a conservative gate can be derived.
 /// - `None` when no sound residue gate exists.
@@ -921,6 +942,7 @@ fn derive_residue_gate_plan(hir: &Hir) -> Option<ResidueGatePlan> {
 ///
 /// Only matches a single consuming atom (literal/class or fixed repetition),
 /// optionally wrapped by ASCII word boundaries and captures.
+/// Any single-sided boundary is ignored to avoid false negatives.
 ///
 /// # Returns
 /// - `Some(gate)` for ASCII-only, fixed-shape patterns.
@@ -974,6 +996,7 @@ fn derive_run_length_gate(hir: &Hir) -> Option<RunLengthGate> {
 ///
 /// Leading/trailing lookarounds and empties are ignored; if more than one
 /// consuming element remains, the run-length gate cannot represent it.
+/// A single boundary is intentionally dropped (only both sides are honored).
 ///
 /// # Returns
 /// - `(boundary, core)` when exactly one consuming element remains.
@@ -1379,6 +1402,9 @@ fn collect_confirm_all_literals(hir: &Hir, cfg: &AnchorDeriveConfig) -> Vec<Vec<
 ///
 /// # Soundness
 /// - Patterns that can match the empty string are always unfilterable.
+///
+/// # Errors
+/// - `InvalidPattern` when the regex fails to parse.
 pub fn compile_trigger_plan(
     pattern: &str,
     cfg: &AnchorDeriveConfig,
@@ -1442,6 +1468,14 @@ pub fn compile_trigger_plan(
 /// # Returns
 /// - A vector of anchor byte strings; any match must contain at least one.
 ///
+/// # Examples
+/// ```rust
+/// # use crate::regex2anchor::{AnchorDeriveConfig, derive_anchors_from_pattern};
+/// let cfg = AnchorDeriveConfig::default();
+/// let anchors = derive_anchors_from_pattern("foo[0-9]+bar", &cfg).unwrap();
+/// assert!(anchors.contains(&b"foo".to_vec()) || anchors.contains(&b"bar".to_vec()));
+/// ```
+///
 /// # Soundness
 /// - Returns an error rather than guessing when a sound anchor set is impossible.
 ///
@@ -1471,6 +1505,14 @@ pub fn derive_anchors_from_pattern(
 /// This uses `from_utf8_lossy` and is therefore **not** a safe representation
 /// for arbitrary byte patterns. Use `derive_anchors_from_pattern` if you care
 /// about raw bytes.
+///
+/// # Examples
+/// ```rust
+/// # use crate::regex2anchor::{AnchorDeriveConfig, derive_anchors_as_strings};
+/// let cfg = AnchorDeriveConfig::default();
+/// let anchors = derive_anchors_as_strings("api[_-]?key", &cfg).unwrap();
+/// assert!(anchors.iter().any(|s| s.contains("api")));
+/// ```
 pub fn derive_anchors_as_strings(
     pattern: &str,
     cfg: &AnchorDeriveConfig,

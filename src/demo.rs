@@ -89,8 +89,5 @@ pub(crate) fn demo_tuning() -> Tuning {
         max_work_items: 256,
         max_findings_per_chunk: 8192,
         scan_utf16_variants: true,
-        ac_kind: crate::api::AnchorAcKind::DFA,
-        ac_dense_depth: None,
-        ac_byte_classes: None,
     }
 }

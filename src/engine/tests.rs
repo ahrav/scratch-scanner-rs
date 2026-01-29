@@ -17,6 +17,69 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::vectorscan_prefilter::{stream_match_callback, VsStreamMatchCtx, VsStreamWindow};
+
+fn decoded_prefilter_hit(engine: &Engine, decoded: &[u8]) -> bool {
+    let Some(vs_stream) = engine.vs_stream.as_ref() else {
+        return true;
+    };
+
+    let mut scratch = match vs_stream.alloc_scratch() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let mut stream = match vs_stream.open_stream() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    let mut pending: Vec<VsStreamWindow> = Vec::new();
+    let mut ctx = VsStreamMatchCtx {
+        pending: &mut pending as *mut Vec<VsStreamWindow>,
+        meta: vs_stream.meta().as_ptr(),
+        meta_len: vs_stream.meta().len() as u32,
+    };
+    let cb = stream_match_callback();
+
+    if vs_stream
+        .scan_stream(
+            &mut stream,
+            decoded,
+            &mut scratch,
+            cb,
+            (&mut ctx as *mut VsStreamMatchCtx).cast(),
+        )
+        .is_err()
+    {
+        let _ = vs_stream.close_stream(
+            stream,
+            &mut scratch,
+            cb,
+            (&mut ctx as *mut VsStreamMatchCtx).cast(),
+        );
+        return false;
+    }
+    let mut hit = !pending.is_empty();
+    pending.clear();
+
+    if vs_stream
+        .close_stream(
+            stream,
+            &mut scratch,
+            cb,
+            (&mut ctx as *mut VsStreamMatchCtx).cast(),
+        )
+        .is_err()
+    {
+        return false;
+    }
+    if !pending.is_empty() {
+        hit = true;
+    }
+
+    hit
+}
+
 // Helper that uses the allocation-free scan API and materializes findings.
 fn scan_chunk_findings(engine: &Engine, hay: &[u8]) -> Vec<Finding> {
     let mut scratch = engine.new_scratch();
@@ -569,6 +632,14 @@ fn reference_scan_keys(engine: &Engine, rules: &[RuleSpec], buf: &[u8]) -> HashS
                 let enc_span = enc_span.clone();
                 let enc = &item.buf[enc_span.clone()];
 
+                if tc.id == TransformId::Base64 && tc.gate == Gate::AnchorsInDecoded {
+                    if let Some(gate) = &engine.b64_gate {
+                        if !gate.hits(enc) {
+                            continue;
+                        }
+                    }
+                }
+
                 let remaining = engine
                     .tuning
                     .max_total_decode_output_bytes
@@ -592,10 +663,9 @@ fn reference_scan_keys(engine: &Engine, rules: &[RuleSpec], buf: &[u8]) -> HashS
                 }
 
                 if tc.gate == Gate::AnchorsInDecoded {
-                    let anchors = engine
-                        .anchors
-                        .select(&decoded, engine.tuning.scan_utf16_variants);
-                    if !anchors.ac.is_match(&decoded) {
+                    let enforce_gate = !engine.tuning.scan_utf16_variants
+                        || !engine.has_utf16_anchors;
+                    if enforce_gate && !decoded_prefilter_hit(engine, &decoded) {
                         continue;
                     }
                 }
@@ -1426,7 +1496,10 @@ fn utf16_overlap_accounts_for_scaled_radius() {
         .saturating_mul(2)
         .saturating_add(anchor_len_utf16)
         .saturating_sub(1);
-    let expected_overlap = anchor_len_utf16 + radius.saturating_mul(4) - 1;
+    let expected_overlap = engine
+        .max_prefilter_width
+        .saturating_add(radius.saturating_mul(4))
+        .saturating_sub(1);
 
     assert_eq!(engine.required_overlap(), expected_overlap);
     assert!(old_overlap < engine.required_overlap());
