@@ -13,6 +13,12 @@
 //!   error to keep allocations predictable.
 //! - `Chunk::base_offset` always refers to the start of the chunk including
 //!   overlap, which keeps span reporting consistent across boundaries.
+//!
+//! # Concurrency
+//! The types in this module are not thread-safe. `BufferPool` and
+//! `ScannerRuntime` are `Rc`-backed and assume single-threaded access. If the
+//! pipeline becomes multi-threaded, use per-thread runtimes or a synchronized
+//! buffer pool.
 
 use crate::api::{FileId, Finding};
 use crate::engine::{Engine, ScanScratch};
@@ -46,6 +52,10 @@ pub const FILE_FLAG_SKIPPED: u32 = 1 << 1;
 /// after startup. The arena never grows; capacity overruns are treated as
 /// configuration bugs and will panic.
 ///
+/// `FileId` values are stable indices into the current table. The table is
+/// append-only between calls to [`clear`](Self::clear); clearing invalidates
+/// all prior `FileId`s and any `Path`/`PathSpan` references.
+///
 /// On Unix, [`FileTable::path`] returns a `Path` backed by the arena. Those
 /// borrows are only valid until the table is cleared for the next scan.
 pub struct FileTable {
@@ -72,6 +82,10 @@ impl FileTable {
     /// `path_bytes_cap` is the total byte budget for the Unix path arena; it is
     /// ignored on non-Unix platforms. The arena stores raw bytes (not
     /// NUL-terminated) and must fit within `u32::MAX`.
+    ///
+    /// # Panics
+    /// Panics if `path_bytes_cap` exceeds `u32::MAX`, or if allocating the Unix
+    /// path arena fails.
     pub fn with_capacity_and_path_bytes(cap: usize, path_bytes_cap: usize) -> Self {
         #[cfg(unix)]
         {
@@ -102,6 +116,13 @@ impl FileTable {
     }
 
     /// Inserts a new file record and returns its [`FileId`].
+    ///
+    /// On Unix, the path bytes are appended to the internal arena; on non-Unix
+    /// platforms the `PathBuf` is stored directly.
+    ///
+    /// # Panics
+    /// Panics if the table capacity is exceeded or if the Unix path arena would
+    /// overflow.
     pub fn push(&mut self, path: PathBuf, size: u64, dev_inode: (u64, u64), flags: u32) -> FileId {
         #[cfg(unix)]
         {
@@ -126,6 +147,10 @@ impl FileTable {
     }
 
     /// Inserts a new file record from raw path bytes (Unix only).
+    ///
+    /// # Panics
+    /// Panics if the path arena would overflow or if table capacity is
+    /// exceeded.
     #[cfg(unix)]
     pub(crate) fn push_path_bytes(
         &mut self,
@@ -143,6 +168,10 @@ impl FileTable {
     /// Bytes are appended verbatim to the arena (no separators inserted).
     /// Panics if the arena would overflow; callers should pre-size
     /// `path_bytes_cap` for worst-case scans.
+    ///
+    /// # Panics
+    /// Panics if the arena would overflow or if the resulting span would not
+    /// fit in `u32`.
     #[cfg(unix)]
     pub(crate) fn alloc_path_span(&mut self, bytes: &[u8]) -> PathSpan {
         let start = self.path_bytes.len();
@@ -164,6 +193,10 @@ impl FileTable {
     /// This mirrors `Path::join` without normalization: it inserts a `/` only
     /// when `parent` is non-empty and does not already end with `/`.
     /// Panics if the arena would overflow.
+    ///
+    /// # Panics
+    /// Panics if `parent` does not refer to bytes inside this arena or if the
+    /// arena would overflow.
     #[cfg(unix)]
     pub(crate) fn join_path_span(&mut self, parent: PathSpan, name: &[u8]) -> PathSpan {
         let parent_start = parent.offset as usize;
@@ -211,6 +244,9 @@ impl FileTable {
     /// Inserts a new file record using a previously allocated span (Unix only).
     ///
     /// `span` must refer to bytes in this table's path arena.
+    ///
+    /// # Panics
+    /// Panics if table capacity is exceeded.
     #[cfg(unix)]
     pub(crate) fn push_span(
         &mut self,
@@ -243,7 +279,8 @@ impl FileTable {
 
     /// Clears all tracked files while retaining allocated capacity.
     ///
-    /// On Unix, this invalidates any `Path`/`PathSpan` references into the arena.
+    /// This invalidates all previously returned `FileId`s. On Unix, it also
+    /// invalidates any `Path`/`PathSpan` references into the arena.
     pub fn clear(&mut self) {
         #[cfg(unix)]
         {
@@ -268,6 +305,9 @@ impl FileTable {
     ///
     /// On Unix, the returned `Path` borrows from the internal arena and may
     /// contain non-UTF8 bytes. It is only valid until the next `clear`.
+    ///
+    /// # Panics
+    /// Panics if `id` does not refer to an entry in this table.
     pub fn path(&self, id: FileId) -> &Path {
         #[cfg(unix)]
         {
@@ -321,11 +361,24 @@ const FILETABLE_PATH_BYTES_PER_FILE_DEFAULT: usize = 256;
 ///
 /// `prefix_len` indicates how many bytes at the front are overlap from the
 /// previous chunk. `payload()` excludes that prefix.
+///
+/// Invariants:
+/// - `prefix_len <= len`
+/// - `buf_offset + len <= BUFFER_LEN_MAX`
+/// - `base_offset` points to the first byte in `data()`
 pub struct Chunk {
+    /// File identifier for this chunk.
     pub file_id: FileId,
+    /// File offset where this chunk begins, including the overlap prefix.
     pub base_offset: u64,
+    /// Total byte length of this chunk, including the overlap prefix.
     pub len: u32,
+    /// Number of prefix bytes copied from the previous chunk.
+    ///
+    /// Invariants: `prefix_len <= len` and `len - prefix_len` is the payload
+    /// length for newly read bytes.
     pub prefix_len: u32,
+    /// Backing buffer for the chunk. Returned to the pool when dropped.
     pub buf: BufferHandle,
     /// Starting offset into `buf` where the chunk data begins.
     ///
@@ -337,6 +390,9 @@ pub struct Chunk {
 
 impl Chunk {
     /// Full data slice, including the overlap prefix.
+    ///
+    /// The slice length is `len` and starts at `buf_offset` into the backing
+    /// buffer.
     pub fn data(&self) -> &[u8] {
         let start = self.buf_offset as usize;
         let end = start + self.len as usize;
@@ -344,6 +400,9 @@ impl Chunk {
     }
 
     /// Payload slice excluding the overlap prefix.
+    ///
+    /// The slice length is `len - prefix_len` and contains only newly read
+    /// bytes from the file.
     pub fn payload(&self) -> &[u8] {
         let start = self.buf_offset as usize + self.prefix_len as usize;
         let end = self.buf_offset as usize + self.len as usize;
@@ -352,7 +411,7 @@ impl Chunk {
 }
 
 /// Maximum chunk buffer length (bytes).
-pub const BUFFER_LEN_MAX: usize = 2 * 1024 * 1024;
+pub const BUFFER_LEN_MAX: usize = 16 * 1024 * 1024;
 /// Alignment for pooled buffers (bytes).
 pub const BUFFER_ALIGN: usize = 4096;
 
@@ -410,6 +469,9 @@ pub struct BufferPool(Rc<BufferPoolInner>);
 
 impl BufferPool {
     /// Creates a buffer pool with `capacity` buffers.
+    ///
+    /// # Panics
+    /// Panics if `capacity` is zero or exceeds `u32::MAX`.
     pub fn new(capacity: usize) -> Self {
         assert!(capacity > 0);
         assert!(capacity <= u32::MAX as usize);
@@ -448,6 +510,9 @@ impl BufferPool {
 }
 
 /// RAII handle to a pool buffer, returned to the pool on drop.
+///
+/// The buffer contents are not automatically cleared between uses; call
+/// [`clear`](Self::clear) if you need zeroed memory.
 pub struct BufferHandle {
     pool: Rc<BufferPoolInner>,
     ptr: NonNull<u8>,
@@ -455,6 +520,9 @@ pub struct BufferHandle {
 
 impl BufferHandle {
     /// Returns a shared view over the entire buffer.
+    ///
+    /// The slice length is always `BUFFER_LEN_MAX`. The bytes may contain
+    /// leftover data from previous uses.
     pub fn as_slice(&self) -> &[u8] {
         // SAFETY: `ptr` points to a `BUFFER_LEN_MAX`-byte allocation owned
         // by the pool and is valid for the lifetime of this handle.
@@ -462,12 +530,17 @@ impl BufferHandle {
     }
 
     /// Returns a mutable view over the entire buffer.
+    ///
+    /// The slice length is always `BUFFER_LEN_MAX`.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         // SAFETY: `ptr` is uniquely borrowed via `&mut self` for this call.
         unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), BUFFER_LEN_MAX) }
     }
 
     /// Zeroes the entire buffer.
+    ///
+    /// This is O(`BUFFER_LEN_MAX`) and may be skipped when overwriting the
+    /// whole buffer anyway.
     pub fn clear(&mut self) {
         self.as_mut_slice().fill(0);
     }
@@ -490,6 +563,21 @@ impl Drop for BufferHandle {
 /// This makes span reporting consistent even when a match begins in the overlap.
 ///
 /// The caller provides the overlap `tail` buffer to avoid per-scan allocations.
+///
+/// # Behavior
+/// - Calls `emit` once per non-empty chunk; empty files emit nothing.
+/// - The final chunk may be shorter than `chunk_size`.
+/// - If `emit` returns `ControlFlow::Break`, reading stops early and returns
+///   `Ok(())`.
+/// - `tail` is used as scratch storage; its contents after return are
+///   unspecified.
+///
+/// # Errors
+/// Returns any I/O error from opening or reading the file.
+///
+/// # Panics
+/// Panics if `chunk_size` is zero, if `chunk_size + overlap > BUFFER_LEN_MAX`,
+/// or if `overlap > tail.len()`.
 pub fn read_file_chunks(
     file_id: FileId,
     path: &Path,
@@ -556,18 +644,30 @@ pub fn read_file_chunks(
 }
 
 /// Configuration for synchronous, in-process scanning.
+///
+/// Callers are responsible for choosing values that keep
+/// `chunk_size + overlap <= BUFFER_LEN_MAX` (overlap is derived from the
+/// [`Engine`]) and yield a non-zero [`pool_capacity`](Self::pool_capacity).
 pub struct ScannerConfig {
     /// Bytes per chunk read from disk (excluding overlap).
     ///
     /// Must be > 0 and sized so `chunk_size + overlap <= BUFFER_LEN_MAX`.
     pub chunk_size: usize,
     /// Number of in-flight I/O buffers.
+    ///
+    /// Used only for sizing the internal buffer pool.
     pub io_queue: usize,
     /// Reader thread count used by the caller (for pool sizing).
+    ///
+    /// The runtime itself is single-threaded; this is a sizing hint.
     pub reader_threads: usize,
     /// Scan thread count used by the caller (for pool sizing).
+    ///
+    /// The runtime itself is single-threaded; this is a sizing hint.
     pub scan_threads: usize,
     /// Maximum number of findings retained per file.
+    ///
+    /// If exceeded, scanning stops early and returns an error.
     pub max_findings_per_file: usize,
 }
 
@@ -588,6 +688,9 @@ impl ScannerConfig {
 /// This runtime uses `Rc`-backed pools internally and is intended for
 /// single-threaded use. Results are stored in an internal buffer with a fixed
 /// capacity set at construction time.
+///
+/// The slice returned by [`scan_file_sync`](Self::scan_file_sync) is borrowed
+/// from this internal buffer and is only valid until the next scan.
 pub struct ScannerRuntime {
     engine: Arc<Engine>,
     config: ScannerConfig,
@@ -600,6 +703,10 @@ pub struct ScannerRuntime {
 
 impl ScannerRuntime {
     /// Creates a scanner runtime with its own buffer pool and overlap settings.
+    ///
+    /// # Panics
+    /// Panics if `config.chunk_size + engine.required_overlap()` exceeds
+    /// `BUFFER_LEN_MAX` or if the computed pool capacity is zero.
     pub fn new(engine: Arc<Engine>, config: ScannerConfig) -> Self {
         let overlap = engine.required_overlap();
         let buf_len = overlap.saturating_add(config.chunk_size);
@@ -627,6 +734,10 @@ impl ScannerRuntime {
     /// Findings are stored in an internal fixed-capacity buffer sized at
     /// startup. If the capacity is exceeded, scanning stops early and an error
     /// is returned; callers should treat the results as incomplete.
+    ///
+    /// # Errors
+    /// Returns any I/O error from reading the file. If the findings buffer
+    /// overflows, returns `io::ErrorKind::Other` after stopping the scan early.
     pub fn scan_file_sync(&mut self, file_id: FileId, path: &Path) -> io::Result<&[Finding]> {
         self.out.clear();
         let mut overflow = false;
