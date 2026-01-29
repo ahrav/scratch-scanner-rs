@@ -17,9 +17,45 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::vectorscan_prefilter::{stream_match_callback, VsStreamMatchCtx, VsStreamWindow};
+use super::vectorscan_prefilter::{
+    gate_match_callback, stream_match_callback, VsStreamMatchCtx, VsStreamWindow,
+};
 
 fn decoded_prefilter_hit(engine: &Engine, decoded: &[u8]) -> bool {
+    if let Some(vs_gate) = engine.vs_gate.as_ref() {
+        let mut scratch = match vs_gate.alloc_scratch() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let mut stream = match vs_gate.open_stream() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+
+        let mut hit: u8 = 0;
+        let cb = gate_match_callback();
+        if vs_gate
+            .scan_stream(
+                &mut stream,
+                decoded,
+                &mut scratch,
+                cb,
+                (&mut hit as *mut u8).cast(),
+            )
+            .is_err()
+        {
+            let _ = vs_gate.close_stream(stream, &mut scratch, cb, (&mut hit as *mut u8).cast());
+            return false;
+        }
+        if vs_gate
+            .close_stream(stream, &mut scratch, cb, (&mut hit as *mut u8).cast())
+            .is_err()
+        {
+            return false;
+        }
+        return hit != 0;
+    }
+
     let Some(vs_stream) = engine.vs_stream.as_ref() else {
         return true;
     };
@@ -663,9 +699,13 @@ fn reference_scan_keys(engine: &Engine, rules: &[RuleSpec], buf: &[u8]) -> HashS
                 }
 
                 if tc.gate == Gate::AnchorsInDecoded {
-                    let enforce_gate =
-                        !engine.tuning.scan_utf16_variants || !engine.has_utf16_anchors;
-                    if enforce_gate && !decoded_prefilter_hit(engine, &decoded) {
+                    let gate_satisfied = decoded_prefilter_hit(engine, &decoded);
+                    let enforce_gate = if engine.vs_gate.is_some() {
+                        true
+                    } else {
+                        !engine.tuning.scan_utf16_variants || !engine.has_utf16_anchors
+                    };
+                    if enforce_gate && !gate_satisfied {
                         continue;
                     }
                 }
@@ -1866,6 +1906,154 @@ fn base64_gate_utf16be_anchor_straddles_stream_boundary() {
     assert!(
         hits.iter().any(|h| h.rule == "utf16be-gate-boundary"),
         "expected utf16be match to survive base64 gate boundary"
+    );
+}
+
+#[test]
+fn stream_window_recovers_after_ring_eviction() {
+    let rule = RuleSpec {
+        name: "ring-evict-window",
+        anchors: &[b"TOK"],
+        radius: 128,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        re: Regex::new("TOK").unwrap(),
+    };
+
+    let tc = TransformConfig {
+        id: TransformId::Base64,
+        mode: TransformMode::Always,
+        gate: Gate::None,
+        min_len: 8,
+        max_spans_per_buffer: 4,
+        max_encoded_len: 64 * 1024,
+        max_decoded_bytes: 64 * 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    };
+
+    let mut tuning = demo_tuning();
+    tuning.max_total_decode_output_bytes = tuning.max_total_decode_output_bytes.max(8 * 1024);
+
+    let mut engine =
+        Engine::new_with_anchor_policy(vec![rule], vec![tc], tuning, AnchorPolicy::ManualOnly);
+    if engine.vs_stream.is_none() {
+        return;
+    }
+    engine.stream_ring_bytes = 32;
+
+    let mut decoded = vec![b'A'; 256];
+    decoded.extend_from_slice(b"TOK");
+    decoded.extend(std::iter::repeat_n(b'B', 256));
+    let encoded = b64_encode(&decoded).into_bytes();
+
+    let hits = scan_chunk_findings(&engine, &encoded);
+    assert!(
+        hits.iter().any(|h| h.rule == "ring-evict-window"),
+        "expected match to survive ring eviction"
+    );
+}
+
+#[test]
+fn stream_hit_cap_forces_full_fallback() {
+    let rule = RuleSpec {
+        name: "stream-hit-cap-fallback",
+        anchors: &[b"TOK"],
+        radius: 0,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        re: Regex::new("TOK").unwrap(),
+    };
+
+    let tc = TransformConfig {
+        id: TransformId::Base64,
+        mode: TransformMode::Always,
+        gate: Gate::None,
+        min_len: 8,
+        max_spans_per_buffer: 4,
+        max_encoded_len: 64 * 1024,
+        max_decoded_bytes: 64 * 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    };
+
+    let mut tuning = demo_tuning();
+    tuning.max_windows_per_rule_variant = 1;
+    tuning.max_total_decode_output_bytes = tuning.max_total_decode_output_bytes.max(8 * 1024);
+
+    let engine =
+        Engine::new_with_anchor_policy(vec![rule], vec![tc], tuning, AnchorPolicy::ManualOnly);
+    if engine.vs_stream.is_none() {
+        return;
+    }
+
+    let mut decoded = Vec::new();
+    decoded.extend_from_slice(b"TOK");
+    decoded.extend(std::iter::repeat_n(b'A', 512));
+    decoded.extend_from_slice(b"TOK");
+    let encoded = b64_encode(&decoded).into_bytes();
+
+    let hits = scan_chunk_findings(&engine, &encoded);
+    let count = hits
+        .iter()
+        .filter(|h| h.rule == "stream-hit-cap-fallback")
+        .count();
+    assert!(count >= 2, "expected >=2 matches, got {count}");
+}
+
+#[test]
+fn stream_nested_span_fallback_recovers() {
+    let rule = RuleSpec {
+        name: "nested-span-fallback",
+        anchors: &[b"TOK"],
+        radius: 0,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        re: Regex::new("TOK").unwrap(),
+    };
+
+    let tc = TransformConfig {
+        id: TransformId::Base64,
+        mode: TransformMode::Always,
+        gate: Gate::None,
+        min_len: 4,
+        max_spans_per_buffer: 8,
+        max_encoded_len: 64 * 1024,
+        max_decoded_bytes: 64 * 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    };
+
+    let mut tuning = demo_tuning();
+    tuning.max_total_decode_output_bytes = tuning.max_total_decode_output_bytes.max(16 * 1024);
+
+    let mut engine =
+        Engine::new_with_anchor_policy(vec![rule], vec![tc], tuning, AnchorPolicy::ManualOnly);
+    if engine.vs_stream.is_none() {
+        return;
+    }
+    engine.stream_ring_bytes = 32;
+
+    let inner = b64_encode(b"TOK");
+    let mut outer_decoded = Vec::new();
+    outer_decoded.extend(std::iter::repeat_n(b'A', 128));
+    outer_decoded.extend_from_slice(inner.as_bytes());
+    outer_decoded.extend(std::iter::repeat_n(b'B', 128));
+
+    let outer_encoded = b64_encode(&outer_decoded).into_bytes();
+    let hits = scan_chunk_findings(&engine, &outer_encoded);
+    assert!(
+        hits.iter().any(|h| h.rule == "nested-span-fallback"),
+        "expected nested span to be recovered via fallback"
     );
 }
 

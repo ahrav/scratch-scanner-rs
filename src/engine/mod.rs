@@ -3,35 +3,33 @@
 //! Purpose: compile rule specs into anchors and gates, then scan buffers with
 //! bounded work and reuse scratch allocations.
 //!
-//! # Pipeline overview
+//! # Algorithm
 //! 1. Compile rules into anchor patterns and fast gates (keywords/confirm-all).
 //! 2. Prefilter input buffers and build candidate windows.
 //! 3. Run validators, gates, and regexes inside those windows.
 //! 4. Optionally decode transform spans into derived buffers and repeat (BFS).
 //!
-//! # Data model and lifetimes
+//! # Invariants
 //! - The engine is immutable after construction; all mutable scan state lives in
 //!   [`ScanScratch`], which is single-threaded and reused across scans.
+//! - Scratch buffers are reused across scans and must be reset between scans.
 //! - Decoded buffers are stored in an append-only slab; ranges and `StepId`
 //!   references are only valid until the next `ScanScratch::reset_for_scan`.
 //! - Offsets stored in hot paths use `u32`; callers must chunk inputs so buffer
 //!   lengths fit in `u32`.
-//!
-//! # Budgets and invariants
+//! - `SpanU32` and `BufRef::Slab` ranges are only valid until the next reset.
 //! - All per-scan work is bounded by tuning limits: windows, hits, findings,
 //!   decode output bytes, transform depth, and work items.
-//! - Scratch buffers are reused across scans and must be reset between scans.
-//! - `SpanU32` and `BufRef::Slab` ranges are only valid until the next reset.
 //! - UTF-16 anchors always contain at least one NUL byte, enabling a raw-only
 //!   fast path for NUL-free buffers.
-//! - Vectorscan prefiltering is enabled by default, but best-effort; if the
+//! - Vectorscan prefiltering is enabled by default but best-effort; if the
 //!   prefilter DB fails to compile, we fall back to full-buffer windows.
 //!
-//! # Trade-offs
-//! The engine favors predictable cost over perfect precision: span/anchor
-//! selection is permissive, while validation and gates enforce correctness.
-//! Prefilters (Vectorscan, base64 pre-gate) are conservative: they may admit
-//! false positives but must not drop true matches.
+//! # Design Notes
+//! - The engine favors predictable cost over perfect precision: span/anchor
+//!   selection is permissive, while validation and gates enforce correctness.
+//! - Prefilters (Vectorscan, base64 pre-gate) are conservative: they may admit
+//!   false positives but must not drop true matches.
 
 use crate::api::*;
 use crate::b64_yara_gate::{Base64YaraGate, Base64YaraGateConfig, PaddingPolicy, WhitespacePolicy};
@@ -56,8 +54,9 @@ mod vectorscan_prefilter;
 use self::helpers::*;
 use self::transform::*;
 use self::vectorscan_prefilter::{
-    stream_match_callback, VsAnchorDb, VsPrefilterDb, VsScratch, VsStreamDb, VsStreamMatchCtx,
-    VsStreamWindow,
+    gate_match_callback, stream_match_callback, utf16_stream_match_callback, VsAnchorDb, VsGateDb,
+    VsPrefilterDb, VsScratch, VsStream, VsStreamDb, VsStreamMatchCtx, VsStreamWindow,
+    VsUtf16StreamDb, VsUtf16StreamMatchCtx,
 };
 
 #[cfg(test)]
@@ -86,6 +85,15 @@ impl Variant {
             Variant::Raw => 0,
             Variant::Utf16Le => 1,
             Variant::Utf16Be => 2,
+        }
+    }
+
+    fn from_idx(idx: u8) -> Option<Self> {
+        match idx {
+            0 => Some(Variant::Raw),
+            1 => Some(Variant::Utf16Le),
+            2 => Some(Variant::Utf16Be),
+            _ => None,
         }
     }
 
@@ -543,9 +551,22 @@ impl EntropyScratch {
 /// Per-scan scratch state reused across chunks.
 ///
 /// This is the main allocation amortization vehicle: it owns buffers for window
-/// accumulation, decode slabs, and work queues. It is not thread-safe and should
-/// be used by a single worker at a time. Scratch contents are only valid until
-/// the next call to `reset_for_scan` or any draining/mutation method.
+/// accumulation, decode slabs, and work queues.
+///
+/// # Guarantees
+/// - Steady-state scans reuse allocations; buffers may grow only if the engine's
+///   rule set or tuning increases between scans.
+/// - Findings are recorded as compact [`FindingRec`] entries until drained or
+///   materialized.
+///
+/// # Invariants
+/// - Not thread-safe; use by a single worker at a time.
+/// - Contents (including slices from [`ScanScratch::findings`]) are invalidated
+///   by `reset_for_scan` and any draining/mutation method.
+///
+/// # Performance
+/// - Fixed-capacity buffers cap per-scan work; overflow increments
+///   [`ScanScratch::dropped_findings`].
 pub struct ScanScratch {
     /// Per-chunk finding records awaiting materialization.
     ///
@@ -581,6 +602,10 @@ pub struct ScanScratch {
     span_streams: Vec<SpanStreamEntry>,
     /// Temporary findings buffer for a decoded stream (dedupe-aware).
     tmp_findings: Vec<FindingRec>,
+    /// Per-rule stream hit counts for decoded-window seeding.
+    stream_hit_counts: Vec<u32>,
+    /// Scratch list of touched stream hit counters for fast reset.
+    stream_hit_touched: ScratchVec<u32>,
     accs: Vec<[HitAccumulator; 3]>, // Per (rule, variant) hit accumulators.
     touched_pairs: ScratchVec<u32>, // Scratch list of touched pairs.
     touched: DynamicBitSet,         // Bitset for touched pairs.
@@ -614,8 +639,12 @@ pub struct ScanScratch {
     vs_scratch: Option<VsScratch>,
     /// Per-thread Vectorscan scratch space for UTF-16 anchor prefiltering.
     vs_utf16_scratch: Option<VsScratch>,
+    /// Per-thread Vectorscan scratch space for UTF-16 stream anchor scanning.
+    vs_utf16_stream_scratch: Option<VsScratch>,
     /// Per-thread Vectorscan scratch space for stream-mode scanning.
     vs_stream_scratch: Option<VsScratch>,
+    /// Per-thread Vectorscan scratch space for decoded gate scanning.
+    vs_gate_scratch: Option<VsScratch>,
     #[cfg(feature = "b64-stats")]
     base64_stats: Base64DecodeStats, // Base64 decode/gate instrumentation.
 }
@@ -668,6 +697,9 @@ impl ScanScratch {
             pending_spans: Vec::with_capacity(max_spans.max(16)),
             span_streams: Vec::with_capacity(engine.transforms.len()),
             tmp_findings: Vec::with_capacity(max_findings),
+            stream_hit_counts: vec![0u32; rules_len.saturating_mul(3)],
+            stream_hit_touched: ScratchVec::with_capacity(rules_len.saturating_mul(3))
+                .expect("scratch stream_hit_touched allocation failed"),
             accs,
             touched_pairs: ScratchVec::with_capacity(rules_len.saturating_mul(3))
                 .expect("scratch touched_pairs allocation failed"),
@@ -697,9 +729,17 @@ impl ScanScratch {
                 db.alloc_scratch()
                     .expect("vectorscan utf16 scratch allocation failed")
             }),
+            vs_utf16_stream_scratch: engine.vs_utf16_stream.as_ref().map(|db| {
+                db.alloc_scratch()
+                    .expect("vectorscan utf16 stream scratch allocation failed")
+            }),
             vs_stream_scratch: engine.vs_stream.as_ref().map(|db| {
                 db.alloc_scratch()
                     .expect("vectorscan stream scratch allocation failed")
+            }),
+            vs_gate_scratch: engine.vs_gate.as_ref().map(|db| {
+                db.alloc_scratch()
+                    .expect("vectorscan gate scratch allocation failed")
             }),
             #[cfg(feature = "b64-stats")]
             base64_stats: Base64DecodeStats::default(),
@@ -726,6 +766,12 @@ impl ScanScratch {
         self.pending_spans.clear();
         self.span_streams.clear();
         self.tmp_findings.clear();
+        for idx in self.stream_hit_touched.drain() {
+            let slot = idx as usize;
+            if let Some(hit) = self.stream_hit_counts.get_mut(slot) {
+                *hit = 0;
+            }
+        }
         self.step_arena.reset();
         self.utf16_buf.clear();
         self.entropy_scratch.reset();
@@ -767,6 +813,23 @@ impl ScanScratch {
                 self.vs_utf16_scratch = None;
             }
         }
+        match engine.vs_utf16_stream.as_ref() {
+            Some(db) => {
+                let need_alloc = match self.vs_utf16_stream_scratch.as_ref() {
+                    Some(s) => s.bound_db_ptr() != db.db_ptr(),
+                    None => true,
+                };
+                if need_alloc {
+                    self.vs_utf16_stream_scratch = Some(
+                        db.alloc_scratch()
+                            .expect("vectorscan utf16 stream scratch allocation failed"),
+                    );
+                }
+            }
+            None => {
+                self.vs_utf16_stream_scratch = None;
+            }
+        }
         match engine.vs_stream.as_ref() {
             Some(db) => {
                 let need_alloc = match self.vs_stream_scratch.as_ref() {
@@ -782,6 +845,23 @@ impl ScanScratch {
             }
             None => {
                 self.vs_stream_scratch = None;
+            }
+        }
+        match engine.vs_gate.as_ref() {
+            Some(db) => {
+                let need_alloc = match self.vs_gate_scratch.as_ref() {
+                    Some(s) => s.bound_db_ptr() != db.db_ptr(),
+                    None => true,
+                };
+                if need_alloc {
+                    self.vs_gate_scratch = Some(
+                        db.alloc_scratch()
+                            .expect("vectorscan gate scratch allocation failed"),
+                    );
+                }
+            }
+            None => {
+                self.vs_gate_scratch = None;
             }
         }
         self.touched_pairs.clear();
@@ -833,6 +913,15 @@ impl ScanScratch {
         if self.expanded.capacity() < engine.tuning.max_windows_per_rule_variant {
             self.expanded = ScratchVec::with_capacity(engine.tuning.max_windows_per_rule_variant)
                 .expect("scratch expanded allocation failed");
+        }
+        let stream_hits_len = engine.rules.len().saturating_mul(3);
+        if self.stream_hit_counts.len() != stream_hits_len {
+            self.stream_hit_counts = vec![0u32; stream_hits_len];
+            self.stream_hit_touched =
+                ScratchVec::with_capacity(stream_hits_len).expect("scratch stream hits");
+        } else if self.stream_hit_touched.capacity() < stream_hits_len {
+            self.stream_hit_touched =
+                ScratchVec::with_capacity(stream_hits_len).expect("scratch stream hits");
         }
         if self.max_findings != engine.tuning.max_findings_per_chunk {
             self.max_findings = engine.tuning.max_findings_per_chunk;
@@ -925,10 +1014,18 @@ impl ScanScratch {
         self.drain_findings(out);
     }
 
-    /// Drops findings that are fully contained in a chunk prefix.
+    /// Drops findings that end at or before the overlap prefix boundary.
     ///
-    /// `new_bytes_start` is the absolute byte offset where the new, non-overlap
-    /// region begins (typically `base_offset + prefix_len`).
+    /// This is used with sliding-window or chunked scans: after advancing the
+    /// scan window, remove findings wholly contained in the previous overlap
+    /// prefix to avoid duplicate emission.
+    ///
+    /// # Preconditions
+    /// - `new_bytes_start` is the absolute byte offset where the new, non-overlap
+    ///   region begins (typically `base_offset + prefix_len`).
+    ///
+    /// # Effects
+    /// - Compacts in place and preserves the relative order of remaining findings.
     pub fn drop_prefix_findings(&mut self, new_bytes_start: u64) {
         if new_bytes_start == 0 {
             return;
@@ -963,6 +1060,8 @@ impl ScanScratch {
     ///
     /// The slice is invalidated by the next scan or any call that drains
     /// or mutates the scratch buffers.
+    ///
+    /// Order reflects scan traversal and is not guaranteed to be sorted by span.
     pub fn findings(&self) -> &[FindingRec] {
         self.out.as_slice()
     }
@@ -1085,6 +1184,19 @@ impl Default for WorkItem {
 /// Compiled scanning engine with derived anchors, rules, and transforms.
 ///
 /// Build once, then reuse with per-scan scratch buffers to avoid allocations.
+///
+/// # Guarantees
+/// - Immutable after construction; methods only borrow `&self`.
+/// - `scan_chunk_*` methods reset the provided [`ScanScratch`] before use and
+///   enforce per-scan tuning budgets.
+///
+/// # Invariants
+/// - Input buffers must be chunked so `buf.len() <= u32::MAX`.
+/// - [`ScanScratch`] is single-threaded; use one scratch per worker/thread.
+///
+/// # Performance
+/// - Prefilters and gates bound work; regex validation runs only inside
+///   candidate windows.
 pub struct Engine {
     rules: Vec<RuleCompiled>,
     transforms: Vec<TransformConfig>,
@@ -1103,8 +1215,12 @@ pub struct Engine {
     //
     // When present, this prefilters UTF-16 variants using literal anchors.
     vs_utf16: Option<VsAnchorDb>,
+    // Vectorscan stream-mode DB for UTF-16 anchor scanning in decoded streams.
+    vs_utf16_stream: Option<VsUtf16StreamDb>,
     // Vectorscan stream-mode DB for decoded-byte scanning.
     vs_stream: Option<VsStreamDb>,
+    // Vectorscan stream-mode DB for decoded-space anchor gating.
+    vs_gate: Option<VsGateDb>,
     // Base64 pre-decode gate built from anchor patterns.
     //
     // This runs in *encoded space* and is deliberately conservative:
@@ -1165,6 +1281,10 @@ pub struct VectorscanStats {
     pub anchor_after_vs: u64,
     /// Buffers where raw Vectorscan was used and UTF-16 scan was skipped.
     pub anchor_skipped: u64,
+    /// Stream decode spans that fell back to full decode.
+    pub stream_force_full: u64,
+    /// Stream decode spans that exceeded the per-rule window cap.
+    pub stream_window_cap_exceeded: u64,
 }
 
 #[cfg(feature = "stats")]
@@ -1179,6 +1299,8 @@ struct VectorscanCounters {
     anchor_only: AtomicU64,
     anchor_after_vs: AtomicU64,
     anchor_skipped: AtomicU64,
+    stream_force_full: AtomicU64,
+    stream_window_cap_exceeded: AtomicU64,
 }
 
 #[cfg(feature = "stats")]
@@ -1196,6 +1318,8 @@ impl VectorscanCounters {
             anchor_only: self.anchor_only.load(Ordering::Relaxed),
             anchor_after_vs: self.anchor_after_vs.load(Ordering::Relaxed),
             anchor_skipped: self.anchor_skipped.load(Ordering::Relaxed),
+            stream_force_full: self.stream_force_full.load(Ordering::Relaxed),
+            stream_window_cap_exceeded: self.stream_window_cap_exceeded.load(Ordering::Relaxed),
         }
     }
 }
@@ -1210,6 +1334,14 @@ impl Engine {
     }
 
     /// Compiles rule specs into an engine with a specific anchor policy.
+    ///
+    /// # Design Notes
+    /// - `AnchorPolicy::ManualOnly` uses only explicit anchors provided by rules.
+    /// - `AnchorPolicy::DerivedOnly` ignores manual anchors and relies on derived
+    ///   anchors/residue gates; rules that cannot be gated are reported via
+    ///   [`Engine::unfilterable_rules`].
+    /// - `AnchorPolicy::PreferDerived` derives anchors when possible and falls
+    ///   back to manual anchors when derivation is unavailable.
     ///
     /// # Panics
     /// Panics if any rule, transform, or tuning invariants are violated.
@@ -1537,6 +1669,15 @@ impl Engine {
             .map(|w| w as usize)
             .unwrap_or(max_anchor_pat_len);
         let vs_stream = VsStreamDb::try_new_stream(&rules, max_decoded_cap).ok();
+        let needs_decoded_gate = transforms
+            .iter()
+            .any(|tc| tc.gate == Gate::AnchorsInDecoded);
+        let vs_gate =
+            if needs_decoded_gate && !anchor_patterns_all.is_empty() && vs_stream.is_some() {
+                VsGateDb::try_new_gate(&anchor_patterns_all).ok()
+            } else {
+                None
+            };
         let max_stream_window_bytes = vs_stream
             .as_ref()
             .and_then(|db| {
@@ -1575,6 +1716,25 @@ impl Engine {
                 }
             }
         };
+        let vs_utf16_stream = if !has_utf16_anchors {
+            None
+        } else {
+            match VsUtf16StreamDb::try_new_utf16_stream(
+                &anchor_patterns_utf16,
+                &pat_targets_utf16,
+                &pat_offsets_utf16,
+                &utf16_seed_radius_bytes,
+                &tuning,
+            ) {
+                Ok(db) => Some(db),
+                Err(err) => {
+                    if std::env::var_os("SCANNER_VS_UTF16_DEBUG").is_some() {
+                        eprintln!("vectorscan utf16 stream db build failed: {err}");
+                    }
+                    None
+                }
+            }
+        };
         Self {
             rules: rules_compiled,
             transforms,
@@ -1582,7 +1742,9 @@ impl Engine {
             entropy_log2,
             vs,
             vs_utf16,
+            vs_utf16_stream,
             vs_stream,
+            vs_gate,
             b64_gate,
             residue_rules,
             unfilterable_rules,
@@ -1611,7 +1773,9 @@ impl Engine {
             .snapshot(self.vs.is_some(), self.vs_utf16.is_some())
     }
 
-    /// Rules that could not be given a sound gate from their regex pattern.
+    /// Rules whose regex patterns could not be given a sound prefilter gate.
+    ///
+    /// The slice contains `(rule_index, reason)` pairs in original rule order.
     pub fn unfilterable_rules(&self) -> &[(usize, UnfilterableReason)] {
         &self.unfilterable_rules
     }
@@ -1620,6 +1784,8 @@ impl Engine {
     ///
     /// Findings are stored in `scratch` and returned as a shared slice. The
     /// returned slice is valid until `scratch` is reused for another scan.
+    ///
+    /// Equivalent to `scan_chunk_into` with `file_id = 0` and `base_offset = 0`.
     pub fn scan_chunk<'a>(&self, hay: &[u8], scratch: &'a mut ScanScratch) -> &'a [FindingRec] {
         self.scan_chunk_into(hay, FileId(0), 0, scratch);
         scratch.findings()
@@ -1654,6 +1820,14 @@ impl Engine {
     ///
     /// `base_offset` is the absolute byte offset of `root_buf` within the file
     /// or stream and is used to compute `root_hint_*` fields for findings.
+    ///
+    /// # Preconditions
+    /// - `root_buf.len() <= u32::MAX`.
+    /// - `scratch` is exclusively owned for the duration of the call.
+    ///
+    /// # Effects
+    /// - Resets `scratch`, overwriting any pending findings.
+    /// - Enqueues decode work items and updates per-scan counters.
     pub fn scan_chunk_into(
         &self,
         root_buf: &[u8],
@@ -1932,7 +2106,9 @@ impl Engine {
     /// Returns the required overlap between chunks for correctness.
     ///
     /// This ensures verification windows (including two-phase expansions) fit
-    /// across chunk boundaries.
+    /// across chunk boundaries. When scanning overlapping chunks, call
+    /// [`ScanScratch::drop_prefix_findings`] with the new start offset to avoid
+    /// emitting duplicates from the overlap prefix.
     pub fn required_overlap(&self) -> usize {
         self.max_window_diameter_bytes
             .saturating_add(self.max_prefilter_width.saturating_sub(1))
@@ -2690,6 +2866,58 @@ impl Engine {
         let _ = (base_offset, file_id, transform_idx);
     }
 
+    fn redecode_window_into(
+        &self,
+        tc: &TransformConfig,
+        encoded: &[u8],
+        lo: u64,
+        hi: u64,
+        max_out: usize,
+        out: &mut Vec<u8>,
+    ) -> bool {
+        if hi <= lo {
+            return true;
+        }
+        let needed = match usize::try_from(hi.saturating_sub(lo)) {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        out.clear();
+        if needed > 0 {
+            out.reserve(needed);
+        }
+
+        let mut decoded_offset: u64 = 0;
+        let mut local_out = 0usize;
+        let mut truncated = false;
+
+        let res = stream_decode(tc, encoded, |chunk| {
+            if local_out.saturating_add(chunk.len()) > max_out {
+                truncated = true;
+                return ControlFlow::Break(());
+            }
+            local_out = local_out.saturating_add(chunk.len());
+
+            let chunk_start = decoded_offset;
+            let chunk_end = decoded_offset.saturating_add(chunk.len() as u64);
+            if chunk_end > lo && chunk_start < hi {
+                let copy_start = lo.saturating_sub(chunk_start) as usize;
+                let copy_end = hi.min(chunk_end).saturating_sub(chunk_start) as usize;
+                out.extend_from_slice(&chunk[copy_start..copy_end]);
+            }
+            decoded_offset = chunk_end;
+            if decoded_offset >= hi {
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        });
+
+        if res.is_err() || truncated {
+            return false;
+        }
+        out.len() == needed
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn decode_stream_and_scan(
         &self,
@@ -2704,6 +2932,13 @@ impl Engine {
         file_id: FileId,
         scratch: &mut ScanScratch,
     ) {
+        for idx in scratch.stream_hit_touched.drain() {
+            let slot = idx as usize;
+            if let Some(hit) = scratch.stream_hit_counts.get_mut(slot) {
+                *hit = 0;
+            }
+        }
+
         if encoded.is_empty() {
             return;
         }
@@ -2720,6 +2955,16 @@ impl Engine {
             return;
         }
 
+        let total_decode_start = scratch.total_decode_output_bytes;
+        let mut force_full = false;
+        let gate_enabled = tc.gate == Gate::AnchorsInDecoded;
+        let mut gate_hit: u8 = 0;
+        let mut gate_db_active = false;
+        let mut gate_db_failed = false;
+        let mut gate_stream: Option<VsStream> = None;
+        let mut gate_scratch: Option<VsScratch> = None;
+        let gate_cb = gate_match_callback();
+
         #[cfg(feature = "b64-stats")]
         let is_b64_gate = tc.id == TransformId::Base64 && tc.gate == Gate::AnchorsInDecoded;
 
@@ -2733,21 +2978,51 @@ impl Engine {
 
         let mut local_out = 0usize;
         let mut truncated = false;
-        let mut saw_gate_hit = false;
+        let mut prefilter_gate_hit = false;
         let mut found_any = false;
         let mut local_dropped = 0usize;
 
+        if gate_enabled {
+            if let Some(db) = self.vs_gate.as_ref() {
+                let mut vs_gate_scratch = match scratch.vs_gate_scratch.take() {
+                    Some(s) => Some(s),
+                    None => db.alloc_scratch().ok(),
+                };
+                if let Some(vs_gate_scratch) = vs_gate_scratch.take() {
+                    match db.open_stream() {
+                        Ok(stream) => {
+                            gate_db_active = true;
+                            gate_stream = Some(stream);
+                            gate_scratch = Some(vs_gate_scratch);
+                        }
+                        Err(_) => {
+                            scratch.vs_gate_scratch = Some(vs_gate_scratch);
+                        }
+                    }
+                }
+            }
+        }
+
         let slab_start = scratch.slab.buf.len();
         let want_utf16_scan = self.tuning.scan_utf16_variants && self.has_utf16_anchors;
+        let use_utf16_stream = want_utf16_scan && self.vs_utf16_stream.is_some();
         let decoded_full_start = slab_start;
         let mut decoded_full_len = 0usize;
         let mut decoded_has_nul = false;
+        let mut utf16_stream: Option<VsStream> = None;
+        let mut utf16_stream_scratch: Option<VsScratch> = None;
+        let mut utf16_stream_ctx: Option<VsUtf16StreamMatchCtx> = None;
+        let utf16_stream_cb = utf16_stream_match_callback();
 
         let process_window = |win: PendingWindow,
                               hi: u64,
                               scratch: &mut ScanScratch,
                               found_any: &mut bool,
-                              local_dropped: &mut usize| {
+                              local_dropped: &mut usize,
+                              force_full: &mut bool| {
+            if *force_full {
+                return;
+            }
             let lo = win.lo;
             if hi <= lo {
                 return;
@@ -2756,7 +3031,16 @@ impl Engine {
             if !scratch
                 .decode_ring
                 .extend_range_to(lo, hi, &mut scratch.window_bytes)
+                && !self.redecode_window_into(
+                    tc,
+                    encoded,
+                    lo,
+                    hi,
+                    max_out,
+                    &mut scratch.window_bytes,
+                )
             {
+                *force_full = true;
                 return;
             }
             let (bytes_ptr, bytes_len) = {
@@ -2872,7 +3156,7 @@ impl Engine {
                 return ControlFlow::Break(());
             }
 
-            if want_utf16_scan {
+            if want_utf16_scan && !use_utf16_stream {
                 if scratch.slab.buf.len().saturating_add(chunk.len()) > scratch.slab.limit {
                     truncated = true;
                     return ControlFlow::Break(());
@@ -2906,15 +3190,155 @@ impl Engine {
                 return ControlFlow::Break(());
             }
 
+            if gate_db_active && gate_hit == 0 {
+                if let (Some(db), Some(gstream), Some(gscratch)) = (
+                    self.vs_gate.as_ref(),
+                    gate_stream.as_mut(),
+                    gate_scratch.as_mut(),
+                ) {
+                    if db
+                        .scan_stream(
+                            gstream,
+                            chunk,
+                            gscratch,
+                            gate_cb,
+                            (&mut gate_hit as *mut u8).cast(),
+                        )
+                        .is_err()
+                    {
+                        gate_db_active = false;
+                        gate_db_failed = true;
+                    }
+                }
+            }
+
+            if use_utf16_stream {
+                if let Some(db) = self.vs_utf16_stream.as_ref() {
+                    let mut scanned_chunk = false;
+                    if utf16_stream.is_none() && memchr(0, chunk).is_some() {
+                        let mut vs_utf16_scratch = match scratch.vs_utf16_stream_scratch.take() {
+                            Some(s) => s,
+                            None => match db.alloc_scratch() {
+                                Ok(s) => s,
+                                Err(_) => {
+                                    truncated = true;
+                                    return ControlFlow::Break(());
+                                }
+                            },
+                        };
+                        let mut ustream = match db.open_stream() {
+                            Ok(s) => s,
+                            Err(_) => {
+                                scratch.vs_utf16_stream_scratch = Some(vs_utf16_scratch);
+                                truncated = true;
+                                return ControlFlow::Break(());
+                            }
+                        };
+                        let base_offset = scratch.decode_ring.start_offset();
+                        let mut uctx = VsUtf16StreamMatchCtx {
+                            pending: &mut scratch.vs_stream_matches as *mut Vec<VsStreamWindow>,
+                            targets: db.targets().as_ptr(),
+                            pat_offsets: db.pat_offsets().as_ptr(),
+                            pat_lens: db.pat_lens().as_ptr(),
+                            pat_count: db.pat_lens().len() as u32,
+                            base_offset,
+                        };
+                        let (seg1, seg2) = scratch.decode_ring.segments();
+                        if !seg1.is_empty()
+                            && db
+                                .scan_stream(
+                                    &mut ustream,
+                                    seg1,
+                                    &mut vs_utf16_scratch,
+                                    utf16_stream_cb,
+                                    (&mut uctx as *mut VsUtf16StreamMatchCtx).cast(),
+                                )
+                                .is_err()
+                        {
+                            truncated = true;
+                            return ControlFlow::Break(());
+                        }
+                        if !seg2.is_empty()
+                            && db
+                                .scan_stream(
+                                    &mut ustream,
+                                    seg2,
+                                    &mut vs_utf16_scratch,
+                                    utf16_stream_cb,
+                                    (&mut uctx as *mut VsUtf16StreamMatchCtx).cast(),
+                                )
+                                .is_err()
+                        {
+                            truncated = true;
+                            return ControlFlow::Break(());
+                        }
+                        utf16_stream = Some(ustream);
+                        utf16_stream_scratch = Some(vs_utf16_scratch);
+                        utf16_stream_ctx = Some(uctx);
+                        scanned_chunk = true;
+                    }
+
+                    if !scanned_chunk {
+                        if let (Some(ustream), Some(vs_utf16_scratch), Some(uctx)) = (
+                            utf16_stream.as_mut(),
+                            utf16_stream_scratch.as_mut(),
+                            utf16_stream_ctx.as_mut(),
+                        ) {
+                            if db
+                                .scan_stream(
+                                    ustream,
+                                    chunk,
+                                    vs_utf16_scratch,
+                                    utf16_stream_cb,
+                                    (uctx as *mut VsUtf16StreamMatchCtx).cast(),
+                                )
+                                .is_err()
+                            {
+                                truncated = true;
+                                return ControlFlow::Break(());
+                            }
+                        }
+                    }
+                }
+            }
+
             if !scratch.vs_stream_matches.is_empty() {
-                saw_gate_hit = true;
+                let max_hits = self.tuning.max_windows_per_rule_variant as u32;
                 for win in scratch.vs_stream_matches.drain(..) {
+                    if win.force_full {
+                        force_full = true;
+                        break;
+                    }
+                    let variant = match Variant::from_idx(win.variant_idx) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    if variant == Variant::Raw {
+                        prefilter_gate_hit = true;
+                    }
+                    let idx = win.rule_id as usize * 3 + variant.idx();
+                    let hit = &mut scratch.stream_hit_counts[idx];
+                    if *hit == 0 {
+                        scratch.stream_hit_touched.push(idx as u32);
+                    }
+                    *hit = hit.saturating_add(1);
+                    if *hit > max_hits {
+                        #[cfg(feature = "stats")]
+                        self.vs_stats
+                            .stream_window_cap_exceeded
+                            .fetch_add(1, Ordering::Relaxed);
+                        force_full = true;
+                        break;
+                    }
                     scratch.pending_windows.push(PendingWindow {
                         hi: win.hi,
                         lo: win.lo,
                         rule_id: win.rule_id,
-                        variant: Variant::Raw,
+                        variant,
                     });
+                }
+                if force_full {
+                    return ControlFlow::Break(());
                 }
             }
 
@@ -2926,7 +3350,17 @@ impl Engine {
                     _ => break,
                 };
                 let win = scratch.pending_windows.pop().expect("pending window");
-                process_window(win, hi, scratch, &mut found_any, &mut local_dropped);
+                process_window(
+                    win,
+                    hi,
+                    scratch,
+                    &mut found_any,
+                    &mut local_dropped,
+                    &mut force_full,
+                );
+                if force_full {
+                    return ControlFlow::Break(());
+                }
             }
 
             let chunk_start = decoded_offset.saturating_sub(chunk.len() as u64);
@@ -2949,7 +3383,8 @@ impl Engine {
                             return true;
                         }
                         if !scratch.decode_ring.has_range(lo, hi) {
-                            return true;
+                            force_full = true;
+                            return false;
                         }
 
                         let span_start = scratch.slab.buf.len();
@@ -2958,7 +3393,8 @@ impl Engine {
                             .extend_range_to(lo, hi, &mut scratch.slab.buf)
                         {
                             scratch.slab.buf.truncate(span_start);
-                            return true;
+                            force_full = true;
+                            return false;
                         }
                         let range = span_start..scratch.slab.buf.len();
 
@@ -2998,6 +3434,9 @@ impl Engine {
                             state.feed(chunk, chunk_start, &mut on_span)
                         }
                     }
+                    if force_full {
+                        return ControlFlow::Break(());
+                    }
                 }
             }
 
@@ -3012,87 +3451,209 @@ impl Engine {
         );
         scratch.vs_stream_scratch = Some(vs_scratch);
 
+        if let Some(db) = self.vs_gate.as_ref() {
+            if let (Some(gstream), Some(mut gscratch)) = (gate_stream.take(), gate_scratch.take()) {
+                let _ = db.close_stream(
+                    gstream,
+                    &mut gscratch,
+                    gate_cb,
+                    (&mut gate_hit as *mut u8).cast(),
+                );
+                gate_scratch = Some(gscratch);
+            }
+        }
+        if let Some(gscratch) = gate_scratch.take() {
+            scratch.vs_gate_scratch = Some(gscratch);
+        }
+
+        if let Some(db) = self.vs_utf16_stream.as_ref() {
+            if let (Some(ustream), Some(mut vs_utf16_scratch), Some(mut uctx)) = (
+                utf16_stream.take(),
+                utf16_stream_scratch.take(),
+                utf16_stream_ctx.take(),
+            ) {
+                let _ = db.close_stream(
+                    ustream,
+                    &mut vs_utf16_scratch,
+                    utf16_stream_cb,
+                    (&mut uctx as *mut VsUtf16StreamMatchCtx).cast(),
+                );
+                utf16_stream_scratch = Some(vs_utf16_scratch);
+            }
+        }
+        if let Some(vs_utf16_scratch) = utf16_stream_scratch.take() {
+            scratch.vs_utf16_stream_scratch = Some(vs_utf16_scratch);
+        }
+
+        if force_full {
+            #[cfg(feature = "stats")]
+            self.vs_stats
+                .stream_force_full
+                .fetch_add(1, Ordering::Relaxed);
+            scratch.slab.buf.truncate(slab_start);
+            scratch.total_decode_output_bytes = total_decode_start;
+            scratch.pending_windows.clear();
+            scratch.vs_stream_matches.clear();
+            scratch.pending_spans.clear();
+            scratch.span_streams.clear();
+            scratch.tmp_findings.clear();
+            self.decode_span_fallback(
+                tc,
+                transform_idx,
+                encoded,
+                step_id,
+                root_hint,
+                depth,
+                base_offset,
+                file_id,
+                scratch,
+            );
+            return;
+        }
+
         if res.is_ok() {
             if !scratch.vs_stream_matches.is_empty() {
-                saw_gate_hit = true;
+                let max_hits = self.tuning.max_windows_per_rule_variant as u32;
                 for win in scratch.vs_stream_matches.drain(..) {
+                    if win.force_full {
+                        force_full = true;
+                        break;
+                    }
+                    let variant = match Variant::from_idx(win.variant_idx) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    if variant == Variant::Raw {
+                        prefilter_gate_hit = true;
+                    }
+                    let idx = win.rule_id as usize * 3 + variant.idx();
+                    let hit = &mut scratch.stream_hit_counts[idx];
+                    if *hit == 0 {
+                        scratch.stream_hit_touched.push(idx as u32);
+                    }
+                    *hit = hit.saturating_add(1);
+                    if *hit > max_hits {
+                        force_full = true;
+                        break;
+                    }
                     scratch.pending_windows.push(PendingWindow {
                         hi: win.hi,
                         lo: win.lo,
                         rule_id: win.rule_id,
-                        variant: Variant::Raw,
+                        variant,
                     });
                 }
+                if force_full {
+                    scratch.vs_stream_matches.clear();
+                }
             }
-
-            for entry in scratch.span_streams.iter_mut() {
-                let end_offset = decoded_offset;
-                let mut on_span = |lo: u64, hi: u64| -> bool {
-                    if entry.spans_emitted >= entry.max_spans {
-                        return false;
-                    }
-                    if scratch.work_items_enqueued + scratch.pending_spans.len()
-                        >= self.tuning.max_work_items
-                    {
-                        return false;
-                    }
-                    if hi <= lo {
-                        return true;
-                    }
-                    if !scratch.decode_ring.has_range(lo, hi) {
-                        return true;
-                    }
-                    let span_start = scratch.slab.buf.len();
-                    if !scratch
-                        .decode_ring
-                        .extend_range_to(lo, hi, &mut scratch.slab.buf)
-                    {
-                        scratch.slab.buf.truncate(span_start);
-                        return true;
-                    }
-                    let range = span_start..scratch.slab.buf.len();
-                    let tcfg = &self.transforms[entry.transform_idx];
-                    if tcfg.id == TransformId::Base64 && tcfg.gate == Gate::AnchorsInDecoded {
-                        if let Some(gate) = &self.b64_gate {
-                            if !gate.hits(&scratch.slab.buf[range.clone()]) {
-                                scratch.slab.buf.truncate(span_start);
-                                return true;
+            if !force_full {
+                for entry in scratch.span_streams.iter_mut() {
+                    let end_offset = decoded_offset;
+                    let mut on_span = |lo: u64, hi: u64| -> bool {
+                        if entry.spans_emitted >= entry.max_spans {
+                            return false;
+                        }
+                        if scratch.work_items_enqueued + scratch.pending_spans.len()
+                            >= self.tuning.max_work_items
+                        {
+                            return false;
+                        }
+                        if hi <= lo {
+                            return true;
+                        }
+                        if !scratch.decode_ring.has_range(lo, hi) {
+                            force_full = true;
+                            return false;
+                        }
+                        let span_start = scratch.slab.buf.len();
+                        if !scratch
+                            .decode_ring
+                            .extend_range_to(lo, hi, &mut scratch.slab.buf)
+                        {
+                            scratch.slab.buf.truncate(span_start);
+                            force_full = true;
+                            return false;
+                        }
+                        let range = span_start..scratch.slab.buf.len();
+                        let tcfg = &self.transforms[entry.transform_idx];
+                        if tcfg.id == TransformId::Base64 && tcfg.gate == Gate::AnchorsInDecoded {
+                            if let Some(gate) = &self.b64_gate {
+                                if !gate.hits(&scratch.slab.buf[range.clone()]) {
+                                    scratch.slab.buf.truncate(span_start);
+                                    return true;
+                                }
                             }
                         }
-                    }
-                    let parent_span = lo as usize..hi as usize;
-                    let child_step_id = scratch.step_arena.push(
-                        step_id,
-                        DecodeStep::Transform {
+                        let parent_span = lo as usize..hi as usize;
+                        let child_step_id = scratch.step_arena.push(
+                            step_id,
+                            DecodeStep::Transform {
+                                transform_idx: entry.transform_idx,
+                                parent_span: parent_span.clone(),
+                            },
+                        );
+                        let child_root_hint = root_hint.clone().unwrap_or(parent_span);
+                        scratch.pending_spans.push(PendingDecodeSpan {
                             transform_idx: entry.transform_idx,
-                            parent_span: parent_span.clone(),
-                        },
-                    );
-                    let child_root_hint = root_hint.clone().unwrap_or(parent_span);
-                    scratch.pending_spans.push(PendingDecodeSpan {
-                        transform_idx: entry.transform_idx,
-                        range,
-                        step_id: child_step_id,
-                        root_hint: Some(child_root_hint),
-                        depth: depth + 1,
-                    });
-                    entry.spans_emitted = entry.spans_emitted.saturating_add(1);
-                    true
-                };
+                            range,
+                            step_id: child_step_id,
+                            root_hint: Some(child_root_hint),
+                            depth: depth + 1,
+                        });
+                        entry.spans_emitted = entry.spans_emitted.saturating_add(1);
+                        true
+                    };
 
-                match &mut entry.state {
-                    SpanStreamState::Url(state) => state.finish(end_offset, &mut on_span),
-                    SpanStreamState::Base64(state) => state.finish(end_offset, &mut on_span),
+                    match &mut entry.state {
+                        SpanStreamState::Url(state) => state.finish(end_offset, &mut on_span),
+                        SpanStreamState::Base64(state) => state.finish(end_offset, &mut on_span),
+                    }
+                    if force_full {
+                        break;
+                    }
                 }
             }
         }
 
-        if res.is_ok() {
+        if res.is_ok() && !force_full {
             let final_offset = decoded_offset;
             while let Some(win) = scratch.pending_windows.pop() {
                 let hi = win.hi.min(final_offset);
-                process_window(win, hi, scratch, &mut found_any, &mut local_dropped);
+                process_window(
+                    win,
+                    hi,
+                    scratch,
+                    &mut found_any,
+                    &mut local_dropped,
+                    &mut force_full,
+                );
+                if force_full {
+                    break;
+                }
             }
+        }
+
+        if force_full {
+            scratch.slab.buf.truncate(slab_start);
+            scratch.total_decode_output_bytes = total_decode_start;
+            scratch.pending_windows.clear();
+            scratch.vs_stream_matches.clear();
+            scratch.pending_spans.clear();
+            scratch.span_streams.clear();
+            scratch.tmp_findings.clear();
+            self.decode_span_fallback(
+                tc,
+                transform_idx,
+                encoded,
+                step_id,
+                root_hint,
+                depth,
+                base_offset,
+                file_id,
+                scratch,
+            );
+            return;
         }
 
         if res.is_err() || truncated || local_out == 0 || local_out > max_out {
@@ -3113,7 +3674,7 @@ impl Engine {
             return;
         }
 
-        if want_utf16_scan && decoded_has_nul && decoded_full_len > 0 {
+        if want_utf16_scan && !use_utf16_stream && decoded_has_nul && decoded_full_len > 0 {
             if let Some(vs_utf16) = self.vs_utf16.as_ref() {
                 if let Some(mut vs_utf16_scratch) = scratch.vs_utf16_scratch.take() {
                     #[cfg(feature = "stats")]
@@ -3296,9 +3857,23 @@ impl Engine {
             }
         }
 
-        let enforce_gate = tc.gate == Gate::AnchorsInDecoded
-            && (!self.tuning.scan_utf16_variants || !self.has_utf16_anchors);
-        if enforce_gate && !saw_gate_hit {
+        let gate_satisfied = if gate_db_active || gate_hit != 0 {
+            gate_hit != 0
+        } else {
+            prefilter_gate_hit
+        };
+        let enforce_gate = if gate_enabled {
+            if gate_db_failed {
+                false
+            } else if gate_db_active || gate_hit != 0 {
+                true
+            } else {
+                !self.tuning.scan_utf16_variants || !self.has_utf16_anchors
+            }
+        } else {
+            false
+        };
+        if enforce_gate && !gate_satisfied {
             #[cfg(feature = "b64-stats")]
             if is_b64_gate {
                 scratch.base64_stats.decoded_bytes_total = scratch
@@ -3499,6 +4074,7 @@ fn map_to_patterns(map: AHashMap<Vec<u8>, Vec<Target>>) -> (Vec<Vec<u8>>, Vec<Ta
     (patterns, flat, offsets)
 }
 
+/// Benchmark helper to expose span detection for transform configs.
 #[cfg(feature = "bench")]
 pub fn bench_find_spans_into(tc: &TransformConfig, buf: &[u8], out: &mut Vec<Range<usize>>) {
     find_spans_into(tc, buf, out);

@@ -119,6 +119,23 @@ fn main() {
         eprintln!("{label}: iters={iters}");
     }
 
+    #[cfg(feature = "stats")]
+    fn run_stream_stats(label: &str, buf: &[u8]) {
+        let engine = scanner_rs::demo_engine();
+        let mut scratch = engine.new_scratch();
+        let _ = engine.scan_chunk_records(buf, scanner_rs::FileId(0), 0, &mut scratch);
+        let stats = engine.vectorscan_stats();
+        eprintln!(
+            "{label}: stream_force_full={} stream_window_cap_exceeded={}",
+            stats.stream_force_full, stats.stream_window_cap_exceeded
+        );
+    }
+
+    #[cfg(not(feature = "stats"))]
+    fn run_stream_stats(label: &str, _buf: &[u8]) {
+        eprintln!("{label}: enable --features stats to report stream telemetry");
+    }
+
     let mut args = env::args().skip(1);
     let mode = args.next().unwrap_or_else(|| "all".to_string());
     let secs = args
@@ -154,6 +171,9 @@ fn main() {
             bench_find_spans_into(&b64_cfg_full, black_box(&base64_noise), &mut spans);
             black_box(spans.len());
         }),
+        "stream_stats" => {
+            run_stream_stats("stream_stats", &base64_noise);
+        }
         "all" => {
             run_for("url_random", duration, || {
                 bench_find_spans_into(&url_cfg_random, black_box(&random), &mut spans);
@@ -171,10 +191,11 @@ fn main() {
                 bench_find_spans_into(&b64_cfg_full, black_box(&base64_noise), &mut spans);
                 black_box(spans.len());
             });
+            run_stream_stats("stream_stats", &base64_noise);
         }
         _ => {
             eprintln!(
-                "usage: perf_hotspots [url_random|url_urlish|b64_random|b64_noise|all] [seconds]"
+                "usage: perf_hotspots [url_random|url_urlish|b64_random|b64_noise|stream_stats|all] [seconds]"
             );
         }
     }
