@@ -25,6 +25,13 @@
 //! - Long runs are split at `max_len` boundaries to bound worst-case work.
 //! - Decoders are single-pass and O(1) memory; they emit bounded chunks via callbacks.
 //!
+//! # Span splitting (edge case)
+//! Runs are split strictly on `max_len` byte boundaries, without aligning to
+//! encoding quanta (`%HH` or 4-char base64). This is an explicit trade-off:
+//! scanning stays bounded, but a valid encoding can be split across spans.
+//! Downstream decode treats each span independently; percent-escape fragments
+//! pass through unchanged, while base64 fragments can be rejected.
+//!
 //! # Trade-offs
 //! These components intentionally trade precision for cheap scanning. Strict
 //! validation happens in decode/gating, while span finders bias toward not
@@ -41,6 +48,9 @@ use crate::api::{TransformConfig, TransformId};
 use crate::scratch_memory::ScratchVec;
 use memchr::{memchr, memchr2};
 use std::ops::{ControlFlow, Range};
+
+/// Output buffer size used by streaming decoders.
+pub(super) const STREAM_DECODE_CHUNK_BYTES: usize = 16 * 1024;
 
 // --------------------------
 // Transform: URL percent
@@ -190,6 +200,10 @@ pub(super) trait SpanSink {
 /// `+` when `plus_to_space` is enabled) can produce a span. Runs are split at
 /// `max_len` boundaries to cap worst-case work; each split segment must still
 /// satisfy the trigger and `min_len` requirements to be emitted.
+///
+/// Note: `max_len` splitting does not align to `%HH`; a split escape will be
+/// treated as literal by the decoder, which is acceptable for this scan-first
+/// design.
 pub(super) struct UrlSpanStream {
     min_len: usize,
     max_len: usize,
@@ -310,6 +324,9 @@ impl UrlSpanStream {
 /// Runs may include allowed whitespace, but spans are trimmed to the last base64
 /// alphabet byte. `min_chars` counts alphabet characters only; whitespace does
 /// not contribute. Runs are split at `max_len` boundaries to keep scanning bounded.
+///
+/// Note: `max_len` splitting does not align to 4-char base64 quanta. A split
+/// segment may fail strict decode if it ends with a 1-char tail.
 pub(super) struct Base64SpanStream {
     min_chars: usize,
     max_len: usize,
@@ -494,6 +511,7 @@ impl SpanSink for ScratchVec<SpanU32> {
 /// Notes:
 /// - "URL-ish" includes RFC3986 unreserved/reserved bytes plus '%' and '+'.
 /// - Runs longer than `max_len` are split at the boundary to keep scans bounded.
+///   Splits are byte-count based and may cut through a `%HH` escape.
 /// - When `plus_to_space` is false, '+' is allowed in runs but does not trigger
 ///   a span by itself.
 /// - Scanning stops after `max_spans` spans are appended.
@@ -556,8 +574,14 @@ pub(super) fn find_url_spans_into(
 ///
 /// Decodes `%HH` escapes and optionally converts `+` to space. Invalid or
 /// incomplete escapes are passed through verbatim. Output is emitted in
-/// bounded chunks (1KB scratch buffer), and the `on_bytes` callback may stop
+/// bounded chunks (stream decode buffer), and the `on_bytes` callback may stop
 /// decoding early by returning `ControlFlow::Break(())` (treated as success).
+///
+/// # Behavior
+/// - Only `%` followed by two hex digits is decoded; all other bytes are
+///   forwarded unchanged (including `%` itself).
+/// - Output length is never larger than input length.
+/// - `on_bytes` may be called multiple times; chunk boundaries are arbitrary.
 ///
 /// # Errors
 /// Currently infallible; the error type is reserved for test helpers that
@@ -580,7 +604,7 @@ fn stream_decode_url_percent(
         cf
     }
 
-    let mut out = [0u8; 1024];
+    let mut out = [0u8; STREAM_DECODE_CHUNK_BYTES];
     let mut n = 0usize;
 
     let mut i = 0usize;
@@ -669,6 +693,7 @@ enum Base64DecodeError {
 /// - `min_chars` counts base64 alphabet characters only; whitespace does not
 ///   contribute to the minimum.
 /// - `max_len` counts all bytes in the run, including whitespace.
+///   Splits are byte-count based and may cut through a 4-char base64 quantum.
 /// - `allow_space_ws` adds ASCII space to the allowed whitespace set (in
 ///   addition to `\r`, `\n`, `\t`).
 /// - The scan is intentionally permissive and relies on downstream decode gates
@@ -762,8 +787,12 @@ pub(super) fn find_base64_spans_into(
 ///
 /// Whitespace is ignored. Padding is validated, but an unpadded tail
 /// (2 or 3 bytes in the final quantum) is accepted. Output is emitted in
-/// bounded chunks (1KB scratch buffer). The `on_bytes` callback may stop
+/// bounded chunks (stream decode buffer). The `on_bytes` callback may stop
 /// decoding early by returning `ControlFlow::Break(())` (treated as success).
+///
+/// # Behavior
+/// - Once padding is seen, only trailing whitespace is allowed.
+/// - Output may have been emitted before an error is returned.
 ///
 /// # Errors
 /// - `InvalidByte`: a non-base64, non-whitespace byte was encountered.
@@ -794,7 +823,7 @@ fn stream_decode_base64(
     let mut qn = 0usize;
     let mut seen_pad = false;
 
-    let mut out: [u8; 1024] = [0; 1024];
+    let mut out: [u8; STREAM_DECODE_CHUNK_BYTES] = [0; STREAM_DECODE_CHUNK_BYTES];
     let mut out_len = 0usize;
 
     for &b in input {
