@@ -20,8 +20,6 @@
 //!   decode output bytes, transform depth, and work items.
 //! - UTF-16 anchors always contain at least one NUL byte, enabling a raw-only
 //!   fast path for NUL-free buffers.
-//! - Vectorscan prefiltering is enabled by default but best-effort; if the
-//!   prefilter DB fails to compile, we fall back to full-buffer windows.
 //!
 //! # Safety
 //! - Unsafe slices are formed only from ranges validated against the root buffer,
@@ -33,6 +31,14 @@
 //!   selection is permissive, while validation and gates enforce correctness.
 //! - Prefilters (Vectorscan, base64 pre-gate) are conservative: they may admit
 //!   false positives but must not drop true matches.
+//!
+//! # Failure Modes and Limits
+//! - Raw Vectorscan prefilter DB build failures are fatal (fallback disabled).
+//! - UTF-16 prefilter DB build or scan failures disable UTF-16 anchor scans
+//!   for the affected buffer.
+//! - Budget enforcement may coalesce windows, skip deeper decode work, or drop
+//!   findings; dropped findings are counted in
+//!   [`ScanScratch::dropped_findings`].
 
 use crate::api::*;
 use crate::b64_yara_gate::{Base64YaraGate, Base64YaraGateConfig, PaddingPolicy, WhitespacePolicy};
@@ -435,6 +441,10 @@ impl HitAccumulator {
         self.windows.capacity()
     }
 
+    /// Drains accumulated windows into `out`, preserving either the coalesced
+    /// superset or the precise window list.
+    ///
+    /// This clears internal state so subsequent pushes start fresh.
     fn take_into(&mut self, out: &mut ScratchVec<SpanU32>) {
         out.clear();
         if let Some(c) = self.coalesced.take() {
@@ -544,8 +554,10 @@ impl DecodeSlab {
     /// Append decoded bytes into the slab while enforcing per-transform and
     /// global decode budgets.
     ///
-    /// On decode error, truncation, or zero output, the slab is rolled back to
-    /// its pre-call length and `Err(())` is returned.
+    /// On decode error, truncation, or zero output, both the slab and
+    /// `ctx_total_decode_output_bytes` are rolled back to their pre-call values
+    /// and `Err(())` is returned. On success, the returned range points at the
+    /// newly appended bytes.
     fn append_stream_decode(
         &mut self,
         tc: &TransformConfig,
@@ -1200,6 +1212,9 @@ struct PendingDecodeSpan {
 
 /// Pending decoded-space window produced by stream scanning.
 ///
+/// Offsets are in decoded-byte space (relative to the stream) and are
+/// half-open: `[lo, hi)`.
+///
 /// `Ord` is reversed so `BinaryHeap` yields the smallest `hi` first.
 #[derive(Eq, PartialEq)]
 struct PendingWindow {
@@ -1227,18 +1242,23 @@ impl PartialOrd for PendingWindow {
 }
 
 /// Streaming span detector state for nested transforms.
+///
+/// Each variant tracks incremental parsing state so we can emit spans while
+/// decoding without rescanning the full buffer.
 enum SpanStreamState {
     Url(UrlSpanStream),
     Base64(Base64SpanStream),
 }
 
 /// Per-transform span stream bookkeeping during decoded scanning.
+///
+/// Tracks per-buffer span caps and transform modes alongside the stream state.
 struct SpanStreamEntry {
     transform_idx: usize,
     mode: TransformMode,
     state: SpanStreamState,
-    spans_emitted: usize,
-    max_spans: usize,
+    spans_emitted: usize, // Spans emitted so far for this buffer.
+    max_spans: usize,     // Per-buffer cap for this transform.
 }
 
 /// Work item in the transform/scan queue.
@@ -1306,9 +1326,9 @@ pub struct Engine {
 
     // Vectorscan/Hyperscan prefilter DB for raw scanning.
     //
-    // Built by default, but stored as `None` when the prefilter DB fails to
-    // compile (unsupported patterns, expression-info failures, etc.).
-    // When present, this seeds candidate windows in a single `hs_scan` pass.
+    // Built during engine construction. Failures are fatal (fallback disabled),
+    // so this should be `Some` in normal builds. When present, it seeds
+    // candidate windows in a single `hs_scan` pass.
     vs: Option<VsPrefilterDb>,
     // Density gate to decide when raw Vectorscan is worthwhile.
     raw_density_gate: Option<RawDensityGate>,
@@ -1763,8 +1783,8 @@ impl Engine {
             .max()
             .unwrap_or(0);
 
-        // Optional optimization. If the DB can't be built (e.g. regex syntax
-        // incompatibility), fall back to full-buffer raw windows.
+        // Required: if the DB can't be built (e.g. regex incompatibility),
+        // fail fast rather than falling back to full-buffer scans.
         let utf16_input = if tuning.scan_utf16_variants && has_utf16_anchors {
             Some(Utf16AnchorInput {
                 patterns: &anchor_patterns_utf16,
@@ -1775,7 +1795,10 @@ impl Engine {
         } else {
             None
         };
-        let vs = VsPrefilterDb::try_new(&rules, &tuning, utf16_input).ok();
+        let vs = Some(
+            VsPrefilterDb::try_new(&rules, &tuning, utf16_input)
+                .expect("vectorscan prefilter db build failed (fallback disabled)"),
+        );
         let max_prefilter_width = vs
             .as_ref()
             .and_then(|db| db.max_match_width_bounded())
@@ -2283,127 +2306,58 @@ impl Engine {
         let merge_gap = self.tuning.merge_gap as u32;
         let pressure_gap_start = self.tuning.pressure_gap_start as u32;
 
-        // Stage 1: Vectorscan prefilter on raw bytes (best-effort).
-        let mut used_vectorscan = false;
-        let mut saw_utf16 = false;
-
-        let mut vs_allowed = true;
-        if let Some(gate) = self.raw_density_gate.as_ref() {
-            if !gate.allows_hs(buf) {
-                vs_allowed = false;
-            }
-        }
-
-        if vs_allowed {
-            if let Some(vs) = self.vs.as_ref() {
-                if let Some(mut vs_scratch) = scratch.vs_scratch.take() {
+        // Stage 1: Vectorscan prefilter on raw bytes (required).
+        let used_vectorscan = true;
+        let saw_utf16 = if let Some(vs) = self.vs.as_ref() {
+            let mut vs_scratch = scratch
+                .vs_scratch
+                .take()
+                .expect("vectorscan scratch missing");
+            #[cfg(feature = "stats")]
+            self.vs_stats
+                .scans_attempted
+                .fetch_add(1, Ordering::Relaxed);
+            let result = if self.tuning.vs_direct_raw_regex {
+                scratch.raw_hs_matches.clear();
+                vs.scan_raw_capture(buf, scratch, &mut vs_scratch)
+            } else {
+                vs.scan_raw(buf, scratch, &mut vs_scratch)
+            };
+            scratch.vs_scratch = Some(vs_scratch);
+            match result {
+                Ok(saw) => {
                     #[cfg(feature = "stats")]
-                    self.vs_stats
-                        .scans_attempted
-                        .fetch_add(1, Ordering::Relaxed);
-                    let result = if self.tuning.vs_direct_raw_regex {
-                        scratch.raw_hs_matches.clear();
-                        vs.scan_raw_capture(buf, scratch, &mut vs_scratch)
-                    } else {
-                        vs.scan_raw(buf, scratch, &mut vs_scratch)
-                    };
-                    scratch.vs_scratch = Some(vs_scratch);
-                    match result {
-                        Ok(saw) => {
-                            used_vectorscan = true;
-                            saw_utf16 = saw;
-                            #[cfg(feature = "stats")]
-                            self.vs_stats.scans_ok.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(_err) => {
-                            #[cfg(feature = "stats")]
-                            self.vs_stats.scans_err.fetch_add(1, Ordering::Relaxed);
-                            // Roll back partial accumulator state on error.
-                            if scratch.touched_any {
-                                scratch.touched_pairs.clear();
-                                for pair in scratch.touched.iter_set() {
-                                    scratch.touched_pairs.push(pair as u32);
-                                }
-                                scratch.touched.clear();
-                                scratch.touched_any = false;
-                                let touched_len = scratch.touched_pairs.len();
-                                for i in 0..touched_len {
-                                    let pair = scratch.touched_pairs[i] as usize;
-                                    let rid = pair / 3;
-                                    let vidx = pair % 3;
-                                    scratch.accs[rid][vidx].reset();
-                                }
-                                scratch.touched_pairs.clear();
-                            }
-                        }
-                    }
+                    self.vs_stats.scans_ok.fetch_add(1, Ordering::Relaxed);
+                    saw
+                }
+                Err(err) => {
+                    #[cfg(feature = "stats")]
+                    self.vs_stats.scans_err.fetch_add(1, Ordering::Relaxed);
+                    panic!("vectorscan scan failed with fallback disabled: {err}");
                 }
             }
-        }
-
-        let mut used_vectorscan_utf16 = false;
-
-        if used_vectorscan {
-            used_vectorscan_utf16 = saw_utf16;
         } else {
-            // Fallback: seed a full-buffer window for raw variants.
-            let max_hits = self.tuning.max_anchor_hits_per_rule_variant;
-            for rid in 0..self.rules.len() {
-                scratch.accs[rid][Variant::Raw.idx()].push(0, hay_len as usize, max_hits);
-                scratch.mark_touched(rid, Variant::Raw);
-            }
-
-            // Decide whether we need the UTF-16 anchor scan (fallback path only).
-            let need_utf16_anchor_scan =
-                self.tuning.scan_utf16_variants && memchr(0, buf).is_some();
-            if need_utf16_anchor_scan {
-                if let Some(vs_utf16) = self.vs_utf16.as_ref() {
-                    if let Some(mut vs_scratch) = scratch.vs_utf16_scratch.take() {
-                        #[cfg(feature = "stats")]
-                        self.vs_stats
-                            .utf16_scans_attempted
-                            .fetch_add(1, Ordering::Relaxed);
-                        let result = vs_utf16.scan_utf16(buf, scratch, &mut vs_scratch);
-                        scratch.vs_utf16_scratch = Some(vs_scratch);
-                        used_vectorscan_utf16 = true;
-                        match result {
-                            Ok(()) => {
-                                #[cfg(feature = "stats")]
-                                self.vs_stats.utf16_scans_ok.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Err(_err) => {
-                                #[cfg(feature = "stats")]
-                                self.vs_stats
-                                    .utf16_scans_err
-                                    .fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if used_vectorscan {
-            if let Some(vs) = self.vs.as_ref() {
-                if !vs.raw_missing_rules().is_empty() {
-                    let max_hits = self.tuning.max_anchor_hits_per_rule_variant;
-                    for &rid in vs.raw_missing_rules() {
-                        let rid = rid as usize;
-                        scratch.accs[rid][Variant::Raw.idx()].push(0, hay_len as usize, max_hits);
-                        scratch.mark_touched(rid, Variant::Raw);
-                    }
-                }
-            }
-        }
-
-        let raw_missing_rules = if used_vectorscan {
-            self.vs
-                .as_ref()
-                .map(|db| db.raw_missing_rules())
-                .unwrap_or(&[])
-        } else {
-            &[]
+            panic!("vectorscan prefilter database unavailable (fallback disabled)");
         };
+
+        let used_vectorscan_utf16 = saw_utf16;
+
+        if let Some(vs) = self.vs.as_ref() {
+            if !vs.raw_missing_rules().is_empty() {
+                let max_hits = self.tuning.max_anchor_hits_per_rule_variant;
+                for &rid in vs.raw_missing_rules() {
+                    let rid = rid as usize;
+                    scratch.accs[rid][Variant::Raw.idx()].push(0, hay_len as usize, max_hits);
+                    scratch.mark_touched(rid, Variant::Raw);
+                }
+            }
+        }
+
+        let raw_missing_rules = self
+            .vs
+            .as_ref()
+            .map(|db| db.raw_missing_rules())
+            .unwrap_or(&[]);
 
         if used_vectorscan && self.tuning.vs_direct_raw_regex {
             let raw_matches: Vec<RawHsMatch> = scratch.raw_hs_matches.drain(..).collect();

@@ -1261,13 +1261,15 @@ impl VsPrefilterDb {
         const RAW_FLAGS: c_uint = vs::HS_FLAG_SOM_LEFTMOST as c_uint;
 
         #[derive(Clone)]
-        struct RawPattern {
+        struct RawPattern<'a> {
             rule_id: u32,
             seed_radius: u32,
             c_pat: CString,
+            name: &'a str,
+            pattern: &'a str,
         }
 
-        let mut raw_patterns: Vec<RawPattern> = Vec::with_capacity(rules.len());
+        let mut raw_patterns: Vec<RawPattern<'_>> = Vec::with_capacity(rules.len());
         let mut max_width = 0u32;
         let mut unbounded = false;
 
@@ -1291,6 +1293,8 @@ impl VsPrefilterDb {
                 rule_id: rid as u32,
                 seed_radius: usize_to_u32_saturating(seed_radius),
                 c_pat,
+                name: r.name,
+                pattern: r.re.as_str(),
             });
         }
 
@@ -1314,7 +1318,7 @@ impl VsPrefilterDb {
         }
         let platform = unsafe { platform.assume_init() };
 
-        let compile_db = |raw: &[RawPattern]| -> Result<*mut vs::hs_database_t, String> {
+        let compile_db = |raw: &[RawPattern<'_>]| -> Result<*mut vs::hs_database_t, String> {
             let utf16_len = utf16_data.as_ref().map_or(0, |d| d.pat_lens.len());
             let mut c_patterns: Vec<CString> =
                 Vec::with_capacity(raw.len().saturating_add(utf16_len));
@@ -1384,7 +1388,7 @@ impl VsPrefilterDb {
             Ok(db)
         };
 
-        let compile_single = |pat: &RawPattern| -> Result<(), String> {
+        let compile_single = |pat: &RawPattern<'_>| -> Result<(), String> {
             let expr_ptrs = [pat.c_pat.as_ptr()];
             let flags = [RAW_FLAGS];
             let ids = [0u32];
@@ -1437,12 +1441,26 @@ impl VsPrefilterDb {
             Ok(db) => db,
             Err(_err) => {
                 raw_kept.clear();
+                let mut errors = Vec::new();
                 for pat in &raw_patterns {
-                    if compile_single(pat).is_ok() {
-                        raw_kept.push(pat.clone());
-                    } else {
-                        raw_missing_rules.push(pat.rule_id);
+                    match compile_single(pat) {
+                        Ok(()) => raw_kept.push(pat.clone()),
+                        Err(err) => {
+                            raw_missing_rules.push(pat.rule_id);
+                            errors.push(format!(
+                                "rule='{}' pattern='{}' error={}",
+                                pat.name, pat.pattern, err
+                            ));
+                        }
                     }
+                }
+
+                if !errors.is_empty() {
+                    return Err(format!(
+                        "vectorscan raw db compile failed for {} rules:\n{}",
+                        errors.len(),
+                        errors.join("\n")
+                    ));
                 }
 
                 if raw_kept.is_empty() && utf16_data.as_ref().is_none_or(|d| d.pat_lens.is_empty())
@@ -1452,14 +1470,6 @@ impl VsPrefilterDb {
                 compile_db(&raw_kept)?
             }
         };
-
-        if raw_missing_rules.is_empty() && raw_kept.len() != raw_patterns.len() {
-            for pat in &raw_patterns {
-                if !raw_kept.iter().any(|p| p.rule_id == pat.rule_id) {
-                    raw_missing_rules.push(pat.rule_id);
-                }
-            }
-        }
 
         let raw_rule_ids: Vec<u32> = raw_kept.iter().map(|p| p.rule_id).collect();
         let raw_seed_radius: Vec<u32> = raw_kept.iter().map(|p| p.seed_radius).collect();
