@@ -33,8 +33,8 @@
 //! # Design choices
 //! - If window math saturates `u32`, we fall back to whole-buffer windows rather
 //!   than risking under-seeding.
-//! - UTF-16 scanning always uses anchor databases; Vectorscan only gates raw-
-//!   byte and decoded-stream variants.
+//! - UTF-16 scanning always uses anchor databases; Vectorscan only gates
+//!   raw-byte and decoded-stream variants.
 use crate::api::{RuleSpec, Tuning};
 use libc::{c_char, c_int, c_uint, c_void};
 use std::ffi::CString;
