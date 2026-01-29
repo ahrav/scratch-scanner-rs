@@ -298,8 +298,7 @@ impl UrlSpanStream {
         if self.done || !self.in_run {
             return;
         }
-        if self.triggers > 0 && self.run_len >= self.min_len && !on_span(self.start, end_offset)
-        {
+        if self.triggers > 0 && self.run_len >= self.min_len && !on_span(self.start, end_offset) {
             self.done = true;
         }
         self.in_run = false;

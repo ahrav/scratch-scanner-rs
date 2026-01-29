@@ -240,7 +240,6 @@ fn bench_size_sweep(c: &mut Criterion) {
         });
     }
     b64_group.finish();
-
 }
 
 fn bench_decode_url(c: &mut Criterion) {

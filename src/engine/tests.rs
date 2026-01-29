@@ -663,8 +663,8 @@ fn reference_scan_keys(engine: &Engine, rules: &[RuleSpec], buf: &[u8]) -> HashS
                 }
 
                 if tc.gate == Gate::AnchorsInDecoded {
-                    let enforce_gate = !engine.tuning.scan_utf16_variants
-                        || !engine.has_utf16_anchors;
+                    let enforce_gate =
+                        !engine.tuning.scan_utf16_variants || !engine.has_utf16_anchors;
                     if enforce_gate && !decoded_prefilter_hit(engine, &decoded) {
                         continue;
                     }

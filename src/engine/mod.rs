@@ -43,8 +43,8 @@ use crate::stdx::{ByteRing, DynamicBitSet, FixedSet128};
 use ahash::AHashMap;
 use memchr::{memchr, memmem};
 use regex::bytes::Regex;
-use std::ops::{ControlFlow, Range};
 use std::collections::BinaryHeap;
+use std::ops::{ControlFlow, Range};
 #[cfg(feature = "stats")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -56,8 +56,8 @@ mod vectorscan_prefilter;
 use self::helpers::*;
 use self::transform::*;
 use self::vectorscan_prefilter::{
-    stream_match_callback, VsAnchorDb, VsPrefilterDb, VsScratch, VsStreamDb,
-    VsStreamMatchCtx, VsStreamWindow,
+    stream_match_callback, VsAnchorDb, VsPrefilterDb, VsScratch, VsStreamDb, VsStreamMatchCtx,
+    VsStreamWindow,
 };
 
 #[cfg(test)]
@@ -562,11 +562,11 @@ pub struct ScanScratch {
     /// Fixed capacity ensures no allocations during the scan loop; the tuning
     /// parameter `max_work_items` determines the upper bound.
     work_q: ScratchVec<WorkItem>,
-    work_head: usize,                       // Cursor into work_q.
-    slab: DecodeSlab,                       // Decoded output storage.
-    seen: FixedSet128,                      // Dedupe for decoded buffers.
-    total_decode_output_bytes: usize,       // Global decode budget tracker.
-    work_items_enqueued: usize,             // Work queue budget tracker.
+    work_head: usize,                 // Cursor into work_q.
+    slab: DecodeSlab,                 // Decoded output storage.
+    seen: FixedSet128,                // Dedupe for decoded buffers.
+    total_decode_output_bytes: usize, // Global decode budget tracker.
+    work_items_enqueued: usize,       // Work queue budget tracker.
     /// Streaming decoded-byte ring buffer for window capture.
     decode_ring: ByteRing,
     /// Temporary buffer for materializing decoded windows from the ring.
@@ -581,13 +581,13 @@ pub struct ScanScratch {
     span_streams: Vec<SpanStreamEntry>,
     /// Temporary findings buffer for a decoded stream (dedupe-aware).
     tmp_findings: Vec<FindingRec>,
-    accs: Vec<[HitAccumulator; 3]>,         // Per (rule, variant) hit accumulators.
-    touched_pairs: ScratchVec<u32>,         // Scratch list of touched pairs.
-    touched: DynamicBitSet,                 // Bitset for touched pairs.
-    touched_any: bool,                      // Fast path for "none touched".
-    windows: ScratchVec<SpanU32>,           // Merged windows for a pair.
-    expanded: ScratchVec<SpanU32>,          // Expanded windows for two-phase rules.
-    spans: ScratchVec<SpanU32>,             // Transform span candidates.
+    accs: Vec<[HitAccumulator; 3]>, // Per (rule, variant) hit accumulators.
+    touched_pairs: ScratchVec<u32>, // Scratch list of touched pairs.
+    touched: DynamicBitSet,         // Bitset for touched pairs.
+    touched_any: bool,              // Fast path for "none touched".
+    windows: ScratchVec<SpanU32>,   // Merged windows for a pair.
+    expanded: ScratchVec<SpanU32>,  // Expanded windows for two-phase rules.
+    spans: ScratchVec<SpanU32>,     // Transform span candidates.
     /// Decode provenance arena.
     ///
     /// Stores parent-linked decode steps so findings can reconstruct their
@@ -877,14 +877,16 @@ impl ScanScratch {
             self.pending_windows = BinaryHeap::with_capacity(pending_cap);
         }
         if self.vs_stream_matches.capacity() < pending_cap {
-            self.vs_stream_matches.reserve(pending_cap - self.vs_stream_matches.capacity());
+            self.vs_stream_matches
+                .reserve(pending_cap - self.vs_stream_matches.capacity());
         }
         if self.pending_spans.capacity() < max_spans.max(16) {
             self.pending_spans
                 .reserve(max_spans.max(16) - self.pending_spans.capacity());
         }
         if self.span_streams.capacity() < engine.transforms.len() {
-            self.span_streams.reserve(engine.transforms.len() - self.span_streams.capacity());
+            self.span_streams
+                .reserve(engine.transforms.len() - self.span_streams.capacity());
         }
         if self.tmp_findings.capacity() < self.max_findings {
             self.tmp_findings
@@ -1197,7 +1199,6 @@ impl VectorscanCounters {
         }
     }
 }
-
 
 impl Engine {
     /// Compiles rule specs into an engine with Vectorscan prefilters and gates.
@@ -1549,8 +1550,7 @@ impl Engine {
                     .max()
             })
             .unwrap_or(0);
-        let max_anchor_window_bytes = max_window_diameter_bytes
-            .saturating_add(max_anchor_pat_len);
+        let max_anchor_window_bytes = max_window_diameter_bytes.saturating_add(max_anchor_pat_len);
         let stream_ring_bytes = max_stream_window_bytes
             .max(max_encoded_len)
             .max(max_anchor_window_bytes)
@@ -3141,9 +3141,7 @@ impl Engine {
                     match result {
                         Ok(()) => {
                             #[cfg(feature = "stats")]
-                            self.vs_stats
-                                .utf16_scans_ok
-                                .fetch_add(1, Ordering::Relaxed);
+                            self.vs_stats.utf16_scans_ok.fetch_add(1, Ordering::Relaxed);
                         }
                         Err(_) => {
                             #[cfg(feature = "stats")]
@@ -3219,8 +3217,10 @@ impl Engine {
                             );
 
                             if let Some(tp) = &rule.two_phase {
-                                let seed_radius_bytes = tp.seed_radius.saturating_mul(variant.scale());
-                                let full_radius_bytes = tp.full_radius.saturating_mul(variant.scale());
+                                let seed_radius_bytes =
+                                    tp.seed_radius.saturating_mul(variant.scale());
+                                let full_radius_bytes =
+                                    tp.full_radius.saturating_mul(variant.scale());
                                 let extra = full_radius_bytes.saturating_sub(seed_radius_bytes);
 
                                 scratch.expanded.clear();
@@ -3333,8 +3333,7 @@ impl Engine {
         }
 
         if local_dropped > 0 {
-            scratch.findings_dropped =
-                scratch.findings_dropped.saturating_add(local_dropped);
+            scratch.findings_dropped = scratch.findings_dropped.saturating_add(local_dropped);
         }
         let mut tmp_findings = std::mem::take(&mut scratch.tmp_findings);
         for rec in tmp_findings.drain(..) {
@@ -3366,7 +3365,6 @@ impl Engine {
         let _ = enqueued;
         let _ = (transform_idx, base_offset, file_id);
     }
-
 }
 // --------------------------
 // Compile helpers
@@ -3516,8 +3514,7 @@ pub use self::validator::{
 };
 
 #[cfg(feature = "bench")]
-impl Engine {
-}
+impl Engine {}
 
 #[cfg(test)]
 mod tests;
