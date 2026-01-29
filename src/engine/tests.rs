@@ -1858,7 +1858,7 @@ fn tiger_boundary_base64_padding_split() {
 
 #[test]
 fn base64_gate_utf16be_anchor_straddles_stream_boundary() {
-    // The base64 stream decoder flushes output in ~1KB chunks (1020 bytes),
+    // The base64 stream decoder flushes output in bounded chunks,
     // so we place a UTF-16BE anchor so its final byte lands in a 1-byte tail
     // chunk. The gate must inspect tail+chunk to see the NULs and match.
     let rule = RuleSpec {
@@ -1893,7 +1893,7 @@ fn base64_gate_utf16be_anchor_straddles_stream_boundary() {
         Engine::new_with_anchor_policy(vec![rule], vec![tc], tuning, AnchorPolicy::ManualOnly);
 
     let utf16 = utf16be_bytes(b"TOK");
-    let flush_len = 1020usize; // stream_decode_base64 flush threshold
+    let flush_len = super::transform::STREAM_DECODE_CHUNK_BYTES.saturating_sub(4);
     let prefix_len = flush_len - (utf16.len().saturating_sub(1));
 
     let mut decoded = vec![b'A'; prefix_len];

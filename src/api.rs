@@ -14,7 +14,7 @@
 //! - Hot-path offsets are stored as `u32`; callers must chunk inputs so any
 //!   single buffer fits in `u32::MAX` bytes.
 //!
-//! # High-level flow
+//! # Algorithm
 //! 1. Findings are accumulated as compact `FindingRec` values on the hot path.
 //! 2. `FindingRec` is later materialized into `Finding` by expanding the decode-step chain.
 //! 3. Optional transform decoding is bounded by per-rule and global budgets.
@@ -85,6 +85,7 @@ pub enum TransformMode {
 
     /// Correctness trade (explicit).
     /// Skips this transform if this buffer already produced any findings.
+    /// Findings are scoped to the current buffer (derived buffers are not considered).
     /// This can miss findings that only appear in nested encodings.
     IfNoFindingsInThisBuffer,
 }
@@ -123,6 +124,11 @@ pub struct TransformConfig {
     pub mode: TransformMode,
 
     /// Gate policy (if enabled).
+    ///
+    /// When set to `AnchorsInDecoded`, the engine scans decoded bytes for any
+    /// anchor variant and discards the decoded buffer if none are found. For
+    /// Base64, an extra encoded-space prefilter may skip decoding before this
+    /// gate runs.
     pub gate: Gate,
 
     /// Minimum encoded length to consider for span detection.
@@ -169,7 +175,8 @@ impl TransformConfig {
 
 /// Base64 decode/gate instrumentation counters.
 ///
-/// Counters saturate on overflow.
+/// # Guarantees
+/// - Counters saturate on overflow.
 #[cfg(feature = "b64-stats")]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Base64DecodeStats {
@@ -284,6 +291,9 @@ pub type DecodeSteps = FixedVec<DecodeStep, MAX_DECODE_STEPS>;
 /// # Guarantees
 /// - `span` and `root_span_hint` are half-open byte ranges.
 /// - `decode_steps` describes how to reach the representation where `span` applies.
+///
+/// # Performance
+/// - `Finding` is the materialized, user-facing form; keep `FindingRec` on the hot path.
 #[derive(Clone, Debug)]
 pub struct Finding {
     /// Rule name that produced this finding.
@@ -311,11 +321,15 @@ pub struct Finding {
 ///
 /// This is later materialized into [`Finding`] by expanding the decode-step chain.
 ///
+/// # Performance
+/// - Fixed-width fields keep the record compact and `Copy` for ring buffers.
+///
 /// # Invariants
 /// - `span_start..span_end` is a half-open range in the current buffer.
 /// - `root_hint_start..root_hint_end` is a half-open range in the root file buffer.
 /// - `span_start`/`span_end` must fit in `u32`; callers must chunk inputs accordingly.
 /// - `step_id` is only valid while the originating scratch arena is alive and not reset.
+/// - `step_id == STEP_ROOT` denotes a root-buffer finding with no decode steps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FindingRec {
     /// Source file id for the finding.
@@ -438,6 +452,8 @@ impl ValidatorKind {
 }
 
 /// Post-match delimiter requirement for token-like rules.
+///
+/// Delimiter checks operate on raw bytes, not Unicode scalars.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DelimAfter {
     /// No delimiter requirement; the match may be followed by any byte or end.
@@ -448,6 +464,8 @@ pub enum DelimAfter {
 }
 
 /// Tail character class for validator checks.
+///
+/// All charsets are ASCII byte classes applied to raw bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TailCharset {
     /// `[A-Z0-9]`
@@ -550,10 +568,14 @@ impl RuleSpec {
 
 /// Shannon-entropy gate configuration.
 ///
+/// # Algorithm
 /// - Entropy is computed over the matched byte slice (full regex match).
-/// - Threshold is bits/byte in [0.0, 8.0].
 /// - Matches shorter than `min_len` pass (entropy is noisy on tiny samples).
 /// - Matches longer than `max_len` are capped for cost control (first `max_len` bytes).
+///
+/// # Invariants
+/// - Threshold is bits/byte in [0.0, 8.0].
+/// - `min_len <= max_len`.
 #[derive(Clone, Debug)]
 pub struct EntropySpec {
     /// Minimum entropy threshold in bits/byte.
@@ -625,6 +647,13 @@ pub struct Tuning {
     /// When false, only raw anchors are scanned (UTF-16 is skipped even if NULs
     /// are present). This is useful for modes that avoid binary/UTF-16 content.
     pub scan_utf16_variants: bool,
+
+    /// When true, treat raw Vectorscan regex matches as exact candidates and
+    /// validate them directly (skip window expansion + regex re-scan).
+    ///
+    /// This uses the Vectorscan regex engine as the primary matcher for raw
+    /// rules and still applies post-match entropy gating.
+    pub vs_direct_raw_regex: bool,
 }
 
 impl Tuning {
@@ -644,6 +673,7 @@ impl Tuning {
 /// Policy for selecting anchors during engine compilation.
 ///
 /// Determines whether to derive anchors from regexes, use manual anchors, or both.
+/// This choice only affects compilation; runtime scanning uses the compiled anchors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnchorPolicy {
     /// Prefer derived anchors, falling back to manual anchors if derivation fails.

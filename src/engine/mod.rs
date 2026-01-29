@@ -1,13 +1,11 @@
-//! Core scanning engine: rule compilation, prefilters, and scan execution.
-//!
-//! Purpose: compile rule specs into anchors and gates, then scan buffers with
-//! bounded work and reuse scratch allocations.
+//! Core scanning engine: compiles rule specs into anchors/gates and executes
+//! bounded scans with reusable scratch allocations.
 //!
 //! # Algorithm
-//! 1. Compile rules into anchor patterns and fast gates (keywords/confirm-all).
-//! 2. Prefilter input buffers and build candidate windows.
-//! 3. Run validators, gates, and regexes inside those windows.
-//! 4. Optionally decode transform spans into derived buffers and repeat (BFS).
+//! 1. Compile rules into anchor patterns, confirm-all literals, and keyword gates.
+//! 2. Prefilter input buffers (Vectorscan / gates) to build candidate windows.
+//! 3. Validate windows with regexes/validators and record compact findings.
+//! 4. Optionally decode transform spans into derived buffers and repeat via BFS.
 //!
 //! # Invariants
 //! - The engine is immutable after construction; all mutable scan state lives in
@@ -24,6 +22,11 @@
 //!   fast path for NUL-free buffers.
 //! - Vectorscan prefiltering is enabled by default but best-effort; if the
 //!   prefilter DB fails to compile, we fall back to full-buffer windows.
+//!
+//! # Safety
+//! - Unsafe slices are formed only from ranges validated against the root buffer,
+//!   the decode slab, or scratch-owned temporary buffers; those buffers are not
+//!   reallocated while the slices are in use.
 //!
 //! # Design Notes
 //! - The engine favors predictable cost over perfect precision: span/anchor
@@ -47,16 +50,18 @@ use std::ops::{ControlFlow, Range};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod helpers;
+mod raw_density_gate;
 mod transform;
 mod validator;
 mod vectorscan_prefilter;
 
 use self::helpers::*;
+use self::raw_density_gate::RawDensityGate;
 use self::transform::*;
 use self::vectorscan_prefilter::{
-    gate_match_callback, stream_match_callback, utf16_stream_match_callback, VsAnchorDb, VsGateDb,
-    VsPrefilterDb, VsScratch, VsStream, VsStreamDb, VsStreamMatchCtx, VsStreamWindow,
-    VsUtf16StreamDb, VsUtf16StreamMatchCtx,
+    gate_match_callback, stream_match_callback, utf16_stream_match_callback, Utf16AnchorInput,
+    VsAnchorDb, VsGateDb, VsPrefilterDb, VsScratch, VsStream, VsStreamDb, VsStreamMatchCtx,
+    VsStreamWindow, VsUtf16StreamDb, VsUtf16StreamMatchCtx,
 };
 
 #[cfg(test)]
@@ -72,6 +77,10 @@ use crate::runtime::{ScannerConfig, ScannerRuntime};
 /// Raw anchors match input bytes directly. UTF-16 variants match byte-encoded
 /// UTF-16LE/BE anchors and double window radii via `scale()` so windows are
 /// sized in bytes, not code units.
+///
+/// # Invariants
+/// - `idx()` ordering is stable and used for packed tables and array slots.
+/// - `scale()` returns 1 for raw and 2 for UTF-16 variants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Variant {
     Raw,
@@ -126,6 +135,10 @@ impl Variant {
 /// by this specific anchor (so the validator can remain authoritative).
 ///
 /// Layout (low bits): [variant (2)] [match_start] [keyword_implied] [rule_id...]
+///
+/// # Invariants
+/// - `rule_id` fits in the upper bits after `VARIANT_SHIFT`.
+/// - The low-bit layout is stable and must match `variant()` and flag accessors.
 #[derive(Clone, Copy, Debug)]
 struct Target(u32);
 
@@ -178,7 +191,14 @@ impl Target {
 /// confirm patterns contiguous for cache-friendly memmem checks (both ANY and
 /// ALL gates).
 ///
-/// Invariant: `offsets[0] == 0` and `bytes.len() <= u32::MAX`.
+/// # Invariants
+/// - `offsets[0] == 0` and the last offset equals `bytes.len()`.
+/// - `offsets` is monotonically non-decreasing.
+/// - `bytes.len() <= u32::MAX`.
+///
+/// # Performance
+/// - Contiguous storage enables cache-friendly `memmem` gates without
+///   per-window allocations.
 #[derive(Clone, Debug)]
 struct PackedPatterns {
     bytes: Vec<u8>,
@@ -224,6 +244,12 @@ impl PackedPatterns {
 ///
 /// Stores prepacked confirm patterns per variant so the scan loop can run
 /// memmem without per-hit allocation or UTF-16 conversions.
+///
+/// # Guarantees
+/// - `confirm` entries are encoded per variant and indexed by `Variant::idx()`.
+///
+/// # Invariants
+/// - Radii and pattern lengths are validated by `RuleSpec::assert_valid`.
 #[derive(Clone, Debug)]
 struct TwoPhaseCompiled {
     seed_radius: usize,
@@ -233,6 +259,10 @@ struct TwoPhaseCompiled {
     confirm: [PackedPatterns; 3],
 }
 
+/// Keyword gate compiled per variant for fast "any keyword" checks.
+///
+/// # Guarantees
+/// - `any` is encoded per variant and indexed by `Variant::idx()`.
 #[derive(Clone, Debug)]
 struct KeywordsCompiled {
     // Raw / Utf16Le / Utf16Be variants packed for fast memmem gating.
@@ -248,12 +278,20 @@ struct KeywordsCompiled {
 /// - The remaining literals are checked with AND semantics using PackedPatterns.
 /// - UTF-16 variants are encoded the same way as anchors/keywords so we can
 ///   reject windows before decoding.
+///
+/// # Guarantees
+/// - `primary` holds the longest literal (per `compile_confirm_all` sorting).
+/// - `rest` is encoded per variant and indexed by `Variant::idx()`.
 #[derive(Clone, Debug)]
 struct ConfirmAllCompiled {
     primary: [Option<Vec<u8>>; 3],
     rest: [PackedPatterns; 3],
 }
 
+/// Entropy gate parameters compiled into a rule.
+///
+/// # Invariants
+/// - Values are validated by `RuleSpec::assert_valid`.
 #[derive(Clone, Copy, Debug)]
 struct EntropyCompiled {
     // Prevalidated config stored in compiled rules to avoid repeated lookups.
@@ -267,6 +305,11 @@ struct EntropyCompiled {
 ///
 /// This keeps precompiled regexes and optional two-phase data to minimize
 /// work in the hot path.
+///
+/// # Invariants
+/// - All fields are derived from a validated `RuleSpec`.
+/// - Optional gates (`confirm_all`, `keywords`, `entropy`, `two_phase`) are
+///   internally consistent with `variant` indexing.
 #[derive(Clone, Debug)]
 struct RuleCompiled {
     name: &'static str,
@@ -286,8 +329,20 @@ struct RuleCompiled {
 /// Uses `u32` offsets to reduce memory footprint and improve cache density.
 /// Valid only for buffers whose length fits in `u32`. Spans are half-open
 /// ranges (`start..end`).
+///
+/// # Invariants
+/// - `start <= end` and both fit in `u32`.
+/// - Only valid while the referenced buffer remains unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SpanU32 {
+    start: u32,
+    end: u32,
+}
+
+/// Raw Vectorscan match used when direct regex capture is enabled.
+#[derive(Clone, Copy, Debug)]
+struct RawHsMatch {
+    rule_id: u32,
     start: u32,
     end: u32,
 }
@@ -318,6 +373,12 @@ impl SpanU32 {
 /// Windows are pushed in non-decreasing order for anchor scans. When switching
 /// to coalesced mode, ordering is no longer meaningful; downstream code must
 /// not assume sorted windows unless it explicitly sorts them.
+///
+/// # Guarantees
+/// - If `coalesced` is set, it is a superset of all hits seen so far.
+///
+/// # Performance
+/// - Per-rule memory is capped at `max_hits`; append stays O(1) until coalesced.
 struct HitAccumulator {
     windows: ScratchVec<SpanU32>,
     coalesced: Option<SpanU32>,
@@ -404,6 +465,9 @@ struct StepNode {
 ///
 /// This is append-only and reset between scans. `StepId` values are only valid
 /// while this arena is alive and not reset.
+///
+/// # Performance
+/// - `push` is O(1); `materialize` is O(depth) for a single finding.
 struct StepArena {
     /// Parent-linked decode step nodes.
     ///
@@ -450,6 +514,14 @@ impl StepArena {
 ///   returned ranges remain valid for the lifetime of a scan.
 ///
 /// The slab is cleared between scans, which invalidates all ranges at once.
+///
+/// # Invariants
+/// - Append operations must not exceed `limit`; on overflow, callers roll back.
+/// - Ranges returned from `append_stream_decode` are valid only until reset or
+///   explicit truncation.
+///
+/// # Performance
+/// - Avoids per-span allocations by reusing a single contiguous buffer.
 struct DecodeSlab {
     buf: Vec<u8>,
     limit: usize,
@@ -519,6 +591,10 @@ impl DecodeSlab {
     }
 }
 
+/// Scratch histogram for entropy gating.
+///
+/// # Performance
+/// - Reset is O(distinct bytes) via the `used` list instead of O(256).
 #[derive(Clone, Copy)]
 struct EntropyScratch {
     // Histogram for byte frequencies (256 bins).
@@ -613,6 +689,8 @@ pub struct ScanScratch {
     windows: ScratchVec<SpanU32>,   // Merged windows for a pair.
     expanded: ScratchVec<SpanU32>,  // Expanded windows for two-phase rules.
     spans: ScratchVec<SpanU32>,     // Transform span candidates.
+    /// Raw Vectorscan regex matches captured for direct validation.
+    raw_hs_matches: Vec<RawHsMatch>,
     /// Decode provenance arena.
     ///
     /// Stores parent-linked decode steps so findings can reconstruct their
@@ -697,6 +775,7 @@ impl ScanScratch {
             pending_spans: Vec::with_capacity(max_spans.max(16)),
             span_streams: Vec::with_capacity(engine.transforms.len()),
             tmp_findings: Vec::with_capacity(max_findings),
+            raw_hs_matches: Vec::new(),
             stream_hit_counts: vec![0u32; rules_len.saturating_mul(3)],
             stream_hit_touched: ScratchVec::with_capacity(rules_len.saturating_mul(3))
                 .expect("scratch stream_hit_touched allocation failed"),
@@ -869,6 +948,7 @@ impl ScanScratch {
         self.windows.clear();
         self.expanded.clear();
         self.spans.clear();
+        self.raw_hs_matches.clear();
 
         let accs_need_rebuild = self.accs.len() != engine.rules.len()
             || self
@@ -1084,6 +1164,9 @@ impl ScanScratch {
 ///
 /// `Root` points to the input chunk. `Slab(range)` points into `DecodeSlab`.
 /// Slab ranges are only valid until the slab is reset or truncated.
+///
+/// # Invariants
+/// - `Slab` ranges must stay within the decode slab for the current scan.
 #[derive(Default, Clone)]
 enum BufRef {
     #[default]
@@ -1092,6 +1175,9 @@ enum BufRef {
 }
 
 /// Reference to an encoded span to decode.
+///
+/// # Invariants
+/// - Ranges are validated against the source buffer before decoding.
 #[derive(Clone)]
 enum EncRef {
     Root(Range<usize>),
@@ -1099,6 +1185,10 @@ enum EncRef {
 }
 
 /// Pending decode span captured during streaming decode.
+///
+/// # Invariants
+/// - `range` indexes into the decode slab for the current scan.
+/// - `depth` is bounded by the transform depth limit.
 #[derive(Clone)]
 struct PendingDecodeSpan {
     transform_idx: usize,
@@ -1108,6 +1198,9 @@ struct PendingDecodeSpan {
     depth: usize,
 }
 
+/// Pending decoded-space window produced by stream scanning.
+///
+/// `Ord` is reversed so `BinaryHeap` yields the smallest `hi` first.
 #[derive(Eq, PartialEq)]
 struct PendingWindow {
     hi: u64,
@@ -1133,11 +1226,13 @@ impl PartialOrd for PendingWindow {
     }
 }
 
+/// Streaming span detector state for nested transforms.
 enum SpanStreamState {
     Url(UrlSpanStream),
     Base64(Base64SpanStream),
 }
 
+/// Per-transform span stream bookkeeping during decoded scanning.
 struct SpanStreamEntry {
     transform_idx: usize,
     mode: TransformMode,
@@ -1150,6 +1245,10 @@ struct SpanStreamEntry {
 ///
 /// Carries the decode provenance (StepId) and a root-span hint for reporting.
 /// Depth enforces the transform recursion limit and keeps traversal iterative.
+///
+/// # Invariants
+/// - `depth` is bounded by the configured transform depth limit.
+/// - `root_hint` is `None` for the root buffer and `Some` for derived buffers.
 enum WorkItem {
     ScanBuf {
         buf: BufRef,
@@ -1211,6 +1310,8 @@ pub struct Engine {
     // compile (unsupported patterns, expression-info failures, etc.).
     // When present, this seeds candidate windows in a single `hs_scan` pass.
     vs: Option<VsPrefilterDb>,
+    // Density gate to decide when raw Vectorscan is worthwhile.
+    raw_density_gate: Option<RawDensityGate>,
     // Optional Vectorscan DB for UTF-16 anchor scanning.
     //
     // When present, this prefilters UTF-16 variants using literal anchors.
@@ -1595,17 +1696,19 @@ impl Engine {
             }
         }
 
-        let (_anchor_patterns_raw, _pat_targets_raw, _pat_offsets_raw) =
+        let (anchor_patterns_raw, _pat_targets_raw, _pat_offsets_raw) =
             map_to_patterns(pat_map_raw);
         let (anchor_patterns_all, _pat_targets_all, _pat_offsets_all) =
             map_to_patterns(pat_map_all);
         let (anchor_patterns_utf16, pat_targets_utf16, pat_offsets_utf16) =
             map_to_patterns(pat_map_utf16);
+        let has_utf16_anchors = !anchor_patterns_utf16.is_empty();
         let max_anchor_pat_len = anchor_patterns_all
             .iter()
             .map(|p| p.len())
             .max()
             .unwrap_or(0);
+        let raw_density_gate = RawDensityGate::build(&anchor_patterns_raw);
 
         // Build the base64 pre-gate from the same anchor universe as the decoded gate:
         // raw anchors plus UTF-16 variants. This keeps the pre-gate *sound* with
@@ -1662,7 +1765,17 @@ impl Engine {
 
         // Optional optimization. If the DB can't be built (e.g. regex syntax
         // incompatibility), fall back to full-buffer raw windows.
-        let vs = VsPrefilterDb::try_new(&rules, &tuning).ok();
+        let utf16_input = if tuning.scan_utf16_variants && has_utf16_anchors {
+            Some(Utf16AnchorInput {
+                patterns: &anchor_patterns_utf16,
+                pat_targets: &pat_targets_utf16,
+                pat_offsets: &pat_offsets_utf16,
+                seed_radius_bytes: &utf16_seed_radius_bytes,
+            })
+        } else {
+            None
+        };
+        let vs = VsPrefilterDb::try_new(&rules, &tuning, utf16_input).ok();
         let max_prefilter_width = vs
             .as_ref()
             .and_then(|db| db.max_match_width_bounded())
@@ -1695,8 +1808,8 @@ impl Engine {
         let stream_ring_bytes = max_stream_window_bytes
             .max(max_encoded_len)
             .max(max_anchor_window_bytes)
+            .max(STREAM_DECODE_CHUNK_BYTES)
             .max(1);
-        let has_utf16_anchors = !anchor_patterns_utf16.is_empty();
         let vs_utf16 = if !has_utf16_anchors {
             None
         } else {
@@ -1741,6 +1854,7 @@ impl Engine {
             tuning,
             entropy_log2,
             vs,
+            raw_density_gate,
             vs_utf16,
             vs_utf16_stream,
             vs_stream,
@@ -2145,6 +2259,14 @@ impl Engine {
         }
     }
 
+    /// Applies the prefilter/gating pipeline to a single buffer variant.
+    ///
+    /// # Preconditions
+    /// - `buf.len() <= u32::MAX` and `scratch` belongs to the current scan.
+    ///
+    /// # Effects
+    /// - Populates per-rule hit windows and emits findings into `scratch`.
+    /// - May decode UTF-16 windows for validation when enabled.
     fn scan_rules_on_buffer(
         &self,
         buf: &[u8],
@@ -2163,93 +2285,146 @@ impl Engine {
 
         // Stage 1: Vectorscan prefilter on raw bytes (best-effort).
         let mut used_vectorscan = false;
-        let mut saw_nul = false;
+        let mut saw_utf16 = false;
 
-        if let Some(vs) = self.vs.as_ref() {
-            if let Some(mut vs_scratch) = scratch.vs_scratch.take() {
-                #[cfg(feature = "stats")]
-                self.vs_stats
-                    .scans_attempted
-                    .fetch_add(1, Ordering::Relaxed);
-                let result = vs.scan_raw(buf, scratch, &mut vs_scratch);
-                scratch.vs_scratch = Some(vs_scratch);
-                match result {
-                    Ok(nul) => {
-                        used_vectorscan = true;
-                        saw_nul = nul;
-                        #[cfg(feature = "stats")]
-                        self.vs_stats.scans_ok.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(_err) => {
-                        #[cfg(feature = "stats")]
-                        self.vs_stats.scans_err.fetch_add(1, Ordering::Relaxed);
-                        // Roll back partial accumulator state on error.
-                        if scratch.touched_any {
-                            scratch.touched_pairs.clear();
-                            for pair in scratch.touched.iter_set() {
-                                scratch.touched_pairs.push(pair as u32);
+        let mut vs_allowed = true;
+        if let Some(gate) = self.raw_density_gate.as_ref() {
+            if !gate.allows_hs(buf) {
+                vs_allowed = false;
+            }
+        }
+
+        if vs_allowed {
+            if let Some(vs) = self.vs.as_ref() {
+                if let Some(mut vs_scratch) = scratch.vs_scratch.take() {
+                    #[cfg(feature = "stats")]
+                    self.vs_stats
+                        .scans_attempted
+                        .fetch_add(1, Ordering::Relaxed);
+                    let result = if self.tuning.vs_direct_raw_regex {
+                        scratch.raw_hs_matches.clear();
+                        vs.scan_raw_capture(buf, scratch, &mut vs_scratch)
+                    } else {
+                        vs.scan_raw(buf, scratch, &mut vs_scratch)
+                    };
+                    scratch.vs_scratch = Some(vs_scratch);
+                    match result {
+                        Ok(saw) => {
+                            used_vectorscan = true;
+                            saw_utf16 = saw;
+                            #[cfg(feature = "stats")]
+                            self.vs_stats.scans_ok.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(_err) => {
+                            #[cfg(feature = "stats")]
+                            self.vs_stats.scans_err.fetch_add(1, Ordering::Relaxed);
+                            // Roll back partial accumulator state on error.
+                            if scratch.touched_any {
+                                scratch.touched_pairs.clear();
+                                for pair in scratch.touched.iter_set() {
+                                    scratch.touched_pairs.push(pair as u32);
+                                }
+                                scratch.touched.clear();
+                                scratch.touched_any = false;
+                                let touched_len = scratch.touched_pairs.len();
+                                for i in 0..touched_len {
+                                    let pair = scratch.touched_pairs[i] as usize;
+                                    let rid = pair / 3;
+                                    let vidx = pair % 3;
+                                    scratch.accs[rid][vidx].reset();
+                                }
+                                scratch.touched_pairs.clear();
                             }
-                            scratch.touched.clear();
-                            scratch.touched_any = false;
-                            let touched_len = scratch.touched_pairs.len();
-                            for i in 0..touched_len {
-                                let pair = scratch.touched_pairs[i] as usize;
-                                let rid = pair / 3;
-                                let vidx = pair % 3;
-                                scratch.accs[rid][vidx].reset();
-                            }
-                            scratch.touched_pairs.clear();
                         }
                     }
                 }
             }
         }
 
-        if !used_vectorscan {
+        let mut used_vectorscan_utf16 = false;
+
+        if used_vectorscan {
+            used_vectorscan_utf16 = saw_utf16;
+        } else {
             // Fallback: seed a full-buffer window for raw variants.
             let max_hits = self.tuning.max_anchor_hits_per_rule_variant;
             for rid in 0..self.rules.len() {
                 scratch.accs[rid][Variant::Raw.idx()].push(0, hay_len as usize, max_hits);
                 scratch.mark_touched(rid, Variant::Raw);
             }
-        }
 
-        // Decide whether we need the UTF-16 anchor scan.
-        //
-        // If Vectorscan ran, we avoid an extra full memchr pass by using the
-        // NUL sentinel result from the same `hs_scan`.
-        let need_utf16_anchor_scan = self.tuning.scan_utf16_variants
-            && if used_vectorscan {
-                saw_nul
-            } else {
-                memchr(0, buf).is_some()
-            };
-
-        let mut used_vectorscan_utf16 = false;
-
-        if need_utf16_anchor_scan {
-            if let Some(vs_utf16) = self.vs_utf16.as_ref() {
-                if let Some(mut vs_scratch) = scratch.vs_utf16_scratch.take() {
-                    #[cfg(feature = "stats")]
-                    self.vs_stats
-                        .utf16_scans_attempted
-                        .fetch_add(1, Ordering::Relaxed);
-                    let result = vs_utf16.scan_utf16(buf, scratch, &mut vs_scratch);
-                    scratch.vs_utf16_scratch = Some(vs_scratch);
-                    used_vectorscan_utf16 = true;
-                    match result {
-                        Ok(()) => {
-                            #[cfg(feature = "stats")]
-                            self.vs_stats.utf16_scans_ok.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(_err) => {
-                            #[cfg(feature = "stats")]
-                            self.vs_stats
-                                .utf16_scans_err
-                                .fetch_add(1, Ordering::Relaxed);
+            // Decide whether we need the UTF-16 anchor scan (fallback path only).
+            let need_utf16_anchor_scan =
+                self.tuning.scan_utf16_variants && memchr(0, buf).is_some();
+            if need_utf16_anchor_scan {
+                if let Some(vs_utf16) = self.vs_utf16.as_ref() {
+                    if let Some(mut vs_scratch) = scratch.vs_utf16_scratch.take() {
+                        #[cfg(feature = "stats")]
+                        self.vs_stats
+                            .utf16_scans_attempted
+                            .fetch_add(1, Ordering::Relaxed);
+                        let result = vs_utf16.scan_utf16(buf, scratch, &mut vs_scratch);
+                        scratch.vs_utf16_scratch = Some(vs_scratch);
+                        used_vectorscan_utf16 = true;
+                        match result {
+                            Ok(()) => {
+                                #[cfg(feature = "stats")]
+                                self.vs_stats.utf16_scans_ok.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(_err) => {
+                                #[cfg(feature = "stats")]
+                                self.vs_stats
+                                    .utf16_scans_err
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
                 }
+            }
+        }
+
+        if used_vectorscan {
+            if let Some(vs) = self.vs.as_ref() {
+                if !vs.raw_missing_rules().is_empty() {
+                    let max_hits = self.tuning.max_anchor_hits_per_rule_variant;
+                    for &rid in vs.raw_missing_rules() {
+                        let rid = rid as usize;
+                        scratch.accs[rid][Variant::Raw.idx()].push(0, hay_len as usize, max_hits);
+                        scratch.mark_touched(rid, Variant::Raw);
+                    }
+                }
+            }
+        }
+
+        let raw_missing_rules = if used_vectorscan {
+            self.vs
+                .as_ref()
+                .map(|db| db.raw_missing_rules())
+                .unwrap_or(&[])
+        } else {
+            &[]
+        };
+
+        if used_vectorscan && self.tuning.vs_direct_raw_regex {
+            let raw_matches: Vec<RawHsMatch> = scratch.raw_hs_matches.drain(..).collect();
+            for m in raw_matches {
+                let rid = m.rule_id as usize;
+                if rid >= self.rules.len() {
+                    continue;
+                }
+                let rule = &self.rules[rid];
+                let w = m.start as usize..m.end as usize;
+                self.run_rule_on_raw_match(
+                    rid as u32,
+                    rule,
+                    buf,
+                    w,
+                    step_id,
+                    root_hint.clone(),
+                    base_offset,
+                    file_id,
+                    scratch,
+                );
             }
         }
 
@@ -2321,74 +2496,155 @@ impl Engine {
                 self.tuning.max_windows_per_rule_variant,
             );
 
-            if let Some(tp) = &rule.two_phase {
-                // Two-phase: confirm in seed windows, then expand.
-                let seed_radius_bytes = tp.seed_radius.saturating_mul(variant.scale());
-                let full_radius_bytes = tp.full_radius.saturating_mul(variant.scale());
-                let extra = full_radius_bytes.saturating_sub(seed_radius_bytes);
+            let allow_two_phase =
+                if used_vectorscan && self.tuning.vs_direct_raw_regex && variant == Variant::Raw {
+                    raw_missing_rules.contains(&(rid as u32))
+                } else {
+                    true
+                };
+            if allow_two_phase {
+                if let Some(tp) = &rule.two_phase {
+                    // Two-phase: confirm in seed windows, then expand.
+                    let seed_radius_bytes = tp.seed_radius.saturating_mul(variant.scale());
+                    let full_radius_bytes = tp.full_radius.saturating_mul(variant.scale());
+                    let extra = full_radius_bytes.saturating_sub(seed_radius_bytes);
 
-                scratch.expanded.clear();
-                let windows_len = scratch.windows.len();
-                for i in 0..windows_len {
-                    let seed = scratch.windows[i];
-                    let seed_range = seed.to_range();
-                    let win = &buf[seed_range.clone()];
-                    if !contains_any_memmem(win, &tp.confirm[vidx]) {
+                    scratch.expanded.clear();
+                    let windows_len = scratch.windows.len();
+                    for i in 0..windows_len {
+                        let seed = scratch.windows[i];
+                        let seed_range = seed.to_range();
+                        let win = &buf[seed_range.clone()];
+                        if !contains_any_memmem(win, &tp.confirm[vidx]) {
+                            continue;
+                        }
+
+                        let lo = seed_range.start.saturating_sub(extra);
+                        let hi = (seed_range.end + extra).min(buf.len());
+                        scratch.expanded.push(SpanU32::new(lo, hi));
+                    }
+
+                    if scratch.expanded.is_empty() {
                         continue;
                     }
 
-                    let lo = seed_range.start.saturating_sub(extra);
-                    let hi = (seed_range.end + extra).min(buf.len());
-                    scratch.expanded.push(SpanU32::new(lo, hi));
-                }
+                    merge_ranges_with_gap_sorted(&mut scratch.expanded, merge_gap);
+                    coalesce_under_pressure_sorted(
+                        &mut scratch.expanded,
+                        hay_len,
+                        pressure_gap_start,
+                        self.tuning.max_windows_per_rule_variant,
+                    );
 
-                if scratch.expanded.is_empty() {
+                    let expanded_len = scratch.expanded.len();
+                    for i in 0..expanded_len {
+                        let w = scratch.expanded[i].to_range();
+                        self.run_rule_on_window(
+                            rid as u32,
+                            rule,
+                            variant,
+                            buf,
+                            w,
+                            step_id,
+                            root_hint.clone(),
+                            base_offset,
+                            file_id,
+                            scratch,
+                        );
+                    }
                     continue;
                 }
+            }
 
-                merge_ranges_with_gap_sorted(&mut scratch.expanded, merge_gap);
-                coalesce_under_pressure_sorted(
-                    &mut scratch.expanded,
-                    hay_len,
-                    pressure_gap_start,
-                    self.tuning.max_windows_per_rule_variant,
+            let win_len = scratch.windows.len();
+            for i in 0..win_len {
+                let w = scratch.windows[i].to_range();
+                self.run_rule_on_window(
+                    rid as u32,
+                    rule,
+                    variant,
+                    buf,
+                    w,
+                    step_id,
+                    root_hint.clone(),
+                    base_offset,
+                    file_id,
+                    scratch,
                 );
-
-                let expanded_len = scratch.expanded.len();
-                for i in 0..expanded_len {
-                    let w = scratch.expanded[i].to_range();
-                    self.run_rule_on_window(
-                        rid as u32,
-                        rule,
-                        variant,
-                        buf,
-                        w,
-                        step_id,
-                        root_hint.clone(),
-                        base_offset,
-                        file_id,
-                        scratch,
-                    );
-                }
-            } else {
-                let win_len = scratch.windows.len();
-                for i in 0..win_len {
-                    let w = scratch.windows[i].to_range();
-                    self.run_rule_on_window(
-                        rid as u32,
-                        rule,
-                        variant,
-                        buf,
-                        w,
-                        step_id,
-                        root_hint.clone(),
-                        base_offset,
-                        file_id,
-                        scratch,
-                    );
-                }
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_rule_on_raw_match(
+        &self,
+        rule_id: u32,
+        rule: &RuleCompiled,
+        buf: &[u8],
+        m: Range<usize>,
+        step_id: StepId,
+        root_hint: Option<Range<usize>>,
+        base_offset: u64,
+        file_id: FileId,
+        scratch: &mut ScanScratch,
+    ) {
+        if m.start >= buf.len() {
+            return;
+        }
+
+        let rm = match rule.re.find_at(buf, m.start) {
+            Some(rm) if rm.start() == m.start => rm,
+            _ => return,
+        };
+
+        let span_in_buf = m.start..rm.end();
+        if span_in_buf.end > buf.len() {
+            return;
+        }
+
+        let radius = if let Some(tp) = &rule.two_phase {
+            tp.full_radius
+        } else {
+            rule.radius
+        };
+        let gate_lo = span_in_buf.start.saturating_sub(radius);
+        let gate_hi = (span_in_buf.end + radius).min(buf.len());
+        let gate_window = &buf[gate_lo..gate_hi];
+
+        if let Some(needle) = rule.must_contain {
+            if memmem::find(gate_window, needle).is_none() {
+                return;
+            }
+        }
+
+        if let Some(kws) = &rule.keywords {
+            if !contains_any_memmem(gate_window, &kws.any[Variant::Raw.idx()]) {
+                return;
+            }
+        }
+
+        if let Some(ent) = rule.entropy {
+            let mbytes = &buf[span_in_buf.clone()];
+            if !entropy_gate_passes(
+                &ent,
+                mbytes,
+                &mut scratch.entropy_scratch,
+                &self.entropy_log2,
+            ) {
+                return;
+            }
+        }
+        let root_span_hint = root_hint.clone().unwrap_or_else(|| span_in_buf.clone());
+
+        scratch.push_finding(FindingRec {
+            file_id,
+            rule_id,
+            span_start: span_in_buf.start as u32,
+            span_end: span_in_buf.end as u32,
+            root_hint_start: base_offset + root_span_hint.start as u64,
+            root_hint_end: base_offset + root_span_hint.end as u64,
+            step_id,
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2798,6 +3054,17 @@ impl Engine {
         }
     }
 
+    /// Decodes an encoded span in full, dedupes it, and enqueues it for scanning.
+    ///
+    /// This is the fallback path when stream decoding is unavailable or fails.
+    ///
+    /// # Preconditions
+    /// - `enc` comes from the current scan buffer or decode slab.
+    /// - `scratch` has been reset for the current scan.
+    ///
+    /// # Effects
+    /// - May append decoded bytes to the slab and enqueue a `ScanBuf` work item.
+    /// - Updates per-scan decode budgets and dedupe state.
     #[allow(clippy::too_many_arguments)]
     fn decode_span_fallback(
         &self,
@@ -2918,6 +3185,16 @@ impl Engine {
         out.len() == needed
     }
 
+    /// Stream-decodes `encoded` and scans windows without materializing the full buffer.
+    ///
+    /// # Preconditions
+    /// - `encoded` is the bytes for the current decode span.
+    /// - `scratch` belongs to the current scan and has been reset.
+    ///
+    /// # Effects
+    /// - Populates `scratch` findings and pending decode spans.
+    /// - Falls back to `decode_span_fallback` if the stream path becomes unsafe
+    ///   (window cap exceeded or a window/span cannot be reconstructed).
     #[allow(clippy::too_many_arguments)]
     fn decode_stream_and_scan(
         &self,

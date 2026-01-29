@@ -7,6 +7,16 @@
 //! - UTF-16 anchors and decoded-space gating via `VsAnchorDb`, `VsUtf16StreamDb`,
 //!   and `VsGateDb`.
 //!
+//! # Pattern id layout
+//! - Raw rule expressions are compiled first; their ids are `0..raw_rule_count`.
+//! - Optional UTF-16 anchor patterns are appended; their ids start at `utf16_id_base`.
+//! - `raw_rule_ids` maps raw pattern index -> rule id; UTF-16 patterns map via
+//!   the `utf16_*` tables.
+//!
+//! # Coordinate systems
+//! - Raw/UTF-16 anchor scans operate on raw-byte offsets in the scanned buffer.
+//! - Stream prefilters emit decoded-byte offsets in the post-transform stream.
+//!
 //! # Correctness contract
 //! Prefiltering is conservative: it may add extra windows but must never drop
 //! true matches. Window math is saturating and clamped to the available
@@ -21,14 +31,11 @@
 //!   that bound.
 //!
 //! # Window seeding
-//! 1. Compile each rule regex with `HS_FLAG_PREFILTER` (block or stream mode).
-//! 2. Use `hs_expression_info` to estimate `max_width` for window math.
-//! 3. On a match ending at `to`, compute `lo = to - (max_width + seed)` and
-//!    `hi = to + seed`, clamped to the haystack length.
-//! 4. For unbounded widths or overflowing math, mark the rule as
-//!    "whole-buffer on hit" and cap callbacks with `HS_FLAG_SINGLEMATCH`.
-//! 5. Optionally include a NUL sentinel expression to decide whether to run
-//!    UTF-16 anchor scanning without a separate memchr pass.
+//! 1. Compile each rule regex in block mode (exact matches, no prefilter flags).
+//! 2. Use `hs_expression_info` to estimate `max_width` for overlap sizing.
+//! 3. On a match, seed a window using the reported match span.
+//! 4. Optionally include UTF-16 anchor patterns in the same database to avoid
+//!    a second scan pass.
 //!
 //! # Design choices
 //! - If window math saturates `u32`, we fall back to whole-buffer windows rather
@@ -43,46 +50,38 @@ use std::ptr;
 
 use vectorscan_rs_sys as vs;
 
-use super::{ScanScratch, Target, Variant};
-
-/// Packed per-rule metadata for the Vectorscan prefilter callback.
-///
-/// `lo_pad` is precomputed as `max_width + seed_radius` to keep the callback
-/// branchless on the hot path; values are stored in `u32` and may saturate.
-/// Entries are indexed by rule id assigned at compile time.
-///
-/// Hot-path math (clamped to the haystack length):
-/// - `lo = end - lo_pad` (saturating)
-/// - `hi = min(end + seed, hay_len)`
-///
-/// Sentinel:
-/// - `seed == u32::MAX` means "whole-buffer on hit".
-/// - `lo_pad` is set to `u32::MAX` in that case and ignored.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub(crate) struct VsRuleMeta {
-    pub(crate) lo_pad: u32,
-    pub(crate) seed: u32,
-}
+use super::{RawHsMatch, ScanScratch, Target, Variant};
 
 /// Compiled Vectorscan database plus per-rule window metadata for raw-byte scanning.
 ///
 /// The database is immutable after compilation and can be shared across
 /// threads, but each thread must allocate its own `VsScratch`.
+///
+/// Raw pattern ids follow compile order and may be a filtered subset of rules;
+/// `raw_rule_ids` maps expression index -> rule id and `raw_missing_rules`
+/// records rules rejected by Vectorscan. Optional UTF-16 anchor patterns are
+/// appended after raw patterns and resolved via the `utf16_*` mapping tables.
 pub(crate) struct VsPrefilterDb {
     db: *mut vs::hs_database_t,
-    meta: Vec<VsRuleMeta>,            // Indexed by rule id.
+    raw_rule_count: u32,
+    raw_seed_radius: Vec<u32>,
+    raw_rule_ids: Vec<u32>,
+    raw_missing_rules: Vec<u32>,
+    utf16_id_base: u32,
+    utf16_pat_count: u32,
+    utf16_targets: Vec<VsAnchorTarget>,
+    utf16_pat_offsets: Vec<u32>,
+    utf16_pat_lens: Vec<u32>,
     max_hits_per_rule_variant: usize, // Cap used by hit accumulators.
-    nul_sentinel_id: u32,             // Extra expression id when has_nul_sentinel.
-    has_nul_sentinel: bool,
-    max_width: u32,  // Max bounded width across all rules.
-    unbounded: bool, // True if any rule reports an unbounded width.
+    max_width: u32,                   // Max bounded width across all rules.
+    unbounded: bool,                  // True if any rule reports an unbounded width.
 }
 
 /// Per-rule metadata for stream-mode window seeding.
 ///
-/// `max_width` is derived from `hs_expression_info` and may be capped; `radius`
-/// comes from rule tuning and expands windows around the match end.
+/// `max_width` is derived from `hs_expression_info` in decoded-byte space and may
+/// be capped; a reported 0 width is treated as unbounded. `radius` comes from
+/// rule tuning and expands windows around the match end.
 /// `whole_buffer_on_hit` is a boolean (0/1) that tells the callback to emit a
 /// force-full window instead of computing offsets.
 #[repr(C)]
@@ -108,6 +107,8 @@ pub(crate) struct VsStreamDb {
 /// Uses literal byte patterns to detect whether any anchor variant appears in
 /// a decoded stream. Patterns are compiled with `HS_FLAG_SINGLEMATCH` to avoid
 /// repeated callbacks once a hit is detected.
+/// A hit serves as a decoded-space gate signal; callers may skip downstream
+/// scanning when no anchors are observed.
 pub(crate) struct VsGateDb {
     db: *mut vs::hs_database_t,
 }
@@ -184,6 +185,8 @@ impl VsStreamDb {
     ///
     /// Uses `hs_expression_info` to estimate match width; a zero width is
     /// treated as unbounded and capped by `max_decoded_cap` when provided.
+    /// Patterns are compiled with `HS_FLAG_PREFILTER`; hits are conservative
+    /// and used only for window seeding.
     pub(crate) fn try_new_stream(
         rules: &[RuleSpec],
         max_decoded_cap: usize,
@@ -364,7 +367,8 @@ impl VsStreamDb {
 
 /// Stream match event used by decoded-byte scanning.
 ///
-/// `lo`/`hi` bound the candidate window (decoded-byte offsets) to verify.
+/// `lo`/`hi` bound the candidate window (decoded-byte offsets, half-open
+/// `[lo, hi)`) to verify.
 /// `variant_idx` matches `Variant::idx()`. `force_full` asks the caller to
 /// fall back to a full decode scan and ignore `lo`/`hi`.
 #[repr(C)]
@@ -382,6 +386,7 @@ pub(crate) struct VsStreamWindow {
 /// - `pending` points to a live `Vec<VsStreamWindow>` for the duration of the scan.
 /// - `pending` is not accessed concurrently while the scan runs.
 /// - `meta` points to an array of `meta_len` entries indexed by rule id.
+/// - `meta_len` matches the number of compiled rules; ids are expected to be `< meta_len`.
 #[repr(C)]
 pub(crate) struct VsStreamMatchCtx {
     pub(crate) pending: *mut Vec<VsStreamWindow>,
@@ -395,7 +400,9 @@ pub(crate) struct VsStreamMatchCtx {
 /// - `pending` points to a live `Vec<VsStreamWindow>` for the duration of the scan.
 /// - `pending` is not accessed concurrently while the scan runs.
 /// - `targets`/`pat_offsets`/`pat_lens` describe the UTF-16 anchor mapping tables.
-/// - `base_offset` is the absolute offset of the current decode ring start.
+/// - `pat_offsets` has length `pat_count + 1` and is monotonically increasing.
+/// - `pat_lens` has length `pat_count`.
+/// - `base_offset` converts stream-local match offsets into absolute decoded offsets.
 #[repr(C)]
 pub(crate) struct VsUtf16StreamMatchCtx {
     pub(crate) pending: *mut Vec<VsStreamWindow>,
@@ -409,7 +416,7 @@ pub(crate) struct VsUtf16StreamMatchCtx {
 /// Stream-mode match callback. Pushes window seeds into `pending`.
 ///
 /// # Safety
-/// - `ctx` must point to a valid `VsStreamMatchCtx`.
+/// - `ctx` must be non-null and point to a valid `VsStreamMatchCtx`.
 /// - `pending` and `meta` must outlive the call and not be accessed concurrently.
 /// - This callback must never panic or unwind across the FFI boundary.
 unsafe extern "C" fn vs_on_stream_match(
@@ -484,6 +491,9 @@ pub(crate) fn gate_match_callback() -> vs::match_event_handler {
 
 /// UTF-16 stream match callback. Seeds UTF-16 variant windows into `pending`.
 ///
+/// Converts stream-local match offsets into absolute decoded offsets using
+/// `base_offset`.
+///
 /// # Safety
 /// - `ctx` must point to a valid `VsUtf16StreamMatchCtx`.
 /// - `pending` and UTF-16 mapping tables must outlive the call and not be
@@ -535,8 +545,8 @@ pub(crate) fn utf16_stream_match_callback() -> vs::match_event_handler {
 
 /// Mapping from UTF-16 anchor patterns to rule/variant targets.
 ///
-/// `seed_radius_bytes` is the extra padding (decoded bytes) applied around the
-/// matched anchor when seeding windows.
+/// `seed_radius_bytes` is the extra padding (raw bytes, in the UTF-16 byte
+/// stream) applied around the matched anchor when seeding windows.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct VsAnchorTarget {
@@ -545,12 +555,140 @@ pub(crate) struct VsAnchorTarget {
     seed_radius_bytes: u32,
 }
 
+/// Inputs describing UTF-16 anchor patterns and their target rules.
+///
+/// `patterns` holds raw UTF-16 byte patterns. `pat_targets` is a flat list of
+/// rule/variant targets, and `pat_offsets` is a prefix-sum table mapping each
+/// pattern to its target slice. `seed_radius_bytes` is indexed by rule id.
+pub(crate) struct Utf16AnchorInput<'a> {
+    pub(crate) patterns: &'a [Vec<u8>],
+    pub(crate) pat_targets: &'a [Target],
+    pub(crate) pat_offsets: &'a [u32],
+    pub(crate) seed_radius_bytes: &'a [u32],
+}
+
+struct Utf16AnchorData {
+    patterns: Vec<CString>,
+    targets: Vec<VsAnchorTarget>,
+    pat_offsets: Vec<u32>,
+    pat_lens: Vec<u32>,
+}
+
+/// Builds the filtered pattern table and target mappings for UTF-16 anchors.
+///
+/// Empty patterns are dropped, offsets are compacted, and out-of-range target
+/// ranges are ignored. When `debug` is true, basic pattern stats are logged.
+///
+/// # Errors
+/// Returns an error if no non-empty patterns remain or if pattern encoding fails.
+fn build_utf16_anchor_data(
+    patterns: &[Vec<u8>],
+    pat_targets: &[Target],
+    pat_offsets: &[u32],
+    seed_radius_bytes: &[u32],
+    debug: bool,
+) -> Result<Utf16AnchorData, String> {
+    if patterns.is_empty() {
+        return Err("no utf16 anchor patterns".to_string());
+    }
+    let mut filtered_patterns: Vec<&[u8]> = Vec::with_capacity(patterns.len());
+    let mut filtered_offsets: Vec<u32> = Vec::with_capacity(pat_offsets.len());
+    let mut filtered_targets: Vec<Target> = Vec::with_capacity(pat_targets.len());
+
+    filtered_offsets.push(0);
+    for (pid, pat) in patterns.iter().enumerate() {
+        if pat.is_empty() {
+            continue;
+        }
+        let off_start = *pat_offsets.get(pid).unwrap_or(&0) as usize;
+        let off_end = *pat_offsets.get(pid + 1).unwrap_or(&0) as usize;
+        if off_start < off_end && off_end <= pat_targets.len() {
+            filtered_targets.extend_from_slice(&pat_targets[off_start..off_end]);
+        }
+        filtered_patterns.push(pat.as_slice());
+        filtered_offsets.push(filtered_targets.len() as u32);
+    }
+
+    if filtered_patterns.is_empty() {
+        return Err("no non-empty utf16 anchor patterns".to_string());
+    }
+
+    if debug {
+        let mut zero_len = 0usize;
+        let mut leading_nul = 0usize;
+        let mut min_len = usize::MAX;
+        let mut max_len = 0usize;
+        for pat in &filtered_patterns {
+            let len = pat.len();
+            if len == 0 {
+                zero_len = zero_len.saturating_add(1);
+            }
+            if matches!(pat.first(), Some(0)) {
+                leading_nul = leading_nul.saturating_add(1);
+            }
+            min_len = min_len.min(len);
+            max_len = max_len.max(len);
+        }
+        if min_len == usize::MAX {
+            min_len = 0;
+        }
+        let first = filtered_patterns.first().unwrap();
+        eprintln!(
+            "vectorscan utf16 db build: patterns={} zero_len={} leading_nul={} min_len={} max_len={} first_len={} first_byte={}",
+            filtered_patterns.len(),
+            zero_len,
+            leading_nul,
+            min_len,
+            max_len,
+            first.len(),
+            first.first().copied().unwrap_or(0),
+        );
+    }
+
+    let mut c_patterns: Vec<CString> = Vec::with_capacity(filtered_patterns.len());
+    for pat in &filtered_patterns {
+        let mut expr = String::with_capacity(pat.len().saturating_mul(4));
+        for b in *pat {
+            use std::fmt::Write;
+            let _ = write!(expr, "\\x{b:02X}");
+        }
+        let c_pat = CString::new(expr)
+            .map_err(|_| "utf16 anchor pattern contains unexpected NUL".to_string())?;
+        c_patterns.push(c_pat);
+    }
+
+    let mut targets = Vec::with_capacity(filtered_targets.len());
+    for t in &filtered_targets {
+        let rule_id = t.rule_id() as u32;
+        let variant_idx = t.variant().idx() as u8;
+        let seed_radius_bytes = *seed_radius_bytes.get(rule_id as usize).unwrap_or(&0);
+        targets.push(VsAnchorTarget {
+            rule_id,
+            variant_idx,
+            seed_radius_bytes,
+        });
+    }
+
+    let mut pat_lens = Vec::with_capacity(filtered_patterns.len());
+    for pat in &filtered_patterns {
+        pat_lens.push(usize_to_u32_saturating(pat.len()));
+    }
+
+    Ok(Utf16AnchorData {
+        patterns: c_patterns,
+        targets,
+        pat_offsets: filtered_offsets,
+        pat_lens,
+    })
+}
+
 /// Vectorscan database for UTF-16 anchor prefiltering.
 ///
 /// Patterns are literal bytes (encoded as `\xNN` regexes); matches are expanded
 /// into rule/variant windows using the `targets` mapping.
 /// `pat_offsets` is a prefix-sum table: pattern `i` maps to
 /// `targets[pat_offsets[i]..pat_offsets[i + 1]]`.
+/// Window offsets are in raw-byte coordinates of the scanned buffer.
 pub(crate) struct VsAnchorDb {
     db: *mut vs::hs_database_t,
     targets: Vec<VsAnchorTarget>,
@@ -563,6 +701,7 @@ pub(crate) struct VsAnchorDb {
 ///
 /// Uses the same mapping tables as `VsAnchorDb`, but runs in stream mode and
 /// emits `VsStreamWindow` entries via the UTF-16 stream callback.
+/// Window offsets are in decoded-byte coordinates of the stream output.
 pub(crate) struct VsUtf16StreamDb {
     db: *mut vs::hs_database_t,
     targets: Vec<VsAnchorTarget>,
@@ -617,77 +756,19 @@ impl VsAnchorDb {
         tuning: &Tuning,
     ) -> Result<Self, String> {
         let debug = std::env::var("SCANNER_VS_UTF16_DEBUG").is_ok();
-        if patterns.is_empty() {
-            return Err("no utf16 anchor patterns".to_string());
-        }
-        let mut filtered_patterns: Vec<&[u8]> = Vec::with_capacity(patterns.len());
-        let mut filtered_offsets: Vec<u32> = Vec::with_capacity(pat_offsets.len());
-        let mut filtered_targets: Vec<Target> = Vec::with_capacity(pat_targets.len());
+        let data = build_utf16_anchor_data(
+            patterns,
+            pat_targets,
+            pat_offsets,
+            utf16_seed_radius_bytes,
+            debug,
+        )?;
 
-        filtered_offsets.push(0);
-        for (pid, pat) in patterns.iter().enumerate() {
-            if pat.is_empty() {
-                continue;
-            }
-            let off_start = *pat_offsets.get(pid).unwrap_or(&0) as usize;
-            let off_end = *pat_offsets.get(pid + 1).unwrap_or(&0) as usize;
-            if off_start < off_end && off_end <= pat_targets.len() {
-                filtered_targets.extend_from_slice(&pat_targets[off_start..off_end]);
-            }
-            filtered_patterns.push(pat.as_slice());
-            filtered_offsets.push(filtered_targets.len() as u32);
-        }
+        let mut expr_ptrs: Vec<*const c_char> = Vec::with_capacity(data.patterns.len());
+        let mut ids: Vec<c_uint> = Vec::with_capacity(data.patterns.len());
 
-        if filtered_patterns.is_empty() {
-            return Err("no non-empty utf16 anchor patterns".to_string());
-        }
-
-        if debug {
-            let mut zero_len = 0usize;
-            let mut leading_nul = 0usize;
-            let mut min_len = usize::MAX;
-            let mut max_len = 0usize;
-            for pat in &filtered_patterns {
-                let len = pat.len();
-                if len == 0 {
-                    zero_len = zero_len.saturating_add(1);
-                }
-                if matches!(pat.first(), Some(0)) {
-                    leading_nul = leading_nul.saturating_add(1);
-                }
-                min_len = min_len.min(len);
-                max_len = max_len.max(len);
-            }
-            if min_len == usize::MAX {
-                min_len = 0;
-            }
-            let first = filtered_patterns.first().unwrap();
-            eprintln!(
-                "vectorscan utf16 db build: patterns={} zero_len={} leading_nul={} min_len={} max_len={} first_len={} first_byte={}",
-                filtered_patterns.len(),
-                zero_len,
-                leading_nul,
-                min_len,
-                max_len,
-                first.len(),
-                first.first().copied().unwrap_or(0),
-            );
-        }
-
-        let mut c_patterns: Vec<CString> = Vec::with_capacity(filtered_patterns.len());
-        let mut expr_ptrs: Vec<*const c_char> = Vec::with_capacity(filtered_patterns.len());
-        let mut ids: Vec<c_uint> = Vec::with_capacity(filtered_patterns.len());
-
-        for (id, pat) in filtered_patterns.iter().enumerate() {
-            let mut expr = String::with_capacity(pat.len().saturating_mul(4));
-            for b in *pat {
-                use std::fmt::Write;
-                let _ = write!(expr, "\\x{b:02X}");
-            }
-            let c_pat = CString::new(expr)
-                .map_err(|_| "utf16 anchor pattern contains unexpected NUL".to_string())?;
-            c_patterns.push(c_pat);
-            expr_ptrs.push(c_patterns.last().unwrap().as_ptr());
+        for (id, pat) in data.patterns.iter().enumerate() {
+            expr_ptrs.push(pat.as_ptr());
             ids.push(id as c_uint);
         }
 
@@ -742,28 +823,11 @@ impl VsAnchorDb {
             return Err(msg);
         }
 
-        let mut targets = Vec::with_capacity(filtered_targets.len());
-        for t in &filtered_targets {
-            let rule_id = t.rule_id() as u32;
-            let variant_idx = t.variant().idx() as u8;
-            let seed_radius_bytes = *utf16_seed_radius_bytes.get(rule_id as usize).unwrap_or(&0);
-            targets.push(VsAnchorTarget {
-                rule_id,
-                variant_idx,
-                seed_radius_bytes,
-            });
-        }
-
-        let mut pat_lens = Vec::with_capacity(filtered_patterns.len());
-        for pat in &filtered_patterns {
-            pat_lens.push(usize_to_u32_saturating(pat.len()));
-        }
-
         Ok(Self {
             db,
-            targets,
-            pat_offsets: filtered_offsets,
-            pat_lens,
+            targets: data.targets,
+            pat_offsets: data.pat_offsets,
+            pat_lens: data.pat_lens,
             max_hits_per_rule_variant: tuning.max_anchor_hits_per_rule_variant,
         })
     }
@@ -789,6 +853,8 @@ impl VsAnchorDb {
     /// Scans raw bytes for UTF-16 anchor hits and seeds per-variant windows.
     ///
     /// The callback performs window math using the precomputed target mapping.
+    /// `vs_scratch` must be allocated for this database and not shared across
+    /// threads; `scratch` must not be accessed concurrently.
     pub(crate) fn scan_utf16(
         &self,
         hay: &[u8],
@@ -806,7 +872,7 @@ impl VsAnchorDb {
             pat_offsets: self.pat_offsets.as_ptr(),
             pat_lens: self.pat_lens.as_ptr(),
             pat_count: self.pat_lens.len() as u32,
-            hay_len: len_u32 as u32,
+            hay_len: len_u32,
             max_hits: self.max_hits_per_rule_variant,
         };
 
@@ -848,77 +914,19 @@ impl VsUtf16StreamDb {
         tuning: &Tuning,
     ) -> Result<Self, String> {
         let debug = std::env::var("SCANNER_VS_UTF16_DEBUG").is_ok();
-        if patterns.is_empty() {
-            return Err("no utf16 anchor patterns".to_string());
-        }
-        let mut filtered_patterns: Vec<&[u8]> = Vec::with_capacity(patterns.len());
-        let mut filtered_offsets: Vec<u32> = Vec::with_capacity(pat_offsets.len());
-        let mut filtered_targets: Vec<Target> = Vec::with_capacity(pat_targets.len());
+        let data = build_utf16_anchor_data(
+            patterns,
+            pat_targets,
+            pat_offsets,
+            utf16_seed_radius_bytes,
+            debug,
+        )?;
 
-        filtered_offsets.push(0);
-        for (pid, pat) in patterns.iter().enumerate() {
-            if pat.is_empty() {
-                continue;
-            }
-            let off_start = *pat_offsets.get(pid).unwrap_or(&0) as usize;
-            let off_end = *pat_offsets.get(pid + 1).unwrap_or(&0) as usize;
-            if off_start < off_end && off_end <= pat_targets.len() {
-                filtered_targets.extend_from_slice(&pat_targets[off_start..off_end]);
-            }
-            filtered_patterns.push(pat.as_slice());
-            filtered_offsets.push(filtered_targets.len() as u32);
-        }
+        let mut expr_ptrs: Vec<*const c_char> = Vec::with_capacity(data.patterns.len());
+        let mut ids: Vec<c_uint> = Vec::with_capacity(data.patterns.len());
 
-        if filtered_patterns.is_empty() {
-            return Err("no non-empty utf16 anchor patterns".to_string());
-        }
-
-        if debug {
-            let mut zero_len = 0usize;
-            let mut leading_nul = 0usize;
-            let mut min_len = usize::MAX;
-            let mut max_len = 0usize;
-            for pat in &filtered_patterns {
-                let len = pat.len();
-                if len == 0 {
-                    zero_len = zero_len.saturating_add(1);
-                }
-                if matches!(pat.first(), Some(0)) {
-                    leading_nul = leading_nul.saturating_add(1);
-                }
-                min_len = min_len.min(len);
-                max_len = max_len.max(len);
-            }
-            if min_len == usize::MAX {
-                min_len = 0;
-            }
-            let first = filtered_patterns.first().unwrap();
-            eprintln!(
-                "vectorscan utf16 stream db build: patterns={} zero_len={} leading_nul={} min_len={} max_len={} first_len={} first_byte={}",
-                filtered_patterns.len(),
-                zero_len,
-                leading_nul,
-                min_len,
-                max_len,
-                first.len(),
-                first.first().copied().unwrap_or(0),
-            );
-        }
-
-        let mut c_patterns: Vec<CString> = Vec::with_capacity(filtered_patterns.len());
-        let mut expr_ptrs: Vec<*const c_char> = Vec::with_capacity(filtered_patterns.len());
-        let mut ids: Vec<c_uint> = Vec::with_capacity(filtered_patterns.len());
-
-        for (id, pat) in filtered_patterns.iter().enumerate() {
-            let mut expr = String::with_capacity(pat.len().saturating_mul(4));
-            for b in *pat {
-                use std::fmt::Write;
-                let _ = write!(expr, "\\x{b:02X}");
-            }
-            let c_pat = CString::new(expr)
-                .map_err(|_| "utf16 anchor pattern contains unexpected NUL".to_string())?;
-            c_patterns.push(c_pat);
-            expr_ptrs.push(c_patterns.last().unwrap().as_ptr());
+        for (id, pat) in data.patterns.iter().enumerate() {
+            expr_ptrs.push(pat.as_ptr());
             ids.push(id as c_uint);
         }
 
@@ -966,28 +974,11 @@ impl VsUtf16StreamDb {
             return Err(msg);
         }
 
-        let mut targets = Vec::with_capacity(filtered_targets.len());
-        for t in &filtered_targets {
-            let rule_id = t.rule_id() as u32;
-            let variant_idx = t.variant().idx() as u8;
-            let seed_radius_bytes = *utf16_seed_radius_bytes.get(rule_id as usize).unwrap_or(&0);
-            targets.push(VsAnchorTarget {
-                rule_id,
-                variant_idx,
-                seed_radius_bytes,
-            });
-        }
-
-        let mut pat_lens = Vec::with_capacity(filtered_patterns.len());
-        for pat in &filtered_patterns {
-            pat_lens.push(usize_to_u32_saturating(pat.len()));
-        }
-
         Ok(Self {
             db,
-            targets,
-            pat_offsets: filtered_offsets,
-            pat_lens,
+            targets: data.targets,
+            pat_offsets: data.pat_offsets,
+            pat_lens: data.pat_lens,
             max_hits_per_rule_variant: tuning.max_anchor_hits_per_rule_variant,
         })
     }
@@ -1258,18 +1249,25 @@ impl Drop for VsScratch {
 }
 
 impl VsPrefilterDb {
-    /// Builds a Vectorscan prefilter DB and per-rule window metadata.
+    /// Builds a Vectorscan DB for exact raw regex matches and optional UTF-16 anchor hits.
     ///
     /// Returns an error if the database cannot be compiled or if any rule
     /// pattern is rejected by `hs_expression_info`.
-    /// Rules with unbounded widths or overflowing padding are converted into
-    /// whole-buffer entries and compiled with `HS_FLAG_SINGLEMATCH`.
-    pub(crate) fn try_new(rules: &[RuleSpec], tuning: &Tuning) -> Result<Self, String> {
-        let mut c_patterns: Vec<CString> = Vec::with_capacity(rules.len().saturating_add(1));
-        let mut expr_ptrs: Vec<*const c_char> = Vec::with_capacity(rules.len().saturating_add(1));
-        let mut flags: Vec<c_uint> = Vec::with_capacity(rules.len().saturating_add(1));
-        let mut ids: Vec<c_uint> = Vec::with_capacity(rules.len().saturating_add(1));
-        let mut meta: Vec<VsRuleMeta> = Vec::with_capacity(rules.len());
+    pub(crate) fn try_new(
+        rules: &[RuleSpec],
+        tuning: &Tuning,
+        utf16: Option<Utf16AnchorInput<'_>>,
+    ) -> Result<Self, String> {
+        const RAW_FLAGS: c_uint = vs::HS_FLAG_SOM_LEFTMOST as c_uint;
+
+        #[derive(Clone)]
+        struct RawPattern {
+            rule_id: u32,
+            seed_radius: u32,
+            c_pat: CString,
+        }
+
+        let mut raw_patterns: Vec<RawPattern> = Vec::with_capacity(rules.len());
         let mut max_width = 0u32;
         let mut unbounded = false;
 
@@ -1280,8 +1278,7 @@ impl VsPrefilterDb {
                 r.radius
             };
 
-            let seed_u32 = usize_to_u32_saturating(seed_radius);
-            let (mut max_width_u32, c_pat) = expression_info_prefilter_max_width(r.re.as_str())?;
+            let (mut max_width_u32, c_pat) = expression_info_max_width(r.re.as_str(), RAW_FLAGS)?;
             if max_width_u32 == 0 {
                 max_width_u32 = u32::MAX;
             }
@@ -1290,48 +1287,25 @@ impl VsPrefilterDb {
             }
             max_width = max_width.max(max_width_u32);
 
-            // Whole-buffer on hit:
-            // - Unbounded max width (or effectively unbounded for our u32 buffers).
-            // - Or padding math saturates.
-            //
-            // For these rules we cap callbacks with SINGLEMATCH and seed [0, hay_len].
-            let lo_pad = max_width_u32.saturating_add(seed_u32);
-            let whole_buf = max_width_u32 == u32::MAX || seed_u32 == u32::MAX || lo_pad == u32::MAX;
-
-            let mut f = vs::HS_FLAG_PREFILTER as c_uint;
-            if whole_buf {
-                f |= vs::HS_FLAG_SINGLEMATCH as c_uint;
-                meta.push(VsRuleMeta {
-                    lo_pad: u32::MAX,
-                    seed: u32::MAX,
-                });
-            } else {
-                meta.push(VsRuleMeta {
-                    lo_pad,
-                    seed: seed_u32,
-                });
-            }
-
-            c_patterns.push(c_pat);
-            expr_ptrs.push(c_patterns.last().unwrap().as_ptr());
-            flags.push(f);
-            ids.push(rid as c_uint);
+            raw_patterns.push(RawPattern {
+                rule_id: rid as u32,
+                seed_radius: usize_to_u32_saturating(seed_radius),
+                c_pat,
+            });
         }
 
-        let nul_sentinel_id = rules.len() as u32;
-        let mut has_nul_sentinel = false;
-        if tuning.scan_utf16_variants {
-            // One extra expression used to detect NUL bytes so we can decide whether
-            // to run the UTF-16 anchor scan without an extra memchr pass.
-            //
-            // SINGLEMATCH guarantees at most one callback for this expression.
-            let nul_pat = CString::new(r"\x00").expect("nul sentinel pattern contains NUL");
-            c_patterns.push(nul_pat);
-            expr_ptrs.push(c_patterns.last().unwrap().as_ptr());
-            flags.push(vs::HS_FLAG_SINGLEMATCH as c_uint);
-            ids.push(nul_sentinel_id as c_uint);
-            has_nul_sentinel = true;
-        }
+        let utf16_data = if let Some(utf16) = utf16 {
+            let debug = std::env::var("SCANNER_VS_UTF16_DEBUG").is_ok();
+            Some(build_utf16_anchor_data(
+                utf16.patterns,
+                utf16.pat_targets,
+                utf16.pat_offsets,
+                utf16.seed_radius_bytes,
+                debug,
+            )?)
+        } else {
+            None
+        };
 
         let mut platform = MaybeUninit::<vs::hs_platform_info_t>::zeroed();
         unsafe {
@@ -1340,50 +1314,187 @@ impl VsPrefilterDb {
         }
         let platform = unsafe { platform.assume_init() };
 
-        let mut db: *mut vs::hs_database_t = ptr::null_mut();
-        let mut compile_err: *mut vs::hs_compile_error_t = ptr::null_mut();
+        let compile_db = |raw: &[RawPattern]| -> Result<*mut vs::hs_database_t, String> {
+            let utf16_len = utf16_data.as_ref().map_or(0, |d| d.pat_lens.len());
+            let mut c_patterns: Vec<CString> =
+                Vec::with_capacity(raw.len().saturating_add(utf16_len));
+            let mut expr_ptrs: Vec<*const c_char> =
+                Vec::with_capacity(raw.len().saturating_add(utf16_len));
+            let mut flags: Vec<c_uint> = Vec::with_capacity(raw.len().saturating_add(utf16_len));
+            let mut ids: Vec<c_uint> = Vec::with_capacity(raw.len().saturating_add(utf16_len));
 
-        let rc = unsafe {
-            vs::hs_compile_multi(
-                expr_ptrs.as_ptr(),
-                flags.as_ptr(),
-                ids.as_ptr(),
-                expr_ptrs.len() as c_uint,
-                vs::HS_MODE_BLOCK as c_uint,
-                &platform as *const vs::hs_platform_info_t,
-                &mut db as *mut *mut vs::hs_database_t,
-                &mut compile_err as *mut *mut vs::hs_compile_error_t,
-            )
+            for (idx, pat) in raw.iter().enumerate() {
+                c_patterns.push(pat.c_pat.clone());
+                expr_ptrs.push(c_patterns.last().unwrap().as_ptr());
+                flags.push(RAW_FLAGS);
+                ids.push(idx as c_uint);
+            }
+
+            if let Some(data) = &utf16_data {
+                let base = raw.len() as u32;
+                for (idx, pat) in data.patterns.iter().enumerate() {
+                    c_patterns.push(pat.clone());
+                    expr_ptrs.push(c_patterns.last().unwrap().as_ptr());
+                    flags.push(0);
+                    ids.push(base + idx as u32);
+                }
+            }
+
+            if expr_ptrs.is_empty() {
+                return Err("no patterns to compile".to_string());
+            }
+
+            let mut db: *mut vs::hs_database_t = ptr::null_mut();
+            let mut compile_err: *mut vs::hs_compile_error_t = ptr::null_mut();
+            let rc = unsafe {
+                vs::hs_compile_multi(
+                    expr_ptrs.as_ptr(),
+                    flags.as_ptr(),
+                    ids.as_ptr(),
+                    expr_ptrs.len() as c_uint,
+                    vs::HS_MODE_BLOCK as c_uint,
+                    &platform as *const vs::hs_platform_info_t,
+                    &mut db as *mut *mut vs::hs_database_t,
+                    &mut compile_err as *mut *mut vs::hs_compile_error_t,
+                )
+            };
+
+            if rc != vs::HS_SUCCESS as c_int {
+                let msg = unsafe {
+                    if compile_err.is_null() {
+                        "hs_compile_multi failed (no error message)".to_string()
+                    } else {
+                        let s = if (*compile_err).message.is_null() {
+                            "hs_compile_multi failed (null error message)".to_string()
+                        } else {
+                            let cstr = std::ffi::CStr::from_ptr((*compile_err).message);
+                            format!(
+                                "hs_compile_multi failed at expression {}: {}",
+                                (*compile_err).expression,
+                                cstr.to_string_lossy()
+                            )
+                        };
+                        vs::hs_free_compile_error(compile_err);
+                        s
+                    }
+                };
+                return Err(msg);
+            }
+
+            Ok(db)
         };
 
-        if rc != vs::HS_SUCCESS as c_int {
-            let msg = unsafe {
-                if compile_err.is_null() {
-                    "hs_compile_multi failed (no error message)".to_string()
-                } else {
-                    let s = if (*compile_err).message.is_null() {
-                        "hs_compile_multi failed (null error message)".to_string()
-                    } else {
-                        let cstr = std::ffi::CStr::from_ptr((*compile_err).message);
-                        format!(
-                            "hs_compile_multi failed at expression {}: {}",
-                            (*compile_err).expression,
-                            cstr.to_string_lossy()
-                        )
-                    };
-                    vs::hs_free_compile_error(compile_err);
-                    s
-                }
+        let compile_single = |pat: &RawPattern| -> Result<(), String> {
+            let expr_ptrs = [pat.c_pat.as_ptr()];
+            let flags = [RAW_FLAGS];
+            let ids = [0u32];
+            let mut db: *mut vs::hs_database_t = ptr::null_mut();
+            let mut compile_err: *mut vs::hs_compile_error_t = ptr::null_mut();
+            let rc = unsafe {
+                vs::hs_compile_multi(
+                    expr_ptrs.as_ptr(),
+                    flags.as_ptr(),
+                    ids.as_ptr(),
+                    1,
+                    vs::HS_MODE_BLOCK as c_uint,
+                    &platform as *const vs::hs_platform_info_t,
+                    &mut db as *mut *mut vs::hs_database_t,
+                    &mut compile_err as *mut *mut vs::hs_compile_error_t,
+                )
             };
-            return Err(msg);
+            if rc != vs::HS_SUCCESS as c_int {
+                let msg = unsafe {
+                    if compile_err.is_null() {
+                        "hs_compile_multi failed (no error message)".to_string()
+                    } else {
+                        let s = if (*compile_err).message.is_null() {
+                            "hs_compile_multi failed (null error message)".to_string()
+                        } else {
+                            let cstr = std::ffi::CStr::from_ptr((*compile_err).message);
+                            format!(
+                                "hs_compile_multi failed at expression {}: {}",
+                                (*compile_err).expression,
+                                cstr.to_string_lossy()
+                            )
+                        };
+                        vs::hs_free_compile_error(compile_err);
+                        s
+                    }
+                };
+                return Err(msg);
+            }
+            unsafe {
+                if !db.is_null() {
+                    vs::hs_free_database(db);
+                }
+            }
+            Ok(())
+        };
+
+        let mut raw_kept = raw_patterns.clone();
+        let mut raw_missing_rules = Vec::new();
+        let db = match compile_db(&raw_kept) {
+            Ok(db) => db,
+            Err(_err) => {
+                raw_kept.clear();
+                for pat in &raw_patterns {
+                    if compile_single(pat).is_ok() {
+                        raw_kept.push(pat.clone());
+                    } else {
+                        raw_missing_rules.push(pat.rule_id);
+                    }
+                }
+
+                if raw_kept.is_empty() && utf16_data.as_ref().is_none_or(|d| d.pat_lens.is_empty())
+                {
+                    return Err("vectorscan raw db compile failed for all patterns".to_string());
+                }
+                compile_db(&raw_kept)?
+            }
+        };
+
+        if raw_missing_rules.is_empty() && raw_kept.len() != raw_patterns.len() {
+            for pat in &raw_patterns {
+                if !raw_kept.iter().any(|p| p.rule_id == pat.rule_id) {
+                    raw_missing_rules.push(pat.rule_id);
+                }
+            }
         }
+
+        let raw_rule_ids: Vec<u32> = raw_kept.iter().map(|p| p.rule_id).collect();
+        let raw_seed_radius: Vec<u32> = raw_kept.iter().map(|p| p.seed_radius).collect();
+        let raw_rule_count = raw_kept.len() as u32;
+
+        let (utf16_id_base, utf16_pat_count, utf16_targets, utf16_pat_offsets, utf16_pat_lens) =
+            if let Some(data) = utf16_data {
+                let pat_count = data.pat_lens.len() as u32;
+                if pat_count == 0 {
+                    (raw_rule_count, 0, Vec::new(), Vec::new(), Vec::new())
+                } else {
+                    (
+                        raw_rule_count,
+                        pat_count,
+                        data.targets,
+                        data.pat_offsets,
+                        data.pat_lens,
+                    )
+                }
+            } else {
+                (raw_rule_count, 0, Vec::new(), Vec::new(), Vec::new())
+            };
 
         Ok(Self {
             db,
-            meta,
+            raw_rule_count,
+            raw_seed_radius,
+            raw_rule_ids,
+            raw_missing_rules,
+            utf16_id_base,
+            utf16_pat_count,
+            utf16_targets,
+            utf16_pat_offsets,
+            utf16_pat_lens,
             max_hits_per_rule_variant: tuning.max_anchor_hits_per_rule_variant,
-            nul_sentinel_id,
-            has_nul_sentinel,
             max_width,
             unbounded,
         })
@@ -1421,14 +1532,20 @@ impl VsPrefilterDb {
         self.db
     }
 
-    /// Scan raw bytes and seed per-rule candidate windows into `scratch.accs[*][Raw]`.
+    #[inline]
+    pub(crate) fn raw_missing_rules(&self) -> &[u32] {
+        &self.raw_missing_rules
+    }
+
+    /// Scan raw bytes and seed per-rule candidate windows.
     ///
-    /// This is a best-effort accelerator: on success it may seed more windows
-    /// than necessary, but it should not miss real matches.
+    /// Exact regex matches seed raw windows; UTF-16 anchor patterns (when
+    /// present in the database) seed UTF-16 windows.
     ///
-    /// Returns `Ok(true)` if a NUL byte was observed (only when the DB was built
-    /// with a NUL sentinel expression). If `has_nul_sentinel` is false, this
-    /// always returns `Ok(false)`.
+    /// `vs_scratch` must be allocated for this database and not shared across
+    /// threads; `scratch` must not be accessed concurrently.
+    ///
+    /// Returns `Ok(true)` if any UTF-16 anchor hit was observed.
     pub(crate) fn scan_raw(
         &self,
         hay: &[u8],
@@ -1442,13 +1559,18 @@ impl VsPrefilterDb {
 
         let mut ctx = VsMatchCtx {
             scratch: scratch as *mut ScanScratch,
-            meta: self.meta.as_ptr(),
-            meta_len: self.meta.len() as u32,
-            hay_len: len_u32 as u32,
+            hay_len: len_u32,
             max_hits: self.max_hits_per_rule_variant,
-            nul_id: self.nul_sentinel_id,
-            saw_nul: false,
-            has_nul_sentinel: self.has_nul_sentinel,
+            raw_rule_count: self.raw_rule_count,
+            raw_seed_radius: self.raw_seed_radius.as_ptr(),
+            raw_rule_ids: self.raw_rule_ids.as_ptr(),
+            utf16_id_base: self.utf16_id_base,
+            utf16_pat_count: self.utf16_pat_count,
+            utf16_targets: self.utf16_targets.as_ptr(),
+            utf16_pat_offsets: self.utf16_pat_offsets.as_ptr(),
+            utf16_pat_lens: self.utf16_pat_lens.as_ptr(),
+            saw_utf16: false,
+            capture_raw: false,
         };
 
         let rc = unsafe {
@@ -1464,7 +1586,64 @@ impl VsPrefilterDb {
         };
 
         if rc == vs::HS_SUCCESS as c_int || rc == vs::HS_SCAN_TERMINATED as c_int {
-            Ok(ctx.saw_nul)
+            Ok(ctx.saw_utf16)
+        } else {
+            Err(format!("hs_scan failed: rc={rc}"))
+        }
+    }
+
+    /// Scan raw bytes and capture exact Vectorscan match spans.
+    ///
+    /// This is used for diagnostics/tests; window seeding is disabled and
+    /// `scratch.raw_hs_matches` is populated instead. `vs_scratch` must be
+    /// bound to this database.
+    ///
+    /// Returns `Ok(true)` if any UTF-16 anchor hit was observed.
+    pub(crate) fn scan_raw_capture(
+        &self,
+        hay: &[u8],
+        scratch: &mut ScanScratch,
+        vs_scratch: &mut VsScratch,
+    ) -> Result<bool, String> {
+        let len_u32 = match u32::try_from(hay.len()) {
+            Ok(v) => v,
+            Err(_) => return Err("vectorscan scan length exceeds u32::MAX".to_string()),
+        };
+
+        if vs_scratch.bound_db_ptr() != self.db {
+            return Err("vectorscan scratch bound to a different database".to_string());
+        }
+
+        let mut ctx = VsMatchCtx {
+            scratch: scratch as *mut ScanScratch,
+            hay_len: len_u32,
+            max_hits: self.max_hits_per_rule_variant,
+            raw_rule_count: self.raw_rule_count,
+            raw_seed_radius: self.raw_seed_radius.as_ptr(),
+            raw_rule_ids: self.raw_rule_ids.as_ptr(),
+            utf16_id_base: self.utf16_id_base,
+            utf16_pat_count: self.utf16_pat_count,
+            utf16_targets: self.utf16_targets.as_ptr(),
+            utf16_pat_offsets: self.utf16_pat_offsets.as_ptr(),
+            utf16_pat_lens: self.utf16_pat_lens.as_ptr(),
+            saw_utf16: false,
+            capture_raw: true,
+        };
+
+        let rc = unsafe {
+            vs::hs_scan(
+                self.db,
+                hay.as_ptr().cast::<c_char>(),
+                len_u32,
+                0,
+                vs_scratch.scratch,
+                Some(vs_on_match),
+                (&mut ctx as *mut VsMatchCtx).cast::<c_void>(),
+            )
+        };
+
+        if rc == vs::HS_SUCCESS as c_int || rc == vs::HS_SCAN_TERMINATED as c_int {
+            Ok(ctx.saw_utf16)
         } else {
             Err(format!("hs_scan failed: rc={rc}"))
         }
@@ -1476,17 +1655,25 @@ impl VsPrefilterDb {
 ///
 /// Safety invariants:
 /// - `scratch` points to a live `ScanScratch` for the duration of the scan.
-/// - `meta` points to an array of `meta_len` entries indexed by rule id.
 /// - `hay_len` matches the length passed to `hs_scan`.
+/// - If `utf16_pat_count > 0`, the UTF-16 mapping tables are valid and
+///   `utf16_pat_offsets` has length `utf16_pat_count + 1`.
+/// - `raw_rule_ids`/`raw_seed_radius` each have length `raw_rule_count`.
+/// - `capture_raw` toggles raw-match capture vs window seeding.
 struct VsMatchCtx {
     scratch: *mut ScanScratch,
-    meta: *const VsRuleMeta,
-    meta_len: u32,
     hay_len: u32,
     max_hits: usize,
-    nul_id: u32,
-    saw_nul: bool,
-    has_nul_sentinel: bool,
+    raw_rule_count: u32,
+    raw_seed_radius: *const u32,
+    raw_rule_ids: *const u32,
+    utf16_id_base: u32,
+    utf16_pat_count: u32,
+    utf16_targets: *const VsAnchorTarget,
+    utf16_pat_offsets: *const u32,
+    utf16_pat_lens: *const u32,
+    saw_utf16: bool,
+    capture_raw: bool,
 }
 
 #[repr(C)]
@@ -1498,6 +1685,7 @@ struct VsMatchCtx {
 /// - `pat_offsets` has length `pat_count + 1` and is monotonically increasing.
 /// - `pat_lens` has length `pat_count`.
 /// - `hay_len` matches the length passed to `hs_scan`.
+/// - `max_hits` caps windows per (rule, variant) accumulator.
 struct VsAnchorMatchCtx {
     scratch: *mut ScanScratch,
     targets: *const VsAnchorTarget,
@@ -1511,54 +1699,102 @@ struct VsAnchorMatchCtx {
 /// Prefilter match callback for raw-byte scanning.
 ///
 /// Seeds per-rule raw windows in `ScanScratch` based on the match end offset.
-/// Must never panic or unwind across the FFI boundary.
+/// `id` values below `raw_rule_count` denote raw rules; ids at or above
+/// `utf16_id_base` denote UTF-16 anchor patterns.
+///
+/// # Safety
+/// - `ctx` must be non-null and point to a valid `VsMatchCtx`.
+/// - `scratch` and mapping tables referenced by `ctx` must remain valid and not
+///   be accessed concurrently for the duration of the scan.
+/// - This callback must never panic or unwind across the FFI boundary.
 extern "C" fn vs_on_match(
     id: c_uint,
-    _from: u64,
+    from: u64,
     to: u64,
     _flags: c_uint,
     ctx: *mut c_void,
 ) -> c_int {
     // Absolutely no panics across FFI.
     let c = unsafe { &mut *(ctx as *mut VsMatchCtx) };
+    if id < c.raw_rule_count {
+        let raw_idx = id as usize;
+        let rid = unsafe { *c.raw_rule_ids.add(raw_idx) as usize };
 
-    // NUL sentinel is only present when scan_utf16_variants is enabled.
-    if c.has_nul_sentinel && id == c.nul_id {
-        c.saw_nul = true;
+        // SAFETY: `scratch` is valid for the duration of the scan and is not used concurrently.
+        let scratch = unsafe { &mut *c.scratch };
+
+        const RAW_IDX: usize = 0;
+
+        let end = to as u32;
+        let start = from as u32;
+        if end > c.hay_len || start > end {
+            return 0;
+        }
+
+        if c.capture_raw {
+            scratch.raw_hs_matches.push(RawHsMatch {
+                rule_id: rid as u32,
+                start,
+                end,
+            });
+        } else {
+            let seed = unsafe { *c.raw_seed_radius.add(raw_idx) };
+            let lo = start.saturating_sub(seed);
+            let hi = end.saturating_add(seed).min(c.hay_len);
+
+            let accs = unsafe { scratch.accs.get_unchecked_mut(rid) };
+            let acc = unsafe { accs.get_unchecked_mut(RAW_IDX) };
+            acc.push(lo as usize, hi as usize, c.max_hits);
+            scratch.mark_touched(rid, Variant::Raw);
+        }
         return 0;
     }
 
-    let rid = id as usize;
-    debug_assert!(rid < c.meta_len as usize);
+    if c.utf16_pat_count == 0 || id < c.utf16_id_base {
+        return 0;
+    }
 
-    let meta = unsafe { *c.meta.add(rid) };
+    let pid = (id - c.utf16_id_base) as usize;
+    if pid >= c.utf16_pat_count as usize {
+        return 0;
+    }
 
-    // SAFETY: `scratch` is valid for the duration of the scan and is not used concurrently.
+    let len = unsafe { *c.utf16_pat_lens.add(pid) };
+    let end = to as u32;
+    if end > c.hay_len {
+        return 0;
+    }
+    let start = end.saturating_sub(len);
+
+    let off_start = unsafe { *c.utf16_pat_offsets.add(pid) } as usize;
+    let off_end = unsafe { *c.utf16_pat_offsets.add(pid + 1) } as usize;
+
+    // SAFETY: `scratch` is valid for the duration of the scan and not used concurrently.
     let scratch = unsafe { &mut *c.scratch };
 
-    const RAW_IDX: usize = 0; // Raw variant is always index 0.
+    for i in off_start..off_end {
+        let target = unsafe { *c.utf16_targets.add(i) };
+        let seed = target.seed_radius_bytes;
+        let lo = start.saturating_sub(seed);
+        let hi = end.saturating_add(seed).min(c.hay_len);
 
-    // Whole-buffer on hit sentinel.
-    if meta.seed == u32::MAX {
-        // Unchecked indexing is safe because ids are assigned by us at compile time.
+        let rid = target.rule_id as usize;
+        let vidx = target.variant_idx as usize;
+
         let accs = unsafe { scratch.accs.get_unchecked_mut(rid) };
-        let acc = unsafe { accs.get_unchecked_mut(RAW_IDX) };
-        acc.push(0, c.hay_len as usize, 1);
-        scratch.mark_touched(rid, Variant::Raw);
-        return 0;
+        let acc = unsafe { accs.get_unchecked_mut(vidx) };
+        acc.push(lo as usize, hi as usize, c.max_hits);
+
+        let variant = match target.variant_idx {
+            1 => Variant::Utf16Le,
+            2 => Variant::Utf16Be,
+            _ => Variant::Raw,
+        };
+        scratch.mark_touched(rid, variant);
+        if matches!(variant, Variant::Utf16Le | Variant::Utf16Be) {
+            c.saw_utf16 = true;
+        }
     }
-
-    // hs_scan length is u32, and `to` is guaranteed to be <= length.
-    let end = to as u32;
-    debug_assert!(end <= c.hay_len);
-
-    let lo = end.saturating_sub(meta.lo_pad);
-    let hi = end.saturating_add(meta.seed).min(c.hay_len);
-
-    let accs = unsafe { scratch.accs.get_unchecked_mut(rid) };
-    let acc = unsafe { accs.get_unchecked_mut(RAW_IDX) };
-    acc.push(lo as usize, hi as usize, c.max_hits);
-    scratch.mark_touched(rid, Variant::Raw);
 
     0
 }
@@ -1566,7 +1802,13 @@ extern "C" fn vs_on_match(
 /// UTF-16 anchor match callback.
 ///
 /// Expands each anchor match into windows for all rule/variant targets tied to
-/// the matched pattern. Must never panic or unwind across the FFI boundary.
+/// the matched pattern.
+///
+/// # Safety
+/// - `ctx` must be non-null and point to a valid `VsAnchorMatchCtx`.
+/// - `scratch` and mapping tables referenced by `ctx` must remain valid and not
+///   be accessed concurrently for the duration of the scan.
+/// - This callback must never panic or unwind across the FFI boundary.
 extern "C" fn vs_anchor_on_match(
     id: c_uint,
     _from: u64,
@@ -1615,14 +1857,13 @@ extern "C" fn vs_anchor_on_match(
     0
 }
 
-/// Returns `(max_width, c_pattern)` for use in prefilter compilation.
+/// Returns `(max_width, c_pattern)` for use in compilation.
 ///
 /// Errors if the pattern contains NUL bytes or if `hs_expression_info` fails.
 /// A reported `max_width` of zero is treated as "unbounded" by callers.
-fn expression_info_prefilter_max_width(pattern: &str) -> Result<(u32, CString), String> {
+fn expression_info_max_width(pattern: &str, flags: c_uint) -> Result<(u32, CString), String> {
     let c_pat = CString::new(pattern).map_err(|_| "pattern contains NUL byte".to_string())?;
 
-    let flags = vs::HS_FLAG_PREFILTER as c_uint;
     let mut info_ptr: *mut vs::hs_expr_info_t = ptr::null_mut();
     let mut compile_err: *mut vs::hs_compile_error_t = ptr::null_mut();
     let rc =
@@ -1659,6 +1900,10 @@ fn expression_info_prefilter_max_width(pattern: &str) -> Result<(u32, CString), 
     }
 
     Ok((maxw, c_pat))
+}
+
+fn expression_info_prefilter_max_width(pattern: &str) -> Result<(u32, CString), String> {
+    expression_info_max_width(pattern, vs::HS_FLAG_PREFILTER as c_uint)
 }
 
 #[inline]
