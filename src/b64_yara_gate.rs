@@ -69,6 +69,7 @@ pub struct Base64YaraGateConfig {
     /// Drop generated base64-permutation patterns shorter than this.
     /// - Larger => fewer false positives, faster downstream, but higher miss risk for short anchors.
     /// - Smaller => more coverage for short anchors, but gate becomes noisy.
+    ///
     /// This length check happens after unstable prefix/suffix trimming.
     pub min_pattern_len: usize,
     /// How to treat '=' (padding) in input.
