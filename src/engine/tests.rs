@@ -495,7 +495,7 @@ fn anchor_policy_falls_back_to_manual_on_unfilterable() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
-        re: Regex::new(".*").unwrap(),
+        re: Regex::new("[A-Za-z]{1,}").unwrap(),
     };
 
     let eng = Engine::new(vec![rule], Vec::new(), demo_tuning());

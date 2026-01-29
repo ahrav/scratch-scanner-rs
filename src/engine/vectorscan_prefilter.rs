@@ -17,6 +17,11 @@
 //! - Raw/UTF-16 anchor scans operate on raw-byte offsets in the scanned buffer.
 //! - Stream prefilters emit decoded-byte offsets in the post-transform stream.
 //!
+//! # Match offsets
+//! Vectorscan reports `from`/`to` offsets in the coordinate system of the scan
+//! input. We treat `to` as the match end offset for window seeding, and when
+//! start-of-match (SOM) is enabled we use `from` as the match start.
+//!
 //! # Correctness contract
 //! Prefiltering is conservative: it may add extra windows but must never drop
 //! true matches. Window math is saturating and clamped to the available
@@ -42,6 +47,13 @@
 //!   than risking under-seeding.
 //! - UTF-16 scanning always uses anchor databases; Vectorscan only gates
 //!   raw-byte and decoded-stream variants.
+//!
+//! # Limits and fallback behavior
+//! - Scan APIs accept `u32` lengths; we return errors when a haystack exceeds
+//!   that bound.
+//! - If multi-compile fails for raw rules, we fall back to per-rule compilation
+//!   and drop unsupported patterns; `raw_missing_rules` exposes the dropped ids.
+//! - Empty UTF-16/gate pattern sets return an error early.
 use crate::api::{RuleSpec, Tuning};
 use libc::{c_char, c_int, c_uint, c_void};
 use std::ffi::CString;
@@ -66,6 +78,7 @@ pub(crate) struct VsPrefilterDb {
     raw_rule_count: u32,
     raw_seed_radius: Vec<u32>,
     raw_rule_ids: Vec<u32>,
+    raw_match_widths: Vec<u32>,
     raw_missing_rules: Vec<u32>,
     utf16_id_base: u32,
     utf16_pat_count: u32,
@@ -75,15 +88,16 @@ pub(crate) struct VsPrefilterDb {
     max_hits_per_rule_variant: usize, // Cap used by hit accumulators.
     max_width: u32,                   // Max bounded width across all rules.
     unbounded: bool,                  // True if any rule reports an unbounded width.
+    use_som: bool,
 }
 
 /// Per-rule metadata for stream-mode window seeding.
 ///
 /// `max_width` is derived from `hs_expression_info` in decoded-byte space and may
-/// be capped; a reported 0 width is treated as unbounded. `radius` comes from
-/// rule tuning and expands windows around the match end.
-/// `whole_buffer_on_hit` is a boolean (0/1) that tells the callback to emit a
-/// force-full window instead of computing offsets.
+/// be capped; a reported 0 width is treated as unbounded. When unbounded,
+/// `whole_buffer_on_hit` is set and the callback asks the caller to scan the
+/// full decoded stream instead of emitting offsets. `radius` comes from rule
+/// tuning and expands windows around the match end.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct VsStreamMeta {
@@ -1258,7 +1272,8 @@ impl VsPrefilterDb {
         tuning: &Tuning,
         utf16: Option<Utf16AnchorInput<'_>>,
     ) -> Result<Self, String> {
-        const RAW_FLAGS: c_uint = vs::HS_FLAG_SOM_LEFTMOST as c_uint;
+        const RAW_FLAGS: c_uint = vs::HS_FLAG_PREFILTER as c_uint;
+        const USE_SOM: bool = false;
 
         #[derive(Clone)]
         struct RawPattern<'a> {
@@ -1267,6 +1282,7 @@ impl VsPrefilterDb {
             c_pat: CString,
             name: &'a str,
             pattern: &'a str,
+            max_width: u32,
         }
 
         let mut raw_patterns: Vec<RawPattern<'_>> = Vec::with_capacity(rules.len());
@@ -1295,6 +1311,7 @@ impl VsPrefilterDb {
                 c_pat,
                 name: r.name,
                 pattern: r.re.as_str(),
+                max_width: max_width_u32,
             });
         }
 
@@ -1498,6 +1515,7 @@ impl VsPrefilterDb {
             raw_rule_count,
             raw_seed_radius,
             raw_rule_ids,
+            raw_match_widths,
             raw_missing_rules,
             utf16_id_base,
             utf16_pat_count,
@@ -1507,6 +1525,7 @@ impl VsPrefilterDb {
             max_hits_per_rule_variant: tuning.max_anchor_hits_per_rule_variant,
             max_width,
             unbounded,
+            use_som: USE_SOM,
         })
     }
 
@@ -1547,6 +1566,11 @@ impl VsPrefilterDb {
         &self.raw_missing_rules
     }
 
+    #[inline]
+    pub(crate) fn supports_som(&self) -> bool {
+        self.use_som
+    }
+
     /// Scan raw bytes and seed per-rule candidate windows.
     ///
     /// Exact regex matches seed raw windows; UTF-16 anchor patterns (when
@@ -1574,6 +1598,7 @@ impl VsPrefilterDb {
             raw_rule_count: self.raw_rule_count,
             raw_seed_radius: self.raw_seed_radius.as_ptr(),
             raw_rule_ids: self.raw_rule_ids.as_ptr(),
+            raw_match_widths: self.raw_match_widths.as_ptr(),
             utf16_id_base: self.utf16_id_base,
             utf16_pat_count: self.utf16_pat_count,
             utf16_targets: self.utf16_targets.as_ptr(),
@@ -1581,6 +1606,7 @@ impl VsPrefilterDb {
             utf16_pat_lens: self.utf16_pat_lens.as_ptr(),
             saw_utf16: false,
             capture_raw: false,
+            use_som: self.use_som,
         };
 
         let rc = unsafe {
@@ -1631,6 +1657,7 @@ impl VsPrefilterDb {
             raw_rule_count: self.raw_rule_count,
             raw_seed_radius: self.raw_seed_radius.as_ptr(),
             raw_rule_ids: self.raw_rule_ids.as_ptr(),
+            raw_match_widths: self.raw_match_widths.as_ptr(),
             utf16_id_base: self.utf16_id_base,
             utf16_pat_count: self.utf16_pat_count,
             utf16_targets: self.utf16_targets.as_ptr(),
@@ -1638,6 +1665,7 @@ impl VsPrefilterDb {
             utf16_pat_lens: self.utf16_pat_lens.as_ptr(),
             saw_utf16: false,
             capture_raw: true,
+            use_som: self.use_som,
         };
 
         let rc = unsafe {
@@ -1668,7 +1696,8 @@ impl VsPrefilterDb {
 /// - `hay_len` matches the length passed to `hs_scan`.
 /// - If `utf16_pat_count > 0`, the UTF-16 mapping tables are valid and
 ///   `utf16_pat_offsets` has length `utf16_pat_count + 1`.
-/// - `raw_rule_ids`/`raw_seed_radius` each have length `raw_rule_count`.
+/// - `raw_rule_ids`/`raw_seed_radius`/`raw_match_widths` each have length
+///   `raw_rule_count`.
 /// - `capture_raw` toggles raw-match capture vs window seeding.
 struct VsMatchCtx {
     scratch: *mut ScanScratch,
@@ -1677,6 +1706,7 @@ struct VsMatchCtx {
     raw_rule_count: u32,
     raw_seed_radius: *const u32,
     raw_rule_ids: *const u32,
+    raw_match_widths: *const u32,
     utf16_id_base: u32,
     utf16_pat_count: u32,
     utf16_targets: *const VsAnchorTarget,
@@ -1684,6 +1714,7 @@ struct VsMatchCtx {
     utf16_pat_lens: *const u32,
     saw_utf16: bool,
     capture_raw: bool,
+    use_som: bool,
 }
 
 #[repr(C)]
@@ -1736,10 +1767,23 @@ extern "C" fn vs_on_match(
         const RAW_IDX: usize = 0;
 
         let end = to as u32;
-        let start = from as u32;
-        if end > c.hay_len || start > end {
+        if end > c.hay_len {
             return 0;
         }
+        let start = if c.use_som {
+            let start = from as u32;
+            if start > end {
+                return 0;
+            }
+            start
+        } else {
+            let max_width = unsafe { *c.raw_match_widths.add(raw_idx) };
+            if max_width == u32::MAX {
+                0
+            } else {
+                end.saturating_sub(max_width)
+            }
+        };
 
         if c.capture_raw {
             scratch.raw_hs_matches.push(RawHsMatch {

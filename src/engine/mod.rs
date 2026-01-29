@@ -21,6 +21,13 @@
 //! - UTF-16 anchors always contain at least one NUL byte, enabling a raw-only
 //!   fast path for NUL-free buffers.
 //!
+//! # Span Semantics
+//! - Raw findings report byte offsets in the scanned buffer.
+//! - UTF-16 variant findings report spans in decoded UTF-8 bytes and attach a
+//!   [`DecodeStep::Utf16Window`] that records the source UTF-16 window.
+//! - Findings from decoded/transformed buffers report spans in derived buffers;
+//!   the decode step chain provides provenance back to the root input.
+//!
 //! # Safety
 //! - Unsafe slices are formed only from ranges validated against the root buffer,
 //!   the decode slab, or scratch-owned temporary buffers; those buffers are not
@@ -2309,6 +2316,7 @@ impl Engine {
         // Stage 1: Vectorscan prefilter on raw bytes (required).
         let used_vectorscan = true;
         let saw_utf16 = if let Some(vs) = self.vs.as_ref() {
+            let use_direct_raw = self.tuning.vs_direct_raw_regex && vs.supports_som();
             let mut vs_scratch = scratch
                 .vs_scratch
                 .take()
@@ -2317,7 +2325,7 @@ impl Engine {
             self.vs_stats
                 .scans_attempted
                 .fetch_add(1, Ordering::Relaxed);
-            let result = if self.tuning.vs_direct_raw_regex {
+            let result = if use_direct_raw {
                 scratch.raw_hs_matches.clear();
                 vs.scan_raw_capture(buf, scratch, &mut vs_scratch)
             } else {
@@ -2359,26 +2367,28 @@ impl Engine {
             .map(|db| db.raw_missing_rules())
             .unwrap_or(&[]);
 
-        if used_vectorscan && self.tuning.vs_direct_raw_regex {
-            let raw_matches: Vec<RawHsMatch> = scratch.raw_hs_matches.drain(..).collect();
-            for m in raw_matches {
-                let rid = m.rule_id as usize;
-                if rid >= self.rules.len() {
-                    continue;
+        if let Some(vs) = self.vs.as_ref() {
+            if used_vectorscan && self.tuning.vs_direct_raw_regex && vs.supports_som() {
+                let raw_matches: Vec<RawHsMatch> = scratch.raw_hs_matches.drain(..).collect();
+                for m in raw_matches {
+                    let rid = m.rule_id as usize;
+                    if rid >= self.rules.len() {
+                        continue;
+                    }
+                    let rule = &self.rules[rid];
+                    let w = m.start as usize..m.end as usize;
+                    self.run_rule_on_raw_match(
+                        rid as u32,
+                        rule,
+                        buf,
+                        w,
+                        step_id,
+                        root_hint.clone(),
+                        base_offset,
+                        file_id,
+                        scratch,
+                    );
                 }
-                let rule = &self.rules[rid];
-                let w = m.start as usize..m.end as usize;
-                self.run_rule_on_raw_match(
-                    rid as u32,
-                    rule,
-                    buf,
-                    w,
-                    step_id,
-                    root_hint.clone(),
-                    base_offset,
-                    file_id,
-                    scratch,
-                );
             }
         }
 
@@ -2803,6 +2813,14 @@ impl Engine {
         }
     }
 
+    /// Validates a raw decoded-space window and appends findings into `scratch.tmp_findings`.
+    ///
+    /// # Preconditions
+    /// - `window_start` is the decoded-space offset for `window[0]`.
+    ///
+    /// # Effects
+    /// - Sets `found_any` when any match passes gates.
+    /// - Increments `dropped` when the per-chunk findings cap is exceeded.
     #[allow(clippy::too_many_arguments)]
     fn run_rule_on_raw_window_into(
         &self,
@@ -2880,6 +2898,17 @@ impl Engine {
         }
     }
 
+    /// Validates a UTF-16 window by decoding to UTF-8 and appending findings.
+    ///
+    /// Spans recorded in findings are in decoded UTF-8 byte space; an attached
+    /// [`DecodeStep::Utf16Window`] records the raw UTF-16 parent span.
+    ///
+    /// # Preconditions
+    /// - `window_start` is the decoded-space offset for `raw_win[0]`.
+    ///
+    /// # Effects
+    /// - Sets `found_any` when any match passes gates.
+    /// - Increments `dropped` when the per-chunk findings cap is exceeded.
     #[allow(clippy::too_many_arguments)]
     fn run_rule_on_utf16_window_into(
         &self,
@@ -3019,6 +3048,7 @@ impl Engine {
     /// # Effects
     /// - May append decoded bytes to the slab and enqueue a `ScanBuf` work item.
     /// - Updates per-scan decode budgets and dedupe state.
+    /// - On dedupe hits, rolls back the slab and skips enqueueing.
     #[allow(clippy::too_many_arguments)]
     fn decode_span_fallback(
         &self,
@@ -3087,6 +3117,13 @@ impl Engine {
         let _ = (base_offset, file_id, transform_idx);
     }
 
+    /// Re-decodes the decoded-byte window `[lo, hi)` into `out`.
+    ///
+    /// This is used when the ring buffer no longer holds the full window.
+    ///
+    /// # Returns
+    /// - `true` if exactly `hi - lo` bytes were reconstructed.
+    /// - `false` if decoding fails, truncates, or exceeds `max_out`.
     fn redecode_window_into(
         &self,
         tc: &TransformConfig,
@@ -3140,6 +3177,15 @@ impl Engine {
     }
 
     /// Stream-decodes `encoded` and scans windows without materializing the full buffer.
+    ///
+    /// # Strategy
+    /// - Track decoded bytes in a ring buffer.
+    /// - Use the stream Vectorscan DB to emit candidate windows.
+    /// - Re-decode windows only when they fall outside the ring buffer.
+    ///
+    /// # Gate behavior
+    /// - When `tc.gate == Gate::AnchorsInDecoded`, enforce decoded-space gating
+    ///   when possible; otherwise fall back to prefilter-based gating.
     ///
     /// # Preconditions
     /// - `encoded` is the bytes for the current decode span.
