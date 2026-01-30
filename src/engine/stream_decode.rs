@@ -7,8 +7,8 @@
 //!
 //! ## Invariants
 //! - Decoded offsets are monotonically increasing during a stream decode.
-//! - `pending_windows` is a min-heap by `hi`, so windows are only processed
-//!   once the decoded offset has reached the window end.
+//! - `pending_windows` is a timing wheel keyed by `hi` (G=1), so windows are
+//!   only processed once the decoded offset has reached the window end.
 //! - `scratch.slab` is append-only during a stream pass; on abort or fallback
 //!   it is truncated back to its pre-decode length.
 //! - Per-scan decode budgets (`max_total_decode_output_bytes`, per-transform
@@ -26,6 +26,7 @@
 //! may relax enforcement to avoid dropping UTF-16-only matches.
 
 use crate::api::{DecodeStep, FileId, StepId};
+use crate::stdx::PushOutcome;
 use memchr::memchr;
 use std::ops::{ControlFlow, Range};
 #[cfg(feature = "stats")]
@@ -266,7 +267,7 @@ impl Engine {
 
         scratch.decode_ring.reset();
         scratch.window_bytes.clear();
-        scratch.pending_windows.clear();
+        scratch.pending_windows.reset();
         scratch.vs_stream_matches.clear();
         scratch.pending_spans.clear();
         scratch.span_streams.clear();
@@ -383,6 +384,13 @@ impl Engine {
                 }
             }
         };
+
+        // Use raw pointers to avoid borrowing `scratch` across timing-wheel callbacks.
+        // The callbacks are synchronous and never outlive this function call.
+        let scratch_ptr = scratch as *mut ScanScratch;
+        let found_any_ptr = &mut found_any as *mut bool;
+        let local_dropped_ptr = &mut local_dropped as *mut usize;
+        let force_full_ptr = &mut force_full as *mut bool;
 
         if depth < self.tuning.max_transform_depth {
             for (tidx, tcfg) in self.transforms.iter().enumerate() {
@@ -604,7 +612,8 @@ impl Engine {
 
             if !scratch.vs_stream_matches.is_empty() {
                 let max_hits = self.tuning.max_windows_per_rule_variant as u32;
-                for win in scratch.vs_stream_matches.drain(..) {
+                let mut vs_matches = std::mem::take(&mut scratch.vs_stream_matches);
+                for win in vs_matches.drain(..) {
                     if win.force_full {
                         force_full = true;
                         break;
@@ -631,13 +640,36 @@ impl Engine {
                         force_full = true;
                         break;
                     }
-                    scratch.pending_windows.push(PendingWindow {
+                    let pending = PendingWindow {
                         hi: win.hi,
                         lo: win.lo,
                         rule_id: win.rule_id,
                         variant,
-                    });
+                    };
+                    match scratch.pending_windows.push(pending.hi, pending) {
+                        Ok(PushOutcome::Scheduled) => {}
+                        Ok(PushOutcome::Ready(win)) => {
+                            let hi = win.hi.min(decoded_offset);
+                            process_window(
+                                win,
+                                hi,
+                                scratch,
+                                &mut found_any,
+                                &mut local_dropped,
+                                &mut force_full,
+                            );
+                            if force_full {
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            force_full = true;
+                            break;
+                        }
+                    }
                 }
+                vs_matches.clear();
+                scratch.vs_stream_matches = vs_matches;
                 if force_full {
                     return ControlFlow::Break(());
                 }
@@ -645,23 +677,23 @@ impl Engine {
 
             decoded_offset = decoded_offset.saturating_add(chunk.len() as u64);
 
-            loop {
-                let hi = match scratch.pending_windows.peek() {
-                    Some(top) if top.hi <= decoded_offset => top.hi,
-                    _ => break,
-                };
-                let win = scratch.pending_windows.pop().expect("pending window");
-                process_window(
-                    win,
-                    hi,
-                    scratch,
-                    &mut found_any,
-                    &mut local_dropped,
-                    &mut force_full,
-                );
-                if force_full {
-                    return ControlFlow::Break(());
-                }
+            scratch
+                .pending_windows
+                .advance_and_drain(decoded_offset, |win| {
+                    // SAFETY: pending_windows is mutably borrowed; we only touch other fields.
+                    let scratch = unsafe { &mut *scratch_ptr };
+                    let found_any = unsafe { &mut *found_any_ptr };
+                    let local_dropped = unsafe { &mut *local_dropped_ptr };
+                    let force_full = unsafe { &mut *force_full_ptr };
+                    if *force_full {
+                        return;
+                    }
+                    let hi = win.hi.min(decoded_offset);
+                    process_window(win, hi, scratch, found_any, local_dropped, force_full);
+                });
+
+            if force_full {
+                return ControlFlow::Break(());
             }
 
             let chunk_start = decoded_offset.saturating_sub(chunk.len() as u64);
@@ -793,9 +825,10 @@ impl Engine {
             self.vs_stats
                 .stream_force_full
                 .fetch_add(1, Ordering::Relaxed);
+            // Roll back streaming state/budgets before falling back to full decode.
             scratch.slab.buf.truncate(slab_start);
             scratch.total_decode_output_bytes = total_decode_start;
-            scratch.pending_windows.clear();
+            scratch.pending_windows.reset();
             scratch.vs_stream_matches.clear();
             scratch.pending_spans.clear();
             scratch.span_streams.clear();
@@ -817,7 +850,8 @@ impl Engine {
         if res.is_ok() {
             if !scratch.vs_stream_matches.is_empty() {
                 let max_hits = self.tuning.max_windows_per_rule_variant as u32;
-                for win in scratch.vs_stream_matches.drain(..) {
+                let mut vs_matches = std::mem::take(&mut scratch.vs_stream_matches);
+                for win in vs_matches.drain(..) {
                     if win.force_full {
                         force_full = true;
                         break;
@@ -839,13 +873,36 @@ impl Engine {
                         force_full = true;
                         break;
                     }
-                    scratch.pending_windows.push(PendingWindow {
+                    let pending = PendingWindow {
                         hi: win.hi,
                         lo: win.lo,
                         rule_id: win.rule_id,
                         variant,
-                    });
+                    };
+                    match scratch.pending_windows.push(pending.hi, pending) {
+                        Ok(PushOutcome::Scheduled) => {}
+                        Ok(PushOutcome::Ready(win)) => {
+                            let hi = win.hi.min(decoded_offset);
+                            process_window(
+                                win,
+                                hi,
+                                scratch,
+                                &mut found_any,
+                                &mut local_dropped,
+                                &mut force_full,
+                            );
+                            if force_full {
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            force_full = true;
+                            break;
+                        }
+                    }
                 }
+                vs_matches.clear();
+                scratch.vs_stream_matches = vs_matches;
                 if force_full {
                     scratch.vs_stream_matches.clear();
                 }
@@ -922,26 +979,24 @@ impl Engine {
 
         if res.is_ok() && !force_full {
             let final_offset = decoded_offset;
-            while let Some(win) = scratch.pending_windows.pop() {
-                let hi = win.hi.min(final_offset);
-                process_window(
-                    win,
-                    hi,
-                    scratch,
-                    &mut found_any,
-                    &mut local_dropped,
-                    &mut force_full,
-                );
-                if force_full {
-                    break;
+            scratch.pending_windows.advance_and_drain(u64::MAX, |win| {
+                // SAFETY: pending_windows is mutably borrowed; we only touch other fields.
+                let scratch = unsafe { &mut *scratch_ptr };
+                let found_any = unsafe { &mut *found_any_ptr };
+                let local_dropped = unsafe { &mut *local_dropped_ptr };
+                let force_full = unsafe { &mut *force_full_ptr };
+                if *force_full {
+                    return;
                 }
-            }
+                let hi = win.hi.min(final_offset);
+                process_window(win, hi, scratch, found_any, local_dropped, force_full);
+            });
         }
 
         if force_full {
             scratch.slab.buf.truncate(slab_start);
             scratch.total_decode_output_bytes = total_decode_start;
-            scratch.pending_windows.clear();
+            scratch.pending_windows.reset();
             scratch.vs_stream_matches.clear();
             scratch.pending_spans.clear();
             scratch.span_streams.clear();

@@ -229,6 +229,126 @@ These gates are designed to be **local and bounded**:
 | `pressure_gap_start` | 128 | Starting gap for pressure coalescing |
 | `max_anchor_hits_per_rule_variant` | 2048 | Hard cap on anchor hits |
 | `max_utf16_decoded_bytes_per_window` | 64KB | UTF-16 decode output limit |
+| `pending_window_horizon_bytes` | max_radius + chunk_size | TimingWheel horizon bound |
+| `pending_window_cap` | rules × 3 × max_windows | TimingWheel node pool capacity |
+
+## Stream Decode Window Scheduling
+
+During streaming decode (URL/Base64 transforms), the engine uses a **TimingWheel** to
+schedule window validation without materializing the full decoded buffer. This enables
+efficient incremental scanning where windows are processed exactly when they become
+complete.
+
+```mermaid
+flowchart TB
+    subgraph StreamDecode["Stream Decode Loop"]
+        Chunk["Decode chunk"]
+        Scan["Vectorscan stream scan"]
+        Match["Anchor match at offset"]
+        Window["Window (lo, hi)"]
+    end
+
+    subgraph TimingWheel["TimingWheel<PendingWindow, 1>"]
+        Push["push(hi, window)"]
+        Scheduled["Scheduled into bucket"]
+        Ready["Ready (already due)"]
+    end
+
+    subgraph Advance["advance_and_drain(decoded_offset)"]
+        Drain["Drain buckets <= offset"]
+        Process["process_window()"]
+        Validate["Regex validation"]
+    end
+
+    Chunk --> Scan
+    Scan --> Match
+    Match --> Window
+    Window --> Push
+
+    Push --> |"hi >= cursor"| Scheduled
+    Push --> |"hi < cursor"| Ready
+
+    Ready --> Process
+    Scheduled --> Drain
+    Drain --> Process
+    Process --> Validate
+
+    style StreamDecode fill:#e3f2fd
+    style TimingWheel fill:#fff3e0
+    style Advance fill:#e8f5e9
+```
+
+### How It Works
+
+1. **Window Discovery**: During streaming decode, Vectorscan reports anchor matches
+   at decoded-space offsets. Each match generates a window `[lo, hi)` where `hi`
+   is the exclusive right edge (when the window becomes complete).
+
+2. **Scheduling**: Windows are pushed to the timing wheel keyed by `hi`:
+   ```rust
+   match scratch.pending_windows.push(hi, pending_window) {
+       Ok(PushOutcome::Scheduled) => { /* queued for later */ }
+       Ok(PushOutcome::Ready(w))  => process_window(w, ...),
+       Err(_) => { /* pool exhausted, fallback to full decode */ }
+   }
+   ```
+
+3. **Draining**: As more bytes are decoded, `advance_and_drain(decoded_offset)`
+   fires all windows whose `hi <= decoded_offset`:
+   ```rust
+   scratch.pending_windows.advance_and_drain(decoded_offset, |win| {
+       process_window(win, ...);
+   });
+   ```
+
+4. **Final Flush**: At end-of-stream, `advance_and_drain(u64::MAX)` drains all
+   remaining windows.
+
+### TimingWheel Design
+
+The timing wheel uses **exact scheduling** with `G=1` (granularity = 1 byte):
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  TimingWheel<PendingWindow, 1>                                  │
+├─────────────────────────────────────────────────────────────────┤
+│  wheel_size: power of 2 >= horizon / G                          │
+│  cursor_abs: next bucket to process                             │
+│  occ: Bitset2 (two-level bitmap for fast next-slot lookup)      │
+├─────────────────────────────────────────────────────────────────┤
+│  Node Pool (fixed capacity):                                    │
+│  ┌─────┬─────┬─────┬─────┐                                      │
+│  │ win │ win │free │free │ ...                                  │
+│  └──┬──┴──┬──┴─────┴─────┘                                      │
+│     │     │                                                     │
+│     └──┬──┘                                                     │
+│        v                                                        │
+│  Slot FIFO lists (intrusive linked list per bucket)             │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Key properties**:
+
+- **Never fires early**: Windows are guaranteed to not fire before `hi`
+- **FIFO within bucket**: Windows at the same offset drain in insertion order
+- **Fixed allocation**: Node pool is pre-sized; pool exhaustion triggers fallback
+- **O(1) push**: Hash-based slot lookup with FIFO append
+- **O(buckets + items) drain**: Bitmap skips empty buckets efficiently
+
+### Fallback on Pool Exhaustion
+
+If the timing wheel's node pool is exhausted or horizon is exceeded, the stream
+decode falls back to full buffer materialization:
+
+```rust
+Err(PushError::PoolExhausted) | Err(PushError::TooFarInFuture { .. }) => {
+    scratch.pending_windows.reset();
+    // Fall back to non-streaming full decode path
+}
+```
+
+This ensures correctness is preserved even under adversarial input that
+generates many overlapping windows.
 
 ## Finding Output
 

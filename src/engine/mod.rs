@@ -46,6 +46,8 @@
 //! - Budget enforcement may coalesce windows, skip deeper decode work, or drop
 //!   findings; dropped findings are counted in
 //!   [`ScanScratch::dropped_findings`].
+//! - Stream decoding may fall back to full decode when window caps or budgets
+//!   are exceeded; correctness is preserved at the cost of throughput.
 
 // Internal compiled representation modules
 mod decode_state;

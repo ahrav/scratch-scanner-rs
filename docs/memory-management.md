@@ -273,6 +273,7 @@ pub struct ScanScratch {
     spans: ScratchVec<SpanU32>,     // Transform span candidates
     gate: GateScratch,              // Gate streaming scratch
     step_arena: StepArena,          // Decode provenance
+    pending_windows: TimingWheel<PendingWindow, 1>,  // Window expiration scheduler
     utf16_buf: Vec<u8>,             // UTF-16 decode output
     steps_buf: Vec<DecodeStep>,     // Finding materialization temp
 }

@@ -6,12 +6,14 @@
 
 use super::core::Engine;
 use super::helpers::{decode_utf16be_to_vec, decode_utf16le_to_vec, entropy_gate_passes, hash128};
+#[cfg(all(test, feature = "stdx-proptest"))]
 use super::hit_pool::{HitAccPool, SpanU32};
 use super::rule_repr::{utf16be_bytes, utf16le_bytes, EntropyCompiled, PackedPatterns, Variant};
 use super::scratch::EntropyScratch;
+#[cfg(all(test, feature = "stdx-proptest"))]
+use super::transform::find_url_spans_into;
 use super::transform::{
-    decode_to_vec, find_base64_spans_into, find_spans_into, find_url_spans_into,
-    transform_quick_trigger,
+    decode_to_vec, find_base64_spans_into, find_spans_into, transform_quick_trigger,
 };
 use super::vectorscan_prefilter::{
     gate_match_callback, stream_match_callback, VsStreamMatchCtx, VsStreamWindow,
@@ -22,6 +24,7 @@ use crate::api::{
 };
 use crate::demo::{demo_engine, demo_rules, demo_tuning};
 use crate::regex2anchor::{compile_trigger_plan, AnchorDeriveConfig, TriggerPlan};
+#[cfg(all(test, feature = "stdx-proptest"))]
 use crate::scratch_memory::ScratchVec;
 use crate::tiger_harness::{
     check_oracle_covered, correctness_engine, load_regressions_from_dir, maybe_write_regression,

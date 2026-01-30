@@ -39,6 +39,7 @@ graph TB
         ScanScratch["ScanScratch<br/>Reusable Scratch Buffers"]
         StepArena["StepArena<br/>Decode Provenance"]
         FixedSet128["FixedSet128<br/>Deduplication"]
+        TimingWheel["TimingWheel&lt;PendingWindow, 1&gt;<br/>Window Expiration Scheduler"]
     end
 
     Main --> |"Arc&lt;Engine&gt;"| Engine
@@ -63,6 +64,7 @@ graph TB
     ScanScratch --> DecodeSlab
     ScanScratch --> StepArena
     ScanScratch --> FixedSet128
+    ScanScratch --> TimingWheel
 
     RingBuffer --> |"Inter-stage<br/>Communication"| Pipeline
 
@@ -93,6 +95,7 @@ graph TB
 | **RingBuffer** | `src/stdx/ring_buffer.rs:22` | Fixed-capacity SPSC queue |
 | **BitSet** | `src/stdx/bitset.rs:30` | Compile-time fixed bitset |
 | **ScanScratch** | `src/lib.rs:859` | Per-scan reusable scratch state |
+| **TimingWheel** | `src/stdx/timing_wheel.rs` | Hashed timing wheel for window expiration scheduling |
 
 ## Data Flow
 
