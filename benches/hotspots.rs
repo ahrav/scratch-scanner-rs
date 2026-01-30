@@ -1,3 +1,5 @@
+use base64::engine::general_purpose::STANDARD as B64_STD;
+use base64::Engine as _;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use scanner_rs::{
     bench_find_spans_into, bench_stream_decode_base64, bench_stream_decode_url, Gate,
@@ -57,6 +59,8 @@ struct SizeSweep {
     random: Vec<u8>,
     urlish: Vec<u8>,
     base64_noise: Vec<u8>,
+    base64_real_mime: Vec<u8>,
+    base64_real_pem: Vec<u8>,
 }
 
 fn make_random(len: usize, seed: u64) -> Vec<u8> {
@@ -71,6 +75,72 @@ fn make_base64(len: usize, seed: u64) -> Vec<u8> {
     let mut rng = XorShift64::new(seed);
     rng.fill_base64(&mut buf);
     buf
+}
+
+fn real_payload() -> Vec<u8> {
+    const SRC_ARCH: &[u8] = include_bytes!("../docs/architecture.md");
+    const SRC_ENGINE: &[u8] = include_bytes!("../docs/detection-engine.md");
+    const SRC_MEM: &[u8] = include_bytes!("../docs/memory-management.md");
+
+    let mut raw = Vec::with_capacity(SRC_ARCH.len() + SRC_ENGINE.len() + SRC_MEM.len());
+    raw.extend_from_slice(SRC_ARCH);
+    raw.extend_from_slice(SRC_ENGINE);
+    raw.extend_from_slice(SRC_MEM);
+    raw
+}
+
+fn encode_base64(raw: &[u8], wrap_mime: bool) -> Vec<u8> {
+    let encoded = B64_STD.encode(raw);
+    if !wrap_mime {
+        return encoded.into_bytes();
+    }
+    let mut out = Vec::with_capacity(encoded.len() + encoded.len() / 76 + 1);
+    for chunk in encoded.as_bytes().chunks(76) {
+        out.extend_from_slice(chunk);
+        out.push(b'\n');
+    }
+    out
+}
+
+fn repeat_to_len(pattern: &[u8], len: usize) -> Vec<u8> {
+    if len == 0 {
+        return Vec::new();
+    }
+    if pattern.is_empty() {
+        return vec![b'A'; len];
+    }
+    let mut buf = Vec::with_capacity(len);
+    while buf.len() < len {
+        let remaining = len - buf.len();
+        let take = remaining.min(pattern.len());
+        buf.extend_from_slice(&pattern[..take]);
+    }
+    buf
+}
+
+fn make_real_base64(len: usize, wrap_mime: bool) -> Vec<u8> {
+    let raw = real_payload();
+    if raw.is_empty() {
+        return vec![b'A'; len];
+    }
+    let pattern = encode_base64(&raw, wrap_mime);
+    repeat_to_len(&pattern, len)
+}
+
+fn make_real_base64_pem(len: usize) -> Vec<u8> {
+    let raw = real_payload();
+    if raw.is_empty() {
+        return vec![b'A'; len];
+    }
+    let body = encode_base64(&raw, true);
+    let mut pattern = Vec::with_capacity(body.len() + 128);
+    pattern.extend_from_slice(b"-----BEGIN SCANNER-RS TEST-----\n");
+    pattern.extend_from_slice(&body);
+    if !body.ends_with(b"\n") {
+        pattern.push(b'\n');
+    }
+    pattern.extend_from_slice(b"-----END SCANNER-RS TEST-----\n");
+    repeat_to_len(&pattern, len)
 }
 
 fn make_urlish(len: usize) -> Vec<u8> {
@@ -96,6 +166,8 @@ fn make_size_sweep(sizes: &[usize]) -> Vec<SizeSweep> {
             random: make_random(size, 0x1234_5678_9abc_def0 ^ (idx as u64)),
             urlish: make_urlish(size),
             base64_noise: make_base64(size, 0x0f0e_0d0c_0b0a_0908 ^ (idx as u64)),
+            base64_real_mime: make_real_base64(size, true),
+            base64_real_pem: make_real_base64_pem(size),
         })
         .collect()
 }
@@ -141,6 +213,14 @@ fn bench_transform_spans(c: &mut Criterion) {
         name: "base64_noise",
         buf: make_base64(BUF_LEN, 0x0f0e_0d0c_0b0a_0908),
     };
+    let b64_real_mime = Dataset {
+        name: "base64_real_mime",
+        buf: make_real_base64(BUF_LEN, true),
+    };
+    let b64_real_pem = Dataset {
+        name: "base64_real_pem",
+        buf: make_real_base64_pem(BUF_LEN),
+    };
 
     let url_cfg_limited = url_config(8);
     let url_cfg_unbounded = url_config(1024);
@@ -168,7 +248,7 @@ fn bench_transform_spans(c: &mut Criterion) {
     url_group.finish();
 
     let mut b64_group = c.benchmark_group("transform_spans_b64");
-    for ds in [&random, &b64_noise] {
+    for ds in [&random, &b64_noise, &b64_real_mime, &b64_real_pem] {
         b64_group.throughput(Throughput::Bytes(ds.buf.len() as u64));
         b64_group.bench_with_input(BenchmarkId::new("limited", ds.name), ds, |b, ds| {
             b.iter(|| {
@@ -235,6 +315,18 @@ fn bench_size_sweep(c: &mut Criterion) {
         b64_group.bench_with_input(BenchmarkId::new("base64_noise", ds.size), ds, |b, ds| {
             b.iter(|| {
                 bench_find_spans_into(&b64_cfg, black_box(&ds.base64_noise), &mut spans);
+                black_box(spans.len());
+            })
+        });
+        b64_group.bench_with_input(BenchmarkId::new("base64_real_mime", ds.size), ds, |b, ds| {
+            b.iter(|| {
+                bench_find_spans_into(&b64_cfg, black_box(&ds.base64_real_mime), &mut spans);
+                black_box(spans.len());
+            })
+        });
+        b64_group.bench_with_input(BenchmarkId::new("base64_real_pem", ds.size), ds, |b, ds| {
+            b.iter(|| {
+                bench_find_spans_into(&b64_cfg, black_box(&ds.base64_real_pem), &mut spans);
                 black_box(spans.len());
             })
         });

@@ -683,7 +683,7 @@ enum Base64DecodeError {
 /// Finds base64-ish spans within `hay` and appends them to `spans`.
 ///
 /// Guarantees / invariants:
-/// - Each byte is classified at most once (single-pass scan).
+/// - The scan advances in a single forward pass (SIMD paths classify in blocks).
 /// - Spans contain only base64 chars + allowed whitespace.
 /// - Spans end at the last base64 byte; trailing whitespace is trimmed.
 /// - Runs are split at `max_len` to bound worst-case work.
@@ -712,6 +712,24 @@ pub(super) fn find_base64_spans_into(
         return;
     }
 
+    // SIMD fast paths are pure accelerators; correctness is validated against the scalar
+    // reference in property tests.
+    if find_base64_spans_into_simd(hay, min_chars, max_len, max_spans, allow_space_ws, spans) {
+        return;
+    }
+
+    find_base64_spans_into_scalar(hay, min_chars, max_len, max_spans, allow_space_ws, spans);
+}
+
+#[inline]
+fn find_base64_spans_into_scalar(
+    hay: &[u8],
+    min_chars: usize,
+    max_len: usize,
+    max_spans: usize,
+    allow_space_ws: bool,
+    spans: &mut impl SpanSink,
+) {
     let allow_mask = if allow_space_ws {
         B64_CHAR | B64_WS | B64_WS_SPACE
     } else {
@@ -775,6 +793,842 @@ pub(super) fn find_base64_spans_into(
             }
             in_run = false;
             i += 1;
+        }
+    }
+
+    if in_run && have_b64 && b64_chars >= min_chars && span_count < max_spans {
+        spans.push(start..(last_b64 + 1));
+    }
+}
+
+// --------------------------
+// SIMD base64 span finder
+// --------------------------
+
+#[inline]
+fn should_use_simd(hay: &[u8], allow_mask: u8) -> bool {
+    const SAMPLE_BYTES: usize = 2048;
+    const RUN_THRESHOLD: usize = 384;
+    const RATIO_NUM: usize = 97; // 97%
+    const RATIO_DEN: usize = 100;
+
+    let end = hay.len().min(SAMPLE_BYTES);
+    let mut run = 0usize;
+    let mut allowed = 0usize;
+    let mut i = 0usize;
+    while i < end {
+        let flags = BYTE_CLASS[hay[i] as usize];
+        if (flags & allow_mask) != 0 {
+            run += 1;
+            allowed += 1;
+            if run >= RUN_THRESHOLD {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+        i += 1;
+    }
+    allowed.saturating_mul(RATIO_DEN) >= end.saturating_mul(RATIO_NUM)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn find_base64_spans_into_simd(
+    hay: &[u8],
+    min_chars: usize,
+    max_len: usize,
+    max_spans: usize,
+    allow_space_ws: bool,
+    spans: &mut impl SpanSink,
+) -> bool {
+    // For x86_64 we always have SSE2; AVX2 is optional.
+    // Skip SIMD setup for tiny buffers (dispatch cost can dominate).
+    if hay.len() < 64 {
+        return false;
+    }
+    let allow_mask = if allow_space_ws {
+        B64_CHAR | B64_WS | B64_WS_SPACE
+    } else {
+        B64_CHAR | B64_WS
+    };
+    if !should_use_simd(hay, allow_mask) {
+        return false;
+    }
+    unsafe {
+        if std::is_x86_feature_detected!("avx2") {
+            find_base64_spans_into_avx2(hay, min_chars, max_len, max_spans, allow_space_ws, spans);
+        } else {
+            find_base64_spans_into_sse2(hay, min_chars, max_len, max_spans, allow_space_ws, spans);
+        }
+    }
+    true
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[inline]
+fn find_base64_spans_into_simd(
+    hay: &[u8],
+    min_chars: usize,
+    max_len: usize,
+    max_spans: usize,
+    allow_space_ws: bool,
+    spans: &mut impl SpanSink,
+) -> bool {
+    if hay.len() < 64 {
+        return false;
+    }
+    let allow_mask = if allow_space_ws {
+        B64_CHAR | B64_WS | B64_WS_SPACE
+    } else {
+        B64_CHAR | B64_WS
+    };
+    if !should_use_simd(hay, allow_mask) {
+        return false;
+    }
+    unsafe {
+        find_base64_spans_into_neon(hay, min_chars, max_len, max_spans, allow_space_ws, spans);
+    }
+    true
+}
+
+#[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", target_feature = "neon"))))]
+#[inline]
+fn find_base64_spans_into_simd(
+    _hay: &[u8],
+    _min_chars: usize,
+    _max_len: usize,
+    _max_spans: usize,
+    _allow_space_ws: bool,
+    _spans: &mut impl SpanSink,
+) -> bool {
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn find_base64_spans_into_sse2(
+    hay: &[u8],
+    min_chars: usize,
+    max_len: usize,
+    max_spans: usize,
+    allow_space_ws: bool,
+    spans: &mut impl SpanSink,
+) {
+    use std::arch::x86_64::*;
+
+    #[inline(always)]
+    unsafe fn range_u8(vx: __m128i, all: __m128i, lo1: __m128i, hi: __m128i) -> __m128i {
+        // vx is v ^ 0x80; lo1 and hi are also xor'd with 0x80.
+        // range = (vx > lo-1) & !(vx > hi)
+        let ge_lo = _mm_cmpgt_epi8(vx, lo1);
+        let gt_hi = _mm_cmpgt_epi8(vx, hi);
+        let le_hi = _mm_andnot_si128(gt_hi, all);
+        _mm_and_si128(ge_lo, le_hi)
+    }
+
+    #[inline(always)]
+    unsafe fn classify_block(
+        v: __m128i,
+        flip: __m128i,
+        all: __m128i,
+        a_lo1: __m128i,
+        z_hi: __m128i,
+        aa_lo1: __m128i,
+        zz_hi: __m128i,
+        d0_lo1: __m128i,
+        d9_hi: __m128i,
+        plus: __m128i,
+        slash: __m128i,
+        eq: __m128i,
+        dash: __m128i,
+        us: __m128i,
+        ws_space_allow: __m128i,
+        sp: __m128i,
+        nl: __m128i,
+        cr: __m128i,
+        tab: __m128i,
+    ) -> (u32, u32) {
+        let vx = _mm_xor_si128(v, flip);
+        let upper = range_u8(vx, all, a_lo1, z_hi);
+        let lower = range_u8(vx, all, aa_lo1, zz_hi);
+        let digit = range_u8(vx, all, d0_lo1, d9_hi);
+
+        let mut sym = _mm_cmpeq_epi8(v, plus);
+        sym = _mm_or_si128(sym, _mm_cmpeq_epi8(v, slash));
+        sym = _mm_or_si128(sym, _mm_cmpeq_epi8(v, eq));
+        sym = _mm_or_si128(sym, _mm_cmpeq_epi8(v, dash));
+        sym = _mm_or_si128(sym, _mm_cmpeq_epi8(v, us));
+
+        let b64 = _mm_or_si128(_mm_or_si128(upper, lower), _mm_or_si128(digit, sym));
+
+        let mut ws = _mm_cmpeq_epi8(v, nl);
+        ws = _mm_or_si128(ws, _mm_cmpeq_epi8(v, cr));
+        ws = _mm_or_si128(ws, _mm_cmpeq_epi8(v, tab));
+        let ws_sp = _mm_and_si128(_mm_cmpeq_epi8(v, sp), ws_space_allow);
+        ws = _mm_or_si128(ws, ws_sp);
+
+        let allowed = _mm_or_si128(b64, ws);
+
+        let allowed_bits = (_mm_movemask_epi8(allowed) as u32) & 0xFFFF;
+        let b64_bits = (_mm_movemask_epi8(b64) as u32) & 0xFFFF;
+        (allowed_bits, b64_bits)
+    }
+
+    const LANES: usize = 16;
+    let len = hay.len();
+    let mut span_count = 0usize;
+
+    let allow_mask_scalar = if allow_space_ws {
+        B64_CHAR | B64_WS | B64_WS_SPACE
+    } else {
+        B64_CHAR | B64_WS
+    };
+
+    // Constants.
+    let flip = _mm_set1_epi8(-128); // 0x80
+    let all = _mm_set1_epi8(-1);
+    let ws_space_allow = if allow_space_ws { all } else { _mm_setzero_si128() };
+
+    let a_lo1 = _mm_set1_epi8(((b'A'.wrapping_sub(1) ^ 0x80) as u8) as i8);
+    let z_hi = _mm_set1_epi8(((b'Z' ^ 0x80) as u8) as i8);
+    let aa_lo1 = _mm_set1_epi8(((b'a'.wrapping_sub(1) ^ 0x80) as u8) as i8);
+    let zz_hi = _mm_set1_epi8(((b'z' ^ 0x80) as u8) as i8);
+    let d0_lo1 = _mm_set1_epi8(((b'0'.wrapping_sub(1) ^ 0x80) as u8) as i8);
+    let d9_hi = _mm_set1_epi8(((b'9' ^ 0x80) as u8) as i8);
+
+    let plus = _mm_set1_epi8(b'+' as i8);
+    let slash = _mm_set1_epi8(b'/' as i8);
+    let eq = _mm_set1_epi8(b'=' as i8);
+    let dash = _mm_set1_epi8(b'-' as i8);
+    let us = _mm_set1_epi8(b'_' as i8);
+
+    let sp = _mm_set1_epi8(b' ' as i8);
+    let nl = _mm_set1_epi8(b'\n' as i8);
+    let cr = _mm_set1_epi8(b'\r' as i8);
+    let tab = _mm_set1_epi8(b'\t' as i8);
+
+    // Current run state.
+    let mut in_run = false;
+    let mut start = 0usize;
+    let mut run_len = 0usize;
+    let mut b64_chars = 0usize;
+    let mut have_b64 = false;
+    let mut last_b64 = 0usize;
+
+    let mut i = 0usize;
+    while i < len {
+        if !in_run {
+            // SIMD skip until we find any allowed byte.
+            while i + LANES <= len {
+                let ptr = hay.as_ptr().add(i) as *const __m128i;
+                let v = _mm_loadu_si128(ptr);
+                let (allowed_bits, _) = classify_block(
+                    v, flip, all, a_lo1, z_hi, aa_lo1, zz_hi, d0_lo1, d9_hi, plus, slash, eq,
+                    dash, us, ws_space_allow, sp, nl, cr, tab,
+                );
+                if allowed_bits == 0 {
+                    i += LANES;
+                    continue;
+                }
+                i += allowed_bits.trailing_zeros() as usize;
+                break;
+            }
+            while i < len {
+                let flags = BYTE_CLASS[hay[i] as usize];
+                if (flags & allow_mask_scalar) != 0 {
+                    break;
+                }
+                i += 1;
+            }
+            if i >= len {
+                break;
+            }
+            in_run = true;
+            start = i;
+            run_len = 0;
+            b64_chars = 0;
+            have_b64 = false;
+        }
+
+        // Process up to the run cap.
+        let remaining = max_len.saturating_sub(run_len);
+        if remaining == 0 {
+            // Defensive: should not happen (we clear in_run on split), but keep semantics.
+            if have_b64 && b64_chars >= min_chars {
+                spans.push(start..(last_b64 + 1));
+                span_count += 1;
+                if span_count >= max_spans {
+                    return;
+                }
+            }
+            in_run = false;
+            continue;
+        }
+        let end = (i + remaining).min(len);
+
+        while i + LANES <= end {
+            let ptr = hay.as_ptr().add(i) as *const __m128i;
+            let v = _mm_loadu_si128(ptr);
+            let (allowed_bits, b64_bits) = classify_block(
+                v, flip, all, a_lo1, z_hi, aa_lo1, zz_hi, d0_lo1, d9_hi, plus, slash, eq, dash,
+                us, ws_space_allow, sp, nl, cr, tab,
+            );
+
+            if allowed_bits == 0xFFFF {
+                // Entire block is part of the run.
+                run_len += LANES;
+                if b64_bits != 0 {
+                    b64_chars += b64_bits.count_ones() as usize;
+                    have_b64 = true;
+                    let last = 31 - (b64_bits as u32).leading_zeros();
+                    last_b64 = i + last as usize;
+                }
+                i += LANES;
+                continue;
+            }
+
+            // Disallowed byte terminates the run within this block.
+            let prefix_len = allowed_bits.trailing_ones() as usize;
+            if prefix_len != 0 {
+                let prefix_mask = b64_bits & ((1u32 << prefix_len) - 1);
+                run_len += prefix_len;
+                if prefix_mask != 0 {
+                    b64_chars += prefix_mask.count_ones() as usize;
+                    have_b64 = true;
+                    let last = 31 - prefix_mask.leading_zeros();
+                    last_b64 = i + last as usize;
+                }
+                i += prefix_len;
+            }
+
+            // Finalize the run and consume the disallowed byte.
+            if have_b64 && b64_chars >= min_chars {
+                spans.push(start..(last_b64 + 1));
+                span_count += 1;
+                if span_count >= max_spans {
+                    return;
+                }
+            }
+            in_run = false;
+            i = i.saturating_add(1);
+            break;
+        }
+
+        if !in_run {
+            continue;
+        }
+
+        // Scalar tail for the last <16 bytes (or until we hit a disallowed byte).
+        while i < end {
+            let flags = BYTE_CLASS[hay[i] as usize];
+            let allowed = (flags & allow_mask_scalar) != 0;
+            if allowed {
+                run_len += 1;
+                if (flags & B64_CHAR) != 0 {
+                    b64_chars += 1;
+                    last_b64 = i;
+                    have_b64 = true;
+                }
+                i += 1;
+                continue;
+            }
+
+            if have_b64 && b64_chars >= min_chars {
+                spans.push(start..(last_b64 + 1));
+                span_count += 1;
+                if span_count >= max_spans {
+                    return;
+                }
+            }
+            in_run = false;
+            i += 1;
+            break;
+        }
+
+        // If we hit the run cap without encountering a disallowed byte, split here.
+        if in_run && run_len >= max_len {
+            if have_b64 && b64_chars >= min_chars {
+                spans.push(start..(last_b64 + 1));
+                span_count += 1;
+                if span_count >= max_spans {
+                    return;
+                }
+            }
+            in_run = false;
+        }
+    }
+
+    if in_run && have_b64 && b64_chars >= min_chars && span_count < max_spans {
+        spans.push(start..(last_b64 + 1));
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn find_base64_spans_into_avx2(
+    hay: &[u8],
+    min_chars: usize,
+    max_len: usize,
+    max_spans: usize,
+    allow_space_ws: bool,
+    spans: &mut impl SpanSink,
+) {
+    use std::arch::x86_64::*;
+
+    #[inline(always)]
+    unsafe fn range_u8(vx: __m256i, all: __m256i, lo1: __m256i, hi: __m256i) -> __m256i {
+        let ge_lo = _mm256_cmpgt_epi8(vx, lo1);
+        let gt_hi = _mm256_cmpgt_epi8(vx, hi);
+        let le_hi = _mm256_andnot_si256(gt_hi, all);
+        _mm256_and_si256(ge_lo, le_hi)
+    }
+
+    #[inline(always)]
+    unsafe fn classify_block(
+        v: __m256i,
+        flip: __m256i,
+        all: __m256i,
+        a_lo1: __m256i,
+        z_hi: __m256i,
+        aa_lo1: __m256i,
+        zz_hi: __m256i,
+        d0_lo1: __m256i,
+        d9_hi: __m256i,
+        plus: __m256i,
+        slash: __m256i,
+        eq: __m256i,
+        dash: __m256i,
+        us: __m256i,
+        ws_space_allow: __m256i,
+        sp: __m256i,
+        nl: __m256i,
+        cr: __m256i,
+        tab: __m256i,
+    ) -> (u32, u32) {
+        let vx = _mm256_xor_si256(v, flip);
+        let upper = range_u8(vx, all, a_lo1, z_hi);
+        let lower = range_u8(vx, all, aa_lo1, zz_hi);
+        let digit = range_u8(vx, all, d0_lo1, d9_hi);
+
+        let mut sym = _mm256_cmpeq_epi8(v, plus);
+        sym = _mm256_or_si256(sym, _mm256_cmpeq_epi8(v, slash));
+        sym = _mm256_or_si256(sym, _mm256_cmpeq_epi8(v, eq));
+        sym = _mm256_or_si256(sym, _mm256_cmpeq_epi8(v, dash));
+        sym = _mm256_or_si256(sym, _mm256_cmpeq_epi8(v, us));
+
+        let b64 = _mm256_or_si256(
+            _mm256_or_si256(upper, lower),
+            _mm256_or_si256(digit, sym),
+        );
+
+        let mut ws = _mm256_cmpeq_epi8(v, nl);
+        ws = _mm256_or_si256(ws, _mm256_cmpeq_epi8(v, cr));
+        ws = _mm256_or_si256(ws, _mm256_cmpeq_epi8(v, tab));
+        let ws_sp = _mm256_and_si256(_mm256_cmpeq_epi8(v, sp), ws_space_allow);
+        ws = _mm256_or_si256(ws, ws_sp);
+
+        let allowed = _mm256_or_si256(b64, ws);
+        let allowed_bits = _mm256_movemask_epi8(allowed) as u32;
+        let b64_bits = _mm256_movemask_epi8(b64) as u32;
+        (allowed_bits, b64_bits)
+    }
+
+    const LANES: usize = 32;
+    let len = hay.len();
+    let mut span_count = 0usize;
+
+    let allow_mask_scalar = if allow_space_ws {
+        B64_CHAR | B64_WS | B64_WS_SPACE
+    } else {
+        B64_CHAR | B64_WS
+    };
+
+    let flip = _mm256_set1_epi8(-128);
+    let all = _mm256_set1_epi8(-1);
+    let ws_space_allow = if allow_space_ws { all } else { _mm256_setzero_si256() };
+
+    let a_lo1 = _mm256_set1_epi8(((b'A'.wrapping_sub(1) ^ 0x80) as u8) as i8);
+    let z_hi = _mm256_set1_epi8(((b'Z' ^ 0x80) as u8) as i8);
+    let aa_lo1 = _mm256_set1_epi8(((b'a'.wrapping_sub(1) ^ 0x80) as u8) as i8);
+    let zz_hi = _mm256_set1_epi8(((b'z' ^ 0x80) as u8) as i8);
+    let d0_lo1 = _mm256_set1_epi8(((b'0'.wrapping_sub(1) ^ 0x80) as u8) as i8);
+    let d9_hi = _mm256_set1_epi8(((b'9' ^ 0x80) as u8) as i8);
+
+    let plus = _mm256_set1_epi8(b'+' as i8);
+    let slash = _mm256_set1_epi8(b'/' as i8);
+    let eq = _mm256_set1_epi8(b'=' as i8);
+    let dash = _mm256_set1_epi8(b'-' as i8);
+    let us = _mm256_set1_epi8(b'_' as i8);
+
+    let sp = _mm256_set1_epi8(b' ' as i8);
+    let nl = _mm256_set1_epi8(b'\n' as i8);
+    let cr = _mm256_set1_epi8(b'\r' as i8);
+    let tab = _mm256_set1_epi8(b'\t' as i8);
+
+    let mut in_run = false;
+    let mut start = 0usize;
+    let mut run_len = 0usize;
+    let mut b64_chars = 0usize;
+    let mut have_b64 = false;
+    let mut last_b64 = 0usize;
+
+    let mut i = 0usize;
+    while i < len {
+        if !in_run {
+            while i + LANES <= len {
+                let ptr = hay.as_ptr().add(i) as *const __m256i;
+                let v = _mm256_loadu_si256(ptr);
+                let (allowed_bits, _) = classify_block(
+                    v, flip, all, a_lo1, z_hi, aa_lo1, zz_hi, d0_lo1, d9_hi, plus, slash, eq,
+                    dash, us, ws_space_allow, sp, nl, cr, tab,
+                );
+                if allowed_bits == 0 {
+                    i += LANES;
+                    continue;
+                }
+                i += allowed_bits.trailing_zeros() as usize;
+                break;
+            }
+            while i < len {
+                let flags = BYTE_CLASS[hay[i] as usize];
+                if (flags & allow_mask_scalar) != 0 {
+                    break;
+                }
+                i += 1;
+            }
+            if i >= len {
+                break;
+            }
+            in_run = true;
+            start = i;
+            run_len = 0;
+            b64_chars = 0;
+            have_b64 = false;
+        }
+
+        let remaining = max_len.saturating_sub(run_len);
+        if remaining == 0 {
+            if have_b64 && b64_chars >= min_chars {
+                spans.push(start..(last_b64 + 1));
+                span_count += 1;
+                if span_count >= max_spans {
+                    return;
+                }
+            }
+            in_run = false;
+            continue;
+        }
+        let end = (i + remaining).min(len);
+
+        while i + LANES <= end {
+            let ptr = hay.as_ptr().add(i) as *const __m256i;
+            let v = _mm256_loadu_si256(ptr);
+            let (allowed_bits, b64_bits) = classify_block(
+                v, flip, all, a_lo1, z_hi, aa_lo1, zz_hi, d0_lo1, d9_hi, plus, slash, eq, dash,
+                us, ws_space_allow, sp, nl, cr, tab,
+            );
+
+            if allowed_bits == 0xFFFF_FFFF {
+                run_len += LANES;
+                if b64_bits != 0 {
+                    b64_chars += b64_bits.count_ones() as usize;
+                    have_b64 = true;
+                    let last = 31 - b64_bits.leading_zeros();
+                    last_b64 = i + last as usize;
+                }
+                i += LANES;
+                continue;
+            }
+
+            let prefix_len = allowed_bits.trailing_ones() as usize;
+            if prefix_len != 0 {
+                let prefix_mask = b64_bits & ((1u32 << prefix_len) - 1);
+                run_len += prefix_len;
+                if prefix_mask != 0 {
+                    b64_chars += prefix_mask.count_ones() as usize;
+                    have_b64 = true;
+                    let last = 31 - prefix_mask.leading_zeros();
+                    last_b64 = i + last as usize;
+                }
+                i += prefix_len;
+            }
+
+            if have_b64 && b64_chars >= min_chars {
+                spans.push(start..(last_b64 + 1));
+                span_count += 1;
+                if span_count >= max_spans {
+                    return;
+                }
+            }
+            in_run = false;
+            i = i.saturating_add(1);
+            break;
+        }
+
+        if !in_run {
+            continue;
+        }
+
+        while i < end {
+            let flags = BYTE_CLASS[hay[i] as usize];
+            let allowed = (flags & allow_mask_scalar) != 0;
+            if allowed {
+                run_len += 1;
+                if (flags & B64_CHAR) != 0 {
+                    b64_chars += 1;
+                    last_b64 = i;
+                    have_b64 = true;
+                }
+                i += 1;
+                continue;
+            }
+
+            if have_b64 && b64_chars >= min_chars {
+                spans.push(start..(last_b64 + 1));
+                span_count += 1;
+                if span_count >= max_spans {
+                    return;
+                }
+            }
+            in_run = false;
+            i += 1;
+            break;
+        }
+
+        if in_run && run_len >= max_len {
+            if have_b64 && b64_chars >= min_chars {
+                spans.push(start..(last_b64 + 1));
+                span_count += 1;
+                if span_count >= max_spans {
+                    return;
+                }
+            }
+            in_run = false;
+        }
+    }
+
+    if in_run && have_b64 && b64_chars >= min_chars && span_count < max_spans {
+        spans.push(start..(last_b64 + 1));
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+unsafe fn find_base64_spans_into_neon(
+    hay: &[u8],
+    min_chars: usize,
+    max_len: usize,
+    max_spans: usize,
+    allow_space_ws: bool,
+    spans: &mut impl SpanSink,
+) {
+    use std::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn movemask_u8x16(mask: uint8x16_t) -> u16 {
+        // Convert 0x00/0xFF lanes into a packed 16-bit mask.
+        //
+        // Avoid reduction intrinsics (eg vaddvq_*) to keep this compatible with
+        // baseline ARMv8 AArch64 implementations.
+
+        #[inline(always)]
+        unsafe fn hsum_u8x8(v: uint8x8_t) -> u16 {
+            // Pairwise add long: 8x u8 -> 4x u16 -> 2x u32 -> 1x u64.
+            let s16: uint16x4_t = vpaddl_u8(v);
+            let s32: uint32x2_t = vpaddl_u16(s16);
+            let s64: uint64x1_t = vpaddl_u32(s32);
+            vget_lane_u64(s64, 0) as u16
+        }
+
+        let bits = vshrq_n_u8(mask, 7); // lanes become {0,1}
+        let lo = vget_low_u8(bits);
+        let hi = vget_high_u8(bits);
+
+        // weights: 1,2,4,...,128
+        let w: [u8; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+        let wv: uint8x8_t = vld1_u8(w.as_ptr());
+
+        let lo_sum = hsum_u8x8(vmul_u8(lo, wv));
+        let hi_sum = hsum_u8x8(vmul_u8(hi, wv));
+        lo_sum | (hi_sum << 8)
+    }
+
+    #[inline(always)]
+    unsafe fn classify_block(
+        v: uint8x16_t,
+        ws_space_allow: uint8x16_t,
+    ) -> (u16, u16) {
+        let upper = vandq_u8(vcgeq_u8(v, vdupq_n_u8(b'A')), vcleq_u8(v, vdupq_n_u8(b'Z')));
+        let lower = vandq_u8(vcgeq_u8(v, vdupq_n_u8(b'a')), vcleq_u8(v, vdupq_n_u8(b'z')));
+        let digit = vandq_u8(vcgeq_u8(v, vdupq_n_u8(b'0')), vcleq_u8(v, vdupq_n_u8(b'9')));
+
+        let mut sym = vceqq_u8(v, vdupq_n_u8(b'+'));
+        sym = vorrq_u8(sym, vceqq_u8(v, vdupq_n_u8(b'/')));
+        sym = vorrq_u8(sym, vceqq_u8(v, vdupq_n_u8(b'=')));
+        sym = vorrq_u8(sym, vceqq_u8(v, vdupq_n_u8(b'-')));
+        sym = vorrq_u8(sym, vceqq_u8(v, vdupq_n_u8(b'_')));
+
+        let b64 = vorrq_u8(vorrq_u8(upper, lower), vorrq_u8(digit, sym));
+
+        let mut ws = vceqq_u8(v, vdupq_n_u8(b'\n'));
+        ws = vorrq_u8(ws, vceqq_u8(v, vdupq_n_u8(b'\r')));
+        ws = vorrq_u8(ws, vceqq_u8(v, vdupq_n_u8(b'\t')));
+        let ws_sp = vandq_u8(vceqq_u8(v, vdupq_n_u8(b' ')), ws_space_allow);
+        ws = vorrq_u8(ws, ws_sp);
+
+        let allowed = vorrq_u8(b64, ws);
+
+        let allowed_bits = movemask_u8x16(allowed);
+        let b64_bits = movemask_u8x16(b64);
+        (allowed_bits, b64_bits)
+    }
+
+    const LANES: usize = 16;
+    let len = hay.len();
+    let mut span_count = 0usize;
+
+    let allow_mask_scalar = if allow_space_ws {
+        B64_CHAR | B64_WS | B64_WS_SPACE
+    } else {
+        B64_CHAR | B64_WS
+    };
+
+    let ws_space_allow = if allow_space_ws {
+        vdupq_n_u8(0xFF)
+    } else {
+        vdupq_n_u8(0x00)
+    };
+
+    let mut in_run = false;
+    let mut start = 0usize;
+    let mut run_len = 0usize;
+    let mut b64_chars = 0usize;
+    let mut have_b64 = false;
+    let mut last_b64 = 0usize;
+
+    let mut i = 0usize;
+    while i < len {
+        if !in_run {
+            while i + LANES <= len {
+                let v = vld1q_u8(hay.as_ptr().add(i));
+                let (allowed_bits, _) = classify_block(v, ws_space_allow);
+                if allowed_bits == 0 {
+                    i += LANES;
+                    continue;
+                }
+                i += allowed_bits.trailing_zeros() as usize;
+                break;
+            }
+            while i < len {
+                let flags = BYTE_CLASS[hay[i] as usize];
+                if (flags & allow_mask_scalar) != 0 {
+                    break;
+                }
+                i += 1;
+            }
+            if i >= len {
+                break;
+            }
+            in_run = true;
+            start = i;
+            run_len = 0;
+            b64_chars = 0;
+            have_b64 = false;
+        }
+
+        let remaining = max_len.saturating_sub(run_len);
+        if remaining == 0 {
+            if have_b64 && b64_chars >= min_chars {
+                spans.push(start..(last_b64 + 1));
+                span_count += 1;
+                if span_count >= max_spans {
+                    return;
+                }
+            }
+            in_run = false;
+            continue;
+        }
+        let end = (i + remaining).min(len);
+
+        while i + LANES <= end {
+            let v = vld1q_u8(hay.as_ptr().add(i));
+            let (allowed_bits, b64_bits) = classify_block(v, ws_space_allow);
+            if allowed_bits == 0xFFFF {
+                run_len += LANES;
+                if b64_bits != 0 {
+                    b64_chars += b64_bits.count_ones() as usize;
+                    have_b64 = true;
+                    let last = 31 - (b64_bits as u32).leading_zeros();
+                    last_b64 = i + last as usize;
+                }
+                i += LANES;
+                continue;
+            }
+
+            let prefix_len = allowed_bits.trailing_ones() as usize;
+            if prefix_len != 0 {
+                let prefix_mask = b64_bits & ((1u16 << prefix_len) - 1);
+                run_len += prefix_len;
+                if prefix_mask != 0 {
+                    b64_chars += prefix_mask.count_ones() as usize;
+                    have_b64 = true;
+                    let last = 31 - (prefix_mask as u32).leading_zeros();
+                    last_b64 = i + last as usize;
+                }
+                i += prefix_len;
+            }
+
+            if have_b64 && b64_chars >= min_chars {
+                spans.push(start..(last_b64 + 1));
+                span_count += 1;
+                if span_count >= max_spans {
+                    return;
+                }
+            }
+            in_run = false;
+            i = i.saturating_add(1);
+            break;
+        }
+
+        if !in_run {
+            continue;
+        }
+
+        while i < end {
+            let flags = BYTE_CLASS[hay[i] as usize];
+            let allowed = (flags & allow_mask_scalar) != 0;
+            if allowed {
+                run_len += 1;
+                if (flags & B64_CHAR) != 0 {
+                    b64_chars += 1;
+                    last_b64 = i;
+                    have_b64 = true;
+                }
+                i += 1;
+                continue;
+            }
+
+            if have_b64 && b64_chars >= min_chars {
+                spans.push(start..(last_b64 + 1));
+                span_count += 1;
+                if span_count >= max_spans {
+                    return;
+                }
+            }
+            in_run = false;
+            i += 1;
+            break;
+        }
+
+        if in_run && run_len >= max_len {
+            if have_b64 && b64_chars >= min_chars {
+                spans.push(start..(last_b64 + 1));
+                span_count += 1;
+                if span_count >= max_spans {
+                    return;
+                }
+            }
+            in_run = false;
         }
     }
 

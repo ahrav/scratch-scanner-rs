@@ -334,6 +334,15 @@ fn base64_span_respects_max_len() {
 }
 
 #[test]
+fn base64_span_large_run_exercises_simd_fast_path() {
+    // Large enough to use SIMD paths on supported targets.
+    let hay = vec![b'A'; 256];
+    let mut spans = Vec::new();
+    find_base64_spans_into(&hay, 1, 1024, 8, false, &mut spans);
+    assert_eq!(spans, vec![0..256]);
+}
+
+#[test]
 fn keyword_gate_filters_without_keyword() {
     const ANCHORS: &[&[u8]] = &[b"ANCH"];
     const KEYWORDS: &[&[u8]] = &[b"kw"];
