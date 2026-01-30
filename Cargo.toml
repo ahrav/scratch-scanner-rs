@@ -86,6 +86,26 @@ harness = false
 name = "memory_bandwidth"
 harness = false
 
+[[bench]]
+name = "scanner_throughput"
+harness = false
+
+[[bench]]
+name = "vectorscan_overhead"
+harness = false
+
+[[bench]]
+name = "rule_scaling"
+harness = false
+
+[[bench]]
+name = "anchor_optimization"
+harness = false
+
+[[bench]]
+name = "throughput_comparison"
+harness = false
+
 [profile.dev]
 opt-level = 1
 

@@ -50,7 +50,10 @@ const CACHE_LINE_ALIGN: usize = 128;
 /// Returns a raw pointer; caller must deallocate with `aligned_dealloc`.
 #[inline]
 fn aligned_alloc<T: Copy + Default>(n: usize) -> *mut T {
-    let size = n * std::mem::size_of::<T>();
+    assert!(n > 0, "Cannot allocate zero elements");
+    let size = n
+        .checked_mul(std::mem::size_of::<T>())
+        .expect("Allocation size overflow");
     let layout = Layout::from_size_align(size, CACHE_LINE_ALIGN).expect("Invalid layout");
     let ptr = unsafe { alloc(layout) as *mut T };
     assert!(!ptr.is_null(), "Allocation failed");
@@ -64,7 +67,9 @@ fn aligned_alloc<T: Copy + Default>(n: usize) -> *mut T {
 /// Deallocate a buffer allocated with `aligned_alloc`.
 #[inline]
 fn aligned_dealloc<T>(ptr: *mut T, n: usize) {
-    let size = n * std::mem::size_of::<T>();
+    let size = n
+        .checked_mul(std::mem::size_of::<T>())
+        .expect("Deallocation size overflow");
     let layout = Layout::from_size_align(size, CACHE_LINE_ALIGN).expect("Invalid layout");
     unsafe { dealloc(ptr as *mut u8, layout) };
 }
@@ -98,6 +103,14 @@ impl<T: Copy + Default> AlignedBuffer<T> {
 
     fn as_slice(&self) -> &[T] {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    fn as_ptr(&self) -> *const T {
+        self.ptr
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut T {
+        self.ptr
     }
 }
 
@@ -508,14 +521,14 @@ fn bench_memcpy(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("bytes", name), &size, |b, &size| {
             let size = size as usize;
             let mut src: AlignedBuffer<u8> = AlignedBuffer::new(size);
-            let dst: AlignedBuffer<u8> = AlignedBuffer::new(size);
+            let mut dst: AlignedBuffer<u8> = AlignedBuffer::new(size);
             for (i, v) in src.as_mut_slice().iter_mut().enumerate() {
                 *v = (i & 0xFF) as u8;
             }
 
             b.iter(|| {
                 unsafe {
-                    std::ptr::copy_nonoverlapping(black_box(src.ptr), dst.ptr, size);
+                    std::ptr::copy_nonoverlapping(black_box(src.as_ptr()), dst.as_mut_ptr(), size);
                 }
                 black_box(dst.as_slice()[0])
             })
@@ -537,14 +550,14 @@ fn bench_memmove(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("bytes", name), &size, |b, &size| {
             let size = size as usize;
             let mut src: AlignedBuffer<u8> = AlignedBuffer::new(size);
-            let dst: AlignedBuffer<u8> = AlignedBuffer::new(size);
+            let mut dst: AlignedBuffer<u8> = AlignedBuffer::new(size);
             for (i, v) in src.as_mut_slice().iter_mut().enumerate() {
                 *v = (i & 0xFF) as u8;
             }
 
             b.iter(|| {
                 unsafe {
-                    std::ptr::copy(black_box(src.ptr), dst.ptr, size);
+                    std::ptr::copy(black_box(src.as_ptr()), dst.as_mut_ptr(), size);
                 }
                 black_box(dst.as_slice()[0])
             })
