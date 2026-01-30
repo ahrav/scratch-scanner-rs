@@ -59,13 +59,14 @@ mod runtime;
 pub use api::Base64DecodeStats;
 pub use api::{
     AnchorPolicy, DecodeStep, DecodeSteps, DelimAfter, EntropySpec, FileId, Finding, FindingRec,
-    Gate, RuleSpec, StepId, TailCharset, TransformConfig, TransformId, TransformMode, Tuning,
-    TwoPhaseSpec, Utf16Endianness, ValidatorKind, MAX_DECODE_STEPS,
+    Gate, PrefilterMode, RuleSpec, StepId, TailCharset, TransformConfig, TransformId,
+    TransformMode, Tuning, TwoPhaseSpec, Utf16Endianness, ValidatorKind, MAX_DECODE_STEPS,
 };
 
 pub use demo::{
     demo_engine, demo_engine_with_anchor_mode,
-    demo_engine_with_anchor_mode_and_max_transform_depth, AnchorMode,
+    demo_engine_with_anchor_mode_and_max_transform_depth, demo_engine_with_anchor_mode_and_tuning,
+    demo_tuning, AnchorMode,
 };
 
 #[cfg(feature = "bench")]
