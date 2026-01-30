@@ -195,6 +195,10 @@ pub enum PushOutcome<T> {
 ///
 /// - `l1` bit `i` is set iff `l0[i] != 0`.
 /// - Last-word masks (`*_last_mask`) keep out-of-range bits clear.
+///
+/// This is an internal implementation detail of `TimingWheel`. It is `pub` only
+/// for benchmarking purposes and should not be relied upon as a stable API.
+#[doc(hidden)]
 pub struct Bitset2 {
     bits: usize,
     l0: Box<[u64]>,
@@ -654,6 +658,7 @@ impl<T: Copy, const G: u32> TimingWheel<T, G> {
     /// - `PoolExhausted` if the fixed node pool is full.
     /// - `TooFarInFuture` if `hi_end` exceeds the configured horizon.
     #[inline]
+    #[must_use = "may return Ready(T) which needs immediate handling"]
     pub fn push(&mut self, hi_end: u64, payload: T) -> Result<PushOutcome<T>, PushError> {
         let g = G as u64;
         let key = ceil_div_u64(hi_end, g);
@@ -688,17 +693,28 @@ impl<T: Copy, const G: u32> TimingWheel<T, G> {
             self.next[idx as usize] = NONE_U32;
             self.occ.set(slot);
         } else {
-            #[cfg(debug_assertions)]
-            {
-                let existing = self.slot_key[slot];
-                if existing != key {
-                    // Put node back before returning error.
-                    self.free_node(idx);
+            // Slot collision check: verify the existing key matches the new key.
+            // Under correct horizon enforcement, collisions are mathematically impossible.
+            // In debug builds, return a descriptive error; in release builds, panic
+            // to prevent silent data corruption.
+            let existing = self.slot_key[slot];
+            if existing != key {
+                self.free_node(idx);
+                #[cfg(debug_assertions)]
+                {
                     return Err(PushError::SlotCollision {
                         slot,
                         existing_key: existing,
                         new_key: key,
                     });
+                }
+                #[cfg(not(debug_assertions))]
+                {
+                    panic!(
+                        "TimingWheel slot collision: slot={}, existing_key={}, new_key={}, \
+                         cursor_abs={}, wheel_size={}. This indicates a bug in horizon sizing.",
+                        slot, existing, key, self.cursor_abs, self.wheel_size
+                    );
                 }
             }
 
@@ -792,7 +808,8 @@ impl<T: Copy, const G: u32> TimingWheel<T, G> {
     ///
     /// # Preconditions
     ///
-    /// `now_offset` must be monotone non-decreasing. Debug builds assert this.
+    /// `now_offset` must be monotone non-decreasing. Violating this returns 0
+    /// without draining (debug builds panic).
     ///
     /// # Returns
     ///
@@ -805,7 +822,16 @@ impl<T: Copy, const G: u32> TimingWheel<T, G> {
         let g = G as u64;
         let now_bucket = now_offset / g;
 
-        debug_assert!(now_bucket >= self.now_bucket, "time must be monotone");
+        // Time must be monotone non-decreasing. In debug builds, panic on violation.
+        // In release builds, return 0 to avoid corrupting internal state.
+        if now_bucket < self.now_bucket {
+            debug_assert!(
+                false,
+                "time must be monotone: now_bucket={} < self.now_bucket={}",
+                now_bucket, self.now_bucket
+            );
+            return 0;
+        }
 
         // Only skip if:
         // 1. We're at the same bucket as before, AND

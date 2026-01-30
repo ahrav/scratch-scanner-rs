@@ -620,7 +620,14 @@ impl Engine {
                     }
                     let variant = match Variant::from_idx(win.variant_idx) {
                         Some(v) => v,
-                        None => continue,
+                        None => {
+                            debug_assert!(
+                                false,
+                                "Invalid variant_idx {} from Vectorscan callback",
+                                win.variant_idx
+                            );
+                            continue;
+                        }
                     };
                     if variant == Variant::Raw {
                         prefilter_gate_hit = true;
@@ -662,7 +669,9 @@ impl Engine {
                                 break;
                             }
                         }
-                        Err(_) => {
+                        Err(e) => {
+                            #[cfg(debug_assertions)]
+                            eprintln!("TimingWheel push failed: {:?}", e);
                             force_full = true;
                             break;
                         }
@@ -858,7 +867,14 @@ impl Engine {
                     }
                     let variant = match Variant::from_idx(win.variant_idx) {
                         Some(v) => v,
-                        None => continue,
+                        None => {
+                            debug_assert!(
+                                false,
+                                "Invalid variant_idx {} from Vectorscan callback",
+                                win.variant_idx
+                            );
+                            continue;
+                        }
                     };
                     if variant == Variant::Raw {
                         prefilter_gate_hit = true;
@@ -895,7 +911,9 @@ impl Engine {
                                 break;
                             }
                         }
-                        Err(_) => {
+                        Err(e) => {
+                            #[cfg(debug_assertions)]
+                            eprintln!("TimingWheel push failed: {:?}", e);
                             force_full = true;
                             break;
                         }
