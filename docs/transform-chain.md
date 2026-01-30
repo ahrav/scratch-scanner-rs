@@ -82,6 +82,8 @@ flowchart TB
     Gate --> |"no"| Decode
 
     Decode --> StreamDecode
+    StreamDecode --> |"anchor matches"| TimingWheel["TimingWheel<br/>pending_windows"]
+    TimingWheel --> |"advance_and_drain"| WindowValidation["Window Validation"]
     StreamDecode --> Slab
     Slab --> Hash
     Hash --> Seen
@@ -219,6 +221,40 @@ sequenceDiagram
 
     Gate-->>Transform: false (no anchor found)
 ```
+
+## Stream Decode Window Scheduling
+
+During streaming decode, anchor matches are discovered incrementally as chunks
+decode. The **TimingWheel** schedules these matches for validation without
+waiting for the full buffer:
+
+```mermaid
+sequenceDiagram
+    participant Stream as stream_decode()
+    participant VS as Vectorscan (streaming)
+    participant TW as TimingWheel
+    participant Val as process_window()
+
+    loop Each decoded chunk
+        Stream->>VS: scan_chunk(decoded_bytes)
+        VS-->>Stream: anchor match at offset X
+        Stream->>TW: push(hi=X+radius, window)
+        TW-->>Stream: Scheduled | Ready
+        Stream->>TW: advance_and_drain(current_offset)
+        TW-->>Val: windows with hi <= offset
+        Val->>Val: regex validation
+    end
+
+    Note over Stream,TW: End of stream
+    Stream->>TW: advance_and_drain(u64::MAX)
+    TW-->>Val: remaining windows
+```
+
+**Key invariant**: `pending_windows` uses `G=1` (exact scheduling), so windows
+fire precisely when `decoded_offset >= hi`. This avoids both early firing
+(incomplete window) and excessive latency.
+
+See `docs/detection-engine.md` for TimingWheel data structure details.
 
 ## StepArena Provenance
 

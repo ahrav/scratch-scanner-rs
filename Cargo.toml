@@ -78,6 +78,10 @@ name = "validator"
 harness = false
 required-features = ["bench"]
 
+[[bench]]
+name = "timing_wheel"
+harness = false
+
 [profile.dev]
 opt-level = 1
 

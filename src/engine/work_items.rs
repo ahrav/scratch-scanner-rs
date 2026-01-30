@@ -4,6 +4,9 @@
 //! item enums used for breadth-first traversal during scanning. Range values
 //! are half-open `[lo, hi)` in their respective address spaces and are only
 //! valid for the current scan (decode slab resets invalidate slab ranges).
+//!
+//! `PendingWindow` ordering is intentionally reversed so a max-heap behaves as
+//! a min-heap keyed by earliest window end.
 
 use crate::api::{StepId, STEP_ROOT};
 use std::ops::Range;
@@ -61,8 +64,10 @@ pub(super) struct PendingDecodeSpan {
 /// Offsets are in decoded-byte space (relative to the stream) and are
 /// half-open: `[lo, hi)`.
 ///
-/// `Ord` is reversed so `BinaryHeap` yields the smallest `hi` first (min-heap).
-#[derive(Eq, PartialEq)]
+/// # Ordering
+/// - Ordered by earliest `hi`, then `lo`, then `(rule_id, variant)` so priority
+///   queues drain windows as soon as their end offset is reached.
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) struct PendingWindow {
     pub(super) hi: u64,
     pub(super) lo: u64,
@@ -99,6 +104,9 @@ pub(super) enum SpanStreamState {
 /// Per-transform span stream bookkeeping during decoded scanning.
 ///
 /// Tracks per-buffer span caps and transform modes alongside the stream state.
+///
+/// # Invariants
+/// - `spans_emitted <= max_spans` for the current buffer.
 pub(super) struct SpanStreamEntry {
     pub(super) transform_idx: usize,
     pub(super) mode: TransformMode,

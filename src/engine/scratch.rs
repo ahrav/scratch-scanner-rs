@@ -7,8 +7,7 @@
 
 use crate::api::{DecodeStep, FindingRec};
 use crate::scratch_memory::ScratchVec;
-use crate::stdx::{ByteRing, FixedSet128};
-use std::collections::BinaryHeap;
+use crate::stdx::{ByteRing, FixedSet128, TimingWheel};
 
 #[cfg(feature = "b64-stats")]
 use crate::api::Base64DecodeStats;
@@ -16,6 +15,7 @@ use crate::api::Base64DecodeStats;
 use super::decode_state::{DecodeSlab, StepArena};
 use super::helpers::pow2_at_least;
 use super::hit_pool::{HitAccPool, RawHsMatch, SpanU32};
+use super::transform::STREAM_DECODE_CHUNK_BYTES;
 use super::vectorscan_prefilter::{VsScratch, VsStreamWindow};
 use super::work_items::{PendingDecodeSpan, PendingWindow, SpanStreamEntry, WorkItem};
 
@@ -105,8 +105,10 @@ pub struct ScanScratch {
     pub(super) decode_ring: ByteRing,
     /// Temporary buffer for materializing decoded windows from the ring.
     pub(super) window_bytes: Vec<u8>,
-    /// Pending window heap (min-heap by `hi`) for decoded stream verification.
-    pub(super) pending_windows: BinaryHeap<PendingWindow>,
+    /// Pending window timing wheel (exact, G=1) keyed by `hi` for decoded stream verification.
+    pub(super) pending_windows: TimingWheel<PendingWindow, 1>,
+    /// Max window horizon used to size the timing wheel (max window radius + stream chunk).
+    pub(super) pending_window_horizon_bytes: u64,
     /// Match windows produced by the Vectorscan stream callback.
     pub(super) vs_stream_matches: Vec<VsStreamWindow>,
     /// Pending decode spans captured during streaming decode.
@@ -116,6 +118,8 @@ pub struct ScanScratch {
     /// Temporary findings buffer for a decoded stream (dedupe-aware).
     pub(super) tmp_findings: Vec<FindingRec>,
     /// Per-rule stream hit counts for decoded-window seeding.
+    ///
+    /// Indexing is `rule_id * 3 + variant_idx` (Raw/Utf16Le/Utf16Be).
     pub(super) stream_hit_counts: Vec<u32>,
     /// Scratch list of touched stream hit counters for fast reset.
     pub(super) stream_hit_touched: ScratchVec<u32>,
@@ -193,7 +197,14 @@ impl ScanScratch {
                 .saturating_mul(2)
                 .max(1024),
         );
-        let pending_cap = engine.tuning.max_windows_per_rule_variant.max(16);
+        let stream_match_cap = engine.tuning.max_windows_per_rule_variant.max(16);
+        let pending_window_cap = rules_len
+            .saturating_mul(3)
+            .saturating_mul(engine.tuning.max_windows_per_rule_variant)
+            .max(16);
+        let max_radius_bytes = (engine.max_window_diameter_bytes / 2) as u64;
+        let pending_window_horizon_bytes =
+            max_radius_bytes.saturating_add(STREAM_DECODE_CHUNK_BYTES as u64);
 
         Self {
             out: ScratchVec::with_capacity(max_findings).expect("scratch out allocation failed"),
@@ -208,8 +219,9 @@ impl ScanScratch {
             work_items_enqueued: 0,
             decode_ring: ByteRing::with_capacity(engine.stream_ring_bytes),
             window_bytes: Vec::with_capacity(engine.stream_ring_bytes),
-            pending_windows: BinaryHeap::with_capacity(pending_cap),
-            vs_stream_matches: Vec::with_capacity(pending_cap),
+            pending_windows: TimingWheel::new(pending_window_horizon_bytes, pending_window_cap),
+            pending_window_horizon_bytes,
+            vs_stream_matches: Vec::with_capacity(stream_match_cap),
             pending_spans: Vec::with_capacity(max_spans.max(16)),
             span_streams: Vec::with_capacity(engine.transforms.len()),
             tmp_findings: Vec::with_capacity(max_findings),
@@ -277,7 +289,7 @@ impl ScanScratch {
         self.work_items_enqueued = 0;
         self.decode_ring.reset();
         self.window_bytes.clear();
-        self.pending_windows.clear();
+        self.pending_windows.reset();
         self.vs_stream_matches.clear();
         self.pending_spans.clear();
         self.span_streams.clear();
@@ -470,13 +482,26 @@ impl ScanScratch {
             self.window_bytes
                 .reserve(engine.stream_ring_bytes - self.window_bytes.capacity());
         }
-        let pending_cap = engine.tuning.max_windows_per_rule_variant.max(16);
-        if self.pending_windows.capacity() < pending_cap {
-            self.pending_windows = BinaryHeap::with_capacity(pending_cap);
+        let stream_match_cap = engine.tuning.max_windows_per_rule_variant.max(16);
+        let pending_window_cap = engine
+            .rules
+            .len()
+            .saturating_mul(3)
+            .saturating_mul(engine.tuning.max_windows_per_rule_variant)
+            .max(16);
+        let max_radius_bytes = (engine.max_window_diameter_bytes / 2) as u64;
+        let pending_window_horizon_bytes =
+            max_radius_bytes.saturating_add(STREAM_DECODE_CHUNK_BYTES as u64);
+        if self.pending_windows.capacity() < pending_window_cap
+            || self.pending_window_horizon_bytes < pending_window_horizon_bytes
+        {
+            self.pending_windows =
+                TimingWheel::new(pending_window_horizon_bytes, pending_window_cap);
+            self.pending_window_horizon_bytes = pending_window_horizon_bytes;
         }
-        if self.vs_stream_matches.capacity() < pending_cap {
+        if self.vs_stream_matches.capacity() < stream_match_cap {
             self.vs_stream_matches
-                .reserve(pending_cap - self.vs_stream_matches.capacity());
+                .reserve(stream_match_cap - self.vs_stream_matches.capacity());
         }
         if self.pending_spans.capacity() < max_spans.max(16) {
             self.pending_spans
