@@ -1,4 +1,43 @@
-//! Scan sibling repositories with two prefilter modes and compare throughput.
+//! Benchmark comparison of prefilter modes (Regex vs Auto) across repositories.
+//!
+//! This tool scans sibling repositories using two different prefilter configurations
+//! and reports throughput (MiB/s) for each, allowing direct performance comparison.
+//!
+//! # Usage
+//!
+//! ```bash
+//! # Run from within a repo; scans siblings in parent directory
+//! cargo run --release --bin bench_repos
+//!
+//! # Specify a custom root directory
+//! cargo run --release --bin bench_repos -- --root /path/to/repos
+//!
+//! # Filter to repos containing "api" in their name
+//! cargo run --release --bin bench_repos -- --filter api
+//!
+//! # Limit to first 5 repos
+//! cargo run --release --bin bench_repos -- --max-repos 5
+//!
+//! # Control scan order (for cache warming fairness)
+//! cargo run --release --bin bench_repos -- --order regex-first
+//! cargo run --release --bin bench_repos -- --order auto-first
+//! cargo run --release --bin bench_repos -- --order alternate  # default
+//!
+//! # Enable detailed stats (requires "stats" feature)
+//! cargo run --release --bin bench_repos --features stats
+//! ```
+//!
+//! # Output Format
+//!
+//! The output is a table with columns:
+//! - `repo`: Repository name
+//! - `MiB`: Total bytes attempted (not necessarily scanned, some files may error)
+//! - `regex`: Throughput in MiB/s using `PrefilterMode::Regex`
+//! - `auto`: Throughput in MiB/s using `PrefilterMode::Auto`
+//! - `delta%`: Percentage difference (`(auto - regex) / regex * 100`)
+//! - `errs`: Total I/O errors encountered across both runs
+//!
+//! Positive delta% means Auto mode is faster; negative means Regex mode is faster.
 
 #[cfg(feature = "stats")]
 use scanner_rs::VectorscanStats;
@@ -14,10 +53,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Controls which prefilter mode runs first for each repository.
+///
+/// Scan order matters for benchmark fairness because the first scan warms filesystem
+/// caches, giving the second scan an advantage. Different orderings help identify
+/// whether observed differences are due to prefilter performance or cache effects.
 #[derive(Clone, Copy)]
 enum Order {
+    /// Always run Regex mode first (Auto benefits from warm cache).
     RegexFirst,
+    /// Always run Auto mode first (Regex benefits from warm cache).
     AutoFirst,
+    /// Alternate which runs first per repo (fairest for aggregate comparisons).
     Alternate,
 }
 
@@ -32,28 +79,49 @@ impl Order {
     }
 }
 
+/// A discovered repository to benchmark.
 struct Repo {
+    /// Repository directory name (used for display in output table).
     name: String,
+    /// Absolute path to the repository root.
     path: PathBuf,
 }
 
+/// Result of scanning a single repository with one prefilter mode.
 struct RunResult {
+    /// Total bytes *attempted* (sum of file sizes), not necessarily all successfully scanned.
     bytes: u64,
+    /// Count of I/O errors encountered (directory reads, file reads, metadata access).
     errors: u64,
+    /// Wall-clock time for the scan in seconds.
     elapsed_s: f64,
 }
 
+/// Checks if a directory is a git repository.
+///
+/// Returns `true` if the directory contains a `.git` entry, which may be either:
+/// - A directory (standard git repos)
+/// - A file (git worktrees and submodules store a pointer file instead)
 fn is_repo_dir(path: &Path) -> bool {
     let git_dir = path.join(".git");
     if git_dir.is_dir() {
         return true;
     }
+    // Worktrees and submodules use a .git *file* pointing to the actual git dir.
     if git_dir.is_file() {
-        return true; // Worktrees/submodules can store .git as a file.
+        return true;
     }
     false
 }
 
+/// Discovers git repositories in the immediate children of `root`.
+///
+/// Only performs single-level discovery (does not recurse into subdirectories).
+/// Results are sorted alphabetically by name for deterministic ordering.
+///
+/// # Arguments
+/// - `filter`: If `Some`, only includes repos whose name *contains* this substring.
+/// - `max_repos`: If `Some`, stops after discovering this many repos (before sorting).
 fn discover_repos(
     root: &Path,
     filter: Option<&str>,
@@ -93,6 +161,17 @@ fn discover_repos(
     Ok(repos)
 }
 
+/// Returns `true` for directories that should be skipped during scanning.
+///
+/// Skipped directories include:
+/// - VCS internals (`.git`, `.hg`, `.svn`)
+/// - Build artifacts (`target`, `dist`, `build`, `out`, `.next`)
+/// - Dependencies (`node_modules`)
+/// - Caches (`.cache`, `__pycache__`)
+/// - Virtual environments (`.venv`, `venv`)
+///
+/// These directories typically contain generated/vendored content that inflates
+/// scan time without providing meaningful benchmark signal.
 fn should_skip_dir(name: &str) -> bool {
     matches!(
         name,
@@ -112,16 +191,26 @@ fn should_skip_dir(name: &str) -> bool {
     )
 }
 
+/// Scans all files in a repository using synchronous single-threaded I/O.
+///
+/// Uses a deliberately constrained configuration to isolate prefilter performance:
+/// - Single-threaded scanning eliminates thread scheduling variance
+/// - Synchronous I/O avoids async runtime overhead
+/// - High findings limit prevents truncation from affecting timing
+///
+/// Errors (permission denied, broken symlinks, etc.) are counted but do not
+/// abort the scan—we continue to get throughput numbers even for repos with
+/// some inaccessible files.
 fn scan_repo(engine: &Arc<scanner_rs::Engine>, path: &Path) -> io::Result<RunResult> {
     let start = Instant::now();
     let overlap = engine.required_overlap();
     let chunk_size = BUFFER_LEN_MAX.saturating_sub(overlap).max(1);
     let config = ScannerConfig {
         chunk_size,
-        io_queue: 2,
-        reader_threads: 1,
-        scan_threads: 1,
-        max_findings_per_file: 16_384,
+        io_queue: 2,        // Minimal queue depth for sequential scanning.
+        reader_threads: 1,  // Single-threaded to isolate prefilter performance.
+        scan_threads: 1,    // Single-threaded to isolate prefilter performance.
+        max_findings_per_file: 16_384, // High limit to avoid truncation affecting timing.
     };
     let mut runtime = ScannerRuntime::new(Arc::clone(engine), config);
 
@@ -157,6 +246,7 @@ fn scan_repo(engine: &Arc<scanner_rs::Engine>, path: &Path) -> io::Result<RunRes
             let name_str = name.to_str().unwrap_or_default();
 
             if file_type.is_dir() {
+                // Skip symlinked directories to avoid infinite loops and double-counting.
                 if file_type.is_symlink() || should_skip_dir(name_str) {
                     continue;
                 }
@@ -188,10 +278,12 @@ fn scan_repo(engine: &Arc<scanner_rs::Engine>, path: &Path) -> io::Result<RunRes
     Ok(RunResult {
         bytes,
         errors,
+        // Epsilon floor prevents division by zero in throughput calculations.
         elapsed_s: elapsed.max(0.000_000_1),
     })
 }
 
+/// Calculates throughput in MiB/s (mebibytes per second).
 fn format_mib_s(bytes: u64, elapsed_s: f64) -> f64 {
     if elapsed_s <= 0.0 {
         return 0.0;
@@ -199,8 +291,14 @@ fn format_mib_s(bytes: u64, elapsed_s: f64) -> f64 {
     (bytes as f64 / (1024.0 * 1024.0)) / elapsed_s
 }
 
+/// Logs detailed Auto-mode statistics when performance is notably worse than Regex.
+///
+/// Only prints stats when `delta_pct < -5.0` (Auto is 5%+ slower than Regex).
+/// This threshold filters out noise—small differences aren't actionable, but
+/// significant regressions warrant investigation of the mode selection heuristics.
 #[cfg(feature = "stats")]
 fn maybe_log_auto_stats(before: VectorscanStats, after: VectorscanStats, delta_pct: f64) {
+    // Only log when Auto is meaningfully slower (5%+ regression).
     if delta_pct >= -5.0 {
         return;
     }
@@ -217,6 +315,9 @@ fn maybe_log_auto_stats(before: VectorscanStats, after: VectorscanStats, delta_p
     let gate_missing = after
         .auto_gate_missing
         .saturating_sub(before.auto_gate_missing);
+    let aborts = after
+        .auto_anchor_aborts
+        .saturating_sub(before.auto_anchor_aborts);
     let anchor_bytes = after
         .auto_anchor_bytes
         .saturating_sub(before.auto_anchor_bytes);
@@ -236,14 +337,15 @@ fn maybe_log_auto_stats(before: VectorscanStats, after: VectorscanStats, delta_p
         0.0
     };
     eprintln!(
-        "  auto_scans: anchor={} regex={} (anchor%={:.1}, bytes%={:.1}) gate_allow={} gate_reject={} gate_missing={}",
+        "  auto_scans: anchor={} regex={} (anchor%={:.1}, bytes%={:.1}) gate_allow={} gate_reject={} gate_missing={} aborts={}",
         auto_anchor,
         auto_regex,
         anchor_pct,
         anchor_bytes_pct,
         gate_allow,
         gate_reject,
-        gate_missing
+        gate_missing,
+        aborts
     );
 }
 

@@ -1503,6 +1503,8 @@ pub struct VectorscanStats {
     pub auto_gate_reject: u64,
     /// Auto mode: density gate unavailable.
     pub auto_gate_missing: u64,
+    /// Auto mode: anchor scans aborted due to hit density.
+    pub auto_anchor_aborts: u64,
     /// Auto mode: total bytes scanned with anchor-literal prefilter.
     pub auto_anchor_bytes: u64,
     /// Auto mode: total bytes scanned with regex prefilter.
@@ -1528,6 +1530,7 @@ struct VectorscanCounters {
     auto_gate_allow: AtomicU64,
     auto_gate_reject: AtomicU64,
     auto_gate_missing: AtomicU64,
+    auto_anchor_aborts: AtomicU64,
     auto_anchor_bytes: AtomicU64,
     auto_regex_bytes: AtomicU64,
 }
@@ -1554,6 +1557,7 @@ impl VectorscanCounters {
             auto_gate_allow: self.auto_gate_allow.load(Ordering::Relaxed),
             auto_gate_reject: self.auto_gate_reject.load(Ordering::Relaxed),
             auto_gate_missing: self.auto_gate_missing.load(Ordering::Relaxed),
+            auto_anchor_aborts: self.auto_anchor_aborts.load(Ordering::Relaxed),
             auto_anchor_bytes: self.auto_anchor_bytes.load(Ordering::Relaxed),
             auto_regex_bytes: self.auto_regex_bytes.load(Ordering::Relaxed),
         }
@@ -2593,8 +2597,8 @@ impl Engine {
         };
         let mut vs = vs.expect("vectorscan prefilter database unavailable (fallback disabled)");
         if used_anchor_db && matches!(self.tuning.prefilter_mode, PrefilterMode::Auto) {
-            let mut limit = buf.len() / 64;
-            limit = limit.clamp(256, 100_000);
+            let mut limit = buf.len() / 512;
+            limit = limit.clamp(64, 10_000);
             scratch.prefilter_hit_limit = limit as u32;
         }
         let mut use_direct_raw =
@@ -2673,6 +2677,10 @@ impl Engine {
             && matches!(self.tuning.prefilter_mode, PrefilterMode::Auto)
             && scratch.prefilter_aborted
         {
+            #[cfg(feature = "stats")]
+            self.vs_stats
+                .auto_anchor_aborts
+                .fetch_add(1, Ordering::Relaxed);
             scratch
                 .hit_acc_pool
                 .reset_touched(scratch.touched_pairs.as_slice());
