@@ -4,22 +4,39 @@
 //! tracking. A slow reference scanner is included to validate correctness
 //! across transforms and UTF-16 variants.
 
-use super::*;
+use super::core::Engine;
+use super::helpers::{decode_utf16be_to_vec, decode_utf16le_to_vec, entropy_gate_passes, hash128};
+use super::hit_pool::{HitAccPool, SpanU32};
+use super::rule_repr::{utf16be_bytes, utf16le_bytes, EntropyCompiled, PackedPatterns, Variant};
+use super::scratch::EntropyScratch;
+use super::transform::{
+    decode_to_vec, find_base64_spans_into, find_spans_into, find_url_spans_into,
+    transform_quick_trigger,
+};
+use super::vectorscan_prefilter::{
+    gate_match_callback, stream_match_callback, VsStreamMatchCtx, VsStreamWindow,
+};
+use crate::api::{
+    AnchorPolicy, DecodeStep, EntropySpec, FileId, Finding, FindingRec, Gate, RuleSpec,
+    TransformConfig, TransformId, TransformMode, Tuning, Utf16Endianness, ValidatorKind,
+};
+use crate::demo::{demo_engine, demo_rules, demo_tuning};
+use crate::regex2anchor::{compile_trigger_plan, AnchorDeriveConfig, TriggerPlan};
+use crate::scratch_memory::ScratchVec;
 use crate::tiger_harness::{
     check_oracle_covered, correctness_engine, load_regressions_from_dir, maybe_write_regression,
     scan_chunked_records, scan_one_chunk_records, ChunkPattern, ChunkPlan,
 };
+use crate::{ScannerConfig, ScannerRuntime};
+use memchr::memmem;
 use proptest::prelude::*;
+use regex::bytes::Regex;
 use std::collections::HashSet;
 use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-use super::vectorscan_prefilter::{
-    gate_match_callback, stream_match_callback, VsStreamMatchCtx, VsStreamWindow,
-};
 
 fn decoded_prefilter_hit(engine: &Engine, decoded: &[u8]) -> bool {
     if let Some(vs_gate) = engine.vs_gate.as_ref() {
@@ -284,7 +301,7 @@ fn base64_utf16_aws_key_is_detected() {
     let eng = demo_engine();
 
     let aws = b"AKIAIOSFODNN7EXAMPLE"; // 20 bytes
-    let utf16le = super::utf16le_bytes(aws);
+    let utf16le = utf16le_bytes(aws);
     let b64 = b64_encode(&utf16le);
 
     let hay = format!("prefix {} suffix", b64).into_bytes();
@@ -1457,7 +1474,7 @@ fn scan_file_sync_materializes_provenance_across_chunks() -> std::io::Result<()>
     );
 
     let aws = b"AKIAIOSFODNN7EXAMPLE"; // 20 bytes
-    let utf16le = super::utf16le_bytes(aws);
+    let utf16le = utf16le_bytes(aws);
     let b64 = b64_encode(&utf16le);
 
     let mut buf = vec![b'!'; 17];
@@ -2171,8 +2188,8 @@ mod proptests {
                 }
             }
 
-            let acc_coalesced = if acc.coalesced_set[pair] != 0 {
-                Some(acc.coalesced[pair])
+            let acc_coalesced = if acc.coalesced_set()[pair] != 0 {
+                Some(acc.coalesced()[pair])
             } else {
                 None
             };
@@ -2180,14 +2197,14 @@ mod proptests {
             match (acc_coalesced, ref_coalesced) {
                 (Some(actual), Some(expected)) => {
                     prop_assert_eq!(actual, expected);
-                    prop_assert_eq!(acc.lens[pair], 0);
+                    prop_assert_eq!(acc.lens()[pair], 0);
                 }
                 (None, None) => {
-                    let len = acc.lens[pair] as usize;
+                    let len = acc.lens()[pair] as usize;
                     prop_assert_eq!(len, ref_windows.len());
                     let base = pair * max_hits;
                     for (i, expected) in ref_windows.iter().enumerate() {
-                        prop_assert_eq!(acc.windows[base + i], *expected);
+                        prop_assert_eq!(acc.windows()[base + i], *expected);
                     }
                 }
                 _ => {

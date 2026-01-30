@@ -32,8 +32,8 @@
 //! - Each scanning thread must use its own `hs_scratch_t` (`VsScratch`).
 //! - Match callbacks must never panic or unwind across the FFI boundary.
 //! - Callback `ctx` pointers are valid only for the duration of a scan.
-//! - Scan buffers must fit in `u32`; calls return errors when lengths exceed
-//!   that bound.
+//! - Scan buffers must fit in `u32`; some entrypoints return errors when lengths
+//!   exceed that bound, others assume callers pre-chunk input accordingly.
 //!
 //! # Window seeding
 //! 1. Compile each rule regex in block mode with `HS_FLAG_PREFILTER` to get
@@ -64,7 +64,9 @@ use std::ptr;
 
 use vectorscan_rs_sys as vs;
 
-use super::{RawHsMatch, ScanScratch, SpanU32, Target, Variant};
+use super::hit_pool::{RawHsMatch, SpanU32};
+use super::rule_repr::{Target, Variant};
+use super::scratch::ScanScratch;
 
 /// Compiled Vectorscan database plus per-rule window metadata for raw-byte scanning.
 ///
@@ -222,7 +224,7 @@ impl VsStreamDb {
     /// Build a stream-mode database for decoded-byte scanning.
     ///
     /// Uses `hs_expression_info` to estimate match width; a zero width is
-    /// treated as unbounded and capped by `max_decoded_cap` when provided.
+    /// treated as unbounded and capped by `max_decoded_cap` when nonzero.
     /// Patterns are compiled with `HS_FLAG_PREFILTER`; hits are conservative
     /// and used only for window seeding.
     pub(crate) fn try_new_stream(
@@ -1133,6 +1135,7 @@ impl VsUtf16StreamDb {
 
     /// Scans a decoded stream chunk for UTF-16 anchor hits.
     ///
+    /// The chunk length must fit in `u32` (Vectorscan API constraint).
     /// `scratch` must be allocated for this database; `ctx` must remain valid
     /// for the duration of the call. `HS_SCAN_TERMINATED` is treated as success to
     /// allow early termination in callbacks.

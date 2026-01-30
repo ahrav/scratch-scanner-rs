@@ -42,8 +42,11 @@
 //! where `base_offset` is the absolute byte offset of `chunk[0]` in the original
 //! buffer. Call `finish(end_offset, ...)` once at end-of-stream to flush a trailing
 //! run; after `on_span` returns `false`, the stream becomes inert until `reset()`.
+//! Chunks are expected to arrive in-order with monotonic `base_offset` (typically
+//! contiguous). Gaps or overlaps split runs across chunk boundaries and may
+//! suppress or fragment spans.
 
-use super::SpanU32;
+use super::hit_pool::SpanU32;
 use crate::api::{TransformConfig, TransformId};
 use crate::scratch_memory::ScratchVec;
 use memchr::{memchr, memchr2};
@@ -186,6 +189,8 @@ fn is_urlish(b: u8) -> bool {
 /// Spans are half-open byte ranges (`start..end`) into the input buffer.
 /// Implementations are expected to preserve insertion order and tolerate
 /// being cleared and reused across scans.
+/// Callers must ensure spans are valid for the sink (for example, `SpanU32`
+/// requires all offsets fit in `u32`).
 /// Callers are responsible for ensuring `start <= end` and that spans are
 /// within the input buffer.
 pub(super) trait SpanSink {
@@ -240,9 +245,10 @@ impl UrlSpanStream {
     /// Feed the next chunk of bytes into the scanner.
     ///
     /// `base_offset` must be the absolute offset of `chunk[0]` in the original
-    /// buffer. Spans are reported as half-open absolute ranges. Returning
-    /// `false` from `on_span` stops the scan early; the stream must be `reset()`
-    /// before reuse.
+    /// buffer. Chunks should be provided in order with a monotonic
+    /// `base_offset` (typically contiguous) so runs can span chunk boundaries.
+    /// Spans are reported as half-open absolute ranges. Returning `false` from
+    /// `on_span` stops the scan early; the stream must be `reset()` before reuse.
     pub(super) fn feed<F>(&mut self, chunk: &[u8], base_offset: u64, mut on_span: F)
     where
         F: FnMut(u64, u64) -> bool,
@@ -369,9 +375,11 @@ impl Base64SpanStream {
     /// Feed the next chunk of bytes into the scanner.
     ///
     /// `base_offset` must be the absolute offset of `chunk[0]` in the original
-    /// buffer. Spans are reported as half-open absolute ranges trimmed to the
-    /// last base64 byte. Returning `false` from `on_span` stops the scan early;
-    /// the stream must be `reset()` before reuse.
+    /// buffer. Chunks should be provided in order with a monotonic
+    /// `base_offset` (typically contiguous) so runs can span chunk boundaries.
+    /// Spans are reported as half-open absolute ranges trimmed to the last
+    /// base64 byte. Returning `false` from `on_span` stops the scan early; the
+    /// stream must be `reset()` before reuse.
     pub(super) fn feed<F>(&mut self, chunk: &[u8], base_offset: u64, mut on_span: F)
     where
         F: FnMut(u64, u64) -> bool,
