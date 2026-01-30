@@ -21,9 +21,7 @@
 //! Notes:
 //! - Hardware counters are Linux-only and best-effort. Use --disable-hw-counters to skip them.
 
-use scanner_rs::{
-    demo_engine_with_anchor_mode_and_tuning, demo_tuning, AnchorMode, Engine, PrefilterMode,
-};
+use scanner_rs::{demo_engine_with_anchor_mode_and_tuning, demo_tuning, AnchorMode, Engine};
 use std::env;
 use std::fs::File;
 use std::hint::black_box;
@@ -1220,30 +1218,16 @@ impl BenchmarkSuite {
             println!("=== Scanner Benchmark Suite ===\n");
         }
 
-        let mut base = demo_tuning();
-        base.prefilter_mode = PrefilterMode::Regex;
-        let mut anchor = demo_tuning();
-        anchor.prefilter_mode = PrefilterMode::AnchorLiterals;
+        let base = demo_tuning();
 
         let engines = vec![
             EngineVariant {
-                name: "manual_regex",
+                name: "manual",
                 engine: demo_engine_with_anchor_mode_and_tuning(AnchorMode::Manual, base.clone()),
             },
             EngineVariant {
-                name: "manual_anchor",
-                engine: demo_engine_with_anchor_mode_and_tuning(AnchorMode::Manual, anchor.clone()),
-            },
-            EngineVariant {
-                name: "derived_regex",
+                name: "derived",
                 engine: demo_engine_with_anchor_mode_and_tuning(AnchorMode::Derived, base.clone()),
-            },
-            EngineVariant {
-                name: "derived_anchor",
-                engine: demo_engine_with_anchor_mode_and_tuning(
-                    AnchorMode::Derived,
-                    anchor.clone(),
-                ),
             },
         ];
 

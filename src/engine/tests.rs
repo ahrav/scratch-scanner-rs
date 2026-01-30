@@ -649,6 +649,9 @@ fn reference_scan_keys(engine: &Engine, rules: &[RuleSpec], buf: &[u8]) -> HashS
             if !transform_quick_trigger(tc, &item.buf) {
                 continue;
             }
+            if !engine.base64_buffer_gate(tc, &item.buf) {
+                continue;
+            }
 
             let mut spans = Vec::new();
             find_spans_into(tc, &item.buf, &mut spans);

@@ -63,13 +63,11 @@ use std::ops::{ControlFlow, Range};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod helpers;
-mod raw_density_gate;
 mod transform;
 mod validator;
 mod vectorscan_prefilter;
 
 use self::helpers::*;
-use self::raw_density_gate::RawDensityGate;
 use self::transform::*;
 use self::vectorscan_prefilter::{
     gate_match_callback, stream_match_callback, utf16_stream_match_callback, AnchorInput,
@@ -772,12 +770,6 @@ pub struct ScanScratch {
     spans: ScratchVec<SpanU32>, // Transform span candidates.
     /// Raw Vectorscan regex matches captured for direct validation.
     raw_hs_matches: Vec<RawHsMatch>,
-    /// Total prefilter hits seen in the current raw scan (for Auto fallback).
-    prefilter_hits: u32,
-    /// Hit limit that triggers an early prefilter abort (0 = disabled).
-    prefilter_hit_limit: u32,
-    /// True if the current prefilter scan aborted early due to density.
-    prefilter_aborted: bool,
     /// Decode provenance arena.
     ///
     /// Stores parent-linked decode steps so findings can reconstruct their
@@ -798,19 +790,22 @@ pub struct ScanScratch {
     /// during materialization. Capacity is bounded by `max_transform_depth`.
     steps_buf: ScratchVec<DecodeStep>,
 
-    /// Per-thread Vectorscan scratch space for the regex prefilter DB.
+    /// Per-thread Vectorscan scratch space for the unified prefilter DB.
     ///
     /// Vectorscan requires each scanning thread to have its own scratch memory.
-    vs_regex_scratch: Option<VsScratch>,
-    /// Per-thread Vectorscan scratch space for the anchor-literal prefilter DB.
-    vs_anchor_scratch: Option<VsScratch>,
+    /// Used for raw-buffer scanning (anchors + regex patterns in block mode).
+    vs_scratch: Option<VsScratch>,
     /// Per-thread Vectorscan scratch space for UTF-16 anchor prefiltering.
+    /// Used for UTF-16 variant anchor scanning in block mode on raw buffers.
     vs_utf16_scratch: Option<VsScratch>,
     /// Per-thread Vectorscan scratch space for UTF-16 stream anchor scanning.
+    /// Used for streaming UTF-16 anchor detection in decoded byte streams.
     vs_utf16_stream_scratch: Option<VsScratch>,
     /// Per-thread Vectorscan scratch space for stream-mode scanning.
+    /// Used for decoded-stream regex prefiltering in streaming mode.
     vs_stream_scratch: Option<VsScratch>,
     /// Per-thread Vectorscan scratch space for decoded gate scanning.
+    /// Used for anchor gating in decoded transform output (e.g., base64 decoded bytes).
     vs_gate_scratch: Option<VsScratch>,
     #[cfg(feature = "b64-stats")]
     base64_stats: Base64DecodeStats, // Base64 decode/gate instrumentation.
@@ -863,9 +858,6 @@ impl ScanScratch {
             span_streams: Vec::with_capacity(engine.transforms.len()),
             tmp_findings: Vec::with_capacity(max_findings),
             raw_hs_matches: Vec::new(),
-            prefilter_hits: 0,
-            prefilter_hit_limit: 0,
-            prefilter_aborted: false,
             stream_hit_counts: vec![0u32; rules_len.saturating_mul(3)],
             stream_hit_touched: ScratchVec::with_capacity(rules_len.saturating_mul(3))
                 .expect("scratch stream_hit_touched allocation failed"),
@@ -888,13 +880,9 @@ impl ScanScratch {
                 engine.tuning.max_transform_depth.saturating_add(1),
             )
             .expect("scratch steps_buf allocation failed"),
-            vs_regex_scratch: engine.vs_regex.as_ref().map(|db| {
+            vs_scratch: engine.vs.as_ref().map(|db| {
                 db.alloc_scratch()
-                    .expect("vectorscan regex scratch allocation failed")
-            }),
-            vs_anchor_scratch: engine.vs_anchor.as_ref().map(|db| {
-                db.alloc_scratch()
-                    .expect("vectorscan anchor scratch allocation failed")
+                    .expect("vectorscan scratch allocation failed")
             }),
             vs_utf16_scratch: engine.vs_utf16.as_ref().map(|db| {
                 db.alloc_scratch()
@@ -937,9 +925,6 @@ impl ScanScratch {
         self.pending_spans.clear();
         self.span_streams.clear();
         self.tmp_findings.clear();
-        self.prefilter_hits = 0;
-        self.prefilter_hit_limit = 0;
-        self.prefilter_aborted = false;
         for idx in self.stream_hit_touched.drain() {
             let slot = idx as usize;
             if let Some(hit) = self.stream_hit_counts.get_mut(slot) {
@@ -952,40 +937,22 @@ impl ScanScratch {
         #[cfg(feature = "b64-stats")]
         self.base64_stats.reset();
 
-        match engine.vs_regex.as_ref() {
+        match engine.vs.as_ref() {
             Some(db) => {
-                let need_alloc = match self.vs_regex_scratch.as_ref() {
+                let need_alloc = match self.vs_scratch.as_ref() {
                     Some(s) => s.bound_db_ptr() != db.db_ptr(),
                     None => true,
                 };
                 if need_alloc {
-                    self.vs_regex_scratch = Some(
+                    self.vs_scratch = Some(
                         db.alloc_scratch()
-                            .expect("vectorscan regex scratch allocation failed"),
+                            .expect("vectorscan scratch allocation failed"),
                     );
                 }
             }
             None => {
-                // Drop scratch if the engine no longer has regex prefiltering.
-                self.vs_regex_scratch = None;
-            }
-        }
-        match engine.vs_anchor.as_ref() {
-            Some(db) => {
-                let need_alloc = match self.vs_anchor_scratch.as_ref() {
-                    Some(s) => s.bound_db_ptr() != db.db_ptr(),
-                    None => true,
-                };
-                if need_alloc {
-                    self.vs_anchor_scratch = Some(
-                        db.alloc_scratch()
-                            .expect("vectorscan anchor scratch allocation failed"),
-                    );
-                }
-            }
-            None => {
-                // Drop scratch if the engine no longer has anchor prefiltering.
-                self.vs_anchor_scratch = None;
+                // Drop scratch if the engine no longer has vectorscan enabled.
+                self.vs_scratch = None;
             }
         }
         match engine.vs_utf16.as_ref() {
@@ -1411,14 +1378,11 @@ pub struct Engine {
     // Log2 lookup table for entropy gating.
     entropy_log2: Vec<f32>,
 
-    // Vectorscan/Hyperscan prefilter DBs for raw scanning.
+    // Unified Vectorscan/Hyperscan prefilter DB for raw scanning.
     //
-    // Built during engine construction. Failures are fatal (fallback disabled).
-    // `vs_regex` is the regex-prefilter DB; `vs_anchor` is the anchor-literal DB.
-    vs_regex: Option<VsPrefilterDb>,
-    vs_anchor: Option<VsPrefilterDb>,
-    // Density gate to decide when anchor literals are selective.
-    raw_density_gate: Option<RawDensityGate>,
+    // Combines literal anchors with regex patterns into a single DB for efficient
+    // multi-pattern matching. Built during engine construction; failures are fatal.
+    vs: Option<VsPrefilterDb>,
     // Optional Vectorscan DB for UTF-16 anchor scanning.
     //
     // When present, this prefilters UTF-16 variants using literal anchors.
@@ -1435,7 +1399,7 @@ pub struct Engine {
     // if a decoded buffer contains an anchor, at least one YARA-style base64
     // permutation of that anchor must appear in the encoded stream. We still
     // perform the decoded-space gate for correctness; this pre-gate exists
-    // purely to skip wasteful decodes when no anchor could possibly appear.
+    // purely to skip wasteful span scans/decodes when no anchor could possibly appear.
     b64_gate: Option<Base64YaraGate>,
 
     // Residue gates for rules without anchors (pass 2).
@@ -1446,10 +1410,20 @@ pub struct Engine {
     #[cfg(feature = "stats")]
     vs_stats: VectorscanCounters,
 
+    /// Maximum byte length of any single anchor pattern.
+    /// Used for buffer sizing during anchor compilation.
     max_anchor_pat_len: usize,
+    /// True if any rule has UTF-16 anchor variants compiled.
+    /// Controls whether UTF-16 scanning paths are active.
     has_utf16_anchors: bool,
+    /// Maximum window size (in bytes) across all rules.
+    /// Determines buffer sizing for validation windows.
     max_window_diameter_bytes: usize,
+    /// Maximum prefilter width reported by Vectorscan for any pattern.
+    /// Used for window expansion around match offsets.
     max_prefilter_width: usize,
+    /// Ring buffer size for stream-mode decoded scanning.
+    /// Must accommodate the largest possible match span.
     stream_ring_bytes: usize,
 }
 
@@ -1493,22 +1467,6 @@ pub struct VectorscanStats {
     pub stream_force_full: u64,
     /// Stream decode spans that exceeded the per-rule window cap.
     pub stream_window_cap_exceeded: u64,
-    /// Auto mode: buffers that used the anchor-literal prefilter.
-    pub auto_anchor_scans: u64,
-    /// Auto mode: buffers that used the regex prefilter.
-    pub auto_regex_scans: u64,
-    /// Auto mode: density gate allowed anchor prefiltering.
-    pub auto_gate_allow: u64,
-    /// Auto mode: density gate rejected anchor prefiltering.
-    pub auto_gate_reject: u64,
-    /// Auto mode: density gate unavailable.
-    pub auto_gate_missing: u64,
-    /// Auto mode: anchor scans aborted due to hit density.
-    pub auto_anchor_aborts: u64,
-    /// Auto mode: total bytes scanned with anchor-literal prefilter.
-    pub auto_anchor_bytes: u64,
-    /// Auto mode: total bytes scanned with regex prefilter.
-    pub auto_regex_bytes: u64,
 }
 
 #[cfg(feature = "stats")]
@@ -1525,14 +1483,6 @@ struct VectorscanCounters {
     anchor_skipped: AtomicU64,
     stream_force_full: AtomicU64,
     stream_window_cap_exceeded: AtomicU64,
-    auto_anchor_scans: AtomicU64,
-    auto_regex_scans: AtomicU64,
-    auto_gate_allow: AtomicU64,
-    auto_gate_reject: AtomicU64,
-    auto_gate_missing: AtomicU64,
-    auto_anchor_aborts: AtomicU64,
-    auto_anchor_bytes: AtomicU64,
-    auto_regex_bytes: AtomicU64,
 }
 
 #[cfg(feature = "stats")]
@@ -1552,14 +1502,6 @@ impl VectorscanCounters {
             anchor_skipped: self.anchor_skipped.load(Ordering::Relaxed),
             stream_force_full: self.stream_force_full.load(Ordering::Relaxed),
             stream_window_cap_exceeded: self.stream_window_cap_exceeded.load(Ordering::Relaxed),
-            auto_anchor_scans: self.auto_anchor_scans.load(Ordering::Relaxed),
-            auto_regex_scans: self.auto_regex_scans.load(Ordering::Relaxed),
-            auto_gate_allow: self.auto_gate_allow.load(Ordering::Relaxed),
-            auto_gate_reject: self.auto_gate_reject.load(Ordering::Relaxed),
-            auto_gate_missing: self.auto_gate_missing.load(Ordering::Relaxed),
-            auto_anchor_aborts: self.auto_anchor_aborts.load(Ordering::Relaxed),
-            auto_anchor_bytes: self.auto_anchor_bytes.load(Ordering::Relaxed),
-            auto_regex_bytes: self.auto_regex_bytes.load(Ordering::Relaxed),
         }
     }
 }
@@ -1645,13 +1587,10 @@ impl Engine {
             .collect::<Vec<_>>();
 
         // Build deduped anchor patterns: pattern -> targets
-        let mut pat_map_raw: AHashMap<Vec<u8>, Vec<Target>> =
-            AHashMap::with_capacity(rules.len().saturating_mul(3).max(16));
         let mut pat_map_all: AHashMap<Vec<u8>, Vec<Target>> =
             AHashMap::with_capacity(rules.len().saturating_mul(3).max(16));
         let mut pat_map_utf16: AHashMap<Vec<u8>, Vec<Target>> =
             AHashMap::with_capacity(rules.len().saturating_mul(2).max(16));
-        let mut has_raw_anchor = vec![false; rules.len()];
         let mut residue_rules: Vec<(usize, ResidueGatePlan)> = Vec::with_capacity(rules.len());
         let mut unfilterable_rules: Vec<(usize, UnfilterableReason)> =
             Vec::with_capacity(rules.len());
@@ -1682,8 +1621,7 @@ impl Engine {
             };
             let mut manual_used = false;
             let mut add_manual =
-                |pat_map_raw: &mut AHashMap<Vec<u8>, Vec<Target>>,
-                 pat_map_all: &mut AHashMap<Vec<u8>, Vec<Target>>,
+                |pat_map_all: &mut AHashMap<Vec<u8>, Vec<Target>>,
                  pat_map_utf16: &mut AHashMap<Vec<u8>, Vec<Target>>| {
                     if !allow_manual {
                         return;
@@ -1699,17 +1637,6 @@ impl Engine {
                     }
                     for &a in r.anchors {
                         let keyword_implied = keyword_implied_for_anchor(a);
-                        has_raw_anchor[rid] = true;
-                        add_pat_raw(
-                            pat_map_raw,
-                            a,
-                            Target::new(
-                                rid_u32,
-                                Variant::Raw,
-                                validator_match_start,
-                                keyword_implied,
-                            ),
-                        );
                         add_pat_raw(
                             pat_map_all,
                             a,
@@ -1764,7 +1691,7 @@ impl Engine {
                 };
 
             if !allow_derive {
-                add_manual(&mut pat_map_raw, &mut pat_map_all, &mut pat_map_utf16);
+                add_manual(&mut pat_map_all, &mut pat_map_utf16);
                 continue;
             }
 
@@ -1777,7 +1704,7 @@ impl Engine {
                         anchor_plan_stats.unfilterable_rules =
                             anchor_plan_stats.unfilterable_rules.saturating_add(1);
                     }
-                    add_manual(&mut pat_map_raw, &mut pat_map_all, &mut pat_map_utf16);
+                    add_manual(&mut pat_map_all, &mut pat_map_utf16);
                     continue;
                 }
             };
@@ -1800,12 +1727,6 @@ impl Engine {
                     }
                     for anchor in anchors {
                         let keyword_implied = keyword_implied_for_anchor(&anchor);
-                        has_raw_anchor[rid] = true;
-                        add_pat_raw(
-                            &mut pat_map_raw,
-                            &anchor,
-                            Target::new(rid_u32, Variant::Raw, false, keyword_implied),
-                        );
                         add_pat_raw(
                             &mut pat_map_all,
                             &anchor,
@@ -1840,7 +1761,7 @@ impl Engine {
                         anchor_plan_stats.residue_rules =
                             anchor_plan_stats.residue_rules.saturating_add(1);
                     }
-                    add_manual(&mut pat_map_raw, &mut pat_map_all, &mut pat_map_utf16);
+                    add_manual(&mut pat_map_all, &mut pat_map_utf16);
                 }
                 TriggerPlan::Unfilterable { reason } => {
                     unfilterable_rules.push((rid, reason));
@@ -1849,13 +1770,13 @@ impl Engine {
                         anchor_plan_stats.unfilterable_rules =
                             anchor_plan_stats.unfilterable_rules.saturating_add(1);
                     }
-                    add_manual(&mut pat_map_raw, &mut pat_map_all, &mut pat_map_utf16);
+                    add_manual(&mut pat_map_all, &mut pat_map_utf16);
                 }
             }
         }
 
-        let (anchor_patterns_raw, pat_targets_raw, pat_offsets_raw) = map_to_patterns(pat_map_raw);
-        let (anchor_patterns_all, pat_targets_all, pat_offsets_all) = map_to_patterns(pat_map_all);
+        let (anchor_patterns_all, _pat_targets_all, _pat_offsets_all) =
+            map_to_patterns(pat_map_all);
         let (anchor_patterns_utf16, pat_targets_utf16, pat_offsets_utf16) =
             map_to_patterns(pat_map_utf16);
         let has_utf16_anchors = !anchor_patterns_utf16.is_empty();
@@ -1864,24 +1785,6 @@ impl Engine {
             .map(|p| p.len())
             .max()
             .unwrap_or(0);
-        let raw_density_gate = RawDensityGate::build(&anchor_patterns_raw);
-        let build_anchor_db = matches!(
-            tuning.prefilter_mode,
-            PrefilterMode::AnchorLiterals | PrefilterMode::Auto
-        );
-        let build_regex_db = matches!(
-            tuning.prefilter_mode,
-            PrefilterMode::Regex | PrefilterMode::Auto
-        );
-        let fallback_rules: Vec<usize> = if build_anchor_db {
-            has_raw_anchor
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, has_anchor)| (!has_anchor).then_some(idx))
-                .collect()
-        } else {
-            Vec::new()
-        };
 
         // Build the base64 pre-gate from the same anchor universe as the decoded gate:
         // raw anchors plus UTF-16 variants. This keeps the pre-gate *sound* with
@@ -1938,70 +1841,26 @@ impl Engine {
 
         // Required: if the DB can't be built (e.g. regex incompatibility),
         // fail fast rather than falling back to full-buffer scans.
-        let anchor_input_anchor = if build_anchor_db {
-            let (patterns, pat_targets, pat_offsets) = if tuning.scan_utf16_variants {
-                (&anchor_patterns_all, &pat_targets_all, &pat_offsets_all)
-            } else {
-                (&anchor_patterns_raw, &pat_targets_raw, &pat_offsets_raw)
-            };
-            if patterns.is_empty() {
-                None
-            } else {
-                Some(AnchorInput {
-                    patterns,
-                    pat_targets,
-                    pat_offsets,
-                    seed_radius_raw: &raw_seed_radius_bytes,
-                    seed_radius_utf16: &utf16_seed_radius_bytes,
-                })
-            }
+        let anchor_input = if tuning.scan_utf16_variants && has_utf16_anchors {
+            Some(AnchorInput {
+                patterns: &anchor_patterns_utf16,
+                pat_targets: &pat_targets_utf16,
+                pat_offsets: &pat_offsets_utf16,
+                seed_radius_raw: &raw_seed_radius_bytes,
+                seed_radius_utf16: &utf16_seed_radius_bytes,
+            })
         } else {
             None
         };
-        let anchor_input_regex =
-            if build_regex_db && tuning.scan_utf16_variants && has_utf16_anchors {
-                Some(AnchorInput {
-                    patterns: &anchor_patterns_utf16,
-                    pat_targets: &pat_targets_utf16,
-                    pat_offsets: &pat_offsets_utf16,
-                    seed_radius_raw: &raw_seed_radius_bytes,
-                    seed_radius_utf16: &utf16_seed_radius_bytes,
-                })
-            } else {
-                None
-            };
-        let vs_anchor = if build_anchor_db {
-            let raw_rule_filter = Some(fallback_rules.as_slice());
-            Some(
-                VsPrefilterDb::try_new(&rules, &tuning, anchor_input_anchor, raw_rule_filter)
-                    .expect("vectorscan anchor prefilter db build failed (fallback disabled)"),
-            )
-        } else {
-            None
-        };
-        let vs_regex = if build_regex_db {
-            Some(
-                VsPrefilterDb::try_new(&rules, &tuning, anchor_input_regex, None)
-                    .expect("vectorscan regex prefilter db build failed (fallback disabled)"),
-            )
-        } else {
-            None
-        };
-        let max_regex_width = vs_regex
+        let vs = Some(
+            VsPrefilterDb::try_new(&rules, &tuning, anchor_input)
+                .expect("vectorscan prefilter db build failed (fallback disabled)"),
+        );
+        let max_regex_width = vs
             .as_ref()
             .and_then(|db| db.max_match_width_bounded())
             .map(|w| w as usize);
-        let max_anchor_width = vs_anchor
-            .as_ref()
-            .and_then(|db| db.max_match_width_bounded())
-            .map(|w| w as usize);
-        let mut max_prefilter_width = max_anchor_pat_len;
-        if let Some(w) = max_regex_width {
-            max_prefilter_width = max_prefilter_width.max(w);
-        }
-        if let Some(w) = max_anchor_width {
-            max_prefilter_width = max_prefilter_width.max(w);
-        }
+        let max_prefilter_width = max_regex_width.unwrap_or(max_anchor_pat_len);
         let vs_stream = VsStreamDb::try_new_stream(&rules, max_decoded_cap).ok();
         let needs_decoded_gate = transforms
             .iter()
@@ -2076,9 +1935,7 @@ impl Engine {
             transforms,
             tuning,
             entropy_log2,
-            vs_regex,
-            vs_anchor,
-            raw_density_gate,
+            vs,
             vs_utf16,
             vs_utf16_stream,
             vs_stream,
@@ -2107,10 +1964,8 @@ impl Engine {
     /// Returns Vectorscan usage counters (feature: `stats`).
     #[cfg(feature = "stats")]
     pub fn vectorscan_stats(&self) -> VectorscanStats {
-        self.vs_stats.snapshot(
-            self.vs_regex.is_some() || self.vs_anchor.is_some(),
-            self.vs_utf16.is_some(),
-        )
+        self.vs_stats
+            .snapshot(self.vs.is_some(), self.vs_utf16.is_some())
     }
 
     /// Rules whose regex patterns could not be given a sound prefilter gate.
@@ -2253,6 +2108,9 @@ impl Engine {
                             continue;
                         }
                         if !transform_quick_trigger(tc, cur_buf) {
+                            continue;
+                        }
+                        if !self.base64_buffer_gate(tc, cur_buf) {
                             continue;
                         }
 
@@ -2467,6 +2325,17 @@ impl Engine {
         ScanScratch::new(self)
     }
 
+    #[inline]
+    fn base64_buffer_gate(&self, tc: &TransformConfig, buf: &[u8]) -> bool {
+        if tc.id != TransformId::Base64 || tc.gate != Gate::AnchorsInDecoded {
+            return true;
+        }
+        match &self.b64_gate {
+            Some(gate) if gate.pattern_count() > 0 => gate.hits_anywhere(buf),
+            _ => true,
+        }
+    }
+
     /// Drains compact findings from scratch and materializes provenance.
     pub fn drain_findings_materialized(&self, scratch: &mut ScanScratch, out: &mut Vec<Finding>) {
         for rec in scratch.out.drain() {
@@ -2517,103 +2386,17 @@ impl Engine {
                 .reset_touched(scratch.touched_pairs.as_slice());
             scratch.touched_pairs.clear();
         }
-        scratch.prefilter_hits = 0;
-        scratch.prefilter_hit_limit = 0;
-        scratch.prefilter_aborted = false;
-
         // Stage 1: Vectorscan prefilter on raw bytes (required).
-        #[derive(Clone, Copy)]
-        enum AutoGateState {
-            Allow,
-            Reject,
-            Missing,
-        }
-
-        #[cfg(feature = "stats")]
-        let (vs, used_anchor_db, auto_gate_state) = match self.tuning.prefilter_mode {
-            PrefilterMode::Regex => (self.vs_regex.as_ref(), false, AutoGateState::Missing),
-            PrefilterMode::AnchorLiterals => {
-                (self.vs_anchor.as_ref(), true, AutoGateState::Missing)
-            }
-            PrefilterMode::Auto => {
-                let (prefer_anchor, gate_state) = match self.raw_density_gate.as_ref() {
-                    Some(gate) => {
-                        if gate.allows_hs_strict(buf) {
-                            (true, AutoGateState::Allow)
-                        } else {
-                            (false, AutoGateState::Reject)
-                        }
-                    }
-                    None => (false, AutoGateState::Missing),
-                };
-                let (vs, used_anchor) = if prefer_anchor {
-                    if let Some(db) = self.vs_anchor.as_ref() {
-                        (Some(db), true)
-                    } else {
-                        (self.vs_regex.as_ref(), false)
-                    }
-                } else if let Some(db) = self.vs_regex.as_ref() {
-                    (Some(db), false)
-                } else if let Some(db) = self.vs_anchor.as_ref() {
-                    (Some(db), true)
-                } else {
-                    (None, false)
-                };
-                (vs, used_anchor, gate_state)
-            }
-        };
-        #[cfg(not(feature = "stats"))]
-        let (vs, used_anchor_db, _auto_gate_state) = match self.tuning.prefilter_mode {
-            PrefilterMode::Regex => (self.vs_regex.as_ref(), false, AutoGateState::Missing),
-            PrefilterMode::AnchorLiterals => {
-                (self.vs_anchor.as_ref(), true, AutoGateState::Missing)
-            }
-            PrefilterMode::Auto => {
-                let (prefer_anchor, gate_state) = match self.raw_density_gate.as_ref() {
-                    Some(gate) => {
-                        if gate.allows_hs_strict(buf) {
-                            (true, AutoGateState::Allow)
-                        } else {
-                            (false, AutoGateState::Reject)
-                        }
-                    }
-                    None => (false, AutoGateState::Missing),
-                };
-                let (vs, used_anchor) = if prefer_anchor {
-                    if let Some(db) = self.vs_anchor.as_ref() {
-                        (Some(db), true)
-                    } else {
-                        (self.vs_regex.as_ref(), false)
-                    }
-                } else if let Some(db) = self.vs_regex.as_ref() {
-                    (Some(db), false)
-                } else if let Some(db) = self.vs_anchor.as_ref() {
-                    (Some(db), true)
-                } else {
-                    (None, false)
-                };
-                (vs, used_anchor, gate_state)
-            }
-        };
-        let mut vs = vs.expect("vectorscan prefilter database unavailable (fallback disabled)");
-        if used_anchor_db && matches!(self.tuning.prefilter_mode, PrefilterMode::Auto) {
-            let mut limit = buf.len() / 512;
-            limit = limit.clamp(64, 10_000);
-            scratch.prefilter_hit_limit = limit as u32;
-        }
-        let mut use_direct_raw =
-            !used_anchor_db && self.tuning.vs_direct_raw_regex && vs.supports_som();
-        let mut vs_scratch = if used_anchor_db {
-            scratch
-                .vs_anchor_scratch
-                .take()
-                .expect("vectorscan anchor scratch missing")
-        } else {
-            scratch
-                .vs_regex_scratch
-                .take()
-                .expect("vectorscan regex scratch missing")
-        };
+        let used_vectorscan = true;
+        let vs = self
+            .vs
+            .as_ref()
+            .expect("vectorscan prefilter database unavailable (fallback disabled)");
+        let use_direct_raw = self.tuning.vs_direct_raw_regex && vs.supports_som();
+        let mut vs_scratch = scratch
+            .vs_scratch
+            .take()
+            .expect("vectorscan scratch missing");
         #[cfg(feature = "stats")]
         self.vs_stats
             .scans_attempted
@@ -2624,44 +2407,8 @@ impl Engine {
         } else {
             vs.scan_raw(buf, scratch, &mut vs_scratch)
         };
-        if used_anchor_db {
-            scratch.vs_anchor_scratch = Some(vs_scratch);
-        } else {
-            scratch.vs_regex_scratch = Some(vs_scratch);
-        }
-        #[cfg(feature = "stats")]
-        if matches!(self.tuning.prefilter_mode, PrefilterMode::Auto) {
-            match auto_gate_state {
-                AutoGateState::Allow => self
-                    .vs_stats
-                    .auto_gate_allow
-                    .fetch_add(1, Ordering::Relaxed),
-                AutoGateState::Reject => self
-                    .vs_stats
-                    .auto_gate_reject
-                    .fetch_add(1, Ordering::Relaxed),
-                AutoGateState::Missing => self
-                    .vs_stats
-                    .auto_gate_missing
-                    .fetch_add(1, Ordering::Relaxed),
-            };
-            if used_anchor_db {
-                self.vs_stats
-                    .auto_anchor_scans
-                    .fetch_add(1, Ordering::Relaxed);
-                self.vs_stats
-                    .auto_anchor_bytes
-                    .fetch_add(buf.len() as u64, Ordering::Relaxed);
-            } else {
-                self.vs_stats
-                    .auto_regex_scans
-                    .fetch_add(1, Ordering::Relaxed);
-                self.vs_stats
-                    .auto_regex_bytes
-                    .fetch_add(buf.len() as u64, Ordering::Relaxed);
-            }
-        }
-        let mut saw_utf16 = match result {
+        scratch.vs_scratch = Some(vs_scratch);
+        let saw_utf16 = match result {
             Ok(saw) => {
                 #[cfg(feature = "stats")]
                 self.vs_stats.scans_ok.fetch_add(1, Ordering::Relaxed);
@@ -2673,50 +2420,6 @@ impl Engine {
                 panic!("vectorscan scan failed with fallback disabled: {err}");
             }
         };
-        if used_anchor_db
-            && matches!(self.tuning.prefilter_mode, PrefilterMode::Auto)
-            && scratch.prefilter_aborted
-        {
-            #[cfg(feature = "stats")]
-            self.vs_stats
-                .auto_anchor_aborts
-                .fetch_add(1, Ordering::Relaxed);
-            scratch
-                .hit_acc_pool
-                .reset_touched(scratch.touched_pairs.as_slice());
-            scratch.touched_pairs.clear();
-            scratch.prefilter_hits = 0;
-            scratch.prefilter_hit_limit = 0;
-            scratch.prefilter_aborted = false;
-
-            if let Some(vs_regex) = self.vs_regex.as_ref() {
-                let mut vs_scratch = scratch
-                    .vs_regex_scratch
-                    .take()
-                    .expect("vectorscan regex scratch missing");
-                #[cfg(feature = "stats")]
-                self.vs_stats
-                    .scans_attempted
-                    .fetch_add(1, Ordering::Relaxed);
-                let result = vs_regex.scan_raw(buf, scratch, &mut vs_scratch);
-                scratch.vs_regex_scratch = Some(vs_scratch);
-                match result {
-                    Ok(saw) => {
-                        #[cfg(feature = "stats")]
-                        self.vs_stats.scans_ok.fetch_add(1, Ordering::Relaxed);
-                        saw_utf16 = saw;
-                    }
-                    Err(err) => {
-                        #[cfg(feature = "stats")]
-                        self.vs_stats.scans_err.fetch_add(1, Ordering::Relaxed);
-                        panic!("vectorscan scan failed with fallback disabled: {err}");
-                    }
-                }
-                use_direct_raw = false;
-                vs = vs_regex;
-            }
-        }
-        let used_vectorscan = true;
 
         let used_vectorscan_utf16 = saw_utf16;
 

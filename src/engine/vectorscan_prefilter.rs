@@ -99,6 +99,7 @@ pub(crate) struct VsPrefilterDb {
     /// Byte length of each anchor pattern.
     anchor_pat_lens: Vec<u32>,
     /// Cap used by hit accumulators.
+    /// Maps to `Tuning::max_anchor_hits_per_rule_variant` at build time.
     max_hits_per_rule_variant: usize,
     /// Max bounded width across all rules.
     max_width: u32,
@@ -421,7 +422,11 @@ pub(crate) struct VsStreamWindow {
     pub(crate) force_full: bool,
 }
 
-/// Callback context for stream-mode scans.
+/// Callback context for stream-mode scans on decoded byte streams.
+///
+/// Unlike `VsUtf16StreamMatchCtx`, this does not include a `base_offset` field
+/// because standard stream scanning processes the entire decoded buffer in a
+/// single stream, so match offsets are already absolute within that buffer.
 ///
 /// Safety invariants:
 /// - `pending` points to a live `Vec<VsStreamWindow>` for the duration of the scan.
@@ -436,6 +441,11 @@ pub(crate) struct VsStreamMatchCtx {
 }
 
 /// Callback context for UTF-16 anchor stream scans.
+///
+/// Unlike `VsStreamMatchCtx`, this includes a `base_offset` field because UTF-16
+/// decoded streams may be processed across multiple chunks, and each scan_stream
+/// call reports offsets relative to that chunk. `base_offset` translates those
+/// stream-local offsets into absolute positions within the full decoded output.
 ///
 /// Safety invariants:
 /// - `pending` points to a live `Vec<VsStreamWindow>` for the duration of the scan.
@@ -1358,7 +1368,6 @@ impl VsPrefilterDb {
         rules: &[RuleSpec],
         tuning: &Tuning,
         anchor: Option<AnchorInput<'_>>,
-        raw_rule_filter: Option<&[usize]>,
     ) -> Result<Self, String> {
         const RAW_FLAGS: c_uint = vs::HS_FLAG_PREFILTER as c_uint;
         const USE_SOM: bool = false;
@@ -1377,14 +1386,7 @@ impl VsPrefilterDb {
         let mut max_width = 0u32;
         let mut unbounded = false;
 
-        let raw_iter: Box<dyn Iterator<Item = (usize, &RuleSpec)>> =
-            if let Some(filter) = raw_rule_filter {
-                Box::new(filter.iter().copied().map(|rid| (rid, &rules[rid])))
-            } else {
-                Box::new(rules.iter().enumerate())
-            };
-
-        for (rid, r) in raw_iter {
+        for (rid, r) in rules.iter().enumerate() {
             let seed_radius = if let Some(tp) = &r.two_phase {
                 tp.seed_radius
             } else {
@@ -1858,15 +1860,6 @@ extern "C" fn vs_on_match(
 
         // SAFETY: `scratch` is valid for the duration of the scan and is not used concurrently.
         let scratch = unsafe { &mut *c.scratch };
-        if scratch.prefilter_hit_limit != 0 {
-            let new_hits = scratch.prefilter_hits.saturating_add(1);
-            if new_hits >= scratch.prefilter_hit_limit {
-                scratch.prefilter_hits = new_hits;
-                scratch.prefilter_aborted = true;
-                return vs::HS_SCAN_TERMINATED as c_int;
-            }
-            scratch.prefilter_hits = new_hits;
-        }
 
         const RAW_IDX: usize = 0;
 
@@ -1931,16 +1924,6 @@ extern "C" fn vs_on_match(
 
     // SAFETY: `scratch` is valid for the duration of the scan and not used concurrently.
     let scratch = unsafe { &mut *c.scratch };
-    if scratch.prefilter_hit_limit != 0 {
-        let incr = off_end.saturating_sub(off_start) as u32;
-        let new_hits = scratch.prefilter_hits.saturating_add(incr);
-        if new_hits >= scratch.prefilter_hit_limit {
-            scratch.prefilter_hits = new_hits;
-            scratch.prefilter_aborted = true;
-            return vs::HS_SCAN_TERMINATED as c_int;
-        }
-        scratch.prefilter_hits = new_hits;
-    }
 
     for i in off_start..off_end {
         let target = unsafe { *c.anchor_targets.add(i) };

@@ -1,6 +1,5 @@
 use crate::api::{
-    AnchorPolicy, Gate, PrefilterMode, RuleSpec, TransformConfig, TransformId, TransformMode,
-    Tuning,
+    AnchorPolicy, Gate, RuleSpec, TransformConfig, TransformId, TransformMode, Tuning,
 };
 use crate::engine::Engine;
 use crate::gitleaks_rules::gitleaks_rules;
@@ -100,6 +99,5 @@ pub fn demo_tuning() -> Tuning {
         max_findings_per_chunk: 8192,
         scan_utf16_variants: true,
         vs_direct_raw_regex: false,
-        prefilter_mode: PrefilterMode::Auto,
     }
 }

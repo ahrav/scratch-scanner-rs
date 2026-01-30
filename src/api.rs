@@ -88,9 +88,15 @@ pub enum TransformMode {
     Always,
 
     /// Correctness trade (explicit).
-    /// Skips this transform if this buffer already produced any findings.
-    /// Findings are scoped to the current buffer (derived buffers are not considered).
-    /// This can miss findings that only appear in nested encodings.
+    /// Skips this transform if the *current buffer* already produced any findings.
+    ///
+    /// Scope: This only considers findings from the current buffer being scanned;
+    /// findings from parent buffers (that produced this one) or child buffers
+    /// (derived via earlier transforms) are not considered. Each buffer tracks
+    /// its own "has findings" flag independently.
+    ///
+    /// This can miss findings that only appear in nested encodings (e.g., base64
+    /// inside URL-encoded content).
     IfNoFindingsInThisBuffer,
 }
 
@@ -104,7 +110,10 @@ pub enum Gate {
     /// (raw + UTF-16LE/BE variants).
     ///
     /// This is only sound when anchors are required for a rule (the default),
-    /// because the gate ignores non-anchor-only matches.
+    /// because the gate ignores non-anchor-only matches. False negatives are
+    /// possible when anchors are optional (e.g., rules with `|` alternation where
+    /// some branches have no anchor). Use `Gate::None` for such rules if
+    /// completeness is critical.
     AnchorsInDecoded,
 }
 
@@ -538,8 +547,11 @@ pub struct RuleSpec {
     /// single-pass, chunked scanning (no global context) while filtering noisy
     /// windows cheaply via memmem.
     ///
-    /// Keywords are compiled into raw + UTF-16LE/BE variants the same way anchors
-    /// are, so the gate works consistently across encodings.
+    /// # Encoding behavior
+    /// Keywords are evaluated on the *raw representation* of the window (i.e., the
+    /// bytes as they appear after any transform decoding, before UTF-8 interpretation).
+    /// Like anchors, keywords are compiled into raw + UTF-16LE/BE variants so the
+    /// gate works consistently whether scanning raw buffers or decoded UTF-16 content.
     pub keywords_any: Option<&'static [&'static [u8]]>,
 
     /// Optional entropy gate evaluated on each regex match.
@@ -663,14 +675,14 @@ pub struct Tuning {
     ///
     /// This uses the Vectorscan regex engine as the primary matcher for raw
     /// rules and still applies post-match entropy gating.
-    pub vs_direct_raw_regex: bool,
-
-    /// Selects the raw prefilter strategy.
     ///
-    /// - `Regex`: Use Vectorscan regex prefilters (default).
-    /// - `AnchorLiterals`: Use Vectorscan literal anchor patterns (raw + UTF-16)
-    ///   with fanout targets; rules without anchors fall back to regex prefiltering.
-    pub prefilter_mode: PrefilterMode,
+    /// # Behavior details
+    /// - Skips window expansion: match bounds come directly from Vectorscan.
+    /// - Still applies entropy gates if configured on the rule.
+    /// - May improve throughput for rules where Vectorscan's match bounds are
+    ///   already tight, but can miss findings if the rule regex differs from
+    ///   what Vectorscan compiled (e.g., due to flag differences).
+    pub vs_direct_raw_regex: bool,
 }
 
 impl Tuning {
@@ -709,16 +721,4 @@ pub enum AnchorPolicy {
     ManualOnly,
     /// Only use derived anchors; ignore manual anchors entirely.
     DerivedOnly,
-}
-
-/// Raw prefilter strategy for Stage 1 window seeding.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PrefilterMode {
-    /// Choose between regex and anchor-literal prefilters based on rule
-    /// characteristics (anchor count, regex complexity, expected selectivity).
-    Auto,
-    /// Use Vectorscan regex prefilters for all rules.
-    Regex,
-    /// Use Vectorscan literal anchor patterns; unanchored rules fall back to regex.
-    AnchorLiterals,
 }

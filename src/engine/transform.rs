@@ -439,6 +439,9 @@ impl Base64SpanStream {
     }
 
     /// Flush a trailing run at end-of-stream, trimming trailing whitespace.
+    ///
+    /// The `_end_offset` parameter is accepted for API symmetry with `UrlSpanStream`
+    /// but is unused here; base64 spans are self-delimiting by trailing whitespace.
     pub(super) fn finish<F>(&mut self, _end_offset: u64, mut on_span: F)
     where
         F: FnMut(u64, u64) -> bool,
@@ -628,7 +631,9 @@ fn stream_decode_url_percent(
         out[n] = decoded;
         n += 1;
 
-        // Leave headroom so we can always write the next decoded byte.
+        // Leave 4 bytes of headroom to safely write the next decoded output.
+        // URL decoding produces 1 byte per decode; base64 can produce up to 3.
+        // Using 4 covers both cases with a small margin.
         if n >= out.len() - 4 {
             match flush_buf(&mut out, &mut n, &mut on_bytes) {
                 ControlFlow::Continue(()) => {}
@@ -967,7 +972,7 @@ pub(super) fn transform_quick_trigger(tc: &TransformConfig, buf: &[u8]) -> bool 
             }
             false
         }
-        TransformId::Base64 => true, // span finder is the real filter; keep trigger cheap
+        TransformId::Base64 => true, // span finder is the real filter; engine applies anchor gate when enabled
     }
 }
 

@@ -187,6 +187,51 @@ impl Base64YaraGate {
         self.scan_with_state(encoded, &mut st)
     }
 
+    /// One-shot scan over a whole buffer, treating '=' as a boundary.
+    ///
+    /// This is a conservative buffer-level prefilter: it scans across multiple
+    /// spans and ignores padding boundaries so a single call can cover the
+    /// entire buffer. It may return more false positives than `hits`, but it
+    /// will not introduce false negatives for valid base64 runs.
+    ///
+    /// # Difference from `hits`
+    /// - `hits_anywhere`: Treats '=' as a boundary (resets state) but continues
+    ///   scanning the rest of the buffer. Suitable for whole-buffer prefiltering.
+    /// - `hits`: Respects `PaddingPolicy` and may halt entirely on '=' (with
+    ///   `StopAndHalt`). Suitable for per-span scanning with precise boundaries.
+    #[inline]
+    pub fn hits_anywhere(&self, encoded: &[u8]) -> bool {
+        let mut state = 0usize;
+        let lut = input_lut(self.whitespace_policy);
+
+        for &b in encoded {
+            let v = lut[b as usize];
+            if v < 64 {
+                let sym = v as usize;
+                state = self.ac.next_state(state, sym);
+                if self.ac.is_match(state) {
+                    return true;
+                }
+                continue;
+            }
+
+            if v == TAG_WS {
+                continue;
+            }
+
+            if v == TAG_PAD {
+                // Treat padding as a boundary and continue scanning.
+                state = 0;
+                continue;
+            }
+
+            // Any other byte breaks the run; restart from the root state.
+            state = 0;
+        }
+
+        false
+    }
+
     /// Incremental scan. Useful if your base64 span crosses chunk boundaries.
     ///
     /// Caller must reset state between independent spans/runs.
@@ -214,6 +259,8 @@ impl Base64YaraGate {
 
         // Defensive: if a state from another gate is reused, avoid panicking.
         // This trades perfect streaming semantics for resilience against misuse.
+        // An invalid state (>= state_count) silently restarts from the root,
+        // which may miss a match that spans the boundary but prevents crashes.
         let mut state = st.state as usize;
         if state >= self.ac.state_count() {
             state = 0;
@@ -386,8 +433,11 @@ fn base64_encode_std(input: &[u8]) -> Vec<u8> {
 // Runtime normalization
 // -----------------------------
 
+/// Marker for bytes that are not valid base64 alphabet characters.
 const TAG_INVALID: u8 = 0xFF;
+/// Marker for whitespace bytes (space, newline, tab, etc.) to be skipped.
 const TAG_WS: u8 = 0xFE;
+/// Marker for padding character '=' which may reset or halt the automaton.
 const TAG_PAD: u8 = 0xFD;
 
 #[inline]
@@ -909,6 +959,22 @@ mod tests {
         // If scanning continues after '=', this would match.
         let encoded = b"AAAA=dGVzdA";
         assert!(!gate.hits(encoded));
+    }
+
+    #[test]
+    fn hits_anywhere_continues_after_padding() {
+        let gate = Base64YaraGate::build(
+            [b"abc".as_slice()],
+            Base64YaraGateConfig {
+                min_pattern_len: 4,
+                padding_policy: PaddingPolicy::StopAndHalt,
+                ..Default::default()
+            },
+        );
+
+        let encoded = b"foo=YWJj";
+        assert!(!gate.hits(encoded));
+        assert!(gate.hits_anywhere(encoded));
     }
 
     #[test]
