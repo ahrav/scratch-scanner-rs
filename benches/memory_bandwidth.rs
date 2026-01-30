@@ -40,6 +40,10 @@ use std::alloc::{alloc, dealloc, Layout};
 // ============================================================================
 
 /// Cache line alignment for Apple Silicon (128 bytes).
+///
+/// Apple M-series chips use 128-byte cache lines (vs 64 bytes on x86).
+/// Aligning buffers to this boundary prevents false sharing and ensures
+/// clean cache line boundaries for accurate bandwidth measurements.
 const CACHE_LINE_ALIGN: usize = 128;
 
 /// Allocate a cache-line-aligned buffer of `n` elements.
@@ -66,6 +70,15 @@ fn aligned_dealloc<T>(ptr: *mut T, n: usize) {
 }
 
 /// RAII wrapper for aligned allocations.
+///
+/// Manages cache-line-aligned memory for benchmark buffers.
+/// Uses raw pointers internally to guarantee alignment that `Vec<T>`
+/// cannot provide (Vec aligns to `align_of::<T>()`, not cache lines).
+///
+/// # Safety
+/// - `ptr` is always non-null and valid for `len` elements
+/// - Memory is initialized with `T::default()` on construction
+/// - Proper deallocation is handled by `Drop`
 struct AlignedBuffer<T: Copy + Default> {
     ptr: *mut T,
     len: usize,
@@ -114,6 +127,13 @@ const CACHE_PROBE_SIZES: &[(u64, &str)] = &[
 // ============================================================================
 // 1. STREAM Benchmarks (Classic Memory Bandwidth)
 // ============================================================================
+//
+// Based on McCalpin's STREAM benchmark (https://www.cs.virginia.edu/stream/).
+// These kernels measure sustainable memory bandwidth for simple operations.
+// The "bytes moved" calculation accounts for both reads and writes to memory.
+//
+// Copy/Scale: 2N bytes (read src, write dst)
+// Add/Triad:  3N bytes (read src1, read src2, write dst)
 
 /// STREAM Copy: a[i] = b[i] (2N bytes moved)
 fn bench_stream_copy(c: &mut Criterion) {
@@ -263,6 +283,14 @@ fn bench_stream_triad(c: &mut Criterion) {
 // ============================================================================
 // 2. Cache Hierarchy Probing
 // ============================================================================
+//
+// These benchmarks reveal cache level transitions by varying buffer size.
+// Apple M-series typical hierarchy:
+//   - L1D: ~128KB per P-core (192 KB on M3), ~64KB per E-core
+//   - L2:  ~16MB shared (varies by chip)
+//   - RAM: Unified memory, 100-400 GB/s aggregate bandwidth
+//
+// Expect distinct "knees" in throughput as working set exceeds each cache level.
 
 /// Sequential read of u64 values.
 fn bench_cache_sequential_read(c: &mut Criterion) {
@@ -353,8 +381,20 @@ fn bench_cache_read_modify_write(c: &mut Criterion) {
 // ============================================================================
 // 3. Random Access Patterns
 // ============================================================================
+//
+// Random access benchmarks reveal memory latency rather than bandwidth.
+// Sequential access hides latency via prefetching; random access cannot.
+//
+// Key insights:
+// - Small buffers (< L2): Random ≈ sequential due to cache residency
+// - Large buffers (> L2): Random degrades dramatically (each access = cache miss)
+// - Useful for sizing data structures that benefit from cache locality
 
-/// Simple LCG for deterministic random indices.
+/// Linear Congruential Generator for deterministic random indices.
+///
+/// Uses Knuth's MMIX LCG constants (multiplier: 6364136223846793005, increment: 1).
+/// Full 64-bit period ensures no repeated indices within benchmark iteration counts.
+/// Deterministic seeding guarantees reproducible access patterns across runs.
 #[inline]
 fn lcg_next(state: &mut u64) -> u64 {
     *state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -545,6 +585,14 @@ fn bench_copy_from_slice(c: &mut Criterion) {
 // ============================================================================
 // 5. Byte Scanning Ceiling
 // ============================================================================
+//
+// These benchmarks establish the theoretical maximum speed for byte-by-byte
+// operations - the "ceiling" that any scanner/parser/decoder cannot exceed.
+//
+// Compare your actual scanner throughput against these baselines:
+// - If scanner < 50% of sum_scalar: significant optimization opportunity
+// - If scanner ≈ memchr throughput: likely memory-bound, well optimized
+// - If scanner > memchr: verify benchmark methodology (shouldn't be possible)
 
 /// Sum all bytes (scalar).
 fn bench_byte_scan_sum(c: &mut Criterion) {
@@ -673,8 +721,27 @@ fn bench_byte_count_scalar(c: &mut Criterion) {
 // ============================================================================
 // 6. SIMD vs Scalar (aarch64/NEON)
 // ============================================================================
+//
+// Direct comparison between hand-written NEON intrinsics and scalar loops.
+// On Apple Silicon, LLVM auto-vectorization is often excellent, so these
+// benchmarks answer: "Is manual SIMD worth the complexity?"
+//
+// Typical findings:
+// - Small buffers (L1): SIMD overhead may hurt; scalar is fine
+// - Large buffers (RAM-bound): Both hit memory ceiling; SIMD helps less
+// - Mid-size (L2): SIMD shines with 2-4x speedup
 
 /// NEON sum_bytes (64 bytes/iteration using 4x 128-bit registers).
+///
+/// # Strategy
+/// - **4x unrolling**: Processes 64 bytes per loop iteration (4 × 16-byte vectors).
+///   This saturates the memory bus and hides instruction latency.
+/// - **u16 accumulators**: Uses `vpadalq_u8` (pairwise add and accumulate) to widen
+///   u8 values to u16, preventing overflow until final reduction.
+/// - **Separate accumulators**: Four independent `acc0..acc3` avoid data dependencies
+///   between loop iterations, enabling out-of-order execution.
+///
+/// Expected throughput: Near memory bandwidth ceiling for large buffers.
 #[cfg(target_arch = "aarch64")]
 fn bench_simd_sum_bytes(c: &mut Criterion) {
     use std::arch::aarch64::*;
@@ -743,7 +810,17 @@ fn bench_simd_sum_bytes(c: &mut Criterion) {
     group.finish();
 }
 
-/// NEON find_byte.
+/// NEON find_byte using vectorized comparison.
+///
+/// # Strategy
+/// - **16-byte chunks**: Compares 16 bytes simultaneously using `vceqq_u8`.
+/// - **Fast bailout**: Uses `vmaxvq_u8` to check if any lane matched (non-zero = found).
+///   This avoids extracting individual lane results on every iteration.
+/// - **Fallback scan**: On match detection, scalar loop finds exact position within chunk.
+///   This is rare (target at end), so cold-path overhead is acceptable.
+///
+/// Trade-off: Less sophisticated than memchr's multi-needle optimizations,
+/// but demonstrates raw NEON comparison throughput ceiling.
 #[cfg(target_arch = "aarch64")]
 fn bench_simd_find_byte(c: &mut Criterion) {
     use std::arch::aarch64::*;
