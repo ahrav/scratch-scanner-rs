@@ -50,6 +50,10 @@ harness = false
 required-features = ["bench"]
 
 [[bench]]
+name = "set_associative_cache"
+harness = false
+
+[[bench]]
 name = "ring_buffer"
 harness = false
 
