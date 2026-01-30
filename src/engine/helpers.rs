@@ -1,15 +1,21 @@
 //! Helper routines for window merging, entropy gating, UTF-16 decode, and hashing.
 //!
 //! # Invariants
-//! - Window merge helpers expect input ranges sorted by `start`.
-//! - Prefilter and entropy helpers must never drop true positives.
+//! - Window merge helpers expect input ranges sorted by `start` and normalized
+//!   (`start <= end`).
+//! - Prefilter helpers must be conservative: they may allow false positives but
+//!   must not drop candidates that could satisfy full rule validation.
 //!
 //! # Design Notes
 //! - Window merging widens spans to trade small extra scanning for fewer passes.
 //! - Entropy gating is conservative: short samples always pass.
+//! - UTF-16 anchor helpers are byte-wise wideners (ASCII-focused), not general
+//!   UTF-8 -> UTF-16 conversion.
 //! - UTF-16 decoding uses replacement characters and enforces output limits.
 
-use super::{EntropyCompiled, EntropyScratch, PackedPatterns, SpanU32};
+use super::hit_pool::SpanU32;
+use super::rule_repr::{EntropyCompiled, PackedPatterns};
+use super::scratch::EntropyScratch;
 use crate::scratch_memory::ScratchVec;
 use memchr::memmem;
 
@@ -21,14 +27,16 @@ use memchr::memmem;
 ///
 /// # Preconditions
 /// - `ranges` must be sorted by `start` ascending.
+/// - Each span is normalized (`start <= end`).
 ///
 /// # Effects
-/// - Adjacent ranges within `gap` bytes are merged into a single window.
+/// - Adjacent or overlapping ranges within `gap` bytes are merged into a single window.
 /// - Output remains sorted and non-overlapping.
 ///
 /// # Design Notes
 /// - The soft gap reduces the number of regex runs at the cost of slightly
 ///   wider windows.
+/// - `gap == 0` behaves like a standard overlap/adjacency merge.
 ///
 /// # Complexity
 /// - O(n) time, O(1) extra space.
@@ -61,12 +69,14 @@ pub(super) fn merge_ranges_with_gap_sorted(ranges: &mut ScratchVec<SpanU32>, gap
 ///
 /// # Preconditions
 /// - `ranges` must be sorted by `start` ascending.
+/// - Each span is normalized (`start <= end`) and bounded by `hay_len`.
 /// - `ranges` should already be lightly merged with a small gap when possible.
 ///
 /// # Effects
-/// - Expands the merge gap exponentially to reduce the window count.
-/// - If still over the cap, collapses to a single window.
-/// - The final ranges are a superset of the original windows.
+/// - Expands the merge gap exponentially to reduce the window count (capped at `hay_len`).
+/// - If still over the cap, collapses to a single window spanning the first/last range
+///   (clamped to `hay_len`).
+/// - The final ranges are a superset of the original windows (given the preconditions).
 ///
 /// # Complexity
 /// - O(n log G) where G is the number of gap doublings, O(1) extra space.
@@ -107,6 +117,10 @@ pub(super) fn coalesce_under_pressure_sorted(
 /// # Preconditions
 /// - `needles.offsets` indexes into `needles.bytes` and is monotonically
 ///   increasing. Each interval denotes one pattern.
+/// - `needles` uses a prefix-sum offset table (last offset == `needles.bytes.len()`).
+///
+/// # Behavior
+/// - Returns false when `needles` contains no patterns.
 pub(super) fn contains_any_memmem(hay: &[u8], needles: &PackedPatterns) -> bool {
     let count = needles.offsets.len().saturating_sub(1);
     for i in 0..count {
@@ -125,6 +139,10 @@ pub(super) fn contains_any_memmem(hay: &[u8], needles: &PackedPatterns) -> bool 
 /// # Preconditions
 /// - `needles.offsets` indexes into `needles.bytes` and is monotonically
 ///   increasing. Each interval denotes one pattern.
+/// - `needles` uses a prefix-sum offset table (last offset == `needles.bytes.len()`).
+///
+/// # Behavior
+/// - Returns true when `needles` contains no patterns.
 pub(super) fn contains_all_memmem(hay: &[u8], needles: &PackedPatterns) -> bool {
     let count = needles.offsets.len().saturating_sub(1);
     for i in 0..count {
@@ -144,7 +162,8 @@ pub(super) fn contains_all_memmem(hay: &[u8], needles: &PackedPatterns) -> bool 
 
 /// Precomputes log2 values for entropy calculations.
 ///
-/// The table is sized to the maximum entropy window length across rules.
+/// The table is sized to the maximum entropy window length across rules and
+/// can be shared across entropy checks to avoid repeated `log2` calls.
 /// Index 0 is unused; index 1 is log2(1) = 0.
 pub(super) fn build_log2_table(max: usize) -> Vec<f32> {
     let len = max.saturating_add(1).max(2);
@@ -168,6 +187,7 @@ fn log2_lookup(table: &[f32], n: usize) -> f32 {
 ///
 /// # Effects
 /// - Uses and resets `scratch` for histogram bookkeeping.
+/// - `scratch` contents are unspecified after return; it is meant for reuse.
 ///
 /// # Returns
 /// - 0.0 for empty input.
@@ -219,6 +239,9 @@ fn shannon_entropy_bits_per_byte(
 /// # Behavior
 /// - Buffers shorter than `spec.min_len` always pass (entropy is noisy).
 /// - Longer buffers are capped at `spec.max_len` for the computation.
+///
+/// # Preconditions
+/// - `spec.min_len <= spec.max_len` and `spec.min_bits_per_byte` is in [0.0, 8.0].
 #[inline]
 pub(super) fn entropy_gate_passes(
     spec: &EntropyCompiled,
@@ -242,6 +265,10 @@ pub(super) fn entropy_gate_passes(
 // --------------------------
 
 /// Produces the UTF-16LE byte sequence for a UTF-8 anchor.
+///
+/// This is a byte-wise widening (`b, 0`), not a full UTF-8 -> UTF-16 conversion.
+/// It is correct for ASCII anchors and for matching UTF-16 text that encodes
+/// those ASCII bytes.
 pub(super) fn utf16le_bytes(anchor: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(anchor.len() * 2);
     for &b in anchor {
@@ -252,6 +279,10 @@ pub(super) fn utf16le_bytes(anchor: &[u8]) -> Vec<u8> {
 }
 
 /// Produces the UTF-16BE byte sequence for a UTF-8 anchor.
+///
+/// This is a byte-wise widening (`0, b`), not a full UTF-8 -> UTF-16 conversion.
+/// It is correct for ASCII anchors and for matching UTF-16 text that encodes
+/// those ASCII bytes.
 pub(super) fn utf16be_bytes(anchor: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(anchor.len() * 2);
     for &b in anchor {
@@ -269,6 +300,10 @@ pub(super) enum Utf16DecodeError {
 
 #[cfg(test)]
 /// Decodes UTF-16LE into a UTF-8 `Vec`, enforcing a maximum output size.
+///
+/// # Behavior
+/// - Ignores a trailing odd byte (incomplete code unit).
+/// - Replaces invalid sequences with U+FFFD.
 pub(super) fn decode_utf16le_to_vec(
     input: &[u8],
     max_out: usize,
@@ -280,6 +315,10 @@ pub(super) fn decode_utf16le_to_vec(
 
 #[cfg(test)]
 /// Decodes UTF-16BE into a UTF-8 `Vec`, enforcing a maximum output size.
+///
+/// # Behavior
+/// - Ignores a trailing odd byte (incomplete code unit).
+/// - Replaces invalid sequences with U+FFFD.
 pub(super) fn decode_utf16be_to_vec(
     input: &[u8],
     max_out: usize,
@@ -323,6 +362,11 @@ fn decode_utf16_to_vec_inner(
 
 /// Decodes UTF-16LE into the provided scratch buffer.
 ///
+/// # Behavior
+/// - Clears `out` before writing.
+/// - Ignores a trailing odd byte (incomplete code unit).
+/// - Replaces invalid sequences with U+FFFD.
+///
 /// # Errors
 /// - `OutputTooLarge` if the result would exceed `max_out` or buffer capacity.
 pub(super) fn decode_utf16le_to_buf(
@@ -334,6 +378,11 @@ pub(super) fn decode_utf16le_to_buf(
 }
 
 /// Decodes UTF-16BE into the provided scratch buffer.
+///
+/// # Behavior
+/// - Clears `out` before writing.
+/// - Ignores a trailing odd byte (incomplete code unit).
+/// - Replaces invalid sequences with U+FFFD.
 ///
 /// # Errors
 /// - `OutputTooLarge` if the result would exceed `max_out` or buffer capacity.
@@ -347,6 +396,11 @@ pub(super) fn decode_utf16be_to_buf(
 
 /// Decodes UTF-16 into a scratch buffer, using replacement characters for
 /// invalid sequences.
+///
+/// # Behavior
+/// - Clears `out` before writing.
+/// - Ignores a trailing odd byte (incomplete code unit).
+/// - On error, `out` may contain a truncated prefix; treat its contents as unspecified.
 ///
 /// # Errors
 /// - `OutputTooLarge` if the result would exceed `max_out` or buffer capacity.
@@ -409,6 +463,9 @@ pub(super) fn hash128(bytes: &[u8]) -> u128 {
 }
 
 /// Returns the smallest power of two greater than or equal to `v`.
+///
+/// # Behavior
+/// - Returns 1 when `v == 0`.
 pub(super) fn pow2_at_least(v: usize) -> usize {
     v.next_power_of_two()
 }

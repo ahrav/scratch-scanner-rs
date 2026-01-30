@@ -5,12 +5,12 @@ edition = "2021"
 
 [dependencies]
 aegis = "0.9"
-aho-corasick = "1.1"
 ahash = "0.8"
 libc = "0.2"
 memchr = "2.6"
 regex = "1.10"
 regex-syntax = "0.8"
+vectorscan-rs-sys = "0.0.5"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.6"
@@ -72,6 +72,11 @@ harness = false
 [[bench]]
 name = "released_set"
 harness = false
+
+[[bench]]
+name = "validator"
+harness = false
+required-features = ["bench"]
 
 [profile.dev]
 opt-level = 1

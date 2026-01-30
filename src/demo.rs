@@ -31,6 +31,15 @@ pub fn demo_engine_with_anchor_mode(mode: AnchorMode) -> Engine {
     Engine::new_with_anchor_policy(demo_rules(), demo_transforms(), demo_tuning(), policy)
 }
 
+/// Builds a demo engine with the specified anchor mode and tuning.
+pub fn demo_engine_with_anchor_mode_and_tuning(mode: AnchorMode, tuning: Tuning) -> Engine {
+    let policy = match mode {
+        AnchorMode::Manual => AnchorPolicy::ManualOnly,
+        AnchorMode::Derived => AnchorPolicy::DerivedOnly,
+    };
+    Engine::new_with_anchor_policy(demo_rules(), demo_transforms(), tuning, policy)
+}
+
 /// Builds a demo engine with the specified anchor mode and transform depth cap.
 pub fn demo_engine_with_anchor_mode_and_max_transform_depth(
     mode: AnchorMode,
@@ -77,7 +86,7 @@ pub(crate) fn demo_transforms() -> Vec<TransformConfig> {
     ]
 }
 
-pub(crate) fn demo_tuning() -> Tuning {
+pub fn demo_tuning() -> Tuning {
     Tuning {
         merge_gap: 64,
         max_windows_per_rule_variant: 16,
@@ -89,8 +98,6 @@ pub(crate) fn demo_tuning() -> Tuning {
         max_work_items: 256,
         max_findings_per_chunk: 8192,
         scan_utf16_variants: true,
-        ac_kind: crate::api::AnchorAcKind::DFA,
-        ac_dense_depth: None,
-        ac_byte_classes: None,
+        vs_direct_raw_regex: false,
     }
 }

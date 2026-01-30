@@ -16,7 +16,7 @@ flowchart TB
     end
 
     subgraph Phase2["Phase 2: Window Building"]
-        HitAcc["HitAccumulator<br/>per (rule, variant)"]
+        HitAcc["HitAccPool<br/>per (rule, variant)"]
         Merge["merge_ranges_with_gap_sorted()<br/>gap=64"]
         Coalesce["coalesce_under_pressure_sorted()<br/>max_windows=16"]
     end
@@ -92,8 +92,9 @@ for m in self.ac_anchors.find_overlapping_iter(buf) {
         let variant = t.variant(); // Raw/Utf16Le/Utf16Be
         let rule = &self.rules[rule_id];
         let radius = compute_radius(rule, variant);
-        let window = (m.start() - radius)..(m.end() + radius);
-        accs[rule_id][variant.idx()].push(window);
+        let window = SpanU32::new(m.start() - radius, m.end() + radius);
+        let pair = rule_id * 3 + variant.idx();
+        hit_acc_pool.push_span(pair, window, &mut touched_pairs);
     }
 }
 ```

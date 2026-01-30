@@ -5,10 +5,7 @@ fn main() {
 
 #[cfg(feature = "bench")]
 fn main() {
-    use scanner_rs::{
-        bench_find_spans_into, demo_engine_with_anchor_mode, AnchorMode, Gate, TransformConfig,
-        TransformId, TransformMode,
-    };
+    use scanner_rs::{bench_find_spans_into, Gate, TransformConfig, TransformId, TransformMode};
     use std::env;
     use std::hint::black_box;
     use std::time::{Duration, Instant};
@@ -84,24 +81,6 @@ fn main() {
         buf
     }
 
-    fn make_anchor_hits(len: usize) -> Vec<u8> {
-        let anchors: [&[u8]; 5] = [b"AKIA", b"ghp_", b"xoxb-", b"glpat-", b"sk_test_"];
-        let mut buf = vec![b'a'; len];
-        let stride = 4096;
-        let mut i = 0usize;
-        let mut idx = 0usize;
-        while i < buf.len() {
-            let a = anchors[idx % anchors.len()];
-            if i + a.len() > buf.len() {
-                break;
-            }
-            buf[i..i + a.len()].copy_from_slice(a);
-            i = i.saturating_add(stride);
-            idx += 1;
-        }
-        buf
-    }
-
     fn url_config(max_spans: usize) -> TransformConfig {
         TransformConfig {
             id: TransformId::UrlPercent,
@@ -140,6 +119,23 @@ fn main() {
         eprintln!("{label}: iters={iters}");
     }
 
+    #[cfg(feature = "stats")]
+    fn run_stream_stats(label: &str, buf: &[u8]) {
+        let engine = scanner_rs::demo_engine();
+        let mut scratch = engine.new_scratch();
+        let _ = engine.scan_chunk_records(buf, scanner_rs::FileId(0), 0, &mut scratch);
+        let stats = engine.vectorscan_stats();
+        eprintln!(
+            "{label}: stream_force_full={} stream_window_cap_exceeded={}",
+            stats.stream_force_full, stats.stream_window_cap_exceeded
+        );
+    }
+
+    #[cfg(not(feature = "stats"))]
+    fn run_stream_stats(label: &str, _buf: &[u8]) {
+        eprintln!("{label}: enable --features stats to report stream telemetry");
+    }
+
     let mut args = env::args().skip(1);
     let mode = args.next().unwrap_or_else(|| "all".to_string());
     let secs = args
@@ -156,11 +152,6 @@ fn main() {
     let random = make_random(BUF_LEN, 0x1234_5678_9abc_def0);
     let urlish = make_urlish(BUF_LEN);
     let base64_noise = make_base64(BUF_LEN, 0x0f0e_0d0c_0b0a_0908);
-    let anchors_hits = make_anchor_hits(BUF_LEN);
-
-    let engine = demo_engine_with_anchor_mode(AnchorMode::Manual);
-    let ac = engine.bench_ac_anchors();
-
     let mut spans = Vec::with_capacity(4096);
 
     match mode.as_str() {
@@ -180,20 +171,9 @@ fn main() {
             bench_find_spans_into(&b64_cfg_full, black_box(&base64_noise), &mut spans);
             black_box(spans.len());
         }),
-        "ac_random" => run_for("ac_random", duration, || {
-            let mut count = 0usize;
-            for _ in ac.find_overlapping_iter(black_box(&random)) {
-                count += 1;
-            }
-            black_box(count);
-        }),
-        "ac_hits" => run_for("ac_hits", duration, || {
-            let mut count = 0usize;
-            for _ in ac.find_overlapping_iter(black_box(&anchors_hits)) {
-                count += 1;
-            }
-            black_box(count);
-        }),
+        "stream_stats" => {
+            run_stream_stats("stream_stats", &base64_noise);
+        }
         "all" => {
             run_for("url_random", duration, || {
                 bench_find_spans_into(&url_cfg_random, black_box(&random), &mut spans);
@@ -211,24 +191,11 @@ fn main() {
                 bench_find_spans_into(&b64_cfg_full, black_box(&base64_noise), &mut spans);
                 black_box(spans.len());
             });
-            run_for("ac_random", duration, || {
-                let mut count = 0usize;
-                for _ in ac.find_overlapping_iter(black_box(&random)) {
-                    count += 1;
-                }
-                black_box(count);
-            });
-            run_for("ac_hits", duration, || {
-                let mut count = 0usize;
-                for _ in ac.find_overlapping_iter(black_box(&anchors_hits)) {
-                    count += 1;
-                }
-                black_box(count);
-            });
+            run_stream_stats("stream_stats", &base64_noise);
         }
         _ => {
             eprintln!(
-                "usage: perf_hotspots [url_random|url_urlish|b64_random|b64_noise|ac_random|ac_hits|all] [seconds]"
+                "usage: perf_hotspots [url_random|url_urlish|b64_random|b64_noise|stream_stats|all] [seconds]"
             );
         }
     }

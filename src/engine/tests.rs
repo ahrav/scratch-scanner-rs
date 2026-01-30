@@ -4,18 +4,134 @@
 //! tracking. A slow reference scanner is included to validate correctness
 //! across transforms and UTF-16 variants.
 
-use super::*;
+use super::core::Engine;
+use super::helpers::{decode_utf16be_to_vec, decode_utf16le_to_vec, entropy_gate_passes, hash128};
+use super::hit_pool::{HitAccPool, SpanU32};
+use super::rule_repr::{utf16be_bytes, utf16le_bytes, EntropyCompiled, PackedPatterns, Variant};
+use super::scratch::EntropyScratch;
+use super::transform::{
+    decode_to_vec, find_base64_spans_into, find_spans_into, find_url_spans_into,
+    transform_quick_trigger,
+};
+use super::vectorscan_prefilter::{
+    gate_match_callback, stream_match_callback, VsStreamMatchCtx, VsStreamWindow,
+};
+use crate::api::{
+    AnchorPolicy, DecodeStep, EntropySpec, FileId, Finding, FindingRec, Gate, RuleSpec,
+    TransformConfig, TransformId, TransformMode, Tuning, Utf16Endianness, ValidatorKind,
+};
+use crate::demo::{demo_engine, demo_rules, demo_tuning};
+use crate::regex2anchor::{compile_trigger_plan, AnchorDeriveConfig, TriggerPlan};
+use crate::scratch_memory::ScratchVec;
 use crate::tiger_harness::{
     check_oracle_covered, correctness_engine, load_regressions_from_dir, maybe_write_regression,
     scan_chunked_records, scan_one_chunk_records, ChunkPattern, ChunkPlan,
 };
+use crate::{ScannerConfig, ScannerRuntime};
+use memchr::memmem;
 use proptest::prelude::*;
+use regex::bytes::Regex;
 use std::collections::HashSet;
 use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+fn decoded_prefilter_hit(engine: &Engine, decoded: &[u8]) -> bool {
+    if let Some(vs_gate) = engine.vs_gate.as_ref() {
+        let mut scratch = match vs_gate.alloc_scratch() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let mut stream = match vs_gate.open_stream() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+
+        let mut hit: u8 = 0;
+        let cb = gate_match_callback();
+        if vs_gate
+            .scan_stream(
+                &mut stream,
+                decoded,
+                &mut scratch,
+                cb,
+                (&mut hit as *mut u8).cast(),
+            )
+            .is_err()
+        {
+            let _ = vs_gate.close_stream(stream, &mut scratch, cb, (&mut hit as *mut u8).cast());
+            return false;
+        }
+        if vs_gate
+            .close_stream(stream, &mut scratch, cb, (&mut hit as *mut u8).cast())
+            .is_err()
+        {
+            return false;
+        }
+        return hit != 0;
+    }
+
+    let Some(vs_stream) = engine.vs_stream.as_ref() else {
+        return true;
+    };
+
+    let mut scratch = match vs_stream.alloc_scratch() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let mut stream = match vs_stream.open_stream() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    let mut pending: Vec<VsStreamWindow> = Vec::new();
+    let mut ctx = VsStreamMatchCtx {
+        pending: &mut pending as *mut Vec<VsStreamWindow>,
+        meta: vs_stream.meta().as_ptr(),
+        meta_len: vs_stream.meta().len() as u32,
+    };
+    let cb = stream_match_callback();
+
+    if vs_stream
+        .scan_stream(
+            &mut stream,
+            decoded,
+            &mut scratch,
+            cb,
+            (&mut ctx as *mut VsStreamMatchCtx).cast(),
+        )
+        .is_err()
+    {
+        let _ = vs_stream.close_stream(
+            stream,
+            &mut scratch,
+            cb,
+            (&mut ctx as *mut VsStreamMatchCtx).cast(),
+        );
+        return false;
+    }
+    let mut hit = !pending.is_empty();
+    pending.clear();
+
+    if vs_stream
+        .close_stream(
+            stream,
+            &mut scratch,
+            cb,
+            (&mut ctx as *mut VsStreamMatchCtx).cast(),
+        )
+        .is_err()
+    {
+        return false;
+    }
+    if !pending.is_empty() {
+        hit = true;
+    }
+
+    hit
+}
 
 // Helper that uses the allocation-free scan API and materializes findings.
 fn scan_chunk_findings(engine: &Engine, hay: &[u8]) -> Vec<Finding> {
@@ -185,7 +301,7 @@ fn base64_utf16_aws_key_is_detected() {
     let eng = demo_engine();
 
     let aws = b"AKIAIOSFODNN7EXAMPLE"; // 20 bytes
-    let utf16le = super::utf16le_bytes(aws);
+    let utf16le = utf16le_bytes(aws);
     let b64 = b64_encode(&utf16le);
 
     let hay = format!("prefix {} suffix", b64).into_bytes();
@@ -396,7 +512,7 @@ fn anchor_policy_falls_back_to_manual_on_unfilterable() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
-        re: Regex::new(".*").unwrap(),
+        re: Regex::new("[A-Za-z]{1,}").unwrap(),
     };
 
     let eng = Engine::new(vec![rule], Vec::new(), demo_tuning());
@@ -550,6 +666,9 @@ fn reference_scan_keys(engine: &Engine, rules: &[RuleSpec], buf: &[u8]) -> HashS
             if !transform_quick_trigger(tc, &item.buf) {
                 continue;
             }
+            if !engine.base64_buffer_gate(tc, &item.buf) {
+                continue;
+            }
 
             let mut spans = Vec::new();
             find_spans_into(tc, &item.buf, &mut spans);
@@ -568,6 +687,14 @@ fn reference_scan_keys(engine: &Engine, rules: &[RuleSpec], buf: &[u8]) -> HashS
 
                 let enc_span = enc_span.clone();
                 let enc = &item.buf[enc_span.clone()];
+
+                if tc.id == TransformId::Base64 && tc.gate == Gate::AnchorsInDecoded {
+                    if let Some(gate) = &engine.b64_gate {
+                        if !gate.hits(enc) {
+                            continue;
+                        }
+                    }
+                }
 
                 let remaining = engine
                     .tuning
@@ -592,10 +719,13 @@ fn reference_scan_keys(engine: &Engine, rules: &[RuleSpec], buf: &[u8]) -> HashS
                 }
 
                 if tc.gate == Gate::AnchorsInDecoded {
-                    let anchors = engine
-                        .anchors
-                        .select(&decoded, engine.tuning.scan_utf16_variants);
-                    if !anchors.ac.is_match(&decoded) {
+                    let gate_satisfied = decoded_prefilter_hit(engine, &decoded);
+                    let enforce_gate = if engine.vs_gate.is_some() {
+                        true
+                    } else {
+                        !engine.tuning.scan_utf16_variants || !engine.has_utf16_anchors
+                    };
+                    if enforce_gate && !gate_satisfied {
                         continue;
                     }
                 }
@@ -1344,7 +1474,7 @@ fn scan_file_sync_materializes_provenance_across_chunks() -> std::io::Result<()>
     );
 
     let aws = b"AKIAIOSFODNN7EXAMPLE"; // 20 bytes
-    let utf16le = super::utf16le_bytes(aws);
+    let utf16le = utf16le_bytes(aws);
     let b64 = b64_encode(&utf16le);
 
     let mut buf = vec![b'!'; 17];
@@ -1426,7 +1556,10 @@ fn utf16_overlap_accounts_for_scaled_radius() {
         .saturating_mul(2)
         .saturating_add(anchor_len_utf16)
         .saturating_sub(1);
-    let expected_overlap = anchor_len_utf16 + radius.saturating_mul(4) - 1;
+    let expected_overlap = engine
+        .max_prefilter_width
+        .saturating_add(radius.saturating_mul(4))
+        .saturating_sub(1);
 
     assert_eq!(engine.required_overlap(), expected_overlap);
     assert!(old_overlap < engine.required_overlap());
@@ -1745,7 +1878,7 @@ fn tiger_boundary_base64_padding_split() {
 
 #[test]
 fn base64_gate_utf16be_anchor_straddles_stream_boundary() {
-    // The base64 stream decoder flushes output in ~1KB chunks (1020 bytes),
+    // The base64 stream decoder flushes output in bounded chunks,
     // so we place a UTF-16BE anchor so its final byte lands in a 1-byte tail
     // chunk. The gate must inspect tail+chunk to see the NULs and match.
     let rule = RuleSpec {
@@ -1780,7 +1913,7 @@ fn base64_gate_utf16be_anchor_straddles_stream_boundary() {
         Engine::new_with_anchor_policy(vec![rule], vec![tc], tuning, AnchorPolicy::ManualOnly);
 
     let utf16 = utf16be_bytes(b"TOK");
-    let flush_len = 1020usize; // stream_decode_base64 flush threshold
+    let flush_len = super::transform::STREAM_DECODE_CHUNK_BYTES.saturating_sub(4);
     let prefix_len = flush_len - (utf16.len().saturating_sub(1));
 
     let mut decoded = vec![b'A'; prefix_len];
@@ -1793,6 +1926,154 @@ fn base64_gate_utf16be_anchor_straddles_stream_boundary() {
     assert!(
         hits.iter().any(|h| h.rule == "utf16be-gate-boundary"),
         "expected utf16be match to survive base64 gate boundary"
+    );
+}
+
+#[test]
+fn stream_window_recovers_after_ring_eviction() {
+    let rule = RuleSpec {
+        name: "ring-evict-window",
+        anchors: &[b"TOK"],
+        radius: 128,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        re: Regex::new("TOK").unwrap(),
+    };
+
+    let tc = TransformConfig {
+        id: TransformId::Base64,
+        mode: TransformMode::Always,
+        gate: Gate::None,
+        min_len: 8,
+        max_spans_per_buffer: 4,
+        max_encoded_len: 64 * 1024,
+        max_decoded_bytes: 64 * 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    };
+
+    let mut tuning = demo_tuning();
+    tuning.max_total_decode_output_bytes = tuning.max_total_decode_output_bytes.max(8 * 1024);
+
+    let mut engine =
+        Engine::new_with_anchor_policy(vec![rule], vec![tc], tuning, AnchorPolicy::ManualOnly);
+    if engine.vs_stream.is_none() {
+        return;
+    }
+    engine.stream_ring_bytes = 32;
+
+    let mut decoded = vec![b'A'; 256];
+    decoded.extend_from_slice(b"TOK");
+    decoded.extend(std::iter::repeat_n(b'B', 256));
+    let encoded = b64_encode(&decoded).into_bytes();
+
+    let hits = scan_chunk_findings(&engine, &encoded);
+    assert!(
+        hits.iter().any(|h| h.rule == "ring-evict-window"),
+        "expected match to survive ring eviction"
+    );
+}
+
+#[test]
+fn stream_hit_cap_forces_full_fallback() {
+    let rule = RuleSpec {
+        name: "stream-hit-cap-fallback",
+        anchors: &[b"TOK"],
+        radius: 0,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        re: Regex::new("TOK").unwrap(),
+    };
+
+    let tc = TransformConfig {
+        id: TransformId::Base64,
+        mode: TransformMode::Always,
+        gate: Gate::None,
+        min_len: 8,
+        max_spans_per_buffer: 4,
+        max_encoded_len: 64 * 1024,
+        max_decoded_bytes: 64 * 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    };
+
+    let mut tuning = demo_tuning();
+    tuning.max_windows_per_rule_variant = 1;
+    tuning.max_total_decode_output_bytes = tuning.max_total_decode_output_bytes.max(8 * 1024);
+
+    let engine =
+        Engine::new_with_anchor_policy(vec![rule], vec![tc], tuning, AnchorPolicy::ManualOnly);
+    if engine.vs_stream.is_none() {
+        return;
+    }
+
+    let mut decoded = Vec::new();
+    decoded.extend_from_slice(b"TOK");
+    decoded.extend(std::iter::repeat_n(b'A', 512));
+    decoded.extend_from_slice(b"TOK");
+    let encoded = b64_encode(&decoded).into_bytes();
+
+    let hits = scan_chunk_findings(&engine, &encoded);
+    let count = hits
+        .iter()
+        .filter(|h| h.rule == "stream-hit-cap-fallback")
+        .count();
+    assert!(count >= 2, "expected >=2 matches, got {count}");
+}
+
+#[test]
+fn stream_nested_span_fallback_recovers() {
+    let rule = RuleSpec {
+        name: "nested-span-fallback",
+        anchors: &[b"TOK"],
+        radius: 0,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        re: Regex::new("TOK").unwrap(),
+    };
+
+    let tc = TransformConfig {
+        id: TransformId::Base64,
+        mode: TransformMode::Always,
+        gate: Gate::None,
+        min_len: 4,
+        max_spans_per_buffer: 8,
+        max_encoded_len: 64 * 1024,
+        max_decoded_bytes: 64 * 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    };
+
+    let mut tuning = demo_tuning();
+    tuning.max_total_decode_output_bytes = tuning.max_total_decode_output_bytes.max(16 * 1024);
+
+    let mut engine =
+        Engine::new_with_anchor_policy(vec![rule], vec![tc], tuning, AnchorPolicy::ManualOnly);
+    if engine.vs_stream.is_none() {
+        return;
+    }
+    engine.stream_ring_bytes = 32;
+
+    let inner = b64_encode(b"TOK");
+    let mut outer_decoded = Vec::new();
+    outer_decoded.extend(std::iter::repeat_n(b'A', 128));
+    outer_decoded.extend_from_slice(inner.as_bytes());
+    outer_decoded.extend(std::iter::repeat_n(b'B', 128));
+
+    let outer_encoded = b64_encode(&outer_decoded).into_bytes();
+    let hits = scan_chunk_findings(&engine, &outer_encoded);
+    assert!(
+        hits.iter().any(|h| h.rule == "nested-span-fallback"),
+        "expected nested span to be recovered via fallback"
     );
 }
 
@@ -1870,11 +2151,15 @@ mod proptests {
         }
 
         #[test]
-        fn prop_hit_accumulator_coalesces(
+        fn prop_hit_acc_pool_coalesces(
             ranges in prop::collection::vec((0u32..512, 0u32..512), 0..128),
             max_hits in 1usize..32
         ) {
-            let mut acc = HitAccumulator::with_capacity(max_hits);
+            let mut acc =
+                HitAccPool::new(1, max_hits).expect("hit accumulator pool allocation failed");
+            let mut touched_pairs: ScratchVec<u32> =
+                ScratchVec::with_capacity(1).expect("scratch touched_pairs allocation failed");
+            let pair = 0usize;
             let mut ref_windows: Vec<SpanU32> = Vec::new();
             let mut ref_coalesced: Option<SpanU32> = None;
 
@@ -1882,7 +2167,7 @@ mod proptests {
                 let (start, end) = if a <= b { (a, b) } else { (b, a) };
                 let start = start as usize;
                 let end = end as usize;
-                acc.push(start, end, max_hits);
+                acc.push_span(pair, SpanU32::new(start, end), &mut touched_pairs);
 
                 let r = SpanU32::new(start, end);
                 if let Some(c) = ref_coalesced.as_mut() {
@@ -1903,15 +2188,23 @@ mod proptests {
                 }
             }
 
-            match (acc.coalesced, ref_coalesced) {
+            let acc_coalesced = if acc.coalesced_set()[pair] != 0 {
+                Some(acc.coalesced()[pair])
+            } else {
+                None
+            };
+
+            match (acc_coalesced, ref_coalesced) {
                 (Some(actual), Some(expected)) => {
                     prop_assert_eq!(actual, expected);
-                    prop_assert_eq!(acc.windows.len(), 0);
+                    prop_assert_eq!(acc.lens()[pair], 0);
                 }
                 (None, None) => {
-                    prop_assert_eq!(acc.windows.len(), ref_windows.len());
+                    let len = acc.lens()[pair] as usize;
+                    prop_assert_eq!(len, ref_windows.len());
+                    let base = pair * max_hits;
                     for (i, expected) in ref_windows.iter().enumerate() {
-                        prop_assert_eq!(acc.windows[i], *expected);
+                        prop_assert_eq!(acc.windows()[base + i], *expected);
                     }
                 }
                 _ => {

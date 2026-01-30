@@ -1,5 +1,9 @@
 //! Public API data types for configuring the scanner and reporting results.
 //!
+//! Purpose: provide the shared configuration and result structs used by the
+//! engine and its callers. These types are intentionally behavior-free; the
+//! engine performs validation and enforcement when it is built.
+//!
 //! # Invariants
 //! - `FileId` and `StepId` are opaque indices; they are only valid for the table/arena
 //!   that created them.
@@ -7,11 +11,13 @@
 //!   the maximum transform depth.
 //! - `RuleSpec`, `TransformConfig`, and `Tuning` are validated at engine build time;
 //!   invalid combinations panic during construction.
+//! - Hot-path offsets are stored as `u32`; callers must chunk inputs so any
+//!   single buffer fits in `u32::MAX` bytes.
 //!
 //! # Algorithm
-//! - Findings are accumulated as compact `FindingRec` values on the hot path.
-//! - `FindingRec` is later materialized into `Finding` by expanding the decode-step chain.
-//! - Optional transform decoding is bounded by per-rule and global budgets.
+//! 1. Findings are accumulated as compact `FindingRec` values on the hot path.
+//! 2. `FindingRec` is later materialized into `Finding` by expanding the decode-step chain.
+//! 3. Optional transform decoding is bounded by per-rule and global budgets.
 //!
 //! # Design Notes
 //! - Types here are intentionally lightweight and `Copy` where possible to keep scans
@@ -25,6 +31,14 @@ use std::ops::Range;
 
 /// Opaque file identifier used to index into [`FileTable`].
 ///
+/// This is not a filesystem path; callers must look up metadata in the
+/// owning `FileTable`.
+///
+/// # Construction
+/// Create via [`FileTable::insert`] or similar registration methods.
+/// Direct construction with `FileId(n)` is valid but callers must ensure
+/// the index corresponds to an entry in the associated `FileTable`.
+///
 /// # Invariants
 /// - Only valid for the `FileTable` that produced it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -37,6 +51,7 @@ pub struct FileId(pub u32);
 ///
 /// # Invariants
 /// - Only valid while the originating decode-step arena is alive and not reset.
+/// - `STEP_ROOT` is the sentinel root for an empty provenance chain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct StepId(pub(crate) u32);
 
@@ -62,7 +77,6 @@ pub enum TransformId {
     UrlPercent,
     /// Base64 decoding (with optional whitespace allowances).
     Base64,
-    // Add more: JsonUnescape, HtmlUnescape, Gzip, Zlib, Brotli, etc.
 }
 
 /// Controls when a transform is applied during scanning.
@@ -74,8 +88,15 @@ pub enum TransformMode {
     Always,
 
     /// Correctness trade (explicit).
-    /// Skips this transform if this buffer already produced any findings.
-    /// This can miss findings that only appear in nested encodings.
+    /// Skips this transform if the *current buffer* already produced any findings.
+    ///
+    /// Scope: This only considers findings from the current buffer being scanned;
+    /// findings from parent buffers (that produced this one) or child buffers
+    /// (derived via earlier transforms) are not considered. Each buffer tracks
+    /// its own "has findings" flag independently.
+    ///
+    /// This can miss findings that only appear in nested encodings (e.g., base64
+    /// inside URL-encoded content).
     IfNoFindingsInThisBuffer,
 }
 
@@ -87,10 +108,18 @@ pub enum Gate {
 
     /// Stream-decode and proceed only if decoded bytes contain any anchor variant
     /// (raw + UTF-16LE/BE variants).
+    ///
+    /// This is only sound when anchors are required for a rule (the default),
+    /// because the gate ignores non-anchor-only matches. False negatives are
+    /// possible when anchors are optional (e.g., rules with `|` alternation where
+    /// some branches have no anchor). Use `Gate::None` for such rules if
+    /// completeness is critical.
     AnchorsInDecoded,
 }
 
 /// Configuration for a single transform stage.
+///
+/// Lengths are in bytes of the encoded input unless otherwise noted.
 ///
 /// # Invariants
 /// - `max_encoded_len >= min_len`.
@@ -108,6 +137,11 @@ pub struct TransformConfig {
     pub mode: TransformMode,
 
     /// Gate policy (if enabled).
+    ///
+    /// When set to `AnchorsInDecoded`, the engine scans decoded bytes for any
+    /// anchor variant and discards the decoded buffer if none are found. For
+    /// Base64, an extra encoded-space prefilter may skip decoding before this
+    /// gate runs.
     pub gate: Gate,
 
     /// Minimum encoded length to consider for span detection.
@@ -118,12 +152,14 @@ pub struct TransformConfig {
     pub max_encoded_len: usize,
 
     /// Maximum decoded bytes produced per span.
+    /// Decodes exceeding this cap are aborted for that span.
     pub max_decoded_bytes: usize,
 
-    /// URL option: treat '+' as space.
+    /// URL option: treat '+' as space. Ignored unless `id == UrlPercent`.
     pub plus_to_space: bool,
 
     /// Base64 option: allow space as whitespace during span detection.
+    /// Ignored unless `id == Base64`.
     pub base64_allow_space_ws: bool,
 }
 
@@ -152,7 +188,8 @@ impl TransformConfig {
 
 /// Base64 decode/gate instrumentation counters.
 ///
-/// Counters saturate on overflow.
+/// # Guarantees
+/// - Counters saturate on overflow.
 #[cfg(feature = "b64-stats")]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Base64DecodeStats {
@@ -189,10 +226,12 @@ pub struct Base64DecodeStats {
 
 #[cfg(feature = "b64-stats")]
 impl Base64DecodeStats {
+    /// Resets all counters to zero.
     pub(crate) fn reset(&mut self) {
         *self = Self::default();
     }
 
+    /// Accumulates counters from `other` into `self` with saturating arithmetic.
     pub(crate) fn add(&mut self, other: &Self) {
         self.spans = self.spans.saturating_add(other.spans);
         self.span_bytes = self.span_bytes.saturating_add(other.span_bytes);
@@ -228,7 +267,9 @@ impl Base64DecodeStats {
 /// UTF-16 endianness used when validating UTF-16 anchor hits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Utf16Endianness {
+    /// Little-endian UTF-16.
     Le,
+    /// Big-endian UTF-16.
     Be,
 }
 
@@ -242,14 +283,17 @@ pub enum DecodeStep {
     /// Transform step is deterministic via transform_idx (index into Engine.transforms).
     Transform {
         transform_idx: usize,
-        parent_span: Range<usize>, // span in the parent representation
+        /// Span in the parent representation (half-open byte range).
+        parent_span: Range<usize>,
     },
 
-    /// Not a queued transform. This is a local validation step used when an UTF-16 anchor variant hits.
-    /// The consumer can replay this by decoding parent_span as UTF-16 with the given endianness.
+    /// Not a queued transform. This is a local validation step used when a UTF-16
+    /// anchor variant hits. The consumer can replay this by decoding `parent_span`
+    /// as UTF-16 with the given endianness.
     Utf16Window {
         endianness: Utf16Endianness,
-        parent_span: Range<usize>, // span in the parent representation
+        /// Span in the parent representation (half-open byte range).
+        parent_span: Range<usize>,
     },
 }
 
@@ -264,6 +308,9 @@ pub type DecodeSteps = FixedVec<DecodeStep, MAX_DECODE_STEPS>;
 /// # Guarantees
 /// - `span` and `root_span_hint` are half-open byte ranges.
 /// - `decode_steps` describes how to reach the representation where `span` applies.
+///
+/// # Performance
+/// - `Finding` is the materialized, user-facing form; keep `FindingRec` on the hot path.
 #[derive(Clone, Debug)]
 pub struct Finding {
     /// Rule name that produced this finding.
@@ -278,6 +325,8 @@ pub struct Finding {
     /// - For raw findings in root: exact match span.
     /// - For derived buffers: outermost container span in root (or best available).
     /// - For UTF-16 window findings in root: the decoded window span in root.
+    ///
+    /// For file-backed scans this is an absolute byte offset within the file.
     pub root_span_hint: Range<usize>,
 
     /// Decode steps from root buffer to the representation where `span` applies.
@@ -289,10 +338,15 @@ pub struct Finding {
 ///
 /// This is later materialized into [`Finding`] by expanding the decode-step chain.
 ///
+/// # Performance
+/// - Fixed-width fields keep the record compact and `Copy` for ring buffers.
+///
 /// # Invariants
 /// - `span_start..span_end` is a half-open range in the current buffer.
 /// - `root_hint_start..root_hint_end` is a half-open range in the root file buffer.
+/// - `span_start`/`span_end` must fit in `u32`; callers must chunk inputs accordingly.
 /// - `step_id` is only valid while the originating scratch arena is alive and not reset.
+/// - `step_id == STEP_ROOT` denotes a root-buffer finding with no decode steps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FindingRec {
     /// Source file id for the finding.
@@ -313,6 +367,13 @@ pub struct FindingRec {
 }
 
 /// Two-phase rule specification: confirm in a smaller seed window, then expand.
+///
+/// # Algorithm
+/// 1. Check `confirm_any` inside the seed window (`seed_radius`).
+/// 2. If any confirm hits, expand to `full_radius` and run regex validation.
+///
+/// # Trade-offs
+/// - Reduces regex work on noisy data, but may widen windows on confirm hits.
 ///
 /// # Invariants
 /// - `seed_radius <= full_radius`.
@@ -358,7 +419,7 @@ pub enum ValidatorKind {
         tail_len: u16,
         /// Character class used for each tail byte.
         tail: TailCharset,
-        /// Require a `regex::bytes` word boundary (`\b`) before the prefix.
+        /// Require a regex word boundary (`\b`) before the prefix.
         require_word_boundary_before: bool,
         /// Optional delimiter check after the tail.
         delim_after: DelimAfter,
@@ -376,7 +437,7 @@ pub enum ValidatorKind {
         max_tail: u16,
         /// Character class used for each tail byte.
         tail: TailCharset,
-        /// Require a `regex::bytes` word boundary (`\b`) before the prefix.
+        /// Require a regex word boundary (`\b`) before the prefix.
         require_word_boundary_before: bool,
         /// Optional delimiter check after the tail.
         delim_after: DelimAfter,
@@ -408,16 +469,20 @@ impl ValidatorKind {
 }
 
 /// Post-match delimiter requirement for token-like rules.
+///
+/// Delimiter checks operate on raw bytes, not Unicode scalars.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DelimAfter {
     /// No delimiter requirement; the match may be followed by any byte or end.
     None,
     /// Gitleaks-style token terminator:
-    /// `['"|\n|\r|\\s|\\x60]` or end-of-input.
+    /// `['"|\\n|\\r|\\s|\\x60]` or end-of-input.
     GitleaksTokenTerminator,
 }
 
 /// Tail character class for validator checks.
+///
+/// All charsets are ASCII byte classes applied to raw bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TailCharset {
     /// `[A-Z0-9]`
@@ -428,7 +493,7 @@ pub enum TailCharset {
     LowerAlnum,
     /// `[A-Za-z0-9_-]`
     AlnumDashUnderscore,
-    /// `[A-Za-z0-9=_\\-.]` (case-insensitive)
+    /// `[A-Za-z0-9=_\-.]` (case-insensitive)
     Sendgrid66Set,
     /// `[a-h0-9]` (case-insensitive)
     DatabricksSet,
@@ -482,8 +547,11 @@ pub struct RuleSpec {
     /// single-pass, chunked scanning (no global context) while filtering noisy
     /// windows cheaply via memmem.
     ///
-    /// Keywords are compiled into raw + UTF-16LE/BE variants the same way anchors
-    /// are, so the gate works consistently across encodings.
+    /// # Encoding behavior
+    /// Keywords are evaluated on the *raw representation* of the window (i.e., the
+    /// bytes as they appear after any transform decoding, before UTF-8 interpretation).
+    /// Like anchors, keywords are compiled into raw + UTF-16LE/BE variants so the
+    /// gate works consistently whether scanning raw buffers or decoded UTF-16 content.
     pub keywords_any: Option<&'static [&'static [u8]]>,
 
     /// Optional entropy gate evaluated on each regex match.
@@ -520,14 +588,21 @@ impl RuleSpec {
 
 /// Shannon-entropy gate configuration.
 ///
+/// # Algorithm
 /// - Entropy is computed over the matched byte slice (full regex match).
-/// - Threshold is bits/byte in [0.0, 8.0].
 /// - Matches shorter than `min_len` pass (entropy is noisy on tiny samples).
 /// - Matches longer than `max_len` are capped for cost control (first `max_len` bytes).
+///
+/// # Invariants
+/// - Threshold is bits/byte in [0.0, 8.0].
+/// - `min_len <= max_len`.
 #[derive(Clone, Debug)]
 pub struct EntropySpec {
+    /// Minimum entropy threshold in bits/byte.
     pub min_bits_per_byte: f32,
+    /// Matches shorter than this length pass without entropy checks.
     pub min_len: usize,
+    /// Max number of bytes used for entropy calculation.
     pub max_len: usize,
 }
 
@@ -557,24 +632,26 @@ impl EntropySpec {
 /// - `max_findings_per_chunk` is a hard cap; excess findings are dropped.
 #[derive(Clone, Debug)]
 pub struct Tuning {
-    /// Window merge gap (bytes) when coalescing adjacent anchor hits.
+    /// Window merge gap in bytes when coalescing adjacent anchor hits.
+    /// Typical values: 64–256 bytes.
     pub merge_gap: usize,
 
     /// After merging, if windows per (rule, variant) still exceed this, coalesce under pressure.
     pub max_windows_per_rule_variant: usize,
-    /// Starting gap used during pressure coalescing.
+    /// Starting gap in bytes used during pressure coalescing.
     pub pressure_gap_start: usize,
 
     /// Prevent vector blowups before merging by collapsing to a single coalesced range.
     pub max_anchor_hits_per_rule_variant: usize,
 
-    /// UTF-16 decoding (for validation).
+    /// Maximum bytes produced when decoding a UTF-16 window for validation.
     pub max_utf16_decoded_bytes_per_window: usize,
 
     /// Max transform depth (number of decode steps) per work item chain.
     /// Must be <= `MAX_DECODE_STEPS - 1`; enforced at engine build time.
     pub max_transform_depth: usize,
 
+    /// Maximum total decoded output bytes across all transforms per scan.
     /// Counts ALL decoded output bytes:
     /// - full decodes
     /// - streaming gate decoded chunks
@@ -593,27 +670,19 @@ pub struct Tuning {
     /// are present). This is useful for modes that avoid binary/UTF-16 content.
     pub scan_utf16_variants: bool,
 
-    /// Aho-Corasick automaton kind for anchor scans.
-    pub ac_kind: AnchorAcKind,
-
-    /// Optional depth for dense transition tables in the NFA.
-    /// When `None`, the crate default is used.
-    pub ac_dense_depth: Option<usize>,
-
-    /// Optional byte-class setting for the NFA.
-    /// When `None`, the crate default is used.
-    pub ac_byte_classes: Option<bool>,
-}
-
-/// Anchor automaton kind selection for the Aho-Corasick builder.
-///
-/// Controls the automaton type used for anchor scanning.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AnchorAcKind {
-    Auto,
-    DFA,
-    ContiguousNFA,
-    NoncontiguousNFA,
+    /// When true, treat raw Vectorscan regex matches as exact candidates and
+    /// validate them directly (skip window expansion + regex re-scan).
+    ///
+    /// This uses the Vectorscan regex engine as the primary matcher for raw
+    /// rules and still applies post-match entropy gating.
+    ///
+    /// # Behavior details
+    /// - Skips window expansion: match bounds come directly from Vectorscan.
+    /// - Still applies entropy gates if configured on the rule.
+    /// - May improve throughput for rules where Vectorscan's match bounds are
+    ///   already tight, but can miss findings if the rule regex differs from
+    ///   what Vectorscan compiled (e.g., due to flag differences).
+    pub vs_direct_raw_regex: bool,
 }
 
 impl Tuning {
@@ -633,6 +702,17 @@ impl Tuning {
 /// Policy for selecting anchors during engine compilation.
 ///
 /// Determines whether to derive anchors from regexes, use manual anchors, or both.
+/// This choice only affects compilation; runtime scanning uses the compiled anchors.
+///
+/// # Choosing a Policy
+/// - [`PreferDerived`]: Default for most use cases; automatic anchor extraction
+///   with manual fallback ensures coverage.
+/// - [`ManualOnly`]: Use when regexes are complex and derivation produces poor anchors.
+/// - [`DerivedOnly`]: Use when manual anchors are stale or you want pure automation.
+///
+/// [`PreferDerived`]: AnchorPolicy::PreferDerived
+/// [`ManualOnly`]: AnchorPolicy::ManualOnly
+/// [`DerivedOnly`]: AnchorPolicy::DerivedOnly
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnchorPolicy {
     /// Prefer derived anchors, falling back to manual anchors if derivation fails.
