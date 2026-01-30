@@ -72,7 +72,7 @@ use self::helpers::*;
 use self::raw_density_gate::RawDensityGate;
 use self::transform::*;
 use self::vectorscan_prefilter::{
-    gate_match_callback, stream_match_callback, utf16_stream_match_callback, Utf16AnchorInput,
+    gate_match_callback, stream_match_callback, utf16_stream_match_callback, AnchorInput,
     VsAnchorDb, VsGateDb, VsPrefilterDb, VsScratch, VsStream, VsStreamDb, VsStreamMatchCtx,
     VsStreamWindow, VsUtf16StreamDb, VsUtf16StreamMatchCtx,
 };
@@ -376,9 +376,10 @@ impl SpanU32 {
     }
 }
 
-/// Accumulates anchor hit windows for a single (rule, variant).
+/// Accumulates anchor hit windows across all (rule, variant) pairs.
 ///
-/// Starts as an append-only list. If the hit count exceeds the configured cap,
+/// Storage is fixed-stride: `windows` is laid out as `pair * max_hits + idx`.
+/// Each pair starts as an append-only list. Once the hit count exceeds the cap,
 /// it switches to a single "coalesced" window that covers the union of all hits
 /// seen so far. The fallback is conservative (may over-expand) but guarantees
 /// correctness while bounding memory growth.
@@ -388,81 +389,144 @@ impl SpanU32 {
 /// not assume sorted windows unless it explicitly sorts them.
 ///
 /// # Guarantees
-/// - If `coalesced` is set, it is a superset of all hits seen so far.
+/// - If `coalesced_set[pair] != 0`, `coalesced[pair]` is a superset of all hits
+///   seen so far for that pair.
 ///
 /// # Performance
-/// - Per-rule memory is capped at `max_hits`; append stays O(1) until coalesced.
-struct HitAccumulator {
-    windows: ScratchVec<SpanU32>,
-    coalesced: Option<SpanU32>,
+/// - Per-pair memory is capped at `max_hits`; append stays O(1) until coalesced.
+/// - Single allocation for all pairs; no per-(rule, variant) allocations.
+struct HitAccPool {
+    max_hits: u32,
+    pair_count: usize,
+
+    // Fixed-stride storage: base = pair * max_hits
+    windows: Vec<SpanU32>,
+    lens: Vec<u32>,
+
+    coalesced: Vec<SpanU32>,
+    coalesced_set: Vec<u8>, // 0/1
+
+    // Membership for touched pairs to keep touched_pairs unique.
+    touched: DynamicBitSet,
 }
 
-impl HitAccumulator {
-    fn with_capacity(cap: usize) -> Self {
-        assert!(cap > 0, "hit accumulator capacity must be > 0");
-        Self {
-            windows: ScratchVec::with_capacity(cap)
-                .expect("scratch hit accumulator allocation failed"),
-            coalesced: None,
+impl HitAccPool {
+    fn new(pair_count: usize, max_hits: usize) -> Result<Self, String> {
+        if max_hits == 0 {
+            return Err("hit accumulator max_hits must be > 0".to_string());
+        }
+        let max_hits_u32 = u32::try_from(max_hits)
+            .map_err(|_| "hit accumulator max_hits exceeds u32::MAX".to_string())?;
+        let total = pair_count
+            .checked_mul(max_hits)
+            .ok_or_else(|| "HitAccPool windows size overflow".to_string())?;
+
+        // SpanU32 is Copy; zero-init cost is one-time.
+        let windows = vec![SpanU32 { start: 0, end: 0 }; total];
+        let lens = vec![0u32; pair_count];
+        let coalesced = vec![SpanU32 { start: 0, end: 0 }; pair_count];
+        let coalesced_set = vec![0u8; pair_count];
+        let touched = DynamicBitSet::empty(pair_count);
+
+        Ok(Self {
+            max_hits: max_hits_u32,
+            pair_count,
+            windows,
+            lens,
+            coalesced,
+            coalesced_set,
+            touched,
+        })
+    }
+
+    #[inline]
+    fn pair_count(&self) -> usize {
+        self.pair_count
+    }
+
+    #[inline]
+    fn max_hits(&self) -> u32 {
+        self.max_hits
+    }
+
+    #[inline(always)]
+    fn reset_touched(&mut self, touched_pairs: &[u32]) {
+        // Clear membership bits only for touched pairs (O(#touched)).
+        for &p in touched_pairs {
+            self.touched.unset(p as usize);
         }
     }
 
-    fn push(&mut self, start: usize, end: usize, max_hits: usize) {
-        debug_assert!(max_hits > 0, "max_hits must be > 0");
-        let r = SpanU32::new(start, end);
-        if let Some(c) = self.coalesced.as_mut() {
-            // Once coalesced, we only widen the single window. This ensures
-            // correctness (superset) while bounding per-rule memory.
-            c.start = c.start.min(r.start);
-            c.end = c.end.max(r.end);
+    #[inline(always)]
+    fn mark_touched(&mut self, pair: usize, touched_pairs: &mut ScratchVec<u32>) {
+        // membership check
+        if !self.touched.is_set(pair) {
+            self.touched.set(pair);
+            touched_pairs.push(pair as u32);
+        }
+    }
+
+    #[inline(always)]
+    fn push_span(&mut self, pair: usize, span: SpanU32, touched_pairs: &mut ScratchVec<u32>) {
+        self.mark_touched(pair, touched_pairs);
+
+        if self.coalesced_set[pair] != 0 {
+            // Expand coalesced window
+            let c = &mut self.coalesced[pair];
+            c.start = c.start.min(span.start);
+            c.end = c.end.max(span.end);
             return;
         }
 
-        if self.windows.len() < max_hits {
-            self.windows.push(r);
+        let len = self.lens[pair] as usize;
+        let max_hits = self.max_hits as usize;
+        if len < max_hits {
+            let base = pair * max_hits;
+            self.windows[base + len] = span;
+            self.lens[pair] = (len + 1) as u32;
             return;
         }
 
-        // Switch to coalesced fallback once we exceed the hit cap.
-        // This trades precision for deterministic memory usage.
-        let mut c = self.windows[0];
-        let win_len = self.windows.len();
-        for i in 1..win_len {
-            let w = self.windows[i];
-            c.start = c.start.min(w.start);
-            c.end = c.end.max(w.end);
+        // Overflow: coalesce everything into one span and drop the per-hit list.
+        let base = pair * max_hits;
+        let mut lo = span.start;
+        let mut hi = span.end;
+        for i in 0..len {
+            let s = self.windows[base + i];
+            lo = lo.min(s.start);
+            hi = hi.max(s.end);
         }
-        c.start = c.start.min(r.start);
-        c.end = c.end.max(r.end);
-
-        self.windows.clear();
-        self.coalesced = Some(c);
+        self.coalesced[pair] = SpanU32 { start: lo, end: hi };
+        self.coalesced_set[pair] = 1;
+        self.lens[pair] = 0;
     }
 
-    fn reset(&mut self) {
-        self.windows.clear();
-        self.coalesced = None;
-    }
-
-    fn capacity(&self) -> usize {
-        self.windows.capacity()
-    }
-
-    /// Drains accumulated windows into `out`, preserving either the coalesced
-    /// superset or the precise window list.
-    ///
-    /// This clears internal state so subsequent pushes start fresh.
-    fn take_into(&mut self, out: &mut ScratchVec<SpanU32>) {
+    #[inline(always)]
+    fn take_into(&mut self, pair: usize, out: &mut ScratchVec<SpanU32>) {
         out.clear();
-        if let Some(c) = self.coalesced.take() {
-            out.push(c);
-        } else {
-            let len = self.windows.len();
-            for i in 0..len {
-                out.push(self.windows[i]);
-            }
-            self.windows.clear();
+
+        if self.coalesced_set[pair] != 0 {
+            out.push(self.coalesced[pair]);
+            self.coalesced_set[pair] = 0;
+            return;
         }
+
+        let len = self.lens[pair] as usize;
+        if len == 0 {
+            return;
+        }
+        let max_hits = self.max_hits as usize;
+        let base = pair * max_hits;
+        for i in 0..len {
+            out.push(self.windows[base + i]);
+        }
+        self.lens[pair] = 0;
+    }
+
+    #[inline(always)]
+    fn reset_pair(&mut self, pair: usize) {
+        self.lens[pair] = 0;
+        self.coalesced_set[pair] = 0;
     }
 }
 
@@ -701,15 +765,19 @@ pub struct ScanScratch {
     stream_hit_counts: Vec<u32>,
     /// Scratch list of touched stream hit counters for fast reset.
     stream_hit_touched: ScratchVec<u32>,
-    accs: Vec<[HitAccumulator; 3]>, // Per (rule, variant) hit accumulators.
-    touched_pairs: ScratchVec<u32>, // Scratch list of touched pairs.
-    touched: DynamicBitSet,         // Bitset for touched pairs.
-    touched_any: bool,              // Fast path for "none touched".
-    windows: ScratchVec<SpanU32>,   // Merged windows for a pair.
-    expanded: ScratchVec<SpanU32>,  // Expanded windows for two-phase rules.
-    spans: ScratchVec<SpanU32>,     // Transform span candidates.
+    hit_acc_pool: HitAccPool, // Per-(rule, variant) hit accumulator pool.
+    touched_pairs: ScratchVec<u32>, // Scratch list of touched pairs (unique).
+    windows: ScratchVec<SpanU32>, // Merged windows for a pair.
+    expanded: ScratchVec<SpanU32>, // Expanded windows for two-phase rules.
+    spans: ScratchVec<SpanU32>, // Transform span candidates.
     /// Raw Vectorscan regex matches captured for direct validation.
     raw_hs_matches: Vec<RawHsMatch>,
+    /// Total prefilter hits seen in the current raw scan (for Auto fallback).
+    prefilter_hits: u32,
+    /// Hit limit that triggers an early prefilter abort (0 = disabled).
+    prefilter_hit_limit: u32,
+    /// True if the current prefilter scan aborted early due to density.
+    prefilter_aborted: bool,
     /// Decode provenance arena.
     ///
     /// Stores parent-linked decode steps so findings can reconstruct their
@@ -730,10 +798,12 @@ pub struct ScanScratch {
     /// during materialization. Capacity is bounded by `max_transform_depth`.
     steps_buf: ScratchVec<DecodeStep>,
 
-    /// Per-thread Vectorscan scratch space (present when the prefilter DB is active).
+    /// Per-thread Vectorscan scratch space for the regex prefilter DB.
     ///
     /// Vectorscan requires each scanning thread to have its own scratch memory.
-    vs_scratch: Option<VsScratch>,
+    vs_regex_scratch: Option<VsScratch>,
+    /// Per-thread Vectorscan scratch space for the anchor-literal prefilter DB.
+    vs_anchor_scratch: Option<VsScratch>,
     /// Per-thread Vectorscan scratch space for UTF-16 anchor prefiltering.
     vs_utf16_scratch: Option<VsScratch>,
     /// Per-thread Vectorscan scratch space for UTF-16 stream anchor scanning.
@@ -756,12 +826,10 @@ impl ScanScratch {
             .max()
             .unwrap_or(0);
         let max_findings = engine.tuning.max_findings_per_chunk;
-        let mut accs = Vec::with_capacity(rules_len);
-        for _ in 0..rules_len {
-            accs.push(std::array::from_fn(|_| {
-                HitAccumulator::with_capacity(engine.tuning.max_anchor_hits_per_rule_variant)
-            }));
-        }
+        let pair_count = rules_len.checked_mul(3).expect("rule pair count overflow");
+        let hit_acc_pool =
+            HitAccPool::new(pair_count, engine.tuning.max_anchor_hits_per_rule_variant)
+                .expect("hit accumulator pool allocation failed");
 
         let max_steps = engine.tuning.max_work_items.saturating_add(
             rules_len.saturating_mul(2 * engine.tuning.max_windows_per_rule_variant),
@@ -795,14 +863,15 @@ impl ScanScratch {
             span_streams: Vec::with_capacity(engine.transforms.len()),
             tmp_findings: Vec::with_capacity(max_findings),
             raw_hs_matches: Vec::new(),
+            prefilter_hits: 0,
+            prefilter_hit_limit: 0,
+            prefilter_aborted: false,
             stream_hit_counts: vec![0u32; rules_len.saturating_mul(3)],
             stream_hit_touched: ScratchVec::with_capacity(rules_len.saturating_mul(3))
                 .expect("scratch stream_hit_touched allocation failed"),
-            accs,
-            touched_pairs: ScratchVec::with_capacity(rules_len.saturating_mul(3))
+            hit_acc_pool,
+            touched_pairs: ScratchVec::with_capacity(pair_count)
                 .expect("scratch touched_pairs allocation failed"),
-            touched: DynamicBitSet::empty(rules_len.saturating_mul(3)),
-            touched_any: false,
             windows: ScratchVec::with_capacity(engine.tuning.max_anchor_hits_per_rule_variant)
                 .expect("scratch windows allocation failed"),
             expanded: ScratchVec::with_capacity(engine.tuning.max_windows_per_rule_variant)
@@ -819,9 +888,13 @@ impl ScanScratch {
                 engine.tuning.max_transform_depth.saturating_add(1),
             )
             .expect("scratch steps_buf allocation failed"),
-            vs_scratch: engine.vs.as_ref().map(|db| {
+            vs_regex_scratch: engine.vs_regex.as_ref().map(|db| {
                 db.alloc_scratch()
-                    .expect("vectorscan scratch allocation failed")
+                    .expect("vectorscan regex scratch allocation failed")
+            }),
+            vs_anchor_scratch: engine.vs_anchor.as_ref().map(|db| {
+                db.alloc_scratch()
+                    .expect("vectorscan anchor scratch allocation failed")
             }),
             vs_utf16_scratch: engine.vs_utf16.as_ref().map(|db| {
                 db.alloc_scratch()
@@ -864,6 +937,9 @@ impl ScanScratch {
         self.pending_spans.clear();
         self.span_streams.clear();
         self.tmp_findings.clear();
+        self.prefilter_hits = 0;
+        self.prefilter_hit_limit = 0;
+        self.prefilter_aborted = false;
         for idx in self.stream_hit_touched.drain() {
             let slot = idx as usize;
             if let Some(hit) = self.stream_hit_counts.get_mut(slot) {
@@ -876,22 +952,40 @@ impl ScanScratch {
         #[cfg(feature = "b64-stats")]
         self.base64_stats.reset();
 
-        match engine.vs.as_ref() {
+        match engine.vs_regex.as_ref() {
             Some(db) => {
-                let need_alloc = match self.vs_scratch.as_ref() {
+                let need_alloc = match self.vs_regex_scratch.as_ref() {
                     Some(s) => s.bound_db_ptr() != db.db_ptr(),
                     None => true,
                 };
                 if need_alloc {
-                    self.vs_scratch = Some(
+                    self.vs_regex_scratch = Some(
                         db.alloc_scratch()
-                            .expect("vectorscan scratch allocation failed"),
+                            .expect("vectorscan regex scratch allocation failed"),
                     );
                 }
             }
             None => {
-                // Drop scratch if the engine no longer has vectorscan enabled.
-                self.vs_scratch = None;
+                // Drop scratch if the engine no longer has regex prefiltering.
+                self.vs_regex_scratch = None;
+            }
+        }
+        match engine.vs_anchor.as_ref() {
+            Some(db) => {
+                let need_alloc = match self.vs_anchor_scratch.as_ref() {
+                    Some(s) => s.bound_db_ptr() != db.db_ptr(),
+                    None => true,
+                };
+                if need_alloc {
+                    self.vs_anchor_scratch = Some(
+                        db.alloc_scratch()
+                            .expect("vectorscan anchor scratch allocation failed"),
+                    );
+                }
+            }
+            None => {
+                // Drop scratch if the engine no longer has anchor prefiltering.
+                self.vs_anchor_scratch = None;
             }
         }
         match engine.vs_utf16.as_ref() {
@@ -962,36 +1056,28 @@ impl ScanScratch {
                 self.vs_gate_scratch = None;
             }
         }
+        self.hit_acc_pool
+            .reset_touched(self.touched_pairs.as_slice());
         self.touched_pairs.clear();
-        self.touched_any = false;
         self.windows.clear();
         self.expanded.clear();
         self.spans.clear();
         self.raw_hs_matches.clear();
 
-        let accs_need_rebuild = self.accs.len() != engine.rules.len()
-            || self
-                .accs
-                .first()
-                .map(|accs| accs[0].capacity() < engine.tuning.max_anchor_hits_per_rule_variant)
-                .unwrap_or(true);
+        let expected_pairs = engine.rules.len().saturating_mul(3);
+        let max_hits_u32 =
+            u32::try_from(engine.tuning.max_anchor_hits_per_rule_variant).unwrap_or(u32::MAX);
+        let accs_need_rebuild = self.hit_acc_pool.pair_count() != expected_pairs
+            || self.hit_acc_pool.max_hits() < max_hits_u32;
         if accs_need_rebuild {
-            self.accs.clear();
-            self.accs.reserve(engine.rules.len());
-            for _ in 0..engine.rules.len() {
-                self.accs.push(std::array::from_fn(|_| {
-                    HitAccumulator::with_capacity(engine.tuning.max_anchor_hits_per_rule_variant)
-                }));
-            }
+            self.hit_acc_pool = HitAccPool::new(
+                expected_pairs,
+                engine.tuning.max_anchor_hits_per_rule_variant,
+            )
+            .expect("hit accumulator pool allocation failed");
         }
-        let expected_bits = engine.rules.len().saturating_mul(3);
-        if self.touched.bit_length() != expected_bits {
-            self.touched = DynamicBitSet::empty(expected_bits);
-        } else {
-            self.touched.clear();
-        }
-        if self.touched_pairs.capacity() < expected_bits {
-            self.touched_pairs = ScratchVec::with_capacity(expected_bits)
+        if self.touched_pairs.capacity() < expected_pairs {
+            self.touched_pairs = ScratchVec::with_capacity(expected_pairs)
                 .expect("scratch touched_pairs allocation failed");
         }
         let max_spans = engine
@@ -1147,12 +1233,6 @@ impl ScanScratch {
             }
         }
         self.out.truncate(write_idx);
-    }
-
-    fn mark_touched(&mut self, rule_id: usize, variant: Variant) {
-        let idx = rule_id * 3 + variant.idx();
-        self.touched.set(idx);
-        self.touched_any = true;
     }
 
     /// Returns a shared view of accumulated finding records.
@@ -1331,13 +1411,13 @@ pub struct Engine {
     // Log2 lookup table for entropy gating.
     entropy_log2: Vec<f32>,
 
-    // Vectorscan/Hyperscan prefilter DB for raw scanning.
+    // Vectorscan/Hyperscan prefilter DBs for raw scanning.
     //
-    // Built during engine construction. Failures are fatal (fallback disabled),
-    // so this should be `Some` in normal builds. When present, it seeds
-    // candidate windows in a single `hs_scan` pass.
-    vs: Option<VsPrefilterDb>,
-    // Density gate to decide when raw Vectorscan is worthwhile.
+    // Built during engine construction. Failures are fatal (fallback disabled).
+    // `vs_regex` is the regex-prefilter DB; `vs_anchor` is the anchor-literal DB.
+    vs_regex: Option<VsPrefilterDb>,
+    vs_anchor: Option<VsPrefilterDb>,
+    // Density gate to decide when anchor literals are selective.
     raw_density_gate: Option<RawDensityGate>,
     // Optional Vectorscan DB for UTF-16 anchor scanning.
     //
@@ -1413,6 +1493,20 @@ pub struct VectorscanStats {
     pub stream_force_full: u64,
     /// Stream decode spans that exceeded the per-rule window cap.
     pub stream_window_cap_exceeded: u64,
+    /// Auto mode: buffers that used the anchor-literal prefilter.
+    pub auto_anchor_scans: u64,
+    /// Auto mode: buffers that used the regex prefilter.
+    pub auto_regex_scans: u64,
+    /// Auto mode: density gate allowed anchor prefiltering.
+    pub auto_gate_allow: u64,
+    /// Auto mode: density gate rejected anchor prefiltering.
+    pub auto_gate_reject: u64,
+    /// Auto mode: density gate unavailable.
+    pub auto_gate_missing: u64,
+    /// Auto mode: total bytes scanned with anchor-literal prefilter.
+    pub auto_anchor_bytes: u64,
+    /// Auto mode: total bytes scanned with regex prefilter.
+    pub auto_regex_bytes: u64,
 }
 
 #[cfg(feature = "stats")]
@@ -1429,6 +1523,13 @@ struct VectorscanCounters {
     anchor_skipped: AtomicU64,
     stream_force_full: AtomicU64,
     stream_window_cap_exceeded: AtomicU64,
+    auto_anchor_scans: AtomicU64,
+    auto_regex_scans: AtomicU64,
+    auto_gate_allow: AtomicU64,
+    auto_gate_reject: AtomicU64,
+    auto_gate_missing: AtomicU64,
+    auto_anchor_bytes: AtomicU64,
+    auto_regex_bytes: AtomicU64,
 }
 
 #[cfg(feature = "stats")]
@@ -1448,6 +1549,13 @@ impl VectorscanCounters {
             anchor_skipped: self.anchor_skipped.load(Ordering::Relaxed),
             stream_force_full: self.stream_force_full.load(Ordering::Relaxed),
             stream_window_cap_exceeded: self.stream_window_cap_exceeded.load(Ordering::Relaxed),
+            auto_anchor_scans: self.auto_anchor_scans.load(Ordering::Relaxed),
+            auto_regex_scans: self.auto_regex_scans.load(Ordering::Relaxed),
+            auto_gate_allow: self.auto_gate_allow.load(Ordering::Relaxed),
+            auto_gate_reject: self.auto_gate_reject.load(Ordering::Relaxed),
+            auto_gate_missing: self.auto_gate_missing.load(Ordering::Relaxed),
+            auto_anchor_bytes: self.auto_anchor_bytes.load(Ordering::Relaxed),
+            auto_regex_bytes: self.auto_regex_bytes.load(Ordering::Relaxed),
         }
     }
 }
@@ -1499,6 +1607,22 @@ impl Engine {
             .unwrap_or(0);
         let entropy_log2 = build_log2_table(max_entropy_len);
 
+        let raw_seed_radius_bytes = rules
+            .iter()
+            .map(|r| {
+                let seed = if let Some(tp) = &r.two_phase {
+                    tp.seed_radius
+                } else {
+                    r.radius
+                };
+                if seed > u32::MAX as usize {
+                    u32::MAX
+                } else {
+                    seed as u32
+                }
+            })
+            .collect::<Vec<_>>();
+
         let utf16_seed_radius_bytes = rules
             .iter()
             .map(|r| {
@@ -1523,6 +1647,7 @@ impl Engine {
             AHashMap::with_capacity(rules.len().saturating_mul(3).max(16));
         let mut pat_map_utf16: AHashMap<Vec<u8>, Vec<Target>> =
             AHashMap::with_capacity(rules.len().saturating_mul(2).max(16));
+        let mut has_raw_anchor = vec![false; rules.len()];
         let mut residue_rules: Vec<(usize, ResidueGatePlan)> = Vec::with_capacity(rules.len());
         let mut unfilterable_rules: Vec<(usize, UnfilterableReason)> =
             Vec::with_capacity(rules.len());
@@ -1570,6 +1695,7 @@ impl Engine {
                     }
                     for &a in r.anchors {
                         let keyword_implied = keyword_implied_for_anchor(a);
+                        has_raw_anchor[rid] = true;
                         add_pat_raw(
                             pat_map_raw,
                             a,
@@ -1670,6 +1796,7 @@ impl Engine {
                     }
                     for anchor in anchors {
                         let keyword_implied = keyword_implied_for_anchor(&anchor);
+                        has_raw_anchor[rid] = true;
                         add_pat_raw(
                             &mut pat_map_raw,
                             &anchor,
@@ -1723,10 +1850,8 @@ impl Engine {
             }
         }
 
-        let (anchor_patterns_raw, _pat_targets_raw, _pat_offsets_raw) =
-            map_to_patterns(pat_map_raw);
-        let (anchor_patterns_all, _pat_targets_all, _pat_offsets_all) =
-            map_to_patterns(pat_map_all);
+        let (anchor_patterns_raw, pat_targets_raw, pat_offsets_raw) = map_to_patterns(pat_map_raw);
+        let (anchor_patterns_all, pat_targets_all, pat_offsets_all) = map_to_patterns(pat_map_all);
         let (anchor_patterns_utf16, pat_targets_utf16, pat_offsets_utf16) =
             map_to_patterns(pat_map_utf16);
         let has_utf16_anchors = !anchor_patterns_utf16.is_empty();
@@ -1736,6 +1861,23 @@ impl Engine {
             .max()
             .unwrap_or(0);
         let raw_density_gate = RawDensityGate::build(&anchor_patterns_raw);
+        let build_anchor_db = matches!(
+            tuning.prefilter_mode,
+            PrefilterMode::AnchorLiterals | PrefilterMode::Auto
+        );
+        let build_regex_db = matches!(
+            tuning.prefilter_mode,
+            PrefilterMode::Regex | PrefilterMode::Auto
+        );
+        let fallback_rules: Vec<usize> = if build_anchor_db {
+            has_raw_anchor
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, has_anchor)| (!has_anchor).then_some(idx))
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         // Build the base64 pre-gate from the same anchor universe as the decoded gate:
         // raw anchors plus UTF-16 variants. This keeps the pre-gate *sound* with
@@ -1792,25 +1934,70 @@ impl Engine {
 
         // Required: if the DB can't be built (e.g. regex incompatibility),
         // fail fast rather than falling back to full-buffer scans.
-        let utf16_input = if tuning.scan_utf16_variants && has_utf16_anchors {
-            Some(Utf16AnchorInput {
-                patterns: &anchor_patterns_utf16,
-                pat_targets: &pat_targets_utf16,
-                pat_offsets: &pat_offsets_utf16,
-                seed_radius_bytes: &utf16_seed_radius_bytes,
-            })
+        let anchor_input_anchor = if build_anchor_db {
+            let (patterns, pat_targets, pat_offsets) = if tuning.scan_utf16_variants {
+                (&anchor_patterns_all, &pat_targets_all, &pat_offsets_all)
+            } else {
+                (&anchor_patterns_raw, &pat_targets_raw, &pat_offsets_raw)
+            };
+            if patterns.is_empty() {
+                None
+            } else {
+                Some(AnchorInput {
+                    patterns,
+                    pat_targets,
+                    pat_offsets,
+                    seed_radius_raw: &raw_seed_radius_bytes,
+                    seed_radius_utf16: &utf16_seed_radius_bytes,
+                })
+            }
         } else {
             None
         };
-        let vs = Some(
-            VsPrefilterDb::try_new(&rules, &tuning, utf16_input)
-                .expect("vectorscan prefilter db build failed (fallback disabled)"),
-        );
-        let max_prefilter_width = vs
+        let anchor_input_regex =
+            if build_regex_db && tuning.scan_utf16_variants && has_utf16_anchors {
+                Some(AnchorInput {
+                    patterns: &anchor_patterns_utf16,
+                    pat_targets: &pat_targets_utf16,
+                    pat_offsets: &pat_offsets_utf16,
+                    seed_radius_raw: &raw_seed_radius_bytes,
+                    seed_radius_utf16: &utf16_seed_radius_bytes,
+                })
+            } else {
+                None
+            };
+        let vs_anchor = if build_anchor_db {
+            let raw_rule_filter = Some(fallback_rules.as_slice());
+            Some(
+                VsPrefilterDb::try_new(&rules, &tuning, anchor_input_anchor, raw_rule_filter)
+                    .expect("vectorscan anchor prefilter db build failed (fallback disabled)"),
+            )
+        } else {
+            None
+        };
+        let vs_regex = if build_regex_db {
+            Some(
+                VsPrefilterDb::try_new(&rules, &tuning, anchor_input_regex, None)
+                    .expect("vectorscan regex prefilter db build failed (fallback disabled)"),
+            )
+        } else {
+            None
+        };
+        let max_regex_width = vs_regex
             .as_ref()
             .and_then(|db| db.max_match_width_bounded())
-            .map(|w| w as usize)
-            .unwrap_or(max_anchor_pat_len);
+            .map(|w| w as usize);
+        let max_anchor_width = vs_anchor
+            .as_ref()
+            .and_then(|db| db.max_match_width_bounded())
+            .map(|w| w as usize);
+        let mut max_prefilter_width = max_anchor_pat_len;
+        if let Some(w) = max_regex_width {
+            max_prefilter_width = max_prefilter_width.max(w);
+        }
+        if let Some(w) = max_anchor_width {
+            max_prefilter_width = max_prefilter_width.max(w);
+        }
         let vs_stream = VsStreamDb::try_new_stream(&rules, max_decoded_cap).ok();
         let needs_decoded_gate = transforms
             .iter()
@@ -1847,6 +2034,7 @@ impl Engine {
                 &anchor_patterns_utf16,
                 &pat_targets_utf16,
                 &pat_offsets_utf16,
+                &raw_seed_radius_bytes,
                 &utf16_seed_radius_bytes,
                 &tuning,
             ) {
@@ -1866,6 +2054,7 @@ impl Engine {
                 &anchor_patterns_utf16,
                 &pat_targets_utf16,
                 &pat_offsets_utf16,
+                &raw_seed_radius_bytes,
                 &utf16_seed_radius_bytes,
                 &tuning,
             ) {
@@ -1883,7 +2072,8 @@ impl Engine {
             transforms,
             tuning,
             entropy_log2,
-            vs,
+            vs_regex,
+            vs_anchor,
             raw_density_gate,
             vs_utf16,
             vs_utf16_stream,
@@ -1913,8 +2103,10 @@ impl Engine {
     /// Returns Vectorscan usage counters (feature: `stats`).
     #[cfg(feature = "stats")]
     pub fn vectorscan_stats(&self) -> VectorscanStats {
-        self.vs_stats
-            .snapshot(self.vs.is_some(), self.vs_utf16.is_some())
+        self.vs_stats.snapshot(
+            self.vs_regex.is_some() || self.vs_anchor.is_some(),
+            self.vs_utf16.is_some(),
+        )
     }
 
     /// Rules whose regex patterns could not be given a sound prefilter gate.
@@ -2313,75 +2505,243 @@ impl Engine {
         let merge_gap = self.tuning.merge_gap as u32;
         let pressure_gap_start = self.tuning.pressure_gap_start as u32;
 
+        // `touched_pairs` is cleared after each buffer; fast-path when empty.
+        debug_assert!(scratch.touched_pairs.is_empty());
+        if !scratch.touched_pairs.is_empty() {
+            scratch
+                .hit_acc_pool
+                .reset_touched(scratch.touched_pairs.as_slice());
+            scratch.touched_pairs.clear();
+        }
+        scratch.prefilter_hits = 0;
+        scratch.prefilter_hit_limit = 0;
+        scratch.prefilter_aborted = false;
+
         // Stage 1: Vectorscan prefilter on raw bytes (required).
-        let used_vectorscan = true;
-        let saw_utf16 = if let Some(vs) = self.vs.as_ref() {
-            let use_direct_raw = self.tuning.vs_direct_raw_regex && vs.supports_som();
-            let mut vs_scratch = scratch
-                .vs_scratch
-                .take()
-                .expect("vectorscan scratch missing");
-            #[cfg(feature = "stats")]
-            self.vs_stats
-                .scans_attempted
-                .fetch_add(1, Ordering::Relaxed);
-            let result = if use_direct_raw {
-                scratch.raw_hs_matches.clear();
-                vs.scan_raw_capture(buf, scratch, &mut vs_scratch)
-            } else {
-                vs.scan_raw(buf, scratch, &mut vs_scratch)
-            };
-            scratch.vs_scratch = Some(vs_scratch);
-            match result {
-                Ok(saw) => {
-                    #[cfg(feature = "stats")]
-                    self.vs_stats.scans_ok.fetch_add(1, Ordering::Relaxed);
-                    saw
-                }
-                Err(err) => {
-                    #[cfg(feature = "stats")]
-                    self.vs_stats.scans_err.fetch_add(1, Ordering::Relaxed);
-                    panic!("vectorscan scan failed with fallback disabled: {err}");
-                }
+        #[derive(Clone, Copy)]
+        enum AutoGateState {
+            Allow,
+            Reject,
+            Missing,
+        }
+
+        #[cfg(feature = "stats")]
+        let (vs, used_anchor_db, auto_gate_state) = match self.tuning.prefilter_mode {
+            PrefilterMode::Regex => (self.vs_regex.as_ref(), false, AutoGateState::Missing),
+            PrefilterMode::AnchorLiterals => {
+                (self.vs_anchor.as_ref(), true, AutoGateState::Missing)
             }
-        } else {
-            panic!("vectorscan prefilter database unavailable (fallback disabled)");
+            PrefilterMode::Auto => {
+                let (prefer_anchor, gate_state) = match self.raw_density_gate.as_ref() {
+                    Some(gate) => {
+                        if gate.allows_hs_strict(buf) {
+                            (true, AutoGateState::Allow)
+                        } else {
+                            (false, AutoGateState::Reject)
+                        }
+                    }
+                    None => (false, AutoGateState::Missing),
+                };
+                let (vs, used_anchor) = if prefer_anchor {
+                    if let Some(db) = self.vs_anchor.as_ref() {
+                        (Some(db), true)
+                    } else {
+                        (self.vs_regex.as_ref(), false)
+                    }
+                } else if let Some(db) = self.vs_regex.as_ref() {
+                    (Some(db), false)
+                } else if let Some(db) = self.vs_anchor.as_ref() {
+                    (Some(db), true)
+                } else {
+                    (None, false)
+                };
+                (vs, used_anchor, gate_state)
+            }
         };
+        #[cfg(not(feature = "stats"))]
+        let (vs, used_anchor_db, _auto_gate_state) = match self.tuning.prefilter_mode {
+            PrefilterMode::Regex => (self.vs_regex.as_ref(), false, AutoGateState::Missing),
+            PrefilterMode::AnchorLiterals => {
+                (self.vs_anchor.as_ref(), true, AutoGateState::Missing)
+            }
+            PrefilterMode::Auto => {
+                let (prefer_anchor, gate_state) = match self.raw_density_gate.as_ref() {
+                    Some(gate) => {
+                        if gate.allows_hs_strict(buf) {
+                            (true, AutoGateState::Allow)
+                        } else {
+                            (false, AutoGateState::Reject)
+                        }
+                    }
+                    None => (false, AutoGateState::Missing),
+                };
+                let (vs, used_anchor) = if prefer_anchor {
+                    if let Some(db) = self.vs_anchor.as_ref() {
+                        (Some(db), true)
+                    } else {
+                        (self.vs_regex.as_ref(), false)
+                    }
+                } else if let Some(db) = self.vs_regex.as_ref() {
+                    (Some(db), false)
+                } else if let Some(db) = self.vs_anchor.as_ref() {
+                    (Some(db), true)
+                } else {
+                    (None, false)
+                };
+                (vs, used_anchor, gate_state)
+            }
+        };
+        let mut vs = vs.expect("vectorscan prefilter database unavailable (fallback disabled)");
+        if used_anchor_db && matches!(self.tuning.prefilter_mode, PrefilterMode::Auto) {
+            let mut limit = buf.len() / 64;
+            limit = limit.clamp(256, 100_000);
+            scratch.prefilter_hit_limit = limit as u32;
+        }
+        let mut use_direct_raw =
+            !used_anchor_db && self.tuning.vs_direct_raw_regex && vs.supports_som();
+        let mut vs_scratch = if used_anchor_db {
+            scratch
+                .vs_anchor_scratch
+                .take()
+                .expect("vectorscan anchor scratch missing")
+        } else {
+            scratch
+                .vs_regex_scratch
+                .take()
+                .expect("vectorscan regex scratch missing")
+        };
+        #[cfg(feature = "stats")]
+        self.vs_stats
+            .scans_attempted
+            .fetch_add(1, Ordering::Relaxed);
+        let result = if use_direct_raw {
+            scratch.raw_hs_matches.clear();
+            vs.scan_raw_capture(buf, scratch, &mut vs_scratch)
+        } else {
+            vs.scan_raw(buf, scratch, &mut vs_scratch)
+        };
+        if used_anchor_db {
+            scratch.vs_anchor_scratch = Some(vs_scratch);
+        } else {
+            scratch.vs_regex_scratch = Some(vs_scratch);
+        }
+        #[cfg(feature = "stats")]
+        if matches!(self.tuning.prefilter_mode, PrefilterMode::Auto) {
+            match auto_gate_state {
+                AutoGateState::Allow => self
+                    .vs_stats
+                    .auto_gate_allow
+                    .fetch_add(1, Ordering::Relaxed),
+                AutoGateState::Reject => self
+                    .vs_stats
+                    .auto_gate_reject
+                    .fetch_add(1, Ordering::Relaxed),
+                AutoGateState::Missing => self
+                    .vs_stats
+                    .auto_gate_missing
+                    .fetch_add(1, Ordering::Relaxed),
+            };
+            if used_anchor_db {
+                self.vs_stats
+                    .auto_anchor_scans
+                    .fetch_add(1, Ordering::Relaxed);
+                self.vs_stats
+                    .auto_anchor_bytes
+                    .fetch_add(buf.len() as u64, Ordering::Relaxed);
+            } else {
+                self.vs_stats
+                    .auto_regex_scans
+                    .fetch_add(1, Ordering::Relaxed);
+                self.vs_stats
+                    .auto_regex_bytes
+                    .fetch_add(buf.len() as u64, Ordering::Relaxed);
+            }
+        }
+        let mut saw_utf16 = match result {
+            Ok(saw) => {
+                #[cfg(feature = "stats")]
+                self.vs_stats.scans_ok.fetch_add(1, Ordering::Relaxed);
+                saw
+            }
+            Err(err) => {
+                #[cfg(feature = "stats")]
+                self.vs_stats.scans_err.fetch_add(1, Ordering::Relaxed);
+                panic!("vectorscan scan failed with fallback disabled: {err}");
+            }
+        };
+        if used_anchor_db
+            && matches!(self.tuning.prefilter_mode, PrefilterMode::Auto)
+            && scratch.prefilter_aborted
+        {
+            scratch
+                .hit_acc_pool
+                .reset_touched(scratch.touched_pairs.as_slice());
+            scratch.touched_pairs.clear();
+            scratch.prefilter_hits = 0;
+            scratch.prefilter_hit_limit = 0;
+            scratch.prefilter_aborted = false;
+
+            if let Some(vs_regex) = self.vs_regex.as_ref() {
+                let mut vs_scratch = scratch
+                    .vs_regex_scratch
+                    .take()
+                    .expect("vectorscan regex scratch missing");
+                #[cfg(feature = "stats")]
+                self.vs_stats
+                    .scans_attempted
+                    .fetch_add(1, Ordering::Relaxed);
+                let result = vs_regex.scan_raw(buf, scratch, &mut vs_scratch);
+                scratch.vs_regex_scratch = Some(vs_scratch);
+                match result {
+                    Ok(saw) => {
+                        #[cfg(feature = "stats")]
+                        self.vs_stats.scans_ok.fetch_add(1, Ordering::Relaxed);
+                        saw_utf16 = saw;
+                    }
+                    Err(err) => {
+                        #[cfg(feature = "stats")]
+                        self.vs_stats.scans_err.fetch_add(1, Ordering::Relaxed);
+                        panic!("vectorscan scan failed with fallback disabled: {err}");
+                    }
+                }
+                use_direct_raw = false;
+                vs = vs_regex;
+            }
+        }
+        let used_vectorscan = true;
 
         let used_vectorscan_utf16 = saw_utf16;
 
-        if let Some(vs) = self.vs.as_ref() {
-            if !vs.raw_missing_rules().is_empty() {
-                panic!(
-                    "vectorscan raw db missing {} rule patterns (fallback disabled)",
-                    vs.raw_missing_rules().len()
-                );
-            }
+        if !vs.raw_missing_rules().is_empty() {
+            panic!(
+                "vectorscan raw db missing {} rule patterns (fallback disabled)",
+                vs.raw_missing_rules().len()
+            );
         }
 
-        if let Some(vs) = self.vs.as_ref() {
-            if used_vectorscan && self.tuning.vs_direct_raw_regex && vs.supports_som() {
-                let raw_matches: Vec<RawHsMatch> = scratch.raw_hs_matches.drain(..).collect();
-                for m in raw_matches {
-                    let rid = m.rule_id as usize;
-                    if rid >= self.rules.len() {
-                        continue;
-                    }
-                    let rule = &self.rules[rid];
-                    let w = m.start as usize..m.end as usize;
-                    self.run_rule_on_raw_match(
-                        rid as u32,
-                        rule,
-                        buf,
-                        w,
-                        step_id,
-                        root_hint.clone(),
-                        base_offset,
-                        file_id,
-                        scratch,
-                    );
+        if use_direct_raw {
+            let mut raw_matches = Vec::new();
+            std::mem::swap(&mut raw_matches, &mut scratch.raw_hs_matches);
+            for m in raw_matches.drain(..) {
+                let rid = m.rule_id as usize;
+                if rid >= self.rules.len() {
+                    continue;
                 }
+                let rule = &self.rules[rid];
+                let w = m.start as usize..m.end as usize;
+                self.run_rule_on_raw_match(
+                    rid as u32,
+                    rule,
+                    buf,
+                    w,
+                    step_id,
+                    root_hint.clone(),
+                    base_offset,
+                    file_id,
+                    scratch,
+                );
             }
+            std::mem::swap(&mut raw_matches, &mut scratch.raw_hs_matches);
         }
 
         #[cfg(feature = "stats")]
@@ -2399,7 +2759,7 @@ impl Engine {
             }
         }
 
-        if !scratch.touched_any {
+        if scratch.touched_pairs.is_empty() {
             return;
         }
 
@@ -2407,12 +2767,6 @@ impl Engine {
         // prefilter hit in this buffer. This avoids O(rules * variants) work
         // when nothing matched, which is critical once rule counts grow.
         const VARIANTS: [Variant; 3] = [Variant::Raw, Variant::Utf16Le, Variant::Utf16Be];
-        scratch.touched_pairs.clear();
-        for pair in scratch.touched.iter_set() {
-            scratch.touched_pairs.push(pair as u32);
-        }
-        scratch.touched.clear();
-        scratch.touched_any = false;
         let touched_len = scratch.touched_pairs.len();
         for i in 0..touched_len {
             let pair = scratch.touched_pairs[i] as usize;
@@ -2421,10 +2775,7 @@ impl Engine {
             let variant = VARIANTS[vidx];
             let rule = &self.rules[rid];
 
-            {
-                let acc = &mut scratch.accs[rid][vidx];
-                acc.take_into(&mut scratch.windows);
-            }
+            scratch.hit_acc_pool.take_into(pair, &mut scratch.windows);
             if scratch.windows.is_empty() {
                 continue;
             }
@@ -2452,14 +2803,7 @@ impl Engine {
                 self.tuning.max_windows_per_rule_variant,
             );
 
-            let allow_two_phase = !(used_vectorscan
-                && self.tuning.vs_direct_raw_regex
-                && variant == Variant::Raw
-                && self
-                    .vs
-                    .as_ref()
-                    .map(|db| db.supports_som())
-                    .unwrap_or(false));
+            let allow_two_phase = !(use_direct_raw && variant == Variant::Raw);
             if allow_two_phase {
                 if let Some(tp) = &rule.two_phase {
                     // Two-phase: confirm in seed windows, then expand.
@@ -2531,6 +2875,10 @@ impl Engine {
                 );
             }
         }
+        scratch
+            .hit_acc_pool
+            .reset_touched(scratch.touched_pairs.as_slice());
+        scratch.touched_pairs.clear();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3953,9 +4301,13 @@ impl Engine {
                         .utf16_scans_attempted
                         .fetch_add(1, Ordering::Relaxed);
 
-                    scratch.touched.clear();
-                    scratch.touched_pairs.clear();
-                    scratch.touched_any = false;
+                    debug_assert!(scratch.touched_pairs.is_empty());
+                    if !scratch.touched_pairs.is_empty() {
+                        scratch
+                            .hit_acc_pool
+                            .reset_touched(scratch.touched_pairs.as_slice());
+                        scratch.touched_pairs.clear();
+                    }
 
                     let decoded_end = decoded_full_start.saturating_add(decoded_full_len);
                     let (decoded_ptr, decoded_len) = {
@@ -3969,9 +4321,9 @@ impl Engine {
                     let result = vs_utf16.scan_utf16(decoded, scratch, &mut vs_utf16_scratch);
                     scratch.vs_utf16_scratch = Some(vs_utf16_scratch);
 
-                    let used_vectorscan_utf16 = result.is_ok();
+                    let used_vectorscan_utf16 = result.as_ref().map(|saw| *saw).unwrap_or(false);
                     match result {
-                        Ok(()) => {
+                        Ok(_) => {
                             #[cfg(feature = "stats")]
                             self.vs_stats.utf16_scans_ok.fetch_add(1, Ordering::Relaxed);
                         }
@@ -3981,35 +4333,24 @@ impl Engine {
                                 .utf16_scans_err
                                 .fetch_add(1, Ordering::Relaxed);
 
-                            if scratch.touched_any {
-                                scratch.touched_pairs.clear();
-                                for pair in scratch.touched.iter_set() {
-                                    scratch.touched_pairs.push(pair as u32);
-                                }
-                                scratch.touched.clear();
-                                scratch.touched_any = false;
+                            if !scratch.touched_pairs.is_empty() {
                                 let touched_len = scratch.touched_pairs.len();
                                 for i in 0..touched_len {
                                     let pair = scratch.touched_pairs[i] as usize;
-                                    let rid = pair / 3;
-                                    let vidx = pair % 3;
-                                    scratch.accs[rid][vidx].reset();
+                                    scratch.hit_acc_pool.reset_pair(pair);
                                 }
+                                scratch
+                                    .hit_acc_pool
+                                    .reset_touched(scratch.touched_pairs.as_slice());
                                 scratch.touched_pairs.clear();
                             }
                             // Skip UTF-16 scan on error.
                         }
                     }
 
-                    if scratch.touched_any {
+                    if !scratch.touched_pairs.is_empty() {
                         const VARIANTS: [Variant; 3] =
                             [Variant::Raw, Variant::Utf16Le, Variant::Utf16Be];
-                        scratch.touched_pairs.clear();
-                        for pair in scratch.touched.iter_set() {
-                            scratch.touched_pairs.push(pair as u32);
-                        }
-                        scratch.touched.clear();
-                        scratch.touched_any = false;
                         let touched_len = scratch.touched_pairs.len();
                         let hay_len = decoded_len as u32;
                         let merge_gap = self.tuning.merge_gap as u32;
@@ -4025,10 +4366,7 @@ impl Engine {
                             }
                             let rule = &self.rules[rid];
 
-                            {
-                                let acc = &mut scratch.accs[rid][vidx];
-                                acc.take_into(&mut scratch.windows);
-                            }
+                            scratch.hit_acc_pool.take_into(pair, &mut scratch.windows);
                             if scratch.windows.is_empty() {
                                 continue;
                             }
@@ -4123,6 +4461,10 @@ impl Engine {
                                 }
                             }
                         }
+                        scratch
+                            .hit_acc_pool
+                            .reset_touched(scratch.touched_pairs.as_slice());
+                        scratch.touched_pairs.clear();
                     }
                 }
             }

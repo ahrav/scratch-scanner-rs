@@ -36,6 +36,10 @@ const PREFILTER_MIN_LEN: usize = 64;
 const START_MAX_HIT_RATE: f32 = 0.45;
 /// Max acceptable hit rate for rare-byte gating.
 const RARE_MAX_HIT_RATE: f32 = 0.15;
+/// Stricter max hit rate for start-byte gating (Auto mode).
+const START_MAX_HIT_RATE_STRICT: f32 = 0.30;
+/// Stricter max hit rate for rare-byte gating (Auto mode).
+const RARE_MAX_HIT_RATE_STRICT: f32 = 0.08;
 /// Primary rare-byte set size budget.
 const RARE_MAX_BYTES_PRIMARY: usize = 16;
 /// Fallback rare-byte set size budget.
@@ -70,11 +74,14 @@ const BYTE_FREQ_RANK: [u8; 256] = [
 /// Fixed-size byte set with constant-time membership tests.
 #[derive(Clone, Debug)]
 struct ByteSet {
+    /// Lookup table: `table[b] != 0` means byte `b` is in the set.
     table: [u8; 256],
+    /// Deduplicated list of bytes in the set (sorted after `finalize()`).
     bytes: Vec<u8>,
 }
 
 impl ByteSet {
+    /// Creates an empty byte set.
     fn empty() -> Self {
         Self {
             table: [0u8; 256],
@@ -82,6 +89,7 @@ impl ByteSet {
         }
     }
 
+    /// Inserts a byte into the set (no-op if already present).
     fn insert(&mut self, b: u8) {
         let idx = b as usize;
         if self.table[idx] == 0 {
@@ -90,22 +98,27 @@ impl ByteSet {
         }
     }
 
+    /// Returns true if the byte is in the set.
     fn contains(&self, b: u8) -> bool {
         self.table[b as usize] != 0
     }
 
+    /// Returns the number of distinct bytes in the set.
     fn len(&self) -> usize {
         self.bytes.len()
     }
 
+    /// Returns true if the set contains no bytes.
     fn is_empty(&self) -> bool {
         self.bytes.is_empty()
     }
 
+    /// Sorts the byte list for deterministic iteration order.
     fn finalize(&mut self) {
         self.bytes.sort_unstable();
     }
 
+    /// Counts how many bytes in `hay` are members of this set.
     fn count_hits(&self, hay: &[u8]) -> usize {
         let mut hits = 0usize;
         for &b in hay {
@@ -187,19 +200,59 @@ impl RawDensityGate {
 
         start_ok || rare_ok
     }
+
+    /// Returns true when Vectorscan should run on this buffer (strict mode).
+    ///
+    /// When both gates are available, require *both* to pass; otherwise use
+    /// the single available gate. This is more conservative than `allows_hs`
+    /// and is intended for Auto-mode decisions where regressions are costly.
+    pub(super) fn allows_hs_strict(&self, hay: &[u8]) -> bool {
+        if hay.len() < PREFILTER_MIN_LEN {
+            return false;
+        }
+
+        let start_ok = self
+            .start
+            .as_ref()
+            .map(|p| p.sample_hit_rate(hay) <= START_MAX_HIT_RATE_STRICT);
+        let rare_ok = self
+            .rare
+            .as_ref()
+            .map(|p| p.sample_hit_rate(hay) <= RARE_MAX_HIT_RATE_STRICT);
+
+        match (start_ok, rare_ok) {
+            (Some(s), Some(r)) => s && r,
+            (Some(s), None) => s,
+            (None, Some(r)) => r,
+            (None, None) => false,
+        }
+    }
 }
 
 /// Per-pattern byte candidate with scoring and span metadata.
+///
+/// Used during rare-byte selection to rank candidate bytes by frequency
+/// and positional stability within a pattern.
 #[derive(Clone, Copy, Debug)]
 struct PatternByteInfo {
+    /// The candidate byte value.
     byte: u8,
+    /// Earliest offset where this byte appears in the pattern.
     min_offset: u32,
+    /// Latest offset where this byte appears in the pattern.
     max_offset: u32,
+    /// Suffix length after the earliest occurrence (`len - min_offset`).
     tail: u32,
+    /// Approximate span: `max_offset + tail`. Smaller is better for anchoring.
     span: u32,
+    /// Selection score: `freq_rank + 2*span`. Lower scores are preferred.
     score: u32,
 }
 
+/// Builds the start-byte gate from anchor patterns.
+///
+/// Collects the first byte of each pattern into a set. Returns `None` if
+/// any pattern is empty (since there's no first byte to collect).
 fn build_start_gate(patterns: &[Vec<u8>]) -> Option<ByteSetGate> {
     let mut set = ByteSet::empty();
 
@@ -218,6 +271,14 @@ fn build_start_gate(patterns: &[Vec<u8>]) -> Option<ByteSetGate> {
     Some(ByteSetGate { set })
 }
 
+/// Builds the rare-byte gate from anchor patterns.
+///
+/// For each pattern, selects a "rare" byte based on frequency rank and
+/// positional span. Prefers reusing already-selected bytes to keep the
+/// gate set small. Returns `None` if:
+/// - Any pattern is empty
+/// - The rare-byte set exceeds size limits
+/// - Any selected byte has offset/span beyond configured thresholds
 fn build_rare_gate(patterns: &[Vec<u8>]) -> Option<ByteSetGate> {
     if patterns.is_empty() {
         return None;
@@ -252,11 +313,8 @@ fn build_rare_gate(patterns: &[Vec<u8>]) -> Option<ByteSetGate> {
             }
             let min_offset = min_off[idx];
             let max_offset = max_off[idx];
-            // Tail is the suffix length after the earliest occurrence.
             let tail = len.saturating_sub(min_offset);
-            // Span approximates how far the byte can appear within the pattern.
             let span = max_offset.saturating_add(tail);
-            // Score favors rare bytes, then tighter spans.
             let freq = BYTE_FREQ_RANK[idx] as u32;
             let score = freq.saturating_add(span.saturating_mul(2));
             bytes.push(PatternByteInfo {
@@ -340,6 +398,14 @@ fn build_rare_gate(patterns: &[Vec<u8>]) -> Option<ByteSetGate> {
     Some(ByteSetGate { set })
 }
 
+/// Attempts to assign a rare byte from each pattern within a size budget.
+///
+/// Processes patterns in `order` (typically fewest-candidates-first), reusing
+/// already-assigned bytes when possible. Returns `true` if all patterns were
+/// assigned within `max_bytes`; `false` otherwise.
+///
+/// On success, `set` contains the selected bytes and `assignments` contains
+/// the chosen `PatternByteInfo` for each pattern (in pattern order).
 fn try_assign(
     pattern_info: &[Vec<PatternByteInfo>],
     order: &[usize],

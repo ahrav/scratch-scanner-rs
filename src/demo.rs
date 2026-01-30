@@ -1,5 +1,6 @@
 use crate::api::{
-    AnchorPolicy, Gate, RuleSpec, TransformConfig, TransformId, TransformMode, Tuning,
+    AnchorPolicy, Gate, PrefilterMode, RuleSpec, TransformConfig, TransformId, TransformMode,
+    Tuning,
 };
 use crate::engine::Engine;
 use crate::gitleaks_rules::gitleaks_rules;
@@ -29,6 +30,15 @@ pub fn demo_engine_with_anchor_mode(mode: AnchorMode) -> Engine {
         AnchorMode::Derived => AnchorPolicy::DerivedOnly,
     };
     Engine::new_with_anchor_policy(demo_rules(), demo_transforms(), demo_tuning(), policy)
+}
+
+/// Builds a demo engine with the specified anchor mode and tuning.
+pub fn demo_engine_with_anchor_mode_and_tuning(mode: AnchorMode, tuning: Tuning) -> Engine {
+    let policy = match mode {
+        AnchorMode::Manual => AnchorPolicy::ManualOnly,
+        AnchorMode::Derived => AnchorPolicy::DerivedOnly,
+    };
+    Engine::new_with_anchor_policy(demo_rules(), demo_transforms(), tuning, policy)
 }
 
 /// Builds a demo engine with the specified anchor mode and transform depth cap.
@@ -77,7 +87,7 @@ pub(crate) fn demo_transforms() -> Vec<TransformConfig> {
     ]
 }
 
-pub(crate) fn demo_tuning() -> Tuning {
+pub fn demo_tuning() -> Tuning {
     Tuning {
         merge_gap: 64,
         max_windows_per_rule_variant: 16,
@@ -90,5 +100,6 @@ pub(crate) fn demo_tuning() -> Tuning {
         max_findings_per_chunk: 8192,
         scan_utf16_variants: true,
         vs_direct_raw_regex: false,
+        prefilter_mode: PrefilterMode::Auto,
     }
 }

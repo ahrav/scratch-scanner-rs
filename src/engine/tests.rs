@@ -2131,11 +2131,15 @@ mod proptests {
         }
 
         #[test]
-        fn prop_hit_accumulator_coalesces(
+        fn prop_hit_acc_pool_coalesces(
             ranges in prop::collection::vec((0u32..512, 0u32..512), 0..128),
             max_hits in 1usize..32
         ) {
-            let mut acc = HitAccumulator::with_capacity(max_hits);
+            let mut acc =
+                HitAccPool::new(1, max_hits).expect("hit accumulator pool allocation failed");
+            let mut touched_pairs: ScratchVec<u32> =
+                ScratchVec::with_capacity(1).expect("scratch touched_pairs allocation failed");
+            let pair = 0usize;
             let mut ref_windows: Vec<SpanU32> = Vec::new();
             let mut ref_coalesced: Option<SpanU32> = None;
 
@@ -2143,7 +2147,7 @@ mod proptests {
                 let (start, end) = if a <= b { (a, b) } else { (b, a) };
                 let start = start as usize;
                 let end = end as usize;
-                acc.push(start, end, max_hits);
+                acc.push_span(pair, SpanU32::new(start, end), &mut touched_pairs);
 
                 let r = SpanU32::new(start, end);
                 if let Some(c) = ref_coalesced.as_mut() {
@@ -2164,15 +2168,23 @@ mod proptests {
                 }
             }
 
-            match (acc.coalesced, ref_coalesced) {
+            let acc_coalesced = if acc.coalesced_set[pair] != 0 {
+                Some(acc.coalesced[pair])
+            } else {
+                None
+            };
+
+            match (acc_coalesced, ref_coalesced) {
                 (Some(actual), Some(expected)) => {
                     prop_assert_eq!(actual, expected);
-                    prop_assert_eq!(acc.windows.len(), 0);
+                    prop_assert_eq!(acc.lens[pair], 0);
                 }
                 (None, None) => {
-                    prop_assert_eq!(acc.windows.len(), ref_windows.len());
+                    let len = acc.lens[pair] as usize;
+                    prop_assert_eq!(len, ref_windows.len());
+                    let base = pair * max_hits;
                     for (i, expected) in ref_windows.iter().enumerate() {
-                        prop_assert_eq!(acc.windows[i], *expected);
+                        prop_assert_eq!(acc.windows[base + i], *expected);
                     }
                 }
                 _ => {

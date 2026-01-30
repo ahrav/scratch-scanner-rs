@@ -21,7 +21,9 @@
 //! Notes:
 //! - Hardware counters are Linux-only and best-effort. Use --disable-hw-counters to skip them.
 
-use scanner_rs::{demo_engine_with_anchor_mode, AnchorMode, Engine};
+use scanner_rs::{
+    demo_engine_with_anchor_mode_and_tuning, demo_tuning, AnchorMode, Engine, PrefilterMode,
+};
 use std::env;
 use std::fs::File;
 use std::hint::black_box;
@@ -104,16 +106,20 @@ impl XorShift64 {
 /// Each variant stresses a different encoding or hit distribution.
 enum DatasetKind {
     Random,
+    AsciiNoise,
     AsciiHits,
+    AnchorDense,
     Utf16LeHits,
     Utf16BeHits,
     Base64Hits,
 }
 
 impl DatasetKind {
-    const ALL: [DatasetKind; 5] = [
+    const ALL: [DatasetKind; 7] = [
         DatasetKind::Random,
+        DatasetKind::AsciiNoise,
         DatasetKind::AsciiHits,
+        DatasetKind::AnchorDense,
         DatasetKind::Utf16LeHits,
         DatasetKind::Utf16BeHits,
         DatasetKind::Base64Hits,
@@ -122,7 +128,9 @@ impl DatasetKind {
     fn name(self) -> &'static str {
         match self {
             DatasetKind::Random => "random",
+            DatasetKind::AsciiNoise => "ascii_noise",
             DatasetKind::AsciiHits => "ascii_hits",
+            DatasetKind::AnchorDense => "anchor_dense",
             DatasetKind::Utf16LeHits => "utf16le_hits",
             DatasetKind::Utf16BeHits => "utf16be_hits",
             DatasetKind::Base64Hits => "base64_hits",
@@ -133,7 +141,9 @@ impl DatasetKind {
     fn build(self, len: usize) -> Vec<u8> {
         match self {
             DatasetKind::Random => make_random(len, 0x1234_5678_9abc_def0),
+            DatasetKind::AsciiNoise => make_ascii_noise(len),
             DatasetKind::AsciiHits => make_ascii_hits(len),
+            DatasetKind::AnchorDense => make_anchor_dense(len),
             DatasetKind::Utf16LeHits => make_utf16_hits(len, false),
             DatasetKind::Utf16BeHits => make_utf16_hits(len, true),
             DatasetKind::Base64Hits => make_base64_hits(len),
@@ -162,6 +172,24 @@ fn make_ascii_hits(len: usize) -> Vec<u8> {
     rng.fill_ascii(&mut buf);
     inject_token(&mut buf, AWS_TOKEN, 4 * 1024);
     inject_token(&mut buf, GHP_TOKEN, 16 * 1024);
+    buf
+}
+
+/// ASCII letter corpus with no injected tokens (source-like, no secrets).
+fn make_ascii_noise(len: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; len];
+    let mut rng = XorShift64::new(0x2222_3333_4444_5555);
+    rng.fill_ascii(&mut buf);
+    buf
+}
+
+/// ASCII corpus with dense injected tokens (high anchor density).
+fn make_anchor_dense(len: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; len];
+    let mut rng = XorShift64::new(0x3333_4444_5555_6666);
+    rng.fill_ascii(&mut buf);
+    inject_token(&mut buf, AWS_TOKEN, 128);
+    inject_token(&mut buf, GHP_TOKEN, 512);
     buf
 }
 
@@ -1192,14 +1220,30 @@ impl BenchmarkSuite {
             println!("=== Scanner Benchmark Suite ===\n");
         }
 
+        let mut base = demo_tuning();
+        base.prefilter_mode = PrefilterMode::Regex;
+        let mut anchor = demo_tuning();
+        anchor.prefilter_mode = PrefilterMode::AnchorLiterals;
+
         let engines = vec![
             EngineVariant {
-                name: "manual",
-                engine: demo_engine_with_anchor_mode(AnchorMode::Manual),
+                name: "manual_regex",
+                engine: demo_engine_with_anchor_mode_and_tuning(AnchorMode::Manual, base.clone()),
             },
             EngineVariant {
-                name: "derived",
-                engine: demo_engine_with_anchor_mode(AnchorMode::Derived),
+                name: "manual_anchor",
+                engine: demo_engine_with_anchor_mode_and_tuning(AnchorMode::Manual, anchor.clone()),
+            },
+            EngineVariant {
+                name: "derived_regex",
+                engine: demo_engine_with_anchor_mode_and_tuning(AnchorMode::Derived, base.clone()),
+            },
+            EngineVariant {
+                name: "derived_anchor",
+                engine: demo_engine_with_anchor_mode_and_tuning(
+                    AnchorMode::Derived,
+                    anchor.clone(),
+                ),
             },
         ];
 
@@ -1222,12 +1266,22 @@ impl BenchmarkSuite {
     fn list_tests(&self) {
         let mut names = Vec::new();
         for &size in SIZE_SWEEP {
-            for engine in ["manual", "derived"] {
+            for engine in [
+                "manual_regex",
+                "manual_anchor",
+                "derived_regex",
+                "derived_anchor",
+            ] {
                 names.push(test_name_size(DatasetKind::Random.name(), size, engine));
             }
         }
         for kind in DatasetKind::ALL {
-            for engine in ["manual", "derived"] {
+            for engine in [
+                "manual_regex",
+                "manual_anchor",
+                "derived_regex",
+                "derived_anchor",
+            ] {
                 names.push(test_name_dataset(kind.name(), engine));
             }
         }

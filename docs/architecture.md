@@ -73,9 +73,9 @@ Key details:
   Small fixed-capacity hash set used to dedupe decoded buffers (128-bit keys).
   Generation counters make reset O(1) without clearing memory.
 
-- HitAccumulator
-  Collects anchor hit windows and switches to a single coalesced window when
-  hit volume exceeds a configured limit.
+- HitAccPool (hit accumulator pool)
+  Collects anchor hit windows for all (rule, variant) pairs and switches a pair
+  to a single coalesced window when hit volume exceeds a configured limit.
 
 ## Findings and Spans
 

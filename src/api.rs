@@ -34,6 +34,11 @@ use std::ops::Range;
 /// This is not a filesystem path; callers must look up metadata in the
 /// owning `FileTable`.
 ///
+/// # Construction
+/// Create via [`FileTable::insert`] or similar registration methods.
+/// Direct construction with `FileId(n)` is valid but callers must ensure
+/// the index corresponds to an entry in the associated `FileTable`.
+///
 /// # Invariants
 /// - Only valid for the `FileTable` that produced it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -72,7 +77,6 @@ pub enum TransformId {
     UrlPercent,
     /// Base64 decoding (with optional whitespace allowances).
     Base64,
-    // Add more: JsonUnescape, HtmlUnescape, Gzip, Zlib, Brotli, etc.
 }
 
 /// Controls when a transform is applied during scanning.
@@ -213,10 +217,12 @@ pub struct Base64DecodeStats {
 
 #[cfg(feature = "b64-stats")]
 impl Base64DecodeStats {
+    /// Resets all counters to zero.
     pub(crate) fn reset(&mut self) {
         *self = Self::default();
     }
 
+    /// Accumulates counters from `other` into `self` with saturating arithmetic.
     pub(crate) fn add(&mut self, other: &Self) {
         self.spans = self.spans.saturating_add(other.spans);
         self.span_bytes = self.span_bytes.saturating_add(other.span_bytes);
@@ -268,7 +274,8 @@ pub enum DecodeStep {
     /// Transform step is deterministic via transform_idx (index into Engine.transforms).
     Transform {
         transform_idx: usize,
-        parent_span: Range<usize>, // span in the parent representation
+        /// Span in the parent representation (half-open byte range).
+        parent_span: Range<usize>,
     },
 
     /// Not a queued transform. This is a local validation step used when a UTF-16
@@ -276,7 +283,8 @@ pub enum DecodeStep {
     /// as UTF-16 with the given endianness.
     Utf16Window {
         endianness: Utf16Endianness,
-        parent_span: Range<usize>, // span in the parent representation
+        /// Span in the parent representation (half-open byte range).
+        parent_span: Range<usize>,
     },
 }
 
@@ -402,7 +410,7 @@ pub enum ValidatorKind {
         tail_len: u16,
         /// Character class used for each tail byte.
         tail: TailCharset,
-        /// Require a `regex::bytes` word boundary (`\b`) before the prefix.
+        /// Require a regex word boundary (`\b`) before the prefix.
         require_word_boundary_before: bool,
         /// Optional delimiter check after the tail.
         delim_after: DelimAfter,
@@ -420,7 +428,7 @@ pub enum ValidatorKind {
         max_tail: u16,
         /// Character class used for each tail byte.
         tail: TailCharset,
-        /// Require a `regex::bytes` word boundary (`\b`) before the prefix.
+        /// Require a regex word boundary (`\b`) before the prefix.
         require_word_boundary_before: bool,
         /// Optional delimiter check after the tail.
         delim_after: DelimAfter,
@@ -459,7 +467,7 @@ pub enum DelimAfter {
     /// No delimiter requirement; the match may be followed by any byte or end.
     None,
     /// Gitleaks-style token terminator:
-    /// `['"|\n|\r|\\s|\\x60]` or end-of-input.
+    /// `['"|\\n|\\r|\\s|\\x60]` or end-of-input.
     GitleaksTokenTerminator,
 }
 
@@ -476,7 +484,7 @@ pub enum TailCharset {
     LowerAlnum,
     /// `[A-Za-z0-9_-]`
     AlnumDashUnderscore,
-    /// `[A-Za-z0-9=_\\-.]` (case-insensitive)
+    /// `[A-Za-z0-9=_\-.]` (case-insensitive)
     Sendgrid66Set,
     /// `[a-h0-9]` (case-insensitive)
     DatabricksSet,
@@ -612,24 +620,26 @@ impl EntropySpec {
 /// - `max_findings_per_chunk` is a hard cap; excess findings are dropped.
 #[derive(Clone, Debug)]
 pub struct Tuning {
-    /// Window merge gap (bytes) when coalescing adjacent anchor hits.
+    /// Window merge gap in bytes when coalescing adjacent anchor hits.
+    /// Typical values: 64–256 bytes.
     pub merge_gap: usize,
 
     /// After merging, if windows per (rule, variant) still exceed this, coalesce under pressure.
     pub max_windows_per_rule_variant: usize,
-    /// Starting gap used during pressure coalescing.
+    /// Starting gap in bytes used during pressure coalescing.
     pub pressure_gap_start: usize,
 
     /// Prevent vector blowups before merging by collapsing to a single coalesced range.
     pub max_anchor_hits_per_rule_variant: usize,
 
-    /// UTF-16 decoding (for validation).
+    /// Maximum bytes produced when decoding a UTF-16 window for validation.
     pub max_utf16_decoded_bytes_per_window: usize,
 
     /// Max transform depth (number of decode steps) per work item chain.
     /// Must be <= `MAX_DECODE_STEPS - 1`; enforced at engine build time.
     pub max_transform_depth: usize,
 
+    /// Maximum total decoded output bytes across all transforms per scan.
     /// Counts ALL decoded output bytes:
     /// - full decodes
     /// - streaming gate decoded chunks
@@ -654,6 +664,13 @@ pub struct Tuning {
     /// This uses the Vectorscan regex engine as the primary matcher for raw
     /// rules and still applies post-match entropy gating.
     pub vs_direct_raw_regex: bool,
+
+    /// Selects the raw prefilter strategy.
+    ///
+    /// - `Regex`: Use Vectorscan regex prefilters (default).
+    /// - `AnchorLiterals`: Use Vectorscan literal anchor patterns (raw + UTF-16)
+    ///   with fanout targets; rules without anchors fall back to regex prefiltering.
+    pub prefilter_mode: PrefilterMode,
 }
 
 impl Tuning {
@@ -674,6 +691,16 @@ impl Tuning {
 ///
 /// Determines whether to derive anchors from regexes, use manual anchors, or both.
 /// This choice only affects compilation; runtime scanning uses the compiled anchors.
+///
+/// # Choosing a Policy
+/// - [`PreferDerived`]: Default for most use cases; automatic anchor extraction
+///   with manual fallback ensures coverage.
+/// - [`ManualOnly`]: Use when regexes are complex and derivation produces poor anchors.
+/// - [`DerivedOnly`]: Use when manual anchors are stale or you want pure automation.
+///
+/// [`PreferDerived`]: AnchorPolicy::PreferDerived
+/// [`ManualOnly`]: AnchorPolicy::ManualOnly
+/// [`DerivedOnly`]: AnchorPolicy::DerivedOnly
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnchorPolicy {
     /// Prefer derived anchors, falling back to manual anchors if derivation fails.
@@ -682,4 +709,16 @@ pub enum AnchorPolicy {
     ManualOnly,
     /// Only use derived anchors; ignore manual anchors entirely.
     DerivedOnly,
+}
+
+/// Raw prefilter strategy for Stage 1 window seeding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefilterMode {
+    /// Choose between regex and anchor-literal prefilters based on rule
+    /// characteristics (anchor count, regex complexity, expected selectivity).
+    Auto,
+    /// Use Vectorscan regex prefilters for all rules.
+    Regex,
+    /// Use Vectorscan literal anchor patterns; unanchored rules fall back to regex.
+    AnchorLiterals,
 }

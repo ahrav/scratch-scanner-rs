@@ -99,10 +99,8 @@ classDiagram
         -usize work_head
         -DecodeSlab slab
         -FixedSet128 seen
-        -Vec~[HitAccumulator; 3]~ accs
+        -HitAccPool hit_acc_pool
         -ScratchVec~u32~ touched_pairs
-        -DynamicBitSet touched
-        -bool touched_any
         -ScratchVec~SpanU32~ windows
         -ScratchVec~SpanU32~ expanded
         -ScratchVec~SpanU32~ spans

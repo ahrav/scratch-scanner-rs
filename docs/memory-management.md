@@ -266,9 +266,8 @@ pub struct ScanScratch {
     seen: FixedSet128,              // Deduplication set
     total_decode_output_bytes: usize,
     work_items_enqueued: usize,
-    accs: Vec<[HitAccumulator; 3]>, // Per-rule, per-variant accumulators
+    hit_acc_pool: HitAccPool,       // Per-(rule, variant) accumulator pool
     touched_pairs: ScratchVec<u32>, // Scratch list of touched (rule, variant)
-    touched: DynamicBitSet,         // Bitset of touched (rule, variant)
     windows: ScratchVec<SpanU32>,   // Temp window storage
     expanded: ScratchVec<SpanU32>,  // Expanded two-phase windows
     spans: ScratchVec<SpanU32>,     // Transform span candidates
