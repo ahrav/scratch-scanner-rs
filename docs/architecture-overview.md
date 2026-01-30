@@ -10,7 +10,7 @@ graph TB
 
     subgraph Core["Core Engine"]
         Engine["Engine<br/>Pattern Matching"]
-        Rules["RuleSpec / RuleCompiled<br/>Detection Rules"]
+        Rules["RuleSpec / RuleCompiled / RuleMeta<br/>Detection Rules"]
         AC["AhoCorasick<br/>Anchor Automaton"]
         Transforms["TransformConfig<br/>URL/Base64 Decoding"]
         Tuning["Tuning<br/>DoS Protection"]
@@ -82,7 +82,7 @@ graph TB
 |-----------|----------|---------|
 | **CLI Layer** | `src/main.rs` | Entry point that parses args and invokes the pipeline |
 | **Engine** | `src/lib.rs:992` | Compiled scanning engine with anchor patterns, rules, and transforms |
-| **RuleSpec/RuleCompiled** | `src/lib.rs:189-633` | Rule definitions and compiled representations |
+| **RuleSpec/RuleCompiled/RuleMeta** | `src/lib.rs:189-633` | Rule definitions, hot compiled data, and cold metadata |
 | **AhoCorasick** | External crate | Multi-pattern anchor scanning (raw + UTF-16 variants) |
 | **TransformConfig** | `src/lib.rs:96-121` | Transform stage configuration (URL percent, Base64) |
 | **Pipeline** | `src/pipeline.rs:419` | 4-stage cooperative pipeline coordinator |
