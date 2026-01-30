@@ -82,6 +82,10 @@ required-features = ["bench"]
 name = "timing_wheel"
 harness = false
 
+[[bench]]
+name = "memory_bandwidth"
+harness = false
+
 [profile.dev]
 opt-level = 1
 
