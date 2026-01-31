@@ -276,9 +276,9 @@ impl UrlSpanStream {
             }
 
             if urlish {
-                self.run_len = self.run_len.saturating_add(1);
+                self.run_len += 1;
                 if b == b'%' || (self.plus_to_space && b == b'+') {
-                    self.triggers = self.triggers.saturating_add(1);
+                    self.triggers += 1;
                 }
                 i += 1;
 
@@ -414,9 +414,9 @@ impl Base64SpanStream {
             }
 
             if allowed {
-                self.run_len = self.run_len.saturating_add(1);
+                self.run_len += 1;
                 if (flags & B64_CHAR) != 0 {
-                    self.b64_chars = self.b64_chars.saturating_add(1);
+                    self.b64_chars += 1;
                     self.last_b64 = abs;
                     self.have_b64 = true;
                 }
