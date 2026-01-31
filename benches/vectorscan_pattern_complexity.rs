@@ -22,6 +22,7 @@
 //! Run with: cargo bench --bench vectorscan_pattern_complexity
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use scanner_rs::RuleSpec;
 use std::ffi::CString;
 use vectorscan_rs_sys as vs;
 
@@ -165,6 +166,56 @@ impl Drop for VsDb {
             vs::hs_free_database(self.db);
         }
     }
+}
+
+fn build_full_rule_patterns(include_generic: bool) -> Vec<String> {
+    let mut rules: Vec<RuleSpec> = scanner_rs::gitleaks_rules();
+    if !include_generic {
+        rules.retain(|r| r.name != "generic-api-key");
+    }
+    rules.iter().map(|r| r.re.as_str().to_owned()).collect()
+}
+
+fn build_prefilter_flags(count: usize) -> Vec<u32> {
+    vec![vs::HS_FLAG_PREFILTER; count]
+}
+
+/// Benchmark 4b: Full rule set as used by the engine prefilter DB.
+fn bench_full_rules_prefilter(c: &mut Criterion) {
+    let mut group = c.benchmark_group("vs_full_rules_prefilter");
+    group.throughput(Throughput::Bytes(BUFFER_SIZE as u64));
+
+    let clean_data = gen_clean_ascii(BUFFER_SIZE, 0x1234);
+    let anchor_data = gen_data_with_anchors(BUFFER_SIZE);
+
+    let full_patterns = build_full_rule_patterns(true);
+    let full_flags = build_prefilter_flags(full_patterns.len());
+    let full_refs: Vec<&str> = full_patterns.iter().map(|p| p.as_str()).collect();
+    let full_db = VsDb::compile(&full_refs, &full_flags).expect("compile full rules failed");
+
+    let no_generic_patterns = build_full_rule_patterns(false);
+    let no_generic_flags = build_prefilter_flags(no_generic_patterns.len());
+    let no_generic_refs: Vec<&str> = no_generic_patterns.iter().map(|p| p.as_str()).collect();
+    let no_generic_db =
+        VsDb::compile(&no_generic_refs, &no_generic_flags).expect("compile no-generic failed");
+
+    group.bench_function("full_rules_clean", |b| {
+        b.iter(|| black_box(full_db.scan(black_box(&clean_data))))
+    });
+
+    group.bench_function("full_rules_with_anchors", |b| {
+        b.iter(|| black_box(full_db.scan(black_box(&anchor_data))))
+    });
+
+    group.bench_function("no_generic_clean", |b| {
+        b.iter(|| black_box(no_generic_db.scan(black_box(&clean_data))))
+    });
+
+    group.bench_function("no_generic_with_anchors", |b| {
+        b.iter(|| black_box(no_generic_db.scan(black_box(&anchor_data))))
+    });
+
+    group.finish();
 }
 
 /// Benchmark 1: Pure literal patterns (no regex)
@@ -419,6 +470,7 @@ criterion_group!(
     bench_simple_regex,
     bench_complex_regex_prefilter,
     bench_full_gitleaks_patterns,
+    bench_full_rules_prefilter,
     bench_pattern_count_scaling,
     bench_callback_overhead,
 );

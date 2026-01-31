@@ -96,6 +96,11 @@ name = "vectorscan_overhead"
 harness = false
 
 [[bench]]
+name = "vectorscan_pattern_complexity"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
 name = "rule_scaling"
 harness = false
 
