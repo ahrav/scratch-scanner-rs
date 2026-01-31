@@ -374,10 +374,6 @@ fn bench_bitset_boundaries(c: &mut Criterion) {
                 black_box(sum)
             })
         });
-
-        group.bench_with_input(BenchmarkId::new("is_empty", size), &bits, |b, bits| {
-            b.iter(|| black_box(bits.is_empty()))
-        });
     }
 
     group.finish();
@@ -455,82 +451,6 @@ fn bench_bitset_mixed_read_write(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmarks is_empty() across different states
-fn bench_bitset_is_empty(c: &mut Criterion) {
-    let bits_empty = DynamicBitSet::empty(DEFAULT_BITS);
-    let bits_first_bit = {
-        let mut b = DynamicBitSet::empty(DEFAULT_BITS);
-        b.set(0);
-        b
-    };
-    let bits_last_bit = {
-        let mut b = DynamicBitSet::empty(DEFAULT_BITS);
-        b.set(DEFAULT_BITS - 1);
-        b
-    };
-    let bits_moderate = make_bitset_with_density(DEFAULT_BITS, DENSITY_MODERATE, 0x5555);
-
-    let mut group = c.benchmark_group("bitset_is_empty");
-
-    group.bench_function("empty_true", |b| {
-        b.iter(|| black_box(bits_empty.is_empty()))
-    });
-
-    group.bench_function("first_bit_set", |b| {
-        b.iter(|| black_box(bits_first_bit.is_empty()))
-    });
-
-    group.bench_function("last_bit_set", |b| {
-        b.iter(|| black_box(bits_last_bit.is_empty()))
-    });
-
-    group.bench_function("moderate_density", |b| {
-        b.iter(|| black_box(bits_moderate.is_empty()))
-    });
-
-    group.finish();
-}
-
-/// Benchmarks highest_set_bit() across different bit positions
-fn bench_bitset_highest_set_bit(c: &mut Criterion) {
-    let bits_empty = DynamicBitSet::empty(DEFAULT_BITS);
-    let bits_first_bit = {
-        let mut b = DynamicBitSet::empty(DEFAULT_BITS);
-        b.set(0);
-        b
-    };
-    let bits_last_bit = {
-        let mut b = DynamicBitSet::empty(DEFAULT_BITS);
-        b.set(DEFAULT_BITS - 1);
-        b
-    };
-    let bits_middle = {
-        let mut b = DynamicBitSet::empty(DEFAULT_BITS);
-        b.set(DEFAULT_BITS / 2);
-        b
-    };
-
-    let mut group = c.benchmark_group("bitset_highest_set_bit");
-
-    group.bench_function("empty", |b| {
-        b.iter(|| black_box(bits_empty.highest_set_bit()))
-    });
-
-    group.bench_function("first_bit_only", |b| {
-        b.iter(|| black_box(bits_first_bit.highest_set_bit()))
-    });
-
-    group.bench_function("last_bit_only", |b| {
-        b.iter(|| black_box(bits_last_bit.highest_set_bit()))
-    });
-
-    group.bench_function("middle_bit", |b| {
-        b.iter(|| black_box(bits_middle.highest_set_bit()))
-    });
-
-    group.finish();
-}
-
 criterion_group!(
     benches,
     bench_fixed_set128,
@@ -554,8 +474,6 @@ criterion_group!(
     bench_bitset_populate_then_count,
     bench_bitset_populate_then_iterate,
     bench_bitset_mixed_read_write,
-    bench_bitset_is_empty,
-    bench_bitset_highest_set_bit,
 );
 
 criterion_main!(benches, bitset_benches);
