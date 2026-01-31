@@ -16,7 +16,6 @@
 //! - `byte_ring`: internal byte ring keyed by absolute stream offsets.
 //! - `fixed_set`: fixed-capacity hash set with epoch-based O(1) reset.
 //! - `fixed_vec`: stack-allocated vector with constant capacity.
-//! - `queue`: intrusive FIFO queue using embedded links.
 //! - `released_set`: fixed-capacity hash set with O(1) pop and fast clear.
 //! - `ring_buffer`: stack-allocated ring buffer with power-of-two capacity.
 //! - `timing_wheel`: hashed timing wheel with FIFO per bucket and bitmap occupancy.
@@ -30,7 +29,6 @@ pub mod byte_ring;
 pub mod fastrange;
 pub mod fixed_set;
 pub mod fixed_vec;
-pub mod queue;
 pub mod released_set;
 pub mod ring_buffer;
 pub mod timing_wheel;
@@ -39,7 +37,6 @@ pub use bitset::{words_for_bits, BitSet, BitSetIterator, DynamicBitSet, DynamicB
 pub(crate) use byte_ring::ByteRing;
 pub use fixed_set::FixedSet128;
 pub use fixed_vec::FixedVec;
-pub use queue::{Queue, QueueLink, QueueNode};
 pub use released_set::ReleasedSet;
 pub use ring_buffer::RingBuffer;
 pub use timing_wheel::{Bitset2, PushError, PushOutcome, TimingWheel};
