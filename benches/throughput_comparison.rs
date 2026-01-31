@@ -78,51 +78,6 @@ fn gen_realistic_source_code(size: usize) -> Vec<u8> {
     buf
 }
 
-#[cfg(feature = "stats")]
-fn dump_generic_stats(label: &str, engine: &Engine, buf: &[u8]) {
-    let mut scratch = engine.new_scratch();
-    let _ = engine.scan_chunk(buf, &mut scratch);
-    let stats = scratch.rule_stats();
-    let mut generic_id = None;
-    for rid in 0..stats.rule_count {
-        if engine.rule_name(rid as u32) == "generic-api-key" {
-            generic_id = Some(rid);
-            break;
-        }
-    }
-
-    let Some(rid) = generic_id else {
-        eprintln!("[stats] {label}: generic-api-key not found");
-        return;
-    };
-
-    let mib = (buf.len() as f64) / (1024.0 * 1024.0);
-    let anchors = stats.anchor_hits_raw[rid].saturating_add(stats.anchor_hits_utf16[rid]);
-    let regex_bytes = stats.regex_bytes_raw[rid]
-        .saturating_add(stats.regex_bytes_utf16[rid])
-        .saturating_add(stats.stream_regex_bytes_raw[rid])
-        .saturating_add(stats.stream_regex_bytes_utf16[rid]);
-    let regex_matches = stats.regex_matches_raw[rid]
-        .saturating_add(stats.regex_matches_utf16[rid])
-        .saturating_add(stats.stream_regex_matches_raw[rid])
-        .saturating_add(stats.stream_regex_matches_utf16[rid]);
-
-    let anchors_per_mib = (anchors as f64) / mib;
-    let regex_bytes_per_mib = (regex_bytes as f64) / mib;
-    let regex_bytes_per_mib_mib = regex_bytes_per_mib / (1024.0 * 1024.0);
-    let regex_matches_per_mib = (regex_matches as f64) / mib;
-
-    eprintln!(
-        "[stats] {label}: anchors={} ({:.2}/MiB) regex_bytes={} ({:.2} MiB/MiB) regex_matches={} ({:.2}/MiB)",
-        anchors,
-        anchors_per_mib,
-        regex_bytes,
-        regex_bytes_per_mib_mib,
-        regex_matches,
-        regex_matches_per_mib
-    );
-}
-
 // ============================================================================
 // Benchmarks
 // ============================================================================
@@ -195,13 +150,6 @@ fn bench_throughput_comparison(c: &mut Criterion) {
     // Layer 3: Full gitleaks engine
     let full_engine = demo_engine();
     let mut full_scratch = full_engine.new_scratch();
-
-    #[cfg(feature = "stats")]
-    {
-        dump_generic_stats("L3_gitleaks_ascii", &full_engine, &ascii);
-        dump_generic_stats("L3_gitleaks_random", &full_engine, &random);
-        dump_generic_stats("L3_gitleaks_realistic", &full_engine, &realistic);
-    }
 
     group.bench_function("L3_gitleaks_ascii", |b| {
         b.iter(|| {

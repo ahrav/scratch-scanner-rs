@@ -3,28 +3,24 @@
 //! This module wires together the prefilter pipeline and final rule evaluation
 //! for a single decoded buffer variant. The pipeline is:
 //! 1. Run the Vectorscan prefilter on raw bytes to collect hit windows.
-//! 2. Optionally process direct raw regex captures (when enabled) and emit
-//!    findings without a second anchor scan.
-//! 3. For each touched (rule, variant) pair, normalize windows (sort/merge/
+//! 2. For each touched (rule, variant) pair, normalize windows (sort/merge/
 //!    coalesce) and apply optional two-phase confirmation.
-//! 4. Run full rule matching on the resulting windows and emit findings.
+//! 3. Run full rule matching on the resulting windows and emit findings.
 //!
 //! All work is bounded by a `u32`-addressable buffer; windows and spans are
 //! stored as `SpanU32` to keep hot-path memory compact.
 
-use crate::api::{FileId, FindingRec, StepId};
-use memchr::memmem;
+use crate::api::{FileId, StepId};
 use std::ops::Range;
 #[cfg(feature = "stats")]
 use std::sync::atomic::Ordering;
 
 use super::core::Engine;
 use super::helpers::{
-    coalesce_under_pressure_sorted, contains_any_memmem, entropy_gate_passes,
-    merge_ranges_with_gap_sorted,
+    coalesce_under_pressure_sorted, contains_any_memmem, merge_ranges_with_gap_sorted,
 };
 use super::hit_pool::SpanU32;
-use super::rule_repr::{RuleCompiled, Variant};
+use super::rule_repr::Variant;
 use super::scratch::ScanScratch;
 
 impl Engine {
@@ -72,7 +68,6 @@ impl Engine {
             .vs
             .as_ref()
             .expect("vectorscan prefilter database unavailable (fallback disabled)");
-        let use_direct_raw = self.tuning.vs_direct_raw_regex && vs.supports_som();
         let mut vs_scratch = scratch
             .vs_scratch
             .take()
@@ -81,12 +76,7 @@ impl Engine {
         self.vs_stats
             .scans_attempted
             .fetch_add(1, Ordering::Relaxed);
-        let result = if use_direct_raw {
-            scratch.raw_hs_matches.clear();
-            vs.scan_raw_capture(buf, scratch, &mut vs_scratch)
-        } else {
-            vs.scan_raw(buf, scratch, &mut vs_scratch)
-        };
+        let result = vs.scan_raw(buf, scratch, &mut vs_scratch);
         scratch.vs_scratch = Some(vs_scratch);
         let saw_utf16 = match result {
             Ok(saw) => {
@@ -108,31 +98,6 @@ impl Engine {
                 "vectorscan raw db missing {} rule patterns (fallback disabled)",
                 vs.raw_missing_rules().len()
             );
-        }
-
-        if use_direct_raw {
-            let mut raw_matches = Vec::new();
-            std::mem::swap(&mut raw_matches, &mut scratch.raw_hs_matches);
-            for m in raw_matches.drain(..) {
-                let rid = m.rule_id as usize;
-                if rid >= self.rules.len() {
-                    continue;
-                }
-                let rule = &self.rules[rid];
-                let w = m.start as usize..m.end as usize;
-                self.run_rule_on_raw_match(
-                    rid as u32,
-                    rule,
-                    buf,
-                    w,
-                    step_id,
-                    root_hint.clone(),
-                    base_offset,
-                    file_id,
-                    scratch,
-                );
-            }
-            std::mem::swap(&mut raw_matches, &mut scratch.raw_hs_matches);
         }
 
         #[cfg(feature = "stats")]
@@ -198,59 +163,56 @@ impl Engine {
             // the full radius. This filters noisy prefilter hits while keeping
             // correctness (if the seed match is missing, the full match cannot
             // succeed).
-            let allow_two_phase = !(use_direct_raw && variant == Variant::Raw);
-            if allow_two_phase {
-                if let Some(tp) = &rule.two_phase {
-                    // Two-phase: confirm in seed windows, then expand.
-                    let seed_radius_bytes = tp.seed_radius.saturating_mul(variant.scale());
-                    let full_radius_bytes = tp.full_radius.saturating_mul(variant.scale());
-                    let extra = full_radius_bytes.saturating_sub(seed_radius_bytes);
+            if let Some(tp) = &rule.two_phase {
+                // Two-phase: confirm in seed windows, then expand.
+                let seed_radius_bytes = tp.seed_radius.saturating_mul(variant.scale());
+                let full_radius_bytes = tp.full_radius.saturating_mul(variant.scale());
+                let extra = full_radius_bytes.saturating_sub(seed_radius_bytes);
 
-                    scratch.expanded.clear();
-                    let windows_len = scratch.windows.len();
-                    for i in 0..windows_len {
-                        let seed = scratch.windows[i];
-                        let seed_range = seed.to_range();
-                        let win = &buf[seed_range.clone()];
-                        if !contains_any_memmem(win, &tp.confirm[vidx]) {
-                            continue;
-                        }
-
-                        let lo = seed_range.start.saturating_sub(extra);
-                        let hi = (seed_range.end + extra).min(buf.len());
-                        scratch.expanded.push(SpanU32::new(lo, hi));
-                    }
-
-                    if scratch.expanded.is_empty() {
+                scratch.expanded.clear();
+                let windows_len = scratch.windows.len();
+                for i in 0..windows_len {
+                    let seed = scratch.windows[i];
+                    let seed_range = seed.to_range();
+                    let win = &buf[seed_range.clone()];
+                    if !contains_any_memmem(win, &tp.confirm[vidx]) {
                         continue;
                     }
 
-                    merge_ranges_with_gap_sorted(&mut scratch.expanded, merge_gap);
-                    coalesce_under_pressure_sorted(
-                        &mut scratch.expanded,
-                        hay_len,
-                        pressure_gap_start,
-                        self.tuning.max_windows_per_rule_variant,
-                    );
+                    let lo = seed_range.start.saturating_sub(extra);
+                    let hi = (seed_range.end + extra).min(buf.len());
+                    scratch.expanded.push(SpanU32::new(lo, hi));
+                }
 
-                    let expanded_len = scratch.expanded.len();
-                    for i in 0..expanded_len {
-                        let w = scratch.expanded[i].to_range();
-                        self.run_rule_on_window(
-                            rid as u32,
-                            rule,
-                            variant,
-                            buf,
-                            w,
-                            step_id,
-                            root_hint.clone(),
-                            base_offset,
-                            file_id,
-                            scratch,
-                        );
-                    }
+                if scratch.expanded.is_empty() {
                     continue;
                 }
+
+                merge_ranges_with_gap_sorted(&mut scratch.expanded, merge_gap);
+                coalesce_under_pressure_sorted(
+                    &mut scratch.expanded,
+                    hay_len,
+                    pressure_gap_start,
+                    self.tuning.max_windows_per_rule_variant,
+                );
+
+                let expanded_len = scratch.expanded.len();
+                for i in 0..expanded_len {
+                    let w = scratch.expanded[i].to_range();
+                    self.run_rule_on_window(
+                        rid as u32,
+                        rule,
+                        variant,
+                        buf,
+                        w,
+                        step_id,
+                        root_hint.clone(),
+                        base_offset,
+                        file_id,
+                        scratch,
+                    );
+                }
+                continue;
             }
 
             let win_len = scratch.windows.len();
@@ -274,88 +236,5 @@ impl Engine {
             .hit_acc_pool
             .reset_touched(scratch.touched_pairs.as_slice());
         scratch.touched_pairs.clear();
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    /// Validates a direct Vectorscan raw regex capture and emits a finding.
-    ///
-    /// This path is only used when direct raw capture is enabled. It performs
-    /// a full regex match anchored at the reported start, then applies the
-    /// same gating (must-contain/keywords/entropy) used for window scans.
-    ///
-    /// # Preconditions
-    /// - `buf.len() <= u32::MAX`.
-    /// - `m` is the raw Vectorscan capture range in `buf`.
-    pub(super) fn run_rule_on_raw_match(
-        &self,
-        rule_id: u32,
-        rule: &RuleCompiled,
-        buf: &[u8],
-        m: Range<usize>,
-        step_id: StepId,
-        root_hint: Option<Range<usize>>,
-        base_offset: u64,
-        file_id: FileId,
-        scratch: &mut ScanScratch,
-    ) {
-        if m.start >= buf.len() {
-            return;
-        }
-
-        // Accept only matches anchored at the reported start to avoid
-        // drifting the Vectorscan capture to a later regex match.
-        let rm = match rule.re.find_at(buf, m.start) {
-            Some(rm) if rm.start() == m.start => rm,
-            _ => return,
-        };
-
-        let span_in_buf = m.start..rm.end();
-        if span_in_buf.end > buf.len() {
-            return;
-        }
-
-        let radius = if let Some(tp) = &rule.two_phase {
-            tp.full_radius
-        } else {
-            rule.radius
-        };
-        let gate_lo = span_in_buf.start.saturating_sub(radius);
-        let gate_hi = (span_in_buf.end + radius).min(buf.len());
-        let gate_window = &buf[gate_lo..gate_hi];
-
-        if let Some(needle) = rule.must_contain {
-            if memmem::find(gate_window, needle).is_none() {
-                return;
-            }
-        }
-
-        if let Some(kws) = &rule.keywords {
-            if !contains_any_memmem(gate_window, &kws.any[Variant::Raw.idx()]) {
-                return;
-            }
-        }
-
-        if let Some(ent) = rule.entropy {
-            let mbytes = &buf[span_in_buf.clone()];
-            if !entropy_gate_passes(
-                &ent,
-                mbytes,
-                &mut scratch.entropy_scratch,
-                &self.entropy_log2,
-            ) {
-                return;
-            }
-        }
-        let root_span_hint = root_hint.clone().unwrap_or_else(|| span_in_buf.clone());
-
-        scratch.push_finding(FindingRec {
-            file_id,
-            rule_id,
-            span_start: span_in_buf.start as u32,
-            span_end: span_in_buf.end as u32,
-            root_hint_start: base_offset + root_span_hint.start as u64,
-            root_hint_end: base_offset + root_span_hint.end as u64,
-            step_id,
-        });
     }
 }

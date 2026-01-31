@@ -669,20 +669,6 @@ pub struct Tuning {
     /// When false, only raw anchors are scanned (UTF-16 is skipped even if NULs
     /// are present). This is useful for modes that avoid binary/UTF-16 content.
     pub scan_utf16_variants: bool,
-
-    /// When true, treat raw Vectorscan regex matches as exact candidates and
-    /// validate them directly (skip window expansion + regex re-scan).
-    ///
-    /// This uses the Vectorscan regex engine as the primary matcher for raw
-    /// rules and still applies post-match entropy gating.
-    ///
-    /// # Behavior details
-    /// - Skips window expansion: match bounds come directly from Vectorscan.
-    /// - Still applies entropy gates if configured on the rule.
-    /// - May improve throughput for rules where Vectorscan's match bounds are
-    ///   already tight, but can miss findings if the rule regex differs from
-    ///   what Vectorscan compiled (e.g., due to flag differences).
-    pub vs_direct_raw_regex: bool,
 }
 
 impl Tuning {

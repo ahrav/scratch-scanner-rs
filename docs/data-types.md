@@ -98,7 +98,6 @@ classDiagram
         +usize max_findings_per_chunk
         +bool scan_utf16_variants
         +RawPrefilterMode raw_prefilter_mode
-        +bool vs_direct_raw_regex
     }
 
     class ScanScratch {

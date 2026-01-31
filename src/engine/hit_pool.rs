@@ -38,16 +38,6 @@ impl SpanU32 {
     }
 }
 
-/// Raw Vectorscan match used when direct regex capture is enabled.
-///
-/// Offsets are half-open byte ranges in the raw buffer.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct RawHsMatch {
-    pub(super) rule_id: u32,
-    pub(super) start: u32,
-    pub(super) end: u32,
-}
-
 /// Accumulates anchor hit windows across all (rule, variant) pairs.
 ///
 /// Storage is fixed-stride: `windows` is laid out as `pair * max_hits + idx`.
