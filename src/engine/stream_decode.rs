@@ -669,9 +669,9 @@ impl Engine {
                                 break;
                             }
                         }
-                        Err(e) => {
+                        Err(_e) => {
                             #[cfg(debug_assertions)]
-                            eprintln!("TimingWheel push failed: {:?}", e);
+                            eprintln!("TimingWheel push failed: {:?}", _e);
                             force_full = true;
                             break;
                         }
@@ -911,9 +911,9 @@ impl Engine {
                                 break;
                             }
                         }
-                        Err(e) => {
+                        Err(_e) => {
                             #[cfg(debug_assertions)]
-                            eprintln!("TimingWheel push failed: {:?}", e);
+                            eprintln!("TimingWheel push failed: {:?}", _e);
                             force_full = true;
                             break;
                         }
