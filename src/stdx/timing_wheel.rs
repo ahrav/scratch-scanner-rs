@@ -1172,7 +1172,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, kani))]
 impl Bitset2 {
     #[inline(always)]
     fn is_set(&self, bit: usize) -> bool {
@@ -1182,7 +1182,7 @@ impl Bitset2 {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, kani))]
 impl<T: Copy, const G: u32> TimingWheel<T, G> {
     pub(crate) fn debug_validate(&self) {
         let cap = self.next.len();
@@ -1319,7 +1319,7 @@ mod equivalence_tests {
     }
 }
 
-// Property-based tests are in the sibling module timing_wheel_tests.rs
-#[cfg(all(test, feature = "stdx-proptest"))]
+// Property-based tests and Kani proofs are in the sibling module timing_wheel_tests.rs
+#[cfg(any(all(test, feature = "stdx-proptest"), kani))]
 #[path = "timing_wheel_tests.rs"]
 mod timing_wheel_tests;

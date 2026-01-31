@@ -19,16 +19,6 @@ struct FakeDecodeStep {
     parent_span: Range<usize>,
 }
 
-// Copy variant for measuring push without clone overhead.
-// This isolates push() cost from clone() cost.
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-struct CopyStep {
-    transform_idx: usize,
-    span_start: usize,
-    span_end: usize,
-}
-
 impl FakeDecodeStep {
     fn new(idx: usize) -> Self {
         Self {
@@ -66,67 +56,7 @@ fn bench_construction(c: &mut Criterion) {
 }
 
 // ============================================================================
-// 2. Push Benchmarks
-// ============================================================================
-
-fn bench_push(c: &mut Criterion) {
-    let mut group = c.benchmark_group("fixed_vec/push");
-
-    // Use Copy type to measure push without clone overhead.
-    // This isolates the cost of the assert + write + len increment.
-    type CopyVec = FixedVec<CopyStep, 8>;
-
-    // Single push (Copy type, no clone overhead)
-    group.bench_function("push_single_copy", |b| {
-        let mut v: CopyVec = FixedVec::new();
-        let step = CopyStep {
-            transform_idx: 0,
-            span_start: 0,
-            span_end: 100,
-        };
-        b.iter(|| {
-            v.clear();
-            v.push(black_box(step));
-            black_box(&v);
-        })
-    });
-
-    // Fill to capacity (8 pushes, Copy type)
-    group.throughput(Throughput::Elements(8));
-    group.bench_function("push_fill_n8_copy", |b| {
-        let mut v: CopyVec = FixedVec::new();
-        let steps: [CopyStep; 8] = std::array::from_fn(|i| CopyStep {
-            transform_idx: i,
-            span_start: i,
-            span_end: i + 100,
-        });
-        b.iter(|| {
-            v.clear();
-            for step in steps {
-                v.push(black_box(step));
-            }
-            black_box(&v);
-        })
-    });
-
-    // Also measure with Clone type to show real-world cost
-    group.bench_function("push_fill_n8_clone", |b| {
-        let mut v: DecodeSteps = FixedVec::new();
-        let steps: Vec<_> = (0..8).map(FakeDecodeStep::new).collect();
-        b.iter(|| {
-            v.clear();
-            for step in &steps {
-                v.push(black_box(step.clone()));
-            }
-            black_box(&v);
-        })
-    });
-
-    group.finish();
-}
-
-// ============================================================================
-// 3. Extend from Slice Benchmarks (PRIMARY HOT PATH)
+// 2. Extend from Slice Benchmarks (PRIMARY HOT PATH)
 // ============================================================================
 
 fn bench_extend_from_slice(c: &mut Criterion) {
@@ -138,9 +68,8 @@ fn bench_extend_from_slice(c: &mut Criterion) {
         group.throughput(Throughput::Elements(n as u64));
 
         group.bench_with_input(BenchmarkId::new("elements", n), &steps, |b, steps| {
-            let mut v: DecodeSteps = FixedVec::new();
             b.iter(|| {
-                v.clear();
+                let mut v: DecodeSteps = FixedVec::new();
                 v.extend_from_slice(black_box(steps.as_slice()));
                 black_box(&v);
             })
@@ -151,32 +80,7 @@ fn bench_extend_from_slice(c: &mut Criterion) {
 }
 
 // ============================================================================
-// 4. Clear Benchmarks
-// ============================================================================
-
-fn bench_clear(c: &mut Criterion) {
-    let mut group = c.benchmark_group("fixed_vec/clear");
-
-    for n in [1, 4, 8] {
-        let steps: Vec<_> = (0..n).map(FakeDecodeStep::new).collect();
-
-        group.bench_with_input(BenchmarkId::new("elements", n), &steps, |b, steps| {
-            let mut v: DecodeSteps = FixedVec::new();
-            v.extend_from_slice(steps.as_slice());
-            b.iter(|| {
-                // Refill to ensure clear has work to do
-                v.clear();
-                v.extend_from_slice(steps.as_slice());
-                black_box(&v);
-            })
-        });
-    }
-
-    group.finish();
-}
-
-// ============================================================================
-// 5. Iteration Benchmarks
+// 3. Iteration Benchmarks
 // ============================================================================
 
 fn bench_iteration(c: &mut Criterion) {
@@ -198,12 +102,13 @@ fn bench_iteration(c: &mut Criterion) {
         })
     });
 
-    // Index access
+    // Index access via Deref
     group.bench_function("index_access_n8", |b| {
         b.iter(|| {
             let mut sum = 0usize;
-            for i in 0..v.len() {
-                sum = sum.wrapping_add(v[i].transform_idx);
+            let slice = v.as_slice();
+            for item in slice {
+                sum = sum.wrapping_add(item.transform_idx);
             }
             black_box(sum)
         })
@@ -213,7 +118,7 @@ fn bench_iteration(c: &mut Criterion) {
 }
 
 // ============================================================================
-// 6. Real-World Workflow Benchmarks
+// 4. Real-World Workflow Benchmarks
 // ============================================================================
 
 fn bench_workflow(c: &mut Criterion) {
@@ -242,23 +147,11 @@ fn bench_workflow(c: &mut Criterion) {
         );
     }
 
-    // Repeated use pattern (reuse with clear)
-    let steps: Vec<_> = (0..8).map(FakeDecodeStep::new).collect();
-    group.throughput(Throughput::Elements(8));
-    group.bench_function("reuse_clear_extend_n8", |b| {
-        let mut v: DecodeSteps = FixedVec::new();
-        b.iter(|| {
-            v.clear();
-            v.extend_from_slice(black_box(steps.as_slice()));
-            black_box(&v);
-        })
-    });
-
     group.finish();
 }
 
 // ============================================================================
-// 7. Clone Benchmarks
+// 5. Clone Benchmarks
 // ============================================================================
 
 fn bench_clone(c: &mut Criterion) {
@@ -279,7 +172,7 @@ fn bench_clone(c: &mut Criterion) {
 }
 
 // ============================================================================
-// 8. Comparison vs Vec<T>
+// 6. Comparison vs Vec<T>
 // ============================================================================
 
 fn bench_vs_vec(c: &mut Criterion) {
@@ -331,7 +224,7 @@ fn bench_vs_vec(c: &mut Criterion) {
 }
 
 // ============================================================================
-// 9. Batch Workflow (Multiple Findings Simulation)
+// 7. Batch Workflow (Multiple Findings Simulation)
 // ============================================================================
 
 fn bench_batch_workflow(c: &mut Criterion) {
@@ -369,9 +262,7 @@ fn bench_batch_workflow(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_construction,
-    bench_push,
     bench_extend_from_slice,
-    bench_clear,
     bench_iteration,
     bench_workflow,
     bench_clone,
