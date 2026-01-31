@@ -847,7 +847,7 @@ fn scan_rules_reference(
 
                         let mut steps = steps.to_vec();
                         steps.push(StepKind::Utf16 {
-                            le: matches!(variant.utf16_endianness().unwrap(), Utf16Endianness::Le),
+                            le: matches!(variant, Variant::Utf16Le),
                         });
 
                         for rm in rule.re.find_iter(&decoded) {

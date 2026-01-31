@@ -21,7 +21,7 @@
 use crate::api::*;
 use crate::b64_yara_gate::{Base64YaraGate, Base64YaraGateConfig, PaddingPolicy, WhitespacePolicy};
 use crate::regex2anchor::{
-    compile_trigger_plan, AnchorDeriveConfig, ResidueGatePlan, TriggerPlan, UnfilterableReason,
+    compile_trigger_plan, AnchorDeriveConfig, TriggerPlan, UnfilterableReason,
 };
 use ahash::AHashMap;
 #[cfg(feature = "stats")]
@@ -183,8 +183,6 @@ pub struct Engine {
     // purely to skip wasteful span scans/decodes when no anchor could possibly appear.
     pub(super) b64_gate: Option<Base64YaraGate>,
 
-    // Residue gates for rules without anchors (pass 2).
-    residue_rules: Vec<(usize, ResidueGatePlan)>,
     // Rules that cannot be given a sound prefilter gate under the policy.
     unfilterable_rules: Vec<(usize, UnfilterableReason)>,
     #[cfg(feature = "stats")]
@@ -193,9 +191,6 @@ pub struct Engine {
     #[cfg(feature = "stats")]
     pub(super) vs_stats: VectorscanCounters,
 
-    /// Maximum byte length of any single anchor pattern.
-    /// Used for buffer sizing during anchor compilation.
-    pub(super) max_anchor_pat_len: usize,
     /// True if any rule has UTF-16 anchor variants compiled.
     /// Controls whether UTF-16 scanning paths are active.
     pub(super) has_utf16_anchors: bool,
@@ -303,7 +298,6 @@ impl Engine {
             AHashMap::with_capacity(rules.len().saturating_mul(3).max(16));
         let mut pat_map_utf16: AHashMap<Vec<u8>, Vec<Target>> =
             AHashMap::with_capacity(rules.len().saturating_mul(2).max(16));
-        let mut residue_rules: Vec<(usize, ResidueGatePlan)> = Vec::with_capacity(rules.len());
         let mut unfilterable_rules: Vec<(usize, UnfilterableReason)> =
             Vec::with_capacity(rules.len());
         #[cfg(feature = "stats")]
@@ -468,8 +462,7 @@ impl Engine {
                         );
                     }
                 }
-                TriggerPlan::Residue { gate } => {
-                    residue_rules.push((rid, gate));
+                TriggerPlan::Residue { gate: _ } => {
                     #[cfg(feature = "stats")]
                     {
                         anchor_plan_stats.residue_rules =
@@ -657,13 +650,11 @@ impl Engine {
             vs_stream,
             vs_gate,
             b64_gate,
-            residue_rules,
             unfilterable_rules,
             #[cfg(feature = "stats")]
             anchor_plan_stats,
             #[cfg(feature = "stats")]
             vs_stats: VectorscanCounters::default(),
-            max_anchor_pat_len,
             has_utf16_anchors,
             max_window_diameter_bytes,
             max_prefilter_width,
@@ -1093,9 +1084,3 @@ pub fn bench_find_spans_into(
 
 #[cfg(feature = "bench")]
 pub use super::transform::{bench_stream_decode_base64, bench_stream_decode_url};
-
-#[cfg(feature = "bench")]
-pub use super::validator::{
-    bench_is_word_byte, bench_tail_matches_charset, bench_validate_aws_access_key,
-    bench_validate_prefix_bounded, bench_validate_prefix_fixed,
-};

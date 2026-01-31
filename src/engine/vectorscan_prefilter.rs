@@ -99,9 +99,6 @@ pub(crate) struct VsPrefilterDb {
     anchor_pat_offsets: Vec<u32>,
     /// Byte length of each anchor pattern.
     anchor_pat_lens: Vec<u32>,
-    /// Cap used by hit accumulators.
-    /// Maps to `Tuning::max_anchor_hits_per_rule_variant` at build time.
-    max_hits_per_rule_variant: usize,
     /// Max bounded width across all rules.
     max_width: u32,
     /// True if any rule reports an unbounded width.
@@ -778,8 +775,6 @@ pub(crate) struct VsAnchorDb {
     pat_offsets: Vec<u32>,
     /// Byte length of each anchor pattern.
     pat_lens: Vec<u32>,
-    /// Per-(rule, variant) hit cap.
-    max_hits_per_rule_variant: usize,
 }
 
 /// Vectorscan stream database for UTF-16 anchor scanning.
@@ -796,8 +791,6 @@ pub(crate) struct VsUtf16StreamDb {
     pat_offsets: Vec<u32>,
     /// Byte length of each anchor pattern.
     pat_lens: Vec<u32>,
-    /// Per-(rule, variant) hit cap.
-    max_hits_per_rule_variant: usize,
 }
 
 // Safe because hs_database_t is immutable after compilation, and we require per-thread scratch.
@@ -844,7 +837,7 @@ impl VsAnchorDb {
         pat_offsets: &[u32],
         seed_radius_raw: &[u32],
         seed_radius_utf16: &[u32],
-        tuning: &Tuning,
+        _tuning: &Tuning,
     ) -> Result<Self, String> {
         let debug = std::env::var("SCANNER_VS_UTF16_DEBUG").is_ok();
         let data = build_anchor_data(
@@ -920,7 +913,6 @@ impl VsAnchorDb {
             targets: data.targets,
             pat_offsets: data.pat_offsets,
             pat_lens: data.pat_lens,
-            max_hits_per_rule_variant: tuning.max_anchor_hits_per_rule_variant,
         })
     }
 
@@ -1006,7 +998,7 @@ impl VsUtf16StreamDb {
         pat_offsets: &[u32],
         seed_radius_raw: &[u32],
         seed_radius_utf16: &[u32],
-        tuning: &Tuning,
+        _tuning: &Tuning,
     ) -> Result<Self, String> {
         let debug = std::env::var("SCANNER_VS_UTF16_DEBUG").is_ok();
         let data = build_anchor_data(
@@ -1075,7 +1067,6 @@ impl VsUtf16StreamDb {
             targets: data.targets,
             pat_offsets: data.pat_offsets,
             pat_lens: data.pat_lens,
-            max_hits_per_rule_variant: tuning.max_anchor_hits_per_rule_variant,
         })
     }
 
@@ -1113,12 +1104,6 @@ impl VsUtf16StreamDb {
     #[inline]
     pub(crate) fn pat_lens(&self) -> &[u32] {
         &self.pat_lens
-    }
-
-    /// Returns the per-(rule, variant) hit cap.
-    #[inline]
-    pub(crate) fn max_hits_per_rule_variant(&self) -> usize {
-        self.max_hits_per_rule_variant
     }
 
     pub(crate) fn open_stream(&self) -> Result<VsStream, String> {
@@ -1366,7 +1351,7 @@ impl VsPrefilterDb {
     /// recompile patterns individually to surface the specific rule errors.
     pub(crate) fn try_new(
         rules: &[RuleSpec],
-        tuning: &Tuning,
+        _tuning: &Tuning,
         anchor: Option<AnchorInput<'_>>,
     ) -> Result<Self, String> {
         const RAW_FLAGS: c_uint = vs::HS_FLAG_PREFILTER as c_uint;
@@ -1620,7 +1605,6 @@ impl VsPrefilterDb {
             anchor_targets,
             anchor_pat_offsets,
             anchor_pat_lens,
-            max_hits_per_rule_variant: tuning.max_anchor_hits_per_rule_variant,
             max_width,
             unbounded,
         })

@@ -29,7 +29,7 @@ use super::helpers::{
     contains_all_memmem, contains_any_memmem, decode_utf16be_to_buf, decode_utf16le_to_buf,
     entropy_gate_passes,
 };
-use super::rule_repr::{RuleCompiled, Variant};
+use super::rule_repr::{PackedPatterns, RuleCompiled, Variant};
 use super::scratch::ScanScratch;
 
 impl Engine {

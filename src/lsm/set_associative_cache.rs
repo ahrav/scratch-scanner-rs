@@ -1085,17 +1085,6 @@ where
         bits
     }
 
-    #[inline]
-    fn compress_u16_mask(byte_mask: u16) -> u16 {
-        let mut lanes = 0u16;
-        for i in 0..8 {
-            if ((byte_mask >> (i * 2)) & 1) != 0 {
-                lanes |= 1u16 << i;
-            }
-        }
-        lanes
-    }
-
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "sse2")]
     unsafe fn search_tags_sse2(tags: &[TagT; WAYS], tag: TagT) -> u16 {

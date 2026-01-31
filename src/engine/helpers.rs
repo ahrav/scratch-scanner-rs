@@ -264,34 +264,6 @@ pub(super) fn entropy_gate_passes(
 // UTF-16 helpers
 // --------------------------
 
-/// Produces the UTF-16LE byte sequence for a UTF-8 anchor.
-///
-/// This is a byte-wise widening (`b, 0`), not a full UTF-8 -> UTF-16 conversion.
-/// It is correct for ASCII anchors and for matching UTF-16 text that encodes
-/// those ASCII bytes.
-pub(super) fn utf16le_bytes(anchor: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(anchor.len() * 2);
-    for &b in anchor {
-        out.push(b);
-        out.push(0);
-    }
-    out
-}
-
-/// Produces the UTF-16BE byte sequence for a UTF-8 anchor.
-///
-/// This is a byte-wise widening (`0, b`), not a full UTF-8 -> UTF-16 conversion.
-/// It is correct for ASCII anchors and for matching UTF-16 text that encodes
-/// those ASCII bytes.
-pub(super) fn utf16be_bytes(anchor: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(anchor.len() * 2);
-    for &b in anchor {
-        out.push(0);
-        out.push(b);
-    }
-    out
-}
-
 #[derive(Debug)]
 pub(super) enum Utf16DecodeError {
     /// Output would exceed the configured maximum or buffer capacity.

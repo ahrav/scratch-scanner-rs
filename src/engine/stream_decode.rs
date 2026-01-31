@@ -403,7 +403,6 @@ impl Engine {
                 };
                 scratch.span_streams.push(SpanStreamEntry {
                     transform_idx: tidx,
-                    mode: tcfg.mode,
                     state,
                     spans_emitted: 0,
                     max_spans: tcfg.max_spans_per_buffer,

@@ -13,7 +13,6 @@ use std::ops::Range;
 
 use super::rule_repr::Variant;
 use super::transform::{Base64SpanStream, UrlSpanStream};
-use crate::api::TransformMode;
 
 /// Reference to a buffer being scanned.
 ///
@@ -109,7 +108,6 @@ pub(super) enum SpanStreamState {
 /// - `spans_emitted <= max_spans` for the current buffer.
 pub(super) struct SpanStreamEntry {
     pub(super) transform_idx: usize,
-    pub(super) mode: TransformMode,
     pub(super) state: SpanStreamState,
     pub(super) spans_emitted: usize, // Spans emitted so far for this buffer.
     pub(super) max_spans: usize,     // Per-buffer cap for this transform.

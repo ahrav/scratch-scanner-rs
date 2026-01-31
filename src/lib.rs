@@ -77,11 +77,6 @@ pub fn gitleaks_rules() -> Vec<RuleSpec> {
 
 #[cfg(feature = "bench")]
 pub use engine::{bench_find_spans_into, bench_stream_decode_base64, bench_stream_decode_url};
-#[cfg(feature = "bench")]
-pub use engine::{
-    bench_is_word_byte, bench_tail_matches_charset, bench_validate_aws_access_key,
-    bench_validate_prefix_bounded, bench_validate_prefix_fixed,
-};
 #[cfg(feature = "stats")]
 pub use engine::{AnchorPlanStats, VectorscanStats};
 pub use engine::{Engine, ScanScratch};

@@ -10,7 +10,7 @@
 //!   unit) used for literal gating. They are not general-purpose UTF-16 encoders.
 //! - Variant ordering is stable and reused for packed arrays and bit layouts.
 
-use crate::api::{RuleSpec, Utf16Endianness, ValidatorKind};
+use crate::api::RuleSpec;
 use ahash::AHashMap;
 use regex::bytes::Regex;
 
@@ -59,15 +59,6 @@ impl Variant {
         match self {
             Variant::Raw => 1,
             Variant::Utf16Le | Variant::Utf16Be => 2,
-        }
-    }
-
-    /// Returns the UTF-16 endianness for UTF-16 variants.
-    pub(super) fn utf16_endianness(self) -> Option<Utf16Endianness> {
-        match self {
-            Variant::Raw => None,
-            Variant::Utf16Le => Some(Utf16Endianness::Le),
-            Variant::Utf16Be => Some(Utf16Endianness::Be),
         }
     }
 }
@@ -132,15 +123,6 @@ impl Target {
             2 => Variant::Utf16Be,
             _ => unreachable!("invalid variant tag"),
         }
-    }
-
-    pub(super) fn match_start_aligned(self) -> bool {
-        (self.0 & Self::MATCH_START_MASK) != 0
-    }
-
-    /// Whether keyword gating is implied for this particular anchor.
-    pub(super) fn keyword_implied(self) -> bool {
-        (self.0 & Self::KEYWORD_IMPLIED_MASK) != 0
     }
 }
 
@@ -285,8 +267,6 @@ pub(super) struct EntropyCompiled {
 #[derive(Clone, Debug)]
 pub(super) struct RuleCompiled {
     pub(super) name: &'static str,
-    pub(super) radius: usize,
-    pub(super) validator: ValidatorKind,
     pub(super) must_contain: Option<&'static [u8]>,
     // Derived AND gate: all literals must appear in the window before regex.
     pub(super) confirm_all: Option<ConfirmAllCompiled>,
@@ -352,8 +332,6 @@ pub(super) fn compile_rule(spec: &RuleSpec) -> RuleCompiled {
 
     RuleCompiled {
         name: spec.name,
-        radius: spec.radius,
-        validator: spec.validator,
         must_contain: spec.must_contain,
         confirm_all: None,
         keywords,
