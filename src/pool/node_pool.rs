@@ -9,7 +9,7 @@
 //! - Each acquired pointer is aligned to `NODE_ALIGNMENT` and sized for
 //!   `NODE_SIZE` bytes.
 //! - Every acquired node must be released exactly once back to the same pool.
-//! - `reset`, `deinit`, and `drop` invalidate all outstanding node pointers.
+//! - `drop` invalidates all outstanding node pointers.
 //! - The bitset tracks *free* nodes (set bit means available).
 //!
 //! # Semantics
@@ -92,27 +92,10 @@ impl<const NODE_SIZE: usize, const NODE_ALIGNMENT: usize> NodePoolType<NODE_SIZE
         }
     }
 
-    /// Explicitly deallocates the pool. Idempotent.
-    ///
-    /// # Panics
-    /// Panics if any nodes remain outstanding. This catches leaks during
-    /// development and mirrors `drop` behavior.
-    pub fn deinit(&mut self) {
-        self.deinit_internal(true);
-    }
-
-    /// Marks all nodes as free without deallocating the buffer.
-    ///
-    /// Useful for bulk reset scenarios. Invalidates all outstanding node
-    /// pointers. The underlying memory is not cleared.
-    pub fn reset(&mut self) {
-        Self::set_all(&mut self.free);
-    }
-
     /// Returns pointer to an uninitialized node.
     ///
-    /// The pointer is valid until `release`, `reset`, `deinit`, or `drop`. The
-    /// caller must initialize the memory before use.
+    /// The pointer is valid until `release` or `drop`. The caller must
+    /// initialize the memory before use.
     ///
     /// # Panics
     /// Panics on exhaustion rather than returning an error; running out of
