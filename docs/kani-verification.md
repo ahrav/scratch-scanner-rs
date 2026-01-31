@@ -45,17 +45,17 @@ cargo kani --features kani --harness verify_pool_coherence --verbose
 
 ### TimingWheel Proofs
 
-Located in `src/stdx/timing_wheel.rs` under `#[cfg(kani)] mod kani_proofs`.
+Located in `src/stdx/timing_wheel_tests.rs` under `#[cfg(kani)] mod kani_proofs`.
 
 | Proof Harness | Property Verified | Bounds | Unwind |
 |---------------|-------------------|--------|--------|
-| `verify_never_fires_early` | Items never fire before their `hi_end` time (core correctness) | wheel_size=16, cap=8, hi_end<=56 | 10 |
-| `verify_pool_coherence` | Every node is free XOR in-use (no corruption) | 4 pushes, partial drain | 12 |
+| `verify_never_fires_early` | Items never fire before their `hi_end` time (core correctness) | wheel_size=16, cap=8, hi_end<=56 | 20 |
+| `verify_pool_coherence` | Every node is free XOR in-use (no corruption) | 4 pushes, partial drain | 20 |
 | `verify_horizon_enforcement` | `TooFarInFuture` returned for items beyond horizon | Single push beyond limit | - |
-| `verify_slot_occupancy_consistency` | `head[slot] == NONE` iff occupancy bit is clear | 1 push + drain | 10 |
-| `verify_fifo_ordering` | Items in same bucket drain in insertion order | 3 items, same bucket | 8 |
-| `verify_monotonicity_no_corruption` | Time going backwards is no-op, no state corruption | Forward then backward | 6 |
-| `verify_reset` | Reset restores wheel to initial state | 2 pushes + reset | 10 |
+| `verify_slot_occupancy_consistency` | `head[slot] == NONE` iff occupancy bit is clear | 1 push + drain | 20 |
+| `verify_fifo_ordering` | Items in same bucket drain in insertion order | 3 items, same bucket | 20 |
+| `verify_monotonicity_no_corruption` | Time going backwards is no-op, no state corruption | Forward then backward | 20 |
+| `verify_reset` | Reset restores wheel to initial state | 2 pushes + reset | 20 |
 
 ### Bitset2 Proofs
 
@@ -211,5 +211,5 @@ Reduce bounds or add more `kani::assume()` constraints to limit state space.
 
 - [Kani Documentation](https://model-checking.github.io/kani/)
 - [Kani Tutorial](https://model-checking.github.io/kani/tutorial.html)
-- Source: `src/stdx/timing_wheel.rs` (proofs in `mod kani_proofs`)
-- Related: `src/stdx/timing_wheel_tests.rs` (proptest coverage)
+- Source: `src/stdx/timing_wheel_tests.rs` (Kani proofs in `mod kani_proofs`)
+- Related: `src/stdx/timing_wheel.rs` (TimingWheel implementation)

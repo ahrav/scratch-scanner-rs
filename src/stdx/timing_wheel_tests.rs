@@ -410,7 +410,7 @@ mod kani_proofs {
     ///
     /// Bounded: wheel_size=8, cap=8, single push + drain operation.
     #[kani::proof]
-    #[kani::unwind(10)]
+    #[kani::unwind(20)]
     fn verify_never_fires_early() {
         // G=8: bucket key = ceil(hi_end / 8)
         // wheel_size will be >= 8 for horizon=56
@@ -437,7 +437,7 @@ mod kani_proofs {
     ///
     /// Bounded: 4 pushes, partial drain, then validate.
     #[kani::proof]
-    #[kani::unwind(12)]
+    #[kani::unwind(20)]
     fn verify_pool_coherence() {
         let mut tw: TimingWheel<u32, 8> = TimingWheel::new(56, 8);
 
@@ -481,7 +481,7 @@ mod kani_proofs {
     /// From invariants (line 95-96): "head[slot] == NONE_U32 iff the slot is empty.
     /// When empty, tail is NONE_U32 and the occupancy bit is clear."
     #[kani::proof]
-    #[kani::unwind(10)]
+    #[kani::unwind(20)]
     fn verify_slot_occupancy_consistency() {
         let mut tw: TimingWheel<u32, 8> = TimingWheel::new(56, 8);
 
@@ -503,7 +503,7 @@ mod kani_proofs {
     /// From design: "Each slot is a FIFO list of nodes" and
     /// "Drain order: A -> B -> C (FIFO)"
     #[kani::proof]
-    #[kani::unwind(8)]
+    #[kani::unwind(20)]
     fn verify_fifo_ordering() {
         let mut tw: TimingWheel<u32, 8> = TimingWheel::new(56, 8);
 
@@ -527,7 +527,7 @@ mod kani_proofs {
     ///
     /// This proof verifies that going backwards is a no-op (doesn't corrupt state).
     #[kani::proof]
-    #[kani::unwind(6)]
+    #[kani::unwind(20)]
     fn verify_monotonicity_no_corruption() {
         let mut tw: TimingWheel<u32, 8> = TimingWheel::new(56, 8);
 
@@ -550,7 +550,7 @@ mod kani_proofs {
 
     /// Verifies reset restores the wheel to initial state.
     #[kani::proof]
-    #[kani::unwind(10)]
+    #[kani::unwind(20)]
     fn verify_reset() {
         let mut tw: TimingWheel<u32, 8> = TimingWheel::new(56, 8);
 
