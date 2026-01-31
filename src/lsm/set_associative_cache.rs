@@ -983,6 +983,17 @@ where
         bits
     }
 
+    /// Compresses a byte-wise movemask into one bit per u16 lane.
+    #[inline(always)]
+    fn compress_u16_mask(mask: u16) -> u16 {
+        // Keep even bits (lane LSBs), then pack them into the low 8 bits.
+        let mut m = mask & 0x5555;
+        m = (m | (m >> 1)) & 0x3333;
+        m = (m | (m >> 2)) & 0x0F0F;
+        m = (m | (m >> 4)) & 0x00FF;
+        m
+    }
+
     /// Bitmask of ways whose tag matches `tag` (bit i corresponds to way i).
     #[cfg(target_arch = "aarch64")]
     #[target_feature(enable = "neon")]
