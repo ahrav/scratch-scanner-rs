@@ -32,6 +32,52 @@ use super::helpers::{
 use super::rule_repr::{RuleCompiled, Variant};
 use super::scratch::ScanScratch;
 
+/// Cheap precheck for rules with assignment-value patterns.
+///
+/// Returns `false` if the regex cannot possibly match because the window lacks
+/// the necessary structure: a separator (`=`, `:`, `>`) followed by a plausible
+/// token (10+ alphanumeric/underscore/hyphen/dot characters).
+///
+/// This is a conservative filter: it only rejects windows where the regex
+/// definitely cannot match, never producing false negatives.
+///
+/// # Performance
+/// O(window.len()) byte scan vs O(regex_complexity × window.len()) for regex.
+#[inline]
+fn has_assignment_value_shape(window: &[u8]) -> bool {
+    // Find any assignment separator. We check for `=`, `:`, and `>` (for `=>`).
+    // The position we find may be part of `=>`, but that's fine for our purpose.
+    let sep_pos = match window
+        .iter()
+        .position(|&b| b == b'=' || b == b':' || b == b'>')
+    {
+        Some(pos) => pos,
+        None => return false,
+    };
+
+    // Check for plausible token run after separator (10+ alnum/underscore/hyphen/dot).
+    let after_sep = &window[sep_pos + 1..];
+
+    // Skip whitespace/quotes/extra separators after the separator.
+    let token_start = after_sep
+        .iter()
+        .position(|&b| !matches!(b, b' ' | b'\t' | b'"' | b'\'' | b'`' | b'=' | b'>'))
+        .unwrap_or(after_sep.len());
+
+    if token_start >= after_sep.len() {
+        return false;
+    }
+
+    // Count consecutive token chars.
+    let token_bytes = &after_sep[token_start..];
+    let token_len = token_bytes
+        .iter()
+        .take_while(|&&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
+        .count();
+
+    token_len >= 10
+}
+
 impl Engine {
     /// Runs a compiled rule against one window and appends findings into `scratch`.
     ///
@@ -89,6 +135,11 @@ impl Engine {
                     if !contains_any_memmem(window, &kws.any[Variant::Raw.idx()]) {
                         return;
                     }
+                }
+
+                // Assignment-shape precheck: skip regex if window lacks required structure.
+                if rule.needs_assignment_shape_check && !has_assignment_value_shape(window) {
+                    return;
                 }
 
                 let entropy = rule.entropy;
@@ -195,6 +246,11 @@ impl Engine {
                     }
                 }
 
+                // Assignment-shape precheck on decoded UTF-8 bytes.
+                if rule.needs_assignment_shape_check && !has_assignment_value_shape(decoded) {
+                    return;
+                }
+
                 let endianness = match variant {
                     Variant::Utf16Le => Utf16Endianness::Le,
                     Variant::Utf16Be => Utf16Endianness::Be,
@@ -297,6 +353,11 @@ impl Engine {
             if !contains_any_memmem(window, &kws.any[Variant::Raw.idx()]) {
                 return;
             }
+        }
+
+        // Assignment-shape precheck: skip regex if window lacks required structure.
+        if rule.needs_assignment_shape_check && !has_assignment_value_shape(window) {
+            return;
         }
 
         let max_findings = scratch.max_findings;
@@ -429,6 +490,11 @@ impl Engine {
             }
         }
 
+        // Assignment-shape precheck on decoded UTF-8 bytes.
+        if rule.needs_assignment_shape_check && !has_assignment_value_shape(decoded) {
+            return;
+        }
+
         let endianness = match variant {
             Variant::Utf16Le => Utf16Endianness::Le,
             Variant::Utf16Be => Utf16Endianness::Be,
@@ -479,5 +545,84 @@ impl Engine {
                 *dropped = dropped.saturating_add(1);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_has_assignment_value_shape_with_equals() {
+        // Basic assignment with long token
+        assert!(has_assignment_value_shape(b"api_key=AKIAIOSFODNN7EXAMPLE"));
+        assert!(has_assignment_value_shape(b"token = abcdefghij1234567890"));
+        assert!(has_assignment_value_shape(b"secret=\"longtoken1234\""));
+    }
+
+    #[test]
+    fn test_has_assignment_value_shape_with_colon() {
+        // JSON-style assignment
+        assert!(has_assignment_value_shape(
+            b"\"api_key\": \"AKIAIOSFODNN7EXAMPLE\""
+        ));
+        assert!(has_assignment_value_shape(b"token: abcdefghij1234567890"));
+    }
+
+    #[test]
+    fn test_has_assignment_value_shape_with_arrow() {
+        // Arrow assignment (=> becomes > after =)
+        assert!(has_assignment_value_shape(b"key => longtoken1234567890"));
+        assert!(has_assignment_value_shape(b"secret => AKIAIOSFODNN7EX"));
+    }
+
+    #[test]
+    fn test_has_assignment_value_shape_short_token() {
+        // Token too short (less than 10 chars)
+        assert!(!has_assignment_value_shape(b"key=short"));
+        assert!(!has_assignment_value_shape(b"x: abc"));
+        assert!(!has_assignment_value_shape(b"token = 123456789")); // exactly 9 chars
+    }
+
+    #[test]
+    fn test_has_assignment_value_shape_no_separator() {
+        // No assignment separator at all
+        assert!(!has_assignment_value_shape(
+            b"some random text without assignment"
+        ));
+        assert!(!has_assignment_value_shape(b"api_key AKIAIOSFODNN7EXAMPLE"));
+    }
+
+    #[test]
+    fn test_has_assignment_value_shape_no_token_after_separator() {
+        // Separator but no token after it
+        assert!(!has_assignment_value_shape(b"key="));
+        assert!(!has_assignment_value_shape(b"token:   "));
+        assert!(!has_assignment_value_shape(b"secret = \"\""));
+    }
+
+    #[test]
+    fn test_has_assignment_value_shape_with_special_chars_in_token() {
+        // Token with allowed special chars (underscore, hyphen, dot)
+        assert!(has_assignment_value_shape(b"key=abc_def-ghi.jkl"));
+        assert!(has_assignment_value_shape(b"token: some-long-token-value"));
+        assert!(has_assignment_value_shape(b"id = user.name.domain"));
+    }
+
+    #[test]
+    fn test_has_assignment_value_shape_boundary_10_chars() {
+        // Exactly 10 chars should pass
+        assert!(has_assignment_value_shape(b"key=0123456789"));
+        // 9 chars should fail
+        assert!(!has_assignment_value_shape(b"key=012345678"));
+    }
+
+    #[test]
+    fn test_has_assignment_value_shape_skips_whitespace_and_quotes() {
+        // Whitespace and quotes after separator should be skipped
+        assert!(has_assignment_value_shape(b"key=  longtokenvalue"));
+        assert!(has_assignment_value_shape(b"key=\"longtokenvalue\""));
+        assert!(has_assignment_value_shape(b"key='longtokenvalue'"));
+        assert!(has_assignment_value_shape(b"key=`longtokenvalue`"));
     }
 }

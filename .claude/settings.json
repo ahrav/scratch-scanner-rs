@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [[ \"$CLAUDE_FILE_PATH\" == *.rs ]]; then cargo fmt --all && cargo check 2>&1 | head -50; fi"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [[ \"$CLAUDE_FILE_PATH\" == *.rs ]] && grep -q 'unsafe' \"$CLAUDE_FILE_PATH\" 2>/dev/null; then echo '⚠️  WARNING: This file contains unsafe code blocks. Proceeding with caution.'; fi"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -274,6 +274,10 @@ pub(super) struct RuleCompiled {
     pub(super) entropy: Option<EntropyCompiled>,
     pub(super) re: Regex,
     pub(super) two_phase: Option<TwoPhaseCompiled>,
+    /// Cheap precheck gate: if true, the rule requires an assignment separator
+    /// (`=`, `:`, `=>`) followed by a plausible token (10+ alphanumeric chars).
+    /// Used to skip expensive regex on windows that cannot match.
+    pub(super) needs_assignment_shape_check: bool,
 }
 
 // --------------------------
@@ -330,6 +334,10 @@ pub(super) fn compile_rule(spec: &RuleSpec) -> RuleCompiled {
         max_len: e.max_len,
     });
 
+    // Enable assignment-shape precheck for rules with assignment-pattern regexes.
+    // Currently only `generic-api-key` benefits from this optimization.
+    let needs_assignment_shape_check = spec.name == "generic-api-key";
+
     RuleCompiled {
         name: spec.name,
         must_contain: spec.must_contain,
@@ -338,6 +346,7 @@ pub(super) fn compile_rule(spec: &RuleSpec) -> RuleCompiled {
         entropy,
         re: spec.re.clone(),
         two_phase,
+        needs_assignment_shape_check,
     }
 }
 
