@@ -173,6 +173,124 @@ The engine reports 13 rules as "unfilterable" with `OnlyWeakAnchors`. This is a 
    - 1-250 rules showed <5% throughput difference
    - Pattern structure matters more than count
 
+## New Experiments (2026-01-30)
+
+We added a focused benchmark (`benches/prefilter_tradeoffs.rs`) and a new tuning
+knob (`raw_prefilter_mode`) to separate **prefilter cost** from **validation
+cost**.
+
+### Hypotheses to Test
+
+1. **Regex complexity dominates clean-data throughput**
+   - Run `prefilter/clean` in `prefilter_tradeoffs`
+   - Compare simple vs complex regexes across rule counts
+   - Expect larger deltas from complexity than from count
+
+2. **Anchor hit rate drives validation cost**
+   - Run `validation/anchor_flood`
+   - Expect throughput to drop sharply when anchor density is high
+
+3. **Anchors-only prefilter recovers throughput when anchors are selective**
+   - Compare `RegexAndAnchors` vs `AnchorsOnlyForAnchoredRules` in
+     `prefilter/mode_comparison`
+   - Repeat on `gitleaks_derived_*` to see impact on the real rule set
+
+### Suggested Tuning for Isolation
+
+Use these tuning settings for apples-to-apples comparisons:
+
+- `max_transform_depth = 0` (disable transforms)
+- `scan_utf16_variants = false` (raw-only)
+- `raw_prefilter_mode = AnchorsOnlyForAnchoredRules` (experimental toggle)
+
+`raw_prefilter_mode` is **experimental**: it skips raw regex prefilters for
+anchored rules and relies on anchor selectivity. Unanchored rules still use
+regex prefilters to avoid false negatives.
+
+### Prefilter Tradeoffs Results (this machine)
+
+All results are from `cargo bench --bench prefilter_tradeoffs` on a 4 MiB buffer.
+These numbers will vary by hardware but the relative trends should hold.
+
+**Clean data (no anchor hits):**
+
+| Rule Set | 1 rule | 10 rules | 50 rules | 200 rules |
+| --- | --- | --- | --- | --- |
+| Simple regex | 14.9 GiB/s | 12.6 GiB/s | 12.8 GiB/s | 12.7 GiB/s |
+| Complex regex | 12.6 GiB/s | 9.3 GiB/s | 4.3 GiB/s | 4.2 GiB/s |
+
+**Anchor-flood data (high hit rate, no true matches):**
+
+| Rule Set | 10 rules | 50 rules | 200 rules |
+| --- | --- | --- | --- |
+| Simple regex | 3.6 GiB/s | 2.4 GiB/s | 2.4 GiB/s |
+| Complex regex | 0.88 GiB/s | 0.80 GiB/s | 0.79 GiB/s |
+
+**Prefilter mode comparison (clean data):**
+
+| Configuration | Throughput |
+| --- | --- |
+| Synthetic 200 complex, regex+anchors | 4.39 GiB/s |
+| Synthetic 200 complex, anchor-only | 13.15 GiB/s |
+| Gitleaks derived, regex+anchors | 443 MiB/s |
+| Gitleaks derived, anchor-only | 288 MiB/s |
+
+**Takeaway:**
+- Complex regex prefiltering is a real cost on clean data.
+- The full gitleaks suite is dominated by **validation cost under high anchor hit rates**.
+- Raw regex prefiltering *helps* gitleaks by reducing candidate volume; anchor-only hurts.
+
+### Repo Profiling Harness
+
+For per-rule profiling across real repositories, use:
+
+```bash
+cargo run --bin bench_repos --features rule-profile -- --profile-rules --profile-top 50
+```
+
+Notes:
+- The harness skips `.git` (and other common build dirs) via `should_skip_dir`.
+- Use `--root <path>` to point at the parent directory containing repos.
+
+### Repo Profiling Results (2026-01-30)
+
+Profile run: `bench_repos --profile-rules` across 29 sibling repos under
+`/Users/ahrav/Projects` (default root). Overall throughput was ~44 MiB/s.
+
+Top offenders by total validation time:
+
+| Rank | Rule | Time (ms) | Windows in | Matches |
+| --- | --- | ---: | ---: | ---: |
+| 1 | `generic-api-key` | 1606 | 8861 | 72350 |
+| 2 | `private-key` | 62 | 66 | 1727 |
+| 3 | `sourcegraph-access-token` | 49 | 893 | 30695 |
+| 4 | `jwt` | 7 | 41 | 2131 |
+| 5 | `facebook-page-access-token` | 7 | 20 | 32 |
+
+Early takeaway: **`generic-api-key` dominates**. It has a very high window and
+match count relative to other rules, making it the first candidate for anchor
+and regex simplification.
+
+### Repo Profiling Results (Derived Anchors)
+
+Profile run: `bench_repos --anchors=derived --profile-rules` across 26 sibling
+repos under `/Users/ahrav/Projects` (default root). Overall throughput was
+~44 MiB/s.
+
+Top offenders by total validation time:
+
+| Rank | Rule | Time (ms) | Windows in | Matches |
+| --- | --- | ---: | ---: | ---: |
+| 1 | `generic-api-key` | 1521 | 8841 | 72302 |
+| 2 | `private-key` | 62 | 63 | 1724 |
+| 3 | `sourcegraph-access-token` | 48 | 891 | 30695 |
+| 4 | `jwt` | 7 | 41 | 2131 |
+| 5 | `facebook-page-access-token` | 7 | 20 | 32 |
+
+Derived vs manual results are effectively the same for the top offenders, which
+reinforces that **validation cost + hit rate** (not anchor derivation policy)
+is the primary bottleneck in real repos.
+
 ## Recommended Next Steps
 
 ### Priority 1: Investigate Unfilterable Rules
@@ -209,3 +327,8 @@ Reaching 5+ GiB/s would require fundamental changes to either:
 - The gitleaks rule complexity
 - The validation pipeline architecture
 - Or both
+
+## Related Documentation
+
+For detailed root cause analysis and actionable recommendations, see:
+- [Throughput Bottleneck Analysis](./throughput_bottleneck_analysis.md) - Deep dive into the two primary bottlenecks (Vectorscan complexity vs validation cost) with benchmark evidence and fix strategies
