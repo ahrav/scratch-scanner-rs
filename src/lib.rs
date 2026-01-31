@@ -48,7 +48,6 @@ pub mod stdx;
 pub mod test_utils;
 #[cfg(any(test, feature = "tiger-harness"))]
 pub mod tiger_harness;
-pub mod util;
 
 mod api;
 mod demo;
