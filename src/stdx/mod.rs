@@ -35,7 +35,7 @@ pub mod released_set;
 pub mod ring_buffer;
 pub mod timing_wheel;
 
-pub use bitset::{words_for_bits, BitSet, BitSetIterator, DynamicBitSet, DynamicBitSetIterator};
+pub use bitset::{words_for_bits, DynamicBitSet, DynamicBitSetIterator};
 pub(crate) use byte_ring::ByteRing;
 pub use fixed_set::FixedSet128;
 pub use fixed_vec::FixedVec;

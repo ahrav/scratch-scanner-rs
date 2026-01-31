@@ -3,6 +3,10 @@ name = "scanner-rs"
 version = "0.1.0"
 edition = "2021"
 
+# Allow Kani's cfg flag (set automatically by cargo kani)
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
 [dependencies]
 aegis = "0.9"
 ahash = "0.8"
@@ -28,6 +32,7 @@ stats = []
 b64-stats = ["stats"]
 bench = []
 tiger-harness = []
+kani = []  # Gate Kani model-checking proofs
 
 [dev-dependencies]
 base64 = "0.22"
