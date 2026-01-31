@@ -71,10 +71,6 @@ name = "fixed_vec"
 harness = false
 
 [[bench]]
-name = "queue"
-harness = false
-
-[[bench]]
 name = "released_set"
 harness = false
 

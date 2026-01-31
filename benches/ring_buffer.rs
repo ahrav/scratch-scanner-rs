@@ -3,30 +3,6 @@ use scanner_rs::stdx::RingBuffer;
 
 const OPS_PER_ITER: u64 = 10_000;
 
-struct XorShift64 {
-    state: u64,
-}
-
-impl XorShift64 {
-    fn new(seed: u64) -> Self {
-        Self { state: seed }
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        let mut x = self.state;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.state = x;
-        x
-    }
-}
-
-fn make_u64_keys(count: usize, seed: u64) -> Vec<u64> {
-    let mut rng = XorShift64::new(seed);
-    (0..count).map(|_| rng.next_u64()).collect()
-}
-
 /// Benchmarks the hot path: push when full requires pop first.
 fn bench_push_pop_cycle(c: &mut Criterion) {
     let mut group = c.benchmark_group("ring_buffer");
@@ -173,48 +149,6 @@ fn bench_fill_drain(c: &mut Criterion) {
     group.finish();
 }
 
-/// Random access via get() - tests index calculation.
-fn bench_random_access(c: &mut Criterion) {
-    let indices = make_u64_keys(OPS_PER_ITER as usize, 0xdead_beef_cafe_babe);
-
-    let mut group = c.benchmark_group("ring_buffer");
-    group.throughput(Throughput::Elements(OPS_PER_ITER));
-
-    group.bench_function("random_get_cap8", |b| {
-        let mut rb: RingBuffer<u64, 8> = RingBuffer::new();
-        for i in 0..8u64 {
-            rb.push_back_assume_capacity(i);
-        }
-        b.iter(|| {
-            let mut sum = 0u64;
-            for &idx in &indices {
-                if let Some(&val) = rb.get((idx % 8) as u32) {
-                    sum = sum.wrapping_add(val);
-                }
-            }
-            black_box(sum)
-        })
-    });
-
-    group.bench_function("random_get_cap64", |b| {
-        let mut rb: RingBuffer<u64, 64> = RingBuffer::new();
-        for i in 0..64u64 {
-            rb.push_back_assume_capacity(i);
-        }
-        b.iter(|| {
-            let mut sum = 0u64;
-            for &idx in &indices {
-                if let Some(&val) = rb.get((idx % 64) as u32) {
-                    sum = sum.wrapping_add(val);
-                }
-            }
-            black_box(sum)
-        })
-    });
-
-    group.finish();
-}
-
 /// Test wraparound behavior - push/pop with offset head.
 fn bench_wraparound(c: &mut Criterion) {
     let mut group = c.benchmark_group("ring_buffer");
@@ -236,30 +170,6 @@ fn bench_wraparound(c: &mut Criterion) {
                 rb.push_back_assume_capacity(black_box(i));
                 black_box(rb.pop_front());
             }
-        })
-    });
-
-    group.finish();
-}
-
-/// Test front() access pattern.
-fn bench_front_access(c: &mut Criterion) {
-    let mut group = c.benchmark_group("ring_buffer");
-    group.throughput(Throughput::Elements(OPS_PER_ITER));
-
-    group.bench_function("front_access_cap8", |b| {
-        let mut rb: RingBuffer<u64, 8> = RingBuffer::new();
-        for i in 0..8u64 {
-            rb.push_back_assume_capacity(i);
-        }
-        b.iter(|| {
-            let mut sum = 0u64;
-            for _ in 0..OPS_PER_ITER {
-                if let Some(&val) = rb.front() {
-                    sum = sum.wrapping_add(val);
-                }
-            }
-            black_box(sum)
         })
     });
 
@@ -305,9 +215,7 @@ criterion_group!(
     bench_push_pop_cycle,
     bench_alternating,
     bench_fill_drain,
-    bench_random_access,
     bench_wraparound,
-    bench_front_access,
     bench_push_variants,
 );
 

@@ -51,24 +51,12 @@ impl ByteRing {
         self.buf.len()
     }
 
-    /// Returns the number of bytes currently retained.
-    pub(crate) fn len(&self) -> usize {
-        self.len
-    }
-
     /// Returns the absolute offset of the first retained byte.
     ///
     /// Meaningful when `len > 0`; when empty, callers should treat this as the
     /// offset where the next retained byte would begin.
     pub(crate) fn start_offset(&self) -> u64 {
         self.start_offset
-    }
-
-    /// Returns the absolute offset one past the last retained byte.
-    ///
-    /// Uses saturating arithmetic to avoid `u64` overflow.
-    pub(crate) fn end_offset(&self) -> u64 {
-        self.start_offset.saturating_add(self.len as u64)
     }
 
     /// Returns the retained bytes as up to two slices in logical order.
