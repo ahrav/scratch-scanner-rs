@@ -32,6 +32,8 @@ use memchr::memmem;
 /// # Effects
 /// - Adjacent or overlapping ranges within `gap` bytes are merged into a single window.
 /// - Output remains sorted and non-overlapping.
+/// - When merging, preserves the **earliest** (smallest) anchor hint to maintain
+///   conservative correctness.
 ///
 /// # Design Notes
 /// - The soft gap reduces the number of regex runs at the cost of slightly
@@ -54,6 +56,8 @@ pub(super) fn merge_ranges_with_gap_sorted(ranges: &mut ScratchVec<SpanU32>, gap
         debug_assert!(r.start >= cur.start);
         if r.start <= cur.end.saturating_add(gap) {
             cur.end = cur.end.max(r.end);
+            // Preserve the earliest anchor hint when merging.
+            cur.anchor_hint = cur.anchor_hint.min(r.anchor_hint);
         } else {
             ranges[write] = cur;
             write += 1;
@@ -77,6 +81,7 @@ pub(super) fn merge_ranges_with_gap_sorted(ranges: &mut ScratchVec<SpanU32>, gap
 /// - If still over the cap, collapses to a single window spanning the first/last range
 ///   (clamped to `hay_len`).
 /// - The final ranges are a superset of the original windows (given the preconditions).
+/// - When collapsing, preserves the **earliest** (smallest) anchor hint.
 ///
 /// # Complexity
 /// - O(n log G) where G is the number of gap doublings, O(1) extra space.
@@ -98,12 +103,18 @@ pub(super) fn coalesce_under_pressure_sorted(
 
     if ranges.len() > max_windows && !ranges.is_empty() {
         // Hard fallback: collapse to a single window to bound work deterministically.
+        // Preserve the earliest anchor hint across all windows.
         let start = ranges[0].start;
         let end = ranges[ranges.len() - 1].end;
+        let mut min_anchor = start;
+        for i in 0..ranges.len() {
+            min_anchor = min_anchor.min(ranges[i].anchor_hint);
+        }
         ranges.clear();
         ranges.push(SpanU32 {
             start: start.min(hay_len),
             end: end.min(hay_len),
+            anchor_hint: min_anchor.min(hay_len),
         });
     }
 }

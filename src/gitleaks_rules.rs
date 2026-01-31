@@ -3203,21 +3203,25 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 r#"(?i)[\w.-]{0,50}?(?:sonar[_.-]?(login|token))(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}((?:squ_|sqp_|sqa_)?[a-z0-9=_\-]{40})(?:[\x60'"\s;]|\\[nr]|$)"#,
             ),
         },
+        // Sourcegraph tokens always have "sgp_" prefix. We intentionally exclude:
+        // - Generic 40-hex patterns ([a-fA-F0-9]{40}) which match git SHAs, checksums, etc.
+        // - "sourcegraph" keyword anchors which trigger on docs/URLs without tokens
+        // This reduces false positives significantly while catching all structured token formats.
         RuleSpec {
             name: "sourcegraph-access-token",
-            anchors: &[b"sgp_", b"SGP_", b"sourcegraph", b"SOURCEGRAPH"],
+            anchors: &[b"sgp_", b"SGP_"],
             radius: 256,
             validator: ValidatorKind::None,
             two_phase: None,
             must_contain: None,
-            keywords_any: Some(&[b"sgp_", b"SGP_", b"sourcegraph", b"SOURCEGRAPH"]),
+            keywords_any: Some(&[b"sgp_", b"SGP_"]),
             entropy: Some(EntropySpec {
                 min_bits_per_byte: 3.0,
                 min_len: 16,
                 max_len: 256,
             }),
             re: build_regex(
-                r#"(?i)\b(\b(sgp_(?:[a-fA-F0-9]{16}|local)_[a-fA-F0-9]{40}|sgp_[a-fA-F0-9]{40}|[a-fA-F0-9]{40})\b)(?:[\x60'"\s;]|\\[nr]|$)"#,
+                r#"(?i)\b(sgp_(?:[a-fA-F0-9]{16}|local)_[a-fA-F0-9]{40}|sgp_[a-fA-F0-9]{40})\b(?:[\x60'"\s;]|\\[nr]|$)"#,
             ),
         },
         RuleSpec {

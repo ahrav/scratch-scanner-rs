@@ -477,7 +477,7 @@ impl SpanSink for ScratchVec<SpanU32> {
     }
 
     fn push(&mut self, span: Range<usize>) {
-        ScratchVec::push(self, SpanU32::new(span.start, span.end));
+        ScratchVec::push(self, SpanU32::new_no_hint(span.start, span.end));
     }
 }
 

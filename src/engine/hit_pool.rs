@@ -13,23 +13,50 @@ use std::ops::Range;
 /// Valid only for buffers whose length fits in `u32`. Spans are half-open
 /// ranges (`start..end`).
 ///
+/// # Fields
+/// - `anchor_hint`: Vectorscan's `from` match offset, clamped to `[start, end]`.
+///   Used to start regex searches near the anchor instead of at window start.
+///   When windows are merged, the earliest (smallest) anchor_hint is preserved.
+///
 /// # Invariants
 /// - `start <= end` and both fit in `u32`.
+/// - `anchor_hint` is in `[start, end]` (clamped during construction).
 /// - Only valid while the referenced buffer remains unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct SpanU32 {
     pub(super) start: u32,
     pub(super) end: u32,
+    /// Anchor hint from Vectorscan's `from` offset, clamped to window bounds.
+    pub(super) anchor_hint: u32,
 }
 
 impl SpanU32 {
-    pub(super) fn new(start: usize, end: usize) -> Self {
+    /// Creates a span with an explicit anchor hint.
+    ///
+    /// The anchor hint is clamped to `[start, end]` to maintain invariants.
+    pub(super) fn new(start: usize, end: usize, anchor_hint: usize) -> Self {
+        debug_assert!(start <= end);
+        debug_assert!(start <= u32::MAX as usize);
+        debug_assert!(end <= u32::MAX as usize);
+        let clamped_hint = anchor_hint.clamp(start, end);
+        Self {
+            start: start as u32,
+            end: end as u32,
+            anchor_hint: clamped_hint as u32,
+        }
+    }
+
+    /// Creates a span without an anchor hint (defaults to start).
+    ///
+    /// Used for backward compatibility and cases where anchor hints are unavailable.
+    pub(super) fn new_no_hint(start: usize, end: usize) -> Self {
         debug_assert!(start <= end);
         debug_assert!(start <= u32::MAX as usize);
         debug_assert!(end <= u32::MAX as usize);
         Self {
             start: start as u32,
             end: end as u32,
+            anchor_hint: start as u32,
         }
     }
 
@@ -89,9 +116,23 @@ impl HitAccPool {
             .ok_or_else(|| "HitAccPool windows size overflow".to_string())?;
 
         // SpanU32 is Copy; zero-init cost is one-time.
-        let windows = vec![SpanU32 { start: 0, end: 0 }; total];
+        let windows = vec![
+            SpanU32 {
+                start: 0,
+                end: 0,
+                anchor_hint: 0
+            };
+            total
+        ];
         let lens = vec![0u32; pair_count];
-        let coalesced = vec![SpanU32 { start: 0, end: 0 }; pair_count];
+        let coalesced = vec![
+            SpanU32 {
+                start: 0,
+                end: 0,
+                anchor_hint: 0
+            };
+            pair_count
+        ];
         let coalesced_set = vec![0u8; pair_count];
         let touched = DynamicBitSet::empty(pair_count);
 
@@ -147,10 +188,11 @@ impl HitAccPool {
         self.mark_touched(pair, touched_pairs);
 
         if self.coalesced_set[pair] != 0 {
-            // Expand coalesced window
+            // Expand coalesced window, preserving the earliest anchor hint.
             let c = &mut self.coalesced[pair];
             c.start = c.start.min(span.start);
             c.end = c.end.max(span.end);
+            c.anchor_hint = c.anchor_hint.min(span.anchor_hint);
             return;
         }
 
@@ -164,15 +206,22 @@ impl HitAccPool {
         }
 
         // Overflow: coalesce everything into one span and drop the per-hit list.
+        // Preserve the earliest (smallest) anchor hint across all windows.
         let base = pair * max_hits;
         let mut lo = span.start;
         let mut hi = span.end;
+        let mut min_anchor = span.anchor_hint;
         for i in 0..len {
             let s = self.windows[base + i];
             lo = lo.min(s.start);
             hi = hi.max(s.end);
+            min_anchor = min_anchor.min(s.anchor_hint);
         }
-        self.coalesced[pair] = SpanU32 { start: lo, end: hi };
+        self.coalesced[pair] = SpanU32 {
+            start: lo,
+            end: hi,
+            anchor_hint: min_anchor,
+        };
         self.coalesced_set[pair] = 1;
         self.lens[pair] = 0;
     }

@@ -409,6 +409,9 @@ impl VsStreamDb {
 /// fall back to a full decode scan and ignore `lo`/`hi`.
 /// `lo`/`hi` are not clamped to the current stream length; callers must clamp
 /// when materializing decode work.
+///
+/// `anchor_hint` is Vectorscan's `from` match offset, preserved to start regex
+/// searches near the anchor instead of at window start.
 #[repr(C)]
 pub(crate) struct VsStreamWindow {
     pub(crate) rule_id: u32,
@@ -416,6 +419,8 @@ pub(crate) struct VsStreamWindow {
     pub(crate) hi: u64,
     pub(crate) variant_idx: u8,
     pub(crate) force_full: bool,
+    /// Anchor hint from Vectorscan's `from` offset.
+    pub(crate) anchor_hint: u64,
 }
 
 /// Callback context for stream-mode scans on decoded byte streams.
@@ -469,7 +474,7 @@ pub(crate) struct VsUtf16StreamMatchCtx {
 /// - This callback must never panic or unwind across the FFI boundary.
 unsafe extern "C" fn vs_on_stream_match(
     id: c_uint,
-    _from: u64,
+    from: u64,
     to: u64,
     _flags: c_uint,
     ctx: *mut c_void,
@@ -490,6 +495,7 @@ unsafe extern "C" fn vs_on_stream_match(
             hi: 0,
             variant_idx: 0,
             force_full: true,
+            anchor_hint: from,
         });
         return 0;
     }
@@ -498,6 +504,9 @@ unsafe extern "C" fn vs_on_stream_match(
     let lo = to.saturating_sub(max_width.saturating_add(radius));
     let hi = to.saturating_add(radius);
 
+    // Clamp anchor hint to window bounds.
+    let anchor_hint = from.clamp(lo, to);
+
     let pending = &mut *c.pending;
     pending.push(VsStreamWindow {
         rule_id: id,
@@ -505,6 +514,7 @@ unsafe extern "C" fn vs_on_stream_match(
         hi,
         variant_idx: 0,
         force_full: false,
+        anchor_hint,
     });
     0
 }
@@ -549,7 +559,7 @@ pub(crate) fn gate_match_callback() -> vs::match_event_handler {
 /// - This callback must never panic or unwind across the FFI boundary.
 unsafe extern "C" fn vs_utf16_stream_on_match(
     id: c_uint,
-    _from: u64,
+    from: u64,
     to: u64,
     _flags: c_uint,
     ctx: *mut c_void,
@@ -567,6 +577,9 @@ unsafe extern "C" fn vs_utf16_stream_on_match(
     let end = c.base_offset.saturating_add(to);
     let start = end.saturating_sub(len);
 
+    // Compute absolute anchor hint from base_offset + from.
+    let abs_from = c.base_offset.saturating_add(from);
+
     let off_start = *c.pat_offsets.add(pid) as usize;
     let off_end = *c.pat_offsets.add(pid + 1) as usize;
 
@@ -576,12 +589,15 @@ unsafe extern "C" fn vs_utf16_stream_on_match(
         let seed = target.seed_radius_bytes as u64;
         let lo = start.saturating_sub(seed);
         let hi = end.saturating_add(seed);
+        // Clamp anchor hint to window bounds.
+        let anchor_hint = abs_from.clamp(lo, end);
         pending.push(VsStreamWindow {
             rule_id: target.rule_id,
             lo,
             hi,
             variant_idx: target.variant_idx,
             force_full: false,
+            anchor_hint,
         });
     }
     0
@@ -1761,7 +1777,7 @@ struct VsAnchorMatchCtx {
 /// - This callback must never panic or unwind across the FFI boundary.
 extern "C" fn vs_on_match(
     id: c_uint,
-    _from: u64,
+    from: u64,
     to: u64,
     _flags: c_uint,
     ctx: *mut c_void,
@@ -1791,10 +1807,17 @@ extern "C" fn vs_on_match(
         let lo = start.saturating_sub(seed);
         let hi = end.saturating_add(seed).min(c.hay_len);
 
+        // Clamp anchor hint to window bounds.
+        let anchor_hint = (from as u32).clamp(lo, end);
+
         let pair = rid * 3 + RAW_IDX;
         scratch.hit_acc_pool.push_span(
             pair,
-            SpanU32 { start: lo, end: hi },
+            SpanU32 {
+                start: lo,
+                end: hi,
+                anchor_hint,
+            },
             &mut scratch.touched_pairs,
         );
         return 0;
@@ -1828,13 +1851,20 @@ extern "C" fn vs_on_match(
         let lo = start.saturating_sub(seed);
         let hi = end.saturating_add(seed).min(c.hay_len);
 
+        // Clamp anchor hint to window bounds.
+        let anchor_hint = (from as u32).clamp(lo, end);
+
         let rid = target.rule_id as usize;
         let vidx = target.variant_idx as usize;
 
         let pair = rid * 3 + vidx;
         scratch.hit_acc_pool.push_span(
             pair,
-            SpanU32 { start: lo, end: hi },
+            SpanU32 {
+                start: lo,
+                end: hi,
+                anchor_hint,
+            },
             &mut scratch.touched_pairs,
         );
         if matches!(target.variant_idx, 1 | 2) {
@@ -1857,7 +1887,7 @@ extern "C" fn vs_on_match(
 /// - This callback must never panic or unwind across the FFI boundary.
 extern "C" fn vs_anchor_on_match(
     id: c_uint,
-    _from: u64,
+    from: u64,
     to: u64,
     _flags: c_uint,
     ctx: *mut c_void,
@@ -1885,13 +1915,20 @@ extern "C" fn vs_anchor_on_match(
         let lo = start.saturating_sub(seed);
         let hi = end.saturating_add(seed).min(c.hay_len);
 
+        // Clamp anchor hint to window bounds.
+        let anchor_hint = (from as u32).clamp(lo, end);
+
         let rid = target.rule_id as usize;
         let vidx = target.variant_idx as usize;
 
         let pair = rid * 3 + vidx;
         scratch.hit_acc_pool.push_span(
             pair,
-            SpanU32 { start: lo, end: hi },
+            SpanU32 {
+                start: lo,
+                end: hi,
+                anchor_hint,
+            },
             &mut scratch.touched_pairs,
         );
         if matches!(target.variant_idx, 1 | 2) {

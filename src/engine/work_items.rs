@@ -63,6 +63,10 @@ pub(super) struct PendingDecodeSpan {
 /// Offsets are in decoded-byte space (relative to the stream) and are
 /// half-open: `[lo, hi)`.
 ///
+/// # Fields
+/// - `anchor_hint`: Vectorscan's `from` match offset in decoded-byte space.
+///   Used to start regex searches near the anchor instead of at window start.
+///
 /// # Ordering
 /// - Ordered by earliest `hi`, then `lo`, then `(rule_id, variant)` so priority
 ///   queues drain windows as soon as their end offset is reached.
@@ -72,6 +76,8 @@ pub(super) struct PendingWindow {
     pub(super) lo: u64,
     pub(super) rule_id: u32,
     pub(super) variant: Variant,
+    /// Anchor hint from Vectorscan's `from` offset.
+    pub(super) anchor_hint: u64,
 }
 
 impl Ord for PendingWindow {

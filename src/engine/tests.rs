@@ -2170,12 +2170,14 @@ mod proptests {
                 let (start, end) = if a <= b { (a, b) } else { (b, a) };
                 let start = start as usize;
                 let end = end as usize;
-                acc.push_span(pair, SpanU32::new(start, end), &mut touched_pairs);
+                acc.push_span(pair, SpanU32::new_no_hint(start, end), &mut touched_pairs);
 
-                let r = SpanU32::new(start, end);
+                let r = SpanU32::new_no_hint(start, end);
                 if let Some(c) = ref_coalesced.as_mut() {
                     c.start = c.start.min(r.start);
                     c.end = c.end.max(r.end);
+                    // Preserve the earliest anchor_hint when coalescing.
+                    c.anchor_hint = c.anchor_hint.min(r.anchor_hint);
                 } else if ref_windows.len() < max_hits {
                     ref_windows.push(r);
                 } else {
@@ -2183,9 +2185,11 @@ mod proptests {
                     for w in &ref_windows[1..] {
                         c.start = c.start.min(w.start);
                         c.end = c.end.max(w.end);
+                        c.anchor_hint = c.anchor_hint.min(w.anchor_hint);
                     }
                     c.start = c.start.min(r.start);
                     c.end = c.end.max(r.end);
+                    c.anchor_hint = c.anchor_hint.min(r.anchor_hint);
                     ref_windows.clear();
                     ref_coalesced = Some(c);
                 }
