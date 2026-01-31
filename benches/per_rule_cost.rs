@@ -145,7 +145,6 @@ fn main() {
         keywords_any: None,
         entropy: None,
         re: regex::bytes::Regex::new(r"\xFF\xFE\xFD\xFC[a-z]{10}").unwrap(),
-        simple_re: None,
     };
     let baseline_engine = Engine::new_with_anchor_policy(
         vec![baseline_rule],
