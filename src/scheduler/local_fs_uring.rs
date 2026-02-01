@@ -307,9 +307,9 @@ fn emit_findings_formatted(
         let rule = engine.rule_name(rec.rule_id);
 
         use std::io::Write as _;
-        let _ = write!(
+        let _ = writeln!(
             out_buf,
-            ":{}-{} {}\n",
+            ":{}-{} {}",
             rec.root_hint_start, rec.root_hint_end, rule
         );
     }
@@ -1054,7 +1054,7 @@ pub fn scan_local_fs_uring(
         match t.join() {
             Ok(Ok(s)) => io_stats.merge(s),
             Ok(Err(e)) => return Err(e),
-            Err(_) => return Err(io::Error::new(io::ErrorKind::Other, "io thread panicked")),
+            Err(_) => return Err(io::Error::other("io thread panicked")),
         }
     }
 
