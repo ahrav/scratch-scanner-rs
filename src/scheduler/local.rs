@@ -1,4 +1,4 @@
-//! Local Filesystem Scanner (Phase 5.1)
+//! Local Filesystem Scanner
 //!
 //! # Architecture
 //!

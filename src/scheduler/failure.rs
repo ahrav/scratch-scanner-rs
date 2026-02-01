@@ -1,4 +1,4 @@
-//! Failure Model & Retry Budget System (Phase 8.1)
+//! Failure Model & Retry Budget System
 //!
 //! # Design
 //!

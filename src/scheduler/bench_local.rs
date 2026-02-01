@@ -1,4 +1,4 @@
-//! Local Scan Benchmark Harness (Phase 9.2)
+//! Local Scan Benchmark Harness
 //!
 //! # Purpose
 //!

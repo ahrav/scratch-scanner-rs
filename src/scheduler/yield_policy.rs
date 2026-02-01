@@ -1,4 +1,4 @@
-//! Deterministic Yield Policies (Phase 10.2)
+//! Deterministic Yield Policies
 //!
 //! # Purpose
 //!

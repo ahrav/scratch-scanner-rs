@@ -1,4 +1,4 @@
-//! # Scheduler Contract (Phase 0)
+//! # Scheduler Contract
 //!
 //! Run-scoped identifiers, engine contract, and scheduler limits.
 //!

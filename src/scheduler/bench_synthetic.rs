@@ -1,4 +1,4 @@
-//! Synthetic File Generation for Benchmarks (Phase 9.2)
+//! Synthetic File Generation for Benchmarks
 //!
 //! # Purpose
 //!

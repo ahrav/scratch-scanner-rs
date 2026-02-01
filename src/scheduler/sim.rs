@@ -1,4 +1,4 @@
-//! Deterministic Simulator for Scheduler Invariant Verification (Phase 8.3)
+//! Deterministic Simulator for Scheduler Invariant Verification
 //!
 //! # Purpose
 //!

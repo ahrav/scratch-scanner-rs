@@ -1,4 +1,4 @@
-//! Work-Stealing CPU Executor (Phase 1)
+//! Work-Stealing CPU Executor
 //!
 //! # Architecture
 //!
@@ -49,7 +49,7 @@
 //! # What This Does NOT Guarantee Yet
 //!
 //! - **Bounded task queues**: crossbeam queues are unbounded.
-//!   Use `TokenBudget` from Phase 0 to enforce `max_queued_tasks`.
+//!   Use `TokenBudget` to enforce `max_queued_tasks`.
 //! - **I/O completion integration**: the seam exists via [`ExecutorHandle::spawn()`].
 
 use super::metrics::WorkerMetricsLocal;
@@ -142,8 +142,8 @@ impl Default for ExecutorConfig {
 
 /// Handle for external producers (I/O threads, API callers).
 ///
-/// This is the "thin seam" for Phase 2: I/O completion can enqueue
-/// CPU work via this handle without knowing executor internals.
+/// This is the seam between I/O and CPU engines: I/O completion handlers
+/// enqueue CPU work via this handle without knowing executor internals.
 ///
 /// # Thread Safety
 ///

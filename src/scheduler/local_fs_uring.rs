@@ -1,4 +1,4 @@
-//! Local Filesystem Scanner with io_uring (Phase 6)
+//! Local Filesystem Scanner with io_uring
 //!
 //! # Architecture
 //!
@@ -62,7 +62,7 @@ use std::thread;
 // Configuration
 // ============================================================================
 
-/// Phase 6 config: local FS using io_uring I/O threads + CPU executor scan threads.
+/// Configuration for local FS scanning using io_uring I/O threads + CPU executor scan threads.
 #[derive(Clone, Debug)]
 pub struct LocalFsUringConfig {
     /// Number of CPU worker threads for scanning.
@@ -944,7 +944,7 @@ fn walk_and_send_files(
 // Entry Point
 // ============================================================================
 
-/// Phase 6 entry point: scan local filesystem using io_uring.
+/// Scan local filesystem using io_uring.
 ///
 /// # Arguments
 ///

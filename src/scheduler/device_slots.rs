@@ -1,4 +1,4 @@
-//! Device Slots for mmap-Based I/O Fairness (Phase 10.3)
+//! Device Slots for mmap-Based I/O Fairness
 //!
 //! # Purpose
 //!

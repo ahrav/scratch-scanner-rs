@@ -1,4 +1,4 @@
-//! Benchmark Harness for Local Scanning (Phase 9.2)
+//! Benchmark Harness for Local Scanning
 //!
 //! # Purpose
 //!

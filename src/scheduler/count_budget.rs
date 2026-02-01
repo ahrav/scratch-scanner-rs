@@ -1,4 +1,4 @@
-//! Blocking Token Budget for In-Flight Object Caps (Phase 3)
+//! Blocking Token Budget for In-Flight Object Caps
 //!
 //! # Purpose
 //!

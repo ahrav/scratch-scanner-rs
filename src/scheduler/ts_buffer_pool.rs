@@ -1,4 +1,4 @@
-//! Thread-Safe Fixed-Capacity Buffer Pool (Phase 2)
+//! Thread-Safe Fixed-Capacity Buffer Pool
 //!
 //! # Design
 //!

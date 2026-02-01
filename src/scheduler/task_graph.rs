@@ -1,4 +1,4 @@
-//! Task Graph: Typed Task Model for Scanner Scheduler (Phase 7.1)
+//! Task Graph: Typed Task Model for Scanner Scheduler
 //!
 //! # Architecture
 //!

@@ -1,4 +1,4 @@
-//! Executor Microbenchmark (Phase 9.2)
+//! Executor Microbenchmark
 //!
 //! # Purpose
 //!

@@ -1,4 +1,4 @@
-//! Output Sink for Parallel Scanning (Phase 4)
+//! Output Sink for Parallel Scanning
 //!
 //! # Design
 //!

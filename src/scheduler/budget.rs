@@ -28,7 +28,7 @@
 //! 1. **Sharded budget**: N atomics, acquire from preferred shard, steal if needed
 //! 2. **Local caching**: Per-worker cache with bulk refill/flush
 //!
-//! For Phase 0, we use the simple single-atomic design. Measure contention with
+//! We use the simple single-atomic design. Measure contention with
 //! `perf c2c` or similar before adding complexity.
 //!
 //! ## Invariants

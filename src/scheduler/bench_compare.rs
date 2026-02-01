@@ -1,4 +1,4 @@
-//! Benchmark Comparison and Regression Detection (Phase 9.2)
+//! Benchmark Comparison and Regression Detection
 //!
 //! # Purpose
 //!

@@ -1,4 +1,4 @@
-//! Findings Collection System (Phase 8.2)
+//! Findings Collection System
 //!
 //! # Design
 //!

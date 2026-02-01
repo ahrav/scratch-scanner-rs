@@ -1,4 +1,4 @@
-//! Remote Fetch Pipeline (Phase 5.3)
+//! Remote Fetch Pipeline
 //!
 //! # Architecture
 //!

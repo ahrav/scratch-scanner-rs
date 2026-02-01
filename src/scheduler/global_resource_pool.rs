@@ -1,4 +1,4 @@
-//! Global Resource Pool for Fat Jobs (Phase 10.1)
+//! Global Resource Pool for Fat Jobs
 //!
 //! # Purpose
 //!

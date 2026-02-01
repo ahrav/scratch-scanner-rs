@@ -1,4 +1,4 @@
-//! Sendable Chunk Wrapper (Phase 2)
+//! Sendable Chunk Wrapper
 //!
 //! # Purpose
 //!

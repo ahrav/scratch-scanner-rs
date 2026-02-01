@@ -1,4 +1,4 @@
-//! Engine Interface Stubs (Phase 4)
+//! Engine Interface Stubs
 //!
 //! # Purpose
 //!
