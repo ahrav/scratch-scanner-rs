@@ -96,6 +96,12 @@ graph TB
 | **BitSet** | `src/stdx/bitset.rs:30` | Compile-time fixed bitset |
 | **ScanScratch** | `src/lib.rs:859` | Per-scan reusable scratch state |
 | **TimingWheel** | `src/stdx/timing_wheel.rs` | Hashed timing wheel for window expiration scheduling |
+| **Sim Harness (feature `sim-harness`)** | `src/sim/` | Deterministic simulation primitives (RNG/clock/trace) used by the harnesses |
+
+## Testing Harnesses
+
+The optional sim harnesses provide deterministic simulation primitives and replayable traces for
+scanner and scheduler testing. See `docs/test_harness.md` for the full design and workflow.
 
 ## Data Flow
 

@@ -18,6 +18,7 @@ libc = "0.2"
 memchr = "2.6"
 regex = "1.10"
 regex-syntax = "0.8"
+serde = { version = "1.0", features = ["derive"], optional = true }
 vectorscan-rs-sys = "0.0.5"
 
 # Directory walking and parallel scanning
@@ -43,6 +44,7 @@ stats = []
 b64-stats = ["stats"]
 bench = []
 tiger-harness = []
+sim-harness = ["serde"]
 kani = []  # Gate Kani model-checking proofs
 scheduler-affinity = ["core_affinity"]  # Thread pinning support for scheduler
 io-uring = []  # Enable io_uring scanner on Linux
