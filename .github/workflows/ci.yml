@@ -78,7 +78,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ubuntu-22.04
-      - run: cargo test --all-targets --features stdx-proptest,tiger-harness
+      - run: cargo test --all-targets --features stdx-proptest,tiger-harness,scheduler-sim
 
   fuzz-linux:
     name: Fuzz (Scheduled, Nightly Only, Linux)

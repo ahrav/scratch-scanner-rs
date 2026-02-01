@@ -846,7 +846,7 @@ pub fn replay_sim(cfg: SimConfig, trace: &SimTrace) -> Result<SimReport, SimErro
 // Tests
 // ============================================================================
 
-#[cfg(test)]
+#[cfg(all(test, feature = "scheduler-sim"))]
 mod tests {
     use super::*;
 
