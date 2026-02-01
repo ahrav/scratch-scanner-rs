@@ -306,7 +306,10 @@ impl WorkerMetricsLocal {
         }
     }
 
-    /// Local hit rate: local_pops / total_pops.
+    /// Local hit rate: `local_pops / (local_pops + injector_pops + steal_successes)`.
+    ///
+    /// Measures how often this worker consumed tasks from its own deque vs.
+    /// fetching from the global injector or stealing from peers.
     pub fn local_hit_rate(&self) -> f64 {
         let total = self
             .local_pops
@@ -319,7 +322,10 @@ impl WorkerMetricsLocal {
         }
     }
 
-    /// Steal success rate: steal_successes / steal_attempts.
+    /// Steal success rate: `steal_successes / steal_attempts`.
+    ///
+    /// Indicates how often steal attempts found work. A rate near 0 means
+    /// peers' deques were usually empty when this worker tried to steal.
     pub fn steal_rate(&self) -> f64 {
         if self.steal_attempts == 0 {
             0.0
@@ -329,9 +335,30 @@ impl WorkerMetricsLocal {
     }
 }
 
-/// Aggregated metrics snapshot.
+/// Aggregated metrics snapshot from all workers.
 ///
-/// Collected after workers join - still plain data, no atomics needed.
+/// # Lifecycle
+///
+/// 1. Workers run with their own [`WorkerMetricsLocal`] (no contention)
+/// 2. After all workers join, create one `MetricsSnapshot`
+/// 3. Call [`merge_worker`](Self::merge_worker) for each worker's metrics
+/// 4. Query aggregate statistics (rates, percentiles, throughput)
+///
+/// # Thread Safety
+///
+/// Like `WorkerMetricsLocal`, this is **not thread-safe**. Intended for
+/// single-threaded aggregation after parallel work completes.
+///
+/// # Example
+///
+/// ```ignore
+/// let mut snapshot = MetricsSnapshot::new();
+/// for worker in workers {
+///     snapshot.merge_worker(&worker.metrics);
+/// }
+/// snapshot.duration_ns = elapsed.as_nanos() as u64;
+/// println!("Throughput: {:.2} GB/s", snapshot.gb_per_sec());
+/// ```
 #[derive(Clone, Debug, Default)]
 pub struct MetricsSnapshot {
     /// Total tasks enqueued across all workers.
@@ -392,7 +419,14 @@ impl MetricsSnapshot {
         }
     }
 
-    /// Merge a worker's metrics into this snapshot.
+    /// Merge a worker's local metrics into this aggregate snapshot.
+    ///
+    /// Accumulates all counters and merges histograms. Call once per worker
+    /// after workers have joined. Increments `worker_count` automatically.
+    ///
+    /// # Performance
+    ///
+    /// O(1) for counters + O(64) for histogram merge. Total ~70 additions.
     pub fn merge_worker(&mut self, w: &WorkerMetricsLocal) {
         self.tasks_enqueued = self.tasks_enqueued.wrapping_add(w.tasks_enqueued);
         self.tasks_executed = self.tasks_executed.wrapping_add(w.tasks_executed);
@@ -414,7 +448,11 @@ impl MetricsSnapshot {
         self.worker_count = self.worker_count.wrapping_add(1);
     }
 
-    /// Aggregate local hit rate.
+    /// Aggregate local hit rate: `local_pops / (local_pops + injector_pops + steal_successes)`.
+    ///
+    /// Higher values (>0.8) indicate good work locality - workers mostly consume
+    /// their own spawned tasks. Low values suggest excessive stealing or reliance
+    /// on the global injector queue.
     pub fn local_hit_rate(&self) -> f64 {
         let total = self
             .local_pops
@@ -427,7 +465,13 @@ impl MetricsSnapshot {
         }
     }
 
-    /// Aggregate steal rate.
+    /// Aggregate steal success rate: `steal_successes / steal_attempts`.
+    ///
+    /// Low steal rates (<0.1) may indicate:
+    /// - Workers are well-balanced (steals rarely needed)
+    /// - Deques are often empty when stealing (potential idleness)
+    ///
+    /// Very high steal rates (>0.5) suggest work is poorly distributed.
     pub fn steal_rate(&self) -> f64 {
         if self.steal_attempts == 0 {
             0.0
@@ -436,7 +480,10 @@ impl MetricsSnapshot {
         }
     }
 
-    /// Tasks per second (requires duration_ns to be set).
+    /// Tasks completed per second: `tasks_executed / (duration_ns / 1e9)`.
+    ///
+    /// Returns 0.0 if `duration_ns` is not set. Set `duration_ns` from your
+    /// external timer after workers complete.
     pub fn tasks_per_sec(&self) -> f64 {
         if self.duration_ns == 0 {
             0.0
@@ -445,7 +492,9 @@ impl MetricsSnapshot {
         }
     }
 
-    /// Bytes per second (requires duration_ns to be set).
+    /// Bytes scanned per second: `bytes_scanned / (duration_ns / 1e9)`.
+    ///
+    /// Returns 0.0 if `duration_ns` is not set.
     pub fn bytes_per_sec(&self) -> f64 {
         if self.duration_ns == 0 {
             0.0
@@ -454,7 +503,10 @@ impl MetricsSnapshot {
         }
     }
 
-    /// GB/s scanned (requires duration_ns to be set).
+    /// Throughput in GiB/s (gibibytes, 1024³ bytes).
+    ///
+    /// Returns 0.0 if `duration_ns` is not set. Useful for comparing against
+    /// disk/network bandwidth limits.
     pub fn gb_per_sec(&self) -> f64 {
         self.bytes_per_sec() / (1024.0 * 1024.0 * 1024.0)
     }
