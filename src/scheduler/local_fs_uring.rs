@@ -805,7 +805,7 @@ fn io_worker_loop(
                         buf: op.buf,
                     };
 
-                    if let Err(SpawnError::Closed(_)) = cpu.spawn(task) {
+                    if cpu.spawn(task).is_err() {
                         // CPU executor shut down. Start stopping.
                         stopping = true;
                         st.failed = true;
