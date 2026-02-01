@@ -41,7 +41,6 @@ bench = []
 tiger-harness = []
 kani = []  # Gate Kani model-checking proofs
 scheduler-affinity = ["core_affinity"]  # Thread pinning support for scheduler
-catch-panics = []  # Catch panics in scheduler executor
 io-uring = []  # Enable io_uring scanner on Linux
 
 [dev-dependencies]
