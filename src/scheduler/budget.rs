@@ -106,6 +106,13 @@ impl ByteBudget {
     ///
     /// Returns `Some(BytePermit)` on success, `None` if insufficient budget.
     ///
+    /// # Complexity
+    ///
+    /// - **Uncontended**: O(1) - single successful CAS
+    /// - **Contended**: O(k) where k = number of concurrent acquirers. Each CAS
+    ///   failure retries with the observed value, so progress is guaranteed
+    ///   (lock-free, not wait-free).
+    ///
     /// # Performance
     /// - Lock-free CAS loop
     /// - `spin_loop()` on contention to reduce bus pressure
@@ -155,6 +162,9 @@ impl ByteBudget {
     ///
     /// Typically called automatically by `BytePermit::drop()`.
     /// Use `release_raw()` for manual release after cross-thread handoff.
+    ///
+    /// # Complexity
+    /// O(1) - single atomic fetch_add, no CAS loop needed for release.
     #[inline]
     fn release(&self, bytes: u64) {
         if bytes == 0 {
@@ -188,9 +198,15 @@ impl ByteBudget {
 ///
 /// Automatically releases the acquired bytes on drop.
 ///
+/// # Thread Safety
+///
+/// `BytePermit` is `Send` but not `Sync`. You can move it to another thread,
+/// but you cannot share references across threads. This is the intended design:
+/// a permit represents exclusive ownership of budget capacity.
+///
 /// # Ownership Transfer
 ///
-/// `BytePermit` is `Send`, so you can move it to another thread:
+/// Since `BytePermit` is `Send`, you can move it to another thread:
 ///
 /// ```ignore
 /// let permit = budget.try_acquire(256)?;
@@ -232,6 +248,16 @@ impl<'a> BytePermit<'a> {
     /// Use this for cross-thread handoff where another component will
     /// call `ByteBudget::release_raw()` later.
     ///
+    /// # Soundness
+    ///
+    /// Uses `mem::forget` to skip the `Drop` impl. This is sound because:
+    /// - `BytePermit` owns no heap allocations (just a reference + integer)
+    /// - The budget reference remains valid (lifetime bound to `'a`)
+    /// - The caller takes responsibility for calling `release_raw()` later
+    ///
+    /// Leaking the permit (forgetting to call `release_raw`) doesn't cause UB,
+    /// only budget capacity exhaustion.
+    ///
     /// # Example
     /// ```ignore
     /// let permit = budget.try_acquire(1024)?;
@@ -242,7 +268,7 @@ impl<'a> BytePermit<'a> {
     #[inline]
     pub fn into_raw(self) -> u64 {
         let bytes = self.bytes;
-        std::mem::forget(self); // Skip Drop
+        std::mem::forget(self);
         bytes
     }
 
@@ -307,6 +333,8 @@ impl TokenBudget {
     }
 
     /// Try to acquire `count` tokens.
+    ///
+    /// See [`ByteBudget::try_acquire`] for complexity and performance notes.
     #[inline]
     pub fn try_acquire(&self, count: u32) -> Option<TokenPermit<'_>> {
         if count == 0 {
@@ -369,6 +397,11 @@ impl TokenBudget {
 }
 
 /// RAII permit for token budgets.
+///
+/// # Thread Safety
+///
+/// `TokenPermit` is `Send` but not `Sync`, mirroring `BytePermit` semantics.
+/// Move the permit to transfer ownership; don't share references.
 #[derive(Debug)]
 pub struct TokenPermit<'a> {
     budget: &'a TokenBudget,
@@ -383,6 +416,8 @@ impl<'a> TokenPermit<'a> {
     }
 
     /// Consume the permit and return count WITHOUT releasing.
+    ///
+    /// See [`BytePermit::into_raw`] for soundness rationale.
     #[inline]
     pub fn into_raw(self) -> u32 {
         let count = self.count;
