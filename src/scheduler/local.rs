@@ -284,12 +284,6 @@ pub struct LocalStats {
     /// This includes file open failures, metadata read failures, and
     /// read errors during scanning. Aggregated from worker metrics.
     pub io_errors: u64,
-    /// Errors encountered during file discovery (directory walking).
-    ///
-    /// This includes permission denied, broken symlinks, and other errors
-    /// that prevented a file from being added to the scan queue. These are
-    /// distinct from `io_errors` which occur during actual scanning.
-    pub discovery_errors: u64,
 }
 
 /// Complete report from a local scan.

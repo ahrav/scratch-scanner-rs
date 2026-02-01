@@ -291,9 +291,7 @@ pub use local::{
 };
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub use local_fs_uring::{scan_local_fs_uring, LocalFsUringConfig, UringIoStats};
-pub use parallel_scan::{
-    parallel_scan_dir, parallel_scan_files, ParallelScanConfig, ParallelScanReport,
-};
+pub use parallel_scan::{parallel_scan_dir, ParallelScanConfig, ParallelScanReport};
 pub use remote::{ErrorClass, RemoteBackend, RemoteConfig, RetryPolicy};
 
 // Observability
