@@ -10,11 +10,18 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 [dependencies]
 aegis = "0.9"
 ahash = "0.8"
+crossbeam-channel = "0.5"
+crossbeam-deque = "0.8"
+crossbeam-queue = "0.3"
+crossbeam-utils = "0.8"
 libc = "0.2"
 memchr = "2.6"
 regex = "1.10"
 regex-syntax = "0.8"
 vectorscan-rs-sys = "0.0.5"
+
+# Optional dependency for thread pinning
+core_affinity = { version = "0.8", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.6"
@@ -33,6 +40,9 @@ b64-stats = ["stats"]
 bench = []
 tiger-harness = []
 kani = []  # Gate Kani model-checking proofs
+scheduler-affinity = ["core_affinity"]  # Thread pinning support for scheduler
+io-uring = []  # Enable io_uring scanner on Linux
+scheduler-sim = []  # Enable longer-running scheduler simulation tests
 
 [dev-dependencies]
 base64 = "0.22"
@@ -40,6 +50,7 @@ proptest = "1.4"
 criterion = "0.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+tempfile = "3.10"
 
 [[bench]]
 name = "scan"

@@ -42,6 +42,7 @@ pub mod lsm;
 pub mod pipeline;
 pub mod pool;
 pub mod regex2anchor;
+pub mod scheduler;
 pub mod scratch_memory;
 pub mod stdx;
 #[cfg(test)]
