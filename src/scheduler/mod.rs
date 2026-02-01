@@ -201,7 +201,7 @@
 //!   [`TokenBudget`], [`ChunkParams`], [`RunConfig`], [`Limits`]
 //! - **Supporting**: [`CountBudget`], [`TsBufferPool`], [`OutputSink`] variants,
 //!   [`WorkerFindingsBuffer`]
-//! - **Local scanning**: [`scan_local`], [`LocalConfig`], [`scan_local_uring`] (Linux)
+//! - **Local scanning**: [`scan_local`], [`LocalConfig`], [`scan_local_fs_uring`] (Linux)
 //! - **Advanced**: [`affinity`] functions, [`failure`] types, [`sim`] harness
 
 // Core scheduling
@@ -275,7 +275,7 @@ pub use worker_id::{current_worker_id, set_current_worker_id};
 // I/O backends
 pub use local::{scan_local, LocalConfig, LocalStats};
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
-pub use local_fs_uring::{scan_local_uring, UringConfig, UringStats};
+pub use local_fs_uring::{scan_local_fs_uring, LocalFsUringConfig, UringIoStats};
 pub use remote::{ErrorClass, RemoteBackend, RemoteConfig, RetryPolicy};
 
 // Observability

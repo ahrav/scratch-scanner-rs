@@ -37,12 +37,12 @@
 
 #![cfg(all(target_os = "linux", feature = "io-uring"))]
 
-use crate::count_budget::{CountBudget, CountPermit};
-use crate::engine_stub::{FileId, FindingRec, MockEngine, ScanScratch, BUFFER_LEN_MAX};
-use crate::executor::{Executor, ExecutorConfig, ExecutorHandle, SpawnError, WorkerCtx};
-use crate::metrics::MetricsSnapshot;
-use crate::output_sink::OutputSink;
-use crate::ts_buffer_pool::{BufferPoolPolicy, TsBufferHandle, TsBufferPool, TsBufferPoolConfig};
+use super::count_budget::{CountBudget, CountPermit};
+use super::engine_stub::{FileId, FindingRec, MockEngine, ScanScratch, BUFFER_LEN_MAX};
+use super::executor::{Executor, ExecutorConfig, ExecutorHandle, SpawnError, WorkerCtx};
+use super::metrics::MetricsSnapshot;
+use super::output_sink::OutputSink;
+use super::ts_buffer_pool::{BufferPoolPolicy, TsBufferHandle, TsBufferPool, TsBufferPoolConfig};
 
 use crossbeam_channel as chan;
 
@@ -1075,9 +1075,9 @@ pub fn scan_local_fs_uring(
 
 #[cfg(test)]
 mod tests {
+    use super::engine_stub::{EngineTuning, MockRule};
+    use super::output_sink::VecSink;
     use super::*;
-    use crate::engine_stub::{EngineTuning, MockRule};
-    use crate::output_sink::VecSink;
     use tempfile::tempdir;
 
     #[test]
