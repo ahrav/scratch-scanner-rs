@@ -520,6 +520,7 @@ mod tests {
             must_contain: None,
             keywords_any: None,
             entropy: None,
+            secret_group: None,
             re: Regex::new(r"SECRET[A-Z0-9]{8}").unwrap(),
         }
     }

@@ -30,7 +30,14 @@ fn find_release_binary() -> PathBuf {
 
     // Check CARGO_TARGET_DIR first
     if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
-        return PathBuf::from(target_dir).join("release").join(BINARY_NAME);
+        let base = PathBuf::from(target_dir);
+        // If cross-compiling, Cargo places binary under <target_dir>/<target>/release/
+        let base = if let Ok(target) = std::env::var("CARGO_BUILD_TARGET") {
+            base.join(target)
+        } else {
+            base
+        };
+        return base.join("release").join(BINARY_NAME);
     }
 
     // Check for cross-compilation target
