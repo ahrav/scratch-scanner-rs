@@ -487,7 +487,30 @@ struct CollectResult {
 }
 
 fn collect_files(root: &Path, config: &ParallelScanConfig) -> io::Result<CollectResult> {
-    // Verify root is accessible (readable) before walking.
+    // Handle single-file input: skip directory walking entirely.
+    // This allows `parallel_scan_dir` to accept file paths for convenience,
+    // even though the function name suggests directory-only.
+    if root.is_file() {
+        let meta = std::fs::metadata(root)?;
+        let size = meta.len();
+        if size > 0 && size <= config.max_file_size {
+            return Ok(CollectResult {
+                files: vec![LocalFile {
+                    path: root.to_path_buf(),
+                    size,
+                }],
+                discovery_errors: 0,
+            });
+        } else {
+            // File exists but is empty or too large — return empty list (not an error)
+            return Ok(CollectResult {
+                files: vec![],
+                discovery_errors: 0,
+            });
+        }
+    }
+
+    // Verify root directory is accessible (readable) before walking.
     // This catches permission denied early rather than silently returning
     // an empty file list. The exists() check in parallel_scan_dir only
     // verifies the inode exists, not that we can read the directory.
@@ -813,5 +836,72 @@ mod tests {
         let report = result.unwrap();
         assert_eq!(report.stats.files_enqueued, 1);
         assert!(report.stats.discovery_errors >= 1); // Subdirectory error counted
+    }
+
+    #[test]
+    fn scans_single_file() {
+        let rules = vec![simple_rule()];
+        let transforms: Vec<TransformConfig> = vec![];
+        let engine = Arc::new(Engine::new(rules, transforms, test_tuning()));
+        let sink = Arc::new(VecSink::new());
+
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("single.txt");
+        fs::write(&file, "SECRETABCD1234").unwrap();
+
+        // Pass file path directly (not directory)
+        let result = parallel_scan_dir(&file, engine, small_config(), sink.clone());
+
+        assert!(result.is_ok());
+        let report = result.unwrap();
+        assert_eq!(report.stats.files_enqueued, 1);
+
+        let output = sink.take();
+        let output_str = String::from_utf8_lossy(&output);
+        assert!(output_str.contains("test-secret"));
+    }
+
+    #[test]
+    fn single_file_respects_max_size() {
+        let rules = vec![simple_rule()];
+        let transforms: Vec<TransformConfig> = vec![];
+        let engine = Arc::new(Engine::new(rules, transforms, test_tuning()));
+        let sink = Arc::new(VecSink::new());
+
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("large.txt");
+        let content = vec![b'x'; 1000];
+        fs::write(&file, &content).unwrap();
+
+        let mut config = small_config();
+        config.max_file_size = 100; // Smaller than file
+
+        // Pass file path directly
+        let result = parallel_scan_dir(&file, engine, config, sink.clone());
+
+        assert!(result.is_ok());
+        let report = result.unwrap();
+        // File is too large, should be skipped
+        assert_eq!(report.stats.files_enqueued, 0);
+    }
+
+    #[test]
+    fn single_file_skips_empty() {
+        let rules = vec![simple_rule()];
+        let transforms: Vec<TransformConfig> = vec![];
+        let engine = Arc::new(Engine::new(rules, transforms, test_tuning()));
+        let sink = Arc::new(VecSink::new());
+
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("empty.txt");
+        fs::write(&file, "").unwrap();
+
+        // Pass empty file path directly
+        let result = parallel_scan_dir(&file, engine, small_config(), sink.clone());
+
+        assert!(result.is_ok());
+        let report = result.unwrap();
+        // Empty file should be skipped
+        assert_eq!(report.stats.files_enqueued, 0);
     }
 }

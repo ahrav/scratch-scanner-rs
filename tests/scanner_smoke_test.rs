@@ -16,6 +16,35 @@ fn make_temp_dir() -> PathBuf {
     path
 }
 
+/// Find the release binary, respecting CARGO_TARGET_DIR and cross-compilation.
+///
+/// Checks in order:
+/// 1. CARGO_TARGET_DIR environment variable
+/// 2. CARGO_BUILD_TARGET for cross-compilation
+/// 3. Default ./target/release/ location
+fn find_release_binary() -> PathBuf {
+    #[cfg(windows)]
+    const BINARY_NAME: &str = "scanner-rs.exe";
+    #[cfg(not(windows))]
+    const BINARY_NAME: &str = "scanner-rs";
+
+    // Check CARGO_TARGET_DIR first
+    if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
+        return PathBuf::from(target_dir).join("release").join(BINARY_NAME);
+    }
+
+    // Check for cross-compilation target
+    if let Ok(target) = std::env::var("CARGO_BUILD_TARGET") {
+        return PathBuf::from("target")
+            .join(target)
+            .join("release")
+            .join(BINARY_NAME);
+    }
+
+    // Default location
+    PathBuf::from("target").join("release").join(BINARY_NAME)
+}
+
 #[test]
 fn scanner_binary_finds_secrets() {
     let tmp = make_temp_dir();
@@ -31,10 +60,11 @@ fn scanner_binary_finds_secrets() {
         .unwrap();
     assert!(status.success(), "Failed to build scanner");
 
-    let output = Command::new("./target/release/scanner-rs")
-        .arg(&tmp)
-        .output()
-        .unwrap();
+    // Use dynamic binary path instead of hardcoded path.
+    // This respects CARGO_TARGET_DIR and cross-compilation settings.
+    let binary = find_release_binary();
+
+    let output = Command::new(&binary).arg(&tmp).output().unwrap();
 
     assert!(
         output.status.success(),
