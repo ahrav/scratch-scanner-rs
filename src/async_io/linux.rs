@@ -606,6 +606,7 @@ mod tests {
             must_contain: None,
             keywords_any: None,
             entropy: None,
+            secret_group: None,
             re: Regex::new("SECRET").unwrap(),
         };
         let engine = Arc::new(Engine::new_with_anchor_policy(

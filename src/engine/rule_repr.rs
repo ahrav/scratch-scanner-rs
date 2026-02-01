@@ -278,6 +278,15 @@ pub(super) struct RuleCompiled {
     /// (`=`, `:`, `=>`) followed by a plausible token (10+ alphanumeric chars).
     /// Used to skip expensive regex on windows that cannot match.
     pub(super) needs_assignment_shape_check: bool,
+    /// Optional capture group index for secret extraction.
+    ///
+    /// Passed to [`extract_secret_span`] during window validation to determine
+    /// which portion of the regex match represents the actual secret. When set,
+    /// the engine extracts from the specified group; when `None`, it defaults to
+    /// capture group 1 (gitleaks convention), falling back to the full match.
+    ///
+    /// [`extract_secret_span`]: super::helpers::extract_secret_span
+    pub(super) secret_group: Option<u16>,
 }
 
 // --------------------------
@@ -347,6 +356,7 @@ pub(super) fn compile_rule(spec: &RuleSpec) -> RuleCompiled {
         re: spec.re.clone(),
         two_phase,
         needs_assignment_shape_check,
+        secret_group: spec.secret_group,
     }
 }
 
