@@ -270,8 +270,10 @@ pub struct WorkerMetricsLocal {
     pub park_count: u64,
     /// I/O errors encountered (file open, read, metadata failures).
     pub io_errors: u64,
+    /// Total findings emitted by this worker.
+    pub findings_emitted: u64,
     // Padding to separate from histograms
-    _pad: [u64; 4],
+    _pad: [u64; 3],
     // 8 * 8 = 64 bytes (second cache line)
 
     // ===== COLD DATA (histograms - rarely read during execution) =====
@@ -303,7 +305,8 @@ impl WorkerMetricsLocal {
             idle_spins: 0,
             park_count: 0,
             io_errors: 0,
-            _pad: [0; 4],
+            findings_emitted: 0,
+            _pad: [0; 3],
             queue_time_ns: Log2Hist::new(),
             task_time_ns: Log2Hist::new(),
         }
@@ -395,6 +398,8 @@ pub struct MetricsSnapshot {
     pub park_count: u64,
     /// Total I/O errors (file open, read, metadata failures).
     pub io_errors: u64,
+    /// Total findings emitted across all workers.
+    pub findings_emitted: u64,
 
     /// Number of workers merged.
     pub worker_count: u32,
@@ -420,6 +425,7 @@ impl MetricsSnapshot {
             idle_spins: 0,
             park_count: 0,
             io_errors: 0,
+            findings_emitted: 0,
             worker_count: 0,
             duration_ns: 0,
         }
@@ -451,6 +457,7 @@ impl MetricsSnapshot {
         self.idle_spins = self.idle_spins.wrapping_add(w.idle_spins);
         self.park_count = self.park_count.wrapping_add(w.park_count);
         self.io_errors = self.io_errors.wrapping_add(w.io_errors);
+        self.findings_emitted = self.findings_emitted.wrapping_add(w.findings_emitted);
 
         self.worker_count = self.worker_count.wrapping_add(1);
     }

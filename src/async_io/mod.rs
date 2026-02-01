@@ -1,17 +1,65 @@
-//! Asynchronous IO backends for single-threaded, overlapped scan + read.
+//! Asynchronous I/O backends for single-threaded, overlapped scan + read.
 //!
-//! This module provides:
-//! - Linux io_uring with aligned payload offsets (O_DIRECT-ready).
-//! - macOS POSIX AIO with read-ahead and overlap preservation.
+//! # Overview
 //!
-//! Both backends keep the scan loop single-threaded while overlapping IO.
+//! These backends achieve high throughput on a single thread by overlapping
+//! file reads with CPU scanning work. While one buffer is being scanned, the
+//! next is being filled by the kernel—no idle CPU time waiting for I/O.
 //!
-//! # Invariants and budgets
-//! - `chunk_size` is aligned and sized to leave room for overlap in
-//!   `BUFFER_LEN_MAX`.
-//! - Queue depth must be >= 2 to overlap read/scan without stalling.
-//! - Unix path storage uses a fixed-size arena; overruns are treated as
-//!   configuration errors to keep allocation predictable.
+//! ```text
+//!    Time ──────────────────────────────────────────────────────►
+//!
+//!    CPU:    [scan chunk 0]     [scan chunk 1]     [scan chunk 2]
+//!    I/O:         [read chunk 1]     [read chunk 2]     [read chunk 3]
+//!                      └──overlap──┘      └──overlap──┘
+//! ```
+//!
+//! # Platform Backends
+//!
+//! | Platform | Module | Mechanism | O_DIRECT |
+//! |----------|--------|-----------|----------|
+//! | Linux | [`linux`] | io_uring SQE/CQE | Yes (aligned) |
+//! | macOS | [`macos`] | POSIX AIO (`aio_read`) | No |
+//!
+//! # When to Use Async vs Blocking
+//!
+//! | Scenario | Recommendation |
+//! |----------|----------------|
+//! | Hot page cache | Blocking reads (kernel overhead dominates) |
+//! | Cold cache, SSD | Async (overlap hides latency) |
+//! | Cold cache, HDD | Async (overlap essential for throughput) |
+//! | Many small files | Blocking (open/close dominates) |
+//! | Few large files | Async (read time dominates) |
+//!
+//! For most production workloads with mixed file sizes and cache states,
+//! the parallel scheduler in [`crate::scheduler`] with blocking reads
+//! outperforms single-threaded async due to better CPU utilization.
+//!
+//! # Invariants
+//!
+//! - **Chunk alignment**: `chunk_size` is aligned to `BUFFER_ALIGN` and sized
+//!   to leave room for overlap prefix in `BUFFER_LEN_MAX`.
+//! - **Queue depth ≥ 2**: Required to overlap read and scan; depth of 1 would
+//!   serialize operations with no benefit over blocking reads.
+//! - **Fixed memory budget**: All buffers allocated upfront; no hot-path
+//!   allocation. Path storage uses a fixed-size arena.
+//! - **Ordered emission**: Chunks are emitted in file offset order regardless
+//!   of I/O completion order (important for overlap correctness).
+//!
+//! # Memory Layout
+//!
+//! Each buffer holds `overlap + chunk_size` bytes:
+//!
+//! ```text
+//! ┌─────────────────┬──────────────────────────────────────────┐
+//! │  overlap prefix │              payload bytes               │
+//! │  (from prev)    │              (new read)                  │
+//! └─────────────────┴──────────────────────────────────────────┘
+//! │◄──── overlap ───►│◄────────── chunk_size ──────────────────►│
+//! ```
+//!
+//! The prefix is copied from the previous chunk's tail, allowing the scanner
+//! to detect secrets spanning chunk boundaries without re-reading from disk.
 
 use crate::pipeline::PipelineStats;
 use crate::scratch_memory::ScratchVec;
@@ -33,17 +81,35 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::io::RawFd;
 
-/// Default chunk size for async IO scanners (bytes).
+/// Default chunk size for async I/O scanners (bytes).
 ///
-/// A value of 0 means "auto", resolved to the maximum aligned size that still
-/// leaves room for the overlap prefix within `BUFFER_LEN_MAX`.
+/// A value of 0 means "auto", resolved at runtime to the maximum aligned size
+/// that fits within `BUFFER_LEN_MAX` after reserving space for overlap.
+///
+/// The auto-resolution formula:
+/// ```text
+/// max_chunk = align_down(BUFFER_LEN_MAX - overlap, BUFFER_ALIGN)
+/// ```
+///
+/// For typical overlap values (256 bytes), this yields chunk sizes near
+/// `BUFFER_LEN_MAX`, maximizing bytes per syscall while maintaining alignment.
 pub const ASYNC_DEFAULT_CHUNK_SIZE: usize = 0;
 
 /// Default queue depth for async submissions.
 ///
-/// The Linux implementation uses a **single in-flight read** plus the current
-/// scan buffer; macOS uses a small read-ahead window. A depth of 2 is the
-/// minimal setting for overlap.
+/// Queue depth controls how many I/O operations can be in-flight simultaneously:
+///
+/// - **Depth 2** (minimum): One buffer scanning, one buffer being filled.
+///   Achieves basic overlap but any I/O latency spike stalls the CPU.
+///
+/// - **Depth 4-8**: Recommended for HDDs where latency variance is high.
+///   Extra in-flight reads absorb latency spikes.
+///
+/// - **Higher depths**: Diminishing returns; mainly useful for network storage
+///   with high latency variance.
+///
+/// The default of 2 is conservative on memory while still enabling overlap.
+/// Increase if profiling shows CPU idle time waiting for I/O completion.
 pub const ASYNC_DEFAULT_QUEUE_DEPTH: u32 = 2;
 
 /// Default maximum number of files to scan.
@@ -172,7 +238,7 @@ fn set_errno(value: libc::c_int) {
 /// Rejects paths containing NUL or longer than `PATH_MAX` to avoid heap
 /// allocation when invoking libc APIs.
 #[cfg(unix)]
-fn with_c_path<T>(
+pub(super) fn with_c_path<T>(
     path: &Path,
     f: impl FnOnce(*const libc::c_char) -> io::Result<T>,
 ) -> io::Result<T> {

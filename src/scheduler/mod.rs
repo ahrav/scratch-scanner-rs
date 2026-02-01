@@ -46,12 +46,19 @@
 //! | [`metrics`] | Per-worker metrics with cache-line isolation |
 //! | [`rng`] | Deterministic RNG for reproducible steal patterns |
 //!
+//! ## Engine Abstraction
+//!
+//! | Module | Purpose |
+//! |--------|---------|
+//! | [`engine_trait`] | Trait definitions ([`ScanEngine`], [`EngineScratch`], [`FindingRecord`]) |
+//! | [`engine_stub`] | Mock engine for testing scheduler in isolation |
+//! | [`engine_impl`] | Bridges traits to real [`crate::engine::Engine`] |
+//!
 //! ## Supporting Primitives
 //!
 //! | Module | Purpose |
 //! |--------|---------|
 //! | [`count_budget`] | Integer-based permits (e.g., max concurrent fetches) |
-//! | [`engine_stub`] | Mock scanner engine for testing scheduler in isolation |
 //! | [`findings`] | Per-worker finding buffers with dedup via [`SecretHash`] |
 //! | [`output_sink`] | Pluggable finding destinations (stdout, file, vec) |
 //! | [`ts_buffer_pool`] | Thread-safe buffer recycling to avoid allocation churn |
@@ -62,7 +69,8 @@
 //!
 //! | Module | Purpose |
 //! |--------|---------|
-//! | [`local`] | Filesystem scanning with `std::fs` |
+//! | [`local`] | Low-level filesystem scanning with `std::fs` |
+//! | [`parallel_scan`] | High-level directory scanning with gitignore support |
 //! | [`local_fs_uring`] | Linux-only io_uring backend (feature `io-uring`) |
 //! | [`remote`] | HTTP/object-store backend with retry policies |
 //!
@@ -214,7 +222,9 @@ pub mod rng;
 
 // Supporting primitives
 pub mod count_budget;
+pub mod engine_impl;
 pub mod engine_stub;
+pub mod engine_trait;
 pub mod findings;
 pub mod output_sink;
 pub mod ts_buffer_pool;
@@ -225,6 +235,7 @@ pub mod worker_id;
 pub mod local;
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub mod local_fs_uring;
+pub mod parallel_scan;
 pub mod remote;
 
 // Observability
@@ -263,9 +274,11 @@ pub use rng::XorShift64;
 
 // Supporting primitives
 pub use count_budget::{CountBudget, CountPermit};
+pub use engine_impl::RealEngineScratch;
 pub use engine_stub::{
     FileId, FindingRec, MockEngine, RuleId, ScanScratch, BUFFER_ALIGN, BUFFER_LEN_MAX,
 };
+pub use engine_trait::{EngineScratch, FindingRecord, ScanEngine};
 pub use findings::{GlobalFindingsCollector, SecretHash, WorkerFindingsBuffer};
 pub use output_sink::{FileSink, NullSink, OutputSink, StdoutSink, VecSink};
 pub use ts_buffer_pool::{TsBufferHandle, TsBufferPool, TsBufferPoolConfig};
@@ -273,9 +286,14 @@ pub use ts_chunk::TsChunk;
 pub use worker_id::{current_worker_id, set_current_worker_id};
 
 // I/O backends
-pub use local::{scan_local, LocalConfig, LocalStats};
+pub use local::{
+    scan_local, FileSource, LocalConfig, LocalFile, LocalReport, LocalStats, VecFileSource,
+};
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub use local_fs_uring::{scan_local_fs_uring, LocalFsUringConfig, UringIoStats};
+pub use parallel_scan::{
+    parallel_scan_dir, parallel_scan_files, ParallelScanConfig, ParallelScanReport,
+};
 pub use remote::{ErrorClass, RemoteBackend, RemoteConfig, RetryPolicy};
 
 // Observability

@@ -36,6 +36,17 @@
 //! 2. Read sequentially, carry overlap bytes forward via `copy_within`
 //! 3. Eliminates: seeks, re-reading overlap from kernel, per-chunk pool churn
 //!
+//! ```text
+//! Iteration 1:                    Iteration 2:
+//! ┌─────────────────────────┐     ┌─────────────────────────┐
+//! │      payload bytes      │     │overlap│  new payload    │
+//! │      (from read)        │     │(copy) │  (from read)    │
+//! └─────────────────────────┘     └─────────────────────────┘
+//!                           │            ▲
+//!                           └────────────┘
+//!                         copy_within(tail → head)
+//! ```
+//!
 //! # When to Consider io_uring
 //!
 //! Profile first. If workers show significant idle time waiting on reads
@@ -43,10 +54,12 @@
 //! For page-cache-hot workloads, blocking reads are competitive.
 
 use super::count_budget::CountBudget;
+use super::engine_trait::{EngineScratch, FindingRecord, ScanEngine};
 use super::executor::{Executor, ExecutorConfig, WorkerCtx};
 use super::metrics::MetricsSnapshot;
 use super::ts_buffer_pool::{TsBufferPool, TsBufferPoolConfig};
-use crate::scheduler::engine_stub::{FileId, FindingRec, MockEngine, ScanScratch, BUFFER_LEN_MAX};
+use crate::api::FileId;
+use crate::scheduler::engine_stub::BUFFER_LEN_MAX;
 use crate::scheduler::output_sink::OutputSink;
 
 use std::fs::File;
@@ -119,7 +132,7 @@ impl LocalConfig {
     /// # Panics
     ///
     /// Panics if configuration violates invariants.
-    pub fn validate(&self, engine: &MockEngine) {
+    pub fn validate<E: ScanEngine>(&self, engine: &E) {
         assert!(self.workers > 0, "workers must be > 0");
         assert!(self.chunk_size > 0, "chunk_size must be > 0");
         assert!(self.pool_buffers > 0, "pool_buffers must be > 0");
@@ -152,12 +165,12 @@ impl LocalConfig {
     }
 
     /// Compute buffer length including overlap.
-    pub fn buffer_len(&self, engine: &MockEngine) -> usize {
+    pub fn buffer_len<E: ScanEngine>(&self, engine: &E) -> usize {
         self.chunk_size.saturating_add(engine.required_overlap())
     }
 
     /// Compute peak memory usage for buffers.
-    pub fn peak_buffer_memory(&self, engine: &MockEngine) -> usize {
+    pub fn peak_buffer_memory<E: ScanEngine>(&self, engine: &E) -> usize {
         self.pool_buffers.saturating_mul(self.buffer_len(engine))
     }
 }
@@ -238,15 +251,15 @@ struct FileTask {
 // Per-Worker Scratch
 // ============================================================================
 
-struct LocalScratch {
-    engine: Arc<MockEngine>,
+struct LocalScratch<E: ScanEngine> {
+    engine: Arc<E>,
     pool: TsBufferPool,
     out: Arc<dyn OutputSink>,
 
     /// Per-worker engine scratch.
-    scan_scratch: ScanScratch,
+    scan_scratch: E::Scratch,
     /// Per-worker findings buffer (avoids alloc per chunk).
-    pending: Vec<FindingRec>,
+    pending: Vec<<E::Scratch as EngineScratch>::Finding>,
     /// Per-worker output formatting buffer.
     out_buf: Vec<u8>,
 
@@ -284,41 +297,67 @@ pub struct LocalReport {
 // Helpers
 // ============================================================================
 
-/// Deduplicate findings in place by (rule_id, root_hint, span).
+/// Deduplicate findings in place by (rule_id, root_hint).
 ///
-/// Sorting first ensures O(n log n) dedup rather than O(n²) pairwise comparison.
-/// The sort key ordering matches the natural "importance" of fields for stable output.
-fn dedupe_findings(findings: &mut Vec<FindingRec>) {
+/// # Algorithm
+///
+/// 1. Sort by `(rule_id, root_hint_start, root_hint_end)` — O(n log n)
+/// 2. Dedup adjacent elements with matching keys — O(n)
+///
+/// Total: O(n log n) vs O(n²) for pairwise comparison.
+///
+/// # Why Sort Before Dedup?
+///
+/// `Vec::dedup_by` only removes *adjacent* duplicates. Sorting brings
+/// identical findings together, ensuring all duplicates are removed.
+/// The sort key ordering also provides stable, deterministic output ordering.
+///
+/// # When This Is Needed
+///
+/// This handles within-chunk duplicates (same finding emitted multiple times
+/// by the engine). Cross-chunk duplicates are handled by `drop_prefix_findings`.
+fn dedupe_findings<F: FindingRecord>(findings: &mut Vec<F>) {
     if findings.len() <= 1 {
         return;
     }
 
     findings.sort_unstable_by_key(|f| {
         (
-            f.rule_id.0,
-            f.root_hint_start,
-            f.root_hint_end,
-            f.span_start,
-            f.span_end,
+            f.rule_id(),
+            f.root_hint_start(),
+            f.root_hint_end(),
+            f.span_start(),
+            f.span_end(),
         )
     });
 
     findings.dedup_by(|a, b| {
-        a.rule_id == b.rule_id
-            && a.root_hint_start == b.root_hint_start
-            && a.root_hint_end == b.root_hint_end
-            && a.span_start == b.span_start
-            && a.span_end == b.span_end
+        a.rule_id() == b.rule_id()
+            && a.root_hint_start() == b.root_hint_start()
+            && a.root_hint_end() == b.root_hint_end()
+            && a.span_start() == b.span_start()
+            && a.span_end() == b.span_end()
     });
 }
 
-/// Format and emit findings.
-fn emit_findings(
-    engine: &MockEngine,
+/// Format and emit findings to the output sink.
+///
+/// # Output Format
+///
+/// Each finding is formatted as: `<path>:<start>-<end> <rule_name>\n`
+///
+/// Example: `/home/user/code/config.js:42-68 aws-access-key`
+///
+/// # Buffer Reuse
+///
+/// The `out_buf` is reused across calls to avoid allocation per file.
+/// It's cleared at the start of each call.
+fn emit_findings<E: ScanEngine, F: FindingRecord>(
+    engine: &E,
     out: &Arc<dyn OutputSink>,
     out_buf: &mut Vec<u8>,
     path: &[u8],
-    findings: &[FindingRec],
+    findings: &[F],
 ) {
     if findings.is_empty() {
         return;
@@ -336,9 +375,9 @@ fn emit_findings(
         writeln!(
             out_buf,
             "{}-{} {}",
-            rec.root_hint_start,
-            rec.root_hint_end,
-            engine.rule_name(rec.rule_id)
+            rec.root_hint_start(),
+            rec.root_hint_end(),
+            engine.rule_name(rec.rule_id())
         )
         .expect("write to Vec<u8> cannot fail");
     }
@@ -366,11 +405,38 @@ fn emit_findings(
 /// - Truncated files: we stop at actual EOF
 /// - Growing files: we stop at size-at-open (consistent snapshot)
 ///
+/// # Chunk Processing Loop
+///
+/// ```text
+/// ┌────────────────────────────────────────────────────────────────────┐
+/// │                        process_file() flow                         │
+/// └────────────────────────────────────────────────────────────────────┘
+///
+/// open(path) ─► metadata.len() ─► acquire_buffer()
+///                    │
+///                    ▼
+///     ┌──────────────────────────────┐
+///     │     for each chunk:          │◄──────────────────┐
+///     │  1. copy_within(overlap)     │                   │
+///     │  2. read(new_bytes)          │                   │
+///     │  3. scan_chunk_into()        │                   │
+///     │  4. drop_prefix_findings()   │                   │
+///     │  5. emit_findings()          │                   │
+///     └──────────────┬───────────────┘                   │
+///                    │                                   │
+///                    ▼                                   │
+///            offset < file_size? ───yes──────────────────┘
+///                    │
+///                    no
+///                    ▼
+///             release_buffer()
+/// ```
+///
 /// # Error Handling
 ///
 /// I/O errors are logged but do not propagate (fail-soft per file).
 /// The executor continues with remaining files.
-fn process_file(task: FileTask, ctx: &mut WorkerCtx<FileTask, LocalScratch>) {
+fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, LocalScratch<E>>) {
     let scratch = &mut ctx.scratch;
     let engine = &scratch.engine;
     let overlap = engine.required_overlap();
@@ -487,9 +553,15 @@ fn process_file(task: FileTask, ctx: &mut WorkerCtx<FileTask, LocalScratch>) {
             dedupe_findings(&mut scratch.pending);
         }
 
+        // Count findings before emitting (pending.len() is the count for this chunk)
+        ctx.metrics.findings_emitted = ctx
+            .metrics
+            .findings_emitted
+            .wrapping_add(scratch.pending.len() as u64);
+
         // Emit findings
         emit_findings(
-            engine,
+            engine.as_ref(),
             &scratch.out,
             &mut scratch.out_buf,
             path_bytes,
@@ -528,6 +600,12 @@ fn process_file(task: FileTask, ctx: &mut WorkerCtx<FileTask, LocalScratch>) {
 /// We want partial reads at EOF (to handle final chunk), while `read_exact`
 /// returns `UnexpectedEof` on short reads. This wrapper gives us EINTR-safe
 /// partial-read semantics.
+///
+/// # Signal Handling
+///
+/// `EINTR` (interrupted system call) can occur when a signal is delivered
+/// during the read. This wrapper retries automatically, which is the standard
+/// Unix idiom for non-interruptible reads.
 fn read_some(file: &mut File, dst: &mut [u8]) -> io::Result<usize> {
     loop {
         match file.read(dst) {
@@ -544,34 +622,73 @@ fn read_some(file: &mut File, dst: &mut [u8]) -> io::Result<usize> {
 
 /// Scan local files with blocking reads.
 ///
+/// This is the low-level entry point for local filesystem scanning. For most
+/// use cases, prefer [`parallel_scan_dir`](super::parallel_scan::parallel_scan_dir)
+/// which handles directory walking and gitignore.
+///
 /// # Arguments
 ///
 /// - `engine`: Detection engine (determines overlap, provides scan logic)
-/// - `source`: Iterator of files to scan
-/// - `cfg`: Configuration
-/// - `out`: Output sink for findings
+/// - `source`: Iterator of files to scan (e.g., [`VecFileSource`])
+/// - `cfg`: Configuration for workers, chunking, and memory budgets
+/// - `out`: Output sink for findings (e.g., [`VecSink`](super::output_sink::VecSink))
 ///
 /// # Returns
 ///
-/// Report containing statistics and executor metrics.
+/// [`LocalReport`] containing:
+/// - `stats`: Discovery statistics (files enqueued, bytes, I/O errors)
+/// - `metrics`: Executor metrics (chunks scanned, bytes scanned, timing)
+///
+/// # Execution Model
+///
+/// ```text
+/// ┌─────────────────────────────────────────────────────────────────────┐
+/// │                           scan_local()                              │
+/// └─────────────────────────────────────────────────────────────────────┘
+///                    │
+///         ┌─────────┴─────────┐
+///         ▼                   ▼
+///   ┌───────────────┐   ┌───────────────────────────────────────────┐
+///   │  main thread  │   │              Executor                     │
+///   │  (discovery)  │   │  ┌─────────┐ ┌─────────┐ ┌─────────┐     │
+///   │               │──►│  │Worker 0 │ │Worker 1 │ │Worker N │     │
+///   │  next_file()  │   │  └─────────┘ └─────────┘ └─────────┘     │
+///   │  in loop      │   │       │           │           │          │
+///   └───────────────┘   │       ▼           ▼           ▼          │
+///                       │  process_file() process_file() ...       │
+///                       └───────────────────────────────────────────┘
+/// ```
+///
+/// The main thread pulls files from `source` and enqueues them. Workers
+/// process files in parallel using work-stealing. The `CountBudget` limits
+/// how far ahead discovery can run.
 ///
 /// # Example
 ///
 /// ```ignore
+/// // With MockEngine (for testing):
 /// let engine = Arc::new(MockEngine::new(rules, 16));
 /// let files = vec![LocalFile { path: "test.txt".into(), size: 1024 }];
 /// let source = VecFileSource::new(files);
 /// let sink = Arc::new(VecSink::new());
 ///
 /// let report = scan_local(engine, source, LocalConfig::default(), sink);
+///
+/// // With real Engine (for production):
+/// let engine = Arc::new(Engine::new(rules, transforms, tuning));
+/// let report = scan_local(engine, source, LocalConfig::default(), sink);
 /// ```
-pub fn scan_local<S: FileSource>(
-    engine: Arc<MockEngine>,
+pub fn scan_local<E, S>(
+    engine: Arc<E>,
     mut source: S,
     cfg: LocalConfig,
     out: Arc<dyn OutputSink>,
-) -> LocalReport {
-    cfg.validate(&engine);
+) -> LocalReport
+where
+    E: ScanEngine,
+    S: FileSource,
+{
+    cfg.validate(engine.as_ref());
 
     let overlap = engine.required_overlap();
     let buf_len = cfg.chunk_size.saturating_add(overlap);
@@ -587,6 +704,10 @@ pub fn scan_local<S: FileSource>(
     // Object budget for discovery backpressure
     let budget = CountBudget::new(cfg.max_in_flight_objects);
 
+    // Capture config values before moving into closure
+    let dedupe = cfg.dedupe_within_chunk;
+    let chunk_size = cfg.chunk_size;
+
     // Create executor
     let ex = Executor::<FileTask>::new(
         ExecutorConfig {
@@ -598,20 +719,21 @@ pub fn scan_local<S: FileSource>(
             let engine = Arc::clone(&engine);
             let pool = pool.clone();
             let out = Arc::clone(&out);
-            let dedupe = cfg.dedupe_within_chunk;
-            let chunk_size = cfg.chunk_size;
-            move |_wid| LocalScratch {
-                engine: Arc::clone(&engine),
-                pool: pool.clone(),
-                out: Arc::clone(&out),
-                scan_scratch: engine.new_scratch(),
-                pending: Vec::with_capacity(engine.tuning.max_findings_per_chunk),
-                out_buf: Vec::with_capacity(64 * 1024),
-                dedupe_within_chunk: dedupe,
-                chunk_size,
+            move |_wid| {
+                let scan_scratch = engine.new_scratch();
+                LocalScratch {
+                    engine: Arc::clone(&engine),
+                    pool: pool.clone(),
+                    out: Arc::clone(&out),
+                    scan_scratch,
+                    pending: Vec::with_capacity(4096), // Reasonable default
+                    out_buf: Vec::with_capacity(64 * 1024),
+                    dedupe_within_chunk: dedupe,
+                    chunk_size,
+                }
             }
         },
-        process_file,
+        process_file::<E>,
     );
 
     // Discovery loop
@@ -659,7 +781,7 @@ pub fn scan_local<S: FileSource>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduler::engine_stub::MockRule;
+    use crate::scheduler::engine_stub::{MockEngine, MockRule};
     use crate::scheduler::output_sink::VecSink;
     use std::io::Write;
     use tempfile::NamedTempFile;

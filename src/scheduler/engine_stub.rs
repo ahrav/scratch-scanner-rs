@@ -328,6 +328,83 @@ impl MockEngine {
 }
 
 // ============================================================================
+// Trait Implementations
+// ============================================================================
+
+use super::engine_trait::{EngineScratch, FindingRecord, ScanEngine};
+use crate::api::FileId as ApiFileId;
+
+impl FindingRecord for FindingRec {
+    #[inline]
+    fn rule_id(&self) -> u32 {
+        self.rule_id.0 as u32
+    }
+
+    #[inline]
+    fn root_hint_start(&self) -> u64 {
+        self.root_hint_start
+    }
+
+    #[inline]
+    fn root_hint_end(&self) -> u64 {
+        self.root_hint_end
+    }
+
+    #[inline]
+    fn span_start(&self) -> u64 {
+        self.span_start
+    }
+
+    #[inline]
+    fn span_end(&self) -> u64 {
+        self.span_end
+    }
+}
+
+impl EngineScratch for ScanScratch {
+    type Finding = FindingRec;
+
+    fn clear(&mut self) {
+        self.clear();
+    }
+
+    fn drop_prefix_findings(&mut self, new_bytes_start: u64) {
+        self.drop_prefix_findings(new_bytes_start);
+    }
+
+    fn drain_findings_into(&mut self, out: &mut Vec<Self::Finding>) {
+        self.drain_findings_into(out);
+    }
+}
+
+impl ScanEngine for MockEngine {
+    type Scratch = ScanScratch;
+
+    fn required_overlap(&self) -> usize {
+        self.required_overlap()
+    }
+
+    fn new_scratch(&self) -> Self::Scratch {
+        self.new_scratch()
+    }
+
+    fn scan_chunk_into(
+        &self,
+        data: &[u8],
+        file_id: ApiFileId,
+        base_offset: u64,
+        scratch: &mut Self::Scratch,
+    ) {
+        // Convert api::FileId to engine_stub::FileId
+        self.scan_chunk_into(data, FileId(file_id.0), base_offset, scratch);
+    }
+
+    fn rule_name(&self, rule_id: u32) -> &str {
+        self.rule_name(RuleId(rule_id as u16))
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

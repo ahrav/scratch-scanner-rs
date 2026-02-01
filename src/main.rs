@@ -1,6 +1,32 @@
+//! Secret Scanner CLI
+//!
+//! A high-performance secret detection tool that scans filesystem paths for
+//! sensitive credentials, API keys, and other secrets using pattern matching
+//! with optional Base64/URL decoding.
+//!
+//! # Execution Modes
+//!
+//! - **Parallel (default)**: Work-stealing scheduler with N workers doing
+//!   concurrent file I/O and scanning. Best for multi-core machines and SSDs.
+//!
+//! - **Single-threaded** (`--workers=1` or `--single-threaded`): Legacy pipeline
+//!   mode that processes files sequentially. Useful for debugging or when
+//!   parallelism overhead exceeds benefit (very small scans).
+//!
+//! # Output Format
+//!
+//! Findings are written to stdout as: `<path>:<start>-<end> <rule_name>`
+//!
+//! Statistics are written to stderr upon completion:
+//! `files=N chunks=N bytes=N findings=N errors=N elapsed_ms=N throughput_mib_s=N workers=N`
+//!
+//! # Exit Codes
+//!
+//! - `0`: Success (regardless of findings count)
+//! - `2`: Invalid arguments or configuration error
+
 use scanner_rs::pipeline::scan_path_default;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use scanner_rs::AsyncIoConfig;
+use scanner_rs::scheduler::{parallel_scan_dir, ParallelScanConfig, StdoutSink};
 use scanner_rs::{
     demo_engine_with_anchor_mode, demo_engine_with_anchor_mode_and_max_transform_depth, AnchorMode,
 };
@@ -10,21 +36,47 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-enum IoBackend {
-    /// Choose the platform async backend (no sync fallback).
+/// Worker configuration determining parallelism strategy.
+///
+/// The scanner supports two fundamentally different execution paths:
+/// - Parallel: Work-stealing scheduler (any `workers >= 2`)
+/// - Single-threaded: Legacy sequential pipeline (forces `workers == 1`)
+///
+/// The distinction matters because single-threaded mode uses a different
+/// code path (the pipeline module) which may behave differently in edge cases.
+enum WorkerConfig {
+    /// Auto-detect based on CPU count (parallel mode).
+    ///
+    /// Uses `num_cpus::get()` to determine worker count, falling back to at
+    /// least 1. On most systems this equals the number of logical cores.
     Auto,
-    /// Force synchronous IO.
-    Sync,
-    /// Force Linux io_uring.
-    Uring,
-    /// Force macOS POSIX AIO.
-    Aio,
+    /// Use explicit worker count (parallel mode if N >= 2).
+    ///
+    /// Setting `Explicit(1)` is semantically equivalent to `SingleThreaded`.
+    Explicit(usize),
+    /// Force single-threaded mode using the legacy pipeline.
+    ///
+    /// This bypasses the work-stealing scheduler entirely, using the older
+    /// sequential pipeline from `scanner_rs::pipeline`. Useful for:
+    /// - Debugging scheduler vs engine issues
+    /// - Baseline comparison benchmarks
+    /// - Environments where threading is problematic
+    SingleThreaded,
 }
 
-impl IoBackend {
-    fn default_for_platform() -> Self {
-        IoBackend::Auto
-    }
+fn print_usage(exe: &std::ffi::OsStr) {
+    eprintln!(
+        "usage: {} [OPTIONS] <path>
+
+OPTIONS:
+    --workers=<N>           Use N parallel workers (default: auto-detect CPU count)
+    --workers=1             Force single-threaded mode (same as --single-threaded)
+    --single-threaded       Force single-threaded mode (legacy pipeline)
+    --anchors=manual|derived  Anchor extraction mode (default: manual)
+    --max-transform-depth=<N> Maximum decode depth (default: 2)
+    --help, -h              Show this help message",
+        exe.to_string_lossy()
+    );
 }
 
 fn main() -> io::Result<()> {
@@ -32,11 +84,27 @@ fn main() -> io::Result<()> {
     let exe = args.next().unwrap_or_else(|| "scanner-rs".into());
     let mut anchor_mode = AnchorMode::Manual;
     let mut path: Option<PathBuf> = None;
-    let mut io_backend = IoBackend::default_for_platform();
+    let mut worker_config = WorkerConfig::Auto;
     let mut max_transform_depth: Option<usize> = None;
 
     for arg in args {
         if let Some(flag) = arg.to_str() {
+            if let Some(value) = flag.strip_prefix("--workers=") {
+                let n: usize = value.parse().unwrap_or_else(|_| {
+                    eprintln!("invalid --workers value: {}", value);
+                    std::process::exit(2);
+                });
+                if n == 0 {
+                    eprintln!("--workers must be >= 1");
+                    std::process::exit(2);
+                }
+                worker_config = if n == 1 {
+                    WorkerConfig::SingleThreaded
+                } else {
+                    WorkerConfig::Explicit(n)
+                };
+                continue;
+            }
             if let Some(value) = flag.strip_prefix("--max-transform-depth=") {
                 max_transform_depth = Some(value.parse().unwrap_or_else(|_| {
                     eprintln!("invalid --max-transform-depth value: {}", value);
@@ -59,6 +127,10 @@ fn main() -> io::Result<()> {
                 continue;
             }
             match flag {
+                "--single-threaded" => {
+                    worker_config = WorkerConfig::SingleThreaded;
+                    continue;
+                }
                 "--anchors=manual" => {
                     anchor_mode = AnchorMode::Manual;
                     continue;
@@ -67,35 +139,13 @@ fn main() -> io::Result<()> {
                     anchor_mode = AnchorMode::Derived;
                     continue;
                 }
-                "--io=sync" => {
-                    io_backend = IoBackend::Sync;
-                    continue;
-                }
-                "--io=auto" => {
-                    io_backend = IoBackend::Auto;
-                    continue;
-                }
-                "--io=uring" => {
-                    io_backend = IoBackend::Uring;
-                    continue;
-                }
-                "--io=aio" => {
-                    io_backend = IoBackend::Aio;
-                    continue;
-                }
                 "--help" | "-h" => {
-                    eprintln!(
-                        "usage: {} [--anchors=manual|derived] [--io=auto|sync|uring|aio] [--max-transform-depth=<N>|--decode-depth=<N>] <path>",
-                        exe.to_string_lossy()
-                    );
+                    print_usage(&exe);
                     std::process::exit(0);
                 }
                 _ if flag.starts_with("--") => {
                     eprintln!("unknown flag: {}", flag);
-                    eprintln!(
-                        "usage: {} [--anchors=manual|derived] [--io=auto|sync|uring|aio] [--max-transform-depth=<N>|--decode-depth=<N>] <path>",
-                        exe.to_string_lossy()
-                    );
+                    print_usage(&exe);
                     std::process::exit(2);
                 }
                 _ => {}
@@ -103,20 +153,14 @@ fn main() -> io::Result<()> {
         }
 
         if path.is_some() {
-            eprintln!(
-                "usage: {} [--anchors=manual|derived] <path>",
-                exe.to_string_lossy()
-            );
+            print_usage(&exe);
             std::process::exit(2);
         }
         path = Some(PathBuf::from(arg));
     }
 
     let Some(path) = path else {
-        eprintln!(
-            "usage: {} [--anchors=manual|derived] [--io=auto|sync|uring|aio] [--max-transform-depth=<N>|--decode-depth=<N>] <path>",
-            exe.to_string_lossy()
-        );
+        print_usage(&exe);
         std::process::exit(2);
     };
 
@@ -125,64 +169,61 @@ fn main() -> io::Result<()> {
         None => demo_engine_with_anchor_mode(anchor_mode),
     });
     let start = Instant::now();
-    let run_scan = || match io_backend {
-        IoBackend::Sync => scan_path_default(&path, Arc::clone(&engine)),
-        IoBackend::Auto => {
-            #[cfg(target_os = "linux")]
-            {
-                match scanner_rs::UringScanner::new(Arc::clone(&engine), AsyncIoConfig::default()) {
-                    Ok(mut scanner) => scanner.scan_path(&path),
-                    Err(err) => {
-                        eprintln!("io_uring unavailable ({}); use --io=sync to override", err);
-                        std::process::exit(2);
-                    }
-                }
-            }
-            #[cfg(target_os = "macos")]
-            {
-                match scanner_rs::AioScanner::new(Arc::clone(&engine), AsyncIoConfig::default()) {
-                    Ok(mut scanner) => scanner.scan_path(&path),
-                    Err(err) => {
-                        eprintln!("POSIX AIO unavailable ({}); use --io=sync to override", err);
-                        std::process::exit(2);
-                    }
-                }
-            }
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            {
-                eprintln!("async IO not supported on this platform; use --io=sync to override");
-                std::process::exit(2);
-            }
-        }
-        IoBackend::Uring => {
-            #[cfg(target_os = "linux")]
-            {
-                let mut scanner =
-                    scanner_rs::UringScanner::new(Arc::clone(&engine), AsyncIoConfig::default())?;
-                scanner.scan_path(&path)
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                eprintln!("--io=uring is only supported on Linux");
-                std::process::exit(2);
-            }
-        }
-        IoBackend::Aio => {
-            #[cfg(target_os = "macos")]
-            {
-                let mut scanner =
-                    scanner_rs::AioScanner::new(Arc::clone(&engine), AsyncIoConfig::default())?;
-                scanner.scan_path(&path)
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                eprintln!("--io=aio is only supported on macOS");
-                std::process::exit(2);
-            }
-        }
+
+    // Determine number of workers
+    let workers = match worker_config {
+        WorkerConfig::Auto => num_cpus::get().max(1),
+        WorkerConfig::Explicit(n) => n,
+        WorkerConfig::SingleThreaded => 1, // Will use legacy pipeline below
     };
 
-    let stats = run_scan()?;
+    // Unified statistics structure to normalize output between execution modes.
+    //
+    // The parallel scheduler and legacy pipeline return different stat types,
+    // so we map both into this common representation for consistent output.
+    struct ScanStats {
+        /// Total files processed (or enqueued for parallel mode).
+        files: u64,
+        /// Total chunks scanned across all files.
+        chunks: u64,
+        /// Total payload bytes scanned (excluding overlap re-scans).
+        bytes_scanned: u64,
+        /// Number of secret findings emitted.
+        findings: u64,
+        /// I/O and processing errors encountered.
+        errors: u64,
+    }
+
+    let stats = if matches!(worker_config, WorkerConfig::SingleThreaded) {
+        // Legacy single-threaded mode
+        let pipeline_stats = scan_path_default(&path, Arc::clone(&engine))?;
+        ScanStats {
+            files: pipeline_stats.files,
+            chunks: pipeline_stats.chunks,
+            bytes_scanned: pipeline_stats.bytes_scanned,
+            findings: pipeline_stats.findings,
+            errors: pipeline_stats.errors,
+        }
+    } else {
+        // Parallel mode (default)
+        let config = ParallelScanConfig {
+            workers,
+            skip_hidden: false,       // Scan all files including hidden
+            respect_gitignore: false, // Don't skip gitignored files
+            ..Default::default()
+        };
+        let sink = Arc::new(StdoutSink::new());
+        let report = parallel_scan_dir(&path, Arc::clone(&engine), config, sink)?;
+
+        // Map LocalReport to our unified stats
+        ScanStats {
+            files: report.stats.files_enqueued,
+            chunks: report.metrics.chunks_scanned,
+            bytes_scanned: report.metrics.bytes_scanned,
+            findings: report.metrics.findings_emitted,
+            errors: report.stats.io_errors,
+        }
+    };
     let elapsed = start.elapsed();
     let elapsed_secs = elapsed.as_secs_f64();
     let throughput_mib = if elapsed_secs > 0.0 {
@@ -192,14 +233,15 @@ fn main() -> io::Result<()> {
     };
 
     eprintln!(
-        "files={} chunks={} bytes={} findings={} errors={} elapsed_ms={} throughput_mib_s={:.2}",
+        "files={} chunks={} bytes={} findings={} errors={} elapsed_ms={} throughput_mib_s={:.2} workers={}",
         stats.files,
         stats.chunks,
         stats.bytes_scanned,
         stats.findings,
         stats.errors,
         elapsed.as_millis(),
-        throughput_mib
+        throughput_mib,
+        workers
     );
 
     #[cfg(feature = "stats")]
@@ -221,51 +263,8 @@ fn main() -> io::Result<()> {
         );
     }
 
-    #[cfg(feature = "b64-stats")]
-    {
-        let b64 = stats.base64;
-        let decoded_wasted = b64
-            .decoded_bytes_wasted_no_anchor
-            .saturating_add(b64.decoded_bytes_wasted_error);
-        let decoded_wasted_pct_of_decoded = if b64.decoded_bytes_total > 0 {
-            (decoded_wasted as f64) * 100.0 / (b64.decoded_bytes_total as f64)
-        } else {
-            0.0
-        };
-        let pre_gate_total_encoded = b64
-            .pre_gate_skip_bytes
-            .saturating_add(b64.decode_attempt_bytes);
-        let pre_gate_skip_pct_of_total_encoded = if pre_gate_total_encoded > 0 {
-            (b64.pre_gate_skip_bytes as f64) * 100.0 / (pre_gate_total_encoded as f64)
-        } else {
-            0.0
-        };
-
-        eprintln!(
-            "b64 spans={} span_bytes={} decode_attempts={} decode_attempt_bytes={} decode_errors={}",
-            b64.spans,
-            b64.span_bytes,
-            b64.decode_attempts,
-            b64.decode_attempt_bytes,
-            b64.decode_errors
-        );
-        eprintln!(
-            "b64 decoded_total={} decoded_kept={} decoded_wasted_no_anchor={} decoded_wasted_error={} decoded_wasted_pct_of_decoded={:.2}",
-            b64.decoded_bytes_total,
-            b64.decoded_bytes_kept,
-            b64.decoded_bytes_wasted_no_anchor,
-            b64.decoded_bytes_wasted_error,
-            decoded_wasted_pct_of_decoded
-        );
-        eprintln!(
-            "b64 pre_gate_checks={} pre_gate_pass={} pre_gate_skip={} pre_gate_skip_bytes={} pre_gate_skip_pct_of_total_encoded={:.2}",
-            b64.pre_gate_checks,
-            b64.pre_gate_pass,
-            b64.pre_gate_skip,
-            b64.pre_gate_skip_bytes,
-            pre_gate_skip_pct_of_total_encoded
-        );
-    }
+    // Note: b64-stats feature is only available in single-threaded mode
+    // For parallel mode, per-chunk stats would need to be aggregated across workers
 
     Ok(())
 }
