@@ -35,6 +35,8 @@
 //!
 //! # Module Organization
 //!
+//! ## Core Scheduling
+//!
 //! | Module | Purpose |
 //! |--------|---------|
 //! | [`contract`] | Run-scoped IDs, engine contracts, limits, invariants |
@@ -43,6 +45,60 @@
 //! | [`chunking`] | Chunk iteration and overlap-based deduplication |
 //! | [`metrics`] | Per-worker metrics with cache-line isolation |
 //! | [`rng`] | Deterministic RNG for reproducible steal patterns |
+//!
+//! ## Supporting Primitives
+//!
+//! | Module | Purpose |
+//! |--------|---------|
+//! | [`count_budget`] | Integer-based permits (e.g., max concurrent fetches) |
+//! | [`engine_stub`] | Mock scanner engine for testing scheduler in isolation |
+//! | [`findings`] | Per-worker finding buffers with dedup via [`SecretHash`] |
+//! | [`output_sink`] | Pluggable finding destinations (stdout, file, vec) |
+//! | [`ts_buffer_pool`] | Thread-safe buffer recycling to avoid allocation churn |
+//! | [`ts_chunk`] | Thread-safe chunk wrapper for cross-thread handoff |
+//! | [`worker_id`] | Thread-local worker ID for metrics/debugging |
+//!
+//! ## I/O Backends
+//!
+//! | Module | Purpose |
+//! |--------|---------|
+//! | [`local`] | Filesystem scanning with `std::fs` |
+//! | [`local_fs_uring`] | Linux-only io_uring backend (feature `io-uring`) |
+//! | [`remote`] | HTTP/object-store backend with retry policies |
+//!
+//! ## Observability
+//!
+//! | Module | Purpose |
+//! |--------|---------|
+//! | [`affinity`] | CPU pinning and topology queries |
+//! | [`alloc`] | Allocation tracking via custom global allocator |
+//! | [`bench`] | Micro-benchmark harness with warmup and statistics |
+//! | [`rusage`] | Process resource usage (wall time, RSS, faults) |
+//!
+//! ## Testing Infrastructure
+//!
+//! | Module | Purpose |
+//! |--------|---------|
+//! | [`failure`] | Error classification (retryable vs permanent vs exhaustion) |
+//! | [`sim`] | Deterministic simulation for property testing |
+//! | [`task_graph`] | Object lifecycle FSM (enumerate → fetch → scan → done) |
+//!
+//! ## Benchmarks
+//!
+//! | Module | Purpose |
+//! |--------|---------|
+//! | [`bench_compare`] | A/B comparison between scheduler configurations |
+//! | [`bench_executor`] | Executor-level benchmarks (steal overhead, spawn cost) |
+//! | [`bench_local`] | Filesystem scan benchmarks |
+//! | [`bench_synthetic`] | Synthetic workload generators |
+//!
+//! ## Resource Control
+//!
+//! | Module | Purpose |
+//! |--------|---------|
+//! | [`device_slots`] | Per-device I/O concurrency limits (SSD vs HDD vs network) |
+//! | [`global_resource_pool`] | Centralized permits for "fat" jobs (large mmap, etc.) |
+//! | [`yield_policy`] | Cooperative yield strategies to prevent starvation |
 //!
 //! # Non-Negotiable Invariants
 //!
@@ -128,8 +184,27 @@
 //! - `metrics.rs`: bounds-check-free histogram recording (index proven in-range)
 //!
 //! All unsafe blocks have documented invariants and are tested.
+//!
+//! # Feature Flags
+//!
+//! | Feature | Effect |
+//! |---------|--------|
+//! | `io-uring` | Enables [`local_fs_uring`] for async filesystem I/O on Linux |
+//!
+//! # Re-exports
+//!
+//! The crate root re-exports commonly used types so users can write
+//! `use scheduler::{Executor, ByteBudget, ...}` without navigating submodules.
+//! Re-exports are grouped by layer:
+//!
+//! - **Core**: [`Executor`], [`ExecutorConfig`], [`WorkerCtx`], [`ByteBudget`],
+//!   [`TokenBudget`], [`ChunkParams`], [`RunConfig`], [`Limits`]
+//! - **Supporting**: [`CountBudget`], [`TsBufferPool`], [`OutputSink`] variants,
+//!   [`WorkerFindingsBuffer`]
+//! - **Local scanning**: [`scan_local`], [`LocalConfig`], [`scan_local_uring`] (Linux)
+//! - **Advanced**: [`affinity`] functions, [`failure`] types, [`sim`] harness
 
-// Core scheduler modules
+// Core scheduling
 pub mod budget;
 pub mod chunking;
 pub mod contract;
@@ -137,7 +212,7 @@ pub mod executor;
 pub mod metrics;
 pub mod rng;
 
-// Phase 1: Core supporting modules
+// Supporting primitives
 pub mod count_budget;
 pub mod engine_stub;
 pub mod findings;
@@ -146,63 +221,39 @@ pub mod ts_buffer_pool;
 pub mod ts_chunk;
 pub mod worker_id;
 
-// Phase 2: Local scanner modules
+// I/O backends
 pub mod local;
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub mod local_fs_uring;
 pub mod remote;
 
-// Phase 3: Tooling & observability
+// Observability
 pub mod affinity;
 pub mod alloc;
 pub mod bench;
 pub mod rusage;
 
-// Phase 4: Test support / failure model
+// Testing infrastructure
 pub mod failure;
 pub mod sim;
 pub mod task_graph;
 
-// Phase 5: Benchmark harnesses
+// Benchmarks
 pub mod bench_compare;
 pub mod bench_executor;
 pub mod bench_local;
 pub mod bench_synthetic;
 
-// Phase 10: Resource Control (mmap fairness, fat jobs, yield policies)
+// Resource control
 pub mod device_slots;
 pub mod global_resource_pool;
 pub mod yield_policy;
 
-// ============================================================================
-// Re-exports for ergonomic API surface
-// ============================================================================
-//
-// Users can `use scheduler::*` to get the primary types without navigating
-// submodule structure. The API is organized in layers:
-//
-// **Core (always needed):**
-// - Executor, WorkerCtx, ExecutorConfig - the work-stealing runtime
-// - ByteBudget, TokenBudget - backpressure primitives
-// - ChunkParams, ChunkIter - chunking configuration
-// - RunConfig, Limits - scan configuration and hard caps
-//
-// **Supporting (common use cases):**
-// - CountBudget - integer-based permits (e.g., concurrent fetches)
-// - TsBufferPool - thread-safe buffer recycling
-// - OutputSink variants - finding output destinations
-// - WorkerFindingsBuffer - per-worker finding aggregation
-//
-// **Local scanning:**
-// - scan_local, LocalConfig - filesystem scanning entry point
-// - scan_local_uring (Linux) - io_uring-accelerated variant
-//
-// **Advanced/Tooling:**
-// - affinity, alloc, rusage - system-level observability
-// - failure module - retry/exhaustion classification
-// - sim module - deterministic simulation testing
+// ---------------------------------------------------------------------------
+// Re-exports (see module docs for organization by layer)
+// ---------------------------------------------------------------------------
 
-// Core budget/execution
+// Core scheduling
 pub use budget::{ByteBudget, BytePermit, TokenBudget, TokenPermit};
 pub use chunking::{ChunkIter, ChunkMeta, ChunkParams};
 pub use contract::{EngineContract, Limits, ObjectId, RunConfig, SourceId, ViewId};
@@ -210,7 +261,7 @@ pub use executor::{Executor, ExecutorConfig, ExecutorHandle, WorkerCtx};
 pub use metrics::{Log2Hist, MetricsSnapshot, WorkerMetricsLocal};
 pub use rng::XorShift64;
 
-// Phase 1: Core supporting
+// Supporting primitives
 pub use count_budget::{CountBudget, CountPermit};
 pub use engine_stub::{
     FileId, FindingRec, MockEngine, RuleId, ScanScratch, BUFFER_ALIGN, BUFFER_LEN_MAX,
@@ -221,13 +272,13 @@ pub use ts_buffer_pool::{TsBufferHandle, TsBufferPool, TsBufferPoolConfig};
 pub use ts_chunk::TsChunk;
 pub use worker_id::{current_worker_id, set_current_worker_id};
 
-// Phase 2: Local scanner
+// I/O backends
 pub use local::{scan_local, LocalConfig, LocalStats};
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub use local_fs_uring::{scan_local_uring, UringConfig, UringStats};
 pub use remote::{ErrorClass, RemoteBackend, RemoteConfig, RetryPolicy};
 
-// Phase 3: Tooling & observability
+// Observability
 pub use affinity::{
     allowed_cpus, first_allowed_cpu, num_cpus, pin_current_thread_to_core, try_pin_to_core,
     try_pin_to_first_allowed, CpuSet, CPU_SET_CAPACITY,
@@ -238,7 +289,7 @@ pub use bench::{
 };
 pub use rusage::{rusage_children, rusage_self, ProcUsage, ProcUsageDelta};
 
-// Phase 4: Failure model / simulation
+// Testing infrastructure
 pub use failure::{
     ClassifyError, ExhaustionReason, FailureSummary, HttpStatusClassifier, IoErrorClassifier,
     ObjectOutcome, PartialResultsPolicy, PermanentReason, RetryBudget, RetryDecision,
@@ -253,7 +304,7 @@ pub use task_graph::{
     Task, TaskMetrics, ENUM_BATCH_SIZE, MAX_FETCH_SPAWNS_PER_ENUM,
 };
 
-// Phase 10: Resource Control
+// Resource control
 pub use device_slots::{DeviceId, DeviceSlotPermit, DeviceSlots, DeviceSlotsConfig, IoModel};
 pub use global_resource_pool::{
     FatJobPermit, FatJobRequest, GlobalResourcePool, GlobalResourcePoolConfig,
