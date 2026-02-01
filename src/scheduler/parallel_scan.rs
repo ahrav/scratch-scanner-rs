@@ -405,7 +405,7 @@ impl FileSource for SingleFileSource {
 /// Individual file I/O errors do not cause the function to return `Err`;
 /// they are counted in `report.stats.io_errors` and scanning continues.
 /// Discovery errors (permission denied on subdirs, broken symlinks) are
-/// logged but not tracked in metrics to keep the design simple.
+/// logged in debug builds but not tracked in metrics to keep the design simple.
 ///
 /// # Complexity
 ///
@@ -690,7 +690,7 @@ mod tests {
         let _ = fs::set_permissions(&subdir, fs::Permissions::from_mode(0o755));
 
         // Should succeed - only the root-level file is scanned
-        // Discovery errors (unreadable subdir) are logged but not tracked in metrics
+        // Discovery errors (unreadable subdir) are logged in debug builds
         assert!(result.is_ok());
         let report = result.unwrap();
         assert_eq!(report.stats.files_enqueued, 1);
