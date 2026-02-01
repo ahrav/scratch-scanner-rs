@@ -137,13 +137,128 @@ pub mod executor;
 pub mod metrics;
 pub mod rng;
 
-// Re-exports for ergonomic API surface.
-// Users can `use scheduler::*` to get the primary types without
-// navigating submodule structure.
+// Phase 1: Core supporting modules
+pub mod count_budget;
+pub mod engine_stub;
+pub mod findings;
+pub mod output_sink;
+pub mod ts_buffer_pool;
+pub mod ts_chunk;
+pub mod worker_id;
 
+// Phase 2: Local scanner modules
+pub mod local;
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+pub mod local_fs_uring;
+pub mod remote;
+
+// Phase 3: Tooling & observability
+pub mod affinity;
+pub mod alloc;
+pub mod bench;
+pub mod rusage;
+
+// Phase 4: Test support / failure model
+pub mod failure;
+pub mod sim;
+pub mod task_graph;
+
+// Phase 5: Benchmark harnesses
+pub mod bench_compare;
+pub mod bench_executor;
+pub mod bench_local;
+pub mod bench_synthetic;
+
+// Phase 10: Resource Control (mmap fairness, fat jobs, yield policies)
+pub mod device_slots;
+pub mod global_resource_pool;
+pub mod yield_policy;
+
+// ============================================================================
+// Re-exports for ergonomic API surface
+// ============================================================================
+//
+// Users can `use scheduler::*` to get the primary types without navigating
+// submodule structure. The API is organized in layers:
+//
+// **Core (always needed):**
+// - Executor, WorkerCtx, ExecutorConfig - the work-stealing runtime
+// - ByteBudget, TokenBudget - backpressure primitives
+// - ChunkParams, ChunkIter - chunking configuration
+// - RunConfig, Limits - scan configuration and hard caps
+//
+// **Supporting (common use cases):**
+// - CountBudget - integer-based permits (e.g., concurrent fetches)
+// - TsBufferPool - thread-safe buffer recycling
+// - OutputSink variants - finding output destinations
+// - WorkerFindingsBuffer - per-worker finding aggregation
+//
+// **Local scanning:**
+// - scan_local, LocalConfig - filesystem scanning entry point
+// - scan_local_uring (Linux) - io_uring-accelerated variant
+//
+// **Advanced/Tooling:**
+// - affinity, alloc, rusage - system-level observability
+// - failure module - retry/exhaustion classification
+// - sim module - deterministic simulation testing
+
+// Core budget/execution
 pub use budget::{ByteBudget, BytePermit, TokenBudget, TokenPermit};
 pub use chunking::{ChunkIter, ChunkMeta, ChunkParams};
 pub use contract::{EngineContract, Limits, ObjectId, RunConfig, SourceId, ViewId};
 pub use executor::{Executor, ExecutorConfig, ExecutorHandle, WorkerCtx};
 pub use metrics::{Log2Hist, MetricsSnapshot, WorkerMetricsLocal};
 pub use rng::XorShift64;
+
+// Phase 1: Core supporting
+pub use count_budget::{CountBudget, CountPermit};
+pub use engine_stub::{
+    FileId, FindingRec, MockEngine, RuleId, ScanScratch, BUFFER_ALIGN, BUFFER_LEN_MAX,
+};
+pub use findings::{GlobalFindingsCollector, SecretHash, WorkerFindingsBuffer};
+pub use output_sink::{FileSink, NullSink, OutputSink, StdoutSink, VecSink};
+pub use ts_buffer_pool::{TsBufferHandle, TsBufferPool, TsBufferPoolConfig};
+pub use ts_chunk::TsChunk;
+pub use worker_id::{current_worker_id, set_current_worker_id};
+
+// Phase 2: Local scanner
+pub use local::{scan_local, LocalConfig, LocalStats};
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+pub use local_fs_uring::{scan_local_uring, UringConfig, UringStats};
+pub use remote::{ErrorClass, RemoteBackend, RemoteConfig, RetryPolicy};
+
+// Phase 3: Tooling & observability
+pub use affinity::{
+    allowed_cpus, first_allowed_cpu, num_cpus, pin_current_thread_to_core, try_pin_to_core,
+    try_pin_to_first_allowed, CpuSet, CPU_SET_CAPACITY,
+};
+pub use alloc::{alloc_stats, AllocGuard, AllocStats, AllocStatsDelta, CountingAllocator};
+pub use bench::{
+    run_benchmark, BenchConfig, BenchIter, BenchIterMetrics, BenchReport, Benchmarkable, Stopwatch,
+};
+pub use rusage::{rusage_children, rusage_self, ProcUsage, ProcUsageDelta};
+
+// Phase 4: Failure model / simulation
+pub use failure::{
+    ClassifyError, ExhaustionReason, FailureSummary, HttpStatusClassifier, IoErrorClassifier,
+    ObjectOutcome, PartialResultsPolicy, PermanentReason, RetryBudget, RetryDecision,
+    RetryableReason,
+};
+pub use sim::{
+    replay_sim, run_sim, Action, BudgetEnforcement, ObjectSpec, SimConfig, SimError, SimReport,
+    SimTrace,
+};
+pub use task_graph::{
+    CursorState, EnumCursor, ObjectCtx, ObjectDescriptor, ObjectFrontier, ObjectPermit, ObjectRef,
+    Task, TaskMetrics, ENUM_BATCH_SIZE, MAX_FETCH_SPAWNS_PER_ENUM,
+};
+
+// Phase 10: Resource Control
+pub use device_slots::{DeviceId, DeviceSlotPermit, DeviceSlots, DeviceSlotsConfig, IoModel};
+pub use global_resource_pool::{
+    FatJobPermit, FatJobRequest, GlobalResourcePool, GlobalResourcePoolConfig,
+};
+pub use yield_policy::{
+    AdaptiveYield, AlwaysYield, BoxedYieldPolicy, EveryN, GitPhase, GitYieldPolicy, NeverYield,
+    YieldPolicy,
+};

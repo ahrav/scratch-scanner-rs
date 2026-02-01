@@ -5,7 +5,7 @@
 //! This module enables O(1) per-worker routing for buffer pool returns:
 //! - Worker threads set their ID at startup via `set_current_worker_id(Some(id))`
 //! - Buffer pool `release()` checks TLS to route to local queue first
-//! - Non-worker threads (I/O completions, external callers) fall back to global queue
+//! - Non-worker threads (I/O completions) fall back to global queue
 //!
 //! # Safety
 //!
@@ -24,9 +24,28 @@
 use std::cell::Cell;
 
 /// Sentinel value indicating no worker ID is set.
+///
+/// # Why `usize::MAX`?
+///
+/// - **Not a valid worker ID**: No executor will have 2^64 workers.
+/// - **Branchless comparison**: `id == NO_WORKER` compiles to a single `cmp`.
+/// - **No `Option` overhead**: Avoids the 1-byte discriminant + padding that
+///   `Option<usize>` would add in TLS (minor, but TLS access is already slow).
+///
+/// Trade-off: Caller must not pass `usize::MAX` as a worker ID. This is enforced
+/// by the executor (worker IDs are sequential from 0).
 const NO_WORKER: usize = usize::MAX;
 
 thread_local! {
+    /// Per-thread worker ID storage.
+    ///
+    /// Initialized to `NO_WORKER` (not a worker thread). The executor sets this
+    /// to the actual worker ID before entering the work loop, and clears it on exit.
+    ///
+    /// # Initialization Timing
+    ///
+    /// The `const { ... }` initializer means no runtime init code runs—the value
+    /// is baked into the binary. First access on any thread sees `NO_WORKER`.
     static WORKER_ID: Cell<usize> = const { Cell::new(NO_WORKER) };
 }
 

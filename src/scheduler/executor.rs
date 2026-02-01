@@ -148,9 +148,17 @@ impl Default for ExecutorConfig {
 /// # Thread Safety
 ///
 /// `Clone` and `Send + Sync`. Multiple producers can call `spawn` concurrently.
-#[derive(Clone)]
 pub struct ExecutorHandle<T> {
     shared: Arc<Shared<T>>,
+}
+
+// Manual Clone impl to avoid requiring T: Clone
+impl<T> Clone for ExecutorHandle<T> {
+    fn clone(&self) -> Self {
+        Self {
+            shared: Arc::clone(&self.shared),
+        }
+    }
 }
 
 impl<T: Send + 'static> ExecutorHandle<T> {
