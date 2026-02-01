@@ -191,7 +191,7 @@ impl LocalScanBenchmark {
         synthetic_config
             .validate()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        local_config.validate(&engine);
+        local_config.validate(engine.as_ref());
 
         // Generate synthetic files
         let synthetic = SyntheticFileSource::generate(synthetic_config)?;
@@ -214,7 +214,7 @@ impl LocalScanBenchmark {
         synthetic: SyntheticFileSource,
         local_config: LocalConfig,
     ) -> Self {
-        local_config.validate(&engine);
+        local_config.validate(engine.as_ref());
 
         Self {
             engine,
@@ -326,7 +326,7 @@ where
     F: Fn() -> Box<dyn FileSource> + Send,
 {
     pub fn new(engine: Arc<MockEngine>, local_config: LocalConfig, source_factory: F) -> Self {
-        local_config.validate(&engine);
+        local_config.validate(engine.as_ref());
 
         Self {
             engine,

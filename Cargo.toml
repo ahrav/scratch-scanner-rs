@@ -20,6 +20,10 @@ regex = "1.10"
 regex-syntax = "0.8"
 vectorscan-rs-sys = "0.0.5"
 
+# Directory walking and parallel scanning
+ignore = "0.4"
+num_cpus = "1.16"
+
 # Optional dependency for thread pinning
 core_affinity = { version = "0.8", optional = true }
 

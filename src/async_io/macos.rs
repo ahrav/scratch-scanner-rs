@@ -1,25 +1,74 @@
 //! macOS async I/O scanning using POSIX AIO.
 //!
 //! # Overview
-//! This module implements a single-threaded scanner that overlaps read-ahead
-//! with scanning using a fixed-depth queue of POSIX AIO requests. Overlap bytes
-//! are stitched into each buffer so the scanner always sees a contiguous
-//! prefix+payload slice without redundant rescans.
 //!
-//! # Invariants and trade-offs
-//! - Queue depth must be >= 2 to overlap read/scan.
-//! - Buffers are fixed-size; `payload_off + chunk_size` must fit in
-//!   `BUFFER_LEN_MAX`.
-//! - Requests are emitted in file order even if completions arrive out of order.
-//! - AIO is best-effort; transient submit errors are retried, and EINTR is
-//!   handled by retrying `aio_suspend`.
+//! This module implements a single-threaded scanner that overlaps read-ahead
+//! with scanning using a fixed-depth queue of POSIX AIO requests. The design
+//! keeps the CPU busy scanning while the kernel fills the next buffer.
+//!
+//! # Architecture
+//!
+//! ```text
+//!                              ┌─────────────────────────────┐
+//!                              │       MacosAioScanner       │
+//!                              │  (owns engine, pool, walker)│
+//!                              └──────────────┬──────────────┘
+//!                                             │
+//!                    ┌────────────────────────┼────────────────────────┐
+//!                    │                        │                        │
+//!                    ▼                        ▼                        ▼
+//!           ┌────────────────┐      ┌────────────────┐      ┌─────────────────┐
+//!           │   BufferPool   │      │ AioFileReader  │      │     Walker      │
+//!           │  (fixed bufs)  │      │ (slot machine) │      │ (DFS discovery) │
+//!           └────────────────┘      └───────┬────────┘      └─────────────────┘
+//!                                           │
+//!                    ┌──────────────────────┼──────────────────────┐
+//!                    │                      │                      │
+//!                    ▼                      ▼                      ▼
+//!             ┌───────────┐          ┌───────────┐          ┌───────────┐
+//!             │  AioSlot  │          │  AioSlot  │          │  AioSlot  │
+//!             │ (aiocb 0) │          │ (aiocb 1) │          │ (aiocb N) │
+//!             └───────────┘          └───────────┘          └───────────┘
+//! ```
+//!
+//! # Slot State Machine
+//!
+//! Each `AioSlot` transitions through: `Empty → InFlight → Completed → Empty`
+//!
+//! ```text
+//!      submit()          poll_complete()         emit_ready()
+//!   ┌───────────┐       ┌──────────────┐       ┌────────────┐
+//!   │   Empty   │──────►│   InFlight   │──────►│ Completed  │─────┐
+//!   └───────────┘       └──────────────┘       └────────────┘     │
+//!         ▲                                                       │
+//!         └───────────────────reset()────────────────────────────┘
+//! ```
+//!
+//! # Ordered Emission
+//!
+//! AIO completions may arrive out of order, but chunks must be emitted in file
+//! offset order for correct overlap handling. The reader tracks:
+//! - `next_seq`: Sequence number for next submit
+//! - `next_emit_seq`: Sequence number of next chunk to emit
+//!
+//! Completed chunks wait in a ready table (keyed by `seq % queue_depth`) until
+//! their sequence number matches `next_emit_seq`.
+//!
+//! # Invariants
+//!
+//! - **Queue depth ≥ 2**: Required to overlap read and scan.
+//! - **Buffer sizing**: `payload_off + chunk_size ≤ BUFFER_LEN_MAX`.
+//! - **Ordered emission**: Chunks emitted strictly by sequence number.
+//! - **Transient retry**: `EAGAIN`, `ENOMEM`, `EINTR` on submit trigger backoff.
+//! - **EINTR handling**: `aio_suspend` retries on interrupt.
+//! - **Leak-free cleanup**: `Drop` drains all in-flight requests before freeing buffers.
 
 use super::*;
 use crate::{BufferPool, Chunk, Engine, FindingRec, ScanScratch};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::mem;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{FromRawFd, RawFd};
 use std::sync::Arc;
 
 mod aio {
@@ -156,12 +205,43 @@ mod aio {
 
 /// macOS async scanner powered by POSIX AIO.
 ///
-/// The scanner stays single-threaded and uses a fixed read-ahead depth
-/// to overlap IO and scanning without unbounded buffering. Per-file reader
-/// buffers are allocated once and reused across files.
+/// # Design
 ///
-/// This wrapper owns its reader, buffers, and scratch state; reuse the same
-/// instance for multiple scans to avoid allocations.
+/// The scanner stays single-threaded and uses a fixed read-ahead depth to
+/// overlap I/O and scanning without unbounded buffering. All per-file state
+/// (reader, buffers, scratch) is allocated once at construction and reused
+/// across files to minimize allocation churn.
+///
+/// # Ownership
+///
+/// ```text
+/// MacosAioScanner
+/// ├── engine: Arc<Engine>      # Shared detection engine
+/// ├── pool: BufferPool         # Fixed-size buffer arena
+/// ├── reader: AioFileReader    # Reusable per-file reader
+/// ├── scratch: ScanScratch     # Engine scratch space
+/// ├── pending: Vec<FindingRec> # Per-chunk findings buffer
+/// ├── files: FileTable         # Path + metadata storage
+/// ├── walker: Walker           # DFS directory traversal
+/// └── out: BufWriter<Stdout>   # Buffered output
+/// ```
+///
+/// # Usage
+///
+/// ```ignore
+/// let mut scanner = MacosAioScanner::new(engine, config)?;
+///
+/// // First scan
+/// let stats1 = scanner.scan_path("/path/to/scan1")?;
+///
+/// // Reuse for subsequent scans (no reallocation)
+/// let stats2 = scanner.scan_path("/path/to/scan2")?;
+/// ```
+///
+/// # Memory Budget
+///
+/// Peak memory = `(queue_depth + 1) × buffer_size + path_bytes_cap + scratch`.
+/// With defaults (depth=2, 256K buffers, 256K paths): ~1 MiB baseline.
 pub struct MacosAioScanner {
     engine: Arc<Engine>,
     pool: BufferPool,
@@ -334,8 +414,32 @@ enum AioSlotState {
 
 /// One in-flight AIO request slot.
 ///
-/// The buffer handle is retained until the request completes so the kernel
-/// never reads into freed memory.
+/// # Safety Contract
+///
+/// The buffer handle (`handle`) MUST be retained until the request completes.
+/// The kernel writes directly into this buffer; dropping it while in-flight
+/// would cause undefined behavior (use-after-free or write to unmapped memory).
+///
+/// # State Machine
+///
+/// ```text
+///                 ┌─────────────────────────────────────────────┐
+///                 │                 AioSlot                      │
+///                 │                                             │
+///   submit() ────►│  Empty ──► InFlight ──► Completed ──► Empty │
+///                 │            (kernel      (data ready)        │
+///                 │             writing)                        │
+///                 └─────────────────────────────────────────────┘
+/// ```
+///
+/// # Fields
+///
+/// - `cb`: The POSIX `aiocb` control block passed to `aio_read()`
+/// - `handle`: Buffer ownership (keeps memory alive during I/O)
+/// - `offset`: File offset where this read started
+/// - `seq`: Sequence number for ordered emission
+/// - `req_len`: Bytes requested from kernel
+/// - `read_len`: Bytes actually returned (may be < req_len at EOF)
 struct AioSlot {
     cb: libc::aiocb,
     state: AioSlotState,
@@ -456,11 +560,47 @@ impl AioSlot {
 
 /// Reusable file-local AIO reader with read-ahead and ordered chunk emission.
 ///
-/// This reader:
-/// - keeps a fixed number of in-flight reads (read-ahead window)
-/// - preserves overlap across chunks without payload copies
-/// - emits chunks strictly in order
-/// - allocates its buffers once and reuses them via `reset_for_file`
+/// # Design
+///
+/// The reader maintains a fixed pool of `AioSlot`s, each capable of holding
+/// one in-flight read. Slots cycle through states: Empty → InFlight → Completed.
+///
+/// # Key Behaviors
+///
+/// - **Read-ahead**: Keeps up to `queue_depth` reads in flight simultaneously.
+/// - **Overlap preservation**: The tail of each completed chunk becomes the
+///   prefix of the next, enabling boundary-crossing secret detection.
+/// - **Ordered emission**: Regardless of completion order, chunks are returned
+///   in strict file offset order (via sequence numbering).
+/// - **Zero hot-path allocation**: All vectors sized at construction; the
+///   `next_chunk()` loop never allocates.
+///
+/// # State Tracking
+///
+/// ```text
+/// ┌─────────────────────────────────────────────────────────────────────┐
+/// │                         AioFileReader                               │
+/// │                                                                     │
+/// │  Submission tracking:                                               │
+/// │    next_offset  ─► File offset for next read                        │
+/// │    next_seq     ─► Sequence number for next submit                  │
+/// │    end_seq      ─► Sequence of final chunk (may shrink on EOF)      │
+/// │                                                                     │
+/// │  Emission tracking:                                                 │
+/// │    next_emit_seq ─► Sequence of next chunk to return                │
+/// │    ready_seq[]   ─► Completed seq numbers (indexed by seq % depth)  │
+/// │    ready_slot[]  ─► Slot index for each ready seq                   │
+/// │                                                                     │
+/// │  Overlap carry:                                                     │
+/// │    tail[]        ─► Last `overlap` bytes of previous chunk          │
+/// │    tail_len      ─► Actual bytes in tail (< overlap for first/small)│
+/// └─────────────────────────────────────────────────────────────────────┘
+/// ```
+///
+/// # Lifetime
+///
+/// A single `AioFileReader` instance is reused across all files in a scan.
+/// `reset_for_file()` drains any in-flight requests and reinitializes state.
 struct AioFileReader {
     file_id: FileId,
     file: Option<File>,
@@ -548,8 +688,19 @@ impl AioFileReader {
         self.file = None;
         self.fd = -1;
 
-        let file = File::open(path)?;
-        let fd = file.as_raw_fd();
+        // Use raw libc::open with stack-allocated C string to avoid heap allocation.
+        // std::fs::File::open internally creates a CString which allocates.
+        let fd = with_c_path(path, |c_path| unsafe {
+            let fd = libc::open(c_path, libc::O_RDONLY | libc::O_CLOEXEC);
+            if fd < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(fd)
+            }
+        })?;
+
+        // Convert raw fd to File for ownership/drop semantics.
+        let file = unsafe { File::from_raw_fd(fd) };
 
         self.file = Some(file);
         self.fd = fd;
