@@ -1362,6 +1362,15 @@ impl Drop for VsScratch {
 impl VsPrefilterDb {
     /// Builds a Vectorscan DB for raw regex prefilter matches and optional anchor hits.
     ///
+    /// # Arguments
+    /// * `rules` - Rule specifications to compile
+    /// * `_tuning` - Tuning parameters (currently unused)
+    /// * `anchor` - Optional anchor patterns to include as exact literals
+    /// * `use_raw_prefilter` - Per-rule flags indicating whether to include raw regex.
+    ///   When `None`, all rules use raw regex prefiltering. When `Some`, only rules
+    ///   with `use_raw_prefilter[rid] == true` have their regex compiled. Rules with
+    ///   `false` rely on anchor patterns for window seeding.
+    ///
     /// Returns an error if the database cannot be compiled or if any rule
     /// pattern is rejected by `hs_expression_info`. If multi-compile fails, we
     /// recompile patterns individually to surface the specific rule errors.
@@ -1369,6 +1378,7 @@ impl VsPrefilterDb {
         rules: &[RuleSpec],
         _tuning: &Tuning,
         anchor: Option<AnchorInput<'_>>,
+        use_raw_prefilter: Option<&[bool]>,
     ) -> Result<Self, String> {
         const RAW_FLAGS: c_uint = vs::HS_FLAG_PREFILTER as c_uint;
 
@@ -1400,7 +1410,16 @@ impl VsPrefilterDb {
             if max_width_u32 == u32::MAX {
                 unbounded = true;
             }
+            // Always track max_width for all rules (needed for window expansion).
             max_width = max_width.max(max_width_u32);
+
+            // Skip adding raw regex pattern for rules where use_raw_prefilter[rid] is false.
+            // These rules rely on anchor patterns (in the anchor input) for window seeding.
+            if let Some(flags) = use_raw_prefilter {
+                if rid < flags.len() && !flags[rid] {
+                    continue;
+                }
+            }
 
             raw_patterns.push(RawPattern {
                 rule_id: rid as u32,

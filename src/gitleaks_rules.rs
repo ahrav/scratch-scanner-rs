@@ -54,7 +54,8 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 min_len: 16,
                 max_len: 256,
             }),
-            re: build_regex(r"ops_eyJ[a-zA-Z0-9+/]{250,}={0,3}"),
+            // Upper bound added to enable accurate max_width calculation
+            re: build_regex(r"ops_eyJ[a-zA-Z0-9+/]{250,2048}={0,3}"),
         },
         RuleSpec {
             name: "adafruit-api-key",
@@ -331,18 +332,13 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
         },
         RuleSpec {
             name: "aws-access-token",
-            anchors: &[
-                b"a3t", b"A3T", b"akia", b"AKIA", b"asia", b"ASIA", b"abia", b"ABIA", b"acca",
-                b"ACCA",
-            ],
+            // Only uppercase anchors - regex is case-sensitive: (A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)
+            anchors: &[b"A3T", b"AKIA", b"ASIA", b"ABIA", b"ACCA"],
             radius: 256,
             validator: ValidatorKind::None,
             two_phase: None,
             must_contain: None,
-            keywords_any: Some(&[
-                b"a3t", b"A3T", b"akia", b"AKIA", b"asia", b"ASIA", b"abia", b"ABIA", b"acca",
-                b"ACCA",
-            ]),
+            keywords_any: Some(&[b"A3T", b"AKIA", b"ASIA", b"ABIA", b"ACCA"]),
             entropy: Some(EntropySpec {
                 min_bits_per_byte: 3.0,
                 min_len: 16,
@@ -659,8 +655,9 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 min_len: 16,
                 max_len: 256,
             }),
+            // Bounded .{0,2048}? to enable accurate max_width calculation
             re: build_regex(
-                r#"\bcurl\b(?:.*?|.*?(?:[\r\n]{1,2}.*?){1,5})[ \t\n\r](?:-H|--header)(?:=|[ \t]{0,5})(?:"(?i)(?:Authorization:[ \t]{0,5}(?:Basic[ \t]([a-z0-9+/]{8,}={0,3})|(?:Bearer|(?:Api-)?Token)[ \t]([\w=~@.+/-]{8,})|([\w=~@.+/-]{8,}))|(?:(?:X-(?:[a-z]+-)?)?(?:Api-?)?(?:Key|Token)):[ \t]{0,5}([\w=~@.+/-]{8,}))"|'(?i)(?:Authorization:[ \t]{0,5}(?:Basic[ \t]([a-z0-9+/]{8,}={0,3})|(?:Bearer|(?:Api-)?Token)[ \t]([\w=~@.+/-]{8,})|([\w=~@.+/-]{8,}))|(?:(?:X-(?:[a-z]+-)?)?(?:Api-?)?(?:Key|Token)):[ \t]{0,5}([\w=~@.+/-]{8,}))')(?:\B|\s|\z)"#,
+                r#"\bcurl\b(?:.{0,2048}?|.{0,2048}?(?:[\r\n]{1,2}.{0,2048}?){1,5})[ \t\n\r](?:-H|--header)(?:=|[ \t]{0,5})(?:"(?i)(?:Authorization:[ \t]{0,5}(?:Basic[ \t]([a-z0-9+/]{8,}={0,3})|(?:Bearer|(?:Api-)?Token)[ \t]([\w=~@.+/-]{8,})|([\w=~@.+/-]{8,}))|(?:(?:X-(?:[a-z]+-)?)?(?:Api-?)?(?:Key|Token)):[ \t]{0,5}([\w=~@.+/-]{8,}))"|'(?i)(?:Authorization:[ \t]{0,5}(?:Basic[ \t]([a-z0-9+/]{8,}={0,3})|(?:Bearer|(?:Api-)?Token)[ \t]([\w=~@.+/-]{8,})|([\w=~@.+/-]{8,}))|(?:(?:X-(?:[a-z]+-)?)?(?:Api-?)?(?:Key|Token)):[ \t]{0,5}([\w=~@.+/-]{8,}))')(?:\B|\s|\z)"#,
             ),
         },
         RuleSpec {
@@ -676,8 +673,9 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 min_len: 16,
                 max_len: 256,
             }),
+            // Bounded .{0,2048} to enable accurate max_width calculation
             re: build_regex(
-                r#"\bcurl\b(?:.*|.*(?:[\r\n]{1,2}.*){1,5})[ \t\n\r](?:-u|--user)(?:=|[ \t]{0,5})("(:[^"]{3,}|[^:"]{3,}:|[^:"]{3,}:[^"]{3,})"|'([^:']{3,}:[^']{3,})'|((?:"[^"]{3,}"|'[^']{3,}'|[\w$@.-]+):(?:"[^"]{3,}"|'[^']{3,}'|[\w${}@.-]+)))(?:\s|\z)"#,
+                r#"\bcurl\b(?:.{0,2048}|.{0,2048}(?:[\r\n]{1,2}.{0,2048}){1,5})[ \t\n\r](?:-u|--user)(?:=|[ \t]{0,5})("(:[^"]{3,}|[^:"]{3,}:|[^:"]{3,}:[^"]{3,})"|'([^:']{3,}:[^']{3,})'|((?:"[^"]{3,}"|'[^']{3,}'|[\w$@.-]+):(?:"[^"]{3,}"|'[^']{3,}'|[\w${}@.-]+)))(?:\s|\z)"#,
             ),
         },
         RuleSpec {
@@ -970,12 +968,13 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
         },
         RuleSpec {
             name: "facebook-page-access-token",
-            anchors: &[b"eaam", b"EAAM", b"eaac", b"EAAC"],
+            // Only uppercase anchors - regex requires uppercase: EAA[MC](?i)
+            anchors: &[b"EAAM", b"EAAC"],
             radius: 256,
             validator: ValidatorKind::None,
             two_phase: None,
             must_contain: None,
-            keywords_any: Some(&[b"eaam", b"EAAM", b"eaac", b"EAAC"]),
+            keywords_any: Some(&[b"EAAM", b"EAAC"]),
             entropy: Some(EntropySpec {
                 min_bits_per_byte: 4.0,
                 min_len: 16,
@@ -1123,8 +1122,9 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 min_len: 16,
                 max_len: 256,
             }),
+            // Upper bounds added to enable accurate max_width calculation
             re: build_regex(
-                r#"\b((?:fo1_[\w-]{43}|fm1[ar]_[a-zA-Z0-9+\/]{100,}={0,3}|fm2_[a-zA-Z0-9+\/]{100,}={0,3}))(?:[\x60'"\s;]|\\[nr]|$)"#,
+                r#"\b((?:fo1_[\w-]{43}|fm1[ar]_[a-zA-Z0-9+\/]{100,1024}={0,3}|fm2_[a-zA-Z0-9+\/]{100,1024}={0,3}))(?:[\x60'"\s;]|\\[nr]|$)"#,
             ),
         },
         RuleSpec {
@@ -2799,12 +2799,13 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
         },
         RuleSpec {
             name: "sendgrid-api-token",
-            anchors: &[b"sg.", b"SG."],
+            // Only uppercase anchor - regex requires uppercase: SG\.(?i)
+            anchors: &[b"SG."],
             radius: 256,
             validator: ValidatorKind::None,
             two_phase: None,
             must_contain: None,
-            keywords_any: Some(&[b"sg.", b"SG."]),
+            keywords_any: Some(&[b"SG."]),
             entropy: Some(EntropySpec {
                 min_bits_per_byte: 2.0,
                 min_len: 16,
