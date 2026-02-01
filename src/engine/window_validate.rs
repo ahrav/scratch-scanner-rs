@@ -20,9 +20,13 @@
 //!
 //! # Secret Extraction
 //! The finding's `span_start`/`span_end` reflect the *secret* portion of the match,
-//! not necessarily the full regex match. This enables accurate deduplication: two
-//! findings with identical secrets (but different surrounding context) will hash
-//! the same. The extraction priority is:
+//! not necessarily the full regex match. The `root_hint_*` fields use the *full match*
+//! span (not secret span or window span) to ensure correct deduplication in chunked
+//! scans: `drop_prefix_findings()` uses `root_hint_end` to decide whether to keep a
+//! finding. Using the full match span handles trailing context correctly (e.g., when
+//! a pattern like `secret([a-z]+)(?:;|$)` has a delimiter that extends into new bytes).
+//!
+//! The extraction priority is:
 //! 1. Configured `secret_group` if present and non-empty.
 //! 2. Capture group 1 if non-empty (gitleaks convention).
 //! 3. Full match (group 0) as fallback.
@@ -200,9 +204,15 @@ impl Engine {
                     let secret_end = search_start + secret_end;
 
                     let span_in_buf = (w.start + secret_start)..(w.start + secret_end);
-                    // Use full window span for root_span_hint (aligned with UTF-16 path).
-                    // The secret span is still tracked via span_start/span_end.
-                    let root_span_hint = root_hint.clone().unwrap_or_else(|| w.clone());
+                    let match_span_in_buf = (w.start + match_start)..(w.start + match_end);
+                    // Use FULL MATCH span for root_span_hint to ensure correct deduplication
+                    // in chunked scans. drop_prefix_findings() uses root_hint_end to decide
+                    // whether to keep a finding:
+                    // - Window span: too wide → duplicates (the original bug)
+                    // - Secret span: too narrow → missed findings when trailing context
+                    //   (e.g., `;` delimiter) extends into new bytes
+                    // - Full match span: correct → captures actual regex match extent
+                    let root_span_hint = root_hint.clone().unwrap_or(match_span_in_buf);
 
                     scratch.push_finding(FindingRec {
                         file_id,
@@ -332,6 +342,9 @@ impl Engine {
                     // Extract secret span using capture group logic.
                     let (secret_start, secret_end) = extract_secret_span(&caps, rule.secret_group);
 
+                    // For UTF-16, span_start/span_end are in decoded UTF-8 space but
+                    // root_span_hint must be in raw buffer space. We use the window span
+                    // since mapping back to exact raw positions is complex.
                     let root_span_hint = root_hint.clone().unwrap_or_else(|| w.clone());
 
                     if out.len() < max_findings {
@@ -447,7 +460,11 @@ impl Engine {
             let span_start = window_start.saturating_add(secret_start as u64) as usize;
             let span_end = window_start.saturating_add(secret_end as u64) as usize;
             let span_in_buf = span_start..span_end;
-            let root_span_hint = root_hint.clone().unwrap_or_else(|| span_in_buf.clone());
+            // Use FULL MATCH span for root_span_hint (see Raw variant comment for rationale).
+            let match_hint_start = window_start.saturating_add(match_start as u64) as usize;
+            let match_hint_end = window_start.saturating_add(match_end as u64) as usize;
+            let match_span_in_buf = match_hint_start..match_hint_end;
+            let root_span_hint = root_hint.clone().unwrap_or(match_span_in_buf);
 
             if out.len() < max_findings {
                 out.push(FindingRec {
@@ -605,6 +622,9 @@ impl Engine {
             // Extract secret span using capture group logic.
             let (secret_start, secret_end) = extract_secret_span(&caps, rule.secret_group);
 
+            // For UTF-16, span_start/span_end are in decoded UTF-8 space but
+            // root_span_hint must be in raw buffer space. We use the parent span
+            // since mapping back to exact raw positions is complex.
             let root_span_hint = root_hint.clone().unwrap_or_else(|| parent_span.clone());
 
             if out.len() < max_findings {

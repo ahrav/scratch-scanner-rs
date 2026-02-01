@@ -475,8 +475,9 @@ pub(super) fn u64_to_usize(v: u64) -> usize {
 ///    Gitleaks rules place the secret in group 1 by convention.
 /// 3. **Full match fallback**: Otherwise, use group 0 (the entire match).
 ///
-/// Empty groups are skipped because some patterns have optional groups that may
-/// match zero characters (e.g., `([A-Z]*)` matching empty string).
+/// Groups that did not participate in the match (`None`) or captured an empty
+/// span are skipped, because some patterns have optional groups that may not
+/// capture meaningful content (e.g., `([A-Z]*)` matching an empty string).
 ///
 /// # Arguments
 /// - `captures`: The regex Captures from a successful match.
@@ -495,10 +496,21 @@ pub(super) fn extract_secret_span(
 ) -> (usize, usize) {
     // Priority 1: Use configured secret_group if set.
     if let Some(gi) = secret_group {
-        if let Some(m) = captures.get(gi as usize) {
+        let group_idx = gi as usize;
+        if let Some(m) = captures.get(group_idx) {
             if m.start() < m.end() {
                 return (m.start(), m.end());
             }
+            // Group exists but matched empty - fall through to other priorities.
+        } else {
+            // Configured group does not exist in this regex. This indicates a rule
+            // configuration error that should have been caught by RuleSpec::assert_valid().
+            debug_assert!(
+                false,
+                "secret_group {} does not exist in regex (only {} groups)",
+                group_idx,
+                captures.len()
+            );
         }
     }
 

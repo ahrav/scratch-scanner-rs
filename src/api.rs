@@ -569,14 +569,25 @@ pub struct RuleSpec {
     /// `None`) is to prefer capture group 1 if it exists and is non-empty, falling
     /// back to the full match span.
     ///
+    /// # Fallback Behavior
+    /// If the specified group did not participate in the match or captured an empty
+    /// span, the engine falls back to the default behavior: prefer capture group 1
+    /// if non-empty, otherwise use the full match (group 0).
+    ///
     /// # Gitleaks Compatibility
     /// Gitleaks rules conventionally place the secret in capture group 1. Setting
     /// this field allows overriding that convention for rules with different capture
     /// group layouts.
     ///
     /// # Indexing
-    /// - Group 0 is the full match (equivalent to not specifying a group).
+    /// - Group 0 is the full match; use `Some(0)` to always extract the full match
+    ///   even when capture groups exist.
     /// - Groups 1+ are the parenthesized capture groups in order.
+    ///
+    /// # Validation
+    /// The group index is validated at engine build time via [`RuleSpec::assert_valid`].
+    /// Specifying a group that does not exist in the regex will panic during engine
+    /// construction.
     pub secret_group: Option<u16>,
 
     /// Final check. Bytes regex (no UTF-8 assumption).
@@ -599,6 +610,15 @@ impl RuleSpec {
         }
         if let Some(ent) = &self.entropy {
             ent.assert_valid();
+        }
+        if let Some(gi) = self.secret_group {
+            let group_count = self.re.captures_len();
+            assert!(
+                (gi as usize) < group_count,
+                "secret_group {} does not exist in regex (only {} groups, including group 0)",
+                gi,
+                group_count
+            );
         }
     }
 }

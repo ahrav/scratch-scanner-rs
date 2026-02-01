@@ -5,7 +5,9 @@
 //! across transforms and UTF-16 variants.
 
 use super::core::Engine;
-use super::helpers::{decode_utf16be_to_vec, decode_utf16le_to_vec, entropy_gate_passes, hash128};
+use super::helpers::{
+    decode_utf16be_to_vec, decode_utf16le_to_vec, entropy_gate_passes, extract_secret_span, hash128,
+};
 #[cfg(all(test, feature = "stdx-proptest"))]
 use super::hit_pool::{HitAccPool, SpanU32};
 use super::rule_repr::{utf16be_bytes, utf16le_bytes, EntropyCompiled, PackedPatterns, Variant};
@@ -494,6 +496,8 @@ fn entropy_gate_filters_low_entropy_matches() {
 // - `secret_extraction_skips_empty_group1`: Empty optional groups fallback
 // - `secret_extraction_hash_consistency`: Same secret → same hash (dedup correctness)
 // - `secret_extraction_utf16le_path`: Works through UTF-16 decode path
+// - `secret_extraction_explicit_group0_overrides_group1`: Some(0) forces full match
+// - `secret_extraction_empty_configured_group_falls_back`: Empty configured group fallback
 
 #[test]
 fn secret_extraction_prefers_group1_over_full_match() {
@@ -925,6 +929,93 @@ fn root_span_hint_uses_full_window_for_partial_secret() {
 }
 
 #[test]
+fn secret_extraction_explicit_group0_overrides_group1() {
+    // When secret_group is explicitly set to 0, it should use the full match
+    // even if group 1 exists and is non-empty. This is useful for rules where
+    // capture groups exist for other purposes (e.g., GUID repetition in URLs).
+    const ANCHORS: &[&[u8]] = &[b"TOK_"];
+    let rule = RuleSpec {
+        name: "explicit-group0",
+        anchors: ANCHORS,
+        radius: 16,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        secret_group: Some(0), // Explicitly use full match
+        // Pattern: TOK_<secret>_END where <secret> would normally be group 1
+        re: Regex::new(r"TOK_([A-Za-z0-9]{8})_END").unwrap(),
+    };
+    let eng = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let hay = b"prefix TOK_Secret12_END suffix";
+    let hits = scan_chunk_findings(&eng, hay);
+    assert!(
+        hits.iter().any(|h| h.rule == "explicit-group0"),
+        "expected finding for explicit-group0 rule"
+    );
+
+    let hit = hits.iter().find(|h| h.rule == "explicit-group0").unwrap();
+    let secret = &hay[hit.span.clone()];
+    // With secret_group: Some(0), should extract full match, not group 1
+    assert_eq!(
+        secret, b"TOK_Secret12_END",
+        "secret_group: Some(0) should extract full match, not group 1"
+    );
+}
+
+#[test]
+fn secret_extraction_empty_configured_group_falls_back() {
+    // When secret_group points to a group that matches empty, fall back to
+    // group 1 or full match (same as empty group 1 behavior).
+    const ANCHORS: &[&[u8]] = &[b"CFG_"];
+    let rule = RuleSpec {
+        name: "empty-configured-group",
+        anchors: ANCHORS,
+        radius: 16,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        secret_group: Some(2), // Points to group 2 which can be empty
+        // Pattern: CFG_<prefix>_<optional> - group 1 is prefix, group 2 is optional suffix
+        re: Regex::new(r"CFG_([a-z0-9]{8})([A-Z]*)").unwrap(),
+    };
+    let eng = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Input where group 2 is empty (no uppercase letters after the prefix)
+    let hay = b"prefix CFG_secret12 suffix";
+    let hits = scan_chunk_findings(&eng, hay);
+    assert!(
+        hits.iter().any(|h| h.rule == "empty-configured-group"),
+        "expected finding for empty-configured-group rule"
+    );
+
+    let hit = hits
+        .iter()
+        .find(|h| h.rule == "empty-configured-group")
+        .unwrap();
+    let secret = &hay[hit.span.clone()];
+    // Group 2 is empty, so should fall back to group 1
+    assert_eq!(
+        secret, b"secret12",
+        "when configured group is empty, should fall back to group 1"
+    );
+}
+
+#[test]
 fn anchor_policy_prefers_derived_over_manual() {
     const MANUAL: &[&[u8]] = &[b"bar"];
     let rule = RuleSpec {
@@ -1227,14 +1318,15 @@ fn scan_rules_reference(
                 Variant::Raw => {
                     for w in windows {
                         let window = &buf[w.clone()];
-                        for rm in rule.re.find_iter(window) {
+                        for caps in rule.re.captures_iter(window) {
+                            let full_match = caps.get(0).expect("group 0 always exists");
                             if let Some(spec) = rule.entropy.as_ref() {
                                 let ent = EntropyCompiled {
                                     min_bits_per_byte: spec.min_bits_per_byte,
                                     min_len: spec.min_len,
                                     max_len: spec.max_len,
                                 };
-                                let mbytes = &window[rm.start()..rm.end()];
+                                let mbytes = &window[full_match.start()..full_match.end()];
                                 if !entropy_gate_passes(
                                     &ent,
                                     mbytes,
@@ -1244,7 +1336,10 @@ fn scan_rules_reference(
                                     continue;
                                 }
                             }
-                            let span = (w.start + rm.start())..(w.start + rm.end());
+                            // Extract secret span to match production behavior.
+                            let (secret_start, secret_end) =
+                                extract_secret_span(&caps, rule.secret_group);
+                            let span = (w.start + secret_start)..(w.start + secret_end);
                             out.insert(FindingKey {
                                 rule: rule.name,
                                 span,
@@ -1300,15 +1395,16 @@ fn scan_rules_reference(
                             le: matches!(variant, Variant::Utf16Le),
                         });
 
-                        for rm in rule.re.find_iter(&decoded) {
+                        for caps in rule.re.captures_iter(&decoded) {
+                            let full_match = caps.get(0).expect("group 0 always exists");
                             if let Some(spec) = rule.entropy.as_ref() {
                                 let ent = EntropyCompiled {
                                     min_bits_per_byte: spec.min_bits_per_byte,
                                     min_len: spec.min_len,
                                     max_len: spec.max_len,
                                 };
-                                let span = rm.start()..rm.end();
-                                let mbytes = &decoded[span.clone()];
+                                let span = full_match.start()..full_match.end();
+                                let mbytes = &decoded[span];
                                 if !entropy_gate_passes(
                                     &ent,
                                     mbytes,
@@ -1318,7 +1414,10 @@ fn scan_rules_reference(
                                     continue;
                                 }
                             }
-                            let span = rm.start()..rm.end();
+                            // Extract secret span to match production behavior.
+                            let (secret_start, secret_end) =
+                                extract_secret_span(&caps, rule.secret_group);
+                            let span = secret_start..secret_end;
                             out.insert(FindingKey {
                                 rule: rule.name,
                                 span,
@@ -1883,8 +1982,10 @@ fn validate_findings(engine: &Engine, root: &[u8], findings: &[Finding]) -> Resu
             .ok_or_else(|| format!("rule not found: {}", finding.rule))?;
 
         let mut matched = false;
-        for rm in rule.re.find_iter(&buf) {
-            if rm.start() == finding.span.start && rm.end() == finding.span.end {
+        for caps in rule.re.captures_iter(&buf) {
+            // Extract secret span to match production behavior.
+            let (secret_start, secret_end) = extract_secret_span(&caps, rule.secret_group);
+            if secret_start == finding.span.start && secret_end == finding.span.end {
                 matched = true;
                 break;
             }
@@ -2040,6 +2141,70 @@ fn utf16_overlap_accounts_for_scaled_radius() {
         good.iter()
             .any(|rec| engine.rule_name(rec.rule_id) == "utf16-boundary"),
         "expected match with required_overlap"
+    );
+}
+
+/// Regression test: Verify deduplication works when a secret is entirely
+/// within the overlap prefix but the window extends past the chunk boundary.
+///
+/// Bug: Commit f415259 changed root_span_hint fallback from match span to
+/// window span, causing drop_prefix_findings() to keep findings it should drop.
+#[test]
+fn test_chunked_scan_dedup_secret_in_overlap_with_wide_window() {
+    const ANCHORS: &[&[u8]] = &[b"KEY_"];
+
+    let rule = RuleSpec {
+        name: "dedup-regression",
+        anchors: ANCHORS,
+        radius: 128, // Wide window radius to extend past chunk boundary
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        secret_group: None,
+        re: Regex::new(r"KEY_([A-Za-z0-9]{16})").unwrap(),
+    };
+
+    let eng = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Buffer layout:
+    //   [padding][KEY_0123456789ABCDEF][more_padding........]
+    //   ^0       ^64                  ^84                   ^256
+    //
+    // Chunk boundary at offset 128:
+    //   Chunk 0: bytes [0, 192), base_offset=0
+    //   Chunk 1: bytes [64, 256), base_offset=64, new_bytes_start=128
+    //
+    // Secret at [64, 84) is entirely in overlap [64, 128)
+    // Window with radius=128 will extend to ~196, past boundary 128
+    //
+    // Expected: 1 finding (deduped correctly)
+    // Bug: 2 findings (window span causes false keep)
+
+    let mut buf = vec![b'x'; 256];
+    buf[64..84].copy_from_slice(b"KEY_0123456789ABCDEF");
+
+    let chunk_size = 128;
+    let overlap = 64;
+    let findings = scan_in_chunks_with_overlap(&eng, &buf, chunk_size, overlap);
+
+    // Count findings for this specific secret
+    let dedup_keys: HashSet<_> = findings
+        .iter()
+        .map(|f| (f.rule_id, f.span_start, f.span_end))
+        .collect();
+
+    assert_eq!(
+        dedup_keys.len(),
+        1,
+        "Expected 1 unique finding, got {} (duplicate emitted due to window-based root_hint)",
+        dedup_keys.len()
     );
 }
 

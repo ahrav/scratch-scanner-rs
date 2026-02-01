@@ -2417,7 +2417,9 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             must_contain: None,
             keywords_any: Some(&[b"webhook.office.com", b"webhookb2", b"incomingwebhook"]),
             entropy: None,
-            // Capture groups are for GUID repetition; the full URL is the secret.
+            // Capture groups 1-3 are for GUID repetition; we want the full URL as the
+            // secret, so we explicitly set secret_group to 0 to override the default
+            // group-1 preference.
             secret_group: Some(0),
             re: build_regex(
                 r"https://[a-z0-9]+\.webhook\.office\.com/webhookb2/[a-z0-9]{8}-([a-z0-9]{4}-){3}[a-z0-9]{12}@[a-z0-9]{8}-([a-z0-9]{4}-){3}[a-z0-9]{12}/IncomingWebhook/[a-z0-9]{32}/[a-z0-9]{8}-([a-z0-9]{4}-){3}[a-z0-9]{12}",
