@@ -59,12 +59,6 @@ pub(super) const STREAM_DECODE_CHUNK_BYTES: usize = 16 * 1024;
 // Transform: URL percent
 // --------------------------
 
-/// Internal error used to signal output-size violations in tests.
-#[derive(Debug)]
-enum UrlDecodeError {
-    OutputTooLarge,
-}
-
 fn is_hex(b: u8) -> bool {
     b.is_ascii_hexdigit()
 }
@@ -179,11 +173,6 @@ const fn build_b64_decode_table() -> [u8; 256] {
 
 static B64_DECODE: [u8; 256] = build_b64_decode_table();
 
-#[inline]
-fn is_urlish(b: u8) -> bool {
-    (BYTE_CLASS[b as usize] & URLISH) != 0
-}
-
 /// Target for span collection, allowing reuse of `Vec` or `ScratchVec`.
 ///
 /// Spans are half-open byte ranges (`start..end`) into the input buffer.
@@ -234,14 +223,6 @@ impl UrlSpanStream {
         }
     }
 
-    pub(super) fn reset(&mut self) {
-        self.in_run = false;
-        self.start = 0;
-        self.run_len = 0;
-        self.triggers = 0;
-        self.done = false;
-    }
-
     /// Feed the next chunk of bytes into the scanner.
     ///
     /// `base_offset` must be the absolute offset of `chunk[0]` in the original
@@ -276,9 +257,9 @@ impl UrlSpanStream {
             }
 
             if urlish {
-                self.run_len = self.run_len.saturating_add(1);
+                self.run_len += 1;
                 if b == b'%' || (self.plus_to_space && b == b'+') {
-                    self.triggers = self.triggers.saturating_add(1);
+                    self.triggers += 1;
                 }
                 i += 1;
 
@@ -362,16 +343,6 @@ impl Base64SpanStream {
         }
     }
 
-    pub(super) fn reset(&mut self) {
-        self.in_run = false;
-        self.start = 0;
-        self.run_len = 0;
-        self.b64_chars = 0;
-        self.have_b64 = false;
-        self.last_b64 = 0;
-        self.done = false;
-    }
-
     /// Feed the next chunk of bytes into the scanner.
     ///
     /// `base_offset` must be the absolute offset of `chunk[0]` in the original
@@ -414,9 +385,9 @@ impl Base64SpanStream {
             }
 
             if allowed {
-                self.run_len = self.run_len.saturating_add(1);
+                self.run_len += 1;
                 if (flags & B64_CHAR) != 0 {
-                    self.b64_chars = self.b64_chars.saturating_add(1);
+                    self.b64_chars += 1;
                     self.last_b64 = abs;
                     self.have_b64 = true;
                 }
@@ -506,7 +477,7 @@ impl SpanSink for ScratchVec<SpanU32> {
     }
 
     fn push(&mut self, span: Range<usize>) {
-        ScratchVec::push(self, SpanU32::new(span.start, span.end));
+        ScratchVec::push(self, SpanU32::new_no_hint(span.start, span.end));
     }
 }
 
@@ -601,7 +572,7 @@ fn stream_decode_url_percent(
     input: &[u8],
     plus_to_space: bool,
     mut on_bytes: impl FnMut(&[u8]) -> ControlFlow<()>,
-) -> Result<(), UrlDecodeError> {
+) {
     fn flush_buf(
         out: &mut [u8],
         n: &mut usize,
@@ -645,15 +616,18 @@ fn stream_decode_url_percent(
         if n >= out.len() - 4 {
             match flush_buf(&mut out, &mut n, &mut on_bytes) {
                 ControlFlow::Continue(()) => {}
-                ControlFlow::Break(()) => return Ok(()),
+                ControlFlow::Break(()) => return,
             }
         }
     }
 
-    match flush_buf(&mut out, &mut n, &mut on_bytes) {
-        ControlFlow::Continue(()) => Ok(()),
-        ControlFlow::Break(()) => Ok(()),
-    }
+    let _ = flush_buf(&mut out, &mut n, &mut on_bytes);
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+enum UrlTestError {
+    OutputTooLarge,
 }
 
 #[cfg(test)]
@@ -661,7 +635,7 @@ fn decode_url_percent_to_vec(
     input: &[u8],
     plus_to_space: bool,
     max_out: usize,
-) -> Result<Vec<u8>, UrlDecodeError> {
+) -> Result<Vec<u8>, UrlTestError> {
     let mut out = Vec::with_capacity(input.len().min(max_out));
     let mut too_large = false;
 
@@ -672,10 +646,10 @@ fn decode_url_percent_to_vec(
         }
         out.extend_from_slice(chunk);
         ControlFlow::Continue(())
-    })?;
+    });
 
     if too_large {
-        return Err(UrlDecodeError::OutputTooLarge);
+        return Err(UrlTestError::OutputTooLarge);
     }
     Ok(out)
 }
@@ -687,10 +661,9 @@ fn decode_url_percent_to_vec(
 /// Internal error used to signal decode failures in tests.
 #[derive(Debug)]
 enum Base64DecodeError {
-    InvalidByte(u8),
+    InvalidByte,
     InvalidPadding,
     TruncatedQuantum,
-    OutputTooLarge,
 }
 
 /// Finds base64-ish spans within `hay` and appends them to `spans`.
@@ -849,7 +822,7 @@ fn stream_decode_base64(
         // B64_INVALID (0xFF) for invalid bytes. Eliminates the match-per-byte overhead.
         let v = B64_DECODE[b as usize];
         if v == B64_INVALID {
-            return Err(Base64DecodeError::InvalidByte(b));
+            return Err(Base64DecodeError::InvalidByte);
         }
 
         // Once padding is seen, only trailing whitespace is allowed.
@@ -945,7 +918,13 @@ fn stream_decode_base64(
 }
 
 #[cfg(test)]
-fn decode_base64_to_vec(input: &[u8], max_out: usize) -> Result<Vec<u8>, Base64DecodeError> {
+#[derive(Debug)]
+enum Base64TestError {
+    OutputTooLarge,
+}
+
+#[cfg(test)]
+fn decode_base64_to_vec(input: &[u8], max_out: usize) -> Result<Vec<u8>, Base64TestError> {
     let mut out = Vec::with_capacity((input.len() * 3) / 4);
     let mut too_large = false;
 
@@ -956,10 +935,11 @@ fn decode_base64_to_vec(input: &[u8], max_out: usize) -> Result<Vec<u8>, Base64D
         }
         out.extend_from_slice(chunk);
         ControlFlow::Continue(())
-    })?;
+    })
+    .map_err(|_| Base64TestError::OutputTooLarge)?; // Map internal errors to generic failure for this helper
 
     if too_large {
-        return Err(Base64DecodeError::OutputTooLarge);
+        return Err(Base64TestError::OutputTooLarge);
     }
     Ok(out)
 }
@@ -1014,7 +994,8 @@ pub(super) fn stream_decode(
 ) -> Result<(), ()> {
     match tc.id {
         TransformId::UrlPercent => {
-            stream_decode_url_percent(input, tc.plus_to_space, on_bytes).map_err(|_| ())
+            stream_decode_url_percent(input, tc.plus_to_space, on_bytes);
+            Ok(())
         }
         TransformId::Base64 => stream_decode_base64(input, on_bytes).map_err(|_| ()),
     }
@@ -1044,7 +1025,7 @@ pub(super) fn decode_to_vec(
 #[cfg(feature = "bench")]
 pub fn bench_stream_decode_url(input: &[u8], plus_to_space: bool) -> usize {
     let mut decoded_bytes = 0usize;
-    let _ = stream_decode_url_percent(input, plus_to_space, |chunk| {
+    stream_decode_url_percent(input, plus_to_space, |chunk| {
         decoded_bytes += chunk.len();
         ControlFlow::Continue(())
     });

@@ -31,8 +31,6 @@ use std::ffi::CStr;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
-#[cfg(unix)]
 use std::os::unix::io::RawFd;
 
 /// Default chunk size for async IO scanners (bytes).
@@ -94,6 +92,7 @@ impl Default for AsyncIoConfig {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn align_up(value: usize, align: usize) -> usize {
     assert!(align.is_power_of_two());
     (value + (align - 1)) & !(align - 1)
@@ -104,6 +103,7 @@ fn align_down(value: usize, align: usize) -> usize {
     value & !(align - 1)
 }
 
+#[cfg(target_os = "linux")]
 fn align_down_u64(value: u64, align: u64) -> u64 {
     assert!(align.is_power_of_two());
     value & !(align - 1)
@@ -549,6 +549,7 @@ impl Walker {
     }
 }
 
+#[cfg(not(unix))]
 fn dev_inode(meta: &std::fs::Metadata) -> (u64, u64) {
     #[cfg(unix)]
     {

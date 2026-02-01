@@ -164,9 +164,6 @@ mod aio {
 /// instance for multiple scans to avoid allocations.
 pub struct MacosAioScanner {
     engine: Arc<Engine>,
-    config: AsyncIoConfig,
-    overlap: usize,
-    payload_off: usize,
     pool: BufferPool,
     reader: AioFileReader,
     scratch: ScanScratch,
@@ -222,9 +219,6 @@ impl MacosAioScanner {
 
         Ok(Self {
             engine,
-            config,
-            overlap,
-            payload_off,
             pool,
             reader,
             scratch,
@@ -986,10 +980,10 @@ mod tests {
 
         let mut reader = AioFileReader::new(
             &scanner.pool,
-            scanner.payload_off,
-            scanner.overlap,
-            scanner.config.chunk_size,
-            scanner.config.queue_depth,
+            scanner.reader.payload_off,
+            scanner.reader.overlap,
+            scanner.reader.chunk_size,
+            scanner.reader.queue_depth as u32,
         )?;
         reader.reset_for_file(file_id, &path, data.len() as u64)?;
 
@@ -1011,16 +1005,16 @@ mod tests {
         let mut tail: Vec<u8> = Vec::new();
         let mut offset = 0usize;
         while offset < data.len() {
-            let end = (offset + scanner.config.chunk_size).min(data.len());
+            let end = (offset + scanner.reader.chunk_size).min(data.len());
             let payload = &data[offset..end];
             let mut chunk = Vec::with_capacity(tail.len() + payload.len());
             chunk.extend_from_slice(&tail);
             chunk.extend_from_slice(payload);
             expected.push(chunk.clone());
 
-            let keep = scanner.overlap.min(chunk.len());
+            let keep = scanner.reader.overlap.min(chunk.len());
             tail = chunk[chunk.len() - keep..].to_vec();
-            offset = offset.saturating_add(scanner.config.chunk_size);
+            offset = offset.saturating_add(scanner.reader.chunk_size);
         }
 
         assert_eq!(chunks, expected);
@@ -1045,10 +1039,10 @@ mod tests {
         let scanner = MacosAioScanner::new(engine, config)?;
         let mut reader = AioFileReader::new(
             &scanner.pool,
-            scanner.payload_off,
-            scanner.overlap,
-            scanner.config.chunk_size,
-            scanner.config.queue_depth,
+            scanner.reader.payload_off,
+            scanner.reader.overlap,
+            scanner.reader.chunk_size,
+            scanner.reader.queue_depth as u32,
         )?;
         reader.reset_for_file(FileId(0), &path, data.len() as u64)?;
 
@@ -1078,10 +1072,10 @@ mod tests {
         let scanner = MacosAioScanner::new(engine, config)?;
         let mut reader = AioFileReader::new(
             &scanner.pool,
-            scanner.payload_off,
-            scanner.overlap,
-            scanner.config.chunk_size,
-            scanner.config.queue_depth,
+            scanner.reader.payload_off,
+            scanner.reader.overlap,
+            scanner.reader.chunk_size,
+            scanner.reader.queue_depth as u32,
         )?;
         reader.reset_for_file(FileId(0), &path, data.len() as u64)?;
 
@@ -1115,10 +1109,10 @@ mod tests {
         let scanner = MacosAioScanner::new(engine, config)?;
         let mut reader = AioFileReader::new(
             &scanner.pool,
-            scanner.payload_off,
-            scanner.overlap,
-            scanner.config.chunk_size,
-            scanner.config.queue_depth,
+            scanner.reader.payload_off,
+            scanner.reader.overlap,
+            scanner.reader.chunk_size,
+            scanner.reader.queue_depth as u32,
         )?;
         reader.reset_for_file(FileId(0), &path, data.len() as u64)?;
 
@@ -1156,10 +1150,10 @@ mod tests {
         let scanner = MacosAioScanner::new(engine, config)?;
         let mut reader = AioFileReader::new(
             &scanner.pool,
-            scanner.payload_off,
-            scanner.overlap,
-            scanner.config.chunk_size,
-            scanner.config.queue_depth,
+            scanner.reader.payload_off,
+            scanner.reader.overlap,
+            scanner.reader.chunk_size,
+            scanner.reader.queue_depth as u32,
         )?;
         reader.reset_for_file(FileId(0), &path, data.len() as u64)?;
 

@@ -99,9 +99,14 @@ struct EntropyCompiled {
     max_len: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RuleMeta {
+    name: &'static str,
+    validator: ValidatorKind,
+}
+
 #[derive(Clone, Debug)]
 struct RuleCompiled {
-    name: &'static str,
     radius: usize,
     must_contain: Option<&'static [u8]>,
 
@@ -114,6 +119,9 @@ struct RuleCompiled {
     two_phase: Option<TwoPhaseCompiled>,
 }
 ```
+
+`RuleMeta` is stored alongside `RuleCompiled` in the engine so reporting and
+validator metadata stay off the hot scan path.
 
 ### 3) Entropy scratch (no allocations)
 
@@ -255,7 +263,6 @@ fn compile_rule(spec: &RuleSpec) -> RuleCompiled {
     });
 
     RuleCompiled {
-        name: spec.name,
         radius: spec.radius,
         must_contain: spec.must_contain,
         keywords,

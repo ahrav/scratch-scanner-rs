@@ -21,7 +21,7 @@
 use crate::api::*;
 use crate::b64_yara_gate::{Base64YaraGate, Base64YaraGateConfig, PaddingPolicy, WhitespacePolicy};
 use crate::regex2anchor::{
-    compile_trigger_plan, AnchorDeriveConfig, ResidueGatePlan, TriggerPlan, UnfilterableReason,
+    compile_trigger_plan, AnchorDeriveConfig, TriggerPlan, UnfilterableReason,
 };
 use ahash::AHashMap;
 #[cfg(feature = "stats")]
@@ -183,8 +183,6 @@ pub struct Engine {
     // purely to skip wasteful span scans/decodes when no anchor could possibly appear.
     pub(super) b64_gate: Option<Base64YaraGate>,
 
-    // Residue gates for rules without anchors (pass 2).
-    residue_rules: Vec<(usize, ResidueGatePlan)>,
     // Rules that cannot be given a sound prefilter gate under the policy.
     unfilterable_rules: Vec<(usize, UnfilterableReason)>,
     #[cfg(feature = "stats")]
@@ -193,9 +191,6 @@ pub struct Engine {
     #[cfg(feature = "stats")]
     pub(super) vs_stats: VectorscanCounters,
 
-    /// Maximum byte length of any single anchor pattern.
-    /// Used for buffer sizing during anchor compilation.
-    pub(super) max_anchor_pat_len: usize,
     /// True if any rule has UTF-16 anchor variants compiled.
     /// Controls whether UTF-16 scanning paths are active.
     pub(super) has_utf16_anchors: bool,
@@ -303,7 +298,6 @@ impl Engine {
             AHashMap::with_capacity(rules.len().saturating_mul(3).max(16));
         let mut pat_map_utf16: AHashMap<Vec<u8>, Vec<Target>> =
             AHashMap::with_capacity(rules.len().saturating_mul(2).max(16));
-        let mut residue_rules: Vec<(usize, ResidueGatePlan)> = Vec::with_capacity(rules.len());
         let mut unfilterable_rules: Vec<(usize, UnfilterableReason)> =
             Vec::with_capacity(rules.len());
         #[cfg(feature = "stats")]
@@ -468,8 +462,7 @@ impl Engine {
                         );
                     }
                 }
-                TriggerPlan::Residue { gate } => {
-                    residue_rules.push((rid, gate));
+                TriggerPlan::Residue { gate: _ } => {
                     #[cfg(feature = "stats")]
                     {
                         anchor_plan_stats.residue_rules =
@@ -489,11 +482,11 @@ impl Engine {
             }
         }
 
-        let (anchor_patterns_all, _pat_targets_all, _pat_offsets_all) =
-            map_to_patterns(pat_map_all);
+        let (anchor_patterns_all, pat_targets_all, pat_offsets_all) = map_to_patterns(pat_map_all);
         let (anchor_patterns_utf16, pat_targets_utf16, pat_offsets_utf16) =
             map_to_patterns(pat_map_utf16);
         let has_utf16_anchors = !anchor_patterns_utf16.is_empty();
+        let _has_any_anchors = !anchor_patterns_all.is_empty();
         let max_anchor_pat_len = anchor_patterns_all
             .iter()
             .map(|p| p.len())
@@ -554,13 +547,81 @@ impl Engine {
             .max()
             .unwrap_or(0);
 
+        // Compute per-rule flags for whether to include raw regex in prefilter DB.
+        // Rules with strong literal anchors (5+ bytes, all anchors) can skip raw regex
+        // prefiltering and rely on anchor patterns instead. This reduces Vectorscan DB
+        // size and improves clean-data throughput.
+        //
+        // We require 5+ bytes (not 4) to be conservative:
+        // - Short anchors may have case-sensitivity mismatches with the regex
+        // - Longer anchors are more likely to be unique and correctly case-matched
+        //
+        // We also keep raw prefilter for case-insensitive regexes since anchor patterns
+        // are byte-exact and won't match different-case variants.
+        let use_raw_prefilter: Vec<bool> = rules
+            .iter()
+            .map(|r| {
+                // Rule needs raw prefilter if:
+                // 1. No anchors at all
+                if r.anchors.is_empty() {
+                    return true;
+                }
+                // 2. Regex is case-insensitive (anchors are byte-exact, won't match)
+                let re_str = r.re.as_str();
+                if re_str.starts_with("(?i)") || re_str.contains("(?i:") {
+                    return true;
+                }
+                // 3. Any anchor is shorter than 5 bytes (weak anchor)
+                !r.anchors.iter().all(|a| a.len() >= 5)
+            })
+            .collect();
+
+        // Build prefilter anchor patterns: include UTF-16 patterns (as before) plus
+        // raw patterns ONLY for rules that skip raw regex prefiltering.
+        // This ensures rules with strong anchors can still be found without their
+        // regex in the prefilter DB, while not adding redundant raw anchors for
+        // rules that already have their regex compiled.
+        let mut pat_map_prefilter: AHashMap<Vec<u8>, Vec<Target>> =
+            AHashMap::with_capacity(pat_targets_utf16.len().saturating_add(rules.len()));
+
+        // Add all UTF-16 patterns (same as before).
+        for (pat, targets) in anchor_patterns_utf16.iter().zip(
+            pat_offsets_utf16
+                .windows(2)
+                .map(|w| &pat_targets_utf16[w[0] as usize..w[1] as usize]),
+        ) {
+            for &t in targets {
+                add_pat_owned(&mut pat_map_prefilter, pat.clone(), t);
+            }
+        }
+
+        // Add raw patterns only for rules that skip raw regex prefiltering.
+        for (pat, targets) in anchor_patterns_all.iter().zip(
+            pat_offsets_all
+                .windows(2)
+                .map(|w| &pat_targets_all[w[0] as usize..w[1] as usize]),
+        ) {
+            for &t in targets {
+                let rid = t.rule_id();
+                let var = t.variant();
+                // Only add raw variant patterns for rules that skip raw regex.
+                if var == Variant::Raw && !use_raw_prefilter[rid] {
+                    add_pat_owned(&mut pat_map_prefilter, pat.clone(), t);
+                }
+            }
+        }
+
+        let (anchor_patterns_prefilter, pat_targets_prefilter, pat_offsets_prefilter) =
+            map_to_patterns(pat_map_prefilter);
+        let has_prefilter_anchors = !anchor_patterns_prefilter.is_empty();
+
         // Required: if the DB can't be built (e.g. regex incompatibility),
         // fail fast rather than falling back to full-buffer scans.
-        let anchor_input = if tuning.scan_utf16_variants && has_utf16_anchors {
+        let anchor_input = if has_prefilter_anchors {
             Some(AnchorInput {
-                patterns: &anchor_patterns_utf16,
-                pat_targets: &pat_targets_utf16,
-                pat_offsets: &pat_offsets_utf16,
+                patterns: &anchor_patterns_prefilter,
+                pat_targets: &pat_targets_prefilter,
+                pat_offsets: &pat_offsets_prefilter,
                 seed_radius_raw: &raw_seed_radius_bytes,
                 seed_radius_utf16: &utf16_seed_radius_bytes,
             })
@@ -568,7 +629,7 @@ impl Engine {
             None
         };
         let vs = Some(
-            VsPrefilterDb::try_new(&rules, &tuning, anchor_input)
+            VsPrefilterDb::try_new(&rules, &tuning, anchor_input, Some(&use_raw_prefilter))
                 .expect("vectorscan prefilter db build failed (fallback disabled)"),
         );
         let max_regex_width = vs
@@ -657,13 +718,11 @@ impl Engine {
             vs_stream,
             vs_gate,
             b64_gate,
-            residue_rules,
             unfilterable_rules,
             #[cfg(feature = "stats")]
             anchor_plan_stats,
             #[cfg(feature = "stats")]
             vs_stats: VectorscanCounters::default(),
-            max_anchor_pat_len,
             has_utf16_anchors,
             max_window_diameter_bytes,
             max_prefilter_width,
@@ -1093,9 +1152,3 @@ pub fn bench_find_spans_into(
 
 #[cfg(feature = "bench")]
 pub use super::transform::{bench_stream_decode_base64, bench_stream_decode_url};
-
-#[cfg(feature = "bench")]
-pub use super::validator::{
-    bench_is_word_byte, bench_tail_matches_charset, bench_validate_aws_access_key,
-    bench_validate_prefix_bounded, bench_validate_prefix_fixed,
-};

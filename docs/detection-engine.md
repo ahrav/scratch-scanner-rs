@@ -224,13 +224,21 @@ These gates are designed to be **local and bounded**:
 
 | Parameter | Default | Purpose |
 |-----------|---------|---------|
-| `merge_gap` | 64 | Window merge gap (bytes) |
-| `max_windows_per_rule_variant` | 16 | Max windows before pressure coalescing |
+| `merge_gap` | 64 | Merge adjacent windows within this byte gap |
+| `max_windows_per_rule_variant` | 16 | Max windows per (rule, variant) before pressure coalescing |
 | `pressure_gap_start` | 128 | Starting gap for pressure coalescing |
-| `max_anchor_hits_per_rule_variant` | 2048 | Hard cap on anchor hits |
-| `max_utf16_decoded_bytes_per_window` | 64KB | UTF-16 decode output limit |
-| `pending_window_horizon_bytes` | max_radius + chunk_size | TimingWheel horizon bound |
-| `pending_window_cap` | rules × 3 × max_windows | TimingWheel node pool capacity |
+| `max_anchor_hits_per_rule_variant` | 2048 | Cap on raw anchor hits before collapsing |
+| `max_utf16_decoded_bytes_per_window` | 64 KiB | UTF-16 decode output limit per window |
+| `max_transform_depth` | 3 | Max nested decode steps (root + transforms) |
+| `max_total_decode_output_bytes` | 512 KiB | Global decoded output budget per scan |
+| `max_work_items` | 256 | Cap on queued decode work items per scan |
+| `max_findings_per_chunk` | 8192 | Hard cap on findings per chunk |
+| `scan_utf16_variants` | true | Enable UTF-16 anchor variants |
+| `raw_prefilter_mode` | `RegexAndAnchors` | Raw prefilter policy (regex+anchors vs anchor-only for anchored rules) |
+
+Derived (non-config) limits used by streaming decode:
+- `pending_window_horizon_bytes = max_window_radius + STREAM_DECODE_CHUNK_BYTES`
+- `pending_window_cap = rules × 3 × max_windows_per_rule_variant`
 
 ## Stream Decode Window Scheduling
 
@@ -363,3 +371,12 @@ FindingRec {
     step_id: StepId(0),      // Decode provenance chain
 }
 ```
+
+## Related Documentation
+
+| Document | Description |
+|----------|-------------|
+| [Throughput Analysis](./throughput_analysis.md) | Layer-by-layer performance metrics and optimization history |
+| [Throughput Bottleneck Analysis](./throughput_bottleneck_analysis.md) | Deep dive into the two primary bottlenecks and actionable fixes |
+| [Transform Chain](./transform-chain.md) | URL/Base64 transform gating and decode flow |
+| [Memory Management](./memory-management.md) | Buffer pools, scratch allocation, and memory budgets |

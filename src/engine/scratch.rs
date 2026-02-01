@@ -14,7 +14,7 @@ use crate::api::Base64DecodeStats;
 
 use super::decode_state::{DecodeSlab, StepArena};
 use super::helpers::pow2_at_least;
-use super::hit_pool::{HitAccPool, RawHsMatch, SpanU32};
+use super::hit_pool::{HitAccPool, SpanU32};
 use super::transform::STREAM_DECODE_CHUNK_BYTES;
 use super::vectorscan_prefilter::{VsScratch, VsStreamWindow};
 use super::work_items::{PendingDecodeSpan, PendingWindow, SpanStreamEntry, WorkItem};
@@ -128,8 +128,6 @@ pub struct ScanScratch {
     pub(super) windows: ScratchVec<SpanU32>, // Merged windows for a pair.
     pub(super) expanded: ScratchVec<SpanU32>, // Expanded windows for two-phase rules.
     pub(super) spans: ScratchVec<SpanU32>, // Transform span candidates.
-    /// Raw Vectorscan regex matches captured for direct validation.
-    pub(super) raw_hs_matches: Vec<RawHsMatch>,
     /// Decode provenance arena.
     ///
     /// Stores parent-linked decode steps so findings can reconstruct their
@@ -225,7 +223,6 @@ impl ScanScratch {
             pending_spans: Vec::with_capacity(max_spans.max(16)),
             span_streams: Vec::with_capacity(engine.transforms.len()),
             tmp_findings: Vec::with_capacity(max_findings),
-            raw_hs_matches: Vec::new(),
             stream_hit_counts: vec![0u32; rules_len.saturating_mul(3)],
             stream_hit_touched: ScratchVec::with_capacity(rules_len.saturating_mul(3))
                 .expect("scratch stream_hit_touched allocation failed"),
@@ -398,7 +395,6 @@ impl ScanScratch {
         self.windows.clear();
         self.expanded.clear();
         self.spans.clear();
-        self.raw_hs_matches.clear();
 
         let expected_pairs = engine.rules.len().saturating_mul(3);
         let max_hits_u32 =

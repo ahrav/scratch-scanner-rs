@@ -27,3 +27,4 @@ fuzz/Cargo.lock
 #.idea/
 
 .DS_Store
+.worktrees/

@@ -38,3 +38,15 @@ After modifying Rust code, ALWAYS run these steps:
 - `cargo build` / `cargo test`
 - `cargo test --features stdx-proptest` for property tests
 - Benchmarks in `benches/` directory
+
+## Rule Optimization Workflow
+After modifying rules in `src/gitleaks_rules.rs`:
+1. Run `cargo test` to verify no regressions
+2. Build release: `RUSTFLAGS="-C target-cpu=native" cargo build --release`
+3. Benchmark against test repos: `./target/release/scanner-rs ../linux ../RustyPixels ../gitleaks ../tigerbeetle ../trufflehog ../kingfisher`
+4. Compare throughput/findings against baseline
+
+## Gitleaks Rules Patterns
+- Add inline comments for rules with non-obvious anchor/keyword choices (see vault, sourcegraph rules)
+- Avoid generic patterns like `[a-fA-F0-9]{40}` that match git SHAs
+- Prefer structured prefixes (e.g., `sgp_`, `hvs.`) over keyword anchors like service names

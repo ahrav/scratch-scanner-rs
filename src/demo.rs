@@ -98,6 +98,5 @@ pub fn demo_tuning() -> Tuning {
         max_work_items: 256,
         max_findings_per_chunk: 8192,
         scan_utf16_variants: true,
-        vs_direct_raw_regex: false,
     }
 }

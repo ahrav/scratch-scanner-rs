@@ -13,7 +13,6 @@ use std::ops::Range;
 
 use super::rule_repr::Variant;
 use super::transform::{Base64SpanStream, UrlSpanStream};
-use crate::api::TransformMode;
 
 /// Reference to a buffer being scanned.
 ///
@@ -64,6 +63,10 @@ pub(super) struct PendingDecodeSpan {
 /// Offsets are in decoded-byte space (relative to the stream) and are
 /// half-open: `[lo, hi)`.
 ///
+/// # Fields
+/// - `anchor_hint`: Vectorscan's `from` match offset in decoded-byte space.
+///   Used to start regex searches near the anchor instead of at window start.
+///
 /// # Ordering
 /// - Ordered by earliest `hi`, then `lo`, then `(rule_id, variant)` so priority
 ///   queues drain windows as soon as their end offset is reached.
@@ -73,6 +76,8 @@ pub(super) struct PendingWindow {
     pub(super) lo: u64,
     pub(super) rule_id: u32,
     pub(super) variant: Variant,
+    /// Anchor hint from Vectorscan's `from` offset.
+    pub(super) anchor_hint: u64,
 }
 
 impl Ord for PendingWindow {
@@ -109,7 +114,6 @@ pub(super) enum SpanStreamState {
 /// - `spans_emitted <= max_spans` for the current buffer.
 pub(super) struct SpanStreamEntry {
     pub(super) transform_idx: usize,
-    pub(super) mode: TransformMode,
     pub(super) state: SpanStreamState,
     pub(super) spans_emitted: usize, // Spans emitted so far for this buffer.
     pub(super) max_spans: usize,     // Per-buffer cap for this transform.

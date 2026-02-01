@@ -32,6 +32,59 @@ use super::helpers::{
 use super::rule_repr::{RuleCompiled, Variant};
 use super::scratch::ScanScratch;
 
+/// Number of bytes to scan backward from the anchor hint position.
+///
+/// This margin accounts for patterns where the anchor may be in the middle
+/// of the match (e.g., backward-looking patterns). 64 bytes is sufficient
+/// for most secret patterns while keeping overhead low.
+const BACK_SCAN_MARGIN: usize = 64;
+
+/// Cheap precheck for rules with assignment-value patterns.
+///
+/// Returns `false` if the regex cannot possibly match because the window lacks
+/// the necessary structure: a separator (`=`, `:`, `>`) followed by a plausible
+/// token (10+ alphanumeric/underscore/hyphen/dot characters).
+///
+/// This is a conservative filter: it only rejects windows where the regex
+/// definitely cannot match, never producing false negatives.
+///
+/// # Performance
+/// O(window.len()) byte scan vs O(regex_complexity × window.len()) for regex.
+#[inline]
+fn has_assignment_value_shape(window: &[u8]) -> bool {
+    // Find any assignment separator. We check for `=`, `:`, and `>` (for `=>`).
+    // The position we find may be part of `=>`, but that's fine for our purpose.
+    let sep_pos = match window
+        .iter()
+        .position(|&b| b == b'=' || b == b':' || b == b'>')
+    {
+        Some(pos) => pos,
+        None => return false,
+    };
+
+    // Check for plausible token run after separator (10+ alnum/underscore/hyphen/dot).
+    let after_sep = &window[sep_pos + 1..];
+
+    // Skip whitespace/quotes/extra separators after the separator.
+    let token_start = after_sep
+        .iter()
+        .position(|&b| !matches!(b, b' ' | b'\t' | b'"' | b'\'' | b'`' | b'=' | b'>'))
+        .unwrap_or(after_sep.len());
+
+    if token_start >= after_sep.len() {
+        return false;
+    }
+
+    // Count consecutive token chars.
+    let token_bytes = &after_sep[token_start..];
+    let token_len = token_bytes
+        .iter()
+        .take_while(|&&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
+        .count();
+
+    token_len >= 10
+}
+
 impl Engine {
     /// Runs a compiled rule against one window and appends findings into `scratch`.
     ///
@@ -42,6 +95,9 @@ impl Engine {
     ///   parent raw span is recorded via `DecodeStep::Utf16Window`.
     /// - `root_hint`, when provided, is expected to be in the same coordinate
     ///   space as `buf`/`w` and is used as the finding root span.
+    /// - `anchor_hint` is the byte offset (in `buf` coordinates) where Vectorscan
+    ///   reported the match start. Regex search starts near this position with
+    ///   a back-scan margin for correctness.
     ///
     /// Errors / edge cases:
     /// - Returns early when gates fail, decode budgets are exhausted, or decoding
@@ -60,6 +116,7 @@ impl Engine {
         base_offset: u64,
         file_id: FileId,
         scratch: &mut ScanScratch,
+        anchor_hint: usize,
     ) {
         match variant {
             Variant::Raw => {
@@ -91,10 +148,25 @@ impl Engine {
                     }
                 }
 
+                // Assignment-shape precheck: skip regex if window lacks required structure.
+                if rule.needs_assignment_shape_check && !has_assignment_value_shape(window) {
+                    return;
+                }
+
+                // Compute search start based on anchor hint with back-scan margin.
+                // Gates still run on full window for correctness, but regex starts near anchor.
+                let hint_in_window = anchor_hint.saturating_sub(w.start);
+                let search_start = hint_in_window.saturating_sub(BACK_SCAN_MARGIN);
+                let search_window = &window[search_start..];
+
                 let entropy = rule.entropy;
-                for rm in rule.re.find_iter(window) {
+                for rm in rule.re.find_iter(search_window) {
+                    // Adjust match offsets back to window coordinates.
+                    let match_start = search_start + rm.start();
+                    let match_end = search_start + rm.end();
+
                     if let Some(ent) = entropy {
-                        let mbytes = &window[rm.start()..rm.end()];
+                        let mbytes = &window[match_start..match_end];
                         // Entropy is evaluated on the *matched* bytes, not the whole window.
                         // This keeps the signal tied to the candidate token itself.
                         if !entropy_gate_passes(
@@ -107,7 +179,7 @@ impl Engine {
                         }
                     }
 
-                    let span_in_buf = (w.start + rm.start())..(w.start + rm.end());
+                    let span_in_buf = (w.start + match_start)..(w.start + match_end);
                     let root_span_hint = root_hint.clone().unwrap_or_else(|| span_in_buf.clone());
 
                     scratch.push_finding(FindingRec {
@@ -195,6 +267,11 @@ impl Engine {
                     }
                 }
 
+                // Assignment-shape precheck on decoded UTF-8 bytes.
+                if rule.needs_assignment_shape_check && !has_assignment_value_shape(decoded) {
+                    return;
+                }
+
                 let endianness = match variant {
                     Variant::Utf16Le => Utf16Endianness::Le,
                     Variant::Utf16Be => Utf16Endianness::Be,
@@ -256,6 +333,8 @@ impl Engine {
     /// - Span offsets in findings are expressed in decoded-stream byte space.
     /// - `root_hint`, when present, is in the same coordinate space as
     ///   `base_offset` and overrides the default root span.
+    /// - `anchor_hint` is the decoded-stream offset where Vectorscan reported the
+    ///   match start. Regex search starts near this position with a back-scan margin.
     ///
     /// # Effects
     /// - Sets `found_any` when any match passes gates.
@@ -274,6 +353,7 @@ impl Engine {
         scratch: &mut ScanScratch,
         dropped: &mut usize,
         found_any: &mut bool,
+        anchor_hint: u64,
     ) {
         if let Some(needle) = rule.must_contain {
             if memmem::find(window, needle).is_none() {
@@ -299,12 +379,27 @@ impl Engine {
             }
         }
 
+        // Assignment-shape precheck: skip regex if window lacks required structure.
+        if rule.needs_assignment_shape_check && !has_assignment_value_shape(window) {
+            return;
+        }
+
+        // Compute search start based on anchor hint with back-scan margin.
+        // Gates still run on full window for correctness, but regex starts near anchor.
+        let hint_in_window = anchor_hint.saturating_sub(window_start) as usize;
+        let search_start = hint_in_window.saturating_sub(BACK_SCAN_MARGIN);
+        let search_window = &window[search_start..];
+
         let max_findings = scratch.max_findings;
         let out = &mut scratch.tmp_findings;
         let entropy = rule.entropy;
-        for rm in rule.re.find_iter(window) {
+        for rm in rule.re.find_iter(search_window) {
+            // Adjust match offsets back to window coordinates.
+            let match_start = search_start + rm.start();
+            let match_end = search_start + rm.end();
+
             if let Some(ent) = entropy {
-                let mbytes = &window[rm.start()..rm.end()];
+                let mbytes = &window[match_start..match_end];
                 if !entropy_gate_passes(
                     &ent,
                     mbytes,
@@ -316,8 +411,8 @@ impl Engine {
             }
 
             *found_any = true;
-            let span_start = window_start.saturating_add(rm.start() as u64) as usize;
-            let span_end = window_start.saturating_add(rm.end() as u64) as usize;
+            let span_start = window_start.saturating_add(match_start as u64) as usize;
+            let span_end = window_start.saturating_add(match_end as u64) as usize;
             let span_in_buf = span_start..span_end;
             let root_span_hint = root_hint.clone().unwrap_or_else(|| span_in_buf.clone());
 
@@ -346,6 +441,9 @@ impl Engine {
     ///   span in decoded-stream byte offsets.
     /// - `root_hint`, when present, is in the same coordinate space as
     ///   `base_offset` and overrides the default root span.
+    /// - `anchor_hint` is provided for API consistency but is not currently used
+    ///   for offset search in UTF-16 path due to coordinate space differences
+    ///   between raw UTF-16 bytes and decoded UTF-8.
     ///
     /// # Effects
     /// - Sets `found_any` when any match passes gates.
@@ -368,6 +466,7 @@ impl Engine {
         scratch: &mut ScanScratch,
         dropped: &mut usize,
         found_any: &mut bool,
+        _anchor_hint: u64,
     ) {
         // Decode this window as UTF-16 and run the same validators on UTF-8 output.
         let remaining = self
@@ -429,6 +528,11 @@ impl Engine {
             }
         }
 
+        // Assignment-shape precheck on decoded UTF-8 bytes.
+        if rule.needs_assignment_shape_check && !has_assignment_value_shape(decoded) {
+            return;
+        }
+
         let endianness = match variant {
             Variant::Utf16Le => Utf16Endianness::Le,
             Variant::Utf16Be => Utf16Endianness::Be,
@@ -479,5 +583,84 @@ impl Engine {
                 *dropped = dropped.saturating_add(1);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_has_assignment_value_shape_with_equals() {
+        // Basic assignment with long token
+        assert!(has_assignment_value_shape(b"api_key=AKIAIOSFODNN7EXAMPLE"));
+        assert!(has_assignment_value_shape(b"token = abcdefghij1234567890"));
+        assert!(has_assignment_value_shape(b"secret=\"longtoken1234\""));
+    }
+
+    #[test]
+    fn test_has_assignment_value_shape_with_colon() {
+        // JSON-style assignment
+        assert!(has_assignment_value_shape(
+            b"\"api_key\": \"AKIAIOSFODNN7EXAMPLE\""
+        ));
+        assert!(has_assignment_value_shape(b"token: abcdefghij1234567890"));
+    }
+
+    #[test]
+    fn test_has_assignment_value_shape_with_arrow() {
+        // Arrow assignment (=> becomes > after =)
+        assert!(has_assignment_value_shape(b"key => longtoken1234567890"));
+        assert!(has_assignment_value_shape(b"secret => AKIAIOSFODNN7EX"));
+    }
+
+    #[test]
+    fn test_has_assignment_value_shape_short_token() {
+        // Token too short (less than 10 chars)
+        assert!(!has_assignment_value_shape(b"key=short"));
+        assert!(!has_assignment_value_shape(b"x: abc"));
+        assert!(!has_assignment_value_shape(b"token = 123456789")); // exactly 9 chars
+    }
+
+    #[test]
+    fn test_has_assignment_value_shape_no_separator() {
+        // No assignment separator at all
+        assert!(!has_assignment_value_shape(
+            b"some random text without assignment"
+        ));
+        assert!(!has_assignment_value_shape(b"api_key AKIAIOSFODNN7EXAMPLE"));
+    }
+
+    #[test]
+    fn test_has_assignment_value_shape_no_token_after_separator() {
+        // Separator but no token after it
+        assert!(!has_assignment_value_shape(b"key="));
+        assert!(!has_assignment_value_shape(b"token:   "));
+        assert!(!has_assignment_value_shape(b"secret = \"\""));
+    }
+
+    #[test]
+    fn test_has_assignment_value_shape_with_special_chars_in_token() {
+        // Token with allowed special chars (underscore, hyphen, dot)
+        assert!(has_assignment_value_shape(b"key=abc_def-ghi.jkl"));
+        assert!(has_assignment_value_shape(b"token: some-long-token-value"));
+        assert!(has_assignment_value_shape(b"id = user.name.domain"));
+    }
+
+    #[test]
+    fn test_has_assignment_value_shape_boundary_10_chars() {
+        // Exactly 10 chars should pass
+        assert!(has_assignment_value_shape(b"key=0123456789"));
+        // 9 chars should fail
+        assert!(!has_assignment_value_shape(b"key=012345678"));
+    }
+
+    #[test]
+    fn test_has_assignment_value_shape_skips_whitespace_and_quotes() {
+        // Whitespace and quotes after separator should be skipped
+        assert!(has_assignment_value_shape(b"key=  longtokenvalue"));
+        assert!(has_assignment_value_shape(b"key=\"longtokenvalue\""));
+        assert!(has_assignment_value_shape(b"key='longtokenvalue'"));
+        assert!(has_assignment_value_shape(b"key=`longtokenvalue`"));
     }
 }

@@ -67,7 +67,6 @@ mod window_validate;
 // Existing modules
 mod helpers;
 mod transform;
-mod validator;
 mod vectorscan_prefilter;
 
 #[cfg(test)]
@@ -81,8 +80,4 @@ pub use scratch::ScanScratch;
 pub use core::{AnchorPlanStats, VectorscanStats};
 
 #[cfg(feature = "bench")]
-pub use core::{
-    bench_find_spans_into, bench_is_word_byte, bench_stream_decode_base64, bench_stream_decode_url,
-    bench_tail_matches_charset, bench_validate_aws_access_key, bench_validate_prefix_bounded,
-    bench_validate_prefix_fixed,
-};
+pub use core::{bench_find_spans_into, bench_stream_decode_base64, bench_stream_decode_url};

@@ -54,7 +54,8 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 min_len: 16,
                 max_len: 256,
             }),
-            re: build_regex(r"ops_eyJ[a-zA-Z0-9+/]{250,}={0,3}"),
+            // Upper bound added to enable accurate max_width calculation
+            re: build_regex(r"ops_eyJ[a-zA-Z0-9+/]{250,2048}={0,3}"),
         },
         RuleSpec {
             name: "adafruit-api-key",
@@ -331,18 +332,13 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
         },
         RuleSpec {
             name: "aws-access-token",
-            anchors: &[
-                b"a3t", b"A3T", b"akia", b"AKIA", b"asia", b"ASIA", b"abia", b"ABIA", b"acca",
-                b"ACCA",
-            ],
+            // Only uppercase anchors - regex is case-sensitive: (A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)
+            anchors: &[b"A3T", b"AKIA", b"ASIA", b"ABIA", b"ACCA"],
             radius: 256,
             validator: ValidatorKind::None,
             two_phase: None,
             must_contain: None,
-            keywords_any: Some(&[
-                b"a3t", b"A3T", b"akia", b"AKIA", b"asia", b"ASIA", b"abia", b"ABIA", b"acca",
-                b"ACCA",
-            ]),
+            keywords_any: Some(&[b"A3T", b"AKIA", b"ASIA", b"ABIA", b"ACCA"]),
             entropy: Some(EntropySpec {
                 min_bits_per_byte: 3.0,
                 min_len: 16,
@@ -380,14 +376,20 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             }),
             re: build_regex(r"bedrock-api-key-YmVkcm9jay5hbWF6b25hd3MuY29t"),
         },
+        // OPTIMIZED: Azure AD client secrets contain "\dQ~" - digit followed by "Q~".
+        // The "Q~" anchor alone is too short (2 chars < min_anchor_len=3).
+        // Extend anchors to "[0-9]Q~" patterns (3 chars each) for 10 variants.
+        // This is safe: any match containing \dQ~ must contain one of these anchors.
         RuleSpec {
             name: "azure-ad-client-secret",
-            anchors: &[b"q~", b"Q~"],
+            anchors: &[
+                b"0Q~", b"1Q~", b"2Q~", b"3Q~", b"4Q~", b"5Q~", b"6Q~", b"7Q~", b"8Q~", b"9Q~",
+            ],
             radius: 256,
             validator: ValidatorKind::None,
             two_phase: None,
             must_contain: None,
-            keywords_any: Some(&[b"q~", b"Q~"]),
+            keywords_any: Some(&[b"Q~"]),
             entropy: Some(EntropySpec {
                 min_bits_per_byte: 3.0,
                 min_len: 16,
@@ -653,8 +655,9 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 min_len: 16,
                 max_len: 256,
             }),
+            // Bounded .{0,2048}? to enable accurate max_width calculation
             re: build_regex(
-                r#"\bcurl\b(?:.*?|.*?(?:[\r\n]{1,2}.*?){1,5})[ \t\n\r](?:-H|--header)(?:=|[ \t]{0,5})(?:"(?i)(?:Authorization:[ \t]{0,5}(?:Basic[ \t]([a-z0-9+/]{8,}={0,3})|(?:Bearer|(?:Api-)?Token)[ \t]([\w=~@.+/-]{8,})|([\w=~@.+/-]{8,}))|(?:(?:X-(?:[a-z]+-)?)?(?:Api-?)?(?:Key|Token)):[ \t]{0,5}([\w=~@.+/-]{8,}))"|'(?i)(?:Authorization:[ \t]{0,5}(?:Basic[ \t]([a-z0-9+/]{8,}={0,3})|(?:Bearer|(?:Api-)?Token)[ \t]([\w=~@.+/-]{8,})|([\w=~@.+/-]{8,}))|(?:(?:X-(?:[a-z]+-)?)?(?:Api-?)?(?:Key|Token)):[ \t]{0,5}([\w=~@.+/-]{8,}))')(?:\B|\s|\z)"#,
+                r#"\bcurl\b(?:.{0,2048}?|.{0,2048}?(?:[\r\n]{1,2}.{0,2048}?){1,5})[ \t\n\r](?:-H|--header)(?:=|[ \t]{0,5})(?:"(?i)(?:Authorization:[ \t]{0,5}(?:Basic[ \t]([a-z0-9+/]{8,}={0,3})|(?:Bearer|(?:Api-)?Token)[ \t]([\w=~@.+/-]{8,})|([\w=~@.+/-]{8,}))|(?:(?:X-(?:[a-z]+-)?)?(?:Api-?)?(?:Key|Token)):[ \t]{0,5}([\w=~@.+/-]{8,}))"|'(?i)(?:Authorization:[ \t]{0,5}(?:Basic[ \t]([a-z0-9+/]{8,}={0,3})|(?:Bearer|(?:Api-)?Token)[ \t]([\w=~@.+/-]{8,})|([\w=~@.+/-]{8,}))|(?:(?:X-(?:[a-z]+-)?)?(?:Api-?)?(?:Key|Token)):[ \t]{0,5}([\w=~@.+/-]{8,}))')(?:\B|\s|\z)"#,
             ),
         },
         RuleSpec {
@@ -670,8 +673,9 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 min_len: 16,
                 max_len: 256,
             }),
+            // Bounded .{0,2048} to enable accurate max_width calculation
             re: build_regex(
-                r#"\bcurl\b(?:.*|.*(?:[\r\n]{1,2}.*){1,5})[ \t\n\r](?:-u|--user)(?:=|[ \t]{0,5})("(:[^"]{3,}|[^:"]{3,}:|[^:"]{3,}:[^"]{3,})"|'([^:']{3,}:[^']{3,})'|((?:"[^"]{3,}"|'[^']{3,}'|[\w$@.-]+):(?:"[^"]{3,}"|'[^']{3,}'|[\w${}@.-]+)))(?:\s|\z)"#,
+                r#"\bcurl\b(?:.{0,2048}|.{0,2048}(?:[\r\n]{1,2}.{0,2048}){1,5})[ \t\n\r](?:-u|--user)(?:=|[ \t]{0,5})("(:[^"]{3,}|[^:"]{3,}:|[^:"]{3,}:[^"]{3,})"|'([^:']{3,}:[^']{3,})'|((?:"[^"]{3,}"|'[^']{3,}'|[\w$@.-]+):(?:"[^"]{3,}"|'[^']{3,}'|[\w${}@.-]+)))(?:\s|\z)"#,
             ),
         },
         RuleSpec {
@@ -964,12 +968,13 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
         },
         RuleSpec {
             name: "facebook-page-access-token",
-            anchors: &[b"eaam", b"EAAM", b"eaac", b"EAAC"],
+            // Only uppercase anchors - regex requires uppercase: EAA[MC](?i)
+            anchors: &[b"EAAM", b"EAAC"],
             radius: 256,
             validator: ValidatorKind::None,
             two_phase: None,
             must_contain: None,
-            keywords_any: Some(&[b"eaam", b"EAAM", b"eaac", b"EAAC"]),
+            keywords_any: Some(&[b"EAAM", b"EAAC"]),
             entropy: Some(EntropySpec {
                 min_bits_per_byte: 4.0,
                 min_len: 16,
@@ -1117,8 +1122,9 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 min_len: 16,
                 max_len: 256,
             }),
+            // Upper bounds added to enable accurate max_width calculation
             re: build_regex(
-                r#"\b((?:fo1_[\w-]{43}|fm1[ar]_[a-zA-Z0-9+\/]{100,}={0,3}|fm2_[a-zA-Z0-9+\/]{100,}={0,3}))(?:[\x60'"\s;]|\\[nr]|$)"#,
+                r#"\b((?:fo1_[\w-]{43}|fm1[ar]_[a-zA-Z0-9+\/]{100,1024}={0,3}|fm2_[a-zA-Z0-9+\/]{100,1024}={0,3}))(?:[\x60'"\s;]|\\[nr]|$)"#,
             ),
         },
         RuleSpec {
@@ -1848,21 +1854,29 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 r#"(?i)[\w.-]{0,50}?(?:jfrog|artifactory|bintray|xray)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{64})(?:[\x60'"\s;]|\\[nr]|$)"#,
             ),
         },
+        // OPTIMIZED: Extended anchor from "ey" (2 chars) to "eyJ" (3 chars).
+        // All valid JWTs start with "eyJ" because:
+        // - JWT header is base64-encoded JSON object
+        // - JSON objects start with "{"
+        // - Base64 of "{\"" is "eyJ" (regardless of what follows the quote)
+        // This reduces false anchor matches by ~2.4x on typical data.
+        // See docs/anchor_optimization_spec.md for safety analysis.
         RuleSpec {
             name: "jwt",
-            anchors: &[b"ey"],
+            anchors: &[b"eyJ"],
             radius: 256,
             validator: ValidatorKind::None,
             two_phase: None,
             must_contain: None,
-            keywords_any: Some(&[b"ey"]),
+            keywords_any: Some(&[b"eyJ"]),
             entropy: Some(EntropySpec {
                 min_bits_per_byte: 3.0,
                 min_len: 16,
                 max_len: 256,
             }),
             re: build_regex(
-                r#"\b(ey[a-zA-Z0-9]{17,}\.ey[a-zA-Z0-9\/\\_-]{17,}\.(?:[a-zA-Z0-9\/\\_-]{10,}={0,2})?)(?:[\x60'"\s;]|\\[nr]|$)"#,
+                // Changed: ey → eyJ, adjusted length requirement from 17 to 16 to maintain same total
+                r#"\b(eyJ[a-zA-Z0-9]{16,}\.eyJ[a-zA-Z0-9\/\\_-]{16,}\.(?:[a-zA-Z0-9\/\\_-]{10,}={0,2})?)(?:[\x60'"\s;]|\\[nr]|$)"#,
             ),
         },
         RuleSpec {
@@ -2785,12 +2799,13 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
         },
         RuleSpec {
             name: "sendgrid-api-token",
-            anchors: &[b"sg.", b"SG."],
+            // Only uppercase anchor - regex requires uppercase: SG\.(?i)
+            anchors: &[b"SG."],
             radius: 256,
             validator: ValidatorKind::None,
             two_phase: None,
             must_contain: None,
-            keywords_any: Some(&[b"sg.", b"SG."]),
+            keywords_any: Some(&[b"SG."]),
             entropy: Some(EntropySpec {
                 min_bits_per_byte: 2.0,
                 min_len: 16,
@@ -3189,21 +3204,25 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 r#"(?i)[\w.-]{0,50}?(?:sonar[_.-]?(login|token))(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}((?:squ_|sqp_|sqa_)?[a-z0-9=_\-]{40})(?:[\x60'"\s;]|\\[nr]|$)"#,
             ),
         },
+        // Sourcegraph tokens always have "sgp_" prefix. We intentionally exclude:
+        // - Generic 40-hex patterns ([a-fA-F0-9]{40}) which match git SHAs, checksums, etc.
+        // - "sourcegraph" keyword anchors which trigger on docs/URLs without tokens
+        // This reduces false positives significantly while catching all structured token formats.
         RuleSpec {
             name: "sourcegraph-access-token",
-            anchors: &[b"sgp_", b"SGP_", b"sourcegraph", b"SOURCEGRAPH"],
+            anchors: &[b"sgp_", b"SGP_"],
             radius: 256,
             validator: ValidatorKind::None,
             two_phase: None,
             must_contain: None,
-            keywords_any: Some(&[b"sgp_", b"SGP_", b"sourcegraph", b"SOURCEGRAPH"]),
+            keywords_any: Some(&[b"sgp_", b"SGP_"]),
             entropy: Some(EntropySpec {
                 min_bits_per_byte: 3.0,
                 min_len: 16,
                 max_len: 256,
             }),
             re: build_regex(
-                r#"(?i)\b(\b(sgp_(?:[a-fA-F0-9]{16}|local)_[a-fA-F0-9]{40}|sgp_[a-fA-F0-9]{40}|[a-fA-F0-9]{40})\b)(?:[\x60'"\s;]|\\[nr]|$)"#,
+                r#"(?i)\b(sgp_(?:[a-fA-F0-9]{16}|local)_[a-fA-F0-9]{40}|sgp_[a-fA-F0-9]{40})\b(?:[\x60'"\s;]|\\[nr]|$)"#,
             ),
         },
         RuleSpec {
@@ -3315,14 +3334,22 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 r#"(?i)[\w.-]{0,50}?(?:travis)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{22})(?:[\x60'"\s;]|\\[nr]|$)"#,
             ),
         },
+        // OPTIMIZED: Twilio API keys always start with "SK" followed by 32 hex chars.
+        // The "SK" prefix alone is too short (2 chars < min_anchor_len=3).
+        // Extend anchors to "SK[0-9a-fA-F]" patterns (3 chars each) for 32 variants.
+        // This is safe: any match of SK[0-9a-fA-F]{32} contains one of these anchors.
         RuleSpec {
             name: "twilio-api-key",
-            anchors: &[b"sk", b"SK"],
+            anchors: &[
+                b"SK0", b"SK1", b"SK2", b"SK3", b"SK4", b"SK5", b"SK6", b"SK7", b"SK8", b"SK9",
+                b"SKa", b"SKb", b"SKc", b"SKd", b"SKe", b"SKf", b"SKA", b"SKB", b"SKC", b"SKD",
+                b"SKE", b"SKF",
+            ],
             radius: 256,
             validator: ValidatorKind::None,
             two_phase: None,
             must_contain: None,
-            keywords_any: Some(&[b"sk", b"SK"]),
+            keywords_any: Some(&[b"SK"]),
             entropy: Some(EntropySpec {
                 min_bits_per_byte: 3.0,
                 min_len: 16,
@@ -3436,22 +3463,48 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             }),
             re: build_regex(r#"\b(hvb\.[\w-]{138,300})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
+        // OPTIMIZED: Split into two rules to avoid the noisy "s." anchor.
+        // Modern Vault tokens use "hvs." prefix (4 chars, distinctive).
+        // Legacy tokens use "s." prefix (2 chars, extremely noisy: matches "e.g.", "3.14", etc.)
+        // See docs/anchor_optimization_spec.md for details.
+        //
+        // Rule 1: Modern hvs. tokens - no change needed, anchor is already safe
         RuleSpec {
             name: "vault-service-token",
-            anchors: &[b"hvs.", b"s."],
+            anchors: &[b"hvs."],
             radius: 256,
             validator: ValidatorKind::None,
             two_phase: None,
             must_contain: None,
-            keywords_any: Some(&[b"hvs.", b"s."]),
+            keywords_any: Some(&[b"hvs."]),
             entropy: Some(EntropySpec {
                 min_bits_per_byte: 3.5,
                 min_len: 16,
                 max_len: 256,
             }),
-            re: build_regex(
-                r#"\b((?:hvs\.[\w-]{90,120}|s\.(?i:[a-z0-9]{24})))(?:[\x60'"\s;]|\\[nr]|$)"#,
-            ),
+            re: build_regex(r#"\b(hvs\.[\w-]{90,120})(?:[\x60'"\s;]|\\[nr]|$)"#),
+        },
+        // Rule 2: Legacy s. tokens - require "vault" keyword context via two-phase
+        // This trades a small chance of missing contextless legacy tokens for much better
+        // performance on data that contains "s." patterns (decimals, abbreviations, etc.)
+        RuleSpec {
+            name: "vault-service-token-legacy",
+            anchors: &[b"vault", b"VAULT", b"Vault"],
+            radius: 512,
+            validator: ValidatorKind::None,
+            two_phase: Some(TwoPhaseSpec {
+                seed_radius: 128,
+                full_radius: 512,
+                confirm_any: &[b"s."],
+            }),
+            must_contain: None,
+            keywords_any: Some(&[b"vault", b"VAULT", b"Vault"]),
+            entropy: Some(EntropySpec {
+                min_bits_per_byte: 3.5,
+                min_len: 16,
+                max_len: 256,
+            }),
+            re: build_regex(r#"\b(s\.[a-zA-Z0-9]{24})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
         RuleSpec {
             name: "yandex-access-token",

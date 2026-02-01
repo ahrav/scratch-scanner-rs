@@ -364,6 +364,7 @@ impl Engine {
                         scratch,
                         local_dropped,
                         found_any,
+                        win.anchor_hint,
                     );
                 }
                 Variant::Utf16Le | Variant::Utf16Be => {
@@ -380,6 +381,7 @@ impl Engine {
                         scratch,
                         local_dropped,
                         found_any,
+                        win.anchor_hint,
                     );
                 }
             }
@@ -403,7 +405,6 @@ impl Engine {
                 };
                 scratch.span_streams.push(SpanStreamEntry {
                     transform_idx: tidx,
-                    mode: tcfg.mode,
                     state,
                     spans_emitted: 0,
                     max_spans: tcfg.max_spans_per_buffer,
@@ -652,6 +653,7 @@ impl Engine {
                         lo: win.lo,
                         rule_id: win.rule_id,
                         variant,
+                        anchor_hint: win.anchor_hint,
                     };
                     match scratch.pending_windows.push(pending.hi, pending) {
                         Ok(PushOutcome::Scheduled) => {}
@@ -669,9 +671,9 @@ impl Engine {
                                 break;
                             }
                         }
-                        Err(e) => {
+                        Err(_e) => {
                             #[cfg(debug_assertions)]
-                            eprintln!("TimingWheel push failed: {:?}", e);
+                            eprintln!("TimingWheel push failed: {:?}", _e);
                             force_full = true;
                             break;
                         }
@@ -894,6 +896,7 @@ impl Engine {
                         lo: win.lo,
                         rule_id: win.rule_id,
                         variant,
+                        anchor_hint: win.anchor_hint,
                     };
                     match scratch.pending_windows.push(pending.hi, pending) {
                         Ok(PushOutcome::Scheduled) => {}
@@ -911,9 +914,9 @@ impl Engine {
                                 break;
                             }
                         }
-                        Err(e) => {
+                        Err(_e) => {
                             #[cfg(debug_assertions)]
-                            eprintln!("TimingWheel push failed: {:?}", e);
+                            eprintln!("TimingWheel push failed: {:?}", _e);
                             force_full = true;
                             break;
                         }
@@ -1164,7 +1167,12 @@ impl Engine {
 
                                     let lo = seed_range.start.saturating_sub(extra);
                                     let hi = (seed_range.end + extra).min(decoded.len());
-                                    scratch.expanded.push(SpanU32::new(lo, hi));
+                                    // Preserve anchor_hint from the seed window.
+                                    scratch.expanded.push(SpanU32::new(
+                                        lo,
+                                        hi,
+                                        seed.anchor_hint as usize,
+                                    ));
                                 }
 
                                 if scratch.expanded.is_empty() {
@@ -1181,7 +1189,8 @@ impl Engine {
 
                                 let expanded_len = scratch.expanded.len();
                                 for i in 0..expanded_len {
-                                    let w = scratch.expanded[i].to_range();
+                                    let span = scratch.expanded[i];
+                                    let w = span.to_range();
                                     let win = &decoded[w.clone()];
                                     self.run_rule_on_utf16_window_into(
                                         rid as u32,
@@ -1196,12 +1205,14 @@ impl Engine {
                                         scratch,
                                         &mut local_dropped,
                                         &mut found_any,
+                                        span.anchor_hint as u64,
                                     );
                                 }
                             } else {
                                 let win_len = scratch.windows.len();
                                 for i in 0..win_len {
-                                    let w = scratch.windows[i].to_range();
+                                    let span = scratch.windows[i];
+                                    let w = span.to_range();
                                     let win = &decoded[w.clone()];
                                     self.run_rule_on_utf16_window_into(
                                         rid as u32,
@@ -1216,6 +1227,7 @@ impl Engine {
                                         scratch,
                                         &mut local_dropped,
                                         &mut found_any,
+                                        span.anchor_hint as u64,
                                     );
                                 }
                             }

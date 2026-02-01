@@ -8,6 +8,7 @@ classDiagram
 
     class Engine {
         -Vec~RuleCompiled~ rules
+        -Vec~RuleMeta~ rule_meta
         -Vec~TransformConfig~ transforms
         -Tuning tuning
         -AhoCorasick ac_anchors
@@ -34,11 +35,15 @@ classDiagram
     }
 
     class RuleCompiled {
-        -&'static str name
         -usize radius
         -Option~&'static [u8]~ must_contain
         -Regex re
         -Option~TwoPhaseCompiled~ two_phase
+    }
+
+    class RuleMeta {
+        -&'static str name
+        -ValidatorKind validator
     }
 
     class TwoPhaseCompiled {
@@ -91,6 +96,8 @@ classDiagram
         +usize max_total_decode_output_bytes
         +usize max_work_items
         +usize max_findings_per_chunk
+        +bool scan_utf16_variants
+        +RawPrefilterMode raw_prefilter_mode
     }
 
     class ScanScratch {
@@ -142,6 +149,7 @@ classDiagram
     }
 
     Engine --> RuleCompiled : contains
+    Engine --> RuleMeta : contains
     Engine --> TransformConfig : contains
     Engine --> Tuning : contains
     Engine --> ScanScratch : creates
@@ -354,6 +362,7 @@ classDiagram
 | Source | Relationship | Target | Description |
 |--------|--------------|--------|-------------|
 | `Engine` | contains | `RuleCompiled` | Compiled detection rules |
+| `Engine` | contains | `RuleMeta` | Cold rule metadata (name, validator) |
 | `Engine` | contains | `TransformConfig` | Transform configurations |
 | `Engine` | creates | `ScanScratch` | Per-scan scratch state |
 | `Pipeline` | owns | `BufferPool` | Buffer memory pool |

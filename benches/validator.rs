@@ -1,8 +1,152 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use scanner_rs::{
-    bench_is_word_byte, bench_tail_matches_charset, bench_validate_aws_access_key,
-    bench_validate_prefix_bounded, bench_validate_prefix_fixed, DelimAfter, TailCharset,
-};
+use scanner_rs::{DelimAfter, TailCharset};
+
+#[inline(always)]
+/// Bench helper: ASCII word-byte classifier for boundary checks.
+fn bench_is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+#[inline(always)]
+/// Bench helper: tests whether a byte belongs to a validator tail charset.
+fn bench_tail_matches_charset(byte: u8, charset: TailCharset) -> bool {
+    match charset {
+        TailCharset::UpperAlnum => matches!(byte, b'A'..=b'Z' | b'0'..=b'9'),
+        TailCharset::Alnum => byte.is_ascii_alphanumeric(),
+        TailCharset::LowerAlnum => matches!(byte, b'a'..=b'z' | b'0'..=b'9'),
+        TailCharset::AlnumDashUnderscore => {
+            byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
+        }
+        TailCharset::Sendgrid66Set => {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'=' | b'_' | b'-' | b'.')
+        }
+        TailCharset::DatabricksSet => matches!(byte, b'0'..=b'9' | b'a'..=b'h' | b'A'..=b'H'),
+        TailCharset::Base64Std => byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/',
+    }
+}
+
+#[inline(always)]
+fn gitleaks_terminator(byte: u8) -> bool {
+    byte == b'\'' || byte == b'"' || byte == b'`' || byte.is_ascii_whitespace()
+}
+
+#[inline(always)]
+/// Bench helper: delimiter check for token validators.
+fn delim_ok(buf: &[u8], pos: usize, delim_after: DelimAfter) -> bool {
+    match delim_after {
+        DelimAfter::None => true,
+        DelimAfter::GitleaksTokenTerminator => {
+            if pos >= buf.len() {
+                return true;
+            }
+            gitleaks_terminator(buf[pos])
+        }
+    }
+}
+
+/// Bench helper: validates a fixed-length tail after a known prefix range.
+fn bench_validate_prefix_fixed(
+    buf: &[u8],
+    start: usize,
+    end: usize,
+    tail_len: usize,
+    tail: TailCharset,
+    require_word_boundary: bool,
+    delim_after: DelimAfter,
+) -> bool {
+    if end < start || end > buf.len() {
+        return false;
+    }
+    if require_word_boundary && start > 0 && bench_is_word_byte(buf[start - 1]) {
+        return false;
+    }
+
+    let tail_end = match end.checked_add(tail_len) {
+        Some(pos) => pos,
+        None => return false,
+    };
+    if tail_end > buf.len() {
+        return false;
+    }
+
+    for &b in &buf[end..tail_end] {
+        if !bench_tail_matches_charset(b, tail) {
+            return false;
+        }
+    }
+
+    delim_ok(buf, tail_end, delim_after)
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Bench helper: validates a bounded tail length after a known prefix range.
+fn bench_validate_prefix_bounded(
+    buf: &[u8],
+    start: usize,
+    end: usize,
+    min_tail: usize,
+    max_tail: usize,
+    tail: TailCharset,
+    require_word_boundary: bool,
+    delim_after: DelimAfter,
+) -> bool {
+    if end < start || end > buf.len() || min_tail > max_tail {
+        return false;
+    }
+    if require_word_boundary && start > 0 && bench_is_word_byte(buf[start - 1]) {
+        return false;
+    }
+
+    let min_end = match end.checked_add(min_tail) {
+        Some(pos) => pos,
+        None => return false,
+    };
+    if min_end > buf.len() {
+        return false;
+    }
+
+    let max_end = match end.checked_add(max_tail) {
+        Some(pos) => pos.min(buf.len()),
+        None => buf.len(),
+    };
+
+    let mut pos = end;
+    while pos < max_end {
+        let b = buf[pos];
+        if !bench_tail_matches_charset(b, tail) {
+            break;
+        }
+        pos += 1;
+    }
+
+    if pos < min_end {
+        return false;
+    }
+
+    if delim_after == DelimAfter::None {
+        return true;
+    }
+
+    delim_ok(buf, pos, delim_after)
+}
+
+/// Bench helper: validates an AWS access key token (20 bytes, uppercase/digits).
+fn bench_validate_aws_access_key(buf: &[u8], start: usize, _end: usize) -> bool {
+    const AWS_KEY_LEN: usize = 20;
+    if start >= buf.len() {
+        return false;
+    }
+    let end = match start.checked_add(AWS_KEY_LEN) {
+        Some(pos) => pos,
+        None => return false,
+    };
+    if end > buf.len() {
+        return false;
+    }
+    buf[start..end]
+        .iter()
+        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+}
 
 // -----------------------------------------------------------------------------
 // is_word_byte benchmarks
@@ -357,9 +501,7 @@ fn bench_bulk_validation(c: &mut Criterion) {
                     TailCharset::AlnumDashUnderscore,
                     false,
                     DelimAfter::None,
-                )
-                .is_some()
-                {
+                ) {
                     matches += 1;
                 }
             }
@@ -380,9 +522,7 @@ fn bench_bulk_validation(c: &mut Criterion) {
                     TailCharset::AlnumDashUnderscore,
                     false,
                     DelimAfter::None,
-                )
-                .is_some()
-                {
+                ) {
                     matches += 1;
                 }
             }
