@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if [[ \"$CLAUDE_FILE_PATH\" == *.rs ]]; then cargo fmt --all && cargo check 2>&1 | head -50; fi"
+            "command": "if [[ \"$CLAUDE_FILE_PATH\" == *.rs ]]; then cargo fmt --all && cargo clippy --all-targets 2>&1 | head -100; fi"
           }
         ]
       }
@@ -18,6 +18,10 @@
           {
             "type": "command",
             "command": "if [[ \"$CLAUDE_FILE_PATH\" == *.rs ]] && grep -q 'unsafe' \"$CLAUDE_FILE_PATH\" 2>/dev/null; then echo '⚠️  WARNING: This file contains unsafe code blocks. Proceeding with caution.'; fi"
+          },
+          {
+            "type": "command",
+            "command": "if [[ \"$CLAUDE_FILE_PATH\" == *gitleaks_rules.rs ]]; then echo '⚠️  WARNING: gitleaks_rules.rs contains generated patterns. Confirm intentional edit.' >&2; fi"
           }
         ]
       }
