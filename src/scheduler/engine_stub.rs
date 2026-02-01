@@ -457,8 +457,14 @@ mod tests {
 
     #[test]
     fn constants_are_sane() {
-        assert!(BUFFER_LEN_MAX >= 64 * 1024, "buffer too small for practical use");
-        assert!(BUFFER_ALIGN.is_power_of_two(), "alignment must be power of 2");
+        assert!(
+            BUFFER_LEN_MAX >= 64 * 1024,
+            "buffer too small for practical use"
+        );
+        assert!(
+            BUFFER_ALIGN.is_power_of_two(),
+            "alignment must be power of 2"
+        );
         assert!(BUFFER_ALIGN >= 512, "alignment too small for O_DIRECT");
     }
 }

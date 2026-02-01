@@ -129,6 +129,7 @@
 //!
 //! All unsafe blocks have documented invariants and are tested.
 
+// Core scheduler modules
 pub mod budget;
 pub mod chunking;
 pub mod contract;

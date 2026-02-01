@@ -504,7 +504,7 @@ mod tests {
 
         let leaked = p.forget();
         assert_eq!(leaked, 3); // Returns count of leaked permits
-        // Permits should NOT be released
+                               // Permits should NOT be released
         assert_eq!(b.available(), 2);
     }
 
