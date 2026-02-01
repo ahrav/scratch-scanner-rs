@@ -261,11 +261,13 @@ impl MockEngine {
 
     /// Get rule name by ID.
     ///
-    /// # Panics
-    ///
-    /// Panics if rule_id is out of bounds.
+    /// Returns `"<unknown-rule>"` for invalid IDs to match the `ScanEngine`
+    /// trait contract (see `engine_trait.rs`).
     pub fn rule_name(&self, rule_id: RuleId) -> &str {
-        &self.rules[rule_id.0 as usize].name
+        self.rules
+            .get(rule_id.0 as usize)
+            .map(|r| r.name.as_str())
+            .unwrap_or("<unknown-rule>")
     }
 
     /// Number of rules.

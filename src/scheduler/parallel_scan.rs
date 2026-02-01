@@ -438,15 +438,20 @@ pub fn parallel_scan_dir(
 
     // Collect files first for simpler implementation
     // Future optimization: streaming with DirWalker
-    let files = collect_files(root, &config)?;
+    let collect_result = collect_files(root, &config)?;
 
     let source = VecSource {
-        files: files.into_iter(),
+        files: collect_result.files.into_iter(),
     };
 
     let local_config = config.to_local_config();
 
-    Ok(scan_local(engine, source, local_config, output))
+    let mut report = scan_local(engine, source, local_config, output);
+
+    // Include discovery errors from the file collection phase
+    report.stats.discovery_errors = collect_result.discovery_errors;
+
+    Ok(report)
 }
 
 /// Collect all files from a directory tree.
@@ -468,10 +473,31 @@ pub fn parallel_scan_dir(
 ///
 /// # Errors
 ///
-/// Returns `Err` only if the walker itself fails (e.g., permission denied on root).
-/// Errors on individual files are silently skipped—this is intentional to match
-/// `ignore` crate behavior and avoid aborting on single bad symlinks.
-fn collect_files(root: &Path, config: &ParallelScanConfig) -> io::Result<Vec<LocalFile>> {
+/// Returns `Err` if:
+/// - Root directory cannot be read (permission denied, I/O error)
+///
+/// Individual entry errors during traversal (broken symlinks, permission
+/// denied on subdirectories) are counted in `discovery_errors` but don't
+/// cause the function to fail.
+/// Result of file collection including discovered files and error counts.
+struct CollectResult {
+    files: Vec<LocalFile>,
+    /// Errors during directory traversal (permission denied, broken symlink, etc.)
+    discovery_errors: u64,
+}
+
+fn collect_files(root: &Path, config: &ParallelScanConfig) -> io::Result<CollectResult> {
+    // Verify root is accessible (readable) before walking.
+    // This catches permission denied early rather than silently returning
+    // an empty file list. The exists() check in parallel_scan_dir only
+    // verifies the inode exists, not that we can read the directory.
+    std::fs::read_dir(root).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("Cannot read root directory '{}': {}", root.display(), e),
+        )
+    })?;
+
     let mut builder = ignore::WalkBuilder::new(root);
 
     builder
@@ -482,31 +508,52 @@ fn collect_files(root: &Path, config: &ParallelScanConfig) -> io::Result<Vec<Loc
         .git_exclude(config.respect_gitignore);
 
     let mut files = Vec::new();
+    let mut discovery_errors: u64 = 0;
 
     for entry in builder.build() {
         // Skip individual entry errors (permission denied, broken symlink, etc.)
         // rather than aborting the entire scan. This matches the documented
-        // fail-soft behavior and DirWalker's error handling.
-        let Ok(entry) = entry else {
-            continue;
+        // fail-soft behavior. We count these errors for observability.
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_e) => {
+                discovery_errors = discovery_errors.saturating_add(1);
+                #[cfg(debug_assertions)]
+                eprintln!("[collect_files] Discovery error: {}", _e);
+                continue;
+            }
         };
 
         if let Some(ft) = entry.file_type() {
             if ft.is_file() {
-                if let Ok(meta) = entry.metadata() {
-                    let size = meta.len();
-                    if size <= config.max_file_size && size > 0 {
-                        files.push(LocalFile {
-                            path: entry.into_path(),
-                            size,
-                        });
+                match entry.metadata() {
+                    Ok(meta) => {
+                        let size = meta.len();
+                        if size <= config.max_file_size && size > 0 {
+                            files.push(LocalFile {
+                                path: entry.into_path(),
+                                size,
+                            });
+                        }
+                    }
+                    Err(_e) => {
+                        discovery_errors = discovery_errors.saturating_add(1);
+                        #[cfg(debug_assertions)]
+                        eprintln!(
+                            "[collect_files] Metadata error for {:?}: {}",
+                            entry.path(),
+                            _e
+                        );
                     }
                 }
             }
         }
     }
 
-    Ok(files)
+    Ok(CollectResult {
+        files,
+        discovery_errors,
+    })
 }
 
 /// Scan a list of files in parallel using the real detection engine.
@@ -705,5 +752,66 @@ mod tests {
         let report = parallel_scan_files(files, engine, small_config(), sink.clone());
 
         assert_eq!(report.stats.files_enqueued, 1);
+    }
+
+    #[test]
+    #[cfg(unix)] // chmod requires Unix
+    fn errors_on_unreadable_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let unreadable = dir.path().join("unreadable");
+        fs::create_dir(&unreadable).unwrap();
+
+        // Remove read permission
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let rules = vec![simple_rule()];
+        let transforms: Vec<TransformConfig> = vec![];
+        let engine = Arc::new(Engine::new(rules, transforms, test_tuning()));
+        let sink = Arc::new(VecSink::new());
+
+        let result = parallel_scan_dir(&unreadable, engine, small_config(), sink);
+
+        // Restore permissions before assertions (for cleanup)
+        let _ = fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o755));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn continues_on_unreadable_subdir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+
+        // Readable file at root level
+        let file = dir.path().join("readable.txt");
+        fs::write(&file, "SECRETABCD1234").unwrap();
+
+        // Unreadable subdirectory
+        let subdir = dir.path().join("blocked");
+        fs::create_dir(&subdir).unwrap();
+        fs::write(subdir.join("hidden.txt"), "SECRETEFGH5678").unwrap();
+        fs::set_permissions(&subdir, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let rules = vec![simple_rule()];
+        let transforms: Vec<TransformConfig> = vec![];
+        let engine = Arc::new(Engine::new(rules, transforms, test_tuning()));
+        let sink = Arc::new(VecSink::new());
+
+        let result = parallel_scan_dir(dir.path(), engine, small_config(), sink.clone());
+
+        // Restore permissions before assertions
+        let _ = fs::set_permissions(&subdir, fs::Permissions::from_mode(0o755));
+
+        // Should succeed - only the root-level file is scanned
+        assert!(result.is_ok());
+        let report = result.unwrap();
+        assert_eq!(report.stats.files_enqueued, 1);
+        assert!(report.stats.discovery_errors >= 1); // Subdirectory error counted
     }
 }

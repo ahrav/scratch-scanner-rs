@@ -87,27 +87,43 @@ impl FindingRecord for ApiFindingRec {
 ///
 /// 2. **Store findings separately**: Would add copying overhead.
 ///
-/// 3. **Lazy reset**: Clear findings but delay full reset until next scan.
-///    This is what we do: `clear()` is a no-op, and `scan_chunk_into` calls
-///    `reset_for_scan` internally before scanning.
+/// 3. **Lazy reset**: Clear only the local drain buffer; delay full engine scratch
+///    reset until next scan. This is what we do: `clear()` clears `findings_buf`
+///    (our local drain buffer), and `scan_chunk_into` calls `reset_for_scan`
+///    internally before scanning to reset the engine's internal state.
 pub struct RealEngineScratch {
     scratch: RealScanScratch,
     /// Temporary buffer for draining findings.
     findings_buf: Vec<ApiFindingRec>,
 }
 
-// SAFETY: RealEngineScratch is only created inside a worker thread via `new_scratch()`
-// and never transferred to another thread after creation. The `Send` bound is required
-// by the `EngineScratch` trait for the executor to pass scratch to worker threads at
-// startup, but in practice each scratch instance is thread-local after initialization.
+// SAFETY: RealEngineScratch wraps ScanScratch which is not automatically Send because
+// it contains `Option<VsScratch>` fields holding raw pointers to Vectorscan FFI handles
+// (`*mut hs_scratch_t`, `*mut hs_database_t`). Raw pointers are !Send by default.
 //
-// Invariants maintained:
-// 1. Created once per worker in `Executor::new()` → scratch_init closure
-// 2. Stored in `WorkerCtx` which is never moved between threads
-// 3. Only accessed by the owning worker thread during `process_file()`
+// The unsafe impl Send is justified because:
 //
-// The internal `ScratchVec<T>` uses `NonNull` for pointer manipulation, but the
-// data it points to is owned and follows Rust's aliasing rules.
+// 1. **Ownership model**: Each scratch instance is created per-worker and never shared.
+//    - Created once in `Executor::new()` via the `scratch_init` closure
+//    - Stored in `WorkerCtx` which is pinned to a single worker thread
+//    - Only accessed by the owning worker thread during `process_file()`
+//
+// 2. **Transfer semantics**: The Send bound is required by the `EngineScratch` trait
+//    to allow the executor to pass scratch to worker threads at startup. After this
+//    one-time transfer, each scratch instance is thread-local for the lifetime of
+//    the scan.
+//
+// 3. **Vectorscan safety**: The underlying `hs_scratch_t` handles are not thread-safe
+//    for concurrent use (Vectorscan requirement), but they ARE safe to transfer between
+//    threads as long as only one thread uses them at a time. Our ownership model
+//    guarantees single-thread access after initialization.
+//
+// 4. **Other fields**: `ScratchVec<T>` uses `NonNull` internally but owns its data
+//    and follows Rust's aliasing rules. `Vec<u8>`, `Vec<FindingRec>`, etc. are all
+//    Send when their contents are Send.
+//
+// If the executor's invariants change (e.g., work-stealing that moves scratch between
+// workers), this unsafe impl would become unsound and must be revisited.
 unsafe impl Send for RealEngineScratch {}
 
 impl RealEngineScratch {

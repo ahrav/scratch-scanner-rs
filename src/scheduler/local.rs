@@ -284,6 +284,12 @@ pub struct LocalStats {
     /// This includes file open failures, metadata read failures, and
     /// read errors during scanning. Aggregated from worker metrics.
     pub io_errors: u64,
+    /// Errors encountered during file discovery (directory walking).
+    ///
+    /// This includes permission denied, broken symlinks, and other errors
+    /// that prevented a file from being added to the scan queue. These are
+    /// distinct from `io_errors` which occur during actual scanning.
+    pub discovery_errors: u64,
 }
 
 /// Complete report from a local scan.
@@ -316,6 +322,7 @@ pub struct LocalReport {
 ///
 /// This handles within-chunk duplicates (same finding emitted multiple times
 /// by the engine). Cross-chunk duplicates are handled by `drop_prefix_findings`.
+#[inline]
 fn dedupe_findings<F: FindingRecord>(findings: &mut Vec<F>) {
     if findings.len() <= 1 {
         return;
@@ -352,6 +359,7 @@ fn dedupe_findings<F: FindingRecord>(findings: &mut Vec<F>) {
 ///
 /// The `out_buf` is reused across calls to avoid allocation per file.
 /// It's cleared at the start of each call.
+#[inline]
 fn emit_findings<E: ScanEngine, F: FindingRecord>(
     engine: &E,
     out: &Arc<dyn OutputSink>,
@@ -512,7 +520,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
             Err(e) => {
                 ctx.metrics.io_errors = ctx.metrics.io_errors.saturating_add(1);
                 #[cfg(debug_assertions)]
-                eprintln!("[local] Read failed: {}", e);
+                eprintln!("[local] Read failed for {:?}: {}", task.path, e);
                 let _ = e;
 
                 break;

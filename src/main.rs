@@ -190,8 +190,10 @@ fn main() -> io::Result<()> {
         bytes_scanned: u64,
         /// Number of secret findings emitted.
         findings: u64,
-        /// I/O and processing errors encountered.
-        errors: u64,
+        /// I/O and processing errors encountered during scanning.
+        io_errors: u64,
+        /// Errors encountered during file discovery (directory walking).
+        discovery_errors: u64,
     }
 
     let stats = if matches!(worker_config, WorkerConfig::SingleThreaded) {
@@ -202,7 +204,8 @@ fn main() -> io::Result<()> {
             chunks: pipeline_stats.chunks,
             bytes_scanned: pipeline_stats.bytes_scanned,
             findings: pipeline_stats.findings,
-            errors: pipeline_stats.errors,
+            io_errors: pipeline_stats.errors,
+            discovery_errors: 0, // Legacy pipeline doesn't track discovery errors
         }
     } else {
         // Parallel mode (default)
@@ -221,7 +224,8 @@ fn main() -> io::Result<()> {
             chunks: report.metrics.chunks_scanned,
             bytes_scanned: report.metrics.bytes_scanned,
             findings: report.metrics.findings_emitted,
-            errors: report.stats.io_errors,
+            io_errors: report.stats.io_errors,
+            discovery_errors: report.stats.discovery_errors,
         }
     };
     let elapsed = start.elapsed();
@@ -233,12 +237,13 @@ fn main() -> io::Result<()> {
     };
 
     eprintln!(
-        "files={} chunks={} bytes={} findings={} errors={} elapsed_ms={} throughput_mib_s={:.2} workers={}",
+        "files={} chunks={} bytes={} findings={} io_errors={} discovery_errors={} elapsed_ms={} throughput_mib_s={:.2} workers={}",
         stats.files,
         stats.chunks,
         stats.bytes_scanned,
         stats.findings,
-        stats.errors,
+        stats.io_errors,
+        stats.discovery_errors,
         elapsed.as_millis(),
         throughput_mib,
         workers
