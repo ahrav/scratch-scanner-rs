@@ -2208,6 +2208,78 @@ fn test_chunked_scan_dedup_secret_in_overlap_with_wide_window() {
     );
 }
 
+/// Test that trailing context doesn't cause missed findings.
+///
+/// When a pattern has trailing context after the capture group (e.g., `secret([a-z]+)(?:;|$)`),
+/// the full match may extend into new bytes even when the secret ends in the overlap prefix.
+/// Using the secret span for root_hint would incorrectly drop these findings.
+///
+/// Buffer layout:
+///   [padding][KEY_ABCD1234;][padding...]
+///   ^0       ^60          ^72         ^128
+///             ^^^^^^^^^^^ secret (60..71)
+///             ^^^^^^^^^^^^ full match including delimiter (60..72)
+///
+/// Chunk boundary at 64, overlap starts at 32:
+///   - Secret ends at 71 (in overlap region but past new_bytes_start)
+///   - Full match ends at 72 (delimiter `;` past secret end)
+///
+/// With secret-only root_hint: finding might be dropped if logic changes
+/// With full match root_hint: finding is correctly kept
+#[test]
+fn test_chunked_scan_trailing_context_not_dropped() {
+    const ANCHORS: &[&[u8]] = &[b"KEY_"];
+
+    // Pattern with trailing delimiter context after the capture group.
+    // The `;` is NOT part of the captured secret but IS part of the full match.
+    let rule = RuleSpec {
+        name: "trailing-context-test",
+        anchors: ANCHORS,
+        radius: 64,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        secret_group: Some(1), // Capture group 1 is the secret
+        re: Regex::new(r"KEY_([A-Z0-9]{8})(?:;|$)").unwrap(),
+    };
+
+    let eng = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Position the secret so it ends before chunk boundary but the delimiter is right at/after it.
+    // Chunk boundary at 64, secret at [52, 64), delimiter at 64.
+    let mut buf = vec![b'x'; 128];
+    // KEY_ABCD1234; starting at offset 48
+    // KEY_ at [48, 52), secret at [52, 60), ; at 60
+    buf[48..61].copy_from_slice(b"KEY_ABCD1234;");
+
+    let chunk_size = 64;
+    let overlap = 32;
+    let findings = scan_in_chunks_with_overlap(&eng, &buf, chunk_size, overlap);
+
+    // Should find exactly 1 match (not 0 due to incorrect dropping)
+    assert_eq!(
+        findings.len(),
+        1,
+        "Expected 1 finding for trailing context pattern, got {}. Finding may have been incorrectly dropped.",
+        findings.len()
+    );
+
+    // Verify the span covers just the secret (capture group 1), not the delimiter
+    let f = &findings[0];
+    assert_eq!(f.span_start, 52, "Secret should start at offset 52");
+    assert_eq!(
+        f.span_end, 60,
+        "Secret should end at offset 60 (excluding delimiter)"
+    );
+}
+
 // --------------------------
 // Property tests for engine correctness and chunking.
 // Gated behind `stdx-proptest` to keep `cargo test` fast.
