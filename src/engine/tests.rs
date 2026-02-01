@@ -366,6 +366,7 @@ fn keyword_gate_filters_without_keyword() {
         must_contain: None,
         keywords_any: Some(KEYWORDS),
         entropy: None,
+        secret_group: None,
         re: Regex::new("secret").unwrap(),
     };
     let eng = Engine::new_with_anchor_policy(
@@ -395,6 +396,7 @@ fn derived_confirm_all_is_compiled() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        secret_group: None,
         re: Regex::new(r"foo\d+bar").unwrap(),
     };
 
@@ -458,6 +460,7 @@ fn entropy_gate_filters_low_entropy_matches() {
             min_len: 8,
             max_len: 32,
         }),
+        secret_group: None,
         re: Regex::new(r"TOK_[A-Za-z0-9]{8}").unwrap(),
     };
     let eng = Engine::new_with_anchor_policy(
@@ -476,6 +479,451 @@ fn entropy_gate_filters_low_entropy_matches() {
     assert!(hits.iter().any(|h| h.rule == "entropy-gate"));
 }
 
+// --------------------------
+// Secret extraction tests
+// --------------------------
+//
+// These tests verify the capture-group-based secret extraction logic implemented
+// in `extract_secret_span`. The feature allows rules to specify which capture group
+// contains the actual secret (vs. surrounding context like prefixes/delimiters).
+//
+// Test coverage:
+// - `secret_extraction_prefers_group1_over_full_match`: Default gitleaks convention
+// - `secret_extraction_uses_configured_secret_group`: Explicit `secret_group` override
+// - `secret_extraction_falls_back_to_full_match_without_groups`: No capture groups
+// - `secret_extraction_skips_empty_group1`: Empty optional groups fallback
+// - `secret_extraction_hash_consistency`: Same secret → same hash (dedup correctness)
+// - `secret_extraction_utf16le_path`: Works through UTF-16 decode path
+
+#[test]
+fn secret_extraction_prefers_group1_over_full_match() {
+    // Rule with capture group 1 should extract from group 1, not full match.
+    // The engine stores the extracted secret span in the finding's `span` field.
+    const ANCHORS: &[&[u8]] = &[b"KEY_"];
+    let rule = RuleSpec {
+        name: "group1-extraction",
+        anchors: ANCHORS,
+        radius: 16,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        secret_group: None,
+        // Pattern: KEY_<secret> where <secret> is captured in group 1
+        re: Regex::new(r"KEY_([A-Za-z0-9]{8,16})").unwrap(),
+    };
+    let eng = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let hay = b"prefix KEY_SecretValue1 suffix";
+    let hits = scan_chunk_findings(&eng, hay);
+    assert!(
+        hits.iter().any(|h| h.rule == "group1-extraction"),
+        "expected finding for group1-extraction rule"
+    );
+
+    // The span should be just the captured group 1, not the full "KEY_SecretValue1"
+    let hit = hits.iter().find(|h| h.rule == "group1-extraction").unwrap();
+    let secret = &hay[hit.span.clone()];
+    assert_eq!(
+        secret, b"SecretValue1",
+        "span should be capture group 1 (secret only)"
+    );
+}
+
+#[test]
+fn secret_extraction_uses_configured_secret_group() {
+    // When secret_group is set, it should override the default group 1 behavior.
+    const ANCHORS: &[&[u8]] = &[b"TOK"];
+    let rule = RuleSpec {
+        name: "secret-group-override",
+        anchors: ANCHORS,
+        radius: 16,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        secret_group: Some(2), // Use group 2 instead of group 1
+        // Pattern: TOK<prefix>:<secret> where prefix is group 1, secret is group 2
+        re: Regex::new(r"TOK([A-Z]+):([a-z0-9]{8,16})").unwrap(),
+    };
+    let eng = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let hay = b"prefix TOKTYPE:secretval12 suffix";
+    let hits = scan_chunk_findings(&eng, hay);
+    assert!(
+        hits.iter().any(|h| h.rule == "secret-group-override"),
+        "expected finding for secret-group-override rule"
+    );
+
+    let hit = hits
+        .iter()
+        .find(|h| h.rule == "secret-group-override")
+        .unwrap();
+    let secret = &hay[hit.span.clone()];
+    assert_eq!(
+        secret, b"secretval12",
+        "span should be capture group 2 (configured secret_group)"
+    );
+}
+
+#[test]
+fn secret_extraction_falls_back_to_full_match_without_groups() {
+    // When there are no capture groups, fall back to full match.
+    const ANCHORS: &[&[u8]] = &[b"AKIA"];
+    let rule = RuleSpec {
+        name: "no-groups-fallback",
+        anchors: ANCHORS,
+        radius: 16,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        secret_group: None,
+        // Pattern with no capture groups
+        re: Regex::new(r"AKIA[A-Z0-9]{16}").unwrap(),
+    };
+    let eng = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let hay = b"prefix AKIAIOSFODNN7EXAMPLE suffix";
+    let hits = scan_chunk_findings(&eng, hay);
+    assert!(
+        hits.iter().any(|h| h.rule == "no-groups-fallback"),
+        "expected finding for no-groups-fallback rule"
+    );
+
+    let hit = hits
+        .iter()
+        .find(|h| h.rule == "no-groups-fallback")
+        .unwrap();
+    // Without capture groups, span should be full match
+    let matched = &hay[hit.span.clone()];
+    assert_eq!(
+        matched, b"AKIAIOSFODNN7EXAMPLE",
+        "without capture groups, span should be full match"
+    );
+}
+
+#[test]
+fn secret_extraction_skips_empty_group1() {
+    // When group 1 is empty (matches zero chars), fall back to full match.
+    const ANCHORS: &[&[u8]] = &[b"OPT"];
+    let rule = RuleSpec {
+        name: "empty-group1-fallback",
+        anchors: ANCHORS,
+        radius: 16,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        secret_group: None,
+        // Group 1 can be empty (optional prefix), group 0 is the full match
+        re: Regex::new(r"OPT([A-Z]*)_[a-z0-9]{8}").unwrap(),
+    };
+    let eng = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Input where group 1 is empty (no uppercase letters after OPT)
+    let hay = b"prefix OPT_abcd1234 suffix";
+    let hits = scan_chunk_findings(&eng, hay);
+    assert!(
+        hits.iter().any(|h| h.rule == "empty-group1-fallback"),
+        "expected finding for empty-group1-fallback rule"
+    );
+
+    let hit = hits
+        .iter()
+        .find(|h| h.rule == "empty-group1-fallback")
+        .unwrap();
+    // Since group 1 is empty, span should be full match fallback
+    let matched = &hay[hit.span.clone()];
+    assert_eq!(
+        matched, b"OPT_abcd1234",
+        "when group 1 is empty, span should be full match"
+    );
+}
+
+#[test]
+fn secret_extraction_hash_consistency() {
+    // Same secret value should produce the same hash regardless of how it's found.
+    const ANCHORS: &[&[u8]] = &[b"SEC_"];
+    let rule = RuleSpec {
+        name: "hash-consistency",
+        anchors: ANCHORS,
+        radius: 16,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        secret_group: None,
+        re: Regex::new(r"SEC_([A-Za-z0-9]{12})").unwrap(),
+    };
+    let eng = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Two different contexts with the same secret value
+    let hay1 = b"first SEC_AbCdEfGh1234 context";
+    let hay2 = b"different SEC_AbCdEfGh1234 other";
+
+    let hits1 = scan_chunk_findings(&eng, hay1);
+    let hits2 = scan_chunk_findings(&eng, hay2);
+
+    let hit1 = hits1
+        .iter()
+        .find(|h| h.rule == "hash-consistency")
+        .expect("expected hit in hay1");
+    let hit2 = hits2
+        .iter()
+        .find(|h| h.rule == "hash-consistency")
+        .expect("expected hit in hay2");
+
+    // Verify both findings extracted the same secret (from capture group 1)
+    let secret1 = &hay1[hit1.span.clone()];
+    let secret2 = &hay2[hit2.span.clone()];
+    assert_eq!(secret1, secret2, "secrets should match");
+    assert_eq!(secret1, b"AbCdEfGh1234");
+
+    // Hash the secrets using the same function the engine uses
+    let hash1 = hash128(secret1);
+    let hash2 = hash128(secret2);
+    assert_eq!(hash1, hash2, "hashes should be identical for same secret");
+}
+
+#[test]
+fn secret_extraction_utf16le_path() {
+    // Secret extraction should work correctly through UTF-16LE decode path.
+    const ANCHORS: &[&[u8]] = &[b"UTF_"];
+    let rule = RuleSpec {
+        name: "utf16-extraction",
+        anchors: ANCHORS,
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        secret_group: None,
+        re: Regex::new(r"UTF_([A-Za-z0-9]{8})").unwrap(),
+    };
+
+    let mut tuning = demo_tuning();
+    tuning.scan_utf16_variants = true;
+
+    let eng =
+        Engine::new_with_anchor_policy(vec![rule], Vec::new(), tuning, AnchorPolicy::ManualOnly);
+
+    // Create a UTF-16LE encoded input
+    let plain = b"UTF_Secret12";
+    let utf16 = utf16le_bytes(plain);
+    let mut hay = vec![b'!'; 8];
+    hay.extend_from_slice(&utf16);
+    hay.extend(vec![b'!'; 8]);
+
+    let hits = scan_chunk_findings(&eng, &hay);
+    assert!(
+        hits.iter().any(|h| h.rule == "utf16-extraction"),
+        "expected finding through UTF-16LE path"
+    );
+
+    // Verify the finding has correct decode steps
+    let hit = hits.iter().find(|h| h.rule == "utf16-extraction").unwrap();
+    assert!(
+        !hit.decode_steps.is_empty(),
+        "UTF-16 finding should have decode steps"
+    );
+    assert!(
+        matches!(
+            &hit.decode_steps[0],
+            DecodeStep::Utf16Window { endianness, .. } if matches!(endianness, Utf16Endianness::Le)
+        ),
+        "first decode step should be UTF-16LE"
+    );
+
+    // The span should be the extracted secret (capture group 1), not the full match
+    // Note: The span is in the decoded UTF-8 buffer, not the original UTF-16LE
+    // We verify length matches "Secret12" (8 chars)
+    assert_eq!(
+        hit.span.len(),
+        8,
+        "span should be capture group 1 length (Secret12)"
+    );
+}
+
+#[test]
+fn secret_extraction_sonar_extracts_token_not_keyword() {
+    // Regression test: sonar-api-token was extracting "login"|"token" (group 1)
+    // instead of the actual secret (group 2). Verify we extract the token.
+    use crate::gitleaks_rules::gitleaks_rules;
+
+    let rules = gitleaks_rules();
+    let sonar_rule = rules
+        .iter()
+        .find(|r| r.name == "sonar-api-token")
+        .expect("sonar-api-token rule should exist");
+
+    // Build an engine with just this rule.
+    let eng = Engine::new_with_anchor_policy(
+        vec![sonar_rule.clone()],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Test input matching the rule pattern.
+    let token = b"squ_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8";
+    let hay = format!("SONAR_TOKEN='{}'", std::str::from_utf8(token).unwrap()).into_bytes();
+
+    let hits = scan_chunk_findings(&eng, &hay);
+    assert!(
+        hits.iter().any(|h| h.rule == "sonar-api-token"),
+        "expected finding for sonar-api-token rule"
+    );
+
+    let hit = hits.iter().find(|h| h.rule == "sonar-api-token").unwrap();
+    let secret = &hay[hit.span.clone()];
+
+    // Should extract the actual token, not "TOKEN" (keyword from group 1).
+    assert_eq!(
+        secret, token,
+        "sonar rule should extract the token (group 2), not the keyword"
+    );
+}
+
+#[test]
+fn secret_extraction_teams_webhook_extracts_full_url() {
+    // Regression test: microsoft-teams-webhook was extracting GUID fragment
+    // (from capture groups used for repetition) instead of the full URL.
+    use crate::gitleaks_rules::gitleaks_rules;
+
+    let rules = gitleaks_rules();
+    let teams_rule = rules
+        .iter()
+        .find(|r| r.name == "microsoft-teams-webhook")
+        .expect("microsoft-teams-webhook rule should exist");
+
+    let eng = Engine::new_with_anchor_policy(
+        vec![teams_rule.clone()],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Construct a valid Teams webhook URL matching the rule regex.
+    let webhook_url = b"https://example.webhook.office.com/webhookb2/12345678-abcd-1234-abcd-123456789012@12345678-abcd-1234-abcd-123456789012/IncomingWebhook/abcdef01234567890123456789abcdef/12345678-abcd-1234-abcd-123456789012";
+    let hay = format!(
+        "webhook_url='{}'",
+        std::str::from_utf8(webhook_url).unwrap()
+    )
+    .into_bytes();
+
+    let hits = scan_chunk_findings(&eng, &hay);
+    assert!(
+        hits.iter().any(|h| h.rule == "microsoft-teams-webhook"),
+        "expected finding for microsoft-teams-webhook rule"
+    );
+
+    let hit = hits
+        .iter()
+        .find(|h| h.rule == "microsoft-teams-webhook")
+        .unwrap();
+    let secret = &hay[hit.span.clone()];
+
+    // Should extract the full URL, not just a GUID fragment like "abcd-".
+    assert!(
+        secret.starts_with(b"https://"),
+        "teams webhook should extract full URL, got: {:?}",
+        std::str::from_utf8(secret)
+    );
+    assert!(
+        secret.len() > 100,
+        "extracted secret should be the full URL (>100 chars), got {} chars",
+        secret.len()
+    );
+}
+
+#[test]
+fn root_span_hint_uses_full_window_for_partial_secret() {
+    // Regression test: root_span_hint was using secret-only span in Raw variant,
+    // causing chunk boundary drops when delimiter falls in new bytes region.
+    // Now root_span_hint uses full window span (aligned with UTF-16 path).
+
+    // Create a rule where the secret is a substring of the full match.
+    const ANCHORS: &[&[u8]] = &[b"PREFIX_"];
+    let rule = RuleSpec {
+        name: "partial-secret-window",
+        anchors: ANCHORS,
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        secret_group: None,
+        // Pattern: PREFIX_<secret>_SUFFIX - group 1 is just the middle part.
+        re: Regex::new(r"PREFIX_([A-Za-z0-9]{8})_SUFFIX").unwrap(),
+    };
+
+    let eng = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Construct input where the secret ends near the chunk boundary but SUFFIX
+    // extends past it. This exercises root_span_hint calculation.
+    let hay = b"data PREFIX_Secret12_SUFFIX more data";
+    let hits = scan_chunk_findings(&eng, hay);
+
+    assert!(
+        hits.iter().any(|h| h.rule == "partial-secret-window"),
+        "expected finding for partial-secret-window rule"
+    );
+
+    let hit = hits
+        .iter()
+        .find(|h| h.rule == "partial-secret-window")
+        .unwrap();
+
+    // The span should be just the captured secret (group 1).
+    let secret = &hay[hit.span.clone()];
+    assert_eq!(
+        secret, b"Secret12",
+        "span should be capture group 1 (secret only)"
+    );
+
+    // The root_span_hint should cover the full window (PREFIX_Secret12_SUFFIX).
+    // We verify indirectly by checking the finding was not dropped.
+    // The fix ensures root_span_hint uses w.clone() instead of span_in_buf.clone().
+}
+
 #[test]
 fn anchor_policy_prefers_derived_over_manual() {
     const MANUAL: &[&[u8]] = &[b"bar"];
@@ -488,6 +936,7 @@ fn anchor_policy_prefers_derived_over_manual() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        secret_group: None,
         re: Regex::new("foo").unwrap(),
     };
 
@@ -515,6 +964,7 @@ fn anchor_policy_falls_back_to_manual_on_unfilterable() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        secret_group: None,
         re: Regex::new("[A-Za-z]{1,}").unwrap(),
     };
 
@@ -1507,6 +1957,7 @@ fn scan_file_sync_drops_prefix_duplicates() -> std::io::Result<()> {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        secret_group: None,
         re: Regex::new("X").unwrap(),
     }];
     let engine = Arc::new(Engine::new(rules, Vec::new(), demo_tuning()));
@@ -1544,6 +1995,7 @@ fn utf16_overlap_accounts_for_scaled_radius() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        secret_group: None,
         re: Regex::new(r"aaatok_[0-9]{8}bbbb").unwrap(),
     };
     let engine = Engine::new_with_anchor_policy(
@@ -1591,189 +2043,200 @@ fn utf16_overlap_accounts_for_scaled_radius() {
     );
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: 128,
-        .. ProptestConfig::default()
-    })]
-
-    #[test]
-    fn prop_engine_matches_reference(case in input_case_strategy()) {
-        let engine = demo_engine();
-        let rules = demo_rules();
-
-        let findings = scan_chunk_findings(&engine, &case.buf);
-        let engine_keys = findings_to_keys(&findings);
-        let ref_keys = reference_scan_keys(&engine, &rules, &case.buf);
-
-        prop_assert_eq!(engine_keys, ref_keys);
-
-        if let Err(msg) = validate_findings(&engine, &case.buf, &findings) {
-            prop_assert!(false, "{}", msg);
-        }
-    }
-
-    #[test]
-    fn prop_chunked_matches_full(case in input_case_strategy(), chunk_size in 1usize..256) {
-        let engine = demo_engine();
-        let mut scratch = engine.new_scratch();
-        let full = engine.scan_chunk_records(&case.buf, FileId(0), 0, &mut scratch);
-        let chunked = scan_in_chunks(&engine, &case.buf, chunk_size);
-
-        let full_keys = recs_to_keys(full);
-        let chunked_keys = recs_to_keys(&chunked);
-
-        prop_assert!(chunked_keys.is_superset(&full_keys));
-    }
-}
-
 // --------------------------
-// Tiger-style chunking nondeterminism harness
+// Property tests for engine correctness and chunking.
+// Gated behind `stdx-proptest` to keep `cargo test` fast.
+// Run with: cargo test --features stdx-proptest
 // --------------------------
 
-proptest! {
-    // Keep this relatively small: each case runs multiple chunking plans.
-    #![proptest_config(ProptestConfig {
-        cases: 32,
-        .. ProptestConfig::default()
-    })]
+#[cfg(all(test, feature = "stdx-proptest"))]
+mod engine_proptests {
+    use super::*;
 
-    #[test]
-    fn prop_tiger_chunk_plans_cover_oracle(
-        case in input_case_strategy(),
-        seed in any::<u64>(),
-    ) {
-        let engine = correctness_engine();
-        let oracle = scan_one_chunk_records(&engine, &case.buf);
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 128,
+            .. ProptestConfig::default()
+        })]
 
-        // A small set of "interesting" sizes that tends to shake out edge cases.
-        const SIZES: &[usize] = &[
-            1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 255, 256,
-        ];
+        #[test]
+        fn prop_engine_matches_reference(case in input_case_strategy()) {
+            let engine = demo_engine();
+            let rules = demo_rules();
 
-        let pick = |shift: u32| -> usize { SIZES[((seed >> shift) as usize) % SIZES.len()] };
+            let findings = scan_chunk_findings(&engine, &case.buf);
+            let engine_keys = findings_to_keys(&findings);
+            let ref_keys = reference_scan_keys(&engine, &rules, &case.buf);
 
-        let s0 = pick(0);
-        let s1 = pick(8);
-        let s2 = pick(16);
-        let s3 = pick(24);
+            prop_assert_eq!(engine_keys, ref_keys);
 
-        // Force at least one plan where the chunk size exceeds required overlap.
-        // Otherwise very small chunks can overlap the whole previous chunk, which
-        // is correct but less stressful.
-        let overlap = engine.required_overlap();
-        let big = overlap.saturating_add(1).saturating_add(seed as usize % 512);
+            if let Err(msg) = validate_findings(&engine, &case.buf, &findings) {
+                prop_assert!(false, "{}", msg);
+            }
+        }
 
-        // Shift boundaries by making the first chunk a different size.
-        let first_shift = 1 + ((seed >> 32) as usize % 64);
+        #[test]
+        fn prop_chunked_matches_full(case in input_case_strategy(), chunk_size in 1usize..256) {
+            let engine = demo_engine();
+            let mut scratch = engine.new_scratch();
+            let full = engine.scan_chunk_records(&case.buf, FileId(0), 0, &mut scratch);
+            let chunked = scan_in_chunks(&engine, &case.buf, chunk_size);
 
-        let plans: Vec<ChunkPlan> = vec![
-            ChunkPlan::fixed(s0),
-            ChunkPlan::fixed_shifted(s0, first_shift),
-            ChunkPlan::alternating(s1, s2),
-            ChunkPlan::random_range(seed, 1, s3.max(1)).with_first_chunk(first_shift),
-            ChunkPlan {
-                pattern: ChunkPattern::Sequence(vec![1, s0, 2, s1, 3, s2, 5, s3]),
-                seed: 0,
-                first_chunk_len: None,
-            },
-            ChunkPlan::fixed(big).with_first_chunk(first_shift),
-        ];
+            let full_keys = recs_to_keys(full);
+            let chunked_keys = recs_to_keys(&chunked);
 
-        for plan in plans {
-            let plan_dbg = format!("{plan:?}");
-            // Preserve the exact plan for regression capture before it is consumed.
-            let plan_for_regression = plan.clone();
-            let chunked = scan_chunked_records(&engine, &case.buf, plan);
-            if let Err(msg) = check_oracle_covered(&engine, &oracle, &chunked) {
-                maybe_write_regression(
-                    "tiger_chunk_plans_cover_oracle",
-                    seed,
-                    &plan_for_regression,
-                    &case.buf,
-                );
-                prop_assert!(false, "plan={}: {}", plan_dbg, msg);
+            prop_assert!(chunked_keys.is_superset(&full_keys));
+        }
+    }
+
+    // --------------------------
+    // Tiger-style chunking nondeterminism harness
+    // --------------------------
+
+    proptest! {
+        // Keep this relatively small: each case runs multiple chunking plans.
+        #![proptest_config(ProptestConfig {
+            cases: 32,
+            .. ProptestConfig::default()
+        })]
+
+        #[test]
+        fn prop_tiger_chunk_plans_cover_oracle(
+            case in input_case_strategy(),
+            seed in any::<u64>(),
+        ) {
+            let engine = correctness_engine();
+            let oracle = scan_one_chunk_records(&engine, &case.buf);
+
+            // A small set of "interesting" sizes that tends to shake out edge cases.
+            const SIZES: &[usize] = &[
+                1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 255, 256,
+            ];
+
+            let pick = |shift: u32| -> usize { SIZES[((seed >> shift) as usize) % SIZES.len()] };
+
+            let s0 = pick(0);
+            let s1 = pick(8);
+            let s2 = pick(16);
+            let s3 = pick(24);
+
+            // Force at least one plan where the chunk size exceeds required overlap.
+            // Otherwise very small chunks can overlap the whole previous chunk, which
+            // is correct but less stressful.
+            let overlap = engine.required_overlap();
+            let big = overlap.saturating_add(1).saturating_add(seed as usize % 512);
+
+            // Shift boundaries by making the first chunk a different size.
+            let first_shift = 1 + ((seed >> 32) as usize % 64);
+
+            let plans: Vec<ChunkPlan> = vec![
+                ChunkPlan::fixed(s0),
+                ChunkPlan::fixed_shifted(s0, first_shift),
+                ChunkPlan::alternating(s1, s2),
+                ChunkPlan::random_range(seed, 1, s3.max(1)).with_first_chunk(first_shift),
+                ChunkPlan {
+                    pattern: ChunkPattern::Sequence(vec![1, s0, 2, s1, 3, s2, 5, s3]),
+                    seed: 0,
+                    first_chunk_len: None,
+                },
+                ChunkPlan::fixed(big).with_first_chunk(first_shift),
+            ];
+
+            for plan in plans {
+                let plan_dbg = format!("{plan:?}");
+                // Preserve the exact plan for regression capture before it is consumed.
+                let plan_for_regression = plan.clone();
+                let chunked = scan_chunked_records(&engine, &case.buf, plan);
+                if let Err(msg) = check_oracle_covered(&engine, &oracle, &chunked) {
+                    maybe_write_regression(
+                        "tiger_chunk_plans_cover_oracle",
+                        seed,
+                        &plan_for_regression,
+                        &case.buf,
+                    );
+                    prop_assert!(false, "plan={}: {}", plan_dbg, msg);
+                }
             }
         }
     }
-}
 
-proptest! {
-    // Focused boundary-alignment property: ensure a secret instance that
-    // straddles a chunk boundary is still reported.
-    #![proptest_config(ProptestConfig {
-        cases: 32,
-        .. ProptestConfig::default()
-    })]
+    proptest! {
+        // Focused boundary-alignment property: ensure a secret instance that
+        // straddles a chunk boundary is still reported.
+        #![proptest_config(ProptestConfig {
+            cases: 32,
+            .. ProptestConfig::default()
+        })]
 
-    #[test]
-    fn prop_tiger_boundary_crossing_not_dropped(
-        token_case in token_strategy(),
-        base in base_encoding_strategy(),
-        chain in transform_chain_strategy(),
-        seed in any::<u64>(),
-    ) {
-        let engine = correctness_engine();
-        let overlap = engine.required_overlap();
+        #[test]
+        fn prop_tiger_boundary_crossing_not_dropped(
+            token_case in token_strategy(),
+            base in base_encoding_strategy(),
+            chain in transform_chain_strategy(),
+            seed in any::<u64>(),
+        ) {
+            let engine = correctness_engine();
+            let overlap = engine.required_overlap();
 
-        // Build an encoded secret instance with safe surrounding bytes so
-        // word-boundary + delimiter validators are more likely to pass.
-        let mut token = token_case.token;
-        if requires_trailing_delimiter(token_case.rule_name) {
-            token.push(b' ');
-        }
-
-        let encoded = apply_encoding(&token, base, chain);
-        prop_assume!(encoded.len() >= 2);
-
-        // Choose a chunk size > overlap so we are testing the contract
-        // "overlap is sufficient", not the degenerate case where overlap equals
-        // the whole previous chunk.
-        let chunk_size = overlap.saturating_add(1).saturating_add(seed as usize % 256);
-
-        let k_max = overlap.min(encoded.len() - 1);
-        prop_assume!(k_max >= 1);
-
-        // Try a handful of k alignments that hit:
-        // - base64 quanta boundaries (mod 4)
-        // - url-percent triplets (mod 3)
-        // - utf16 odd/even boundaries (mod 2)
-        let ks = [1usize, 2, 3, 4, 7, 8, 15];
-
-        for &k in ks.iter() {
-            if k > k_max {
-                continue;
+            // Build an encoded secret instance with safe surrounding bytes so
+            // word-boundary + delimiter validators are more likely to pass.
+            let mut token = token_case.token;
+            if requires_trailing_delimiter(token_case.rule_name) {
+                token.push(b' ');
             }
 
-            // Place the token so that it starts `k` bytes before the boundary at
-            // `chunk_size`. That makes the token start within the overlap prefix
-            // of chunk 2, and finish in its payload.
-            let start = chunk_size - k;
+            let encoded = apply_encoding(&token, base, chain);
+            prop_assume!(encoded.len() >= 2);
 
-            let mut buf = vec![b'A'; start];
-            // Force a non-word byte right before the secret; this satisfies rules with
-            // require_word_boundary_before=true more often than random bytes.
-            if start > 0 {
-                buf[start - 1] = b' ';
-            }
+            // Choose a chunk size > overlap so we are testing the contract
+            // "overlap is sufficient", not the degenerate case where overlap equals
+            // the whole previous chunk.
+            let chunk_size = overlap.saturating_add(1).saturating_add(seed as usize % 256);
 
-            buf.extend_from_slice(&encoded);
-            buf.push(b' ');
-            buf.extend_from_slice(b"ZZZ");
+            let k_max = overlap.min(encoded.len() - 1);
+            prop_assume!(k_max >= 1);
 
-            let oracle = scan_one_chunk_records(&engine, &buf);
-            prop_assume!(!oracle.is_empty());
+            // Try a handful of k alignments that hit:
+            // - base64 quanta boundaries (mod 4)
+            // - url-percent triplets (mod 3)
+            // - utf16 odd/even boundaries (mod 2)
+            let ks = [1usize, 2, 3, 4, 7, 8, 15];
 
-            let chunked = scan_chunked_records(&engine, &buf, ChunkPlan::fixed(chunk_size));
-            if let Err(msg) = check_oracle_covered(&engine, &oracle, &chunked) {
-                let plan = ChunkPlan::fixed(chunk_size);
-                maybe_write_regression(
-                    "tiger_boundary_crossing_not_dropped",
-                    seed,
-                    &plan,
-                    &buf,
-                );
-                prop_assert!(false, "chunk_size={} k={}: {}", chunk_size, k, msg);
+            for &k in ks.iter() {
+                if k > k_max {
+                    continue;
+                }
+
+                // Place the token so that it starts `k` bytes before the boundary at
+                // `chunk_size`. That makes the token start within the overlap prefix
+                // of chunk 2, and finish in its payload.
+                let start = chunk_size - k;
+
+                let mut buf = vec![b'A'; start];
+                // Force a non-word byte right before the secret; this satisfies rules with
+                // require_word_boundary_before=true more often than random bytes.
+                if start > 0 {
+                    buf[start - 1] = b' ';
+                }
+
+                buf.extend_from_slice(&encoded);
+                buf.push(b' ');
+                buf.extend_from_slice(b"ZZZ");
+
+                let oracle = scan_one_chunk_records(&engine, &buf);
+                prop_assume!(!oracle.is_empty());
+
+                let chunked = scan_chunked_records(&engine, &buf, ChunkPlan::fixed(chunk_size));
+                if let Err(msg) = check_oracle_covered(&engine, &oracle, &chunked) {
+                    let plan = ChunkPlan::fixed(chunk_size);
+                    maybe_write_regression(
+                        "tiger_boundary_crossing_not_dropped",
+                        seed,
+                        &plan,
+                        &buf,
+                    );
+                    prop_assert!(false, "chunk_size={} k={}: {}", chunk_size, k, msg);
+                }
             }
         }
     }
@@ -1893,6 +2356,7 @@ fn base64_gate_utf16be_anchor_straddles_stream_boundary() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        secret_group: None,
         re: Regex::new("TOK").unwrap(),
     };
 
@@ -1943,6 +2407,7 @@ fn stream_window_recovers_after_ring_eviction() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        secret_group: None,
         re: Regex::new("TOK").unwrap(),
     };
 
@@ -1991,6 +2456,7 @@ fn stream_hit_cap_forces_full_fallback() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        secret_group: None,
         re: Regex::new("TOK").unwrap(),
     };
 
@@ -2041,6 +2507,7 @@ fn stream_nested_span_fallback_recovers() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        secret_group: None,
         re: Regex::new("TOK").unwrap(),
     };
 

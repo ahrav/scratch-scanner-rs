@@ -461,3 +461,56 @@ pub(super) fn u64_to_usize(v: u64) -> usize {
         v as usize
     }
 }
+
+/// Extracts the secret span from a regex match using capture group logic.
+///
+/// Many rules match more context than the actual secret (e.g., `KEY_([a-z0-9]+)`
+/// matches `KEY_abc123` but the secret is just `abc123`). This function extracts
+/// the narrowest meaningful span for deduplication and reporting.
+///
+/// # Priority
+/// 1. **Configured group**: If `secret_group` is set and that group matched
+///    non-empty content, use it. This allows rules with unconventional layouts.
+/// 2. **Gitleaks convention**: If capture group 1 exists and is non-empty, use it.
+///    Gitleaks rules place the secret in group 1 by convention.
+/// 3. **Full match fallback**: Otherwise, use group 0 (the entire match).
+///
+/// Empty groups are skipped because some patterns have optional groups that may
+/// match zero characters (e.g., `([A-Z]*)` matching empty string).
+///
+/// # Arguments
+/// - `captures`: The regex Captures from a successful match.
+/// - `secret_group`: Optional configured group index from `RuleSpec::secret_group`.
+///
+/// # Returns
+/// `(start, end)` byte offsets of the secret span relative to the search haystack.
+/// These offsets are in the same coordinate space as `Captures::get(0)`.
+///
+/// # Panics
+/// Panics if group 0 does not exist (impossible for a successful match).
+#[inline]
+pub(super) fn extract_secret_span(
+    captures: &regex::bytes::Captures<'_>,
+    secret_group: Option<u16>,
+) -> (usize, usize) {
+    // Priority 1: Use configured secret_group if set.
+    if let Some(gi) = secret_group {
+        if let Some(m) = captures.get(gi as usize) {
+            if m.start() < m.end() {
+                return (m.start(), m.end());
+            }
+        }
+    }
+
+    // Priority 2: Use capture group 1 (gitleaks convention).
+    // Skip if empty to handle optional groups like `([A-Z]*)`.
+    if let Some(m) = captures.get(1) {
+        if m.start() < m.end() {
+            return (m.start(), m.end());
+        }
+    }
+
+    // Priority 3: Fall back to full match (group 0).
+    let full = captures.get(0).expect("group 0 always exists");
+    (full.start(), full.end())
+}

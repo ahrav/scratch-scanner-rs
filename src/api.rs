@@ -562,6 +562,23 @@ pub struct RuleSpec {
     /// predictable and avoid noisy small-sample statistics.
     pub entropy: Option<EntropySpec>,
 
+    /// Optional capture group index for secret extraction.
+    ///
+    /// When set, the engine extracts the secret value from the specified capture
+    /// group rather than using the default heuristic. The default behavior (when
+    /// `None`) is to prefer capture group 1 if it exists and is non-empty, falling
+    /// back to the full match span.
+    ///
+    /// # Gitleaks Compatibility
+    /// Gitleaks rules conventionally place the secret in capture group 1. Setting
+    /// this field allows overriding that convention for rules with different capture
+    /// group layouts.
+    ///
+    /// # Indexing
+    /// - Group 0 is the full match (equivalent to not specifying a group).
+    /// - Groups 1+ are the parenthesized capture groups in order.
+    pub secret_group: Option<u16>,
+
     /// Final check. Bytes regex (no UTF-8 assumption).
     pub re: Regex,
 }

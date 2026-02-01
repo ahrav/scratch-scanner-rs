@@ -126,6 +126,7 @@ fn generic_api_key_rule() -> RuleSpec {
             min_len: 16,
             max_len: 256,
         }),
+        secret_group: None,
         re: build_regex(
             r#"(?i)[\w.-]{0,50}?(?:access|auth|(?-i:[Aa]pi|API)|credential|creds|key|passw(?:or)?d|secret|token)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([\w.=-]{10,150}|[a-z0-9][a-z0-9+/]{11,}={0,3})(?:[\x60'"\s;]|\\[nr]|$)"#,
         ),
@@ -143,6 +144,7 @@ fn impossible_rule(name: &'static str) -> RuleSpec {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        secret_group: None,
         re: build_regex(r"\xFF\xFE\xFD\xFC[a-z]{10}"),
     }
 }
@@ -162,6 +164,7 @@ fn github_pat_rule() -> RuleSpec {
             min_len: 16,
             max_len: 256,
         }),
+        secret_group: None,
         re: build_regex(r"ghp_[0-9a-zA-Z]{36}"),
     }
 }
@@ -177,6 +180,7 @@ fn aws_rule() -> RuleSpec {
         must_contain: None,
         keywords_any: Some(&[b"AKIA", b"AGPA", b"AIDA", b"AROA", b"AIPA"]),
         entropy: None,
+        secret_group: None,
         re: build_regex(r"(?:AKIA|AGPA|AIDA|AROA|AIPA)[A-Z0-9]{16}"),
     }
 }
@@ -391,6 +395,7 @@ fn bench_anchor_density(c: &mut Criterion) {
                 min_len: 16,
                 max_len: 256,
             }),
+            secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:access|auth|api|key|passw(?:or)?d|secret|token)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([\w.=-]{10,150})(?:[\x60'"\s;]|\\[nr]|$)"#,
             ),

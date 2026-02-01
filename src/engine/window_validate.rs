@@ -3,22 +3,36 @@
 //! Purpose: run a compiled rule against a fixed-size window of bytes and record
 //! findings while enforcing cheap gates and decode budgets.
 //!
-//! Invariants:
+//! # Invariants
 //! - Window ranges must be valid for the provided buffer.
 //! - For `Variant::Raw`, match spans are in raw byte space; for UTF-16 variants,
 //!   match spans are in decoded UTF-8 byte space.
 //! - `root_hint` (when present) is expressed in the same coordinate space as
 //!   `base_offset` and anchors findings back to the parent stream.
 //!
-//! High-level algorithm:
+//! # Algorithm
 //! 1. Apply cheap byte gates (must-contain, confirm-all, keyword gate).
 //! 2. For UTF-16 variants, decode with per-window and total-output budgets.
-//! 3. Run the regex, apply entropy gates, and record findings.
+//! 3. Run regex via `captures_iter` to access capture groups.
+//! 4. Apply entropy gates on the *full match* (group 0).
+//! 5. Extract the secret span using capture group priority (see [`extract_secret_span`]).
+//! 6. Record the finding with the extracted secret span.
 //!
-//! Design choices:
+//! # Secret Extraction
+//! The finding's `span_start`/`span_end` reflect the *secret* portion of the match,
+//! not necessarily the full regex match. This enables accurate deduplication: two
+//! findings with identical secrets (but different surrounding context) will hash
+//! the same. The extraction priority is:
+//! 1. Configured `secret_group` if present and non-empty.
+//! 2. Capture group 1 if non-empty (gitleaks convention).
+//! 3. Full match (group 0) as fallback.
+//!
+//! # Design Choices
 //! - Keyword/confirm gates run on raw UTF-16 bytes to avoid wasting decode budget.
 //! - UTF-16 findings attach a `DecodeStep::Utf16Window` so callers can map
 //!   decoded spans back to parent byte offsets.
+//!
+//! [`extract_secret_span`]: super::helpers::extract_secret_span
 
 use crate::api::{DecodeStep, FileId, FindingRec, StepId, Utf16Endianness};
 use memchr::memmem;
@@ -27,7 +41,7 @@ use std::ops::Range;
 use super::core::Engine;
 use super::helpers::{
     contains_all_memmem, contains_any_memmem, decode_utf16be_to_buf, decode_utf16le_to_buf,
-    entropy_gate_passes,
+    entropy_gate_passes, extract_secret_span,
 };
 use super::rule_repr::{RuleCompiled, Variant};
 use super::scratch::ScanScratch;
@@ -160,10 +174,11 @@ impl Engine {
                 let search_window = &window[search_start..];
 
                 let entropy = rule.entropy;
-                for rm in rule.re.find_iter(search_window) {
-                    // Adjust match offsets back to window coordinates.
-                    let match_start = search_start + rm.start();
-                    let match_end = search_start + rm.end();
+                for caps in rule.re.captures_iter(search_window) {
+                    // Get full match for entropy gating and anchor hint.
+                    let full_match = caps.get(0).expect("group 0 always exists");
+                    let match_start = search_start + full_match.start();
+                    let match_end = search_start + full_match.end();
 
                     if let Some(ent) = entropy {
                         let mbytes = &window[match_start..match_end];
@@ -179,8 +194,15 @@ impl Engine {
                         }
                     }
 
-                    let span_in_buf = (w.start + match_start)..(w.start + match_end);
-                    let root_span_hint = root_hint.clone().unwrap_or_else(|| span_in_buf.clone());
+                    // Extract secret span using capture group logic.
+                    let (secret_start, secret_end) = extract_secret_span(&caps, rule.secret_group);
+                    let secret_start = search_start + secret_start;
+                    let secret_end = search_start + secret_end;
+
+                    let span_in_buf = (w.start + secret_start)..(w.start + secret_end);
+                    // Use full window span for root_span_hint (aligned with UTF-16 path).
+                    // The secret span is still tracked via span_start/span_end.
+                    let root_span_hint = root_hint.clone().unwrap_or_else(|| w.clone());
 
                     scratch.push_finding(FindingRec {
                         file_id,
@@ -289,8 +311,9 @@ impl Engine {
                 let out = &mut scratch.out;
                 let dropped = &mut scratch.findings_dropped;
                 let entropy = rule.entropy;
-                for rm in rule.re.find_iter(decoded) {
-                    let span = rm.start()..rm.end();
+                for caps in rule.re.captures_iter(decoded) {
+                    let full_match = caps.get(0).expect("group 0 always exists");
+                    let span = full_match.start()..full_match.end();
 
                     if let Some(ent) = entropy {
                         let mbytes = &decoded[span.clone()];
@@ -306,14 +329,17 @@ impl Engine {
                         }
                     }
 
+                    // Extract secret span using capture group logic.
+                    let (secret_start, secret_end) = extract_secret_span(&caps, rule.secret_group);
+
                     let root_span_hint = root_hint.clone().unwrap_or_else(|| w.clone());
 
                     if out.len() < max_findings {
                         out.push(FindingRec {
                             file_id,
                             rule_id,
-                            span_start: span.start as u32,
-                            span_end: span.end as u32,
+                            span_start: secret_start as u32,
+                            span_end: secret_end as u32,
                             root_hint_start: base_offset + root_span_hint.start as u64,
                             root_hint_end: base_offset + root_span_hint.end as u64,
                             step_id: utf16_step_id,
@@ -393,10 +419,11 @@ impl Engine {
         let max_findings = scratch.max_findings;
         let out = &mut scratch.tmp_findings;
         let entropy = rule.entropy;
-        for rm in rule.re.find_iter(search_window) {
+        for caps in rule.re.captures_iter(search_window) {
+            let full_match = caps.get(0).expect("group 0 always exists");
             // Adjust match offsets back to window coordinates.
-            let match_start = search_start + rm.start();
-            let match_end = search_start + rm.end();
+            let match_start = search_start + full_match.start();
+            let match_end = search_start + full_match.end();
 
             if let Some(ent) = entropy {
                 let mbytes = &window[match_start..match_end];
@@ -411,8 +438,14 @@ impl Engine {
             }
 
             *found_any = true;
-            let span_start = window_start.saturating_add(match_start as u64) as usize;
-            let span_end = window_start.saturating_add(match_end as u64) as usize;
+
+            // Extract secret span using capture group logic.
+            let (secret_start, secret_end) = extract_secret_span(&caps, rule.secret_group);
+            let secret_start = search_start + secret_start;
+            let secret_end = search_start + secret_end;
+
+            let span_start = window_start.saturating_add(secret_start as u64) as usize;
+            let span_end = window_start.saturating_add(secret_end as u64) as usize;
             let span_in_buf = span_start..span_end;
             let root_span_hint = root_hint.clone().unwrap_or_else(|| span_in_buf.clone());
 
@@ -551,8 +584,9 @@ impl Engine {
         let max_findings = scratch.max_findings;
         let out = &mut scratch.tmp_findings;
         let entropy = rule.entropy;
-        for rm in rule.re.find_iter(decoded) {
-            let span = rm.start()..rm.end();
+        for caps in rule.re.captures_iter(decoded) {
+            let full_match = caps.get(0).expect("group 0 always exists");
+            let span = full_match.start()..full_match.end();
 
             if let Some(ent) = entropy {
                 let mbytes = &decoded[span.clone()];
@@ -567,14 +601,18 @@ impl Engine {
             }
 
             *found_any = true;
+
+            // Extract secret span using capture group logic.
+            let (secret_start, secret_end) = extract_secret_span(&caps, rule.secret_group);
+
             let root_span_hint = root_hint.clone().unwrap_or_else(|| parent_span.clone());
 
             if out.len() < max_findings {
                 out.push(FindingRec {
                     file_id,
                     rule_id,
-                    span_start: span.start as u32,
-                    span_end: span.end as u32,
+                    span_start: secret_start as u32,
+                    span_end: secret_end as u32,
                     root_hint_start: base_offset + root_span_hint.start as u64,
                     root_hint_end: base_offset + root_span_hint.end as u64,
                     step_id: utf16_step_id,

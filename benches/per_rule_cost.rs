@@ -144,6 +144,7 @@ fn main() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        secret_group: None,
         re: regex::bytes::Regex::new(r"\xFF\xFE\xFD\xFC[a-z]{10}").unwrap(),
     };
     let baseline_engine = Engine::new_with_anchor_policy(
