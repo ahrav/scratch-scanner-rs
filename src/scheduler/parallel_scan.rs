@@ -307,23 +307,39 @@ impl DirWalker {
             walker.run(|| {
                 let sender = sender.clone();
                 Box::new(move |result| {
-                    if let Ok(entry) = result {
-                        if let Some(ft) = entry.file_type() {
-                            if ft.is_file() {
-                                if let Ok(meta) = entry.metadata() {
-                                    let size = meta.len();
-                                    if size <= max_file_size && size > 0 {
-                                        let file = LocalFile {
-                                            path: entry.into_path(),
-                                            size,
-                                        };
-                                        // Stop walking if receiver dropped (scanner finished)
-                                        if sender.send(file).is_err() {
-                                            return ignore::WalkState::Quit;
+                    match result {
+                        Ok(entry) => {
+                            if let Some(ft) = entry.file_type() {
+                                if ft.is_file() {
+                                    match entry.metadata() {
+                                        Ok(meta) => {
+                                            let size = meta.len();
+                                            if size <= max_file_size && size > 0 {
+                                                let file = LocalFile {
+                                                    path: entry.into_path(),
+                                                    size,
+                                                };
+                                                // Stop walking if receiver dropped (scanner finished)
+                                                if sender.send(file).is_err() {
+                                                    return ignore::WalkState::Quit;
+                                                }
+                                            }
+                                        }
+                                        Err(_e) => {
+                                            #[cfg(debug_assertions)]
+                                            eprintln!(
+                                                "[DirWalker] Metadata error for {:?}: {}",
+                                                entry.path(),
+                                                _e
+                                            );
                                         }
                                     }
                                 }
                             }
+                        }
+                        Err(_e) => {
+                            #[cfg(debug_assertions)]
+                            eprintln!("[DirWalker] Discovery error: {}", _e);
                         }
                     }
                     ignore::WalkState::Continue
