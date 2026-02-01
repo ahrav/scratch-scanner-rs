@@ -217,6 +217,7 @@ pub mod budget;
 pub mod chunking;
 pub mod contract;
 pub mod executor;
+pub(crate) mod executor_core;
 pub mod metrics;
 pub mod rng;
 

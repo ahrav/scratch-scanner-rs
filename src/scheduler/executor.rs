@@ -52,6 +52,10 @@
 //!   Use `TokenBudget` to enforce `max_queued_tasks`.
 //! - **I/O completion integration**: the seam exists via [`ExecutorHandle::spawn()`].
 
+use super::executor_core::{
+    close_gate, decrement_count, in_flight, increment_count, is_accepting, ACCEPTING_BIT,
+    COUNT_UNIT, WAKE_ON_HOARD_THRESHOLD,
+};
 use super::metrics::WorkerMetricsLocal;
 use super::rng::XorShift64;
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
@@ -189,7 +193,7 @@ impl<T: Send + 'static> ExecutorHandle<T> {
         // CAS loop: atomically check accepting AND increment count
         let mut s = self.shared.state.load(Ordering::Acquire);
         loop {
-            if !Shared::<T>::is_accepting(s) {
+            if !is_accepting(s) {
                 return Err(task);
             }
             // Try to increment count (add 2 because count is in bits 1+)
@@ -212,7 +216,7 @@ impl<T: Send + 'static> ExecutorHandle<T> {
     /// Check if the executor is still accepting external work.
     #[inline]
     pub fn is_accepting(&self) -> bool {
-        Shared::<T>::is_accepting(self.shared.state.load(Ordering::Acquire))
+        is_accepting(self.shared.state.load(Ordering::Acquire))
     }
 }
 
@@ -286,9 +290,6 @@ impl<T: Send + 'static> ExecutorHandle<T> {
 /// | internal spawn | `fetch_add(2)` | count++ (workers only run when open) |
 /// | completion | `fetch_sub(2)` | count--; if result==0 && !accepting: done |
 /// | join/close | `fetch_and(!1)` | clear accepting bit |
-const ACCEPTING_BIT: usize = 1;
-const COUNT_UNIT: usize = 2;
-
 /// Shared state between all workers and the executor owner.
 ///
 /// # Ownership Model
@@ -362,18 +363,6 @@ struct Shared<T> {
 }
 
 impl<T> Shared<T> {
-    /// Extract in_flight count from state.
-    #[inline]
-    fn in_flight(state: usize) -> usize {
-        state >> 1
-    }
-
-    /// Check if accepting from state.
-    #[inline]
-    fn is_accepting(state: usize) -> bool {
-        (state & ACCEPTING_BIT) != 0
-    }
-
     /// Wake one worker (round-robin).
     fn unpark_one(&self) {
         let n = self.unparkers.len();
@@ -467,37 +456,6 @@ pub struct WorkerCtx<T, S> {
     local_spawns_since_wake: u32,
 }
 
-/// Threshold for local spawns before waking a sibling.
-///
-/// # Problem: Work Hoarding
-///
-/// Without this heuristic, a worker that rapidly spawns local tasks might
-/// accumulate thousands of tasks while siblings sleep. By the time siblings
-/// wake (on next steal attempt), tail latency spikes.
-///
-/// # Solution: Wake-on-Hoard
-///
-/// After `N` consecutive local spawns, wake one sibling proactively.
-/// This bounds the "hoarding window" to ~N tasks.
-///
-/// # Why 32?
-///
-/// | Threshold | Wakeup Rate | Overhead | Tail Latency |
-/// |-----------|-------------|----------|--------------|
-/// | 8 | High | ~12.5% of spawns trigger syscall | Low |
-/// | 32 | Medium | ~3% of spawns trigger syscall | Medium |
-/// | 128 | Low | ~0.8% of spawns trigger syscall | Higher |
-///
-/// 32 balances responsiveness with syscall overhead. For workloads with
-/// very short tasks (<1µs), consider lowering. For long tasks (>100µs),
-/// stealing latency is less critical.
-///
-/// # Tuning
-///
-/// Measure `steal_attempts` vs `steal_successes` in [`MetricsSnapshot`].
-/// If success rate is low and tail latency is high, lower this threshold.
-const WAKE_ON_HOARD_THRESHOLD: u32 = 32;
-
 impl<T: Send + 'static, S> WorkerCtx<T, S> {
     /// Spawn a task locally (preferred).
     ///
@@ -512,7 +470,7 @@ impl<T: Send + 'static, S> WorkerCtx<T, S> {
     #[inline]
     pub fn spawn_local(&mut self, task: T) {
         // Workers don't need to check accepting - they only run when executor is live
-        self.shared.state.fetch_add(COUNT_UNIT, Ordering::AcqRel);
+        increment_count(&self.shared.state);
         self.metrics.tasks_enqueued = self.metrics.tasks_enqueued.saturating_add(1);
         self.local.push(task);
 
@@ -536,7 +494,7 @@ impl<T: Send + 'static, S> WorkerCtx<T, S> {
     /// Higher contention than local spawn. Includes an unpark call.
     #[inline]
     pub fn spawn_global(&mut self, task: T) {
-        self.shared.state.fetch_add(COUNT_UNIT, Ordering::AcqRel);
+        increment_count(&self.shared.state);
         self.metrics.tasks_enqueued = self.metrics.tasks_enqueued.saturating_add(1);
         self.shared.injector.push(task);
         self.shared.unpark_one();
@@ -718,13 +676,10 @@ impl<T: Send + 'static> Executor<T> {
     pub fn join(mut self) -> super::metrics::MetricsSnapshot {
         // Atomically close the gate (clear accepting bit)
         // This prevents new external spawns while we wait
-        let prev_state = self
-            .shared
-            .state
-            .fetch_and(!ACCEPTING_BIT, Ordering::AcqRel);
+        let prev_state = close_gate(&self.shared.state);
 
         // If count was already 0 when we closed, we're done
-        if Shared::<T>::in_flight(prev_state) == 0 {
+        if in_flight(prev_state) == 0 {
             self.shared.initiate_done();
         }
 
@@ -846,20 +801,20 @@ fn worker_loop<T, S, RunnerFn>(
             }));
             if let Err(p) = res {
                 // Decrement state before breaking - the task was popped
-                ctx.shared.state.fetch_sub(COUNT_UNIT, Ordering::AcqRel);
+                decrement_count(&ctx.shared.state);
                 ctx.shared.record_panic(p);
                 break;
             }
 
             // Decrement count after execution
-            let prev_state = ctx.shared.state.fetch_sub(COUNT_UNIT, Ordering::AcqRel);
-            let prev_count = Shared::<T>::in_flight(prev_state);
+            let prev_state = decrement_count(&ctx.shared.state);
+            let prev_count = in_flight(prev_state);
             debug_assert!(prev_count > 0, "in_flight underflow");
 
             // If count is now 0 AND gate is closed, we're done
             // prev_state had count >= 1, so if prev_count == 1, new count is 0
             // Also check that accepting bit is not set
-            if prev_count == 1 && !Shared::<T>::is_accepting(prev_state) {
+            if prev_count == 1 && !is_accepting(prev_state) {
                 ctx.shared.initiate_done();
                 break;
             }
@@ -870,7 +825,7 @@ fn worker_loop<T, S, RunnerFn>(
         // No work found
         // Check combined state: if count==0 and not accepting, we're done
         let state = ctx.shared.state.load(Ordering::Acquire);
-        if Shared::<T>::in_flight(state) == 0 && !Shared::<T>::is_accepting(state) {
+        if in_flight(state) == 0 && !is_accepting(state) {
             ctx.shared.initiate_done();
             break;
         }
