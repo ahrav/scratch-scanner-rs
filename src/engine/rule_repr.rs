@@ -84,7 +84,7 @@ impl Variant {
 /// # Invariants
 /// - `rule_id` fits in the upper bits after `VARIANT_SHIFT`.
 /// - The low-bit layout is stable and must match `variant()` and flag accessors.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Target(u32);
 
 impl Target {
@@ -419,24 +419,29 @@ pub(super) fn add_pat_owned(
 
 /// Flatten a pattern->targets map into packed arrays used by the scan loop.
 ///
-/// The returned `patterns` order is the map's iteration order and is therefore
-/// not stable. The accompanying `offsets` vector provides the target slice for
-/// each pattern id.
+/// The returned `patterns` order is deterministic: patterns are sorted
+/// lexicographically by bytes and each pattern's target list is sorted by the
+/// packed `Target` value. The accompanying `offsets` vector provides the target
+/// slice for each pattern id.
 pub(super) fn map_to_patterns(
     map: AHashMap<Vec<u8>, Vec<Target>>,
 ) -> (Vec<Vec<u8>>, Vec<Target>, Vec<u32>) {
-    let mut patterns: Vec<Vec<u8>> = Vec::with_capacity(map.len());
+    let mut entries: Vec<(Vec<u8>, Vec<Target>)> = map.into_iter().collect();
+    entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+
+    let mut patterns: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
     let mut flat: Vec<Target> = Vec::new();
-    let mut offsets: Vec<u32> = Vec::with_capacity(map.len().saturating_add(1));
+    let mut offsets: Vec<u32> = Vec::with_capacity(entries.len().saturating_add(1));
     offsets.push(0);
 
     let mut total_targets = 0usize;
-    for ts in map.values() {
+    for (_, ts) in entries.iter() {
         total_targets = total_targets.saturating_add(ts.len());
     }
     flat.reserve(total_targets);
 
-    for (p, ts) in map {
+    for (p, mut ts) in entries {
+        ts.sort_unstable();
         patterns.push(p);
         flat.extend(ts);
         assert!(flat.len() <= u32::MAX as usize);
@@ -465,4 +470,43 @@ pub(super) fn utf16be_bytes(ascii: &[u8]) -> Vec<u8> {
         out.push(b);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn map_to_patterns_sorts_patterns_and_targets() {
+        let mut map: AHashMap<Vec<u8>, Vec<Target>> = AHashMap::new();
+        map.insert(
+            b"b".to_vec(),
+            vec![
+                Target::new(2, Variant::Raw, false, false),
+                Target::new(1, Variant::Raw, false, false),
+            ],
+        );
+        map.insert(
+            b"a".to_vec(),
+            vec![Target::new(3, Variant::Utf16Le, false, false)],
+        );
+        map.insert(
+            b"aa".to_vec(),
+            vec![Target::new(1, Variant::Raw, true, false)],
+        );
+
+        let (patterns, flat, offsets) = map_to_patterns(map);
+
+        assert_eq!(patterns, vec![b"a".to_vec(), b"aa".to_vec(), b"b".to_vec()]);
+        assert_eq!(offsets, vec![0, 1, 2, 4]);
+        assert_eq!(
+            flat,
+            vec![
+                Target::new(3, Variant::Utf16Le, false, false),
+                Target::new(1, Variant::Raw, true, false),
+                Target::new(1, Variant::Raw, false, false),
+                Target::new(2, Variant::Raw, false, false),
+            ]
+        );
+    }
 }
