@@ -57,6 +57,9 @@ pub struct ChunkParams {
     /// New bytes to read per chunk (excluding overlap).
     pub payload_bytes: u32,
     /// Overlap bytes to prepend from previous chunk's tail.
+    ///
+    /// This value typically comes from `EngineContract::required_overlap_bytes`
+    /// and ensures boundary-spanning matches are not missed.
     pub overlap_bytes: u32,
 }
 
@@ -175,6 +178,9 @@ impl ChunkMeta {
     }
 
     /// Check if this is the first chunk (no overlap prefix).
+    ///
+    /// Useful for initialization logic that should run once per object,
+    /// such as emitting object-start markers or initializing per-object state.
     #[inline]
     pub fn is_first_chunk(&self) -> bool {
         self.base_offset == 0 && self.prefix_len == 0
@@ -220,6 +226,31 @@ pub fn params_from_contract(
 /// - Each step "reads" up to `payload_bytes`
 /// - Each emitted chunk includes `prefix_len` overlap from the previous tail
 /// - `base_offset` is `offset - prefix_len` (start including overlap)
+///
+/// ## State Machine
+///
+/// ```text
+/// ┌─────────────────────────────────────────────────────────────────┐
+/// │  offset=0, tail_len=0                                           │
+/// │       │                                                         │
+/// │       ▼                                                         │
+/// │  ┌─────────┐  read=min(payload,remaining)  ┌─────────────────┐  │
+/// │  │ Chunk 0 │ ─────────────────────────────►│ offset+=read    │  │
+/// │  │ prefix=0│                               │ tail=min(ovlp,  │  │
+/// │  └─────────┘                               │      read)      │  │
+/// │                                            └────────┬────────┘  │
+/// │       ┌─────────────────────────────────────────────┘           │
+/// │       ▼                                                         │
+/// │  ┌─────────┐  offset < obj_len?            ┌─────────────────┐  │
+/// │  │ Chunk N │ ──────── yes ────────────────►│ emit chunk with │  │
+/// │  │prefix=  │                               │ prefix=tail_len │  │
+/// │  │tail_len │◄──────────────────────────────└─────────────────┘  │
+/// │  └────┬────┘                                                    │
+/// │       │ no                                                      │
+/// │       ▼                                                         │
+/// │     Done                                                        │
+/// └─────────────────────────────────────────────────────────────────┘
+/// ```
 ///
 /// # Performance
 ///
