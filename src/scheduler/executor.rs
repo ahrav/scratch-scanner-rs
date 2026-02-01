@@ -2,9 +2,34 @@
 //!
 //! # Architecture
 //!
+//! ```text
+//!                    ┌─────────────────────────────────────────────────────────────┐
+//!                    │                        Executor                             │
+//!                    │                                                             │
+//!  External ─────────┼────► Injector ──────┬──────────────────────────────────────┤
+//!  Producers         │      (Crossbeam)    │                                       │
+//!                    │                     ▼                                       │
+//!                    │     ┌─────────────────────────────────────────────────┐     │
+//!                    │     │   Worker 0    │   Worker 1    │   Worker N     │     │
+//!                    │     │  ┌─────────┐  │  ┌─────────┐  │  ┌─────────┐  │     │
+//!                    │     │  │ Deque   │◄─┼─►│ Deque   │◄─┼─►│ Deque   │  │     │
+//!                    │     │  │ (LIFO)  │  │  │ (LIFO)  │  │  │ (LIFO)  │  │     │
+//!                    │     │  └────┬────┘  │  └────┬────┘  │  └────┬────┘  │     │
+//!                    │     │       │       │       │       │       │       │     │
+//!                    │     │  ┌────▼────┐  │  ┌────▼────┐  │  ┌────▼────┐  │     │
+//!                    │     │  │WorkerCtx│  │  │WorkerCtx│  │  │WorkerCtx│  │     │
+//!                    │     │  │+ scratch│  │  │+ scratch│  │  │+ scratch│  │     │
+//!                    │     │  │+ metrics│  │  │+ metrics│  │  │+ metrics│  │     │
+//!                    │     │  └─────────┘  │  └─────────┘  │  └─────────┘  │     │
+//!                    │     └───────────────┴───────────────┴───────────────┘     │
+//!                    │                           ▲                                │
+//!                    │          Shared: state, done, unparkers                   │
+//!                    └─────────────────────────────────────────────────────────────┘
+//! ```
+//!
 //! - N worker threads (optionally pinned to cores)
 //! - Per-worker Chase-Lev deque (LIFO local, FIFO steal)
-//! - Per-worker scratch space via `WorkerCtx<T, S>`
+//! - Per-worker scratch space via [`WorkerCtx<T, S>`]
 //! - Global injector for external producers
 //! - Tiered idle strategy: spin → yield → park
 //!
@@ -25,7 +50,7 @@
 //!
 //! - **Bounded task queues**: crossbeam queues are unbounded.
 //!   Use `TokenBudget` from Phase 0 to enforce `max_queued_tasks`.
-//! - **I/O completion integration**: the seam exists via `ExecutorHandle::spawn()`.
+//! - **I/O completion integration**: the seam exists via [`ExecutorHandle::spawn()`].
 
 use super::metrics::WorkerMetricsLocal;
 use super::rng::XorShift64;
@@ -131,17 +156,26 @@ pub struct ExecutorHandle<T> {
 impl<T: Send + 'static> ExecutorHandle<T> {
     /// Spawn a task from outside the worker threads.
     ///
-    /// Returns `Err(task)` if the executor is shutting down.
+    /// # Errors
+    ///
+    /// Returns `Err(task)` if the executor is shutting down (i.e., `join()` has
+    /// been called). The task is returned so the caller can handle it.
     ///
     /// # Correctness
     ///
     /// Uses CAS to atomically check accepting + increment count, eliminating
-    /// the TOCTOU race between spawn and join.
+    /// the TOCTOU race between spawn and join. See [`ACCEPTING_BIT`] for details.
     ///
-    /// # Performance Note
+    /// # Performance
     ///
-    /// Uses the global injector queue. For high-frequency external spawns,
-    /// consider batching.
+    /// | Aspect | Cost |
+    /// |--------|------|
+    /// | CAS loop | 1-3 iterations typical (contention-dependent) |
+    /// | Injector push | O(1) amortized (Crossbeam MPMC) |
+    /// | Unpark | 1 syscall (futex on Linux, kevent on macOS) |
+    ///
+    /// For high-frequency external spawns, consider batching to amortize
+    /// the per-spawn syscall overhead.
     #[inline]
     pub fn spawn(&self, task: T) -> Result<(), T> {
         // CAS loop: atomically check accepting AND increment count
@@ -180,42 +214,142 @@ impl<T: Send + 'static> ExecutorHandle<T> {
 
 /// Combined executor state: `(in_flight_count << 1) | accepting_bit`
 ///
-/// This encoding ensures that "close gate" and "increment count" are mutually
-/// exclusive operations, eliminating the TOCTOU race between spawn and join.
+/// # Problem: TOCTOU Race in Spawn/Join
 ///
-/// - Bit 0: accepting_external (1 = accepting, 0 = closed)
-/// - Bits 1+: in_flight count (stored as count << 1)
+/// A naive implementation might use separate atomics for "accepting" and "count":
+/// ```text
+/// // BROKEN: Race between steps 1 and 2
+/// if accepting.load() {          // (1) check
+///     count.fetch_add(1);        // (2) increment
+///     // Another thread calls join() between (1) and (2)
+///     // → Task spawned after join "closed the gate"
+/// }
+/// ```
 ///
-/// State transitions:
-/// - init: `state = 1` (accepting, count=0)
-/// - external spawn: CAS loop "if accepting, count++"
-/// - internal spawn: `fetch_add(2)` (count++)
-/// - completion: `fetch_sub(2)` (count--); if result==0, done
-/// - join/close: `fetch_and(!1)` (clear accepting bit)
+/// # Solution: Combined Atomic State
+///
+/// ```text
+/// State = (in_flight_count << 1) | accepting_bit
+///
+///        63                              1   0
+///       ┌─────────────────────────────┬─────┐
+///       │      in_flight_count        │ A   │
+///       └─────────────────────────────┴─────┘
+///                                       │
+///                                       └── accepting bit (1=open, 0=closed)
+/// ```
+///
+/// # State Transitions
+///
+/// ```text
+///                      ┌─────────────────────────────────────────┐
+///                      │                                         │
+///                      ▼                                         │
+///  init ──► state=0x01 ──────────────────────────────────────────┤
+///           (accepting, count=0)                                 │
+///                │                                               │
+///                │ external spawn                                │
+///                │ CAS: if accepting, count++                    │
+///                ▼                                               │
+///           state=0x03 ────────► ... ────────► state=(2n+1)      │
+///           (accepting, count=1)               (accepting, n)    │
+///                │                                  │            │
+///                │ completion                       │ join()     │
+///                │ fetch_sub(2)                     │ fetch_and(!1)
+///                ▼                                  ▼            │
+///           state=0x01 ◄──────────────────── state=2n            │
+///           (accepting, count=0)             (closed, count=n)   │
+///                │                                  │            │
+///                │ join() when count=0             │ completions
+///                ▼                                  ▼            │
+///           state=0x00 ◄──────────────────── state=0x00          │
+///           (closed, count=0)                (closed, count=0)   │
+///                │                                               │
+///                └───────────────────────────────────────────────┘
+///                  initiate_done() → workers exit
+/// ```
+///
+/// # Operations
+///
+/// | Operation | Atomic | Effect |
+/// |-----------|--------|--------|
+/// | init | store | `state = 1` (accepting, count=0) |
+/// | external spawn | CAS loop | if accepting: count++ |
+/// | internal spawn | `fetch_add(2)` | count++ (workers only run when open) |
+/// | completion | `fetch_sub(2)` | count--; if result==0 && !accepting: done |
+/// | join/close | `fetch_and(!1)` | clear accepting bit |
 const ACCEPTING_BIT: usize = 1;
 const COUNT_UNIT: usize = 2;
 
 /// Shared state between all workers and the executor owner.
+///
+/// # Ownership Model
+///
+/// ```text
+///   Executor                          Worker threads
+///      │                                    │
+///      │    Arc<Shared<T>>                 │
+///      └────────┬───────────────────────────┘
+///               │
+///               ▼
+///         ┌───────────────────────────────────────────────┐
+///         │                  Shared<T>                    │
+///         │                                               │
+///         │  injector: Injector<T>    ◄── external spawn  │
+///         │  stealers: Vec<Stealer>   ◄── cross-worker    │
+///         │  state: AtomicUsize       ◄── spawn/join sync │
+///         │  done: AtomicBool         ◄── shutdown signal │
+///         │  unparkers: Vec<Unparker> ◄── wakeup handles  │
+///         │  panic: Mutex<Option<..>> ◄── error capture   │
+///         └───────────────────────────────────────────────┘
+/// ```
+///
+/// # Invariants
+///
+/// - `stealers.len() == unparkers.len() == config.workers`
+/// - `state` encodes both accepting flag and in-flight count (see `ACCEPTING_BIT`)
+/// - `done` is monotonic: once set to true, never cleared
+/// - `panic` captures only the first panic; subsequent panics are discarded
 struct Shared<T> {
     /// Global injector queue for external submissions.
+    ///
+    /// MPMC queue: any thread can push, workers batch-steal via `steal_batch_and_pop`.
     injector: Injector<T>,
+
     /// Stealers for each worker's local queue.
+    ///
+    /// `stealers[i]` steals from worker `i`'s local deque (FIFO steal order).
+    /// Workers use randomized victim selection to reduce correlated contention.
     stealers: Vec<Stealer<T>>,
 
     /// Combined state: `(in_flight << 1) | accepting`
     ///
     /// This single atomic eliminates the shutdown race between spawn and join.
+    /// See [`ACCEPTING_BIT`] for the encoding and state transition diagram.
     state: AtomicUsize,
 
-    /// Stop flag. Once true, workers exit.
+    /// Stop flag. Once true, workers exit their main loop.
+    ///
+    /// Set by:
+    /// - `initiate_done()` when count reaches 0 after gate closes
+    /// - `record_panic()` on first worker panic
     done: AtomicBool,
 
     /// Unparkers for each worker.
+    ///
+    /// Used by `unpark_one()` (round-robin) and `unpark_all()` (shutdown).
     unparkers: Vec<Unparker>,
+
     /// Round-robin counter for wakeups.
+    ///
+    /// Distributes wakeup load across workers. Relaxed ordering is fine—
+    /// we don't need precise round-robin, just approximate fairness.
     next_unpark: AtomicUsize,
 
     /// First panic captured from any worker.
+    ///
+    /// Only the first panic is stored; this simplifies error handling and
+    /// ensures `join()` propagates a deterministic panic.
     panic: Mutex<Option<Box<dyn Any + Send + 'static>>>,
 }
 
@@ -271,15 +405,39 @@ impl<T> Shared<T> {
 
 /// Per-worker context passed to every task execution.
 ///
-/// This is where you put per-worker state:
-/// - Scanner scratch buffers
-/// - Decode buffers
-/// - Per-worker buffer pool
-/// - Per-worker metrics
+/// # Overview
+///
+/// ```text
+///     WorkerCtx<T, S>
+///     ┌──────────────────────────────────────────────────────────────┐
+///     │                                                              │
+///     │  ┌─────────────────────┐    ┌────────────────────────────┐  │
+///     │  │  User-Facing        │    │  Internal                  │  │
+///     │  │                     │    │                            │  │
+///     │  │  worker_id: usize   │    │  local: Worker<T>  (deque) │  │
+///     │  │  scratch: S         │    │  parker: Parker            │  │
+///     │  │  rng: XorShift64    │    │  shared: Arc<Shared<T>>    │  │
+///     │  │  metrics: Local     │    │                            │  │
+///     │  │                     │    │                            │  │
+///     │  └─────────────────────┘    └────────────────────────────┘  │
+///     │                                                              │
+///     │  Methods:                                                    │
+///     │    spawn_local()   - enqueue to own deque (fast)            │
+///     │    spawn_global()  - enqueue to injector (slower)           │
+///     │    handle()        - get ExecutorHandle for external use    │
+///     │                                                              │
+///     └──────────────────────────────────────────────────────────────┘
+/// ```
+///
+/// # Typical Scratch Contents
+///
+/// - Scanner scratch buffers (regex match state, decode buffers)
+/// - Per-worker memory pools (avoid global allocator contention)
+/// - Thread-local caches (compiled regexes, lookup tables)
 ///
 /// # Type Parameters
 ///
-/// - `T`: Task type
+/// - `T`: Task type. Should be small (≤32 bytes) and `Copy` if possible.
 /// - `S`: User-defined scratch type, initialized via `scratch_init`
 pub struct WorkerCtx<T, S> {
     /// Worker ID (0..workers).
@@ -303,11 +461,33 @@ pub struct WorkerCtx<T, S> {
 
 /// Threshold for local spawns before waking a sibling.
 ///
-/// If a worker spawns this many tasks locally without waking anyone,
-/// it signals a potential idle sibling to help.
+/// # Problem: Work Hoarding
 ///
-/// Tuning: Higher = less wakeup overhead, higher tail latency.
-/// Lower = more responsive stealing, more syscall overhead.
+/// Without this heuristic, a worker that rapidly spawns local tasks might
+/// accumulate thousands of tasks while siblings sleep. By the time siblings
+/// wake (on next steal attempt), tail latency spikes.
+///
+/// # Solution: Wake-on-Hoard
+///
+/// After `N` consecutive local spawns, wake one sibling proactively.
+/// This bounds the "hoarding window" to ~N tasks.
+///
+/// # Why 32?
+///
+/// | Threshold | Wakeup Rate | Overhead | Tail Latency |
+/// |-----------|-------------|----------|--------------|
+/// | 8 | High | ~12.5% of spawns trigger syscall | Low |
+/// | 32 | Medium | ~3% of spawns trigger syscall | Medium |
+/// | 128 | Low | ~0.8% of spawns trigger syscall | Higher |
+///
+/// 32 balances responsiveness with syscall overhead. For workloads with
+/// very short tasks (<1µs), consider lowering. For long tasks (>100µs),
+/// stealing latency is less critical.
+///
+/// # Tuning
+///
+/// Measure `steal_attempts` vs `steal_successes` in [`MetricsSnapshot`].
+/// If success rate is low and tail latency is high, lower this threshold.
 const WAKE_ON_HOARD_THRESHOLD: u32 = 32;
 
 impl<T: Send + 'static, S> WorkerCtx<T, S> {
@@ -570,6 +750,65 @@ impl<T: Send + 'static> Executor<T> {
 // ============================================================================
 
 /// Main worker loop.
+///
+/// # Algorithm
+///
+/// ```text
+///                         ┌─────────────┐
+///                         │  Start      │
+///                         └──────┬──────┘
+///                                │
+///                                ▼
+///                         ┌─────────────┐
+///                    ┌────│ done flag?  │────┐
+///                    │yes └─────────────┘ no │
+///                    │                       │
+///                    ▼                       ▼
+///              ┌─────────┐           ┌─────────────┐
+///              │  Exit   │           │  pop_task() │
+///              └─────────┘           └──────┬──────┘
+///                                           │
+///                    ┌──────────────────────┼──────────────────────┐
+///                    │ Some(task)           │ None                 │
+///                    ▼                       ▼                      │
+///             ┌─────────────┐        ┌─────────────┐               │
+///             │ Execute     │        │ Check state │               │
+///             │ runner(task)│        │ count==0 && │               │
+///             └──────┬──────┘        │ !accepting? │               │
+///                    │               └──────┬──────┘               │
+///                    ▼                      │                       │
+///             ┌─────────────┐        ┌──────┴──────┐               │
+///             │ Decrement   │        │ yes      no │               │
+///             │ in_flight   │        ▼             ▼               │
+///             └──────┬──────┘   ┌─────────┐  ┌─────────────┐       │
+///                    │          │ Done!   │  │ Tiered idle │       │
+///                    │          │ Signal  │  │ spin→yield→ │       │
+///                    │          │ shutdown│  │ park        │       │
+///                    │          └─────────┘  └──────┬──────┘       │
+///                    │                              │               │
+///                    └──────────────────────────────┴───────────────┘
+///                                      │
+///                                      ▼
+///                               (loop continues)
+/// ```
+///
+/// # Tiered Idle Strategy
+///
+/// When no work is found, workers use a graduated backoff:
+///
+/// 1. **Spin** (`idle_rounds <= spin_iters`): CPU-bound spinning with `spin_loop()` hint.
+///    Best for bursty workloads where work arrives within nanoseconds.
+///
+/// 2. **Yield** (every 16th iteration): `thread::yield_now()` gives other threads a chance.
+///    Reduces CPU pressure when spinning isn't productive.
+///
+/// 3. **Park** (after spin threshold): `park_timeout()` sleeps until unparked or timeout.
+///    Minimizes CPU waste during idle periods while remaining responsive.
+///
+/// # Complexity
+///
+/// - **Per-iteration**: O(steal_tries) worst case (randomized victim selection)
+/// - **Termination**: O(1) check via combined atomic state
 fn worker_loop<T, S, RunnerFn>(
     cfg: ExecutorConfig,
     runner: &Arc<RunnerFn>,
@@ -654,6 +893,55 @@ fn worker_loop<T, S, RunnerFn>(
 }
 
 /// Try to pop a task: local first, then injector, then steal.
+///
+/// # Priority Order
+///
+/// ```text
+///  ┌─────────────────────────────────────────────────────────────────┐
+///  │                        pop_task()                               │
+///  │                                                                 │
+///  │   ┌──────────────┐                                              │
+///  │   │ 1. Local pop │  ◄── LIFO, best cache locality              │
+///  │   │    O(1)      │      Same core, hot L1/L2 cache             │
+///  │   └──────┬───────┘                                              │
+///  │          │ empty                                                │
+///  │          ▼                                                      │
+///  │   ┌──────────────────────┐                                      │
+///  │   │ 2. Injector batch    │  ◄── MPMC, moderate contention      │
+///  │   │    steal_batch_and_pop│      Batch amortizes lock cost      │
+///  │   │    O(batch_size)     │                                      │
+///  │   └──────┬───────────────┘                                      │
+///  │          │ empty                                                │
+///  │          ▼                                                      │
+///  │   ┌──────────────────────┐                                      │
+///  │   │ 3. Victim stealing   │  ◄── Randomized to avoid hot spots  │
+///  │   │    O(steal_tries)    │      FIFO steal preserves fairness   │
+///  │   │    random victim     │                                      │
+///  │   └──────────────────────┘                                      │
+///  │                                                                 │
+///  └─────────────────────────────────────────────────────────────────┘
+/// ```
+///
+/// # Why This Order?
+///
+/// 1. **Local pop**: Zero contention (single-threaded fast path), best locality.
+///    Tasks spawned locally likely operate on data still in L1/L2 cache.
+///
+/// 2. **Injector**: External work needs distribution. Batch steal moves multiple
+///    tasks to the local deque, amortizing the cost of global queue access.
+///
+/// 3. **Stealing**: Last resort when both local and injector are empty.
+///    Randomized victim selection prevents "thundering herd" on a single hot worker.
+///
+/// # Randomized Victim Selection
+///
+/// Instead of round-robin (which causes correlated stealing when all workers
+/// are idle), we pick random victims. This distributes steal attempts uniformly,
+/// reducing contention spikes.
+///
+/// The formula `victim = rng.next_usize(n-1); if victim >= self { victim += 1 }`
+/// ensures we never steal from ourselves while maintaining uniform distribution
+/// over the remaining N-1 workers.
 fn pop_task<T, S>(steal_tries: u32, ctx: &mut WorkerCtx<T, S>) -> Option<T>
 where
     T: Send + 'static,
@@ -680,6 +968,7 @@ where
 
     for _ in 0..steal_tries {
         // Pick random victim, excluding self
+        // Formula: [0, n-1) → [0, n) \ {self}
         let mut victim = ctx.rng.next_usize(n - 1);
         if victim >= ctx.worker_id {
             victim += 1;
