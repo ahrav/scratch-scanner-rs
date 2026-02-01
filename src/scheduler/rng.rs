@@ -52,7 +52,10 @@ impl XorShift64 {
         Self { state: seed }
     }
 
-    /// Generate the next u64 value.
+    /// Generate the next u64 value using XorShift64.
+    ///
+    /// The shift constants (13, 7, 17) are from Marsaglia's "Xorshift RNGs" paper
+    /// and produce a full-period generator (2^64 - 1 values before repeating).
     #[inline]
     pub fn next_u64(&mut self) -> u64 {
         let mut x = self.state;
@@ -152,7 +155,10 @@ impl XorShift64 {
         }
     }
 
-    /// Get the current state (for debugging/checkpointing).
+    /// Get the current state for debugging or checkpointing.
+    ///
+    /// Useful for reproducing specific execution traces: save state before
+    /// a sequence, then recreate with `XorShift64::new(saved_state)`.
     #[inline]
     pub fn state(&self) -> u64 {
         self.state
@@ -177,10 +183,14 @@ impl Default for XorShift64 {
     }
 }
 
-/// SplitMix64 mixing function.
+/// SplitMix64 mixing function from Sebastiano Vigna's "Further scramblings of Marsaglia's
+/// xorshift generators" (2017).
 ///
 /// Used to improve seed quality when forking RNGs.
 /// Turns correlated sequential outputs into well-distributed seeds.
+///
+/// The constants are carefully chosen to achieve good avalanche behavior:
+/// each input bit affects roughly half the output bits.
 #[inline]
 fn splitmix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E3779B97F4A7C15);
