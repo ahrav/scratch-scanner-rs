@@ -43,9 +43,18 @@ use std::sync::Mutex;
 // Finding Types
 // ============================================================================
 
-/// Unique identifier for an object being scanned.
+/// Unique identifier for an object in the findings system.
+///
+/// **Note**: This is distinct from `contract::ObjectId` which is a structured
+/// identifier with `(source, idx)` fields. This is a simple u64 wrapper
+/// used for finding deduplication and output ordering.
+///
+/// The caller is responsible for mapping their object identifiers to `u64`.
+/// Typical mappings:
+/// - For `contract::ObjectId`: `(source.0 as u64) << 32 | idx as u64`
+/// - For file IDs: use the file ID directly
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ObjectId(pub u64);
+pub struct FindingObjectId(pub u64);
 
 /// Unique identifier for a detector type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -131,7 +140,7 @@ fn trim_bytes(bytes: &[u8]) -> &[u8] {
 /// dedupe truly identical secrets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FindingKey {
-    pub object_id: ObjectId,
+    pub object_id: FindingObjectId,
     pub start_offset: u64,
     pub end_offset: u64,
     pub detector_id: DetectorId,
@@ -143,7 +152,7 @@ pub struct FindingKey {
 pub struct Finding {
     // === Dedup Key Fields ===
     /// Object where finding was detected.
-    pub object_id: ObjectId,
+    pub object_id: FindingObjectId,
 
     /// Byte offset where secret starts.
     pub start_offset: u64,
@@ -583,7 +592,7 @@ mod tests {
         confidence: f32,
     ) -> Finding {
         Finding {
-            object_id: ObjectId(object_id),
+            object_id: FindingObjectId(object_id),
             start_offset: start,
             end_offset: end,
             detector_id: DetectorId(detector),

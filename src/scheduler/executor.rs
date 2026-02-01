@@ -838,24 +838,17 @@ fn worker_loop<T, S, RunnerFn>(
             idle_rounds = 0;
             ctx.metrics.tasks_executed = ctx.metrics.tasks_executed.saturating_add(1);
 
-            // Execute task (with panic catching in tests)
-            #[cfg(any(test, feature = "catch-panics"))]
-            {
-                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    (runner)(task, ctx);
-                }));
-                if let Err(p) = res {
-                    // FIX: Decrement state before breaking on panic
-                    // The task was popped, so we must account for it
-                    ctx.shared.state.fetch_sub(COUNT_UNIT, Ordering::AcqRel);
-                    ctx.shared.record_panic(p);
-                    break;
-                }
-            }
-
-            #[cfg(not(any(test, feature = "catch-panics")))]
-            {
+            // Execute task (always catch panics to ensure counter consistency).
+            // Without panic catching, a panic would bypass the fetch_sub below,
+            // leaving in_flight inflated and causing join() to block forever.
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 (runner)(task, ctx);
+            }));
+            if let Err(p) = res {
+                // Decrement state before breaking - the task was popped
+                ctx.shared.state.fetch_sub(COUNT_UNIT, Ordering::AcqRel);
+                ctx.shared.record_panic(p);
+                break;
             }
 
             // Decrement count after execution
@@ -950,6 +943,7 @@ fn worker_loop<T, S, RunnerFn>(
 /// The formula `victim = rng.next_usize(n-1); if victim >= self { victim += 1 }`
 /// ensures we never steal from ourselves while maintaining uniform distribution
 /// over the remaining N-1 workers.
+#[inline(always)]
 fn pop_task<T, S>(steal_tries: u32, ctx: &mut WorkerCtx<T, S>) -> Option<T>
 where
     T: Send + 'static,
@@ -1003,10 +997,21 @@ where
 fn pin_current_thread(worker_id: usize) {
     let cores = match core_affinity::get_core_ids() {
         Some(v) if !v.is_empty() => v,
-        _ => return,
+        _ => {
+            eprintln!(
+                "WARN: Failed to get core IDs for worker {}, skipping affinity",
+                worker_id
+            );
+            return;
+        }
     };
     let core = cores[worker_id % cores.len()];
-    let _ = core_affinity::set_for_current(core);
+    if !core_affinity::set_for_current(core) {
+        eprintln!(
+            "WARN: Failed to pin worker {} to core {:?}",
+            worker_id, core.id
+        );
+    }
 }
 
 // ============================================================================

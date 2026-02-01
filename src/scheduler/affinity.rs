@@ -206,9 +206,16 @@ pub fn first_allowed_cpu() -> Option<usize> {
 /// Returns 1 if parallelism cannot be determined (e.g., exotic platform
 /// or permission denied). Code should handle the single-CPU case gracefully.
 pub fn num_cpus() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
+    match std::thread::available_parallelism() {
+        Ok(n) => n.get(),
+        Err(e) => {
+            eprintln!(
+                "WARN: Could not determine CPU count ({}), defaulting to 1",
+                e
+            );
+            1
+        }
+    }
 }
 
 /// Pins the current thread to a specific core, logging failures.

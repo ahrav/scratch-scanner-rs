@@ -266,6 +266,11 @@ pub struct LocalStats {
     pub files_enqueued: u64,
     /// Total bytes across all enqueued files.
     pub bytes_enqueued: u64,
+    /// Files that failed to process due to I/O errors.
+    ///
+    /// This includes file open failures, metadata read failures, and
+    /// read errors during scanning. Aggregated from worker metrics.
+    pub io_errors: u64,
 }
 
 /// Complete report from a local scan.
@@ -375,6 +380,7 @@ fn process_file(task: FileTask, ctx: &mut WorkerCtx<FileTask, LocalScratch>) {
     let mut file = match File::open(&task.path) {
         Ok(f) => f,
         Err(e) => {
+            ctx.metrics.io_errors = ctx.metrics.io_errors.saturating_add(1);
             #[cfg(debug_assertions)]
             eprintln!("[local] Failed to open file {:?}: {}", task.path, e);
             let _ = e;
@@ -388,6 +394,7 @@ fn process_file(task: FileTask, ctx: &mut WorkerCtx<FileTask, LocalScratch>) {
     let file_size = match file.metadata() {
         Ok(m) => m.len(),
         Err(e) => {
+            ctx.metrics.io_errors = ctx.metrics.io_errors.saturating_add(1);
             #[cfg(debug_assertions)]
             eprintln!("[local] Failed to get metadata {:?}: {}", task.path, e);
             let _ = e;
@@ -422,14 +429,22 @@ fn process_file(task: FileTask, ctx: &mut WorkerCtx<FileTask, LocalScratch>) {
             buf.as_mut_slice().copy_within(have - carry..have, 0);
         }
 
-        // Read next payload bytes after the prefix
+        // Read next payload bytes after the prefix.
+        // Cap by remaining snapshot size to maintain point-in-time semantics:
+        // if the file grows after open, we only scan up to the original size.
         let read_start = carry;
-        let read_max = chunk_size.min(buf.len() - carry);
+        let remaining_in_snapshot = file_size.saturating_sub(offset) as usize;
+        if remaining_in_snapshot == 0 {
+            // Reached snapshot boundary - done with this file
+            break;
+        }
+        let read_max = chunk_size.min(buf.len() - carry).min(remaining_in_snapshot);
         let dst = &mut buf.as_mut_slice()[read_start..read_start + read_max];
 
         let n = match read_some(&mut file, dst) {
             Ok(n) => n,
             Err(e) => {
+                ctx.metrics.io_errors = ctx.metrics.io_errors.saturating_add(1);
                 #[cfg(debug_assertions)]
                 eprintln!("[local] Read failed: {}", e);
                 let _ = e;
@@ -630,6 +645,9 @@ pub fn scan_local<S: FileSource>(
     let metrics = ex.join();
 
     out.flush();
+
+    // Aggregate I/O errors from worker metrics into stats
+    stats.io_errors = metrics.io_errors;
 
     LocalReport { stats, metrics }
 }
