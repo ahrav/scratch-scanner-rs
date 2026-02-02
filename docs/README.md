@@ -79,30 +79,12 @@ Documentation index for the scanner-rs secret scanning engine. This guide helps 
 
 ---
 
-### 5. Performance & Optimization
-
-#### Analysis & Investigations
-| Document | Focus | Key Findings |
-|----------|-------|--------------|
-| [throughput_analysis.md](throughput_analysis.md) | Layer-by-layer metrics | 489 MiB/s ASCII, 170 MiB/s random, gaps analysis |
-| [throughput_bottleneck_analysis.md](throughput_bottleneck_analysis.md) | Two primary bottlenecks | Vectorscan automaton complexity vs validation cost |
-| [throughput_investigation.md](throughput_investigation.md) | 10× performance gap | generic-api-key has 20 anchors, not 270 |
-
-#### Optimization Work
-| Document | Focus | Key Findings |
-|----------|-------|--------------|
-| [rule_optimization_analysis.md](rule_optimization_analysis.md) | 222 gitleaks rules analyzed | 4 optimization categories, 2.4-6.4× speedups |
-| [anchor_optimization_spec.md](anchor_optimization_spec.md) | Exact changes for anchor optimization | JWT `ey`→`eyJ`, Vault token split |
-
----
-
-### 6. Memory Management & Correctness
+### 5. Memory Management & Correctness
 
 | Document | Focus | Key Concepts |
 |----------|-------|--------------|
 | [memory-management.md](memory-management.md) | Buffer lifecycle & pools | BufferPool, RAII, 136×2MB buffers, DecodeSlab, ScanScratch |
 | [kani-verification.md](kani-verification.md) | Formal verification | Kani model checking for TimingWheel (8 proofs), Bitset2 (5 proofs) |
-| [tiger_harness_plan.md](tiger_harness_plan.md) | Deterministic testing | Simulation-style harness for chunking semantics validation |
 
 ---
 
@@ -114,7 +96,6 @@ Documentation index for the scanner-rs secret scanning engine. This guide helps 
 | Understand the overall architecture | [architecture-overview.md](architecture-overview.md) |
 | Learn how detection works | [detection-engine.md](detection-engine.md) |
 | Add a new detection rule | [detection-rules.md](detection-rules.md) |
-| Optimize performance | [throughput_analysis.md](throughput_analysis.md) → [rule_optimization_analysis.md](rule_optimization_analysis.md) |
 | Understand the pipeline | [pipeline-flow.md](pipeline-flow.md) → [pipeline-state-machine.md](pipeline-state-machine.md) |
 | Work on the scheduler | [scheduler-local.md](scheduler-local.md) → [scheduler-task-graph.md](scheduler-task-graph.md) |
 | Debug memory issues | [memory-management.md](memory-management.md) |
@@ -142,7 +123,7 @@ Documentation index for the scanner-rs secret scanning engine. This guide helps 
 | `src/scheduler/device_slots.rs` | [scheduler-device-slots.md](scheduler-device-slots.md) |
 | `src/scheduler/global_resource_pool.rs` | [scheduler-global-resource-pool.md](scheduler-global-resource-pool.md) |
 | `src/pipeline.rs` | [pipeline-flow.md](pipeline-flow.md), [pipeline-state-machine.md](pipeline-state-machine.md) |
-| `src/gitleaks_rules.rs` | [detection-rules.md](detection-rules.md), [anchor_optimization_spec.md](anchor_optimization_spec.md) |
+| `src/gitleaks_rules.rs` | [detection-rules.md](detection-rules.md) |
 
 ---
 
