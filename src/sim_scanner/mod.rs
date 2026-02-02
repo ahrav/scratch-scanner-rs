@@ -10,7 +10,7 @@ pub mod scenario;
 
 pub use crate::sim::fs::{SimFsSpec, SimNodeSpec, SimPath};
 pub use replay::replay_artifact;
-pub use runner::{FailureKind, FailureReport, RunOutcome};
+pub use runner::{FailureKind, FailureReport, RunOutcome, ScannerSimRunner};
 pub use scenario::{
     ExpectedSecret, RuleSuiteSpec, RunConfig, Scenario, SecretRepr, SpanU32, SyntheticRuleSpec,
 };

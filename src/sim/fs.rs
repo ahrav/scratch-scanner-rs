@@ -128,6 +128,14 @@ impl SimFs {
         handle.cursor = offset.saturating_add(data.len() as u64);
         Ok(data)
     }
+
+    /// Return file paths in deterministic order.
+    pub fn file_paths(&self) -> Vec<SimPath> {
+        self.files
+            .keys()
+            .map(|bytes| SimPath::new(bytes.clone()))
+            .collect()
+    }
 }
 
 /// Handle to a simulated file.
