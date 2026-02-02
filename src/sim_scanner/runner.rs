@@ -365,7 +365,10 @@ struct FindingKey {
 
 impl From<&FindingRec> for FindingKey {
     fn from(rec: &FindingRec) -> Self {
-        let (span_start, span_end) = if rec.step_id == STEP_ROOT {
+        // Use dedupe_with_span to determine whether span contributes to finding identity.
+        // This is more accurate than checking step_id == STEP_ROOT since derived findings
+        // can also have stable spans when dedupe_with_span is true.
+        let (span_start, span_end) = if rec.dedupe_with_span {
             (rec.span_start, rec.span_end)
         } else {
             (0, 0)
@@ -382,6 +385,9 @@ impl From<&FindingRec> for FindingKey {
 }
 
 /// Output collector that enforces a no-duplicates invariant.
+///
+/// Set `SCANNER_SIM_DUP_DEBUG=1` to print diagnostic details when duplicate
+/// findings are detected.
 struct OutputCollector {
     findings: Vec<FindingRec>,
     seen: BTreeSet<FindingKey>,
@@ -404,6 +410,21 @@ impl OutputCollector {
                 continue;
             }
             if !self.seen.insert(key) {
+                if std::env::var_os("SCANNER_SIM_DUP_DEBUG").is_some() {
+                    if let Some(prev) = self
+                        .findings
+                        .iter()
+                        .find(|existing| FindingKey::from(*existing) == key)
+                    {
+                        eprintln!(
+                            "duplicate finding details:\n  prev={prev:?}\n  new={rec:?}\n  key={key:?}"
+                        );
+                    } else {
+                        eprintln!(
+                            "duplicate finding details (prev not found): key={key:?} new={rec:?}"
+                        );
+                    }
+                }
                 return Err(FailureReport {
                     kind: FailureKind::InvariantViolation { code: 20 },
                     message: format!("duplicate finding emitted: {:?}", key),

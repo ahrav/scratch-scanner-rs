@@ -7,9 +7,10 @@
 //! - `SIM_RUN_*` overrides run config (workers/chunk/overlap/stability/etc).
 
 use std::collections::BTreeMap;
+use std::fs;
 
 use scanner_rs::sim::fault::{Corruption, FaultPlan, FileFaultPlan, IoFault, ReadFault};
-use scanner_rs::sim::SimRng;
+use scanner_rs::sim::{ReproArtifact, SimRng, TraceDump};
 use scanner_rs::sim_scanner::{
     build_engine_from_suite, generate_scenario, RunConfig, RunOutcome, ScannerSimRunner,
     ScenarioGenConfig, SecretRepr,
@@ -121,6 +122,16 @@ fn bounded_random_scanner_sims() {
                         serde_json::to_string_pretty(&scenario).unwrap()
                     );
                 }
+                if std::env::var_os("SCANNER_SIM_WRITE_FAIL").is_some() {
+                    write_failure_artifact(
+                        seed,
+                        schedule_seed,
+                        &run_cfg,
+                        &scenario,
+                        &fault_plan,
+                        &fail,
+                    );
+                }
                 panic!("scanner sim failed (seed {seed}): {fail:?}");
             }
         }
@@ -223,4 +234,48 @@ fn random_fault_plan(
     }
 
     FaultPlan { per_file }
+}
+
+fn write_failure_artifact(
+    scenario_seed: u64,
+    schedule_seed: u64,
+    run_config: &RunConfig,
+    scenario: &scanner_rs::sim_scanner::Scenario,
+    fault_plan: &FaultPlan,
+    failure: &scanner_rs::sim_scanner::FailureReport,
+) {
+    let artifact = ReproArtifact {
+        schema_version: 1,
+        scanner_pkg_version: "dev".to_string(),
+        git_commit: None,
+        target: "local".to_string(),
+        scenario_seed,
+        schedule_seed,
+        run_config: run_config.clone(),
+        scenario: scenario.clone(),
+        fault_plan: fault_plan.clone(),
+        failure: failure.clone(),
+        trace: TraceDump {
+            ring: Vec::new(),
+            full: None,
+        },
+    };
+
+    let out_dir = "tests/failures";
+    if let Err(err) = fs::create_dir_all(out_dir) {
+        eprintln!("scanner sim: failed to create {out_dir}: {err}");
+        return;
+    }
+
+    let path = format!("{out_dir}/scanner_seed_{scenario_seed}.case.json");
+    match serde_json::to_string_pretty(&artifact) {
+        Ok(json) => {
+            if let Err(err) = fs::write(&path, json) {
+                eprintln!("scanner sim: failed to write {path}: {err}");
+            }
+        }
+        Err(err) => {
+            eprintln!("scanner sim: failed to serialize artifact: {err}");
+        }
+    }
 }
