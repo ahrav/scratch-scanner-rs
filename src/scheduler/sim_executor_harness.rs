@@ -470,12 +470,44 @@ impl TaskTraceHooks for NoopTaskTrace {
 
 /// Bytecode VM for scheduler simulations.
 ///
+/// # Execution Model
+///
+/// ```text
+///   LogicalTask                    Executor Queue
+///   ┌─────────────┐               ┌───────────────┐
+///   │ program: 0  │               │               │
+///   │ pc: 0       │  ◄────────────│  run-token    │
+///   │ blocked: No │               │  (TaskId=42)  │
+///   └─────────────┘               └───────────────┘
+///         │
+///         │ exec_one(tid=42)
+///         ▼
+///   ┌─────────────┐
+///   │ Execute     │
+///   │ programs[0] │
+///   │   .code[0]  │
+///   └─────────────┘
+///         │
+///         │ Yield { Local }
+///         ▼
+///   ┌─────────────┐               ┌───────────────┐
+///   │ pc: 1       │               │  new token    │
+///   │ blocked: No │  ────────────►│  (TaskId=42)  │
+///   └─────────────┘               └───────────────┘
+/// ```
+///
 /// # Semantics
 ///
-/// - A logical task persists across run-tokens.
-/// - Each executor run consumes one token and advances exactly one instruction.
+/// - A logical task persists across run-tokens (it has identity).
+/// - Each executor step consumes one token and advances exactly one instruction.
 /// - `Yield` and `Spawn` create new run-tokens via the executor queues.
 /// - `Sleep`/`WaitIo` block without enqueuing a token until an external event.
+///
+/// # Invariants
+///
+/// - A task never has two run-tokens in flight simultaneously (enforced by blocking).
+/// - Completed tasks never re-enter the runnable set.
+/// - `pc` advances monotonically except for `Jump` and `TryAcquire` branch instructions.
 pub(crate) struct TaskVm {
     programs: Vec<TaskProgram>,
     tasks: std::collections::BTreeMap<TaskId, LogicalTask>,
@@ -1128,6 +1160,24 @@ impl SimState {
 
 /// Step-wise oracle checks for determinism, safety, and liveness.
 ///
+/// # Checked Invariants
+///
+/// | Invariant | Violation Kind | Description |
+/// |-----------|----------------|-------------|
+/// | No starvation | `RunnableStarvation` | Runnable tasks execute within bounded steps |
+/// | Resource accounting | `ResourceOverflow` | Available ≤ total for each resource |
+/// | Gate consistency | `GateViolation` | `done` set when gate closes at count=0 |
+///
+/// # Starvation Bound
+///
+/// A task enqueued at step `S` with backlog `B` must execute by step:
+/// `S + max_starvation + B` where `max_starvation = workers * (steal_tries + 2) * 4`.
+///
+/// This bound is deliberately loose to avoid false positives from driver
+/// scheduling choices that don't represent scheduler bugs.
+///
+/// # Design Notes
+///
 /// These checks are deliberately simple: they run on every step and surface
 /// violations as structured trace events rather than panicking, so the
 /// harness can serialize a repro and continue to shrink it.
@@ -1370,9 +1420,33 @@ fn enabled_actions(state: &SimState) -> Vec<DriverAction> {
 
 /// Run a simulation using a custom driver policy.
 ///
+/// # Driver Contract
+///
 /// The `choose` callback receives the enabled actions for the current step and
 /// must return one of them. If it returns an action not in the enabled set, the
 /// harness falls back to the first enabled action to preserve determinism.
+///
+/// # Action Priority (`enabled_actions` order)
+///
+/// ```text
+/// 1. DeliverEvent   - scheduled events whose time has arrived
+/// 2. StepWorker     - workers that are not parked (or have unpark token)
+/// 3. AdvanceTimeTo  - only when no other actions are enabled
+/// ```
+///
+/// # Termination
+///
+/// The simulation terminates when:
+/// - `case.max_steps` is reached (timeout)
+/// - `enabled_actions` returns empty (natural completion)
+/// - An oracle check fails (invariant violation recorded in trace)
+/// - A task panics (`ExitPanicked` result)
+///
+/// # Trace Output
+///
+/// The returned `Trace` contains all driver steps, executor events, and task
+/// instructions. Use `trace_hash()` to compute a stable fingerprint for
+/// regression testing.
 pub fn run_with_driver<F>(case: &SimCase, mut choose: F) -> Trace
 where
     F: FnMut(&[DriverAction]) -> DriverAction,

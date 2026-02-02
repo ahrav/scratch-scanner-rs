@@ -650,6 +650,11 @@ impl<T, S> WorkerCtxLike<T, S> for WorkerCtx<T, S> {
 /// ```
 pub struct Executor<T> {
     shared: Arc<Shared<T>>,
+    /// Worker thread handles indexed by worker ID.
+    ///
+    /// Joined in reverse order during `join()` to collect per-worker metrics.
+    /// The first panic encountered is captured and re-thrown after all threads
+    /// have been joined.
     threads: Vec<JoinHandle<WorkerMetricsLocal>>,
 }
 

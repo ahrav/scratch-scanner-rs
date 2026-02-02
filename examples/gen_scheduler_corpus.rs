@@ -32,6 +32,12 @@ fn write_artifact(path: &Path, artifact: &ReproArtifact) {
 }
 
 /// Build a replay artifact with a stable trace hash for the given case.
+///
+/// # Note on Failure Kind
+///
+/// Corpus artifacts use `FailureKind::Timeout` as a sentinel value since
+/// they represent successful runs stored for regression testing, not actual
+/// failures. The `step` field records the total trace length.
 fn build_artifact(case: SimCase, choices: Vec<DriverChoice>) -> ReproArtifact {
     let trace = run_with_choices(&case, &choices);
     let hash = trace_hash(&trace);
@@ -50,6 +56,13 @@ fn build_artifact(case: SimCase, choices: Vec<DriverChoice>) -> ReproArtifact {
 }
 
 /// Yield + completion, plus a future join-close to exercise time advance.
+///
+/// # Coverage
+///
+/// - Local yield re-enqueue
+/// - Time advance (`AdvanceTimeTo` action)
+/// - `CloseGateJoin` external event
+/// - Single-worker execution path
 fn case_basic(seed: u64) -> (SimCase, Vec<DriverChoice>) {
     let exec_cfg = SimExecCfg {
         workers: 1,
@@ -89,6 +102,13 @@ fn case_basic(seed: u64) -> (SimCase, Vec<DriverChoice>) {
 }
 
 /// Local spawn + second worker stealing from a victim.
+///
+/// # Coverage
+///
+/// - `Spawn` instruction with `Local` placement
+/// - Multi-worker configuration (2 workers)
+/// - Work stealing path (`PopSource::Steal`)
+/// - Explicit driver choices forcing steal interleaving
 fn case_steal(seed: u64) -> (SimCase, Vec<DriverChoice>) {
     let exec_cfg = SimExecCfg {
         workers: 2,
@@ -134,6 +154,12 @@ fn case_steal(seed: u64) -> (SimCase, Vec<DriverChoice>) {
 }
 
 /// IO completion + sleep wakeup + join gate close.
+///
+/// # Coverage
+///
+/// - `WaitIo` instruction and `IoComplete` external event
+/// - `Sleep` instruction and time-based wakeup
+/// - Injector pop path (external spawns after wakeup)
 fn case_io_sleep(seed: u64) -> (SimCase, Vec<DriverChoice>) {
     let exec_cfg = SimExecCfg {
         workers: 1,
@@ -178,6 +204,13 @@ fn case_io_sleep(seed: u64) -> (SimCase, Vec<DriverChoice>) {
 }
 
 /// Resource acquire/release with both success and failure branches.
+///
+/// # Coverage
+///
+/// - `TryAcquire` instruction (success path via `ok` jump)
+/// - `TryAcquire` instruction (failure path via `fail` jump)
+/// - `Release` instruction
+/// - Resource accounting model validation
 fn case_resources(seed: u64) -> (SimCase, Vec<DriverChoice>) {
     let exec_cfg = SimExecCfg {
         workers: 1,
@@ -242,6 +275,12 @@ fn case_resources(seed: u64) -> (SimCase, Vec<DriverChoice>) {
 }
 
 /// Global injector spawn path.
+///
+/// # Coverage
+///
+/// - `Spawn` instruction with `Global` placement
+/// - Injector pop path (task pushed to global queue)
+/// - Wake-on-spawn behavior (sibling unpark)
 fn case_global_spawn(seed: u64) -> (SimCase, Vec<DriverChoice>) {
     let exec_cfg = SimExecCfg {
         workers: 2,
@@ -285,6 +324,12 @@ fn case_global_spawn(seed: u64) -> (SimCase, Vec<DriverChoice>) {
 }
 
 /// External spawn placement for a newly allocated task.
+///
+/// # Coverage
+///
+/// - `Spawn` instruction with `External` placement
+/// - Gate-respecting spawn (may fail if gate closed)
+/// - Injector path for externally spawned tasks
 fn case_external_spawn(seed: u64) -> (SimCase, Vec<DriverChoice>) {
     let exec_cfg = SimExecCfg {
         workers: 1,
@@ -325,6 +370,11 @@ fn case_external_spawn(seed: u64) -> (SimCase, Vec<DriverChoice>) {
 }
 
 /// Jump instruction to exercise control-flow variants.
+///
+/// # Coverage
+///
+/// - `Jump` instruction (unconditional PC transfer)
+/// - Non-sequential bytecode execution
 fn case_jump(seed: u64) -> (SimCase, Vec<DriverChoice>) {
     let exec_cfg = SimExecCfg {
         workers: 1,

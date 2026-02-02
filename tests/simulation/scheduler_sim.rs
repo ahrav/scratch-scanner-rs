@@ -13,9 +13,26 @@ use scanner_rs::scheduler::sim_executor_harness::{
 
 /// Aggregate coverage across the serialized corpus.
 ///
-/// The goal is to keep the replay suite "exhaustive-ish" by ensuring every
-/// scheduler-relevant instruction and driver action is exercised by at least
-/// one artifact.
+/// # Coverage Philosophy
+///
+/// The corpus aims to be "exhaustive-ish": every scheduler-relevant code path
+/// should be exercised by at least one artifact. This provides regression
+/// protection without requiring exhaustive enumeration of all interleavings.
+///
+/// # Coverage Categories
+///
+/// - **Instruction coverage**: Each bytecode instruction type
+/// - **Placement coverage**: All spawn placement variants (`Local`, `Global`, `External`)
+/// - **Queue coverage**: Pop from local, injector, and steal paths
+/// - **Driver coverage**: Time advance and external event delivery
+///
+/// # Maintenance
+///
+/// When adding new instructions or scheduler features:
+/// 1. Add corresponding coverage flags to this struct
+/// 2. Update `observe_trace()` to track the new path
+/// 3. Update `assert_complete()` to require coverage
+/// 4. Add a corpus artifact in `tests/simulation/corpus/` that exercises the path
 #[derive(Default)]
 struct CorpusCoverage {
     multi_worker: bool,
@@ -361,9 +378,25 @@ fn tokens_for_kind(kind: TemplateKind) -> usize {
 
 /// Fair, deterministic driver policy for stress runs.
 ///
-/// The driver prioritizes delivering external events, then steps workers in a
-/// round-robin order. This avoids pathological starvation caused by a biased
-/// driver rather than the scheduler itself.
+/// # Policy
+///
+/// ```text
+/// Priority 1: DeliverEvent   (ensures external events don't starve)
+/// Priority 2: StepWorker     (round-robin across worker IDs)
+/// Priority 3: AdvanceTimeTo  (implicit from enabled_actions)
+/// ```
+///
+/// # Why Round-Robin?
+///
+/// A biased driver (e.g., always picking worker 0) can cause artificial
+/// starvation that doesn't represent real scheduler behavior. Round-robin
+/// ensures all workers get execution opportunities, so any starvation
+/// violation represents a genuine scheduler bug.
+///
+/// # Determinism
+///
+/// The driver is deterministic given the same enabled action sequence.
+/// This allows failed stress seeds to be replayed exactly.
 struct FairDriver {
     next_worker: usize,
 }
@@ -473,8 +506,26 @@ fn write_failure_artifact(
 
 /// Build a small randomized case from a fixed seed.
 ///
-/// We intentionally use bounded templates instead of arbitrary bytecode so the
-/// generated programs stay valid and terminate under small step budgets.
+/// # Validity Guarantees
+///
+/// Generated cases are always valid:
+/// - At least one non-spawn program exists (prevents infinite spawn loops)
+/// - Spawn targets reference valid program indices
+/// - IO tokens have corresponding `IoComplete` events scheduled
+/// - Resource programs reference resource ID 0 (created if needed)
+///
+/// # Termination Guarantee
+///
+/// Cases terminate within `max_steps` under a fair driver because:
+/// - No instruction creates unbounded work (spawns are finite)
+/// - External events are scheduled before `max_steps / 2`
+/// - All blocking instructions (`WaitIo`, `Sleep`) have wakeup events
+///
+/// # Template Approach
+///
+/// We use bounded templates instead of arbitrary bytecode so the generated
+/// programs stay valid and terminate under small step budgets. Each template
+/// produces a self-contained program with known behavior.
 fn random_case(seed: u64, cfg: StressConfig) -> SimCase {
     let mut rng = XorShift64::new(seed);
 
