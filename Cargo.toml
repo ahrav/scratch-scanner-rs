@@ -138,3 +138,30 @@ codegen-units = 1
 
 [profile.bench]
 inherits = "release"
+
+# ============================================================================
+# Test Targets
+# ============================================================================
+# Organized test targets for different test categories.
+# See tests/README.md for details on each category.
+
+[[test]]
+name = "integration"
+path = "tests/integration/main.rs"
+
+[[test]]
+name = "smoke"
+path = "tests/smoke/main.rs"
+
+[[test]]
+name = "property"
+path = "tests/property/main.rs"
+
+[[test]]
+name = "simulation"
+path = "tests/simulation/main.rs"
+required-features = ["scheduler-sim"]
+
+[[test]]
+name = "diagnostic"
+path = "tests/diagnostic/main.rs"

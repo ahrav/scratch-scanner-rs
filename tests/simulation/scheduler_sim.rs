@@ -464,7 +464,7 @@ fn write_failure_artifact(
         },
     };
 
-    let out_dir = "tests/scheduler_failures";
+    let out_dir = "tests/failures";
     fs::create_dir_all(out_dir).expect("create failure dir");
     let path = format!("{out_dir}/seed_{seed}.json");
     let json = serde_json::to_string_pretty(&artifact).expect("serialize failure artifact");
@@ -599,7 +599,7 @@ fn scheduler_sim_deterministic_basic() {
 /// Replays any stored repro artifacts and validates trace hashes.
 #[test]
 fn scheduler_sim_replay_corpus() {
-    let corpus_dir = "tests/scheduler_corpus";
+    let corpus_dir = "tests/simulation/corpus";
     let entries = fs::read_dir(corpus_dir).unwrap_or_else(|_| panic!("missing {corpus_dir}"));
     let mut coverage = CorpusCoverage::default();
     let mut artifacts = 0usize;
