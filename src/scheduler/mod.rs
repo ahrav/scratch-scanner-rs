@@ -217,6 +217,7 @@ pub mod budget;
 pub mod chunking;
 pub mod contract;
 pub mod executor;
+pub(crate) mod executor_core;
 pub mod metrics;
 pub mod rng;
 
@@ -247,6 +248,8 @@ pub mod rusage;
 // Testing infrastructure
 pub mod failure;
 pub mod sim;
+#[cfg(any(test, feature = "scheduler-sim"))]
+pub mod sim_executor_harness;
 pub mod task_graph;
 
 // Benchmarks

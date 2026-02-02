@@ -97,6 +97,9 @@ graph TB
 | **DynamicBitSet** | `src/stdx/bitset.rs:51` | Runtime-sized bitset for pool tracking |
 | **ScanScratch** | `src/engine/scratch.rs:83` | Per-scan reusable scratch state |
 | **TimingWheel** | `src/stdx/timing_wheel.rs:479` | Hashed timing wheel for window expiration scheduling |
+| **Scheduler Sim Harness** | `src/scheduler/sim_executor_harness.rs` | Deterministic executor model for scheduler interleaving tests |
+| **Scheduler Sim Task VM** | `src/scheduler/sim_executor_harness.rs` | Bytecode VM driving scheduler-only task effects in simulation |
+| **Scheduler Sim Resources** | `src/scheduler/sim_executor_harness.rs` | Deterministic resource accounting for permits/budgets in simulation |
 
 ## Data Flow
 

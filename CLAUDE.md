@@ -37,11 +37,16 @@ After modifying Rust code, ALWAYS run these steps:
 ## Build & Test
 - `cargo build` - Build the project
 - `cargo test` - Fast unit tests only (~15-30s)
-- `cargo test --features stdx-proptest` - Unit + property tests (~3-5 min)
-- `cargo test --features scheduler-sim` - Unit + scheduler simulation tests
+- `cargo test --test integration` - Integration tests
+- `cargo test --test smoke` - End-to-end smoke tests
+- `cargo test --test property` - Property-based tests (proptest)
+- `cargo test --features scheduler-sim --test simulation` - Scheduler simulation tests
+- `cargo test --test diagnostic -- --ignored --nocapture` - Diagnostic/audit tools
+- `cargo test --features stdx-proptest` - Unit + stdx property tests (~3-5 min)
 - `cargo kani --features kani` - Kani model checking
 - `cargo +nightly fuzz run <target>` - Fuzz testing (targets in `/fuzz/`)
 - Benchmarks in `benches/` directory, run with `cargo bench`
+- See `tests/README.md` for full test organization details
 
 ## Rule Optimization Workflow
 After modifying rules in `src/gitleaks_rules.rs`:

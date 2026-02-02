@@ -28,3 +28,10 @@ fuzz/Cargo.lock
 
 .DS_Store
 .worktrees/
+
+# Internal design docs (not for external consumption)
+docs/scheduler_test_harness.md
+docs/scheduler_test_harness_tasks.md
+
+# Scheduler simulation stress test failures (generated)
+tests/failures/
