@@ -20,6 +20,11 @@ pub struct SimTaskId(u32);
 
 impl SimTaskId {
     #[inline(always)]
+    pub fn from_u32(id: u32) -> Self {
+        Self(id)
+    }
+
+    #[inline(always)]
     pub fn index(self) -> usize {
         self.0 as usize
     }
@@ -30,6 +35,11 @@ impl SimTaskId {
 pub struct WorkerId(u32);
 
 impl WorkerId {
+    #[inline(always)]
+    pub fn from_u32(id: u32) -> Self {
+        Self(id)
+    }
+
     #[inline(always)]
     pub fn index(self) -> usize {
         self.0 as usize
@@ -169,9 +179,22 @@ impl SimExecutor {
         &self.tasks[task_id.index()]
     }
 
+    /// Whether any task is currently queued for execution.
+    pub fn has_queued_tasks(&self) -> bool {
+        self.any_task_queued()
+    }
+
     /// Current state of a task.
     pub fn state(&self, task_id: SimTaskId) -> SimTaskState {
         self.states[task_id.index()]
+    }
+
+    /// Remove a task from all queues (local and global).
+    pub fn remove_from_queues(&mut self, task_id: SimTaskId) {
+        for queue in &mut self.local_queues {
+            queue.retain(|t| *t != task_id);
+        }
+        self.global_queue.retain(|t| *t != task_id);
     }
 
     fn alloc_task(&mut self, task: SimTask, state: SimTaskState) -> SimTaskId {

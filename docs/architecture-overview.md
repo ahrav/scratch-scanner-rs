@@ -102,6 +102,8 @@ graph TB
 
 The optional sim harnesses provide deterministic simulation primitives and replayable traces for
 scanner and scheduler testing. See `docs/test_harness.md` for the full design and workflow.
+Scheduler harness code lives in `src/sim_scheduler/` and the scanner harness code lives in
+`src/sim_scanner/`.
 
 | Component | Location | Purpose |
 |-----------|----------|---------|
