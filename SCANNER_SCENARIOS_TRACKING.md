@@ -4,7 +4,7 @@
 
 **Location**: This document is internal and excluded from version control via `.gitignore`.
 
-**Progress**: **50/50 scenarios verified** ✅
+**Progress**: **52/52 scenarios verified** ✅
 
 ---
 
@@ -32,28 +32,28 @@ rm -rf tests/failures/
 ### Files
 
 - **Test runner**: `tests/simulation/scanner_corpus.rs` (auto-discovers `*.case.json` files)
-- **Corpus directory**: `tests/corpus/scanner/` (50 total scenarios)
+- **Corpus directory**: `tests/corpus/scanner/` (52 total scenarios)
 - **Harness guide**: `docs/scanner_test_harness_guide.md`
 
 ---
 
 ## Integration Summary
 
-Current corpus size: **50 scenarios** (all present in `tests/corpus/scanner/`).
+Current corpus size: **52 scenarios** (all present in `tests/corpus/scanner/`).
 
 Last verified: **February 2, 2026** with:
 ```bash
 cargo test --features sim-harness --test simulation scanner_corpus
 ```
 
-### Coverage Breakdown (50 Total)
+### Coverage Breakdown (52 Total)
 
 | Category | Count | Files |
 |----------|-------|-------|
 | **Raw Matching** | 8 | raw_start_boundary, raw_split_across_chunks, raw_secret_at_eof, raw_back_to_back, raw_boundary, raw_cross_chunk_end_boundary, raw_nonascii_padding, mf_parallel |
 | **Raw No-Match Stress** | 3 | raw_many_anchor_hits_no_match, raw_high_entropy_0_255, raw_repetitive_a_200 |
 | **Overlap Configuration** | 2 | overlap_eq_required, overlap_gt_required |
-| **Base64 Transform** | 9 | b64_pad_eqeq, b64_pad_eq, b64_no_padding, b64_spans_eq_cap_16, b64_spans_gt_cap_17, b64_truncated_quantum, b64_invalid_padding, b64_internal_newline, b64_split_across_chunk_boundary |
+| **Base64 Transform** | 10 | b64_pad_eqeq, b64_pad_eq, b64_no_padding, b64_padding_seed17, b64_spans_eq_cap_16, b64_spans_gt_cap_17, b64_truncated_quantum, b64_invalid_padding, b64_internal_newline, b64_split_across_chunk_boundary |
 | **URL Percent Encoding** | 7 | urlpct_upper, urlpct_lower, urlpct_min_len_edges, urlpct_spans_eq_cap_16, urlpct_spans_gt_cap_17, urlpct_end_on_boundary, urlpct_invalid_tail |
 | **Mixed Transforms** | 1 | transforms |
 | **UTF-16 Variants** | 10 | utf16, utf16_mixed_endianness, utf16be_aligned, utf16be_mixed_parity, utf16be_mixed_parity_tiny_chunks, utf16le_aligned, utf16le_misaligned, utf16le_truncated_odd_len_tail, utf16le_with_bom, utf16_mix_two_secrets |
@@ -62,8 +62,8 @@ cargo test --features sim-harness --test simulation scanner_corpus
 | **Regex Variants** | 1 | case_insensitive_regex_jwt |
 | **Deterministic Replay** | 1 | deterministic_replay_stability_runs |
 | **Transform Depth=0** | 1 | max_transform_depth0_no_decode |
-| **Fault Injection** | 1 | duplicate_finding_seed1 |
-| **TOTAL** | **50** | - |
+| **Fault Injection** | 2 | duplicate_finding_seed1, extra_expected_root_seed728 |
+| **TOTAL** | **52** | - |
 
 ---
 
@@ -74,7 +74,7 @@ cargo test --features sim-harness --test simulation scanner_corpus
 - [x] **Raw matching** (8 scenarios)
 - [x] **Raw no-match stress** (3 scenarios)
 - [x] **Overlap configuration** (2 scenarios)
-- [x] **Base64 transform** (9 scenarios)
+- [x] **Base64 transform** (10 scenarios)
 - [x] **URL percent encoding** (7 scenarios)
 - [x] **Mixed transforms** (1 scenario)
 - [x] **UTF-16 variants** (10 scenarios)
@@ -83,7 +83,7 @@ cargo test --features sim-harness --test simulation scanner_corpus
 - [x] **Adversarial false positives** (1 scenario)
 - [x] **Deterministic replay** (1 scenario)
 - [x] **Transform depth=0** (1 scenario)
-- [x] **Fault injection** (1 scenario)
+- [x] **Fault injection** (2 scenarios)
 
 ### Out of Corpus (Schema Unsupported)
 
@@ -130,6 +130,8 @@ These are intentionally **not** in the corpus because their schemas are not supp
 ### Added to Corpus
 
 - `scanner_seed_1.case.json` -> `duplicate_finding_seed1.case.json` (deep random + faults; duplicate finding regression)
+- `scanner_seed_17.case.json` -> `b64_padding_seed17.case.json` (deep random + partial reads; base64 padding drift tolerance)
+- `scanner_seed_728.case.json` -> `extra_expected_root_seed728.case.json` (deep random; reference scan misses expected raw span)
 
 ---
 
@@ -158,10 +160,11 @@ All corpus files are located in `tests/corpus/scanner/` with naming pattern `<ca
 - `overlap_eq_required.case.json`
 - `overlap_gt_required.case.json`
 
-**Base64 Transform (9)**:
+**Base64 Transform (10)**:
 - `b64_pad_eqeq.case.json`
 - `b64_pad_eq.case.json`
 - `b64_no_padding.case.json`
+- `b64_padding_seed17.case.json`
 - `b64_spans_eq_cap_16.case.json`
 - `b64_spans_gt_cap_17.case.json`
 - `b64_truncated_quantum.case.json`
@@ -212,8 +215,9 @@ All corpus files are located in `tests/corpus/scanner/` with naming pattern `<ca
 **Transform Depth=0 (1)**:
 - `max_transform_depth0_no_decode.case.json`
 
-**Fault Injection (1)**:
+**Fault Injection (2)**:
 - `duplicate_finding_seed1.case.json`
+- `extra_expected_root_seed728.case.json`
 
 ---
 
@@ -227,7 +231,7 @@ cargo test --features sim-harness --test simulation scanner_corpus
 ```
 
 Result:
-- **Pass** (50 scenarios, 0 failures)
+- **Pass** (52 scenarios, 0 failures)
 
 ### Seed / Argument Overrides
 

@@ -9,6 +9,7 @@ This directory contains deterministic scanner simulation scenarios. Each `*.case
 | `b64_internal_newline.case.json` | Base64 secret with embedded LF; verifies whitespace-tolerant span finding and decoding. |
 | `b64_invalid_padding.case.json` | Base64 transform with invalid padding; ensures decoder rejects/handles bad padding safely. |
 | `b64_no_padding.case.json` | Base64 transform without `=` padding; verifies decode and match still succeed. |
+| `b64_padding_seed17.case.json` | Deep random regression: base64 padding drift across partial reads must not fail differential oracle. |
 | `b64_pad_eq.case.json` | Base64 transform with single `=` padding; verifies decode and match. |
 | `b64_pad_eqeq.case.json` | Base64 transform with double `==` padding; verifies decode and match. |
 | `b64_spans_eq_cap_16.case.json` | Base64 span detection exactly at span cap (16) for a buffer. |
@@ -19,6 +20,7 @@ This directory contains deterministic scanner simulation scenarios. Each `*.case
 | `case_insensitive_regex_jwt.case.json` | Case-insensitive JWT bearer regex (lowercase bearer) in raw data. |
 | `deterministic_replay_stability_runs.case.json` | Same scenario replayed with multiple schedules; results must be stable. |
 | `duplicate_finding_seed1.case.json` | Deep random seed regression with faults; prevents duplicate non-root findings in overlap scans. |
+| `extra_expected_root_seed728.case.json` | Deep random regression where chunked scan finds an expected raw secret missed by the single-chunk reference. |
 | `empty_path.case.json` | Empty path bytes; ensures path edge case is handled safely. |
 | `longpath.case.json` | Very long path; validates path handling and hashing stability. |
 | `max_transform_depth0_no_decode.case.json` | Depth limit set to 0; encoded content must not be decoded. |
