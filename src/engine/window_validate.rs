@@ -38,7 +38,7 @@
 //!
 //! [`extract_secret_span`]: super::helpers::extract_secret_span
 
-use crate::api::{DecodeStep, FileId, FindingRec, StepId, Utf16Endianness};
+use crate::api::{DecodeStep, FileId, FindingRec, StepId, Utf16Endianness, STEP_ROOT};
 use memchr::memmem;
 use std::ops::Range;
 
@@ -225,6 +225,10 @@ impl Engine {
                         }
                     }
                     let drop_hint_end = base_offset + drop_hint_end as u64;
+                    // When root-span mapping is unavailable (nested transforms with
+                    // length-changing parents), keep decoded spans in the dedupe key
+                    // to avoid collapsing distinct matches.
+                    let include_span = step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
 
                     scratch.push_finding_with_drop_hint(
                         FindingRec {
@@ -237,6 +241,7 @@ impl Engine {
                             step_id,
                         },
                         drop_hint_end,
+                        include_span,
                     );
                 }
             }
@@ -426,6 +431,9 @@ impl Engine {
                 }
             }
             let drop_hint_end = base_offset + drop_hint_end as u64;
+            // Preserve decoded spans in the dedupe key when root-span mapping
+            // is unavailable for nested transforms.
+            let include_span = utf16_step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
             scratch.push_finding_with_drop_hint(
                 FindingRec {
                     file_id,
@@ -437,6 +445,7 @@ impl Engine {
                     step_id: utf16_step_id,
                 },
                 drop_hint_end,
+                include_span,
             );
         }
     }

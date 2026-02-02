@@ -3063,6 +3063,84 @@ fn chunked_overlap_gt_chunk_dedupes_transform_findings() {
 }
 
 #[test]
+fn nested_transform_dedupe_keeps_multiple_matches() {
+    let rule = RuleSpec {
+        name: "tok0",
+        anchors: &[b"TOK0_"],
+        radius: 64,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        secret_group: None,
+        re: Regex::new("TOK0_[A-Z0-9]{8}").unwrap(),
+    };
+
+    let transforms = vec![
+        TransformConfig {
+            id: TransformId::Base64,
+            mode: TransformMode::Always,
+            gate: Gate::None,
+            min_len: 4,
+            max_spans_per_buffer: 16,
+            max_encoded_len: 64 * 1024,
+            max_decoded_bytes: 64 * 1024,
+            plus_to_space: false,
+            base64_allow_space_ws: false,
+        },
+        TransformConfig {
+            id: TransformId::UrlPercent,
+            mode: TransformMode::Always,
+            gate: Gate::None,
+            min_len: 4,
+            max_spans_per_buffer: 16,
+            max_encoded_len: 64 * 1024,
+            max_decoded_bytes: 64 * 1024,
+            plus_to_space: false,
+            base64_allow_space_ws: false,
+        },
+    ];
+
+    let mut tuning = demo_tuning();
+    tuning.scan_utf16_variants = false;
+    let engine =
+        Engine::new_with_anchor_policy(vec![rule], transforms, tuning, AnchorPolicy::ManualOnly);
+
+    let tok_a = b"TOK0_ABCDEFGH";
+    let tok_b = b"TOK0_IJKLMNOP";
+    let mut decoded = Vec::new();
+    decoded.extend_from_slice(tok_a);
+    decoded.extend_from_slice(b"--");
+    decoded.extend_from_slice(tok_b);
+
+    let url_encoded = url_percent_encode_all(&decoded);
+    let b64_encoded = b64_encode(&url_encoded).into_bytes();
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"prefix ");
+    buf.extend_from_slice(&b64_encoded);
+    buf.extend_from_slice(b" suffix");
+
+    let findings = scan_one_chunk_records(&engine, &buf);
+    let spans: HashSet<_> = findings
+        .iter()
+        .map(|rec| (rec.span_start, rec.span_end))
+        .collect();
+
+    assert_eq!(
+        findings.len(),
+        2,
+        "expected two distinct findings from nested transform chain"
+    );
+    assert_eq!(
+        spans.len(),
+        2,
+        "expected distinct spans for nested transform matches"
+    );
+}
+
+#[test]
 fn tiger_boundary_base64_padding_split() {
     // Ensure base64 '=' padding is split across the chunk boundary so the
     // decoder must carry padding state across chunks.

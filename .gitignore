@@ -49,3 +49,6 @@ docs/throughput_investigation.md
 
 # Scheduler simulation stress test failures (generated)
 tests/failures/
+
+# Scanner scenario tracking (internal progress document)
+SCANNER_SCENARIOS_TRACKING.md

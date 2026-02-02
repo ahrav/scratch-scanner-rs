@@ -256,12 +256,13 @@ pub struct ScanScratch {
     /// Key composition (32 bytes → 128-bit hash):
     /// - `file_id` (4 bytes) — scoped to current file
     /// - `rule_id` (4 bytes) — distinguishes rule matches
-    /// - `span_start`, `span_end` (8 bytes) — root-level span (zeroed for transforms)
+    /// - `span_start`, `span_end` (8 bytes) — root-level span (zeroed for mapped transforms)
     /// - `root_hint_start`, `root_hint_end` (16 bytes) — dedupe boundary in root coordinates
     ///
-    /// Transform-derived findings use zeroed span coordinates because the same
-    /// root hint window can produce matches at different decoded offsets across
-    /// chunk boundaries; the root hint range is the stable identity.
+    /// Transform-derived findings use zeroed span coordinates when a precise
+    /// root-span mapping exists because the same encoded region can decode to
+    /// different offsets across chunk boundaries. When mapping is unavailable,
+    /// the decoded span is included to keep distinct matches separate.
     pub(super) seen_findings: FixedSet128,
     pub(super) total_decode_output_bytes: usize, // Global decode budget tracker.
     pub(super) work_items_enqueued: usize,       // Work queue budget tracker.
@@ -861,7 +862,7 @@ impl ScanScratch {
     }
 
     pub(super) fn push_finding(&mut self, rec: FindingRec) {
-        self.push_finding_with_drop_hint(rec, rec.root_hint_end);
+        self.push_finding_with_drop_hint(rec, rec.root_hint_end, rec.step_id == STEP_ROOT);
     }
 
     /// Records a finding with an explicit drop boundary, deduplicating against
@@ -879,9 +880,10 @@ impl ScanScratch {
     /// ```
     ///
     /// For transform-derived findings (`step_id != STEP_ROOT`), span coordinates
-    /// are zeroed. This is intentional: the same encoded region can decode to
-    /// different byte offsets depending on chunk alignment, but the root hint
-    /// window (the encoded bytes that triggered the decode) is stable.
+    /// are zeroed only when a precise root-span mapping is available. When
+    /// mapping is unavailable (nested transforms with length-changing parents),
+    /// the decoded span is included to avoid collapsing distinct matches that
+    /// share the same coarse root hint window.
     ///
     /// # Why Not Just Span Coordinates?
     ///
@@ -895,11 +897,20 @@ impl ScanScratch {
     /// The underlying `FixedSet128` is a probabilistic structure (Bloom-like).
     /// Collisions may suppress distinct findings, but the capacity is sized to
     /// `4× max_findings` to keep collision probability low for typical scans.
+    ///
+    /// `include_span` controls whether `span_start`/`span_end` participate in
+    /// the dedupe key (used when root-span mapping is unavailable).
     #[inline(always)]
-    pub(super) fn push_finding_with_drop_hint(&mut self, rec: FindingRec, drop_hint_end: u64) {
+    pub(super) fn push_finding_with_drop_hint(
+        &mut self,
+        rec: FindingRec,
+        drop_hint_end: u64,
+        include_span: bool,
+    ) {
         // For root-level findings, include the exact span in the dedup key.
-        // For transform-derived findings, zero the span since decoded offsets
-        // vary by chunk alignment but root hints are stable.
+        // For transform-derived findings with mapped root spans, zero the span
+        // since decoded offsets can vary by chunk alignment. When mapping is
+        // unavailable, include the span to preserve distinct matches.
         //
         // Additionally, normalize root_hint_end for base64 padding tolerance.
         // Base64 can decode correctly with or without padding (e.g., 18 or 20
@@ -907,20 +918,23 @@ impl ScanScratch {
         // the actual encoded length is within padding tolerance (3 chars).
         // This ensures findings from the same decoded content with different
         // padding get deduplicated across chunk boundaries.
-        let (span_start, span_end, normalized_root_hint_end) = if rec.step_id == STEP_ROOT {
-            (rec.span_start, rec.span_end, rec.root_hint_end)
+        let include_span = include_span || rec.step_id == STEP_ROOT;
+        let (span_start, span_end) = if include_span {
+            (rec.span_start, rec.span_end)
+        } else {
+            (0, 0)
+        };
+        let normalized_root_hint_end = if rec.step_id == STEP_ROOT {
+            rec.root_hint_end
         } else {
             let decoded_len = rec.span_end.saturating_sub(rec.span_start) as u64;
             let min_encoded = (decoded_len * 4).div_ceil(3); // ceil(decoded * 4/3)
             let actual_encoded = rec.root_hint_end.saturating_sub(rec.root_hint_start);
-            let normalized_end = if actual_encoded > min_encoded
-                && actual_encoded <= min_encoded.saturating_add(3)
-            {
+            if actual_encoded > min_encoded && actual_encoded <= min_encoded.saturating_add(3) {
                 rec.root_hint_start.saturating_add(min_encoded)
             } else {
                 rec.root_hint_end
-            };
-            (0, 0, normalized_end)
+            }
         };
 
         // Build a 32-byte dedup key and hash to 128 bits.

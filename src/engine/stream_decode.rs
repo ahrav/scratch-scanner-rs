@@ -25,7 +25,7 @@
 //! Vectorscan gate. If it cannot be used, we fall back to prefilter hits and
 //! may relax enforcement to avoid dropping UTF-16-only matches.
 
-use crate::api::{DecodeStep, FileId, StepId};
+use crate::api::{DecodeStep, FileId, StepId, STEP_ROOT};
 use crate::stdx::PushOutcome;
 use memchr::memchr;
 use std::ops::{ControlFlow, Range};
@@ -1363,8 +1363,15 @@ impl Engine {
         let mut tmp_findings = std::mem::take(&mut scratch.tmp_findings);
         let mut tmp_drop_hint_end = std::mem::take(&mut scratch.tmp_drop_hint_end);
         debug_assert_eq!(tmp_findings.len(), tmp_drop_hint_end.len());
+        // If we cannot map decoded offsets back to root, keep decoded spans in
+        // the dedupe key to avoid collapsing distinct nested-transform matches.
+        let include_span = scratch.root_span_map_ctx.is_none();
         for (rec, drop_end) in tmp_findings.drain(..).zip(tmp_drop_hint_end.drain(..)) {
-            scratch.push_finding_with_drop_hint(rec, drop_end);
+            scratch.push_finding_with_drop_hint(
+                rec,
+                drop_end,
+                include_span || rec.step_id == STEP_ROOT,
+            );
         }
         scratch.tmp_findings = tmp_findings;
         scratch.tmp_drop_hint_end = tmp_drop_hint_end;
