@@ -1,10 +1,23 @@
 //! Deterministic scanner simulation runner.
 //!
-//! The baseline runner executes a discover task and a set of file scan tasks
-//! over a single-threaded simulated executor. Each file scan task processes
-//! one chunk per step, applying overlap-based deduplication and collecting
-//! findings in a deterministic order.
+//! Scope:
+//! - Deterministic, single-threaded scheduling of discover + scan tasks.
+//! - Chunked scanning with overlap deduplication using the real `Engine`.
+//! - No fault injection, timeouts, or IO latency (those are layered on later).
+//!
+//! Determinism:
+//! - File discovery order is lexicographic by raw path bytes.
+//! - Schedule decisions are driven by a seedable RNG in `SimExecutor`.
+//! - Output ordering is emission order; a stability oracle compares sets.
+//!
+//! Oracles implemented here:
+//! - Termination: enforce a max-steps bound to catch hangs.
+//! - Monotonic progress: chunk offsets and prefix boundaries never move backward.
+//! - Overlap dedupe: no finding may be entirely contained in the overlap prefix.
+//! - Duplicate suppression: emitted findings are unique under a normalized key.
+//! - Stability: repeated runs with different schedule seeds yield the same set.
 
+use std::collections::BTreeSet;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use serde::{Deserialize, Serialize};
@@ -15,6 +28,8 @@ use crate::sim_scanner::scenario::{RunConfig, Scenario};
 use crate::{Engine, FileId, FindingRec, ScanScratch};
 
 /// Result of a simulation run.
+///
+/// `Ok` returns raw `FindingRec` entries in emission order (not sorted).
 #[derive(Clone, Debug)]
 pub enum RunOutcome {
     Ok { findings: Vec<FindingRec> },
@@ -22,6 +37,8 @@ pub enum RunOutcome {
 }
 
 /// Structured failure report captured in artifacts.
+///
+/// `step` is the simulation step index where the failure was detected.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FailureReport {
     pub kind: FailureKind,
@@ -32,28 +49,77 @@ pub struct FailureReport {
 /// Failure classification for deterministic triage.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum FailureKind {
+    /// A panic escaped from engine or harness logic.
     Panic,
+    /// The simulation failed to reach a terminal state within the step budget.
     Hang,
+    /// An invariant about ordering, offsets, or dedupe was violated.
     InvariantViolation { code: u32 },
+    /// A correctness oracle failed (reserved for later phases).
     OracleMismatch,
+    /// The same scenario produced different final findings across schedules.
     StabilityMismatch,
+    /// Placeholder for unimplemented phases.
     Unimplemented,
 }
 
 /// Deterministic scanner simulation runner.
+///
+/// Preconditions:
+/// - `cfg.overlap >= engine.required_overlap()`.
+/// - `cfg.chunk_size > 0` and `cfg.workers > 0`.
 pub struct ScannerSimRunner {
     cfg: RunConfig,
     schedule_seed: u64,
 }
 
 impl ScannerSimRunner {
+    /// Create a new runner with a fixed schedule seed.
     pub fn new(cfg: RunConfig, schedule_seed: u64) -> Self {
         Self { cfg, schedule_seed }
     }
 
     /// Execute a single scenario under the current schedule seed.
+    ///
+    /// If `cfg.stability_runs > 1`, replays the same scenario under additional
+    /// schedule seeds and compares the normalized finding sets.
     pub fn run(&self, scenario: &Scenario, engine: &Engine) -> RunOutcome {
-        let res = catch_unwind(AssertUnwindSafe(|| self.run_inner(scenario, engine)));
+        let base = match self.run_once_catch(scenario, engine, self.schedule_seed) {
+            RunOutcome::Ok { findings } => findings,
+            fail => return fail,
+        };
+
+        if self.cfg.stability_runs <= 1 {
+            return RunOutcome::Ok { findings: base };
+        }
+
+        let baseline = normalize_findings(&base);
+        for i in 1..self.cfg.stability_runs {
+            let seed = self.schedule_seed.wrapping_add(i as u64);
+            match self.run_once_catch(scenario, engine, seed) {
+                RunOutcome::Ok { findings } => {
+                    let candidate = normalize_findings(&findings);
+                    if candidate != baseline {
+                        return RunOutcome::Failed(FailureReport {
+                            kind: FailureKind::StabilityMismatch,
+                            message: format!(
+                                "stability mismatch between seeds {} and {}",
+                                self.schedule_seed, seed
+                            ),
+                            step: 0,
+                        });
+                    }
+                }
+                fail => return fail,
+            }
+        }
+
+        RunOutcome::Ok { findings: base }
+    }
+
+    // Wrap a single run to convert panics into a structured failure.
+    fn run_once_catch(&self, scenario: &Scenario, engine: &Engine, seed: u64) -> RunOutcome {
+        let res = catch_unwind(AssertUnwindSafe(|| self.run_once(scenario, engine, seed)));
         match res {
             Ok(outcome) => outcome,
             Err(payload) => RunOutcome::Failed(FailureReport {
@@ -64,7 +130,8 @@ impl ScannerSimRunner {
         }
     }
 
-    fn run_inner(&self, scenario: &Scenario, engine: &Engine) -> RunOutcome {
+    /// Execute a single schedule with no stability replay.
+    fn run_once(&self, scenario: &Scenario, engine: &Engine, seed: u64) -> RunOutcome {
         if self.cfg.workers == 0 {
             return self.fail(
                 FailureKind::InvariantViolation { code: 1 },
@@ -81,20 +148,30 @@ impl ScannerSimRunner {
         }
 
         let overlap = self.cfg.overlap as usize;
-        debug_assert!(overlap >= engine.required_overlap());
+        if overlap < engine.required_overlap() {
+            return self.fail(
+                FailureKind::InvariantViolation { code: 10 },
+                "overlap smaller than engine.required_overlap()",
+                0,
+            );
+        }
 
         let fs = SimFs::from_spec(&scenario.fs);
-        let mut executor = SimExecutor::new(self.cfg.workers, self.schedule_seed);
+        let files = fs.file_paths();
+        let total_bytes = total_file_bytes(&fs, &files);
+        let max_steps = resolve_max_steps(&self.cfg, files.len() as u64, total_bytes);
+
+        let mut executor = SimExecutor::new(self.cfg.workers, seed);
         let mut tasks: Vec<ScannerTask> = Vec::new();
         let mut output = OutputCollector::new();
 
-        let discover = DiscoverState::new(fs.file_paths());
+        let discover = DiscoverState::new(files);
         let discover_id = executor.spawn_external(SimTask {
             kind: TaskKind::Discover as u16,
         });
         insert_task(&mut tasks, discover_id, ScannerTask::Discover(discover));
 
-        for step in 0..self.cfg.max_steps {
+        for step in 0..max_steps {
             if !executor.has_queued_tasks() {
                 if all_tasks_completed(&executor, &tasks) {
                     return RunOutcome::Ok {
@@ -133,12 +210,16 @@ impl ScannerSimRunner {
                         files_to_spawn = Some(std::mem::take(&mut state.files));
                     }
                     ScannerTask::FileScan(state) => {
-                        let done = state.scan_next_chunk(
+                        let done = match state.scan_next_chunk(
                             engine,
                             overlap,
                             self.cfg.chunk_size as usize,
                             &mut output,
-                        );
+                            step,
+                        ) {
+                            Ok(done) => done,
+                            Err(fail) => return RunOutcome::Failed(fail),
+                        };
                         if done {
                             executor.mark_completed(task_id);
                         } else {
@@ -156,6 +237,7 @@ impl ScannerSimRunner {
             }
 
             if let Some(files) = files_to_spawn {
+                // Spawn file scan tasks deterministically in discovered order.
                 for (idx, path) in files.iter().enumerate() {
                     let file_id = FileId(idx as u32);
                     let state =
@@ -188,7 +270,7 @@ impl ScannerSimRunner {
             }
         }
 
-        self.fail(FailureKind::Hang, "max steps exceeded", self.cfg.max_steps)
+        self.fail(FailureKind::Hang, "max steps exceeded", max_steps)
     }
 
     fn fail(&self, kind: FailureKind, message: &str, step: u64) -> RunOutcome {
@@ -201,26 +283,69 @@ impl ScannerSimRunner {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Task classification for the executor (used for tracing/debugging).
 enum TaskKind {
     Discover = 1,
     FileScan = 2,
 }
 
+/// Normalized finding identity used for dedupe and stability checks.
+///
+/// Note: `step_id` is intentionally excluded because it is scratch-local.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct FindingKey {
+    file_id: u32,
+    rule_id: u32,
+    span_start: u32,
+    span_end: u32,
+    root_hint_start: u64,
+    root_hint_end: u64,
+}
+
+impl From<&FindingRec> for FindingKey {
+    fn from(rec: &FindingRec) -> Self {
+        Self {
+            file_id: rec.file_id.0,
+            rule_id: rec.rule_id,
+            span_start: rec.span_start,
+            span_end: rec.span_end,
+            root_hint_start: rec.root_hint_start,
+            root_hint_end: rec.root_hint_end,
+        }
+    }
+}
+
+/// Output collector that enforces a no-duplicates invariant.
 struct OutputCollector {
     findings: Vec<FindingRec>,
+    seen: BTreeSet<FindingKey>,
 }
 
 impl OutputCollector {
     fn new() -> Self {
         Self {
             findings: Vec::new(),
+            seen: BTreeSet::new(),
         }
     }
 
-    fn append(&mut self, batch: &mut Vec<FindingRec>) {
-        self.findings.append(batch);
+    /// Append a batch of findings, rejecting duplicates by normalized key.
+    fn append(&mut self, batch: &mut Vec<FindingRec>, step: u64) -> Result<(), FailureReport> {
+        for rec in batch.drain(..) {
+            let key = FindingKey::from(&rec);
+            if !self.seen.insert(key) {
+                return Err(FailureReport {
+                    kind: FailureKind::InvariantViolation { code: 20 },
+                    message: "duplicate finding emitted".to_string(),
+                    step,
+                });
+            }
+            self.findings.push(rec);
+        }
+        Ok(())
     }
 
+    /// Finish and return findings in emission order.
     fn finish(self) -> Vec<FindingRec> {
         self.findings
     }
@@ -231,6 +356,7 @@ enum ScannerTask {
     FileScan(Box<FileScanState>),
 }
 
+/// Discover task state (pre-sorted file list).
 struct DiscoverState {
     files: Vec<SimPath>,
 }
@@ -242,6 +368,12 @@ impl DiscoverState {
     }
 }
 
+/// Per-file scanning state for deterministic chunked scans.
+///
+/// Invariants:
+/// - `offset` is the next payload byte index in `buf`.
+/// - `tail_len <= overlap` and `tail` stores the last `overlap` bytes of the
+///   previous chunk buffer.
 struct FileScanState {
     file_id: FileId,
     path: SimPath,
@@ -254,6 +386,7 @@ struct FileScanState {
 }
 
 impl FileScanState {
+    /// Load the entire file into memory for deterministic chunking.
     fn new(
         fs: &SimFs,
         path: SimPath,
@@ -282,19 +415,51 @@ impl FileScanState {
         })
     }
 
+    /// Scan the next chunk and advance the cursor.
+    ///
+    /// Returns `Ok(true)` when the file is fully processed.
     fn scan_next_chunk(
         &mut self,
         engine: &Engine,
         overlap: usize,
         chunk_size: usize,
         output: &mut OutputCollector,
-    ) -> bool {
+        step: u64,
+    ) -> Result<bool, FailureReport> {
+        if self.offset > self.buf.len() {
+            return Err(FailureReport {
+                kind: FailureKind::InvariantViolation { code: 11 },
+                message: "offset exceeds file length".to_string(),
+                step,
+            });
+        }
         if self.offset >= self.buf.len() {
-            return true;
+            return Ok(true);
+        }
+        if self.tail_len > overlap {
+            return Err(FailureReport {
+                kind: FailureKind::InvariantViolation { code: 12 },
+                message: "tail_len exceeds overlap".to_string(),
+                step,
+            });
+        }
+        if self.tail_len > self.offset {
+            return Err(FailureReport {
+                kind: FailureKind::InvariantViolation { code: 13 },
+                message: "tail_len exceeds offset".to_string(),
+                step,
+            });
         }
 
         let remaining = self.buf.len() - self.offset;
         let payload_len = chunk_size.min(remaining);
+        if payload_len == 0 {
+            return Err(FailureReport {
+                kind: FailureKind::InvariantViolation { code: 14 },
+                message: "zero-length payload".to_string(),
+                step,
+            });
+        }
         let payload = &self.buf[self.offset..self.offset + payload_len];
 
         let mut chunk = Vec::with_capacity(self.tail_len + payload.len());
@@ -302,10 +467,28 @@ impl FileScanState {
         chunk.extend_from_slice(payload);
 
         let base_offset = self.offset.saturating_sub(self.tail_len) as u64;
+        let new_bytes_start = self.offset as u64;
+        if base_offset.saturating_add(self.tail_len as u64) != new_bytes_start {
+            return Err(FailureReport {
+                kind: FailureKind::InvariantViolation { code: 15 },
+                message: "prefix boundary mismatch".to_string(),
+                step,
+            });
+        }
         engine.scan_chunk_into(&chunk, self.file_id, base_offset, &mut self.scratch);
-        self.scratch.drop_prefix_findings(self.offset as u64);
+        self.scratch.drop_prefix_findings(new_bytes_start);
+        // Invariant: no finding may end at or before the prefix boundary.
+        for rec in self.scratch.findings() {
+            if rec.root_hint_end <= new_bytes_start {
+                return Err(FailureReport {
+                    kind: FailureKind::InvariantViolation { code: 16 },
+                    message: "prefix dedupe failed".to_string(),
+                    step,
+                });
+            }
+        }
         self.scratch.drain_findings_into(&mut self.batch);
-        output.append(&mut self.batch);
+        output.append(&mut self.batch, step)?;
 
         let total_len = chunk.len();
         let keep = overlap.min(total_len);
@@ -313,12 +496,29 @@ impl FileScanState {
             self.tail[..keep].copy_from_slice(&chunk[total_len - keep..]);
         }
         self.tail_len = keep;
-        self.offset += payload_len;
+        let prev_offset = self.offset;
+        self.offset = self.offset.saturating_add(payload_len);
+        if self.offset <= prev_offset {
+            return Err(FailureReport {
+                kind: FailureKind::InvariantViolation { code: 17 },
+                message: "offset did not advance".to_string(),
+                step,
+            });
+        }
+        let expected_next = base_offset.saturating_add(chunk.len() as u64);
+        if expected_next != self.offset as u64 {
+            return Err(FailureReport {
+                kind: FailureKind::InvariantViolation { code: 18 },
+                message: "base_offset + chunk_len mismatch".to_string(),
+                step,
+            });
+        }
 
-        self.offset >= self.buf.len()
+        Ok(self.offset >= self.buf.len())
     }
 }
 
+/// Insert a task into the slot indexed by its task id.
 fn insert_task(tasks: &mut Vec<ScannerTask>, task_id: SimTaskId, task: ScannerTask) {
     if task_id.index() == tasks.len() {
         tasks.push(task);
@@ -327,6 +527,7 @@ fn insert_task(tasks: &mut Vec<ScannerTask>, task_id: SimTaskId, task: ScannerTa
     }
 }
 
+/// Return whether every known task has reached the completed state.
 fn all_tasks_completed(executor: &SimExecutor, tasks: &[ScannerTask]) -> bool {
     tasks
         .iter()
@@ -334,6 +535,36 @@ fn all_tasks_completed(executor: &SimExecutor, tasks: &[ScannerTask]) -> bool {
         .all(|(idx, _)| executor.state(SimTaskId::from_u32(idx as u32)) == SimTaskState::Completed)
 }
 
+/// Normalize findings into a stable, ordered key set.
+fn normalize_findings(findings: &[FindingRec]) -> BTreeSet<FindingKey> {
+    findings.iter().map(FindingKey::from).collect()
+}
+
+/// Sum file lengths for a scenario (missing paths contribute 0).
+fn total_file_bytes(fs: &SimFs, files: &[SimPath]) -> u64 {
+    let mut total = 0u64;
+    for path in files {
+        if let Ok(handle) = fs.open_file(path) {
+            total = total.saturating_add(handle.len);
+        }
+    }
+    total
+}
+
+/// Resolve the max steps bound. If `cfg.max_steps > 0`, honor it; otherwise
+/// derive a conservative bound from file count and byte count.
+fn resolve_max_steps(cfg: &RunConfig, file_count: u64, total_bytes: u64) -> u64 {
+    if cfg.max_steps > 0 {
+        return cfg.max_steps;
+    }
+    let chunk = (cfg.chunk_size as u64).max(1);
+    let chunks = total_bytes.saturating_add(chunk - 1) / chunk;
+    let base = 32u64;
+    let alpha = 8u64;
+    base.saturating_add(alpha.saturating_mul(file_count.saturating_add(chunks)))
+}
+
+/// Format panic payloads into a stable message.
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         s.to_string()
