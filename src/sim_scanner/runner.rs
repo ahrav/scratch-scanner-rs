@@ -15,16 +15,18 @@
 //! - Monotonic progress: chunk offsets and prefix boundaries never move backward.
 //! - Overlap dedupe: no finding may be entirely contained in the overlap prefix.
 //! - Duplicate suppression: emitted findings are unique under a normalized key.
+//! - Ground-truth: expected secrets are found, and no unexpected findings appear.
+//! - Differential: chunked results match a single-chunk reference scan.
 //! - Stability: repeated runs with different schedule seeds yield the same set.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use serde::{Deserialize, Serialize};
 
 use crate::sim::executor::{SimExecutor, SimTask, SimTaskId, SimTaskState, StepResult};
 use crate::sim::fs::{SimFs, SimPath};
-use crate::sim_scanner::scenario::{RunConfig, Scenario};
+use crate::sim_scanner::scenario::{RunConfig, Scenario, SecretRepr, SpanU32};
 use crate::{Engine, FileId, FindingRec, ScanScratch};
 
 /// Result of a simulation run.
@@ -157,7 +159,7 @@ impl ScannerSimRunner {
         }
 
         let fs = SimFs::from_spec(&scenario.fs);
-        let files = fs.file_paths();
+        let files = sorted_file_paths(&fs);
         let total_bytes = total_file_bytes(&fs, &files);
         let max_steps = resolve_max_steps(&self.cfg, files.len() as u64, total_bytes);
 
@@ -165,7 +167,7 @@ impl ScannerSimRunner {
         let mut tasks: Vec<ScannerTask> = Vec::new();
         let mut output = OutputCollector::new();
 
-        let discover = DiscoverState::new(files);
+        let discover = DiscoverState::new(files.clone());
         let discover_id = executor.spawn_external(SimTask {
             kind: TaskKind::Discover as u16,
         });
@@ -174,9 +176,13 @@ impl ScannerSimRunner {
         for step in 0..max_steps {
             if !executor.has_queued_tasks() {
                 if all_tasks_completed(&executor, &tasks) {
-                    return RunOutcome::Ok {
-                        findings: output.finish(),
-                    };
+                    let findings = output.finish();
+                    if let Err(fail) =
+                        self.run_oracles(scenario, engine, &fs, &files, &findings, step)
+                    {
+                        return RunOutcome::Failed(fail);
+                    }
+                    return RunOutcome::Ok { findings };
                 }
                 return self.fail(
                     FailureKind::Hang,
@@ -279,6 +285,20 @@ impl ScannerSimRunner {
             message: message.to_string(),
             step,
         })
+    }
+
+    fn run_oracles(
+        &self,
+        scenario: &Scenario,
+        engine: &Engine,
+        fs: &SimFs,
+        files: &[SimPath],
+        findings: &[FindingRec],
+        step: u64,
+    ) -> Result<(), FailureReport> {
+        oracle_ground_truth(scenario, files, findings, step)?;
+        oracle_differential(engine, fs, files, findings, step)?;
+        Ok(())
     }
 }
 
@@ -535,9 +555,210 @@ fn all_tasks_completed(executor: &SimExecutor, tasks: &[ScannerTask]) -> bool {
         .all(|(idx, _)| executor.state(SimTaskId::from_u32(idx as u32)) == SimTaskState::Completed)
 }
 
+#[derive(Clone, Debug)]
+struct ExpectedEntry {
+    path: SimPath,
+    file_id: FileId,
+    rule_id: u32,
+    span: SpanU32,
+    repr: SecretRepr,
+    matched: bool,
+}
+
 /// Normalize findings into a stable, ordered key set.
 fn normalize_findings(findings: &[FindingRec]) -> BTreeSet<FindingKey> {
     findings.iter().map(FindingKey::from).collect()
+}
+
+/// Return file paths in deterministic order.
+fn sorted_file_paths(fs: &SimFs) -> Vec<SimPath> {
+    let mut files = fs.file_paths();
+    files.sort_by(|a, b| a.bytes.cmp(&b.bytes));
+    files
+}
+
+/// Check that observed findings match the scenario's expected secrets.
+///
+/// Matches require the same `(file_id, rule_id)` and containment of the expected
+/// root span within the finding's `root_hint` range. Any extra finding is a
+/// ground-truth failure.
+fn oracle_ground_truth(
+    scenario: &Scenario,
+    files: &[SimPath],
+    findings: &[FindingRec],
+    step: u64,
+) -> Result<(), FailureReport> {
+    let file_ids = build_file_id_map(files);
+    let mut expected = Vec::with_capacity(scenario.expected.len());
+    let mut index: BTreeMap<(u32, u32), Vec<usize>> = BTreeMap::new();
+
+    for exp in &scenario.expected {
+        let file_id = match file_ids.get(&exp.path.bytes) {
+            Some(id) => *id,
+            None => {
+                return Err(FailureReport {
+                    kind: FailureKind::OracleMismatch,
+                    message: format!(
+                        "expected secret references missing path {:?}",
+                        exp.path.bytes
+                    ),
+                    step,
+                })
+            }
+        };
+        let idx = expected.len();
+        expected.push(ExpectedEntry {
+            path: exp.path.clone(),
+            file_id,
+            rule_id: exp.rule_id,
+            span: exp.root_span,
+            repr: exp.repr.clone(),
+            matched: false,
+        });
+        index.entry((file_id.0, exp.rule_id)).or_default().push(idx);
+    }
+
+    for rec in findings {
+        let Some(candidates) = index.get(&(rec.file_id.0, rec.rule_id)) else {
+            return Err(FailureReport {
+                kind: FailureKind::OracleMismatch,
+                message: format!(
+                    "unexpected finding in {:?} (rule_id {}, root_hint {}..{})",
+                    path_for_file_id(files, rec.file_id)
+                        .map(|p| p.bytes.clone())
+                        .unwrap_or_default(),
+                    rec.rule_id,
+                    rec.root_hint_start,
+                    rec.root_hint_end
+                ),
+                step,
+            });
+        };
+        let mut matched = false;
+        for &idx in candidates {
+            let entry = &mut expected[idx];
+            if span_contained(entry.span, rec.root_hint_start, rec.root_hint_end) {
+                entry.matched = true;
+                matched = true;
+            }
+        }
+        if !matched {
+            return Err(FailureReport {
+                kind: FailureKind::OracleMismatch,
+                message: format!(
+                    "unexpected finding in {:?} (rule_id {}, root_hint {}..{})",
+                    path_for_file_id(files, rec.file_id)
+                        .map(|p| p.bytes.clone())
+                        .unwrap_or_default(),
+                    rec.rule_id,
+                    rec.root_hint_start,
+                    rec.root_hint_end
+                ),
+                step,
+            });
+        }
+    }
+
+    if let Some(miss) = expected.iter().find(|e| !e.matched) {
+        return Err(FailureReport {
+            kind: FailureKind::OracleMismatch,
+            message: format!(
+                "missing expected secret in {:?} (rule_id {}, span {}..{}, repr {:?})",
+                miss.path.bytes, miss.rule_id, miss.span.start, miss.span.end, miss.repr
+            ),
+            step,
+        });
+    }
+
+    Ok(())
+}
+
+/// Compare chunked findings against a single-chunk reference scan.
+fn oracle_differential(
+    engine: &Engine,
+    fs: &SimFs,
+    files: &[SimPath],
+    findings: &[FindingRec],
+    step: u64,
+) -> Result<(), FailureReport> {
+    let reference = reference_findings(engine, fs, files).map_err(|msg| FailureReport {
+        kind: FailureKind::OracleMismatch,
+        message: msg,
+        step,
+    })?;
+
+    let observed = normalize_findings(findings);
+    let expected = normalize_findings(&reference);
+    if observed != expected {
+        let mut message = format!(
+            "differential mismatch (sim {}, reference {})",
+            observed.len(),
+            expected.len()
+        );
+        if let Some(miss) = expected.difference(&observed).next() {
+            message.push_str(&format!(", missing {:?}", miss));
+        }
+        if let Some(extra) = observed.difference(&expected).next() {
+            message.push_str(&format!(", extra {:?}", extra));
+        }
+        return Err(FailureReport {
+            kind: FailureKind::OracleMismatch,
+            message,
+            step,
+        });
+    }
+
+    Ok(())
+}
+
+fn reference_findings(
+    engine: &Engine,
+    fs: &SimFs,
+    files: &[SimPath],
+) -> Result<Vec<FindingRec>, String> {
+    let mut scratch = engine.new_scratch();
+    let mut out = Vec::new();
+
+    for (idx, path) in files.iter().enumerate() {
+        let file_id = FileId(idx as u32);
+        let handle = fs
+            .open_file(path)
+            .map_err(|e| format!("open {:?}: {e}", path.bytes))?;
+        let len =
+            usize::try_from(handle.len).map_err(|_| format!("file too large: {:?}", path.bytes))?;
+        if len > u32::MAX as usize {
+            return Err(format!(
+                "reference scan requires <= u32::MAX bytes: {:?}",
+                path.bytes
+            ));
+        }
+        let data = fs
+            .read_at(&handle, 0, len)
+            .map_err(|e| format!("read {:?}: {e}", path.bytes))?;
+
+        engine.scan_chunk_into(data, file_id, 0, &mut scratch);
+        scratch.drain_findings_into(&mut out);
+    }
+
+    Ok(out)
+}
+
+fn build_file_id_map(files: &[SimPath]) -> BTreeMap<Vec<u8>, FileId> {
+    let mut map = BTreeMap::new();
+    for (idx, path) in files.iter().enumerate() {
+        map.insert(path.bytes.clone(), FileId(idx as u32));
+    }
+    map
+}
+
+fn path_for_file_id(files: &[SimPath], file_id: FileId) -> Option<&SimPath> {
+    files.get(file_id.0 as usize)
+}
+
+fn span_contained(span: SpanU32, start: u64, end: u64) -> bool {
+    let span_start = span.start as u64;
+    let span_end = span.end as u64;
+    span_start >= start && span_end <= end
 }
 
 /// Sum file lengths for a scenario (missing paths contribute 0).

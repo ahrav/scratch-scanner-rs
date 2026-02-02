@@ -109,6 +109,8 @@ Scheduler harness code lives in `src/sim_scheduler/` and the scanner harness cod
 |-----------|----------|---------|
 | **SimExecutor** | `src/sim/executor.rs` | Deterministic single-thread work-stealing model for simulation |
 | **SimFs** | `src/sim/fs.rs` | Deterministic in-memory filesystem used by scenarios |
+| **ScenarioGenerator** | `src/sim_scanner/generator.rs` | Synthetic scenario builder with expected-secret ground truth |
+| **Scanner Oracles** | `src/sim_scanner/runner.rs` | Ground-truth and differential checks for scanner simulations |
 | **SimRng / SimClock** | `src/sim/rng.rs`, `src/sim/clock.rs` | Stable RNG and simulated time source |
 | **TraceRing** | `src/sim/trace.rs` | Bounded trace buffer for replay and debugging |
 

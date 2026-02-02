@@ -4,11 +4,16 @@
 //! deterministic runner and replay logic. The schema is versioned to support
 //! forward-compatible artifact evolution.
 
+pub mod generator;
 pub mod replay;
 pub mod runner;
 pub mod scenario;
 
 pub use crate::sim::fs::{SimFsSpec, SimNodeSpec, SimPath};
+pub use generator::{
+    build_engine_from_suite, generate_scenario, materialize_rules, synthetic_transforms,
+    synthetic_tuning, ScenarioGenConfig,
+};
 pub use replay::replay_artifact;
 pub use runner::{FailureKind, FailureReport, RunOutcome, ScannerSimRunner};
 pub use scenario::{

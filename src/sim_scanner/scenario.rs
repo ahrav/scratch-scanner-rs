@@ -98,6 +98,13 @@ pub struct SyntheticRuleSpec {
     pub name: String,
     /// Anchor bytes inserted alongside the secret to force candidate windows.
     pub anchors: Vec<Vec<u8>>,
+    /// Validation radius in bytes around an anchor hit.
+    #[serde(default = "default_rule_radius")]
+    pub radius: u32,
     /// Regex pattern used by the engine during validation.
     pub regex: String,
+}
+
+fn default_rule_radius() -> u32 {
+    64
 }
