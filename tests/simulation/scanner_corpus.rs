@@ -1,4 +1,4 @@
-#![cfg(feature = "sim-harness")]
+#![cfg(any(test, feature = "sim-harness"))]
 //! Replay minimized scanner corpus cases and assert regressions stay fixed.
 
 use std::fs;

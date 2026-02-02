@@ -1,4 +1,4 @@
-#![cfg(feature = "sim-harness")]
+#![cfg(any(test, feature = "sim-harness"))]
 //! Bounded random scanner simulations to exercise scheduling, chunking, and faults.
 //!
 //! Environment knobs:
@@ -128,16 +128,14 @@ fn bounded_random_scanner_sims() {
 }
 
 fn random_run_config(rng: &mut SimRng, deep: bool) -> RunConfig {
-    let workers_min_default = if deep { 1 } else { 1 };
     let workers_max_default = if deep { 8 } else { 4 };
-    let workers_min = env_u32("SIM_RUN_WORKERS_MIN", workers_min_default).max(1);
+    let workers_min = env_u32("SIM_RUN_WORKERS_MIN", 1).max(1);
     let workers_max = env_u32("SIM_RUN_WORKERS_MAX", workers_max_default).max(workers_min);
     let workers = env_u32_opt("SIM_RUN_WORKERS")
         .unwrap_or_else(|| rand_range_inclusive(rng, workers_min, workers_max));
 
-    let chunk_min_default = if deep { 16 } else { 16 };
     let chunk_max_default = if deep { 128 } else { 64 };
-    let chunk_min = env_u32("SIM_RUN_CHUNK_MIN", chunk_min_default).max(1);
+    let chunk_min = env_u32("SIM_RUN_CHUNK_MIN", 16).max(1);
     let chunk_max = env_u32("SIM_RUN_CHUNK_MAX", chunk_max_default).max(chunk_min);
     let chunk_size = env_u32_opt("SIM_RUN_CHUNK_SIZE")
         .unwrap_or_else(|| rand_range_inclusive(rng, chunk_min, chunk_max));
