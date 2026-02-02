@@ -143,8 +143,8 @@ impl SimSchedulerRunner {
 
     fn execute_task(&mut self, step: u64, worker: WorkerId, task_id: SimTaskId) -> RunOutcome {
         let idx = task_id.index();
-        let task = match self.tasks.get_mut(idx) {
-            Some(task) => task,
+        let (program_idx, pc) = match self.tasks.get(idx) {
+            Some(task) => (task.program_idx, task.pc),
             None => {
                 return self.fail(
                     FailureKind::InvariantViolation { code: 2 },
@@ -154,17 +154,19 @@ impl SimSchedulerRunner {
             }
         };
 
-        let program = match self.program.tasks.get(task.program_idx as usize) {
+        let program = match self.program.tasks.get(program_idx as usize) {
             Some(p) => p,
             None => return self.fail(FailureKind::ProgramError, "invalid program index", step),
         };
 
-        if task.pc >= program.code.len() {
+        if pc >= program.code.len() {
             return self.fail(FailureKind::ProgramError, "pc out of bounds", step);
         }
 
-        let instr = program.code[task.pc].clone();
-        task.pc = task.pc.saturating_add(1);
+        let instr = program.code[pc].clone();
+        if let Some(task) = self.tasks.get_mut(idx) {
+            task.pc = task.pc.saturating_add(1);
+        }
 
         match instr {
             Instr::Spawn { task_idx } => {
@@ -188,7 +190,12 @@ impl SimSchedulerRunner {
             }
             Instr::Acquire { budget } => match self.acquire_budget(task_id, budget, step) {
                 Ok(true) => self.reschedule(worker, task_id, step),
-                Ok(false) => {}
+                Ok(false) => {
+                    // Retry the acquire when the task is unblocked.
+                    if let Some(task) = self.tasks.get_mut(idx) {
+                        task.pc = task.pc.saturating_sub(1);
+                    }
+                }
                 Err(outcome) => return outcome,
             },
             Instr::Release { budget } => {

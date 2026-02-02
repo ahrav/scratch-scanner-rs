@@ -5,7 +5,7 @@
 //! state is single-threaded and reused across chunks to keep the hot path
 //! allocation-free.
 
-use crate::api::{DecodeStep, FindingRec};
+use crate::api::{DecodeStep, FileId, FindingRec, TransformConfig, TransformId};
 use crate::scratch_memory::ScratchVec;
 use crate::stdx::{ByteRing, FixedSet128, TimingWheel};
 
@@ -15,7 +15,7 @@ use crate::api::Base64DecodeStats;
 use super::decode_state::{DecodeSlab, StepArena};
 use super::helpers::pow2_at_least;
 use super::hit_pool::{HitAccPool, SpanU32};
-use super::transform::STREAM_DECODE_CHUNK_BYTES;
+use super::transform::{map_decoded_offset, STREAM_DECODE_CHUNK_BYTES};
 use super::vectorscan_prefilter::{VsScratch, VsStreamWindow};
 use super::work_items::{PendingDecodeSpan, PendingWindow, SpanStreamEntry, WorkItem};
 
@@ -38,6 +38,152 @@ pub(super) struct EntropyScratch {
     // List of "touched" byte values so we can reset in O(distinct) instead of O(256).
     pub(super) used: [u8; 256],
     pub(super) used_len: u16,
+}
+
+/// Context for mapping decoded spans back to root (encoded) coordinates.
+///
+/// During transform scans, findings are reported in decoded-byte coordinates.
+/// This context captures the encoded span being decoded so that decoded offsets
+/// can be translated back to root-buffer offsets for deduplication and output.
+///
+/// # Safety
+/// - `tc` points to an `Engine`-owned `TransformConfig` that outlives the scan.
+/// - `encoded_ptr`/`encoded_len` describe the encoded span being decoded;
+///   the referenced bytes must remain valid while this context is set.
+/// - This context is only valid for the duration of a single scan; it is
+///   cleared after each buffer scan completes.
+#[derive(Clone, Copy)]
+pub(super) struct RootSpanMapCtx {
+    tc: *const TransformConfig,
+    encoded_ptr: *const u8,
+    encoded_len: usize,
+    root_start: usize,
+    // Minimum overlap (in bytes) guaranteed by chunked scans; used to decide
+    // whether a trigger before the match would have appeared in the prior chunk.
+    overlap_backscan: usize,
+}
+
+impl RootSpanMapCtx {
+    pub(super) fn new(
+        tc: &TransformConfig,
+        encoded: &[u8],
+        root_start: usize,
+        overlap_backscan: usize,
+    ) -> Self {
+        Self {
+            tc: tc as *const TransformConfig,
+            encoded_ptr: encoded.as_ptr(),
+            encoded_len: encoded.len(),
+            root_start,
+            overlap_backscan,
+        }
+    }
+
+    pub(super) fn map_span(&self, span: std::ops::Range<usize>) -> std::ops::Range<usize> {
+        // SAFETY: The engine-owned transform config lives for the duration
+        // of the scan, and encoded bytes are valid while the map context is set.
+        let tc = unsafe { &*self.tc };
+        let encoded = unsafe { std::slice::from_raw_parts(self.encoded_ptr, self.encoded_len) };
+        let start = map_decoded_offset(tc, encoded, span.start);
+        let end = map_decoded_offset(tc, encoded, span.end);
+        let root_start = self.root_start;
+        (root_start + start)..(root_start + end)
+    }
+
+    // Returns true if a URL-percent trigger appears within the match span or
+    // within the guaranteed overlap prefix immediately preceding it.
+    pub(super) fn has_trigger_before_or_in_match(
+        &self,
+        root_span: std::ops::Range<usize>,
+    ) -> Option<bool> {
+        // SAFETY: The engine-owned transform config lives for the duration
+        // of the scan, and encoded bytes are valid while the map context is set.
+        let tc = unsafe { &*self.tc };
+        if tc.id != TransformId::UrlPercent {
+            return None;
+        }
+
+        let encoded = unsafe { std::slice::from_raw_parts(self.encoded_ptr, self.encoded_len) };
+        let plus_to_space = tc.plus_to_space;
+        let span_start = root_span
+            .start
+            .saturating_sub(self.root_start)
+            .min(self.encoded_len);
+        let span_end = root_span
+            .end
+            .saturating_sub(self.root_start)
+            .min(self.encoded_len);
+        let scan_start = span_start
+            .saturating_sub(self.overlap_backscan)
+            .min(self.encoded_len);
+        let scan_end = span_end.min(self.encoded_len);
+
+        if scan_start >= scan_end {
+            return Some(false);
+        }
+
+        let mut has_trigger = false;
+        for &b in &encoded[scan_start..scan_end] {
+            if b == b'%' || (plus_to_space && b == b'+') {
+                has_trigger = true;
+                break;
+            }
+        }
+        Some(has_trigger)
+    }
+
+    /// Returns an extended drop boundary for URL-percent matches, or `None`.
+    ///
+    /// # Returns
+    /// - `Some(offset)` if a trigger (`%` or `+`) exists after the match span
+    ///   and no trigger appears within the overlap prefix before the match.
+    ///   The returned offset extends past the first post-match trigger.
+    /// - `None` if this is not a URL-percent transform, or if a trigger already
+    ///   exists within the overlap window (which means the prior chunk would
+    ///   have included this trigger, so no extension is needed).
+    ///
+    /// # Rationale
+    /// URL-percent runs can begin with raw ASCII before the first `%` or `+`.
+    /// If the match lands in that raw prefix, the normal match-end boundary
+    /// would allow a later chunk (starting at the trigger) to re-emit the
+    /// same match. Extending the drop boundary past the trigger prevents
+    /// duplicate findings across chunk boundaries.
+    pub(super) fn drop_hint_end_for_match(
+        &self,
+        match_span: std::ops::Range<usize>,
+    ) -> Option<usize> {
+        // SAFETY: The engine-owned transform config lives for the duration
+        // of the scan, and encoded bytes are valid while the map context is set.
+        let tc = unsafe { &*self.tc };
+        if tc.id != TransformId::UrlPercent {
+            return None;
+        }
+
+        let encoded = unsafe { std::slice::from_raw_parts(self.encoded_ptr, self.encoded_len) };
+        let plus_to_space = tc.plus_to_space;
+        let span_end = match_span
+            .end
+            .saturating_sub(self.root_start)
+            .min(self.encoded_len);
+
+        // If a trigger is already within the overlap backscan window (or inside
+        // the match), a prior chunk would have had a trigger too, so avoid
+        // widening the dedupe boundary and risking duplicates.
+        if self
+            .has_trigger_before_or_in_match(match_span.clone())
+            .unwrap_or(false)
+        {
+            return None;
+        }
+
+        for (idx, &b) in encoded[span_end..].iter().enumerate() {
+            if b == b'%' || (plus_to_space && b == b'+') {
+                return Some(self.root_start + span_end + idx + 1);
+            }
+        }
+
+        None
+    }
 }
 
 impl EntropyScratch {
@@ -88,6 +234,8 @@ pub struct ScanScratch {
     /// capacity prevents allocation in the hot path; overflow increments
     /// `findings_dropped` instead of reallocating.
     pub(super) out: ScratchVec<FindingRec>,
+    /// Drop boundary used by `drop_prefix_findings` (absolute offset in file).
+    pub(super) drop_hint_end: ScratchVec<u64>,
     pub(super) max_findings: usize,     // Per-chunk cap from tuning.
     pub(super) findings_dropped: usize, // Overflow counter when cap is exceeded.
     /// Work queue for breadth-first buffer traversal.
@@ -117,6 +265,8 @@ pub struct ScanScratch {
     pub(super) span_streams: Vec<SpanStreamEntry>,
     /// Temporary findings buffer for a decoded stream (dedupe-aware).
     pub(super) tmp_findings: Vec<FindingRec>,
+    /// Drop boundaries aligned with `tmp_findings`.
+    pub(super) tmp_drop_hint_end: Vec<u64>,
     /// Per-rule stream hit counts for decoded-window seeding.
     ///
     /// Indexing is `rule_id * 3 + variant_idx` (Raw/Utf16Le/Utf16Be).
@@ -147,6 +297,17 @@ pub struct ScanScratch {
     /// reconstruct the full decode path. This buffer holds the reversed chain
     /// during materialization. Capacity is bounded by `max_transform_depth`.
     pub(super) steps_buf: ScratchVec<DecodeStep>,
+    pub(super) root_span_map_ctx: Option<RootSpanMapCtx>,
+    /// Overlap size inferred from the previous chunk in the same file.
+    ///
+    /// Used to determine whether a transform trigger before a match would have
+    /// appeared in the prior chunk, so dedupe boundaries can be widened only
+    /// when needed.
+    pub(super) chunk_overlap_backscan: usize,
+    /// Last scanned chunk metadata (used to infer overlap).
+    pub(super) last_chunk_start: u64,
+    pub(super) last_chunk_len: usize,
+    pub(super) last_file_id: Option<FileId>,
 
     /// Per-thread Vectorscan scratch space for the unified prefilter DB.
     ///
@@ -206,6 +367,8 @@ impl ScanScratch {
 
         Self {
             out: ScratchVec::with_capacity(max_findings).expect("scratch out allocation failed"),
+            drop_hint_end: ScratchVec::with_capacity(max_findings)
+                .expect("scratch drop_hint_end allocation failed"),
             max_findings,
             findings_dropped: 0,
             work_q: ScratchVec::with_capacity(engine.tuning.max_work_items.saturating_add(1))
@@ -223,6 +386,7 @@ impl ScanScratch {
             pending_spans: Vec::with_capacity(max_spans.max(16)),
             span_streams: Vec::with_capacity(engine.transforms.len()),
             tmp_findings: Vec::with_capacity(max_findings),
+            tmp_drop_hint_end: Vec::with_capacity(max_findings),
             stream_hit_counts: vec![0u32; rules_len.saturating_mul(3)],
             stream_hit_touched: ScratchVec::with_capacity(rules_len.saturating_mul(3))
                 .expect("scratch stream_hit_touched allocation failed"),
@@ -265,6 +429,11 @@ impl ScanScratch {
                 db.alloc_scratch()
                     .expect("vectorscan gate scratch allocation failed")
             }),
+            root_span_map_ctx: None,
+            chunk_overlap_backscan: 0,
+            last_chunk_start: 0,
+            last_chunk_len: 0,
+            last_file_id: None,
             #[cfg(feature = "b64-stats")]
             base64_stats: Base64DecodeStats::default(),
         }
@@ -277,6 +446,7 @@ impl ScanScratch {
     /// slices into scratch buffers are invalid after this call.
     pub(super) fn reset_for_scan(&mut self, engine: &Engine) {
         self.out.clear();
+        self.drop_hint_end.clear();
         self.findings_dropped = 0;
         self.work_q.clear();
         self.work_head = 0;
@@ -291,6 +461,7 @@ impl ScanScratch {
         self.pending_spans.clear();
         self.span_streams.clear();
         self.tmp_findings.clear();
+        self.tmp_drop_hint_end.clear();
         for idx in self.stream_hit_touched.drain() {
             let slot = idx as usize;
             if let Some(hit) = self.stream_hit_counts.get_mut(slot) {
@@ -300,6 +471,7 @@ impl ScanScratch {
         self.step_arena.reset();
         self.utf16_buf.clear();
         self.entropy_scratch.reset();
+        self.root_span_map_ctx = None;
         #[cfg(feature = "b64-stats")]
         self.base64_stats.reset();
 
@@ -447,6 +619,10 @@ impl ScanScratch {
             self.out = ScratchVec::with_capacity(self.max_findings)
                 .expect("scratch out allocation failed");
         }
+        if self.drop_hint_end.capacity() < self.max_findings {
+            self.drop_hint_end = ScratchVec::with_capacity(self.max_findings)
+                .expect("scratch drop_hint_end allocation failed");
+        }
         if self.work_q.capacity() < engine.tuning.max_work_items.saturating_add(1) {
             self.work_q = ScratchVec::with_capacity(engine.tuning.max_work_items.saturating_add(1))
                 .expect("scratch work_q allocation failed");
@@ -511,6 +687,42 @@ impl ScanScratch {
             self.tmp_findings
                 .reserve(self.max_findings - self.tmp_findings.capacity());
         }
+        if self.tmp_drop_hint_end.capacity() < self.max_findings {
+            self.tmp_drop_hint_end
+                .reserve(self.max_findings - self.tmp_drop_hint_end.capacity());
+        }
+    }
+
+    /// Updates inferred overlap metadata for the current chunk.
+    ///
+    /// This infers the overlap length by comparing the current chunk start to
+    /// the previous chunk end within the same file. Non-overlapping or
+    /// out-of-order chunks set the overlap to zero.
+    pub(super) fn update_chunk_overlap(
+        &mut self,
+        file_id: FileId,
+        base_offset: u64,
+        buf_len: usize,
+    ) {
+        let mut overlap = 0usize;
+        if self.last_file_id == Some(file_id) {
+            let last_end = self
+                .last_chunk_start
+                .saturating_add(self.last_chunk_len as u64);
+            if base_offset > self.last_chunk_start {
+                if base_offset <= last_end {
+                    overlap = (last_end - base_offset) as usize;
+                }
+            } else if base_offset == self.last_chunk_start && buf_len > self.last_chunk_len {
+                // Growing-window case (overlap >= chunk): previous chunk is a prefix.
+                overlap = self.last_chunk_len;
+            }
+        }
+
+        self.chunk_overlap_backscan = overlap;
+        self.last_file_id = Some(file_id);
+        self.last_chunk_start = base_offset;
+        self.last_chunk_len = buf_len;
     }
 
     /// Returns per-scan base64 decode/gate stats.
@@ -530,6 +742,7 @@ impl ScanScratch {
             "output capacity too small"
         );
         out.extend(self.out.drain());
+        self.drop_hint_end.clear();
     }
 
     /// Returns the number of pending compact findings.
@@ -556,15 +769,32 @@ impl ScanScratch {
     ///
     /// # Effects
     /// - Compacts in place and preserves the relative order of remaining findings.
+    ///
+    /// For transform-derived findings, the drop boundary may be widened beyond
+    /// the match span when a transform trigger occurs after the match and no
+    /// trigger appears within the guaranteed overlap prefix before the match.
+    /// This avoids dropping findings whose matches appear before late-appearing
+    /// triggers (e.g., URL-percent runs with raw prefixes) while preventing
+    /// duplicate emission when earlier triggers are already in the overlap.
     pub fn drop_prefix_findings(&mut self, new_bytes_start: u64) {
         if new_bytes_start == 0 {
             return;
         }
-        // Compact in place: keep only findings where root_hint_end > new_bytes_start.
+        debug_assert_eq!(
+            self.out.len(),
+            self.drop_hint_end.len(),
+            "drop hint length mismatch"
+        );
+        // Compact in place: keep only findings where the dedupe boundary is after
+        // the new-bytes start.
         let mut write_idx = 0;
         let len = self.out.len();
         for read_idx in 0..len {
-            if self.out[read_idx].root_hint_end > new_bytes_start {
+            let drop_end = {
+                let slice = self.drop_hint_end.as_slice();
+                slice[read_idx]
+            };
+            if drop_end > new_bytes_start {
                 if write_idx != read_idx {
                     // Move the element to the write position.
                     // SAFETY: Both indices are in bounds and non-overlapping.
@@ -574,10 +804,16 @@ impl ScanScratch {
                         std::ptr::copy_nonoverlapping(src, dst, 1);
                     }
                 }
+                self.drop_hint_end.as_mut_slice()[write_idx] = drop_end;
                 write_idx += 1;
             }
         }
         self.out.truncate(write_idx);
+        self.drop_hint_end.truncate(write_idx);
+    }
+
+    pub(crate) fn drop_hint_end(&self) -> &[u64] {
+        self.drop_hint_end.as_slice()
     }
 
     /// Returns a shared view of accumulated finding records.
@@ -596,8 +832,13 @@ impl ScanScratch {
     }
 
     pub(super) fn push_finding(&mut self, rec: FindingRec) {
+        self.push_finding_with_drop_hint(rec, rec.root_hint_end);
+    }
+
+    pub(super) fn push_finding_with_drop_hint(&mut self, rec: FindingRec, drop_hint_end: u64) {
         if self.out.len() < self.max_findings {
             self.out.push(rec);
+            self.drop_hint_end.push(drop_hint_end);
         } else {
             self.findings_dropped = self.findings_dropped.saturating_add(1);
         }

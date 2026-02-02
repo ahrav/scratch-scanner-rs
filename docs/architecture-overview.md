@@ -113,6 +113,7 @@ Scheduler harness code lives in `src/sim_scheduler/` and the scanner harness cod
 | **Scanner Oracles** | `src/sim_scanner/runner.rs` | Ground-truth and differential checks for scanner simulations |
 | **SimRng / SimClock** | `src/sim/rng.rs`, `src/sim/clock.rs` | Stable RNG and simulated time source |
 | **TraceRing** | `src/sim/trace.rs` | Bounded trace buffer for replay and debugging |
+| **Minimizer** | `src/sim/minimize.rs` | Deterministic shrink passes for failing scanner artifacts |
 
 ## Data Flow
 

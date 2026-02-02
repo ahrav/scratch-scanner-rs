@@ -28,3 +28,6 @@ fuzz/Cargo.lock
 
 .DS_Store
 .worktrees/
+
+docs/test_harness.md
+docs/test_harness_work_units.md

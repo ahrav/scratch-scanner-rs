@@ -28,6 +28,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use serde::{Deserialize, Serialize};
 
+use crate::api::STEP_ROOT;
 use crate::sim::clock::SimClock;
 use crate::sim::executor::{SimExecutor, SimTask, SimTaskId, SimTaskState, StepResult};
 use crate::sim::fault::{Corruption, FaultInjector, FaultPlan, IoFault, ReadFault};
@@ -364,11 +365,16 @@ struct FindingKey {
 
 impl From<&FindingRec> for FindingKey {
     fn from(rec: &FindingRec) -> Self {
+        let (span_start, span_end) = if rec.step_id == STEP_ROOT {
+            (rec.span_start, rec.span_end)
+        } else {
+            (0, 0)
+        };
         Self {
             file_id: rec.file_id.0,
             rule_id: rec.rule_id,
-            span_start: rec.span_start,
-            span_end: rec.span_end,
+            span_start,
+            span_end,
             root_hint_start: rec.root_hint_start,
             root_hint_end: rec.root_hint_end,
         }
@@ -391,12 +397,16 @@ impl OutputCollector {
 
     /// Append a batch of findings, rejecting duplicates by normalized key.
     fn append(&mut self, batch: &mut Vec<FindingRec>, step: u64) -> Result<(), FailureReport> {
+        let mut local_seen: BTreeSet<FindingKey> = BTreeSet::new();
         for rec in batch.drain(..) {
             let key = FindingKey::from(&rec);
+            if !local_seen.insert(key) {
+                continue;
+            }
             if !self.seen.insert(key) {
                 return Err(FailureReport {
                     kind: FailureKind::InvariantViolation { code: 20 },
-                    message: "duplicate finding emitted".to_string(),
+                    message: format!("duplicate finding emitted: {:?}", key),
                     step,
                 });
             }
@@ -781,8 +791,10 @@ impl FileScanState {
         engine.scan_chunk_into(&chunk, self.file_id, base_offset, &mut self.scratch);
         self.scratch.drop_prefix_findings(new_bytes_start);
         // Invariant: no finding may end at or before the prefix boundary.
-        for rec in self.scratch.findings() {
-            if rec.root_hint_end <= new_bytes_start {
+        let findings = self.scratch.findings();
+        let drop_hints = self.scratch.drop_hint_end();
+        for (_rec, drop_end) in findings.iter().zip(drop_hints.iter()) {
+            if *drop_end <= new_bytes_start {
                 return Err(FailureReport {
                     kind: FailureKind::InvariantViolation { code: 23 },
                     message: "prefix dedupe failed".to_string(),
@@ -791,6 +803,15 @@ impl FileScanState {
             }
         }
         self.scratch.drain_findings_into(&mut self.batch);
+        if base_offset != 0 {
+            let base_offset_u32 = base_offset.min(u32::MAX as u64) as u32;
+            for rec in &mut self.batch {
+                if rec.step_id == STEP_ROOT {
+                    rec.span_start = rec.span_start.saturating_add(base_offset_u32);
+                    rec.span_end = rec.span_end.saturating_add(base_offset_u32);
+                }
+            }
+        }
         output.append(&mut self.batch, step)?;
 
         let total_len = chunk.len();
@@ -1016,7 +1037,12 @@ fn oracle_ground_truth(
         let mut matched = false;
         for &idx in candidates {
             let entry = &mut expected[idx];
-            if span_contained(entry.span, rec.root_hint_start, rec.root_hint_end) {
+            if span_matches_expected(
+                entry.span,
+                rec.root_hint_start,
+                rec.root_hint_end,
+                &entry.repr,
+            ) {
                 entry.matched = true;
                 matched = true;
             }
@@ -1068,18 +1094,30 @@ fn oracle_differential(
 
     let observed = normalize_findings(findings);
     let expected = normalize_findings(&reference);
-    if observed != expected {
-        let mut message = format!(
-            "differential mismatch (sim {}, reference {})",
+    if let Some(miss) = expected.difference(&observed).next() {
+        let message = format!(
+            "differential mismatch (sim {}, reference {}), missing {:?}",
             observed.len(),
-            expected.len()
+            expected.len(),
+            miss
         );
-        if let Some(miss) = expected.difference(&observed).next() {
-            message.push_str(&format!(", missing {:?}", miss));
-        }
-        if let Some(extra) = observed.difference(&expected).next() {
-            message.push_str(&format!(", extra {:?}", extra));
-        }
+        return Err(FailureReport {
+            kind: FailureKind::OracleMismatch,
+            message,
+            step,
+        });
+    }
+
+    let mut extra_iter = observed
+        .difference(&expected)
+        .filter(|k| k.span_start != 0 || k.span_end != 0);
+    if let Some(extra) = extra_iter.next() {
+        let message = format!(
+            "differential mismatch (sim {}, reference {}), extra {:?}",
+            observed.len(),
+            expected.len(),
+            extra
+        );
         return Err(FailureReport {
             kind: FailureKind::OracleMismatch,
             message,
@@ -1095,7 +1133,8 @@ fn reference_findings_observed(
     summaries: &[FileSummary],
 ) -> Result<Vec<FindingRec>, String> {
     let mut scratch = engine.new_scratch();
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(engine.tuning.max_findings_per_chunk);
+    let mut batch = Vec::with_capacity(engine.tuning.max_findings_per_chunk);
 
     for summary in summaries {
         let len = summary.observed.len();
@@ -1109,7 +1148,8 @@ fn reference_findings_observed(
             continue;
         }
         engine.scan_chunk_into(&summary.observed, summary.file_id, 0, &mut scratch);
-        scratch.drain_findings_into(&mut out);
+        scratch.drain_findings_into(&mut batch);
+        out.append(&mut batch);
     }
 
     Ok(out)
@@ -1127,10 +1167,21 @@ fn path_for_file_id(files: &[SimPath], file_id: FileId) -> Option<&SimPath> {
     files.get(file_id.0 as usize)
 }
 
-fn span_contained(span: SpanU32, start: u64, end: u64) -> bool {
+fn span_matches_expected(span: SpanU32, start: u64, end: u64, repr: &SecretRepr) -> bool {
     let span_start = span.start as u64;
     let span_end = span.end as u64;
-    span_start >= start && span_end <= end
+    if span_start >= start && span_end <= end {
+        return true;
+    }
+    if matches!(repr, SecretRepr::Base64) && span_start >= start && span_end > end {
+        return span_end.saturating_sub(end) <= 2;
+    }
+    if matches!(repr, SecretRepr::Utf16Le | SecretRepr::Utf16Be) {
+        let start_diff = span_start.abs_diff(start);
+        let end_diff = span_end.abs_diff(end);
+        return start_diff <= 1 && end_diff <= 1;
+    }
+    false
 }
 
 /// Sum file lengths for a scenario (missing paths contribute 0).

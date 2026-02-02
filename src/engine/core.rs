@@ -32,7 +32,7 @@ use super::rule_repr::{
     add_pat_owned, add_pat_raw, compile_confirm_all, compile_rule, map_to_patterns, utf16be_bytes,
     utf16le_bytes, RuleCompiled, Target, Variant,
 };
-use super::scratch::ScanScratch;
+use super::scratch::{RootSpanMapCtx, ScanScratch};
 use super::transform::STREAM_DECODE_CHUNK_BYTES;
 use super::vectorscan_prefilter::{
     AnchorInput, VsAnchorDb, VsGateDb, VsPrefilterDb, VsStreamDb, VsUtf16StreamDb,
@@ -816,10 +816,13 @@ impl Engine {
         scratch: &mut ScanScratch,
     ) {
         scratch.reset_for_scan(self);
+        scratch.update_chunk_overlap(file_id, base_offset, root_buf.len());
         scratch.work_q.push(WorkItem::ScanBuf {
             buf: BufRef::Root,
             step_id: STEP_ROOT,
             root_hint: None,
+            transform_idx: None,
+            enc_ref: None,
             depth: 0,
         });
 
@@ -838,6 +841,8 @@ impl Engine {
                     buf,
                     step_id,
                     root_hint,
+                    transform_idx,
+                    enc_ref,
                     depth,
                 } => {
                     let before = scratch.out.len();
@@ -855,6 +860,21 @@ impl Engine {
                     // not reallocate during a scan, and `buf_len` is bounded by the checked range.
                     let cur_buf = unsafe { std::slice::from_raw_parts(buf_ptr, buf_len) };
 
+                    scratch.root_span_map_ctx =
+                        match (transform_idx, enc_ref.as_ref(), root_hint.as_ref()) {
+                            (Some(tidx), Some(EncRef::Root(span)), Some(hint))
+                                if hint.start == span.start && hint.end == span.end =>
+                            {
+                                Some(RootSpanMapCtx::new(
+                                    &self.transforms[tidx],
+                                    &root_buf[span.clone()],
+                                    hint.start,
+                                    scratch.chunk_overlap_backscan,
+                                ))
+                            }
+                            _ => None,
+                        };
+
                     self.scan_rules_on_buffer(
                         cur_buf,
                         step_id,
@@ -863,6 +883,7 @@ impl Engine {
                         file_id,
                         scratch,
                     );
+                    scratch.root_span_map_ctx = None;
                     let found_any_in_this_buf = scratch.out.len() > before;
 
                     if depth >= self.tuning.max_transform_depth {
@@ -957,37 +978,91 @@ impl Engine {
                                 }
                             }
 
-                            let child_step_id = scratch.step_arena.push(
-                                step_id,
-                                DecodeStep::Transform {
-                                    transform_idx: tidx,
-                                    parent_span: enc_span.clone(),
-                                },
-                            );
+                            let mut span_starts = [0usize; 4];
+                            let mut span_ends = [0usize; 4];
+                            let mut span_count = 0usize;
 
-                            let child_root_hint = if root_hint.is_none() {
-                                Some(enc_span.clone())
-                            } else {
-                                root_hint.clone()
-                            };
-
-                            let enc_ref = match &buf {
-                                BufRef::Root => EncRef::Root(enc_span.clone()),
-                                BufRef::Slab(_) => {
-                                    let start = buf_offset.saturating_add(enc_span.start);
-                                    let end = buf_offset.saturating_add(enc_span.end);
-                                    EncRef::Slab(start..end)
+                            if tc.id == TransformId::Base64 {
+                                let allow_space_ws = tc.base64_allow_space_ws;
+                                for shift in 0..4usize {
+                                    let Some(rel) = super::transform::base64_skip_chars(
+                                        enc,
+                                        shift,
+                                        allow_space_ws,
+                                    ) else {
+                                        break;
+                                    };
+                                    let start = enc_span.start.saturating_add(rel);
+                                    if start >= enc_span.end {
+                                        continue;
+                                    }
+                                    if span_starts[..span_count].contains(&start) {
+                                        continue;
+                                    }
+                                    let enc_aligned = &cur_buf[start..enc_span.end];
+                                    let remaining_chars = super::transform::base64_char_count(
+                                        enc_aligned,
+                                        allow_space_ws,
+                                    );
+                                    if remaining_chars < tc.min_len {
+                                        continue;
+                                    }
+                                    span_starts[span_count] = start;
+                                    span_ends[span_count] = enc_span.end;
+                                    span_count += 1;
+                                    if span_count >= span_starts.len() {
+                                        break;
+                                    }
                                 }
-                            };
+                            } else {
+                                span_starts[0] = enc_span.start;
+                                span_ends[0] = enc_span.end;
+                                span_count = 1;
+                            }
 
-                            scratch.work_q.push(WorkItem::DecodeSpan {
-                                transform_idx: tidx,
-                                enc_ref,
-                                step_id: child_step_id,
-                                root_hint: child_root_hint,
-                                depth: depth + 1,
-                            });
-                            scratch.work_items_enqueued += 1;
+                            for idx in 0..span_count {
+                                if scratch.work_items_enqueued >= self.tuning.max_work_items {
+                                    break;
+                                }
+                                if scratch.total_decode_output_bytes
+                                    >= self.tuning.max_total_decode_output_bytes
+                                {
+                                    break;
+                                }
+
+                                let enc_span = span_starts[idx]..span_ends[idx];
+                                let child_step_id = scratch.step_arena.push(
+                                    step_id,
+                                    DecodeStep::Transform {
+                                        transform_idx: tidx,
+                                        parent_span: enc_span.clone(),
+                                    },
+                                );
+
+                                let child_root_hint = if root_hint.is_none() {
+                                    Some(enc_span.clone())
+                                } else {
+                                    root_hint.clone()
+                                };
+
+                                let enc_ref = match &buf {
+                                    BufRef::Root => EncRef::Root(enc_span.clone()),
+                                    BufRef::Slab(_) => {
+                                        let start = buf_offset.saturating_add(enc_span.start);
+                                        let end = buf_offset.saturating_add(enc_span.end);
+                                        EncRef::Slab(start..end)
+                                    }
+                                };
+
+                                scratch.work_q.push(WorkItem::DecodeSpan {
+                                    transform_idx: tidx,
+                                    enc_ref,
+                                    step_id: child_step_id,
+                                    root_hint: child_root_hint,
+                                    depth: depth + 1,
+                                });
+                                scratch.work_items_enqueued += 1;
+                            }
                         }
                     }
                 }
@@ -1008,7 +1083,7 @@ impl Engine {
                         continue;
                     }
 
-                    let (enc_ptr, enc_len) = match enc_ref {
+                    let (enc_ptr, enc_len) = match &enc_ref {
                         EncRef::Root(r) => {
                             if r.end <= root_buf.len() {
                                 // SAFETY: bounds are checked against `root_buf`.
@@ -1032,15 +1107,23 @@ impl Engine {
                     // SAFETY: `enc_ptr` points into `root_buf` or the decode slab. Both remain
                     // valid for the duration of this scan and are not reallocated.
                     let enc = unsafe { std::slice::from_raw_parts(enc_ptr, enc_len) };
+                    let root_hint_maps_encoded = match (&enc_ref, &root_hint) {
+                        (EncRef::Root(span), Some(hint)) => {
+                            hint.start == span.start && hint.end == span.end
+                        }
+                        _ => false,
+                    };
 
                     if let Some(vs_stream) = self.vs_stream.as_ref() {
                         self.decode_stream_and_scan(
                             vs_stream,
                             tc,
                             transform_idx,
+                            &enc_ref,
                             enc,
                             step_id,
                             root_hint,
+                            root_hint_maps_encoded,
                             depth,
                             base_offset,
                             file_id,
@@ -1050,6 +1133,7 @@ impl Engine {
                         self.decode_span_fallback(
                             tc,
                             transform_idx,
+                            &enc_ref,
                             enc,
                             step_id,
                             root_hint,
@@ -1137,6 +1221,7 @@ impl Engine {
                 decode_steps: steps,
             });
         }
+        scratch.drop_hint_end.clear();
     }
 }
 

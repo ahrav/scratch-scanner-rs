@@ -16,6 +16,7 @@ pub mod clock;
 pub mod executor;
 pub mod fault;
 pub mod fs;
+pub mod minimize;
 pub mod rng;
 pub mod trace;
 
@@ -26,5 +27,6 @@ pub use executor::{
 };
 pub use fault::{Corruption, FaultInjector, FaultPlan, FileFaultPlan, IoFault, ReadFault};
 pub use fs::{SimFileHandle, SimFs, SimFsSpec, SimNodeSpec, SimPath};
+pub use minimize::{minimize_scanner_case, MinimizerCfg};
 pub use rng::SimRng;
 pub use trace::{TraceEvent, TraceRing};

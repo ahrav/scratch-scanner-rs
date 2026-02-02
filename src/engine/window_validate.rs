@@ -45,7 +45,7 @@ use std::ops::Range;
 use super::core::Engine;
 use super::helpers::{
     contains_all_memmem, contains_any_memmem, decode_utf16be_to_buf, decode_utf16le_to_buf,
-    entropy_gate_passes, extract_secret_span,
+    entropy_gate_passes, extract_secret_span, map_utf16_decoded_offset,
 };
 use super::rule_repr::{RuleCompiled, Variant};
 use super::scratch::ScanScratch;
@@ -212,156 +212,221 @@ impl Engine {
                     // - Secret span: too narrow → missed findings when trailing context
                     //   (e.g., `;` delimiter) extends into new bytes
                     // - Full match span: correct → captures actual regex match extent
-                    let root_span_hint = root_hint.clone().unwrap_or(match_span_in_buf);
+                    let root_span_hint = if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
+                        ctx.map_span(match_span_in_buf.clone())
+                    } else {
+                        root_hint.clone().unwrap_or(match_span_in_buf)
+                    };
 
-                    scratch.push_finding(FindingRec {
-                        file_id,
-                        rule_id,
-                        span_start: span_in_buf.start as u32,
-                        span_end: span_in_buf.end as u32,
-                        root_hint_start: base_offset + root_span_hint.start as u64,
-                        root_hint_end: base_offset + root_span_hint.end as u64,
-                        step_id,
-                    });
+                    let mut drop_hint_end = root_span_hint.end;
+                    if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
+                        if let Some(end) = ctx.drop_hint_end_for_match(root_span_hint.clone()) {
+                            drop_hint_end = drop_hint_end.max(end);
+                        }
+                    }
+                    let drop_hint_end = base_offset + drop_hint_end as u64;
+
+                    scratch.push_finding_with_drop_hint(
+                        FindingRec {
+                            file_id,
+                            rule_id,
+                            span_start: span_in_buf.start as u32,
+                            span_end: span_in_buf.end as u32,
+                            root_hint_start: base_offset + root_span_hint.start as u64,
+                            root_hint_end: base_offset + root_span_hint.end as u64,
+                            step_id,
+                        },
+                        drop_hint_end,
+                    );
                 }
             }
 
             Variant::Utf16Le | Variant::Utf16Be => {
-                // Decode this window as UTF-16 and run the same validators on UTF-8 output.
-                let remaining = self
-                    .tuning
-                    .max_total_decode_output_bytes
-                    .saturating_sub(scratch.total_decode_output_bytes);
-                if remaining == 0 {
-                    return;
-                }
-
-                if let Some(confirm) = &rule.confirm_all {
-                    // Confirm-all literals are encoded like anchors/keywords so we can
-                    // cheaply reject UTF-16 windows before decoding.
-                    let raw_win = &buf[w.clone()];
-                    let vidx = variant.idx();
-                    if let Some(primary) = &confirm.primary[vidx] {
-                        if memmem::find(raw_win, primary).is_none() {
-                            return;
-                        }
+                // UTF-16 anchors can appear at either byte parity; merged windows may
+                // cover both. Run both alignments to avoid dropping opposite-parity hits.
+                let parity = anchor_hint.saturating_sub(w.start) & 1;
+                let offsets = [parity, parity ^ 1];
+                for offset in offsets {
+                    let decode_start = w.start.saturating_add(offset);
+                    if decode_start >= w.end {
+                        continue;
                     }
-                    if !contains_all_memmem(raw_win, &confirm.rest[vidx]) {
-                        return;
-                    }
-                }
-
-                if let Some(kws) = &rule.keywords {
-                    // For UTF-16 variants, apply the keyword gate on the raw UTF-16 bytes
-                    // *before* decoding to avoid spending decode budget on windows that
-                    // could never pass the keyword check.
-                    let raw_win = &buf[w.clone()];
-                    let vidx = variant.idx();
-                    if !contains_any_memmem(raw_win, &kws.any[vidx]) {
-                        return;
-                    }
-                }
-
-                let max_out = self
-                    .tuning
-                    .max_utf16_decoded_bytes_per_window
-                    .min(remaining);
-
-                let decoded = match variant {
-                    Variant::Utf16Le => {
-                        decode_utf16le_to_buf(&buf[w.clone()], max_out, &mut scratch.utf16_buf)
-                    }
-                    Variant::Utf16Be => {
-                        decode_utf16be_to_buf(&buf[w.clone()], max_out, &mut scratch.utf16_buf)
-                    }
-                    _ => unreachable!(),
-                };
-
-                if decoded.is_err() {
-                    return;
-                }
-
-                let decoded = scratch.utf16_buf.as_slice();
-                if decoded.is_empty() {
-                    return;
-                }
-
-                scratch.total_decode_output_bytes = scratch
-                    .total_decode_output_bytes
-                    .saturating_add(decoded.len());
-                if scratch.total_decode_output_bytes > self.tuning.max_total_decode_output_bytes {
-                    return;
-                }
-
-                if let Some(needle) = rule.must_contain {
-                    if memmem::find(decoded, needle).is_none() {
-                        return;
-                    }
-                }
-
-                // Assignment-shape precheck on decoded UTF-8 bytes.
-                if rule.needs_assignment_shape_check && !has_assignment_value_shape(decoded) {
-                    return;
-                }
-
-                let endianness = match variant {
-                    Variant::Utf16Le => Utf16Endianness::Le,
-                    Variant::Utf16Be => Utf16Endianness::Be,
-                    Variant::Raw => unreachable!("raw variant in UTF-16 branch"),
-                };
-                let utf16_step_id = scratch.step_arena.push(
-                    step_id,
-                    DecodeStep::Utf16Window {
-                        endianness,
-                        parent_span: w.clone(),
-                    },
-                );
-
-                let max_findings = scratch.max_findings;
-                let out = &mut scratch.out;
-                let dropped = &mut scratch.findings_dropped;
-                let entropy = rule.entropy;
-                for caps in rule.re.captures_iter(decoded) {
-                    let full_match = caps.get(0).expect("group 0 always exists");
-                    let span = full_match.start()..full_match.end();
-
-                    if let Some(ent) = entropy {
-                        let mbytes = &decoded[span.clone()];
-                        // Entropy gate runs on UTF-8 decoded bytes because the regex
-                        // is evaluated there; this keeps thresholds consistent.
-                        if !entropy_gate_passes(
-                            &ent,
-                            mbytes,
-                            &mut scratch.entropy_scratch,
-                            &self.entropy_log2,
-                        ) {
-                            continue;
-                        }
-                    }
-
-                    // Extract secret span using capture group logic.
-                    let (secret_start, secret_end) = extract_secret_span(&caps, rule.secret_group);
-
-                    // For UTF-16, span_start/span_end are in decoded UTF-8 space but
-                    // root_span_hint must be in raw buffer space. We use the window span
-                    // since mapping back to exact raw positions is complex.
-                    let root_span_hint = root_hint.clone().unwrap_or_else(|| w.clone());
-
-                    if out.len() < max_findings {
-                        out.push(FindingRec {
-                            file_id,
-                            rule_id,
-                            span_start: secret_start as u32,
-                            span_end: secret_end as u32,
-                            root_hint_start: base_offset + root_span_hint.start as u64,
-                            root_hint_end: base_offset + root_span_hint.end as u64,
-                            step_id: utf16_step_id,
-                        });
-                    } else {
-                        *dropped = dropped.saturating_add(1);
+                    let decode_range = decode_start..w.end;
+                    self.run_rule_on_utf16_window_aligned(
+                        rule_id,
+                        rule,
+                        variant,
+                        buf,
+                        decode_range,
+                        step_id,
+                        root_hint.clone(),
+                        base_offset,
+                        file_id,
+                        scratch,
+                    );
+                    if scratch.total_decode_output_bytes
+                        >= self.tuning.max_total_decode_output_bytes
+                    {
+                        break;
                     }
                 }
             }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_rule_on_utf16_window_aligned(
+        &self,
+        rule_id: u32,
+        rule: &RuleCompiled,
+        variant: Variant,
+        buf: &[u8],
+        decode_range: Range<usize>,
+        step_id: StepId,
+        root_hint: Option<Range<usize>>,
+        base_offset: u64,
+        file_id: FileId,
+        scratch: &mut ScanScratch,
+    ) {
+        // Decode this window as UTF-16 and run the same validators on UTF-8 output.
+        let remaining = self
+            .tuning
+            .max_total_decode_output_bytes
+            .saturating_sub(scratch.total_decode_output_bytes);
+        if remaining == 0 {
+            return;
+        }
+
+        let raw_win = &buf[decode_range.clone()];
+
+        if let Some(confirm) = &rule.confirm_all {
+            // Confirm-all literals are encoded like anchors/keywords so we can
+            // cheaply reject UTF-16 windows before decoding.
+            let vidx = variant.idx();
+            if let Some(primary) = &confirm.primary[vidx] {
+                if memmem::find(raw_win, primary).is_none() {
+                    return;
+                }
+            }
+            if !contains_all_memmem(raw_win, &confirm.rest[vidx]) {
+                return;
+            }
+        }
+
+        if let Some(kws) = &rule.keywords {
+            // For UTF-16 variants, apply the keyword gate on the raw UTF-16 bytes
+            // *before* decoding to avoid spending decode budget on windows that
+            // could never pass the keyword check.
+            let vidx = variant.idx();
+            if !contains_any_memmem(raw_win, &kws.any[vidx]) {
+                return;
+            }
+        }
+
+        let max_out = self
+            .tuning
+            .max_utf16_decoded_bytes_per_window
+            .min(remaining);
+
+        let decoded = match variant {
+            Variant::Utf16Le => decode_utf16le_to_buf(raw_win, max_out, &mut scratch.utf16_buf),
+            Variant::Utf16Be => decode_utf16be_to_buf(raw_win, max_out, &mut scratch.utf16_buf),
+            _ => unreachable!(),
+        };
+
+        if decoded.is_err() {
+            return;
+        }
+
+        let decoded_len = scratch.utf16_buf.len();
+        let decoded_ptr = scratch.utf16_buf.as_slice().as_ptr();
+        // SAFETY: `utf16_buf` is not mutated while `decoded` is in use.
+        let decoded = unsafe { std::slice::from_raw_parts(decoded_ptr, decoded_len) };
+        if decoded.is_empty() {
+            return;
+        }
+
+        scratch.total_decode_output_bytes = scratch
+            .total_decode_output_bytes
+            .saturating_add(decoded.len());
+        if scratch.total_decode_output_bytes > self.tuning.max_total_decode_output_bytes {
+            return;
+        }
+
+        if let Some(needle) = rule.must_contain {
+            if memmem::find(decoded, needle).is_none() {
+                return;
+            }
+        }
+
+        // Assignment-shape precheck on decoded UTF-8 bytes.
+        if rule.needs_assignment_shape_check && !has_assignment_value_shape(decoded) {
+            return;
+        }
+
+        let endianness = match variant {
+            Variant::Utf16Le => Utf16Endianness::Le,
+            Variant::Utf16Be => Utf16Endianness::Be,
+            Variant::Raw => unreachable!("raw variant in UTF-16 branch"),
+        };
+        let utf16_step_id = scratch.step_arena.push(
+            step_id,
+            DecodeStep::Utf16Window {
+                endianness,
+                parent_span: decode_range.clone(),
+            },
+        );
+
+        let entropy = rule.entropy;
+        for caps in rule.re.captures_iter(decoded) {
+            let full_match = caps.get(0).expect("group 0 always exists");
+            let span = full_match.start()..full_match.end();
+
+            if let Some(ent) = entropy {
+                let mbytes = &decoded[span.clone()];
+                // Entropy gate runs on UTF-8 decoded bytes because the regex
+                // is evaluated there; this keeps thresholds consistent.
+                if !entropy_gate_passes(
+                    &ent,
+                    mbytes,
+                    &mut scratch.entropy_scratch,
+                    &self.entropy_log2,
+                ) {
+                    continue;
+                }
+            }
+
+            // Extract secret span using capture group logic.
+            let (secret_start, secret_end) = extract_secret_span(&caps, rule.secret_group);
+
+            // Map decoded UTF-8 match span back to raw UTF-16 byte offsets.
+            let match_raw_start =
+                map_utf16_decoded_offset(raw_win, span.start, matches!(variant, Variant::Utf16Le));
+            let match_raw_end =
+                map_utf16_decoded_offset(raw_win, span.end, matches!(variant, Variant::Utf16Le));
+            let mapped_span =
+                (decode_range.start + match_raw_start)..(decode_range.start + match_raw_end);
+            let root_span_hint = root_hint.clone().unwrap_or(mapped_span);
+
+            let mut drop_hint_end = root_span_hint.end;
+            if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
+                if let Some(end) = ctx.drop_hint_end_for_match(root_span_hint.clone()) {
+                    drop_hint_end = drop_hint_end.max(end);
+                }
+            }
+            let drop_hint_end = base_offset + drop_hint_end as u64;
+            scratch.push_finding_with_drop_hint(
+                FindingRec {
+                    file_id,
+                    rule_id,
+                    span_start: secret_start as u32,
+                    span_end: secret_end as u32,
+                    root_hint_start: base_offset + root_span_hint.start as u64,
+                    root_hint_end: base_offset + root_span_hint.end as u64,
+                    step_id: utf16_step_id,
+                },
+                drop_hint_end,
+            );
         }
     }
 
@@ -464,9 +529,21 @@ impl Engine {
             let match_hint_start = window_start.saturating_add(match_start as u64) as usize;
             let match_hint_end = window_start.saturating_add(match_end as u64) as usize;
             let match_span_in_buf = match_hint_start..match_hint_end;
-            let root_span_hint = root_hint.clone().unwrap_or(match_span_in_buf);
+            let root_span_hint = if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
+                ctx.map_span(match_span_in_buf.clone())
+            } else {
+                root_hint.clone().unwrap_or(match_span_in_buf)
+            };
 
             if out.len() < max_findings {
+                let mut drop_hint_end = root_span_hint.end;
+                if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
+                    if let Some(end) = ctx.drop_hint_end_for_match(root_span_hint.clone()) {
+                        drop_hint_end = drop_hint_end.max(end);
+                    }
+                }
+                let drop_hint_end = base_offset + drop_hint_end as u64;
+
                 out.push(FindingRec {
                     file_id,
                     rule_id,
@@ -476,6 +553,7 @@ impl Engine {
                     root_hint_end: base_offset + root_span_hint.end as u64,
                     step_id,
                 });
+                scratch.tmp_drop_hint_end.push(drop_hint_end);
             } else {
                 *dropped = dropped.saturating_add(1);
             }
@@ -502,7 +580,7 @@ impl Engine {
     /// # Edge cases
     /// - Returns early when decode budgets are exhausted or decoding fails.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn run_rule_on_utf16_window_into(
+    fn run_rule_on_utf16_window_aligned_into(
         &self,
         rule_id: u32,
         rule: &RuleCompiled,
@@ -516,7 +594,6 @@ impl Engine {
         scratch: &mut ScanScratch,
         dropped: &mut usize,
         found_any: &mut bool,
-        _anchor_hint: u64,
     ) {
         // Decode this window as UTF-16 and run the same validators on UTF-8 output.
         let remaining = self
@@ -560,7 +637,10 @@ impl Engine {
             return;
         }
 
-        let decoded = scratch.utf16_buf.as_slice();
+        let decoded_len = scratch.utf16_buf.len();
+        let decoded_ptr = scratch.utf16_buf.as_slice().as_ptr();
+        // SAFETY: `utf16_buf` is not mutated while `decoded` is in use.
+        let decoded = unsafe { std::slice::from_raw_parts(decoded_ptr, decoded_len) };
         if decoded.is_empty() {
             return;
         }
@@ -622,12 +702,30 @@ impl Engine {
             // Extract secret span using capture group logic.
             let (secret_start, secret_end) = extract_secret_span(&caps, rule.secret_group);
 
-            // For UTF-16, span_start/span_end are in decoded UTF-8 space but
-            // root_span_hint must be in raw buffer space. We use the parent span
-            // since mapping back to exact raw positions is complex.
-            let root_span_hint = root_hint.clone().unwrap_or_else(|| parent_span.clone());
+            // Map decoded UTF-8 match span back to raw UTF-16 offsets, then
+            // lift into decoded-stream coordinates and (when available) map
+            // through the transform root-span context.
+            let match_raw_start =
+                map_utf16_decoded_offset(raw_win, span.start, matches!(variant, Variant::Utf16Le));
+            let match_raw_end =
+                map_utf16_decoded_offset(raw_win, span.end, matches!(variant, Variant::Utf16Le));
+            let match_stream_start = window_start as usize + match_raw_start;
+            let match_stream_end = window_start as usize + match_raw_end;
+            let mapped_span = match_stream_start..match_stream_end;
+            let root_span_hint = if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
+                ctx.map_span(mapped_span.clone())
+            } else {
+                root_hint.clone().unwrap_or(mapped_span)
+            };
 
             if out.len() < max_findings {
+                let mut drop_hint_end = root_span_hint.end;
+                if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
+                    if let Some(end) = ctx.drop_hint_end_for_match(root_span_hint.clone()) {
+                        drop_hint_end = drop_hint_end.max(end);
+                    }
+                }
+                let drop_hint_end = base_offset + drop_hint_end as u64;
                 out.push(FindingRec {
                     file_id,
                     rule_id,
@@ -637,8 +735,55 @@ impl Engine {
                     root_hint_end: base_offset + root_span_hint.end as u64,
                     step_id: utf16_step_id,
                 });
+                scratch.tmp_drop_hint_end.push(drop_hint_end);
             } else {
                 *dropped = dropped.saturating_add(1);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_rule_on_utf16_window_into(
+        &self,
+        rule_id: u32,
+        rule: &RuleCompiled,
+        variant: Variant,
+        raw_win: &[u8],
+        window_start: u64,
+        step_id: StepId,
+        root_hint: &Option<Range<usize>>,
+        base_offset: u64,
+        file_id: FileId,
+        scratch: &mut ScanScratch,
+        dropped: &mut usize,
+        found_any: &mut bool,
+        anchor_hint: u64,
+    ) {
+        // UTF-16 anchors can land on either byte parity within a merged window;
+        // scan both alignments so mixed-parity anchors are not missed.
+        let parity = (anchor_hint.saturating_sub(window_start) & 1) as usize;
+        let offsets = [parity, parity ^ 1];
+
+        for offset in offsets {
+            if offset >= raw_win.len() {
+                continue;
+            }
+            self.run_rule_on_utf16_window_aligned_into(
+                rule_id,
+                rule,
+                variant,
+                &raw_win[offset..],
+                window_start.saturating_add(offset as u64),
+                step_id,
+                root_hint,
+                base_offset,
+                file_id,
+                scratch,
+                dropped,
+                found_any,
+            );
+            if scratch.total_decode_output_bytes >= self.tuning.max_total_decode_output_bytes {
+                break;
             }
         }
     }

@@ -309,7 +309,9 @@ fn xorshift64(state: &mut u64) -> u64 {
 /// These are test-only helpers that serialize inputs and chunk plans for
 /// deterministic replay.
 #[cfg(test)]
-pub(crate) use regressions::{load_regressions_from_dir, maybe_write_regression};
+pub(crate) use regressions::load_regressions_from_dir;
+#[cfg(all(test, feature = "stdx-proptest"))]
+pub(crate) use regressions::maybe_write_regression;
 
 #[cfg(test)]
 mod regressions {

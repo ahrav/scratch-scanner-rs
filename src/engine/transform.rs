@@ -198,6 +198,13 @@ pub(super) trait SpanSink {
 /// Note: `max_len` splitting does not align to `%HH`; a split escape will be
 /// treated as literal by the decoder, which is acceptable for this scan-first
 /// design.
+///
+/// # Invariants
+/// - Once `done` is set (via `on_span` returning `false`), no further spans
+///   will be emitted until `reset()` is called.
+/// - `in_run` is `true` iff we are currently inside an eligible URL-ish run.
+/// - Between chunks, run state (`start`, `run_len`, `triggers`) is preserved
+///   so that runs can span chunk boundaries.
 pub(super) struct UrlSpanStream {
     min_len: usize,
     max_len: usize,
@@ -314,6 +321,14 @@ impl UrlSpanStream {
 ///
 /// Note: `max_len` splitting does not align to 4-char base64 quanta. A split
 /// segment may fail strict decode if it ends with a 1-char tail.
+///
+/// # Invariants
+/// - Once `done` is set (via `on_span` returning `false`), no further spans
+///   will be emitted until `reset()` is called.
+/// - `in_run` is `true` iff we are currently inside an eligible base64 run.
+/// - `have_b64` tracks whether at least one alphabet character (not whitespace)
+///   has been seen in the current run; runs with only whitespace are discarded.
+/// - Between chunks, run state is preserved so that runs can span boundaries.
 pub(super) struct Base64SpanStream {
     min_chars: usize,
     max_len: usize,
@@ -715,7 +730,8 @@ pub(super) fn find_base64_spans_into(
 
     let mut i = 0usize;
     while i < hay.len() {
-        let flags = BYTE_CLASS[hay[i] as usize];
+        let b = hay[i];
+        let flags = BYTE_CLASS[b as usize];
         let allowed = (flags & allow_mask) != 0;
 
         if !in_run {
@@ -733,6 +749,26 @@ pub(super) fn find_base64_spans_into(
         if allowed {
             run_len += 1;
             if (flags & B64_CHAR) != 0 {
+                if b == b'=' {
+                    if have_b64 {
+                        let mut pad_end = i;
+                        if i + 1 < hay.len() && hay[i + 1] == b'=' {
+                            pad_end = i + 1;
+                            i += 1;
+                        }
+                        last_b64 = pad_end;
+                        if b64_chars >= min_chars {
+                            spans.push(start..(last_b64 + 1));
+                            span_count += 1;
+                            if span_count >= max_spans {
+                                return;
+                            }
+                        }
+                    }
+                    in_run = false;
+                    i += 1;
+                    continue;
+                }
                 b64_chars += 1;
                 last_b64 = i;
                 have_b64 = true;
@@ -767,6 +803,46 @@ pub(super) fn find_base64_spans_into(
     if in_run && have_b64 && b64_chars >= min_chars && span_count < max_spans {
         spans.push(start..(last_b64 + 1));
     }
+}
+
+pub(super) fn base64_skip_chars(
+    encoded: &[u8],
+    skip: usize,
+    allow_space_ws: bool,
+) -> Option<usize> {
+    if skip == 0 {
+        return Some(0);
+    }
+    let mut seen = 0usize;
+    for (i, &b) in encoded.iter().enumerate() {
+        if matches!(b, b'\n' | b'\r' | b'\t') || (allow_space_ws && b == b' ') {
+            continue;
+        }
+        if (BYTE_CLASS[b as usize] & B64_CHAR) == 0 {
+            return None;
+        }
+        seen += 1;
+        if seen == skip {
+            return Some(i + 1);
+        }
+    }
+    None
+}
+
+pub(super) fn base64_char_count(encoded: &[u8], allow_space_ws: bool) -> usize {
+    let mut count = 0usize;
+    for &b in encoded {
+        if matches!(b, b'\n' | b'\r' | b'\t') || (allow_space_ws && b == b' ') {
+            continue;
+        }
+        if (BYTE_CLASS[b as usize] & B64_CHAR) == 0 {
+            break;
+        }
+        if b != b'=' {
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Streaming base64 decoder that accepts std + URL-safe alphabets.
@@ -999,6 +1075,138 @@ pub(super) fn stream_decode(
         }
         TransformId::Base64 => stream_decode_base64(input, on_bytes).map_err(|_| ()),
     }
+}
+
+/// Map a decoded output offset back to the number of encoded bytes consumed.
+///
+/// Returns the encoded offset (half-open) such that decoding `encoded[0..offset]`
+/// would produce at least `decoded_offset` bytes. If `decoded_offset` exceeds
+/// decoded output length, returns `encoded.len()`.
+pub(super) fn map_decoded_offset(
+    tc: &TransformConfig,
+    encoded: &[u8],
+    decoded_offset: usize,
+) -> usize {
+    match tc.id {
+        TransformId::UrlPercent => map_decoded_offset_url(encoded, decoded_offset),
+        TransformId::Base64 => {
+            map_decoded_offset_base64(encoded, decoded_offset, tc.base64_allow_space_ws)
+        }
+    }
+}
+
+fn map_decoded_offset_url(encoded: &[u8], decoded_offset: usize) -> usize {
+    if decoded_offset == 0 {
+        return 0;
+    }
+    let mut decoded = 0usize;
+    let mut i = 0usize;
+    while i < encoded.len() {
+        if decoded >= decoded_offset {
+            break;
+        }
+        let b = encoded[i];
+        if b == b'%' && i + 2 < encoded.len() && is_hex(encoded[i + 1]) && is_hex(encoded[i + 2]) {
+            i += 3;
+        } else {
+            i += 1;
+        }
+        decoded += 1;
+    }
+    i.min(encoded.len())
+}
+
+fn map_decoded_offset_base64(encoded: &[u8], decoded_offset: usize, allow_space_ws: bool) -> usize {
+    if decoded_offset == 0 {
+        return 0;
+    }
+    let total_decoded = base64_decoded_len(encoded, allow_space_ws);
+    if decoded_offset >= total_decoded {
+        return encoded.len();
+    }
+    let mut decoded = 0usize;
+    let mut quad: [u8; 4] = [0; 4];
+    let mut qn = 0usize;
+    let mut i = 0usize;
+
+    while i < encoded.len() {
+        let b = encoded[i];
+        i += 1;
+        if matches!(b, b'\n' | b'\r' | b'\t') || (allow_space_ws && b == b' ') {
+            continue;
+        }
+        let v = B64_DECODE[b as usize];
+        if v == B64_INVALID {
+            break;
+        }
+        quad[qn] = v;
+        qn += 1;
+
+        if qn == 2 {
+            decoded += 1;
+            if decoded >= decoded_offset {
+                return i;
+            }
+        } else if qn == 3 {
+            if quad[2] == B64_PAD {
+                break;
+            }
+            decoded += 1;
+            if decoded >= decoded_offset {
+                return i;
+            }
+        } else if qn == 4 {
+            if quad[2] == B64_PAD {
+                break;
+            }
+            if quad[3] != B64_PAD {
+                decoded += 1;
+                if decoded >= decoded_offset {
+                    return i;
+                }
+            }
+            qn = 0;
+        }
+    }
+
+    i.min(encoded.len())
+}
+
+fn base64_decoded_len(encoded: &[u8], allow_space_ws: bool) -> usize {
+    let mut decoded = 0usize;
+    let mut quad: [u8; 4] = [0; 4];
+    let mut qn = 0usize;
+
+    for &b in encoded {
+        if matches!(b, b'\n' | b'\r' | b'\t') || (allow_space_ws && b == b' ') {
+            continue;
+        }
+        let v = B64_DECODE[b as usize];
+        if v == B64_INVALID {
+            break;
+        }
+        quad[qn] = v;
+        qn += 1;
+
+        if qn == 2 {
+            decoded += 1;
+        } else if qn == 3 {
+            if quad[2] == B64_PAD {
+                break;
+            }
+            decoded += 1;
+        } else if qn == 4 {
+            if quad[2] == B64_PAD {
+                break;
+            }
+            if quad[3] != B64_PAD {
+                decoded += 1;
+            }
+            qn = 0;
+        }
+    }
+
+    decoded
 }
 
 /// Decode into a `Vec` with output-size protection (tests only).

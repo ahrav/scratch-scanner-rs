@@ -377,6 +377,65 @@ pub(super) fn decode_utf16be_to_buf(
     decode_utf16_to_buf(input, max_out, false, out)
 }
 
+/// Maps a decoded UTF-8 offset back to the raw UTF-16 byte offset.
+///
+/// Returns the raw byte offset (half-open) such that decoding `input[0..offset]`
+/// would produce at least `decoded_offset` UTF-8 bytes. If `decoded_offset`
+/// exceeds the decoded length, returns the largest even byte offset.
+pub(super) fn map_utf16_decoded_offset(input: &[u8], decoded_offset: usize, le: bool) -> usize {
+    if decoded_offset == 0 {
+        return 0;
+    }
+    let n = input.len() / 2;
+    let mut decoded = 0usize;
+    let mut i = 0usize;
+
+    while i < n {
+        let b0 = input[2 * i];
+        let b1 = input[2 * i + 1];
+        let u = if le {
+            u16::from_le_bytes([b0, b1])
+        } else {
+            u16::from_be_bytes([b0, b1])
+        };
+
+        let (ch, advance) = if (0xD800..=0xDBFF).contains(&u) {
+            if i + 1 < n {
+                let b2 = input[2 * (i + 1)];
+                let b3 = input[2 * (i + 1) + 1];
+                let u2 = if le {
+                    u16::from_le_bytes([b2, b3])
+                } else {
+                    u16::from_be_bytes([b2, b3])
+                };
+                if (0xDC00..=0xDFFF).contains(&u2) {
+                    let high = (u - 0xD800) as u32;
+                    let low = (u2 - 0xDC00) as u32;
+                    let code = 0x10000 + ((high << 10) | low);
+                    let ch = std::char::from_u32(code).unwrap_or('\u{FFFD}');
+                    (ch, 2)
+                } else {
+                    ('\u{FFFD}', 1)
+                }
+            } else {
+                ('\u{FFFD}', 1)
+            }
+        } else if (0xDC00..=0xDFFF).contains(&u) {
+            ('\u{FFFD}', 1)
+        } else {
+            (std::char::from_u32(u as u32).unwrap_or('\u{FFFD}'), 1)
+        };
+
+        decoded = decoded.saturating_add(ch.len_utf8());
+        i = i.saturating_add(advance);
+        if decoded >= decoded_offset {
+            return i.saturating_mul(2);
+        }
+    }
+
+    n.saturating_mul(2)
+}
+
 /// Decodes UTF-16 into a scratch buffer, using replacement characters for
 /// invalid sequences.
 ///
