@@ -45,49 +45,57 @@ This gap represents the combined cost of: window formation/merging, gate checks 
 
 #### 2.1 generic-api-key (Primary Offender)
 
-**Location:** `src/gitleaks_rules.rs:1231-1246`
+**Location:** `src/gitleaks_rules.rs:1258-1316`
 
 ```rust
 RuleSpec {
     name: "generic-api-key",
-    anchors: generic_api_key_anchors(),  // 270 anchors!
+    anchors: &[
+        b"access", b"ACCESS",
+        b"api", b"API",
+        b"auth", b"AUTH",
+        b"key", b"KEY",
+        b"credential", b"CREDENTIAL",
+        b"creds", b"CREDS",
+        b"passwd", b"PASSWD",
+        b"password", b"PASSWORD",
+        b"secret", b"SECRET",
+        b"token", b"TOKEN",
+    ],  // 20 anchors (10 keywords × 2 case variants)
     radius: 256,
     validator: ValidatorKind::None,
     two_phase: None,
     must_contain: None,
-    keywords_any: None,  // No keyword gate!
+    keywords_any: Some(&[
+        b"access", b"ACCESS",
+        b"api", b"API",
+        b"auth", b"AUTH",
+        b"key", b"KEY",
+        b"credential", b"CREDENTIAL",
+        b"creds", b"CREDS",
+        b"passwd", b"PASSWD",
+        b"password", b"PASSWORD",
+        b"secret", b"SECRET",
+        b"token", b"TOKEN",
+    ]),
     entropy: Some(EntropySpec {
         min_bits_per_byte: 3.5,
         min_len: 16,
         max_len: 256,
     }),
     re: build_regex(
-        r#"(?i)(?:access|auth|api|credential|creds|key|passw(?:or)?d|secret|token|id)(?:[
-\t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([\w.=-]{10,150}|[a-z0-9][a-z0-9+/]{11,}={0,3})(?:[\x60'"\s;]|\\[nr]|$)"#,
+        r#"(?i)[\w.-]{0,50}?(?:access|auth|(?-i:[Aa]pi|API)|credential|creds|key|passw(?:or)?d|secret|token)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([\w.=-]{10,150}|[a-z0-9][a-z0-9+/]{11,}={0,3})(?:[\x60'"\s;]|\\[nr]|$)"#,
     ),
 }
 ```
 
-**Anchor generation logic** (`src/gitleaks_rules.rs:26-64`):
-
-```rust
-const KEYWORDS: [&str; 10] = [
-    "key", "api", "auth", "token", "secret",
-    "password", "credential", "creds", "access", "id",
-];
-const SEPARATORS: [&str; 9] = ["=", " =", "  =", ":", " :", "\":", "':", " =>", " >"];
-
-// Generates 10 keywords * 9 separators * 3 case variants = 270 anchors
-// Examples: "key=", "KEY =", "Token:", "SECRET  =", "api\":", etc.
-```
-
 **Why this rule is expensive:**
 
-1. **270 anchors** - The largest anchor set in the entire ruleset
-2. **Generic word anchors** - Words like `key`, `api`, `token` match frequently in normal source code
-3. **No `keywords_any` gate** - Every anchor hit proceeds directly to regex execution
-4. **Complex regex** - Case-insensitivity (`(?i)`), alternations, lazy quantifiers (`{0,20}`)
-5. **Large radius (256 bytes)** - Creates large validation windows
+1. **20 generic word anchors** - Words like `key`, `api`, `token` match frequently in normal source code
+2. **High anchor hit rate** - Common programming vocabulary appears in variable names, comments, documentation
+3. **Complex regex** - Case-insensitivity (`(?i)`), alternations, lazy quantifiers (`{0,50}?`)
+4. **Large radius (256 bytes)** - Creates large validation windows
+5. **Despite having keywords_any gate** - The gate doesn't filter much since it uses the same generic keywords as anchors
 
 **Profiling data** from real repository scan (`bench_repos --profile-rules`):
 
@@ -99,33 +107,35 @@ const SEPARATORS: [&str; 9] = ["=", " =", "  =", ":", " :", "\":", "':", " =>", 
 
 #### 2.2 sourcegraph-access-token (Secondary Offender)
 
-**Location:** `src/gitleaks_rules.rs:3218-3233`
+**Location:** `src/gitleaks_rules.rs:3416-3432`
 
 ```rust
 RuleSpec {
     name: "sourcegraph-access-token",
-    anchors: &[b"sgp_", b"SGP_", b"sourcegraph", b"SOURCEGRAPH"],
+    anchors: &[b"sgp_", b"SGP_"],  // Specific prefix anchors only
     radius: 256,
     validator: ValidatorKind::None,
     two_phase: None,
     must_contain: None,
-    keywords_any: Some(&[b"sgp_", b"SGP_", b"sourcegraph", b"SOURCEGRAPH"]),
+    keywords_any: Some(&[b"sgp_", b"SGP_"]),
     entropy: Some(EntropySpec {
         min_bits_per_byte: 3.0,
         min_len: 16,
         max_len: 256,
     }),
     re: build_regex(
-        r#"(?i)\b(\b(sgp_(?:[a-fA-F0-9]{16}|local)_[a-fA-F0-9]{40}|sgp_[a-fA-F0-9]{40}|[a-fA-F0-9]{40})\b)(?:[\x60'"\s;]|\\[nr]|$)"#,
+        r#"(?i)\b(sgp_(?:[a-fA-F0-9]{16}|local)_[a-fA-F0-9]{40}|sgp_[a-fA-F0-9]{40})\b(?:[\x60'"\s;]|\\[nr]|$)"#,
     ),
 }
 ```
 
-**Why this rule is expensive:**
+**Note:** This rule was previously slower due to generic `sourcegraph`/`SOURCEGRAPH` keyword anchors and a regex with `[a-fA-F0-9]{40}` that matched git SHAs. The current optimized version uses only the `sgp_` prefix anchors and a more specific regex pattern.
 
-1. **Generic anchors** - `sourcegraph` and `SOURCEGRAPH` match in URLs, comments, documentation
-2. **Overly broad regex alternation** - `[a-fA-F0-9]{40}` matches ANY 40-character hex string (e.g., git commit hashes)
-3. **Profiling shows:** 893 windows processed, 30695 regex matches (rank #3 by validation time)
+**Why this rule could still be expensive:**
+
+1. **Relatively short anchors** - `sgp_` is only 4 characters
+2. **Common prefix pattern** - May appear in code, though less frequently than generic keywords
+3. **Profiling shows:** 893 windows processed, 30695 regex matches (rank #3 by validation time in older versions)
 
 ---
 

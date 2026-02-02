@@ -33,8 +33,8 @@ SCHEDULER_SIM_STRESS_SEEDS=100 cargo test --features scheduler-sim scheduler_sim
 ```
 
 **Key paths:**
-- **Corpus**: `tests/scheduler_corpus/*.json` - regression tests replayed on every run
-- **Failures**: `tests/scheduler_failures/*.json` - where stress failures are written
+- **Corpus**: `tests/simulation/corpus/*.json` - regression tests replayed on every run
+- **Failures**: `tests/simulation/failures/*.json` - where stress failures are written
 
 ## SimCase DSL Reference
 
@@ -391,7 +391,7 @@ With only 1 unit available, one task acquires while the other fails and takes th
 
 ### Adding a Test to the Corpus
 
-1. Create a JSON file in `tests/scheduler_corpus/` following the schema above
+1. Create a JSON file in `tests/simulation/corpus/` following the schema above
 2. Run `cargo test --features scheduler-sim scheduler_sim_replay_corpus`
 3. The test will fail with `trace hash mismatch` and print the actual hash
 4. Copy the printed hash into your JSON as `expected_trace_hash`
@@ -400,7 +400,7 @@ With only 1 unit available, one task acquires while the other fails and takes th
 Example workflow:
 ```bash
 # Create your test case
-vim tests/scheduler_corpus/my_test.json
+vim tests/simulation/corpus/my_test.json
 
 # Run to get the trace hash (will fail first time)
 cargo test --features scheduler-sim scheduler_sim_replay_corpus
@@ -412,7 +412,7 @@ cargo test --features scheduler-sim scheduler_sim_replay_corpus
 
 ### Interpreting Failure Artifacts
 
-When stress tests find a violation, they write an artifact to `tests/scheduler_failures/`:
+When stress tests find a violation, they write an artifact to `tests/simulation/failures/`:
 
 ```json
 {
@@ -490,9 +490,9 @@ A: Corpus artifacts are valid test cases that should pass. "Timeout" means "ran 
 **Q: How do I debug a failing stress test?**
 
 A:
-1. Find the artifact in `tests/scheduler_failures/`
+1. Find the artifact in `tests/simulation/failures/`
 2. Set `SCHEDULER_SIM_STRESS_SEEDS=1` and `SCHEDULER_SIM_STRESS_SEED_BASE=<seed>` to reproduce
-3. Add the artifact to `tests/scheduler_corpus/` to make it a permanent regression test
+3. Add the artifact to `tests/simulation/corpus/` to make it a permanent regression test
 
 **Q: Can I test the actual crossbeam queues?**
 
