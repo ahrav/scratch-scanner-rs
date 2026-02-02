@@ -29,14 +29,15 @@ use std::time::Duration;
 
 use super::executor::ExecutorConfig;
 use super::executor_core::{
-    in_flight, is_accepting, worker_step, IdleAction, IdleHooks, NoopTrace, TraceHooks,
-    WorkerCtxLike, WorkerStepResult, ACCEPTING_BIT, COUNT_UNIT, WAKE_ON_HOARD_THRESHOLD,
+    in_flight, is_accepting, worker_step, ExecTraceEvent, IdleAction, IdleHooks, NoopTrace,
+    PopSource, TraceHooks, WorkerCtxLike, WorkerStepResult, ACCEPTING_BIT, COUNT_UNIT,
+    WAKE_ON_HOARD_THRESHOLD,
 };
 use super::rng::XorShift64;
 
 /// Simulation configuration for the executor policy.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct SimExecCfg {
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SimExecCfg {
     /// Number of simulated workers.
     pub workers: usize,
     /// Steal attempts per idle cycle.
@@ -377,23 +378,23 @@ pub(crate) type ResourceId = u16;
 pub(crate) type IoToken = u32;
 
 /// Static task program definition.
-#[derive(Clone, Debug)]
-pub(crate) struct TaskProgram {
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct TaskProgram {
     pub name: String,
     pub code: Vec<Instruction>,
 }
 
 /// Where a run-token should be enqueued.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SpawnPlacement {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SpawnPlacement {
     Local,
     Global,
     External,
 }
 
 /// Scheduler-relevant bytecode instruction set.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Instruction {
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Instruction {
     Yield {
         placement: SpawnPlacement,
     },
@@ -425,8 +426,8 @@ pub(crate) enum Instruction {
 }
 
 /// Initial task state used to seed a simulation case.
-#[derive(Clone, Debug)]
-pub(crate) struct LogicalTaskInit {
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct LogicalTaskInit {
     pub tid: TaskId,
     pub program: ProgramId,
     pub pc: u16,
@@ -693,8 +694,8 @@ impl TaskVm {
 }
 
 /// Resource specification for simulation.
-#[derive(Clone, Debug)]
-pub(crate) struct ResourceSpec {
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ResourceSpec {
     pub id: ResourceId,
     pub total: u32,
 }
@@ -758,15 +759,15 @@ impl ResourceModel {
 /// External events delivered by the simulation driver.
 ///
 /// `CloseGateJoin` models `Executor::join()` closing the accepting gate.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ExternalEvent {
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ExternalEvent {
     IoComplete { token: IoToken },
     CloseGateJoin,
 }
 
 /// Scheduled external event for deterministic replay.
-#[derive(Clone, Debug)]
-pub(crate) struct ScheduledEvent {
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ScheduledEvent {
     pub at_step: u64,
     pub event: ExternalEvent,
 }
@@ -775,8 +776,8 @@ pub(crate) struct ScheduledEvent {
 ///
 /// The driver uses this to build a `SimState` with a fixed executor policy,
 /// static programs, and a deterministic external event schedule.
-#[derive(Clone, Debug)]
-pub(crate) struct SimCase {
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SimCase {
     pub exec_cfg: SimExecCfg,
     pub resources: Vec<ResourceSpec>,
     pub programs: Vec<TaskProgram>,
@@ -796,8 +797,8 @@ impl SimCase {
 }
 
 /// Actions the deterministic driver can choose at each step.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum DriverAction {
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DriverAction {
     /// Execute a single worker step.
     StepWorker { wid: usize },
     /// Deliver a scheduled external event whose time has arrived.
@@ -807,35 +808,35 @@ pub(crate) enum DriverAction {
 }
 
 /// Choice encoding for replay: index into the enabled action list.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DriverChoice {
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DriverChoice {
     pub idx: u16,
 }
 
 /// Trace header for deterministic replay.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct TraceHeader {
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TraceHeader {
     pub schema_version: u32,
     pub seed: u64,
 }
 
 /// Trace of driver actions and scheduler events.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Trace {
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Trace {
     pub header: TraceHeader,
     pub events: Vec<TraceEvent>,
     pub final_digest: StateDigest,
 }
 
 /// Trace events emitted during a simulation run.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum TraceEvent {
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TraceEvent {
     Step {
         n: u64,
         action: DriverAction,
     },
     Exec {
-        event: super::executor_core::ExecTraceEvent<TaskId>,
+        event: ExecTraceEventSimple,
     },
     TaskInstr {
         tid: TaskId,
@@ -851,8 +852,8 @@ pub(crate) enum TraceEvent {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct StateDigest {
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StateDigest {
     pub in_flight: usize,
     pub accepting: bool,
     pub done: bool,
@@ -860,8 +861,69 @@ pub(crate) struct StateDigest {
     pub injector_len: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ViolationKind {
+/// Public-safe executor trace summary for serialization.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Public-safe executor trace summary for serialization.
+pub enum ExecTraceEventSimple {
+    Pop {
+        wid: usize,
+        source: ExecTraceSource,
+        victim: Option<usize>,
+        tid: TaskId,
+    },
+    SpawnLocal {
+        wid: usize,
+    },
+    SpawnGlobal {
+        wid: usize,
+    },
+    SpawnExternal,
+    UnparkOne {
+        target: usize,
+    },
+    InitiateDone,
+    PanicRecorded,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ExecTraceSource {
+    Local,
+    Injector,
+    Steal,
+}
+
+impl From<&ExecTraceEvent<TaskId>> for ExecTraceEventSimple {
+    fn from(event: &ExecTraceEvent<TaskId>) -> Self {
+        match event {
+            ExecTraceEvent::Pop {
+                wid,
+                source,
+                victim,
+                tag,
+            } => ExecTraceEventSimple::Pop {
+                wid: *wid,
+                source: match source {
+                    PopSource::Local => ExecTraceSource::Local,
+                    PopSource::Injector => ExecTraceSource::Injector,
+                    PopSource::Steal => ExecTraceSource::Steal,
+                },
+                victim: *victim,
+                tid: *tag,
+            },
+            ExecTraceEvent::SpawnLocal { wid } => ExecTraceEventSimple::SpawnLocal { wid: *wid },
+            ExecTraceEvent::SpawnGlobal { wid } => ExecTraceEventSimple::SpawnGlobal { wid: *wid },
+            ExecTraceEvent::SpawnExternal => ExecTraceEventSimple::SpawnExternal,
+            ExecTraceEvent::UnparkOne { target } => {
+                ExecTraceEventSimple::UnparkOne { target: *target }
+            }
+            ExecTraceEvent::InitiateDone => ExecTraceEventSimple::InitiateDone,
+            ExecTraceEvent::PanicRecorded => ExecTraceEventSimple::PanicRecorded,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ViolationKind {
     InFlightMismatch,
     DoubleRun,
     TaskStateOverlap,
@@ -872,22 +934,22 @@ pub(crate) enum ViolationKind {
     IllegalUnblock,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum FailureKind {
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FailureKind {
     Violation(ViolationKind),
     Panic,
     Timeout,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct FailureInfo {
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FailureInfo {
     pub kind: FailureKind,
     pub step: u64,
     pub message: String,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct ReproArtifact {
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ReproArtifact {
     pub schema_version: u32,
     pub seed: u64,
     pub case: SimCase,
@@ -896,8 +958,8 @@ pub(crate) struct ReproArtifact {
     pub failure: FailureInfo,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct MinimizeConfig {
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct MinimizeConfig {
     pub max_checks: usize,
 }
 
@@ -905,7 +967,7 @@ pub(crate) struct MinimizeConfig {
 ///
 /// This is used to sanity-check replay determinism without storing the
 /// entire trace in the repro artifact.
-pub(crate) fn trace_hash(trace: &Trace) -> u64 {
+pub fn trace_hash(trace: &Trace) -> u64 {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
@@ -918,7 +980,7 @@ pub(crate) fn trace_hash(trace: &Trace) -> u64 {
     u64::from_le_bytes(out)
 }
 
-pub(crate) fn minimize(
+pub fn minimize(
     mut artifact: ReproArtifact,
     cfg: MinimizeConfig,
     check: impl Fn(&ReproArtifact) -> Result<(), FailureInfo>,
@@ -1264,7 +1326,7 @@ fn enabled_actions(state: &SimState) -> Vec<DriverAction> {
 }
 
 /// Run a simulation using explicit driver choices (or default-first selection).
-pub(crate) fn run_with_choices(case: &SimCase, choices: &[DriverChoice]) -> Trace {
+pub fn run_with_choices(case: &SimCase, choices: &[DriverChoice]) -> Trace {
     let mut state = SimState::from_case(case);
     let mut driver = Driver::new(choices);
     let mut oracles = OracleChecker::new(case.exec_cfg.workers, case.exec_cfg.steal_tries);
@@ -1327,7 +1389,7 @@ pub(crate) fn run_with_choices(case: &SimCase, choices: &[DriverChoice]) -> Trac
                 }
                 for event in &exec_trace.events {
                     trace.events.push(TraceEvent::Exec {
-                        event: event.clone(),
+                        event: ExecTraceEventSimple::from(event),
                     });
                 }
                 for (tid, pc, instr) in &task_trace.events {
@@ -1385,7 +1447,7 @@ pub(crate) fn run_with_choices(case: &SimCase, choices: &[DriverChoice]) -> Trac
 }
 
 /// Assert that a case + choices produce identical traces across runs.
-pub(crate) fn assert_deterministic(case: &SimCase, choices: &[DriverChoice]) {
+pub fn assert_deterministic(case: &SimCase, choices: &[DriverChoice]) {
     let t1 = run_with_choices(case, choices);
     let t2 = run_with_choices(case, choices);
     assert_eq!(t1, t2, "non-deterministic trace");

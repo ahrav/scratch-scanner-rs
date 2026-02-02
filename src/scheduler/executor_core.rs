@@ -48,7 +48,7 @@ pub(crate) const COUNT_UNIT: usize = 2;
 pub(crate) const WAKE_ON_HOARD_THRESHOLD: u32 = 32;
 
 /// Source queue for a popped task.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum PopSource {
     Local,
     Injector,
@@ -75,7 +75,9 @@ pub(crate) enum WorkerStepResult<Tag> {
 }
 
 /// Structured trace events emitted by the step engine.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// This is serializable so sim traces can be persisted as JSON repro cases.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum ExecTraceEvent<Tag> {
     Pop {
         wid: usize,
