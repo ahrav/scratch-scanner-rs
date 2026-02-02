@@ -47,12 +47,14 @@ struct CorpusCoverage {
     instr_release: bool,
     instr_jump: bool,
     instr_complete: bool,
+    instr_panic: bool,
     pop_local: bool,
     pop_injector: bool,
     pop_steal: bool,
     advance_time: bool,
     external_io: bool,
     external_close_gate: bool,
+    exec_panic_recorded: bool,
 }
 
 impl CorpusCoverage {
@@ -70,15 +72,17 @@ impl CorpusCoverage {
                         self.advance_time = true;
                     }
                 }
-                TraceEvent::Exec { event } => {
-                    if let ExecTraceEventSimple::Pop { source, .. } = event {
-                        match source {
-                            ExecTraceSource::Local => self.pop_local = true,
-                            ExecTraceSource::Injector => self.pop_injector = true,
-                            ExecTraceSource::Steal => self.pop_steal = true,
-                        }
+                TraceEvent::Exec { event } => match event {
+                    ExecTraceEventSimple::Pop { source, .. } => match source {
+                        ExecTraceSource::Local => self.pop_local = true,
+                        ExecTraceSource::Injector => self.pop_injector = true,
+                        ExecTraceSource::Steal => self.pop_steal = true,
+                    },
+                    ExecTraceEventSimple::PanicRecorded => {
+                        self.exec_panic_recorded = true;
                     }
-                }
+                    _ => {}
+                },
                 TraceEvent::TaskInstr { instr, .. } => match instr {
                     Instruction::Yield { .. } => {
                         self.instr_yield = true;
@@ -97,7 +101,7 @@ impl CorpusCoverage {
                     Instruction::Release { .. } => self.instr_release = true,
                     Instruction::Jump { .. } => self.instr_jump = true,
                     Instruction::Complete => self.instr_complete = true,
-                    Instruction::Panic => {}
+                    Instruction::Panic => self.instr_panic = true,
                 },
                 TraceEvent::External { event } => match event {
                     ExternalEvent::IoComplete { .. } => self.external_io = true,

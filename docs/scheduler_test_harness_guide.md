@@ -34,7 +34,7 @@ SCHEDULER_SIM_STRESS_SEEDS=100 cargo test --features scheduler-sim scheduler_sim
 
 **Key paths:**
 - **Corpus**: `tests/simulation/corpus/*.json` - regression tests replayed on every run
-- **Failures**: `tests/simulation/failures/*.json` - where stress failures are written
+- **Failures**: `tests/failures/*.json` - where stress failures are written
 
 ## SimCase DSL Reference
 
@@ -65,7 +65,7 @@ A `SimCase` defines a complete simulation scenario in JSON. The harness loads th
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `workers` | u32 | required | Number of simulated worker threads |
+| `workers` | usize | required | Number of simulated worker threads |
 | `steal_tries` | u32 | 4 | Steal attempts before parking |
 | `seed` | u64 | required | RNG seed for deterministic victim selection |
 | `wake_on_hoard_threshold` | u32 | 32 | Local spawns before waking a sibling worker |

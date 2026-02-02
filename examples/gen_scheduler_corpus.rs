@@ -1,6 +1,6 @@
 //! Generates deterministic scheduler simulation corpus artifacts.
 //!
-//! The corpus is consumed by `tests/scheduler_sim.rs` to replay traces and
+//! The corpus is consumed by `tests/simulation/scheduler_sim.rs` to replay traces and
 //! enforce coverage across scheduler paths (steal vs injector vs local),
 //! driver actions (time advance, external delivery), and bytecode variants
 //! (spawn/yield, IO, sleep, resources, jump).
@@ -9,7 +9,7 @@
 //! - `cargo run --example gen_scheduler_corpus --features scheduler-sim`
 //!
 //! Output:
-//! - `tests/scheduler_corpus/*.json`
+//! - `tests/simulation/corpus/*.json`
 //!
 //! Keep each case small and targeted; the replay test asserts aggregate
 //! coverage so no single artifact needs to exercise everything.
@@ -23,7 +23,7 @@ use scanner_rs::scheduler::sim_executor_harness::{
 };
 
 const SCHEMA_VERSION: u32 = 1;
-const CORPUS_DIR: &str = "tests/scheduler_corpus";
+const CORPUS_DIR: &str = "tests/simulation/corpus";
 
 /// Serialize and write a repro artifact to disk.
 fn write_artifact(path: &Path, artifact: &ReproArtifact) {

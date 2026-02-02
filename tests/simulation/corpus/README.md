@@ -13,6 +13,7 @@ This directory contains deterministic test cases for the scheduler simulation ha
 | `global_spawn.json` | 2 | Global injector spawning behavior |
 | `external_spawn.json` | 1 | External spawn with gate semantics |
 | `jump.json` | 1 | Control flow with `Jump` instruction |
+| `panic.json` | 1 | Task panic handling via `Panic` instruction |
 
 ## Coverage Requirements
 
@@ -24,6 +25,7 @@ The corpus must collectively exercise:
 - `Sleep` and `WaitIo`
 - `TryAcquire` and `Release`
 - `Jump` and `Complete`
+- `Panic` (verifies panic handling and `ExitPanicked` result)
 
 **Scheduler Behavior:**
 - Multi-worker execution

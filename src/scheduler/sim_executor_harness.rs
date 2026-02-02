@@ -654,12 +654,14 @@ impl TaskVm {
             }
         }
 
-        debug_assert!(
+        // In simulation mode, always check invariants to catch concurrency bugs.
+        // These would be debug_assert in production, but the harness exists to find bugs.
+        assert!(
             ex.state >= before_state.saturating_sub(COUNT_UNIT),
             "executor state underflow"
         );
         for (rid, before) in before_avail {
-            debug_assert!(
+            assert!(
                 res.avail(rid) <= before + res.totals.get(&rid).copied().unwrap_or(0),
                 "resource accounting overflow for {rid}"
             );
@@ -703,6 +705,11 @@ impl TaskVm {
     }
 
     /// Deliver an IO completion, unblocking any waiting tasks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the executor gate is closed when trying to spawn a waiting task.
+    /// This indicates a simulation bug where IO completion races with gate closure.
     pub(crate) fn deliver_io<S>(&mut self, token: IoToken, ex: &mut SimExecutor<TaskId, S>) {
         let Some(waiters) = self.io_waiters.remove(&token) else {
             return;
@@ -710,12 +717,18 @@ impl TaskVm {
         for tid in waiters {
             if let Some(task) = self.tasks.get_mut(&tid) {
                 task.blocked = None;
-                let _ = ex.spawn_external(tid);
+                ex.spawn_external(tid)
+                    .expect("spawn_external failed during IO delivery - gate unexpectedly closed");
             }
         }
     }
 
     /// Wake sleepers whose deadlines are <= `now`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the executor gate is closed when trying to spawn a sleeping task.
+    /// This indicates a simulation bug where sleep wakeup races with gate closure.
     pub(crate) fn wake_sleepers<S>(&mut self, now: u64, ex: &mut SimExecutor<TaskId, S>) {
         let keys: Vec<u64> = self.sleepers.range(..=now).map(|(k, _)| *k).collect();
         for k in keys {
@@ -723,7 +736,9 @@ impl TaskVm {
                 for tid in tids {
                     if let Some(task) = self.tasks.get_mut(&tid) {
                         task.blocked = None;
-                        let _ = ex.spawn_external(tid);
+                        ex.spawn_external(tid).expect(
+                            "spawn_external failed during sleep wakeup - gate unexpectedly closed",
+                        );
                     }
                 }
             }
@@ -905,7 +920,6 @@ pub struct StateDigest {
 
 /// Public-safe executor trace summary for serialization.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-/// Public-safe executor trace summary for serialization.
 pub enum ExecTraceEventSimple {
     Pop {
         wid: usize,
@@ -1134,7 +1148,8 @@ impl SimState {
         let res = ResourceModel::new(&case.resources);
 
         for tid in &case.initial_runnable {
-            let _ = ex.spawn_external(*tid);
+            ex.spawn_external(*tid)
+                .expect("initial spawn should never fail - executor starts in accepting state");
         }
 
         Self {

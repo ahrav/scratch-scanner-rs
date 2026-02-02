@@ -366,6 +366,11 @@ where
 
         let prev_state = ctx.shared_state_fetch_sub(COUNT_UNIT);
         let prev_count = in_flight(prev_state);
+        // In test/simulation builds, always check this invariant to catch concurrency bugs.
+        // In production, this is a debug-only check to avoid overhead.
+        #[cfg(any(test, feature = "scheduler-sim"))]
+        assert!(prev_count > 0, "in_flight underflow");
+        #[cfg(not(any(test, feature = "scheduler-sim")))]
         debug_assert!(prev_count > 0, "in_flight underflow");
 
         if prev_count == 1 && !is_accepting(prev_state) {
