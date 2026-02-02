@@ -722,11 +722,14 @@ impl ScanScratch {
         base_offset: u64,
         buf_len: usize,
     ) {
-        // Reset finding dedup state on file transitions or when starting a new
-        // scan from offset 0. This ensures findings from a previous file don't
-        // suppress valid findings in the current file, and allows re-scanning
-        // the same file from the beginning without stale dedup state.
-        if self.last_file_id != Some(file_id) || base_offset == 0 {
+        // Reset finding dedup state on file transitions. This ensures findings
+        // from a previous file don't suppress valid findings in the current file.
+        //
+        // Note: We do NOT reset when base_offset == 0 for the same file, as this
+        // would break deduplication for chunked scans with large overlap where
+        // base_offset = offset - tail_len can be 0 for continuation chunks.
+        // Callers wanting to re-scan the same file should use reset_for_scan().
+        if self.last_file_id != Some(file_id) {
             self.seen_findings.reset();
         }
 
@@ -892,14 +895,32 @@ impl ScanScratch {
     /// The underlying `FixedSet128` is a probabilistic structure (Bloom-like).
     /// Collisions may suppress distinct findings, but the capacity is sized to
     /// `4× max_findings` to keep collision probability low for typical scans.
+    #[inline(always)]
     pub(super) fn push_finding_with_drop_hint(&mut self, rec: FindingRec, drop_hint_end: u64) {
         // For root-level findings, include the exact span in the dedup key.
         // For transform-derived findings, zero the span since decoded offsets
         // vary by chunk alignment but root hints are stable.
-        let (span_start, span_end) = if rec.step_id == STEP_ROOT {
-            (rec.span_start, rec.span_end)
+        //
+        // Additionally, normalize root_hint_end for base64 padding tolerance.
+        // Base64 can decode correctly with or without padding (e.g., 18 or 20
+        // chars for 13 bytes). Compute the minimum encoded length and clamp if
+        // the actual encoded length is within padding tolerance (3 chars).
+        // This ensures findings from the same decoded content with different
+        // padding get deduplicated across chunk boundaries.
+        let (span_start, span_end, normalized_root_hint_end) = if rec.step_id == STEP_ROOT {
+            (rec.span_start, rec.span_end, rec.root_hint_end)
         } else {
-            (0, 0)
+            let decoded_len = rec.span_end.saturating_sub(rec.span_start) as u64;
+            let min_encoded = (decoded_len * 4).div_ceil(3); // ceil(decoded * 4/3)
+            let actual_encoded = rec.root_hint_end.saturating_sub(rec.root_hint_start);
+            let normalized_end = if actual_encoded > min_encoded
+                && actual_encoded <= min_encoded.saturating_add(3)
+            {
+                rec.root_hint_start.saturating_add(min_encoded)
+            } else {
+                rec.root_hint_end
+            };
+            (0, 0, normalized_end)
         };
 
         // Build a 32-byte dedup key and hash to 128 bits.
@@ -909,10 +930,85 @@ impl ScanScratch {
         key_bytes[8..12].copy_from_slice(&span_start.to_le_bytes());
         key_bytes[12..16].copy_from_slice(&span_end.to_le_bytes());
         key_bytes[16..24].copy_from_slice(&rec.root_hint_start.to_le_bytes());
-        key_bytes[24..32].copy_from_slice(&rec.root_hint_end.to_le_bytes());
+        key_bytes[24..32].copy_from_slice(&normalized_root_hint_end.to_le_bytes());
 
-        if !self.seen_findings.insert(hash128(&key_bytes)) {
-            return; // Already seen (or hash collision).
+        let is_new = self.seen_findings.insert(hash128(&key_bytes));
+
+        if !is_new {
+            // Duplicate key detected. Prefer findings with more information:
+            // 1. Transform findings over RAW (transforms provide decoded content)
+            // 2. For transform findings with base64 padding tolerance, prefer larger root_hint_end
+            //
+            // Search for the existing finding that matches this dedup key and potentially replace it.
+            for (i, existing) in self.out.as_mut_slice().iter_mut().enumerate() {
+                if existing.file_id != rec.file_id || existing.rule_id != rec.rule_id {
+                    continue;
+                }
+
+                // Check if this existing finding matches the dedup key criteria.
+                let existing_matches = if rec.step_id == STEP_ROOT {
+                    // Incoming is RAW: match on span and root_hint
+                    existing.span_start == rec.span_start
+                        && existing.span_end == rec.span_end
+                        && existing.root_hint_start == rec.root_hint_start
+                        && existing.root_hint_end == rec.root_hint_end
+                } else {
+                    // Incoming is transform: match on root_hint_start and normalized_root_hint_end
+                    if existing.step_id == STEP_ROOT {
+                        // Existing is RAW, incoming is transform. They match if the RAW's
+                        // root_hint overlaps with the transform's normalized root_hint.
+                        existing.root_hint_start == rec.root_hint_start
+                            && existing.root_hint_end <= normalized_root_hint_end.saturating_add(3)
+                            && existing.root_hint_end >= normalized_root_hint_end
+                    } else {
+                        // Both are transforms: match on normalized root_hint
+                        if existing.root_hint_start != rec.root_hint_start {
+                            false
+                        } else {
+                            // Compute normalized_end for existing
+                            let existing_decoded_len =
+                                existing.span_end.saturating_sub(existing.span_start) as u64;
+                            let existing_min_encoded = (existing_decoded_len * 4).div_ceil(3);
+                            let existing_actual_encoded = existing
+                                .root_hint_end
+                                .saturating_sub(existing.root_hint_start);
+                            let existing_normalized_end = if existing_actual_encoded
+                                > existing_min_encoded
+                                && existing_actual_encoded <= existing_min_encoded.saturating_add(3)
+                            {
+                                existing
+                                    .root_hint_start
+                                    .saturating_add(existing_min_encoded)
+                            } else {
+                                existing.root_hint_end
+                            };
+                            existing_normalized_end == normalized_root_hint_end
+                        }
+                    }
+                };
+
+                if existing_matches {
+                    // Found the matching existing finding. Decide whether to replace it.
+                    let should_replace =
+                        if rec.step_id != STEP_ROOT && existing.step_id == STEP_ROOT {
+                            // Incoming is transform, existing is RAW: prefer transform
+                            true
+                        } else if rec.step_id == STEP_ROOT && existing.step_id != STEP_ROOT {
+                            // Incoming is RAW, existing is transform: keep transform
+                            false
+                        } else {
+                            // Both same type: prefer larger root_hint_end
+                            rec.root_hint_end > existing.root_hint_end
+                        };
+
+                    if should_replace {
+                        *existing = rec;
+                        self.drop_hint_end.as_mut_slice()[i] = drop_hint_end;
+                    }
+                    return;
+                }
+            }
+            return; // Already seen (or hash collision) and no update needed.
         }
 
         if self.out.len() < self.max_findings {

@@ -338,9 +338,14 @@ impl Engine {
             return;
         }
 
+        // Create a slice that doesn't carry the borrow from `scratch`, allowing us to
+        // call mutable methods on `scratch` while iterating over `decoded`. A simple
+        // `scratch.utf16_buf.as_slice()` would hold an immutable borrow of `scratch`
+        // for the slice's lifetime, preventing the mutable borrow needed for push_finding.
+        // SAFETY: `utf16_buf` is not mutated while `decoded` is in use - the mutable
+        // methods only modify `out`, `drop_hint_end`, `seen_findings`, not `utf16_buf`.
         let decoded_len = scratch.utf16_buf.len();
         let decoded_ptr = scratch.utf16_buf.as_slice().as_ptr();
-        // SAFETY: `utf16_buf` is not mutated while `decoded` is in use.
         let decoded = unsafe { std::slice::from_raw_parts(decoded_ptr, decoded_len) };
         if decoded.is_empty() {
             return;
@@ -406,7 +411,13 @@ impl Engine {
                 map_utf16_decoded_offset(raw_win, span.end, matches!(variant, Variant::Utf16Le));
             let mapped_span =
                 (decode_range.start + match_raw_start)..(decode_range.start + match_raw_end);
-            let root_span_hint = root_hint.clone().unwrap_or(mapped_span);
+            // Apply root_span_map_ctx for transform-derived findings (same as Raw variant)
+            // to ensure each UTF-16 match gets a distinct root hint for deduplication.
+            let root_span_hint = if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
+                ctx.map_span(mapped_span.clone())
+            } else {
+                root_hint.clone().unwrap_or(mapped_span)
+            };
 
             let mut drop_hint_end = root_span_hint.end;
             if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
@@ -637,9 +648,14 @@ impl Engine {
             return;
         }
 
+        // Create a slice that doesn't carry the borrow from `scratch`, allowing us to
+        // call mutable methods on `scratch` while iterating over `decoded`. A simple
+        // `scratch.utf16_buf.as_slice()` would hold an immutable borrow of `scratch`
+        // for the slice's lifetime, preventing the mutable borrow needed for push_finding.
+        // SAFETY: `utf16_buf` is not mutated while `decoded` is in use - the mutable
+        // methods only modify `out`, `drop_hint_end`, `seen_findings`, not `utf16_buf`.
         let decoded_len = scratch.utf16_buf.len();
         let decoded_ptr = scratch.utf16_buf.as_slice().as_ptr();
-        // SAFETY: `utf16_buf` is not mutated while `decoded` is in use.
         let decoded = unsafe { std::slice::from_raw_parts(decoded_ptr, decoded_len) };
         if decoded.is_empty() {
             return;
