@@ -520,6 +520,13 @@ impl TaskVm {
     ) where
         Trace: TaskTraceHooks,
     {
+        let before_state = ex.state;
+        let before_avail: Vec<(ResourceId, u32)> = res
+            .totals
+            .keys()
+            .map(|rid| (*rid, res.avail(*rid)))
+            .collect();
+
         let (program, pc, blocked, completed) = match self.tasks.get(&tid) {
             Some(task) => (
                 task.program,
@@ -606,6 +613,17 @@ impl TaskVm {
             Instruction::Panic => {
                 panic!("task panic requested");
             }
+        }
+
+        debug_assert!(
+            ex.state >= before_state.saturating_sub(COUNT_UNIT),
+            "executor state underflow"
+        );
+        for (rid, before) in before_avail {
+            debug_assert!(
+                res.avail(rid) <= before + res.totals.get(&rid).copied().unwrap_or(0),
+                "resource accounting overflow for {rid}"
+            );
         }
     }
 
@@ -701,6 +719,20 @@ impl ResourceModel {
         Self { totals, avail }
     }
 
+    pub(crate) fn check_invariants(&self, step: u64) -> Result<(), FailureInfo> {
+        for (rid, total) in &self.totals {
+            let avail = *self.avail.get(rid).unwrap_or(&0);
+            if avail > *total {
+                return Err(FailureInfo {
+                    kind: FailureKind::Violation(ViolationKind::ResourceOverflow),
+                    step,
+                    message: format!("resource {rid} avail {avail} > total {total}"),
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn try_acquire(&mut self, rid: ResourceId, units: u32) -> bool {
         let a = *self.avail.get(&rid).unwrap_or(&0);
         if a < units {
@@ -708,6 +740,10 @@ impl ResourceModel {
         }
         self.avail.insert(rid, a - units);
         true
+    }
+
+    pub(crate) fn avail(&self, rid: ResourceId) -> u32 {
+        *self.avail.get(&rid).unwrap_or(&0)
     }
 
     pub(crate) fn release(&mut self, rid: ResourceId, units: u32) {
@@ -808,6 +844,36 @@ pub(crate) enum TraceEvent {
     External {
         event: ExternalEvent,
     },
+    InvariantViolation {
+        kind: ViolationKind,
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ViolationKind {
+    InFlightMismatch,
+    DoubleRun,
+    TaskStateOverlap,
+    GateViolation,
+    ResourceOverflow,
+    LostWakeup,
+    RunnableStarvation,
+    IllegalUnblock,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FailureKind {
+    Violation(ViolationKind),
+    Panic,
+    Timeout,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FailureInfo {
+    pub kind: FailureKind,
+    pub step: u64,
+    pub message: String,
 }
 
 /// Internal state used by the driver loop.
@@ -818,6 +884,7 @@ struct SimState {
     res: ResourceModel,
     events: Vec<ScheduledEvent>,
     delivered: Vec<bool>,
+    ran_tasks: std::collections::BTreeMap<TaskId, u64>,
 }
 
 impl SimState {
@@ -838,7 +905,83 @@ impl SimState {
             res,
             events: case.external_events.clone(),
             delivered: vec![false; case.external_events.len()],
+            ran_tasks: std::collections::BTreeMap::new(),
         }
+    }
+}
+
+/// Step-wise oracle checks for determinism, safety, and liveness.
+///
+/// These checks are deliberately simple: they run on every step and surface
+/// violations as structured trace events rather than panicking, so the
+/// harness can serialize a repro and continue to shrink it.
+struct OracleChecker {
+    runnable_age: std::collections::BTreeMap<TaskId, u64>,
+    max_starvation: u64,
+    last_step: u64,
+}
+
+impl OracleChecker {
+    fn new(workers: usize, steal_tries: u32) -> Self {
+        let k = (workers as u64)
+            .saturating_mul(steal_tries as u64 + 2)
+            .saturating_mul(4);
+        Self {
+            runnable_age: std::collections::BTreeMap::new(),
+            max_starvation: k.max(1),
+            last_step: 0,
+        }
+    }
+
+    /// Validate invariants after a single driver step.
+    fn check_step(
+        &mut self,
+        state: &SimState,
+        exec_events: &[super::executor_core::ExecTraceEvent<TaskId>],
+        task_events: &[(TaskId, u16, Instruction)],
+        step: u64,
+    ) -> Result<(), FailureInfo> {
+        self.last_step = step;
+
+        // Track runnable age: initial_runnable and any task re-enqueued via events.
+        for ev in exec_events {
+            if let super::executor_core::ExecTraceEvent::Pop { tag, .. } = ev {
+                self.runnable_age.remove(tag);
+            }
+        }
+
+        for (tid, _, instr) in task_events {
+            if matches!(instr, Instruction::Yield { .. } | Instruction::Spawn { .. }) {
+                self.runnable_age.entry(*tid).or_insert(step);
+            }
+        }
+
+        // Starvation: runnable task should execute within bound.
+        for (tid, since) in &self.runnable_age {
+            if step.saturating_sub(*since) > self.max_starvation {
+                return Err(FailureInfo {
+                    kind: FailureKind::Violation(ViolationKind::RunnableStarvation),
+                    step,
+                    message: format!("task {tid} runnable since step {since}"),
+                });
+            }
+        }
+
+        state.res.check_invariants(step).map_err(|mut info| {
+            info.step = step;
+            info
+        })?;
+
+        // In-flight counter should be >= runnable + running (approx check).
+        if state.ex.in_flight() == 0 && !is_accepting(state.ex.state) && !state.ex.done {
+            return Err(FailureInfo {
+                kind: FailureKind::Violation(ViolationKind::GateViolation),
+                step,
+                message: "gate closed with zero in-flight but done not set".to_string(),
+            });
+        }
+
+        Ok(())
     }
 }
 
@@ -979,6 +1122,7 @@ fn enabled_actions(state: &SimState) -> Vec<DriverAction> {
 pub(crate) fn run_with_choices(case: &SimCase, choices: &[DriverChoice]) -> Trace {
     let mut state = SimState::from_case(case);
     let mut driver = Driver::new(choices);
+    let mut oracles = OracleChecker::new(case.exec_cfg.workers, case.exec_cfg.steal_tries);
     let mut trace = Trace {
         header: TraceHeader {
             schema_version: 1,
@@ -1012,15 +1156,51 @@ pub(crate) fn run_with_choices(case: &SimCase, choices: &[DriverChoice]) -> Trac
                         .exec_one(tid, wid, now, ex, &mut state.res, &mut task_trace);
                 };
 
-                let _ = state
+                let res = state
                     .ex
                     .step_worker(wid, &mut runner, &mut idle, &mut exec_trace);
 
-                for event in exec_trace.events {
-                    trace.events.push(TraceEvent::Exec { event });
+                for event in &exec_trace.events {
+                    if let super::executor_core::ExecTraceEvent::Pop { tag, .. } = event {
+                        let count = state.ran_tasks.entry(*tag).or_insert(0);
+                        *count += 1;
+                        if *count > 1 {
+                            trace.events.push(TraceEvent::InvariantViolation {
+                                kind: ViolationKind::DoubleRun,
+                                message: format!("task {tag} executed more than once"),
+                            });
+                            return trace;
+                        }
+                    }
                 }
-                for (tid, pc, instr) in task_trace.events {
-                    trace.events.push(TraceEvent::TaskInstr { tid, pc, instr });
+                for event in &exec_trace.events {
+                    trace.events.push(TraceEvent::Exec {
+                        event: event.clone(),
+                    });
+                }
+                for (tid, pc, instr) in &task_trace.events {
+                    trace.events.push(TraceEvent::TaskInstr {
+                        tid: *tid,
+                        pc: *pc,
+                        instr: instr.clone(),
+                    });
+                }
+
+                if let Err(info) =
+                    oracles.check_step(&state, &exec_trace.events, &task_trace.events, step)
+                {
+                    trace.events.push(TraceEvent::InvariantViolation {
+                        kind: match info.kind {
+                            FailureKind::Violation(kind) => kind,
+                            _ => ViolationKind::InFlightMismatch,
+                        },
+                        message: info.message,
+                    });
+                    return trace;
+                }
+
+                if matches!(res, WorkerStepResult::ExitPanicked) {
+                    break;
                 }
             }
             DriverAction::DeliverEvent { index } => {
