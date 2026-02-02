@@ -132,6 +132,10 @@ Fault plans are keyed by file path bytes and specify deterministic I/O behaviors
 
 ### Structure
 
+`FaultPlan.per_file` is keyed by raw path bytes. In JSON artifacts, keys are
+serialized as lowercase hex strings; UTF-8 path strings are also accepted when
+loading artifacts.
+
 ```json
 {
   "per_file": {

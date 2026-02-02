@@ -29,6 +29,11 @@ and maintains zero allocations during the hot path. Memory scales with worker co
 **Key insight**: HitAccPool dominates at 83.3% of per-worker memory. This is
 sized for worst-case: 669 (rule,variant) pairs × 2048 max hits × 12 bytes/SpanU32.
 
+> **Future optimization**: HitAccPool may be over-provisioned. Reducing
+> `max_anchor_hits_per_rule_variant` from 2048 to 512 could save ~60% memory.
+> See [investigation-hit-acc-pool-sizing.md](investigation-hit-acc-pool-sizing.md)
+> for details on how to evaluate this.
+
 ### Buffer Pool (System-Wide)
 
 - **Buffers**: `workers × 4` (e.g., 32 buffers for 8 workers)
