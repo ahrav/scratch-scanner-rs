@@ -11,12 +11,14 @@
 //!
 //! This module is only available with the `sim-harness` feature.
 
+pub mod artifact;
 pub mod clock;
 pub mod fault;
 pub mod fs;
 pub mod rng;
 pub mod trace;
 
+pub use artifact::{ReproArtifact, TraceDump};
 pub use clock::SimClock;
 pub use fault::{Corruption, FaultInjector, FaultPlan, FileFaultPlan, IoFault, ReadFault};
 pub use fs::{SimFileHandle, SimFs, SimFsSpec, SimNodeSpec, SimPath};
