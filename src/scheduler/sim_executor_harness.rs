@@ -366,3 +366,350 @@ impl IdleHooks for SimIdle {
         }
     }
 }
+
+// ============================================================================
+// Task VM + resources
+// ============================================================================
+
+pub(crate) type ProgramId = u32;
+pub(crate) type TaskId = u32;
+pub(crate) type ResourceId = u16;
+pub(crate) type IoToken = u32;
+
+/// Static task program definition.
+#[derive(Clone, Debug)]
+pub(crate) struct TaskProgram {
+    pub name: String,
+    pub code: Vec<Instruction>,
+}
+
+/// Where a run-token should be enqueued.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpawnPlacement {
+    Local,
+    Global,
+    External,
+}
+
+/// Scheduler-relevant bytecode instruction set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Instruction {
+    Yield {
+        placement: SpawnPlacement,
+    },
+    Spawn {
+        program: ProgramId,
+        placement: SpawnPlacement,
+    },
+    Sleep {
+        ticks: u32,
+    },
+    WaitIo {
+        token: IoToken,
+    },
+    TryAcquire {
+        res: ResourceId,
+        units: u32,
+        ok: u16,
+        fail: u16,
+    },
+    Release {
+        res: ResourceId,
+        units: u32,
+    },
+    Jump {
+        target: u16,
+    },
+    Complete,
+    Panic,
+}
+
+/// Initial task state used to seed a simulation case.
+#[derive(Clone, Debug)]
+pub(crate) struct LogicalTaskInit {
+    pub tid: TaskId,
+    pub program: ProgramId,
+    pub pc: u16,
+}
+
+/// Blocking reason for a logical task.
+///
+/// `Resource` is reserved for future blocking semantics; current bytecode
+/// uses `TryAcquire` instead of blocking on resources.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BlockReason {
+    SleepUntil(u64),
+    Io(IoToken),
+    Resource(ResourceId),
+}
+
+#[derive(Clone, Debug)]
+struct LogicalTask {
+    program: ProgramId,
+    pc: u16,
+    blocked: Option<BlockReason>,
+    held: std::collections::BTreeMap<ResourceId, u32>,
+    completed: bool,
+}
+
+/// Bytecode VM for scheduler simulations.
+///
+/// # Semantics
+///
+/// - A logical task persists across run-tokens.
+/// - Each executor run consumes one token and advances exactly one instruction.
+/// - `Yield` and `Spawn` create new run-tokens via the executor queues.
+/// - `Sleep`/`WaitIo` block without enqueuing a token until an external event.
+pub(crate) struct TaskVm {
+    programs: Vec<TaskProgram>,
+    tasks: std::collections::BTreeMap<TaskId, LogicalTask>,
+    io_waiters: std::collections::BTreeMap<IoToken, std::collections::BTreeSet<TaskId>>,
+    sleepers: std::collections::BTreeMap<u64, Vec<TaskId>>,
+    next_tid: TaskId,
+}
+
+impl TaskVm {
+    pub(crate) fn new(programs: Vec<TaskProgram>, tasks: Vec<LogicalTaskInit>) -> Self {
+        let mut map = std::collections::BTreeMap::new();
+        let mut max_tid = 0;
+        for t in tasks {
+            max_tid = max_tid.max(t.tid);
+            map.insert(
+                t.tid,
+                LogicalTask {
+                    program: t.program,
+                    pc: t.pc,
+                    blocked: None,
+                    held: std::collections::BTreeMap::new(),
+                    completed: false,
+                },
+            );
+        }
+        Self {
+            programs,
+            tasks: map,
+            io_waiters: std::collections::BTreeMap::new(),
+            sleepers: std::collections::BTreeMap::new(),
+            next_tid: max_tid.saturating_add(1),
+        }
+    }
+
+    /// Execute a single instruction for the given task id.
+    ///
+    /// If the task is blocked or completed, this is a no-op.
+    pub(crate) fn exec_one<S>(
+        &mut self,
+        tid: TaskId,
+        wid: usize,
+        now: u64,
+        ex: &mut SimExecutor<TaskId, S>,
+        res: &mut ResourceModel,
+    ) {
+        let (program, pc, blocked, completed) = match self.tasks.get(&tid) {
+            Some(task) => (
+                task.program,
+                task.pc,
+                task.blocked.is_some(),
+                task.completed,
+            ),
+            None => panic!("unknown task id {tid}"),
+        };
+        if completed || blocked {
+            return;
+        }
+
+        let instr = self
+            .programs
+            .get(program as usize)
+            .and_then(|prog| prog.code.get(pc as usize))
+            .cloned()
+            .unwrap_or(Instruction::Complete);
+
+        match instr {
+            Instruction::Yield { placement } => {
+                let task = self.tasks.get_mut(&tid).expect("task exists");
+                task.pc = task.pc.saturating_add(1);
+                self.enqueue_run_token(ex, wid, tid, placement);
+            }
+            Instruction::Spawn { program, placement } => {
+                let child_tid = self.allocate_task(program);
+                self.enqueue_run_token(ex, wid, child_tid, placement);
+                let task = self.tasks.get_mut(&tid).expect("task exists");
+                task.pc = task.pc.saturating_add(1);
+            }
+            Instruction::Sleep { ticks } => {
+                let wake = now.saturating_add(ticks as u64);
+                let task = self.tasks.get_mut(&tid).expect("task exists");
+                task.blocked = Some(BlockReason::SleepUntil(wake));
+                self.sleepers.entry(wake).or_default().push(tid);
+                task.pc = task.pc.saturating_add(1);
+            }
+            Instruction::WaitIo { token } => {
+                let task = self.tasks.get_mut(&tid).expect("task exists");
+                task.blocked = Some(BlockReason::Io(token));
+                self.io_waiters.entry(token).or_default().insert(tid);
+                task.pc = task.pc.saturating_add(1);
+            }
+            Instruction::TryAcquire {
+                res: rid,
+                units,
+                ok,
+                fail,
+            } => {
+                let task = self.tasks.get_mut(&tid).expect("task exists");
+                if res.try_acquire(rid, units) {
+                    *task.held.entry(rid).or_insert(0) += units;
+                    task.pc = ok;
+                } else {
+                    task.pc = fail;
+                }
+            }
+            Instruction::Release { res: rid, units } => {
+                let task = self.tasks.get_mut(&tid).expect("task exists");
+                let held = task
+                    .held
+                    .get_mut(&rid)
+                    .unwrap_or_else(|| panic!("release without hold on {rid}"));
+                assert!(*held >= units, "release underflow");
+                *held -= units;
+                if *held == 0 {
+                    task.held.remove(&rid);
+                }
+                res.release(rid, units);
+                task.pc = task.pc.saturating_add(1);
+            }
+            Instruction::Jump { target } => {
+                let task = self.tasks.get_mut(&tid).expect("task exists");
+                task.pc = target;
+            }
+            Instruction::Complete => {
+                let task = self.tasks.get_mut(&tid).expect("task exists");
+                task.completed = true;
+            }
+            Instruction::Panic => {
+                panic!("task panic requested");
+            }
+        }
+    }
+
+    fn enqueue_run_token<S>(
+        &self,
+        ex: &mut SimExecutor<TaskId, S>,
+        wid: usize,
+        tid: TaskId,
+        placement: SpawnPlacement,
+    ) {
+        match placement {
+            SpawnPlacement::Local => ex.spawn_local_for(wid, tid),
+            SpawnPlacement::Global => ex.spawn_global(tid),
+            SpawnPlacement::External => {
+                let _ = ex.spawn_external(tid);
+            }
+        }
+    }
+
+    fn allocate_task(&mut self, program: ProgramId) -> TaskId {
+        let tid = self.next_tid;
+        self.next_tid = self.next_tid.saturating_add(1);
+        self.tasks.insert(
+            tid,
+            LogicalTask {
+                program,
+                pc: 0,
+                blocked: None,
+                held: std::collections::BTreeMap::new(),
+                completed: false,
+            },
+        );
+        tid
+    }
+
+    /// Deliver an IO completion, unblocking any waiting tasks.
+    pub(crate) fn deliver_io<S>(&mut self, token: IoToken, ex: &mut SimExecutor<TaskId, S>) {
+        let Some(waiters) = self.io_waiters.remove(&token) else {
+            return;
+        };
+        for tid in waiters {
+            if let Some(task) = self.tasks.get_mut(&tid) {
+                task.blocked = None;
+                let _ = ex.spawn_external(tid);
+            }
+        }
+    }
+
+    /// Wake sleepers whose deadlines are <= `now`.
+    pub(crate) fn wake_sleepers<S>(&mut self, now: u64, ex: &mut SimExecutor<TaskId, S>) {
+        let keys: Vec<u64> = self.sleepers.range(..=now).map(|(k, _)| *k).collect();
+        for k in keys {
+            if let Some(tids) = self.sleepers.remove(&k) {
+                for tid in tids {
+                    if let Some(task) = self.tasks.get_mut(&tid) {
+                        task.blocked = None;
+                        let _ = ex.spawn_external(tid);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Resource specification for simulation.
+#[derive(Clone, Debug)]
+pub(crate) struct ResourceSpec {
+    pub id: ResourceId,
+    pub total: u32,
+}
+
+/// Deterministic resource accounting model.
+///
+/// This model is intentionally minimal: it never blocks. `TryAcquire` is
+/// a conditional check; `Release` asserts against over-release.
+pub(crate) struct ResourceModel {
+    totals: std::collections::BTreeMap<ResourceId, u32>,
+    avail: std::collections::BTreeMap<ResourceId, u32>,
+}
+
+impl ResourceModel {
+    pub(crate) fn new(specs: &[ResourceSpec]) -> Self {
+        let mut totals = std::collections::BTreeMap::new();
+        let mut avail = std::collections::BTreeMap::new();
+        for s in specs {
+            totals.insert(s.id, s.total);
+            avail.insert(s.id, s.total);
+        }
+        Self { totals, avail }
+    }
+
+    pub(crate) fn try_acquire(&mut self, rid: ResourceId, units: u32) -> bool {
+        let a = *self.avail.get(&rid).unwrap_or(&0);
+        if a < units {
+            return false;
+        }
+        self.avail.insert(rid, a - units);
+        true
+    }
+
+    pub(crate) fn release(&mut self, rid: ResourceId, units: u32) {
+        let a = *self.avail.get(&rid).unwrap_or(&0);
+        let t = *self.totals.get(&rid).unwrap_or(&0);
+        let new = a + units;
+        assert!(new <= t, "resource over-release");
+        self.avail.insert(rid, new);
+    }
+}
+
+/// External events delivered by the simulation driver.
+///
+/// `CloseGateJoin` models `Executor::join()` closing the accepting gate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ExternalEvent {
+    IoComplete { token: IoToken },
+    CloseGateJoin,
+}
+
+/// Scheduled external event for deterministic replay.
+#[derive(Clone, Debug)]
+pub(crate) struct ScheduledEvent {
+    pub at_step: u64,
+    pub event: ExternalEvent,
+}
