@@ -510,7 +510,8 @@ impl<T: Send + 'static, S> WorkerCtx<T, S> {
 }
 
 // Bridges production `WorkerCtx` to the core step engine. This preserves
-// all scheduling semantics: local LIFO, batch injector steals, FIFO victim steals.
+// all scheduling semantics: local LIFO, batch injector steals, FIFO victim steals,
+// and accurate steal metrics.
 impl<T, S> WorkerCtxLike<T, S> for WorkerCtx<T, S> {
     fn worker_id(&self) -> usize {
         self.worker_id
@@ -880,8 +881,9 @@ impl<T: Send + 'static> Executor<T> {
 /// # Implementation Note
 ///
 /// The loop delegates to [`worker_step`] to keep production and simulation
-/// policy logic in lockstep. If the scheduling policy changes, update the
-/// step engine so both modes stay consistent.
+/// policy logic in lockstep. The step engine also owns the in-flight counter
+/// decrement (including panic paths), so production must not duplicate that
+/// accounting.
 fn worker_loop<T, S, RunnerFn>(
     cfg: ExecutorConfig,
     runner: &Arc<RunnerFn>,
@@ -892,9 +894,10 @@ fn worker_loop<T, S, RunnerFn>(
 {
     let mut idle = TieredIdle::new();
     let mut trace = NoopTrace;
+    let mut run = |task: T, ctx: &mut WorkerCtx<T, S>| (runner)(task, ctx);
 
     loop {
-        match worker_step(&cfg, runner.as_ref(), ctx, &mut idle, &mut trace) {
+        match worker_step(&cfg, &mut run, ctx, &mut idle, &mut trace) {
             WorkerStepResult::RanTask { .. } => {
                 ctx.metrics.tasks_executed = ctx.metrics.tasks_executed.saturating_add(1);
             }

@@ -210,12 +210,12 @@ impl<T: Send + 'static, S> SimExecutor<T, S> {
     pub(crate) fn step_worker<Runner, Idle, Trace>(
         &mut self,
         wid: usize,
-        runner: &Runner,
+        runner: &mut Runner,
         idle: &mut Idle,
         trace: &mut Trace,
     ) -> WorkerStepResult<Trace::TaskTag>
     where
-        Runner: Fn(T, &mut SimExecutor<T, S>) + 'static,
+        Runner: FnMut(T, &mut SimExecutor<T, S>),
         Idle: IdleHooks,
         Trace: TraceHooks<T>,
     {
@@ -244,10 +244,10 @@ impl<T: Send + 'static, S> SimExecutor<T, S> {
     pub(crate) fn step_worker_no_trace<Runner>(
         &mut self,
         wid: usize,
-        runner: &Runner,
+        runner: &mut Runner,
     ) -> WorkerStepResult<<NoopTrace as TraceHooks<T>>::TaskTag>
     where
-        Runner: Fn(T, &mut SimExecutor<T, S>) + 'static,
+        Runner: FnMut(T, &mut SimExecutor<T, S>),
     {
         let mut idle = SimIdle;
         let mut trace = NoopTrace;
@@ -452,6 +452,18 @@ struct LogicalTask {
     completed: bool,
 }
 
+pub(crate) trait TaskTraceHooks {
+    /// Called before an instruction is executed for a task.
+    fn on_task_instr(&mut self, tid: TaskId, pc: u16, instr: &Instruction);
+}
+
+/// No-op task tracing (production default).
+pub(crate) struct NoopTaskTrace;
+
+impl TaskTraceHooks for NoopTaskTrace {
+    fn on_task_instr(&mut self, _tid: TaskId, _pc: u16, _instr: &Instruction) {}
+}
+
 /// Bytecode VM for scheduler simulations.
 ///
 /// # Semantics
@@ -497,14 +509,17 @@ impl TaskVm {
     /// Execute a single instruction for the given task id.
     ///
     /// If the task is blocked or completed, this is a no-op.
-    pub(crate) fn exec_one<S>(
+    pub(crate) fn exec_one<S, Trace>(
         &mut self,
         tid: TaskId,
         wid: usize,
         now: u64,
         ex: &mut SimExecutor<TaskId, S>,
         res: &mut ResourceModel,
-    ) {
+        trace: &mut Trace,
+    ) where
+        Trace: TaskTraceHooks,
+    {
         let (program, pc, blocked, completed) = match self.tasks.get(&tid) {
             Some(task) => (
                 task.program,
@@ -524,6 +539,8 @@ impl TaskVm {
             .and_then(|prog| prog.code.get(pc as usize))
             .cloned()
             .unwrap_or(Instruction::Complete);
+
+        trace.on_task_instr(tid, pc, &instr);
 
         match instr {
             Instruction::Yield { placement } => {
@@ -651,6 +668,10 @@ impl TaskVm {
             }
         }
     }
+
+    pub(crate) fn next_sleep_deadline(&self) -> Option<u64> {
+        self.sleepers.keys().next().copied()
+    }
 }
 
 /// Resource specification for simulation.
@@ -712,4 +733,327 @@ pub(crate) enum ExternalEvent {
 pub(crate) struct ScheduledEvent {
     pub at_step: u64,
     pub event: ExternalEvent,
+}
+
+/// Simulation case definition for deterministic driver runs.
+///
+/// The driver uses this to build a `SimState` with a fixed executor policy,
+/// static programs, and a deterministic external event schedule.
+#[derive(Clone, Debug)]
+pub(crate) struct SimCase {
+    pub exec_cfg: SimExecCfg,
+    pub resources: Vec<ResourceSpec>,
+    pub programs: Vec<TaskProgram>,
+    pub tasks: Vec<LogicalTaskInit>,
+    pub initial_runnable: Vec<TaskId>,
+    pub external_events: Vec<ScheduledEvent>,
+    /// Hard cap on driver steps (prevents infinite runs).
+    pub max_steps: u64,
+}
+
+impl SimCase {
+    pub(crate) fn validate(&self) {
+        self.exec_cfg.validate();
+        assert!(!self.programs.is_empty(), "programs must be non-empty");
+        assert!(self.max_steps > 0, "max_steps must be > 0");
+    }
+}
+
+/// Actions the deterministic driver can choose at each step.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DriverAction {
+    /// Execute a single worker step.
+    StepWorker { wid: usize },
+    /// Deliver a scheduled external event whose time has arrived.
+    DeliverEvent { index: usize },
+    /// Advance simulated time to the next deadline.
+    AdvanceTimeTo { now: u64 },
+}
+
+/// Choice encoding for replay: index into the enabled action list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DriverChoice {
+    pub idx: u16,
+}
+
+/// Trace header for deterministic replay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TraceHeader {
+    pub schema_version: u32,
+    pub seed: u64,
+}
+
+/// Trace of driver actions and scheduler events.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Trace {
+    pub header: TraceHeader,
+    pub events: Vec<TraceEvent>,
+}
+
+/// Trace events emitted during a simulation run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TraceEvent {
+    Step {
+        n: u64,
+        action: DriverAction,
+    },
+    Exec {
+        event: super::executor_core::ExecTraceEvent<TaskId>,
+    },
+    TaskInstr {
+        tid: TaskId,
+        pc: u16,
+        instr: Instruction,
+    },
+    External {
+        event: ExternalEvent,
+    },
+}
+
+/// Internal state used by the driver loop.
+struct SimState {
+    now: u64,
+    ex: SimExecutor<TaskId, ()>,
+    vm: TaskVm,
+    res: ResourceModel,
+    events: Vec<ScheduledEvent>,
+    delivered: Vec<bool>,
+}
+
+impl SimState {
+    fn from_case(case: &SimCase) -> Self {
+        case.validate();
+        let mut ex = SimExecutor::new(case.exec_cfg, |_| ());
+        let vm = TaskVm::new(case.programs.clone(), case.tasks.clone());
+        let res = ResourceModel::new(&case.resources);
+
+        for tid in &case.initial_runnable {
+            let _ = ex.spawn_external(*tid);
+        }
+
+        Self {
+            now: 0,
+            ex,
+            vm,
+            res,
+            events: case.external_events.clone(),
+            delivered: vec![false; case.external_events.len()],
+        }
+    }
+}
+
+/// Deterministic driver with optional pre-recorded choices.
+struct Driver {
+    choices: Vec<DriverChoice>,
+    cursor: usize,
+}
+
+impl Driver {
+    fn new(choices: &[DriverChoice]) -> Self {
+        Self {
+            choices: choices.to_vec(),
+            cursor: 0,
+        }
+    }
+
+    /// Choose the next enabled action.
+    ///
+    /// If choices are exhausted or out of range, defaults to the first action
+    /// to keep replay deterministic and total.
+    fn choose(&mut self, enabled: &[DriverAction]) -> DriverAction {
+        let idx = if self.cursor < self.choices.len() {
+            self.choices[self.cursor].idx as usize
+        } else {
+            0
+        };
+        self.cursor = self.cursor.saturating_add(1);
+        enabled
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| enabled[0].clone())
+    }
+}
+
+/// Collects executor-side trace events during a single step.
+struct ExecEventSink {
+    events: Vec<super::executor_core::ExecTraceEvent<TaskId>>,
+}
+
+impl ExecEventSink {
+    fn new() -> Self {
+        Self { events: Vec::new() }
+    }
+}
+
+impl TraceHooks<TaskId> for ExecEventSink {
+    type TaskTag = TaskId;
+
+    fn is_enabled(&self) -> bool {
+        true
+    }
+
+    fn tag_task(&mut self, task: &TaskId) -> Self::TaskTag {
+        *task
+    }
+
+    fn on_event(&mut self, event: super::executor_core::ExecTraceEvent<Self::TaskTag>) {
+        self.events.push(event);
+    }
+}
+
+/// Collects task instruction events during a single step.
+struct TaskEventSink {
+    events: Vec<(TaskId, u16, Instruction)>,
+}
+
+impl TaskEventSink {
+    fn new() -> Self {
+        Self { events: Vec::new() }
+    }
+}
+
+impl TaskTraceHooks for TaskEventSink {
+    fn on_task_instr(&mut self, tid: TaskId, pc: u16, instr: &Instruction) {
+        self.events.push((tid, pc, instr.clone()));
+    }
+}
+
+/// Compute the next time jump candidate from future events or sleepers.
+fn next_time(state: &SimState) -> Option<u64> {
+    let mut next: Option<u64> = None;
+    for (idx, ev) in state.events.iter().enumerate() {
+        if state.delivered[idx] {
+            continue;
+        }
+        if ev.at_step > state.now {
+            next = Some(match next {
+                Some(cur) => cur.min(ev.at_step),
+                None => ev.at_step,
+            });
+        }
+    }
+
+    if let Some(sleep) = state.vm.next_sleep_deadline() {
+        if sleep > state.now {
+            next = Some(match next {
+                Some(cur) => cur.min(sleep),
+                None => sleep,
+            });
+        }
+    }
+
+    next
+}
+
+/// Enumerate enabled actions in a stable order for deterministic replay.
+fn enabled_actions(state: &SimState) -> Vec<DriverAction> {
+    if state.ex.done {
+        return Vec::new();
+    }
+
+    let mut actions = Vec::new();
+    for (idx, ev) in state.events.iter().enumerate() {
+        if !state.delivered[idx] && ev.at_step <= state.now {
+            actions.push(DriverAction::DeliverEvent { index: idx });
+        }
+    }
+
+    let all_parked = state.ex.workers.iter().all(|w| w.parked && !w.unpark_token);
+
+    if !all_parked {
+        for wid in 0..state.ex.workers.len() {
+            actions.push(DriverAction::StepWorker { wid });
+        }
+    }
+
+    if actions.is_empty() {
+        if let Some(next) = next_time(state) {
+            actions.push(DriverAction::AdvanceTimeTo { now: next });
+        }
+    }
+
+    actions
+}
+
+/// Run a simulation using explicit driver choices (or default-first selection).
+pub(crate) fn run_with_choices(case: &SimCase, choices: &[DriverChoice]) -> Trace {
+    let mut state = SimState::from_case(case);
+    let mut driver = Driver::new(choices);
+    let mut trace = Trace {
+        header: TraceHeader {
+            schema_version: 1,
+            seed: case.exec_cfg.seed,
+        },
+        events: Vec::new(),
+    };
+
+    for step in 0..case.max_steps {
+        let enabled = enabled_actions(&state);
+        if enabled.is_empty() {
+            break;
+        }
+
+        let action = driver.choose(&enabled);
+        trace.events.push(TraceEvent::Step {
+            n: step,
+            action: action.clone(),
+        });
+
+        match action {
+            DriverAction::StepWorker { wid } => {
+                let now = state.now;
+                let mut exec_trace = ExecEventSink::new();
+                let mut task_trace = TaskEventSink::new();
+                let mut idle = SimIdle;
+
+                let mut runner = |tid: TaskId, ex: &mut SimExecutor<TaskId, ()>| {
+                    state
+                        .vm
+                        .exec_one(tid, wid, now, ex, &mut state.res, &mut task_trace);
+                };
+
+                let _ = state
+                    .ex
+                    .step_worker(wid, &mut runner, &mut idle, &mut exec_trace);
+
+                for event in exec_trace.events {
+                    trace.events.push(TraceEvent::Exec { event });
+                }
+                for (tid, pc, instr) in task_trace.events {
+                    trace.events.push(TraceEvent::TaskInstr { tid, pc, instr });
+                }
+            }
+            DriverAction::DeliverEvent { index } => {
+                state.delivered[index] = true;
+                let event = state.events[index].event.clone();
+                trace.events.push(TraceEvent::External {
+                    event: event.clone(),
+                });
+                match event {
+                    ExternalEvent::IoComplete { token } => {
+                        state.vm.deliver_io(token, &mut state.ex);
+                    }
+                    ExternalEvent::CloseGateJoin => {
+                        let prev = state.ex.close_gate();
+                        if in_flight(prev) == 0 {
+                            state.ex.initiate_done();
+                        }
+                    }
+                }
+            }
+            DriverAction::AdvanceTimeTo { now } => {
+                state.now = now;
+                state.vm.wake_sleepers(state.now, &mut state.ex);
+            }
+        }
+    }
+
+    trace
+}
+
+/// Assert that a case + choices produce identical traces across runs.
+pub(crate) fn assert_deterministic(case: &SimCase, choices: &[DriverChoice]) {
+    let t1 = run_with_choices(case, choices);
+    let t2 = run_with_choices(case, choices);
+    assert_eq!(t1, t2, "non-deterministic trace");
 }

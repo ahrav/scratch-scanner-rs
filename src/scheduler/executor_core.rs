@@ -258,6 +258,11 @@ pub(crate) fn decrement_count(state: &AtomicUsize) -> usize {
 /// The formula `victim = rng.next_usize(n-1); if victim >= self { victim += 1 }`
 /// ensures we never steal from ourselves while maintaining uniform distribution
 /// over the remaining N-1 workers.
+///
+/// # Metrics Hooks
+///
+/// `record_steal_attempt` is called for each failed victim probe. A single
+/// successful steal emits `record_steal_success` and returns immediately.
 #[inline(always)]
 pub(crate) fn pop_task<T, S, C>(
     steal_tries: u32,
@@ -306,9 +311,16 @@ where
 /// This mirrors the production worker loop but avoids blocking. The caller
 /// is responsible for handling `ShouldPark` (e.g., by parking or recording
 /// a park intent in simulation).
+///
+/// # Invariants
+///
+/// - Consumes exactly one run-token on `RanTask` by decrementing the combined
+///   in-flight count (or on panic before exiting).
+/// - Never parks if work is immediately available.
+/// - Calls `initiate_done` when the gate is closed and count reaches zero.
 pub(crate) fn worker_step<T, S, C, RunnerFn, Idle, Trace>(
     cfg: &ExecutorConfig,
-    runner: &RunnerFn,
+    runner: &mut RunnerFn,
     ctx: &mut C,
     idle: &mut Idle,
     trace: &mut Trace,
@@ -316,7 +328,7 @@ pub(crate) fn worker_step<T, S, C, RunnerFn, Idle, Trace>(
 where
     T: Send + 'static,
     C: WorkerCtxLike<T, S>,
-    RunnerFn: Fn(T, &mut C) + 'static,
+    RunnerFn: FnMut(T, &mut C),
     Idle: IdleHooks,
     Trace: TraceHooks<T>,
 {
