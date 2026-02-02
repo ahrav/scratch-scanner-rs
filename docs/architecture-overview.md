@@ -103,6 +103,13 @@ graph TB
 The optional sim harnesses provide deterministic simulation primitives and replayable traces for
 scanner and scheduler testing. See `docs/test_harness.md` for the full design and workflow.
 
+| Component | Location | Purpose |
+|-----------|----------|---------|
+| **SimExecutor** | `src/sim/executor.rs` | Deterministic single-thread work-stealing model for simulation |
+| **SimFs** | `src/sim/fs.rs` | Deterministic in-memory filesystem used by scenarios |
+| **SimRng / SimClock** | `src/sim/rng.rs`, `src/sim/clock.rs` | Stable RNG and simulated time source |
+| **TraceRing** | `src/sim/trace.rs` | Bounded trace buffer for replay and debugging |
+
 ## Data Flow
 
 1. **Input**: File path from CLI
