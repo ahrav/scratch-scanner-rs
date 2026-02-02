@@ -165,3 +165,11 @@ required-features = ["scheduler-sim"]
 [[test]]
 name = "diagnostic"
 path = "tests/diagnostic/main.rs"
+
+# ============================================================================
+# Examples
+# ============================================================================
+
+[[example]]
+name = "gen_scheduler_corpus"
+required-features = ["scheduler-sim"]
