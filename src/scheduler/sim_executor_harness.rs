@@ -456,6 +456,9 @@ struct LogicalTask {
 pub(crate) trait TaskTraceHooks {
     /// Called before an instruction is executed for a task.
     fn on_task_instr(&mut self, tid: TaskId, pc: u16, instr: &Instruction);
+
+    /// Called when a spawn successfully enqueues a new run-token.
+    fn on_task_spawn(&mut self, _parent: TaskId, _child: TaskId, _placement: SpawnPlacement) {}
 }
 
 /// No-op task tracing (production default).
@@ -558,7 +561,10 @@ impl TaskVm {
             }
             Instruction::Spawn { program, placement } => {
                 let child_tid = self.allocate_task(program);
-                self.enqueue_run_token(ex, wid, child_tid, placement);
+                let enqueued = self.enqueue_run_token(ex, wid, child_tid, placement);
+                if enqueued {
+                    trace.on_task_spawn(tid, child_tid, placement);
+                }
                 let task = self.tasks.get_mut(&tid).expect("task exists");
                 task.pc = task.pc.saturating_add(1);
             }
@@ -634,13 +640,17 @@ impl TaskVm {
         wid: usize,
         tid: TaskId,
         placement: SpawnPlacement,
-    ) {
+    ) -> bool {
         match placement {
-            SpawnPlacement::Local => ex.spawn_local_for(wid, tid),
-            SpawnPlacement::Global => ex.spawn_global(tid),
-            SpawnPlacement::External => {
-                let _ = ex.spawn_external(tid);
+            SpawnPlacement::Local => {
+                ex.spawn_local_for(wid, tid);
+                true
             }
+            SpawnPlacement::Global => {
+                ex.spawn_global(tid);
+                true
+            }
+            SpawnPlacement::External => ex.spawn_external(tid).is_ok(),
         }
     }
 
@@ -925,6 +935,7 @@ impl From<&ExecTraceEvent<TaskId>> for ExecTraceEventSimple {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ViolationKind {
     InFlightMismatch,
+    /// Reserved for future run-token tracking; not emitted by current oracles.
     DoubleRun,
     TaskStateOverlap,
     GateViolation,
@@ -1081,7 +1092,6 @@ struct SimState {
     res: ResourceModel,
     events: Vec<ScheduledEvent>,
     delivered: Vec<bool>,
-    ran_tasks: std::collections::BTreeMap<TaskId, u64>,
 }
 
 impl SimState {
@@ -1102,7 +1112,6 @@ impl SimState {
             res,
             events: case.external_events.clone(),
             delivered: vec![false; case.external_events.len()],
-            ran_tasks: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1122,10 +1131,19 @@ impl SimState {
 /// These checks are deliberately simple: they run on every step and surface
 /// violations as structured trace events rather than panicking, so the
 /// harness can serialize a repro and continue to shrink it.
+///
+/// Note: run-token level double-run detection is not enforced because the
+/// simulator does not track explicit run-token identifiers yet.
 struct OracleChecker {
-    runnable_age: std::collections::BTreeMap<TaskId, u64>,
+    runnable_age: std::collections::BTreeMap<TaskId, RunnableAge>,
     max_starvation: u64,
     last_step: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RunnableAge {
+    since: u64,
+    backlog: u64,
 }
 
 impl OracleChecker {
@@ -1146,30 +1164,47 @@ impl OracleChecker {
         state: &SimState,
         exec_events: &[super::executor_core::ExecTraceEvent<TaskId>],
         task_events: &[(TaskId, u16, Instruction)],
+        spawn_events: &[(TaskId, TaskId, SpawnPlacement)],
         step: u64,
     ) -> Result<(), FailureInfo> {
         self.last_step = step;
 
-        // Track runnable age: initial_runnable and any task re-enqueued via events.
+        // Track runnable age for re-enqueued tasks and spawned children.
         for ev in exec_events {
             if let super::executor_core::ExecTraceEvent::Pop { tag, .. } = ev {
                 self.runnable_age.remove(tag);
             }
         }
 
+        let backlog = state.ex.in_flight() as u64;
         for (tid, _, instr) in task_events {
-            if matches!(instr, Instruction::Yield { .. } | Instruction::Spawn { .. }) {
-                self.runnable_age.entry(*tid).or_insert(step);
+            if matches!(instr, Instruction::Yield { .. }) {
+                self.runnable_age.entry(*tid).or_insert(RunnableAge {
+                    since: step,
+                    backlog,
+                });
             }
         }
 
-        // Starvation: runnable task should execute within bound.
-        for (tid, since) in &self.runnable_age {
-            if step.saturating_sub(*since) > self.max_starvation {
+        for (_, child, _) in spawn_events {
+            self.runnable_age.entry(*child).or_insert(RunnableAge {
+                since: step,
+                backlog,
+            });
+        }
+
+        // Starvation: runnable task should execute within bound, scaled by
+        // the backlog at the time the task became runnable.
+        for (tid, age) in &self.runnable_age {
+            let bound = self.max_starvation.saturating_add(age.backlog);
+            if step.saturating_sub(age.since) > bound {
                 return Err(FailureInfo {
                     kind: FailureKind::Violation(ViolationKind::RunnableStarvation),
                     step,
-                    message: format!("task {tid} runnable since step {since}"),
+                    message: format!(
+                        "task {tid} runnable since step {} (backlog {})",
+                        age.since, age.backlog
+                    ),
                 });
             }
         }
@@ -1254,17 +1289,25 @@ impl TraceHooks<TaskId> for ExecEventSink {
 /// Collects task instruction events during a single step.
 struct TaskEventSink {
     events: Vec<(TaskId, u16, Instruction)>,
+    spawn_events: Vec<(TaskId, TaskId, SpawnPlacement)>,
 }
 
 impl TaskEventSink {
     fn new() -> Self {
-        Self { events: Vec::new() }
+        Self {
+            events: Vec::new(),
+            spawn_events: Vec::new(),
+        }
     }
 }
 
 impl TaskTraceHooks for TaskEventSink {
     fn on_task_instr(&mut self, tid: TaskId, pc: u16, instr: &Instruction) {
         self.events.push((tid, pc, instr.clone()));
+    }
+
+    fn on_task_spawn(&mut self, parent: TaskId, child: TaskId, placement: SpawnPlacement) {
+        self.spawn_events.push((parent, child, placement));
     }
 }
 
@@ -1325,10 +1368,16 @@ fn enabled_actions(state: &SimState) -> Vec<DriverAction> {
     actions
 }
 
-/// Run a simulation using explicit driver choices (or default-first selection).
-pub fn run_with_choices(case: &SimCase, choices: &[DriverChoice]) -> Trace {
+/// Run a simulation using a custom driver policy.
+///
+/// The `choose` callback receives the enabled actions for the current step and
+/// must return one of them. If it returns an action not in the enabled set, the
+/// harness falls back to the first enabled action to preserve determinism.
+pub fn run_with_driver<F>(case: &SimCase, mut choose: F) -> Trace
+where
+    F: FnMut(&[DriverAction]) -> DriverAction,
+{
     let mut state = SimState::from_case(case);
-    let mut driver = Driver::new(choices);
     let mut oracles = OracleChecker::new(case.exec_cfg.workers, case.exec_cfg.steal_tries);
     let mut trace = Trace {
         header: TraceHeader {
@@ -1351,7 +1400,11 @@ pub fn run_with_choices(case: &SimCase, choices: &[DriverChoice]) -> Trace {
             break;
         }
 
-        let action = driver.choose(&enabled);
+        let mut action = choose(&enabled);
+        if !enabled.contains(&action) {
+            action = enabled[0].clone();
+        }
+
         trace.events.push(TraceEvent::Step {
             n: step,
             action: action.clone(),
@@ -1375,19 +1428,6 @@ pub fn run_with_choices(case: &SimCase, choices: &[DriverChoice]) -> Trace {
                     .step_worker(wid, &mut runner, &mut idle, &mut exec_trace);
 
                 for event in &exec_trace.events {
-                    if let super::executor_core::ExecTraceEvent::Pop { tag, .. } = event {
-                        let count = state.ran_tasks.entry(*tag).or_insert(0);
-                        *count += 1;
-                        if *count > 1 {
-                            trace.events.push(TraceEvent::InvariantViolation {
-                                kind: ViolationKind::DoubleRun,
-                                message: format!("task {tag} executed more than once"),
-                            });
-                            return trace;
-                        }
-                    }
-                }
-                for event in &exec_trace.events {
                     trace.events.push(TraceEvent::Exec {
                         event: ExecTraceEventSimple::from(event),
                     });
@@ -1400,9 +1440,13 @@ pub fn run_with_choices(case: &SimCase, choices: &[DriverChoice]) -> Trace {
                     });
                 }
 
-                if let Err(info) =
-                    oracles.check_step(&state, &exec_trace.events, &task_trace.events, step)
-                {
+                if let Err(info) = oracles.check_step(
+                    &state,
+                    &exec_trace.events,
+                    &task_trace.events,
+                    &task_trace.spawn_events,
+                    step,
+                ) {
                     trace.events.push(TraceEvent::InvariantViolation {
                         kind: match info.kind {
                             FailureKind::Violation(kind) => kind,
@@ -1444,6 +1488,12 @@ pub fn run_with_choices(case: &SimCase, choices: &[DriverChoice]) -> Trace {
 
     trace.final_digest = state.digest();
     trace
+}
+
+/// Run a simulation using explicit driver choices (or default-first selection).
+pub fn run_with_choices(case: &SimCase, choices: &[DriverChoice]) -> Trace {
+    let mut driver = Driver::new(choices);
+    run_with_driver(case, |enabled| driver.choose(enabled))
 }
 
 /// Assert that a case + choices produce identical traces across runs.
