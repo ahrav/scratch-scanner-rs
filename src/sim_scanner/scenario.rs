@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::sim::fs::{SimFsSpec, SimPath};
+
 /// Configuration for a single simulation run.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunConfig {
@@ -80,38 +82,6 @@ impl SpanU32 {
         debug_assert!(start <= end);
         Self { start, end }
     }
-}
-
-/// Path stored as raw bytes to support invalid UTF-8.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct SimPath {
-    pub bytes: Vec<u8>,
-}
-
-impl SimPath {
-    #[inline(always)]
-    pub fn new(bytes: Vec<u8>) -> Self {
-        Self { bytes }
-    }
-}
-
-/// Declarative filesystem layout for a scenario.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SimFsSpec {
-    pub nodes: Vec<SimNodeSpec>,
-}
-
-/// Filesystem node specification.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum SimNodeSpec {
-    Dir {
-        path: SimPath,
-        children: Vec<SimPath>,
-    },
-    File {
-        path: SimPath,
-        contents: Vec<u8>,
-    },
 }
 
 /// Synthetic rule suite specification for scenario generation.

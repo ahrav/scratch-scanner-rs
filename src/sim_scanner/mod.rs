@@ -6,7 +6,7 @@
 
 pub mod scenario;
 
+pub use crate::sim::fs::{SimFsSpec, SimNodeSpec, SimPath};
 pub use scenario::{
-    ExpectedSecret, RuleSuiteSpec, RunConfig, Scenario, SecretRepr, SimPath, SpanU32,
-    SyntheticRuleSpec,
+    ExpectedSecret, RuleSuiteSpec, RunConfig, Scenario, SecretRepr, SpanU32, SyntheticRuleSpec,
 };

@@ -12,9 +12,11 @@
 //! This module is only available with the `sim-harness` feature.
 
 pub mod clock;
+pub mod fs;
 pub mod rng;
 pub mod trace;
 
 pub use clock::SimClock;
+pub use fs::{SimFileHandle, SimFs, SimFsSpec, SimNodeSpec, SimPath};
 pub use rng::SimRng;
 pub use trace::{TraceEvent, TraceRing};
