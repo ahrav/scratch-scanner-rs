@@ -46,6 +46,8 @@ pub mod scheduler;
 pub mod scratch_memory;
 #[cfg(feature = "sim-harness")]
 pub mod sim;
+#[cfg(feature = "sim-harness")]
+pub mod sim_scanner;
 pub mod stdx;
 #[cfg(test)]
 pub mod test_utils;
