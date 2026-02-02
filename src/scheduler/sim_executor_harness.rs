@@ -824,6 +824,7 @@ pub(crate) struct TraceHeader {
 pub(crate) struct Trace {
     pub header: TraceHeader,
     pub events: Vec<TraceEvent>,
+    pub final_digest: StateDigest,
 }
 
 /// Trace events emitted during a simulation run.
@@ -851,6 +852,15 @@ pub(crate) enum TraceEvent {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StateDigest {
+    pub in_flight: usize,
+    pub accepting: bool,
+    pub done: bool,
+    pub worker_locals: Vec<usize>,
+    pub injector_len: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ViolationKind {
     InFlightMismatch,
     DoubleRun,
@@ -874,6 +884,131 @@ pub(crate) struct FailureInfo {
     pub kind: FailureKind,
     pub step: u64,
     pub message: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ReproArtifact {
+    pub schema_version: u32,
+    pub seed: u64,
+    pub case: SimCase,
+    pub driver_choices: Vec<DriverChoice>,
+    pub expected_trace_hash: u64,
+    pub failure: FailureInfo,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MinimizeConfig {
+    pub max_checks: usize,
+}
+
+/// Compute a stable 64-bit hash of the trace events.
+///
+/// This is used to sanity-check replay determinism without storing the
+/// entire trace in the repro artifact.
+pub(crate) fn trace_hash(trace: &Trace) -> u64 {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    for event in &trace.events {
+        hasher.update(format!("{event:?}").as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&digest[..8]);
+    u64::from_le_bytes(out)
+}
+
+pub(crate) fn minimize(
+    mut artifact: ReproArtifact,
+    cfg: MinimizeConfig,
+    check: impl Fn(&ReproArtifact) -> Result<(), FailureInfo>,
+) -> ReproArtifact {
+    let mut checks = 0usize;
+
+    loop {
+        if checks >= cfg.max_checks {
+            break;
+        }
+
+        let mut changed = false;
+
+        // Reduce workers.
+        for w in 1..artifact.case.exec_cfg.workers {
+            if checks >= cfg.max_checks {
+                break;
+            }
+            let mut cand = artifact.clone();
+            cand.case.exec_cfg.workers = w;
+            checks += 1;
+            if check(&cand).is_err() {
+                artifact = cand;
+                changed = true;
+                break;
+            }
+        }
+
+        // Reduce external events (ddmin-like: try dropping halves).
+        if !artifact.case.external_events.is_empty() {
+            let mut keep = artifact.case.external_events.clone();
+            let mut n = keep.len();
+            let mut step_size = n / 2;
+            while step_size > 0 {
+                let mut i = 0;
+                while i < n {
+                    if checks >= cfg.max_checks {
+                        break;
+                    }
+                    let mut cand = artifact.clone();
+                    let mut filtered = Vec::with_capacity(keep.len());
+                    for (idx, ev) in keep.iter().enumerate() {
+                        if idx < i || idx >= i + step_size {
+                            filtered.push(ev.clone());
+                        }
+                    }
+                    cand.case.external_events = filtered;
+                    checks += 1;
+                    if check(&cand).is_err() {
+                        artifact = cand;
+                        keep = artifact.case.external_events.clone();
+                        n = keep.len();
+                        changed = true;
+                        break;
+                    }
+                    i += step_size;
+                }
+                if !changed {
+                    step_size /= 2;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Reduce driver choices by truncating.
+        if !artifact.driver_choices.is_empty() {
+            let mut cut = artifact.driver_choices.len() / 2;
+            while cut > 0 {
+                if checks >= cfg.max_checks {
+                    break;
+                }
+                let mut cand = artifact.clone();
+                cand.driver_choices.truncate(cut);
+                checks += 1;
+                if check(&cand).is_err() {
+                    artifact = cand;
+                    changed = true;
+                    break;
+                }
+                cut /= 2;
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+
+    artifact
 }
 
 /// Internal state used by the driver loop.
@@ -906,6 +1041,16 @@ impl SimState {
             events: case.external_events.clone(),
             delivered: vec![false; case.external_events.len()],
             ran_tasks: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn digest(&self) -> StateDigest {
+        StateDigest {
+            in_flight: self.ex.in_flight(),
+            accepting: is_accepting(self.ex.state),
+            done: self.ex.done,
+            worker_locals: self.ex.workers.iter().map(|w| w.local.len()).collect(),
+            injector_len: self.ex.injector.len(),
         }
     }
 }
@@ -1129,6 +1274,13 @@ pub(crate) fn run_with_choices(case: &SimCase, choices: &[DriverChoice]) -> Trac
             seed: case.exec_cfg.seed,
         },
         events: Vec::new(),
+        final_digest: StateDigest {
+            in_flight: 0,
+            accepting: false,
+            done: false,
+            worker_locals: Vec::new(),
+            injector_len: 0,
+        },
     };
 
     for step in 0..case.max_steps {
@@ -1228,6 +1380,7 @@ pub(crate) fn run_with_choices(case: &SimCase, choices: &[DriverChoice]) -> Trac
         }
     }
 
+    trace.final_digest = state.digest();
     trace
 }
 
