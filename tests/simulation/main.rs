@@ -16,3 +16,6 @@ mod scanner_corpus;
 
 #[cfg(feature = "sim-harness")]
 mod scanner_discovery;
+
+#[cfg(feature = "sim-harness")]
+mod scanner_max_file_size;

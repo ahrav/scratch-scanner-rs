@@ -132,6 +132,7 @@ pub fn generate_scenario(seed: u64, cfg: &ScenarioGenConfig) -> Result<Scenario,
             path,
             contents: buf,
             // Generator defaults to a known file type; tests override as needed.
+            discovery_len_hint: None,
             type_hint: SimTypeHint::File,
         });
     }

@@ -64,6 +64,11 @@ pub enum SimNodeSpec {
     File {
         path: SimPath,
         contents: Vec<u8>,
+        /// Optional discovery-time size hint used for max size filtering.
+        ///
+        /// `None` defaults to the current file contents length.
+        #[serde(default)]
+        discovery_len_hint: Option<u64>,
         /// Optional file-type hint used by simulated discovery.
         ///
         /// `Unknown` models missing `file_type()` results and must still

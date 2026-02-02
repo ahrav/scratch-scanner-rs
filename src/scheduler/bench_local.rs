@@ -426,6 +426,7 @@ mod tests {
             pool_buffers: 8,
             local_queue_cap: 2,
             max_in_flight_objects: 8,
+            max_file_size: u64::MAX,
             seed: 12345,
             dedupe_within_chunk: true,
         }

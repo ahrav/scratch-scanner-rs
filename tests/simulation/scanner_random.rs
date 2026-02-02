@@ -5,6 +5,7 @@
 //! - `SIM_SCANNER_DEEP=1` enables a larger default scenario and higher fault rates.
 //! - `SIM_SCENARIO_*` overrides scenario size (rules/files/secrets/noise).
 //! - `SIM_RUN_*` overrides run config (workers/chunk/overlap/stability/etc).
+//! - `SIM_RUN_MAX_FILE_SIZE` sets the max file size cap for scanning.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -154,6 +155,7 @@ fn random_run_config(rng: &mut SimRng, deep: bool) -> RunConfig {
     let overlap = env_u32("SIM_RUN_OVERLAP", if deep { 128 } else { 64 });
     let max_in_flight_objects = env_u32("SIM_RUN_MAX_IN_FLIGHT", if deep { 32 } else { 16 });
     let buffer_pool_cap = env_u32("SIM_RUN_BUFFER_POOL_CAP", if deep { 16 } else { 8 });
+    let max_file_size = env_u64("SIM_RUN_MAX_FILE_SIZE", u64::MAX);
     let max_steps = env_u64("SIM_RUN_MAX_STEPS", 0);
     let max_transform_depth = env_u32("SIM_RUN_MAX_TRANSFORM_DEPTH", if deep { 4 } else { 3 });
     let scan_utf16_variants = env_bool("SIM_RUN_SCAN_UTF16", true);
@@ -165,6 +167,7 @@ fn random_run_config(rng: &mut SimRng, deep: bool) -> RunConfig {
         overlap,
         max_in_flight_objects,
         buffer_pool_cap,
+        max_file_size,
         max_steps,
         max_transform_depth,
         scan_utf16_variants,

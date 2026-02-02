@@ -1,5 +1,5 @@
 #![cfg(any(test, feature = "sim-harness"))]
-//! Scanner simulation coverage for discovery type-hint fallback.
+//! Scanner simulation coverage for open-time max file size enforcement.
 
 use std::collections::BTreeMap;
 
@@ -7,11 +7,11 @@ use scanner_rs::sim::FaultPlan;
 use scanner_rs::sim::SimNodeSpec;
 use scanner_rs::sim_scanner::{
     build_engine_from_suite, generate_scenario, RunConfig, RunOutcome, ScannerSimRunner,
-    ScenarioGenConfig, SimTypeHint,
+    ScenarioGenConfig, SecretRepr,
 };
 
 #[test]
-fn discovery_falls_back_when_type_hint_missing() {
+fn open_time_size_cap_skips_growth_after_discovery() {
     let gen_cfg = ScenarioGenConfig {
         rule_count: 1,
         file_count: 1,
@@ -19,15 +19,20 @@ fn discovery_falls_back_when_type_hint_missing() {
         token_len: 12,
         min_noise_len: 4,
         max_noise_len: 8,
-        representations: vec![scanner_rs::sim_scanner::SecretRepr::Raw],
+        representations: vec![SecretRepr::Raw],
         ..ScenarioGenConfig::default()
     };
 
-    let mut scenario = generate_scenario(1234, &gen_cfg).expect("generate scenario");
-    // Force discovery to treat the file type as unknown and require fallback.
+    let mut scenario = generate_scenario(777, &gen_cfg).expect("generate scenario");
     for node in &mut scenario.fs.nodes {
-        if let SimNodeSpec::File { type_hint, .. } = node {
-            *type_hint = SimTypeHint::Unknown;
+        if let SimNodeSpec::File {
+            contents,
+            discovery_len_hint,
+            ..
+        } = node
+        {
+            *discovery_len_hint = Some(4);
+            contents.extend(std::iter::repeat_n(b'x', 128));
             break;
         }
     }
@@ -38,7 +43,7 @@ fn discovery_falls_back_when_type_hint_missing() {
         overlap: 64,
         max_in_flight_objects: 4,
         buffer_pool_cap: 4,
-        max_file_size: u64::MAX,
+        max_file_size: 32,
         max_steps: 0,
         max_transform_depth: 2,
         scan_utf16_variants: true,
@@ -52,7 +57,7 @@ fn discovery_falls_back_when_type_hint_missing() {
         run_cfg.overlap = required;
     }
 
-    let runner = ScannerSimRunner::new(run_cfg.clone(), 0xC0FF_EE01);
+    let runner = ScannerSimRunner::new(run_cfg, 0xC0FF_EE02);
     let fault_plan = FaultPlan {
         per_file: BTreeMap::new(),
     };
@@ -63,10 +68,13 @@ fn discovery_falls_back_when_type_hint_missing() {
     match (first, second) {
         (RunOutcome::Ok { findings: a }, RunOutcome::Ok { findings: b }) => {
             assert_eq!(a, b);
-            assert!(!a.is_empty());
+            assert!(
+                a.is_empty(),
+                "expected size cap to skip scanning, got {a:?}"
+            );
         }
         (RunOutcome::Failed(fail), _) | (_, RunOutcome::Failed(fail)) => {
-            panic!("discovery fallback sim failed: {fail:?}");
+            panic!("size-cap sim failed: {fail:?}");
         }
     }
 }

@@ -78,6 +78,7 @@ use std::sync::Arc;
 /// - `chunk_size`: 64-256 KiB typical. Larger = fewer syscalls, more memory per file.
 /// - `pool_buffers`: Bound peak memory. Should be >= `workers` to avoid starvation.
 /// - `max_in_flight_objects`: Bound discovery depth. Too high = memory for paths/metadata.
+/// - `max_file_size`: Open-time size cap; oversized files are skipped.
 #[derive(Clone, Debug)]
 pub struct LocalConfig {
     /// Number of CPU worker threads.
@@ -101,6 +102,12 @@ pub struct LocalConfig {
     /// Controls discovery backpressure. Higher = more path metadata in memory.
     pub max_in_flight_objects: usize,
 
+    /// Maximum file size in bytes to scan.
+    ///
+    /// Files larger than this are skipped after `open()` based on the
+    /// snapshot size from `metadata().len()`.
+    pub max_file_size: u64,
+
     /// Seed for deterministic executor behavior.
     pub seed: u64,
 
@@ -120,6 +127,7 @@ impl Default for LocalConfig {
             pool_buffers: 32,
             local_queue_cap: 4,
             max_in_flight_objects: 256,
+            max_file_size: u64::MAX,
             seed: 0x853c49e6748fea9b,
             dedupe_within_chunk: true,
         }
@@ -266,6 +274,7 @@ struct LocalScratch<E: ScanEngine> {
     /// Configuration flags.
     dedupe_within_chunk: bool,
     chunk_size: usize,
+    max_file_size: u64,
 }
 
 // ============================================================================
@@ -473,6 +482,11 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
 
     // Empty file: nothing to scan
     if file_size == 0 {
+        return;
+    }
+
+    // Enforce size cap at open time for snapshot semantics.
+    if file_size > scratch.max_file_size {
         return;
     }
 
@@ -732,6 +746,7 @@ where
                     out_buf: Vec::with_capacity(64 * 1024),
                     dedupe_within_chunk: dedupe,
                     chunk_size,
+                    max_file_size: cfg.max_file_size,
                 }
             }
         },
@@ -811,6 +826,7 @@ mod tests {
             pool_buffers: 8,
             local_queue_cap: 2,
             max_in_flight_objects: 8,
+            max_file_size: u64::MAX,
             seed: 12345,
             dedupe_within_chunk: true,
         }
@@ -854,6 +870,28 @@ mod tests {
         let report = scan_local(engine, source, small_config(), sink.clone());
 
         assert_eq!(report.stats.files_enqueued, 1);
+        assert!(sink.take().is_empty());
+    }
+
+    #[test]
+    fn enforces_max_file_size_at_open_time() {
+        let engine = Arc::new(test_engine());
+        let sink = Arc::new(VecSink::new());
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, "SECRETABCD1234").unwrap();
+        tmp.flush().unwrap();
+
+        let path = tmp.path().to_path_buf();
+        let source = VecFileSource::new(vec![LocalFile { path, size: 4 }]);
+
+        let mut cfg = small_config();
+        cfg.max_file_size = 4; // Smaller than actual file size at open time.
+
+        let report = scan_local(engine, source, cfg, sink.clone());
+
+        assert_eq!(report.stats.files_enqueued, 1);
+        assert_eq!(report.metrics.bytes_scanned, 0);
         assert!(sink.take().is_empty());
     }
 

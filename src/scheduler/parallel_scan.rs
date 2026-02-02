@@ -64,7 +64,7 @@
 //! - **Directory walking**: Recursive traversal with symlink control
 //! - **Gitignore support**: Respects `.gitignore`, `.git/info/exclude`, global gitignore
 //! - **Hidden file filtering**: Optionally skip dotfiles and dot-directories
-//! - **Size filtering**: Skip files above `max_file_size` to avoid memory pressure
+//! - **Size filtering**: Skip files above `max_file_size` (discovery + open-time check)
 //! - **Parallel scanning**: Work-stealing scheduler with chunked I/O
 //! - **Overlap handling**: Automatic chunk overlap for boundary-crossing secrets
 //!
@@ -297,8 +297,9 @@ impl ParallelScanConfig {
     /// Convert to [`LocalConfig`](super::local::LocalConfig) for the scheduler.
     ///
     /// This extracts only the scheduler-relevant parameters; directory walking
-    /// options (`follow_symlinks`, `skip_hidden`, `respect_gitignore`, `max_file_size`)
-    /// are handled during file collection, not during scanning.
+    /// options (`follow_symlinks`, `skip_hidden`, `respect_gitignore`) are handled
+    /// during file collection. `max_file_size` is enforced both at discovery and
+    /// open time.
     fn to_local_config(&self) -> LocalConfig {
         LocalConfig {
             workers: self.workers,
@@ -306,6 +307,7 @@ impl ParallelScanConfig {
             pool_buffers: self.pool_buffers,
             local_queue_cap: self.local_queue_cap,
             max_in_flight_objects: self.max_in_flight_objects,
+            max_file_size: self.max_file_size,
             seed: self.seed,
             dedupe_within_chunk: true,
         }

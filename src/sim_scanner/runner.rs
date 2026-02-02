@@ -182,7 +182,7 @@ impl ScannerSimRunner {
         }
 
         let fs = SimFs::from_spec(&scenario.fs);
-        let files = discover_file_paths(&fs, &scenario.fs);
+        let files = discover_file_paths(&fs, &scenario.fs, self.cfg.max_file_size);
         let total_bytes = total_file_bytes(&fs, &files);
         let fault_ops = estimate_fault_ops(fault_plan);
         let max_steps = resolve_max_steps(&self.cfg, files.len() as u64, total_bytes, fault_ops);
@@ -265,6 +265,7 @@ impl ScannerSimRunner {
                             &mut faults,
                             overlap,
                             self.cfg.chunk_size as usize,
+                            self.cfg.max_file_size,
                             &mut output,
                             step,
                             clock.now_ticks(),
@@ -546,6 +547,7 @@ impl FileScanState {
         faults: &mut FaultInjector,
         overlap: usize,
         chunk_size: usize,
+        max_file_size: u64,
         output: &mut OutputCollector,
         step: u64,
         now: u64,
@@ -590,6 +592,13 @@ impl FileScanState {
                     message: format!("file too large: {:?}", self.path.bytes),
                     step,
                 });
+            }
+            if handle.len == 0 {
+                return Ok(FileStepOutcome::Done);
+            }
+            if handle.len > max_file_size {
+                self.ground_truth_ok = false;
+                return Ok(FileStepOutcome::Done);
             }
             self.handle = Some(handle);
         }
@@ -1038,15 +1047,23 @@ fn normalize_findings_for_diff(engine: &Engine, findings: &[FindingRec]) -> BTre
 ///
 /// This models DirWalker behavior: `Unknown` type hints must still attempt
 /// metadata (here, a simulated open) to avoid silent drops.
-fn discover_file_paths(fs: &SimFs, spec: &SimFsSpec) -> Vec<SimPath> {
+fn discover_file_paths(fs: &SimFs, spec: &SimFsSpec, max_file_size: u64) -> Vec<SimPath> {
     let mut files = Vec::new();
     for node in &spec.nodes {
         let SimNodeSpec::File {
-            path, type_hint, ..
+            path,
+            contents,
+            type_hint,
+            discovery_len_hint,
         } = node
         else {
             continue;
         };
+
+        let hint_len = discovery_len_hint.unwrap_or(contents.len() as u64);
+        if hint_len == 0 || hint_len > max_file_size {
+            continue;
+        }
 
         let include = match type_hint {
             SimTypeHint::File => true,
