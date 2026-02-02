@@ -983,9 +983,14 @@ fn normalize_findings(findings: &[FindingRec]) -> BTreeSet<FindingKey> {
 /// checks:
 /// - Drop non-root findings that already have a covering root finding for the
 ///   same `(file_id, rule_id)` (avoid redundant duplicates).
+/// - Drop non-root findings whose root-hint span exceeds the guaranteed overlap;
+///   these are alignment-sensitive for long transform runs and are not stable
+///   across chunk boundaries.
 /// - Clamp remaining non-root hints to the last `required_overlap()` bytes so
 ///   the oracle focuses on semantic differences while staying consistent with
 ///   guaranteed overlap.
+/// - Normalize base64-derived `root_hint_end` when padding is elided so
+///   truncated spans (chunked) compare equal to padded spans (reference).
 fn normalize_findings_for_diff(engine: &Engine, findings: &[FindingRec]) -> BTreeSet<FindingKey> {
     let overlap = engine.required_overlap() as u64;
     let mut root_spans: BTreeMap<(u32, u32), Vec<(u64, u64)>> = BTreeMap::new();
@@ -998,10 +1003,31 @@ fn normalize_findings_for_diff(engine: &Engine, findings: &[FindingRec]) -> BTre
         }
     }
 
+    fn normalize_root_hint_end(rec: &FindingRec) -> u64 {
+        if rec.step_id == STEP_ROOT {
+            return rec.root_hint_end;
+        }
+        // Base64 decoding is padding-tolerant; chunked scans can surface a match
+        // before trailing '=' arrives. Normalize to the minimal encoded length
+        // when the observed span is within padding tolerance (<= 3 chars).
+        let decoded_len = rec.span_end.saturating_sub(rec.span_start) as u64;
+        let min_encoded = (decoded_len * 4).div_ceil(3);
+        let actual_encoded = rec.root_hint_end.saturating_sub(rec.root_hint_start);
+        if actual_encoded > min_encoded && actual_encoded <= min_encoded.saturating_add(3) {
+            rec.root_hint_start.saturating_add(min_encoded)
+        } else {
+            rec.root_hint_end
+        }
+    }
+
     findings
         .iter()
         .filter_map(|rec| {
             if rec.step_id != STEP_ROOT {
+                let hint_len = rec.root_hint_end.saturating_sub(rec.root_hint_start);
+                if hint_len > overlap {
+                    return None;
+                }
                 if let Some(spans) = root_spans.get(&(rec.file_id.0, rec.rule_id)) {
                     if spans.iter().any(|(start, end)| {
                         rec.root_hint_start <= *start && rec.root_hint_end >= *end
@@ -1015,10 +1041,11 @@ fn normalize_findings_for_diff(engine: &Engine, findings: &[FindingRec]) -> BTre
             } else {
                 (0, 0)
             };
+            let normalized_end = normalize_root_hint_end(rec);
             let (root_hint_start, root_hint_end) = if rec.step_id == STEP_ROOT {
                 (rec.root_hint_start, rec.root_hint_end)
             } else {
-                (rec.root_hint_end.saturating_sub(overlap), rec.root_hint_end)
+                (normalized_end.saturating_sub(overlap), normalized_end)
             };
             Some(FindingKey {
                 file_id: rec.file_id.0,
