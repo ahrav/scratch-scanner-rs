@@ -248,6 +248,8 @@ pub mod rusage;
 // Testing infrastructure
 pub mod failure;
 pub mod sim;
+#[cfg(any(test, feature = "scheduler-sim"))]
+pub mod sim_executor_harness;
 pub mod task_graph;
 
 // Benchmarks

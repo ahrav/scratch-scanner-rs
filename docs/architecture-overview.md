@@ -96,6 +96,7 @@ graph TB
 | **BitSet** | `src/stdx/bitset.rs:30` | Compile-time fixed bitset |
 | **ScanScratch** | `src/lib.rs:859` | Per-scan reusable scratch state |
 | **TimingWheel** | `src/stdx/timing_wheel.rs` | Hashed timing wheel for window expiration scheduling |
+| **Scheduler Sim Harness** | `src/scheduler/sim_executor_harness.rs` | Deterministic executor model for scheduler interleaving tests |
 
 ## Data Flow
 
