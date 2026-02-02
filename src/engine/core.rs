@@ -860,14 +860,38 @@ impl Engine {
                     // not reallocate during a scan, and `buf_len` is bounded by the checked range.
                     let cur_buf = unsafe { std::slice::from_raw_parts(buf_ptr, buf_len) };
 
+                    // Build mapping context to translate decoded-space offsets back to root buffer
+                    // positions. This is used when reporting findings: the `root_hint` in a finding
+                    // should point to the *original* bytes in the root buffer, not intermediate
+                    // decoded buffers.
+                    //
+                    // For nested transforms (e.g., URL inside Base64), we need to map through
+                    // each decode layer. The context is only valid when the encoded span maps
+                    // 1:1 with the root hint (either directly from root, or through a slab
+                    // where lengths match).
                     scratch.root_span_map_ctx =
                         match (transform_idx, enc_ref.as_ref(), root_hint.as_ref()) {
+                            // Encoded bytes come directly from root buffer.
                             (Some(tidx), Some(EncRef::Root(span)), Some(hint))
                                 if hint.start == span.start && hint.end == span.end =>
                             {
                                 Some(RootSpanMapCtx::new(
                                     &self.transforms[tidx],
                                     &root_buf[span.clone()],
+                                    hint.start,
+                                    scratch.chunk_overlap_backscan,
+                                ))
+                            }
+                            // Encoded bytes are in the slab (from a prior decode). The hint length
+                            // must match the span length to ensure correct offset translation.
+                            (Some(tidx), Some(EncRef::Slab(span)), Some(hint))
+                                if span.end <= scratch.slab.buf.len()
+                                    && hint.end.saturating_sub(hint.start)
+                                        == span.end.saturating_sub(span.start) =>
+                            {
+                                Some(RootSpanMapCtx::new(
+                                    &self.transforms[tidx],
+                                    &scratch.slab.buf[span.clone()],
                                     hint.start,
                                     scratch.chunk_overlap_backscan,
                                 ))
@@ -1039,11 +1063,18 @@ impl Engine {
                                     },
                                 );
 
-                                let child_root_hint = if root_hint.is_none() {
-                                    Some(enc_span.clone())
-                                } else {
-                                    root_hint.clone()
-                                };
+                                // Compute the child's root hint. For nested transforms, use the
+                                // mapping context to translate the encoded span back to root-buffer
+                                // coordinates. This ensures findings report offsets into the original
+                                // input, not intermediate decoded buffers.
+                                let child_root_hint =
+                                    if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
+                                        Some(ctx.map_span(enc_span.clone()))
+                                    } else if root_hint.is_none() {
+                                        Some(enc_span.clone())
+                                    } else {
+                                        root_hint.clone()
+                                    };
 
                                 let enc_ref = match &buf {
                                     BufRef::Root => EncRef::Root(enc_span.clone()),

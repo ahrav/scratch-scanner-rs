@@ -22,7 +22,7 @@ use super::vectorscan_prefilter::{
 };
 use crate::api::{
     AnchorPolicy, DecodeStep, EntropySpec, FileId, Finding, FindingRec, Gate, RuleSpec,
-    TransformConfig, TransformId, TransformMode, Tuning, Utf16Endianness, ValidatorKind,
+    TransformConfig, TransformId, TransformMode, Tuning, Utf16Endianness, ValidatorKind, STEP_ROOT,
 };
 use crate::demo::{demo_engine, demo_rules, demo_tuning};
 use crate::regex2anchor::{compile_trigger_plan, AnchorDeriveConfig, TriggerPlan};
@@ -2955,6 +2955,84 @@ fn chunked_url_percent_no_duplicate_when_trigger_before_and_after() {
         "expected no duplicate findings: {:?}",
         chunked
     );
+}
+
+#[test]
+fn chunked_overlap_gt_chunk_dedupes_transform_findings() {
+    let rule = RuleSpec {
+        name: "tok0",
+        anchors: &[b"TOK0_"],
+        radius: 64,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        secret_group: None,
+        re: Regex::new("TOK0_[A-Z0-9]{8}").unwrap(),
+    };
+
+    let transforms = vec![TransformConfig {
+        id: TransformId::UrlPercent,
+        mode: TransformMode::Always,
+        gate: Gate::AnchorsInDecoded,
+        min_len: 4,
+        max_spans_per_buffer: 16,
+        max_encoded_len: 64 * 1024,
+        max_decoded_bytes: 64 * 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    }];
+
+    let mut tuning = demo_tuning();
+    tuning.scan_utf16_variants = false;
+    let engine =
+        Engine::new_with_anchor_policy(vec![rule], transforms, tuning, AnchorPolicy::ManualOnly);
+    if engine.vs_stream.is_none() {
+        return;
+    }
+
+    let token = b"TOK0_ABCDEFGH";
+    let encoded = url_percent_encode_all(token);
+
+    let mut buf = Vec::new();
+    buf.extend(std::iter::repeat_n(b'x', 64));
+    buf.extend_from_slice(&encoded);
+    buf.extend(std::iter::repeat_n(b'y', 64));
+    buf.extend_from_slice(token);
+    buf.extend(std::iter::repeat_n(b'z', 64));
+
+    let findings = scan_in_chunks_with_overlap(&engine, &buf, 8, 32);
+
+    #[derive(Debug, Hash, PartialEq, Eq)]
+    struct Key {
+        rule_id: u32,
+        span_start: u32,
+        span_end: u32,
+        root_hint_start: u64,
+        root_hint_end: u64,
+    }
+
+    let mut seen = HashSet::new();
+    for rec in &findings {
+        let (span_start, span_end) = if rec.step_id == STEP_ROOT {
+            (rec.span_start, rec.span_end)
+        } else {
+            (0, 0)
+        };
+        let key = Key {
+            rule_id: rec.rule_id,
+            span_start,
+            span_end,
+            root_hint_start: rec.root_hint_start,
+            root_hint_end: rec.root_hint_end,
+        };
+        assert!(
+            seen.insert(key),
+            "duplicate finding emitted in overlap>chunk scenario: {:?}",
+            rec
+        );
+    }
 }
 
 #[test]

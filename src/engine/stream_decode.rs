@@ -33,11 +33,13 @@ use std::ops::{ControlFlow, Range};
 use std::sync::atomic::Ordering;
 
 use super::core::Engine;
-use super::helpers::{coalesce_under_pressure_sorted, hash128, merge_ranges_with_gap_sorted};
+use super::helpers::{
+    coalesce_under_pressure_sorted, hash128, merge_ranges_with_gap_sorted, u64_to_usize,
+};
 use super::hit_pool::SpanU32;
 use super::rule_repr::Variant;
 use super::scratch::{RootSpanMapCtx, ScanScratch};
-use super::transform::{stream_decode, Base64SpanStream, UrlSpanStream};
+use super::transform::{map_decoded_offset, stream_decode, Base64SpanStream, UrlSpanStream};
 use super::vectorscan_prefilter::{
     gate_match_callback, stream_match_callback, utf16_stream_match_callback, VsScratch, VsStream,
     VsStreamDb, VsStreamMatchCtx, VsUtf16StreamMatchCtx,
@@ -793,7 +795,7 @@ impl Engine {
                             }
                         }
 
-                        let parent_span = lo as usize..hi as usize;
+                        let parent_span = u64_to_usize(lo)..u64_to_usize(hi);
                         let child_step_id = scratch.step_arena.push(
                             step_id,
                             DecodeStep::Transform {
@@ -801,13 +803,23 @@ impl Engine {
                                 parent_span: parent_span.clone(),
                             },
                         );
-                        let child_root_hint = root_hint.clone().unwrap_or(parent_span);
+                        // Map the nested span back to root-buffer coordinates. For nested transforms,
+                        // `parent_span` is in decoded-space offsets; we translate through the parent
+                        // transform to get the corresponding encoded-space range, then offset by the
+                        // root hint's start to get absolute root-buffer positions.
+                        let child_root_hint = if let Some(hint) = root_hint.as_ref() {
+                            let start = map_decoded_offset(tc, encoded, parent_span.start);
+                            let end = map_decoded_offset(tc, encoded, parent_span.end);
+                            Some(hint.start.saturating_add(start)..hint.start.saturating_add(end))
+                        } else {
+                            Some(parent_span)
+                        };
 
                         scratch.pending_spans.push(PendingDecodeSpan {
                             transform_idx: entry.transform_idx,
                             range,
                             step_id: child_step_id,
-                            root_hint: Some(child_root_hint),
+                            root_hint: child_root_hint,
                             depth: depth + 1,
                         });
                         entry.spans_emitted = entry.spans_emitted.saturating_add(1);
@@ -1009,7 +1021,7 @@ impl Engine {
                                 }
                             }
                         }
-                        let parent_span = lo as usize..hi as usize;
+                        let parent_span = u64_to_usize(lo)..u64_to_usize(hi);
                         let child_step_id = scratch.step_arena.push(
                             step_id,
                             DecodeStep::Transform {
@@ -1017,12 +1029,20 @@ impl Engine {
                                 parent_span: parent_span.clone(),
                             },
                         );
-                        let child_root_hint = root_hint.clone().unwrap_or(parent_span);
+                        // Same mapping logic as the streaming loop above: translate decoded-space
+                        // offsets back to root-buffer coordinates for accurate finding locations.
+                        let child_root_hint = if let Some(hint) = root_hint.as_ref() {
+                            let start = map_decoded_offset(tc, encoded, parent_span.start);
+                            let end = map_decoded_offset(tc, encoded, parent_span.end);
+                            Some(hint.start.saturating_add(start)..hint.start.saturating_add(end))
+                        } else {
+                            Some(parent_span)
+                        };
                         scratch.pending_spans.push(PendingDecodeSpan {
                             transform_idx: entry.transform_idx,
                             range,
                             step_id: child_step_id,
-                            root_hint: Some(child_root_hint),
+                            root_hint: child_root_hint,
                             depth: depth + 1,
                         });
                         entry.spans_emitted = entry.spans_emitted.saturating_add(1);

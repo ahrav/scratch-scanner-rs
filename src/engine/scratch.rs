@@ -5,7 +5,7 @@
 //! state is single-threaded and reused across chunks to keep the hot path
 //! allocation-free.
 
-use crate::api::{DecodeStep, FileId, FindingRec, TransformConfig, TransformId};
+use crate::api::{DecodeStep, FileId, FindingRec, TransformConfig, TransformId, STEP_ROOT};
 use crate::scratch_memory::ScratchVec;
 use crate::stdx::{ByteRing, FixedSet128, TimingWheel};
 
@@ -13,7 +13,7 @@ use crate::stdx::{ByteRing, FixedSet128, TimingWheel};
 use crate::api::Base64DecodeStats;
 
 use super::decode_state::{DecodeSlab, StepArena};
-use super::helpers::pow2_at_least;
+use super::helpers::{hash128, pow2_at_least};
 use super::hit_pool::{HitAccPool, SpanU32};
 use super::transform::{map_decoded_offset, STREAM_DECODE_CHUNK_BYTES};
 use super::vectorscan_prefilter::{VsScratch, VsStreamWindow};
@@ -244,9 +244,25 @@ pub struct ScanScratch {
     /// Fixed capacity ensures no allocations during the scan loop; the tuning
     /// parameter `max_work_items` determines the upper bound.
     pub(super) work_q: ScratchVec<WorkItem>,
-    pub(super) work_head: usize,                 // Cursor into work_q.
-    pub(super) slab: DecodeSlab,                 // Decoded output storage.
-    pub(super) seen: FixedSet128,                // Dedupe for decoded buffers.
+    pub(super) work_head: usize,  // Cursor into work_q.
+    pub(super) slab: DecodeSlab,  // Decoded output storage.
+    pub(super) seen: FixedSet128, // Dedupe for decoded buffers.
+    /// Bloom-style deduplication for output findings within a file.
+    ///
+    /// Prevents emitting the same finding multiple times when overlapping chunks
+    /// or transform re-scans produce identical matches. The set is reset on file
+    /// boundary transitions (new file or `base_offset == 0`).
+    ///
+    /// Key composition (32 bytes → 128-bit hash):
+    /// - `file_id` (4 bytes) — scoped to current file
+    /// - `rule_id` (4 bytes) — distinguishes rule matches
+    /// - `span_start`, `span_end` (8 bytes) — root-level span (zeroed for transforms)
+    /// - `root_hint_start`, `root_hint_end` (16 bytes) — dedupe boundary in root coordinates
+    ///
+    /// Transform-derived findings use zeroed span coordinates because the same
+    /// root hint window can produce matches at different decoded offsets across
+    /// chunk boundaries; the root hint range is the stable identity.
+    pub(super) seen_findings: FixedSet128,
     pub(super) total_decode_output_bytes: usize, // Global decode budget tracker.
     pub(super) work_items_enqueued: usize,       // Work queue budget tracker.
     /// Streaming decoded-byte ring buffer for window capture.
@@ -356,6 +372,7 @@ impl ScanScratch {
                 .saturating_mul(2)
                 .max(1024),
         );
+        let findings_cap = pow2_at_least(max_findings.saturating_mul(4).max(64));
         let stream_match_cap = engine.tuning.max_windows_per_rule_variant.max(16);
         let pending_window_cap = rules_len
             .saturating_mul(3)
@@ -376,6 +393,7 @@ impl ScanScratch {
             work_head: 0,
             slab: DecodeSlab::with_limit(engine.tuning.max_total_decode_output_bytes),
             seen: FixedSet128::with_pow2(seen_cap),
+            seen_findings: FixedSet128::with_pow2(findings_cap),
             total_decode_output_bytes: 0,
             work_items_enqueued: 0,
             decode_ring: ByteRing::with_capacity(engine.stream_ring_bytes),
@@ -704,6 +722,14 @@ impl ScanScratch {
         base_offset: u64,
         buf_len: usize,
     ) {
+        // Reset finding dedup state on file transitions or when starting a new
+        // scan from offset 0. This ensures findings from a previous file don't
+        // suppress valid findings in the current file, and allows re-scanning
+        // the same file from the beginning without stale dedup state.
+        if self.last_file_id != Some(file_id) || base_offset == 0 {
+            self.seen_findings.reset();
+        }
+
         let mut overlap = 0usize;
         if self.last_file_id == Some(file_id) {
             let last_end = self
@@ -835,7 +861,60 @@ impl ScanScratch {
         self.push_finding_with_drop_hint(rec, rec.root_hint_end);
     }
 
+    /// Records a finding with an explicit drop boundary, deduplicating against
+    /// previously seen findings within the current file.
+    ///
+    /// # Deduplication Strategy
+    ///
+    /// Findings are keyed by a 32-byte composite:
+    ///
+    /// ```text
+    /// ┌────────┬────────┬────────────┬──────────┬─────────────────┬───────────────┐
+    /// │file_id │rule_id │ span_start │ span_end │ root_hint_start │ root_hint_end │
+    /// │ 4B     │ 4B     │ 4B         │ 4B       │ 8B              │ 8B            │
+    /// └────────┴────────┴────────────┴──────────┴─────────────────┴───────────────┘
+    /// ```
+    ///
+    /// For transform-derived findings (`step_id != STEP_ROOT`), span coordinates
+    /// are zeroed. This is intentional: the same encoded region can decode to
+    /// different byte offsets depending on chunk alignment, but the root hint
+    /// window (the encoded bytes that triggered the decode) is stable.
+    ///
+    /// # Why Not Just Span Coordinates?
+    ///
+    /// Chunked scanning with overlap can produce the "same" finding from different
+    /// chunk perspectives. The root hint window captures the logical identity of
+    /// where the secret lives in the original file, regardless of which chunk
+    /// boundary happened to include it.
+    ///
+    /// # False Positives
+    ///
+    /// The underlying `FixedSet128` is a probabilistic structure (Bloom-like).
+    /// Collisions may suppress distinct findings, but the capacity is sized to
+    /// `4× max_findings` to keep collision probability low for typical scans.
     pub(super) fn push_finding_with_drop_hint(&mut self, rec: FindingRec, drop_hint_end: u64) {
+        // For root-level findings, include the exact span in the dedup key.
+        // For transform-derived findings, zero the span since decoded offsets
+        // vary by chunk alignment but root hints are stable.
+        let (span_start, span_end) = if rec.step_id == STEP_ROOT {
+            (rec.span_start, rec.span_end)
+        } else {
+            (0, 0)
+        };
+
+        // Build a 32-byte dedup key and hash to 128 bits.
+        let mut key_bytes = [0u8; 32];
+        key_bytes[0..4].copy_from_slice(&rec.file_id.0.to_le_bytes());
+        key_bytes[4..8].copy_from_slice(&rec.rule_id.to_le_bytes());
+        key_bytes[8..12].copy_from_slice(&span_start.to_le_bytes());
+        key_bytes[12..16].copy_from_slice(&span_end.to_le_bytes());
+        key_bytes[16..24].copy_from_slice(&rec.root_hint_start.to_le_bytes());
+        key_bytes[24..32].copy_from_slice(&rec.root_hint_end.to_le_bytes());
+
+        if !self.seen_findings.insert(hash128(&key_bytes)) {
+            return; // Already seen (or hash collision).
+        }
+
         if self.out.len() < self.max_findings {
             self.out.push(rec);
             self.drop_hint_end.push(drop_hint_end);

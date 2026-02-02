@@ -955,6 +955,62 @@ fn normalize_findings(findings: &[FindingRec]) -> BTreeSet<FindingKey> {
     findings.iter().map(FindingKey::from).collect()
 }
 
+/// Normalize findings for differential comparison.
+///
+/// Derived-buffer `root_hint` spans are best-effort and can vary with chunk
+/// boundaries (nested transforms over long URL/base64 runs). For differential
+/// checks:
+/// - Drop non-root findings that already have a covering root finding for the
+///   same `(file_id, rule_id)` (avoid redundant duplicates).
+/// - Clamp remaining non-root hints to the last `required_overlap()` bytes so
+///   the oracle focuses on semantic differences while staying consistent with
+///   guaranteed overlap.
+fn normalize_findings_for_diff(engine: &Engine, findings: &[FindingRec]) -> BTreeSet<FindingKey> {
+    let overlap = engine.required_overlap() as u64;
+    let mut root_spans: BTreeMap<(u32, u32), Vec<(u64, u64)>> = BTreeMap::new();
+    for rec in findings {
+        if rec.step_id == STEP_ROOT {
+            root_spans
+                .entry((rec.file_id.0, rec.rule_id))
+                .or_default()
+                .push((rec.span_start as u64, rec.span_end as u64));
+        }
+    }
+
+    findings
+        .iter()
+        .filter_map(|rec| {
+            if rec.step_id != STEP_ROOT {
+                if let Some(spans) = root_spans.get(&(rec.file_id.0, rec.rule_id)) {
+                    if spans.iter().any(|(start, end)| {
+                        rec.root_hint_start <= *start && rec.root_hint_end >= *end
+                    }) {
+                        return None;
+                    }
+                }
+            }
+            let (span_start, span_end) = if rec.step_id == STEP_ROOT {
+                (rec.span_start, rec.span_end)
+            } else {
+                (0, 0)
+            };
+            let (root_hint_start, root_hint_end) = if rec.step_id == STEP_ROOT {
+                (rec.root_hint_start, rec.root_hint_end)
+            } else {
+                (rec.root_hint_end.saturating_sub(overlap), rec.root_hint_end)
+            };
+            Some(FindingKey {
+                file_id: rec.file_id.0,
+                rule_id: rec.rule_id,
+                span_start,
+                span_end,
+                root_hint_start,
+                root_hint_end,
+            })
+        })
+        .collect()
+}
+
 /// Return file paths in deterministic order.
 fn sorted_file_paths(fs: &SimFs) -> Vec<SimPath> {
     let mut files = fs.file_paths();
@@ -1092,8 +1148,8 @@ fn oracle_differential(
             step,
         })?;
 
-    let observed = normalize_findings(findings);
-    let expected = normalize_findings(&reference);
+    let observed = normalize_findings_for_diff(engine, findings);
+    let expected = normalize_findings_for_diff(engine, &reference);
     if let Some(miss) = expected.difference(&observed).next() {
         let message = format!(
             "differential mismatch (sim {}, reference {}), missing {:?}",
