@@ -71,6 +71,7 @@
 //! # Correctness Invariants
 //!
 //! - **Work-conserving**: Every file matching filters is scanned (no silent drops)
+//! - **Type-hint safety**: Missing `file_type()` hints fall back to metadata
 //! - **Consistent snapshots**: File size captured at open time, not discovery time
 //! - **Deduplication**: Findings in chunk overlap regions are deduplicated
 //! - **Fail-soft**: I/O errors on individual files don't abort the scan
@@ -95,6 +96,84 @@ use crate::engine::Engine;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
+
+/// Minimal entry adapter so discovery classification can be unit-tested.
+///
+/// This keeps the DirWalker logic centralized while letting tests inject
+/// `file_type()`-missing cases without depending on platform-specific behavior.
+trait EntryLike {
+    fn file_type(&self) -> Option<std::fs::FileType>;
+    fn metadata(&self) -> io::Result<std::fs::Metadata>;
+    fn path(&self) -> &Path;
+    fn into_path(self) -> std::path::PathBuf
+    where
+        Self: Sized;
+}
+
+impl EntryLike for ignore::DirEntry {
+    #[inline(always)]
+    fn file_type(&self) -> Option<std::fs::FileType> {
+        ignore::DirEntry::file_type(self)
+    }
+
+    #[inline(always)]
+    fn metadata(&self) -> io::Result<std::fs::Metadata> {
+        ignore::DirEntry::metadata(self).map_err(io::Error::other)
+    }
+
+    #[inline(always)]
+    fn path(&self) -> &Path {
+        ignore::DirEntry::path(self)
+    }
+
+    #[inline(always)]
+    fn into_path(self) -> std::path::PathBuf {
+        ignore::DirEntry::into_path(self)
+    }
+}
+
+/// Classify a directory entry into a `LocalFile`, if eligible.
+///
+/// The algorithm uses `file_type()` as a fast hint when available, but must
+/// fall back to `metadata()` if the hint is missing. This prevents silent drops
+/// on platforms that do not supply file type in directory entries.
+///
+/// Returns `None` on:
+/// - Non-file entries
+/// - Metadata errors
+/// - Zero-length files
+/// - Files exceeding `max_file_size`
+#[inline(always)]
+fn local_file_from_entry<E: EntryLike>(entry: E, max_file_size: u64) -> Option<LocalFile> {
+    if let Some(ft) = entry.file_type() {
+        if !ft.is_file() {
+            return None;
+        }
+    }
+
+    let meta = match entry.metadata() {
+        Ok(meta) => meta,
+        Err(_e) => {
+            #[cfg(debug_assertions)]
+            eprintln!("[DirWalker] Metadata error for {:?}: {}", entry.path(), _e);
+            return None;
+        }
+    };
+
+    if !meta.file_type().is_file() {
+        return None;
+    }
+
+    let size = meta.len();
+    if size == 0 || size > max_file_size {
+        return None;
+    }
+
+    Some(LocalFile {
+        path: entry.into_path(),
+        size,
+    })
+}
 
 // ============================================================================
 // Configuration
@@ -309,31 +388,10 @@ impl DirWalker {
                 Box::new(move |result| {
                     match result {
                         Ok(entry) => {
-                            if let Some(ft) = entry.file_type() {
-                                if ft.is_file() {
-                                    match entry.metadata() {
-                                        Ok(meta) => {
-                                            let size = meta.len();
-                                            if size <= max_file_size && size > 0 {
-                                                let file = LocalFile {
-                                                    path: entry.into_path(),
-                                                    size,
-                                                };
-                                                // Stop walking if receiver dropped (scanner finished)
-                                                if sender.send(file).is_err() {
-                                                    return ignore::WalkState::Quit;
-                                                }
-                                            }
-                                        }
-                                        Err(_e) => {
-                                            #[cfg(debug_assertions)]
-                                            eprintln!(
-                                                "[DirWalker] Metadata error for {:?}: {}",
-                                                entry.path(),
-                                                _e
-                                            );
-                                        }
-                                    }
+                            if let Some(file) = local_file_from_entry(entry, max_file_size) {
+                                // Stop walking if receiver dropped (scanner finished)
+                                if sender.send(file).is_err() {
+                                    return ignore::WalkState::Quit;
                                 }
                             }
                         }
@@ -511,6 +569,28 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    struct StubEntry {
+        path: std::path::PathBuf,
+    }
+
+    impl EntryLike for StubEntry {
+        fn file_type(&self) -> Option<std::fs::FileType> {
+            None
+        }
+
+        fn metadata(&self) -> io::Result<std::fs::Metadata> {
+            fs::metadata(&self.path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+
+        fn into_path(self) -> std::path::PathBuf {
+            self.path
+        }
+    }
+
     fn test_tuning() -> Tuning {
         Tuning {
             merge_gap: 64,
@@ -595,6 +675,21 @@ mod tests {
 
         assert_eq!(report.stats.files_enqueued, 0);
         assert!(sink.take().is_empty());
+    }
+
+    #[test]
+    fn file_type_none_falls_back_to_metadata() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("unknown_type.txt");
+        fs::write(&file, "SECRETABCD1234").unwrap();
+
+        let entry = StubEntry { path: file.clone() };
+        let file_opt = local_file_from_entry(entry, small_config().max_file_size);
+
+        assert!(file_opt.is_some());
+        let local = file_opt.unwrap();
+        assert_eq!(local.path, file);
+        assert!(local.size > 0);
     }
 
     #[test]

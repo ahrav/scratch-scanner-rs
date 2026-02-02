@@ -13,3 +13,6 @@ mod scanner_random;
 
 #[cfg(feature = "sim-harness")]
 mod scanner_corpus;
+
+#[cfg(feature = "sim-harness")]
+mod scanner_discovery;

@@ -8,6 +8,7 @@
 //!
 //! Determinism:
 //! - File discovery order is lexicographic by raw path bytes.
+//! - Discovery honors type-hint metadata fallbacks for unknown file types.
 //! - Schedule decisions are driven by a seedable RNG in `SimExecutor`.
 //! - IO faults are keyed by path + read index and are schedule-independent.
 //! - Output ordering is emission order; a stability oracle compares sets.
@@ -33,7 +34,7 @@ use crate::api::STEP_ROOT;
 use crate::sim::clock::SimClock;
 use crate::sim::executor::{SimExecutor, SimTask, SimTaskId, SimTaskState, StepResult};
 use crate::sim::fault::{Corruption, FaultInjector, FaultPlan, IoFault, ReadFault};
-use crate::sim::fs::{SimFileHandle, SimFs, SimPath};
+use crate::sim::fs::{SimFileHandle, SimFs, SimFsSpec, SimNodeSpec, SimPath, SimTypeHint};
 use crate::sim_scanner::scenario::{RunConfig, Scenario, SecretRepr, SpanU32};
 use crate::{Engine, FileId, FindingRec, ScanScratch};
 
@@ -181,7 +182,7 @@ impl ScannerSimRunner {
         }
 
         let fs = SimFs::from_spec(&scenario.fs);
-        let files = sorted_file_paths(&fs);
+        let files = discover_file_paths(&fs, &scenario.fs);
         let total_bytes = total_file_bytes(&fs, &files);
         let fault_ops = estimate_fault_ops(fault_plan);
         let max_steps = resolve_max_steps(&self.cfg, files.len() as u64, total_bytes, fault_ops);
@@ -1033,9 +1034,31 @@ fn normalize_findings_for_diff(engine: &Engine, findings: &[FindingRec]) -> BTre
         .collect()
 }
 
-/// Return file paths in deterministic order.
-fn sorted_file_paths(fs: &SimFs) -> Vec<SimPath> {
-    let mut files = fs.file_paths();
+/// Discover file paths with type-hint fallback semantics.
+///
+/// This models DirWalker behavior: `Unknown` type hints must still attempt
+/// metadata (here, a simulated open) to avoid silent drops.
+fn discover_file_paths(fs: &SimFs, spec: &SimFsSpec) -> Vec<SimPath> {
+    let mut files = Vec::new();
+    for node in &spec.nodes {
+        let SimNodeSpec::File {
+            path, type_hint, ..
+        } = node
+        else {
+            continue;
+        };
+
+        let include = match type_hint {
+            SimTypeHint::File => true,
+            SimTypeHint::NotFile => false,
+            SimTypeHint::Unknown => fs.open_file(path).is_ok(),
+        };
+
+        if include {
+            files.push(path.clone());
+        }
+    }
+
     files.sort_by(|a, b| a.bytes.cmp(&b.bytes));
     files
 }
