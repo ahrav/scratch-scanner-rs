@@ -264,6 +264,11 @@ pub struct ScanScratch {
     /// different offsets across chunk boundaries. When mapping is unavailable,
     /// the decoded span is included to keep distinct matches separate.
     pub(super) seen_findings: FixedSet128,
+    /// Per-scan dedupe set used to detect duplicates within a single chunk scan.
+    ///
+    /// This resets every `scan_chunk_into` and lets us prefer more informative
+    /// findings within a scan while suppressing repeats across chunks.
+    pub(super) seen_findings_scan: FixedSet128,
     pub(super) total_decode_output_bytes: usize, // Global decode budget tracker.
     pub(super) work_items_enqueued: usize,       // Work queue budget tracker.
     /// Streaming decoded-byte ring buffer for window capture.
@@ -395,6 +400,7 @@ impl ScanScratch {
             slab: DecodeSlab::with_limit(engine.tuning.max_total_decode_output_bytes),
             seen: FixedSet128::with_pow2(seen_cap),
             seen_findings: FixedSet128::with_pow2(findings_cap),
+            seen_findings_scan: FixedSet128::with_pow2(findings_cap),
             total_decode_output_bytes: 0,
             work_items_enqueued: 0,
             decode_ring: ByteRing::with_capacity(engine.stream_ring_bytes),
@@ -471,6 +477,7 @@ impl ScanScratch {
         self.work_head = 0;
         self.slab.reset();
         self.seen.reset();
+        self.seen_findings_scan.reset();
         self.total_decode_output_bytes = 0;
         self.work_items_enqueued = 0;
         self.decode_ring.reset();
@@ -862,7 +869,7 @@ impl ScanScratch {
     }
 
     pub(super) fn push_finding(&mut self, rec: FindingRec) {
-        self.push_finding_with_drop_hint(rec, rec.root_hint_end, rec.step_id == STEP_ROOT);
+        self.push_finding_with_drop_hint(rec, rec.root_hint_end, rec.dedupe_with_span);
     }
 
     /// Records a finding with an explicit drop boundary, deduplicating against
@@ -900,6 +907,11 @@ impl ScanScratch {
     ///
     /// `include_span` controls whether `span_start`/`span_end` participate in
     /// the dedupe key (used when root-span mapping is unavailable).
+    ///
+    /// Dedupe is split into two layers:
+    /// - A per-file set (`seen_findings`) that suppresses cross-chunk repeats.
+    /// - A per-scan set (`seen_findings_scan`) that enables within-scan replacement
+    ///   (e.g., prefer transform findings) without re-emitting earlier chunks.
     #[inline(always)]
     pub(super) fn push_finding_with_drop_hint(
         &mut self,
@@ -946,7 +958,14 @@ impl ScanScratch {
         key_bytes[16..24].copy_from_slice(&rec.root_hint_start.to_le_bytes());
         key_bytes[24..32].copy_from_slice(&normalized_root_hint_end.to_le_bytes());
 
-        let is_new = self.seen_findings.insert(hash128(&key_bytes));
+        let hash = hash128(&key_bytes);
+        let seen_in_scan = !self.seen_findings_scan.insert(hash);
+        let is_new = self.seen_findings.insert(hash);
+
+        if !is_new && !seen_in_scan {
+            // Seen in a prior scan/chunk; suppress to avoid cross-chunk duplicates.
+            return;
+        }
 
         if !is_new {
             // Duplicate key detected. Prefer findings with more information:

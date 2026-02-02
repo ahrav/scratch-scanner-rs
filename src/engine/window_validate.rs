@@ -238,6 +238,7 @@ impl Engine {
                             span_end: span_in_buf.end as u32,
                             root_hint_start: base_offset + root_span_hint.start as u64,
                             root_hint_end: base_offset + root_span_hint.end as u64,
+                            dedupe_with_span: include_span,
                             step_id,
                         },
                         drop_hint_end,
@@ -442,6 +443,7 @@ impl Engine {
                     span_end: secret_end as u32,
                     root_hint_start: base_offset + root_span_hint.start as u64,
                     root_hint_end: base_offset + root_span_hint.end as u64,
+                    dedupe_with_span: include_span,
                     step_id: utf16_step_id,
                 },
                 drop_hint_end,
@@ -563,6 +565,11 @@ impl Engine {
                     }
                 }
                 let drop_hint_end = base_offset + drop_hint_end as u64;
+                // Include span in dedupe key for root findings (stable offsets) or when
+                // root-span mapping is unavailable (nested transforms with length-changing
+                // parents). For mapped transforms, decoded spans can shift with chunk
+                // alignment, so dedupe uses only the root hint window.
+                let dedupe_with_span = step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
 
                 out.push(FindingRec {
                     file_id,
@@ -571,6 +578,7 @@ impl Engine {
                     span_end: span_in_buf.end as u32,
                     root_hint_start: base_offset + root_span_hint.start as u64,
                     root_hint_end: base_offset + root_span_hint.end as u64,
+                    dedupe_with_span,
                     step_id,
                 });
                 scratch.tmp_drop_hint_end.push(drop_hint_end);
@@ -751,6 +759,10 @@ impl Engine {
                     }
                 }
                 let drop_hint_end = base_offset + drop_hint_end as u64;
+                // Include span in dedupe key for root findings or when root-span mapping
+                // is unavailable. See run_rule_on_raw_window_into for full rationale.
+                let dedupe_with_span =
+                    utf16_step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
                 out.push(FindingRec {
                     file_id,
                     rule_id,
@@ -758,6 +770,7 @@ impl Engine {
                     span_end: secret_end as u32,
                     root_hint_start: base_offset + root_span_hint.start as u64,
                     root_hint_end: base_offset + root_span_hint.end as u64,
+                    dedupe_with_span,
                     step_id: utf16_step_id,
                 });
                 scratch.tmp_drop_hint_end.push(drop_hint_end);
