@@ -159,11 +159,11 @@ pub trait FileSource: Send + 'static {
 ```rust
 pub struct LocalFile {
     pub path: PathBuf,
-    pub size: u64,  // Discovery hint (not used for actual processing)
+    pub size: u64,  // Discovery hint (may be 0 if metadata was skipped)
 }
 ```
 
-The `size` is a discovery hint for memory budgeting. The actual file size is re-read at open time for snapshot semantics.
+The `size` is a discovery hint for memory budgeting and stats. The actual file size is re-read at open time for snapshot semantics and size-cap enforcement.
 
 ### VecFileSource
 

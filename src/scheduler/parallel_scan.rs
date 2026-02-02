@@ -64,7 +64,7 @@
 //! - **Directory walking**: Recursive traversal with symlink control
 //! - **Gitignore support**: Respects `.gitignore`, `.git/info/exclude`, global gitignore
 //! - **Hidden file filtering**: Optionally skip dotfiles and dot-directories
-//! - **Size filtering**: Skip files above `max_file_size` (discovery + open-time check)
+//! - **Size filtering**: Enforced at open time; discovery avoids per-file metadata
 //! - **Parallel scanning**: Work-stealing scheduler with chunked I/O
 //! - **Overlap handling**: Automatic chunk overlap for boundary-crossing secrets
 //!
@@ -138,17 +138,22 @@ impl EntryLike for ignore::DirEntry {
 /// fall back to `metadata()` if the hint is missing. This prevents silent drops
 /// on platforms that do not supply file type in directory entries.
 ///
+/// Discovery avoids per-file metadata when a type hint is available. Size caps
+/// are enforced at open time in `local.rs`.
+///
 /// Returns `None` on:
 /// - Non-file entries
-/// - Metadata errors
-/// - Zero-length files
-/// - Files exceeding `max_file_size`
+/// - Metadata errors when the type hint is missing
 #[inline(always)]
-fn local_file_from_entry<E: EntryLike>(entry: E, max_file_size: u64) -> Option<LocalFile> {
+fn local_file_from_entry<E: EntryLike>(entry: E) -> Option<LocalFile> {
     if let Some(ft) = entry.file_type() {
         if !ft.is_file() {
             return None;
         }
+        return Some(LocalFile {
+            path: entry.into_path(),
+            size: 0,
+        });
     }
 
     let meta = match entry.metadata() {
@@ -164,14 +169,9 @@ fn local_file_from_entry<E: EntryLike>(entry: E, max_file_size: u64) -> Option<L
         return None;
     }
 
-    let size = meta.len();
-    if size == 0 || size > max_file_size {
-        return None;
-    }
-
     Some(LocalFile {
         path: entry.into_path(),
-        size,
+        size: meta.len(),
     })
 }
 
@@ -381,8 +381,6 @@ impl DirWalker {
         let walker = builder.build_parallel();
 
         let (sender, receiver) = crossbeam_channel::bounded(config.max_in_flight_objects);
-        let max_file_size = config.max_file_size;
-
         // Spawn walker thread
         std::thread::spawn(move || {
             walker.run(|| {
@@ -390,7 +388,7 @@ impl DirWalker {
                 Box::new(move |result| {
                     match result {
                         Ok(entry) => {
-                            if let Some(file) = local_file_from_entry(entry, max_file_size) {
+                            if let Some(file) = local_file_from_entry(entry) {
                                 // Stop walking if receiver dropped (scanner finished)
                                 if sender.send(file).is_err() {
                                     return ignore::WalkState::Quit;
@@ -543,12 +541,7 @@ fn scan_single_file(
     let meta = std::fs::metadata(path)?;
     let size = meta.len();
 
-    // Filter by size (same as DirWalker does)
-    if size > config.max_file_size || size == 0 {
-        // File filtered out - return empty report
-        return Ok(LocalReport::default());
-    }
-
+    // Size is only a discovery hint here; open-time enforcement happens in local.rs.
     let file = LocalFile {
         path: path.to_path_buf(),
         size,
@@ -686,7 +679,7 @@ mod tests {
         fs::write(&file, "SECRETABCD1234").unwrap();
 
         let entry = StubEntry { path: file.clone() };
-        let file_opt = local_file_from_entry(entry, small_config().max_file_size);
+        let file_opt = local_file_from_entry(entry);
 
         assert!(file_opt.is_some());
         let local = file_opt.unwrap();
@@ -716,8 +709,9 @@ mod tests {
 
         let report = parallel_scan_dir(dir.path(), engine, config, sink.clone()).unwrap();
 
-        // Only the small file should be scanned
-        assert_eq!(report.stats.files_enqueued, 1);
+        // Discovery enqueues both; open-time enforcement skips the large file.
+        assert_eq!(report.stats.files_enqueued, 2);
+        assert!(report.metrics.bytes_scanned < large_content.len() as u64);
     }
 
     #[test]
@@ -836,8 +830,10 @@ mod tests {
 
         assert!(result.is_ok());
         let report = result.unwrap();
-        // File is too large, should be skipped
-        assert_eq!(report.stats.files_enqueued, 0);
+        // File is too large, should be skipped at open time.
+        assert_eq!(report.stats.files_enqueued, 1);
+        assert_eq!(report.metrics.bytes_scanned, 0);
+        assert!(sink.take().is_empty());
     }
 
     #[test]
@@ -856,7 +852,9 @@ mod tests {
 
         assert!(result.is_ok());
         let report = result.unwrap();
-        // Empty file should be skipped
-        assert_eq!(report.stats.files_enqueued, 0);
+        // Empty file should be skipped at open time.
+        assert_eq!(report.stats.files_enqueued, 1);
+        assert_eq!(report.metrics.bytes_scanned, 0);
+        assert!(sink.take().is_empty());
     }
 }

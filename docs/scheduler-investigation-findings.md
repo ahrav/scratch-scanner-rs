@@ -73,12 +73,12 @@ Impact: Unnecessary syscall per file in the hot path, especially visible for tin
 
 Work units:
 
-- [ ] Validate the reasoning with a quick syscall profile on a representative repo. Confirm that discovery-time `stat` is a significant portion of per-file syscalls.
+- [ ] Validate the reasoning with a quick syscall profile on a representative repo. Confirm that discovery-time `stat` is a significant portion of per-file syscalls. (Blocked on macOS without root; run via `strace -f -c`/`perf stat` on Linux or `sudo dtruss -c` on macOS.)
 - [ ] If the reasoning does not hold for current workloads, document the exception and defer the change.
 - [ ] Draft an evidence-backed plan for measurement. Include: workload selection, metrics, and expected syscall deltas. Use the benchmark guidance in `docs/throughput_investigation.md` as a template.
-- [ ] Implement the change by removing discovery-time size metadata and relying on open-time enforcement only, or gate it behind a policy knob that defaults to open-time enforcement.
+- [x] Implement the change by removing discovery-time size metadata and relying on open-time enforcement only, or gate it behind a policy knob that defaults to open-time enforcement.
 - [ ] Measure and record: `newfstatat/statx` count deltas, total wall time, and bytes scanned per second. Confirm no regressions in correctness.
-- [ ] Run doc-rigor on code files changed for this task and update docs/comments as needed.
+- [x] Run doc-rigor on code files changed for this task and update docs/comments as needed.
 
 ### Perf: Batch External Task Injection During Discovery
 

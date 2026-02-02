@@ -192,7 +192,10 @@ impl LocalConfig {
 pub struct LocalFile {
     /// Path to the file.
     pub path: PathBuf,
-    /// File size in bytes.
+    /// File size hint in bytes.
+    ///
+    /// Discovery may skip per-file metadata for performance, so this can be 0.
+    /// Open-time metadata determines the actual size and enforcement.
     pub size: u64,
 }
 
@@ -247,6 +250,8 @@ struct FileTask {
     path: PathBuf,
     /// File size hint from discovery (not used in processing).
     ///
+    /// May be 0 if discovery skipped metadata for performance.
+    ///
     /// Processing uses `file.metadata().len()` for snapshot-at-open semantics.
     /// Kept for logging/debugging the discovery phase.
     #[allow(dead_code)]
@@ -286,7 +291,10 @@ struct LocalScratch<E: ScanEngine> {
 pub struct LocalStats {
     /// Files discovered and enqueued.
     pub files_enqueued: u64,
-    /// Total bytes across all enqueued files.
+    /// Total bytes across all enqueued files (hint-based).
+    ///
+    /// If discovery skipped metadata, this may undercount and should not be
+    /// treated as authoritative for throughput calculations.
     pub bytes_enqueued: u64,
     /// Files that failed to process due to I/O errors.
     ///
