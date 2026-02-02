@@ -3,11 +3,13 @@
 //! Scope:
 //! - Deterministic, single-threaded scheduling of discover + scan tasks.
 //! - Chunked scanning with overlap deduplication using the real `Engine`.
-//! - No fault injection, timeouts, or IO latency (those are layered on later).
+//! - Fault injection, IO latency, and cancellations are modeled deterministically
+//!   via a simulated clock and an IO event queue.
 //!
 //! Determinism:
 //! - File discovery order is lexicographic by raw path bytes.
 //! - Schedule decisions are driven by a seedable RNG in `SimExecutor`.
+//! - IO faults are keyed by path + read index and are schedule-independent.
 //! - Output ordering is emission order; a stability oracle compares sets.
 //!
 //! Oracles implemented here:
@@ -15,8 +17,10 @@
 //! - Monotonic progress: chunk offsets and prefix boundaries never move backward.
 //! - Overlap dedupe: no finding may be entirely contained in the overlap prefix.
 //! - Duplicate suppression: emitted findings are unique under a normalized key.
-//! - Ground-truth: expected secrets are found, and no unexpected findings appear.
-//! - Differential: chunked results match a single-chunk reference scan.
+//! - Ground-truth: expected secrets are found (for fully observed files),
+//!   and no unexpected findings appear.
+//! - Differential: chunked results match a single-chunk scan over the observed
+//!   byte stream (post-faults).
 //! - Stability: repeated runs with different schedule seeds yield the same set.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -24,8 +28,10 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use serde::{Deserialize, Serialize};
 
+use crate::sim::clock::SimClock;
 use crate::sim::executor::{SimExecutor, SimTask, SimTaskId, SimTaskState, StepResult};
-use crate::sim::fs::{SimFs, SimPath};
+use crate::sim::fault::{Corruption, FaultInjector, FaultPlan, IoFault, ReadFault};
+use crate::sim::fs::{SimFileHandle, SimFs, SimPath};
 use crate::sim_scanner::scenario::{RunConfig, Scenario, SecretRepr, SpanU32};
 use crate::{Engine, FileId, FindingRec, ScanScratch};
 
@@ -81,12 +87,12 @@ impl ScannerSimRunner {
         Self { cfg, schedule_seed }
     }
 
-    /// Execute a single scenario under the current schedule seed.
+    /// Execute a single scenario under the current schedule seed and fault plan.
     ///
     /// If `cfg.stability_runs > 1`, replays the same scenario under additional
     /// schedule seeds and compares the normalized finding sets.
-    pub fn run(&self, scenario: &Scenario, engine: &Engine) -> RunOutcome {
-        let base = match self.run_once_catch(scenario, engine, self.schedule_seed) {
+    pub fn run(&self, scenario: &Scenario, engine: &Engine, fault_plan: &FaultPlan) -> RunOutcome {
+        let base = match self.run_once_catch(scenario, engine, fault_plan, self.schedule_seed) {
             RunOutcome::Ok { findings } => findings,
             fail => return fail,
         };
@@ -98,7 +104,7 @@ impl ScannerSimRunner {
         let baseline = normalize_findings(&base);
         for i in 1..self.cfg.stability_runs {
             let seed = self.schedule_seed.wrapping_add(i as u64);
-            match self.run_once_catch(scenario, engine, seed) {
+            match self.run_once_catch(scenario, engine, fault_plan, seed) {
                 RunOutcome::Ok { findings } => {
                     let candidate = normalize_findings(&findings);
                     if candidate != baseline {
@@ -120,8 +126,16 @@ impl ScannerSimRunner {
     }
 
     // Wrap a single run to convert panics into a structured failure.
-    fn run_once_catch(&self, scenario: &Scenario, engine: &Engine, seed: u64) -> RunOutcome {
-        let res = catch_unwind(AssertUnwindSafe(|| self.run_once(scenario, engine, seed)));
+    fn run_once_catch(
+        &self,
+        scenario: &Scenario,
+        engine: &Engine,
+        fault_plan: &FaultPlan,
+        seed: u64,
+    ) -> RunOutcome {
+        let res = catch_unwind(AssertUnwindSafe(|| {
+            self.run_once(scenario, engine, fault_plan, seed)
+        }));
         match res {
             Ok(outcome) => outcome,
             Err(payload) => RunOutcome::Failed(FailureReport {
@@ -133,7 +147,13 @@ impl ScannerSimRunner {
     }
 
     /// Execute a single schedule with no stability replay.
-    fn run_once(&self, scenario: &Scenario, engine: &Engine, seed: u64) -> RunOutcome {
+    fn run_once(
+        &self,
+        scenario: &Scenario,
+        engine: &Engine,
+        fault_plan: &FaultPlan,
+        seed: u64,
+    ) -> RunOutcome {
         if self.cfg.workers == 0 {
             return self.fail(
                 FailureKind::InvariantViolation { code: 1 },
@@ -161,11 +181,15 @@ impl ScannerSimRunner {
         let fs = SimFs::from_spec(&scenario.fs);
         let files = sorted_file_paths(&fs);
         let total_bytes = total_file_bytes(&fs, &files);
-        let max_steps = resolve_max_steps(&self.cfg, files.len() as u64, total_bytes);
+        let fault_ops = estimate_fault_ops(fault_plan);
+        let max_steps = resolve_max_steps(&self.cfg, files.len() as u64, total_bytes, fault_ops);
 
         let mut executor = SimExecutor::new(self.cfg.workers, seed);
         let mut tasks: Vec<ScannerTask> = Vec::new();
         let mut output = OutputCollector::new();
+        let mut clock = SimClock::new();
+        let mut faults = FaultInjector::new(fault_plan.clone());
+        let mut io_waiters: BTreeMap<u64, Vec<SimTaskId>> = BTreeMap::new();
 
         let discover = DiscoverState::new(files.clone());
         let discover_id = executor.spawn_external(SimTask {
@@ -174,19 +198,35 @@ impl ScannerSimRunner {
         insert_task(&mut tasks, discover_id, ScannerTask::Discover(discover));
 
         for step in 0..max_steps {
+            deliver_due_io(&mut executor, &mut io_waiters, clock.now_ticks());
+
             if !executor.has_queued_tasks() {
                 if all_tasks_completed(&executor, &tasks) {
                     let findings = output.finish();
+                    let summaries = take_file_summaries(&mut tasks);
                     if let Err(fail) =
-                        self.run_oracles(scenario, engine, &fs, &files, &findings, step)
+                        self.run_oracles(scenario, engine, &files, &findings, &summaries, step)
                     {
                         return RunOutcome::Failed(fail);
                     }
                     return RunOutcome::Ok { findings };
                 }
+                if let Some(next_tick) = next_io_tick(&io_waiters) {
+                    clock.advance_to(next_tick);
+                    deliver_due_io(&mut executor, &mut io_waiters, clock.now_ticks());
+                } else {
+                    return self.fail(
+                        FailureKind::Hang,
+                        "no runnable tasks but incomplete work",
+                        step,
+                    );
+                }
+            }
+
+            if !executor.has_queued_tasks() {
                 return self.fail(
                     FailureKind::Hang,
-                    "no runnable tasks but incomplete work",
+                    "no runnable tasks after advancing time",
                     step,
                 );
             }
@@ -216,21 +256,31 @@ impl ScannerSimRunner {
                         files_to_spawn = Some(std::mem::take(&mut state.files));
                     }
                     ScannerTask::FileScan(state) => {
-                        let done = match state.scan_next_chunk(
+                        let outcome = match state.step(
                             engine,
+                            &fs,
+                            &mut faults,
                             overlap,
                             self.cfg.chunk_size as usize,
                             &mut output,
                             step,
+                            clock.now_ticks(),
                         ) {
-                            Ok(done) => done,
+                            Ok(outcome) => outcome,
                             Err(fail) => return RunOutcome::Failed(fail),
                         };
-                        if done {
-                            executor.mark_completed(task_id);
-                        } else {
-                            executor.mark_runnable(task_id);
-                            executor.enqueue_local(worker, task_id);
+                        match outcome {
+                            FileStepOutcome::Done => {
+                                executor.mark_completed(task_id);
+                            }
+                            FileStepOutcome::Reschedule => {
+                                executor.mark_runnable(task_id);
+                                executor.enqueue_local(worker, task_id);
+                            }
+                            FileStepOutcome::Blocked { ready_at } => {
+                                executor.mark_blocked(task_id);
+                                io_waiters.entry(ready_at).or_default().push(task_id);
+                            }
                         }
                     }
                 }
@@ -246,17 +296,7 @@ impl ScannerSimRunner {
                 // Spawn file scan tasks deterministically in discovered order.
                 for (idx, path) in files.iter().enumerate() {
                     let file_id = FileId(idx as u32);
-                    let state =
-                        match FileScanState::new(&fs, path.clone(), file_id, engine, overlap) {
-                            Ok(state) => state,
-                            Err(msg) => {
-                                return RunOutcome::Failed(FailureReport {
-                                    kind: FailureKind::InvariantViolation { code: 10 },
-                                    message: msg,
-                                    step,
-                                })
-                            }
-                        };
+                    let state = FileScanState::new(path.clone(), file_id, engine, overlap);
 
                     let spawned_id = executor.spawn_local(
                         worker,
@@ -291,13 +331,13 @@ impl ScannerSimRunner {
         &self,
         scenario: &Scenario,
         engine: &Engine,
-        fs: &SimFs,
         files: &[SimPath],
         findings: &[FindingRec],
+        summaries: &[FileSummary],
         step: u64,
     ) -> Result<(), FailureReport> {
-        oracle_ground_truth(scenario, files, findings, step)?;
-        oracle_differential(engine, fs, files, findings, step)?;
+        oracle_ground_truth(scenario, files, findings, summaries, step)?;
+        oracle_differential(engine, findings, summaries, step)?;
         Ok(())
     }
 }
@@ -376,6 +416,35 @@ enum ScannerTask {
     FileScan(Box<FileScanState>),
 }
 
+/// Summary of the bytes observed for a file during simulation.
+///
+/// `ground_truth_ok` is false if any data-affecting fault (error/cancel/corrupt)
+/// occurred, which causes ground-truth checks to skip this file.
+#[derive(Clone, Debug)]
+struct FileSummary {
+    file_id: FileId,
+    observed: Vec<u8>,
+    ground_truth_ok: bool,
+}
+
+/// Result of executing one file-task quantum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileStepOutcome {
+    Done,
+    Reschedule,
+    Blocked { ready_at: u64 },
+}
+
+/// Pending IO read submitted with latency.
+#[derive(Clone, Debug)]
+struct PendingRead {
+    fault: ReadFault,
+    requested: usize,
+    offset: u64,
+    ready_at: u64,
+    cancel_after: bool,
+}
+
 /// Discover task state (pre-sorted file list).
 struct DiscoverState {
     files: Vec<SimPath>,
@@ -390,15 +459,25 @@ impl DiscoverState {
 
 /// Per-file scanning state for deterministic chunked scans.
 ///
+/// The task advances through open → read → scan. Reads may block on simulated
+/// latency; a pending read stores the submission offset so we can assert no
+/// cursor movement occurred while blocked.
+///
 /// Invariants:
-/// - `offset` is the next payload byte index in `buf`.
+/// - `handle.cursor` is the next payload byte offset in the file.
 /// - `tail_len <= overlap` and `tail` stores the last `overlap` bytes of the
 ///   previous chunk buffer.
+/// - `tail_len as u64 <= handle.cursor` whenever a handle is open.
 struct FileScanState {
     file_id: FileId,
     path: SimPath,
-    buf: Vec<u8>,
-    offset: usize,
+    handle: Option<SimFileHandle>,
+    open_fault: Option<IoFault>,
+    open_fault_used: bool,
+    pending: Option<PendingRead>,
+    reads_done: u32,
+    observed: Vec<u8>,
+    ground_truth_ok: bool,
     tail: Vec<u8>,
     tail_len: usize,
     scratch: ScanScratch,
@@ -406,91 +485,295 @@ struct FileScanState {
 }
 
 impl FileScanState {
-    /// Load the entire file into memory for deterministic chunking.
-    fn new(
-        fs: &SimFs,
-        path: SimPath,
-        file_id: FileId,
-        engine: &Engine,
-        overlap: usize,
-    ) -> Result<Self, String> {
-        let handle = fs
-            .open_file(&path)
-            .map_err(|e| format!("open {:?}: {e}", path.bytes))?;
-        let len =
-            usize::try_from(handle.len).map_err(|_| format!("file too large: {:?}", path.bytes))?;
-        let data = fs
-            .read_at(&handle, 0, len)
-            .map_err(|e| format!("read {:?}: {e}", path.bytes))?;
-
-        Ok(Self {
+    /// Initialize per-file scan state without touching IO.
+    fn new(path: SimPath, file_id: FileId, engine: &Engine, overlap: usize) -> Self {
+        Self {
             file_id,
             path,
-            buf: data.to_vec(),
-            offset: 0,
+            handle: None,
+            open_fault: None,
+            open_fault_used: false,
+            pending: None,
+            reads_done: 0,
+            observed: Vec::new(),
+            ground_truth_ok: true,
             tail: vec![0u8; overlap],
             tail_len: 0,
             scratch: engine.new_scratch(),
             batch: Vec::with_capacity(engine.tuning.max_findings_per_chunk),
-        })
+        }
     }
 
-    /// Scan the next chunk and advance the cursor.
-    ///
-    /// Returns `Ok(true)` when the file is fully processed.
-    fn scan_next_chunk(
+    /// Execute one simulation quantum for this file.
+    #[allow(clippy::too_many_arguments)]
+    fn step(
         &mut self,
         engine: &Engine,
+        fs: &SimFs,
+        faults: &mut FaultInjector,
         overlap: usize,
         chunk_size: usize,
         output: &mut OutputCollector,
         step: u64,
-    ) -> Result<bool, FailureReport> {
-        if self.offset > self.buf.len() {
+        now: u64,
+    ) -> Result<FileStepOutcome, FailureReport> {
+        if chunk_size == 0 {
             return Err(FailureReport {
                 kind: FailureKind::InvariantViolation { code: 11 },
-                message: "offset exceeds file length".to_string(),
+                message: "chunk_size must be > 0".to_string(),
                 step,
             });
         }
-        if self.offset >= self.buf.len() {
-            return Ok(true);
+
+        if self.handle.is_none() {
+            if self.open_fault.is_none() {
+                // Latch the open fault once per file to keep retries deterministic.
+                self.open_fault = faults.on_open(&self.path.bytes);
+            }
+            if let Some(fault) = self.open_fault.clone() {
+                match fault {
+                    IoFault::ErrKind { .. } => {
+                        self.ground_truth_ok = false;
+                        return Ok(FileStepOutcome::Done);
+                    }
+                    IoFault::EIntrOnce => {
+                        if !self.open_fault_used {
+                            self.open_fault_used = true;
+                            return Ok(FileStepOutcome::Reschedule);
+                        }
+                    }
+                    IoFault::PartialRead { .. } => {}
+                }
+            }
+
+            let handle = fs.open_file(&self.path).map_err(|e| FailureReport {
+                kind: FailureKind::InvariantViolation { code: 12 },
+                message: format!("open {:?}: {e}", self.path.bytes),
+                step,
+            })?;
+            if handle.len > usize::MAX as u64 {
+                return Err(FailureReport {
+                    kind: FailureKind::InvariantViolation { code: 13 },
+                    message: format!("file too large: {:?}", self.path.bytes),
+                    step,
+                });
+            }
+            self.handle = Some(handle);
         }
+
+        let Some(handle) = self.handle.as_mut() else {
+            return Err(FailureReport {
+                kind: FailureKind::InvariantViolation { code: 14 },
+                message: "missing file handle".to_string(),
+                step,
+            });
+        };
+
+        if let Some(pending) = self.pending.take() {
+            if pending.ready_at > now {
+                self.pending = Some(pending);
+                return Err(FailureReport {
+                    kind: FailureKind::InvariantViolation { code: 15 },
+                    message: "io completion before ready".to_string(),
+                    step,
+                });
+            }
+            if pending.offset != handle.cursor {
+                return Err(FailureReport {
+                    kind: FailureKind::InvariantViolation { code: 16 },
+                    message: "io completion offset mismatch".to_string(),
+                    step,
+                });
+            }
+            // Complete the previously submitted read now that its latency elapsed.
+            return self.complete_read(
+                engine,
+                fs,
+                overlap,
+                output,
+                step,
+                pending.fault,
+                pending.requested,
+                pending.cancel_after,
+            );
+        }
+
+        let remaining = handle.len.saturating_sub(handle.cursor);
+        if remaining == 0 {
+            return Ok(FileStepOutcome::Done);
+        }
+        let requested = chunk_size.min(remaining as usize);
+        let fault = faults.on_read(&self.path.bytes);
+        self.reads_done = self.reads_done.saturating_add(1);
+        // Latch cancellation at submission time for schedule-independent behavior.
+        let cancel_after = faults.should_cancel(&self.path.bytes, self.reads_done);
+
+        if fault.latency_ticks > 0 {
+            let ready_at = now.saturating_add(fault.latency_ticks);
+            self.pending = Some(PendingRead {
+                fault,
+                requested,
+                offset: handle.cursor,
+                ready_at,
+                cancel_after,
+            });
+            return Ok(FileStepOutcome::Blocked { ready_at });
+        }
+
+        self.complete_read(
+            engine,
+            fs,
+            overlap,
+            output,
+            step,
+            fault,
+            requested,
+            cancel_after,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn complete_read(
+        &mut self,
+        engine: &Engine,
+        fs: &SimFs,
+        overlap: usize,
+        output: &mut OutputCollector,
+        step: u64,
+        fault: ReadFault,
+        requested: usize,
+        cancel_after: bool,
+    ) -> Result<FileStepOutcome, FailureReport> {
+        let Some(handle) = self.handle.as_mut() else {
+            return Err(FailureReport {
+                kind: FailureKind::InvariantViolation { code: 17 },
+                message: "missing file handle".to_string(),
+                step,
+            });
+        };
+
         if self.tail_len > overlap {
             return Err(FailureReport {
-                kind: FailureKind::InvariantViolation { code: 12 },
+                kind: FailureKind::InvariantViolation { code: 18 },
                 message: "tail_len exceeds overlap".to_string(),
                 step,
             });
         }
-        if self.tail_len > self.offset {
+        if (self.tail_len as u64) > handle.cursor {
             return Err(FailureReport {
-                kind: FailureKind::InvariantViolation { code: 13 },
+                kind: FailureKind::InvariantViolation { code: 19 },
                 message: "tail_len exceeds offset".to_string(),
                 step,
             });
         }
 
-        let remaining = self.buf.len() - self.offset;
-        let payload_len = chunk_size.min(remaining);
-        if payload_len == 0 {
+        let ReadFault {
+            fault: io_fault,
+            corruption,
+            ..
+        } = fault;
+
+        match io_fault {
+            Some(IoFault::ErrKind { .. }) => {
+                self.ground_truth_ok = false;
+                Ok(FileStepOutcome::Done)
+            }
+            Some(IoFault::EIntrOnce) => {
+                if cancel_after && handle.cursor < handle.len {
+                    self.ground_truth_ok = false;
+                    return Ok(FileStepOutcome::Done);
+                }
+                Ok(FileStepOutcome::Reschedule)
+            }
+            Some(IoFault::PartialRead { max_len }) => {
+                let capped = (max_len as usize).min(requested);
+                self.read_and_scan(
+                    engine,
+                    fs,
+                    overlap,
+                    output,
+                    step,
+                    capped,
+                    corruption,
+                    cancel_after,
+                )
+            }
+            None => self.read_and_scan(
+                engine,
+                fs,
+                overlap,
+                output,
+                step,
+                requested,
+                corruption,
+                cancel_after,
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_and_scan(
+        &mut self,
+        engine: &Engine,
+        fs: &SimFs,
+        overlap: usize,
+        output: &mut OutputCollector,
+        step: u64,
+        requested: usize,
+        corruption: Option<Corruption>,
+        cancel_after: bool,
+    ) -> Result<FileStepOutcome, FailureReport> {
+        let Some(handle) = self.handle.as_mut() else {
             return Err(FailureReport {
-                kind: FailureKind::InvariantViolation { code: 14 },
-                message: "zero-length payload".to_string(),
+                kind: FailureKind::InvariantViolation { code: 20 },
+                message: "missing file handle".to_string(),
                 step,
             });
+        };
+
+        if requested == 0 {
+            if handle.cursor < handle.len {
+                self.ground_truth_ok = false;
+            }
+            return Ok(FileStepOutcome::Done);
         }
-        let payload = &self.buf[self.offset..self.offset + payload_len];
 
-        let mut chunk = Vec::with_capacity(self.tail_len + payload.len());
+        let read_offset = handle.cursor;
+        let data = fs
+            .read_at(handle, read_offset, requested)
+            .map_err(|e| FailureReport {
+                kind: FailureKind::InvariantViolation { code: 21 },
+                message: format!("read {:?}: {e}", self.path.bytes),
+                step,
+            })?;
+        let mut payload = data.to_vec();
+        if let Some(c) = corruption {
+            apply_corruption(&mut payload, &c);
+            self.ground_truth_ok = false;
+        }
+
+        let payload_len = payload.len();
+        handle.cursor = handle.cursor.saturating_add(payload_len as u64);
+
+        if payload_len == 0 {
+            if handle.cursor < handle.len {
+                self.ground_truth_ok = false;
+            }
+            return Ok(FileStepOutcome::Done);
+        }
+
+        // Track the exact byte stream presented to the engine.
+        self.observed.extend_from_slice(&payload);
+
+        let mut chunk = Vec::with_capacity(self.tail_len + payload_len);
         chunk.extend_from_slice(&self.tail[..self.tail_len]);
-        chunk.extend_from_slice(payload);
+        chunk.extend_from_slice(&payload);
 
-        let base_offset = self.offset.saturating_sub(self.tail_len) as u64;
-        let new_bytes_start = self.offset as u64;
+        let base_offset = read_offset.saturating_sub(self.tail_len as u64);
+        let new_bytes_start = read_offset;
         if base_offset.saturating_add(self.tail_len as u64) != new_bytes_start {
             return Err(FailureReport {
-                kind: FailureKind::InvariantViolation { code: 15 },
+                kind: FailureKind::InvariantViolation { code: 22 },
                 message: "prefix boundary mismatch".to_string(),
                 step,
             });
@@ -501,7 +784,7 @@ impl FileScanState {
         for rec in self.scratch.findings() {
             if rec.root_hint_end <= new_bytes_start {
                 return Err(FailureReport {
-                    kind: FailureKind::InvariantViolation { code: 16 },
+                    kind: FailureKind::InvariantViolation { code: 23 },
                     message: "prefix dedupe failed".to_string(),
                     step,
                 });
@@ -516,25 +799,26 @@ impl FileScanState {
             self.tail[..keep].copy_from_slice(&chunk[total_len - keep..]);
         }
         self.tail_len = keep;
-        let prev_offset = self.offset;
-        self.offset = self.offset.saturating_add(payload_len);
-        if self.offset <= prev_offset {
-            return Err(FailureReport {
-                kind: FailureKind::InvariantViolation { code: 17 },
-                message: "offset did not advance".to_string(),
-                step,
-            });
-        }
+
         let expected_next = base_offset.saturating_add(chunk.len() as u64);
-        if expected_next != self.offset as u64 {
+        if expected_next != handle.cursor {
             return Err(FailureReport {
-                kind: FailureKind::InvariantViolation { code: 18 },
+                kind: FailureKind::InvariantViolation { code: 24 },
                 message: "base_offset + chunk_len mismatch".to_string(),
                 step,
             });
         }
 
-        Ok(self.offset >= self.buf.len())
+        if cancel_after && handle.cursor < handle.len {
+            self.ground_truth_ok = false;
+            return Ok(FileStepOutcome::Done);
+        }
+
+        if handle.cursor < handle.len {
+            Ok(FileStepOutcome::Reschedule)
+        } else {
+            Ok(FileStepOutcome::Done)
+        }
     }
 }
 
@@ -553,6 +837,86 @@ fn all_tasks_completed(executor: &SimExecutor, tasks: &[ScannerTask]) -> bool {
         .iter()
         .enumerate()
         .all(|(idx, _)| executor.state(SimTaskId::from_u32(idx as u32)) == SimTaskState::Completed)
+}
+
+fn take_file_summaries(tasks: &mut [ScannerTask]) -> Vec<FileSummary> {
+    let mut summaries = Vec::new();
+    for task in tasks {
+        if let ScannerTask::FileScan(state) = task {
+            summaries.push(FileSummary {
+                file_id: state.file_id,
+                observed: std::mem::take(&mut state.observed),
+                ground_truth_ok: state.ground_truth_ok,
+            });
+        }
+    }
+    summaries.sort_by_key(|s| s.file_id.0);
+    summaries
+}
+
+fn deliver_due_io(
+    executor: &mut SimExecutor,
+    io_waiters: &mut BTreeMap<u64, Vec<SimTaskId>>,
+    now: u64,
+) {
+    let due: Vec<u64> = io_waiters.range(..=now).map(|(k, _)| *k).collect();
+    for key in due {
+        if let Some(mut tasks) = io_waiters.remove(&key) {
+            tasks.sort_by_key(|t| t.index());
+            for task_id in tasks {
+                if executor.state(task_id) == SimTaskState::Blocked {
+                    executor.mark_runnable(task_id);
+                    executor.enqueue_global(task_id);
+                }
+            }
+        }
+    }
+}
+
+fn next_io_tick(io_waiters: &BTreeMap<u64, Vec<SimTaskId>>) -> Option<u64> {
+    io_waiters.keys().next().copied()
+}
+
+fn estimate_fault_ops(plan: &FaultPlan) -> u64 {
+    let mut count = 0u64;
+    for file in plan.per_file.values() {
+        if file.open.is_some() {
+            count = count.saturating_add(1);
+        }
+        if file.cancel_after_reads.is_some() {
+            count = count.saturating_add(1);
+        }
+        for read in &file.reads {
+            if read.fault.is_some() || read.latency_ticks > 0 || read.corruption.is_some() {
+                count = count.saturating_add(1);
+            }
+        }
+    }
+    count
+}
+
+fn apply_corruption(buf: &mut Vec<u8>, corruption: &Corruption) {
+    match corruption {
+        Corruption::TruncateTo { new_len } => {
+            let len = (*new_len as usize).min(buf.len());
+            buf.truncate(len);
+        }
+        Corruption::FlipBit { offset, mask } => {
+            if let Some(byte) = buf.get_mut(*offset as usize) {
+                *byte ^= *mask;
+            }
+        }
+        Corruption::Overwrite { offset, bytes } => {
+            let start = *offset as usize;
+            for (idx, value) in bytes.iter().enumerate() {
+                if let Some(byte) = buf.get_mut(start.saturating_add(idx)) {
+                    *byte = *value;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -581,16 +945,25 @@ fn sorted_file_paths(fs: &SimFs) -> Vec<SimPath> {
 ///
 /// Matches require the same `(file_id, rule_id)` and containment of the expected
 /// root span within the finding's `root_hint` range. Any extra finding is a
-/// ground-truth failure.
+/// ground-truth failure. Files marked `ground_truth_ok = false` are skipped.
 fn oracle_ground_truth(
     scenario: &Scenario,
     files: &[SimPath],
     findings: &[FindingRec],
+    summaries: &[FileSummary],
     step: u64,
 ) -> Result<(), FailureReport> {
     let file_ids = build_file_id_map(files);
     let mut expected = Vec::with_capacity(scenario.expected.len());
     let mut index: BTreeMap<(u32, u32), Vec<usize>> = BTreeMap::new();
+    let mut skip_files: BTreeSet<u32> = BTreeSet::new();
+
+    for summary in summaries {
+        // Files with data-affecting faults are excluded from ground-truth checks.
+        if !summary.ground_truth_ok {
+            skip_files.insert(summary.file_id.0);
+        }
+    }
 
     for exp in &scenario.expected {
         let file_id = match file_ids.get(&exp.path.bytes) {
@@ -606,6 +979,9 @@ fn oracle_ground_truth(
                 })
             }
         };
+        if skip_files.contains(&file_id.0) {
+            continue;
+        }
         let idx = expected.len();
         expected.push(ExpectedEntry {
             path: exp.path.clone(),
@@ -619,6 +995,9 @@ fn oracle_ground_truth(
     }
 
     for rec in findings {
+        if skip_files.contains(&rec.file_id.0) {
+            continue;
+        }
         let Some(candidates) = index.get(&(rec.file_id.0, rec.rule_id)) else {
             return Err(FailureReport {
                 kind: FailureKind::OracleMismatch,
@@ -676,16 +1055,16 @@ fn oracle_ground_truth(
 /// Compare chunked findings against a single-chunk reference scan.
 fn oracle_differential(
     engine: &Engine,
-    fs: &SimFs,
-    files: &[SimPath],
     findings: &[FindingRec],
+    summaries: &[FileSummary],
     step: u64,
 ) -> Result<(), FailureReport> {
-    let reference = reference_findings(engine, fs, files).map_err(|msg| FailureReport {
-        kind: FailureKind::OracleMismatch,
-        message: msg,
-        step,
-    })?;
+    let reference =
+        reference_findings_observed(engine, summaries).map_err(|msg| FailureReport {
+            kind: FailureKind::OracleMismatch,
+            message: msg,
+            step,
+        })?;
 
     let observed = normalize_findings(findings);
     let expected = normalize_findings(&reference);
@@ -711,32 +1090,25 @@ fn oracle_differential(
     Ok(())
 }
 
-fn reference_findings(
+fn reference_findings_observed(
     engine: &Engine,
-    fs: &SimFs,
-    files: &[SimPath],
+    summaries: &[FileSummary],
 ) -> Result<Vec<FindingRec>, String> {
     let mut scratch = engine.new_scratch();
     let mut out = Vec::new();
 
-    for (idx, path) in files.iter().enumerate() {
-        let file_id = FileId(idx as u32);
-        let handle = fs
-            .open_file(path)
-            .map_err(|e| format!("open {:?}: {e}", path.bytes))?;
-        let len =
-            usize::try_from(handle.len).map_err(|_| format!("file too large: {:?}", path.bytes))?;
+    for summary in summaries {
+        let len = summary.observed.len();
         if len > u32::MAX as usize {
             return Err(format!(
-                "reference scan requires <= u32::MAX bytes: {:?}",
-                path.bytes
+                "reference scan requires <= u32::MAX bytes: file_id {:?}",
+                summary.file_id
             ));
         }
-        let data = fs
-            .read_at(&handle, 0, len)
-            .map_err(|e| format!("read {:?}: {e}", path.bytes))?;
-
-        engine.scan_chunk_into(data, file_id, 0, &mut scratch);
+        if summary.observed.is_empty() {
+            continue;
+        }
+        engine.scan_chunk_into(&summary.observed, summary.file_id, 0, &mut scratch);
         scratch.drain_findings_into(&mut out);
     }
 
@@ -774,7 +1146,7 @@ fn total_file_bytes(fs: &SimFs, files: &[SimPath]) -> u64 {
 
 /// Resolve the max steps bound. If `cfg.max_steps > 0`, honor it; otherwise
 /// derive a conservative bound from file count and byte count.
-fn resolve_max_steps(cfg: &RunConfig, file_count: u64, total_bytes: u64) -> u64 {
+fn resolve_max_steps(cfg: &RunConfig, file_count: u64, total_bytes: u64, fault_ops: u64) -> u64 {
     if cfg.max_steps > 0 {
         return cfg.max_steps;
     }
@@ -782,7 +1154,9 @@ fn resolve_max_steps(cfg: &RunConfig, file_count: u64, total_bytes: u64) -> u64 
     let chunks = total_bytes.saturating_add(chunk - 1) / chunk;
     let base = 32u64;
     let alpha = 8u64;
+    let beta = 4u64;
     base.saturating_add(alpha.saturating_mul(file_count.saturating_add(chunks)))
+        .saturating_add(beta.saturating_mul(fault_ops))
 }
 
 /// Format panic payloads into a stable message.
