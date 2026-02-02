@@ -6,9 +6,13 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use serde::{Deserializer, Serializer};
 
 /// Fault plan keyed by file path bytes.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+///
+/// Serialization encodes path bytes as lowercase hex strings under `per_file`
+/// so artifacts remain JSON-compatible.
+#[derive(Clone, Debug)]
 pub struct FaultPlan {
     pub per_file: BTreeMap<Vec<u8>, FileFaultPlan>,
 }

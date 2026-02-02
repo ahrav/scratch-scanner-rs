@@ -2,6 +2,68 @@
 
 Buffer lifecycle and pool management in scanner-rs.
 
+## Multi-Core Production Memory Model
+
+The production multi-core scanner (`scan_local`) allocates memory at startup
+and maintains zero allocations during the hot path. Memory scales with worker count.
+
+### Memory Breakdown by Worker Count
+
+| Workers | Per-Worker | Buffer Pool | **Total** |
+|---------|------------|-------------|-----------|
+| 4       | 75.3 MiB   | 5.0 MiB     | ~80 MiB   |
+| 8       | 150.5 MiB  | 10.0 MiB    | ~161 MiB  |
+| 12      | 225.8 MiB  | 15.0 MiB    | ~241 MiB  |
+| 16      | 301.1 MiB  | 20.0 MiB    | ~321 MiB  |
+
+### Per-Worker Allocation (~18.8 MiB each)
+
+| Component | Size | % of Total |
+|-----------|------|------------|
+| **HitAccPool.windows** | 15.68 MiB | 83.3% |
+| FixedSet128 (seen_findings) | 768 KiB | 4.0% |
+| FindingRec buffers (out + tmp) | 640 KiB | 3.3% |
+| DecodeSlab | 512 KiB | 2.6% |
+| Other (ByteRing, TimingWheel, etc.) | ~1.2 MiB | 6.8% |
+
+**Key insight**: HitAccPool dominates at 83.3% of per-worker memory. This is
+sized for worst-case: 669 (rule,variant) pairs × 2048 max hits × 12 bytes/SpanU32.
+
+### Buffer Pool (System-Wide)
+
+- **Buffers**: `workers × 4` (e.g., 32 buffers for 8 workers)
+- **Buffer size**: `chunk_size + overlap` = 256 KiB + 64 KiB = 320 KiB
+- **Total**: ~10 MiB for 8 workers
+
+### Production Configuration (ParallelScanConfig)
+
+```rust
+ParallelScanConfig {
+    workers: num_cpus::get(),     // Auto-detect CPU count
+    chunk_size: 256 * 1024,       // 256 KiB chunks
+    pool_buffers: workers * 4,    // 4 buffers per worker
+    max_in_flight_objects: 1024,
+    local_queue_cap: 4,
+}
+```
+
+### Zero-Allocation Hot Path
+
+After startup allocation, the scan phase is allocation-free:
+- All per-worker scratch is pre-allocated (ScanScratch, LocalScratch)
+- Buffer pool provides fixed I/O buffers (TsBufferPool)
+- Findings use pre-sized vectors that are reused across chunks
+
+Run diagnostic tests to verify: `cargo test --test diagnostic -- --ignored --nocapture --test-threads=1`
+
+---
+
+## Single-Threaded Pipeline Memory Model
+
+> **Note**: The diagrams below describe the single-threaded `Pipeline` API, which uses
+> different buffer sizes (2 MiB vs 256 KiB). For production multi-core scanning, see
+> the section above.
+
 ```mermaid
 flowchart TB
     subgraph Init["Initialization"]

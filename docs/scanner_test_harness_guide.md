@@ -27,24 +27,24 @@ The scheduler harness tests work distribution policy (stealing, parking, resourc
 
 ```bash
 # Run corpus regression tests
-cargo test --features sim-harness --test sim_corpus_scanner
+cargo test --features sim-harness --test simulation scanner_corpus
 
 # Run bounded random simulations
-cargo test --features sim-harness --test sim_random_scanner
+cargo test --features sim-harness --test simulation scanner_random
 
 # Scale via environment variables
-SIM_SCANNER_SEED_COUNT=100 cargo test --features sim-harness --test sim_random_scanner
+SIM_SCANNER_SEED_COUNT=100 cargo test --features sim-harness --test simulation scanner_random
 
 # Enable deep testing (more files, secrets, faults)
-SIM_SCANNER_DEEP=1 cargo test --features sim-harness --test sim_random_scanner
+SIM_SCANNER_DEEP=1 cargo test --features sim-harness --test simulation scanner_random
 
 # Debug a failing case
-DUMP_SIM_FAIL=1 cargo test --features sim-harness --test sim_random_scanner
+DUMP_SIM_FAIL=1 cargo test --features sim-harness --test simulation scanner_random
 ```
 
 **Key paths:**
 - **Corpus**: `tests/corpus/scanner/*.case.json` - regression tests replayed on every run
-- **Random tests**: `tests/sim_random_scanner.rs` - bounded random scenario generation
+- **Random tests**: `tests/simulation/scanner_random.rs` - bounded random scenario generation
 
 ## ScenarioGenConfig Reference
 
@@ -291,7 +291,7 @@ let run_cfg = RunConfig {
 3. Copy minimized artifact to `tests/corpus/scanner/<name>.case.json`
 4. Verify replay passes:
    ```bash
-   cargo test --features sim-harness --test sim_corpus_scanner
+   cargo test --features sim-harness --test simulation scanner_corpus
    ```
 
 ### Using the Minimizer
