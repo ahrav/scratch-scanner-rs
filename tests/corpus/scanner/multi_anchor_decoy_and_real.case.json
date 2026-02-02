@@ -1,0 +1,74 @@
+{
+  "failure": {
+    "kind": "Unimplemented",
+    "message": "corpus",
+    "step": 0
+  },
+  "fault_plan": {
+    "per_file": {}
+  },
+  "git_commit": null,
+  "run_config": {
+    "buffer_pool_cap": 8,
+    "chunk_size": 64,
+    "max_in_flight_objects": 16,
+    "max_steps": 0,
+    "max_transform_depth": 0,
+    "overlap": 512,
+    "scan_utf16_variants": false,
+    "stability_runs": 2,
+    "workers": 1
+  },
+  "scanner_pkg_version": "dev",
+  "scenario": {
+    "expected": [
+      {
+        "path": {
+          "bytes": [109, 117, 108, 116, 105, 95, 97, 110, 99, 104, 111, 114, 46, 116, 120, 116]
+        },
+        "repr": "Raw",
+        "root_span": {
+          "end": 57,
+          "start": 42
+        },
+        "rule_id": 0
+      }
+    ],
+    "fs": {
+      "nodes": [
+        {
+          "File": {
+            "contents": [100, 101, 99, 111, 121, 58, 32, 97, 112, 105, 95, 107, 101, 121, 32, 98, 117, 116, 32, 110, 111, 32, 118, 97, 108, 117, 101, 32, 104, 101, 114, 101, 46, 32, 114, 101, 97, 108, 58, 32, 97, 112, 105, 95, 107, 101, 121, 61, 115, 107, 95, 108, 105, 118, 101, 95, 49, 50, 51, 52, 53, 54, 55, 56],
+            "path": {
+              "bytes": [109, 117, 108, 116, 105, 95, 97, 110, 99, 104, 111, 114, 46, 116, 120, 116]
+            }
+          }
+        }
+      ]
+    },
+    "rule_suite": {
+      "rules": [
+        {
+          "anchors": [
+            [97, 112, 105, 95, 107, 101, 121],
+            [115, 107, 95]
+          ],
+          "name": "generic-api-key",
+          "radius": 64,
+          "regex": "api_key=sk_[a-z_0-9]{8,}",
+          "rule_id": 0
+        }
+      ],
+      "schema_version": 1
+    },
+    "schema_version": 1
+  },
+  "scenario_seed": 2030,
+  "schedule_seed": 3030,
+  "schema_version": 1,
+  "target": "local",
+  "trace": {
+    "full": null,
+    "ring": []
+  }
+}
