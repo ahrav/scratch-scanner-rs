@@ -1,5 +1,10 @@
 #![cfg(feature = "sim-harness")]
 //! Bounded random scanner simulations to exercise scheduling, chunking, and faults.
+//!
+//! Environment knobs:
+//! - `SIM_SCANNER_DEEP=1` enables a larger default scenario and higher fault rates.
+//! - `SIM_SCENARIO_*` overrides scenario size (rules/files/secrets/noise).
+//! - `SIM_RUN_*` overrides run config (workers/chunk/overlap/stability/etc).
 
 use std::collections::BTreeMap;
 
@@ -19,29 +24,81 @@ fn seed_value_from_env(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_u32_opt(name: &str) -> Option<u32> {
+    std::env::var(name).ok().and_then(|v| v.parse().ok())
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(v) => {
+            let v = v.to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        }
+        Err(_) => default,
+    }
+}
+
+fn rand_range_inclusive(rng: &mut SimRng, min: u32, max: u32) -> u32 {
+    if min >= max {
+        return min;
+    }
+    let hi = max.saturating_add(1);
+    if min >= hi {
+        return min;
+    }
+    rng.gen_range(min, hi)
+}
+
+fn scenario_config_from_env(deep: bool) -> ScenarioGenConfig {
+    let mut cfg = ScenarioGenConfig {
+        rule_count: if deep { 8 } else { 3 },
+        file_count: if deep { 8 } else { 3 },
+        secrets_per_file: if deep { 6 } else { 3 },
+        token_len: if deep { 24 } else { 12 },
+        min_noise_len: if deep { 8 } else { 4 },
+        max_noise_len: if deep { 128 } else { 16 },
+        representations: vec![
+            SecretRepr::Raw,
+            SecretRepr::Base64,
+            SecretRepr::UrlPercent,
+            SecretRepr::Utf16Le,
+            SecretRepr::Utf16Be,
+        ],
+        ..ScenarioGenConfig::default()
+    };
+
+    cfg.rule_count = env_u32("SIM_SCENARIO_RULES", cfg.rule_count);
+    cfg.file_count = env_u32("SIM_SCENARIO_FILES", cfg.file_count);
+    cfg.secrets_per_file = env_u32("SIM_SCENARIO_SECRETS", cfg.secrets_per_file);
+    cfg.token_len = env_u32("SIM_SCENARIO_TOKEN_LEN", cfg.token_len);
+    cfg.min_noise_len = env_u32("SIM_SCENARIO_MIN_NOISE", cfg.min_noise_len);
+    cfg.max_noise_len = env_u32("SIM_SCENARIO_MAX_NOISE", cfg.max_noise_len);
+    cfg
+}
+
 #[test]
 fn bounded_random_scanner_sims() {
+    let deep = env_bool("SIM_SCANNER_DEEP", false);
     let seed_start = seed_value_from_env("SIM_SCANNER_SEED_START", 0);
     let seed_count = seed_value_from_env("SIM_SCANNER_SEED_COUNT", DEFAULT_SEED_COUNT);
     for seed in seed_start..seed_start.saturating_add(seed_count) {
         let mut rng = SimRng::new(seed.wrapping_add(0xA5A5_5A5A));
-        let run_cfg = random_run_config(&mut rng);
-        let gen_cfg = ScenarioGenConfig {
-            rule_count: 3,
-            file_count: 3,
-            secrets_per_file: 3,
-            token_len: 12,
-            min_noise_len: 4,
-            max_noise_len: 16,
-            representations: vec![
-                SecretRepr::Raw,
-                SecretRepr::Base64,
-                SecretRepr::UrlPercent,
-                SecretRepr::Utf16Le,
-                SecretRepr::Utf16Be,
-            ],
-            ..ScenarioGenConfig::default()
-        };
+        let run_cfg = random_run_config(&mut rng, deep);
+        let gen_cfg = scenario_config_from_env(deep);
 
         let scenario = generate_scenario(seed, &gen_cfg).expect("generate scenario");
         let engine = build_engine_from_suite(&scenario.rule_suite, &run_cfg).expect("build engine");
@@ -51,7 +108,7 @@ fn bounded_random_scanner_sims() {
             run_cfg.overlap = required;
         }
 
-        let fault_plan = random_fault_plan(&mut rng, &scenario, run_cfg.chunk_size);
+        let fault_plan = random_fault_plan(&mut rng, &scenario, run_cfg.chunk_size, deep);
         let schedule_seed = seed.wrapping_add(0xC0FF_EE00);
         let runner = ScannerSimRunner::new(run_cfg.clone(), schedule_seed);
 
@@ -70,19 +127,39 @@ fn bounded_random_scanner_sims() {
     }
 }
 
-fn random_run_config(rng: &mut SimRng) -> RunConfig {
-    let workers = rng.gen_range(1, 5);
-    let chunk_size = rng.gen_range(16, 64);
+fn random_run_config(rng: &mut SimRng, deep: bool) -> RunConfig {
+    let workers_min_default = if deep { 1 } else { 1 };
+    let workers_max_default = if deep { 8 } else { 4 };
+    let workers_min = env_u32("SIM_RUN_WORKERS_MIN", workers_min_default).max(1);
+    let workers_max = env_u32("SIM_RUN_WORKERS_MAX", workers_max_default).max(workers_min);
+    let workers = env_u32_opt("SIM_RUN_WORKERS")
+        .unwrap_or_else(|| rand_range_inclusive(rng, workers_min, workers_max));
+
+    let chunk_min_default = if deep { 16 } else { 16 };
+    let chunk_max_default = if deep { 128 } else { 64 };
+    let chunk_min = env_u32("SIM_RUN_CHUNK_MIN", chunk_min_default).max(1);
+    let chunk_max = env_u32("SIM_RUN_CHUNK_MAX", chunk_max_default).max(chunk_min);
+    let chunk_size = env_u32_opt("SIM_RUN_CHUNK_SIZE")
+        .unwrap_or_else(|| rand_range_inclusive(rng, chunk_min, chunk_max));
+
+    let overlap = env_u32("SIM_RUN_OVERLAP", if deep { 128 } else { 64 });
+    let max_in_flight_objects = env_u32("SIM_RUN_MAX_IN_FLIGHT", if deep { 32 } else { 16 });
+    let buffer_pool_cap = env_u32("SIM_RUN_BUFFER_POOL_CAP", if deep { 16 } else { 8 });
+    let max_steps = env_u64("SIM_RUN_MAX_STEPS", 0);
+    let max_transform_depth = env_u32("SIM_RUN_MAX_TRANSFORM_DEPTH", if deep { 4 } else { 3 });
+    let scan_utf16_variants = env_bool("SIM_RUN_SCAN_UTF16", true);
+    let stability_runs = env_u32("SIM_RUN_STABILITY_RUNS", if deep { 4 } else { 2 });
+
     RunConfig {
         workers,
         chunk_size,
-        overlap: 64,
-        max_in_flight_objects: 16,
-        buffer_pool_cap: 8,
-        max_steps: 0,
-        max_transform_depth: 3,
-        scan_utf16_variants: true,
-        stability_runs: 2,
+        overlap,
+        max_in_flight_objects,
+        buffer_pool_cap,
+        max_steps,
+        max_transform_depth,
+        scan_utf16_variants,
+        stability_runs,
     }
 }
 
@@ -90,6 +167,7 @@ fn random_fault_plan(
     rng: &mut SimRng,
     scenario: &scanner_rs::sim_scanner::Scenario,
     chunk_size: u32,
+    deep: bool,
 ) -> FaultPlan {
     let mut per_file = BTreeMap::new();
     let max_len = chunk_size.max(4);
@@ -104,11 +182,11 @@ fn random_fault_plan(
             cancel_after_reads: None,
         };
 
-        if rng.gen_bool(1, 10) {
+        if rng.gen_bool(1, if deep { 5 } else { 10 }) {
             plan.open = Some(IoFault::ErrKind { kind: 2 });
         }
 
-        let read_faults = rng.gen_range(0, 3);
+        let read_faults = rng.gen_range(0, if deep { 5 } else { 3 });
         for _ in 0..read_faults {
             let fault = match rng.gen_range(0, 3) {
                 0 => IoFault::PartialRead {
@@ -122,7 +200,7 @@ fn random_fault_plan(
             } else {
                 0
             };
-            let corruption = if rng.gen_bool(1, 12) {
+            let corruption = if rng.gen_bool(1, if deep { 6 } else { 12 }) {
                 Some(Corruption::FlipBit {
                     offset: 0,
                     mask: 0x01,
@@ -137,7 +215,7 @@ fn random_fault_plan(
             });
         }
 
-        if rng.gen_bool(1, 20) {
+        if rng.gen_bool(1, if deep { 10 } else { 20 }) {
             plan.cancel_after_reads = Some(rng.gen_range(1, 4));
         }
 

@@ -29,5 +29,23 @@ fuzz/Cargo.lock
 .DS_Store
 .worktrees/
 
+# Internal design docs (scanner harness planning)
 docs/test_harness.md
 docs/test_harness_work_units.md
+
+# Internal design docs (not for external consumption)
+# Implementation plans and specifications
+docs/tiger_harness_plan.md
+docs/anchor_optimization_spec.md
+docs/archive-scanning-plan.md
+docs/scheduler_test_harness.md
+docs/scheduler_test_harness_tasks.md
+
+# Performance investigations and internal analysis
+docs/rule_optimization_analysis.md
+docs/throughput_analysis.md
+docs/throughput_bottleneck_analysis.md
+docs/throughput_investigation.md
+
+# Scheduler simulation stress test failures (generated)
+tests/failures/

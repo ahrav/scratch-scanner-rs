@@ -81,29 +81,32 @@ graph TB
 | Component | Location | Purpose |
 |-----------|----------|---------|
 | **CLI Layer** | `src/main.rs` | Entry point that parses args and invokes the pipeline |
-| **Engine** | `src/lib.rs:992` | Compiled scanning engine with anchor patterns, rules, and transforms |
-| **RuleSpec/RuleCompiled/RuleMeta** | `src/lib.rs:189-633` | Rule definitions, hot compiled data, and cold metadata |
+| **Engine** | `src/engine/core.rs:154` | Compiled scanning engine with anchor patterns, rules, and transforms |
+| **RuleSpec** | `src/api.rs:519` | Rule definitions and specification for rule-based scanning |
+| **RuleCompiled** | `src/engine/rule_repr.rs:268` | Compiled rule representation with hot data and validation gates |
 | **AhoCorasick** | External crate | Multi-pattern anchor scanning (raw + UTF-16 variants) |
-| **TransformConfig** | `src/lib.rs:96-121` | Transform stage configuration (URL percent, Base64) |
-| **Pipeline** | `src/pipeline.rs:419` | 4-stage cooperative pipeline coordinator |
-| **Walker** | `src/pipeline.rs:84` | Recursive file system traversal |
-| **ReaderStage** | `src/pipeline.rs:232` | File chunking with overlap preservation |
-| **ScanStage** | `src/pipeline.rs:303` | Detection engine invocation |
-| **OutputStage** | `src/pipeline.rs:376` | Finding output to stdout |
-| **BufferPool** | `src/lib.rs:367` | Fixed-capacity aligned buffer pool |
-| **NodePoolType** | `src/lsm/node_pool.rs:32` | Generic pre-allocated node pool |
-| **RingBuffer** | `src/stdx/ring_buffer.rs:22` | Fixed-capacity SPSC queue |
-| **BitSet** | `src/stdx/bitset.rs:30` | Compile-time fixed bitset |
-| **ScanScratch** | `src/lib.rs:859` | Per-scan reusable scratch state |
-| **TimingWheel** | `src/stdx/timing_wheel.rs` | Hashed timing wheel for window expiration scheduling |
-| **Sim Harness (feature `sim-harness`)** | `src/sim/` | Deterministic simulation primitives (RNG/clock/trace) used by the harnesses |
+| **TransformConfig** | `src/api.rs:132` | Transform stage configuration (URL percent, Base64) |
+| **Pipeline** | `src/pipeline.rs:831` | 4-stage cooperative pipeline coordinator |
+| **Walker** | `src/pipeline.rs:331` | Recursive file system traversal (Unix primary; fallback at line 196) |
+| **ReaderStage** | `src/pipeline.rs:579` | File chunking with overlap preservation |
+| **ScanStage** | `src/pipeline.rs:680` | Detection engine invocation |
+| **OutputStage** | `src/pipeline.rs:785` | Finding output to stdout |
+| **BufferPool** | `src/runtime.rs:468` | Fixed-capacity aligned buffer pool |
+| **NodePoolType** | `src/pool/node_pool.rs:49` | Generic pre-allocated node pool |
+| **RingBuffer** | `src/stdx/ring_buffer.rs:45` | Fixed-capacity SPSC queue |
+| **DynamicBitSet** | `src/stdx/bitset.rs:51` | Runtime-sized bitset for pool tracking |
+| **ScanScratch** | `src/engine/scratch.rs:83` | Per-scan reusable scratch state |
+| **TimingWheel** | `src/stdx/timing_wheel.rs:479` | Hashed timing wheel for window expiration scheduling |
 
 ## Testing Harnesses
 
-The optional sim harnesses provide deterministic simulation primitives and replayable traces for
-scanner and scheduler testing. See `docs/test_harness.md` for the full design and workflow.
-Scheduler harness code lives in `src/sim_scheduler/` and the scanner harness code lives in
-`src/sim_scanner/`.
+The optional simulation harnesses provide deterministic simulation primitives and replayable traces
+for both scanner and scheduler testing. See `docs/scanner_test_harness_guide.md` and
+`docs/scheduler_test_harness_guide.md` for the full design and workflow.
+
+### Scanner Simulation Harness (`sim-harness` feature)
+
+Scanner harness code lives in `src/sim_scanner/` with shared primitives in `src/sim/`.
 
 | Component | Location | Purpose |
 |-----------|----------|---------|
@@ -114,6 +117,16 @@ Scheduler harness code lives in `src/sim_scheduler/` and the scanner harness cod
 | **SimRng / SimClock** | `src/sim/rng.rs`, `src/sim/clock.rs` | Stable RNG and simulated time source |
 | **TraceRing** | `src/sim/trace.rs` | Bounded trace buffer for replay and debugging |
 | **Minimizer** | `src/sim/minimize.rs` | Deterministic shrink passes for failing scanner artifacts |
+
+### Scheduler Simulation Harness (`scheduler-sim` feature)
+
+Scheduler harness code lives in `src/scheduler/sim_executor_harness.rs`.
+
+| Component | Location | Purpose |
+|-----------|----------|---------|
+| **Scheduler Sim Harness** | `src/scheduler/sim_executor_harness.rs` | Deterministic executor model for scheduler interleaving tests |
+| **Scheduler Sim Task VM** | `src/scheduler/sim_executor_harness.rs` | Bytecode VM driving scheduler-only task effects in simulation |
+| **Scheduler Sim Resources** | `src/scheduler/sim_executor_harness.rs` | Deterministic resource accounting for permits/budgets in simulation |
 
 ## Data Flow
 

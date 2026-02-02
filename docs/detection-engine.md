@@ -376,7 +376,5 @@ FindingRec {
 
 | Document | Description |
 |----------|-------------|
-| [Throughput Analysis](./throughput_analysis.md) | Layer-by-layer performance metrics and optimization history |
-| [Throughput Bottleneck Analysis](./throughput_bottleneck_analysis.md) | Deep dive into the two primary bottlenecks and actionable fixes |
 | [Transform Chain](./transform-chain.md) | URL/Base64 transform gating and decode flow |
 | [Memory Management](./memory-management.md) | Buffer pools, scratch allocation, and memory budgets |

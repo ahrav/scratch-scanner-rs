@@ -68,6 +68,10 @@ jobs:
     env:
       PROPTEST_CASES: "64"
       PROPTEST_FUZZ_MULTIPLIER: "4"
+      SCHEDULER_SIM_STRESS_SEEDS: "2000"
+      SCHEDULER_SIM_STRESS_MAX_STEPS: "2000"
+      SCHEDULER_SIM_STRESS_MAX_PROGRAMS: "8"
+      SCHEDULER_SIM_STRESS_MAX_TASKS: "8"
     steps:
       - uses: actions/checkout@v4
       - name: Install system deps
