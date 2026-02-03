@@ -35,7 +35,7 @@ use std::path::Path;
 use gix_commitgraph::{Graph, Position};
 
 use super::commit_walk_limits::CommitWalkLimits;
-use super::errors::Phase2PlanError;
+use super::errors::CommitPlanError;
 use super::object_id::{ObjectFormat, OidBytes};
 use super::repo_open::{RepoJobState, StartSetRef};
 
@@ -76,7 +76,7 @@ pub trait CommitGraph {
     /// Total commits in the commit-graph.
     fn num_commits(&self) -> u32;
     /// Lookup a commit OID, returning its position if found.
-    fn lookup(&self, oid: &OidBytes) -> Result<Option<Position>, Phase2PlanError>;
+    fn lookup(&self, oid: &OidBytes) -> Result<Option<Position>, CommitPlanError>;
     /// Returns the generation number for a commit.
     fn generation(&self, pos: Position) -> u32;
     /// Collects parent positions into `scratch`.
@@ -89,7 +89,7 @@ pub trait CommitGraph {
         pos: Position,
         max_parents: u32,
         scratch: &mut ParentScratch,
-    ) -> Result<(), Phase2PlanError>;
+    ) -> Result<(), CommitPlanError>;
 }
 
 /// Thin wrapper around `gix_commitgraph::Graph` that validates OID lengths
@@ -112,8 +112,8 @@ impl CommitGraphView {
     ///
     /// Returns `CommitGraphOpen` if the commit-graph file is missing,
     /// corrupt, or uses an incompatible format version.
-    pub fn open(info_dir: &Path, object_format: ObjectFormat) -> Result<Self, Phase2PlanError> {
-        let graph = Graph::at(info_dir).map_err(|e| Phase2PlanError::CommitGraphOpen {
+    pub fn open(info_dir: &Path, object_format: ObjectFormat) -> Result<Self, CommitPlanError> {
+        let graph = Graph::at(info_dir).map_err(|e| CommitPlanError::CommitGraphOpen {
             reason: e.to_string(),
         })?;
         let num_commits = graph.num_commits();
@@ -126,7 +126,7 @@ impl CommitGraphView {
     }
 
     /// Opens the commit-graph for a repo job state.
-    pub fn open_repo(repo: &RepoJobState) -> Result<Self, Phase2PlanError> {
+    pub fn open_repo(repo: &RepoJobState) -> Result<Self, CommitPlanError> {
         let info_dir = repo.paths.objects_dir.join("info");
         Self::open(&info_dir, repo.object_format)
     }
@@ -150,14 +150,14 @@ impl CommitGraph for CommitGraphView {
     }
 
     #[inline(always)]
-    fn lookup(&self, oid: &OidBytes) -> Result<Option<Position>, Phase2PlanError> {
+    fn lookup(&self, oid: &OidBytes) -> Result<Option<Position>, CommitPlanError> {
         let expected = self.object_format.oid_len() as usize;
         let len = oid.len() as usize;
         if len != expected {
-            return Err(Phase2PlanError::InvalidOidLength { len, expected });
+            return Err(CommitPlanError::InvalidOidLength { len, expected });
         }
         let gix_oid = gix_hash::oid::try_from_bytes(oid.as_slice())
-            .map_err(|_| Phase2PlanError::InvalidOidLength { len, expected })?;
+            .map_err(|_| CommitPlanError::InvalidOidLength { len, expected })?;
         Ok(self.graph.lookup(gix_oid))
     }
 
@@ -171,11 +171,11 @@ impl CommitGraph for CommitGraphView {
         pos: Position,
         max_parents: u32,
         scratch: &mut ParentScratch,
-    ) -> Result<(), Phase2PlanError> {
+    ) -> Result<(), CommitPlanError> {
         scratch.clear();
         let commit = self.commit(pos);
         for p_result in commit.iter_parents() {
-            let p = p_result.map_err(|_| Phase2PlanError::ParentDecodeFailed)?;
+            let p = p_result.map_err(|_| CommitPlanError::ParentDecodeFailed)?;
             scratch.push(p, max_parents)?;
         }
         Ok(())
@@ -226,7 +226,7 @@ impl ParentScratch {
     ///
     /// Returns `TooManyParents` if `max_parents` is exceeded.
     #[inline(always)]
-    pub fn push(&mut self, pos: Position, max_parents: u32) -> Result<(), Phase2PlanError> {
+    pub fn push(&mut self, pos: Position, max_parents: u32) -> Result<(), CommitPlanError> {
         if !self.spilled {
             if self.inline_len < MAX_PARENTS_INLINE {
                 self.inline[self.inline_len] = pos;
@@ -243,7 +243,7 @@ impl ParentScratch {
         }
 
         if self.len() > max_parents as usize {
-            return Err(Phase2PlanError::TooManyParents {
+            return Err(CommitPlanError::TooManyParents {
                 count: self.len(),
                 max: max_parents as usize,
             });
@@ -430,7 +430,7 @@ fn is_ancestor<CG: CommitGraph>(
     stack: &mut Vec<Position>,
     parents: &mut ParentScratch,
     max_parents: u32,
-) -> Result<bool, Phase2PlanError> {
+) -> Result<bool, CommitPlanError> {
     if ancestor == descendant {
         return Ok(true);
     }
@@ -546,7 +546,7 @@ impl RefRangeWalker {
 /// # Errors
 /// The iterator yields `Err` on commit-graph corruption or limit violations.
 /// Callers should stop consuming after the first error.
-pub struct Phase2CommitIter<'a, CG: CommitGraph = CommitGraphView> {
+pub struct CommitPlanIter<'a, CG: CommitGraph = CommitGraphView> {
     cg: &'a CG,
     limits: CommitWalkLimits,
 
@@ -564,7 +564,7 @@ pub struct Phase2CommitIter<'a, CG: CommitGraph = CommitGraphView> {
     parent_scratch: ParentScratch,
 }
 
-impl<'a, CG: CommitGraph> Phase2CommitIter<'a, CG> {
+impl<'a, CG: CommitGraph> CommitPlanIter<'a, CG> {
     /// Creates a new introduced-by-commit iterator.
     ///
     /// # Errors
@@ -574,7 +574,7 @@ impl<'a, CG: CommitGraph> Phase2CommitIter<'a, CG> {
         repo: &'a RepoJobState,
         cg: &'a CG,
         limits: CommitWalkLimits,
-    ) -> Result<Self, Phase2PlanError> {
+    ) -> Result<Self, CommitPlanError> {
         Self::new_from_refs(&repo.start_set, cg, limits)
     }
 
@@ -583,12 +583,12 @@ impl<'a, CG: CommitGraph> Phase2CommitIter<'a, CG> {
         refs: &'a [StartSetRef],
         cg: &'a CG,
         limits: CommitWalkLimits,
-    ) -> Result<Self, Phase2PlanError> {
+    ) -> Result<Self, CommitPlanError> {
         limits.validate();
 
         let commits = cg.num_commits();
         if commits > limits.max_commits_in_graph {
-            return Err(Phase2PlanError::CommitGraphTooLarge {
+            return Err(CommitPlanError::CommitGraphTooLarge {
                 commits,
                 max: limits.max_commits_in_graph,
             });
@@ -609,7 +609,7 @@ impl<'a, CG: CommitGraph> Phase2CommitIter<'a, CG> {
         })
     }
 
-    fn init_next_ref(&mut self) -> Result<bool, Phase2PlanError> {
+    fn init_next_ref(&mut self) -> Result<bool, CommitPlanError> {
         if self.ref_idx >= self.refs.len() {
             return Ok(false);
         }
@@ -623,7 +623,7 @@ impl<'a, CG: CommitGraph> Phase2CommitIter<'a, CG> {
         let tip_pos = self
             .cg
             .lookup(&r.tip)?
-            .ok_or(Phase2PlanError::TipNotFound)?;
+            .ok_or(CommitPlanError::TipNotFound)?;
 
         // Optional new-ref skip optimization.
         //
@@ -710,7 +710,7 @@ impl<'a, CG: CommitGraph> Phase2CommitIter<'a, CG> {
     /// This marks every commit reachable from the watermark with generation
     /// `>= target_gen` as uninteresting, so the interesting frontier can
     /// safely emit any commit of that generation without missing exclusions.
-    fn advance_uninteresting(&mut self, target_gen: u32) -> Result<(), Phase2PlanError> {
+    fn advance_uninteresting(&mut self, target_gen: u32) -> Result<(), CommitPlanError> {
         while let Some(&top_u) = self.walker.heap_uninteresting.peek() {
             if top_u.gen < target_gen {
                 break;
@@ -736,7 +736,7 @@ impl<'a, CG: CommitGraph> Phase2CommitIter<'a, CG> {
             }
 
             if self.walker.current_heap_size() > self.limits.max_heap_entries {
-                return Err(Phase2PlanError::HeapLimitExceeded {
+                return Err(CommitPlanError::HeapLimitExceeded {
                     entries: self.walker.current_heap_size(),
                     max: self.limits.max_heap_entries,
                 });
@@ -746,8 +746,8 @@ impl<'a, CG: CommitGraph> Phase2CommitIter<'a, CG> {
     }
 }
 
-impl<CG: CommitGraph> Iterator for Phase2CommitIter<'_, CG> {
-    type Item = Result<PlannedCommit, Phase2PlanError>;
+impl<CG: CommitGraph> Iterator for CommitPlanIter<'_, CG> {
+    type Item = Result<PlannedCommit, CommitPlanError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -788,7 +788,7 @@ impl<CG: CommitGraph> Iterator for Phase2CommitIter<'_, CG> {
                 }
 
                 if self.walker.current_heap_size() > self.limits.max_heap_entries {
-                    return Some(Err(Phase2PlanError::HeapLimitExceeded {
+                    return Some(Err(CommitPlanError::HeapLimitExceeded {
                         entries: self.walker.current_heap_size(),
                         max: self.limits.max_heap_entries,
                     }));
@@ -822,8 +822,8 @@ pub fn introduced_by_plan<CG: CommitGraph>(
     repo: &RepoJobState,
     cg: &CG,
     limits: CommitWalkLimits,
-) -> Result<Vec<PlannedCommit>, Phase2PlanError> {
-    let iter = Phase2CommitIter::new(repo, cg, limits)?;
+) -> Result<Vec<PlannedCommit>, CommitPlanError> {
+    let iter = CommitPlanIter::new(repo, cg, limits)?;
     let mut positions = Vec::new();
     for item in iter {
         positions.push(item?.pos);
@@ -860,7 +860,7 @@ pub fn topo_order_positions<CG: CommitGraph>(
     cg: &CG,
     positions: &[Position],
     limits: CommitWalkLimits,
-) -> Result<Vec<Position>, Phase2PlanError> {
+) -> Result<Vec<Position>, CommitPlanError> {
     if positions.is_empty() {
         return Ok(Vec::new());
     }
@@ -869,7 +869,7 @@ pub fn topo_order_positions<CG: CommitGraph>(
 
     let num_commits = cg.num_commits();
     if num_commits > limits.max_commits_in_graph {
-        return Err(Phase2PlanError::CommitGraphTooLarge {
+        return Err(CommitPlanError::CommitGraphTooLarge {
             commits: num_commits,
             max: limits.max_commits_in_graph,
         });
@@ -954,7 +954,7 @@ pub fn topo_order_positions<CG: CommitGraph>(
 
     if ordered.len() != total {
         let remaining = (total - ordered.len()) as u32;
-        return Err(Phase2PlanError::TopoSortCycle { remaining });
+        return Err(CommitPlanError::TopoSortCycle { remaining });
     }
 
     Ok(ordered)
@@ -1141,6 +1141,6 @@ mod tests {
             scratch.push(Position(i as u32), 4).unwrap();
         }
         let err = scratch.push(Position(4), 4).unwrap_err();
-        assert!(matches!(err, Phase2PlanError::TooManyParents { .. }));
+        assert!(matches!(err, CommitPlanError::TooManyParents { .. }));
     }
 }

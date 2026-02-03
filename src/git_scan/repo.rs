@@ -32,8 +32,8 @@ use std::io;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use super::errors::Phase1Error;
-use super::limits::Phase1Limits;
+use super::errors::RepoOpenError;
+use super::limits::RepoOpenLimits;
 use super::preflight_error::PreflightError;
 use super::preflight_limits::PreflightLimits;
 
@@ -67,7 +67,7 @@ impl RepoLimits for PreflightLimits {
     }
 }
 
-impl RepoLimits for Phase1Limits {
+impl RepoLimits for RepoOpenLimits {
     fn max_dot_git_file_bytes(&self) -> u32 {
         self.max_dot_git_file_bytes
     }
@@ -151,7 +151,7 @@ impl RepoError for PreflightError {
     }
 }
 
-impl RepoError for Phase1Error {
+impl RepoError for RepoOpenError {
     fn io(err: io::Error) -> Self {
         Self::io(err)
     }
@@ -376,6 +376,9 @@ impl GitRepoPaths {
 /// Parses a `.git` file to extract the gitdir path.
 ///
 /// Expected format: `gitdir: <path>\n`. The path may contain non-UTF-8 bytes.
+///
+/// Relative paths are resolved against the worktree root (`base_dir`),
+/// matching Git's behavior for linked worktrees.
 fn parse_gitdir_file<E, L>(dot_git_file: &Path, base_dir: &Path, limits: &L) -> Result<PathBuf, E>
 where
     E: RepoError,

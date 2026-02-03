@@ -5,8 +5,8 @@ use std::path::Path;
 use std::process::Command;
 
 use scanner_rs::git_scan::{
-    repo_open, CommitGraph, CommitGraphView, CommitWalkLimits, Phase1Error, Phase1Limits,
-    Phase2CommitIter, RefWatermarkStore, StartSetConfig, StartSetResolver,
+    repo_open, CommitGraph, CommitGraphView, CommitPlanIter, CommitWalkLimits, RefWatermarkStore,
+    RepoOpenError, RepoOpenLimits, StartSetConfig, StartSetResolver,
 };
 use scanner_rs::git_scan::{OidBytes, RepoArtifactStatus};
 use tempfile::TempDir;
@@ -81,7 +81,7 @@ impl StartSetResolver for TestResolver {
     fn resolve(
         &self,
         _paths: &scanner_rs::git_scan::GitRepoPaths,
-    ) -> Result<Vec<(Vec<u8>, OidBytes)>, Phase1Error> {
+    ) -> Result<Vec<(Vec<u8>, OidBytes)>, RepoOpenError> {
         Ok(self.refs.clone())
     }
 }
@@ -97,7 +97,7 @@ impl RefWatermarkStore for TestWatermarkStore {
         _policy_hash: [u8; 32],
         _start_set_id: [u8; 32],
         ref_names: &[&[u8]],
-    ) -> Result<Vec<Option<OidBytes>>, Phase1Error> {
+    ) -> Result<Vec<Option<OidBytes>>, RepoOpenError> {
         let mut out = Vec::with_capacity(ref_names.len());
         for name in ref_names {
             let mut found = None;
@@ -146,7 +146,7 @@ fn commit_walk_linear_history() {
         start_set_id,
         &resolver,
         &watermark_store,
-        Phase1Limits::DEFAULT,
+        RepoOpenLimits::DEFAULT,
     )
     .unwrap();
 
@@ -154,7 +154,7 @@ fn commit_walk_linear_history() {
 
     let cg = CommitGraphView::open_repo(&state).unwrap();
 
-    let iter = Phase2CommitIter::new(&state, &cg, CommitWalkLimits::RESTRICTIVE).unwrap();
+    let iter = CommitPlanIter::new(&state, &cg, CommitWalkLimits::RESTRICTIVE).unwrap();
     let mut out = Vec::new();
     for item in iter {
         out.push(item.unwrap().pos);

@@ -85,7 +85,7 @@ impl StartSetConfig {
     /// # Panics
     ///
     /// Panics if any ref name in `ExplicitRefs` exceeds `u16::MAX` bytes.
-    /// This cannot happen when refs pass through `Phase1Limits` validation
+    /// This cannot happen when refs pass through `RepoOpenLimits` validation
     /// (default max: 1024 bytes), so this is defense-in-depth.
     #[must_use]
     pub fn id(&self) -> StartSetId {
@@ -184,7 +184,7 @@ fn push_u16_le(out: &mut Vec<u8>, v: u16) {
 /// # Panics
 ///
 /// Panics if `b.len() > u16::MAX`. Ref names exceeding 64 KiB are rejected
-/// earlier by `Phase1Limits::max_refname_bytes` (default: 1024, max: u16),
+/// earlier by `RepoOpenLimits::max_refname_bytes` (default: 1024, max: u16),
 /// so this is a defense-in-depth assertion, not a user-facing error.
 fn push_bytes_u16(out: &mut Vec<u8>, b: &[u8]) {
     assert!(

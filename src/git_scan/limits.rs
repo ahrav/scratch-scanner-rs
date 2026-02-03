@@ -14,7 +14,7 @@
 /// Repo discovery only inspects repository metadata; these limits bound
 /// the size of that metadata so the scan remains predictable and cheap.
 #[derive(Clone, Copy, Debug)]
-pub struct Phase1Limits {
+pub struct RepoOpenLimits {
     // --- u32 fields (grouped for alignment) ---
     /// Maximum number of refs in the start set (refs selected for scanning).
     pub max_refs_in_start_set: u32,
@@ -48,7 +48,7 @@ pub struct Phase1Limits {
     pub max_alternates_count: u8,
 }
 
-impl Phase1Limits {
+impl RepoOpenLimits {
     /// Safe defaults suitable for large monorepos.
     pub const DEFAULT: Self = Self {
         max_refs_in_start_set: 16_384,
@@ -140,15 +140,15 @@ impl Phase1Limits {
     }
 }
 
-impl Default for Phase1Limits {
+impl Default for RepoOpenLimits {
     fn default() -> Self {
         Self::DEFAULT
     }
 }
 
-const _: () = Phase1Limits::DEFAULT.validate();
-const _: () = Phase1Limits::RESTRICTIVE.validate();
-const _: () = assert!(std::mem::size_of::<Phase1Limits>() == 28);
+const _: () = RepoOpenLimits::DEFAULT.validate();
+const _: () = RepoOpenLimits::RESTRICTIVE.validate();
+const _: () = assert!(std::mem::size_of::<RepoOpenLimits>() == 28);
 
 #[cfg(test)]
 mod tests {
@@ -156,11 +156,11 @@ mod tests {
 
     #[test]
     fn default_limits_valid() {
-        Phase1Limits::DEFAULT.validate();
+        RepoOpenLimits::DEFAULT.validate();
     }
 
     #[test]
     fn restrictive_limits_valid() {
-        Phase1Limits::RESTRICTIVE.validate();
+        RepoOpenLimits::RESTRICTIVE.validate();
     }
 }

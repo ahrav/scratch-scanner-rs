@@ -11,7 +11,7 @@ use std::io;
 /// Errors from repo discovery and open.
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum Phase1Error {
+pub enum RepoOpenError {
     /// I/O error during file operations.
     Io(io::Error),
     /// Path canonicalization failed.
@@ -44,7 +44,7 @@ pub enum Phase1Error {
     InvalidUtf8Config,
 }
 
-impl Phase1Error {
+impl RepoOpenError {
     /// Creates an I/O error variant.
     #[inline]
     pub fn io(err: io::Error) -> Self {
@@ -58,7 +58,7 @@ impl Phase1Error {
     }
 }
 
-impl fmt::Display for Phase1Error {
+impl fmt::Display for RepoOpenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(err) => write!(f, "I/O error: {err}"),
@@ -93,7 +93,7 @@ impl fmt::Display for Phase1Error {
     }
 }
 
-impl std::error::Error for Phase1Error {
+impl std::error::Error for RepoOpenError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(err) | Self::Canonicalization(err) => Some(err),
@@ -108,7 +108,7 @@ impl std::error::Error for Phase1Error {
 /// commit-graph corruption, missing tips, or violated traversal limits.
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum Phase2PlanError {
+pub enum CommitPlanError {
     /// Commit-graph could not be opened or parsed.
     CommitGraphOpen { reason: String },
     /// OID has invalid length.
@@ -127,7 +127,7 @@ pub enum Phase2PlanError {
     TopoSortCycle { remaining: u32 },
 }
 
-impl fmt::Display for Phase2PlanError {
+impl fmt::Display for CommitPlanError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::CommitGraphOpen { reason } => {
@@ -157,7 +157,7 @@ impl fmt::Display for Phase2PlanError {
     }
 }
 
-impl std::error::Error for Phase2PlanError {}
+impl std::error::Error for CommitPlanError {}
 
 /// Errors from tree diff and candidate collection.
 ///
@@ -165,7 +165,7 @@ impl std::error::Error for Phase2PlanError {}
 /// and extracting candidate paths.
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum Phase2Error {
+pub enum TreeDiffError {
     /// Tree object not found.
     TreeNotFound,
     /// Object exists but is not a tree.
@@ -186,7 +186,7 @@ pub enum Phase2Error {
     PathArenaFull,
 }
 
-impl fmt::Display for Phase2Error {
+impl fmt::Display for TreeDiffError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::TreeNotFound => write!(f, "tree not found"),
@@ -213,7 +213,7 @@ impl fmt::Display for Phase2Error {
     }
 }
 
-impl std::error::Error for Phase2Error {}
+impl std::error::Error for TreeDiffError {}
 
 /// Errors from spill and dedupe.
 ///
@@ -221,7 +221,7 @@ impl std::error::Error for Phase2Error {}
 /// de-duplicating large result sets on disk.
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum Phase3Error {
+pub enum SpillError {
     /// I/O error during spill file operations.
     Io(io::Error),
     /// Maximum number of spill run files exceeded.
@@ -244,7 +244,7 @@ pub enum Phase3Error {
     PathTooLong { len: usize, max: usize },
 }
 
-impl fmt::Display for Phase3Error {
+impl fmt::Display for SpillError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(err) => write!(f, "I/O error: {err}"),
@@ -279,7 +279,7 @@ impl fmt::Display for Phase3Error {
     }
 }
 
-impl std::error::Error for Phase3Error {
+impl std::error::Error for SpillError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(err) => Some(err),
@@ -288,7 +288,7 @@ impl std::error::Error for Phase3Error {
     }
 }
 
-impl From<io::Error> for Phase3Error {
+impl From<io::Error> for SpillError {
     fn from(err: io::Error) -> Self {
         Self::Io(err)
     }
@@ -299,8 +299,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn phase1_error_display() {
-        let err = Phase1Error::StartSetTooLarge {
+    fn repo_open_error_display() {
+        let err = RepoOpenError::StartSetTooLarge {
             count: 100,
             max: 50,
         };
@@ -310,15 +310,15 @@ mod tests {
     }
 
     #[test]
-    fn phase2_error_display() {
-        let err = Phase2Error::MaxTreeDepthExceeded { max_depth: 256 };
+    fn tree_diff_error_display() {
+        let err = TreeDiffError::MaxTreeDepthExceeded { max_depth: 256 };
         let msg = format!("{err}");
         assert!(msg.contains("256"));
     }
 
     #[test]
-    fn phase2_plan_error_display() {
-        let err = Phase2PlanError::HeapLimitExceeded {
+    fn commit_plan_error_display() {
+        let err = CommitPlanError::HeapLimitExceeded {
             entries: 10,
             max: 5,
         };
@@ -328,17 +328,17 @@ mod tests {
     }
 
     #[test]
-    fn phase3_error_display() {
-        let err = Phase3Error::SpillRunLimitExceeded { runs: 10, max: 8 };
+    fn spill_error_display() {
+        let err = SpillError::SpillRunLimitExceeded { runs: 10, max: 8 };
         let msg = format!("{err}");
         assert!(msg.contains("10"));
         assert!(msg.contains("8"));
     }
 
     #[test]
-    fn phase3_from_io_error() {
+    fn spill_from_io_error() {
         let io_err = io::Error::new(io::ErrorKind::NotFound, "test");
-        let phase3_err: Phase3Error = io_err.into();
-        assert!(matches!(phase3_err, Phase3Error::Io(_)));
+        let spill_err: SpillError = io_err.into();
+        assert!(matches!(spill_err, SpillError::Io(_)));
     }
 }

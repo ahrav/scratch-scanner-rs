@@ -6,7 +6,7 @@
 
 /// Hard caps for commit-graph traversal and ordering.
 ///
-/// These limits are enforced during phase-2 planning:
+/// These limits are enforced during commit planning:
 /// - Range walks for introduced-by commits.
 /// - Topological ordering of the scanned subgraph.
 /// - Snapshot plans (tip-only) still validate graph size.

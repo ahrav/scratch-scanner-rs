@@ -4,7 +4,7 @@ use proptest::prelude::*;
 
 use scanner_rs::git_scan::{ByteRef, OidBytes};
 use scanner_rs::git_scan::{
-    CommitGraph, CommitWalkLimits, ParentScratch, Phase2CommitIter, Phase2PlanError, StartSetRef,
+    CommitGraph, CommitPlanError, CommitPlanIter, CommitWalkLimits, ParentScratch, StartSetRef,
 };
 
 use gix_commitgraph::Position;
@@ -37,11 +37,11 @@ impl CommitGraph for TestCommitGraph {
         self.parents.len() as u32
     }
 
-    fn lookup(&self, oid: &OidBytes) -> Result<Option<Position>, Phase2PlanError> {
+    fn lookup(&self, oid: &OidBytes) -> Result<Option<Position>, CommitPlanError> {
         let len = oid.len() as usize;
         let expected = 20usize;
         if len != expected {
-            return Err(Phase2PlanError::InvalidOidLength { len, expected });
+            return Err(CommitPlanError::InvalidOidLength { len, expected });
         }
         let bytes = oid.as_slice();
         let mut buf = [0u8; 4];
@@ -63,7 +63,7 @@ impl CommitGraph for TestCommitGraph {
         pos: Position,
         max_parents: u32,
         scratch: &mut ParentScratch,
-    ) -> Result<(), Phase2PlanError> {
+    ) -> Result<(), CommitPlanError> {
         scratch.clear();
         for &p in &self.parents[pos.0 as usize] {
             scratch.push(p, max_parents)?;
@@ -167,7 +167,7 @@ proptest! {
         }
 
         let limits = CommitWalkLimits::RESTRICTIVE;
-        let iter = Phase2CommitIter::new_from_refs(&refs, &graph, limits).unwrap();
+        let iter = CommitPlanIter::new_from_refs(&refs, &graph, limits).unwrap();
 
         let mut got = vec![false; n];
         for item in iter {

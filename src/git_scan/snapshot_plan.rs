@@ -7,7 +7,7 @@
 
 use super::commit_walk::{CommitGraph, PlannedCommit};
 use super::commit_walk_limits::CommitWalkLimits;
-use super::errors::Phase2PlanError;
+use super::errors::CommitPlanError;
 use super::repo_open::RepoJobState;
 
 /// Produces a snapshot plan: each ref tip appears once as a "diff vs empty tree".
@@ -15,16 +15,19 @@ use super::repo_open::RepoJobState;
 /// # Errors
 /// - `CommitGraphTooLarge` if the graph exceeds the configured limit.
 /// - `TipNotFound` if a ref tip is missing from the commit-graph.
+///
+/// # Ordering
+/// The output order matches `repo.start_set` (deterministic ref ordering).
 pub fn snapshot_plan<CG: CommitGraph>(
     repo: &RepoJobState,
     cg: &CG,
     limits: CommitWalkLimits,
-) -> Result<Vec<PlannedCommit>, Phase2PlanError> {
+) -> Result<Vec<PlannedCommit>, CommitPlanError> {
     limits.validate();
 
     let commits = cg.num_commits();
     if commits > limits.max_commits_in_graph {
-        return Err(Phase2PlanError::CommitGraphTooLarge {
+        return Err(CommitPlanError::CommitGraphTooLarge {
             commits,
             max: limits.max_commits_in_graph,
         });
@@ -32,7 +35,7 @@ pub fn snapshot_plan<CG: CommitGraph>(
 
     let mut out = Vec::with_capacity(repo.start_set.len());
     for r in &repo.start_set {
-        let tip_pos = cg.lookup(&r.tip)?.ok_or(Phase2PlanError::TipNotFound)?;
+        let tip_pos = cg.lookup(&r.tip)?.ok_or(CommitPlanError::TipNotFound)?;
         out.push(PlannedCommit {
             pos: tip_pos,
             snapshot_root: true,

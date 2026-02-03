@@ -1,11 +1,12 @@
-// Integration tests for repo_open's filesystem discovery and artifact handling.
-// The commit-graph and MIDX files contain placeholder bytes; repo_open only
-// checks for presence and mmaps them during these tests.
+//! Integration tests for repo_open's filesystem discovery and artifact handling.
+//!
+//! The commit-graph and MIDX files contain placeholder bytes; repo_open only
+//! checks for presence and mmaps them during these tests.
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use scanner_rs::git_scan::{
-    repo_open, Phase1Error, Phase1Limits, RefWatermarkStore, StartSetConfig, StartSetResolver,
+    repo_open, RefWatermarkStore, RepoOpenError, RepoOpenLimits, StartSetConfig, StartSetResolver,
 };
 use scanner_rs::git_scan::{OidBytes, RepoArtifactStatus};
 use tempfile::TempDir;
@@ -67,7 +68,7 @@ impl StartSetResolver for TestResolver {
     fn resolve(
         &self,
         _paths: &scanner_rs::git_scan::GitRepoPaths,
-    ) -> Result<Vec<(Vec<u8>, OidBytes)>, Phase1Error> {
+    ) -> Result<Vec<(Vec<u8>, OidBytes)>, RepoOpenError> {
         Ok(self.refs.clone())
     }
 }
@@ -81,7 +82,7 @@ impl RefWatermarkStore for TestWatermarkStore {
         _policy_hash: [u8; 32],
         _start_set_id: [u8; 32],
         ref_names: &[&[u8]],
-    ) -> Result<Vec<Option<OidBytes>>, Phase1Error> {
+    ) -> Result<Vec<Option<OidBytes>>, RepoOpenError> {
         Ok(ref_names
             .iter()
             .map(|name| {
@@ -124,7 +125,7 @@ fn repo_open_linked_worktree_and_alternates() {
         start_set_id,
         &resolver,
         &TestWatermarkStore,
-        Phase1Limits::DEFAULT,
+        RepoOpenLimits::DEFAULT,
     )
     .unwrap();
 
@@ -165,7 +166,7 @@ fn repo_open_sorts_refs_and_loads_watermarks() {
         start_set_id,
         &resolver,
         &TestWatermarkStore,
-        Phase1Limits::DEFAULT,
+        RepoOpenLimits::DEFAULT,
     )
     .unwrap();
 

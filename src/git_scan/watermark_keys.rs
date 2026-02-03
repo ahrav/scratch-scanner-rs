@@ -161,7 +161,7 @@ impl KeyArena {
     /// # Panics
     ///
     /// Panics if the arena would exceed `u32::MAX` bytes after this key.
-    /// With `Phase1Limits::max_refs_in_start_set` at 1M and
+    /// With `RepoOpenLimits::max_refs_in_start_set` at 1M and
     /// `max_refname_bytes` at 1024, worst case is about 1.04 GB and still
     /// within `u32::MAX`. This assert catches sizing bugs.
     ///

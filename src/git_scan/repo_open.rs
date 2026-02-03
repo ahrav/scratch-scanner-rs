@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 use memmap2::Mmap;
 
 use super::byte_arena::{ByteArena, ByteRef};
-use super::errors::Phase1Error;
-use super::limits::Phase1Limits;
+use super::errors::RepoOpenError;
+use super::limits::RepoOpenLimits;
 use super::object_id::{ObjectFormat, OidBytes};
 use super::repo::GitRepoPaths;
 use super::start_set::StartSetId;
@@ -58,6 +58,8 @@ pub struct RepoArtifactPaths {
 /// Memory-mapped artifact files.
 ///
 /// Only populated when `RepoArtifactStatus::Ready`.
+/// Maps are read-only and expected to remain valid for the duration of
+/// a repo job (maintenance must not run concurrently).
 #[derive(Debug, Default)]
 pub struct RepoArtifactMmaps {
     /// Memory-mapped commit-graph.
@@ -104,6 +106,7 @@ pub struct RepoJobState {
     /// Start set refs, sorted deterministically by name.
     ///
     /// Invariant: sorted by `ref_names.get(r.name)` lexicographically.
+    /// Empty when `artifact_status` is `NeedsMaintenance`.
     pub start_set: Vec<StartSetRef>,
 }
 
@@ -123,7 +126,7 @@ pub trait StartSetResolver {
     /// # Errors
     ///
     /// Return an error if ref resolution fails.
-    fn resolve(&self, paths: &GitRepoPaths) -> Result<Vec<(Vec<u8>, OidBytes)>, Phase1Error>;
+    fn resolve(&self, paths: &GitRepoPaths) -> Result<Vec<(Vec<u8>, OidBytes)>, RepoOpenError>;
 }
 
 /// Trait for loading persisted ref watermarks.
@@ -150,7 +153,7 @@ pub trait RefWatermarkStore {
         policy_hash: [u8; 32],
         start_set_id: StartSetId,
         ref_names: &[&[u8]],
-    ) -> Result<Vec<Option<OidBytes>>, Phase1Error>;
+    ) -> Result<Vec<Option<OidBytes>>, RepoOpenError>;
 }
 
 /// Executes repo discovery and open.
@@ -187,8 +190,8 @@ pub fn repo_open(
     start_set_id: StartSetId,
     resolver: &dyn StartSetResolver,
     watermark_store: &dyn RefWatermarkStore,
-    limits: Phase1Limits,
-) -> Result<RepoJobState, Phase1Error> {
+    limits: RepoOpenLimits,
+) -> Result<RepoJobState, RepoOpenError> {
     limits.validate();
 
     let paths = GitRepoPaths::resolve(repo_root, &limits)?;
@@ -256,7 +259,7 @@ fn check_artifact_status(artifact_paths: &RepoArtifactPaths) -> RepoArtifactStat
 /// Memory-maps the artifact files for later read-only access.
 ///
 /// Assumes `check_artifact_status` returned `Ready`.
-fn mmap_artifacts(artifact_paths: &RepoArtifactPaths) -> Result<RepoArtifactMmaps, Phase1Error> {
+fn mmap_artifacts(artifact_paths: &RepoArtifactPaths) -> Result<RepoArtifactMmaps, RepoOpenError> {
     let commit_graph = mmap_file(&artifact_paths.commit_graph)?;
     let midx = mmap_file(&artifact_paths.midx)?;
 
@@ -266,15 +269,15 @@ fn mmap_artifacts(artifact_paths: &RepoArtifactPaths) -> Result<RepoArtifactMmap
     })
 }
 
-fn mmap_file(path: &Path) -> Result<Mmap, Phase1Error> {
-    let file = File::open(path).map_err(Phase1Error::io)?;
+fn mmap_file(path: &Path) -> Result<Mmap, RepoOpenError> {
+    let file = File::open(path).map_err(RepoOpenError::io)?;
 
     #[allow(unsafe_code)]
     unsafe {
         // SAFETY: We map the file read-only and treat it as immutable during the scan.
         // Repo maintenance is expected to be quiescent; if the file is truncated
         // or replaced while mapped, the OS may signal a fault. That risk is accepted.
-        Mmap::map(&file).map_err(Phase1Error::io)
+        Mmap::map(&file).map_err(RepoOpenError::io)
     }
 }
 
@@ -290,12 +293,12 @@ fn resolve_start_set_with_watermarks(
     paths: &GitRepoPaths,
     resolver: &dyn StartSetResolver,
     watermark_store: &dyn RefWatermarkStore,
-    limits: &Phase1Limits,
-) -> Result<(ByteArena, Vec<StartSetRef>), Phase1Error> {
+    limits: &RepoOpenLimits,
+) -> Result<(ByteArena, Vec<StartSetRef>), RepoOpenError> {
     let mut refs = resolver.resolve(paths)?;
 
     if refs.len() > limits.max_refs_in_start_set as usize {
-        return Err(Phase1Error::StartSetTooLarge {
+        return Err(RepoOpenError::StartSetTooLarge {
             count: refs.len(),
             max: limits.max_refs_in_start_set as usize,
         });
@@ -308,7 +311,7 @@ fn resolve_start_set_with_watermarks(
 
     for (name_bytes, tip) in &refs {
         if name_bytes.len() > limits.max_refname_bytes as usize {
-            return Err(Phase1Error::RefNameTooLong {
+            return Err(RepoOpenError::RefNameTooLong {
                 len: name_bytes.len(),
                 max: limits.max_refname_bytes as usize,
             });
@@ -316,7 +319,7 @@ fn resolve_start_set_with_watermarks(
 
         let name_ref = ref_names
             .intern(name_bytes)
-            .ok_or(Phase1Error::ArenaOverflow)?;
+            .ok_or(RepoOpenError::ArenaOverflow)?;
 
         interned_refs.push((name_ref, *tip));
     }
@@ -330,7 +333,7 @@ fn resolve_start_set_with_watermarks(
         watermark_store.load_watermarks(repo_id, policy_hash, start_set_id, &name_slices)?;
 
     if watermarks.len() != interned_refs.len() {
-        return Err(Phase1Error::WatermarkCountMismatch {
+        return Err(RepoOpenError::WatermarkCountMismatch {
             got: watermarks.len(),
             expected: interned_refs.len(),
         });
@@ -360,15 +363,15 @@ fn resolve_start_set_with_watermarks(
 /// Anything else defaults to SHA-1.
 fn detect_object_format(
     paths: &GitRepoPaths,
-    limits: &Phase1Limits,
-) -> Result<ObjectFormat, Phase1Error> {
+    limits: &RepoOpenLimits,
+) -> Result<ObjectFormat, RepoOpenError> {
     for config_path in paths.config_paths() {
         if !config_path.is_file() {
             continue;
         }
 
         let bytes = read_bounded_file(&config_path, limits.max_config_file_bytes)?;
-        let text = std::str::from_utf8(&bytes).map_err(|_| Phase1Error::InvalidUtf8Config)?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| RepoOpenError::InvalidUtf8Config)?;
 
         for line in text.lines() {
             let line = line.trim();
@@ -392,12 +395,12 @@ fn detect_object_format(
 ///
 /// The size check is done via metadata first; the read itself is bounded via
 /// `take()` to guard against concurrent file growth.
-fn read_bounded_file(path: &Path, max_bytes: u32) -> Result<Vec<u8>, Phase1Error> {
-    let file = File::open(path).map_err(Phase1Error::io)?;
-    let metadata = file.metadata().map_err(Phase1Error::io)?;
+fn read_bounded_file(path: &Path, max_bytes: u32) -> Result<Vec<u8>, RepoOpenError> {
+    let file = File::open(path).map_err(RepoOpenError::io)?;
+    let metadata = file.metadata().map_err(RepoOpenError::io)?;
 
     if metadata.len() > max_bytes as u64 {
-        return Err(Phase1Error::FileTooLarge {
+        return Err(RepoOpenError::FileTooLarge {
             size: metadata.len(),
             limit: max_bytes,
         });
@@ -406,7 +409,7 @@ fn read_bounded_file(path: &Path, max_bytes: u32) -> Result<Vec<u8>, Phase1Error
     let size = metadata.len() as usize;
     let mut buffer = Vec::with_capacity(size);
     let mut take = file.take(max_bytes as u64);
-    take.read_to_end(&mut buffer).map_err(Phase1Error::io)?;
+    take.read_to_end(&mut buffer).map_err(RepoOpenError::io)?;
 
     Ok(buffer)
 }

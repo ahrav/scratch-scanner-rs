@@ -1,10 +1,12 @@
+//! Integration test for snapshot planning against a real `git` repo.
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 
 use scanner_rs::git_scan::{
-    repo_open, snapshot_plan, CommitGraph, CommitGraphView, CommitWalkLimits, Phase1Error,
-    Phase1Limits, RefWatermarkStore, StartSetConfig, StartSetResolver,
+    repo_open, snapshot_plan, CommitGraph, CommitGraphView, CommitWalkLimits, RefWatermarkStore,
+    RepoOpenError, RepoOpenLimits, StartSetConfig, StartSetResolver,
 };
 use scanner_rs::git_scan::{OidBytes, RepoArtifactStatus};
 use tempfile::TempDir;
@@ -78,7 +80,7 @@ impl StartSetResolver for TestResolver {
     fn resolve(
         &self,
         _paths: &scanner_rs::git_scan::GitRepoPaths,
-    ) -> Result<Vec<(Vec<u8>, OidBytes)>, Phase1Error> {
+    ) -> Result<Vec<(Vec<u8>, OidBytes)>, RepoOpenError> {
         Ok(self.refs.clone())
     }
 }
@@ -92,7 +94,7 @@ impl RefWatermarkStore for EmptyWatermarkStore {
         _policy_hash: [u8; 32],
         _start_set_id: [u8; 32],
         ref_names: &[&[u8]],
-    ) -> Result<Vec<Option<OidBytes>>, Phase1Error> {
+    ) -> Result<Vec<Option<OidBytes>>, RepoOpenError> {
         Ok(vec![None; ref_names.len()])
     }
 }
@@ -128,7 +130,7 @@ fn snapshot_plan_emits_ref_tips() {
         start_set_id,
         &resolver,
         &EmptyWatermarkStore,
-        Phase1Limits::DEFAULT,
+        RepoOpenLimits::DEFAULT,
     )
     .unwrap();
 
