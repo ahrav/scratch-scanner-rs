@@ -129,7 +129,7 @@ Each op slot stores:
 
 On CQE:
 - `Open` success → enqueue `Stat`
-- `Stat` success → populate `FileState.size`, enqueue for reads
+- `Stat` success → build `ReadState` (size snapshot), enqueue for reads
 - Any failure → update stats, release permit, cleanup
 
 ## Fallback Behavior

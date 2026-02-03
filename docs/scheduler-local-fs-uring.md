@@ -865,7 +865,7 @@ struct FileToken {
 
 struct FileWork {
     path: PathBuf,                  // Path to open
-    size: u64,                      // Discovered size (double-checked at open)
+    size: u64,                      // Discovered size hint (open-time size enforced)
     token: Arc<FileToken>,          // Permit + ID
 }
 
