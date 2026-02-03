@@ -128,12 +128,12 @@ Impact: `io_uring` path is not comparable to production scanning and cannot deli
 
 Work units:
 
-- [ ] Validate the reasoning by confirming the current `local_fs_uring` type dependencies and data flow.
-- [ ] If the reasoning does not hold, document the discrepancy and update the finding.
-- [ ] Draft an evidence-backed plan for integrating `ScanEngine` and how to validate parity with `local.rs`.
-- [ ] Implement the refactor so `local_fs_uring` uses the real engine trait and scratch types.
+- [x] Validate the reasoning by confirming the current `local_fs_uring` type dependencies and data flow. (Confirmed: prior code used `MockEngine`, `ScanScratch`, and `FindingRec`.)
+- [x] If the reasoning does not hold, document the discrepancy and update the finding. (Reasoning holds.)
+- [x] Draft an evidence-backed plan for integrating `ScanEngine` and how to validate parity with `local.rs`. Plan: refactor `local_fs_uring` generics to `ScanEngine`, reuse `FindingRecord` for dedupe/output, and validate parity with mock-engine tests plus a small real-engine scan on the same input.
+- [x] Implement the refactor so `local_fs_uring` uses the real engine trait and scratch types.
 - [ ] Measure: ensure functional parity and no regressions in findings or determinism on the same input set.
-- [ ] Run doc-rigor on code files changed for this task and update docs/comments as needed.
+- [x] Run doc-rigor on code files changed for this task and update docs/comments as needed.
 
 ### Perf: Avoid Re-Reading Overlap Bytes In `local_fs_uring`
 

@@ -38,7 +38,8 @@
 #![cfg(all(target_os = "linux", feature = "io-uring"))]
 
 use super::count_budget::{CountBudget, CountPermit};
-use super::engine_stub::{FileId, FindingRec, MockEngine, ScanScratch, BUFFER_LEN_MAX};
+use super::engine_stub::{FileId, BUFFER_LEN_MAX};
+use super::engine_trait::{EngineScratch, FindingRecord, ScanEngine};
 use super::executor::{Executor, ExecutorConfig, ExecutorHandle, WorkerCtx};
 use super::metrics::MetricsSnapshot;
 use super::output_sink::OutputSink;
@@ -132,7 +133,7 @@ impl LocalFsUringConfig {
     /// # Panics
     ///
     /// Panics if configuration is invalid.
-    pub fn validate(&self, engine: &MockEngine) {
+    pub fn validate<E: ScanEngine>(&self, engine: &E) {
         assert!(self.cpu_workers > 0, "cpu_workers must be > 0");
         assert!(self.io_threads > 0, "io_threads must be > 0");
         assert!(self.ring_entries >= 8, "ring_entries must be >= 8");
@@ -243,11 +244,11 @@ enum CpuTask {
 }
 
 /// Per-CPU-worker scratch space.
-struct CpuScratch {
-    engine: Arc<MockEngine>,
+struct CpuScratch<E: ScanEngine> {
+    engine: Arc<E>,
     out: Arc<dyn OutputSink>,
-    scratch: ScanScratch,
-    pending: Vec<FindingRec>,
+    scratch: E::Scratch,
+    pending: Vec<<E::Scratch as EngineScratch>::Finding>,
     out_buf: Vec<u8>,
     dedupe_within_chunk: bool,
 }
@@ -257,44 +258,37 @@ struct CpuScratch {
 // ============================================================================
 
 /// In-place dedupe of findings by (rule_id, root_hint, span).
-fn dedupe_pending_in_place(p: &mut Vec<FindingRec>) {
+fn dedupe_pending_in_place<F: FindingRecord>(p: &mut Vec<F>) {
     if p.len() <= 1 {
         return;
     }
 
-    p.sort_unstable_by(|a, b| {
+    p.sort_unstable_by_key(|f| {
         (
-            a.rule_id,
-            a.root_hint_start,
-            a.root_hint_end,
-            a.span_start,
-            a.span_end,
+            f.rule_id(),
+            f.root_hint_start(),
+            f.root_hint_end(),
+            f.span_start(),
+            f.span_end(),
         )
-            .cmp(&(
-                b.rule_id,
-                b.root_hint_start,
-                b.root_hint_end,
-                b.span_start,
-                b.span_end,
-            ))
     });
 
     p.dedup_by(|a, b| {
-        a.rule_id == b.rule_id
-            && a.root_hint_start == b.root_hint_start
-            && a.root_hint_end == b.root_hint_end
-            && a.span_start == b.span_start
-            && a.span_end == b.span_end
+        a.rule_id() == b.rule_id()
+            && a.root_hint_start() == b.root_hint_start()
+            && a.root_hint_end() == b.root_hint_end()
+            && a.span_start() == b.span_start()
+            && a.span_end() == b.span_end()
     });
 }
 
 /// Format and emit findings to output sink.
-fn emit_findings_formatted(
-    engine: &MockEngine,
+fn emit_findings_formatted<E: ScanEngine, F: FindingRecord>(
+    engine: &E,
     out: &Arc<dyn OutputSink>,
     out_buf: &mut Vec<u8>,
     display: &[u8],
-    recs: &[FindingRec],
+    recs: &[F],
 ) {
     if recs.is_empty() {
         return;
@@ -304,13 +298,15 @@ fn emit_findings_formatted(
 
     for rec in recs {
         out_buf.extend_from_slice(display);
-        let rule = engine.rule_name(rec.rule_id);
+        let rule = engine.rule_name(rec.rule_id());
 
         use std::io::Write as _;
         let _ = writeln!(
             out_buf,
             ":{}-{} {}",
-            rec.root_hint_start, rec.root_hint_end, rule
+            rec.root_hint_start(),
+            rec.root_hint_end(),
+            rule
         );
     }
 
@@ -321,7 +317,7 @@ fn emit_findings_formatted(
 // CPU Task Runner
 // ============================================================================
 
-fn cpu_runner(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScratch>) {
+fn cpu_runner<E: ScanEngine>(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScratch<E>>) {
     match task {
         CpuTask::ScanChunk {
             token,
@@ -476,12 +472,12 @@ fn open_file_safe(path: &Path, follow_symlinks: bool) -> io::Result<File> {
 ///
 /// On `stop` signal or channel close, we stop accepting new work but drain
 /// all in-flight operations to completion.
-fn io_worker_loop(
+fn io_worker_loop<E: ScanEngine>(
     _wid: usize,
     rx: chan::Receiver<FileWork>,
     pool: TsBufferPool,
     cpu: ExecutorHandle<CpuTask>,
-    engine: Arc<MockEngine>,
+    engine: Arc<E>,
     cfg: LocalFsUringConfig,
     stop: Arc<AtomicBool>,
 ) -> io::Result<UringIoStats> {
@@ -948,7 +944,7 @@ fn walk_and_send_files(
 ///
 /// # Arguments
 ///
-/// - `engine`: Detection engine (provides overlap requirement and scanning)
+/// - `engine`: Detection engine implementing [`ScanEngine`]
 /// - `roots`: Root directories to scan
 /// - `cfg`: Configuration
 /// - `out`: Output sink for findings
@@ -960,8 +956,8 @@ fn walk_and_send_files(
 /// # Errors
 ///
 /// Returns `io::Error` if io_uring initialization fails or an I/O thread panics.
-pub fn scan_local_fs_uring(
-    engine: Arc<MockEngine>,
+pub fn scan_local_fs_uring<E: ScanEngine>(
+    engine: Arc<E>,
     roots: &[PathBuf],
     cfg: LocalFsUringConfig,
     out: Arc<dyn OutputSink>,
@@ -998,12 +994,14 @@ pub fn scan_local_fs_uring(
                 engine: Arc::clone(&engine),
                 out: Arc::clone(&out),
                 scratch: engine.new_scratch(),
-                pending: Vec::with_capacity(engine.tuning.max_findings_per_chunk),
+                // Match the local scan default: avoid steady-state allocs without
+                // relying on engine-specific tuning details.
+                pending: Vec::with_capacity(4096),
                 out_buf: Vec::with_capacity(64 * 1024),
                 dedupe_within_chunk: dedupe,
             }
         },
-        cpu_runner,
+        cpu_runner::<E>,
     );
 
     let cpu = ex.handle();
@@ -1075,7 +1073,7 @@ pub fn scan_local_fs_uring(
 
 #[cfg(test)]
 mod tests {
-    use super::super::engine_stub::{EngineTuning, MockRule};
+    use super::super::engine_stub::{EngineTuning, MockEngine, MockRule};
     use super::super::output_sink::VecSink;
     use super::*;
     use tempfile::tempdir;
