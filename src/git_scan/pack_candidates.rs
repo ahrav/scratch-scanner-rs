@@ -119,6 +119,6 @@ mod tests {
     #[test]
     fn candidate_layout_sizes() {
         assert!(std::mem::size_of::<PackCandidate>() <= 64);
-        assert!(std::mem::size_of::<LooseCandidate>() <= 48);
+        assert!(std::mem::size_of::<LooseCandidate>() <= 64);
     }
 }

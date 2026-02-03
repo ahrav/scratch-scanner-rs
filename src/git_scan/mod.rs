@@ -32,7 +32,10 @@ pub mod midx;
 pub mod midx_error;
 pub mod object_id;
 pub mod object_store;
+pub mod pack_cache;
 pub mod pack_candidates;
+pub mod pack_decode;
+pub mod pack_delta;
 pub mod pack_inflate;
 pub mod pack_plan;
 pub mod pack_plan_model;
@@ -76,9 +79,12 @@ pub use mapping_bridge::{MappingBridge, MappingBridgeConfig, MappingStats};
 pub use midx::MidxView;
 pub use object_id::{ObjectFormat, OidBytes};
 pub use object_store::{ObjectStore, TreeSource};
+pub use pack_cache::{CachedObject, PackCache};
 pub use pack_candidates::{
     CollectingPackCandidateSink, LooseCandidate, PackCandidate, PackCandidateSink,
 };
+pub use pack_decode::{entry_header_at, inflate_entry_payload, PackDecodeError, PackDecodeLimits};
+pub use pack_delta::{apply_delta, DeltaError};
 pub use pack_plan::{build_pack_plans, OidResolver, PackPlanConfig, PackPlanError, PackView};
 pub use pack_plan_model::{
     BaseLoc, CandidateAtOffset, Cluster, DeltaDep, DeltaKind, PackPlan, PackPlanStats,

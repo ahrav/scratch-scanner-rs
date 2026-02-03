@@ -124,6 +124,21 @@ and the delta-base closure:
 Memory is linear in `candidates.len()` + `need_offsets.len()` with explicit
 caps on closure expansion and header parsing.
 
+## Git Pack Decode Budgets
+
+Pack decode uses bounded buffers and a fixed-size cache:
+
+- **Inflate buffers**: zlib output is capped by `PackDecodeLimits.max_object_bytes`
+  for full objects and `PackDecodeLimits.max_delta_bytes` for delta payloads.
+- **Header parsing**: entry headers are bounded by
+  `PackDecodeLimits.max_header_bytes`.
+- **Pack cache**: `PackCache` stores decoded objects in fixed-size slots
+  (default 64 KiB, 4-way set associative). Entries larger than a slot are
+  not cached.
+
+These limits keep pack decoding deterministic and bound memory to the
+configured cache capacity plus temporary inflate buffers.
+
 ## Single-Threaded Pipeline Memory Model
 
 > **Note**: The diagrams below describe the single-threaded `Pipeline` API, which uses

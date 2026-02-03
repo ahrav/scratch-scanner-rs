@@ -63,7 +63,7 @@ use super::tree_order::git_tree_name_cmp;
 ///
 /// This matches common filesystem limits (PATH_MAX on Linux/macOS).
 /// Paths exceeding this are rejected to prevent DoS via deeply nested trees.
-const MAX_PATH_LEN: usize = 8192;
+const MAX_PATH_LEN: usize = 4096;
 
 /// Counters for tree diff operations.
 ///
@@ -408,20 +408,29 @@ impl TreeDiffWalker {
             }
             (false, false) => {
                 if new_kind.is_blob_like() {
-                    let change_kind = if old_kind.is_blob_like() {
-                        ChangeKind::Modify
+                    if old_kind.is_blob_like() {
+                        if new_oid != old_oid {
+                            self.emit_candidate(
+                                candidates,
+                                new_oid,
+                                name,
+                                ChangeKind::Modify,
+                                new_mode,
+                                commit_id,
+                                parent_idx,
+                            )?;
+                        }
                     } else {
-                        ChangeKind::Add
-                    };
-                    self.emit_candidate(
-                        candidates,
-                        new_oid,
-                        name,
-                        change_kind,
-                        new_mode,
-                        commit_id,
-                        parent_idx,
-                    )?;
+                        self.emit_candidate(
+                            candidates,
+                            new_oid,
+                            name,
+                            ChangeKind::Add,
+                            new_mode,
+                            commit_id,
+                            parent_idx,
+                        )?;
+                    }
                 }
             }
         }
@@ -451,6 +460,7 @@ impl TreeDiffWalker {
             });
         }
 
+        let prefix_len = self.path_buf.len();
         self.path_buf.extend_from_slice(name);
         self.path_buf.push(b'/');
 
@@ -462,7 +472,7 @@ impl TreeDiffWalker {
             old_bytes,
             new_pos: 0,
             old_pos: 0,
-            prefix_len: self.path_buf.len(),
+            prefix_len,
         });
 
         Ok(())
