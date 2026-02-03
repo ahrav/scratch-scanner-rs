@@ -128,6 +128,28 @@ graph LR
     W4 --> M2
 ```
 
+## Git Chunking Adapter
+
+Git blob scanning feeds decoded bytes through a fixed-size ring buffer and
+scans overlapping chunks with the core `Engine`. The overlap length is
+`Engine::required_overlap()`; after each chunk scan, the adapter calls
+`ScanScratch::drop_prefix_findings(new_bytes_start)` where `new_bytes_start`
+is the absolute byte offset of the new (non-overlap) region. This guarantees
+chunking invariance without re-materializing full blobs in the scanner.
+
+## FindingKey Hashing
+
+For each match, the engine computes a normalized hash on the **secret span**
+in the final representation (decoded UTF-8 / transformed bytes):
+
+```
+norm_hash = BLAKE3(secret_bytes)
+```
+
+The hash is stored in a scratch sidecar aligned with `FindingRec` indices and
+is used by Git persistence as part of the deterministic finding key
+`(start, end, rule_id, norm_hash)`. No raw secret bytes are stored.
+
 **Pressure Coalescing**: If windows exceed `max_windows_per_rule_variant` (16), the gap doubles until windows fit, or everything merges into one.
 
 ### Seed Confirmation + Expansion

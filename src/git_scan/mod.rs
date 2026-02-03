@@ -25,6 +25,7 @@
 pub mod byte_arena;
 pub mod commit_walk;
 pub mod commit_walk_limits;
+pub mod engine_adapter;
 pub mod errors;
 pub mod limits;
 pub mod mapping_bridge;
@@ -77,6 +78,10 @@ pub use commit_walk::{
     ParentScratch, PlannedCommit,
 };
 pub use commit_walk_limits::CommitWalkLimits;
+pub use engine_adapter::{
+    scan_blob_chunked, EngineAdapter, EngineAdapterConfig, EngineAdapterError, FindingKey,
+    ScannedBlob, DEFAULT_CHUNK_BYTES, DEFAULT_PATH_ARENA_BYTES,
+};
 pub use errors::{CommitPlanError, RepoOpenError, SpillError, TreeDiffError};
 pub use limits::RepoOpenLimits;
 pub use mapping_bridge::{MappingBridge, MappingBridgeConfig, MappingStats};

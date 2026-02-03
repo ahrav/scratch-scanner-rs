@@ -140,6 +140,94 @@ fn decoded_prefilter_hit(engine: &Engine, decoded: &[u8]) -> bool {
     hit
 }
 
+#[test]
+fn norm_hash_deterministic_for_raw_matches() {
+    let rule = RuleSpec {
+        name: "tok",
+        anchors: &[b"TOK_"],
+        radius: 16,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        secret_group: Some(1),
+        re: Regex::new(r"TOK_([A-Z0-9]{4})").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+    let mut scratch = engine.new_scratch();
+    let hay = b"xx TOK_ABCD yy TOK_ABCD zz TOK_WXYZ";
+    engine.scan_chunk_into(hay, FileId(0), 0, &mut scratch);
+    scratch.drop_prefix_findings(0);
+
+    let recs = scratch.findings();
+    let hashes = scratch.norm_hashes();
+    assert_eq!(recs.len(), hashes.len());
+    assert!(recs.len() >= 3);
+
+    let mut seen = std::collections::HashMap::new();
+    for (rec, hash) in recs.iter().zip(hashes.iter()) {
+        let secret = &hay[rec.span_start as usize..rec.span_end as usize];
+        let expected = *blake3::hash(secret).as_bytes();
+        assert_eq!(*hash, expected);
+        *seen.entry(*hash).or_insert(0usize) += 1;
+    }
+
+    let abcd = *blake3::hash(b"ABCD").as_bytes();
+    let wxyz = *blake3::hash(b"WXYZ").as_bytes();
+    assert_eq!(seen.get(&abcd), Some(&2));
+    assert_eq!(seen.get(&wxyz), Some(&1));
+}
+
+#[test]
+fn norm_hash_uses_decoded_bytes_for_base64_transform() {
+    let rule = RuleSpec {
+        name: "b64",
+        anchors: &[b"SECRET_"],
+        radius: 24,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        secret_group: Some(1),
+        re: Regex::new(r"SECRET_([A-Z]{4})").unwrap(),
+    };
+    let transforms = vec![TransformConfig {
+        id: TransformId::Base64,
+        mode: TransformMode::Always,
+        gate: Gate::AnchorsInDecoded,
+        min_len: 8,
+        max_spans_per_buffer: 8,
+        max_encoded_len: 1024,
+        max_decoded_bytes: 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    }];
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        transforms,
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+    let mut scratch = engine.new_scratch();
+    let hay = b"prefix U0VDUkVUX0FCQ0Q= suffix";
+    engine.scan_chunk_into(hay, FileId(0), 0, &mut scratch);
+    scratch.drop_prefix_findings(0);
+
+    let hashes = scratch.norm_hashes();
+    assert_eq!(hashes.len(), 1);
+    let expected = *blake3::hash(b"ABCD").as_bytes();
+    assert_eq!(hashes[0], expected);
+}
+
 // Helper that uses the allocation-free scan API and materializes findings.
 fn scan_chunk_findings(engine: &Engine, hay: &[u8]) -> Vec<Finding> {
     let mut scratch = engine.new_scratch();

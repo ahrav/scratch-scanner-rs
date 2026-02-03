@@ -87,7 +87,7 @@ pub fn gitleaks_rules() -> Vec<RuleSpec> {
 pub use engine::{bench_find_spans_into, bench_stream_decode_base64, bench_stream_decode_url};
 #[cfg(feature = "stats")]
 pub use engine::{AnchorPlanStats, VectorscanStats};
-pub use engine::{Engine, ScanScratch};
+pub use engine::{Engine, NormHash, ScanScratch};
 
 pub use async_io::AsyncIoConfig;
 #[cfg(any(target_os = "linux", target_os = "macos"))]

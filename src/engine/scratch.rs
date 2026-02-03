@@ -22,6 +22,9 @@ use super::work_items::{PendingDecodeSpan, PendingWindow, SpanStreamEntry, WorkI
 // Forward declaration for Engine (will be used via super::)
 use super::Engine;
 
+/// Normalized secret hash bytes (BLAKE3 output).
+pub type NormHash = [u8; 32];
+
 /// Scratch histogram for entropy gating.
 ///
 /// # Performance
@@ -80,6 +83,7 @@ impl RootSpanMapCtx {
     }
 
     pub(super) fn map_span(&self, span: std::ops::Range<usize>) -> std::ops::Range<usize> {
+        // Map decoded offsets back to absolute root-buffer offsets.
         // SAFETY: The engine-owned transform config lives for the duration
         // of the scan, and encoded bytes are valid while the map context is set.
         let tc = unsafe { &*self.tc };
@@ -96,6 +100,7 @@ impl RootSpanMapCtx {
         &self,
         root_span: std::ops::Range<usize>,
     ) -> Option<bool> {
+        // Only applicable for URL-percent transforms.
         // SAFETY: The engine-owned transform config lives for the duration
         // of the scan, and encoded bytes are valid while the map context is set.
         let tc = unsafe { &*self.tc };
@@ -234,6 +239,8 @@ pub struct ScanScratch {
     /// capacity prevents allocation in the hot path; overflow increments
     /// `findings_dropped` instead of reallocating.
     pub(super) out: ScratchVec<FindingRec>,
+    /// Normalized hash for each finding (aligned with `out`).
+    pub(super) norm_hash: ScratchVec<NormHash>,
     /// Drop boundary used by `drop_prefix_findings` (absolute offset in file).
     pub(super) drop_hint_end: ScratchVec<u64>,
     pub(super) max_findings: usize,     // Per-chunk cap from tuning.
@@ -289,6 +296,8 @@ pub struct ScanScratch {
     pub(super) tmp_findings: Vec<FindingRec>,
     /// Drop boundaries aligned with `tmp_findings`.
     pub(super) tmp_drop_hint_end: Vec<u64>,
+    /// Normalized hashes aligned with `tmp_findings`.
+    pub(super) tmp_norm_hash: Vec<NormHash>,
     /// Per-rule stream hit counts for decoded-window seeding.
     ///
     /// Indexing is `rule_id * 3 + variant_idx` (Raw/Utf16Le/Utf16Be).
@@ -390,6 +399,8 @@ impl ScanScratch {
 
         Self {
             out: ScratchVec::with_capacity(max_findings).expect("scratch out allocation failed"),
+            norm_hash: ScratchVec::with_capacity(max_findings)
+                .expect("scratch norm_hash allocation failed"),
             drop_hint_end: ScratchVec::with_capacity(max_findings)
                 .expect("scratch drop_hint_end allocation failed"),
             max_findings,
@@ -412,6 +423,7 @@ impl ScanScratch {
             span_streams: Vec::with_capacity(engine.transforms.len()),
             tmp_findings: Vec::with_capacity(max_findings),
             tmp_drop_hint_end: Vec::with_capacity(max_findings),
+            tmp_norm_hash: Vec::with_capacity(max_findings),
             stream_hit_counts: vec![0u32; rules_len.saturating_mul(3)],
             stream_hit_touched: ScratchVec::with_capacity(rules_len.saturating_mul(3))
                 .expect("scratch stream_hit_touched allocation failed"),
@@ -471,6 +483,7 @@ impl ScanScratch {
     /// slices into scratch buffers are invalid after this call.
     pub(super) fn reset_for_scan(&mut self, engine: &Engine) {
         self.out.clear();
+        self.norm_hash.clear();
         self.drop_hint_end.clear();
         self.findings_dropped = 0;
         self.work_q.clear();
@@ -488,6 +501,7 @@ impl ScanScratch {
         self.span_streams.clear();
         self.tmp_findings.clear();
         self.tmp_drop_hint_end.clear();
+        self.tmp_norm_hash.clear();
         for idx in self.stream_hit_touched.drain() {
             let slot = idx as usize;
             if let Some(hit) = self.stream_hit_counts.get_mut(slot) {
@@ -645,6 +659,10 @@ impl ScanScratch {
             self.out = ScratchVec::with_capacity(self.max_findings)
                 .expect("scratch out allocation failed");
         }
+        if self.norm_hash.capacity() < self.max_findings {
+            self.norm_hash = ScratchVec::with_capacity(self.max_findings)
+                .expect("scratch norm_hash allocation failed");
+        }
         if self.drop_hint_end.capacity() < self.max_findings {
             self.drop_hint_end = ScratchVec::with_capacity(self.max_findings)
                 .expect("scratch drop_hint_end allocation failed");
@@ -717,6 +735,10 @@ impl ScanScratch {
             self.tmp_drop_hint_end
                 .reserve(self.max_findings - self.tmp_drop_hint_end.capacity());
         }
+        if self.tmp_norm_hash.capacity() < self.max_findings {
+            self.tmp_norm_hash
+                .reserve(self.max_findings - self.tmp_norm_hash.capacity());
+        }
     }
 
     /// Updates inferred overlap metadata for the current chunk.
@@ -774,11 +796,17 @@ impl ScanScratch {
     /// Panics if `out.capacity()` is smaller than the number of findings.
     pub fn drain_findings(&mut self, out: &mut Vec<FindingRec>) {
         out.clear();
+        debug_assert_eq!(
+            self.out.len(),
+            self.norm_hash.len(),
+            "norm hash length mismatch"
+        );
         assert!(
             out.capacity() >= self.out.len(),
             "output capacity too small"
         );
         out.extend(self.out.drain());
+        self.norm_hash.clear();
         self.drop_hint_end.clear();
     }
 
@@ -822,6 +850,11 @@ impl ScanScratch {
             self.drop_hint_end.len(),
             "drop hint length mismatch"
         );
+        debug_assert_eq!(
+            self.out.len(),
+            self.norm_hash.len(),
+            "norm hash length mismatch"
+        );
         // Compact in place: keep only findings where the dedupe boundary is after
         // the new-bytes start.
         let mut write_idx = 0;
@@ -842,15 +875,22 @@ impl ScanScratch {
                     }
                 }
                 self.drop_hint_end.as_mut_slice()[write_idx] = drop_end;
+                let hash = self.norm_hash.as_slice()[read_idx];
+                self.norm_hash.as_mut_slice()[write_idx] = hash;
                 write_idx += 1;
             }
         }
         self.out.truncate(write_idx);
         self.drop_hint_end.truncate(write_idx);
+        self.norm_hash.truncate(write_idx);
     }
 
     pub(crate) fn drop_hint_end(&self) -> &[u64] {
         self.drop_hint_end.as_slice()
+    }
+
+    pub(crate) fn norm_hashes(&self) -> &[NormHash] {
+        self.norm_hash.as_slice()
     }
 
     /// Returns a shared view of accumulated finding records.
@@ -860,6 +900,11 @@ impl ScanScratch {
     ///
     /// Order reflects scan traversal and is not guaranteed to be sorted by span.
     pub fn findings(&self) -> &[FindingRec] {
+        debug_assert_eq!(
+            self.out.len(),
+            self.norm_hash.len(),
+            "norm hash length mismatch"
+        );
         self.out.as_slice()
     }
 
@@ -868,8 +913,8 @@ impl ScanScratch {
         self.findings_dropped
     }
 
-    pub(super) fn push_finding(&mut self, rec: FindingRec) {
-        self.push_finding_with_drop_hint(rec, rec.root_hint_end, rec.dedupe_with_span);
+    pub(super) fn push_finding(&mut self, rec: FindingRec, norm_hash: NormHash) {
+        self.push_finding_with_drop_hint(rec, norm_hash, rec.root_hint_end, rec.dedupe_with_span);
     }
 
     /// Records a finding with an explicit drop boundary, deduplicating against
@@ -916,9 +961,15 @@ impl ScanScratch {
     pub(super) fn push_finding_with_drop_hint(
         &mut self,
         rec: FindingRec,
+        norm_hash: NormHash,
         drop_hint_end: u64,
         include_span: bool,
     ) {
+        debug_assert_eq!(
+            self.out.len(),
+            self.norm_hash.len(),
+            "norm hash length mismatch"
+        );
         // For root-level findings, include the exact span in the dedup key.
         // For transform-derived findings with mapped root spans, zero the span
         // since decoded offsets can vary by chunk alignment. When mapping is
@@ -1037,6 +1088,7 @@ impl ScanScratch {
                     if should_replace {
                         *existing = rec;
                         self.drop_hint_end.as_mut_slice()[i] = drop_hint_end;
+                        self.norm_hash.as_mut_slice()[i] = norm_hash;
                     }
                     return;
                 }
@@ -1046,6 +1098,7 @@ impl ScanScratch {
 
         if self.out.len() < self.max_findings {
             self.out.push(rec);
+            self.norm_hash.push(norm_hash);
             self.drop_hint_end.push(drop_hint_end);
         } else {
             self.findings_dropped = self.findings_dropped.saturating_add(1);

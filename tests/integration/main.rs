@@ -4,6 +4,7 @@
 
 mod anchor_optimization;
 mod git_commit_walk;
+mod git_engine_adapter;
 mod git_mapping_bridge;
 mod git_pack_exec;
 mod git_pack_plan;

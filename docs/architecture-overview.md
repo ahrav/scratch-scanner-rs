@@ -111,6 +111,7 @@ graph TB
 | **MIDX Mapping**    | `src/git_scan/midx.rs`, `src/git_scan/mapping_bridge.rs` | MIDX parsing and blob-to-pack mapping                     |
 | **Tree Diff Walker** | `src/git_scan/tree_diff.rs` | OID-only tree diffs that emit candidate blobs with context          |
 | **Pack Executor**   | `src/git_scan/pack_exec.rs` | Executes pack plans to decode candidate blobs with bounded buffers |
+| **Engine Adapter**  | `src/git_scan/engine_adapter.rs` | Streams decoded blob bytes into the engine with overlap chunking |
 | **Pack I/O**        | `src/git_scan/pack_io.rs` | MIDX-backed pack mmap loader for cross-pack REF delta bases |
 | **Pack Strategy**   | `src/git_scan/pack_strategy.rs` | Chooses sparse vs pack-linear execution from plan stats |
 | **Pack AMQ Filter** | `src/git_scan/pack_amq.rs` | Approximate membership filter for pack-linear candidate gating |
