@@ -1968,4 +1968,115 @@ mod tests {
         let buf2 = pool.try_acquire();
         assert!(buf2.is_some());
     }
+
+    #[test]
+    fn uring_open_stat_parity_with_blocking() -> io::Result<()> {
+        let engine = Arc::new(MockEngine::with_tuning(
+            vec![MockRule {
+                name: "secret".into(),
+                pattern: b"SECRET".to_vec(),
+            }],
+            6,
+            EngineTuning {
+                max_findings_per_chunk: 128,
+                max_rules: 16,
+            },
+        ));
+
+        let dir = tempdir()?;
+        let file_path = dir.path().join("a.txt");
+        std::fs::write(&file_path, b"xxSECRETyy")?;
+
+        let base_cfg = LocalFsUringConfig {
+            cpu_workers: 2,
+            io_threads: 1,
+            ring_entries: 64,
+            io_depth: 16,
+            chunk_size: 16,
+            max_in_flight_files: 8,
+            file_queue_cap: 8,
+            pool_buffers: 32,
+            use_registered_buffers: false,
+            open_stat_mode: OpenStatMode::BlockingOnly,
+            resolve_policy: ResolvePolicy::Default,
+            follow_symlinks: false,
+            max_file_size: None,
+            seed: 123,
+            dedupe_within_chunk: true,
+        };
+
+        let sink_blocking = Arc::new(VecSink::new());
+        let (_summary, _io_stats, _cpu_metrics) = scan_local_fs_uring(
+            Arc::clone(&engine),
+            &[dir.path().to_path_buf()],
+            base_cfg.clone(),
+            sink_blocking.clone(),
+        )?;
+        let out_blocking = sink_blocking.take();
+
+        let sink_uring = Arc::new(VecSink::new());
+        let mut uring_cfg = base_cfg;
+        uring_cfg.open_stat_mode = OpenStatMode::UringPreferred;
+        let (_summary, _io_stats, _cpu_metrics) = scan_local_fs_uring(
+            Arc::clone(&engine),
+            &[dir.path().to_path_buf()],
+            uring_cfg,
+            sink_uring.clone(),
+        )?;
+        let out_uring = sink_uring.take();
+
+        assert_eq!(
+            out_blocking, out_uring,
+            "open/stat path should match blocking output"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn blocking_mode_skips_open_stat_ops() -> io::Result<()> {
+        let engine = Arc::new(MockEngine::with_tuning(
+            vec![MockRule {
+                name: "secret".into(),
+                pattern: b"SECRET".to_vec(),
+            }],
+            6,
+            EngineTuning {
+                max_findings_per_chunk: 128,
+                max_rules: 16,
+            },
+        ));
+
+        let dir = tempdir()?;
+        let file_path = dir.path().join("a.txt");
+        std::fs::write(&file_path, b"xxSECRETyy")?;
+
+        let cfg = LocalFsUringConfig {
+            cpu_workers: 2,
+            io_threads: 1,
+            ring_entries: 64,
+            io_depth: 16,
+            chunk_size: 16,
+            max_in_flight_files: 8,
+            file_queue_cap: 8,
+            pool_buffers: 32,
+            use_registered_buffers: false,
+            open_stat_mode: OpenStatMode::BlockingOnly,
+            resolve_policy: ResolvePolicy::Default,
+            follow_symlinks: false,
+            max_file_size: None,
+            seed: 123,
+            dedupe_within_chunk: true,
+        };
+
+        let sink = Arc::new(VecSink::new());
+        let (_summary, io_stats, _cpu_metrics) =
+            scan_local_fs_uring(engine, &[dir.path().to_path_buf()], cfg, sink)?;
+
+        assert_eq!(io_stats.open_ops_submitted, 0);
+        assert_eq!(io_stats.stat_ops_submitted, 0);
+        assert_eq!(io_stats.open_stat_fallbacks, 0);
+
+        Ok(())
+    }
 }

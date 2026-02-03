@@ -940,6 +940,8 @@ let cfg = LocalFsUringConfig {
     file_queue_cap: 256,
     pool_buffers: 256,
     use_registered_buffers: false,
+    open_stat_mode: OpenStatMode::UringPreferred,
+    resolve_policy: ResolvePolicy::Default,
     follow_symlinks: false,
     max_file_size: Some(100 * 1024 * 1024),  // 100 MB max
     seed: 1,
@@ -957,6 +959,9 @@ let (summary, io_stats, cpu_metrics) =
 // Results
 println!("Files seen: {}", summary.files_seen);
 println!("Files enqueued: {}", summary.files_enqueued);
+println!("Open ops submitted: {}", io_stats.open_ops_submitted);
+println!("Stat ops submitted: {}", io_stats.stat_ops_submitted);
+println!("Open/stat fallbacks: {}", io_stats.open_stat_fallbacks);
 println!("Reads completed: {}", io_stats.reads_completed);
 println!("Chunks scanned: {}", cpu_metrics.chunks_scanned);
 ```
