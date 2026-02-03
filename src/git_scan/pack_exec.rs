@@ -4,6 +4,12 @@
 //! and emits decoded blob bytes to a caller-provided sink. All skips are
 //! recorded with explicit reasons.
 //!
+//! Execution order is driven by `PackPlan.exec_order`: when absent, offsets
+//! are processed in ascending order and candidate gating uses a single
+//! forward-only merge cursor over `candidate_offsets`. When present, the
+//! executor precomputes exact per-offset candidate ranges to preserve
+//! gating under out-of-order execution.
+//!
 //! The executor treats decode failures as per-offset skips and only returns
 //! fatal errors for pack parsing, sink failures, or external base loading
 //! errors.
@@ -24,7 +30,8 @@ use super::pack_plan_model::{BaseLoc, DeltaDep, PackPlan};
 
 /// External base object for REF deltas.
 ///
-/// The bytes should contain the fully inflated base object.
+/// The bytes must contain the fully inflated base object and will be used as
+/// the delta application base.
 #[derive(Debug)]
 pub struct ExternalBase {
     pub kind: ObjectKind,
@@ -32,16 +39,24 @@ pub struct ExternalBase {
 }
 
 /// Provider for external REF delta bases.
+///
+/// Implementations may source bases from loose objects or other packs.
 pub trait ExternalBaseProvider {
     /// Returns the base object for a given OID, or `None` if missing.
+    ///
+    /// Any error is treated as fatal for the entire pack execution.
     fn load_base(&mut self, oid: &OidBytes) -> Result<Option<ExternalBase>, PackExecError>;
 }
 
 /// Sink for decoded pack blobs.
+///
+/// The sink is invoked only for blob objects. Non-blob objects are recorded
+/// as skips with `SkipReason::NotBlob`.
 pub trait PackObjectSink {
     /// Receives a decoded blob candidate.
     ///
-    /// The `bytes` slice is only valid for the duration of the call.
+    /// The `bytes` slice is only valid for the duration of the call and may
+    /// be backed by either a cache entry or a scratch buffer.
     fn emit(
         &mut self,
         candidate: &PackCandidate,
@@ -56,6 +71,8 @@ pub trait PackObjectSink {
 }
 
 /// Pack executor error taxonomy (fatal only).
+///
+/// Decode errors do not appear here; they are tracked as `SkipReason`s.
 #[derive(Debug)]
 pub enum PackExecError {
     PackParse(PackParseError),
@@ -103,6 +120,9 @@ pub enum SkipReason {
 }
 
 /// Record of a skipped offset.
+///
+/// A single offset may appear multiple times if multiple candidates map to
+/// the same offset and are all skipped.
 #[derive(Debug)]
 pub struct SkipRecord {
     pub offset: u64,
@@ -133,8 +153,8 @@ pub struct PackExecReport {
     pub skips: Vec<SkipRecord>,
 }
 
-#[derive(Clone, Copy, Debug)]
 /// Where the decoded bytes live after `decode_offset`.
+#[derive(Clone, Copy, Debug)]
 enum DecodedStorage {
     Cache,
     Scratch,
@@ -151,6 +171,9 @@ struct DecodedObject {
 ///
 /// The plan's `exec_order` is respected when present to satisfy forward
 /// delta dependencies. Pack bytes must contain the full pack file.
+///
+/// The returned report includes both successful decode stats and per-offset
+/// skip reasons for non-fatal failures.
 ///
 /// # Errors
 /// - `PackExecError::PackParse` for invalid pack headers.
@@ -174,25 +197,10 @@ pub fn execute_pack_plan<S: PackObjectSink, B: ExternalBaseProvider>(
         delta_map.insert(dep.offset, *dep);
     }
 
-    // Map each need_offset index to the candidate indices that share it.
-    let mut candidate_ranges = vec![None; plan.need_offsets.len()];
-    let mut cand_idx = 0usize;
-    for (need_idx, &offset) in plan.need_offsets.iter().enumerate() {
-        let start = cand_idx;
-        while cand_idx < plan.candidate_offsets.len()
-            && plan.candidate_offsets[cand_idx].offset == offset
-        {
-            cand_idx += 1;
-        }
-        if cand_idx > start {
-            candidate_ranges[need_idx] = Some((start, cand_idx));
-        }
-    }
-
     let mut inflate_buf: Vec<u8> = Vec::with_capacity(limits.max_delta_bytes.max(1024));
     let mut result_buf: Vec<u8> = Vec::with_capacity(limits.max_object_bytes.max(1024));
 
-    let mut handle_idx = |idx: usize| -> Result<(), PackExecError> {
+    let mut handle_idx = |idx: usize, range: Option<(usize, usize)>| -> Result<(), PackExecError> {
         let offset = plan.need_offsets[idx];
 
         let decoded = if cache.get(offset).is_some() {
@@ -228,7 +236,7 @@ pub fn execute_pack_plan<S: PackObjectSink, B: ExternalBaseProvider>(
             DecodedStorage::Scratch => result_buf.as_slice(),
         };
 
-        if let Some((start, end)) = candidate_ranges[idx] {
+        if let Some((start, end)) = range {
             for cand_idx in start..end {
                 let candidate =
                     &plan.candidates[plan.candidate_offsets[cand_idx].cand_idx as usize];
@@ -250,12 +258,30 @@ pub fn execute_pack_plan<S: PackObjectSink, B: ExternalBaseProvider>(
     };
 
     if let Some(order) = plan.exec_order.as_ref() {
+        // Out-of-order execution: precompute exact candidate ranges by need index.
+        let candidate_ranges = build_candidate_ranges(plan);
         for &idx in order {
-            handle_idx(idx as usize)?;
+            let idx = idx as usize;
+            handle_idx(idx, candidate_ranges[idx])?;
         }
     } else {
-        for idx in 0..plan.need_offsets.len() {
-            handle_idx(idx)?;
+        // Monotone execution: merge candidate offsets with need offsets.
+        let cand = &plan.candidate_offsets;
+        let mut cand_idx = 0usize;
+        for (idx, &offset) in plan.need_offsets.iter().enumerate() {
+            while cand_idx < cand.len() && cand[cand_idx].offset < offset {
+                cand_idx += 1;
+            }
+            let range = if cand_idx < cand.len() && cand[cand_idx].offset == offset {
+                let start = cand_idx;
+                while cand_idx < cand.len() && cand[cand_idx].offset == offset {
+                    cand_idx += 1;
+                }
+                Some((start, cand_idx))
+            } else {
+                None
+            };
+            handle_idx(idx, range)?;
         }
     }
 
@@ -263,7 +289,32 @@ pub fn execute_pack_plan<S: PackObjectSink, B: ExternalBaseProvider>(
     Ok(report)
 }
 
+/// Build candidate index ranges for each `need_offsets` entry.
+///
+/// This is used only when `exec_order` reorders offsets; it avoids repeated
+/// scans of the candidate list.
+fn build_candidate_ranges(plan: &PackPlan) -> Vec<Option<(usize, usize)>> {
+    let mut ranges = vec![None; plan.need_offsets.len()];
+    let mut cand_idx = 0usize;
+    for (need_idx, &offset) in plan.need_offsets.iter().enumerate() {
+        let start = cand_idx;
+        while cand_idx < plan.candidate_offsets.len()
+            && plan.candidate_offsets[cand_idx].offset == offset
+        {
+            cand_idx += 1;
+        }
+        if cand_idx > start {
+            ranges[need_idx] = Some((start, cand_idx));
+        }
+    }
+    ranges
+}
+
 /// Decodes a single offset, using the cache for bases and for storing results.
+///
+/// Returns `Ok(None)` for non-fatal decode issues, with the skip recorded in
+/// the report. Successful decodes return metadata describing where the bytes
+/// reside (cache vs scratch).
 #[allow(clippy::too_many_arguments)]
 fn decode_offset<'a, B: ExternalBaseProvider>(
     pack: &'a PackFile<'a>,
@@ -472,6 +523,9 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
 }
 
 /// Inflates a delta payload and applies it to the provided base.
+///
+/// Decode errors are tracked as skips in the report; delta application
+/// errors are returned to the caller as `DeltaError`.
 #[allow(clippy::too_many_arguments)]
 fn decode_delta_entry(
     pack: &PackFile<'_>,
@@ -513,6 +567,9 @@ fn decode_delta_entry(
 }
 
 /// Returns the best OID to query for external bases.
+///
+/// If the planner resolved a specific external base OID, prefer it over the
+/// base OID encoded in the REF delta header.
 fn oid_or_base(base_oid: OidBytes, dep: Option<&DeltaDep>) -> OidBytes {
     match dep {
         Some(DeltaDep {
@@ -520,5 +577,343 @@ fn oid_or_base(base_oid: OidBytes, dep: Option<&DeltaDep>) -> OidBytes {
             ..
         }) => *oid,
         _ => base_oid,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git_scan::byte_arena::{ByteArena, ByteRef};
+    use crate::git_scan::pack_plan_model::{CandidateAtOffset, PackPlanStats};
+    use crate::git_scan::tree_candidate::{CandidateContext, ChangeKind};
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    #[derive(Default)]
+    struct TestSink {
+        emitted: Vec<OidBytes>,
+    }
+
+    impl PackObjectSink for TestSink {
+        fn emit(
+            &mut self,
+            candidate: &PackCandidate,
+            _path: &[u8],
+            _bytes: &[u8],
+        ) -> Result<(), PackExecError> {
+            self.emitted.push(candidate.oid);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct NoExternal;
+
+    impl ExternalBaseProvider for NoExternal {
+        fn load_base(&mut self, _oid: &OidBytes) -> Result<Option<ExternalBase>, PackExecError> {
+            panic!("unexpected external base lookup in test");
+        }
+    }
+
+    fn ctx(path_ref: ByteRef) -> CandidateContext {
+        CandidateContext {
+            commit_id: 1,
+            parent_idx: 0,
+            change_kind: ChangeKind::Add,
+            ctx_flags: 0,
+            cand_flags: 0,
+            path_ref,
+        }
+    }
+
+    fn encode_entry_header(kind: ObjectKind, size: usize) -> Vec<u8> {
+        let obj_type = match kind {
+            ObjectKind::Commit => 1u8,
+            ObjectKind::Tree => 2u8,
+            ObjectKind::Blob => 3u8,
+            ObjectKind::Tag => 4u8,
+        };
+        let mut out = Vec::new();
+        let mut remaining = size as u64;
+        let mut first = ((obj_type & 0x07) << 4) | ((remaining & 0x0f) as u8);
+        remaining >>= 4;
+        if remaining != 0 {
+            first |= 0x80;
+        }
+        out.push(first);
+        while remaining != 0 {
+            let mut byte = (remaining & 0x7f) as u8;
+            remaining >>= 7;
+            if remaining != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+        }
+        out
+    }
+
+    fn compress(data: &[u8]) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn build_pack(entries: &[(ObjectKind, &[u8])]) -> (Vec<u8>, Vec<u64>) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"PACK");
+        bytes.extend_from_slice(&2u32.to_be_bytes());
+        bytes.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+
+        let mut offsets = Vec::with_capacity(entries.len());
+        for (kind, data) in entries {
+            offsets.push(bytes.len() as u64);
+            bytes.extend_from_slice(&encode_entry_header(*kind, data.len()));
+            bytes.extend_from_slice(&compress(data));
+        }
+
+        bytes.extend_from_slice(&[0u8; 20]);
+        (bytes, offsets)
+    }
+
+    fn candidate_span(offsets: &[CandidateAtOffset]) -> u64 {
+        if offsets.is_empty() {
+            0
+        } else {
+            let first = offsets.first().unwrap().offset;
+            let last = offsets.last().unwrap().offset;
+            last.saturating_sub(first)
+        }
+    }
+
+    fn build_plan(
+        need_offsets: Vec<u64>,
+        candidates: Vec<PackCandidate>,
+        candidate_offsets: Vec<CandidateAtOffset>,
+        exec_order: Option<Vec<u32>>,
+    ) -> PackPlan {
+        let stats = PackPlanStats {
+            candidate_count: candidates.len() as u32,
+            need_count: need_offsets.len() as u32,
+            external_bases: 0,
+            forward_deps: exec_order.as_ref().map_or(0, |_| 1),
+            candidate_span: candidate_span(&candidate_offsets),
+        };
+
+        PackPlan {
+            pack_id: 0,
+            oid_len: 20,
+            candidates,
+            candidate_offsets,
+            need_offsets,
+            delta_deps: Vec::new(),
+            exec_order,
+            clusters: Vec::new(),
+            stats,
+        }
+    }
+
+    #[test]
+    fn merge_fast_path_emits_single_candidate() {
+        let (pack, offsets) = build_pack(&[(ObjectKind::Blob, b"hello")]);
+        let offset = offsets[0];
+
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"file.txt").unwrap();
+        let candidate = PackCandidate {
+            oid: OidBytes::sha1([0x11; 20]),
+            ctx: ctx(path_ref),
+            pack_id: 0,
+            offset,
+        };
+
+        let plan = build_plan(
+            vec![offset],
+            vec![candidate],
+            vec![CandidateAtOffset {
+                offset,
+                cand_idx: 0,
+            }],
+            None,
+        );
+
+        let mut cache = PackCache::new(0);
+        let mut external = NoExternal;
+        let mut sink = TestSink::default();
+
+        let report = execute_pack_plan(
+            &plan,
+            &pack,
+            &arena,
+            &PackDecodeLimits::new(64, 1024, 1024),
+            &mut cache,
+            &mut external,
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(report.stats.emitted_candidates, 1);
+        assert_eq!(sink.emitted.len(), 1);
+    }
+
+    #[test]
+    fn merge_fast_path_emits_multiple_candidates_at_same_offset() {
+        let (pack, offsets) = build_pack(&[(ObjectKind::Blob, b"hello")]);
+        let offset = offsets[0];
+
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"file.txt").unwrap();
+        let candidates = vec![
+            PackCandidate {
+                oid: OidBytes::sha1([0x11; 20]),
+                ctx: ctx(path_ref),
+                pack_id: 0,
+                offset,
+            },
+            PackCandidate {
+                oid: OidBytes::sha1([0x22; 20]),
+                ctx: ctx(path_ref),
+                pack_id: 0,
+                offset,
+            },
+        ];
+
+        let plan = build_plan(
+            vec![offset],
+            candidates,
+            vec![
+                CandidateAtOffset {
+                    offset,
+                    cand_idx: 0,
+                },
+                CandidateAtOffset {
+                    offset,
+                    cand_idx: 1,
+                },
+            ],
+            None,
+        );
+
+        let mut cache = PackCache::new(0);
+        let mut external = NoExternal;
+        let mut sink = TestSink::default();
+
+        let report = execute_pack_plan(
+            &plan,
+            &pack,
+            &arena,
+            &PackDecodeLimits::new(64, 1024, 1024),
+            &mut cache,
+            &mut external,
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(report.stats.emitted_candidates, 2);
+        assert_eq!(sink.emitted.len(), 2);
+    }
+
+    #[test]
+    fn merge_fast_path_skips_non_blob_candidates() {
+        let (pack, offsets) = build_pack(&[(ObjectKind::Tree, b"tree")]);
+        let offset = offsets[0];
+
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"file.txt").unwrap();
+        let candidate = PackCandidate {
+            oid: OidBytes::sha1([0x33; 20]),
+            ctx: ctx(path_ref),
+            pack_id: 0,
+            offset,
+        };
+
+        let plan = build_plan(
+            vec![offset],
+            vec![candidate],
+            vec![CandidateAtOffset {
+                offset,
+                cand_idx: 0,
+            }],
+            None,
+        );
+
+        let mut cache = PackCache::new(0);
+        let mut external = NoExternal;
+        let mut sink = TestSink::default();
+
+        let report = execute_pack_plan(
+            &plan,
+            &pack,
+            &arena,
+            &PackDecodeLimits::new(64, 1024, 1024),
+            &mut cache,
+            &mut external,
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(report.stats.emitted_candidates, 0);
+        assert_eq!(report.skips.len(), 1);
+        assert!(matches!(report.skips[0].reason, SkipReason::NotBlob));
+    }
+
+    #[test]
+    fn out_of_order_exec_uses_candidate_ranges() {
+        let (pack, offsets) =
+            build_pack(&[(ObjectKind::Blob, b"first"), (ObjectKind::Blob, b"second")]);
+
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"file.txt").unwrap();
+        let candidates = vec![
+            PackCandidate {
+                oid: OidBytes::sha1([0x11; 20]),
+                ctx: ctx(path_ref),
+                pack_id: 0,
+                offset: offsets[0],
+            },
+            PackCandidate {
+                oid: OidBytes::sha1([0x22; 20]),
+                ctx: ctx(path_ref),
+                pack_id: 0,
+                offset: offsets[1],
+            },
+        ];
+
+        let plan = build_plan(
+            vec![offsets[0], offsets[1]],
+            candidates,
+            vec![
+                CandidateAtOffset {
+                    offset: offsets[0],
+                    cand_idx: 0,
+                },
+                CandidateAtOffset {
+                    offset: offsets[1],
+                    cand_idx: 1,
+                },
+            ],
+            Some(vec![1, 0]),
+        );
+
+        let mut cache = PackCache::new(0);
+        let mut external = NoExternal;
+        let mut sink = TestSink::default();
+
+        let report = execute_pack_plan(
+            &plan,
+            &pack,
+            &arena,
+            &PackDecodeLimits::new(64, 1024, 1024),
+            &mut cache,
+            &mut external,
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(report.stats.emitted_candidates, 2);
+        assert_eq!(
+            sink.emitted,
+            vec![OidBytes::sha1([0x22; 20]), OidBytes::sha1([0x11; 20])]
+        );
     }
 }

@@ -67,6 +67,8 @@ impl Default for PackPlanConfig {
 }
 
 /// Errors from pack planning.
+///
+/// Planning failures are fatal for the pack: no partial plan is emitted.
 #[derive(Debug)]
 pub enum PackPlanError {
     /// Pack parsing failed.
@@ -213,6 +215,7 @@ impl<'a> PackView<'a> {
     }
 }
 
+/// Parsed entry metadata cached during planning.
 #[derive(Clone, Copy, Debug)]
 enum ParsedEntry {
     NonDelta,
@@ -225,6 +228,7 @@ enum ParsedEntry {
     },
 }
 
+/// Worklist entry for delta-base expansion.
 #[derive(Clone, Copy, Debug)]
 struct WorkItem {
     offset: u64,
@@ -289,11 +293,19 @@ fn build_pack_plan_for_pack<'a, R: OidResolver>(
         });
     }
     candidate_offsets.sort_by(|a, b| a.offset.cmp(&b.offset).then(a.cand_idx.cmp(&b.cand_idx)));
+    debug_assert!(
+        candidate_offsets.windows(2).all(|pair| {
+            pair[0].offset < pair[1].offset
+                || (pair[0].offset == pair[1].offset && pair[0].cand_idx < pair[1].cand_idx)
+        }),
+        "candidate_offsets must be sorted by offset then cand_idx"
+    );
 
     let mut unique_candidate_offsets: Vec<u64> =
         candidate_offsets.iter().map(|c| c.offset).collect();
     unique_candidate_offsets.sort_unstable();
     unique_candidate_offsets.dedup();
+    debug_assert!(is_sorted_unique(&unique_candidate_offsets));
 
     let candidate_span = span_from_sorted(&unique_candidate_offsets);
 
@@ -387,6 +399,12 @@ fn build_pack_plan_for_pack<'a, R: OidResolver>(
     let mut need_offsets: Vec<u64> = need_set.into_iter().collect();
     need_offsets.sort_unstable();
     debug_assert!(is_sorted_unique(&need_offsets));
+    debug_assert!(
+        candidate_offsets
+            .iter()
+            .all(|cand| need_offsets.binary_search(&cand.offset).is_ok()),
+        "candidate offset missing from need_offsets"
+    );
 
     let delta_deps = build_delta_deps(&need_offsets, &entry_cache, pack_id);
     let exec_order = build_exec_order(&need_offsets, &delta_deps, pack_id)?;
@@ -422,6 +440,10 @@ fn build_pack_plan_for_pack<'a, R: OidResolver>(
     })
 }
 
+/// Parse an entry header at `offset` and cache the result.
+///
+/// Candidate offsets that are out of range return a dedicated error; base
+/// offsets that are out of range are treated as pack corruption.
 fn parse_entry<R: OidResolver>(
     offset: u64,
     pack: &PackView<'_>,
@@ -457,6 +479,9 @@ fn parse_entry<R: OidResolver>(
     Ok(parsed)
 }
 
+/// Build delta dependency descriptors for the current pack.
+///
+/// External bases are recorded as `BaseLoc::External`.
 fn build_delta_deps(
     need_offsets: &[u64],
     cache: &HashMap<u64, ParsedEntry>,
@@ -492,6 +517,10 @@ fn build_delta_deps(
     deps
 }
 
+/// Build an execution order that respects forward delta dependencies.
+///
+/// Returns `None` when natural `need_offsets` order already satisfies all
+/// dependencies.
 fn build_exec_order(
     need_offsets: &[u64],
     delta_deps: &[DeltaDep],
@@ -567,6 +596,7 @@ fn build_exec_order(
     Ok(Some(order))
 }
 
+/// Cluster nearby offsets to reduce large seek gaps during execution.
 fn cluster_offsets(need_offsets: &[u64]) -> Vec<Cluster> {
     // Split into clusters to limit seek gaps during pack reads.
     if need_offsets.is_empty() {
@@ -603,6 +633,7 @@ fn cluster_offsets(need_offsets: &[u64]) -> Vec<Cluster> {
     clusters
 }
 
+/// Span (last - first) for a sorted offset list.
 fn span_from_sorted(offsets: &[u64]) -> u64 {
     if offsets.is_empty() {
         0
@@ -611,6 +642,7 @@ fn span_from_sorted(offsets: &[u64]) -> u64 {
     }
 }
 
+/// Returns true if the slice is strictly increasing.
 fn is_sorted_unique(offsets: &[u64]) -> bool {
     offsets.windows(2).all(|pair| pair[0] < pair[1])
 }
