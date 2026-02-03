@@ -242,10 +242,10 @@ Work units:
   - Use many files (e.g., 16–64) and a tiny `max_in_flight_objects` (1–2) to stress permit reuse.
   - Set `discovery_len_hint` small but extend actual contents beyond `max_file_size` to force open-time skip.
   - Run with `stability_runs = 2` (or two explicit schedule seeds) and assert both runs succeed.
-- [ ] Validate determinism:
+- [x] Validate determinism:
   - Ensure the stability comparison passes with identical findings across schedules.
   - Confirm no hangs or invariant failures occur at high contention.
-- [ ] Run doc-rigor on code files changed for this task and update docs/comments as needed.
+- [x] Run doc-rigor on code files changed for this task and update docs/comments as needed.
 
 ## Benchmark And Evidence Plan
 
