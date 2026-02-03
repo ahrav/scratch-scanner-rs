@@ -5,6 +5,9 @@
 //! that is stable across spill runs, so spill files can be merged without
 //! additional normalization.
 //!
+//! Canonical ordering: OID, path bytes, commit id, parent index, change kind,
+//! context flags, candidate flags.
+//!
 //! # Invariants
 //! - `candidates.len() <= max_candidates`
 //! - All `path_ref` values refer into `path_arena`
@@ -23,6 +26,9 @@ use super::work_items::WorkItems;
 ///
 /// This is a single-threaded, in-memory structure. It does not perform any
 /// spilling itself; the caller (spiller) decides when to flush to disk.
+///
+/// Candidates are appended in arbitrary order. Call `sort_and_dedupe` before
+/// persisting or iterating for spill output.
 ///
 /// # Invariants
 /// - `path_ref` values in `candidates` point into `path_arena`.
@@ -73,6 +79,8 @@ impl CandidateChunk {
     }
 
     /// Pushes a candidate into the chunk.
+    ///
+    /// Ordering is not enforced; duplicates are allowed until `sort_and_dedupe`.
     ///
     /// # Errors
     /// - `SpillError::OidLengthMismatch` if the OID length does not match `oid_len`.
@@ -138,6 +146,9 @@ impl CandidateChunk {
     }
 
     /// Iterates over resolved candidates with path bytes.
+    ///
+    /// The returned order matches the current candidate vector. Call
+    /// `sort_and_dedupe` first to get canonical ordering.
     ///
     /// The returned paths borrow from the chunk's arena and become invalid
     /// once the chunk is cleared.
@@ -215,6 +226,7 @@ fn compare_candidates(arena: &ByteArena, a: &TreeCandidate, b: &TreeCandidate) -
         .then_with(|| a.ctx.cand_flags.cmp(&b.ctx.cand_flags))
 }
 
+/// Returns true if two candidates are identical for spill dedupe purposes.
 fn candidates_equal(arena: &ByteArena, a: &TreeCandidate, b: &TreeCandidate) -> bool {
     a.oid == b.oid
         && a.ctx.commit_id == b.ctx.commit_id
