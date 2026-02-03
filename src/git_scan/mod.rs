@@ -34,7 +34,6 @@ pub mod midx;
 pub mod midx_error;
 pub mod object_id;
 pub mod object_store;
-pub mod pack_amq;
 pub mod pack_cache;
 pub mod pack_candidates;
 pub mod pack_decode;
@@ -44,7 +43,6 @@ pub mod pack_inflate;
 pub mod pack_io;
 pub mod pack_plan;
 pub mod pack_plan_model;
-pub mod pack_strategy;
 pub mod path_policy;
 pub mod persist;
 pub mod persist_rocksdb;
@@ -96,7 +94,6 @@ pub use mapping_bridge::{MappingBridge, MappingBridgeConfig, MappingStats};
 pub use midx::MidxView;
 pub use object_id::{ObjectFormat, OidBytes};
 pub use object_store::{ObjectStore, TreeSource};
-pub use pack_amq::PackAmq;
 pub use pack_cache::{CachedObject, PackCache};
 pub use pack_candidates::{
     CollectingPackCandidateSink, LooseCandidate, PackCandidate, PackCandidateSink,
@@ -113,7 +110,6 @@ pub use pack_plan_model::{
     BaseLoc, CandidateAtOffset, Cluster, DeltaDep, DeltaKind, PackPlan, PackPlanStats,
     CLUSTER_GAP_BYTES,
 };
-pub use pack_strategy::{cluster_offsets, select_pack_strategy, PackStrategy};
 pub use path_policy::PathClass;
 pub use persist::{persist_finalize_output, InMemoryPersistenceStore, PersistenceStore};
 pub use policy_hash::{policy_hash, MergeDiffMode, PolicyHash};
