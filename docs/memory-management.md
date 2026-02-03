@@ -63,6 +63,23 @@ Run diagnostic tests to verify: `cargo test --test diagnostic -- --ignored --noc
 
 ---
 
+## Git Tree Loading Budgets
+
+Git tree diffing has its own bounded memory envelope:
+
+- **Tree bytes budget**: `TreeDiffLimits.max_tree_bytes_per_job` caps the total
+  decompressed tree payloads loaded during a repo job.
+- **Pack access**: pack files are memory-mapped on demand and shared across
+  tree loads as read-only slices; no pack data is copied unless inflated.
+- **Inflate buffers**: tree payloads and delta instructions are inflated into
+  bounded buffers capped by the tree bytes budget (plus a small header slack
+  for loose objects).
+- **Candidate storage**: candidate buffer and path arena sizes are explicitly
+  bounded by `TreeDiffLimits.max_candidates` and `max_path_arena_bytes`.
+
+These limits make Git tree traversal deterministic and DoS-resistant while
+keeping blob data out of memory during diffing.
+
 ## Single-Threaded Pipeline Memory Model
 
 > **Note**: The diagrams below describe the single-threaded `Pipeline` API, which uses

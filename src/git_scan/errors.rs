@@ -184,6 +184,8 @@ pub enum TreeDiffError {
     CandidateBufferFull,
     /// Path arena capacity exceeded.
     PathArenaFull,
+    /// Object store failure (MIDX, pack, or loose object decode).
+    ObjectStoreError { detail: String },
 }
 
 impl fmt::Display for TreeDiffError {
@@ -209,6 +211,7 @@ impl fmt::Display for TreeDiffError {
             }
             Self::CandidateBufferFull => write!(f, "candidate buffer full"),
             Self::PathArenaFull => write!(f, "path arena full"),
+            Self::ObjectStoreError { detail } => write!(f, "object store error: {detail}"),
         }
     }
 }

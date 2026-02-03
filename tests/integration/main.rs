@@ -7,4 +7,5 @@ mod git_commit_walk;
 mod git_preflight;
 mod git_repo_open;
 mod git_snapshot;
+mod git_tree_diff;
 mod manual_anchors;

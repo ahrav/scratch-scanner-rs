@@ -107,6 +107,9 @@ graph TB
 | **Commit Walk**     | `src/git_scan/commit_walk.rs`  | `(watermark, tip]` traversal for introduced-by commit selection      |
 | **Commit Walk Limits** | `src/git_scan/commit_walk_limits.rs` | Hard caps for commit traversal and ordering                   |
 | **Snapshot Plan**   | `src/git_scan/snapshot_plan.rs` | Snapshot-mode commit selection (tips only)                          |
+| **Tree Object Store** | `src/git_scan/object_store.rs` | Pack/loose tree loading for OID-only tree diffs                    |
+| **Tree Diff Walker** | `src/git_scan/tree_diff.rs` | OID-only tree diffs that emit candidate blobs with context          |
+| **Path Policy**     | `src/git_scan/path_policy.rs` | Fast path classification for candidate flags                         |
 | **Policy Hash**     | `src/git_scan/policy_hash.rs`  | Canonical BLAKE3 identity over rules, transforms, and tuning         |
 
 ## Git Scanning Preflight
@@ -129,6 +132,13 @@ Commit selection uses the commit-graph for deterministic `(watermark, tip]`
 traversal in introduced-by mode and emits snapshot tips directly in snapshot
 mode. Introduced-by plans are reordered topologically so ancestors appear
 before descendants, ensuring first-introduction semantics across merges.
+
+## Git Tree Diff
+
+Tree diffing loads tree objects from the object store and walks them in Git tree
+order to emit blob candidates with commit/parent context and path classification.
+The walker skips unchanged subtrees, never reads blobs during diffing, and
+preserves deterministic candidate ordering for downstream spill/dedupe.
 
 ## Git Policy Hash
 
