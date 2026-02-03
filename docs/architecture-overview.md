@@ -110,6 +110,12 @@ graph TB
 | **Tree Object Store** | `src/git_scan/object_store.rs` | Pack/loose tree loading for OID-only tree diffs                    |
 | **Tree Diff Walker** | `src/git_scan/tree_diff.rs` | OID-only tree diffs that emit candidate blobs with context          |
 | **Path Policy**     | `src/git_scan/path_policy.rs` | Fast path classification for candidate flags                         |
+| **Spill Limits**    | `src/git_scan/spill_limits.rs` | Hard caps for spill chunk sizing and on-disk run growth             |
+| **CandidateChunk**  | `src/git_scan/spill_chunk.rs` | Bounded candidate buffer + path arena with in-chunk dedupe          |
+| **Spill Runs**      | `src/git_scan/run_writer.rs`, `src/git_scan/run_reader.rs` | Stable on-disk encoding for sorted candidate runs     |
+| **Run Merger**      | `src/git_scan/spill_merge.rs` | K-way merge of spill runs with canonical dedupe                     |
+| **Spiller**         | `src/git_scan/spiller.rs`     | Orchestrates chunking, spilling, and global merge                   |
+| **WorkItems**       | `src/git_scan/work_items.rs`  | SoA candidate metadata tables for sorting without moving structs    |
 | **Policy Hash**     | `src/git_scan/policy_hash.rs`  | Canonical BLAKE3 identity over rules, transforms, and tuning         |
 
 ## Git Scanning Preflight
@@ -139,6 +145,15 @@ Tree diffing loads tree objects from the object store and walks them in Git tree
 order to emit blob candidates with commit/parent context and path classification.
 The walker skips unchanged subtrees, never reads blobs during diffing, and
 preserves deterministic candidate ordering for downstream spill/dedupe.
+
+## Git Spill + Dedupe
+
+Spill + dedupe buffers candidates in `CandidateChunk` until limits are reached,
+then sorts and dedupes within the chunk before writing a spill run (`RunWriter`).
+`Spiller` tracks spill run counts and bytes, and `RunMerger` performs a k-way
+merge across runs to emit globally sorted, unique candidates. `WorkItems` stores
+candidate metadata in SoA form so downstream sorting can shuffle indices without
+moving large structs.
 
 ## Git Policy Hash
 

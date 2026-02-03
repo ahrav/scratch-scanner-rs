@@ -30,7 +30,14 @@ pub mod preflight_error;
 pub mod preflight_limits;
 pub mod repo;
 pub mod repo_open;
+pub mod run_format;
+pub mod run_reader;
+pub mod run_writer;
 pub mod snapshot_plan;
+pub mod spill_chunk;
+pub mod spill_limits;
+pub mod spill_merge;
+pub mod spiller;
 pub mod start_set;
 pub mod tree_cache;
 pub mod tree_candidate;
@@ -39,6 +46,7 @@ pub mod tree_diff_limits;
 pub mod tree_entry;
 pub mod tree_order;
 pub mod watermark_keys;
+pub mod work_items;
 
 pub use byte_arena::{ByteArena, ByteRef};
 pub use commit_walk::{
@@ -60,7 +68,14 @@ pub use repo_open::{
     repo_open, RefWatermarkStore, RepoArtifactMmaps, RepoArtifactPaths, RepoArtifactStatus,
     RepoJobState, StartSetRef, StartSetResolver,
 };
+pub use run_format::{RunContext, RunHeader, RunRecord};
+pub use run_reader::RunReader;
+pub use run_writer::RunWriter;
 pub use snapshot_plan::snapshot_plan;
+pub use spill_chunk::CandidateChunk;
+pub use spill_limits::SpillLimits;
+pub use spill_merge::{merge_all, RunMerger};
+pub use spiller::Spiller;
 pub use start_set::{StartSetConfig, StartSetId};
 pub use tree_candidate::{
     CandidateBuffer, CandidateContext, ChangeKind, ResolvedCandidate, TreeCandidate,
@@ -72,3 +87,4 @@ pub use tree_order::{git_tree_file_name_cmp, git_tree_name_cmp};
 pub use watermark_keys::{
     decode_ref_watermark_value, encode_ref_watermark_value, KeyArena, KeyRef, NS_REF_WATERMARK,
 };
+pub use work_items::WorkItems;

@@ -83,6 +83,21 @@ Git tree diffing has its own bounded memory envelope:
 These limits make Git tree traversal deterministic and DoS-resistant while
 keeping blob data out of memory during diffing.
 
+## Git Spill + Dedupe Budgets
+
+Spill/dedupe keeps candidate metadata in SoA tables sized to the spill chunk
+limit. `WorkItems` allocates once up to `SpillLimits.max_chunk_candidates` and
+stores:
+
+- `oid_table`: one OID per candidate (20 or 32 bytes each)
+- `ctx_table`: one `CandidateContext` per candidate (commit/parent/kind/flags + path ref)
+- Index/attribute arrays: `oid_idx`, `ctx_idx`, `path_ref`, `flags`, `pack_id`, `offset`
+- Sorting scratch: `order` + `scratch` (`u32` each)
+
+Path bytes are stored separately in the chunk `ByteArena` and bounded by
+`SpillLimits.max_chunk_path_bytes`, so total spill working set remains linear
+in candidate count plus bounded path arena growth.
+
 ## Single-Threaded Pipeline Memory Model
 
 > **Note**: The diagrams below describe the single-threaded `Pipeline` API, which uses
