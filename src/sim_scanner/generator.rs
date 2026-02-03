@@ -15,7 +15,7 @@ use crate::api::{
     AnchorPolicy, Gate, RuleSpec, TransformConfig, TransformId, TransformMode, Tuning,
     ValidatorKind,
 };
-use crate::sim::fs::{SimFsSpec, SimNodeSpec, SimPath};
+use crate::sim::fs::{SimFsSpec, SimNodeSpec, SimPath, SimTypeHint};
 use crate::sim::rng::SimRng;
 use crate::sim_scanner::scenario::{
     ExpectedSecret, RuleSuiteSpec, RunConfig, Scenario, SecretRepr, SpanU32, SyntheticRuleSpec,
@@ -131,6 +131,9 @@ pub fn generate_scenario(seed: u64, cfg: &ScenarioGenConfig) -> Result<Scenario,
         nodes.push(SimNodeSpec::File {
             path,
             contents: buf,
+            // Generator defaults to a known file type; tests override as needed.
+            discovery_len_hint: None,
+            type_hint: SimTypeHint::File,
         });
     }
 

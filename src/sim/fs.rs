@@ -8,6 +8,7 @@
 //! - Directory listings are sorted lexicographically by path bytes.
 //! - File reads never panic; missing paths return `io::ErrorKind::NotFound`.
 //! - Reads past EOF return an empty slice.
+//! - Discovery type hints may be unknown; callers must fall back to metadata.
 
 use std::collections::BTreeMap;
 
@@ -26,6 +27,27 @@ impl SimPath {
     }
 }
 
+/// Type hint used by simulated discovery.
+///
+/// This models `DirEntry::file_type()` returning either a concrete type or
+/// no hint at all. Unknown hints must fall back to metadata in discovery.
+///
+/// Serde defaults to `File` to keep older artifacts compatible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SimTypeHint {
+    /// `file_type()` reports a regular file.
+    File,
+    /// `file_type()` reports a non-file entry.
+    NotFile,
+    /// `file_type()` returned `None` (unknown, fallback to metadata).
+    Unknown,
+}
+
+/// Default hint used when older artifacts omit the field.
+fn default_type_hint() -> SimTypeHint {
+    SimTypeHint::File
+}
+
 /// Declarative filesystem layout for a scenario.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SimFsSpec {
@@ -42,6 +64,17 @@ pub enum SimNodeSpec {
     File {
         path: SimPath,
         contents: Vec<u8>,
+        /// Optional discovery-time size hint used for max size filtering.
+        ///
+        /// `None` defaults to the current file contents length.
+        #[serde(default)]
+        discovery_len_hint: Option<u64>,
+        /// Optional file-type hint used by simulated discovery.
+        ///
+        /// `Unknown` models missing `file_type()` results and must still
+        /// fall back to metadata.
+        #[serde(default = "default_type_hint")]
+        type_hint: SimTypeHint,
     },
 }
 
@@ -60,7 +93,7 @@ impl SimFs {
 
         for node in &spec.nodes {
             match node {
-                SimNodeSpec::File { path, contents } => {
+                SimNodeSpec::File { path, contents, .. } => {
                     files.insert(path.bytes.clone(), contents.clone());
                 }
                 SimNodeSpec::Dir { path, children } => {

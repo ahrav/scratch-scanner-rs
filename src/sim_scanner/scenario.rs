@@ -22,6 +22,13 @@ pub struct RunConfig {
     /// Maximum number of buffers in the simulated pool.
     pub buffer_pool_cap: u32,
 
+    /// Maximum file size in bytes to scan.
+    ///
+    /// Files larger than this are skipped at open time. Discovery may also
+    /// pre-filter using size hints.
+    #[serde(default = "default_max_file_size")]
+    pub max_file_size: u64,
+
     /// Maximum number of simulation steps before declaring a hang.
     pub max_steps: u64,
 
@@ -32,6 +39,10 @@ pub struct RunConfig {
 
     /// Number of stability runs per scenario (different schedules).
     pub stability_runs: u32,
+}
+
+fn default_max_file_size() -> u64 {
+    u64::MAX
 }
 
 /// Top-level scenario schema for scanner simulations.

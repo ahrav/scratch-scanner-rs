@@ -78,6 +78,7 @@ use std::sync::Arc;
 /// - `chunk_size`: 64-256 KiB typical. Larger = fewer syscalls, more memory per file.
 /// - `pool_buffers`: Bound peak memory. Should be >= `workers` to avoid starvation.
 /// - `max_in_flight_objects`: Bound discovery depth. Too high = memory for paths/metadata.
+/// - `max_file_size`: Open-time size cap; oversized files are skipped.
 #[derive(Clone, Debug)]
 pub struct LocalConfig {
     /// Number of CPU worker threads.
@@ -101,6 +102,12 @@ pub struct LocalConfig {
     /// Controls discovery backpressure. Higher = more path metadata in memory.
     pub max_in_flight_objects: usize,
 
+    /// Maximum file size in bytes to scan.
+    ///
+    /// Files larger than this are skipped after `open()` based on the
+    /// snapshot size from `metadata().len()`.
+    pub max_file_size: u64,
+
     /// Seed for deterministic executor behavior.
     pub seed: u64,
 
@@ -120,6 +127,7 @@ impl Default for LocalConfig {
             pool_buffers: 32,
             local_queue_cap: 4,
             max_in_flight_objects: 256,
+            max_file_size: u64::MAX,
             seed: 0x853c49e6748fea9b,
             dedupe_within_chunk: true,
         }
@@ -184,7 +192,10 @@ impl LocalConfig {
 pub struct LocalFile {
     /// Path to the file.
     pub path: PathBuf,
-    /// File size in bytes.
+    /// File size hint in bytes.
+    ///
+    /// Discovery may skip per-file metadata for performance, so this can be 0.
+    /// Open-time metadata determines the actual size and enforcement.
     pub size: u64,
 }
 
@@ -239,6 +250,8 @@ struct FileTask {
     path: PathBuf,
     /// File size hint from discovery (not used in processing).
     ///
+    /// May be 0 if discovery skipped metadata for performance.
+    ///
     /// Processing uses `file.metadata().len()` for snapshot-at-open semantics.
     /// Kept for logging/debugging the discovery phase.
     #[allow(dead_code)]
@@ -266,6 +279,7 @@ struct LocalScratch<E: ScanEngine> {
     /// Configuration flags.
     dedupe_within_chunk: bool,
     chunk_size: usize,
+    max_file_size: u64,
 }
 
 // ============================================================================
@@ -277,7 +291,10 @@ struct LocalScratch<E: ScanEngine> {
 pub struct LocalStats {
     /// Files discovered and enqueued.
     pub files_enqueued: u64,
-    /// Total bytes across all enqueued files.
+    /// Total bytes across all enqueued files (hint-based).
+    ///
+    /// If discovery skipped metadata, this may undercount and should not be
+    /// treated as authoritative for throughput calculations.
     pub bytes_enqueued: u64,
     /// Files that failed to process due to I/O errors.
     ///
@@ -473,6 +490,11 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
 
     // Empty file: nothing to scan
     if file_size == 0 {
+        return;
+    }
+
+    // Enforce size cap at open time for snapshot semantics.
+    if file_size > scratch.max_file_size {
         return;
     }
 
@@ -732,6 +754,7 @@ where
                     out_buf: Vec::with_capacity(64 * 1024),
                     dedupe_within_chunk: dedupe,
                     chunk_size,
+                    max_file_size: cfg.max_file_size,
                 }
             }
         },
@@ -741,6 +764,10 @@ where
     // Discovery loop
     let mut stats = LocalStats::default();
     let mut next_file_id: u32 = 0;
+    // Batch discovery injections to amortize wakeups and injector contention.
+    // Keep the batch small to avoid large bursts of in-flight work.
+    let batch_cap = cfg.max_in_flight_objects.clamp(1, 64);
+    let mut batch: Vec<FileTask> = Vec::with_capacity(batch_cap);
 
     while let Some(file) = source.next_file() {
         // Acquire in-flight permit (blocks if at capacity)
@@ -760,9 +787,17 @@ where
             _permit: permit,
         };
 
-        // This should not fail since we haven't called join() yet
-        ex.spawn_external(task)
-            .expect("executor rejected task before join");
+        batch.push(task);
+        if batch.len() >= batch_cap {
+            // This should not fail since we haven't called join() yet.
+            ex.spawn_external_batch(std::mem::take(&mut batch))
+                .expect("executor rejected task batch before join");
+        }
+    }
+
+    if !batch.is_empty() {
+        ex.spawn_external_batch(batch)
+            .expect("executor rejected task batch before join");
     }
 
     // Wait for all files to complete
@@ -811,6 +846,7 @@ mod tests {
             pool_buffers: 8,
             local_queue_cap: 2,
             max_in_flight_objects: 8,
+            max_file_size: u64::MAX,
             seed: 12345,
             dedupe_within_chunk: true,
         }
@@ -854,6 +890,28 @@ mod tests {
         let report = scan_local(engine, source, small_config(), sink.clone());
 
         assert_eq!(report.stats.files_enqueued, 1);
+        assert!(sink.take().is_empty());
+    }
+
+    #[test]
+    fn enforces_max_file_size_at_open_time() {
+        let engine = Arc::new(test_engine());
+        let sink = Arc::new(VecSink::new());
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, "SECRETABCD1234").unwrap();
+        tmp.flush().unwrap();
+
+        let path = tmp.path().to_path_buf();
+        let source = VecFileSource::new(vec![LocalFile { path, size: 4 }]);
+
+        let mut cfg = small_config();
+        cfg.max_file_size = 4; // Smaller than actual file size at open time.
+
+        let report = scan_local(engine, source, cfg, sink.clone());
+
+        assert_eq!(report.stats.files_enqueued, 1);
+        assert_eq!(report.metrics.bytes_scanned, 0);
         assert!(sink.take().is_empty());
     }
 

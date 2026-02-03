@@ -64,13 +64,14 @@
 //! - **Directory walking**: Recursive traversal with symlink control
 //! - **Gitignore support**: Respects `.gitignore`, `.git/info/exclude`, global gitignore
 //! - **Hidden file filtering**: Optionally skip dotfiles and dot-directories
-//! - **Size filtering**: Skip files above `max_file_size` to avoid memory pressure
+//! - **Size filtering**: Enforced at open time; discovery avoids per-file metadata
 //! - **Parallel scanning**: Work-stealing scheduler with chunked I/O
 //! - **Overlap handling**: Automatic chunk overlap for boundary-crossing secrets
 //!
 //! # Correctness Invariants
 //!
 //! - **Work-conserving**: Every file matching filters is scanned (no silent drops)
+//! - **Type-hint safety**: Missing `file_type()` hints fall back to metadata
 //! - **Consistent snapshots**: File size captured at open time, not discovery time
 //! - **Deduplication**: Findings in chunk overlap regions are deduplicated
 //! - **Fail-soft**: I/O errors on individual files don't abort the scan
@@ -95,6 +96,84 @@ use crate::engine::Engine;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
+
+/// Minimal entry adapter so discovery classification can be unit-tested.
+///
+/// This keeps the DirWalker logic centralized while letting tests inject
+/// `file_type()`-missing cases without depending on platform-specific behavior.
+trait EntryLike {
+    fn file_type(&self) -> Option<std::fs::FileType>;
+    fn metadata(&self) -> io::Result<std::fs::Metadata>;
+    fn path(&self) -> &Path;
+    fn into_path(self) -> std::path::PathBuf
+    where
+        Self: Sized;
+}
+
+impl EntryLike for ignore::DirEntry {
+    #[inline(always)]
+    fn file_type(&self) -> Option<std::fs::FileType> {
+        ignore::DirEntry::file_type(self)
+    }
+
+    #[inline(always)]
+    fn metadata(&self) -> io::Result<std::fs::Metadata> {
+        ignore::DirEntry::metadata(self).map_err(io::Error::other)
+    }
+
+    #[inline(always)]
+    fn path(&self) -> &Path {
+        ignore::DirEntry::path(self)
+    }
+
+    #[inline(always)]
+    fn into_path(self) -> std::path::PathBuf {
+        ignore::DirEntry::into_path(self)
+    }
+}
+
+/// Classify a directory entry into a `LocalFile`, if eligible.
+///
+/// The algorithm uses `file_type()` as a fast hint when available, but must
+/// fall back to `metadata()` if the hint is missing. This prevents silent drops
+/// on platforms that do not supply file type in directory entries.
+///
+/// Discovery avoids per-file metadata when a type hint is available. Size caps
+/// are enforced at open time in `local.rs`.
+///
+/// Returns `None` on:
+/// - Non-file entries
+/// - Metadata errors when the type hint is missing
+#[inline(always)]
+fn local_file_from_entry<E: EntryLike>(entry: E) -> Option<LocalFile> {
+    if let Some(ft) = entry.file_type() {
+        if !ft.is_file() {
+            return None;
+        }
+        return Some(LocalFile {
+            path: entry.into_path(),
+            size: 0,
+        });
+    }
+
+    let meta = match entry.metadata() {
+        Ok(meta) => meta,
+        Err(_e) => {
+            #[cfg(debug_assertions)]
+            eprintln!("[DirWalker] Metadata error for {:?}: {}", entry.path(), _e);
+            return None;
+        }
+    };
+
+    if !meta.file_type().is_file() {
+        return None;
+    }
+
+    Some(LocalFile {
+        path: entry.into_path(),
+        size: meta.len(),
+    })
+}
 
 // ============================================================================
 // Configuration
@@ -218,8 +297,9 @@ impl ParallelScanConfig {
     /// Convert to [`LocalConfig`](super::local::LocalConfig) for the scheduler.
     ///
     /// This extracts only the scheduler-relevant parameters; directory walking
-    /// options (`follow_symlinks`, `skip_hidden`, `respect_gitignore`, `max_file_size`)
-    /// are handled during file collection, not during scanning.
+    /// options (`follow_symlinks`, `skip_hidden`, `respect_gitignore`) are handled
+    /// during file collection. `max_file_size` is enforced both at discovery and
+    /// open time.
     fn to_local_config(&self) -> LocalConfig {
         LocalConfig {
             workers: self.workers,
@@ -227,6 +307,7 @@ impl ParallelScanConfig {
             pool_buffers: self.pool_buffers,
             local_queue_cap: self.local_queue_cap,
             max_in_flight_objects: self.max_in_flight_objects,
+            max_file_size: self.max_file_size,
             seed: self.seed,
             dedupe_within_chunk: true,
         }
@@ -300,8 +381,6 @@ impl DirWalker {
         let walker = builder.build_parallel();
 
         let (sender, receiver) = crossbeam_channel::bounded(config.max_in_flight_objects);
-        let max_file_size = config.max_file_size;
-
         // Spawn walker thread
         std::thread::spawn(move || {
             walker.run(|| {
@@ -309,31 +388,10 @@ impl DirWalker {
                 Box::new(move |result| {
                     match result {
                         Ok(entry) => {
-                            if let Some(ft) = entry.file_type() {
-                                if ft.is_file() {
-                                    match entry.metadata() {
-                                        Ok(meta) => {
-                                            let size = meta.len();
-                                            if size <= max_file_size && size > 0 {
-                                                let file = LocalFile {
-                                                    path: entry.into_path(),
-                                                    size,
-                                                };
-                                                // Stop walking if receiver dropped (scanner finished)
-                                                if sender.send(file).is_err() {
-                                                    return ignore::WalkState::Quit;
-                                                }
-                                            }
-                                        }
-                                        Err(_e) => {
-                                            #[cfg(debug_assertions)]
-                                            eprintln!(
-                                                "[DirWalker] Metadata error for {:?}: {}",
-                                                entry.path(),
-                                                _e
-                                            );
-                                        }
-                                    }
+                            if let Some(file) = local_file_from_entry(entry) {
+                                // Stop walking if receiver dropped (scanner finished)
+                                if sender.send(file).is_err() {
+                                    return ignore::WalkState::Quit;
                                 }
                             }
                         }
@@ -483,12 +541,7 @@ fn scan_single_file(
     let meta = std::fs::metadata(path)?;
     let size = meta.len();
 
-    // Filter by size (same as DirWalker does)
-    if size > config.max_file_size || size == 0 {
-        // File filtered out - return empty report
-        return Ok(LocalReport::default());
-    }
-
+    // Size is only a discovery hint here; open-time enforcement happens in local.rs.
     let file = LocalFile {
         path: path.to_path_buf(),
         size,
@@ -510,6 +563,28 @@ mod tests {
     use regex::bytes::Regex;
     use std::fs;
     use tempfile::TempDir;
+
+    struct StubEntry {
+        path: std::path::PathBuf,
+    }
+
+    impl EntryLike for StubEntry {
+        fn file_type(&self) -> Option<std::fs::FileType> {
+            None
+        }
+
+        fn metadata(&self) -> io::Result<std::fs::Metadata> {
+            fs::metadata(&self.path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+
+        fn into_path(self) -> std::path::PathBuf {
+            self.path
+        }
+    }
 
     fn test_tuning() -> Tuning {
         Tuning {
@@ -598,6 +673,21 @@ mod tests {
     }
 
     #[test]
+    fn file_type_none_falls_back_to_metadata() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("unknown_type.txt");
+        fs::write(&file, "SECRETABCD1234").unwrap();
+
+        let entry = StubEntry { path: file.clone() };
+        let file_opt = local_file_from_entry(entry);
+
+        assert!(file_opt.is_some());
+        let local = file_opt.unwrap();
+        assert_eq!(local.path, file);
+        assert!(local.size > 0);
+    }
+
+    #[test]
     fn respects_max_file_size() {
         let rules = vec![simple_rule()];
         let transforms: Vec<TransformConfig> = vec![];
@@ -619,8 +709,9 @@ mod tests {
 
         let report = parallel_scan_dir(dir.path(), engine, config, sink.clone()).unwrap();
 
-        // Only the small file should be scanned
-        assert_eq!(report.stats.files_enqueued, 1);
+        // Discovery enqueues both; open-time enforcement skips the large file.
+        assert_eq!(report.stats.files_enqueued, 2);
+        assert!(report.metrics.bytes_scanned < large_content.len() as u64);
     }
 
     #[test]
@@ -739,8 +830,10 @@ mod tests {
 
         assert!(result.is_ok());
         let report = result.unwrap();
-        // File is too large, should be skipped
-        assert_eq!(report.stats.files_enqueued, 0);
+        // File is too large, should be skipped at open time.
+        assert_eq!(report.stats.files_enqueued, 1);
+        assert_eq!(report.metrics.bytes_scanned, 0);
+        assert!(sink.take().is_empty());
     }
 
     #[test]
@@ -759,7 +852,9 @@ mod tests {
 
         assert!(result.is_ok());
         let report = result.unwrap();
-        // Empty file should be skipped
-        assert_eq!(report.stats.files_enqueued, 0);
+        // Empty file should be skipped at open time.
+        assert_eq!(report.stats.files_enqueued, 1);
+        assert_eq!(report.metrics.bytes_scanned, 0);
+        assert!(sink.take().is_empty());
     }
 }

@@ -213,6 +213,56 @@ impl<T: Send + 'static> ExecutorHandle<T> {
         Ok(())
     }
 
+    /// Spawn a batch of tasks from outside the worker threads.
+    ///
+    /// This amortizes the CAS loop and unpark overhead across many tasks.
+    /// The batch is all-or-nothing: if the executor is not accepting,
+    /// the original `tasks` are returned unchanged.
+    ///
+    /// # Guarantees
+    ///
+    /// - Either all tasks are accepted and enqueued, or none are.
+    /// - Wakeups are bounded to at most the number of workers.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(tasks)` if the executor is shutting down or if the
+    /// in-flight task count would overflow.
+    #[inline]
+    pub fn spawn_batch(&self, tasks: Vec<T>) -> Result<(), Vec<T>> {
+        if tasks.is_empty() {
+            return Ok(());
+        }
+        let task_count = tasks.len();
+        let add = match task_count.checked_mul(COUNT_UNIT) {
+            Some(v) => v,
+            None => return Err(tasks),
+        };
+
+        let mut s = self.shared.state.load(Ordering::Acquire);
+        loop {
+            if !is_accepting(s) {
+                return Err(tasks);
+            }
+            match self.shared.state.compare_exchange_weak(
+                s,
+                s.wrapping_add(add),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => s = actual,
+            }
+        }
+
+        for task in tasks {
+            self.shared.injector.push(task);
+        }
+
+        self.shared.unpark_n(task_count);
+        Ok(())
+    }
+
     /// Check if the executor is still accepting external work.
     #[inline]
     pub fn is_accepting(&self) -> bool {
@@ -377,6 +427,24 @@ impl<T> Shared<T> {
     fn unpark_all(&self) {
         for u in &self.unparkers {
             u.unpark();
+        }
+    }
+
+    /// Wake up to `n` workers (round-robin).
+    fn unpark_n(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let workers = self.unparkers.len();
+        if workers == 0 {
+            return;
+        }
+        if n >= workers {
+            self.unpark_all();
+            return;
+        }
+        for _ in 0..n {
+            self.unpark_one();
         }
     }
 
@@ -776,6 +844,14 @@ impl<T: Send + 'static> Executor<T> {
         self.handle().spawn(task)
     }
 
+    /// Spawn a batch of tasks from outside worker threads.
+    ///
+    /// Convenience for `self.handle().spawn_batch(tasks)`.
+    /// Prefer this when discovery can amortize wakeups across many tasks.
+    pub fn spawn_external_batch(&self, tasks: Vec<T>) -> Result<(), Vec<T>> {
+        self.handle().spawn_batch(tasks)
+    }
+
     /// Stop accepting external spawns and wait for all work to complete.
     ///
     /// Returns aggregated metrics from all workers.
@@ -1015,6 +1091,28 @@ mod tests {
     }
 
     #[test]
+    fn executor_runs_all_external_tasks_batch() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c2 = Arc::clone(&counter);
+
+        let ex = Executor::<usize>::new(
+            test_config(4),
+            |_wid| (),
+            move |_task, _ctx| {
+                c2.fetch_add(1, Ordering::Relaxed);
+            },
+        );
+
+        let n = 10_000usize;
+        let tasks: Vec<usize> = (0..n).collect();
+        ex.spawn_external_batch(tasks).unwrap();
+
+        let metrics = ex.join();
+        assert_eq!(counter.load(Ordering::Relaxed), n);
+        assert_eq!(metrics.tasks_executed, n as u64);
+    }
+
+    #[test]
     fn tasks_can_spawn_more_tasks_locally() {
         let counter = Arc::new(AtomicUsize::new(0));
         let c2 = Arc::clone(&counter);
@@ -1064,6 +1162,11 @@ mod tests {
 
         // Handle should reject spawns after join
         assert!(handle.spawn(42).is_err());
+        let tasks = vec![1u32, 2, 3];
+        let err = handle
+            .spawn_batch(tasks)
+            .expect_err("spawn_batch should fail after join");
+        assert_eq!(err, vec![1u32, 2, 3]);
     }
 
     #[test]

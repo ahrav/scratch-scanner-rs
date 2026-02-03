@@ -9,7 +9,7 @@ pub mod replay;
 pub mod runner;
 pub mod scenario;
 
-pub use crate::sim::fs::{SimFsSpec, SimNodeSpec, SimPath};
+pub use crate::sim::fs::{SimFsSpec, SimNodeSpec, SimPath, SimTypeHint};
 pub use generator::{
     build_engine_from_suite, generate_scenario, materialize_rules, synthetic_transforms,
     synthetic_tuning, ScenarioGenConfig,

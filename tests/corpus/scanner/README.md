@@ -11,6 +11,7 @@ This directory contains deterministic scanner simulation scenarios. Each `*.case
 | `b64_no_padding.case.json` | Base64 transform without `=` padding; verifies decode and match still succeed. |
 | `b64_pad_eq.case.json` | Base64 transform with single `=` padding; verifies decode and match. |
 | `b64_pad_eqeq.case.json` | Base64 transform with double `==` padding; verifies decode and match. |
+| `b64_padding_seed17.case.json` | Deep random regression: base64 padding drift across partial reads must not fail differential oracle. |
 | `b64_padding_split_boundary.case.json` | Base64 padding `=` split across chunk boundary; ensures padding logic is boundary-safe. |
 | `b64_spans_eq_cap_16.case.json` | Base64 span detection exactly at span cap (16) for a buffer. |
 | `b64_spans_gt_cap_17.case.json` | Base64 span detection above cap (17); verifies cap enforcement. |
@@ -27,6 +28,7 @@ This directory contains deterministic scanner simulation scenarios. Each `*.case
 | `duplicate_finding_seed1.case.json` | Deep random seed regression with faults; prevents duplicate non-root findings in overlap scans. |
 | `empty_file.case.json` | Zero-byte file; scan exits cleanly with no findings. |
 | `empty_path.case.json` | Empty path bytes; ensures path edge case is handled safely. |
+| `extra_expected_root_seed728.case.json` | Deep random regression where chunked scan finds an expected raw secret missed by the single-chunk reference. |
 | `huge_noise_sparse_secrets.case.json` | Large file with long noise gaps; stresses chunk scheduling and buffer reuse. |
 | `longpath.case.json` | Very long path; validates path handling and hashing stability. |
 | `max_transform_depth0_no_decode.case.json` | Depth limit set to 0; encoded content must not be decoded. |

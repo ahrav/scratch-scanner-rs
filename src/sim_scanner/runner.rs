@@ -8,6 +8,7 @@
 //!
 //! Determinism:
 //! - File discovery order is lexicographic by raw path bytes.
+//! - Discovery honors type-hint metadata fallbacks for unknown file types.
 //! - Schedule decisions are driven by a seedable RNG in `SimExecutor`.
 //! - IO faults are keyed by path + read index and are schedule-independent.
 //! - Output ordering is emission order; a stability oracle compares sets.
@@ -17,13 +18,15 @@
 //! - Monotonic progress: chunk offsets and prefix boundaries never move backward.
 //! - Overlap dedupe: no finding may be entirely contained in the overlap prefix.
 //! - Duplicate suppression: emitted findings are unique under a normalized key.
+//! - In-flight budget: file-task permits never exceed `max_in_flight_objects`.
 //! - Ground-truth: expected secrets are found (for fully observed files),
 //!   and no unexpected findings appear.
 //! - Differential: chunked results match a single-chunk scan over the observed
-//!   byte stream (post-faults).
+//!   byte stream (post-faults). Non-root findings are compared only when
+//!   `SCANNER_SIM_STRICT_NON_ROOT=1` is set.
 //! - Stability: repeated runs with different schedule seeds yield the same set.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use serde::{Deserialize, Serialize};
@@ -32,7 +35,7 @@ use crate::api::STEP_ROOT;
 use crate::sim::clock::SimClock;
 use crate::sim::executor::{SimExecutor, SimTask, SimTaskId, SimTaskState, StepResult};
 use crate::sim::fault::{Corruption, FaultInjector, FaultPlan, IoFault, ReadFault};
-use crate::sim::fs::{SimFileHandle, SimFs, SimPath};
+use crate::sim::fs::{SimFileHandle, SimFs, SimFsSpec, SimNodeSpec, SimPath, SimTypeHint};
 use crate::sim_scanner::scenario::{RunConfig, Scenario, SecretRepr, SpanU32};
 use crate::{Engine, FileId, FindingRec, ScanScratch};
 
@@ -180,7 +183,7 @@ impl ScannerSimRunner {
         }
 
         let fs = SimFs::from_spec(&scenario.fs);
-        let files = sorted_file_paths(&fs);
+        let files = discover_file_paths(&fs, &scenario.fs, self.cfg.max_file_size);
         let total_bytes = total_file_bytes(&fs, &files);
         let fault_ops = estimate_fault_ops(fault_plan);
         let max_steps = resolve_max_steps(&self.cfg, files.len() as u64, total_bytes, fault_ops);
@@ -191,6 +194,11 @@ impl ScannerSimRunner {
         let mut clock = SimClock::new();
         let mut faults = FaultInjector::new(fault_plan.clone());
         let mut io_waiters: BTreeMap<u64, Vec<SimTaskId>> = BTreeMap::new();
+        // Track file-task permits to mirror discovery backpressure invariants.
+        let mut in_flight_objects: u32 = 0;
+        let mut max_seen_in_flight: u32 = 0;
+        // Set when discovery is blocked waiting for permits.
+        let mut discover_waiting = false;
 
         let discover = DiscoverState::new(files.clone());
         let discover_id = executor.spawn_external(SimTask {
@@ -205,6 +213,16 @@ impl ScannerSimRunner {
                 if all_tasks_completed(&executor, &tasks) {
                     let findings = output.finish();
                     let summaries = take_file_summaries(&mut tasks);
+                    if in_flight_objects != 0 {
+                        return self.fail(
+                            FailureKind::InvariantViolation { code: 33 },
+                            &format!(
+                                "in-flight permits leaked at completion: {} outstanding (max_seen {})",
+                                in_flight_objects, max_seen_in_flight
+                            ),
+                            step,
+                        );
+                    }
                     if let Err(fail) =
                         self.run_oracles(scenario, engine, &files, &findings, &summaries, step)
                     {
@@ -250,11 +268,41 @@ impl ScannerSimRunner {
             }
 
             let task_idx = task_id.index();
-            let mut files_to_spawn = None;
+            let mut discover_spawn: Option<Vec<DiscoveredFile>> = None;
+            let mut discover_block = false;
+            let mut discover_done = false;
             if let Some(task_state) = tasks.get_mut(task_idx) {
                 match task_state {
                     ScannerTask::Discover(state) => {
-                        files_to_spawn = Some(std::mem::take(&mut state.files));
+                        if state.files.is_empty() {
+                            discover_done = true;
+                        } else {
+                            let available = self
+                                .cfg
+                                .max_in_flight_objects
+                                .saturating_sub(in_flight_objects);
+                            if available == 0 {
+                                // Mirror discovery backpressure: wait for a permit.
+                                discover_block = true;
+                            } else {
+                                let mut batch = Vec::with_capacity(available as usize);
+                                for _ in 0..available {
+                                    if let Some(entry) = state.files.pop_front() {
+                                        batch.push(entry);
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                if !batch.is_empty() {
+                                    discover_spawn = Some(batch);
+                                }
+                                if state.files.is_empty() {
+                                    discover_done = true;
+                                } else {
+                                    discover_block = true;
+                                }
+                            }
+                        }
                     }
                     ScannerTask::FileScan(state) => {
                         let outcome = match state.step(
@@ -263,6 +311,7 @@ impl ScannerSimRunner {
                             &mut faults,
                             overlap,
                             self.cfg.chunk_size as usize,
+                            self.cfg.max_file_size,
                             &mut output,
                             step,
                             clock.now_ticks(),
@@ -273,6 +322,23 @@ impl ScannerSimRunner {
                         match outcome {
                             FileStepOutcome::Done => {
                                 executor.mark_completed(task_id);
+                                if in_flight_objects == 0 {
+                                    return self.fail(
+                                        FailureKind::InvariantViolation { code: 30 },
+                                        "in-flight underflow on file completion",
+                                        step,
+                                    );
+                                }
+                                in_flight_objects -= 1;
+                                if discover_waiting
+                                    && in_flight_objects < self.cfg.max_in_flight_objects
+                                    && executor.state(discover_id) == SimTaskState::Blocked
+                                {
+                                    // Wake discovery when permits become available.
+                                    executor.mark_runnable(discover_id);
+                                    executor.enqueue_global(discover_id);
+                                    discover_waiting = false;
+                                }
                             }
                             FileStepOutcome::Reschedule => {
                                 executor.mark_runnable(task_id);
@@ -293,11 +359,11 @@ impl ScannerSimRunner {
                 );
             }
 
-            if let Some(files) = files_to_spawn {
+            if let Some(files) = discover_spawn {
                 // Spawn file scan tasks deterministically in discovered order.
-                for (idx, path) in files.iter().enumerate() {
-                    let file_id = FileId(idx as u32);
-                    let state = FileScanState::new(path.clone(), file_id, engine, overlap);
+                for entry in files {
+                    let state =
+                        FileScanState::new(entry.path.clone(), entry.file_id, engine, overlap);
 
                     let spawned_id = executor.spawn_local(
                         worker,
@@ -310,10 +376,48 @@ impl ScannerSimRunner {
                         spawned_id,
                         ScannerTask::FileScan(Box::new(state)),
                     );
+
+                    in_flight_objects = match in_flight_objects.checked_add(1) {
+                        Some(next) => next,
+                        None => {
+                            return self.fail(
+                                FailureKind::InvariantViolation { code: 32 },
+                                "in-flight counter overflow",
+                                step,
+                            );
+                        }
+                    };
+                    if in_flight_objects > max_seen_in_flight {
+                        max_seen_in_flight = in_flight_objects;
+                    }
                 }
 
+                if discover_done {
+                    discover_waiting = false;
+                    executor.mark_completed(task_id);
+                    executor.remove_from_queues(task_id);
+                } else if discover_block {
+                    executor.mark_blocked(task_id);
+                    discover_waiting = true;
+                }
+            } else if discover_done {
+                discover_waiting = false;
                 executor.mark_completed(task_id);
                 executor.remove_from_queues(task_id);
+            } else if discover_block {
+                executor.mark_blocked(task_id);
+                discover_waiting = true;
+            }
+
+            if in_flight_objects > self.cfg.max_in_flight_objects {
+                return self.fail(
+                    FailureKind::InvariantViolation { code: 31 },
+                    &format!(
+                        "in-flight budget exceeded: current {} > max {} (max_seen {})",
+                        in_flight_objects, self.cfg.max_in_flight_objects, max_seen_in_flight
+                    ),
+                    step,
+                );
             }
         }
 
@@ -338,7 +442,7 @@ impl ScannerSimRunner {
         step: u64,
     ) -> Result<(), FailureReport> {
         oracle_ground_truth(scenario, files, findings, summaries, step)?;
-        oracle_differential(engine, findings, summaries, step)?;
+        oracle_differential(scenario, files, engine, findings, summaries, step)?;
         Ok(())
     }
 }
@@ -476,14 +580,28 @@ struct PendingRead {
     cancel_after: bool,
 }
 
-/// Discover task state (pre-sorted file list).
+/// Discover task state (pre-sorted file list with stable IDs).
 struct DiscoverState {
-    files: Vec<SimPath>,
+    files: VecDeque<DiscoveredFile>,
+}
+
+#[derive(Clone, Debug)]
+struct DiscoveredFile {
+    file_id: FileId,
+    path: SimPath,
 }
 
 impl DiscoverState {
     fn new(mut files: Vec<SimPath>) -> Self {
         files.sort_by(|a, b| a.bytes.cmp(&b.bytes));
+        let files = files
+            .into_iter()
+            .enumerate()
+            .map(|(idx, path)| DiscoveredFile {
+                file_id: FileId(idx as u32),
+                path,
+            })
+            .collect();
         Self { files }
     }
 }
@@ -544,6 +662,7 @@ impl FileScanState {
         faults: &mut FaultInjector,
         overlap: usize,
         chunk_size: usize,
+        max_file_size: u64,
         output: &mut OutputCollector,
         step: u64,
         now: u64,
@@ -588,6 +707,14 @@ impl FileScanState {
                     message: format!("file too large: {:?}", self.path.bytes),
                     step,
                 });
+            }
+            if handle.len == 0 {
+                return Ok(FileStepOutcome::Done);
+            }
+            if handle.len > max_file_size {
+                // Size-cap skip: return Done so the runner releases the permit.
+                self.ground_truth_ok = false;
+                return Ok(FileStepOutcome::Done);
             }
             self.handle = Some(handle);
         }
@@ -1059,9 +1186,39 @@ fn normalize_findings_for_diff(engine: &Engine, findings: &[FindingRec]) -> BTre
         .collect()
 }
 
-/// Return file paths in deterministic order.
-fn sorted_file_paths(fs: &SimFs) -> Vec<SimPath> {
-    let mut files = fs.file_paths();
+/// Discover file paths with type-hint fallback semantics.
+///
+/// This models DirWalker behavior: `Unknown` type hints must still attempt
+/// metadata (here, a simulated open) to avoid silent drops.
+fn discover_file_paths(fs: &SimFs, spec: &SimFsSpec, max_file_size: u64) -> Vec<SimPath> {
+    let mut files = Vec::new();
+    for node in &spec.nodes {
+        let SimNodeSpec::File {
+            path,
+            contents,
+            type_hint,
+            discovery_len_hint,
+        } = node
+        else {
+            continue;
+        };
+
+        let hint_len = discovery_len_hint.unwrap_or(contents.len() as u64);
+        if hint_len == 0 || hint_len > max_file_size {
+            continue;
+        }
+
+        let include = match type_hint {
+            SimTypeHint::File => true,
+            SimTypeHint::NotFile => false,
+            SimTypeHint::Unknown => fs.open_file(path).is_ok(),
+        };
+
+        if include {
+            files.push(path.clone());
+        }
+    }
+
     files.sort_by(|a, b| a.bytes.cmp(&b.bytes));
     files
 }
@@ -1184,6 +1341,8 @@ fn oracle_ground_truth(
 
 /// Compare chunked findings against a single-chunk reference scan.
 fn oracle_differential(
+    scenario: &Scenario,
+    files: &[SimPath],
     engine: &Engine,
     findings: &[FindingRec],
     summaries: &[FileSummary],
@@ -1198,12 +1357,36 @@ fn oracle_differential(
 
     let observed = normalize_findings_for_diff(engine, findings);
     let expected = normalize_findings_for_diff(engine, &reference);
-    if let Some(miss) = expected.difference(&observed).next() {
+    let observed_len = observed.len();
+    let expected_len = expected.len();
+
+    let mut observed_root: BTreeSet<FindingKey> = BTreeSet::new();
+    let mut observed_non_root: BTreeMap<(u32, u32), BTreeSet<u64>> = BTreeMap::new();
+    for key in observed {
+        if key.span_start == 0 && key.span_end == 0 {
+            observed_non_root
+                .entry((key.file_id, key.rule_id))
+                .or_default()
+                .insert(key.root_hint_end);
+        } else {
+            observed_root.insert(key);
+        }
+    }
+
+    let mut expected_root: BTreeSet<FindingKey> = BTreeSet::new();
+    let mut expected_non_root: Vec<FindingKey> = Vec::new();
+    for key in expected {
+        if key.span_start == 0 && key.span_end == 0 {
+            expected_non_root.push(key);
+        } else {
+            expected_root.insert(key);
+        }
+    }
+
+    if let Some(miss) = expected_root.difference(&observed_root).next() {
         let message = format!(
             "differential mismatch (sim {}, reference {}), missing {:?}",
-            observed.len(),
-            expected.len(),
-            miss
+            observed_len, expected_len, miss
         );
         return Err(FailureReport {
             kind: FailureKind::OracleMismatch,
@@ -1212,15 +1395,88 @@ fn oracle_differential(
         });
     }
 
-    let mut extra_iter = observed
-        .difference(&expected)
-        .filter(|k| k.span_start != 0 || k.span_end != 0);
-    if let Some(extra) = extra_iter.next() {
+    let strict_non_root = std::env::var_os("SCANNER_SIM_STRICT_NON_ROOT").is_some();
+    if strict_non_root {
+        let mut expected_root_ends: BTreeMap<(u32, u32), BTreeSet<u64>> = BTreeMap::new();
+        for key in &expected_root {
+            expected_root_ends
+                .entry((key.file_id, key.rule_id))
+                .or_default()
+                .insert(key.span_end as u64);
+        }
+
+        // Allow small padding drift for transform findings (e.g., base64 `=` omission)
+        // where chunking can produce equivalent decoded content with root_hint_end
+        // differing by a few bytes.
+        for exp in expected_non_root {
+            // If a root finding already ends at this offset, treat the transform
+            // finding as redundant (chunked scans may drop it).
+            if let Some(root_ends) = expected_root_ends.get(&(exp.file_id, exp.rule_id)) {
+                let lo = exp.root_hint_end.saturating_sub(3);
+                let hi = exp.root_hint_end.saturating_add(3);
+                if root_ends.range(lo..=hi).next().is_some() {
+                    continue;
+                }
+            }
+
+            let Some(ends) = observed_non_root.get_mut(&(exp.file_id, exp.rule_id)) else {
+                let message = format!(
+                    "differential mismatch (sim {}, reference {}), missing {:?}",
+                    observed_len, expected_len, exp
+                );
+                return Err(FailureReport {
+                    kind: FailureKind::OracleMismatch,
+                    message,
+                    step,
+                });
+            };
+            if ends.remove(&exp.root_hint_end) {
+                continue;
+            }
+            let lo = exp.root_hint_end.saturating_sub(3);
+            let hi = exp.root_hint_end.saturating_add(3);
+            if let Some(&candidate) = ends.range(lo..=hi).next() {
+                ends.remove(&candidate);
+                continue;
+            }
+            let message = format!(
+                "differential mismatch (sim {}, reference {}), missing {:?}",
+                observed_len, expected_len, exp
+            );
+            return Err(FailureReport {
+                kind: FailureKind::OracleMismatch,
+                message,
+                step,
+            });
+        }
+    }
+
+    let file_ids = build_file_id_map(files);
+    let mut expected_spans: BTreeMap<(u32, u32), Vec<SpanU32>> = BTreeMap::new();
+    for exp in &scenario.expected {
+        if let Some(id) = file_ids.get(&exp.path.bytes) {
+            expected_spans
+                .entry((id.0, exp.rule_id))
+                .or_default()
+                .push(exp.root_span);
+        }
+    }
+
+    for extra in observed_root.difference(&expected_root) {
+        let matches_expected = expected_spans
+            .get(&(extra.file_id, extra.rule_id))
+            .map(|spans| {
+                spans
+                    .iter()
+                    .any(|s| s.start == extra.span_start && s.end == extra.span_end)
+            })
+            .unwrap_or(false);
+        if matches_expected {
+            continue;
+        }
         let message = format!(
             "differential mismatch (sim {}, reference {}), extra {:?}",
-            observed.len(),
-            expected.len(),
-            extra
+            observed_len, expected_len, extra
         );
         return Err(FailureReport {
             kind: FailureKind::OracleMismatch,

@@ -26,7 +26,7 @@ pub use executor::{
     SimExecutor, SimTask, SimTaskId, SimTaskState, StepDecision, StepResult, WorkerId,
 };
 pub use fault::{Corruption, FaultInjector, FaultPlan, FileFaultPlan, IoFault, ReadFault};
-pub use fs::{SimFileHandle, SimFs, SimFsSpec, SimNodeSpec, SimPath};
+pub use fs::{SimFileHandle, SimFs, SimFsSpec, SimNodeSpec, SimPath, SimTypeHint};
 pub use minimize::{minimize_scanner_case, MinimizerCfg};
 pub use rng::SimRng;
 pub use trace::{TraceEvent, TraceRing};

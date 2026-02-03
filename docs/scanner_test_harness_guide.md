@@ -328,6 +328,8 @@ The minimizer applies deterministic shrink passes:
 | `SIM_SCANNER_SEED_COUNT` | 25 | Number of seeds to test |
 | `SIM_SCANNER_DEEP` | false | Enable larger scenarios and more faults |
 | `DUMP_SIM_FAIL` | unset | Print failure details on panic |
+| `SCANNER_SIM_WRITE_FAIL` | unset | Write failing artifacts to `tests/failures/scanner_seed_<seed>.case.json` |
+| `SCANNER_SIM_STRICT_NON_ROOT` | unset | Enforce differential checks for non-root (transform) findings |
 
 **Scenario overrides:**
 
@@ -367,7 +369,7 @@ The harness validates these invariants during and after each run:
 | **Overlap Dedupe** | Per finding | No finding ends at or before the overlap prefix boundary |
 | **No Duplicates** | End of run | Emitted findings have unique normalized keys |
 | **Ground Truth** | End of run | Expected secrets found (for fully-observed files), no unexpected findings |
-| **Differential** | End of run | Chunked results match single-chunk reference scan |
+| **Differential** | End of run | Chunked results match single-chunk reference scan (root findings; non-root only with `SCANNER_SIM_STRICT_NON_ROOT=1`) |
 | **Stability** | Multi-run | Same finding set across different schedule seeds |
 
 ### Failure Kinds
