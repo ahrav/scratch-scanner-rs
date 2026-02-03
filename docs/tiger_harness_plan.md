@@ -7,7 +7,7 @@ semantics. The harness treats segmentation as input nondeterminism and asserts
 that chunked scanning does not lose oracle findings under a correctness-oriented
 engine configuration.
 
-## Scope (Phase 1: harness + proptests)
+## Scope (Harness + Proptests)
 
 In-scope:
 - In-memory chunk runner that mirrors runtime semantics (prefix + payload,
@@ -21,7 +21,7 @@ In-scope:
   - Segmentation invariance across multiple chunk plans.
   - Boundary no-miss for matches that begin in the prefix and end in payload.
 
-Out-of-scope for Phase 1:
+Out-of-scope for initial harness:
 - Persisted regression corpus and replay tests.
 - Fuzz harnesses or corpus replay.
 - Performance tuning or allocation strategy changes.
@@ -64,7 +64,7 @@ Out-of-scope for Phase 1:
    - Run `cargo test`.
    - Run `cargo clippy`.
 
-## Phase 2: Safety blanket extensions (planned)
+## Safety Blanket Extensions (Planned)
 
 5. Regression bank (deterministic replay).
    - On a proptest failure, serialize `{seed, chunk_plan, input_bytes}` to
@@ -95,5 +95,5 @@ Out-of-scope for Phase 1:
   semantics, not to bypass normal validation logic.
 - The harness must be deterministic and side-effect free so failing cases are
   reproducible from seeds alone.
-- Phase 2 extensions are intentionally structured to make failures replayable
+- Extensions are intentionally structured to make failures replayable
   without relying on proptest's built-in regression files.

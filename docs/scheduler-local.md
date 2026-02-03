@@ -424,6 +424,6 @@ let report = scan_local(engine, source, LocalConfig::default(), sink);
 
 | Document | Description |
 |----------|-------------|
-| [Detection Engine](./detection-engine.md) | Multi-phase pattern matching and finding emission |
+| [Detection Engine](./detection-engine.md) | Multi-stage pattern matching and finding emission |
 | [Memory Management](./memory-management.md) | Buffer pool lifecycle and memory budgets |
 | [Architecture](./architecture.md) | High-level system design and module dependencies |

@@ -98,7 +98,7 @@ pub(super) fn push_span(&mut self, pair: usize, span: SpanU32, ...) {
 
 ## Investigation Plan
 
-### Phase 1: Add Instrumentation
+### Instrumentation
 
 Add statistics tracking under the `stats` feature flag to measure actual usage:
 
@@ -125,7 +125,7 @@ pub struct HitAccPoolStats {
 2. Coalescing trigger point - increment counter and record pair
 3. End of chunk scan - record max_hits_seen
 
-### Phase 2: Run Large-Scale Benchmark
+### Large-Scale Benchmark
 
 Scan a diverse corpus of repositories to gather statistics:
 
@@ -141,7 +141,7 @@ Scan a diverse corpus of repositories to gather statistics:
 3. Coalescing frequency
 4. Correlation between coalescing and scan time
 
-### Phase 3: Analyze Results
+### Analysis
 
 Questions to answer:
 1. What is the maximum `max_hits` actually needed across all scans?
@@ -149,7 +149,7 @@ Questions to answer:
 3. What percentage of scans would be affected by reducing max_hits?
 4. Is there a performance cliff at certain max_hits values?
 
-### Phase 4: Decision Matrix
+### Decision Matrix
 
 Based on results, choose one of:
 

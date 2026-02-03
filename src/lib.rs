@@ -38,6 +38,7 @@
 
 pub mod async_io;
 pub mod b64_yara_gate;
+pub mod git_scan;
 pub mod lsm;
 pub mod pipeline;
 pub mod pool;

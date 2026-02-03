@@ -29,7 +29,7 @@ Documentation index for the scanner-rs secret scanning engine. This guide helps 
 #### Detection Engine
 | Document | Focus | Key Concepts |
 |----------|-------|--------------|
-| [detection-engine.md](detection-engine.md) | Multi-phase pattern matching | Anchor scan, window building, two-phase, regex confirmation |
+| [detection-engine.md](detection-engine.md) | Multi-stage pattern matching | Anchor scan, window building, two-phase, regex confirmation |
 | [detection-rules.md](detection-rules.md) | Rule coverage & anatomy | 223 rules across 12 categories, anchors, two-phase |
 | [transform-chain.md](transform-chain.md) | Recursive decoding flow | URL/Base64 transforms, TimingWheel scheduling |
 

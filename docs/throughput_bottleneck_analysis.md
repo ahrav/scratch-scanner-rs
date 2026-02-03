@@ -193,12 +193,12 @@ After:  anchor = "sk_live_" (Stripe live secret key prefix)
 // After:  anchor hit → cheap check → regex only if confirmed
 
 fn validate_candidate(window: &[u8], rule: &Rule) -> bool {
-    // Phase 1: Cheap seed confirmation
+    // Seed confirmation: cheap format hint
     if !has_required_format_hint(window, rule) {
         return false;  // Skip expensive regex
     }
 
-    // Phase 2: Full regex (only if phase 1 passes)
+    // Full regex (only if seed confirmation passes)
     rule.regex.is_match(window)
 }
 ```
