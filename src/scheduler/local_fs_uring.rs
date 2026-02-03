@@ -884,14 +884,21 @@ fn io_worker_loop<E: ScanEngine>(
         }
 
         // We have ops in flight - wait for at least one completion.
-        // Only use submit_and_wait if we didn't submit this round.
-        if submitted_this_round == 0 {
-            ring.submit_and_wait(1)?;
-        } else if in_flight_ops >= cfg.io_depth {
-            // At capacity, must wait for completions before submitting more.
-            ring.submit_and_wait(1)?;
+        // Drain CQ before waiting to avoid a syscall if completions are ready.
+        let cq_empty = {
+            let cq = ring.completion();
+            cq.is_empty()
+        };
+        if cq_empty {
+            // Only use submit_and_wait if we didn't submit this round.
+            if submitted_this_round == 0 {
+                ring.submit_and_wait(1)?;
+            } else if in_flight_ops >= cfg.io_depth {
+                // At capacity, must wait for completions before submitting more.
+                ring.submit_and_wait(1)?;
+            }
+            // else: we submitted and have room, check completions opportunistically
         }
-        // else: we submitted and have room, check completions opportunistically
 
         // Drain completions.
         for cqe in ring.completion() {

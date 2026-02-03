@@ -453,8 +453,9 @@ Each I/O worker thread runs an event loop:
 │  4. Flush SQ to kernel (syscall)                   │
 │     - ring.submit()                                │
 │                                                     │
-│  5. Wait for completions (if needed):              │
-│     - ring.submit_and_wait(1)                      │
+│  5. Drain CQ; wait only if empty:                  │
+│     - ring.completion().is_empty()                 │
+│     - ring.submit_and_wait(1) if empty             │
 │     - Or yield if buffers exhausted                │
 │                                                     │
 │  6. Reap all completed ops:                        │

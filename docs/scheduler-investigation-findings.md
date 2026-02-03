@@ -173,12 +173,12 @@ Impact: Unnecessary syscalls and context switching.
 
 Work units:
 
-- [ ] Validate the reasoning by inspecting the loop and confirming whether CQ draining is skipped.
-- [ ] If the reasoning does not hold, document and skip.
-- [ ] Draft an evidence-backed plan for CQ draining and a micro-benchmark to measure syscall reduction.
-- [ ] Implement the CQ drain-before-wait logic.
-- [ ] Measure `io_uring_enter` syscall deltas and wall time.
-- [ ] Run doc-rigor on code files changed for this task and update docs/comments as needed.
+- [x] Validate the reasoning by inspecting the loop and confirming whether CQ draining is skipped. (Confirmed: loop could call `submit_and_wait` without checking CQ first.)
+- [x] If the reasoning does not hold, document and skip. (Reasoning holds.)
+- [x] Draft an evidence-backed plan for CQ draining and a micro-benchmark to measure syscall reduction. Plan: check CQ emptiness before waiting; compare `io_uring_enter` counts and wall time on Linux.
+- [x] Implement the CQ drain-before-wait logic.
+- [ ] Measure `io_uring_enter` syscall deltas and wall time. (Requires Linux `io_uring` run.)
+- [x] Run doc-rigor on code files changed for this task and update docs/comments as needed.
 
 ### Perf: Optional `IORING_OP_OPENAT` And `IORING_OP_STATX`
 
