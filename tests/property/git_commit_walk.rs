@@ -167,7 +167,7 @@ proptest! {
         }
 
         let limits = CommitWalkLimits::RESTRICTIVE;
-        let mut iter = Phase2CommitIter::new_from_refs(&refs, &graph, limits).unwrap();
+        let iter = Phase2CommitIter::new_from_refs(&refs, &graph, limits).unwrap();
 
         let mut got = vec![false; n];
         for item in iter {

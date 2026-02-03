@@ -154,9 +154,9 @@ fn commit_walk_linear_history() {
 
     let cg = CommitGraphView::open_repo(&state).unwrap();
 
-    let mut iter = Phase2CommitIter::new(&state, &cg, CommitWalkLimits::RESTRICTIVE).unwrap();
+    let iter = Phase2CommitIter::new(&state, &cg, CommitWalkLimits::RESTRICTIVE).unwrap();
     let mut out = Vec::new();
-    while let Some(item) = iter.next() {
+    for item in iter {
         out.push(item.unwrap().pos);
     }
 
