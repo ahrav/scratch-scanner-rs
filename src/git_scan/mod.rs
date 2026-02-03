@@ -101,8 +101,8 @@ pub use pack_candidates::{
 pub use pack_decode::{entry_header_at, inflate_entry_payload, PackDecodeError, PackDecodeLimits};
 pub use pack_delta::{apply_delta, DeltaError};
 pub use pack_exec::{
-    execute_pack_plan, execute_pack_plan_with_strategy, ExternalBase, ExternalBaseProvider,
-    PackExecError, PackExecReport, PackExecStats, PackObjectSink, SkipReason, SkipRecord,
+    execute_pack_plan, ExternalBase, ExternalBaseProvider, PackExecError, PackExecReport,
+    PackExecStats, PackObjectSink, SkipReason, SkipRecord,
 };
 pub use pack_io::{PackIo, PackIoError, PackIoLimits};
 pub use pack_plan::{build_pack_plans, OidResolver, PackPlanConfig, PackPlanError, PackView};
