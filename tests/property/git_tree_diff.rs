@@ -158,6 +158,7 @@ proptest! {
             max_candidates: (path_vec.len() as u32).saturating_add(32),
             max_path_arena_bytes: 1024 * 1024,
             max_tree_bytes_per_job: 4 * 1024 * 1024,
+            max_tree_cache_bytes: 2 * 1024 * 1024,
             max_tree_depth: 64,
         };
 

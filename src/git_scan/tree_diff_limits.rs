@@ -15,9 +15,10 @@
 //! |------------------|-------------|-------------------------------------|
 //! | Candidate buffer | 1M entries x ~50 bytes = 50 MB | Per-repo job |
 //! | Path arena       | 64 MB       | Shared across all candidates        |
+//! | Tree cache       | 64 MB       | Tree payload cache (fixed slots)    |
 //! | Diff stack       | 256 frames x ~100 bytes = 25 KB | Per-diff operation |
 //!
-//! Total default budget: ~115 MB per repo job (excluding mmapped data).
+//! Total default budget: ~179 MB per repo job (excluding mmapped data).
 
 /// Hard caps for tree diff and candidate collection.
 ///
@@ -35,6 +36,14 @@ pub struct TreeDiffLimits {
     ///
     /// Default: 2 GB.
     pub max_tree_bytes_per_job: u64,
+
+    /// Maximum bytes reserved for the tree cache.
+    ///
+    /// The cache stores decompressed tree payloads in fixed-size slots.
+    /// Entries larger than a slot are not cached.
+    ///
+    /// Default: 64 MB.
+    pub max_tree_cache_bytes: u32,
 
     /// Maximum candidates in the in-memory buffer.
     ///
@@ -71,6 +80,7 @@ impl TreeDiffLimits {
     /// Memory budget: ~115 MB per repo job (excluding mmapped data).
     pub const DEFAULT: Self = Self {
         max_tree_bytes_per_job: 2 * 1024 * 1024 * 1024, // 2 GB
+        max_tree_cache_bytes: 64 * 1024 * 1024,         // 64 MB
         max_candidates: 1_048_576,                      // 1M
         max_path_arena_bytes: 64 * 1024 * 1024,         // 64 MB
         max_tree_depth: 256,
@@ -81,6 +91,7 @@ impl TreeDiffLimits {
     /// Memory budget: ~2 MB per repo job.
     pub const RESTRICTIVE: Self = Self {
         max_tree_bytes_per_job: 64 * 1024 * 1024, // 64 MB
+        max_tree_cache_bytes: 8 * 1024 * 1024,    // 8 MB
         max_candidates: 16_384,                   // 16K
         max_path_arena_bytes: 1024 * 1024,        // 1 MB
         max_tree_depth: 64,
@@ -104,6 +115,7 @@ impl TreeDiffLimits {
             self.max_tree_bytes_per_job > 0,
             "tree bytes budget must be > 0"
         );
+        assert!(self.max_tree_cache_bytes > 0, "tree cache must be > 0");
 
         // Upper bounds (prevent misconfigurations)
         assert!(
@@ -121,6 +133,10 @@ impl TreeDiffLimits {
         assert!(
             self.max_tree_bytes_per_job <= 64_u64 * 1024 * 1024 * 1024,
             "tree bytes budget > 64GB is unreasonable"
+        );
+        assert!(
+            self.max_tree_cache_bytes <= 2 * 1024 * 1024 * 1024,
+            "tree cache > 2GB is unreasonable"
         );
 
         // Consistency checks
@@ -146,6 +162,9 @@ impl TreeDiffLimits {
         if self.max_tree_bytes_per_job == 0 {
             return Err("tree bytes budget must be > 0");
         }
+        if self.max_tree_cache_bytes == 0 {
+            return Err("tree cache must be > 0");
+        }
         if self.max_candidates > 100_000_000 {
             return Err("candidate limit > 100M is unreasonable");
         }
@@ -157,6 +176,9 @@ impl TreeDiffLimits {
         }
         if self.max_tree_bytes_per_job > 64 * 1024 * 1024 * 1024 {
             return Err("tree bytes budget > 64GB is unreasonable");
+        }
+        if self.max_tree_cache_bytes > 2 * 1024 * 1024 * 1024 {
+            return Err("tree cache > 2GB is unreasonable");
         }
         if (self.max_path_arena_bytes as u64) < (self.max_candidates as u64) * 8 {
             return Err("path arena too small for candidate count");

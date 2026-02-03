@@ -76,6 +76,9 @@ Git tree diffing has its own bounded memory envelope:
   for loose objects).
 - **Candidate storage**: candidate buffer and path arena sizes are explicitly
   bounded by `TreeDiffLimits.max_candidates` and `max_path_arena_bytes`.
+- **Tree cache sizing**: tree payload cache uses fixed-size slots (4 KiB)
+  with 4-way sets; total cache bytes are rounded down to a power-of-two
+  set count. Entries larger than a slot are not cached.
 
 These limits make Git tree traversal deterministic and DoS-resistant while
 keeping blob data out of memory during diffing.

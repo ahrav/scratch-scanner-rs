@@ -3,6 +3,8 @@
 //! Provides a pack/loose-backed object loader that returns raw tree
 //! payload bytes (no `tree <size>\0` header). This is used by the
 //! tree diff walker to avoid blob reads while traversing trees.
+//! Tree payloads are cached in a fixed-size, set-associative tree cache
+//! to avoid repeated inflations of hot subtrees.
 //!
 //! # Contract
 //! Implementations must return the raw, decompressed tree payload (no
@@ -17,6 +19,7 @@
 //! - `max_object_bytes` caps all inflated payloads and delta buffers
 //! - Delta chains are bounded by `MAX_DELTA_DEPTH`
 //! - Repo artifacts must be `Ready` (commit-graph + MIDX present)
+//! - Tree cache is best-effort: oversize payloads are not cached
 //!
 //! # Ordering
 //! Pack lookup is attempted before loose objects. This mirrors typical Git
@@ -38,6 +41,7 @@ use super::pack_inflate::{
 };
 use super::repo::GitRepoPaths;
 use super::repo_open::RepoJobState;
+use super::tree_cache::TreeCache;
 use super::tree_diff_limits::TreeDiffLimits;
 
 /// Maximum entry header bytes to parse in pack files.
@@ -68,6 +72,10 @@ pub trait TreeSource {
 /// Holds a borrowed MIDX view (tied to the repo job's mmap lifetime) and
 /// lazily mmaps pack files on demand. Pack mmaps are cached in `Arc` so
 /// recursive delta resolution can borrow pack bytes without aliasing `self`.
+///
+/// The tree cache stores decompressed payloads, but cache hits are still
+/// returned as owned `Vec<u8>` to keep `TreeSource` ownership semantics
+/// simple for callers.
 #[derive(Debug)]
 pub struct ObjectStore<'a> {
     oid_len: u8,
@@ -76,6 +84,7 @@ pub struct ObjectStore<'a> {
     pack_paths: Vec<PathBuf>,
     pack_cache: Vec<Option<Arc<Mmap>>>,
     loose_dirs: Vec<PathBuf>,
+    tree_cache: TreeCache,
 }
 
 impl<'a> ObjectStore<'a> {
@@ -112,6 +121,7 @@ impl<'a> ObjectStore<'a> {
         let pack_cache = vec![None; pack_paths.len()];
 
         let loose_dirs = collect_loose_dirs(&repo.paths);
+        let tree_cache = TreeCache::new(limits.max_tree_cache_bytes);
         let max_object_bytes = limits.max_tree_bytes_per_job.min(usize::MAX as u64) as usize;
 
         Ok(Self {
@@ -121,6 +131,7 @@ impl<'a> ObjectStore<'a> {
             pack_paths,
             pack_cache,
             loose_dirs,
+            tree_cache,
         })
     }
 
@@ -156,6 +167,7 @@ impl<'a> ObjectStore<'a> {
         oid: &OidBytes,
         depth: u8,
     ) -> Result<Option<(ObjectKind, Vec<u8>)>, TreeDiffError> {
+        // MIDX lookups are O(log N) on the OID list and return pack offsets.
         let idx = match self.midx.find_oid(oid).map_err(store_error)? {
             Some(idx) => idx,
             None => return Ok(None),
@@ -173,6 +185,7 @@ impl<'a> ObjectStore<'a> {
         offset: u64,
         depth: u8,
     ) -> Result<(ObjectKind, Vec<u8>), TreeDiffError> {
+        // Pack objects can be delta chains; bound recursion by depth.
         let pack = PackFile::parse(pack_bytes, self.oid_len as usize).map_err(store_error)?;
         let header = pack
             .entry_header_at(offset, MAX_ENTRY_HEADER_BYTES)
@@ -317,11 +330,17 @@ impl TreeSource for ObjectStore<'_> {
             });
         }
 
+        if let Some(bytes) = self.tree_cache.get(oid) {
+            return Ok(bytes.to_vec());
+        }
+
         let (kind, data) = self.load_object(oid)?;
         if kind != ObjectKind::Tree {
             return Err(TreeDiffError::NotATree);
         }
 
+        // Cache is best-effort; failures are ignored.
+        self.tree_cache.insert(*oid, &data);
         Ok(data)
     }
 }
