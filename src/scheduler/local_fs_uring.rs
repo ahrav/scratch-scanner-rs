@@ -48,7 +48,7 @@ use super::output_sink::OutputSink;
 use crossbeam_channel as chan;
 use crossbeam_queue::ArrayQueue;
 
-use io_uring::{opcode, types, IoUring};
+use io_uring::{opcode, types, IoUring, Probe};
 
 use std::collections::VecDeque;
 use std::fs::{self, File};
@@ -63,6 +63,40 @@ use std::thread;
 // ============================================================================
 // Configuration
 // ============================================================================
+
+/// Open/stat execution mode for io_uring file setup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OpenStatMode {
+    /// Default: use io_uring open/stat when supported, otherwise fallback.
+    UringPreferred,
+    /// Force blocking open + fstat path (parity/debug).
+    BlockingOnly,
+    /// Require io_uring open/stat; error if unsupported.
+    UringRequired,
+}
+
+impl Default for OpenStatMode {
+    fn default() -> Self {
+        Self::UringPreferred
+    }
+}
+
+/// Path resolution policy for openat2 when available.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResolvePolicy {
+    /// Default: no path resolution constraints (match current behavior).
+    Default,
+    /// Disallow symlink traversal in all components (opt-in).
+    NoSymlinks,
+    /// Restrict traversal beneath dirfd root (requires dirfd strategy).
+    BeneathRoot,
+}
+
+impl Default for ResolvePolicy {
+    fn default() -> Self {
+        Self::Default
+    }
+}
 
 /// Configuration for local FS scanning using io_uring I/O threads + CPU executor scan threads.
 #[derive(Clone, Debug)]
@@ -102,6 +136,12 @@ pub struct LocalFsUringConfig {
     /// registering all buffers up-front and limits the pool size to `u16::MAX`.
     pub use_registered_buffers: bool,
 
+    /// Open/stat execution mode for io_uring file setup.
+    pub open_stat_mode: OpenStatMode,
+
+    /// Path resolution policy for openat2 (ignored when unsupported).
+    pub resolve_policy: ResolvePolicy,
+
     /// Follow symbolic links during discovery.
     pub follow_symlinks: bool,
 
@@ -127,6 +167,8 @@ impl Default for LocalFsUringConfig {
             file_queue_cap: 256,
             pool_buffers: 256,
             use_registered_buffers: false,
+            open_stat_mode: OpenStatMode::default(),
+            resolve_policy: ResolvePolicy::default(),
             follow_symlinks: false,
             max_file_size: None,
             seed: 1,
@@ -211,6 +253,13 @@ pub struct LocalFsSummary {
 pub struct UringIoStats {
     pub files_started: u64,
     pub files_open_failed: u64,
+    pub open_ops_submitted: u64,
+    pub open_ops_completed: u64,
+    pub stat_ops_submitted: u64,
+    pub stat_ops_completed: u64,
+    pub open_failures: u64,
+    pub stat_failures: u64,
+    pub open_stat_fallbacks: u64,
     pub reads_submitted: u64,
     pub reads_completed: u64,
     pub read_errors: u64,
@@ -334,6 +383,13 @@ impl UringIoStats {
     fn merge(&mut self, other: UringIoStats) {
         self.files_started += other.files_started;
         self.files_open_failed += other.files_open_failed;
+        self.open_ops_submitted += other.open_ops_submitted;
+        self.open_ops_completed += other.open_ops_completed;
+        self.stat_ops_submitted += other.stat_ops_submitted;
+        self.stat_ops_completed += other.stat_ops_completed;
+        self.open_failures += other.open_failures;
+        self.stat_failures += other.stat_failures;
+        self.open_stat_fallbacks += other.open_stat_fallbacks;
         self.reads_submitted += other.reads_submitted;
         self.reads_completed += other.reads_completed;
         self.read_errors += other.read_errors;
@@ -344,6 +400,38 @@ impl UringIoStats {
 // ============================================================================
 // Internal Types
 // ============================================================================
+
+#[derive(Clone, Copy, Debug)]
+struct OpenStatCaps {
+    /// IORING_OP_OPENAT supported.
+    openat: bool,
+    /// IORING_OP_OPENAT2 supported.
+    openat2: bool,
+    /// IORING_OP_STATX supported.
+    statx: bool,
+    /// Kernel guarantees submit-time parameter stability.
+    submit_stable: bool,
+}
+
+impl OpenStatCaps {
+    #[inline]
+    fn supports_open_stat(&self) -> bool {
+        (self.openat || self.openat2) && self.statx
+    }
+}
+
+fn probe_uring_caps(ring: &IoUring) -> io::Result<OpenStatCaps> {
+    // Probe opcode availability and submit-stable behavior once per ring.
+    let mut probe = Probe::new();
+    ring.submitter().register_probe(&mut probe)?;
+
+    Ok(OpenStatCaps {
+        openat: probe.is_supported(opcode::OpenAt::CODE),
+        openat2: probe.is_supported(opcode::OpenAt2::CODE),
+        statx: probe.is_supported(opcode::Statx::CODE),
+        submit_stable: ring.params().is_feature_submit_stable(),
+    })
+}
 
 /// Token that holds the in-flight file permit until all chunk tasks complete.
 struct FileToken {
@@ -619,6 +707,45 @@ fn io_worker_loop<E: ScanEngine>(
     let mut ring = IoUring::new(cfg.ring_entries)?;
     let mut stats = UringIoStats::default();
     let mut registered_buffers = false;
+
+    // Probe once per ring to decide open/stat eligibility and record fallback.
+    let mut open_stat_fallback = false;
+    let open_stat_caps = match cfg.open_stat_mode {
+        OpenStatMode::BlockingOnly => None,
+        _ => match probe_uring_caps(&ring) {
+            Ok(caps) => Some(caps),
+            Err(err) => {
+                if cfg.open_stat_mode == OpenStatMode::UringRequired {
+                    return Err(err);
+                }
+                open_stat_fallback = true;
+                None
+            }
+        },
+    };
+
+    let open_stat_supported = open_stat_caps.map_or(false, |caps| caps.supports_open_stat());
+
+    match cfg.open_stat_mode {
+        OpenStatMode::BlockingOnly => {}
+        OpenStatMode::UringPreferred => {
+            if !open_stat_supported {
+                open_stat_fallback = true;
+            }
+        }
+        OpenStatMode::UringRequired => {
+            if !open_stat_supported {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "io_uring open/stat opcodes unsupported",
+                ));
+            }
+        }
+    }
+
+    if open_stat_fallback {
+        stats.open_stat_fallbacks += 1;
+    }
 
     if cfg.use_registered_buffers {
         let bufs = pool.iovecs();
@@ -1286,6 +1413,8 @@ mod tests {
             file_queue_cap: 8,
             pool_buffers: 32,
             use_registered_buffers: false,
+            open_stat_mode: OpenStatMode::BlockingOnly,
+            resolve_policy: ResolvePolicy::Default,
             follow_symlinks: false,
             max_file_size: None,
             seed: 123,

@@ -149,6 +149,13 @@ Add counters:
 - `open_failures`, `stat_failures`
 - `open_stat_fallbacks`
 
+## Work Units Checklist
+
+- [x] Unit 1: Add config surface (`OpenStatMode`, `ResolvePolicy`), probe io_uring capabilities, track fallback counters; final step run doc-rigor on code touched.
+- [ ] Unit 2: Wire open/stat ops and per-file state machine (pending open/stat), include per-file fallback path; final step run doc-rigor on code touched.
+- [ ] Unit 3: Implement openat2/openat flags + resolve policy mapping, statx `AT_EMPTY_PATH`, open-time size enforcement; final step run doc-rigor on code touched.
+- [ ] Unit 4: Linux parity tests + metrics validation + doc updates; final step run doc-rigor on code touched.
+
 ## Test Plan (Linux Only)
 
 - Functional parity vs blocking path on the same dataset.

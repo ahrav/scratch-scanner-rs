@@ -192,6 +192,7 @@ Work units:
 - [x] If the reasoning does not hold, document and defer. (Reasoning holds.)
 - [x] Draft an evidence-backed plan that estimates net win and complexity cost. Plan: add optional `IORING_OP_OPENAT` + `IORING_OP_STATX` path in I/O threads, measure `openat/statx` syscall counts vs `io_uring_enter` overhead; only consider if open/stat is a significant share on tiny-file workloads.
 - [x] Document the detailed design plan and fallback semantics. See `docs/io-uring-open-statx-plan.md`.
+- [x] Track implementation work units as a checklist in `docs/io-uring-open-statx-plan.md` (Unit 1 complete: config + probe scaffolding + fallback counters + doc-rigor).
 - [ ] Implement only if projected wins outweigh complexity and if the `io_uring` path is already production-parity. (Deferred: parity measurement still pending.)
 - [ ] Measure syscall deltas and end-to-end throughput impact. (Requires Linux `io_uring` run.)
 - [x] Run doc-rigor on code files changed for this task and update docs/comments as needed. (No code changes in this step.)
