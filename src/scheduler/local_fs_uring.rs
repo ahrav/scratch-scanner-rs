@@ -5,6 +5,7 @@
 //! - I/O threads use io_uring for async reads
 //! - CPU threads run the work-stealing executor for scanning
 //! - Buffer ownership transfers: I/O thread acquires, CPU thread releases
+//! - Overlap bytes are carried in-memory between chunks (payload-only reads)
 //!
 //! # Why io_uring?
 //!
@@ -387,6 +388,8 @@ struct FileState {
     done: bool,
     failed: bool,
     token: Arc<FileToken>,
+    overlap_buf: Box<[u8]>,
+    overlap_len: usize,
 }
 
 /// Per-read-op state for completion matching.
@@ -400,7 +403,7 @@ struct Op {
     file_slot: usize,
     base_offset: u64,
     prefix_len: usize,
-    requested_len: usize,
+    payload_len: usize,
     buf: TsBufferHandle,
 }
 
@@ -556,6 +559,8 @@ fn io_worker_loop<E: ScanEngine>(
             done: false,
             failed: false,
             token: w.token,
+            overlap_buf: vec![0u8; overlap].into_boxed_slice(),
+            overlap_len: 0,
         });
 
         ready.push_back(slot);
@@ -630,20 +635,24 @@ fn io_worker_loop<E: ScanEngine>(
             }
 
             let offset = st.next_offset;
-            let base_offset = offset.saturating_sub(overlap as u64);
-            let prefix_len = (offset - base_offset) as usize;
+            let prefix_len = st.overlap_len;
 
             let payload_len = (st.size - offset).min(chunk_size as u64) as usize;
-            let requested_len = prefix_len + payload_len;
 
-            debug_assert!(requested_len <= buf_len);
+            debug_assert!(prefix_len + payload_len <= buf_len);
+
+            // Copy overlap bytes from the previous chunk into the buffer so we
+            // only read the payload from disk (no overlap re-reads).
+            if prefix_len > 0 {
+                buf.as_mut_slice()[..prefix_len].copy_from_slice(&st.overlap_buf[..prefix_len]);
+            }
 
             let op_slot = free_ops.pop().unwrap();
             let fd = st.file.as_raw_fd();
-            let ptr = buf.as_slice().as_ptr() as *mut u8;
+            let ptr = unsafe { buf.as_mut_slice().as_mut_ptr().add(prefix_len) };
 
-            let entry = opcode::Read::new(types::Fd(fd), ptr, requested_len as u32)
-                .offset(base_offset)
+            let entry = opcode::Read::new(types::Fd(fd), ptr, payload_len as u32)
+                .offset(offset)
                 .build()
                 .user_data(op_slot as u64);
 
@@ -662,11 +671,13 @@ fn io_worker_loop<E: ScanEngine>(
                 }
             }
 
+            let base_offset = offset.saturating_sub(prefix_len as u64);
+
             ops[op_slot] = Some(Op {
                 file_slot,
                 base_offset,
                 prefix_len,
-                requested_len,
+                payload_len,
                 buf,
             });
 
@@ -782,7 +793,7 @@ fn io_worker_loop<E: ScanEngine>(
                     st.done = true;
                     drop(op.buf);
                 } else {
-                    if n < op.requested_len {
+                    if n < op.payload_len {
                         // Short read: file likely shrank. Treat as truncation.
                         // We scan what we got, but mark file done since we can't
                         // trust our offset calculations for subsequent chunks.
@@ -790,13 +801,23 @@ fn io_worker_loop<E: ScanEngine>(
                         st.done = true;
                     }
 
-                    let actual_prefix = op.prefix_len.min(n);
-                    let len = n as u32;
+                    let total_len = op.prefix_len.saturating_add(n);
+                    let len = total_len as u32;
+
+                    if overlap > 0 {
+                        let overlap_len = overlap.min(total_len);
+                        if overlap_len > 0 {
+                            let start = total_len - overlap_len;
+                            st.overlap_buf[..overlap_len]
+                                .copy_from_slice(&op.buf.as_slice()[start..start + overlap_len]);
+                        }
+                        st.overlap_len = overlap_len;
+                    }
 
                     let task = CpuTask::ScanChunk {
                         token: Arc::clone(&st.token),
                         base_offset: op.base_offset,
-                        prefix_len: actual_prefix as u32,
+                        prefix_len: op.prefix_len as u32,
                         len,
                         buf: op.buf,
                     };

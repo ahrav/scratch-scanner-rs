@@ -143,12 +143,12 @@ Impact: Extra I/O volume and wasted bandwidth for large files.
 
 Work units:
 
-- [ ] Validate the reasoning by confirming the current overlap strategy in `local_fs_uring` and comparing it to `async_io/linux.rs`.
-- [ ] If the reasoning does not hold, document and update the finding.
-- [ ] Draft an evidence-backed plan for the overlap-copy pipeline and define how to measure I/O reduction.
-- [ ] Implement the overlap-copy strategy so subsequent reads are payload-only and overlap is copied locally.
-- [ ] Measure I/O volume and throughput changes on large-file workloads.
-- [ ] Run doc-rigor on code files changed for this task and update docs/comments as needed.
+- [x] Validate the reasoning by confirming the current overlap strategy in `local_fs_uring` and comparing it to `async_io/linux.rs`. (Confirmed: `local_fs_uring` read path re-read overlap via `base_offset = offset - overlap`.)
+- [x] If the reasoning does not hold, document and update the finding. (Reasoning holds.)
+- [x] Draft an evidence-backed plan for the overlap-copy pipeline and define how to measure I/O reduction. Plan: copy tail overlap into per-file buffer, submit payload-only reads, and measure `read` bytes (or `io_uring_enter` bytes) on Linux with `perf`/`strace`.
+- [x] Implement the overlap-copy strategy so subsequent reads are payload-only and overlap is copied locally.
+- [ ] Measure I/O volume and throughput changes on large-file workloads. (Requires Linux `io_uring` run; not measurable on macOS.)
+- [x] Run doc-rigor on code files changed for this task and update docs/comments as needed.
 
 ### Perf: Registered Buffers For `io_uring` Reads
 
