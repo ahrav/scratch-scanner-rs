@@ -36,6 +36,7 @@ pub mod pack_cache;
 pub mod pack_candidates;
 pub mod pack_decode;
 pub mod pack_delta;
+pub mod pack_exec;
 pub mod pack_inflate;
 pub mod pack_plan;
 pub mod pack_plan_model;
@@ -85,6 +86,10 @@ pub use pack_candidates::{
 };
 pub use pack_decode::{entry_header_at, inflate_entry_payload, PackDecodeError, PackDecodeLimits};
 pub use pack_delta::{apply_delta, DeltaError};
+pub use pack_exec::{
+    execute_pack_plan, ExternalBase, ExternalBaseProvider, PackExecError, PackExecReport,
+    PackExecStats, PackObjectSink, SkipReason, SkipRecord,
+};
 pub use pack_plan::{build_pack_plans, OidResolver, PackPlanConfig, PackPlanError, PackView};
 pub use pack_plan_model::{
     BaseLoc, CandidateAtOffset, Cluster, DeltaDep, DeltaKind, PackPlan, PackPlanStats,
