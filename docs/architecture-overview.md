@@ -115,6 +115,7 @@ graph TB
 | **Spill Runs**      | `src/git_scan/run_writer.rs`, `src/git_scan/run_reader.rs` | Stable on-disk encoding for sorted candidate runs     |
 | **Run Merger**      | `src/git_scan/spill_merge.rs` | K-way merge of spill runs with canonical dedupe                     |
 | **Spiller**         | `src/git_scan/spiller.rs`     | Orchestrates chunking, spilling, and global merge                   |
+| **Seen Blob Store** | `src/git_scan/seen_store.rs`  | Batched seen-blob checks for filtering already scanned blobs         |
 | **WorkItems**       | `src/git_scan/work_items.rs`  | SoA candidate metadata tables for sorting without moving structs    |
 | **Policy Hash**     | `src/git_scan/policy_hash.rs`  | Canonical BLAKE3 identity over rules, transforms, and tuning         |
 
@@ -154,6 +155,9 @@ then sorts and dedupes within the chunk before writing a spill run (`RunWriter`)
 merge across runs to emit globally sorted, unique candidates. `WorkItems` stores
 candidate metadata in SoA form so downstream sorting can shuffle indices without
 moving large structs.
+
+After global dedupe, sorted OID batches are sent to the seen-blob store so
+previously scanned blobs can be filtered before decoding.
 
 ## Git Policy Hash
 

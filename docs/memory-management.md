@@ -98,6 +98,10 @@ Path bytes are stored separately in the chunk `ByteArena` and bounded by
 `SpillLimits.max_chunk_path_bytes`, so total spill working set remains linear
 in candidate count plus bounded path arena growth.
 
+Seen filtering uses a per-batch arena capped by `SpillLimits.seen_batch_max_path_bytes`
+and batches up to `SpillLimits.seen_batch_max_oids` OIDs before issuing a
+seen-store query. Batches are flushed on either limit to keep memory bounded.
+
 ## Single-Threaded Pipeline Memory Model
 
 > **Note**: The diagrams below describe the single-threaded `Pipeline` API, which uses

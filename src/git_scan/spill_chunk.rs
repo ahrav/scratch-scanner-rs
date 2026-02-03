@@ -2,7 +2,8 @@
 //!
 //! A spill chunk holds a bounded set of candidates plus an arena for their
 //! paths. The chunk can be sorted and deduped using a canonical ordering
-//! that is stable across spill runs.
+//! that is stable across spill runs, so spill files can be merged without
+//! additional normalization.
 //!
 //! # Invariants
 //! - `candidates.len() <= max_candidates`
@@ -22,6 +23,10 @@ use super::work_items::WorkItems;
 ///
 /// This is a single-threaded, in-memory structure. It does not perform any
 /// spilling itself; the caller (spiller) decides when to flush to disk.
+///
+/// # Invariants
+/// - `path_ref` values in `candidates` point into `path_arena`.
+/// - `oid_len` is validated on every push.
 #[derive(Debug)]
 pub struct CandidateChunk {
     candidates: Vec<TreeCandidate>,
@@ -60,6 +65,8 @@ impl CandidateChunk {
     }
 
     /// Clears candidates and path arena, retaining capacity.
+    ///
+    /// Any previously returned `ByteRef` values become invalid.
     pub fn clear(&mut self) {
         self.candidates.clear();
         self.path_arena = ByteArena::with_capacity(self.path_arena.capacity());
@@ -67,7 +74,10 @@ impl CandidateChunk {
 
     /// Pushes a candidate into the chunk.
     ///
-    /// Returns `SpillError::ArenaOverflow` if the chunk is full.
+    /// # Errors
+    /// - `SpillError::OidLengthMismatch` if the OID length does not match `oid_len`.
+    /// - `SpillError::PathTooLong` if the path exceeds `max_path_len`.
+    /// - `SpillError::ArenaOverflow` if the chunk or path arena is full.
     #[allow(clippy::too_many_arguments)]
     pub fn push(
         &mut self,
@@ -117,7 +127,8 @@ impl CandidateChunk {
     /// Sorts candidates by canonical order and removes duplicates.
     ///
     /// This is required before spilling a chunk to disk to ensure run files
-    /// are globally mergeable.
+    /// are globally mergeable. The ordering compares path bytes (not arena
+    /// offsets) to stay stable across runs.
     pub fn sort_and_dedupe(&mut self) {
         let arena = &self.path_arena;
         self.candidates
@@ -142,6 +153,9 @@ impl CandidateChunk {
     ///
     /// The work items reference this chunk's path arena via `ByteRef`, so the
     /// chunk must remain alive while the items are processed.
+    ///
+    /// # Errors
+    /// Returns `SpillError::ArenaOverflow` if the destination work items are full.
     pub fn fill_work_items(&self, items: &mut WorkItems) -> Result<(), SpillError> {
         items.clear();
         for cand in &self.candidates {
@@ -159,6 +173,8 @@ impl CandidateChunk {
 }
 
 /// Iterator over resolved candidates.
+///
+/// Each yielded item borrows path bytes from the chunk's arena.
 pub struct ResolvedIter<'a> {
     chunk: &'a CandidateChunk,
     idx: usize,
@@ -190,6 +206,7 @@ impl<'a> Iterator for ResolvedIter<'a> {
 fn compare_candidates(arena: &ByteArena, a: &TreeCandidate, b: &TreeCandidate) -> Ordering {
     a.oid
         .cmp(&b.oid)
+        // Compare by path bytes so ordering is independent of arena layout.
         .then_with(|| arena.get(a.ctx.path_ref).cmp(arena.get(b.ctx.path_ref)))
         .then_with(|| a.ctx.commit_id.cmp(&b.ctx.commit_id))
         .then_with(|| a.ctx.parent_idx.cmp(&b.ctx.parent_idx))
@@ -215,6 +232,8 @@ mod tests {
     fn limits() -> SpillLimits {
         SpillLimits {
             max_spill_bytes: 1024 * 1024,
+            seen_batch_max_oids: 16,
+            seen_batch_max_path_bytes: 256,
             max_chunk_candidates: 8,
             max_chunk_path_bytes: 128,
             max_spill_runs: 4,
