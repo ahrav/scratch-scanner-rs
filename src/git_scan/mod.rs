@@ -60,9 +60,13 @@ pub use commit_walk::{
 pub use commit_walk_limits::CommitWalkLimits;
 pub use errors::{CommitPlanError, RepoOpenError, SpillError, TreeDiffError};
 pub use limits::RepoOpenLimits;
-pub use mapping_bridge::{MappingBridge, MappingBridgeConfig};
+pub use mapping_bridge::{MappingBridge, MappingBridgeConfig, MappingStats};
+pub use midx::MidxView;
 pub use object_id::{ObjectFormat, OidBytes};
 pub use object_store::{ObjectStore, TreeSource};
+pub use pack_candidates::{
+    CollectingPackCandidateSink, LooseCandidate, PackCandidate, PackCandidateSink,
+};
 pub use path_policy::PathClass;
 pub use policy_hash::{policy_hash, MergeDiffMode, PolicyHash};
 pub use preflight::{preflight, ArtifactPaths, ArtifactStatus, PreflightReport};

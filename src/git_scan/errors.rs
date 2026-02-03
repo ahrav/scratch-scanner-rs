@@ -8,6 +8,8 @@
 use std::fmt;
 use std::io;
 
+use super::midx_error::MidxError;
+
 /// Errors from repo discovery and open.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -237,6 +239,8 @@ pub enum SpillError {
     CorruptRunFile { detail: &'static str },
     /// OID length in run file doesn't match expected.
     OidLengthMismatch { got: u8, expected: u8 },
+    /// MIDX mapping or lookup error.
+    MidxError(MidxError),
     /// Path in run file exceeds safety limit.
     RunPathTooLong { len: usize, max: usize },
     /// Seen-blob store returned wrong number of results.
@@ -265,6 +269,7 @@ impl fmt::Display for SpillError {
                     "OID length mismatch in run: got {got}, expected {expected}"
                 )
             }
+            Self::MidxError(err) => write!(f, "{err}"),
             Self::RunPathTooLong { len, max } => {
                 write!(f, "path in run file too long: {len} bytes (max: {max})")
             }
@@ -286,6 +291,7 @@ impl std::error::Error for SpillError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(err) => Some(err),
+            Self::MidxError(err) => Some(err),
             _ => None,
         }
     }
@@ -294,6 +300,12 @@ impl std::error::Error for SpillError {
 impl From<io::Error> for SpillError {
     fn from(err: io::Error) -> Self {
         Self::Io(err)
+    }
+}
+
+impl From<MidxError> for SpillError {
+    fn from(err: MidxError) -> Self {
+        Self::MidxError(err)
     }
 }
 
