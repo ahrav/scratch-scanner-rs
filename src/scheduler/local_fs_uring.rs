@@ -44,9 +44,9 @@ use super::engine_trait::{EngineScratch, FindingRecord, ScanEngine};
 use super::executor::{Executor, ExecutorConfig, ExecutorHandle, WorkerCtx};
 use super::metrics::MetricsSnapshot;
 use super::output_sink::OutputSink;
-use super::ts_buffer_pool::{TsBufferHandle, TsBufferPool, TsBufferPoolConfig};
 
 use crossbeam_channel as chan;
+use crossbeam_queue::ArrayQueue;
 
 use io_uring::{opcode, types, IoUring};
 
@@ -96,6 +96,12 @@ pub struct LocalFsUringConfig {
     /// - queued scan tasks (each holds a buffer)
     pub pool_buffers: usize,
 
+    /// Use io_uring registered buffers (`READ_FIXED`) for reads.
+    ///
+    /// This can reduce per-op overhead for high-IOPS workloads, but requires
+    /// registering all buffers up-front and limits the pool size to `u16::MAX`.
+    pub use_registered_buffers: bool,
+
     /// Follow symbolic links during discovery.
     pub follow_symlinks: bool,
 
@@ -120,6 +126,7 @@ impl Default for LocalFsUringConfig {
             max_in_flight_files: 512,
             file_queue_cap: 256,
             pool_buffers: 256,
+            use_registered_buffers: false,
             follow_symlinks: false,
             max_file_size: None,
             seed: 1,
@@ -145,6 +152,13 @@ impl LocalFsUringConfig {
         );
         assert!(self.file_queue_cap > 0, "file_queue_cap must be > 0");
         assert!(self.pool_buffers > 0, "pool_buffers must be > 0");
+        if self.use_registered_buffers {
+            assert!(
+                self.pool_buffers <= u16::MAX as usize,
+                "pool_buffers ({}) must be <= u16::MAX for registered buffers",
+                self.pool_buffers
+            );
+        }
 
         let overlap = engine.required_overlap();
         let buf_len = overlap.saturating_add(self.chunk_size);
@@ -203,6 +217,119 @@ pub struct UringIoStats {
     pub short_reads: u64,
 }
 
+// ============================================================================
+// Fixed Buffer Pool (io_uring READ_FIXED)
+// ============================================================================
+
+/// Fixed buffer pool backed by a stable buffer table.
+///
+/// Buffers are allocated once and never moved, allowing safe registration with
+/// io_uring via `register_buffers`. Handles return buffers to a global free
+/// queue on drop.
+struct FixedBufferPool {
+    buffer_len: usize,
+    buffers: Vec<Box<[u8]>>,
+    free: ArrayQueue<usize>,
+}
+
+impl FixedBufferPool {
+    fn new(buffer_len: usize, total: usize) -> Arc<Self> {
+        let mut buffers = Vec::with_capacity(total);
+        for _ in 0..total {
+            buffers.push(vec![0u8; buffer_len].into_boxed_slice());
+        }
+
+        let free = ArrayQueue::new(total);
+        for idx in 0..total {
+            free.push(idx).expect("fixed buffer free queue overflow");
+        }
+
+        Arc::new(Self {
+            buffer_len,
+            buffers,
+            free,
+        })
+    }
+
+    #[inline]
+    fn buffer_len(&self) -> usize {
+        self.buffer_len
+    }
+
+    #[inline]
+    fn try_acquire(self: &Arc<Self>) -> Option<FixedBufferHandle> {
+        self.free.pop().map(|index| FixedBufferHandle {
+            pool: Arc::clone(self),
+            index,
+        })
+    }
+
+    /// Build iovec list for io_uring registration.
+    ///
+    /// # Safety
+    ///
+    /// Callers must ensure buffers outlive the registration.
+    fn iovecs(&self) -> Vec<libc::iovec> {
+        self.buffers
+            .iter()
+            .map(|buf| libc::iovec {
+                iov_base: buf.as_ptr() as *mut libc::c_void,
+                iov_len: buf.len(),
+            })
+            .collect()
+    }
+
+    #[inline]
+    fn buf_ptr(&self, index: usize) -> *mut u8 {
+        self.buffers[index].as_ptr() as *mut u8
+    }
+
+    #[inline]
+    fn buf_len(&self, index: usize) -> usize {
+        self.buffers[index].len()
+    }
+}
+
+struct FixedBufferHandle {
+    pool: Arc<FixedBufferPool>,
+    index: usize,
+}
+
+impl FixedBufferHandle {
+    #[inline]
+    fn buf_index(&self) -> u16 {
+        self.index as u16
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        &self.pool.buffers[self.index]
+    }
+
+    /// Mutable slice of the buffer.
+    ///
+    /// # Safety
+    ///
+    /// This uses `unsafe` to create a mutable slice from a shared reference.
+    /// It is sound because each buffer index is owned by exactly one handle
+    /// at a time (enforced by the free queue).
+    #[inline]
+    fn as_mut_slice(&self) -> &mut [u8] {
+        let ptr = self.pool.buf_ptr(self.index);
+        let len = self.pool.buf_len(self.index);
+        unsafe { std::slice::from_raw_parts_mut(ptr, len) }
+    }
+}
+
+impl Drop for FixedBufferHandle {
+    fn drop(&mut self) {
+        self.pool
+            .free
+            .push(self.index)
+            .expect("fixed buffer free queue overflow");
+    }
+}
+
 impl UringIoStats {
     fn merge(&mut self, other: UringIoStats) {
         self.files_started += other.files_started;
@@ -240,7 +367,7 @@ enum CpuTask {
         base_offset: u64,
         prefix_len: u32,
         len: u32,
-        buf: TsBufferHandle,
+        buf: FixedBufferHandle,
     },
 }
 
@@ -404,7 +531,7 @@ struct Op {
     base_offset: u64,
     prefix_len: usize,
     payload_len: usize,
-    buf: TsBufferHandle,
+    buf: FixedBufferHandle,
 }
 
 // ============================================================================
@@ -478,7 +605,7 @@ fn open_file_safe(path: &Path, follow_symlinks: bool) -> io::Result<File> {
 fn io_worker_loop<E: ScanEngine>(
     _wid: usize,
     rx: chan::Receiver<FileWork>,
-    pool: TsBufferPool,
+    pool: Arc<FixedBufferPool>,
     cpu: ExecutorHandle<CpuTask>,
     engine: Arc<E>,
     cfg: LocalFsUringConfig,
@@ -491,6 +618,17 @@ fn io_worker_loop<E: ScanEngine>(
 
     let mut ring = IoUring::new(cfg.ring_entries)?;
     let mut stats = UringIoStats::default();
+    let mut registered_buffers = false;
+
+    if cfg.use_registered_buffers {
+        let bufs = pool.iovecs();
+        // SAFETY: Buffers are owned by the pool and live for the lifetime
+        // of the ring. We unregister after draining completions.
+        unsafe {
+            ring.submitter().register_buffers(&bufs)?;
+        }
+        registered_buffers = true;
+    }
 
     // File slab + queue for files ready to submit (not currently in-flight).
     let mut files: Vec<Option<FileState>> = Vec::new();
@@ -651,10 +789,16 @@ fn io_worker_loop<E: ScanEngine>(
             let fd = st.file.as_raw_fd();
             let ptr = unsafe { buf.as_mut_slice().as_mut_ptr().add(prefix_len) };
 
-            let entry = opcode::Read::new(types::Fd(fd), ptr, payload_len as u32)
-                .offset(offset)
-                .build()
-                .user_data(op_slot as u64);
+            let entry = if cfg.use_registered_buffers {
+                opcode::ReadFixed::new(types::Fd(fd), ptr, payload_len as u32, buf.buf_index())
+                    .offset(offset)
+                    .build()
+            } else {
+                opcode::Read::new(types::Fd(fd), ptr, payload_len as u32)
+                    .offset(offset)
+                    .build()
+            }
+            .user_data(op_slot as u64);
 
             // SAFETY:
             // - `buf` lives in `ops[op_slot]` until completion
@@ -852,6 +996,11 @@ fn io_worker_loop<E: ScanEngine>(
         drain_in_flight(&mut ring, &mut ops, &mut in_flight_ops, &mut stats)?;
     }
 
+    if registered_buffers {
+        // Ignore unregister errors; ring teardown will clean up in worst case.
+        let _ = ring.submitter().unregister_buffers();
+    }
+
     Ok(stats)
 }
 
@@ -990,13 +1139,7 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
     assert!(buf_len <= BUFFER_LEN_MAX);
 
     // Global-only pool because I/O threads acquire and CPU threads release.
-    // Using workers=0 and local_queue_cap=0 configures global-only mode.
-    let pool = TsBufferPool::new(TsBufferPoolConfig {
-        buffer_len: buf_len,
-        total_buffers: cfg.pool_buffers,
-        workers: 0,
-        local_queue_cap: 0,
-    });
+    let pool = FixedBufferPool::new(buf_len, cfg.pool_buffers);
 
     let file_budget = Arc::new(CountBudget::new(cfg.max_in_flight_files));
 
@@ -1135,6 +1278,7 @@ mod tests {
             max_in_flight_files: 8,
             file_queue_cap: 8,
             pool_buffers: 32,
+            use_registered_buffers: false,
             follow_symlinks: false,
             max_file_size: None,
             seed: 123,

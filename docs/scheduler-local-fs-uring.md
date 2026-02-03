@@ -83,7 +83,7 @@ flowchart TB
         OpSlots["SQ/CQ slots<br/>io_depth entries"]
     end
 
-    subgraph BufferPool["Shared Buffer Pool<br/>(TsBufferPool)"]
+    subgraph BufferPool["Shared Buffer Pool<br/>(FixedBufferPool)"]
         BufAcq["Try acquire()<br/>I/O thread"]
         BufRel["Release on drop<br/>CPU thread"]
     end
@@ -322,6 +322,7 @@ pub struct LocalFsUringConfig {
     pub max_in_flight_files: usize,      // Hard cap on discovered-but-not-done files
     pub file_queue_cap: usize,           // Bounded channel size: discovery → I/O
     pub pool_buffers: usize,             // Total buffers in global pool
+    pub use_registered_buffers: bool,    // Use READ_FIXED (registered buffers)
 
     // Safety options
     pub follow_symlinks: bool,           // O_NOFOLLOW if false
@@ -346,6 +347,7 @@ pub fn default() -> Self {
         max_in_flight_files: 512,        // Cap on in-flight objects
         file_queue_cap: 256,             // Bounded discovery → I/O queue
         pool_buffers: 256,               // 256 buffers (>= io_threads * io_depth)
+        use_registered_buffers: false,   // Off by default
         follow_symlinks: false,          // Safe default: O_NOFOLLOW
         max_file_size: None,             // No size filter
         seed: 1,                         // Deterministic executor
@@ -359,7 +361,7 @@ pub fn default() -> Self {
 The `validate()` method enforces invariants:
 
 ```rust
-pub fn validate(&self, engine: &MockEngine) {
+pub fn validate<E: ScanEngine>(&self, engine: &E) {
     // Basic sizes
     assert!(self.cpu_workers > 0);
     assert!(self.io_threads > 0);
@@ -368,7 +370,7 @@ pub fn validate(&self, engine: &MockEngine) {
     // Buffer sizing
     let overlap = engine.required_overlap();
     let buf_len = overlap.saturating_add(self.chunk_size);
-    assert!(buf_len <= BUFFER_LEN_MAX);  // 2 MiB limit
+    assert!(buf_len <= BUFFER_LEN_MAX);  // 4 MiB limit
 
     // io_depth must fit in ring
     let max_depth = (self.ring_entries as usize).saturating_sub(1);
@@ -380,6 +382,10 @@ pub fn validate(&self, engine: &MockEngine) {
         self.pool_buffers >= min_pool,
         "pool_buffers >= io_threads * io_depth"
     );
+
+    if self.use_registered_buffers {
+        assert!(self.pool_buffers <= u16::MAX as usize);
+    }
 }
 ```
 
@@ -398,23 +404,23 @@ pub fn validate(&self, engine: &MockEngine) {
 
 ### Buffer Pool Configuration
 
-The buffer pool is configured in **global-only mode** (no per-worker caches):
+The buffer pool is configured as a fixed global pool:
 
 ```rust
-let pool = TsBufferPool::new(TsBufferPoolConfig {
-    buffer_len: buf_len,              // overlap + chunk_size
-    total_buffers: cfg.pool_buffers,  // global total
-    workers: 0,                       // No per-worker caches
-    local_queue_cap: 0,               // Global-only mode
-});
+let pool = FixedBufferPool::new(
+    buf_len,            // overlap + chunk_size
+    cfg.pool_buffers,   // global total
+);
 ```
 
-**Why global-only?**
-- I/O threads and CPU threads are separate pools
+**Why fixed global-only?**
+- I/O threads and CPU threads share a single buffer table
 - Global acquisition/release simplifies handoff
-- Avoids per-worker lock contention on small core counts
+- Required for optional `READ_FIXED` (registered buffers)
 
 **Memory bound**: Peak memory = `pool_buffers * (overlap + chunk_size)` ≈ 256 × 260 KB ≈ 67 MB
+
+**Registered buffers**: When `use_registered_buffers` is true, `pool_buffers` must be <= `u16::MAX` (io_uring buffer table limit).
 
 ## Submission and Completion Flow
 
@@ -438,8 +444,8 @@ Each I/O worker thread runs an event loop:
 │  3. Fill SQ up to io_depth:                        │
 │     - Pop file from 'ready'                        │
 │     - Try acquire buffer                          │
-│     - Calculate offset + prefix_len               │
-│     - Build Read opcode                           │
+│     - Copy overlap prefix into buffer             │
+│     - Submit payload-only read (Read/ReadFixed)   │
 │     - Push to SQ (lockfree)                        │
 │     - Store Op metadata in ops[]                  │
 │     - Increment in_flight_ops                     │
@@ -484,6 +490,8 @@ struct FileState {
     done: bool,                  // Reached EOF (monotonic)
     failed: bool,                // Read error or truncation (monotonic)
     token: Arc<FileToken>,       // Keeps permit alive
+    overlap_buf: Box<[u8]>,      // Tail overlap bytes
+    overlap_len: usize,          // Valid bytes in overlap_buf
 }
 
 // Invariants (enforced by loop):
@@ -499,10 +507,10 @@ Each in-flight read operation has an `Op` entry:
 ```rust
 struct Op {
     file_slot: usize,             // FileState index (for completion lookup)
-    base_offset: u64,             // Offset including overlap
+    base_offset: u64,             // Offset of buffer[0] in file
     prefix_len: usize,            // Overlap bytes (dropped in findings)
-    requested_len: usize,         // Total bytes requested from kernel
-    buf: TsBufferHandle,          // Buffer (must stay valid until CQE)
+    payload_len: usize,           // Bytes read from kernel
+    buf: FixedBufferHandle,       // Buffer (must stay valid until CQE)
 }
 
 // Invariant: ops[user_data] is Some() while in-flight, None after completion
@@ -512,17 +520,14 @@ struct Op {
 ### SQE Submission Example
 
 ```rust
-// Calculate read region (with overlap carry)
+// Calculate read region (payload-only; overlap already copied)
 let offset = st.next_offset;                           // Current file offset
-let base_offset = offset.saturating_sub(overlap as u64); // Include overlap
-let prefix_len = (offset - base_offset) as usize;      // Bytes to skip in findings
-
+let prefix_len = st.overlap_len;                       // Bytes to skip in findings
 let payload_len = (st.size - offset).min(chunk_size as u64) as usize;
-let requested_len = prefix_len + payload_len;          // Total to read
 
-// Build and push SQE
-let entry = opcode::Read::new(types::Fd(fd), ptr, requested_len as u32)
-    .offset(base_offset)
+// Build and push SQE (Read or ReadFixed)
+let entry = opcode::Read::new(types::Fd(fd), ptr, payload_len as u32)
+    .offset(offset)
     .build()
     .user_data(op_slot as u64);  // Correlation ID
 
@@ -758,6 +763,7 @@ pub struct LocalFsUringConfig {
     pub max_in_flight_files: usize,
     pub file_queue_cap: usize,
     pub pool_buffers: usize,
+    pub use_registered_buffers: bool,
     pub follow_symlinks: bool,
     pub max_file_size: Option<u64>,
     pub seed: u64,
@@ -765,7 +771,7 @@ pub struct LocalFsUringConfig {
 }
 
 impl LocalFsUringConfig {
-    pub fn validate(&self, engine: &MockEngine);  // Panics on invalid config
+    pub fn validate<E: ScanEngine>(&self, engine: &E);  // Panics on invalid config
 }
 ```
 
@@ -794,8 +800,8 @@ pub struct UringIoStats {
 ### Entry Point
 
 ```rust
-pub fn scan_local_fs_uring(
-    engine: Arc<MockEngine>,
+pub fn scan_local_fs_uring<E: ScanEngine>(
+    engine: Arc<E>,
     roots: &[PathBuf],
     cfg: LocalFsUringConfig,
     out: Arc<dyn OutputSink>,
@@ -832,14 +838,16 @@ struct FileState {
     done: bool,                     // Monotonic: reached EOF
     failed: bool,                   // Monotonic: read error
     token: Arc<FileToken>,
+    overlap_buf: Box<[u8]>,         // Tail overlap bytes
+    overlap_len: usize,             // Valid bytes in overlap_buf
 }
 
 struct Op {
     file_slot: usize,               // FileState index
-    base_offset: u64,               // Read offset (includes overlap)
-    prefix_len: usize,              // Overlap bytes to drop
-    requested_len: usize,           // Total bytes requested
-    buf: TsBufferHandle,            // Buffer (lifetime to CQE)
+    base_offset: u64,               // Offset of buffer[0] in file
+    prefix_len: usize,              // Overlap bytes prepended
+    payload_len: usize,             // Bytes read from disk
+    buf: FixedBufferHandle,         // Buffer (lifetime to CQE)
 }
 
 enum CpuTask {
@@ -848,7 +856,7 @@ enum CpuTask {
         base_offset: u64,
         prefix_len: u32,
         len: u32,
-        buf: TsBufferHandle,
+        buf: FixedBufferHandle,
     },
 }
 ```
@@ -857,12 +865,12 @@ enum CpuTask {
 
 ```rust
 // Main loop for I/O worker thread
-fn io_worker_loop(
+fn io_worker_loop<E: ScanEngine>(
     _wid: usize,
     rx: chan::Receiver<FileWork>,      // File queue
-    pool: TsBufferPool,                 // Shared buffer pool
+    pool: Arc<FixedBufferPool>,         // Shared buffer pool
     cpu: ExecutorHandle<CpuTask>,       // CPU executor handle
-    engine: Arc<MockEngine>,
+    engine: Arc<E>,
     cfg: LocalFsUringConfig,
     stop: Arc<AtomicBool>,              // Graceful shutdown flag
 ) -> io::Result<UringIoStats>;
@@ -889,18 +897,18 @@ fn drain_in_flight(
 ) -> io::Result<()>;
 
 // CPU worker task runner
-fn cpu_runner(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScratch>);
+fn cpu_runner<E: ScanEngine>(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScratch<E>>);
 
 // Deduplication helper
-fn dedupe_pending_in_place(p: &mut Vec<FindingRec>);
+fn dedupe_pending_in_place<F: FindingRecord>(p: &mut Vec<F>);
 
 // Output formatting
-fn emit_findings_formatted(
-    engine: &MockEngine,
+fn emit_findings_formatted<E: ScanEngine, F: FindingRecord>(
+    engine: &E,
     out: &Arc<dyn OutputSink>,
     out_buf: &mut Vec<u8>,
     display: &[u8],
-    recs: &[FindingRec],
+    recs: &[F],
 );
 ```
 
@@ -922,6 +930,7 @@ let cfg = LocalFsUringConfig {
     max_in_flight_files: 512,
     file_queue_cap: 256,
     pool_buffers: 256,
+    use_registered_buffers: false,
     follow_symlinks: false,
     max_file_size: Some(100 * 1024 * 1024),  // 100 MB max
     seed: 1,

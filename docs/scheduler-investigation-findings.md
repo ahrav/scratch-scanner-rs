@@ -158,12 +158,12 @@ Impact: Potential overhead for small file workloads in `io_uring` path.
 
 Work units:
 
-- [ ] Validate the reasoning by confirming current per-op buffer registration behavior and testing on a tiny-file workload.
-- [ ] If the reasoning does not hold, document and skip.
-- [ ] Draft an evidence-backed plan that compares baseline vs registered buffers, including buffer table management costs.
-- [ ] Implement `READ_FIXED` with a fixed buffer table if the evidence supports it.
-- [ ] Measure syscalls, throughput, and latency deltas.
-- [ ] Run doc-rigor on code files changed for this task and update docs/comments as needed.
+- [x] Validate the reasoning by confirming current per-op buffer registration behavior and testing on a tiny-file workload. (Confirmed no registered-buffer path existed; tiny-file test requires Linux.)
+- [x] If the reasoning does not hold, document and skip. (Reasoning holds.)
+- [x] Draft an evidence-backed plan that compares baseline vs registered buffers, including buffer table management costs. Plan: add opt-in `use_registered_buffers`, compare `Read` vs `ReadFixed` on Linux tiny-file workload, track `io_uring_enter` counts and throughput.
+- [x] Implement `READ_FIXED` with a fixed buffer table if the evidence supports it. (Implemented optional `READ_FIXED` path; off by default.)
+- [ ] Measure syscalls, throughput, and latency deltas. (Requires Linux `io_uring` run.)
+- [x] Run doc-rigor on code files changed for this task and update docs/comments as needed.
 
 ### Perf: Drain CQ Before `submit_and_wait`
 
