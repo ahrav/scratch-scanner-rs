@@ -3,11 +3,17 @@
 //! Wraps the delta decoder from `pack_inflate` so pack decode callers can
 //! apply deltas with explicit output caps. Callers are responsible for
 //! enforcing delta chain depth and choosing base objects.
+//!
+//! The re-exported helpers validate base/result sizes and enforce a maximum
+//! output size to avoid unbounded allocations on corrupt deltas.
 
 // Re-exported so pack decode stages can enforce output caps without
 // depending on `pack_inflate` directly.
 
-pub use super::pack_inflate::{apply_delta, DeltaError};
+/// Applies a Git delta buffer to a base object.
+pub use super::pack_inflate::apply_delta;
+/// Errors returned by `apply_delta`.
+pub use super::pack_inflate::DeltaError;
 
 #[cfg(test)]
 mod tests {
