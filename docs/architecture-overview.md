@@ -122,6 +122,11 @@ graph TB
 | **Run Merger**      | `src/git_scan/spill_merge.rs` | K-way merge of spill runs with canonical dedupe                     |
 | **Spiller**         | `src/git_scan/spiller.rs`     | Orchestrates chunking, spilling, and global merge                   |
 | **Seen Blob Store** | `src/git_scan/seen_store.rs`  | Batched seen-blob checks for filtering already scanned blobs         |
+| **Finalize Builder** | `src/git_scan/finalize.rs` | Builds deterministic blob_ctx/finding/seen_blob + ref_watermark ops |
+| **Persistence Store** | `src/git_scan/persist.rs` | Two-phase persistence contract for data ops then watermarks |
+| **RocksDB Store** | `src/git_scan/persist_rocksdb.rs` | RocksDB adapter for persistence, seen-blob checks, and watermarks |
+| **Git Scan Runner** | `src/git_scan/runner.rs` | End-to-end orchestration across all Git scan stages |
+| **Git Scan CLI** | `src/bin/git_scan.rs` | CLI entrypoint for Git scanning pipeline |
 | **WorkItems**       | `src/git_scan/work_items.rs`  | SoA candidate metadata tables for sorting without moving structs    |
 | **Policy Hash**     | `src/git_scan/policy_hash.rs`  | Canonical BLAKE3 identity over rules, transforms, and tuning         |
 
@@ -164,6 +169,13 @@ moving large structs.
 
 After global dedupe, sorted OID batches are sent to the seen-blob store so
 previously scanned blobs can be filtered before decoding.
+
+## Git Finalize + Persist
+
+Finalize converts scanned blob results into deterministic write ops for
+blob_ctx, finding, and seen_blob namespaces plus ref watermark updates.
+Persistence writes data ops first, then advances ref watermarks only for
+complete runs to avoid skipping unscanned blobs.
 
 ## Git Policy Hash
 

@@ -54,11 +54,11 @@ pub fn demo_engine_with_anchor_mode_and_max_transform_depth(
     Engine::new_with_anchor_policy(demo_rules(), demo_transforms(), tuning, policy)
 }
 
-pub(crate) fn demo_rules() -> Vec<RuleSpec> {
+pub fn demo_rules() -> Vec<RuleSpec> {
     gitleaks_rules()
 }
 
-pub(crate) fn demo_transforms() -> Vec<TransformConfig> {
+pub fn demo_transforms() -> Vec<TransformConfig> {
     vec![
         TransformConfig {
             id: TransformId::UrlPercent,

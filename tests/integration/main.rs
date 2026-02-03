@@ -8,6 +8,7 @@ mod git_engine_adapter;
 mod git_mapping_bridge;
 mod git_pack_exec;
 mod git_pack_plan;
+mod git_persist;
 mod git_preflight;
 mod git_repo_open;
 mod git_run_format;

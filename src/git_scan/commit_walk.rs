@@ -72,6 +72,9 @@ pub struct PlannedCommit {
 // =========================================================================
 
 /// Commit-graph access required by traversal and ordering.
+///
+/// Implementations must provide deterministic parent iteration to keep
+/// traversal output stable across runs.
 pub trait CommitGraph {
     /// Total commits in the commit-graph.
     fn num_commits(&self) -> u32;
@@ -140,6 +143,19 @@ impl CommitGraphView {
             self.num_commits,
         );
         self.graph.commit_at(pos)
+    }
+
+    /// Returns the root tree OID for the commit at `pos`.
+    pub fn root_tree_oid(&self, pos: Position) -> Result<OidBytes, CommitPlanError> {
+        let commit = self.commit(pos);
+        let tree = commit.root_tree_id();
+        let oid = OidBytes::from_slice(tree.as_bytes());
+        debug_assert_eq!(
+            oid.len(),
+            self.object_format.oid_len(),
+            "tree oid length mismatch"
+        );
+        Ok(oid)
     }
 }
 
@@ -661,7 +677,8 @@ impl<'a, CG: CommitGraph> CommitPlanIter<'a, CG> {
             }
         }
 
-        // Resolve and validate watermark.
+        // Resolve and validate watermark. Non-ancestor watermarks are ignored,
+        // which falls back to a full-history walk for that ref.
         let mut wm_pos_opt: Option<Position> = None;
         if let Some(wm_oid) = r.watermark {
             if let Some(wm_pos) = self.cg.lookup(&wm_oid)? {
@@ -966,6 +983,9 @@ pub fn topo_order_positions<CG: CommitGraph>(
 // =========================================================================
 
 /// Fixed-capacity ring buffer queue.
+///
+/// Capacity must be at least the number of positions that can be enqueued;
+/// overflow is a logic error guarded by debug assertions.
 struct PosQueue {
     buf: Vec<Position>,
     head: usize,

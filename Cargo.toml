@@ -27,6 +27,7 @@ gix-commitgraph = "0.29"
 gix-hash = "0.19"
 flate2 = "1.0"
 xorf = { version = "0.12", default-features = false, features = ["binary-fuse"] }
+rocksdb = { version = "0.22", optional = true }
 
 # Directory walking and parallel scanning
 ignore = "0.4"
@@ -56,6 +57,7 @@ kani = []  # Gate Kani model-checking proofs
 scheduler-affinity = ["core_affinity"]  # Thread pinning support for scheduler
 io-uring = []  # Enable io_uring scanner on Linux
 scheduler-sim = []  # Enable longer-running scheduler simulation tests
+rocksdb = ["dep:rocksdb"]
 
 [dev-dependencies]
 base64 = "0.22"

@@ -27,6 +27,7 @@ pub mod commit_walk;
 pub mod commit_walk_limits;
 pub mod engine_adapter;
 pub mod errors;
+pub mod finalize;
 pub mod limits;
 pub mod mapping_bridge;
 pub mod midx;
@@ -45,6 +46,7 @@ pub mod pack_plan;
 pub mod pack_plan_model;
 pub mod pack_strategy;
 pub mod path_policy;
+pub mod persist;
 pub mod persist_rocksdb;
 pub mod policy_hash;
 pub mod preflight;
@@ -55,6 +57,7 @@ pub mod repo_open;
 pub mod run_format;
 pub mod run_reader;
 pub mod run_writer;
+pub mod runner;
 pub mod seen_store;
 pub mod snapshot_plan;
 pub mod spill_chunk;
@@ -82,7 +85,12 @@ pub use engine_adapter::{
     scan_blob_chunked, EngineAdapter, EngineAdapterConfig, EngineAdapterError, FindingKey,
     ScannedBlob, DEFAULT_CHUNK_BYTES, DEFAULT_PATH_ARENA_BYTES,
 };
+pub use errors::PersistError;
 pub use errors::{CommitPlanError, RepoOpenError, SpillError, TreeDiffError};
+pub use finalize::{
+    build_finalize_ops, FinalizeInput, FinalizeOutcome, FinalizeOutput, FinalizeStats, RefEntry,
+    WriteOp,
+};
 pub use limits::RepoOpenLimits;
 pub use mapping_bridge::{MappingBridge, MappingBridgeConfig, MappingStats};
 pub use midx::MidxView;
@@ -107,6 +115,7 @@ pub use pack_plan_model::{
 };
 pub use pack_strategy::{cluster_offsets, select_pack_strategy, PackStrategy};
 pub use path_policy::PathClass;
+pub use persist::{persist_finalize_output, InMemoryPersistenceStore, PersistenceStore};
 pub use policy_hash::{policy_hash, MergeDiffMode, PolicyHash};
 pub use preflight::{preflight, ArtifactPaths, ArtifactStatus, PreflightReport};
 pub use preflight_error::PreflightError;
@@ -119,6 +128,7 @@ pub use repo_open::{
 pub use run_format::{RunContext, RunHeader, RunRecord};
 pub use run_reader::RunReader;
 pub use run_writer::RunWriter;
+pub use runner::{run_git_scan, GitScanConfig, GitScanError, GitScanReport, GitScanResult};
 pub use seen_store::{AlwaysSeenStore, InMemorySeenStore, NeverSeenStore, SeenBlobStore};
 pub use snapshot_plan::snapshot_plan;
 pub use spill_chunk::CandidateChunk;

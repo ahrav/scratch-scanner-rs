@@ -204,7 +204,7 @@ impl Spiller {
     ///
     /// On success, all temporary run files are deleted. On error, cleanup
     /// happens via `Drop` (best-effort).
-    pub fn finalize<S: SeenBlobStore, B: UniqueBlobSink>(
+    pub fn finalize<S: SeenBlobStore + ?Sized, B: UniqueBlobSink>(
         mut self,
         seen_store: &S,
         sink: &mut B,
@@ -238,7 +238,7 @@ impl Spiller {
     /// The chunk must already be sorted and deduped. For each OID, the
     /// canonical context is selected and then checked against the seen store
     /// in bounded batches.
-    fn process_chunk_only<S: SeenBlobStore, B: UniqueBlobSink>(
+    fn process_chunk_only<S: SeenBlobStore + ?Sized, B: UniqueBlobSink>(
         &self,
         seen_store: &S,
         sink: &mut B,
@@ -300,7 +300,7 @@ impl Spiller {
     ///
     /// For each OID, selects the canonical record and batches seen-store
     /// lookups. Run files must already be sorted by canonical run order.
-    fn process_with_merge<S: SeenBlobStore, B: UniqueBlobSink>(
+    fn process_with_merge<S: SeenBlobStore + ?Sized, B: UniqueBlobSink>(
         &self,
         seen_store: &S,
         sink: &mut B,
@@ -364,11 +364,12 @@ impl Spiller {
     /// Adds a unique OID to the pending seen-store batch.
     ///
     /// Flushes the batch when it would exceed the OID or path arena limits.
+    /// `stats.unique_blobs` is incremented for each OID before seen filtering.
     ///
     /// # Errors
     /// Propagates errors from flushing or pushing into the batch.
     #[allow(clippy::too_many_arguments)]
-    fn push_unique<S: SeenBlobStore, B: UniqueBlobSink>(
+    fn push_unique<S: SeenBlobStore + ?Sized, B: UniqueBlobSink>(
         &self,
         batch: &mut BatchBuffer,
         oid: OidBytes,
@@ -401,7 +402,7 @@ impl Spiller {
     /// - `SpillError::SeenResponseMismatch` if the seen store returns a
     ///   mismatched number of flags.
     /// - Propagates errors from the seen store or sink.
-    fn flush_batch<S: SeenBlobStore, B: UniqueBlobSink>(
+    fn flush_batch<S: SeenBlobStore + ?Sized, B: UniqueBlobSink>(
         &self,
         batch: &BatchBuffer,
         stats: &mut SpillStats,
@@ -447,6 +448,8 @@ impl Drop for Spiller {
 }
 
 /// Drops the path reference and yields the run context for a candidate.
+///
+/// Paths are stored separately for canonical selection and emission.
 fn resolved_to_context(cand: &ResolvedCandidate<'_>) -> RunContext {
     RunContext {
         commit_id: cand.commit_id,
@@ -494,7 +497,6 @@ fn is_more_canonical(a_ctx: RunContext, a_path: &[u8], b_ctx: RunContext, b_path
 /// Batch buffer for seen-store queries.
 ///
 /// Stores sorted unique OIDs plus interned paths in a bounded arena.
-/// Bounded batch of unique blobs for seen-store queries.
 ///
 /// # Invariants
 /// - OIDs are appended in non-decreasing order.

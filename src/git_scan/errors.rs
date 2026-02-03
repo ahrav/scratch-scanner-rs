@@ -15,6 +15,9 @@ use std::io;
 use super::midx_error::MidxError;
 
 /// Errors from repo discovery and open.
+///
+/// These errors occur before any object scanning begins and typically
+/// indicate repository layout or configuration issues.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum RepoOpenError {
@@ -312,6 +315,58 @@ impl From<io::Error> for SpillError {
 impl From<MidxError> for SpillError {
     fn from(err: MidxError) -> Self {
         Self::MidxError(err)
+    }
+}
+
+/// Errors from persistence operations.
+///
+/// These errors represent failures after scanning has completed.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum PersistError {
+    /// I/O error during persistence operations.
+    Io(io::Error),
+    /// Backend-specific error string.
+    Backend { detail: String },
+}
+
+impl PersistError {
+    /// Creates an I/O error variant.
+    #[inline]
+    pub fn io(err: io::Error) -> Self {
+        Self::Io(err)
+    }
+
+    /// Creates a backend error variant.
+    #[inline]
+    pub fn backend(detail: impl Into<String>) -> Self {
+        Self::Backend {
+            detail: detail.into(),
+        }
+    }
+}
+
+impl fmt::Display for PersistError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(err) => write!(f, "persistence I/O error: {err}"),
+            Self::Backend { detail } => write!(f, "persistence backend error: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for PersistError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<io::Error> for PersistError {
+    fn from(err: io::Error) -> Self {
+        Self::Io(err)
     }
 }
 
