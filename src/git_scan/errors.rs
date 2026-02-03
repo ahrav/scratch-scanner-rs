@@ -1,7 +1,9 @@
 //! Error types for Git scanning stages.
 //!
 //! Errors are stage-specific to keep diagnostics precise and avoid a
-//! single monolithic error enum that grows unbounded.
+//! single monolithic error enum that grows unbounded. All enums are
+//! `#[non_exhaustive]` to allow adding variants without breaking callers;
+//! consumers should include a fallback match arm.
 
 use std::fmt;
 use std::io;
@@ -100,7 +102,67 @@ impl std::error::Error for Phase1Error {
     }
 }
 
+/// Errors from commit selection (commit-graph traversal and ordering).
+///
+/// These errors occur before tree diffing starts and typically indicate
+/// commit-graph corruption, missing tips, or violated traversal limits.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum Phase2PlanError {
+    /// Commit-graph could not be opened or parsed.
+    CommitGraphOpen { reason: String },
+    /// OID has invalid length.
+    InvalidOidLength { len: usize, expected: usize },
+    /// Commit-graph exceeds the configured limit.
+    CommitGraphTooLarge { commits: u32, max: u32 },
+    /// Tip commit not found in the commit-graph.
+    TipNotFound,
+    /// Heap frontier exceeded the configured limit.
+    HeapLimitExceeded { entries: u32, max: u32 },
+    /// Commit-graph parent list entry is corrupt.
+    ParentDecodeFailed,
+    /// Commit has more parents than allowed.
+    TooManyParents { count: usize, max: usize },
+    /// Topological ordering could not process all commits (cycle or corruption).
+    TopoSortCycle { remaining: u32 },
+}
+
+impl fmt::Display for Phase2PlanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CommitGraphOpen { reason } => {
+                write!(f, "commit-graph open failed: {reason}")
+            }
+            Self::InvalidOidLength { len, expected } => {
+                write!(f, "invalid OID length: {len} (expected {expected})")
+            }
+            Self::CommitGraphTooLarge { commits, max } => {
+                write!(f, "commit-graph too large: {commits} commits (max: {max})")
+            }
+            Self::TipNotFound => write!(f, "tip commit not found in commit-graph"),
+            Self::HeapLimitExceeded { entries, max } => {
+                write!(f, "heap limit exceeded: {entries} entries (max: {max})")
+            }
+            Self::ParentDecodeFailed => write!(f, "commit-graph parent decode failed"),
+            Self::TooManyParents { count, max } => {
+                write!(f, "too many parents: {count} (max: {max})")
+            }
+            Self::TopoSortCycle { remaining } => {
+                write!(
+                    f,
+                    "topological ordering failed: {remaining} commits unresolved"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for Phase2PlanError {}
+
 /// Errors from tree diff and candidate collection.
+///
+/// These errors occur after the commit plan is built, while loading trees
+/// and extracting candidate paths.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Phase2Error {
@@ -154,6 +216,9 @@ impl fmt::Display for Phase2Error {
 impl std::error::Error for Phase2Error {}
 
 /// Errors from spill and dedupe.
+///
+/// These errors occur after candidate extraction, when spilling and
+/// de-duplicating large result sets on disk.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Phase3Error {
@@ -249,6 +314,17 @@ mod tests {
         let err = Phase2Error::MaxTreeDepthExceeded { max_depth: 256 };
         let msg = format!("{err}");
         assert!(msg.contains("256"));
+    }
+
+    #[test]
+    fn phase2_plan_error_display() {
+        let err = Phase2PlanError::HeapLimitExceeded {
+            entries: 10,
+            max: 5,
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("10"));
+        assert!(msg.contains("5"));
     }
 
     #[test]

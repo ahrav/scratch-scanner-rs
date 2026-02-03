@@ -103,6 +103,10 @@ graph TB
 | **RepoJobState**    | `src/git_scan/repo_open.rs`    | Bundled repo metadata for downstream Git scan phases                 |
 | **StartSetId**      | `src/git_scan/start_set.rs`    | Deterministic identity for start set configuration                   |
 | **Watermark Keys**  | `src/git_scan/watermark_keys.rs` | Stable ref watermark key/value encoding                            |
+| **Commit Graph View** | `src/git_scan/commit_walk.rs` | Commit-graph adapter with deterministic position lookup              |
+| **Commit Walk**     | `src/git_scan/commit_walk.rs`  | `(watermark, tip]` traversal for introduced-by commit selection      |
+| **Commit Walk Limits** | `src/git_scan/commit_walk_limits.rs` | Hard caps for commit traversal and ordering                   |
+| **Snapshot Plan**   | `src/git_scan/snapshot_plan.rs` | Snapshot-mode commit selection (tips only)                          |
 | **Policy Hash**     | `src/git_scan/policy_hash.rs`  | Canonical BLAKE3 identity over rules, transforms, and tuning         |
 
 ## Git Scanning Preflight
@@ -118,6 +122,13 @@ commit-graph and MIDX presence, and memory-maps those artifacts when ready.
 It also resolves the start set refs (via `StartSetResolver`) and loads per-ref
 watermarks from `RefWatermarkStore` using the `StartSetId` and policy hash.
 The resulting `RepoJobState` is the metadata contract for later Git phases.
+
+## Git Commit Selection
+
+Commit selection uses the commit-graph for deterministic `(watermark, tip]`
+traversal in introduced-by mode and emits snapshot tips directly in snapshot
+mode. Introduced-by plans are reordered topologically so ancestors appear
+before descendants, ensuring first-introduction semantics across merges.
 
 ## Git Policy Hash
 
