@@ -43,6 +43,10 @@
 //! Candidates are emitted in Git tree order for each diff. For merge commits,
 //! the caller should invoke `diff_trees` once per parent; `parent_idx` tags
 //! the candidate with which parent diff produced it.
+//!
+//! # Budgeting
+//! The tree-bytes budget is enforced cumulatively via `TreeDiffStats`. Call
+//! `reset_stats()` when starting a new repo job to reset the budget counter.
 
 use std::cmp::Ordering;
 
@@ -212,6 +216,7 @@ impl TreeDiffWalker {
     ///
     /// - If `new_tree == old_tree`, this is a no-op.
     /// - `parent_idx` is preserved in candidate context for later merge/dedupe.
+    /// - The candidate buffer is appended to; it is not cleared by this call.
     pub fn diff_trees<S: TreeSource>(
         &mut self,
         source: &mut S,
@@ -313,6 +318,7 @@ impl TreeDiffWalker {
         source: &mut S,
         oid: Option<&OidBytes>,
     ) -> Result<Vec<u8>, TreeDiffError> {
+        // Loading a tree increments stats and enforces the cumulative budget.
         if let Some(oid) = oid {
             let bytes = source.load_tree(oid)?;
             self.stats.trees_loaded += 1;
@@ -430,6 +436,7 @@ impl TreeDiffWalker {
         old_oid: Option<&OidBytes>,
         name: &[u8],
     ) -> Result<(), TreeDiffError> {
+        // Extend the path buffer with "name/" for the subtree frame.
         if self.stack.len() >= self.max_depth as usize {
             return Err(TreeDiffError::MaxTreeDepthExceeded {
                 max_depth: self.max_depth,
@@ -472,6 +479,7 @@ impl TreeDiffWalker {
         commit_id: u32,
         parent_idx: u8,
     ) -> Result<(), TreeDiffError> {
+        // Temporarily append the leaf name to the current path prefix.
         let full_len = self.path_buf.len() + name.len();
         if full_len > MAX_PATH_LEN {
             return Err(TreeDiffError::PathTooLong {

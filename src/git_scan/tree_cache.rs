@@ -10,6 +10,12 @@
 //! - Each slot owns a fixed `slot_size` byte range in the arena
 //!
 //! Tree payloads larger than `slot_size` are not cached.
+//!
+//! # Invariants
+//! - `sets` is 0 (disabled) or a power of two
+//! - `slot_size` is a power of two, >= `MIN_SLOT_SIZE`
+//! - `storage.len() == sets * WAYS * slot_size`
+//! - Cache is best-effort; insertions may evict existing entries
 
 use super::object_id::OidBytes;
 
