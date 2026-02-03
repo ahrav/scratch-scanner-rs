@@ -227,7 +227,7 @@ Work units:
   - Track `in_flight_objects`, `max_in_flight_objects`, and (optional) `max_seen_in_flight` for diagnostics.
   - Increment on every file task spawn and enforce `in_flight_objects <= max_in_flight_objects` each step.
   - Decrement on every terminal path for a file task (`FileStepOutcome::Done`), with underflow checks.
-- [ ] Gate discovery task spawning by the in-flight budget:
+- [x] Gate discovery task spawning by the in-flight budget:
   - Modify `DiscoverState` to spawn only up to available permits and leave the remainder in `state.files`.
   - If files remain after hitting the cap, reschedule the discover task (mark runnable + enqueue) to continue later.
   - Ensure deterministic ordering is preserved (still spawn in sorted order).

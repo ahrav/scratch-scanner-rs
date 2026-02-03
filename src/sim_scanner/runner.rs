@@ -26,7 +26,7 @@
 //!   `SCANNER_SIM_STRICT_NON_ROOT=1` is set.
 //! - Stability: repeated runs with different schedule seeds yield the same set.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use serde::{Deserialize, Serialize};
@@ -197,6 +197,8 @@ impl ScannerSimRunner {
         // Track file-task permits to mirror discovery backpressure invariants.
         let mut in_flight_objects: u32 = 0;
         let mut max_seen_in_flight: u32 = 0;
+        // Set when discovery is blocked waiting for permits.
+        let mut discover_waiting = false;
 
         let discover = DiscoverState::new(files.clone());
         let discover_id = executor.spawn_external(SimTask {
@@ -256,11 +258,41 @@ impl ScannerSimRunner {
             }
 
             let task_idx = task_id.index();
-            let mut files_to_spawn = None;
+            let mut discover_spawn: Option<Vec<DiscoveredFile>> = None;
+            let mut discover_block = false;
+            let mut discover_done = false;
             if let Some(task_state) = tasks.get_mut(task_idx) {
                 match task_state {
                     ScannerTask::Discover(state) => {
-                        files_to_spawn = Some(std::mem::take(&mut state.files));
+                        if state.files.is_empty() {
+                            discover_done = true;
+                        } else {
+                            let available = self
+                                .cfg
+                                .max_in_flight_objects
+                                .saturating_sub(in_flight_objects);
+                            if available == 0 {
+                                // Mirror discovery backpressure: wait for a permit.
+                                discover_block = true;
+                            } else {
+                                let mut batch = Vec::with_capacity(available as usize);
+                                for _ in 0..available {
+                                    if let Some(entry) = state.files.pop_front() {
+                                        batch.push(entry);
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                if !batch.is_empty() {
+                                    discover_spawn = Some(batch);
+                                }
+                                if state.files.is_empty() {
+                                    discover_done = true;
+                                } else {
+                                    discover_block = true;
+                                }
+                            }
+                        }
                     }
                     ScannerTask::FileScan(state) => {
                         let outcome = match state.step(
@@ -288,6 +320,15 @@ impl ScannerSimRunner {
                                     );
                                 }
                                 in_flight_objects -= 1;
+                                if discover_waiting
+                                    && in_flight_objects < self.cfg.max_in_flight_objects
+                                    && executor.state(discover_id) == SimTaskState::Blocked
+                                {
+                                    // Wake discovery when permits become available.
+                                    executor.mark_runnable(discover_id);
+                                    executor.enqueue_global(discover_id);
+                                    discover_waiting = false;
+                                }
                             }
                             FileStepOutcome::Reschedule => {
                                 executor.mark_runnable(task_id);
@@ -308,11 +349,11 @@ impl ScannerSimRunner {
                 );
             }
 
-            if let Some(files) = files_to_spawn {
+            if let Some(files) = discover_spawn {
                 // Spawn file scan tasks deterministically in discovered order.
-                for (idx, path) in files.iter().enumerate() {
-                    let file_id = FileId(idx as u32);
-                    let state = FileScanState::new(path.clone(), file_id, engine, overlap);
+                for entry in files {
+                    let state =
+                        FileScanState::new(entry.path.clone(), entry.file_id, engine, overlap);
 
                     let spawned_id = executor.spawn_local(
                         worker,
@@ -341,8 +382,21 @@ impl ScannerSimRunner {
                     }
                 }
 
+                if discover_done {
+                    discover_waiting = false;
+                    executor.mark_completed(task_id);
+                    executor.remove_from_queues(task_id);
+                } else if discover_block {
+                    executor.mark_blocked(task_id);
+                    discover_waiting = true;
+                }
+            } else if discover_done {
+                discover_waiting = false;
                 executor.mark_completed(task_id);
                 executor.remove_from_queues(task_id);
+            } else if discover_block {
+                executor.mark_blocked(task_id);
+                discover_waiting = true;
             }
 
             if in_flight_objects > self.cfg.max_in_flight_objects {
@@ -516,14 +570,28 @@ struct PendingRead {
     cancel_after: bool,
 }
 
-/// Discover task state (pre-sorted file list).
+/// Discover task state (pre-sorted file list with stable IDs).
 struct DiscoverState {
-    files: Vec<SimPath>,
+    files: VecDeque<DiscoveredFile>,
+}
+
+#[derive(Clone, Debug)]
+struct DiscoveredFile {
+    file_id: FileId,
+    path: SimPath,
 }
 
 impl DiscoverState {
     fn new(mut files: Vec<SimPath>) -> Self {
         files.sort_by(|a, b| a.bytes.cmp(&b.bytes));
+        let files = files
+            .into_iter()
+            .enumerate()
+            .map(|(idx, path)| DiscoveredFile {
+                file_id: FileId(idx as u32),
+                path,
+            })
+            .collect();
         Self { files }
     }
 }
