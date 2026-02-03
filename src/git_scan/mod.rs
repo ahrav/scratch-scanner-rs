@@ -8,6 +8,14 @@
 //! detects object format, memory-maps commit-graph and MIDX, and loads the
 //! start set plus watermarks needed for incremental Git scanning.
 //!
+//! Pipeline overview:
+//! 1. `preflight` verifies repository layout and artifacts.
+//! 2. `repo_open` loads commit-graph/MIDX metadata and start set state.
+//! 3. `commit_walk` builds the commit plan.
+//! 4. `tree_diff` extracts candidate blobs and paths.
+//! 5. `spill` dedupes and filters candidates against the seen store.
+//! 6. `mapping_bridge` maps unique blobs to pack/loose candidates.
+//!
 //! # Invariants
 //! - No blob reads (metadata only).
 //! - File reads are bounded by explicit limits.
@@ -23,6 +31,7 @@ pub mod midx;
 pub mod midx_error;
 pub mod object_id;
 pub mod object_store;
+pub mod pack_candidates;
 pub mod pack_inflate;
 pub mod path_policy;
 pub mod persist_rocksdb;

@@ -4,6 +4,10 @@
 //! single monolithic error enum that grows unbounded. All enums are
 //! `#[non_exhaustive]` to allow adding variants without breaking callers;
 //! consumers should include a fallback match arm.
+//!
+//! Conversions (`From<io::Error>`, `From<MidxError>`) are provided for
+//! spill-related errors to keep propagation ergonomic while preserving
+//! a source error for diagnostics.
 
 use std::fmt;
 use std::io;
@@ -54,6 +58,8 @@ impl RepoOpenError {
     }
 
     /// Creates a canonicalization error variant.
+    ///
+    /// This preserves the original `io::Error` as the source.
     #[inline]
     pub fn canonicalization(err: io::Error) -> Self {
         Self::Canonicalization(err)
