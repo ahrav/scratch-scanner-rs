@@ -33,11 +33,13 @@ use std::ops::{ControlFlow, Range};
 use std::sync::atomic::Ordering;
 
 use super::core::Engine;
-use super::helpers::{coalesce_under_pressure_sorted, hash128, merge_ranges_with_gap_sorted};
+use super::helpers::{
+    coalesce_under_pressure_sorted, hash128, merge_ranges_with_gap_sorted, u64_to_usize,
+};
 use super::hit_pool::SpanU32;
 use super::rule_repr::Variant;
-use super::scratch::ScanScratch;
-use super::transform::{stream_decode, Base64SpanStream, UrlSpanStream};
+use super::scratch::{RootSpanMapCtx, ScanScratch};
+use super::transform::{map_decoded_offset, stream_decode, Base64SpanStream, UrlSpanStream};
 use super::vectorscan_prefilter::{
     gate_match_callback, stream_match_callback, utf16_stream_match_callback, VsScratch, VsStream,
     VsStreamDb, VsStreamMatchCtx, VsUtf16StreamMatchCtx,
@@ -46,6 +48,29 @@ use super::work_items::{
     BufRef, EncRef, PendingDecodeSpan, PendingWindow, SpanStreamEntry, SpanStreamState, WorkItem,
 };
 use crate::api::{Gate, TransformConfig, TransformId, TransformMode};
+
+struct RootSpanMapGuard {
+    scratch: *mut ScanScratch,
+}
+
+fn mix_root_hint_hash(h: u128, root_hint: &Option<Range<usize>>) -> u128 {
+    let Some(hint) = root_hint.as_ref() else {
+        return h;
+    };
+    let mut buf = [0u8; 16];
+    buf[..8].copy_from_slice(&(hint.start as u64).to_le_bytes());
+    buf[8..].copy_from_slice(&(hint.end as u64).to_le_bytes());
+    h ^ hash128(&buf)
+}
+
+impl Drop for RootSpanMapGuard {
+    fn drop(&mut self) {
+        // SAFETY: Guard is scoped to the duration of decode_stream_and_scan.
+        unsafe {
+            (*self.scratch).root_span_map_ctx = None;
+        }
+    }
+}
 
 impl Engine {
     /// Decodes an encoded span in full, dedupes it, and enqueues it for scanning.
@@ -68,6 +93,7 @@ impl Engine {
         &self,
         tc: &TransformConfig,
         transform_idx: usize,
+        enc_ref: &EncRef,
         enc: &[u8],
         step_id: StepId,
         root_hint: Option<Range<usize>>,
@@ -114,7 +140,7 @@ impl Engine {
             return;
         }
 
-        let h = hash128(decoded);
+        let h = mix_root_hint_hash(hash128(decoded), &root_hint);
         if !scratch.seen.insert(h) {
             scratch.slab.buf.truncate(decoded_range.start);
             return;
@@ -124,6 +150,8 @@ impl Engine {
             buf: BufRef::Slab(decoded_range),
             step_id,
             root_hint,
+            transform_idx: Some(transform_idx),
+            enc_ref: Some(enc_ref.clone()),
             depth,
         });
         scratch.work_items_enqueued = scratch.work_items_enqueued.saturating_add(1);
@@ -219,9 +247,11 @@ impl Engine {
         vs_stream: &VsStreamDb,
         tc: &TransformConfig,
         transform_idx: usize,
+        enc_ref: &EncRef,
         encoded: &[u8],
         step_id: StepId,
         root_hint: Option<Range<usize>>,
+        root_hint_maps_encoded: bool,
         depth: usize,
         base_offset: u64,
         file_id: FileId,
@@ -234,6 +264,17 @@ impl Engine {
                 *hit = 0;
             }
         }
+
+        scratch.root_span_map_ctx = if root_hint_maps_encoded {
+            root_hint.as_ref().map(|hint| {
+                RootSpanMapCtx::new(tc, encoded, hint.start, scratch.chunk_overlap_backscan)
+            })
+        } else {
+            None
+        };
+        let _root_map_guard = RootSpanMapGuard {
+            scratch: scratch as *mut ScanScratch,
+        };
 
         if encoded.is_empty() {
             return;
@@ -272,6 +313,7 @@ impl Engine {
         scratch.pending_spans.clear();
         scratch.span_streams.clear();
         scratch.tmp_findings.clear();
+        scratch.tmp_drop_hint_end.clear();
 
         let mut local_out = 0usize;
         let mut truncated = false;
@@ -753,7 +795,7 @@ impl Engine {
                             }
                         }
 
-                        let parent_span = lo as usize..hi as usize;
+                        let parent_span = u64_to_usize(lo)..u64_to_usize(hi);
                         let child_step_id = scratch.step_arena.push(
                             step_id,
                             DecodeStep::Transform {
@@ -761,13 +803,23 @@ impl Engine {
                                 parent_span: parent_span.clone(),
                             },
                         );
-                        let child_root_hint = root_hint.clone().unwrap_or(parent_span);
+                        // Map the nested span back to root-buffer coordinates. For nested transforms,
+                        // `parent_span` is in decoded-space offsets; we translate through the parent
+                        // transform to get the corresponding encoded-space range, then offset by the
+                        // root hint's start to get absolute root-buffer positions.
+                        let child_root_hint = if let Some(hint) = root_hint.as_ref() {
+                            let start = map_decoded_offset(tc, encoded, parent_span.start);
+                            let end = map_decoded_offset(tc, encoded, parent_span.end);
+                            Some(hint.start.saturating_add(start)..hint.start.saturating_add(end))
+                        } else {
+                            Some(parent_span)
+                        };
 
                         scratch.pending_spans.push(PendingDecodeSpan {
                             transform_idx: entry.transform_idx,
                             range,
                             step_id: child_step_id,
-                            root_hint: Some(child_root_hint),
+                            root_hint: child_root_hint,
                             depth: depth + 1,
                         });
                         entry.spans_emitted = entry.spans_emitted.saturating_add(1);
@@ -844,9 +896,11 @@ impl Engine {
             scratch.pending_spans.clear();
             scratch.span_streams.clear();
             scratch.tmp_findings.clear();
+            scratch.tmp_drop_hint_end.clear();
             self.decode_span_fallback(
                 tc,
                 transform_idx,
+                enc_ref,
                 encoded,
                 step_id,
                 root_hint,
@@ -967,7 +1021,7 @@ impl Engine {
                                 }
                             }
                         }
-                        let parent_span = lo as usize..hi as usize;
+                        let parent_span = u64_to_usize(lo)..u64_to_usize(hi);
                         let child_step_id = scratch.step_arena.push(
                             step_id,
                             DecodeStep::Transform {
@@ -975,12 +1029,20 @@ impl Engine {
                                 parent_span: parent_span.clone(),
                             },
                         );
-                        let child_root_hint = root_hint.clone().unwrap_or(parent_span);
+                        // Same mapping logic as the streaming loop above: translate decoded-space
+                        // offsets back to root-buffer coordinates for accurate finding locations.
+                        let child_root_hint = if let Some(hint) = root_hint.as_ref() {
+                            let start = map_decoded_offset(tc, encoded, parent_span.start);
+                            let end = map_decoded_offset(tc, encoded, parent_span.end);
+                            Some(hint.start.saturating_add(start)..hint.start.saturating_add(end))
+                        } else {
+                            Some(parent_span)
+                        };
                         scratch.pending_spans.push(PendingDecodeSpan {
                             transform_idx: entry.transform_idx,
                             range,
                             step_id: child_step_id,
-                            root_hint: Some(child_root_hint),
+                            root_hint: child_root_hint,
                             depth: depth + 1,
                         });
                         entry.spans_emitted = entry.spans_emitted.saturating_add(1);
@@ -1022,9 +1084,11 @@ impl Engine {
             scratch.pending_spans.clear();
             scratch.span_streams.clear();
             scratch.tmp_findings.clear();
+            scratch.tmp_drop_hint_end.clear();
             self.decode_span_fallback(
                 tc,
                 transform_idx,
+                enc_ref,
                 encoded,
                 step_id,
                 root_hint,
@@ -1287,7 +1351,7 @@ impl Engine {
                 .saturating_add(local_out as u64);
         }
 
-        let h = u128::from_le_bytes(mac.finalize());
+        let h = mix_root_hint_hash(u128::from_le_bytes(mac.finalize()), &root_hint);
         if !scratch.seen.insert(h) {
             scratch.slab.buf.truncate(slab_start);
             return;
@@ -1297,10 +1361,13 @@ impl Engine {
             scratch.findings_dropped = scratch.findings_dropped.saturating_add(local_dropped);
         }
         let mut tmp_findings = std::mem::take(&mut scratch.tmp_findings);
-        for rec in tmp_findings.drain(..) {
-            scratch.push_finding(rec);
+        let mut tmp_drop_hint_end = std::mem::take(&mut scratch.tmp_drop_hint_end);
+        debug_assert_eq!(tmp_findings.len(), tmp_drop_hint_end.len());
+        for (rec, drop_end) in tmp_findings.drain(..).zip(tmp_drop_hint_end.drain(..)) {
+            scratch.push_finding_with_drop_hint(rec, drop_end, rec.dedupe_with_span);
         }
         scratch.tmp_findings = tmp_findings;
+        scratch.tmp_drop_hint_end = tmp_drop_hint_end;
 
         let found_any_in_buf = found_any;
         let mut enqueued = 0usize;

@@ -132,6 +132,8 @@ pub(super) enum WorkItem {
         buf: BufRef,
         step_id: StepId,
         root_hint: Option<Range<usize>>, // None for root buffer; Some for derived buffers
+        transform_idx: Option<usize>,
+        enc_ref: Option<EncRef>,
         depth: usize,
     },
     DecodeSpan {
@@ -149,6 +151,8 @@ impl Default for WorkItem {
             buf: BufRef::Root,
             step_id: STEP_ROOT,
             root_hint: None,
+            transform_idx: None,
+            enc_ref: None,
             depth: 0,
         }
     }

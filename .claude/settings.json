@@ -7,6 +7,10 @@
           {
             "type": "command",
             "command": "if [[ \"$CLAUDE_FILE_PATH\" == *.rs ]]; then cargo fmt --all && cargo clippy --all-targets 2>&1 | head -100; fi"
+          },
+          {
+            "type": "command",
+            "command": ".claude/hooks/doc-rigor-gate.sh"
           }
         ]
       }

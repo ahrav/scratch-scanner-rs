@@ -5,7 +5,7 @@
 //! state is single-threaded and reused across chunks to keep the hot path
 //! allocation-free.
 
-use crate::api::{DecodeStep, FindingRec};
+use crate::api::{DecodeStep, FileId, FindingRec, TransformConfig, TransformId, STEP_ROOT};
 use crate::scratch_memory::ScratchVec;
 use crate::stdx::{ByteRing, FixedSet128, TimingWheel};
 
@@ -13,9 +13,9 @@ use crate::stdx::{ByteRing, FixedSet128, TimingWheel};
 use crate::api::Base64DecodeStats;
 
 use super::decode_state::{DecodeSlab, StepArena};
-use super::helpers::pow2_at_least;
+use super::helpers::{hash128, pow2_at_least};
 use super::hit_pool::{HitAccPool, SpanU32};
-use super::transform::STREAM_DECODE_CHUNK_BYTES;
+use super::transform::{map_decoded_offset, STREAM_DECODE_CHUNK_BYTES};
 use super::vectorscan_prefilter::{VsScratch, VsStreamWindow};
 use super::work_items::{PendingDecodeSpan, PendingWindow, SpanStreamEntry, WorkItem};
 
@@ -38,6 +38,152 @@ pub(super) struct EntropyScratch {
     // List of "touched" byte values so we can reset in O(distinct) instead of O(256).
     pub(super) used: [u8; 256],
     pub(super) used_len: u16,
+}
+
+/// Context for mapping decoded spans back to root (encoded) coordinates.
+///
+/// During transform scans, findings are reported in decoded-byte coordinates.
+/// This context captures the encoded span being decoded so that decoded offsets
+/// can be translated back to root-buffer offsets for deduplication and output.
+///
+/// # Safety
+/// - `tc` points to an `Engine`-owned `TransformConfig` that outlives the scan.
+/// - `encoded_ptr`/`encoded_len` describe the encoded span being decoded;
+///   the referenced bytes must remain valid while this context is set.
+/// - This context is only valid for the duration of a single scan; it is
+///   cleared after each buffer scan completes.
+#[derive(Clone, Copy)]
+pub(super) struct RootSpanMapCtx {
+    tc: *const TransformConfig,
+    encoded_ptr: *const u8,
+    encoded_len: usize,
+    root_start: usize,
+    // Minimum overlap (in bytes) guaranteed by chunked scans; used to decide
+    // whether a trigger before the match would have appeared in the prior chunk.
+    overlap_backscan: usize,
+}
+
+impl RootSpanMapCtx {
+    pub(super) fn new(
+        tc: &TransformConfig,
+        encoded: &[u8],
+        root_start: usize,
+        overlap_backscan: usize,
+    ) -> Self {
+        Self {
+            tc: tc as *const TransformConfig,
+            encoded_ptr: encoded.as_ptr(),
+            encoded_len: encoded.len(),
+            root_start,
+            overlap_backscan,
+        }
+    }
+
+    pub(super) fn map_span(&self, span: std::ops::Range<usize>) -> std::ops::Range<usize> {
+        // SAFETY: The engine-owned transform config lives for the duration
+        // of the scan, and encoded bytes are valid while the map context is set.
+        let tc = unsafe { &*self.tc };
+        let encoded = unsafe { std::slice::from_raw_parts(self.encoded_ptr, self.encoded_len) };
+        let start = map_decoded_offset(tc, encoded, span.start);
+        let end = map_decoded_offset(tc, encoded, span.end);
+        let root_start = self.root_start;
+        (root_start + start)..(root_start + end)
+    }
+
+    // Returns true if a URL-percent trigger appears within the match span or
+    // within the guaranteed overlap prefix immediately preceding it.
+    pub(super) fn has_trigger_before_or_in_match(
+        &self,
+        root_span: std::ops::Range<usize>,
+    ) -> Option<bool> {
+        // SAFETY: The engine-owned transform config lives for the duration
+        // of the scan, and encoded bytes are valid while the map context is set.
+        let tc = unsafe { &*self.tc };
+        if tc.id != TransformId::UrlPercent {
+            return None;
+        }
+
+        let encoded = unsafe { std::slice::from_raw_parts(self.encoded_ptr, self.encoded_len) };
+        let plus_to_space = tc.plus_to_space;
+        let span_start = root_span
+            .start
+            .saturating_sub(self.root_start)
+            .min(self.encoded_len);
+        let span_end = root_span
+            .end
+            .saturating_sub(self.root_start)
+            .min(self.encoded_len);
+        let scan_start = span_start
+            .saturating_sub(self.overlap_backscan)
+            .min(self.encoded_len);
+        let scan_end = span_end.min(self.encoded_len);
+
+        if scan_start >= scan_end {
+            return Some(false);
+        }
+
+        let mut has_trigger = false;
+        for &b in &encoded[scan_start..scan_end] {
+            if b == b'%' || (plus_to_space && b == b'+') {
+                has_trigger = true;
+                break;
+            }
+        }
+        Some(has_trigger)
+    }
+
+    /// Returns an extended drop boundary for URL-percent matches, or `None`.
+    ///
+    /// # Returns
+    /// - `Some(offset)` if a trigger (`%` or `+`) exists after the match span
+    ///   and no trigger appears within the overlap prefix before the match.
+    ///   The returned offset extends past the first post-match trigger.
+    /// - `None` if this is not a URL-percent transform, or if a trigger already
+    ///   exists within the overlap window (which means the prior chunk would
+    ///   have included this trigger, so no extension is needed).
+    ///
+    /// # Rationale
+    /// URL-percent runs can begin with raw ASCII before the first `%` or `+`.
+    /// If the match lands in that raw prefix, the normal match-end boundary
+    /// would allow a later chunk (starting at the trigger) to re-emit the
+    /// same match. Extending the drop boundary past the trigger prevents
+    /// duplicate findings across chunk boundaries.
+    pub(super) fn drop_hint_end_for_match(
+        &self,
+        match_span: std::ops::Range<usize>,
+    ) -> Option<usize> {
+        // SAFETY: The engine-owned transform config lives for the duration
+        // of the scan, and encoded bytes are valid while the map context is set.
+        let tc = unsafe { &*self.tc };
+        if tc.id != TransformId::UrlPercent {
+            return None;
+        }
+
+        let encoded = unsafe { std::slice::from_raw_parts(self.encoded_ptr, self.encoded_len) };
+        let plus_to_space = tc.plus_to_space;
+        let span_end = match_span
+            .end
+            .saturating_sub(self.root_start)
+            .min(self.encoded_len);
+
+        // If a trigger is already within the overlap backscan window (or inside
+        // the match), a prior chunk would have had a trigger too, so avoid
+        // widening the dedupe boundary and risking duplicates.
+        if self
+            .has_trigger_before_or_in_match(match_span.clone())
+            .unwrap_or(false)
+        {
+            return None;
+        }
+
+        for (idx, &b) in encoded[span_end..].iter().enumerate() {
+            if b == b'%' || (plus_to_space && b == b'+') {
+                return Some(self.root_start + span_end + idx + 1);
+            }
+        }
+
+        None
+    }
 }
 
 impl EntropyScratch {
@@ -88,6 +234,8 @@ pub struct ScanScratch {
     /// capacity prevents allocation in the hot path; overflow increments
     /// `findings_dropped` instead of reallocating.
     pub(super) out: ScratchVec<FindingRec>,
+    /// Drop boundary used by `drop_prefix_findings` (absolute offset in file).
+    pub(super) drop_hint_end: ScratchVec<u64>,
     pub(super) max_findings: usize,     // Per-chunk cap from tuning.
     pub(super) findings_dropped: usize, // Overflow counter when cap is exceeded.
     /// Work queue for breadth-first buffer traversal.
@@ -96,9 +244,31 @@ pub struct ScanScratch {
     /// Fixed capacity ensures no allocations during the scan loop; the tuning
     /// parameter `max_work_items` determines the upper bound.
     pub(super) work_q: ScratchVec<WorkItem>,
-    pub(super) work_head: usize,                 // Cursor into work_q.
-    pub(super) slab: DecodeSlab,                 // Decoded output storage.
-    pub(super) seen: FixedSet128,                // Dedupe for decoded buffers.
+    pub(super) work_head: usize,  // Cursor into work_q.
+    pub(super) slab: DecodeSlab,  // Decoded output storage.
+    pub(super) seen: FixedSet128, // Dedupe for decoded buffers.
+    /// Bloom-style deduplication for output findings within a file.
+    ///
+    /// Prevents emitting the same finding multiple times when overlapping chunks
+    /// or transform re-scans produce identical matches. The set is reset on file
+    /// boundary transitions (new file or `base_offset == 0`).
+    ///
+    /// Key composition (32 bytes → 128-bit hash):
+    /// - `file_id` (4 bytes) — scoped to current file
+    /// - `rule_id` (4 bytes) — distinguishes rule matches
+    /// - `span_start`, `span_end` (8 bytes) — root-level span (zeroed for mapped transforms)
+    /// - `root_hint_start`, `root_hint_end` (16 bytes) — dedupe boundary in root coordinates
+    ///
+    /// Transform-derived findings use zeroed span coordinates when a precise
+    /// root-span mapping exists because the same encoded region can decode to
+    /// different offsets across chunk boundaries. When mapping is unavailable,
+    /// the decoded span is included to keep distinct matches separate.
+    pub(super) seen_findings: FixedSet128,
+    /// Per-scan dedupe set used to detect duplicates within a single chunk scan.
+    ///
+    /// This resets every `scan_chunk_into` and lets us prefer more informative
+    /// findings within a scan while suppressing repeats across chunks.
+    pub(super) seen_findings_scan: FixedSet128,
     pub(super) total_decode_output_bytes: usize, // Global decode budget tracker.
     pub(super) work_items_enqueued: usize,       // Work queue budget tracker.
     /// Streaming decoded-byte ring buffer for window capture.
@@ -117,6 +287,8 @@ pub struct ScanScratch {
     pub(super) span_streams: Vec<SpanStreamEntry>,
     /// Temporary findings buffer for a decoded stream (dedupe-aware).
     pub(super) tmp_findings: Vec<FindingRec>,
+    /// Drop boundaries aligned with `tmp_findings`.
+    pub(super) tmp_drop_hint_end: Vec<u64>,
     /// Per-rule stream hit counts for decoded-window seeding.
     ///
     /// Indexing is `rule_id * 3 + variant_idx` (Raw/Utf16Le/Utf16Be).
@@ -147,6 +319,17 @@ pub struct ScanScratch {
     /// reconstruct the full decode path. This buffer holds the reversed chain
     /// during materialization. Capacity is bounded by `max_transform_depth`.
     pub(super) steps_buf: ScratchVec<DecodeStep>,
+    pub(super) root_span_map_ctx: Option<RootSpanMapCtx>,
+    /// Overlap size inferred from the previous chunk in the same file.
+    ///
+    /// Used to determine whether a transform trigger before a match would have
+    /// appeared in the prior chunk, so dedupe boundaries can be widened only
+    /// when needed.
+    pub(super) chunk_overlap_backscan: usize,
+    /// Last scanned chunk metadata (used to infer overlap).
+    pub(super) last_chunk_start: u64,
+    pub(super) last_chunk_len: usize,
+    pub(super) last_file_id: Option<FileId>,
 
     /// Per-thread Vectorscan scratch space for the unified prefilter DB.
     ///
@@ -195,6 +378,7 @@ impl ScanScratch {
                 .saturating_mul(2)
                 .max(1024),
         );
+        let findings_cap = pow2_at_least(max_findings.saturating_mul(4).max(64));
         let stream_match_cap = engine.tuning.max_windows_per_rule_variant.max(16);
         let pending_window_cap = rules_len
             .saturating_mul(3)
@@ -206,6 +390,8 @@ impl ScanScratch {
 
         Self {
             out: ScratchVec::with_capacity(max_findings).expect("scratch out allocation failed"),
+            drop_hint_end: ScratchVec::with_capacity(max_findings)
+                .expect("scratch drop_hint_end allocation failed"),
             max_findings,
             findings_dropped: 0,
             work_q: ScratchVec::with_capacity(engine.tuning.max_work_items.saturating_add(1))
@@ -213,6 +399,8 @@ impl ScanScratch {
             work_head: 0,
             slab: DecodeSlab::with_limit(engine.tuning.max_total_decode_output_bytes),
             seen: FixedSet128::with_pow2(seen_cap),
+            seen_findings: FixedSet128::with_pow2(findings_cap),
+            seen_findings_scan: FixedSet128::with_pow2(findings_cap),
             total_decode_output_bytes: 0,
             work_items_enqueued: 0,
             decode_ring: ByteRing::with_capacity(engine.stream_ring_bytes),
@@ -223,6 +411,7 @@ impl ScanScratch {
             pending_spans: Vec::with_capacity(max_spans.max(16)),
             span_streams: Vec::with_capacity(engine.transforms.len()),
             tmp_findings: Vec::with_capacity(max_findings),
+            tmp_drop_hint_end: Vec::with_capacity(max_findings),
             stream_hit_counts: vec![0u32; rules_len.saturating_mul(3)],
             stream_hit_touched: ScratchVec::with_capacity(rules_len.saturating_mul(3))
                 .expect("scratch stream_hit_touched allocation failed"),
@@ -265,6 +454,11 @@ impl ScanScratch {
                 db.alloc_scratch()
                     .expect("vectorscan gate scratch allocation failed")
             }),
+            root_span_map_ctx: None,
+            chunk_overlap_backscan: 0,
+            last_chunk_start: 0,
+            last_chunk_len: 0,
+            last_file_id: None,
             #[cfg(feature = "b64-stats")]
             base64_stats: Base64DecodeStats::default(),
         }
@@ -277,11 +471,13 @@ impl ScanScratch {
     /// slices into scratch buffers are invalid after this call.
     pub(super) fn reset_for_scan(&mut self, engine: &Engine) {
         self.out.clear();
+        self.drop_hint_end.clear();
         self.findings_dropped = 0;
         self.work_q.clear();
         self.work_head = 0;
         self.slab.reset();
         self.seen.reset();
+        self.seen_findings_scan.reset();
         self.total_decode_output_bytes = 0;
         self.work_items_enqueued = 0;
         self.decode_ring.reset();
@@ -291,6 +487,7 @@ impl ScanScratch {
         self.pending_spans.clear();
         self.span_streams.clear();
         self.tmp_findings.clear();
+        self.tmp_drop_hint_end.clear();
         for idx in self.stream_hit_touched.drain() {
             let slot = idx as usize;
             if let Some(hit) = self.stream_hit_counts.get_mut(slot) {
@@ -300,6 +497,7 @@ impl ScanScratch {
         self.step_arena.reset();
         self.utf16_buf.clear();
         self.entropy_scratch.reset();
+        self.root_span_map_ctx = None;
         #[cfg(feature = "b64-stats")]
         self.base64_stats.reset();
 
@@ -447,6 +645,10 @@ impl ScanScratch {
             self.out = ScratchVec::with_capacity(self.max_findings)
                 .expect("scratch out allocation failed");
         }
+        if self.drop_hint_end.capacity() < self.max_findings {
+            self.drop_hint_end = ScratchVec::with_capacity(self.max_findings)
+                .expect("scratch drop_hint_end allocation failed");
+        }
         if self.work_q.capacity() < engine.tuning.max_work_items.saturating_add(1) {
             self.work_q = ScratchVec::with_capacity(engine.tuning.max_work_items.saturating_add(1))
                 .expect("scratch work_q allocation failed");
@@ -511,6 +713,53 @@ impl ScanScratch {
             self.tmp_findings
                 .reserve(self.max_findings - self.tmp_findings.capacity());
         }
+        if self.tmp_drop_hint_end.capacity() < self.max_findings {
+            self.tmp_drop_hint_end
+                .reserve(self.max_findings - self.tmp_drop_hint_end.capacity());
+        }
+    }
+
+    /// Updates inferred overlap metadata for the current chunk.
+    ///
+    /// This infers the overlap length by comparing the current chunk start to
+    /// the previous chunk end within the same file. Non-overlapping or
+    /// out-of-order chunks set the overlap to zero.
+    pub(super) fn update_chunk_overlap(
+        &mut self,
+        file_id: FileId,
+        base_offset: u64,
+        buf_len: usize,
+    ) {
+        // Reset finding dedup state on file transitions. This ensures findings
+        // from a previous file don't suppress valid findings in the current file.
+        //
+        // Note: We do NOT reset when base_offset == 0 for the same file, as this
+        // would break deduplication for chunked scans with large overlap where
+        // base_offset = offset - tail_len can be 0 for continuation chunks.
+        // Callers wanting to re-scan the same file should use reset_for_scan().
+        if self.last_file_id != Some(file_id) {
+            self.seen_findings.reset();
+        }
+
+        let mut overlap = 0usize;
+        if self.last_file_id == Some(file_id) {
+            let last_end = self
+                .last_chunk_start
+                .saturating_add(self.last_chunk_len as u64);
+            if base_offset > self.last_chunk_start {
+                if base_offset <= last_end {
+                    overlap = (last_end - base_offset) as usize;
+                }
+            } else if base_offset == self.last_chunk_start && buf_len > self.last_chunk_len {
+                // Growing-window case (overlap >= chunk): previous chunk is a prefix.
+                overlap = self.last_chunk_len;
+            }
+        }
+
+        self.chunk_overlap_backscan = overlap;
+        self.last_file_id = Some(file_id);
+        self.last_chunk_start = base_offset;
+        self.last_chunk_len = buf_len;
     }
 
     /// Returns per-scan base64 decode/gate stats.
@@ -530,6 +779,7 @@ impl ScanScratch {
             "output capacity too small"
         );
         out.extend(self.out.drain());
+        self.drop_hint_end.clear();
     }
 
     /// Returns the number of pending compact findings.
@@ -556,15 +806,32 @@ impl ScanScratch {
     ///
     /// # Effects
     /// - Compacts in place and preserves the relative order of remaining findings.
+    ///
+    /// For transform-derived findings, the drop boundary may be widened beyond
+    /// the match span when a transform trigger occurs after the match and no
+    /// trigger appears within the guaranteed overlap prefix before the match.
+    /// This avoids dropping findings whose matches appear before late-appearing
+    /// triggers (e.g., URL-percent runs with raw prefixes) while preventing
+    /// duplicate emission when earlier triggers are already in the overlap.
     pub fn drop_prefix_findings(&mut self, new_bytes_start: u64) {
         if new_bytes_start == 0 {
             return;
         }
-        // Compact in place: keep only findings where root_hint_end > new_bytes_start.
+        debug_assert_eq!(
+            self.out.len(),
+            self.drop_hint_end.len(),
+            "drop hint length mismatch"
+        );
+        // Compact in place: keep only findings where the dedupe boundary is after
+        // the new-bytes start.
         let mut write_idx = 0;
         let len = self.out.len();
         for read_idx in 0..len {
-            if self.out[read_idx].root_hint_end > new_bytes_start {
+            let drop_end = {
+                let slice = self.drop_hint_end.as_slice();
+                slice[read_idx]
+            };
+            if drop_end > new_bytes_start {
                 if write_idx != read_idx {
                     // Move the element to the write position.
                     // SAFETY: Both indices are in bounds and non-overlapping.
@@ -574,10 +841,16 @@ impl ScanScratch {
                         std::ptr::copy_nonoverlapping(src, dst, 1);
                     }
                 }
+                self.drop_hint_end.as_mut_slice()[write_idx] = drop_end;
                 write_idx += 1;
             }
         }
         self.out.truncate(write_idx);
+        self.drop_hint_end.truncate(write_idx);
+    }
+
+    pub(crate) fn drop_hint_end(&self) -> &[u64] {
+        self.drop_hint_end.as_slice()
     }
 
     /// Returns a shared view of accumulated finding records.
@@ -596,8 +869,184 @@ impl ScanScratch {
     }
 
     pub(super) fn push_finding(&mut self, rec: FindingRec) {
+        self.push_finding_with_drop_hint(rec, rec.root_hint_end, rec.dedupe_with_span);
+    }
+
+    /// Records a finding with an explicit drop boundary, deduplicating against
+    /// previously seen findings within the current file.
+    ///
+    /// # Deduplication Strategy
+    ///
+    /// Findings are keyed by a 32-byte composite:
+    ///
+    /// ```text
+    /// ┌────────┬────────┬────────────┬──────────┬─────────────────┬───────────────┐
+    /// │file_id │rule_id │ span_start │ span_end │ root_hint_start │ root_hint_end │
+    /// │ 4B     │ 4B     │ 4B         │ 4B       │ 8B              │ 8B            │
+    /// └────────┴────────┴────────────┴──────────┴─────────────────┴───────────────┘
+    /// ```
+    ///
+    /// For transform-derived findings (`step_id != STEP_ROOT`), span coordinates
+    /// are zeroed only when a precise root-span mapping is available. When
+    /// mapping is unavailable (nested transforms with length-changing parents),
+    /// the decoded span is included to avoid collapsing distinct matches that
+    /// share the same coarse root hint window.
+    ///
+    /// # Why Not Just Span Coordinates?
+    ///
+    /// Chunked scanning with overlap can produce the "same" finding from different
+    /// chunk perspectives. The root hint window captures the logical identity of
+    /// where the secret lives in the original file, regardless of which chunk
+    /// boundary happened to include it.
+    ///
+    /// # False Positives
+    ///
+    /// The underlying `FixedSet128` is a probabilistic structure (Bloom-like).
+    /// Collisions may suppress distinct findings, but the capacity is sized to
+    /// `4× max_findings` to keep collision probability low for typical scans.
+    ///
+    /// `include_span` controls whether `span_start`/`span_end` participate in
+    /// the dedupe key (used when root-span mapping is unavailable).
+    ///
+    /// Dedupe is split into two layers:
+    /// - A per-file set (`seen_findings`) that suppresses cross-chunk repeats.
+    /// - A per-scan set (`seen_findings_scan`) that enables within-scan replacement
+    ///   (e.g., prefer transform findings) without re-emitting earlier chunks.
+    #[inline(always)]
+    pub(super) fn push_finding_with_drop_hint(
+        &mut self,
+        rec: FindingRec,
+        drop_hint_end: u64,
+        include_span: bool,
+    ) {
+        // For root-level findings, include the exact span in the dedup key.
+        // For transform-derived findings with mapped root spans, zero the span
+        // since decoded offsets can vary by chunk alignment. When mapping is
+        // unavailable, include the span to preserve distinct matches.
+        //
+        // Additionally, normalize root_hint_end for base64 padding tolerance.
+        // Base64 can decode correctly with or without padding (e.g., 18 or 20
+        // chars for 13 bytes). Compute the minimum encoded length and clamp if
+        // the actual encoded length is within padding tolerance (3 chars).
+        // This ensures findings from the same decoded content with different
+        // padding get deduplicated across chunk boundaries.
+        let include_span = include_span || rec.step_id == STEP_ROOT;
+        let (span_start, span_end) = if include_span {
+            (rec.span_start, rec.span_end)
+        } else {
+            (0, 0)
+        };
+        let normalized_root_hint_end = if rec.step_id == STEP_ROOT {
+            rec.root_hint_end
+        } else {
+            let decoded_len = rec.span_end.saturating_sub(rec.span_start) as u64;
+            let min_encoded = (decoded_len * 4).div_ceil(3); // ceil(decoded * 4/3)
+            let actual_encoded = rec.root_hint_end.saturating_sub(rec.root_hint_start);
+            if actual_encoded > min_encoded && actual_encoded <= min_encoded.saturating_add(3) {
+                rec.root_hint_start.saturating_add(min_encoded)
+            } else {
+                rec.root_hint_end
+            }
+        };
+
+        // Build a 32-byte dedup key and hash to 128 bits.
+        let mut key_bytes = [0u8; 32];
+        key_bytes[0..4].copy_from_slice(&rec.file_id.0.to_le_bytes());
+        key_bytes[4..8].copy_from_slice(&rec.rule_id.to_le_bytes());
+        key_bytes[8..12].copy_from_slice(&span_start.to_le_bytes());
+        key_bytes[12..16].copy_from_slice(&span_end.to_le_bytes());
+        key_bytes[16..24].copy_from_slice(&rec.root_hint_start.to_le_bytes());
+        key_bytes[24..32].copy_from_slice(&normalized_root_hint_end.to_le_bytes());
+
+        let hash = hash128(&key_bytes);
+        let seen_in_scan = !self.seen_findings_scan.insert(hash);
+        let is_new = self.seen_findings.insert(hash);
+
+        if !is_new && !seen_in_scan {
+            // Seen in a prior scan/chunk; suppress to avoid cross-chunk duplicates.
+            return;
+        }
+
+        if !is_new {
+            // Duplicate key detected. Prefer findings with more information:
+            // 1. Transform findings over RAW (transforms provide decoded content)
+            // 2. For transform findings with base64 padding tolerance, prefer larger root_hint_end
+            //
+            // Search for the existing finding that matches this dedup key and potentially replace it.
+            for (i, existing) in self.out.as_mut_slice().iter_mut().enumerate() {
+                if existing.file_id != rec.file_id || existing.rule_id != rec.rule_id {
+                    continue;
+                }
+
+                // Check if this existing finding matches the dedup key criteria.
+                let existing_matches = if rec.step_id == STEP_ROOT {
+                    // Incoming is RAW: match on span and root_hint
+                    existing.span_start == rec.span_start
+                        && existing.span_end == rec.span_end
+                        && existing.root_hint_start == rec.root_hint_start
+                        && existing.root_hint_end == rec.root_hint_end
+                } else {
+                    // Incoming is transform: match on root_hint_start and normalized_root_hint_end
+                    if existing.step_id == STEP_ROOT {
+                        // Existing is RAW, incoming is transform. They match if the RAW's
+                        // root_hint overlaps with the transform's normalized root_hint.
+                        existing.root_hint_start == rec.root_hint_start
+                            && existing.root_hint_end <= normalized_root_hint_end.saturating_add(3)
+                            && existing.root_hint_end >= normalized_root_hint_end
+                    } else {
+                        // Both are transforms: match on normalized root_hint
+                        if existing.root_hint_start != rec.root_hint_start {
+                            false
+                        } else {
+                            // Compute normalized_end for existing
+                            let existing_decoded_len =
+                                existing.span_end.saturating_sub(existing.span_start) as u64;
+                            let existing_min_encoded = (existing_decoded_len * 4).div_ceil(3);
+                            let existing_actual_encoded = existing
+                                .root_hint_end
+                                .saturating_sub(existing.root_hint_start);
+                            let existing_normalized_end = if existing_actual_encoded
+                                > existing_min_encoded
+                                && existing_actual_encoded <= existing_min_encoded.saturating_add(3)
+                            {
+                                existing
+                                    .root_hint_start
+                                    .saturating_add(existing_min_encoded)
+                            } else {
+                                existing.root_hint_end
+                            };
+                            existing_normalized_end == normalized_root_hint_end
+                        }
+                    }
+                };
+
+                if existing_matches {
+                    // Found the matching existing finding. Decide whether to replace it.
+                    let should_replace =
+                        if rec.step_id != STEP_ROOT && existing.step_id == STEP_ROOT {
+                            // Incoming is transform, existing is RAW: prefer transform
+                            true
+                        } else if rec.step_id == STEP_ROOT && existing.step_id != STEP_ROOT {
+                            // Incoming is RAW, existing is transform: keep transform
+                            false
+                        } else {
+                            // Both same type: prefer larger root_hint_end
+                            rec.root_hint_end > existing.root_hint_end
+                        };
+
+                    if should_replace {
+                        *existing = rec;
+                        self.drop_hint_end.as_mut_slice()[i] = drop_hint_end;
+                    }
+                    return;
+                }
+            }
+            return; // Already seen (or hash collision) and no update needed.
+        }
+
         if self.out.len() < self.max_findings {
             self.out.push(rec);
+            self.drop_hint_end.push(drop_hint_end);
         } else {
             self.findings_dropped = self.findings_dropped.saturating_add(1);
         }

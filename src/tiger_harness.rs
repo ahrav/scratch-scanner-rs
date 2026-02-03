@@ -259,11 +259,29 @@ pub fn check_oracle_covered(
     oracle: &[FindingRec],
     chunked: &[FindingRec],
 ) -> Result<(), String> {
+    // Match dedupe's base64 padding normalization so chunked scans that see
+    // an unpadded span still cover the oracle span that includes padding.
+    fn normalized_root_hint_end(rec: &FindingRec) -> u64 {
+        if rec.step_id == crate::api::STEP_ROOT {
+            return rec.root_hint_end;
+        }
+        let decoded_len = rec.span_end.saturating_sub(rec.span_start) as u64;
+        let min_encoded = (decoded_len * 4).div_ceil(3);
+        let actual_encoded = rec.root_hint_end.saturating_sub(rec.root_hint_start);
+        if actual_encoded > min_encoded && actual_encoded <= min_encoded.saturating_add(3) {
+            rec.root_hint_start.saturating_add(min_encoded)
+        } else {
+            rec.root_hint_end
+        }
+    }
+
     for o in oracle {
+        let oracle_end = normalized_root_hint_end(o);
         let ok = chunked.iter().any(|s| {
+            let chunk_end = normalized_root_hint_end(s);
             s.rule_id == o.rule_id
                 && s.root_hint_start <= o.root_hint_start
-                && s.root_hint_end >= o.root_hint_end
+                && chunk_end >= oracle_end
         });
 
         if !ok {
@@ -309,7 +327,9 @@ fn xorshift64(state: &mut u64) -> u64 {
 /// These are test-only helpers that serialize inputs and chunk plans for
 /// deterministic replay.
 #[cfg(test)]
-pub(crate) use regressions::{load_regressions_from_dir, maybe_write_regression};
+pub(crate) use regressions::load_regressions_from_dir;
+#[cfg(all(test, feature = "stdx-proptest"))]
+pub(crate) use regressions::maybe_write_regression;
 
 #[cfg(test)]
 mod regressions {

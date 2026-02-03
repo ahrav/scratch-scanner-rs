@@ -79,11 +79,11 @@ flowchart TB
         IOW1["I/O Worker 0<br/>io_uring ring"]
         IOW2["I/O Worker 1<br/>io_uring ring"]
         IOwN["I/O Worker N<br/>io_uring ring"]
-        FileState["Per-file state:<br/>size, offset, in_flight"]
+        FileState["Per-file state:<br/>phase, size, overlap"]
         OpSlots["SQ/CQ slots<br/>io_depth entries"]
     end
 
-    subgraph BufferPool["Shared Buffer Pool<br/>(TsBufferPool)"]
+    subgraph BufferPool["Shared Buffer Pool<br/>(FixedBufferPool)"]
         BufAcq["Try acquire()<br/>I/O thread"]
         BufRel["Release on drop<br/>CPU thread"]
     end
@@ -253,8 +253,8 @@ if cpu.spawn(task).is_err() {
     st.done = true;
 } else {
     // Spawned successfully; re-queue file for next chunk if needed
-    if !st.done && !st.failed && st.next_offset < st.size {
-        ready.push_back(op.file_slot);
+    if !st.done && !st.failed && rs.next_offset < rs.size {
+        read_ready.push_back(op.file_slot);
     }
 }
 ```
@@ -315,13 +315,16 @@ pub struct LocalFsUringConfig {
 
     // I/O tuning
     pub ring_entries: u32,               // SQ/CQ size (e.g., 256)
-    pub io_depth: usize,                 // Max concurrent reads per thread (e.g., 128)
+    pub io_depth: usize,                 // Max concurrent ops per thread (reads + open/stat)
 
     // Memory and chunking
     pub chunk_size: usize,               // Payload bytes per chunk (e.g., 256 KB)
     pub max_in_flight_files: usize,      // Hard cap on discovered-but-not-done files
     pub file_queue_cap: usize,           // Bounded channel size: discovery → I/O
     pub pool_buffers: usize,             // Total buffers in global pool
+    pub use_registered_buffers: bool,    // Use READ_FIXED (registered buffers)
+    pub open_stat_mode: OpenStatMode,    // io_uring open/stat vs blocking
+    pub resolve_policy: ResolvePolicy,   // openat2 resolve policy (Linux)
 
     // Safety options
     pub follow_symlinks: bool,           // O_NOFOLLOW if false
@@ -333,6 +336,10 @@ pub struct LocalFsUringConfig {
 }
 ```
 
+Open/stat controls:
+- `open_stat_mode`: `UringPreferred` (default), `BlockingOnly`, or `UringRequired`.
+- `resolve_policy`: Only applies to `openat2` when supported. `Default` matches current behavior; `NoSymlinks` and `BeneathRoot` are opt-in. When `openat2` is unavailable, resolve policy is ignored and the blocking open path is used.
+
 ### Default Configuration
 
 ```rust
@@ -341,11 +348,14 @@ pub fn default() -> Self {
         cpu_workers: 8,                  // 8 CPU threads for scanning
         io_threads: 4,                   // 4 I/O threads with io_uring
         ring_entries: 256,               // SQ+CQ capacity
-        io_depth: 128,                   // Up to 128 concurrent reads per I/O thread
+        io_depth: 128,                   // Up to 128 concurrent ops per I/O thread
         chunk_size: 256 * 1024,          // 256 KB chunks
         max_in_flight_files: 512,        // Cap on in-flight objects
         file_queue_cap: 256,             // Bounded discovery → I/O queue
         pool_buffers: 256,               // 256 buffers (>= io_threads * io_depth)
+        use_registered_buffers: false,   // Off by default
+        open_stat_mode: OpenStatMode::UringPreferred, // io_uring open/stat
+        resolve_policy: ResolvePolicy::Default,       // No extra resolution constraints
         follow_symlinks: false,          // Safe default: O_NOFOLLOW
         max_file_size: None,             // No size filter
         seed: 1,                         // Deterministic executor
@@ -359,7 +369,7 @@ pub fn default() -> Self {
 The `validate()` method enforces invariants:
 
 ```rust
-pub fn validate(&self, engine: &MockEngine) {
+pub fn validate<E: ScanEngine>(&self, engine: &E) {
     // Basic sizes
     assert!(self.cpu_workers > 0);
     assert!(self.io_threads > 0);
@@ -368,7 +378,7 @@ pub fn validate(&self, engine: &MockEngine) {
     // Buffer sizing
     let overlap = engine.required_overlap();
     let buf_len = overlap.saturating_add(self.chunk_size);
-    assert!(buf_len <= BUFFER_LEN_MAX);  // 2 MiB limit
+    assert!(buf_len <= BUFFER_LEN_MAX);  // 4 MiB limit
 
     // io_depth must fit in ring
     let max_depth = (self.ring_entries as usize).saturating_sub(1);
@@ -380,6 +390,10 @@ pub fn validate(&self, engine: &MockEngine) {
         self.pool_buffers >= min_pool,
         "pool_buffers >= io_threads * io_depth"
     );
+
+    if self.use_registered_buffers {
+        assert!(self.pool_buffers <= u16::MAX as usize);
+    }
 }
 ```
 
@@ -398,23 +412,23 @@ pub fn validate(&self, engine: &MockEngine) {
 
 ### Buffer Pool Configuration
 
-The buffer pool is configured in **global-only mode** (no per-worker caches):
+The buffer pool is configured as a fixed global pool:
 
 ```rust
-let pool = TsBufferPool::new(TsBufferPoolConfig {
-    buffer_len: buf_len,              // overlap + chunk_size
-    total_buffers: cfg.pool_buffers,  // global total
-    workers: 0,                       // No per-worker caches
-    local_queue_cap: 0,               // Global-only mode
-});
+let pool = FixedBufferPool::new(
+    buf_len,            // overlap + chunk_size
+    cfg.pool_buffers,   // global total
+);
 ```
 
-**Why global-only?**
-- I/O threads and CPU threads are separate pools
+**Why fixed global-only?**
+- I/O threads and CPU threads share a single buffer table
 - Global acquisition/release simplifies handoff
-- Avoids per-worker lock contention on small core counts
+- Required for optional `READ_FIXED` (registered buffers)
 
 **Memory bound**: Peak memory = `pool_buffers * (overlap + chunk_size)` ≈ 256 × 260 KB ≈ 67 MB
+
+**Registered buffers**: When `use_registered_buffers` is true, `pool_buffers` must be <= `u16::MAX` (io_uring buffer table limit).
 
 ## Submission and Completion Flow
 
@@ -430,16 +444,15 @@ Each I/O worker thread runs an event loop:
 │  1. Check stop flag (signal for clean shutdown)    │
 │                                                     │
 │  2. Pull new files from bounded channel (batch)    │
-│     - Calls open_file_safe() with O_NOFOLLOW       │
-│     - Skips empty files                            │
-│     - Creates FileState entry                      │
-│     - Adds to 'ready' queue                        │
+│     - Create FileState in PendingOpen (io_uring)   │
+│       or Ready (blocking fallback)                 │
+│     - Enqueue into open_ready/read_ready           │
 │                                                     │
 │  3. Fill SQ up to io_depth:                        │
-│     - Pop file from 'ready'                        │
-│     - Try acquire buffer                          │
-│     - Calculate offset + prefix_len               │
-│     - Build Read opcode                           │
+│     - Prefer read_ready, then stat_ready, open     │
+│     - Open: submit OPENAT/OPENAT2                  │
+│     - Stat: submit STATX (AT_EMPTY_PATH)           │
+│     - Read: acquire buffer, copy overlap, submit   │
 │     - Push to SQ (lockfree)                        │
 │     - Store Op metadata in ops[]                  │
 │     - Increment in_flight_ops                     │
@@ -447,21 +460,23 @@ Each I/O worker thread runs an event loop:
 │  4. Flush SQ to kernel (syscall)                   │
 │     - ring.submit()                                │
 │                                                     │
-│  5. Wait for completions (if needed):              │
-│     - ring.submit_and_wait(1)                      │
+│  5. Drain CQ; wait only if empty:                  │
+│     - ring.completion().is_empty()                 │
+│     - ring.submit_and_wait(1) if empty             │
 │     - Or yield if buffers exhausted                │
 │                                                     │
 │  6. Reap all completed ops:                        │
 │     - For each CQE:                               │
 │       - Match to Op via user_data                 │
-│       - If success: spawn CPU task (ScanChunk)    │
-│       - If error or short read: mark file done    │
-│       - Re-queue file for next chunk (if needed)  │
+│       - Open success → queue Stat                 │
+│       - Stat success → queue Read                 │
+│       - Read success → spawn ScanChunk            │
+│       - Errors/short reads → mark file done       │
 │       - Release buffer to pool (RAII)             │
 │                                                     │
 │  7. Decide next step:                              │
 │     - If stop && in_flight == 0: exit loop       │
-│     - If channel closed && no ready files: exit   │
+│     - If channel closed && no queued files: exit  │
 │     - Else: continue (go to step 1)              │
 │                                                     │
 │  8. Drain any remaining in-flight ops             │
@@ -477,52 +492,79 @@ Each file has a `FileState` entry tracking its progress:
 
 ```rust
 struct FileState {
-    file: File,                  // Open file descriptor
-    size: u64,                   // Size captured at open (snapshot)
-    next_offset: u64,            // Offset for next chunk (monotonic)
-    in_flight: u32,              // 0 or 1 (exactly one chunk in-flight)
-    done: bool,                  // Reached EOF (monotonic)
-    failed: bool,                // Read error or truncation (monotonic)
+    phase: FilePhase,            // PendingOpen → PendingStat → Ready
+    in_flight: u32,              // 0 or 1 (exactly one op in-flight)
+    done: bool,                  // Monotonic: finished or skipped
+    failed: bool,                // Monotonic: open/stat/read failure
     token: Arc<FileToken>,       // Keeps permit alive
 }
 
+enum FilePhase {
+    PendingOpen { path: PathBuf },
+    PendingStat { file: Option<File> },
+    Ready(ReadState),
+}
+
+struct ReadState {
+    file: File,                  // Open file descriptor
+    size: u64,                   // Size captured at open (snapshot)
+    next_offset: u64,            // Offset for next chunk (monotonic)
+    overlap_buf: Box<[u8]>,      // Tail overlap bytes
+    overlap_len: usize,          // Valid bytes in overlap_buf
+}
+
 // Invariants (enforced by loop):
-// - in_flight is always 0 or 1 (single-chunk-in-flight per file)
+// - in_flight is always 0 or 1 (single op in-flight per file)
 // - done and failed are monotonic (once true, never reset)
+// - phase only advances (no backward transitions)
 // - next_offset only advances (never seeks backward)
 ```
 
 ### Operation Tracking
 
-Each in-flight read operation has an `Op` entry:
+Each in-flight operation has an `Op` entry:
 
 ```rust
-struct Op {
+enum Op {
+    Open(OpenOp),
+    Stat(StatOp),
+    Read(ReadOp),
+}
+
+struct OpenOp {
     file_slot: usize,             // FileState index (for completion lookup)
-    base_offset: u64,             // Offset including overlap
+    path: CString,                // NUL-terminated path (lifetime to CQE)
+    open_how: Option<Box<types::OpenHow>>,
+}
+
+struct StatOp {
+    file_slot: usize,             // FileState index
+    statx_buf: Box<libc::statx>,  // Buffer (lifetime to CQE)
+}
+
+struct ReadOp {
+    file_slot: usize,             // FileState index (for completion lookup)
+    base_offset: u64,             // Offset of buffer[0] in file
     prefix_len: usize,            // Overlap bytes (dropped in findings)
-    requested_len: usize,         // Total bytes requested from kernel
-    buf: TsBufferHandle,          // Buffer (must stay valid until CQE)
+    payload_len: usize,           // Bytes read from kernel
+    buf: FixedBufferHandle,       // Buffer (lifetime to CQE)
 }
 
 // Invariant: ops[user_data] is Some() while in-flight, None after completion
-// Lifetime coupling: buffer stays valid via ops[] until CQE is reaped
+// Lifetime coupling: path/open_how/statx/buffer stay valid via ops[] until CQE
 ```
 
 ### SQE Submission Example
 
 ```rust
-// Calculate read region (with overlap carry)
-let offset = st.next_offset;                           // Current file offset
-let base_offset = offset.saturating_sub(overlap as u64); // Include overlap
-let prefix_len = (offset - base_offset) as usize;      // Bytes to skip in findings
+// Calculate read region (payload-only; overlap already copied)
+let offset = rs.next_offset;                           // Current file offset
+let prefix_len = rs.overlap_len;                       // Bytes to skip in findings
+let payload_len = (rs.size - offset).min(chunk_size as u64) as usize;
 
-let payload_len = (st.size - offset).min(chunk_size as u64) as usize;
-let requested_len = prefix_len + payload_len;          // Total to read
-
-// Build and push SQE
-let entry = opcode::Read::new(types::Fd(fd), ptr, requested_len as u32)
-    .offset(base_offset)
+// Build and push SQE (Read or ReadFixed)
+let entry = opcode::Read::new(types::Fd(fd), ptr, payload_len as u32)
+    .offset(offset)
     .build()
     .user_data(op_slot as u64);  // Correlation ID
 
@@ -571,8 +613,8 @@ for cqe in ring.completion() {
 
         if cpu.spawn(task).is_ok() {
             // Task spawned; re-queue file if more chunks to read
-            if !st.done && !st.failed && st.next_offset < st.size {
-                ready.push_back(op.file_slot);
+            if !st.done && !st.failed && rs.next_offset < rs.size {
+                read_ready.push_back(op.file_slot);
             } else {
                 st.done = true;
             }
@@ -586,22 +628,15 @@ for cqe in ring.completion() {
 
 ## Error Handling and Resilience
 
-### Open Failures
+### Open/Stat Failures
 
-Files that cannot be opened are tracked but not scanned:
+Files that cannot be opened or stat'ed are tracked but not scanned. In blocking mode
+or per-file fallback, `open_file_safe()` failures increment `files_open_failed`. In
+io_uring mode, open/stat CQEs increment `open_failures`/`stat_failures`, and may fall
+back on `-EINVAL`/`-EOPNOTSUPP` when `open_stat_mode != UringRequired`.
 
-```rust
-let file = match open_file_safe(&w.path, cfg.follow_symlinks) {
-    Ok(f) => f,
-    Err(_) => {
-        stats.files_open_failed += 1;
-        drop(w.token);  // Permit released; file budget unblocked
-        return;
-    }
-};
-```
-
-**Metrics**: `files_open_failed` counter incremented; file skipped without blocking discovery.
+**Metrics**: `files_open_failed`, `open_failures`, `stat_failures`, and
+`open_stat_fallbacks` capture these outcomes without blocking discovery.
 
 ### Read Errors
 
@@ -655,11 +690,11 @@ match rx.try_recv() {
     Ok(w) => add_file(...),
     Err(chan::TryRecvError::Disconnected) => {
         channel_closed = true;
-        // Continue processing ready files and draining in-flight
+        // Continue processing queued files and draining in-flight
     }
 }
 
-// Later: if no ready files, exit loop (clean shutdown)
+// Later: if no queued files, exit loop (clean shutdown)
 ```
 
 ### Drain Before Exit
@@ -758,6 +793,9 @@ pub struct LocalFsUringConfig {
     pub max_in_flight_files: usize,
     pub file_queue_cap: usize,
     pub pool_buffers: usize,
+    pub use_registered_buffers: bool,
+    pub open_stat_mode: OpenStatMode,
+    pub resolve_policy: ResolvePolicy,
     pub follow_symlinks: bool,
     pub max_file_size: Option<u64>,
     pub seed: u64,
@@ -765,7 +803,7 @@ pub struct LocalFsUringConfig {
 }
 
 impl LocalFsUringConfig {
-    pub fn validate(&self, engine: &MockEngine);  // Panics on invalid config
+    pub fn validate<E: ScanEngine>(&self, engine: &E);  // Panics on invalid config
 }
 ```
 
@@ -784,6 +822,13 @@ pub struct LocalFsSummary {
 pub struct UringIoStats {
     pub files_started: u64,        // Files opened by I/O threads
     pub files_open_failed: u64,    // Open failures
+    pub open_ops_submitted: u64,   // OPENAT/OPENAT2 SQEs submitted
+    pub open_ops_completed: u64,   // OPENAT/OPENAT2 CQEs reaped
+    pub stat_ops_submitted: u64,   // STATX SQEs submitted
+    pub stat_ops_completed: u64,   // STATX CQEs reaped
+    pub open_failures: u64,        // OPENAT/OPENAT2 errors
+    pub stat_failures: u64,        // STATX errors
+    pub open_stat_fallbacks: u64,  // Fallbacks to blocking open/stat
     pub reads_submitted: u64,      // SQEs submitted to kernel
     pub reads_completed: u64,      // CQEs reaped
     pub read_errors: u64,          // Syscall errors or short reads
@@ -794,8 +839,8 @@ pub struct UringIoStats {
 ### Entry Point
 
 ```rust
-pub fn scan_local_fs_uring(
-    engine: Arc<MockEngine>,
+pub fn scan_local_fs_uring<E: ScanEngine>(
+    engine: Arc<E>,
     roots: &[PathBuf],
     cfg: LocalFsUringConfig,
     out: Arc<dyn OutputSink>,
@@ -820,26 +865,55 @@ struct FileToken {
 
 struct FileWork {
     path: PathBuf,                  // Path to open
-    size: u64,                      // Discovered size (double-checked at open)
+    size: u64,                      // Discovered size hint (open-time size enforced)
     token: Arc<FileToken>,          // Permit + ID
 }
 
 struct FileState {
-    file: File,                     // Opened file descriptor
-    size: u64,                      // Actual file size (from fstat)
-    next_offset: u64,               // Next chunk offset
-    in_flight: u32,                 // 0 or 1 (single in-flight per file)
-    done: bool,                     // Monotonic: reached EOF
-    failed: bool,                   // Monotonic: read error
+    phase: FilePhase,               // PendingOpen → PendingStat → Ready
+    in_flight: u32,                 // 0 or 1 (single op in-flight per file)
+    done: bool,                     // Monotonic: reached EOF or skipped
+    failed: bool,                   // Monotonic: open/stat/read error
     token: Arc<FileToken>,
 }
 
-struct Op {
+enum FilePhase {
+    PendingOpen { path: PathBuf },
+    PendingStat { file: Option<File> },
+    Ready(ReadState),
+}
+
+struct ReadState {
+    file: File,                     // Opened file descriptor
+    size: u64,                      // Actual file size (from statx/fstat)
+    next_offset: u64,               // Next chunk offset
+    overlap_buf: Box<[u8]>,         // Tail overlap bytes
+    overlap_len: usize,             // Valid bytes in overlap_buf
+}
+
+enum Op {
+    Open(OpenOp),
+    Stat(StatOp),
+    Read(ReadOp),
+}
+
+struct OpenOp {
     file_slot: usize,               // FileState index
-    base_offset: u64,               // Read offset (includes overlap)
-    prefix_len: usize,              // Overlap bytes to drop
-    requested_len: usize,           // Total bytes requested
-    buf: TsBufferHandle,            // Buffer (lifetime to CQE)
+    path: CString,                  // NUL-terminated path
+    open_how: Option<Box<types::OpenHow>>,
+}
+
+struct StatOp {
+    file_slot: usize,               // FileState index
+    statx_buf: Box<libc::statx>,
+}
+
+struct ReadOp {
+    file_slot: usize,               // FileState index
+    base_offset: u64,               // Offset of buffer[0] in file
+    prefix_len: usize,              // Overlap bytes prepended
+    payload_len: usize,             // Bytes read from disk
+    buf: FixedBufferHandle,         // Buffer (lifetime to CQE)
 }
 
 enum CpuTask {
@@ -848,7 +922,7 @@ enum CpuTask {
         base_offset: u64,
         prefix_len: u32,
         len: u32,
-        buf: TsBufferHandle,
+        buf: FixedBufferHandle,
     },
 }
 ```
@@ -857,12 +931,12 @@ enum CpuTask {
 
 ```rust
 // Main loop for I/O worker thread
-fn io_worker_loop(
+fn io_worker_loop<E: ScanEngine>(
     _wid: usize,
     rx: chan::Receiver<FileWork>,      // File queue
-    pool: TsBufferPool,                 // Shared buffer pool
+    pool: Arc<FixedBufferPool>,         // Shared buffer pool
     cpu: ExecutorHandle<CpuTask>,       // CPU executor handle
-    engine: Arc<MockEngine>,
+    engine: Arc<E>,
     cfg: LocalFsUringConfig,
     stop: Arc<AtomicBool>,              // Graceful shutdown flag
 ) -> io::Result<UringIoStats>;
@@ -889,18 +963,18 @@ fn drain_in_flight(
 ) -> io::Result<()>;
 
 // CPU worker task runner
-fn cpu_runner(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScratch>);
+fn cpu_runner<E: ScanEngine>(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScratch<E>>);
 
 // Deduplication helper
-fn dedupe_pending_in_place(p: &mut Vec<FindingRec>);
+fn dedupe_pending_in_place<F: FindingRecord>(p: &mut Vec<F>);
 
 // Output formatting
-fn emit_findings_formatted(
-    engine: &MockEngine,
+fn emit_findings_formatted<E: ScanEngine, F: FindingRecord>(
+    engine: &E,
     out: &Arc<dyn OutputSink>,
     out_buf: &mut Vec<u8>,
     display: &[u8],
-    recs: &[FindingRec],
+    recs: &[F],
 );
 ```
 
@@ -922,6 +996,9 @@ let cfg = LocalFsUringConfig {
     max_in_flight_files: 512,
     file_queue_cap: 256,
     pool_buffers: 256,
+    use_registered_buffers: false,
+    open_stat_mode: OpenStatMode::UringPreferred,
+    resolve_policy: ResolvePolicy::Default,
     follow_symlinks: false,
     max_file_size: Some(100 * 1024 * 1024),  // 100 MB max
     seed: 1,
@@ -939,21 +1016,24 @@ let (summary, io_stats, cpu_metrics) =
 // Results
 println!("Files seen: {}", summary.files_seen);
 println!("Files enqueued: {}", summary.files_enqueued);
+println!("Open ops submitted: {}", io_stats.open_ops_submitted);
+println!("Stat ops submitted: {}", io_stats.stat_ops_submitted);
+println!("Open/stat fallbacks: {}", io_stats.open_stat_fallbacks);
 println!("Reads completed: {}", io_stats.reads_completed);
 println!("Chunks scanned: {}", cpu_metrics.chunks_scanned);
 ```
 
 ## Correctness and Invariants
 
-### Single-Chunk-In-Flight Per File
+### Single-Op-In-Flight Per File
 
-**Invariant**: At most 1 read operation in-flight per file at any time.
+**Invariant**: At most 1 operation (open/stat/read) in-flight per file at any time.
 
-**Why**: Allows deduplication logic to assume prefix-drop is valid (no gaps from out-of-order completions).
+**Why**: Keeps per-file state transitions deterministic and preserves prefix-drop semantics for reads.
 
 **Enforcement**:
 ```rust
-// Files in 'ready' queue always have in_flight == 0
+// Files in ready queues (open/stat/read) always have in_flight == 0
 debug_assert_eq!(st.in_flight, 0);
 
 // After push to SQ:
@@ -965,7 +1045,7 @@ st.in_flight = 0;
 
 ### Monotonic State Transitions
 
-**Invariant**: `done` and `failed` flags are monotonic (once true, never reset to false).
+**Invariant**: `done`, `failed`, and `phase` are monotonic (once advanced, never reset or move backward).
 
 **Why**: Simplifies state machine; once a file is finalized, it stays finalized.
 

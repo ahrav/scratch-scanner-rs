@@ -97,6 +97,33 @@ graph TB
 | **DynamicBitSet** | `src/stdx/bitset.rs:51` | Runtime-sized bitset for pool tracking |
 | **ScanScratch** | `src/engine/scratch.rs:83` | Per-scan reusable scratch state |
 | **TimingWheel** | `src/stdx/timing_wheel.rs:479` | Hashed timing wheel for window expiration scheduling |
+
+## Testing Harnesses
+
+The optional simulation harnesses provide deterministic simulation primitives and replayable traces
+for both scanner and scheduler testing. See `docs/scanner_test_harness_guide.md` and
+`docs/scheduler_test_harness_guide.md` for the full design and workflow.
+
+### Scanner Simulation Harness (`sim-harness` feature)
+
+Scanner harness code lives in `src/sim_scanner/` with shared primitives in `src/sim/`.
+
+| Component | Location | Purpose |
+|-----------|----------|---------|
+| **SimExecutor** | `src/sim/executor.rs` | Deterministic single-thread work-stealing model for simulation |
+| **SimFs** | `src/sim/fs.rs` | Deterministic in-memory filesystem used by scenarios |
+| **ScenarioGenerator** | `src/sim_scanner/generator.rs` | Synthetic scenario builder with expected-secret ground truth |
+| **Scanner Oracles** | `src/sim_scanner/runner.rs` | Ground-truth and differential checks for scanner simulations |
+| **SimRng / SimClock** | `src/sim/rng.rs`, `src/sim/clock.rs` | Stable RNG and simulated time source |
+| **TraceRing** | `src/sim/trace.rs` | Bounded trace buffer for replay and debugging |
+| **Minimizer** | `src/sim/minimize.rs` | Deterministic shrink passes for failing scanner artifacts |
+
+### Scheduler Simulation Harness (`scheduler-sim` feature)
+
+Scheduler harness code lives in `src/scheduler/sim_executor_harness.rs`.
+
+| Component | Location | Purpose |
+|-----------|----------|---------|
 | **Scheduler Sim Harness** | `src/scheduler/sim_executor_harness.rs` | Deterministic executor model for scheduler interleaving tests |
 | **Scheduler Sim Task VM** | `src/scheduler/sim_executor_harness.rs` | Bytecode VM driving scheduler-only task effects in simulation |
 | **Scheduler Sim Resources** | `src/scheduler/sim_executor_harness.rs` | Deterministic resource accounting for permits/budgets in simulation |

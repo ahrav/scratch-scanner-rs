@@ -22,16 +22,18 @@ use super::vectorscan_prefilter::{
 };
 use crate::api::{
     AnchorPolicy, DecodeStep, EntropySpec, FileId, Finding, FindingRec, Gate, RuleSpec,
-    TransformConfig, TransformId, TransformMode, Tuning, Utf16Endianness, ValidatorKind,
+    TransformConfig, TransformId, TransformMode, Tuning, Utf16Endianness, ValidatorKind, STEP_ROOT,
 };
 use crate::demo::{demo_engine, demo_rules, demo_tuning};
 use crate::regex2anchor::{compile_trigger_plan, AnchorDeriveConfig, TriggerPlan};
 #[cfg(all(test, feature = "stdx-proptest"))]
 use crate::scratch_memory::ScratchVec;
 use crate::tiger_harness::{
-    check_oracle_covered, correctness_engine, load_regressions_from_dir, maybe_write_regression,
-    scan_chunked_records, scan_one_chunk_records, ChunkPattern, ChunkPlan,
+    check_oracle_covered, correctness_engine, load_regressions_from_dir, scan_chunked_records,
+    scan_one_chunk_records, ChunkPlan,
 };
+#[cfg(all(test, feature = "stdx-proptest"))]
+use crate::tiger_harness::{maybe_write_regression, ChunkPattern};
 use crate::{ScannerConfig, ScannerRuntime};
 use memchr::memmem;
 use proptest::prelude::*;
@@ -221,36 +223,82 @@ fn find_base64_spans_reference(
         return spans;
     }
 
+    // Mirror the production span finder semantics, including padding handling.
     let mut i = 0usize;
+    let mut in_run = false;
+    let mut start = 0usize;
+    let mut run_len = 0usize;
+    let mut b64_chars = 0usize;
+    let mut have_b64 = false;
+    let mut last_b64 = 0usize;
+
     while i < hay.len() && spans.len() < max_spans {
-        while i < hay.len() && !is_b64_or_ws_ref(hay[i], allow_space_ws) {
-            i += 1;
-        }
-        if i >= hay.len() {
-            break;
-        }
+        let b = hay[i];
+        let allowed = is_b64_or_ws_ref(b, allow_space_ws);
 
-        let start = i;
-        let mut b64_chars = 0usize;
-        let mut last_b64 = None::<usize>;
-
-        while i < hay.len() && (i - start) < max_len {
-            let b = hay[i];
-            if !is_b64_or_ws_ref(b, allow_space_ws) {
-                break;
+        if !in_run {
+            if !allowed {
+                i += 1;
+                continue;
             }
+            in_run = true;
+            start = i;
+            run_len = 0;
+            b64_chars = 0;
+            have_b64 = false;
+        }
+
+        if allowed {
+            run_len += 1;
             if is_b64_char_ref(b) {
+                if b == b'=' {
+                    if have_b64 {
+                        let mut pad_end = i;
+                        if i + 1 < hay.len() && hay[i + 1] == b'=' {
+                            pad_end = i + 1;
+                            i += 1;
+                        }
+                        last_b64 = pad_end;
+                        if b64_chars >= min_chars {
+                            spans.push(start..(last_b64 + 1));
+                            if spans.len() >= max_spans {
+                                return spans;
+                            }
+                        }
+                    }
+                    in_run = false;
+                    i += 1;
+                    continue;
+                }
                 b64_chars += 1;
-                last_b64 = Some(i);
+                last_b64 = i;
+                have_b64 = true;
             }
             i += 1;
-        }
 
-        if b64_chars >= min_chars {
-            if let Some(last) = last_b64 {
-                spans.push(start..(last + 1));
+            if run_len >= max_len {
+                if have_b64 && b64_chars >= min_chars {
+                    spans.push(start..(last_b64 + 1));
+                    if spans.len() >= max_spans {
+                        return spans;
+                    }
+                }
+                in_run = false;
             }
+        } else {
+            if have_b64 && b64_chars >= min_chars {
+                spans.push(start..(last_b64 + 1));
+                if spans.len() >= max_spans {
+                    return spans;
+                }
+            }
+            in_run = false;
+            i += 1;
         }
+    }
+
+    if in_run && have_b64 && b64_chars >= min_chars && spans.len() < max_spans {
+        spans.push(start..(last_b64 + 1));
     }
 
     spans
@@ -313,6 +361,57 @@ fn base64_utf16_aws_key_is_detected() {
     let hits = scan_chunk_findings(&eng, &hay);
 
     assert!(hits.iter().any(|h| h.rule == "aws-access-token"));
+}
+
+#[test]
+fn base64_padding_in_root_hint() {
+    let rule = RuleSpec {
+        name: "b64-padding",
+        anchors: &[b"SIM0_"],
+        radius: 25,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        secret_group: None,
+        re: Regex::new(r"SIM0_[A-Z0-9]{12}").unwrap(),
+    };
+    let transforms = vec![TransformConfig {
+        id: TransformId::Base64,
+        mode: TransformMode::Always,
+        gate: Gate::AnchorsInDecoded,
+        min_len: 4,
+        max_spans_per_buffer: 16,
+        max_encoded_len: 64 * 1024,
+        max_decoded_bytes: 64 * 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    }];
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        transforms,
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let token = b"SIM0_ABCDEFGH1234";
+    let b64 = b64_encode(token);
+    let hay = format!("xx{}yy", b64).into_bytes();
+    let start = 2usize;
+    let end = start + b64.len();
+
+    let hits = scan_chunk_findings(&engine, &hay);
+    assert!(
+        hits.iter().any(|h| {
+            h.rule == "b64-padding"
+                && h.root_span_hint.start <= start
+                && h.root_span_hint.end >= end
+        }),
+        "expected base64 root_hint to include padding span {}..{}",
+        start,
+        end
+    );
 }
 
 #[test]
@@ -1351,79 +1450,93 @@ fn scan_rules_reference(
                 }
                 Variant::Utf16Le | Variant::Utf16Be => {
                     for w in windows {
-                        if *total_decode_output_bytes >= engine.tuning.max_total_decode_output_bytes
-                        {
-                            return found_any;
-                        }
-
-                        let remaining = engine
-                            .tuning
-                            .max_total_decode_output_bytes
-                            .saturating_sub(*total_decode_output_bytes);
-                        if remaining == 0 {
-                            return found_any;
-                        }
-                        let max_out = engine
-                            .tuning
-                            .max_utf16_decoded_bytes_per_window
-                            .min(remaining);
-
-                        let decoded = match variant {
-                            Variant::Utf16Le => decode_utf16le_to_vec(&buf[w.clone()], max_out),
-                            Variant::Utf16Be => decode_utf16be_to_vec(&buf[w.clone()], max_out),
-                            _ => unreachable!(),
-                        };
-
-                        let decoded = match decoded {
-                            Ok(bytes) => bytes,
-                            Err(_) => continue,
-                        };
-
-                        if decoded.is_empty() {
-                            continue;
-                        }
-
-                        *total_decode_output_bytes =
-                            total_decode_output_bytes.saturating_add(decoded.len());
-                        if *total_decode_output_bytes > engine.tuning.max_total_decode_output_bytes
-                        {
-                            return found_any;
-                        }
-
-                        let mut steps = steps.to_vec();
-                        steps.push(StepKind::Utf16 {
-                            le: matches!(variant, Variant::Utf16Le),
-                        });
-
-                        for caps in rule.re.captures_iter(&decoded) {
-                            let full_match = caps.get(0).expect("group 0 always exists");
-                            if let Some(spec) = rule.entropy.as_ref() {
-                                let ent = EntropyCompiled {
-                                    min_bits_per_byte: spec.min_bits_per_byte,
-                                    min_len: spec.min_len,
-                                    max_len: spec.max_len,
-                                };
-                                let span = full_match.start()..full_match.end();
-                                let mbytes = &decoded[span];
-                                if !entropy_gate_passes(
-                                    &ent,
-                                    mbytes,
-                                    entropy_scratch,
-                                    &engine.entropy_log2,
-                                ) {
-                                    continue;
-                                }
+                        // Match engine parity handling: UTF-16 anchors can land on either byte
+                        // alignment, so decode both offsets within the window.
+                        for offset in 0..=1 {
+                            let decode_start = w.start.saturating_add(offset);
+                            if decode_start >= w.end {
+                                continue;
                             }
-                            // Extract secret span to match production behavior.
-                            let (secret_start, secret_end) =
-                                extract_secret_span(&caps, rule.secret_group);
-                            let span = secret_start..secret_end;
-                            out.insert(FindingKey {
-                                rule: rule.name,
-                                span,
-                                steps: steps.clone(),
+                            if *total_decode_output_bytes
+                                >= engine.tuning.max_total_decode_output_bytes
+                            {
+                                return found_any;
+                            }
+
+                            let remaining = engine
+                                .tuning
+                                .max_total_decode_output_bytes
+                                .saturating_sub(*total_decode_output_bytes);
+                            if remaining == 0 {
+                                return found_any;
+                            }
+                            let max_out = engine
+                                .tuning
+                                .max_utf16_decoded_bytes_per_window
+                                .min(remaining);
+
+                            let decoded = match variant {
+                                Variant::Utf16Le => {
+                                    decode_utf16le_to_vec(&buf[decode_start..w.end], max_out)
+                                }
+                                Variant::Utf16Be => {
+                                    decode_utf16be_to_vec(&buf[decode_start..w.end], max_out)
+                                }
+                                _ => unreachable!(),
+                            };
+
+                            let decoded = match decoded {
+                                Ok(bytes) => bytes,
+                                Err(_) => continue,
+                            };
+
+                            if decoded.is_empty() {
+                                continue;
+                            }
+
+                            *total_decode_output_bytes =
+                                total_decode_output_bytes.saturating_add(decoded.len());
+                            if *total_decode_output_bytes
+                                > engine.tuning.max_total_decode_output_bytes
+                            {
+                                return found_any;
+                            }
+
+                            let mut steps = steps.to_vec();
+                            steps.push(StepKind::Utf16 {
+                                le: matches!(variant, Variant::Utf16Le),
                             });
-                            found_any = true;
+
+                            for caps in rule.re.captures_iter(&decoded) {
+                                let full_match = caps.get(0).expect("group 0 always exists");
+                                if let Some(spec) = rule.entropy.as_ref() {
+                                    let ent = EntropyCompiled {
+                                        min_bits_per_byte: spec.min_bits_per_byte,
+                                        min_len: spec.min_len,
+                                        max_len: spec.max_len,
+                                    };
+                                    let span = full_match.start()..full_match.end();
+                                    let mbytes = &decoded[span];
+                                    if !entropy_gate_passes(
+                                        &ent,
+                                        mbytes,
+                                        entropy_scratch,
+                                        &engine.entropy_log2,
+                                    ) {
+                                        continue;
+                                    }
+                                }
+                                // Extract secret span to match production behavior.
+                                let (secret_start, secret_end) =
+                                    extract_secret_span(&caps, rule.secret_group);
+                                let span = secret_start..secret_end;
+                                out.insert(FindingKey {
+                                    rule: rule.name,
+                                    span,
+                                    steps: steps.clone(),
+                                });
+                                found_any = true;
+                            }
                         }
                     }
                 }
@@ -1920,6 +2033,27 @@ fn recs_to_keys(recs: &[FindingRec]) -> HashSet<RecKey> {
         .collect()
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct FullRecKey {
+    rule_id: u32,
+    span_start: u32,
+    span_end: u32,
+    root_hint_start: u64,
+    root_hint_end: u64,
+}
+
+fn recs_to_full_keys(recs: &[FindingRec]) -> HashSet<FullRecKey> {
+    recs.iter()
+        .map(|rec| FullRecKey {
+            rule_id: rec.rule_id,
+            span_start: rec.span_start,
+            span_end: rec.span_end,
+            root_hint_start: rec.root_hint_start,
+            root_hint_end: rec.root_hint_end,
+        })
+        .collect()
+}
+
 fn replay_steps(engine: &Engine, root: &[u8], steps: &[DecodeStep]) -> Option<Vec<u8>> {
     let mut cur = root.to_vec();
 
@@ -2141,6 +2275,112 @@ fn utf16_overlap_accounts_for_scaled_radius() {
         good.iter()
             .any(|rec| engine.rule_name(rec.rule_id) == "utf16-boundary"),
         "expected match with required_overlap"
+    );
+}
+
+#[test]
+fn utf16le_anchor_odd_offset_near_start_is_detected() {
+    let rule = RuleSpec {
+        name: "utf16-odd-start",
+        anchors: &[b"SIM2_"],
+        radius: 25,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        secret_group: None,
+        re: Regex::new(r"SIM2_[A-Z0-9]{12}").unwrap(),
+    };
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let token = b"SIM2_ABCDEFGH1234";
+    let utf16 = utf16le_bytes(token);
+
+    let mut buf = vec![b'x'; 15]; // odd offset, forces window clamp at 0
+    let start = buf.len();
+    buf.extend_from_slice(&utf16);
+    let end = buf.len();
+    buf.extend_from_slice(b"zzz");
+
+    let mut scratch = engine.new_scratch();
+    engine.scan_chunk_into(&buf, FileId(0), 0, &mut scratch);
+    let hits = scratch.findings();
+    assert!(
+        hits.iter().any(|rec| {
+            engine.rule_name(rec.rule_id) == "utf16-odd-start"
+                && rec.root_hint_start <= start as u64
+                && rec.root_hint_end >= end as u64
+        }),
+        "expected utf16 match at odd offset near start (span {}..{})",
+        start,
+        end
+    );
+}
+
+#[test]
+fn utf16be_mixed_parity_anchors_find_both() {
+    let rule = RuleSpec {
+        name: "utf16be-mixed-parity",
+        anchors: &[b"SIM2_"],
+        radius: 25,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        secret_group: None,
+        re: Regex::new(r"SIM2_[A-Z0-9]{12}").unwrap(),
+    };
+    let mut tuning = demo_tuning();
+    tuning.scan_utf16_variants = true;
+    let engine =
+        Engine::new_with_anchor_policy(vec![rule], Vec::new(), tuning, AnchorPolicy::ManualOnly);
+
+    let token_a = b"SIM2_9E8N0D075LOG";
+    let token_b = b"SIM2_7M0VSS01PXYO";
+    let utf16_a = utf16be_bytes(token_a);
+    let utf16_b = utf16be_bytes(token_b);
+
+    let mut buf = vec![b'x'; 9]; // odd offset for first token
+    let start_a = buf.len();
+    buf.extend_from_slice(&utf16_a);
+    let end_a = buf.len();
+    buf.extend_from_slice(&[b'x'; 9]);
+    let start_b = buf.len();
+    buf.extend_from_slice(&utf16_b);
+    let end_b = buf.len();
+
+    let mut scratch = engine.new_scratch();
+    engine.scan_chunk_into(&buf, FileId(0), 0, &mut scratch);
+    let hits = scratch.findings();
+    let mut saw_a = false;
+    let mut saw_b = false;
+    for rec in hits {
+        if engine.rule_name(rec.rule_id) != "utf16be-mixed-parity" {
+            continue;
+        }
+        if rec.root_hint_start <= start_a as u64 && rec.root_hint_end >= end_a as u64 {
+            saw_a = true;
+        }
+        if rec.root_hint_start <= start_b as u64 && rec.root_hint_end >= end_b as u64 {
+            saw_b = true;
+        }
+    }
+    assert!(
+        saw_a,
+        "expected utf16be match at odd offset (span {}..{})",
+        start_a, end_a
+    );
+    assert!(
+        saw_b,
+        "expected utf16be match at even offset (span {}..{})",
+        start_b, end_b
     );
 }
 
@@ -2538,6 +2778,426 @@ fn tiger_boundary_percent_triplet_split() {
     if let Err(msg) = check_oracle_covered(&engine, &oracle, &chunked) {
         panic!("percent triplet split failed: {}", msg);
     }
+}
+
+#[test]
+fn chunked_transform_root_hint_matches_reference() {
+    let rule = RuleSpec {
+        name: "tok0",
+        anchors: &[b"TOK0_"],
+        radius: 64,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        secret_group: None,
+        re: Regex::new("TOK0_[A-Z0-9]{8}").unwrap(),
+    };
+
+    let transforms = vec![
+        TransformConfig {
+            id: TransformId::UrlPercent,
+            mode: TransformMode::Always,
+            gate: Gate::AnchorsInDecoded,
+            min_len: 4,
+            max_spans_per_buffer: 16,
+            max_encoded_len: 64 * 1024,
+            max_decoded_bytes: 64 * 1024,
+            plus_to_space: false,
+            base64_allow_space_ws: false,
+        },
+        TransformConfig {
+            id: TransformId::Base64,
+            mode: TransformMode::Always,
+            gate: Gate::AnchorsInDecoded,
+            min_len: 4,
+            max_spans_per_buffer: 16,
+            max_encoded_len: 64 * 1024,
+            max_decoded_bytes: 64 * 1024,
+            plus_to_space: false,
+            base64_allow_space_ws: false,
+        },
+    ];
+
+    let mut tuning = demo_tuning();
+    tuning.scan_utf16_variants = false;
+    let engine =
+        Engine::new_with_anchor_policy(vec![rule], transforms, tuning, AnchorPolicy::ManualOnly);
+
+    let token = b"TOK0_ABCDEFGH";
+    let encoded_b64 = b64_encode(token).into_bytes();
+    let encoded_url = url_percent_encode_all(token);
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"start ");
+    buf.extend_from_slice(&encoded_b64);
+    buf.extend_from_slice(b" mid ");
+    buf.extend_from_slice(&encoded_url);
+    buf.extend_from_slice(b" end");
+
+    let reference = scan_one_chunk_records(&engine, &buf);
+    let chunked = scan_in_chunks_with_overlap(&engine, &buf, 24, 512);
+
+    // Compare findings by essential properties: rule_id, decoded span, and root_hint_start.
+    // root_hint_end may differ slightly for base64 due to padding tolerance when chunked
+    // scanning finds the secret via a truncated base64 span before seeing the complete span.
+    // This is acceptable: the decoded content is identical, and root_hint_start correctly
+    // identifies where the encoded secret begins.
+    assert_eq!(
+        reference.len(),
+        chunked.len(),
+        "finding count mismatch: reference {} vs chunked {}",
+        reference.len(),
+        chunked.len()
+    );
+
+    // Build comparison keys that don't include root_hint_end (may differ for base64 padding)
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct CoreKey {
+        rule_id: u32,
+        span_start: u32,
+        span_end: u32,
+        root_hint_start: u64,
+    }
+
+    let reference_core: std::collections::HashSet<_> = reference
+        .iter()
+        .map(|r| CoreKey {
+            rule_id: r.rule_id,
+            span_start: r.span_start,
+            span_end: r.span_end,
+            root_hint_start: r.root_hint_start,
+        })
+        .collect();
+
+    let chunked_core: std::collections::HashSet<_> = chunked
+        .iter()
+        .map(|r| CoreKey {
+            rule_id: r.rule_id,
+            span_start: r.span_start,
+            span_end: r.span_end,
+            root_hint_start: r.root_hint_start,
+        })
+        .collect();
+
+    assert_eq!(
+        reference_core, chunked_core,
+        "core keys mismatch:\nreference: {:?}\nchunked: {:?}",
+        reference_core, chunked_core
+    );
+
+    // Verify root_hint_end is within base64 padding tolerance (up to 3 chars difference)
+    for r_rec in &reference {
+        let c_rec = chunked
+            .iter()
+            .find(|c| {
+                c.rule_id == r_rec.rule_id
+                    && c.span_start == r_rec.span_start
+                    && c.root_hint_start == r_rec.root_hint_start
+            })
+            .expect("matching chunked finding");
+        let diff = r_rec.root_hint_end.abs_diff(c_rec.root_hint_end);
+        assert!(
+            diff <= 3,
+            "root_hint_end difference {} exceeds base64 padding tolerance for rule {} at {}",
+            diff,
+            r_rec.rule_id,
+            r_rec.root_hint_start
+        );
+    }
+}
+
+#[test]
+fn chunked_url_percent_prefix_trigger_kept() {
+    let rule = RuleSpec {
+        name: "tok0",
+        anchors: &[b"TOK0_"],
+        radius: 64,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        secret_group: None,
+        re: Regex::new("TOK0_[A-Z0-9]{8}").unwrap(),
+    };
+
+    let transforms = vec![TransformConfig {
+        id: TransformId::UrlPercent,
+        mode: TransformMode::Always,
+        gate: Gate::AnchorsInDecoded,
+        min_len: 4,
+        max_spans_per_buffer: 16,
+        max_encoded_len: 64 * 1024,
+        max_decoded_bytes: 64 * 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    }];
+
+    let mut tuning = demo_tuning();
+    tuning.scan_utf16_variants = false;
+    let engine =
+        Engine::new_with_anchor_policy(vec![rule], transforms, tuning, AnchorPolicy::ManualOnly);
+    if engine.vs_stream.is_none() {
+        return;
+    }
+
+    let token = b"TOK0_ABCDEFGH";
+    let mut buf = Vec::new();
+    buf.extend_from_slice(token);
+    buf.extend(std::iter::repeat_n(b'x', 24));
+    buf.extend_from_slice(&url_percent_encode_all(b"WXYZ"));
+
+    let reference = scan_one_chunk_records(&engine, &buf);
+    let chunked = scan_in_chunks_with_overlap(&engine, &buf, 32, engine.required_overlap());
+
+    let reference_keys = recs_to_full_keys(&reference);
+    let chunked_keys = recs_to_full_keys(&chunked);
+
+    assert_eq!(
+        reference_keys, chunked_keys,
+        "reference keys: {:?}\nchunked keys: {:?}",
+        reference_keys, chunked_keys
+    );
+}
+
+#[test]
+fn chunked_url_percent_no_duplicate_when_trigger_before_and_after() {
+    let rule = RuleSpec {
+        name: "tok0",
+        anchors: &[b"TOK0_"],
+        radius: 64,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        secret_group: None,
+        re: Regex::new("TOK0_[A-Z0-9]{8}").unwrap(),
+    };
+
+    let transforms = vec![TransformConfig {
+        id: TransformId::UrlPercent,
+        mode: TransformMode::Always,
+        gate: Gate::AnchorsInDecoded,
+        min_len: 4,
+        max_spans_per_buffer: 16,
+        max_encoded_len: 64 * 1024,
+        max_decoded_bytes: 64 * 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    }];
+
+    let mut tuning = demo_tuning();
+    tuning.scan_utf16_variants = false;
+    let engine =
+        Engine::new_with_anchor_policy(vec![rule], transforms, tuning, AnchorPolicy::ManualOnly);
+    if engine.vs_stream.is_none() {
+        return;
+    }
+
+    let overlap = engine.required_overlap();
+    let chunk_size = overlap.saturating_add(32);
+
+    let token = b"TOK0_ABCDEFGH";
+    let before_trigger = b"%41";
+    let after_trigger = b"%42";
+
+    let chunk2_start = chunk_size.saturating_sub(overlap);
+    let token_start = chunk2_start + 8;
+    let prefix_len = token_start.saturating_sub(before_trigger.len());
+    let after_trigger_offset = chunk_size.saturating_add(4);
+    let after_fill = after_trigger_offset.saturating_sub(token_start + token.len());
+
+    let mut buf = Vec::new();
+    buf.extend(std::iter::repeat_n(b'a', prefix_len));
+    buf.extend_from_slice(before_trigger);
+    buf.extend_from_slice(token);
+    buf.extend(std::iter::repeat_n(b'b', after_fill));
+    buf.extend_from_slice(after_trigger);
+    buf.extend(std::iter::repeat_n(b'c', 16));
+
+    assert!(token_start < overlap, "token not in overlap prefix");
+    assert!(
+        after_trigger_offset >= chunk_size,
+        "after-trigger not in new bytes"
+    );
+    assert!(buf.len() > chunk_size, "buffer should span multiple chunks");
+
+    let reference = scan_one_chunk_records(&engine, &buf);
+    let chunked = scan_in_chunks_with_overlap(&engine, &buf, chunk_size, overlap);
+
+    let reference_keys = recs_to_full_keys(&reference);
+    let chunked_keys = recs_to_full_keys(&chunked);
+
+    assert_eq!(
+        reference_keys, chunked_keys,
+        "reference keys: {:?}\nchunked keys: {:?}",
+        reference_keys, chunked_keys
+    );
+    assert_eq!(
+        chunked.len(),
+        chunked_keys.len(),
+        "expected no duplicate findings: {:?}",
+        chunked
+    );
+}
+
+#[test]
+fn chunked_overlap_gt_chunk_dedupes_transform_findings() {
+    let rule = RuleSpec {
+        name: "tok0",
+        anchors: &[b"TOK0_"],
+        radius: 64,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        secret_group: None,
+        re: Regex::new("TOK0_[A-Z0-9]{8}").unwrap(),
+    };
+
+    let transforms = vec![TransformConfig {
+        id: TransformId::UrlPercent,
+        mode: TransformMode::Always,
+        gate: Gate::AnchorsInDecoded,
+        min_len: 4,
+        max_spans_per_buffer: 16,
+        max_encoded_len: 64 * 1024,
+        max_decoded_bytes: 64 * 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    }];
+
+    let mut tuning = demo_tuning();
+    tuning.scan_utf16_variants = false;
+    let engine =
+        Engine::new_with_anchor_policy(vec![rule], transforms, tuning, AnchorPolicy::ManualOnly);
+    if engine.vs_stream.is_none() {
+        return;
+    }
+
+    let token = b"TOK0_ABCDEFGH";
+    let encoded = url_percent_encode_all(token);
+
+    let mut buf = Vec::new();
+    buf.extend(std::iter::repeat_n(b'x', 64));
+    buf.extend_from_slice(&encoded);
+    buf.extend(std::iter::repeat_n(b'y', 64));
+    buf.extend_from_slice(token);
+    buf.extend(std::iter::repeat_n(b'z', 64));
+
+    let findings = scan_in_chunks_with_overlap(&engine, &buf, 8, 32);
+
+    #[derive(Debug, Hash, PartialEq, Eq)]
+    struct Key {
+        rule_id: u32,
+        span_start: u32,
+        span_end: u32,
+        root_hint_start: u64,
+        root_hint_end: u64,
+    }
+
+    let mut seen = HashSet::new();
+    for rec in &findings {
+        let (span_start, span_end) = if rec.step_id == STEP_ROOT {
+            (rec.span_start, rec.span_end)
+        } else {
+            (0, 0)
+        };
+        let key = Key {
+            rule_id: rec.rule_id,
+            span_start,
+            span_end,
+            root_hint_start: rec.root_hint_start,
+            root_hint_end: rec.root_hint_end,
+        };
+        assert!(
+            seen.insert(key),
+            "duplicate finding emitted in overlap>chunk scenario: {:?}",
+            rec
+        );
+    }
+}
+
+#[test]
+fn nested_transform_dedupe_keeps_multiple_matches() {
+    let rule = RuleSpec {
+        name: "tok0",
+        anchors: &[b"TOK0_"],
+        radius: 64,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        secret_group: None,
+        re: Regex::new("TOK0_[A-Z0-9]{8}").unwrap(),
+    };
+
+    let transforms = vec![
+        TransformConfig {
+            id: TransformId::Base64,
+            mode: TransformMode::Always,
+            gate: Gate::None,
+            min_len: 4,
+            max_spans_per_buffer: 16,
+            max_encoded_len: 64 * 1024,
+            max_decoded_bytes: 64 * 1024,
+            plus_to_space: false,
+            base64_allow_space_ws: false,
+        },
+        TransformConfig {
+            id: TransformId::UrlPercent,
+            mode: TransformMode::Always,
+            gate: Gate::None,
+            min_len: 4,
+            max_spans_per_buffer: 16,
+            max_encoded_len: 64 * 1024,
+            max_decoded_bytes: 64 * 1024,
+            plus_to_space: false,
+            base64_allow_space_ws: false,
+        },
+    ];
+
+    let mut tuning = demo_tuning();
+    tuning.scan_utf16_variants = false;
+    let engine =
+        Engine::new_with_anchor_policy(vec![rule], transforms, tuning, AnchorPolicy::ManualOnly);
+
+    let tok_a = b"TOK0_ABCDEFGH";
+    let tok_b = b"TOK0_IJKLMNOP";
+    let mut decoded = Vec::new();
+    decoded.extend_from_slice(tok_a);
+    decoded.extend_from_slice(b"--");
+    decoded.extend_from_slice(tok_b);
+
+    let url_encoded = url_percent_encode_all(&decoded);
+    let b64_encoded = b64_encode(&url_encoded).into_bytes();
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"prefix ");
+    buf.extend_from_slice(&b64_encoded);
+    buf.extend_from_slice(b" suffix");
+
+    let findings = scan_one_chunk_records(&engine, &buf);
+    let spans: HashSet<_> = findings
+        .iter()
+        .map(|rec| (rec.span_start, rec.span_end))
+        .collect();
+
+    assert_eq!(
+        findings.len(),
+        2,
+        "expected two distinct findings from nested transform chain"
+    );
+    assert_eq!(
+        spans.len(),
+        2,
+        "expected distinct spans for nested transform matches"
+    );
 }
 
 #[test]

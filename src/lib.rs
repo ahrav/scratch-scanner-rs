@@ -44,6 +44,12 @@ pub mod pool;
 pub mod regex2anchor;
 pub mod scheduler;
 pub mod scratch_memory;
+#[cfg(feature = "sim-harness")]
+pub mod sim;
+#[cfg(feature = "sim-harness")]
+pub mod sim_scanner;
+#[cfg(feature = "sim-harness")]
+pub mod sim_scheduler;
 pub mod stdx;
 #[cfg(test)]
 pub mod test_utils;

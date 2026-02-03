@@ -1870,8 +1870,9 @@ extern "C" fn vs_on_match(
         let lo = start.saturating_sub(seed);
         let hi = end.saturating_add(seed).min(c.hay_len);
 
-        // Clamp anchor hint to window bounds.
-        let anchor_hint = (from as u32).clamp(lo, end);
+        // Anchor patterns are fixed-width; use the computed start as the hint to
+        // avoid relying on `from` for prefilter-style callbacks.
+        let anchor_hint = start.clamp(lo, end);
 
         let rid = target.rule_id as usize;
         let vidx = target.variant_idx as usize;
@@ -1906,7 +1907,7 @@ extern "C" fn vs_on_match(
 /// - This callback must never panic or unwind across the FFI boundary.
 extern "C" fn vs_anchor_on_match(
     id: c_uint,
-    from: u64,
+    _from: u64,
     to: u64,
     _flags: c_uint,
     ctx: *mut c_void,
@@ -1934,8 +1935,9 @@ extern "C" fn vs_anchor_on_match(
         let lo = start.saturating_sub(seed);
         let hi = end.saturating_add(seed).min(c.hay_len);
 
-        // Clamp anchor hint to window bounds.
-        let anchor_hint = (from as u32).clamp(lo, end);
+        // Anchor patterns are fixed-width; use the computed start as the hint to
+        // avoid relying on `from` for prefilter-style callbacks.
+        let anchor_hint = start.clamp(lo, end);
 
         let rid = target.rule_id as usize;
         let vidx = target.variant_idx as usize;

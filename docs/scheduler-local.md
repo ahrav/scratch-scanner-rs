@@ -93,6 +93,7 @@ File size is captured at `open()` time via `metadata().len()`. This means:
 - **Truncated files**: Scanning stops at actual EOF
 - **Growing files**: Scanning stops at size-at-open (consistent snapshot)
 - **TOCTOU safety**: No time-of-check-time-of-use race on file size
+- **Size cap enforcement**: `max_file_size` is checked against the open-time size
 
 ### Work-Conserving Semantics
 
@@ -110,6 +111,7 @@ pub struct LocalConfig {
     pub pool_buffers: usize,         // Total buffers in pool
     pub local_queue_cap: usize,      // Per-worker buffer queue
     pub max_in_flight_objects: usize,// In-flight file limit
+    pub max_file_size: u64,          // Max bytes to scan (open-time enforced)
     pub seed: u64,                   // Deterministic executor seed
     pub dedupe_within_chunk: bool,   // Deduplicate findings per chunk
 }
@@ -124,6 +126,7 @@ pub struct LocalConfig {
 | `max_in_flight_objects` | Bounds discovery depth and path metadata in memory. Typically 100–1000. |
 | `local_queue_cap` | Per-worker local queue for buffers. Typically 2–8 to amortize pool contention. |
 | `workers` | Match CPU cores for I/O-light workloads; may be higher for highly parallelizable CPU work. |
+| `max_file_size` | Size cap in bytes. Enforced at open time using `metadata().len()`. |
 
 ### Configuration Validation
 
@@ -156,11 +159,11 @@ pub trait FileSource: Send + 'static {
 ```rust
 pub struct LocalFile {
     pub path: PathBuf,
-    pub size: u64,  // Discovery hint (not used for actual processing)
+    pub size: u64,  // Discovery hint (may be 0 if metadata was skipped)
 }
 ```
 
-The `size` is a discovery hint for memory budgeting. The actual file size is re-read at open time for snapshot semantics.
+The `size` is a discovery hint for memory budgeting and stats. The actual file size is re-read at open time for snapshot semantics and size-cap enforcement.
 
 ### VecFileSource
 
@@ -371,6 +374,7 @@ let cfg = LocalConfig {
     pool_buffers: 16,              // 16 buffers (~2 MiB per buffer)
     local_queue_cap: 2,
     max_in_flight_objects: 512,
+    max_file_size: 100 * 1024 * 1024, // 100 MiB
     seed: 42,
     dedupe_within_chunk: true,
 };
@@ -407,6 +411,7 @@ let report = scan_local(engine, source, LocalConfig::default(), sink);
 - **Budget bounded**: `max_in_flight_objects` limits discovered-but-not-complete files
 - **Buffer bounded**: `pool_buffers` limits peak memory
 - **Snapshot semantics**: File size taken at open time (consistent point-in-time)
+- **Size cap**: Files exceeding `max_file_size` at open time are skipped
 - **Finding uniqueness**: Cross-chunk duplicates avoided via `drop_prefix_findings()`
 
 ### RAII Semantics
@@ -422,4 +427,3 @@ let report = scan_local(engine, source, LocalConfig::default(), sink);
 | [Detection Engine](./detection-engine.md) | Multi-phase pattern matching and finding emission |
 | [Memory Management](./memory-management.md) | Buffer pool lifecycle and memory budgets |
 | [Architecture](./architecture.md) | High-level system design and module dependencies |
-

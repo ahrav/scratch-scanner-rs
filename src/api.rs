@@ -361,6 +361,13 @@ pub struct FindingRec {
     pub root_hint_start: u64,
     /// Best-effort root span hint (absolute byte offset in file).
     pub root_hint_end: u64,
+    /// Whether `span_start`/`span_end` should participate in dedupe for this finding.
+    ///
+    /// For transform-derived findings with precise root-span mapping, decoded spans
+    /// can shift with chunk alignment, so dedupe uses only the root hint window.
+    /// When root-span mapping is unavailable, include spans to avoid collapsing
+    /// distinct matches that share a coarse root hint.
+    pub dedupe_with_span: bool,
     /// Decode-step chain id for reconstructing provenance.
     /// Valid only while the originating `ScanScratch` arena is alive and not reset.
     pub step_id: StepId,
