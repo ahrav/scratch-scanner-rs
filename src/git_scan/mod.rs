@@ -4,6 +4,10 @@
 //! layout, verify required artifacts (commit-graph and MIDX), and enforce pack
 //! count limits. Preflight must not read object contents.
 //!
+//! The repo_open module produces `RepoJobState`: it resolves repo paths,
+//! detects object format, memory-maps commit-graph and MIDX, and loads the
+//! start set plus watermarks needed for incremental Git scanning.
+//!
 //! # Invariants
 //! - No blob reads (metadata only).
 //! - File reads are bounded by explicit limits.
@@ -17,6 +21,9 @@ pub mod preflight;
 pub mod preflight_error;
 pub mod preflight_limits;
 pub mod repo;
+pub mod repo_open;
+pub mod start_set;
+pub mod watermark_keys;
 
 pub use byte_arena::{ByteArena, ByteRef};
 pub use errors::{Phase1Error, Phase2Error, Phase3Error};
@@ -26,3 +33,11 @@ pub use preflight::{preflight, ArtifactPaths, ArtifactStatus, PreflightReport};
 pub use preflight_error::PreflightError;
 pub use preflight_limits::PreflightLimits;
 pub use repo::{GitRepoPaths, RepoKind};
+pub use repo_open::{
+    repo_open, RefWatermarkStore, RepoArtifactMmaps, RepoArtifactPaths, RepoArtifactStatus,
+    RepoJobState, StartSetRef, StartSetResolver,
+};
+pub use start_set::{StartSetConfig, StartSetId};
+pub use watermark_keys::{
+    decode_ref_watermark_value, encode_ref_watermark_value, KeyArena, KeyRef, NS_REF_WATERMARK,
+};

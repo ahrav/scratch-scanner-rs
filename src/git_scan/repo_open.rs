@@ -1,0 +1,417 @@
+//! Repository discovery and open for Git scanning.
+//!
+//! This stage prepares a repository for scanning by:
+//! - Resolving repository paths (worktree, bare, linked worktree)
+//! - Checking artifact readiness (commit-graph, MIDX)
+//! - Memory-mapping metadata files (commit-graph, MIDX only - not packs)
+//! - Resolving start set tips (refs to scan)
+//! - Loading persisted watermarks for incremental scanning
+//!
+//! Packs are not mmapped here. They are opened on demand in later phases
+//! per pack plan to avoid unnecessary FD and VMA pressure.
+
+use std::fs::{self, File};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+use memmap2::Mmap;
+
+use super::byte_arena::{ByteArena, ByteRef};
+use super::errors::Phase1Error;
+use super::limits::Phase1Limits;
+use super::object_id::{ObjectFormat, OidBytes};
+use super::repo::GitRepoPaths;
+use super::start_set::StartSetId;
+
+/// Status of required artifacts (commit-graph, MIDX).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepoArtifactStatus {
+    /// All required artifacts are present and can be mmapped.
+    Ready,
+    /// One or more artifacts are missing; repo needs maintenance.
+    NeedsMaintenance {
+        /// True if commit-graph is missing.
+        missing_commit_graph: bool,
+        /// True if multi-pack-index is missing.
+        missing_midx: bool,
+    },
+}
+
+impl RepoArtifactStatus {
+    /// Returns true if all artifacts are ready.
+    #[inline]
+    #[must_use]
+    pub const fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+}
+
+/// Paths to required artifact files.
+#[derive(Clone, Debug)]
+pub struct RepoArtifactPaths {
+    /// Path to the commit-graph file.
+    pub commit_graph: PathBuf,
+    /// Path to the multi-pack-index file.
+    pub midx: PathBuf,
+}
+
+/// Memory-mapped artifact files.
+///
+/// Only populated when `RepoArtifactStatus::Ready`.
+#[derive(Debug, Default)]
+pub struct RepoArtifactMmaps {
+    /// Memory-mapped commit-graph.
+    pub commit_graph: Option<Mmap>,
+    /// Memory-mapped multi-pack-index.
+    pub midx: Option<Mmap>,
+}
+
+/// A ref in the start set with its resolved tip and optional watermark.
+#[derive(Clone, Debug)]
+pub struct StartSetRef {
+    /// Interned ref name (e.g., `refs/heads/main`).
+    pub name: ByteRef,
+    /// Resolved commit OID at tip.
+    pub tip: OidBytes,
+    /// Last scanned tip OID for this ref (if previously scanned).
+    pub watermark: Option<OidBytes>,
+}
+
+/// Complete state for a repository job after repo open.
+///
+/// This struct contains everything needed for later Git phases without
+/// additional file opens (except pack files in pack processing phases).
+#[derive(Debug)]
+pub struct RepoJobState {
+    /// Resolved repository paths.
+    pub paths: GitRepoPaths,
+
+    /// Object ID format (SHA-1 or SHA-256).
+    pub object_format: ObjectFormat,
+
+    /// Paths to artifact files.
+    pub artifact_paths: RepoArtifactPaths,
+
+    /// Artifact readiness status.
+    pub artifact_status: RepoArtifactStatus,
+
+    /// Memory-mapped artifacts (only if `artifact_status.is_ready()`).
+    pub mmaps: RepoArtifactMmaps,
+
+    /// Arena for ref name storage.
+    pub ref_names: ByteArena,
+
+    /// Start set refs, sorted deterministically by name.
+    ///
+    /// Invariant: sorted by `ref_names.get(r.name)` lexicographically.
+    pub start_set: Vec<StartSetRef>,
+}
+
+/// Trait for resolving start set refs.
+///
+/// Implement this with gix plumbing to enumerate refs per your start set
+/// configuration (default branch only, all remotes, branches + tags, etc).
+pub trait StartSetResolver {
+    /// Resolves refs in the start set.
+    ///
+    /// # Requirements
+    ///
+    /// - Ref names must be fully qualified (e.g., `refs/heads/main`)
+    /// - Tips must be commit OIDs (peel tags to commits)
+    /// - Order does not matter (repo open sorts deterministically)
+    ///
+    /// # Errors
+    ///
+    /// Return an error if ref resolution fails.
+    fn resolve(&self, paths: &GitRepoPaths) -> Result<Vec<(Vec<u8>, OidBytes)>, Phase1Error>;
+}
+
+/// Trait for loading persisted ref watermarks.
+///
+/// Implement this with your database layer. The watermark store is keyed by
+/// `(repo_id, policy_hash, start_set_id, ref_name)`.
+pub trait RefWatermarkStore {
+    /// Loads watermarks for the given refs.
+    ///
+    /// # Arguments
+    ///
+    /// * `repo_id` - Repository identifier
+    /// * `policy_hash` - Policy identity (rules + merge semantics)
+    /// * `start_set_id` - Start set configuration identity
+    /// * `ref_names` - Ref names to load watermarks for (in order)
+    ///
+    /// # Returns
+    ///
+    /// A vector of `Option<OidBytes>` aligned with `ref_names`.
+    /// Length must equal `ref_names.len()`.
+    fn load_watermarks(
+        &self,
+        repo_id: u64,
+        policy_hash: [u8; 32],
+        start_set_id: StartSetId,
+        ref_names: &[&[u8]],
+    ) -> Result<Vec<Option<OidBytes>>, Phase1Error>;
+}
+
+/// Executes repo discovery and open.
+///
+/// # Arguments
+///
+/// * `repo_root` - Path to repository (worktree or bare root)
+/// * `repo_id` - Repository identifier (for watermark keys)
+/// * `policy_hash` - Policy identity hash
+/// * `start_set_id` - Start set configuration identity
+/// * `resolver` - Start set resolver implementation
+/// * `watermark_store` - Watermark store implementation
+/// * `limits` - Hard caps for repo open
+///
+/// # Returns
+///
+/// A `RepoJobState` ready for later Git phases.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Repository paths cannot be resolved
+/// - Start set exceeds limits
+/// - Watermark store returns wrong count
+///
+/// Note: Missing artifacts is not an error. Check `artifact_status` and
+/// run maintenance if needed before proceeding to later phases. When
+/// artifacts are missing, `mmaps` and `start_set` are empty; rerun
+/// `repo_open` after maintenance to populate them.
+pub fn repo_open(
+    repo_root: &Path,
+    repo_id: u64,
+    policy_hash: [u8; 32],
+    start_set_id: StartSetId,
+    resolver: &dyn StartSetResolver,
+    watermark_store: &dyn RefWatermarkStore,
+    limits: Phase1Limits,
+) -> Result<RepoJobState, Phase1Error> {
+    limits.validate();
+
+    let paths = GitRepoPaths::resolve(repo_root, &limits)?;
+    let object_format = detect_object_format(&paths, &limits)?;
+
+    let artifact_paths = RepoArtifactPaths {
+        commit_graph: paths.objects_dir.join("info").join("commit-graph"),
+        midx: paths.pack_dir.join("multi-pack-index"),
+    };
+
+    let artifact_status = check_artifact_status(&artifact_paths);
+
+    if !artifact_status.is_ready() {
+        return Ok(RepoJobState {
+            paths,
+            object_format,
+            artifact_paths,
+            artifact_status,
+            mmaps: RepoArtifactMmaps::default(),
+            ref_names: ByteArena::with_capacity(0),
+            start_set: Vec::new(),
+        });
+    }
+
+    let mmaps = mmap_artifacts(&artifact_paths)?;
+
+    let (ref_names, start_set) = resolve_start_set_with_watermarks(
+        repo_id,
+        policy_hash,
+        start_set_id,
+        &paths,
+        resolver,
+        watermark_store,
+        &limits,
+    )?;
+
+    Ok(RepoJobState {
+        paths,
+        object_format,
+        artifact_paths,
+        artifact_status,
+        mmaps,
+        ref_names,
+        start_set,
+    })
+}
+
+/// Checks for the presence of required artifact files.
+///
+/// This is a fast existence check only; file contents are not validated here.
+fn check_artifact_status(artifact_paths: &RepoArtifactPaths) -> RepoArtifactStatus {
+    let missing_commit_graph = !is_file(&artifact_paths.commit_graph);
+    let missing_midx = !is_file(&artifact_paths.midx);
+
+    if missing_commit_graph || missing_midx {
+        RepoArtifactStatus::NeedsMaintenance {
+            missing_commit_graph,
+            missing_midx,
+        }
+    } else {
+        RepoArtifactStatus::Ready
+    }
+}
+
+/// Memory-maps the artifact files for later read-only access.
+///
+/// Assumes `check_artifact_status` returned `Ready`.
+fn mmap_artifacts(artifact_paths: &RepoArtifactPaths) -> Result<RepoArtifactMmaps, Phase1Error> {
+    let commit_graph = mmap_file(&artifact_paths.commit_graph)?;
+    let midx = mmap_file(&artifact_paths.midx)?;
+
+    Ok(RepoArtifactMmaps {
+        commit_graph: Some(commit_graph),
+        midx: Some(midx),
+    })
+}
+
+fn mmap_file(path: &Path) -> Result<Mmap, Phase1Error> {
+    let file = File::open(path).map_err(Phase1Error::io)?;
+
+    #[allow(unsafe_code)]
+    unsafe {
+        // SAFETY: We map the file read-only and treat it as immutable during the scan.
+        // Repo maintenance is expected to be quiescent; if the file is truncated
+        // or replaced while mapped, the OS may signal a fault. That risk is accepted.
+        Mmap::map(&file).map_err(Phase1Error::io)
+    }
+}
+
+/// Resolves the start set, interns ref names, and loads watermarks.
+///
+/// The resolver output is sorted lexicographically by ref name to ensure a
+/// deterministic order. Watermarks are fetched in that same order and then
+/// paired back with their refs.
+fn resolve_start_set_with_watermarks(
+    repo_id: u64,
+    policy_hash: [u8; 32],
+    start_set_id: StartSetId,
+    paths: &GitRepoPaths,
+    resolver: &dyn StartSetResolver,
+    watermark_store: &dyn RefWatermarkStore,
+    limits: &Phase1Limits,
+) -> Result<(ByteArena, Vec<StartSetRef>), Phase1Error> {
+    let mut refs = resolver.resolve(paths)?;
+
+    if refs.len() > limits.max_refs_in_start_set as usize {
+        return Err(Phase1Error::StartSetTooLarge {
+            count: refs.len(),
+            max: limits.max_refs_in_start_set as usize,
+        });
+    }
+
+    refs.sort_by(|(a, _), (b, _)| a.as_slice().cmp(b.as_slice()));
+
+    let mut ref_names = ByteArena::with_capacity(limits.max_refname_arena_bytes);
+    let mut interned_refs = Vec::with_capacity(refs.len());
+
+    for (name_bytes, tip) in &refs {
+        if name_bytes.len() > limits.max_refname_bytes as usize {
+            return Err(Phase1Error::RefNameTooLong {
+                len: name_bytes.len(),
+                max: limits.max_refname_bytes as usize,
+            });
+        }
+
+        let name_ref = ref_names
+            .intern(name_bytes)
+            .ok_or(Phase1Error::ArenaOverflow)?;
+
+        interned_refs.push((name_ref, *tip));
+    }
+
+    let name_slices: Vec<&[u8]> = interned_refs
+        .iter()
+        .map(|(name_ref, _)| ref_names.get(*name_ref))
+        .collect();
+
+    let watermarks =
+        watermark_store.load_watermarks(repo_id, policy_hash, start_set_id, &name_slices)?;
+
+    if watermarks.len() != interned_refs.len() {
+        return Err(Phase1Error::WatermarkCountMismatch {
+            got: watermarks.len(),
+            expected: interned_refs.len(),
+        });
+    }
+
+    let start_set: Vec<StartSetRef> = interned_refs
+        .into_iter()
+        .zip(watermarks)
+        .map(|((name, tip), watermark)| StartSetRef {
+            name,
+            tip,
+            watermark,
+        })
+        .collect();
+
+    Ok((ref_names, start_set))
+}
+
+/// Detects the repository object format via config.
+///
+/// This is a lightweight scan, not a full Git config parser. It:
+/// - Reads the first existing config path
+/// - Ignores comments/blank lines
+/// - Treats any line containing both "objectformat" and "sha256"
+///   (case-insensitive) as a SHA-256 repo
+///
+/// Anything else defaults to SHA-1.
+fn detect_object_format(
+    paths: &GitRepoPaths,
+    limits: &Phase1Limits,
+) -> Result<ObjectFormat, Phase1Error> {
+    for config_path in paths.config_paths() {
+        if !config_path.is_file() {
+            continue;
+        }
+
+        let bytes = read_bounded_file(&config_path, limits.max_config_file_bytes)?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| Phase1Error::InvalidUtf8Config)?;
+
+        for line in text.lines() {
+            let line = line.trim();
+            if line.starts_with('#') || line.starts_with(';') || line.is_empty() {
+                continue;
+            }
+
+            let lower = line.to_ascii_lowercase();
+            if lower.contains("objectformat") && lower.contains("sha256") {
+                return Ok(ObjectFormat::Sha256);
+            }
+        }
+
+        return Ok(ObjectFormat::Sha1);
+    }
+
+    Ok(ObjectFormat::Sha1)
+}
+
+/// Reads a file with a maximum byte limit.
+///
+/// The size check is done via metadata first; the read itself is bounded via
+/// `take()` to guard against concurrent file growth.
+fn read_bounded_file(path: &Path, max_bytes: u32) -> Result<Vec<u8>, Phase1Error> {
+    let file = File::open(path).map_err(Phase1Error::io)?;
+    let metadata = file.metadata().map_err(Phase1Error::io)?;
+
+    if metadata.len() > max_bytes as u64 {
+        return Err(Phase1Error::FileTooLarge {
+            size: metadata.len(),
+            limit: max_bytes,
+        });
+    }
+
+    let size = metadata.len() as usize;
+    let mut buffer = Vec::with_capacity(size);
+    let mut take = file.take(max_bytes as u64);
+    take.read_to_end(&mut buffer).map_err(Phase1Error::io)?;
+
+    Ok(buffer)
+}
+
+#[inline]
+fn is_file(path: &Path) -> bool {
+    fs::metadata(path).map(|m| m.is_file()).unwrap_or(false)
+}

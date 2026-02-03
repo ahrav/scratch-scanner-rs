@@ -4,4 +4,5 @@
 
 mod anchor_optimization;
 mod git_preflight;
+mod git_repo_open;
 mod manual_anchors;

@@ -28,11 +28,170 @@
 
 use std::ffi::OsStr;
 use std::fs::{self, File};
+use std::io;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use super::errors::Phase1Error;
+use super::limits::Phase1Limits;
 use super::preflight_error::PreflightError;
 use super::preflight_limits::PreflightLimits;
+
+/// Limits required for repository path resolution.
+pub trait RepoLimits {
+    /// Maximum bytes to read from `.git` file (gitdir pointer).
+    fn max_dot_git_file_bytes(&self) -> u32;
+    /// Maximum bytes to read from `commondir` file.
+    fn max_commondir_file_bytes(&self) -> u32;
+    /// Maximum bytes to read from `info/alternates` file.
+    fn max_alternates_file_bytes(&self) -> u32;
+    /// Maximum number of alternates to accept.
+    fn max_alternates_count(&self) -> u8;
+}
+
+impl RepoLimits for PreflightLimits {
+    fn max_dot_git_file_bytes(&self) -> u32 {
+        self.max_dot_git_file_bytes
+    }
+
+    fn max_commondir_file_bytes(&self) -> u32 {
+        self.max_commondir_file_bytes
+    }
+
+    fn max_alternates_file_bytes(&self) -> u32 {
+        self.max_alternates_file_bytes
+    }
+
+    fn max_alternates_count(&self) -> u8 {
+        self.max_alternates_count
+    }
+}
+
+impl RepoLimits for Phase1Limits {
+    fn max_dot_git_file_bytes(&self) -> u32 {
+        self.max_dot_git_file_bytes
+    }
+
+    fn max_commondir_file_bytes(&self) -> u32 {
+        self.max_commondir_file_bytes
+    }
+
+    fn max_alternates_file_bytes(&self) -> u32 {
+        self.max_alternates_file_bytes
+    }
+
+    fn max_alternates_count(&self) -> u8 {
+        self.max_alternates_count
+    }
+}
+
+/// Error contract required for repository path resolution.
+pub trait RepoError: Sized {
+    /// I/O error during file operations.
+    fn io(err: io::Error) -> Self;
+    /// Path canonicalization failed.
+    fn canonicalization(err: io::Error) -> Self;
+    /// Not a Git repository (no .git dir/file, not bare).
+    fn not_a_repository() -> Self;
+    /// The .git file is malformed (bad gitdir pointer).
+    fn malformed_gitdir_file() -> Self;
+    /// The gitdir target doesn't exist or isn't a directory.
+    fn gitdir_target_not_dir() -> Self;
+    /// The commondir file is malformed.
+    fn malformed_commondir_file() -> Self;
+    /// The common directory doesn't exist or isn't a directory.
+    fn common_dir_not_dir() -> Self;
+    /// The objects directory doesn't exist or isn't a directory.
+    fn objects_dir_not_dir() -> Self;
+    /// An alternate object directory doesn't exist or isn't a directory.
+    fn alternate_not_dir() -> Self;
+    /// File exceeds size limit.
+    fn file_too_large(size: u64, limit: u32) -> Self;
+}
+
+impl RepoError for PreflightError {
+    fn io(err: io::Error) -> Self {
+        Self::io(err)
+    }
+
+    fn canonicalization(err: io::Error) -> Self {
+        Self::canonicalization(err)
+    }
+
+    fn not_a_repository() -> Self {
+        Self::NotARepository
+    }
+
+    fn malformed_gitdir_file() -> Self {
+        Self::MalformedGitdirFile
+    }
+
+    fn gitdir_target_not_dir() -> Self {
+        Self::GitdirTargetNotDir
+    }
+
+    fn malformed_commondir_file() -> Self {
+        Self::MalformedCommondirFile
+    }
+
+    fn common_dir_not_dir() -> Self {
+        Self::CommonDirNotDir
+    }
+
+    fn objects_dir_not_dir() -> Self {
+        Self::ObjectsDirNotDir
+    }
+
+    fn alternate_not_dir() -> Self {
+        Self::AlternateNotDir
+    }
+
+    fn file_too_large(size: u64, limit: u32) -> Self {
+        Self::FileTooLarge { size, limit }
+    }
+}
+
+impl RepoError for Phase1Error {
+    fn io(err: io::Error) -> Self {
+        Self::io(err)
+    }
+
+    fn canonicalization(err: io::Error) -> Self {
+        Self::canonicalization(err)
+    }
+
+    fn not_a_repository() -> Self {
+        Self::NotARepository
+    }
+
+    fn malformed_gitdir_file() -> Self {
+        Self::MalformedGitdirFile
+    }
+
+    fn gitdir_target_not_dir() -> Self {
+        Self::GitdirTargetNotDir
+    }
+
+    fn malformed_commondir_file() -> Self {
+        Self::MalformedCommondirFile
+    }
+
+    fn common_dir_not_dir() -> Self {
+        Self::CommonDirNotDir
+    }
+
+    fn objects_dir_not_dir() -> Self {
+        Self::ObjectsDirNotDir
+    }
+
+    fn alternate_not_dir() -> Self {
+        Self::AlternateNotDir
+    }
+
+    fn file_too_large(size: u64, limit: u32) -> Self {
+        Self::FileTooLarge { size, limit }
+    }
+}
 
 /// Type of Git repository detected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,7 +262,11 @@ impl GitRepoPaths {
     /// - Required directories are missing
     /// - File reads exceed limits
     /// - Path canonicalization fails
-    pub fn resolve(repo_root: &Path, limits: &PreflightLimits) -> Result<Self, PreflightError> {
+    pub fn resolve<E, L>(repo_root: &Path, limits: &L) -> Result<Self, E>
+    where
+        E: RepoError,
+        L: RepoLimits,
+    {
         assert!(
             !repo_root.as_os_str().is_empty(),
             "repo_root cannot be empty"
@@ -140,7 +303,7 @@ impl GitRepoPaths {
             return Self::from_git_dir(RepoKind::Bare, None, git_dir, limits);
         }
 
-        Err(PreflightError::NotARepository)
+        Err(E::not_a_repository())
     }
 
     /// Returns true if this is a linked worktree (git_dir != common_dir).
@@ -154,29 +317,33 @@ impl GitRepoPaths {
     ///
     /// `git_dir` must already be canonicalized. This routine also validates
     /// the `objects` directory and parses `info/alternates`.
-    fn from_git_dir(
+    fn from_git_dir<E, L>(
         kind: RepoKind,
         worktree_root: Option<PathBuf>,
         git_dir: PathBuf,
-        limits: &PreflightLimits,
-    ) -> Result<Self, PreflightError> {
+        limits: &L,
+    ) -> Result<Self, E>
+    where
+        E: RepoError,
+        L: RepoLimits,
+    {
         assert!(!git_dir.as_os_str().is_empty(), "git_dir cannot be empty");
         assert!(
-            limits.max_alternates_count > 0,
+            limits.max_alternates_count() > 0,
             "must allow at least 1 alternate"
         );
 
-        let common_dir = resolve_common_dir(&git_dir, limits)?;
+        let common_dir = resolve_common_dir::<E, L>(&git_dir, limits)?;
 
         let objects_dir = common_dir.join("objects");
         if !is_dir(&objects_dir) {
-            return Err(PreflightError::ObjectsDirNotDir);
+            return Err(E::objects_dir_not_dir());
         }
-        let objects_dir = canonicalize_path(&objects_dir)?;
+        let objects_dir = canonicalize_path::<E>(&objects_dir)?;
 
         let pack_dir = objects_dir.join("pack");
 
-        let alternate_object_dirs = parse_alternates(&objects_dir, limits)?;
+        let alternate_object_dirs = parse_alternates::<E, L>(&objects_dir, limits)?;
 
         debug_assert!(
             objects_dir.starts_with(&common_dir),
@@ -193,25 +360,36 @@ impl GitRepoPaths {
             alternate_object_dirs,
         })
     }
+
+    /// Returns path candidates for the Git config file.
+    ///
+    /// For normal repos: returns `common_dir/config`.
+    /// For linked worktrees: returns `common_dir/config` only.
+    ///
+    /// Note: Worktree-specific config (`git_dir/config.worktree`) is not
+    /// currently supported. The standard config in `common_dir` is used.
+    pub fn config_paths(&self) -> impl Iterator<Item = PathBuf> + '_ {
+        std::iter::once(self.common_dir.join("config"))
+    }
 }
 
 /// Parses a `.git` file to extract the gitdir path.
 ///
 /// Expected format: `gitdir: <path>\n`. The path may contain non-UTF-8 bytes.
-fn parse_gitdir_file(
-    dot_git_file: &Path,
-    base_dir: &Path,
-    limits: &PreflightLimits,
-) -> Result<PathBuf, PreflightError> {
-    let bytes = read_bounded_file(dot_git_file, limits.max_dot_git_file_bytes)?;
+fn parse_gitdir_file<E, L>(dot_git_file: &Path, base_dir: &Path, limits: &L) -> Result<PathBuf, E>
+where
+    E: RepoError,
+    L: RepoLimits,
+{
+    let bytes = read_bounded_file::<E>(dot_git_file, limits.max_dot_git_file_bytes())?;
 
-    let path = parse_gitdir_bytes(&bytes).ok_or(PreflightError::MalformedGitdirFile)?;
+    let path = parse_gitdir_bytes(&bytes).ok_or(E::malformed_gitdir_file())?;
 
     let resolved = resolve_path(base_dir, &path);
-    let canonical = canonicalize_path(&resolved)?;
+    let canonical = canonicalize_path::<E>(&resolved)?;
 
     if !is_dir(&canonical) {
-        return Err(PreflightError::GitdirTargetNotDir);
+        return Err(E::gitdir_target_not_dir());
     }
 
     Ok(canonical)
@@ -254,22 +432,26 @@ fn parse_gitdir_bytes(bytes: &[u8]) -> Option<PathBuf> {
 /// Resolves the common directory for a git directory.
 ///
 /// If a `commondir` file exists, it is interpreted relative to `git_dir`.
-fn resolve_common_dir(git_dir: &Path, limits: &PreflightLimits) -> Result<PathBuf, PreflightError> {
+fn resolve_common_dir<E, L>(git_dir: &Path, limits: &L) -> Result<PathBuf, E>
+where
+    E: RepoError,
+    L: RepoLimits,
+{
     let commondir_file = git_dir.join("commondir");
 
     if !is_file(&commondir_file) {
         return Ok(git_dir.to_path_buf());
     }
 
-    let bytes = read_bounded_file(&commondir_file, limits.max_commondir_file_bytes)?;
+    let bytes = read_bounded_file::<E>(&commondir_file, limits.max_commondir_file_bytes())?;
 
-    let path = parse_commondir_bytes(&bytes).ok_or(PreflightError::MalformedCommondirFile)?;
+    let path = parse_commondir_bytes(&bytes).ok_or(E::malformed_commondir_file())?;
 
     let resolved = resolve_path(git_dir, &path);
-    let canonical = canonicalize_path(&resolved)?;
+    let canonical = canonicalize_path::<E>(&resolved)?;
 
     if !is_dir(&canonical) {
-        return Err(PreflightError::CommonDirNotDir);
+        return Err(E::common_dir_not_dir());
     }
 
     Ok(canonical)
@@ -299,20 +481,22 @@ fn parse_commondir_bytes(bytes: &[u8]) -> Option<PathBuf> {
 ///
 /// The file format is one path per line. Blank lines and `#` comments are
 /// ignored. Parsing stops after a bounded number of lines and paths to keep
-/// runtime and memory bounded.
-fn parse_alternates(
-    objects_dir: &Path,
-    limits: &PreflightLimits,
-) -> Result<Vec<PathBuf>, PreflightError> {
+/// runtime and memory bounded. Relative paths are resolved against the
+/// repository's `objects` directory, matching Git's behavior.
+fn parse_alternates<E, L>(objects_dir: &Path, limits: &L) -> Result<Vec<PathBuf>, E>
+where
+    E: RepoError,
+    L: RepoLimits,
+{
     let alternates_file = objects_dir.join("info").join("alternates");
 
     if !is_file(&alternates_file) {
         return Ok(Vec::new());
     }
 
-    let bytes = read_bounded_file(&alternates_file, limits.max_alternates_file_bytes)?;
+    let bytes = read_bounded_file::<E>(&alternates_file, limits.max_alternates_file_bytes())?;
 
-    let max_count = limits.max_alternates_count as usize;
+    let max_count = limits.max_alternates_count() as usize;
     let mut alternates = Vec::with_capacity(max_count.min(8));
 
     let max_lines = max_count * 2; // Account for comments and blank lines
@@ -336,13 +520,13 @@ fn parse_alternates(
         let path = bytes_to_path(trimmed);
         let resolved = resolve_path(objects_dir, &path);
 
-        let canonical = match canonicalize_path(&resolved) {
+        let canonical = match canonicalize_path::<E>(&resolved) {
             Ok(p) => p,
-            Err(_) => return Err(PreflightError::AlternateNotDir),
+            Err(_) => return Err(E::alternate_not_dir()),
         };
 
         if !is_dir(&canonical) {
-            return Err(PreflightError::AlternateNotDir);
+            return Err(E::alternate_not_dir());
         }
 
         alternates.push(canonical);
@@ -366,30 +550,27 @@ fn resolve_path(base: &Path, path: &Path) -> PathBuf {
 
 /// Canonicalizes a path, resolving symlinks and `..` components.
 ///
-/// Errors are mapped to `PreflightError::Canonicalization`.
-fn canonicalize_path(path: &Path) -> Result<PathBuf, PreflightError> {
-    fs::canonicalize(path).map_err(PreflightError::canonicalization)
+/// Errors are mapped via `RepoError::canonicalization`.
+fn canonicalize_path<E: RepoError>(path: &Path) -> Result<PathBuf, E> {
+    fs::canonicalize(path).map_err(E::canonicalization)
 }
 
 /// Reads a file with a maximum byte limit.
 ///
 /// The file size is checked via metadata before reading. The read itself is
 /// capped with `take()` to guard against concurrent file growth.
-fn read_bounded_file(path: &Path, max_bytes: u32) -> Result<Vec<u8>, PreflightError> {
-    let file = File::open(path).map_err(PreflightError::io)?;
-    let metadata = file.metadata().map_err(PreflightError::io)?;
+fn read_bounded_file<E: RepoError>(path: &Path, max_bytes: u32) -> Result<Vec<u8>, E> {
+    let file = File::open(path).map_err(E::io)?;
+    let metadata = file.metadata().map_err(E::io)?;
 
     if metadata.len() > max_bytes as u64 {
-        return Err(PreflightError::FileTooLarge {
-            size: metadata.len(),
-            limit: max_bytes,
-        });
+        return Err(E::file_too_large(metadata.len(), max_bytes));
     }
 
     let size = metadata.len() as usize;
     let mut buffer = Vec::with_capacity(size);
     let mut take = file.take(max_bytes as u64);
-    take.read_to_end(&mut buffer).map_err(PreflightError::io)?;
+    take.read_to_end(&mut buffer).map_err(E::io)?;
 
     Ok(buffer)
 }
