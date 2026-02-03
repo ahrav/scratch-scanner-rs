@@ -440,6 +440,9 @@ fn is_more_canonical(a_ctx: RunContext, a_path: &[u8], b_ctx: RunContext, b_path
     a_ctx.cand_flags < b_ctx.cand_flags
 }
 
+/// Batch buffer for seen-store queries.
+///
+/// Stores sorted unique OIDs plus interned paths in a bounded arena.
 struct BatchBuffer {
     oids: Vec<OidBytes>,
     blobs: Vec<UniqueBlob>,
