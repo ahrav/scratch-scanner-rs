@@ -78,9 +78,12 @@ use std::sync::Arc;
 // Null Sink (Quiet Benchmarks)
 // ============================================================================
 
-/// Output sink that discards all output but counts bytes.
+/// Output sink that discards output but counts bytes and write calls.
 ///
 /// Used for benchmarks where we don't want I/O overhead from writing findings.
+/// When configured with a passthrough sink, it forwards writes while still
+/// tracking counts. This enables output-heavy benchmarks without changing
+/// the metrics collection path.
 ///
 /// # Performance Note
 ///
@@ -94,15 +97,29 @@ use std::sync::Arc;
 /// Safe for concurrent use. Counters are independent (no consistency
 /// guarantee between `bytes_written` and `write_calls` for a single
 /// logical write observed from another thread).
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct NullSink {
     bytes_written: AtomicU64,
     write_calls: AtomicU64,
+    passthrough: Option<Arc<dyn OutputSink>>,
 }
 
 impl NullSink {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            bytes_written: AtomicU64::new(0),
+            write_calls: AtomicU64::new(0),
+            passthrough: None,
+        }
+    }
+
+    /// Create a counting sink that forwards writes to another sink.
+    pub fn with_passthrough(passthrough: Arc<dyn OutputSink>) -> Self {
+        Self {
+            bytes_written: AtomicU64::new(0),
+            write_calls: AtomicU64::new(0),
+            passthrough: Some(passthrough),
+        }
     }
 
     /// Total bytes "written" (discarded).
@@ -127,10 +144,15 @@ impl OutputSink for NullSink {
         self.bytes_written
             .fetch_add(buf.len() as u64, Ordering::Relaxed);
         self.write_calls.fetch_add(1, Ordering::Relaxed);
+        if let Some(passthrough) = &self.passthrough {
+            passthrough.write_all(buf);
+        }
     }
 
     fn flush(&self) {
-        // No-op
+        if let Some(passthrough) = &self.passthrough {
+            passthrough.flush();
+        }
     }
 }
 
@@ -187,6 +209,23 @@ impl LocalScanBenchmark {
         synthetic_config: SyntheticConfig,
         local_config: LocalConfig,
     ) -> io::Result<Self> {
+        Self::new_with_output_sink(
+            engine,
+            synthetic_config,
+            local_config,
+            Arc::new(super::output_sink::NullSink::new()),
+        )
+    }
+
+    /// Creates a new benchmark and forwards findings to a custom output sink.
+    ///
+    /// The benchmark still tracks write call counts regardless of sink.
+    pub fn new_with_output_sink(
+        engine: Arc<MockEngine>,
+        synthetic_config: SyntheticConfig,
+        local_config: LocalConfig,
+        output: Arc<dyn OutputSink>,
+    ) -> io::Result<Self> {
         // Validate configs (panics on invalid - programmer error)
         synthetic_config
             .validate()
@@ -201,7 +240,7 @@ impl LocalScanBenchmark {
             local_config,
             synthetic,
             current_source: None,
-            sink: Arc::new(NullSink::new()),
+            sink: Arc::new(NullSink::with_passthrough(output)),
         })
     }
 
@@ -214,6 +253,22 @@ impl LocalScanBenchmark {
         synthetic: SyntheticFileSource,
         local_config: LocalConfig,
     ) -> Self {
+        Self::from_synthetic_with_output_sink(
+            engine,
+            synthetic,
+            local_config,
+            Arc::new(super::output_sink::NullSink::new()),
+        )
+    }
+
+    /// Creates a benchmark from pre-generated synthetic files and forwards
+    /// findings to a custom output sink.
+    pub fn from_synthetic_with_output_sink(
+        engine: Arc<MockEngine>,
+        synthetic: SyntheticFileSource,
+        local_config: LocalConfig,
+        output: Arc<dyn OutputSink>,
+    ) -> Self {
         local_config.validate(engine.as_ref());
 
         Self {
@@ -221,7 +276,7 @@ impl LocalScanBenchmark {
             local_config,
             synthetic,
             current_source: None,
-            sink: Arc::new(NullSink::new()),
+            sink: Arc::new(NullSink::with_passthrough(output)),
         }
     }
 
@@ -498,6 +553,20 @@ mod tests {
         sink.reset();
         assert_eq!(sink.bytes_written(), 0);
         assert_eq!(sink.write_calls(), 0);
+    }
+
+    #[test]
+    fn null_sink_passthrough_writes() {
+        let inner = Arc::new(crate::scheduler::output_sink::VecSink::new());
+        let sink = NullSink::with_passthrough(Arc::clone(&inner) as Arc<dyn OutputSink>);
+
+        sink.write_all(b"hello ");
+        sink.write_all(b"world");
+        sink.flush();
+
+        assert_eq!(sink.bytes_written(), 11);
+        assert_eq!(sink.write_calls(), 2);
+        assert_eq!(inner.len(), 11);
     }
 
     #[test]

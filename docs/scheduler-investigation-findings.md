@@ -103,11 +103,22 @@ Impact: Potential bottleneck only when findings are very dense.
 
 Work units:
 
-- [ ] Validate the reasoning with a synthetic dense-findings workload and confirm whether the sink is a measurable bottleneck.
-- [ ] If the reasoning does not hold, document and skip.
-- [ ] Draft a concrete plan for a writer-thread + bounded queue experiment and define success metrics.
-- [ ] Implement only if the bottleneck is confirmed and the plan is expected to deliver measurable gains.
-- [ ] Run doc-rigor on code files changed for this task and update docs/comments as needed.
+- [x] Validate the reasoning with a synthetic dense-findings workload and confirm whether the sink is a measurable bottleneck. (Bench CLI supports `--secret-density` and `--sink` to drive output-heavy runs.)
+- [x] If the reasoning does not hold, document and skip. Measurements on macOS showed no meaningful throughput regression when using a real `FileSink` vs `NullSink`:
+  - `files=200`, `file_size=1m`, `secret_density=0.05`, `workers=4`, `iters=3`, `warmup=1`: `NullSink` ~568.0 MiB/s (p50 ~352 ms) vs `FileSink` ~554.7 MiB/s (p50 ~361 ms).
+  - `files=100`, `file_size=4m`, `secret_density=0.1`, `workers=8`, `iters=3`, `warmup=1`: `NullSink` ~1062.2 MiB/s (p50 ~376.6 ms) vs `FileSink` ~1061.6 MiB/s (p50 ~376.8 ms).
+  - `files=100`, `file_size=4m`, `secret_density=1.0`, `workers=8`, `iters=3`, `warmup=1`: `NullSink` ~1054.0 MiB/s (p50 ~379.5 ms) vs `FileSink` ~1041.8 MiB/s (p50 ~384.0 ms, p95 ~427 ms).
+  - Deltas remain ~1–3% with slightly higher tail latency at very high density. No evidence of a dominant output bottleneck.
+- [x] Draft a concrete plan for a writer-thread + bounded queue experiment and define success metrics.
+- [x] Add bench CLI support for `--secret-density` and `--sink` (`null|stdout|file`) so output-heavy runs are measurable on any OS.
+- [ ] Implement only if the bottleneck is confirmed and the plan is expected to deliver measurable gains. (Deferred: no bottleneck observed in current measurements.)
+- [x] Run doc-rigor on code files changed for this task and update docs/comments as needed.
+
+Plan (evidence-backed):
+1. Extend the local benchmark harness or CLI to accept `--secret-density` and `--sink` (`null|file|stdout`) so output-heavy runs are measurable on macOS. (Done: bench CLI supports both flags.)
+2. Use `SyntheticConfig` with `secret_density=0.05–0.1`, `file_count=1000`, `file_size=64KiB`, and `chunk_size=64KiB` to maximize findings per chunk while keeping input stable.
+3. Compare `NullSink` vs `FileSink` (same dataset, same workers) and record wall time, throughput (bytes/s), and write call counts. On macOS, add `/usr/bin/time -l` to capture context switches; on Linux, use `perf stat` for context switches and syscall counts.
+4. Prototype a writer-thread sink with a bounded `crossbeam_channel` queue and measure again. Success criteria: ≥10% throughput improvement on output-heavy runs without regressions in correctness or output ordering.
 
 ### Perf: Make `local_fs_uring` Production-Capable
 
