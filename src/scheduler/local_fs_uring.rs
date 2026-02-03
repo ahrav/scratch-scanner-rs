@@ -39,11 +39,12 @@
 #![cfg(all(target_os = "linux", feature = "io-uring"))]
 
 use super::count_budget::{CountBudget, CountPermit};
-use super::engine_stub::{FileId, BUFFER_LEN_MAX};
+use super::engine_stub::BUFFER_LEN_MAX;
 use super::engine_trait::{EngineScratch, FindingRecord, ScanEngine};
 use super::executor::{Executor, ExecutorConfig, ExecutorHandle, WorkerCtx};
 use super::metrics::MetricsSnapshot;
 use super::output_sink::OutputSink;
+use crate::api::FileId;
 
 use crossbeam_channel as chan;
 use crossbeam_queue::ArrayQueue;
@@ -552,7 +553,7 @@ fn cpu_runner<E: ScanEngine>(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScra
             len,
             buf,
         } => {
-            let engine = &ctx.scratch.engine;
+            let engine = ctx.scratch.engine.as_ref();
 
             let len_usize = len as usize;
             let data = &buf.as_slice()[..len_usize];
@@ -851,7 +852,7 @@ fn io_worker_loop<E: ScanEngine>(
         Failed,
     }
 
-    let mut blocking_open = |path: &Path, stats: &mut UringIoStats| -> BlockingOutcome {
+    let blocking_open = |path: &Path, stats: &mut UringIoStats| -> BlockingOutcome {
         // Use O_NOFOLLOW when follow_symlinks is false to prevent TOCTOU attacks.
         let file = match open_file_safe(path, cfg.follow_symlinks) {
             Ok(f) => f,
@@ -1779,7 +1780,7 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
     cfg: LocalFsUringConfig,
     out: Arc<dyn OutputSink>,
 ) -> io::Result<(LocalFsSummary, UringIoStats, MetricsSnapshot)> {
-    cfg.validate(&engine);
+    cfg.validate(engine.as_ref());
 
     let overlap = engine.required_overlap();
     let buf_len = overlap.saturating_add(cfg.chunk_size);
@@ -1886,6 +1887,7 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
 mod tests {
     use super::super::engine_stub::{EngineTuning, MockEngine, MockRule};
     use super::super::output_sink::VecSink;
+    use super::super::{TsBufferPool, TsBufferPoolConfig};
     use super::*;
     use tempfile::tempdir;
 

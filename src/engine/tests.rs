@@ -1404,79 +1404,93 @@ fn scan_rules_reference(
                 }
                 Variant::Utf16Le | Variant::Utf16Be => {
                     for w in windows {
-                        if *total_decode_output_bytes >= engine.tuning.max_total_decode_output_bytes
-                        {
-                            return found_any;
-                        }
-
-                        let remaining = engine
-                            .tuning
-                            .max_total_decode_output_bytes
-                            .saturating_sub(*total_decode_output_bytes);
-                        if remaining == 0 {
-                            return found_any;
-                        }
-                        let max_out = engine
-                            .tuning
-                            .max_utf16_decoded_bytes_per_window
-                            .min(remaining);
-
-                        let decoded = match variant {
-                            Variant::Utf16Le => decode_utf16le_to_vec(&buf[w.clone()], max_out),
-                            Variant::Utf16Be => decode_utf16be_to_vec(&buf[w.clone()], max_out),
-                            _ => unreachable!(),
-                        };
-
-                        let decoded = match decoded {
-                            Ok(bytes) => bytes,
-                            Err(_) => continue,
-                        };
-
-                        if decoded.is_empty() {
-                            continue;
-                        }
-
-                        *total_decode_output_bytes =
-                            total_decode_output_bytes.saturating_add(decoded.len());
-                        if *total_decode_output_bytes > engine.tuning.max_total_decode_output_bytes
-                        {
-                            return found_any;
-                        }
-
-                        let mut steps = steps.to_vec();
-                        steps.push(StepKind::Utf16 {
-                            le: matches!(variant, Variant::Utf16Le),
-                        });
-
-                        for caps in rule.re.captures_iter(&decoded) {
-                            let full_match = caps.get(0).expect("group 0 always exists");
-                            if let Some(spec) = rule.entropy.as_ref() {
-                                let ent = EntropyCompiled {
-                                    min_bits_per_byte: spec.min_bits_per_byte,
-                                    min_len: spec.min_len,
-                                    max_len: spec.max_len,
-                                };
-                                let span = full_match.start()..full_match.end();
-                                let mbytes = &decoded[span];
-                                if !entropy_gate_passes(
-                                    &ent,
-                                    mbytes,
-                                    entropy_scratch,
-                                    &engine.entropy_log2,
-                                ) {
-                                    continue;
-                                }
+                        // Match engine parity handling: UTF-16 anchors can land on either byte
+                        // alignment, so decode both offsets within the window.
+                        for offset in 0..=1 {
+                            let decode_start = w.start.saturating_add(offset);
+                            if decode_start >= w.end {
+                                continue;
                             }
-                            // Extract secret span to match production behavior.
-                            let (secret_start, secret_end) =
-                                extract_secret_span(&caps, rule.secret_group);
-                            let span = secret_start..secret_end;
-                            out.insert(FindingKey {
-                                rule: rule.name,
-                                span,
-                                steps: steps.clone(),
+                            if *total_decode_output_bytes
+                                >= engine.tuning.max_total_decode_output_bytes
+                            {
+                                return found_any;
+                            }
+
+                            let remaining = engine
+                                .tuning
+                                .max_total_decode_output_bytes
+                                .saturating_sub(*total_decode_output_bytes);
+                            if remaining == 0 {
+                                return found_any;
+                            }
+                            let max_out = engine
+                                .tuning
+                                .max_utf16_decoded_bytes_per_window
+                                .min(remaining);
+
+                            let decoded = match variant {
+                                Variant::Utf16Le => {
+                                    decode_utf16le_to_vec(&buf[decode_start..w.end], max_out)
+                                }
+                                Variant::Utf16Be => {
+                                    decode_utf16be_to_vec(&buf[decode_start..w.end], max_out)
+                                }
+                                _ => unreachable!(),
+                            };
+
+                            let decoded = match decoded {
+                                Ok(bytes) => bytes,
+                                Err(_) => continue,
+                            };
+
+                            if decoded.is_empty() {
+                                continue;
+                            }
+
+                            *total_decode_output_bytes =
+                                total_decode_output_bytes.saturating_add(decoded.len());
+                            if *total_decode_output_bytes
+                                > engine.tuning.max_total_decode_output_bytes
+                            {
+                                return found_any;
+                            }
+
+                            let mut steps = steps.to_vec();
+                            steps.push(StepKind::Utf16 {
+                                le: matches!(variant, Variant::Utf16Le),
                             });
-                            found_any = true;
+
+                            for caps in rule.re.captures_iter(&decoded) {
+                                let full_match = caps.get(0).expect("group 0 always exists");
+                                if let Some(spec) = rule.entropy.as_ref() {
+                                    let ent = EntropyCompiled {
+                                        min_bits_per_byte: spec.min_bits_per_byte,
+                                        min_len: spec.min_len,
+                                        max_len: spec.max_len,
+                                    };
+                                    let span = full_match.start()..full_match.end();
+                                    let mbytes = &decoded[span];
+                                    if !entropy_gate_passes(
+                                        &ent,
+                                        mbytes,
+                                        entropy_scratch,
+                                        &engine.entropy_log2,
+                                    ) {
+                                        continue;
+                                    }
+                                }
+                                // Extract secret span to match production behavior.
+                                let (secret_start, secret_end) =
+                                    extract_secret_span(&caps, rule.secret_group);
+                                let span = secret_start..secret_end;
+                                out.insert(FindingKey {
+                                    rule: rule.name,
+                                    span,
+                                    steps: steps.clone(),
+                                });
+                                found_any = true;
+                            }
                         }
                     }
                 }
