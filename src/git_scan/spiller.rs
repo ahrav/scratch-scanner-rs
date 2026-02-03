@@ -262,9 +262,11 @@ impl Spiller {
                     canonical_path = Some(cand.path);
                 }
                 Some(oid) if oid != cand.oid => {
-                    let ctx = canonical_ctx.expect("canonical ctx missing");
-                    let path = canonical_path.expect("canonical path missing");
-                    self.push_unique(&mut batch, oid, ctx, path, stats, seen_store, sink)?;
+                    let best_ctx = canonical_ctx.expect("canonical ctx missing");
+                    let best_path = canonical_path.expect("canonical path missing");
+                    self.push_unique(
+                        &mut batch, oid, best_ctx, best_path, stats, seen_store, sink,
+                    )?;
                     current_oid = Some(cand.oid);
                     canonical_ctx = Some(ctx);
                     canonical_path = Some(cand.path);
