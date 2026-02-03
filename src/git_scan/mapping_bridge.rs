@@ -2,7 +2,11 @@
 //!
 //! The bridge re-interns path bytes into a long-lived `ByteArena`, enforces
 //! sorted unique input, and maps each blob to a pack offset via the MIDX
-//! or emits it as a loose candidate.
+//! or emits it as a loose candidate. All emitted candidates reference the
+//! bridge-owned arena, so callers must keep it alive for downstream use.
+//!
+//! This stage is typically driven by the spill/unique-blob output, which
+//! guarantees sorted OIDs.
 
 use std::cmp::Ordering;
 
@@ -33,6 +37,9 @@ impl Default for MappingBridgeConfig {
 }
 
 /// Mapping statistics.
+///
+/// `unique_blobs_in` should equal `packed_matched + loose_unmatched` after
+/// a successful `finish`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MappingStats {
     /// Total unique blobs processed.
@@ -48,6 +55,11 @@ pub struct MappingStats {
 /// Paths are re-interned into the bridge's arena so downstream stages can
 /// hold stable `ByteRef` values. The input stream must be strictly sorted
 /// by OID and contain no duplicates.
+///
+/// # Errors
+/// - `SpillError::PathTooLong` if a path exceeds `ByteRef::MAX_LEN`.
+/// - `SpillError::ArenaOverflow` if the bridge path arena fills up.
+/// - `SpillError::MidxError` for MIDX lookup or ordering violations.
 pub struct MappingBridge<'midx, S: PackCandidateSink> {
     midx: &'midx MidxView<'midx>,
     sink: S,
@@ -58,6 +70,8 @@ pub struct MappingBridge<'midx, S: PackCandidateSink> {
 
 impl<'midx, S: PackCandidateSink> MappingBridge<'midx, S> {
     /// Creates a new mapping bridge.
+    ///
+    /// The internal path arena uses `config.path_arena_capacity`.
     #[must_use]
     pub fn new(midx: &'midx MidxView<'midx>, sink: S, config: MappingBridgeConfig) -> Self {
         Self {
@@ -85,6 +99,9 @@ impl<'midx, S: PackCandidateSink> MappingBridge<'midx, S> {
     ///
     /// This does not call `sink.finish()`. Callers should invoke the sink
     /// finish via the `UniqueBlobSink` trait before consuming the bridge.
+    ///
+    /// # Errors
+    /// Returns `SpillError::MidxError` if internal stats are inconsistent.
     pub fn finish(self) -> Result<(MappingStats, S, ByteArena), SpillError> {
         let total = self.stats.packed_matched + self.stats.loose_unmatched;
         if total != self.stats.unique_blobs_in {
@@ -95,6 +112,7 @@ impl<'midx, S: PackCandidateSink> MappingBridge<'midx, S> {
         Ok((self.stats, self.sink, self.path_arena))
     }
 
+    /// Ensures strictly increasing OID order and rejects duplicates.
     fn ensure_sorted(&mut self, oid: OidBytes) -> Result<(), SpillError> {
         if let Some(last) = self.last_oid {
             match oid.cmp(&last) {
@@ -107,6 +125,7 @@ impl<'midx, S: PackCandidateSink> MappingBridge<'midx, S> {
         Ok(())
     }
 
+    /// Re-interns a path from a source arena into the bridge arena.
     fn intern_path(&mut self, paths: &ByteArena, path_ref: ByteRef) -> Result<ByteRef, SpillError> {
         let path = paths.get(path_ref);
         if path.is_empty() {

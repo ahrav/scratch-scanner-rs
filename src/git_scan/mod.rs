@@ -15,6 +15,7 @@
 //! 4. `tree_diff` extracts candidate blobs and paths.
 //! 5. `spill` dedupes and filters candidates against the seen store.
 //! 6. `mapping_bridge` maps unique blobs to pack/loose candidates.
+//! 7. `pack_plan` builds per-pack decode plans from pack candidates.
 //!
 //! # Invariants
 //! - No blob reads (metadata only).
@@ -33,6 +34,8 @@ pub mod object_id;
 pub mod object_store;
 pub mod pack_candidates;
 pub mod pack_inflate;
+pub mod pack_plan;
+pub mod pack_plan_model;
 pub mod path_policy;
 pub mod persist_rocksdb;
 pub mod policy_hash;
@@ -75,6 +78,11 @@ pub use object_id::{ObjectFormat, OidBytes};
 pub use object_store::{ObjectStore, TreeSource};
 pub use pack_candidates::{
     CollectingPackCandidateSink, LooseCandidate, PackCandidate, PackCandidateSink,
+};
+pub use pack_plan::{build_pack_plans, OidResolver, PackPlanConfig, PackPlanError, PackView};
+pub use pack_plan_model::{
+    BaseLoc, CandidateAtOffset, Cluster, DeltaDep, DeltaKind, PackPlan, PackPlanStats,
+    CLUSTER_GAP_BYTES,
 };
 pub use path_policy::PathClass;
 pub use policy_hash::{policy_hash, MergeDiffMode, PolicyHash};

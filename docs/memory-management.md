@@ -102,6 +102,28 @@ Seen filtering uses a per-batch arena capped by `SpillLimits.seen_batch_max_path
 and batches up to `SpillLimits.seen_batch_max_oids` OIDs before issuing a
 seen-store query. Batches are flushed on either limit to keep memory bounded.
 
+## Git Pack Planning Budgets
+
+Pack planning builds per-pack `PackPlan` buffers sized to the candidate set
+and the delta-base closure:
+
+- Candidate list: one `PackCandidate` per packed blob.
+- Candidate offsets: one `CandidateAtOffset` per candidate (sorted by offset).
+- Need offsets: unique `u64` offsets for candidates plus pack-local bases,
+  expanded up to `PackPlanConfig.max_delta_depth` and capped by
+  `PackPlanConfig.max_worklist_entries`.
+- Delta deps: one `DeltaDep` per delta entry in `need_offsets` (records
+  internal base offsets or external base OIDs).
+- Entry header cache: one cached `ParsedEntry` per offset in `need_offsets`
+  during planning, bounded by the same worklist cap.
+- Exec order: optional `Vec<u32>` of indices into `need_offsets` when forward
+  dependencies exist.
+- Clusters: ranges over `need_offsets` split when gaps exceed
+  `CLUSTER_GAP_BYTES`.
+
+Memory is linear in `candidates.len()` + `need_offsets.len()` with explicit
+caps on closure expansion and header parsing.
+
 ## Single-Threaded Pipeline Memory Model
 
 > **Note**: The diagrams below describe the single-threaded `Pipeline` API, which uses

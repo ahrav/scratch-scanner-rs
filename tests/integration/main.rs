@@ -5,6 +5,7 @@
 mod anchor_optimization;
 mod git_commit_walk;
 mod git_mapping_bridge;
+mod git_pack_plan;
 mod git_preflight;
 mod git_repo_open;
 mod git_run_format;
