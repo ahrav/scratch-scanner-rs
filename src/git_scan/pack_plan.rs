@@ -496,6 +496,8 @@ fn build_exec_order(
     delta_deps: &[DeltaDep],
     pack_id: u16,
 ) -> Result<Option<Vec<u32>>, PackPlanError> {
+    // If all delta bases are at offsets <= their dependents, natural
+    // `need_offsets` order already respects dependencies.
     if need_offsets.is_empty() {
         return Ok(None);
     }
@@ -565,6 +567,7 @@ fn build_exec_order(
 }
 
 fn cluster_offsets(need_offsets: &[u64]) -> Vec<Cluster> {
+    // Split into clusters to limit seek gaps during pack reads.
     if need_offsets.is_empty() {
         return Vec::new();
     }
