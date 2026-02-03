@@ -188,12 +188,13 @@ Impact: Possible syscall reduction, but increased ring complexity.
 
 Work units:
 
-- [ ] Validate the reasoning by confirming baseline open/stat syscall counts and ring overhead.
-- [ ] If the reasoning does not hold, document and defer.
-- [ ] Draft an evidence-backed plan that estimates net win and complexity cost.
-- [ ] Implement only if projected wins outweigh complexity and if the `io_uring` path is already production-parity.
-- [ ] Measure syscall deltas and end-to-end throughput impact.
-- [ ] Run doc-rigor on code files changed for this task and update docs/comments as needed.
+- [x] Validate the reasoning by confirming baseline open/stat syscall counts and ring overhead. (Confirmed: `open_file_safe` + `file.metadata()` do blocking `openat`/`fstat`; no ring-based open/stat today.)
+- [x] If the reasoning does not hold, document and defer. (Reasoning holds.)
+- [x] Draft an evidence-backed plan that estimates net win and complexity cost. Plan: add optional `IORING_OP_OPENAT` + `IORING_OP_STATX` path in I/O threads, measure `openat/statx` syscall counts vs `io_uring_enter` overhead; only consider if open/stat is a significant share on tiny-file workloads.
+- [x] Document the detailed design plan and fallback semantics. See `docs/io-uring-open-statx-plan.md`.
+- [ ] Implement only if projected wins outweigh complexity and if the `io_uring` path is already production-parity. (Deferred: parity measurement still pending.)
+- [ ] Measure syscall deltas and end-to-end throughput impact. (Requires Linux `io_uring` run.)
+- [x] Run doc-rigor on code files changed for this task and update docs/comments as needed. (No code changes in this step.)
 
 ## Harness Coverage Gaps And Work Units
 
