@@ -4,6 +4,11 @@
 //! when limits are exceeded, and emits globally sorted unique blobs after
 //! seen-store filtering.
 //!
+//! Run files are written in a canonical ordering (OID, path bytes, commit id,
+//! parent index, change kind, context flags, candidate flags). Canonical
+//! selection for a given OID uses a different priority (see
+//! `is_more_canonical`) but does not depend on run ordering.
+//!
 //! # Workflow
 //! - Accumulate candidates into a `CandidateChunk`.
 //! - On overflow, sort+dedupe and write a run to disk.
@@ -32,6 +37,9 @@ use super::unique_blob::{UniqueBlob, UniqueBlobSink};
 const IO_BUFFER_SIZE: usize = 256 * 1024;
 
 /// Statistics from spill + seen filtering.
+///
+/// Counts are derived after global dedupe. `unique_blobs` counts distinct OIDs
+/// before seen-store filtering; `emitted_blobs` counts those that were unseen.
 #[derive(Debug, Clone, Default)]
 pub struct SpillStats {
     /// Total candidates received.
@@ -50,7 +58,8 @@ pub struct SpillStats {
 
 /// Orchestrates spill runs and merge/dedupe.
 ///
-/// The spiller is single-threaded and owns the temporary spill files.
+/// The spiller is single-threaded and owns the temporary spill files. All run
+/// files are deleted on drop, even if `finalize` fails.
 #[derive(Debug)]
 pub struct Spiller {
     limits: SpillLimits,
@@ -66,6 +75,10 @@ impl Spiller {
     /// Creates a new spiller for a repository job.
     ///
     /// The spill directory is created if it does not exist.
+    ///
+    /// # Errors
+    /// - Returns `SpillError::OidLengthMismatch` if `oid_len` is not 20 or 32.
+    /// - Propagates I/O errors from creating the spill directory.
     pub fn new(limits: SpillLimits, oid_len: u8, spill_dir: &Path) -> Result<Self, SpillError> {
         limits.validate();
         if oid_len != 20 && oid_len != 32 {
@@ -89,6 +102,11 @@ impl Spiller {
     /// Pushes a candidate, spilling the chunk if required.
     ///
     /// If the chunk is full, this spills the current chunk and retries once.
+    /// The `candidates_received` counter is incremented only on success.
+    ///
+    /// # Errors
+    /// Returns the same errors as `CandidateChunk::push`, plus any spill I/O
+    /// errors if a spill is required.
     #[allow(clippy::too_many_arguments)]
     pub fn push(
         &mut self,
@@ -134,6 +152,11 @@ impl Spiller {
     /// Spills the current chunk to disk if it contains data.
     ///
     /// This writes a sorted, deduped run file and updates the spill byte budget.
+    ///
+    /// # Errors
+    /// - `SpillError::SpillRunLimitExceeded` if the run count limit is reached.
+    /// - `SpillError::SpillBytesExceeded` if total spill bytes exceed the limit.
+    /// - Propagates I/O errors when creating or writing the run file.
     pub fn spill_chunk(&mut self) -> Result<(), SpillError> {
         if self.chunk.is_empty() {
             return Ok(());
@@ -178,6 +201,9 @@ impl Spiller {
     }
 
     /// Finalizes spill processing, emitting unseen unique blobs to the sink.
+    ///
+    /// On success, all temporary run files are deleted. On error, cleanup
+    /// happens via `Drop` (best-effort).
     pub fn finalize<S: SeenBlobStore, B: UniqueBlobSink>(
         mut self,
         seen_store: &S,
@@ -207,6 +233,11 @@ impl Spiller {
         Ok(stats)
     }
 
+    /// Processes a single in-memory chunk without on-disk runs.
+    ///
+    /// The chunk must already be sorted and deduped. For each OID, the
+    /// canonical context is selected and then checked against the seen store
+    /// in bounded batches.
     fn process_chunk_only<S: SeenBlobStore, B: UniqueBlobSink>(
         &self,
         seen_store: &S,
@@ -263,6 +294,10 @@ impl Spiller {
         Ok(())
     }
 
+    /// Processes on-disk runs by merging and deduping across runs.
+    ///
+    /// For each OID, selects the canonical record and batches seen-store
+    /// lookups. Run files must already be sorted by canonical run order.
     fn process_with_merge<S: SeenBlobStore, B: UniqueBlobSink>(
         &self,
         seen_store: &S,
@@ -324,6 +359,12 @@ impl Spiller {
         Ok(())
     }
 
+    /// Adds a unique OID to the pending seen-store batch.
+    ///
+    /// Flushes the batch when it would exceed the OID or path arena limits.
+    ///
+    /// # Errors
+    /// Propagates errors from flushing or pushing into the batch.
     #[allow(clippy::too_many_arguments)]
     fn push_unique<S: SeenBlobStore, B: UniqueBlobSink>(
         &self,
@@ -352,6 +393,12 @@ impl Spiller {
         Ok(())
     }
 
+    /// Flushes a batch: queries the seen store and emits unseen blobs.
+    ///
+    /// # Errors
+    /// - `SpillError::SeenResponseMismatch` if the seen store returns a
+    ///   mismatched number of flags.
+    /// - Propagates errors from the seen store or sink.
     fn flush_batch<S: SeenBlobStore, B: UniqueBlobSink>(
         &self,
         batch: &BatchBuffer,
@@ -383,6 +430,7 @@ impl Spiller {
         Ok(())
     }
 
+    /// Best-effort removal of temporary run files.
     fn cleanup_runs(&mut self) {
         for path in self.runs.drain(..) {
             let _ = fs::remove_file(path);
@@ -396,6 +444,7 @@ impl Drop for Spiller {
     }
 }
 
+/// Drops the path reference and yields the run context for a candidate.
 fn resolved_to_context(cand: &ResolvedCandidate<'_>) -> RunContext {
     RunContext {
         commit_id: cand.commit_id,
@@ -443,6 +492,12 @@ fn is_more_canonical(a_ctx: RunContext, a_path: &[u8], b_ctx: RunContext, b_path
 /// Batch buffer for seen-store queries.
 ///
 /// Stores sorted unique OIDs plus interned paths in a bounded arena.
+/// Bounded batch of unique blobs for seen-store queries.
+///
+/// # Invariants
+/// - OIDs are appended in non-decreasing order.
+/// - `blobs.len() == oids.len()`.
+/// - `path_ref` values point into `path_arena` and are invalid after `clear`.
 struct BatchBuffer {
     oids: Vec<OidBytes>,
     blobs: Vec<UniqueBlob>,
@@ -452,6 +507,7 @@ struct BatchBuffer {
 }
 
 impl BatchBuffer {
+    /// Creates an empty batch buffer with preallocated capacities.
     fn new(max_oids: usize, max_path_bytes: u32) -> Self {
         Self {
             oids: Vec::with_capacity(max_oids),
@@ -462,34 +518,46 @@ impl BatchBuffer {
         }
     }
 
+    /// Returns the number of queued OIDs.
     fn len(&self) -> usize {
         self.oids.len()
     }
 
+    /// Returns true if the batch is empty.
     fn is_empty(&self) -> bool {
         self.oids.is_empty()
     }
 
+    /// Returns the maximum OIDs allowed per batch.
     fn max_oids(&self) -> usize {
         self.max_oids
     }
 
+    /// Returns the OIDs in insertion order (sorted).
     fn oids(&self) -> &[OidBytes] {
         &self.oids
     }
 
+    /// Returns the unique blobs aligned with `oids`.
     fn blobs(&self) -> &[UniqueBlob] {
         &self.blobs
     }
 
+    /// Returns the arena holding path bytes for this batch.
     fn paths(&self) -> &ByteArena {
         &self.path_arena
     }
 
+    /// Returns true if the batch can accommodate another OID and path.
     fn can_fit(&self, path_len: usize) -> bool {
         self.oids.len() < self.max_oids && self.path_arena.remaining() as usize >= path_len
     }
 
+    /// Pushes a new unique blob into the batch.
+    ///
+    /// # Errors
+    /// - `SpillError::ArenaOverflow` if the batch or path arena is full.
+    /// - `SpillError::PathTooLong` if the path exceeds `ByteRef::MAX_LEN`.
     fn push(&mut self, oid: OidBytes, ctx: RunContext, path: &[u8]) -> Result<(), SpillError> {
         debug_assert!(
             self.oids.last().map(|prev| prev <= &oid).unwrap_or(true),
@@ -501,6 +569,7 @@ impl BatchBuffer {
         }
 
         let path_ref = if path.is_empty() {
+            // Avoid interning empty paths; treat as a zero-length ref.
             ByteRef::new(0, 0)
         } else if path.len() > ByteRef::MAX_LEN as usize {
             return Err(SpillError::PathTooLong {
@@ -527,6 +596,9 @@ impl BatchBuffer {
         Ok(())
     }
 
+    /// Clears the batch and resets the path arena, retaining capacity.
+    ///
+    /// Any previously returned `ByteRef` values become invalid.
     fn clear(&mut self) {
         self.oids.clear();
         self.blobs.clear();
