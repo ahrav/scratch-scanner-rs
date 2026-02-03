@@ -223,36 +223,82 @@ fn find_base64_spans_reference(
         return spans;
     }
 
+    // Mirror the production span finder semantics, including padding handling.
     let mut i = 0usize;
+    let mut in_run = false;
+    let mut start = 0usize;
+    let mut run_len = 0usize;
+    let mut b64_chars = 0usize;
+    let mut have_b64 = false;
+    let mut last_b64 = 0usize;
+
     while i < hay.len() && spans.len() < max_spans {
-        while i < hay.len() && !is_b64_or_ws_ref(hay[i], allow_space_ws) {
-            i += 1;
-        }
-        if i >= hay.len() {
-            break;
-        }
+        let b = hay[i];
+        let allowed = is_b64_or_ws_ref(b, allow_space_ws);
 
-        let start = i;
-        let mut b64_chars = 0usize;
-        let mut last_b64 = None::<usize>;
-
-        while i < hay.len() && (i - start) < max_len {
-            let b = hay[i];
-            if !is_b64_or_ws_ref(b, allow_space_ws) {
-                break;
+        if !in_run {
+            if !allowed {
+                i += 1;
+                continue;
             }
+            in_run = true;
+            start = i;
+            run_len = 0;
+            b64_chars = 0;
+            have_b64 = false;
+        }
+
+        if allowed {
+            run_len += 1;
             if is_b64_char_ref(b) {
+                if b == b'=' {
+                    if have_b64 {
+                        let mut pad_end = i;
+                        if i + 1 < hay.len() && hay[i + 1] == b'=' {
+                            pad_end = i + 1;
+                            i += 1;
+                        }
+                        last_b64 = pad_end;
+                        if b64_chars >= min_chars {
+                            spans.push(start..(last_b64 + 1));
+                            if spans.len() >= max_spans {
+                                return spans;
+                            }
+                        }
+                    }
+                    in_run = false;
+                    i += 1;
+                    continue;
+                }
                 b64_chars += 1;
-                last_b64 = Some(i);
+                last_b64 = i;
+                have_b64 = true;
             }
             i += 1;
-        }
 
-        if b64_chars >= min_chars {
-            if let Some(last) = last_b64 {
-                spans.push(start..(last + 1));
+            if run_len >= max_len {
+                if have_b64 && b64_chars >= min_chars {
+                    spans.push(start..(last_b64 + 1));
+                    if spans.len() >= max_spans {
+                        return spans;
+                    }
+                }
+                in_run = false;
             }
+        } else {
+            if have_b64 && b64_chars >= min_chars {
+                spans.push(start..(last_b64 + 1));
+                if spans.len() >= max_spans {
+                    return spans;
+                }
+            }
+            in_run = false;
+            i += 1;
         }
+    }
+
+    if in_run && have_b64 && b64_chars >= min_chars && spans.len() < max_spans {
+        spans.push(start..(last_b64 + 1));
     }
 
     spans
