@@ -103,6 +103,7 @@ graph TB
 | **RepoJobState**    | `src/git_scan/repo_open.rs`    | Bundled repo metadata for downstream Git scan phases                 |
 | **StartSetId**      | `src/git_scan/start_set.rs`    | Deterministic identity for start set configuration                   |
 | **Watermark Keys**  | `src/git_scan/watermark_keys.rs` | Stable ref watermark key/value encoding                            |
+| **Policy Hash**     | `src/git_scan/policy_hash.rs`  | Canonical BLAKE3 identity over rules, transforms, and tuning         |
 
 ## Git Scanning Preflight
 
@@ -117,6 +118,15 @@ commit-graph and MIDX presence, and memory-maps those artifacts when ready.
 It also resolves the start set refs (via `StartSetResolver`) and loads per-ref
 watermarks from `RefWatermarkStore` using the `StartSetId` and policy hash.
 The resulting `RepoJobState` is the metadata contract for later Git phases.
+
+## Git Policy Hash
+
+The policy hash is a canonical BLAKE3 identity over:
+- Rule specs (canonicalized and order-invariant)
+- Transform configs (order-preserving)
+- Tuning parameters
+- Merge diff mode
+- Path policy version
 
 ## Testing Harnesses
 
