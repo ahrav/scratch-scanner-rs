@@ -18,6 +18,7 @@
 //! - Monotonic progress: chunk offsets and prefix boundaries never move backward.
 //! - Overlap dedupe: no finding may be entirely contained in the overlap prefix.
 //! - Duplicate suppression: emitted findings are unique under a normalized key.
+//! - In-flight budget: file-task permits never exceed `max_in_flight_objects`.
 //! - Ground-truth: expected secrets are found (for fully observed files),
 //!   and no unexpected findings appear.
 //! - Differential: chunked results match a single-chunk scan over the observed
@@ -193,6 +194,9 @@ impl ScannerSimRunner {
         let mut clock = SimClock::new();
         let mut faults = FaultInjector::new(fault_plan.clone());
         let mut io_waiters: BTreeMap<u64, Vec<SimTaskId>> = BTreeMap::new();
+        // Track file-task permits to mirror discovery backpressure invariants.
+        let mut in_flight_objects: u32 = 0;
+        let mut max_seen_in_flight: u32 = 0;
 
         let discover = DiscoverState::new(files.clone());
         let discover_id = executor.spawn_external(SimTask {
@@ -276,6 +280,14 @@ impl ScannerSimRunner {
                         match outcome {
                             FileStepOutcome::Done => {
                                 executor.mark_completed(task_id);
+                                if in_flight_objects == 0 {
+                                    return self.fail(
+                                        FailureKind::InvariantViolation { code: 30 },
+                                        "in-flight underflow on file completion",
+                                        step,
+                                    );
+                                }
+                                in_flight_objects -= 1;
                             }
                             FileStepOutcome::Reschedule => {
                                 executor.mark_runnable(task_id);
@@ -313,10 +325,35 @@ impl ScannerSimRunner {
                         spawned_id,
                         ScannerTask::FileScan(Box::new(state)),
                     );
+
+                    in_flight_objects = match in_flight_objects.checked_add(1) {
+                        Some(next) => next,
+                        None => {
+                            return self.fail(
+                                FailureKind::InvariantViolation { code: 32 },
+                                "in-flight counter overflow",
+                                step,
+                            );
+                        }
+                    };
+                    if in_flight_objects > max_seen_in_flight {
+                        max_seen_in_flight = in_flight_objects;
+                    }
                 }
 
                 executor.mark_completed(task_id);
                 executor.remove_from_queues(task_id);
+            }
+
+            if in_flight_objects > self.cfg.max_in_flight_objects {
+                return self.fail(
+                    FailureKind::InvariantViolation { code: 31 },
+                    &format!(
+                        "in-flight budget exceeded: current {} > max {} (max_seen {})",
+                        in_flight_objects, self.cfg.max_in_flight_objects, max_seen_in_flight
+                    ),
+                    step,
+                );
             }
         }
 
