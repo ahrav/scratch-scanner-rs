@@ -440,6 +440,7 @@ fn parse_entry<R: OidResolver>(
         Err(PackParseError::OffsetOutOfRange(_)) if is_candidate => {
             return Err(PackPlanError::CandidateOffsetOutOfRange { pack_id, offset })
         }
+        // Base offsets outside the pack are treated as pack corruption.
         Err(err) => return Err(PackPlanError::PackParse(err)),
     };
 

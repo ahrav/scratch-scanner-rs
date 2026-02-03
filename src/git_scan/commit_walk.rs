@@ -296,7 +296,6 @@ impl Default for ParentScratch {
 /// when multiple refs overlap.
 pub struct VisitedCommitBitset {
     words: Vec<u64>,
-    #[cfg(debug_assertions)]
     capacity: u32,
 }
 
@@ -307,7 +306,6 @@ impl VisitedCommitBitset {
         let word_count = n.div_ceil(64);
         Self {
             words: vec![0u64; word_count],
-            #[cfg(debug_assertions)]
             capacity: num_commits,
         }
     }
@@ -579,6 +577,8 @@ impl<'a, CG: CommitGraph> CommitPlanIter<'a, CG> {
     }
 
     /// Creates a new iterator from an explicit ref slice.
+    ///
+    /// Refs are processed in the given order to keep output deterministic.
     pub fn new_from_refs(
         refs: &'a [StartSetRef],
         cg: &'a CG,
@@ -794,6 +794,7 @@ impl<CG: CommitGraph> Iterator for CommitPlanIter<'_, CG> {
                     }));
                 }
 
+                // Only emit if this commit was not already emitted by a prior ref.
                 if !self.visited.test_and_set(pos) {
                     continue;
                 }

@@ -111,6 +111,9 @@ graph TB
 | **MIDX Mapping**    | `src/git_scan/midx.rs`, `src/git_scan/mapping_bridge.rs` | MIDX parsing and blob-to-pack mapping                     |
 | **Tree Diff Walker** | `src/git_scan/tree_diff.rs` | OID-only tree diffs that emit candidate blobs with context          |
 | **Pack Executor**   | `src/git_scan/pack_exec.rs` | Executes pack plans to decode candidate blobs with bounded buffers |
+| **Pack I/O**        | `src/git_scan/pack_io.rs` | MIDX-backed pack mmap loader for cross-pack REF delta bases |
+| **Pack Strategy**   | `src/git_scan/pack_strategy.rs` | Chooses sparse vs pack-linear execution from plan stats |
+| **Pack AMQ Filter** | `src/git_scan/pack_amq.rs` | Approximate membership filter for pack-linear candidate gating |
 | **Path Policy**     | `src/git_scan/path_policy.rs` | Fast path classification for candidate flags                         |
 | **Spill Limits**    | `src/git_scan/spill_limits.rs` | Hard caps for spill chunk sizing and on-disk run growth             |
 | **CandidateChunk**  | `src/git_scan/spill_chunk.rs` | Bounded candidate buffer + path arena with in-chunk dedupe          |

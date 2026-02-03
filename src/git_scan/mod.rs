@@ -32,14 +32,17 @@ pub mod midx;
 pub mod midx_error;
 pub mod object_id;
 pub mod object_store;
+pub mod pack_amq;
 pub mod pack_cache;
 pub mod pack_candidates;
 pub mod pack_decode;
 pub mod pack_delta;
 pub mod pack_exec;
 pub mod pack_inflate;
+pub mod pack_io;
 pub mod pack_plan;
 pub mod pack_plan_model;
+pub mod pack_strategy;
 pub mod path_policy;
 pub mod persist_rocksdb;
 pub mod policy_hash;
@@ -80,6 +83,7 @@ pub use mapping_bridge::{MappingBridge, MappingBridgeConfig, MappingStats};
 pub use midx::MidxView;
 pub use object_id::{ObjectFormat, OidBytes};
 pub use object_store::{ObjectStore, TreeSource};
+pub use pack_amq::PackAmq;
 pub use pack_cache::{CachedObject, PackCache};
 pub use pack_candidates::{
     CollectingPackCandidateSink, LooseCandidate, PackCandidate, PackCandidateSink,
@@ -87,14 +91,16 @@ pub use pack_candidates::{
 pub use pack_decode::{entry_header_at, inflate_entry_payload, PackDecodeError, PackDecodeLimits};
 pub use pack_delta::{apply_delta, DeltaError};
 pub use pack_exec::{
-    execute_pack_plan, ExternalBase, ExternalBaseProvider, PackExecError, PackExecReport,
-    PackExecStats, PackObjectSink, SkipReason, SkipRecord,
+    execute_pack_plan, execute_pack_plan_with_strategy, ExternalBase, ExternalBaseProvider,
+    PackExecError, PackExecReport, PackExecStats, PackObjectSink, SkipReason, SkipRecord,
 };
+pub use pack_io::{PackIo, PackIoError, PackIoLimits};
 pub use pack_plan::{build_pack_plans, OidResolver, PackPlanConfig, PackPlanError, PackView};
 pub use pack_plan_model::{
     BaseLoc, CandidateAtOffset, Cluster, DeltaDep, DeltaKind, PackPlan, PackPlanStats,
     CLUSTER_GAP_BYTES,
 };
+pub use pack_strategy::{cluster_offsets, select_pack_strategy, PackStrategy};
 pub use path_policy::PathClass;
 pub use policy_hash::{policy_hash, MergeDiffMode, PolicyHash};
 pub use preflight::{preflight, ArtifactPaths, ArtifactStatus, PreflightReport};

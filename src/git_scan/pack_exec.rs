@@ -21,6 +21,7 @@ use super::pack_decode::{
 use super::pack_delta::apply_delta;
 use super::pack_inflate::{DeltaError, EntryKind, ObjectKind, PackFile, PackParseError};
 use super::pack_plan_model::{BaseLoc, DeltaDep, PackPlan};
+use super::pack_strategy::PackStrategy;
 
 /// External base object for REF deltas.
 ///
@@ -134,11 +135,13 @@ pub struct PackExecReport {
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Where the decoded bytes live after `decode_offset`.
 enum DecodedStorage {
     Cache,
     Scratch,
 }
 
+/// Metadata for a decoded offset (kind + storage location).
 #[derive(Clone, Copy, Debug)]
 struct DecodedObject {
     kind: ObjectKind,
@@ -163,6 +166,34 @@ pub fn execute_pack_plan<S: PackObjectSink, B: ExternalBaseProvider>(
     external: &mut B,
     sink: &mut S,
 ) -> Result<PackExecReport, PackExecError> {
+    execute_pack_plan_with_strategy(
+        plan,
+        pack_bytes,
+        paths,
+        limits,
+        cache,
+        external,
+        sink,
+        PackStrategy::Sparse,
+    )
+}
+
+/// Executes a pack plan with an explicit strategy.
+///
+/// `PackStrategy::Sparse` respects `plan.exec_order` when present. Linear
+/// mode enforces pack-order execution and should only be used when the plan
+/// has no forward dependencies.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_pack_plan_with_strategy<S: PackObjectSink, B: ExternalBaseProvider>(
+    plan: &PackPlan,
+    pack_bytes: &[u8],
+    paths: &ByteArena,
+    limits: &PackDecodeLimits,
+    cache: &mut PackCache,
+    external: &mut B,
+    sink: &mut S,
+    strategy: PackStrategy,
+) -> Result<PackExecReport, PackExecError> {
     let pack = PackFile::parse(pack_bytes, plan.oid_len as usize)?;
     let mut report = PackExecReport::default();
 
@@ -186,11 +217,7 @@ pub fn execute_pack_plan<S: PackObjectSink, B: ExternalBaseProvider>(
         }
     }
 
-    let indices: Vec<usize> = if let Some(order) = &plan.exec_order {
-        order.iter().map(|&idx| idx as usize).collect()
-    } else {
-        (0..plan.need_offsets.len()).collect()
-    };
+    let indices = execution_indices(plan, strategy);
 
     let mut inflate_buf: Vec<u8> = Vec::with_capacity(limits.max_delta_bytes.max(1024));
     let mut result_buf: Vec<u8> = Vec::with_capacity(limits.max_object_bytes.max(1024));
@@ -252,6 +279,17 @@ pub fn execute_pack_plan<S: PackObjectSink, B: ExternalBaseProvider>(
 
     sink.finish()?;
     Ok(report)
+}
+
+fn execution_indices(plan: &PackPlan, strategy: PackStrategy) -> Vec<usize> {
+    match strategy {
+        PackStrategy::Sparse => plan
+            .exec_order
+            .as_ref()
+            .map(|order| order.iter().map(|&idx| idx as usize).collect())
+            .unwrap_or_else(|| (0..plan.need_offsets.len()).collect()),
+        PackStrategy::Linear => (0..plan.need_offsets.len()).collect(),
+    }
 }
 
 /// Decodes a single offset, using the cache for bases and for storing results.
