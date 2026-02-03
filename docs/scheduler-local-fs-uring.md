@@ -315,7 +315,7 @@ pub struct LocalFsUringConfig {
 
     // I/O tuning
     pub ring_entries: u32,               // SQ/CQ size (e.g., 256)
-    pub io_depth: usize,                 // Max concurrent reads per thread (e.g., 128)
+    pub io_depth: usize,                 // Max concurrent ops per thread (reads + open/stat)
 
     // Memory and chunking
     pub chunk_size: usize,               // Payload bytes per chunk (e.g., 256 KB)
@@ -323,6 +323,8 @@ pub struct LocalFsUringConfig {
     pub file_queue_cap: usize,           // Bounded channel size: discovery → I/O
     pub pool_buffers: usize,             // Total buffers in global pool
     pub use_registered_buffers: bool,    // Use READ_FIXED (registered buffers)
+    pub open_stat_mode: OpenStatMode,    // io_uring open/stat vs blocking
+    pub resolve_policy: ResolvePolicy,   // openat2 resolve policy (Linux)
 
     // Safety options
     pub follow_symlinks: bool,           // O_NOFOLLOW if false
@@ -334,6 +336,10 @@ pub struct LocalFsUringConfig {
 }
 ```
 
+Open/stat controls:
+- `open_stat_mode`: `UringPreferred` (default), `BlockingOnly`, or `UringRequired`.
+- `resolve_policy`: Only applies to `openat2` when supported. `Default` matches current behavior; `NoSymlinks` and `BeneathRoot` are opt-in.
+
 ### Default Configuration
 
 ```rust
@@ -342,12 +348,14 @@ pub fn default() -> Self {
         cpu_workers: 8,                  // 8 CPU threads for scanning
         io_threads: 4,                   // 4 I/O threads with io_uring
         ring_entries: 256,               // SQ+CQ capacity
-        io_depth: 128,                   // Up to 128 concurrent reads per I/O thread
+        io_depth: 128,                   // Up to 128 concurrent ops per I/O thread
         chunk_size: 256 * 1024,          // 256 KB chunks
         max_in_flight_files: 512,        // Cap on in-flight objects
         file_queue_cap: 256,             // Bounded discovery → I/O queue
         pool_buffers: 256,               // 256 buffers (>= io_threads * io_depth)
         use_registered_buffers: false,   // Off by default
+        open_stat_mode: OpenStatMode::UringPreferred, // io_uring open/stat
+        resolve_policy: ResolvePolicy::Default,       // No extra resolution constraints
         follow_symlinks: false,          // Safe default: O_NOFOLLOW
         max_file_size: None,             // No size filter
         seed: 1,                         // Deterministic executor

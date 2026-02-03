@@ -192,7 +192,7 @@ Work units:
 - [x] If the reasoning does not hold, document and defer. (Reasoning holds.)
 - [x] Draft an evidence-backed plan that estimates net win and complexity cost. Plan: add optional `IORING_OP_OPENAT` + `IORING_OP_STATX` path in I/O threads, measure `openat/statx` syscall counts vs `io_uring_enter` overhead; only consider if open/stat is a significant share on tiny-file workloads.
 - [x] Document the detailed design plan and fallback semantics. See `docs/io-uring-open-statx-plan.md`.
-- [x] Track implementation work units as a checklist in `docs/io-uring-open-statx-plan.md` (Unit 1 complete: config + probe scaffolding + fallback counters + doc-rigor).
+- [x] Track implementation work units as a checklist in `docs/io-uring-open-statx-plan.md` (Units 1–2 complete: config + probe scaffolding + fallback counters + open/stat state machine + doc-rigor).
 - [ ] Implement only if projected wins outweigh complexity and if the `io_uring` path is already production-parity. (Deferred: parity measurement still pending.)
 - [ ] Measure syscall deltas and end-to-end throughput impact. (Requires Linux `io_uring` run.)
 - [x] Run doc-rigor on code files changed for this task and update docs/comments as needed. (No code changes in this step.)
@@ -223,9 +223,28 @@ Work units:
 
 Work units:
 
-- [ ] Define an invariant that in-flight counts remain balanced under size-cap gating.
-- [ ] Add a property test that asserts budgets are conserved across runs with different interleavings.
-- [ ] Validate determinism by re-running with the same seed and comparing traces.
+- [x] Model an explicit in-flight budget in the scanner sim runner (`src/sim_scanner/runner.rs`):
+  - Track `in_flight_objects`, `max_in_flight_objects`, and (optional) `max_seen_in_flight` for diagnostics.
+  - Increment on every file task spawn and enforce `in_flight_objects <= max_in_flight_objects` each step.
+  - Decrement on every terminal path for a file task (`FileStepOutcome::Done`), with underflow checks.
+- [ ] Gate discovery task spawning by the in-flight budget:
+  - Modify `DiscoverState` to spawn only up to available permits and leave the remainder in `state.files`.
+  - If files remain after hitting the cap, reschedule the discover task (mark runnable + enqueue) to continue later.
+  - Ensure deterministic ordering is preserved (still spawn in sorted order).
+- [ ] Ensure size-cap early exits release permits:
+  - Verify `FileScanState::step` returns `Done` when `handle.len > max_file_size`.
+  - Confirm the runner’s `Done` handling releases the permit and never leaks it even when scanning is skipped.
+- [ ] Add end-of-run budget invariant checks in the runner:
+  - Before oracles, assert `in_flight_objects == 0` (no permit leaks).
+  - Keep failure path consistent with existing `FailureKind::InvariantViolation` conventions.
+- [ ] Add a focused simulation test for budget invariance under size-cap gating:
+  - New test file: `tests/simulation/scanner_budget_invariance.rs`.
+  - Use many files (e.g., 16–64) and a tiny `max_in_flight_objects` (1–2) to stress permit reuse.
+  - Set `discovery_len_hint` small but extend actual contents beyond `max_file_size` to force open-time skip.
+  - Run with `stability_runs = 2` (or two explicit schedule seeds) and assert both runs succeed.
+- [ ] Validate determinism:
+  - Ensure the stability comparison passes with identical findings across schedules.
+  - Confirm no hangs or invariant failures occur at high contention.
 - [ ] Run doc-rigor on code files changed for this task and update docs/comments as needed.
 
 ## Benchmark And Evidence Plan

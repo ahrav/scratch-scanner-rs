@@ -51,10 +51,11 @@ use crossbeam_queue::ArrayQueue;
 use io_uring::{opcode, types, IoUring, Probe};
 
 use std::collections::VecDeque;
+use std::ffi::CString;
 use std::fs::{self, File};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -110,7 +111,7 @@ pub struct LocalFsUringConfig {
     /// Number of SQ/CQ entries per io_uring.
     pub ring_entries: u32,
 
-    /// Max in-flight read ops per I/O thread.
+    /// Max in-flight ops per I/O thread (reads + open/stat).
     /// Must be <= ring_entries - 1.
     pub io_depth: usize,
 
@@ -591,30 +592,61 @@ fn cpu_runner<E: ScanEngine>(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScra
 ///
 /// # Invariants
 ///
-/// - `in_flight` is 0 or 1 (we enforce single-chunk-in-flight per file)
+/// - `in_flight` is 0 or 1 (single op in-flight per file)
 /// - `done` is monotonic: once true, never reset to false
 /// - `failed` is monotonic: once true, never reset to false
-/// - `next_offset` only advances, never retreats
+/// - `phase` only moves forward: PendingOpen → PendingStat → ReadyRead
 struct FileState {
-    file: File,
-    size: u64,
-    next_offset: u64,
+    phase: FilePhase,
     in_flight: u32,
     done: bool,
     failed: bool,
     token: Arc<FileToken>,
+}
+
+/// Phase-specific data for a file slot.
+enum FilePhase {
+    /// Path queued for open via io_uring (or fallback).
+    PendingOpen { path: PathBuf },
+    /// File opened; waiting on statx for size snapshot.
+    PendingStat { file: Option<File> },
+    /// Ready for read submissions with size + overlap tracking.
+    Ready(ReadState),
+}
+
+struct ReadState {
+    file: File,
+    size: u64,
+    next_offset: u64,
     overlap_buf: Box<[u8]>,
     overlap_len: usize,
 }
 
-/// Per-read-op state for completion matching.
+/// Per-op state for completion matching.
 ///
 /// # Lifetime Coupling
 ///
-/// The `buf` field's backing memory is referenced by the kernel until the
-/// corresponding CQE is reaped. The `file_slot` keeps the file open.
-/// Both must remain valid until completion.
-struct Op {
+/// - `Open`: path + open_how must live until CQE is reaped
+/// - `Stat`: statx buffer must live until CQE is reaped
+/// - `Read`: buffer must live until CQE is reaped
+enum Op {
+    Open(OpenOp),
+    Stat(StatOp),
+    Read(ReadOp),
+}
+
+struct OpenOp {
+    file_slot: usize,
+    path: CString,
+    open_how: Option<Box<types::OpenHow>>,
+}
+
+struct StatOp {
+    file_slot: usize,
+    statx_buf: Box<libc::statx>,
+}
+
+struct ReadOp {
     file_slot: usize,
     base_offset: u64,
     prefix_len: usize,
@@ -643,14 +675,35 @@ fn drain_in_flight(
             let op_slot = cqe.user_data() as usize;
 
             if let Some(op) = ops.get_mut(op_slot).and_then(|o| o.take()) {
-                // Buffer dropped here, returned to pool
-                drop(op.buf);
+                let res = cqe.result();
                 *in_flight_ops = in_flight_ops.saturating_sub(1);
-                stats.reads_completed += 1;
 
-                // Count errors even during drain
-                if cqe.result() < 0 {
-                    stats.read_errors += 1;
+                match op {
+                    Op::Read(op) => {
+                        // Buffer dropped here, returned to pool
+                        drop(op.buf);
+                        stats.reads_completed += 1;
+                        if res < 0 {
+                            stats.read_errors += 1;
+                        }
+                    }
+                    Op::Open(_op) => {
+                        stats.open_ops_completed += 1;
+                        if res < 0 {
+                            stats.open_failures += 1;
+                        } else {
+                            // Prevent fd leak on shutdown path.
+                            unsafe {
+                                libc::close(res);
+                            }
+                        }
+                    }
+                    Op::Stat(_op) => {
+                        stats.stat_ops_completed += 1;
+                        if res < 0 {
+                            stats.stat_failures += 1;
+                        }
+                    }
                 }
             }
         }
@@ -682,9 +735,13 @@ fn open_file_safe(path: &Path, follow_symlinks: bool) -> io::Result<File> {
 /// - **Single-chunk-in-flight per file**: We only allow one outstanding read
 ///   per file to ensure prefix-drop deduplication logic is valid (no gaps from
 ///   failed earlier chunks).
+/// - **Open/stat staging**: Each file advances `PendingOpen → PendingStat → Ready`
+///   before any reads are submitted.
 /// - **Drain before return**: All in-flight ops MUST complete before we return,
 ///   otherwise the kernel may write to freed memory.
 /// - **Buffer lifetime**: Buffers live in `ops[]` until CQE is reaped.
+/// - **Fallback safety**: Unsupported open/stat opcodes fall back to blocking
+///   open + fstat unless `open_stat_mode = UringRequired`.
 ///
 /// # Shutdown
 ///
@@ -724,7 +781,12 @@ fn io_worker_loop<E: ScanEngine>(
         },
     };
 
-    let open_stat_supported = open_stat_caps.map_or(false, |caps| caps.supports_open_stat());
+    let open_stat_supported = open_stat_caps
+        .as_ref()
+        .map_or(false, |caps| caps.supports_open_stat());
+    let _submit_stable = open_stat_caps
+        .as_ref()
+        .map_or(false, |caps| caps.submit_stable);
 
     match cfg.open_stat_mode {
         OpenStatMode::BlockingOnly => {}
@@ -757,13 +819,13 @@ fn io_worker_loop<E: ScanEngine>(
         registered_buffers = true;
     }
 
-    // File slab + queue for files ready to submit (not currently in-flight).
+    // File slab + per-phase queues for files ready to submit (not in-flight).
     let mut files: Vec<Option<FileState>> = Vec::new();
     let mut free_file_slots: Vec<usize> = Vec::new();
-    // CORRECTNESS: Files in `ready` queue have in_flight == 0.
-    // We enforce exactly one chunk in-flight per file to ensure prefix-drop
-    // logic is valid (no gaps from failed earlier chunks).
-    let mut ready: VecDeque<usize> = VecDeque::new();
+    // CORRECTNESS: Files in ready queues have in_flight == 0.
+    let mut open_ready: VecDeque<usize> = VecDeque::new();
+    let mut stat_ready: VecDeque<usize> = VecDeque::new();
+    let mut read_ready: VecDeque<usize> = VecDeque::new();
 
     // Op slots keyed by user_data.
     let slots = cfg.ring_entries as usize;
@@ -774,23 +836,19 @@ fn io_worker_loop<E: ScanEngine>(
     let mut stopping = false;
     let mut channel_closed = false;
 
-    // Helper: add file work to tracking.
-    let add_file = |w: FileWork,
-                    stats: &mut UringIoStats,
-                    files: &mut Vec<Option<FileState>>,
-                    free_file_slots: &mut Vec<usize>,
-                    ready: &mut VecDeque<usize>,
-                    follow_symlinks: bool| {
-        stats.files_started += 1;
+    enum BlockingOutcome {
+        Ready(ReadState),
+        Skipped,
+        Failed,
+    }
 
+    let mut blocking_open = |path: &Path, stats: &mut UringIoStats| -> BlockingOutcome {
         // Use O_NOFOLLOW when follow_symlinks is false to prevent TOCTOU attacks.
-        let file = match open_file_safe(&w.path, follow_symlinks) {
+        let file = match open_file_safe(path, cfg.follow_symlinks) {
             Ok(f) => f,
             Err(_) => {
                 stats.files_open_failed += 1;
-                // Drop token: permit releases immediately (no scan tasks).
-                drop(w.token);
-                return;
+                return BlockingOutcome::Failed;
             }
         };
 
@@ -800,16 +858,68 @@ fn io_worker_loop<E: ScanEngine>(
             Ok(m) => m.len(),
             Err(_) => {
                 stats.files_open_failed += 1;
+                return BlockingOutcome::Failed;
+            }
+        };
+
+        if let Some(max_sz) = cfg.max_file_size {
+            if size > max_sz {
+                return BlockingOutcome::Skipped;
+            }
+        }
+
+        if size == 0 {
+            return BlockingOutcome::Skipped;
+        }
+
+        BlockingOutcome::Ready(ReadState {
+            file,
+            size,
+            next_offset: 0,
+            overlap_buf: vec![0u8; overlap].into_boxed_slice(),
+            overlap_len: 0,
+        })
+    };
+
+    // Helper: add file work to tracking.
+    let add_file = |w: FileWork,
+                    stats: &mut UringIoStats,
+                    files: &mut Vec<Option<FileState>>,
+                    free_file_slots: &mut Vec<usize>,
+                    open_ready: &mut VecDeque<usize>,
+                    read_ready: &mut VecDeque<usize>| {
+        stats.files_started += 1;
+
+        if open_stat_supported {
+            let slot = free_file_slots.pop().unwrap_or_else(|| {
+                files.push(None);
+                files.len() - 1
+            });
+
+            files[slot] = Some(FileState {
+                phase: FilePhase::PendingOpen { path: w.path },
+                in_flight: 0,
+                done: false,
+                failed: false,
+                token: w.token,
+            });
+
+            open_ready.push_back(slot);
+            return;
+        }
+
+        // Blocking fallback: open + fstat to build read state.
+        let read_state = match blocking_open(&w.path, stats) {
+            BlockingOutcome::Ready(state) => state,
+            BlockingOutcome::Skipped => {
+                drop(w.token);
+                return;
+            }
+            BlockingOutcome::Failed => {
                 drop(w.token);
                 return;
             }
         };
-
-        // Skip empty files.
-        if size == 0 {
-            drop(w.token);
-            return;
-        }
 
         let slot = free_file_slots.pop().unwrap_or_else(|| {
             files.push(None);
@@ -817,18 +927,14 @@ fn io_worker_loop<E: ScanEngine>(
         });
 
         files[slot] = Some(FileState {
-            file,
-            size,
-            next_offset: 0,
+            phase: FilePhase::Ready(read_state),
             in_flight: 0,
             done: false,
             failed: false,
             token: w.token,
-            overlap_buf: vec![0u8; overlap].into_boxed_slice(),
-            overlap_len: 0,
         });
 
-        ready.push_back(slot);
+        read_ready.push_back(slot);
     };
 
     loop {
@@ -847,8 +953,8 @@ fn io_worker_loop<E: ScanEngine>(
                         &mut stats,
                         &mut files,
                         &mut free_file_slots,
-                        &mut ready,
-                        cfg.follow_symlinks,
+                        &mut open_ready,
+                        &mut read_ready,
                     ),
                     Err(chan::TryRecvError::Empty) => break,
                     Err(chan::TryRecvError::Disconnected) => {
@@ -863,102 +969,301 @@ fn io_worker_loop<E: ScanEngine>(
         let mut submitted_this_round = 0;
 
         // Fill submissions up to io_depth.
-        // CORRECTNESS: Only one chunk in-flight per file at a time.
+        // CORRECTNESS: Only one op in-flight per file at a time.
         while in_flight_ops < cfg.io_depth && !stopping {
-            if ready.is_empty() {
-                break;
-            }
             if free_ops.is_empty() {
                 break;
             }
 
-            // Acquire buffer first to avoid holding op slot while stalled.
-            let Some(buf) = pool.try_acquire() else {
-                break;
-            };
+            let mut scheduled = false;
 
-            let file_slot = ready.pop_front().unwrap();
-            let Some(st) = files.get_mut(file_slot).and_then(|s| s.as_mut()) else {
-                // Stale slot.
-                drop(buf);
-                continue;
-            };
+            // Prefer reads (buffered) to keep throughput high.
+            if let Some(file_slot) = read_ready.pop_front() {
+                let Some(st) = files.get_mut(file_slot).and_then(|s| s.as_mut()) else {
+                    // Stale slot.
+                    continue;
+                };
 
-            // INVARIANT: Files in ready queue should have in_flight == 0.
-            debug_assert_eq!(
-                st.in_flight, 0,
-                "file in ready queue should not have in-flight ops"
-            );
+                if st.failed || st.done {
+                    st.done = true;
+                    files[file_slot] = None;
+                    free_file_slots.push(file_slot);
+                    continue;
+                }
 
-            if st.failed || st.done || st.next_offset >= st.size {
-                st.done = true;
-                drop(buf);
-                // Cleanup immediately since nothing in flight.
-                files[file_slot] = None;
-                free_file_slots.push(file_slot);
-                continue;
-            }
+                match &mut st.phase {
+                    FilePhase::Ready(rs) => {
+                        // INVARIANT: Files in read queue should have in_flight == 0.
+                        debug_assert_eq!(
+                            st.in_flight, 0,
+                            "file in read queue should not have in-flight ops"
+                        );
 
-            let offset = st.next_offset;
-            let prefix_len = st.overlap_len;
+                        if rs.next_offset >= rs.size {
+                            st.done = true;
+                            files[file_slot] = None;
+                            free_file_slots.push(file_slot);
+                            continue;
+                        }
 
-            let payload_len = (st.size - offset).min(chunk_size as u64) as usize;
+                        if let Some(buf) = pool.try_acquire() {
+                            let offset = rs.next_offset;
+                            let prefix_len = rs.overlap_len;
 
-            debug_assert!(prefix_len + payload_len <= buf_len);
+                            let payload_len = (rs.size - offset).min(chunk_size as u64) as usize;
 
-            // Copy overlap bytes from the previous chunk into the buffer so we
-            // only read the payload from disk (no overlap re-reads).
-            if prefix_len > 0 {
-                buf.as_mut_slice()[..prefix_len].copy_from_slice(&st.overlap_buf[..prefix_len]);
-            }
+                            debug_assert!(prefix_len + payload_len <= buf_len);
 
-            let op_slot = free_ops.pop().unwrap();
-            let fd = st.file.as_raw_fd();
-            let ptr = unsafe { buf.as_mut_slice().as_mut_ptr().add(prefix_len) };
+                            // Copy overlap bytes from the previous chunk into the buffer so we
+                            // only read the payload from disk (no overlap re-reads).
+                            if prefix_len > 0 {
+                                buf.as_mut_slice()[..prefix_len]
+                                    .copy_from_slice(&rs.overlap_buf[..prefix_len]);
+                            }
 
-            let entry = if cfg.use_registered_buffers {
-                opcode::ReadFixed::new(types::Fd(fd), ptr, payload_len as u32, buf.buf_index())
-                    .offset(offset)
-                    .build()
-            } else {
-                opcode::Read::new(types::Fd(fd), ptr, payload_len as u32)
-                    .offset(offset)
-                    .build()
-            }
-            .user_data(op_slot as u64);
+                            let op_slot = free_ops.pop().unwrap();
+                            let fd = rs.file.as_raw_fd();
+                            let ptr = unsafe { buf.as_mut_slice().as_mut_ptr().add(prefix_len) };
 
-            // SAFETY:
-            // - `buf` lives in `ops[op_slot]` until completion
-            // - `st.file` lives until file cleanup
-            // - We drain all in-flight ops before returning
-            unsafe {
-                let mut sq = ring.submission();
-                if sq.push(&entry).is_err() {
-                    // SQ unexpectedly full - return resources and break.
-                    drop(buf);
-                    free_ops.push(op_slot);
-                    ready.push_front(file_slot);
-                    break;
+                            let entry = if cfg.use_registered_buffers {
+                                opcode::ReadFixed::new(
+                                    types::Fd(fd),
+                                    ptr,
+                                    payload_len as u32,
+                                    buf.buf_index(),
+                                )
+                                .offset(offset)
+                                .build()
+                            } else {
+                                opcode::Read::new(types::Fd(fd), ptr, payload_len as u32)
+                                    .offset(offset)
+                                    .build()
+                            }
+                            .user_data(op_slot as u64);
+
+                            // SAFETY:
+                            // - `buf` lives in `ops[op_slot]` until completion
+                            // - `rs.file` lives until file cleanup
+                            // - We drain all in-flight ops before returning
+                            unsafe {
+                                let mut sq = ring.submission();
+                                if sq.push(&entry).is_err() {
+                                    // SQ unexpectedly full - return resources and break.
+                                    drop(buf);
+                                    free_ops.push(op_slot);
+                                    read_ready.push_front(file_slot);
+                                    break;
+                                }
+                            }
+
+                            let base_offset = offset.saturating_sub(prefix_len as u64);
+
+                            ops[op_slot] = Some(Op::Read(ReadOp {
+                                file_slot,
+                                base_offset,
+                                prefix_len,
+                                payload_len,
+                                buf,
+                            }));
+
+                            in_flight_ops += 1;
+                            submitted_this_round += 1;
+                            stats.reads_submitted += 1;
+
+                            st.in_flight = 1; // Exactly 1 - single in-flight per file
+                            rs.next_offset = rs.next_offset.saturating_add(payload_len as u64);
+                            scheduled = true;
+                        } else {
+                            // No buffer: re-queue and allow open/stat to proceed.
+                            read_ready.push_back(file_slot);
+                        }
+                    }
+                    FilePhase::PendingOpen { .. } => {
+                        open_ready.push_back(file_slot);
+                    }
+                    FilePhase::PendingStat { .. } => {
+                        stat_ready.push_back(file_slot);
+                    }
                 }
             }
 
-            let base_offset = offset.saturating_sub(prefix_len as u64);
+            if scheduled {
+                continue;
+            }
 
-            ops[op_slot] = Some(Op {
-                file_slot,
-                base_offset,
-                prefix_len,
-                payload_len,
-                buf,
-            });
+            if let Some(file_slot) = stat_ready.pop_front() {
+                let Some(st) = files.get_mut(file_slot).and_then(|s| s.as_mut()) else {
+                    continue;
+                };
 
-            in_flight_ops += 1;
-            submitted_this_round += 1;
-            stats.reads_submitted += 1;
+                if st.failed || st.done {
+                    st.done = true;
+                    files[file_slot] = None;
+                    free_file_slots.push(file_slot);
+                    continue;
+                }
 
-            st.in_flight = 1; // Exactly 1 - single in-flight per file
-            st.next_offset = st.next_offset.saturating_add(payload_len as u64);
-            // NOTE: Do NOT add back to ready here. Happens on completion.
+                let FilePhase::PendingStat { file } = &st.phase else {
+                    // Phase drift: re-queue based on actual phase.
+                    match &st.phase {
+                        FilePhase::PendingOpen { .. } => open_ready.push_back(file_slot),
+                        FilePhase::Ready(_) => read_ready.push_back(file_slot),
+                        FilePhase::PendingStat { .. } => {}
+                    }
+                    continue;
+                };
+
+                let Some(file) = file.as_ref() else {
+                    // Already moved; mark failed to avoid spin.
+                    st.failed = true;
+                    st.done = true;
+                    files[file_slot] = None;
+                    free_file_slots.push(file_slot);
+                    continue;
+                };
+
+                debug_assert_eq!(
+                    st.in_flight, 0,
+                    "file in stat queue should not have in-flight ops"
+                );
+
+                let mut statx_buf = Box::new(unsafe { std::mem::zeroed::<libc::statx>() });
+                let statx_ptr = statx_buf.as_mut() as *mut libc::statx as *mut types::statx;
+                let empty_path = b"\0";
+
+                let entry = opcode::Statx::new(
+                    types::Fd(file.as_raw_fd()),
+                    empty_path.as_ptr() as *const _,
+                    statx_ptr,
+                )
+                .flags(libc::AT_EMPTY_PATH)
+                .mask(libc::STATX_SIZE | libc::STATX_TYPE | libc::STATX_MODE)
+                .build();
+
+                let op_slot = free_ops.pop().unwrap();
+                let entry = entry.user_data(op_slot as u64);
+
+                unsafe {
+                    let mut sq = ring.submission();
+                    if sq.push(&entry).is_err() {
+                        free_ops.push(op_slot);
+                        stat_ready.push_front(file_slot);
+                        break;
+                    }
+                }
+
+                ops[op_slot] = Some(Op::Stat(StatOp {
+                    file_slot,
+                    statx_buf,
+                }));
+
+                in_flight_ops += 1;
+                submitted_this_round += 1;
+                stats.stat_ops_submitted += 1;
+                st.in_flight = 1;
+                scheduled = true;
+            }
+
+            if scheduled {
+                continue;
+            }
+
+            if let Some(file_slot) = open_ready.pop_front() {
+                let Some(st) = files.get_mut(file_slot).and_then(|s| s.as_mut()) else {
+                    continue;
+                };
+
+                if st.failed || st.done {
+                    st.done = true;
+                    files[file_slot] = None;
+                    free_file_slots.push(file_slot);
+                    continue;
+                }
+
+                let FilePhase::PendingOpen { path } = &st.phase else {
+                    match &st.phase {
+                        FilePhase::PendingStat { .. } => stat_ready.push_back(file_slot),
+                        FilePhase::Ready(_) => read_ready.push_back(file_slot),
+                        FilePhase::PendingOpen { .. } => {}
+                    }
+                    continue;
+                };
+
+                debug_assert_eq!(
+                    st.in_flight, 0,
+                    "file in open queue should not have in-flight ops"
+                );
+
+                let flags = libc::O_RDONLY
+                    | libc::O_CLOEXEC
+                    | if cfg.follow_symlinks {
+                        0
+                    } else {
+                        libc::O_NOFOLLOW
+                    };
+                let use_openat2 = open_stat_caps.as_ref().map_or(false, |caps| caps.openat2);
+
+                let path_cstr = match CString::new(path.as_os_str().as_bytes()) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        stats.files_open_failed += 1;
+                        stats.open_failures += 1;
+                        st.failed = true;
+                        st.done = true;
+                        files[file_slot] = None;
+                        free_file_slots.push(file_slot);
+                        continue;
+                    }
+                };
+
+                let open_how = if use_openat2 {
+                    Some(Box::new(types::OpenHow::new().flags(flags as u64)))
+                } else {
+                    None
+                };
+
+                let op_slot = free_ops.pop().unwrap();
+                let entry = if use_openat2 {
+                    let how = open_how.as_ref().expect("open_how missing");
+                    opcode::OpenAt2::new(
+                        types::Fd(libc::AT_FDCWD),
+                        path_cstr.as_ptr(),
+                        how.as_ref(),
+                    )
+                    .build()
+                } else {
+                    opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), path_cstr.as_ptr())
+                        .flags(flags)
+                        .mode(0)
+                        .build()
+                }
+                .user_data(op_slot as u64);
+
+                unsafe {
+                    let mut sq = ring.submission();
+                    if sq.push(&entry).is_err() {
+                        free_ops.push(op_slot);
+                        open_ready.push_front(file_slot);
+                        break;
+                    }
+                }
+
+                ops[op_slot] = Some(Op::Open(OpenOp {
+                    file_slot,
+                    path: path_cstr,
+                    open_how,
+                }));
+
+                in_flight_ops += 1;
+                submitted_this_round += 1;
+                stats.open_ops_submitted += 1;
+                st.in_flight = 1;
+                scheduled = true;
+            }
+
+            if !scheduled {
+                break;
+            }
         }
 
         // Batch submit if we queued anything.
@@ -973,7 +1278,10 @@ fn io_worker_loop<E: ScanEngine>(
                 break;
             }
 
-            if ready.is_empty() {
+            let has_work =
+                !open_ready.is_empty() || !stat_ready.is_empty() || !read_ready.is_empty();
+
+            if !has_work {
                 if channel_closed {
                     // No work, no more incoming, no in-flight. Done.
                     break;
@@ -986,15 +1294,15 @@ fn io_worker_loop<E: ScanEngine>(
                             &mut stats,
                             &mut files,
                             &mut free_file_slots,
-                            &mut ready,
-                            cfg.follow_symlinks,
+                            &mut open_ready,
+                            &mut read_ready,
                         );
                         continue;
                     }
                     Err(_) => {
                         channel_closed = true;
                         // Check if we have any ready files to process.
-                        if ready.is_empty() {
+                        if !has_work {
                             break;
                         }
                         // Else continue to try submitting.
@@ -1002,7 +1310,7 @@ fn io_worker_loop<E: ScanEngine>(
                     }
                 }
             } else {
-                // Files ready but no buffers available.
+                // Work queued but resources unavailable (likely buffers).
                 // Yield to let CPU workers release buffers, then retry.
                 // This avoids busy-spin while waiting for pool.
                 std::thread::yield_now();
@@ -1046,80 +1354,273 @@ fn io_worker_loop<E: ScanEngine>(
 
             free_ops.push(op_slot);
             in_flight_ops = in_flight_ops.saturating_sub(1);
-            stats.reads_completed += 1;
-
-            let Some(st) = files.get_mut(op.file_slot).and_then(|s| s.as_mut()) else {
-                // File already cleaned up (shouldn't happen with 1-in-flight).
-                drop(op.buf);
-                continue;
-            };
-
-            st.in_flight = 0;
-
-            if res < 0 {
-                // Read syscall failed.
-                stats.read_errors += 1;
-                st.failed = true;
-                st.done = true;
-                drop(op.buf);
-            } else {
-                let n = res as usize;
-                if n == 0 {
-                    // Unexpected EOF (empty read).
-                    stats.read_errors += 1;
-                    st.failed = true;
-                    st.done = true;
-                    drop(op.buf);
-                } else {
-                    if n < op.payload_len {
-                        // Short read: file likely shrank. Treat as truncation.
-                        // We scan what we got, but mark file done since we can't
-                        // trust our offset calculations for subsequent chunks.
-                        stats.short_reads += 1;
-                        st.done = true;
-                    }
-
-                    let total_len = op.prefix_len.saturating_add(n);
-                    let len = total_len as u32;
-
-                    if overlap > 0 {
-                        let overlap_len = overlap.min(total_len);
-                        if overlap_len > 0 {
-                            let start = total_len - overlap_len;
-                            st.overlap_buf[..overlap_len]
-                                .copy_from_slice(&op.buf.as_slice()[start..start + overlap_len]);
-                        }
-                        st.overlap_len = overlap_len;
-                    }
-
-                    let task = CpuTask::ScanChunk {
-                        token: Arc::clone(&st.token),
-                        base_offset: op.base_offset,
-                        prefix_len: op.prefix_len as u32,
-                        len,
-                        buf: op.buf,
+            match op {
+                Op::Read(op) => {
+                    stats.reads_completed += 1;
+                    let Some(st) = files.get_mut(op.file_slot).and_then(|s| s.as_mut()) else {
+                        // File already cleaned up (shouldn't happen with 1-in-flight).
+                        drop(op.buf);
+                        continue;
                     };
 
-                    if cpu.spawn(task).is_err() {
-                        // CPU executor shut down. Start stopping.
-                        stopping = true;
+                    st.in_flight = 0;
+
+                    let FilePhase::Ready(rs) = &mut st.phase else {
+                        drop(op.buf);
+                        continue;
+                    };
+
+                    if res < 0 {
+                        // Read syscall failed.
+                        stats.read_errors += 1;
                         st.failed = true;
                         st.done = true;
+                        drop(op.buf);
                     } else {
-                        // Successfully spawned. If file has more data, re-queue.
-                        if !st.done && !st.failed && st.next_offset < st.size {
-                            ready.push_back(op.file_slot);
-                        } else {
+                        let n = res as usize;
+                        if n == 0 {
+                            // Unexpected EOF (empty read).
+                            stats.read_errors += 1;
+                            st.failed = true;
                             st.done = true;
+                            drop(op.buf);
+                        } else {
+                            if n < op.payload_len {
+                                // Short read: file likely shrank. Treat as truncation.
+                                // We scan what we got, but mark file done since we can't
+                                // trust our offset calculations for subsequent chunks.
+                                stats.short_reads += 1;
+                                st.done = true;
+                            }
+
+                            let total_len = op.prefix_len.saturating_add(n);
+                            let len = total_len as u32;
+
+                            if overlap > 0 {
+                                let overlap_len = overlap.min(total_len);
+                                if overlap_len > 0 {
+                                    let start = total_len - overlap_len;
+                                    rs.overlap_buf[..overlap_len].copy_from_slice(
+                                        &op.buf.as_slice()[start..start + overlap_len],
+                                    );
+                                }
+                                rs.overlap_len = overlap_len;
+                            }
+
+                            let task = CpuTask::ScanChunk {
+                                token: Arc::clone(&st.token),
+                                base_offset: op.base_offset,
+                                prefix_len: op.prefix_len as u32,
+                                len,
+                                buf: op.buf,
+                            };
+
+                            if cpu.spawn(task).is_err() {
+                                // CPU executor shut down. Start stopping.
+                                stopping = true;
+                                st.failed = true;
+                                st.done = true;
+                            } else {
+                                // Successfully spawned. If file has more data, re-queue.
+                                if !st.done && !st.failed && rs.next_offset < rs.size {
+                                    read_ready.push_back(op.file_slot);
+                                } else {
+                                    st.done = true;
+                                }
+                            }
                         }
                     }
-                }
-            }
 
-            // Cleanup file if done and no more in-flight.
-            if st.done && st.in_flight == 0 {
-                files[op.file_slot] = None;
-                free_file_slots.push(op.file_slot);
+                    // Cleanup file if done and no more in-flight.
+                    if st.done && st.in_flight == 0 {
+                        files[op.file_slot] = None;
+                        free_file_slots.push(op.file_slot);
+                    }
+                }
+                Op::Open(op) => {
+                    stats.open_ops_completed += 1;
+                    let Some(st) = files.get_mut(op.file_slot).and_then(|s| s.as_mut()) else {
+                        if res >= 0 {
+                            unsafe {
+                                libc::close(res);
+                            }
+                        }
+                        continue;
+                    };
+
+                    st.in_flight = 0;
+
+                    if res < 0 {
+                        stats.open_failures += 1;
+                        let errno = -res;
+                        let can_fallback = cfg.open_stat_mode != OpenStatMode::UringRequired
+                            && (errno == libc::EINVAL || errno == libc::EOPNOTSUPP);
+
+                        if can_fallback {
+                            stats.open_stat_fallbacks += 1;
+                            let path = match &mut st.phase {
+                                FilePhase::PendingOpen { path } => std::mem::take(path),
+                                _ => PathBuf::new(),
+                            };
+
+                            match blocking_open(&path, &mut stats) {
+                                BlockingOutcome::Ready(read_state) => {
+                                    st.phase = FilePhase::Ready(read_state);
+                                    read_ready.push_back(op.file_slot);
+                                }
+                                BlockingOutcome::Skipped => {
+                                    st.done = true;
+                                }
+                                BlockingOutcome::Failed => {
+                                    st.failed = true;
+                                    st.done = true;
+                                }
+                            }
+                        } else {
+                            stats.files_open_failed += 1;
+                            st.failed = true;
+                            st.done = true;
+                        }
+                    } else {
+                        let fd = res;
+                        // SAFETY: fd came from io_uring openat/openat2 and is owned by us now.
+                        let file = unsafe { File::from_raw_fd(fd) };
+                        st.phase = FilePhase::PendingStat { file: Some(file) };
+                        stat_ready.push_back(op.file_slot);
+                    }
+
+                    if st.done && st.in_flight == 0 {
+                        files[op.file_slot] = None;
+                        free_file_slots.push(op.file_slot);
+                    }
+                }
+                Op::Stat(op) => {
+                    stats.stat_ops_completed += 1;
+                    let Some(st) = files.get_mut(op.file_slot).and_then(|s| s.as_mut()) else {
+                        continue;
+                    };
+
+                    st.in_flight = 0;
+
+                    if res < 0 {
+                        stats.stat_failures += 1;
+                        let errno = -res;
+                        let can_fallback = cfg.open_stat_mode != OpenStatMode::UringRequired
+                            && (errno == libc::EINVAL || errno == libc::EOPNOTSUPP);
+
+                        if can_fallback {
+                            stats.open_stat_fallbacks += 1;
+                            let file = match &mut st.phase {
+                                FilePhase::PendingStat { file } => file.as_ref(),
+                                _ => None,
+                            };
+
+                            if let Some(file) = file {
+                                match file.metadata() {
+                                    Ok(m) => {
+                                        let size = m.len();
+                                        if let Some(max_sz) = cfg.max_file_size {
+                                            if size > max_sz {
+                                                st.done = true;
+                                                if st.done && st.in_flight == 0 {
+                                                    files[op.file_slot] = None;
+                                                    free_file_slots.push(op.file_slot);
+                                                }
+                                                continue;
+                                            }
+                                        }
+                                        if size == 0 {
+                                            st.done = true;
+                                            if st.done && st.in_flight == 0 {
+                                                files[op.file_slot] = None;
+                                                free_file_slots.push(op.file_slot);
+                                            }
+                                            continue;
+                                        }
+
+                                        let file = match &mut st.phase {
+                                            FilePhase::PendingStat { file } => {
+                                                file.take().expect("file missing in PendingStat")
+                                            }
+                                            _ => {
+                                                st.failed = true;
+                                                st.done = true;
+                                                if st.done && st.in_flight == 0 {
+                                                    files[op.file_slot] = None;
+                                                    free_file_slots.push(op.file_slot);
+                                                }
+                                                continue;
+                                            }
+                                        };
+
+                                        st.phase = FilePhase::Ready(ReadState {
+                                            file,
+                                            size,
+                                            next_offset: 0,
+                                            overlap_buf: vec![0u8; overlap].into_boxed_slice(),
+                                            overlap_len: 0,
+                                        });
+                                        read_ready.push_back(op.file_slot);
+                                    }
+                                    Err(_) => {
+                                        st.failed = true;
+                                        st.done = true;
+                                    }
+                                }
+                            } else {
+                                st.failed = true;
+                                st.done = true;
+                            }
+                        } else {
+                            st.failed = true;
+                            st.done = true;
+                        }
+                    } else {
+                        let statx = &*op.statx_buf;
+                        let size = statx.stx_size as u64;
+
+                        if let Some(max_sz) = cfg.max_file_size {
+                            if size > max_sz {
+                                st.done = true;
+                            }
+                        }
+
+                        if !st.done {
+                            if size == 0 {
+                                st.done = true;
+                            } else {
+                                let file = match &mut st.phase {
+                                    FilePhase::PendingStat { file } => {
+                                        file.take().expect("file missing in PendingStat")
+                                    }
+                                    _ => {
+                                        st.failed = true;
+                                        st.done = true;
+                                        if st.done && st.in_flight == 0 {
+                                            files[op.file_slot] = None;
+                                            free_file_slots.push(op.file_slot);
+                                        }
+                                        continue;
+                                    }
+                                };
+
+                                st.phase = FilePhase::Ready(ReadState {
+                                    file,
+                                    size,
+                                    next_offset: 0,
+                                    overlap_buf: vec![0u8; overlap].into_boxed_slice(),
+                                    overlap_len: 0,
+                                });
+                                read_ready.push_back(op.file_slot);
+                            }
+                        }
+                    }
+
+                    if st.done && st.in_flight == 0 {
+                        files[op.file_slot] = None;
+                        free_file_slots.push(op.file_slot);
+                    }
+                }
             }
         }
     }
