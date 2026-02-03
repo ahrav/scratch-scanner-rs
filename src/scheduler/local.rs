@@ -764,6 +764,10 @@ where
     // Discovery loop
     let mut stats = LocalStats::default();
     let mut next_file_id: u32 = 0;
+    // Batch discovery injections to amortize wakeups and injector contention.
+    // Keep the batch small to avoid large bursts of in-flight work.
+    let batch_cap = cfg.max_in_flight_objects.clamp(1, 64);
+    let mut batch: Vec<FileTask> = Vec::with_capacity(batch_cap);
 
     while let Some(file) = source.next_file() {
         // Acquire in-flight permit (blocks if at capacity)
@@ -783,9 +787,17 @@ where
             _permit: permit,
         };
 
-        // This should not fail since we haven't called join() yet
-        ex.spawn_external(task)
-            .expect("executor rejected task before join");
+        batch.push(task);
+        if batch.len() >= batch_cap {
+            // This should not fail since we haven't called join() yet.
+            ex.spawn_external_batch(std::mem::take(&mut batch))
+                .expect("executor rejected task batch before join");
+        }
+    }
+
+    if !batch.is_empty() {
+        ex.spawn_external_batch(batch)
+            .expect("executor rejected task batch before join");
     }
 
     // Wait for all files to complete

@@ -88,12 +88,12 @@ Impact: Unnecessary wakeups and contention for massive directory trees.
 
 Work units:
 
-- [ ] Validate the reasoning by measuring unpark frequency and context switch rates during large scans.
+- [ ] Validate the reasoning by measuring unpark frequency and context switch rates during large scans. (Blocked on macOS without sudo/DTrace; use Linux `perf`/`strace` or macOS with `dtruss` privileges.)
 - [ ] If the reasoning does not hold, document why and skip.
 - [ ] Draft an evidence-backed plan for improvement with expected wakeup reduction and a measurement plan.
-- [ ] Implement a `spawn_external_batch` variant that injects multiple tasks and performs bounded unpark.
-- [ ] Measure and record changes in wakeups, wall time, and p95 queue latency.
-- [ ] Run doc-rigor on code files changed for this task and update docs/comments as needed.
+- [x] Implement a `spawn_external_batch` variant that injects multiple tasks and performs bounded unpark.
+- [ ] Measure and record changes in wakeups, wall time, and p95 queue latency. (Blocked on macOS without syscall tracing access or a pre-change baseline.)
+- [x] Run doc-rigor on code files changed for this task and update docs/comments as needed.
 
 ### Perf: Conditional Output Batching For Dense Findings
 
