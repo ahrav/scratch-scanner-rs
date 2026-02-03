@@ -67,9 +67,10 @@ use std::thread;
 // ============================================================================
 
 /// Open/stat execution mode for io_uring file setup.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub enum OpenStatMode {
     /// Default: use io_uring open/stat when supported, otherwise fallback.
+    #[default]
     UringPreferred,
     /// Force blocking open + fstat path (parity/debug).
     BlockingOnly,
@@ -77,27 +78,16 @@ pub enum OpenStatMode {
     UringRequired,
 }
 
-impl Default for OpenStatMode {
-    fn default() -> Self {
-        Self::UringPreferred
-    }
-}
-
 /// Path resolution policy for openat2 when available.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub enum ResolvePolicy {
     /// Default: no path resolution constraints (match current behavior).
+    #[default]
     Default,
     /// Disallow symlink traversal in all components (opt-in).
     NoSymlinks,
     /// Restrict traversal beneath dirfd root (requires dirfd strategy).
     BeneathRoot,
-}
-
-impl Default for ResolvePolicy {
-    fn default() -> Self {
-        Self::Default
-    }
 }
 
 /// Configuration for local FS scanning using io_uring I/O threads + CPU executor scan threads.
@@ -361,11 +351,12 @@ impl FixedBufferHandle {
     ///
     /// # Safety
     ///
-    /// This uses `unsafe` to create a mutable slice from a shared reference.
+    /// This uses `unsafe` to create a mutable slice from pooled storage.
     /// It is sound because each buffer index is owned by exactly one handle
-    /// at a time (enforced by the free queue).
+    /// at a time (enforced by the free queue), and `&mut self` guarantees
+    /// exclusive access to this handle.
     #[inline]
-    fn as_mut_slice(&self) -> &mut [u8] {
+    fn as_mut_slice(&mut self) -> &mut [u8] {
         let ptr = self.pool.buf_ptr(self.index);
         let len = self.pool.buf_len(self.index);
         unsafe { std::slice::from_raw_parts_mut(ptr, len) }
@@ -426,8 +417,8 @@ impl OpenStatCaps {
 fn resolve_bits(policy: ResolvePolicy) -> u64 {
     match policy {
         ResolvePolicy::Default => 0,
-        ResolvePolicy::NoSymlinks => libc::RESOLVE_NO_SYMLINKS as u64,
-        ResolvePolicy::BeneathRoot => libc::RESOLVE_BENEATH as u64,
+        ResolvePolicy::NoSymlinks => libc::RESOLVE_NO_SYMLINKS,
+        ResolvePolicy::BeneathRoot => libc::RESOLVE_BENEATH,
     }
 }
 
@@ -793,10 +784,10 @@ fn io_worker_loop<E: ScanEngine>(
 
     let open_stat_supported = open_stat_caps
         .as_ref()
-        .map_or(false, |caps| caps.supports_open_stat());
+        .is_some_and(|caps| caps.supports_open_stat());
     let _submit_stable = open_stat_caps
         .as_ref()
-        .map_or(false, |caps| caps.submit_stable);
+        .is_some_and(|caps| caps.submit_stable);
 
     match cfg.open_stat_mode {
         OpenStatMode::BlockingOnly => {}
@@ -1016,7 +1007,7 @@ fn io_worker_loop<E: ScanEngine>(
                             continue;
                         }
 
-                        if let Some(buf) = pool.try_acquire() {
+                        if let Some(mut buf) = pool.try_acquire() {
                             let offset = rs.next_offset;
                             let prefix_len = rs.overlap_len;
 
@@ -1211,7 +1202,7 @@ fn io_worker_loop<E: ScanEngine>(
                     } else {
                         libc::O_NOFOLLOW
                     };
-                let use_openat2 = open_stat_caps.as_ref().map_or(false, |caps| caps.openat2);
+                let use_openat2 = open_stat_caps.as_ref().is_some_and(|caps| caps.openat2);
 
                 let path_cstr = match CString::new(path.as_os_str().as_bytes()) {
                     Ok(s) => s,
@@ -1590,7 +1581,7 @@ fn io_worker_loop<E: ScanEngine>(
                         }
                     } else {
                         let statx = &*op.statx_buf;
-                        let size = statx.stx_size as u64;
+                        let size = statx.stx_size;
 
                         if let Some(max_sz) = cfg.max_file_size {
                             if size > max_sz {
