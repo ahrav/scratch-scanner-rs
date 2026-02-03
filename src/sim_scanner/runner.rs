@@ -213,6 +213,16 @@ impl ScannerSimRunner {
                 if all_tasks_completed(&executor, &tasks) {
                     let findings = output.finish();
                     let summaries = take_file_summaries(&mut tasks);
+                    if in_flight_objects != 0 {
+                        return self.fail(
+                            FailureKind::InvariantViolation { code: 33 },
+                            &format!(
+                                "in-flight permits leaked at completion: {} outstanding (max_seen {})",
+                                in_flight_objects, max_seen_in_flight
+                            ),
+                            step,
+                        );
+                    }
                     if let Err(fail) =
                         self.run_oracles(scenario, engine, &files, &findings, &summaries, step)
                     {
@@ -702,6 +712,7 @@ impl FileScanState {
                 return Ok(FileStepOutcome::Done);
             }
             if handle.len > max_file_size {
+                // Size-cap skip: return Done so the runner releases the permit.
                 self.ground_truth_ok = false;
                 return Ok(FileStepOutcome::Done);
             }

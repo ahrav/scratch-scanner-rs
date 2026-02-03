@@ -421,6 +421,15 @@ impl OpenStatCaps {
     }
 }
 
+/// Map resolve policy to openat2 resolve bits (ignored when openat2 unsupported).
+fn resolve_bits(policy: ResolvePolicy) -> u64 {
+    match policy {
+        ResolvePolicy::Default => 0,
+        ResolvePolicy::NoSymlinks => libc::RESOLVE_NO_SYMLINKS as u64,
+        ResolvePolicy::BeneathRoot => libc::RESOLVE_BENEATH as u64,
+    }
+}
+
 fn probe_uring_caps(ring: &IoUring) -> io::Result<OpenStatCaps> {
     // Probe opcode availability and submit-stable behavior once per ring.
     let mut probe = Probe::new();
@@ -1217,7 +1226,10 @@ fn io_worker_loop<E: ScanEngine>(
                 };
 
                 let open_how = if use_openat2 {
-                    Some(Box::new(types::OpenHow::new().flags(flags as u64)))
+                    let resolve = resolve_bits(cfg.resolve_policy);
+                    Some(Box::new(
+                        types::OpenHow::new().flags(flags as u64).resolve(resolve),
+                    ))
                 } else {
                     None
                 };

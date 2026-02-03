@@ -338,7 +338,7 @@ pub struct LocalFsUringConfig {
 
 Open/stat controls:
 - `open_stat_mode`: `UringPreferred` (default), `BlockingOnly`, or `UringRequired`.
-- `resolve_policy`: Only applies to `openat2` when supported. `Default` matches current behavior; `NoSymlinks` and `BeneathRoot` are opt-in.
+- `resolve_policy`: Only applies to `openat2` when supported. `Default` matches current behavior; `NoSymlinks` and `BeneathRoot` are opt-in. When `openat2` is unavailable, resolve policy is ignored and the blocking open path is used.
 
 ### Default Configuration
 
