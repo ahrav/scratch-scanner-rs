@@ -9,10 +9,12 @@
 //! - Tests install `CountingAllocator` to make allocation tracking visible.
 
 #[cfg(debug_assertions)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::cell::Cell;
 
 #[cfg(debug_assertions)]
-static ENABLED: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static ENABLED: Cell<bool> = Cell::new(false);
+}
 
 /// Returns true when the debug allocation guard is enabled.
 ///
@@ -21,7 +23,7 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 pub fn enabled() -> bool {
     #[cfg(debug_assertions)]
     {
-        ENABLED.load(Ordering::Relaxed)
+        ENABLED.with(|flag| flag.get())
     }
     #[cfg(not(debug_assertions))]
     {
@@ -35,7 +37,7 @@ pub fn enabled() -> bool {
 pub fn set_enabled(enabled: bool) {
     #[cfg(debug_assertions)]
     {
-        ENABLED.store(enabled, Ordering::Relaxed);
+        ENABLED.with(|flag| flag.set(enabled));
     }
     #[cfg(not(debug_assertions))]
     {
