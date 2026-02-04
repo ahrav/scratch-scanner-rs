@@ -3,7 +3,7 @@
 //! This module manages pack file access and bounded object decoding for
 //! cross-pack REF delta bases. It is intentionally narrow in scope:
 //! callers provide OIDs, and `PackIo` resolves them via the MIDX to pack
-//! offsets, loads pack bytes via mmap, and decodes the object with strict
+//! offsets, loads pack bytes (mmap-backed by default), and decodes the object with strict
 //! limits on header size, delta payload size, and output size.
 //!
 //! # Scope
@@ -18,6 +18,7 @@
 //! - Delta payload sizes never exceed `limits.decode.max_delta_bytes`.
 //! - Delta chains are bounded by `limits.max_delta_depth`.
 //! - Loose object headers never exceed `LOOSE_HEADER_MAX_BYTES`.
+//! - Missing bases are treated as missing objects (`None`).
 
 use std::fs;
 use std::fs::File;
@@ -69,7 +70,7 @@ impl PackIoLimits {
 pub enum PackIoError {
     /// Repository artifacts are not ready.
     ArtifactsNotReady,
-    /// MIDX mmap is missing.
+    /// MIDX bytes are missing.
     MissingMidx,
     /// MIDX parsing or lookup failed.
     Midx(MidxError),
@@ -97,7 +98,7 @@ impl std::fmt::Display for PackIoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ArtifactsNotReady => write!(f, "repo artifacts not ready"),
-            Self::MissingMidx => write!(f, "midx mmap missing"),
+            Self::MissingMidx => write!(f, "midx bytes missing"),
             Self::Midx(err) => write!(f, "{err}"),
             Self::Io(err) => write!(f, "pack I/O error: {err}"),
             Self::PackParse(err) => write!(f, "{err}"),
@@ -190,8 +191,8 @@ impl<'a> PackIo<'a> {
             return Err(PackIoError::ArtifactsNotReady);
         }
 
-        let midx_mmap = repo.mmaps.midx.as_ref().ok_or(PackIoError::MissingMidx)?;
-        let midx = MidxView::parse(midx_mmap.as_ref(), repo.object_format)?;
+        let midx_bytes = repo.mmaps.midx.as_ref().ok_or(PackIoError::MissingMidx)?;
+        let midx = MidxView::parse(midx_bytes.as_slice(), repo.object_format)?;
 
         let pack_dirs = collect_pack_dirs(&repo.paths);
         let pack_names = list_pack_files(&pack_dirs)?;
@@ -241,6 +242,7 @@ impl<'a> PackIo<'a> {
     ///
     /// Pack lookup is attempted first; on miss, loose object directories
     /// are searched.
+    /// Delta depth is enforced across pack hops using `limits.max_delta_depth`.
     ///
     /// # Errors
     /// Returns `PackIoError` for malformed pack data or delta failures.
@@ -414,7 +416,7 @@ impl<'a> PackIo<'a> {
 
         Ok(self.pack_cache[idx]
             .as_ref()
-            .expect("pack mmap present")
+            .expect("pack bytes present")
             .clone())
     }
 }

@@ -20,6 +20,7 @@
 //! - Loose objects are decoded via `PackIo::load_loose_object`; failures are
 //!   recorded as skipped candidates.
 //! - Persistence is optional; callers can run the pipeline without a store.
+//! - When artifacts are missing, the run short-circuits with `NeedsMaintenance`.
 
 use std::fs;
 use std::fs::File;
@@ -27,9 +28,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use memmap2::Mmap;
-
 use crate::Engine;
+
+use memmap2::Mmap;
 
 use super::byte_arena::ByteArena;
 use super::commit_walk::{
@@ -150,6 +151,12 @@ impl CandidateSink for SpillCandidateSink<'_> {
 /// production usage. Callers should set `repo_id` and `policy_hash` to
 /// stable identifiers for their environment to ensure consistent
 /// persistence keys and scan identity.
+///
+/// `pack_cache_bytes` is an in-memory cache cap; oversized values are rejected
+/// at runtime when converting to `u32`.
+///
+/// `spill_dir` controls where intermediate spill files are written. When
+/// `None`, a unique temp directory is created per run.
 #[derive(Clone, Debug)]
 pub struct GitScanConfig {
     /// Stable repository identifier used to namespace persisted keys.
@@ -406,6 +413,9 @@ impl From<io::Error> for GitScanError {
 /// - `seen_store` is used to dedupe candidates across runs.
 /// - `watermark_store` records ref watermarks when finalize succeeds.
 /// - `persist_store` is optional; when `None`, finalize output is returned only.
+///
+/// If no persistence store is provided, the caller is responsible for
+/// interpreting `FinalizeOutcome` and storing watermarks as needed.
 ///
 /// # Returns
 /// - `NeedsMaintenance` when repo artifacts are missing or out of date.
@@ -666,12 +676,12 @@ fn make_spill_dir() -> Result<PathBuf, io::Error> {
 /// # Errors
 /// Returns `GitScanError::Midx` if the MIDX mmap is missing or corrupted.
 fn load_midx(repo: &RepoJobState) -> Result<MidxView<'_>, GitScanError> {
-    let midx_mmap = repo
+    let midx_bytes = repo
         .mmaps
         .midx
         .as_ref()
-        .ok_or_else(|| GitScanError::Midx(MidxError::corrupt("midx mmap missing")))?;
-    Ok(MidxView::parse(midx_mmap.as_ref(), repo.object_format)?)
+        .ok_or_else(|| GitScanError::Midx(MidxError::corrupt("midx bytes missing")))?;
+    Ok(MidxView::parse(midx_bytes.as_slice(), repo.object_format)?)
 }
 
 /// Convert the repo start set into finalize `RefEntry` values.

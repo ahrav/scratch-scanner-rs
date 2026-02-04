@@ -10,11 +10,14 @@
 //!
 //! Packs are not mmapped here. They are opened on demand in later phases
 //! per pack plan to avoid unnecessary FD and VMA pressure.
-//!
 //! # Invariants
 //! - Missing artifacts yield `NeedsMaintenance` with empty `mmaps` and `start_set`.
 //! - When artifacts are ready, fingerprints are captured for maintenance checks.
 //! - Start set refs are sorted deterministically by name.
+//!
+//! This stage performs minimal validation of metadata files: it checks for
+//! presence and mmaps commit-graph and MIDX, but parsing and structural
+//! validation are done by later phases.
 
 use std::fs::{self, File, Metadata};
 use std::io::Read;
@@ -24,6 +27,7 @@ use std::time::SystemTime;
 use memmap2::Mmap;
 
 use super::byte_arena::{ByteArena, ByteRef};
+use super::bytes::BytesView;
 use super::errors::RepoOpenError;
 use super::limits::RepoOpenLimits;
 use super::object_id::{ObjectFormat, OidBytes};
@@ -64,17 +68,17 @@ pub struct RepoArtifactPaths {
     pub midx: PathBuf,
 }
 
-/// Memory-mapped artifact files.
+/// Artifact bytes for required metadata files.
 ///
 /// Only populated when `RepoArtifactStatus::Ready`.
-/// Maps are read-only and expected to remain valid for the duration of
+/// Views are read-only and expected to remain valid for the duration of
 /// a repo job (maintenance must not run concurrently).
 #[derive(Debug, Default)]
 pub struct RepoArtifactMmaps {
-    /// Memory-mapped commit-graph.
-    pub commit_graph: Option<Mmap>,
-    /// Memory-mapped multi-pack-index.
-    pub midx: Option<Mmap>,
+    /// Commit-graph bytes (mmap or in-memory).
+    pub commit_graph: Option<BytesView>,
+    /// Multi-pack-index bytes (mmap or in-memory).
+    pub midx: Option<BytesView>,
 }
 
 /// Fingerprint of an artifact file.
@@ -113,6 +117,7 @@ pub struct StartSetRef {
 /// This struct contains everything needed for later Git phases without
 /// additional file opens (except pack files in pack processing phases). It
 /// also records artifact fingerprints used to detect concurrent maintenance.
+/// When artifacts are missing, `start_set` is empty and `mmaps` is unset.
 #[derive(Debug)]
 pub struct RepoJobState {
     /// Resolved repository paths.
@@ -127,7 +132,7 @@ pub struct RepoJobState {
     /// Artifact readiness status.
     pub artifact_status: RepoArtifactStatus,
 
-    /// Memory-mapped artifacts (only if `artifact_status.is_ready()`).
+    /// Artifact bytes (only if `artifact_status.is_ready()`).
     pub mmaps: RepoArtifactMmaps,
 
     /// Artifact fingerprints captured at repo open (only if artifacts were ready).
@@ -346,8 +351,8 @@ fn mmap_artifacts(
     ))
 }
 
-/// Maps a file read-only and returns the mmap plus a metadata fingerprint.
-fn mmap_file(path: &Path) -> Result<(Mmap, ArtifactFingerprint), RepoOpenError> {
+/// Maps a file read-only and returns a byte view plus a metadata fingerprint.
+fn mmap_file(path: &Path) -> Result<(BytesView, ArtifactFingerprint), RepoOpenError> {
     let file = File::open(path).map_err(RepoOpenError::io)?;
     let metadata = file.metadata().map_err(RepoOpenError::io)?;
     let fingerprint = fingerprint_metadata(&metadata)?;
@@ -358,7 +363,7 @@ fn mmap_file(path: &Path) -> Result<(Mmap, ArtifactFingerprint), RepoOpenError> 
         // Repo maintenance is expected to be quiescent; if the file is truncated
         // or replaced while mapped, the OS may signal a fault. That risk is accepted.
         let mmap = Mmap::map(&file).map_err(RepoOpenError::io)?;
-        Ok((mmap, fingerprint))
+        Ok((BytesView::from_mmap(mmap), fingerprint))
     }
 }
 
