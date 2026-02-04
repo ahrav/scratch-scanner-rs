@@ -4,6 +4,11 @@
 //! compare tree-diff behavior against `git diff-tree` output or explicit
 //! expectations. They also exercise spill partitioning and corrupt-tree
 //! error reporting.
+//!
+//! # Test Harness
+//! These tests require a `git` CLI with multi-pack-index support; otherwise
+//! they skip. Repos are fully packed and have commit-graph/MIDX artifacts
+//! because the object store requires those ready artifacts.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -28,6 +33,8 @@ fn git_available() -> bool {
 
 /// Returns true when this git build supports the MIDX command.
 fn git_supports_midx() -> bool {
+    // Some Git builds omit the multi-pack-index command; probing `--help`
+    // keeps the check fast and portable.
     Command::new("git")
         .args(["multi-pack-index", "--help"])
         .output()
@@ -126,6 +133,7 @@ fn prepare_repo_with_commits() -> TempDir {
     run_git(tmp.path(), &["add", "-A"]);
     run_git(tmp.path(), &["commit", "-m", "c2"]);
 
+    // Prepare artifacts expected by the object store.
     run_git(tmp.path(), &["commit-graph", "write", "--reachable"]);
     run_git(tmp.path(), &["repack", "-ad"]);
     run_git(tmp.path(), &["multi-pack-index", "write"]);
@@ -201,6 +209,7 @@ fn open_repo_state(repo: &Path) -> RepoJobState {
     let resolver = TestResolver {
         refs: vec![(b"refs/heads/main".to_vec(), head_oid)],
     };
+    // Keep the start set consistent with the resolver: only the default branch.
     let start_set_id = StartSetConfig::DefaultBranchOnly.id();
 
     let state = repo_open(
@@ -219,6 +228,8 @@ fn open_repo_state(repo: &Path) -> RepoJobState {
 }
 
 /// Collect tree diff change kinds into a map keyed by UTF-8 path.
+///
+/// The repo fixtures use ASCII paths, so the UTF-8 conversion is lossless.
 fn diff_paths(
     store: &mut ObjectStore,
     limits: &TreeDiffLimits,
@@ -330,6 +341,7 @@ fn tree_diff_spill_path_uses_spill_arena() {
     let tmp = prepare_repo_with_many_files(128);
     let state = open_repo_state(tmp.path());
 
+    // Force spill behavior by keeping the cache tiny.
     let mut limits = TreeDiffLimits::RESTRICTIVE;
     limits.max_tree_cache_bytes = 64;
     limits.max_tree_spill_bytes = 1024 * 1024;
@@ -387,12 +399,14 @@ fn tree_diff_streaming_matches_buffered() {
         &["show", "-s", "--format=%T", "HEAD~1"],
     ));
 
+    // Streaming limits: tiny cache/spill budgets to maximize re-reads.
     let mut limits_stream = TreeDiffLimits::RESTRICTIVE;
     limits_stream.max_tree_cache_bytes = 64;
     limits_stream.max_tree_spill_bytes = 1;
     limits_stream.max_tree_bytes_in_flight = 8 * 1024 * 1024;
     limits_stream.max_path_arena_bytes = 1024 * 1024;
 
+    // Buffered limits: large cache/spill budgets to maximize reuse.
     let mut limits_buffered = limits_stream;
     limits_buffered.max_tree_cache_bytes = 8 * 1024 * 1024;
     limits_buffered.max_tree_spill_bytes = 8 * 1024 * 1024;
@@ -480,6 +494,7 @@ fn merge_diff_modes_emit_expected_candidates() {
     assert!(first_only.contains_key("feature.txt"));
 }
 
+/// Merge diff mode helper: compose expected per-parent change maps.
 fn collect_merge_candidates(
     mode: MergeDiffMode,
     first_parent: &BTreeMap<String, ChangeKind>,
@@ -496,6 +511,9 @@ fn collect_merge_candidates(
 }
 
 /// Collect unique blobs via spill with the supplied limits.
+///
+/// This uses streaming candidate emission into `Spiller` to exercise the
+/// spill partitioning logic under tight limits.
 fn collect_unique_blobs(state: &RepoJobState, limits: SpillLimits) -> Vec<CollectedUniqueBlob> {
     let cg = CommitGraphView::open_repo(state).unwrap();
     let plan = introduced_by_plan(state, &cg, CommitWalkLimits::RESTRICTIVE).unwrap();
@@ -523,6 +541,7 @@ fn collect_unique_blobs(state: &RepoJobState, limits: SpillLimits) -> Vec<Collec
             ctx_flags: u16,
             cand_flags: u16,
         ) -> Result<(), TreeDiffError> {
+            // Translate candidate emission into spiller pushes.
             self.spiller
                 .push(
                     oid,
@@ -611,6 +630,9 @@ fn collect_unique_blobs(state: &RepoJobState, limits: SpillLimits) -> Vec<Collec
 }
 
 /// Collect unique blobs using a buffered candidate path before spilling.
+///
+/// This mirrors `collect_unique_blobs` but uses `CandidateBuffer` to ensure
+/// buffered and streaming paths are equivalent.
 fn collect_unique_blobs_buffered(
     state: &RepoJobState,
     limits: SpillLimits,
@@ -763,6 +785,7 @@ fn buffered_vs_streaming_candidates_match() {
 
 /// Write a corrupt tree object into the object database.
 fn write_corrupt_tree(objects_dir: &Path, oid: &OidBytes) {
+    // Missing the trailing OID bytes, so the tree entry is truncated.
     let payload = b"100644 file\0";
     let mut data = format!("tree {}\0", payload.len()).into_bytes();
     data.extend_from_slice(payload);

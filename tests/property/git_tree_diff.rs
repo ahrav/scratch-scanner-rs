@@ -224,6 +224,7 @@ proptest! {
             )
             .unwrap();
 
+        // Reference diff: map old and new entries and compare by path.
         let mut expected: BTreeMap<Vec<u8>, (ChangeKind, OidBytes)> = BTreeMap::new();
         let mut old_map: BTreeMap<Vec<u8>, OidBytes> = BTreeMap::new();
         for (path, oid) in &old_entries {
@@ -294,6 +295,8 @@ proptest! {
         let mut source_stream = TestTreeStore { trees: store.clone() };
         let mut source_buffered = TestTreeStore { trees: store };
 
+        // Streaming limits: tiny cache/spill budget so the walker must
+        // re-load tree payloads instead of relying on the cache.
         let limits_stream = TreeDiffLimits {
             max_candidates: (path_vec.len() as u32).saturating_add(32),
             max_path_arena_bytes: 1024 * 1024,
@@ -303,6 +306,7 @@ proptest! {
             max_tree_depth: 64,
         };
 
+        // Buffered limits: large cache and spill budget to maximize reuse.
         let mut limits_buffered = limits_stream;
         limits_buffered.max_tree_cache_bytes = 2 * 1024 * 1024;
         limits_buffered.max_tree_spill_bytes = 2 * 1024 * 1024;
