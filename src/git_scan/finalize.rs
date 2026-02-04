@@ -13,6 +13,18 @@
 //! - Findings are deduped by `(start, end, rule_id, norm_hash)` within each
 //!   blob OID before persistence.
 //!
+//! # Invariants
+//! - `path_arena` and `finding_arena` must cover all references in
+//!   `scanned_blobs`.
+//! - `skipped_candidate_oids` being non-empty forces a `Partial` outcome and
+//!   suppresses watermark ops.
+//! - `data_ops` are emitted in namespace order (`bc` < `fn` < `sb`) and sorted
+//!   within each namespace for lexicographic stores.
+//!
+//! # Key Safety
+//! - Ref watermark keys are null-terminated to keep prefix scans safe.
+//! - Keys use big-endian numeric fields to preserve ordering.
+//!
 //! # Key namespaces (lexicographic ordering)
 //! | Prefix | Namespace     | Description                         |
 //! |--------|---------------|-------------------------------------|

@@ -912,8 +912,8 @@ fn is_file(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::byte_arena::ByteRef;
+    use super::*;
     use crate::git_scan::{ByteRef, CandidateContext, ChangeKind};
     use crate::{
         demo_tuning, AnchorPolicy, Engine, Gate, RuleSpec, TransformConfig, TransformId,
