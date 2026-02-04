@@ -12,9 +12,7 @@ use std::fmt;
 
 /// Policy for how to treat encrypted archives or encrypted entries.
 ///
-/// "FailArchive" and "FailRun" are not used until archive scanning exists,
-/// but the configuration surface is defined now so downstream code can remain
-/// simple and policy-driven.
+/// Policy choices are enforced in archive scanning paths (pipeline + scheduler).
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum EncryptedPolicy {

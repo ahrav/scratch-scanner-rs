@@ -195,6 +195,9 @@ impl Log2Hist {
 /// # Returns
 /// Index in range [0, 63].
 ///
+/// This invariant is relied upon by `Log2Hist::record` and `record_n`, which
+/// use unchecked indexing for performance.
+///
 /// # Mapping
 /// - 0 -> bucket 0
 /// - 1 -> bucket 0

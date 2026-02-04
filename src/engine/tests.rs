@@ -15,7 +15,8 @@ use super::scratch::EntropyScratch;
 #[cfg(all(test, feature = "stdx-proptest"))]
 use super::transform::find_url_spans_into;
 use super::transform::{
-    decode_to_vec, find_base64_spans_into, find_spans_into, transform_quick_trigger,
+    base64_char_count, base64_skip_chars, decode_to_vec, find_base64_spans_into, find_spans_into,
+    transform_quick_trigger,
 };
 use super::vectorscan_prefilter::{
     gate_match_callback, stream_match_callback, VsStreamMatchCtx, VsStreamWindow,
@@ -1339,54 +1340,102 @@ fn reference_scan_keys(engine: &Engine, rules: &[RuleSpec], buf: &[u8]) -> HashS
                     }
                 }
 
-                let remaining = engine
-                    .tuning
-                    .max_total_decode_output_bytes
-                    .saturating_sub(total_decode_output_bytes);
-                if remaining == 0 {
-                    break;
-                }
-                let max_out = tc.max_decoded_bytes.min(remaining);
+                let mut span_starts = [0usize; 4];
+                let mut span_ends = [0usize; 4];
+                let mut span_count = 0usize;
 
-                let decoded = match decode_to_vec(tc, enc, max_out) {
-                    Ok(bytes) => bytes,
-                    Err(_) => continue,
-                };
-                if decoded.is_empty() {
-                    continue;
+                if tc.id == TransformId::Base64 {
+                    let allow_space_ws = tc.base64_allow_space_ws;
+                    for shift in 0..4usize {
+                        let Some(rel) = base64_skip_chars(enc, shift, allow_space_ws) else {
+                            break;
+                        };
+                        let start = enc_span.start.saturating_add(rel);
+                        if start >= enc_span.end {
+                            continue;
+                        }
+                        if span_starts[..span_count].contains(&start) {
+                            continue;
+                        }
+                        let enc_aligned = &item.buf[start..enc_span.end];
+                        let remaining_chars = base64_char_count(enc_aligned, allow_space_ws);
+                        if remaining_chars < tc.min_len {
+                            continue;
+                        }
+                        span_starts[span_count] = start;
+                        span_ends[span_count] = enc_span.end;
+                        span_count += 1;
+                        if span_count >= span_starts.len() {
+                            break;
+                        }
+                    }
+                } else {
+                    span_starts[0] = enc_span.start;
+                    span_ends[0] = enc_span.end;
+                    span_count = 1;
                 }
 
-                total_decode_output_bytes = total_decode_output_bytes.saturating_add(decoded.len());
-                if total_decode_output_bytes > engine.tuning.max_total_decode_output_bytes {
-                    break;
-                }
+                for idx in 0..span_count {
+                    if work_items_enqueued >= engine.tuning.max_work_items {
+                        break;
+                    }
+                    if total_decode_output_bytes >= engine.tuning.max_total_decode_output_bytes {
+                        break;
+                    }
 
-                if tc.gate == Gate::AnchorsInDecoded {
-                    let gate_satisfied = decoded_prefilter_hit(engine, &decoded);
-                    let enforce_gate = if engine.vs_gate.is_some() {
-                        true
-                    } else {
-                        !engine.tuning.scan_utf16_variants || !engine.has_utf16_anchors
+                    let enc_span = span_starts[idx]..span_ends[idx];
+                    let enc = &item.buf[enc_span.clone()];
+
+                    let remaining = engine
+                        .tuning
+                        .max_total_decode_output_bytes
+                        .saturating_sub(total_decode_output_bytes);
+                    if remaining == 0 {
+                        break;
+                    }
+                    let max_out = tc.max_decoded_bytes.min(remaining);
+
+                    let decoded = match decode_to_vec(tc, enc, max_out) {
+                        Ok(bytes) => bytes,
+                        Err(_) => continue,
                     };
-                    if enforce_gate && !gate_satisfied {
+                    if decoded.is_empty() {
                         continue;
                     }
+
+                    total_decode_output_bytes =
+                        total_decode_output_bytes.saturating_add(decoded.len());
+                    if total_decode_output_bytes > engine.tuning.max_total_decode_output_bytes {
+                        break;
+                    }
+
+                    if tc.gate == Gate::AnchorsInDecoded {
+                        let gate_satisfied = decoded_prefilter_hit(engine, &decoded);
+                        let enforce_gate = if engine.vs_gate.is_some() {
+                            true
+                        } else {
+                            !engine.tuning.scan_utf16_variants || !engine.has_utf16_anchors
+                        };
+                        if enforce_gate && !gate_satisfied {
+                            continue;
+                        }
+                    }
+
+                    let h = hash128(&decoded);
+                    if !seen.insert(h) {
+                        continue;
+                    }
+
+                    let mut steps = item.steps.clone();
+                    steps.push(StepKind::Transform { idx: tidx });
+
+                    work_q.push(RefWorkItem {
+                        buf: decoded,
+                        steps,
+                        depth: item.depth + 1,
+                    });
+                    work_items_enqueued += 1;
                 }
-
-                let h = hash128(&decoded);
-                if !seen.insert(h) {
-                    continue;
-                }
-
-                let mut steps = item.steps.clone();
-                steps.push(StepKind::Transform { idx: tidx });
-
-                work_q.push(RefWorkItem {
-                    buf: decoded,
-                    steps,
-                    depth: item.depth + 1,
-                });
-                work_items_enqueued += 1;
             }
         }
     }

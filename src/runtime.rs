@@ -341,6 +341,10 @@ impl FileTable {
     ///
     /// This is used by archive scanning so output formatting can still read
     /// a path from `FileTable` without panicking on path arena overflow.
+    ///
+    /// Callers that bypass `FileTable` should still ensure virtual `FileId` values
+    /// are unique and isolated from real files (for example, by using a high-bit
+    /// namespace) to avoid cross-file engine state leakage.
     pub fn try_insert_virtual(
         &mut self,
         display_bytes: &[u8],
@@ -571,6 +575,8 @@ impl BufferPoolInner {
 ///
 /// Each acquired buffer is returned to the pool when its [`BufferHandle`] drops.
 /// This pool is `Rc`-backed and intended for single-threaded use.
+///
+/// Buffers are always `BUFFER_LEN_MAX` bytes and aligned to `BUFFER_ALIGN`.
 #[derive(Clone)]
 pub struct BufferPool(Rc<BufferPoolInner>);
 
@@ -620,6 +626,8 @@ impl BufferPool {
 ///
 /// The buffer contents are not automatically cleared between uses; call
 /// [`clear`](Self::clear) if you need zeroed memory.
+///
+/// This handle is not `Send`/`Sync` because the underlying pool is `Rc`-backed.
 pub struct BufferHandle {
     pool: Rc<BufferPoolInner>,
     ptr: NonNull<u8>,
@@ -678,6 +686,8 @@ impl Drop for BufferHandle {
 ///   `Ok(())`.
 /// - `tail` is used as scratch storage; its contents after return are
 ///   unspecified.
+/// - If the `emit` closure retains chunks, the buffer pool must be sized
+///   accordingly to avoid exhausting available buffers.
 ///
 /// # Errors
 /// Returns any I/O error from opening or reading the file.

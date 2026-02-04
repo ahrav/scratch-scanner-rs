@@ -99,6 +99,12 @@ graph TB
 | **ScanScratch** | `src/engine/scratch.rs:83` | Per-scan reusable scratch state |
 | **TimingWheel** | `src/stdx/timing_wheel.rs:479` | Hashed timing wheel for window expiration scheduling |
 
+## Archive Scanning Notes
+
+- Nested archive expansion is streaming-only and bounded by `ArchiveConfig::max_archive_depth`.
+- Policy enforcement is deterministic: `FailArchive` stops the current container, `FailRun` aborts the scan.
+- Archive entries use virtual `FileId` values (high-bit namespace) to isolate per-file engine state.
+
 ## Testing Harnesses
 
 The optional simulation harnesses provide deterministic simulation primitives and replayable traces

@@ -142,6 +142,9 @@ impl EntryLike for ignore::DirEntry {
 /// Discovery avoids per-file metadata when a type hint is available. Size caps
 /// are enforced at open time in `local.rs`.
 ///
+/// When the fast type hint path is used, the file size is set to 0; open-time
+/// metadata determines the actual size and enforcement.
+///
 /// Returns `None` on:
 /// - Non-file entries
 /// - Metadata errors when the type hint is missing
@@ -325,6 +328,8 @@ impl ParallelScanConfig {
 // ============================================================================
 
 /// Report from a parallel directory scan.
+///
+/// This is currently identical to `LocalReport` (stats + metrics snapshot).
 pub type ParallelScanReport = LocalReport;
 
 // ============================================================================

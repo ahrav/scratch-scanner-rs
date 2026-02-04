@@ -25,6 +25,8 @@
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 
+use crate::archive::formats::tar::TarRead;
+
 use flate2::read::DeflateDecoder;
 
 use crate::archive::{
@@ -642,19 +644,24 @@ impl<'a> ZipEntryReader<'a> {
 /// Read wrapper that limits reads to a fixed number of bytes.
 ///
 /// This is used to bound entry payload reads to the compressed size.
-pub struct LimitedRead<'a, R: Read> {
+pub struct LimitedRead<'a, R: ?Sized + Read> {
     inner: &'a mut R,
     remaining: u64,
 }
 
-impl<'a, R: Read> LimitedRead<'a, R> {
+impl<'a, R: ?Sized + Read> LimitedRead<'a, R> {
     #[inline]
     pub fn new(inner: &'a mut R, remaining: u64) -> Self {
         Self { inner, remaining }
     }
+
+    #[inline]
+    pub fn remaining(&self) -> u64 {
+        self.remaining
+    }
 }
 
-impl<R: Read> Read for LimitedRead<'_, R> {
+impl<R: ?Sized + Read> Read for LimitedRead<'_, R> {
     #[inline]
     fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
         if self.remaining == 0 {
@@ -666,6 +673,8 @@ impl<R: Read> Read for LimitedRead<'_, R> {
         Ok(n)
     }
 }
+
+impl<R: ?Sized + Read> TarRead for LimitedRead<'_, R> {}
 
 /// Read wrapper that counts bytes read from the underlying reader.
 ///

@@ -88,6 +88,13 @@ impl<R: Read> TarRead for GzipStream<R> {
     }
 }
 
+impl<T: TarRead + ?Sized> TarRead for &mut T {
+    #[inline(always)]
+    fn take_compressed_delta(&mut self) -> u64 {
+        (**self).take_compressed_delta()
+    }
+}
+
 impl TarRead for std::io::Cursor<Vec<u8>> {}
 
 /// A parsed tar entry header (after applying GNU/PAX overrides).
@@ -242,9 +249,9 @@ impl TarCursor {
     /// This consumes only header/metadata records. For regular entries, the
     /// caller must read (or skip) the payload and then advance alignment via
     /// `advance_entry_blocks` or the helper skip methods.
-    pub fn next_entry<'a>(
+    pub fn next_entry<'a, R: TarRead + ?Sized>(
         &'a mut self,
-        input: &mut impl TarRead,
+        input: &mut R,
         budgets: &mut ArchiveBudgets,
         cfg: &ArchiveConfig,
     ) -> io::Result<TarNext<'a>> {
@@ -348,9 +355,9 @@ impl TarCursor {
     }
 
     /// Skip non-regular entry payload and padding as metadata-bounded work.
-    pub fn skip_payload_and_pad(
+    pub fn skip_payload_and_pad<R: TarRead + ?Sized>(
         &mut self,
-        input: &mut impl TarRead,
+        input: &mut R,
         budgets: &mut ArchiveBudgets,
         size: u64,
         pad: u64,
@@ -376,9 +383,9 @@ impl TarCursor {
     }
 
     /// Skip padding bytes after a payload read, charging metadata budget.
-    pub fn skip_padding_only(
+    pub fn skip_padding_only<R: TarRead + ?Sized>(
         &mut self,
-        input: &mut impl TarRead,
+        input: &mut R,
         budgets: &mut ArchiveBudgets,
         pad: u64,
     ) -> io::Result<Result<(), PartialReason>> {
@@ -388,9 +395,9 @@ impl TarCursor {
         Ok(Ok(()))
     }
 
-    fn skip_bytes_as_metadata(
+    fn skip_bytes_as_metadata<R: TarRead + ?Sized>(
         &mut self,
-        input: &mut impl TarRead,
+        input: &mut R,
         budgets: &mut ArchiveBudgets,
         mut n: u64,
     ) -> io::Result<Result<(), PartialReason>> {
@@ -414,9 +421,9 @@ impl TarCursor {
         Ok(Ok(()))
     }
 
-    fn read_gnu_longname(
+    fn read_gnu_longname<R: TarRead + ?Sized>(
         &mut self,
-        input: &mut impl TarRead,
+        input: &mut R,
         budgets: &mut ArchiveBudgets,
         cfg: &ArchiveConfig,
         size: u64,
@@ -465,9 +472,9 @@ impl TarCursor {
         }
     }
 
-    fn read_pax_path(
+    fn read_pax_path<R: TarRead + ?Sized>(
         &mut self,
-        input: &mut impl TarRead,
+        input: &mut R,
         budgets: &mut ArchiveBudgets,
         cfg: &ArchiveConfig,
         size: u64,
@@ -781,7 +788,7 @@ fn memchr_byte_from(needle: u8, hay: &[u8], start: usize) -> Option<usize> {
     None
 }
 
-fn read_some<R: Read>(r: &mut R, dst: &mut [u8]) -> io::Result<usize> {
+fn read_some<R: Read + ?Sized>(r: &mut R, dst: &mut [u8]) -> io::Result<usize> {
     loop {
         match r.read(dst) {
             Ok(n) => return Ok(n),
@@ -791,7 +798,7 @@ fn read_some<R: Read>(r: &mut R, dst: &mut [u8]) -> io::Result<usize> {
     }
 }
 
-fn read_exact_or_eof<R: Read>(r: &mut R, dst: &mut [u8]) -> io::Result<bool> {
+fn read_exact_or_eof<R: Read + ?Sized>(r: &mut R, dst: &mut [u8]) -> io::Result<bool> {
     let mut off = 0;
     while off < dst.len() {
         let n = read_some(r, &mut dst[off..])?;
@@ -810,7 +817,7 @@ fn read_exact_or_eof<R: Read>(r: &mut R, dst: &mut [u8]) -> io::Result<bool> {
     Ok(true)
 }
 
-fn read_exact_n<R: Read>(r: &mut R, dst: &mut [u8]) -> io::Result<()> {
+fn read_exact_n<R: Read + ?Sized>(r: &mut R, dst: &mut [u8]) -> io::Result<()> {
     let mut off = 0;
     while off < dst.len() {
         let n = read_some(r, &mut dst[off..])?;
