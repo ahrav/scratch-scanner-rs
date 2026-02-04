@@ -204,6 +204,19 @@ Scanner harness code lives in `src/sim_scanner/` with shared primitives in `src/
 | **TraceRing**         | `src/sim/trace.rs`                   | Bounded trace buffer for replay and debugging                  |
 | **Minimizer**         | `src/sim/minimize.rs`                | Deterministic shrink passes for failing scanner artifacts      |
 
+### Git Simulation Harness (`sim-harness` feature)
+
+Git simulation harness code lives in `src/sim_git_scan/` with shared primitives in `src/sim/`.
+
+| Component               | Location                                | Purpose                                                             |
+| ----------------------- | --------------------------------------- | ------------------------------------------------------------------- |
+| **Git Scenario Schema** | `src/sim_git_scan/scenario.rs`          | Repo model + artifact bytes schema for deterministic Git scenarios  |
+| **Git Runner**          | `src/sim_git_scan/runner.rs`            | Deterministic stage runner and failure taxonomy                     |
+| **Git Trace Ring**      | `src/sim_git_scan/trace.rs`             | Bounded trace buffer for Git simulation replay                      |
+| **Git Artifact Schema** | `src/sim_git_scan/artifact.rs`          | Reproducible artifact format for Git sim failures                   |
+| **Git Fault Plan**      | `src/sim_git_scan/fault.rs`             | Deterministic fault injection plan keyed by logical Git resources   |
+| **SimExecutor**         | `src/sim/executor.rs`                   | Shared deterministic executor used for schedule control             |
+
 ### Scheduler Simulation Harness (`scheduler-sim` feature)
 
 Scheduler harness code lives in `src/scheduler/sim_executor_harness.rs`.
