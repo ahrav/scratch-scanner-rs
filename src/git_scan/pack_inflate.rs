@@ -501,7 +501,11 @@ pub fn apply_delta(
         if (cmd & 0x80) != 0 {
             let (off, size) = decode_copy_params(delta, &mut pos, cmd)?;
 
-            if off.checked_add(size).is_none_or(|end| end > base.len()) {
+            let end = match off.checked_add(size) {
+                Some(end) => end,
+                None => return Err(DeltaError::CopyOutOfRange),
+            };
+            if end > base.len() {
                 return Err(DeltaError::CopyOutOfRange);
             }
             if out.len() + size > result_size {
