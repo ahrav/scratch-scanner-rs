@@ -1117,12 +1117,12 @@ mod tests {
             require_quoted: true,
             key_names_any: None,
         };
-        let window = b"key='SECRET'";
+        let window = b"key='SECRET' ";
         let secret_start = window.iter().position(|&b| b == b'S').unwrap();
         let secret_end = secret_start + "SECRET".len();
         assert!(local_context_passes(window, secret_start, secret_end, spec));
 
-        let window = b"key=SECRET";
+        let window = b"key=SECRET ";
         let secret_start = window.iter().position(|&b| b == b'S').unwrap();
         let secret_end = secret_start + "SECRET".len();
         assert!(!local_context_passes(

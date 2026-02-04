@@ -1,4 +1,4 @@
-use crate::api::{EntropySpec, RuleSpec, TwoPhaseSpec, ValidatorKind};
+use crate::api::{EntropySpec, LocalContextSpec, RuleSpec, TwoPhaseSpec, ValidatorKind};
 use regex::bytes::Regex;
 
 const REGEX_SIZE_LIMITS: &[usize] = &[32 * 1024 * 1024, 128 * 1024 * 1024, 512 * 1024 * 1024];
@@ -1386,7 +1386,36 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 min_len: 16,
                 max_len: 256,
             }),
-            local_context: None,
+            // Local context gate: require assignment shape on the same line and
+            // a nearby key name to reduce noisy token-only matches.
+            local_context: Some(LocalContextSpec {
+                lookbehind: 256,
+                lookahead: 128,
+                require_same_line_assignment: true,
+                require_quoted: false,
+                key_names_any: Some(&[
+                    b"access",
+                    b"ACCESS",
+                    b"api",
+                    b"API",
+                    b"auth",
+                    b"AUTH",
+                    b"key",
+                    b"KEY",
+                    b"credential",
+                    b"CREDENTIAL",
+                    b"creds",
+                    b"CREDS",
+                    b"passwd",
+                    b"PASSWD",
+                    b"password",
+                    b"PASSWORD",
+                    b"secret",
+                    b"SECRET",
+                    b"token",
+                    b"TOKEN",
+                ]),
+            }),
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:access|auth|(?-i:[Aa]pi|API)|credential|creds|key|passw(?:or)?d|secret|token)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([\w.=-]{10,150}|[a-z0-9][a-z0-9+/]{11,}={0,3})(?:[\x60'"\s;]|\\[nr]|$)"#,

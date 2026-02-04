@@ -271,7 +271,7 @@ fn local_context_gate_applies_in_base64_stream_decode() {
         AnchorPolicy::ManualOnly,
     );
 
-    let good_plain = b"key=\"SECRET_ABCD\"";
+    let good_plain = b"key=\"SECRET_ABCD\" ";
     let good_b64 = b64_encode(good_plain);
     let hay = format!("prefix {good_b64} suffix");
     let hits = scan_chunk_findings(&engine, hay.as_bytes());
@@ -280,13 +280,108 @@ fn local_context_gate_applies_in_base64_stream_decode() {
         "expected finding with quoted secret in decoded stream"
     );
 
-    let bad_plain = b"key=SECRET_ABCD";
+    let bad_plain = b"key=SECRET_ABCD ";
     let bad_b64 = b64_encode(bad_plain);
     let hay = format!("prefix {bad_b64} suffix");
     let hits = scan_chunk_findings(&engine, hay.as_bytes());
     assert!(
         !hits.iter().any(|h| h.rule == "b64-local-context"),
         "expected local context gate to filter unquoted decoded secret"
+    );
+}
+
+#[test]
+fn local_context_gate_filters_without_assignment_when_bounds_present() {
+    let rule = RuleSpec {
+        name: "lc-assign",
+        anchors: &[b"TOK_"],
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        local_context: Some(LocalContextSpec {
+            lookbehind: 64,
+            lookahead: 64,
+            require_same_line_assignment: true,
+            require_quoted: false,
+            key_names_any: None,
+        }),
+        secret_group: None,
+        re: Regex::new(r"TOK_[A-Z]{4}").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let hay = b"prefix\nTOK_ABCD\nsuffix";
+    let hits = scan_chunk_findings(&engine, hay);
+    assert!(
+        !hits.iter().any(|h| h.rule == "lc-assign"),
+        "expected local context gate to filter when assignment is missing"
+    );
+
+    let hay = b"prefix\nkey = TOK_ABCD\nsuffix";
+    let hits = scan_chunk_findings(&engine, hay);
+    assert!(
+        hits.iter().any(|h| h.rule == "lc-assign"),
+        "expected local context gate to pass when assignment is present"
+    );
+}
+
+#[test]
+fn local_context_key_names_required_and_fail_open_when_out_of_range() {
+    let rule = RuleSpec {
+        name: "lc-keyname",
+        anchors: &[b"TOK_"],
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        local_context: Some(LocalContextSpec {
+            lookbehind: 64,
+            lookahead: 64,
+            require_same_line_assignment: false,
+            require_quoted: false,
+            key_names_any: Some(&[b"key"]),
+        }),
+        secret_group: None,
+        re: Regex::new(r"TOK_[A-Z]{4}").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let hay = b"prefix\nkey = TOK_ABCD\nsuffix";
+    let hits = scan_chunk_findings(&engine, hay);
+    assert!(
+        hits.iter().any(|h| h.rule == "lc-keyname"),
+        "expected local context gate to pass with required key name"
+    );
+
+    let hay = b"prefix\nvalue = TOK_ABCD\nsuffix";
+    let hits = scan_chunk_findings(&engine, hay);
+    assert!(
+        !hits.iter().any(|h| h.rule == "lc-keyname"),
+        "expected local context gate to filter without key name"
+    );
+
+    let hay = b"prefix key = TOK_ABCD suffix";
+    let hits = scan_chunk_findings(&engine, hay);
+    assert!(
+        hits.iter().any(|h| h.rule == "lc-keyname"),
+        "expected local context gate to fail open when line bounds are missing"
     );
 }
 
@@ -1073,15 +1168,22 @@ fn local_context_gate_applies_in_utf16_path() {
     good.push(b'"');
     good.extend_from_slice(good_plain);
     good.push(b'"');
-    let utf16 = utf16le_bytes(&good);
+    // Prefix with two zero bytes so the BE-aligned decode includes a leading
+    // character before the match; otherwise the quote gate can fail open at offset 0.
+    let mut utf16 = Vec::with_capacity(2 + good.len() * 2);
+    utf16.extend_from_slice(&[0u8, 0u8]);
+    utf16.extend_from_slice(&utf16le_bytes(&good));
     let hits = scan_chunk_findings(&eng, &utf16);
     assert!(
         hits.iter().any(|h| h.rule == "utf16-local-context"),
         "expected quoted UTF-16 match to pass local context gate"
     );
 
-    let bad_plain = b"UTF_Secret12";
-    let utf16 = utf16le_bytes(bad_plain);
+    let bad_plain = b"xUTF_Secret12 ";
+    // Same prefix ensures both UTF-16 alignments see a non-quote before the secret.
+    let mut utf16 = Vec::with_capacity(2 + bad_plain.len() * 2);
+    utf16.extend_from_slice(&[0u8, 0u8]);
+    utf16.extend_from_slice(&utf16le_bytes(bad_plain));
     let hits = scan_chunk_findings(&eng, &utf16);
     assert!(
         !hits.iter().any(|h| h.rule == "utf16-local-context"),
