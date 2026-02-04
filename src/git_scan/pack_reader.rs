@@ -55,6 +55,7 @@ pub trait PackReader {
     ///
     /// This helper performs a single `read_at` call to allow deterministic
     /// fault injection (short reads map to a single failure).
+    /// If `dst` is empty, this returns `Ok(())` without calling `read_at`.
     fn read_exact_at(&mut self, offset: u64, dst: &mut [u8]) -> Result<(), PackReadError> {
         if dst.is_empty() {
             return Ok(());
@@ -106,7 +107,7 @@ impl PackReader for SlicePackReader<'_> {
 
 impl PackReader for BytesView {
     fn len(&self) -> u64 {
-        self.len() as u64
+        BytesView::len(self) as u64
     }
 
     fn read_at(&mut self, offset: u64, dst: &mut [u8]) -> Result<usize, PackReadError> {

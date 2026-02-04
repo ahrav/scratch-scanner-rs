@@ -1,4 +1,3 @@
-#![cfg(any(test, feature = "sim-harness"))]
 //! Bounded random Git simulation harness.
 //!
 //! Environment knobs:

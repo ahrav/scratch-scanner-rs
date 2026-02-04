@@ -13,6 +13,8 @@ pub enum SimGitError {
     MissingObject { kind: &'static str },
     /// Pack bytes were missing for a pack id.
     PackIdOutOfRange { pack_id: u16, pack_count: usize },
+    /// Duplicate pack id encountered while assembling pack bytes.
+    DuplicatePackId { pack_id: u16 },
     /// Pack count mismatch between metadata and bytes.
     PackCountMismatch { expected: usize, actual: usize },
     /// MIDX parse failed.
@@ -32,6 +34,9 @@ impl fmt::Display for SimGitError {
                 pack_count,
             } => {
                 write!(f, "pack id {pack_id} out of range (count {pack_count})")
+            }
+            Self::DuplicatePackId { pack_id } => {
+                write!(f, "duplicate pack id {pack_id}")
             }
             Self::PackCountMismatch { expected, actual } => {
                 write!(f, "pack count mismatch: expected {expected}, got {actual}")

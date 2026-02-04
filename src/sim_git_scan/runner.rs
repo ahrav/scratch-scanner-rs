@@ -613,7 +613,7 @@ fn stage_pack_exec(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
     for plan in &plans {
         let reader_bytes = pack_bytes
             .pack_bytes(plan.pack_id)
-            .map_err(|err| failure_inv(39, err))?;
+            .map_err(|err| failure_inv(41, err))?;
         let mut reader = FaultyPackReader::new(
             GitResourceId::Pack {
                 pack_id: plan.pack_id,

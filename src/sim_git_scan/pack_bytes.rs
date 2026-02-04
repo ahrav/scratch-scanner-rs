@@ -2,6 +2,8 @@
 //!
 //! This module converts embedded pack bytes into `PackView`s and provides
 //! accessors suitable for in-memory execution and planning.
+//! Pack ids are expected to be contiguous starting at 0; duplicates are
+//! rejected so the id can be used as a dense index.
 
 use crate::git_scan::{BytesView, ObjectFormat, PackPlanError, PackView};
 
@@ -82,9 +84,8 @@ fn collect_packs(packs: &[GitPackBytes]) -> Result<Vec<BytesView>, SimGitError> 
     for pack in packs {
         let idx = pack.pack_id as usize;
         if out[idx].is_some() {
-            return Err(SimGitError::PackCountMismatch {
-                expected,
-                actual: packs.len(),
+            return Err(SimGitError::DuplicatePackId {
+                pack_id: pack.pack_id,
             });
         }
         out[idx] = Some(BytesView::from_vec(pack.bytes.clone()));

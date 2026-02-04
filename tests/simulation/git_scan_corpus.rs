@@ -1,4 +1,3 @@
-#![cfg(any(test, feature = "sim-harness"))]
 //! Replay minimized Git simulation corpus cases and assert regressions stay fixed.
 //!
 //! Each `.case.json` file under `tests/corpus/git_scan` is replayed with the

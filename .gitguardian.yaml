@@ -1,0 +1,5 @@
+version: 2
+
+# Test fixtures intentionally contain secret-like material for detection coverage.
+paths-ignore:
+  - "tests/corpus/real_rules/fixtures/**"
