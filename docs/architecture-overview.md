@@ -215,6 +215,11 @@ Git simulation harness code lives in `src/sim_git_scan/` with shared primitives 
 | **Git Trace Ring**      | `src/sim_git_scan/trace.rs`             | Bounded trace buffer for Git simulation replay                      |
 | **Git Artifact Schema** | `src/sim_git_scan/artifact.rs`          | Reproducible artifact format for Git sim failures                   |
 | **Git Fault Plan**      | `src/sim_git_scan/fault.rs`             | Deterministic fault injection plan keyed by logical Git resources   |
+| **Sim Commit Graph**    | `src/sim_git_scan/commit_graph.rs`      | In-memory commit-graph adapter for deterministic commit walks       |
+| **Sim Start Set**       | `src/sim_git_scan/start_set.rs`         | Start set + watermark adapters for simulated refs                   |
+| **Sim Tree Source**     | `src/sim_git_scan/tree_source.rs`       | Tree-source adapter that encodes semantic trees into raw bytes      |
+| **Sim Pack Bytes**      | `src/sim_git_scan/pack_bytes.rs`        | In-memory pack bytes and pack-view adapter                          |
+| **Sim Pack I/O**        | `src/sim_git_scan/pack_io.rs`           | External base resolver over in-memory pack bytes                    |
 | **SimExecutor**         | `src/sim/executor.rs`                   | Shared deterministic executor used for schedule control             |
 
 ### Scheduler Simulation Harness (`scheduler-sim` feature)

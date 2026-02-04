@@ -5,6 +5,11 @@
 //! Determinism-critical inputs (scenario, seeds, fault plan, and run config)
 //! are stored alongside diagnostic metadata such as build version and trace
 //! snapshots.
+//!
+//! # Versioning
+//! - `schema_version` governs this artifact wrapper.
+//! - `scenario.schema_version` governs the embedded scenario payload.
+//! - Callers should validate both before replaying across versions.
 
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +22,8 @@ use super::trace::GitTraceEvent;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GitTraceDump {
     /// Ring-buffer snapshot of recent events.
+    ///
+    /// Events are ordered from oldest to newest.
     pub ring: Vec<GitTraceEvent>,
     /// Optional full trace for exact replay.
     pub full: Option<Vec<GitTraceEvent>>,
@@ -33,6 +40,8 @@ pub struct GitReproArtifact {
     /// Optional git commit for the scanner build (diagnostics only).
     pub git_commit: Option<String>,
     /// Human-readable target label (for example repo name or path).
+    ///
+    /// This is informational only and must not affect replay.
     pub target: String,
 
     /// Determinism keys.
@@ -72,7 +81,7 @@ mod tests {
             },
             fault_plan: GitFaultPlan::default(),
             failure: FailureReport {
-                kind: crate::sim_git_scan::runner::FailureKind::Unimplemented,
+                kind: crate::sim_git_scan::runner::FailureKind::OracleMismatch,
                 message: "x".to_string(),
                 step: 0,
             },

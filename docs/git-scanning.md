@@ -39,11 +39,13 @@ flowchart LR
 ## Determinism and Safety Invariants
 
 - Preflight and repo open read metadata only; no blob payloads are read before pack decoding.
+- Metadata artifacts are accessed through read-only byte views (mmap-backed in production).
 - Candidate ordering is deterministic and stable across spill boundaries.
 - Findings are deduped per blob and stored as `(start, end, rule_id, norm_hash)`.
 - No raw secret bytes are persisted; only hashes and metadata are stored.
 - Persistence is two-phase: write data ops first and write watermarks only for complete runs.
 - Any decode skips or loose-object fallbacks result in `FinalizeOutcome::Partial`.
+ - Pack decoding can be driven via a read-at reader for deterministic fault injection.
 
 ## Persistence Contract
 

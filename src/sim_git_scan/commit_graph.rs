@@ -34,6 +34,11 @@ impl SimCommitGraph {
     ///
     /// This assigns positions in `repo.commits` order and precomputes parent
     /// links to avoid repeated OID lookups during walks.
+    ///
+    /// # Errors
+    /// - `InvalidOidLength` if any commit or tree OID length is wrong.
+    /// - `DuplicateOid` if two commits share the same OID.
+    /// - `MissingObject` if a parent OID is not present in the model.
     pub fn from_repo(repo: &GitRepoModel) -> Result<Self, SimGitError> {
         let object_format = to_object_format(repo.object_format);
         let mut oid_to_pos = HashMap::with_capacity(repo.commits.len());
@@ -64,12 +69,24 @@ impl SimCommitGraph {
     }
 
     /// Returns the root tree OID for the commit at `pos`.
+    ///
+    /// Returns `MissingObject` if `pos` is out of range.
     pub fn root_tree_oid(&self, pos: Position) -> Result<OidBytes, SimGitError> {
         let idx = pos.0 as usize;
         if idx >= self.roots.len() {
             return Err(SimGitError::MissingObject { kind: "commit" });
         }
         Ok(self.roots[idx])
+    }
+
+    /// Returns parent positions for a commit.
+    #[must_use]
+    pub fn parents(&self, pos: Position) -> &[Position] {
+        let idx = pos.0 as usize;
+        self.parents
+            .get(idx)
+            .map(|p| p.as_slice())
+            .unwrap_or_default()
     }
 }
 

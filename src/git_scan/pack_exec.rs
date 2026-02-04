@@ -13,6 +13,16 @@
 //! The executor treats decode failures as per-offset skips and only returns
 //! fatal errors for pack parsing, sink failures, or external base loading
 //! errors.
+//!
+//! # Plan assumptions
+//! - `need_offsets` is sorted ascending.
+//! - `candidate_offsets` is sorted ascending by offset and grouped per offset.
+//! - `exec_order`, when present, indexes into `need_offsets`.
+//!
+//! # Buffer ownership
+//! - `PackCache` stores decoded bytes when space permits.
+//! - Otherwise, bytes live in a scratch buffer that is overwritten per offset.
+//! - Sinks must consume `bytes` within the `emit` call.
 
 use std::collections::HashMap;
 use std::fmt;

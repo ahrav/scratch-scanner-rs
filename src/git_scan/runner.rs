@@ -6,6 +6,7 @@
 //! # Notes
 //! - Loose objects are currently treated as skipped candidates.
 //! - Persistence is optional; callers can run the pipeline without a store.
+//! - When artifacts are missing, the run short-circuits with `NeedsMaintenance`.
 
 use std::fs;
 use std::fs::File;
@@ -59,6 +60,9 @@ use super::tree_diff_limits::TreeDiffLimits;
 ///
 /// `pack_cache_bytes` is an in-memory cache cap; oversized values are rejected
 /// at runtime when converting to `u32`.
+///
+/// `spill_dir` controls where intermediate spill files are written. When
+/// `None`, a unique temp directory is created per run.
 #[derive(Clone, Debug)]
 pub struct GitScanConfig {
     /// Stable repository identifier used to namespace persisted keys.
@@ -253,6 +257,9 @@ impl From<io::Error> for GitScanError {
 /// The pipeline short-circuits with `NeedsMaintenance` if preflight or repo
 /// open indicates missing artifacts (MIDX, commit graph, etc.). On success,
 /// the scan is finalized and optionally persisted.
+///
+/// If no persistence store is provided, the caller is responsible for
+/// interpreting `FinalizeOutcome` and storing watermarks as needed.
 ///
 /// # Caveats
 /// - Loose objects are currently treated as skipped candidates. This yields
