@@ -14,10 +14,14 @@
 //!   read via buffered IO to avoid short reads and alignment traps.
 
 use super::*;
-use crate::{BufferPool, Chunk, Engine, FindingRec, ScanScratch};
+use crate::git_scan::path_policy::lexical_family_for_path;
+use crate::lexical::{LexRuns, DEFAULT_LEX_RUN_CAP};
+use crate::scheduler::lexical_pass::{apply_lexical_context, tokenize_for_lexical};
+use crate::{BufferPool, Chunk, ContextMode, Engine, FindingRec, ScanScratch};
 use io_uring::{opcode, types, IoUring};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
@@ -40,6 +44,9 @@ pub struct UringScanner {
     ring: IoUring,
     scratch: ScanScratch,
     pending: Vec<FindingRec>,
+    file_findings: Vec<FindingRec>,
+    lex_runs: LexRuns,
+    lex_buf: Vec<u8>,
     files: FileTable,
     walker: Walker,
     out: BufWriter<io::Stdout>,
@@ -85,6 +92,10 @@ impl UringScanner {
         let ring = IoUring::new(config.queue_depth)?;
         let scratch = engine.new_scratch();
         let pending = Vec::with_capacity(engine.tuning.max_findings_per_chunk);
+        let file_findings = Vec::with_capacity(engine.tuning.max_findings_per_chunk);
+        let lex_runs = LexRuns::with_capacity(DEFAULT_LEX_RUN_CAP)
+            .expect("lexical run buffer allocation failed");
+        let lex_buf = vec![0u8; buf_len];
         let files =
             FileTable::with_capacity_and_path_bytes(config.max_files, config.path_bytes_cap);
         let walker = Walker::new(config.max_files)?;
@@ -99,6 +110,9 @@ impl UringScanner {
             ring,
             scratch,
             pending,
+            file_findings,
+            lex_runs,
+            lex_buf,
             files,
             walker,
             out,
@@ -111,6 +125,7 @@ impl UringScanner {
         let engine = Arc::clone(&self.engine);
         self.files.clear();
         self.pending.clear();
+        self.file_findings.clear();
         self.walker.reset(path, &mut self.files, &mut stats)?;
 
         while !self.walker.is_done() {
@@ -131,6 +146,10 @@ impl UringScanner {
                 &engine,
                 &mut self.scratch,
                 &mut self.pending,
+                &mut self.file_findings,
+                &mut self.lex_runs,
+                &mut self.lex_buf,
+                self.config.context_mode,
                 file_id,
                 file_path,
                 file_size,
@@ -160,6 +179,8 @@ impl UringScanner {
 /// Keeps one read in flight while scanning the previous chunk to overlap IO
 /// and compute. The function drains pending findings before switching chunks
 /// so buffers are not dropped while the kernel owns them.
+/// When `context_mode != Off`, findings are buffered per file and lexical
+/// filtering runs after the file completes.
 // Keep scan dependencies explicit so the hot path has no hidden state
 // and the call site shows all mutable resources.
 fn scan_file<W: Write>(
@@ -172,6 +193,10 @@ fn scan_file<W: Write>(
     engine: &Engine,
     scratch: &mut ScanScratch,
     pending: &mut Vec<FindingRec>,
+    file_findings: &mut Vec<FindingRec>,
+    lex_runs: &mut LexRuns,
+    lex_buf: &mut [u8],
+    context_mode: ContextMode,
     file_id: FileId,
     path: &Path,
     file_size: u64,
@@ -189,6 +214,10 @@ fn scan_file<W: Write>(
         chunk_size,
         use_o_direct,
     )?;
+
+    if context_mode != ContextMode::Off {
+        file_findings.clear();
+    }
 
     let mut current = match reader.read_first()? {
         Some(chunk) => chunk,
@@ -216,7 +245,69 @@ fn scan_file<W: Write>(
         // reader that still has a kernel read in flight.
         let next = if submitted { reader.wait_next()? } else { None };
 
-        for rec in pending.drain(..) {
+        if context_mode == ContextMode::Off {
+            for rec in pending.drain(..) {
+                let rule = engine.rule_name(rec.rule_id);
+                write_path(out, path)?;
+                write!(
+                    out,
+                    ":{}-{} {}",
+                    rec.root_hint_start, rec.root_hint_end, rule
+                )?;
+                out.write_all(b"\n")?;
+                stats.findings += 1;
+            }
+        } else {
+            file_findings.append(pending);
+        }
+
+        match next {
+            Some(next) => current = next,
+            None => break,
+        }
+    }
+
+    if context_mode != ContextMode::Off && !file_findings.is_empty() {
+        let mut needs_lexical = false;
+        for rec in file_findings.iter() {
+            if engine.rule_lexical_context(rec.rule_id).is_some() {
+                needs_lexical = true;
+                break;
+            }
+        }
+
+        if needs_lexical {
+            #[cfg(unix)]
+            let family = lexical_family_for_path(path.as_os_str().as_bytes());
+            #[cfg(not(unix))]
+            let family = {
+                let path = path.to_string_lossy();
+                lexical_family_for_path(path.as_bytes())
+            };
+
+            if let Some(family) = family {
+                if let Ok(mut file) = File::open(path) {
+                    if let Ok(meta) = file.metadata() {
+                        // Only trust lexical offsets if the file size matches
+                        // the snapshot we scanned.
+                        if meta.len() == file_size
+                            && tokenize_for_lexical(&mut file, file_size, family, lex_buf, lex_runs)
+                                .is_ok()
+                        {
+                            apply_lexical_context(
+                                engine,
+                                file_findings,
+                                lex_runs,
+                                file_size,
+                                context_mode,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        for rec in file_findings.drain(..) {
             let rule = engine.rule_name(rec.rule_id);
             write_path(out, path)?;
             write!(
@@ -226,11 +317,6 @@ fn scan_file<W: Write>(
             )?;
             out.write_all(b"\n")?;
             stats.findings += 1;
-        }
-
-        match next {
-            Some(next) => current = next,
-            None => break,
         }
     }
 
@@ -553,9 +639,10 @@ fn is_direct_unsupported(err: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{AnchorPolicy, RuleSpec, ValidatorKind};
+    use crate::api::{AnchorPolicy, LexicalClassSet, LexicalContextSpec, RuleSpec, ValidatorKind};
     use crate::demo::demo_tuning;
     use crate::engine::Engine;
+    use crate::runtime::{ScannerConfig, ScannerRuntime};
     use regex::bytes::Regex;
     use std::fs;
     use std::io;
@@ -617,6 +704,28 @@ mod tests {
         }
     }
 
+    fn engine_with_lexical_rule() -> Arc<Engine> {
+        let rule = RuleSpec {
+            name: "secret",
+            anchors: &[b"SECRET"],
+            radius: 0,
+            validator: ValidatorKind::None,
+            two_phase: None,
+            must_contain: None,
+            keywords_any: None,
+            entropy: None,
+            local_context: None,
+            lexical_context: Some(LexicalContextSpec {
+                require_any: Some(LexicalClassSet::STRING),
+                prefer_any: LexicalClassSet::STRING,
+                deny_any: LexicalClassSet::COMMENT,
+            }),
+            secret_group: None,
+            re: Regex::new("SECRET").unwrap(),
+        };
+        Arc::new(Engine::new(vec![rule], Vec::new(), demo_tuning()))
+    }
+
     #[test]
     fn scan_file_does_not_drop_in_flight_on_output_error() -> io::Result<()> {
         // Build a tiny engine that will definitely emit a finding in the
@@ -632,6 +741,7 @@ mod tests {
             keywords_any: None,
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: Regex::new("SECRET").unwrap(),
         };
@@ -671,6 +781,10 @@ mod tests {
             &engine,
             &mut scratch,
             &mut pending,
+            &mut scanner.file_findings,
+            &mut scanner.lex_runs,
+            &mut scanner.lex_buf,
+            scanner.config.context_mode,
             FileId(0),
             temp.path(),
             bytes.len() as u64,
@@ -681,6 +795,86 @@ mod tests {
 
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
         assert!(writer.writes > 0, "writer should be invoked at least once");
+        Ok(())
+    }
+
+    #[test]
+    fn uring_matches_runtime_output_with_lexical_filtering() -> io::Result<()> {
+        let engine = engine_with_lexical_rule();
+        let dir = tempfile::tempdir()?;
+        let file_path = dir.path().join("sample.rs");
+        fs::write(&file_path, b"let a = \"SECRET\"; // SECRET\n")?;
+
+        let mut runtime = ScannerRuntime::new(
+            Arc::clone(&engine),
+            ScannerConfig {
+                chunk_size: 1024,
+                io_queue: 1,
+                reader_threads: 1,
+                scan_threads: 1,
+                max_findings_per_file: 64,
+                context_mode: ContextMode::Filter,
+            },
+        );
+        let mut runtime_lines: Vec<String> = runtime
+            .scan_file_sync(FileId(0), &file_path)?
+            .iter()
+            .map(|f| {
+                format!(
+                    "{}:{}-{} {}",
+                    file_path.display(),
+                    f.root_span_hint.start,
+                    f.root_span_hint.end,
+                    f.rule
+                )
+            })
+            .collect();
+        runtime_lines.sort();
+
+        let config = AsyncIoConfig {
+            chunk_size: BUFFER_ALIGN,
+            queue_depth: 2,
+            max_files: 1,
+            use_o_direct: false,
+            context_mode: ContextMode::Filter,
+            ..Default::default()
+        };
+        let mut scanner = UringScanner::new(Arc::clone(&engine), config)?;
+
+        let file_size = fs::metadata(&file_path)?.len();
+        let mut scratch = engine.new_scratch();
+        let mut pending = Vec::with_capacity(engine.tuning.max_findings_per_chunk);
+        let mut stats = PipelineStats::default();
+        let mut output = Vec::new();
+
+        scan_file(
+            &mut scanner.ring,
+            &scanner.pool,
+            scanner.payload_off,
+            scanner.overlap,
+            scanner.config.chunk_size,
+            scanner.config.use_o_direct,
+            &engine,
+            &mut scratch,
+            &mut pending,
+            &mut scanner.file_findings,
+            &mut scanner.lex_runs,
+            &mut scanner.lex_buf,
+            scanner.config.context_mode,
+            FileId(0),
+            &file_path,
+            file_size,
+            &mut output,
+            &mut stats,
+        )?;
+
+        let mut uring_lines: Vec<String> = String::from_utf8_lossy(&output)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        uring_lines.sort();
+
+        assert_eq!(runtime_lines, uring_lines);
         Ok(())
     }
 }

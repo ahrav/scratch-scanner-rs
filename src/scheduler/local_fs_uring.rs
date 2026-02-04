@@ -42,9 +42,12 @@ use super::count_budget::{CountBudget, CountPermit};
 use super::engine_stub::BUFFER_LEN_MAX;
 use super::engine_trait::{EngineScratch, FindingRecord, ScanEngine};
 use super::executor::{Executor, ExecutorConfig, ExecutorHandle, WorkerCtx};
+use super::lexical_pass::{apply_lexical_context, tokenize_for_lexical};
 use super::metrics::MetricsSnapshot;
 use super::output_sink::OutputSink;
 use crate::api::FileId;
+use crate::git_scan::path_policy::lexical_family_for_path;
+use crate::lexical::{LexRuns, DEFAULT_LEX_RUN_CAP};
 
 use crossbeam_channel as chan;
 use crossbeam_queue::ArrayQueue;
@@ -58,8 +61,8 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 // ============================================================================
@@ -145,6 +148,9 @@ pub struct LocalFsUringConfig {
 
     /// Deduplicate findings within each chunk.
     pub dedupe_within_chunk: bool,
+
+    /// Context mode for candidate-only lexical filtering.
+    pub context_mode: crate::ContextMode,
 }
 
 impl Default for LocalFsUringConfig {
@@ -165,6 +171,7 @@ impl Default for LocalFsUringConfig {
             max_file_size: None,
             seed: 1,
             dedupe_within_chunk: true,
+            context_mode: crate::ContextMode::Off,
         }
     }
 }
@@ -435,12 +442,75 @@ fn probe_uring_caps(ring: &IoUring) -> io::Result<OpenStatCaps> {
     })
 }
 
+/// Buffered finding stored per file for lexical filtering.
+#[derive(Clone, Copy, Debug)]
+struct BufferedFinding {
+    rule_id: u32,
+    root_hint_start: u64,
+    root_hint_end: u64,
+    span_start: u64,
+    span_end: u64,
+    lexical_root_span_precise: bool,
+}
+
+impl BufferedFinding {
+    #[inline]
+    fn from_record<F: FindingRecord>(rec: &F) -> Self {
+        Self {
+            rule_id: rec.rule_id(),
+            root_hint_start: rec.root_hint_start(),
+            root_hint_end: rec.root_hint_end(),
+            span_start: rec.span_start(),
+            span_end: rec.span_end(),
+            lexical_root_span_precise: rec.lexical_root_span_precise(),
+        }
+    }
+}
+
+impl FindingRecord for BufferedFinding {
+    #[inline]
+    fn rule_id(&self) -> u32 {
+        self.rule_id
+    }
+
+    #[inline]
+    fn root_hint_start(&self) -> u64 {
+        self.root_hint_start
+    }
+
+    #[inline]
+    fn root_hint_end(&self) -> u64 {
+        self.root_hint_end
+    }
+
+    #[inline]
+    fn span_start(&self) -> u64 {
+        self.span_start
+    }
+
+    #[inline]
+    fn span_end(&self) -> u64 {
+        self.span_end
+    }
+
+    #[inline]
+    fn lexical_root_span_precise(&self) -> bool {
+        self.lexical_root_span_precise
+    }
+}
+
 /// Token that holds the in-flight file permit until all chunk tasks complete.
 struct FileToken {
     _permit: CountPermit,
     file_id: FileId,
     /// Path bytes for output (no heap allocation per finding).
     display: Arc<[u8]>,
+    path: PathBuf,
+    file_size: AtomicU64,
+    pending_chunks: AtomicU32,
+    read_complete: AtomicBool,
+    finalized: AtomicBool,
+    findings: Mutex<Vec<BufferedFinding>>,
 }
 
 /// Work item for I/O threads.
@@ -459,6 +529,10 @@ enum CpuTask {
         len: u32,
         buf: FixedBufferHandle,
     },
+    FinalizeFile {
+        token: Arc<FileToken>,
+        buf: FixedBufferHandle,
+    },
 }
 
 /// Per-CPU-worker scratch space.
@@ -467,8 +541,10 @@ struct CpuScratch<E: ScanEngine> {
     out: Arc<dyn OutputSink>,
     scratch: E::Scratch,
     pending: Vec<<E::Scratch as EngineScratch>::Finding>,
+    lex_runs: LexRuns,
     out_buf: Vec<u8>,
     dedupe_within_chunk: bool,
+    context_mode: crate::ContextMode,
 }
 
 // ============================================================================
@@ -531,6 +607,65 @@ fn emit_findings_formatted<E: ScanEngine, F: FindingRecord>(
     out.write_all(out_buf.as_slice());
 }
 
+fn finalize_file<E: ScanEngine>(
+    engine: &E,
+    token: &FileToken,
+    context_mode: crate::ContextMode,
+    runs: &mut LexRuns,
+    buf: &mut [u8],
+    out: &Arc<dyn OutputSink>,
+    out_buf: &mut Vec<u8>,
+) {
+    if token.finalized.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    let mut findings = {
+        let mut guard = token.findings.lock().expect("findings mutex poisoned");
+        std::mem::take(&mut *guard)
+    };
+
+    if findings.is_empty() {
+        return;
+    }
+
+    if context_mode != crate::ContextMode::Off {
+        let mut needs_lexical = false;
+        for rec in &findings {
+            if engine.rule_lexical_context(rec.rule_id()).is_some() {
+                needs_lexical = true;
+                break;
+            }
+        }
+
+        if needs_lexical {
+            if let Some(family) = lexical_family_for_path(token.display.as_ref()) {
+                if let Ok(mut lex_file) = File::open(&token.path) {
+                    if let Ok(meta) = lex_file.metadata() {
+                        // Only trust lexical offsets if the file size matches
+                        // the snapshot we scanned.
+                        let file_size = token.file_size.load(Ordering::Acquire);
+                        if meta.len() == file_size
+                            && tokenize_for_lexical(&mut lex_file, file_size, family, buf, runs)
+                                .is_ok()
+                        {
+                            apply_lexical_context(
+                                engine,
+                                &mut findings,
+                                runs,
+                                file_size,
+                                context_mode,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    emit_findings_formatted(engine, out, out_buf, token.display.as_ref(), &findings);
+}
+
 // ============================================================================
 // CPU Task Runner
 // ============================================================================
@@ -566,13 +701,33 @@ fn cpu_runner<E: ScanEngine>(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScra
                 dedupe_pending_in_place(&mut ctx.scratch.pending);
             }
 
-            emit_findings_formatted(
-                engine,
-                &ctx.scratch.out,
-                &mut ctx.scratch.out_buf,
-                &token.display,
-                &ctx.scratch.pending,
-            );
+            if ctx.scratch.context_mode == crate::ContextMode::Off {
+                emit_findings_formatted(
+                    engine,
+                    &ctx.scratch.out,
+                    &mut ctx.scratch.out_buf,
+                    &token.display,
+                    &ctx.scratch.pending,
+                );
+            } else {
+                if !ctx.scratch.pending.is_empty() {
+                    let mut guard = token.findings.lock().expect("findings mutex poisoned");
+                    guard.extend(ctx.scratch.pending.iter().map(BufferedFinding::from_record));
+                }
+
+                let remaining = token.pending_chunks.fetch_sub(1, Ordering::AcqRel) - 1;
+                if remaining == 0 && token.read_complete.load(Ordering::Acquire) {
+                    finalize_file(
+                        engine,
+                        &token,
+                        ctx.scratch.context_mode,
+                        &mut ctx.scratch.lex_runs,
+                        buf.as_mut_slice(),
+                        &ctx.scratch.out,
+                        &mut ctx.scratch.out_buf,
+                    );
+                }
+            }
 
             // Metrics: payload bytes only (exclude overlap prefix).
             let payload = (len as u64).saturating_sub(prefix_len as u64);
@@ -580,6 +735,19 @@ fn cpu_runner<E: ScanEngine>(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScra
             ctx.metrics.bytes_scanned += payload;
 
             // Buffer returns to pool on drop (RAII).
+            drop(buf);
+        }
+        CpuTask::FinalizeFile { token, mut buf } => {
+            let engine = ctx.scratch.engine.as_ref();
+            finalize_file(
+                engine,
+                &token,
+                ctx.scratch.context_mode,
+                &mut ctx.scratch.lex_runs,
+                buf.as_mut_slice(),
+                &ctx.scratch.out,
+                &mut ctx.scratch.out_buf,
+            );
             drop(buf);
         }
     }
@@ -911,7 +1079,10 @@ fn io_worker_loop<E: ScanEngine>(
 
         // Blocking fallback: open + fstat to build read state.
         let read_state = match blocking_open(&w.path, stats) {
-            BlockingOutcome::Ready(state) => state,
+            BlockingOutcome::Ready(state) => {
+                w.token.file_size.store(state.size, Ordering::Release);
+                state
+            }
             BlockingOutcome::Skipped => {
                 drop(w.token);
                 return;
@@ -1379,7 +1550,20 @@ fn io_worker_loop<E: ScanEngine>(
                         stats.read_errors += 1;
                         st.failed = true;
                         st.done = true;
-                        drop(op.buf);
+                        st.token.read_complete.store(true, Ordering::Release);
+                        if cfg.context_mode != crate::ContextMode::Off
+                            && st.token.pending_chunks.load(Ordering::Acquire) == 0
+                        {
+                            let task = CpuTask::FinalizeFile {
+                                token: Arc::clone(&st.token),
+                                buf: op.buf,
+                            };
+                            if cpu.spawn(task).is_err() {
+                                drop(op.buf);
+                            }
+                        } else {
+                            drop(op.buf);
+                        }
                     } else {
                         let n = res as usize;
                         if n == 0 {
@@ -1387,7 +1571,20 @@ fn io_worker_loop<E: ScanEngine>(
                             stats.read_errors += 1;
                             st.failed = true;
                             st.done = true;
-                            drop(op.buf);
+                            st.token.read_complete.store(true, Ordering::Release);
+                            if cfg.context_mode != crate::ContextMode::Off
+                                && st.token.pending_chunks.load(Ordering::Acquire) == 0
+                            {
+                                let task = CpuTask::FinalizeFile {
+                                    token: Arc::clone(&st.token),
+                                    buf: op.buf,
+                                };
+                                if cpu.spawn(task).is_err() {
+                                    drop(op.buf);
+                                }
+                            } else {
+                                drop(op.buf);
+                            }
                         } else {
                             if n < op.payload_len {
                                 // Short read: file likely shrank. Treat as truncation.
@@ -1411,6 +1608,10 @@ fn io_worker_loop<E: ScanEngine>(
                                 rs.overlap_len = overlap_len;
                             }
 
+                            if st.done || rs.next_offset >= rs.size {
+                                st.token.read_complete.store(true, Ordering::Release);
+                            }
+
                             let task = CpuTask::ScanChunk {
                                 token: Arc::clone(&st.token),
                                 base_offset: op.base_offset,
@@ -1419,17 +1620,26 @@ fn io_worker_loop<E: ScanEngine>(
                                 buf: op.buf,
                             };
 
+                            if cfg.context_mode != crate::ContextMode::Off {
+                                st.token.pending_chunks.fetch_add(1, Ordering::AcqRel);
+                            }
+
                             if cpu.spawn(task).is_err() {
                                 // CPU executor shut down. Start stopping.
                                 stopping = true;
                                 st.failed = true;
                                 st.done = true;
+                                st.token.read_complete.store(true, Ordering::Release);
+                                if cfg.context_mode != crate::ContextMode::Off {
+                                    st.token.pending_chunks.fetch_sub(1, Ordering::AcqRel);
+                                }
                             } else {
                                 // Successfully spawned. If file has more data, re-queue.
                                 if !st.done && !st.failed && rs.next_offset < rs.size {
                                     read_ready.push_back(op.file_slot);
                                 } else {
                                     st.done = true;
+                                    st.token.read_complete.store(true, Ordering::Release);
                                 }
                             }
                         }
@@ -1557,6 +1767,7 @@ fn io_worker_loop<E: ScanEngine>(
                                             }
                                         };
 
+                                        st.token.file_size.store(size, Ordering::Release);
                                         st.phase = FilePhase::Ready(ReadState {
                                             file,
                                             size,
@@ -1608,6 +1819,7 @@ fn io_worker_loop<E: ScanEngine>(
                                     }
                                 };
 
+                                st.token.file_size.store(size, Ordering::Release);
                                 st.phase = FilePhase::Ready(ReadState {
                                     file,
                                     size,
@@ -1733,6 +1945,12 @@ fn walk_and_send_files(
             _permit: permit,
             file_id,
             display,
+            path: path.clone(),
+            file_size: AtomicU64::new(size),
+            pending_chunks: AtomicU32::new(0),
+            read_complete: AtomicBool::new(false),
+            finalized: AtomicBool::new(false),
+            findings: Mutex::new(Vec::new()),
         });
 
         // Backpressure: bounded channel send blocks here.
@@ -1793,6 +2011,7 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
             let engine = Arc::clone(&engine);
             let out = Arc::clone(&out);
             let dedupe = cfg.dedupe_within_chunk;
+            let context_mode = cfg.context_mode;
             move |_wid| CpuScratch {
                 engine: Arc::clone(&engine),
                 out: Arc::clone(&out),
@@ -1800,8 +2019,11 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
                 // Match the local scan default: avoid steady-state allocs without
                 // relying on engine-specific tuning details.
                 pending: Vec::with_capacity(4096),
+                lex_runs: LexRuns::with_capacity(DEFAULT_LEX_RUN_CAP)
+                    .expect("lexical run buffer allocation failed"),
                 out_buf: Vec::with_capacity(64 * 1024),
                 dedupe_within_chunk: dedupe,
+                context_mode,
             }
         },
         cpu_runner::<E>,
@@ -1925,6 +2147,7 @@ mod tests {
             max_file_size: None,
             seed: 123,
             dedupe_within_chunk: true,
+            context_mode: crate::ContextMode::Off,
         };
 
         let (_summary, _io_stats, _cpu_metrics) =
@@ -1996,6 +2219,7 @@ mod tests {
             max_file_size: None,
             seed: 123,
             dedupe_within_chunk: true,
+            context_mode: crate::ContextMode::Off,
         };
 
         let sink_blocking = Arc::new(VecSink::new());
@@ -2060,6 +2284,7 @@ mod tests {
             max_file_size: None,
             seed: 123,
             dedupe_within_chunk: true,
+            context_mode: crate::ContextMode::Off,
         };
 
         let sink = Arc::new(VecSink::new());

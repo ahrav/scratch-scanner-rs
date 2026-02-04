@@ -513,6 +513,139 @@ pub enum TailCharset {
 /// This bounds hot-path scanning for micro-context checks.
 pub const LOCAL_CONTEXT_MAX_LOOKAROUND: usize = 1024;
 
+/// Coarse lexical class for a byte range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum LexicalClass {
+    /// Unknown or unclassified context (fail-open).
+    Unknown = 0,
+    /// Code or unclassified tokens in source-like files.
+    Code = 1,
+    /// String literal content.
+    String = 2,
+    /// Line or block comment content.
+    Comment = 3,
+    /// Config-file value or non-comment content.
+    Config = 4,
+}
+
+/// Bitset of lexical classes used for rule-level requirements.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LexicalClassSet(u8);
+
+impl LexicalClassSet {
+    pub const EMPTY: Self = Self(0);
+    pub const CODE: Self = Self(1 << 0);
+    pub const STRING: Self = Self(1 << 1);
+    pub const COMMENT: Self = Self(1 << 2);
+    pub const CONFIG: Self = Self(1 << 3);
+    pub const ALL: Self = Self(Self::CODE.0 | Self::STRING.0 | Self::COMMENT.0 | Self::CONFIG.0);
+
+    #[inline]
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn intersects(self, other: Self) -> bool {
+        (self.0 & other.0) != 0
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+impl core::ops::BitOr for LexicalClassSet {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl core::ops::BitOrAssign for LexicalClassSet {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+impl From<LexicalClass> for LexicalClassSet {
+    fn from(value: LexicalClass) -> Self {
+        match value {
+            LexicalClass::Code => Self::CODE,
+            LexicalClass::String => Self::STRING,
+            LexicalClass::Comment => Self::COMMENT,
+            LexicalClass::Config => Self::CONFIG,
+            LexicalClass::Unknown => Self::EMPTY,
+        }
+    }
+}
+
+/// Lexical context gate configuration for post-scan filtering/scoring.
+///
+/// These checks are applied in a candidate-only second pass and must fail open
+/// when lexical context is unknown.
+#[derive(Clone, Copy, Debug)]
+pub struct LexicalContextSpec {
+    /// If set, the lexical class must intersect this set to be considered valid.
+    pub require_any: Option<LexicalClassSet>,
+    /// Contexts that are strong positive signals for scoring.
+    pub prefer_any: LexicalClassSet,
+    /// Contexts that are definitive negatives (filter in `ContextMode::Filter`).
+    pub deny_any: LexicalClassSet,
+}
+
+impl LexicalContextSpec {
+    /// Internal invariant checks used at engine build time.
+    pub(crate) fn assert_valid(&self) {
+        if let Some(req) = self.require_any {
+            assert!(
+                !req.is_empty(),
+                "lexical_context require_any must not be empty"
+            );
+            assert!(
+                !req.intersects(self.deny_any),
+                "lexical_context require_any must not overlap deny_any"
+            );
+            if !self.prefer_any.is_empty() {
+                assert!(
+                    req.contains(self.prefer_any),
+                    "lexical_context prefer_any must be a subset of require_any"
+                );
+            }
+        }
+    }
+}
+
+/// Controls whether lexical context is computed and/or used for filtering.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ContextMode {
+    /// Do not compute lexical context (current behavior).
+    #[default]
+    Off,
+    /// Compute lexical context and attach scores, but do not drop findings.
+    Score,
+    /// Compute lexical context and drop findings only when context is definitive.
+    Filter,
+}
+
 /// Local context gate configuration for post-regex validation.
 ///
 /// These checks are intentionally bounded and allocation-free so they can run
@@ -625,6 +758,9 @@ pub struct RuleSpec {
     /// Optional local context gate evaluated after secret extraction.
     pub local_context: Option<LocalContextSpec>,
 
+    /// Optional lexical context gate evaluated in a candidate-only second pass.
+    pub lexical_context: Option<LexicalContextSpec>,
+
     /// Optional capture group index for secret extraction.
     ///
     /// When set, the engine extracts the secret value from the specified capture
@@ -675,6 +811,9 @@ impl RuleSpec {
             ent.assert_valid();
         }
         if let Some(ctx) = &self.local_context {
+            ctx.assert_valid();
+        }
+        if let Some(ctx) = &self.lexical_context {
             ctx.assert_valid();
         }
         if let Some(gi) = self.secret_group {
@@ -742,9 +881,16 @@ mod tests {
             keywords_any: None,
             entropy: None,
             local_context,
+            lexical_context: None,
             secret_group: None,
             re: Regex::new(r"tok_[a-z0-9]{8}").unwrap(),
         }
+    }
+
+    fn dummy_rule_with_lexical(lexical_context: Option<LexicalContextSpec>) -> RuleSpec {
+        let mut rule = dummy_rule(None);
+        rule.lexical_context = lexical_context;
+        rule
     }
 
     #[test]
@@ -772,6 +918,42 @@ mod tests {
             key_names_any: Some(&[]),
         };
         let rule = dummy_rule(Some(ctx));
+        rule.assert_valid();
+    }
+
+    #[test]
+    #[should_panic(expected = "lexical_context require_any must not be empty")]
+    fn lexical_context_empty_require_panics() {
+        let ctx = LexicalContextSpec {
+            require_any: Some(LexicalClassSet::EMPTY),
+            prefer_any: LexicalClassSet::EMPTY,
+            deny_any: LexicalClassSet::EMPTY,
+        };
+        let rule = dummy_rule_with_lexical(Some(ctx));
+        rule.assert_valid();
+    }
+
+    #[test]
+    #[should_panic(expected = "lexical_context require_any must not overlap deny_any")]
+    fn lexical_context_require_overlaps_deny_panics() {
+        let ctx = LexicalContextSpec {
+            require_any: Some(LexicalClassSet::STRING),
+            prefer_any: LexicalClassSet::EMPTY,
+            deny_any: LexicalClassSet::STRING,
+        };
+        let rule = dummy_rule_with_lexical(Some(ctx));
+        rule.assert_valid();
+    }
+
+    #[test]
+    #[should_panic(expected = "lexical_context prefer_any must be a subset of require_any")]
+    fn lexical_context_prefer_not_subset_panics() {
+        let ctx = LexicalContextSpec {
+            require_any: Some(LexicalClassSet::CODE),
+            prefer_any: LexicalClassSet::STRING,
+            deny_any: LexicalClassSet::EMPTY,
+        };
+        let rule = dummy_rule_with_lexical(Some(ctx));
         rule.assert_valid();
     }
 }

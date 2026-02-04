@@ -25,7 +25,7 @@ flowchart LR
     end
 
     subgraph ChunkRing["chunk_ring<br/>capacity: 128"]
-        CR[("Chunk Queue<br/>SpscRing")]
+        CR[("ScanItem Queue<br/>Chunk or FileDone")]
     end
 
     subgraph Scanner["Scan Stage"]
@@ -91,21 +91,23 @@ flowchart LR
 
 ### Reader Stage
 - **Input**: `file_ring` (FileId queue)
-- **Output**: `chunk_ring` (Chunk queue, cap=128)
-- **State**: `active: Option<FileReader>`, `overlap`, `chunk_size`
+- **Output**: `chunk_ring` (ScanItem queue, cap=128)
+- **State**: `active: Option<FileReader>`, `pending_done: Option<FileId>`, `overlap`, `chunk_size`
 - **Behavior**:
   - Opens files via FileTable path lookup
   - Reads 1MB chunks with configurable overlap
   - Preserves overlap for cross-boundary pattern matching
+  - Enqueues `FileDone` after EOF so the scan stage can finalize lexical filtering
 
 ### Scan Stage
-- **Input**: `chunk_ring` (Chunk queue)
+- **Input**: `chunk_ring` (ScanItem queue)
 - **Output**: `out_ring` (FindingRec queue, cap=8192)
-- **State**: `scratch: ScanScratch`, `pending: Vec<FindingRec>`
+- **State**: `scratch: ScanScratch`, `pending_emit: Vec<FindingRec>`
 - **Behavior**:
   - Invokes `Engine::scan_chunk_into()` on each chunk
-  - Drains findings to pending buffer
-  - Flushes pending to out_ring (handles backpressure)
+  - Drains findings to pending buffer when `context_mode = Off`
+  - Buffers findings per file when `context_mode != Off`
+  - Applies lexical filtering on `FileDone` before emitting
 
 ### Output Stage
 - **Input**: `out_ring` (FindingRec queue)
@@ -142,7 +144,7 @@ sequenceDiagram
 | Ring | Capacity | Type | Purpose |
 |------|----------|------|---------|
 | `file_ring` | 1024 | `SpscRing<FileId>` | File discovery queue |
-| `chunk_ring` | 128 | `SpscRing<Chunk>` | Read chunk queue |
+| `chunk_ring` | 128 | `SpscRing<ScanItem>` | Read chunk queue + `FileDone` markers |
 | `out_ring` | 8192 | `SpscRing<FindingRec>` | Finding output queue |
 
 ## Pool Sizing

@@ -50,7 +50,7 @@
 //!
 //! The engine is immutable and shared; scratch is per-worker and never shared.
 
-use crate::api::FileId;
+use crate::api::{FileId, LexicalContextSpec};
 
 // ============================================================================
 // FindingRecord Trait
@@ -103,6 +103,15 @@ pub trait FindingRecord: Clone + Send + 'static {
 
     /// Full match span end offset (byte position in original buffer).
     fn span_end(&self) -> u64;
+
+    /// Whether the root span hint is precise enough for lexical context checks.
+    ///
+    /// Transform-derived findings with coarse root-span hints should return
+    /// `false` so lexical context fails open.
+    #[inline]
+    fn lexical_root_span_precise(&self) -> bool {
+        true
+    }
 }
 
 // ============================================================================
@@ -222,4 +231,12 @@ pub trait ScanEngine: Send + Sync + 'static {
     ///
     /// Used for output formatting. Returns `"<unknown-rule>"` for invalid IDs.
     fn rule_name(&self, rule_id: u32) -> &str;
+
+    /// Optional lexical context spec for a rule.
+    ///
+    /// Default returns `None` for engines that do not support lexical context.
+    #[inline]
+    fn rule_lexical_context(&self, _rule_id: u32) -> Option<LexicalContextSpec> {
+        None
+    }
 }

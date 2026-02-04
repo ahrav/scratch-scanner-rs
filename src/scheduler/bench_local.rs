@@ -484,6 +484,7 @@ mod tests {
             max_file_size: u64::MAX,
             seed: 12345,
             dedupe_within_chunk: true,
+            context_mode: crate::ContextMode::Off,
         }
     }
 

@@ -41,18 +41,22 @@
 //! - Error classification: Retryable vs Permanent
 
 use super::count_budget::{CountBudget, CountPermit};
+use super::engine_trait::ScanEngine;
 use super::executor::{Executor, ExecutorConfig, ExecutorHandle, WorkerCtx};
+use super::lexical_pass::apply_lexical_context;
 use super::metrics::MetricsSnapshot;
 use super::rng::XorShift64;
 use super::ts_buffer_pool::{TsBufferHandle, TsBufferPool, TsBufferPoolConfig};
+use crate::git_scan::path_policy::lexical_family_for_path;
+use crate::lexical::{LexRuns, LexicalFamily, LexicalTokenizer, DEFAULT_LEX_RUN_CAP};
 use crate::scheduler::engine_stub::{FileId, FindingRec, MockEngine, ScanScratch, BUFFER_LEN_MAX};
 use crate::scheduler::output_sink::OutputSink;
 
 use crossbeam_channel as chan;
 
 use std::io::Write as _;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -142,6 +146,9 @@ pub struct RemoteConfig {
 
     /// If true, deduplicate findings within each chunk.
     pub dedupe_within_chunk: bool,
+
+    /// Context mode for candidate-only lexical filtering.
+    pub context_mode: crate::ContextMode,
 }
 
 impl Default for RemoteConfig {
@@ -158,6 +165,7 @@ impl Default for RemoteConfig {
             max_object_time: Some(Duration::from_secs(30)),
             seed: 1,
             dedupe_within_chunk: true,
+            context_mode: crate::ContextMode::Off,
         }
     }
 }
@@ -361,6 +369,8 @@ struct ObjectToken {
     _permit: CountPermit,
     file_id: FileId,
     display: Arc<[u8]>,
+    findings: Mutex<Vec<FindingRec>>,
+    pending_chunks: AtomicU32,
 }
 
 /// Work item sent from discovery to I/O threads.
@@ -396,6 +406,7 @@ struct CpuScratch {
     out_buf: Vec<u8>,
 
     dedupe_within_chunk: bool,
+    context_mode: crate::ContextMode,
 }
 
 // ============================================================================
@@ -490,13 +501,21 @@ fn cpu_runner(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScratch>) {
                 dedupe_pending_in_place(&mut ctx.scratch.pending);
             }
 
-            emit_findings_formatted(
-                engine,
-                &ctx.scratch.out,
-                &mut ctx.scratch.out_buf,
-                &token.display,
-                &ctx.scratch.pending,
-            );
+            if ctx.scratch.context_mode == crate::ContextMode::Off {
+                emit_findings_formatted(
+                    engine,
+                    &ctx.scratch.out,
+                    &mut ctx.scratch.out_buf,
+                    &token.display,
+                    &ctx.scratch.pending,
+                );
+            } else {
+                if !ctx.scratch.pending.is_empty() {
+                    let mut guard = token.findings.lock().expect("findings mutex poisoned");
+                    guard.extend_from_slice(&ctx.scratch.pending);
+                }
+                token.pending_chunks.fetch_sub(1, Ordering::AcqRel);
+            }
 
             // Metrics: count payload bytes only
             let payload = (len as u64).saturating_sub(prefix_len as u64);
@@ -539,6 +558,48 @@ fn compute_backoff(attempt: u32, policy: RetryPolicy, rng: &mut XorShift64) -> D
     let out = (base + offset).max(0) as u128;
 
     Duration::from_nanos(out.min(u64::MAX as u128) as u64)
+}
+
+/// Tokenize an entire remote object for lexical context.
+///
+/// Returns `Err(())` on early EOF or contract violations so callers can
+/// treat lexical filtering as fail-open.
+fn tokenize_remote_object<B: RemoteBackend>(
+    backend: &B,
+    handle: &B::Object,
+    size: u64,
+    family: LexicalFamily,
+    buf: &mut [u8],
+    runs: &mut LexRuns,
+) -> Result<(), ()> {
+    runs.clear();
+    let mut tokenizer = LexicalTokenizer::new(family);
+    let mut offset: u64 = 0;
+    while offset < size {
+        let remaining = size.saturating_sub(offset);
+        let read_len = (remaining as usize).min(buf.len());
+        let fetched = backend
+            .fetch_range(handle, offset, &mut buf[..read_len])
+            .map_err(|_| ())?;
+
+        if fetched == 0 {
+            return Err(());
+        }
+
+        let end_offset = offset.saturating_add(fetched as u64);
+        if fetched < read_len && end_offset != size {
+            return Err(());
+        }
+
+        tokenizer.process_chunk(&buf[..fetched], offset, runs);
+        offset = end_offset;
+
+        if runs.is_overflowed() {
+            break;
+        }
+    }
+    tokenizer.finish(offset, runs);
+    Ok(())
 }
 
 // ============================================================================
@@ -596,12 +657,17 @@ fn io_worker_loop<B: RemoteBackend>(
     rx: chan::Receiver<ObjectWork<B::Object>>,
     pool: TsBufferPool,
     cpu: ExecutorHandle<CpuTask>,
+    engine: Arc<MockEngine>,
+    out: Arc<dyn OutputSink>,
     cfg: RemoteConfig,
     overlap: usize,
     stop: Arc<AtomicBool>,
 ) -> IoStats {
     let mut stats = IoStats::default();
     let mut rng = XorShift64::new(cfg.seed ^ ((wid as u64).wrapping_mul(0xD1B54A32D192ED03)));
+    let mut out_buf = Vec::with_capacity(64 * 1024);
+    let mut lex_runs =
+        LexRuns::with_capacity(DEFAULT_LEX_RUN_CAP).expect("lexical run buffer allocation failed");
 
     while let Ok(work) = rx.recv() {
         if stop.load(Ordering::Relaxed) {
@@ -698,6 +764,9 @@ fn io_worker_loop<B: RemoteBackend>(
                         let actual_payload = fetched.saturating_sub(prefix_len);
 
                         // Enqueue scan task (buffer ownership transfers to CPU side)
+                        if cfg.context_mode != crate::ContextMode::Off {
+                            work.token.pending_chunks.fetch_add(1, Ordering::AcqRel);
+                        }
                         if cpu
                             .spawn(CpuTask::ScanChunk {
                                 token: Arc::clone(&work.token),
@@ -711,6 +780,9 @@ fn io_worker_loop<B: RemoteBackend>(
                             // Executor closed
                             stop.store(true, Ordering::Relaxed);
                             failed = true;
+                            if cfg.context_mode != crate::ContextMode::Off {
+                                work.token.pending_chunks.fetch_sub(1, Ordering::AcqRel);
+                            }
                             break 'chunk_loop;
                         }
 
@@ -768,6 +840,66 @@ fn io_worker_loop<B: RemoteBackend>(
             // work.token dropped here; permit releases when all enqueued chunks finish
         } else {
             stats.objects_completed += 1;
+        }
+
+        if cfg.context_mode != crate::ContextMode::Off {
+            while work.token.pending_chunks.load(Ordering::Acquire) != 0 {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                std::thread::park_timeout(Duration::from_micros(200));
+            }
+
+            let mut findings = {
+                let mut guard = work.token.findings.lock().expect("findings mutex poisoned");
+                std::mem::take(&mut *guard)
+            };
+
+            if !findings.is_empty() {
+                if !failed {
+                    let mut needs_lexical = false;
+                    for rec in &findings {
+                        if engine.rule_lexical_context(rec.rule_id.0 as u32).is_some() {
+                            needs_lexical = true;
+                            break;
+                        }
+                    }
+
+                    if needs_lexical {
+                        if let Some(family) = lexical_family_for_path(work.token.display.as_ref()) {
+                            if let Some(mut buf) = acquire_buffer_blocking(&pool, &stop) {
+                                if tokenize_remote_object(
+                                    backend.as_ref(),
+                                    &work.handle,
+                                    size,
+                                    family,
+                                    buf.as_mut_slice(),
+                                    &mut lex_runs,
+                                )
+                                .is_ok()
+                                {
+                                    apply_lexical_context(
+                                        engine.as_ref(),
+                                        &mut findings,
+                                        &lex_runs,
+                                        size,
+                                        cfg.context_mode,
+                                    );
+                                }
+                                drop(buf);
+                            }
+                        }
+                    }
+                }
+
+                emit_findings_formatted(
+                    &engine,
+                    &out,
+                    &mut out_buf,
+                    &work.token.display,
+                    &findings,
+                );
+            }
         }
     }
 
@@ -841,6 +973,7 @@ pub fn scan_remote<B: RemoteBackend>(
             let engine = Arc::clone(&engine);
             let out = Arc::clone(&out);
             let dedupe = cfg.dedupe_within_chunk;
+            let context_mode = cfg.context_mode;
             move |_wid| CpuScratch {
                 engine: Arc::clone(&engine),
                 out: Arc::clone(&out),
@@ -848,6 +981,7 @@ pub fn scan_remote<B: RemoteBackend>(
                 pending: Vec::with_capacity(engine.tuning.max_findings_per_chunk),
                 out_buf: Vec::with_capacity(64 * 1024),
                 dedupe_within_chunk: dedupe,
+                context_mode,
             }
         },
         cpu_runner,
@@ -866,11 +1000,15 @@ pub fn scan_remote<B: RemoteBackend>(
         let rx = rx.clone();
         let pool = pool.clone();
         let cpu = cpu_handle.clone();
+        let engine = Arc::clone(&engine);
+        let out = Arc::clone(&out);
         let cfg2 = cfg.clone();
         let stop2 = Arc::clone(&stop);
 
         io_threads.push(thread::spawn(move || {
-            io_worker_loop(wid, backend, rx, pool, cpu, cfg2, overlap, stop2)
+            io_worker_loop(
+                wid, backend, rx, pool, cpu, engine, out, cfg2, overlap, stop2,
+            )
         }));
     }
     drop(rx); // Close our receiver; only I/O threads hold receivers now
@@ -912,6 +1050,8 @@ pub fn scan_remote<B: RemoteBackend>(
                 _permit: permit,
                 file_id,
                 display: obj.display.into_boxed_slice().into(),
+                findings: Mutex::new(Vec::new()),
+                pending_chunks: AtomicU32::new(0),
             });
 
             let mut work = Some(ObjectWork {
@@ -1134,6 +1274,7 @@ mod tests {
             max_object_time: Some(Duration::from_secs(5)),
             seed: 42,
             dedupe_within_chunk: true,
+            context_mode: crate::ContextMode::Off,
         }
     }
 

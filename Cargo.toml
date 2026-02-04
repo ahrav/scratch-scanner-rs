@@ -116,6 +116,11 @@ name = "scanner_throughput"
 harness = false
 
 [[bench]]
+name = "lexical_tokenizer"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
 name = "vectorscan_overhead"
 harness = false
 

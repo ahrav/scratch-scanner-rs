@@ -68,6 +68,27 @@ Three layers of backpressure:
 
 ---
 
+### Candidate-Only Lexical Pass
+
+When `context_mode` is not `Off`, the remote backend buffers findings per object
+and applies lexical filtering after all chunks finish. Emission moves from the
+CPU worker to the end of the object.
+
+Flow summary:
+1. CPU chunk tasks append findings into the object token instead of emitting.
+2. The I/O worker waits for `pending_chunks` to reach zero after the fetch loop.
+3. If any rule requires lexical context and the object path maps to a
+   `LexicalFamily`, the I/O worker re-fetches the object and tokenizes it with
+   `LexicalTokenizer`.
+4. `apply_lexical_context` filters buffered findings.
+5. If tokenization fails, the object changes, or the family is unknown, the
+   buffered findings are emitted unfiltered (fail-open).
+
+The lexical pass reuses the shared buffer pool for the re-fetch to avoid extra
+allocations.
+
+---
+
 ## 3. Retry Policies
 
 ### ErrorClass
@@ -238,6 +259,7 @@ pub struct RemoteConfig {
     pub max_object_time: Option<Duration>, // e.g., 30 seconds
     pub seed: u64,                      // PRNG seed
     pub dedupe_within_chunk: bool,      // Per-chunk dedup
+    pub context_mode: ContextMode,      // Off, Score, or Filter
 }
 ```
 

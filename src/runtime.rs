@@ -20,15 +20,21 @@
 //! pipeline becomes multi-threaded, use per-thread runtimes or a synchronized
 //! buffer pool.
 
-use crate::api::{FileId, Finding};
+use crate::api::{ContextMode, FileId, Finding, FindingRec};
 use crate::engine::{Engine, ScanScratch};
+use crate::git_scan::path_policy::lexical_family_for_path;
+use crate::lexical::{LexRuns, DEFAULT_LEX_RUN_CAP};
 use crate::pool::NodePoolType;
+use crate::scheduler::engine_trait::FindingRecord;
+use crate::scheduler::lexical_pass::{apply_lexical_context, tokenize_for_lexical};
 #[cfg(unix)]
 use crate::scratch_memory::ScratchVec;
 use std::cell::{Cell, UnsafeCell};
 use std::fs::File;
 use std::io::{self, Read};
 use std::ops::ControlFlow;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::rc::Rc;
@@ -669,6 +675,8 @@ pub struct ScannerConfig {
     ///
     /// If exceeded, scanning stops early and returns an error.
     pub max_findings_per_file: usize,
+    /// Context mode for candidate-only lexical filtering.
+    pub context_mode: ContextMode,
 }
 
 impl ScannerConfig {
@@ -680,6 +688,65 @@ impl ScannerConfig {
         self.io_queue
             .saturating_add(self.scan_threads.saturating_mul(2))
             .saturating_add(self.reader_threads)
+    }
+}
+
+/// Minimal record used to apply lexical context filtering post-scan.
+#[derive(Clone, Copy, Debug)]
+struct BufferedFinding {
+    rule_id: u32,
+    root_hint_start: u64,
+    root_hint_end: u64,
+    span_start: u64,
+    span_end: u64,
+    lexical_root_span_precise: bool,
+    out_index: usize,
+}
+
+impl BufferedFinding {
+    #[inline]
+    fn from_record(rec: &FindingRec, out_index: usize) -> Self {
+        Self {
+            rule_id: rec.rule_id,
+            root_hint_start: rec.root_hint_start,
+            root_hint_end: rec.root_hint_end,
+            span_start: u64::from(rec.span_start),
+            span_end: u64::from(rec.span_end),
+            lexical_root_span_precise: rec.lexical_root_span_precise(),
+            out_index,
+        }
+    }
+}
+
+impl FindingRecord for BufferedFinding {
+    #[inline]
+    fn rule_id(&self) -> u32 {
+        self.rule_id
+    }
+
+    #[inline]
+    fn root_hint_start(&self) -> u64 {
+        self.root_hint_start
+    }
+
+    #[inline]
+    fn root_hint_end(&self) -> u64 {
+        self.root_hint_end
+    }
+
+    #[inline]
+    fn span_start(&self) -> u64 {
+        self.span_start
+    }
+
+    #[inline]
+    fn span_end(&self) -> u64 {
+        self.span_end
+    }
+
+    #[inline]
+    fn lexical_root_span_precise(&self) -> bool {
+        self.lexical_root_span_precise
     }
 }
 
@@ -697,7 +764,11 @@ pub struct ScannerRuntime {
     overlap: usize,
     pool: BufferPool,
     scratch: ScanScratch,
+    chunk_recs: Vec<FindingRec>,
+    buffered_findings: Vec<BufferedFinding>,
     out: Vec<Finding>,
+    lex_runs: LexRuns,
+    lex_buf: Vec<u8>,
     tail: Vec<u8>,
 }
 
@@ -716,7 +787,12 @@ impl ScannerRuntime {
         );
         let pool = BufferPool::new(config.pool_capacity());
         let scratch = engine.new_scratch();
+        let chunk_recs = Vec::with_capacity(engine.tuning.max_findings_per_chunk);
+        let buffered_findings = Vec::with_capacity(config.max_findings_per_file);
         let out = Vec::with_capacity(config.max_findings_per_file);
+        let lex_runs = LexRuns::with_capacity(DEFAULT_LEX_RUN_CAP)
+            .expect("lexical run buffer allocation failed");
+        let lex_buf = vec![0u8; buf_len];
         let tail = vec![0u8; overlap];
         Self {
             engine,
@@ -724,7 +800,11 @@ impl ScannerRuntime {
             overlap,
             pool,
             scratch,
+            chunk_recs,
+            buffered_findings,
             out,
+            lex_runs,
+            lex_buf,
             tail,
         }
     }
@@ -740,7 +820,11 @@ impl ScannerRuntime {
     /// overflows, returns `io::ErrorKind::Other` after stopping the scan early.
     pub fn scan_file_sync(&mut self, file_id: FileId, path: &Path) -> io::Result<&[Finding]> {
         self.out.clear();
+        self.chunk_recs.clear();
+        self.buffered_findings.clear();
         let mut overflow = false;
+        let mut file_size: u64 = 0;
+        let context_mode = self.config.context_mode;
 
         let engine = &self.engine;
         let pool = &self.pool;
@@ -749,26 +833,174 @@ impl ScannerRuntime {
         let tail = &mut self.tail;
         let scratch = &mut self.scratch;
         let out = &mut self.out;
+        let chunk_recs = &mut self.chunk_recs;
+        let buffered_findings = &mut self.buffered_findings;
 
-        read_file_chunks(file_id, path, pool, chunk_size, overlap, tail, |chunk| {
-            engine.scan_chunk_into(chunk.data(), chunk.file_id, chunk.base_offset, scratch);
-            let new_bytes_start = chunk.base_offset + chunk.prefix_len as u64;
-            scratch.drop_prefix_findings(new_bytes_start);
+        if context_mode == ContextMode::Off {
+            read_file_chunks(file_id, path, pool, chunk_size, overlap, tail, |chunk| {
+                engine.scan_chunk_into(chunk.data(), chunk.file_id, chunk.base_offset, scratch);
+                let new_bytes_start = chunk.base_offset + chunk.prefix_len as u64;
+                scratch.drop_prefix_findings(new_bytes_start);
 
-            let pending = scratch.pending_findings_len();
-            if out.len().saturating_add(pending) > out.capacity() {
-                overflow = true;
-                return ControlFlow::Break(());
-            }
+                let pending = scratch.pending_findings_len();
+                if out.len().saturating_add(pending) > out.capacity() {
+                    overflow = true;
+                    return ControlFlow::Break(());
+                }
 
-            engine.drain_findings_materialized(scratch, out);
-            ControlFlow::Continue(())
-        })?;
+                engine.drain_findings_materialized(scratch, out);
+                let payload = (chunk.len as u64).saturating_sub(chunk.prefix_len as u64);
+                file_size = file_size.saturating_add(payload);
+                ControlFlow::Continue(())
+            })?;
+        } else {
+            read_file_chunks(file_id, path, pool, chunk_size, overlap, tail, |chunk| {
+                engine.scan_chunk_into(chunk.data(), chunk.file_id, chunk.base_offset, scratch);
+                let new_bytes_start = chunk.base_offset + chunk.prefix_len as u64;
+                scratch.drop_prefix_findings(new_bytes_start);
+
+                let pending = scratch.pending_findings_len();
+                if out.len().saturating_add(pending) > out.capacity() {
+                    overflow = true;
+                    return ControlFlow::Break(());
+                }
+
+                chunk_recs.clear();
+                scratch.drain_findings_into(chunk_recs);
+                let base_idx = out.len();
+                for (idx, rec) in chunk_recs.iter().enumerate() {
+                    buffered_findings.push(BufferedFinding::from_record(rec, base_idx + idx));
+                }
+                engine.materialize_findings_from(scratch, chunk_recs, out);
+
+                let payload = (chunk.len as u64).saturating_sub(chunk.prefix_len as u64);
+                file_size = file_size.saturating_add(payload);
+                ControlFlow::Continue(())
+            })?;
+        }
 
         if overflow {
             return Err(io::Error::from(io::ErrorKind::Other));
         }
 
+        if context_mode != ContextMode::Off && !buffered_findings.is_empty() {
+            let mut needs_lexical = false;
+            for rec in buffered_findings.iter() {
+                if engine.rule_lexical_context(rec.rule_id).is_some() {
+                    needs_lexical = true;
+                    break;
+                }
+            }
+
+            if needs_lexical {
+                #[cfg(unix)]
+                let family = lexical_family_for_path(path.as_os_str().as_bytes());
+                #[cfg(not(unix))]
+                let family = {
+                    let path = path.to_string_lossy();
+                    lexical_family_for_path(path.as_bytes())
+                };
+
+                if let Some(family) = family {
+                    if let Ok(mut file) = File::open(path) {
+                        if let Ok(meta) = file.metadata() {
+                            // Skip lexical filtering if the file size changed
+                            // after the initial scan (offsets would be stale).
+                            if meta.len() == file_size
+                                && tokenize_for_lexical(
+                                    &mut file,
+                                    file_size,
+                                    family,
+                                    &mut self.lex_buf,
+                                    &mut self.lex_runs,
+                                )
+                                .is_ok()
+                            {
+                                apply_lexical_context(
+                                    engine.as_ref(),
+                                    buffered_findings,
+                                    &self.lex_runs,
+                                    file_size,
+                                    context_mode,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            if buffered_findings.len() != out.len() {
+                let mut keep = vec![false; out.len()];
+                for rec in buffered_findings.iter() {
+                    if let Some(slot) = keep.get_mut(rec.out_index) {
+                        *slot = true;
+                    }
+                }
+                let mut idx = 0usize;
+                out.retain(|_| {
+                    let keep_it = keep.get(idx).copied().unwrap_or(false);
+                    idx += 1;
+                    keep_it
+                });
+            }
+        }
+
         Ok(self.out.as_slice())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::{LexicalClassSet, LexicalContextSpec, RuleSpec, ValidatorKind};
+    use crate::demo::demo_tuning;
+    use regex::bytes::Regex;
+    use std::fs;
+    use std::sync::Arc;
+
+    fn engine_with_lexical_rule() -> Arc<Engine> {
+        let rule = RuleSpec {
+            name: "secret",
+            anchors: &[b"SECRET"],
+            radius: 0,
+            validator: ValidatorKind::None,
+            two_phase: None,
+            must_contain: None,
+            keywords_any: None,
+            entropy: None,
+            local_context: None,
+            lexical_context: Some(LexicalContextSpec {
+                require_any: Some(LexicalClassSet::STRING),
+                prefer_any: LexicalClassSet::STRING,
+                deny_any: LexicalClassSet::COMMENT,
+            }),
+            secret_group: None,
+            re: Regex::new("SECRET").unwrap(),
+        };
+        Arc::new(Engine::new(vec![rule], Vec::new(), demo_tuning()))
+    }
+
+    #[test]
+    fn scan_file_sync_fails_open_on_unknown_language() -> io::Result<()> {
+        let engine = engine_with_lexical_rule();
+        let mut runtime = ScannerRuntime::new(
+            engine,
+            ScannerConfig {
+                chunk_size: 1024,
+                io_queue: 1,
+                reader_threads: 1,
+                scan_threads: 1,
+                max_findings_per_file: 64,
+                context_mode: ContextMode::Filter,
+            },
+        );
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("secret.unknown");
+        fs::write(&path, b"SECRET\n")?;
+
+        let findings = runtime.scan_file_sync(FileId(0), &path)?;
+        assert_eq!(findings.len(), 1);
+        Ok(())
     }
 }

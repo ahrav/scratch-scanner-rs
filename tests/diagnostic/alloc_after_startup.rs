@@ -13,7 +13,7 @@ use scanner_rs::pipeline::{
 use scanner_rs::scheduler::{
     scan_local, LocalConfig, LocalFile, NullSink, OutputSink, VecFileSource,
 };
-use scanner_rs::{demo_engine, ScannerConfig, ScannerRuntime};
+use scanner_rs::{demo_engine, ContextMode, ScannerConfig, ScannerRuntime};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fs;
 use std::io;
@@ -207,6 +207,7 @@ fn allocs_after_startup_in_scanner_runtime_scan_file_sync() -> io::Result<()> {
             reader_threads: 1,
             scan_threads: 1,
             max_findings_per_file: 128,
+            context_mode: ContextMode::Off,
         },
     );
 

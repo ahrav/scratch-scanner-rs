@@ -227,6 +227,7 @@ pub mod engine_impl;
 pub mod engine_stub;
 pub mod engine_trait;
 pub mod findings;
+pub mod lexical_pass;
 pub mod output_sink;
 pub mod ts_buffer_pool;
 pub mod ts_chunk;

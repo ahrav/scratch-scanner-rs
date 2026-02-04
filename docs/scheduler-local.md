@@ -4,7 +4,7 @@ The local scheduler module implements blocking-read file scanning with overlap-c
 
 ## Module Purpose
 
-`src/scheduler/local.rs` provides the core scanning logic for local filesystem traversal. Each worker thread opens files, reads them sequentially, chunks the data with overlap preservation, and emits findings. The module emphasizes correctness through work-conserving semantics and point-in-time snapshot safety, using blocking I/O as a strong baseline before adding complexity like `io_uring`.
+`src/scheduler/local.rs` provides the core scanning logic for local filesystem traversal. Each worker thread opens files, reads them sequentially, chunks the data with overlap preservation, and buffers findings per file. When lexical context is enabled, a candidate-only second pass re-opens the file to tokenize and filter findings before emission. The module emphasizes correctness through work-conserving semantics and point-in-time snapshot safety, using blocking I/O as a strong baseline before adding complexity like `io_uring`.
 
 ## Architecture Overview
 
@@ -28,6 +28,8 @@ flowchart TB
         Meta["metadata().len()"]
         ChunkLoop["Chunk loop<br/>overlap carry"]
         Scan["engine.scan_chunk_into()"]
+        Buffer["Buffer findings<br/>(per file)"]
+        Lexical["Lexical pass<br/>(candidate-only)"]
         Output["emit_findings()"]
     end
 
@@ -47,7 +49,9 @@ flowchart TB
     Open --> Meta
     Meta --> ChunkLoop
     ChunkLoop --> Scan
-    Scan --> Output
+    Scan --> Buffer
+    Buffer --> Lexical
+    Lexical --> Output
     Output --> Sink
 
     style Discovery fill:#e3f2fd
@@ -114,6 +118,7 @@ pub struct LocalConfig {
     pub max_file_size: u64,          // Max bytes to scan (open-time enforced)
     pub seed: u64,                   // Deterministic executor seed
     pub dedupe_within_chunk: bool,   // Deduplicate findings per chunk
+    pub context_mode: ContextMode,   // Candidate-only lexical filtering mode
 }
 ```
 
@@ -127,6 +132,15 @@ pub struct LocalConfig {
 | `local_queue_cap` | Per-worker local queue for buffers. Typically 2–8 to amortize pool contention. |
 | `workers` | Match CPU cores for I/O-light workloads; may be higher for highly parallelizable CPU work. |
 | `max_file_size` | Size cap in bytes. Enforced at open time using `metadata().len()`. |
+
+## Candidate-Only Lexical Context
+
+When `context_mode` is enabled, the scheduler buffers findings per file and
+re-opens candidate files for a second pass. The file is tokenized into
+code/comment/string/config runs based on a language-family mapping derived from
+the path extension. Findings are filtered only when lexical context is
+definitive; unknown context, run-cap overflow, or I/O errors fail open (findings
+are emitted unfiltered).
 
 ### Configuration Validation
 

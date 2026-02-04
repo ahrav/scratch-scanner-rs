@@ -237,6 +237,10 @@ Some rules benefit from additional semantic filters beyond anchors + regex:
   such as assignment separators, required key names, and/or matching quotes.
   This gate is fail-open when line boundaries are missing in the window to
   avoid false negatives at chunk edges.
+- **Lexical context gate (candidate-only)**: after scanning, re-read candidate
+  files and classify byte ranges as code/comment/string/config with a streaming
+  tokenizer. Rule-level lexical requirements can then score or filter findings.
+  The gate fails open on unknown context, run-cap overflow, or I/O errors.
 - **Entropy gate**: after a regex match, compute Shannon entropy (bits/byte)
   of the matched bytes. Low-entropy matches are rejected as likely false
   positives (e.g., repeated characters or structured IDs).
@@ -246,8 +250,27 @@ These gates are designed to be **local and bounded**:
   **before decoding** to avoid wasting decode budget.
 - Local context uses bounded lookaround windows and operates on decoded UTF-8
   bytes for UTF-16 variants, preserving fail-open semantics at boundaries.
+- Lexical context runs in a **second pass** only when findings exist; it is
+  allocation-free after warm-up and fails open when context is unknown.
 - Entropy runs only on the regex match and is capped by `max_len` to keep cost
   predictable.
+
+## Lexical Tokenizer Families (Design B)
+
+The candidate-only lexical pass classifies byte ranges with lightweight,
+streaming tokenizers. Initial coverage is intentionally coarse but fast:
+
+- **C-like**: `//` and `/* */` comments, `'\"`/`\"`/`` ` `` string delimiters with
+  backslash escapes.
+- **Python-like**: `#` comments, single/double quotes, and `'''`/`\"\"\"` triple
+  quotes (fail-open on ambiguous boundaries).
+- **Shell-like**: `#` comments, single/double quotes with backslash escapes.
+- **Config**: `#`, `;`, and `//` line comments; quoted strings; unquoted values
+  are classified as `Config` (not `Code`).
+
+Tokenizer output is stored as run-length segments and used for rule-specific
+lexical context gating and scoring. Lookups treat runs as half-open ranges
+`[start, end)` and use a binary search to map findings to a class.
 
 ## Tuning Parameters
 

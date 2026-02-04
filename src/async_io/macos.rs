@@ -64,10 +64,14 @@
 //! - **Leak-free cleanup**: `Drop` drains all in-flight requests before freeing buffers.
 
 use super::*;
-use crate::{BufferPool, Chunk, Engine, FindingRec, ScanScratch};
+use crate::git_scan::path_policy::lexical_family_for_path;
+use crate::lexical::{LexRuns, DEFAULT_LEX_RUN_CAP};
+use crate::scheduler::lexical_pass::{apply_lexical_context, tokenize_for_lexical};
+use crate::{BufferPool, Chunk, ContextMode, Engine, FindingRec, ScanScratch};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::mem;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::sync::Arc;
 
@@ -244,10 +248,14 @@ mod aio {
 /// With defaults (depth=2, 256K buffers, 256K paths): ~1 MiB baseline.
 pub struct MacosAioScanner {
     engine: Arc<Engine>,
+    config: AsyncIoConfig,
     pool: BufferPool,
     reader: AioFileReader,
     scratch: ScanScratch,
     pending: Vec<FindingRec>,
+    file_findings: Vec<FindingRec>,
+    lex_runs: LexRuns,
+    lex_buf: Vec<u8>,
     files: FileTable,
     walker: Walker,
     out: BufWriter<io::Stdout>,
@@ -292,6 +300,10 @@ impl MacosAioScanner {
         )?;
         let scratch = engine.new_scratch();
         let pending = Vec::with_capacity(engine.tuning.max_findings_per_chunk);
+        let file_findings = Vec::with_capacity(engine.tuning.max_findings_per_chunk);
+        let lex_runs = LexRuns::with_capacity(DEFAULT_LEX_RUN_CAP)
+            .expect("lexical run buffer allocation failed");
+        let lex_buf = vec![0u8; buf_len];
         let files =
             FileTable::with_capacity_and_path_bytes(config.max_files, config.path_bytes_cap);
         let walker = Walker::new(config.max_files)?;
@@ -299,10 +311,14 @@ impl MacosAioScanner {
 
         Ok(Self {
             engine,
+            config,
             pool,
             reader,
             scratch,
             pending,
+            file_findings,
+            lex_runs,
+            lex_buf,
             files,
             walker,
             out,
@@ -314,6 +330,7 @@ impl MacosAioScanner {
         let engine = Arc::clone(&self.engine);
         self.files.clear();
         self.pending.clear();
+        self.file_findings.clear();
         self.walker.reset(path, &mut self.files, stats)?;
 
         while !self.walker.is_done() {
@@ -330,6 +347,10 @@ impl MacosAioScanner {
                 engine.as_ref(),
                 &mut self.scratch,
                 &mut self.pending,
+                &mut self.file_findings,
+                &mut self.lex_runs,
+                &mut self.lex_buf,
+                self.config.context_mode,
                 file_id,
                 file_path,
                 file_size,
@@ -363,21 +384,31 @@ impl MacosAioScanner {
 /// Scan a single file using POSIX AIO reads.
 ///
 /// Keeps the AIO queue filled while scanning, preserving ordering and overlap.
+/// When `context_mode != Off`, findings are buffered per file and lexical
+/// filtering runs after the file completes.
 // Keep scan dependencies explicit so the hot path has no hidden state
 // and the call site shows all mutable resources.
-fn scan_file(
+fn scan_file<W: Write>(
     reader: &mut AioFileReader,
     pool: &BufferPool,
     engine: &Engine,
     scratch: &mut ScanScratch,
     pending: &mut Vec<FindingRec>,
+    file_findings: &mut Vec<FindingRec>,
+    lex_runs: &mut LexRuns,
+    lex_buf: &mut [u8],
+    context_mode: ContextMode,
     file_id: FileId,
     path: &Path,
     file_size: u64,
-    out: &mut BufWriter<io::Stdout>,
+    out: &mut W,
     stats: &mut PipelineStats,
 ) -> io::Result<()> {
     reader.reset_for_file(file_id, path, file_size)?;
+
+    if context_mode != ContextMode::Off {
+        file_findings.clear();
+    }
 
     while let Some(chunk) = reader.next_chunk(pool)? {
         let payload_len = chunk.len.saturating_sub(chunk.prefix_len) as u64;
@@ -389,7 +420,64 @@ fn scan_file(
         scratch.drop_prefix_findings(new_bytes_start);
         scratch.drain_findings_into(pending);
 
-        for rec in pending.drain(..) {
+        if context_mode == ContextMode::Off {
+            for rec in pending.drain(..) {
+                let rule = engine.rule_name(rec.rule_id);
+                write_path(out, path)?;
+                write!(
+                    out,
+                    ":{}-{} {}",
+                    rec.root_hint_start, rec.root_hint_end, rule
+                )?;
+                out.write_all(b"\n")?;
+                stats.findings += 1;
+            }
+        } else {
+            file_findings.append(pending);
+        }
+    }
+
+    if context_mode != ContextMode::Off && !file_findings.is_empty() {
+        let mut needs_lexical = false;
+        for rec in file_findings.iter() {
+            if engine.rule_lexical_context(rec.rule_id).is_some() {
+                needs_lexical = true;
+                break;
+            }
+        }
+
+        if needs_lexical {
+            #[cfg(unix)]
+            let family = lexical_family_for_path(path.as_os_str().as_bytes());
+            #[cfg(not(unix))]
+            let family = {
+                let path = path.to_string_lossy();
+                lexical_family_for_path(path.as_bytes())
+            };
+
+            if let Some(family) = family {
+                if let Ok(mut file) = File::open(path) {
+                    if let Ok(meta) = file.metadata() {
+                        // Only trust lexical offsets if the file size matches
+                        // the snapshot we scanned.
+                        if meta.len() == file_size
+                            && tokenize_for_lexical(&mut file, file_size, family, lex_buf, lex_runs)
+                                .is_ok()
+                        {
+                            apply_lexical_context(
+                                engine,
+                                file_findings,
+                                lex_runs,
+                                file_size,
+                                context_mode,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        for rec in file_findings.drain(..) {
             let rule = engine.rule_name(rec.rule_id);
             write_path(out, path)?;
             write!(
@@ -1081,8 +1169,14 @@ pub type AioScanner = MacosAioScanner;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::{LexicalClassSet, LexicalContextSpec, RuleSpec, ValidatorKind};
+    use crate::demo::demo_tuning;
+    use crate::runtime::{ScannerConfig, ScannerRuntime};
+    use regex::bytes::Regex;
+    use std::fs;
     use std::io;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     struct TempDir {
@@ -1110,6 +1204,28 @@ mod tests {
         path.push(format!("{}_{}_{}", prefix, std::process::id(), stamp));
         std::fs::create_dir(&path)?;
         Ok(TempDir { path })
+    }
+
+    fn engine_with_lexical_rule() -> Arc<Engine> {
+        let rule = RuleSpec {
+            name: "secret",
+            anchors: &[b"SECRET"],
+            radius: 0,
+            validator: ValidatorKind::None,
+            two_phase: None,
+            must_contain: None,
+            keywords_any: None,
+            entropy: None,
+            local_context: None,
+            lexical_context: Some(LexicalContextSpec {
+                require_any: Some(LexicalClassSet::STRING),
+                prefer_any: LexicalClassSet::STRING,
+                deny_any: LexicalClassSet::COMMENT,
+            }),
+            secret_group: None,
+            re: Regex::new("SECRET").unwrap(),
+        };
+        Arc::new(Engine::new(vec![rule], Vec::new(), demo_tuning()))
     }
 
     #[test]
@@ -1324,6 +1440,80 @@ mod tests {
         assert_eq!(reader.wait_list.capacity(), caps.3);
         assert_eq!(reader.tail.capacity(), caps.4);
 
+        Ok(())
+    }
+
+    #[test]
+    fn aio_matches_runtime_output_with_lexical_filtering() -> io::Result<()> {
+        let engine = engine_with_lexical_rule();
+        let tmp = make_temp_dir("scanner_async_parity")?;
+        let file_path = tmp.path().join("sample.rs");
+        fs::write(&file_path, b"let a = \"SECRET\"; // SECRET\n")?;
+
+        let mut runtime = ScannerRuntime::new(
+            Arc::clone(&engine),
+            ScannerConfig {
+                chunk_size: 1024,
+                io_queue: 1,
+                reader_threads: 1,
+                scan_threads: 1,
+                max_findings_per_file: 64,
+                context_mode: ContextMode::Filter,
+            },
+        );
+        let mut runtime_lines: Vec<String> = runtime
+            .scan_file_sync(FileId(0), &file_path)?
+            .iter()
+            .map(|f| {
+                format!(
+                    "{}:{}-{} {}",
+                    file_path.display(),
+                    f.root_span_hint.start,
+                    f.root_span_hint.end,
+                    f.rule
+                )
+            })
+            .collect();
+        runtime_lines.sort();
+
+        let config = AsyncIoConfig {
+            chunk_size: 32 * 1024,
+            queue_depth: 2,
+            context_mode: ContextMode::Filter,
+            ..AsyncIoConfig::default()
+        };
+        let mut scanner = MacosAioScanner::new(Arc::clone(&engine), config)?;
+
+        let file_size = fs::metadata(&file_path)?.len();
+        let mut scratch = engine.new_scratch();
+        let mut pending = Vec::with_capacity(engine.tuning.max_findings_per_chunk);
+        let mut stats = PipelineStats::default();
+        let mut output = Vec::new();
+
+        scan_file(
+            &mut scanner.reader,
+            &scanner.pool,
+            engine.as_ref(),
+            &mut scratch,
+            &mut pending,
+            &mut scanner.file_findings,
+            &mut scanner.lex_runs,
+            &mut scanner.lex_buf,
+            scanner.config.context_mode,
+            FileId(0),
+            &file_path,
+            file_size,
+            &mut output,
+            &mut stats,
+        )?;
+
+        let mut aio_lines: Vec<String> = String::from_utf8_lossy(&output)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        aio_lines.sort();
+
+        assert_eq!(runtime_lines, aio_lines);
         Ok(())
     }
 }

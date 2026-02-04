@@ -161,6 +161,7 @@ mod tests {
             keywords_any: None,
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: Regex::new(pattern).unwrap(),
         }

@@ -91,6 +91,9 @@ graph TB
 | **ReaderStage**     | `src/pipeline.rs:579`          | File chunking with overlap preservation                              |
 | **ScanStage**       | `src/pipeline.rs:680`          | Detection engine invocation                                          |
 | **OutputStage**     | `src/pipeline.rs:785`          | Finding output to stdout                                             |
+| **Async I/O (Linux)** | `src/async_io/linux.rs`      | io_uring scanner; buffers per-file findings and applies lexical pass |
+| **Async I/O (macOS)** | `src/async_io/macos.rs`      | POSIX AIO scanner; buffers per-file findings and applies lexical pass |
+| **AsyncIoConfig**   | `src/async_io/mod.rs:128`      | Shared async config (queue depth, chunk size, `context_mode`)        |
 | **BufferPool**      | `src/runtime.rs:468`           | Fixed-capacity aligned buffer pool                                   |
 | **NodePoolType**    | `src/pool/node_pool.rs:49`     | Generic pre-allocated node pool                                      |
 | **RingBuffer**      | `src/stdx/ring_buffer.rs:45`   | Fixed-capacity SPSC queue                                            |
@@ -127,6 +130,15 @@ graph TB
 | **Git Scan CLI** | `src/bin/git_scan.rs` | CLI entrypoint for Git scanning pipeline |
 | **WorkItems**       | `src/git_scan/work_items.rs`  | SoA candidate metadata tables for sorting without moving structs    |
 | **Policy Hash**     | `src/git_scan/policy_hash.rs`  | Canonical BLAKE3 identity over rules, transforms, and tuning         |
+
+## Async Scanners + Lexical Pass
+
+The async scanners (Linux io_uring and macOS POSIX AIO) follow the same
+candidate-only lexical filtering flow as the pipeline: findings are buffered
+per file, a second pass re-reads the file for lexical tokenization based on
+path family, and `context_mode` controls whether findings are filtered before
+emission. If the file changes or tokenization fails, the scanners fail open and
+emit unfiltered findings.
 
 ## Git Scanning Preflight
 
@@ -232,3 +244,6 @@ Scheduler harness code lives in `src/scheduler/sim_executor_harness.rs`.
   single file cannot blow up CPU or memory.
 - **Correctness over cleverness**: gates may allow false positives, but they
   never skip possible true matches; correctness is preserved by design.
+- **Candidate-only lexical context**: an optional second pass classifies
+  code/comment/string/config regions for findings and can filter only when
+  context is definitive; unknown context fails open.

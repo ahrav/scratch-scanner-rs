@@ -36,7 +36,7 @@
 //! This preserves the trait's simplicity while satisfying the real engine's requirements.
 
 use super::engine_trait::{EngineScratch, FindingRecord, ScanEngine};
-use crate::api::{FileId, FindingRec as ApiFindingRec};
+use crate::api::{FileId, FindingRec as ApiFindingRec, STEP_ROOT};
 use crate::engine::{Engine, ScanScratch as RealScanScratch};
 
 // ============================================================================
@@ -67,6 +67,11 @@ impl FindingRecord for ApiFindingRec {
     #[inline]
     fn span_end(&self) -> u64 {
         u64::from(self.span_end)
+    }
+
+    #[inline]
+    fn lexical_root_span_precise(&self) -> bool {
+        self.step_id == STEP_ROOT || !self.dedupe_with_span
     }
 }
 
@@ -205,6 +210,10 @@ impl ScanEngine for Engine {
     fn rule_name(&self, rule_id: u32) -> &str {
         self.rule_name(rule_id)
     }
+
+    fn rule_lexical_context(&self, rule_id: u32) -> Option<crate::api::LexicalContextSpec> {
+        self.rule_lexical_context(rule_id)
+    }
 }
 
 // ============================================================================
@@ -243,6 +252,7 @@ mod tests {
             keywords_any: None,
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: Regex::new(r"SECRET[A-Z0-9]{8}").unwrap(),
         }

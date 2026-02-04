@@ -273,6 +273,9 @@ pub struct ParallelScanConfig {
     /// large binaries, media files, or database dumps that are unlikely
     /// to contain secrets but would consume significant scan time.
     pub max_file_size: u64,
+
+    /// Context mode for candidate-only lexical filtering.
+    pub context_mode: crate::ContextMode,
 }
 
 impl Default for ParallelScanConfig {
@@ -289,6 +292,7 @@ impl Default for ParallelScanConfig {
             skip_hidden: true,
             respect_gitignore: true,
             max_file_size: 100 * 1024 * 1024, // 100 MiB
+            context_mode: crate::ContextMode::Off,
         }
     }
 }
@@ -310,6 +314,7 @@ impl ParallelScanConfig {
             max_file_size: self.max_file_size,
             seed: self.seed,
             dedupe_within_chunk: true,
+            context_mode: self.context_mode,
         }
     }
 }
@@ -564,6 +569,12 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    #[test]
+    fn parallel_config_defaults_context_mode_off() {
+        let cfg = ParallelScanConfig::default();
+        assert_eq!(cfg.context_mode, crate::ContextMode::Off);
+    }
+
     struct StubEntry {
         path: std::path::PathBuf,
     }
@@ -612,6 +623,7 @@ mod tests {
             keywords_any: None,
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: Regex::new(r"SECRET[A-Z0-9]{8}").unwrap(),
         }
@@ -629,6 +641,7 @@ mod tests {
             skip_hidden: true,
             respect_gitignore: false,
             max_file_size: 10 * 1024 * 1024,
+            context_mode: crate::ContextMode::Off,
         }
     }
 

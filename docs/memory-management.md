@@ -426,3 +426,12 @@ All vectors are reused across chunks via `reset_for_scan()`:
 - Vectors are cleared but retain capacity
 - `seen` uses generation-based O(1) reset
 - Avoids per-chunk allocation overhead
+
+## Lexical Context Scratch (Design B)
+
+Candidate-only lexical filtering uses a fixed-capacity run buffer:
+
+- `LexRuns` stores `LexRun { start, end, class }` segments in `ScratchVec<LexRun>`.
+- If the run cap is exceeded, the tokenizer marks the buffer as overflowed,
+  clears existing runs, and **fails open** (lexical context = unknown).
+- The run buffer is reused per file and never reallocates after warm-up.

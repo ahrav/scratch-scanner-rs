@@ -22,6 +22,7 @@ fn test_engine() -> &'static Engine {
             keywords_any: None,
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: Some(1),
             re: Regex::new(r"TOK_([A-Z0-9]{4,8})").unwrap(),
         };
@@ -35,6 +36,7 @@ fn test_engine() -> &'static Engine {
             keywords_any: None,
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: Some(1),
             re: Regex::new(r"KEY_([a-z0-9]{6})").unwrap(),
         };

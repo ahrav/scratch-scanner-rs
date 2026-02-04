@@ -81,13 +81,16 @@ stateDiagram-v2
         [*] --> Idle
         Idle --> Reading: file_ring.pop()
         Reading --> Reading: more chunks
-        Reading --> Idle: EOF reached
+        Reading --> EmittingDone: EOF reached
+        EmittingDone --> Idle: FileDone enqueued
     }
 
     state ScanStage {
         [*] --> Scanning
         Scanning --> Flushing: chunk scanned
         Flushing --> Scanning: pending drained
+        Scanning --> Finalizing: FileDone received
+        Finalizing --> Scanning: lexical pass complete
     }
 
     state OutputStage {
@@ -103,7 +106,8 @@ let done = walker.is_done()           // No more files to discover
     && reader.is_idle()               // No active file being read
     && file_ring.is_empty()           // No pending file IDs
     && chunk_ring.is_empty()          // No pending chunks
-    && !scanner.has_pending()         // No buffered findings
+    && !scanner.has_pending_emit()    // No buffered findings waiting to emit
+    && !scanner.has_buffered_file()   // No per-file findings awaiting finalize
     && out_ring.is_empty();           // All findings written
 ```
 
@@ -114,7 +118,8 @@ graph TB
         RI["reader.is_idle()"]
         FE["file_ring.is_empty()"]
         CE["chunk_ring.is_empty()"]
-        NP["!scanner.has_pending()"]
+        NP["!scanner.has_pending_emit()"]
+        BF["!scanner.has_buffered_file()"]
         OE["out_ring.is_empty()"]
     end
 
@@ -123,6 +128,7 @@ graph TB
     FE --> AND
     CE --> AND
     NP --> AND
+    BF --> AND
     OE --> AND
 
     AND{{"ALL true?"}}
@@ -141,7 +147,7 @@ loop {
     let mut progressed = false;
 
     progressed |= output.pump(&engine, &files, &mut out_ring, &mut stats)?;
-    progressed |= scanner.pump(&engine, &mut chunk_ring, &mut out_ring);
+    progressed |= scanner.pump(&engine, &files, &mut chunk_ring, &mut out_ring);
     progressed |= reader.pump(&mut file_ring, &mut chunk_ring, &pool, &files, &mut stats)?;
     progressed |= walker.pump(&mut files, &mut file_ring, &mut stats)?;
 

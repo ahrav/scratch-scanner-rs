@@ -1213,6 +1213,13 @@ impl Engine {
             .unwrap_or("<unknown-rule>")
     }
 
+    /// Returns the lexical context spec for a rule, if any.
+    pub fn rule_lexical_context(&self, rule_id: u32) -> Option<LexicalContextSpec> {
+        self.rules
+            .get(rule_id as usize)
+            .and_then(|r| r.lexical_context)
+    }
+
     /// Allocates a fresh scratch state sized for this engine.
     pub fn new_scratch(&self) -> ScanScratch {
         ScanScratch::new(self)
@@ -1254,6 +1261,32 @@ impl Engine {
         }
         scratch.norm_hash.clear();
         scratch.drop_hint_end.clear();
+    }
+
+    /// Materializes findings from a provided slice using the current scratch arena.
+    ///
+    /// The findings must come from the same `ScanScratch` instance; `step_id`
+    /// references are only valid while its step arena remains alive.
+    pub fn materialize_findings_from(
+        &self,
+        scratch: &mut ScanScratch,
+        recs: &[FindingRec],
+        out: &mut Vec<Finding>,
+    ) {
+        for rec in recs {
+            let rule = &self.rules[rec.rule_id as usize];
+            scratch
+                .step_arena
+                .materialize(rec.step_id, &mut scratch.steps_buf);
+            let mut steps = DecodeSteps::new();
+            steps.extend_from_slice(scratch.steps_buf.as_slice());
+            out.push(Finding {
+                rule: rule.name,
+                span: (rec.span_start as usize)..(rec.span_end as usize),
+                root_span_hint: u64_to_usize(rec.root_hint_start)..u64_to_usize(rec.root_hint_end),
+                decode_steps: steps,
+            });
+        }
     }
 }
 

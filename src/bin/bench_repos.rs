@@ -1,8 +1,8 @@
 //! Scan sibling repositories and report throughput.
 
 use scanner_rs::{
-    demo_engine_with_anchor_mode_and_tuning, demo_tuning, AnchorMode, FileId, ScannerConfig,
-    ScannerRuntime, BUFFER_LEN_MAX,
+    demo_engine_with_anchor_mode_and_tuning, demo_tuning, AnchorMode, ContextMode, FileId,
+    ScannerConfig, ScannerRuntime, BUFFER_LEN_MAX,
 };
 use std::env;
 use std::ffi::OsStr;
@@ -102,6 +102,7 @@ fn scan_repo(engine: &Arc<scanner_rs::Engine>, path: &Path) -> io::Result<RunRes
         reader_threads: 1,
         scan_threads: 1,
         max_findings_per_file: 16_384,
+        context_mode: ContextMode::Off,
     };
     let mut runtime = ScannerRuntime::new(Arc::clone(engine), config);
 

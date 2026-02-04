@@ -63,7 +63,7 @@
 
 use crate::pipeline::PipelineStats;
 use crate::scratch_memory::ScratchVec;
-use crate::{FileId, FileTable, BUFFER_ALIGN, BUFFER_LEN_MAX};
+use crate::{ContextMode, FileId, FileTable, BUFFER_ALIGN, BUFFER_LEN_MAX};
 #[cfg(not(unix))]
 use std::fs;
 use std::io;
@@ -143,6 +143,8 @@ pub struct AsyncIoConfig {
     pub queue_depth: u32,
     /// Enable O_DIRECT for the aligned portion of reads on Linux.
     pub use_o_direct: bool,
+    /// Context mode for candidate-only lexical filtering.
+    pub context_mode: ContextMode,
 }
 
 impl Default for AsyncIoConfig {
@@ -154,6 +156,7 @@ impl Default for AsyncIoConfig {
             path_bytes_cap: max_files.saturating_mul(ASYNC_PATH_BYTES_PER_FILE),
             queue_depth: ASYNC_DEFAULT_QUEUE_DEPTH,
             use_o_direct: true,
+            context_mode: ContextMode::Off,
         }
     }
 }
@@ -648,3 +651,14 @@ pub use linux::UringScanner;
 
 #[cfg(target_os = "macos")]
 pub use macos::{AioScanner, MacosAioScanner};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn async_io_config_defaults_context_mode_off() {
+        let cfg = AsyncIoConfig::default();
+        assert_eq!(cfg.context_mode, ContextMode::Off);
+    }
+}

@@ -62,15 +62,16 @@ mod api;
 mod demo;
 mod engine;
 mod gitleaks_rules;
+mod lexical;
 mod runtime;
 
 #[cfg(feature = "b64-stats")]
 pub use api::Base64DecodeStats;
 pub use api::{
-    AnchorPolicy, DecodeStep, DecodeSteps, DelimAfter, EntropySpec, FileId, Finding, FindingRec,
-    Gate, LocalContextSpec, RuleSpec, StepId, TailCharset, TransformConfig, TransformId,
-    TransformMode, Tuning, TwoPhaseSpec, Utf16Endianness, ValidatorKind,
-    LOCAL_CONTEXT_MAX_LOOKAROUND, MAX_DECODE_STEPS,
+    AnchorPolicy, ContextMode, DecodeStep, DecodeSteps, DelimAfter, EntropySpec, FileId, Finding,
+    FindingRec, Gate, LexicalClass, LexicalClassSet, LexicalContextSpec, LocalContextSpec,
+    RuleSpec, StepId, TailCharset, TransformConfig, TransformId, TransformMode, Tuning,
+    TwoPhaseSpec, Utf16Endianness, ValidatorKind, LOCAL_CONTEXT_MAX_LOOKAROUND, MAX_DECODE_STEPS,
 };
 
 pub use demo::{
@@ -90,6 +91,8 @@ pub use engine::{bench_find_spans_into, bench_stream_decode_base64, bench_stream
 #[cfg(feature = "stats")]
 pub use engine::{AnchorPlanStats, VectorscanStats};
 pub use engine::{Engine, NormHash, ScanScratch};
+#[cfg(feature = "bench")]
+pub use lexical::{LexRuns, LexicalFamily, LexicalTokenizer, DEFAULT_LEX_RUN_CAP};
 
 pub use async_io::AsyncIoConfig;
 #[cfg(any(target_os = "linux", target_os = "macos"))]

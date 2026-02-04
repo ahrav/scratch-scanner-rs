@@ -16,14 +16,17 @@
 //! - On Unix, path storage is a fixed-size arena; exceeding it is a hard error.
 //! - The pipeline is single-threaded and not Sync/Send by design.
 
+use crate::git_scan::path_policy::lexical_family_for_path;
+use crate::lexical::{LexRuns, DEFAULT_LEX_RUN_CAP};
 #[cfg(unix)]
 use crate::runtime::PathSpan;
+use crate::scheduler::lexical_pass::{apply_lexical_context, tokenize_for_lexical};
 #[cfg(unix)]
 use crate::scratch_memory::ScratchVec;
 use crate::stdx::RingBuffer;
 use crate::{
-    BufferPool, Chunk, Engine, FileId, FileTable, FindingRec, ScanScratch, BUFFER_ALIGN,
-    BUFFER_LEN_MAX,
+    BufferPool, Chunk, ContextMode, Engine, FileId, FileTable, FindingRec, ScanScratch,
+    BUFFER_ALIGN, BUFFER_LEN_MAX,
 };
 #[cfg(not(unix))]
 use std::fs;
@@ -102,6 +105,8 @@ pub struct PipelineConfig {
     /// ignored. Exceeding the arena is treated as a configuration bug and will
     /// fail fast rather than allocate.
     pub path_bytes_cap: usize,
+    /// Context mode for candidate-only lexical filtering.
+    pub context_mode: ContextMode,
 }
 
 impl Default for PipelineConfig {
@@ -111,6 +116,7 @@ impl Default for PipelineConfig {
             chunk_size: DEFAULT_CHUNK_SIZE,
             max_files,
             path_bytes_cap: max_files.saturating_mul(PIPE_PATH_BYTES_PER_FILE),
+            context_mode: ContextMode::Off,
         }
     }
 }
@@ -180,6 +186,12 @@ impl<T, const N: usize> SpscRing<T, N> {
     fn clear(&mut self) {
         while self.pop().is_some() {}
     }
+}
+
+/// Scanner work item: either a data chunk or an end-of-file marker.
+enum ScanItem {
+    Chunk(Chunk),
+    FileDone(FileId),
 }
 
 #[cfg(not(unix))]
@@ -580,6 +592,7 @@ struct ReaderStage {
     overlap: usize,
     chunk_size: usize,
     active: Option<FileReader>,
+    pending_done: Option<FileId>,
     tail: Vec<u8>,
     tail_len: usize,
 }
@@ -590,6 +603,7 @@ impl ReaderStage {
             overlap,
             chunk_size,
             active: None,
+            pending_done: None,
             tail: vec![0u8; overlap],
             tail_len: 0,
         }
@@ -597,11 +611,12 @@ impl ReaderStage {
 
     fn reset(&mut self) {
         self.active = None;
+        self.pending_done = None;
         self.tail_len = 0;
     }
 
     fn is_idle(&self) -> bool {
-        self.active.is_none()
+        self.active.is_none() && self.pending_done.is_none()
     }
 
     fn is_waiting(&self) -> bool {
@@ -613,7 +628,7 @@ impl ReaderStage {
     fn pump<const FILE_CAP: usize, const CHUNK_CAP: usize>(
         &mut self,
         file_ring: &mut SpscRing<FileId, FILE_CAP>,
-        chunk_ring: &mut SpscRing<Chunk, CHUNK_CAP>,
+        chunk_ring: &mut SpscRing<ScanItem, CHUNK_CAP>,
         pool: &BufferPool,
         files: &FileTable,
         stats: &mut PipelineStats,
@@ -621,6 +636,15 @@ impl ReaderStage {
         let mut progressed = false;
 
         while !chunk_ring.is_full() {
+            if let Some(done_id) = self.pending_done {
+                if chunk_ring.push(ScanItem::FileDone(done_id)).is_err() {
+                    break;
+                }
+                self.pending_done = None;
+                progressed = true;
+                continue;
+            }
+
             let handle = match pool.try_acquire() {
                 Some(handle) => handle,
                 None => break,
@@ -644,10 +668,10 @@ impl ReaderStage {
                 };
 
                 self.active = Some(FileReader::new(file_id, file));
-                progressed = true;
             }
 
             let reader = self.active.as_mut().expect("reader active");
+            let file_id = reader.file_id;
             match reader.read_next_chunk(
                 handle,
                 self.chunk_size,
@@ -658,13 +682,15 @@ impl ReaderStage {
                 Some(chunk) => {
                     let new_bytes = u64::from(chunk.len.saturating_sub(chunk.prefix_len));
                     stats.bytes_scanned = stats.bytes_scanned.saturating_add(new_bytes);
-                    chunk_ring.push_assume_capacity(chunk);
+                    chunk_ring.push_assume_capacity(ScanItem::Chunk(chunk));
                     stats.chunks += 1;
                     progressed = true;
                 }
                 None => {
                     self.active = None;
                     self.tail_len = 0;
+                    self.pending_done = Some(file_id);
+                    progressed = true;
                 }
             }
         }
@@ -675,30 +701,50 @@ impl ReaderStage {
 
 /// Stage that scans chunks and buffers findings for output.
 ///
-/// Findings are buffered in `pending` to honor output backpressure without
-/// stalling chunk consumption permanently.
+/// When `context_mode` is enabled, findings are buffered per file until a
+/// `FileDone` marker arrives, at which point lexical filtering is applied.
 struct ScanStage {
     scratch: ScanScratch,
-    pending: Vec<FindingRec>,
+    pending_emit: Vec<FindingRec>,
     pending_idx: usize,
+    chunk_buf: Vec<FindingRec>,
+    file_findings: Vec<FindingRec>,
+    active_file: Option<FileId>,
+    lex_runs: LexRuns,
+    lex_buf: Vec<u8>,
+    context_mode: ContextMode,
 }
 
 impl ScanStage {
-    fn new(engine: &Engine) -> Self {
+    fn new(engine: &Engine, context_mode: ContextMode, lex_buf_len: usize) -> Self {
         Self {
             scratch: engine.new_scratch(),
-            pending: Vec::with_capacity(engine.tuning.max_findings_per_chunk),
+            pending_emit: Vec::with_capacity(engine.tuning.max_findings_per_chunk),
             pending_idx: 0,
+            chunk_buf: Vec::with_capacity(engine.tuning.max_findings_per_chunk),
+            file_findings: Vec::with_capacity(engine.tuning.max_findings_per_chunk),
+            active_file: None,
+            lex_runs: LexRuns::with_capacity(DEFAULT_LEX_RUN_CAP)
+                .expect("lexical run buffer allocation failed"),
+            lex_buf: vec![0u8; lex_buf_len],
+            context_mode,
         }
     }
 
     fn reset(&mut self) {
-        self.pending.clear();
+        self.pending_emit.clear();
         self.pending_idx = 0;
+        self.chunk_buf.clear();
+        self.file_findings.clear();
+        self.active_file = None;
     }
 
-    fn has_pending(&self) -> bool {
-        self.pending_idx < self.pending.len()
+    fn has_pending_emit(&self) -> bool {
+        self.pending_idx < self.pending_emit.len()
+    }
+
+    fn has_buffered_file(&self) -> bool {
+        self.active_file.is_some() || !self.file_findings.is_empty()
     }
 
     fn flush_pending<const OUT_CAP: usize>(
@@ -707,26 +753,94 @@ impl ScanStage {
     ) -> bool {
         let mut progressed = false;
 
-        while self.pending_idx < self.pending.len() {
-            if out_ring.push(self.pending[self.pending_idx]).is_err() {
+        while self.pending_idx < self.pending_emit.len() {
+            if out_ring.push(self.pending_emit[self.pending_idx]).is_err() {
                 break;
             }
             self.pending_idx += 1;
             progressed = true;
         }
 
-        if self.pending_idx >= self.pending.len() {
-            self.pending.clear();
+        if self.pending_idx >= self.pending_emit.len() {
+            self.pending_emit.clear();
             self.pending_idx = 0;
         }
 
         progressed
     }
 
+    fn finalize_file(&mut self, engine: &Engine, files: &FileTable, file_id: FileId) -> bool {
+        if self.active_file.is_some() && self.active_file != Some(file_id) {
+            debug_assert!(false, "file ordering violated in pipeline scan ring");
+        }
+        self.active_file = None;
+
+        if self.file_findings.is_empty() {
+            return false;
+        }
+
+        if self.context_mode != ContextMode::Off {
+            let mut needs_lexical = false;
+            for rec in &self.file_findings {
+                if engine.rule_lexical_context(rec.rule_id).is_some() {
+                    needs_lexical = true;
+                    break;
+                }
+            }
+
+            if needs_lexical {
+                let path = files.path(file_id);
+                #[cfg(unix)]
+                let family = lexical_family_for_path(path.as_os_str().as_bytes());
+                #[cfg(not(unix))]
+                let family = {
+                    let path = path.to_string_lossy();
+                    lexical_family_for_path(path.as_bytes())
+                };
+
+                if let Some(family) = family {
+                    if let Ok(mut file) = File::open(path) {
+                        if let Ok(meta) = file.metadata() {
+                            // Only apply lexical filtering if the file still
+                            // matches the size we scanned (stable offsets).
+                            let file_size = files.size(file_id);
+                            if meta.len() == file_size
+                                && tokenize_for_lexical(
+                                    &mut file,
+                                    file_size,
+                                    family,
+                                    &mut self.lex_buf,
+                                    &mut self.lex_runs,
+                                )
+                                .is_ok()
+                            {
+                                apply_lexical_context(
+                                    engine,
+                                    &mut self.file_findings,
+                                    &self.lex_runs,
+                                    file_size,
+                                    self.context_mode,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !self.file_findings.is_empty() {
+            self.pending_emit.append(&mut self.file_findings);
+            return true;
+        }
+
+        false
+    }
+
     fn pump<const CHUNK_CAP: usize, const OUT_CAP: usize>(
         &mut self,
         engine: &Engine,
-        chunk_ring: &mut SpscRing<Chunk, CHUNK_CAP>,
+        files: &FileTable,
+        chunk_ring: &mut SpscRing<ScanItem, CHUNK_CAP>,
         out_ring: &mut SpscRing<FindingRec, OUT_CAP>,
         stats: &mut PipelineStats,
     ) -> bool {
@@ -734,31 +848,65 @@ impl ScanStage {
         let _ = stats;
         let mut progressed = false;
 
-        if self.has_pending() {
+        if self.has_pending_emit() {
             // Backpressure: if output is full, we keep draining pending findings
             // before scanning another chunk. This prevents unbounded buffering.
             return self.flush_pending(out_ring);
         }
 
-        let chunk = match chunk_ring.pop() {
-            Some(chunk) => chunk,
+        let item = match chunk_ring.pop() {
+            Some(item) => item,
             None => return progressed,
         };
 
-        engine.scan_chunk_into(
-            chunk.data(),
-            chunk.file_id,
-            chunk.base_offset,
-            &mut self.scratch,
-        );
-        let new_bytes_start = chunk.base_offset + chunk.prefix_len as u64;
-        self.scratch.drop_prefix_findings(new_bytes_start);
-        #[cfg(feature = "b64-stats")]
-        stats.base64.add(&self.scratch.base64_stats());
-        self.scratch.drain_findings_into(&mut self.pending);
-        progressed = true;
+        match item {
+            ScanItem::Chunk(chunk) => {
+                if self.context_mode != ContextMode::Off {
+                    if let Some(active) = self.active_file {
+                        debug_assert!(
+                            active == chunk.file_id,
+                            "pipeline scan ring interleaved file ids"
+                        );
+                    } else {
+                        self.active_file = Some(chunk.file_id);
+                    }
+                }
 
-        progressed |= self.flush_pending(out_ring);
+                engine.scan_chunk_into(
+                    chunk.data(),
+                    chunk.file_id,
+                    chunk.base_offset,
+                    &mut self.scratch,
+                );
+                let new_bytes_start = chunk.base_offset + chunk.prefix_len as u64;
+                self.scratch.drop_prefix_findings(new_bytes_start);
+                #[cfg(feature = "b64-stats")]
+                stats.base64.add(&self.scratch.base64_stats());
+                self.chunk_buf.clear();
+                self.scratch.drain_findings_into(&mut self.chunk_buf);
+
+                if self.context_mode == ContextMode::Off {
+                    if !self.chunk_buf.is_empty() {
+                        self.pending_emit.append(&mut self.chunk_buf);
+                    }
+                    progressed = true;
+                    progressed |= self.flush_pending(out_ring);
+                } else if !self.chunk_buf.is_empty() {
+                    self.file_findings.append(&mut self.chunk_buf);
+                    progressed = true;
+                } else {
+                    progressed = true;
+                }
+            }
+            ScanItem::FileDone(file_id) => {
+                if self.context_mode != ContextMode::Off {
+                    progressed |= self.finalize_file(engine, files, file_id);
+                    progressed |= self.flush_pending(out_ring);
+                } else {
+                    progressed = true;
+                }
+            }
+        }
 
         progressed
     }
@@ -835,7 +983,7 @@ pub struct Pipeline<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP
     pool: BufferPool,
     files: FileTable,
     file_ring: SpscRing<FileId, FILE_CAP>,
-    chunk_ring: SpscRing<Chunk, CHUNK_CAP>,
+    chunk_ring: SpscRing<ScanItem, CHUNK_CAP>,
     out_ring: SpscRing<FindingRec, OUT_CAP>,
     walker: Walker,
     reader: ReaderStage,
@@ -870,7 +1018,7 @@ impl<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize>
         let chunk_size = config.chunk_size;
         let max_files = config.max_files;
         let path_bytes_cap = config.path_bytes_cap;
-        let scanner = ScanStage::new(&engine);
+        let scanner = ScanStage::new(&engine, config.context_mode, buf_len);
         let pool = BufferPool::new(default_pool_capacity());
         Self {
             engine,
@@ -905,6 +1053,7 @@ impl<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize>
                 .pump(&self.engine, &self.files, &mut self.out_ring, stats)?;
             progressed |= self.scanner.pump(
                 &self.engine,
+                &self.files,
                 &mut self.chunk_ring,
                 &mut self.out_ring,
                 stats,
@@ -924,7 +1073,8 @@ impl<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize>
                 && self.reader.is_idle()
                 && self.file_ring.is_empty()
                 && self.chunk_ring.is_empty()
-                && !self.scanner.has_pending()
+                && !self.scanner.has_pending_emit()
+                && !self.scanner.has_buffered_file()
                 && self.out_ring.is_empty();
 
             if done {
@@ -1092,10 +1242,16 @@ fn dev_inode(meta: &std::fs::Metadata) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::{LexicalClassSet, LexicalContextSpec, RuleSpec, ValidatorKind};
+    use crate::demo::demo_tuning;
+    use crate::scheduler::output_sink::VecSink;
+    use crate::scheduler::{scan_local, LocalConfig, LocalFile, VecFileSource};
+    use regex::bytes::Regex;
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TempDir {
@@ -1114,6 +1270,12 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pipeline_config_defaults_context_mode_off() {
+        let cfg = PipelineConfig::default();
+        assert_eq!(cfg.context_mode, ContextMode::Off);
+    }
+
     fn make_temp_dir(prefix: &str) -> io::Result<TempDir> {
         let mut path = std::env::temp_dir();
         let stamp = SystemTime::now()
@@ -1123,6 +1285,118 @@ mod tests {
         path.push(format!("{}_{}_{}", prefix, std::process::id(), stamp));
         fs::create_dir(&path)?;
         Ok(TempDir { path })
+    }
+
+    fn engine_with_lexical_rule() -> Arc<Engine> {
+        let rule = RuleSpec {
+            name: "secret",
+            anchors: &[b"SECRET"],
+            radius: 0,
+            validator: ValidatorKind::None,
+            two_phase: None,
+            must_contain: None,
+            keywords_any: None,
+            entropy: None,
+            local_context: None,
+            lexical_context: Some(LexicalContextSpec {
+                require_any: Some(LexicalClassSet::STRING),
+                prefer_any: LexicalClassSet::STRING,
+                deny_any: LexicalClassSet::COMMENT,
+            }),
+            secret_group: None,
+            re: Regex::new("SECRET").unwrap(),
+        };
+        Arc::new(Engine::new(vec![rule], Vec::new(), demo_tuning()))
+    }
+
+    fn drain_out_ring<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize>(
+        pipeline: &mut Pipeline<FILE_CAP, CHUNK_CAP, OUT_CAP>,
+        out: &mut Vec<String>,
+    ) -> bool {
+        let mut progressed = false;
+        while let Some(rec) = pipeline.out_ring.pop() {
+            let path = pipeline.files.path(rec.file_id);
+            let rule = pipeline.engine.rule_name(rec.rule_id);
+            out.push(format!(
+                "{}:{}-{} {}",
+                path.display(),
+                rec.root_hint_start,
+                rec.root_hint_end,
+                rule
+            ));
+            progressed = true;
+        }
+        progressed
+    }
+
+    fn scan_path_collect_lines(path: &Path, engine: Arc<Engine>) -> io::Result<Vec<String>> {
+        let mut pipeline: Pipeline<PIPE_FILE_RING_CAP, PIPE_CHUNK_RING_CAP, PIPE_OUT_RING_CAP> =
+            Pipeline::new(
+                Arc::clone(&engine),
+                PipelineConfig {
+                    context_mode: ContextMode::Filter,
+                    ..PipelineConfig::default()
+                },
+            );
+
+        let mut stats = PipelineStats::default();
+        pipeline.files.clear();
+        pipeline.file_ring.clear();
+        pipeline.chunk_ring.clear();
+        pipeline.out_ring.clear();
+        pipeline
+            .walker
+            .reset(path, &mut pipeline.files, &mut stats)?;
+        pipeline.reader.reset();
+        pipeline.scanner.reset();
+
+        let mut lines = Vec::new();
+
+        loop {
+            let mut progressed = false;
+
+            progressed |= drain_out_ring(&mut pipeline, &mut lines);
+            progressed |= pipeline.scanner.pump(
+                &pipeline.engine,
+                &pipeline.files,
+                &mut pipeline.chunk_ring,
+                &mut pipeline.out_ring,
+                &mut stats,
+            );
+            progressed |= pipeline.reader.pump(
+                &mut pipeline.file_ring,
+                &mut pipeline.chunk_ring,
+                &pipeline.pool,
+                &pipeline.files,
+                &mut stats,
+            )?;
+            progressed |=
+                pipeline
+                    .walker
+                    .pump(&mut pipeline.files, &mut pipeline.file_ring, &mut stats)?;
+
+            let done = pipeline.walker.is_done()
+                && pipeline.reader.is_idle()
+                && pipeline.file_ring.is_empty()
+                && pipeline.chunk_ring.is_empty()
+                && !pipeline.scanner.has_pending_emit()
+                && !pipeline.scanner.has_buffered_file()
+                && pipeline.out_ring.is_empty();
+
+            if done {
+                break;
+            }
+
+            if !progressed {
+                if pipeline.reader.is_waiting() {
+                    std::thread::yield_now();
+                    continue;
+                }
+                return Err(io::Error::other("pipeline stalled"));
+            }
+        }
+
+        Ok(lines)
     }
 
     #[cfg(unix)]
@@ -1173,6 +1447,41 @@ mod tests {
         assert!(stats.open_errors > 0);
         assert!(stats.errors >= stats.walk_errors + stats.open_errors);
 
+        Ok(())
+    }
+
+    #[test]
+    fn pipeline_matches_scheduler_local_with_lexical_filtering() -> io::Result<()> {
+        let tmp = make_temp_dir("scanner_parity")?;
+        let file_path = tmp.path().join("sample.rs");
+        let contents = b"let a = \"SECRET\"; // SECRET\n";
+        fs::write(&file_path, contents)?;
+
+        let engine = engine_with_lexical_rule();
+
+        let mut pipeline_lines = scan_path_collect_lines(&file_path, Arc::clone(&engine))?;
+        pipeline_lines.sort();
+
+        let file_size = fs::metadata(&file_path)?.len();
+        let source = VecFileSource::new(vec![LocalFile {
+            path: file_path.clone(),
+            size: file_size,
+        }]);
+        let cfg = LocalConfig {
+            context_mode: ContextMode::Filter,
+            ..LocalConfig::default()
+        };
+        let sink = Arc::new(VecSink::new());
+        scan_local(Arc::clone(&engine), source, cfg, sink.clone());
+
+        let out = sink.take();
+        let mut scheduler_lines: Vec<String> = String::from_utf8_lossy(&out)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        scheduler_lines.sort();
+
+        assert_eq!(pipeline_lines, scheduler_lines);
         Ok(())
     }
 }

@@ -105,6 +105,21 @@ flowchart TB
     style Enqueue fill:#c8e6c9
 ```
 
+## Lexical Context Interaction (Design B)
+
+Candidate-only lexical filtering evaluates findings against the **root-file
+bytes**, not decoded buffers. The second pass re-reads the root file, tokenizes
+it into lexical runs, and then applies rule-level lexical requirements.
+Transform-derived findings rely on `root_hint` spans from `StepArena` to map
+back to root offsets; if a hint is missing or coarse, lexical context is
+treated as unknown and the finding **fails open** (is not filtered).
+
+Key points:
+- The lexical pass runs only after findings are buffered per file/object.
+- Only findings with precise root-span hints are eligible for lexical filtering.
+- Transform findings with `root_hint = None` or coarse hints pass through
+  unfiltered to avoid false negatives.
+
 ## Budget Limits
 
 ```mermaid

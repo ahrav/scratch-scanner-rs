@@ -56,9 +56,12 @@
 use super::count_budget::CountBudget;
 use super::engine_trait::{EngineScratch, FindingRecord, ScanEngine};
 use super::executor::{Executor, ExecutorConfig, WorkerCtx};
+use super::lexical_pass::{apply_lexical_context, tokenize_for_lexical};
 use super::metrics::MetricsSnapshot;
 use super::ts_buffer_pool::{TsBufferPool, TsBufferPoolConfig};
 use crate::api::FileId;
+use crate::git_scan::path_policy::lexical_family_for_path;
+use crate::lexical::{LexRuns, DEFAULT_LEX_RUN_CAP};
 use crate::scheduler::engine_stub::BUFFER_LEN_MAX;
 use crate::scheduler::output_sink::OutputSink;
 
@@ -117,6 +120,9 @@ pub struct LocalConfig {
     /// duplicate findings for the same match (e.g., overlapping patterns).
     /// Cross-chunk deduplication is handled separately by `drop_prefix_findings`.
     pub dedupe_within_chunk: bool,
+
+    /// Context mode for candidate-only lexical filtering.
+    pub context_mode: crate::ContextMode,
 }
 
 impl Default for LocalConfig {
@@ -130,6 +136,7 @@ impl Default for LocalConfig {
             max_file_size: u64::MAX,
             seed: 0x853c49e6748fea9b,
             dedupe_within_chunk: true,
+            context_mode: crate::ContextMode::Off,
         }
     }
 }
@@ -273,6 +280,10 @@ struct LocalScratch<E: ScanEngine> {
     scan_scratch: E::Scratch,
     /// Per-worker findings buffer (avoids alloc per chunk).
     pending: Vec<<E::Scratch as EngineScratch>::Finding>,
+    /// Per-file findings buffer (candidate-only lexical pass).
+    file_findings: Vec<<E::Scratch as EngineScratch>::Finding>,
+    /// Per-worker lexical run buffer.
+    lex_runs: LexRuns,
     /// Per-worker output formatting buffer.
     out_buf: Vec<u8>,
 
@@ -280,6 +291,7 @@ struct LocalScratch<E: ScanEngine> {
     dedupe_within_chunk: bool,
     chunk_size: usize,
     max_file_size: u64,
+    context_mode: crate::ContextMode,
 }
 
 // ============================================================================
@@ -440,7 +452,7 @@ fn emit_findings<E: ScanEngine, F: FindingRecord>(
 ///     │  2. read(new_bytes)          │                   │
 ///     │  3. scan_chunk_into()        │                   │
 ///     │  4. drop_prefix_findings()   │                   │
-///     │  5. emit_findings()          │                   │
+///     │  5. buffer findings          │                   │
 ///     └──────────────┬───────────────┘                   │
 ///                    │                                   │
 ///                    ▼                                   │
@@ -450,6 +462,10 @@ fn emit_findings<E: ScanEngine, F: FindingRecord>(
 ///                    ▼
 ///             release_buffer()
 /// ```
+///
+/// After the chunk loop, candidate-only lexical context re-opens the file,
+/// tokenizes it by language family, and filters findings before emission when
+/// context mode is enabled.
 ///
 /// # Error Handling
 ///
@@ -500,6 +516,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
 
     // Path bytes for output
     let path_bytes = task.path.as_os_str().as_encoded_bytes();
+    scratch.file_findings.clear();
 
     // Acquire ONE buffer for the entire file (blocking, never skip)
     // This is correct because:
@@ -577,20 +594,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
             dedupe_findings(&mut scratch.pending);
         }
 
-        // Count findings before emitting (pending.len() is the count for this chunk)
-        ctx.metrics.findings_emitted = ctx
-            .metrics
-            .findings_emitted
-            .wrapping_add(scratch.pending.len() as u64);
-
-        // Emit findings
-        emit_findings(
-            engine.as_ref(),
-            &scratch.out,
-            &mut scratch.out_buf,
-            path_bytes,
-            &scratch.pending,
-        );
+        scratch.file_findings.extend_from_slice(&scratch.pending);
 
         // Update metrics with ACTUAL bytes scanned (not planned)
         let actual_payload = n; // New bytes read this iteration
@@ -610,6 +614,62 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
             break;
         }
     }
+
+    if scratch.file_findings.is_empty() {
+        return;
+    }
+
+    if scratch.context_mode != crate::ContextMode::Off {
+        let mut needs_lexical = false;
+        for rec in &scratch.file_findings {
+            if engine.rule_lexical_context(rec.rule_id()).is_some() {
+                needs_lexical = true;
+                break;
+            }
+        }
+
+        if needs_lexical {
+            if let Some(family) = lexical_family_for_path(path_bytes) {
+                if let Ok(mut lex_file) = File::open(&task.path) {
+                    if let Ok(meta) = lex_file.metadata() {
+                        // Only trust lexical offsets if the file size matches
+                        // the snapshot we scanned.
+                        if meta.len() == file_size
+                            && tokenize_for_lexical(
+                                &mut lex_file,
+                                file_size,
+                                family,
+                                buf.as_mut_slice(),
+                                &mut scratch.lex_runs,
+                            )
+                            .is_ok()
+                        {
+                            apply_lexical_context(
+                                engine.as_ref(),
+                                &mut scratch.file_findings,
+                                &scratch.lex_runs,
+                                file_size,
+                                scratch.context_mode,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    ctx.metrics.findings_emitted = ctx
+        .metrics
+        .findings_emitted
+        .wrapping_add(scratch.file_findings.len() as u64);
+
+    emit_findings(
+        engine.as_ref(),
+        &scratch.out,
+        &mut scratch.out_buf,
+        path_bytes,
+        &scratch.file_findings,
+    );
 
     // Buffer returned to pool on drop
     // Permit released when FileTask drops
@@ -751,10 +811,14 @@ where
                     out: Arc::clone(&out),
                     scan_scratch,
                     pending: Vec::with_capacity(4096), // Reasonable default
+                    file_findings: Vec::with_capacity(4096),
+                    lex_runs: LexRuns::with_capacity(DEFAULT_LEX_RUN_CAP)
+                        .expect("lexical run buffer allocation failed"),
                     out_buf: Vec::with_capacity(64 * 1024),
                     dedupe_within_chunk: dedupe,
                     chunk_size,
                     max_file_size: cfg.max_file_size,
+                    context_mode: cfg.context_mode,
                 }
             }
         },
@@ -823,6 +887,12 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    #[test]
+    fn local_config_defaults_context_mode_off() {
+        let cfg = LocalConfig::default();
+        assert_eq!(cfg.context_mode, crate::ContextMode::Off);
+    }
+
     fn test_engine() -> MockEngine {
         MockEngine::new(
             vec![
@@ -849,6 +919,7 @@ mod tests {
             max_file_size: u64::MAX,
             seed: 12345,
             dedupe_within_chunk: true,
+            context_mode: crate::ContextMode::Off,
         }
     }
 

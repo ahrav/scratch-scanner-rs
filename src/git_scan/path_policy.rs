@@ -10,6 +10,8 @@ use core::ops::{BitOr, BitOrAssign};
 
 use memchr::memrchr;
 
+use crate::lexical::LexicalFamily;
+
 /// Bitfield classification for candidate paths.
 ///
 /// This is a bitset, not a single-choice enum. The classifier will set
@@ -142,6 +144,33 @@ const SOURCE_EXTS: &[&[u8]] = &[
     b"proto", b"gradle",
 ];
 
+const C_LIKE_EXTS: &[&[u8]] = &[
+    b"rs", b"c", b"h", b"cc", b"cpp", b"cxx", b"hpp", b"hxx", b"hh", b"m", b"mm", b"go", b"java",
+    b"kt", b"kts", b"swift", b"js", b"jsx", b"ts", b"tsx", b"cs", b"fs", b"scala", b"clj",
+    b"groovy", b"dart", b"lua", b"php",
+];
+
+const PYTHON_LIKE_EXTS: &[&[u8]] = &[b"py", b"pyi", b"pyw", b"rb", b"erb"];
+
+const SHELL_LIKE_EXTS: &[&[u8]] = &[
+    b"sh", b"bash", b"zsh", b"ksh", b"csh", b"tcsh", b"fish", b"ps1", b"psm1", b"psd1",
+];
+
+const CONFIG_EXTS: &[&[u8]] = &[
+    b"toml",
+    b"yaml",
+    b"yml",
+    b"json",
+    b"hcl",
+    b"tf",
+    b"tfvars",
+    b"ini",
+    b"cfg",
+    b"conf",
+    b"env",
+    b"properties",
+];
+
 const BINARY_EXTS: &[&[u8]] = &[
     b"png", b"jpg", b"jpeg", b"gif", b"bmp", b"ico", b"tiff", b"webp", b"zip", b"gz", b"tgz",
     b"xz", b"bz2", b"7z", b"rar", b"tar", b"zst", b"pdf", b"doc", b"docx", b"ppt", b"pptx", b"xls",
@@ -149,6 +178,34 @@ const BINARY_EXTS: &[&[u8]] = &[
     b"ttf", b"otf", b"exe", b"dll", b"so", b"dylib", b"bin", b"dat", b"db", b"sqlite", b"class",
     b"jar", b"war", b"wasm",
 ];
+
+/// Map a path to a lexical tokenizer family using extension/name heuristics.
+///
+/// Returns `None` when the extension is unknown, which signals a fail-open
+/// lexical context decision.
+#[must_use]
+pub fn lexical_family_for_path(path: &[u8]) -> Option<LexicalFamily> {
+    let name = file_name(path);
+    if is_dotenv_name(name) {
+        return Some(LexicalFamily::Config);
+    }
+
+    let ext = file_extension(path)?;
+    if ext_matches(ext, C_LIKE_EXTS) {
+        return Some(LexicalFamily::CLike);
+    }
+    if ext_matches(ext, PYTHON_LIKE_EXTS) {
+        return Some(LexicalFamily::PythonLike);
+    }
+    if ext_matches(ext, SHELL_LIKE_EXTS) {
+        return Some(LexicalFamily::ShellLike);
+    }
+    if ext_matches(ext, CONFIG_EXTS) {
+        return Some(LexicalFamily::Config);
+    }
+
+    None
+}
 
 fn contains_segment(path: &[u8], table: &[&[u8]]) -> bool {
     let mut start = 0usize;
@@ -201,6 +258,30 @@ fn file_extension(path: &[u8]) -> Option<&[u8]> {
     }
 }
 
+fn file_name(path: &[u8]) -> &[u8] {
+    let name_start = memrchr(b'/', path).map(|idx| idx + 1).unwrap_or(0);
+    &path[name_start..]
+}
+
+fn is_dotenv_name(name: &[u8]) -> bool {
+    if name == b".envrc" {
+        return true;
+    }
+    if !name.starts_with(b".env") {
+        return false;
+    }
+    name.len() == 4 || name.get(4) == Some(&b'.')
+}
+
+fn ext_matches(ext: &[u8], table: &[&[u8]]) -> bool {
+    for &candidate in table {
+        if eq_ignore_ascii_case(ext, candidate) {
+            return true;
+        }
+    }
+    false
+}
+
 fn eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -244,5 +325,46 @@ mod tests {
     fn classifies_unknown() {
         let class = classify_path(b"data/blob.xyz");
         assert!(class.contains(PathClass::UNKNOWN));
+    }
+
+    #[test]
+    fn lexical_family_maps_common_extensions() {
+        assert_eq!(
+            lexical_family_for_path(b"src/app.ts"),
+            Some(LexicalFamily::CLike)
+        );
+        assert_eq!(
+            lexical_family_for_path(b"src/app.py"),
+            Some(LexicalFamily::PythonLike)
+        );
+        assert_eq!(
+            lexical_family_for_path(b"scripts/deploy.sh"),
+            Some(LexicalFamily::ShellLike)
+        );
+        assert_eq!(
+            lexical_family_for_path(b"config/app.toml"),
+            Some(LexicalFamily::Config)
+        );
+    }
+
+    #[test]
+    fn lexical_family_handles_dotenv() {
+        assert_eq!(
+            lexical_family_for_path(b".env"),
+            Some(LexicalFamily::Config)
+        );
+        assert_eq!(
+            lexical_family_for_path(b"env/.env.local"),
+            Some(LexicalFamily::Config)
+        );
+        assert_eq!(
+            lexical_family_for_path(b"env/.envrc"),
+            Some(LexicalFamily::Config)
+        );
+    }
+
+    #[test]
+    fn lexical_family_unknown_returns_none() {
+        assert_eq!(lexical_family_for_path(b"data/blob.xyz"), None);
     }
 }

@@ -11,7 +11,10 @@
 //! - Any change to rule literals, regex, or config should be treated as a
 //!   policy change and reflected in downstream benchmarking.
 
-use crate::api::{EntropySpec, LocalContextSpec, RuleSpec, TwoPhaseSpec, ValidatorKind};
+use crate::api::{
+    EntropySpec, LexicalClassSet, LexicalContextSpec, LocalContextSpec, RuleSpec, TwoPhaseSpec,
+    ValidatorKind,
+};
 use regex::bytes::Regex;
 
 /// Progressive regex size limits (bytes) to tolerate large DFAs on complex rules.
@@ -47,6 +50,11 @@ fn build_regex(pattern: &str) -> Regex {
 /// gating; regexes are validated at startup and will panic if compilation fails.
 pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
     const PRIVATE_KEY_CONFIRM: &[&[u8]] = &[b"PRIVATE KEY"];
+    const LEXICAL_TOKEN_CTX: LexicalContextSpec = LexicalContextSpec {
+        require_any: None,
+        prefer_any: LexicalClassSet::STRING.union(LexicalClassSet::CONFIG),
+        deny_any: LexicalClassSet::COMMENT,
+    };
 
     vec![
         RuleSpec {
@@ -63,6 +71,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r"\bA3-[A-Z0-9]{6}-(?:(?:[A-Z0-9]{11})|(?:[A-Z0-9]{6}-[A-Z0-9]{5}))-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}\b",
@@ -83,6 +92,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             }),
             // Upper bound added to enable accurate max_width calculation
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"ops_eyJ[a-zA-Z0-9+/]{250,2048}={0,3}"),
         },
@@ -96,6 +106,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"adafruit", b"ADAFRUIT"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:adafruit)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9_-]{32})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -115,6 +126,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:adobe)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-f0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -134,6 +146,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(p8e-(?i)[a-z0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -147,6 +160,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"age-secret-key-1", b"AGE-SECRET-KEY-1"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"AGE-SECRET-KEY-1[QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L]{58}"),
         },
@@ -160,6 +174,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"airtable", b"AIRTABLE"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:airtable)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{17})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -176,6 +191,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"airtable"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"\b(pat[[:alnum:]]{14}\.[a-f0-9]{64})\b"),
         },
@@ -189,6 +205,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"algolia", b"ALGOLIA"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:algolia)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -208,6 +225,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(LTAI(?i)[a-z0-9]{20})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -225,6 +243,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:alibaba)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{30})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -240,6 +259,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"sk-ant-admin01"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(sk-ant-admin01-[a-zA-Z0-9_\-]{93}AA)(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -253,6 +273,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"sk-ant-api03"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(sk-ant-api03-[a-zA-Z0-9_\-]{93}AA)(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -270,6 +291,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"\bAKCp[A-Za-z0-9]{69}\b"),
         },
@@ -287,6 +309,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"\bcmVmd[A-Za-z0-9]{59}\b"),
         },
@@ -300,6 +323,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"asana", b"ASANA"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:asana)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([0-9]{16})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -315,6 +339,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"asana", b"ASANA"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:asana)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -352,6 +377,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:(?-i:ATLASSIAN|[Aa]tlassian)|(?-i:CONFLUENCE|[Cc]onfluence)|(?-i:JIRA|[Jj]ira))(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{20}[a-f0-9]{4})(?:[\x60'"\s;]|\\[nr]|$)|\b(ATATT3[A-Za-z0-9_\-=]{186})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -389,6 +415,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"\b((?:sc|ext|scauth|authress)_(?i)[a-z0-9]{5,30}\.[a-z0-9]{4,6}\.(?-i:acc)[_-][a-z0-9-]{10,32}\.[a-z0-9+/_=-]{30,120})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -409,6 +436,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"\b((?:A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z2-7]{16})\b"),
         },
@@ -426,6 +454,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 269,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(ABSK[A-Za-z0-9+/]{109,269}={0,2})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -443,6 +472,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"bedrock-api-key-YmVkcm9jay5hbWF6b25hd3MuY29t"),
         },
@@ -466,6 +496,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?:^|[\\'"\x60\s>=:(,)])([a-zA-Z0-9_~.]{3}\dQ~[a-zA-Z0-9_~.-]{31,34})(?:$|[\\'"\x60\s<),])"#,
@@ -481,6 +512,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"beamer", b"BEAMER"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:beamer)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(b_[a-z0-9=_\-]{44})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -496,6 +528,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"bitbucket", b"BITBUCKET"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:bitbucket)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -511,6 +544,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"bitbucket", b"BITBUCKET"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:bitbucket)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9=_\-]{64})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -526,6 +560,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"bittrex", b"BITTREX"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:bittrex)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -541,6 +576,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"bittrex", b"BITTREX"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:bittrex)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -560,6 +596,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"[\w.-]{0,50}?(?i:[\w.-]{0,50}?(?:(?-i:[Mm]eraki|MERAKI))(?:[ \t\w.-]{0,20})[\s'"]{0,3})(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([0-9a-f]{40})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -579,6 +616,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"\b(4b1d[A-Za-z0-9]{38})\b"),
         },
@@ -596,6 +634,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"(?i)CLOJARS_[a-z0-9]{60}"),
         },
@@ -613,6 +652,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:cloudflare)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9_-]{40})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -632,6 +672,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:cloudflare)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-f0-9]{37})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -651,6 +692,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(v1\.0-[a-f0-9]{24}-[a-f0-9]{146})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -664,6 +706,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"codecov", b"CODECOV"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:codecov)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -683,6 +726,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"[\w.-]{0,50}?(?i:[\w.-]{0,50}?(?:cohere|CO_API_KEY)(?:[ \t\w.-]{0,20})[\s'"]{0,3})(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-zA-Z0-9]{40})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -698,6 +742,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"coinbase", b"COINBASE"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:coinbase)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9_-]{64})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -713,6 +758,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"confluent", b"CONFLUENT"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:confluent)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{16})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -728,6 +774,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"confluent", b"CONFLUENT"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:confluent)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{64})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -743,6 +790,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"contentful", b"CONTENTFUL"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:contentful)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9=_\-]{43})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -763,6 +811,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             }),
             // Bounded .{0,2048}? to enable accurate max_width calculation
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"\bcurl\b(?:.{0,2048}?|.{0,2048}?(?:[\r\n]{1,2}.{0,2048}?){1,5})[ \t\n\r](?:-H|--header)(?:=|[ \t]{0,5})(?:"(?i)(?:Authorization:[ \t]{0,5}(?:Basic[ \t]([a-z0-9+/]{8,}={0,3})|(?:Bearer|(?:Api-)?Token)[ \t]([\w=~@.+/-]{8,})|([\w=~@.+/-]{8,}))|(?:(?:X-(?:[a-z]+-)?)?(?:Api-?)?(?:Key|Token)):[ \t]{0,5}([\w=~@.+/-]{8,}))"|'(?i)(?:Authorization:[ \t]{0,5}(?:Basic[ \t]([a-z0-9+/]{8,}={0,3})|(?:Bearer|(?:Api-)?Token)[ \t]([\w=~@.+/-]{8,})|([\w=~@.+/-]{8,}))|(?:(?:X-(?:[a-z]+-)?)?(?:Api-?)?(?:Key|Token)):[ \t]{0,5}([\w=~@.+/-]{8,}))')(?:\B|\s|\z)"#,
@@ -783,6 +832,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             }),
             // Bounded .{0,2048} to enable accurate max_width calculation
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"\bcurl\b(?:.{0,2048}|.{0,2048}(?:[\r\n]{1,2}.{0,2048}){1,5})[ \t\n\r](?:-u|--user)(?:=|[ \t]{0,5})("(:[^"]{3,}|[^:"]{3,}:|[^:"]{3,}:[^"]{3,})"|'([^:']{3,}:[^']{3,})'|((?:"[^"]{3,}"|'[^']{3,}'|[\w$@.-]+):(?:"[^"]{3,}"|'[^']{3,}'|[\w${}@.-]+)))(?:\s|\z)"#,
@@ -802,6 +852,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(dapi[a-f0-9]{32}(?:-\d)?)(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -815,6 +866,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"datadog", b"DATADOG"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:datadog)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{40})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -830,6 +882,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"dnkey", b"DNKEY"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:dnkey)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(dnkey-[a-z0-9=_\-]{26}-[a-z0-9=_\-]{52})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -849,6 +902,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(doo_v1_[a-f0-9]{64})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -866,6 +920,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(dop_v1_[a-f0-9]{64})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -879,6 +934,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"dor_v1_", b"DOR_V1_"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"(?i)\b(dor_v1_[a-f0-9]{64})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -892,6 +948,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"discord", b"DISCORD"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:discord)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-f0-9]{64})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -911,6 +968,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:discord)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([0-9]{18})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -930,6 +988,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:discord)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9=_\-]{32})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -949,6 +1008,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"dp\.pt\.(?i)[a-z0-9]{43}"),
         },
@@ -962,6 +1022,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"droneci", b"DRONECI"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:droneci)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -977,6 +1038,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"dropbox", b"DROPBOX"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:dropbox)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{15})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -992,6 +1054,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"dropbox", b"DROPBOX"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:dropbox)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{11}(AAAAAAAAAA)[a-z0-9\-_=]{43})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -1007,6 +1070,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"dropbox", b"DROPBOX"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:dropbox)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(sl\.[a-z0-9\-=_]{135})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -1026,6 +1090,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"duffel_(?:test|live)_(?i)[a-z0-9_\-=]{43}"),
         },
@@ -1043,6 +1108,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"dt0c01\.(?i)[a-z0-9]{24}\.[a-z0-9]{64}"),
         },
@@ -1060,6 +1126,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"\bEZAK(?i)[a-z0-9]{54}\b"),
         },
@@ -1077,6 +1144,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"\bEZTK(?i)[a-z0-9]{54}\b"),
         },
@@ -1094,6 +1162,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:(?-i:ETSY|[Ee]tsy))(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{24})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -1113,6 +1182,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"(?i)\b(\d{15,16}(\||%)[0-9a-z\-_]{27,40})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -1131,6 +1201,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(EAA[MC](?i)[a-z0-9]{100,})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -1148,6 +1219,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:facebook)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-f0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -1163,6 +1235,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"fastly", b"FASTLY"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:fastly)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9=_\-]{32})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -1178,6 +1251,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"finicity", b"FINICITY"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:finicity)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-f0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -1193,6 +1267,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"finicity", b"FINICITY"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:finicity)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{20})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -1208,6 +1283,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"finnhub", b"FINNHUB"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:finnhub)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{20})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -1223,6 +1299,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"flickr", b"FLICKR"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:flickr)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -1242,6 +1319,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"FLWSECK_TEST-(?i)[a-h0-9]{12}"),
         },
@@ -1259,6 +1337,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"FLWPUBK_TEST-(?i)[a-h0-9]{32}-X"),
         },
@@ -1276,6 +1355,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"FLWSECK_TEST-(?i)[a-h0-9]{32}-X"),
         },
@@ -1294,6 +1374,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             }),
             // Upper bounds added to enable accurate max_width calculation
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"\b((?:fo1_[\w-]{43}|fm1[ar]_[a-zA-Z0-9+\/]{100,1024}={0,3}|fm2_[a-zA-Z0-9+\/]{100,1024}={0,3}))(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -1309,6 +1390,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"fio-u-", b"FIO-U-"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"fio-u-(?i)[a-z0-9\-_=]{64}"),
         },
@@ -1322,6 +1404,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"secret_key", b"SECRET_KEY"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"(?i)["']secret_key["']\s*=>\s*["'](sk_[\S]{29})["']"#),
         },
@@ -1335,6 +1418,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"freshbooks", b"FRESHBOOKS"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:freshbooks)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{64})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -1354,6 +1438,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(AIza[\w-]{35})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -1442,6 +1527,8 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                     b"TOKEN",
                 ]),
             }),
+            // Lexical context gate: drop matches in comments and prefer string/config values.
+            lexical_context: Some(LEXICAL_TOKEN_CTX),
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:access|auth|(?-i:[Aa]pi|API)|credential|creds|key|passw(?:or)?d|secret|token)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([\w.=-]{10,150}|[a-z0-9][a-z0-9+/]{11,}={0,3})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -1461,6 +1548,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: Some(LEXICAL_TOKEN_CTX),
             secret_group: None,
             re: build_regex(r"(?:ghu|ghs)_[0-9a-zA-Z]{36}"),
         },
@@ -1478,6 +1566,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: Some(LEXICAL_TOKEN_CTX),
             secret_group: None,
             re: build_regex(r"github_pat_\w{82}"),
         },
@@ -1495,6 +1584,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: Some(LEXICAL_TOKEN_CTX),
             secret_group: None,
             re: build_regex(r"gho_[0-9a-zA-Z]{36}"),
         },
@@ -1512,6 +1602,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: Some(LEXICAL_TOKEN_CTX),
             secret_group: None,
             re: build_regex(r"ghp_[0-9a-zA-Z]{36}"),
         },
@@ -1529,6 +1620,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: Some(LEXICAL_TOKEN_CTX),
             secret_group: None,
             re: build_regex(r"ghr_[0-9a-zA-Z]{36}"),
         },
@@ -1546,6 +1638,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"glcbt-[0-9a-zA-Z]{1,5}_[0-9a-zA-Z_-]{20}"),
         },
@@ -1563,6 +1656,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"gldt-[0-9a-zA-Z_\-]{20}"),
         },
@@ -1580,6 +1674,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"glffct-[0-9a-zA-Z_\-]{20}"),
         },
@@ -1597,6 +1692,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"glft-[0-9a-zA-Z_\-]{20}"),
         },
@@ -1614,6 +1710,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"glimt-[0-9a-zA-Z_\-]{25}"),
         },
@@ -1631,6 +1728,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"glagent-[0-9a-zA-Z_\-]{50}"),
         },
@@ -1648,6 +1746,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"gloas-[0-9a-zA-Z_\-]{64}"),
         },
@@ -1665,6 +1764,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"glpat-[\w-]{20}"),
         },
@@ -1682,6 +1782,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 300,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"\bglpat-[0-9a-zA-Z_-]{27,300}\.[0-9a-z]{2}[0-9a-z]{7}\b"),
         },
@@ -1699,6 +1800,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"glptt-[0-9a-f]{40}"),
         },
@@ -1716,6 +1818,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"GR1348941[\w-]{20}"),
         },
@@ -1733,6 +1836,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"glrt-[0-9a-zA-Z_\-]{20}"),
         },
@@ -1750,6 +1854,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 300,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"\bglrt-t\d_[0-9a-zA-Z_\-]{27,300}\.[0-9a-z]{2}[0-9a-z]{7}\b"),
         },
@@ -1767,6 +1872,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"glsoat-[0-9a-zA-Z_\-]{20}"),
         },
@@ -1784,6 +1890,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"_gitlab_session=[0-9a-z]{32}"),
         },
@@ -1797,6 +1904,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"gitter", b"GITTER"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:gitter)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9_-]{40})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -1812,6 +1920,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"live_", b"LIVE_", b"gocardless", b"GOCARDLESS"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:gocardless)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(live_(?i)[a-z0-9\-_=]{40})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -1831,6 +1940,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 400,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"(?i)\b(eyJrIjoi[A-Za-z0-9]{70,400}={0,3})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -1848,6 +1958,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 400,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"(?i)\b(glc_[A-Za-z0-9+/]{32,400}={0,3})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -1865,6 +1976,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)\b(glsa_[A-Za-z0-9]{32}_[A-Fa-f0-9]{8})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -1880,6 +1992,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"pat.", b"sat."]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"(?:pat|sat)\.[a-zA-Z0-9_-]{22}\.[a-zA-Z0-9]{24}\.[a-zA-Z0-9]{20}"),
         },
@@ -1897,6 +2010,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"(?i)[a-z0-9]{14}\.(?-i:atlasv1)\.[a-z0-9\-_=]{60,70}"),
         },
@@ -1924,6 +2038,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:administrator_login_password|password)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}("[a-z0-9=_\-]{8,20}")(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -1939,6 +2054,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"heroku", b"HEROKU"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:heroku)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -1958,6 +2074,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b((HRKU-AA[0-9a-zA-Z_-]{58}))(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -1971,6 +2088,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"hubspot", b"HUBSPOT"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:hubspot)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -1990,6 +2108,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(hf_(?i:[a-z]{34}))(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -2007,6 +2126,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(api_org_(?i:[a-z]{34}))(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -2024,6 +2144,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(ico-[a-zA-Z0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -2037,6 +2158,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"intercom", b"INTERCOM"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:intercom)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9=_\-]{60})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2070,6 +2192,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"\b(s-s4t2(?:ud|af)-(?i)[abcdef0123456789]{64})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2103,6 +2226,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             ]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:jfrog|artifactory|bintray|xray)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{73})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2136,6 +2260,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             ]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:jfrog|artifactory|bintray|xray)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{64})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2162,6 +2287,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 // Changed: ey → eyJ, adjusted length requirement from 17 to 16 to maintain same total
@@ -2182,6 +2308,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r"\bZXlK(?:(?P<alg>aGJHY2lPaU)|(?P<apu>aGNIVWlPaU)|(?P<apv>aGNIWWlPaU)|(?P<aud>aGRXUWlPaU)|(?P<b64>aU5qUWlP)|(?P<crit>amNtbDBJanBi)|(?P<cty>amRIa2lPaU)|(?P<epk>bGNHc2lPbn)|(?P<enc>bGJtTWlPaU)|(?P<jku>cWEzVWlPaU)|(?P<jwk>cWQyc2lPb)|(?P<iss>cGMzTWlPaU)|(?P<iv>cGRpSTZJ)|(?P<kid>cmFXUWlP)|(?P<key_ops>clpYbGZiM0J6SWpwY)|(?P<kty>cmRIa2lPaUp)|(?P<nonce>dWIyNWpaU0k2)|(?P<p2c>d01tTWlP)|(?P<p2s>d01uTWlPaU)|(?P<ppt>d2NIUWlPaU)|(?P<sub>emRXSWlPaU)|(?P<svt>emRuUWlP)|(?P<tag>MFlXY2lPaU)|(?P<typ>MGVYQWlPaUp)|(?P<url>MWNtd2l)|(?P<use>MWMyVWlPaUp)|(?P<ver>MlpYSWlPaU)|(?P<version>MlpYSnphVzl1SWpv)|(?P<x>NElqb2)|(?P<x5c>NE5XTWlP)|(?P<x5t>NE5YUWlPaU)|(?P<x5ts256>NE5YUWpVekkxTmlJNkl)|(?P<x5u>NE5YVWlPaU)|(?P<zip>NmFYQWlPaU))[a-zA-Z0-9\/\\_+\-\r\n]{40,}={0,2}",
@@ -2197,6 +2324,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"kraken", b"KRAKEN"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:kraken)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9\/=_\+\-]{80,90})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2212,6 +2340,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"secret", b"SECRET"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)(?:\bkind:[ \t]*["']?\bsecret\b["']?(?s:.){0,200}?\bdata:(?s:.){0,100}?\s+([\w.-]+:(?:[ \t]*(?:\||>[-+]?)\s+)?[ \t]*(?:["']?[a-z0-9+/]{10,}={0,3}["']?|\{\{[ \t\w"|$:=,.-]+}}|""|''))|\bdata:(?s:.){0,100}?\s+([\w.-]+:(?:[ \t]*(?:\||>[-+]?)\s+)?[ \t]*(?:["']?[a-z0-9+/]{10,}={0,3}["']?|\{\{[ \t\w"|$:=,.-]+}}|""|''))(?s:.){0,200}?\bkind:[ \t]*["']?\bsecret\b["']?)"#,
@@ -2227,6 +2356,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"kucoin", b"KUCOIN"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:kucoin)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-f0-9]{24})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2242,6 +2372,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"kucoin", b"KUCOIN"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:kucoin)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2257,6 +2388,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"launchdarkly", b"LAUNCHDARKLY"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:launchdarkly)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9=_\-]{40})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2276,6 +2408,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"lin_api_(?i)[a-z0-9]{40}"),
         },
@@ -2293,6 +2426,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:linear)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-f0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2326,6 +2460,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:linked[_-]?in)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{14})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2359,6 +2494,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:linked[_-]?in)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{16})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2374,6 +2510,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"test_", b"TEST_", b"live_", b"LIVE_"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:lob)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}((live|test)_[a-f0-9]{35})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2403,6 +2540,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             ]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:lob)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}((test|live)_pub_[a-f0-9]{31})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2418,6 +2556,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"looker", b"LOOKER"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:looker)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{20})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2433,6 +2572,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"looker", b"LOOKER"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:looker)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{24})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2448,6 +2588,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"mailchimp", b"MAILCHIMP"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:MailchimpSDK.initialize|mailchimp)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-f0-9]{32}-us\d\d)(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2463,6 +2604,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"mailgun", b"MAILGUN"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:mailgun)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(key-[a-f0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2478,6 +2620,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"mailgun", b"MAILGUN"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:mailgun)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(pubkey-[a-f0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2493,6 +2636,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"mailgun", b"MAILGUN"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:mailgun)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-h0-9]{32}-[a-h0-9]{8}-[a-h0-9]{8})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2508,6 +2652,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"mapbox", b"MAPBOX"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:mapbox)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(pk\.[a-z0-9]{60}\.[a-z0-9]{22})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2523,6 +2668,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"mattermost", b"MATTERMOST"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:mattermost)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{26})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2542,6 +2688,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b([A-Za-z0-9]{6}_[A-Za-z0-9]{29}_mmk)(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -2569,6 +2716,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             ]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:message[_-]?bird)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{25})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2598,6 +2746,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             ]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:message[_-]?bird)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2616,6 +2765,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             // secret, so we explicitly set secret_group to 0 to override the default
             // group-1 preference.
             local_context: None,
+            lexical_context: None,
             secret_group: Some(0),
             re: build_regex(
                 r"https://[a-z0-9]+\.webhook\.office\.com/webhookb2/[a-z0-9]{8}-([a-z0-9]{4}-){3}[a-z0-9]{12}@[a-z0-9]{8}-([a-z0-9]{4}-){3}[a-z0-9]{12}/IncomingWebhook/[a-z0-9]{32}/[a-z0-9]{8}-([a-z0-9]{4}-){3}[a-z0-9]{12}",
@@ -2631,6 +2781,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"netlify", b"NETLIFY"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:netlify)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9=_\-]{40,46})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2646,6 +2797,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"nrjs-", b"NRJS-"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:new-relic|newrelic|new_relic)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(NRJS-[a-f0-9]{19})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2661,6 +2813,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"nrii-", b"NRII-"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:new-relic|newrelic|new_relic)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(NRII-[a-z0-9-]{32})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2690,6 +2843,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             ]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:new-relic|newrelic|new_relic)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{64})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2705,6 +2859,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"nrak", b"NRAK"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:new-relic|newrelic|new_relic)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(NRAK-[a-z0-9]{27})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2724,6 +2879,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"\b(ntn_[0-9]{11}[A-Za-z0-9]{32}[A-Za-z0-9]{3})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2743,6 +2899,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: Some(LEXICAL_TOKEN_CTX),
             secret_group: None,
             re: build_regex(r#"(?i)\b(npm_[a-z0-9]{36})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -2760,6 +2917,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 512,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)<add key=\"(?:(?:ClearText)?Password)\"\s*value=\"(.{8,})\"\s*/>"#,
@@ -2789,6 +2947,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             ]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:nytimes|new-york-times,|newyorktimes)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9=_\-]{32})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2808,6 +2967,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(API-[A-Z0-9]{26})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -2825,6 +2985,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"[\w.-]{0,50}?(?i:[\w.-]{0,50}?(?:(?-i:[Oo]kta|OKTA))(?:[ \t\w.-]{0,20})[\s'"]{0,3})(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(00[\w=\-]{40})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2844,6 +3005,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"\b(sk-(?:proj|svcacct|admin)-(?:[A-Za-z0-9_-]{74}|[A-Za-z0-9_-]{58})T3BlbkFJ(?:[A-Za-z0-9_-]{74}|[A-Za-z0-9_-]{58})\b|sk-[a-zA-Z0-9]{20}T3BlbkFJ[a-zA-Z0-9]{20})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2863,6 +3025,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"\b(sha256~[\w-]{43})(?:[^\w-]|\z)"),
         },
@@ -2880,6 +3043,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(pplx-[a-zA-Z0-9]{48})(?:[\x60'"\s;]|\\[nr]|$|\b)"#),
         },
@@ -2894,6 +3058,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b".p12", b".P12", b".pfx", b".PFX"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"(?i)(?:^|\/)[^\/]+\.p(?:12|fx)$"),
         },
@@ -2907,6 +3072,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"plaid", b"PLAID"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:plaid)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(access-(?:sandbox|development|production)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2926,6 +3092,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:plaid)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{24})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2945,6 +3112,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:plaid)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{30})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -2964,6 +3132,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(pscale_tkn_(?i)[\w=\.-]{32,64})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -2981,6 +3150,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(pscale_oauth_[\w=\.-]{32,64})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -2998,6 +3168,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"(?i)\b(pscale_pw_(?i)[\w=\.-]{32,64})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -3015,6 +3186,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(PMAK-(?i)[a-f0-9]{24}\-[a-f0-9]{34})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -3032,6 +3204,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(pnu_[a-zA-Z0-9]{36})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -3049,6 +3222,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"-----begin", b"-----BEGIN"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r"(?i)-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----[\s\S-]{64,}?KEY(?: BLOCK)?-----",
@@ -3068,6 +3242,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"[\w.-]{0,50}?(?i:[\w.-]{0,50}?(?:private[_-]?ai)(?:[ \t\w.-]{0,20})[\s'"]{0,3})(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -3087,6 +3262,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(pul-[a-f0-9]{40})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -3104,6 +3280,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 1000,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"pypi-AgEIcHlwaS5vcmc[\w-]{50,1000}"),
         },
@@ -3117,6 +3294,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"rapidapi", b"RAPIDAPI"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:rapidapi)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9_-]{50})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -3136,6 +3314,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(rdme_[a-z0-9]{70})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -3153,6 +3332,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(rubygems_[a-f0-9]{48})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -3170,6 +3350,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(tk-us-[\w-]{48})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -3183,6 +3364,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"sendbird", b"SENDBIRD"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:sendbird)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -3198,6 +3380,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"sendbird", b"SENDBIRD"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:sendbird)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-f0-9]{40})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -3218,6 +3401,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(SG\.(?i)[a-z0-9=_\-\.]{66})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -3235,6 +3419,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"\b(xkeysib-[a-f0-9]{64}\-(?i)[a-z0-9]{16})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -3254,6 +3439,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:sentry)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-f0-9]{64})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -3273,6 +3459,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r"\bsntrys_eyJpYXQiO[a-zA-Z0-9+/]{10,200}(?:LCJyZWdpb25fdXJs|InJlZ2lvbl91cmwi|cmVnaW9uX3VybCI6)[a-zA-Z0-9+/]{10,200}={0,2}_[a-zA-Z0-9+/]{43}(?:[^a-zA-Z0-9+/]|\z)",
@@ -3292,6 +3479,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(sntryu_[a-f0-9]{64})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -3309,6 +3497,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(sm_aat_[a-zA-Z0-9]{16})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -3326,6 +3515,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(sm_pat_[a-zA-Z0-9]{16})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -3343,6 +3533,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(sm_sat_[a-zA-Z0-9]{16})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -3360,6 +3551,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(shippo_(?:live|test)_[a-fA-F0-9]{40})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -3377,6 +3569,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"shpat_[a-fA-F0-9]{32}"),
         },
@@ -3394,6 +3587,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"shpca_[a-fA-F0-9]{32}"),
         },
@@ -3411,6 +3605,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"shppa_[a-fA-F0-9]{32}"),
         },
@@ -3428,6 +3623,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"shpss_[a-fA-F0-9]{32}"),
         },
@@ -3451,6 +3647,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             ]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:BUNDLE_ENTERPRISE__CONTRIBSYS__COM|BUNDLE_GEMS__CONTRIBSYS__COM)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-f0-9]{8}:[a-f0-9]{8})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -3476,6 +3673,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             ]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r"(?i)\bhttps?://([a-f0-9]{8}:[a-f0-9]{8})@(?:gems.contribsys.com|enterprise.contribsys.com)(?:[\/|\#|\?|:]|$)",
@@ -3495,6 +3693,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 512,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"(?i)xapp-\d-[A-Z0-9]+-\d+-[a-z0-9]+"),
         },
@@ -3512,6 +3711,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"xoxb-[0-9]{10,13}-[0-9]{10,13}[a-zA-Z0-9-]*"),
         },
@@ -3529,6 +3729,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"(?i)xoxe.xox[bp]-\d-[A-Z0-9]{163,166}"),
         },
@@ -3546,6 +3747,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"(?i)xoxe-\d-[A-Z0-9]{146}"),
         },
@@ -3563,6 +3765,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"xoxb-[0-9]{8,14}-[a-zA-Z0-9]{18,26}"),
         },
@@ -3580,6 +3783,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 512,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"xox[os]-\d+-\d+-\d+-[a-fA-F\d]+"),
         },
@@ -3597,6 +3801,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: Some(LEXICAL_TOKEN_CTX),
             secret_group: None,
             re: build_regex(r"xox[ar]-(?:\d-)?[0-9a-zA-Z]{8,48}"),
         },
@@ -3614,6 +3819,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"xox[pe](?:-[0-9]{10,13}){3}-[a-zA-Z0-9-]{28,34}"),
         },
@@ -3627,6 +3833,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"hooks.slack.com"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r"(?:https?://)?hooks.slack.com/(?:services|workflows|triggers)/[A-Za-z0-9+/]{43,56}",
@@ -3642,6 +3849,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"snyk", b"SNYK"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:snyk[_.-]?(?:(?:api|oauth)[_.-]?)?(?:key|token))(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -3658,6 +3866,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             entropy: None,
             // Group 1 captures "login"|"token" keyword; group 2 captures the actual secret.
             local_context: None,
+            lexical_context: None,
             secret_group: Some(2),
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:sonar[_.-]?(login|token))(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}((?:squ_|sqp_|sqa_)?[a-z0-9=_\-]{40})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -3681,6 +3890,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)\b(sgp_(?:[a-fA-F0-9]{16}|local)_[a-fA-F0-9]{40}|sgp_[a-fA-F0-9]{40})\b(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -3700,6 +3910,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b((?:EAAA|sq0atp-)[\w-]{22,60})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -3713,6 +3924,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"squarespace", b"SQUARESPACE"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:squarespace)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -3736,6 +3948,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"\b((?:sk|rk)_(?:test|live|prod)_[a-zA-Z0-9]{10,99})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -3755,6 +3968,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"[\w.-]{0,50}?(?i:[\w.-]{0,50}?(?:(?-i:[Ss]umo|SUMO))(?:[ \t\w.-]{0,20})[\s'"]{0,3})(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(su[a-zA-Z0-9]{12})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -3774,6 +3988,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:(?-i:[Ss]umo|SUMO))(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{64})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -3789,6 +4004,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"telegr", b"TELEGR"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:telegr)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([0-9]{5,16}:(?-i:A)[a-z0-9_\-]{34})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -3804,6 +4020,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"travis", b"TRAVIS"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:travis)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{22})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -3831,6 +4048,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r"SK[0-9a-fA-F]{32}"),
         },
@@ -3844,6 +4062,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"twitch", b"TWITCH"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:twitch)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{30})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -3859,6 +4078,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"twitter", b"TWITTER"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:twitter)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{45})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -3874,6 +4094,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"twitter", b"TWITTER"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:twitter)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([0-9]{15,25}-[a-zA-Z0-9]{20,40})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -3889,6 +4110,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"twitter", b"TWITTER"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:twitter)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{25})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -3904,6 +4126,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"twitter", b"TWITTER"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:twitter)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{50})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -3919,6 +4142,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"twitter", b"TWITTER"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:twitter)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(A{22}[a-zA-Z0-9%]{80,100})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -3934,6 +4158,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"tfp_", b"TFP_"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:typeform)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(tfp_[a-z0-9\-_\.=]{59})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -3953,6 +4178,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 300,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(hvb\.[\w-]{138,300})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -3976,6 +4202,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(hvs\.[\w-]{90,120})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -4000,6 +4227,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
                 max_len: 256,
             }),
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(r#"\b(s\.[a-zA-Z0-9]{24})(?:[\x60'"\s;]|\\[nr]|$)"#),
         },
@@ -4013,6 +4241,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"yandex", b"YANDEX"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:yandex)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(t1\.[A-Z0-9a-z_-]+[=]{0,2}\.[A-Z0-9a-z_-]{86}[=]{0,2})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -4028,6 +4257,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"yandex", b"YANDEX"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:yandex)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(AQVN[A-Za-z0-9_\-]{35,38})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -4043,6 +4273,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"yandex", b"YANDEX"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:yandex)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(YC[a-zA-Z0-9_\-]{38})(?:[\x60'"\s;]|\\[nr]|$)"#,
@@ -4058,6 +4289,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
             keywords_any: Some(&[b"zendesk", b"ZENDESK"]),
             entropy: None,
             local_context: None,
+            lexical_context: None,
             secret_group: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:zendesk)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{40})(?:[\x60'"\s;]|\\[nr]|$)"#,

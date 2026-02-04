@@ -129,6 +129,25 @@ flowchart TB
     style Output fill:#ffccbc
 ```
 
+## Candidate-Only Lexical Pass
+
+When `context_mode` is not `Off`, the io_uring backend buffers findings per
+file and performs a second, lexical-aware pass before emitting output.
+The per-chunk pipeline in the diagram above still runs, but emission moves to
+the end of the file.
+
+Flow summary:
+1. CPU chunk tasks append findings into the file token instead of emitting.
+2. The I/O thread tracks `pending_chunks` and sets `read_complete` once all
+   reads are issued or a read failure occurs.
+3. The last chunk completion (or read error path with no remaining chunks)
+   triggers `finalize_file`.
+4. `finalize_file` reopens the file, verifies the size matches the recorded
+   size, tokenizes it with `LexicalTokenizer` using the file's
+   `LexicalFamily`, then applies `apply_lexical_context`.
+5. If the file family is unknown, the file changed, or tokenization fails, the
+   buffered findings are emitted unfiltered (fail-open).
+
 ## Queue Management: SQE and CQE Semantics
 
 io_uring uses two ring buffers (user-space to kernel communication):
@@ -333,6 +352,9 @@ pub struct LocalFsUringConfig {
 
     // Deduplication
     pub dedupe_within_chunk: bool,       // Dedupe findings per chunk
+
+    // Lexical filtering
+    pub context_mode: ContextMode,       // Off, Score, or Filter
 }
 ```
 
@@ -360,6 +382,7 @@ pub fn default() -> Self {
         max_file_size: None,             // No size filter
         seed: 1,                         // Deterministic executor
         dedupe_within_chunk: true,       // Dedupe by default
+        context_mode: ContextMode::Off,  // Emit per chunk (no lexical pass)
     }
 }
 ```
@@ -800,6 +823,7 @@ pub struct LocalFsUringConfig {
     pub max_file_size: Option<u64>,
     pub seed: u64,
     pub dedupe_within_chunk: bool,
+    pub context_mode: ContextMode,
 }
 
 impl LocalFsUringConfig {

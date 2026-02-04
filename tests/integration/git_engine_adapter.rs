@@ -19,6 +19,7 @@ fn test_engine() -> Engine {
         keywords_any: None,
         entropy: None,
         local_context: None,
+        lexical_context: None,
         secret_group: Some(1),
         re: Regex::new(r"TOK_([A-Z0-9]{8})").unwrap(),
     };

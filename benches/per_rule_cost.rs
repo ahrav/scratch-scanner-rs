@@ -145,6 +145,7 @@ fn main() {
         keywords_any: None,
         entropy: None,
         local_context: None,
+        lexical_context: None,
         secret_group: None,
         re: regex::bytes::Regex::new(r"\xFF\xFE\xFD\xFC[a-z]{10}").unwrap(),
     };
