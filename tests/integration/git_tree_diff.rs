@@ -1,4 +1,9 @@
 //! Integration tests for tree diff and object store against a real Git repo.
+//!
+//! These tests build small repos, write commit-graph/MIDX artifacts, and then
+//! compare tree-diff behavior against `git diff-tree` output or explicit
+//! expectations. They also exercise spill partitioning and corrupt-tree
+//! error reporting.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -16,10 +21,12 @@ use scanner_rs::git_scan::{
 use scanner_rs::git_scan::{OidBytes, PlannedCommit, RepoJobState};
 use tempfile::TempDir;
 
+/// Returns true when the `git` CLI is available on the host.
 fn git_available() -> bool {
     Command::new("git").arg("--version").output().is_ok()
 }
 
+/// Returns true when this git build supports the MIDX command.
 fn git_supports_midx() -> bool {
     Command::new("git")
         .args(["multi-pack-index", "--help"])
@@ -28,6 +35,7 @@ fn git_supports_midx() -> bool {
         .unwrap_or(false)
 }
 
+/// Runs a git command inside `repo` and asserts success.
 fn run_git(repo: &Path, args: &[&str]) {
     let status = Command::new("git")
         .args(args)
@@ -37,6 +45,7 @@ fn run_git(repo: &Path, args: &[&str]) {
     assert!(status.success(), "git command failed: {args:?}");
 }
 
+/// Runs a git command and returns UTF-8 stdout, asserting success.
 fn git_output(repo: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .args(args)
@@ -47,6 +56,7 @@ fn git_output(repo: &Path, args: &[&str]) -> String {
     String::from_utf8(out.stdout).expect("git output not utf8")
 }
 
+/// Decode a hex string into bytes (expects even length and valid hex digits).
 fn decode_hex(hex: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(hex.len() / 2);
     let bytes = hex.as_bytes();
@@ -60,11 +70,13 @@ fn decode_hex(hex: &str) -> Vec<u8> {
     out
 }
 
+/// Parse a Git object ID from hex output.
 fn oid_from_hex(hex: &str) -> OidBytes {
     let bytes = decode_hex(hex.trim());
     OidBytes::from_slice(&bytes)
 }
 
+/// Start set resolver that returns fixed refs.
 struct TestResolver {
     refs: Vec<(Vec<u8>, OidBytes)>,
 }
@@ -78,6 +90,7 @@ impl StartSetResolver for TestResolver {
     }
 }
 
+/// Watermark store that returns no watermarks for all refs.
 struct EmptyWatermarkStore;
 
 impl RefWatermarkStore for EmptyWatermarkStore {
@@ -92,6 +105,9 @@ impl RefWatermarkStore for EmptyWatermarkStore {
     }
 }
 
+/// Create a repo with a simple two-commit history.
+///
+/// The second commit modifies, adds, and deletes paths to exercise tree diff.
 fn prepare_repo_with_commits() -> TempDir {
     let tmp = TempDir::new().unwrap();
     run_git(tmp.path(), &["init", "-b", "main"]);
@@ -117,6 +133,7 @@ fn prepare_repo_with_commits() -> TempDir {
     tmp
 }
 
+/// Create a repo with a two-parent merge commit for merge diff tests.
 fn prepare_repo_with_merge() -> TempDir {
     let tmp = TempDir::new().unwrap();
     run_git(tmp.path(), &["init", "-b", "main"]);
@@ -149,6 +166,7 @@ fn prepare_repo_with_merge() -> TempDir {
     tmp
 }
 
+/// Open repo state with commit-graph and MIDX artifacts ready.
 fn open_repo_state(repo: &Path) -> RepoJobState {
     let head = git_output(repo, &["rev-parse", "HEAD"]);
     let head_oid = oid_from_hex(&head);
@@ -173,6 +191,7 @@ fn open_repo_state(repo: &Path) -> RepoJobState {
     state
 }
 
+/// Collect tree diff change kinds into a map keyed by UTF-8 path.
 fn diff_paths(
     store: &mut ObjectStore,
     limits: &TreeDiffLimits,
@@ -250,6 +269,7 @@ fn tree_diff_matches_git_diff_tree() {
         ],
     );
 
+    // Baseline expected changes from git itself.
     let mut expected: BTreeMap<String, ChangeKind> = BTreeMap::new();
     for line in diff.lines() {
         let mut parts = line.splitn(2, '\t');
@@ -349,6 +369,7 @@ fn collect_merge_candidates(
     }
 }
 
+/// Collect unique blobs via spill with the supplied limits.
 fn collect_unique_blobs(state: &RepoJobState, limits: SpillLimits) -> Vec<CollectedUniqueBlob> {
     let cg = CommitGraphView::open_repo(state).unwrap();
     let plan = introduced_by_plan(state, &cg, CommitWalkLimits::RESTRICTIVE).unwrap();
@@ -478,6 +499,7 @@ fn spill_limits_streaming_is_partition_invariant() {
     limits_small.max_chunk_path_bytes = 64;
     limits_small.seen_batch_max_oids = 2;
     limits_small.seen_batch_max_path_bytes = 64;
+    limits_small.max_path_len = 64;
 
     let mut limits_large = limits_small;
     limits_large.max_chunk_candidates = 1024;
@@ -530,6 +552,7 @@ fn spill_limits_streaming_is_partition_invariant() {
     assert_eq!(out_small, out_large);
 }
 
+/// Write a corrupt tree object into the object database.
 fn write_corrupt_tree(objects_dir: &Path, oid: &OidBytes) {
     let payload = b"100644 file\0";
     let mut data = format!("tree {}\0", payload.len()).into_bytes();

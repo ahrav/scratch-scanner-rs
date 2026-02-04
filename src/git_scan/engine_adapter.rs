@@ -172,6 +172,7 @@ pub struct EngineAdapter<'a> {
     findings_arena: Vec<FindingKey>,
     findings_buf: Vec<FindingKey>,
     chunker: RingChunker,
+    // Monotone ID for this adapter instance; wraps on overflow.
     next_file_id: u32,
 }
 
@@ -215,6 +216,13 @@ impl<'a> EngineAdapter<'a> {
             blobs: std::mem::take(&mut self.results),
             finding_arena: std::mem::take(&mut self.findings_arena),
         }
+    }
+
+    /// Clears accumulated results while preserving allocated capacity.
+    pub fn clear_results(&mut self) {
+        self.results.clear();
+        self.findings_arena.clear();
+        self.findings_buf.clear();
     }
 
     /// Returns the adapter-owned path arena.
@@ -309,6 +317,7 @@ impl<'a> EngineAdapter<'a> {
             return Err(EngineAdapterError::FindingArenaOverflow { end, max: u32::MAX });
         }
 
+        // Extend the shared arena; the returned span is used by `ScannedBlob`.
         self.findings_arena.extend_from_slice(&self.findings_buf);
         Ok(FindingSpan {
             start: start as u32,

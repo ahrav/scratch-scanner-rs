@@ -132,12 +132,19 @@ impl From<PackParseError> for PackExecError {
 /// These are non-fatal and recorded in the execution report.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SkipReason {
+    /// Pack parsing failed for this offset.
     PackParse(PackParseError),
+    /// Inflating or decoding this entry failed.
     Decode(PackDecodeError),
+    /// Delta application failed after a successful decode.
     Delta(DeltaError),
+    /// An OFS/REF delta base was expected in-pack but missing from cache.
     BaseMissing { base_offset: u64 },
+    /// External base provider returned `None` for a REF delta.
     ExternalBaseMissing { oid: OidBytes },
+    /// External base provider returned an error.
     ExternalBaseError,
+    /// Entry decoded successfully but is not a blob.
     NotBlob,
 }
 
@@ -180,7 +187,9 @@ pub struct PackExecReport {
 /// Where the decoded bytes live after `decode_offset`.
 #[derive(Clone, Copy, Debug)]
 enum DecodedStorage {
+    /// Bytes are stored in the `PackCache`.
     Cache,
+    /// Bytes are stored in the scratch buffer passed to the decoder.
     Scratch,
 }
 
@@ -1453,6 +1462,14 @@ mod tests {
             }
         }
 
+        if std::env::var("SCANNER_RS_ALLOC_GUARD").ok().as_deref() != Some("1") {
+            eprintln!(
+                "alloc guard test skipped; set SCANNER_RS_ALLOC_GUARD=1 and \
+run with --test-threads=1 to enable"
+            );
+            return;
+        }
+
         let rule = RuleSpec {
             name: "tok",
             anchors: &[b"TOK_"],
@@ -1510,12 +1527,26 @@ mod tests {
         adapter.reserve_findings(8);
         adapter.reserve_findings_buf(8);
 
-        let mut cache = PackCache::new(64 * 1024);
-        let mut external = NoExternal;
+        alloc_guard::set_enabled(false);
+        let mut warm_cache = PackCache::new(64 * 1024);
+        let mut warm_external = NoExternal;
+        let _warm = execute_pack_plan(
+            &plan,
+            &pack,
+            &arena,
+            &PackDecodeLimits::new(64, 1024, 1024),
+            &mut warm_cache,
+            &mut warm_external,
+            &mut adapter,
+        )
+        .unwrap();
+        adapter.clear_results();
 
         alloc_guard::set_enabled(true);
         let _reset = Reset;
 
+        let mut cache = PackCache::new(64 * 1024);
+        let mut external = NoExternal;
         let report = execute_pack_plan(
             &plan,
             &pack,

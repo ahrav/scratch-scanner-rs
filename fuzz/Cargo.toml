@@ -59,3 +59,10 @@ path = "fuzz_targets/fuzz_tiger_chunking.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_pack_parse_delta"
+path = "fuzz_targets/fuzz_pack_parse_delta.rs"
+test = false
+doc = false
+bench = false

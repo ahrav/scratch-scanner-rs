@@ -89,6 +89,11 @@ fn ensure_artifacts(repo: &Path) {
     run_git(repo, &["commit-graph", "write", "--reachable"]);
 }
 
+/// Update the commit-graph after new commits without repacking objects.
+fn update_commit_graph(repo: &Path) {
+    run_git(repo, &["commit-graph", "write", "--reachable"]);
+}
+
 /// Build a tiny engine that detects TOK_ secrets (and Base64 variants).
 fn test_engine() -> Engine {
     let rule = RuleSpec {
@@ -196,6 +201,7 @@ fn loose_only_candidate_scans_complete() {
     ensure_artifacts(tmp.path());
     // Commit after artifacts so the new blob remains loose.
     commit_file(tmp.path(), "secret.txt", "TOK_ABCDEFGH\n", "secret");
+    update_commit_graph(tmp.path());
 
     let watermark = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD~1"]));
     let result = run_scan(tmp.path(), Some(watermark));
@@ -222,6 +228,7 @@ fn packed_and_loose_candidates_scan_complete() {
     ensure_artifacts(tmp.path());
     // Base blob is packed; secret blob remains loose.
     commit_file(tmp.path(), "secret.txt", "TOK_ABCDEFGH\n", "secret");
+    update_commit_graph(tmp.path());
 
     let result = run_scan(tmp.path(), None);
 
@@ -247,6 +254,7 @@ fn missing_loose_object_yields_partial() {
     ensure_artifacts(tmp.path());
 
     commit_file(tmp.path(), "secret.txt", "TOK_ABCDEFGH\n", "secret");
+    update_commit_graph(tmp.path());
     let blob_hex = git_output(tmp.path(), &["rev-parse", "HEAD:secret.txt"]);
     let blob_oid = oid_from_hex(&blob_hex);
 

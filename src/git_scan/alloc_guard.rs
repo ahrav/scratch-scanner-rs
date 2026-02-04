@@ -7,13 +7,15 @@
 //! - This only affects call sites that explicitly check `enabled()`.
 //! - Allocation guards may false-positive if other threads allocate.
 //! - Tests install `CountingAllocator` to make allocation tracking visible.
+//! - The enable flag is thread-local, but allocation counters are global.
+//!   Enable the guard only around code that is expected to be allocation-free.
 
 #[cfg(debug_assertions)]
 use std::cell::Cell;
 
 #[cfg(debug_assertions)]
 thread_local! {
-    static ENABLED: Cell<bool> = Cell::new(false);
+    static ENABLED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Returns true when the debug allocation guard is enabled.
