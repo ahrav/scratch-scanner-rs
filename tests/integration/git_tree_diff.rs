@@ -16,7 +16,7 @@ use scanner_rs::git_scan::{
     CollectingUniqueBlobSink, CommitGraph, CommitGraphView, CommitWalkLimits, MergeDiffMode,
     NeverSeenStore, ObjectStore, ParentScratch, RefWatermarkStore, RepoArtifactStatus,
     RepoOpenError, RepoOpenLimits, SpillLimits, Spiller, StartSetConfig, StartSetResolver,
-    TreeDiffError, TreeDiffLimits, TreeDiffWalker,
+    TreeBytes, TreeDiffError, TreeDiffLimits, TreeDiffWalker, TreeSource,
 };
 use scanner_rs::git_scan::{OidBytes, PlannedCommit, RepoJobState};
 use tempfile::TempDir;
@@ -125,6 +125,33 @@ fn prepare_repo_with_commits() -> TempDir {
     fs::remove_file(tmp.path().join("dir/b.txt")).unwrap();
     run_git(tmp.path(), &["add", "-A"]);
     run_git(tmp.path(), &["commit", "-m", "c2"]);
+
+    run_git(tmp.path(), &["commit-graph", "write", "--reachable"]);
+    run_git(tmp.path(), &["repack", "-ad"]);
+    run_git(tmp.path(), &["multi-pack-index", "write"]);
+
+    tmp
+}
+
+/// Create a repo with many files to force large tree payloads.
+fn prepare_repo_with_many_files(count: usize) -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    run_git(tmp.path(), &["init", "-b", "main"]);
+    run_git(tmp.path(), &["config", "user.email", "test@example.com"]);
+    run_git(tmp.path(), &["config", "user.name", "Test User"]);
+
+    for idx in 0..count {
+        let path = tmp.path().join(format!("file_{idx:04}.txt"));
+        fs::write(path, format!("line {idx}\n")).unwrap();
+    }
+
+    run_git(tmp.path(), &["add", "."]);
+    run_git(tmp.path(), &["commit", "-m", "initial"]);
+
+    // Modify one file to create a second commit.
+    fs::write(tmp.path().join("file_0000.txt"), "updated\n").unwrap();
+    run_git(tmp.path(), &["add", "."]);
+    run_git(tmp.path(), &["commit", "-m", "update"]);
 
     run_git(tmp.path(), &["commit-graph", "write", "--reachable"]);
     run_git(tmp.path(), &["repack", "-ad"]);
@@ -291,6 +318,102 @@ fn tree_diff_matches_git_diff_tree() {
     }
 
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn tree_diff_spill_path_uses_spill_arena() {
+    if !git_available() || !git_supports_midx() {
+        eprintln!("git or multi-pack-index not available; skipping spill path test");
+        return;
+    }
+
+    let tmp = prepare_repo_with_many_files(128);
+    let state = open_repo_state(tmp.path());
+
+    let mut limits = TreeDiffLimits::RESTRICTIVE;
+    limits.max_tree_cache_bytes = 64;
+    limits.max_tree_spill_bytes = 1024 * 1024;
+    limits.max_tree_bytes_in_flight = 8 * 1024 * 1024;
+    limits.max_path_arena_bytes = 1024 * 1024;
+
+    let spill = tempfile::tempdir().unwrap();
+    let mut store = ObjectStore::open(&state, &limits, spill.path()).unwrap();
+
+    let new_tree = oid_from_hex(&git_output(
+        tmp.path(),
+        &["show", "-s", "--format=%T", "HEAD"],
+    ));
+    let old_tree = oid_from_hex(&git_output(
+        tmp.path(),
+        &["show", "-s", "--format=%T", "HEAD~1"],
+    ));
+
+    let bytes = store.load_tree(&new_tree).unwrap();
+    assert!(matches!(bytes, TreeBytes::Spilled(_)));
+
+    let mut walker = TreeDiffWalker::new(&limits, state.object_format.oid_len());
+    let mut candidates = CandidateBuffer::new(&limits, state.object_format.oid_len());
+
+    walker
+        .diff_trees(
+            &mut store,
+            &mut candidates,
+            Some(&new_tree),
+            Some(&old_tree),
+            0,
+            0,
+        )
+        .unwrap();
+
+    assert!(!candidates.is_empty());
+}
+
+#[test]
+fn tree_diff_streaming_matches_buffered() {
+    if !git_available() || !git_supports_midx() {
+        eprintln!("git or multi-pack-index not available; skipping streaming test");
+        return;
+    }
+
+    let tmp = prepare_repo_with_many_files(128);
+    let state = open_repo_state(tmp.path());
+
+    let new_tree = oid_from_hex(&git_output(
+        tmp.path(),
+        &["show", "-s", "--format=%T", "HEAD"],
+    ));
+    let old_tree = oid_from_hex(&git_output(
+        tmp.path(),
+        &["show", "-s", "--format=%T", "HEAD~1"],
+    ));
+
+    let mut limits_stream = TreeDiffLimits::RESTRICTIVE;
+    limits_stream.max_tree_cache_bytes = 64;
+    limits_stream.max_tree_spill_bytes = 1;
+    limits_stream.max_tree_bytes_in_flight = 8 * 1024 * 1024;
+    limits_stream.max_path_arena_bytes = 1024 * 1024;
+
+    let mut limits_buffered = limits_stream;
+    limits_buffered.max_tree_cache_bytes = 8 * 1024 * 1024;
+    limits_buffered.max_tree_spill_bytes = 8 * 1024 * 1024;
+
+    let spill_stream = tempfile::tempdir().unwrap();
+    let spill_buffered = tempfile::tempdir().unwrap();
+
+    let mut store_stream = ObjectStore::open(&state, &limits_stream, spill_stream.path()).unwrap();
+    let mut store_buffered =
+        ObjectStore::open(&state, &limits_buffered, spill_buffered.path()).unwrap();
+
+    let out_stream = diff_paths(&mut store_stream, &limits_stream, &new_tree, &old_tree, 0);
+    let out_buffered = diff_paths(
+        &mut store_buffered,
+        &limits_buffered,
+        &new_tree,
+        &old_tree,
+        0,
+    );
+
+    assert_eq!(out_stream, out_buffered);
 }
 
 #[test]

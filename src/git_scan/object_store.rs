@@ -23,6 +23,20 @@
 //! - Spill arena stores large tree payloads in a fixed-size mmapped file;
 //!   spill indexing is best-effort and may disable itself when full
 //!
+//! # Load Pipeline
+//! - Validate OID length
+//! - Check tree cache for a pinned payload
+//! - Check spill index for spilled payloads
+//! - Load the object from pack or loose storage
+//! - Verify the object kind is `tree`
+//! - Spill large payloads (best-effort), otherwise insert into cache
+//!
+//! # Spill/Cache Behavior
+//! Small payloads stay in RAM. Large payloads can be written to the spill arena
+//! and optionally indexed for fast lookup. The spill index is open-addressed
+//! and never deletes entries; once full, it is disabled and lookups fall back
+//! to pack/loose reads.
+//!
 //! # Ordering
 //! Pack lookup is attempted before loose objects. This mirrors typical Git
 //! layouts where packs are the primary store and loose objects are a fallback.
@@ -101,6 +115,11 @@ impl SpillIndexEntry {
 }
 
 /// Fixed-size open-addressed hash table for spilled tree payloads.
+///
+/// Uses linear probing with FNV-1a hashing. There are no tombstones; once all
+/// slots are occupied, inserts fail and callers may disable indexing. This
+/// keeps lookup and insert logic simple and deterministic at the cost of
+/// best-effort behavior under high spill pressure.
 ///
 /// Invariants:
 /// - `slots.len()` is power-of-two so masking is cheap.
@@ -196,6 +215,9 @@ pub enum TreeBytes {
     /// Owned bytes (e.g., from pack/loose reads).
     Owned(Vec<u8>),
     /// Bytes stored in the spill arena.
+    ///
+    /// The underlying spill arena must outlive the returned `TreeBytes` for
+    /// the slice to remain valid.
     Spilled(SpillSlice),
 }
 
@@ -275,6 +297,9 @@ impl<'a> ObjectStore<'a> {
     ///
     /// The store resolves pack paths from the MIDX and uses a best-effort
     /// tree cache sized by `TreeDiffLimits`.
+    ///
+    /// `spill_dir` is used for the spill arena backing file; it should be on
+    /// a fast local disk to keep large-tree reads predictable.
     ///
     /// # Errors
     /// Returns `TreeDiffError::ObjectStoreError` if artifacts are missing,
@@ -461,7 +486,7 @@ impl<'a> ObjectStore<'a> {
                 inflate_limited(
                     pack.slice_from(header.data_start),
                     &mut delta,
-                    self.max_object_bytes,
+                    payload_size,
                 )
                 .map_err(|err| TreeDiffError::ObjectStoreError {
                     detail: format!(
@@ -505,7 +530,7 @@ impl<'a> ObjectStore<'a> {
                 inflate_limited(
                     pack.slice_from(header.data_start),
                     &mut delta,
-                    self.max_object_bytes,
+                    payload_size,
                 )
                 .map_err(|err| TreeDiffError::ObjectStoreError {
                     detail: format!(
@@ -604,6 +629,9 @@ impl<'a> ObjectStore<'a> {
         oid: &OidBytes,
         bytes: &[u8],
     ) -> Result<Option<SpillSlice>, TreeDiffError> {
+        // Spilling is best-effort: we only spill large payloads and stop once
+        // the arena reports out-of-space. Indexing is optional and can be
+        // disabled if the table fills to avoid unbounded probe costs.
         if self.spill_exhausted || bytes.len() < self.spill_min_bytes {
             return Ok(None);
         }
@@ -821,6 +849,11 @@ fn strip_pack_suffix(name: &[u8]) -> Vec<u8> {
     }
 }
 
+/// Parses a loose object payload into kind and raw bytes.
+///
+/// Expects the inflated loose format `<type> <size>\0<payload>` and verifies
+/// that the payload size matches the header. Payloads larger than
+/// `max_payload` are rejected.
 fn parse_loose_object(
     bytes: &[u8],
     max_payload: usize,

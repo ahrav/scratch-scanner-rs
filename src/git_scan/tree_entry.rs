@@ -38,6 +38,13 @@
 //! to `next()` return `None`. This prevents garbage results from partially
 //! parsed state.
 //!
+//! # Streaming vs. Complete Buffers
+//!
+//! `TreeEntryIter` expects a complete tree payload; if the last entry is
+//! truncated it is treated as corruption. For streaming callers that may
+//! refill a buffer mid-entry, use `parse_entry` directly and handle the
+//! `ParseOutcome::Incomplete` case.
+//!
 //! # Strictness
 //!
 //! The parser rejects malformed entries:
@@ -174,6 +181,7 @@ impl ParsedTreeEntry {
     }
 
     pub(crate) fn offset_by(&mut self, delta: usize) {
+        // Used when a sliding window is advanced while parsing a stream.
         self.name_start = self.name_start.saturating_add(delta);
         self.name_end = self.name_end.saturating_add(delta);
         self.oid_start = self.oid_start.saturating_add(delta);
@@ -294,7 +302,15 @@ impl<'a> TreeEntryIter<'a> {
         }
 
         let remaining = &self.data[self.pos..];
-        match parse_entry(remaining, self.oid_len)? {
+        let outcome = match parse_entry(remaining, self.oid_len) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                self.fuse();
+                return Err(err);
+            }
+        };
+
+        match outcome {
             ParseOutcome::Complete(parsed) => {
                 let entry = parsed.materialize(remaining, self.oid_len);
                 self.pos += parsed.entry_len;
@@ -328,6 +344,10 @@ impl<'a> Iterator for TreeEntryIter<'a> {
 /// `ParseOutcome::Incomplete` so streaming callers can refill buffers.
 /// Callers should only treat `Incomplete` as corruption when they are
 /// at EOF.
+///
+/// # Errors
+/// Returns `TreeDiffError::CorruptTree` if the mode digits are invalid or
+/// if the entry name is empty or contains a slash.
 pub(crate) fn parse_entry(data: &[u8], oid_len: u8) -> Result<ParseOutcome, TreeDiffError> {
     if data.is_empty() {
         return Ok(ParseOutcome::Incomplete(ParseStage::Mode));

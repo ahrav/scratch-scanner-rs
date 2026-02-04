@@ -104,6 +104,26 @@ fn build_root(paths: &[(Vec<u8>, OidBytes)]) -> (Option<OidBytes>, HashMap<OidBy
     (Some(root_oid), store)
 }
 
+fn collect_candidates_map(
+    source: &mut TestTreeStore,
+    limits: &TreeDiffLimits,
+    new_root: Option<&OidBytes>,
+    old_root: Option<&OidBytes>,
+) -> BTreeMap<Vec<u8>, (ChangeKind, OidBytes)> {
+    let mut walker = TreeDiffWalker::new(limits, 20);
+    let mut candidates = CandidateBuffer::new(limits, 20);
+
+    walker
+        .diff_trees(source, &mut candidates, new_root, old_root, 0, 0)
+        .unwrap();
+
+    let mut out = BTreeMap::new();
+    for cand in candidates.iter_resolved() {
+        out.insert(cand.path.to_vec(), (cand.change_kind, cand.oid));
+    }
+    out
+}
+
 fn oid_from_byte(val: u8) -> OidBytes {
     OidBytes::sha1([val; 20])
 }
@@ -202,5 +222,78 @@ proptest! {
         }
 
         prop_assert_eq!(actual, expected);
+    }
+}
+
+proptest! {
+    #[test]
+    fn streaming_matches_buffered(
+        (paths, flags) in prop::collection::btree_set(path_strategy(), 0..=12)
+            .prop_flat_map(|paths| {
+                let len = paths.len();
+                (
+                    Just(paths),
+                    prop::collection::vec(
+                        (any::<bool>(), any::<bool>(), any::<u8>(), any::<u8>(), any::<bool>()),
+                        len,
+                    ),
+                )
+            }),
+    ) {
+        let path_vec: Vec<Vec<u8>> = paths.into_iter().collect();
+        let mut old_entries: Vec<(Vec<u8>, OidBytes)> = Vec::new();
+        let mut new_entries: Vec<(Vec<u8>, OidBytes)> = Vec::new();
+
+        for (path, (in_old, in_new, old_val, new_val, same)) in path_vec.iter().zip(flags) {
+            let old_oid = oid_from_byte(old_val);
+            let mut new_oid = oid_from_byte(new_val);
+
+            if in_old {
+                old_entries.push((path.clone(), old_oid));
+            }
+            if in_new {
+                if in_old && same {
+                    new_oid = old_oid;
+                } else if in_old && new_oid == old_oid {
+                    new_oid = oid_from_byte(old_val.wrapping_add(1));
+                }
+                new_entries.push((path.clone(), new_oid));
+            }
+        }
+
+        let (old_root, mut store) = build_root(&old_entries);
+        let (new_root, new_store) = build_root(&new_entries);
+        store.extend(new_store);
+
+        let mut source_stream = TestTreeStore { trees: store.clone() };
+        let mut source_buffered = TestTreeStore { trees: store };
+
+        let limits_stream = TreeDiffLimits {
+            max_candidates: (path_vec.len() as u32).saturating_add(32),
+            max_path_arena_bytes: 1024 * 1024,
+            max_tree_bytes_in_flight: 4 * 1024 * 1024,
+            max_tree_spill_bytes: 1,
+            max_tree_cache_bytes: 64,
+            max_tree_depth: 64,
+        };
+
+        let mut limits_buffered = limits_stream;
+        limits_buffered.max_tree_cache_bytes = 2 * 1024 * 1024;
+        limits_buffered.max_tree_spill_bytes = 2 * 1024 * 1024;
+
+        let stream_out = collect_candidates_map(
+            &mut source_stream,
+            &limits_stream,
+            new_root.as_ref(),
+            old_root.as_ref(),
+        );
+        let buffered_out = collect_candidates_map(
+            &mut source_buffered,
+            &limits_buffered,
+            new_root.as_ref(),
+            old_root.as_ref(),
+        );
+
+        prop_assert_eq!(stream_out, buffered_out);
     }
 }
