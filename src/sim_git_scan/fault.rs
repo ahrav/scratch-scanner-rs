@@ -75,6 +75,92 @@ pub struct GitFaultPlan {
     pub resources: Vec<GitResourceFaults>,
 }
 
+/// Runtime fault injector keyed by logical Git resources.
+#[derive(Clone, Debug)]
+pub struct GitFaultInjector {
+    resources: Vec<ResourceState>,
+}
+
+#[derive(Clone, Debug)]
+struct ResourceState {
+    resource: GitResourceId,
+    reads: Vec<GitReadFault>,
+    next_idx: u32,
+}
+
+impl GitFaultInjector {
+    /// Create a new injector from a deterministic fault plan.
+    pub fn new(plan: GitFaultPlan) -> Self {
+        let mut resources = Vec::with_capacity(plan.resources.len());
+        for res in plan.resources {
+            resources.push(ResourceState {
+                resource: res.resource,
+                reads: res.reads,
+                next_idx: 0,
+            });
+        }
+        Self { resources }
+    }
+
+    /// Retrieves the next read fault for a resource and advances its read index.
+    pub fn next_read(&mut self, resource: &GitResourceId) -> (GitReadFault, u32) {
+        for state in &mut self.resources {
+            if &state.resource == resource {
+                let idx = state.next_idx;
+                state.next_idx = state.next_idx.saturating_add(1);
+                let fault = state.reads.get(idx as usize).cloned().unwrap_or_default();
+                return (fault, idx);
+            }
+        }
+        (GitReadFault::default(), 0)
+    }
+}
+
+impl GitResourceId {
+    /// Stable numeric id for trace logging.
+    #[must_use]
+    pub fn stable_id(&self) -> u32 {
+        match self {
+            Self::CommitGraph => 1,
+            Self::Midx => 2,
+            Self::Pack { pack_id } => 1000 + (*pack_id as u32),
+            Self::Persist => 2000,
+            Self::Other(name) => 3000 + stable_hash_u32(name.as_bytes()),
+        }
+    }
+}
+
+/// Stable numeric id for fault kinds used in trace events.
+#[must_use]
+pub fn fault_kind_code(fault: &GitIoFault) -> u16 {
+    match fault {
+        GitIoFault::ErrKind { .. } => 1,
+        GitIoFault::PartialRead { .. } => 2,
+        GitIoFault::EIntrOnce => 3,
+    }
+}
+
+/// Stable numeric id for corruption kinds used in trace events.
+#[must_use]
+pub fn corruption_kind_code(corruption: &GitCorruption) -> u16 {
+    match corruption {
+        GitCorruption::TruncateTo { .. } => 10,
+        GitCorruption::FlipBit { .. } => 11,
+        GitCorruption::Overwrite { .. } => 12,
+    }
+}
+
+fn stable_hash_u32(bytes: &[u8]) -> u32 {
+    const FNV_OFFSET: u32 = 0x811c9dc5;
+    const FNV_PRIME: u32 = 0x0100_0193;
+    let mut hash = FNV_OFFSET;
+    for &b in bytes {
+        hash ^= b as u32;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,5 +180,38 @@ mod tests {
         let json = serde_json::to_string(&plan).expect("serialize plan");
         let decoded: GitFaultPlan = serde_json::from_str(&json).expect("deserialize plan");
         assert_eq!(decoded.resources.len(), 1);
+    }
+
+    #[test]
+    fn injector_advances_read_index() {
+        let plan = GitFaultPlan {
+            resources: vec![GitResourceFaults {
+                resource: GitResourceId::Midx,
+                reads: vec![
+                    GitReadFault {
+                        fault: Some(GitIoFault::ErrKind { kind: 1 }),
+                        latency_ticks: 0,
+                        corruption: None,
+                    },
+                    GitReadFault {
+                        fault: Some(GitIoFault::PartialRead { max_len: 4 }),
+                        latency_ticks: 0,
+                        corruption: None,
+                    },
+                ],
+            }],
+        };
+
+        let mut injector = GitFaultInjector::new(plan);
+        let (first, idx0) = injector.next_read(&GitResourceId::Midx);
+        let (second, idx1) = injector.next_read(&GitResourceId::Midx);
+        let (third, idx2) = injector.next_read(&GitResourceId::Midx);
+
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 1);
+        assert_eq!(idx2, 2);
+        assert!(matches!(first.fault, Some(GitIoFault::ErrKind { .. })));
+        assert!(matches!(second.fault, Some(GitIoFault::PartialRead { .. })));
+        assert!(third.fault.is_none());
     }
 }

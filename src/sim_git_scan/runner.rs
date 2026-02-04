@@ -5,24 +5,25 @@
 //! shape (sorted/disjoint sets), watermark gating, and stability across
 //! schedule seeds.
 //!
-//! Phase 0 does not yet apply the `fault_plan`; the API reserves it for
-//! later injection points.
-
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 
 use crate::git_scan::{
-    build_pack_plans, ByteArena, CandidateBuffer, CommitPlanIter, CommitWalkLimits,
+    build_pack_plans, ByteArena, BytesView, CandidateBuffer, CommitPlanIter, CommitWalkLimits,
     FinalizeOutcome, OidBytes, PackCache, PackDecodeLimits, PackExecError, PackExecReport,
-    PackPlanConfig, PlannedCommit, StartSetRef, TreeDiffLimits, TreeDiffWalker,
+    PackPlanConfig, PackReadError, PackReader, PlannedCommit, StartSetRef, TreeDiffLimits,
+    TreeDiffWalker,
 };
 use crate::sim::executor::{SimExecutor, SimTask, SimTaskId, StepResult};
 
 use super::commit_graph::SimCommitGraph;
 use super::convert::{to_object_format, to_oid_bytes};
-use super::fault::GitFaultPlan;
+use super::fault::{
+    corruption_kind_code, fault_kind_code, GitFaultInjector, GitFaultPlan, GitIoFault,
+    GitResourceId,
+};
 use super::pack_bytes::SimPackBytes;
 use super::pack_io::SimPackIo;
 use super::scenario::{GitRunConfig, GitScenario};
@@ -204,18 +205,11 @@ impl GitSimRunner {
         }
     }
 
-    fn run_once(
-        &self,
-        scenario: &GitScenario,
-        _fault_plan: &GitFaultPlan,
-        seed: u64,
-    ) -> RunOutcome {
+    fn run_once(&self, scenario: &GitScenario, fault_plan: &GitFaultPlan, seed: u64) -> RunOutcome {
         let mut executor = SimExecutor::new(self.cfg.workers, seed);
         let mut tasks: Vec<StageKind> = Vec::new();
 
-        // Phase 0 schedules exactly one task per stage in a fixed order.
-        // Scheduling decisions are still recorded for determinism checks.
-        let mut state = RunState::new(scenario, self.cfg.trace_capacity);
+        let mut state = RunState::new(scenario, self.cfg.trace_capacity, fault_plan.clone());
         spawn_stage(&mut executor, &mut tasks, StageKind::RepoOpen);
 
         let max_steps = derive_max_steps(self.cfg.max_steps, scenario);
@@ -322,6 +316,7 @@ enum StageKind {
 struct RunState<'a> {
     scenario: &'a GitScenario,
     trace: GitTraceRing,
+    faults: GitFaultInjector,
     ref_arena: Option<ByteArena>,
     refs: Vec<StartSetRef>,
     commit_graph: Option<SimCommitGraph>,
@@ -334,10 +329,11 @@ struct RunState<'a> {
 }
 
 impl<'a> RunState<'a> {
-    fn new(scenario: &'a GitScenario, trace_capacity: u32) -> Self {
+    fn new(scenario: &'a GitScenario, trace_capacity: u32, fault_plan: GitFaultPlan) -> Self {
         Self {
             scenario,
             trace: GitTraceRing::new(trace_capacity as usize),
+            faults: GitFaultInjector::new(fault_plan),
             ref_arena: None,
             refs: Vec::new(),
             commit_graph: None,
@@ -378,6 +374,16 @@ fn derive_max_steps(max_steps: u64, scenario: &GitScenario) -> u64 {
 
 fn stage_repo_open(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
     let repo = &state.scenario.repo;
+    if let Some(artifacts) = &state.scenario.artifacts {
+        if let Some(bytes) = &artifacts.commit_graph {
+            let _ = apply_fault_to_bytes(
+                &mut state.faults,
+                &mut state.trace,
+                &GitResourceId::CommitGraph,
+                bytes,
+            )?;
+        }
+    }
     let _start_set = SimStartSet::from_repo(repo).map_err(|err| failure_inv(1, err))?;
     let commit_graph = SimCommitGraph::from_repo(repo).map_err(|err| failure_inv(2, err))?;
     let tree_source = SimTreeSource::from_repo(repo).map_err(|err| failure_inv(3, err))?;
@@ -522,7 +528,14 @@ fn stage_pack_exec(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
     let midx_bytes = artifacts.midx.clone().unwrap_or_default();
     let object_format = to_object_format(state.scenario.repo.object_format);
 
-    let midx_view = crate::git_scan::MidxView::parse(&midx_bytes, object_format)
+    let midx_faulted = apply_fault_to_bytes(
+        &mut state.faults,
+        &mut state.trace,
+        &GitResourceId::Midx,
+        &midx_bytes,
+    )?;
+
+    let midx_view = crate::git_scan::MidxView::parse(&midx_faulted, object_format)
         .map_err(|err| failure_inv(31, err))?;
 
     let pack_bytes = SimPackBytes::from_repo(&state.scenario.repo, artifacts)
@@ -589,7 +602,7 @@ fn stage_pack_exec(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
     }
     let mut external = SimPackIo::new(
         object_format,
-        crate::git_scan::BytesView::from_vec(midx_bytes),
+        crate::git_scan::BytesView::from_vec(midx_faulted),
         pack_list,
         crate::git_scan::PackIoLimits::new(limits, 32),
     )
@@ -598,9 +611,17 @@ fn stage_pack_exec(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
     let mut sink = CollectingSink::default();
 
     for plan in &plans {
-        let mut reader = pack_bytes
+        let reader_bytes = pack_bytes
             .pack_bytes(plan.pack_id)
             .map_err(|err| failure_inv(39, err))?;
+        let mut reader = FaultyPackReader::new(
+            GitResourceId::Pack {
+                pack_id: plan.pack_id,
+            },
+            reader_bytes,
+            &mut state.faults,
+            &mut state.trace,
+        );
 
         let report = crate::git_scan::execute_pack_plan_with_reader(
             plan,
@@ -764,6 +785,180 @@ fn hash_event(hasher: &mut Hasher, ev: &GitTraceEvent) {
             hasher.update(&kind.to_le_bytes());
         }
     }
+}
+
+fn apply_fault_to_bytes(
+    faults: &mut GitFaultInjector,
+    trace: &mut GitTraceRing,
+    resource: &GitResourceId,
+    bytes: &[u8],
+) -> Result<Vec<u8>, FailureReport> {
+    let (fault, op) = faults.next_read(resource);
+    record_fault_events(trace, resource, op, &fault);
+
+    let mut out = bytes.to_vec();
+    if let Some(io_fault) = &fault.fault {
+        match io_fault {
+            GitIoFault::ErrKind { kind } => {
+                return Err(failure_inv(70, format!("fault err kind {kind}")));
+            }
+            GitIoFault::EIntrOnce => {
+                return Err(failure_inv(71, "fault interrupted"));
+            }
+            GitIoFault::PartialRead { max_len } => {
+                let max_len = (*max_len as usize).min(out.len());
+                out.truncate(max_len);
+            }
+        }
+    }
+
+    if let Some(corruption) = &fault.corruption {
+        apply_corruption_vec(&mut out, corruption);
+    }
+
+    Ok(out)
+}
+
+fn record_fault_events(
+    trace: &mut GitTraceRing,
+    resource: &GitResourceId,
+    op: u32,
+    fault: &super::fault::GitReadFault,
+) {
+    if let Some(io_fault) = &fault.fault {
+        trace.push(GitTraceEvent::FaultInjected {
+            resource_id: resource.stable_id(),
+            op,
+            kind: fault_kind_code(io_fault),
+        });
+    }
+    if let Some(corruption) = &fault.corruption {
+        trace.push(GitTraceEvent::FaultInjected {
+            resource_id: resource.stable_id(),
+            op,
+            kind: corruption_kind_code(corruption),
+        });
+    }
+}
+
+fn apply_corruption_vec(buf: &mut Vec<u8>, corruption: &super::fault::GitCorruption) {
+    match corruption {
+        super::fault::GitCorruption::TruncateTo { new_len } => {
+            let new_len = (*new_len as usize).min(buf.len());
+            buf.truncate(new_len);
+        }
+        super::fault::GitCorruption::FlipBit { offset, mask } => {
+            let idx = *offset as usize;
+            if idx < buf.len() {
+                buf[idx] ^= *mask;
+            }
+        }
+        super::fault::GitCorruption::Overwrite { offset, bytes } => {
+            let start = *offset as usize;
+            if start >= buf.len() {
+                return;
+            }
+            let len = (buf.len() - start).min(bytes.len());
+            buf[start..start + len].copy_from_slice(&bytes[..len]);
+        }
+    }
+}
+
+struct FaultyPackReader<'a> {
+    resource: GitResourceId,
+    bytes: BytesView,
+    faults: &'a mut GitFaultInjector,
+    trace: &'a mut GitTraceRing,
+}
+
+impl<'a> FaultyPackReader<'a> {
+    fn new(
+        resource: GitResourceId,
+        bytes: BytesView,
+        faults: &'a mut GitFaultInjector,
+        trace: &'a mut GitTraceRing,
+    ) -> Self {
+        Self {
+            resource,
+            bytes,
+            faults,
+            trace,
+        }
+    }
+}
+
+impl PackReader for FaultyPackReader<'_> {
+    fn len(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+
+    fn read_at(&mut self, offset: u64, dst: &mut [u8]) -> Result<usize, PackReadError> {
+        let offset_usize = offset as usize;
+        let bytes = self.bytes.as_slice();
+        if offset_usize > bytes.len() {
+            return Err(PackReadError::OutOfRange {
+                offset,
+                len: dst.len(),
+            });
+        }
+
+        let (fault, op) = self.faults.next_read(&self.resource);
+        record_fault_events(self.trace, &self.resource, op, &fault);
+
+        if let Some(io_fault) = &fault.fault {
+            match io_fault {
+                GitIoFault::ErrKind { kind } => {
+                    return Err(PackReadError::Io(format!("fault err kind {kind}")));
+                }
+                GitIoFault::EIntrOnce => {
+                    return Err(PackReadError::Io("fault interrupted".to_string()));
+                }
+                GitIoFault::PartialRead { .. } => {}
+            }
+        }
+
+        let available = &bytes[offset_usize..];
+        let mut n = available.len().min(dst.len());
+
+        if let Some(GitIoFault::PartialRead { max_len }) = &fault.fault {
+            n = n.min(*max_len as usize);
+        }
+
+        dst[..n].copy_from_slice(&available[..n]);
+
+        if let Some(corruption) = &fault.corruption {
+            n = apply_corruption_read(dst, n, corruption);
+        }
+
+        Ok(n)
+    }
+}
+
+fn apply_corruption_read(
+    buf: &mut [u8],
+    mut len: usize,
+    corruption: &super::fault::GitCorruption,
+) -> usize {
+    match corruption {
+        super::fault::GitCorruption::TruncateTo { new_len } => {
+            let new_len = (*new_len as usize).min(len);
+            len = new_len;
+        }
+        super::fault::GitCorruption::FlipBit { offset, mask } => {
+            let idx = *offset as usize;
+            if idx < len {
+                buf[idx] ^= *mask;
+            }
+        }
+        super::fault::GitCorruption::Overwrite { offset, bytes } => {
+            let start = *offset as usize;
+            if start < len {
+                let copy_len = (len - start).min(bytes.len());
+                buf[start..start + copy_len].copy_from_slice(&bytes[..copy_len]);
+            }
+        }
+    }
+    len
 }
 
 /// Validate end-of-run invariants and correctness oracles.
@@ -974,6 +1169,270 @@ mod tests {
 
         assert!(matches!(failure.kind, FailureKind::Hang));
         assert_eq!(failure.message, "max steps exceeded");
+    }
+
+    #[test]
+    fn corrupt_midx_bytes_fail_parse() {
+        let midx_bytes = build_minimal_midx();
+        let plan = GitFaultPlan {
+            resources: vec![super::super::fault::GitResourceFaults {
+                resource: GitResourceId::Midx,
+                reads: vec![super::super::fault::GitReadFault {
+                    fault: None,
+                    latency_ticks: 0,
+                    corruption: Some(super::super::fault::GitCorruption::TruncateTo { new_len: 8 }),
+                }],
+            }],
+        };
+
+        let mut injector = GitFaultInjector::new(plan);
+        let mut trace = GitTraceRing::new(16);
+        let faulted =
+            apply_fault_to_bytes(&mut injector, &mut trace, &GitResourceId::Midx, &midx_bytes)
+                .expect("faulted bytes");
+
+        let parsed =
+            crate::git_scan::MidxView::parse(&faulted, crate::git_scan::ObjectFormat::Sha1);
+        assert!(parsed.is_err(), "corrupt midx should fail parse");
+    }
+
+    #[test]
+    fn pack_reader_partial_read_returns_error() {
+        use crate::git_scan::pack_inflate::ObjectKind;
+        use crate::git_scan::pack_plan_model::CandidateAtOffset;
+        use crate::git_scan::{
+            execute_pack_plan_with_reader, ByteArena, CandidateContext, ChangeKind, PackCache,
+            PackCandidate, PackDecodeLimits, PackExecError, PackPlan, PackPlanStats,
+        };
+        use crate::git_scan::{ExternalBase, ExternalBaseProvider, PackObjectSink};
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        struct NoExternal;
+
+        impl ExternalBaseProvider for NoExternal {
+            fn load_base(
+                &mut self,
+                _oid: &crate::git_scan::OidBytes,
+            ) -> Result<Option<ExternalBase>, PackExecError> {
+                Ok(None)
+            }
+        }
+
+        #[derive(Default)]
+        struct CollectingSink {
+            scanned: Vec<crate::git_scan::OidBytes>,
+        }
+
+        impl PackObjectSink for CollectingSink {
+            fn emit(
+                &mut self,
+                candidate: &PackCandidate,
+                _path: &[u8],
+                _bytes: &[u8],
+            ) -> Result<(), PackExecError> {
+                self.scanned.push(candidate.oid);
+                Ok(())
+            }
+        }
+
+        fn encode_entry_header(kind: ObjectKind, size: usize) -> Vec<u8> {
+            let obj_type = match kind {
+                ObjectKind::Commit => 1u8,
+                ObjectKind::Tree => 2u8,
+                ObjectKind::Blob => 3u8,
+                ObjectKind::Tag => 4u8,
+            };
+            let mut out = Vec::new();
+            let mut remaining = size as u64;
+            let mut first = ((obj_type & 0x07) << 4) | ((remaining & 0x0f) as u8);
+            remaining >>= 4;
+            if remaining != 0 {
+                first |= 0x80;
+            }
+            out.push(first);
+            while remaining != 0 {
+                let mut byte = (remaining & 0x7f) as u8;
+                remaining >>= 7;
+                if remaining != 0 {
+                    byte |= 0x80;
+                }
+                out.push(byte);
+            }
+            out
+        }
+
+        fn compress(data: &[u8]) -> Vec<u8> {
+            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(data).unwrap();
+            encoder.finish().unwrap()
+        }
+
+        fn build_pack(entries: &[(ObjectKind, &[u8])]) -> (Vec<u8>, Vec<u64>) {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(b"PACK");
+            bytes.extend_from_slice(&2u32.to_be_bytes());
+            bytes.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+
+            let mut offsets = Vec::with_capacity(entries.len());
+            for (kind, data) in entries {
+                offsets.push(bytes.len() as u64);
+                bytes.extend_from_slice(&encode_entry_header(*kind, data.len()));
+                bytes.extend_from_slice(&compress(data));
+            }
+
+            bytes.extend_from_slice(&[0u8; 20]);
+            (bytes, offsets)
+        }
+
+        let (pack, offsets) = build_pack(&[(ObjectKind::Blob, b"hello")]);
+        let plan = PackPlan {
+            pack_id: 0,
+            oid_len: 20,
+            candidates: vec![PackCandidate {
+                oid: crate::git_scan::OidBytes::sha1([0x11; 20]),
+                ctx: CandidateContext {
+                    commit_id: 1,
+                    parent_idx: 0,
+                    change_kind: ChangeKind::Add,
+                    ctx_flags: 0,
+                    cand_flags: 0,
+                    path_ref: crate::git_scan::ByteRef::new(0, 0),
+                },
+                pack_id: 0,
+                offset: offsets[0],
+            }],
+            candidate_offsets: vec![CandidateAtOffset {
+                offset: offsets[0],
+                cand_idx: 0,
+            }],
+            need_offsets: vec![offsets[0]],
+            delta_deps: Vec::new(),
+            exec_order: None,
+            clusters: Vec::new(),
+            stats: PackPlanStats {
+                candidate_count: 1,
+                need_count: 1,
+                external_bases: 0,
+                forward_deps: 0,
+                candidate_span: 0,
+            },
+        };
+
+        let plan_fault = GitFaultPlan {
+            resources: vec![super::super::fault::GitResourceFaults {
+                resource: GitResourceId::Pack { pack_id: 0 },
+                reads: vec![super::super::fault::GitReadFault {
+                    fault: Some(GitIoFault::PartialRead { max_len: 8 }),
+                    latency_ticks: 0,
+                    corruption: None,
+                }],
+            }],
+        };
+
+        let mut injector = GitFaultInjector::new(plan_fault);
+        let mut trace = GitTraceRing::new(16);
+        let mut reader = FaultyPackReader::new(
+            GitResourceId::Pack { pack_id: 0 },
+            BytesView::from_vec(pack),
+            &mut injector,
+            &mut trace,
+        );
+
+        let arena = ByteArena::with_capacity(32);
+        let mut cache = PackCache::new(64 * 1024);
+        let limits = PackDecodeLimits::new(64, 1024, 1024);
+        let mut sink = CollectingSink::default();
+        let mut external = NoExternal;
+
+        let err = execute_pack_plan_with_reader(
+            &plan,
+            &mut reader,
+            &arena,
+            &limits,
+            &mut cache,
+            &mut external,
+            &mut sink,
+        )
+        .expect_err("expected pack read error");
+        assert!(matches!(err, PackExecError::PackRead(_)));
+    }
+
+    fn build_minimal_midx() -> Vec<u8> {
+        const MIDX_MAGIC: [u8; 4] = *b"MIDX";
+        const MIDX_VERSION: u8 = 1;
+        const MIDX_HEADER_SIZE: usize = 12;
+        const CHUNK_ENTRY_SIZE: usize = 12;
+        const CHUNK_PNAM: [u8; 4] = *b"PNAM";
+        const CHUNK_OIDF: [u8; 4] = *b"OIDF";
+        const CHUNK_OIDL: [u8; 4] = *b"OIDL";
+        const CHUNK_OOFF: [u8; 4] = *b"OOFF";
+        const FANOUT_SIZE: usize = 256 * 4;
+
+        let pack_names = vec![b"pack-test".to_vec()];
+        let objects = vec![([0x11; 20], 0u16, 100u64)];
+
+        let mut pnam = Vec::new();
+        for name in &pack_names {
+            pnam.extend_from_slice(name);
+            pnam.push(0);
+        }
+
+        let mut oidf = vec![0u8; FANOUT_SIZE];
+        let mut counts = [0u32; 256];
+        for (oid, _, _) in &objects {
+            counts[oid[0] as usize] += 1;
+        }
+        let mut running = 0u32;
+        for (i, count) in counts.iter().enumerate() {
+            running += count;
+            let off = i * 4;
+            oidf[off..off + 4].copy_from_slice(&running.to_be_bytes());
+        }
+
+        let mut oidl = Vec::with_capacity(objects.len() * 20);
+        let mut ooff = Vec::with_capacity(objects.len() * 8);
+        for (oid, pack_id, offset) in &objects {
+            oidl.extend_from_slice(oid);
+            ooff.extend_from_slice(&(*pack_id as u32).to_be_bytes());
+            ooff.extend_from_slice(&(*offset as u32).to_be_bytes());
+        }
+
+        let chunk_count = 4u8;
+        let header_size = MIDX_HEADER_SIZE;
+        let chunk_table_size = (chunk_count as usize + 1) * CHUNK_ENTRY_SIZE;
+
+        let pnam_off = (header_size + chunk_table_size) as u64;
+        let oidf_off = pnam_off + pnam.len() as u64;
+        let oidl_off = oidf_off + oidf.len() as u64;
+        let ooff_off = oidl_off + oidl.len() as u64;
+        let end_off = ooff_off + ooff.len() as u64;
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&MIDX_MAGIC);
+        out.push(MIDX_VERSION);
+        out.push(1); // SHA-1
+        out.push(chunk_count);
+        out.push(0); // base count
+        out.extend_from_slice(&(pack_names.len() as u32).to_be_bytes());
+
+        let mut push_chunk = |id: [u8; 4], off: u64| {
+            out.extend_from_slice(&id);
+            out.extend_from_slice(&off.to_be_bytes());
+        };
+
+        push_chunk(CHUNK_PNAM, pnam_off);
+        push_chunk(CHUNK_OIDF, oidf_off);
+        push_chunk(CHUNK_OIDL, oidl_off);
+        push_chunk(CHUNK_OOFF, ooff_off);
+        push_chunk([0, 0, 0, 0], end_off);
+
+        out.extend_from_slice(&pnam);
+        out.extend_from_slice(&oidf);
+        out.extend_from_slice(&oidl);
+        out.extend_from_slice(&ooff);
+        out
     }
 }
 

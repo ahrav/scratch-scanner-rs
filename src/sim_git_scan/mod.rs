@@ -27,6 +27,7 @@ pub mod fault;
 pub mod minimize;
 pub mod pack_bytes;
 pub mod pack_io;
+pub mod persist;
 pub mod replay;
 pub mod runner;
 pub mod scenario;
@@ -38,10 +39,13 @@ pub use artifact::{GitReproArtifact, GitTraceDump};
 pub use commit_graph::SimCommitGraph;
 pub use convert::{to_object_format, to_oid_bytes};
 pub use error::SimGitError;
-pub use fault::{GitCorruption, GitFaultPlan, GitIoFault, GitReadFault, GitResourceId};
+pub use fault::{
+    GitCorruption, GitFaultInjector, GitFaultPlan, GitIoFault, GitReadFault, GitResourceId,
+};
 pub use minimize::{minimize_git_case, MinimizerCfg};
 pub use pack_bytes::SimPackBytes;
 pub use pack_io::SimPackIo;
+pub use persist::{PersistPhase, SimPersistOp, SimPersistStore};
 pub use replay::replay_artifact;
 pub use runner::{FailureKind, FailureReport, GitSimRunner, RunOutcome, RunReport};
 pub use scenario::{

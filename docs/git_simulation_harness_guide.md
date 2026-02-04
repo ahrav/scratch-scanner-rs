@@ -45,6 +45,42 @@ deterministic interleaving.
 - Gating: `FinalizeOutcome::Complete` requires zero skips; `Partial` requires
   non-zero skips.
 
+## Fault Plan
+
+Faults are keyed by logical resources and per-read index so injected failures
+are deterministic and schedule-independent.
+
+Resources:
+- `CommitGraph`
+- `Midx`
+- `Pack { pack_id }`
+- `Persist`
+- `Other(String)` for non-core resources
+
+Faults:
+- `ErrKind { kind }` (simulated I/O error)
+- `PartialRead { max_len }` (short read)
+- `EIntrOnce` (interrupted read)
+
+Corruption:
+- `TruncateTo { new_len }`
+- `FlipBit { offset, mask }`
+- `Overwrite { offset, bytes }`
+
+Each fault is consumed in read-index order (`0`, `1`, …). When a fault or
+corruption is applied, the runner emits a `FaultInjected` trace event that
+captures the resource id, read index, and fault kind.
+
+## Persistence Safety
+
+The simulation persistence store (`SimPersistStore`) logs operations in the
+order they are issued and enforces the two-phase contract:
+
+- Data ops are always written first.
+- Watermark ops are written only for `FinalizeOutcome::Complete`.
+- Faults injected on the persistence resource abort the phase and prevent
+  watermark writes, preserving partial-run gating.
+
 ## Failure Taxonomy
 
 - `Panic`: unexpected panic in runner logic.
