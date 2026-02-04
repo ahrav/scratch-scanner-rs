@@ -24,6 +24,7 @@
 //! - File reads are bounded by explicit limits.
 //! - Outputs are deterministic for identical repo state.
 
+pub mod alloc_guard;
 pub mod byte_arena;
 pub mod commit_walk;
 pub mod commit_walk_limits;
@@ -75,6 +76,7 @@ pub mod unique_blob;
 pub mod watermark_keys;
 pub mod work_items;
 
+pub use alloc_guard::{enabled as alloc_guard_enabled, set_enabled as set_alloc_guard_enabled};
 pub use byte_arena::{ByteArena, ByteRef};
 pub use commit_walk::{
     introduced_by_plan, topo_order_positions, CommitGraph, CommitGraphView, CommitPlanIter,
@@ -83,7 +85,7 @@ pub use commit_walk::{
 pub use commit_walk_limits::CommitWalkLimits;
 pub use engine_adapter::{
     scan_blob_chunked, EngineAdapter, EngineAdapterConfig, EngineAdapterError, FindingKey,
-    ScannedBlob, DEFAULT_CHUNK_BYTES, DEFAULT_PATH_ARENA_BYTES,
+    FindingSpan, ScannedBlob, ScannedBlobs, DEFAULT_CHUNK_BYTES, DEFAULT_PATH_ARENA_BYTES,
 };
 pub use errors::PersistError;
 pub use errors::{CommitPlanError, MappingCandidateKind, RepoOpenError, SpillError, TreeDiffError};

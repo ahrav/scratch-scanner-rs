@@ -10,13 +10,21 @@
 //! executor precomputes exact per-offset candidate ranges to preserve
 //! gating under out-of-order execution.
 //!
+//! # Invariants
+//! - `plan.need_offsets` and `plan.candidate_offsets` are sorted by pack offset.
+//! - `exec_order`, when present, is a permutation of `need_offsets` indices.
+//! - The sink must not retain `bytes` slices beyond `emit` calls.
+//!
 //! The executor treats decode failures as per-offset skips and only returns
-//! fatal errors for pack parsing, sink failures, or external base loading
-//! errors.
+//! fatal errors for pack parsing or sink failures. External base provider
+//! errors are recorded as skips for the affected offsets.
 
 use std::collections::HashMap;
 use std::fmt;
 
+use crate::scheduler::AllocGuard;
+
+use super::alloc_guard;
 use super::byte_arena::ByteArena;
 use super::object_id::OidBytes;
 use super::pack_cache::PackCache;
@@ -44,7 +52,8 @@ pub struct ExternalBase {
 pub trait ExternalBaseProvider {
     /// Returns the base object for a given OID, or `None` if missing.
     ///
-    /// Any error is treated as fatal for the entire pack execution.
+    /// Any error is recorded as `SkipReason::ExternalBaseError` for the
+    /// affected offset; execution continues.
     fn load_base(&mut self, oid: &OidBytes) -> Result<Option<ExternalBase>, PackExecError>;
 }
 
@@ -56,7 +65,8 @@ pub trait PackObjectSink {
     /// Receives a decoded blob candidate.
     ///
     /// The `bytes` slice is only valid for the duration of the call and may
-    /// be backed by either a cache entry or a scratch buffer.
+    /// be backed by either a cache entry or a scratch buffer. Implementations
+    /// must copy if they need to retain the bytes.
     fn emit(
         &mut self,
         candidate: &PackCandidate,
@@ -150,6 +160,7 @@ pub struct PackExecStats {
 #[derive(Debug, Default)]
 pub struct PackExecReport {
     pub stats: PackExecStats,
+    /// Per-offset skip records (may include repeated offsets).
     pub skips: Vec<SkipRecord>,
 }
 
@@ -173,11 +184,11 @@ struct DecodedObject {
 /// delta dependencies. Pack bytes must contain the full pack file.
 ///
 /// The returned report includes both successful decode stats and per-offset
-/// skip reasons for non-fatal failures.
+/// skip reasons for non-fatal failures (decode errors, missing bases, and
+/// external base provider errors).
 ///
 /// # Errors
 /// - `PackExecError::PackParse` for invalid pack headers.
-/// - `PackExecError::ExternalBase` for external base loader failures.
 /// - `PackExecError::Sink` for sink failures.
 #[allow(clippy::too_many_arguments)]
 pub fn execute_pack_plan<S: PackObjectSink, B: ExternalBaseProvider>(
@@ -191,6 +202,11 @@ pub fn execute_pack_plan<S: PackObjectSink, B: ExternalBaseProvider>(
 ) -> Result<PackExecReport, PackExecError> {
     let pack = PackFile::parse(pack_bytes, plan.oid_len as usize)?;
     let mut report = PackExecReport::default();
+    report
+        .skips
+        .reserve(plan.candidate_offsets.len().min(u32::MAX as usize));
+
+    let alloc_guard_enabled = alloc_guard::enabled();
 
     let mut delta_map: HashMap<u64, DeltaDep> = HashMap::with_capacity(plan.delta_deps.len());
     for dep in &plan.delta_deps {
@@ -201,6 +217,11 @@ pub fn execute_pack_plan<S: PackObjectSink, B: ExternalBaseProvider>(
     let mut result_buf: Vec<u8> = Vec::with_capacity(limits.max_object_bytes.max(1024));
 
     let mut handle_idx = |idx: usize, range: Option<(usize, usize)>| -> Result<(), PackExecError> {
+        let guard = if alloc_guard_enabled {
+            Some(AllocGuard::new())
+        } else {
+            None
+        };
         let offset = plan.need_offsets[idx];
 
         let decoded = if cache.get(offset).is_some() {
@@ -254,6 +275,10 @@ pub fn execute_pack_plan<S: PackObjectSink, B: ExternalBaseProvider>(
             }
         }
 
+        if let Some(guard) = guard {
+            guard.assert_no_alloc();
+        }
+
         Ok(())
     };
 
@@ -292,7 +317,7 @@ pub fn execute_pack_plan<S: PackObjectSink, B: ExternalBaseProvider>(
 /// Build candidate index ranges for each `need_offsets` entry.
 ///
 /// This is used only when `exec_order` reorders offsets; it avoids repeated
-/// scans of the candidate list.
+/// scans of the candidate list by leveraging sorted candidate offsets.
 fn build_candidate_ranges(plan: &PackPlan) -> Vec<Option<(usize, usize)>> {
     let mut ranges = vec![None; plan.need_offsets.len()];
     let mut cand_idx = 0usize;
@@ -312,9 +337,10 @@ fn build_candidate_ranges(plan: &PackPlan) -> Vec<Option<(usize, usize)>> {
 
 /// Decodes a single offset, using the cache for bases and for storing results.
 ///
-/// Returns `Ok(None)` for non-fatal decode issues, with the skip recorded in
-/// the report. Successful decodes return metadata describing where the bytes
-/// reside (cache vs scratch).
+/// Returns `Ok(None)` for non-fatal issues (decode errors, missing bases, or
+/// external base provider errors), with the skip recorded in the report.
+/// Successful decodes return metadata describing where the bytes reside
+/// (cache vs scratch).
 #[allow(clippy::too_many_arguments)]
 fn decode_offset<'a, B: ExternalBaseProvider>(
     pack: &'a PackFile<'a>,
@@ -387,14 +413,23 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                     header,
                     base.bytes,
                     limits,
-                    report,
                     inflate_buf,
                     result_buf,
                 ) {
-                    report.skips.push(SkipRecord {
-                        offset,
-                        reason: SkipReason::Delta(err),
-                    });
+                    match err {
+                        DeltaDecodeError::Decode(err) => {
+                            report.skips.push(SkipRecord {
+                                offset,
+                                reason: SkipReason::Decode(err),
+                            });
+                        }
+                        DeltaDecodeError::Delta(err) => {
+                            report.skips.push(SkipRecord {
+                                offset,
+                                reason: SkipReason::Delta(err),
+                            });
+                        }
+                    }
                     report.stats.skipped_offsets += 1;
                     return Ok(None);
                 }
@@ -436,14 +471,23 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                             header,
                             base.bytes,
                             limits,
-                            report,
                             inflate_buf,
                             result_buf,
                         ) {
-                            report.skips.push(SkipRecord {
-                                offset,
-                                reason: SkipReason::Delta(err),
-                            });
+                            match err {
+                                DeltaDecodeError::Decode(err) => {
+                                    report.skips.push(SkipRecord {
+                                        offset,
+                                        reason: SkipReason::Decode(err),
+                                    });
+                                }
+                                DeltaDecodeError::Delta(err) => {
+                                    report.skips.push(SkipRecord {
+                                        offset,
+                                        reason: SkipReason::Delta(err),
+                                    });
+                                }
+                            }
                             report.stats.skipped_offsets += 1;
                             return Ok(None);
                         }
@@ -474,14 +518,23 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                                 header,
                                 &base.bytes,
                                 limits,
-                                report,
                                 inflate_buf,
                                 result_buf,
                             ) {
-                                report.skips.push(SkipRecord {
-                                    offset,
-                                    reason: SkipReason::Delta(err),
-                                });
+                                match err {
+                                    DeltaDecodeError::Decode(err) => {
+                                        report.skips.push(SkipRecord {
+                                            offset,
+                                            reason: SkipReason::Decode(err),
+                                        });
+                                    }
+                                    DeltaDecodeError::Delta(err) => {
+                                        report.skips.push(SkipRecord {
+                                            offset,
+                                            reason: SkipReason::Delta(err),
+                                        });
+                                    }
+                                }
                                 report.stats.skipped_offsets += 1;
                                 return Ok(None);
                             }
@@ -524,30 +577,24 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
 
 /// Inflates a delta payload and applies it to the provided base.
 ///
-/// Decode errors are tracked as skips in the report; delta application
-/// errors are returned to the caller as `DeltaError`.
+/// Decode errors are returned to the caller for skip tracking; delta
+/// application errors surface as `DeltaError`.
 #[allow(clippy::too_many_arguments)]
 fn decode_delta_entry(
     pack: &PackFile<'_>,
-    offset: u64,
+    _offset: u64,
     header: super::pack_inflate::EntryHeader,
     base_bytes: &[u8],
     limits: &PackDecodeLimits,
-    report: &mut PackExecReport,
     inflate_buf: &mut Vec<u8>,
     result_buf: &mut Vec<u8>,
-) -> Result<(), DeltaError> {
+) -> Result<(), DeltaDecodeError> {
     inflate_buf.clear();
     if inflate_buf.capacity() < limits.max_delta_bytes {
         inflate_buf.reserve(limits.max_delta_bytes - inflate_buf.capacity());
     }
     if let Err(err) = inflate_entry_payload(pack, &header, inflate_buf, limits) {
-        report.skips.push(SkipRecord {
-            offset,
-            reason: SkipReason::Decode(err),
-        });
-        report.stats.skipped_offsets += 1;
-        return Ok(());
+        return Err(DeltaDecodeError::Decode(err));
     }
 
     result_buf.clear();
@@ -561,9 +608,14 @@ fn decode_delta_entry(
         result_buf,
         header.size as usize,
         limits.max_object_bytes,
-    )?;
+    )
+    .map_err(DeltaDecodeError::Delta)
+}
 
-    Ok(())
+#[derive(Debug)]
+enum DeltaDecodeError {
+    Decode(PackDecodeError),
+    Delta(DeltaError),
 }
 
 /// Returns the best OID to query for external bases.
@@ -584,7 +636,7 @@ fn oid_or_base(base_oid: OidBytes, dep: Option<&DeltaDep>) -> OidBytes {
 mod tests {
     use super::*;
     use crate::git_scan::byte_arena::{ByteArena, ByteRef};
-    use crate::git_scan::pack_plan_model::{CandidateAtOffset, PackPlanStats};
+    use crate::git_scan::pack_plan_model::{CandidateAtOffset, DeltaKind, PackPlanStats};
     use crate::git_scan::tree_candidate::{CandidateContext, ChangeKind};
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
@@ -634,6 +686,14 @@ mod tests {
             ObjectKind::Blob => 3u8,
             ObjectKind::Tag => 4u8,
         };
+        encode_header_bytes(obj_type, size)
+    }
+
+    fn encode_delta_header(obj_type: u8, size: usize) -> Vec<u8> {
+        encode_header_bytes(obj_type, size)
+    }
+
+    fn encode_header_bytes(obj_type: u8, size: usize) -> Vec<u8> {
         let mut out = Vec::new();
         let mut remaining = size as u64;
         let mut first = ((obj_type & 0x07) << 4) | ((remaining & 0x0f) as u8);
@@ -651,6 +711,20 @@ mod tests {
             out.push(byte);
         }
         out
+    }
+
+    fn encode_ofs_distance(mut dist: u64) -> Vec<u8> {
+        assert!(dist > 0);
+        let mut bytes = Vec::new();
+        bytes.push((dist & 0x7f) as u8);
+        dist >>= 7;
+        while dist > 0 {
+            dist -= 1;
+            bytes.push(((dist & 0x7f) as u8) | 0x80);
+            dist >>= 7;
+        }
+        bytes.reverse();
+        bytes
     }
 
     fn compress(data: &[u8]) -> Vec<u8> {
@@ -915,5 +989,81 @@ mod tests {
             sink.emitted,
             vec![OidBytes::sha1([0x22; 20]), OidBytes::sha1([0x11; 20])]
         );
+    }
+
+    #[test]
+    fn delta_inflate_error_skips_without_emitting() {
+        let base_bytes = b"BASE";
+
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&2u32.to_be_bytes());
+
+        let base_offset = pack.len() as u64;
+        pack.extend_from_slice(&encode_entry_header(ObjectKind::Blob, base_bytes.len()));
+        pack.extend_from_slice(&compress(base_bytes));
+
+        let delta_offset = pack.len() as u64;
+        let mut delta_entry = encode_delta_header(6, 4);
+        delta_entry.extend_from_slice(&encode_ofs_distance(delta_offset - base_offset));
+        delta_entry.extend_from_slice(&[0x78]); // truncated zlib stream
+        pack.extend_from_slice(&delta_entry);
+        pack.extend_from_slice(&[0u8; 20]);
+
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"file.txt").unwrap();
+        let candidate = PackCandidate {
+            oid: OidBytes::sha1([0x44; 20]),
+            ctx: ctx(path_ref),
+            pack_id: 0,
+            offset: delta_offset,
+        };
+
+        let plan = PackPlan {
+            pack_id: 0,
+            oid_len: 20,
+            candidates: vec![candidate],
+            candidate_offsets: vec![CandidateAtOffset {
+                offset: delta_offset,
+                cand_idx: 0,
+            }],
+            need_offsets: vec![base_offset, delta_offset],
+            delta_deps: vec![DeltaDep {
+                offset: delta_offset,
+                kind: DeltaKind::Ofs,
+                base: BaseLoc::Offset(base_offset),
+            }],
+            exec_order: None,
+            clusters: Vec::new(),
+            stats: PackPlanStats {
+                candidate_count: 1,
+                need_count: 2,
+                external_bases: 0,
+                forward_deps: 0,
+                candidate_span: delta_offset - base_offset,
+            },
+        };
+
+        let mut cache = PackCache::new(64 * 1024);
+        let mut external = NoExternal;
+        let mut sink = TestSink::default();
+
+        let report = execute_pack_plan(
+            &plan,
+            &pack,
+            &arena,
+            &PackDecodeLimits::new(64, 1024, 1024),
+            &mut cache,
+            &mut external,
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(report.stats.emitted_candidates, 0);
+        assert!(report.skips.iter().any(|skip| {
+            matches!(skip.reason, SkipReason::Decode(PackDecodeError::Inflate(_)))
+        }));
+        assert!(cache.get(delta_offset).is_none());
     }
 }

@@ -17,7 +17,8 @@
 //! - Pack cache sizing must fit in `u32` (checked before execution).
 //!
 //! # Notes
-//! - Loose objects are currently treated as skipped candidates.
+//! - Loose objects are decoded via `PackIo::load_loose_object`; failures are
+//!   recorded as skipped candidates.
 //! - Persistence is optional; callers can run the pipeline without a store.
 
 use std::fs;
@@ -30,6 +31,7 @@ use memmap2::Mmap;
 
 use crate::Engine;
 
+use super::byte_arena::ByteArena;
 use super::commit_walk::{
     introduced_by_plan, CommitGraph, CommitGraphView, ParentScratch, PlannedCommit,
 };
@@ -44,9 +46,10 @@ use super::midx_error::MidxError;
 use super::object_id::{ObjectFormat, OidBytes};
 use super::object_store::ObjectStore;
 use super::pack_cache::PackCache;
-use super::pack_candidates::CappedPackCandidateSink;
+use super::pack_candidates::{CappedPackCandidateSink, LooseCandidate};
 use super::pack_decode::PackDecodeLimits;
 use super::pack_exec::{execute_pack_plan, PackExecError, PackExecReport, SkipReason, SkipRecord};
+use super::pack_inflate::ObjectKind;
 use super::pack_io::{PackIo, PackIoError, PackIoLimits};
 use super::pack_plan::{build_pack_plans, PackPlanConfig, PackPlanError, PackView};
 use super::pack_plan_model::{PackPlan, PackPlanStats};
@@ -215,8 +218,12 @@ pub enum GitScanResult {
 /// Reason a candidate blob was skipped during the run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CandidateSkipReason {
-    /// Candidate was loose and the pipeline does not yet scan loose objects.
-    LooseUnscanned,
+    /// Loose object was missing on disk.
+    LooseMissing,
+    /// Loose object failed to decode.
+    LooseDecode,
+    /// Loose object was not a blob.
+    LooseNotBlob,
     /// Pack entry was not a blob.
     PackNotBlob,
     /// Pack entry failed to decode.
@@ -408,9 +415,12 @@ impl From<io::Error> for GitScanError {
 /// Preflight pack-count recommendations are advisory only; the scan proceeds
 /// as long as required artifacts are present.
 ///
+/// # Errors
+/// Pack mmap limits and cache sizing may surface as `GitScanError::ResourceLimit`.
+///
 /// # Caveats
-/// - Loose objects are currently treated as skipped candidates. This yields
-///   a `FinalizeOutcome::Partial` and suppresses watermark writes.
+/// - Loose object decode failures are recorded as skipped candidates and may
+///   yield a `FinalizeOutcome::Partial`, suppressing watermark writes.
 #[allow(clippy::too_many_arguments)]
 pub fn run_git_scan(
     repo_root: &Path,
@@ -540,6 +550,7 @@ pub fn run_git_scan(
     let pack_names = list_pack_files(&pack_dirs)?;
     midx.verify_completeness(pack_names.iter().map(|n| n.as_slice()))?;
     let pack_paths = resolve_pack_paths(&midx, &pack_dirs)?;
+    // Enforce pack mmap limits before decoding to cap address space usage.
     let pack_mmaps = mmap_pack_files(&pack_paths, config.pack_mmap)?;
     let pack_views = build_pack_views(&pack_mmaps, repo.object_format)?;
 
@@ -564,16 +575,9 @@ pub fn run_git_scan(
     let mut cache = PackCache::new(pack_cache_bytes);
     let mut external = PackIo::open(&repo, config.pack_io)?;
     let mut adapter = EngineAdapter::new(engine, config.engine_adapter);
+    adapter.reserve_results(sink.packed.len().saturating_add(sink.loose.len()));
     let mut pack_exec_reports = Vec::with_capacity(plans.len());
     let mut skipped_candidates = Vec::new();
-
-    // Record loose candidates as skipped (not yet decoded).
-    for cand in &sink.loose {
-        skipped_candidates.push(SkippedCandidate {
-            oid: cand.oid,
-            reason: CandidateSkipReason::LooseUnscanned,
-        });
-    }
 
     for plan in &plans {
         let pack_id = plan.pack_id as usize;
@@ -598,7 +602,17 @@ pub fn run_git_scan(
         pack_exec_reports.push(report);
     }
 
-    let scanned_blobs = adapter.take_results();
+    if !sink.loose.is_empty() {
+        scan_loose_candidates(
+            &sink.loose,
+            &mapping_arena,
+            &mut adapter,
+            &mut external,
+            &mut skipped_candidates,
+        )?;
+    }
+
+    let scanned = adapter.take_results();
     let path_arena = adapter.path_arena();
 
     // Finalize ops.
@@ -610,7 +624,8 @@ pub fn run_git_scan(
         policy_hash: config.policy_hash,
         start_set_id,
         refs,
-        scanned_blobs,
+        scanned_blobs: scanned.blobs,
+        finding_arena: &scanned.finding_arena,
         skipped_candidate_oids,
         path_arena,
     });
@@ -816,6 +831,47 @@ fn build_pack_views<'a>(
     Ok(views)
 }
 
+/// Loads loose candidates and scans blob payloads.
+///
+/// Missing or undecodable loose objects are recorded as skips so the run can
+/// complete with partial results.
+fn scan_loose_candidates(
+    candidates: &[LooseCandidate],
+    paths: &ByteArena,
+    adapter: &mut EngineAdapter,
+    pack_io: &mut PackIo<'_>,
+    skipped: &mut Vec<SkippedCandidate>,
+) -> Result<(), GitScanError> {
+    for candidate in candidates {
+        let path = paths.get(candidate.ctx.path_ref);
+        match pack_io.load_loose_object(&candidate.oid) {
+            Ok(Some((ObjectKind::Blob, bytes))) => {
+                adapter.emit_loose(candidate, path, &bytes)?;
+            }
+            Ok(Some((_kind, _bytes))) => {
+                skipped.push(SkippedCandidate {
+                    oid: candidate.oid,
+                    reason: CandidateSkipReason::LooseNotBlob,
+                });
+            }
+            Ok(None) => {
+                skipped.push(SkippedCandidate {
+                    oid: candidate.oid,
+                    reason: CandidateSkipReason::LooseMissing,
+                });
+            }
+            Err(PackIoError::LooseObject { .. }) => {
+                skipped.push(SkippedCandidate {
+                    oid: candidate.oid,
+                    reason: CandidateSkipReason::LooseDecode,
+                });
+            }
+            Err(err) => return Err(GitScanError::PackIo(err)),
+        }
+    }
+    Ok(())
+}
+
 /// Collect candidates that were skipped during pack execution.
 ///
 /// The skip records are offsets into the pack stream; we map them back to
@@ -852,4 +908,265 @@ fn is_pack_file(name: &std::ffi::OsStr) -> bool {
 
 fn is_file(path: &Path) -> bool {
     fs::metadata(path).map(|m| m.is_file()).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        demo_tuning, AnchorPolicy, Engine, Gate, RuleSpec, TransformConfig, TransformId,
+        TransformMode, ValidatorKind,
+    };
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use regex::bytes::Regex;
+    use std::io::Write;
+    use tempfile::tempdir;
+
+    /// Helper for constructing a minimal SHA-1 MIDX buffer.
+    ///
+    /// Only the chunks needed by `MidxView` lookups are populated.
+    #[derive(Default)]
+    struct MidxBuilder {
+        pack_names: Vec<Vec<u8>>,
+        objects: Vec<([u8; 20], u16, u64)>,
+    }
+
+    impl MidxBuilder {
+        fn add_pack(&mut self, name: &[u8]) {
+            self.pack_names.push(name.to_vec());
+        }
+
+        fn build(&self) -> Vec<u8> {
+            const MIDX_MAGIC: [u8; 4] = *b"MIDX";
+            const VERSION: u8 = 1;
+            const HEADER_SIZE: usize = 12;
+            const CHUNK_ENTRY_SIZE: usize = 12;
+            const CHUNK_PNAM: [u8; 4] = *b"PNAM";
+            const CHUNK_OIDF: [u8; 4] = *b"OIDF";
+            const CHUNK_OIDL: [u8; 4] = *b"OIDL";
+            const CHUNK_OOFF: [u8; 4] = *b"OOFF";
+
+            let mut objects = self.objects.clone();
+            objects.sort_by(|a, b| a.0.cmp(&b.0));
+
+            let pack_count = self.pack_names.len() as u32;
+
+            let mut pnam = Vec::new();
+            for name in &self.pack_names {
+                pnam.extend_from_slice(name);
+                pnam.push(0);
+            }
+
+            let mut oidf = vec![0u8; 256 * 4];
+            let mut counts = [0u32; 256];
+            for (oid, _, _) in &objects {
+                counts[oid[0] as usize] += 1;
+            }
+            let mut running = 0u32;
+            for (i, count) in counts.iter().enumerate() {
+                running += count;
+                let off = i * 4;
+                oidf[off..off + 4].copy_from_slice(&running.to_be_bytes());
+            }
+
+            let mut oidl = Vec::with_capacity(objects.len() * 20);
+            for (oid, _, _) in &objects {
+                oidl.extend_from_slice(oid);
+            }
+
+            let mut ooff = Vec::with_capacity(objects.len() * 8);
+            for (_, pack_id, offset) in &objects {
+                ooff.extend_from_slice(&(*pack_id as u32).to_be_bytes());
+                ooff.extend_from_slice(&(*offset as u32).to_be_bytes());
+            }
+
+            let chunk_count = 4u8;
+            let chunk_table_size = (chunk_count as usize + 1) * CHUNK_ENTRY_SIZE;
+            let pnam_off = (HEADER_SIZE + chunk_table_size) as u64;
+            let oidf_off = pnam_off + pnam.len() as u64;
+            let oidl_off = oidf_off + oidf.len() as u64;
+            let ooff_off = oidl_off + oidl.len() as u64;
+            let end_off = ooff_off + ooff.len() as u64;
+
+            let mut out = Vec::new();
+            out.extend_from_slice(&MIDX_MAGIC);
+            out.push(VERSION);
+            out.push(1); // SHA-1
+            out.push(chunk_count);
+            out.push(0); // base count
+            out.extend_from_slice(&pack_count.to_be_bytes());
+
+            let mut push_chunk = |id: [u8; 4], off: u64| {
+                out.extend_from_slice(&id);
+                out.extend_from_slice(&off.to_be_bytes());
+            };
+
+            push_chunk(CHUNK_PNAM, pnam_off);
+            push_chunk(CHUNK_OIDF, oidf_off);
+            push_chunk(CHUNK_OIDL, oidl_off);
+            push_chunk(CHUNK_OOFF, ooff_off);
+            push_chunk([0, 0, 0, 0], end_off);
+
+            out.extend_from_slice(&pnam);
+            out.extend_from_slice(&oidf);
+            out.extend_from_slice(&oidl);
+            out.extend_from_slice(&ooff);
+
+            out
+        }
+    }
+
+    fn test_engine() -> Engine {
+        let rule = RuleSpec {
+            name: "tok",
+            anchors: &[b"TOK_"],
+            radius: 16,
+            validator: ValidatorKind::None,
+            two_phase: None,
+            must_contain: None,
+            keywords_any: None,
+            entropy: None,
+            secret_group: Some(1),
+            re: Regex::new(r"TOK_([A-Z0-9]{8})").unwrap(),
+        };
+
+        let transforms = vec![TransformConfig {
+            id: TransformId::Base64,
+            mode: TransformMode::Always,
+            gate: Gate::AnchorsInDecoded,
+            min_len: 16,
+            max_spans_per_buffer: 4,
+            max_encoded_len: 1024,
+            max_decoded_bytes: 1024,
+            plus_to_space: false,
+            base64_allow_space_ws: false,
+        }];
+
+        Engine::new_with_anchor_policy(
+            vec![rule],
+            transforms,
+            demo_tuning(),
+            AnchorPolicy::ManualOnly,
+        )
+    }
+
+    fn compress(data: &[u8]) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn oid_to_hex(oid: &OidBytes) -> String {
+        let mut out = String::with_capacity(oid.len() as usize * 2);
+        for &b in oid.as_slice() {
+            out.push_str(&format!("{:02x}", b));
+        }
+        out
+    }
+
+    fn write_loose_blob(objects_dir: &Path, oid: OidBytes, payload: &[u8]) {
+        let mut header = Vec::new();
+        header.extend_from_slice(b"blob ");
+        header.extend_from_slice(payload.len().to_string().as_bytes());
+        header.push(0);
+        header.extend_from_slice(payload);
+
+        let compressed = compress(&header);
+        let hex = oid_to_hex(&oid);
+        let (dir, file) = hex.split_at(2);
+        let dir_path = objects_dir.join(dir);
+        fs::create_dir_all(&dir_path).unwrap();
+        fs::write(dir_path.join(file), &compressed).unwrap();
+    }
+
+    fn build_pack_io(objects_dir: &Path) -> PackIo<'_> {
+        let mut builder = MidxBuilder::default();
+        builder.add_pack(b"pack-test");
+        let midx_bytes = builder.build();
+        let midx = MidxView::parse(&midx_bytes, ObjectFormat::Sha1).unwrap();
+
+        let pack_paths = vec![objects_dir.join("pack-test.pack")];
+        let limits = PackIoLimits::new(PackDecodeLimits::new(64, 1024 * 1024, 1024 * 1024), 2);
+        PackIo::from_parts(midx, pack_paths, vec![objects_dir.to_path_buf()], limits).unwrap()
+    }
+
+    fn loose_candidate(path_ref: ByteRef, oid: OidBytes) -> LooseCandidate {
+        LooseCandidate {
+            oid,
+            ctx: CandidateContext {
+                commit_id: 1,
+                parent_idx: 0,
+                change_kind: super::tree_candidate::ChangeKind::Add,
+                ctx_flags: 0,
+                cand_flags: 0,
+                path_ref,
+            },
+        }
+    }
+
+    #[test]
+    fn loose_blob_with_secret_is_scanned() {
+        let engine = test_engine();
+        let temp = tempdir().unwrap();
+        let objects_dir = temp.path().join("objects");
+
+        let oid = OidBytes::sha1([0xAB; 20]);
+        write_loose_blob(&objects_dir, oid, b"hello TOK_ABCDEFGH");
+
+        let mut pack_io = build_pack_io(&objects_dir);
+        let mut adapter = EngineAdapter::new(&engine, EngineAdapterConfig::default());
+        adapter.reserve_results(1);
+        adapter.reserve_findings(4);
+        adapter.reserve_findings_buf(4);
+
+        let mut paths = ByteArena::with_capacity(64);
+        let path_ref = paths.intern(b"src/lib.rs").unwrap();
+        let candidate = loose_candidate(path_ref, oid);
+        let mut skipped = Vec::new();
+
+        scan_loose_candidates(
+            &[candidate],
+            &paths,
+            &mut adapter,
+            &mut pack_io,
+            &mut skipped,
+        )
+        .unwrap();
+
+        assert!(skipped.is_empty());
+        let scanned = adapter.take_results();
+        assert_eq!(scanned.blobs.len(), 1);
+        assert!(!scanned.finding_arena.is_empty());
+    }
+
+    #[test]
+    fn missing_loose_object_is_skipped() {
+        let engine = test_engine();
+        let temp = tempdir().unwrap();
+        let objects_dir = temp.path().join("objects");
+
+        let oid = OidBytes::sha1([0xCD; 20]);
+        let mut pack_io = build_pack_io(&objects_dir);
+        let mut adapter = EngineAdapter::new(&engine, EngineAdapterConfig::default());
+        let mut paths = ByteArena::with_capacity(64);
+        let path_ref = paths.intern(b"src/lib.rs").unwrap();
+        let candidate = loose_candidate(path_ref, oid);
+        let mut skipped = Vec::new();
+
+        scan_loose_candidates(
+            &[candidate],
+            &paths,
+            &mut adapter,
+            &mut pack_io,
+            &mut skipped,
+        )
+        .unwrap();
+
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].oid, oid);
+        assert_eq!(skipped[0].reason, CandidateSkipReason::LooseMissing);
+        let scanned = adapter.take_results();
+        assert!(scanned.blobs.is_empty());
+    }
 }

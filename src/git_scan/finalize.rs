@@ -25,7 +25,7 @@
 use std::cmp::Ordering;
 
 use super::byte_arena::ByteArena;
-use super::engine_adapter::{FindingKey, ScannedBlob};
+use super::engine_adapter::{FindingKey, FindingSpan, ScannedBlob};
 use super::object_id::OidBytes;
 use super::start_set::StartSetId;
 use super::tree_candidate::CandidateContext;
@@ -57,7 +57,8 @@ pub struct RefEntry {
 ///
 /// The builder takes ownership of the collections so it can sort them
 /// deterministically. The `path_arena` must contain all `path_ref` entries
-/// referenced by `scanned_blobs`. Multiple contexts for the same blob OID are
+/// referenced by `scanned_blobs`, and `finding_arena` must contain all
+/// `ScannedBlob.findings` spans. Multiple contexts for the same blob OID are
 /// allowed; the builder selects a single canonical context per OID.
 pub struct FinalizeInput<'a> {
     /// Repository identifier.
@@ -71,6 +72,8 @@ pub struct FinalizeInput<'a> {
     /// Scanned blobs with their contexts and findings.
     /// Will be sorted by OID.
     pub scanned_blobs: Vec<ScannedBlob>,
+    /// Shared findings arena referenced by `scanned_blobs`.
+    pub finding_arena: &'a [FindingKey],
     /// OIDs that were skipped during decode (budget exceeded, corrupt, etc.).
     /// If non-empty, watermarks will NOT be advanced.
     pub skipped_candidate_oids: Vec<OidBytes>,
@@ -151,6 +154,13 @@ pub struct NamespaceCounts {
     pub finding: u64,
     pub seen_blob: u64,
     pub ref_watermark: u64,
+}
+
+fn finding_slice<'a>(span: FindingSpan, arena: &'a [FindingKey]) -> &'a [FindingKey] {
+    let start = span.start as usize;
+    let end = start.saturating_add(span.len as usize);
+    debug_assert!(end <= arena.len(), "finding span out of bounds");
+    &arena[start..end]
 }
 
 // =============================================================================
@@ -400,7 +410,8 @@ pub fn build_finalize_ops(mut input: FinalizeInput<'_>) -> FinalizeOutput {
         // --- 2. findings (namespace "fn\0") ---
         blob_findings.clear();
         for blob in &blobs[i..j] {
-            blob_findings.extend_from_slice(&blob.findings);
+            let findings = finding_slice(blob.findings, input.finding_arena);
+            blob_findings.extend_from_slice(findings);
         }
         let pre_dedup = blob_findings.len();
         blob_findings.sort_unstable();
@@ -533,8 +544,22 @@ mod tests {
         }
     }
 
-    fn basic_input<'a>(arena: &'a mut ByteArena) -> FinalizeInput<'a> {
+    fn push_findings(arena: &mut Vec<FindingKey>, findings: &[FindingKey]) -> FindingSpan {
+        let start = arena.len();
+        arena.extend_from_slice(findings);
+        FindingSpan {
+            start: start as u32,
+            len: findings.len() as u32,
+        }
+    }
+
+    fn basic_input<'a>(
+        arena: &'a mut ByteArena,
+        finding_arena: &'a mut Vec<FindingKey>,
+    ) -> FinalizeInput<'a> {
         let path_ref = arena.intern(b"src/main.rs").unwrap();
+        let span_a = push_findings(finding_arena, &[finding(0, 15, 1)]);
+        let span_b = push_findings(finding_arena, &[]);
         FinalizeInput {
             repo_id: 42,
             policy_hash: [0xBB; 32],
@@ -547,14 +572,15 @@ mod tests {
                 ScannedBlob {
                     oid: test_oid(0x10),
                     ctx: ctx(1, path_ref),
-                    findings: vec![finding(0, 15, 1)],
+                    findings: span_a,
                 },
                 ScannedBlob {
                     oid: test_oid(0x20),
                     ctx: ctx(2, path_ref),
-                    findings: vec![],
+                    findings: span_b,
                 },
             ],
+            finding_arena: &*finding_arena,
             skipped_candidate_oids: vec![],
             path_arena: &*arena,
         }
@@ -563,7 +589,8 @@ mod tests {
     #[test]
     fn complete_run_produces_all_ops() {
         let mut arena = ByteArena::with_capacity(1024);
-        let out = build_finalize_ops(basic_input(&mut arena));
+        let mut finding_arena = Vec::new();
+        let out = build_finalize_ops(basic_input(&mut arena, &mut finding_arena));
 
         assert_eq!(out.outcome, FinalizeOutcome::Complete);
         assert!(!out.watermark_ops.is_empty());
@@ -578,7 +605,8 @@ mod tests {
     #[test]
     fn partial_run_suppresses_watermarks() {
         let mut arena = ByteArena::with_capacity(1024);
-        let mut input = basic_input(&mut arena);
+        let mut finding_arena = Vec::new();
+        let mut input = basic_input(&mut arena, &mut finding_arena);
         input.skipped_candidate_oids.push(test_oid(0xFF));
 
         let out = build_finalize_ops(input);
@@ -590,7 +618,8 @@ mod tests {
     #[test]
     fn data_ops_are_globally_sorted() {
         let mut arena = ByteArena::with_capacity(1024);
-        let out = build_finalize_ops(basic_input(&mut arena));
+        let mut finding_arena = Vec::new();
+        let out = build_finalize_ops(basic_input(&mut arena, &mut finding_arena));
         for pair in out.data_ops.windows(2) {
             assert!(pair[0].key <= pair[1].key);
         }
@@ -599,7 +628,9 @@ mod tests {
     #[test]
     fn canonical_context_selects_minimum() {
         let mut arena = ByteArena::with_capacity(1024);
+        let mut finding_arena = Vec::new();
         let path_ref = arena.intern(b"src/main.rs").unwrap();
+        let span = push_findings(&mut finding_arena, &[]);
         let input = FinalizeInput {
             repo_id: 1,
             policy_hash: [0; 32],
@@ -609,14 +640,15 @@ mod tests {
                 ScannedBlob {
                     oid: test_oid(0xAA),
                     ctx: ctx(10, path_ref),
-                    findings: vec![],
+                    findings: span,
                 },
                 ScannedBlob {
                     oid: test_oid(0xAA),
                     ctx: ctx(5, path_ref),
-                    findings: vec![],
+                    findings: span,
                 },
             ],
+            finding_arena: &finding_arena,
             skipped_candidate_oids: vec![],
             path_arena: &arena,
         };
@@ -636,8 +668,10 @@ mod tests {
     #[test]
     fn canonical_context_tiebreak_by_path() {
         let mut arena = ByteArena::with_capacity(1024);
+        let mut finding_arena = Vec::new();
         let path_ref_a = arena.intern(b"z/file.rs").unwrap();
         let path_ref_b = arena.intern(b"a/file.rs").unwrap();
+        let span = push_findings(&mut finding_arena, &[]);
         let input = FinalizeInput {
             repo_id: 1,
             policy_hash: [0; 32],
@@ -647,14 +681,15 @@ mod tests {
                 ScannedBlob {
                     oid: test_oid(0xBB),
                     ctx: ctx(1, path_ref_a),
-                    findings: vec![],
+                    findings: span,
                 },
                 ScannedBlob {
                     oid: test_oid(0xBB),
                     ctx: ctx(1, path_ref_b),
-                    findings: vec![],
+                    findings: span,
                 },
             ],
+            finding_arena: &finding_arena,
             skipped_candidate_oids: vec![],
             path_arena: &arena,
         };
@@ -674,9 +709,12 @@ mod tests {
     #[test]
     fn findings_deduped_across_paths() {
         let mut arena = ByteArena::with_capacity(1024);
+        let mut finding_arena = Vec::new();
         let path_ref_a = arena.intern(b"a/file.rs").unwrap();
         let path_ref_b = arena.intern(b"b/file.rs").unwrap();
         let f = finding(0, 15, 1);
+        let span_a = push_findings(&mut finding_arena, &[f]);
+        let span_b = push_findings(&mut finding_arena, &[f]);
         let input = FinalizeInput {
             repo_id: 1,
             policy_hash: [0; 32],
@@ -686,14 +724,15 @@ mod tests {
                 ScannedBlob {
                     oid: test_oid(0xCC),
                     ctx: ctx(1, path_ref_a),
-                    findings: vec![f],
+                    findings: span_a,
                 },
                 ScannedBlob {
                     oid: test_oid(0xCC),
                     ctx: ctx(2, path_ref_b),
-                    findings: vec![f],
+                    findings: span_b,
                 },
             ],
+            finding_arena: &finding_arena,
             skipped_candidate_oids: vec![],
             path_arena: &arena,
         };
@@ -706,7 +745,16 @@ mod tests {
     #[test]
     fn distinct_findings_preserved() {
         let mut arena = ByteArena::with_capacity(1024);
+        let mut finding_arena = Vec::new();
         let path_ref = arena.intern(b"a/file.rs").unwrap();
+        let span = push_findings(
+            &mut finding_arena,
+            &[
+                finding(0, 15, 1),
+                finding(20, 30, 2),
+                finding_with_hash(0, 15, 1, 0xBB),
+            ],
+        );
         let input = FinalizeInput {
             repo_id: 1,
             policy_hash: [0; 32],
@@ -715,12 +763,9 @@ mod tests {
             scanned_blobs: vec![ScannedBlob {
                 oid: test_oid(0xDD),
                 ctx: ctx(1, path_ref),
-                findings: vec![
-                    finding(0, 15, 1),
-                    finding(20, 30, 2),
-                    finding_with_hash(0, 15, 1, 0xBB),
-                ],
+                findings: span,
             }],
+            finding_arena: &finding_arena,
             skipped_candidate_oids: vec![],
             path_arena: &arena,
         };
@@ -733,6 +778,7 @@ mod tests {
     #[test]
     fn watermark_ops_sorted_by_ref_name() {
         let arena = ByteArena::with_capacity(1024);
+        let finding_arena = Vec::new();
         let input = FinalizeInput {
             repo_id: 1,
             policy_hash: [0; 32],
@@ -752,6 +798,7 @@ mod tests {
                 },
             ],
             scanned_blobs: vec![],
+            finding_arena: &finding_arena,
             skipped_candidate_oids: vec![],
             path_arena: &arena,
         };
@@ -766,6 +813,7 @@ mod tests {
     #[test]
     fn watermark_value_encodes_oid() {
         let arena = ByteArena::with_capacity(1024);
+        let finding_arena = Vec::new();
         let tip = test_oid(0xAB);
         let input = FinalizeInput {
             repo_id: 1,
@@ -776,6 +824,7 @@ mod tests {
                 tip_oid: tip,
             }],
             scanned_blobs: vec![],
+            finding_arena: &finding_arena,
             skipped_candidate_oids: vec![],
             path_arena: &arena,
         };

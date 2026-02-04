@@ -39,11 +39,15 @@ flowchart LR
 ## Determinism and Safety Invariants
 
 - Preflight and repo open read metadata only; no blob payloads are read before pack decoding.
+- Preflight/repo open detect maintenance lock files and capture artifact fingerprints; runner revalidates before pack exec.
+- Preflight reports pack-count maintenance recommendations separately; pack count does not block scans.
+- Pack execution mmaps are bounded by explicit pack count and total byte limits.
 - Candidate ordering is deterministic and stable across spill boundaries.
 - Findings are deduped per blob and stored as `(start, end, rule_id, norm_hash)`.
 - No raw secret bytes are persisted; only hashes and metadata are stored.
 - Persistence is two-phase: write data ops first and write watermarks only for complete runs.
 - Any decode skips or loose-object fallbacks result in `FinalizeOutcome::Partial`.
+- Skipped candidates are reported with explicit reasons; pack exec reports contain detailed decode errors.
 
 ## Persistence Contract
 
@@ -59,3 +63,4 @@ are skipped to avoid advancing ref tips past unscanned blobs.
 
 - `docs/architecture-overview.md`
 - `docs/detection-engine.md`
+- `docs/git-scan-pack-exec-merge-fast-path.md`
