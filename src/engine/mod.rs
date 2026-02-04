@@ -74,7 +74,7 @@ mod tests;
 
 // Public re-exports
 pub use core::Engine;
-pub use scratch::ScanScratch;
+pub use scratch::{NormHash, ScanScratch};
 
 #[cfg(feature = "stats")]
 pub use core::{AnchorPlanStats, VectorscanStats};

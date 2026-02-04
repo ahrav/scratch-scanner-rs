@@ -322,16 +322,16 @@ impl YieldPolicy for AlwaysYield {
 // AdaptiveYield - Variable Interval Based on Phase
 // ============================================================================
 
-/// Adaptive yield policy with different intervals per phase.
+/// Adaptive yield policy with different intervals per work type.
 ///
-/// Use when different phases of a task have different work unit costs.
+/// Use when different parts of a task have different work unit costs.
 /// For example, Git commit walking is cheap but blob inflation is expensive.
 ///
-/// # Phase Semantics
+/// # Work-Unit Semantics
 ///
-/// Different phases typically count DIFFERENT types of work units:
-/// - Phase 0 might count commits (cheap operations)
-/// - Phase 1 might count KB inflated (expensive operations)
+/// Different work types typically count DIFFERENT units:
+/// - Commit-walk intervals might count commits (cheap operations)
+/// - Inflate intervals might count KB inflated (expensive operations)
 ///
 /// When switching phases via `set_phase()`, the counter resets because
 /// you're now counting a different type of work. This is intentional.
@@ -343,13 +343,13 @@ impl YieldPolicy for AlwaysYield {
 ///     .with_phase(0, 256)   // Yield every 256 commits
 ///     .with_phase(1, 64);   // Yield every 64 KB inflated
 ///
-/// // During commit walk (phase 0)
+/// // During commit walk (interval slot 0)
 /// policy.set_phase(0);
 /// for commit in commits {
 ///     if policy.should_yield(1) { ... }
 /// }
 ///
-/// // During blob inflation (phase 1) - counter resets
+/// // During blob inflation (interval slot 1) - counter resets
 /// policy.set_phase(1);
 /// for chunk in chunks {
 ///     if policy.should_yield(chunk.len_kb()) { ... }
@@ -492,7 +492,7 @@ impl Default for AdaptiveYield {
 // GitYieldPolicy - Specialized for Git Operations
 // ============================================================================
 
-/// Git-specific phase identifiers.
+/// Git-specific operation identifiers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
 pub enum GitPhase {
@@ -530,7 +530,7 @@ impl GitPhase {
 ///
 /// # Default Intervals
 ///
-/// | Phase | Interval | Rationale |
+/// | Operation | Interval | Rationale |
 /// |-------|----------|-----------|
 /// | CommitWalk | 128 | Commits are cheap to enumerate |
 /// | CandidateEmit | 64 | Moderate cost per candidate |
@@ -790,14 +790,14 @@ mod tests {
     fn adaptive_phases() {
         let mut policy = AdaptiveYield::new(100).with_phase(0, 10).with_phase(1, 5);
 
-        // Phase 0: interval 10
+        // Slot 0: interval 10
         policy.set_phase(0);
         for _ in 0..9 {
             assert!(!policy.should_yield(1));
         }
         assert!(policy.should_yield(1)); // 10th
 
-        // Phase 1: interval 5
+        // Slot 1: interval 5
         policy.set_phase(1);
         assert_eq!(policy.counter(), 0); // Reset on phase change
         for _ in 0..4 {

@@ -230,6 +230,8 @@ impl Engine {
                     // to avoid collapsing distinct matches.
                     let include_span = step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
 
+                    let secret_bytes = &window[secret_start..secret_end];
+                    let norm_hash = *blake3::hash(secret_bytes).as_bytes();
                     scratch.push_finding_with_drop_hint(
                         FindingRec {
                             file_id,
@@ -241,6 +243,7 @@ impl Engine {
                             dedupe_with_span: include_span,
                             step_id,
                         },
+                        norm_hash,
                         drop_hint_end,
                         include_span,
                     );
@@ -294,6 +297,8 @@ impl Engine {
         file_id: FileId,
         scratch: &mut ScanScratch,
     ) {
+        // Caller is responsible for UTF-16 alignment; `decode_range.start`
+        // should be on a code-unit boundary (parity handled upstream).
         // Decode this window as UTF-16 and run the same validators on UTF-8 output.
         let remaining = self
             .tuning
@@ -435,6 +440,8 @@ impl Engine {
             // Preserve decoded spans in the dedupe key when root-span mapping
             // is unavailable for nested transforms.
             let include_span = utf16_step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
+            let secret_bytes = &decoded[secret_start..secret_end];
+            let norm_hash = *blake3::hash(secret_bytes).as_bytes();
             scratch.push_finding_with_drop_hint(
                 FindingRec {
                     file_id,
@@ -446,6 +453,7 @@ impl Engine {
                     dedupe_with_span: include_span,
                     step_id: utf16_step_id,
                 },
+                norm_hash,
                 drop_hint_end,
                 include_span,
             );
@@ -571,6 +579,8 @@ impl Engine {
                 // alignment, so dedupe uses only the root hint window.
                 let dedupe_with_span = step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
 
+                let secret_bytes = &window[secret_start..secret_end];
+                let norm_hash = *blake3::hash(secret_bytes).as_bytes();
                 out.push(FindingRec {
                     file_id,
                     rule_id,
@@ -582,6 +592,7 @@ impl Engine {
                     step_id,
                 });
                 scratch.tmp_drop_hint_end.push(drop_hint_end);
+                scratch.tmp_norm_hash.push(norm_hash);
             } else {
                 *dropped = dropped.saturating_add(1);
             }
@@ -763,6 +774,8 @@ impl Engine {
                 // is unavailable. See run_rule_on_raw_window_into for full rationale.
                 let dedupe_with_span =
                     utf16_step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
+                let secret_bytes = &decoded[secret_start..secret_end];
+                let norm_hash = *blake3::hash(secret_bytes).as_bytes();
                 out.push(FindingRec {
                     file_id,
                     rule_id,
@@ -774,6 +787,7 @@ impl Engine {
                     step_id: utf16_step_id,
                 });
                 scratch.tmp_drop_hint_end.push(drop_hint_end);
+                scratch.tmp_norm_hash.push(norm_hash);
             } else {
                 *dropped = dropped.saturating_add(1);
             }

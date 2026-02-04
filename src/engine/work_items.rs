@@ -7,6 +7,10 @@
 //!
 //! `PendingWindow` ordering is intentionally reversed so a max-heap behaves as
 //! a min-heap keyed by earliest window end.
+//!
+//! # Lifetime model
+//! - `Slab` ranges are only valid until the decode slab is reset/truncated.
+//! - Root ranges are tied to the current input buffer.
 
 use crate::api::{StepId, STEP_ROOT};
 use std::ops::Range;
@@ -21,6 +25,7 @@ use super::transform::{Base64SpanStream, UrlSpanStream};
 ///
 /// # Invariants
 /// - `Slab` ranges must stay within the decode slab for the current scan.
+/// - Ranges are half-open `[lo, hi)` in slab address space.
 #[derive(Default, Clone)]
 pub(super) enum BufRef {
     #[default]
@@ -34,6 +39,7 @@ pub(super) enum BufRef {
 ///
 /// # Invariants
 /// - Ranges are validated against the source buffer before decoding.
+/// - Ranges are half-open `[lo, hi)` in the source buffer.
 #[derive(Clone)]
 pub(super) enum EncRef {
     Root(Range<usize>),
@@ -127,6 +133,7 @@ pub(super) struct SpanStreamEntry {
 /// # Invariants
 /// - `depth` is bounded by the configured transform depth limit.
 /// - `root_hint` is `None` for the root buffer and `Some` for derived buffers.
+/// - `enc_ref` is only populated when the scan originates from a decoded span.
 pub(super) enum WorkItem {
     ScanBuf {
         buf: BufRef,
