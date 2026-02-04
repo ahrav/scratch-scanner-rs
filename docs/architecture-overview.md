@@ -104,6 +104,8 @@ graph TB
 - Nested archive expansion is streaming-only and bounded by `ArchiveConfig::max_archive_depth`.
 - Policy enforcement is deterministic: `FailArchive` stops the current container, `FailRun` aborts the scan.
 - Archive entries use virtual `FileId` values (high-bit namespace) to isolate per-file engine state.
+- Hardening expectations and review findings are tracked in
+  `docs/archive-hardening-checklist.md` and `docs/archive-review-checklist.md`.
 
 ## Testing Harnesses
 

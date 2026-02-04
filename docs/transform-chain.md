@@ -126,6 +126,8 @@ When archive scanning is enabled, entry payload bytes flow through the same
 transform chain and decoding budgets as regular files. Archive entry paths are
 canonicalized separately in the archive subsystem and do not affect transform
 logic or decode limits.
+See `docs/archive-scanning-plan.md` and `docs/archive-hardening-checklist.md`
+for archive-specific invariants and budget guardrails.
 
 | Limit | Default | Purpose |
 |-------|---------|---------|
