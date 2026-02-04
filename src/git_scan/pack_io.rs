@@ -429,24 +429,21 @@ impl ExternalBaseProvider for PackIo<'_> {
     }
 }
 
+/// Inflate and apply a delta entry, enforcing decode and output limits.
+///
+/// The delta payload is bounded by `limits.max_delta_bytes`; the final object
+/// is capped at `limits.max_object_bytes`.
 fn apply_delta_entry(
     pack: &PackFile<'_>,
     header: &super::pack_inflate::EntryHeader,
     base_bytes: &[u8],
     limits: &PackDecodeLimits,
 ) -> Result<Vec<u8>, PackIoError> {
-    // Inflate the delta payload with a hard cap, then apply it to the base.
     let mut delta = Vec::with_capacity(limits.max_delta_bytes);
     inflate_entry_payload(pack, header, &mut delta, limits)?;
 
-    let mut out = Vec::with_capacity(header.size as usize);
-    apply_delta(
-        base_bytes,
-        &delta,
-        &mut out,
-        header.size as usize,
-        limits.max_object_bytes,
-    )?;
+    let mut out = Vec::new();
+    apply_delta(base_bytes, &delta, &mut out, limits.max_object_bytes)?;
 
     Ok(out)
 }

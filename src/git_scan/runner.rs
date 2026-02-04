@@ -725,7 +725,7 @@ pub fn run_git_scan(
     };
 
     let mut spiller = Spiller::new(config.spill, repo.object_format.oid_len(), &spill_dir)?;
-    let mut object_store = ObjectStore::open(&repo, &config.tree_diff)?;
+    let mut object_store = ObjectStore::open(&repo, &config.tree_diff, &spill_dir)?;
     let mut walker = TreeDiffWalker::new(&config.tree_diff, repo.object_format.oid_len());
     let mut parent_scratch = ParentScratch::new();
 

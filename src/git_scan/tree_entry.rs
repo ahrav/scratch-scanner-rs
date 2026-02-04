@@ -136,6 +136,62 @@ impl<'a> TreeEntry<'a> {
     }
 }
 
+/// Parsed tree entry offsets relative to the provided input slice.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ParsedTreeEntry {
+    pub(crate) name_start: usize,
+    pub(crate) name_end: usize,
+    pub(crate) oid_start: usize,
+    pub(crate) oid_end: usize,
+    pub(crate) kind: EntryKind,
+    pub(crate) mode: u32,
+    pub(crate) entry_len: usize,
+}
+
+impl ParsedTreeEntry {
+    pub(crate) fn materialize<'a>(&self, data: &'a [u8], oid_len: u8) -> TreeEntry<'a> {
+        TreeEntry {
+            name: &data[self.name_start..self.name_end],
+            oid_bytes: &data[self.oid_start..self.oid_end],
+            kind: self.kind,
+            mode: self.mode,
+            oid_len,
+        }
+    }
+
+    pub(crate) fn offset_by(&mut self, delta: usize) {
+        self.name_start = self.name_start.saturating_add(delta);
+        self.name_end = self.name_end.saturating_add(delta);
+        self.oid_start = self.oid_start.saturating_add(delta);
+        self.oid_end = self.oid_end.saturating_add(delta);
+    }
+}
+
+/// Parsing stage that can run out of bytes when streaming.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ParseStage {
+    Mode,
+    Name,
+    Oid,
+}
+
+impl ParseStage {
+    pub(crate) const fn error_detail(self) -> &'static str {
+        match self {
+            Self::Mode => "unexpected end while parsing mode",
+            Self::Name => "unexpected end while parsing name",
+            Self::Oid => "unexpected end while parsing OID",
+        }
+    }
+}
+
+/// Result of parsing a tree entry from a byte slice.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ParseOutcome {
+    Complete(ParsedTreeEntry),
+    Incomplete(ParseStage),
+}
+
 /// Iterator over tree entries in a raw tree object.
 ///
 /// Yields entries in tree order (already sorted by Git).
@@ -221,75 +277,19 @@ impl<'a> TreeEntryIter<'a> {
         }
 
         let remaining = &self.data[self.pos..];
-
-        // Parse mode (ASCII octal digits until space)
-        let space_offset = memchr_space(remaining).ok_or_else(|| {
-            self.fuse();
-            TreeDiffError::CorruptTree {
-                detail: "unexpected end while parsing mode",
+        match parse_entry(remaining, self.oid_len)? {
+            ParseOutcome::Complete(parsed) => {
+                let entry = parsed.materialize(remaining, self.oid_len);
+                self.pos += parsed.entry_len;
+                Ok(Some(entry))
             }
-        })?;
-
-        let mode_bytes = &remaining[..space_offset];
-        let mode = parse_octal_mode(mode_bytes).ok_or_else(|| {
-            self.fuse();
-            TreeDiffError::CorruptTree {
-                detail: "invalid mode digits",
+            ParseOutcome::Incomplete(stage) => {
+                self.fuse();
+                Err(TreeDiffError::CorruptTree {
+                    detail: stage.error_detail(),
+                })
             }
-        })?;
-
-        // Parse name (bytes until NUL)
-        let after_space = &remaining[space_offset + 1..];
-        let nul_offset = memchr_nul(after_space).ok_or_else(|| {
-            self.fuse();
-            TreeDiffError::CorruptTree {
-                detail: "unexpected end while parsing name",
-            }
-        })?;
-
-        let name = &after_space[..nul_offset];
-
-        // Validate name: must be non-empty
-        if name.is_empty() {
-            self.fuse();
-            return Err(TreeDiffError::CorruptTree {
-                detail: "empty entry name",
-            });
         }
-
-        // Validate name: must not contain '/'
-        if memchr_slash(name).is_some() {
-            self.fuse();
-            return Err(TreeDiffError::CorruptTree {
-                detail: "entry name contains slash",
-            });
-        }
-
-        // Parse OID (fixed bytes)
-        let oid_len = self.oid_len as usize;
-        let after_nul = &after_space[nul_offset + 1..];
-        if after_nul.len() < oid_len {
-            self.fuse();
-            return Err(TreeDiffError::CorruptTree {
-                detail: "unexpected end while parsing OID",
-            });
-        }
-
-        let oid_bytes = &after_nul[..oid_len];
-
-        // Commit position update (only on success)
-        // space_offset + 1 (space) + nul_offset + 1 (nul) + oid_len
-        self.pos += space_offset + 1 + nul_offset + 1 + oid_len;
-
-        let kind = classify_mode(mode);
-
-        Ok(Some(TreeEntry {
-            name,
-            oid_bytes,
-            kind,
-            mode,
-            oid_len: self.oid_len,
-        }))
     }
 }
 
@@ -303,6 +303,63 @@ impl<'a> Iterator for TreeEntryIter<'a> {
             Err(e) => Some(Err(e)),
         }
     }
+}
+
+pub(crate) fn parse_entry(data: &[u8], oid_len: u8) -> Result<ParseOutcome, TreeDiffError> {
+    if data.is_empty() {
+        return Ok(ParseOutcome::Incomplete(ParseStage::Mode));
+    }
+
+    // Parse mode (ASCII octal digits until space)
+    let space_offset = match memchr_space(data) {
+        Some(idx) => idx,
+        None => return Ok(ParseOutcome::Incomplete(ParseStage::Mode)),
+    };
+
+    let mode_bytes = &data[..space_offset];
+    let mode = parse_octal_mode(mode_bytes).ok_or(TreeDiffError::CorruptTree {
+        detail: "invalid mode digits",
+    })?;
+
+    // Parse name (bytes until NUL)
+    let after_space = &data[space_offset + 1..];
+    let nul_offset = match memchr_nul(after_space) {
+        Some(idx) => idx,
+        None => return Ok(ParseOutcome::Incomplete(ParseStage::Name)),
+    };
+
+    let name = &after_space[..nul_offset];
+    if name.is_empty() {
+        return Err(TreeDiffError::CorruptTree {
+            detail: "empty entry name",
+        });
+    }
+
+    if memchr_slash(name).is_some() {
+        return Err(TreeDiffError::CorruptTree {
+            detail: "entry name contains slash",
+        });
+    }
+
+    let oid_len = oid_len as usize;
+    let after_nul = &after_space[nul_offset + 1..];
+    if after_nul.len() < oid_len {
+        return Ok(ParseOutcome::Incomplete(ParseStage::Oid));
+    }
+
+    let oid_start = space_offset + 1 + nul_offset + 1;
+    let oid_end = oid_start + oid_len;
+    let kind = classify_mode(mode);
+
+    Ok(ParseOutcome::Complete(ParsedTreeEntry {
+        name_start: space_offset + 1,
+        name_end: space_offset + 1 + nul_offset,
+        oid_start,
+        oid_end,
+        kind,
+        mode,
+        entry_len: oid_end,
+    }))
 }
 
 // Delimiter scanning helpers

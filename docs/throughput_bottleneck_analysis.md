@@ -13,6 +13,19 @@ The 98% throughput drop from simple rules to full gitleaks is **workload-depende
 
 ---
 
+## Git Scan Baselines (Linux)
+
+Baseline repository: `../linux` (local checkout).
+
+| Tool | Result | Notes |
+|------|--------|-------|
+| Kingfisher | ~4 minutes (assumed) | Baseline provided by user guidance |
+| `git_scan` | Failed | `tree bytes budget exceeded` (pre-fix baseline) |
+
+Hardware + OS: dev machine (not recorded; baseline assumed).
+
+---
+
 ## Git Scan Instrumentation (Phase 10)
 
 Git scanning exposes lightweight counters when built with `--features git-perf`.

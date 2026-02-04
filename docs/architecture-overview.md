@@ -108,6 +108,8 @@ graph TB
 | **Commit Walk Limits** | `src/git_scan/commit_walk_limits.rs` | Hard caps for commit traversal and ordering                   |
 | **Snapshot Plan**   | `src/git_scan/snapshot_plan.rs` | Snapshot-mode commit selection (tips only)                          |
 | **Tree Object Store** | `src/git_scan/object_store.rs` | Pack/loose tree loading for OID-only tree diffs                    |
+| **Tree Spill Arena** | `src/git_scan/spill_arena.rs` | Preallocated mmapped file for large tree payload spill               |
+| **Tree Spill Index** | `src/git_scan/object_store.rs` | Fixed-size OID index for reusing spilled tree payloads               |
 | **MIDX Mapping**    | `src/git_scan/midx.rs`, `src/git_scan/mapping_bridge.rs` | MIDX parsing and blob-to-pack mapping                     |
 | **Tree Diff Walker** | `src/git_scan/tree_diff.rs` | OID-only tree diffs that emit candidate blobs with context          |
 | **Pack Executor**   | `src/git_scan/pack_exec.rs` | Executes pack plans to decode candidate blobs with bounded buffers |
@@ -158,6 +160,10 @@ preserves deterministic candidate ordering for downstream spill/dedupe. Outputs
 flow through the `CandidateSink` interface so callers can stream directly into
 spill/dedupe; `CandidateBuffer` remains as a buffered fallback for tests and
 diagnostics.
+
+The tree object store can spill large tree payloads into a preallocated,
+memory-mapped spill arena. Spilled trees are indexed by OID for reuse and do not
+count against the in-flight RAM budget.
 
 ## Git Spill + Dedupe
 

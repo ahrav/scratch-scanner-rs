@@ -20,6 +20,8 @@
 //! - Delta chains are bounded by `MAX_DELTA_DEPTH`
 //! - Repo artifacts must be `Ready` (commit-graph + MIDX present)
 //! - Tree cache is best-effort: oversize payloads are not cached
+//! - Spill arena stores large tree payloads in a fixed-size mmapped file;
+//!   spill indexing is best-effort and may disable itself when full
 //!
 //! # Ordering
 //! Pack lookup is attempted before loose objects. This mirrors typical Git
@@ -41,6 +43,7 @@ use super::pack_inflate::{
 };
 use super::repo::GitRepoPaths;
 use super::repo_open::RepoJobState;
+use super::spill_arena::{SpillArena, SpillArenaError, SpillSlice};
 use super::tree_cache::{TreeCache, TreeCacheHandle};
 use super::tree_diff_limits::TreeDiffLimits;
 
@@ -50,6 +53,120 @@ const MAX_ENTRY_HEADER_BYTES: usize = 64;
 const MAX_DELTA_DEPTH: u8 = 64;
 /// Safety allowance for loose object headers (`"tree <size>\0"`).
 const LOOSE_HEADER_MAX_BYTES: usize = 64;
+/// Minimum number of spill-index slots (power of two).
+const MIN_SPILL_INDEX_ENTRIES: usize = 64;
+/// Maximum number of spill-index slots (power of two).
+const MAX_SPILL_INDEX_ENTRIES: usize = 1_048_576;
+/// FNV-1a offset basis for spill index hashing.
+const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+/// FNV-1a prime for spill index hashing.
+const FNV_PRIME: u64 = 0x00000100000001b3;
+
+/// Fixed spill-index slot storing an OID key and spill offset/length.
+///
+/// `key_len == 0` denotes an empty slot. Entries are never deleted.
+/// `key_bytes` is sized for the maximum supported OID (SHA-256); `key_len`
+/// records the actual length (SHA-1 or SHA-256).
+#[derive(Clone, Copy, Debug)]
+struct SpillIndexEntry {
+    key_len: u8,
+    key_bytes: [u8; 32],
+    offset: u64,
+    len: u64,
+}
+
+impl SpillIndexEntry {
+    const EMPTY: Self = Self {
+        key_len: 0,
+        key_bytes: [0u8; 32],
+        offset: 0,
+        len: 0,
+    };
+
+    fn is_empty(&self) -> bool {
+        self.key_len == 0
+    }
+
+    fn matches(&self, oid: &OidBytes) -> bool {
+        self.key_len == oid.len() && &self.key_bytes[..self.key_len as usize] == oid.as_slice()
+    }
+
+    fn set(&mut self, oid: &OidBytes, offset: u64, len: u64) {
+        self.key_len = oid.len();
+        self.key_bytes.fill(0);
+        self.key_bytes[..oid.len() as usize].copy_from_slice(oid.as_slice());
+        self.offset = offset;
+        self.len = len;
+    }
+}
+
+/// Fixed-size open-addressed hash table for spilled tree payloads.
+///
+/// Invariants:
+/// - `slots.len()` is power-of-two so masking is cheap.
+/// - `key_len == 0` marks an empty slot; no deletions are performed.
+/// - An empty `slots` disables indexing (lookups return `None`).
+/// - Inserts are best-effort; once full, callers can disable indexing.
+#[derive(Debug)]
+struct SpillIndex {
+    mask: usize,
+    slots: Vec<SpillIndexEntry>,
+}
+
+impl SpillIndex {
+    fn new(entries: usize) -> Self {
+        if entries == 0 {
+            return Self {
+                mask: 0,
+                slots: Vec::new(),
+            };
+        }
+
+        let entries = entries.clamp(MIN_SPILL_INDEX_ENTRIES, MAX_SPILL_INDEX_ENTRIES);
+        let entries = entries.next_power_of_two();
+        let slots = vec![SpillIndexEntry::EMPTY; entries];
+        Self {
+            mask: entries - 1,
+            slots,
+        }
+    }
+
+    fn lookup(&self, oid: &OidBytes) -> Option<(u64, u64)> {
+        if self.slots.is_empty() {
+            return None;
+        }
+
+        let mut idx = (hash_oid(oid) as usize) & self.mask;
+        for _ in 0..self.slots.len() {
+            let entry = &self.slots[idx];
+            if entry.is_empty() {
+                return None;
+            }
+            if entry.matches(oid) {
+                return Some((entry.offset, entry.len));
+            }
+            idx = (idx + 1) & self.mask;
+        }
+        None
+    }
+
+    fn insert(&mut self, oid: &OidBytes, offset: u64, len: u64) -> bool {
+        if self.slots.is_empty() {
+            return false;
+        }
+
+        let mut idx = (hash_oid(oid) as usize) & self.mask;
+        for _ in 0..self.slots.len() {
+            let entry = &mut self.slots[idx];
+            if entry.is_empty() || entry.matches(oid) {
+                entry.set(oid, offset, len);
+                return true;
+            }
+            idx = (idx + 1) & self.mask;
+        }
+        false
+    }
+}
 
 /// Trait for loading tree object bytes.
 ///
@@ -78,6 +195,8 @@ pub enum TreeBytes {
     Cached(TreeCacheHandle),
     /// Owned bytes (e.g., from pack/loose reads).
     Owned(Vec<u8>),
+    /// Bytes stored in the spill arena.
+    Spilled(SpillSlice),
 }
 
 impl TreeBytes {
@@ -93,6 +212,7 @@ impl TreeBytes {
         match self {
             Self::Cached(handle) => handle.as_slice(),
             Self::Owned(buf) => buf.as_slice(),
+            Self::Spilled(slice) => slice.as_slice(),
         }
     }
 
@@ -100,6 +220,19 @@ impl TreeBytes {
     #[must_use]
     pub fn len(&self) -> usize {
         self.as_slice().len()
+    }
+
+    /// Returns the in-flight length (RAM-resident bytes).
+    ///
+    /// Spilled bytes are treated as 0 in-flight because they live in the
+    /// spill arena, not in RAM.
+    #[must_use]
+    pub fn in_flight_len(&self) -> usize {
+        match self {
+            Self::Cached(handle) => handle.as_slice().len(),
+            Self::Owned(buf) => buf.len(),
+            Self::Spilled(_) => 0,
+        }
     }
 
     /// Returns true if the payload is empty.
@@ -126,6 +259,15 @@ pub struct ObjectStore<'a> {
     pack_cache: Vec<Option<Arc<Mmap>>>,
     loose_dirs: Vec<PathBuf>,
     tree_cache: TreeCache,
+    spill: Option<SpillArena>,
+    /// Minimum payload size to consider spilling (smaller payloads stay in RAM).
+    spill_min_bytes: usize,
+    /// Set when the spill arena is out of space; disables further spills.
+    spill_exhausted: bool,
+    /// Best-effort index for spilled payloads (OID -> offset/len).
+    spill_index: SpillIndex,
+    /// Set when the index fills; subsequent spills are not indexed.
+    spill_index_exhausted: bool,
 }
 
 impl<'a> ObjectStore<'a> {
@@ -137,7 +279,11 @@ impl<'a> ObjectStore<'a> {
     /// # Errors
     /// Returns `TreeDiffError::ObjectStoreError` if artifacts are missing,
     /// the MIDX is malformed, or pack files cannot be resolved.
-    pub fn open(repo: &'a RepoJobState, limits: &TreeDiffLimits) -> Result<Self, TreeDiffError> {
+    pub fn open(
+        repo: &'a RepoJobState,
+        limits: &TreeDiffLimits,
+        spill_dir: &Path,
+    ) -> Result<Self, TreeDiffError> {
         if !repo.artifact_status.is_ready() {
             return Err(TreeDiffError::ObjectStoreError {
                 detail: "repo artifacts not ready".to_string(),
@@ -166,7 +312,11 @@ impl<'a> ObjectStore<'a> {
 
         let loose_dirs = collect_loose_dirs(&repo.paths);
         let tree_cache = TreeCache::new(limits.max_tree_cache_bytes);
-        let max_object_bytes = limits.max_tree_bytes_per_job.min(usize::MAX as u64) as usize;
+        let max_object_bytes = limits.max_tree_bytes_in_flight.min(usize::MAX as u64) as usize;
+        let spill = SpillArena::new(spill_dir, limits.max_tree_spill_bytes).map_err(store_error)?;
+        let spill_min_bytes = limits.max_tree_cache_bytes.max(1) as usize;
+        let spill_index_entries = spill_index_entries(limits.max_tree_spill_bytes, spill_min_bytes);
+        let spill_index = SpillIndex::new(spill_index_entries);
 
         Ok(Self {
             oid_len: repo.object_format.oid_len(),
@@ -176,6 +326,11 @@ impl<'a> ObjectStore<'a> {
             pack_cache,
             loose_dirs,
             tree_cache,
+            spill: Some(spill),
+            spill_min_bytes,
+            spill_exhausted: false,
+            spill_index,
+            spill_index_exhausted: false,
         })
     }
 
@@ -220,74 +375,153 @@ impl<'a> ObjectStore<'a> {
 
         let (pack_id, offset) = self.midx.offset_at(idx).map_err(store_error)?;
         let pack = self.pack_data(pack_id)?;
-        let obj = self.read_pack_object(pack.as_ref(), offset, depth)?;
+        let obj = self.read_pack_object(pack_id, pack.as_ref(), offset, depth, Some(*oid))?;
         Ok(Some(obj))
     }
 
     fn read_pack_object(
         &mut self,
+        pack_id: u16,
         pack_bytes: &[u8],
         offset: u64,
         depth: u8,
+        root_oid: Option<OidBytes>,
     ) -> Result<(ObjectKind, Vec<u8>), TreeDiffError> {
         // Pack objects can be delta chains; bound recursion by depth.
-        let pack = PackFile::parse(pack_bytes, self.oid_len as usize).map_err(store_error)?;
+        let pack = PackFile::parse(pack_bytes, self.oid_len as usize).map_err(|err| {
+            TreeDiffError::ObjectStoreError {
+                detail: format!(
+                    "pack {pack_id} offset {offset}: {err}{}",
+                    format_root_oid(root_oid)
+                ),
+            }
+        })?;
         let header = pack
             .entry_header_at(offset, MAX_ENTRY_HEADER_BYTES)
-            .map_err(store_error)?;
+            .map_err(|err| TreeDiffError::ObjectStoreError {
+                detail: format!(
+                    "pack {pack_id} offset {offset}: {err}{}",
+                    format_root_oid(root_oid)
+                ),
+            })?;
 
-        let size = usize::try_from(header.size).map_err(|_| store_error("object size overflow"))?;
-        if size > self.max_object_bytes {
-            return Err(TreeDiffError::ObjectStoreError {
-                detail: format!("object size {size} exceeds cap {}", self.max_object_bytes),
-            });
-        }
+        let payload_size =
+            usize::try_from(header.size).map_err(|_| TreeDiffError::ObjectStoreError {
+                detail: format!(
+                    "pack {pack_id} offset {offset}: object size overflow{}",
+                    format_root_oid(root_oid)
+                ),
+            })?;
 
         match header.kind {
             EntryKind::NonDelta { kind } => {
-                let mut out = Vec::with_capacity(size);
-                inflate_exact(pack.slice_from(header.data_start), &mut out, size)
-                    .map_err(store_error)?;
+                if payload_size > self.max_object_bytes {
+                    return Err(TreeDiffError::ObjectStoreError {
+                        detail: format!(
+                            "pack {pack_id} offset {offset}: object size {payload_size} exceeds cap {}{}",
+                            self.max_object_bytes,
+                            format_root_oid(root_oid)
+                        ),
+                    });
+                }
+
+                let mut out = Vec::with_capacity(payload_size);
+                inflate_exact(pack.slice_from(header.data_start), &mut out, payload_size).map_err(
+                    |err| TreeDiffError::ObjectStoreError {
+                        detail: format!(
+                            "pack {pack_id} offset {offset}: {err}{}",
+                            format_root_oid(root_oid)
+                        ),
+                    },
+                )?;
                 Ok((kind, out))
             }
             EntryKind::OfsDelta { base_offset } => {
+                if payload_size > self.max_object_bytes {
+                    return Err(TreeDiffError::ObjectStoreError {
+                        detail: format!(
+                            "pack {pack_id} offset {offset}: delta payload size {payload_size} exceeds cap {}{}",
+                            self.max_object_bytes,
+                            format_root_oid(root_oid)
+                        ),
+                    });
+                }
                 if depth == 0 {
-                    return Err(store_error("delta chain too deep"));
+                    return Err(TreeDiffError::ObjectStoreError {
+                        detail: format!(
+                            "pack {pack_id} offset {offset}: delta chain too deep{}",
+                            format_root_oid(root_oid)
+                        ),
+                    });
                 }
                 let (base_kind, base_bytes) =
-                    self.read_pack_object(pack_bytes, base_offset, depth - 1)?;
+                    self.read_pack_object(pack_id, pack_bytes, base_offset, depth - 1, root_oid)?;
 
-                let mut delta = Vec::with_capacity(size.min(self.max_object_bytes));
+                let mut delta = Vec::with_capacity(payload_size.min(self.max_object_bytes));
                 inflate_limited(
                     pack.slice_from(header.data_start),
                     &mut delta,
                     self.max_object_bytes,
                 )
-                .map_err(store_error)?;
+                .map_err(|err| TreeDiffError::ObjectStoreError {
+                    detail: format!(
+                        "pack {pack_id} offset {offset}: delta inflate failed: {err} (base offset {base_offset}){}",
+                        format_root_oid(root_oid)
+                    ),
+                })?;
 
-                let mut out = Vec::with_capacity(size);
-                apply_delta(&base_bytes, &delta, &mut out, size, self.max_object_bytes)
-                    .map_err(store_error)?;
+                let mut out = Vec::new();
+                apply_delta(&base_bytes, &delta, &mut out, self.max_object_bytes)
+                    .map_err(|err| TreeDiffError::ObjectStoreError {
+                        detail: format!(
+                            "pack {pack_id} offset {offset}: delta apply failed: {err} (base offset {base_offset}){}",
+                            format_root_oid(root_oid)
+                        ),
+                    })?;
 
                 Ok((base_kind, out))
             }
             EntryKind::RefDelta { base_oid } => {
+                if payload_size > self.max_object_bytes {
+                    return Err(TreeDiffError::ObjectStoreError {
+                        detail: format!(
+                            "pack {pack_id} offset {offset}: delta payload size {payload_size} exceeds cap {}{}",
+                            self.max_object_bytes,
+                            format_root_oid(root_oid)
+                        ),
+                    });
+                }
                 if depth == 0 {
-                    return Err(store_error("delta chain too deep"));
+                    return Err(TreeDiffError::ObjectStoreError {
+                        detail: format!(
+                            "pack {pack_id} offset {offset}: delta chain too deep{}",
+                            format_root_oid(root_oid)
+                        ),
+                    });
                 }
                 let (base_kind, base_bytes) = self.load_object_with_depth(&base_oid, depth - 1)?;
 
-                let mut delta = Vec::with_capacity(size.min(self.max_object_bytes));
+                let mut delta = Vec::with_capacity(payload_size.min(self.max_object_bytes));
                 inflate_limited(
                     pack.slice_from(header.data_start),
                     &mut delta,
                     self.max_object_bytes,
                 )
-                .map_err(store_error)?;
+                .map_err(|err| TreeDiffError::ObjectStoreError {
+                    detail: format!(
+                        "pack {pack_id} offset {offset}: delta inflate failed: {err} (base oid {base_oid}){}",
+                        format_root_oid(root_oid)
+                    ),
+                })?;
 
-                let mut out = Vec::with_capacity(size);
-                apply_delta(&base_bytes, &delta, &mut out, size, self.max_object_bytes)
-                    .map_err(store_error)?;
+                let mut out = Vec::new();
+                apply_delta(&base_bytes, &delta, &mut out, self.max_object_bytes)
+                    .map_err(|err| TreeDiffError::ObjectStoreError {
+                        detail: format!(
+                            "pack {pack_id} offset {offset}: delta apply failed: {err} (base oid {base_oid}){}",
+                            format_root_oid(root_oid)
+                        ),
+                    })?;
 
                 Ok((base_kind, out))
             }
@@ -364,6 +598,40 @@ impl<'a> ObjectStore<'a> {
             .expect("pack mmap present")
             .clone())
     }
+
+    fn try_spill(
+        &mut self,
+        oid: &OidBytes,
+        bytes: &[u8],
+    ) -> Result<Option<SpillSlice>, TreeDiffError> {
+        if self.spill_exhausted || bytes.len() < self.spill_min_bytes {
+            return Ok(None);
+        }
+
+        let Some(spill) = self.spill.as_mut() else {
+            return Ok(None);
+        };
+
+        match spill.append(bytes) {
+            Ok(slice) => {
+                if !self.spill_index_exhausted {
+                    let inserted = self.spill_index.insert(oid, slice.offset(), slice.len());
+                    if !inserted {
+                        // Index is full: keep spilling but stop indexing to avoid costly probes.
+                        self.spill_index_exhausted = true;
+                    }
+                }
+                Ok(Some(slice))
+            }
+            Err(SpillArenaError::OutOfSpace { .. }) => {
+                self.spill_exhausted = true;
+                Ok(None)
+            }
+            Err(err) => Err(TreeDiffError::ObjectStoreError {
+                detail: err.to_string(),
+            }),
+        }
+    }
 }
 
 impl TreeSource for ObjectStore<'_> {
@@ -379,9 +647,19 @@ impl TreeSource for ObjectStore<'_> {
             return Ok(TreeBytes::Cached(handle));
         }
 
+        if let Some((offset, len)) = self.spill_index.lookup(oid) {
+            if let Some(spill) = self.spill.as_ref() {
+                return Ok(TreeBytes::Spilled(spill.slice(offset, len)));
+            }
+        }
+
         let (kind, data) = self.load_object(oid)?;
         if kind != ObjectKind::Tree {
             return Err(TreeDiffError::NotATree);
+        }
+
+        if let Some(slice) = self.try_spill(oid, &data)? {
+            return Ok(TreeBytes::Spilled(slice));
         }
 
         // Cache is best-effort; failures are ignored.
@@ -390,9 +668,48 @@ impl TreeSource for ObjectStore<'_> {
     }
 }
 
+/// Computes the spill index capacity from spill size and spill threshold.
+///
+/// The result is clamped to a power-of-two range to bound RAM usage while
+/// still allowing O(1) indexing for the largest spilled trees.
+fn spill_index_entries(max_spill_bytes: u64, spill_min_bytes: usize) -> usize {
+    if max_spill_bytes == 0 {
+        return 0;
+    }
+
+    let min_bytes = spill_min_bytes.max(1) as u64;
+    let mut entries = max_spill_bytes / min_bytes;
+    if entries == 0 {
+        entries = 1;
+    }
+    if entries > MAX_SPILL_INDEX_ENTRIES as u64 {
+        entries = MAX_SPILL_INDEX_ENTRIES as u64;
+    }
+    let entries = entries as usize;
+    let entries = entries.max(MIN_SPILL_INDEX_ENTRIES);
+    entries.next_power_of_two()
+}
+
+/// Hashes an OID for spill-index probing (FNV-1a).
+fn hash_oid(oid: &OidBytes) -> u64 {
+    let mut hash = FNV_OFFSET_BASIS;
+    for &byte in oid.as_slice() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
 fn store_error<E: std::fmt::Display>(err: E) -> TreeDiffError {
     TreeDiffError::ObjectStoreError {
         detail: err.to_string(),
+    }
+}
+
+fn format_root_oid(root_oid: Option<OidBytes>) -> String {
+    match root_oid {
+        Some(oid) => format!(" (root oid {oid})"),
+        None => String::new(),
     }
 }
 

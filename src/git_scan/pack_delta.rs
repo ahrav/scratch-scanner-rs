@@ -10,9 +10,14 @@
 // Re-exported so pack decode stages can enforce output caps without
 // depending on `pack_inflate` directly.
 
-/// Applies a Git delta buffer to a base object.
+/// Applies a Git delta buffer to a base object, enforcing a hard output cap.
+///
+/// The output buffer is cleared before writing; pass a reusable `Vec` to
+/// avoid repeated allocations across delta applications.
 pub use super::pack_inflate::apply_delta;
 /// Errors returned by `apply_delta`.
+///
+/// These cover truncated inputs, size mismatches, and bounds violations.
 pub use super::pack_inflate::DeltaError;
 
 #[cfg(test)]
@@ -49,7 +54,7 @@ mod tests {
         delta.extend_from_slice(b"XYZ");
 
         let mut out = Vec::new();
-        apply_delta(base, &delta, &mut out, 6, 16).unwrap();
+        apply_delta(base, &delta, &mut out, 16).unwrap();
         assert_eq!(out, b"abcXYZ");
     }
 }

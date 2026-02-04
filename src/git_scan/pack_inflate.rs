@@ -184,7 +184,7 @@ impl From<DeltaError> for PackObjectError {
 /// within the pack. The header itself is variable length.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EntryHeader {
-    /// Uncompressed size of the object (or delta result size).
+    /// Uncompressed payload size (delta entries store delta bytes, not the result).
     pub size: u64,
     /// Byte offset where the zlib stream begins.
     pub data_start: usize,
@@ -367,6 +367,9 @@ impl<'a> PackFile<'a> {
 ///
 /// Returns the number of input bytes consumed from `input`.
 ///
+/// The output buffer is cleared before writing. Callers should reserve at
+/// least `max_out` capacity to satisfy debug assertions and avoid reallocations.
+///
 /// This does not enforce that the stream ends exactly at the end of `input`;
 /// callers should use the returned byte count to advance within a pack.
 pub fn inflate_limited(
@@ -425,6 +428,9 @@ pub fn inflate_limited(
 ///
 /// Returns the number of input bytes consumed from `input`.
 ///
+/// The output buffer is cleared before writing. Callers should reserve at
+/// least `expected` capacity to satisfy debug assertions and avoid reallocations.
+///
 /// If the stream ends early or produces fewer bytes than expected, returns
 /// `TruncatedInput`.
 pub fn inflate_exact(
@@ -463,18 +469,19 @@ fn read_leb128_u64(data: &[u8], pos: &mut usize) -> Result<u64, DeltaError> {
     Err(DeltaError::VarintOverflow)
 }
 
-/// Apply a git delta buffer to `base`, producing `expected_result_size` bytes.
+/// Apply a git delta buffer to `base`, producing the result encoded in `delta`.
 ///
 /// The caller supplies `max_out` as a hard safety cap to prevent allocating
 /// unbounded output on corrupt deltas.
 ///
 /// The delta format encodes both base size and result size as varints at the
 /// head of the stream; both are validated.
+///
+/// The output buffer is cleared before writing.
 pub fn apply_delta(
     base: &[u8],
     delta: &[u8],
     out: &mut Vec<u8>,
-    expected_result_size: usize,
     max_out: usize,
 ) -> Result<(), DeltaError> {
     let mut pos = 0usize;
@@ -485,14 +492,14 @@ pub fn apply_delta(
     }
 
     let result_size = read_leb128_u64(delta, &mut pos)? as usize;
-    if result_size != expected_result_size {
-        return Err(DeltaError::ResultSizeMismatch);
-    }
     if result_size > max_out {
         return Err(DeltaError::OutputOverrun);
     }
 
     out.clear();
+    if out.capacity() < result_size {
+        out.reserve(result_size - out.capacity());
+    }
 
     while pos < delta.len() {
         let cmd = delta[pos];

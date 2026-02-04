@@ -67,8 +67,9 @@ Run diagnostic tests to verify: `cargo test --test diagnostic -- --ignored --noc
 
 Git tree diffing has its own bounded memory envelope:
 
-- **Tree bytes budget**: `TreeDiffLimits.max_tree_bytes_per_job` caps the total
-  decompressed tree payloads loaded during a repo job.
+- **Tree bytes in-flight budget**: `TreeDiffLimits.max_tree_bytes_in_flight` caps
+  the total decompressed tree payloads retained at any one time. This is a
+  peak-memory guard, not a cumulative counter.
 - **Pack access**: pack files are memory-mapped on demand only for packs
   referenced by mapping results; no pack data is copied unless inflated.
 - **Inflate buffers**: tree payloads and delta instructions are inflated into
@@ -84,6 +85,14 @@ Git tree diffing has its own bounded memory envelope:
   set count. Entries larger than a slot are not cached. Cache hits return
   pinned handles so tree bytes can be borrowed without copying; pinned slots
   are skipped by eviction until the handle is dropped.
+- **Tree spill arena**: large tree payloads can be written into a preallocated,
+  memory-mapped spill file sized by `TreeDiffLimits.max_tree_spill_bytes`.
+  Spilled bytes are referenced by `(offset, len)` handles and do not count
+  against the in-flight RAM budget.
+- **Spill index**: a fixed-size, open-addressed OID index (sized from the
+  spill capacity and spill threshold) reuses spilled tree payloads without
+  heap allocations after startup. When the index is full, spilling continues
+  but reuse is disabled.
 
 These limits make Git tree traversal deterministic and DoS-resistant while
 keeping blob data out of memory during diffing.

@@ -700,19 +700,8 @@ fn decode_delta_entry(
     perf::record_pack_inflate(inflate_buf.len(), inflate_nanos);
 
     result_buf.clear();
-    if result_buf.capacity() < header.size as usize {
-        result_buf.reserve(header.size as usize - result_buf.capacity());
-    }
-
-    let (apply_res, apply_nanos) = perf::time(|| {
-        apply_delta(
-            base_bytes,
-            inflate_buf,
-            result_buf,
-            header.size as usize,
-            limits.max_object_bytes,
-        )
-    });
+    let (apply_res, apply_nanos) =
+        perf::time(|| apply_delta(base_bytes, inflate_buf, result_buf, limits.max_object_bytes));
     match apply_res {
         Ok(()) => {
             perf::record_delta_apply(result_buf.len(), apply_nanos);
@@ -1243,7 +1232,7 @@ mod tests {
         pack.extend_from_slice(&compress(base_bytes));
 
         let delta_offset = pack.len() as u64;
-        let mut delta_entry = encode_delta_header(6, result_bytes.len());
+        let mut delta_entry = encode_delta_header(6, delta_payload.len());
         delta_entry.extend_from_slice(&encode_ofs_distance(delta_offset - base_offset));
         delta_entry.extend_from_slice(&compress(&delta_payload));
         pack.extend_from_slice(&delta_entry);
@@ -1319,7 +1308,7 @@ mod tests {
         pack.extend_from_slice(&1u32.to_be_bytes());
 
         let delta_offset = pack.len() as u64;
-        let mut delta_entry = encode_delta_header(7, result_bytes.len());
+        let mut delta_entry = encode_delta_header(7, delta_payload.len());
         delta_entry.extend_from_slice(base_oid.as_slice());
         delta_entry.extend_from_slice(&compress(&delta_payload));
         pack.extend_from_slice(&delta_entry);

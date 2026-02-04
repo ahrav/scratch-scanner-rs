@@ -191,7 +191,7 @@ pub enum TreeDiffError {
     InvalidOidLength { len: usize, expected: usize },
     /// Maximum tree recursion depth exceeded.
     MaxTreeDepthExceeded { max_depth: u16 },
-    /// Total tree bytes budget exceeded.
+    /// In-flight tree bytes budget exceeded.
     TreeBytesBudgetExceeded { loaded: u64, budget: u64 },
     /// Path exceeds length limit.
     PathTooLong { len: usize, max: usize },
@@ -220,7 +220,7 @@ impl fmt::Display for TreeDiffError {
             Self::TreeBytesBudgetExceeded { loaded, budget } => {
                 write!(
                     f,
-                    "tree bytes budget exceeded: loaded {loaded}, budget {budget}"
+                    "tree bytes in-flight budget exceeded: loaded {loaded}, budget {budget}"
                 )
             }
             Self::PathTooLong { len, max } => {

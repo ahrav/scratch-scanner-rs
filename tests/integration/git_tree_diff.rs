@@ -232,7 +232,8 @@ fn tree_diff_matches_git_diff_tree() {
     let state = open_repo_state(tmp.path());
 
     let limits = TreeDiffLimits::RESTRICTIVE;
-    let mut store = ObjectStore::open(&state, &limits).unwrap();
+    let spill = tempfile::tempdir().unwrap();
+    let mut store = ObjectStore::open(&state, &limits, spill.path()).unwrap();
     let mut walker = TreeDiffWalker::new(&limits, state.object_format.oid_len());
     let mut candidates = CandidateBuffer::new(&limits, state.object_format.oid_len());
 
@@ -303,7 +304,8 @@ fn corrupt_tree_is_reported() {
     let state = open_repo_state(tmp.path());
 
     let limits = TreeDiffLimits::RESTRICTIVE;
-    let mut store = ObjectStore::open(&state, &limits).unwrap();
+    let spill = tempfile::tempdir().unwrap();
+    let mut store = ObjectStore::open(&state, &limits, spill.path()).unwrap();
     let mut walker = TreeDiffWalker::new(&limits, state.object_format.oid_len());
     let mut candidates = CandidateBuffer::new(&limits, state.object_format.oid_len());
 
@@ -330,7 +332,8 @@ fn merge_diff_modes_emit_expected_candidates() {
     let parent2_tree = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD^2^{tree}"]));
 
     let limits = TreeDiffLimits::RESTRICTIVE;
-    let mut store = ObjectStore::open(&state, &limits).unwrap();
+    let spill = tempfile::tempdir().unwrap();
+    let mut store = ObjectStore::open(&state, &limits, spill.path()).unwrap();
 
     let first_parent = diff_paths(&mut store, &limits, &merge_tree, &parent1_tree, 0);
     let second_parent = diff_paths(&mut store, &limits, &merge_tree, &parent2_tree, 1);
@@ -375,11 +378,11 @@ fn collect_unique_blobs(state: &RepoJobState, limits: SpillLimits) -> Vec<Collec
     let plan = introduced_by_plan(state, &cg, CommitWalkLimits::RESTRICTIVE).unwrap();
 
     let tree_limits = TreeDiffLimits::RESTRICTIVE;
-    let mut store = ObjectStore::open(state, &tree_limits).unwrap();
+    let tmp = TempDir::new().unwrap();
+    let mut store = ObjectStore::open(state, &tree_limits, tmp.path()).unwrap();
     let mut walker = TreeDiffWalker::new(&tree_limits, state.object_format.oid_len());
     let mut parent_scratch = ParentScratch::new();
 
-    let tmp = TempDir::new().unwrap();
     let mut spiller = Spiller::new(limits, state.object_format.oid_len(), tmp.path()).unwrap();
 
     struct SpillSink<'a> {
@@ -493,12 +496,11 @@ fn collect_unique_blobs_buffered(
     let plan = introduced_by_plan(state, &cg, CommitWalkLimits::RESTRICTIVE).unwrap();
 
     let tree_limits = TreeDiffLimits::RESTRICTIVE;
-    let mut store = ObjectStore::open(state, &tree_limits).unwrap();
+    let tmp = TempDir::new().unwrap();
+    let mut store = ObjectStore::open(state, &tree_limits, tmp.path()).unwrap();
     let mut walker = TreeDiffWalker::new(&tree_limits, state.object_format.oid_len());
     let mut parent_scratch = ParentScratch::new();
     let mut buffer = CandidateBuffer::new(&tree_limits, state.object_format.oid_len());
-
-    let tmp = TempDir::new().unwrap();
     let mut spiller = Spiller::new(limits, state.object_format.oid_len(), tmp.path()).unwrap();
 
     for PlannedCommit { pos, snapshot_root } in &plan {
