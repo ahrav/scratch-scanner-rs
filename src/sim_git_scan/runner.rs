@@ -1,8 +1,12 @@
 //! Deterministic Git simulation runner.
 //!
 //! The runner executes stage tasks under a deterministic scheduler and
-//! records a bounded trace for replay. It enforces stability and basic
-//! invariants at end of run.
+//! records a bounded trace for replay. End-of-run oracles validate output
+//! shape (sorted/disjoint sets), watermark gating, and stability across
+//! schedule seeds.
+//!
+//! Phase 0 does not yet apply the `fault_plan`; the API reserves it for
+//! later injection points.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -68,7 +72,7 @@ pub struct RunReport {
     pub scanned_hash: [u8; 32],
     /// Hash of skipped OIDs (sorted, unique).
     pub skipped_hash: [u8; 32],
-    /// Hash of trace events (order-sensitive).
+    /// Hash of trace events (order-sensitive, bounded to the trace ring).
     pub trace_hash: [u8; 32],
 }
 
@@ -209,16 +213,16 @@ impl GitSimRunner {
         let mut executor = SimExecutor::new(self.cfg.workers, seed);
         let mut tasks: Vec<StageKind> = Vec::new();
 
+        // Phase 0 schedules exactly one task per stage in a fixed order.
+        // Scheduling decisions are still recorded for determinism checks.
         let mut state = RunState::new(scenario, self.cfg.trace_capacity);
         spawn_stage(&mut executor, &mut tasks, StageKind::RepoOpen);
 
-        let mut steps = 0u64;
         let max_steps = derive_max_steps(self.cfg.max_steps, scenario);
         let mut done = false;
+        let mut steps = 0u64;
 
-        while steps < max_steps {
-            steps = steps.saturating_add(1);
-
+        for step in 1..=max_steps {
             if done {
                 break;
             }
@@ -228,7 +232,7 @@ impl GitSimRunner {
                     return RunOutcome::Failed(FailureReport {
                         kind: FailureKind::Hang,
                         message: "no runnable tasks".to_string(),
-                        step: steps,
+                        step,
                     });
                 }
                 StepResult::Ran {
@@ -236,6 +240,7 @@ impl GitSimRunner {
                     task_id,
                     decision,
                 } => {
+                    steps = step;
                     state.trace.push(GitTraceEvent::Decision {
                         code: (decision.choices << 16) | decision.chosen,
                     });
@@ -278,7 +283,7 @@ impl GitSimRunner {
                             }
                         }
                         Err(mut failure) => {
-                            failure.step = steps;
+                            failure.step = step;
                             return RunOutcome::Failed(failure);
                         }
                     }
@@ -294,7 +299,13 @@ impl GitSimRunner {
             });
         }
 
-        let report = build_report(&state, steps);
+        let report = match build_report(&state, steps) {
+            Ok(report) => report,
+            Err(mut failure) => {
+                failure.step = steps;
+                return RunOutcome::Failed(failure);
+            }
+        };
         RunOutcome::Ok { report }
     }
 }
@@ -358,6 +369,7 @@ fn derive_max_steps(max_steps: u64, scenario: &GitScenario) -> u64 {
     if max_steps != 0 {
         return max_steps;
     }
+    // Heuristic to prevent hangs while allowing small scenarios to complete.
     let commits = scenario.repo.commits.len() as u64;
     let refs = scenario.repo.refs.len() as u64;
     let trees = scenario.repo.trees.len() as u64;
@@ -375,6 +387,7 @@ fn stage_repo_open(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
     let mut refs = repo.refs.clone();
     refs.sort_by(|a, b| a.name.cmp(&b.name));
 
+    // Size the arena from total ref name bytes to avoid growth churn.
     let total_bytes: usize = refs.iter().map(|r| r.name.len()).sum();
     let mut arena = ByteArena::with_capacity(total_bytes as u32 + 1);
     let mut start_set_refs = Vec::with_capacity(refs.len());
@@ -490,6 +503,7 @@ fn stage_pack_exec(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
     let mut scanned: Vec<OidBytes> = Vec::new();
     let mut skipped: Vec<OidBytes> = Vec::new();
 
+    // If there are no byte-level artifacts, treat the semantic candidates as scanned.
     let Some(artifacts) = &state.scenario.artifacts else {
         collect_semantic_scan(candidates, &mut scanned);
         state.scanned = dedupe_sorted(scanned);
@@ -497,6 +511,7 @@ fn stage_pack_exec(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
         return Ok(state.scanned.len() as u32);
     };
 
+    // If artifacts are present but incomplete, treat all candidates as skipped.
     if artifacts.midx.is_none() || artifacts.packs.is_empty() {
         collect_semantic_skip(candidates, &mut skipped);
         state.scanned = Vec::new();
@@ -681,21 +696,21 @@ fn dedupe_sorted(mut oids: Vec<OidBytes>) -> Vec<OidBytes> {
     oids
 }
 
-fn build_report(state: &RunState<'_>, steps: u64) -> RunReport {
-    let scanned_hash = hash_oids(&state.scanned);
-    let skipped_hash = hash_oids(&state.skipped);
-    let trace_hash = hash_trace(&state.trace.dump());
-
+fn build_report(state: &RunState<'_>, steps: u64) -> Result<RunReport, FailureReport> {
     let commit_count = state.plan.len() as u32;
     let candidate_count = state
         .candidates
         .as_ref()
         .map(|c| c.len() as u32)
         .unwrap_or(0);
-    let skipped_count = state.skipped.len();
-    let outcome = state.outcome.unwrap_or(FinalizeOutcome::Complete);
+    let outcome = validate_outputs(state)?;
 
-    RunReport {
+    let scanned_hash = hash_oids(&state.scanned);
+    let skipped_hash = hash_oids(&state.skipped);
+    let trace_hash = hash_trace(&state.trace.dump());
+    let skipped_count = state.skipped.len();
+
+    Ok(RunReport {
         steps,
         commit_count,
         candidate_count,
@@ -704,7 +719,7 @@ fn build_report(state: &RunState<'_>, steps: u64) -> RunReport {
         scanned_hash,
         skipped_hash,
         trace_hash,
-    }
+    })
 }
 
 fn hash_oids(oids: &[OidBytes]) -> [u8; 32] {
@@ -751,6 +766,64 @@ fn hash_event(hasher: &mut Hasher, ev: &GitTraceEvent) {
     }
 }
 
+/// Validate end-of-run invariants and correctness oracles.
+fn validate_outputs(state: &RunState<'_>) -> Result<FinalizeOutcome, FailureReport> {
+    let outcome = state
+        .outcome
+        .ok_or_else(|| failure_inv(60, "missing finalize outcome"))?;
+
+    // Enforce set semantics: sorted, unique, and disjoint.
+    if !is_sorted_unique(&state.scanned) {
+        return Err(failure_inv(61, "scanned OIDs not sorted/unique"));
+    }
+    if !is_sorted_unique(&state.skipped) {
+        return Err(failure_inv(62, "skipped OIDs not sorted/unique"));
+    }
+    if has_overlap(&state.scanned, &state.skipped) {
+        return Err(failure_oracle("scanned and skipped sets overlap"));
+    }
+
+    let skipped_count = state.skipped.len();
+    match outcome {
+        FinalizeOutcome::Complete => {
+            if skipped_count != 0 {
+                return Err(failure_inv(63, "complete outcome with skips"));
+            }
+        }
+        FinalizeOutcome::Partial {
+            skipped_count: expected,
+        } => {
+            if expected != skipped_count {
+                return Err(failure_oracle(format!(
+                    "partial skipped_count mismatch: expected {expected}, got {skipped_count}"
+                )));
+            }
+            if skipped_count == 0 {
+                return Err(failure_oracle("partial outcome with zero skips"));
+            }
+        }
+    }
+
+    Ok(outcome)
+}
+
+fn is_sorted_unique(oids: &[OidBytes]) -> bool {
+    oids.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn has_overlap(left: &[OidBytes], right: &[OidBytes]) -> bool {
+    let mut i = 0usize;
+    let mut j = 0usize;
+    while i < left.len() && j < right.len() {
+        match left[i].cmp(&right[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => return true,
+        }
+    }
+    false
+}
+
 fn failure_inv<T: std::fmt::Display>(code: u32, err: T) -> FailureReport {
     FailureReport {
         kind: FailureKind::InvariantViolation { code },
@@ -758,3 +831,152 @@ fn failure_inv<T: std::fmt::Display>(code: u32, err: T) -> FailureReport {
         step: 0,
     }
 }
+
+fn failure_oracle<T: std::fmt::Display>(err: T) -> FailureReport {
+    FailureReport {
+        kind: FailureKind::OracleMismatch,
+        message: err.to_string(),
+        step: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sim_git_scan::scenario::{
+        GitBlobSpec, GitCommitSpec, GitObjectFormat, GitOid, GitRefSpec, GitRepoModel, GitScenario,
+        GitTreeEntryKind, GitTreeEntrySpec, GitTreeSpec,
+    };
+
+    fn oid(val: u8) -> GitOid {
+        GitOid {
+            bytes: vec![val; 20],
+        }
+    }
+
+    fn simple_scenario() -> GitScenario {
+        GitScenario {
+            schema_version: super::super::scenario::GIT_SCENARIO_SCHEMA_VERSION,
+            repo: GitRepoModel {
+                object_format: GitObjectFormat::Sha1,
+                refs: vec![GitRefSpec {
+                    name: b"refs/heads/main".to_vec(),
+                    tip: oid(1),
+                    watermark: None,
+                }],
+                commits: vec![GitCommitSpec {
+                    oid: oid(1),
+                    parents: Vec::new(),
+                    tree: oid(2),
+                    generation: 1,
+                }],
+                trees: vec![GitTreeSpec {
+                    oid: oid(2),
+                    entries: vec![GitTreeEntrySpec {
+                        name: b"file.txt".to_vec(),
+                        mode: 0o100644,
+                        oid: oid(3),
+                        kind: GitTreeEntryKind::Blob,
+                    }],
+                }],
+                blobs: vec![GitBlobSpec {
+                    oid: oid(3),
+                    bytes: b"hello".to_vec(),
+                }],
+            },
+            artifacts: None,
+        }
+    }
+
+    #[test]
+    fn trace_hash_matches_expected_stage_order() {
+        let scenario = simple_scenario();
+        let cfg = GitRunConfig {
+            workers: 1,
+            max_steps: 0,
+            stability_runs: 1,
+            trace_capacity: 64,
+        };
+        let runner = GitSimRunner::new(cfg, 7);
+        let outcome = runner.run(&scenario, &GitFaultPlan::default());
+        let report = match outcome {
+            RunOutcome::Ok { report } => report,
+            RunOutcome::Failed(fail) => panic!("unexpected failure: {fail:?}"),
+        };
+
+        let decision = GitTraceEvent::Decision { code: 1 << 16 };
+        let expected = vec![
+            decision.clone(),
+            GitTraceEvent::StageEnter {
+                stage_id: StageKind::RepoOpen as u16,
+            },
+            GitTraceEvent::StageExit {
+                stage_id: StageKind::RepoOpen as u16,
+                items: 1,
+            },
+            decision.clone(),
+            GitTraceEvent::StageEnter {
+                stage_id: StageKind::CommitWalk as u16,
+            },
+            GitTraceEvent::StageExit {
+                stage_id: StageKind::CommitWalk as u16,
+                items: 1,
+            },
+            decision.clone(),
+            GitTraceEvent::StageEnter {
+                stage_id: StageKind::TreeDiff as u16,
+            },
+            GitTraceEvent::StageExit {
+                stage_id: StageKind::TreeDiff as u16,
+                items: 1,
+            },
+            decision.clone(),
+            GitTraceEvent::StageEnter {
+                stage_id: StageKind::PackExec as u16,
+            },
+            GitTraceEvent::StageExit {
+                stage_id: StageKind::PackExec as u16,
+                items: 1,
+            },
+            decision,
+            GitTraceEvent::StageEnter {
+                stage_id: StageKind::Finalize as u16,
+            },
+            GitTraceEvent::StageExit {
+                stage_id: StageKind::Finalize as u16,
+                items: 0,
+            },
+        ];
+
+        let expected_hash = hash_trace(&expected);
+        assert_eq!(report.trace_hash, expected_hash);
+        assert_eq!(report.commit_count, 1);
+        assert_eq!(report.candidate_count, 1);
+        assert_eq!(report.skipped_count, 0);
+        assert_eq!(report.outcome, SimFinalizeOutcome::Complete);
+    }
+
+    #[test]
+    fn run_halts_when_step_budget_exceeded() {
+        let scenario = simple_scenario();
+        let cfg = GitRunConfig {
+            workers: 1,
+            max_steps: 2,
+            stability_runs: 1,
+            trace_capacity: 32,
+        };
+        let runner = GitSimRunner::new(cfg, 1);
+        let outcome = runner.run(&scenario, &GitFaultPlan::default());
+        let failure = match outcome {
+            RunOutcome::Failed(fail) => fail,
+            RunOutcome::Ok { .. } => panic!("expected hang failure"),
+        };
+
+        assert!(matches!(failure.kind, FailureKind::Hang));
+        assert_eq!(failure.message, "max steps exceeded");
+    }
+}
+
+#[cfg(all(test, feature = "stdx-proptest"))]
+#[path = "runner_tests.rs"]
+mod runner_tests;

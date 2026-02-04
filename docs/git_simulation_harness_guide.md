@@ -9,6 +9,7 @@ repository layout.
 - Provide deterministic stage execution under `SimExecutor`.
 - Capture bounded trace events for replay and debugging.
 - Enforce stability across schedule seeds.
+- Validate correctness and gating invariants with structured oracles.
 
 ## Runner Lifecycle
 
@@ -24,6 +25,8 @@ Stages:
 5. Finalize (determine complete vs partial outcome)
 
 Stage boundaries emit trace events so failures can be replayed and minimized.
+Each step also records the scheduler decision so trace hashes capture the
+deterministic interleaving.
 
 ## Invariants
 
@@ -32,6 +35,23 @@ Stage boundaries emit trace events so failures can be replayed and minimized.
 - Watermark gating: any skipped candidate yields `Partial` and suppresses
   watermark advancement.
 - Ordering: refs are processed in lexicographic order by raw refname bytes.
+- Output sets: scanned and skipped OIDs are sorted, unique, and disjoint.
+
+## Oracles
+
+- Termination: runs complete within `max_steps` or return `FailureKind::Hang`.
+- Determinism: identical `{scenario, seed}` yields identical trace hash.
+- Stability: multiple schedule seeds compare normalized outputs and outcome.
+- Gating: `FinalizeOutcome::Complete` requires zero skips; `Partial` requires
+  non-zero skips.
+
+## Failure Taxonomy
+
+- `Panic`: unexpected panic in runner logic.
+- `Hang`: no runnable tasks or exceeded `max_steps`.
+- `InvariantViolation`: ordering or structural invariants failed.
+- `OracleMismatch`: correctness oracle failed (gating, overlap, mismatch).
+- `StabilityMismatch`: output differed across schedule seeds.
 
 ## Running Tests
 
