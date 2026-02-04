@@ -31,7 +31,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use serde::{Deserialize, Serialize};
 
-use crate::api::STEP_ROOT;
+use crate::api::{DecodeStep, TransformId, STEP_ROOT};
 use crate::sim::clock::SimClock;
 use crate::sim::executor::{SimExecutor, SimTask, SimTaskId, SimTaskState, StepResult};
 use crate::sim::fault::{Corruption, FaultInjector, FaultPlan, IoFault, ReadFault};
@@ -211,7 +211,7 @@ impl ScannerSimRunner {
 
             if !executor.has_queued_tasks() {
                 if all_tasks_completed(&executor, &tasks) {
-                    let findings = output.finish();
+                    let collected = output.finish();
                     let summaries = take_file_summaries(&mut tasks);
                     if in_flight_objects != 0 {
                         return self.fail(
@@ -224,10 +224,11 @@ impl ScannerSimRunner {
                         );
                     }
                     if let Err(fail) =
-                        self.run_oracles(scenario, engine, &files, &findings, &summaries, step)
+                        self.run_oracles(scenario, engine, &files, &collected, &summaries, step)
                     {
                         return RunOutcome::Failed(fail);
                     }
+                    let CollectedFindings { recs: findings, .. } = collected;
                     return RunOutcome::Ok { findings };
                 }
                 if let Some(next_tick) = next_io_tick(&io_waiters) {
@@ -437,11 +438,11 @@ impl ScannerSimRunner {
         scenario: &Scenario,
         engine: &Engine,
         files: &[SimPath],
-        findings: &[FindingRec],
+        findings: &CollectedFindings,
         summaries: &[FileSummary],
         step: u64,
     ) -> Result<(), FailureReport> {
-        oracle_ground_truth(scenario, files, findings, summaries, step)?;
+        oracle_ground_truth(scenario, files, &findings.recs, summaries, step)?;
         oracle_differential(scenario, files, engine, findings, summaries, step)?;
         Ok(())
     }
@@ -488,25 +489,71 @@ impl From<&FindingRec> for FindingKey {
     }
 }
 
+/// Findings plus leaf transform metadata for differential normalization.
+///
+/// `leaf_transforms` is aligned with `recs` by index. Entries are `None` for
+/// root findings or chains that contain no transform steps (e.g., UTF-16 only).
+#[derive(Clone, Debug)]
+struct CollectedFindings {
+    recs: Vec<FindingRec>,
+    leaf_transforms: Vec<Option<TransformId>>,
+}
+
 /// Output collector that enforces a no-duplicates invariant.
 ///
 /// Set `SCANNER_SIM_DUP_DEBUG=1` to print diagnostic details when duplicate
 /// findings are detected.
 struct OutputCollector {
     findings: Vec<FindingRec>,
+    leaf_transforms: Vec<Option<TransformId>>,
     seen: BTreeSet<FindingKey>,
+}
+
+fn leaf_transform_id(
+    engine: &Engine,
+    scratch: &mut ScanScratch,
+    rec: &FindingRec,
+) -> Option<TransformId> {
+    // Leaf transform is the last transform step in the decode chain (if any).
+    if rec.step_id == STEP_ROOT {
+        return None;
+    }
+    let steps = scratch.materialize_decode_steps(rec.step_id);
+    steps.iter().rev().find_map(|step| match step {
+        DecodeStep::Transform { transform_idx, .. } => Some(engine.transform_id(*transform_idx)),
+        DecodeStep::Utf16Window { .. } => None,
+    })
+}
+
+fn append_leaf_transforms(
+    engine: &Engine,
+    scratch: &mut ScanScratch,
+    recs: &[FindingRec],
+    out: &mut Vec<Option<TransformId>>,
+) {
+    out.reserve(recs.len());
+    for rec in recs {
+        out.push(leaf_transform_id(engine, scratch, rec));
+    }
 }
 
 impl OutputCollector {
     fn new() -> Self {
         Self {
             findings: Vec::new(),
+            leaf_transforms: Vec::new(),
             seen: BTreeSet::new(),
         }
     }
 
     /// Append a batch of findings, rejecting duplicates by normalized key.
-    fn append(&mut self, batch: &mut Vec<FindingRec>, step: u64) -> Result<(), FailureReport> {
+    fn append(
+        &mut self,
+        batch: &mut Vec<FindingRec>,
+        engine: &Engine,
+        scratch: &mut ScanScratch,
+        step: u64,
+    ) -> Result<(), FailureReport> {
         let mut local_seen: BTreeSet<FindingKey> = BTreeSet::new();
         for rec in batch.drain(..) {
             let key = FindingKey::from(&rec);
@@ -535,14 +582,19 @@ impl OutputCollector {
                     step,
                 });
             }
+            let leaf_transform = leaf_transform_id(engine, scratch, &rec);
             self.findings.push(rec);
+            self.leaf_transforms.push(leaf_transform);
         }
         Ok(())
     }
 
     /// Finish and return findings in emission order.
-    fn finish(self) -> Vec<FindingRec> {
-        self.findings
+    fn finish(self) -> CollectedFindings {
+        CollectedFindings {
+            recs: self.findings,
+            leaf_transforms: self.leaf_transforms,
+        }
     }
 }
 
@@ -960,7 +1012,7 @@ impl FileScanState {
                 }
             }
         }
-        output.append(&mut self.batch, step)?;
+        output.append(&mut self.batch, engine, &mut self.scratch, step)?;
 
         let total_len = chunk.len();
         let keep = overlap.min(total_len);
@@ -1110,13 +1162,22 @@ fn normalize_findings(findings: &[FindingRec]) -> BTreeSet<FindingKey> {
 /// checks:
 /// - Drop non-root findings that already have a covering root finding for the
 ///   same `(file_id, rule_id)` (avoid redundant duplicates).
+/// - Drop non-root findings whose root-hint span exceeds the guaranteed overlap;
+///   these are alignment-sensitive for long transform runs and are not stable
+///   across chunk boundaries.
 /// - Clamp remaining non-root hints to the last `required_overlap()` bytes so
 ///   the oracle focuses on semantic differences while staying consistent with
 ///   guaranteed overlap.
-fn normalize_findings_for_diff(engine: &Engine, findings: &[FindingRec]) -> BTreeSet<FindingKey> {
+/// - Normalize base64-derived `root_hint_end` when padding is elided so
+///   truncated spans (chunked) compare equal to padded spans (reference).
+fn normalize_findings_for_diff(
+    engine: &Engine,
+    findings: &CollectedFindings,
+) -> BTreeSet<FindingKey> {
+    debug_assert_eq!(findings.recs.len(), findings.leaf_transforms.len());
     let overlap = engine.required_overlap() as u64;
     let mut root_spans: BTreeMap<(u32, u32), Vec<(u64, u64)>> = BTreeMap::new();
-    for rec in findings {
+    for rec in &findings.recs {
         if rec.step_id == STEP_ROOT {
             root_spans
                 .entry((rec.file_id.0, rec.rule_id))
@@ -1125,14 +1186,43 @@ fn normalize_findings_for_diff(engine: &Engine, findings: &[FindingRec]) -> BTre
         }
     }
 
+    fn normalize_root_hint_end(rec: &FindingRec, leaf_transform: Option<TransformId>) -> u64 {
+        if rec.step_id == STEP_ROOT {
+            return rec.root_hint_end;
+        }
+        // Only Base64 uses 4/3 padding rules; other transforms must not normalize.
+        if leaf_transform != Some(TransformId::Base64) {
+            return rec.root_hint_end;
+        }
+        // Base64 decoding is padding-tolerant; chunked scans can surface a match
+        // before trailing '=' arrives. Normalize to the minimal encoded length
+        // when the observed span is within padding tolerance (<= 3 chars).
+        let decoded_len = rec.span_end.saturating_sub(rec.span_start) as u64;
+        let min_encoded = (decoded_len * 4).div_ceil(3);
+        let actual_encoded = rec.root_hint_end.saturating_sub(rec.root_hint_start);
+        if actual_encoded > min_encoded && actual_encoded <= min_encoded.saturating_add(3) {
+            rec.root_hint_start.saturating_add(min_encoded)
+        } else {
+            rec.root_hint_end
+        }
+    }
+
     findings
+        .recs
         .iter()
-        .filter_map(|rec| {
+        .zip(findings.leaf_transforms.iter())
+        .filter_map(|(rec, leaf_transform)| {
+            let normalized_end = normalize_root_hint_end(rec, *leaf_transform);
             if rec.step_id != STEP_ROOT {
+                let hint_len = normalized_end.saturating_sub(rec.root_hint_start);
+                if hint_len > overlap {
+                    return None;
+                }
                 if let Some(spans) = root_spans.get(&(rec.file_id.0, rec.rule_id)) {
-                    if spans.iter().any(|(start, end)| {
-                        rec.root_hint_start <= *start && rec.root_hint_end >= *end
-                    }) {
+                    if spans
+                        .iter()
+                        .any(|(start, end)| rec.root_hint_start <= *start && normalized_end >= *end)
+                    {
                         return None;
                     }
                 }
@@ -1145,7 +1235,7 @@ fn normalize_findings_for_diff(engine: &Engine, findings: &[FindingRec]) -> BTre
             let (root_hint_start, root_hint_end) = if rec.step_id == STEP_ROOT {
                 (rec.root_hint_start, rec.root_hint_end)
             } else {
-                (rec.root_hint_end.saturating_sub(overlap), rec.root_hint_end)
+                (normalized_end.saturating_sub(overlap), normalized_end)
             };
             Some(FindingKey {
                 file_id: rec.file_id.0,
@@ -1317,7 +1407,7 @@ fn oracle_differential(
     scenario: &Scenario,
     files: &[SimPath],
     engine: &Engine,
-    findings: &[FindingRec],
+    findings: &CollectedFindings,
     summaries: &[FileSummary],
     step: u64,
 ) -> Result<(), FailureReport> {
@@ -1464,9 +1554,10 @@ fn oracle_differential(
 fn reference_findings_observed(
     engine: &Engine,
     summaries: &[FileSummary],
-) -> Result<Vec<FindingRec>, String> {
+) -> Result<CollectedFindings, String> {
     let mut scratch = engine.new_scratch();
     let mut out = Vec::with_capacity(engine.tuning.max_findings_per_chunk);
+    let mut out_transforms = Vec::with_capacity(engine.tuning.max_findings_per_chunk);
     let mut batch = Vec::with_capacity(engine.tuning.max_findings_per_chunk);
 
     for summary in summaries {
@@ -1482,10 +1573,14 @@ fn reference_findings_observed(
         }
         engine.scan_chunk_into(&summary.observed, summary.file_id, 0, &mut scratch);
         scratch.drain_findings_into(&mut batch);
+        append_leaf_transforms(engine, &mut scratch, &batch, &mut out_transforms);
         out.append(&mut batch);
     }
 
-    Ok(out)
+    Ok(CollectedFindings {
+        recs: out,
+        leaf_transforms: out_transforms,
+    })
 }
 
 fn build_file_id_map(files: &[SimPath]) -> BTreeMap<Vec<u8>, FileId> {
@@ -1551,5 +1646,166 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
         s.clone()
     } else {
         "panic payload".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_findings_for_diff, CollectedFindings};
+    use crate::api::{FileId, FindingRec, StepId, TransformId, STEP_ROOT};
+    use crate::sim_scanner::generator::build_engine_from_suite;
+    use crate::sim_scanner::scenario::{RuleSuiteSpec, RunConfig, SyntheticRuleSpec};
+
+    fn test_engine() -> crate::Engine {
+        let suite = RuleSuiteSpec {
+            schema_version: 1,
+            rules: vec![SyntheticRuleSpec {
+                rule_id: 0,
+                name: "test_rule".to_string(),
+                anchors: vec![b"TEST".to_vec()],
+                radius: 16,
+                regex: "TEST[0-9]{4}".to_string(),
+            }],
+        };
+        let run_cfg = RunConfig {
+            workers: 1,
+            chunk_size: 64,
+            overlap: 64,
+            max_in_flight_objects: 1,
+            buffer_pool_cap: 1,
+            max_file_size: u64::MAX,
+            max_steps: 0,
+            max_transform_depth: 2,
+            scan_utf16_variants: false,
+            stability_runs: 1,
+        };
+        build_engine_from_suite(&suite, &run_cfg).expect("engine build")
+    }
+
+    fn non_root_rec(
+        span_len: u32,
+        root_hint_start: u64,
+        root_hint_end: u64,
+        step_id: StepId,
+    ) -> FindingRec {
+        FindingRec {
+            file_id: FileId(0),
+            rule_id: 0,
+            span_start: 0,
+            span_end: span_len,
+            root_hint_start,
+            root_hint_end,
+            dedupe_with_span: false,
+            step_id,
+        }
+    }
+
+    fn root_rec(span_start: u32, span_end: u32) -> FindingRec {
+        FindingRec {
+            file_id: FileId(0),
+            rule_id: 0,
+            span_start,
+            span_end,
+            root_hint_start: span_start as u64,
+            root_hint_end: span_end as u64,
+            dedupe_with_span: true,
+            step_id: STEP_ROOT,
+        }
+    }
+
+    #[test]
+    fn normalize_findings_for_diff_uses_normalized_end_for_overlap_filter() {
+        let engine = test_engine();
+        let overlap = engine.required_overlap() as u64;
+
+        let mut decoded_len = 1u64;
+        let (min_encoded, decoded_len) = loop {
+            let min_encoded = (decoded_len * 4).div_ceil(3);
+            if min_encoded <= overlap && min_encoded + 3 > overlap {
+                break (min_encoded, decoded_len);
+            }
+            decoded_len = decoded_len.saturating_add(1);
+            assert!(decoded_len < 4096);
+        };
+
+        let root_hint_start: u64 = 100;
+        let actual_encoded = overlap.saturating_add(1);
+        let root_hint_end = root_hint_start.saturating_add(actual_encoded);
+        assert!(actual_encoded > min_encoded);
+        assert!(actual_encoded <= min_encoded.saturating_add(3));
+
+        let rec = non_root_rec(
+            decoded_len as u32,
+            root_hint_start,
+            root_hint_end,
+            StepId(0),
+        );
+        let findings = CollectedFindings {
+            recs: vec![rec],
+            leaf_transforms: vec![Some(TransformId::Base64)],
+        };
+
+        let normalized = normalize_findings_for_diff(&engine, &findings);
+        assert_eq!(normalized.len(), 1);
+        let key = normalized.iter().next().unwrap();
+        assert_eq!(key.root_hint_end, root_hint_start + min_encoded);
+    }
+
+    #[test]
+    fn normalize_findings_for_diff_uses_normalized_end_for_coverage_filter() {
+        let engine = test_engine();
+        let overlap = engine.required_overlap() as u64;
+
+        let decoded_len = 1u64;
+        let min_encoded = (decoded_len * 4).div_ceil(3);
+        assert!(overlap >= min_encoded);
+
+        let root_hint_start: u64 = 0;
+        let actual_encoded = min_encoded.saturating_add(3);
+        let root_hint_end = root_hint_start.saturating_add(actual_encoded);
+        let root_span_end = (min_encoded + 1) as u32;
+        assert!(root_span_end as u64 <= actual_encoded);
+        assert!(root_span_end as u64 > min_encoded);
+
+        let root = root_rec(0, root_span_end);
+        let non_root = non_root_rec(
+            decoded_len as u32,
+            root_hint_start,
+            root_hint_end,
+            StepId(1),
+        );
+        let findings = CollectedFindings {
+            recs: vec![root, non_root],
+            leaf_transforms: vec![None, Some(TransformId::Base64)],
+        };
+
+        let normalized = normalize_findings_for_diff(&engine, &findings);
+        assert_eq!(normalized.len(), 2);
+        assert!(normalized
+            .iter()
+            .any(|key| key.span_start == 0 && key.span_end == 0));
+        assert!(normalized
+            .iter()
+            .any(|key| key.span_start != 0 || key.span_end != 0));
+    }
+
+    #[test]
+    fn normalize_findings_for_diff_skips_base64_padding_for_non_base64() {
+        let engine = test_engine();
+        let overlap = engine.required_overlap() as u64;
+        assert!(overlap >= 3);
+
+        let root_hint_start = 50;
+        let root_hint_end = root_hint_start + 3;
+        let rec = non_root_rec(1, root_hint_start, root_hint_end, StepId(2));
+        let findings = CollectedFindings {
+            recs: vec![rec],
+            leaf_transforms: vec![Some(TransformId::UrlPercent)],
+        };
+
+        let normalized = normalize_findings_for_diff(&engine, &findings);
+        assert_eq!(normalized.len(), 1);
+        let key = normalized.iter().next().unwrap();
+        assert_eq!(key.root_hint_end, root_hint_end);
     }
 }
