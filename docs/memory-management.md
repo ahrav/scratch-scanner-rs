@@ -93,6 +93,13 @@ Git tree diffing has its own bounded memory envelope:
   spill capacity and spill threshold) reuses spilled tree payloads without
   heap allocations after startup. When the index is full, spilling continues
   but reuse is disabled.
+- **Streaming parser**: tree diffs switch to a streaming entry parser for
+  spill-backed or large tree payloads. The parser retains a fixed-size
+  buffer (`TREE_STREAM_BUF_BYTES`, currently 16 KiB) so tree iteration stays
+  bounded in RAM while still preserving Git tree order.
+- **Spill I/O hints**: on Unix, the spill arena applies `posix_fadvise` and
+  `madvise(MADV_SEQUENTIAL)` hints to favor sequential access. On non-Unix
+  platforms these calls are no-ops.
 
 These limits make Git tree traversal deterministic and DoS-resistant while
 keeping blob data out of memory during diffing.

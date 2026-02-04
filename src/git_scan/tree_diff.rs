@@ -38,6 +38,8 @@
 //! - No blob reads (OID comparison only)
 //! - Fixed-size stack allocation (bounded depth)
 //! - Stack is reused across diff_trees calls (no per-call allocation)
+//! - Large or spill-backed trees are parsed with a streaming buffer
+//!   to keep the working set bounded
 //!
 //! # Output Ordering
 //! Candidates are emitted in Git tree order for each diff. For merge commits,
@@ -45,8 +47,9 @@
 //! the candidate with which parent diff produced it.
 //!
 //! # Budgeting
-//! The tree-bytes budget is enforced cumulatively via `TreeDiffStats`. Call
-//! `reset_stats()` when starting a new repo job to reset the budget counter.
+//! The tree-bytes budget is enforced on in-flight bytes retained by the
+//! walker. Call `reset_stats()` when starting a new repo job; the in-flight
+//! tracker is reset and the diff stack must be empty.
 
 use std::cmp::Ordering;
 
@@ -57,8 +60,8 @@ use super::path_policy::classify_path;
 use super::tree_candidate::{CandidateSink, ChangeKind};
 use super::tree_diff_limits::TreeDiffLimits;
 use super::tree_entry::{parse_entry, EntryKind, ParseOutcome, ParsedTreeEntry, TreeEntry};
-use super::tree_stream::{TreeBytesReader, TreeStream};
 use super::tree_order::git_tree_name_cmp;
+use super::tree_stream::{TreeBytesReader, TreeStream};
 
 /// Maximum path length in bytes.
 ///
@@ -153,7 +156,9 @@ impl BufferedCursor {
 
     fn peek_entry(&mut self) -> Result<Option<TreeEntry<'_>>, TreeDiffError> {
         if let Some(parsed) = self.cached {
-            return Ok(Some(parsed.materialize(self.bytes.as_slice(), self.oid_len)));
+            return Ok(Some(
+                parsed.materialize(self.bytes.as_slice(), self.oid_len),
+            ));
         }
 
         if self.pos >= self.bytes.len() {
@@ -165,7 +170,9 @@ impl BufferedCursor {
             ParseOutcome::Complete(mut parsed) => {
                 parsed.offset_by(self.pos);
                 self.cached = Some(parsed);
-                Ok(Some(parsed.materialize(self.bytes.as_slice(), self.oid_len)))
+                Ok(Some(
+                    parsed.materialize(self.bytes.as_slice(), self.oid_len),
+                ))
             }
             ParseOutcome::Incomplete(stage) => Err(TreeDiffError::CorruptTree {
                 detail: stage.error_detail(),
@@ -388,11 +395,7 @@ impl TreeDiffWalker {
                     self.release_tree_bytes(frame.old_cursor.in_flight_len());
                     self.path_buf.truncate(frame.prefix_len);
                 }
-                Action::AddedEntry {
-                    oid,
-                    kind,
-                    mode,
-                } => {
+                Action::AddedEntry { oid, kind, mode } => {
                     debug_assert!(!name_scratch.is_empty());
                     let frame = self.stack.last_mut().expect("frame exists");
                     frame.new_cursor.advance()?;
@@ -435,11 +438,7 @@ impl TreeDiffWalker {
                         parent_idx,
                     )?;
                 }
-                Action::NewBeforeOld {
-                    oid,
-                    kind,
-                    mode,
-                } => {
+                Action::NewBeforeOld { oid, kind, mode } => {
                     debug_assert!(!name_scratch.is_empty());
                     let frame = self.stack.last_mut().expect("frame exists");
                     frame.new_cursor.advance()?;
@@ -493,11 +492,7 @@ impl TreeDiffWalker {
                 .tree_bytes_in_flight_peak
                 .max(self.tree_bytes_in_flight);
 
-            Ok(TreeCursor::new(
-                bytes,
-                self.oid_len,
-                self.stream_threshold,
-            ))
+            Ok(TreeCursor::new(bytes, self.oid_len, self.stream_threshold))
         } else {
             Ok(TreeCursor::empty(self.oid_len))
         }

@@ -38,6 +38,17 @@
 //! to `next()` return `None`. This prevents garbage results from partially
 //! parsed state.
 //!
+//! # Strictness
+//!
+//! The parser rejects malformed entries:
+//! - Empty names
+//! - Names containing `/`
+//! - Non-octal mode digits
+//! - Truncated OIDs (treated as "incomplete" until EOF)
+//!
+//! Entry ordering and duplicate names are not validated here; those are
+//! handled at higher layers (tree diffing and traversal).
+//!
 //! # Performance
 //!
 //! Delimiter scanning uses `iter().position()` which the compiler optimizes
@@ -137,6 +148,9 @@ impl<'a> TreeEntry<'a> {
 }
 
 /// Parsed tree entry offsets relative to the provided input slice.
+///
+/// `entry_len` is the number of bytes to advance from the start of the slice
+/// to reach the next entry.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ParsedTreeEntry {
     pub(crate) name_start: usize,
@@ -186,6 +200,9 @@ impl ParseStage {
 }
 
 /// Result of parsing a tree entry from a byte slice.
+///
+/// `Incomplete` indicates the slice ended mid-entry; callers should supply
+/// more bytes (or treat as corruption at EOF).
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ParseOutcome {
     Complete(ParsedTreeEntry),
@@ -305,6 +322,12 @@ impl<'a> Iterator for TreeEntryIter<'a> {
     }
 }
 
+/// Parses a single tree entry from the start of `data`.
+///
+/// The slice must start at an entry boundary. Incomplete data yields
+/// `ParseOutcome::Incomplete` so streaming callers can refill buffers.
+/// Callers should only treat `Incomplete` as corruption when they are
+/// at EOF.
 pub(crate) fn parse_entry(data: &[u8], oid_len: u8) -> Result<ParseOutcome, TreeDiffError> {
     if data.is_empty() {
         return Ok(ParseOutcome::Incomplete(ParseStage::Mode));

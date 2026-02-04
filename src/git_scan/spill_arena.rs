@@ -12,6 +12,9 @@ use std::sync::Arc;
 
 use memmap2::{Mmap, MmapMut};
 
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+
 /// Reference to a spilled payload within the arena.
 ///
 /// Holds an `Arc` to the read-only mapping so the underlying bytes remain
@@ -117,6 +120,8 @@ impl SpillArena {
         // and is only used for immutable reads.
         let reader = Arc::new(unsafe { Mmap::map(&file)? });
 
+        advise_sequential(&file, &reader);
+
         Ok(Self {
             path,
             capacity,
@@ -205,6 +210,22 @@ fn open_spill_file(path: &Path, capacity: u64) -> Result<File, SpillArenaError> 
     file.set_len(capacity)?;
     Ok(file)
 }
+
+#[cfg(unix)]
+fn advise_sequential(file: &File, reader: &Mmap) {
+    unsafe {
+        #[cfg(target_os = "linux")]
+        let _ = libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+        let _ = libc::madvise(
+            reader.as_ptr() as *mut libc::c_void,
+            reader.len(),
+            libc::MADV_SEQUENTIAL,
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn advise_sequential(_file: &File, _reader: &Mmap) {}
 
 #[cfg(test)]
 mod tests {

@@ -112,6 +112,7 @@ graph TB
 | **Tree Spill Index** | `src/git_scan/object_store.rs` | Fixed-size OID index for reusing spilled tree payloads               |
 | **MIDX Mapping**    | `src/git_scan/midx.rs`, `src/git_scan/mapping_bridge.rs` | MIDX parsing and blob-to-pack mapping                     |
 | **Tree Diff Walker** | `src/git_scan/tree_diff.rs` | OID-only tree diffs that emit candidate blobs with context          |
+| **Tree Stream Parser** | `src/git_scan/tree_stream.rs` | Streaming tree entry parser with bounded buffer                     |
 | **Pack Executor**   | `src/git_scan/pack_exec.rs` | Executes pack plans to decode candidate blobs with bounded buffers |
 | **Engine Adapter**  | `src/git_scan/engine_adapter.rs` | Streams decoded blob bytes into the engine with overlap chunking |
 | **Pack I/O**        | `src/git_scan/pack_io.rs` | MIDX-backed pack mmap loader for cross-pack REF delta bases |
@@ -164,6 +165,9 @@ diagnostics.
 The tree object store can spill large tree payloads into a preallocated,
 memory-mapped spill arena. Spilled trees are indexed by OID for reuse and do not
 count against the in-flight RAM budget.
+
+For large or spill-backed trees, the walker switches to a streaming parser that
+keeps only a bounded buffer of tree bytes in RAM while iterating entries.
 
 ## Git Spill + Dedupe
 

@@ -137,6 +137,12 @@ scans overlapping chunks with the core `Engine`. The overlap length is
 is the absolute byte offset of the new (non-overlap) region. This guarantees
 chunking invariance without re-materializing full blobs in the scanner.
 
+## Git Tree Diff Streaming
+
+Git tree diffing now uses a streaming entry parser for spill-backed or large
+tree payloads. This keeps tree iteration bounded to a fixed-size buffer while
+preserving Git tree order before candidates reach the engine adapter.
+
 ## FindingKey Hashing
 
 For each match, the engine computes a normalized hash on the **secret span**
