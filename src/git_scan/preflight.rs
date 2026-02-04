@@ -38,24 +38,17 @@ pub struct ArtifactPaths {
     pub pack_dir: PathBuf,
 }
 
-/// Status of required artifacts (commit-graph, MIDX, pack count).
+/// Status of required artifacts (commit-graph, MIDX, lock files).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArtifactStatus {
-    /// All required artifacts are present and pack count is within limits.
-    Ready { pack_count: u32 },
-    /// One or more artifacts are missing or pack count exceeded.
+    /// All required artifacts are present.
+    Ready,
+    /// One or more required artifacts are missing or locked.
     NeedsMaintenance {
         /// `true` if `info/commit-graph` is missing.
         missing_commit_graph: bool,
         /// `true` if `multi-pack-index` is missing.
         missing_midx: bool,
-        /// Total number of `*.pack` files observed (including alternates).
-        ///
-        /// This count is capped at `max_pack_count + 1` to allow early exit
-        /// when the limit is exceeded.
-        pack_count: u32,
-        /// Pack count limit that was checked.
-        max_pack_count: u16,
         /// `true` if a Git maintenance lock file is present.
         lock_present: bool,
     },
@@ -66,14 +59,15 @@ impl ArtifactStatus {
     #[inline]
     #[must_use]
     pub const fn is_ready(&self) -> bool {
-        matches!(self, Self::Ready { .. })
+        matches!(self, Self::Ready)
     }
 }
 
 /// Result of the preflight check.
 ///
 /// The report is fully derived from repository metadata; no blob objects are
-/// read during preflight and artifact contents are not parsed.
+/// read during preflight and artifact contents are not parsed. Readiness is
+/// reported separately from maintenance recommendations (pack count).
 #[derive(Debug)]
 pub struct PreflightReport {
     /// Resolved repository paths.
@@ -82,6 +76,31 @@ pub struct PreflightReport {
     pub artifact_paths: ArtifactPaths,
     /// Artifact readiness status.
     pub status: ArtifactStatus,
+    /// Maintenance recommendation details.
+    pub maintenance: PreflightMaintenance,
+}
+
+/// Maintenance recommendation details.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreflightMaintenance {
+    /// Total number of `*.pack` files observed (including alternates).
+    ///
+    /// This count is capped at `max_pack_count + 1` to allow early exit
+    /// when the limit is exceeded.
+    pub pack_count: u32,
+    /// Pack count recommendation threshold.
+    pub max_pack_count: u16,
+    /// `true` if pack count exceeds the recommendation threshold.
+    pub pack_count_exceeded: bool,
+}
+
+impl PreflightMaintenance {
+    /// Returns true if maintenance is recommended.
+    #[inline]
+    #[must_use]
+    pub const fn recommended(&self) -> bool {
+        self.pack_count_exceeded
+    }
 }
 
 /// Executes the maintenance preflight.
@@ -116,22 +135,25 @@ pub fn preflight(
     let pack_limit_exceeded = pack_count > limits.max_pack_count as u32;
     let lock_present = has_lock_files(&repo, &artifact_paths)?;
 
-    let status = if missing_commit_graph || missing_midx || pack_limit_exceeded || lock_present {
+    let status = if missing_commit_graph || missing_midx || lock_present {
         ArtifactStatus::NeedsMaintenance {
             missing_commit_graph,
             missing_midx,
-            pack_count,
-            max_pack_count: limits.max_pack_count,
             lock_present,
         }
     } else {
-        ArtifactStatus::Ready { pack_count }
+        ArtifactStatus::Ready
     };
 
     Ok(PreflightReport {
         repo,
         artifact_paths,
         status,
+        maintenance: PreflightMaintenance {
+            pack_count,
+            max_pack_count: limits.max_pack_count,
+            pack_count_exceeded: pack_limit_exceeded,
+        },
     })
 }
 

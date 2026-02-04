@@ -65,6 +65,40 @@ use super::tree_candidate::CandidateBuffer;
 use super::tree_diff::{TreeDiffStats, TreeDiffWalker};
 use super::tree_diff_limits::TreeDiffLimits;
 
+/// Limits for pack file mmapping during scan execution.
+#[derive(Clone, Copy, Debug)]
+pub struct PackMmapLimits {
+    /// Maximum number of pack files to mmap.
+    pub max_open_packs: u16,
+    /// Maximum total bytes to mmap across all packs.
+    pub max_total_bytes: u64,
+}
+
+impl PackMmapLimits {
+    /// Safe defaults suitable for large monorepos.
+    pub const DEFAULT: Self = Self {
+        max_open_packs: 128,
+        max_total_bytes: 8 * 1024 * 1024 * 1024,
+    };
+
+    /// Restrictive limits for testing or constrained environments.
+    pub const RESTRICTIVE: Self = Self {
+        max_open_packs: 8,
+        max_total_bytes: 512 * 1024 * 1024,
+    };
+
+    /// Validates that limits are internally consistent.
+    ///
+    /// # Panics
+    ///
+    /// Panics if limits are invalid (indicates a configuration bug).
+    #[track_caller]
+    pub const fn validate(&self) {
+        assert!(self.max_open_packs > 0, "must allow at least 1 pack");
+        assert!(self.max_total_bytes > 0, "pack mmap budget must be > 0");
+    }
+}
+
 /// Git scan runner configuration.
 ///
 /// The defaults mirror the Git scanning limits and are intended for
@@ -93,6 +127,8 @@ pub struct GitScanConfig {
     pub pack_decode: PackDecodeLimits,
     pub pack_io: PackIoLimits,
     pub engine_adapter: EngineAdapterConfig,
+    /// Pack mmap limits during pack execution.
+    pub pack_mmap: PackMmapLimits,
     /// Pack cache size in bytes (must fit in `u32`).
     pub pack_cache_bytes: usize,
     /// Optional spill directory override. When `None`, a temp directory is used.
@@ -118,6 +154,7 @@ impl Default for GitScanConfig {
             pack_decode,
             pack_io: PackIoLimits::new(pack_decode, PackPlanConfig::default().max_delta_depth),
             engine_adapter: EngineAdapterConfig::default(),
+            pack_mmap: PackMmapLimits::DEFAULT,
             pack_cache_bytes: 64 * 1024 * 1024,
             spill_dir: None,
         }
@@ -210,6 +247,7 @@ pub enum GitScanError {
     PackIo(PackIoError),
     Persist(PersistError),
     Io(io::Error),
+    ResourceLimit(String),
 }
 
 impl std::fmt::Display for GitScanError {
@@ -226,6 +264,7 @@ impl std::fmt::Display for GitScanError {
             Self::PackIo(err) => write!(f, "{err}"),
             Self::Persist(err) => write!(f, "{err}"),
             Self::Io(err) => write!(f, "{err}"),
+            Self::ResourceLimit(msg) => write!(f, "resource limit exceeded: {msg}"),
         }
     }
 }
@@ -244,6 +283,7 @@ impl std::error::Error for GitScanError {
             Self::PackIo(err) => Some(err),
             Self::Persist(err) => Some(err),
             Self::Io(err) => Some(err),
+            Self::ResourceLimit(_) => None,
         }
     }
 }
@@ -321,6 +361,10 @@ impl From<io::Error> for GitScanError {
 /// - `NeedsMaintenance` when repo artifacts are missing or out of date.
 /// - `Completed` with a `GitScanReport` when the scan finishes.
 ///
+/// # Maintenance
+/// Preflight pack-count recommendations are advisory only; the scan proceeds
+/// as long as required artifacts are present.
+///
 /// # Caveats
 /// - Loose objects are currently treated as skipped candidates. This yields
 ///   a `FinalizeOutcome::Partial` and suppresses watermark writes.
@@ -334,7 +378,7 @@ pub fn run_git_scan(
     persist_store: Option<&dyn PersistenceStore>,
     config: &GitScanConfig,
 ) -> Result<GitScanResult, GitScanError> {
-    // Preflight (metadata-only readiness).
+    // Preflight (metadata-only readiness). Pack count recommendations are advisory.
     let preflight = preflight(repo_root, config.preflight)?;
     if !preflight.status.is_ready() {
         return Ok(GitScanResult::NeedsMaintenance { preflight });
@@ -461,7 +505,7 @@ pub fn run_git_scan(
     let pack_names = list_pack_files(&pack_dirs)?;
     midx.verify_completeness(pack_names.iter().map(|n| n.as_slice()))?;
     let pack_paths = resolve_pack_paths(&midx, &pack_dirs)?;
-    let pack_mmaps = mmap_pack_files(&pack_paths)?;
+    let pack_mmaps = mmap_pack_files(&pack_paths, config.pack_mmap)?;
     let pack_views = build_pack_views(&pack_mmaps, repo.object_format)?;
 
     let mut pack_plan_stats = Vec::new();
@@ -685,9 +729,30 @@ fn strip_pack_suffix(name: &[u8]) -> Vec<u8> {
 /// Memory-map pack files for zero-copy decoding.
 ///
 /// The mappings are read-only and may outlive the file handles.
-fn mmap_pack_files(pack_paths: &[PathBuf]) -> Result<Vec<Mmap>, GitScanError> {
+fn mmap_pack_files(
+    pack_paths: &[PathBuf],
+    limits: PackMmapLimits,
+) -> Result<Vec<Mmap>, GitScanError> {
+    limits.validate();
+    if pack_paths.len() > limits.max_open_packs as usize {
+        return Err(GitScanError::ResourceLimit(format!(
+            "pack count {} exceeds limit {}",
+            pack_paths.len(),
+            limits.max_open_packs
+        )));
+    }
+
     let mut out = Vec::with_capacity(pack_paths.len());
+    let mut total_bytes = 0_u64;
     for path in pack_paths {
+        let metadata = fs::metadata(path)?;
+        total_bytes = total_bytes.saturating_add(metadata.len());
+        if total_bytes > limits.max_total_bytes {
+            return Err(GitScanError::ResourceLimit(format!(
+                "mapped pack bytes {} exceed limit {}",
+                total_bytes, limits.max_total_bytes
+            )));
+        }
         let file = File::open(path)?;
         // SAFETY: mapping read-only pack files; the OS keeps the mapping valid
         // even after `file` is dropped.

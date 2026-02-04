@@ -115,7 +115,9 @@ pub use pack_plan_model::{
 pub use path_policy::PathClass;
 pub use persist::{persist_finalize_output, InMemoryPersistenceStore, PersistenceStore};
 pub use policy_hash::{policy_hash, MergeDiffMode, PolicyHash};
-pub use preflight::{preflight, ArtifactPaths, ArtifactStatus, PreflightReport};
+pub use preflight::{
+    preflight, ArtifactPaths, ArtifactStatus, PreflightMaintenance, PreflightReport,
+};
 pub use preflight_error::PreflightError;
 pub use preflight_limits::PreflightLimits;
 pub use repo::{GitRepoPaths, RepoKind};
@@ -128,7 +130,7 @@ pub use run_reader::RunReader;
 pub use run_writer::RunWriter;
 pub use runner::{
     run_git_scan, CandidateSkipReason, GitScanConfig, GitScanError, GitScanReport, GitScanResult,
-    SkippedCandidate,
+    PackMmapLimits, SkippedCandidate,
 };
 pub use seen_store::{AlwaysSeenStore, InMemorySeenStore, NeverSeenStore, SeenBlobStore};
 pub use snapshot_plan::snapshot_plan;
