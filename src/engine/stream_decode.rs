@@ -5,6 +5,14 @@
 //! keeps a decoded ring buffer, feeds Vectorscan stream DBs, and only
 //! materializes candidate windows for rule evaluation.
 //!
+//! ## Data flow
+//! - `stream_decode` yields decoded chunks.
+//! - Chunks are appended to `decode_ring` (recent decoded bytes only).
+//! - Vectorscan streams emit candidate windows into `pending_windows`.
+//! - Windows are materialized from the ring (or re-decoded) and scanned.
+//! - URL/Base64 span streams emit nested decode spans when bytes are still in
+//!   the ring; otherwise we fall back to full decode.
+//!
 //! ## Invariants
 //! - Decoded offsets are monotonically increasing during a stream decode.
 //! - `pending_windows` is a timing wheel keyed by `hi` (G=1), so windows are
@@ -24,6 +32,11 @@
 //! For `Gate::AnchorsInDecoded`, the preferred path is the decoded-space
 //! Vectorscan gate. If it cannot be used, we fall back to prefilter hits and
 //! may relax enforcement to avoid dropping UTF-16-only matches.
+//!
+//! ## Borrowing model
+//! We use raw pointers in a few tight loops to avoid holding mutable borrows
+//! across timing-wheel callbacks. These pointers are scoped to the call and
+//! never outlive `decode_stream_and_scan`.
 
 use crate::api::{DecodeStep, FileId, StepId};
 use crate::stdx::PushOutcome;
@@ -52,10 +65,19 @@ use super::work_items::{
 };
 use crate::api::{Gate, TransformConfig, TransformId, TransformMode};
 
+/// Guard that clears `root_span_map_ctx` on all exit paths.
+///
+/// # Safety
+/// `scratch` must point to the `ScanScratch` passed to the current
+/// `decode_stream_and_scan` call and must outlive the guard.
 struct RootSpanMapGuard {
     scratch: *mut ScanScratch,
 }
 
+/// Mix the root span into a decoded-content hash.
+///
+/// This prevents dedupe collisions when identical decoded bytes originate from
+/// different root spans (important for accurate root-hint attribution).
 fn mix_root_hint_hash(h: u128, root_hint: &Option<Range<usize>>) -> u128 {
     let Some(hint) = root_hint.as_ref() else {
         return h;
@@ -392,7 +414,8 @@ impl Engine {
             };
             // SAFETY: `bytes_ptr` comes from `scratch.window_bytes`. We materialize the slice
             // from a raw pointer to avoid borrowing `scratch` across calls that mutate other
-            // scratch fields. `window_bytes` is not mutated until after this slice is consumed.
+            // scratch fields. `window_bytes` is not mutated until after this slice is consumed,
+            // and the slice never escapes this function.
             let bytes = unsafe { std::slice::from_raw_parts(bytes_ptr, bytes_len) };
             let rule = &self.rules[win.rule_id as usize];
             match win.variant {
