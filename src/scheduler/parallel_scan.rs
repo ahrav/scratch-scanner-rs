@@ -91,6 +91,7 @@
 
 use super::local::{scan_local, FileSource, LocalConfig, LocalFile, LocalReport};
 use super::output_sink::OutputSink;
+use crate::archive::ArchiveConfig;
 use crate::engine::Engine;
 
 use std::io;
@@ -273,6 +274,9 @@ pub struct ParallelScanConfig {
     /// large binaries, media files, or database dumps that are unlikely
     /// to contain secrets but would consume significant scan time.
     pub max_file_size: u64,
+
+    /// Archive scanning configuration.
+    pub archive: ArchiveConfig,
 }
 
 impl Default for ParallelScanConfig {
@@ -289,6 +293,7 @@ impl Default for ParallelScanConfig {
             skip_hidden: true,
             respect_gitignore: true,
             max_file_size: 100 * 1024 * 1024, // 100 MiB
+            archive: ArchiveConfig::default(),
         }
     }
 }
@@ -310,6 +315,7 @@ impl ParallelScanConfig {
             max_file_size: self.max_file_size,
             seed: self.seed,
             dedupe_within_chunk: true,
+            archive: self.archive.clone(),
         }
     }
 }
@@ -628,6 +634,7 @@ mod tests {
             skip_hidden: true,
             respect_gitignore: false,
             max_file_size: 10 * 1024 * 1024,
+            archive: ArchiveConfig::default(),
         }
     }
 

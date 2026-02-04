@@ -586,16 +586,746 @@ impl FileReader {
     }
 }
 
+/// Hard cap on per-read output for archive streams.
+const ARCHIVE_STREAM_READ_MAX: usize = 256 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArchiveEnd {
+    Scanned,
+    Skipped(ArchiveSkipReason),
+    Partial(PartialReason),
+}
+
+struct ArchiveScratch {
+    scan_scratch: ScanScratch,
+    pending: Vec<FindingRec>,
+    canon: EntryPathCanonicalizer,
+    vpaths: Vec<VirtualPathBuilder>,
+    path_budget_used: Vec<usize>,
+    budgets: ArchiveBudgets,
+    /// Per-depth TAR cursors (one per nested depth).
+    tar_cursors: Vec<TarCursor>,
+    gzip_header_buf: Vec<u8>,
+    gzip_name_buf: Vec<u8>,
+    stream_buf: Vec<u8>,
+    chunk_size: usize,
+    /// Monotonic virtual `FileId` generator for archive entries.
+    next_virtual_file_id: u32,
+}
+
+impl ArchiveScratch {
+    fn new(engine: &Engine, archive: &ArchiveConfig, chunk_size: usize) -> Self {
+        let depth_cap = archive.max_archive_depth as usize + 2;
+        let mut vpaths = Vec::with_capacity(depth_cap);
+        for _ in 0..depth_cap {
+            vpaths.push(VirtualPathBuilder::with_capacity(
+                archive.max_virtual_path_len_per_entry,
+            ));
+        }
+        let mut tar_cursors = Vec::with_capacity(depth_cap);
+        for _ in 0..depth_cap {
+            tar_cursors.push(TarCursor::with_capacity(archive));
+        }
+        let path_budget_used = vec![0usize; depth_cap];
+        let gzip_name_cap = archive.max_virtual_path_len_per_entry;
+        let gzip_header_cap = archive
+            .max_virtual_path_len_per_entry
+            .saturating_add(256)
+            .min(archive.max_archive_metadata_bytes as usize)
+            .clamp(64, 64 * 1024);
+        let overlap = engine.required_overlap();
+        let buf_len = chunk_size.saturating_add(overlap).max(overlap + 1);
+
+        Self {
+            scan_scratch: engine.new_scratch(),
+            pending: Vec::with_capacity(engine.tuning.max_findings_per_chunk),
+            canon: EntryPathCanonicalizer::with_capacity(
+                DEFAULT_MAX_COMPONENTS,
+                archive.max_virtual_path_len_per_entry,
+            ),
+            vpaths,
+            path_budget_used,
+            budgets: ArchiveBudgets::new(archive),
+            tar_cursors,
+            gzip_header_buf: vec![0u8; gzip_header_cap],
+            gzip_name_buf: Vec::with_capacity(gzip_name_cap),
+            stream_buf: vec![0u8; buf_len],
+            chunk_size,
+            next_virtual_file_id: 0x8000_0000,
+        }
+    }
+}
+
+#[inline(always)]
+fn map_archive_skip_to_partial(reason: ArchiveSkipReason) -> PartialReason {
+    match reason {
+        ArchiveSkipReason::MetadataBudgetExceeded => PartialReason::MetadataBudgetExceeded,
+        ArchiveSkipReason::PathBudgetExceeded => PartialReason::PathBudgetExceeded,
+        ArchiveSkipReason::EntryCountExceeded => PartialReason::EntryCountExceeded,
+        ArchiveSkipReason::ArchiveOutputBudgetExceeded => {
+            PartialReason::ArchiveOutputBudgetExceeded
+        }
+        ArchiveSkipReason::RootOutputBudgetExceeded => PartialReason::RootOutputBudgetExceeded,
+        ArchiveSkipReason::InflationRatioExceeded => PartialReason::InflationRatioExceeded,
+        ArchiveSkipReason::UnsupportedFeature => PartialReason::UnsupportedFeature,
+        _ => PartialReason::MalformedZip,
+    }
+}
+
+#[inline(always)]
+fn budget_hit_to_partial_reason(hit: BudgetHit) -> PartialReason {
+    match hit {
+        BudgetHit::PartialArchive(r) => r,
+        BudgetHit::StopRoot(r) => r,
+        BudgetHit::SkipArchive(r) => map_archive_skip_to_partial(r),
+        BudgetHit::SkipEntry(_) => PartialReason::EntryOutputBudgetExceeded,
+    }
+}
+
+#[inline(always)]
+fn budget_hit_to_archive_end(hit: BudgetHit) -> ArchiveEnd {
+    match hit {
+        BudgetHit::SkipArchive(r) => ArchiveEnd::Skipped(r),
+        BudgetHit::PartialArchive(r) => ArchiveEnd::Partial(r),
+        BudgetHit::StopRoot(r) => ArchiveEnd::Partial(r),
+        BudgetHit::SkipEntry(_) => ArchiveEnd::Partial(PartialReason::EntryOutputBudgetExceeded),
+    }
+}
+
+/// Allocate a virtual `FileId` for archive entries (high-bit namespace).
+#[inline]
+fn alloc_virtual_file_id(next_virtual_file_id: &mut u32) -> FileId {
+    const VIRTUAL_FILE_ID_BASE: u32 = 0x8000_0000;
+    const VIRTUAL_FILE_ID_MASK: u32 = 0x7FFF_FFFF;
+
+    let id = *next_virtual_file_id;
+    let next = (id.wrapping_add(1) & VIRTUAL_FILE_ID_MASK) | VIRTUAL_FILE_ID_BASE;
+    *next_virtual_file_id = next;
+    FileId(id)
+}
+
+/// Charge decompressed bytes that were read but not scanned (entry truncation).
+#[inline(always)]
+fn charge_discarded_bytes(budgets: &mut ArchiveBudgets, bytes: u64) -> Result<(), PartialReason> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    match budgets.charge_discarded_out(bytes) {
+        ChargeResult::Ok => Ok(()),
+        ChargeResult::Clamp { hit, .. } => Err(budget_hit_to_partial_reason(hit)),
+    }
+}
+
+/// Drain remaining tar entry payload bytes to realign the stream.
+fn discard_remaining_payload<R: TarRead>(
+    input: &mut R,
+    budgets: &mut ArchiveBudgets,
+    buf: &mut [u8],
+    mut remaining: u64,
+) -> Result<(), PartialReason> {
+    while remaining > 0 {
+        let step = buf.len().min(remaining as usize);
+        let n = match input.read(&mut buf[..step]) {
+            Ok(n) => n,
+            Err(_) => return Err(PartialReason::MalformedTar),
+        };
+        if n == 0 {
+            return Err(PartialReason::MalformedTar);
+        }
+        budgets.charge_compressed_in(input.take_compressed_delta());
+        charge_discarded_bytes(budgets, n as u64)?;
+        remaining = remaining.saturating_sub(n as u64);
+    }
+    Ok(())
+}
+
+fn scan_gzip_file(
+    path: &Path,
+    file_id: FileId,
+    engine: &Engine,
+    archive: &ArchiveConfig,
+    scratch: &mut ArchiveScratch,
+    output: &mut OutputStage,
+    stats: &mut PipelineStats,
+) -> io::Result<ArchiveEnd> {
+    let overlap = engine.required_overlap();
+    let chunk_size = scratch.chunk_size.min(ARCHIVE_STREAM_READ_MAX);
+
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => {
+            stats.open_errors = stats.open_errors.saturating_add(1);
+            stats.errors = stats.errors.saturating_add(1);
+            return Ok(ArchiveEnd::Skipped(ArchiveSkipReason::IoError));
+        }
+    };
+
+    let parent_bytes = path.as_os_str().as_encoded_bytes();
+    let max_len = archive.max_virtual_path_len_per_entry;
+    debug_assert!(scratch.vpaths.len() > 1);
+    debug_assert!(scratch.path_budget_used.len() > 1);
+    scratch.path_budget_used[1] = 0;
+
+    let (mut gz, name_len) = match GzipStream::new_with_header(
+        file,
+        &mut scratch.gzip_header_buf,
+        &mut scratch.gzip_name_buf,
+        max_len,
+    ) {
+        Ok(v) => v,
+        Err(_) => {
+            stats.errors = stats.errors.saturating_add(1);
+            return Ok(ArchiveEnd::Skipped(ArchiveSkipReason::IoError));
+        }
+    };
+
+    let entry_name_bytes = if let Some(len) = name_len {
+        let c = scratch.canon.canonicalize(
+            &scratch.gzip_name_buf[..len],
+            DEFAULT_MAX_COMPONENTS,
+            max_len,
+        );
+        if c.had_traversal {
+            stats.archive.record_path_had_traversal();
+        }
+        if c.component_cap_exceeded {
+            stats.archive.record_component_cap_exceeded();
+        }
+        if c.truncated {
+            stats.archive.record_path_truncated();
+        }
+        c.bytes
+    } else {
+        b"<gunzip>"
+    };
+
+    let path_bytes = scratch.vpaths[1]
+        .build(parent_bytes, entry_name_bytes, max_len)
+        .bytes;
+    let need = path_bytes.len();
+    if scratch.path_budget_used[1].saturating_add(need) > archive.max_virtual_path_bytes_per_archive
+    {
+        let (_inner, hdr_buf) = gz.into_inner().into_parts();
+        scratch.gzip_header_buf = hdr_buf;
+        return Ok(ArchiveEnd::Partial(PartialReason::PathBudgetExceeded));
+    }
+    scratch.path_budget_used[1] = scratch.path_budget_used[1].saturating_add(need);
+
+    scratch.budgets.reset();
+    if let Err(hit) = scratch.budgets.enter_archive() {
+        let (_inner, hdr_buf) = gz.into_inner().into_parts();
+        scratch.gzip_header_buf = hdr_buf;
+        return Ok(budget_hit_to_archive_end(hit));
+    }
+    if let Err(hit) = scratch.budgets.begin_entry() {
+        scratch.budgets.exit_archive();
+        let (_inner, hdr_buf) = gz.into_inner().into_parts();
+        scratch.gzip_header_buf = hdr_buf;
+        return Ok(budget_hit_to_archive_end(hit));
+    }
+
+    let buf = &mut scratch.stream_buf;
+
+    let mut offset: u64 = 0;
+    let mut carry: usize = 0;
+    let mut have: usize = 0;
+    let mut outcome = ArchiveEnd::Scanned;
+    let mut entry_scanned = false;
+    let mut entry_partial_reason: Option<PartialReason> = None;
+
+    loop {
+        if carry > 0 && have > 0 {
+            buf.copy_within(have - carry..have, 0);
+        }
+
+        let allowance = scratch
+            .budgets
+            .remaining_decompressed_allowance_with_ratio_probe(true);
+        if allowance == 0 {
+            if let ChargeResult::Clamp { hit, .. } = scratch.budgets.charge_decompressed_out(1) {
+                let r = budget_hit_to_partial_reason(hit);
+                outcome = ArchiveEnd::Partial(r);
+                entry_partial_reason = Some(r);
+            }
+            break;
+        }
+
+        let read_max = chunk_size
+            .min(buf.len().saturating_sub(carry))
+            .min(allowance.min(u64::from(u32::MAX)) as usize);
+
+        if read_max == 0 {
+            if let ChargeResult::Clamp { hit, .. } = scratch.budgets.charge_decompressed_out(1) {
+                let r = budget_hit_to_partial_reason(hit);
+                outcome = ArchiveEnd::Partial(r);
+                entry_partial_reason = Some(r);
+            }
+            break;
+        }
+
+        let dst = &mut buf[carry..carry + read_max];
+        let n = match gz.read(dst) {
+            Ok(n) => n,
+            Err(_) => {
+                outcome = ArchiveEnd::Partial(PartialReason::GzipCorrupt);
+                entry_partial_reason = Some(PartialReason::GzipCorrupt);
+                break;
+            }
+        };
+
+        if n == 0 {
+            break;
+        }
+
+        scratch
+            .budgets
+            .charge_compressed_in(gz.take_compressed_delta());
+
+        let mut allowed = n as u64;
+        if let ChargeResult::Clamp { allowed: a, hit } =
+            scratch.budgets.charge_decompressed_out(allowed)
+        {
+            let r = budget_hit_to_partial_reason(hit);
+            allowed = a;
+            outcome = ArchiveEnd::Partial(r);
+            entry_partial_reason = Some(r);
+        }
+
+        if allowed == 0 {
+            break;
+        }
+
+        let allowed_usize = allowed as usize;
+        let read_len = carry + allowed_usize;
+
+        let base_offset = offset.saturating_sub(carry as u64);
+        let data = &buf[..read_len];
+
+        engine.scan_chunk_into(data, file_id, base_offset, &mut scratch.scan_scratch);
+        if !entry_scanned {
+            stats.archive.record_entry_scanned();
+            entry_scanned = true;
+        }
+
+        let new_bytes_start = offset;
+        scratch.scan_scratch.drop_prefix_findings(new_bytes_start);
+
+        scratch.pending.clear();
+        scratch
+            .scan_scratch
+            .drain_findings_into(&mut scratch.pending);
+
+        output.emit_findings_direct(engine, path_bytes, &scratch.pending, stats)?;
+
+        stats.chunks = stats.chunks.saturating_add(1);
+        stats.bytes_scanned = stats.bytes_scanned.saturating_add(allowed);
+
+        offset = offset.saturating_add(allowed);
+        have = read_len;
+        carry = overlap.min(read_len);
+
+        if allowed_usize < n {
+            break;
+        }
+    }
+
+    scratch.budgets.end_entry(offset > 0);
+    scratch.budgets.exit_archive();
+
+    let (_inner, hdr_buf) = gz.into_inner().into_parts();
+    scratch.gzip_header_buf = hdr_buf;
+
+    if !entry_scanned && outcome == ArchiveEnd::Scanned {
+        outcome = ArchiveEnd::Partial(PartialReason::GzipCorrupt);
+        entry_partial_reason = Some(PartialReason::GzipCorrupt);
+    }
+
+    if let Some(r) = entry_partial_reason {
+        stats.archive.record_entry_partial(r, path_bytes, false);
+    }
+
+    Ok(outcome)
+}
+
+/// Scan a tar stream (plain or gzip-wrapped) as sequential entries.
+///
+/// # Invariants
+/// - Entry payloads are scanned with chunk+overlap semantics.
+/// - Non-regular entries are skipped explicitly.
+/// - Malformed headers or payload reads yield `PartialReason::MalformedTar`.
+#[allow(clippy::too_many_arguments)]
+fn scan_tar_stream<R: TarRead>(
+    input: &mut R,
+    parent_bytes: &[u8],
+    engine: &Engine,
+    archive: &ArchiveConfig,
+    scratch: &mut ArchiveScratch,
+    output: &mut OutputStage,
+    stats: &mut PipelineStats,
+    ratio_active: bool,
+) -> io::Result<ArchiveEnd> {
+    let overlap = engine.required_overlap();
+    let chunk_size = scratch.chunk_size.min(ARCHIVE_STREAM_READ_MAX);
+    let max_len = archive.max_virtual_path_len_per_entry;
+
+    debug_assert!(scratch.vpaths.len() > 1);
+    debug_assert!(scratch.path_budget_used.len() > 1);
+    scratch.path_budget_used[1] = 0;
+
+    scratch.budgets.reset();
+    if let Err(hit) = scratch.budgets.enter_archive() {
+        return Ok(budget_hit_to_archive_end(hit));
+    }
+
+    let cursor = scratch
+        .tar_cursors
+        .get_mut(0)
+        .expect("tar cursor scratch exhausted");
+    cursor.reset();
+
+    let buf = &mut scratch.stream_buf;
+    let mut outcome = ArchiveEnd::Scanned;
+
+    loop {
+        let (entry_name, entry_size, entry_pad, entry_typeflag) =
+            match cursor.next_entry(input, &mut scratch.budgets, archive) {
+                Ok(TarNext::End) => break,
+                Ok(TarNext::Stop(r)) => {
+                    outcome = ArchiveEnd::Partial(r);
+                    break;
+                }
+                Ok(TarNext::Entry(m)) => (m.name, m.size, m.pad, m.typeflag),
+                Err(_) => {
+                    outcome = ArchiveEnd::Partial(PartialReason::MalformedTar);
+                    break;
+                }
+            };
+
+        let (entry_display, is_regular) = {
+            let c = scratch
+                .canon
+                .canonicalize(entry_name, DEFAULT_MAX_COMPONENTS, max_len);
+            if c.had_traversal {
+                stats.archive.record_path_had_traversal();
+            }
+            if c.component_cap_exceeded {
+                stats.archive.record_component_cap_exceeded();
+            }
+            if c.truncated {
+                stats.archive.record_path_truncated();
+            }
+            let entry_display = scratch.vpaths[1]
+                .build(parent_bytes, c.bytes, max_len)
+                .bytes;
+            let _nested_kind = detect_kind_from_name_bytes(entry_name);
+            let is_regular = entry_typeflag == 0 || entry_typeflag == b'0';
+            (entry_display, is_regular)
+        };
+
+        let need = entry_display.len();
+        if scratch.path_budget_used[1].saturating_add(need)
+            > archive.max_virtual_path_bytes_per_archive
+        {
+            outcome = ArchiveEnd::Partial(PartialReason::PathBudgetExceeded);
+            break;
+        }
+        scratch.path_budget_used[1] = scratch.path_budget_used[1].saturating_add(need);
+
+        if !is_regular {
+            stats
+                .archive
+                .record_entry_skipped(EntrySkipReason::NonRegular, entry_display, false);
+            match cursor.skip_payload_and_pad(input, &mut scratch.budgets, entry_size, entry_pad) {
+                Ok(Ok(())) => continue,
+                Ok(Err(r)) => {
+                    outcome = ArchiveEnd::Partial(r);
+                    break;
+                }
+                Err(_) => {
+                    outcome = ArchiveEnd::Partial(PartialReason::MalformedTar);
+                    break;
+                }
+            }
+        }
+
+        scratch.budgets.begin_entry_scan();
+
+        let entry_file_id = alloc_virtual_file_id(&mut scratch.next_virtual_file_id);
+        let mut remaining = entry_size;
+        let mut offset: u64 = 0;
+        let mut carry: usize = 0;
+        let mut have: usize = 0;
+        let mut entry_scanned = false;
+        let mut entry_partial_reason: Option<PartialReason> = None;
+        let mut stop_archive = false;
+
+        while remaining > 0 {
+            if carry > 0 && have > 0 {
+                buf.copy_within(have - carry..have, 0);
+            }
+
+            let allow = scratch
+                .budgets
+                .remaining_decompressed_allowance_with_ratio_probe(ratio_active);
+            if allow == 0 {
+                if let ChargeResult::Clamp { hit, .. } = scratch.budgets.charge_decompressed_out(1)
+                {
+                    let r = budget_hit_to_partial_reason(hit);
+                    entry_partial_reason = Some(r);
+                    if !matches!(hit, BudgetHit::SkipEntry(_)) {
+                        outcome = ArchiveEnd::Partial(r);
+                        stop_archive = true;
+                    }
+                }
+                break;
+            }
+
+            let read_max = chunk_size
+                .min(buf.len().saturating_sub(carry))
+                .min(allow.min(remaining).min(u64::from(u32::MAX)) as usize);
+            if read_max == 0 {
+                if let ChargeResult::Clamp { hit, .. } = scratch.budgets.charge_decompressed_out(1)
+                {
+                    let r = budget_hit_to_partial_reason(hit);
+                    entry_partial_reason = Some(r);
+                    if !matches!(hit, BudgetHit::SkipEntry(_)) {
+                        outcome = ArchiveEnd::Partial(r);
+                        stop_archive = true;
+                    }
+                }
+                break;
+            }
+
+            let dst = &mut buf[carry..carry + read_max];
+            let n = match input.read(dst) {
+                Ok(n) => n,
+                Err(_) => {
+                    outcome = ArchiveEnd::Partial(PartialReason::MalformedTar);
+                    entry_partial_reason = Some(PartialReason::MalformedTar);
+                    stop_archive = true;
+                    break;
+                }
+            };
+
+            scratch
+                .budgets
+                .charge_compressed_in(input.take_compressed_delta());
+
+            if n == 0 {
+                outcome = ArchiveEnd::Partial(PartialReason::MalformedTar);
+                entry_partial_reason = Some(PartialReason::MalformedTar);
+                stop_archive = true;
+                break;
+            }
+            remaining = remaining.saturating_sub(n as u64);
+
+            let mut allowed = n as u64;
+            if let ChargeResult::Clamp { allowed: a, hit } =
+                scratch.budgets.charge_decompressed_out(allowed)
+            {
+                let r = budget_hit_to_partial_reason(hit);
+                allowed = a;
+                entry_partial_reason = Some(r);
+                if !matches!(hit, BudgetHit::SkipEntry(_)) {
+                    outcome = ArchiveEnd::Partial(r);
+                    stop_archive = true;
+                }
+            }
+
+            if allowed == 0 {
+                if let Err(r) = charge_discarded_bytes(&mut scratch.budgets, n as u64) {
+                    if entry_partial_reason.is_none() {
+                        entry_partial_reason = Some(r);
+                    }
+                    outcome = ArchiveEnd::Partial(r);
+                    stop_archive = true;
+                }
+                break;
+            }
+
+            let allowed_usize = allowed as usize;
+            let read_len = carry + allowed_usize;
+            let base_offset = offset.saturating_sub(carry as u64);
+            let data = &buf[..read_len];
+
+            engine.scan_chunk_into(data, entry_file_id, base_offset, &mut scratch.scan_scratch);
+            if !entry_scanned {
+                stats.archive.record_entry_scanned();
+                entry_scanned = true;
+            }
+
+            let new_bytes_start = offset;
+            scratch.scan_scratch.drop_prefix_findings(new_bytes_start);
+
+            scratch.pending.clear();
+            scratch
+                .scan_scratch
+                .drain_findings_into(&mut scratch.pending);
+
+            output.emit_findings_direct(engine, entry_display, &scratch.pending, stats)?;
+
+            stats.chunks = stats.chunks.saturating_add(1);
+            stats.bytes_scanned = stats.bytes_scanned.saturating_add(allowed);
+
+            offset = offset.saturating_add(allowed);
+            have = read_len;
+            carry = overlap.min(read_len);
+
+            if allowed_usize < n {
+                let extra = (n - allowed_usize) as u64;
+                if let Err(r) = charge_discarded_bytes(&mut scratch.budgets, extra) {
+                    if entry_partial_reason.is_none() {
+                        entry_partial_reason = Some(r);
+                    }
+                    outcome = ArchiveEnd::Partial(r);
+                    stop_archive = true;
+                }
+                break;
+            }
+        }
+
+        if !stop_archive && remaining > 0 {
+            if let Err(r) = discard_remaining_payload(
+                input,
+                &mut scratch.budgets,
+                buf.as_mut_slice(),
+                remaining,
+            ) {
+                if entry_partial_reason.is_none() {
+                    entry_partial_reason = Some(r);
+                }
+                outcome = ArchiveEnd::Partial(r);
+                stop_archive = true;
+            }
+        }
+
+        scratch.budgets.end_entry(offset > 0);
+        if let Some(r) = entry_partial_reason {
+            stats.archive.record_entry_partial(r, entry_display, false);
+        }
+
+        if stop_archive {
+            break;
+        }
+
+        match cursor.skip_padding_only(input, &mut scratch.budgets, entry_pad) {
+            Ok(Ok(())) => {}
+            Ok(Err(r)) => {
+                outcome = ArchiveEnd::Partial(r);
+                break;
+            }
+            Err(_) => {
+                outcome = ArchiveEnd::Partial(PartialReason::MalformedTar);
+                break;
+            }
+        }
+        cursor.advance_entry_blocks(entry_size, entry_pad);
+    }
+
+    scratch.budgets.exit_archive();
+    Ok(outcome)
+}
+
+/// Process a plain `.tar` file.
+fn scan_tar_file(
+    path: &Path,
+    engine: &Engine,
+    archive: &ArchiveConfig,
+    scratch: &mut ArchiveScratch,
+    output: &mut OutputStage,
+    stats: &mut PipelineStats,
+) -> io::Result<ArchiveEnd> {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => {
+            stats.open_errors = stats.open_errors.saturating_add(1);
+            stats.errors = stats.errors.saturating_add(1);
+            return Ok(ArchiveEnd::Skipped(ArchiveSkipReason::IoError));
+        }
+    };
+
+    let parent_bytes = path.as_os_str().as_encoded_bytes();
+    let mut input = TarInput::Plain(file);
+    scan_tar_stream(
+        &mut input,
+        parent_bytes,
+        engine,
+        archive,
+        scratch,
+        output,
+        stats,
+        false,
+    )
+}
+
+/// Process a `.tar.gz` file via gzip+tar streaming.
+fn scan_targz_file(
+    path: &Path,
+    engine: &Engine,
+    archive: &ArchiveConfig,
+    scratch: &mut ArchiveScratch,
+    output: &mut OutputStage,
+    stats: &mut PipelineStats,
+) -> io::Result<ArchiveEnd> {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => {
+            stats.open_errors = stats.open_errors.saturating_add(1);
+            stats.errors = stats.errors.saturating_add(1);
+            return Ok(ArchiveEnd::Skipped(ArchiveSkipReason::IoError));
+        }
+    };
+
+    let parent_bytes = path.as_os_str().as_encoded_bytes();
+    let mut input = TarInput::Gzip(GzipStream::new(file));
+    scan_tar_stream(
+        &mut input,
+        parent_bytes,
+        engine,
+        archive,
+        scratch,
+        output,
+        stats,
+        true,
+    )
+}
+
 /// Stage that turns file ids into buffered chunks.
 ///
 /// Maintains a single active reader and a fixed overlap tail to keep IO
 /// sequential and memory bounded.
+///
+/// When archive scanning is enabled, this stage detects archive containers and
+/// routes them through the archive dispatch entrypoint instead of emitting
+/// chunks.
 struct ReaderStage {
     overlap: usize,
     chunk_size: usize,
     active: Option<FileReader>,
     tail: Vec<u8>,
     tail_len: usize,
+}
+
+/// Dispatch archive scanning by kind.
+///
+/// Currently gzip/tar/tar.gz are supported; other formats are skipped.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_archive_scan(
+    path: &Path,
+    file_id: FileId,
+    engine: &Engine,
+    archive: &ArchiveConfig,
+    scratch: &mut ArchiveScratch,
+    output: &mut OutputStage,
+    stats: &mut PipelineStats,
+    kind: ArchiveKind,
+) -> io::Result<ArchiveEnd> {
+    match kind {
+        ArchiveKind::Gzip => scan_gzip_file(path, file_id, engine, archive, scratch, output, stats),
+        ArchiveKind::Tar => scan_tar_file(path, engine, archive, scratch, output, stats),
+        ArchiveKind::TarGz => scan_targz_file(path, engine, archive, scratch, output, stats),
+        _ => Ok(ArchiveEnd::Skipped(ArchiveSkipReason::UnsupportedFeature)),
+    }
 }
 
 impl ReaderStage {
@@ -624,12 +1354,17 @@ impl ReaderStage {
         false
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn pump<const FILE_CAP: usize, const CHUNK_CAP: usize>(
         &mut self,
         file_ring: &mut SpscRing<FileId, FILE_CAP>,
         chunk_ring: &mut SpscRing<Chunk, CHUNK_CAP>,
         pool: &BufferPool,
         files: &FileTable,
+        engine: &Engine,
+        archive: &ArchiveConfig,
+        archive_scratch: &mut ArchiveScratch,
+        output: &mut OutputStage,
         stats: &mut PipelineStats,
     ) -> io::Result<bool> {
         let mut progressed = false;
@@ -648,7 +1383,37 @@ impl ReaderStage {
 
                 self.tail_len = 0;
                 let path = files.path(file_id);
-                let file = match File::open(path) {
+                let path_bytes = path.as_os_str().as_encoded_bytes();
+                let ext_kind = if archive.enabled {
+                    detect_kind_from_path(path)
+                } else {
+                    None
+                };
+                if let Some(kind) = ext_kind {
+                    stats.archive.record_archive_seen();
+                    let outcome = dispatch_archive_scan(
+                        path,
+                        file_id,
+                        engine,
+                        archive,
+                        archive_scratch,
+                        output,
+                        stats,
+                        kind,
+                    )?;
+                    match outcome {
+                        ArchiveEnd::Scanned => stats.archive.record_archive_scanned(),
+                        ArchiveEnd::Skipped(r) => {
+                            stats.archive.record_archive_skipped(r, path_bytes, false);
+                        }
+                        ArchiveEnd::Partial(r) => {
+                            stats.archive.record_archive_partial(r, path_bytes, false);
+                        }
+                    }
+                    continue;
+                }
+
+                let mut file = match File::open(path) {
                     Ok(file) => file,
                     Err(_) => {
                         stats.open_errors += 1;
@@ -656,6 +1421,46 @@ impl ReaderStage {
                         continue;
                     }
                 };
+
+                if archive.enabled {
+                    let mut header = [0u8; TAR_BLOCK_LEN];
+                    let n = match file.read(&mut header) {
+                        Ok(n) => n,
+                        Err(_) => {
+                            stats.errors += 1;
+                            continue;
+                        }
+                    };
+                    if n > 0 {
+                        if let Some(kind) = sniff_kind_from_header(&header[..n]) {
+                            stats.archive.record_archive_seen();
+                            let outcome = dispatch_archive_scan(
+                                path,
+                                file_id,
+                                engine,
+                                archive,
+                                archive_scratch,
+                                output,
+                                stats,
+                                kind,
+                            )?;
+                            match outcome {
+                                ArchiveEnd::Scanned => stats.archive.record_archive_scanned(),
+                                ArchiveEnd::Skipped(r) => {
+                                    stats.archive.record_archive_skipped(r, path_bytes, false);
+                                }
+                                ArchiveEnd::Partial(r) => {
+                                    stats.archive.record_archive_partial(r, path_bytes, false);
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    if file.seek(SeekFrom::Start(0)).is_err() {
+                        stats.errors += 1;
+                        continue;
+                    }
+                }
 
                 self.active = Some(FileReader::new(file_id, file));
                 progressed = true;
@@ -793,6 +1598,11 @@ fn write_path<W: Write>(out: &mut W, path: &Path) -> io::Result<()> {
     }
 }
 
+#[inline]
+fn write_path_bytes<W: Write>(out: &mut W, bytes: &[u8]) -> io::Result<()> {
+    out.write_all(bytes)
+}
+
 /// Stage that formats findings to stdout.
 ///
 /// Output format: `path:start-end rule` (one finding per line).
@@ -833,6 +1643,32 @@ impl OutputStage {
         Ok(progressed)
     }
 
+    fn emit_findings_direct(
+        &mut self,
+        engine: &Engine,
+        display_path: &[u8],
+        findings: &[FindingRec],
+        stats: &mut PipelineStats,
+    ) -> io::Result<()> {
+        if findings.is_empty() {
+            return Ok(());
+        }
+
+        for rec in findings {
+            let rule = engine.rule_name(rec.rule_id);
+            write_path_bytes(&mut self.out, display_path)?;
+            write!(
+                self.out,
+                ":{}-{} {}",
+                rec.root_hint_start, rec.root_hint_end, rule
+            )?;
+            self.out.write_all(b"\n")?;
+            stats.findings = stats.findings.wrapping_add(1);
+        }
+
+        Ok(())
+    }
+
     fn flush(&mut self) -> io::Result<()> {
         self.out.flush()
     }
@@ -854,6 +1690,7 @@ pub struct Pipeline<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP
     walker: Walker,
     reader: ReaderStage,
     scanner: ScanStage,
+    archive_scratch: ArchiveScratch,
     output: OutputStage,
 }
 
@@ -877,6 +1714,9 @@ impl<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize>
         if config.path_bytes_cap == 0 {
             config.path_bytes_cap = config.max_files.saturating_mul(PIPE_PATH_BYTES_PER_FILE);
         }
+        if let Err(err) = config.archive.validate() {
+            panic!("archive config invalid: {err}");
+        }
 
         let buf_len = overlap.saturating_add(config.chunk_size);
         assert!(buf_len <= BUFFER_LEN_MAX);
@@ -885,6 +1725,7 @@ impl<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize>
         let max_files = config.max_files;
         let path_bytes_cap = config.path_bytes_cap;
         let scanner = ScanStage::new(&engine);
+        let archive_scratch = ArchiveScratch::new(&engine, &config.archive, chunk_size);
         let pool = BufferPool::new(default_pool_capacity());
         Self {
             engine,
@@ -898,6 +1739,7 @@ impl<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize>
             walker: Walker::new(max_files),
             reader: ReaderStage::new(overlap, chunk_size),
             scanner,
+            archive_scratch,
             output: OutputStage::new(),
         }
     }
@@ -928,6 +1770,10 @@ impl<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize>
                 &mut self.chunk_ring,
                 &self.pool,
                 &self.files,
+                self.engine.as_ref(),
+                &self.config.archive,
+                &mut self.archive_scratch,
+                &mut self.output,
                 stats,
             )?;
             progressed |= self
@@ -1106,7 +1952,11 @@ fn dev_inode(meta: &std::fs::Metadata) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive::ArchiveSkipReason;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
     use std::fs;
+    use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
@@ -1187,6 +2037,77 @@ mod tests {
         assert!(stats.open_errors > 0);
         assert!(stats.errors >= stats.walk_errors + stats.open_errors);
 
+        Ok(())
+    }
+
+    #[test]
+    fn pipeline_skips_archive_when_enabled() -> io::Result<()> {
+        let tmp = make_temp_dir("scanner_archive_skip")?;
+        let path = tmp.path().join("sample.zip");
+        fs::write(&path, b"SECRET")?;
+
+        let engine = Arc::new(crate::demo_engine());
+        let mut cfg = PipelineConfig::default();
+        cfg.archive.enabled = true;
+        let mut pipeline: Pipeline<PIPE_FILE_RING_CAP, PIPE_CHUNK_RING_CAP, PIPE_OUT_RING_CAP> =
+            Pipeline::new(engine, cfg);
+
+        let stats = pipeline.scan_path(&path)?;
+
+        assert_eq!(stats.archive.archives_seen, 1);
+        assert_eq!(stats.archive.archives_skipped, 1);
+        assert_eq!(
+            stats.archive.archive_skip_reasons[ArchiveSkipReason::UnsupportedFeature.as_usize()],
+            1
+        );
+        assert_eq!(stats.bytes_scanned, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn pipeline_scans_archive_extension_when_disabled() -> io::Result<()> {
+        let tmp = make_temp_dir("scanner_archive_disabled")?;
+        let path = tmp.path().join("sample.zip");
+        let payload = b"plain bytes with SECRET marker";
+        fs::write(&path, payload)?;
+
+        let engine = Arc::new(crate::demo_engine());
+        let mut cfg = PipelineConfig::default();
+        cfg.archive.enabled = false;
+        let mut pipeline: Pipeline<PIPE_FILE_RING_CAP, PIPE_CHUNK_RING_CAP, PIPE_OUT_RING_CAP> =
+            Pipeline::new(engine, cfg);
+
+        let stats = pipeline.scan_path(&path)?;
+
+        assert_eq!(stats.archive.archives_seen, 0);
+        assert_eq!(stats.archive.archives_skipped, 0);
+        assert!(stats.bytes_scanned >= payload.len() as u64);
+        Ok(())
+    }
+
+    #[test]
+    fn pipeline_scans_gzip_when_enabled() -> io::Result<()> {
+        let tmp = make_temp_dir("scanner_gzip_scan")?;
+        let path = tmp.path().join("payload.txt.gz");
+
+        let payload = b"payload SECRET inside";
+        let f = fs::File::create(&path)?;
+        let mut enc = GzEncoder::new(f, Compression::default());
+        enc.write_all(payload)?;
+        enc.finish()?;
+
+        let engine = Arc::new(crate::demo_engine());
+        let mut cfg = PipelineConfig::default();
+        cfg.archive.enabled = true;
+        let mut pipeline: Pipeline<PIPE_FILE_RING_CAP, PIPE_CHUNK_RING_CAP, PIPE_OUT_RING_CAP> =
+            Pipeline::new(engine, cfg);
+
+        let stats = pipeline.scan_path(&path)?;
+
+        assert_eq!(stats.archive.archives_seen, 1);
+        assert_eq!(stats.archive.archives_scanned, 1);
+        assert!(stats.archive.entries_scanned > 0);
+        assert!(stats.bytes_scanned > 0);
         Ok(())
     }
 }

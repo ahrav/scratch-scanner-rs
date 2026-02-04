@@ -10,7 +10,8 @@
 //!   `BUFFER_LEN_MAX`.
 //! - The buffer pool is intentionally single-threaded (`Rc` + `UnsafeCell`).
 //! - On Unix, paths live in a fixed-capacity byte arena; overflow is a hard
-//!   error to keep allocations predictable.
+//!   error to keep allocations predictable. Archive expansion should use the
+//!   fallible `try_*` APIs to avoid panics on hostile inputs.
 //! - `Chunk::base_offset` always refers to the start of the chunk including
 //!   overlap, which keeps span reporting consistent across boundaries.
 //!
@@ -163,6 +164,16 @@ impl FileTable {
         self.push_span(span, size, dev_inode, flags)
     }
 
+    /// Attempts to reserve space for path bytes and returns a span (Unix only).
+    ///
+    /// This is the non-panicking variant used by archive expansion.
+    /// Returns `None` if the path arena would overflow or if spans would
+    /// not fit in `u32`.
+    #[cfg(unix)]
+    pub(crate) fn try_push_path_bytes(&mut self, bytes: &[u8]) -> Option<PathSpan> {
+        self.try_alloc_path_span(bytes)
+    }
+
     /// Reserves space for a path and returns its span (Unix only).
     ///
     /// Bytes are appended verbatim to the arena (no separators inserted).
@@ -186,6 +197,27 @@ impl FileTable {
             offset: start as u32,
             len: bytes.len() as u32,
         }
+    }
+
+    /// Fallible variant of `alloc_path_span` (Unix only).
+    #[cfg(unix)]
+    fn try_alloc_path_span(&mut self, bytes: &[u8]) -> Option<PathSpan> {
+        let start = self.path_bytes.len();
+        let new_len = start.saturating_add(bytes.len());
+        if new_len > self.path_bytes.capacity() {
+            return None;
+        }
+        if new_len > u32::MAX as usize {
+            return None;
+        }
+        if bytes.len() > u32::MAX as usize {
+            return None;
+        }
+        self.path_bytes.extend_from_slice(bytes);
+        Some(PathSpan {
+            offset: start as u32,
+            len: bytes.len() as u32,
+        })
     }
 
     /// Appends `parent` + "/" + `name` into the path arena (Unix only).
@@ -270,6 +302,81 @@ impl FileTable {
         self.dev_inodes.push(dev_inode);
         self.flags.push(flags);
         id
+    }
+
+    /// Non-panicking variant of `push_span` (Unix only).
+    ///
+    /// Returns `None` if the table capacity is exceeded or if the span is invalid.
+    #[cfg(unix)]
+    pub(crate) fn try_push_span(
+        &mut self,
+        span: PathSpan,
+        size: u64,
+        dev_inode: (u64, u64),
+        flags: u32,
+    ) -> Option<FileId> {
+        let start = span.offset as usize;
+        let end = start.saturating_add(span.len as usize);
+        if end > self.path_bytes.len() {
+            return None;
+        }
+        if self.sizes.len() >= self.sizes.capacity() {
+            return None;
+        }
+        if self.path_spans.len() >= self.path_spans.capacity() {
+            return None;
+        }
+        if self.sizes.len() >= u32::MAX as usize {
+            return None;
+        }
+        let id = FileId(self.sizes.len() as u32);
+        self.path_spans.push(span);
+        self.sizes.push(size);
+        self.dev_inodes.push(dev_inode);
+        self.flags.push(flags);
+        Some(id)
+    }
+
+    /// Inserts a "virtual file" (for example an archive entry) with explicit display bytes.
+    ///
+    /// This is used by archive scanning so output formatting can still read
+    /// a path from `FileTable` without panicking on path arena overflow.
+    pub fn try_insert_virtual(
+        &mut self,
+        display_bytes: &[u8],
+        size_hint: u64,
+        flags: u32,
+    ) -> Option<FileId> {
+        let dev_inode = (0u64, 0u64);
+
+        #[cfg(unix)]
+        {
+            let span = self.try_alloc_path_span(display_bytes)?;
+            self.try_push_span(span, size_hint, dev_inode, flags)
+        }
+
+        #[cfg(not(unix))]
+        {
+            if self.sizes.len() >= self.sizes.capacity() {
+                return None;
+            }
+            if self.paths.len() >= self.paths.capacity() {
+                return None;
+            }
+            if self.sizes.len() >= u32::MAX as usize {
+                return None;
+            }
+
+            let path_str = std::str::from_utf8(display_bytes)
+                .map(|s| s.to_owned())
+                .unwrap_or_else(|_| String::from_utf8_lossy(display_bytes).to_string());
+            let id = FileId(self.sizes.len() as u32);
+            self.paths.push(PathBuf::from(path_str));
+            self.sizes.push(size_hint);
+            self.dev_inodes.push(dev_inode);
+            self.flags.push(flags);
+            Some(id)
+        }
     }
 
     /// Returns the number of tracked files.
@@ -770,5 +877,28 @@ impl ScannerRuntime {
         }
 
         Ok(self.out.as_slice())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests_filetable_try {
+    use super::*;
+
+    #[test]
+    fn try_push_path_bytes_respects_arena_budget() {
+        let mut t = FileTable::with_capacity_and_path_bytes(1, 4);
+        assert!(t.try_push_path_bytes(b"abcd").is_some());
+        assert!(t.try_push_path_bytes(b"e").is_none());
+    }
+
+    #[test]
+    fn try_insert_virtual_respects_file_capacity() {
+        let mut t = FileTable::with_capacity_and_path_bytes(2, 64);
+        let a = t.try_insert_virtual(b"a", 1, 0);
+        let b = t.try_insert_virtual(b"b", 1, 0);
+        let c = t.try_insert_virtual(b"c", 1, 0);
+        assert!(a.is_some());
+        assert!(b.is_some());
+        assert!(c.is_none());
     }
 }
