@@ -153,6 +153,7 @@ fn generate_unique_rules(count: usize) -> Vec<RuleSpec> {
                 keywords_any: None,
                 entropy: None,
                 local_context: None,
+                lexical_context: None,
                 secret_group: None,
                 re: regex::bytes::Regex::new(&format!(r"{prefix}[A-Z0-9]{{16}}")).unwrap(),
             }
