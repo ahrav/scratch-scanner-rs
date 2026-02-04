@@ -18,7 +18,8 @@
 //! 7. `pack_plan` builds per-pack decode plans from pack candidates.
 //!
 //! # Invariants
-//! - No blob reads (metadata only).
+//! - Metadata stages (preflight through pack planning) do not read blob payloads.
+//! - Pack execution and engine adaptation read and scan blob bytes with explicit limits.
 //! - File reads are bounded by explicit limits.
 //! - Outputs are deterministic for identical repo state.
 
@@ -124,7 +125,10 @@ pub use repo_open::{
 pub use run_format::{RunContext, RunHeader, RunRecord};
 pub use run_reader::RunReader;
 pub use run_writer::RunWriter;
-pub use runner::{run_git_scan, GitScanConfig, GitScanError, GitScanReport, GitScanResult};
+pub use runner::{
+    run_git_scan, CandidateSkipReason, GitScanConfig, GitScanError, GitScanReport, GitScanResult,
+    SkippedCandidate,
+};
 pub use seen_store::{AlwaysSeenStore, InMemorySeenStore, NeverSeenStore, SeenBlobStore};
 pub use snapshot_plan::snapshot_plan;
 pub use spill_chunk::CandidateChunk;

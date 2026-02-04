@@ -3,6 +3,19 @@
 //! Orchestrates preflight, repo open, commit walk, tree diff, spill/dedupe,
 //! pack planning, pack decode + scan, finalize, and persistence.
 //!
+//! # Pipeline
+//! 1. Preflight repository metadata and artifact readiness.
+//! 2. Open the repo (start set resolution, watermarks, and artifact status).
+//! 3. Plan commits, diff trees, and collect candidate blobs.
+//! 4. Spill/dedupe candidates and map them to pack entries.
+//! 5. Plan packs, decode + scan, then finalize and optionally persist.
+//!
+//! # Invariants
+//! - If preflight or repo open detects missing artifacts, the run returns
+//!   `GitScanResult::NeedsMaintenance` and skips the scan pipeline.
+//! - MIDX completeness is verified before pack execution.
+//! - Pack cache sizing must fit in `u32` (checked before execution).
+//!
 //! # Notes
 //! - Loose objects are currently treated as skipped candidates.
 //! - Persistence is optional; callers can run the pipeline without a store.
@@ -33,7 +46,7 @@ use super::object_store::ObjectStore;
 use super::pack_cache::PackCache;
 use super::pack_candidates::CollectingPackCandidateSink;
 use super::pack_decode::PackDecodeLimits;
-use super::pack_exec::{execute_pack_plan, PackExecError, PackExecReport, SkipRecord};
+use super::pack_exec::{execute_pack_plan, PackExecError, PackExecReport, SkipReason, SkipRecord};
 use super::pack_io::{PackIo, PackIoError, PackIoLimits};
 use super::pack_plan::{build_pack_plans, PackPlanConfig, PackPlanError, PackView};
 use super::pack_plan_model::{PackPlan, PackPlanStats};
@@ -56,7 +69,8 @@ use super::tree_diff_limits::TreeDiffLimits;
 ///
 /// The defaults mirror the Git scanning limits and are intended for
 /// production usage. Callers should set `repo_id` and `policy_hash` to
-/// stable identifiers for their environment.
+/// stable identifiers for their environment to ensure consistent
+/// persistence keys and scan identity.
 #[derive(Clone, Debug)]
 pub struct GitScanConfig {
     /// Stable repository identifier used to namespace persisted keys.
@@ -115,8 +129,50 @@ impl Default for GitScanConfig {
 pub enum GitScanResult {
     /// The repo is missing required maintenance artifacts (commit-graph, MIDX, etc.).
     NeedsMaintenance { preflight: PreflightReport },
-    /// Scan completed (data ops may still be partial if candidates were skipped).
+    /// Scan completed; consult `finalize.outcome` and `skipped_candidates` for partial runs.
     Completed(GitScanReport),
+}
+
+/// Reason a candidate blob was skipped during the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateSkipReason {
+    /// Candidate was loose and the pipeline does not yet scan loose objects.
+    LooseUnscanned,
+    /// Pack entry was not a blob.
+    PackNotBlob,
+    /// Pack entry failed to decode.
+    PackDecode,
+    /// Delta application failed.
+    PackDelta,
+    /// Delta base offset was missing from the cache.
+    PackBaseMissing,
+    /// External base OID could not be resolved.
+    PackExternalBaseMissing,
+    /// External base provider failed.
+    PackExternalBaseError,
+    /// Pack parse error surfaced as a skip.
+    PackParse,
+}
+
+impl CandidateSkipReason {
+    fn from_pack_skip(reason: &SkipReason) -> Self {
+        match reason {
+            SkipReason::PackParse(_) => Self::PackParse,
+            SkipReason::Decode(_) => Self::PackDecode,
+            SkipReason::Delta(_) => Self::PackDelta,
+            SkipReason::BaseMissing { .. } => Self::PackBaseMissing,
+            SkipReason::ExternalBaseMissing { .. } => Self::PackExternalBaseMissing,
+            SkipReason::ExternalBaseError => Self::PackExternalBaseError,
+            SkipReason::NotBlob => Self::PackNotBlob,
+        }
+    }
+}
+
+/// Candidate blob skipped during the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SkippedCandidate {
+    pub oid: OidBytes,
+    pub reason: CandidateSkipReason,
 }
 
 /// Summary report for a completed scan.
@@ -134,6 +190,8 @@ pub struct GitScanReport {
     pub pack_plan_stats: Vec<PackPlanStats>,
     /// Pack decode + scan reports.
     pub pack_exec_reports: Vec<PackExecReport>,
+    /// Candidates skipped with explicit reasons.
+    pub skipped_candidates: Vec<SkippedCandidate>,
     /// Finalize output and persistence stats.
     pub finalize: FinalizeOutput,
 }
@@ -251,6 +309,17 @@ impl From<io::Error> for GitScanError {
 /// The pipeline short-circuits with `NeedsMaintenance` if preflight or repo
 /// open indicates missing artifacts (MIDX, commit graph, etc.). On success,
 /// the scan is finalized and optionally persisted.
+///
+/// # Inputs
+/// - `repo_root` must reference a Git repository with readable metadata.
+/// - `resolver` controls how the start set is chosen (default branch, refs, etc.).
+/// - `seen_store` is used to dedupe candidates across runs.
+/// - `watermark_store` records ref watermarks when finalize succeeds.
+/// - `persist_store` is optional; when `None`, finalize output is returned only.
+///
+/// # Returns
+/// - `NeedsMaintenance` when repo artifacts are missing or out of date.
+/// - `Completed` with a `GitScanReport` when the scan finishes.
 ///
 /// # Caveats
 /// - Loose objects are currently treated as skipped candidates. This yields
@@ -412,11 +481,14 @@ pub fn run_git_scan(
     let mut external = PackIo::open(&repo, config.pack_io)?;
     let mut adapter = EngineAdapter::new(engine, config.engine_adapter);
     let mut pack_exec_reports = Vec::with_capacity(plans.len());
-    let mut skipped_candidate_oids = Vec::new();
+    let mut skipped_candidates = Vec::new();
 
     // Record loose candidates as skipped (not yet decoded).
     for cand in &sink.loose {
-        skipped_candidate_oids.push(cand.oid);
+        skipped_candidates.push(SkippedCandidate {
+            oid: cand.oid,
+            reason: CandidateSkipReason::LooseUnscanned,
+        });
     }
 
     for plan in &plans {
@@ -438,7 +510,7 @@ pub fn run_git_scan(
             &mut external,
             &mut adapter,
         )?;
-        collect_skipped_candidate_oids(plan, &report.skips, &mut skipped_candidate_oids);
+        collect_skipped_candidates(plan, &report.skips, &mut skipped_candidates);
         pack_exec_reports.push(report);
     }
 
@@ -447,6 +519,8 @@ pub fn run_git_scan(
 
     // Finalize ops.
     let refs = build_ref_entries(&repo);
+    let skipped_candidate_oids = skipped_candidates.iter().map(|entry| entry.oid).collect();
+
     let finalize = build_finalize_ops(FinalizeInput {
         repo_id: config.repo_id,
         policy_hash: config.policy_hash,
@@ -468,11 +542,14 @@ pub fn run_git_scan(
         mapping_stats,
         pack_plan_stats,
         pack_exec_reports,
+        skipped_candidates,
         finalize,
     }))
 }
 
 /// Create a unique spill directory under the OS temp directory.
+///
+/// The directory name is derived from the PID and a nanosecond timestamp.
 fn make_spill_dir() -> Result<PathBuf, io::Error> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
     let mut path = std::env::temp_dir();
@@ -486,6 +563,9 @@ fn make_spill_dir() -> Result<PathBuf, io::Error> {
 }
 
 /// Load the MIDX view for the repository.
+///
+/// # Errors
+/// Returns `GitScanError::Midx` if the MIDX mmap is missing or corrupted.
 fn load_midx(repo: &RepoJobState) -> Result<MidxView<'_>, GitScanError> {
     let midx_mmap = repo
         .mmaps
@@ -496,6 +576,8 @@ fn load_midx(repo: &RepoJobState) -> Result<MidxView<'_>, GitScanError> {
 }
 
 /// Convert the repo start set into finalize `RefEntry` values.
+///
+/// The ref names are taken from the repo's shared name table.
 fn build_ref_entries(repo: &RepoJobState) -> Vec<RefEntry> {
     let mut refs = Vec::with_capacity(repo.start_set.len());
     for r in &repo.start_set {
@@ -508,6 +590,8 @@ fn build_ref_entries(repo: &RepoJobState) -> Vec<RefEntry> {
 }
 
 /// Collect pack directories, including alternates.
+///
+/// Alternates that resolve to the main objects dir are ignored.
 fn collect_pack_dirs(paths: &GitRepoPaths) -> Vec<PathBuf> {
     let mut dirs = Vec::with_capacity(1 + paths.alternate_object_dirs.len());
     dirs.push(paths.pack_dir.clone());
@@ -521,6 +605,9 @@ fn collect_pack_dirs(paths: &GitRepoPaths) -> Vec<PathBuf> {
 }
 
 /// List pack file names from the provided pack directories.
+///
+/// Returns raw file names (as bytes) for `.pack` files. Missing pack
+/// directories are ignored; other IO errors are returned.
 fn list_pack_files(pack_dirs: &[PathBuf]) -> Result<Vec<Vec<u8>>, GitScanError> {
     let mut names = Vec::new();
     for dir in pack_dirs {
@@ -545,6 +632,9 @@ fn list_pack_files(pack_dirs: &[PathBuf]) -> Result<Vec<Vec<u8>>, GitScanError> 
 }
 
 /// Resolve pack file paths referenced by the MIDX.
+///
+/// The MIDX stores pack basenames; we add the `.pack` suffix and search
+/// each pack directory until a match is found.
 fn resolve_pack_paths(
     midx: &MidxView<'_>,
     pack_dirs: &[PathBuf],
@@ -588,6 +678,8 @@ fn strip_pack_suffix(name: &[u8]) -> Vec<u8> {
 }
 
 /// Memory-map pack files for zero-copy decoding.
+///
+/// The mappings are read-only and may outlive the file handles.
 fn mmap_pack_files(pack_paths: &[PathBuf]) -> Result<Vec<Mmap>, GitScanError> {
     let mut out = Vec::with_capacity(pack_paths.len());
     for path in pack_paths {
@@ -601,6 +693,9 @@ fn mmap_pack_files(pack_paths: &[PathBuf]) -> Result<Vec<Mmap>, GitScanError> {
 }
 
 /// Parse pack headers into `PackView`s used for planning.
+///
+/// Each pack view validates header structure and captures offsets needed by
+/// the planning stage.
 fn build_pack_views<'a>(
     pack_mmaps: &'a [Mmap],
     format: ObjectFormat,
@@ -614,22 +709,30 @@ fn build_pack_views<'a>(
     Ok(views)
 }
 
-/// Collect candidate OIDs that were skipped during pack execution.
+/// Collect candidates that were skipped during pack execution.
 ///
 /// The skip records are offsets into the pack stream; we map them back to
-/// candidate offsets and record the corresponding OIDs.
-fn collect_skipped_candidate_oids(plan: &PackPlan, skips: &[SkipRecord], out: &mut Vec<OidBytes>) {
+/// candidate offsets and record the corresponding OIDs with a reason.
+fn collect_skipped_candidates(
+    plan: &PackPlan,
+    skips: &[SkipRecord],
+    out: &mut Vec<SkippedCandidate>,
+) {
     if skips.is_empty() {
         return;
     }
     let offsets = &plan.candidate_offsets;
     for skip in skips {
+        let reason = CandidateSkipReason::from_pack_skip(&skip.reason);
         let start = offsets.partition_point(|c| c.offset < skip.offset);
         let end = offsets.partition_point(|c| c.offset <= skip.offset);
         for cand in &offsets[start..end] {
             let idx = cand.cand_idx as usize;
             if let Some(entry) = plan.candidates.get(idx) {
-                out.push(entry.oid);
+                out.push(SkippedCandidate {
+                    oid: entry.oid,
+                    reason,
+                });
             }
         }
     }
