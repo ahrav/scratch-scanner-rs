@@ -5,8 +5,9 @@
 //! count limits. Preflight must not read object contents.
 //!
 //! The repo_open module produces `RepoJobState`: it resolves repo paths,
-//! detects object format, memory-maps commit-graph and MIDX, and loads the
-//! start set plus watermarks needed for incremental Git scanning.
+//! detects object format, memory-maps commit-graph and MIDX, records artifact
+//! fingerprints, and loads the start set plus watermarks needed for incremental
+//! Git scanning.
 //!
 //! Pipeline overview:
 //! 1. `preflight` verifies repository layout and artifacts.
@@ -119,8 +120,8 @@ pub use preflight_error::PreflightError;
 pub use preflight_limits::PreflightLimits;
 pub use repo::{GitRepoPaths, RepoKind};
 pub use repo_open::{
-    repo_open, RefWatermarkStore, RepoArtifactMmaps, RepoArtifactPaths, RepoArtifactStatus,
-    RepoJobState, StartSetRef, StartSetResolver,
+    repo_open, ArtifactFingerprint, RefWatermarkStore, RepoArtifactFingerprint, RepoArtifactMmaps,
+    RepoArtifactPaths, RepoArtifactStatus, RepoJobState, StartSetRef, StartSetResolver,
 };
 pub use run_format::{RunContext, RunHeader, RunRecord};
 pub use run_reader::RunReader;

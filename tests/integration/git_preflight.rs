@@ -39,10 +39,12 @@ fn preflight_missing_artifacts() {
         ArtifactStatus::NeedsMaintenance {
             missing_commit_graph,
             missing_midx,
+            lock_present,
             ..
         } => {
             assert!(missing_commit_graph, "commit-graph should be missing");
             assert!(missing_midx, "midx should be missing");
+            assert!(!lock_present, "lock should be absent");
         }
         ArtifactStatus::Ready { .. } => panic!("expected NeedsMaintenance"),
     }
@@ -72,6 +74,7 @@ fn preflight_pack_count_threshold() {
             missing_midx,
             pack_count,
             max_pack_count,
+            lock_present,
         } => {
             assert!(!missing_commit_graph, "commit-graph should be present");
             assert!(!missing_midx, "midx should be present");
@@ -79,6 +82,7 @@ fn preflight_pack_count_threshold() {
                 pack_count > max_pack_count as u32,
                 "pack count should exceed limit"
             );
+            assert!(!lock_present, "lock should be absent");
         }
         ArtifactStatus::Ready { .. } => panic!("expected NeedsMaintenance"),
     }
@@ -117,6 +121,29 @@ fn preflight_alternates_in_pack_count() {
     match report.status {
         ArtifactStatus::NeedsMaintenance { pack_count, .. } => {
             assert!(pack_count > 1, "alternate pack should count toward total");
+        }
+        ArtifactStatus::Ready { .. } => panic!("expected NeedsMaintenance"),
+    }
+}
+
+#[test]
+fn preflight_detects_lock_files() {
+    let tmp = TempDir::new().unwrap();
+    let git_dir = create_worktree_repo(tmp.path());
+    let objects_dir = git_dir.join("objects");
+    let pack_dir = objects_dir.join("pack");
+
+    write_commit_graph(&objects_dir);
+    write_midx(&pack_dir);
+
+    let lock_path = objects_dir.join("info").join("commit-graph.lock");
+    fs::write(lock_path, b"").unwrap();
+
+    let report = preflight(tmp.path(), PreflightLimits::DEFAULT).unwrap();
+
+    match report.status {
+        ArtifactStatus::NeedsMaintenance { lock_present, .. } => {
+            assert!(lock_present, "lock should be detected");
         }
         ArtifactStatus::Ready { .. } => panic!("expected NeedsMaintenance"),
     }

@@ -472,6 +472,11 @@ pub fn run_git_scan(
         plans.append(&mut pack_plans);
     }
 
+    // Validate artifacts before decoding packs to avoid scanning during maintenance.
+    if !repo.artifacts_unchanged()? {
+        return Ok(GitScanResult::NeedsMaintenance { preflight });
+    }
+
     // Execute pack plans + scan.
     let pack_cache_bytes: u32 = config
         .pack_cache_bytes

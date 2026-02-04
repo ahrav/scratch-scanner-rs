@@ -3,16 +3,23 @@
 //! This stage prepares a repository for scanning by:
 //! - Resolving repository paths (worktree, bare, linked worktree)
 //! - Checking artifact readiness (commit-graph, MIDX)
+//! - Detecting maintenance lock files and recording artifact fingerprints
 //! - Memory-mapping metadata files (commit-graph, MIDX only - not packs)
 //! - Resolving start set tips (refs to scan)
 //! - Loading persisted watermarks for incremental scanning
 //!
 //! Packs are not mmapped here. They are opened on demand in later phases
 //! per pack plan to avoid unnecessary FD and VMA pressure.
+//!
+//! # Invariants
+//! - Missing artifacts yield `NeedsMaintenance` with empty `mmaps` and `start_set`.
+//! - When artifacts are ready, fingerprints are captured for maintenance checks.
+//! - Start set refs are sorted deterministically by name.
 
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use memmap2::Mmap;
 
@@ -34,6 +41,8 @@ pub enum RepoArtifactStatus {
         missing_commit_graph: bool,
         /// True if multi-pack-index is missing.
         missing_midx: bool,
+        /// True if a Git maintenance lock file is present.
+        lock_present: bool,
     },
 }
 
@@ -68,6 +77,26 @@ pub struct RepoArtifactMmaps {
     pub midx: Option<Mmap>,
 }
 
+/// Fingerprint of an artifact file.
+///
+/// This is a lightweight change detector (length + mtime), not a content hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArtifactFingerprint {
+    /// File length in bytes.
+    pub len: u64,
+    /// Last modification time.
+    pub modified: SystemTime,
+}
+
+/// Fingerprints for commit-graph and MIDX.
+///
+/// Used to detect concurrent maintenance between repo open and later phases.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RepoArtifactFingerprint {
+    pub commit_graph: ArtifactFingerprint,
+    pub midx: ArtifactFingerprint,
+}
+
 /// A ref in the start set with its resolved tip and optional watermark.
 #[derive(Clone, Debug)]
 pub struct StartSetRef {
@@ -82,7 +111,8 @@ pub struct StartSetRef {
 /// Complete state for a repository job after repo open.
 ///
 /// This struct contains everything needed for later Git phases without
-/// additional file opens (except pack files in pack processing phases).
+/// additional file opens (except pack files in pack processing phases). It
+/// also records artifact fingerprints used to detect concurrent maintenance.
 #[derive(Debug)]
 pub struct RepoJobState {
     /// Resolved repository paths.
@@ -100,6 +130,9 @@ pub struct RepoJobState {
     /// Memory-mapped artifacts (only if `artifact_status.is_ready()`).
     pub mmaps: RepoArtifactMmaps,
 
+    /// Artifact fingerprints captured at repo open (only if artifacts were ready).
+    pub artifact_fingerprint: Option<RepoArtifactFingerprint>,
+
     /// Arena for ref name storage.
     pub ref_names: ByteArena,
 
@@ -108,6 +141,33 @@ pub struct RepoJobState {
     /// Invariant: sorted by `ref_names.get(r.name)` lexicographically.
     /// Empty when `artifact_status` is `NeedsMaintenance`.
     pub start_set: Vec<StartSetRef>,
+}
+
+impl RepoJobState {
+    /// Returns true if artifacts remain unchanged and no lock files are present.
+    ///
+    /// Returns `false` if no baseline fingerprint was captured (artifacts not ready).
+    pub fn artifacts_unchanged(&self) -> Result<bool, RepoOpenError> {
+        let Some(expected) = self.artifact_fingerprint else {
+            return Ok(false);
+        };
+
+        if has_lock_files(&self.paths, &self.artifact_paths)? {
+            return Ok(false);
+        }
+
+        let current = RepoArtifactFingerprint::from_paths(&self.artifact_paths)?;
+        Ok(current == expected)
+    }
+}
+
+impl RepoArtifactFingerprint {
+    fn from_paths(paths: &RepoArtifactPaths) -> Result<Self, RepoOpenError> {
+        Ok(Self {
+            commit_graph: fingerprint_path(&paths.commit_graph)?,
+            midx: fingerprint_path(&paths.midx)?,
+        })
+    }
 }
 
 /// Trait for resolving start set refs.
@@ -202,7 +262,8 @@ pub fn repo_open(
         midx: paths.pack_dir.join("multi-pack-index"),
     };
 
-    let artifact_status = check_artifact_status(&artifact_paths);
+    let lock_present = has_lock_files(&paths, &artifact_paths)?;
+    let artifact_status = check_artifact_status(&artifact_paths, lock_present);
 
     if !artifact_status.is_ready() {
         return Ok(RepoJobState {
@@ -211,12 +272,13 @@ pub fn repo_open(
             artifact_paths,
             artifact_status,
             mmaps: RepoArtifactMmaps::default(),
+            artifact_fingerprint: None,
             ref_names: ByteArena::with_capacity(0),
             start_set: Vec::new(),
         });
     }
 
-    let mmaps = mmap_artifacts(&artifact_paths)?;
+    let (mmaps, artifact_fingerprint) = mmap_artifacts(&artifact_paths)?;
 
     let (ref_names, start_set) = resolve_start_set_with_watermarks(
         repo_id,
@@ -234,6 +296,7 @@ pub fn repo_open(
         artifact_paths,
         artifact_status,
         mmaps,
+        artifact_fingerprint: Some(artifact_fingerprint),
         ref_names,
         start_set,
     })
@@ -242,14 +305,19 @@ pub fn repo_open(
 /// Checks for the presence of required artifact files.
 ///
 /// This is a fast existence check only; file contents are not validated here.
-fn check_artifact_status(artifact_paths: &RepoArtifactPaths) -> RepoArtifactStatus {
+/// Any detected maintenance lock forces `NeedsMaintenance`.
+fn check_artifact_status(
+    artifact_paths: &RepoArtifactPaths,
+    lock_present: bool,
+) -> RepoArtifactStatus {
     let missing_commit_graph = !is_file(&artifact_paths.commit_graph);
     let missing_midx = !is_file(&artifact_paths.midx);
 
-    if missing_commit_graph || missing_midx {
+    if missing_commit_graph || missing_midx || lock_present {
         RepoArtifactStatus::NeedsMaintenance {
             missing_commit_graph,
             missing_midx,
+            lock_present,
         }
     } else {
         RepoArtifactStatus::Ready
@@ -258,26 +326,39 @@ fn check_artifact_status(artifact_paths: &RepoArtifactPaths) -> RepoArtifactStat
 
 /// Memory-maps the artifact files for later read-only access.
 ///
-/// Assumes `check_artifact_status` returned `Ready`.
-fn mmap_artifacts(artifact_paths: &RepoArtifactPaths) -> Result<RepoArtifactMmaps, RepoOpenError> {
-    let commit_graph = mmap_file(&artifact_paths.commit_graph)?;
-    let midx = mmap_file(&artifact_paths.midx)?;
+/// Assumes `check_artifact_status` returned `Ready`. The returned fingerprint
+/// is captured from the file metadata used for the mapping.
+fn mmap_artifacts(
+    artifact_paths: &RepoArtifactPaths,
+) -> Result<(RepoArtifactMmaps, RepoArtifactFingerprint), RepoOpenError> {
+    let (commit_graph, commit_graph_fp) = mmap_file(&artifact_paths.commit_graph)?;
+    let (midx, midx_fp) = mmap_file(&artifact_paths.midx)?;
 
-    Ok(RepoArtifactMmaps {
-        commit_graph: Some(commit_graph),
-        midx: Some(midx),
-    })
+    Ok((
+        RepoArtifactMmaps {
+            commit_graph: Some(commit_graph),
+            midx: Some(midx),
+        },
+        RepoArtifactFingerprint {
+            commit_graph: commit_graph_fp,
+            midx: midx_fp,
+        },
+    ))
 }
 
-fn mmap_file(path: &Path) -> Result<Mmap, RepoOpenError> {
+/// Maps a file read-only and returns the mmap plus a metadata fingerprint.
+fn mmap_file(path: &Path) -> Result<(Mmap, ArtifactFingerprint), RepoOpenError> {
     let file = File::open(path).map_err(RepoOpenError::io)?;
+    let metadata = file.metadata().map_err(RepoOpenError::io)?;
+    let fingerprint = fingerprint_metadata(&metadata)?;
 
     #[allow(unsafe_code)]
     unsafe {
         // SAFETY: We map the file read-only and treat it as immutable during the scan.
         // Repo maintenance is expected to be quiescent; if the file is truncated
         // or replaced while mapped, the OS may signal a fault. That risk is accepted.
-        Mmap::map(&file).map_err(RepoOpenError::io)
+        let mmap = Mmap::map(&file).map_err(RepoOpenError::io)?;
+        Ok((mmap, fingerprint))
     }
 }
 
@@ -286,6 +367,10 @@ fn mmap_file(path: &Path) -> Result<Mmap, RepoOpenError> {
 /// The resolver output is sorted lexicographically by ref name to ensure a
 /// deterministic order. Watermarks are fetched in that same order and then
 /// paired back with their refs.
+///
+/// # Errors
+/// Returns an error if limits are exceeded, ref names cannot be interned,
+/// or the watermark store returns a mismatched count.
 fn resolve_start_set_with_watermarks(
     repo_id: u64,
     policy_hash: [u8; 32],
@@ -350,6 +435,79 @@ fn resolve_start_set_with_watermarks(
         .collect();
 
     Ok((ref_names, start_set))
+}
+
+fn fingerprint_path(path: &Path) -> Result<ArtifactFingerprint, RepoOpenError> {
+    let metadata = fs::metadata(path).map_err(RepoOpenError::io)?;
+    fingerprint_metadata(&metadata)
+}
+
+fn fingerprint_metadata(metadata: &Metadata) -> Result<ArtifactFingerprint, RepoOpenError> {
+    let modified = metadata.modified().map_err(RepoOpenError::io)?;
+    Ok(ArtifactFingerprint {
+        len: metadata.len(),
+        modified,
+    })
+}
+
+fn has_lock_files(
+    paths: &GitRepoPaths,
+    artifact_paths: &RepoArtifactPaths,
+) -> Result<bool, RepoOpenError> {
+    // Only artifact and pack directory locks are considered here.
+    if is_file(&lock_path(&artifact_paths.commit_graph))
+        || is_file(&lock_path(&artifact_paths.midx))
+    {
+        return Ok(true);
+    }
+
+    let mut pack_dirs = Vec::with_capacity(1 + paths.alternate_object_dirs.len());
+    pack_dirs.push(paths.pack_dir.clone());
+    for alternate in &paths.alternate_object_dirs {
+        if alternate == &paths.objects_dir {
+            continue;
+        }
+        pack_dirs.push(alternate.join("pack"));
+    }
+
+    for pack_dir in pack_dirs {
+        if has_lock_files_in_dir(&pack_dir)? {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn has_lock_files_in_dir(pack_dir: &Path) -> Result<bool, RepoOpenError> {
+    let entries = match fs::read_dir(pack_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(RepoOpenError::io(err)),
+    };
+
+    for entry in entries {
+        let entry = entry.map_err(RepoOpenError::io)?;
+        let file_type = entry.file_type().map_err(RepoOpenError::io)?;
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let file_name = entry.file_name();
+        if Path::new(&file_name)
+            .extension()
+            .is_some_and(|ext| ext == "lock")
+        {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+#[inline]
+fn lock_path(path: &Path) -> PathBuf {
+    path.with_extension("lock")
 }
 
 /// Detects the repository object format via config.
