@@ -914,8 +914,8 @@ fn is_file(path: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::{
-        demo_tuning, AnchorPolicy, Engine, Gate, RuleSpec, TransformConfig, TransformId,
-        TransformMode, ValidatorKind,
+        demo_tuning, AnchorPolicy, ByteRef, CandidateContext, ChangeKind, Engine, Gate, RuleSpec,
+        TransformConfig, TransformId, TransformMode, ValidatorKind,
     };
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
@@ -1080,11 +1080,13 @@ mod tests {
         fs::write(dir_path.join(file), &compressed).unwrap();
     }
 
-    fn build_pack_io(objects_dir: &Path) -> PackIo<'_> {
+    fn build_pack_io(objects_dir: &Path) -> PackIo<'static> {
         let mut builder = MidxBuilder::default();
         builder.add_pack(b"pack-test");
         let midx_bytes = builder.build();
-        let midx = MidxView::parse(&midx_bytes, ObjectFormat::Sha1).unwrap();
+        // Leak the bytes for the duration of the test to satisfy `MidxView` lifetimes.
+        let midx_bytes: &'static [u8] = Box::leak(midx_bytes.into_boxed_slice());
+        let midx = MidxView::parse(midx_bytes, ObjectFormat::Sha1).unwrap();
 
         let pack_paths = vec![objects_dir.join("pack-test.pack")];
         let limits = PackIoLimits::new(PackDecodeLimits::new(64, 1024 * 1024, 1024 * 1024), 2);
@@ -1097,7 +1099,7 @@ mod tests {
             ctx: CandidateContext {
                 commit_id: 1,
                 parent_idx: 0,
-                change_kind: super::tree_candidate::ChangeKind::Add,
+                change_kind: ChangeKind::Add,
                 ctx_flags: 0,
                 cand_flags: 0,
                 path_ref,
