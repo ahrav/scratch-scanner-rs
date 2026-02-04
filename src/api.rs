@@ -508,6 +508,59 @@ pub enum TailCharset {
     Base64Std,
 }
 
+/// Maximum lookaround (per side) for local context gates.
+///
+/// This bounds hot-path scanning for micro-context checks.
+pub const LOCAL_CONTEXT_MAX_LOOKAROUND: usize = 1024;
+
+/// Local context gate configuration for post-regex validation.
+///
+/// These checks are intentionally bounded and allocation-free so they can run
+/// in the hot path after a regex match but before emitting a finding.
+#[derive(Clone, Copy, Debug)]
+pub struct LocalContextSpec {
+    /// Lookbehind bytes before the secret span.
+    pub lookbehind: usize,
+    /// Lookahead bytes after the secret span.
+    pub lookahead: usize,
+    /// Require an assignment separator on the same line before the secret.
+    pub require_same_line_assignment: bool,
+    /// Require the secret to be wrapped in matching quotes.
+    pub require_quoted: bool,
+    /// Optional key names that must appear on the same line (any-of).
+    pub key_names_any: Option<&'static [&'static [u8]]>,
+}
+
+impl LocalContextSpec {
+    /// Internal invariant checks used at engine build time.
+    pub(crate) fn assert_valid(&self) {
+        assert!(
+            self.lookbehind <= LOCAL_CONTEXT_MAX_LOOKAROUND,
+            "local_context lookbehind {} exceeds max {}",
+            self.lookbehind,
+            LOCAL_CONTEXT_MAX_LOOKAROUND
+        );
+        assert!(
+            self.lookahead <= LOCAL_CONTEXT_MAX_LOOKAROUND,
+            "local_context lookahead {} exceeds max {}",
+            self.lookahead,
+            LOCAL_CONTEXT_MAX_LOOKAROUND
+        );
+        if let Some(keys) = self.key_names_any {
+            assert!(
+                !keys.is_empty(),
+                "local_context key_names_any must not be empty"
+            );
+            for key in keys {
+                assert!(
+                    !key.is_empty(),
+                    "local_context key_names_any contains empty key"
+                );
+            }
+        }
+    }
+}
+
 /// Rule configuration for anchor scan + regex validation.
 ///
 /// # Invariants
@@ -569,6 +622,9 @@ pub struct RuleSpec {
     /// predictable and avoid noisy small-sample statistics.
     pub entropy: Option<EntropySpec>,
 
+    /// Optional local context gate evaluated after secret extraction.
+    pub local_context: Option<LocalContextSpec>,
+
     /// Optional capture group index for secret extraction.
     ///
     /// When set, the engine extracts the secret value from the specified capture
@@ -618,6 +674,9 @@ impl RuleSpec {
         if let Some(ent) = &self.entropy {
             ent.assert_valid();
         }
+        if let Some(ctx) = &self.local_context {
+            ctx.assert_valid();
+        }
         if let Some(gi) = self.secret_group {
             let group_count = self.re.captures_len();
             assert!(
@@ -665,6 +724,55 @@ impl EntropySpec {
             self.min_len <= self.max_len,
             "entropy min_len must be <= max_len"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_rule(local_context: Option<LocalContextSpec>) -> RuleSpec {
+        RuleSpec {
+            name: "test-rule",
+            anchors: &[b"tok_"],
+            radius: 8,
+            validator: ValidatorKind::None,
+            two_phase: None,
+            must_contain: None,
+            keywords_any: None,
+            entropy: None,
+            local_context,
+            secret_group: None,
+            re: Regex::new(r"tok_[a-z0-9]{8}").unwrap(),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "local_context lookbehind")]
+    fn local_context_lookbehind_too_large_panics() {
+        let ctx = LocalContextSpec {
+            lookbehind: LOCAL_CONTEXT_MAX_LOOKAROUND + 1,
+            lookahead: 0,
+            require_same_line_assignment: false,
+            require_quoted: false,
+            key_names_any: None,
+        };
+        let rule = dummy_rule(Some(ctx));
+        rule.assert_valid();
+    }
+
+    #[test]
+    #[should_panic(expected = "local_context key_names_any must not be empty")]
+    fn local_context_empty_key_list_panics() {
+        let ctx = LocalContextSpec {
+            lookbehind: 128,
+            lookahead: 128,
+            require_same_line_assignment: false,
+            require_quoted: false,
+            key_names_any: Some(&[]),
+        };
+        let rule = dummy_rule(Some(ctx));
+        rule.assert_valid();
     }
 }
 

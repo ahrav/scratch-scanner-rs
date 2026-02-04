@@ -21,8 +21,9 @@ use super::vectorscan_prefilter::{
     gate_match_callback, stream_match_callback, VsStreamMatchCtx, VsStreamWindow,
 };
 use crate::api::{
-    AnchorPolicy, DecodeStep, EntropySpec, FileId, Finding, FindingRec, Gate, RuleSpec,
-    TransformConfig, TransformId, TransformMode, Tuning, Utf16Endianness, ValidatorKind, STEP_ROOT,
+    AnchorPolicy, DecodeStep, EntropySpec, FileId, Finding, FindingRec, Gate, LocalContextSpec,
+    RuleSpec, TransformConfig, TransformId, TransformMode, Tuning, Utf16Endianness, ValidatorKind,
+    STEP_ROOT,
 };
 use crate::demo::{demo_engine, demo_rules, demo_tuning};
 use crate::regex2anchor::{compile_trigger_plan, AnchorDeriveConfig, TriggerPlan};
@@ -151,6 +152,7 @@ fn norm_hash_deterministic_for_raw_matches() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        local_context: None,
         secret_group: Some(1),
         re: Regex::new(r"TOK_([A-Z0-9]{4})").unwrap(),
     };
@@ -196,6 +198,7 @@ fn norm_hash_uses_decoded_bytes_for_base64_transform() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        local_context: None,
         secret_group: Some(1),
         re: Regex::new(r"SECRET_([A-Z]{4})").unwrap(),
     };
@@ -226,6 +229,160 @@ fn norm_hash_uses_decoded_bytes_for_base64_transform() {
     assert_eq!(hashes.len(), 1);
     let expected = *blake3::hash(b"ABCD").as_bytes();
     assert_eq!(hashes[0], expected);
+}
+
+#[test]
+fn local_context_gate_applies_in_base64_stream_decode() {
+    let rule = RuleSpec {
+        name: "b64-local-context",
+        anchors: &[b"SECRET_"],
+        radius: 24,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        local_context: Some(LocalContextSpec {
+            lookbehind: 64,
+            lookahead: 64,
+            require_same_line_assignment: false,
+            require_quoted: true,
+            key_names_any: None,
+        }),
+        secret_group: Some(0),
+        re: Regex::new(r"SECRET_[A-Z]{4}").unwrap(),
+    };
+    let transforms = vec![TransformConfig {
+        id: TransformId::Base64,
+        mode: TransformMode::Always,
+        gate: Gate::AnchorsInDecoded,
+        min_len: 8,
+        max_spans_per_buffer: 8,
+        max_encoded_len: 1024,
+        max_decoded_bytes: 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    }];
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        transforms,
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let good_plain = b"key=\"SECRET_ABCD\" ";
+    let good_b64 = b64_encode(good_plain);
+    let hay = format!("prefix {good_b64} suffix");
+    let hits = scan_chunk_findings(&engine, hay.as_bytes());
+    assert!(
+        hits.iter().any(|h| h.rule == "b64-local-context"),
+        "expected finding with quoted secret in decoded stream"
+    );
+
+    let bad_plain = b"key=SECRET_ABCD ";
+    let bad_b64 = b64_encode(bad_plain);
+    let hay = format!("prefix {bad_b64} suffix");
+    let hits = scan_chunk_findings(&engine, hay.as_bytes());
+    assert!(
+        !hits.iter().any(|h| h.rule == "b64-local-context"),
+        "expected local context gate to filter unquoted decoded secret"
+    );
+}
+
+#[test]
+fn local_context_gate_filters_without_assignment_when_bounds_present() {
+    let rule = RuleSpec {
+        name: "lc-assign",
+        anchors: &[b"TOK_"],
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        local_context: Some(LocalContextSpec {
+            lookbehind: 64,
+            lookahead: 64,
+            require_same_line_assignment: true,
+            require_quoted: false,
+            key_names_any: None,
+        }),
+        secret_group: None,
+        re: Regex::new(r"TOK_[A-Z]{4}").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let hay = b"prefix\nTOK_ABCD\nsuffix";
+    let hits = scan_chunk_findings(&engine, hay);
+    assert!(
+        !hits.iter().any(|h| h.rule == "lc-assign"),
+        "expected local context gate to filter when assignment is missing"
+    );
+
+    let hay = b"prefix\nkey = TOK_ABCD\nsuffix";
+    let hits = scan_chunk_findings(&engine, hay);
+    assert!(
+        hits.iter().any(|h| h.rule == "lc-assign"),
+        "expected local context gate to pass when assignment is present"
+    );
+}
+
+#[test]
+fn local_context_key_names_required_and_fail_open_when_out_of_range() {
+    let rule = RuleSpec {
+        name: "lc-keyname",
+        anchors: &[b"TOK_"],
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        local_context: Some(LocalContextSpec {
+            lookbehind: 64,
+            lookahead: 64,
+            require_same_line_assignment: false,
+            require_quoted: false,
+            key_names_any: Some(&[b"key"]),
+        }),
+        secret_group: None,
+        re: Regex::new(r"TOK_[A-Z]{4}").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let hay = b"prefix\nkey = TOK_ABCD\nsuffix";
+    let hits = scan_chunk_findings(&engine, hay);
+    assert!(
+        hits.iter().any(|h| h.rule == "lc-keyname"),
+        "expected local context gate to pass with required key name"
+    );
+
+    let hay = b"prefix\nvalue = TOK_ABCD\nsuffix";
+    let hits = scan_chunk_findings(&engine, hay);
+    assert!(
+        !hits.iter().any(|h| h.rule == "lc-keyname"),
+        "expected local context gate to filter without key name"
+    );
+
+    let hay = b"prefix key = TOK_ABCD suffix";
+    let hits = scan_chunk_findings(&engine, hay);
+    assert!(
+        hits.iter().any(|h| h.rule == "lc-keyname"),
+        "expected local context gate to fail open when line bounds are missing"
+    );
 }
 
 // Helper that uses the allocation-free scan API and materializes findings.
@@ -462,6 +619,7 @@ fn base64_padding_in_root_hint() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        local_context: None,
         secret_group: None,
         re: Regex::new(r"SIM0_[A-Z0-9]{12}").unwrap(),
     };
@@ -555,6 +713,7 @@ fn keyword_gate_filters_without_keyword() {
         must_contain: None,
         keywords_any: Some(KEYWORDS),
         entropy: None,
+        local_context: None,
         secret_group: None,
         re: Regex::new("secret").unwrap(),
     };
@@ -585,6 +744,7 @@ fn derived_confirm_all_is_compiled() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        local_context: None,
         secret_group: None,
         re: Regex::new(r"foo\d+bar").unwrap(),
     };
@@ -649,6 +809,7 @@ fn entropy_gate_filters_low_entropy_matches() {
             min_len: 8,
             max_len: 32,
         }),
+        local_context: None,
         secret_group: None,
         re: Regex::new(r"TOK_[A-Za-z0-9]{8}").unwrap(),
     };
@@ -700,6 +861,7 @@ fn secret_extraction_prefers_group1_over_full_match() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        local_context: None,
         secret_group: None,
         // Pattern: KEY_<secret> where <secret> is captured in group 1
         re: Regex::new(r"KEY_([A-Za-z0-9]{8,16})").unwrap(),
@@ -740,6 +902,7 @@ fn secret_extraction_uses_configured_secret_group() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        local_context: None,
         secret_group: Some(2), // Use group 2 instead of group 1
         // Pattern: TOK<prefix>:<secret> where prefix is group 1, secret is group 2
         re: Regex::new(r"TOK([A-Z]+):([a-z0-9]{8,16})").unwrap(),
@@ -782,6 +945,7 @@ fn secret_extraction_falls_back_to_full_match_without_groups() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        local_context: None,
         secret_group: None,
         // Pattern with no capture groups
         re: Regex::new(r"AKIA[A-Z0-9]{16}").unwrap(),
@@ -825,6 +989,7 @@ fn secret_extraction_skips_empty_group1() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        local_context: None,
         secret_group: None,
         // Group 1 can be empty (optional prefix), group 0 is the full match
         re: Regex::new(r"OPT([A-Z]*)_[a-z0-9]{8}").unwrap(),
@@ -869,6 +1034,7 @@ fn secret_extraction_hash_consistency() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        local_context: None,
         secret_group: None,
         re: Regex::new(r"SEC_([A-Za-z0-9]{12})").unwrap(),
     };
@@ -920,6 +1086,7 @@ fn secret_extraction_utf16le_path() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        local_context: None,
         secret_group: None,
         re: Regex::new(r"UTF_([A-Za-z0-9]{8})").unwrap(),
     };
@@ -964,6 +1131,63 @@ fn secret_extraction_utf16le_path() {
         hit.span.len(),
         8,
         "span should be capture group 1 length (Secret12)"
+    );
+}
+
+#[test]
+fn local_context_gate_applies_in_utf16_path() {
+    const ANCHORS: &[&[u8]] = &[b"UTF_"];
+    let rule = RuleSpec {
+        name: "utf16-local-context",
+        anchors: ANCHORS,
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        local_context: Some(LocalContextSpec {
+            lookbehind: 64,
+            lookahead: 64,
+            require_same_line_assignment: false,
+            require_quoted: true,
+            key_names_any: None,
+        }),
+        secret_group: Some(0),
+        re: Regex::new(r"UTF_[A-Za-z0-9]{8}").unwrap(),
+    };
+
+    let mut tuning = demo_tuning();
+    tuning.scan_utf16_variants = true;
+
+    let eng =
+        Engine::new_with_anchor_policy(vec![rule], Vec::new(), tuning, AnchorPolicy::ManualOnly);
+
+    let good_plain = b"UTF_Secret12";
+    let mut good = Vec::with_capacity(good_plain.len() + 2);
+    good.push(b'"');
+    good.extend_from_slice(good_plain);
+    good.push(b'"');
+    // Prefix with two zero bytes so the BE-aligned decode includes a leading
+    // character before the match; otherwise the quote gate can fail open at offset 0.
+    let mut utf16 = Vec::with_capacity(2 + good.len() * 2);
+    utf16.extend_from_slice(&[0u8, 0u8]);
+    utf16.extend_from_slice(&utf16le_bytes(&good));
+    let hits = scan_chunk_findings(&eng, &utf16);
+    assert!(
+        hits.iter().any(|h| h.rule == "utf16-local-context"),
+        "expected quoted UTF-16 match to pass local context gate"
+    );
+
+    let bad_plain = b"xUTF_Secret12 ";
+    // Same prefix ensures both UTF-16 alignments see a non-quote before the secret.
+    let mut utf16 = Vec::with_capacity(2 + bad_plain.len() * 2);
+    utf16.extend_from_slice(&[0u8, 0u8]);
+    utf16.extend_from_slice(&utf16le_bytes(bad_plain));
+    let hits = scan_chunk_findings(&eng, &utf16);
+    assert!(
+        !hits.iter().any(|h| h.rule == "utf16-local-context"),
+        "expected unquoted UTF-16 match to be filtered by local context gate"
     );
 }
 
@@ -1076,6 +1300,7 @@ fn root_span_hint_uses_full_window_for_partial_secret() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        local_context: None,
         secret_group: None,
         // Pattern: PREFIX_<secret>_SUFFIX - group 1 is just the middle part.
         re: Regex::new(r"PREFIX_([A-Za-z0-9]{8})_SUFFIX").unwrap(),
@@ -1130,6 +1355,7 @@ fn secret_extraction_explicit_group0_overrides_group1() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        local_context: None,
         secret_group: Some(0), // Explicitly use full match
         // Pattern: TOK_<secret>_END where <secret> would normally be group 1
         re: Regex::new(r"TOK_([A-Za-z0-9]{8})_END").unwrap(),
@@ -1171,6 +1397,7 @@ fn secret_extraction_empty_configured_group_falls_back() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        local_context: None,
         secret_group: Some(2), // Points to group 2 which can be empty
         // Pattern: CFG_<prefix>_<optional> - group 1 is prefix, group 2 is optional suffix
         re: Regex::new(r"CFG_([a-z0-9]{8})([A-Z]*)").unwrap(),
@@ -1214,6 +1441,7 @@ fn anchor_policy_prefers_derived_over_manual() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        local_context: None,
         secret_group: None,
         re: Regex::new("foo").unwrap(),
     };
@@ -1242,6 +1470,7 @@ fn anchor_policy_falls_back_to_manual_on_unfilterable() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        local_context: None,
         secret_group: None,
         re: Regex::new("[A-Za-z]{1,}").unwrap(),
     };
@@ -2280,6 +2509,7 @@ fn scan_file_sync_drops_prefix_duplicates() -> std::io::Result<()> {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        local_context: None,
         secret_group: None,
         re: Regex::new("X").unwrap(),
     }];
@@ -2318,6 +2548,7 @@ fn utf16_overlap_accounts_for_scaled_radius() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        local_context: None,
         secret_group: None,
         re: Regex::new(r"aaatok_[0-9]{8}bbbb").unwrap(),
     };
@@ -2377,6 +2608,7 @@ fn utf16le_anchor_odd_offset_near_start_is_detected() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        local_context: None,
         secret_group: None,
         re: Regex::new(r"SIM2_[A-Z0-9]{12}").unwrap(),
     };
@@ -2422,6 +2654,7 @@ fn utf16be_mixed_parity_anchors_find_both() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        local_context: None,
         secret_group: None,
         re: Regex::new(r"SIM2_[A-Z0-9]{12}").unwrap(),
     };
@@ -2490,6 +2723,7 @@ fn test_chunked_scan_dedup_secret_in_overlap_with_wide_window() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        local_context: None,
         secret_group: None,
         re: Regex::new(r"KEY_([A-Za-z0-9]{16})").unwrap(),
     };
@@ -2569,6 +2803,7 @@ fn test_chunked_scan_trailing_context_not_dropped() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        local_context: None,
         secret_group: Some(1), // Capture group 1 is the secret
         re: Regex::new(r"KEY_([A-Z0-9]{8})(?:;|$)").unwrap(),
     };
@@ -2879,6 +3114,7 @@ fn chunked_transform_root_hint_matches_reference() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        local_context: None,
         secret_group: None,
         re: Regex::new("TOK0_[A-Z0-9]{8}").unwrap(),
     };
@@ -3007,6 +3243,7 @@ fn chunked_url_percent_prefix_trigger_kept() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        local_context: None,
         secret_group: None,
         re: Regex::new("TOK0_[A-Z0-9]{8}").unwrap(),
     };
@@ -3061,6 +3298,7 @@ fn chunked_url_percent_no_duplicate_when_trigger_before_and_after() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        local_context: None,
         secret_group: None,
         re: Regex::new("TOK0_[A-Z0-9]{8}").unwrap(),
     };
@@ -3143,6 +3381,7 @@ fn chunked_overlap_gt_chunk_dedupes_transform_findings() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        local_context: None,
         secret_group: None,
         re: Regex::new("TOK0_[A-Z0-9]{8}").unwrap(),
     };
@@ -3221,6 +3460,7 @@ fn nested_transform_dedupe_keeps_multiple_matches() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        local_context: None,
         secret_group: None,
         re: Regex::new("TOK0_[A-Z0-9]{8}").unwrap(),
     };
@@ -3341,6 +3581,7 @@ fn base64_gate_utf16be_anchor_straddles_stream_boundary() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        local_context: None,
         secret_group: None,
         re: Regex::new("TOK").unwrap(),
     };
@@ -3392,6 +3633,7 @@ fn stream_window_recovers_after_ring_eviction() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        local_context: None,
         secret_group: None,
         re: Regex::new("TOK").unwrap(),
     };
@@ -3441,6 +3683,7 @@ fn stream_hit_cap_forces_full_fallback() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        local_context: None,
         secret_group: None,
         re: Regex::new("TOK").unwrap(),
     };
@@ -3492,6 +3735,7 @@ fn stream_nested_span_fallback_recovers() {
         must_contain: None,
         keywords_any: None,
         entropy: None,
+        local_context: None,
         secret_group: None,
         re: Regex::new("TOK").unwrap(),
     };

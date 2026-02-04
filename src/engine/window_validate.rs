@@ -16,7 +16,8 @@
 //! 3. Run regex via `captures_iter` to access capture groups.
 //! 4. Apply entropy gates on the *full match* (group 0).
 //! 5. Extract the secret span using capture group priority (see [`extract_secret_span`]).
-//! 6. Record the finding with the extracted secret span.
+//! 6. Apply local context checks (when configured) on the secret span.
+//! 7. Record the finding with the extracted secret span.
 //!
 //! # Secret Extraction
 //! The finding's `span_start`/`span_end` reflect the *secret* portion of the match,
@@ -36,9 +37,18 @@
 //! - UTF-16 findings attach a `DecodeStep::Utf16Window` so callers can map
 //!   decoded spans back to parent byte offsets.
 //!
+//! # Entry Points
+//! - `run_rule_on_window`: engine hot path that writes findings directly into
+//!   `ScanScratch` and applies dedupe/drop-hint bookkeeping immediately.
+//! - `run_rule_on_raw_window_into` / `run_rule_on_utf16_window_into`: scheduler
+//!   adapters that accumulate findings in `scratch.tmp_findings` for the caller
+//!   to commit and account for dropped findings.
+//!
 //! [`extract_secret_span`]: super::helpers::extract_secret_span
 
-use crate::api::{DecodeStep, FileId, FindingRec, StepId, Utf16Endianness, STEP_ROOT};
+use crate::api::{
+    DecodeStep, FileId, FindingRec, LocalContextSpec, StepId, Utf16Endianness, STEP_ROOT,
+};
 use memchr::memmem;
 use std::ops::Range;
 
@@ -101,6 +111,109 @@ fn has_assignment_value_shape(window: &[u8]) -> bool {
         .count();
 
     token_len >= 10
+}
+
+/// Returns the (line_start, line_end) bounds around `secret_start` when both
+/// newline boundaries are found within the lookaround window.
+///
+/// If either boundary is missing within the bounded lookaround, returns `None`
+/// to preserve fail-open behavior at chunk/window edges.
+#[inline]
+fn find_line_bounds(
+    hay: &[u8],
+    secret_start: usize,
+    lookbehind: usize,
+    lookahead: usize,
+) -> Option<(usize, usize)> {
+    let back = secret_start.min(lookbehind);
+    let scan_start = secret_start - back;
+    let mut line_start = None;
+    for i in (scan_start..secret_start).rev() {
+        if hay[i] == b'\n' {
+            line_start = Some(i + 1);
+            break;
+        }
+    }
+
+    let fwd_end = secret_start.saturating_add(lookahead).min(hay.len());
+    let mut line_end = None;
+    for (i, &b) in hay.iter().enumerate().take(fwd_end).skip(secret_start) {
+        if b == b'\n' {
+            line_end = Some(i);
+            break;
+        }
+    }
+
+    match (line_start, line_end) {
+        (Some(start), Some(end)) => Some((start, end)),
+        _ => None,
+    }
+}
+
+#[inline]
+fn has_assignment_sep(line: &[u8]) -> bool {
+    line.iter().any(|&b| b == b'=' || b == b':' || b == b'>')
+}
+
+#[inline]
+fn contains_any_literal(hay: &[u8], needles: &[&[u8]]) -> bool {
+    for &needle in needles {
+        if memmem::find(hay, needle).is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+#[inline]
+fn is_quoted_at(hay: &[u8], secret_start: usize, secret_end: usize) -> Option<bool> {
+    let left = secret_start.checked_sub(1)?;
+    let ql = *hay.get(left)?;
+    let qr = *hay.get(secret_end)?;
+    let is_quote = ql == b'\'' || ql == b'"' || ql == b'`';
+    Some(is_quote && ql == qr)
+}
+
+/// Bounded, fail-open local context gate.
+///
+/// Returns `false` only when the required context is definitively absent within
+/// the bounded lookaround window. Missing line boundaries result in `true`.
+#[inline]
+fn local_context_passes(
+    window: &[u8],
+    secret_start: usize,
+    secret_end: usize,
+    spec: LocalContextSpec,
+) -> bool {
+    if spec.require_quoted {
+        match is_quoted_at(window, secret_start, secret_end) {
+            Some(true) => {}
+            Some(false) => return false,
+            None => {}
+        }
+    }
+
+    if spec.require_same_line_assignment || spec.key_names_any.is_some() {
+        let bounds = find_line_bounds(window, secret_start, spec.lookbehind, spec.lookahead);
+        let (line_start, line_end) = match bounds {
+            Some(bounds) => bounds,
+            None => return true,
+        };
+
+        let line_before_secret = &window[line_start..line_end.min(secret_start)];
+
+        if spec.require_same_line_assignment && !has_assignment_sep(line_before_secret) {
+            return false;
+        }
+
+        if let Some(keys) = spec.key_names_any {
+            if !contains_any_literal(line_before_secret, keys) {
+                return false;
+            }
+        }
+    }
+
+    true
 }
 
 impl Engine {
@@ -202,6 +315,12 @@ impl Engine {
                     let (secret_start, secret_end) = extract_secret_span(&caps, rule.secret_group);
                     let secret_start = search_start + secret_start;
                     let secret_end = search_start + secret_end;
+
+                    if let Some(ctx) = rule.local_context {
+                        if !local_context_passes(window, secret_start, secret_end, ctx) {
+                            continue;
+                        }
+                    }
 
                     let span_in_buf = (w.start + secret_start)..(w.start + secret_end);
                     let match_span_in_buf = (w.start + match_start)..(w.start + match_end);
@@ -415,6 +534,12 @@ impl Engine {
             // Extract secret span using capture group logic.
             let (secret_start, secret_end) = extract_secret_span(&caps, rule.secret_group);
 
+            if let Some(ctx) = rule.local_context {
+                if !local_context_passes(decoded, secret_start, secret_end, ctx) {
+                    continue;
+                }
+            }
+
             // Map decoded UTF-8 match span back to raw UTF-16 byte offsets.
             let match_raw_start =
                 map_utf16_decoded_offset(raw_win, span.start, matches!(variant, Variant::Utf16Le));
@@ -545,12 +670,18 @@ impl Engine {
                 }
             }
 
-            *found_any = true;
-
             // Extract secret span using capture group logic.
             let (secret_start, secret_end) = extract_secret_span(&caps, rule.secret_group);
             let secret_start = search_start + secret_start;
             let secret_end = search_start + secret_end;
+
+            if let Some(ctx) = rule.local_context {
+                if !local_context_passes(window, secret_start, secret_end, ctx) {
+                    continue;
+                }
+            }
+
+            *found_any = true;
 
             let span_start = window_start.saturating_add(secret_start as u64) as usize;
             let span_end = window_start.saturating_add(secret_end as u64) as usize;
@@ -741,10 +872,16 @@ impl Engine {
                 }
             }
 
-            *found_any = true;
-
             // Extract secret span using capture group logic.
             let (secret_start, secret_end) = extract_secret_span(&caps, rule.secret_group);
+
+            if let Some(ctx) = rule.local_context {
+                if !local_context_passes(decoded, secret_start, secret_end, ctx) {
+                    continue;
+                }
+            }
+
+            *found_any = true;
 
             // Map decoded UTF-8 match span back to raw UTF-16 offsets, then
             // lift into decoded-stream coordinates and (when available) map
@@ -917,5 +1054,80 @@ mod tests {
         assert!(has_assignment_value_shape(b"key=\"longtokenvalue\""));
         assert!(has_assignment_value_shape(b"key='longtokenvalue'"));
         assert!(has_assignment_value_shape(b"key=`longtokenvalue`"));
+    }
+
+    #[test]
+    fn test_local_context_same_line_assignment_passes() {
+        let spec = LocalContextSpec {
+            lookbehind: 64,
+            lookahead: 64,
+            require_same_line_assignment: true,
+            require_quoted: false,
+            key_names_any: None,
+        };
+        let window = b"prefix\nkey = SECRET\nsuffix";
+        let secret_start = window.iter().position(|&b| b == b'S').unwrap();
+        let secret_end = secret_start + "SECRET".len();
+        assert!(local_context_passes(window, secret_start, secret_end, spec));
+    }
+
+    #[test]
+    fn test_local_context_same_line_assignment_fails_when_missing() {
+        let spec = LocalContextSpec {
+            lookbehind: 64,
+            lookahead: 64,
+            require_same_line_assignment: true,
+            require_quoted: false,
+            key_names_any: None,
+        };
+        let window = b"prefix\nnope SECRET\nsuffix";
+        let secret_start = window.iter().position(|&b| b == b'S').unwrap();
+        let secret_end = secret_start + "SECRET".len();
+        assert!(!local_context_passes(
+            window,
+            secret_start,
+            secret_end,
+            spec
+        ));
+    }
+
+    #[test]
+    fn test_local_context_same_line_assignment_fail_open_without_bounds() {
+        let spec = LocalContextSpec {
+            lookbehind: 4,
+            lookahead: 4,
+            require_same_line_assignment: true,
+            require_quoted: false,
+            key_names_any: None,
+        };
+        let window = b"prefix SECRET suffix";
+        let secret_start = window.iter().position(|&b| b == b'S').unwrap();
+        let secret_end = secret_start + "SECRET".len();
+        assert!(local_context_passes(window, secret_start, secret_end, spec));
+    }
+
+    #[test]
+    fn test_local_context_requires_quotes() {
+        let spec = LocalContextSpec {
+            lookbehind: 64,
+            lookahead: 64,
+            require_same_line_assignment: false,
+            require_quoted: true,
+            key_names_any: None,
+        };
+        let window = b"key='SECRET' ";
+        let secret_start = window.iter().position(|&b| b == b'S').unwrap();
+        let secret_end = secret_start + "SECRET".len();
+        assert!(local_context_passes(window, secret_start, secret_end, spec));
+
+        let window = b"key=SECRET ";
+        let secret_start = window.iter().position(|&b| b == b'S').unwrap();
+        let secret_end = secret_start + "SECRET".len();
+        assert!(!local_context_passes(
+            window,
+            secret_start,
+            secret_end,
+            spec
+        ));
     }
 }
