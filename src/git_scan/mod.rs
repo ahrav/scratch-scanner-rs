@@ -140,7 +140,7 @@ pub use spill_merge::{merge_all, RunMerger};
 pub use spiller::{SpillStats, Spiller};
 pub use start_set::{StartSetConfig, StartSetId};
 pub use tree_candidate::{
-    CandidateBuffer, CandidateContext, ChangeKind, ResolvedCandidate, TreeCandidate,
+    CandidateBuffer, CandidateContext, CandidateSink, ChangeKind, ResolvedCandidate, TreeCandidate,
 };
 pub use tree_diff::{TreeDiffStats, TreeDiffWalker};
 pub use tree_diff_limits::TreeDiffLimits;

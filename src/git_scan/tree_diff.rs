@@ -54,7 +54,7 @@ use super::errors::TreeDiffError;
 use super::object_id::OidBytes;
 use super::object_store::TreeSource;
 use super::path_policy::classify_path;
-use super::tree_candidate::{CandidateBuffer, ChangeKind};
+use super::tree_candidate::{CandidateSink, ChangeKind};
 use super::tree_diff_limits::TreeDiffLimits;
 use super::tree_entry::{EntryKind, TreeEntry, TreeEntryIter};
 use super::tree_order::git_tree_name_cmp;
@@ -67,7 +67,8 @@ const MAX_PATH_LEN: usize = 4096;
 
 /// Counters for tree diff operations.
 ///
-/// Statistics are cumulative until `reset_stats()` is called.
+/// Statistics are cumulative until `reset_stats()` is called. The
+/// `tree_bytes_loaded` counter is used to enforce the per-job budget.
 #[derive(Clone, Debug, Default)]
 pub struct TreeDiffStats {
     /// Number of trees loaded.
@@ -198,7 +199,7 @@ impl TreeDiffWalker {
     /// # Arguments
     ///
     /// * `source` - Tree object loader
-    /// * `candidates` - Output buffer for candidates
+    /// * `candidates` - Output sink for candidates
     /// * `new_tree` - OID of the new (child) tree, or None for empty tree
     /// * `old_tree` - OID of the old (parent) tree, or None for empty tree
     /// * `commit_id` - Commit identifier for attribution
@@ -216,11 +217,13 @@ impl TreeDiffWalker {
     ///
     /// - If `new_tree == old_tree`, this is a no-op.
     /// - `parent_idx` is preserved in candidate context for later merge/dedupe.
-    /// - The candidate buffer is appended to; it is not cleared by this call.
-    pub fn diff_trees<S: TreeSource>(
+    /// - The candidate sink is appended to; it is not cleared by this call.
+    /// - Stats are cumulative across calls; `reset_stats()` clears counters.
+    /// - The tree-bytes budget is enforced across calls until reset.
+    pub fn diff_trees<S: TreeSource, C: CandidateSink>(
         &mut self,
         source: &mut S,
-        candidates: &mut CandidateBuffer,
+        candidates: &mut C,
         new_tree: Option<&OidBytes>,
         old_tree: Option<&OidBytes>,
         commit_id: u32,
@@ -313,6 +316,9 @@ impl TreeDiffWalker {
         Ok(())
     }
 
+    /// Loads tree bytes and updates cumulative stats and budget.
+    ///
+    /// `None` yields an empty tree without incrementing counters.
     fn load_tree_bytes<S: TreeSource>(
         &mut self,
         source: &mut S,
@@ -338,10 +344,10 @@ impl TreeDiffWalker {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn handle_new_entry<S: TreeSource>(
+    fn handle_new_entry<S: TreeSource, C: CandidateSink>(
         &mut self,
         source: &mut S,
-        candidates: &mut CandidateBuffer,
+        candidates: &mut C,
         oid: &OidBytes,
         name: &[u8],
         kind: EntryKind,
@@ -366,10 +372,10 @@ impl TreeDiffWalker {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn handle_matched_entries<S: TreeSource>(
+    fn handle_matched_entries<S: TreeSource, C: CandidateSink>(
         &mut self,
         source: &mut S,
-        candidates: &mut CandidateBuffer,
+        candidates: &mut C,
         new_oid: &OidBytes,
         old_oid: &OidBytes,
         name: &[u8],
@@ -438,6 +444,7 @@ impl TreeDiffWalker {
         Ok(())
     }
 
+    /// Pushes a subtree frame, extending `path_buf` with `name/`.
     fn push_subtree_frame<S: TreeSource>(
         &mut self,
         source: &mut S,
@@ -479,9 +486,13 @@ impl TreeDiffWalker {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn emit_candidate(
+    /// Emits a candidate using the current path prefix plus `name`.
+    ///
+    /// The path slice is backed by an internal buffer that is reused on the
+    /// next emission; sinks must copy the path if they need to retain it.
+    fn emit_candidate<C: CandidateSink>(
         &mut self,
-        candidates: &mut CandidateBuffer,
+        candidates: &mut C,
         oid: &OidBytes,
         name: &[u8],
         change_kind: ChangeKind,
@@ -504,7 +515,7 @@ impl TreeDiffWalker {
         let mode_u16 = mode as u16;
         let cand_flags = classify_path(&self.path_buf).bits();
 
-        candidates.push(
+        candidates.emit(
             *oid,
             &self.path_buf,
             commit_id,
@@ -522,6 +533,7 @@ impl TreeDiffWalker {
     }
 }
 
+/// Computes the next action by comparing tree entries in Git tree order.
 fn compute_action(
     new_entry: Option<(TreeEntry<'_>, usize)>,
     old_entry: Option<(TreeEntry<'_>, usize)>,
@@ -582,6 +594,7 @@ fn compute_action(
     }
 }
 
+/// Parses the next tree entry at `pos`, returning it and the next position.
 fn next_entry(
     bytes: &[u8],
     pos: usize,
@@ -601,6 +614,7 @@ fn next_entry(
     }
 }
 
+/// Converts raw OID bytes into `OidBytes`, enforcing the configured length.
 fn convert_oid(bytes: &[u8], oid_len: u8) -> Result<OidBytes, TreeDiffError> {
     OidBytes::try_from_slice(bytes).ok_or(TreeDiffError::InvalidOidLength {
         len: bytes.len(),
@@ -611,6 +625,7 @@ fn convert_oid(bytes: &[u8], oid_len: u8) -> Result<OidBytes, TreeDiffError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git_scan::CandidateBuffer;
 
     use std::collections::HashMap;
 

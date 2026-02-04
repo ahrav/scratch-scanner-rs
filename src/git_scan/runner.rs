@@ -61,7 +61,7 @@ use super::seen_store::SeenBlobStore;
 use super::spill_limits::SpillLimits;
 use super::spiller::{SpillStats, Spiller};
 use super::start_set::StartSetConfig;
-use super::tree_candidate::CandidateBuffer;
+use super::tree_candidate::CandidateSink;
 use super::tree_diff::{TreeDiffStats, TreeDiffWalker};
 use super::tree_diff_limits::TreeDiffLimits;
 
@@ -69,8 +69,12 @@ use super::tree_diff_limits::TreeDiffLimits;
 #[derive(Clone, Copy, Debug)]
 pub struct PackMmapLimits {
     /// Maximum number of pack files to mmap.
+    ///
+    /// Counted from MIDX-resolved pack paths.
     pub max_open_packs: u16,
     /// Maximum total bytes to mmap across all packs.
+    ///
+    /// Computed from file sizes; this caps address space usage, not RSS.
     pub max_total_bytes: u64,
 }
 
@@ -96,6 +100,44 @@ impl PackMmapLimits {
     pub const fn validate(&self) {
         assert!(self.max_open_packs > 0, "must allow at least 1 pack");
         assert!(self.max_total_bytes > 0, "pack mmap budget must be > 0");
+    }
+}
+
+/// Candidate sink that forwards tree-diff output to the spill/dedupe stage.
+struct SpillCandidateSink<'a> {
+    spiller: &'a mut Spiller,
+}
+
+impl<'a> SpillCandidateSink<'a> {
+    fn new(spiller: &'a mut Spiller) -> Self {
+        Self { spiller }
+    }
+}
+
+impl CandidateSink for SpillCandidateSink<'_> {
+    fn emit(
+        &mut self,
+        oid: OidBytes,
+        path: &[u8],
+        commit_id: u32,
+        parent_idx: u8,
+        change_kind: super::tree_candidate::ChangeKind,
+        ctx_flags: u16,
+        cand_flags: u16,
+    ) -> Result<(), TreeDiffError> {
+        self.spiller
+            .push(
+                oid,
+                path,
+                commit_id,
+                parent_idx,
+                change_kind,
+                ctx_flags,
+                cand_flags,
+            )
+            .map_err(|err| TreeDiffError::CandidateSinkError {
+                detail: err.to_string(),
+            })
     }
 }
 
@@ -127,7 +169,7 @@ pub struct GitScanConfig {
     pub pack_decode: PackDecodeLimits,
     pub pack_io: PackIoLimits,
     pub engine_adapter: EngineAdapterConfig,
-    /// Pack mmap limits during pack execution.
+    /// Pack mmap limits during pack execution (count + total bytes).
     pub pack_mmap: PackMmapLimits,
     /// Pack cache size in bytes (must fit in `u32`).
     pub pack_cache_bytes: usize,
@@ -247,6 +289,7 @@ pub enum GitScanError {
     PackIo(PackIoError),
     Persist(PersistError),
     Io(io::Error),
+    /// Resource limit exceeded (pack mmap counts or bytes).
     ResourceLimit(String),
 }
 
@@ -402,93 +445,82 @@ pub fn run_git_scan(
     let cg = CommitGraphView::open_repo(&repo)?;
     let plan = introduced_by_plan(&repo, &cg, config.commit_walk)?;
 
-    // Tree diff and candidate collection.
-    let mut object_store = ObjectStore::open(&repo, &config.tree_diff)?;
-    let mut walker = TreeDiffWalker::new(&config.tree_diff, repo.object_format.oid_len());
-    let mut candidates = CandidateBuffer::new(&config.tree_diff, repo.object_format.oid_len());
-    let mut parent_scratch = ParentScratch::new();
-
-    for PlannedCommit { pos, snapshot_root } in &plan {
-        let commit_id = pos.0;
-        let new_tree = cg.root_tree_oid(*pos)?;
-
-        if *snapshot_root {
-            walker.diff_trees(
-                &mut object_store,
-                &mut candidates,
-                Some(&new_tree),
-                None,
-                commit_id,
-                0,
-            )?;
-            continue;
-        }
-
-        parent_scratch.clear();
-        cg.collect_parents(
-            *pos,
-            config.commit_walk.max_parents_per_commit,
-            &mut parent_scratch,
-        )?;
-        let parents = parent_scratch.as_slice();
-
-        if parents.is_empty() {
-            walker.diff_trees(
-                &mut object_store,
-                &mut candidates,
-                Some(&new_tree),
-                None,
-                commit_id,
-                0,
-            )?;
-            continue;
-        }
-
-        match config.merge_diff_mode {
-            MergeDiffMode::AllParents => {
-                for (idx, parent_pos) in parents.iter().enumerate() {
-                    let old_tree = cg.root_tree_oid(*parent_pos)?;
-                    walker.diff_trees(
-                        &mut object_store,
-                        &mut candidates,
-                        Some(&new_tree),
-                        Some(&old_tree),
-                        commit_id,
-                        idx as u8,
-                    )?;
-                }
-            }
-            MergeDiffMode::FirstParentOnly => {
-                let old_tree = cg.root_tree_oid(parents[0])?;
-                walker.diff_trees(
-                    &mut object_store,
-                    &mut candidates,
-                    Some(&new_tree),
-                    Some(&old_tree),
-                    commit_id,
-                    0,
-                )?;
-            }
-        }
-    }
-
-    // Spill + dedupe.
+    // Spill + dedupe (stream candidates during tree diff).
     let spill_dir = match &config.spill_dir {
         Some(path) => path.clone(),
         None => make_spill_dir()?,
     };
 
     let mut spiller = Spiller::new(config.spill, repo.object_format.oid_len(), &spill_dir)?;
-    for cand in candidates.iter_resolved() {
-        spiller.push(
-            cand.oid,
-            cand.path,
-            cand.commit_id,
-            cand.parent_idx,
-            cand.change_kind,
-            cand.ctx_flags,
-            cand.cand_flags,
-        )?;
+    let mut object_store = ObjectStore::open(&repo, &config.tree_diff)?;
+    let mut walker = TreeDiffWalker::new(&config.tree_diff, repo.object_format.oid_len());
+    let mut parent_scratch = ParentScratch::new();
+
+    {
+        let mut sink = SpillCandidateSink::new(&mut spiller);
+        for PlannedCommit { pos, snapshot_root } in &plan {
+            let commit_id = pos.0;
+            let new_tree = cg.root_tree_oid(*pos)?;
+
+            if *snapshot_root {
+                walker.diff_trees(
+                    &mut object_store,
+                    &mut sink,
+                    Some(&new_tree),
+                    None,
+                    commit_id,
+                    0,
+                )?;
+                continue;
+            }
+
+            parent_scratch.clear();
+            cg.collect_parents(
+                *pos,
+                config.commit_walk.max_parents_per_commit,
+                &mut parent_scratch,
+            )?;
+            let parents = parent_scratch.as_slice();
+
+            if parents.is_empty() {
+                walker.diff_trees(
+                    &mut object_store,
+                    &mut sink,
+                    Some(&new_tree),
+                    None,
+                    commit_id,
+                    0,
+                )?;
+                continue;
+            }
+
+            match config.merge_diff_mode {
+                MergeDiffMode::AllParents => {
+                    for (idx, parent_pos) in parents.iter().enumerate() {
+                        let old_tree = cg.root_tree_oid(*parent_pos)?;
+                        walker.diff_trees(
+                            &mut object_store,
+                            &mut sink,
+                            Some(&new_tree),
+                            Some(&old_tree),
+                            commit_id,
+                            idx as u8,
+                        )?;
+                    }
+                }
+                MergeDiffMode::FirstParentOnly => {
+                    let old_tree = cg.root_tree_oid(parents[0])?;
+                    walker.diff_trees(
+                        &mut object_store,
+                        &mut sink,
+                        Some(&new_tree),
+                        Some(&old_tree),
+                        commit_id,
+                        0,
+                    )?;
+                }
+            }
+        }
     }
 
     let midx = load_midx(&repo)?;
@@ -729,6 +761,8 @@ fn strip_pack_suffix(name: &[u8]) -> Vec<u8> {
 /// Memory-map pack files for zero-copy decoding.
 ///
 /// The mappings are read-only and may outlive the file handles.
+/// Returns `GitScanError::ResourceLimit` if pack counts or total bytes exceed
+/// the configured mmap limits.
 fn mmap_pack_files(
     pack_paths: &[PathBuf],
     limits: PackMmapLimits,

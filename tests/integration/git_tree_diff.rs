@@ -7,11 +7,13 @@ use std::path::Path;
 use std::process::Command;
 
 use scanner_rs::git_scan::{
-    repo_open, CandidateBuffer, ChangeKind, MergeDiffMode, ObjectStore, RefWatermarkStore,
-    RepoArtifactStatus, RepoOpenError, RepoOpenLimits, StartSetConfig, StartSetResolver,
+    introduced_by_plan, repo_open, CandidateBuffer, CandidateSink, ChangeKind, CollectedUniqueBlob,
+    CollectingUniqueBlobSink, CommitGraph, CommitGraphView, CommitWalkLimits, MergeDiffMode,
+    NeverSeenStore, ObjectStore, ParentScratch, RefWatermarkStore, RepoArtifactStatus,
+    RepoOpenError, RepoOpenLimits, SpillLimits, Spiller, StartSetConfig, StartSetResolver,
     TreeDiffError, TreeDiffLimits, TreeDiffWalker,
 };
-use scanner_rs::git_scan::{OidBytes, RepoJobState};
+use scanner_rs::git_scan::{OidBytes, PlannedCommit, RepoJobState};
 use tempfile::TempDir;
 
 fn git_available() -> bool {
@@ -345,6 +347,187 @@ fn collect_merge_candidates(
         }
         MergeDiffMode::FirstParentOnly => first_parent.clone(),
     }
+}
+
+fn collect_unique_blobs(state: &RepoJobState, limits: SpillLimits) -> Vec<CollectedUniqueBlob> {
+    let cg = CommitGraphView::open_repo(state).unwrap();
+    let plan = introduced_by_plan(state, &cg, CommitWalkLimits::RESTRICTIVE).unwrap();
+
+    let tree_limits = TreeDiffLimits::RESTRICTIVE;
+    let mut store = ObjectStore::open(state, &tree_limits).unwrap();
+    let mut walker = TreeDiffWalker::new(&tree_limits, state.object_format.oid_len());
+    let mut parent_scratch = ParentScratch::new();
+
+    let tmp = TempDir::new().unwrap();
+    let mut spiller = Spiller::new(limits, state.object_format.oid_len(), tmp.path()).unwrap();
+
+    struct SpillSink<'a> {
+        spiller: &'a mut Spiller,
+    }
+
+    impl CandidateSink for SpillSink<'_> {
+        fn emit(
+            &mut self,
+            oid: OidBytes,
+            path: &[u8],
+            commit_id: u32,
+            parent_idx: u8,
+            change_kind: ChangeKind,
+            ctx_flags: u16,
+            cand_flags: u16,
+        ) -> Result<(), TreeDiffError> {
+            self.spiller
+                .push(
+                    oid,
+                    path,
+                    commit_id,
+                    parent_idx,
+                    change_kind,
+                    ctx_flags,
+                    cand_flags,
+                )
+                .map_err(|err| TreeDiffError::CandidateSinkError {
+                    detail: err.to_string(),
+                })
+        }
+    }
+
+    {
+        let mut sink = SpillSink {
+            spiller: &mut spiller,
+        };
+        for PlannedCommit { pos, snapshot_root } in &plan {
+            let commit_id = pos.0;
+            let new_tree = cg.root_tree_oid(*pos).unwrap();
+
+            if *snapshot_root {
+                walker
+                    .diff_trees(&mut store, &mut sink, Some(&new_tree), None, commit_id, 0)
+                    .unwrap();
+                continue;
+            }
+
+            parent_scratch.clear();
+            cg.collect_parents(
+                *pos,
+                CommitWalkLimits::RESTRICTIVE.max_parents_per_commit,
+                &mut parent_scratch,
+            )
+            .unwrap();
+            let parents = parent_scratch.as_slice();
+
+            if parents.is_empty() {
+                walker
+                    .diff_trees(&mut store, &mut sink, Some(&new_tree), None, commit_id, 0)
+                    .unwrap();
+                continue;
+            }
+
+            let merge_mode = MergeDiffMode::AllParents;
+            match merge_mode {
+                MergeDiffMode::AllParents => {
+                    for (idx, parent_pos) in parents.iter().enumerate() {
+                        let old_tree = cg.root_tree_oid(*parent_pos).unwrap();
+                        walker
+                            .diff_trees(
+                                &mut store,
+                                &mut sink,
+                                Some(&new_tree),
+                                Some(&old_tree),
+                                commit_id,
+                                idx as u8,
+                            )
+                            .unwrap();
+                    }
+                }
+                MergeDiffMode::FirstParentOnly => {
+                    let old_tree = cg.root_tree_oid(parents[0]).unwrap();
+                    walker
+                        .diff_trees(
+                            &mut store,
+                            &mut sink,
+                            Some(&new_tree),
+                            Some(&old_tree),
+                            commit_id,
+                            0,
+                        )
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    let store = NeverSeenStore;
+    let mut sink = CollectingUniqueBlobSink::default();
+    spiller.finalize(&store, &mut sink).unwrap();
+    sink.blobs
+}
+
+#[test]
+fn spill_limits_streaming_is_partition_invariant() {
+    if !git_available() || !git_supports_midx() {
+        eprintln!("git or multi-pack-index not available; skipping spill limits test");
+        return;
+    }
+
+    let tmp = prepare_repo_with_commits();
+    let state = open_repo_state(tmp.path());
+
+    let mut limits_small = SpillLimits::RESTRICTIVE;
+    limits_small.max_chunk_candidates = 2;
+    limits_small.max_chunk_path_bytes = 64;
+    limits_small.seen_batch_max_oids = 2;
+    limits_small.seen_batch_max_path_bytes = 64;
+
+    let mut limits_large = limits_small;
+    limits_large.max_chunk_candidates = 1024;
+    limits_large.max_chunk_path_bytes = 4096;
+
+    let mut out_small = collect_unique_blobs(&state, limits_small);
+    let mut out_large = collect_unique_blobs(&state, limits_large);
+
+    out_small.sort_by(|a, b| {
+        (
+            a.oid,
+            a.ctx.commit_id,
+            a.ctx.parent_idx,
+            a.ctx.change_kind.as_u8(),
+            a.ctx.ctx_flags,
+            a.ctx.cand_flags,
+            &a.path,
+        )
+            .cmp(&(
+                b.oid,
+                b.ctx.commit_id,
+                b.ctx.parent_idx,
+                b.ctx.change_kind.as_u8(),
+                b.ctx.ctx_flags,
+                b.ctx.cand_flags,
+                &b.path,
+            ))
+    });
+    out_large.sort_by(|a, b| {
+        (
+            a.oid,
+            a.ctx.commit_id,
+            a.ctx.parent_idx,
+            a.ctx.change_kind.as_u8(),
+            a.ctx.ctx_flags,
+            a.ctx.cand_flags,
+            &a.path,
+        )
+            .cmp(&(
+                b.oid,
+                b.ctx.commit_id,
+                b.ctx.parent_idx,
+                b.ctx.change_kind.as_u8(),
+                b.ctx.ctx_flags,
+                b.ctx.cand_flags,
+                &b.path,
+            ))
+    });
+
+    assert_eq!(out_small, out_large);
 }
 
 fn write_corrupt_tree(objects_dir: &Path, oid: &OidBytes) {

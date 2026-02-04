@@ -5,9 +5,12 @@
 //! `#[non_exhaustive]` to allow adding variants without breaking callers;
 //! consumers should include a fallback match arm.
 //!
-//! Conversions (`From<io::Error>`, `From<MidxError>`) are provided for
-//! spill-related errors to keep propagation ergonomic while preserving
-//! a source error for diagnostics.
+//! # Design Notes
+//! - Variants with `detail` carry human-readable context and are not stable
+//!   for machine parsing.
+//! - I/O errors preserve their source to keep diagnostics actionable.
+//! - Stage boundaries are intentional: an error from one stage should not be
+//!   reused to describe another stage's failure mode.
 
 use std::fmt;
 use std::io;
@@ -17,7 +20,7 @@ use super::midx_error::MidxError;
 /// Errors from repo discovery and open.
 ///
 /// These errors occur before any object scanning begins and typically
-/// indicate repository layout or configuration issues.
+/// indicate repository layout, configuration, or limit violations.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum RepoOpenError {
@@ -173,7 +176,8 @@ impl std::error::Error for CommitPlanError {}
 /// Errors from tree diff and candidate collection.
 ///
 /// These errors occur after the commit plan is built, while loading trees
-/// and extracting candidate paths.
+/// and extracting candidate paths. Many are recoverable by maintenance or
+/// increasing limits (tree depth, bytes, or buffer capacity).
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum TreeDiffError {
@@ -195,6 +199,8 @@ pub enum TreeDiffError {
     CandidateBufferFull,
     /// Path arena capacity exceeded.
     PathArenaFull,
+    /// Candidate sink failed.
+    CandidateSinkError { detail: String },
     /// Object store failure (MIDX, pack, or loose object decode).
     ObjectStoreError { detail: String },
 }
@@ -222,6 +228,7 @@ impl fmt::Display for TreeDiffError {
             }
             Self::CandidateBufferFull => write!(f, "candidate buffer full"),
             Self::PathArenaFull => write!(f, "path arena full"),
+            Self::CandidateSinkError { detail } => write!(f, "candidate sink error: {detail}"),
             Self::ObjectStoreError { detail } => write!(f, "object store error: {detail}"),
         }
     }
@@ -320,7 +327,8 @@ impl From<MidxError> for SpillError {
 
 /// Errors from persistence operations.
 ///
-/// These errors represent failures after scanning has completed.
+/// These errors represent failures after scanning has completed; in-memory
+/// results may still be available even if persistence fails.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum PersistError {
