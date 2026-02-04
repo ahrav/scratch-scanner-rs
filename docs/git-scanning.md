@@ -51,6 +51,20 @@ flowchart LR
 - Any decode skips or missing/corrupt loose objects result in `FinalizeOutcome::Partial`.
 - Skipped candidates are reported with explicit reasons; pack exec reports contain detailed decode errors.
 
+## Concurrency and Backpressure
+
+Git scanning executes **single-threaded** today. There are no in-flight queues
+between stages; instead, each stage enforces explicit bounds:
+
+- Spill/dedupe caps (`SpillLimits`) limit candidate count and spill bytes.
+- Mapping caps (`MappingBridgeConfig`) bound packed/loose candidate buffers.
+- Pack planning limits (`PackPlanConfig`) bound delta expansion worklists.
+- Pack execution limits (`PackMmapLimits`, `PackDecodeLimits`) bound mmaps and
+  inflate sizes.
+
+These limits provide deterministic backpressure and serve as the queue/budget
+boundaries for any future parallelization.
+
 ## Persistence Contract
 
 Finalize produces two batches:

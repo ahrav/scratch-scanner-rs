@@ -783,6 +783,20 @@ mod tests {
         encoder.finish().unwrap()
     }
 
+    fn encode_ofs_distance(mut dist: u64) -> Vec<u8> {
+        assert!(dist > 0);
+        let mut bytes = Vec::new();
+        bytes.push((dist & 0x7f) as u8);
+        dist >>= 7;
+        while dist > 0 {
+            dist -= 1;
+            bytes.push(((dist & 0x7f) as u8) | 0x80);
+            dist >>= 7;
+        }
+        bytes.reverse();
+        bytes
+    }
+
     fn oid_to_hex(oid: &OidBytes) -> String {
         let mut out = String::with_capacity(oid.len() as usize * 2);
         for &b in oid.as_slice() {
@@ -831,6 +845,29 @@ mod tests {
         out.extend_from_slice(&1u32.to_be_bytes());
         out.extend_from_slice(&encode_entry_header(7, result.len() as u64));
         out.extend_from_slice(&base_oid);
+        out.extend_from_slice(&compress(&delta));
+        out.extend_from_slice(&[0u8; 20]);
+        out
+    }
+
+    fn build_pack_ofs_delta(base_offset: u64, result: &[u8]) -> Vec<u8> {
+        let mut delta = Vec::new();
+        delta.extend_from_slice(&encode_varint(0));
+        delta.extend_from_slice(&encode_varint(result.len() as u64));
+        delta.push(result.len() as u8);
+        delta.extend_from_slice(result);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(b"PACK");
+        out.extend_from_slice(&2u32.to_be_bytes());
+        out.extend_from_slice(&2u32.to_be_bytes());
+
+        out.extend_from_slice(&encode_entry_header(3, 0));
+        out.extend_from_slice(&compress(&[]));
+
+        let delta_offset = out.len() as u64;
+        out.extend_from_slice(&encode_entry_header(6, result.len() as u64));
+        out.extend_from_slice(&encode_ofs_distance(delta_offset - base_offset));
         out.extend_from_slice(&compress(&delta));
         out.extend_from_slice(&[0u8; 20]);
         out
@@ -935,5 +972,40 @@ mod tests {
         let delta = io.load_object(&OidBytes::sha1(delta_oid)).unwrap().unwrap();
         assert_eq!(delta.0, ObjectKind::Blob);
         assert_eq!(delta.1, result_bytes);
+    }
+
+    #[test]
+    fn delta_depth_exceeded_is_reported() {
+        let base_oid = [0x11; 20];
+        let delta_oid = [0x22; 20];
+
+        let result_bytes = b"delta";
+        let pack = build_pack_ofs_delta(12, result_bytes);
+
+        let temp = tempdir().unwrap();
+        let pack_path = temp.path().join("pack-depth.pack");
+        fs::write(&pack_path, &pack).unwrap();
+
+        let mut builder = MidxBuilder::default();
+        builder.add_pack(b"pack-depth");
+        builder.add_object(base_oid, 0, 12);
+        builder.add_object(delta_oid, 0, 12 + 1 + compress(&[]).len() as u64);
+        let midx_bytes = builder.build();
+        let midx = MidxView::parse(&midx_bytes, ObjectFormat::Sha1).unwrap();
+
+        let limits = PackIoLimits::new(PackDecodeLimits::new(64, 1024, 1024), 0);
+        let mut io = PackIo::from_parts(
+            midx,
+            vec![pack_path],
+            vec![temp.path().to_path_buf()],
+            limits,
+        )
+        .unwrap();
+
+        let err = io.load_object(&OidBytes::sha1(delta_oid)).unwrap_err();
+        assert!(matches!(
+            err,
+            PackIoError::DeltaDepthExceeded { max_depth: 0 }
+        ));
     }
 }

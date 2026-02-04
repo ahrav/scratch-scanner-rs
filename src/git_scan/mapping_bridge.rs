@@ -5,6 +5,13 @@
 //! or emits it as a loose candidate. All emitted candidates reference the
 //! bridge-owned arena, so callers must keep it alive for downstream use.
 //!
+//! # Algorithm
+//! 1. Validate strict OID ordering (rejects duplicates or regressions).
+//! 2. Re-intern the candidate path into the bridge arena.
+//! 3. Look up the blob OID in the MIDX.
+//! 4. Emit a packed or loose candidate into the downstream sink.
+//! 5. Track per-blob stats and reconcile them at `finish()`.
+//!
 //! # Invariants
 //! - Input OIDs must be strictly increasing and duplicate-free.
 //! - Path references in emitted candidates are valid only while the bridge's
@@ -22,6 +29,7 @@ use super::midx::MidxView;
 use super::midx_error::MidxError;
 use super::object_id::OidBytes;
 use super::pack_candidates::{LooseCandidate, PackCandidate, PackCandidateSink};
+use super::perf;
 use super::tree_candidate::CandidateContext;
 use super::unique_blob::{UniqueBlob, UniqueBlobSink};
 
@@ -116,6 +124,9 @@ impl<'midx, S: PackCandidateSink> MappingBridge<'midx, S> {
     /// This does not call `sink.finish()`. Callers should invoke the sink
     /// finish via the `UniqueBlobSink` trait before consuming the bridge.
     ///
+    /// The returned arena must stay alive as long as emitted candidates are
+    /// used, because their `ByteRef`s point into it.
+    ///
     /// # Errors
     /// Returns `SpillError::MidxError` if internal stats are inconsistent.
     pub fn finish(self) -> Result<(MappingStats, S, ByteArena), SpillError> {
@@ -129,6 +140,9 @@ impl<'midx, S: PackCandidateSink> MappingBridge<'midx, S> {
     }
 
     /// Ensures strictly increasing OID order and rejects duplicates.
+    ///
+    /// This defends against spill bugs and protects downstream merge logic
+    /// that assumes sorted candidates.
     fn ensure_sorted(&mut self, oid: OidBytes) -> Result<(), SpillError> {
         if let Some(last) = self.last_oid {
             match oid.cmp(&last) {
@@ -144,6 +158,7 @@ impl<'midx, S: PackCandidateSink> MappingBridge<'midx, S> {
     /// Re-interns a path from a source arena into the bridge arena.
     ///
     /// Empty paths are preserved as the zero `ByteRef` sentinel.
+    /// This maintains stable path references across downstream stages.
     fn intern_path(&mut self, paths: &ByteArena, path_ref: ByteRef) -> Result<ByteRef, SpillError> {
         let path = paths.get(path_ref);
         if path.is_empty() {
@@ -173,7 +188,10 @@ impl<S: PackCandidateSink> UniqueBlobSink for MappingBridge<'_, S> {
 
         self.stats.unique_blobs_in += 1;
 
-        match self.midx.find_oid(&blob.oid)? {
+        let (lookup, nanos) = perf::time(|| self.midx.find_oid(&blob.oid));
+        perf::record_mapping(nanos);
+
+        match lookup? {
             Some(idx) => {
                 let (pack_id, offset) = self.midx.offset_at(idx)?;
                 let candidate = PackCandidate {

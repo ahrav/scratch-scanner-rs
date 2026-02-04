@@ -17,6 +17,18 @@
 //! 5. `spill` dedupes and filters candidates against the seen store.
 //! 6. `mapping_bridge` maps unique blobs to pack/loose candidates.
 //! 7. `pack_plan` builds per-pack decode plans from pack candidates.
+//! 8. `pack_exec` decodes blobs and streams bytes into `engine_adapter`.
+//! 9. `finalize` builds persistence ops, and `persist` commits them atomically.
+//!
+//! # Output model
+//! - Metadata phases emit stable plans and candidate lists without reading blobs.
+//! - Execution phases decode blobs with explicit limits and report per-offset
+//!   skips while keeping output deterministic.
+//! - Finalization emits write ops for data and (on complete runs) watermarks.
+//!
+//! # Feature gates
+//! - `rocksdb` enables the RocksDB persistence adapter.
+//! - `git-perf` enables performance counters for pack decode and scan stages.
 //!
 //! # Invariants
 //! - Metadata stages (preflight through pack planning) do not read blob payloads.
@@ -47,6 +59,7 @@ pub mod pack_io;
 pub mod pack_plan;
 pub mod pack_plan_model;
 pub mod path_policy;
+pub mod perf;
 pub mod persist;
 pub mod persist_rocksdb;
 pub mod policy_hash;
@@ -116,6 +129,7 @@ pub use pack_plan_model::{
     CLUSTER_GAP_BYTES,
 };
 pub use path_policy::PathClass;
+pub use perf::{reset as reset_git_perf, snapshot as git_perf_snapshot, GitPerfStats};
 pub use persist::{persist_finalize_output, InMemoryPersistenceStore, PersistenceStore};
 pub use policy_hash::{policy_hash, MergeDiffMode, PolicyHash};
 pub use preflight::{
