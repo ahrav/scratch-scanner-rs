@@ -16,6 +16,15 @@
 //! - On Unix, path storage is a fixed-size arena; exceeding it is a hard error.
 //! - The pipeline is single-threaded and not Sync/Send by design.
 
+use crate::archive::formats::{
+    tar::TAR_BLOCK_LEN, GzipStream, TarCursor, TarInput, TarNext, TarRead,
+};
+use crate::archive::{
+    detect_kind_from_name_bytes, detect_kind_from_path, sniff_kind_from_header, ArchiveBudgets,
+    ArchiveConfig, ArchiveKind, ArchiveSkipReason, ArchiveStats, BudgetHit, ChargeResult,
+    EntryPathCanonicalizer, EntrySkipReason, PartialReason, VirtualPathBuilder,
+    DEFAULT_MAX_COMPONENTS,
+};
 #[cfg(unix)]
 use crate::runtime::PathSpan;
 #[cfg(unix)]
@@ -28,7 +37,7 @@ use crate::{
 #[cfg(not(unix))]
 use std::fs;
 use std::fs::File;
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 #[cfg(not(unix))]
 use std::path::PathBuf;
@@ -102,6 +111,8 @@ pub struct PipelineConfig {
     /// ignored. Exceeding the arena is treated as a configuration bug and will
     /// fail fast rather than allocate.
     pub path_bytes_cap: usize,
+    /// Archive scanning configuration.
+    pub archive: ArchiveConfig,
 }
 
 impl Default for PipelineConfig {
@@ -111,6 +122,7 @@ impl Default for PipelineConfig {
             chunk_size: DEFAULT_CHUNK_SIZE,
             max_files,
             path_bytes_cap: max_files.saturating_mul(PIPE_PATH_BYTES_PER_FILE),
+            archive: ArchiveConfig::default(),
         }
     }
 }
@@ -139,6 +151,8 @@ pub struct PipelineStats {
     /// Optional Base64 decode/gate instrumentation (feature: `b64-stats`).
     #[cfg(feature = "b64-stats")]
     pub base64: crate::Base64DecodeStats,
+    /// Archive scanning outcomes (when enabled).
+    pub archive: ArchiveStats,
 }
 
 /// Simple single-producer, single-consumer ring wrapper.

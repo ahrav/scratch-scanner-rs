@@ -36,6 +36,7 @@
 //!
 //! For a longer design walkthrough, see `docs/architecture.md`.
 
+pub mod archive;
 pub mod async_io;
 pub mod b64_yara_gate;
 pub mod lsm;

@@ -120,6 +120,13 @@ graph LR
     style Limits fill:#ffebee
 ```
 
+## Archive Entry Context
+
+When archive scanning is enabled, entry payload bytes flow through the same
+transform chain and decoding budgets as regular files. Archive entry paths are
+canonicalized separately in the archive subsystem and do not affect transform
+logic or decode limits.
+
 | Limit | Default | Purpose |
 |-------|---------|---------|
 | `max_transform_depth` | 3 | Maximum decode chain length |

@@ -87,6 +87,7 @@ graph TB
 | **AhoCorasick** | External crate | Multi-pattern anchor scanning (raw + UTF-16 variants) |
 | **TransformConfig** | `src/api.rs:132` | Transform stage configuration (URL percent, Base64) |
 | **Pipeline** | `src/pipeline.rs:831` | 4-stage cooperative pipeline coordinator |
+| **Archive Core** | `src/archive/mod.rs` | Archive scanning config, budgets, outcomes, path canonicalization, and format helpers |
 | **Walker** | `src/pipeline.rs:331` | Recursive file system traversal (Unix primary; fallback at line 196) |
 | **ReaderStage** | `src/pipeline.rs:579` | File chunking with overlap preservation |
 | **ScanStage** | `src/pipeline.rs:680` | Detection engine invocation |

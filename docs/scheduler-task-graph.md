@@ -146,6 +146,12 @@ if detection_finds_archive(buffer) {
 
 The nested enumeration acquires its own frontier permits independently.
 
+**Dispatch note:** in the local scheduler (filesystem backend), archive
+containers are detected by extension/magic and routed through the archive
+dispatch entrypoint. In Phase 3 this dispatch is a skip path; later phases
+replace it with actual archive scanning while preserving the same task
+boundaries.
+
 ### Re-enqueueing on Backpressure
 
 When the frontier is at capacity, `Enumerate` does not block or drop work:
