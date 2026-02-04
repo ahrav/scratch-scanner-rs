@@ -35,6 +35,8 @@ Input: Window [w.start..w.end) in buffer
   ↓
 [Gate 6] Extract secret span from capture groups
   ↓
+[Gate 7] Apply local context checks (bounded, fail-open)
+  ↓
 Output: FindingRec with spans in appropriate coordinate space
 ```
 
@@ -186,6 +188,18 @@ if rule.needs_assignment_shape_check && !has_assignment_value_shape(window) {
 **Purpose**: Reject windows that lack the basic structure for assignment patterns (e.g., `key=value`).
 
 **When enabled**: When the rule regex expects an assignment-like structure.
+
+### 5. Local Context Gate (Design A)
+
+Local context gates run **after** regex matching and secret extraction. They
+inspect a bounded lookaround slice (same line) to validate micro-context such as
+assignment separators, quoting, or key-name hints. These checks are:
+
+- **Bounded**: O(k) for small lookbehind/lookahead windows
+- **Allocation-free**: byte scans only
+- **Fail-open**: when line boundaries are not found inside the lookaround range
+
+Local context gates are rule-selective and opt-in via rule config.
 
 ---
 

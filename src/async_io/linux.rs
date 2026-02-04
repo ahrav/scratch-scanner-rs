@@ -239,17 +239,29 @@ fn scan_file<W: Write>(
 
 /// Read plan for a single payload read submission.
 struct ReadPlan {
+    /// File descriptor selected for this read (direct or buffered).
     fd: RawFd,
+    /// Absolute file offset for the read.
+    ///
+    /// Direct reads are aligned to `BUFFER_ALIGN` and fall within `direct_end`.
     offset: u64,
+    /// Read length in bytes (<= `chunk_size`).
+    ///
+    /// Direct reads are aligned; buffered tail reads may be shorter/unaligned.
     len: usize,
 }
 
 /// Pending in-flight read plus metadata to construct a `Chunk`.
 struct PendingRead {
+    /// Buffer handle owning the backing storage during the in-flight read.
     handle: crate::BufferHandle,
+    /// Overlap bytes copied ahead of the payload.
     prefix_len: usize,
+    /// Buffer offset where the prefix begins.
     buf_offset: usize,
+    /// File offset corresponding to the payload start (after prefix).
     payload_file_offset: u64,
+    /// Planned payload length (used to detect short reads).
     read_len: usize,
 }
 
@@ -325,6 +337,9 @@ impl<'a> UringFileReader<'a> {
         })
     }
 
+    /// Submit and wait for the first payload to prime the pipeline.
+    ///
+    /// Returns `Ok(None)` for empty files.
     fn read_first(&mut self) -> io::Result<Option<Chunk>> {
         // Prime the pipeline: read the first payload synchronously so we
         // have bytes to scan before issuing the overlapped read.
@@ -335,6 +350,7 @@ impl<'a> UringFileReader<'a> {
         self.wait_next()
     }
 
+    /// Submit the next read, carrying forward overlap bytes from `current`.
     fn submit_next_from_current(&mut self, current: &Chunk) -> io::Result<bool> {
         let overlap_len = self.overlap.min(current.len as usize);
         let total_len = current.len as usize;
@@ -347,6 +363,9 @@ impl<'a> UringFileReader<'a> {
         self.submit_read(handle, prefix, overlap_len)
     }
 
+    /// Submit the next read described by `next_read_plan`.
+    ///
+    /// Returns `Ok(false)` when EOF is reached and no read is submitted.
     fn submit_read(
         &mut self,
         mut handle: crate::BufferHandle,
@@ -400,6 +419,9 @@ impl<'a> UringFileReader<'a> {
         Ok(true)
     }
 
+    /// Wait for the in-flight read to complete and materialize a `Chunk`.
+    ///
+    /// On short reads, clamps the known file size to avoid overshooting EOF.
     fn wait_next(&mut self) -> io::Result<Option<Chunk>> {
         let pending = match self.in_flight.take() {
             Some(pending) => pending,
@@ -453,6 +475,8 @@ impl<'a> UringFileReader<'a> {
         Ok(Some(chunk))
     }
 
+    /// Choose the next read plan, using direct IO for the aligned prefix
+    /// and buffered IO for the tail.
     fn next_read_plan(&self) -> Option<ReadPlan> {
         if self.next_offset >= self.file_size {
             return None;
@@ -485,6 +509,7 @@ impl<'a> UringFileReader<'a> {
         })
     }
 
+    /// Clamp the known file size if a short read indicates truncation.
     fn clamp_file_size(&mut self, observed_size: u64) {
         if observed_size < self.file_size {
             self.file_size = observed_size;
@@ -606,6 +631,7 @@ mod tests {
             must_contain: None,
             keywords_any: None,
             entropy: None,
+            local_context: None,
             secret_group: None,
             re: Regex::new("SECRET").unwrap(),
         };

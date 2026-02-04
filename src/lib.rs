@@ -68,8 +68,9 @@ mod runtime;
 pub use api::Base64DecodeStats;
 pub use api::{
     AnchorPolicy, DecodeStep, DecodeSteps, DelimAfter, EntropySpec, FileId, Finding, FindingRec,
-    Gate, RuleSpec, StepId, TailCharset, TransformConfig, TransformId, TransformMode, Tuning,
-    TwoPhaseSpec, Utf16Endianness, ValidatorKind, MAX_DECODE_STEPS,
+    Gate, LocalContextSpec, RuleSpec, StepId, TailCharset, TransformConfig, TransformId,
+    TransformMode, Tuning, TwoPhaseSpec, Utf16Endianness, ValidatorKind,
+    LOCAL_CONTEXT_MAX_LOOKAROUND, MAX_DECODE_STEPS,
 };
 
 pub use demo::{
