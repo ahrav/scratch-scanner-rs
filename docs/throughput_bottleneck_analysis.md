@@ -24,6 +24,10 @@ Use them to compute the metrics in the hardening plan:
 - **Mapping cost**: `mapping_nanos / total_nanos` and `mapping_calls`
 - **Cache hit rate**: `cache_hits / (cache_hits + cache_misses)`
 
+Mapping now uses a streaming MIDX cursor that walks the sorted OID list and
+gallops within fanout buckets, avoiding a full binary search per blob. Ensure
+the unique-blob stream is strictly sorted so the cursor can advance monotonically.
+
 ### Usage
 
 ```rust
@@ -37,6 +41,59 @@ let stats = git_perf_snapshot();
 For allocation checks, enable the debug allocation guard via
 `git_scan::set_alloc_guard_enabled(true)` in debug builds and use the
 counting allocator when running perf tests.
+
+### Metrics Snapshot (Git Scan)
+
+`GitScanReport` now records stage timings, perf counters, and allocation deltas
+for the hot stages. Use `format_metrics()` to emit stable `key=value` lines
+for reproducible baselines and golden tests.
+
+Notes:
+- `cycles_per_byte` is derived from wall-clock time when `GIT_SCAN_CPU_HZ` is set.
+- Allocation counters require the counting allocator (tests install it by default).
+- `mapping.nanos` measures total time spent in mapping-bridge emits.
+
+Example:
+
+```text
+stage.tree_diff.nanos=2000
+stage.spill.nanos=3000
+stage.mapping.nanos=4000
+stage.pack_plan.nanos=5000
+stage.pack_exec.nanos=6000
+stage.scan.nanos=8000
+tree_diff.bytes=1000
+tree_diff.bytes_per_sec=500000000
+tree_diff.ns_per_byte=2
+pack_inflate.bytes=2000
+pack_inflate.nanos=4000
+pack_inflate.bytes_per_sec=500000000
+pack_inflate.ns_per_byte=2
+pack_inflate.cycles_per_byte=0
+scan.bytes=4000
+scan.nanos=8000
+scan.bytes_per_sec=500000000
+scan.ns_per_byte=2
+scan.cycles_per_byte=0
+spill.runs=2
+spill.bytes=4096
+alloc.pack_exec.allocs=3
+alloc.pack_exec.bytes=4096
+```
+
+### Git Scan Benchmark Harness
+
+Use the dedicated benchmark harness to capture reproducible end-to-end Git scan
+metrics with warmup discard, ≥10 measured iterations, and median + MAD output.
+
+```text
+cargo bench --bench git_scan_perf --features git-perf -- --repo /path/to/repo --iters=10 --warmup=1
+```
+
+Notes:
+- Add `--pin-core=N` (and `--features scheduler-affinity`) to pin the process.
+- `scan_bps` uses `git-perf` counters; `wall_bps` includes total pipeline time.
+- The summary line reports median + MAD for wall and scan throughput.
 
 ---
 

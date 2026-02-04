@@ -25,10 +25,11 @@ use std::fs;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use memmap2::Mmap;
 
+use crate::scheduler::{alloc_stats, AllocStats, AllocStatsDelta};
 use crate::Engine;
 
 use super::byte_arena::ByteArena;
@@ -48,7 +49,10 @@ use super::object_store::ObjectStore;
 use super::pack_cache::PackCache;
 use super::pack_candidates::{CappedPackCandidateSink, LooseCandidate};
 use super::pack_decode::PackDecodeLimits;
-use super::pack_exec::{execute_pack_plan, PackExecError, PackExecReport, SkipReason, SkipRecord};
+use super::pack_exec::{
+    execute_pack_plan_with_scratch, PackExecError, PackExecReport, PackExecScratch, SkipReason,
+    SkipRecord,
+};
 use super::pack_inflate::ObjectKind;
 use super::pack_io::{PackIo, PackIoError, PackIoLimits};
 use super::pack_plan::{build_pack_plans, PackPlanConfig, PackPlanError, PackView};
@@ -162,15 +166,25 @@ pub struct GitScanConfig {
     pub merge_diff_mode: MergeDiffMode,
     /// Path-policy version for scan configuration hashing.
     pub path_policy_version: u32,
+    /// Preflight limits and readiness thresholds.
     pub preflight: PreflightLimits,
+    /// Repo-open limits (mmap sizes, ref caps, etc.).
     pub repo_open: RepoOpenLimits,
+    /// Commit-walk limits (parents, batching).
     pub commit_walk: CommitWalkLimits,
+    /// Tree-diff limits (depth, byte budgets, candidate caps).
     pub tree_diff: TreeDiffLimits,
+    /// Spill/dedupe limits (chunk sizes, run caps, seen batching).
     pub spill: SpillLimits,
+    /// Mapping bridge limits (arena sizes, candidate caps).
     pub mapping: MappingBridgeConfig,
+    /// Pack planning configuration (cluster sizing, delta bounds).
     pub pack_plan: PackPlanConfig,
+    /// Pack decode limits (inflate and object size caps).
     pub pack_decode: PackDecodeLimits,
+    /// Pack IO limits (loose object caps, base resolution).
     pub pack_io: PackIoLimits,
+    /// Engine adapter configuration (chunk sizes and overlap).
     pub engine_adapter: EngineAdapterConfig,
     /// Pack mmap limits during pack execution (count + total bytes).
     pub pack_mmap: PackMmapLimits,
@@ -207,6 +221,7 @@ impl Default for GitScanConfig {
 }
 
 /// Result of a Git scan run.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum GitScanResult {
     /// The repo is missing required maintenance artifacts (commit-graph, MIDX, etc.).
@@ -257,8 +272,223 @@ impl CandidateSkipReason {
 /// Candidate blob skipped during the run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SkippedCandidate {
+    /// Blob object ID.
     pub oid: OidBytes,
+    /// Why the candidate was skipped.
     pub reason: CandidateSkipReason,
+}
+
+/// Wall-clock timing per Git scan stage (nanoseconds).
+///
+/// `mapping` and `scan` are populated from the `git-perf` counters when
+/// available; they are zero when the feature is disabled.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GitScanStageNanos {
+    /// Tree diff stage time.
+    pub tree_diff: u64,
+    /// Spill/dedupe stage time.
+    pub spill: u64,
+    /// Mapping bridge stage time (from perf counters when enabled).
+    pub mapping: u64,
+    /// Pack planning stage time.
+    pub pack_plan: u64,
+    /// Pack execution stage time.
+    pub pack_exec: u64,
+    /// Scan stage time (from perf counters when enabled).
+    pub scan: u64,
+}
+
+/// Allocation deltas captured across hot stages.
+///
+/// These are best-effort global deltas and require the counting allocator
+/// to be installed (tests do this by default).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GitScanAllocStats {
+    /// Allocation deltas for pack decode + scan.
+    pub pack_exec: AllocStatsDelta,
+}
+
+/// Snapshot of key Git scan metrics for reporting.
+///
+/// Throughput values are derived via integer division. `cycles_per_byte`
+/// uses the optional `GIT_SCAN_CPU_HZ` hint and reports `0` when unset.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GitScanMetricsSnapshot {
+    /// Stage timing in nanoseconds.
+    pub stages: GitScanStageNanos,
+    /// Pack/scan perf counters.
+    pub perf: super::perf::GitPerfStats,
+    /// Total bytes read by tree diff.
+    pub tree_diff_bytes: u64,
+    /// Number of spill runs produced.
+    pub spill_runs: usize,
+    /// Total spill bytes written.
+    pub spill_bytes: u64,
+    /// Allocation deltas for hot stages.
+    pub alloc: GitScanAllocStats,
+}
+
+impl GitScanMetricsSnapshot {
+    /// Formats metrics as stable key=value lines.
+    ///
+    /// `cycles_per_byte` uses `GIT_SCAN_CPU_HZ` when set; otherwise it is `0`.
+    #[must_use]
+    pub fn format(&self) -> String {
+        fn bytes_per_sec(bytes: u64, nanos: u64) -> u64 {
+            if bytes == 0 || nanos == 0 {
+                0
+            } else {
+                bytes.saturating_mul(1_000_000_000).saturating_div(nanos)
+            }
+        }
+
+        fn nanos_per_byte(bytes: u64, nanos: u64) -> u64 {
+            if bytes == 0 {
+                0
+            } else {
+                nanos.saturating_div(bytes)
+            }
+        }
+
+        fn cycles_per_byte(bytes: u64, nanos: u64, cpu_hz: Option<u64>) -> u64 {
+            let Some(hz) = cpu_hz else {
+                return 0;
+            };
+            if bytes == 0 || nanos == 0 {
+                return 0;
+            }
+            let cycles = hz.saturating_mul(nanos).saturating_div(1_000_000_000);
+            cycles.saturating_div(bytes)
+        }
+
+        let cpu_hz = std::env::var("GIT_SCAN_CPU_HZ")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok());
+
+        fn push_line<T: std::fmt::Display>(out: &mut String, key: &str, value: T) {
+            out.push_str(key);
+            out.push('=');
+            out.push_str(&value.to_string());
+            out.push('\n');
+        }
+
+        let mut out = String::new();
+
+        push_line(&mut out, "stage.tree_diff.nanos", self.stages.tree_diff);
+        push_line(&mut out, "stage.spill.nanos", self.stages.spill);
+        push_line(&mut out, "stage.mapping.nanos", self.stages.mapping);
+        push_line(&mut out, "stage.pack_plan.nanos", self.stages.pack_plan);
+        push_line(&mut out, "stage.pack_exec.nanos", self.stages.pack_exec);
+        push_line(&mut out, "stage.scan.nanos", self.stages.scan);
+
+        push_line(&mut out, "tree_diff.bytes", self.tree_diff_bytes);
+        push_line(
+            &mut out,
+            "tree_diff.bytes_per_sec",
+            bytes_per_sec(self.tree_diff_bytes, self.stages.tree_diff),
+        );
+        push_line(
+            &mut out,
+            "tree_diff.ns_per_byte",
+            nanos_per_byte(self.tree_diff_bytes, self.stages.tree_diff),
+        );
+
+        push_line(&mut out, "pack_inflate.bytes", self.perf.pack_inflate_bytes);
+        push_line(&mut out, "pack_inflate.nanos", self.perf.pack_inflate_nanos);
+        push_line(
+            &mut out,
+            "pack_inflate.bytes_per_sec",
+            bytes_per_sec(self.perf.pack_inflate_bytes, self.perf.pack_inflate_nanos),
+        );
+        push_line(
+            &mut out,
+            "pack_inflate.ns_per_byte",
+            nanos_per_byte(self.perf.pack_inflate_bytes, self.perf.pack_inflate_nanos),
+        );
+        push_line(
+            &mut out,
+            "pack_inflate.cycles_per_byte",
+            cycles_per_byte(
+                self.perf.pack_inflate_bytes,
+                self.perf.pack_inflate_nanos,
+                cpu_hz,
+            ),
+        );
+
+        push_line(&mut out, "delta_apply.bytes", self.perf.delta_apply_bytes);
+        push_line(&mut out, "delta_apply.nanos", self.perf.delta_apply_nanos);
+        push_line(
+            &mut out,
+            "delta_apply.bytes_per_sec",
+            bytes_per_sec(self.perf.delta_apply_bytes, self.perf.delta_apply_nanos),
+        );
+        push_line(
+            &mut out,
+            "delta_apply.ns_per_byte",
+            nanos_per_byte(self.perf.delta_apply_bytes, self.perf.delta_apply_nanos),
+        );
+        push_line(
+            &mut out,
+            "delta_apply.cycles_per_byte",
+            cycles_per_byte(
+                self.perf.delta_apply_bytes,
+                self.perf.delta_apply_nanos,
+                cpu_hz,
+            ),
+        );
+
+        push_line(&mut out, "scan.bytes", self.perf.scan_bytes);
+        push_line(&mut out, "scan.nanos", self.perf.scan_nanos);
+        push_line(
+            &mut out,
+            "scan.bytes_per_sec",
+            bytes_per_sec(self.perf.scan_bytes, self.perf.scan_nanos),
+        );
+        push_line(
+            &mut out,
+            "scan.ns_per_byte",
+            nanos_per_byte(self.perf.scan_bytes, self.perf.scan_nanos),
+        );
+        push_line(
+            &mut out,
+            "scan.cycles_per_byte",
+            cycles_per_byte(self.perf.scan_bytes, self.perf.scan_nanos, cpu_hz),
+        );
+
+        push_line(&mut out, "mapping.calls", self.perf.mapping_calls);
+        push_line(&mut out, "mapping.nanos", self.perf.mapping_nanos);
+        push_line(
+            &mut out,
+            "mapping.ns_per_call",
+            nanos_per_byte(self.perf.mapping_calls.max(1), self.perf.mapping_nanos),
+        );
+
+        push_line(&mut out, "spill.runs", self.spill_runs);
+        push_line(&mut out, "spill.bytes", self.spill_bytes);
+
+        push_line(
+            &mut out,
+            "alloc.pack_exec.allocs",
+            self.alloc.pack_exec.allocs,
+        );
+        push_line(
+            &mut out,
+            "alloc.pack_exec.bytes",
+            self.alloc.pack_exec.bytes_allocated,
+        );
+        push_line(
+            &mut out,
+            "alloc.pack_exec.reallocs",
+            self.alloc.pack_exec.reallocs,
+        );
+        push_line(
+            &mut out,
+            "alloc.pack_exec.deallocs",
+            self.alloc.pack_exec.deallocs,
+        );
+
+        out
+    }
 }
 
 /// Summary report for a completed scan.
@@ -274,12 +504,39 @@ pub struct GitScanReport {
     pub mapping_stats: MappingStats,
     /// Per-pack-plan statistics.
     pub pack_plan_stats: Vec<PackPlanStats>,
-    /// Pack decode + scan reports.
+    /// Pack decode + scan reports, in the same order as `pack_plan_stats`.
     pub pack_exec_reports: Vec<PackExecReport>,
     /// Candidates skipped with explicit reasons.
     pub skipped_candidates: Vec<SkippedCandidate>,
     /// Finalize output and persistence stats.
     pub finalize: FinalizeOutput,
+    /// Stage timing data (nanoseconds).
+    pub stage_nanos: GitScanStageNanos,
+    /// Git perf counter snapshot (pack decode, scan, mapping).
+    pub perf_stats: super::perf::GitPerfStats,
+    /// Allocation deltas for hot stages.
+    pub alloc_stats: GitScanAllocStats,
+}
+
+impl GitScanReport {
+    /// Returns a snapshot of key metrics for reporting.
+    #[must_use]
+    pub fn metrics_snapshot(&self) -> GitScanMetricsSnapshot {
+        GitScanMetricsSnapshot {
+            stages: self.stage_nanos,
+            perf: self.perf_stats,
+            tree_diff_bytes: self.tree_diff_stats.tree_bytes_loaded,
+            spill_runs: self.spill_stats.spill_runs,
+            spill_bytes: self.spill_stats.spill_bytes,
+            alloc: self.alloc_stats,
+        }
+    }
+
+    /// Formats metrics as stable key=value lines.
+    #[must_use]
+    pub fn format_metrics(&self) -> String {
+        self.metrics_snapshot().format()
+    }
 }
 
 /// Git scan error taxonomy.
@@ -431,6 +688,12 @@ pub fn run_git_scan(
     persist_store: Option<&dyn PersistenceStore>,
     config: &GitScanConfig,
 ) -> Result<GitScanResult, GitScanError> {
+    // Reset perf counters for a clean per-run snapshot.
+    super::perf::reset();
+
+    let mut stage_nanos = GitScanStageNanos::default();
+    let mut alloc_deltas = GitScanAllocStats::default();
+
     // Preflight (metadata-only readiness). Pack count recommendations are advisory.
     let preflight = preflight(repo_root, config.preflight)?;
     if !preflight.status.is_ready() {
@@ -467,6 +730,7 @@ pub fn run_git_scan(
     let mut parent_scratch = ParentScratch::new();
 
     {
+        let diff_start = Instant::now();
         let mut sink = SpillCandidateSink::new(&mut spiller);
         for PlannedCommit { pos, snapshot_root } in &plan {
             let commit_id = pos.0;
@@ -531,8 +795,10 @@ pub fn run_git_scan(
                 }
             }
         }
+        stage_nanos.tree_diff = diff_start.elapsed().as_nanos() as u64;
     }
 
+    let spill_start = Instant::now();
     let midx = load_midx(&repo)?;
     let mut bridge = MappingBridge::new(
         &midx,
@@ -543,24 +809,33 @@ pub fn run_git_scan(
         config.mapping,
     );
     let spill_stats = spiller.finalize(seen_store, &mut bridge)?;
-    let (mapping_stats, sink, mapping_arena) = bridge.finish()?;
+    stage_nanos.spill = spill_start.elapsed().as_nanos() as u64;
+    let (mapping_stats, mut sink, mapping_arena) = bridge.finish()?;
 
     // Pack planning.
+    let pack_plan_start = Instant::now();
     let pack_dirs = collect_pack_dirs(&repo.paths);
     let pack_names = list_pack_files(&pack_dirs)?;
     midx.verify_completeness(pack_names.iter().map(|n| n.as_slice()))?;
     let pack_paths = resolve_pack_paths(&midx, &pack_dirs)?;
+    let mut used_pack_ids: Vec<u16> = sink.packed.iter().map(|cand| cand.pack_id).collect();
+    used_pack_ids.sort_unstable();
+    used_pack_ids.dedup();
     // Enforce pack mmap limits before decoding to cap address space usage.
-    let pack_mmaps = mmap_pack_files(&pack_paths, config.pack_mmap)?;
+    let pack_mmaps = mmap_pack_files(&pack_paths, &used_pack_ids, config.pack_mmap)?;
     let pack_views = build_pack_views(&pack_mmaps, repo.object_format)?;
 
     let mut pack_plan_stats = Vec::new();
     let mut plans = Vec::new();
+    let packed_len = sink.packed.len();
+    let loose_len = sink.loose.len();
     if !sink.packed.is_empty() {
-        let mut pack_plans = build_pack_plans(&sink.packed, &pack_views, &midx, &config.pack_plan)?;
+        let packed = std::mem::take(&mut sink.packed);
+        let mut pack_plans = build_pack_plans(packed, &pack_views, &midx, &config.pack_plan)?;
         pack_plan_stats.extend(pack_plans.iter().map(|p| p.stats));
         plans.append(&mut pack_plans);
     }
+    stage_nanos.pack_plan = pack_plan_start.elapsed().as_nanos() as u64;
 
     // Validate artifacts before decoding packs to avoid scanning during maintenance.
     if !repo.artifacts_unchanged()? {
@@ -575,21 +850,25 @@ pub fn run_git_scan(
     let mut cache = PackCache::new(pack_cache_bytes);
     let mut external = PackIo::open(&repo, config.pack_io)?;
     let mut adapter = EngineAdapter::new(engine, config.engine_adapter);
-    adapter.reserve_results(sink.packed.len().saturating_add(sink.loose.len()));
+    adapter.reserve_results(packed_len.saturating_add(loose_len));
     let mut pack_exec_reports = Vec::with_capacity(plans.len());
     let mut skipped_candidates = Vec::new();
 
+    let pack_exec_start = Instant::now();
+    let pack_exec_alloc_before: AllocStats = alloc_stats();
+    let mut exec_scratch = PackExecScratch::default();
     for plan in &plans {
         let pack_id = plan.pack_id as usize;
         let pack_bytes = pack_mmaps
             .get(pack_id)
+            .and_then(|mmap| mmap.as_ref())
             .ok_or(GitScanError::PackPlan(PackPlanError::PackIdOutOfRange {
                 pack_id: plan.pack_id,
                 pack_count: pack_mmaps.len(),
             }))?
             .as_ref();
 
-        let report = execute_pack_plan(
+        let report = execute_pack_plan_with_scratch(
             plan,
             pack_bytes,
             &mapping_arena,
@@ -597,6 +876,7 @@ pub fn run_git_scan(
             &mut cache,
             &mut external,
             &mut adapter,
+            &mut exec_scratch,
         )?;
         collect_skipped_candidates(plan, &report.skips, &mut skipped_candidates);
         pack_exec_reports.push(report);
@@ -611,9 +891,12 @@ pub fn run_git_scan(
             &mut skipped_candidates,
         )?;
     }
+    stage_nanos.pack_exec = pack_exec_start.elapsed().as_nanos() as u64;
+    let pack_exec_alloc_after = alloc_stats();
+    alloc_deltas.pack_exec = pack_exec_alloc_after.since(&pack_exec_alloc_before);
 
     let scanned = adapter.take_results();
-    let path_arena = adapter.path_arena();
+    let path_arena = &mapping_arena;
 
     // Finalize ops.
     let refs = build_ref_entries(&repo);
@@ -634,6 +917,10 @@ pub fn run_git_scan(
         persist_finalize_output(store, &finalize)?;
     }
 
+    let perf_stats = super::perf::snapshot();
+    stage_nanos.mapping = perf_stats.mapping_nanos;
+    stage_nanos.scan = perf_stats.scan_nanos;
+
     Ok(GitScanResult::Completed(GitScanReport {
         commit_count: plan.len(),
         tree_diff_stats: walker.stats().clone(),
@@ -643,6 +930,9 @@ pub fn run_git_scan(
         pack_exec_reports,
         skipped_candidates,
         finalize,
+        stage_nanos,
+        perf_stats,
+        alloc_stats: alloc_deltas,
     }))
 }
 
@@ -783,20 +1073,30 @@ fn strip_pack_suffix(name: &[u8]) -> Vec<u8> {
 /// the configured mmap limits.
 fn mmap_pack_files(
     pack_paths: &[PathBuf],
+    used_pack_ids: &[u16],
     limits: PackMmapLimits,
-) -> Result<Vec<Mmap>, GitScanError> {
+) -> Result<Vec<Option<Mmap>>, GitScanError> {
     limits.validate();
-    if pack_paths.len() > limits.max_open_packs as usize {
+    if used_pack_ids.len() > limits.max_open_packs as usize {
         return Err(GitScanError::ResourceLimit(format!(
             "pack count {} exceeds limit {}",
-            pack_paths.len(),
+            used_pack_ids.len(),
             limits.max_open_packs
         )));
     }
 
     let mut out = Vec::with_capacity(pack_paths.len());
+    out.resize_with(pack_paths.len(), || None);
     let mut total_bytes = 0_u64;
-    for path in pack_paths {
+    for &pack_id in used_pack_ids {
+        let idx = pack_id as usize;
+        let path =
+            pack_paths
+                .get(idx)
+                .ok_or(GitScanError::PackPlan(PackPlanError::PackIdOutOfRange {
+                    pack_id,
+                    pack_count: pack_paths.len(),
+                }))?;
         let metadata = fs::metadata(path)?;
         total_bytes = total_bytes.saturating_add(metadata.len());
         if total_bytes > limits.max_total_bytes {
@@ -809,7 +1109,7 @@ fn mmap_pack_files(
         // SAFETY: mapping read-only pack files; the OS keeps the mapping valid
         // even after `file` is dropped.
         let mmap = unsafe { Mmap::map(&file)? };
-        out.push(mmap);
+        out[idx] = Some(mmap);
     }
     Ok(out)
 }
@@ -819,24 +1119,27 @@ fn mmap_pack_files(
 /// Each pack view validates header structure and captures offsets needed by
 /// the planning stage.
 fn build_pack_views<'a>(
-    pack_mmaps: &'a [Mmap],
+    pack_mmaps: &'a [Option<Mmap>],
     format: ObjectFormat,
-) -> Result<Vec<PackView<'a>>, GitScanError> {
+) -> Result<Vec<Option<PackView<'a>>>, GitScanError> {
     let mut views = Vec::with_capacity(pack_mmaps.len());
     for mmap in pack_mmaps {
-        let view = PackView::parse(mmap.as_ref(), format.oid_len())
-            .map_err(|err| GitScanError::PackPlan(PackPlanError::PackParse(err)))?;
-        views.push(view);
+        if let Some(mmap) = mmap {
+            let view = PackView::parse(mmap.as_ref(), format.oid_len())
+                .map_err(|err| GitScanError::PackPlan(PackPlanError::PackParse(err)))?;
+            views.push(Some(view));
+        } else {
+            views.push(None);
+        }
     }
     Ok(views)
 }
 
-/// Loads loose candidates and scans blob payloads.
+/// Load loose candidates and scan blob payloads.
 ///
 /// Missing or undecodable loose objects are recorded as skips so the run can
 /// complete with partial results. Paths are re-interned into the adapter's
 /// arena via `emit_loose`.
-/// Scan loose candidates and record explicit skip reasons for failures.
 ///
 /// Missing objects, decode errors, and non-blob kinds are recorded as skips.
 /// Unexpected pack I/O errors are returned as fatal scan errors.
@@ -881,6 +1184,7 @@ fn scan_loose_candidates(
 ///
 /// The skip records are offsets into the pack stream; we map them back to
 /// candidate offsets and record the corresponding OIDs with a reason.
+/// If multiple candidates share an offset, each one is recorded.
 fn collect_skipped_candidates(
     plan: &PackPlan,
     skips: &[SkipRecord],
@@ -1021,6 +1325,82 @@ mod tests {
 
             out
         }
+    }
+
+    #[test]
+    fn metrics_format_is_stable() {
+        let snapshot = GitScanMetricsSnapshot {
+            stages: GitScanStageNanos {
+                tree_diff: 2_000,
+                spill: 3_000,
+                mapping: 4_000,
+                pack_plan: 5_000,
+                pack_exec: 6_000,
+                scan: 8_000,
+            },
+            perf: crate::git_scan::GitPerfStats {
+                pack_inflate_bytes: 2_000,
+                pack_inflate_nanos: 4_000,
+                delta_apply_bytes: 3_000,
+                delta_apply_nanos: 6_000,
+                scan_bytes: 4_000,
+                scan_nanos: 8_000,
+                mapping_calls: 5,
+                mapping_nanos: 2_500,
+                cache_hits: 0,
+                cache_misses: 0,
+            },
+            tree_diff_bytes: 1_000,
+            spill_runs: 2,
+            spill_bytes: 4_096,
+            alloc: GitScanAllocStats {
+                pack_exec: AllocStatsDelta {
+                    allocs: 3,
+                    deallocs: 2,
+                    reallocs: 1,
+                    bytes_allocated: 4_096,
+                    bytes_deallocated: 2_048,
+                },
+            },
+        };
+
+        let expected = "\
+stage.tree_diff.nanos=2000
+stage.spill.nanos=3000
+stage.mapping.nanos=4000
+stage.pack_plan.nanos=5000
+stage.pack_exec.nanos=6000
+stage.scan.nanos=8000
+tree_diff.bytes=1000
+tree_diff.bytes_per_sec=500000000
+tree_diff.ns_per_byte=2
+pack_inflate.bytes=2000
+pack_inflate.nanos=4000
+pack_inflate.bytes_per_sec=500000000
+pack_inflate.ns_per_byte=2
+pack_inflate.cycles_per_byte=0
+delta_apply.bytes=3000
+delta_apply.nanos=6000
+delta_apply.bytes_per_sec=500000000
+delta_apply.ns_per_byte=2
+delta_apply.cycles_per_byte=0
+scan.bytes=4000
+scan.nanos=8000
+scan.bytes_per_sec=500000000
+scan.ns_per_byte=2
+scan.cycles_per_byte=0
+mapping.calls=5
+mapping.nanos=2500
+mapping.ns_per_call=500
+spill.runs=2
+spill.bytes=4096
+alloc.pack_exec.allocs=3
+alloc.pack_exec.bytes=4096
+alloc.pack_exec.reallocs=1
+alloc.pack_exec.deallocs=2
+";
+
+        assert_eq!(snapshot.format(), expected);
     }
 
     fn test_engine() -> Engine {

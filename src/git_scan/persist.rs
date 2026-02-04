@@ -23,6 +23,7 @@ pub trait PersistenceStore {
     ///
     /// Implementations may assume ops are pre-sorted by key for performance
     /// diagnostics, but must not require ordering for correctness.
+    /// Implementations must ignore `watermark_ops` when the outcome is partial.
     fn commit_finalize(&self, output: &FinalizeOutput) -> Result<(), PersistError>;
 }
 
@@ -43,6 +44,8 @@ pub fn persist_finalize_output(
 /// The store records committed ops for later inspection and intentionally
 /// skips synchronization; it uses `RefCell` for interior mutability and is not
 /// thread-safe.
+///
+/// Each commit appends to the stored ops; no dedupe is performed.
 #[derive(Debug, Default)]
 pub struct InMemoryPersistenceStore {
     /// Recorded data writes from successful finalize calls.

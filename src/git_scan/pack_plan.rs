@@ -13,16 +13,16 @@
 //! 2. Parse entry headers for candidate offsets and resolve REF deltas.
 //! 3. Expand a pack-local base closure up to `max_delta_depth`.
 //! 4. Materialize sorted `need_offsets`, delta dependencies, exec order,
-//!    and offset clusters.
+//!    and (optionally) offset clusters.
 //!
 //! # Invariants
 //! - `need_offsets` is sorted and unique.
 //! - `candidate_offsets` is sorted by offset (ties by candidate index).
 //! - `exec_order` indices refer to `need_offsets`.
 //! - `clusters` are contiguous ranges within `need_offsets` split by
-//!   `CLUSTER_GAP_BYTES`.
+//!   `CLUSTER_GAP_BYTES` when clustering is enabled.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 
 use super::midx::MidxView;
@@ -254,16 +254,17 @@ struct WorkItem {
 /// same pack offset; they are preserved as distinct entries in
 /// `PackPlan.candidates` while `need_offsets` is deduplicated.
 ///
-/// `packs` must be indexed by `pack_id` (PNAM order). Missing pack views
-/// result in `PackIdOutOfRange`.
+/// `packs` must be indexed by `pack_id` (PNAM order). Unused pack slots may
+/// be `None`; referenced pack IDs must be `Some`, otherwise
+/// `PackIdOutOfRange` is returned.
 ///
 /// # Errors
 ///
 /// Returns `PackPlanError` for invalid pack headers, out-of-range offsets,
 /// or resolver failures.
 pub fn build_pack_plans<'a, R: OidResolver>(
-    candidates: &[PackCandidate],
-    packs: &[PackView<'a>],
+    mut candidates: Vec<PackCandidate>,
+    packs: &[Option<PackView<'a>>],
     resolver: &R,
     config: &PackPlanConfig,
 ) -> Result<Vec<PackPlan>, PackPlanError> {
@@ -271,20 +272,36 @@ pub fn build_pack_plans<'a, R: OidResolver>(
         return Ok(Vec::new());
     }
 
-    let mut by_pack: BTreeMap<u16, Vec<PackCandidate>> = BTreeMap::new();
-    for cand in candidates {
-        by_pack.entry(cand.pack_id).or_default().push(*cand);
+    let mut buckets: Vec<Vec<PackCandidate>> = vec![Vec::new(); packs.len()];
+    let mut pack_ids: Vec<u16> = Vec::new();
+    for cand in candidates.drain(..) {
+        let pack_idx = cand.pack_id as usize;
+        if pack_idx >= packs.len() {
+            return Err(PackPlanError::PackIdOutOfRange {
+                pack_id: cand.pack_id,
+                pack_count: packs.len(),
+            });
+        }
+        if buckets[pack_idx].is_empty() {
+            pack_ids.push(cand.pack_id);
+        }
+        buckets[pack_idx].push(cand);
     }
 
-    let mut plans = Vec::with_capacity(by_pack.len());
-    for (pack_id, pack_candidates) in by_pack {
-        let pack_idx = pack_id as usize;
-        let pack = packs.get(pack_idx).ok_or(PackPlanError::PackIdOutOfRange {
-            pack_id,
-            pack_count: packs.len(),
-        })?;
+    pack_ids.sort_unstable();
 
-        let plan = build_pack_plan_for_pack(pack_id, pack, &pack_candidates, resolver, config)?;
+    let mut plans = Vec::with_capacity(pack_ids.len());
+    for pack_id in pack_ids {
+        let pack_idx = pack_id as usize;
+        let pack = packs.get(pack_idx).and_then(|pack| pack.as_ref()).ok_or(
+            PackPlanError::PackIdOutOfRange {
+                pack_id,
+                pack_count: packs.len(),
+            },
+        )?;
+        let pack_candidates = std::mem::take(&mut buckets[pack_idx]);
+
+        let plan = build_pack_plan_for_pack(pack_id, pack, pack_candidates, resolver, config)?;
         plans.push(plan);
     }
 
@@ -294,7 +311,7 @@ pub fn build_pack_plans<'a, R: OidResolver>(
 fn build_pack_plan_for_pack<'a, R: OidResolver>(
     pack_id: u16,
     pack: &PackView<'a>,
-    candidates: &[PackCandidate],
+    candidates: Vec<PackCandidate>,
     resolver: &R,
     config: &PackPlanConfig,
 ) -> Result<PackPlan, PackPlanError> {
@@ -424,7 +441,8 @@ fn build_pack_plan_for_pack<'a, R: OidResolver>(
 
     let delta_deps = build_delta_deps(&need_offsets, &entry_cache, pack_id);
     let exec_order = build_exec_order(&need_offsets, &delta_deps, pack_id)?;
-    let clusters = cluster_offsets(&need_offsets);
+    // Pack exec does not currently consume clustering hints; skip computation.
+    let clusters = Vec::new();
 
     let external_bases = delta_deps
         .iter()
@@ -446,7 +464,7 @@ fn build_pack_plan_for_pack<'a, R: OidResolver>(
     Ok(PackPlan {
         pack_id,
         oid_len: pack.oid_len(),
-        candidates: candidates.to_vec(),
+        candidates,
         candidate_offsets,
         need_offsets,
         delta_deps,

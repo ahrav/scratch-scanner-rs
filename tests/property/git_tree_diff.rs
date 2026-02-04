@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, HashMap};
 use proptest::prelude::*;
 
 use scanner_rs::git_scan::{
-    git_tree_name_cmp, CandidateBuffer, ChangeKind, OidBytes, TreeDiffError, TreeDiffLimits,
-    TreeDiffWalker, TreeSource,
+    git_tree_name_cmp, CandidateBuffer, ChangeKind, OidBytes, TreeBytes, TreeDiffError,
+    TreeDiffLimits, TreeDiffWalker, TreeSource,
 };
 
 #[derive(Default)]
@@ -15,10 +15,11 @@ struct TestTreeStore {
 }
 
 impl TreeSource for TestTreeStore {
-    fn load_tree(&mut self, oid: &OidBytes) -> Result<Vec<u8>, TreeDiffError> {
+    fn load_tree(&mut self, oid: &OidBytes) -> Result<TreeBytes, TreeDiffError> {
         self.trees
             .get(oid)
             .cloned()
+            .map(TreeBytes::Owned)
             .ok_or(TreeDiffError::TreeNotFound)
     }
 }

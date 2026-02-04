@@ -16,6 +16,9 @@
 //! - `slot_size` is a power of two, >= `MIN_SLOT_SIZE`
 //! - `storage.len() == sets * WAYS * slot_size`
 //! - Cache is best-effort; insertions may evict existing entries
+//! - Pinned slots are never evicted; handles must be dropped to release pins
+
+use std::cell::Cell;
 
 use super::object_id::OidBytes;
 
@@ -27,12 +30,13 @@ const MIN_SLOT_SIZE: u32 = 256;
 const WAYS: usize = 4;
 
 /// Cache slot metadata.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Slot {
     oid: OidBytes,
     len: u32,
     clock: u8,
     valid: bool,
+    pins: Cell<u16>,
 }
 
 impl Slot {
@@ -43,6 +47,7 @@ impl Slot {
             len: 0,
             clock: 0,
             valid: false,
+            pins: Cell::new(0),
         }
     }
 }
@@ -58,6 +63,47 @@ pub struct TreeCache {
     storage: Vec<u8>,
     slots: Vec<Slot>,
     clock_hands: Vec<u8>,
+}
+
+/// Handle to a pinned tree payload stored in the cache.
+///
+/// The handle keeps the slot pinned until drop so cached bytes are not
+/// overwritten while the caller is still borrowing them.
+///
+/// # Safety
+/// The handle must not outlive the cache that created it.
+#[derive(Debug)]
+pub struct TreeCacheHandle {
+    cache: *const TreeCache,
+    slot: usize,
+    offset: usize,
+    len: usize,
+}
+
+impl TreeCacheHandle {
+    /// Returns the cached tree bytes.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: `TreeCacheHandle` pins the slot for the duration of its
+        // lifetime. Callers ensure the cache outlives the handle.
+        unsafe {
+            let cache = &*self.cache;
+            &cache.storage[self.offset..self.offset + self.len]
+        }
+    }
+}
+
+impl Drop for TreeCacheHandle {
+    fn drop(&mut self) {
+        // SAFETY: The handle is only constructed with a valid cache pointer.
+        unsafe {
+            let cache = &*self.cache;
+            let slot = &cache.slots[self.slot];
+            let pins = slot.pins.get();
+            debug_assert!(pins > 0, "tree cache pin count underflow");
+            slot.pins.set(pins.saturating_sub(1));
+        }
+    }
 }
 
 impl TreeCache {
@@ -100,10 +146,11 @@ impl TreeCache {
         self.capacity_bytes
     }
 
-    /// Looks up cached tree bytes by OID.
+    /// Looks up cached tree bytes by OID and returns a pinned handle.
     ///
     /// Returns `None` if the cache is disabled or if the entry is missing.
-    pub fn get(&mut self, oid: &OidBytes) -> Option<&[u8]> {
+    /// On hit, the slot is pinned and the CLOCK bit is set.
+    pub fn get_handle(&mut self, oid: &OidBytes) -> Option<TreeCacheHandle> {
         if self.sets == 0 {
             return None;
         }
@@ -116,8 +163,14 @@ impl TreeCache {
             if slot.valid && slot.oid == *oid {
                 slot.clock = 1;
                 let offset = idx * self.slot_size as usize;
-                let end = offset + slot.len as usize;
-                return Some(&self.storage[offset..end]);
+                slot.pins.set(slot.pins.get().saturating_add(1));
+                let len = slot.len as usize;
+                return Some(TreeCacheHandle {
+                    cache: self as *const TreeCache,
+                    slot: idx,
+                    offset,
+                    len,
+                });
             }
         }
         None
@@ -125,7 +178,9 @@ impl TreeCache {
 
     /// Inserts tree bytes into the cache.
     ///
-    /// Returns true if the entry was cached.
+    /// Returns true if the entry was cached. Returns false if the cache is
+    /// disabled, the payload is too large for a slot, or all candidate slots
+    /// are pinned.
     pub fn insert(&mut self, oid: OidBytes, bytes: &[u8]) -> bool {
         if self.sets == 0 {
             return false;
@@ -140,13 +195,14 @@ impl TreeCache {
         for way in 0..WAYS {
             let idx = base + way;
             if self.slots[idx].valid && self.slots[idx].oid == oid {
-                self.write_slot(idx, oid, bytes);
                 self.slots[idx].clock = 1;
                 return true;
             }
         }
 
-        let victim = self.select_victim(base, set);
+        let Some(victim) = self.select_victim(base, set) else {
+            return false;
+        };
         self.write_slot(victim, oid, bytes);
         true
     }
@@ -168,22 +224,26 @@ impl TreeCache {
         hash as usize & (self.sets - 1)
     }
 
-    fn select_victim(&mut self, base: usize, set: usize) -> usize {
+    fn select_victim(&mut self, base: usize, set: usize) -> Option<usize> {
         // CLOCK: pick the first slot with clock=0, clearing clock bits as we go.
         let mut hand = self.clock_hands[set] as usize % WAYS;
-        for _ in 0..WAYS {
+        for _ in 0..(WAYS * 2) {
             let idx = base + hand;
-            if !self.slots[idx].valid || self.slots[idx].clock == 0 {
-                self.clock_hands[set] = ((hand + 1) % WAYS) as u8;
-                return idx;
+            let pins = self.slots[idx].pins.get();
+            if pins > 0 {
+                hand = (hand + 1) % WAYS;
+                continue;
             }
-            self.slots[idx].clock = 0;
+            let slot = &mut self.slots[idx];
+            if !slot.valid || slot.clock == 0 {
+                self.clock_hands[set] = ((hand + 1) % WAYS) as u8;
+                return Some(idx);
+            }
+            slot.clock = 0;
             hand = (hand + 1) % WAYS;
         }
 
-        let idx = base + hand;
-        self.clock_hands[set] = ((hand + 1) % WAYS) as u8;
-        idx
+        None
     }
 
     fn write_slot(&mut self, idx: usize, oid: OidBytes, bytes: &[u8]) {
@@ -197,6 +257,7 @@ impl TreeCache {
         slot.len = bytes.len() as u32;
         slot.clock = 1;
         slot.valid = true;
+        slot.pins.set(0);
     }
 }
 
@@ -234,8 +295,8 @@ mod tests {
         let payload = b"tree-bytes";
 
         assert!(cache.insert(oid, payload));
-        let got = cache.get(&oid).unwrap();
-        assert_eq!(got, payload);
+        let handle = cache.get_handle(&oid).unwrap();
+        assert_eq!(handle.as_slice(), payload);
     }
 
     #[test]
@@ -245,7 +306,7 @@ mod tests {
         let payload = vec![0u8; cache.slot_size as usize + 1];
 
         assert!(!cache.insert(oid, &payload));
-        assert!(cache.get(&oid).is_none());
+        assert!(cache.get_handle(&oid).is_none());
     }
 
     #[test]
@@ -266,10 +327,10 @@ mod tests {
             assert!(cache.insert(*oid, &data));
         }
 
-        assert!(cache.get(&oids[0]).is_none());
+        assert!(cache.get_handle(&oids[0]).is_none());
         let mut hit_count = 0;
         for oid in oids.iter().skip(1) {
-            if cache.get(oid).is_some() {
+            if cache.get_handle(oid).is_some() {
                 hit_count += 1;
             }
         }
@@ -281,6 +342,6 @@ mod tests {
         let mut cache = TreeCache::new(MIN_SLOT_SIZE * WAYS as u32 - 1);
         let oid = OidBytes::sha1([0x33; 20]);
         assert!(!cache.insert(oid, b"data"));
-        assert!(cache.get(&oid).is_none());
+        assert!(cache.get_handle(&oid).is_none());
     }
 }

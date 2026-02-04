@@ -17,6 +17,8 @@
 ///
 /// This is a small, copyable handle. It does not track lifetimes, so the
 /// caller must ensure it is only used with the arena it was created from.
+/// A zero-length reference (`off=0,len=0`) is commonly used as an empty-path
+/// sentinel, but is still tied to the owning arena.
 ///
 /// # Invariants
 /// - `off + len` must not overflow `u32` (enforced by `end()`)
@@ -190,6 +192,13 @@ impl ByteArena {
     #[must_use]
     pub fn capacity(&self) -> u32 {
         self.capacity
+    }
+
+    /// Clears all stored bytes while preserving allocated capacity.
+    ///
+    /// All previously returned `ByteRef` values become invalid after this call.
+    pub fn clear_keep_capacity(&mut self) {
+        self.bytes.clear();
     }
 }
 

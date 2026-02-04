@@ -52,7 +52,7 @@ use std::cmp::Ordering;
 
 use super::errors::TreeDiffError;
 use super::object_id::OidBytes;
-use super::object_store::TreeSource;
+use super::object_store::{TreeBytes, TreeSource};
 use super::path_policy::classify_path;
 use super::tree_candidate::{CandidateSink, ChangeKind};
 use super::tree_diff_limits::TreeDiffLimits;
@@ -86,9 +86,9 @@ pub struct TreeDiffStats {
 /// Stack frame for iterative tree diff.
 struct DiffFrame {
     /// New tree bytes (owned to avoid lifetime issues).
-    new_bytes: Vec<u8>,
+    new_bytes: TreeBytes,
     /// Old tree bytes (owned).
-    old_bytes: Vec<u8>,
+    old_bytes: TreeBytes,
     /// Position in new_bytes.
     new_pos: usize,
     /// Position in old_bytes.
@@ -109,7 +109,6 @@ enum Action {
     AddedEntry {
         new_end: usize,
         oid: OidBytes,
-        name_copy: Vec<u8>,
         kind: EntryKind,
         mode: u32,
     },
@@ -123,14 +122,12 @@ enum Action {
         old_oid: OidBytes,
         new_kind: EntryKind,
         old_kind: EntryKind,
-        name_copy: Vec<u8>,
         new_mode: u32,
     },
     /// new < old in tree ordering: entry added in new tree.
     NewBeforeOld {
         new_end: usize,
         oid: OidBytes,
-        name_copy: Vec<u8>,
         kind: EntryKind,
         mode: u32,
     },
@@ -142,6 +139,8 @@ enum Action {
 ///
 /// The walker maintains internal state (stack, path buffer) that is reused
 /// across multiple `diff_trees` calls for efficiency.
+/// Candidate paths are assembled in a reusable buffer; sinks must copy
+/// the provided path if they need to retain it.
 ///
 /// # Invariants
 /// - `stack.len() <= max_depth`
@@ -190,6 +189,7 @@ impl TreeDiffWalker {
     ///
     /// Call this when starting a new repository scan to get fresh stats.
     /// The internal buffers (stack, path_buf) are retained for reuse.
+    /// The tree-bytes budget is not reset; it is fixed per walker.
     pub fn reset_stats(&mut self) {
         self.stats = TreeDiffStats::default();
     }
@@ -218,6 +218,8 @@ impl TreeDiffWalker {
     /// - If `new_tree == old_tree`, this is a no-op.
     /// - `parent_idx` is preserved in candidate context for later merge/dedupe.
     /// - The candidate sink is appended to; it is not cleared by this call.
+    /// - Candidate paths are borrowed from an internal buffer and are only
+    ///   valid until the next emission.
     /// - Stats are cumulative across calls; `reset_stats()` clears counters.
     /// - The tree-bytes budget is enforced across calls until reset.
     pub fn diff_trees<S: TreeSource, C: CandidateSink>(
@@ -247,16 +249,33 @@ impl TreeDiffWalker {
             prefix_len: 0,
         });
 
+        // Reused entry-name buffer so we can drop frame borrows before mutating the stack.
+        let mut name_scratch = Vec::with_capacity(256);
+
         while !self.stack.is_empty() {
             let depth = self.stack.len() as u16;
             self.stats.max_depth_reached = self.stats.max_depth_reached.max(depth);
 
-            let frame = self.stack.last_mut().expect("frame exists");
+            let action = {
+                let frame = self.stack.last().expect("frame exists");
+                let new_entry =
+                    next_entry(frame.new_bytes.as_slice(), frame.new_pos, self.oid_len)?;
+                let old_entry =
+                    next_entry(frame.old_bytes.as_slice(), frame.old_pos, self.oid_len)?;
 
-            let new_entry = next_entry(&frame.new_bytes, frame.new_pos, self.oid_len)?;
-            let old_entry = next_entry(&frame.old_bytes, frame.old_pos, self.oid_len)?;
-
-            let action = compute_action(new_entry, old_entry, self.oid_len)?;
+                let action = compute_action(new_entry.as_ref(), old_entry.as_ref(), self.oid_len)?;
+                if matches!(
+                    action,
+                    Action::AddedEntry { .. }
+                        | Action::MatchedEntries { .. }
+                        | Action::NewBeforeOld { .. }
+                ) {
+                    let (entry, _) = new_entry.expect("name requires new entry");
+                    name_scratch.clear();
+                    name_scratch.extend_from_slice(entry.name);
+                }
+                action
+            };
 
             match action {
                 Action::Pop => {
@@ -266,16 +285,25 @@ impl TreeDiffWalker {
                 Action::AddedEntry {
                     new_end,
                     oid,
-                    name_copy,
                     kind,
                     mode,
                 } => {
+                    debug_assert!(!name_scratch.is_empty());
+                    let frame = self.stack.last_mut().expect("frame exists");
                     frame.new_pos = new_end;
                     self.handle_new_entry(
-                        source, candidates, &oid, &name_copy, kind, mode, commit_id, parent_idx,
+                        source,
+                        candidates,
+                        &oid,
+                        &name_scratch,
+                        kind,
+                        mode,
+                        commit_id,
+                        parent_idx,
                     )?;
                 }
                 Action::DeletedEntry { old_end } => {
+                    let frame = self.stack.last_mut().expect("frame exists");
                     frame.old_pos = old_end;
                 }
                 Action::MatchedEntries {
@@ -285,29 +313,47 @@ impl TreeDiffWalker {
                     old_oid,
                     new_kind,
                     old_kind,
-                    name_copy,
                     new_mode,
                 } => {
+                    debug_assert!(!name_scratch.is_empty());
+                    let frame = self.stack.last_mut().expect("frame exists");
                     frame.new_pos = new_end;
                     frame.old_pos = old_end;
                     self.handle_matched_entries(
-                        source, candidates, &new_oid, &old_oid, &name_copy, new_kind, old_kind,
-                        new_mode, commit_id, parent_idx,
+                        source,
+                        candidates,
+                        &new_oid,
+                        &old_oid,
+                        &name_scratch,
+                        new_kind,
+                        old_kind,
+                        new_mode,
+                        commit_id,
+                        parent_idx,
                     )?;
                 }
                 Action::NewBeforeOld {
                     new_end,
                     oid,
-                    name_copy,
                     kind,
                     mode,
                 } => {
+                    debug_assert!(!name_scratch.is_empty());
+                    let frame = self.stack.last_mut().expect("frame exists");
                     frame.new_pos = new_end;
                     self.handle_new_entry(
-                        source, candidates, &oid, &name_copy, kind, mode, commit_id, parent_idx,
+                        source,
+                        candidates,
+                        &oid,
+                        &name_scratch,
+                        kind,
+                        mode,
+                        commit_id,
+                        parent_idx,
                     )?;
                 }
                 Action::OldBeforeNew { old_end } => {
+                    let frame = self.stack.last_mut().expect("frame exists");
                     frame.old_pos = old_end;
                 }
             }
@@ -323,7 +369,7 @@ impl TreeDiffWalker {
         &mut self,
         source: &mut S,
         oid: Option<&OidBytes>,
-    ) -> Result<Vec<u8>, TreeDiffError> {
+    ) -> Result<TreeBytes, TreeDiffError> {
         // Loading a tree increments stats and enforces the cumulative budget.
         if let Some(oid) = oid {
             let bytes = source.load_tree(oid)?;
@@ -339,7 +385,7 @@ impl TreeDiffWalker {
 
             Ok(bytes)
         } else {
-            Ok(Vec::new())
+            Ok(TreeBytes::empty())
         }
     }
 
@@ -535,8 +581,8 @@ impl TreeDiffWalker {
 
 /// Computes the next action by comparing tree entries in Git tree order.
 fn compute_action(
-    new_entry: Option<(TreeEntry<'_>, usize)>,
-    old_entry: Option<(TreeEntry<'_>, usize)>,
+    new_entry: Option<&(TreeEntry<'_>, usize)>,
+    old_entry: Option<&(TreeEntry<'_>, usize)>,
     oid_len: u8,
 ) -> Result<Action, TreeDiffError> {
     match (new_entry, old_entry) {
@@ -545,15 +591,14 @@ fn compute_action(
         (Some((new_ent, new_end)), None) => {
             let oid = convert_oid(new_ent.oid_bytes, oid_len)?;
             Ok(Action::AddedEntry {
-                new_end,
+                new_end: *new_end,
                 oid,
-                name_copy: new_ent.name.to_vec(),
                 kind: new_ent.kind,
                 mode: new_ent.mode,
             })
         }
 
-        (None, Some((_, old_end))) => Ok(Action::DeletedEntry { old_end }),
+        (None, Some((_, old_end))) => Ok(Action::DeletedEntry { old_end: *old_end }),
 
         (Some((new_ent, new_end)), Some((old_ent, old_end))) => {
             let cmp = git_tree_name_cmp(
@@ -567,25 +612,23 @@ fn compute_action(
                 Ordering::Less => {
                     let oid = convert_oid(new_ent.oid_bytes, oid_len)?;
                     Ok(Action::NewBeforeOld {
-                        new_end,
+                        new_end: *new_end,
                         oid,
-                        name_copy: new_ent.name.to_vec(),
                         kind: new_ent.kind,
                         mode: new_ent.mode,
                     })
                 }
-                Ordering::Greater => Ok(Action::OldBeforeNew { old_end }),
+                Ordering::Greater => Ok(Action::OldBeforeNew { old_end: *old_end }),
                 Ordering::Equal => {
                     let new_oid = convert_oid(new_ent.oid_bytes, oid_len)?;
                     let old_oid = convert_oid(old_ent.oid_bytes, oid_len)?;
                     Ok(Action::MatchedEntries {
-                        new_end,
-                        old_end,
+                        new_end: *new_end,
+                        old_end: *old_end,
                         new_oid,
                         old_oid,
                         new_kind: new_ent.kind,
                         old_kind: old_ent.kind,
-                        name_copy: new_ent.name.to_vec(),
                         new_mode: new_ent.mode,
                     })
                 }
@@ -646,10 +689,11 @@ mod tests {
     }
 
     impl TreeSource for MockTreeSource {
-        fn load_tree(&mut self, oid: &OidBytes) -> Result<Vec<u8>, TreeDiffError> {
+        fn load_tree(&mut self, oid: &OidBytes) -> Result<TreeBytes, TreeDiffError> {
             self.trees
                 .get(oid)
                 .cloned()
+                .map(TreeBytes::Owned)
                 .ok_or(TreeDiffError::TreeNotFound)
         }
     }

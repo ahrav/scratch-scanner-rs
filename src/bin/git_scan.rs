@@ -5,6 +5,11 @@
 //! The start-set resolver shells out to `git` and only supports default-branch
 //! or explicit-ref modes. Watermarks are disabled, so each run scans full
 //! history for the selected refs.
+//!
+//! # Exit codes
+//! - `0`: scan completed successfully.
+//! - `2`: invalid usage or scan failed.
+//! - `3`: repository needs maintenance artifacts (commit-graph, MIDX).
 
 use std::env;
 use std::io;
@@ -233,6 +238,7 @@ fn main() -> io::Result<()> {
                 eprintln!("mapping_stats={:?}", report.mapping_stats);
                 eprintln!("pack_plan_stats={:?}", report.pack_plan_stats);
                 eprintln!("pack_exec_reports={:?}", report.pack_exec_reports);
+                eprintln!("{}", report.format_metrics());
             }
             Ok(())
         }
@@ -244,6 +250,8 @@ fn main() -> io::Result<()> {
 }
 
 /// Run `git` in `repo` and return trimmed UTF-8 stdout.
+///
+/// Output is lossy UTF-8 and trailing whitespace is removed.
 ///
 /// # Errors
 /// Returns an I/O error if the command fails or exits non-zero.
@@ -260,6 +268,9 @@ fn run_git(repo: &PathBuf, args: &[&str]) -> io::Result<String> {
 }
 
 /// Resolve the default-branch tip, falling back to detached `HEAD`.
+///
+/// Uses `symbolic-ref --quiet HEAD` to find the default branch; if that
+/// fails, falls back to `HEAD`.
 fn resolve_default_branch(repo: &PathBuf) -> Result<Vec<(Vec<u8>, OidBytes)>, RepoOpenError> {
     let head_ref = run_git(repo, &["symbolic-ref", "--quiet", "HEAD"]).ok();
     if let Some(ref_name) = head_ref {
@@ -275,6 +286,8 @@ fn resolve_default_branch(repo: &PathBuf) -> Result<Vec<(Vec<u8>, OidBytes)>, Re
 }
 
 /// Resolve the tip OIDs for explicitly provided ref names.
+///
+/// Each ref is passed to `git rev-parse`; missing refs surface as errors.
 fn resolve_explicit_refs(
     repo: &PathBuf,
     refs: &[Vec<u8>],

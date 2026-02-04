@@ -98,7 +98,7 @@ pub use commit_walk::{
 pub use commit_walk_limits::CommitWalkLimits;
 pub use engine_adapter::{
     scan_blob_chunked, EngineAdapter, EngineAdapterConfig, EngineAdapterError, FindingKey,
-    FindingSpan, ScannedBlob, ScannedBlobs, DEFAULT_CHUNK_BYTES, DEFAULT_PATH_ARENA_BYTES,
+    FindingSpan, ScannedBlob, ScannedBlobs, DEFAULT_CHUNK_BYTES,
 };
 pub use errors::PersistError;
 pub use errors::{CommitPlanError, MappingCandidateKind, RepoOpenError, SpillError, TreeDiffError};
@@ -110,7 +110,7 @@ pub use limits::RepoOpenLimits;
 pub use mapping_bridge::{MappingBridge, MappingBridgeConfig, MappingStats};
 pub use midx::MidxView;
 pub use object_id::{ObjectFormat, OidBytes};
-pub use object_store::{ObjectStore, TreeSource};
+pub use object_store::{ObjectStore, TreeBytes, TreeSource};
 pub use pack_cache::{CachedObject, PackCache};
 pub use pack_candidates::{
     CappedPackCandidateSink, CollectingPackCandidateSink, LooseCandidate, PackCandidate,
@@ -146,8 +146,9 @@ pub use run_format::{RunContext, RunHeader, RunRecord};
 pub use run_reader::RunReader;
 pub use run_writer::RunWriter;
 pub use runner::{
-    run_git_scan, CandidateSkipReason, GitScanConfig, GitScanError, GitScanReport, GitScanResult,
-    PackMmapLimits, SkippedCandidate,
+    run_git_scan, CandidateSkipReason, GitScanAllocStats, GitScanConfig, GitScanError,
+    GitScanMetricsSnapshot, GitScanReport, GitScanResult, GitScanStageNanos, PackMmapLimits,
+    SkippedCandidate,
 };
 pub use seen_store::{AlwaysSeenStore, InMemorySeenStore, NeverSeenStore, SeenBlobStore};
 pub use snapshot_plan::snapshot_plan;

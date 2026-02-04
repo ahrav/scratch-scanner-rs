@@ -154,7 +154,10 @@ before descendants, ensuring first-introduction semantics across merges.
 Tree diffing loads tree objects from the object store and walks them in Git tree
 order to emit blob candidates with commit/parent context and path classification.
 The walker skips unchanged subtrees, never reads blobs during diffing, and
-preserves deterministic candidate ordering for downstream spill/dedupe.
+preserves deterministic candidate ordering for downstream spill/dedupe. Outputs
+flow through the `CandidateSink` interface so callers can stream directly into
+spill/dedupe; `CandidateBuffer` remains as a buffered fallback for tests and
+diagnostics.
 
 ## Git Spill + Dedupe
 
@@ -165,8 +168,15 @@ merge across runs to emit globally sorted, unique candidates. `WorkItems` stores
 candidate metadata in SoA form so downstream sorting can shuffle indices without
 moving large structs.
 
+Spill chunks now reduce to a single canonical record per OID before writing
+runs to disk, shrinking spill bytes without changing canonical context rules.
+
 After global dedupe, sorted OID batches are sent to the seen-blob store so
 previously scanned blobs can be filtered before decoding.
+
+Mapping re-interns candidate paths into a shared arena that is kept alive
+through pack execution and finalize; scan results retain those path refs to
+avoid re-interning in the engine adapter.
 
 ## Git Finalize + Persist
 

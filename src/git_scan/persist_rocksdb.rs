@@ -13,10 +13,11 @@ use std::path::Path;
 
 use super::errors::{PersistError, RepoOpenError, SpillError};
 #[cfg(feature = "rocksdb")]
+use super::finalize::build_ref_wm_key;
+#[cfg(feature = "rocksdb")]
 use super::finalize::FinalizeOutcome;
 use super::finalize::FinalizeOutput;
-#[cfg(feature = "rocksdb")]
-use super::finalize::{build_ref_wm_key, build_seen_blob_key};
+use super::finalize::NS_SEEN_BLOB;
 use super::object_id::OidBytes;
 use super::persist::PersistenceStore;
 use super::repo_open::RefWatermarkStore;
@@ -45,11 +46,32 @@ pub struct RocksDbStore {
     policy_hash: [u8; 32],
 }
 
+/// Returns the byte length of a seen-blob key for the given OID length.
+fn seen_blob_key_len(oid_len: u8) -> usize {
+    3 + 8 + 32 + oid_len as usize
+}
+
+/// Writes a `seen_blob` key into the provided buffer.
+///
+/// Layout: namespace prefix + repo_id + policy_hash + oid bytes.
+fn write_seen_blob_key(buf: &mut [u8], repo_id: u64, policy_hash: &[u8; 32], oid: &OidBytes) {
+    debug_assert_eq!(buf.len(), seen_blob_key_len(oid.len()));
+    let mut offset = 0;
+    buf[offset..offset + 3].copy_from_slice(&NS_SEEN_BLOB);
+    offset += 3;
+    buf[offset..offset + 8].copy_from_slice(&repo_id.to_be_bytes());
+    offset += 8;
+    buf[offset..offset + 32].copy_from_slice(policy_hash);
+    offset += 32;
+    buf[offset..offset + oid.len() as usize].copy_from_slice(oid.as_slice());
+}
+
 impl RocksDbStore {
     /// Opens or creates a RocksDB database at the given path.
     ///
     /// The provided `repo_id` and `policy_hash` are stored on the handle and
     /// used to build keys for `SeenBlobStore` lookups.
+    /// When the `rocksdb` feature is disabled, this returns a backend error.
     ///
     /// # Errors
     /// Returns a backend error when RocksDB cannot be opened or the feature is
@@ -129,10 +151,24 @@ impl SeenBlobStore for RocksDbStore {
             // `oids` are expected to be sorted to preserve key ordering.
             // Results mirror the input order because `multi_get` respects the
             // provided key iterator.
-            let mut keys = Vec::with_capacity(oids.len());
-            for oid in oids {
-                keys.push(build_seen_blob_key(self.repo_id, &self.policy_hash, oid));
+            if oids.is_empty() {
+                return Ok(Vec::new());
             }
+
+            let oid_len = oids[0].len();
+            let key_len = seen_blob_key_len(oid_len);
+            // Build a contiguous key buffer so multi_get can borrow slices without per-key Vecs.
+            let mut buf = Vec::with_capacity(key_len * oids.len());
+            let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(oids.len());
+            for oid in oids {
+                debug_assert_eq!(oid.len(), oid_len, "mixed oid lengths");
+                let start = buf.len();
+                let end = start + key_len;
+                buf.resize(end, 0);
+                write_seen_blob_key(&mut buf[start..end], self.repo_id, &self.policy_hash, oid);
+                ranges.push((start, end));
+            }
+            let keys: Vec<&[u8]> = ranges.iter().map(|(s, e)| &buf[*s..*e]).collect();
             debug_assert!(
                 keys.windows(2).all(|w| w[0] <= w[1]),
                 "seen keys must be sorted"
@@ -208,5 +244,24 @@ impl RefWatermarkStore for RocksDbStore {
                 "rocksdb support not enabled",
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git_scan::finalize::build_seen_blob_key;
+
+    #[test]
+    fn seen_blob_key_builder_matches_legacy() {
+        let repo_id = 42;
+        let policy_hash = [0xAB; 32];
+        let oid = OidBytes::sha1([0x11; 20]);
+
+        let expected = build_seen_blob_key(repo_id, &policy_hash, &oid);
+        let mut buf = vec![0u8; seen_blob_key_len(oid.len())];
+        write_seen_blob_key(&mut buf, repo_id, &policy_hash, &oid);
+
+        assert_eq!(buf, expected);
     }
 }

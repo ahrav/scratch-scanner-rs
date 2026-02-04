@@ -121,6 +121,10 @@ name = "vectorscan_overhead"
 harness = false
 
 [[bench]]
+name = "git_scan_perf"
+harness = false
+
+[[bench]]
 name = "vectorscan_pattern_complexity"
 harness = false
 required-features = ["bench"]

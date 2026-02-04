@@ -69,8 +69,8 @@ Git tree diffing has its own bounded memory envelope:
 
 - **Tree bytes budget**: `TreeDiffLimits.max_tree_bytes_per_job` caps the total
   decompressed tree payloads loaded during a repo job.
-- **Pack access**: pack files are memory-mapped on demand and shared across
-  tree loads as read-only slices; no pack data is copied unless inflated.
+- **Pack access**: pack files are memory-mapped on demand only for packs
+  referenced by mapping results; no pack data is copied unless inflated.
 - **Inflate buffers**: tree payloads and delta instructions are inflated into
   bounded buffers capped by the tree bytes budget (plus a small header slack
   for loose objects).
@@ -81,7 +81,9 @@ Git tree diffing has its own bounded memory envelope:
   initial capacity and can be cleared between diffs when used.
 - **Tree cache sizing**: tree payload cache uses fixed-size slots (4 KiB)
   with 4-way sets; total cache bytes are rounded down to a power-of-two
-  set count. Entries larger than a slot are not cached.
+  set count. Entries larger than a slot are not cached. Cache hits return
+  pinned handles so tree bytes can be borrowed without copying; pinned slots
+  are skipped by eviction until the handle is dropped.
 
 These limits make Git tree traversal deterministic and DoS-resistant while
 keeping blob data out of memory during diffing.
@@ -100,6 +102,13 @@ stores:
 Path bytes are stored separately in the chunk `ByteArena` and bounded by
 `SpillLimits.max_chunk_path_bytes`, so total spill working set remains linear
 in candidate count plus bounded path arena growth.
+
+`ByteArena::clear_keep_capacity()` resets spill path arenas between flushes
+without releasing capacity, keeping spill loops allocation-stable.
+
+Run IO is allocation-aware: `RunWriter::write_resolved` writes borrowed paths
+directly, `RunReader::read_next_into` reuses a scratch record buffer, and the
+spill merger reuses record storage across runs to avoid per-record clones.
 
 Seen filtering uses a per-batch arena capped by `SpillLimits.seen_batch_max_path_bytes`
 and batches up to `SpillLimits.seen_batch_max_oids` OIDs before issuing a
@@ -136,7 +145,7 @@ and the delta-base closure:
 - Exec order: optional `Vec<u32>` of indices into `need_offsets` when forward
   dependencies exist.
 - Clusters: ranges over `need_offsets` split when gaps exceed
-  `CLUSTER_GAP_BYTES`.
+  `CLUSTER_GAP_BYTES` (currently omitted because pack exec does not use them).
 
 Memory is linear in `candidates.len()` + `need_offsets.len()` with explicit
 caps on closure expansion and header parsing.
@@ -147,6 +156,8 @@ Pack decode uses bounded buffers and a fixed-size cache:
 
 - **Inflate buffers**: zlib output is capped by `PackDecodeLimits.max_object_bytes`
   for full objects and `PackDecodeLimits.max_delta_bytes` for delta payloads.
+- **Scratch reuse**: pack exec reuses per-pack scratch buffers for delta maps
+  and candidate ranges to avoid per-plan allocations after warmup.
 - **Header parsing**: entry headers are bounded by
   `PackDecodeLimits.max_header_bytes`.
 - **Pack cache**: `PackCache` stores decoded objects in fixed-size slots
@@ -165,6 +176,8 @@ engine scanning:
   debug-only `AllocGuard` around pack exec and engine adapter scan paths.
 - **Findings arena**: per-blob findings are stored in a shared arena and
   referenced by spans (`FindingSpan`), avoiding per-blob `Vec` allocations.
+- **Chunker reuse**: the engine adapter reuses a fixed-size ring chunker and
+  findings buffer across blobs to keep scan hot loops allocation-free.
 
 Use the allocation guard in debug tests with the counting allocator to
 verify no heap activity after warmup.

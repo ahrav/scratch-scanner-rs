@@ -97,8 +97,11 @@ pub trait PackObjectSink {
 /// Decode errors do not appear here; they are tracked as `SkipReason`s.
 #[derive(Debug)]
 pub enum PackExecError {
+    /// Pack header or index parsing failed.
     PackParse(PackParseError),
+    /// The sink rejected an emitted blob.
     Sink(String),
+    /// External base provider returned a fatal error.
     ExternalBase(String),
 }
 
@@ -184,6 +187,41 @@ pub struct PackExecReport {
     pub skips: Vec<SkipRecord>,
 }
 
+/// Reusable scratch buffers for pack execution.
+#[derive(Debug, Default)]
+pub struct PackExecScratch {
+    delta_map: HashMap<u64, DeltaDep>,
+    inflate_buf: Vec<u8>,
+    result_buf: Vec<u8>,
+    candidate_ranges: Vec<Option<(usize, usize)>>,
+}
+
+impl PackExecScratch {
+    /// Prepares scratch buffers for the given plan and decode limits.
+    fn prepare(&mut self, plan: &PackPlan, limits: &PackDecodeLimits) {
+        self.delta_map.clear();
+        self.delta_map.reserve(plan.delta_deps.len());
+        for dep in &plan.delta_deps {
+            self.delta_map.insert(dep.offset, *dep);
+        }
+
+        let inflate_target = limits.max_delta_bytes.max(1024);
+        if self.inflate_buf.capacity() < inflate_target {
+            self.inflate_buf
+                .reserve(inflate_target - self.inflate_buf.capacity());
+        }
+        self.inflate_buf.clear();
+
+        let result_target = limits.max_object_bytes.max(1024);
+        if self.result_buf.capacity() < result_target {
+            self.result_buf
+                .reserve(result_target - self.result_buf.capacity());
+        }
+        self.result_buf.clear();
+        self.candidate_ranges.clear();
+    }
+}
+
 /// Where the decoded bytes live after `decode_offset`.
 #[derive(Clone, Copy, Debug)]
 enum DecodedStorage {
@@ -212,6 +250,10 @@ struct DecodedObject {
 /// skip reasons for non-fatal failures (decode errors, missing bases, and
 /// external base provider errors).
 ///
+/// For offsets with multiple candidates, `emit` is invoked once per candidate.
+/// Non-blob objects record `SkipReason::NotBlob` for each candidate at the
+/// offset.
+///
 /// # Errors
 /// - `PackExecError::PackParse` for invalid pack headers.
 /// - `PackExecError::Sink` for sink failures.
@@ -225,6 +267,31 @@ pub fn execute_pack_plan<S: PackObjectSink, B: ExternalBaseProvider>(
     external: &mut B,
     sink: &mut S,
 ) -> Result<PackExecReport, PackExecError> {
+    let mut scratch = PackExecScratch::default();
+    execute_pack_plan_with_scratch(
+        plan,
+        pack_bytes,
+        paths,
+        limits,
+        cache,
+        external,
+        sink,
+        &mut scratch,
+    )
+}
+
+/// Executes a pack plan using reusable scratch buffers.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_pack_plan_with_scratch<S: PackObjectSink, B: ExternalBaseProvider>(
+    plan: &PackPlan,
+    pack_bytes: &[u8],
+    paths: &ByteArena,
+    limits: &PackDecodeLimits,
+    cache: &mut PackCache,
+    external: &mut B,
+    sink: &mut S,
+    scratch: &mut PackExecScratch,
+) -> Result<PackExecReport, PackExecError> {
     let pack = PackFile::parse(pack_bytes, plan.oid_len as usize)?;
     let mut report = PackExecReport::default();
     report
@@ -233,13 +300,10 @@ pub fn execute_pack_plan<S: PackObjectSink, B: ExternalBaseProvider>(
 
     let alloc_guard_enabled = alloc_guard::enabled();
 
-    let mut delta_map: HashMap<u64, DeltaDep> = HashMap::with_capacity(plan.delta_deps.len());
-    for dep in &plan.delta_deps {
-        delta_map.insert(dep.offset, *dep);
-    }
-
-    let mut inflate_buf: Vec<u8> = Vec::with_capacity(limits.max_delta_bytes.max(1024));
-    let mut result_buf: Vec<u8> = Vec::with_capacity(limits.max_object_bytes.max(1024));
+    scratch.prepare(plan, limits);
+    let delta_map = &scratch.delta_map;
+    let inflate_buf = &mut scratch.inflate_buf;
+    let result_buf = &mut scratch.result_buf;
 
     let mut handle_idx = |idx: usize, range: Option<(usize, usize)>| -> Result<(), PackExecError> {
         let guard = if alloc_guard_enabled {
@@ -249,39 +313,38 @@ pub fn execute_pack_plan<S: PackObjectSink, B: ExternalBaseProvider>(
         };
         let offset = plan.need_offsets[idx];
 
-        let decoded = if cache.get(offset).is_some() {
+        let (obj_kind, bytes) = if let Some(hit) = cache.get(offset) {
             report.stats.cache_hits += 1;
             perf::record_cache_hit();
-            Some(DecodedObject {
-                kind: cache.get(offset).expect("cache hit").kind,
-                storage: DecodedStorage::Cache,
-            })
+            (hit.kind, hit.bytes)
         } else {
             report.stats.cache_misses += 1;
             perf::record_cache_miss();
-            decode_offset(
+            let decoded = decode_offset(
                 &pack,
                 offset,
                 limits,
                 cache,
                 external,
-                &delta_map,
+                delta_map,
                 &mut report,
-                &mut inflate_buf,
-                &mut result_buf,
-            )?
-        };
+                inflate_buf,
+                result_buf,
+            )?;
 
-        let Some(obj) = decoded else {
-            return Ok(());
-        };
+            let Some(obj) = decoded else {
+                return Ok(());
+            };
 
-        let bytes = match obj.storage {
-            DecodedStorage::Cache => cache
-                .get(offset)
-                .map(|hit| hit.bytes)
-                .unwrap_or(result_buf.as_slice()),
-            DecodedStorage::Scratch => result_buf.as_slice(),
+            let bytes = match obj.storage {
+                DecodedStorage::Cache => cache
+                    .get(offset)
+                    .map(|hit| hit.bytes)
+                    .unwrap_or(result_buf.as_slice()),
+                DecodedStorage::Scratch => result_buf.as_slice(),
+            };
+
+            (obj.kind, bytes)
         };
 
         if let Some((start, end)) = range {
@@ -289,7 +352,7 @@ pub fn execute_pack_plan<S: PackObjectSink, B: ExternalBaseProvider>(
             for cand_idx in start..end {
                 let candidate =
                     &plan.candidates[plan.candidate_offsets[cand_idx].cand_idx as usize];
-                if obj.kind != ObjectKind::Blob {
+                if obj_kind != ObjectKind::Blob {
                     report.skips.push(SkipRecord {
                         offset,
                         reason: SkipReason::NotBlob,
@@ -312,10 +375,10 @@ pub fn execute_pack_plan<S: PackObjectSink, B: ExternalBaseProvider>(
 
     if let Some(order) = plan.exec_order.as_ref() {
         // Out-of-order execution: precompute exact candidate ranges by need index.
-        let candidate_ranges = build_candidate_ranges(plan);
+        build_candidate_ranges(plan, &mut scratch.candidate_ranges);
         for &idx in order {
             let idx = idx as usize;
-            handle_idx(idx, candidate_ranges[idx])?;
+            handle_idx(idx, scratch.candidate_ranges[idx])?;
         }
     } else {
         // Monotone execution: merge candidate offsets with need offsets.
@@ -346,10 +409,11 @@ pub fn execute_pack_plan<S: PackObjectSink, B: ExternalBaseProvider>(
 ///
 /// This is used only when `exec_order` reorders offsets; it avoids repeated
 /// scans of the candidate list by leveraging sorted candidate offsets.
-fn build_candidate_ranges(plan: &PackPlan) -> Vec<Option<(usize, usize)>> {
+fn build_candidate_ranges(plan: &PackPlan, ranges: &mut Vec<Option<(usize, usize)>>) {
     // Single pass over sorted offsets; each need offset maps to a contiguous
     // range in `candidate_offsets` (if any).
-    let mut ranges = vec![None; plan.need_offsets.len()];
+    ranges.clear();
+    ranges.resize(plan.need_offsets.len(), None);
     let mut cand_idx = 0usize;
     for (need_idx, &offset) in plan.need_offsets.iter().enumerate() {
         let start = cand_idx;
@@ -362,7 +426,6 @@ fn build_candidate_ranges(plan: &PackPlan) -> Vec<Option<(usize, usize)>> {
             ranges[need_idx] = Some((start, cand_idx));
         }
     }
-    ranges
 }
 
 /// Decodes a single offset, using the cache for bases and for storing results.

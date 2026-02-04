@@ -204,6 +204,8 @@ impl Spiller {
     ///
     /// On success, all temporary run files are deleted. On error, cleanup
     /// happens via `Drop` (best-effort).
+    ///
+    /// The spiller consumes itself so callers cannot reuse it after finalize.
     pub fn finalize<S: SeenBlobStore + ?Sized, B: UniqueBlobSink>(
         mut self,
         seen_store: &S,
@@ -323,24 +325,40 @@ impl Spiller {
         let mut current_oid: Option<OidBytes> = None;
         let mut canonical: Option<RunRecord> = None;
 
+        let take_scratch = |canonical: &mut Option<RunRecord>| {
+            canonical.take().unwrap_or_else(|| {
+                RunRecord::scratch(self.oid_len, self.limits.max_path_len as usize)
+            })
+        };
+
+        let set_canonical = |dst: &mut RunRecord, src: &RunRecord| {
+            dst.oid = src.oid;
+            dst.ctx = src.ctx;
+            dst.path.clear();
+            dst.path.extend_from_slice(&src.path);
+        };
+
         while let Some(record) = merger.next_unique()? {
             match current_oid {
                 None => {
                     current_oid = Some(record.oid);
-                    canonical = Some(record);
+                    let mut scratch = take_scratch(&mut canonical);
+                    set_canonical(&mut scratch, record);
+                    canonical = Some(scratch);
                 }
                 Some(oid) if oid != record.oid => {
-                    let best = canonical.take().expect("canonical record missing");
+                    let mut best = canonical.take().expect("canonical record missing");
                     self.push_unique(
                         &mut batch, oid, best.ctx, &best.path, stats, seen_store, sink,
                     )?;
                     current_oid = Some(record.oid);
-                    canonical = Some(record);
+                    set_canonical(&mut best, record);
+                    canonical = Some(best);
                 }
                 Some(_) => {
-                    let best = canonical.as_ref().expect("canonical record missing");
+                    let best = canonical.as_mut().expect("canonical record missing");
                     if is_more_canonical(record.ctx, &record.path, best.ctx, &best.path) {
-                        canonical = Some(record);
+                        set_canonical(best, record);
                     }
                 }
             }
@@ -553,6 +571,9 @@ impl BatchBuffer {
     }
 
     /// Returns true if the batch can accommodate another OID and path.
+    ///
+    /// This check is optimistic; the actual `push` may still fail if the
+    /// path exceeds `ByteRef::MAX_LEN`.
     fn can_fit(&self, path_len: usize) -> bool {
         self.oids.len() < self.max_oids && self.path_arena.remaining() as usize >= path_len
     }

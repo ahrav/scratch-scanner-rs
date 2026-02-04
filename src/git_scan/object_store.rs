@@ -41,7 +41,7 @@ use super::pack_inflate::{
 };
 use super::repo::GitRepoPaths;
 use super::repo_open::RepoJobState;
-use super::tree_cache::TreeCache;
+use super::tree_cache::{TreeCache, TreeCacheHandle};
 use super::tree_diff_limits::TreeDiffLimits;
 
 /// Maximum entry header bytes to parse in pack files.
@@ -58,13 +58,55 @@ const LOOSE_HEADER_MAX_BYTES: usize = 64;
 pub trait TreeSource {
     /// Loads a tree object by OID.
     ///
-    /// Implementations may allocate per call; higher-level caches can wrap
-    /// the source to avoid repeated inflations of hot subtrees.
+    /// Implementations may allocate per call; higher-level caches can lend
+    /// pinned payloads to avoid repeated inflations of hot subtrees.
+    /// Returned bytes are treated as read-only and are not retained by the
+    /// caller beyond the `TreeBytes` value.
     ///
     /// # Errors
     /// - `TreeNotFound` if the object doesn't exist
     /// - `NotATree` if the object exists but isn't a tree
-    fn load_tree(&mut self, oid: &OidBytes) -> Result<Vec<u8>, TreeDiffError>;
+    fn load_tree(&mut self, oid: &OidBytes) -> Result<TreeBytes, TreeDiffError>;
+}
+
+/// Tree payload bytes returned by a `TreeSource`.
+#[derive(Debug)]
+pub enum TreeBytes {
+    /// Borrowed bytes pinned in the tree cache.
+    ///
+    /// Dropping the handle releases the pin and may allow eviction.
+    Cached(TreeCacheHandle),
+    /// Owned bytes (e.g., from pack/loose reads).
+    Owned(Vec<u8>),
+}
+
+impl TreeBytes {
+    /// Returns an empty tree payload.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::Owned(Vec::new())
+    }
+
+    /// Returns the tree payload as a byte slice.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Cached(handle) => handle.as_slice(),
+            Self::Owned(buf) => buf.as_slice(),
+        }
+    }
+
+    /// Returns the payload length in bytes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    /// Returns true if the payload is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
 }
 
 /// Pack/loose object store for tree loading.
@@ -73,9 +115,8 @@ pub trait TreeSource {
 /// lazily mmaps pack files on demand. Pack mmaps are cached in `Arc` so
 /// recursive delta resolution can borrow pack bytes without aliasing `self`.
 ///
-/// The tree cache stores decompressed payloads, but cache hits are still
-/// returned as owned `Vec<u8>` to keep `TreeSource` ownership semantics
-/// simple for callers.
+/// The tree cache stores decompressed payloads; cache hits return pinned
+/// handles so callers can borrow the bytes without copying.
 #[derive(Debug)]
 pub struct ObjectStore<'a> {
     oid_len: u8,
@@ -89,6 +130,9 @@ pub struct ObjectStore<'a> {
 
 impl<'a> ObjectStore<'a> {
     /// Opens an object store for the given repository job.
+    ///
+    /// The store resolves pack paths from the MIDX and uses a best-effort
+    /// tree cache sized by `TreeDiffLimits`.
     ///
     /// # Errors
     /// Returns `TreeDiffError::ObjectStoreError` if artifacts are missing,
@@ -153,6 +197,7 @@ impl<'a> ObjectStore<'a> {
         oid: &OidBytes,
         depth: u8,
     ) -> Result<(ObjectKind, Vec<u8>), TreeDiffError> {
+        // Depth is decremented per delta hop to bound recursion.
         if let Some(obj) = self.load_object_from_pack(oid, depth)? {
             return Ok(obj);
         }
@@ -322,7 +367,7 @@ impl<'a> ObjectStore<'a> {
 }
 
 impl TreeSource for ObjectStore<'_> {
-    fn load_tree(&mut self, oid: &OidBytes) -> Result<Vec<u8>, TreeDiffError> {
+    fn load_tree(&mut self, oid: &OidBytes) -> Result<TreeBytes, TreeDiffError> {
         if oid.len() != self.oid_len {
             return Err(TreeDiffError::InvalidOidLength {
                 len: oid.len() as usize,
@@ -330,8 +375,8 @@ impl TreeSource for ObjectStore<'_> {
             });
         }
 
-        if let Some(bytes) = self.tree_cache.get(oid) {
-            return Ok(bytes.to_vec());
+        if let Some(handle) = self.tree_cache.get_handle(oid) {
+            return Ok(TreeBytes::Cached(handle));
         }
 
         let (kind, data) = self.load_object(oid)?;
@@ -341,7 +386,7 @@ impl TreeSource for ObjectStore<'_> {
 
         // Cache is best-effort; failures are ignored.
         self.tree_cache.insert(*oid, &data);
-        Ok(data)
+        Ok(TreeBytes::Owned(data))
     }
 }
 

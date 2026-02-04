@@ -193,8 +193,8 @@ fn pack_exec_matches_git_cat_file() {
 
     let resolver = Resolver { map: resolver_map };
     let plans = build_pack_plans(
-        &candidates,
-        &[pack_view],
+        candidates,
+        &[Some(pack_view)],
         &resolver,
         &PackPlanConfig::default(),
     )

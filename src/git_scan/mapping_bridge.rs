@@ -8,7 +8,7 @@
 //! # Algorithm
 //! 1. Validate strict OID ordering (rejects duplicates or regressions).
 //! 2. Re-intern the candidate path into the bridge arena.
-//! 3. Look up the blob OID in the MIDX.
+//! 3. Look up the blob OID in the MIDX using a streaming cursor.
 //! 4. Emit a packed or loose candidate into the downstream sink.
 //! 5. Track per-blob stats and reconcile them at `finish()`.
 //!
@@ -25,7 +25,7 @@ use std::cmp::Ordering;
 
 use super::byte_arena::{ByteArena, ByteRef};
 use super::errors::SpillError;
-use super::midx::MidxView;
+use super::midx::{MidxCursor, MidxView};
 use super::midx_error::MidxError;
 use super::object_id::OidBytes;
 use super::pack_candidates::{LooseCandidate, PackCandidate, PackCandidateSink};
@@ -90,6 +90,7 @@ pub struct MappingBridge<'midx, S: PackCandidateSink> {
     path_arena: ByteArena,
     stats: MappingStats,
     last_oid: Option<OidBytes>,
+    midx_cursor: MidxCursor,
 }
 
 impl<'midx, S: PackCandidateSink> MappingBridge<'midx, S> {
@@ -104,6 +105,7 @@ impl<'midx, S: PackCandidateSink> MappingBridge<'midx, S> {
             path_arena: ByteArena::with_capacity(config.path_arena_capacity),
             stats: MappingStats::default(),
             last_oid: None,
+            midx_cursor: MidxCursor::default(),
         }
     }
 
@@ -178,39 +180,44 @@ impl<'midx, S: PackCandidateSink> MappingBridge<'midx, S> {
 
 impl<S: PackCandidateSink> UniqueBlobSink for MappingBridge<'_, S> {
     fn emit(&mut self, blob: &UniqueBlob, paths: &ByteArena) -> Result<(), SpillError> {
-        self.ensure_sorted(blob.oid)?;
+        let (res, nanos) = perf::time(|| {
+            self.ensure_sorted(blob.oid)?;
 
-        let path_ref = self.intern_path(paths, blob.ctx.path_ref)?;
-        let ctx = CandidateContext {
-            path_ref,
-            ..blob.ctx
-        };
+            let path_ref = self.intern_path(paths, blob.ctx.path_ref)?;
+            let ctx = CandidateContext {
+                path_ref,
+                ..blob.ctx
+            };
 
-        self.stats.unique_blobs_in += 1;
+            self.stats.unique_blobs_in += 1;
 
-        let (lookup, nanos) = perf::time(|| self.midx.find_oid(&blob.oid));
+            match self
+                .midx
+                .find_oid_sorted(&mut self.midx_cursor, &blob.oid)?
+            {
+                Some(idx) => {
+                    let (pack_id, offset) = self.midx.offset_at(idx)?;
+                    let candidate = PackCandidate {
+                        oid: blob.oid,
+                        ctx,
+                        pack_id,
+                        offset,
+                    };
+                    self.sink.emit_packed(&candidate)?;
+                    self.stats.packed_matched += 1;
+                }
+                None => {
+                    let candidate = LooseCandidate { oid: blob.oid, ctx };
+                    self.sink.emit_loose(&candidate)?;
+                    self.stats.loose_unmatched += 1;
+                }
+            }
+
+            Ok(())
+        });
+
         perf::record_mapping(nanos);
-
-        match lookup? {
-            Some(idx) => {
-                let (pack_id, offset) = self.midx.offset_at(idx)?;
-                let candidate = PackCandidate {
-                    oid: blob.oid,
-                    ctx,
-                    pack_id,
-                    offset,
-                };
-                self.sink.emit_packed(&candidate)?;
-                self.stats.packed_matched += 1;
-            }
-            None => {
-                let candidate = LooseCandidate { oid: blob.oid, ctx };
-                self.sink.emit_loose(&candidate)?;
-                self.stats.loose_unmatched += 1;
-            }
-        }
-
-        Ok(())
+        res
     }
 
     fn finish(&mut self) -> Result<(), SpillError> {

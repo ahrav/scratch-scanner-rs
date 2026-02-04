@@ -484,6 +484,108 @@ fn collect_unique_blobs(state: &RepoJobState, limits: SpillLimits) -> Vec<Collec
     sink.blobs
 }
 
+/// Collect unique blobs using a buffered candidate path before spilling.
+fn collect_unique_blobs_buffered(
+    state: &RepoJobState,
+    limits: SpillLimits,
+) -> Vec<CollectedUniqueBlob> {
+    let cg = CommitGraphView::open_repo(state).unwrap();
+    let plan = introduced_by_plan(state, &cg, CommitWalkLimits::RESTRICTIVE).unwrap();
+
+    let tree_limits = TreeDiffLimits::RESTRICTIVE;
+    let mut store = ObjectStore::open(state, &tree_limits).unwrap();
+    let mut walker = TreeDiffWalker::new(&tree_limits, state.object_format.oid_len());
+    let mut parent_scratch = ParentScratch::new();
+    let mut buffer = CandidateBuffer::new(&tree_limits, state.object_format.oid_len());
+
+    let tmp = TempDir::new().unwrap();
+    let mut spiller = Spiller::new(limits, state.object_format.oid_len(), tmp.path()).unwrap();
+
+    for PlannedCommit { pos, snapshot_root } in &plan {
+        let commit_id = pos.0;
+        let new_tree = cg.root_tree_oid(*pos).unwrap();
+
+        if *snapshot_root {
+            walker
+                .diff_trees(&mut store, &mut buffer, Some(&new_tree), None, commit_id, 0)
+                .unwrap();
+            continue;
+        }
+
+        parent_scratch.clear();
+        cg.collect_parents(
+            *pos,
+            CommitWalkLimits::RESTRICTIVE.max_parents_per_commit,
+            &mut parent_scratch,
+        )
+        .unwrap();
+        let parents = parent_scratch.as_slice();
+
+        if parents.is_empty() {
+            walker
+                .diff_trees(&mut store, &mut buffer, Some(&new_tree), None, commit_id, 0)
+                .unwrap();
+            continue;
+        }
+
+        for (idx, parent_pos) in parents.iter().enumerate() {
+            let old_tree = cg.root_tree_oid(*parent_pos).unwrap();
+            walker
+                .diff_trees(
+                    &mut store,
+                    &mut buffer,
+                    Some(&new_tree),
+                    Some(&old_tree),
+                    commit_id,
+                    idx as u8,
+                )
+                .unwrap();
+        }
+    }
+
+    for cand in buffer.iter_resolved() {
+        spiller
+            .push(
+                cand.oid,
+                cand.path,
+                cand.commit_id,
+                cand.parent_idx,
+                cand.change_kind,
+                cand.ctx_flags,
+                cand.cand_flags,
+            )
+            .unwrap();
+    }
+
+    let store = NeverSeenStore;
+    let mut sink = CollectingUniqueBlobSink::default();
+    spiller.finalize(&store, &mut sink).unwrap();
+    sink.blobs
+}
+
+fn sort_unique_blobs(blobs: &mut [CollectedUniqueBlob]) {
+    blobs.sort_by(|a, b| {
+        (
+            a.oid,
+            a.ctx.commit_id,
+            a.ctx.parent_idx,
+            a.ctx.change_kind.as_u8(),
+            a.ctx.ctx_flags,
+            a.ctx.cand_flags,
+            &a.path,
+        )
+            .cmp(&(
+                b.oid,
+                b.ctx.commit_id,
+                b.ctx.parent_idx,
+                b.ctx.change_kind.as_u8(),
+                b.ctx.ctx_flags,
+                b.ctx.cand_flags,
+                &b.path,
+            ))
+    });
+}
+
 #[test]
 fn spill_limits_streaming_is_partition_invariant() {
     if !git_available() || !git_supports_midx() {
@@ -508,48 +610,30 @@ fn spill_limits_streaming_is_partition_invariant() {
     let mut out_small = collect_unique_blobs(&state, limits_small);
     let mut out_large = collect_unique_blobs(&state, limits_large);
 
-    out_small.sort_by(|a, b| {
-        (
-            a.oid,
-            a.ctx.commit_id,
-            a.ctx.parent_idx,
-            a.ctx.change_kind.as_u8(),
-            a.ctx.ctx_flags,
-            a.ctx.cand_flags,
-            &a.path,
-        )
-            .cmp(&(
-                b.oid,
-                b.ctx.commit_id,
-                b.ctx.parent_idx,
-                b.ctx.change_kind.as_u8(),
-                b.ctx.ctx_flags,
-                b.ctx.cand_flags,
-                &b.path,
-            ))
-    });
-    out_large.sort_by(|a, b| {
-        (
-            a.oid,
-            a.ctx.commit_id,
-            a.ctx.parent_idx,
-            a.ctx.change_kind.as_u8(),
-            a.ctx.ctx_flags,
-            a.ctx.cand_flags,
-            &a.path,
-        )
-            .cmp(&(
-                b.oid,
-                b.ctx.commit_id,
-                b.ctx.parent_idx,
-                b.ctx.change_kind.as_u8(),
-                b.ctx.ctx_flags,
-                b.ctx.cand_flags,
-                &b.path,
-            ))
-    });
+    sort_unique_blobs(&mut out_small);
+    sort_unique_blobs(&mut out_large);
 
     assert_eq!(out_small, out_large);
+}
+
+#[test]
+fn buffered_vs_streaming_candidates_match() {
+    if !git_available() || !git_supports_midx() {
+        eprintln!("git or multi-pack-index not available; skipping buffered vs streaming test");
+        return;
+    }
+
+    let tmp = prepare_repo_with_commits();
+    let state = open_repo_state(tmp.path());
+
+    let limits = SpillLimits::RESTRICTIVE;
+    let mut out_stream = collect_unique_blobs(&state, limits);
+    let mut out_buffered = collect_unique_blobs_buffered(&state, limits);
+
+    sort_unique_blobs(&mut out_stream);
+    sort_unique_blobs(&mut out_buffered);
+
+    assert_eq!(out_stream, out_buffered);
 }
 
 /// Write a corrupt tree object into the object database.
