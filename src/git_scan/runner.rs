@@ -726,6 +726,7 @@ fn collect_skipped_candidates(
     if skips.is_empty() {
         return;
     }
+    // `candidate_offsets` are sorted by pack offset, enabling binary partitioning.
     let offsets = &plan.candidate_offsets;
     for skip in skips {
         let reason = CandidateSkipReason::from_pack_skip(&skip.reason);

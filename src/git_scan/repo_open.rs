@@ -16,7 +16,7 @@
 //! - When artifacts are ready, fingerprints are captured for maintenance checks.
 //! - Start set refs are sorted deterministically by name.
 
-use std::fs::{self, File};
+use std::fs::{self, File, Metadata};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
