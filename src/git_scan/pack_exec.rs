@@ -142,11 +142,11 @@ pub struct SkipRecord {
 /// Execution statistics.
 #[derive(Debug, Default)]
 pub struct PackExecStats {
-    /// Offsets successfully decoded (including bases).
+    /// Offsets successfully decoded (including bases and non-blob kinds).
     pub decoded_offsets: u32,
     /// Candidates emitted to the sink.
     pub emitted_candidates: u32,
-    /// Offsets skipped for any reason.
+    /// Skip records emitted (may exceed unique offsets).
     pub skipped_offsets: u32,
     /// Cache hits on pack offsets.
     pub cache_hits: u32,
@@ -159,6 +159,7 @@ pub struct PackExecStats {
 /// Pack execution report.
 #[derive(Debug, Default)]
 pub struct PackExecReport {
+    /// Aggregate stats for this pack execution.
     pub stats: PackExecStats,
     /// Per-offset skip records (may include repeated offsets).
     pub skips: Vec<SkipRecord>,
@@ -182,6 +183,8 @@ struct DecodedObject {
 ///
 /// The plan's `exec_order` is respected when present to satisfy forward
 /// delta dependencies. Pack bytes must contain the full pack file.
+///
+/// `paths` must contain all path refs referenced by plan candidates.
 ///
 /// The returned report includes both successful decode stats and per-offset
 /// skip reasons for non-fatal failures (decode errors, missing bases, and
