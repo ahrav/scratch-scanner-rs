@@ -1,4 +1,10 @@
 //! Property tests for tree diff walker.
+//!
+//! These tests synthesize Git tree payloads from generated path sets, then
+//! validate that the walker emits the same changes as a straightforward
+//! reference map. Tree objects are encoded in canonical Git order using
+//! `git_tree_name_cmp`, and OIDs are deterministic but synthetic (Blake3
+//! truncated to 20 bytes) so we can compare structure without invoking `git`.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -9,6 +15,7 @@ use scanner_rs::git_scan::{
     TreeDiffLimits, TreeDiffWalker, TreeSource,
 };
 
+/// In-memory tree store keyed by synthetic OIDs.
 #[derive(Default)]
 struct TestTreeStore {
     trees: HashMap<OidBytes, Vec<u8>>,
@@ -24,12 +31,17 @@ impl TreeSource for TestTreeStore {
     }
 }
 
+/// Minimal directory tree used to build raw tree payloads.
 #[derive(Default)]
 struct Node {
     files: Vec<(Vec<u8>, OidBytes)>,
     dirs: BTreeMap<Vec<u8>, Node>,
 }
 
+/// Insert a file path into the directory tree, creating intermediate dirs.
+///
+/// Paths are expected to be slash-delimited and unique (the generator uses a
+/// `BTreeSet`), so this does not attempt to resolve duplicates.
 fn insert_path(node: &mut Node, path: &[u8], oid: OidBytes) {
     if let Some(pos) = path.iter().position(|&b| b == b'/') {
         let (dir, rest) = path.split_at(pos);
@@ -41,6 +53,10 @@ fn insert_path(node: &mut Node, path: &[u8], oid: OidBytes) {
     }
 }
 
+/// Build a raw tree payload for `node`, store it, and return its synthetic OID.
+///
+/// The payload matches Git's tree entry format and is sorted using Git's
+/// tree ordering rules so traversal logic sees canonical ordering.
 fn build_tree(node: &Node, store: &mut HashMap<OidBytes, Vec<u8>>) -> OidBytes {
     struct Entry {
         name: Vec<u8>,
@@ -80,6 +96,8 @@ fn build_tree(node: &Node, store: &mut HashMap<OidBytes, Vec<u8>>) -> OidBytes {
         bytes.extend_from_slice(entry.oid.as_slice());
     }
 
+    // Use a deterministic hash so we can refer to trees without implementing
+    // Git's object hashing in tests.
     let hash = blake3::hash(&bytes);
     let mut oid_bytes = [0u8; 20];
     oid_bytes.copy_from_slice(&hash.as_bytes()[..20]);
@@ -89,6 +107,10 @@ fn build_tree(node: &Node, store: &mut HashMap<OidBytes, Vec<u8>>) -> OidBytes {
     oid
 }
 
+/// Build a root tree from a list of `(path, oid)` entries.
+///
+/// Returns the root OID (or `None` for an empty tree) plus the populated
+/// object store backing the tree structure.
 fn build_root(paths: &[(Vec<u8>, OidBytes)]) -> (Option<OidBytes>, HashMap<OidBytes, Vec<u8>>) {
     if paths.is_empty() {
         return (None, HashMap::new());
@@ -104,6 +126,7 @@ fn build_root(paths: &[(Vec<u8>, OidBytes)]) -> (Option<OidBytes>, HashMap<OidBy
     (Some(root_oid), store)
 }
 
+/// Run a tree diff and collect results into an ordered map for comparisons.
 fn collect_candidates_map(
     source: &mut TestTreeStore,
     limits: &TreeDiffLimits,
@@ -124,10 +147,12 @@ fn collect_candidates_map(
     out
 }
 
+/// Create a synthetic SHA-1 OID filled with a single byte value.
 fn oid_from_byte(val: u8) -> OidBytes {
     OidBytes::sha1([val; 20])
 }
 
+/// Generate short, slash-delimited ASCII paths.
 fn path_strategy() -> impl Strategy<Value = Vec<u8>> {
     let seg = prop::string::string_regex("[a-z]{1,6}").unwrap();
     prop::collection::vec(seg, 1..=3).prop_map(|parts| parts.join("/").into_bytes())
@@ -160,6 +185,7 @@ proptest! {
                 old_entries.push((path.clone(), old_oid));
             }
             if in_new {
+                // Ensure we can force a stable or changed OID without accidental collisions.
                 if in_old && same {
                     new_oid = old_oid;
                 } else if in_old && new_oid == old_oid {
