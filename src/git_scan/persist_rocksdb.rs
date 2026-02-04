@@ -1,8 +1,10 @@
 //! RocksDB-backed persistence adapters.
 //!
 //! This module is feature-gated. Enable with `--features rocksdb`.
-//! The adapter uses a single RocksDB instance with plain key/value pairs
-//! and relies on sorted keys for efficient `multi_get` access.
+//! The adapter uses a single RocksDB instance with plain key/value pairs and
+//! relies on sorted keys for efficient `multi_get` access.
+//! Finalize output is committed with a single `WriteBatch` so data writes and
+//! watermarks become visible atomically.
 //! When the feature is disabled, all public constructors and methods return
 //! explicit backend errors.
 
@@ -10,7 +12,9 @@ use std::io;
 use std::path::Path;
 
 use super::errors::{PersistError, RepoOpenError, SpillError};
-use super::finalize::WriteOp;
+#[cfg(feature = "rocksdb")]
+use super::finalize::FinalizeOutcome;
+use super::finalize::FinalizeOutput;
 #[cfg(feature = "rocksdb")]
 use super::finalize::{build_ref_wm_key, build_seen_blob_key};
 use super::object_id::OidBytes;
@@ -29,7 +33,8 @@ use rocksdb::{Options, WriteBatch, DB};
 /// The store retains the `repo_id` and `policy_hash` used to build
 /// `seen_blob` keys for the spill/dedupe stage.
 /// Watermark loading uses the caller-supplied `(repo_id, policy_hash)` so the
-/// same RocksDB instance can serve multiple namespaces if needed.
+/// same RocksDB instance can serve multiple namespaces if needed. Callers must
+/// supply the same tuple used when writing watermarks to read consistent data.
 #[derive(Debug)]
 pub struct RocksDbStore {
     #[cfg(feature = "rocksdb")]
@@ -43,7 +48,12 @@ pub struct RocksDbStore {
 impl RocksDbStore {
     /// Opens or creates a RocksDB database at the given path.
     ///
-    /// When `rocksdb` feature is disabled, this returns an explicit error.
+    /// The provided `repo_id` and `policy_hash` are stored on the handle and
+    /// used to build keys for `SeenBlobStore` lookups.
+    ///
+    /// # Errors
+    /// Returns a backend error when RocksDB cannot be opened or the feature is
+    /// disabled.
     pub fn open(
         path: impl AsRef<Path>,
         repo_id: u64,
@@ -70,40 +80,33 @@ impl RocksDbStore {
 }
 
 impl PersistenceStore for RocksDbStore {
-    fn write_data_ops(&self, ops: &[WriteOp]) -> Result<(), PersistError> {
+    fn commit_finalize(&self, output: &FinalizeOutput) -> Result<(), PersistError> {
         #[cfg(feature = "rocksdb")]
         {
             debug_assert!(
-                ops.windows(2).all(|w| w[0].key <= w[1].key),
+                output.data_ops.windows(2).all(|w| w[0].key <= w[1].key),
                 "data ops must be sorted by key"
             );
-            let mut batch = WriteBatch::default();
-            for op in ops {
-                batch.put(&op.key, &op.value);
-            }
-            self.db
-                .write(batch)
-                .map_err(|err| PersistError::backend(err.to_string()))?;
-            Ok(())
-        }
-
-        #[cfg(not(feature = "rocksdb"))]
-        {
-            let _ = ops;
-            Err(PersistError::backend("rocksdb support not enabled"))
-        }
-    }
-
-    fn write_watermark_ops(&self, ops: &[WriteOp]) -> Result<(), PersistError> {
-        #[cfg(feature = "rocksdb")]
-        {
             debug_assert!(
-                ops.windows(2).all(|w| w[0].key <= w[1].key),
+                output
+                    .watermark_ops
+                    .windows(2)
+                    .all(|w| w[0].key <= w[1].key),
                 "watermark ops must be sorted by key"
             );
+            debug_assert!(
+                matches!(output.outcome, FinalizeOutcome::Complete)
+                    || output.watermark_ops.is_empty(),
+                "watermark ops present for partial outcome"
+            );
             let mut batch = WriteBatch::default();
-            for op in ops {
+            for op in &output.data_ops {
                 batch.put(&op.key, &op.value);
+            }
+            if matches!(output.outcome, FinalizeOutcome::Complete) {
+                for op in &output.watermark_ops {
+                    batch.put(&op.key, &op.value);
+                }
             }
             self.db
                 .write(batch)
@@ -113,7 +116,7 @@ impl PersistenceStore for RocksDbStore {
 
         #[cfg(not(feature = "rocksdb"))]
         {
-            let _ = ops;
+            let _ = output;
             Err(PersistError::backend("rocksdb support not enabled"))
         }
     }
@@ -124,6 +127,8 @@ impl SeenBlobStore for RocksDbStore {
         #[cfg(feature = "rocksdb")]
         {
             // `oids` are expected to be sorted to preserve key ordering.
+            // Results mirror the input order because `multi_get` respects the
+            // provided key iterator.
             let mut keys = Vec::with_capacity(oids.len());
             for oid in oids {
                 keys.push(build_seen_blob_key(self.repo_id, &self.policy_hash, oid));
@@ -166,6 +171,7 @@ impl RefWatermarkStore for RocksDbStore {
         #[cfg(feature = "rocksdb")]
         {
             // `ref_names` are expected to be sorted to preserve key ordering.
+            // Results mirror the input order with `None` for missing entries.
             let mut keys = Vec::with_capacity(ref_names.len());
             for name in ref_names {
                 keys.push(build_ref_wm_key(repo_id, &policy_hash, &start_set_id, name));

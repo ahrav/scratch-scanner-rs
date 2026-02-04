@@ -45,7 +45,7 @@ flowchart LR
 - Candidate ordering is deterministic and stable across spill boundaries.
 - Findings are deduped per blob and stored as `(start, end, rule_id, norm_hash)`.
 - No raw secret bytes are persisted; only hashes and metadata are stored.
-- Persistence is two-phase: write data ops first and write watermarks only for complete runs.
+- Persistence is atomic: data ops and (when complete) watermark ops are committed together.
 - Loose candidates are scanned via bounded loose-object decode; non-blob or
   missing loose objects are recorded as explicit skips.
 - Any decode skips or missing/corrupt loose objects result in `FinalizeOutcome::Partial`.
@@ -58,8 +58,9 @@ Finalize produces two batches:
 - `data_ops`: `bc\0` (blob_ctx), `fn\0` (finding), `sb\0` (seen_blob)
 - `watermark_ops`: `rw` (ref_watermark)
 
-Persist always writes `data_ops` first. If the run is partial, watermark ops
-are skipped to avoid advancing ref tips past unscanned blobs.
+Persist commits `data_ops` and (when complete) `watermark_ops` in a single
+atomic batch. If the run is partial, watermark ops are skipped to avoid
+advancing ref tips past unscanned blobs.
 
 ## Related Docs
 
