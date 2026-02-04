@@ -23,6 +23,7 @@ vectorscan-rs-sys = "0.0.5"
 sha2 = "0.10"
 blake3 = "1.5"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", optional = true }
 gix-commitgraph = "0.29"
 gix-hash = "0.19"
 flate2 = "1.0"
@@ -51,7 +52,7 @@ stats = []
 b64-stats = ["stats"]
 bench = []
 tiger-harness = []
-sim-harness = []
+sim-harness = ["serde_json"]
 kani = []  # Gate Kani model-checking proofs
 scheduler-affinity = ["core_affinity"]  # Thread pinning support for scheduler
 io-uring = []  # Enable io_uring scanner on Linux

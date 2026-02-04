@@ -6,7 +6,7 @@
 //!
 //! Run with:
 //!   cargo test --features scheduler-sim --test simulation  # scheduler only
-//!   cargo test --features sim-harness --test simulation    # scanner only
+//!   cargo test --features sim-harness --test simulation    # scanner + git
 //!   cargo test --features scheduler-sim,sim-harness --test simulation  # both
 
 #[cfg(feature = "scheduler-sim")]

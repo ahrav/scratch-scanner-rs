@@ -12,18 +12,21 @@
 //!
 //! Module layout:
 //! - `scenario`: schema for Git simulation inputs and run configuration.
+//! - `generator`: synthetic scenario generator for bounded random runs.
 //! - `runner`: deterministic runner and failure taxonomy.
 //! - `trace`: bounded trace ring and Git-specific events.
 //! - `artifact`: reproducible failure artifact schema.
 //! - `fault`: deterministic fault plan schema for Git resources.
+//! - `persist`: deterministic persistence store for simulation.
 //! - `replay`: load + replay artifacts.
-//! - `minimize`: deterministic shrink passes (placeholder in Phase 0).
+//! - `minimize`: deterministic shrink passes for reproduction minimization.
 
 pub mod artifact;
 pub mod commit_graph;
 pub mod convert;
 pub mod error;
 pub mod fault;
+pub mod generator;
 pub mod minimize;
 pub mod pack_bytes;
 pub mod pack_io;
@@ -42,6 +45,7 @@ pub use error::SimGitError;
 pub use fault::{
     GitCorruption, GitFaultInjector, GitFaultPlan, GitIoFault, GitReadFault, GitResourceId,
 };
+pub use generator::{generate_scenario, GitScenarioGenConfig};
 pub use minimize::{minimize_git_case, MinimizerCfg};
 pub use pack_bytes::SimPackBytes;
 pub use pack_io::SimPackIo;

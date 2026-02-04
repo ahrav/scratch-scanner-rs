@@ -57,7 +57,25 @@ Finalize produces two batches:
 Persist always writes `data_ops` first. If the run is partial, watermark ops
 are skipped to avoid advancing ref tips past unscanned blobs.
 
+## Simulation Harness
+
+The Git simulation harness exercises this pipeline deterministically using a
+semantic repo model and optional pack artifacts. It replays `.case.json`
+artifacts and supports bounded random runs.
+
+```bash
+# Replay Git simulation corpus
+cargo test --features sim-harness --test simulation git_scan_corpus
+
+# Run bounded random Git simulations
+cargo test --features sim-harness --test simulation git_scan_random
+```
+
+Corpus cases live in `tests/corpus/git_scan/*.case.json`. Replay failures emit
+artifacts to `tests/failures/` for triage and minimization.
+
 ## Related Docs
 
 - `docs/architecture-overview.md`
 - `docs/detection-engine.md`
+- `docs/git_simulation_harness_guide.md`

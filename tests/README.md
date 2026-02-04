@@ -69,10 +69,16 @@ Deterministic simulation harnesses for both scanner and scheduler testing.
 - Uses `tests/simulation/corpus/*.json` for regression tests
 - See `docs/scheduler_test_harness_guide.md` for full documentation
 
+**Git Simulation** (`sim-harness` feature):
+- Tests Git scan stage ordering, determinism, and fault injection
+- Uses `tests/corpus/git_scan/*.case.json` for regression tests
+- See `docs/git_simulation_harness_guide.md` for full documentation
+
 ### `corpus/`
 Regression test corpus organized by simulation type:
 - `corpus/scanner/` - Scanner simulation artifacts (`.case.json`)
 - `corpus/scheduler/` - Scheduler simulation artifacts (`.case.json`)
+- `corpus/git_scan/` - Git simulation artifacts (`.case.json`)
 
 ### `diagnostic/`
 Analysis and audit tools that are `#[ignore]` by default because they have special requirements (e.g., custom allocators) or produce verbose output. Run manually when investigating specific issues.

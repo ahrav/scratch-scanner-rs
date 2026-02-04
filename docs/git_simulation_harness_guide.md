@@ -103,6 +103,42 @@ cargo test --features sim-harness --test simulation git_scan_random
 cargo test --features sim-harness --test simulation git_scan_corpus
 ```
 
+Corpus cases live in `tests/corpus/git_scan/*.case.json`. Replay failures emit
+artifacts to `tests/failures/` for triage and minimization.
+
+Optional knobs for random runs:
+
+- `SIM_GIT_SCAN_DEEP=1` (larger scenarios)
+- `SIM_GIT_SCAN_SEED_START` / `SIM_GIT_SCAN_SEED_COUNT`
+- `SIM_GIT_SCENARIO_COMMITS`, `SIM_GIT_SCENARIO_REFS`, `SIM_GIT_SCENARIO_BLOBS_PER_TREE`
+- `SIM_GIT_RUN_WORKERS`, `SIM_GIT_RUN_MAX_STEPS`, `SIM_GIT_RUN_STABILITY_RUNS`,
+  `SIM_GIT_RUN_TRACE_CAP`
+
+## CI Expectations
+
+The Git simulation tests are included in the `sim-harness` suite. CI should
+run at least:
+
+```bash
+cargo test --features sim-harness --test simulation
+```
+
+Soak or nightly tiers can increase `SIM_GIT_SCAN_SEED_COUNT` or enable
+`SIM_GIT_SCAN_DEEP=1` for broader coverage.
+
+## Minimization
+
+The Git minimizer (`minimize_git_case`) applies conservative shrink passes:
+
+- Drop unused fault plan entries and trailing read faults.
+- Remove extra refs when failures reproduce with fewer start points.
+- Prune unreachable commits/trees/blobs outside the ref-reachable subgraph.
+- Drop optional artifact bundles when failures reproduce without pack bytes.
+
+Minimization is driven by a reproduction predicate; only candidates that still
+trigger the failure are retained. Use the replay harness to validate minimized
+cases before adding them to the corpus.
+
 ## Related Docs
 
 - `docs/architecture-overview.md`
