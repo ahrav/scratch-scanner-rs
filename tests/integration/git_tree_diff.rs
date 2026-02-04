@@ -7,9 +7,9 @@ use std::path::Path;
 use std::process::Command;
 
 use scanner_rs::git_scan::{
-    repo_open, CandidateBuffer, ChangeKind, ObjectStore, RefWatermarkStore, RepoArtifactStatus,
-    RepoOpenError, RepoOpenLimits, StartSetConfig, StartSetResolver, TreeDiffError, TreeDiffLimits,
-    TreeDiffWalker,
+    repo_open, CandidateBuffer, ChangeKind, MergeDiffMode, ObjectStore, RefWatermarkStore,
+    RepoArtifactStatus, RepoOpenError, RepoOpenLimits, StartSetConfig, StartSetResolver,
+    TreeDiffError, TreeDiffLimits, TreeDiffWalker,
 };
 use scanner_rs::git_scan::{OidBytes, RepoJobState};
 use tempfile::TempDir;
@@ -115,6 +115,38 @@ fn prepare_repo_with_commits() -> TempDir {
     tmp
 }
 
+fn prepare_repo_with_merge() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    run_git(tmp.path(), &["init", "-b", "main"]);
+    run_git(tmp.path(), &["config", "user.email", "test@example.com"]);
+    run_git(tmp.path(), &["config", "user.name", "Test User"]);
+
+    fs::write(tmp.path().join("a.txt"), "base\n").unwrap();
+    run_git(tmp.path(), &["add", "."]);
+    run_git(tmp.path(), &["commit", "-m", "base"]);
+
+    run_git(tmp.path(), &["checkout", "-b", "feature"]);
+    fs::write(tmp.path().join("feature.txt"), "feature\n").unwrap();
+    run_git(tmp.path(), &["add", "."]);
+    run_git(tmp.path(), &["commit", "-m", "feature"]);
+
+    run_git(tmp.path(), &["checkout", "main"]);
+    fs::write(tmp.path().join("a.txt"), "base\nmain\n").unwrap();
+    run_git(tmp.path(), &["add", "."]);
+    run_git(tmp.path(), &["commit", "-m", "main change"]);
+
+    run_git(
+        tmp.path(),
+        &["merge", "--no-ff", "feature", "-m", "merge feature"],
+    );
+
+    run_git(tmp.path(), &["commit-graph", "write", "--reachable"]);
+    run_git(tmp.path(), &["repack", "-ad"]);
+    run_git(tmp.path(), &["multi-pack-index", "write"]);
+
+    tmp
+}
+
 fn open_repo_state(repo: &Path) -> RepoJobState {
     let head = git_output(repo, &["rev-parse", "HEAD"]);
     let head_oid = oid_from_hex(&head);
@@ -137,6 +169,35 @@ fn open_repo_state(repo: &Path) -> RepoJobState {
 
     assert!(matches!(state.artifact_status, RepoArtifactStatus::Ready));
     state
+}
+
+fn diff_paths(
+    store: &mut ObjectStore,
+    limits: &TreeDiffLimits,
+    new_tree: &OidBytes,
+    old_tree: &OidBytes,
+    parent_idx: u8,
+) -> BTreeMap<String, ChangeKind> {
+    let mut walker = TreeDiffWalker::new(limits, store.oid_len());
+    let mut candidates = CandidateBuffer::new(limits, store.oid_len());
+
+    walker
+        .diff_trees(
+            store,
+            &mut candidates,
+            Some(new_tree),
+            Some(old_tree),
+            0,
+            parent_idx,
+        )
+        .unwrap();
+
+    let mut out = BTreeMap::new();
+    for cand in candidates.iter_resolved() {
+        let path = String::from_utf8_lossy(cand.path).into_owned();
+        out.insert(path, cand.change_kind);
+    }
+    out
 }
 
 #[test]
@@ -230,6 +291,60 @@ fn corrupt_tree_is_reported() {
     let result = walker.diff_trees(&mut store, &mut candidates, Some(&corrupt_oid), None, 0, 0);
 
     assert!(matches!(result, Err(TreeDiffError::CorruptTree { .. })));
+}
+
+#[test]
+fn merge_diff_modes_emit_expected_candidates() {
+    if !git_available() || !git_supports_midx() {
+        eprintln!("git or multi-pack-index not available; skipping merge diff test");
+        return;
+    }
+
+    let tmp = prepare_repo_with_merge();
+    let state = open_repo_state(tmp.path());
+
+    let merge_tree = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD^{tree}"]));
+    let parent1_tree = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD^1^{tree}"]));
+    let parent2_tree = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD^2^{tree}"]));
+
+    let limits = TreeDiffLimits::RESTRICTIVE;
+    let mut store = ObjectStore::open(&state, &limits).unwrap();
+
+    let first_parent = diff_paths(&mut store, &limits, &merge_tree, &parent1_tree, 0);
+    let second_parent = diff_paths(&mut store, &limits, &merge_tree, &parent2_tree, 1);
+
+    assert!(first_parent.contains_key("feature.txt"));
+    assert!(!first_parent.contains_key("a.txt"));
+    assert!(second_parent.contains_key("a.txt"));
+    assert!(!second_parent.contains_key("feature.txt"));
+
+    let all_parents =
+        collect_merge_candidates(MergeDiffMode::AllParents, &first_parent, &second_parent);
+    let first_only = collect_merge_candidates(
+        MergeDiffMode::FirstParentOnly,
+        &first_parent,
+        &second_parent,
+    );
+
+    assert!(all_parents.contains_key("feature.txt"));
+    assert!(all_parents.contains_key("a.txt"));
+    assert_eq!(first_only.len(), 1);
+    assert!(first_only.contains_key("feature.txt"));
+}
+
+fn collect_merge_candidates(
+    mode: MergeDiffMode,
+    first_parent: &BTreeMap<String, ChangeKind>,
+    second_parent: &BTreeMap<String, ChangeKind>,
+) -> BTreeMap<String, ChangeKind> {
+    match mode {
+        MergeDiffMode::AllParents => {
+            let mut out = first_parent.clone();
+            out.extend(second_parent.iter().map(|(k, v)| (k.clone(), *v)));
+            out
+        }
+        MergeDiffMode::FirstParentOnly => first_parent.clone(),
+    }
 }
 
 fn write_corrupt_tree(objects_dir: &Path, oid: &OidBytes) {
