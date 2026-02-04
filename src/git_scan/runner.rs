@@ -44,7 +44,7 @@ use super::midx_error::MidxError;
 use super::object_id::{ObjectFormat, OidBytes};
 use super::object_store::ObjectStore;
 use super::pack_cache::PackCache;
-use super::pack_candidates::CollectingPackCandidateSink;
+use super::pack_candidates::CappedPackCandidateSink;
 use super::pack_decode::PackDecodeLimits;
 use super::pack_exec::{execute_pack_plan, PackExecError, PackExecReport, SkipReason, SkipRecord};
 use super::pack_io::{PackIo, PackIoError, PackIoLimits};
@@ -526,7 +526,10 @@ pub fn run_git_scan(
     let midx = load_midx(&repo)?;
     let mut bridge = MappingBridge::new(
         &midx,
-        CollectingPackCandidateSink::default(),
+        CappedPackCandidateSink::new(
+            config.mapping.max_packed_candidates,
+            config.mapping.max_loose_candidates,
+        ),
         config.mapping,
     );
     let spill_stats = spiller.finalize(seen_store, &mut bridge)?;

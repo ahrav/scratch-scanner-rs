@@ -86,7 +86,7 @@ pub use engine_adapter::{
     ScannedBlob, DEFAULT_CHUNK_BYTES, DEFAULT_PATH_ARENA_BYTES,
 };
 pub use errors::PersistError;
-pub use errors::{CommitPlanError, RepoOpenError, SpillError, TreeDiffError};
+pub use errors::{CommitPlanError, MappingCandidateKind, RepoOpenError, SpillError, TreeDiffError};
 pub use finalize::{
     build_finalize_ops, FinalizeInput, FinalizeOutcome, FinalizeOutput, FinalizeStats, RefEntry,
     WriteOp,
@@ -98,7 +98,8 @@ pub use object_id::{ObjectFormat, OidBytes};
 pub use object_store::{ObjectStore, TreeSource};
 pub use pack_cache::{CachedObject, PackCache};
 pub use pack_candidates::{
-    CollectingPackCandidateSink, LooseCandidate, PackCandidate, PackCandidateSink,
+    CappedPackCandidateSink, CollectingPackCandidateSink, LooseCandidate, PackCandidate,
+    PackCandidateSink,
 };
 pub use pack_decode::{entry_header_at, inflate_entry_payload, PackDecodeError, PackDecodeLimits};
 pub use pack_delta::{apply_delta, DeltaError};

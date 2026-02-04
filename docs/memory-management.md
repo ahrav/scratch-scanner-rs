@@ -105,6 +105,18 @@ Seen filtering uses a per-batch arena capped by `SpillLimits.seen_batch_max_path
 and batches up to `SpillLimits.seen_batch_max_oids` OIDs before issuing a
 seen-store query. Batches are flushed on either limit to keep memory bounded.
 
+## Git Mapping Budgets
+
+The mapping bridge re-interns candidate paths into a long-lived arena and
+collects pack/loose candidates for downstream planning:
+
+- **Path arena**: bounded by `MappingBridgeConfig.path_arena_capacity`.
+- **Candidate caps**: `MappingBridgeConfig.max_packed_candidates` and
+  `MappingBridgeConfig.max_loose_candidates` bound the in-memory vectors.
+- **Failure mode**: exceeding either cap returns
+  `SpillError::MappingCandidateLimitExceeded` and aborts the run before
+  watermark advancement.
+
 ## Git Pack Planning Budgets
 
 Pack planning builds per-pack `PackPlan` buffers sized to the candidate set
@@ -119,6 +131,8 @@ and the delta-base closure:
   internal base offsets or external base OIDs).
 - Entry header cache: one cached `ParsedEntry` per offset in `need_offsets`
   during planning, bounded by the same worklist cap.
+- Base lookups: `PackPlanConfig.max_base_lookups` bounds REF delta
+  resolver calls to prevent unbounded MIDX lookups.
 - Exec order: optional `Vec<u32>` of indices into `need_offsets` when forward
   dependencies exist.
 - Clusters: ranges over `need_offsets` split when gaps exceed

@@ -5,6 +5,12 @@
 //! or emits it as a loose candidate. All emitted candidates reference the
 //! bridge-owned arena, so callers must keep it alive for downstream use.
 //!
+//! # Invariants
+//! - Input OIDs must be strictly increasing and duplicate-free.
+//! - Path references in emitted candidates are valid only while the bridge's
+//!   arena is alive.
+//! - Mapping stats must reconcile at `finish()`.
+//!
 //! This stage is typically driven by the spill/unique-blob output, which
 //! guarantees sorted OIDs.
 
@@ -26,12 +32,22 @@ pub struct MappingBridgeConfig {
     ///
     /// Default: 64 MiB.
     pub path_arena_capacity: u32,
+    /// Maximum packed candidates retained by the mapping sink.
+    ///
+    /// Default: 1,048,576 (1M).
+    pub max_packed_candidates: u32,
+    /// Maximum loose candidates retained by the mapping sink.
+    ///
+    /// Default: 1,048,576 (1M).
+    pub max_loose_candidates: u32,
 }
 
 impl Default for MappingBridgeConfig {
     fn default() -> Self {
         Self {
             path_arena_capacity: 64 * 1024 * 1024,
+            max_packed_candidates: 1_048_576,
+            max_loose_candidates: 1_048_576,
         }
     }
 }
@@ -126,6 +142,8 @@ impl<'midx, S: PackCandidateSink> MappingBridge<'midx, S> {
     }
 
     /// Re-interns a path from a source arena into the bridge arena.
+    ///
+    /// Empty paths are preserved as the zero `ByteRef` sentinel.
     fn intern_path(&mut self, paths: &ByteArena, path_ref: ByteRef) -> Result<ByteRef, SpillError> {
         let path = paths.get(path_ref);
         if path.is_empty() {

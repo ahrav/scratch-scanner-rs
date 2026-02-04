@@ -236,6 +236,24 @@ impl fmt::Display for TreeDiffError {
 
 impl std::error::Error for TreeDiffError {}
 
+/// Mapping candidate kind for cap enforcement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MappingCandidateKind {
+    /// Candidate mapped to a pack offset.
+    Packed,
+    /// Candidate that must be loaded from loose objects.
+    Loose,
+}
+
+impl fmt::Display for MappingCandidateKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Packed => write!(f, "packed"),
+            Self::Loose => write!(f, "loose"),
+        }
+    }
+}
+
 /// Errors from spill and dedupe.
 ///
 /// These errors occur after candidate extraction, when spilling and
@@ -265,6 +283,15 @@ pub enum SpillError {
     ArenaOverflow,
     /// Path exceeds length limit.
     PathTooLong { len: usize, max: usize },
+    /// Mapping candidate cap exceeded.
+    MappingCandidateLimitExceeded {
+        /// Candidate kind that exceeded the cap.
+        kind: MappingCandidateKind,
+        /// Configured maximum.
+        max: u32,
+        /// Observed count when the cap was exceeded.
+        observed: u32,
+    },
 }
 
 impl fmt::Display for SpillError {
@@ -298,6 +325,16 @@ impl fmt::Display for SpillError {
             Self::ArenaOverflow => write!(f, "arena overflow"),
             Self::PathTooLong { len, max } => {
                 write!(f, "path too long: {len} bytes (max: {max})")
+            }
+            Self::MappingCandidateLimitExceeded {
+                kind,
+                max,
+                observed,
+            } => {
+                write!(
+                    f,
+                    "mapping candidate cap exceeded for {kind}: saw {observed} (max: {max})"
+                )
             }
         }
     }
