@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use memmap2::{Mmap, MmapMut};
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 
 /// Reference to a spilled payload within the arena.
@@ -216,6 +216,8 @@ fn advise_sequential(file: &File, reader: &Mmap) {
     unsafe {
         #[cfg(target_os = "linux")]
         let _ = libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+        #[cfg(not(target_os = "linux"))]
+        let _ = file;
         let _ = libc::madvise(
             reader.as_ptr() as *mut libc::c_void,
             reader.len(),
