@@ -21,8 +21,9 @@ use super::vectorscan_prefilter::{
     gate_match_callback, stream_match_callback, VsStreamMatchCtx, VsStreamWindow,
 };
 use crate::api::{
-    AnchorPolicy, DecodeStep, EntropySpec, FileId, Finding, FindingRec, Gate, RuleSpec,
-    TransformConfig, TransformId, TransformMode, Tuning, Utf16Endianness, ValidatorKind, STEP_ROOT,
+    AnchorPolicy, DecodeStep, EntropySpec, FileId, Finding, FindingRec, Gate, LocalContextSpec,
+    RuleSpec, TransformConfig, TransformId, TransformMode, Tuning, Utf16Endianness, ValidatorKind,
+    STEP_ROOT,
 };
 use crate::demo::{demo_engine, demo_rules, demo_tuning};
 use crate::regex2anchor::{compile_trigger_plan, AnchorDeriveConfig, TriggerPlan};
@@ -228,6 +229,65 @@ fn norm_hash_uses_decoded_bytes_for_base64_transform() {
     assert_eq!(hashes.len(), 1);
     let expected = *blake3::hash(b"ABCD").as_bytes();
     assert_eq!(hashes[0], expected);
+}
+
+#[test]
+fn local_context_gate_applies_in_base64_stream_decode() {
+    let rule = RuleSpec {
+        name: "b64-local-context",
+        anchors: &[b"SECRET_"],
+        radius: 24,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        local_context: Some(LocalContextSpec {
+            lookbehind: 64,
+            lookahead: 64,
+            require_same_line_assignment: false,
+            require_quoted: true,
+            key_names_any: None,
+        }),
+        secret_group: Some(0),
+        re: Regex::new(r"SECRET_[A-Z]{4}").unwrap(),
+    };
+    let transforms = vec![TransformConfig {
+        id: TransformId::Base64,
+        mode: TransformMode::Always,
+        gate: Gate::AnchorsInDecoded,
+        min_len: 8,
+        max_spans_per_buffer: 8,
+        max_encoded_len: 1024,
+        max_decoded_bytes: 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    }];
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        transforms,
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let good_plain = b"key=\"SECRET_ABCD\"";
+    let good_b64 = b64_encode(good_plain);
+    let hay = format!("prefix {good_b64} suffix");
+    let hits = scan_chunk_findings(&engine, hay.as_bytes());
+    assert!(
+        hits.iter().any(|h| h.rule == "b64-local-context"),
+        "expected finding with quoted secret in decoded stream"
+    );
+
+    let bad_plain = b"key=SECRET_ABCD";
+    let bad_b64 = b64_encode(bad_plain);
+    let hay = format!("prefix {bad_b64} suffix");
+    let hits = scan_chunk_findings(&engine, hay.as_bytes());
+    assert!(
+        !hits.iter().any(|h| h.rule == "b64-local-context"),
+        "expected local context gate to filter unquoted decoded secret"
+    );
 }
 
 // Helper that uses the allocation-free scan API and materializes findings.
@@ -976,6 +1036,56 @@ fn secret_extraction_utf16le_path() {
         hit.span.len(),
         8,
         "span should be capture group 1 length (Secret12)"
+    );
+}
+
+#[test]
+fn local_context_gate_applies_in_utf16_path() {
+    const ANCHORS: &[&[u8]] = &[b"UTF_"];
+    let rule = RuleSpec {
+        name: "utf16-local-context",
+        anchors: ANCHORS,
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        local_context: Some(LocalContextSpec {
+            lookbehind: 64,
+            lookahead: 64,
+            require_same_line_assignment: false,
+            require_quoted: true,
+            key_names_any: None,
+        }),
+        secret_group: Some(0),
+        re: Regex::new(r"UTF_[A-Za-z0-9]{8}").unwrap(),
+    };
+
+    let mut tuning = demo_tuning();
+    tuning.scan_utf16_variants = true;
+
+    let eng =
+        Engine::new_with_anchor_policy(vec![rule], Vec::new(), tuning, AnchorPolicy::ManualOnly);
+
+    let good_plain = b"UTF_Secret12";
+    let mut good = Vec::with_capacity(good_plain.len() + 2);
+    good.push(b'"');
+    good.extend_from_slice(good_plain);
+    good.push(b'"');
+    let utf16 = utf16le_bytes(&good);
+    let hits = scan_chunk_findings(&eng, &utf16);
+    assert!(
+        hits.iter().any(|h| h.rule == "utf16-local-context"),
+        "expected quoted UTF-16 match to pass local context gate"
+    );
+
+    let bad_plain = b"UTF_Secret12";
+    let utf16 = utf16le_bytes(bad_plain);
+    let hits = scan_chunk_findings(&eng, &utf16);
+    assert!(
+        !hits.iter().any(|h| h.rule == "utf16-local-context"),
+        "expected unquoted UTF-16 match to be filtered by local context gate"
     );
 }
 

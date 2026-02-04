@@ -200,6 +200,7 @@ assignment separators, quoting, or key-name hints. These checks are:
 - **Fail-open**: when line boundaries are not found inside the lookaround range
 
 Local context gates are rule-selective and opt-in via rule config.
+They apply uniformly in raw, UTF-16, and stream-decoded validation paths.
 
 ---
 
