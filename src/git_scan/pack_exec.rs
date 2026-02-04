@@ -4,19 +4,45 @@
 //! and emits decoded blob bytes to a caller-provided sink. All skips are
 //! recorded with explicit reasons.
 //!
+//! # Execution model
+//! - Offsets are decoded at most once and may be cached for reuse.
+//! - `inflate_buf` and `result_buf` are reused across offsets to avoid
+//!   repeated allocations on the hot path.
+//! - When the allocation guard is enabled, per-offset decoding and sink
+//!   emission must not allocate.
+//!
 //! Execution order is driven by `PackPlan.exec_order`: when absent, offsets
 //! are processed in ascending order and candidate gating uses a single
 //! forward-only merge cursor over `candidate_offsets`. When present, the
 //! executor precomputes exact per-offset candidate ranges to preserve
 //! gating under out-of-order execution.
 //!
+//! # Invariants
+//! - `plan.need_offsets` and `plan.candidate_offsets` are sorted by pack offset.
+//! - `exec_order`, when present, is a permutation of `need_offsets` indices.
+//! - The sink must not retain `bytes` slices beyond `emit` calls.
+//! - Skip records are appended in execution order.
+//!
 //! The executor treats decode failures as per-offset skips and only returns
-//! fatal errors for pack parsing, sink failures, or external base loading
-//! errors.
+//! fatal errors for pack parsing or sink failures. External base provider
+//! errors are recorded as skips for the affected offsets.
+//!
+//! # Plan assumptions
+//! - `need_offsets` is sorted ascending.
+//! - `candidate_offsets` is sorted ascending by offset and grouped per offset.
+//! - `exec_order`, when present, indexes into `need_offsets`.
+//!
+//! # Buffer ownership
+//! - `PackCache` stores decoded bytes when space permits.
+//! - Otherwise, bytes live in a scratch buffer that is overwritten per offset.
+//! - Sinks must consume `bytes` within the `emit` call.
 
 use std::collections::HashMap;
 use std::fmt;
 
+use crate::scheduler::AllocGuard;
+
+use super::alloc_guard;
 use super::byte_arena::ByteArena;
 use super::object_id::OidBytes;
 use super::pack_cache::PackCache;
@@ -27,6 +53,8 @@ use super::pack_decode::{
 use super::pack_delta::apply_delta;
 use super::pack_inflate::{DeltaError, EntryKind, ObjectKind, PackFile, PackParseError};
 use super::pack_plan_model::{BaseLoc, DeltaDep, PackPlan};
+use super::pack_reader::PackReader;
+use super::perf;
 
 /// External base object for REF deltas.
 ///
@@ -44,7 +72,8 @@ pub struct ExternalBase {
 pub trait ExternalBaseProvider {
     /// Returns the base object for a given OID, or `None` if missing.
     ///
-    /// Any error is treated as fatal for the entire pack execution.
+    /// Any error is recorded as `SkipReason::ExternalBaseError` for the
+    /// affected offset; execution continues.
     fn load_base(&mut self, oid: &OidBytes) -> Result<Option<ExternalBase>, PackExecError>;
 }
 
@@ -56,7 +85,12 @@ pub trait PackObjectSink {
     /// Receives a decoded blob candidate.
     ///
     /// The `bytes` slice is only valid for the duration of the call and may
-    /// be backed by either a cache entry or a scratch buffer.
+    /// be backed by either a cache entry or a scratch buffer. Implementations
+    /// must copy if they need to retain the bytes.
+    /// `path` points into the caller-owned arena.
+    ///
+    /// When the allocation guard is enabled, `emit` must avoid heap
+    /// allocation to preserve hot-path guarantees.
     fn emit(
         &mut self,
         candidate: &PackCandidate,
@@ -76,6 +110,7 @@ pub trait PackObjectSink {
 #[derive(Debug)]
 pub enum PackExecError {
     PackParse(PackParseError),
+    PackRead(String),
     Sink(String),
     ExternalBase(String),
 }
@@ -84,6 +119,7 @@ impl fmt::Display for PackExecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::PackParse(err) => write!(f, "{err}"),
+            Self::PackRead(msg) => write!(f, "pack read error: {msg}"),
             Self::Sink(msg) => write!(f, "sink error: {msg}"),
             Self::ExternalBase(msg) => write!(f, "external base error: {msg}"),
         }
@@ -110,12 +146,19 @@ impl From<PackParseError> for PackExecError {
 /// These are non-fatal and recorded in the execution report.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SkipReason {
+    /// Pack parsing failed for this offset.
     PackParse(PackParseError),
+    /// Inflating or decoding this entry failed.
     Decode(PackDecodeError),
+    /// Delta application failed after a successful decode.
     Delta(DeltaError),
+    /// An OFS/REF delta base was expected in-pack but missing from cache.
     BaseMissing { base_offset: u64 },
+    /// External base provider returned `None` for a REF delta.
     ExternalBaseMissing { oid: OidBytes },
+    /// External base provider returned an error.
     ExternalBaseError,
+    /// Entry decoded successfully but is not a blob.
     NotBlob,
 }
 
@@ -132,11 +175,11 @@ pub struct SkipRecord {
 /// Execution statistics.
 #[derive(Debug, Default)]
 pub struct PackExecStats {
-    /// Offsets successfully decoded (including bases).
+    /// Offsets successfully decoded (including bases and non-blob kinds).
     pub decoded_offsets: u32,
     /// Candidates emitted to the sink.
     pub emitted_candidates: u32,
-    /// Offsets skipped for any reason.
+    /// Skip records emitted (may exceed unique offsets).
     pub skipped_offsets: u32,
     /// Cache hits on pack offsets.
     pub cache_hits: u32,
@@ -149,14 +192,18 @@ pub struct PackExecStats {
 /// Pack execution report.
 #[derive(Debug, Default)]
 pub struct PackExecReport {
+    /// Aggregate stats for this pack execution.
     pub stats: PackExecStats,
+    /// Per-offset skip records (may include repeated offsets), in execution order.
     pub skips: Vec<SkipRecord>,
 }
 
 /// Where the decoded bytes live after `decode_offset`.
 #[derive(Clone, Copy, Debug)]
 enum DecodedStorage {
+    /// Bytes are stored in the `PackCache`.
     Cache,
+    /// Bytes are stored in the scratch buffer passed to the decoder.
     Scratch,
 }
 
@@ -167,17 +214,43 @@ struct DecodedObject {
     storage: DecodedStorage,
 }
 
+/// Executes a pack plan against a `PackReader`.
+///
+/// The reader is used to materialize a contiguous pack byte buffer. This
+/// enables deterministic fault injection for simulation without changing
+/// the core decode logic.
+///
+/// Note: this reads the entire pack into memory; very large packs may exceed
+/// addressable memory on 32-bit platforms.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_pack_plan_with_reader<S: PackObjectSink, B: ExternalBaseProvider, R: PackReader>(
+    plan: &PackPlan,
+    reader: &mut R,
+    paths: &ByteArena,
+    limits: &PackDecodeLimits,
+    cache: &mut PackCache,
+    external: &mut B,
+    sink: &mut S,
+) -> Result<PackExecReport, PackExecError> {
+    let mut pack_bytes = Vec::new();
+    read_pack_bytes(reader, &mut pack_bytes)?;
+    execute_pack_plan(plan, &pack_bytes, paths, limits, cache, external, sink)
+}
+
 /// Executes a pack plan against pack bytes.
 ///
 /// The plan's `exec_order` is respected when present to satisfy forward
 /// delta dependencies. Pack bytes must contain the full pack file.
 ///
+/// `paths` must contain all path refs referenced by plan candidates.
+/// `cache` is updated with decoded objects when capacity allows.
+///
 /// The returned report includes both successful decode stats and per-offset
-/// skip reasons for non-fatal failures.
+/// skip reasons for non-fatal failures (decode errors, missing bases, and
+/// external base provider errors).
 ///
 /// # Errors
 /// - `PackExecError::PackParse` for invalid pack headers.
-/// - `PackExecError::ExternalBase` for external base loader failures.
 /// - `PackExecError::Sink` for sink failures.
 #[allow(clippy::too_many_arguments)]
 pub fn execute_pack_plan<S: PackObjectSink, B: ExternalBaseProvider>(
@@ -191,6 +264,11 @@ pub fn execute_pack_plan<S: PackObjectSink, B: ExternalBaseProvider>(
 ) -> Result<PackExecReport, PackExecError> {
     let pack = PackFile::parse(pack_bytes, plan.oid_len as usize)?;
     let mut report = PackExecReport::default();
+    report
+        .skips
+        .reserve(plan.candidate_offsets.len().min(u32::MAX as usize));
+
+    let alloc_guard_enabled = alloc_guard::enabled();
 
     let mut delta_map: HashMap<u64, DeltaDep> = HashMap::with_capacity(plan.delta_deps.len());
     for dep in &plan.delta_deps {
@@ -201,16 +279,23 @@ pub fn execute_pack_plan<S: PackObjectSink, B: ExternalBaseProvider>(
     let mut result_buf: Vec<u8> = Vec::with_capacity(limits.max_object_bytes.max(1024));
 
     let mut handle_idx = |idx: usize, range: Option<(usize, usize)>| -> Result<(), PackExecError> {
+        let guard = if alloc_guard_enabled {
+            Some(AllocGuard::new())
+        } else {
+            None
+        };
         let offset = plan.need_offsets[idx];
 
         let decoded = if cache.get(offset).is_some() {
             report.stats.cache_hits += 1;
+            perf::record_cache_hit();
             Some(DecodedObject {
                 kind: cache.get(offset).expect("cache hit").kind,
                 storage: DecodedStorage::Cache,
             })
         } else {
             report.stats.cache_misses += 1;
+            perf::record_cache_miss();
             decode_offset(
                 &pack,
                 offset,
@@ -237,6 +322,7 @@ pub fn execute_pack_plan<S: PackObjectSink, B: ExternalBaseProvider>(
         };
 
         if let Some((start, end)) = range {
+            // Candidate range is precomputed (out-of-order) or merged (monotone).
             for cand_idx in start..end {
                 let candidate =
                     &plan.candidates[plan.candidate_offsets[cand_idx].cand_idx as usize];
@@ -252,6 +338,10 @@ pub fn execute_pack_plan<S: PackObjectSink, B: ExternalBaseProvider>(
                 sink.emit(candidate, path, bytes)?;
                 report.stats.emitted_candidates += 1;
             }
+        }
+
+        if let Some(guard) = guard {
+            guard.assert_no_alloc();
         }
 
         Ok(())
@@ -289,11 +379,31 @@ pub fn execute_pack_plan<S: PackObjectSink, B: ExternalBaseProvider>(
     Ok(report)
 }
 
+/// Read the entire pack into `out`, returning a fatal error on short reads.
+fn read_pack_bytes<R: PackReader>(reader: &mut R, out: &mut Vec<u8>) -> Result<(), PackExecError> {
+    let len_u64 = reader.len();
+    let len = usize::try_from(len_u64).map_err(|_| {
+        PackExecError::PackRead(format!("pack length {len_u64} exceeds addressable memory"))
+    })?;
+    out.clear();
+    out.resize(len, 0);
+    if len == 0 {
+        return Ok(());
+    }
+    reader
+        .read_exact_at(0, out)
+        .map_err(|err| PackExecError::PackRead(err.to_string()))
+}
+
 /// Build candidate index ranges for each `need_offsets` entry.
 ///
 /// This is used only when `exec_order` reorders offsets; it avoids repeated
-/// scans of the candidate list.
+/// scans of the candidate list by leveraging sorted candidate offsets.
+///
+/// Assumes `candidate_offsets` is sorted ascending by offset.
 fn build_candidate_ranges(plan: &PackPlan) -> Vec<Option<(usize, usize)>> {
+    // Single pass over sorted offsets; each need offset maps to a contiguous
+    // range in `candidate_offsets` (if any).
     let mut ranges = vec![None; plan.need_offsets.len()];
     let mut cand_idx = 0usize;
     for (need_idx, &offset) in plan.need_offsets.iter().enumerate() {
@@ -312,9 +422,10 @@ fn build_candidate_ranges(plan: &PackPlan) -> Vec<Option<(usize, usize)>> {
 
 /// Decodes a single offset, using the cache for bases and for storing results.
 ///
-/// Returns `Ok(None)` for non-fatal decode issues, with the skip recorded in
-/// the report. Successful decodes return metadata describing where the bytes
-/// reside (cache vs scratch).
+/// Returns `Ok(None)` for non-fatal issues (decode errors, missing bases, or
+/// external base provider errors), with the skip recorded in the report.
+/// Successful decodes return metadata describing where the bytes reside
+/// (cache vs scratch).
 #[allow(clippy::too_many_arguments)]
 fn decode_offset<'a, B: ExternalBaseProvider>(
     pack: &'a PackFile<'a>,
@@ -345,7 +456,9 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
             if result_buf.capacity() < header.size as usize {
                 result_buf.reserve(header.size as usize - result_buf.capacity());
             }
-            if let Err(err) = inflate_entry_payload(pack, &header, result_buf, limits) {
+            let (inflate_res, nanos) =
+                perf::time(|| inflate_entry_payload(pack, &header, result_buf, limits));
+            if let Err(err) = inflate_res {
                 report.skips.push(SkipRecord {
                     offset,
                     reason: SkipReason::Decode(err),
@@ -353,6 +466,7 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                 report.stats.skipped_offsets += 1;
                 return Ok(None);
             }
+            perf::record_pack_inflate(result_buf.len(), nanos);
             report.stats.decoded_offsets += 1;
 
             if cache.insert(offset, kind, result_buf) {
@@ -361,6 +475,7 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                     storage: DecodedStorage::Cache,
                 }))
             } else {
+                // Cache refused the insert; bytes remain in `result_buf`.
                 Ok(Some(DecodedObject {
                     kind,
                     storage: DecodedStorage::Scratch,
@@ -387,14 +502,23 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                     header,
                     base.bytes,
                     limits,
-                    report,
                     inflate_buf,
                     result_buf,
                 ) {
-                    report.skips.push(SkipRecord {
-                        offset,
-                        reason: SkipReason::Delta(err),
-                    });
+                    match err {
+                        DeltaDecodeError::Decode(err) => {
+                            report.skips.push(SkipRecord {
+                                offset,
+                                reason: SkipReason::Decode(err),
+                            });
+                        }
+                        DeltaDecodeError::Delta(err) => {
+                            report.skips.push(SkipRecord {
+                                offset,
+                                reason: SkipReason::Delta(err),
+                            });
+                        }
+                    }
                     report.stats.skipped_offsets += 1;
                     return Ok(None);
                 }
@@ -408,6 +532,7 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                     storage: DecodedStorage::Cache,
                 }))
             } else {
+                // Cache refused the insert; bytes remain in `result_buf`.
                 Ok(Some(DecodedObject {
                     kind: base_kind,
                     storage: DecodedStorage::Scratch,
@@ -436,14 +561,23 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                             header,
                             base.bytes,
                             limits,
-                            report,
                             inflate_buf,
                             result_buf,
                         ) {
-                            report.skips.push(SkipRecord {
-                                offset,
-                                reason: SkipReason::Delta(err),
-                            });
+                            match err {
+                                DeltaDecodeError::Decode(err) => {
+                                    report.skips.push(SkipRecord {
+                                        offset,
+                                        reason: SkipReason::Decode(err),
+                                    });
+                                }
+                                DeltaDecodeError::Delta(err) => {
+                                    report.skips.push(SkipRecord {
+                                        offset,
+                                        reason: SkipReason::Delta(err),
+                                    });
+                                }
+                            }
                             report.stats.skipped_offsets += 1;
                             return Ok(None);
                         }
@@ -474,14 +608,23 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                                 header,
                                 &base.bytes,
                                 limits,
-                                report,
                                 inflate_buf,
                                 result_buf,
                             ) {
-                                report.skips.push(SkipRecord {
-                                    offset,
-                                    reason: SkipReason::Delta(err),
-                                });
+                                match err {
+                                    DeltaDecodeError::Decode(err) => {
+                                        report.skips.push(SkipRecord {
+                                            offset,
+                                            reason: SkipReason::Decode(err),
+                                        });
+                                    }
+                                    DeltaDecodeError::Delta(err) => {
+                                        report.skips.push(SkipRecord {
+                                            offset,
+                                            reason: SkipReason::Delta(err),
+                                        });
+                                    }
+                                }
                                 report.stats.skipped_offsets += 1;
                                 return Ok(None);
                             }
@@ -493,6 +636,7 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                                     storage: DecodedStorage::Cache,
                                 }))
                             } else {
+                                // Cache refused the insert; bytes remain in `result_buf`.
                                 Ok(Some(DecodedObject {
                                     kind: base.kind,
                                     storage: DecodedStorage::Scratch,
@@ -524,46 +668,56 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
 
 /// Inflates a delta payload and applies it to the provided base.
 ///
-/// Decode errors are tracked as skips in the report; delta application
-/// errors are returned to the caller as `DeltaError`.
+/// Decode errors are returned to the caller for skip tracking; delta
+/// application errors surface as `DeltaError`.
 #[allow(clippy::too_many_arguments)]
 fn decode_delta_entry(
     pack: &PackFile<'_>,
-    offset: u64,
+    _offset: u64,
     header: super::pack_inflate::EntryHeader,
     base_bytes: &[u8],
     limits: &PackDecodeLimits,
-    report: &mut PackExecReport,
     inflate_buf: &mut Vec<u8>,
     result_buf: &mut Vec<u8>,
-) -> Result<(), DeltaError> {
+) -> Result<(), DeltaDecodeError> {
     inflate_buf.clear();
     if inflate_buf.capacity() < limits.max_delta_bytes {
         inflate_buf.reserve(limits.max_delta_bytes - inflate_buf.capacity());
     }
-    if let Err(err) = inflate_entry_payload(pack, &header, inflate_buf, limits) {
-        report.skips.push(SkipRecord {
-            offset,
-            reason: SkipReason::Decode(err),
-        });
-        report.stats.skipped_offsets += 1;
-        return Ok(());
+    let (inflate_res, inflate_nanos) =
+        perf::time(|| inflate_entry_payload(pack, &header, inflate_buf, limits));
+    if let Err(err) = inflate_res {
+        return Err(DeltaDecodeError::Decode(err));
     }
+    perf::record_pack_inflate(inflate_buf.len(), inflate_nanos);
 
     result_buf.clear();
     if result_buf.capacity() < header.size as usize {
         result_buf.reserve(header.size as usize - result_buf.capacity());
     }
 
-    apply_delta(
-        base_bytes,
-        inflate_buf,
-        result_buf,
-        header.size as usize,
-        limits.max_object_bytes,
-    )?;
+    let (apply_res, apply_nanos) = perf::time(|| {
+        apply_delta(
+            base_bytes,
+            inflate_buf,
+            result_buf,
+            header.size as usize,
+            limits.max_object_bytes,
+        )
+    });
+    match apply_res {
+        Ok(()) => {
+            perf::record_delta_apply(result_buf.len(), apply_nanos);
+            Ok(())
+        }
+        Err(err) => Err(DeltaDecodeError::Delta(err)),
+    }
+}
 
-    Ok(())
+#[derive(Debug)]
+enum DeltaDecodeError {
+    Decode(PackDecodeError),
+    Delta(DeltaError),
 }
 
 /// Returns the best OID to query for external bases.
@@ -584,10 +738,11 @@ fn oid_or_base(base_oid: OidBytes, dep: Option<&DeltaDep>) -> OidBytes {
 mod tests {
     use super::*;
     use crate::git_scan::byte_arena::{ByteArena, ByteRef};
-    use crate::git_scan::pack_plan_model::{CandidateAtOffset, PackPlanStats};
+    use crate::git_scan::pack_plan_model::{CandidateAtOffset, DeltaKind, PackPlanStats};
     use crate::git_scan::tree_candidate::{CandidateContext, ChangeKind};
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
+    use std::collections::HashMap;
     use std::io::Write;
 
     #[derive(Default)]
@@ -603,6 +758,23 @@ mod tests {
             _bytes: &[u8],
         ) -> Result<(), PackExecError> {
             self.emitted.push(candidate.oid);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct CollectingSink {
+        blobs: HashMap<OidBytes, Vec<u8>>,
+    }
+
+    impl PackObjectSink for CollectingSink {
+        fn emit(
+            &mut self,
+            candidate: &PackCandidate,
+            _path: &[u8],
+            bytes: &[u8],
+        ) -> Result<(), PackExecError> {
+            self.blobs.insert(candidate.oid, bytes.to_vec());
             Ok(())
         }
     }
@@ -634,6 +806,14 @@ mod tests {
             ObjectKind::Blob => 3u8,
             ObjectKind::Tag => 4u8,
         };
+        encode_header_bytes(obj_type, size)
+    }
+
+    fn encode_delta_header(obj_type: u8, size: usize) -> Vec<u8> {
+        encode_header_bytes(obj_type, size)
+    }
+
+    fn encode_header_bytes(obj_type: u8, size: usize) -> Vec<u8> {
         let mut out = Vec::new();
         let mut remaining = size as u64;
         let mut first = ((obj_type & 0x07) << 4) | ((remaining & 0x0f) as u8);
@@ -651,6 +831,52 @@ mod tests {
             out.push(byte);
         }
         out
+    }
+
+    fn encode_ofs_distance(mut dist: u64) -> Vec<u8> {
+        assert!(dist > 0);
+        let mut bytes = Vec::new();
+        bytes.push((dist & 0x7f) as u8);
+        dist >>= 7;
+        while dist > 0 {
+            dist -= 1;
+            bytes.push(((dist & 0x7f) as u8) | 0x80);
+            dist >>= 7;
+        }
+        bytes.reverse();
+        bytes
+    }
+
+    fn encode_varint(mut value: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+        out
+    }
+
+    fn build_insert_delta(result: &[u8], base_len: usize) -> Vec<u8> {
+        let mut delta = Vec::new();
+        delta.extend_from_slice(&encode_varint(base_len as u64));
+        delta.extend_from_slice(&encode_varint(result.len() as u64));
+
+        let mut remaining = result;
+        while !remaining.is_empty() {
+            let chunk = remaining.len().min(0x7f);
+            delta.push(chunk as u8);
+            delta.extend_from_slice(&remaining[..chunk]);
+            remaining = &remaining[chunk..];
+        }
+
+        delta
     }
 
     fn compress(data: &[u8]) -> Vec<u8> {
@@ -915,5 +1141,481 @@ mod tests {
             sink.emitted,
             vec![OidBytes::sha1([0x22; 20]), OidBytes::sha1([0x11; 20])]
         );
+    }
+
+    #[test]
+    fn delta_inflate_error_skips_without_emitting() {
+        let base_bytes = b"BASE";
+
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&2u32.to_be_bytes());
+
+        let base_offset = pack.len() as u64;
+        pack.extend_from_slice(&encode_entry_header(ObjectKind::Blob, base_bytes.len()));
+        pack.extend_from_slice(&compress(base_bytes));
+
+        let delta_offset = pack.len() as u64;
+        let mut delta_entry = encode_delta_header(6, 4);
+        delta_entry.extend_from_slice(&encode_ofs_distance(delta_offset - base_offset));
+        delta_entry.extend_from_slice(&[0x78]); // truncated zlib stream
+        pack.extend_from_slice(&delta_entry);
+        pack.extend_from_slice(&[0u8; 20]);
+
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"file.txt").unwrap();
+        let candidate = PackCandidate {
+            oid: OidBytes::sha1([0x44; 20]),
+            ctx: ctx(path_ref),
+            pack_id: 0,
+            offset: delta_offset,
+        };
+
+        let plan = PackPlan {
+            pack_id: 0,
+            oid_len: 20,
+            candidates: vec![candidate],
+            candidate_offsets: vec![CandidateAtOffset {
+                offset: delta_offset,
+                cand_idx: 0,
+            }],
+            need_offsets: vec![base_offset, delta_offset],
+            delta_deps: vec![DeltaDep {
+                offset: delta_offset,
+                kind: DeltaKind::Ofs,
+                base: BaseLoc::Offset(base_offset),
+            }],
+            exec_order: None,
+            clusters: Vec::new(),
+            stats: PackPlanStats {
+                candidate_count: 1,
+                need_count: 2,
+                external_bases: 0,
+                forward_deps: 0,
+                candidate_span: delta_offset - base_offset,
+            },
+        };
+
+        let mut cache = PackCache::new(64 * 1024);
+        let mut external = NoExternal;
+        let mut sink = TestSink::default();
+
+        let report = execute_pack_plan(
+            &plan,
+            &pack,
+            &arena,
+            &PackDecodeLimits::new(64, 1024, 1024),
+            &mut cache,
+            &mut external,
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(report.stats.emitted_candidates, 0);
+        assert!(report.skips.iter().any(|skip| {
+            matches!(skip.reason, SkipReason::Decode(PackDecodeError::Inflate(_)))
+        }));
+        assert!(cache.get(delta_offset).is_none());
+    }
+
+    #[test]
+    fn ofs_delta_chain_decodes_within_limit() {
+        let base_bytes = b"";
+        let result_bytes = b"TOK_ABCDEFGH";
+        let delta_payload = build_insert_delta(result_bytes, base_bytes.len());
+
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&2u32.to_be_bytes());
+
+        let base_offset = pack.len() as u64;
+        pack.extend_from_slice(&encode_entry_header(ObjectKind::Blob, base_bytes.len()));
+        pack.extend_from_slice(&compress(base_bytes));
+
+        let delta_offset = pack.len() as u64;
+        let mut delta_entry = encode_delta_header(6, result_bytes.len());
+        delta_entry.extend_from_slice(&encode_ofs_distance(delta_offset - base_offset));
+        delta_entry.extend_from_slice(&compress(&delta_payload));
+        pack.extend_from_slice(&delta_entry);
+        pack.extend_from_slice(&[0u8; 20]);
+
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"file.txt").unwrap();
+        let candidate = PackCandidate {
+            oid: OidBytes::sha1([0x55; 20]),
+            ctx: ctx(path_ref),
+            pack_id: 0,
+            offset: delta_offset,
+        };
+
+        let plan = PackPlan {
+            pack_id: 0,
+            oid_len: 20,
+            candidates: vec![candidate],
+            candidate_offsets: vec![CandidateAtOffset {
+                offset: delta_offset,
+                cand_idx: 0,
+            }],
+            need_offsets: vec![base_offset, delta_offset],
+            delta_deps: vec![DeltaDep {
+                offset: delta_offset,
+                kind: DeltaKind::Ofs,
+                base: BaseLoc::Offset(base_offset),
+            }],
+            exec_order: None,
+            clusters: Vec::new(),
+            stats: PackPlanStats {
+                candidate_count: 1,
+                need_count: 2,
+                external_bases: 0,
+                forward_deps: 0,
+                candidate_span: delta_offset - base_offset,
+            },
+        };
+
+        let mut cache = PackCache::new(64 * 1024);
+        let mut external = NoExternal;
+        let mut sink = CollectingSink::default();
+
+        let report = execute_pack_plan(
+            &plan,
+            &pack,
+            &arena,
+            &PackDecodeLimits::new(64, 1024, 1024),
+            &mut cache,
+            &mut external,
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(report.stats.emitted_candidates, 1);
+        assert_eq!(
+            sink.blobs.get(&candidate.oid).map(|b| b.as_slice()),
+            Some(result_bytes.as_slice())
+        );
+    }
+
+    #[test]
+    fn ref_delta_external_base_decodes_within_limit() {
+        let base_bytes = b"";
+        let result_bytes = b"TOK_QWERTY12";
+        let delta_payload = build_insert_delta(result_bytes, base_bytes.len());
+
+        let base_oid = OidBytes::sha1([0x33; 20]);
+
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&1u32.to_be_bytes());
+
+        let delta_offset = pack.len() as u64;
+        let mut delta_entry = encode_delta_header(7, result_bytes.len());
+        delta_entry.extend_from_slice(base_oid.as_slice());
+        delta_entry.extend_from_slice(&compress(&delta_payload));
+        pack.extend_from_slice(&delta_entry);
+        pack.extend_from_slice(&[0u8; 20]);
+
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"file.txt").unwrap();
+        let candidate = PackCandidate {
+            oid: OidBytes::sha1([0x66; 20]),
+            ctx: ctx(path_ref),
+            pack_id: 0,
+            offset: delta_offset,
+        };
+
+        let plan = PackPlan {
+            pack_id: 0,
+            oid_len: 20,
+            candidates: vec![candidate],
+            candidate_offsets: vec![CandidateAtOffset {
+                offset: delta_offset,
+                cand_idx: 0,
+            }],
+            need_offsets: vec![delta_offset],
+            delta_deps: vec![DeltaDep {
+                offset: delta_offset,
+                kind: DeltaKind::Ref,
+                base: BaseLoc::External { oid: base_oid },
+            }],
+            exec_order: None,
+            clusters: Vec::new(),
+            stats: PackPlanStats {
+                candidate_count: 1,
+                need_count: 1,
+                external_bases: 1,
+                forward_deps: 0,
+                candidate_span: 0,
+            },
+        };
+
+        struct ExternalBaseProviderImpl {
+            base_oid: OidBytes,
+            base_bytes: Vec<u8>,
+        }
+
+        impl ExternalBaseProvider for ExternalBaseProviderImpl {
+            fn load_base(&mut self, oid: &OidBytes) -> Result<Option<ExternalBase>, PackExecError> {
+                if *oid == self.base_oid {
+                    Ok(Some(ExternalBase {
+                        kind: ObjectKind::Blob,
+                        bytes: self.base_bytes.clone(),
+                    }))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+
+        let mut cache = PackCache::new(64 * 1024);
+        let mut external = ExternalBaseProviderImpl {
+            base_oid,
+            base_bytes: base_bytes.to_vec(),
+        };
+        let mut sink = CollectingSink::default();
+
+        let report = execute_pack_plan(
+            &plan,
+            &pack,
+            &arena,
+            &PackDecodeLimits::new(64, 1024, 1024),
+            &mut cache,
+            &mut external,
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(report.stats.emitted_candidates, 1);
+        assert_eq!(
+            sink.blobs.get(&candidate.oid).map(|b| b.as_slice()),
+            Some(result_bytes.as_slice())
+        );
+    }
+
+    #[test]
+    fn truncated_non_delta_stream_is_skipped() {
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&1u32.to_be_bytes());
+
+        let offset = pack.len() as u64;
+        pack.extend_from_slice(&encode_entry_header(ObjectKind::Blob, 4));
+        pack.extend_from_slice(&[0x78]); // truncated zlib stream
+        pack.extend_from_slice(&[0u8; 20]);
+
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"file.txt").unwrap();
+        let candidate = PackCandidate {
+            oid: OidBytes::sha1([0x77; 20]),
+            ctx: ctx(path_ref),
+            pack_id: 0,
+            offset,
+        };
+
+        let plan = build_plan(
+            vec![offset],
+            vec![candidate],
+            vec![CandidateAtOffset {
+                offset,
+                cand_idx: 0,
+            }],
+            None,
+        );
+
+        let mut cache = PackCache::new(64 * 1024);
+        let mut external = NoExternal;
+        let mut sink = TestSink::default();
+
+        let report = execute_pack_plan(
+            &plan,
+            &pack,
+            &arena,
+            &PackDecodeLimits::new(64, 1024, 1024),
+            &mut cache,
+            &mut external,
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(report.stats.emitted_candidates, 0);
+        assert!(matches!(
+            report.skips[0].reason,
+            SkipReason::Decode(PackDecodeError::Inflate(_))
+        ));
+    }
+
+    #[test]
+    fn corrupt_pack_header_is_skipped() {
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&1u32.to_be_bytes());
+
+        let offset = pack.len() as u64;
+        pack.push(0x80); // header continuation without following bytes
+        pack.extend_from_slice(&[0u8; 20]);
+
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"file.txt").unwrap();
+        let candidate = PackCandidate {
+            oid: OidBytes::sha1([0x88; 20]),
+            ctx: ctx(path_ref),
+            pack_id: 0,
+            offset,
+        };
+
+        let plan = build_plan(
+            vec![offset],
+            vec![candidate],
+            vec![CandidateAtOffset {
+                offset,
+                cand_idx: 0,
+            }],
+            None,
+        );
+
+        let mut cache = PackCache::new(64 * 1024);
+        let mut external = NoExternal;
+        let mut sink = TestSink::default();
+
+        let report = execute_pack_plan(
+            &plan,
+            &pack,
+            &arena,
+            &PackDecodeLimits::new(64, 1024, 1024),
+            &mut cache,
+            &mut external,
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(report.stats.emitted_candidates, 0);
+        assert!(matches!(
+            report.skips[0].reason,
+            SkipReason::Decode(PackDecodeError::PackParse(_))
+        ));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn alloc_guard_no_alloc_after_warmup() {
+        use crate::git_scan::alloc_guard;
+        use crate::git_scan::{EngineAdapter, EngineAdapterConfig};
+        use crate::{
+            demo_tuning, AnchorPolicy, Engine, Gate, RuleSpec, TransformConfig, TransformId,
+            TransformMode, ValidatorKind,
+        };
+        use regex::bytes::Regex;
+
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                alloc_guard::set_enabled(false);
+            }
+        }
+
+        if std::env::var("SCANNER_RS_ALLOC_GUARD").ok().as_deref() != Some("1") {
+            eprintln!(
+                "alloc guard test skipped; set SCANNER_RS_ALLOC_GUARD=1 and \
+run with --test-threads=1 to enable"
+            );
+            return;
+        }
+
+        let rule = RuleSpec {
+            name: "tok",
+            anchors: &[b"TOK_"],
+            radius: 16,
+            validator: ValidatorKind::None,
+            two_phase: None,
+            must_contain: None,
+            keywords_any: None,
+            entropy: None,
+            secret_group: Some(1),
+            re: Regex::new(r"TOK_([A-Z0-9]{8})").unwrap(),
+        };
+
+        let transforms = vec![TransformConfig {
+            id: TransformId::Base64,
+            mode: TransformMode::Always,
+            gate: Gate::AnchorsInDecoded,
+            min_len: 16,
+            max_spans_per_buffer: 4,
+            max_encoded_len: 1024,
+            max_decoded_bytes: 1024,
+            plus_to_space: false,
+            base64_allow_space_ws: false,
+        }];
+
+        let engine = Engine::new_with_anchor_policy(
+            vec![rule],
+            transforms,
+            demo_tuning(),
+            AnchorPolicy::ManualOnly,
+        );
+
+        let (pack, offsets) = build_pack(&[(ObjectKind::Blob, b"TOK_ABCDEFGH")]);
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"file.txt").unwrap();
+        let candidate = PackCandidate {
+            oid: OidBytes::sha1([0x55; 20]),
+            ctx: ctx(path_ref),
+            pack_id: 0,
+            offset: offsets[0],
+        };
+
+        let plan = build_plan(
+            vec![offsets[0]],
+            vec![candidate],
+            vec![CandidateAtOffset {
+                offset: offsets[0],
+                cand_idx: 0,
+            }],
+            None,
+        );
+
+        let mut adapter = EngineAdapter::new(&engine, EngineAdapterConfig::default());
+        adapter.reserve_results(1);
+        adapter.reserve_findings(8);
+        adapter.reserve_findings_buf(8);
+
+        alloc_guard::set_enabled(false);
+        let mut warm_cache = PackCache::new(64 * 1024);
+        let mut warm_external = NoExternal;
+        let _warm = execute_pack_plan(
+            &plan,
+            &pack,
+            &arena,
+            &PackDecodeLimits::new(64, 1024, 1024),
+            &mut warm_cache,
+            &mut warm_external,
+            &mut adapter,
+        )
+        .unwrap();
+        adapter.clear_results();
+
+        alloc_guard::set_enabled(true);
+        let _reset = Reset;
+
+        let mut cache = PackCache::new(64 * 1024);
+        let mut external = NoExternal;
+        let report = execute_pack_plan(
+            &plan,
+            &pack,
+            &arena,
+            &PackDecodeLimits::new(64, 1024, 1024),
+            &mut cache,
+            &mut external,
+            &mut adapter,
+        )
+        .unwrap();
+
+        assert_eq!(report.stats.emitted_candidates, 1);
+        let scanned = adapter.take_results();
+        assert_eq!(scanned.blobs.len(), 1);
+        assert!(!scanned.finding_arena.is_empty());
     }
 }

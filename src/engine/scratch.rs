@@ -5,7 +5,7 @@
 //! state is single-threaded and reused across chunks to keep the hot path
 //! allocation-free.
 
-use crate::api::{DecodeStep, FileId, FindingRec, TransformConfig, TransformId, STEP_ROOT};
+use crate::api::{DecodeStep, FileId, FindingRec, StepId, TransformConfig, TransformId, STEP_ROOT};
 use crate::scratch_memory::ScratchVec;
 use crate::stdx::{ByteRing, FixedSet128, TimingWheel};
 
@@ -820,6 +820,14 @@ impl ScanScratch {
     /// See [`ScanScratch::drain_findings`] for capacity requirements.
     pub fn drain_findings_into(&mut self, out: &mut Vec<FindingRec>) {
         self.drain_findings(out);
+    }
+
+    /// Materialize decode steps for a finding into the scratch buffer.
+    ///
+    /// The returned slice is valid until the next call that materializes steps.
+    pub(crate) fn materialize_decode_steps(&mut self, step_id: StepId) -> &[DecodeStep] {
+        self.step_arena.materialize(step_id, &mut self.steps_buf);
+        self.steps_buf.as_slice()
     }
 
     /// Drops findings that end at or before the overlap prefix boundary.

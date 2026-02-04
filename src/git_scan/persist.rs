@@ -1,75 +1,66 @@
 //! Persistence store contract and helpers.
 //!
 //! This module defines the write-only persistence API used after finalize.
-//! Callers must write data ops before watermark ops to prevent advancing
-//! watermarks past unscanned blobs.
+//! Persistence must commit data and watermark ops atomically to prevent
+//! advancing ref tips past unscanned blobs.
 //!
-//! # Two-phase contract
+//! # Atomic contract
 //! - `data_ops` are always safe to write.
-//! - `watermark_ops` must only be written for `FinalizeOutcome::Complete`.
-//! - Each write call should be atomic within the store implementation.
+//! - `watermark_ops` are only written for `FinalizeOutcome::Complete`.
+//! - Implementations must commit the combined operation atomically so that
+//!   readers never observe watermarks without the corresponding data writes.
 
 use super::errors::PersistError;
 use super::finalize::{FinalizeOutcome, FinalizeOutput, WriteOp};
 
 /// Persistence store interface for finalize output.
 ///
-/// Implementations should write the provided ops atomically within each call.
-/// Callers may rely on `data_ops` being durable before attempting watermark
-/// writes.
+/// Implementations must commit `data_ops` and (when complete) `watermark_ops`
+/// in a single atomic write. On partial runs, `watermark_ops` must be ignored,
+/// ensuring ref tips never advance past unscanned content.
 pub trait PersistenceStore {
-    /// Writes data ops (blob_ctx + finding + seen_blob).
+    /// Commits finalize output atomically.
     ///
-    /// Implementations may assume ops are pre-sorted by key, but must not
-    /// require it for correctness.
-    fn write_data_ops(&self, ops: &[WriteOp]) -> Result<(), PersistError>;
-    /// Writes watermark ops (ref_watermark).
-    ///
-    /// These ops are only issued for `FinalizeOutcome::Complete`.
-    fn write_watermark_ops(&self, ops: &[WriteOp]) -> Result<(), PersistError>;
+    /// Implementations may assume ops are pre-sorted by key for performance
+    /// diagnostics, but must not require ordering for correctness.
+    fn commit_finalize(&self, output: &FinalizeOutput) -> Result<(), PersistError>;
 }
 
-/// Persist finalize output with two-phase semantics.
+/// Persist finalize output with atomic semantics.
 ///
-/// # Ordering contract
-/// 1. Write `data_ops` first.
-/// 2. If and only if the run is complete, write `watermark_ops`.
-///
-/// Errors during the data phase prevent any watermark writes. If the
-/// watermark phase fails, callers may retry watermark writes without
-/// re-scanning, since data ops are already durable.
+/// This helper forwards to the store and returns the outcome on success so
+/// callers can update control flow without re-inspecting `FinalizeOutput`.
 pub fn persist_finalize_output(
     store: &dyn PersistenceStore,
     output: &FinalizeOutput,
 ) -> Result<FinalizeOutcome, PersistError> {
-    if !output.data_ops.is_empty() {
-        store.write_data_ops(&output.data_ops)?;
-    }
-
-    if matches!(output.outcome, FinalizeOutcome::Complete) && !output.watermark_ops.is_empty() {
-        store.write_watermark_ops(&output.watermark_ops)?;
-    }
-
+    store.commit_finalize(output)?;
     Ok(output.outcome)
 }
 
 /// In-memory persistence store for tests and diagnostics.
 ///
-/// This store is not thread-safe; it uses `RefCell` for interior mutability.
+/// The store records committed ops for later inspection and intentionally
+/// skips synchronization; it uses `RefCell` for interior mutability and is not
+/// thread-safe.
 #[derive(Debug, Default)]
 pub struct InMemoryPersistenceStore {
+    /// Recorded data writes from successful finalize calls.
     pub data_ops: std::cell::RefCell<Vec<WriteOp>>,
+    /// Recorded watermark writes from successful complete runs.
     pub watermark_ops: std::cell::RefCell<Vec<WriteOp>>,
 }
 
 impl PersistenceStore for InMemoryPersistenceStore {
-    fn write_data_ops(&self, ops: &[WriteOp]) -> Result<(), PersistError> {
-        self.data_ops.borrow_mut().extend_from_slice(ops);
-        Ok(())
-    }
-
-    fn write_watermark_ops(&self, ops: &[WriteOp]) -> Result<(), PersistError> {
-        self.watermark_ops.borrow_mut().extend_from_slice(ops);
+    fn commit_finalize(&self, output: &FinalizeOutput) -> Result<(), PersistError> {
+        self.data_ops
+            .borrow_mut()
+            .extend_from_slice(&output.data_ops);
+        if matches!(output.outcome, FinalizeOutcome::Complete) {
+            self.watermark_ops
+                .borrow_mut()
+                .extend_from_slice(&output.watermark_ops);
+        }
         Ok(())
     }
 }

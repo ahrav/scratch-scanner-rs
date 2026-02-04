@@ -204,6 +204,28 @@ Scanner harness code lives in `src/sim_scanner/` with shared primitives in `src/
 | **TraceRing**         | `src/sim/trace.rs`                   | Bounded trace buffer for replay and debugging                  |
 | **Minimizer**         | `src/sim/minimize.rs`                | Deterministic shrink passes for failing scanner artifacts      |
 
+### Git Simulation Harness (`sim-harness` feature)
+
+Git simulation harness code lives in `src/sim_git_scan/` with shared primitives in `src/sim/`.
+
+| Component               | Location                                | Purpose                                                             |
+| ----------------------- | --------------------------------------- | ------------------------------------------------------------------- |
+| **Git Scenario Schema** | `src/sim_git_scan/scenario.rs`          | Repo model + artifact bytes schema for deterministic Git scenarios  |
+| **Git Scenario Generator** | `src/sim_git_scan/generator.rs`      | Synthetic Git repo generator for bounded random tests               |
+| **Git Runner**          | `src/sim_git_scan/runner.rs`            | Deterministic stage runner and failure taxonomy                     |
+| **Git Trace Ring**      | `src/sim_git_scan/trace.rs`             | Bounded trace buffer for Git simulation replay                      |
+| **Git Artifact Schema** | `src/sim_git_scan/artifact.rs`          | Reproducible artifact format for Git sim failures                   |
+| **Git Fault Plan**      | `src/sim_git_scan/fault.rs`             | Deterministic fault injection plan keyed by logical Git resources   |
+| **Git Replay**          | `src/sim_git_scan/replay.rs`            | Load + replay `.case.json` artifacts deterministically              |
+| **Git Minimizer**       | `src/sim_git_scan/minimize.rs`          | Deterministic shrink passes for failing Git artifacts               |
+| **Git Persist Store**   | `src/sim_git_scan/persist.rs`           | Two-phase persistence simulation with fault injection               |
+| **Sim Commit Graph**    | `src/sim_git_scan/commit_graph.rs`      | In-memory commit-graph adapter for deterministic commit walks       |
+| **Sim Start Set**       | `src/sim_git_scan/start_set.rs`         | Start set + watermark adapters for simulated refs                   |
+| **Sim Tree Source**     | `src/sim_git_scan/tree_source.rs`       | Tree-source adapter that encodes semantic trees into raw bytes      |
+| **Sim Pack Bytes**      | `src/sim_git_scan/pack_bytes.rs`        | In-memory pack bytes and pack-view adapter                          |
+| **Sim Pack I/O**        | `src/sim_git_scan/pack_io.rs`           | External base resolver over in-memory pack bytes                    |
+| **SimExecutor**         | `src/sim/executor.rs`                   | Shared deterministic executor used for schedule control             |
+
 ### Scheduler Simulation Harness (`scheduler-sim` feature)
 
 Scheduler harness code lives in `src/scheduler/sim_executor_harness.rs`.

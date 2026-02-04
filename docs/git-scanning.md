@@ -39,11 +39,33 @@ flowchart LR
 ## Determinism and Safety Invariants
 
 - Preflight and repo open read metadata only; no blob payloads are read before pack decoding.
+- Preflight/repo open detect maintenance lock files and capture artifact fingerprints; runner revalidates before pack exec.
+- Metadata artifacts are accessed through read-only byte views (mmap-backed in production).
+- Preflight reports pack-count maintenance recommendations separately; pack count does not block scans.
+- Pack execution mmaps are bounded by explicit pack count and total byte limits.
 - Candidate ordering is deterministic and stable across spill boundaries.
 - Findings are deduped per blob and stored as `(start, end, rule_id, norm_hash)`.
 - No raw secret bytes are persisted; only hashes and metadata are stored.
-- Persistence is two-phase: write data ops first and write watermarks only for complete runs.
-- Any decode skips or loose-object fallbacks result in `FinalizeOutcome::Partial`.
+- Persistence is atomic: data ops and (when complete) watermark ops are committed together.
+- Loose candidates are scanned via bounded loose-object decode; non-blob or
+  missing loose objects are recorded as explicit skips.
+- Any decode skips or missing/corrupt loose objects result in `FinalizeOutcome::Partial`.
+- Skipped candidates are reported with explicit reasons; pack exec reports contain detailed decode errors.
+- Pack decoding can be driven via a read-at reader for deterministic fault injection.
+
+## Concurrency and Backpressure
+
+Git scanning executes **single-threaded** today. There are no in-flight queues
+between stages; instead, each stage enforces explicit bounds:
+
+- Spill/dedupe caps (`SpillLimits`) limit candidate count and spill bytes.
+- Mapping caps (`MappingBridgeConfig`) bound packed/loose candidate buffers.
+- Pack planning limits (`PackPlanConfig`) bound delta expansion worklists.
+- Pack execution limits (`PackMmapLimits`, `PackDecodeLimits`) bound mmaps and
+  inflate sizes.
+
+These limits provide deterministic backpressure and serve as the queue/budget
+boundaries for any future parallelization.
 
 ## Persistence Contract
 
@@ -52,10 +74,30 @@ Finalize produces two batches:
 - `data_ops`: `bc\0` (blob_ctx), `fn\0` (finding), `sb\0` (seen_blob)
 - `watermark_ops`: `rw` (ref_watermark)
 
-Persist always writes `data_ops` first. If the run is partial, watermark ops
-are skipped to avoid advancing ref tips past unscanned blobs.
+Persist commits `data_ops` and (when complete) `watermark_ops` in a single
+atomic batch. If the run is partial, watermark ops are skipped to avoid
+advancing ref tips past unscanned blobs.
+
+## Simulation Harness
+
+The Git simulation harness exercises this pipeline deterministically using a
+semantic repo model and optional pack artifacts. It replays `.case.json`
+artifacts and supports bounded random runs.
+
+```bash
+# Replay Git simulation corpus
+cargo test --features sim-harness --test simulation git_scan_corpus
+
+# Run bounded random Git simulations
+cargo test --features sim-harness --test simulation git_scan_random
+```
+
+Corpus cases live in `tests/corpus/git_scan/*.case.json`. Replay failures emit
+artifacts to `tests/failures/` for triage and minimization.
 
 ## Related Docs
 
 - `docs/architecture-overview.md`
 - `docs/detection-engine.md`
+- `docs/git-scan-pack-exec-merge-fast-path.md`
+- `docs/git_simulation_harness_guide.md`

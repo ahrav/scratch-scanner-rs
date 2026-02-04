@@ -12,6 +12,7 @@ mod git_persist;
 mod git_preflight;
 mod git_repo_open;
 mod git_run_format;
+mod git_scan_validation;
 mod git_seen_unique;
 mod git_snapshot;
 mod git_tree_diff;
