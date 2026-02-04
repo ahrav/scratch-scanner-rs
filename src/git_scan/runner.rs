@@ -13,10 +13,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use memmap2::Mmap;
-
 use crate::Engine;
 
+use super::bytes::BytesView;
 use super::commit_walk::{
     introduced_by_plan, CommitGraph, CommitGraphView, ParentScratch, PlannedCommit,
 };
@@ -57,6 +56,9 @@ use super::tree_diff_limits::TreeDiffLimits;
 /// The defaults mirror the Git scanning limits and are intended for
 /// production usage. Callers should set `repo_id` and `policy_hash` to
 /// stable identifiers for their environment.
+///
+/// `pack_cache_bytes` is an in-memory cache cap; oversized values are rejected
+/// at runtime when converting to `u32`.
 #[derive(Clone, Debug)]
 pub struct GitScanConfig {
     /// Stable repository identifier used to namespace persisted keys.
@@ -427,7 +429,7 @@ pub fn run_git_scan(
                 pack_id: plan.pack_id,
                 pack_count: pack_mmaps.len(),
             }))?
-            .as_ref();
+            .as_slice();
 
         let report = execute_pack_plan(
             plan,
@@ -487,12 +489,12 @@ fn make_spill_dir() -> Result<PathBuf, io::Error> {
 
 /// Load the MIDX view for the repository.
 fn load_midx(repo: &RepoJobState) -> Result<MidxView<'_>, GitScanError> {
-    let midx_mmap = repo
+    let midx_bytes = repo
         .mmaps
         .midx
         .as_ref()
-        .ok_or_else(|| GitScanError::Midx(MidxError::corrupt("midx mmap missing")))?;
-    Ok(MidxView::parse(midx_mmap.as_ref(), repo.object_format)?)
+        .ok_or_else(|| GitScanError::Midx(MidxError::corrupt("midx bytes missing")))?;
+    Ok(MidxView::parse(midx_bytes.as_slice(), repo.object_format)?)
 }
 
 /// Convert the repo start set into finalize `RefEntry` values.
@@ -588,26 +590,26 @@ fn strip_pack_suffix(name: &[u8]) -> Vec<u8> {
 }
 
 /// Memory-map pack files for zero-copy decoding.
-fn mmap_pack_files(pack_paths: &[PathBuf]) -> Result<Vec<Mmap>, GitScanError> {
+fn mmap_pack_files(pack_paths: &[PathBuf]) -> Result<Vec<BytesView>, GitScanError> {
     let mut out = Vec::with_capacity(pack_paths.len());
     for path in pack_paths {
         let file = File::open(path)?;
         // SAFETY: mapping read-only pack files; the OS keeps the mapping valid
         // even after `file` is dropped.
-        let mmap = unsafe { Mmap::map(&file)? };
-        out.push(mmap);
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        out.push(BytesView::from_mmap(mmap));
     }
     Ok(out)
 }
 
 /// Parse pack headers into `PackView`s used for planning.
 fn build_pack_views<'a>(
-    pack_mmaps: &'a [Mmap],
+    pack_mmaps: &'a [BytesView],
     format: ObjectFormat,
 ) -> Result<Vec<PackView<'a>>, GitScanError> {
     let mut views = Vec::with_capacity(pack_mmaps.len());
     for mmap in pack_mmaps {
-        let view = PackView::parse(mmap.as_ref(), format.oid_len())
+        let view = PackView::parse(mmap.as_slice(), format.oid_len())
             .map_err(|err| GitScanError::PackPlan(PackPlanError::PackParse(err)))?;
         views.push(view);
     }
@@ -618,6 +620,7 @@ fn build_pack_views<'a>(
 ///
 /// The skip records are offsets into the pack stream; we map them back to
 /// candidate offsets and record the corresponding OIDs.
+/// Duplicate OIDs may be emitted when multiple candidates share an offset.
 fn collect_skipped_candidate_oids(plan: &PackPlan, skips: &[SkipRecord], out: &mut Vec<OidBytes>) {
     if skips.is_empty() {
         return;

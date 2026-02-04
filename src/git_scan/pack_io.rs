@@ -3,7 +3,7 @@
 //! This module manages pack file access and bounded object decoding for
 //! cross-pack REF delta bases. It is intentionally narrow in scope:
 //! callers provide OIDs, and `PackIo` resolves them via the MIDX to pack
-//! offsets, loads pack bytes via mmap, and decodes the object with strict
+//! offsets, loads pack bytes (mmap-backed by default), and decodes the object with strict
 //! limits on header size, delta payload size, and output size.
 //!
 //! # Scope
@@ -17,15 +17,14 @@
 //! - Object sizes never exceed `limits.decode.max_object_bytes`.
 //! - Delta payload sizes never exceed `limits.decode.max_delta_bytes`.
 //! - Delta chains are bounded by `limits.max_delta_depth`.
+//! - Missing bases are treated as missing objects (`None`).
 
 use std::fs;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use memmap2::Mmap;
-
+use super::bytes::BytesView;
 use super::midx::MidxView;
 use super::midx_error::MidxError;
 use super::object_id::OidBytes;
@@ -65,7 +64,7 @@ impl PackIoLimits {
 pub enum PackIoError {
     /// Repository artifacts are not ready.
     ArtifactsNotReady,
-    /// MIDX mmap is missing.
+    /// MIDX bytes are missing.
     MissingMidx,
     /// MIDX parsing or lookup failed.
     Midx(MidxError),
@@ -91,7 +90,7 @@ impl std::fmt::Display for PackIoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ArtifactsNotReady => write!(f, "repo artifacts not ready"),
-            Self::MissingMidx => write!(f, "midx mmap missing"),
+            Self::MissingMidx => write!(f, "midx bytes missing"),
             Self::Midx(err) => write!(f, "{err}"),
             Self::Io(err) => write!(f, "pack I/O error: {err}"),
             Self::PackParse(err) => write!(f, "{err}"),
@@ -167,7 +166,7 @@ pub struct PackIo<'a> {
     oid_len: u8,
     midx: MidxView<'a>,
     pack_paths: Vec<PathBuf>,
-    pack_cache: Vec<Option<Arc<Mmap>>>,
+    pack_cache: Vec<Option<BytesView>>,
     limits: PackIoLimits,
 }
 
@@ -182,8 +181,8 @@ impl<'a> PackIo<'a> {
             return Err(PackIoError::ArtifactsNotReady);
         }
 
-        let midx_mmap = repo.mmaps.midx.as_ref().ok_or(PackIoError::MissingMidx)?;
-        let midx = MidxView::parse(midx_mmap.as_ref(), repo.object_format)?;
+        let midx_bytes = repo.mmaps.midx.as_ref().ok_or(PackIoError::MissingMidx)?;
+        let midx = MidxView::parse(midx_bytes.as_slice(), repo.object_format)?;
 
         let pack_dirs = collect_pack_dirs(&repo.paths);
         let pack_names = list_pack_files(&pack_dirs)?;
@@ -196,6 +195,7 @@ impl<'a> PackIo<'a> {
     /// Constructs pack I/O from pre-parsed parts.
     ///
     /// This is intended for tests or callers that already resolved pack paths.
+    /// `pack_paths` must be ordered by pack id (PNAM order).
     ///
     /// # Errors
     /// Returns `PackCountMismatch` if `pack_paths` doesn't match the MIDX
@@ -226,6 +226,8 @@ impl<'a> PackIo<'a> {
     ///
     /// Missing delta bases also return `None`; they are treated the same
     /// as missing OIDs to keep the API a simple optional lookup.
+    ///
+    /// Delta depth is enforced across pack hops using `limits.max_delta_depth`.
     ///
     /// # Errors
     /// Returns `PackIoError` for malformed pack data or delta failures.
@@ -318,8 +320,8 @@ impl<'a> PackIo<'a> {
         }
     }
 
-    /// Returns the memory-mapped pack bytes for `pack_id`, mapping lazily.
-    fn pack_data(&mut self, pack_id: u16) -> Result<Arc<Mmap>, PackIoError> {
+    /// Returns the pack bytes for `pack_id`, mapping lazily.
+    fn pack_data(&mut self, pack_id: u16) -> Result<BytesView, PackIoError> {
         let idx = pack_id as usize;
         let pack_count = self.pack_paths.len();
         let path = self
@@ -341,13 +343,13 @@ impl<'a> PackIo<'a> {
         if self.pack_cache[idx].is_none() {
             let file = File::open(path)?;
             // SAFETY: pack files are immutable for the duration of a repo job.
-            let mmap = unsafe { Mmap::map(&file)? };
-            self.pack_cache[idx] = Some(Arc::new(mmap));
+            let mmap = unsafe { memmap2::Mmap::map(&file)? };
+            self.pack_cache[idx] = Some(BytesView::from_mmap(mmap));
         }
 
         Ok(self.pack_cache[idx]
             .as_ref()
-            .expect("pack mmap present")
+            .expect("pack bytes present")
             .clone())
     }
 }

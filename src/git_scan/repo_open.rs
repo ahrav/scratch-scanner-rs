@@ -9,6 +9,10 @@
 //!
 //! Packs are not mmapped here. They are opened on demand in later phases
 //! per pack plan to avoid unnecessary FD and VMA pressure.
+//!
+//! This stage performs minimal validation of metadata files: it checks for
+//! presence and mmaps commit-graph and MIDX, but parsing and structural
+//! validation are done by later phases.
 
 use std::fs::{self, File};
 use std::io::Read;
@@ -17,6 +21,7 @@ use std::path::{Path, PathBuf};
 use memmap2::Mmap;
 
 use super::byte_arena::{ByteArena, ByteRef};
+use super::bytes::BytesView;
 use super::errors::RepoOpenError;
 use super::limits::RepoOpenLimits;
 use super::object_id::{ObjectFormat, OidBytes};
@@ -55,17 +60,17 @@ pub struct RepoArtifactPaths {
     pub midx: PathBuf,
 }
 
-/// Memory-mapped artifact files.
+/// Artifact bytes for required metadata files.
 ///
 /// Only populated when `RepoArtifactStatus::Ready`.
-/// Maps are read-only and expected to remain valid for the duration of
+/// Views are read-only and expected to remain valid for the duration of
 /// a repo job (maintenance must not run concurrently).
 #[derive(Debug, Default)]
 pub struct RepoArtifactMmaps {
-    /// Memory-mapped commit-graph.
-    pub commit_graph: Option<Mmap>,
-    /// Memory-mapped multi-pack-index.
-    pub midx: Option<Mmap>,
+    /// Commit-graph bytes (mmap or in-memory).
+    pub commit_graph: Option<BytesView>,
+    /// Multi-pack-index bytes (mmap or in-memory).
+    pub midx: Option<BytesView>,
 }
 
 /// A ref in the start set with its resolved tip and optional watermark.
@@ -83,6 +88,7 @@ pub struct StartSetRef {
 ///
 /// This struct contains everything needed for later Git phases without
 /// additional file opens (except pack files in pack processing phases).
+/// When artifacts are missing, `start_set` is empty and `mmaps` is unset.
 #[derive(Debug)]
 pub struct RepoJobState {
     /// Resolved repository paths.
@@ -97,7 +103,7 @@ pub struct RepoJobState {
     /// Artifact readiness status.
     pub artifact_status: RepoArtifactStatus,
 
-    /// Memory-mapped artifacts (only if `artifact_status.is_ready()`).
+    /// Artifact bytes (only if `artifact_status.is_ready()`).
     pub mmaps: RepoArtifactMmaps,
 
     /// Arena for ref name storage.
@@ -269,7 +275,7 @@ fn mmap_artifacts(artifact_paths: &RepoArtifactPaths) -> Result<RepoArtifactMmap
     })
 }
 
-fn mmap_file(path: &Path) -> Result<Mmap, RepoOpenError> {
+fn mmap_file(path: &Path) -> Result<BytesView, RepoOpenError> {
     let file = File::open(path).map_err(RepoOpenError::io)?;
 
     #[allow(unsafe_code)]
@@ -277,7 +283,9 @@ fn mmap_file(path: &Path) -> Result<Mmap, RepoOpenError> {
         // SAFETY: We map the file read-only and treat it as immutable during the scan.
         // Repo maintenance is expected to be quiescent; if the file is truncated
         // or replaced while mapped, the OS may signal a fault. That risk is accepted.
-        Mmap::map(&file).map_err(RepoOpenError::io)
+        Mmap::map(&file)
+            .map(BytesView::from_mmap)
+            .map_err(RepoOpenError::io)
     }
 }
 

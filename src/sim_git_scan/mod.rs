@@ -20,16 +20,28 @@
 //! - `minimize`: deterministic shrink passes (placeholder in Phase 0).
 
 pub mod artifact;
+pub mod commit_graph;
+pub mod convert;
+pub mod error;
 pub mod fault;
 pub mod minimize;
+pub mod pack_bytes;
+pub mod pack_io;
 pub mod replay;
 pub mod runner;
 pub mod scenario;
+pub mod start_set;
 pub mod trace;
+pub mod tree_source;
 
 pub use artifact::{GitReproArtifact, GitTraceDump};
+pub use commit_graph::SimCommitGraph;
+pub use convert::{to_object_format, to_oid_bytes};
+pub use error::SimGitError;
 pub use fault::{GitCorruption, GitFaultPlan, GitIoFault, GitReadFault, GitResourceId};
 pub use minimize::{minimize_git_case, MinimizerCfg};
+pub use pack_bytes::SimPackBytes;
+pub use pack_io::SimPackIo;
 pub use replay::replay_artifact;
 pub use runner::{FailureKind, FailureReport, GitSimRunner, RunOutcome, RunReport};
 pub use scenario::{
@@ -37,4 +49,6 @@ pub use scenario::{
     GitRefSpec, GitRepoModel, GitRunConfig, GitScenario, GitTreeEntryKind, GitTreeEntrySpec,
     GitTreeSpec,
 };
+pub use start_set::SimStartSet;
 pub use trace::{GitTraceEvent, GitTraceRing};
+pub use tree_source::SimTreeSource;
