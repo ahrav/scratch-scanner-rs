@@ -834,7 +834,12 @@ fn build_pack_views<'a>(
 /// Loads loose candidates and scans blob payloads.
 ///
 /// Missing or undecodable loose objects are recorded as skips so the run can
-/// complete with partial results.
+/// complete with partial results. Paths are re-interned into the adapter's
+/// arena via `emit_loose`.
+/// Scan loose candidates and record explicit skip reasons for failures.
+///
+/// Missing objects, decode errors, and non-blob kinds are recorded as skips.
+/// Unexpected pack I/O errors are returned as fatal scan errors.
 fn scan_loose_candidates(
     candidates: &[LooseCandidate],
     paths: &ByteArena,
@@ -912,7 +917,6 @@ fn is_file(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::byte_arena::ByteRef;
     use super::*;
     use crate::git_scan::{ByteRef, CandidateContext, ChangeKind};
     use crate::{
