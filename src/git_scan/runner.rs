@@ -913,9 +913,11 @@ fn is_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::byte_arena::ByteRef;
+    use crate::git_scan::{ByteRef, CandidateContext, ChangeKind};
     use crate::{
-        demo_tuning, AnchorPolicy, ByteRef, CandidateContext, ChangeKind, Engine, Gate, RuleSpec,
-        TransformConfig, TransformId, TransformMode, ValidatorKind,
+        demo_tuning, AnchorPolicy, Engine, Gate, RuleSpec, TransformConfig, TransformId,
+        TransformMode, ValidatorKind,
     };
     use flate2::write::ZlibEncoder;
     use flate2::Compression;

@@ -48,6 +48,8 @@ const _: () = {
 #[derive(Clone, Debug)]
 pub struct RefEntry {
     /// Ref name bytes (e.g., `refs/heads/main`).
+    ///
+    /// Must not contain NUL bytes (required for prefix-safe keys).
     pub ref_name: Vec<u8>,
     /// Current tip OID for this ref.
     pub tip_oid: OidBytes,
@@ -150,13 +152,20 @@ pub struct FinalizeStats {
 /// Per-namespace operation counts.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NamespaceCounts {
+    /// Blob context ops.
     pub blob_ctx: u64,
+    /// Finding ops.
     pub finding: u64,
+    /// Seen-blob marker ops.
     pub seen_blob: u64,
+    /// Ref watermark ops.
     pub ref_watermark: u64,
 }
 
-fn finding_slice<'a>(span: FindingSpan, arena: &'a [FindingKey]) -> &'a [FindingKey] {
+/// Returns the finding slice for a span produced by the engine adapter.
+///
+/// The span must be in-bounds for `arena`; this is enforced by debug asserts.
+fn finding_slice(span: FindingSpan, arena: &[FindingKey]) -> &[FindingKey] {
     let start = span.start as usize;
     let end = start.saturating_add(span.len as usize);
     debug_assert!(end <= arena.len(), "finding span out of bounds");
@@ -187,6 +196,9 @@ fn ref_wm_key_len(ref_name: &[u8]) -> usize {
     2 + 8 + 32 + 32 + ref_name.len() + 1
 }
 
+/// Builds a key for blob-keyed namespaces (context or seen markers).
+///
+/// Big-endian numeric fields preserve lexicographic ordering across stores.
 pub(crate) fn build_blob_key(
     ns: &[u8; 3],
     repo_id: u64,
@@ -207,6 +219,7 @@ pub(crate) fn build_seen_blob_key(repo_id: u64, policy_hash: &[u8; 32], oid: &Oi
     build_blob_key(&NS_SEEN_BLOB, repo_id, policy_hash, oid)
 }
 
+/// Builds a finding key for a specific blob OID and finding tuple.
 fn build_finding_key(
     repo_id: u64,
     policy_hash: &[u8; 32],
@@ -227,6 +240,7 @@ fn build_finding_key(
     key
 }
 
+/// Builds a ref watermark key (null-terminated ref name for prefix scans).
 pub(crate) fn build_ref_wm_key(
     repo_id: u64,
     policy_hash: &[u8; 32],
@@ -485,6 +499,8 @@ pub fn build_finalize_ops(mut input: FinalizeInput<'_>) -> FinalizeOutput {
 
 impl FinalizeOutput {
     /// Compute stats breakdown by namespace for diagnostics.
+    ///
+    /// Counts are derived from the output ops, not the input candidates.
     pub fn compute_namespace_counts(&self) -> NamespaceCounts {
         let mut counts = NamespaceCounts::default();
         for op in &self.data_ops {

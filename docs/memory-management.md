@@ -156,6 +156,19 @@ Pack decode uses bounded buffers and a fixed-size cache:
 These limits keep pack decoding deterministic and bound memory to the
 configured cache capacity plus temporary inflate buffers.
 
+## Git Scan Hot-Loop Allocation Guard
+
+Hot-loop allocations are prohibited after warmup in pack execution and
+engine scanning:
+
+- **Debug guard**: `git_scan::set_alloc_guard_enabled(true)` enables a
+  debug-only `AllocGuard` around pack exec and engine adapter scan paths.
+- **Findings arena**: per-blob findings are stored in a shared arena and
+  referenced by spans (`FindingSpan`), avoiding per-blob `Vec` allocations.
+
+Use the allocation guard in debug tests with the counting allocator to
+verify no heap activity after warmup.
+
 ## Single-Threaded Pipeline Memory Model
 
 > **Note**: The diagrams below describe the single-threaded `Pipeline` API, which uses

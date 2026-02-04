@@ -46,7 +46,9 @@ flowchart LR
 - Findings are deduped per blob and stored as `(start, end, rule_id, norm_hash)`.
 - No raw secret bytes are persisted; only hashes and metadata are stored.
 - Persistence is two-phase: write data ops first and write watermarks only for complete runs.
-- Any decode skips or loose-object fallbacks result in `FinalizeOutcome::Partial`.
+- Loose candidates are scanned via bounded loose-object decode; non-blob or
+  missing loose objects are recorded as explicit skips.
+- Any decode skips or missing/corrupt loose objects result in `FinalizeOutcome::Partial`.
 - Skipped candidates are reported with explicit reasons; pack exec reports contain detailed decode errors.
 
 ## Persistence Contract

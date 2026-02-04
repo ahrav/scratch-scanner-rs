@@ -1066,4 +1066,102 @@ mod tests {
         }));
         assert!(cache.get(delta_offset).is_none());
     }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn alloc_guard_no_alloc_after_warmup() {
+        use crate::git_scan::alloc_guard;
+        use crate::git_scan::{EngineAdapter, EngineAdapterConfig};
+        use crate::{
+            demo_tuning, AnchorPolicy, Engine, Gate, RuleSpec, TransformConfig, TransformId,
+            TransformMode, ValidatorKind,
+        };
+        use regex::bytes::Regex;
+
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                alloc_guard::set_enabled(false);
+            }
+        }
+
+        let rule = RuleSpec {
+            name: "tok",
+            anchors: &[b"TOK_"],
+            radius: 16,
+            validator: ValidatorKind::None,
+            two_phase: None,
+            must_contain: None,
+            keywords_any: None,
+            entropy: None,
+            secret_group: Some(1),
+            re: Regex::new(r"TOK_([A-Z0-9]{8})").unwrap(),
+        };
+
+        let transforms = vec![TransformConfig {
+            id: TransformId::Base64,
+            mode: TransformMode::Always,
+            gate: Gate::AnchorsInDecoded,
+            min_len: 16,
+            max_spans_per_buffer: 4,
+            max_encoded_len: 1024,
+            max_decoded_bytes: 1024,
+            plus_to_space: false,
+            base64_allow_space_ws: false,
+        }];
+
+        let engine = Engine::new_with_anchor_policy(
+            vec![rule],
+            transforms,
+            demo_tuning(),
+            AnchorPolicy::ManualOnly,
+        );
+
+        let (pack, offsets) = build_pack(&[(ObjectKind::Blob, b"TOK_ABCDEFGH")]);
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"file.txt").unwrap();
+        let candidate = PackCandidate {
+            oid: OidBytes::sha1([0x55; 20]),
+            ctx: ctx(path_ref),
+            pack_id: 0,
+            offset: offsets[0],
+        };
+
+        let plan = build_plan(
+            vec![offsets[0]],
+            vec![candidate],
+            vec![CandidateAtOffset {
+                offset: offsets[0],
+                cand_idx: 0,
+            }],
+            None,
+        );
+
+        let mut adapter = EngineAdapter::new(&engine, EngineAdapterConfig::default());
+        adapter.reserve_results(1);
+        adapter.reserve_findings(8);
+        adapter.reserve_findings_buf(8);
+
+        let mut cache = PackCache::new(64 * 1024);
+        let mut external = NoExternal;
+
+        alloc_guard::set_enabled(true);
+        let _reset = Reset;
+
+        let report = execute_pack_plan(
+            &plan,
+            &pack,
+            &arena,
+            &PackDecodeLimits::new(64, 1024, 1024),
+            &mut cache,
+            &mut external,
+            &mut adapter,
+        )
+        .unwrap();
+
+        assert_eq!(report.stats.emitted_candidates, 1);
+        let scanned = adapter.take_results();
+        assert_eq!(scanned.blobs.len(), 1);
+        assert!(!scanned.finding_arena.is_empty());
+    }
 }
