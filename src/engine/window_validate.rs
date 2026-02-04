@@ -167,11 +167,9 @@ fn contains_any_literal(hay: &[u8], needles: &[&[u8]]) -> bool {
 
 #[inline]
 fn is_quoted_at(hay: &[u8], secret_start: usize, secret_end: usize) -> Option<bool> {
-    if secret_start == 0 || secret_end >= hay.len() {
-        return None;
-    }
-    let ql = hay[secret_start - 1];
-    let qr = hay[secret_end];
+    let left = secret_start.checked_sub(1)?;
+    let ql = *hay.get(left)?;
+    let qr = *hay.get(secret_end)?;
     let is_quote = ql == b'\'' || ql == b'"' || ql == b'`';
     Some(is_quote && ql == qr)
 }
