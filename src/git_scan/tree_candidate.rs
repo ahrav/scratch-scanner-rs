@@ -80,6 +80,22 @@ pub struct ResolvedCandidate<'a> {
     pub cand_flags: u16,
 }
 
+/// Sink for tree diff candidates.
+pub trait CandidateSink {
+    /// Receives a candidate blob.
+    #[allow(clippy::too_many_arguments)]
+    fn emit(
+        &mut self,
+        oid: OidBytes,
+        path: &[u8],
+        commit_id: u32,
+        parent_idx: u8,
+        change_kind: ChangeKind,
+        ctx_flags: u16,
+        cand_flags: u16,
+    ) -> Result<(), TreeDiffError>;
+}
+
 /// In-memory candidate buffer for tree diff output.
 ///
 /// # Invariants
@@ -98,12 +114,15 @@ pub struct CandidateBuffer {
 }
 
 impl CandidateBuffer {
+    const INIT_CAP: u32 = 16_384;
+
     /// Creates a new candidate buffer.
     #[must_use]
     pub fn new(limits: &TreeDiffLimits, oid_len: u8) -> Self {
         assert!(oid_len == 20 || oid_len == 32, "oid_len must be 20 or 32");
+        let init_cap = limits.max_candidates.min(Self::INIT_CAP) as usize;
         Self {
-            candidates: Vec::with_capacity(limits.max_candidates as usize),
+            candidates: Vec::with_capacity(init_cap),
             path_arena: ByteArena::with_capacity(limits.max_path_arena_bytes),
             max_candidates: limits.max_candidates,
             oid_len,
@@ -184,6 +203,29 @@ impl CandidateBuffer {
     #[must_use]
     pub fn iter_resolved(&self) -> ResolvedIter<'_> {
         ResolvedIter { buf: self, idx: 0 }
+    }
+}
+
+impl CandidateSink for CandidateBuffer {
+    fn emit(
+        &mut self,
+        oid: OidBytes,
+        path: &[u8],
+        commit_id: u32,
+        parent_idx: u8,
+        change_kind: ChangeKind,
+        ctx_flags: u16,
+        cand_flags: u16,
+    ) -> Result<(), TreeDiffError> {
+        self.push(
+            oid,
+            path,
+            commit_id,
+            parent_idx,
+            change_kind,
+            ctx_flags,
+            cand_flags,
+        )
     }
 }
 

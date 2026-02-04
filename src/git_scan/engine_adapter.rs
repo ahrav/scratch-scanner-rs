@@ -4,21 +4,38 @@
 //! and a fixed-size ring buffer, then aggregates findings per blob with
 //! deterministic ordering.
 //!
+//! # Algorithm
+//! 1. Stream blob bytes into fixed windows using `RingChunker`.
+//! 2. Scan each window with `Engine::scan_chunk_into` at the correct base offset.
+//! 3. Drop findings that fall entirely inside the overlap prefix so each match
+//!    is recorded exactly once.
+//! 4. Convert findings into `FindingKey` values (no raw secret bytes).
+//! 5. Sort + dedup per blob to guarantee deterministic ordering.
+//!
 //! # Design
-//! - Chunk overlap uses `Engine::required_overlap()` and `ScanScratch::drop_prefix_findings`.
+//! - Chunk overlap uses `Engine::required_overlap()` and
+//!   `ScanScratch::drop_prefix_findings`.
 //! - A fixed-size ring buffer streams blob bytes into the scanner, avoiding
 //!   per-blob allocations beyond the chunk window.
-//! - Findings are converted to `FindingKey` values (no raw secret bytes) and
-//!   sorted + deduped per blob.
+//! - Findings are stored in a shared arena with per-blob spans.
+//!
+//! # Invariants
+//! - Results are returned in candidate order.
+//! - `ScannedBlob.findings` indexes into the adapter's findings arena.
+//! - Path refs in results point into the adapter's path arena.
+//! - When the debug allocation guard is enabled, scanning must not allocate.
 
 use std::fmt;
 
+use crate::scheduler::AllocGuard;
 use crate::{Engine, FileId, NormHash, ScanScratch};
 
+use super::alloc_guard;
 use super::byte_arena::{ByteArena, ByteRef};
 use super::object_id::OidBytes;
-use super::pack_candidates::PackCandidate;
+use super::pack_candidates::{LooseCandidate, PackCandidate};
 use super::pack_exec::{PackExecError, PackObjectSink};
+use super::perf;
 use super::tree_candidate::CandidateContext;
 
 /// Default chunk window size for adapter scanning (1 MiB).
@@ -32,8 +49,12 @@ pub struct EngineAdapterConfig {
     /// Total chunk window size (prefix + payload).
     ///
     /// The adapter will clamp this to at least `required_overlap + 1`.
+    /// Use `0` to select the default (`DEFAULT_CHUNK_BYTES`).
     pub chunk_bytes: usize,
     /// Maximum bytes for the adapter path arena.
+    ///
+    /// Paths longer than `ByteRef::MAX_LEN` still fail even if the arena has
+    /// capacity.
     pub path_arena_bytes: u32,
 }
 
@@ -65,6 +86,15 @@ pub struct FindingKey {
     pub norm_hash: NormHash,
 }
 
+/// Range into the adapter findings arena for a single blob.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FindingSpan {
+    /// Start index in the findings arena.
+    pub start: u32,
+    /// Number of findings for the blob.
+    pub len: u32,
+}
+
 /// Blob scanned by the engine adapter.
 #[derive(Clone, Debug)]
 pub struct ScannedBlob {
@@ -72,8 +102,17 @@ pub struct ScannedBlob {
     pub oid: OidBytes,
     /// Canonical context with path reference (adapter-owned arena).
     pub ctx: CandidateContext,
-    /// Sorted + deduped findings for this blob.
-    pub findings: Vec<FindingKey>,
+    /// Sorted + deduped findings span in the adapter findings arena.
+    pub findings: FindingSpan,
+}
+
+/// Collected scan results with a shared findings arena.
+#[derive(Clone, Debug)]
+pub struct ScannedBlobs {
+    /// Blobs scanned in candidate order.
+    pub blobs: Vec<ScannedBlob>,
+    /// Shared findings arena referenced by `ScannedBlob.findings`.
+    pub finding_arena: Vec<FindingKey>,
 }
 
 /// Engine adapter error taxonomy.
@@ -85,6 +124,8 @@ pub enum EngineAdapterError {
     PathArenaFull { needed: usize, remaining: u32 },
     /// Finding offsets exceed `u32` bounds.
     FindingOffsetOverflow { start: u64, end: u64 },
+    /// Findings arena index exceeds `u32` bounds.
+    FindingArenaOverflow { end: usize, max: u32 },
 }
 
 impl fmt::Display for EngineAdapterError {
@@ -102,6 +143,9 @@ impl fmt::Display for EngineAdapterError {
             Self::FindingOffsetOverflow { start, end } => {
                 write!(f, "finding offsets exceed u32: {start}..{end}")
             }
+            Self::FindingArenaOverflow { end, max } => {
+                write!(f, "findings arena index {end} exceeds max {max}")
+            }
         }
     }
 }
@@ -115,6 +159,9 @@ impl From<EngineAdapterError> for PackExecError {
 }
 
 /// Git engine adapter that implements `PackObjectSink`.
+///
+/// The adapter reuses a ring chunker and scratch space across blobs to
+/// minimize allocations on hot paths.
 pub struct EngineAdapter<'a> {
     engine: &'a Engine,
     scratch: ScanScratch,
@@ -122,6 +169,10 @@ pub struct EngineAdapter<'a> {
     chunk_bytes: usize,
     path_arena: ByteArena,
     results: Vec<ScannedBlob>,
+    findings_arena: Vec<FindingKey>,
+    findings_buf: Vec<FindingKey>,
+    chunker: RingChunker,
+    // Monotone ID for this adapter instance; wraps on overflow.
     next_file_id: u32,
 }
 
@@ -138,6 +189,9 @@ impl<'a> EngineAdapter<'a> {
             chunk_bytes,
             path_arena: ByteArena::with_capacity(config.path_arena_bytes),
             results: Vec::new(),
+            findings_arena: Vec::new(),
+            findings_buf: Vec::with_capacity(64),
+            chunker: RingChunker::new(chunk_bytes, overlap),
             next_file_id: 0,
         }
     }
@@ -148,15 +202,79 @@ impl<'a> EngineAdapter<'a> {
         &self.results
     }
 
-    /// Takes ownership of the accumulated results.
-    pub fn take_results(&mut self) -> Vec<ScannedBlob> {
-        std::mem::take(&mut self.results)
+    /// Returns the shared findings arena.
+    ///
+    /// Each `ScannedBlob.findings` references a span in this arena.
+    #[must_use]
+    pub fn findings_arena(&self) -> &[FindingKey] {
+        &self.findings_arena
+    }
+
+    /// Takes ownership of the accumulated results and findings arena.
+    pub fn take_results(&mut self) -> ScannedBlobs {
+        ScannedBlobs {
+            blobs: std::mem::take(&mut self.results),
+            finding_arena: std::mem::take(&mut self.findings_arena),
+        }
+    }
+
+    /// Clears accumulated results while preserving allocated capacity.
+    pub fn clear_results(&mut self) {
+        self.results.clear();
+        self.findings_arena.clear();
+        self.findings_buf.clear();
     }
 
     /// Returns the adapter-owned path arena.
     #[must_use]
     pub fn path_arena(&self) -> &ByteArena {
         &self.path_arena
+    }
+
+    /// Reserves capacity for upcoming blob results.
+    pub fn reserve_results(&mut self, additional: usize) {
+        self.results.reserve(additional);
+    }
+
+    /// Reserves capacity in the shared findings arena.
+    pub fn reserve_findings(&mut self, additional: usize) {
+        self.findings_arena.reserve(additional);
+    }
+
+    /// Reserves capacity for the per-blob findings buffer.
+    pub fn reserve_findings_buf(&mut self, additional: usize) {
+        self.findings_buf.reserve(additional);
+    }
+
+    /// Emits a loose candidate blob for scanning.
+    ///
+    /// This follows the same path/arena and finding aggregation logic as
+    /// packed candidates.
+    ///
+    /// # Errors
+    /// - `PathTooLong` or `PathArenaFull` if the path cannot be interned.
+    /// - `FindingOffsetOverflow` or `FindingArenaOverflow` for oversized blobs.
+    pub fn emit_loose(
+        &mut self,
+        candidate: &LooseCandidate,
+        path: &[u8],
+        bytes: &[u8],
+    ) -> Result<(), PackExecError> {
+        let path_ref = self.intern_path(path)?;
+        let mut ctx = candidate.ctx;
+        ctx.path_ref = path_ref;
+
+        let file_id = FileId(self.next_file_id);
+        self.next_file_id = self.next_file_id.wrapping_add(1);
+
+        self.scan_blob_into_buf(file_id, bytes)?;
+        let span = self.record_findings()?;
+        self.results.push(ScannedBlob {
+            oid: candidate.oid,
+            ctx,
+            findings: span,
+        });
+        Ok(())
     }
 
     fn intern_path(&mut self, path: &[u8]) -> Result<ByteRef, EngineAdapterError> {
@@ -174,21 +292,37 @@ impl<'a> EngineAdapter<'a> {
             })
     }
 
-    fn scan_blob(
+    fn scan_blob_into_buf(
         &mut self,
         file_id: FileId,
         bytes: &[u8],
-        out: &mut Vec<FindingKey>,
     ) -> Result<(), EngineAdapterError> {
-        scan_blob_chunked_into(
+        self.findings_buf.clear();
+        scan_blob_chunked_with_chunker(
             self.engine,
             &mut self.scratch,
             file_id,
             bytes,
-            self.chunk_bytes,
             self.overlap,
-            out,
+            &mut self.chunker,
+            &mut self.findings_buf,
         )
+    }
+
+    fn record_findings(&mut self) -> Result<FindingSpan, EngineAdapterError> {
+        let start = self.findings_arena.len();
+        let len = self.findings_buf.len();
+        let end = start.saturating_add(len);
+        if end > u32::MAX as usize {
+            return Err(EngineAdapterError::FindingArenaOverflow { end, max: u32::MAX });
+        }
+
+        // Extend the shared arena; the returned span is used by `ScannedBlob`.
+        self.findings_arena.extend_from_slice(&self.findings_buf);
+        Ok(FindingSpan {
+            start: start as u32,
+            len: len as u32,
+        })
     }
 }
 
@@ -206,18 +340,20 @@ impl PackObjectSink for EngineAdapter<'_> {
         let file_id = FileId(self.next_file_id);
         self.next_file_id = self.next_file_id.wrapping_add(1);
 
-        let mut findings: Vec<FindingKey> = Vec::new();
-        self.scan_blob(file_id, bytes, &mut findings)?;
+        self.scan_blob_into_buf(file_id, bytes)?;
+        let span = self.record_findings()?;
         self.results.push(ScannedBlob {
             oid: candidate.oid,
             ctx,
-            findings,
+            findings: span,
         });
         Ok(())
     }
 }
 
 /// Scan a blob with overlap-safe chunking and return sorted + deduped findings.
+///
+/// Findings are normalized into `FindingKey` values and ordered deterministically.
 ///
 /// # Errors
 /// - `FindingOffsetOverflow` if any finding span exceeds `u32` bounds.
@@ -244,6 +380,7 @@ pub fn scan_blob_chunked(
 
 fn effective_chunk_bytes(requested: usize, overlap: usize) -> usize {
     // Enforce progress and clamp to u32::MAX for offset conversion safety.
+    // Finding offsets are stored as `u32`, so chunking must preserve bounds.
     let min = overlap.saturating_add(1).max(1);
     let base = if requested == 0 {
         DEFAULT_CHUNK_BYTES
@@ -262,30 +399,67 @@ fn scan_blob_chunked_into(
     overlap: usize,
     out: &mut Vec<FindingKey>,
 ) -> Result<(), EngineAdapterError> {
-    out.clear();
     let mut chunker = RingChunker::new(chunk_bytes, overlap);
-    let mut err: Option<EngineAdapterError> = None;
+    scan_blob_chunked_with_chunker(engine, scratch, file_id, blob, overlap, &mut chunker, out)
+}
 
-    chunker.feed(blob, |view| {
-        if err.is_some() {
-            return;
+/// Scan a blob using a reusable chunker and optional allocation guard.
+///
+/// When the debug allocation guard is enabled, `assert_no_alloc()` is called
+/// after the scan to verify no heap allocations occurred in the hot path.
+fn scan_blob_chunked_with_chunker(
+    engine: &Engine,
+    scratch: &mut ScanScratch,
+    file_id: FileId,
+    blob: &[u8],
+    overlap: usize,
+    chunker: &mut RingChunker,
+    out: &mut Vec<FindingKey>,
+) -> Result<(), EngineAdapterError> {
+    let (res, nanos) = perf::time(|| {
+        let guard = if alloc_guard::enabled() {
+            Some(AllocGuard::new())
+        } else {
+            None
+        };
+
+        out.clear();
+        chunker.reset();
+        debug_assert_eq!(chunker.overlap(), overlap, "overlap mismatch");
+        let mut err: Option<EngineAdapterError> = None;
+
+        chunker.feed(blob, |view| {
+            if err.is_some() {
+                return;
+            }
+            scan_chunk(engine, scratch, file_id, overlap, view, out, &mut err);
+        });
+        chunker.flush(|view| {
+            if err.is_some() {
+                return;
+            }
+            scan_chunk(engine, scratch, file_id, overlap, view, out, &mut err);
+        });
+
+        if let Some(err) = err {
+            return Err(err);
         }
-        scan_chunk(engine, scratch, file_id, overlap, view, out, &mut err);
-    });
-    chunker.flush(|view| {
-        if err.is_some() {
-            return;
+
+        out.sort_unstable();
+        out.dedup();
+
+        if let Some(guard) = guard {
+            guard.assert_no_alloc();
         }
-        scan_chunk(engine, scratch, file_id, overlap, view, out, &mut err);
+
+        Ok(())
     });
 
-    if let Some(err) = err {
-        return Err(err);
+    if res.is_ok() {
+        perf::record_scan(blob.len(), nanos);
     }
 
-    out.sort_unstable();
-    out.dedup();
-    Ok(())
+    res
 }
 
 fn scan_chunk(
@@ -298,6 +472,8 @@ fn scan_chunk(
     err: &mut Option<EngineAdapterError>,
 ) {
     engine.scan_chunk_into(view.window, file_id, view.base, scratch);
+    // Skip findings that are fully contained in the overlap prefix.
+    // This keeps each match while avoiding duplicate reporting.
     let new_bytes_start = if view.is_first {
         view.base
     } else {
@@ -328,7 +504,9 @@ fn scan_chunk(
 struct ChunkView<'a> {
     /// Absolute start offset of `window` within the blob.
     base: u64,
+    /// Indicates the first window so the overlap prefix is not dropped.
     is_first: bool,
+    /// Window bytes: overlap prefix followed by new bytes.
     window: &'a [u8],
 }
 
@@ -356,6 +534,10 @@ impl RingChunker {
         }
     }
 
+    fn overlap(&self) -> usize {
+        self.overlap
+    }
+
     fn reset(&mut self) {
         self.filled = 0;
         self.base = 0;
@@ -378,6 +560,7 @@ impl RingChunker {
                 });
                 self.is_first = false;
                 let step = self.chunk_bytes - self.overlap;
+                // Retain the overlap prefix so the next window includes it.
                 if self.overlap > 0 {
                     self.buf
                         .copy_within(self.chunk_bytes - self.overlap..self.chunk_bytes, 0);

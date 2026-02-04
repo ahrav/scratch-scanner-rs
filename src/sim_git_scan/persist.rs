@@ -5,14 +5,15 @@
 //! intended for simulation only and is not thread-safe.
 //!
 //! # Fault model
-//! - Each `write_*_ops` call consumes one fault-plan read for `Persist`.
+//! - Each `commit_finalize` call consumes one fault-plan read for `Persist`.
 //! - I/O faults are surfaced as `PersistError::io`.
 //! - Corruption faults are surfaced as backend errors.
+//! - Faults abort the commit; no ops are logged.
 
 use std::cell::RefCell;
 use std::io;
 
-use crate::git_scan::{PersistError, PersistenceStore, WriteOp};
+use crate::git_scan::{FinalizeOutcome, FinalizeOutput, PersistError, PersistenceStore};
 
 use super::fault::{GitFaultInjector, GitFaultPlan, GitIoFault, GitResourceId};
 
@@ -32,6 +33,11 @@ pub struct SimPersistOp {
 }
 
 /// In-memory persistence store with deterministic fault injection.
+///
+/// # Invariants
+/// - Commits are atomic: if a fault is injected, no ops are logged.
+/// - On `FinalizeOutcome::Complete`, data ops are logged before watermark ops.
+/// - On partial outcomes, watermark ops are ignored.
 #[derive(Debug)]
 pub struct SimPersistStore {
     log: RefCell<Vec<SimPersistOp>>,
@@ -58,7 +64,7 @@ impl SimPersistStore {
         self.log.borrow_mut().clear();
     }
 
-    fn apply_ops(&self, phase: PersistPhase, ops: &[WriteOp]) -> Result<(), PersistError> {
+    fn apply_finalize(&self, output: &FinalizeOutput) -> Result<(), PersistError> {
         let (fault, _idx) = self.faults.borrow_mut().next_read(&GitResourceId::Persist);
         if let Some(io_fault) = &fault.fault {
             return Err(fault_to_error(io_fault));
@@ -68,12 +74,21 @@ impl SimPersistStore {
         }
 
         let mut log = self.log.borrow_mut();
-        for op in ops {
+        for op in &output.data_ops {
             log.push(SimPersistOp {
-                phase,
+                phase: PersistPhase::Data,
                 key: op.key.clone(),
                 value: op.value.clone(),
             });
+        }
+        if matches!(output.outcome, FinalizeOutcome::Complete) {
+            for op in &output.watermark_ops {
+                log.push(SimPersistOp {
+                    phase: PersistPhase::Watermark,
+                    key: op.key.clone(),
+                    value: op.value.clone(),
+                });
+            }
         }
         Ok(())
     }
@@ -86,12 +101,8 @@ impl Default for SimPersistStore {
 }
 
 impl PersistenceStore for SimPersistStore {
-    fn write_data_ops(&self, ops: &[WriteOp]) -> Result<(), PersistError> {
-        self.apply_ops(PersistPhase::Data, ops)
-    }
-
-    fn write_watermark_ops(&self, ops: &[WriteOp]) -> Result<(), PersistError> {
-        self.apply_ops(PersistPhase::Watermark, ops)
+    fn commit_finalize(&self, output: &FinalizeOutput) -> Result<(), PersistError> {
+        self.apply_finalize(output)
     }
 }
 
@@ -132,18 +143,15 @@ mod tests {
     }
 
     #[test]
-    fn persistence_failure_skips_watermarks() {
+    fn persistence_failure_is_atomic() {
         let plan = GitFaultPlan {
             resources: vec![super::super::fault::GitResourceFaults {
                 resource: GitResourceId::Persist,
-                reads: vec![
-                    super::super::fault::GitReadFault::default(),
-                    super::super::fault::GitReadFault {
-                        fault: Some(GitIoFault::ErrKind { kind: 1 }),
-                        latency_ticks: 0,
-                        corruption: None,
-                    },
-                ],
+                reads: vec![super::super::fault::GitReadFault {
+                    fault: Some(GitIoFault::ErrKind { kind: 1 }),
+                    latency_ticks: 0,
+                    corruption: None,
+                }],
             }],
         };
 
@@ -153,8 +161,7 @@ mod tests {
         assert!(result.is_err(), "expected persistence failure");
 
         let log = store.log();
-        assert_eq!(log.len(), 1);
-        assert_eq!(log[0].phase, PersistPhase::Data);
+        assert!(log.is_empty());
     }
 
     #[test]

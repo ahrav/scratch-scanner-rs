@@ -1,16 +1,21 @@
 //! Hard caps and tunables for Git maintenance preflight.
 //!
-//! All limits are explicit and enforced. No silent truncation. These bounds
+//! All limits are explicit and enforced for file reads. Pack count is tracked
+//! as a maintenance recommendation threshold, not a hard gate. These bounds
 //! keep preflight fast and deterministic by capping file reads and the
 //! maximum number of pack files inspected across object stores.
+//!
+//! # Invariants
+//! - Limits are validated at construction and in const contexts.
+//! - Pack count thresholds are advisory; readiness is determined elsewhere.
 
 /// Hard caps for maintenance preflight.
 ///
-/// These limits bound file reads during repository discovery and keep
-/// pack counts within a locality-friendly range.
+/// These limits bound file reads during repository discovery and provide
+/// pack-count thresholds for maintenance recommendations.
 #[derive(Clone, Copy, Debug)]
 pub struct PreflightLimits {
-    /// Maximum number of pack files allowed across all object stores.
+    /// Pack count recommendation threshold across all object stores.
     ///
     /// Pack files are counted by `*.pack` entries in `objects/pack`, including
     /// alternate object directories. Default: 4 (target 1-4 packs).
@@ -39,6 +44,9 @@ pub struct PreflightLimits {
 
 impl PreflightLimits {
     /// Safe defaults suitable for large monorepos.
+    ///
+    /// These values trade a small amount of metadata IO for predictable
+    /// preflight performance on large repositories.
     pub const DEFAULT: Self = Self {
         max_pack_count: 4,
         max_dot_git_file_bytes: 8 * 1024,
@@ -107,9 +115,9 @@ impl Default for PreflightLimits {
     }
 }
 
-// Compile-time validation of default limits
+// Compile-time validation of default limits.
 const _: () = PreflightLimits::DEFAULT.validate();
 const _: () = PreflightLimits::RESTRICTIVE.validate();
 
-// Compile-time size assertion (verify packed layout)
+// Compile-time size assertion (verify packed layout).
 const _: () = assert!(std::mem::size_of::<PreflightLimits>() <= 24);

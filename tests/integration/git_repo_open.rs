@@ -137,6 +137,7 @@ fn repo_open_linked_worktree_and_alternates() {
     assert!(matches!(state.artifact_status, RepoArtifactStatus::Ready));
     assert!(state.mmaps.commit_graph.is_some());
     assert!(state.mmaps.midx.is_some());
+    assert!(state.artifact_fingerprint.is_some());
 }
 
 #[test]
@@ -185,4 +186,74 @@ fn repo_open_sorts_refs_and_loads_watermarks() {
     assert!(state.start_set[0].watermark.is_some());
     assert!(state.start_set[1].watermark.is_none());
     assert!(state.start_set[2].watermark.is_none());
+}
+
+#[test]
+fn repo_open_detects_lock_files() {
+    let tmp = TempDir::new().unwrap();
+    let git_dir = create_main_repo(tmp.path());
+
+    let objects_dir = git_dir.join("objects");
+    let pack_dir = objects_dir.join("pack");
+    write_commit_graph(&objects_dir);
+    write_midx(&pack_dir);
+
+    let lock_path = objects_dir.join("info").join("commit-graph.lock");
+    fs::write(lock_path, b"").unwrap();
+
+    let resolver = TestResolver { refs: vec![] };
+    let start_set_id = StartSetConfig::DefaultBranchOnly.id();
+
+    let state = repo_open(
+        tmp.path(),
+        1,
+        [0u8; 32],
+        start_set_id,
+        &resolver,
+        &TestWatermarkStore,
+        RepoOpenLimits::DEFAULT,
+    )
+    .unwrap();
+
+    match state.artifact_status {
+        RepoArtifactStatus::NeedsMaintenance { lock_present, .. } => {
+            assert!(lock_present, "lock should be detected");
+        }
+        RepoArtifactStatus::Ready => panic!("expected NeedsMaintenance"),
+    }
+    assert!(state.mmaps.commit_graph.is_none());
+    assert!(state.mmaps.midx.is_none());
+    assert!(state.artifact_fingerprint.is_none());
+}
+
+#[test]
+fn repo_open_detects_artifact_changes() {
+    let tmp = TempDir::new().unwrap();
+    let git_dir = create_main_repo(tmp.path());
+
+    let objects_dir = git_dir.join("objects");
+    let pack_dir = objects_dir.join("pack");
+    write_commit_graph(&objects_dir);
+    write_midx(&pack_dir);
+
+    let resolver = TestResolver { refs: vec![] };
+    let start_set_id = StartSetConfig::DefaultBranchOnly.id();
+
+    let state = repo_open(
+        tmp.path(),
+        1,
+        [0u8; 32],
+        start_set_id,
+        &resolver,
+        &TestWatermarkStore,
+        RepoOpenLimits::DEFAULT,
+    )
+    .unwrap();
+
+    assert!(state.artifacts_unchanged().unwrap());
+
+    let commit_graph_path = objects_dir.join("info").join("commit-graph");
+    fs::write(commit_graph_path, b"CGPH2").unwrap();
+
+    assert!(!state.artifacts_unchanged().unwrap());
 }

@@ -75,7 +75,10 @@ Git tree diffing has its own bounded memory envelope:
   bounded buffers capped by the tree bytes budget (plus a small header slack
   for loose objects).
 - **Candidate storage**: candidate buffer and path arena sizes are explicitly
-  bounded by `TreeDiffLimits.max_candidates` and `max_path_arena_bytes`.
+  bounded by `TreeDiffLimits.max_candidates` and `max_path_arena_bytes`. The
+  runner streams candidates directly into the spill/dedupe sink to avoid
+  buffering the entire plan in memory; `CandidateBuffer` uses a capped
+  initial capacity and can be cleared between diffs when used.
 - **Tree cache sizing**: tree payload cache uses fixed-size slots (4 KiB)
   with 4-way sets; total cache bytes are rounded down to a power-of-two
   set count. Entries larger than a slot are not cached.
@@ -102,6 +105,18 @@ Seen filtering uses a per-batch arena capped by `SpillLimits.seen_batch_max_path
 and batches up to `SpillLimits.seen_batch_max_oids` OIDs before issuing a
 seen-store query. Batches are flushed on either limit to keep memory bounded.
 
+## Git Mapping Budgets
+
+The mapping bridge re-interns candidate paths into a long-lived arena and
+collects pack/loose candidates for downstream planning:
+
+- **Path arena**: bounded by `MappingBridgeConfig.path_arena_capacity`.
+- **Candidate caps**: `MappingBridgeConfig.max_packed_candidates` and
+  `MappingBridgeConfig.max_loose_candidates` bound the in-memory vectors.
+- **Failure mode**: exceeding either cap returns
+  `SpillError::MappingCandidateLimitExceeded` and aborts the run before
+  watermark advancement.
+
 ## Git Pack Planning Budgets
 
 Pack planning builds per-pack `PackPlan` buffers sized to the candidate set
@@ -116,6 +131,8 @@ and the delta-base closure:
   internal base offsets or external base OIDs).
 - Entry header cache: one cached `ParsedEntry` per offset in `need_offsets`
   during planning, bounded by the same worklist cap.
+- Base lookups: `PackPlanConfig.max_base_lookups` bounds REF delta
+  resolver calls to prevent unbounded MIDX lookups.
 - Exec order: optional `Vec<u32>` of indices into `need_offsets` when forward
   dependencies exist.
 - Clusters: ranges over `need_offsets` split when gaps exceed
@@ -138,6 +155,19 @@ Pack decode uses bounded buffers and a fixed-size cache:
 
 These limits keep pack decoding deterministic and bound memory to the
 configured cache capacity plus temporary inflate buffers.
+
+## Git Scan Hot-Loop Allocation Guard
+
+Hot-loop allocations are prohibited after warmup in pack execution and
+engine scanning:
+
+- **Debug guard**: `git_scan::set_alloc_guard_enabled(true)` enables a
+  debug-only `AllocGuard` around pack exec and engine adapter scan paths.
+- **Findings arena**: per-blob findings are stored in a shared arena and
+  referenced by spans (`FindingSpan`), avoiding per-blob `Vec` allocations.
+
+Use the allocation guard in debug tests with the counting allocator to
+verify no heap activity after warmup.
 
 ## Single-Threaded Pipeline Memory Model
 

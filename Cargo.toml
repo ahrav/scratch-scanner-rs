@@ -58,6 +58,7 @@ scheduler-affinity = ["core_affinity"]  # Thread pinning support for scheduler
 io-uring = []  # Enable io_uring scanner on Linux
 scheduler-sim = []  # Enable longer-running scheduler simulation tests
 rocksdb = ["dep:rocksdb"]
+git-perf = []
 
 [dev-dependencies]
 base64 = "0.22"

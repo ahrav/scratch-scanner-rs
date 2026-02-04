@@ -41,6 +41,8 @@ const DEFAULT_MAX_HEADER_BYTES: usize = 64;
 const DEFAULT_MAX_DELTA_DEPTH: u8 = 16;
 /// Default maximum offsets tracked during planning.
 const DEFAULT_MAX_WORKLIST_ENTRIES: usize = 1_000_000;
+/// Default maximum REF base lookups during planning.
+const DEFAULT_MAX_BASE_LOOKUPS: usize = 1_000_000;
 
 /// Config for pack planning.
 ///
@@ -54,6 +56,8 @@ pub struct PackPlanConfig {
     pub max_header_bytes: usize,
     /// Maximum number of unique offsets tracked during planning.
     pub max_worklist_entries: usize,
+    /// Maximum REF base lookups during planning.
+    pub max_base_lookups: usize,
 }
 
 impl Default for PackPlanConfig {
@@ -62,6 +66,7 @@ impl Default for PackPlanConfig {
             max_delta_depth: DEFAULT_MAX_DELTA_DEPTH,
             max_header_bytes: DEFAULT_MAX_HEADER_BYTES,
             max_worklist_entries: DEFAULT_MAX_WORKLIST_ENTRIES,
+            max_base_lookups: DEFAULT_MAX_BASE_LOOKUPS,
         }
     }
 }
@@ -79,6 +84,8 @@ pub enum PackPlanError {
     PackIdOutOfRange { pack_id: u16, pack_count: usize },
     /// Unique offsets exceeded the configured worklist limit.
     WorklistLimitExceeded { limit: usize, observed: usize },
+    /// REF base lookups exceeded the configured limit.
+    BaseLookupLimitExceeded { limit: usize, observed: usize },
     /// Delta dependency graph contains a cycle.
     DeltaCycleDetected { pack_id: u16, offset: u64 },
     /// MIDX lookup or ordering error.
@@ -108,6 +115,12 @@ impl fmt::Display for PackPlanError {
                 write!(
                     f,
                     "pack plan worklist exceeded limit {limit} (saw {observed})"
+                )
+            }
+            Self::BaseLookupLimitExceeded { limit, observed } => {
+                write!(
+                    f,
+                    "pack plan base lookups exceeded limit {limit} (saw {observed})"
                 )
             }
             Self::DeltaCycleDetected { pack_id, offset } => {
@@ -312,6 +325,7 @@ fn build_pack_plan_for_pack<'a, R: OidResolver>(
     let mut entry_cache: HashMap<u64, ParsedEntry> =
         HashMap::with_capacity(unique_candidate_offsets.len());
 
+    let mut base_lookup_count = 0usize;
     for &offset in &unique_candidate_offsets {
         // Candidate offsets must be in range; base offsets are validated later.
         parse_entry(
@@ -322,6 +336,7 @@ fn build_pack_plan_for_pack<'a, R: OidResolver>(
             config,
             pack_id,
             true,
+            &mut base_lookup_count,
         )?;
     }
 
@@ -350,6 +365,7 @@ fn build_pack_plan_for_pack<'a, R: OidResolver>(
             config,
             pack_id,
             false,
+            &mut base_lookup_count,
         )?;
 
         let next_depth = item.depth.saturating_add(1);
@@ -444,6 +460,7 @@ fn build_pack_plan_for_pack<'a, R: OidResolver>(
 ///
 /// Candidate offsets that are out of range return a dedicated error; base
 /// offsets that are out of range are treated as pack corruption.
+#[allow(clippy::too_many_arguments)]
 fn parse_entry<R: OidResolver>(
     offset: u64,
     pack: &PackView<'_>,
@@ -452,6 +469,7 @@ fn parse_entry<R: OidResolver>(
     config: &PackPlanConfig,
     pack_id: u16,
     is_candidate: bool,
+    base_lookup_count: &mut usize,
 ) -> Result<ParsedEntry, PackPlanError> {
     if let Some(entry) = cache.get(&offset) {
         return Ok(*entry);
@@ -470,6 +488,13 @@ fn parse_entry<R: OidResolver>(
         EntryKind::NonDelta { .. } => ParsedEntry::NonDelta,
         EntryKind::OfsDelta { base_offset } => ParsedEntry::Ofs { base_offset },
         EntryKind::RefDelta { base_oid } => {
+            if *base_lookup_count >= config.max_base_lookups {
+                return Err(PackPlanError::BaseLookupLimitExceeded {
+                    limit: config.max_base_lookups,
+                    observed: base_lookup_count.saturating_add(1),
+                });
+            }
+            *base_lookup_count += 1;
             let base = resolver.resolve(&base_oid)?;
             ParsedEntry::Ref { base_oid, base }
         }
