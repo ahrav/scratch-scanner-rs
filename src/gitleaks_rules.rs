@@ -1,8 +1,28 @@
+//! Gitleaks-inspired rule set for the scanner.
+//!
+//! Purpose: provide a curated `Vec<RuleSpec>` suitable for default scanning.
+//! The rules favor ASCII anchors/keywords so the engine can derive UTF-16
+//! variants automatically and apply cheap gates before regex validation.
+//!
+//! # Invariants
+//! - Anchors and keyword gates are ASCII-ish literals aligned with the regex intent.
+//! - Regexes are compiled as bytes regexes with Unicode disabled.
+//! - The output order is stable but does not imply rule priority.
+//! - Any change to rule literals, regex, or config should be treated as a
+//!   policy change and reflected in downstream benchmarking.
+
 use crate::api::{EntropySpec, LocalContextSpec, RuleSpec, TwoPhaseSpec, ValidatorKind};
 use regex::bytes::Regex;
 
+/// Progressive regex size limits (bytes) to tolerate large DFAs on complex rules.
+///
+/// We retry compilation on `CompiledTooBig` so a single oversized rule does not
+/// require globally lifting size limits for all patterns.
 const REGEX_SIZE_LIMITS: &[usize] = &[32 * 1024 * 1024, 128 * 1024 * 1024, 512 * 1024 * 1024];
 
+/// Build a bytes regex with increasing size limits.
+///
+/// Panics if the pattern is invalid or exceeds the maximum configured limits.
 fn build_regex(pattern: &str) -> Regex {
     for &limit in REGEX_SIZE_LIMITS {
         let mut builder = regex::bytes::RegexBuilder::new(pattern);
@@ -20,6 +40,11 @@ fn build_regex(pattern: &str) -> Regex {
         REGEX_SIZE_LIMITS[REGEX_SIZE_LIMITS.len() - 1]
     );
 }
+
+/// Return the full gitleaks-derived rule suite.
+///
+/// The rules are expressed as `RuleSpec` with anchors/keywords tuned for fast
+/// gating; regexes are validated at startup and will panic if compilation fails.
 pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
     const PRIVATE_KEY_CONFIRM: &[&[u8]] = &[b"PRIVATE KEY"];
 
@@ -142,6 +167,7 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
         },
         RuleSpec {
             name: "airtable-personnal-access-token",
+            // Token prefix is `pat...`; we anchor on "airtable" to require context.
             anchors: &[b"airtable"],
             radius: 256,
             validator: ValidatorKind::None,

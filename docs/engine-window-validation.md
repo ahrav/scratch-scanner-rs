@@ -6,6 +6,10 @@
 
 The window validation module executes compiled detection rules against fixed-size byte windows extracted from scanned data. It performs the critical "hot path" validation where patterns are matched, gates are enforced, and findings are recorded. The module handles both raw binary data and UTF-16 encoded content, applying progressive filtering through cheap gates before expensive regex matching.
 
+Two entry styles are supported:
+- **Engine hot path**: `run_rule_on_window` writes findings directly into `ScanScratch` and performs dedupe bookkeeping immediately.
+- **Scheduler adapters**: `run_rule_on_raw_window_into` / `run_rule_on_utf16_window_into` accumulate findings into scratch staging buffers so the caller can commit results and track drops.
+
 ### Key Responsibilities
 
 - **Gate-based filtering**: Apply cost-effective byte-level checks before regex execution
@@ -56,7 +60,7 @@ This margin accounts for patterns where the anchor may appear in the middle of t
 
 ## Merge and Coalesce Strategies
 
-This module does not implement merge or coalesce operations. Those are handled in separate modules (likely `engine::core` or `engine::window_build`). The window validation module receives pre-built, non-overlapping windows and focuses on validation and finding extraction.
+This module does not implement merge or coalesce operations. Those are handled in separate modules (e.g., window build/merge stages). The window validation module receives pre-built windows (which may overlap) and focuses only on validation and finding extraction.
 
 ---
 
@@ -94,7 +98,7 @@ The function maintains invariants about coordinate spaces:
 - **Raw variant**: All spans are expressed in raw buffer byte offsets
 - **UTF-16 variants**:
   - Spans in findings are in decoded UTF-8 byte space
-  - Root hints use window range (raw byte offsets)
+  - Root hints use the **full match span** mapped back to raw UTF-16 byte offsets, and then (when available) through `root_span_map_ctx`
   - A `DecodeStep::Utf16Window` is attached to findings to enable mapping back to parent raw offsets
 
 ### Return Behavior
@@ -357,10 +361,11 @@ scratch.push_finding(FindingRec {
 
 ## Finding Recording
 
-Findings are recorded into the provided `ScanScratch` structure via `scratch.push_finding()`:
+Findings are recorded into the provided `ScanScratch` structure with drop-hint and normalization data to support dedupe and chunk-boundary safety. The engine hot path uses `scratch.push_finding_with_drop_hint(...)`, while the scheduler adapters stage data in `scratch.tmp_findings` plus companion arrays (`tmp_drop_hint_end`, `tmp_norm_hash`) for the caller to commit.
 
 ```rust
-scratch.push_finding(FindingRec {
+scratch.push_finding_with_drop_hint(
+    FindingRec {
     file_id,
     rule_id,
     span_start: span_in_buf.start as u32,
@@ -368,7 +373,11 @@ scratch.push_finding(FindingRec {
     root_hint_start: base_offset + root_span_hint.start as u64,
     root_hint_end: base_offset + root_span_hint.end as u64,
     step_id,
-});
+    },
+    norm_hash,
+    drop_hint_end,
+    dedupe_with_span,
+);
 ```
 
 ### FindingRec Fields
@@ -382,6 +391,7 @@ scratch.push_finding(FindingRec {
 | `root_hint_start` | `u64` | Full match start (file offset for deduplication) |
 | `root_hint_end` | `u64` | Full match end (file offset for deduplication) |
 | `step_id` | `StepId` | Decode chain reference (enables span mapping) |
+| `dedupe_with_span` | `bool` | Whether `span_start`/`span_end` participate in dedupe |
 
 ### Capacity Management
 
@@ -403,14 +413,14 @@ Excess findings are counted in `dropped` for metrics but not stored.
 
 **UTF-16 variants**:
 - `span_start`/`span_end`: Decoded UTF-8 byte space
-- `root_hint_*`: Window range (raw byte offsets) due to complexity of mapping individual UTF-8 bytes back to raw UTF-16 positions
+- `root_hint_*`: Full match span mapped back into raw UTF-16 byte offsets, then (when present) through `root_span_map_ctx` for transform-derived buffers
 - `step_id`: Points to `DecodeStep::Utf16Window` that stores endianness and parent span for later mapping
 
 ---
 
 ## UTF-16 Handling
 
-The module supports UTF-16LE and UTF-16BE variants through a unified code path:
+The module supports UTF-16LE and UTF-16BE variants through a unified code path that scans both byte parities when anchors can land on either boundary.
 
 ### Decode Budget Enforcement
 
