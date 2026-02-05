@@ -9,4 +9,4 @@ pub mod zip;
 
 pub use gzip::{is_gzip_magic, GzipStream};
 pub use tar::{is_ustar_header, TarCursor, TarInput, TarNext, TarRead};
-pub use zip::{is_zip_magic, ZipCursor, ZipEntryMeta, ZipEntryReader, ZipNext, ZipOpen};
+pub use zip::{is_zip_magic, ZipCursor, ZipEntryMeta, ZipEntryReader, ZipNext, ZipOpen, ZipSource};

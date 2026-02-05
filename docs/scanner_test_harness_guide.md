@@ -35,6 +35,10 @@ cargo test --features sim-harness --test simulation scanner_corpus
 # Run bounded random simulations
 cargo test --features sim-harness --test simulation scanner_random
 
+# Run archive corpus and random simulations
+cargo test --features sim-harness --test simulation scanner_archive_corpus
+cargo test --features sim-harness --test simulation scanner_archive_random
+
 # Scale via environment variables
 SIM_SCANNER_SEED_COUNT=100 cargo test --features sim-harness --test simulation scanner_random
 
@@ -53,16 +57,20 @@ DUMP_SIM_FAIL=1 cargo test --features sim-harness --test simulation scanner_rand
 
 Configuration for generating synthetic scanner scenarios.
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `schema_version` | u32 | 1 | Schema version for forward-compatible evolution |
-| `rule_count` | u32 | 2 | Number of synthetic rules to generate |
-| `file_count` | u32 | 2 | Number of files to generate |
-| `secrets_per_file` | u32 | 3 | Secrets inserted per file |
-| `token_len` | u32 | 12 | Random token length (appended to rule prefix) |
-| `min_noise_len` | u32 | 8 | Minimum padding bytes between secrets |
-| `max_noise_len` | u32 | 32 | Maximum padding bytes between secrets |
-| `representations` | `Vec<SecretRepr>` | all variants | Allowed secret encodings to choose from |
+| Field              | Type                   | Default                | Description                                     |
+| ------------------ | ---------------------- | ---------------------- | ----------------------------------------------- |
+| `schema_version`   | u32                    | 1                      | Schema version for forward-compatible evolution |
+| `rule_count`       | u32                    | 2                      | Number of synthetic rules to generate           |
+| `file_count`       | u32                    | 2                      | Number of files to generate                     |
+| `secrets_per_file` | u32                    | 3                      | Secrets inserted per file                       |
+| `token_len`        | u32                    | 12                     | Random token length (appended to rule prefix)   |
+| `min_noise_len`    | u32                    | 8                      | Minimum padding bytes between secrets           |
+| `max_noise_len`    | u32                    | 32                     | Maximum padding bytes between secrets           |
+| `representations`  | `Vec<SecretRepr>`      | all variants           | Allowed secret encodings to choose from         |
+| `archive_count`    | u32                    | 0                      | Number of archive files to generate             |
+| `archive_entries`  | u32                    | 2                      | Entries per generated archive                   |
+| `archive_kinds`    | `Vec<ArchiveKindSpec>` | tar, tar.gz, zip, gzip | Archive formats to include                      |
+| `archive`          | `ArchiveConfig`        | default                | Archive config used to compute virtual paths    |
 
 **Example:**
 ```rust
@@ -83,17 +91,18 @@ let scenario = generate_scenario(42, &gen_cfg)?;
 
 Configuration for a single simulation run.
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `workers` | u32 | required | Number of simulated worker threads |
-| `chunk_size` | u32 | required | Scanning chunk size in bytes |
-| `overlap` | u32 | required | Overlap bytes between chunks (must >= `engine.required_overlap()`) |
-| `max_in_flight_objects` | u32 | 16 | Maximum concurrent file operations |
-| `buffer_pool_cap` | u32 | 8 | Buffer pool capacity |
-| `max_steps` | u64 | auto | Simulation step limit (0 = auto-derived) |
-| `max_transform_depth` | u32 | 3 | Maximum decode nesting depth |
-| `scan_utf16_variants` | bool | true | Enable UTF-16 LE/BE scanning |
-| `stability_runs` | u32 | 2 | Runs per scenario with different schedule seeds |
+| Field                   | Type          | Default  | Description                                                        |
+| ----------------------- | ------------- | -------- | ------------------------------------------------------------------ |
+| `workers`               | u32           | required | Number of simulated worker threads                                 |
+| `chunk_size`            | u32           | required | Scanning chunk size in bytes                                       |
+| `overlap`               | u32           | required | Overlap bytes between chunks (must >= `engine.required_overlap()`) |
+| `max_in_flight_objects` | u32           | 16       | Maximum concurrent file operations                                 |
+| `buffer_pool_cap`       | u32           | 8        | Buffer pool capacity                                               |
+| `max_steps`             | u64           | auto     | Simulation step limit (0 = auto-derived)                           |
+| `max_transform_depth`   | u32           | 3        | Maximum decode nesting depth                                       |
+| `scan_utf16_variants`   | bool          | true     | Enable UTF-16 LE/BE scanning                                       |
+| `archive`               | ArchiveConfig | default  | Archive scanning configuration (shared with production)            |
+| `stability_runs`        | u32           | 2        | Runs per scenario with different schedule seeds                    |
 
 **Example:**
 ```rust
@@ -106,6 +115,7 @@ let run_cfg = RunConfig {
     max_steps: 0,  // auto
     max_transform_depth: 3,
     scan_utf16_variants: true,
+    archive: ArchiveConfig::default(),
     stability_runs: 3,
 };
 ```
@@ -114,14 +124,14 @@ let run_cfg = RunConfig {
 
 How a secret is encoded in the generated file.
 
-| Variant | Description | Example |
-|---------|-------------|---------|
-| `Raw` | No encoding, plaintext | `SIM0_TOKEN123ABC` |
-| `Base64` | Standard base64 encoding | `U0lNMF9UT0tFTjEyM0FCQw==` |
-| `UrlPercent` | URL percent encoding (all bytes) | `%53%49%4D%30%5F%54%4F%4B%45%4E...` |
-| `Utf16Le` | UTF-16 Little Endian | Each ASCII byte becomes `[byte, 0x00]` |
-| `Utf16Be` | UTF-16 Big Endian | Each ASCII byte becomes `[0x00, byte]` |
-| `Nested { depth }` | Alternating base64/URL | Multi-layer encoding |
+| Variant            | Description                      | Example                                |
+| ------------------ | -------------------------------- | -------------------------------------- |
+| `Raw`              | No encoding, plaintext           | `SIM0_TOKEN123ABC`                     |
+| `Base64`           | Standard base64 encoding         | `U0lNMF9UT0tFTjEyM0FCQw==`             |
+| `UrlPercent`       | URL percent encoding (all bytes) | `%53%49%4D%30%5F%54%4F%4B%45%4E...`    |
+| `Utf16Le`          | UTF-16 Little Endian             | Each ASCII byte becomes `[byte, 0x00]` |
+| `Utf16Be`          | UTF-16 Big Endian                | Each ASCII byte becomes `[0x00, byte]` |
+| `Nested { depth }` | Alternating base64/URL           | Multi-layer encoding                   |
 
 **Nested encoding example (depth=2):**
 ```
@@ -159,27 +169,27 @@ loading artifacts.
 
 ### IoFault Variants
 
-| Variant | Description |
-|---------|-------------|
-| `ErrKind { kind }` | Return an I/O error (kind maps to `std::io::ErrorKind`) |
-| `PartialRead { max_len }` | Return at most `max_len` bytes (short read) |
-| `EIntrOnce` | Single EINTR-style interruption |
+| Variant                   | Description                                             |
+| ------------------------- | ------------------------------------------------------- |
+| `ErrKind { kind }`        | Return an I/O error (kind maps to `std::io::ErrorKind`) |
+| `PartialRead { max_len }` | Return at most `max_len` bytes (short read)             |
+| `EIntrOnce`               | Single EINTR-style interruption                         |
 
 ### Corruption Variants
 
-| Variant | Description |
-|---------|-------------|
-| `TruncateTo { new_len }` | Truncate read data to `new_len` bytes |
-| `FlipBit { offset, mask }` | XOR `mask` into byte at `offset` |
-| `Overwrite { offset, bytes }` | Overwrite bytes starting at `offset` |
+| Variant                       | Description                           |
+| ----------------------------- | ------------------------------------- |
+| `TruncateTo { new_len }`      | Truncate read data to `new_len` bytes |
+| `FlipBit { offset, mask }`    | XOR `mask` into byte at `offset`      |
+| `Overwrite { offset, bytes }` | Overwrite bytes starting at `offset`  |
 
 ### ReadFault Fields
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `fault` | `Option<IoFault>` | I/O fault to inject |
-| `latency_ticks` | u64 | Simulated I/O latency (blocks task) |
-| `corruption` | `Option<Corruption>` | Data corruption to apply |
+| Field           | Type                 | Description                         |
+| --------------- | -------------------- | ----------------------------------- |
+| `fault`         | `Option<IoFault>`    | I/O fault to inject                 |
+| `latency_ticks` | u64                  | Simulated I/O latency (blocks task) |
+| `corruption`    | `Option<Corruption>` | Data corruption to apply            |
 
 ## Common Scenarios
 
@@ -226,10 +236,17 @@ Use small chunks to force many boundary crossings.
 
 ```rust
 let run_cfg = RunConfig {
+    workers: 2,
     chunk_size: 32,
     overlap: 16,
-    workers: 2,
-    ..Default::default()
+    max_in_flight_objects: 8,
+    buffer_pool_cap: 8,
+    max_file_size: u64::MAX,
+    max_steps: 0,
+    max_transform_depth: 3,
+    scan_utf16_variants: true,
+    archive: ArchiveConfig::default(),
+    stability_runs: 1,
 };
 ```
 
@@ -277,8 +294,17 @@ let gen_cfg = ScenarioGenConfig {
     ..Default::default()
 };
 let run_cfg = RunConfig {
+    workers: 2,
+    chunk_size: 64,
+    overlap: 32,
+    max_in_flight_objects: 8,
+    buffer_pool_cap: 8,
+    max_file_size: u64::MAX,
+    max_steps: 0,
+    max_transform_depth: 3,
     scan_utf16_variants: true,
-    ..Default::default()
+    archive: ArchiveConfig::default(),
+    stability_runs: 1,
 };
 ```
 
@@ -325,65 +351,65 @@ The minimizer applies deterministic shrink passes:
 
 **Random test configuration:**
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SIM_SCANNER_SEED_START` | 0 | First seed in the range |
-| `SIM_SCANNER_SEED_COUNT` | 25 | Number of seeds to test |
-| `SIM_SCANNER_DEEP` | false | Enable larger scenarios and more faults |
-| `DUMP_SIM_FAIL` | unset | Print failure details on panic |
-| `SCANNER_SIM_WRITE_FAIL` | unset | Write failing artifacts to `tests/failures/scanner_seed_<seed>.case.json` |
-| `SCANNER_SIM_STRICT_NON_ROOT` | unset | Enforce differential checks for non-root (transform) findings |
+| Variable                      | Default | Description                                                               |
+| ----------------------------- | ------- | ------------------------------------------------------------------------- |
+| `SIM_SCANNER_SEED_START`      | 0       | First seed in the range                                                   |
+| `SIM_SCANNER_SEED_COUNT`      | 25      | Number of seeds to test                                                   |
+| `SIM_SCANNER_DEEP`            | false   | Enable larger scenarios and more faults                                   |
+| `DUMP_SIM_FAIL`               | unset   | Print failure details on panic                                            |
+| `SCANNER_SIM_WRITE_FAIL`      | unset   | Write failing artifacts to `tests/failures/scanner_seed_<seed>.case.json` |
+| `SCANNER_SIM_STRICT_NON_ROOT` | unset   | Enforce differential checks for non-root (transform) findings             |
 
 **Scenario overrides:**
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SIM_SCENARIO_RULES` | 3 (8 deep) | Number of synthetic rules |
-| `SIM_SCENARIO_FILES` | 3 (8 deep) | Number of files |
-| `SIM_SCENARIO_SECRETS` | 3 (6 deep) | Secrets per file |
-| `SIM_SCENARIO_TOKEN_LEN` | 12 (24 deep) | Token length |
-| `SIM_SCENARIO_MIN_NOISE` | 4 (8 deep) | Min noise bytes |
-| `SIM_SCENARIO_MAX_NOISE` | 16 (128 deep) | Max noise bytes |
+| Variable                 | Default       | Description               |
+| ------------------------ | ------------- | ------------------------- |
+| `SIM_SCENARIO_RULES`     | 3 (8 deep)    | Number of synthetic rules |
+| `SIM_SCENARIO_FILES`     | 3 (8 deep)    | Number of files           |
+| `SIM_SCENARIO_SECRETS`   | 3 (6 deep)    | Secrets per file          |
+| `SIM_SCENARIO_TOKEN_LEN` | 12 (24 deep)  | Token length              |
+| `SIM_SCENARIO_MIN_NOISE` | 4 (8 deep)    | Min noise bytes           |
+| `SIM_SCENARIO_MAX_NOISE` | 16 (128 deep) | Max noise bytes           |
 
 **Run config overrides:**
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SIM_RUN_WORKERS` | random 1-4 | Fixed worker count |
-| `SIM_RUN_WORKERS_MIN` | 1 | Min workers (random) |
-| `SIM_RUN_WORKERS_MAX` | 4 (8 deep) | Max workers (random) |
-| `SIM_RUN_CHUNK_SIZE` | random 16-64 | Fixed chunk size |
-| `SIM_RUN_CHUNK_MIN` | 16 | Min chunk (random) |
-| `SIM_RUN_CHUNK_MAX` | 64 (128 deep) | Max chunk (random) |
-| `SIM_RUN_OVERLAP` | 64 (128 deep) | Overlap bytes |
-| `SIM_RUN_MAX_STEPS` | 0 (auto) | Step limit |
-| `SIM_RUN_MAX_TRANSFORM_DEPTH` | 3 (4 deep) | Max decode depth |
-| `SIM_RUN_SCAN_UTF16` | true | Enable UTF-16 variants |
-| `SIM_RUN_STABILITY_RUNS` | 2 (4 deep) | Stability replays |
+| Variable                      | Default       | Description            |
+| ----------------------------- | ------------- | ---------------------- |
+| `SIM_RUN_WORKERS`             | random 1-4    | Fixed worker count     |
+| `SIM_RUN_WORKERS_MIN`         | 1             | Min workers (random)   |
+| `SIM_RUN_WORKERS_MAX`         | 4 (8 deep)    | Max workers (random)   |
+| `SIM_RUN_CHUNK_SIZE`          | random 16-64  | Fixed chunk size       |
+| `SIM_RUN_CHUNK_MIN`           | 16            | Min chunk (random)     |
+| `SIM_RUN_CHUNK_MAX`           | 64 (128 deep) | Max chunk (random)     |
+| `SIM_RUN_OVERLAP`             | 64 (128 deep) | Overlap bytes          |
+| `SIM_RUN_MAX_STEPS`           | 0 (auto)      | Step limit             |
+| `SIM_RUN_MAX_TRANSFORM_DEPTH` | 3 (4 deep)    | Max decode depth       |
+| `SIM_RUN_SCAN_UTF16`          | true          | Enable UTF-16 variants |
+| `SIM_RUN_STABILITY_RUNS`      | 2 (4 deep)    | Stability replays      |
 
 ## Oracles Checked
 
 The harness validates these invariants during and after each run:
 
-| Oracle | When | Description |
-|--------|------|-------------|
-| **Termination** | Every step | `max_steps` bound prevents infinite loops |
-| **Monotonic Progress** | Per chunk | File cursor never moves backward |
-| **Overlap Dedupe** | Per finding | No finding ends at or before the overlap prefix boundary |
-| **No Duplicates** | End of run | Emitted findings have unique normalized keys |
-| **Ground Truth** | End of run | Expected secrets found (for fully-observed files), no unexpected findings |
-| **Differential** | End of run | Chunked results match single-chunk reference scan (root findings; non-root only with `SCANNER_SIM_STRICT_NON_ROOT=1`) |
-| **Stability** | Multi-run | Same finding set across different schedule seeds |
+| Oracle                 | When        | Description                                                                                                           |
+| ---------------------- | ----------- | --------------------------------------------------------------------------------------------------------------------- |
+| **Termination**        | Every step  | `max_steps` bound prevents infinite loops                                                                             |
+| **Monotonic Progress** | Per chunk   | File cursor never moves backward                                                                                      |
+| **Overlap Dedupe**     | Per finding | No finding ends at or before the overlap prefix boundary                                                              |
+| **No Duplicates**      | End of run  | Emitted findings have unique normalized keys                                                                          |
+| **Ground Truth**       | End of run  | Expected secrets found (for fully-observed files), no unexpected findings                                             |
+| **Differential**       | End of run  | Chunked results match single-chunk reference scan (root findings; non-root only with `SCANNER_SIM_STRICT_NON_ROOT=1`) |
+| **Stability**          | Multi-run   | Same finding set across different schedule seeds                                                                      |
 
 ### Failure Kinds
 
-| Kind | Meaning |
-|------|---------|
-| `Panic` | Panic escaped from engine or harness logic |
-| `Hang` | Simulation did not reach terminal state within step budget |
-| `InvariantViolation { code }` | Internal invariant violated (see code for details) |
-| `OracleMismatch` | Ground-truth or differential oracle failed |
-| `StabilityMismatch` | Different findings across schedule seeds |
+| Kind                          | Meaning                                                    |
+| ----------------------------- | ---------------------------------------------------------- |
+| `Panic`                       | Panic escaped from engine or harness logic                 |
+| `Hang`                        | Simulation did not reach terminal state within step budget |
+| `InvariantViolation { code }` | Internal invariant violated (see code for details)         |
+| `OracleMismatch`              | Ground-truth or differential oracle failed                 |
+| `StabilityMismatch`           | Different findings across schedule seeds                   |
 
 ## ReproArtifact Schema
 

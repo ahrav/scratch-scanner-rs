@@ -50,6 +50,8 @@ pub mod scratch_memory;
 #[cfg(feature = "sim-harness")]
 pub mod sim;
 #[cfg(feature = "sim-harness")]
+pub mod sim_archive;
+#[cfg(feature = "sim-harness")]
 pub mod sim_git_scan;
 #[cfg(feature = "sim-harness")]
 pub mod sim_scanner;

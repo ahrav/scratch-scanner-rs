@@ -10,11 +10,13 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// Policy for how to treat encrypted archives or encrypted entries.
 ///
 /// Policy choices are enforced in archive scanning paths (pipeline + scheduler).
 #[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum EncryptedPolicy {
     /// Skip encrypted content and increment telemetry counters.
     #[default]
@@ -27,7 +29,7 @@ pub enum EncryptedPolicy {
 
 /// Policy for how to treat unsupported archive formats or unsupported features.
 #[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum UnsupportedPolicy {
     /// Skip unsupported content and increment telemetry counters.
     #[default]
@@ -42,7 +44,7 @@ pub enum UnsupportedPolicy {
 ///
 /// All limits are hard bounds. Archive code must treat archive metadata and
 /// payload as hostile: sizes, counts, paths, and offsets are untrusted.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ArchiveConfig {
     /// Master enable switch.
     ///

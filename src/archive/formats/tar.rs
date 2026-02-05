@@ -21,6 +21,7 @@ use crate::archive::{
 
 use std::fs::File;
 use std::io::{self, Read};
+use std::sync::Arc;
 
 pub const TAR_BLOCK_LEN: usize = 512;
 pub const USTAR_MAGIC_OFFSET: usize = 257;
@@ -96,6 +97,8 @@ impl<T: TarRead + ?Sized> TarRead for &mut T {
 }
 
 impl TarRead for std::io::Cursor<Vec<u8>> {}
+
+impl TarRead for std::io::Cursor<Arc<[u8]>> {}
 
 /// A parsed tar entry header (after applying GNU/PAX overrides).
 pub struct TarEntryMeta<'a> {

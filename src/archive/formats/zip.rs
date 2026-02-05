@@ -23,7 +23,8 @@
 //!   policy.
 
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
+use std::sync::Arc;
 
 use crate::archive::formats::tar::TarRead;
 
@@ -32,6 +33,57 @@ use flate2::read::DeflateDecoder;
 use crate::archive::{
     ArchiveBudgets, ArchiveConfig, ArchiveSkipReason, BudgetHit, ChargeResult, PartialReason,
 };
+
+/// Source for ZIP parsing that supports random access and cloning.
+pub trait ZipSource: Read + Seek {
+    /// Total byte length of the archive.
+    fn len(&self) -> io::Result<u64>;
+    /// Returns true if the archive length is zero.
+    #[inline]
+    fn is_empty(&self) -> io::Result<bool> {
+        Ok(self.len()? == 0)
+    }
+    /// Clone the source for concurrent payload reads.
+    fn try_clone(&self) -> io::Result<Self>
+    where
+        Self: Sized;
+}
+
+impl ZipSource for File {
+    #[inline]
+    fn len(&self) -> io::Result<u64> {
+        Ok(self.metadata()?.len())
+    }
+
+    #[inline]
+    fn try_clone(&self) -> io::Result<Self> {
+        self.try_clone()
+    }
+}
+
+impl ZipSource for Cursor<Arc<[u8]>> {
+    #[inline]
+    fn len(&self) -> io::Result<u64> {
+        Ok(self.get_ref().len() as u64)
+    }
+
+    #[inline]
+    fn try_clone(&self) -> io::Result<Self> {
+        Ok(self.clone())
+    }
+}
+
+impl ZipSource for Cursor<Vec<u8>> {
+    #[inline]
+    fn len(&self) -> io::Result<u64> {
+        Ok(self.get_ref().len() as u64)
+    }
+
+    #[inline]
+    fn try_clone(&self) -> io::Result<Self> {
+        Ok(self.clone())
+    }
+}
 
 /// ZIP signatures are `PK..`.
 ///
@@ -117,9 +169,9 @@ impl<'a> ZipEntryMeta<'a> {
 /// # Invariants
 /// - `next_entry` advances monotonically through the central directory region.
 /// - Payload reads are performed via cloned file handles.
-pub struct ZipCursor {
-    file: Option<File>,
-    payload_file: Option<File>,
+pub struct ZipCursor<R: ZipSource> {
+    file: Option<R>,
+    payload_file: Option<R>,
     file_len: u64,
 
     cd_pos: u64,
@@ -139,7 +191,7 @@ pub struct ZipCursor {
     eocd_cap: usize,
 }
 
-impl ZipCursor {
+impl<R: ZipSource> ZipCursor<R> {
     /// Construct a reusable cursor with preallocated buffers.
     pub fn with_capacity(cfg: &ArchiveConfig) -> Self {
         let name_cap = cfg
@@ -211,13 +263,13 @@ impl ZipCursor {
     /// - `ZipOpen::Stop` for malformed data or budget exhaustion.
     pub fn open(
         &mut self,
-        mut file: File,
+        mut file: R,
         budgets: &mut ArchiveBudgets,
         cfg: &ArchiveConfig,
     ) -> io::Result<ZipOpen> {
         self.reset();
 
-        let file_len = file.metadata()?.len();
+        let file_len = file.len()?;
         if file_len < EOCD_MIN_LEN as u64 {
             return Ok(ZipOpen::Stop(PartialReason::MalformedZip));
         }
@@ -316,7 +368,7 @@ impl ZipCursor {
     #[allow(clippy::too_many_arguments)]
     fn finish_open(
         &mut self,
-        file: File,
+        file: R,
         file_len: u64,
         cfg: &ArchiveConfig,
         disk_no: u16,
@@ -555,7 +607,7 @@ impl ZipCursor {
         &'a mut self,
         meta: &ZipEntryMeta<'_>,
         budgets: &mut ArchiveBudgets,
-    ) -> io::Result<Result<ZipEntryReader<'a>, PartialReason>> {
+    ) -> io::Result<Result<ZipEntryReader<'a, R>, PartialReason>> {
         if meta.local_header_offset > self.file_len {
             return Ok(Err(PartialReason::MalformedZip));
         }
@@ -618,12 +670,12 @@ impl ZipCursor {
 ///
 /// # Guarantees
 /// - `total_compressed()` is monotonic and saturating.
-pub enum ZipEntryReader<'a> {
-    Stored(CountedRead<LimitedRead<'a, File>>),
-    Deflate(DeflateDecoder<CountedRead<LimitedRead<'a, File>>>),
+pub enum ZipEntryReader<'a, R: Read> {
+    Stored(CountedRead<LimitedRead<'a, R>>),
+    Deflate(DeflateDecoder<CountedRead<LimitedRead<'a, R>>>),
 }
 
-impl<'a> ZipEntryReader<'a> {
+impl<'a, R: Read> ZipEntryReader<'a, R> {
     #[inline(always)]
     pub fn read_decompressed(&mut self, dst: &mut [u8]) -> io::Result<usize> {
         match self {
@@ -794,6 +846,7 @@ mod tests {
     use super::*;
     use crate::archive::{ArchiveBudgets, ArchiveConfig};
     use std::io::Write;
+    use std::sync::Arc;
     use tempfile::NamedTempFile;
 
     #[test]
@@ -848,5 +901,41 @@ mod tests {
         assert_ne!(entry.name_hash64, 0);
         assert_eq!(cursor.name_buf.capacity(), name_cap);
         cursor.debug_assert_no_growth();
+    }
+
+    #[test]
+    fn in_memory_sources_open_and_read_entries() {
+        let cfg = ArchiveConfig::default();
+
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut zw = zip::ZipWriter::new(&mut cursor);
+            let opts = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zw.start_file("entry.txt", opts).unwrap();
+            zw.write_all(b"hello").unwrap();
+            zw.finish().unwrap();
+        }
+
+        let bytes = cursor.into_inner();
+        let bytes_arc: Arc<[u8]> = Arc::from(bytes.clone());
+
+        fn assert_entry<S: ZipSource>(source: S, cfg: &ArchiveConfig) {
+            let mut budgets = ArchiveBudgets::new(cfg);
+            budgets.enter_archive().unwrap();
+
+            let mut cursor = ZipCursor::with_capacity(cfg);
+            let open = cursor.open(source, &mut budgets, cfg).unwrap();
+            assert!(matches!(open, ZipOpen::Ready));
+
+            let entry = match cursor.next_entry(&mut budgets, cfg).unwrap() {
+                ZipNext::Entry(m) => m,
+                _ => panic!("expected entry"),
+            };
+            assert_eq!(entry.name, b"entry.txt");
+        }
+
+        assert_entry(std::io::Cursor::new(bytes.clone()), &cfg);
+        assert_entry(std::io::Cursor::new(bytes_arc), &cfg);
     }
 }
