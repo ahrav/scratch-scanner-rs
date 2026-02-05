@@ -262,6 +262,11 @@ impl PathBuilder {
         }
     }
 
+    fn clear(&mut self) {
+        self.buf.clear();
+        self.stack.clear();
+    }
+
     fn push_dir(&mut self, name: &[u8]) -> Result<(), TreeDiffError> {
         let new_len = self.buf.len() + name.len() + 1;
         if new_len > MAX_PATH_LEN {
@@ -461,6 +466,9 @@ impl BlobIntroducer {
     }
 
     /// Resets stats and in-flight accounting for a new run.
+    ///
+    /// Requires no in-flight traversal state; `introduce` clears that state
+    /// before returning an error.
     pub fn reset_stats(&mut self) {
         debug_assert!(self.stack.is_empty(), "reset requires empty stack");
         self.stats = BlobIntroStats::default();
@@ -475,6 +483,9 @@ impl BlobIntroducer {
     }
 
     /// Walks the commit plan and emits first-introduced blob candidates.
+    ///
+    /// On error, clears traversal state so the introducer can be reused after
+    /// handling the failure. Seen sets are preserved; call `reset_seen` if needed.
     pub fn introduce<S: CandidateSink>(
         &mut self,
         source: &mut impl TreeSource,
@@ -485,23 +496,38 @@ impl BlobIntroducer {
     ) -> Result<BlobIntroStats, TreeDiffError> {
         self.reset_stats();
 
-        for PlannedCommit { pos, .. } in plan {
-            self.stats.commits_visited += 1;
-            let commit_id = pos.0;
-            let root_oid = cg.root_tree_oid(*pos);
+        let result = (|| {
+            for PlannedCommit { pos, .. } in plan {
+                self.stats.commits_visited += 1;
+                let commit_id = pos.0;
+                let root_oid = cg.root_tree_oid(*pos);
 
-            if let Some(idx) = oid_index.get(&root_oid) {
-                if !self.seen.mark_tree(idx) {
-                    self.stats.subtrees_skipped += 1;
-                    continue;
+                if let Some(idx) = oid_index.get(&root_oid) {
+                    if !self.seen.mark_tree(idx) {
+                        self.stats.subtrees_skipped += 1;
+                        continue;
+                    }
                 }
+
+                self.push_tree(source, &root_oid)?;
+                self.walk_stack(source, oid_index, sink, commit_id)?;
             }
 
-            self.push_tree(source, &root_oid)?;
-            self.walk_stack(source, oid_index, sink, commit_id)?;
+            Ok(self.stats)
+        })();
+
+        if result.is_err() {
+            self.reset_run_state();
         }
 
-        Ok(self.stats)
+        result
+    }
+
+    /// Clears transient traversal state so a subsequent run can start cleanly.
+    fn reset_run_state(&mut self) {
+        self.stack.clear();
+        self.path_builder.clear();
+        self.tree_bytes_in_flight = 0;
     }
 
     fn push_tree(

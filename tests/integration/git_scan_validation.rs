@@ -12,9 +12,9 @@ use regex::bytes::Regex;
 use tempfile::TempDir;
 
 use scanner_rs::git_scan::{
-    run_git_scan, CandidateSkipReason, FinalizeOutcome, GitScanConfig, GitScanResult,
-    InMemoryPersistenceStore, NeverSeenStore, OidBytes, RefWatermarkStore, RepoOpenError,
-    StartSetConfig, StartSetResolver,
+    run_git_scan, CandidateSkipReason, FinalizeOutcome, GitScanConfig, GitScanError, GitScanMode,
+    GitScanResult, InMemoryPersistenceStore, MappingCandidateKind, NeverSeenStore, OidBytes,
+    RefWatermarkStore, RepoOpenError, SpillError, StartSetConfig, StartSetResolver,
 };
 use scanner_rs::{demo_tuning, AnchorPolicy, Engine, Gate, RuleSpec, TransformConfig, TransformId};
 use scanner_rs::{TransformMode, ValidatorKind};
@@ -166,17 +166,28 @@ impl RefWatermarkStore for TestWatermarkStore {
 /// The config pins `repo_id`, `policy_hash`, and `start_set` to keep the
 /// test inputs deterministic. Persistence is routed to an in-memory store.
 fn run_scan(repo: &Path, watermark: Option<OidBytes>) -> GitScanResult {
+    run_scan_with_config(repo, watermark, base_config()).unwrap()
+}
+
+fn base_config() -> GitScanConfig {
+    GitScanConfig {
+        repo_id: 42,
+        policy_hash: [0x11; 32],
+        start_set: StartSetConfig::DefaultBranchOnly,
+        ..Default::default()
+    }
+}
+
+fn run_scan_with_config(
+    repo: &Path,
+    watermark: Option<OidBytes>,
+    config: GitScanConfig,
+) -> Result<GitScanResult, GitScanError> {
     let engine = test_engine();
     let tip = oid_from_hex(&git_output(repo, &["rev-parse", "HEAD"]));
     let resolver = TestResolver { tip };
     let watermark_store = TestWatermarkStore { watermark };
     let persist_store = InMemoryPersistenceStore::default();
-    let config = GitScanConfig {
-        repo_id: 42,
-        policy_hash: [0x11; 32],
-        start_set: StartSetConfig::DefaultBranchOnly,
-        ..Default::default()
-    };
 
     run_git_scan(
         repo,
@@ -187,7 +198,6 @@ fn run_scan(repo: &Path, watermark: Option<OidBytes>) -> GitScanResult {
         Some(&persist_store),
         &config,
     )
-    .unwrap()
 }
 
 #[test]
@@ -214,6 +224,38 @@ fn loose_only_candidate_scans_complete() {
             assert!(report.finalize.stats.total_findings >= 1);
         }
         GitScanResult::NeedsMaintenance { .. } => panic!("expected completed scan"),
+    }
+}
+
+#[test]
+fn odb_blob_respects_packed_candidate_cap() {
+    if !git_available() {
+        eprintln!("git not available; skipping packed candidate cap test");
+        return;
+    }
+
+    let tmp = init_repo();
+    commit_file(tmp.path(), "a.txt", "TOK_ABCDEFGH", "c1");
+    commit_file(tmp.path(), "b.txt", "TOK_IJKLMNOP", "c2");
+    ensure_artifacts(tmp.path());
+
+    let mut config = base_config();
+    config.scan_mode = GitScanMode::OdbBlobFast;
+    config.mapping.max_packed_candidates = 1;
+
+    let err = run_scan_with_config(tmp.path(), None, config)
+        .expect_err("expected packed candidate cap error");
+    match err {
+        GitScanError::Spill(SpillError::MappingCandidateLimitExceeded {
+            kind,
+            max,
+            observed,
+        }) => {
+            assert_eq!(kind, MappingCandidateKind::Packed);
+            assert_eq!(max, 1);
+            assert!(observed >= 2);
+        }
+        other => panic!("expected mapping cap error, got {other:?}"),
     }
 }
 

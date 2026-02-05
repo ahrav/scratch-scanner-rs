@@ -276,9 +276,9 @@ fn default_pack_exec_workers() -> usize {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum GitScanMode {
     /// Current diff-history pipeline (tree diff + spill + mapping + pack plan).
-    #[default]
     DiffHistory,
     /// ODB-blob fast path (first-introduced blob walk + pack-order scan).
+    #[default]
     OdbBlobFast,
 }
 
@@ -957,8 +957,6 @@ pub fn run_git_scan(
 
         let midx = load_midx(&repo)?;
         let mut mapping_cfg = config.mapping;
-        let packed_cap = mapping_cfg.max_packed_candidates.max(midx.object_count());
-        mapping_cfg.max_packed_candidates = packed_cap;
         mapping_cfg.path_arena_capacity = estimate_path_arena_capacity(
             mapping_cfg.path_arena_capacity,
             mapping_cfg.max_packed_candidates,
@@ -2141,6 +2139,11 @@ mod tests {
     use regex::bytes::Regex;
     use std::io::Write;
     use tempfile::tempdir;
+
+    #[test]
+    fn default_scan_mode_matches_config_default() {
+        assert_eq!(GitScanConfig::default().scan_mode, GitScanMode::default());
+    }
 
     /// Helper for constructing a minimal SHA-1 MIDX buffer.
     ///
