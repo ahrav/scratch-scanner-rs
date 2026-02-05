@@ -18,6 +18,7 @@ use super::hit_pool::{HitAccPool, SpanU32};
 use super::transform::{map_decoded_offset, STREAM_DECODE_CHUNK_BYTES};
 use super::vectorscan_prefilter::{VsScratch, VsStreamWindow};
 use super::work_items::{PendingDecodeSpan, PendingWindow, SpanStreamEntry, WorkItem};
+use regex::bytes::CaptureLocations;
 
 // Forward declaration for Engine (will be used via super::)
 use super::Engine;
@@ -298,6 +299,8 @@ pub struct ScanScratch {
     pub(super) tmp_drop_hint_end: Vec<u64>,
     /// Normalized hashes aligned with `tmp_findings`.
     pub(super) tmp_norm_hash: Vec<NormHash>,
+    /// Per-rule regex capture locations (reused to avoid per-scan allocations).
+    pub(super) capture_locs: Vec<Option<CaptureLocations>>,
     /// Per-rule stream hit counts for decoded-window seeding.
     ///
     /// Indexing is `rule_id * 3 + variant_idx` (Raw/Utf16Le/Utf16Be).
@@ -424,6 +427,11 @@ impl ScanScratch {
             tmp_findings: Vec::with_capacity(max_findings),
             tmp_drop_hint_end: Vec::with_capacity(max_findings),
             tmp_norm_hash: Vec::with_capacity(max_findings),
+            capture_locs: engine
+                .rules
+                .iter()
+                .map(|rule| Some(rule.re.capture_locations()))
+                .collect(),
             stream_hit_counts: vec![0u32; rules_len.saturating_mul(3)],
             stream_hit_touched: ScratchVec::with_capacity(rules_len.saturating_mul(3))
                 .expect("scratch stream_hit_touched allocation failed"),
@@ -738,6 +746,13 @@ impl ScanScratch {
         if self.tmp_norm_hash.capacity() < self.max_findings {
             self.tmp_norm_hash
                 .reserve(self.max_findings - self.tmp_norm_hash.capacity());
+        }
+        if self.capture_locs.len() != engine.rules.len() {
+            self.capture_locs = engine
+                .rules
+                .iter()
+                .map(|rule| Some(rule.re.capture_locations()))
+                .collect();
         }
     }
 

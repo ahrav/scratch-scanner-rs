@@ -585,3 +585,38 @@ pub(super) fn extract_secret_span(
     let full = captures.get(0).expect("group 0 always exists");
     (full.start(), full.end())
 }
+
+/// Extracts the secret span from reusable capture locations.
+///
+/// Mirrors [`extract_secret_span`] but operates on `CaptureLocations` to avoid
+/// per-match allocations in hot paths.
+#[inline]
+pub(super) fn extract_secret_span_locs(
+    locs: &regex::bytes::CaptureLocations,
+    secret_group: Option<u16>,
+) -> (usize, usize) {
+    if let Some(gi) = secret_group {
+        let group_idx = gi as usize;
+        if let Some((start, end)) = locs.get(group_idx) {
+            if start < end {
+                return (start, end);
+            }
+        } else {
+            debug_assert!(
+                false,
+                "secret_group {} does not exist in regex (only {} groups)",
+                group_idx,
+                locs.len()
+            );
+        }
+    }
+
+    if let Some((start, end)) = locs.get(1) {
+        if start < end {
+            return (start, end);
+        }
+    }
+
+    let (start, end) = locs.get(0).expect("group 0 always exists");
+    (start, end)
+}
