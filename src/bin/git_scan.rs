@@ -10,8 +10,8 @@
 //! # Notes
 //! - Uses demo rules/transforms/tuning and in-memory persistence; results are not durable.
 //! - `NeverSeenStore` plus empty watermarks force full-history scans.
-//! - Missing maintenance artifacts (commit-graph, MIDX) cause the scan to fail
-//!   with exit code `2`.
+//! - Missing maintenance artifacts (commit-graph, MIDX) are built in memory
+//!   automatically; no preflight maintenance is required.
 //! - `--debug` emits verbose stage metrics to stderr.
 //!
 //! # Exit codes
@@ -92,6 +92,7 @@ OPTIONS:
     --engine-chunk-mb=<N> Engine scan chunk size in MB (default: 1)
     --max-transform-depth=<N> Maximum decode depth (default: demo tuning)
     --debug                 Emit stage statistics to stderr
+    --perf-breakdown        Show pack execution timing breakdown
     --help, -h              Show this help message",
         exe.to_string_lossy()
     );
@@ -111,6 +112,7 @@ fn main() -> io::Result<()> {
     let mut tree_delta_cache_mb: Option<u32> = None;
     let mut engine_chunk_mb: Option<u32> = None;
     let mut debug = false;
+    let mut perf_breakdown = false;
 
     for arg in args {
         if let Some(flag) = arg.to_str() {
@@ -197,6 +199,10 @@ fn main() -> io::Result<()> {
                 }
                 "--debug" => {
                     debug = true;
+                    continue;
+                }
+                "--perf-breakdown" => {
+                    perf_breakdown = true;
                     continue;
                 }
                 "--help" | "-h" => {
@@ -357,6 +363,145 @@ fn main() -> io::Result<()> {
                     cache_reject_hist.format_top(5)
                 );
                 eprintln!("{}", report.format_metrics());
+            }
+            if perf_breakdown {
+                // Aggregate timing across all pack exec reports
+                let mut total_cache_lookup_nanos = 0u64;
+                let mut total_fallback_resolve_nanos = 0u64;
+                let mut total_sink_emit_nanos = 0u64;
+                let mut total_base_cache_hits = 0u64;
+                let mut total_base_cache_misses = 0u64;
+                let mut total_fallback_decodes = 0u64;
+                let mut total_decoded_offsets = 0u64;
+
+                for r in &report.pack_exec_reports {
+                    total_cache_lookup_nanos += r.stats.cache_lookup_nanos;
+                    total_fallback_resolve_nanos += r.stats.fallback_resolve_nanos;
+                    total_sink_emit_nanos += r.stats.sink_emit_nanos;
+                    total_base_cache_hits += r.stats.base_cache_hits as u64;
+                    total_base_cache_misses += r.stats.base_cache_misses as u64;
+                    total_fallback_decodes += r.stats.fallback_base_decodes as u64;
+                    total_decoded_offsets += r.stats.decoded_offsets as u64;
+                }
+
+                let perf = &report.perf_stats;
+                let decode_nanos = perf.pack_inflate_nanos + perf.delta_apply_nanos;
+                let total_nanos = report.stage_nanos.pack_exec;
+
+                let pct = |n: u64| -> f64 {
+                    if total_nanos > 0 {
+                        (n as f64 / total_nanos as f64) * 100.0
+                    } else {
+                        0.0
+                    }
+                };
+                let secs = |n: u64| -> f64 { n as f64 / 1_000_000_000.0 };
+
+                eprintln!("\npack_exec breakdown:");
+                eprintln!(
+                    "  decode: {:.1}% ({:.3}s)",
+                    pct(decode_nanos),
+                    secs(decode_nanos)
+                );
+                eprintln!(
+                    "  cache_lookup: {:.1}% ({:.3}s)",
+                    pct(total_cache_lookup_nanos),
+                    secs(total_cache_lookup_nanos)
+                );
+                eprintln!(
+                    "  fallback_resolve: {:.1}% ({:.3}s)",
+                    pct(total_fallback_resolve_nanos),
+                    secs(total_fallback_resolve_nanos)
+                );
+                eprintln!(
+                    "  sink_emit: {:.1}% ({:.3}s)",
+                    pct(total_sink_emit_nanos),
+                    secs(total_sink_emit_nanos)
+                );
+
+                let total_base_lookups = total_base_cache_hits + total_base_cache_misses;
+                let base_cache_hit_rate = if total_base_lookups > 0 {
+                    (total_base_cache_hits as f64 / total_base_lookups as f64) * 100.0
+                } else {
+                    0.0
+                };
+                let fallback_rate = if total_decoded_offsets > 0 {
+                    (total_fallback_decodes as f64 / total_decoded_offsets as f64) * 100.0
+                } else {
+                    0.0
+                };
+
+                eprintln!("\ncache efficiency:");
+                eprintln!(
+                    "  base_cache_hit_rate: {:.1}% ({}/{})",
+                    base_cache_hit_rate, total_base_cache_hits, total_base_lookups
+                );
+                eprintln!("  fallback_rate: {:.1}%", fallback_rate);
+
+                // Scan sub-stage breakdown (within sink_emit).
+                let vs_pre = perf.scan_vs_prefilter_nanos;
+                let validate = perf.scan_validate_nanos;
+                let transform = perf.scan_transform_nanos;
+                let reset = perf.scan_reset_nanos;
+                let sort_dedup = perf.scan_sort_dedup_nanos;
+                let accounted = vs_pre + validate + transform + reset + sort_dedup;
+                let scan_total = perf.scan_nanos;
+                let other = scan_total.saturating_sub(accounted);
+
+                let scan_pct = |n: u64| -> f64 {
+                    if scan_total > 0 {
+                        (n as f64 / scan_total as f64) * 100.0
+                    } else {
+                        0.0
+                    }
+                };
+
+                eprintln!("\nscan breakdown (within sink_emit):");
+                eprintln!(
+                    "  vs_prefilter:  {:.1}% ({:.3}s)",
+                    scan_pct(vs_pre),
+                    secs(vs_pre)
+                );
+                eprintln!(
+                    "  validate:      {:.1}% ({:.3}s)",
+                    scan_pct(validate),
+                    secs(validate)
+                );
+                eprintln!(
+                    "  transform:     {:.1}% ({:.3}s)",
+                    scan_pct(transform),
+                    secs(transform)
+                );
+                eprintln!(
+                    "  reset:         {:.1}% ({:.3}s)",
+                    scan_pct(reset),
+                    secs(reset)
+                );
+                eprintln!(
+                    "  sort_dedup:    {:.1}% ({:.3}s)",
+                    scan_pct(sort_dedup),
+                    secs(sort_dedup)
+                );
+                eprintln!(
+                    "  other:         {:.1}% ({:.3}s)",
+                    scan_pct(other),
+                    secs(other)
+                );
+
+                let blobs = perf.scan_blob_count;
+                let chunks = perf.scan_chunk_count;
+                let zero_hit = perf.scan_zero_hit_chunks;
+                let findings = perf.scan_findings_count;
+                let zero_pct = if chunks > 0 {
+                    (zero_hit as f64 / chunks as f64) * 100.0
+                } else {
+                    0.0
+                };
+                eprintln!("scan stats:");
+                eprintln!(
+                    "  blobs: {}  chunks: {}  zero_hit_chunks: {} ({:.1}%)  findings: {}",
+                    blobs, chunks, zero_hit, zero_pct, findings
+                );
             }
             Ok(())
         }

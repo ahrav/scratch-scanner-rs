@@ -5,14 +5,14 @@
 //! flat arrays so hot-path lookups avoid per-commit graph access.
 //!
 //! # Invariants
-//! - Arrays are sized to `CommitGraphView::num_commits()` and never grow.
+//! - Arrays are sized to the commit-graph `num_commits()` and never grow.
 //! - Positions are used as direct indices into the arrays.
 //! - OID lengths always match the repo's object format.
 //! - The index is immutable after construction; all reads are O(1).
 
 use gix_commitgraph::Position;
 
-use super::commit_walk::{CommitGraph, CommitGraphView};
+use super::commit_walk::CommitGraph;
 use super::errors::CommitPlanError;
 use super::object_id::OidBytes;
 
@@ -28,22 +28,26 @@ pub struct CommitGraphIndex {
 }
 
 impl CommitGraphIndex {
-    /// Builds a commit-graph index from the given view.
+    /// Builds a commit-graph index from any `CommitGraph` implementation.
     ///
     /// # Costs
     /// - Time: O(N) over commit-graph entries
     /// - Memory: O(N * oid_len) for commit and tree OIDs plus timestamps
-    pub fn build(view: &CommitGraphView) -> Result<Self, CommitPlanError> {
-        let count = view.num_commits() as usize;
+    ///
+    /// # Errors
+    /// Returns `CommitPlanError` if the underlying `CommitGraph` returns an
+    /// error for any commit's OID or root tree OID lookup.
+    pub fn build<CG: CommitGraph>(cg: &CG) -> Result<Self, CommitPlanError> {
+        let count = cg.num_commits() as usize;
         let mut commit_oids = Vec::with_capacity(count);
         let mut root_trees = Vec::with_capacity(count);
         let mut committer_timestamps = Vec::with_capacity(count);
 
         for idx in 0..count {
             let pos = Position(idx as u32);
-            commit_oids.push(view.commit_oid(pos)?);
-            root_trees.push(view.root_tree_oid(pos)?);
-            committer_timestamps.push(view.committer_timestamp(pos));
+            commit_oids.push(cg.commit_oid(pos)?);
+            root_trees.push(cg.root_tree_oid(pos)?);
+            committer_timestamps.push(cg.committer_timestamp(pos));
         }
 
         Ok(Self {
@@ -66,18 +70,27 @@ impl CommitGraphIndex {
     }
 
     /// Returns the commit OID for `pos`.
+    ///
+    /// # Panics
+    /// Panics if `pos` is out of range (`>= len()`).
     #[inline]
     pub fn commit_oid(&self, pos: Position) -> OidBytes {
         self.commit_oids[pos.0 as usize]
     }
 
     /// Returns the root tree OID for `pos`.
+    ///
+    /// # Panics
+    /// Panics if `pos` is out of range (`>= len()`).
     #[inline]
     pub fn root_tree_oid(&self, pos: Position) -> OidBytes {
         self.root_trees[pos.0 as usize]
     }
 
     /// Returns the committer timestamp for `pos` (seconds since epoch).
+    ///
+    /// # Panics
+    /// Panics if `pos` is out of range (`>= len()`).
     #[inline]
     pub fn committer_timestamp(&self, pos: Position) -> u64 {
         self.committer_timestamps[pos.0 as usize]

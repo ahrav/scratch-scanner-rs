@@ -4,11 +4,12 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use scanner_rs::git_scan::OidBytes;
 use scanner_rs::git_scan::{
-    repo_open, CommitGraph, CommitGraphView, CommitPlanIter, CommitWalkLimits, RefWatermarkStore,
-    RepoOpenError, RepoOpenLimits, StartSetConfig, StartSetResolver,
+    acquire_commit_graph, acquire_midx, repo_open, ArtifactBuildLimits, CommitGraph,
+    CommitGraphMem, CommitPlanIter, CommitWalkLimits, MidxView, RefWatermarkStore, RepoOpenError,
+    RepoOpenLimits, StartSetConfig, StartSetResolver,
 };
-use scanner_rs::git_scan::{OidBytes, RepoArtifactStatus};
 use tempfile::TempDir;
 
 fn git_available() -> bool {
@@ -68,12 +69,8 @@ fn init_repo_with_commits(count: usize) -> TempDir {
         run_git(tmp.path(), &["commit", "--allow-empty", "-m", &msg]);
     }
 
-    run_git(tmp.path(), &["commit-graph", "write", "--reachable"]);
-
-    let pack_dir = tmp.path().join(".git/objects/pack");
-    fs::create_dir_all(&pack_dir).unwrap();
-    // Stub MIDX file so preflight treats artifacts as present.
-    fs::write(pack_dir.join("multi-pack-index"), b"MIDX").unwrap();
+    // Pack objects so acquire_midx can find .idx files.
+    run_git(tmp.path(), &["repack", "-ad"]);
 
     tmp
 }
@@ -98,11 +95,8 @@ fn init_repo_with_branches() -> TempDir {
     run_git(tmp.path(), &["add", "."]);
     run_git(tmp.path(), &["commit", "-m", "main"]);
 
-    run_git(tmp.path(), &["commit-graph", "write", "--reachable"]);
-
-    let pack_dir = tmp.path().join(".git/objects/pack");
-    fs::create_dir_all(&pack_dir).unwrap();
-    fs::write(pack_dir.join("multi-pack-index"), b"MIDX").unwrap();
+    // Pack objects so acquire_midx can find .idx files.
+    run_git(tmp.path(), &["repack", "-ad"]);
 
     tmp
 }
@@ -147,6 +141,17 @@ impl RefWatermarkStore for TestWatermarkStore {
     }
 }
 
+/// Build an in-memory commit graph from a mutable `RepoJobState`.
+fn build_commit_graph(state: &mut RepoJobState) -> CommitGraphMem {
+    let limits = ArtifactBuildLimits::default();
+    let midx_result = acquire_midx(state, &limits).unwrap();
+    let midx_view = MidxView::parse(midx_result.bytes.as_slice(), state.object_format).unwrap();
+    acquire_commit_graph(state, &midx_view, &midx_result.pack_paths, &limits).unwrap()
+}
+
+use scanner_rs::git_scan::RepoJobState;
+
+/// With a watermark two commits behind HEAD, only the commits between the watermark (exclusive) and tip should be walked.
 #[test]
 fn commit_walk_linear_history() {
     if !git_available() {
@@ -173,7 +178,7 @@ fn commit_walk_linear_history() {
 
     let start_set_id = StartSetConfig::DefaultBranchOnly.id();
 
-    let state = repo_open(
+    let mut state = repo_open(
         tmp.path(),
         42,
         [0u8; 32],
@@ -184,9 +189,7 @@ fn commit_walk_linear_history() {
     )
     .unwrap();
 
-    assert!(matches!(state.artifact_status, RepoArtifactStatus::Ready));
-
-    let cg = CommitGraphView::open_repo(&state).unwrap();
+    let cg = build_commit_graph(&mut state);
 
     let iter = CommitPlanIter::new(&state, &cg, CommitWalkLimits::RESTRICTIVE).unwrap();
     let mut out = Vec::new();
@@ -200,6 +203,7 @@ fn commit_walk_linear_history() {
     assert_eq!(out, vec![tip_pos, parent_pos]);
 }
 
+/// When no watermark exists for a ref, the walker must scan the entire history reachable from the tip.
 #[test]
 fn commit_walk_missing_watermark_scans_full_history() {
     if !git_available() {
@@ -217,7 +221,7 @@ fn commit_walk_missing_watermark_scans_full_history() {
     let watermark_store = TestWatermarkStore { watermarks: vec![] };
     let start_set_id = StartSetConfig::DefaultBranchOnly.id();
 
-    let state = repo_open(
+    let mut state = repo_open(
         tmp.path(),
         7,
         [0u8; 32],
@@ -228,7 +232,7 @@ fn commit_walk_missing_watermark_scans_full_history() {
     )
     .unwrap();
 
-    let cg = CommitGraphView::open_repo(&state).unwrap();
+    let cg = build_commit_graph(&mut state);
     let mut actual: Vec<u32> = CommitPlanIter::new(&state, &cg, CommitWalkLimits::RESTRICTIVE)
         .unwrap()
         .map(|item| item.unwrap().pos.0)
@@ -245,6 +249,7 @@ fn commit_walk_missing_watermark_scans_full_history() {
     assert_eq!(actual, expected);
 }
 
+/// When the watermark points to a commit on a different branch (not an ancestor of the tip), the walker falls back to full history.
 #[test]
 fn commit_walk_watermark_not_ancestor_scans_full_history() {
     if !git_available() {
@@ -266,7 +271,7 @@ fn commit_walk_watermark_not_ancestor_scans_full_history() {
     };
     let start_set_id = StartSetConfig::DefaultBranchOnly.id();
 
-    let state = repo_open(
+    let mut state = repo_open(
         tmp.path(),
         8,
         [0u8; 32],
@@ -277,7 +282,7 @@ fn commit_walk_watermark_not_ancestor_scans_full_history() {
     )
     .unwrap();
 
-    let cg = CommitGraphView::open_repo(&state).unwrap();
+    let cg = build_commit_graph(&mut state);
     let mut actual: Vec<u32> = CommitPlanIter::new(&state, &cg, CommitWalkLimits::RESTRICTIVE)
         .unwrap()
         .map(|item| item.unwrap().pos.0)

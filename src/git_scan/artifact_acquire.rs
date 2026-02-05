@@ -29,7 +29,6 @@ use super::commit_loader::{
     collect_pack_dirs, load_commits_from_tips, resolve_pack_paths_from_midx, CommitLoadError,
     CommitLoadLimits,
 };
-use super::commit_walk::CommitGraphView;
 use super::errors::{CommitPlanError, RepoOpenError};
 use super::midx::MidxView;
 use super::midx_build::{build_midx_bytes, MidxBuildError, MidxBuildLimits};
@@ -55,16 +54,10 @@ pub struct ArtifactBuildLimits {
 pub enum ArtifactAcquireError {
     /// I/O error during artifact access.
     Io(io::Error),
-    /// MIDX parsing failed and in-memory build is not enabled.
-    MidxMissing,
     /// MIDX build failed.
     MidxBuild(MidxBuildError),
     /// MIDX parsing failed.
     MidxParse(MidxError),
-    /// Commit-graph missing and in-memory build is not enabled.
-    CommitGraphMissing,
-    /// Commit-graph open failed.
-    CommitGraphOpen(CommitPlanError),
     /// Commit loading failed during in-memory graph build.
     CommitLoad(CommitLoadError),
     /// In-memory commit graph construction failed.
@@ -79,13 +72,8 @@ impl fmt::Display for ArtifactAcquireError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(err) => write!(f, "artifact I/O error: {err}"),
-            Self::MidxMissing => write!(f, "MIDX missing and BuildInMemory not enabled"),
             Self::MidxBuild(err) => write!(f, "MIDX build failed: {err}"),
             Self::MidxParse(err) => write!(f, "MIDX parse failed: {err}"),
-            Self::CommitGraphMissing => {
-                write!(f, "commit-graph missing and BuildInMemory not enabled")
-            }
-            Self::CommitGraphOpen(err) => write!(f, "commit-graph open failed: {err}"),
             Self::CommitLoad(err) => write!(f, "commit loading failed: {err}"),
             Self::CommitGraphBuild(err) => write!(f, "commit graph build failed: {err}"),
             Self::RepoOpen(err) => write!(f, "repo open error: {err}"),
@@ -100,7 +88,6 @@ impl std::error::Error for ArtifactAcquireError {
             Self::Io(err) => Some(err),
             Self::MidxBuild(err) => Some(err),
             Self::MidxParse(err) => Some(err),
-            Self::CommitGraphOpen(err) => Some(err),
             Self::CommitLoad(err) => Some(err),
             Self::CommitGraphBuild(err) => Some(err),
             Self::RepoOpen(err) => Some(err),
@@ -139,49 +126,8 @@ impl From<RepoOpenError> for ArtifactAcquireError {
     }
 }
 
-/// Source of commit-graph data.
-///
-/// Allows transparent use of either disk-based `CommitGraphView` or
-/// in-memory `CommitGraphMem`. `acquire_commit_graph` always returns
-/// the in-memory variant.
-pub enum CommitGraphSource {
-    /// Disk-based commit-graph file.
-    View(CommitGraphView),
-    /// In-memory commit graph built from loaded commits.
-    Mem(CommitGraphMem),
-}
-
-impl fmt::Debug for CommitGraphSource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::View(_) => f.debug_struct("CommitGraphSource::View").finish(),
-            Self::Mem(m) => f
-                .debug_struct("CommitGraphSource::Mem")
-                .field("mem", m)
-                .finish(),
-        }
-    }
-}
-
-impl CommitGraphSource {
-    /// Returns a reference to the underlying view if this is a disk-based source.
-    pub fn as_view(&self) -> Option<&CommitGraphView> {
-        match self {
-            Self::View(v) => Some(v),
-            Self::Mem(_) => None,
-        }
-    }
-
-    /// Returns a reference to the underlying mem if this is an in-memory source.
-    pub fn as_mem(&self) -> Option<&CommitGraphMem> {
-        match self {
-            Self::View(_) => None,
-            Self::Mem(m) => Some(m),
-        }
-    }
-}
-
-/// Result of MIDX acquisition.
+/// Output of MIDX acquisition, carrying the MIDX bytes and resolved
+/// pack file paths needed for subsequent pack planning and execution.
 pub struct MidxAcquireResult {
     /// The acquired MIDX bytes (either mmapped or built in-memory).
     pub bytes: BytesView,
@@ -213,20 +159,13 @@ pub fn acquire_midx(
     repo: &mut RepoJobState,
     limits: &ArtifactBuildLimits,
 ) -> Result<MidxAcquireResult, ArtifactAcquireError> {
-    // Build MIDX from pack index files
     let midx_bytes = build_midx_bytes(&repo.paths, repo.object_format, &limits.midx)?;
-
-    // Validate the built MIDX
     MidxView::parse(midx_bytes.as_slice(), repo.object_format)?;
-
-    // Resolve pack paths
     let pack_paths = resolve_pack_paths(repo, &midx_bytes)?;
 
-    // Update fingerprint to PackSet variant
     let packset_fingerprint = RepoArtifactFingerprint::from_pack_dirs(&repo.paths)?;
     repo.artifact_fingerprint = Some(packset_fingerprint);
 
-    // Store the built MIDX
     repo.mmaps.midx = Some(midx_bytes.clone());
 
     Ok(MidxAcquireResult {
@@ -245,32 +184,28 @@ pub fn acquire_midx(
 /// * `limits` - Build limits for artifact construction
 ///
 /// # Returns
-/// A `CommitGraphSource` that can be used for commit traversal.
+/// A `CommitGraphMem` that can be used for commit traversal.
 ///
 /// # Behavior
 /// Loads commits via BFS from the start set tips and builds `CommitGraphMem`.
 /// The graph contains only commits reachable from `repo.start_set` tips.
 /// Parents outside that set are treated as external roots.
 ///
-/// This path always builds in memory (even if a disk commit-graph exists) and
-/// is bounded by `limits.commit_load`.
+/// Bounded by `limits.commit_load`.
 pub fn acquire_commit_graph(
     repo: &RepoJobState,
     midx: &MidxView<'_>,
     pack_paths: &[PathBuf],
     limits: &ArtifactBuildLimits,
-) -> Result<CommitGraphSource, ArtifactAcquireError> {
-    // Build commit graph from pack data
+) -> Result<CommitGraphMem, ArtifactAcquireError> {
     let tips: Vec<OidBytes> = repo.start_set.iter().map(|r| r.tip).collect();
 
     if tips.is_empty() {
         // No tips to traverse; return empty graph
-        let mem = CommitGraphMem::build(vec![], repo.object_format)
-            .map_err(ArtifactAcquireError::CommitGraphBuild)?;
-        return Ok(CommitGraphSource::Mem(mem));
+        return CommitGraphMem::build(vec![], repo.object_format)
+            .map_err(ArtifactAcquireError::CommitGraphBuild);
     }
 
-    // Load commits via BFS from tips
     let commits = load_commits_from_tips(
         &tips,
         midx,
@@ -280,11 +215,8 @@ pub fn acquire_commit_graph(
         None, // No progress callback for now
     )?;
 
-    // Build commit graph
-    let mem = CommitGraphMem::build(commits, repo.object_format)
-        .map_err(ArtifactAcquireError::CommitGraphBuild)?;
-
-    Ok(CommitGraphSource::Mem(mem))
+    CommitGraphMem::build(commits, repo.object_format)
+        .map_err(ArtifactAcquireError::CommitGraphBuild)
 }
 
 /// Resolves pack paths from MIDX data.
@@ -300,6 +232,7 @@ fn resolve_pack_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git_scan::commit_walk::CommitGraph;
 
     #[test]
     fn artifact_build_limits_default() {
@@ -309,12 +242,9 @@ mod tests {
     }
 
     #[test]
-    fn commit_graph_source_accessors() {
-        // Can't easily test without real data, but verify the accessors compile
+    fn commit_graph_mem_builds_empty() {
         let mem =
             CommitGraphMem::build(vec![], super::super::object_id::ObjectFormat::Sha1).unwrap();
-        let source = CommitGraphSource::Mem(mem);
-        assert!(source.as_mem().is_some());
-        assert!(source.as_view().is_none());
+        assert_eq!(mem.num_commits(), 0);
     }
 }

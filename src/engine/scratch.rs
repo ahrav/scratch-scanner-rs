@@ -20,7 +20,6 @@ use super::vectorscan_prefilter::{VsScratch, VsStreamWindow};
 use super::work_items::{PendingDecodeSpan, PendingWindow, SpanStreamEntry, WorkItem};
 use regex::bytes::CaptureLocations;
 
-// Forward declaration for Engine (will be used via super::)
 use super::Engine;
 
 /// Normalized secret hash bytes (BLAKE3 output).
@@ -68,6 +67,10 @@ pub(super) struct RootSpanMapCtx {
 }
 
 impl RootSpanMapCtx {
+    /// Creates a new mapping context for the given transform and encoded span.
+    ///
+    /// The caller must ensure `tc` and `encoded` remain valid and unmodified
+    /// for the lifetime of this context (typically one scan invocation).
     pub(super) fn new(
         tc: &TransformConfig,
         encoded: &[u8],
@@ -83,6 +86,7 @@ impl RootSpanMapCtx {
         }
     }
 
+    /// Maps a decoded-byte span back to absolute root-buffer coordinates.
     pub(super) fn map_span(&self, span: std::ops::Range<usize>) -> std::ops::Range<usize> {
         // Map decoded offsets back to absolute root-buffer offsets.
         // SAFETY: The engine-owned transform config lives for the duration
@@ -95,8 +99,10 @@ impl RootSpanMapCtx {
         (root_start + start)..(root_start + end)
     }
 
-    // Returns true if a URL-percent trigger appears within the match span or
-    // within the guaranteed overlap prefix immediately preceding it.
+    /// Returns whether a URL-percent trigger (`%` or `+`) appears within the
+    /// match span or within the guaranteed overlap prefix preceding it.
+    ///
+    /// Returns `None` if this context is not for a URL-percent transform.
     pub(super) fn has_trigger_before_or_in_match(
         &self,
         root_span: std::ops::Range<usize>,
@@ -365,6 +371,10 @@ pub struct ScanScratch {
 }
 
 impl ScanScratch {
+    /// Allocates scratch state sized to the given engine's rules and tuning.
+    ///
+    /// All fixed-capacity buffers are pre-allocated here. Subsequent scans
+    /// reuse these allocations unless the engine's configuration has grown.
     pub(super) fn new(engine: &Engine) -> Self {
         let rules_len = engine.rules.len();
         let max_spans = engine
@@ -890,7 +900,9 @@ impl ScanScratch {
             if drop_end > new_bytes_start {
                 if write_idx != read_idx {
                     // Move the element to the write position.
-                    // SAFETY: Both indices are in bounds and non-overlapping.
+                    // SAFETY: `write_idx <= read_idx` is maintained by the compaction
+                    // loop (write_idx only increments when read_idx advances past it),
+                    // so src and dst never alias the same element.
                     let src = &self.out[read_idx] as *const FindingRec;
                     let dst = &mut self.out[write_idx] as *mut FindingRec;
                     unsafe {
@@ -908,10 +920,12 @@ impl ScanScratch {
         self.norm_hash.truncate(write_idx);
     }
 
+    /// Returns the drop-boundary offsets aligned 1:1 with [`findings()`].
     pub(crate) fn drop_hint_end(&self) -> &[u64] {
         self.drop_hint_end.as_slice()
     }
 
+    /// Returns the normalized secret hashes aligned 1:1 with [`findings()`].
     pub(crate) fn norm_hashes(&self) -> &[NormHash] {
         self.norm_hash.as_slice()
     }
@@ -936,6 +950,7 @@ impl ScanScratch {
         self.findings_dropped
     }
 
+    /// Records a finding using `root_hint_end` as the default drop boundary.
     pub(super) fn push_finding(&mut self, rec: FindingRec, norm_hash: NormHash) {
         self.push_finding_with_drop_hint(rec, norm_hash, rec.root_hint_end, rec.dedupe_with_span);
     }
@@ -988,6 +1003,7 @@ impl ScanScratch {
         drop_hint_end: u64,
         include_span: bool,
     ) {
+        crate::git_scan::perf::record_scan_finding();
         debug_assert_eq!(
             self.out.len(),
             self.norm_hash.len(),

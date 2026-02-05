@@ -43,11 +43,11 @@ pub struct GitPerfStats {
     pub tree_load_bytes: u64,
     /// Wall-clock nanoseconds spent in tree loads.
     pub tree_load_nanos: u64,
-    /// Tree cache hits.
+    /// Hits against the in-memory tree-object cache (avoids pack decode).
     pub tree_cache_hits: u64,
-    /// Tree delta cache hits.
+    /// Delta instruction stream cache hits (reuses previously inflated delta).
     pub tree_delta_cache_hits: u64,
-    /// Tree delta cache misses.
+    /// Delta instruction stream cache misses (full inflate required).
     pub tree_delta_cache_misses: u64,
     /// Tree delta cache bytes reused.
     pub tree_delta_cache_bytes: u64,
@@ -65,7 +65,7 @@ pub struct GitPerfStats {
     pub tree_delta_chain_4_7: u64,
     /// Tree delta chain length >= 8.
     pub tree_delta_chain_8_plus: u64,
-    /// Tree spill index hits.
+    /// Hits against the spill index for previously decoded tree payloads.
     pub tree_spill_hits: u64,
     /// Tree object loads (cache/spill misses).
     pub tree_object_loads: u64,
@@ -85,6 +85,26 @@ pub struct GitPerfStats {
     pub tree_object_pack: u64,
     /// Tree objects loaded from loose objects.
     pub tree_object_loose: u64,
+
+    // -- Scan sub-stage breakdown (within sink_emit) --
+    /// Wall-clock nanoseconds in Vectorscan prefilter (`vs.scan_raw`).
+    pub scan_vs_prefilter_nanos: u64,
+    /// Wall-clock nanoseconds in window sort/merge + regex validation loop.
+    pub scan_validate_nanos: u64,
+    /// Wall-clock nanoseconds in transform decode + rescan (DecodeSpan items).
+    pub scan_transform_nanos: u64,
+    /// Wall-clock nanoseconds in per-blob `sort_unstable()` + `dedup()`.
+    pub scan_sort_dedup_nanos: u64,
+    /// Wall-clock nanoseconds in `scratch.reset_for_scan()`.
+    pub scan_reset_nanos: u64,
+    /// Total blobs scanned via `scan_blob_chunked_with_chunker`.
+    pub scan_blob_count: u64,
+    /// Total chunks processed via `scan_chunk`.
+    pub scan_chunk_count: u64,
+    /// Chunks where the prefilter produced zero hits (early return).
+    pub scan_zero_hit_chunks: u64,
+    /// Total findings produced (calls to `push_finding_with_drop_hint`).
+    pub scan_findings_count: u64,
 }
 
 #[cfg(feature = "git-perf")]
@@ -156,6 +176,25 @@ static TREE_OBJECT_PACK: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "git-perf")]
 static TREE_OBJECT_LOOSE: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(feature = "git-perf")]
+static SCAN_VS_PREFILTER_NANOS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "git-perf")]
+static SCAN_VALIDATE_NANOS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "git-perf")]
+static SCAN_TRANSFORM_NANOS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "git-perf")]
+static SCAN_SORT_DEDUP_NANOS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "git-perf")]
+static SCAN_RESET_NANOS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "git-perf")]
+static SCAN_BLOB_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "git-perf")]
+static SCAN_CHUNK_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "git-perf")]
+static SCAN_ZERO_HIT_CHUNKS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "git-perf")]
+static SCAN_FINDINGS_COUNT: AtomicU64 = AtomicU64::new(0);
+
 /// Reset all counters to zero.
 ///
 /// This is a no-op when `git-perf` is disabled.
@@ -196,6 +235,15 @@ pub fn reset() {
         TREE_DELTA_APPLY_NANOS.store(0, Ordering::Relaxed);
         TREE_OBJECT_PACK.store(0, Ordering::Relaxed);
         TREE_OBJECT_LOOSE.store(0, Ordering::Relaxed);
+        SCAN_VS_PREFILTER_NANOS.store(0, Ordering::Relaxed);
+        SCAN_VALIDATE_NANOS.store(0, Ordering::Relaxed);
+        SCAN_TRANSFORM_NANOS.store(0, Ordering::Relaxed);
+        SCAN_SORT_DEDUP_NANOS.store(0, Ordering::Relaxed);
+        SCAN_RESET_NANOS.store(0, Ordering::Relaxed);
+        SCAN_BLOB_COUNT.store(0, Ordering::Relaxed);
+        SCAN_CHUNK_COUNT.store(0, Ordering::Relaxed);
+        SCAN_ZERO_HIT_CHUNKS.store(0, Ordering::Relaxed);
+        SCAN_FINDINGS_COUNT.store(0, Ordering::Relaxed);
     }
 }
 
@@ -241,6 +289,15 @@ pub fn snapshot() -> GitPerfStats {
             tree_delta_apply_nanos: TREE_DELTA_APPLY_NANOS.load(Ordering::Relaxed),
             tree_object_pack: TREE_OBJECT_PACK.load(Ordering::Relaxed),
             tree_object_loose: TREE_OBJECT_LOOSE.load(Ordering::Relaxed),
+            scan_vs_prefilter_nanos: SCAN_VS_PREFILTER_NANOS.load(Ordering::Relaxed),
+            scan_validate_nanos: SCAN_VALIDATE_NANOS.load(Ordering::Relaxed),
+            scan_transform_nanos: SCAN_TRANSFORM_NANOS.load(Ordering::Relaxed),
+            scan_sort_dedup_nanos: SCAN_SORT_DEDUP_NANOS.load(Ordering::Relaxed),
+            scan_reset_nanos: SCAN_RESET_NANOS.load(Ordering::Relaxed),
+            scan_blob_count: SCAN_BLOB_COUNT.load(Ordering::Relaxed),
+            scan_chunk_count: SCAN_CHUNK_COUNT.load(Ordering::Relaxed),
+            scan_zero_hit_chunks: SCAN_ZERO_HIT_CHUNKS.load(Ordering::Relaxed),
+            scan_findings_count: SCAN_FINDINGS_COUNT.load(Ordering::Relaxed),
         }
     }
 
@@ -474,5 +531,97 @@ pub fn record_tree_delta_apply(bytes: usize, nanos: u64) {
     #[cfg(not(feature = "git-perf"))]
     {
         let _ = (bytes, nanos);
+    }
+}
+
+/// Record Vectorscan prefilter timing.
+pub fn record_scan_vs_prefilter(nanos: u64) {
+    #[cfg(feature = "git-perf")]
+    {
+        SCAN_VS_PREFILTER_NANOS.fetch_add(nanos, Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "git-perf"))]
+    {
+        let _ = nanos;
+    }
+}
+
+/// Record window validation timing (sort/merge + regex).
+pub fn record_scan_validate(nanos: u64) {
+    #[cfg(feature = "git-perf")]
+    {
+        SCAN_VALIDATE_NANOS.fetch_add(nanos, Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "git-perf"))]
+    {
+        let _ = nanos;
+    }
+}
+
+/// Record transform decode + rescan timing.
+pub fn record_scan_transform(nanos: u64) {
+    #[cfg(feature = "git-perf")]
+    {
+        SCAN_TRANSFORM_NANOS.fetch_add(nanos, Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "git-perf"))]
+    {
+        let _ = nanos;
+    }
+}
+
+/// Record per-blob sort + dedup timing.
+pub fn record_scan_sort_dedup(nanos: u64) {
+    #[cfg(feature = "git-perf")]
+    {
+        SCAN_SORT_DEDUP_NANOS.fetch_add(nanos, Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "git-perf"))]
+    {
+        let _ = nanos;
+    }
+}
+
+/// Record scratch reset timing.
+pub fn record_scan_reset(nanos: u64) {
+    #[cfg(feature = "git-perf")]
+    {
+        SCAN_RESET_NANOS.fetch_add(nanos, Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "git-perf"))]
+    {
+        let _ = nanos;
+    }
+}
+
+/// Record a blob entering the scanner.
+pub fn record_scan_blob() {
+    #[cfg(feature = "git-perf")]
+    {
+        SCAN_BLOB_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Record a chunk entering the scanner.
+pub fn record_scan_chunk() {
+    #[cfg(feature = "git-perf")]
+    {
+        SCAN_CHUNK_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Record a chunk where the prefilter produced zero hits.
+pub fn record_scan_zero_hit_chunk() {
+    #[cfg(feature = "git-perf")]
+    {
+        SCAN_ZERO_HIT_CHUNKS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Record a finding produced by the engine.
+pub fn record_scan_finding() {
+    #[cfg(feature = "git-perf")]
+    {
+        SCAN_FINDINGS_COUNT.fetch_add(1, Ordering::Relaxed);
     }
 }

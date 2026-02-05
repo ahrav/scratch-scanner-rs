@@ -1,24 +1,19 @@
 //! Git scanning pipeline modules.
 //!
-//! The preflight module performs a repository maintenance check: resolve repo
-//! layout, verify required artifacts (commit-graph and MIDX), and enforce pack
-//! count limits. Preflight must not read object contents.
-//!
-//! The repo_open module produces `RepoJobState`: it resolves repo paths,
-//! detects object format, memory-maps commit-graph and MIDX, records artifact
-//! fingerprints, and loads the start set plus watermarks needed for incremental
-//! Git scanning.
+//! The `repo_open` module produces `RepoJobState`: it resolves repo paths,
+//! detects object format, and loads the start set plus watermarks needed for
+//! incremental Git scanning. Artifacts (MIDX, commit-graph) are always built
+//! in memory by `artifact_acquire`.
 //!
 //! Pipeline overview:
-//! 1. `preflight` verifies repository layout and artifacts.
-//! 2. `repo_open` loads commit-graph/MIDX metadata and start set state.
-//! 3. `commit_walk` builds the commit plan.
-//! 4. `tree_diff` extracts candidate blobs and paths.
-//! 5. `spill` dedupes and filters candidates against the seen store.
-//! 6. `mapping_bridge` maps unique blobs to pack/loose candidates.
-//! 7. `pack_plan` builds per-pack decode plans from pack candidates.
-//! 8. `pack_exec` decodes blobs and streams bytes into `engine_adapter`.
-//! 9. `finalize` builds persistence ops, and `persist` commits them atomically.
+//! 1. `repo_open` loads commit-graph/MIDX metadata and start set state.
+//! 2. `commit_walk` builds the commit plan.
+//! 3. `tree_diff` extracts candidate blobs and paths.
+//! 4. `spill` dedupes and filters candidates against the seen store.
+//! 5. `mapping_bridge` maps unique blobs to pack/loose candidates.
+//! 6. `pack_plan` builds per-pack decode plans from pack candidates.
+//! 7. `pack_exec` decodes blobs and streams bytes into `engine_adapter`.
+//! 8. `finalize` builds persistence ops, and `persist` commits them atomically.
 //!
 //! # Output model
 //! - Metadata phases emit stable plans and candidate lists without reading blobs.
@@ -31,7 +26,7 @@
 //! - `git-perf` enables performance counters for pack decode and scan stages.
 //!
 //! # Invariants
-//! - Metadata stages (preflight through pack planning) do not read blob payloads.
+//! - Metadata stages (repo open through pack planning) do not read blob payloads.
 //! - Pack execution and engine adaptation read and scan blob bytes with explicit limits.
 //! - File reads are bounded by explicit limits.
 //! - Outputs are deterministic for identical repo state and configuration.
@@ -107,7 +102,7 @@ pub mod work_items;
 pub use alloc_guard::{enabled as alloc_guard_enabled, set_enabled as set_alloc_guard_enabled};
 pub use artifact_acquire::{
     acquire_commit_graph, acquire_midx, ArtifactAcquireError, ArtifactBuildLimits,
-    CommitGraphSource, MidxAcquireResult,
+    MidxAcquireResult,
 };
 pub use blob_introducer::{BlobIntroStats, BlobIntroducer, SeenSets};
 pub use byte_arena::{ByteArena, ByteRef};
@@ -120,8 +115,8 @@ pub use commit_loader::{
 };
 pub use commit_parse::{parse_commit, CommitParseError, CommitParseLimits, ParsedCommit};
 pub use commit_walk::{
-    introduced_by_plan, topo_order_positions, CommitGraph, CommitGraphView, CommitPlanIter,
-    ParentScratch, PlannedCommit,
+    introduced_by_plan, topo_order_positions, CommitGraph, CommitPlanIter, ParentScratch,
+    PlannedCommit,
 };
 pub use commit_walk_limits::CommitWalkLimits;
 pub use engine_adapter::{
@@ -173,8 +168,8 @@ pub use preflight_error::PreflightError;
 pub use preflight_limits::PreflightLimits;
 pub use repo::{GitRepoPaths, RepoKind};
 pub use repo_open::{
-    repo_open, ArtifactFingerprint, RefWatermarkStore, RepoArtifactFingerprint, RepoArtifactMmaps,
-    RepoArtifactPaths, RepoArtifactStatus, RepoJobState, StartSetRef, StartSetResolver,
+    repo_open, RefWatermarkStore, RepoArtifactFingerprint, RepoArtifactMmaps, RepoArtifactPaths,
+    RepoJobState, StartSetRef, StartSetResolver,
 };
 pub use run_format::{RunContext, RunHeader, RunRecord};
 pub use run_reader::RunReader;

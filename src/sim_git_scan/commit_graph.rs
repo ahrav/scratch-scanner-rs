@@ -144,6 +144,32 @@ impl CommitGraph for SimCommitGraph {
         }
         Ok(())
     }
+
+    fn root_tree_oid(&self, pos: Position) -> Result<OidBytes, CommitPlanError> {
+        let idx = pos.0 as usize;
+        if idx >= self.roots.len() {
+            return Err(CommitPlanError::ParentDecodeFailed);
+        }
+        Ok(self.roots[idx])
+    }
+
+    /// Reverse-lookup: finds the OID for a given position by linear scan.
+    ///
+    /// O(n) because the primary map is OID-to-position. Acceptable for
+    /// simulation workloads.
+    fn commit_oid(&self, pos: Position) -> Result<OidBytes, CommitPlanError> {
+        for (oid, &p) in &self.oid_to_pos {
+            if p == pos {
+                return Ok(*oid);
+            }
+        }
+        Err(CommitPlanError::ParentDecodeFailed)
+    }
+
+    /// Returns 0 for all positions; the simulation harness does not model timestamps.
+    fn committer_timestamp(&self, _pos: Position) -> u64 {
+        0
+    }
 }
 
 #[cfg(test)]

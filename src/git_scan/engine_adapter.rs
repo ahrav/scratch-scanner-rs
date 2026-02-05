@@ -163,7 +163,12 @@ pub struct EngineAdapter<'a> {
 }
 
 impl<'a> EngineAdapter<'a> {
-    /// Creates a new adapter.
+    /// Creates a new adapter bound to the given engine.
+    ///
+    /// The adapter computes overlap from `engine.required_overlap()` and
+    /// clamps `config.chunk_bytes` to ensure forward progress. Scratch
+    /// space and the ring chunker are allocated once and reused across
+    /// all subsequent `emit` / `emit_loose` calls.
     #[must_use]
     pub fn new(engine: &'a Engine, config: EngineAdapterConfig) -> Self {
         let overlap = engine.required_overlap();
@@ -382,6 +387,7 @@ fn scan_blob_chunked_with_chunker(
     chunker: &mut RingChunker,
     out: &mut Vec<FindingKey>,
 ) -> Result<(), EngineAdapterError> {
+    perf::record_scan_blob();
     let (res, nanos) = perf::time(|| {
         let guard = if alloc_guard::enabled() {
             Some(AllocGuard::new())
@@ -411,8 +417,13 @@ fn scan_blob_chunked_with_chunker(
             return Err(err);
         }
 
-        out.sort_unstable();
-        out.dedup();
+        let ((), _sd_nanos) = perf::time(|| {
+            if !out.is_empty() {
+                out.sort_unstable();
+                out.dedup();
+            }
+        });
+        perf::record_scan_sort_dedup(_sd_nanos);
 
         if let Some(guard) = guard {
             guard.assert_no_alloc();
@@ -437,6 +448,7 @@ fn scan_chunk(
     out: &mut Vec<FindingKey>,
     err: &mut Option<EngineAdapterError>,
 ) {
+    perf::record_scan_chunk();
     engine.scan_chunk_into(view.window, file_id, view.base, scratch);
     // Skip findings that are fully contained in the overlap prefix.
     // This keeps each match while avoiding duplicate reporting.
@@ -476,7 +488,9 @@ struct ChunkView<'a> {
     window: &'a [u8],
 }
 
-/// Fixed-size ring chunker for streaming blob bytes.
+/// Fixed-size ring chunker for streaming blob bytes into scan windows.
+///
+/// Invariant: `chunk_bytes > overlap`, enforced at construction.
 struct RingChunker {
     chunk_bytes: usize,
     overlap: usize,

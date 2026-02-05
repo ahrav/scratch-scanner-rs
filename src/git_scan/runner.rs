@@ -10,9 +10,8 @@
 //! 4. Plan packs, decode + scan, then finalize and optionally persist.
 //!
 //! # Artifact Construction
-//! This runner expects MIDX and commit-graph artifacts to be available.
-//! In-memory construction is handled by `artifact_acquire` and should be
-//! performed before invoking the scan when disk artifacts are missing.
+//! The runner always builds MIDX and commit-graph in memory from pack/idx
+//! files via `artifact_acquire` before scanning.
 //!
 //! # Modes
 //! - Diff-history: walk commits, diff trees, spill/dedupe candidates, then plan
@@ -46,13 +45,13 @@ use memmap2::Mmap;
 use crate::scheduler::{alloc_stats, AllocStats, AllocStatsDelta};
 use crate::Engine;
 
-use super::artifact_acquire::ArtifactBuildLimits;
+use super::artifact_acquire::{
+    acquire_commit_graph, acquire_midx, ArtifactAcquireError, ArtifactBuildLimits,
+};
 use super::blob_introducer::BlobIntroducer;
 use super::byte_arena::ByteArena;
 use super::commit_graph::CommitGraphIndex;
-use super::commit_walk::{
-    introduced_by_plan, CommitGraph, CommitGraphView, ParentScratch, PlannedCommit,
-};
+use super::commit_walk::{introduced_by_plan, CommitGraph, ParentScratch, PlannedCommit};
 use super::commit_walk_limits::CommitWalkLimits;
 use super::engine_adapter::{EngineAdapter, EngineAdapterConfig, ScannedBlobs};
 use super::errors::{CommitPlanError, PersistError, RepoOpenError, SpillError, TreeDiffError};
@@ -233,10 +232,10 @@ pub struct GitScanConfig {
     pub pack_exec_workers: usize,
     /// Optional spill directory override. When `None`, a unique temp directory is used.
     pub spill_dir: Option<PathBuf>,
-    /// Limits for artifact construction.
+    /// Limits for in-memory artifact construction.
     ///
-    /// Reserved for callers that build artifacts explicitly; `run_git_scan`
-    /// assumes artifacts are already available.
+    /// Applied when disk artifacts are missing and `run_git_scan` builds
+    /// MIDX and commit-graph in memory.
     pub artifact_build: ArtifactBuildLimits,
 }
 
@@ -766,20 +765,32 @@ impl GitScanReport {
 /// Git scan error taxonomy.
 #[derive(Debug)]
 pub enum GitScanError {
+    /// Repo open phase failed (bad metadata, missing refs, etc.).
     RepoOpen(RepoOpenError),
+    /// Commit plan construction failed.
     CommitPlan(CommitPlanError),
+    /// Tree diff walker encountered an error.
     TreeDiff(TreeDiffError),
+    /// Spill/dedupe pipeline error.
     Spill(SpillError),
+    /// MIDX parsing or validation error.
     Midx(MidxError),
+    /// Pack plan construction error.
     PackPlan(PackPlanError),
+    /// Fatal pack execution error.
     PackExec(PackExecError),
+    /// Pack I/O (loose object or cross-pack base resolution) error.
     PackIo(PackIoError),
+    /// Persistence store write failed.
     Persist(PersistError),
+    /// Underlying I/O error.
     Io(io::Error),
     /// Resource limit exceeded (pack mmap counts or bytes).
     ResourceLimit(String),
     /// Scan mode not yet implemented.
     UnsupportedMode(GitScanMode),
+    /// In-memory artifact construction failed.
+    ArtifactAcquire(ArtifactAcquireError),
     /// Artifacts changed during the scan (concurrent git maintenance detected).
     ConcurrentMaintenance,
 }
@@ -799,6 +810,7 @@ impl std::fmt::Display for GitScanError {
             Self::Io(err) => write!(f, "{err}"),
             Self::ResourceLimit(msg) => write!(f, "resource limit exceeded: {msg}"),
             Self::UnsupportedMode(mode) => write!(f, "scan mode not implemented: {mode}"),
+            Self::ArtifactAcquire(err) => write!(f, "artifact acquisition failed: {err}"),
             Self::ConcurrentMaintenance => {
                 write!(
                     f,
@@ -822,6 +834,7 @@ impl std::error::Error for GitScanError {
             Self::PackIo(err) => Some(err),
             Self::Persist(err) => Some(err),
             Self::Io(err) => Some(err),
+            Self::ArtifactAcquire(err) => Some(err),
             Self::ResourceLimit(_) | Self::UnsupportedMode(_) | Self::ConcurrentMaintenance => None,
         }
     }
@@ -877,12 +890,17 @@ impl From<io::Error> for GitScanError {
         Self::Io(err)
     }
 }
+impl From<ArtifactAcquireError> for GitScanError {
+    fn from(err: ArtifactAcquireError) -> Self {
+        Self::ArtifactAcquire(err)
+    }
+}
 
 /// Runs a full Git scan with the provided configuration and stores.
 ///
-/// The scan requires maintenance artifacts (MIDX, commit-graph) to be present
-/// (or pre-built via `artifact_acquire`). On success, the scan is finalized
-/// and optionally persisted.
+/// When disk artifacts (MIDX, commit-graph) are missing, this function
+/// builds them in memory via `artifact_acquire`. On success, the scan is
+/// finalized and optionally persisted.
 ///
 /// # Inputs
 /// - `repo_root` must reference a Git repository with readable metadata.
@@ -923,14 +941,13 @@ pub fn run_git_scan(
     persist_store: Option<&dyn PersistenceStore>,
     config: &GitScanConfig,
 ) -> Result<GitScanResult, GitScanError> {
-    // Reset perf counters for a clean per-run snapshot.
     super::perf::reset();
 
     let mut stage_nanos = GitScanStageNanos::default();
     let mut alloc_deltas = GitScanAllocStats::default();
 
     let start_set_id = config.start_set.id();
-    let repo = repo_open(
+    let mut repo = repo_open(
         repo_root,
         config.repo_id,
         config.policy_hash,
@@ -940,9 +957,16 @@ pub fn run_git_scan(
         config.repo_open,
     )?;
 
+    let midx_result = acquire_midx(&mut repo, &config.artifact_build)?;
+    let midx_view = MidxView::parse(midx_result.bytes.as_slice(), repo.object_format)?;
+    let cg = acquire_commit_graph(
+        &repo,
+        &midx_view,
+        &midx_result.pack_paths,
+        &config.artifact_build,
+    )?;
+
     if config.scan_mode == GitScanMode::OdbBlobFast {
-        // Commit walk plan.
-        let cg = CommitGraphView::open_repo(&repo)?;
         let plan_start = Instant::now();
         let plan = introduced_by_plan(&repo, &cg, config.commit_walk)?;
         stage_nanos.commit_plan = plan_start.elapsed().as_nanos() as u64;
@@ -1612,8 +1636,7 @@ pub fn run_git_scan(
         }));
     }
 
-    // Commit walk plan.
-    let cg = CommitGraphView::open_repo(&repo)?;
+    // Commit walk plan (diff-history mode).
     let plan_start = Instant::now();
     let plan = introduced_by_plan(&repo, &cg, config.commit_walk)?;
     stage_nanos.commit_plan = plan_start.elapsed().as_nanos() as u64;
@@ -1632,6 +1655,7 @@ pub fn run_git_scan(
 
     {
         let diff_start = Instant::now();
+        let cg: &dyn CommitGraph = &cg;
         let mut sink = SpillCandidateSink::new(&mut spiller);
         for PlannedCommit { pos, snapshot_root } in &plan {
             let commit_id = pos.0;
@@ -1897,10 +1921,10 @@ fn estimate_pack_cache_bytes(
 /// Load the MIDX view for the repository.
 ///
 /// The parser uses the repo's object format to validate OID lengths.
-/// Callers are expected to have verified artifact readiness before calling.
+/// `acquire_midx` must have been called to populate `repo.mmaps.midx`.
 ///
 /// # Errors
-/// Returns `GitScanError::Midx` if the MIDX mmap is missing or corrupted.
+/// Returns `GitScanError::Midx` if the MIDX bytes are missing or corrupted.
 fn load_midx(repo: &RepoJobState) -> Result<MidxView<'_>, GitScanError> {
     let midx_bytes = repo
         .mmaps
@@ -2458,6 +2482,15 @@ mod tests {
                 tree_delta_apply_nanos: 0,
                 tree_object_pack: 0,
                 tree_object_loose: 0,
+                scan_vs_prefilter_nanos: 0,
+                scan_validate_nanos: 0,
+                scan_transform_nanos: 0,
+                scan_sort_dedup_nanos: 0,
+                scan_reset_nanos: 0,
+                scan_blob_count: 0,
+                scan_chunk_count: 0,
+                scan_zero_hit_chunks: 0,
+                scan_findings_count: 0,
             },
             tree_diff_bytes: 1_000,
             spill_runs: 2,

@@ -63,6 +63,8 @@ impl Engine {
             scratch.touched_pairs.clear();
         }
         // Stage 1: Vectorscan prefilter on raw bytes (required).
+        // The fallback (non-Vectorscan) path has been removed; this flag remains
+        // only for stats tracking and conditional sort logic.
         let used_vectorscan = true;
         let vs = self
             .vs
@@ -76,7 +78,9 @@ impl Engine {
         self.vs_stats
             .scans_attempted
             .fetch_add(1, Ordering::Relaxed);
-        let result = vs.scan_raw(buf, scratch, &mut vs_scratch);
+        let (result, _vs_nanos) =
+            crate::git_scan::perf::time(|| vs.scan_raw(buf, scratch, &mut vs_scratch));
+        crate::git_scan::perf::record_scan_vs_prefilter(_vs_nanos);
         scratch.vs_scratch = Some(vs_scratch);
         let saw_utf16 = match result {
             Ok(saw) => {
@@ -116,12 +120,15 @@ impl Engine {
         }
 
         if scratch.touched_pairs.is_empty() {
+            crate::git_scan::perf::record_scan_zero_hit_chunk();
             return;
         }
 
         // Only process (rule, variant) pairs that were actually touched by a
         // prefilter hit in this buffer. This avoids O(rules * variants) work
         // when nothing matched, which is critical once rule counts grow.
+        #[cfg(feature = "git-perf")]
+        let _validate_start = std::time::Instant::now();
         const VARIANTS: [Variant; 3] = [Variant::Raw, Variant::Utf16Le, Variant::Utf16Be];
         let touched_len = scratch.touched_pairs.len();
         for i in 0..touched_len {
@@ -150,7 +157,8 @@ impl Engine {
                     .sort_unstable_by_key(|s| s.start);
             }
 
-            // Windows are pushed in non-decreasing order of match positions.
+            // Post-sort invariant: windows are now in non-decreasing order of start.
+            // Merge adjacent/overlapping windows with the configured gap tolerance.
             merge_ranges_with_gap_sorted(&mut scratch.windows, merge_gap);
             coalesce_under_pressure_sorted(
                 &mut scratch.windows,
@@ -245,5 +253,8 @@ impl Engine {
             .hit_acc_pool
             .reset_touched(scratch.touched_pairs.as_slice());
         scratch.touched_pairs.clear();
+
+        #[cfg(feature = "git-perf")]
+        crate::git_scan::perf::record_scan_validate(_validate_start.elapsed().as_nanos() as u64);
     }
 }

@@ -17,12 +17,12 @@ use std::path::Path;
 use std::process::Command;
 
 use scanner_rs::git_scan::{
-    introduced_by_plan, repo_open, BlobIntroducer, CandidateBuffer, CandidateSink, ChangeKind,
-    CollectedUniqueBlob, CollectingUniqueBlobSink, CommitGraph, CommitGraphIndex, CommitGraphView,
-    CommitWalkLimits, MergeDiffMode, MidxView, NeverSeenStore, ObjectStore, OidIndex,
-    ParentScratch, RefWatermarkStore, RepoArtifactStatus, RepoOpenError, RepoOpenLimits,
-    SpillLimits, Spiller, StartSetConfig, StartSetResolver, TreeBytes, TreeDiffError,
-    TreeDiffLimits, TreeDiffWalker, TreeSource,
+    acquire_commit_graph, acquire_midx, introduced_by_plan, repo_open, ArtifactBuildLimits,
+    BlobIntroducer, CandidateBuffer, CandidateSink, ChangeKind, CollectedUniqueBlob,
+    CollectingUniqueBlobSink, CommitGraph, CommitGraphIndex, CommitWalkLimits, MergeDiffMode,
+    MidxView, NeverSeenStore, ObjectStore, OidIndex, ParentScratch, RefWatermarkStore,
+    RepoOpenError, RepoOpenLimits, SpillLimits, Spiller, StartSetConfig, StartSetResolver,
+    TreeBytes, TreeDiffError, TreeDiffLimits, TreeDiffWalker, TreeSource,
 };
 use scanner_rs::git_scan::{OidBytes, PlannedCommit, RepoJobState};
 use tempfile::TempDir;
@@ -135,7 +135,6 @@ fn prepare_repo_with_commits() -> TempDir {
     run_git(tmp.path(), &["commit", "-m", "c2"]);
 
     // Prepare artifacts expected by the object store.
-    run_git(tmp.path(), &["commit-graph", "write", "--reachable"]);
     run_git(tmp.path(), &["repack", "-ad"]);
     run_git(tmp.path(), &["multi-pack-index", "write"]);
 
@@ -162,7 +161,6 @@ fn prepare_repo_with_many_files(count: usize) -> TempDir {
     run_git(tmp.path(), &["add", "."]);
     run_git(tmp.path(), &["commit", "-m", "update"]);
 
-    run_git(tmp.path(), &["commit-graph", "write", "--reachable"]);
     run_git(tmp.path(), &["repack", "-ad"]);
     run_git(tmp.path(), &["multi-pack-index", "write"]);
 
@@ -195,7 +193,6 @@ fn prepare_repo_with_merge() -> TempDir {
         &["merge", "--no-ff", "feature", "-m", "merge feature"],
     );
 
-    run_git(tmp.path(), &["commit-graph", "write", "--reachable"]);
     run_git(tmp.path(), &["repack", "-ad"]);
     run_git(tmp.path(), &["multi-pack-index", "write"]);
 
@@ -219,15 +216,16 @@ fn prepare_repo_with_excluded_blob_paths() -> TempDir {
     run_git(tmp.path(), &["add", "."]);
     run_git(tmp.path(), &["commit", "-m", "c2"]);
 
-    run_git(tmp.path(), &["commit-graph", "write", "--reachable"]);
     run_git(tmp.path(), &["repack", "-ad"]);
     run_git(tmp.path(), &["multi-pack-index", "write"]);
 
     tmp
 }
 
-/// Create a repo with loose blobs not present in the MIDX.
-fn prepare_repo_with_loose_blobs() -> TempDir {
+/// Create a repo where two commits introduce the same blob content under
+/// different paths (`loose.txt` and `loose_dup.txt`). All objects are packed
+/// so the in-memory artifact builders can find every commit.
+fn prepare_repo_with_duplicate_blobs() -> TempDir {
     let tmp = TempDir::new().unwrap();
     run_git(tmp.path(), &["init", "-b", "main"]);
     run_git(tmp.path(), &["config", "user.email", "test@example.com"]);
@@ -237,10 +235,6 @@ fn prepare_repo_with_loose_blobs() -> TempDir {
     run_git(tmp.path(), &["add", "."]);
     run_git(tmp.path(), &["commit", "-m", "c1"]);
 
-    run_git(tmp.path(), &["commit-graph", "write", "--reachable"]);
-    run_git(tmp.path(), &["repack", "-ad"]);
-    run_git(tmp.path(), &["multi-pack-index", "write"]);
-
     fs::write(tmp.path().join("loose.txt"), "loose\n").unwrap();
     run_git(tmp.path(), &["add", "."]);
     run_git(tmp.path(), &["commit", "-m", "c2"]);
@@ -249,13 +243,15 @@ fn prepare_repo_with_loose_blobs() -> TempDir {
     run_git(tmp.path(), &["add", "."]);
     run_git(tmp.path(), &["commit", "-m", "c3"]);
 
-    // Update commit-graph for new commits, but keep MIDX stale so blobs stay loose.
-    run_git(tmp.path(), &["commit-graph", "write", "--reachable"]);
+    // Pack everything so in-memory artifact builders can load all commits.
+    run_git(tmp.path(), &["repack", "-ad"]);
 
     tmp
 }
 
-/// Open repo state with commit-graph and MIDX artifacts ready.
+/// Open repo state and build in-memory artifacts (MIDX + commit graph).
+///
+/// Returns the mutable state with MIDX populated.
 fn open_repo_state(repo: &Path) -> RepoJobState {
     let head = git_output(repo, &["rev-parse", "HEAD"]);
     let head_oid = oid_from_hex(&head);
@@ -266,7 +262,7 @@ fn open_repo_state(repo: &Path) -> RepoJobState {
     // Keep the start set consistent with the resolver: only the default branch.
     let start_set_id = StartSetConfig::DefaultBranchOnly.id();
 
-    let state = repo_open(
+    let mut state = repo_open(
         repo,
         7,
         [0u8; 32],
@@ -277,8 +273,23 @@ fn open_repo_state(repo: &Path) -> RepoJobState {
     )
     .unwrap();
 
-    assert!(matches!(state.artifact_status, RepoArtifactStatus::Ready));
+    // Build MIDX in-memory (populates state.mmaps.midx).
+    let limits = ArtifactBuildLimits::default();
+    acquire_midx(&mut state, &limits).unwrap();
+
     state
+}
+
+/// Build an in-memory commit graph from a `RepoJobState` that already has MIDX populated.
+fn build_commit_graph_from_state(state: &RepoJobState) -> scanner_rs::git_scan::CommitGraphMem {
+    let midx_bytes = state.mmaps.midx.as_ref().unwrap().as_ref();
+    let midx = MidxView::parse(midx_bytes, state.object_format).unwrap();
+
+    let pack_dirs = scanner_rs::git_scan::collect_pack_dirs(&state.paths);
+    let pack_paths = scanner_rs::git_scan::resolve_pack_paths_from_midx(&midx, &pack_dirs).unwrap();
+
+    let limits = ArtifactBuildLimits::default();
+    acquire_commit_graph(state, &midx, &pack_paths, &limits).unwrap()
 }
 
 /// Collect tree diff change kinds into a map keyed by UTF-8 path.
@@ -398,7 +409,7 @@ fn blob_introducer_matches_diff_history_unique_oids() {
     let limits = TreeDiffLimits::RESTRICTIVE;
     let spill = tempfile::tempdir().unwrap();
     let mut store = ObjectStore::open(&state, &limits, spill.path()).unwrap();
-    let cg = CommitGraphView::open_repo(&state).unwrap();
+    let cg = build_commit_graph_from_state(&state);
     let commit_limits = CommitWalkLimits::RESTRICTIVE;
     let plan = introduced_by_plan(&state, &cg, commit_limits).unwrap();
 
@@ -409,7 +420,7 @@ fn blob_introducer_matches_diff_history_unique_oids() {
 
     for PlannedCommit { pos, .. } in &plan {
         let commit_id = pos.0;
-        let new_tree = cg.root_tree_oid(*pos).unwrap();
+        let new_tree = cg.root_tree_oid(*pos);
 
         parent_scratch.clear();
         cg.collect_parents(
@@ -433,7 +444,7 @@ fn blob_introducer_matches_diff_history_unique_oids() {
                 .unwrap();
         } else {
             for (idx, parent_pos) in parents.iter().enumerate() {
-                let old_tree = cg.root_tree_oid(*parent_pos).unwrap();
+                let old_tree = cg.root_tree_oid(*parent_pos);
                 walker
                     .diff_trees(
                         &mut store,
@@ -497,7 +508,7 @@ fn blob_introducer_prefers_first_non_excluded_path() {
     let limits = TreeDiffLimits::RESTRICTIVE;
     let spill = tempfile::tempdir().unwrap();
     let mut store = ObjectStore::open(&state, &limits, spill.path()).unwrap();
-    let cg = CommitGraphView::open_repo(&state).unwrap();
+    let cg = build_commit_graph_from_state(&state);
     let commit_limits = CommitWalkLimits::RESTRICTIVE;
     let plan = introduced_by_plan(&state, &cg, commit_limits).unwrap();
 
@@ -536,19 +547,19 @@ fn blob_introducer_prefers_first_non_excluded_path() {
 }
 
 #[test]
-fn blob_introducer_dedupes_loose_oids() {
+fn blob_introducer_dedupes_duplicate_oids() {
     if !git_available() || !git_supports_midx() {
-        eprintln!("git or multi-pack-index not available; skipping loose oid test");
+        eprintln!("git or multi-pack-index not available; skipping duplicate oid test");
         return;
     }
 
-    let tmp = prepare_repo_with_loose_blobs();
+    let tmp = prepare_repo_with_duplicate_blobs();
     let state = open_repo_state(tmp.path());
 
     let limits = TreeDiffLimits::RESTRICTIVE;
     let spill = tempfile::tempdir().unwrap();
     let mut store = ObjectStore::open(&state, &limits, spill.path()).unwrap();
-    let cg = CommitGraphView::open_repo(&state).unwrap();
+    let cg = build_commit_graph_from_state(&state);
     let commit_limits = CommitWalkLimits::RESTRICTIVE;
     let plan = introduced_by_plan(&state, &cg, commit_limits).unwrap();
 
@@ -771,7 +782,7 @@ fn collect_merge_candidates(
 /// This uses streaming candidate emission into `Spiller` to exercise the
 /// spill partitioning logic under tight limits.
 fn collect_unique_blobs(state: &RepoJobState, limits: SpillLimits) -> Vec<CollectedUniqueBlob> {
-    let cg = CommitGraphView::open_repo(state).unwrap();
+    let cg = build_commit_graph_from_state(state);
     let plan = introduced_by_plan(state, &cg, CommitWalkLimits::RESTRICTIVE).unwrap();
 
     let tree_limits = TreeDiffLimits::RESTRICTIVE;
@@ -820,7 +831,7 @@ fn collect_unique_blobs(state: &RepoJobState, limits: SpillLimits) -> Vec<Collec
         };
         for PlannedCommit { pos, snapshot_root } in &plan {
             let commit_id = pos.0;
-            let new_tree = cg.root_tree_oid(*pos).unwrap();
+            let new_tree = cg.root_tree_oid(*pos);
 
             if *snapshot_root {
                 walker
@@ -849,7 +860,7 @@ fn collect_unique_blobs(state: &RepoJobState, limits: SpillLimits) -> Vec<Collec
             match merge_mode {
                 MergeDiffMode::AllParents => {
                     for (idx, parent_pos) in parents.iter().enumerate() {
-                        let old_tree = cg.root_tree_oid(*parent_pos).unwrap();
+                        let old_tree = cg.root_tree_oid(*parent_pos);
                         walker
                             .diff_trees(
                                 &mut store,
@@ -863,7 +874,7 @@ fn collect_unique_blobs(state: &RepoJobState, limits: SpillLimits) -> Vec<Collec
                     }
                 }
                 MergeDiffMode::FirstParentOnly => {
-                    let old_tree = cg.root_tree_oid(parents[0]).unwrap();
+                    let old_tree = cg.root_tree_oid(parents[0]);
                     walker
                         .diff_trees(
                             &mut store,
@@ -893,7 +904,7 @@ fn collect_unique_blobs_buffered(
     state: &RepoJobState,
     limits: SpillLimits,
 ) -> Vec<CollectedUniqueBlob> {
-    let cg = CommitGraphView::open_repo(state).unwrap();
+    let cg = build_commit_graph_from_state(state);
     let plan = introduced_by_plan(state, &cg, CommitWalkLimits::RESTRICTIVE).unwrap();
 
     let tree_limits = TreeDiffLimits::RESTRICTIVE;
@@ -906,7 +917,7 @@ fn collect_unique_blobs_buffered(
 
     for PlannedCommit { pos, snapshot_root } in &plan {
         let commit_id = pos.0;
-        let new_tree = cg.root_tree_oid(*pos).unwrap();
+        let new_tree = cg.root_tree_oid(*pos);
 
         if *snapshot_root {
             walker
@@ -932,7 +943,7 @@ fn collect_unique_blobs_buffered(
         }
 
         for (idx, parent_pos) in parents.iter().enumerate() {
-            let old_tree = cg.root_tree_oid(*parent_pos).unwrap();
+            let old_tree = cg.root_tree_oid(*parent_pos);
             walker
                 .diff_trees(
                     &mut store,

@@ -98,8 +98,8 @@ impl CommitGraphMem {
         let mut pending: Vec<usize> = (0..n).collect();
         let mut resolved = vec![false; n];
 
-        // Iterate until all generations are computed
-        // This handles DAG ordering naturally
+        // Fixed-point iteration handles DAG ordering naturally:
+        // each pass resolves commits whose parents are already resolved.
         let mut made_progress = true;
         while made_progress {
             made_progress = false;
@@ -112,7 +112,6 @@ impl CommitGraphMem {
 
                 let commit = &commits[idx];
 
-                // Check if all parents are resolved
                 let mut all_parents_resolved = true;
                 let mut max_parent_gen = 0u32;
 
@@ -158,13 +157,11 @@ impl CommitGraphMem {
             ord => ord,
         });
 
-        // Build position mapping
         let mut idx_to_pos = vec![0u32; n];
         for (pos, &idx) in sorted_indices.iter().enumerate() {
             idx_to_pos[idx] = pos as u32;
         }
 
-        // Build SoA arrays
         let mut commit_oids = Vec::with_capacity(n * oid_len);
         let mut root_trees = Vec::with_capacity(n * oid_len);
         let mut timestamps = Vec::with_capacity(n);
@@ -179,14 +176,12 @@ impl CommitGraphMem {
             let commit = &commits[idx];
             let pos = idx_to_pos[idx];
 
-            // Store commit data
             commit_oids.extend_from_slice(commit.oid.as_slice());
             root_trees.extend_from_slice(commit.tree_oid.as_slice());
             timestamps.push(commit.timestamp);
             final_generations.push(generations[idx]);
             oid_to_pos.insert(commit.oid, pos);
 
-            // Store parent positions
             for parent_oid in &commit.parents {
                 if let Some(&parent_idx) = oid_to_idx.get(parent_oid) {
                     parents_flat.push(idx_to_pos[parent_idx]);
@@ -225,6 +220,9 @@ impl CommitGraphMem {
     }
 
     /// Returns the root tree OID for the commit at `pos`.
+    ///
+    /// # Panics
+    /// Panics if `pos` is out of range (`>= num_commits`).
     pub fn root_tree_oid(&self, pos: Position) -> OidBytes {
         let oid_len = self.format.oid_len() as usize;
         let start = pos.0 as usize * oid_len;
@@ -232,6 +230,9 @@ impl CommitGraphMem {
     }
 
     /// Returns the commit OID for the commit at `pos`.
+    ///
+    /// # Panics
+    /// Panics if `pos` is out of range (`>= num_commits`).
     pub fn commit_oid(&self, pos: Position) -> OidBytes {
         let oid_len = self.format.oid_len() as usize;
         let start = pos.0 as usize * oid_len;
@@ -239,6 +240,9 @@ impl CommitGraphMem {
     }
 
     /// Returns the committer timestamp for the commit at `pos`.
+    ///
+    /// # Panics
+    /// Panics if `pos` is out of range (`>= num_commits`).
     #[inline]
     pub fn committer_timestamp(&self, pos: Position) -> u64 {
         self.timestamps[pos.0 as usize]
@@ -291,6 +295,18 @@ impl CommitGraph for CommitGraphMem {
         }
 
         Ok(())
+    }
+
+    fn root_tree_oid(&self, pos: Position) -> Result<OidBytes, CommitPlanError> {
+        Ok(CommitGraphMem::root_tree_oid(self, pos))
+    }
+
+    fn commit_oid(&self, pos: Position) -> Result<OidBytes, CommitPlanError> {
+        Ok(CommitGraphMem::commit_oid(self, pos))
+    }
+
+    fn committer_timestamp(&self, pos: Position) -> u64 {
+        CommitGraphMem::committer_timestamp(self, pos)
     }
 }
 

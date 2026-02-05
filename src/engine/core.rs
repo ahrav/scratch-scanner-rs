@@ -109,6 +109,7 @@ pub(super) struct VectorscanCounters {
 
 #[cfg(feature = "stats")]
 impl VectorscanCounters {
+    /// Captures a consistent snapshot of all counters with relaxed ordering.
     pub(super) fn snapshot(&self, db_built: bool, utf16_db_built: bool) -> VectorscanStats {
         VectorscanStats {
             db_built,
@@ -815,7 +816,10 @@ impl Engine {
         base_offset: u64,
         scratch: &mut ScanScratch,
     ) {
-        scratch.reset_for_scan(self);
+        let ((), _reset_nanos) = crate::git_scan::perf::time(|| {
+            scratch.reset_for_scan(self);
+        });
+        crate::git_scan::perf::record_scan_reset(_reset_nanos);
         scratch.update_chunk_overlap(file_id, base_offset, root_buf.len());
         scratch.work_q.push(WorkItem::ScanBuf {
             buf: BufRef::Root,
@@ -851,13 +855,18 @@ impl Engine {
                         BufRef::Slab(range) => unsafe {
                             debug_assert!(range.end <= scratch.slab.buf.len());
                             // SAFETY: `range` is sourced from decode output and stays in-bounds.
+                            // The slab does not grow or reallocate during a scan (capacity is
+                            // pre-allocated), and `scan_rules_on_buffer` never writes to the
+                            // slab region backing `cur_buf`, so no aliasing violation occurs.
                             let ptr = scratch.slab.buf.as_ptr().add(range.start);
                             (ptr, range.end.saturating_sub(range.start), range.start)
                         },
                     };
 
-                    // SAFETY: `buf_ptr` points into `root_buf` or the decode slab. The slab does
-                    // not reallocate during a scan, and `buf_len` is bounded by the checked range.
+                    // SAFETY: `buf_ptr` points into `root_buf` (caller-owned, immutable for
+                    // the duration of the scan) or the decode slab (pre-allocated, not
+                    // reallocated during a scan). `buf_len` is bounded by the checked range.
+                    // No mutable references alias `cur_buf` while it is live.
                     let cur_buf = unsafe { std::slice::from_raw_parts(buf_ptr, buf_len) };
 
                     // Build mapping context to translate decoded-space offsets back to root buffer
@@ -1104,6 +1113,9 @@ impl Engine {
                     root_hint,
                     depth,
                 } => {
+                    #[cfg(feature = "git-perf")]
+                    let _transform_start = std::time::Instant::now();
+
                     if scratch.total_decode_output_bytes
                         >= self.tuning.max_total_decode_output_bytes
                     {
@@ -1174,6 +1186,11 @@ impl Engine {
                             scratch,
                         );
                     }
+
+                    #[cfg(feature = "git-perf")]
+                    crate::git_scan::perf::record_scan_transform(
+                        _transform_start.elapsed().as_nanos() as u64,
+                    );
                 }
             }
         }
@@ -1181,7 +1198,8 @@ impl Engine {
 
     /// Scans a buffer and returns a shared view of finding records.
     ///
-    /// The returned slice is valid until `scratch` is reused for another scan.
+    /// Delegates to [`Engine::scan_chunk_into`]; the same preconditions apply
+    /// (`buf.len() <= u32::MAX`, exclusive `scratch` ownership).
     pub fn scan_chunk_records<'a>(
         &self,
         buf: &[u8],
@@ -1205,7 +1223,11 @@ impl Engine {
             .saturating_add(self.max_prefilter_width.saturating_sub(1))
     }
 
-    /// Returns the transform id for a transform index.
+    /// Returns the [`TransformId`] for the transform at position `idx` in the
+    /// engine's transform list.
+    ///
+    /// # Panics
+    /// Panics if `idx >= self.transforms.len()`.
     pub(crate) fn transform_id(&self, idx: usize) -> TransformId {
         self.transforms[idx].id
     }
