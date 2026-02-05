@@ -845,6 +845,59 @@ fn charge_discarded_bytes(budgets: &mut ArchiveBudgets, bytes: u64) -> Result<()
     }
 }
 
+/// Apply decompressed-output budgeting for a read of `n` bytes.
+///
+/// Returns `(allowed, clamped)` where:
+/// - `allowed` is the prefix length to scan/emits.
+/// - `clamped` signals the caller must stop after this iteration.
+///
+/// If the decoder produced more bytes than allowed, the extra bytes are charged
+/// as discarded output so archive/root caps remain accurate.
+#[inline(always)]
+fn apply_entry_budget_clamp(
+    budgets: &mut ArchiveBudgets,
+    n: usize,
+    entry_partial_reason: &mut Option<PartialReason>,
+    outcome: &mut ArchiveEnd,
+    stop_archive: &mut bool,
+) -> (u64, bool) {
+    let mut allowed = n as u64;
+    if let ChargeResult::Clamp { allowed: a, hit } = budgets.charge_decompressed_out(allowed) {
+        let r = budget_hit_to_partial_reason(hit);
+        allowed = a;
+        *entry_partial_reason = Some(r);
+        if !matches!(hit, BudgetHit::SkipEntry(_)) {
+            *outcome = ArchiveEnd::Partial(r);
+            *stop_archive = true;
+        }
+    }
+
+    if allowed == 0 {
+        if let Err(r) = charge_discarded_bytes(budgets, n as u64) {
+            if entry_partial_reason.is_none() {
+                *entry_partial_reason = Some(r);
+            }
+            *outcome = ArchiveEnd::Partial(r);
+            *stop_archive = true;
+        }
+        return (0, true);
+    }
+
+    if allowed < n as u64 {
+        let extra = (n as u64).saturating_sub(allowed);
+        if let Err(r) = charge_discarded_bytes(budgets, extra) {
+            if entry_partial_reason.is_none() {
+                *entry_partial_reason = Some(r);
+            }
+            *outcome = ArchiveEnd::Partial(r);
+            *stop_archive = true;
+        }
+        return (allowed, true);
+    }
+
+    (allowed, false)
+}
+
 /// Drain remaining tar entry payload bytes to realign the stream.
 fn discard_remaining_payload(
     input: &mut dyn TarRead,
@@ -1170,7 +1223,12 @@ fn scan_gzip_stream_nested<R: Read>(
             entry_scanned = true;
         }
 
-        let new_bytes_start = offset;
+        debug_assert_eq!(
+            base_offset.saturating_add(carry as u64),
+            offset,
+            "expected new-bytes start to align with base_offset + carry"
+        );
+        let new_bytes_start = base_offset.saturating_add(carry as u64);
         scan.scan_scratch.drop_prefix_findings(new_bytes_start);
 
         scan.pending.clear();
@@ -1731,7 +1789,12 @@ fn scan_tar_stream_nested(
                 entry_scanned = true;
             }
 
-            let new_bytes_start = offset;
+            debug_assert_eq!(
+                base_offset.saturating_add(carry as u64),
+                offset,
+                "expected new-bytes start to align with base_offset + carry"
+            );
+            let new_bytes_start = base_offset.saturating_add(carry as u64);
             scan.scan_scratch.drop_prefix_findings(new_bytes_start);
 
             scan.pending.clear();
@@ -2129,6 +2192,7 @@ fn scan_zip_file(
         let mut have: usize = 0;
         let mut entry_scanned = false;
         let mut entry_partial_reason: Option<PartialReason> = None;
+        let mut stop_archive = false;
 
         loop {
             if carry > 0 && have > 0 {
@@ -2142,8 +2206,11 @@ fn scan_zip_file(
                 if let ChargeResult::Clamp { hit, .. } = scratch.budgets.charge_decompressed_out(1)
                 {
                     let r = budget_hit_to_partial_reason(hit);
-                    outcome = ArchiveEnd::Partial(r);
                     entry_partial_reason = Some(r);
+                    if !matches!(hit, BudgetHit::SkipEntry(_)) {
+                        outcome = ArchiveEnd::Partial(r);
+                        stop_archive = true;
+                    }
                 }
                 break;
             }
@@ -2156,8 +2223,11 @@ fn scan_zip_file(
                 if let ChargeResult::Clamp { hit, .. } = scratch.budgets.charge_decompressed_out(1)
                 {
                     let r = budget_hit_to_partial_reason(hit);
-                    outcome = ArchiveEnd::Partial(r);
                     entry_partial_reason = Some(r);
+                    if !matches!(hit, BudgetHit::SkipEntry(_)) {
+                        outcome = ArchiveEnd::Partial(r);
+                        stop_archive = true;
+                    }
                 }
                 break;
             }
@@ -2184,15 +2254,13 @@ fn scan_zip_file(
                 break;
             }
 
-            let mut allowed = n as u64;
-            if let ChargeResult::Clamp { allowed: a, hit } =
-                scratch.budgets.charge_decompressed_out(allowed)
-            {
-                let r = budget_hit_to_partial_reason(hit);
-                allowed = a;
-                outcome = ArchiveEnd::Partial(r);
-                entry_partial_reason = Some(r);
-            }
+            let (allowed, clamped) = apply_entry_budget_clamp(
+                &mut scratch.budgets,
+                n,
+                &mut entry_partial_reason,
+                &mut outcome,
+                &mut stop_archive,
+            );
             if allowed == 0 {
                 break;
             }
@@ -2226,7 +2294,7 @@ fn scan_zip_file(
             have = read_len;
             carry = overlap.min(read_len);
 
-            if allowed_usize < n {
+            if clamped {
                 break;
             }
         }
@@ -2234,6 +2302,9 @@ fn scan_zip_file(
         scratch.budgets.end_entry(offset > 0);
         if let Some(r) = entry_partial_reason {
             stats.archive.record_entry_partial(r, path_bytes, false);
+        }
+        if stop_archive {
+            break;
         }
     }
 
@@ -2946,7 +3017,7 @@ fn dev_inode(meta: &std::fs::Metadata) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::archive::PartialReason;
+    use crate::archive::{ArchiveBudgets, ArchiveConfig, PartialReason};
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use std::fs;
@@ -3103,5 +3174,40 @@ mod tests {
         assert!(stats.archive.entries_scanned > 0);
         assert!(stats.bytes_scanned > 0);
         Ok(())
+    }
+
+    #[test]
+    fn pipeline_zip_budget_clamp_charges_discarded_bytes() {
+        let cfg = ArchiveConfig {
+            max_uncompressed_bytes_per_entry: 4,
+            max_total_uncompressed_bytes_per_archive: 5,
+            max_total_uncompressed_bytes_per_root: 5,
+            ..ArchiveConfig::default()
+        };
+
+        let mut budgets = ArchiveBudgets::new(&cfg);
+        assert!(budgets.enter_archive().is_ok());
+        budgets.begin_entry_scan();
+
+        let mut entry_partial_reason = None;
+        let mut outcome = ArchiveEnd::Scanned;
+        let mut stop_archive = false;
+
+        let (allowed, clamped) = apply_entry_budget_clamp(
+            &mut budgets,
+            6,
+            &mut entry_partial_reason,
+            &mut outcome,
+            &mut stop_archive,
+        );
+
+        assert_eq!(allowed, 4);
+        assert!(clamped);
+        assert!(stop_archive);
+        assert_eq!(budgets.root_decompressed_out(), 5);
+        assert_eq!(
+            outcome,
+            ArchiveEnd::Partial(PartialReason::ArchiveOutputBudgetExceeded)
+        );
     }
 }

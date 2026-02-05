@@ -629,6 +629,59 @@ fn charge_discarded_bytes(budgets: &mut ArchiveBudgets, bytes: u64) -> Result<()
     }
 }
 
+/// Apply decompressed-output budgeting for a read of `n` bytes.
+///
+/// Returns `(allowed, clamped)` where:
+/// - `allowed` is the prefix length to scan/emits.
+/// - `clamped` signals the caller must stop after this iteration.
+///
+/// If the decoder produced more bytes than allowed, the extra bytes are charged
+/// as discarded output so archive/root caps remain accurate.
+#[inline(always)]
+fn apply_entry_budget_clamp(
+    budgets: &mut ArchiveBudgets,
+    n: usize,
+    entry_partial_reason: &mut Option<PartialReason>,
+    outcome: &mut ArchiveEnd,
+    stop_archive: &mut bool,
+) -> (u64, bool) {
+    let mut allowed = n as u64;
+    if let ChargeResult::Clamp { allowed: a, hit } = budgets.charge_decompressed_out(allowed) {
+        let r = budget_hit_to_partial_reason(hit);
+        allowed = a;
+        *entry_partial_reason = Some(r);
+        if !matches!(hit, BudgetHit::SkipEntry(_)) {
+            *outcome = ArchiveEnd::Partial(r);
+            *stop_archive = true;
+        }
+    }
+
+    if allowed == 0 {
+        if let Err(r) = charge_discarded_bytes(budgets, n as u64) {
+            if entry_partial_reason.is_none() {
+                *entry_partial_reason = Some(r);
+            }
+            *outcome = ArchiveEnd::Partial(r);
+            *stop_archive = true;
+        }
+        return (0, true);
+    }
+
+    if allowed < n as u64 {
+        let extra = (n as u64).saturating_sub(allowed);
+        if let Err(r) = charge_discarded_bytes(budgets, extra) {
+            if entry_partial_reason.is_none() {
+                *entry_partial_reason = Some(r);
+            }
+            *outcome = ArchiveEnd::Partial(r);
+            *stop_archive = true;
+        }
+        return (allowed, true);
+    }
+
+    (allowed, false)
+}
+
 /// Drain remaining tar entry payload bytes to realign the stream.
 fn discard_remaining_payload(
     input: &mut dyn TarRead,
@@ -1445,6 +1498,7 @@ fn scan_tar_stream_nested<E: ScanEngine>(
         let mut have: usize = 0;
         let mut entry_scanned = false;
         let mut entry_partial_reason: Option<PartialReason> = None;
+        let mut stop_archive = false;
 
         while remaining > 0 {
             if carry > 0 && have > 0 {
@@ -1498,26 +1552,14 @@ fn scan_tar_stream_nested<E: ScanEngine>(
             }
             remaining = remaining.saturating_sub(n as u64);
 
-            let mut allowed = n as u64;
-            if let ChargeResult::Clamp { allowed: a, hit } =
-                budgets.charge_decompressed_out(allowed)
-            {
-                let r = budget_hit_to_partial_reason(hit);
-                allowed = a;
-                entry_partial_reason = Some(r);
-                if !matches!(hit, BudgetHit::SkipEntry(_)) {
-                    outcome = ArchiveEnd::Partial(r);
-                    stop_archive = true;
-                }
-            }
+            let (allowed, clamped) = apply_entry_budget_clamp(
+                budgets,
+                n,
+                &mut entry_partial_reason,
+                &mut outcome,
+                &mut stop_archive,
+            );
             if allowed == 0 {
-                if let Err(r) = charge_discarded_bytes(budgets, n as u64) {
-                    if entry_partial_reason.is_none() {
-                        entry_partial_reason = Some(r);
-                    }
-                    outcome = ArchiveEnd::Partial(r);
-                    stop_archive = true;
-                }
                 break;
             }
 
@@ -1562,15 +1604,7 @@ fn scan_tar_stream_nested<E: ScanEngine>(
             have = read_len;
             carry = overlap.min(read_len);
 
-            if allowed_usize < n {
-                let extra = (n - allowed_usize) as u64;
-                if let Err(r) = charge_discarded_bytes(budgets, extra) {
-                    if entry_partial_reason.is_none() {
-                        entry_partial_reason = Some(r);
-                    }
-                    outcome = ArchiveEnd::Partial(r);
-                    stop_archive = true;
-                }
+            if clamped {
                 break;
             }
         }
@@ -1948,6 +1982,7 @@ fn process_zip_file<E: ScanEngine>(
         let mut have: usize = 0;
         let mut entry_scanned = false;
         let mut entry_partial_reason: Option<PartialReason> = None;
+        let mut stop_archive = false;
 
         loop {
             if carry > 0 && have > 0 {
@@ -1958,8 +1993,11 @@ fn process_zip_file<E: ScanEngine>(
             if allowance == 0 {
                 if let ChargeResult::Clamp { hit, .. } = budgets.charge_decompressed_out(1) {
                     let r = budget_hit_to_partial_reason(hit);
-                    outcome = ArchiveEnd::Partial(r);
                     entry_partial_reason = Some(r);
+                    if !matches!(hit, BudgetHit::SkipEntry(_)) {
+                        outcome = ArchiveEnd::Partial(r);
+                        stop_archive = true;
+                    }
                 }
                 break;
             }
@@ -1971,8 +2009,11 @@ fn process_zip_file<E: ScanEngine>(
             if read_max == 0 {
                 if let ChargeResult::Clamp { hit, .. } = budgets.charge_decompressed_out(1) {
                     let r = budget_hit_to_partial_reason(hit);
-                    outcome = ArchiveEnd::Partial(r);
                     entry_partial_reason = Some(r);
+                    if !matches!(hit, BudgetHit::SkipEntry(_)) {
+                        outcome = ArchiveEnd::Partial(r);
+                        stop_archive = true;
+                    }
                 }
                 break;
             }
@@ -2005,10 +2046,20 @@ fn process_zip_file<E: ScanEngine>(
             {
                 let r = budget_hit_to_partial_reason(hit);
                 allowed = a;
-                outcome = ArchiveEnd::Partial(r);
                 entry_partial_reason = Some(r);
+                if !matches!(hit, BudgetHit::SkipEntry(_)) {
+                    outcome = ArchiveEnd::Partial(r);
+                    stop_archive = true;
+                }
             }
             if allowed == 0 {
+                if let Err(r) = charge_discarded_bytes(budgets, n as u64) {
+                    if entry_partial_reason.is_none() {
+                        entry_partial_reason = Some(r);
+                    }
+                    outcome = ArchiveEnd::Partial(r);
+                    stop_archive = true;
+                }
                 break;
             }
 
@@ -2046,6 +2097,14 @@ fn process_zip_file<E: ScanEngine>(
             carry = overlap.min(read_len);
 
             if allowed_usize < n {
+                let extra = (n - allowed_usize) as u64;
+                if let Err(r) = charge_discarded_bytes(budgets, extra) {
+                    if entry_partial_reason.is_none() {
+                        entry_partial_reason = Some(r);
+                    }
+                    outcome = ArchiveEnd::Partial(r);
+                    stop_archive = true;
+                }
                 break;
             }
         }
@@ -2053,6 +2112,9 @@ fn process_zip_file<E: ScanEngine>(
         budgets.end_entry(offset > 0);
         if let Some(r) = entry_partial_reason {
             metrics.archive.record_entry_partial(r, path_bytes, false);
+        }
+        if stop_archive {
+            break;
         }
     }
 
@@ -2626,6 +2688,41 @@ mod tests {
             dedupe_within_chunk: true,
             archive: ArchiveConfig::default(),
         }
+    }
+
+    #[test]
+    fn zip_budget_clamp_charges_discarded_bytes() {
+        let cfg = ArchiveConfig {
+            max_uncompressed_bytes_per_entry: 4,
+            max_total_uncompressed_bytes_per_archive: 5,
+            max_total_uncompressed_bytes_per_root: 5,
+            ..ArchiveConfig::default()
+        };
+
+        let mut budgets = ArchiveBudgets::new(&cfg);
+        assert!(budgets.enter_archive().is_ok());
+        budgets.begin_entry_scan();
+
+        let mut entry_partial_reason = None;
+        let mut outcome = ArchiveEnd::Scanned;
+        let mut stop_archive = false;
+
+        let (allowed, clamped) = apply_entry_budget_clamp(
+            &mut budgets,
+            6,
+            &mut entry_partial_reason,
+            &mut outcome,
+            &mut stop_archive,
+        );
+
+        assert_eq!(allowed, 4);
+        assert!(clamped);
+        assert!(stop_archive);
+        assert_eq!(budgets.root_decompressed_out(), 5);
+        assert_eq!(
+            outcome,
+            ArchiveEnd::Partial(PartialReason::ArchiveOutputBudgetExceeded)
+        );
     }
 
     #[test]
