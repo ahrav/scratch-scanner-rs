@@ -10,12 +10,13 @@
 //! # Notes
 //! - Uses demo rules/transforms/tuning and in-memory persistence; results are not durable.
 //! - `NeverSeenStore` plus empty watermarks force full-history scans.
+//! - Missing maintenance artifacts (commit-graph, MIDX) cause the scan to fail
+//!   with exit code `2`.
 //! - `--debug` emits verbose stage metrics to stderr.
 //!
 //! # Exit codes
 //! - `0`: scan completed successfully.
 //! - `2`: invalid usage or scan failed.
-//! - `3`: repository needs maintenance artifacts (commit-graph, MIDX).
 
 use std::collections::BTreeMap;
 use std::env;

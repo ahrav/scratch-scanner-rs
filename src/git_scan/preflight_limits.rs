@@ -115,6 +115,24 @@ impl Default for PreflightLimits {
     }
 }
 
+impl super::repo::RepoLimits for PreflightLimits {
+    fn max_dot_git_file_bytes(&self) -> u32 {
+        self.max_dot_git_file_bytes
+    }
+
+    fn max_commondir_file_bytes(&self) -> u32 {
+        self.max_commondir_file_bytes
+    }
+
+    fn max_alternates_file_bytes(&self) -> u32 {
+        self.max_alternates_file_bytes
+    }
+
+    fn max_alternates_count(&self) -> u8 {
+        self.max_alternates_count
+    }
+}
+
 // Compile-time validation of default limits.
 const _: () = PreflightLimits::DEFAULT.validate();
 const _: () = PreflightLimits::RESTRICTIVE.validate();

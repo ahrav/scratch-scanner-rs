@@ -1,18 +1,27 @@
 //! End-to-end Git scan runner.
 //!
-//! Orchestrates preflight, repo open, commit walk, tree diff, spill/dedupe,
-//! pack planning, pack decode + scan, finalize, and persistence.
+//! Orchestrates repo open, commit walk, tree diff, spill/dedupe, pack planning,
+//! pack decode + scan, finalize, and persistence.
 //!
 //! # Pipeline
-//! 1. Preflight repository metadata and artifact readiness.
-//! 2. Open the repo (start set resolution, watermarks, and artifact status).
-//! 3. Plan commits, diff trees, and collect candidate blobs.
-//! 4. Spill/dedupe candidates and map them to pack entries.
-//! 5. Plan packs, decode + scan, then finalize and optionally persist.
+//! 1. Open the repo (start set resolution, watermarks, artifact readiness check).
+//! 2. Plan commits, diff trees, and collect candidate blobs.
+//! 3. Spill/dedupe candidates and map them to pack entries.
+//! 4. Plan packs, decode + scan, then finalize and optionally persist.
+//!
+//! # Artifact Construction
+//! This runner expects MIDX and commit-graph artifacts to be available.
+//! In-memory construction is handled by `artifact_acquire` and should be
+//! performed before invoking the scan when disk artifacts are missing.
+//!
+//! # Modes
+//! - Diff-history: walk commits, diff trees, spill/dedupe candidates, then plan
+//!   packs for decode + scan.
+//! - ODB-blob fast: compute first-introduced blobs from the commit graph, then
+//!   scan in pack order; if candidate caps or path arena limits are exceeded,
+//!   retry via the spill/dedupe pipeline.
 //!
 //! # Invariants
-//! - If preflight or repo open detects missing artifacts, the run returns
-//!   `GitScanResult::NeedsMaintenance` and skips the scan pipeline.
 //! - MIDX completeness is verified before pack execution.
 //! - Pack cache sizing must fit in `u32` (checked before execution).
 //!
@@ -20,7 +29,7 @@
 //! - Loose objects are decoded via `PackIo::load_loose_object`; failures are
 //!   recorded as skipped candidates.
 //! - Persistence is optional; callers can run the pipeline without a store.
-//! - When artifacts are missing, the run short-circuits with `NeedsMaintenance`.
+//! - Stage `mapping`/`scan` timings are sourced from perf counters when enabled.
 
 use std::fs;
 use std::fs::File;
@@ -29,7 +38,7 @@ use std::io;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use memmap2::Mmap;
@@ -37,6 +46,7 @@ use memmap2::Mmap;
 use crate::scheduler::{alloc_stats, AllocStats, AllocStatsDelta};
 use crate::Engine;
 
+use super::artifact_acquire::ArtifactBuildLimits;
 use super::blob_introducer::BlobIntroducer;
 use super::byte_arena::ByteArena;
 use super::commit_graph::CommitGraphIndex;
@@ -71,9 +81,6 @@ use super::pack_plan::{
 use super::pack_plan_model::{PackPlan, PackPlanStats};
 use super::persist::{persist_finalize_output, PersistenceStore};
 use super::policy_hash::MergeDiffMode;
-use super::preflight::{preflight, PreflightReport};
-use super::preflight_error::PreflightError;
-use super::preflight_limits::PreflightLimits;
 use super::repo::GitRepoPaths;
 use super::repo_open::{repo_open, RefWatermarkStore, RepoJobState, StartSetResolver};
 use super::seen_store::SeenBlobStore;
@@ -197,8 +204,6 @@ pub struct GitScanConfig {
     pub merge_diff_mode: MergeDiffMode,
     /// Path-policy version for scan configuration hashing.
     pub path_policy_version: u32,
-    /// Preflight limits and readiness thresholds.
-    pub preflight: PreflightLimits,
     /// Repo-open limits (mmap sizes, ref caps, etc.).
     pub repo_open: RepoOpenLimits,
     /// Commit-walk limits (parents, batching).
@@ -228,6 +233,11 @@ pub struct GitScanConfig {
     pub pack_exec_workers: usize,
     /// Optional spill directory override. When `None`, a unique temp directory is used.
     pub spill_dir: Option<PathBuf>,
+    /// Limits for artifact construction.
+    ///
+    /// Reserved for callers that build artifacts explicitly; `run_git_scan`
+    /// assumes artifacts are already available.
+    pub artifact_build: ArtifactBuildLimits,
 }
 
 impl Default for GitScanConfig {
@@ -241,7 +251,6 @@ impl Default for GitScanConfig {
             start_set: StartSetConfig::DefaultBranchOnly,
             merge_diff_mode: MergeDiffMode::AllParents,
             path_policy_version: 1,
-            preflight: PreflightLimits::DEFAULT,
             repo_open: RepoOpenLimits::DEFAULT,
             commit_walk: CommitWalkLimits::DEFAULT,
             tree_diff: TreeDiffLimits::DEFAULT,
@@ -255,6 +264,7 @@ impl Default for GitScanConfig {
             pack_cache_bytes: 64 * 1024 * 1024,
             pack_exec_workers: default_pack_exec_workers(),
             spill_dir: None,
+            artifact_build: ArtifactBuildLimits::default(),
         }
     }
 }
@@ -292,14 +302,8 @@ impl std::fmt::Display for GitScanMode {
 }
 
 /// Result of a Git scan run.
-#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
-pub enum GitScanResult {
-    /// The repo is missing required maintenance artifacts (commit-graph, MIDX, etc.).
-    NeedsMaintenance { preflight: PreflightReport },
-    /// Scan completed; consult `finalize.outcome` and `skipped_candidates` for partial runs.
-    Completed(GitScanReport),
-}
+pub struct GitScanResult(pub GitScanReport);
 
 /// Reason a candidate blob was skipped during the run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -762,7 +766,6 @@ impl GitScanReport {
 /// Git scan error taxonomy.
 #[derive(Debug)]
 pub enum GitScanError {
-    Preflight(PreflightError),
     RepoOpen(RepoOpenError),
     CommitPlan(CommitPlanError),
     TreeDiff(TreeDiffError),
@@ -777,12 +780,13 @@ pub enum GitScanError {
     ResourceLimit(String),
     /// Scan mode not yet implemented.
     UnsupportedMode(GitScanMode),
+    /// Artifacts changed during the scan (concurrent git maintenance detected).
+    ConcurrentMaintenance,
 }
 
 impl std::fmt::Display for GitScanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Preflight(err) => write!(f, "{err}"),
             Self::RepoOpen(err) => write!(f, "{err}"),
             Self::CommitPlan(err) => write!(f, "{err}"),
             Self::TreeDiff(err) => write!(f, "{err}"),
@@ -795,6 +799,12 @@ impl std::fmt::Display for GitScanError {
             Self::Io(err) => write!(f, "{err}"),
             Self::ResourceLimit(msg) => write!(f, "resource limit exceeded: {msg}"),
             Self::UnsupportedMode(mode) => write!(f, "scan mode not implemented: {mode}"),
+            Self::ConcurrentMaintenance => {
+                write!(
+                    f,
+                    "concurrent git maintenance detected; artifacts changed during scan"
+                )
+            }
         }
     }
 }
@@ -802,7 +812,6 @@ impl std::fmt::Display for GitScanError {
 impl std::error::Error for GitScanError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Preflight(err) => Some(err),
             Self::RepoOpen(err) => Some(err),
             Self::CommitPlan(err) => Some(err),
             Self::TreeDiff(err) => Some(err),
@@ -813,17 +822,11 @@ impl std::error::Error for GitScanError {
             Self::PackIo(err) => Some(err),
             Self::Persist(err) => Some(err),
             Self::Io(err) => Some(err),
-            Self::ResourceLimit(_) => None,
-            Self::UnsupportedMode(_) => None,
+            Self::ResourceLimit(_) | Self::UnsupportedMode(_) | Self::ConcurrentMaintenance => None,
         }
     }
 }
 
-impl From<PreflightError> for GitScanError {
-    fn from(err: PreflightError) -> Self {
-        Self::Preflight(err)
-    }
-}
 impl From<RepoOpenError> for GitScanError {
     fn from(err: RepoOpenError) -> Self {
         Self::RepoOpen(err)
@@ -877,30 +880,35 @@ impl From<io::Error> for GitScanError {
 
 /// Runs a full Git scan with the provided configuration and stores.
 ///
-/// The pipeline short-circuits with `NeedsMaintenance` if preflight or repo
-/// open indicates missing artifacts (MIDX, commit graph, etc.). On success,
-/// the scan is finalized and optionally persisted.
+/// The scan requires maintenance artifacts (MIDX, commit-graph) to be present
+/// (or pre-built via `artifact_acquire`). On success, the scan is finalized
+/// and optionally persisted.
 ///
 /// # Inputs
 /// - `repo_root` must reference a Git repository with readable metadata.
 /// - `resolver` controls how the start set is chosen (default branch, refs, etc.).
 /// - `seen_store` is used to dedupe candidates across runs.
-/// - `watermark_store` records ref watermarks when finalize succeeds.
-/// - `persist_store` is optional; when `None`, finalize output is returned only.
+/// - `watermark_store` supplies existing ref watermarks; it is not mutated here.
+/// - `persist_store` is optional; when `Some`, finalize output (including
+///   watermarks on complete runs) is committed atomically.
 ///
 /// If no persistence store is provided, the caller is responsible for
 /// interpreting `FinalizeOutcome` and storing watermarks as needed.
 ///
 /// # Returns
-/// - `NeedsMaintenance` when repo artifacts are missing or out of date.
-/// - `Completed` with a `GitScanReport` when the scan finishes.
-///
-/// # Maintenance
-/// Preflight pack-count recommendations are advisory only; the scan proceeds
-/// as long as required artifacts are present.
+/// A `GitScanResult` containing the `GitScanReport` when the scan finishes.
 ///
 /// # Errors
+/// Returns `ConcurrentMaintenance` if artifacts changed during the scan,
+/// indicating another process modified the repository.
 /// Pack mmap limits and cache sizing may surface as `GitScanError::ResourceLimit`.
+/// Missing or corrupt maintenance artifacts (commit-graph, MIDX) surface as
+/// `GitScanError::CommitPlan` or `GitScanError::Midx`.
+///
+/// # Determinism
+/// Pack plans are built in pack order, and parallel execution reassembles
+/// results by pack (and shard) order before finalize. This keeps scan output
+/// stable even when multiple workers are used.
 ///
 /// # Caveats
 /// - Loose object decode failures are recorded as skipped candidates and may
@@ -921,12 +929,6 @@ pub fn run_git_scan(
     let mut stage_nanos = GitScanStageNanos::default();
     let mut alloc_deltas = GitScanAllocStats::default();
 
-    // Preflight (metadata-only readiness). Pack count recommendations are advisory.
-    let preflight = preflight(repo_root, config.preflight)?;
-    if !preflight.status.is_ready() {
-        return Ok(GitScanResult::NeedsMaintenance { preflight });
-    }
-
     let start_set_id = config.start_set.id();
     let repo = repo_open(
         repo_root,
@@ -937,9 +939,6 @@ pub fn run_git_scan(
         watermark_store,
         config.repo_open,
     )?;
-    if !repo.artifact_status.is_ready() {
-        return Ok(GitScanResult::NeedsMaintenance { preflight });
-    }
 
     if config.scan_mode == GitScanMode::OdbBlobFast {
         // Commit walk plan.
@@ -1013,6 +1012,8 @@ pub fn run_git_scan(
                     TreeDiffError::CandidateLimitExceeded { .. } | TreeDiffError::PathArenaFull,
                 ) => {
                     let first_elapsed = intro_start.elapsed().as_nanos() as u64;
+                    // The fast path may have recorded a partial seen-set; reset
+                    // so the spill/dedupe retry can re-emit every candidate.
                     introducer.reset_seen();
 
                     let retry_start = Instant::now();
@@ -1079,7 +1080,7 @@ pub fn run_git_scan(
         // Artifact fingerprints must remain stable; we check before planning and
         // again after exec because planning now overlaps execution.
         if !repo.artifacts_unchanged()? {
-            return Ok(GitScanResult::NeedsMaintenance { preflight });
+            return Err(GitScanError::ConcurrentMaintenance);
         }
 
         // Planning prelude remains serial; the plan builder runs on a worker
@@ -1107,6 +1108,7 @@ pub fn run_git_scan(
         let mut pack_exec_alloc_before = AllocStats::default();
         let mut start_pack_exec = || {
             if !pack_exec_started {
+                // Start timing/alloc counters only if we actually execute work.
                 pack_exec_started = true;
                 pack_exec_start = Instant::now();
                 pack_exec_alloc_before = alloc_stats();
@@ -1121,6 +1123,11 @@ pub fn run_git_scan(
 
             let (mut buckets, pack_ids) =
                 bucket_pack_candidates(packed.drain(..), pack_views.len())?;
+            let pack_plan_count = pack_ids.len();
+            // Prefer one worker per pack when enough packs are available to
+            // preserve sequential access and avoid intra-pack sharding.
+            let prefer_pack_parallelism =
+                pack_exec_workers > 1 && pack_plan_count >= pack_exec_workers;
             // Stream per-pack plans to overlap planning with execution while
             // keeping deterministic pack order.
             let (tx, rx) = mpsc::sync_channel::<Result<PackPlan, PackPlanError>>(1);
@@ -1228,7 +1235,160 @@ pub fn run_git_scan(
                     }
 
                     scanned = adapter.take_results();
+                } else if prefer_pack_parallelism {
+                    let (work_tx, work_rx) =
+                        mpsc::sync_channel::<(usize, PackPlan)>(pack_exec_workers);
+                    let work_rx = Arc::new(Mutex::new(work_rx));
+                    let (result_tx, result_rx) = mpsc::channel::<
+                        Result<
+                            (usize, PackExecReport, ScannedBlobs, Vec<SkippedCandidate>),
+                            PackExecError,
+                        >,
+                    >();
+                    let mut handles = Vec::with_capacity(pack_exec_workers);
+
+                    for _ in 0..pack_exec_workers {
+                        let work_rx = Arc::clone(&work_rx);
+                        let result_tx = result_tx.clone();
+                        let pack_paths = pack_paths.clone();
+                        let loose_dirs = loose_dirs.clone();
+                        let pack_decode = config.pack_decode;
+                        let pack_io_limits = config.pack_io;
+                        let adapter_cfg = config.engine_adapter;
+                        let paths = &path_arena;
+                        let spill_dir = &spill_dir;
+                        let pack_mmaps = &pack_mmaps;
+
+                        handles.push(scope.spawn(move || {
+                            let mut cache = PackCache::new(pack_cache_bytes);
+                            let mut external = match PackIo::from_parts(
+                                *midx,
+                                pack_paths,
+                                loose_dirs,
+                                pack_io_limits,
+                            ) {
+                                Ok(external) => external,
+                                Err(err) => {
+                                    let _ = result_tx
+                                        .send(Err(PackExecError::ExternalBase(err.to_string())));
+                                    return;
+                                }
+                            };
+                            let mut adapter = EngineAdapter::new(engine, adapter_cfg);
+                            let mut scratch = PackExecScratch::default();
+
+                            loop {
+                                let work = {
+                                    let rx = work_rx.lock().expect("pack exec work queue poisoned");
+                                    rx.recv()
+                                };
+                                let (seq, plan) = match work {
+                                    Ok(work) => work,
+                                    Err(_) => break,
+                                };
+
+                                let work_result = (|| {
+                                    let pack_id = plan.pack_id as usize;
+                                    let pack_bytes = pack_mmaps
+                                        .get(pack_id)
+                                        .and_then(|mmap| mmap.as_ref())
+                                        .ok_or_else(|| {
+                                            PackExecError::PackRead(format!(
+                                                "pack id {} out of range (pack count {})",
+                                                plan.pack_id,
+                                                pack_mmaps.len()
+                                            ))
+                                        })?
+                                        .as_ref();
+
+                                    adapter.reserve_results(plan.stats.candidate_count as usize);
+                                    let report = execute_pack_plan_with_scratch(
+                                        &plan,
+                                        pack_bytes,
+                                        paths,
+                                        &pack_decode,
+                                        &mut cache,
+                                        &mut external,
+                                        &mut adapter,
+                                        spill_dir,
+                                        &mut scratch,
+                                    )?;
+
+                                    let scanned = adapter.take_results();
+                                    let mut skipped = Vec::new();
+                                    collect_skipped_candidates(&plan, &report.skips, &mut skipped);
+
+                                    Ok((seq, report, scanned, skipped))
+                                })();
+
+                                let should_break = work_result.is_err();
+                                if result_tx.send(work_result).is_err() || should_break {
+                                    break;
+                                }
+                            }
+                        }));
+                    }
+
+                    drop(result_tx);
+
+                    let mut plan_count = 0usize;
+                    for plan in rx {
+                        let plan = plan?;
+                        pack_plan_stats.push(plan.stats);
+                        let deps_len = plan.delta_deps.len() as u32;
+                        pack_plan_delta_deps_total =
+                            pack_plan_delta_deps_total.saturating_add(deps_len as u64);
+                        pack_plan_delta_deps_max = pack_plan_delta_deps_max.max(deps_len);
+
+                        start_pack_exec();
+
+                        let pack_id = plan.pack_id as usize;
+                        pack_mmaps
+                            .get(pack_id)
+                            .and_then(|mmap| mmap.as_ref())
+                            .ok_or(GitScanError::PackPlan(PackPlanError::PackIdOutOfRange {
+                                pack_id: plan.pack_id,
+                                pack_count: pack_mmaps.len(),
+                            }))?;
+
+                        // Use plan_count as the deterministic sequence for reassembly.
+                        if work_tx.send((plan_count, plan)).is_err() {
+                            return Err(GitScanError::PackExec(PackExecError::PackRead(
+                                "pack exec work queue closed".to_string(),
+                            )));
+                        }
+                        plan_count += 1;
+                    }
+                    drop(work_tx);
+
+                    // Reassemble outputs by pack order for deterministic merges.
+                    let mut outputs: Vec<
+                        Option<(PackExecReport, ScannedBlobs, Vec<SkippedCandidate>)>,
+                    > = (0..plan_count).map(|_| None).collect();
+                    for _ in 0..plan_count {
+                        let output = result_rx.recv().map_err(|_| {
+                            GitScanError::PackExec(PackExecError::PackRead(
+                                "pack exec worker channel closed".to_string(),
+                            ))
+                        })?;
+                        let (seq, report, scanned_pack, skipped) = output?;
+                        outputs[seq] = Some((report, scanned_pack, skipped));
+                    }
+
+                    for handle in handles {
+                        handle.join().expect("pack exec worker panicked");
+                    }
+
+                    for output in outputs.into_iter() {
+                        let (report, scanned_pack, skipped) =
+                            output.expect("missing pack exec output");
+                        pack_exec_reports.push(report);
+                        skipped_candidates.extend(skipped);
+                        append_scanned_blobs(&mut scanned, scanned_pack);
+                    }
                 } else {
+                    // Not enough packs to keep workers busy: shard within a
+                    // single pack while preserving deterministic shard order.
                     for plan in rx {
                         let plan = plan?;
                         pack_plan_stats.push(plan.stats);
@@ -1409,7 +1569,7 @@ pub fn run_git_scan(
         }
 
         if !repo.artifacts_unchanged()? {
-            return Ok(GitScanResult::NeedsMaintenance { preflight });
+            return Err(GitScanError::ConcurrentMaintenance);
         }
 
         let refs = build_ref_entries(&repo);
@@ -1434,7 +1594,7 @@ pub fn run_git_scan(
         stage_nanos.mapping = perf_stats.mapping_nanos;
         stage_nanos.scan = perf_stats.scan_nanos;
 
-        return Ok(GitScanResult::Completed(GitScanReport {
+        return Ok(GitScanResult(GitScanReport {
             commit_count: plan.len(),
             tree_diff_stats: TreeDiffStats::from(intro_stats),
             spill_stats,
@@ -1581,7 +1741,7 @@ pub fn run_git_scan(
 
     // Validate artifacts before decoding packs to avoid scanning during maintenance.
     if !repo.artifacts_unchanged()? {
-        return Ok(GitScanResult::NeedsMaintenance { preflight });
+        return Err(GitScanError::ConcurrentMaintenance);
     }
 
     // Execute pack plans + scan.
@@ -1664,7 +1824,7 @@ pub fn run_git_scan(
     stage_nanos.mapping = perf_stats.mapping_nanos;
     stage_nanos.scan = perf_stats.scan_nanos;
 
-    Ok(GitScanResult::Completed(GitScanReport {
+    Ok(GitScanResult(GitScanReport {
         commit_count: plan.len(),
         tree_diff_stats: walker.stats().clone(),
         spill_stats,
@@ -1737,6 +1897,7 @@ fn estimate_pack_cache_bytes(
 /// Load the MIDX view for the repository.
 ///
 /// The parser uses the repo's object format to validate OID lengths.
+/// Callers are expected to have verified artifact readiness before calling.
 ///
 /// # Errors
 /// Returns `GitScanError::Midx` if the MIDX mmap is missing or corrupted.
@@ -1874,6 +2035,11 @@ fn strip_pack_suffix(name: &[u8]) -> Vec<u8> {
 /// The mappings are read-only and may outlive the file handles.
 /// Returns `GitScanError::ResourceLimit` if pack counts or total bytes exceed
 /// the configured mmap limits.
+///
+/// Callers must pass de-duplicated `used_pack_ids`; duplicates would
+/// double-count bytes and re-map the same pack.
+///
+/// The returned vector matches `pack_paths` length so pack IDs remain stable.
 fn mmap_pack_files(
     pack_paths: &[PathBuf],
     used_pack_ids: &[u16],
@@ -1942,6 +2108,9 @@ fn advise_sequential(_file: &File, _reader: &Mmap) {}
 ///
 /// Each pack view validates header structure and captures offsets needed by
 /// the planning stage.
+///
+/// `pack_mmaps` may include `None` for unused packs; the output preserves that
+/// indexing so pack IDs remain stable.
 fn build_pack_views<'a>(
     pack_mmaps: &'a [Option<Mmap>],
     format: ObjectFormat,

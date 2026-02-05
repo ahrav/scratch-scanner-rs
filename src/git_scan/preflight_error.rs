@@ -81,3 +81,45 @@ impl std::error::Error for PreflightError {
         }
     }
 }
+
+impl super::repo::RepoError for PreflightError {
+    fn io(err: io::Error) -> Self {
+        Self::Io(err)
+    }
+
+    fn canonicalization(err: io::Error) -> Self {
+        Self::Canonicalization(err)
+    }
+
+    fn not_a_repository() -> Self {
+        Self::NotARepository
+    }
+
+    fn malformed_gitdir_file() -> Self {
+        Self::MalformedGitdirFile
+    }
+
+    fn gitdir_target_not_dir() -> Self {
+        Self::GitdirTargetNotDir
+    }
+
+    fn malformed_commondir_file() -> Self {
+        Self::MalformedCommondirFile
+    }
+
+    fn common_dir_not_dir() -> Self {
+        Self::CommonDirNotDir
+    }
+
+    fn objects_dir_not_dir() -> Self {
+        Self::ObjectsDirNotDir
+    }
+
+    fn alternate_not_dir() -> Self {
+        Self::AlternateNotDir
+    }
+
+    fn file_too_large(size: u64, limit: u32) -> Self {
+        Self::FileTooLarge { size, limit }
+    }
+}

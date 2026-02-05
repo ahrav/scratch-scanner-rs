@@ -10,6 +10,7 @@
 //!
 //! Packs are not mmapped here. They are opened on demand in later phases
 //! per pack plan to avoid unnecessary FD and VMA pressure.
+//!
 //! # Invariants
 //! - Missing artifacts yield `NeedsMaintenance` with empty `mmaps` and `start_set`.
 //! - When artifacts are ready, fingerprints are captured for maintenance checks.
@@ -18,6 +19,11 @@
 //! This stage performs minimal validation of metadata files: it checks for
 //! presence and mmaps commit-graph and MIDX, but parsing and structural
 //! validation are done by later phases.
+//!
+//! # Concurrency
+//! Repo maintenance must not mutate artifacts during a scan. We detect
+//! maintenance by comparing fingerprints and checking for lock files;
+//! the check is best-effort and does not guard against all races.
 
 use std::fs::{self, File, Metadata};
 use std::io::Read;
@@ -46,6 +52,9 @@ pub enum RepoArtifactStatus {
         /// True if multi-pack-index is missing.
         missing_midx: bool,
         /// True if a Git maintenance lock file is present.
+        ///
+        /// Lock files indicate a concurrent `git maintenance` run; scanning
+        /// should be deferred until they clear.
         lock_present: bool,
     },
 }
@@ -84,6 +93,7 @@ pub struct RepoArtifactMmaps {
 /// Fingerprint of an artifact file.
 ///
 /// This is a lightweight change detector (length + mtime), not a content hash.
+/// It is intended for "did anything change?" checks, not tamper detection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ArtifactFingerprint {
     /// File length in bytes.
@@ -92,13 +102,30 @@ pub struct ArtifactFingerprint {
     pub modified: SystemTime,
 }
 
-/// Fingerprints for commit-graph and MIDX.
+/// Fingerprints for artifact change detection.
 ///
 /// Used to detect concurrent maintenance between repo open and later phases.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RepoArtifactFingerprint {
-    pub commit_graph: ArtifactFingerprint,
-    pub midx: ArtifactFingerprint,
+/// Two variants exist to support both disk-based and in-memory artifact modes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RepoArtifactFingerprint {
+    /// Fingerprint when using disk-based commit-graph and MIDX files.
+    Disk {
+        /// Commit-graph file fingerprint.
+        commit_graph: ArtifactFingerprint,
+        /// MIDX file fingerprint.
+        midx: ArtifactFingerprint,
+    },
+    /// Fingerprint when using in-memory artifacts built from pack/idx files.
+    ///
+    /// This variant uses hashes of pack/idx metadata (basename, size, mtime)
+    /// to detect changes without re-reading artifact files. It is a coarse
+    /// detector and does not verify pack contents.
+    PackSet {
+        /// Hash of `(pack_basename, size, mtime)` for all pack files.
+        packs_hash: [u8; 32],
+        /// Hash of `(idx_basename, size, mtime)` for all idx files.
+        idx_hash: [u8; 32],
+    },
 }
 
 /// A ref in the start set with its resolved tip and optional watermark.
@@ -153,7 +180,7 @@ impl RepoJobState {
     ///
     /// Returns `false` if no baseline fingerprint was captured (artifacts not ready).
     pub fn artifacts_unchanged(&self) -> Result<bool, RepoOpenError> {
-        let Some(expected) = self.artifact_fingerprint else {
+        let Some(ref expected) = self.artifact_fingerprint else {
             return Ok(false);
         };
 
@@ -161,16 +188,110 @@ impl RepoJobState {
             return Ok(false);
         }
 
-        let current = RepoArtifactFingerprint::from_paths(&self.artifact_paths)?;
-        Ok(current == expected)
+        let current = match expected {
+            RepoArtifactFingerprint::Disk { .. } => {
+                RepoArtifactFingerprint::from_artifact_paths(&self.artifact_paths)?
+            }
+            RepoArtifactFingerprint::PackSet { .. } => {
+                RepoArtifactFingerprint::from_pack_dirs(&self.paths)?
+            }
+        };
+        Ok(&current == expected)
     }
 }
 
 impl RepoArtifactFingerprint {
-    fn from_paths(paths: &RepoArtifactPaths) -> Result<Self, RepoOpenError> {
-        Ok(Self {
+    /// Creates a `Disk` fingerprint from artifact paths.
+    pub fn from_artifact_paths(paths: &RepoArtifactPaths) -> Result<Self, RepoOpenError> {
+        Ok(Self::Disk {
             commit_graph: fingerprint_path(&paths.commit_graph)?,
             midx: fingerprint_path(&paths.midx)?,
+        })
+    }
+
+    /// Creates a `PackSet` fingerprint from pack directories.
+    ///
+    /// This fingerprint is used when artifacts are built in-memory from pack/idx files.
+    /// It hashes the metadata (basename, size, mtime) of all pack and idx files.
+    pub fn from_pack_dirs(paths: &GitRepoPaths) -> Result<Self, RepoOpenError> {
+        use sha2::{Digest, Sha256};
+
+        let mut pack_dirs = Vec::with_capacity(1 + paths.alternate_object_dirs.len());
+        pack_dirs.push(paths.pack_dir.clone());
+        for alternate in &paths.alternate_object_dirs {
+            if alternate != &paths.objects_dir {
+                pack_dirs.push(alternate.join("pack"));
+            }
+        }
+
+        // Collect and sort pack/idx file metadata for deterministic hashing
+        let mut pack_entries: Vec<(Vec<u8>, u64, u64)> = Vec::new();
+        let mut idx_entries: Vec<(Vec<u8>, u64, u64)> = Vec::new();
+
+        for pack_dir in &pack_dirs {
+            let entries = match fs::read_dir(pack_dir) {
+                Ok(e) => e,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(RepoOpenError::io(err)),
+            };
+
+            for entry in entries {
+                let entry = entry.map_err(RepoOpenError::io)?;
+                let file_type = entry.file_type().map_err(RepoOpenError::io)?;
+                if !file_type.is_file() {
+                    continue;
+                }
+
+                let file_name = entry.file_name();
+                let path = entry.path();
+                let ext = path.extension().and_then(|e| e.to_str());
+
+                let metadata = entry.metadata().map_err(RepoOpenError::io)?;
+                let mtime = metadata
+                    .modified()
+                    .map_err(RepoOpenError::io)?
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+
+                let basename = file_name.as_encoded_bytes().to_vec();
+                let size = metadata.len();
+
+                match ext {
+                    Some("pack") => pack_entries.push((basename, size, mtime)),
+                    Some("idx") => idx_entries.push((basename, size, mtime)),
+                    _ => {}
+                }
+            }
+        }
+
+        // Sort for determinism
+        pack_entries.sort();
+        idx_entries.sort();
+
+        // Hash pack entries
+        let mut pack_hasher = Sha256::new();
+        for (basename, size, mtime) in &pack_entries {
+            pack_hasher.update(basename);
+            pack_hasher.update(b"\0");
+            pack_hasher.update(size.to_le_bytes());
+            pack_hasher.update(mtime.to_le_bytes());
+        }
+        let packs_hash: [u8; 32] = pack_hasher.finalize().into();
+
+        // Hash idx entries
+        let mut idx_hasher = Sha256::new();
+        for (basename, size, mtime) in &idx_entries {
+            idx_hasher.update(basename);
+            idx_hasher.update(b"\0");
+            idx_hasher.update(size.to_le_bytes());
+            idx_hasher.update(mtime.to_le_bytes());
+        }
+        let idx_hash: [u8; 32] = idx_hasher.finalize().into();
+
+        Ok(Self::PackSet {
+            packs_hash,
+            idx_hash,
         })
     }
 }
@@ -344,7 +465,7 @@ fn mmap_artifacts(
             commit_graph: Some(commit_graph),
             midx: Some(midx),
         },
-        RepoArtifactFingerprint {
+        RepoArtifactFingerprint::Disk {
             commit_graph: commit_graph_fp,
             midx: midx_fp,
         },

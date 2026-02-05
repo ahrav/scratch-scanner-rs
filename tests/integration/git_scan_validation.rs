@@ -217,14 +217,10 @@ fn loose_only_candidate_scans_complete() {
     let watermark = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD~1"]));
     let result = run_scan(tmp.path(), Some(watermark));
 
-    match result {
-        GitScanResult::Completed(report) => {
-            assert_eq!(report.finalize.outcome, FinalizeOutcome::Complete);
-            assert!(report.skipped_candidates.is_empty());
-            assert!(report.finalize.stats.total_findings >= 1);
-        }
-        GitScanResult::NeedsMaintenance { .. } => panic!("expected completed scan"),
-    }
+    let GitScanResult(report) = result;
+    assert_eq!(report.finalize.outcome, FinalizeOutcome::Complete);
+    assert!(report.skipped_candidates.is_empty());
+    assert!(report.finalize.stats.total_findings >= 1);
 }
 
 #[test]
@@ -275,14 +271,10 @@ fn packed_and_loose_candidates_scan_complete() {
 
     let result = run_scan(tmp.path(), None);
 
-    match result {
-        GitScanResult::Completed(report) => {
-            assert_eq!(report.finalize.outcome, FinalizeOutcome::Complete);
-            assert!(report.skipped_candidates.is_empty());
-            assert!(report.finalize.stats.total_findings >= 2);
-        }
-        GitScanResult::NeedsMaintenance { .. } => panic!("expected completed scan"),
-    }
+    let GitScanResult(report) = result;
+    assert_eq!(report.finalize.outcome, FinalizeOutcome::Complete);
+    assert!(report.skipped_candidates.is_empty());
+    assert!(report.finalize.stats.total_findings >= 2);
 }
 
 #[test]
@@ -310,16 +302,13 @@ fn missing_loose_object_yields_partial() {
     let watermark = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD~1"]));
     let result = run_scan(tmp.path(), Some(watermark));
 
-    match result {
-        GitScanResult::Completed(report) => {
-            assert!(matches!(
-                report.finalize.outcome,
-                FinalizeOutcome::Partial { .. }
-            ));
-            assert!(report.skipped_candidates.iter().any(|skip| {
-                skip.oid == blob_oid && skip.reason == CandidateSkipReason::LooseMissing
-            }));
-        }
-        GitScanResult::NeedsMaintenance { .. } => panic!("expected completed scan"),
-    }
+    let GitScanResult(report) = result;
+    assert!(matches!(
+        report.finalize.outcome,
+        FinalizeOutcome::Partial { .. }
+    ));
+    assert!(report
+        .skipped_candidates
+        .iter()
+        .any(|skip| { skip.oid == blob_oid && skip.reason == CandidateSkipReason::LooseMissing }));
 }
