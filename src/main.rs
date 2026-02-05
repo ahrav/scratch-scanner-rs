@@ -25,7 +25,9 @@
 //! - `0`: Success (regardless of findings count)
 //! - `2`: Invalid arguments or configuration error
 
-use scanner_rs::pipeline::scan_path_default;
+use scanner_rs::pipeline::{
+    Pipeline, PipelineConfig, PIPE_CHUNK_RING_CAP, PIPE_FILE_RING_CAP, PIPE_OUT_RING_CAP,
+};
 use scanner_rs::scheduler::{parallel_scan_dir, ParallelScanConfig, StdoutSink};
 use scanner_rs::{
     demo_engine_with_anchor_mode, demo_engine_with_anchor_mode_and_max_transform_depth, AnchorMode,
@@ -74,6 +76,7 @@ OPTIONS:
     --single-threaded       Force single-threaded mode (legacy pipeline)
     --anchors=manual|derived  Anchor extraction mode (default: manual)
     --max-transform-depth=<N> Maximum decode depth (default: 2)
+    --no-archives           Disable archive scanning (zip, tar, gz, etc.)
     --help, -h              Show this help message",
         exe.to_string_lossy()
     );
@@ -86,6 +89,7 @@ fn main() -> io::Result<()> {
     let mut path: Option<PathBuf> = None;
     let mut worker_config = WorkerConfig::Auto;
     let mut max_transform_depth: Option<usize> = None;
+    let mut no_archives = false;
 
     for arg in args {
         if let Some(flag) = arg.to_str() {
@@ -129,6 +133,10 @@ fn main() -> io::Result<()> {
             match flag {
                 "--single-threaded" => {
                     worker_config = WorkerConfig::SingleThreaded;
+                    continue;
+                }
+                "--no-archives" => {
+                    no_archives = true;
                     continue;
                 }
                 "--anchors=manual" => {
@@ -196,7 +204,13 @@ fn main() -> io::Result<()> {
 
     let stats = if matches!(worker_config, WorkerConfig::SingleThreaded) {
         // Legacy single-threaded mode
-        let pipeline_stats = scan_path_default(&path, Arc::clone(&engine))?;
+        let mut pipeline_config = PipelineConfig::default();
+        if no_archives {
+            pipeline_config.archive.enabled = false;
+        }
+        let mut pipeline: Pipeline<PIPE_FILE_RING_CAP, PIPE_CHUNK_RING_CAP, PIPE_OUT_RING_CAP> =
+            Pipeline::new(Arc::clone(&engine), pipeline_config);
+        let pipeline_stats = pipeline.scan_path(&path)?;
         ScanStats {
             files: pipeline_stats.files,
             chunks: pipeline_stats.chunks,
@@ -206,12 +220,15 @@ fn main() -> io::Result<()> {
         }
     } else {
         // Parallel mode (default)
-        let config = ParallelScanConfig {
+        let mut config = ParallelScanConfig {
             workers,
             skip_hidden: false,       // Scan all files including hidden
             respect_gitignore: false, // Don't skip gitignored files
             ..Default::default()
         };
+        if no_archives {
+            config.archive.enabled = false;
+        }
         let sink = Arc::new(StdoutSink::new());
         let report = parallel_scan_dir(&path, Arc::clone(&engine), config, sink)?;
 
