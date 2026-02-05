@@ -98,6 +98,37 @@ graph TB
 | **DynamicBitSet** | `src/stdx/bitset.rs:51` | Runtime-sized bitset for pool tracking |
 | **ScanScratch** | `src/engine/scratch.rs:83` | Per-scan reusable scratch state |
 | **TimingWheel** | `src/stdx/timing_wheel.rs:479` | Hashed timing wheel for window expiration scheduling |
+| **Git Preflight** | `src/git_scan/preflight.rs` | Maintenance readiness check for commit-graph, MIDX, and pack count |
+| **ArtifactStatus** | `src/git_scan/preflight.rs` | `Ready` vs `NeedsMaintenance` flag produced by Git preflight |
+| **Repo Open** | `src/git_scan/repo_open.rs` | Repo discovery, artifact mmaps, start set resolution, watermark load |
+| **RepoJobState** | `src/git_scan/repo_open.rs` | Bundled repo metadata for downstream Git scan phases |
+| **StartSetId** | `src/git_scan/start_set.rs` | Deterministic identity for start set configuration |
+| **Watermark Keys** | `src/git_scan/watermark_keys.rs` | Stable ref watermark key/value encoding |
+| **Commit Graph View** | `src/git_scan/commit_walk.rs` | Commit-graph adapter with deterministic position lookup |
+| **Commit Walk** | `src/git_scan/commit_walk.rs` | `(watermark, tip]` traversal for introduced-by commit selection |
+| **Commit Walk Limits** | `src/git_scan/commit_walk_limits.rs` | Hard caps for commit traversal and ordering |
+| **Snapshot Plan** | `src/git_scan/snapshot_plan.rs` | Snapshot-mode commit selection (tips only) |
+| **Tree Object Store** | `src/git_scan/object_store.rs` | Pack/loose tree loading for OID-only tree diffs |
+| **MIDX Mapping** | `src/git_scan/midx.rs`, `src/git_scan/mapping_bridge.rs` | MIDX parsing and blob-to-pack mapping |
+| **Tree Diff Walker** | `src/git_scan/tree_diff.rs` | OID-only tree diffs that emit candidate blobs with context |
+| **Pack Executor** | `src/git_scan/pack_exec.rs` | Executes pack plans to decode candidate blobs with bounded buffers |
+| **Engine Adapter** | `src/git_scan/engine_adapter.rs` | Streams decoded blob bytes into the engine with overlap chunking |
+| **Pack I/O** | `src/git_scan/pack_io.rs` | MIDX-backed pack mmap loader for cross-pack REF delta bases |
+| **Path Policy** | `src/git_scan/path_policy.rs` | Fast path classification for candidate flags |
+| **Spill Limits** | `src/git_scan/spill_limits.rs` | Hard caps for spill chunk sizing and on-disk run growth |
+| **CandidateChunk** | `src/git_scan/spill_chunk.rs` | Bounded candidate buffer + path arena with in-chunk dedupe |
+| **Spill Runs** | `src/git_scan/run_writer.rs`, `src/git_scan/run_reader.rs` | Stable on-disk encoding for sorted candidate runs |
+| **Run Merger** | `src/git_scan/spill_merge.rs` | K-way merge of spill runs with canonical dedupe |
+| **Spiller** | `src/git_scan/spiller.rs` | Orchestrates chunking, spilling, and global merge |
+| **Seen Blob Store** | `src/git_scan/seen_store.rs` | Batched seen-blob checks for filtering already scanned blobs |
+| **Finalize Builder** | `src/git_scan/finalize.rs` | Builds deterministic blob_ctx/finding/seen_blob + ref_watermark ops |
+| **Persistence Store** | `src/git_scan/persist.rs` | Two-phase persistence contract for data ops then watermarks |
+| **RocksDB Store** | `src/git_scan/persist_rocksdb.rs` | RocksDB adapter for persistence, seen-blob checks, and watermarks |
+| **Git Scan Runner** | `src/git_scan/runner.rs` | End-to-end orchestration across all Git scan stages |
+| **Git Scan CLI** | `src/bin/git_scan.rs` | CLI entrypoint for Git scanning pipeline |
+| **WorkItems** | `src/git_scan/work_items.rs` | SoA candidate metadata tables for sorting without moving structs |
+| **Policy Hash** | `src/git_scan/policy_hash.rs` | Canonical BLAKE3 identity over rules, transforms, and tuning |
+
 
 ## Archive Scanning Notes
 
@@ -129,14 +160,37 @@ Scanner harness code lives in `src/sim_scanner/` with shared primitives in `src/
 | **TraceRing** | `src/sim/trace.rs` | Bounded trace buffer for replay and debugging |
 | **Minimizer** | `src/sim/minimize.rs` | Deterministic shrink passes for failing scanner artifacts |
 
+### Git Simulation Harness (`sim-harness` feature)
+
+Git simulation harness code lives in `src/sim_git_scan/` with shared primitives in `src/sim/`.
+
+| Component | Location | Purpose |
+|-----------|----------|---------|
+| **Git Scenario Schema** | `src/sim_git_scan/scenario.rs` | Repo model + artifact bytes schema for deterministic Git scenarios |
+| **Git Scenario Generator** | `src/sim_git_scan/generator.rs` | Synthetic Git repo generator for bounded random tests |
+| **Git Runner** | `src/sim_git_scan/runner.rs` | Deterministic stage runner and failure taxonomy |
+| **Git Trace Ring** | `src/sim_git_scan/trace.rs` | Bounded trace buffer for Git simulation replay |
+| **Git Artifact Schema** | `src/sim_git_scan/artifact.rs` | Reproducible artifact format for Git sim failures |
+| **Git Fault Plan** | `src/sim_git_scan/fault.rs` | Deterministic fault injection plan keyed by logical Git resources |
+| **Git Replay** | `src/sim_git_scan/replay.rs` | Load + replay `.case.json` artifacts deterministically |
+| **Git Minimizer** | `src/sim_git_scan/minimize.rs` | Deterministic shrink passes for failing Git artifacts |
+| **Git Persist Store** | `src/sim_git_scan/persist.rs` | Two-phase persistence simulation with fault injection |
+| **Sim Commit Graph** | `src/sim_git_scan/commit_graph.rs` | In-memory commit-graph adapter for deterministic commit walks |
+| **Sim Start Set** | `src/sim_git_scan/start_set.rs` | Start set + watermark adapters for simulated refs |
+| **Sim Tree Source** | `src/sim_git_scan/tree_source.rs` | Tree-source adapter that encodes semantic trees into raw bytes |
+| **Sim Pack Bytes** | `src/sim_git_scan/pack_bytes.rs` | In-memory pack bytes and pack-view adapter |
+| **Sim Pack I/O** | `src/sim_git_scan/pack_io.rs` | External base resolver over in-memory pack bytes |
+| **SimExecutor** | `src/sim/executor.rs` | Shared deterministic executor used for schedule control |
+
+
 ### Scheduler Simulation Harness (`scheduler-sim` feature)
 
 Scheduler harness code lives in `src/scheduler/sim_executor_harness.rs`.
 
-| Component | Location | Purpose |
-|-----------|----------|---------|
-| **Scheduler Sim Harness** | `src/scheduler/sim_executor_harness.rs` | Deterministic executor model for scheduler interleaving tests |
-| **Scheduler Sim Task VM** | `src/scheduler/sim_executor_harness.rs` | Bytecode VM driving scheduler-only task effects in simulation |
+| Component                   | Location                                | Purpose                                                             |
+| --------------------------- | --------------------------------------- | ------------------------------------------------------------------- |
+| **Scheduler Sim Harness**   | `src/scheduler/sim_executor_harness.rs` | Deterministic executor model for scheduler interleaving tests       |
+| **Scheduler Sim Task VM**   | `src/scheduler/sim_executor_harness.rs` | Bytecode VM driving scheduler-only task effects in simulation       |
 | **Scheduler Sim Resources** | `src/scheduler/sim_executor_harness.rs` | Deterministic resource accounting for permits/budgets in simulation |
 
 ## Data Flow

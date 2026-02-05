@@ -730,6 +730,31 @@ fn finds_secret_in_nested_gz_inside_tar() {
 }
 
 #[test]
+fn nested_gzip_boundary_spanning_secret_once() {
+    let tmp = TempDir::new().unwrap();
+    let tar_path = tmp.path().join("outer.tar");
+
+    let payload = {
+        let mut v = Vec::new();
+        v.extend_from_slice(b"AAAAA");
+        v.extend_from_slice(b"SECRET");
+        v.extend_from_slice(b"BBBBBBBBBBBB");
+        v
+    };
+    let inner_gz = build_gz_bytes(&payload);
+    let tar_bytes = build_simple_tar("inner.gz", &inner_gz);
+    fs::write(&tar_path, tar_bytes).unwrap();
+
+    let mut cfg = cfg_archives_enabled();
+    cfg.chunk_size = 6;
+
+    let (out, report) = run_scan(vec![file_from_path(&tar_path)], cfg);
+    assert!(report.metrics.chunks_scanned >= 2);
+    let count = out.matches("secret").count();
+    assert_eq!(count, 1, "output: {out}");
+}
+
+#[test]
 fn nested_zip_in_tar_is_not_expanded_and_is_counted() {
     let tmp = TempDir::new().unwrap();
     let tar_path = tmp.path().join("outer.tar");

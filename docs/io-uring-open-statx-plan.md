@@ -99,7 +99,7 @@ descriptor using `AT_EMPTY_PATH` and an empty path string:
 This uses `IORING_OP_STATX` and yields a `statx` buffer that must remain valid
 until completion.
 
-### Direct Descriptors (Phase 2)
+### Direct Descriptors (Follow-up)
 
 If we later want direct descriptors for extra wins:
 - Register file table with `IORING_REGISTER_FILES`

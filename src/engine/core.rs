@@ -1257,6 +1257,7 @@ impl Engine {
                 decode_steps: steps,
             });
         }
+        scratch.norm_hash.clear();
         scratch.drop_hint_end.clear();
     }
 }

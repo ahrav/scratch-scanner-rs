@@ -508,6 +508,59 @@ pub enum TailCharset {
     Base64Std,
 }
 
+/// Maximum lookaround (per side) for local context gates.
+///
+/// This bounds hot-path scanning for micro-context checks.
+pub const LOCAL_CONTEXT_MAX_LOOKAROUND: usize = 1024;
+
+/// Local context gate configuration for post-regex validation.
+///
+/// These checks are intentionally bounded and allocation-free so they can run
+/// in the hot path after a regex match but before emitting a finding.
+#[derive(Clone, Copy, Debug)]
+pub struct LocalContextSpec {
+    /// Lookbehind bytes before the secret span.
+    pub lookbehind: usize,
+    /// Lookahead bytes after the secret span.
+    pub lookahead: usize,
+    /// Require an assignment separator on the same line before the secret.
+    pub require_same_line_assignment: bool,
+    /// Require the secret to be wrapped in matching quotes.
+    pub require_quoted: bool,
+    /// Optional key names that must appear on the same line (any-of).
+    pub key_names_any: Option<&'static [&'static [u8]]>,
+}
+
+impl LocalContextSpec {
+    /// Internal invariant checks used at engine build time.
+    pub(crate) fn assert_valid(&self) {
+        assert!(
+            self.lookbehind <= LOCAL_CONTEXT_MAX_LOOKAROUND,
+            "local_context lookbehind {} exceeds max {}",
+            self.lookbehind,
+            LOCAL_CONTEXT_MAX_LOOKAROUND
+        );
+        assert!(
+            self.lookahead <= LOCAL_CONTEXT_MAX_LOOKAROUND,
+            "local_context lookahead {} exceeds max {}",
+            self.lookahead,
+            LOCAL_CONTEXT_MAX_LOOKAROUND
+        );
+        if let Some(keys) = self.key_names_any {
+            assert!(
+                !keys.is_empty(),
+                "local_context key_names_any must not be empty"
+            );
+            for key in keys {
+                assert!(
+                    !key.is_empty(),
+                    "local_context key_names_any contains empty key"
+                );
+            }
+        }
+    }
+}
+
 /// Rule configuration for anchor scan + regex validation.
 ///
 /// # Invariants
@@ -569,6 +622,9 @@ pub struct RuleSpec {
     /// predictable and avoid noisy small-sample statistics.
     pub entropy: Option<EntropySpec>,
 
+    /// Optional local context gate evaluated after secret extraction.
+    pub local_context: Option<LocalContextSpec>,
+
     /// Optional capture group index for secret extraction.
     ///
     /// When set, the engine extracts the secret value from the specified capture
@@ -618,6 +674,9 @@ impl RuleSpec {
         if let Some(ent) = &self.entropy {
             ent.assert_valid();
         }
+        if let Some(ctx) = &self.local_context {
+            ctx.assert_valid();
+        }
         if let Some(gi) = self.secret_group {
             let group_count = self.re.captures_len();
             assert!(
@@ -665,6 +724,55 @@ impl EntropySpec {
             self.min_len <= self.max_len,
             "entropy min_len must be <= max_len"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_rule(local_context: Option<LocalContextSpec>) -> RuleSpec {
+        RuleSpec {
+            name: "test-rule",
+            anchors: &[b"tok_"],
+            radius: 8,
+            validator: ValidatorKind::None,
+            two_phase: None,
+            must_contain: None,
+            keywords_any: None,
+            entropy: None,
+            local_context,
+            secret_group: None,
+            re: Regex::new(r"tok_[a-z0-9]{8}").unwrap(),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "local_context lookbehind")]
+    fn local_context_lookbehind_too_large_panics() {
+        let ctx = LocalContextSpec {
+            lookbehind: LOCAL_CONTEXT_MAX_LOOKAROUND + 1,
+            lookahead: 0,
+            require_same_line_assignment: false,
+            require_quoted: false,
+            key_names_any: None,
+        };
+        let rule = dummy_rule(Some(ctx));
+        rule.assert_valid();
+    }
+
+    #[test]
+    #[should_panic(expected = "local_context key_names_any must not be empty")]
+    fn local_context_empty_key_list_panics() {
+        let ctx = LocalContextSpec {
+            lookbehind: 128,
+            lookahead: 128,
+            require_same_line_assignment: false,
+            require_quoted: false,
+            key_names_any: Some(&[]),
+        };
+        let rule = dummy_rule(Some(ctx));
+        rule.assert_valid();
     }
 }
 
@@ -751,4 +859,275 @@ pub enum AnchorPolicy {
     ManualOnly,
     /// Only use derived anchors; ignore manual anchors entirely.
     DerivedOnly,
+}
+
+// -------------------------------------------------------------------------
+// Policy-hash encodings (canonical, deterministic)
+// -------------------------------------------------------------------------
+// These encodings must stay in lockstep with `policy_hash` in
+// `src/git_scan/policy_hash.rs`. Any semantic change requires bumping the
+// policy hash version to avoid false cache hits.
+
+impl RuleSpec {
+    /// Encodes this rule into a canonical byte representation for policy hashing.
+    ///
+    /// The encoding is deterministic and order-invariant for anchor/keyword lists.
+    /// Callers should treat this as an internal serialization format and bump
+    /// the policy-hash version if it changes.
+    pub(crate) fn encode_policy(&self, out: &mut Vec<u8>) {
+        push_bytes_u32(out, self.name.as_bytes());
+        encode_bytes_list(out, self.anchors);
+        push_u64_le(out, self.radius as u64);
+        self.validator.encode_policy(out);
+
+        match &self.two_phase {
+            None => out.push(0),
+            Some(tp) => {
+                out.push(1);
+                tp.encode_policy(out);
+            }
+        }
+
+        encode_opt_bytes(out, self.must_contain);
+        encode_opt_bytes_list(out, self.keywords_any);
+
+        match &self.entropy {
+            None => out.push(0),
+            Some(ent) => {
+                out.push(1);
+                ent.encode_policy(out);
+            }
+        }
+
+        match self.secret_group {
+            None => out.push(0),
+            Some(v) => {
+                out.push(1);
+                push_u16_le(out, v);
+            }
+        }
+
+        push_bytes_u32(out, self.re.as_str().as_bytes());
+    }
+}
+
+impl TwoPhaseSpec {
+    /// Encodes this two-phase configuration into canonical bytes.
+    pub(crate) fn encode_policy(&self, out: &mut Vec<u8>) {
+        push_u64_le(out, self.seed_radius as u64);
+        push_u64_le(out, self.full_radius as u64);
+        encode_bytes_list(out, self.confirm_any);
+    }
+}
+
+impl EntropySpec {
+    /// Encodes this entropy configuration into canonical bytes.
+    pub(crate) fn encode_policy(&self, out: &mut Vec<u8>) {
+        push_u32_le(out, self.min_bits_per_byte.to_bits());
+        push_u64_le(out, self.min_len as u64);
+        push_u64_le(out, self.max_len as u64);
+    }
+}
+
+impl ValidatorKind {
+    /// Encodes this validator kind into canonical bytes.
+    pub(crate) fn encode_policy(self, out: &mut Vec<u8>) {
+        match self {
+            ValidatorKind::None => out.push(0),
+            ValidatorKind::AwsAccessKey => out.push(1),
+            ValidatorKind::PrefixFixed {
+                tail_len,
+                tail,
+                require_word_boundary_before,
+                delim_after,
+            } => {
+                out.push(2);
+                push_u16_le(out, tail_len);
+                tail.encode_policy(out);
+                push_bool(out, require_word_boundary_before);
+                delim_after.encode_policy(out);
+            }
+            ValidatorKind::PrefixBounded {
+                min_tail,
+                max_tail,
+                tail,
+                require_word_boundary_before,
+                delim_after,
+            } => {
+                out.push(3);
+                push_u16_le(out, min_tail);
+                push_u16_le(out, max_tail);
+                tail.encode_policy(out);
+                push_bool(out, require_word_boundary_before);
+                delim_after.encode_policy(out);
+            }
+        }
+    }
+}
+
+impl TailCharset {
+    /// Encodes this tail charset into a stable tag.
+    pub(crate) fn encode_policy(self, out: &mut Vec<u8>) {
+        let tag = match self {
+            TailCharset::UpperAlnum => 1,
+            TailCharset::Alnum => 2,
+            TailCharset::LowerAlnum => 3,
+            TailCharset::AlnumDashUnderscore => 4,
+            TailCharset::Sendgrid66Set => 5,
+            TailCharset::DatabricksSet => 6,
+            TailCharset::Base64Std => 7,
+        };
+        out.push(tag);
+    }
+}
+
+impl DelimAfter {
+    /// Encodes this delimiter requirement into a stable tag.
+    pub(crate) fn encode_policy(self, out: &mut Vec<u8>) {
+        let tag = match self {
+            DelimAfter::None => 0,
+            DelimAfter::GitleaksTokenTerminator => 1,
+        };
+        out.push(tag);
+    }
+}
+
+impl TransformConfig {
+    /// Encodes this transform config into canonical bytes.
+    pub(crate) fn encode_policy(&self, out: &mut Vec<u8>) {
+        self.id.encode_policy(out);
+        self.mode.encode_policy(out);
+        self.gate.encode_policy(out);
+        push_u64_le(out, self.min_len as u64);
+        push_u64_le(out, self.max_spans_per_buffer as u64);
+        push_u64_le(out, self.max_encoded_len as u64);
+        push_u64_le(out, self.max_decoded_bytes as u64);
+        push_bool(out, self.plus_to_space);
+        push_bool(out, self.base64_allow_space_ws);
+    }
+}
+
+impl TransformId {
+    /// Encodes this transform id into a stable tag.
+    pub(crate) fn encode_policy(self, out: &mut Vec<u8>) {
+        let tag = match self {
+            TransformId::UrlPercent => 1,
+            TransformId::Base64 => 2,
+        };
+        out.push(tag);
+    }
+}
+
+impl TransformMode {
+    /// Encodes this transform mode into a stable tag.
+    pub(crate) fn encode_policy(self, out: &mut Vec<u8>) {
+        let tag = match self {
+            TransformMode::Disabled => 0,
+            TransformMode::Always => 1,
+            TransformMode::IfNoFindingsInThisBuffer => 2,
+        };
+        out.push(tag);
+    }
+}
+
+impl Gate {
+    /// Encodes this gate policy into a stable tag.
+    pub(crate) fn encode_policy(self, out: &mut Vec<u8>) {
+        let tag = match self {
+            Gate::None => 0,
+            Gate::AnchorsInDecoded => 1,
+        };
+        out.push(tag);
+    }
+}
+
+impl Tuning {
+    /// Encodes tuning into canonical bytes for policy hashing.
+    pub(crate) fn encode_policy(&self, out: &mut Vec<u8>) {
+        push_u64_le(out, self.merge_gap as u64);
+        push_u64_le(out, self.max_windows_per_rule_variant as u64);
+        push_u64_le(out, self.pressure_gap_start as u64);
+        push_u64_le(out, self.max_anchor_hits_per_rule_variant as u64);
+        push_u64_le(out, self.max_utf16_decoded_bytes_per_window as u64);
+        push_u64_le(out, self.max_transform_depth as u64);
+        push_u64_le(out, self.max_total_decode_output_bytes as u64);
+        push_u64_le(out, self.max_work_items as u64);
+        push_u64_le(out, self.max_findings_per_chunk as u64);
+        push_bool(out, self.scan_utf16_variants);
+    }
+}
+
+fn encode_opt_bytes(out: &mut Vec<u8>, value: Option<&[u8]>) {
+    match value {
+        None => out.push(0),
+        Some(bytes) => {
+            out.push(1);
+            push_bytes_u32(out, bytes);
+        }
+    }
+}
+
+/// Encodes an optional list of byte slices.
+///
+/// `None` encodes as a single 0x00 byte; `Some` encodes as 0x01 followed by
+/// `encode_bytes_list`, which is order- and duplicate-invariant.
+fn encode_opt_bytes_list(out: &mut Vec<u8>, value: Option<&[&[u8]]>) {
+    match value {
+        None => out.push(0),
+        Some(list) => {
+            out.push(1);
+            encode_bytes_list(out, list);
+        }
+    }
+}
+
+/// Encodes a list of byte slices in canonical, order-invariant form.
+///
+/// The list is sorted and deduplicated to make policy hashes independent
+/// of anchor/keyword ordering.
+fn encode_bytes_list(out: &mut Vec<u8>, list: &[&[u8]]) {
+    let mut items: Vec<&[u8]> = list.to_vec();
+    items.sort_unstable();
+    items.dedup();
+
+    assert!(
+        items.len() <= u32::MAX as usize,
+        "byte list too large for u32 prefix: {}",
+        items.len()
+    );
+    push_u32_le(out, items.len() as u32);
+    for item in items {
+        push_bytes_u32(out, item);
+    }
+}
+
+fn push_bool(out: &mut Vec<u8>, value: bool) {
+    out.push(u8::from(value));
+}
+
+fn push_u16_le(out: &mut Vec<u8>, value: u16) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_u32_le(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_u64_le(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+/// Encodes a length-prefixed byte slice using a `u32` length in little-endian.
+///
+/// # Panics
+///
+/// Panics if `bytes.len() > u32::MAX` (defense-in-depth).
+fn push_bytes_u32(out: &mut Vec<u8>, bytes: &[u8]) {
+    assert!(
+        bytes.len() <= u32::MAX as usize,
+        "byte slice too long for u32 prefix: {}",
+        bytes.len()
+    );
+    push_u32_le(out, bytes.len() as u32);
+    out.extend_from_slice(bytes);
 }

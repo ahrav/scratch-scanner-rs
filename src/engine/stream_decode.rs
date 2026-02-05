@@ -65,7 +65,7 @@ use super::work_items::{
 };
 use crate::api::{Gate, TransformConfig, TransformId, TransformMode};
 
-/// Guard that clears `root_span_map_ctx` on all exit paths.
+/// RAII guard that clears `root_span_map_ctx` on all exit paths.
 ///
 /// # Safety
 /// `scratch` must point to the `ScanScratch` passed to the current
@@ -79,6 +79,8 @@ struct RootSpanMapGuard {
 /// This prevents dedupe collisions when identical decoded bytes originate from
 /// different root spans (important for accurate root-hint attribution).
 fn mix_root_hint_hash(h: u128, root_hint: &Option<Range<usize>>) -> u128 {
+    // Mix the root hint into the hash so identical decoded bytes at different
+    // positions are not deduped across buffers.
     let Some(hint) = root_hint.as_ref() else {
         return h;
     };
@@ -339,6 +341,7 @@ impl Engine {
         scratch.span_streams.clear();
         scratch.tmp_findings.clear();
         scratch.tmp_drop_hint_end.clear();
+        scratch.tmp_norm_hash.clear();
 
         let mut local_out = 0usize;
         let mut truncated = false;
@@ -977,6 +980,7 @@ impl Engine {
             scratch.span_streams.clear();
             scratch.tmp_findings.clear();
             scratch.tmp_drop_hint_end.clear();
+            scratch.tmp_norm_hash.clear();
             self.decode_span_fallback(
                 tc,
                 transform_idx,
@@ -1220,6 +1224,7 @@ impl Engine {
             scratch.span_streams.clear();
             scratch.tmp_findings.clear();
             scratch.tmp_drop_hint_end.clear();
+            scratch.tmp_norm_hash.clear();
             self.decode_span_fallback(
                 tc,
                 transform_idx,
@@ -1497,12 +1502,19 @@ impl Engine {
         }
         let mut tmp_findings = std::mem::take(&mut scratch.tmp_findings);
         let mut tmp_drop_hint_end = std::mem::take(&mut scratch.tmp_drop_hint_end);
+        let mut tmp_norm_hash = std::mem::take(&mut scratch.tmp_norm_hash);
         debug_assert_eq!(tmp_findings.len(), tmp_drop_hint_end.len());
-        for (rec, drop_end) in tmp_findings.drain(..).zip(tmp_drop_hint_end.drain(..)) {
-            scratch.push_finding_with_drop_hint(rec, drop_end, rec.dedupe_with_span);
+        debug_assert_eq!(tmp_findings.len(), tmp_norm_hash.len());
+        for ((rec, drop_end), norm_hash) in tmp_findings
+            .drain(..)
+            .zip(tmp_drop_hint_end.drain(..))
+            .zip(tmp_norm_hash.drain(..))
+        {
+            scratch.push_finding_with_drop_hint(rec, norm_hash, drop_end, rec.dedupe_with_span);
         }
         scratch.tmp_findings = tmp_findings;
         scratch.tmp_drop_hint_end = tmp_drop_hint_end;
+        scratch.tmp_norm_hash = tmp_norm_hash;
 
         let found_any_in_buf = found_any;
         let mut enqueued = 0usize;

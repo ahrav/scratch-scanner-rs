@@ -10,7 +10,7 @@
 //!   unit) used for literal gating. They are not general-purpose UTF-16 encoders.
 //! - Variant ordering is stable and reused for packed arrays and bit layouts.
 
-use crate::api::RuleSpec;
+use crate::api::{LocalContextSpec, RuleSpec};
 use ahash::AHashMap;
 use regex::bytes::Regex;
 
@@ -272,6 +272,7 @@ pub(super) struct RuleCompiled {
     pub(super) confirm_all: Option<ConfirmAllCompiled>,
     pub(super) keywords: Option<KeywordsCompiled>,
     pub(super) entropy: Option<EntropyCompiled>,
+    pub(super) local_context: Option<LocalContextSpec>,
     pub(super) re: Regex,
     pub(super) two_phase: Option<TwoPhaseCompiled>,
     /// Cheap precheck gate: if true, the rule requires an assignment separator
@@ -353,6 +354,7 @@ pub(super) fn compile_rule(spec: &RuleSpec) -> RuleCompiled {
         confirm_all: None,
         keywords,
         entropy,
+        local_context: spec.local_context,
         re: spec.re.clone(),
         two_phase,
         needs_assignment_shape_check,
