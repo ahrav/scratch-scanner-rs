@@ -224,7 +224,7 @@ pub struct GitScanConfig {
     /// Pack exec worker count (1 = single-threaded).
     /// Default is tuned for throughput; override only with perf data.
     pub pack_exec_workers: usize,
-    /// Optional spill directory override. When `None`, a temp directory is used.
+    /// Optional spill directory override. When `None`, a unique temp directory is used.
     pub spill_dir: Option<PathBuf>,
 }
 
@@ -232,7 +232,8 @@ impl Default for GitScanConfig {
     fn default() -> Self {
         let pack_decode = PackDecodeLimits::new(64, 8 * 1024 * 1024, 8 * 1024 * 1024);
         Self {
-            scan_mode: GitScanMode::DiffHistory,
+            // Default to ODB-blob for throughput; diff-history must be explicit.
+            scan_mode: GitScanMode::OdbBlobFast,
             repo_id: 1,
             policy_hash: [0u8; 32],
             start_set: StartSetConfig::DefaultBranchOnly,
@@ -1698,7 +1699,8 @@ fn estimate_path_arena_capacity(base: u32, packed: u32, loose: u32) -> u32 {
 /// Estimate a pack cache size from mapped pack bytes.
 ///
 /// Uses a fixed fraction of total mapped pack size, clamped to the configured
-/// minimum and an upper safety bound.
+/// minimum and an upper safety bound. Only packs referenced by `used_pack_ids`
+/// contribute to the estimate.
 fn estimate_pack_cache_bytes(
     base: usize,
     pack_mmaps: &[Option<Mmap>],
@@ -1720,6 +1722,8 @@ fn estimate_pack_cache_bytes(
 }
 
 /// Load the MIDX view for the repository.
+///
+/// The parser uses the repo's object format to validate OID lengths.
 ///
 /// # Errors
 /// Returns `GitScanError::Midx` if the MIDX mmap is missing or corrupted.
@@ -1749,6 +1753,7 @@ fn build_ref_entries(repo: &RepoJobState) -> Vec<RefEntry> {
 /// Collect pack directories, including alternates.
 ///
 /// Alternates that resolve to the main objects dir are ignored.
+/// The primary pack dir is returned first.
 fn collect_pack_dirs(paths: &GitRepoPaths) -> Vec<PathBuf> {
     let mut dirs = Vec::with_capacity(1 + paths.alternate_object_dirs.len());
     dirs.push(paths.pack_dir.clone());
@@ -1764,6 +1769,7 @@ fn collect_pack_dirs(paths: &GitRepoPaths) -> Vec<PathBuf> {
 /// Collect loose object directories, including alternates.
 ///
 /// Alternates that resolve to the main objects dir are ignored.
+/// The primary objects dir is returned first.
 fn collect_loose_dirs(paths: &GitRepoPaths) -> Vec<PathBuf> {
     let mut dirs = Vec::with_capacity(1 + paths.alternate_object_dirs.len());
     dirs.push(paths.objects_dir.clone());
@@ -1806,7 +1812,8 @@ fn list_pack_files(pack_dirs: &[PathBuf]) -> Result<Vec<Vec<u8>>, GitScanError> 
 /// Resolve pack file paths referenced by the MIDX.
 ///
 /// The MIDX stores pack basenames; we add the `.pack` suffix and search
-/// each pack directory until a match is found.
+/// each pack directory until a match is found. The first match wins, so
+/// `pack_dirs` order is significant.
 fn resolve_pack_paths(
     midx: &MidxView<'_>,
     pack_dirs: &[PathBuf],
@@ -1901,6 +1908,8 @@ fn mmap_pack_files(
 #[cfg(unix)]
 fn advise_sequential(file: &File, reader: &Mmap) {
     unsafe {
+        // SAFETY: The file descriptor and mmap are valid for the duration of
+        // these advisory calls; failures are ignored because they are hints.
         #[cfg(target_os = "linux")]
         let _ = libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
         #[cfg(not(target_os = "linux"))]
@@ -1952,6 +1961,9 @@ fn summarize_pack_plan_deps(plans: &[PackPlan]) -> (u64, u32) {
 }
 
 /// Returns execution indices in deterministic order for a plan.
+///
+/// When `exec_order` is present, it is used to handle forward delta
+/// dependencies. Otherwise the offsets are executed sequentially.
 fn build_exec_indices(plan: &PackPlan) -> Vec<usize> {
     if let Some(order) = plan.exec_order.as_ref() {
         order.iter().map(|&idx| idx as usize).collect()
@@ -1961,6 +1973,8 @@ fn build_exec_indices(plan: &PackPlan) -> Vec<usize> {
 }
 
 /// Splits a range into `shards` contiguous ranges covering `[0, len)`.
+///
+/// The first `len % shards` ranges receive one extra element.
 fn shard_ranges(len: usize, shards: usize) -> Vec<(usize, usize)> {
     if len == 0 {
         return Vec::new();
@@ -1982,6 +1996,8 @@ fn shard_ranges(len: usize, shards: usize) -> Vec<(usize, usize)> {
 }
 
 /// Merge per-shard results in shard order, rebasing finding spans.
+///
+/// Shards should already be ordered deterministically (for example by pack id).
 fn merge_scanned_blobs(mut shards: Vec<ScannedBlobs>) -> ScannedBlobs {
     let total_blobs: usize = shards.iter().map(|s| s.blobs.len()).sum();
     let total_findings: usize = shards.iter().map(|s| s.finding_arena.len()).sum();

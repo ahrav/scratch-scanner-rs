@@ -142,7 +142,7 @@ impl CandidateChunk {
     pub fn sort_and_dedupe(&mut self) {
         let arena = &self.path_arena;
         self.candidates
-            .sort_by(|a, b| compare_candidates(arena, a, b));
+            .sort_unstable_by(|a, b| compare_candidates(arena, a, b));
         self.candidates
             .dedup_by(|a, b| candidates_equal(arena, a, b));
         self.reduce_by_oid();

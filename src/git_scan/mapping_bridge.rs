@@ -29,11 +29,16 @@ use super::midx::{MidxCursor, MidxView};
 use super::midx_error::MidxError;
 use super::object_id::OidBytes;
 use super::pack_candidates::{LooseCandidate, PackCandidate, PackCandidateSink};
+use super::path_policy::classify_path;
 use super::perf;
 use super::tree_candidate::CandidateContext;
 use super::unique_blob::{UniqueBlob, UniqueBlobSink};
 
 /// Configuration for the mapping bridge.
+///
+/// Note: `max_*_candidates` are not enforced by `MappingBridge` itself. They
+/// are intended to size or cap downstream sinks (for example
+/// `CappedPackCandidateSink`) and to keep pipeline budgets consistent.
 #[derive(Clone, Copy, Debug)]
 pub struct MappingBridgeConfig {
     /// Maximum path arena capacity in bytes.
@@ -80,6 +85,11 @@ pub struct MappingStats {
 /// hold stable `ByteRef` values. The input stream must be strictly sorted
 /// by OID and contain no duplicates.
 ///
+/// # Guarantees
+/// - Each successful `emit` call produces exactly one candidate: packed when
+///   the MIDX lookup succeeds, loose otherwise.
+/// - `finish()` validates that `unique_blobs_in == packed_matched + loose_unmatched`.
+///
 /// # Errors
 /// - `SpillError::PathTooLong` if a path exceeds `ByteRef::MAX_LEN`.
 /// - `SpillError::ArenaOverflow` if the bridge path arena fills up.
@@ -116,6 +126,8 @@ impl<'midx, S: PackCandidateSink> MappingBridge<'midx, S> {
     }
 
     /// Returns a reference to the bridge's path arena.
+    ///
+    /// The arena must stay alive for as long as emitted candidates are used.
     #[must_use]
     pub fn path_arena(&self) -> &ByteArena {
         &self.path_arena
@@ -184,7 +196,11 @@ impl<S: PackCandidateSink> UniqueBlobSink for MappingBridge<'_, S> {
             self.ensure_sorted(blob.oid)?;
 
             let path_ref = self.intern_path(paths, blob.ctx.path_ref)?;
+            // Classify using the interned bytes so we only do this once per unique blob.
+            let path_bytes = self.path_arena.get(path_ref);
+            let cand_flags = classify_path(path_bytes).bits();
             let ctx = CandidateContext {
+                cand_flags,
                 path_ref,
                 ..blob.ctx
             };

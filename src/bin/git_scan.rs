@@ -2,9 +2,15 @@
 //!
 //! Minimal wrapper around the git_scan runner with demo rules.
 //! Intended for local smoke tests and debugging, not production usage.
+//! Defaults to ODB-blob mode for throughput; diff-history requires `--mode=diff`.
 //! The start-set resolver shells out to `git` and only supports default-branch
 //! or explicit-ref modes. Watermarks are disabled, so each run scans full
 //! history for the selected refs.
+//!
+//! # Notes
+//! - Uses demo rules/transforms/tuning and in-memory persistence; results are not durable.
+//! - `NeverSeenStore` plus empty watermarks force full-history scans.
+//! - `--debug` emits verbose stage metrics to stderr.
 //!
 //! # Exit codes
 //! - `0`: scan completed successfully.
@@ -30,6 +36,8 @@ use scanner_rs::{demo_rules, demo_transforms, demo_tuning, AnchorMode, AnchorPol
 ///
 /// Supported configs: `DefaultBranchOnly` and `ExplicitRefs`. All other
 /// start-set modes return an error to keep the CLI lightweight.
+///
+/// Requires `git` on PATH; command failures surface as `RepoOpenError::Io`.
 struct GitCliResolver {
     repo: PathBuf,
     start_set: StartSetConfig,
@@ -75,7 +83,7 @@ fn print_usage(exe: &std::ffi::OsStr) {
 
 OPTIONS:
     --repo-id=<N>           Repository id (default: 1)
-    --mode=diff|odb-blob    Scan mode (default: diff)
+    --mode=diff|odb-blob    Scan mode (default: odb-blob)
     --merge=all|first-parent  Merge diff mode (default: all)
     --anchors=manual|derived  Anchor mode (default: manual)
     --pack-exec-workers=<N> Pack exec worker threads (default: 24)
@@ -94,7 +102,7 @@ fn main() -> io::Result<()> {
 
     let mut repo: Option<PathBuf> = None;
     let mut repo_id: u64 = 1;
-    let mut scan_mode = GitScanMode::DiffHistory;
+    let mut scan_mode = GitScanMode::OdbBlobFast;
     let mut merge_mode = MergeDiffMode::AllParents;
     let mut anchor_mode = AnchorMode::Manual;
     let mut max_transform_depth: Option<usize> = None;
@@ -365,6 +373,7 @@ fn main() -> io::Result<()> {
 /// Run `git` in `repo` and return trimmed UTF-8 stdout.
 ///
 /// Output is lossy UTF-8 and trailing whitespace is removed.
+/// Only stdout is captured; stderr is ignored.
 ///
 /// # Errors
 /// Returns an I/O error if the command fails or exits non-zero.

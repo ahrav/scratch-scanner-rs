@@ -41,6 +41,12 @@
 //! - Large or spill-backed trees are parsed with a streaming buffer
 //!   to keep the working set bounded
 //!
+//! # Invariants
+//! - `TreeSource` returns raw tree payload bytes (no object header) in
+//!   canonical Git tree order.
+//! - The configured `oid_len` is authoritative; mismatches are errors.
+//! - `reset_stats()` must be called only when the diff stack is empty.
+//!
 //! # Output Ordering
 //! Candidates are emitted in Git tree order for each diff. For merge commits,
 //! the caller should invoke `diff_trees` once per parent; `parent_idx` tags
@@ -56,7 +62,6 @@ use std::cmp::Ordering;
 use super::errors::TreeDiffError;
 use super::object_id::OidBytes;
 use super::object_store::{TreeBytes, TreeSource};
-use super::path_policy::classify_path;
 use super::tree_candidate::{CandidateSink, ChangeKind};
 use super::tree_diff_limits::TreeDiffLimits;
 use super::tree_entry::{parse_entry, EntryKind, ParseOutcome, ParsedTreeEntry, TreeEntry};
@@ -202,6 +207,7 @@ enum TreeCursor {
 }
 
 impl TreeCursor {
+    /// Builds a cursor, selecting streaming for large or spill-backed trees.
     fn new(bytes: TreeBytes, oid_len: u8, stream_threshold: usize) -> Self {
         let use_stream = bytes.len() >= stream_threshold || matches!(bytes, TreeBytes::Spilled(_));
         if use_stream {
@@ -213,6 +219,7 @@ impl TreeCursor {
         }
     }
 
+    /// Returns an empty cursor with the configured OID length.
     fn empty(oid_len: u8) -> Self {
         Self::Buffered(BufferedCursor::new(TreeBytes::empty(), oid_len))
     }
@@ -241,8 +248,8 @@ impl TreeCursor {
 
 /// Tree diff walker configuration and state.
 ///
-/// The walker maintains internal state (stack, path buffer) that is reused
-/// across multiple `diff_trees` calls for efficiency.
+/// The walker maintains internal state (stack, path buffer, name scratch)
+/// that is reused across multiple `diff_trees` calls for efficiency.
 /// Candidate paths are assembled in a reusable buffer; sinks must copy
 /// the provided path if they need to retain it.
 ///
@@ -256,6 +263,8 @@ pub struct TreeDiffWalker {
     oid_len: u8,
     /// Path buffer (reused across entries).
     path_buf: Vec<u8>,
+    /// Reused entry-name scratch to avoid per-diff allocations.
+    name_scratch: Vec<u8>,
     /// Diff stack (reused across calls).
     stack: Vec<DiffFrame>,
     /// Statistics.
@@ -281,6 +290,7 @@ impl TreeDiffWalker {
             max_depth: limits.max_tree_depth,
             oid_len,
             path_buf: Vec::with_capacity(4096),
+            name_scratch: Vec::with_capacity(256),
             stack: Vec::with_capacity(limits.max_tree_depth as usize),
             stats: TreeDiffStats::default(),
             tree_bytes_in_flight_limit: limits.max_tree_bytes_in_flight,
@@ -352,115 +362,124 @@ impl TreeDiffWalker {
 
         self.path_buf.clear();
         self.stack.clear();
+        let mut name_scratch = std::mem::take(&mut self.name_scratch);
+        name_scratch.clear();
+        debug_assert!(
+            name_scratch.is_empty(),
+            "name_scratch must be cleared before diff_trees"
+        );
 
-        let new_cursor = self.load_tree_cursor(source, new_tree)?;
-        let old_cursor = self.load_tree_cursor(source, old_tree)?;
+        let result = (|| {
+            let new_cursor = self.load_tree_cursor(source, new_tree)?;
+            let old_cursor = self.load_tree_cursor(source, old_tree)?;
 
-        self.stack.push(DiffFrame {
-            new_cursor,
-            old_cursor,
-            prefix_len: 0,
-        });
+            self.stack.push(DiffFrame {
+                new_cursor,
+                old_cursor,
+                prefix_len: 0,
+            });
 
-        // Reused entry-name buffer so we can drop frame borrows before mutating the stack.
-        let mut name_scratch = Vec::with_capacity(256);
+            while !self.stack.is_empty() {
+                let depth = self.stack.len() as u16;
+                self.stats.max_depth_reached = self.stats.max_depth_reached.max(depth);
 
-        while !self.stack.is_empty() {
-            let depth = self.stack.len() as u16;
-            self.stats.max_depth_reached = self.stats.max_depth_reached.max(depth);
-
-            let action = {
-                let frame = self.stack.last_mut().expect("frame exists");
-                let new_entry = frame.new_cursor.peek_entry()?;
-                let old_entry = frame.old_cursor.peek_entry()?;
-
-                let action = compute_action(new_entry, old_entry, self.oid_len)?;
-                if matches!(
-                    action,
-                    Action::AddedEntry { .. }
-                        | Action::MatchedEntries { .. }
-                        | Action::NewBeforeOld { .. }
-                ) {
-                    let entry = new_entry.expect("name requires new entry");
-                    name_scratch.clear();
-                    name_scratch.extend_from_slice(entry.name);
-                }
-                action
-            };
-
-            match action {
-                Action::Pop => {
-                    let frame = self.stack.pop().expect("frame exists");
-                    self.release_tree_bytes(frame.new_cursor.in_flight_len());
-                    self.release_tree_bytes(frame.old_cursor.in_flight_len());
-                    self.path_buf.truncate(frame.prefix_len);
-                }
-                Action::AddedEntry { oid, kind, mode } => {
-                    debug_assert!(!name_scratch.is_empty());
+                let action = {
                     let frame = self.stack.last_mut().expect("frame exists");
-                    frame.new_cursor.advance()?;
-                    self.handle_new_entry(
-                        source,
-                        candidates,
-                        &oid,
-                        &name_scratch,
-                        kind,
-                        mode,
-                        commit_id,
-                        parent_idx,
-                    )?;
-                }
-                Action::DeletedEntry => {
-                    let frame = self.stack.last_mut().expect("frame exists");
-                    frame.old_cursor.advance()?;
-                }
-                Action::MatchedEntries {
-                    new_oid,
-                    old_oid,
-                    new_kind,
-                    old_kind,
-                    new_mode,
-                } => {
-                    debug_assert!(!name_scratch.is_empty());
-                    let frame = self.stack.last_mut().expect("frame exists");
-                    frame.new_cursor.advance()?;
-                    frame.old_cursor.advance()?;
-                    self.handle_matched_entries(
-                        source,
-                        candidates,
-                        &new_oid,
-                        &old_oid,
-                        &name_scratch,
+                    let new_entry = frame.new_cursor.peek_entry()?;
+                    let old_entry = frame.old_cursor.peek_entry()?;
+
+                    let action = compute_action(new_entry, old_entry, self.oid_len)?;
+                    if matches!(
+                        action,
+                        Action::AddedEntry { .. }
+                            | Action::MatchedEntries { .. }
+                            | Action::NewBeforeOld { .. }
+                    ) {
+                        let entry = new_entry.expect("name requires new entry");
+                        name_scratch.clear();
+                        name_scratch.extend_from_slice(entry.name);
+                    }
+                    action
+                };
+
+                match action {
+                    Action::Pop => {
+                        let frame = self.stack.pop().expect("frame exists");
+                        self.release_tree_bytes(frame.new_cursor.in_flight_len());
+                        self.release_tree_bytes(frame.old_cursor.in_flight_len());
+                        self.path_buf.truncate(frame.prefix_len);
+                    }
+                    Action::AddedEntry { oid, kind, mode } => {
+                        debug_assert!(!name_scratch.is_empty());
+                        let frame = self.stack.last_mut().expect("frame exists");
+                        frame.new_cursor.advance()?;
+                        self.handle_new_entry(
+                            source,
+                            candidates,
+                            &oid,
+                            &name_scratch,
+                            kind,
+                            mode,
+                            commit_id,
+                            parent_idx,
+                        )?;
+                    }
+                    Action::DeletedEntry => {
+                        let frame = self.stack.last_mut().expect("frame exists");
+                        frame.old_cursor.advance()?;
+                    }
+                    Action::MatchedEntries {
+                        new_oid,
+                        old_oid,
                         new_kind,
                         old_kind,
                         new_mode,
-                        commit_id,
-                        parent_idx,
-                    )?;
-                }
-                Action::NewBeforeOld { oid, kind, mode } => {
-                    debug_assert!(!name_scratch.is_empty());
-                    let frame = self.stack.last_mut().expect("frame exists");
-                    frame.new_cursor.advance()?;
-                    self.handle_new_entry(
-                        source,
-                        candidates,
-                        &oid,
-                        &name_scratch,
-                        kind,
-                        mode,
-                        commit_id,
-                        parent_idx,
-                    )?;
-                }
-                Action::OldBeforeNew => {
-                    let frame = self.stack.last_mut().expect("frame exists");
-                    frame.old_cursor.advance()?;
+                    } => {
+                        debug_assert!(!name_scratch.is_empty());
+                        let frame = self.stack.last_mut().expect("frame exists");
+                        frame.new_cursor.advance()?;
+                        frame.old_cursor.advance()?;
+                        self.handle_matched_entries(
+                            source,
+                            candidates,
+                            &new_oid,
+                            &old_oid,
+                            &name_scratch,
+                            new_kind,
+                            old_kind,
+                            new_mode,
+                            commit_id,
+                            parent_idx,
+                        )?;
+                    }
+                    Action::NewBeforeOld { oid, kind, mode } => {
+                        debug_assert!(!name_scratch.is_empty());
+                        let frame = self.stack.last_mut().expect("frame exists");
+                        frame.new_cursor.advance()?;
+                        self.handle_new_entry(
+                            source,
+                            candidates,
+                            &oid,
+                            &name_scratch,
+                            kind,
+                            mode,
+                            commit_id,
+                            parent_idx,
+                        )?;
+                    }
+                    Action::OldBeforeNew => {
+                        let frame = self.stack.last_mut().expect("frame exists");
+                        frame.old_cursor.advance()?;
+                    }
                 }
             }
-        }
 
-        Ok(())
+            Ok(())
+        })();
+
+        self.name_scratch = name_scratch;
+
+        result
     }
 
     /// Loads tree data and updates cumulative stats and in-flight budget.
@@ -670,7 +689,8 @@ impl TreeDiffWalker {
         self.path_buf.extend_from_slice(name);
 
         let mode_u16 = mode as u16;
-        let cand_flags = classify_path(&self.path_buf).bits();
+        // Path classification is deferred until post-dedupe to avoid per-candidate work.
+        let cand_flags = 0;
 
         candidates.emit(
             *oid,
