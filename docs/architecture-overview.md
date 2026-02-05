@@ -104,16 +104,21 @@ graph TB
 | **StartSetId**      | `src/git_scan/start_set.rs`    | Deterministic identity for start set configuration                   |
 | **Watermark Keys**  | `src/git_scan/watermark_keys.rs` | Stable ref watermark key/value encoding                            |
 | **Commit Graph View** | `src/git_scan/commit_walk.rs` | Commit-graph adapter with deterministic position lookup              |
+| **Commit Graph Index** | `src/git_scan/commit_graph.rs` | Cache-friendly SoA tables for commit OIDs, root trees, and timestamps |
 | **Commit Walk**     | `src/git_scan/commit_walk.rs`  | `(watermark, tip]` traversal for introduced-by commit selection      |
 | **Commit Walk Limits** | `src/git_scan/commit_walk_limits.rs` | Hard caps for commit traversal and ordering                   |
 | **Snapshot Plan**   | `src/git_scan/snapshot_plan.rs` | Snapshot-mode commit selection (tips only)                          |
 | **Tree Object Store** | `src/git_scan/object_store.rs` | Pack/loose tree loading for OID-only tree diffs                    |
+| **Tree Delta Cache** | `src/git_scan/tree_delta_cache.rs` | Set-associative cache for tree delta bases keyed by pack offset |
 | **Tree Spill Arena** | `src/git_scan/spill_arena.rs` | Preallocated mmapped file for large tree payload spill               |
 | **Tree Spill Index** | `src/git_scan/object_store.rs` | Fixed-size OID index for reusing spilled tree payloads               |
 | **MIDX Mapping**    | `src/git_scan/midx.rs`, `src/git_scan/mapping_bridge.rs` | MIDX parsing and blob-to-pack mapping                     |
 | **Tree Diff Walker** | `src/git_scan/tree_diff.rs` | OID-only tree diffs that emit candidate blobs with context          |
+| **Blob Introducer** | `src/git_scan/blob_introducer.rs` | First-introduced blob walk for ODB-blob scan mode (no per-commit diffs) |
+| **Pack Candidate Collector** | `src/git_scan/pack_candidates.rs` | Direct blob-to-pack/loose candidate mapping for ODB-blob mode |
 | **Tree Stream Parser** | `src/git_scan/tree_stream.rs` | Streaming tree entry parser with bounded buffer                     |
 | **Pack Executor**   | `src/git_scan/pack_exec.rs` | Executes pack plans to decode candidate blobs with bounded buffers |
+| **Blob Spill**      | `src/git_scan/blob_spill.rs` | Spill-backed mmaps for oversized blob payloads during pack exec     |
 | **Engine Adapter**  | `src/git_scan/engine_adapter.rs` | Streams decoded blob bytes into the engine with overlap chunking |
 | **Pack I/O**        | `src/git_scan/pack_io.rs` | MIDX-backed pack mmap loader for cross-pack REF delta bases |
 | **Path Policy**     | `src/git_scan/path_policy.rs` | Fast path classification for candidate flags                         |
@@ -166,8 +171,47 @@ The tree object store can spill large tree payloads into a preallocated,
 memory-mapped spill arena. Spilled trees are indexed by OID for reuse and do not
 count against the in-flight RAM budget.
 
+To reduce repeated base inflations, the object store also maintains a fixed-size
+tree delta cache keyed by `(pack_id, offset)`. Delta bases are stored in
+fixed-size slots with CLOCK eviction so OFS/REF delta chains can reuse bases
+without re-inflating the same pack entry.
+
 For large or spill-backed trees, the walker switches to a streaming parser that
 keeps only a bounded buffer of tree bytes in RAM while iterating entries.
+
+## Git Scan Modes
+
+**Diff-history mode (default)** uses tree diffs across the commit plan to emit
+candidate blobs with per-commit context. This path feeds the spill/dedupe and
+mapping stages before pack planning and execution.
+
+**ODB-blob mode** replaces per-commit diffs with a single pass that
+discovers each unique blob once (first-introduced semantics) and then scans blobs
+in pack-offset order. Attribution is default in this mode: blobs are tagged with
+the first-seen commit position and a representative path, derived from a
+commit-graph traversal. It reuses the same pack decode and engine adapter stages
+but eliminates redundant tree diff work.
+
+## Git Blob Introducer (ODB-blob mode)
+
+The blob introducer walks commits in topological order and traverses trees
+to discover each blob exactly once. It uses `CommitGraphIndex` for cache-friendly
+root tree and commit metadata lookups, plus two seen-set bitmaps keyed by
+MIDX index (trees + blobs) so repeated subtrees are skipped without parsing.
+Loose blobs missing from the MIDX are deduped in fixed-capacity open-addressing
+sets. Paths are assembled in a reusable buffer and classified via `PathClass`
+to set candidate flags. Excluded paths are tracked separately so a blob can
+still be emitted when it later appears under a non-excluded path. The
+introducer emits candidates with `ChangeKind::Add` and uses the introducing
+commit position for attribution.
+
+## Pack Candidate Collector (ODB-blob mode)
+
+The pack candidate collector receives blob introductions and maps each blob
+OID directly to a pack id and offset via the MIDX. Paths are interned into a
+local `ByteArena` so downstream pack execution can hold stable `ByteRef`s
+without re-interning. Blobs missing from the MIDX are emitted as loose
+candidates for `PackIo::load_loose_object`.
 
 ## Git Spill + Dedupe
 
@@ -187,6 +231,25 @@ previously scanned blobs can be filtered before decoding.
 Mapping re-interns candidate paths into a shared arena that is kept alive
 through pack execution and finalize; scan results retain those path refs to
 avoid re-interning in the engine adapter.
+
+## Pack Execution + Cache
+
+Pack execution inflates and applies deltas for packed objects, emitting blob
+payloads to the engine adapter. A tiered pack cache keeps decoded bases hot:
+Tier A stores <=64 KiB objects, Tier B stores <=512 KiB objects. Both tiers
+use fixed-size slots with CLOCK eviction and preallocated storage, so hot-path
+lookups and inserts stay allocation-free and deterministic.
+
+Oversized pack objects use a spill-backed mmap path: when the inflated payload
+exceeds `PackDecodeLimits.max_object_bytes`, pack exec inflates into a
+temporary spill file under the run `spill_dir` and scans from the mmap instead
+of holding the bytes in RAM. Delta outputs can spill the same way, keeping the
+RAM budget fixed even for very large blobs.
+
+Parallel pack execution shards each pack plan into contiguous offset ranges.
+Each worker owns its own pack cache and scratch state; cross-shard delta bases
+are resolved via on-demand decode rather than shared caches. Results are merged
+in shard order to preserve deterministic output.
 
 ## Git Finalize + Persist
 

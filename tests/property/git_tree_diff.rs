@@ -207,6 +207,7 @@ proptest! {
             max_tree_bytes_in_flight: 4 * 1024 * 1024,
             max_tree_spill_bytes: 4 * 1024 * 1024,
             max_tree_cache_bytes: 2 * 1024 * 1024,
+            max_tree_delta_cache_bytes: 2 * 1024 * 1024,
             max_tree_depth: 64,
         };
 
@@ -303,6 +304,7 @@ proptest! {
             max_tree_bytes_in_flight: 4 * 1024 * 1024,
             max_tree_spill_bytes: 1,
             max_tree_cache_bytes: 64,
+            max_tree_delta_cache_bytes: 64,
             max_tree_depth: 64,
         };
 

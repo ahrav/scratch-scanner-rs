@@ -143,6 +143,15 @@ Git tree diffing now uses a streaming entry parser for spill-backed or large
 tree payloads. This keeps tree iteration bounded to a fixed-size buffer while
 preserving Git tree order before candidates reach the engine adapter.
 
+## Git Path Policy (ODB-Blob)
+
+ODB-blob mode applies path policy during blob introduction, before any blob
+bytes are decoded. A blob is emitted with the **first non-excluded path** it
+appears under. If the blob appears only under excluded paths (for example,
+binary-classified files when `path_policy_version >= 2`), it is skipped. This
+ensures deterministic attribution while avoiding false negatives when the same
+blob content shows up under both excluded and non-excluded paths.
+
 ## FindingKey Hashing
 
 For each match, the engine computes a normalized hash on the **secret span**

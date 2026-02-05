@@ -32,13 +32,13 @@ use super::pack_candidates::PackCandidate;
 use super::pack_inflate::{EntryKind, PackFile, PackParseError};
 use super::pack_plan_model::{
     BaseLoc, CandidateAtOffset, Cluster, DeltaDep, DeltaKind, PackPlan, PackPlanStats,
-    CLUSTER_GAP_BYTES,
+    CLUSTER_GAP_BYTES, NONE_U32,
 };
 
 /// Default safety bound for pack entry headers.
 const DEFAULT_MAX_HEADER_BYTES: usize = 64;
 /// Default maximum delta chain depth.
-const DEFAULT_MAX_DELTA_DEPTH: u8 = 16;
+const DEFAULT_MAX_DELTA_DEPTH: u8 = 64;
 /// Default maximum offsets tracked during planning.
 const DEFAULT_MAX_WORKLIST_ENTRIES: usize = 1_000_000;
 /// Default maximum REF base lookups during planning.
@@ -440,6 +440,7 @@ fn build_pack_plan_for_pack<'a, R: OidResolver>(
     );
 
     let delta_deps = build_delta_deps(&need_offsets, &entry_cache, pack_id);
+    let delta_dep_index = build_delta_dep_index(&need_offsets, &delta_deps);
     let exec_order = build_exec_order(&need_offsets, &delta_deps, pack_id)?;
     // Pack exec does not currently consume clustering hints; skip computation.
     let clusters = Vec::new();
@@ -464,10 +465,12 @@ fn build_pack_plan_for_pack<'a, R: OidResolver>(
     Ok(PackPlan {
         pack_id,
         oid_len: pack.oid_len(),
+        max_delta_depth: config.max_delta_depth,
         candidates,
         candidate_offsets,
         need_offsets,
         delta_deps,
+        delta_dep_index,
         exec_order,
         clusters,
         stats,
@@ -558,6 +561,30 @@ fn build_delta_deps(
         }
     }
     deps
+}
+
+fn build_delta_dep_index(need_offsets: &[u64], delta_deps: &[DeltaDep]) -> Vec<u32> {
+    let mut index = vec![NONE_U32; need_offsets.len()];
+    if delta_deps.is_empty() {
+        return index;
+    }
+
+    let mut dep_idx = 0usize;
+    for (need_idx, &offset) in need_offsets.iter().enumerate() {
+        while dep_idx < delta_deps.len() && delta_deps[dep_idx].offset < offset {
+            dep_idx += 1;
+        }
+        if dep_idx < delta_deps.len() && delta_deps[dep_idx].offset == offset {
+            index[need_idx] = dep_idx as u32;
+            dep_idx += 1;
+        }
+    }
+
+    debug_assert!(
+        dep_idx <= delta_deps.len(),
+        "delta_dep_index ran past delta_deps"
+    );
+    index
 }
 
 /// Build an execution order that respects forward delta dependencies.
@@ -735,5 +762,26 @@ mod tests {
             order.iter().position(|&o| o == idx as u32).unwrap()
         };
         assert!(pos(50) < pos(10));
+    }
+
+    #[test]
+    fn delta_dep_index_maps_need_offsets() {
+        let need_offsets = vec![10, 20, 30, 40];
+        let deps = vec![
+            DeltaDep {
+                offset: 20,
+                kind: DeltaKind::Ofs,
+                base: BaseLoc::Offset(10),
+            },
+            DeltaDep {
+                offset: 40,
+                kind: DeltaKind::Ref,
+                base: BaseLoc::External {
+                    oid: OidBytes::sha1([0x11; 20]),
+                },
+            },
+        ];
+        let index = build_delta_dep_index(&need_offsets, &deps);
+        assert_eq!(index, vec![NONE_U32, 0, NONE_U32, 1]);
     }
 }

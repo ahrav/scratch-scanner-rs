@@ -1,16 +1,20 @@
-//! Set-associative cache for decoded pack objects.
+//! Tiered set-associative cache for decoded pack objects.
 //!
 //! Stores inflated object bytes in fixed-size slots keyed by pack offset.
 //! The cache is set-associative with CLOCK eviction and does not allocate
 //! on the hot path after initialization.
 //!
-//! Oversize entries are not cached. The cache is disabled if the configured
-//! capacity cannot fit at least one full set (WAYS * MIN_SLOT_SIZE).
+//! Oversize entries are not cached. Individual tiers are disabled if the
+//! configured capacity cannot fit at least one full set (WAYS * MIN_SLOT_SIZE).
 
 use super::pack_inflate::ObjectKind;
 
-/// Default slot size for cached pack objects (64 KiB).
-const DEFAULT_SLOT_SIZE: u32 = 64 * 1024;
+/// Default slot size for small cached pack objects (64 KiB).
+const DEFAULT_SMALL_SLOT_SIZE: u32 = 64 * 1024;
+/// Default slot size for large cached pack objects (512 KiB).
+const DEFAULT_LARGE_SLOT_SIZE: u32 = 512 * 1024;
+/// Minimum bytes reserved for the large tier when enabled.
+const MIN_LARGE_TIER_BYTES: u32 = 32 * 1024 * 1024;
 /// Minimum slot size (prevents tiny, inefficient caches).
 const MIN_SLOT_SIZE: u32 = 1024;
 /// Number of ways per set.
@@ -47,14 +51,14 @@ pub struct CachedObject<'a> {
     pub bytes: &'a [u8],
 }
 
-/// Fixed-size cache for decoded pack objects.
+/// Fixed-size cache tier for decoded pack objects.
 ///
 /// # Invariants
 /// - `sets` is a power of two (or zero when disabled).
 /// - Each set has exactly `WAYS` slots.
 /// - Slot storage is contiguous and indexed by `(set, way)`.
 #[derive(Debug)]
-pub struct PackCache {
+struct PackCacheTier {
     capacity_bytes: u32,
     slot_size: u32,
     sets: usize,
@@ -63,23 +67,23 @@ pub struct PackCache {
     clock_hands: Vec<u8>,
 }
 
-impl PackCache {
-    /// Creates a new cache with the given capacity.
+impl PackCacheTier {
+    /// Creates a new cache tier with the given capacity and slot size.
     ///
-    /// If the capacity is too small for at least one set, the cache is
+    /// If the capacity is too small for at least one set, the tier is
     /// initialized in a disabled state.
     ///
     /// The actual capacity may be rounded down to satisfy power-of-two
     /// set counts and slot sizes.
     #[must_use]
-    pub fn new(capacity_bytes: u32) -> Self {
+    fn new_with_slot(capacity_bytes: u32, slot_size: u32) -> Self {
         let min_bytes = MIN_SLOT_SIZE.saturating_mul(WAYS as u32);
         if capacity_bytes < min_bytes {
             return Self::disabled(capacity_bytes);
         }
 
-        let mut slot_size = (capacity_bytes / WAYS as u32).min(DEFAULT_SLOT_SIZE);
-        slot_size = round_down_power_of_two_u32(slot_size).max(MIN_SLOT_SIZE);
+        let slot_size = slot_size.min(capacity_bytes / WAYS as u32);
+        let slot_size = round_down_power_of_two_u32(slot_size).max(MIN_SLOT_SIZE);
 
         let slots_total = capacity_bytes / slot_size;
         let sets = round_down_power_of_two_usize((slots_total / WAYS as u32) as usize);
@@ -102,20 +106,20 @@ impl PackCache {
 
     /// Returns the configured capacity in bytes (rounded to usable bytes).
     #[must_use]
-    pub const fn capacity_bytes(&self) -> u32 {
+    const fn capacity_bytes(&self) -> u32 {
         self.capacity_bytes
     }
 
     /// Returns the slot size in bytes.
     #[must_use]
-    pub const fn slot_size(&self) -> u32 {
+    const fn slot_size(&self) -> u32 {
         self.slot_size
     }
 
     /// Looks up cached bytes by pack offset.
     ///
     /// A hit updates the CLOCK bit for the slot.
-    pub fn get(&mut self, offset: u64) -> Option<CachedObject<'_>> {
+    fn get(&mut self, offset: u64) -> Option<CachedObject<'_>> {
         if self.sets == 0 {
             return None;
         }
@@ -141,7 +145,7 @@ impl PackCache {
     /// Inserts bytes for an offset into the cache.
     ///
     /// Returns true if the entry was cached. Oversize entries are ignored.
-    pub fn insert(&mut self, offset: u64, kind: ObjectKind, bytes: &[u8]) -> bool {
+    fn insert(&mut self, offset: u64, kind: ObjectKind, bytes: &[u8]) -> bool {
         if self.sets == 0 {
             return false;
         }
@@ -213,6 +217,107 @@ impl PackCache {
         slot.clock = 1;
         slot.valid = true;
     }
+
+    #[inline]
+    fn is_disabled(&self) -> bool {
+        self.sets == 0
+    }
+}
+
+/// Tiered cache for decoded pack objects.
+///
+/// Tier A uses small fixed slots; Tier B uses larger slots for oversized bases.
+/// Both tiers are set-associative with CLOCK eviction and preallocated storage.
+#[derive(Debug)]
+pub struct PackCache {
+    small: PackCacheTier,
+    large: PackCacheTier,
+}
+
+impl PackCache {
+    /// Creates a new tiered cache with the given total capacity.
+    ///
+    /// The cache splits capacity into a small and large tier. If either tier
+    /// cannot fit at least one full set, it is disabled and the other tier
+    /// receives the full capacity.
+    #[must_use]
+    pub fn new(capacity_bytes: u32) -> Self {
+        let min_bytes = MIN_SLOT_SIZE.saturating_mul(WAYS as u32);
+        if capacity_bytes < min_bytes {
+            return Self {
+                small: PackCacheTier::disabled(capacity_bytes),
+                large: PackCacheTier::disabled(0),
+            };
+        }
+
+        if capacity_bytes < MIN_LARGE_TIER_BYTES {
+            return Self::single_tier(capacity_bytes, DEFAULT_SMALL_SLOT_SIZE);
+        }
+
+        let mut large_bytes = (capacity_bytes / 4).max(MIN_LARGE_TIER_BYTES);
+        if large_bytes > capacity_bytes {
+            large_bytes = capacity_bytes;
+        }
+        let small_bytes = capacity_bytes.saturating_sub(large_bytes);
+
+        let mut small = PackCacheTier::new_with_slot(small_bytes, DEFAULT_SMALL_SLOT_SIZE);
+        let mut large = PackCacheTier::new_with_slot(large_bytes, DEFAULT_LARGE_SLOT_SIZE);
+
+        if small.is_disabled() && large.is_disabled() {
+            return Self { small, large };
+        }
+        if small.is_disabled() && !large.is_disabled() {
+            large = PackCacheTier::new_with_slot(capacity_bytes, DEFAULT_LARGE_SLOT_SIZE);
+            return Self { small, large };
+        }
+        if large.is_disabled() && !small.is_disabled() {
+            small = PackCacheTier::new_with_slot(capacity_bytes, DEFAULT_SMALL_SLOT_SIZE);
+            return Self { small, large };
+        }
+
+        Self { small, large }
+    }
+
+    /// Returns the configured capacity in bytes (rounded to usable bytes).
+    #[must_use]
+    pub fn capacity_bytes(&self) -> u32 {
+        self.small
+            .capacity_bytes()
+            .saturating_add(self.large.capacity_bytes())
+    }
+
+    /// Returns the small-tier slot size in bytes.
+    #[must_use]
+    pub const fn slot_size(&self) -> u32 {
+        DEFAULT_SMALL_SLOT_SIZE
+    }
+
+    /// Looks up cached bytes by pack offset.
+    ///
+    /// A hit updates the CLOCK bit for the slot.
+    pub fn get(&mut self, offset: u64) -> Option<CachedObject<'_>> {
+        self.small.get(offset).or_else(|| self.large.get(offset))
+    }
+
+    /// Inserts bytes for an offset into the cache.
+    ///
+    /// Returns true if the entry was cached. Oversize entries are ignored.
+    pub fn insert(&mut self, offset: u64, kind: ObjectKind, bytes: &[u8]) -> bool {
+        if bytes.len() <= self.small.slot_size() as usize {
+            return self.small.insert(offset, kind, bytes);
+        }
+        if bytes.len() <= self.large.slot_size() as usize {
+            return self.large.insert(offset, kind, bytes);
+        }
+        false
+    }
+
+    fn single_tier(capacity_bytes: u32, slot_size: u32) -> Self {
+        Self {
+            small: PackCacheTier::new_with_slot(capacity_bytes, slot_size),
+            large: PackCacheTier::disabled(0),
+        }
+    }
 }
 
 fn hash_offset(offset: u64) -> u32 {
@@ -266,5 +371,16 @@ mod tests {
         let hit = cache.get(100).expect("cache hit");
         assert_eq!(hit.kind, ObjectKind::Blob);
         assert_eq!(hit.bytes, data.as_slice());
+    }
+
+    #[test]
+    fn cache_large_tier_insert() {
+        let small = PackCacheTier::new_with_slot(256 * 1024, DEFAULT_SMALL_SLOT_SIZE);
+        let large = PackCacheTier::new_with_slot(2 * 1024 * 1024, DEFAULT_LARGE_SLOT_SIZE);
+        let mut cache = PackCache { small, large };
+        let data = vec![0x22u8; 128 * 1024];
+        assert!(cache.insert(200, ObjectKind::Blob, &data));
+        let hit = cache.get(200).expect("cache hit");
+        assert_eq!(hit.bytes.len(), data.len());
     }
 }

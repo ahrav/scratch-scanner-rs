@@ -199,6 +199,12 @@ pub enum TreeDiffError {
     CandidateBufferFull,
     /// Path arena capacity exceeded.
     PathArenaFull,
+    /// Candidate cap exceeded.
+    CandidateLimitExceeded {
+        kind: MappingCandidateKind,
+        max: u32,
+        observed: u32,
+    },
     /// Candidate sink failed.
     CandidateSinkError { detail: String },
     /// Object store failure (MIDX, pack, or loose object decode).
@@ -228,6 +234,14 @@ impl fmt::Display for TreeDiffError {
             }
             Self::CandidateBufferFull => write!(f, "candidate buffer full"),
             Self::PathArenaFull => write!(f, "path arena full"),
+            Self::CandidateLimitExceeded {
+                kind,
+                max,
+                observed,
+            } => write!(
+                f,
+                "candidate limit exceeded: kind={kind} observed={observed} max={max}"
+            ),
             Self::CandidateSinkError { detail } => write!(f, "candidate sink error: {detail}"),
             Self::ObjectStoreError { detail } => write!(f, "object store error: {detail}"),
         }

@@ -85,6 +85,10 @@ Git tree diffing has its own bounded memory envelope:
   set count. Entries larger than a slot are not cached. Cache hits return
   pinned handles so tree bytes can be borrowed without copying; pinned slots
   are skipped by eviction until the handle is dropped.
+- **Tree delta cache**: delta base cache stores decompressed tree bases
+  keyed by pack offset in fixed-size slots. It is sized by
+  `TreeDiffLimits.max_tree_delta_cache_bytes` and avoids repeated base
+  inflations in deep delta chains. Entries larger than a slot are not cached.
 - **Tree spill arena**: large tree payloads can be written into a preallocated,
   memory-mapped spill file sized by `TreeDiffLimits.max_tree_spill_bytes`.
   Spilled bytes are referenced by `(offset, len)` handles and do not count
@@ -142,6 +146,34 @@ collects pack/loose candidates for downstream planning:
   `SpillError::MappingCandidateLimitExceeded` and aborts the run before
   watermark advancement.
 
+## ODB-Blob Scan Budgets
+
+ODB-blob mode allocates fixed-capacity data structures once at startup:
+
+- **OID index**: open-addressed table mapping OID → MIDX index sized from
+  `midx.object_count` with a ≤0.7 load factor. This is the primary O(1)
+  lookup structure used by the blob introducer.
+- **Commit graph index**: SoA arrays (commit OID, root tree OID, committer
+  timestamp) sized to `commit_graph.num_commits` for cache-friendly lookups
+  during first-seen attribution.
+- **Seen sets**: two `DynamicBitSet`s (trees + blobs) sized to
+  `midx.object_count` to guarantee each tree or blob is processed once.
+- **Loose OID sets**: open-addressed tables for loose blob OIDs (seen +
+  excluded) capped by `MappingBridgeConfig.max_loose_candidates` to match the
+  loose candidate budget.
+- **Path builder**: reusable path buffer + segment stack with a hard
+  `MAX_PATH_LEN` guard (4096 bytes) to avoid per-entry allocation.
+- **Symbol table (planned)**: interns filename segments to reduce repeated
+  allocations and improve cache locality during deep tree traversal.
+- **Pack candidate collector**: bounded `Vec<PackCandidate>`/`Vec<LooseCandidate>`
+  sized by `MappingBridgeConfig.max_*_candidates`. In ODB-blob mode the runner
+  raises `max_packed_candidates` to at least `midx.object_count()` and scales
+  the path arena with a fixed bytes-per-candidate heuristic to avoid cap
+  failures on large repos.
+- **Spill fallback**: if in-memory candidate caps or the path arena overflow,
+  ODB-blob replays the introducer and streams candidates into the existing
+  spill + dedupe pipeline, reusing `SpillLimits` for disk-backed buffering.
+
 ## Git Pack Planning Budgets
 
 Pack planning builds per-pack `PackPlan` buffers sized to the candidate set
@@ -166,19 +198,41 @@ and the delta-base closure:
 Memory is linear in `candidates.len()` + `need_offsets.len()` with explicit
 caps on closure expansion and header parsing.
 
+In ODB-blob mode, the runner scales `max_worklist_entries` and
+`max_base_lookups` to at least 2× the packed candidate count so large repos
+do not trip the default 1M limits.
+
 ## Git Pack Decode Budgets
 
 Pack decode uses bounded buffers and a fixed-size cache:
 
-- **Inflate buffers**: zlib output is capped by `PackDecodeLimits.max_object_bytes`
+- **Inflate buffers**: in-memory output is capped by `PackDecodeLimits.max_object_bytes`
   for full objects and `PackDecodeLimits.max_delta_bytes` for delta payloads.
-- **Scratch reuse**: pack exec reuses per-pack scratch buffers for delta maps
-  and candidate ranges to avoid per-plan allocations after warmup.
+  When a full object or delta output exceeds `max_object_bytes`, pack exec
+  inflates into a spill-backed mmap under the run `spill_dir` and scans from
+  disk instead of growing RAM.
+- **Scratch reuse**: pack exec reuses per-pack scratch buffers for delta maps,
+  candidate ranges, and base/delta buffers (`inflate_buf`, `result_buf`,
+  `base_buf`) to avoid per-plan allocations after warmup. Delta base cache
+  misses re-decode base chains into `base_buf` to preserve correctness
+  without requiring larger caches.
 - **Header parsing**: entry headers are bounded by
   `PackDecodeLimits.max_header_bytes`.
-- **Pack cache**: `PackCache` stores decoded objects in fixed-size slots
-  (default 64 KiB, 4-way set associative). Entries larger than a slot are
-  not cached.
+- **Pack cache (tiered)**: `PackCacheTiered` stores decoded objects in
+  size-segregated fixed-size slots using two internal `PackCache` instances.
+  Tier A uses 64 KiB slots; Tier B uses 512 KiB slots. Entries larger than
+  Tier B are not cached. Each tier is 4-way set associative with CLOCK
+  eviction, and all storage is preallocated.
+- **Sequential hints**: pack mmaps use `posix_fadvise`/`madvise` (when
+  available) to hint sequential access and improve readahead without
+  changing memory caps.
+- **ODB-blob cache sizing**: pack cache bytes are raised to approximately
+  `total_pack_bytes / 64` (capped at 2 GiB) to keep delta bases hot when
+  scanning full history. The default split is 75% Tier A / 25% Tier B,
+  with a minimum of 32 MiB reserved for Tier B.
+- **Parallel pack exec memory**: each worker owns its own pack cache and
+  scratch buffers. A global scheduler caps total workers and enforces
+  per-repo memory ceilings: `workers * (pack_cache_bytes + scratch_bytes)`.
 
 These limits keep pack decoding deterministic and bound memory to the
 configured cache capacity plus temporary inflate buffers.

@@ -15,9 +15,11 @@
 //! - Size caps must be enforced by the caller before allocating outputs.
 //! - The pack trailer hash is ignored; integrity checks happen elsewhere.
 
+use std::cell::RefCell;
 use std::fmt;
 
 use super::object_id::OidBytes;
+use flate2::Decompress;
 
 /// Pack header size: magic(4) + version(4) + object_count(4).
 const PACK_HEADER_SIZE: usize = 12;
@@ -26,7 +28,33 @@ const PACK_HEADER_SIZE: usize = 12;
 const MAX_OFS_BYTES: usize = 10; // ceil(64/7)
 
 /// Internal inflate buffer size.
-const INFLATE_BUF_SIZE: usize = 8192;
+const INFLATE_BUF_SIZE: usize = 64 * 1024;
+
+thread_local! {
+    static INFLATE_DECOMPRESS: RefCell<Decompress> = RefCell::new(Decompress::new(true));
+    static INFLATE_BUF: RefCell<[u8; INFLATE_BUF_SIZE]> =
+        const { RefCell::new([0u8; INFLATE_BUF_SIZE]) };
+}
+
+/// Runs an inflate operation using per-thread scratch buffers.
+///
+/// This avoids per-call allocations by reusing a thread-local `Decompress`
+/// and output buffer. The scratch state is not re-entrant on the same
+/// thread; callers must not invoke inflate helpers recursively from within
+/// an `inflate_stream` callback.
+fn with_inflate_scratch<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut Decompress, &mut [u8]) -> R,
+{
+    INFLATE_DECOMPRESS.with(|de| {
+        INFLATE_BUF.with(|buf| {
+            let mut de = de.borrow_mut();
+            de.reset(true);
+            let mut buf = buf.borrow_mut();
+            f(&mut de, &mut *buf)
+        })
+    })
+}
 
 /// Parsed object kind for non-delta entries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -207,6 +235,7 @@ impl<'a> PackFile<'a> {
     /// Parse and validate a pack file header.
     ///
     /// Expects the full pack bytes including the trailing hash.
+    /// The trailing hash is excluded from `data_end` to prevent misparsing.
     pub fn parse(bytes: &'a [u8], oid_len: usize) -> Result<Self, PackParseError> {
         debug_assert!(oid_len == 20 || oid_len == 32, "oid_len must be 20 or 32");
 
@@ -235,7 +264,9 @@ impl<'a> PackFile<'a> {
     /// Parse the entry header at `offset`.
     ///
     /// `max_header_bytes` is a safety bound to prevent runaway parsing on
-    /// corrupt data.
+    /// corrupt data. For delta entries, the returned `data_start` points
+    /// after the base reference (OFS encoding or REF OID) so callers can
+    /// immediately begin inflating the delta payload.
     pub fn entry_header_at(
         &self,
         offset: u64,
@@ -370,6 +401,7 @@ impl<'a> PackFile<'a> {
 /// The output buffer is cleared before writing. Callers should reserve at
 /// least `max_out` capacity to satisfy debug assertions and avoid reallocations.
 ///
+/// On error, `out` may contain a partial prefix; callers should discard it.
 /// This does not enforce that the stream ends exactly at the end of `input`;
 /// callers should use the returned byte count to advance within a pack.
 pub fn inflate_limited(
@@ -377,51 +409,117 @@ pub fn inflate_limited(
     out: &mut Vec<u8>,
     max_out: usize,
 ) -> Result<usize, InflateError> {
-    use flate2::{Decompress, FlushDecompress, Status};
+    use flate2::{FlushDecompress, Status};
 
     debug_assert!(out.capacity() >= max_out || max_out == 0);
     out.clear();
 
-    let mut de = Decompress::new(true);
-    let mut buf = [0u8; INFLATE_BUF_SIZE];
-    let mut in_pos: usize = 0;
+    with_inflate_scratch(|de, buf| {
+        let mut in_pos: usize = 0;
 
-    loop {
-        let before_in = de.total_in() as usize;
-        let before_out = de.total_out() as usize;
+        loop {
+            let before_in = de.total_in() as usize;
+            let before_out = de.total_out() as usize;
 
-        let status = de
-            .decompress(&input[in_pos..], &mut buf, FlushDecompress::None)
-            .map_err(|_| InflateError::Backend)?;
+            let status = de
+                .decompress(&input[in_pos..], buf, FlushDecompress::None)
+                .map_err(|_| InflateError::Backend)?;
 
-        let consumed = de.total_in() as usize - before_in;
-        let produced = de.total_out() as usize - before_out;
-        in_pos += consumed;
+            let consumed = de.total_in() as usize - before_in;
+            let produced = de.total_out() as usize - before_out;
+            in_pos += consumed;
 
-        if produced != 0 {
-            if out.len() + produced > max_out {
-                return Err(InflateError::LimitExceeded);
+            if produced != 0 {
+                if out.len() + produced > max_out {
+                    return Err(InflateError::LimitExceeded);
+                }
+                out.extend_from_slice(&buf[..produced]);
             }
-            out.extend_from_slice(&buf[..produced]);
-        }
 
-        match status {
-            Status::StreamEnd => return Ok(in_pos),
-            Status::Ok => {
-                if consumed == 0 && produced == 0 {
+            match status {
+                Status::StreamEnd => return Ok(in_pos),
+                Status::Ok => {
+                    if consumed == 0 && produced == 0 {
+                        if in_pos >= input.len() {
+                            return Err(InflateError::TruncatedInput);
+                        }
+                        return Err(InflateError::Stalled);
+                    }
+                }
+                Status::BufError => {
                     if in_pos >= input.len() {
                         return Err(InflateError::TruncatedInput);
                     }
-                    return Err(InflateError::Stalled);
-                }
-            }
-            Status::BufError => {
-                if in_pos >= input.len() {
-                    return Err(InflateError::TruncatedInput);
                 }
             }
         }
-    }
+    })
+}
+
+/// Inflate a zlib stream into a caller-provided sink with an exact output size.
+///
+/// Returns the number of input bytes consumed from `input`.
+///
+/// The sink is invoked with contiguous output chunks. The total output bytes
+/// must equal `expected`, otherwise `TruncatedInput` is returned. Callers
+/// should not assume any particular chunk size.
+pub fn inflate_stream(
+    input: &[u8],
+    expected: usize,
+    mut on_chunk: impl FnMut(&[u8]) -> Result<(), InflateError>,
+) -> Result<usize, InflateError> {
+    use flate2::{FlushDecompress, Status};
+
+    with_inflate_scratch(|de, buf| {
+        let mut in_pos: usize = 0;
+        let mut out_total: usize = 0;
+
+        loop {
+            let before_in = de.total_in() as usize;
+            let before_out = de.total_out() as usize;
+
+            let status = de
+                .decompress(&input[in_pos..], buf, FlushDecompress::None)
+                .map_err(|_| InflateError::Backend)?;
+
+            let consumed = de.total_in() as usize - before_in;
+            let produced = de.total_out() as usize - before_out;
+            in_pos += consumed;
+
+            if produced != 0 {
+                let end = out_total
+                    .checked_add(produced)
+                    .ok_or(InflateError::LimitExceeded)?;
+                if end > expected {
+                    return Err(InflateError::LimitExceeded);
+                }
+                on_chunk(&buf[..produced])?;
+                out_total = end;
+            }
+
+            match status {
+                Status::StreamEnd => {
+                    if out_total != expected {
+                        return Err(InflateError::TruncatedInput);
+                    }
+                    return Ok(in_pos);
+                }
+                Status::Ok => {
+                    if consumed == 0 && produced == 0 {
+                        if in_pos >= input.len() {
+                            return Err(InflateError::TruncatedInput);
+                        }
+                        return Err(InflateError::Stalled);
+                    }
+                }
+                Status::BufError => {
+                    if in_pos >= input.len() {
+                        return Err(InflateError::TruncatedInput);
+                    }
+                }
+            }
+        }
+    })
 }
 
 /// Inflate a zlib stream expecting exactly `expected` output bytes.
@@ -446,6 +544,8 @@ pub fn inflate_exact(
 }
 
 /// Reads a Git delta varint (LEB128-like) as u64.
+///
+/// Fails if the encoding would exceed 64 bits or is truncated.
 fn read_leb128_u64(data: &[u8], pos: &mut usize) -> Result<u64, DeltaError> {
     let mut shift: u32 = 0;
     let mut result: u64 = 0;
@@ -469,6 +569,16 @@ fn read_leb128_u64(data: &[u8], pos: &mut usize) -> Result<u64, DeltaError> {
     Err(DeltaError::VarintOverflow)
 }
 
+/// Parse the base and result sizes from a git delta buffer.
+///
+/// This only reads header varints; it does not validate the remainder.
+pub fn delta_sizes(delta: &[u8]) -> Result<(usize, usize), DeltaError> {
+    let mut pos = 0usize;
+    let base_size = read_leb128_u64(delta, &mut pos)? as usize;
+    let result_size = read_leb128_u64(delta, &mut pos)? as usize;
+    Ok((base_size, result_size))
+}
+
 /// Apply a git delta buffer to `base`, producing the result encoded in `delta`.
 ///
 /// The caller supplies `max_out` as a hard safety cap to prevent allocating
@@ -484,23 +594,41 @@ pub fn apply_delta(
     out: &mut Vec<u8>,
     max_out: usize,
 ) -> Result<(), DeltaError> {
-    let mut pos = 0usize;
+    out.clear();
+    let mut written = 0usize;
+    let res = apply_delta_into(base, delta, max_out, |chunk| {
+        written = written.saturating_add(chunk.len());
+        if out.capacity() < written {
+            out.reserve(written - out.capacity());
+        }
+        out.extend_from_slice(chunk);
+        Ok(())
+    });
+    res.map(|_| ())
+}
 
+/// Apply a git delta buffer to `base`, streaming output into a sink.
+///
+/// The sink is invoked with contiguous output slices. The total output is
+/// validated against the delta header's result size. Chunks may reference
+/// either the input `base` or the delta payload.
+pub fn apply_delta_into(
+    base: &[u8],
+    delta: &[u8],
+    max_out: usize,
+    mut on_chunk: impl FnMut(&[u8]) -> Result<(), DeltaError>,
+) -> Result<usize, DeltaError> {
+    let mut pos = 0usize;
     let base_size = read_leb128_u64(delta, &mut pos)? as usize;
+    let result_size = read_leb128_u64(delta, &mut pos)? as usize;
     if base_size != base.len() {
         return Err(DeltaError::BaseSizeMismatch);
     }
-
-    let result_size = read_leb128_u64(delta, &mut pos)? as usize;
     if result_size > max_out {
         return Err(DeltaError::OutputOverrun);
     }
 
-    out.clear();
-    if out.capacity() < result_size {
-        out.reserve(result_size - out.capacity());
-    }
-
+    let mut out_len = 0usize;
     while pos < delta.len() {
         let cmd = delta[pos];
         pos += 1;
@@ -511,31 +639,36 @@ pub fn apply_delta(
             if off.checked_add(size).is_none_or(|end| end > base.len()) {
                 return Err(DeltaError::CopyOutOfRange);
             }
-            if out.len() + size > result_size {
+            let end = out_len.saturating_add(size);
+            if end > result_size {
                 return Err(DeltaError::OutputOverrun);
             }
 
-            out.extend_from_slice(&base[off..off + size]);
+            on_chunk(&base[off..off + size])?;
+            out_len = end;
         } else if cmd != 0 {
             let size = cmd as usize;
             if pos + size > delta.len() {
                 return Err(DeltaError::Truncated);
             }
-            if out.len() + size > result_size {
+            let end = out_len.saturating_add(size);
+            if end > result_size {
                 return Err(DeltaError::OutputOverrun);
             }
 
-            out.extend_from_slice(&delta[pos..pos + size]);
+            on_chunk(&delta[pos..pos + size])?;
             pos += size;
+            out_len = end;
         } else {
             return Err(DeltaError::BadCommandZero);
         }
     }
 
-    if out.len() != result_size {
+    if out_len != result_size {
         return Err(DeltaError::ResultSizeMismatch);
     }
-    Ok(())
+
+    Ok(result_size)
 }
 
 /// Decodes copy parameters for a delta copy instruction.

@@ -11,6 +11,7 @@
 //! - `2`: invalid usage or scan failed.
 //! - `3`: repository needs maintenance artifacts (commit-graph, MIDX).
 
+use std::collections::BTreeMap;
 use std::env;
 use std::io;
 use std::path::PathBuf;
@@ -20,8 +21,8 @@ use scanner_rs::git_scan::policy_hash;
 use scanner_rs::git_scan::InMemoryPersistenceStore;
 use scanner_rs::git_scan::OidBytes;
 use scanner_rs::git_scan::{
-    run_git_scan, GitScanConfig, GitScanResult, MergeDiffMode, NeverSeenStore, RefWatermarkStore,
-    RepoOpenError, StartSetConfig, StartSetResolver,
+    run_git_scan, GitScanConfig, GitScanMode, GitScanResult, MergeDiffMode, NeverSeenStore,
+    RefWatermarkStore, RepoOpenError, StartSetConfig, StartSetResolver,
 };
 use scanner_rs::{demo_rules, demo_transforms, demo_tuning, AnchorMode, AnchorPolicy, Engine};
 
@@ -74,8 +75,10 @@ fn print_usage(exe: &std::ffi::OsStr) {
 
 OPTIONS:
     --repo-id=<N>           Repository id (default: 1)
+    --mode=diff|odb-blob    Scan mode (default: diff)
     --merge=all|first-parent  Merge diff mode (default: all)
     --anchors=manual|derived  Anchor mode (default: manual)
+    --pack-exec-workers=<N> Pack exec worker threads (default: 1)
     --max-transform-depth=<N> Maximum decode depth (default: demo tuning)
     --debug                 Emit stage statistics to stderr
     --help, -h              Show this help message",
@@ -89,9 +92,11 @@ fn main() -> io::Result<()> {
 
     let mut repo: Option<PathBuf> = None;
     let mut repo_id: u64 = 1;
+    let mut scan_mode = GitScanMode::DiffHistory;
     let mut merge_mode = MergeDiffMode::AllParents;
     let mut anchor_mode = AnchorMode::Manual;
     let mut max_transform_depth: Option<usize> = None;
+    let mut pack_exec_workers: Option<usize> = None;
     let mut debug = false;
 
     for arg in args {
@@ -119,6 +124,29 @@ fn main() -> io::Result<()> {
                     eprintln!("invalid --max-transform-depth value: {}", value);
                     std::process::exit(2);
                 }));
+                continue;
+            }
+            if let Some(value) = flag.strip_prefix("--pack-exec-workers=") {
+                let parsed: usize = value.parse().unwrap_or_else(|_| {
+                    eprintln!("invalid --pack-exec-workers value: {}", value);
+                    std::process::exit(2);
+                });
+                if parsed == 0 {
+                    eprintln!("--pack-exec-workers must be >= 1");
+                    std::process::exit(2);
+                }
+                pack_exec_workers = Some(parsed);
+                continue;
+            }
+            if let Some(value) = flag.strip_prefix("--mode=") {
+                scan_mode = match value {
+                    "diff" | "diff-history" => GitScanMode::DiffHistory,
+                    "odb-blob" | "odb-blob-fast" => GitScanMode::OdbBlobFast,
+                    _ => {
+                        eprintln!("invalid --mode value: {}", value);
+                        std::process::exit(2);
+                    }
+                };
                 continue;
             }
             match flag {
@@ -195,10 +223,12 @@ fn main() -> io::Result<()> {
     let persist_store = InMemoryPersistenceStore::default();
 
     let config = GitScanConfig {
+        scan_mode,
         repo_id,
         merge_diff_mode: merge_mode,
         start_set: start_set.clone(),
         policy_hash: policy,
+        pack_exec_workers: pack_exec_workers.unwrap_or(base_config.pack_exec_workers),
         ..base_config
     };
 
@@ -237,7 +267,40 @@ fn main() -> io::Result<()> {
                 eprintln!("spill_stats={:?}", report.spill_stats);
                 eprintln!("mapping_stats={:?}", report.mapping_stats);
                 eprintln!("pack_plan_stats={:?}", report.pack_plan_stats);
-                eprintln!("pack_exec_reports={:?}", report.pack_exec_reports);
+                eprintln!("pack_plan_config={:?}", report.pack_plan_config);
+                eprintln!(
+                    "pack_plan_delta_deps_total={}",
+                    report.pack_plan_delta_deps_total
+                );
+                eprintln!(
+                    "pack_plan_delta_deps_max={}",
+                    report.pack_plan_delta_deps_max
+                );
+                let pack_exec_stats: Vec<_> =
+                    report.pack_exec_reports.iter().map(|r| &r.stats).collect();
+                let pack_exec_skips: usize =
+                    report.pack_exec_reports.iter().map(|r| r.skips.len()).sum();
+                let cache_reject_hist = scanner_rs::git_scan::aggregate_cache_reject_histogram(
+                    &report.pack_exec_reports,
+                );
+                eprintln!("pack_exec_stats={:?}", pack_exec_stats);
+                eprintln!("pack_exec_skips={}", pack_exec_skips);
+                let mut skipped_by_reason: BTreeMap<&'static str, usize> = BTreeMap::new();
+                for skip in &report.skipped_candidates {
+                    *skipped_by_reason.entry(skip.reason.as_str()).or_default() += 1;
+                }
+                eprintln!("skipped_by_reason={:?}", skipped_by_reason);
+                if !report.skipped_candidates.is_empty() {
+                    let sample: Vec<_> = report.skipped_candidates.iter().take(5).collect();
+                    eprintln!("skipped_sample={:?}", sample);
+                }
+                eprintln!("cache_reject_bytes_total={}", cache_reject_hist.bytes_total);
+                eprintln!("cache_reject_bytes_max={}", cache_reject_hist.bytes_max);
+                eprintln!("cache_reject_histogram={:?}", cache_reject_hist.buckets);
+                eprintln!(
+                    "cache_reject_histogram_top={}",
+                    cache_reject_hist.format_top(5)
+                );
                 eprintln!("{}", report.format_metrics());
             }
             Ok(())

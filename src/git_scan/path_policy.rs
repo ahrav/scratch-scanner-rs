@@ -98,6 +98,18 @@ pub fn classify_path(path: &[u8]) -> PathClass {
     }
 }
 
+/// Returns true if the path should be excluded under the given policy version.
+///
+/// Version 1: no exclusions (default behavior).
+/// Version 2+: exclude binary-classified paths.
+#[must_use]
+pub fn is_excluded_path(path: &[u8], version: u32) -> bool {
+    match version {
+        0 | 1 => false,
+        _ => classify_path(path).contains(PathClass::BINARY),
+    }
+}
+
 const TEST_DIRS: &[&[u8]] = &[
     b"test",
     b"tests",

@@ -4,7 +4,9 @@
 //! payload bytes (no `tree <size>\0` header). This is used by the
 //! tree diff walker to avoid blob reads while traversing trees.
 //! Tree payloads are cached in a fixed-size, set-associative tree cache
-//! to avoid repeated inflations of hot subtrees.
+//! to avoid repeated inflations of hot subtrees. A separate delta base
+//! cache keyed by `(pack_id, offset)` reuses decompressed tree bases when
+//! resolving pack delta chains.
 //!
 //! # Contract
 //! Implementations must return the raw, decompressed tree payload (no
@@ -20,6 +22,7 @@
 //! - Delta chains are bounded by `MAX_DELTA_DEPTH`
 //! - Repo artifacts must be `Ready` (commit-graph + MIDX present)
 //! - Tree cache is best-effort: oversize payloads are not cached
+//! - Tree delta cache is best-effort: oversize bases are not cached
 //! - Spill arena stores large tree payloads in a fixed-size mmapped file;
 //!   spill indexing is best-effort and may disable itself when full
 //!
@@ -30,6 +33,9 @@
 //! - Load the object from pack or loose storage
 //! - Verify the object kind is `tree`
 //! - Spill large payloads (best-effort), otherwise insert into cache
+//!
+//! When the `git-perf` feature is enabled, tree-load cache/spill hit rates and
+//! decode timings are recorded via the global perf counters.
 //!
 //! # Spill/Cache Behavior
 //! Small payloads stay in RAM. Large payloads can be written to the spill arena
@@ -55,10 +61,12 @@ use super::object_id::OidBytes;
 use super::pack_inflate::{
     apply_delta, inflate_exact, inflate_limited, EntryKind, ObjectKind, PackFile,
 };
+use super::perf;
 use super::repo::GitRepoPaths;
 use super::repo_open::RepoJobState;
 use super::spill_arena::{SpillArena, SpillArenaError, SpillSlice};
 use super::tree_cache::{TreeCache, TreeCacheHandle};
+use super::tree_delta_cache::{TreeDeltaCache, TreeDeltaCacheHandle};
 use super::tree_diff_limits::TreeDiffLimits;
 
 /// Maximum entry header bytes to parse in pack files.
@@ -264,6 +272,27 @@ impl TreeBytes {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ObjectSource {
+    Pack,
+    Loose,
+}
+
+#[derive(Debug)]
+struct DecodedTreeObject {
+    kind: ObjectKind,
+    bytes: Vec<u8>,
+    chain_len: u8,
+}
+
+#[derive(Debug)]
+struct LoadedObject {
+    kind: ObjectKind,
+    bytes: Vec<u8>,
+    source: ObjectSource,
+    chain_len: u8,
+}
+
 /// Pack/loose object store for tree loading.
 ///
 /// Holds a borrowed MIDX view (tied to the repo job's mmap lifetime) and
@@ -281,6 +310,7 @@ pub struct ObjectStore<'a> {
     pack_cache: Vec<Option<Arc<Mmap>>>,
     loose_dirs: Vec<PathBuf>,
     tree_cache: TreeCache,
+    tree_delta_cache: TreeDeltaCache,
     spill: Option<SpillArena>,
     /// Minimum payload size to consider spilling (smaller payloads stay in RAM).
     spill_min_bytes: usize,
@@ -337,6 +367,7 @@ impl<'a> ObjectStore<'a> {
 
         let loose_dirs = collect_loose_dirs(&repo.paths);
         let tree_cache = TreeCache::new(limits.max_tree_cache_bytes);
+        let tree_delta_cache = TreeDeltaCache::new(limits.max_tree_delta_cache_bytes);
         let max_object_bytes = limits.max_tree_bytes_in_flight.min(usize::MAX as u64) as usize;
         let spill = SpillArena::new(spill_dir, limits.max_tree_spill_bytes).map_err(store_error)?;
         let spill_min_bytes = limits.max_tree_cache_bytes.max(1) as usize;
@@ -351,6 +382,7 @@ impl<'a> ObjectStore<'a> {
             pack_cache,
             loose_dirs,
             tree_cache,
+            tree_delta_cache,
             spill: Some(spill),
             spill_min_bytes,
             spill_exhausted: false,
@@ -368,21 +400,35 @@ impl<'a> ObjectStore<'a> {
     /// Loads an object by OID, resolving deltas up to `MAX_DELTA_DEPTH`.
     ///
     /// This prefers pack files over loose objects.
-    fn load_object(&mut self, oid: &OidBytes) -> Result<(ObjectKind, Vec<u8>), TreeDiffError> {
-        self.load_object_with_depth(oid, MAX_DELTA_DEPTH)
+    fn load_object(
+        &mut self,
+        oid: &OidBytes,
+    ) -> Result<(ObjectKind, Vec<u8>, ObjectSource), TreeDiffError> {
+        let loaded = self.load_object_with_depth(oid, MAX_DELTA_DEPTH)?;
+        Ok((loaded.kind, loaded.bytes, loaded.source))
     }
 
     fn load_object_with_depth(
         &mut self,
         oid: &OidBytes,
         depth: u8,
-    ) -> Result<(ObjectKind, Vec<u8>), TreeDiffError> {
+    ) -> Result<LoadedObject, TreeDiffError> {
         // Depth is decremented per delta hop to bound recursion.
         if let Some(obj) = self.load_object_from_pack(oid, depth)? {
-            return Ok(obj);
+            return Ok(LoadedObject {
+                kind: obj.kind,
+                bytes: obj.bytes,
+                source: ObjectSource::Pack,
+                chain_len: obj.chain_len,
+            });
         }
         if let Some(obj) = self.load_object_from_loose(oid)? {
-            return Ok(obj);
+            return Ok(LoadedObject {
+                kind: obj.0,
+                bytes: obj.1,
+                source: ObjectSource::Loose,
+                chain_len: 0,
+            });
         }
         Err(TreeDiffError::TreeNotFound)
     }
@@ -391,7 +437,7 @@ impl<'a> ObjectStore<'a> {
         &mut self,
         oid: &OidBytes,
         depth: u8,
-    ) -> Result<Option<(ObjectKind, Vec<u8>)>, TreeDiffError> {
+    ) -> Result<Option<DecodedTreeObject>, TreeDiffError> {
         // MIDX lookups are O(log N) on the OID list and return pack offsets.
         let idx = match self.midx.find_oid(oid).map_err(store_error)? {
             Some(idx) => idx,
@@ -411,7 +457,7 @@ impl<'a> ObjectStore<'a> {
         offset: u64,
         depth: u8,
         root_oid: Option<OidBytes>,
-    ) -> Result<(ObjectKind, Vec<u8>), TreeDiffError> {
+    ) -> Result<DecodedTreeObject, TreeDiffError> {
         // Pack objects can be delta chains; bound recursion by depth.
         let pack = PackFile::parse(pack_bytes, self.oid_len as usize).map_err(|err| {
             TreeDiffError::ObjectStoreError {
@@ -451,15 +497,27 @@ impl<'a> ObjectStore<'a> {
                 }
 
                 let mut out = Vec::with_capacity(payload_size);
-                inflate_exact(pack.slice_from(header.data_start), &mut out, payload_size).map_err(
-                    |err| TreeDiffError::ObjectStoreError {
-                        detail: format!(
-                            "pack {pack_id} offset {offset}: {err}{}",
-                            format_root_oid(root_oid)
-                        ),
-                    },
-                )?;
-                Ok((kind, out))
+                let (inflate_result, inflate_nanos) = perf::time(|| {
+                    inflate_exact(pack.slice_from(header.data_start), &mut out, payload_size)
+                });
+                inflate_result.map_err(|err| TreeDiffError::ObjectStoreError {
+                    detail: format!(
+                        "pack {pack_id} offset {offset}: {err}{}",
+                        format_root_oid(root_oid)
+                    ),
+                })?;
+                perf::record_tree_inflate(out.len(), inflate_nanos);
+                let chain_len = 0;
+                perf::record_tree_delta_chain(chain_len);
+                if kind == ObjectKind::Tree {
+                    self.tree_delta_cache
+                        .insert(pack_id, offset, kind, chain_len, &out);
+                }
+                Ok(DecodedTreeObject {
+                    kind,
+                    bytes: out,
+                    chain_len,
+                })
             }
             EntryKind::OfsDelta { base_offset } => {
                 if payload_size > self.max_object_bytes {
@@ -479,32 +537,74 @@ impl<'a> ObjectStore<'a> {
                         ),
                     });
                 }
-                let (base_kind, base_bytes) =
-                    self.read_pack_object(pack_id, pack_bytes, base_offset, depth - 1, root_oid)?;
+                enum BaseSource {
+                    Cached(TreeDeltaCacheHandle),
+                    Owned(DecodedTreeObject),
+                }
+
+                let (base_result, base_nanos) = perf::time(|| {
+                    if let Some(handle) = self.tree_delta_cache.get_handle(pack_id, base_offset) {
+                        perf::record_tree_delta_cache_hit(handle.len());
+                        return Ok((BaseSource::Cached(handle), true));
+                    }
+                    perf::record_tree_delta_cache_miss();
+                    let base = self.read_pack_object(
+                        pack_id,
+                        pack_bytes,
+                        base_offset,
+                        depth - 1,
+                        root_oid,
+                    )?;
+                    Ok((BaseSource::Owned(base), false))
+                });
+                let (base_source, cache_hit) = base_result?;
+                if cache_hit {
+                    perf::record_tree_delta_cache_hit_nanos(base_nanos);
+                } else {
+                    perf::record_tree_delta_cache_miss_nanos(base_nanos);
+                }
+
+                let (base_kind, base_chain_len, base_bytes) = match &base_source {
+                    BaseSource::Cached(handle) => {
+                        (handle.kind(), handle.chain_len(), handle.as_slice())
+                    }
+                    BaseSource::Owned(base) => (base.kind, base.chain_len, base.bytes.as_slice()),
+                };
 
                 let mut delta = Vec::with_capacity(payload_size.min(self.max_object_bytes));
-                inflate_limited(
-                    pack.slice_from(header.data_start),
-                    &mut delta,
-                    payload_size,
-                )
-                .map_err(|err| TreeDiffError::ObjectStoreError {
+                let (inflate_result, inflate_nanos) = perf::time(|| {
+                    inflate_limited(pack.slice_from(header.data_start), &mut delta, payload_size)
+                });
+                inflate_result.map_err(|err| TreeDiffError::ObjectStoreError {
                     detail: format!(
                         "pack {pack_id} offset {offset}: delta inflate failed: {err} (base offset {base_offset}){}",
                         format_root_oid(root_oid)
                     ),
                 })?;
+                perf::record_tree_inflate(delta.len(), inflate_nanos);
 
                 let mut out = Vec::new();
-                apply_delta(&base_bytes, &delta, &mut out, self.max_object_bytes)
-                    .map_err(|err| TreeDiffError::ObjectStoreError {
-                        detail: format!(
-                            "pack {pack_id} offset {offset}: delta apply failed: {err} (base offset {base_offset}){}",
-                            format_root_oid(root_oid)
-                        ),
-                    })?;
+                let (apply_result, apply_nanos) =
+                    perf::time(|| apply_delta(base_bytes, &delta, &mut out, self.max_object_bytes));
+                apply_result.map_err(|err| TreeDiffError::ObjectStoreError {
+                    detail: format!(
+                        "pack {pack_id} offset {offset}: delta apply failed: {err} (base offset {base_offset}){}",
+                        format_root_oid(root_oid)
+                    ),
+                })?;
+                perf::record_tree_delta_apply(out.len(), apply_nanos);
 
-                Ok((base_kind, out))
+                let chain_len = base_chain_len.saturating_add(1);
+                perf::record_tree_delta_chain(chain_len);
+                if base_kind == ObjectKind::Tree {
+                    self.tree_delta_cache
+                        .insert(pack_id, offset, base_kind, chain_len, &out);
+                }
+                Ok(DecodedTreeObject {
+                    kind: base_kind,
+                    bytes: out,
+                    chain_len,
+                })
             }
             EntryKind::RefDelta { base_oid } => {
                 if payload_size > self.max_object_bytes {
@@ -524,31 +624,51 @@ impl<'a> ObjectStore<'a> {
                         ),
                     });
                 }
-                let (base_kind, base_bytes) = self.load_object_with_depth(&base_oid, depth - 1)?;
+                let loaded = self.load_object_with_depth(&base_oid, depth - 1)?;
+                let base_kind = loaded.kind;
+                let base_chain_len = loaded.chain_len;
+                let base_bytes = loaded.bytes;
 
                 let mut delta = Vec::with_capacity(payload_size.min(self.max_object_bytes));
-                inflate_limited(
-                    pack.slice_from(header.data_start),
-                    &mut delta,
-                    payload_size,
-                )
-                .map_err(|err| TreeDiffError::ObjectStoreError {
+                let (inflate_result, inflate_nanos) = perf::time(|| {
+                    inflate_limited(pack.slice_from(header.data_start), &mut delta, payload_size)
+                });
+                inflate_result.map_err(|err| TreeDiffError::ObjectStoreError {
                     detail: format!(
                         "pack {pack_id} offset {offset}: delta inflate failed: {err} (base oid {base_oid}){}",
                         format_root_oid(root_oid)
                     ),
                 })?;
+                perf::record_tree_inflate(delta.len(), inflate_nanos);
 
                 let mut out = Vec::new();
-                apply_delta(&base_bytes, &delta, &mut out, self.max_object_bytes)
-                    .map_err(|err| TreeDiffError::ObjectStoreError {
-                        detail: format!(
-                            "pack {pack_id} offset {offset}: delta apply failed: {err} (base oid {base_oid}){}",
-                            format_root_oid(root_oid)
-                        ),
-                    })?;
+                let (apply_result, apply_nanos) = perf::time(|| {
+                    apply_delta(
+                        base_bytes.as_slice(),
+                        &delta,
+                        &mut out,
+                        self.max_object_bytes,
+                    )
+                });
+                apply_result.map_err(|err| TreeDiffError::ObjectStoreError {
+                    detail: format!(
+                        "pack {pack_id} offset {offset}: delta apply failed: {err} (base oid {base_oid}){}",
+                        format_root_oid(root_oid)
+                    ),
+                })?;
+                perf::record_tree_delta_apply(out.len(), apply_nanos);
 
-                Ok((base_kind, out))
+                let chain_len = base_chain_len.saturating_add(1);
+                perf::record_tree_delta_chain(chain_len);
+                if base_kind == ObjectKind::Tree {
+                    self.tree_delta_cache
+                        .insert(pack_id, offset, base_kind, chain_len, &out);
+                }
+                Ok(DecodedTreeObject {
+                    kind: base_kind,
+                    bytes: out,
+                    chain_len,
+                })
             }
         }
     }
@@ -664,35 +784,46 @@ impl<'a> ObjectStore<'a> {
 
 impl TreeSource for ObjectStore<'_> {
     fn load_tree(&mut self, oid: &OidBytes) -> Result<TreeBytes, TreeDiffError> {
-        if oid.len() != self.oid_len {
-            return Err(TreeDiffError::InvalidOidLength {
-                len: oid.len() as usize,
-                expected: self.oid_len as usize,
-            });
-        }
-
-        if let Some(handle) = self.tree_cache.get_handle(oid) {
-            return Ok(TreeBytes::Cached(handle));
-        }
-
-        if let Some((offset, len)) = self.spill_index.lookup(oid) {
-            if let Some(spill) = self.spill.as_ref() {
-                return Ok(TreeBytes::Spilled(spill.slice(offset, len)));
+        let (result, nanos) = perf::time(|| {
+            if oid.len() != self.oid_len {
+                return Err(TreeDiffError::InvalidOidLength {
+                    len: oid.len() as usize,
+                    expected: self.oid_len as usize,
+                });
             }
-        }
 
-        let (kind, data) = self.load_object(oid)?;
-        if kind != ObjectKind::Tree {
-            return Err(TreeDiffError::NotATree);
-        }
+            if let Some(handle) = self.tree_cache.get_handle(oid) {
+                perf::record_tree_cache_hit();
+                return Ok(TreeBytes::Cached(handle));
+            }
 
-        if let Some(slice) = self.try_spill(oid, &data)? {
-            return Ok(TreeBytes::Spilled(slice));
-        }
+            if let Some((offset, len)) = self.spill_index.lookup(oid) {
+                if let Some(spill) = self.spill.as_ref() {
+                    perf::record_tree_spill_hit();
+                    return Ok(TreeBytes::Spilled(spill.slice(offset, len)));
+                }
+            }
 
-        // Cache is best-effort; failures are ignored.
-        self.tree_cache.insert(*oid, &data);
-        Ok(TreeBytes::Owned(data))
+            let (obj_res, load_nanos) = perf::time(|| self.load_object(oid));
+            let (kind, data, source) = obj_res?;
+            perf::record_tree_object(data.len(), load_nanos, source == ObjectSource::Pack);
+
+            if kind != ObjectKind::Tree {
+                return Err(TreeDiffError::NotATree);
+            }
+
+            if let Some(slice) = self.try_spill(oid, &data)? {
+                return Ok(TreeBytes::Spilled(slice));
+            }
+
+            // Cache is best-effort; failures are ignored.
+            self.tree_cache.insert(*oid, &data);
+            Ok(TreeBytes::Owned(data))
+        });
+
+        let bytes = result.as_ref().map(|payload| payload.len()).unwrap_or(0);
+        perf::record_tree_load(bytes, nanos);
+        result
     }
 }
 

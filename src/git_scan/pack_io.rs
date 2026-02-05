@@ -22,6 +22,8 @@
 use std::fs;
 use std::fs::File;
 use std::io;
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -409,6 +411,7 @@ impl<'a> PackIo<'a> {
             let file = File::open(path)?;
             // SAFETY: pack files are immutable for the duration of a repo job.
             let mmap = unsafe { Mmap::map(&file)? };
+            advise_sequential(&file, &mmap);
             self.pack_cache[idx] = Some(Arc::new(mmap));
         }
 
@@ -418,6 +421,24 @@ impl<'a> PackIo<'a> {
             .clone())
     }
 }
+
+#[cfg(unix)]
+fn advise_sequential(file: &File, reader: &Mmap) {
+    unsafe {
+        #[cfg(target_os = "linux")]
+        let _ = libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+        #[cfg(not(target_os = "linux"))]
+        let _ = file;
+        let _ = libc::madvise(
+            reader.as_ptr() as *mut libc::c_void,
+            reader.len(),
+            libc::MADV_SEQUENTIAL,
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn advise_sequential(_file: &File, _reader: &Mmap) {}
 
 impl ExternalBaseProvider for PackIo<'_> {
     fn load_base(&mut self, oid: &OidBytes) -> Result<Option<ExternalBase>, PackExecError> {

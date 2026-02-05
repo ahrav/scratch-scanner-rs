@@ -12,6 +12,8 @@
 //! - `candidate_offsets` is sorted by offset (ties by candidate index).
 //! - `exec_order` indices refer to `need_offsets`.
 //! - `clusters` are contiguous ranges within `need_offsets`.
+//! - `delta_deps` is sorted by offset (subset of `need_offsets`).
+//! - `delta_dep_index` maps `need_offsets` index -> `delta_deps` index or NONE_U32.
 
 use super::object_id::OidBytes;
 use super::pack_candidates::PackCandidate;
@@ -21,6 +23,8 @@ use super::pack_candidates::PackCandidate;
 /// Offsets separated by more than this value start a new cluster to limit
 /// seek distance during pack reads.
 pub const CLUSTER_GAP_BYTES: u64 = 1024 * 1024;
+/// Sentinel for missing `u32` indices.
+pub const NONE_U32: u32 = u32::MAX;
 
 /// Delta encoding kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,6 +123,8 @@ pub struct PackPlan {
     pub pack_id: u16,
     /// OID length for this repository (20 or 32).
     pub oid_len: u8,
+    /// Maximum delta chain depth expanded in planning.
+    pub max_delta_depth: u8,
     /// Pack candidates for this pack.
     pub candidates: Vec<PackCandidate>,
     /// Candidate offsets sorted by offset (ties by candidate index).
@@ -127,6 +133,8 @@ pub struct PackPlan {
     pub need_offsets: Vec<u64>,
     /// Delta dependencies for offsets in `need_offsets`.
     pub delta_deps: Vec<DeltaDep>,
+    /// Dense index mapping `need_offsets` index to `delta_deps` index.
+    pub delta_dep_index: Vec<u32>,
     /// Optional execution order (indices into `need_offsets`).
     pub exec_order: Option<Vec<u32>>,
     /// Clusters within `need_offsets`.

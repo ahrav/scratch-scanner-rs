@@ -16,9 +16,10 @@
 //! | Candidate buffer | 1M entries x ~50 bytes = 50 MB | Per-repo job |
 //! | Path arena       | 64 MB       | Shared across all candidates        |
 //! | Tree cache       | 64 MB       | Tree payload cache (fixed slots)    |
+//! | Tree delta cache | 64 MB       | Tree delta base cache (fixed slots) |
 //! | Diff stack       | 256 frames x ~100 bytes = 25 KB | Per-diff operation |
 //!
-//! Total default budget: ~179 MB per repo job (excluding mmapped data).
+//! Total default budget: ~243 MB per repo job (excluding mmapped data).
 
 /// Hard caps for tree diff and candidate collection.
 ///
@@ -55,6 +56,15 @@ pub struct TreeDiffLimits {
     /// Default: 64 MB.
     pub max_tree_cache_bytes: u32,
 
+    /// Maximum bytes reserved for the tree delta base cache.
+    ///
+    /// The cache stores decompressed tree bases keyed by pack offset. Entries
+    /// larger than a slot are not cached. This avoids repeated base inflates
+    /// during tree delta chains.
+    ///
+    /// Default: 64 MB.
+    pub max_tree_delta_cache_bytes: u32,
+
     /// Maximum candidates in the in-memory buffer.
     ///
     /// When this limit is reached, tree diffing must either:
@@ -87,11 +97,12 @@ pub struct TreeDiffLimits {
 impl TreeDiffLimits {
     /// Safe defaults suitable for large monorepos.
     ///
-    /// Memory budget: ~115 MB per repo job (excluding mmapped data).
+    /// Memory budget: ~179 MB per repo job (excluding mmapped data).
     pub const DEFAULT: Self = Self {
         max_tree_bytes_in_flight: 2 * 1024 * 1024 * 1024, // 2 GB
         max_tree_spill_bytes: 8 * 1024 * 1024 * 1024,     // 8 GB
         max_tree_cache_bytes: 64 * 1024 * 1024,           // 64 MB
+        max_tree_delta_cache_bytes: 64 * 1024 * 1024,     // 64 MB
         max_candidates: 1_048_576,                        // 1M
         max_path_arena_bytes: 64 * 1024 * 1024,           // 64 MB
         max_tree_depth: 256,
@@ -99,13 +110,14 @@ impl TreeDiffLimits {
 
     /// Restrictive limits for testing or memory-constrained environments.
     ///
-    /// Memory budget: ~2 MB per repo job.
+    /// Memory budget: ~2 MB per repo job (tight, for tests only).
     pub const RESTRICTIVE: Self = Self {
-        max_tree_bytes_in_flight: 64 * 1024 * 1024, // 64 MB
-        max_tree_spill_bytes: 64 * 1024 * 1024,     // 64 MB
-        max_tree_cache_bytes: 8 * 1024 * 1024,      // 8 MB
-        max_candidates: 16_384,                     // 16K
-        max_path_arena_bytes: 1024 * 1024,          // 1 MB
+        max_tree_bytes_in_flight: 64 * 1024 * 1024,  // 64 MB
+        max_tree_spill_bytes: 64 * 1024 * 1024,      // 64 MB
+        max_tree_cache_bytes: 8 * 1024 * 1024,       // 8 MB
+        max_tree_delta_cache_bytes: 8 * 1024 * 1024, // 8 MB
+        max_candidates: 16_384,                      // 16K
+        max_path_arena_bytes: 1024 * 1024,           // 1 MB
         max_tree_depth: 64,
     };
 
@@ -132,6 +144,10 @@ impl TreeDiffLimits {
             "tree spill bytes must be > 0"
         );
         assert!(self.max_tree_cache_bytes > 0, "tree cache must be > 0");
+        assert!(
+            self.max_tree_delta_cache_bytes > 0,
+            "tree delta cache must be > 0"
+        );
 
         // Upper bounds (prevent misconfigurations)
         assert!(
@@ -157,6 +173,10 @@ impl TreeDiffLimits {
         assert!(
             self.max_tree_cache_bytes <= 2 * 1024 * 1024 * 1024,
             "tree cache > 2GB is unreasonable"
+        );
+        assert!(
+            self.max_tree_delta_cache_bytes <= 2 * 1024 * 1024 * 1024,
+            "tree delta cache > 2GB is unreasonable"
         );
 
         // Consistency checks
@@ -188,6 +208,9 @@ impl TreeDiffLimits {
         if self.max_tree_cache_bytes == 0 {
             return Err("tree cache must be > 0");
         }
+        if self.max_tree_delta_cache_bytes == 0 {
+            return Err("tree delta cache must be > 0");
+        }
         if self.max_candidates > 100_000_000 {
             return Err("candidate limit > 100M is unreasonable");
         }
@@ -206,6 +229,9 @@ impl TreeDiffLimits {
         if self.max_tree_cache_bytes > 2 * 1024 * 1024 * 1024 {
             return Err("tree cache > 2GB is unreasonable");
         }
+        if self.max_tree_delta_cache_bytes > 2 * 1024 * 1024 * 1024 {
+            return Err("tree delta cache > 2GB is unreasonable");
+        }
         if (self.max_path_arena_bytes as u64) < (self.max_candidates as u64) * 8 {
             return Err("path arena too small for candidate count");
         }
@@ -221,7 +247,7 @@ impl Default for TreeDiffLimits {
 
 const _: () = TreeDiffLimits::DEFAULT.validate();
 const _: () = TreeDiffLimits::RESTRICTIVE.validate();
-const _: () = assert!(std::mem::size_of::<TreeDiffLimits>() == 32);
+const _: () = assert!(std::mem::size_of::<TreeDiffLimits>() == 40);
 
 #[cfg(test)]
 mod tests {

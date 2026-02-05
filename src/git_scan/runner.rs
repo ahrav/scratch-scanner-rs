@@ -24,6 +24,8 @@
 use std::fs;
 use std::fs::File;
 use std::io;
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -32,12 +34,14 @@ use memmap2::Mmap;
 use crate::scheduler::{alloc_stats, AllocStats, AllocStatsDelta};
 use crate::Engine;
 
+use super::blob_introducer::BlobIntroducer;
 use super::byte_arena::ByteArena;
+use super::commit_graph::CommitGraphIndex;
 use super::commit_walk::{
     introduced_by_plan, CommitGraph, CommitGraphView, ParentScratch, PlannedCommit,
 };
 use super::commit_walk_limits::CommitWalkLimits;
-use super::engine_adapter::{EngineAdapter, EngineAdapterConfig};
+use super::engine_adapter::{EngineAdapter, EngineAdapterConfig, ScannedBlobs};
 use super::errors::{CommitPlanError, PersistError, RepoOpenError, SpillError, TreeDiffError};
 use super::finalize::{build_finalize_ops, FinalizeInput, FinalizeOutput, RefEntry};
 use super::limits::RepoOpenLimits;
@@ -46,11 +50,13 @@ use super::midx::MidxView;
 use super::midx_error::MidxError;
 use super::object_id::{ObjectFormat, OidBytes};
 use super::object_store::ObjectStore;
+use super::oid_index::OidIndex;
 use super::pack_cache::PackCache;
-use super::pack_candidates::{CappedPackCandidateSink, LooseCandidate};
+use super::pack_candidates::{CappedPackCandidateSink, LooseCandidate, PackCandidateCollector};
 use super::pack_decode::PackDecodeLimits;
 use super::pack_exec::{
-    execute_pack_plan_with_scratch, PackExecError, PackExecReport, PackExecScratch, SkipReason,
+    build_candidate_ranges, execute_pack_plan_with_scratch, execute_pack_plan_with_scratch_indices,
+    merge_pack_exec_reports, PackExecError, PackExecReport, PackExecScratch, SkipReason,
     SkipRecord,
 };
 use super::pack_inflate::ObjectKind;
@@ -84,6 +90,17 @@ pub struct PackMmapLimits {
     /// Computed from file sizes; this caps address space usage, not RSS.
     pub max_total_bytes: u64,
 }
+
+/// Heuristic bytes-per-candidate for path arena sizing in ODB-blob mode.
+///
+/// This is a safety cushion to keep path arenas from overflowing when
+/// candidates greatly exceed default caps, while still bounding capacity
+/// to `u32::MAX`.
+const PATH_BYTES_PER_CANDIDATE_ESTIMATE: u64 = 64;
+/// Denominator for pack cache sizing heuristic (total_bytes / denom).
+const PACK_CACHE_FRACTION_DENOM: u64 = 64;
+/// Upper bound for pack cache sizing in ODB-blob mode (2 GiB).
+const PACK_CACHE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 impl PackMmapLimits {
     /// Safe defaults suitable for large monorepos.
@@ -156,6 +173,8 @@ impl CandidateSink for SpillCandidateSink<'_> {
 /// persistence keys and scan identity.
 #[derive(Clone, Debug)]
 pub struct GitScanConfig {
+    /// Scan mode selection (diff-history vs ODB-blob fast path).
+    pub scan_mode: GitScanMode,
     /// Stable repository identifier used to namespace persisted keys.
     pub repo_id: u64,
     /// Stable policy hash that identifies the scan configuration.
@@ -190,6 +209,8 @@ pub struct GitScanConfig {
     pub pack_mmap: PackMmapLimits,
     /// Pack cache size in bytes (must fit in `u32`).
     pub pack_cache_bytes: usize,
+    /// Pack exec worker count (1 = single-threaded).
+    pub pack_exec_workers: usize,
     /// Optional spill directory override. When `None`, a temp directory is used.
     pub spill_dir: Option<PathBuf>,
 }
@@ -198,6 +219,7 @@ impl Default for GitScanConfig {
     fn default() -> Self {
         let pack_decode = PackDecodeLimits::new(64, 8 * 1024 * 1024, 8 * 1024 * 1024);
         Self {
+            scan_mode: GitScanMode::DiffHistory,
             repo_id: 1,
             policy_hash: [0u8; 32],
             start_set: StartSetConfig::DefaultBranchOnly,
@@ -215,7 +237,27 @@ impl Default for GitScanConfig {
             engine_adapter: EngineAdapterConfig::default(),
             pack_mmap: PackMmapLimits::DEFAULT,
             pack_cache_bytes: 64 * 1024 * 1024,
+            pack_exec_workers: 1,
             spill_dir: None,
+        }
+    }
+}
+
+/// Git scan execution mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GitScanMode {
+    /// Current diff-history pipeline (tree diff + spill + mapping + pack plan).
+    #[default]
+    DiffHistory,
+    /// ODB-blob fast path (first-introduced blob walk + pack-order scan).
+    OdbBlobFast,
+}
+
+impl std::fmt::Display for GitScanMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DiffHistory => write!(f, "diff-history"),
+            Self::OdbBlobFast => write!(f, "odb-blob"),
         }
     }
 }
@@ -267,6 +309,22 @@ impl CandidateSkipReason {
             SkipReason::NotBlob => Self::PackNotBlob,
         }
     }
+
+    /// Returns a stable label for reporting.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::LooseMissing => "loose_missing",
+            Self::LooseDecode => "loose_decode",
+            Self::LooseNotBlob => "loose_not_blob",
+            Self::PackNotBlob => "pack_not_blob",
+            Self::PackDecode => "pack_decode",
+            Self::PackDelta => "pack_delta",
+            Self::PackBaseMissing => "pack_base_missing",
+            Self::PackExternalBaseMissing => "pack_external_base_missing",
+            Self::PackExternalBaseError => "pack_external_base_error",
+            Self::PackParse => "pack_parse",
+        }
+    }
 }
 
 /// Candidate blob skipped during the run.
@@ -286,14 +344,22 @@ pub struct SkippedCandidate {
 pub struct GitScanStageNanos {
     /// Tree diff stage time.
     pub tree_diff: u64,
+    /// Commit-plan construction time.
+    pub commit_plan: u64,
+    /// First-introduced blob walk time (ODB-blob mode).
+    pub blob_intro: u64,
     /// Spill/dedupe stage time.
     pub spill: u64,
+    /// Pack candidate collection time (ODB-blob mode).
+    pub pack_collect: u64,
     /// Mapping bridge stage time (from perf counters when enabled).
     pub mapping: u64,
     /// Pack planning stage time.
     pub pack_plan: u64,
     /// Pack execution stage time.
     pub pack_exec: u64,
+    /// Loose object scan time (ODB-blob mode).
+    pub loose_scan: u64,
     /// Scan stage time (from perf counters when enabled).
     pub scan: u64,
 }
@@ -375,10 +441,18 @@ impl GitScanMetricsSnapshot {
         let mut out = String::new();
 
         push_line(&mut out, "stage.tree_diff.nanos", self.stages.tree_diff);
+        push_line(&mut out, "stage.commit_plan.nanos", self.stages.commit_plan);
+        push_line(&mut out, "stage.blob_intro.nanos", self.stages.blob_intro);
         push_line(&mut out, "stage.spill.nanos", self.stages.spill);
+        push_line(
+            &mut out,
+            "stage.pack_collect.nanos",
+            self.stages.pack_collect,
+        );
         push_line(&mut out, "stage.mapping.nanos", self.stages.mapping);
         push_line(&mut out, "stage.pack_plan.nanos", self.stages.pack_plan);
         push_line(&mut out, "stage.pack_exec.nanos", self.stages.pack_exec);
+        push_line(&mut out, "stage.loose_scan.nanos", self.stages.loose_scan);
         push_line(&mut out, "stage.scan.nanos", self.stages.scan);
 
         push_line(&mut out, "tree_diff.bytes", self.tree_diff_bytes);
@@ -391,6 +465,117 @@ impl GitScanMetricsSnapshot {
             &mut out,
             "tree_diff.ns_per_byte",
             nanos_per_byte(self.tree_diff_bytes, self.stages.tree_diff),
+        );
+
+        push_line(&mut out, "tree_load.calls", self.perf.tree_load_calls);
+        push_line(&mut out, "tree_load.bytes", self.perf.tree_load_bytes);
+        push_line(&mut out, "tree_load.nanos", self.perf.tree_load_nanos);
+        push_line(
+            &mut out,
+            "tree_load.bytes_per_sec",
+            bytes_per_sec(self.perf.tree_load_bytes, self.perf.tree_load_nanos),
+        );
+        push_line(
+            &mut out,
+            "tree_load.ns_per_byte",
+            nanos_per_byte(self.perf.tree_load_bytes, self.perf.tree_load_nanos),
+        );
+        push_line(&mut out, "tree_cache.hits", self.perf.tree_cache_hits);
+        push_line(
+            &mut out,
+            "tree_delta_cache.hits",
+            self.perf.tree_delta_cache_hits,
+        );
+        push_line(
+            &mut out,
+            "tree_delta_cache.misses",
+            self.perf.tree_delta_cache_misses,
+        );
+        push_line(
+            &mut out,
+            "tree_delta_cache.bytes",
+            self.perf.tree_delta_cache_bytes,
+        );
+        push_line(
+            &mut out,
+            "tree_delta_cache.hit_nanos",
+            self.perf.tree_delta_cache_hit_nanos,
+        );
+        push_line(
+            &mut out,
+            "tree_delta_cache.miss_nanos",
+            self.perf.tree_delta_cache_miss_nanos,
+        );
+        push_line(&mut out, "tree_delta_chain.0", self.perf.tree_delta_chain_0);
+        push_line(&mut out, "tree_delta_chain.1", self.perf.tree_delta_chain_1);
+        push_line(
+            &mut out,
+            "tree_delta_chain.2_3",
+            self.perf.tree_delta_chain_2_3,
+        );
+        push_line(
+            &mut out,
+            "tree_delta_chain.4_7",
+            self.perf.tree_delta_chain_4_7,
+        );
+        push_line(
+            &mut out,
+            "tree_delta_chain.8_plus",
+            self.perf.tree_delta_chain_8_plus,
+        );
+        push_line(&mut out, "tree_spill.hits", self.perf.tree_spill_hits);
+        push_line(&mut out, "tree_object.loads", self.perf.tree_object_loads);
+        push_line(&mut out, "tree_object.bytes", self.perf.tree_object_bytes);
+        push_line(&mut out, "tree_object.nanos", self.perf.tree_object_nanos);
+        push_line(
+            &mut out,
+            "tree_object.bytes_per_sec",
+            bytes_per_sec(self.perf.tree_object_bytes, self.perf.tree_object_nanos),
+        );
+        push_line(
+            &mut out,
+            "tree_object.ns_per_byte",
+            nanos_per_byte(self.perf.tree_object_bytes, self.perf.tree_object_nanos),
+        );
+        push_line(&mut out, "tree_object.pack", self.perf.tree_object_pack);
+        push_line(&mut out, "tree_object.loose", self.perf.tree_object_loose);
+        push_line(&mut out, "tree_inflate.bytes", self.perf.tree_inflate_bytes);
+        push_line(&mut out, "tree_inflate.nanos", self.perf.tree_inflate_nanos);
+        push_line(
+            &mut out,
+            "tree_inflate.bytes_per_sec",
+            bytes_per_sec(self.perf.tree_inflate_bytes, self.perf.tree_inflate_nanos),
+        );
+        push_line(
+            &mut out,
+            "tree_inflate.ns_per_byte",
+            nanos_per_byte(self.perf.tree_inflate_bytes, self.perf.tree_inflate_nanos),
+        );
+        push_line(
+            &mut out,
+            "tree_delta_apply.bytes",
+            self.perf.tree_delta_apply_bytes,
+        );
+        push_line(
+            &mut out,
+            "tree_delta_apply.nanos",
+            self.perf.tree_delta_apply_nanos,
+        );
+        push_line(
+            &mut out,
+            "tree_delta_apply.bytes_per_sec",
+            bytes_per_sec(
+                self.perf.tree_delta_apply_bytes,
+                self.perf.tree_delta_apply_nanos,
+            ),
+        );
+        push_line(
+            &mut out,
+            "tree_delta_apply.ns_per_byte",
+            nanos_per_byte(
+                self.perf.tree_delta_apply_bytes,
+                self.perf.tree_delta_apply_nanos,
+            ),
         );
 
         push_line(&mut out, "pack_inflate.bytes", self.perf.pack_inflate_bytes);
@@ -504,6 +689,12 @@ pub struct GitScanReport {
     pub mapping_stats: MappingStats,
     /// Per-pack-plan statistics.
     pub pack_plan_stats: Vec<PackPlanStats>,
+    /// Pack plan configuration used for this run.
+    pub pack_plan_config: PackPlanConfig,
+    /// Total delta dependency count across pack plans.
+    pub pack_plan_delta_deps_total: u64,
+    /// Maximum delta dependency count in a single pack plan.
+    pub pack_plan_delta_deps_max: u32,
     /// Pack decode + scan reports, in the same order as `pack_plan_stats`.
     pub pack_exec_reports: Vec<PackExecReport>,
     /// Candidates skipped with explicit reasons.
@@ -555,6 +746,8 @@ pub enum GitScanError {
     Io(io::Error),
     /// Resource limit exceeded (pack mmap counts or bytes).
     ResourceLimit(String),
+    /// Scan mode not yet implemented.
+    UnsupportedMode(GitScanMode),
 }
 
 impl std::fmt::Display for GitScanError {
@@ -572,6 +765,7 @@ impl std::fmt::Display for GitScanError {
             Self::Persist(err) => write!(f, "{err}"),
             Self::Io(err) => write!(f, "{err}"),
             Self::ResourceLimit(msg) => write!(f, "resource limit exceeded: {msg}"),
+            Self::UnsupportedMode(mode) => write!(f, "scan mode not implemented: {mode}"),
         }
     }
 }
@@ -591,6 +785,7 @@ impl std::error::Error for GitScanError {
             Self::Persist(err) => Some(err),
             Self::Io(err) => Some(err),
             Self::ResourceLimit(_) => None,
+            Self::UnsupportedMode(_) => None,
         }
     }
 }
@@ -714,11 +909,397 @@ pub fn run_git_scan(
         return Ok(GitScanResult::NeedsMaintenance { preflight });
     }
 
+    if config.scan_mode == GitScanMode::OdbBlobFast {
+        // Commit walk plan.
+        let cg = CommitGraphView::open_repo(&repo)?;
+        let plan_start = Instant::now();
+        let plan = introduced_by_plan(&repo, &cg, config.commit_walk)?;
+        stage_nanos.commit_plan = plan_start.elapsed().as_nanos() as u64;
+        let cg_index = CommitGraphIndex::build(&cg)?;
+
+        // Shared spill directory for tree payloads and pack-exec large blobs.
+        let spill_dir = match &config.spill_dir {
+            Some(path) => path.clone(),
+            None => make_spill_dir()?,
+        };
+
+        let midx = load_midx(&repo)?;
+        let mut mapping_cfg = config.mapping;
+        let packed_cap = mapping_cfg.max_packed_candidates.max(midx.object_count());
+        mapping_cfg.max_packed_candidates = packed_cap;
+        mapping_cfg.path_arena_capacity = estimate_path_arena_capacity(
+            mapping_cfg.path_arena_capacity,
+            mapping_cfg.max_packed_candidates,
+            mapping_cfg.max_loose_candidates,
+        );
+        let oid_index = OidIndex::from_midx(&midx);
+        let mut object_store = ObjectStore::open(&repo, &config.tree_diff, &spill_dir)?;
+
+        let mut introducer = BlobIntroducer::new(
+            &config.tree_diff,
+            repo.object_format.oid_len(),
+            midx.object_count(),
+            config.path_policy_version,
+            mapping_cfg.max_loose_candidates,
+        );
+
+        let intro_start = Instant::now();
+        let (intro_stats, packed, loose, path_arena, spill_stats, mapping_stats) = {
+            let mut collector = PackCandidateCollector::new(
+                &midx,
+                &oid_index,
+                mapping_cfg.path_arena_capacity,
+                mapping_cfg.max_packed_candidates,
+                mapping_cfg.max_loose_candidates,
+            );
+
+            match introducer.introduce(
+                &mut object_store,
+                &cg_index,
+                &plan,
+                &oid_index,
+                &mut collector,
+            ) {
+                Ok(stats) => {
+                    stage_nanos.blob_intro = intro_start.elapsed().as_nanos() as u64;
+                    let collect_start = Instant::now();
+                    let (packed, loose, path_arena) = collector.finish();
+                    stage_nanos.pack_collect = collect_start.elapsed().as_nanos() as u64;
+                    let mapping_stats = MappingStats {
+                        unique_blobs_in: packed.len().saturating_add(loose.len()) as u64,
+                        packed_matched: packed.len() as u64,
+                        loose_unmatched: loose.len() as u64,
+                    };
+                    (
+                        stats,
+                        packed,
+                        loose,
+                        path_arena,
+                        SpillStats::default(),
+                        mapping_stats,
+                    )
+                }
+                Err(
+                    TreeDiffError::CandidateLimitExceeded { .. } | TreeDiffError::PathArenaFull,
+                ) => {
+                    let first_elapsed = intro_start.elapsed().as_nanos() as u64;
+                    introducer.reset_seen();
+
+                    let retry_start = Instant::now();
+                    let mut spiller =
+                        Spiller::new(config.spill, repo.object_format.oid_len(), &spill_dir)?;
+                    let mut sink = SpillCandidateSink::new(&mut spiller);
+                    let stats = introducer.introduce(
+                        &mut object_store,
+                        &cg_index,
+                        &plan,
+                        &oid_index,
+                        &mut sink,
+                    )?;
+                    let retry_elapsed = retry_start.elapsed().as_nanos() as u64;
+                    stage_nanos.blob_intro = first_elapsed.saturating_add(retry_elapsed);
+
+                    let spill_start = Instant::now();
+                    let mut bridge = MappingBridge::new(
+                        &midx,
+                        CappedPackCandidateSink::new(
+                            mapping_cfg.max_packed_candidates,
+                            mapping_cfg.max_loose_candidates,
+                        ),
+                        mapping_cfg,
+                    );
+                    let spill_stats = spiller.finalize(seen_store, &mut bridge)?;
+                    stage_nanos.spill = spill_start.elapsed().as_nanos() as u64;
+                    let (mapping_stats, mut sink, mapping_arena) = bridge.finish()?;
+                    let packed = std::mem::take(&mut sink.packed);
+                    let loose = std::mem::take(&mut sink.loose);
+                    (
+                        stats,
+                        packed,
+                        loose,
+                        mapping_arena,
+                        spill_stats,
+                        mapping_stats,
+                    )
+                }
+                Err(err) => return Err(err.into()),
+            }
+        };
+
+        // Pack planning.
+        let pack_plan_start = Instant::now();
+        let pack_dirs = collect_pack_dirs(&repo.paths);
+        let pack_names = list_pack_files(&pack_dirs)?;
+        midx.verify_completeness(pack_names.iter().map(|n| n.as_slice()))?;
+        let pack_paths = resolve_pack_paths(&midx, &pack_dirs)?;
+        let loose_dirs = collect_loose_dirs(&repo.paths);
+        let mut used_pack_ids: Vec<u16> = packed.iter().map(|cand| cand.pack_id).collect();
+        used_pack_ids.sort_unstable();
+        used_pack_ids.dedup();
+        let pack_mmaps = mmap_pack_files(&pack_paths, &used_pack_ids, config.pack_mmap)?;
+        let pack_views = build_pack_views(&pack_mmaps, repo.object_format)?;
+
+        let packed_len = packed.len();
+        let loose_len = loose.len();
+        let mut pack_plan_stats = Vec::new();
+        let mut plans = Vec::new();
+        let mut pack_plan_cfg = config.pack_plan;
+        if packed_len > 0 {
+            // Scale plan caps for large candidate sets in ODB-blob mode.
+            let scaled = packed_len.saturating_mul(2);
+            pack_plan_cfg.max_worklist_entries = pack_plan_cfg.max_worklist_entries.max(scaled);
+            pack_plan_cfg.max_base_lookups = pack_plan_cfg.max_base_lookups.max(scaled);
+            let mut pack_plans = build_pack_plans(packed, &pack_views, &midx, &pack_plan_cfg)?;
+            pack_plan_stats.extend(pack_plans.iter().map(|p| p.stats));
+            plans.append(&mut pack_plans);
+        }
+        let (pack_plan_delta_deps_total, pack_plan_delta_deps_max) =
+            summarize_pack_plan_deps(&plans);
+        stage_nanos.pack_plan = pack_plan_start.elapsed().as_nanos() as u64;
+
+        if !repo.artifacts_unchanged()? {
+            return Ok(GitScanResult::NeedsMaintenance { preflight });
+        }
+
+        // Execute pack plans + scan.
+        let pack_exec_workers = config.pack_exec_workers.max(1);
+        let pack_cache_target =
+            estimate_pack_cache_bytes(config.pack_cache_bytes, &pack_mmaps, &used_pack_ids);
+        let pack_cache_bytes: u32 = pack_cache_target
+            .try_into()
+            .map_err(|_| io::Error::other("pack cache size exceeds u32::MAX"))?;
+        let mut pack_exec_reports = Vec::with_capacity(plans.len());
+        let mut skipped_candidates = Vec::new();
+
+        let pack_exec_start = Instant::now();
+        let pack_exec_alloc_before: AllocStats = alloc_stats();
+        let mut scanned = ScannedBlobs {
+            blobs: Vec::with_capacity(packed_len.saturating_add(loose_len)),
+            finding_arena: Vec::new(),
+        };
+
+        if pack_exec_workers == 1 {
+            let mut cache = PackCache::new(pack_cache_bytes);
+            let mut external =
+                PackIo::from_parts(midx, pack_paths.clone(), loose_dirs.clone(), config.pack_io)
+                    .map_err(GitScanError::PackIo)?;
+            let mut adapter = EngineAdapter::new(engine, config.engine_adapter);
+            adapter.reserve_results(packed_len.saturating_add(loose_len));
+            let mut exec_scratch = PackExecScratch::default();
+            for plan in &plans {
+                let pack_id = plan.pack_id as usize;
+                let pack_bytes = pack_mmaps
+                    .get(pack_id)
+                    .and_then(|mmap| mmap.as_ref())
+                    .ok_or(GitScanError::PackPlan(PackPlanError::PackIdOutOfRange {
+                        pack_id: plan.pack_id,
+                        pack_count: pack_mmaps.len(),
+                    }))?
+                    .as_ref();
+
+                let report = execute_pack_plan_with_scratch(
+                    plan,
+                    pack_bytes,
+                    &path_arena,
+                    &config.pack_decode,
+                    &mut cache,
+                    &mut external,
+                    &mut adapter,
+                    &spill_dir,
+                    &mut exec_scratch,
+                )?;
+                collect_skipped_candidates(plan, &report.skips, &mut skipped_candidates);
+                pack_exec_reports.push(report);
+            }
+
+            if !loose.is_empty() {
+                let loose_start = Instant::now();
+                scan_loose_candidates(
+                    &loose,
+                    &path_arena,
+                    &mut adapter,
+                    &mut external,
+                    &mut skipped_candidates,
+                )?;
+                stage_nanos.loose_scan = loose_start.elapsed().as_nanos() as u64;
+            }
+
+            scanned = adapter.take_results();
+        } else {
+            for plan in &plans {
+                let pack_id = plan.pack_id as usize;
+                let pack_bytes = pack_mmaps
+                    .get(pack_id)
+                    .and_then(|mmap| mmap.as_ref())
+                    .ok_or(GitScanError::PackPlan(PackPlanError::PackIdOutOfRange {
+                        pack_id: plan.pack_id,
+                        pack_count: pack_mmaps.len(),
+                    }))?
+                    .as_ref();
+
+                let exec_indices = build_exec_indices(plan);
+                if exec_indices.is_empty() {
+                    continue;
+                }
+
+                let mut candidate_ranges = Vec::new();
+                build_candidate_ranges(plan, &mut candidate_ranges);
+
+                let ranges = shard_ranges(exec_indices.len(), pack_exec_workers);
+                let shard_outputs = std::thread::scope(
+                    |scope| -> Result<Vec<(usize, PackExecReport, ScannedBlobs)>, PackExecError> {
+                        let mut handles = Vec::with_capacity(ranges.len());
+                        for (shard_idx, (start, end)) in ranges.iter().enumerate() {
+                            let exec_slice = &exec_indices[*start..*end];
+                            let candidate_ranges = &candidate_ranges;
+                            let pack_paths = pack_paths.clone();
+                            let loose_dirs = loose_dirs.clone();
+                            let pack_decode = config.pack_decode;
+                            let pack_io_limits = config.pack_io;
+                            let adapter_cfg = config.engine_adapter;
+                            let paths = &path_arena;
+                            let spill_dir = &spill_dir;
+
+                            handles.push(scope.spawn(move || {
+                                let mut cache = PackCache::new(pack_cache_bytes);
+                                let mut external = PackIo::from_parts(
+                                    midx,
+                                    pack_paths,
+                                    loose_dirs,
+                                    pack_io_limits,
+                                )
+                                .map_err(|err| PackExecError::ExternalBase(err.to_string()))?;
+                                let mut adapter = EngineAdapter::new(engine, adapter_cfg);
+                                let shard_candidates: usize = exec_slice
+                                    .iter()
+                                    .filter_map(|idx| candidate_ranges[*idx].map(|(s, e)| e - s))
+                                    .sum();
+                                adapter.reserve_results(shard_candidates);
+                                let mut scratch = PackExecScratch::default();
+                                let report = execute_pack_plan_with_scratch_indices(
+                                    plan,
+                                    pack_bytes,
+                                    paths,
+                                    &pack_decode,
+                                    &mut cache,
+                                    &mut external,
+                                    &mut adapter,
+                                    spill_dir,
+                                    &mut scratch,
+                                    exec_slice,
+                                    candidate_ranges,
+                                )?;
+                                Ok::<_, PackExecError>((shard_idx, report, adapter.take_results()))
+                            }));
+                        }
+
+                        let mut outputs = Vec::with_capacity(handles.len());
+                        for handle in handles {
+                            let joined = handle.join().expect("pack exec worker panicked")?;
+                            outputs.push(joined);
+                        }
+                        Ok(outputs)
+                    },
+                )?;
+
+                let mut outputs: Vec<Option<(PackExecReport, ScannedBlobs)>> =
+                    (0..ranges.len()).map(|_| None).collect();
+                for (shard_idx, report, scanned_shard) in shard_outputs {
+                    outputs[shard_idx] = Some((report, scanned_shard));
+                }
+
+                let mut reports = Vec::with_capacity(outputs.len());
+                let mut scanned_shards = Vec::with_capacity(outputs.len());
+                for output in outputs.into_iter() {
+                    let (report, scanned_shard) = output.expect("missing pack exec shard output");
+                    reports.push(report);
+                    scanned_shards.push(scanned_shard);
+                }
+
+                let merged_report = merge_pack_exec_reports(reports);
+                collect_skipped_candidates(plan, &merged_report.skips, &mut skipped_candidates);
+                pack_exec_reports.push(merged_report);
+
+                let merged_scanned = merge_scanned_blobs(scanned_shards);
+                append_scanned_blobs(&mut scanned, merged_scanned);
+            }
+
+            if !loose.is_empty() {
+                let mut adapter = EngineAdapter::new(engine, config.engine_adapter);
+                adapter.reserve_results(loose.len());
+                let mut external = PackIo::from_parts(
+                    midx,
+                    pack_paths.clone(),
+                    loose_dirs.clone(),
+                    config.pack_io,
+                )
+                .map_err(GitScanError::PackIo)?;
+                let loose_start = Instant::now();
+                scan_loose_candidates(
+                    &loose,
+                    &path_arena,
+                    &mut adapter,
+                    &mut external,
+                    &mut skipped_candidates,
+                )?;
+                stage_nanos.loose_scan = loose_start.elapsed().as_nanos() as u64;
+                append_scanned_blobs(&mut scanned, adapter.take_results());
+            }
+        }
+
+        stage_nanos.pack_exec = pack_exec_start.elapsed().as_nanos() as u64;
+
+        let pack_exec_alloc_after = alloc_stats();
+        alloc_deltas.pack_exec = pack_exec_alloc_after.since(&pack_exec_alloc_before);
+
+        let refs = build_ref_entries(&repo);
+        let skipped_candidate_oids = skipped_candidates.iter().map(|entry| entry.oid).collect();
+
+        let finalize = build_finalize_ops(FinalizeInput {
+            repo_id: config.repo_id,
+            policy_hash: config.policy_hash,
+            start_set_id,
+            refs,
+            scanned_blobs: scanned.blobs,
+            finding_arena: &scanned.finding_arena,
+            skipped_candidate_oids,
+            path_arena: &path_arena,
+        });
+
+        if let Some(store) = persist_store {
+            persist_finalize_output(store, &finalize)?;
+        }
+
+        let perf_stats = super::perf::snapshot();
+        stage_nanos.mapping = perf_stats.mapping_nanos;
+        stage_nanos.scan = perf_stats.scan_nanos;
+
+        return Ok(GitScanResult::Completed(GitScanReport {
+            commit_count: plan.len(),
+            tree_diff_stats: TreeDiffStats::from(intro_stats),
+            spill_stats,
+            mapping_stats,
+            pack_plan_stats,
+            pack_plan_config: pack_plan_cfg,
+            pack_plan_delta_deps_total,
+            pack_plan_delta_deps_max,
+            pack_exec_reports,
+            skipped_candidates,
+            finalize,
+            stage_nanos,
+            perf_stats,
+            alloc_stats: alloc_deltas,
+        }));
+    }
+
     // Commit walk plan.
     let cg = CommitGraphView::open_repo(&repo)?;
+    let plan_start = Instant::now();
     let plan = introduced_by_plan(&repo, &cg, config.commit_walk)?;
+    stage_nanos.commit_plan = plan_start.elapsed().as_nanos() as u64;
 
     // Spill + dedupe (stream candidates during tree diff).
+    // Shared spill directory for tree payloads and pack-exec large blobs.
     let spill_dir = match &config.spill_dir {
         Some(path) => path.clone(),
         None => make_spill_dir()?,
@@ -835,6 +1416,7 @@ pub fn run_git_scan(
         pack_plan_stats.extend(pack_plans.iter().map(|p| p.stats));
         plans.append(&mut pack_plans);
     }
+    let (pack_plan_delta_deps_total, pack_plan_delta_deps_max) = summarize_pack_plan_deps(&plans);
     stage_nanos.pack_plan = pack_plan_start.elapsed().as_nanos() as u64;
 
     // Validate artifacts before decoding packs to avoid scanning during maintenance.
@@ -876,6 +1458,7 @@ pub fn run_git_scan(
             &mut cache,
             &mut external,
             &mut adapter,
+            &spill_dir,
             &mut exec_scratch,
         )?;
         collect_skipped_candidates(plan, &report.skips, &mut skipped_candidates);
@@ -927,6 +1510,9 @@ pub fn run_git_scan(
         spill_stats,
         mapping_stats,
         pack_plan_stats,
+        pack_plan_config: config.pack_plan,
+        pack_plan_delta_deps_total,
+        pack_plan_delta_deps_max,
         pack_exec_reports,
         skipped_candidates,
         finalize,
@@ -949,6 +1535,42 @@ fn make_spill_dir() -> Result<PathBuf, io::Error> {
     ));
     fs::create_dir_all(&path)?;
     Ok(path)
+}
+
+/// Estimate a path arena capacity based on candidate volume.
+///
+/// Uses a bytes-per-candidate heuristic and returns at least `base`,
+/// clamped to `u32::MAX`.
+fn estimate_path_arena_capacity(base: u32, packed: u32, loose: u32) -> u32 {
+    let total = packed as u64 + loose as u64;
+    let est = total
+        .saturating_mul(PATH_BYTES_PER_CANDIDATE_ESTIMATE)
+        .min(u32::MAX as u64) as u32;
+    base.max(est)
+}
+
+/// Estimate a pack cache size from mapped pack bytes.
+///
+/// Uses a fixed fraction of total mapped pack size, clamped to the configured
+/// minimum and an upper safety bound.
+fn estimate_pack_cache_bytes(
+    base: usize,
+    pack_mmaps: &[Option<Mmap>],
+    used_pack_ids: &[u16],
+) -> usize {
+    let total_bytes: u64 = used_pack_ids
+        .iter()
+        .filter_map(|id| pack_mmaps.get(*id as usize).and_then(|m| m.as_ref()))
+        .map(|m| m.len() as u64)
+        .sum();
+
+    if total_bytes == 0 {
+        return base;
+    }
+
+    let target = total_bytes / PACK_CACHE_FRACTION_DENOM;
+    let target = target.min(PACK_CACHE_MAX_BYTES).max(base as u64);
+    target as usize
 }
 
 /// Load the MIDX view for the repository.
@@ -989,6 +1611,21 @@ fn collect_pack_dirs(paths: &GitRepoPaths) -> Vec<PathBuf> {
             continue;
         }
         dirs.push(alternate.join("pack"));
+    }
+    dirs
+}
+
+/// Collect loose object directories, including alternates.
+///
+/// Alternates that resolve to the main objects dir are ignored.
+fn collect_loose_dirs(paths: &GitRepoPaths) -> Vec<PathBuf> {
+    let mut dirs = Vec::with_capacity(1 + paths.alternate_object_dirs.len());
+    dirs.push(paths.objects_dir.clone());
+    for alternate in &paths.alternate_object_dirs {
+        if alternate == &paths.objects_dir {
+            continue;
+        }
+        dirs.push(alternate.clone());
     }
     dirs
 }
@@ -1109,10 +1746,29 @@ fn mmap_pack_files(
         // SAFETY: mapping read-only pack files; the OS keeps the mapping valid
         // even after `file` is dropped.
         let mmap = unsafe { Mmap::map(&file)? };
+        advise_sequential(&file, &mmap);
         out[idx] = Some(mmap);
     }
     Ok(out)
 }
+
+#[cfg(unix)]
+fn advise_sequential(file: &File, reader: &Mmap) {
+    unsafe {
+        #[cfg(target_os = "linux")]
+        let _ = libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+        #[cfg(not(target_os = "linux"))]
+        let _ = file;
+        let _ = libc::madvise(
+            reader.as_ptr() as *mut libc::c_void,
+            reader.len(),
+            libc::MADV_SEQUENTIAL,
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn advise_sequential(_file: &File, _reader: &Mmap) {}
 
 /// Parse pack headers into `PackView`s used for planning.
 ///
@@ -1133,6 +1789,82 @@ fn build_pack_views<'a>(
         }
     }
     Ok(views)
+}
+
+/// Returns total delta dependency count and the maximum deps in any plan.
+fn summarize_pack_plan_deps(plans: &[PackPlan]) -> (u64, u32) {
+    let mut total = 0u64;
+    let mut max = 0u32;
+    for plan in plans {
+        let len = plan.delta_deps.len() as u32;
+        total = total.saturating_add(len as u64);
+        if len > max {
+            max = len;
+        }
+    }
+    (total, max)
+}
+
+/// Returns execution indices in deterministic order for a plan.
+fn build_exec_indices(plan: &PackPlan) -> Vec<usize> {
+    if let Some(order) = plan.exec_order.as_ref() {
+        order.iter().map(|&idx| idx as usize).collect()
+    } else {
+        (0..plan.need_offsets.len()).collect()
+    }
+}
+
+/// Splits a range into `shards` contiguous ranges covering `[0, len)`.
+fn shard_ranges(len: usize, shards: usize) -> Vec<(usize, usize)> {
+    if len == 0 {
+        return Vec::new();
+    }
+    let shards = shards.max(1).min(len);
+    let base = len / shards;
+    let extra = len % shards;
+    let mut out = Vec::with_capacity(shards);
+    let mut start = 0usize;
+    for idx in 0..shards {
+        let mut end = start + base;
+        if idx < extra {
+            end += 1;
+        }
+        out.push((start, end));
+        start = end;
+    }
+    out
+}
+
+/// Merge per-shard results in shard order, rebasing finding spans.
+fn merge_scanned_blobs(mut shards: Vec<ScannedBlobs>) -> ScannedBlobs {
+    let total_blobs: usize = shards.iter().map(|s| s.blobs.len()).sum();
+    let total_findings: usize = shards.iter().map(|s| s.finding_arena.len()).sum();
+
+    let mut merged = ScannedBlobs {
+        blobs: Vec::with_capacity(total_blobs),
+        finding_arena: Vec::with_capacity(total_findings),
+    };
+
+    for shard in shards.drain(..) {
+        let base = merged.finding_arena.len() as u32;
+        merged.finding_arena.extend_from_slice(&shard.finding_arena);
+        for mut blob in shard.blobs {
+            blob.findings.start = blob.findings.start.saturating_add(base);
+            merged.blobs.push(blob);
+        }
+    }
+
+    merged
+}
+
+/// Append scanned blobs while rebasing finding spans.
+fn append_scanned_blobs(dst: &mut ScannedBlobs, mut src: ScannedBlobs) {
+    let base = dst.finding_arena.len() as u32;
+    dst.finding_arena.extend_from_slice(&src.finding_arena);
+    for mut blob in src.blobs.drain(..) {
+        blob.findings.start = blob.findings.start.saturating_add(base);
+        dst.blobs.push(blob);
+    }
 }
 
 /// Load loose candidates and scan blob payloads.
@@ -1332,10 +2064,14 @@ mod tests {
         let snapshot = GitScanMetricsSnapshot {
             stages: GitScanStageNanos {
                 tree_diff: 2_000,
+                commit_plan: 1_000,
+                blob_intro: 0,
                 spill: 3_000,
+                pack_collect: 0,
                 mapping: 4_000,
                 pack_plan: 5_000,
                 pack_exec: 6_000,
+                loose_scan: 0,
                 scan: 8_000,
             },
             perf: crate::git_scan::GitPerfStats {
@@ -1349,6 +2085,30 @@ mod tests {
                 mapping_nanos: 2_500,
                 cache_hits: 0,
                 cache_misses: 0,
+                tree_load_calls: 0,
+                tree_load_bytes: 0,
+                tree_load_nanos: 0,
+                tree_cache_hits: 0,
+                tree_delta_cache_hits: 0,
+                tree_delta_cache_misses: 0,
+                tree_delta_cache_bytes: 0,
+                tree_delta_cache_hit_nanos: 0,
+                tree_delta_cache_miss_nanos: 0,
+                tree_delta_chain_0: 0,
+                tree_delta_chain_1: 0,
+                tree_delta_chain_2_3: 0,
+                tree_delta_chain_4_7: 0,
+                tree_delta_chain_8_plus: 0,
+                tree_spill_hits: 0,
+                tree_object_loads: 0,
+                tree_object_bytes: 0,
+                tree_object_nanos: 0,
+                tree_inflate_bytes: 0,
+                tree_inflate_nanos: 0,
+                tree_delta_apply_bytes: 0,
+                tree_delta_apply_nanos: 0,
+                tree_object_pack: 0,
+                tree_object_loose: 0,
             },
             tree_diff_bytes: 1_000,
             spill_runs: 2,
@@ -1366,14 +2126,50 @@ mod tests {
 
         let expected = "\
 stage.tree_diff.nanos=2000
+stage.commit_plan.nanos=1000
+stage.blob_intro.nanos=0
 stage.spill.nanos=3000
+stage.pack_collect.nanos=0
 stage.mapping.nanos=4000
 stage.pack_plan.nanos=5000
 stage.pack_exec.nanos=6000
+stage.loose_scan.nanos=0
 stage.scan.nanos=8000
 tree_diff.bytes=1000
 tree_diff.bytes_per_sec=500000000
 tree_diff.ns_per_byte=2
+tree_load.calls=0
+tree_load.bytes=0
+tree_load.nanos=0
+tree_load.bytes_per_sec=0
+tree_load.ns_per_byte=0
+tree_cache.hits=0
+tree_delta_cache.hits=0
+tree_delta_cache.misses=0
+tree_delta_cache.bytes=0
+tree_delta_cache.hit_nanos=0
+tree_delta_cache.miss_nanos=0
+tree_delta_chain.0=0
+tree_delta_chain.1=0
+tree_delta_chain.2_3=0
+tree_delta_chain.4_7=0
+tree_delta_chain.8_plus=0
+tree_spill.hits=0
+tree_object.loads=0
+tree_object.bytes=0
+tree_object.nanos=0
+tree_object.bytes_per_sec=0
+tree_object.ns_per_byte=0
+tree_object.pack=0
+tree_object.loose=0
+tree_inflate.bytes=0
+tree_inflate.nanos=0
+tree_inflate.bytes_per_sec=0
+tree_inflate.ns_per_byte=0
+tree_delta_apply.bytes=0
+tree_delta_apply.nanos=0
+tree_delta_apply.bytes_per_sec=0
+tree_delta_apply.ns_per_byte=0
 pack_inflate.bytes=2000
 pack_inflate.nanos=4000
 pack_inflate.bytes_per_sec=500000000

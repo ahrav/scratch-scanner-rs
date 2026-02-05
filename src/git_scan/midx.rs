@@ -54,7 +54,7 @@ const MAX_MIDX_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 /// - `object_count` equals the last value in the fanout table.
 /// - `oid_len` matches the repository object format.
 /// - Base MIDX layers are not supported; only the top-level index is parsed.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct MidxView<'a> {
     format: ObjectFormat,
     pack_count: u32,

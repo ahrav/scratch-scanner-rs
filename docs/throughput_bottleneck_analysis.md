@@ -19,10 +19,70 @@ Baseline repository: `../linux` (local checkout).
 
 | Tool | Result | Notes |
 |------|--------|-------|
-| Kingfisher | ~4 minutes (assumed) | Baseline provided by user guidance |
-| `git_scan` | Failed | `tree bytes budget exceeded` (pre-fix baseline) |
+| Kingfisher | Scan duration 6m 5s (real 367.20s) | 3,140,648 blobs, 122.49 GiB, findings=6 (`--no-update-check --no-validate`) |
+| `git_scan` (ODB-blob) | **Partial** (real 981.89s) | 3,044,420 blobs, findings=280,073, skipped=77 (`--mode=odb-blob --debug`) |
 
-Hardware + OS: dev machine (not recorded; baseline assumed).
+Hardware + OS: dev machine (local; not formally recorded).
+
+Stage timing (ODB-blob run): `stage.blob_intro` ≈ 270.6s, `stage.pack_exec` ≈ 703.9s.
+
+### Cache Reject Telemetry (P0)
+
+Telemetry fields (debug output):
+- `cache_reject_bytes_total`
+- `cache_reject_bytes_max`
+- `cache_reject_histogram` (log2 bucket counts, bucket 0 covers 0-1 bytes)
+- `cache_reject_histogram_top` (top-N buckets by count)
+
+Linux ODB-blob run (2026-02-05):
+- `cache_insert_rejects`: 2,731,901
+- `cache_reject_bytes_total`: 411,162,204,727 (~383.0 GiB)
+- `cache_reject_bytes_max`: 7,568,214 (~7.22 MiB)
+- Histogram (log2 buckets):
+  - 64–128 KiB: 1,623,892 (59.44%)
+  - 128–256 KiB: 829,921 (30.38%)
+  - 256–512 KiB: 231,403 (8.47%)
+  - 512 KiB–1 MiB: 45,376 (1.66%)
+  - 1–2 MiB: 1,094 (0.04%)
+  - 2–4 MiB: 90
+  - 4–8 MiB: 125
+- Percentile buckets (lower bound shown):
+  - P50: 64–128 KiB
+  - P90: 256–512 KiB
+  - P95: 256–512 KiB
+  - P99: 512 KiB–1 MiB
+
+Implication: a second tier sized at 256–512 KiB would capture ~98% of rejects.
+
+Tiered cache run (2026-02-05):
+- `cache_insert_rejects`: 43,985 (down from 2,731,901)
+- `cache_reject_bytes_total`: 31,508,543,889 (~29.3 GiB)
+- `cache_reject_bytes_max`: 7,568,214 (~7.22 MiB)
+- Histogram (log2 buckets):
+  - 512 KiB–1 MiB: 42,698 (97.07%)
+  - 1–2 MiB: 1,078 (2.45%)
+  - 2–4 MiB: 85
+  - 4–8 MiB: 124
+- Percentile buckets:
+  - P50: 512 KiB–1 MiB
+  - P90: 512 KiB–1 MiB
+  - P95: 512 KiB–1 MiB
+  - P99: 1–2 MiB
+
+Pack exec impact (tiered vs baseline):
+- `fallback_base_decodes`: 1,539,370 → 1,289,496 (~16% drop)
+- `pack_exec.nanos`: 750.5s → 614.9s (~18% drop)
+- `pack_inflate.bytes_per_sec`: 59.0 MiB/s → 89.9 MiB/s
+
+Parallel pack exec run (2026-02-05, `--pack-exec-workers=12`, timed):
+- Wall time (`/usr/bin/time -p`): real 388.91s (user 1045.97s, sys 25.98s)
+- `pack_exec.nanos`: 105.5s (wall)
+- `blob_intro.nanos`: 275.9s (wall)
+- `fallback_base_decodes`: 1,289,520
+- `cache_insert_rejects`: 43,985
+- `scan.nanos`: 593.3s (sum across threads; not wall time)
+
+Result: still slower than Kingfisher baseline (240.00s). Blob introduction and scan remain the dominant wall-time contributors.
 
 ---
 
@@ -65,15 +125,21 @@ Notes:
 - `cycles_per_byte` is derived from wall-clock time when `GIT_SCAN_CPU_HZ` is set.
 - Allocation counters require the counting allocator (tests install it by default).
 - `mapping.nanos` measures total time spent in mapping-bridge emits.
+- ODB-blob mode emits additional stage lines
+  (`stage.blob_intro.nanos`, `stage.pack_collect.nanos`, `stage.loose_scan.nanos`)
+  and uses `stage.spill.nanos` when the spill fallback is engaged.
 
 Example:
 
 ```text
 stage.tree_diff.nanos=2000
+stage.blob_intro.nanos=0
 stage.spill.nanos=3000
+stage.pack_collect.nanos=0
 stage.mapping.nanos=4000
 stage.pack_plan.nanos=5000
 stage.pack_exec.nanos=6000
+stage.loose_scan.nanos=0
 stage.scan.nanos=8000
 tree_diff.bytes=1000
 tree_diff.bytes_per_sec=500000000
@@ -473,3 +539,14 @@ Benchmarks implemented and validated:
 | Rule count cliff | Both | Automaton explosion | Consolidate/tier rules | 2-3× |
 
 **Key insight:** The 98% gap from simple rules to gitleaks is not a single bottleneck—it's two distinct problems requiring different solutions depending on workload characteristics.
+
+---
+
+## Final Comparison (Linux Full History)
+
+Baseline repository: `../linux` (local checkout).
+
+| Tool | Wall time | Blobs | Blobs/sec | Bytes scanned | Bytes/sec | Status / Notes |
+|------|-----------|-------|-----------|--------------|-----------|----------------|
+| Kingfisher | 367.20s | 3,140,648 | 8,553 | 122.49 GiB | 0.3336 GiB/s (341.6 MiB/s) | Complete |
+| `git_scan` (ODB-blob) | 981.89s | 3,044,420 | 3,101 | n/a (git-perf disabled) | n/a | **Partial** (skipped=77) |
