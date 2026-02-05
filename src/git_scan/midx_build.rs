@@ -8,7 +8,8 @@
 //! 1. Enumerate `.idx` files across pack directories in deterministic order
 //! 2. Parse each with `IdxView` (zero-copy)
 //! 3. K-way merge over pre-sorted OID streams (O(N log P) where P = pack count)
-//! 4. Generate MIDX v1 format bytes
+//! 4. Build OID fanout with count + prefix-sum (O(N + 256))
+//! 5. Generate MIDX v1 format bytes
 //!
 //! # Memory Strategy
 //! - Below `max_midx_bytes_in_ram`: build in `Vec<u8>`, return `BytesView::Owned`
@@ -167,7 +168,7 @@ const LARGE_OFFSET_FLAG: u32 = 0x8000_0000;
 /// Returns `MidxBuildError` if:
 /// - No packs are found
 /// - Too many packs or objects
-/// - MIDX would exceed size limits
+/// - MIDX would exceed size limits (heuristic precheck + final serialized cap)
 /// - Any `.idx` file fails to parse
 pub fn build_midx_bytes(
     repo: &GitRepoPaths,
@@ -239,8 +240,19 @@ pub fn build_midx_bytes(
         });
     }
 
-    // Step 4: Build MIDX using k-way merge
+    // Step 4: Build MIDX using k-way merge.
+    //
+    // The estimate above is only heuristic: pack-name bytes and LOFF usage can
+    // move the final size in either direction. Enforce the configured limit
+    // against the serialized byte length before returning.
     let midx_bytes = build_midx_in_memory(&views, format, object_count)?;
+    let actual_size = midx_bytes.len() as u64;
+    if actual_size > limits.max_midx_total_bytes {
+        return Err(MidxBuildError::ArtifactsTooLarge {
+            size: actual_size,
+            limit: limits.max_midx_total_bytes,
+        });
+    }
 
     // Step 5: Validate output
     MidxView::parse(&midx_bytes, format)
@@ -344,8 +356,10 @@ fn pack_name_from_idx_path(path: &Path) -> Vec<u8> {
 
 /// Estimates MIDX output size in bytes.
 ///
-/// This is a heuristic used for limit checks; it may overestimate, especially
-/// for pack-name storage and large-offset frequency.
+/// This is a heuristic used as a fast precheck. The final limit enforcement is
+/// done against the actual serialized byte length from `build_midx_in_memory`.
+/// The estimate may over- or under-shoot, especially for pack-name storage and
+/// large-offset frequency.
 fn estimate_midx_size(pack_count: usize, object_count: usize, oid_len: usize) -> u64 {
     // Header + chunk table
     let header = MIDX_HEADER_SIZE + (5 + 1) * CHUNK_ENTRY_SIZE; // 5 chunks + sentinel
@@ -376,6 +390,13 @@ fn estimate_midx_size(pack_count: usize, object_count: usize, oid_len: usize) ->
 /// OIDs are emitted in sorted order; duplicate OIDs are de-duplicated by
 /// keeping the lowest pack id. Offsets larger than 2^31 are emitted via
 /// the LOFF indirection table.
+///
+/// Fanout construction is split into two phases:
+/// 1. Count emitted objects per first-byte bucket during merge
+/// 2. Convert counts to cumulative fanout with a single prefix-sum pass
+///
+/// This preserves exact fanout semantics while avoiding per-object trailing
+/// writes across all 256 fanout entries.
 ///
 /// `total_objects` is an upper bound used for capacity planning; the final
 /// output may contain fewer objects due to duplicate OIDs.
@@ -449,11 +470,9 @@ fn build_midx_in_memory(
                 ooff.extend_from_slice(&(offset as u32).to_be_bytes());
             }
 
-            // Update fanout
+            // Track per-bucket counts; convert to cumulative fanout after merge.
             let first_byte = entry.oid[0] as usize;
-            for slot in &mut fanout[first_byte..] {
-                *slot = output_idx + 1;
-            }
+            fanout[first_byte] += 1;
 
             prev_oid = Some(unsafe {
                 // SAFETY: `oidl` pre-allocates `total_objects * oid_len`, so
@@ -487,6 +506,13 @@ fn build_midx_in_memory(
     }
 
     let _object_count = output_idx;
+
+    // Convert per-bucket counts to cumulative fanout semantics.
+    let mut running = 0u32;
+    for slot in &mut fanout {
+        running += *slot;
+        *slot = running;
+    }
 
     // Build OIDF chunk (fanout table)
     let mut oidf = Vec::with_capacity(FANOUT_SIZE);
@@ -600,6 +626,94 @@ impl Ord for MergeEntry<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git_scan::repo::RepoKind;
+    use tempfile::tempdir;
+
+    /// Helper to build minimal pack index v2 bytes for MIDX merge tests.
+    struct TestIdxBuilder {
+        objects: Vec<([u8; 20], u64)>,
+    }
+
+    impl TestIdxBuilder {
+        fn new() -> Self {
+            Self {
+                objects: Vec::new(),
+            }
+        }
+
+        fn add_object(&mut self, oid: [u8; 20], offset: u64) {
+            self.objects.push((oid, offset));
+        }
+
+        fn build(&self) -> Vec<u8> {
+            const IDX_MAGIC: [u8; 4] = [0xff, b't', b'O', b'c'];
+            const IDX_VERSION: u32 = 2;
+
+            let mut objects = self.objects.clone();
+            objects.sort_by(|a, b| a.0.cmp(&b.0));
+
+            let mut fanout = vec![0u8; FANOUT_SIZE];
+            let mut counts = [0u32; FANOUT_ENTRIES];
+            for (oid, _) in &objects {
+                counts[oid[0] as usize] += 1;
+            }
+            let mut running = 0u32;
+            for (i, count) in counts.iter().enumerate() {
+                running += count;
+                let off = i * 4;
+                fanout[off..off + 4].copy_from_slice(&running.to_be_bytes());
+            }
+
+            let mut oid_table = Vec::with_capacity(objects.len() * 20);
+            let mut offset_table = Vec::with_capacity(objects.len() * 4);
+            for (oid, offset) in &objects {
+                oid_table.extend_from_slice(oid);
+                offset_table.extend_from_slice(&(*offset as u32).to_be_bytes());
+            }
+
+            let crc_table = vec![0u8; objects.len() * 4];
+            let checksums = vec![0u8; 40]; // pack checksum + idx checksum
+
+            let mut out = Vec::new();
+            out.extend_from_slice(&IDX_MAGIC);
+            out.extend_from_slice(&IDX_VERSION.to_be_bytes());
+            out.extend_from_slice(&fanout);
+            out.extend_from_slice(&oid_table);
+            out.extend_from_slice(&crc_table);
+            out.extend_from_slice(&offset_table);
+            out.extend_from_slice(&checksums);
+            out
+        }
+    }
+
+    fn test_oid(first: u8, second: u8) -> [u8; 20] {
+        let mut oid = [0u8; 20];
+        oid[0] = first;
+        oid[1] = second;
+        oid[19] = first ^ second;
+        oid
+    }
+
+    fn test_repo_with_pack_file(pack_basename: &str) -> (tempfile::TempDir, GitRepoPaths, PathBuf) {
+        let temp = tempdir().unwrap();
+        let git_dir = temp.path().join(".git");
+        let objects_dir = git_dir.join("objects");
+        let pack_dir = objects_dir.join("pack");
+        fs::create_dir_all(&pack_dir).unwrap();
+
+        let repo = GitRepoPaths {
+            kind: RepoKind::Worktree,
+            worktree_root: Some(temp.path().to_path_buf()),
+            git_dir: git_dir.clone(),
+            common_dir: git_dir,
+            objects_dir,
+            pack_dir: pack_dir.clone(),
+            alternate_object_dirs: Vec::new(),
+        };
+
+        let idx_path = pack_dir.join(format!("{pack_basename}.idx"));
+        (temp, repo, idx_path)
+    }
 
     #[test]
     fn estimate_midx_size_reasonable() {
@@ -634,5 +748,125 @@ mod tests {
         assert!(!is_idx_file(OsStr::new("pack-abc.pack")));
         assert!(!is_idx_file(OsStr::new("pack-abc")));
         assert!(!is_idx_file(OsStr::new(".idx")));
+    }
+
+    #[test]
+    fn build_midx_fanout_varying_first_byte_distribution() {
+        let mut idx_builder = TestIdxBuilder::new();
+        idx_builder.add_object(test_oid(0x00, 0x01), 100);
+        idx_builder.add_object(test_oid(0x00, 0x02), 101);
+        idx_builder.add_object(test_oid(0x10, 0x00), 102);
+        idx_builder.add_object(test_oid(0xfe, 0x10), 103);
+        idx_builder.add_object(test_oid(0xfe, 0x20), 104);
+        idx_builder.add_object(test_oid(0xfe, 0x30), 105);
+
+        let idx_bytes = idx_builder.build();
+        let idx_view = IdxView::parse(&idx_bytes, ObjectFormat::Sha1).unwrap();
+        let total_objects = idx_view.object_count() as usize;
+
+        let views = vec![(0u16, b"pack-a.pack".to_vec(), idx_view)];
+        let midx_bytes = build_midx_in_memory(&views, ObjectFormat::Sha1, total_objects).unwrap();
+        let midx = MidxView::parse(&midx_bytes, ObjectFormat::Sha1).unwrap();
+
+        assert_eq!(midx.object_count(), 6);
+        assert_eq!(midx.fanout(0x00), 2);
+        assert_eq!(midx.fanout(0x0f), 2);
+        assert_eq!(midx.fanout(0x10), 3);
+        assert_eq!(midx.fanout(0xfd), 3);
+        assert_eq!(midx.fanout(0xfe), 6);
+        assert_eq!(midx.fanout(0xff), 6);
+    }
+
+    #[test]
+    fn build_midx_fanout_and_dedup_with_duplicate_oids() {
+        let shared_oid = test_oid(0x10, 0x55);
+
+        let mut pack0 = TestIdxBuilder::new();
+        pack0.add_object(shared_oid, 111);
+        pack0.add_object(test_oid(0x80, 0x01), 222);
+
+        let mut pack1 = TestIdxBuilder::new();
+        pack1.add_object(shared_oid, 333);
+        pack1.add_object(test_oid(0xff, 0x02), 444);
+
+        let pack0_bytes = pack0.build();
+        let pack1_bytes = pack1.build();
+        let pack0_view = IdxView::parse(&pack0_bytes, ObjectFormat::Sha1).unwrap();
+        let pack1_view = IdxView::parse(&pack1_bytes, ObjectFormat::Sha1).unwrap();
+        let total_objects = (pack0_view.object_count() + pack1_view.object_count()) as usize;
+
+        let views = vec![
+            (0u16, b"pack-0.pack".to_vec(), pack0_view),
+            (1u16, b"pack-1.pack".to_vec(), pack1_view),
+        ];
+        let midx_bytes = build_midx_in_memory(&views, ObjectFormat::Sha1, total_objects).unwrap();
+        let midx = MidxView::parse(&midx_bytes, ObjectFormat::Sha1).unwrap();
+
+        assert_eq!(midx.object_count(), 3);
+        assert_eq!(midx.fanout(0x0f), 0);
+        assert_eq!(midx.fanout(0x10), 1);
+        assert_eq!(midx.fanout(0x7f), 1);
+        assert_eq!(midx.fanout(0x80), 2);
+        assert_eq!(midx.fanout(0xfe), 2);
+        assert_eq!(midx.fanout(0xff), 3);
+
+        assert_eq!(midx.oid_at(0), &shared_oid);
+        assert_eq!(midx.offset_at(0).unwrap(), (0, 111));
+    }
+
+    #[test]
+    fn build_midx_bytes_checks_actual_serialized_size_cap() {
+        let long_name = format!("pack-{}", "a".repeat(180));
+        let (_temp, repo, idx_path) = test_repo_with_pack_file(&long_name);
+
+        let mut idx_builder = TestIdxBuilder::new();
+        idx_builder.add_object(test_oid(0x42, 0x01), 123);
+        fs::write(&idx_path, idx_builder.build()).unwrap();
+
+        let mut limits = MidxBuildLimits {
+            max_midx_total_bytes: u64::MAX,
+            ..MidxBuildLimits::default()
+        };
+        let baseline = build_midx_bytes(&repo, ObjectFormat::Sha1, &limits).unwrap();
+        let actual_size = baseline.len() as u64;
+
+        let estimated_size = estimate_midx_size(1, 1, ObjectFormat::Sha1.oid_len() as usize);
+        assert!(
+            estimated_size < actual_size,
+            "test requires heuristic underestimation; estimated={estimated_size}, actual={actual_size}"
+        );
+
+        let hard_limit = actual_size - 1;
+        assert!(hard_limit >= estimated_size);
+        limits.max_midx_total_bytes = hard_limit;
+
+        let err = build_midx_bytes(&repo, ObjectFormat::Sha1, &limits).unwrap_err();
+        assert!(matches!(
+            err,
+            MidxBuildError::ArtifactsTooLarge { size, limit }
+            if size == actual_size && limit == hard_limit
+        ));
+    }
+
+    #[test]
+    fn build_midx_bytes_allows_exact_size_limit() {
+        let long_name = format!("pack-{}", "b".repeat(180));
+        let (_temp, repo, idx_path) = test_repo_with_pack_file(&long_name);
+
+        let mut idx_builder = TestIdxBuilder::new();
+        idx_builder.add_object(test_oid(0x43, 0x02), 456);
+        fs::write(&idx_path, idx_builder.build()).unwrap();
+
+        let mut limits = MidxBuildLimits {
+            max_midx_total_bytes: u64::MAX,
+            ..MidxBuildLimits::default()
+        };
+        let baseline = build_midx_bytes(&repo, ObjectFormat::Sha1, &limits).unwrap();
+        let exact_size_limit = baseline.len() as u64;
+
+        limits.max_midx_total_bytes = exact_size_limit;
+        let bytes = build_midx_bytes(&repo, ObjectFormat::Sha1, &limits).unwrap();
+
+        assert_eq!(bytes.len() as u64, exact_size_limit);
     }
 }

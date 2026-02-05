@@ -1,4 +1,15 @@
-//! Integration test for commit-graph range walking against a real `git` repo.
+//! Integration tests for commit-graph range walking against a real `git` repo.
+//!
+//! Each test creates a temporary repository with `git` CLI commands, builds
+//! in-memory artifacts (MIDX + commit graph), and verifies that `CommitPlanIter`
+//! produces the expected commit ranges.
+//!
+//! # Scenarios
+//! - **Linear with watermark**: walks only commits between watermark and tip.
+//! - **Missing watermark**: falls back to scanning full history.
+//! - **Non-ancestor watermark**: detects divergent histories and scans full history.
+//!
+//! Requires `git` on `PATH`; tests skip gracefully if unavailable.
 
 use std::fs;
 use std::path::Path;

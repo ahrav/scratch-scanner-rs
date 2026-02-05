@@ -12,9 +12,9 @@ use regex::bytes::Regex;
 use tempfile::TempDir;
 
 use scanner_rs::git_scan::{
-    run_git_scan, FinalizeOutcome, GitScanConfig, GitScanError, GitScanMode, GitScanResult,
-    InMemoryPersistenceStore, MappingCandidateKind, NeverSeenStore, OidBytes, RefWatermarkStore,
-    RepoOpenError, SpillError, StartSetConfig, StartSetResolver,
+    run_git_scan, FinalizeOutcome, GitScanConfig, GitScanError, GitScanMode, GitScanReport,
+    GitScanResult, InMemoryPersistenceStore, MappingCandidateKind, NeverSeenStore, OidBytes,
+    RefWatermarkStore, RepoOpenError, SpillError, StartSetConfig, StartSetResolver, WriteOp,
 };
 use scanner_rs::{demo_tuning, AnchorPolicy, Engine, Gate, RuleSpec, TransformConfig, TransformId};
 use scanner_rs::{TransformMode, ValidatorKind};
@@ -198,6 +198,36 @@ fn run_scan_with_config(
     )
 }
 
+fn assert_write_ops_equal(left: &[WriteOp], right: &[WriteOp]) {
+    assert_eq!(left.len(), right.len(), "write op length mismatch");
+    for (idx, (lhs, rhs)) in left.iter().zip(right.iter()).enumerate() {
+        assert_eq!(lhs.key, rhs.key, "write op key mismatch at index {idx}");
+        assert_eq!(
+            lhs.value, rhs.value,
+            "write op value mismatch at index {idx}"
+        );
+    }
+}
+
+fn assert_scan_outputs_equal(left: &GitScanReport, right: &GitScanReport) {
+    assert_eq!(left.skipped_candidates, right.skipped_candidates);
+    assert_eq!(left.finalize.outcome, right.finalize.outcome);
+    assert_eq!(
+        left.finalize.stats.unique_blobs,
+        right.finalize.stats.unique_blobs
+    );
+    assert_eq!(
+        left.finalize.stats.total_findings,
+        right.finalize.stats.total_findings
+    );
+    assert_eq!(
+        left.finalize.stats.findings_deduped,
+        right.finalize.stats.findings_deduped
+    );
+    assert_write_ops_equal(&left.finalize.data_ops, &right.finalize.data_ops);
+    assert_write_ops_equal(&left.finalize.watermark_ops, &right.finalize.watermark_ops);
+}
+
 #[test]
 fn loose_only_candidate_scans_complete() {
     if !git_available() {
@@ -273,6 +303,52 @@ fn packed_and_loose_candidates_scan_complete() {
     assert_eq!(report.finalize.outcome, FinalizeOutcome::Complete);
     assert!(report.skipped_candidates.is_empty());
     assert!(report.finalize.stats.total_findings >= 2);
+}
+
+#[test]
+fn diff_history_pack_exec_workers_preserve_deterministic_output() {
+    if !git_available() {
+        eprintln!("git not available; skipping diff-history worker test");
+        return;
+    }
+
+    let tmp = init_repo();
+    let payloads = [
+        "TOK_ABCDEFGH\n",
+        "TOK_IJKLMNOP\n",
+        "TOK_QRSTUVWX\n",
+        "TOK_YZABCDEF\n",
+        "TOK_GHIJKLMN\n",
+        "TOK_OPQRSTUV\n",
+        "TOK_WXYZ1234\n",
+        "TOK_5678ABCD\n",
+    ];
+    for (idx, payload) in payloads.iter().enumerate() {
+        let name = format!("secret-{idx}.txt");
+        let msg = format!("c{idx}");
+        commit_file(tmp.path(), &name, payload, &msg);
+    }
+    ensure_artifacts(tmp.path());
+
+    let mut serial_cfg = base_config();
+    serial_cfg.scan_mode = GitScanMode::DiffHistory;
+    serial_cfg.pack_exec_workers = 1;
+
+    let mut parallel_cfg = serial_cfg.clone();
+    parallel_cfg.pack_exec_workers = 4;
+
+    let GitScanResult(serial_report) = run_scan_with_config(tmp.path(), None, serial_cfg).unwrap();
+    let GitScanResult(parallel_report) =
+        run_scan_with_config(tmp.path(), None, parallel_cfg).unwrap();
+
+    assert_eq!(serial_report.finalize.outcome, FinalizeOutcome::Complete);
+    assert_eq!(parallel_report.finalize.outcome, FinalizeOutcome::Complete);
+    assert!(
+        !serial_report.pack_exec_reports.is_empty(),
+        "expected packed candidates in diff-history test fixture"
+    );
+
+    assert_scan_outputs_equal(&serial_report, &parallel_report);
 }
 
 // NOTE: `missing_loose_object_yields_partial` was removed because the
