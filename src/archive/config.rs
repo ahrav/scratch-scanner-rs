@@ -5,7 +5,7 @@
 //! - Archives are treated as hostile input: sizes, counts, and paths are untrusted.
 //!
 //! # Design Notes
-//! - Defaults are safety-first: archive scanning starts disabled.
+//! - Defaults are safety-first: archive scanning is enabled by default.
 //! - Limits are shared across execution modes to keep behavior consistent.
 
 use std::fmt;
@@ -165,7 +165,7 @@ impl fmt::Display for ArchiveConfigError {
 impl Default for ArchiveConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
 
             max_archive_depth: 3,
             max_entries_per_archive: 4096,
@@ -252,7 +252,7 @@ mod tests {
     #[test]
     fn defaults_are_safe_and_sane() {
         let cfg = ArchiveConfig::default();
-        assert!(!cfg.enabled);
+        assert!(cfg.enabled);
         cfg.validate().unwrap();
     }
 

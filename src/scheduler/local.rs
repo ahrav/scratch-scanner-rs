@@ -2952,7 +2952,8 @@ mod tests {
         let size = fs::metadata(&path).unwrap().len();
 
         let source = VecFileSource::new(vec![LocalFile { path, size }]);
-        let cfg = small_config();
+        let mut cfg = small_config();
+        cfg.archive.enabled = false;
 
         let report = scan_local(engine, source, cfg, sink.clone());
 
