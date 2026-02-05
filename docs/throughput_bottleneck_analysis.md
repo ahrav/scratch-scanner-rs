@@ -13,6 +13,33 @@ The 98% throughput drop from simple rules to full gitleaks is **workload-depende
 
 ---
 
+## Git Scan Instrumentation (Phase 10)
+
+Git scanning exposes lightweight counters when built with `--features git-perf`.
+Use them to compute the metrics in the hardening plan:
+
+- **Pack decode ceiling**: `pack_inflate_bytes / pack_inflate_nanos`
+- **Delta apply cost**: `delta_apply_bytes / delta_apply_nanos`
+- **Scanner ceiling**: `scan_bytes / scan_nanos`
+- **Mapping cost**: `mapping_nanos / total_nanos` and `mapping_calls`
+- **Cache hit rate**: `cache_hits / (cache_hits + cache_misses)`
+
+### Usage
+
+```rust
+use scanner_rs::git_scan::{git_perf_snapshot, reset_git_perf};
+
+reset_git_perf();
+// run git scan pipeline
+let stats = git_perf_snapshot();
+```
+
+For allocation checks, enable the debug allocation guard via
+`git_scan::set_alloc_guard_enabled(true)` in debug builds and use the
+counting allocator when running perf tests.
+
+---
+
 ## Benchmark Results Summary
 
 ### Layer-by-Layer Throughput
@@ -193,12 +220,12 @@ After:  anchor = "sk_live_" (Stripe live secret key prefix)
 // After:  anchor hit → cheap check → regex only if confirmed
 
 fn validate_candidate(window: &[u8], rule: &Rule) -> bool {
-    // Phase 1: Cheap seed confirmation
+    // Seed confirmation: cheap format hint
     if !has_required_format_hint(window, rule) {
         return false;  // Skip expensive regex
     }
 
-    // Phase 2: Full regex (only if phase 1 passes)
+    // Full regex (only if seed confirmation passes)
     rule.regex.is_match(window)
 }
 ```

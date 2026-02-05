@@ -69,6 +69,112 @@ Run diagnostic tests to verify: `cargo test --test diagnostic -- --ignored --noc
 
 ---
 
+## Git Tree Loading Budgets
+
+Git tree diffing has its own bounded memory envelope:
+
+- **Tree bytes budget**: `TreeDiffLimits.max_tree_bytes_per_job` caps the total
+  decompressed tree payloads loaded during a repo job.
+- **Pack access**: pack files are memory-mapped on demand and shared across
+  tree loads as read-only slices; no pack data is copied unless inflated.
+- **Inflate buffers**: tree payloads and delta instructions are inflated into
+  bounded buffers capped by the tree bytes budget (plus a small header slack
+  for loose objects).
+- **Candidate storage**: candidate buffer and path arena sizes are explicitly
+  bounded by `TreeDiffLimits.max_candidates` and `max_path_arena_bytes`. The
+  runner streams candidates directly into the spill/dedupe sink to avoid
+  buffering the entire plan in memory; `CandidateBuffer` uses a capped
+  initial capacity and can be cleared between diffs when used.
+- **Tree cache sizing**: tree payload cache uses fixed-size slots (4 KiB)
+  with 4-way sets; total cache bytes are rounded down to a power-of-two
+  set count. Entries larger than a slot are not cached.
+
+These limits make Git tree traversal deterministic and DoS-resistant while
+keeping blob data out of memory during diffing.
+
+## Git Spill + Dedupe Budgets
+
+Spill/dedupe keeps candidate metadata in SoA tables sized to the spill chunk
+limit. `WorkItems` allocates once up to `SpillLimits.max_chunk_candidates` and
+stores:
+
+- `oid_table`: one OID per candidate (20 or 32 bytes each)
+- `ctx_table`: one `CandidateContext` per candidate (commit/parent/kind/flags + path ref)
+- Index/attribute arrays: `oid_idx`, `ctx_idx`, `path_ref`, `flags`, `pack_id`, `offset`
+- Sorting scratch: `order` + `scratch` (`u32` each)
+
+Path bytes are stored separately in the chunk `ByteArena` and bounded by
+`SpillLimits.max_chunk_path_bytes`, so total spill working set remains linear
+in candidate count plus bounded path arena growth.
+
+Seen filtering uses a per-batch arena capped by `SpillLimits.seen_batch_max_path_bytes`
+and batches up to `SpillLimits.seen_batch_max_oids` OIDs before issuing a
+seen-store query. Batches are flushed on either limit to keep memory bounded.
+
+## Git Mapping Budgets
+
+The mapping bridge re-interns candidate paths into a long-lived arena and
+collects pack/loose candidates for downstream planning:
+
+- **Path arena**: bounded by `MappingBridgeConfig.path_arena_capacity`.
+- **Candidate caps**: `MappingBridgeConfig.max_packed_candidates` and
+  `MappingBridgeConfig.max_loose_candidates` bound the in-memory vectors.
+- **Failure mode**: exceeding either cap returns
+  `SpillError::MappingCandidateLimitExceeded` and aborts the run before
+  watermark advancement.
+
+## Git Pack Planning Budgets
+
+Pack planning builds per-pack `PackPlan` buffers sized to the candidate set
+and the delta-base closure:
+
+- Candidate list: one `PackCandidate` per packed blob.
+- Candidate offsets: one `CandidateAtOffset` per candidate (sorted by offset).
+- Need offsets: unique `u64` offsets for candidates plus pack-local bases,
+  expanded up to `PackPlanConfig.max_delta_depth` and capped by
+  `PackPlanConfig.max_worklist_entries`.
+- Delta deps: one `DeltaDep` per delta entry in `need_offsets` (records
+  internal base offsets or external base OIDs).
+- Entry header cache: one cached `ParsedEntry` per offset in `need_offsets`
+  during planning, bounded by the same worklist cap.
+- Base lookups: `PackPlanConfig.max_base_lookups` bounds REF delta
+  resolver calls to prevent unbounded MIDX lookups.
+- Exec order: optional `Vec<u32>` of indices into `need_offsets` when forward
+  dependencies exist.
+- Clusters: ranges over `need_offsets` split when gaps exceed
+  `CLUSTER_GAP_BYTES`.
+
+Memory is linear in `candidates.len()` + `need_offsets.len()` with explicit
+caps on closure expansion and header parsing.
+
+## Git Pack Decode Budgets
+
+Pack decode uses bounded buffers and a fixed-size cache:
+
+- **Inflate buffers**: zlib output is capped by `PackDecodeLimits.max_object_bytes`
+  for full objects and `PackDecodeLimits.max_delta_bytes` for delta payloads.
+- **Header parsing**: entry headers are bounded by
+  `PackDecodeLimits.max_header_bytes`.
+- **Pack cache**: `PackCache` stores decoded objects in fixed-size slots
+  (default 64 KiB, 4-way set associative). Entries larger than a slot are
+  not cached.
+
+These limits keep pack decoding deterministic and bound memory to the
+configured cache capacity plus temporary inflate buffers.
+
+## Git Scan Hot-Loop Allocation Guard
+
+Hot-loop allocations are prohibited after warmup in pack execution and
+engine scanning:
+
+- **Debug guard**: `git_scan::set_alloc_guard_enabled(true)` enables a
+  debug-only `AllocGuard` around pack exec and engine adapter scan paths.
+- **Findings arena**: per-blob findings are stored in a shared arena and
+  referenced by spans (`FindingSpan`), avoiding per-blob `Vec` allocations.
+
+Use the allocation guard in debug tests with the counting allocator to
+verify no heap activity after warmup.
+
 ## Single-Threaded Pipeline Memory Model
 
 > **Note**: The diagrams below describe the single-threaded `Pipeline` API, which uses

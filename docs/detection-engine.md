@@ -1,6 +1,6 @@
 # Detection Engine Flow
 
-Multi-phase pattern matching flow within `Engine::scan_chunk_into()`.
+Multi-stage pattern matching flow within `Engine::scan_chunk_into()`.
 
 ```mermaid
 flowchart TB
@@ -8,26 +8,26 @@ flowchart TB
         Chunk["Chunk Data<br/>(raw bytes)"]
     end
 
-    subgraph Phase1["Phase 1: Anchor Scan"]
+    subgraph AnchorScan["Anchor Scan"]
         AC["AhoCorasick<br/>find_overlapping_iter()"]
         Raw["Raw Anchors"]
         U16LE["UTF-16LE Anchors"]
         U16BE["UTF-16BE Anchors"]
     end
 
-    subgraph Phase2["Phase 2: Window Building"]
+    subgraph WindowBuild["Window Building"]
         HitAcc["HitAccPool<br/>per (rule, variant)"]
         Merge["merge_ranges_with_gap_sorted()<br/>gap=64"]
         Coalesce["coalesce_under_pressure_sorted()<br/>max_windows=16"]
     end
 
-    subgraph Phase3["Phase 3: Two-Phase Validation"]
+    subgraph SeedConfirm["Seed Confirmation + Expansion"]
         SeedWin["Seed Window<br/>(seed_radius)"]
         Confirm["confirm_any check<br/>memmem search"]
         Expand["Expand to full_radius"]
     end
 
-    subgraph Phase4["Phase 4: Regex Confirmation"]
+    subgraph RegexConfirm["Regex Confirmation"]
         MustContain["must_contain check<br/>(optional)"]
         ConfirmAll["confirm_all check<br/>(optional)"]
         Regex["rule.re.find_iter()"]
@@ -53,11 +53,11 @@ flowchart TB
     Coalesce --> |"if two_phase"| SeedWin
     SeedWin --> Confirm
     Confirm --> |"if confirmed"| Expand
-    Expand --> Phase4
+    Expand --> RegexConfirm
 
-    Coalesce --> |"if !two_phase"| Phase4
+    Coalesce --> |"if !two_phase"| RegexConfirm
 
-    Phase4 --> MustContain
+    RegexConfirm --> MustContain
     MustContain --> ConfirmAll
     ConfirmAll --> Regex
     Regex --> |"Raw variant"| FindingRec
@@ -66,16 +66,16 @@ flowchart TB
     UTF16Dec --> FindingRec
 
     style Input fill:#e3f2fd
-    style Phase1 fill:#fff3e0
-    style Phase2 fill:#e8f5e9
-    style Phase3 fill:#f3e5f5
-    style Phase4 fill:#ffebee
+    style AnchorScan fill:#fff3e0
+    style WindowBuild fill:#e8f5e9
+    style SeedConfirm fill:#f3e5f5
+    style RegexConfirm fill:#ffebee
     style Output fill:#e8eaf6
 ```
 
-## Phase Details
+## Stage Details
 
-### Phase 1: Anchor Scan
+### Anchor Scan
 
 The engine uses Aho-Corasick for multi-pattern matching of anchor strings:
 
@@ -104,7 +104,7 @@ Each anchor is stored in three variants:
 - **UTF-16LE**: Little-endian encoding (e.g., `g\0h\0p\0_\0`)
 - **UTF-16BE**: Big-endian encoding (e.g., `\0g\0h\0p\0_`)
 
-### Phase 2: Window Building
+### Window Building
 
 Windows are accumulated per (rule, variant) pair:
 
@@ -128,9 +128,31 @@ graph LR
     W4 --> M2
 ```
 
+## Git Chunking Adapter
+
+Git blob scanning feeds decoded bytes through a fixed-size ring buffer and
+scans overlapping chunks with the core `Engine`. The overlap length is
+`Engine::required_overlap()`; after each chunk scan, the adapter calls
+`ScanScratch::drop_prefix_findings(new_bytes_start)` where `new_bytes_start`
+is the absolute byte offset of the new (non-overlap) region. This guarantees
+chunking invariance without re-materializing full blobs in the scanner.
+
+## FindingKey Hashing
+
+For each match, the engine computes a normalized hash on the **secret span**
+in the final representation (decoded UTF-8 / transformed bytes):
+
+```
+norm_hash = BLAKE3(secret_bytes)
+```
+
+The hash is stored in a scratch sidecar aligned with `FindingRec` indices and
+is used by Git persistence as part of the deterministic finding key
+`(start, end, rule_id, norm_hash)`. No raw secret bytes are stored.
+
 **Pressure Coalescing**: If windows exceed `max_windows_per_rule_variant` (16), the gap doubles until windows fit, or everything merges into one.
 
-### Phase 3: Two-Phase Validation
+### Seed Confirmation + Expansion
 
 For noisy rules (like private keys), two-phase confirmation reduces false positives:
 
@@ -156,7 +178,7 @@ Example: Private key detection
 - `confirm_any`: ["PRIVATE KEY"]
 - `full_radius`: 16KB (for full PEM block)
 
-### Phase 4: Regex Confirmation
+### Regex Confirmation
 
 For raw variants:
 ```rust
@@ -203,13 +225,18 @@ Selection detail:
 
 See `docs/transform-chain.md` for diagrams and the gating sequence.
 
-## Keyword + Entropy Gates
+## Keyword + Local Context + Entropy Gates
 
 Some rules benefit from additional semantic filters beyond anchors + regex:
 
 - **Keyword gate (any-of)**: at least one keyword must appear inside the same
   validation window as the regex. This is a cheap memmem filter that reduces
   false positives without requiring global context.
+- **Local context gate (rule-selective)**: after regex matching and secret
+  extraction, inspect a bounded same-line lookaround slice for micro-context
+  such as assignment separators, required key names, and/or matching quotes.
+  This gate is fail-open when line boundaries are missing in the window to
+  avoid false negatives at chunk edges.
 - **Entropy gate**: after a regex match, compute Shannon entropy (bits/byte)
   of the matched bytes. Low-entropy matches are rejected as likely false
   positives (e.g., repeated characters or structured IDs).
@@ -217,6 +244,8 @@ Some rules benefit from additional semantic filters beyond anchors + regex:
 These gates are designed to be **local and bounded**:
 - Keywords are checked *before* regex, and for UTF-16 windows the check happens
   **before decoding** to avoid wasting decode budget.
+- Local context uses bounded lookaround windows and operates on decoded UTF-8
+  bytes for UTF-16 variants, preserving fail-open semantics at boundaries.
 - Entropy runs only on the regex match and is capped by `max_len` to keep cost
   predictable.
 

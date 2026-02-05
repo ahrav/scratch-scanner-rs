@@ -69,6 +69,7 @@ impl Default for ScenarioGenConfig {
 }
 
 impl ScenarioGenConfig {
+    /// Validate configuration invariants, returning a human-readable error.
     fn validate(&self) -> Result<(), String> {
         if self.rule_count == 0 {
             return Err("rule_count must be > 0".to_string());
@@ -190,6 +191,7 @@ pub fn materialize_rules(suite: &RuleSuiteSpec) -> Result<Vec<RuleSpec>, String>
             must_contain: None,
             keywords_any: None,
             entropy: None,
+            local_context: None,
             secret_group: None,
             re,
         });
@@ -233,6 +235,10 @@ pub fn synthetic_tuning(run_cfg: &RunConfig) -> Tuning {
     tuning
 }
 
+/// Build a deterministic rule suite with fixed prefixes and regex shapes.
+///
+/// Radius covers `prefix + token` plus a small slack (8 bytes) to avoid
+/// boundary misses in synthetic data.
 fn build_rule_suite(cfg: &ScenarioGenConfig) -> RuleSuiteSpec {
     let mut rules = Vec::with_capacity(cfg.rule_count as usize);
     for rule_id in 0..cfg.rule_count {
@@ -287,6 +293,7 @@ fn append_noise(rng: &mut SimRng, cfg: &ScenarioGenConfig, buf: &mut Vec<u8>) {
     buf.resize(buf.len().saturating_add(noise_len as usize), b'x');
 }
 
+/// Encode the raw token into the requested representation.
 fn encode_secret(raw: &[u8], repr: &SecretRepr) -> Vec<u8> {
     match repr {
         SecretRepr::Raw => raw.to_vec(),
@@ -298,6 +305,9 @@ fn encode_secret(raw: &[u8], repr: &SecretRepr) -> Vec<u8> {
     }
 }
 
+/// Apply alternating base64 and URL-percent layers `depth` times.
+///
+/// Depth 0 returns the raw bytes unchanged.
 fn encode_nested(raw: &[u8], depth: u8) -> Vec<u8> {
     if depth == 0 {
         return raw.to_vec();
@@ -314,6 +324,7 @@ fn encode_nested(raw: &[u8], depth: u8) -> Vec<u8> {
     cur
 }
 
+/// Percent-encode every byte using uppercase hex.
 fn percent_encode_all(input: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len().saturating_mul(3));
     for &b in input {
@@ -324,6 +335,7 @@ fn percent_encode_all(input: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Base64-encode with the standard alphabet and `=` padding.
 fn base64_encode_std(input: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len().div_ceil(3) * 4);
     let mut i = 0;
@@ -362,6 +374,7 @@ fn hex_nibble(n: u8) -> u8 {
     }
 }
 
+/// Widen ASCII bytes into UTF-16 code units (not a general Unicode encoder).
 fn encode_utf16(bytes: &[u8], be: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len().saturating_mul(2));
     for &b in bytes {

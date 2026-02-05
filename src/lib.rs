@@ -28,6 +28,7 @@
 //! - `AsyncScanner` and platform scanners: async file scanning (platform-gated).
 //! - `RuleSpec`, `TwoPhaseSpec`, `TransformConfig`: rule and transform definitions.
 //! - `FindingRec` (hot-path) and `Finding` (materialized output).
+//! - `git_scan`: Git repository scanning pipeline with persistence support.
 //!
 //! ## Design trade-offs
 //! Anchors reduce regex cost at the expense of requiring rules to supply
@@ -39,6 +40,7 @@
 pub mod archive;
 pub mod async_io;
 pub mod b64_yara_gate;
+pub mod git_scan;
 pub mod lsm;
 pub mod pipeline;
 pub mod pool;
@@ -47,6 +49,8 @@ pub mod scheduler;
 pub mod scratch_memory;
 #[cfg(feature = "sim-harness")]
 pub mod sim;
+#[cfg(feature = "sim-harness")]
+pub mod sim_git_scan;
 #[cfg(feature = "sim-harness")]
 pub mod sim_scanner;
 #[cfg(feature = "sim-harness")]
@@ -67,14 +71,15 @@ mod runtime;
 pub use api::Base64DecodeStats;
 pub use api::{
     AnchorPolicy, DecodeStep, DecodeSteps, DelimAfter, EntropySpec, FileId, Finding, FindingRec,
-    Gate, RuleSpec, StepId, TailCharset, TransformConfig, TransformId, TransformMode, Tuning,
-    TwoPhaseSpec, Utf16Endianness, ValidatorKind, MAX_DECODE_STEPS,
+    Gate, LocalContextSpec, RuleSpec, StepId, TailCharset, TransformConfig, TransformId,
+    TransformMode, Tuning, TwoPhaseSpec, Utf16Endianness, ValidatorKind,
+    LOCAL_CONTEXT_MAX_LOOKAROUND, MAX_DECODE_STEPS,
 };
 
 pub use demo::{
     demo_engine, demo_engine_with_anchor_mode,
     demo_engine_with_anchor_mode_and_max_transform_depth, demo_engine_with_anchor_mode_and_tuning,
-    demo_tuning, AnchorMode,
+    demo_rules, demo_transforms, demo_tuning, AnchorMode,
 };
 
 /// Returns the built-in gitleaks rule set (bench feature only).
@@ -87,7 +92,7 @@ pub fn gitleaks_rules() -> Vec<RuleSpec> {
 pub use engine::{bench_find_spans_into, bench_stream_decode_base64, bench_stream_decode_url};
 #[cfg(feature = "stats")]
 pub use engine::{AnchorPlanStats, VectorscanStats};
-pub use engine::{Engine, ScanScratch};
+pub use engine::{Engine, NormHash, ScanScratch};
 
 pub use async_io::AsyncIoConfig;
 #[cfg(any(target_os = "linux", target_os = "macos"))]

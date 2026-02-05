@@ -1,0 +1,492 @@
+//! Git tree entry parsing.
+//!
+//! Parses raw tree object bytes (decompressed, no object header) into entries.
+//! Designed for streaming iteration without per-entry allocation.
+//!
+//! # Tree Object Format
+//!
+//! A tree object contains zero or more entries, each with format:
+//! ```text
+//! <mode> SP <name> NUL <oid>
+//! ```
+//!
+//! Where:
+//! - `<mode>`: ASCII octal digits (e.g., "100644", "40000")
+//! - `SP`: Single space byte (0x20)
+//! - `<name>`: Entry name bytes (non-empty, no slashes, no NUL)
+//! - `NUL`: Single NUL byte (0x00)
+//! - `<oid>`: Raw OID bytes (20 for SHA-1, 32 for SHA-256)
+//!
+//! # Entry Modes
+//!
+//! Git uses a subset of Unix mode bits. The high 4 bits encode object type:
+//!
+//! | Type Mask | Type | Canonical Mode(s) |
+//! |-----------|------|-------------------|
+//! | 0o040000 | Tree | 40000 |
+//! | 0o100000 | Blob | 100644, 100755 |
+//! | 0o120000 | Symlink | 120000 |
+//! | 0o160000 | Gitlink | 160000 |
+//!
+//! Historical Git versions and third-party tools may create non-canonical
+//! blob modes (e.g., 100664, 100600). This parser handles them by checking
+//! the type mask and executable bit, rather than exact mode matching.
+//!
+//! # Iterator Behavior
+//!
+//! The iterator is fused: after returning an error, all subsequent calls
+//! to `next()` return `None`. This prevents garbage results from partially
+//! parsed state.
+//!
+//! # Performance
+//!
+//! Delimiter scanning uses `iter().position()` which the compiler optimizes
+//! well. For maximum performance with SIMD, add the `memchr` crate and swap
+//! the `memchr_*` helper functions.
+
+use super::errors::TreeDiffError;
+use super::object_id::OidBytes;
+
+/// Classification of a tree entry's type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntryKind {
+    /// Subdirectory (mode 040000).
+    Tree,
+    /// Regular file (mode 100644 or similar without execute bit).
+    RegularFile,
+    /// Executable file (mode 100755 or similar with execute bit).
+    ExecutableFile,
+    /// Symbolic link (mode 120000).
+    Symlink,
+    /// Gitlink/submodule (mode 160000).
+    Gitlink,
+    /// Unknown or invalid mode (type bits don't match any known type).
+    Unknown,
+}
+
+impl EntryKind {
+    /// Returns true if this entry is a tree (directory).
+    #[inline]
+    #[must_use]
+    pub const fn is_tree(self) -> bool {
+        matches!(self, Self::Tree)
+    }
+
+    /// Returns true if this entry is blob-like (content we should scan).
+    ///
+    /// Includes regular files, executables, and symlinks.
+    /// Excludes trees (directories) and gitlinks (submodules).
+    #[inline]
+    #[must_use]
+    pub const fn is_blob_like(self) -> bool {
+        matches!(
+            self,
+            Self::RegularFile | Self::ExecutableFile | Self::Symlink
+        )
+    }
+
+    /// Returns true if this entry is a regular or executable file.
+    #[inline]
+    #[must_use]
+    pub const fn is_file(self) -> bool {
+        matches!(self, Self::RegularFile | Self::ExecutableFile)
+    }
+}
+
+/// A parsed tree entry (zero-copy reference into tree bytes).
+///
+/// All byte slices borrow from the tree buffer supplied to `TreeEntryIter`.
+/// They are only valid as long as that buffer lives.
+#[derive(Clone, Copy, Debug)]
+pub struct TreeEntry<'a> {
+    /// Entry name (without any path prefix).
+    /// Guaranteed non-empty and slash-free.
+    pub name: &'a [u8],
+    /// Raw OID bytes (20 or 32 bytes depending on repo format).
+    pub oid_bytes: &'a [u8],
+    /// Classified entry kind.
+    pub kind: EntryKind,
+    /// Raw mode value (for preservation if needed).
+    pub mode: u32,
+    /// OID length from iterator configuration (20 or 32).
+    /// Used for accurate error reporting in `oid()`.
+    oid_len: u8,
+}
+
+impl<'a> TreeEntry<'a> {
+    /// Returns the OID as `OidBytes`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the OID length is invalid (not 20 or 32).
+    /// This should not happen for entries from a valid `TreeEntryIter`,
+    /// which guarantees `oid_bytes.len() == oid_len`.
+    pub fn oid(&self) -> Result<OidBytes, TreeDiffError> {
+        OidBytes::try_from_slice(self.oid_bytes).ok_or(TreeDiffError::InvalidOidLength {
+            len: self.oid_bytes.len(),
+            expected: self.oid_len as usize,
+        })
+    }
+
+    /// Returns the configured OID length (20 or 32).
+    #[inline]
+    #[must_use]
+    pub const fn oid_len(&self) -> u8 {
+        self.oid_len
+    }
+}
+
+/// Iterator over tree entries in a raw tree object.
+///
+/// Yields entries in tree order (already sorted by Git).
+/// Does not allocate; references into the source bytes.
+///
+/// # Fused Behavior
+///
+/// After returning an error, all subsequent calls return `None`.
+/// This prevents garbage results from partial state.
+#[derive(Clone, Debug)]
+pub struct TreeEntryIter<'a> {
+    /// Full tree object bytes (not shrunk; we advance `pos` instead).
+    data: &'a [u8],
+    /// Current position in data. Set to `data.len()` to fuse after error.
+    pos: usize,
+    /// OID length (20 for SHA-1, 32 for SHA-256).
+    oid_len: u8,
+}
+
+impl<'a> TreeEntryIter<'a> {
+    /// Creates a new iterator over tree object bytes.
+    ///
+    /// # Arguments
+    ///
+    /// * `data` - Raw tree object payload (decompressed, no header)
+    /// * `oid_len` - OID length in bytes (20 or 32)
+    ///
+    /// # Panics
+    ///
+    /// Panics if `oid_len` is not 20 or 32.
+    #[must_use]
+    pub fn new(data: &'a [u8], oid_len: usize) -> Self {
+        assert!(
+            oid_len == 20 || oid_len == 32,
+            "OID length must be 20 or 32"
+        );
+        Self {
+            data,
+            pos: 0,
+            oid_len: oid_len as u8,
+        }
+    }
+
+    /// Returns the current byte position (for diagnostics).
+    #[inline]
+    #[must_use]
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
+    /// Returns the total data length.
+    #[inline]
+    #[must_use]
+    pub fn data_len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Returns true if the iterator is exhausted or fused due to error.
+    #[inline]
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.pos >= self.data.len()
+    }
+
+    /// Fuses the iterator (marks it as finished).
+    ///
+    /// Called on error to prevent garbage results from partial state.
+    #[inline]
+    fn fuse(&mut self) {
+        self.pos = self.data.len();
+    }
+
+    /// Parses the next entry, advancing the position.
+    ///
+    /// Returns `Ok(None)` at end of data.
+    /// Returns `Err` on malformed data (and fuses the iterator).
+    ///
+    /// After an error, `next_entry()` and `Iterator::next()` will always
+    /// return `None` to avoid exposing partially parsed state.
+    pub fn next_entry(&mut self) -> Result<Option<TreeEntry<'a>>, TreeDiffError> {
+        if self.pos >= self.data.len() {
+            return Ok(None);
+        }
+
+        let remaining = &self.data[self.pos..];
+
+        // Parse mode (ASCII octal digits until space)
+        let space_offset = memchr_space(remaining).ok_or_else(|| {
+            self.fuse();
+            TreeDiffError::CorruptTree {
+                detail: "unexpected end while parsing mode",
+            }
+        })?;
+
+        let mode_bytes = &remaining[..space_offset];
+        let mode = parse_octal_mode(mode_bytes).ok_or_else(|| {
+            self.fuse();
+            TreeDiffError::CorruptTree {
+                detail: "invalid mode digits",
+            }
+        })?;
+
+        // Parse name (bytes until NUL)
+        let after_space = &remaining[space_offset + 1..];
+        let nul_offset = memchr_nul(after_space).ok_or_else(|| {
+            self.fuse();
+            TreeDiffError::CorruptTree {
+                detail: "unexpected end while parsing name",
+            }
+        })?;
+
+        let name = &after_space[..nul_offset];
+
+        // Validate name: must be non-empty
+        if name.is_empty() {
+            self.fuse();
+            return Err(TreeDiffError::CorruptTree {
+                detail: "empty entry name",
+            });
+        }
+
+        // Validate name: must not contain '/'
+        if memchr_slash(name).is_some() {
+            self.fuse();
+            return Err(TreeDiffError::CorruptTree {
+                detail: "entry name contains slash",
+            });
+        }
+
+        // Parse OID (fixed bytes)
+        let oid_len = self.oid_len as usize;
+        let after_nul = &after_space[nul_offset + 1..];
+        if after_nul.len() < oid_len {
+            self.fuse();
+            return Err(TreeDiffError::CorruptTree {
+                detail: "unexpected end while parsing OID",
+            });
+        }
+
+        let oid_bytes = &after_nul[..oid_len];
+
+        // Commit position update (only on success)
+        // space_offset + 1 (space) + nul_offset + 1 (nul) + oid_len
+        self.pos += space_offset + 1 + nul_offset + 1 + oid_len;
+
+        let kind = classify_mode(mode);
+
+        Ok(Some(TreeEntry {
+            name,
+            oid_bytes,
+            kind,
+            mode,
+            oid_len: self.oid_len,
+        }))
+    }
+}
+
+impl<'a> Iterator for TreeEntryIter<'a> {
+    type Item = Result<TreeEntry<'a>, TreeDiffError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.next_entry() {
+            Ok(Some(entry)) => Some(Ok(entry)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
+
+// Delimiter scanning helpers
+
+#[inline]
+fn memchr_space(haystack: &[u8]) -> Option<usize> {
+    haystack.iter().position(|&b| b == b' ')
+}
+
+#[inline]
+fn memchr_nul(haystack: &[u8]) -> Option<usize> {
+    haystack.iter().position(|&b| b == 0)
+}
+
+#[inline]
+fn memchr_slash(haystack: &[u8]) -> Option<usize> {
+    haystack.iter().position(|&b| b == b'/')
+}
+
+// Mode parsing and classification
+
+/// Parses ASCII octal mode bytes into a u32.
+///
+/// Returns `None` if bytes are empty, too long (>7), or contain non-octal digits.
+///
+/// # Why 7 bytes max?
+///
+/// The maximum valid Git mode is 0o160000 (6 digits). With 7 octal digits,
+/// the maximum value is 0o7777777 = 2,097,151 which fits in u32. This gives
+/// us headroom without overflow risk, so we can use shift-add without checked
+/// arithmetic.
+#[inline]
+fn parse_octal_mode(bytes: &[u8]) -> Option<u32> {
+    if bytes.is_empty() || bytes.len() > 7 {
+        return None;
+    }
+
+    let mut mode: u32 = 0;
+    for &b in bytes {
+        let digit = b.wrapping_sub(b'0');
+        if digit > 7 {
+            return None;
+        }
+        mode = (mode << 3) | u32::from(digit);
+    }
+
+    Some(mode)
+}
+
+/// Classifies a mode value into an entry kind.
+///
+/// Uses mask-based classification for robustness with historical non-canonical
+/// modes (e.g., 100664, 100600 created by older Git versions).
+///
+/// The type is determined by the high 4 bits (masked with 0o170000):
+/// - 0o040000: Tree
+/// - 0o100000: Blob (executable if user-execute bit set)
+/// - 0o120000: Symlink
+/// - 0o160000: Gitlink
+#[inline]
+fn classify_mode(mode: u32) -> EntryKind {
+    const S_IFMT: u32 = 0o170000;
+
+    match mode & S_IFMT {
+        0o040000 => EntryKind::Tree,
+        0o120000 => EntryKind::Symlink,
+        0o160000 => EntryKind::Gitlink,
+        0o100000 => {
+            if (mode & 0o100) != 0 {
+                EntryKind::ExecutableFile
+            } else {
+                EntryKind::RegularFile
+            }
+        }
+        _ => EntryKind::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_entry(mode: &str, name: &str, oid: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(mode.as_bytes());
+        out.push(b' ');
+        out.extend_from_slice(name.as_bytes());
+        out.push(0);
+        out.extend_from_slice(oid);
+        out
+    }
+
+    #[test]
+    fn parses_single_entry() {
+        let oid = [0x11; 20];
+        let data = make_entry("100644", "file.txt", &oid);
+        let mut iter = TreeEntryIter::new(&data, 20);
+
+        let entry = iter.next_entry().unwrap().unwrap();
+        assert_eq!(entry.name, b"file.txt");
+        assert_eq!(entry.oid_bytes, &oid);
+        assert_eq!(entry.kind, EntryKind::RegularFile);
+        assert!(iter.next_entry().unwrap().is_none());
+    }
+
+    #[test]
+    fn parses_multiple_entries() {
+        let mut data = Vec::new();
+        data.extend(make_entry("100644", "a.txt", &[0x11; 20]));
+        data.extend(make_entry("100644", "b.txt", &[0x22; 20]));
+
+        let mut iter = TreeEntryIter::new(&data, 20);
+        let a = iter.next_entry().unwrap().unwrap();
+        let b = iter.next_entry().unwrap().unwrap();
+
+        assert_eq!(a.name, b"a.txt");
+        assert_eq!(b.name, b"b.txt");
+        assert!(iter.next_entry().unwrap().is_none());
+    }
+
+    #[test]
+    fn rejects_empty_name() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"100644 ");
+        data.push(0);
+        data.extend_from_slice(&[0x11; 20]);
+
+        let mut iter = TreeEntryIter::new(&data, 20);
+        let err = iter.next_entry().unwrap_err();
+        assert!(matches!(err, TreeDiffError::CorruptTree { .. }));
+        assert!(iter.next_entry().unwrap().is_none());
+    }
+
+    #[test]
+    fn rejects_slash_in_name() {
+        let data = make_entry("100644", "dir/file", &[0x11; 20]);
+        let mut iter = TreeEntryIter::new(&data, 20);
+        let err = iter.next_entry().unwrap_err();
+        assert!(matches!(err, TreeDiffError::CorruptTree { .. }));
+        assert!(iter.next_entry().unwrap().is_none());
+    }
+
+    #[test]
+    fn rejects_bad_mode_digits() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"10a644 ");
+        data.extend_from_slice(b"file");
+        data.push(0);
+        data.extend_from_slice(&[0x11; 20]);
+
+        let mut iter = TreeEntryIter::new(&data, 20);
+        let err = iter.next_entry().unwrap_err();
+        assert!(matches!(err, TreeDiffError::CorruptTree { .. }));
+    }
+
+    #[test]
+    fn rejects_truncated_oid() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"100644 file");
+        data.push(0);
+        data.extend_from_slice(&[0x11; 10]);
+
+        let mut iter = TreeEntryIter::new(&data, 20);
+        let err = iter.next_entry().unwrap_err();
+        assert!(matches!(err, TreeDiffError::CorruptTree { .. }));
+    }
+
+    #[test]
+    fn classifies_modes() {
+        let mut data = Vec::new();
+        data.extend(make_entry("100644", "file", &[0x11; 20]));
+        data.extend(make_entry("100755", "exec", &[0x22; 20]));
+        data.extend(make_entry("120000", "link", &[0x33; 20]));
+        data.extend(make_entry("160000", "gitlink", &[0x44; 20]));
+        data.extend(make_entry("40000", "tree", &[0x55; 20]));
+
+        let mut iter = TreeEntryIter::new(&data, 20);
+        assert_eq!(iter.next().unwrap().unwrap().kind, EntryKind::RegularFile);
+        assert_eq!(
+            iter.next().unwrap().unwrap().kind,
+            EntryKind::ExecutableFile
+        );
+        assert_eq!(iter.next().unwrap().unwrap().kind, EntryKind::Symlink);
+        assert_eq!(iter.next().unwrap().unwrap().kind, EntryKind::Gitlink);
+        assert_eq!(iter.next().unwrap().unwrap().kind, EntryKind::Tree);
+    }
+}
