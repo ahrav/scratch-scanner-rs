@@ -299,8 +299,11 @@ fn main() -> io::Result<()> {
         Some(&persist_store),
         &config,
     ) {
-        Ok(GitScanResult::NeedsMaintenance { preflight }) => {
-            eprintln!("needs_maintenance status={:?}", preflight.status);
+        Ok(GitScanResult::NeedsMaintenance { repo }) => {
+            eprintln!(
+                "needs_maintenance artifact_status={:?}",
+                repo.artifact_status
+            );
             std::process::exit(3);
         }
         Ok(GitScanResult::Completed(report)) => {

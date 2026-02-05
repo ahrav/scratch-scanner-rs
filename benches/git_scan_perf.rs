@@ -256,10 +256,10 @@ fn run_git_scan_once(
 
     let report = match result {
         GitScanResult::Completed(report) => report,
-        GitScanResult::NeedsMaintenance { preflight } => {
+        GitScanResult::NeedsMaintenance { repo } => {
             return Err(GitScanError::ResourceLimit(format!(
                 "needs maintenance: {:?}",
-                preflight.status
+                repo.artifact_status
             )));
         }
     };

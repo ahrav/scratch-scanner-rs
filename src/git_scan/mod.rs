@@ -37,11 +37,15 @@
 //! - Outputs are deterministic for identical repo state and configuration.
 
 pub mod alloc_guard;
+pub mod artifact_acquire;
 pub mod blob_introducer;
 pub mod blob_spill;
 pub mod byte_arena;
 pub mod bytes;
 pub mod commit_graph;
+pub mod commit_graph_mem;
+pub mod commit_loader;
+pub mod commit_parse;
 pub mod commit_walk;
 pub mod commit_walk_limits;
 pub mod engine_adapter;
@@ -50,6 +54,7 @@ pub mod finalize;
 pub mod limits;
 pub mod mapping_bridge;
 pub mod midx;
+pub mod midx_build;
 pub mod midx_error;
 pub mod object_id;
 pub mod object_store;
@@ -59,6 +64,7 @@ pub mod pack_candidates;
 pub mod pack_decode;
 pub mod pack_delta;
 pub mod pack_exec;
+pub mod pack_idx;
 pub mod pack_inflate;
 pub mod pack_io;
 pub mod pack_plan;
@@ -99,10 +105,20 @@ pub mod watermark_keys;
 pub mod work_items;
 
 pub use alloc_guard::{enabled as alloc_guard_enabled, set_enabled as set_alloc_guard_enabled};
+pub use artifact_acquire::{
+    acquire_commit_graph, acquire_midx, ArtifactAcquireError, ArtifactBuildLimits, ArtifactPolicy,
+    CommitGraphSource, MidxAcquireResult,
+};
 pub use blob_introducer::{BlobIntroStats, BlobIntroducer, SeenSets};
 pub use byte_arena::{ByteArena, ByteRef};
 pub use bytes::BytesView;
 pub use commit_graph::CommitGraphIndex;
+pub use commit_graph_mem::CommitGraphMem;
+pub use commit_loader::{
+    collect_pack_dirs, load_commits_from_tips, resolve_pack_paths_from_midx, CommitLoadError,
+    CommitLoadLimits, LoadedCommit,
+};
+pub use commit_parse::{parse_commit, CommitParseError, CommitParseLimits, ParsedCommit};
 pub use commit_walk::{
     introduced_by_plan, topo_order_positions, CommitGraph, CommitGraphView, CommitPlanIter,
     ParentScratch, PlannedCommit,
@@ -121,6 +137,7 @@ pub use finalize::{
 pub use limits::RepoOpenLimits;
 pub use mapping_bridge::{MappingBridge, MappingBridgeConfig, MappingStats};
 pub use midx::MidxView;
+pub use midx_build::{build_midx_bytes, MidxBuildError, MidxBuildLimits};
 pub use object_id::{ObjectFormat, OidBytes};
 pub use object_store::{ObjectStore, TreeBytes, TreeSource};
 pub use oid_index::OidIndex;
@@ -137,6 +154,7 @@ pub use pack_exec::{
     CacheRejectHistogram, ExternalBase, ExternalBaseProvider, PackExecError, PackExecReport,
     PackExecStats, PackObjectSink, SkipReason, SkipRecord, CACHE_REJECT_BUCKETS,
 };
+pub use pack_idx::{IdxError, IdxOidIter, IdxView};
 pub use pack_io::{PackIo, PackIoError, PackIoLimits};
 pub use pack_plan::{build_pack_plans, OidResolver, PackPlanConfig, PackPlanError, PackView};
 pub use pack_plan_model::{

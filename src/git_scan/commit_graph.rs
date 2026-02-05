@@ -8,6 +8,7 @@
 //! - Arrays are sized to `CommitGraphView::num_commits()` and never grow.
 //! - Positions are used as direct indices into the arrays.
 //! - OID lengths always match the repo's object format.
+//! - The index is immutable after construction; all reads are O(1).
 
 use gix_commitgraph::Position;
 
@@ -28,6 +29,10 @@ pub struct CommitGraphIndex {
 
 impl CommitGraphIndex {
     /// Builds a commit-graph index from the given view.
+    ///
+    /// # Costs
+    /// - Time: O(N) over commit-graph entries
+    /// - Memory: O(N * oid_len) for commit and tree OIDs plus timestamps
     pub fn build(view: &CommitGraphView) -> Result<Self, CommitPlanError> {
         let count = view.num_commits() as usize;
         let mut commit_oids = Vec::with_capacity(count);
