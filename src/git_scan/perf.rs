@@ -105,6 +105,10 @@ pub struct GitPerfStats {
     pub scan_zero_hit_chunks: u64,
     /// Total findings produced (calls to `push_finding_with_drop_hint`).
     pub scan_findings_count: u64,
+    /// Blobs that took the chunker bypass fast path (single-chunk blobs).
+    pub scan_chunker_bypass_count: u64,
+    /// Blobs skipped because they appear to be binary (NUL byte detected).
+    pub scan_binary_skip_count: u64,
 }
 
 #[cfg(feature = "git-perf")]
@@ -194,6 +198,10 @@ static SCAN_CHUNK_COUNT: AtomicU64 = AtomicU64::new(0);
 static SCAN_ZERO_HIT_CHUNKS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "git-perf")]
 static SCAN_FINDINGS_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "git-perf")]
+static SCAN_CHUNKER_BYPASS_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "git-perf")]
+static SCAN_BINARY_SKIP_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Reset all counters to zero.
 ///
@@ -244,6 +252,8 @@ pub fn reset() {
         SCAN_CHUNK_COUNT.store(0, Ordering::Relaxed);
         SCAN_ZERO_HIT_CHUNKS.store(0, Ordering::Relaxed);
         SCAN_FINDINGS_COUNT.store(0, Ordering::Relaxed);
+        SCAN_CHUNKER_BYPASS_COUNT.store(0, Ordering::Relaxed);
+        SCAN_BINARY_SKIP_COUNT.store(0, Ordering::Relaxed);
     }
 }
 
@@ -298,6 +308,8 @@ pub fn snapshot() -> GitPerfStats {
             scan_chunk_count: SCAN_CHUNK_COUNT.load(Ordering::Relaxed),
             scan_zero_hit_chunks: SCAN_ZERO_HIT_CHUNKS.load(Ordering::Relaxed),
             scan_findings_count: SCAN_FINDINGS_COUNT.load(Ordering::Relaxed),
+            scan_chunker_bypass_count: SCAN_CHUNKER_BYPASS_COUNT.load(Ordering::Relaxed),
+            scan_binary_skip_count: SCAN_BINARY_SKIP_COUNT.load(Ordering::Relaxed),
         }
     }
 
@@ -623,5 +635,21 @@ pub fn record_scan_finding() {
     #[cfg(feature = "git-perf")]
     {
         SCAN_FINDINGS_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Record a blob that took the chunker bypass fast path.
+pub fn record_scan_chunker_bypass() {
+    #[cfg(feature = "git-perf")]
+    {
+        SCAN_CHUNKER_BYPASS_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Record a blob skipped because it appears to be binary.
+pub fn record_scan_binary_skip() {
+    #[cfg(feature = "git-perf")]
+    {
+        SCAN_BINARY_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
     }
 }

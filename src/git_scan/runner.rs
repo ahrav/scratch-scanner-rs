@@ -140,6 +140,9 @@ impl PackMmapLimits {
 }
 
 /// Candidate sink that forwards tree-diff output to the spill/dedupe stage.
+///
+/// Adapts `CandidateSink` to `Spiller::push`, translating tree-diff errors
+/// into the common `TreeDiffError` type.
 struct SpillCandidateSink<'a> {
     spiller: &'a mut Spiller,
 }
@@ -303,6 +306,10 @@ impl std::fmt::Display for GitScanMode {
 }
 
 /// Result of a Git scan run.
+///
+/// Wraps `GitScanReport` as a newtype so callers destructure explicitly.
+/// The report contains stage timings, finding counts, skip records, and
+/// the finalize output (including watermark operations).
 #[derive(Debug)]
 pub struct GitScanResult(pub GitScanReport);
 
@@ -2406,6 +2413,11 @@ fn mmap_pack_files(
     Ok(out)
 }
 
+/// Hint to the OS that the pack mmap will be read sequentially.
+///
+/// Issues `POSIX_FADV_SEQUENTIAL` (Linux only) on the file descriptor and
+/// `MADV_SEQUENTIAL` on the mapped region. Both are advisory; failures are
+/// silently ignored since they only affect readahead heuristics.
 #[cfg(unix)]
 fn advise_sequential(file: &File, reader: &Mmap) {
     unsafe {
@@ -2842,6 +2854,8 @@ mod tests {
                 scan_chunk_count: 0,
                 scan_zero_hit_chunks: 0,
                 scan_findings_count: 0,
+                scan_chunker_bypass_count: 0,
+                scan_binary_skip_count: 0,
             },
             tree_diff_bytes: 1_000,
             spill_runs: 2,

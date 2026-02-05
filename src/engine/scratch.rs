@@ -368,6 +368,12 @@ pub struct ScanScratch {
     pub(super) vs_gate_scratch: Option<VsScratch>,
     #[cfg(feature = "b64-stats")]
     pub(super) base64_stats: Base64DecodeStats, // Base64 decode/gate instrumentation.
+    /// Set after the first `reset_for_scan` validates capacities.
+    ///
+    /// Since the `Engine` is immutable after construction, capacity checks
+    /// are idempotent — they only matter on the first call. Subsequent calls
+    /// skip the validation block for reduced per-chunk overhead.
+    capacity_validated: bool,
 }
 
 impl ScanScratch {
@@ -491,6 +497,7 @@ impl ScanScratch {
             last_file_id: None,
             #[cfg(feature = "b64-stats")]
             base64_stats: Base64DecodeStats::default(),
+            capacity_validated: false,
         }
     }
 
@@ -499,7 +506,11 @@ impl ScanScratch {
     /// This may reallocate scratch buffers if the engine's tuning, rule set, or
     /// Vectorscan databases grew since the last scan. All previously returned
     /// slices into scratch buffers are invalid after this call.
+    ///
+    /// After the first successful call, capacity validation is skipped because
+    /// `Engine` is immutable after construction — all checks are idempotent.
     pub(super) fn reset_for_scan(&mut self, engine: &Engine) {
+        // ── Per-scan state clears (must always run) ──────────────────────
         self.out.clear();
         self.norm_hash.clear();
         self.drop_hint_end.clear();
@@ -533,6 +544,21 @@ impl ScanScratch {
         #[cfg(feature = "b64-stats")]
         self.base64_stats.reset();
 
+        // ── Per-scan accumulator resets (must always run) ────────────────
+        self.hit_acc_pool
+            .reset_touched(self.touched_pairs.as_slice());
+        self.touched_pairs.clear();
+        self.windows.clear();
+        self.expanded.clear();
+        self.spans.clear();
+
+        // ── Idempotent capacity / VS-scratch validation ─────────────────
+        // Engine is immutable after construction, so these checks only
+        // matter on the first call. Skip on subsequent calls.
+        if self.capacity_validated {
+            return;
+        }
+
         match engine.vs.as_ref() {
             Some(db) => {
                 let need_alloc = match self.vs_scratch.as_ref() {
@@ -547,7 +573,6 @@ impl ScanScratch {
                 }
             }
             None => {
-                // Drop scratch if the engine no longer has vectorscan enabled.
                 self.vs_scratch = None;
             }
         }
@@ -619,12 +644,6 @@ impl ScanScratch {
                 self.vs_gate_scratch = None;
             }
         }
-        self.hit_acc_pool
-            .reset_touched(self.touched_pairs.as_slice());
-        self.touched_pairs.clear();
-        self.windows.clear();
-        self.expanded.clear();
-        self.spans.clear();
 
         let expected_pairs = engine.rules.len().saturating_mul(3);
         let max_hits_u32 =
@@ -764,6 +783,8 @@ impl ScanScratch {
                 .map(|rule| Some(rule.re.capture_locations()))
                 .collect();
         }
+
+        self.capacity_validated = true;
     }
 
     /// Updates inferred overlap metadata for the current chunk.

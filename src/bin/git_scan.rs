@@ -498,9 +498,20 @@ fn main() -> io::Result<()> {
                     0.0
                 };
                 eprintln!("scan stats:");
+                let bypass = perf.scan_chunker_bypass_count;
+                let binary_skip = perf.scan_binary_skip_count;
+                let bypass_pct = if blobs > 0 {
+                    (bypass as f64 / blobs as f64) * 100.0
+                } else {
+                    0.0
+                };
                 eprintln!(
                     "  blobs: {}  chunks: {}  zero_hit_chunks: {} ({:.1}%)  findings: {}",
                     blobs, chunks, zero_hit, zero_pct, findings
+                );
+                eprintln!(
+                    "  chunker_bypass: {} ({:.1}%)  binary_skip: {}",
+                    bypass, bypass_pct, binary_skip
                 );
             }
             Ok(())
