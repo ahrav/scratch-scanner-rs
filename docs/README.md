@@ -41,7 +41,6 @@ Documentation index for the scanner-rs secret scanning engine. This guide helps 
 | Document | Module | Description |
 |----------|--------|-------------|
 | [engine-vectorscan-prefilter.md](engine-vectorscan-prefilter.md) | `src/engine/vectorscan_prefilter.rs` | Database compilation, pattern types, callback mechanism, gate semantics |
-| [engine-rule-compilation.md](engine-rule-compilation.md) | `src/engine/rule_repr.rs` | RuleSpec→RuleCompiled pipeline, variant handling, gate compilation |
 | [engine-transforms.md](engine-transforms.md) | `src/engine/transform.rs` | URL/Base64 span detection, streaming decode, budget enforcement |
 | [engine-window-validation.md](engine-window-validation.md) | `src/engine/window_validate.rs` | Gate checks, regex execution, entropy checking, finding extraction |
 
@@ -60,7 +59,6 @@ Documentation index for the scanner-rs secret scanning engine. This guide helps 
 |----------|--------|-------------|
 | [scheduler-local.md](scheduler-local.md) | `src/scheduler/local.rs` | FileSource trait, blocking reads, overlap carry, backpressure |
 | [scheduler-task-graph.md](scheduler-task-graph.md) | `src/scheduler/task_graph.rs` | Object lifecycle FSM (enumerate→fetch→scan→done), work-conserving semantics |
-| [scheduler-output-sinks.md](scheduler-output-sinks.md) | `src/scheduler/output_sink.rs` | Pluggable finding destinations (stdout, file, vec), batching |
 
 #### Scheduler Integration
 | Document | Module | Description |

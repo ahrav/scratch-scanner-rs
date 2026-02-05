@@ -78,8 +78,9 @@ OPTIONS:
     --mode=diff|odb-blob    Scan mode (default: diff)
     --merge=all|first-parent  Merge diff mode (default: all)
     --anchors=manual|derived  Anchor mode (default: manual)
-    --pack-exec-workers=<N> Pack exec worker threads (default: 1)
+    --pack-exec-workers=<N> Pack exec worker threads (default: 24)
     --tree-delta-cache-mb=<N> Tree delta cache size in MB (default: 64)
+    --engine-chunk-mb=<N> Engine scan chunk size in MB (default: 1)
     --max-transform-depth=<N> Maximum decode depth (default: demo tuning)
     --debug                 Emit stage statistics to stderr
     --help, -h              Show this help message",
@@ -99,6 +100,7 @@ fn main() -> io::Result<()> {
     let mut max_transform_depth: Option<usize> = None;
     let mut pack_exec_workers: Option<usize> = None;
     let mut tree_delta_cache_mb: Option<u32> = None;
+    let mut engine_chunk_mb: Option<u32> = None;
     let mut debug = false;
 
     for arg in args {
@@ -150,6 +152,18 @@ fn main() -> io::Result<()> {
                     std::process::exit(2);
                 }
                 tree_delta_cache_mb = Some(parsed);
+                continue;
+            }
+            if let Some(value) = flag.strip_prefix("--engine-chunk-mb=") {
+                let parsed: u32 = value.parse().unwrap_or_else(|_| {
+                    eprintln!("invalid --engine-chunk-mb value: {}", value);
+                    std::process::exit(2);
+                });
+                if parsed == 0 {
+                    eprintln!("--engine-chunk-mb must be >= 1");
+                    std::process::exit(2);
+                }
+                engine_chunk_mb = Some(parsed);
                 continue;
             }
             if let Some(value) = flag.strip_prefix("--mode=") {
@@ -217,6 +231,14 @@ fn main() -> io::Result<()> {
         }
         bytes as u32
     });
+    let engine_chunk_bytes = engine_chunk_mb.map(|mb| {
+        let bytes = mb as u64 * 1024 * 1024;
+        if bytes > u64::from(u32::MAX) {
+            eprintln!("--engine-chunk-mb exceeds max chunk size");
+            std::process::exit(2);
+        }
+        bytes as usize
+    });
 
     let policy = policy_hash(
         &rules,
@@ -255,6 +277,9 @@ fn main() -> io::Result<()> {
     };
     if let Some(bytes) = tree_delta_cache_bytes {
         config.tree_diff.max_tree_delta_cache_bytes = bytes;
+    }
+    if let Some(bytes) = engine_chunk_bytes {
+        config.engine_adapter.chunk_bytes = bytes;
     }
 
     match run_git_scan(

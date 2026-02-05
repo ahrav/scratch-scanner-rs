@@ -272,23 +272,7 @@ pub fn build_pack_plans<'a, R: OidResolver>(
         return Ok(Vec::new());
     }
 
-    let mut buckets: Vec<Vec<PackCandidate>> = vec![Vec::new(); packs.len()];
-    let mut pack_ids: Vec<u16> = Vec::new();
-    for cand in candidates.drain(..) {
-        let pack_idx = cand.pack_id as usize;
-        if pack_idx >= packs.len() {
-            return Err(PackPlanError::PackIdOutOfRange {
-                pack_id: cand.pack_id,
-                pack_count: packs.len(),
-            });
-        }
-        if buckets[pack_idx].is_empty() {
-            pack_ids.push(cand.pack_id);
-        }
-        buckets[pack_idx].push(cand);
-    }
-
-    pack_ids.sort_unstable();
+    let (mut buckets, pack_ids) = bucket_pack_candidates(candidates.drain(..), packs.len())?;
 
     let mut plans = Vec::with_capacity(pack_ids.len());
     for pack_id in pack_ids {
@@ -308,7 +292,23 @@ pub fn build_pack_plans<'a, R: OidResolver>(
     Ok(plans)
 }
 
-fn build_pack_plan_for_pack<'a, R: OidResolver>(
+/// Build a pack plan for a single pack and its candidates.
+///
+/// # Preconditions
+/// - `pack_id` must index `pack` in PNAM order.
+/// - `candidates` must all refer to `pack_id`.
+///
+/// # Effects
+/// - Expands delta bases up to `config.max_delta_depth`.
+/// - Deduplicates candidate offsets into `need_offsets`.
+///
+/// # Errors
+/// - Candidate offsets that are out of range return `CandidateOffsetOutOfRange`.
+/// - Pack corruption or resolver failures return `PackPlanError`.
+///
+/// # Complexity
+/// - `O(N log N)` for `N` candidates due to sorting and hash lookups.
+pub(crate) fn build_pack_plan_for_pack<'a, R: OidResolver>(
     pack_id: u16,
     pack: &PackView<'a>,
     candidates: Vec<PackCandidate>,
@@ -475,6 +475,43 @@ fn build_pack_plan_for_pack<'a, R: OidResolver>(
         clusters,
         stats,
     })
+}
+
+/// Bucket pack candidates by pack id and return the active pack ids.
+///
+/// The returned bucket vector is sized to `pack_count` so callers can index
+/// directly by pack id. `pack_ids` contains the unique pack ids that received
+/// candidates, sorted ascending for deterministic planning.
+///
+/// # Errors
+/// Returns `PackPlanError::PackIdOutOfRange` if any candidate references a
+/// pack id outside `[0, pack_count)`.
+pub(crate) fn bucket_pack_candidates<I>(
+    candidates: I,
+    pack_count: usize,
+) -> Result<(Vec<Vec<PackCandidate>>, Vec<u16>), PackPlanError>
+where
+    I: IntoIterator<Item = PackCandidate>,
+{
+    let mut buckets: Vec<Vec<PackCandidate>> = vec![Vec::new(); pack_count];
+    let mut pack_ids: Vec<u16> = Vec::new();
+
+    for cand in candidates {
+        let pack_idx = cand.pack_id as usize;
+        if pack_idx >= pack_count {
+            return Err(PackPlanError::PackIdOutOfRange {
+                pack_id: cand.pack_id,
+                pack_count,
+            });
+        }
+        if buckets[pack_idx].is_empty() {
+            pack_ids.push(cand.pack_id);
+        }
+        buckets[pack_idx].push(cand);
+    }
+
+    pack_ids.sort_unstable();
+    Ok((buckets, pack_ids))
 }
 
 /// Parse an entry header at `offset` and cache the result.

@@ -1,4 +1,4 @@
-# CLAUDE.md
+# AGENTS.md
 
 ## Project Overview
 Rust-based secret scanning engine with pattern matching, transforms (URL/Base64), and streaming decode.

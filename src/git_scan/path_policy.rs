@@ -19,31 +19,41 @@ use memchr::memrchr;
 pub struct PathClass(u8);
 
 impl PathClass {
+    /// Marks paths that look like source files by extension.
     pub const SOURCE: Self = Self(1 << 0);
+    /// Marks paths under test-related directories.
     pub const TEST: Self = Self(1 << 1);
+    /// Marks paths under vendor or third-party directories.
     pub const VENDOR: Self = Self(1 << 2);
+    /// Marks paths under generated/build output directories.
     pub const GENERATED: Self = Self(1 << 3);
+    /// Marks paths that look like binary assets by extension.
     pub const BINARY: Self = Self(1 << 4);
+    /// Marks paths that did not match any heuristic.
     pub const UNKNOWN: Self = Self(1 << 5);
 
+    /// Returns an empty classification (no bits set).
     #[inline]
     #[must_use]
     pub const fn empty() -> Self {
         Self(0)
     }
 
+    /// Returns the raw bitset value as a `u16`.
     #[inline]
     #[must_use]
     pub const fn bits(self) -> u16 {
         self.0 as u16
     }
 
+    /// Returns true if no classification bits are set.
     #[inline]
     #[must_use]
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
 
+    /// Returns true if all bits in `other` are set in `self`.
     #[inline]
     #[must_use]
     pub const fn contains(self, other: Self) -> bool {

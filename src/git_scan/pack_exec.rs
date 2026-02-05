@@ -199,6 +199,8 @@ pub struct PackExecStats {
     pub cache_hits: u32,
     /// Cache misses on pack offsets.
     pub cache_misses: u32,
+    /// Cache inserts skipped by admission policy.
+    pub cache_admission_skips: u32,
     /// External base provider calls for REF deltas.
     pub external_base_calls: u32,
     /// On-demand base decode attempts triggered by cache misses.
@@ -290,6 +292,9 @@ impl PackExecStats {
         self.skipped_offsets = self.skipped_offsets.saturating_add(other.skipped_offsets);
         self.cache_hits = self.cache_hits.saturating_add(other.cache_hits);
         self.cache_misses = self.cache_misses.saturating_add(other.cache_misses);
+        self.cache_admission_skips = self
+            .cache_admission_skips
+            .saturating_add(other.cache_admission_skips);
         self.external_base_calls = self
             .external_base_calls
             .saturating_add(other.external_base_calls);
@@ -392,6 +397,8 @@ pub struct PackExecScratch {
     base_buf: Vec<u8>,
     delta_stack: Vec<DeltaFrame>,
     candidate_ranges: Vec<Option<(usize, usize)>>,
+    /// Base reference counts per `need_offsets` index for cache admission.
+    base_ref_counts: Vec<u16>,
 }
 
 impl PackExecScratch {
@@ -428,6 +435,17 @@ impl PackExecScratch {
         }
         self.delta_stack.clear();
         self.candidate_ranges.clear();
+
+        self.base_ref_counts.clear();
+        self.base_ref_counts.resize(plan.need_offsets.len(), 0);
+        for dep in &plan.delta_deps {
+            if let BaseLoc::Offset(base_offset) = dep.base {
+                if let Ok(idx) = plan.need_offsets.binary_search(&base_offset) {
+                    let count = &mut self.base_ref_counts[idx];
+                    *count = count.saturating_add(1);
+                }
+            }
+        }
     }
 }
 
@@ -442,6 +460,19 @@ enum DecodedStorage {
     ///
     /// The spill must outlive any use of the returned slice.
     Spill(BlobSpill),
+}
+
+#[inline]
+fn should_cache_at_index(base_ref_counts: &[u16], need_idx: usize) -> bool {
+    base_ref_counts.get(need_idx).copied().unwrap_or(0) > 0
+}
+
+#[inline]
+fn should_cache_for_offset(need_offsets: &[u64], base_ref_counts: &[u16], offset: u64) -> bool {
+    match need_offsets.binary_search(&offset) {
+        Ok(idx) => should_cache_at_index(base_ref_counts, idx),
+        Err(_) => false,
+    }
 }
 
 /// Metadata for a decoded offset (kind + storage location).
@@ -589,6 +620,7 @@ pub fn execute_pack_plan_with_scratch<S: PackObjectSink, B: ExternalBaseProvider
     scratch.prepare(plan, limits);
     let inflate_buf = &mut scratch.inflate_buf;
     let result_buf = &mut scratch.result_buf;
+    let base_ref_counts = &scratch.base_ref_counts;
 
     let mut handle_idx = |idx: usize, range: Option<(usize, usize)>| -> Result<(), PackExecError> {
         let guard = if alloc_guard_enabled {
@@ -616,6 +648,7 @@ pub fn execute_pack_plan_with_scratch<S: PackObjectSink, B: ExternalBaseProvider
                 external,
                 &plan.delta_deps,
                 &plan.delta_dep_index,
+                base_ref_counts,
                 &mut report,
                 inflate_buf,
                 result_buf,
@@ -732,6 +765,7 @@ pub fn execute_pack_plan_with_scratch_indices<S: PackObjectSink, B: ExternalBase
     scratch.prepare(plan, limits);
     let inflate_buf = &mut scratch.inflate_buf;
     let result_buf = &mut scratch.result_buf;
+    let base_ref_counts = &scratch.base_ref_counts;
 
     let mut handle_idx = |idx: usize| -> Result<(), PackExecError> {
         let guard = if alloc_guard_enabled {
@@ -760,6 +794,7 @@ pub fn execute_pack_plan_with_scratch_indices<S: PackObjectSink, B: ExternalBase
                 external,
                 &plan.delta_deps,
                 &plan.delta_dep_index,
+                base_ref_counts,
                 &mut report,
                 inflate_buf,
                 result_buf,
@@ -949,6 +984,7 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
     external: &'a mut B,
     delta_deps: &'a [DeltaDep],
     delta_dep_index: &'a [u32],
+    base_ref_counts: &'a [u16],
     report: &'a mut PackExecReport,
     inflate_buf: &'a mut Vec<u8>,
     result_buf: &'a mut Vec<u8>,
@@ -1000,13 +1036,19 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                 perf::record_pack_inflate(result_buf.len(), nanos);
                 report.stats.decoded_offsets += 1;
 
-                if cache.insert(offset, kind, result_buf) {
+                let should_cache = should_cache_at_index(base_ref_counts, need_idx);
+                if should_cache && cache.insert(offset, kind, result_buf) {
                     Ok(Some(DecodedObject {
                         kind,
                         storage: DecodedStorage::Cache,
                     }))
                 } else {
-                    report.stats.record_cache_reject(result_buf.len());
+                    if should_cache {
+                        report.stats.record_cache_reject(result_buf.len());
+                    } else {
+                        report.stats.cache_admission_skips =
+                            report.stats.cache_admission_skips.saturating_add(1);
+                    }
                     Ok(Some(DecodedObject {
                         kind,
                         storage: DecodedStorage::Scratch,
@@ -1065,6 +1107,7 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                         external,
                         delta_deps,
                         delta_dep_index,
+                        base_ref_counts,
                         report,
                         inflate_buf,
                         result_buf,
@@ -1123,13 +1166,19 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
             }
             match storage {
                 DecodedStorage::Cache | DecodedStorage::Scratch => {
-                    if cache.insert(offset, base_kind, result_buf) {
+                    let should_cache = should_cache_at_index(base_ref_counts, need_idx);
+                    if should_cache && cache.insert(offset, base_kind, result_buf) {
                         Ok(Some(DecodedObject {
                             kind: base_kind,
                             storage: DecodedStorage::Cache,
                         }))
                     } else {
-                        report.stats.record_cache_reject(out_len);
+                        if should_cache {
+                            report.stats.record_cache_reject(out_len);
+                        } else {
+                            report.stats.cache_admission_skips =
+                                report.stats.cache_admission_skips.saturating_add(1);
+                        }
                         Ok(Some(DecodedObject {
                             kind: base_kind,
                             storage: DecodedStorage::Scratch,
@@ -1165,6 +1214,7 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                                 external,
                                 delta_deps,
                                 delta_dep_index,
+                                base_ref_counts,
                                 report,
                                 inflate_buf,
                                 result_buf,
@@ -1223,13 +1273,19 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                     }
                     match storage {
                         DecodedStorage::Cache | DecodedStorage::Scratch => {
-                            if cache.insert(offset, base_kind, result_buf) {
+                            let should_cache = should_cache_at_index(base_ref_counts, need_idx);
+                            if should_cache && cache.insert(offset, base_kind, result_buf) {
                                 Ok(Some(DecodedObject {
                                     kind: base_kind,
                                     storage: DecodedStorage::Cache,
                                 }))
                             } else {
-                                report.stats.record_cache_reject(out_len);
+                                if should_cache {
+                                    report.stats.record_cache_reject(out_len);
+                                } else {
+                                    report.stats.cache_admission_skips =
+                                        report.stats.cache_admission_skips.saturating_add(1);
+                                }
                                 Ok(Some(DecodedObject {
                                     kind: base_kind,
                                     storage: DecodedStorage::Scratch,
@@ -1293,13 +1349,22 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                             }
                             match storage {
                                 DecodedStorage::Cache | DecodedStorage::Scratch => {
-                                    if cache.insert(offset, base.kind, result_buf) {
+                                    let should_cache =
+                                        should_cache_at_index(base_ref_counts, need_idx);
+                                    if should_cache && cache.insert(offset, base.kind, result_buf) {
                                         Ok(Some(DecodedObject {
                                             kind: base.kind,
                                             storage: DecodedStorage::Cache,
                                         }))
                                     } else {
-                                        report.stats.record_cache_reject(out_len);
+                                        if should_cache {
+                                            report.stats.record_cache_reject(out_len);
+                                        } else {
+                                            report.stats.cache_admission_skips = report
+                                                .stats
+                                                .cache_admission_skips
+                                                .saturating_add(1);
+                                        }
                                         Ok(Some(DecodedObject {
                                             kind: base.kind,
                                             storage: DecodedStorage::Scratch,
@@ -1431,6 +1496,7 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
     external: &'a mut B,
     delta_deps: &'a [DeltaDep],
     delta_dep_index: &'a [u32],
+    base_ref_counts: &'a [u16],
     report: &'a mut PackExecReport,
     inflate_buf: &mut Vec<u8>,
     result_buf: &mut Vec<u8>,
@@ -1489,8 +1555,15 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
                     }
                     perf::record_pack_inflate(base_buf.len(), nanos);
                     report.stats.decoded_offsets += 1;
-                    if !cache.insert(current_offset, kind, base_buf) {
-                        report.stats.record_cache_reject(base_buf.len());
+                    let should_cache =
+                        should_cache_for_offset(need_offsets, base_ref_counts, current_offset);
+                    if should_cache {
+                        if !cache.insert(current_offset, kind, base_buf) {
+                            report.stats.record_cache_reject(base_buf.len());
+                        }
+                    } else {
+                        report.stats.cache_admission_skips =
+                            report.stats.cache_admission_skips.saturating_add(1);
                     }
                 } else {
                     let mut spill = match BlobSpill::new(spill_dir, size) {
@@ -1554,8 +1627,28 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
                         DecodedStorage::Cache | DecodedStorage::Scratch => {
                             std::mem::swap(base_buf, result_buf);
                             base_spill = None;
-                            if !cache.insert(frame.offset, base_kind, base_buf) {
-                                report.stats.record_cache_reject(base_buf.len());
+                            let should_cache = should_cache_for_offset(
+                                need_offsets,
+                                base_ref_counts,
+                                frame.offset,
+                            );
+                            if should_cache {
+                                let should_cache = should_cache_for_offset(
+                                    need_offsets,
+                                    base_ref_counts,
+                                    frame.offset,
+                                );
+                                if should_cache {
+                                    if !cache.insert(frame.offset, base_kind, base_buf) {
+                                        report.stats.record_cache_reject(base_buf.len());
+                                    }
+                                } else {
+                                    report.stats.cache_admission_skips =
+                                        report.stats.cache_admission_skips.saturating_add(1);
+                                }
+                            } else {
+                                report.stats.cache_admission_skips =
+                                    report.stats.cache_admission_skips.saturating_add(1);
                             }
                         }
                         DecodedStorage::Spill(spill) => {

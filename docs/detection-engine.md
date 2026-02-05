@@ -9,7 +9,7 @@ flowchart TB
     end
 
     subgraph AnchorScan["Anchor Scan"]
-        AC["AhoCorasick<br/>find_overlapping_iter()"]
+        VS["Vectorscan<br/>Prefilter Scan"]
         Raw["Raw Anchors"]
         U16LE["UTF-16LE Anchors"]
         U16BE["UTF-16BE Anchors"]
@@ -38,10 +38,10 @@ flowchart TB
         FindingRec["FindingRec<br/>{ file_id, rule_id, span, step_id }"]
     end
 
-    Chunk --> AC
-    AC --> Raw
-    AC --> U16LE
-    AC --> U16BE
+    Chunk --> VS
+    VS --> Raw
+    VS --> U16LE
+    VS --> U16BE
 
     Raw --> HitAcc
     U16LE --> HitAcc
@@ -77,22 +77,23 @@ flowchart TB
 
 ### Anchor Scan
 
-The engine uses Aho-Corasick for multi-pattern matching of anchor strings:
+The engine uses Vectorscan for multi-pattern prefiltering of anchor strings.
+Vectorscan scans the buffer and invokes a callback for each anchor match:
 
 ```rust
-// Anchor patterns are deduplicated and mapped to rule targets
-for m in self.ac_anchors.find_overlapping_iter(buf) {
-    let pid = m.pattern().as_usize();
-    let start = self.pat_offsets[pid] as usize;
-    let end = self.pat_offsets[pid + 1] as usize;
-    let targets = &self.pat_targets[start..end];  // flat Target list
+// Vectorscan callback fires for each anchor match in the buffer.
+// The callback maps pattern ids to rule targets and accumulates windows.
+fn on_match(pid: usize, start: usize, end: usize, ...) {
+    let start_idx = pat_offsets[pid] as usize;
+    let end_idx = pat_offsets[pid + 1] as usize;
+    let targets = &pat_targets[start_idx..end_idx];  // flat Target list
 
     for &t in targets {
         let rule_id = t.rule_id();
         let variant = t.variant(); // Raw/Utf16Le/Utf16Be
-        let rule = &self.rules[rule_id];
+        let rule = &rules[rule_id];
         let radius = compute_radius(rule, variant);
-        let window = SpanU32::new(m.start() - radius, m.end() + radius);
+        let window = SpanU32::new(start - radius, end + radius);
         let pair = rule_id * 3 + variant.idx();
         hit_acc_pool.push_span(pair, window, &mut touched_pairs);
     }

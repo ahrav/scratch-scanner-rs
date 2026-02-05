@@ -170,6 +170,9 @@ pub(crate) struct ParsedTreeEntry {
 }
 
 impl ParsedTreeEntry {
+    /// Materializes a borrowed `TreeEntry` from the parsed offsets.
+    ///
+    /// `data` must be the same buffer that the entry was parsed from.
     pub(crate) fn materialize<'a>(&self, data: &'a [u8], oid_len: u8) -> TreeEntry<'a> {
         TreeEntry {
             name: &data[self.name_start..self.name_end],
@@ -180,6 +183,7 @@ impl ParsedTreeEntry {
         }
     }
 
+    /// Shifts offsets forward when a sliding window advances.
     pub(crate) fn offset_by(&mut self, delta: usize) {
         // Used when a sliding window is advanced while parsing a stream.
         self.name_start = self.name_start.saturating_add(delta);
@@ -198,6 +202,7 @@ pub(crate) enum ParseStage {
 }
 
 impl ParseStage {
+    /// Returns a static error detail string for incomplete parsing.
     pub(crate) const fn error_detail(self) -> &'static str {
         match self {
             Self::Mode => "unexpected end while parsing mode",

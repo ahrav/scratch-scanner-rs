@@ -100,6 +100,7 @@ pub struct PackPlanStats {
 }
 
 impl PackPlanStats {
+    /// Returns a zeroed stats struct for empty plans.
     #[must_use]
     pub const fn empty() -> Self {
         Self {

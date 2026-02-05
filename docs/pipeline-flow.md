@@ -102,8 +102,7 @@ aggregation when archive scanning is enabled.
   - Preserves overlap for cross-boundary pattern matching
   - Archive handling is gated by `PipelineConfig.archive` (enabled by default)
   - When enabled, ReaderStage detects archives by extension and header sniff
-  - Archive budgets and path canonicalization are defined in
-    `docs/archive-scanning-plan.md` and `docs/archive-hardening-checklist.md`
+  - Archive budgets and path canonicalization are defined in `src/archive/`
 
 ### Scan Stage
 - **Input**: `chunk_ring` (Chunk queue)

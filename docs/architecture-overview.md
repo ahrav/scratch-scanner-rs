@@ -11,7 +11,7 @@ graph TB
     subgraph Core["Core Engine"]
         Engine["Engine<br/>Pattern Matching"]
         Rules["RuleSpec / RuleCompiled / RuleMeta<br/>Detection Rules"]
-        AC["AhoCorasick<br/>Anchor Automaton"]
+        VS["Vectorscan<br/>Anchor Prefilter"]
         Transforms["TransformConfig<br/>URL/Base64 Decoding"]
         Tuning["Tuning<br/>DoS Protection"]
     end
@@ -46,7 +46,7 @@ graph TB
     Main --> |"scan_path_default()"| Walker
 
     Engine --> Rules
-    Engine --> AC
+    Engine --> VS
     Engine --> Transforms
     Engine --> Tuning
 
@@ -84,14 +84,14 @@ graph TB
 | **Engine**          | `src/engine/core.rs:154`       | Compiled scanning engine with anchor patterns, rules, and transforms |
 | **RuleSpec**        | `src/api.rs:519`               | Rule definitions and specification for rule-based scanning           |
 | **RuleCompiled**    | `src/engine/rule_repr.rs:268`  | Compiled rule representation with hot data and validation gates      |
-| **AhoCorasick**     | External crate                 | Multi-pattern anchor scanning (raw + UTF-16 variants)                |
+| **Vectorscan**      | `vectorscan-rs-sys` crate      | Multi-pattern anchor prefilter (raw + UTF-16 variants)               |
 | **TransformConfig** | `src/api.rs:132`               | Transform stage configuration (URL percent, Base64)                  |
-| **Pipeline**        | `src/pipeline.rs:831`          | 4-stage cooperative pipeline coordinator                             |
+| **Pipeline**        | `src/pipeline.rs`              | 4-stage cooperative pipeline coordinator                             |
 | **Archive Core**    | `src/archive/` (`scan.rs`, `budget.rs`, `path.rs`, `formats/*`) | Archive scanning config, budgets, outcomes, path canonicalization, and sink-driven scan core |
-| **Walker**          | `src/pipeline.rs:331`          | Recursive file system traversal (Unix primary; fallback at line 196) |
-| **ReaderStage**     | `src/pipeline.rs:579`          | File chunking with overlap preservation                              |
-| **ScanStage**       | `src/pipeline.rs:680`          | Detection engine invocation                                          |
-| **OutputStage**     | `src/pipeline.rs:785`          | Finding output to stdout                                             |
+| **Walker**          | `src/pipeline.rs`              | Recursive file system traversal (Unix primary with fallback)         |
+| **ReaderStage**     | `src/pipeline.rs`              | File chunking with overlap preservation                              |
+| **ScanStage**       | `src/pipeline.rs`              | Detection engine invocation                                          |
+| **OutputStage**     | `src/pipeline.rs`              | Finding output to stdout                                             |
 | **BufferPool**      | `src/runtime.rs:468`           | Fixed-capacity aligned buffer pool                                   |
 | **NodePoolType**    | `src/pool/node_pool.rs:49`     | Generic pre-allocated node pool                                      |
 | **RingBuffer**      | `src/stdx/ring_buffer.rs:45`   | Fixed-capacity SPSC queue                                            |
@@ -144,8 +144,8 @@ graph TB
 - Policy enforcement is deterministic: `FailArchive` stops the current container, `FailRun` aborts the scan.
 - Archive entries use virtual `FileId` values (high-bit namespace) to isolate per-file engine state.
 - Archive parsing and expansion are centralized in `src/archive/scan.rs` and delegated to a sink (`ArchiveEntrySink`) for entry scanning.
-- Hardening expectations and review findings are tracked in
-  `docs/archive-hardening-checklist.md` and `docs/archive-review-checklist.md`.
+- Hardening expectations and review findings are tracked alongside the archive
+  scanning implementation in `src/archive/`.
 
 ## Git Repo Open
 

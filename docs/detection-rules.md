@@ -121,14 +121,14 @@ graph TB
 
 ```mermaid
 sequenceDiagram
-    participant AC as AhoCorasick
+    participant VS as Vectorscan
     participant Seed as Seed Window (256B)
     participant Confirm as Confirmation
     participant Full as Full Window (16KB)
     participant Regex as Regex
 
-    Note over AC: Anchor "-----BEGIN" found at offset 1000
-    AC->>Seed: Extract bytes 1000-256..1000+256
+    Note over VS: Anchor "-----BEGIN" found at offset 1000
+    VS->>Seed: Extract bytes 1000-256..1000+256
 
     Seed->>Confirm: Search for "PRIVATE KEY"
     alt Found
@@ -159,9 +159,9 @@ graph LR
         BE["UTF-16BE: \\0g\\0h\\0p\\0_<br/>(8 bytes)"]
     end
 
-    AC["AhoCorasick<br/>Automaton"] --> Raw
-    AC --> LE
-    AC --> BE
+    VS["Vectorscan<br/>Prefilter"] --> Raw
+    VS --> LE
+    VS --> BE
 
     style Variants fill:#e8f5e9
 ```
