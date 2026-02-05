@@ -1633,18 +1633,8 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
                                 frame.offset,
                             );
                             if should_cache {
-                                let should_cache = should_cache_for_offset(
-                                    need_offsets,
-                                    base_ref_counts,
-                                    frame.offset,
-                                );
-                                if should_cache {
-                                    if !cache.insert(frame.offset, base_kind, base_buf) {
-                                        report.stats.record_cache_reject(base_buf.len());
-                                    }
-                                } else {
-                                    report.stats.cache_admission_skips =
-                                        report.stats.cache_admission_skips.saturating_add(1);
+                                if !cache.insert(frame.offset, base_kind, base_buf) {
+                                    report.stats.record_cache_reject(base_buf.len());
                                 }
                             } else {
                                 report.stats.cache_admission_skips =
