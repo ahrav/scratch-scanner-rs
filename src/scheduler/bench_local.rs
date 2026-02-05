@@ -461,6 +461,7 @@ impl FileSource for BoxedFileSourceAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive::ArchiveConfig;
     use crate::scheduler::bench::{run_benchmark, BenchConfig};
     use crate::scheduler::engine_stub::MockRule;
 
@@ -485,6 +486,7 @@ mod tests {
             seed: 12345,
             dedupe_within_chunk: true,
             context_mode: crate::ContextMode::Off,
+            archive: ArchiveConfig::default(),
         }
     }
 

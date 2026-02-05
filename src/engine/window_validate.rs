@@ -13,7 +13,7 @@
 //! # Algorithm
 //! 1. Apply cheap byte gates (must-contain, confirm-all, keyword gate).
 //! 2. For UTF-16 variants, decode with per-window and total-output budgets.
-//! 3. Run regex via `captures_iter` to access capture groups.
+//! 3. Run regex with reusable capture locations to access capture groups.
 //! 4. Apply entropy gates on the *full match* (group 0).
 //! 5. Extract the secret span using capture group priority (see [`extract_secret_span`]).
 //! 6. Apply local context checks (when configured) on the secret span.
@@ -36,6 +36,7 @@
 //! - Keyword/confirm gates run on raw UTF-16 bytes to avoid wasting decode budget.
 //! - UTF-16 findings attach a `DecodeStep::Utf16Window` so callers can map
 //!   decoded spans back to parent byte offsets.
+//! - Capture locations are reused per rule to avoid per-match allocations in hot paths.
 //!
 //! # Entry Points
 //! - `run_rule_on_window`: engine hot path that writes findings directly into
@@ -50,12 +51,13 @@ use crate::api::{
     DecodeStep, FileId, FindingRec, LocalContextSpec, StepId, Utf16Endianness, STEP_ROOT,
 };
 use memchr::memmem;
+use regex::bytes::CaptureLocations;
 use std::ops::Range;
 
 use super::core::Engine;
 use super::helpers::{
     contains_all_memmem, contains_any_memmem, decode_utf16be_to_buf, decode_utf16le_to_buf,
-    entropy_gate_passes, extract_secret_span, map_utf16_decoded_offset,
+    entropy_gate_passes, extract_secret_span_locs, map_utf16_decoded_offset,
 };
 use super::rule_repr::{RuleCompiled, Variant};
 use super::scratch::ScanScratch;
@@ -66,6 +68,30 @@ use super::scratch::ScanScratch;
 /// of the match (e.g., backward-looking patterns). 64 bytes is sufficient
 /// for most secret patterns while keeping overhead low.
 const BACK_SCAN_MARGIN: usize = 64;
+
+/// Iterate capture matches without allocating by reusing `CaptureLocations`.
+///
+/// Advances by one byte on empty matches to mirror `captures_iter` semantics.
+#[inline]
+fn for_each_capture_match(
+    re: &regex::bytes::Regex,
+    locs: &mut CaptureLocations,
+    hay: &[u8],
+    mut on_match: impl FnMut(&CaptureLocations, usize, usize),
+) {
+    let mut at = 0usize;
+    while at <= hay.len() {
+        let Some(m) = re.captures_read_at(locs, hay, at) else {
+            break;
+        };
+        on_match(locs, m.start(), m.end());
+        if m.end() == at {
+            at = at.saturating_add(1);
+        } else {
+            at = m.end();
+        }
+    }
+}
 
 /// Cheap precheck for rules with assignment-value patterns.
 ///
@@ -167,11 +193,9 @@ fn contains_any_literal(hay: &[u8], needles: &[&[u8]]) -> bool {
 
 #[inline]
 fn is_quoted_at(hay: &[u8], secret_start: usize, secret_end: usize) -> Option<bool> {
-    if secret_start == 0 || secret_end >= hay.len() {
-        return None;
-    }
-    let ql = hay[secret_start - 1];
-    let qr = hay[secret_end];
+    let left = secret_start.checked_sub(1)?;
+    let ql = *hay.get(left)?;
+    let qr = *hay.get(secret_end)?;
     let is_quote = ql == b'\'' || ql == b'"' || ql == b'`';
     Some(is_quote && ql == qr)
 }
@@ -293,82 +317,94 @@ impl Engine {
                 let search_window = &window[search_start..];
 
                 let entropy = rule.entropy;
-                for caps in rule.re.captures_iter(search_window) {
+                let mut locs = scratch.capture_locs[rule_id as usize]
+                    .take()
+                    .expect("capture locations missing for rule");
+                for_each_capture_match(&rule.re, &mut locs, search_window, |locs, start, end| {
                     // Get full match for entropy gating and anchor hint.
-                    let full_match = caps.get(0).expect("group 0 always exists");
-                    let match_start = search_start + full_match.start();
-                    let match_end = search_start + full_match.end();
+                    let match_start = search_start + start;
+                    let match_end = search_start + end;
 
-                    if let Some(ent) = entropy {
+                    let entropy_ok = if let Some(ent) = entropy {
                         let mbytes = &window[match_start..match_end];
                         // Entropy is evaluated on the *matched* bytes, not the whole window.
                         // This keeps the signal tied to the candidate token itself.
-                        if !entropy_gate_passes(
+                        entropy_gate_passes(
                             &ent,
                             mbytes,
                             &mut scratch.entropy_scratch,
                             &self.entropy_log2,
-                        ) {
-                            continue;
-                        }
-                    }
-
-                    // Extract secret span using capture group logic.
-                    let (secret_start, secret_end) = extract_secret_span(&caps, rule.secret_group);
-                    let secret_start = search_start + secret_start;
-                    let secret_end = search_start + secret_end;
-
-                    if let Some(ctx) = rule.local_context {
-                        if !local_context_passes(window, secret_start, secret_end, ctx) {
-                            continue;
-                        }
-                    }
-
-                    let span_in_buf = (w.start + secret_start)..(w.start + secret_end);
-                    let match_span_in_buf = (w.start + match_start)..(w.start + match_end);
-                    // Use FULL MATCH span for root_span_hint to ensure correct deduplication
-                    // in chunked scans. drop_prefix_findings() uses root_hint_end to decide
-                    // whether to keep a finding:
-                    // - Window span: too wide → duplicates (the original bug)
-                    // - Secret span: too narrow → missed findings when trailing context
-                    //   (e.g., `;` delimiter) extends into new bytes
-                    // - Full match span: correct → captures actual regex match extent
-                    let root_span_hint = if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
-                        ctx.map_span(match_span_in_buf.clone())
+                        )
                     } else {
-                        root_hint.clone().unwrap_or(match_span_in_buf)
+                        true
                     };
 
-                    let mut drop_hint_end = root_span_hint.end;
-                    if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
-                        if let Some(end) = ctx.drop_hint_end_for_match(root_span_hint.clone()) {
-                            drop_hint_end = drop_hint_end.max(end);
+                    if entropy_ok {
+                        // Extract secret span using capture group logic.
+                        let (secret_start, secret_end) =
+                            extract_secret_span_locs(locs, rule.secret_group);
+                        let secret_start = search_start + secret_start;
+                        let secret_end = search_start + secret_end;
+
+                        let context_ok = if let Some(ctx) = rule.local_context {
+                            local_context_passes(window, secret_start, secret_end, ctx)
+                        } else {
+                            true
+                        };
+
+                        if context_ok {
+                            let span_in_buf = (w.start + secret_start)..(w.start + secret_end);
+                            let match_span_in_buf = (w.start + match_start)..(w.start + match_end);
+                            // Use FULL MATCH span for root_span_hint to ensure correct deduplication
+                            // in chunked scans. drop_prefix_findings() uses root_hint_end to decide
+                            // whether to keep a finding:
+                            // - Window span: too wide → duplicates (the original bug)
+                            // - Secret span: too narrow → missed findings when trailing context
+                            //   (e.g., `;` delimiter) extends into new bytes
+                            // - Full match span: correct → captures actual regex match extent
+                            let root_span_hint =
+                                if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
+                                    ctx.map_span(match_span_in_buf.clone())
+                                } else {
+                                    root_hint.clone().unwrap_or(match_span_in_buf)
+                                };
+
+                            let mut drop_hint_end = root_span_hint.end;
+                            if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
+                                if let Some(end) =
+                                    ctx.drop_hint_end_for_match(root_span_hint.clone())
+                                {
+                                    drop_hint_end = drop_hint_end.max(end);
+                                }
+                            }
+                            let drop_hint_end = base_offset + drop_hint_end as u64;
+                            // When root-span mapping is unavailable (nested transforms with
+                            // length-changing parents), keep decoded spans in the dedupe key
+                            // to avoid collapsing distinct matches.
+                            let include_span =
+                                step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
+
+                            let secret_bytes = &window[secret_start..secret_end];
+                            let norm_hash = *blake3::hash(secret_bytes).as_bytes();
+                            scratch.push_finding_with_drop_hint(
+                                FindingRec {
+                                    file_id,
+                                    rule_id,
+                                    span_start: span_in_buf.start as u32,
+                                    span_end: span_in_buf.end as u32,
+                                    root_hint_start: base_offset + root_span_hint.start as u64,
+                                    root_hint_end: base_offset + root_span_hint.end as u64,
+                                    dedupe_with_span: include_span,
+                                    step_id,
+                                },
+                                norm_hash,
+                                drop_hint_end,
+                                include_span,
+                            );
                         }
                     }
-                    let drop_hint_end = base_offset + drop_hint_end as u64;
-                    // When root-span mapping is unavailable (nested transforms with
-                    // length-changing parents), keep decoded spans in the dedupe key
-                    // to avoid collapsing distinct matches.
-                    let include_span = step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
-
-                    let secret_bytes = &window[secret_start..secret_end];
-                    let norm_hash = *blake3::hash(secret_bytes).as_bytes();
-                    scratch.push_finding_with_drop_hint(
-                        FindingRec {
-                            file_id,
-                            rule_id,
-                            span_start: span_in_buf.start as u32,
-                            span_end: span_in_buf.end as u32,
-                            root_hint_start: base_offset + root_span_hint.start as u64,
-                            root_hint_end: base_offset + root_span_hint.end as u64,
-                            dedupe_with_span: include_span,
-                            step_id,
-                        },
-                        norm_hash,
-                        drop_hint_end,
-                        include_span,
-                    );
-                }
+                });
+                scratch.capture_locs[rule_id as usize] = Some(locs);
             }
 
             Variant::Utf16Le | Variant::Utf16Be => {
@@ -515,76 +551,90 @@ impl Engine {
         );
 
         let entropy = rule.entropy;
-        for caps in rule.re.captures_iter(decoded) {
-            let full_match = caps.get(0).expect("group 0 always exists");
-            let span = full_match.start()..full_match.end();
+        let mut locs = scratch.capture_locs[rule_id as usize]
+            .take()
+            .expect("capture locations missing for rule");
+        for_each_capture_match(&rule.re, &mut locs, decoded, |locs, start, end| {
+            let span = start..end;
 
-            if let Some(ent) = entropy {
+            let entropy_ok = if let Some(ent) = entropy {
                 let mbytes = &decoded[span.clone()];
                 // Entropy gate runs on UTF-8 decoded bytes because the regex
                 // is evaluated there; this keeps thresholds consistent.
-                if !entropy_gate_passes(
+                entropy_gate_passes(
                     &ent,
                     mbytes,
                     &mut scratch.entropy_scratch,
                     &self.entropy_log2,
-                ) {
-                    continue;
-                }
-            }
-
-            // Extract secret span using capture group logic.
-            let (secret_start, secret_end) = extract_secret_span(&caps, rule.secret_group);
-
-            if let Some(ctx) = rule.local_context {
-                if !local_context_passes(decoded, secret_start, secret_end, ctx) {
-                    continue;
-                }
-            }
-
-            // Map decoded UTF-8 match span back to raw UTF-16 byte offsets.
-            let match_raw_start =
-                map_utf16_decoded_offset(raw_win, span.start, matches!(variant, Variant::Utf16Le));
-            let match_raw_end =
-                map_utf16_decoded_offset(raw_win, span.end, matches!(variant, Variant::Utf16Le));
-            let mapped_span =
-                (decode_range.start + match_raw_start)..(decode_range.start + match_raw_end);
-            // Apply root_span_map_ctx for transform-derived findings (same as Raw variant)
-            // to ensure each UTF-16 match gets a distinct root hint for deduplication.
-            let root_span_hint = if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
-                ctx.map_span(mapped_span.clone())
+                )
             } else {
-                root_hint.clone().unwrap_or(mapped_span)
+                true
             };
 
-            let mut drop_hint_end = root_span_hint.end;
-            if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
-                if let Some(end) = ctx.drop_hint_end_for_match(root_span_hint.clone()) {
-                    drop_hint_end = drop_hint_end.max(end);
+            if entropy_ok {
+                // Extract secret span using capture group logic.
+                let (secret_start, secret_end) = extract_secret_span_locs(locs, rule.secret_group);
+
+                let context_ok = if let Some(ctx) = rule.local_context {
+                    local_context_passes(decoded, secret_start, secret_end, ctx)
+                } else {
+                    true
+                };
+
+                if context_ok {
+                    // Map decoded UTF-8 match span back to raw UTF-16 byte offsets.
+                    let match_raw_start = map_utf16_decoded_offset(
+                        raw_win,
+                        span.start,
+                        matches!(variant, Variant::Utf16Le),
+                    );
+                    let match_raw_end = map_utf16_decoded_offset(
+                        raw_win,
+                        span.end,
+                        matches!(variant, Variant::Utf16Le),
+                    );
+                    let mapped_span = (decode_range.start + match_raw_start)
+                        ..(decode_range.start + match_raw_end);
+                    // Apply root_span_map_ctx for transform-derived findings (same as Raw variant)
+                    // to ensure each UTF-16 match gets a distinct root hint for deduplication.
+                    let root_span_hint = if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
+                        ctx.map_span(mapped_span.clone())
+                    } else {
+                        root_hint.clone().unwrap_or(mapped_span)
+                    };
+
+                    let mut drop_hint_end = root_span_hint.end;
+                    if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
+                        if let Some(end) = ctx.drop_hint_end_for_match(root_span_hint.clone()) {
+                            drop_hint_end = drop_hint_end.max(end);
+                        }
+                    }
+                    let drop_hint_end = base_offset + drop_hint_end as u64;
+                    // Preserve decoded spans in the dedupe key when root-span mapping
+                    // is unavailable for nested transforms.
+                    let include_span =
+                        utf16_step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
+                    let secret_bytes = &decoded[secret_start..secret_end];
+                    let norm_hash = *blake3::hash(secret_bytes).as_bytes();
+                    scratch.push_finding_with_drop_hint(
+                        FindingRec {
+                            file_id,
+                            rule_id,
+                            span_start: secret_start as u32,
+                            span_end: secret_end as u32,
+                            root_hint_start: base_offset + root_span_hint.start as u64,
+                            root_hint_end: base_offset + root_span_hint.end as u64,
+                            dedupe_with_span: include_span,
+                            step_id: utf16_step_id,
+                        },
+                        norm_hash,
+                        drop_hint_end,
+                        include_span,
+                    );
                 }
             }
-            let drop_hint_end = base_offset + drop_hint_end as u64;
-            // Preserve decoded spans in the dedupe key when root-span mapping
-            // is unavailable for nested transforms.
-            let include_span = utf16_step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
-            let secret_bytes = &decoded[secret_start..secret_end];
-            let norm_hash = *blake3::hash(secret_bytes).as_bytes();
-            scratch.push_finding_with_drop_hint(
-                FindingRec {
-                    file_id,
-                    rule_id,
-                    span_start: secret_start as u32,
-                    span_end: secret_end as u32,
-                    root_hint_start: base_offset + root_span_hint.start as u64,
-                    root_hint_end: base_offset + root_span_hint.end as u64,
-                    dedupe_with_span: include_span,
-                    step_id: utf16_step_id,
-                },
-                norm_hash,
-                drop_hint_end,
-                include_span,
-            );
-        }
+        });
+        scratch.capture_locs[rule_id as usize] = Some(locs);
     }
 
     /// Validates a raw decoded-space window and appends findings into `scratch.tmp_findings`.
@@ -654,82 +704,90 @@ impl Engine {
         let max_findings = scratch.max_findings;
         let out = &mut scratch.tmp_findings;
         let entropy = rule.entropy;
-        for caps in rule.re.captures_iter(search_window) {
-            let full_match = caps.get(0).expect("group 0 always exists");
+        let mut locs = scratch.capture_locs[rule_id as usize]
+            .take()
+            .expect("capture locations missing for rule");
+        for_each_capture_match(&rule.re, &mut locs, search_window, |locs, start, end| {
             // Adjust match offsets back to window coordinates.
-            let match_start = search_start + full_match.start();
-            let match_end = search_start + full_match.end();
+            let match_start = search_start + start;
+            let match_end = search_start + end;
 
-            if let Some(ent) = entropy {
+            let entropy_ok = if let Some(ent) = entropy {
                 let mbytes = &window[match_start..match_end];
-                if !entropy_gate_passes(
+                entropy_gate_passes(
                     &ent,
                     mbytes,
                     &mut scratch.entropy_scratch,
                     &self.entropy_log2,
-                ) {
-                    continue;
-                }
-            }
-
-            // Extract secret span using capture group logic.
-            let (secret_start, secret_end) = extract_secret_span(&caps, rule.secret_group);
-            let secret_start = search_start + secret_start;
-            let secret_end = search_start + secret_end;
-
-            if let Some(ctx) = rule.local_context {
-                if !local_context_passes(window, secret_start, secret_end, ctx) {
-                    continue;
-                }
-            }
-
-            *found_any = true;
-
-            let span_start = window_start.saturating_add(secret_start as u64) as usize;
-            let span_end = window_start.saturating_add(secret_end as u64) as usize;
-            let span_in_buf = span_start..span_end;
-            // Use FULL MATCH span for root_span_hint (see Raw variant comment for rationale).
-            let match_hint_start = window_start.saturating_add(match_start as u64) as usize;
-            let match_hint_end = window_start.saturating_add(match_end as u64) as usize;
-            let match_span_in_buf = match_hint_start..match_hint_end;
-            let root_span_hint = if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
-                ctx.map_span(match_span_in_buf.clone())
+                )
             } else {
-                root_hint.clone().unwrap_or(match_span_in_buf)
+                true
             };
 
-            if out.len() < max_findings {
-                let mut drop_hint_end = root_span_hint.end;
-                if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
-                    if let Some(end) = ctx.drop_hint_end_for_match(root_span_hint.clone()) {
-                        drop_hint_end = drop_hint_end.max(end);
+            if entropy_ok {
+                // Extract secret span using capture group logic.
+                let (secret_start, secret_end) = extract_secret_span_locs(locs, rule.secret_group);
+                let secret_start = search_start + secret_start;
+                let secret_end = search_start + secret_end;
+
+                let context_ok = if let Some(ctx) = rule.local_context {
+                    local_context_passes(window, secret_start, secret_end, ctx)
+                } else {
+                    true
+                };
+
+                if context_ok {
+                    *found_any = true;
+
+                    let span_start = window_start.saturating_add(secret_start as u64) as usize;
+                    let span_end = window_start.saturating_add(secret_end as u64) as usize;
+                    let span_in_buf = span_start..span_end;
+                    // Use FULL MATCH span for root_span_hint (see Raw variant comment for rationale).
+                    let match_hint_start = window_start.saturating_add(match_start as u64) as usize;
+                    let match_hint_end = window_start.saturating_add(match_end as u64) as usize;
+                    let match_span_in_buf = match_hint_start..match_hint_end;
+                    let root_span_hint = if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
+                        ctx.map_span(match_span_in_buf.clone())
+                    } else {
+                        root_hint.clone().unwrap_or(match_span_in_buf)
+                    };
+
+                    if out.len() < max_findings {
+                        let mut drop_hint_end = root_span_hint.end;
+                        if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
+                            if let Some(end) = ctx.drop_hint_end_for_match(root_span_hint.clone()) {
+                                drop_hint_end = drop_hint_end.max(end);
+                            }
+                        }
+                        let drop_hint_end = base_offset + drop_hint_end as u64;
+                        // Include span in dedupe key for root findings (stable offsets) or when
+                        // root-span mapping is unavailable (nested transforms with length-changing
+                        // parents). For mapped transforms, decoded spans can shift with chunk
+                        // alignment, so dedupe uses only the root hint window.
+                        let dedupe_with_span =
+                            step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
+
+                        let secret_bytes = &window[secret_start..secret_end];
+                        let norm_hash = *blake3::hash(secret_bytes).as_bytes();
+                        out.push(FindingRec {
+                            file_id,
+                            rule_id,
+                            span_start: span_in_buf.start as u32,
+                            span_end: span_in_buf.end as u32,
+                            root_hint_start: base_offset + root_span_hint.start as u64,
+                            root_hint_end: base_offset + root_span_hint.end as u64,
+                            dedupe_with_span,
+                            step_id,
+                        });
+                        scratch.tmp_drop_hint_end.push(drop_hint_end);
+                        scratch.tmp_norm_hash.push(norm_hash);
+                    } else {
+                        *dropped = dropped.saturating_add(1);
                     }
                 }
-                let drop_hint_end = base_offset + drop_hint_end as u64;
-                // Include span in dedupe key for root findings (stable offsets) or when
-                // root-span mapping is unavailable (nested transforms with length-changing
-                // parents). For mapped transforms, decoded spans can shift with chunk
-                // alignment, so dedupe uses only the root hint window.
-                let dedupe_with_span = step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
-
-                let secret_bytes = &window[secret_start..secret_end];
-                let norm_hash = *blake3::hash(secret_bytes).as_bytes();
-                out.push(FindingRec {
-                    file_id,
-                    rule_id,
-                    span_start: span_in_buf.start as u32,
-                    span_end: span_in_buf.end as u32,
-                    root_hint_start: base_offset + root_span_hint.start as u64,
-                    root_hint_end: base_offset + root_span_hint.end as u64,
-                    dedupe_with_span,
-                    step_id,
-                });
-                scratch.tmp_drop_hint_end.push(drop_hint_end);
-                scratch.tmp_norm_hash.push(norm_hash);
-            } else {
-                *dropped = dropped.saturating_add(1);
             }
-        }
+        });
+        scratch.capture_locs[rule_id as usize] = Some(locs);
     }
 
     /// Validates a UTF-16 window by decoding to UTF-8 and appending findings.
@@ -858,79 +916,92 @@ impl Engine {
         let max_findings = scratch.max_findings;
         let out = &mut scratch.tmp_findings;
         let entropy = rule.entropy;
-        for caps in rule.re.captures_iter(decoded) {
-            let full_match = caps.get(0).expect("group 0 always exists");
-            let span = full_match.start()..full_match.end();
+        let mut locs = scratch.capture_locs[rule_id as usize]
+            .take()
+            .expect("capture locations missing for rule");
+        for_each_capture_match(&rule.re, &mut locs, decoded, |locs, start, end| {
+            let span = start..end;
 
-            if let Some(ent) = entropy {
+            let entropy_ok = if let Some(ent) = entropy {
                 let mbytes = &decoded[span.clone()];
-                if !entropy_gate_passes(
+                entropy_gate_passes(
                     &ent,
                     mbytes,
                     &mut scratch.entropy_scratch,
                     &self.entropy_log2,
-                ) {
-                    continue;
-                }
-            }
-
-            // Extract secret span using capture group logic.
-            let (secret_start, secret_end) = extract_secret_span(&caps, rule.secret_group);
-
-            if let Some(ctx) = rule.local_context {
-                if !local_context_passes(decoded, secret_start, secret_end, ctx) {
-                    continue;
-                }
-            }
-
-            *found_any = true;
-
-            // Map decoded UTF-8 match span back to raw UTF-16 offsets, then
-            // lift into decoded-stream coordinates and (when available) map
-            // through the transform root-span context.
-            let match_raw_start =
-                map_utf16_decoded_offset(raw_win, span.start, matches!(variant, Variant::Utf16Le));
-            let match_raw_end =
-                map_utf16_decoded_offset(raw_win, span.end, matches!(variant, Variant::Utf16Le));
-            let match_stream_start = window_start as usize + match_raw_start;
-            let match_stream_end = window_start as usize + match_raw_end;
-            let mapped_span = match_stream_start..match_stream_end;
-            let root_span_hint = if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
-                ctx.map_span(mapped_span.clone())
+                )
             } else {
-                root_hint.clone().unwrap_or(mapped_span)
+                true
             };
 
-            if out.len() < max_findings {
-                let mut drop_hint_end = root_span_hint.end;
-                if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
-                    if let Some(end) = ctx.drop_hint_end_for_match(root_span_hint.clone()) {
-                        drop_hint_end = drop_hint_end.max(end);
+            if entropy_ok {
+                // Extract secret span using capture group logic.
+                let (secret_start, secret_end) = extract_secret_span_locs(locs, rule.secret_group);
+
+                let context_ok = if let Some(ctx) = rule.local_context {
+                    local_context_passes(decoded, secret_start, secret_end, ctx)
+                } else {
+                    true
+                };
+
+                if context_ok {
+                    *found_any = true;
+
+                    // Map decoded UTF-8 match span back to raw UTF-16 offsets, then
+                    // lift into decoded-stream coordinates and (when available) map
+                    // through the transform root-span context.
+                    let match_raw_start = map_utf16_decoded_offset(
+                        raw_win,
+                        span.start,
+                        matches!(variant, Variant::Utf16Le),
+                    );
+                    let match_raw_end = map_utf16_decoded_offset(
+                        raw_win,
+                        span.end,
+                        matches!(variant, Variant::Utf16Le),
+                    );
+                    let match_stream_start = window_start as usize + match_raw_start;
+                    let match_stream_end = window_start as usize + match_raw_end;
+                    let mapped_span = match_stream_start..match_stream_end;
+                    let root_span_hint = if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
+                        ctx.map_span(mapped_span.clone())
+                    } else {
+                        root_hint.clone().unwrap_or(mapped_span)
+                    };
+
+                    if out.len() < max_findings {
+                        let mut drop_hint_end = root_span_hint.end;
+                        if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
+                            if let Some(end) = ctx.drop_hint_end_for_match(root_span_hint.clone()) {
+                                drop_hint_end = drop_hint_end.max(end);
+                            }
+                        }
+                        let drop_hint_end = base_offset + drop_hint_end as u64;
+                        // Include span in dedupe key for root findings or when root-span mapping
+                        // is unavailable. See run_rule_on_raw_window_into for full rationale.
+                        let dedupe_with_span =
+                            utf16_step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
+                        let secret_bytes = &decoded[secret_start..secret_end];
+                        let norm_hash = *blake3::hash(secret_bytes).as_bytes();
+                        out.push(FindingRec {
+                            file_id,
+                            rule_id,
+                            span_start: secret_start as u32,
+                            span_end: secret_end as u32,
+                            root_hint_start: base_offset + root_span_hint.start as u64,
+                            root_hint_end: base_offset + root_span_hint.end as u64,
+                            dedupe_with_span,
+                            step_id: utf16_step_id,
+                        });
+                        scratch.tmp_drop_hint_end.push(drop_hint_end);
+                        scratch.tmp_norm_hash.push(norm_hash);
+                    } else {
+                        *dropped = dropped.saturating_add(1);
                     }
                 }
-                let drop_hint_end = base_offset + drop_hint_end as u64;
-                // Include span in dedupe key for root findings or when root-span mapping
-                // is unavailable. See run_rule_on_raw_window_into for full rationale.
-                let dedupe_with_span =
-                    utf16_step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
-                let secret_bytes = &decoded[secret_start..secret_end];
-                let norm_hash = *blake3::hash(secret_bytes).as_bytes();
-                out.push(FindingRec {
-                    file_id,
-                    rule_id,
-                    span_start: secret_start as u32,
-                    span_end: secret_end as u32,
-                    root_hint_start: base_offset + root_span_hint.start as u64,
-                    root_hint_end: base_offset + root_span_hint.end as u64,
-                    dedupe_with_span,
-                    step_id: utf16_step_id,
-                });
-                scratch.tmp_drop_hint_end.push(drop_hint_end);
-                scratch.tmp_norm_hash.push(norm_hash);
-            } else {
-                *dropped = dropped.saturating_add(1);
             }
-        }
+        });
+        scratch.capture_locs[rule_id as usize] = Some(locs);
     }
 
     #[allow(clippy::too_many_arguments)]

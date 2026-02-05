@@ -11,7 +11,7 @@ graph TB
     subgraph Core["Core Engine"]
         Engine["Engine<br/>Pattern Matching"]
         Rules["RuleSpec / RuleCompiled / RuleMeta<br/>Detection Rules"]
-        AC["AhoCorasick<br/>Anchor Automaton"]
+        VS["Vectorscan<br/>Anchor Prefilter"]
         Transforms["TransformConfig<br/>URL/Base64 Decoding"]
         Tuning["Tuning<br/>DoS Protection"]
     end
@@ -46,7 +46,7 @@ graph TB
     Main --> |"scan_path_default()"| Walker
 
     Engine --> Rules
-    Engine --> AC
+    Engine --> VS
     Engine --> Transforms
     Engine --> Tuning
 
@@ -78,22 +78,23 @@ graph TB
 
 ## Component Descriptions
 
-| Component           | Location                       | Purpose                                                              |
+| Component | Location | Purpose |
 | ------------------- | ------------------------------ | -------------------------------------------------------------------- |
 | **CLI Layer**       | `src/main.rs`                  | Entry point that parses args and invokes the pipeline                |
 | **Engine**          | `src/engine/core.rs:154`       | Compiled scanning engine with anchor patterns, rules, and transforms |
 | **RuleSpec**        | `src/api.rs:519`               | Rule definitions and specification for rule-based scanning           |
 | **RuleCompiled**    | `src/engine/rule_repr.rs:268`  | Compiled rule representation with hot data and validation gates      |
-| **AhoCorasick**     | External crate                 | Multi-pattern anchor scanning (raw + UTF-16 variants)                |
+| **Vectorscan**      | `vectorscan-rs-sys` crate      | Multi-pattern anchor prefilter (raw + UTF-16 variants)               |
 | **TransformConfig** | `src/api.rs:132`               | Transform stage configuration (URL percent, Base64)                  |
-| **Pipeline**        | `src/pipeline.rs:831`          | 4-stage cooperative pipeline coordinator                             |
-| **Walker**          | `src/pipeline.rs:331`          | Recursive file system traversal (Unix primary; fallback at line 196) |
-| **ReaderStage**     | `src/pipeline.rs:579`          | File chunking with overlap preservation                              |
-| **ScanStage**       | `src/pipeline.rs:680`          | Detection engine invocation                                          |
-| **OutputStage**     | `src/pipeline.rs:785`          | Finding output to stdout                                             |
+| **Pipeline**        | `src/pipeline.rs`              | 4-stage cooperative pipeline coordinator                             |
+| **Archive Core**    | `src/archive/` (`scan.rs`, `budget.rs`, `path.rs`, `formats/*`) | Archive scanning config, budgets, outcomes, path canonicalization, and sink-driven scan core |
+| **Walker**          | `src/pipeline.rs`              | Recursive file system traversal (Unix primary with fallback)         |
+| **ReaderStage**     | `src/pipeline.rs`              | File chunking with overlap preservation                              |
+| **ScanStage**       | `src/pipeline.rs`              | Detection engine invocation                                          |
+| **OutputStage**     | `src/pipeline.rs`              | Finding output to stdout                                             |
 | **Async I/O (Linux)** | `src/async_io/linux.rs`      | io_uring scanner; buffers per-file findings and applies lexical pass |
 | **Async I/O (macOS)** | `src/async_io/macos.rs`      | POSIX AIO scanner; buffers per-file findings and applies lexical pass |
-| **AsyncIoConfig**   | `src/async_io/mod.rs:128`      | Shared async config (queue depth, chunk size, `context_mode`)        |
+| **AsyncIoConfig**   | `src/async_io/mod.rs`          | Shared async config (queue depth, chunk size, `context_mode`)        |
 | **BufferPool**      | `src/runtime.rs:468`           | Fixed-capacity aligned buffer pool                                   |
 | **NodePoolType**    | `src/pool/node_pool.rs:49`     | Generic pre-allocated node pool                                      |
 | **RingBuffer**      | `src/stdx/ring_buffer.rs:45`   | Fixed-capacity SPSC queue                                            |
@@ -107,13 +108,21 @@ graph TB
 | **StartSetId**      | `src/git_scan/start_set.rs`    | Deterministic identity for start set configuration                   |
 | **Watermark Keys**  | `src/git_scan/watermark_keys.rs` | Stable ref watermark key/value encoding                            |
 | **Commit Graph View** | `src/git_scan/commit_walk.rs` | Commit-graph adapter with deterministic position lookup              |
+| **Commit Graph Index** | `src/git_scan/commit_graph.rs` | Cache-friendly SoA tables for commit OIDs, root trees, and timestamps |
 | **Commit Walk**     | `src/git_scan/commit_walk.rs`  | `(watermark, tip]` traversal for introduced-by commit selection      |
 | **Commit Walk Limits** | `src/git_scan/commit_walk_limits.rs` | Hard caps for commit traversal and ordering                   |
 | **Snapshot Plan**   | `src/git_scan/snapshot_plan.rs` | Snapshot-mode commit selection (tips only)                          |
 | **Tree Object Store** | `src/git_scan/object_store.rs` | Pack/loose tree loading for OID-only tree diffs                    |
+| **Tree Delta Cache** | `src/git_scan/tree_delta_cache.rs` | Set-associative cache for tree delta bases keyed by pack offset |
+| **Tree Spill Arena** | `src/git_scan/spill_arena.rs` | Preallocated mmapped file for large tree payload spill               |
+| **Tree Spill Index** | `src/git_scan/object_store.rs` | Fixed-size OID index for reusing spilled tree payloads               |
 | **MIDX Mapping**    | `src/git_scan/midx.rs`, `src/git_scan/mapping_bridge.rs` | MIDX parsing and blob-to-pack mapping                     |
 | **Tree Diff Walker** | `src/git_scan/tree_diff.rs` | OID-only tree diffs that emit candidate blobs with context          |
+| **Blob Introducer** | `src/git_scan/blob_introducer.rs` | First-introduced blob walk for ODB-blob scan mode (no per-commit diffs) |
+| **Pack Candidate Collector** | `src/git_scan/pack_candidates.rs` | Direct blob-to-pack/loose candidate mapping for ODB-blob mode |
+| **Tree Stream Parser** | `src/git_scan/tree_stream.rs` | Streaming tree entry parser with bounded buffer                     |
 | **Pack Executor**   | `src/git_scan/pack_exec.rs` | Executes pack plans to decode candidate blobs with bounded buffers |
+| **Blob Spill**      | `src/git_scan/blob_spill.rs` | Spill-backed mmaps for oversized blob payloads during pack exec     |
 | **Engine Adapter**  | `src/git_scan/engine_adapter.rs` | Streams decoded blob bytes into the engine with overlap chunking |
 | **Pack I/O**        | `src/git_scan/pack_io.rs` | MIDX-backed pack mmap loader for cross-pack REF delta bases |
 | **Path Policy**     | `src/git_scan/path_policy.rs` | Fast path classification for candidate flags                         |
@@ -140,11 +149,21 @@ path family, and `context_mode` controls whether findings are filtered before
 emission. If the file changes or tokenization fails, the scanners fail open and
 emit unfiltered findings.
 
+## Archive Scanning Notes
+
+- Nested archive expansion is streaming-only and bounded by `ArchiveConfig::max_archive_depth`.
+- Policy enforcement is deterministic: `FailArchive` stops the current container, `FailRun` aborts the scan.
+- Archive entries use virtual `FileId` values (high-bit namespace) to isolate per-file engine state.
+- Archive parsing and expansion are centralized in `src/archive/scan.rs` and delegated to a sink (`ArchiveEntrySink`) for entry scanning.
+- Hardening expectations and review findings are tracked alongside the archive
+  scanning implementation in `src/archive/`.
+
 ## Git Scanning Preflight
 
-The preflight module runs before any Git blob scanning and determines whether
-maintenance artifacts are ready. The `ArtifactStatus` output gates later Git
-scanning stages and surfaces missing commit-graph/MIDX or excessive pack counts.
+Preflight validates that repository metadata is ready for efficient scanning
+(commit-graph present, MIDX present, pack counts within limits). It emits
+`Ready` vs `NeedsMaintenance` so the caller can gate Git scanning or surface
+maintenance guidance before doing expensive work.
 
 ## Git Repo Open
 
@@ -166,7 +185,56 @@ before descendants, ensuring first-introduction semantics across merges.
 Tree diffing loads tree objects from the object store and walks them in Git tree
 order to emit blob candidates with commit/parent context and path classification.
 The walker skips unchanged subtrees, never reads blobs during diffing, and
-preserves deterministic candidate ordering for downstream spill/dedupe.
+preserves deterministic candidate ordering for downstream spill/dedupe. Outputs
+flow through the `CandidateSink` interface so callers can stream directly into
+spill/dedupe; `CandidateBuffer` remains as a buffered fallback for tests and
+diagnostics.
+
+The tree object store can spill large tree payloads into a preallocated,
+memory-mapped spill arena. Spilled trees are indexed by OID for reuse and do not
+count against the in-flight RAM budget.
+
+To reduce repeated base inflations, the object store also maintains a fixed-size
+tree delta cache keyed by `(pack_id, offset)`. Delta bases are stored in
+fixed-size slots with CLOCK eviction so OFS/REF delta chains can reuse bases
+without re-inflating the same pack entry.
+
+For large or spill-backed trees, the walker switches to a streaming parser that
+keeps only a bounded buffer of tree bytes in RAM while iterating entries.
+
+## Git Scan Modes
+
+**Diff-history mode (default)** uses tree diffs across the commit plan to emit
+candidate blobs with per-commit context. This path feeds the spill/dedupe and
+mapping stages before pack planning and execution.
+
+**ODB-blob mode** replaces per-commit diffs with a single pass that
+discovers each unique blob once (first-introduced semantics) and then scans blobs
+in pack-offset order. Attribution is default in this mode: blobs are tagged with
+the first-seen commit position and a representative path, derived from a
+commit-graph traversal. It reuses the same pack decode and engine adapter stages
+but eliminates redundant tree diff work.
+
+## Git Blob Introducer (ODB-blob mode)
+
+The blob introducer walks commits in topological order and traverses trees
+to discover each blob exactly once. It uses `CommitGraphIndex` for cache-friendly
+root tree and commit metadata lookups, plus two seen-set bitmaps keyed by
+MIDX index (trees + blobs) so repeated subtrees are skipped without parsing.
+Loose blobs missing from the MIDX are deduped in fixed-capacity open-addressing
+sets. Paths are assembled in a reusable buffer and classified via `PathClass`
+to set candidate flags. Excluded paths are tracked separately so a blob can
+still be emitted when it later appears under a non-excluded path. The
+introducer emits candidates with `ChangeKind::Add` and uses the introducing
+commit position for attribution.
+
+## Pack Candidate Collector (ODB-blob mode)
+
+The pack candidate collector receives blob introductions and maps each blob
+OID directly to a pack id and offset via the MIDX. Paths are interned into a
+local `ByteArena` so downstream pack execution can hold stable `ByteRef`s
+without re-interning. Blobs missing from the MIDX are emitted as loose
+candidates for `PackIo::load_loose_object`.
 
 ## Git Spill + Dedupe
 
@@ -177,8 +245,34 @@ merge across runs to emit globally sorted, unique candidates. `WorkItems` stores
 candidate metadata in SoA form so downstream sorting can shuffle indices without
 moving large structs.
 
+Spill chunks now reduce to a single canonical record per OID before writing
+runs to disk, shrinking spill bytes without changing canonical context rules.
+
 After global dedupe, sorted OID batches are sent to the seen-blob store so
 previously scanned blobs can be filtered before decoding.
+
+Mapping re-interns candidate paths into a shared arena that is kept alive
+through pack execution and finalize; scan results retain those path refs to
+avoid re-interning in the engine adapter.
+
+## Pack Execution + Cache
+
+Pack execution inflates and applies deltas for packed objects, emitting blob
+payloads to the engine adapter. A tiered pack cache keeps decoded bases hot:
+Tier A stores <=64 KiB objects, Tier B stores <=512 KiB objects. Both tiers
+use fixed-size slots with CLOCK eviction and preallocated storage, so hot-path
+lookups and inserts stay allocation-free and deterministic.
+
+Oversized pack objects use a spill-backed mmap path: when the inflated payload
+exceeds `PackDecodeLimits.max_object_bytes`, pack exec inflates into a
+temporary spill file under the run `spill_dir` and scans from the mmap instead
+of holding the bytes in RAM. Delta outputs can spill the same way, keeping the
+RAM budget fixed even for very large blobs.
+
+Parallel pack execution shards each pack plan into contiguous offset ranges.
+Each worker owns its own pack cache and scratch state; cross-shard delta bases
+are resolved via on-demand decode rather than shared caches. Results are merged
+in shard order to preserve deterministic output.
 
 ## Git Finalize + Persist
 
@@ -206,15 +300,39 @@ for both scanner and scheduler testing. See `docs/scanner_test_harness_guide.md`
 
 Scanner harness code lives in `src/sim_scanner/` with shared primitives in `src/sim/`.
 
-| Component             | Location                             | Purpose                                                        |
-| --------------------- | ------------------------------------ | -------------------------------------------------------------- |
-| **SimExecutor**       | `src/sim/executor.rs`                | Deterministic single-thread work-stealing model for simulation |
-| **SimFs**             | `src/sim/fs.rs`                      | Deterministic in-memory filesystem used by scenarios           |
-| **ScenarioGenerator** | `src/sim_scanner/generator.rs`       | Synthetic scenario builder with expected-secret ground truth   |
-| **Scanner Oracles**   | `src/sim_scanner/runner.rs`          | Ground-truth and differential checks for scanner simulations   |
-| **SimRng / SimClock** | `src/sim/rng.rs`, `src/sim/clock.rs` | Stable RNG and simulated time source                           |
-| **TraceRing**         | `src/sim/trace.rs`                   | Bounded trace buffer for replay and debugging                  |
-| **Minimizer**         | `src/sim/minimize.rs`                | Deterministic shrink passes for failing scanner artifacts      |
+| Component             | Location                             | Purpose                                                                |
+| --------------------- | ------------------------------------ | ---------------------------------------------------------------------- |
+| **SimExecutor**       | `src/sim/executor.rs`                | Deterministic single-thread work-stealing model for simulation         |
+| **SimFs**             | `src/sim/fs.rs`                      | Deterministic in-memory filesystem used by scenarios                   |
+| **ScenarioGenerator** | `src/sim_scanner/generator.rs`       | Synthetic scenario builder with expected-secret ground truth           |
+| **SimArchive**        | `src/sim_archive/`                   | Deterministic archive builders + virtual path materialization for sims |
+| **Scanner Oracles**   | `src/sim_scanner/runner.rs`          | Ground-truth and differential checks for scanner simulations           |
+| **SimRng / SimClock** | `src/sim/rng.rs`, `src/sim/clock.rs` | Stable RNG and simulated time source                                   |
+| **TraceRing**         | `src/sim/trace.rs`                   | Bounded trace buffer for replay and debugging                          |
+| **Minimizer**         | `src/sim/minimize.rs`                | Deterministic shrink passes for failing scanner artifacts              |
+
+### Git Simulation Harness (`sim-harness` feature)
+
+Git simulation harness code lives in `src/sim_git_scan/` with shared primitives in `src/sim/`.
+
+| Component                  | Location                           | Purpose                                                            |
+| -------------------------- | ---------------------------------- | ------------------------------------------------------------------ |
+| **Git Scenario Schema**    | `src/sim_git_scan/scenario.rs`     | Repo model + artifact bytes schema for deterministic Git scenarios |
+| **Git Scenario Generator** | `src/sim_git_scan/generator.rs`    | Synthetic Git repo generator for bounded random tests              |
+| **Git Runner**             | `src/sim_git_scan/runner.rs`       | Deterministic stage runner and failure taxonomy                    |
+| **Git Trace Ring**         | `src/sim_git_scan/trace.rs`        | Bounded trace buffer for Git simulation replay                     |
+| **Git Artifact Schema**    | `src/sim_git_scan/artifact.rs`     | Reproducible artifact format for Git sim failures                  |
+| **Git Fault Plan**         | `src/sim_git_scan/fault.rs`        | Deterministic fault injection plan keyed by logical Git resources  |
+| **Git Replay**             | `src/sim_git_scan/replay.rs`       | Load + replay `.case.json` artifacts deterministically             |
+| **Git Minimizer**          | `src/sim_git_scan/minimize.rs`     | Deterministic shrink passes for failing Git artifacts              |
+| **Git Persist Store**      | `src/sim_git_scan/persist.rs`      | Two-phase persistence simulation with fault injection              |
+| **Sim Commit Graph**       | `src/sim_git_scan/commit_graph.rs` | In-memory commit-graph adapter for deterministic commit walks      |
+| **Sim Start Set**          | `src/sim_git_scan/start_set.rs`    | Start set + watermark adapters for simulated refs                  |
+| **Sim Tree Source**        | `src/sim_git_scan/tree_source.rs`  | Tree-source adapter that encodes semantic trees into raw bytes     |
+| **Sim Pack Bytes**         | `src/sim_git_scan/pack_bytes.rs`   | In-memory pack bytes and pack-view adapter                         |
+| **Sim Pack I/O**           | `src/sim_git_scan/pack_io.rs`      | External base resolver over in-memory pack bytes                   |
+| **SimExecutor**            | `src/sim/executor.rs`              | Shared deterministic executor used for schedule control            |
+
 
 ### Scheduler Simulation Harness (`scheduler-sim` feature)
 

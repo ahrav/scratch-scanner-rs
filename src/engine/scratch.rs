@@ -5,7 +5,7 @@
 //! state is single-threaded and reused across chunks to keep the hot path
 //! allocation-free.
 
-use crate::api::{DecodeStep, FileId, FindingRec, TransformConfig, TransformId, STEP_ROOT};
+use crate::api::{DecodeStep, FileId, FindingRec, StepId, TransformConfig, TransformId, STEP_ROOT};
 use crate::scratch_memory::ScratchVec;
 use crate::stdx::{ByteRing, FixedSet128, TimingWheel};
 
@@ -18,6 +18,7 @@ use super::hit_pool::{HitAccPool, SpanU32};
 use super::transform::{map_decoded_offset, STREAM_DECODE_CHUNK_BYTES};
 use super::vectorscan_prefilter::{VsScratch, VsStreamWindow};
 use super::work_items::{PendingDecodeSpan, PendingWindow, SpanStreamEntry, WorkItem};
+use regex::bytes::CaptureLocations;
 
 // Forward declaration for Engine (will be used via super::)
 use super::Engine;
@@ -298,6 +299,8 @@ pub struct ScanScratch {
     pub(super) tmp_drop_hint_end: Vec<u64>,
     /// Normalized hashes aligned with `tmp_findings`.
     pub(super) tmp_norm_hash: Vec<NormHash>,
+    /// Per-rule regex capture locations (reused to avoid per-scan allocations).
+    pub(super) capture_locs: Vec<Option<CaptureLocations>>,
     /// Per-rule stream hit counts for decoded-window seeding.
     ///
     /// Indexing is `rule_id * 3 + variant_idx` (Raw/Utf16Le/Utf16Be).
@@ -424,6 +427,11 @@ impl ScanScratch {
             tmp_findings: Vec::with_capacity(max_findings),
             tmp_drop_hint_end: Vec::with_capacity(max_findings),
             tmp_norm_hash: Vec::with_capacity(max_findings),
+            capture_locs: engine
+                .rules
+                .iter()
+                .map(|rule| Some(rule.re.capture_locations()))
+                .collect(),
             stream_hit_counts: vec![0u32; rules_len.saturating_mul(3)],
             stream_hit_touched: ScratchVec::with_capacity(rules_len.saturating_mul(3))
                 .expect("scratch stream_hit_touched allocation failed"),
@@ -739,6 +747,13 @@ impl ScanScratch {
             self.tmp_norm_hash
                 .reserve(self.max_findings - self.tmp_norm_hash.capacity());
         }
+        if self.capture_locs.len() != engine.rules.len() {
+            self.capture_locs = engine
+                .rules
+                .iter()
+                .map(|rule| Some(rule.re.capture_locations()))
+                .collect();
+        }
     }
 
     /// Updates inferred overlap metadata for the current chunk.
@@ -820,6 +835,14 @@ impl ScanScratch {
     /// See [`ScanScratch::drain_findings`] for capacity requirements.
     pub fn drain_findings_into(&mut self, out: &mut Vec<FindingRec>) {
         self.drain_findings(out);
+    }
+
+    /// Materialize decode steps for a finding into the scratch buffer.
+    ///
+    /// The returned slice is valid until the next call that materializes steps.
+    pub(crate) fn materialize_decode_steps(&mut self, step_id: StepId) -> &[DecodeStep] {
+        self.step_arena.materialize(step_id, &mut self.steps_buf);
+        self.steps_buf.as_slice()
     }
 
     /// Drops findings that end at or before the overlap prefix boundary.

@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::archive::ArchiveConfig;
 use crate::sim::fs::{SimFsSpec, SimPath};
 
 /// Configuration for a single simulation run.
@@ -37,6 +38,12 @@ pub struct RunConfig {
     /// Whether to scan UTF-16 variants.
     pub scan_utf16_variants: bool,
 
+    /// Archive scanning configuration for simulation runs.
+    ///
+    /// Used both for scan behavior and for deterministic virtual-path mapping.
+    #[serde(default)]
+    pub archive: ArchiveConfig,
+
     /// Number of stability runs per scenario (different schedules).
     pub stability_runs: u32,
 }
@@ -56,6 +63,19 @@ pub struct Scenario {
     pub rule_suite: RuleSuiteSpec,
     /// Expected secrets for ground-truth validation.
     pub expected: Vec<ExpectedSecret>,
+    /// Archive specs for deterministic generation and minimization.
+    #[serde(default)]
+    pub archives: Vec<ArchiveFileSpec>,
+}
+
+/// Disposition for expected secrets in archive scenarios.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub enum ExpectedDisposition {
+    /// Secret must be found if the object was fully observed.
+    #[default]
+    MustFind,
+    /// Secret may be missed for documented reasons (corruption, budgets, etc).
+    MayMiss { reason: String },
 }
 
 /// Expected secret inserted by the scenario generator.
@@ -63,10 +83,13 @@ pub struct Scenario {
 pub struct ExpectedSecret {
     pub path: SimPath,
     pub rule_id: u32,
-    /// Span in the root/original buffer.
+    /// Span in the root/original buffer (encoded bytes, not decoded).
     pub root_span: SpanU32,
     /// Representation used to derive the secret bytes.
     pub repr: SecretRepr,
+    /// Whether the secret must be found or may be missed.
+    #[serde(default)]
+    pub disposition: ExpectedDisposition,
 }
 
 /// Classification of how a secret is represented in the file.
@@ -118,4 +141,70 @@ pub struct SyntheticRuleSpec {
 
 fn default_rule_radius() -> u32 {
     64
+}
+
+/// Archive kind used by the simulation schema.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ArchiveKindSpec {
+    Gzip,
+    Tar,
+    TarGz,
+    Zip,
+}
+
+/// Archive specification for deterministic materialization.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ArchiveFileSpec {
+    /// Filesystem path for the archive file itself.
+    pub root_path: SimPath,
+    /// Archive container kind to materialize.
+    pub kind: ArchiveKindSpec,
+    /// Entry list in deterministic order.
+    pub entries: Vec<ArchiveEntrySpec>,
+    /// Optional corruption applied after materialization.
+    #[serde(default)]
+    pub corruption: Option<ArchiveCorruptionSpec>,
+}
+
+/// Entry specification for archive materialization.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ArchiveEntrySpec {
+    /// Raw entry name bytes (not canonicalized).
+    pub name_bytes: Vec<u8>,
+    /// Uncompressed payload bytes for the entry.
+    pub payload: Vec<u8>,
+    /// Compression mode (used by ZIP materialization).
+    pub compression: EntryCompressionSpec,
+    /// Whether the entry is marked as encrypted (ZIP flag only).
+    #[serde(default)]
+    pub encrypted: bool,
+    /// Entry kind used to set the archive header type.
+    pub kind: EntryKindSpec,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EntryCompressionSpec {
+    /// Store payload without compression.
+    Store,
+    /// Deflate-compress payload (ZIP only).
+    Deflate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EntryKindSpec {
+    /// Regular file entry with payload bytes.
+    RegularFile,
+    /// Directory entry (payload is ignored).
+    Directory,
+    /// Symlink entry (payload is ignored).
+    Symlink,
+    /// Other/non-regular entry (payload is ignored).
+    Other,
+}
+
+/// Archive-level corruption used for malformed variants.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ArchiveCorruptionSpec {
+    /// Truncate the final archive bytes to a fixed length.
+    TruncateTo { len: u64 },
 }

@@ -5,6 +5,14 @@
 //! keeps a decoded ring buffer, feeds Vectorscan stream DBs, and only
 //! materializes candidate windows for rule evaluation.
 //!
+//! ## Data flow
+//! - `stream_decode` yields decoded chunks.
+//! - Chunks are appended to `decode_ring` (recent decoded bytes only).
+//! - Vectorscan streams emit candidate windows into `pending_windows`.
+//! - Windows are materialized from the ring (or re-decoded) and scanned.
+//! - URL/Base64 span streams emit nested decode spans when bytes are still in
+//!   the ring; otherwise we fall back to full decode.
+//!
 //! ## Invariants
 //! - Decoded offsets are monotonically increasing during a stream decode.
 //! - `pending_windows` is a timing wheel keyed by `hi` (G=1), so windows are
@@ -24,6 +32,11 @@
 //! For `Gate::AnchorsInDecoded`, the preferred path is the decoded-space
 //! Vectorscan gate. If it cannot be used, we fall back to prefilter hits and
 //! may relax enforcement to avoid dropping UTF-16-only matches.
+//!
+//! ## Borrowing model
+//! We use raw pointers in a few tight loops to avoid holding mutable borrows
+//! across timing-wheel callbacks. These pointers are scoped to the call and
+//! never outlive `decode_stream_and_scan`.
 
 use crate::api::{DecodeStep, FileId, StepId};
 use crate::stdx::PushOutcome;
@@ -39,7 +52,10 @@ use super::helpers::{
 use super::hit_pool::SpanU32;
 use super::rule_repr::Variant;
 use super::scratch::{RootSpanMapCtx, ScanScratch};
-use super::transform::{map_decoded_offset, stream_decode, Base64SpanStream, UrlSpanStream};
+use super::transform::{
+    base64_char_count, base64_skip_chars, map_decoded_offset, stream_decode, Base64SpanStream,
+    UrlSpanStream,
+};
 use super::vectorscan_prefilter::{
     gate_match_callback, stream_match_callback, utf16_stream_match_callback, VsScratch, VsStream,
     VsStreamDb, VsStreamMatchCtx, VsUtf16StreamMatchCtx,
@@ -49,11 +65,19 @@ use super::work_items::{
 };
 use crate::api::{Gate, TransformConfig, TransformId, TransformMode};
 
-/// RAII guard that clears `root_span_map_ctx` after a streaming decode pass.
+/// RAII guard that clears `root_span_map_ctx` on all exit paths.
+///
+/// # Safety
+/// `scratch` must point to the `ScanScratch` passed to the current
+/// `decode_stream_and_scan` call and must outlive the guard.
 struct RootSpanMapGuard {
     scratch: *mut ScanScratch,
 }
 
+/// Mix the root span into a decoded-content hash.
+///
+/// This prevents dedupe collisions when identical decoded bytes originate from
+/// different root spans (important for accurate root-hint attribution).
 fn mix_root_hint_hash(h: u128, root_hint: &Option<Range<usize>>) -> u128 {
     // Mix the root hint into the hash so identical decoded bytes at different
     // positions are not deduped across buffers.
@@ -393,7 +417,8 @@ impl Engine {
             };
             // SAFETY: `bytes_ptr` comes from `scratch.window_bytes`. We materialize the slice
             // from a raw pointer to avoid borrowing `scratch` across calls that mutate other
-            // scratch fields. `window_bytes` is not mutated until after this slice is consumed.
+            // scratch fields. `window_bytes` is not mutated until after this slice is consumed,
+            // and the slice never escapes this function.
             let bytes = unsafe { std::slice::from_raw_parts(bytes_ptr, bytes_len) };
             let rule = &self.rules[win.rule_id as usize];
             match win.variant {
@@ -788,7 +813,9 @@ impl Engine {
                             force_full = true;
                             return false;
                         }
-                        let range = span_start..scratch.slab.buf.len();
+                        let span_len = u64_to_usize(hi.saturating_sub(lo));
+                        let span_end = span_start.saturating_add(span_len);
+                        let range = span_start..span_end;
 
                         if tcfg.id == TransformId::Base64 && tcfg.gate == Gate::AnchorsInDecoded {
                             if let Some(gate) = &self.b64_gate {
@@ -799,33 +826,85 @@ impl Engine {
                             }
                         }
 
-                        let parent_span = u64_to_usize(lo)..u64_to_usize(hi);
-                        let child_step_id = scratch.step_arena.push(
-                            step_id,
-                            DecodeStep::Transform {
-                                transform_idx: entry.transform_idx,
-                                parent_span: parent_span.clone(),
-                            },
-                        );
-                        // Map the nested span back to root-buffer coordinates. For nested transforms,
-                        // `parent_span` is in decoded-space offsets; we translate through the parent
-                        // transform to get the corresponding encoded-space range, then offset by the
-                        // root hint's start to get absolute root-buffer positions.
-                        let child_root_hint = if let Some(hint) = root_hint.as_ref() {
-                            let start = map_decoded_offset(tc, encoded, parent_span.start);
-                            let end = map_decoded_offset(tc, encoded, parent_span.end);
-                            Some(hint.start.saturating_add(start)..hint.start.saturating_add(end))
-                        } else {
-                            Some(parent_span)
-                        };
+                        let mut span_starts = [0usize; 4];
+                        let mut span_count = 0usize;
 
-                        scratch.pending_spans.push(PendingDecodeSpan {
-                            transform_idx: entry.transform_idx,
-                            range,
-                            step_id: child_step_id,
-                            root_hint: child_root_hint,
-                            depth: depth + 1,
-                        });
+                        if tcfg.id == TransformId::Base64 {
+                            let allow_space_ws = tcfg.base64_allow_space_ws;
+                            let enc = &scratch.slab.buf[range.clone()];
+                            for shift in 0..4usize {
+                                let Some(rel) = base64_skip_chars(enc, shift, allow_space_ws)
+                                else {
+                                    break;
+                                };
+                                let start = span_start.saturating_add(rel);
+                                if start >= span_end {
+                                    continue;
+                                }
+                                if span_starts[..span_count].contains(&start) {
+                                    continue;
+                                }
+                                let enc_aligned = &scratch.slab.buf[start..span_end];
+                                let remaining_chars =
+                                    base64_char_count(enc_aligned, allow_space_ws);
+                                if remaining_chars < tcfg.min_len {
+                                    continue;
+                                }
+                                span_starts[span_count] = start;
+                                span_count += 1;
+                                if span_count >= span_starts.len() {
+                                    break;
+                                }
+                            }
+                        } else {
+                            span_starts[0] = span_start;
+                            span_count = 1;
+                        }
+
+                        let mut enqueued_any = false;
+                        for &aligned_start in span_starts.iter().take(span_count) {
+                            if scratch.work_items_enqueued + scratch.pending_spans.len()
+                                >= self.tuning.max_work_items
+                            {
+                                break;
+                            }
+                            let rel = aligned_start.saturating_sub(span_start);
+                            let parent_span =
+                                u64_to_usize(lo).saturating_add(rel)..u64_to_usize(hi);
+                            let child_step_id = scratch.step_arena.push(
+                                step_id,
+                                DecodeStep::Transform {
+                                    transform_idx: entry.transform_idx,
+                                    parent_span: parent_span.clone(),
+                                },
+                            );
+                            // Map the nested span back to root-buffer coordinates. For nested transforms,
+                            // `parent_span` is in decoded-space offsets; we translate through the parent
+                            // transform to get the corresponding encoded-space range, then offset by the
+                            // root hint's start to get absolute root-buffer positions.
+                            let child_root_hint = if let Some(hint) = root_hint.as_ref() {
+                                let start = map_decoded_offset(tc, encoded, parent_span.start);
+                                let end = map_decoded_offset(tc, encoded, parent_span.end);
+                                Some(
+                                    hint.start.saturating_add(start)
+                                        ..hint.start.saturating_add(end),
+                                )
+                            } else {
+                                Some(parent_span)
+                            };
+
+                            scratch.pending_spans.push(PendingDecodeSpan {
+                                transform_idx: entry.transform_idx,
+                                range: aligned_start..span_end,
+                                step_id: child_step_id,
+                                root_hint: child_root_hint,
+                                depth: depth + 1,
+                            });
+                            enqueued_any = true;
+                        }
+                        if !enqueued_any {
+                            scratch.slab.buf.truncate(span_start);
+                        }
                         entry.spans_emitted = entry.spans_emitted.saturating_add(1);
                         true
                     };
@@ -1016,7 +1095,9 @@ impl Engine {
                             force_full = true;
                             return false;
                         }
-                        let range = span_start..scratch.slab.buf.len();
+                        let span_len = u64_to_usize(hi.saturating_sub(lo));
+                        let span_end = span_start.saturating_add(span_len);
+                        let range = span_start..span_end;
                         let tcfg = &self.transforms[entry.transform_idx];
                         if tcfg.id == TransformId::Base64 && tcfg.gate == Gate::AnchorsInDecoded {
                             if let Some(gate) = &self.b64_gate {
@@ -1026,30 +1107,83 @@ impl Engine {
                                 }
                             }
                         }
-                        let parent_span = u64_to_usize(lo)..u64_to_usize(hi);
-                        let child_step_id = scratch.step_arena.push(
-                            step_id,
-                            DecodeStep::Transform {
-                                transform_idx: entry.transform_idx,
-                                parent_span: parent_span.clone(),
-                            },
-                        );
-                        // Same mapping logic as the streaming loop above: translate decoded-space
-                        // offsets back to root-buffer coordinates for accurate finding locations.
-                        let child_root_hint = if let Some(hint) = root_hint.as_ref() {
-                            let start = map_decoded_offset(tc, encoded, parent_span.start);
-                            let end = map_decoded_offset(tc, encoded, parent_span.end);
-                            Some(hint.start.saturating_add(start)..hint.start.saturating_add(end))
+
+                        let mut span_starts = [0usize; 4];
+                        let mut span_count = 0usize;
+
+                        if tcfg.id == TransformId::Base64 {
+                            let allow_space_ws = tcfg.base64_allow_space_ws;
+                            let enc = &scratch.slab.buf[range.clone()];
+                            for shift in 0..4usize {
+                                let Some(rel) = base64_skip_chars(enc, shift, allow_space_ws)
+                                else {
+                                    break;
+                                };
+                                let start = span_start.saturating_add(rel);
+                                if start >= span_end {
+                                    continue;
+                                }
+                                if span_starts[..span_count].contains(&start) {
+                                    continue;
+                                }
+                                let enc_aligned = &scratch.slab.buf[start..span_end];
+                                let remaining_chars =
+                                    base64_char_count(enc_aligned, allow_space_ws);
+                                if remaining_chars < tcfg.min_len {
+                                    continue;
+                                }
+                                span_starts[span_count] = start;
+                                span_count += 1;
+                                if span_count >= span_starts.len() {
+                                    break;
+                                }
+                            }
                         } else {
-                            Some(parent_span)
-                        };
-                        scratch.pending_spans.push(PendingDecodeSpan {
-                            transform_idx: entry.transform_idx,
-                            range,
-                            step_id: child_step_id,
-                            root_hint: child_root_hint,
-                            depth: depth + 1,
-                        });
+                            span_starts[0] = span_start;
+                            span_count = 1;
+                        }
+
+                        let mut enqueued_any = false;
+                        for &aligned_start in span_starts.iter().take(span_count) {
+                            if scratch.work_items_enqueued + scratch.pending_spans.len()
+                                >= self.tuning.max_work_items
+                            {
+                                break;
+                            }
+                            let rel = aligned_start.saturating_sub(span_start);
+                            let parent_span =
+                                u64_to_usize(lo).saturating_add(rel)..u64_to_usize(hi);
+                            let child_step_id = scratch.step_arena.push(
+                                step_id,
+                                DecodeStep::Transform {
+                                    transform_idx: entry.transform_idx,
+                                    parent_span: parent_span.clone(),
+                                },
+                            );
+                            // Same mapping logic as the streaming loop above: translate decoded-space
+                            // offsets back to root-buffer coordinates for accurate finding locations.
+                            let child_root_hint = if let Some(hint) = root_hint.as_ref() {
+                                let start = map_decoded_offset(tc, encoded, parent_span.start);
+                                let end = map_decoded_offset(tc, encoded, parent_span.end);
+                                Some(
+                                    hint.start.saturating_add(start)
+                                        ..hint.start.saturating_add(end),
+                                )
+                            } else {
+                                Some(parent_span)
+                            };
+                            scratch.pending_spans.push(PendingDecodeSpan {
+                                transform_idx: entry.transform_idx,
+                                range: aligned_start..span_end,
+                                step_id: child_step_id,
+                                root_hint: child_root_hint,
+                                depth: depth + 1,
+                            });
+                            enqueued_any = true;
+                        }
+                        if !enqueued_any {
+                            scratch.slab.buf.truncate(span_start);
+                        }
                         entry.spans_emitted = entry.spans_emitted.saturating_add(1);
                         true
                     };

@@ -45,6 +45,22 @@ pub enum TraceEvent {
         root0: u32,
         root1: u32,
     },
+    ArchiveStart {
+        root: u32,
+        kind: u16,
+    },
+    ArchiveEntryStart {
+        root: u32,
+        entry: u32,
+    },
+    ArchiveEntryEnd {
+        root: u32,
+        entry: u32,
+    },
+    ArchiveEnd {
+        root: u32,
+        outcome: u16,
+    },
     InvariantFail {
         code: u32,
     },

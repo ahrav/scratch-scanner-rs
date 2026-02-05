@@ -38,8 +38,8 @@ flowchart TB
         CheckB64{{"transform == Base64?"}}
         PreGate["b64_yara_gate.hits()<br/>(YARA-style encoded prefilter)"]
         Gate{{"gate == AnchorsInDecoded?"}}
-        StreamGate["decoded anchor gate<br/>stream_decode + AC"]
-        ACMatch["ac_anchors.is_match()"]
+        StreamGate["decoded anchor gate<br/>stream_decode + VS"]
+        VSMatch["vs_gate anchor check"]
     end
 
     subgraph Decode["Decode & Dedupe"]
@@ -76,9 +76,9 @@ flowchart TB
     PreGate --> |"pass"| Gate
     PreGate --> |"fail"| ForTransform
     Gate --> |"yes"| StreamGate
-    StreamGate --> ACMatch
-    ACMatch --> |"no anchor"| ForTransform
-    ACMatch --> |"anchor found"| Decode
+    StreamGate --> VSMatch
+    VSMatch --> |"no anchor"| ForTransform
+    VSMatch --> |"anchor found"| Decode
     Gate --> |"no"| Decode
 
     Decode --> StreamDecode
@@ -135,6 +135,14 @@ graph LR
     style Limits fill:#ffebee
 ```
 
+## Archive Entry Context
+
+When archive scanning is enabled, entry payload bytes flow through the same
+transform chain and decoding budgets as regular files. Archive entry paths are
+canonicalized separately in the archive subsystem and do not affect transform
+logic or decode limits.
+See `src/archive/` for archive-specific invariants and budget guardrails.
+
 | Limit | Default | Purpose |
 |-------|---------|---------|
 | `max_transform_depth` | 3 | Maximum decode chain length |
@@ -188,7 +196,7 @@ the *encoded* bytes before any decoding.
 **Core idea**: a decoded anchor can appear at any of three byte offsets inside a
 base64 quantum. YARA documents this by generating three encoded permutations
 and stripping the unstable prefix/suffix characters. We do the same and then
-search the encoded stream with Aho-Corasick.
+search the encoded stream with Vectorscan.
 
 **Why this is safe**:
 - It is **conservative**: if decoded bytes contain an anchor, at least one of
@@ -212,7 +220,7 @@ sequenceDiagram
     participant Pre as b64_yara_gate (encoded prefilter)
     participant Gate as decoded gate
     participant Stream as stream_decode()
-    participant AC as AhoCorasick
+    participant VS as Vectorscan
     participant Budget as total_decode_output_bytes
 
     Note over Transform,Pre: Base64 only
@@ -225,7 +233,7 @@ sequenceDiagram
         Stream-->>Gate: decoded chunk
         Gate->>Budget: Add chunk.len()
         Gate->>Gate: Prepend tail from previous chunk
-        Gate->>AC: is_match(tail + chunk)?
+        Gate->>VS: is_match(tail + chunk)?
         alt Anchor found
             Gate-->>Transform: true (proceed with full decode)
         else Budget exceeded

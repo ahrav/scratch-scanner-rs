@@ -4,10 +4,10 @@
 //!
 //! Three task types form a DAG:
 //! ```text
-//! Enumerate â”€â”¬â”€> FetchSync â”€â”¬â”€> Scan â”€â”¬â”€> (output)
-//!            â”‚              â”‚         â””â”€> FetchSync (nested archive)
-//!            â”‚              â””â”€> FetchSync (next chunk)
-//!            â””â”€> Enumerate (next cursor batch)
+//! Enumerate --+--> FetchSync --+--> Scan ----> (output)
+//!             |               |     `--> FetchSync (nested archive)
+//!             |               `--> FetchSync (next chunk)
+//!             `--> Enumerate (next cursor batch)
 //! ```
 //!
 //! # Why Typed Tasks Over `Box<dyn FnOnce()>`
@@ -22,15 +22,16 @@
 //! - **Bounded frontier**: `ObjectFrontier` caps discovered-but-not-complete objects
 //! - **Leak-free**: `ObjectCtx` RAII ensures permit release when last reference drops
 //! - **Non-blocking Enumerate**: Uses `try_acquire_ctx()`, re-enqueues on failure
+//! - **Abort-aware**: `FailRun` policies can stop new task dispatch without leaking permits
 //!
 //! # Permit Lifetime via ObjectCtx
 //!
 //! The `ObjectCtx` pattern ensures correct permit lifetime:
 //! ```text
-//! FetchSync { obj: ObjectRef } â”€cloneâ”€> FetchSync { obj: ObjectRef }
-//!                              â””â”€cloneâ”€> Scan { obj: ObjectRef }
-//!                                                    â””â”€ last ref drops
-//!                                                       permit released
+//! FetchSync { obj: ObjectRef } --clone--> FetchSync { obj: ObjectRef }
+//!                              `-clone--> Scan { obj: ObjectRef }
+//!                                              `- last ref drops
+//!                                                 permit released
 //! ```
 //!
 //! The frontier slot is released exactly when the last task referencing the

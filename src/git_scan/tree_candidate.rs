@@ -24,6 +24,7 @@ pub enum ChangeKind {
 }
 
 impl ChangeKind {
+    /// Returns the stable numeric encoding used in run records and spill files.
     #[inline]
     #[must_use]
     pub const fn as_u8(self) -> u8 {
@@ -66,7 +67,7 @@ pub struct TreeCandidate {
 pub struct ResolvedCandidate<'a> {
     /// Blob object ID.
     pub oid: OidBytes,
-    /// Full path bytes.
+    /// Full path bytes (borrowed from the candidate buffer).
     pub path: &'a [u8],
     /// Commit-graph position identifying the introducing commit.
     pub commit_id: u32,
@@ -78,6 +79,25 @@ pub struct ResolvedCandidate<'a> {
     pub ctx_flags: u16,
     /// Candidate flags.
     pub cand_flags: u16,
+}
+
+/// Sink for tree diff candidates.
+///
+/// Implementations should treat `path` as ephemeral input and copy/intern it
+/// if it needs to persist beyond the call.
+pub trait CandidateSink {
+    /// Receives a candidate blob.
+    #[allow(clippy::too_many_arguments)]
+    fn emit(
+        &mut self,
+        oid: OidBytes,
+        path: &[u8],
+        commit_id: u32,
+        parent_idx: u8,
+        change_kind: ChangeKind,
+        ctx_flags: u16,
+        cand_flags: u16,
+    ) -> Result<(), TreeDiffError>;
 }
 
 /// In-memory candidate buffer for tree diff output.
@@ -98,12 +118,15 @@ pub struct CandidateBuffer {
 }
 
 impl CandidateBuffer {
+    const INIT_CAP: u32 = 16_384;
+
     /// Creates a new candidate buffer.
     #[must_use]
     pub fn new(limits: &TreeDiffLimits, oid_len: u8) -> Self {
         assert!(oid_len == 20 || oid_len == 32, "oid_len must be 20 or 32");
+        let init_cap = limits.max_candidates.min(Self::INIT_CAP) as usize;
         Self {
-            candidates: Vec::with_capacity(limits.max_candidates as usize),
+            candidates: Vec::with_capacity(init_cap),
             path_arena: ByteArena::with_capacity(limits.max_path_arena_bytes),
             max_candidates: limits.max_candidates,
             oid_len,
@@ -130,7 +153,7 @@ impl CandidateBuffer {
     /// `ByteRef` values and resolved path slices.
     pub fn clear(&mut self) {
         self.candidates.clear();
-        self.path_arena = ByteArena::with_capacity(self.path_arena.capacity());
+        self.path_arena.clear_keep_capacity();
     }
 
     /// Pushes a new candidate.
@@ -184,6 +207,29 @@ impl CandidateBuffer {
     #[must_use]
     pub fn iter_resolved(&self) -> ResolvedIter<'_> {
         ResolvedIter { buf: self, idx: 0 }
+    }
+}
+
+impl CandidateSink for CandidateBuffer {
+    fn emit(
+        &mut self,
+        oid: OidBytes,
+        path: &[u8],
+        commit_id: u32,
+        parent_idx: u8,
+        change_kind: ChangeKind,
+        ctx_flags: u16,
+        cand_flags: u16,
+    ) -> Result<(), TreeDiffError> {
+        self.push(
+            oid,
+            path,
+            commit_id,
+            parent_idx,
+            change_kind,
+            ctx_flags,
+            cand_flags,
+        )
     }
 }
 

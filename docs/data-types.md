@@ -11,7 +11,7 @@ classDiagram
         -Vec~RuleMeta~ rule_meta
         -Vec~TransformConfig~ transforms
         -Tuning tuning
-        -AhoCorasick ac_anchors
+        -Option~VsPrefilterDb~ vs
         -Option~Base64YaraGate~ b64_gate
         -Vec~Target~ pat_targets
         -Vec~u32~ pat_offsets
@@ -243,7 +243,7 @@ classDiagram
 ## Notes
 
 - `Engine.b64_gate` is an optional encoded-space pre-gate for Base64 spans. It
-  is built from the same anchor patterns as `ac_anchors` and is only used to
+  is built from the same anchor patterns as `vs` and is only used to
   skip wasteful decodes; the decoded-space gate still enforces correctness.
 
 ## Memory Pool Types

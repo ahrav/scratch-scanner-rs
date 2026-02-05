@@ -65,6 +65,16 @@ sequenceDiagram
 
 This prevents deadlocks where upstream stages block on full queues.
 
+**Archive note:** when archive scanning is enabled, archive entries emit findings
+directly with precomputed virtual path bytes (no `FileTable` insertion). Path
+budget exhaustion results in explicit partial outcomes rather than panics.
+
+**Archive dispatch note:** `ReaderStage` performs archive detection when
+`archive.enabled` is true. If a gzip/tar/tar.gz archive is detected, it invokes
+the archive dispatch entrypoint and does not emit chunks for that file; normal
+chunked scanning continues for non-archive inputs and unsupported formats are
+explicitly skipped.
+
 ## Stage States
 
 ```mermaid

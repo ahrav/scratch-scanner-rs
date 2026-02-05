@@ -89,6 +89,9 @@ flowchart LR
 - **State**: `stack: Vec<WalkEntry>`, `done: bool`
 - **Behavior**: DFS traversal, skips symlinks, respects `max_files` limit
 
+`PipelineStats` now includes `archive: ArchiveStats` for archive outcome
+aggregation when archive scanning is enabled.
+
 ### Reader Stage
 - **Input**: `file_ring` (FileId queue)
 - **Output**: `chunk_ring` (ScanItem queue, cap=128)
@@ -98,6 +101,9 @@ flowchart LR
   - Reads 1MB chunks with configurable overlap
   - Preserves overlap for cross-boundary pattern matching
   - Enqueues `FileDone` after EOF so the scan stage can finalize lexical filtering
+  - Archive handling is gated by `PipelineConfig.archive` (enabled by default)
+  - When enabled, ReaderStage detects archives by extension and header sniff
+  - Archive budgets and path canonicalization are defined in `src/archive/`
 
 ### Scan Stage
 - **Input**: `chunk_ring` (ScanItem queue)
@@ -172,3 +178,24 @@ single thread:
 
 These choices trade some peak throughput for debuggability and predictable
 resource usage, which matters for a scanner that may run on arbitrary inputs.
+
+## Git Scan Concurrency & Backpressure
+
+The Git scanning pipeline is **single-threaded** today: each stage executes
+serially inside the runner with no internal queues or cross-thread handoff.
+Backpressure is enforced through explicit limits rather than runtime channels.
+
+Key bounded points:
+
+- **Spill + dedupe**: `SpillLimits` cap candidate count, spill bytes, and run counts.
+- **Mapping bridge**: `MappingBridgeConfig.max_{packed,loose}_candidates` and
+  `path_arena_capacity` cap in-memory candidate sets and path bytes.
+- **Pack planning**: `PackPlanConfig.max_worklist_entries` and
+  `max_delta_depth` bound delta closure expansion.
+- **Pack execution**: `PackMmapLimits` cap open packs + total mmap bytes;
+  `PackDecodeLimits` cap header bytes, delta bytes, and object bytes.
+
+If any limit is exceeded, the scan fails explicitly and produces no watermark
+advance. This makes the single-threaded execution deterministic and resource
+bounded, and it provides clear queue/budget boundaries to carry forward if
+parallelization is added later.

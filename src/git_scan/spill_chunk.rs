@@ -75,7 +75,7 @@ impl CandidateChunk {
     /// Any previously returned `ByteRef` values become invalid.
     pub fn clear(&mut self) {
         self.candidates.clear();
-        self.path_arena = ByteArena::with_capacity(self.path_arena.capacity());
+        self.path_arena.clear_keep_capacity();
     }
 
     /// Pushes a candidate into the chunk.
@@ -137,12 +137,47 @@ impl CandidateChunk {
     /// This is required before spilling a chunk to disk to ensure run files
     /// are globally mergeable. The ordering compares path bytes (not arena
     /// offsets) to stay stable across runs.
+    ///
+    /// Deduplication uses the full canonical key (OID + path + context).
     pub fn sort_and_dedupe(&mut self) {
         let arena = &self.path_arena;
         self.candidates
-            .sort_by(|a, b| compare_candidates(arena, a, b));
+            .sort_unstable_by(|a, b| compare_candidates(arena, a, b));
         self.candidates
             .dedup_by(|a, b| candidates_equal(arena, a, b));
+        self.reduce_by_oid();
+    }
+
+    fn reduce_by_oid(&mut self) {
+        if self.candidates.is_empty() {
+            return;
+        }
+
+        let arena = &self.path_arena;
+        let mut write = 0usize;
+        let mut idx = 0usize;
+        let len = self.candidates.len();
+        while idx < len {
+            let oid = self.candidates[idx].oid;
+            let mut best = self.candidates[idx];
+            let mut best_path = arena.get(best.ctx.path_ref);
+            idx += 1;
+
+            while idx < len && self.candidates[idx].oid == oid {
+                let cand = self.candidates[idx];
+                let path = arena.get(cand.ctx.path_ref);
+                if is_more_canonical(cand.ctx, path, best.ctx, best_path) {
+                    best = cand;
+                    best_path = path;
+                }
+                idx += 1;
+            }
+
+            self.candidates[write] = best;
+            write += 1;
+        }
+
+        self.candidates.truncate(write);
     }
 
     /// Iterates over resolved candidates with path bytes.
@@ -164,6 +199,9 @@ impl CandidateChunk {
     ///
     /// The work items reference this chunk's path arena via `ByteRef`, so the
     /// chunk must remain alive while the items are processed.
+    ///
+    /// Items are emitted in the current candidate order; call
+    /// `sort_and_dedupe` first if you require canonical ordering.
     ///
     /// # Errors
     /// Returns `SpillError::ArenaOverflow` if the destination work items are full.
@@ -237,6 +275,40 @@ fn candidates_equal(arena: &ByteArena, a: &TreeCandidate, b: &TreeCandidate) -> 
         && arena.get(a.ctx.path_ref) == arena.get(b.ctx.path_ref)
 }
 
+fn is_more_canonical(
+    a_ctx: CandidateContext,
+    a_path: &[u8],
+    b_ctx: CandidateContext,
+    b_path: &[u8],
+) -> bool {
+    match a_ctx.commit_id.cmp(&b_ctx.commit_id) {
+        Ordering::Less => return true,
+        Ordering::Greater => return false,
+        Ordering::Equal => {}
+    }
+    match a_path.cmp(b_path) {
+        Ordering::Less => return true,
+        Ordering::Greater => return false,
+        Ordering::Equal => {}
+    }
+    match a_ctx.parent_idx.cmp(&b_ctx.parent_idx) {
+        Ordering::Less => return true,
+        Ordering::Greater => return false,
+        Ordering::Equal => {}
+    }
+    match a_ctx.change_kind.as_u8().cmp(&b_ctx.change_kind.as_u8()) {
+        Ordering::Less => return true,
+        Ordering::Greater => return false,
+        Ordering::Equal => {}
+    }
+    match a_ctx.ctx_flags.cmp(&b_ctx.ctx_flags) {
+        Ordering::Less => return true,
+        Ordering::Greater => return false,
+        Ordering::Equal => {}
+    }
+    a_ctx.cand_flags < b_ctx.cand_flags
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,13 +350,11 @@ mod tests {
         chunk.sort_and_dedupe();
 
         let resolved: Vec<_> = chunk.iter_resolved().collect();
-        assert_eq!(resolved.len(), 3);
+        assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].oid, oid_a);
         assert_eq!(resolved[0].path, b"a.txt");
-        assert_eq!(resolved[1].oid, oid_a);
-        assert_eq!(resolved[1].path, b"b.txt");
-        assert_eq!(resolved[2].oid, oid_b);
-        assert_eq!(resolved[2].path, b"a.txt");
+        assert_eq!(resolved[1].oid, oid_b);
+        assert_eq!(resolved[1].path, b"a.txt");
     }
 
     #[test]

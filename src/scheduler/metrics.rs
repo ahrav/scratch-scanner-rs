@@ -32,6 +32,8 @@
 //!
 //! For higher precision, consider linear-log hybrid histograms (future work).
 
+use crate::archive::ArchiveStats;
+
 /// Log2 histogram for cheap p95/p99-ish tracking.
 ///
 /// Buckets represent power-of-2 ranges:
@@ -64,7 +66,7 @@ impl Default for Log2Hist {
 
 impl Log2Hist {
     /// Create a new empty histogram.
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             buckets: [0; 64],
             count: 0,
@@ -193,6 +195,9 @@ impl Log2Hist {
 /// # Returns
 /// Index in range [0, 63].
 ///
+/// This invariant is relied upon by `Log2Hist::record` and `record_n`, which
+/// use unchecked indexing for performance.
+///
 /// # Mapping
 /// - 0 -> bucket 0
 /// - 1 -> bucket 0
@@ -281,6 +286,8 @@ pub struct WorkerMetricsLocal {
     pub queue_time_ns: Log2Hist,
     /// Task execution time observations in nanoseconds.
     pub task_time_ns: Log2Hist,
+    /// Archive scanning outcomes (cold path).
+    pub archive: ArchiveStats,
 }
 
 // Compile-time verification of alignment
@@ -291,7 +298,7 @@ const _: () = {
 
 impl WorkerMetricsLocal {
     /// Create new empty worker metrics.
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             tasks_executed: 0,
             tasks_enqueued: 0,
@@ -309,6 +316,7 @@ impl WorkerMetricsLocal {
             _pad: [0; 3],
             queue_time_ns: Log2Hist::new(),
             task_time_ns: Log2Hist::new(),
+            archive: ArchiveStats::default(),
         }
     }
 
@@ -400,6 +408,8 @@ pub struct MetricsSnapshot {
     pub io_errors: u64,
     /// Total findings emitted across all workers.
     pub findings_emitted: u64,
+    /// Aggregate archive scanning outcomes.
+    pub archive: ArchiveStats,
 
     /// Number of workers merged.
     pub worker_count: u32,
@@ -409,7 +419,7 @@ pub struct MetricsSnapshot {
 
 impl MetricsSnapshot {
     /// Create a new empty snapshot.
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             tasks_enqueued: 0,
             tasks_executed: 0,
@@ -426,6 +436,7 @@ impl MetricsSnapshot {
             park_count: 0,
             io_errors: 0,
             findings_emitted: 0,
+            archive: ArchiveStats::default(),
             worker_count: 0,
             duration_ns: 0,
         }
@@ -458,6 +469,7 @@ impl MetricsSnapshot {
         self.park_count = self.park_count.wrapping_add(w.park_count);
         self.io_errors = self.io_errors.wrapping_add(w.io_errors);
         self.findings_emitted = self.findings_emitted.wrapping_add(w.findings_emitted);
+        self.archive.merge_from(&w.archive);
 
         self.worker_count = self.worker_count.wrapping_add(1);
     }

@@ -51,3 +51,5 @@ docs/throughput_investigation.md
 tests/failures/
 
 # Scanner scenario tracking (internal progress document)
+
+git_perf_agent_md/*

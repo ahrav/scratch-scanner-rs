@@ -17,14 +17,31 @@
 //! 5. `spill` dedupes and filters candidates against the seen store.
 //! 6. `mapping_bridge` maps unique blobs to pack/loose candidates.
 //! 7. `pack_plan` builds per-pack decode plans from pack candidates.
+//! 8. `pack_exec` decodes blobs and streams bytes into `engine_adapter`.
+//! 9. `finalize` builds persistence ops, and `persist` commits them atomically.
+//!
+//! # Output model
+//! - Metadata phases emit stable plans and candidate lists without reading blobs.
+//! - Execution phases decode blobs with explicit limits and report per-offset
+//!   skips while keeping output deterministic.
+//! - Finalization emits write ops for data and (on complete runs) watermarks.
+//!
+//! # Feature gates
+//! - `rocksdb` enables the RocksDB persistence adapter.
+//! - `git-perf` enables performance counters for pack decode and scan stages.
 //!
 //! # Invariants
 //! - Metadata stages (preflight through pack planning) do not read blob payloads.
 //! - Pack execution and engine adaptation read and scan blob bytes with explicit limits.
 //! - File reads are bounded by explicit limits.
-//! - Outputs are deterministic for identical repo state.
+//! - Outputs are deterministic for identical repo state and configuration.
 
+pub mod alloc_guard;
+pub mod blob_introducer;
+pub mod blob_spill;
 pub mod byte_arena;
+pub mod bytes;
+pub mod commit_graph;
 pub mod commit_walk;
 pub mod commit_walk_limits;
 pub mod engine_adapter;
@@ -36,6 +53,7 @@ pub mod midx;
 pub mod midx_error;
 pub mod object_id;
 pub mod object_store;
+pub mod oid_index;
 pub mod pack_cache;
 pub mod pack_candidates;
 pub mod pack_decode;
@@ -45,7 +63,9 @@ pub mod pack_inflate;
 pub mod pack_io;
 pub mod pack_plan;
 pub mod pack_plan_model;
+pub mod pack_reader;
 pub mod path_policy;
+pub mod perf;
 pub mod persist;
 pub mod persist_rocksdb;
 pub mod policy_hash;
@@ -60,6 +80,7 @@ pub mod run_writer;
 pub mod runner;
 pub mod seen_store;
 pub mod snapshot_plan;
+pub mod spill_arena;
 pub mod spill_chunk;
 pub mod spill_limits;
 pub mod spill_merge;
@@ -67,15 +88,21 @@ pub mod spiller;
 pub mod start_set;
 pub mod tree_cache;
 pub mod tree_candidate;
+pub mod tree_delta_cache;
 pub mod tree_diff;
 pub mod tree_diff_limits;
 pub mod tree_entry;
 pub mod tree_order;
+pub mod tree_stream;
 pub mod unique_blob;
 pub mod watermark_keys;
 pub mod work_items;
 
+pub use alloc_guard::{enabled as alloc_guard_enabled, set_enabled as set_alloc_guard_enabled};
+pub use blob_introducer::{BlobIntroStats, BlobIntroducer, SeenSets};
 pub use byte_arena::{ByteArena, ByteRef};
+pub use bytes::BytesView;
+pub use commit_graph::CommitGraphIndex;
 pub use commit_walk::{
     introduced_by_plan, topo_order_positions, CommitGraph, CommitGraphView, CommitPlanIter,
     ParentScratch, PlannedCommit,
@@ -83,10 +110,10 @@ pub use commit_walk::{
 pub use commit_walk_limits::CommitWalkLimits;
 pub use engine_adapter::{
     scan_blob_chunked, EngineAdapter, EngineAdapterConfig, EngineAdapterError, FindingKey,
-    ScannedBlob, DEFAULT_CHUNK_BYTES, DEFAULT_PATH_ARENA_BYTES,
+    FindingSpan, ScannedBlob, ScannedBlobs, DEFAULT_CHUNK_BYTES,
 };
 pub use errors::PersistError;
-pub use errors::{CommitPlanError, RepoOpenError, SpillError, TreeDiffError};
+pub use errors::{CommitPlanError, MappingCandidateKind, RepoOpenError, SpillError, TreeDiffError};
 pub use finalize::{
     build_finalize_ops, FinalizeInput, FinalizeOutcome, FinalizeOutput, FinalizeStats, RefEntry,
     WriteOp,
@@ -95,16 +122,20 @@ pub use limits::RepoOpenLimits;
 pub use mapping_bridge::{MappingBridge, MappingBridgeConfig, MappingStats};
 pub use midx::MidxView;
 pub use object_id::{ObjectFormat, OidBytes};
-pub use object_store::{ObjectStore, TreeSource};
+pub use object_store::{ObjectStore, TreeBytes, TreeSource};
+pub use oid_index::OidIndex;
 pub use pack_cache::{CachedObject, PackCache};
 pub use pack_candidates::{
-    CollectingPackCandidateSink, LooseCandidate, PackCandidate, PackCandidateSink,
+    CappedPackCandidateSink, CollectingPackCandidateSink, LooseCandidate, PackCandidate,
+    PackCandidateSink,
 };
 pub use pack_decode::{entry_header_at, inflate_entry_payload, PackDecodeError, PackDecodeLimits};
 pub use pack_delta::{apply_delta, DeltaError};
 pub use pack_exec::{
-    execute_pack_plan, ExternalBase, ExternalBaseProvider, PackExecError, PackExecReport,
-    PackExecStats, PackObjectSink, SkipReason, SkipRecord,
+    aggregate_cache_reject_histogram, build_candidate_ranges, execute_pack_plan,
+    execute_pack_plan_with_reader, execute_pack_plan_with_scratch_indices, merge_pack_exec_reports,
+    CacheRejectHistogram, ExternalBase, ExternalBaseProvider, PackExecError, PackExecReport,
+    PackExecStats, PackObjectSink, SkipReason, SkipRecord, CACHE_REJECT_BUCKETS,
 };
 pub use pack_io::{PackIo, PackIoError, PackIoLimits};
 pub use pack_plan::{build_pack_plans, OidResolver, PackPlanConfig, PackPlanError, PackView};
@@ -112,7 +143,9 @@ pub use pack_plan_model::{
     BaseLoc, CandidateAtOffset, Cluster, DeltaDep, DeltaKind, PackPlan, PackPlanStats,
     CLUSTER_GAP_BYTES,
 };
+pub use pack_reader::{PackReadError, PackReader, SlicePackReader};
 pub use path_policy::PathClass;
+pub use perf::{reset as reset_git_perf, snapshot as git_perf_snapshot, GitPerfStats};
 pub use persist::{persist_finalize_output, InMemoryPersistenceStore, PersistenceStore};
 pub use policy_hash::{policy_hash, MergeDiffMode, PolicyHash};
 pub use preflight::{
@@ -129,7 +162,8 @@ pub use run_format::{RunContext, RunHeader, RunRecord};
 pub use run_reader::RunReader;
 pub use run_writer::RunWriter;
 pub use runner::{
-    run_git_scan, CandidateSkipReason, GitScanConfig, GitScanError, GitScanReport, GitScanResult,
+    run_git_scan, CandidateSkipReason, GitScanAllocStats, GitScanConfig, GitScanError,
+    GitScanMetricsSnapshot, GitScanMode, GitScanReport, GitScanResult, GitScanStageNanos,
     PackMmapLimits, SkippedCandidate,
 };
 pub use seen_store::{AlwaysSeenStore, InMemorySeenStore, NeverSeenStore, SeenBlobStore};
@@ -140,7 +174,7 @@ pub use spill_merge::{merge_all, RunMerger};
 pub use spiller::{SpillStats, Spiller};
 pub use start_set::{StartSetConfig, StartSetId};
 pub use tree_candidate::{
-    CandidateBuffer, CandidateContext, ChangeKind, ResolvedCandidate, TreeCandidate,
+    CandidateBuffer, CandidateContext, CandidateSink, ChangeKind, ResolvedCandidate, TreeCandidate,
 };
 pub use tree_diff::{TreeDiffStats, TreeDiffWalker};
 pub use tree_diff_limits::TreeDiffLimits;

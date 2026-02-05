@@ -5,9 +5,12 @@
 //! `#[non_exhaustive]` to allow adding variants without breaking callers;
 //! consumers should include a fallback match arm.
 //!
-//! Conversions (`From<io::Error>`, `From<MidxError>`) are provided for
-//! spill-related errors to keep propagation ergonomic while preserving
-//! a source error for diagnostics.
+//! # Design Notes
+//! - Variants with `detail` carry human-readable context and are not stable
+//!   for machine parsing.
+//! - I/O errors preserve their source to keep diagnostics actionable.
+//! - Stage boundaries are intentional: an error from one stage should not be
+//!   reused to describe another stage's failure mode.
 
 use std::fmt;
 use std::io;
@@ -17,7 +20,7 @@ use super::midx_error::MidxError;
 /// Errors from repo discovery and open.
 ///
 /// These errors occur before any object scanning begins and typically
-/// indicate repository layout or configuration issues.
+/// indicate repository layout, configuration, or limit violations.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum RepoOpenError {
@@ -173,7 +176,8 @@ impl std::error::Error for CommitPlanError {}
 /// Errors from tree diff and candidate collection.
 ///
 /// These errors occur after the commit plan is built, while loading trees
-/// and extracting candidate paths.
+/// and extracting candidate paths. Many are recoverable by maintenance or
+/// increasing limits (tree depth, bytes, or buffer capacity).
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum TreeDiffError {
@@ -187,7 +191,7 @@ pub enum TreeDiffError {
     InvalidOidLength { len: usize, expected: usize },
     /// Maximum tree recursion depth exceeded.
     MaxTreeDepthExceeded { max_depth: u16 },
-    /// Total tree bytes budget exceeded.
+    /// In-flight tree bytes budget exceeded.
     TreeBytesBudgetExceeded { loaded: u64, budget: u64 },
     /// Path exceeds length limit.
     PathTooLong { len: usize, max: usize },
@@ -195,6 +199,14 @@ pub enum TreeDiffError {
     CandidateBufferFull,
     /// Path arena capacity exceeded.
     PathArenaFull,
+    /// Candidate cap exceeded.
+    CandidateLimitExceeded {
+        kind: MappingCandidateKind,
+        max: u32,
+        observed: u32,
+    },
+    /// Candidate sink failed.
+    CandidateSinkError { detail: String },
     /// Object store failure (MIDX, pack, or loose object decode).
     ObjectStoreError { detail: String },
 }
@@ -214,7 +226,7 @@ impl fmt::Display for TreeDiffError {
             Self::TreeBytesBudgetExceeded { loaded, budget } => {
                 write!(
                     f,
-                    "tree bytes budget exceeded: loaded {loaded}, budget {budget}"
+                    "tree bytes in-flight budget exceeded: loaded {loaded}, budget {budget}"
                 )
             }
             Self::PathTooLong { len, max } => {
@@ -222,12 +234,39 @@ impl fmt::Display for TreeDiffError {
             }
             Self::CandidateBufferFull => write!(f, "candidate buffer full"),
             Self::PathArenaFull => write!(f, "path arena full"),
+            Self::CandidateLimitExceeded {
+                kind,
+                max,
+                observed,
+            } => write!(
+                f,
+                "candidate limit exceeded: kind={kind} observed={observed} max={max}"
+            ),
+            Self::CandidateSinkError { detail } => write!(f, "candidate sink error: {detail}"),
             Self::ObjectStoreError { detail } => write!(f, "object store error: {detail}"),
         }
     }
 }
 
 impl std::error::Error for TreeDiffError {}
+
+/// Mapping candidate kind for cap enforcement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MappingCandidateKind {
+    /// Candidate mapped to a pack offset.
+    Packed,
+    /// Candidate that must be loaded from loose objects.
+    Loose,
+}
+
+impl fmt::Display for MappingCandidateKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Packed => write!(f, "packed"),
+            Self::Loose => write!(f, "loose"),
+        }
+    }
+}
 
 /// Errors from spill and dedupe.
 ///
@@ -258,6 +297,15 @@ pub enum SpillError {
     ArenaOverflow,
     /// Path exceeds length limit.
     PathTooLong { len: usize, max: usize },
+    /// Mapping candidate cap exceeded.
+    MappingCandidateLimitExceeded {
+        /// Candidate kind that exceeded the cap.
+        kind: MappingCandidateKind,
+        /// Configured maximum.
+        max: u32,
+        /// Observed count when the cap was exceeded.
+        observed: u32,
+    },
 }
 
 impl fmt::Display for SpillError {
@@ -292,6 +340,16 @@ impl fmt::Display for SpillError {
             Self::PathTooLong { len, max } => {
                 write!(f, "path too long: {len} bytes (max: {max})")
             }
+            Self::MappingCandidateLimitExceeded {
+                kind,
+                max,
+                observed,
+            } => {
+                write!(
+                    f,
+                    "mapping candidate cap exceeded for {kind}: saw {observed} (max: {max})"
+                )
+            }
         }
     }
 }
@@ -320,7 +378,8 @@ impl From<MidxError> for SpillError {
 
 /// Errors from persistence operations.
 ///
-/// These errors represent failures after scanning has completed.
+/// These errors represent failures after scanning has completed; in-memory
+/// results may still be available even if persistence fails.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum PersistError {

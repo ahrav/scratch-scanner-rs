@@ -3,6 +3,7 @@
 //! Scope:
 //! - Deterministic, single-threaded scheduling of discover + scan tasks.
 //! - Chunked scanning with overlap deduplication using the real `Engine`.
+//! - Archive roots are expanded via `archive::scan` into virtual entry objects.
 //! - Fault injection, IO latency, and cancellations are modeled deterministically
 //!   via a simulated clock and an IO event queue.
 //!
@@ -12,6 +13,8 @@
 //! - Schedule decisions are driven by a seedable RNG in `SimExecutor`.
 //! - IO faults are keyed by path + read index and are schedule-independent.
 //! - Output ordering is emission order; a stability oracle compares sets.
+//! - Archive entry paths are stored in a `VirtualPathTable` with a byte cap.
+//! - Trace ring records schedule choices and archive lifecycle events.
 //!
 //! Oracles implemented here:
 //! - Termination: enforce a max-steps bound to catch hangs.
@@ -19,7 +22,7 @@
 //! - Overlap dedupe: no finding may be entirely contained in the overlap prefix.
 //! - Duplicate suppression: emitted findings are unique under a normalized key.
 //! - In-flight budget: file-task permits never exceed `max_in_flight_objects`.
-//! - Ground-truth: expected secrets are found (for fully observed files),
+//! - Ground-truth: expected secrets are found (for fully observed objects),
 //!   and no unexpected findings appear.
 //! - Differential: chunked results match a single-chunk scan over the observed
 //!   byte stream (post-faults). Non-root findings are compared only when
@@ -28,15 +31,28 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::api::STEP_ROOT;
+use crate::api::{DecodeStep, TransformId, STEP_ROOT};
+use crate::archive::formats::tar::TAR_BLOCK_LEN;
+use crate::archive::scan::{
+    scan_gzip_stream, scan_tar_stream, scan_targz_stream, scan_zip_source, ArchiveEnd,
+    ArchiveEntrySink, ArchiveScratch, EntryChunk, EntryMeta,
+};
+use crate::archive::{
+    detect_kind_from_name_bytes, sniff_kind_from_header, ArchiveConfig, ArchiveKind,
+    ArchiveSkipReason, ArchiveStats,
+};
+use crate::sim::artifact::TraceDump;
 use crate::sim::clock::SimClock;
 use crate::sim::executor::{SimExecutor, SimTask, SimTaskId, SimTaskState, StepResult};
 use crate::sim::fault::{Corruption, FaultInjector, FaultPlan, IoFault, ReadFault};
 use crate::sim::fs::{SimFileHandle, SimFs, SimFsSpec, SimNodeSpec, SimPath, SimTypeHint};
-use crate::sim_scanner::scenario::{RunConfig, Scenario, SecretRepr, SpanU32};
+use crate::sim::trace::{TraceEvent, TraceRing};
+use crate::sim_scanner::scenario::{ExpectedDisposition, RunConfig, Scenario, SecretRepr, SpanU32};
+use crate::sim_scanner::vpath_table::VirtualPathTable;
 use crate::{Engine, FileId, FindingRec, ScanScratch};
 
 /// Result of a simulation run.
@@ -75,6 +91,38 @@ pub enum FailureKind {
     Unimplemented,
 }
 
+const TRACE_RING_CAP: usize = 2048;
+
+#[derive(Debug)]
+struct TraceCollector {
+    ring: TraceRing,
+    full: Option<Vec<TraceEvent>>,
+}
+
+impl TraceCollector {
+    fn new() -> Self {
+        let capture_full = std::env::var_os("SIM_TRACE_FULL").is_some();
+        Self {
+            ring: TraceRing::new(TRACE_RING_CAP),
+            full: capture_full.then(Vec::new),
+        }
+    }
+
+    fn record(&mut self, ev: TraceEvent) {
+        self.ring.push(ev.clone());
+        if let Some(full) = &mut self.full {
+            full.push(ev);
+        }
+    }
+
+    fn dump(self) -> TraceDump {
+        TraceDump {
+            ring: self.ring.dump(),
+            full: self.full,
+        }
+    }
+}
+
 /// Deterministic scanner simulation runner.
 ///
 /// Preconditions:
@@ -96,37 +144,65 @@ impl ScannerSimRunner {
     /// If `cfg.stability_runs > 1`, replays the same scenario under additional
     /// schedule seeds and compares the normalized finding sets.
     pub fn run(&self, scenario: &Scenario, engine: &Engine, fault_plan: &FaultPlan) -> RunOutcome {
-        let base = match self.run_once_catch(scenario, engine, fault_plan, self.schedule_seed) {
+        let (outcome, _trace) = self.run_with_trace(scenario, engine, fault_plan);
+        outcome
+    }
+
+    /// Execute a scenario and return the outcome plus trace data.
+    pub fn run_with_trace(
+        &self,
+        scenario: &Scenario,
+        engine: &Engine,
+        fault_plan: &FaultPlan,
+    ) -> (RunOutcome, TraceDump) {
+        let (base_outcome, base_trace) =
+            self.run_once_catch_with_trace(scenario, engine, fault_plan, self.schedule_seed);
+        let base_findings = match base_outcome {
             RunOutcome::Ok { findings } => findings,
-            fail => return fail,
+            fail => return (fail, base_trace),
         };
 
         if self.cfg.stability_runs <= 1 {
-            return RunOutcome::Ok { findings: base };
+            return (
+                RunOutcome::Ok {
+                    findings: base_findings,
+                },
+                base_trace,
+            );
         }
 
-        let baseline = normalize_findings(&base);
+        let baseline = normalize_findings(&base_findings);
         for i in 1..self.cfg.stability_runs {
             let seed = self.schedule_seed.wrapping_add(i as u64);
-            match self.run_once_catch(scenario, engine, fault_plan, seed) {
+            let (candidate_outcome, candidate_trace) =
+                self.run_once_catch_with_trace(scenario, engine, fault_plan, seed);
+            match candidate_outcome {
                 RunOutcome::Ok { findings } => {
                     let candidate = normalize_findings(&findings);
                     if candidate != baseline {
-                        return RunOutcome::Failed(FailureReport {
-                            kind: FailureKind::StabilityMismatch,
-                            message: format!(
-                                "stability mismatch between seeds {} and {}",
-                                self.schedule_seed, seed
-                            ),
-                            step: 0,
-                        });
+                        return (
+                            RunOutcome::Failed(FailureReport {
+                                kind: FailureKind::StabilityMismatch,
+                                message: format!(
+                                    "stability mismatch between seeds {} and {}",
+                                    self.schedule_seed, seed
+                                ),
+                                step: 0,
+                            }),
+                            candidate_trace,
+                        );
                     }
                 }
-                fail => return fail,
+                fail => return (fail, candidate_trace),
             }
         }
 
-        RunOutcome::Ok { findings: base }
+        (
+            RunOutcome::Ok {
+                findings: base_findings,
+            },
+            base_trace,
+        )
     }
 
     // Wrap a single run to convert panics into a structured failure.
@@ -137,17 +213,31 @@ impl ScannerSimRunner {
         fault_plan: &FaultPlan,
         seed: u64,
     ) -> RunOutcome {
+        let (outcome, _trace) = self.run_once_catch_with_trace(scenario, engine, fault_plan, seed);
+        outcome
+    }
+
+    // Wrap a single run to convert panics into a structured failure.
+    fn run_once_catch_with_trace(
+        &self,
+        scenario: &Scenario,
+        engine: &Engine,
+        fault_plan: &FaultPlan,
+        seed: u64,
+    ) -> (RunOutcome, TraceDump) {
+        let mut trace = TraceCollector::new();
         let res = catch_unwind(AssertUnwindSafe(|| {
-            self.run_once(scenario, engine, fault_plan, seed)
+            self.run_once(scenario, engine, fault_plan, seed, &mut trace)
         }));
-        match res {
+        let outcome = match res {
             Ok(outcome) => outcome,
             Err(payload) => RunOutcome::Failed(FailureReport {
                 kind: FailureKind::Panic,
                 message: panic_message(payload),
                 step: 0,
             }),
-        }
+        };
+        (outcome, trace.dump())
     }
 
     /// Execute a single schedule with no stability replay.
@@ -157,6 +247,7 @@ impl ScannerSimRunner {
         engine: &Engine,
         fault_plan: &FaultPlan,
         seed: u64,
+        trace: &mut TraceCollector,
     ) -> RunOutcome {
         if self.cfg.workers == 0 {
             return self.fail(
@@ -191,6 +282,8 @@ impl ScannerSimRunner {
         let mut executor = SimExecutor::new(self.cfg.workers, seed);
         let mut tasks: Vec<ScannerTask> = Vec::new();
         let mut output = OutputCollector::new();
+        let mut summaries: Vec<ObjectSummary> = Vec::new();
+        let mut archive_roots: Vec<ArchiveRootSummary> = Vec::new();
         let mut clock = SimClock::new();
         let mut faults = FaultInjector::new(fault_plan.clone());
         let mut io_waiters: BTreeMap<u64, Vec<SimTaskId>> = BTreeMap::new();
@@ -200,8 +293,24 @@ impl ScannerSimRunner {
         // Set when discovery is blocked waiting for permits.
         let mut discover_waiting = false;
 
-        let discover = DiscoverState::new(files.clone());
+        let vpath_cap = vpath_bytes_cap(&files, &self.cfg.archive);
+        let mut vpaths = VirtualPathTable::new(vpath_cap);
+        let discovered =
+            match build_discovered_files(&fs, &files, &mut vpaths, self.cfg.archive.enabled) {
+                Ok(v) => v,
+                Err(fail) => return RunOutcome::Failed(fail),
+            };
+        let mut archive_scratch = ArchiveScratch::<std::io::Cursor<Arc<[u8]>>>::new(
+            &self.cfg.archive,
+            self.cfg.chunk_size as usize,
+            overlap,
+        );
+        let discover = DiscoverState::new(discovered);
         let discover_id = executor.spawn_external(SimTask {
+            kind: TaskKind::Discover as u16,
+        });
+        trace.record(TraceEvent::TaskSpawn {
+            task_id: discover_id.index() as u32,
             kind: TaskKind::Discover as u16,
         });
         insert_task(&mut tasks, discover_id, ScannerTask::Discover(discover));
@@ -211,8 +320,8 @@ impl ScannerSimRunner {
 
             if !executor.has_queued_tasks() {
                 if all_tasks_completed(&executor, &tasks) {
-                    let findings = output.finish();
-                    let summaries = take_file_summaries(&mut tasks);
+                    let collected = output.finish();
+                    summaries.sort_by_key(|s| s.file_id.0);
                     if in_flight_objects != 0 {
                         return self.fail(
                             FailureKind::InvariantViolation { code: 33 },
@@ -223,11 +332,18 @@ impl ScannerSimRunner {
                             step,
                         );
                     }
-                    if let Err(fail) =
-                        self.run_oracles(scenario, engine, &files, &findings, &summaries, step)
-                    {
+                    if let Err(fail) = self.run_oracles(
+                        scenario,
+                        engine,
+                        &vpaths,
+                        &archive_roots,
+                        &collected,
+                        &summaries,
+                        step,
+                    ) {
                         return RunOutcome::Failed(fail);
                     }
+                    let CollectedFindings { recs: findings, .. } = collected;
                     return RunOutcome::Ok { findings };
                 }
                 if let Some(next_tick) = next_io_tick(&io_waiters) {
@@ -255,8 +371,16 @@ impl ScannerSimRunner {
                     return self.fail(FailureKind::Hang, "executor idle with queued tasks", step)
                 }
                 StepResult::Ran {
-                    worker, task_id, ..
-                } => (worker, task_id),
+                    worker,
+                    task_id,
+                    decision,
+                } => {
+                    trace.record(TraceEvent::StepChoose {
+                        choices: decision.choices,
+                        chosen: decision.chosen,
+                    });
+                    (worker, task_id)
+                }
             };
 
             if executor.state(task_id) != SimTaskState::Runnable {
@@ -304,15 +428,21 @@ impl ScannerSimRunner {
                             }
                         }
                     }
-                    ScannerTask::FileScan(state) => {
+                    ScannerTask::ObjectScan(state) => {
                         let outcome = match state.step(
                             engine,
                             &fs,
                             &mut faults,
                             overlap,
                             self.cfg.chunk_size as usize,
+                            &self.cfg.archive,
                             self.cfg.max_file_size,
                             &mut output,
+                            &mut summaries,
+                            &mut vpaths,
+                            &mut archive_scratch,
+                            &mut archive_roots,
+                            trace,
                             step,
                             clock.now_ticks(),
                         ) {
@@ -320,7 +450,7 @@ impl ScannerSimRunner {
                             Err(fail) => return RunOutcome::Failed(fail),
                         };
                         match outcome {
-                            FileStepOutcome::Done => {
+                            ScanStepOutcome::Done => {
                                 executor.mark_completed(task_id);
                                 if in_flight_objects == 0 {
                                     return self.fail(
@@ -340,11 +470,11 @@ impl ScannerSimRunner {
                                     discover_waiting = false;
                                 }
                             }
-                            FileStepOutcome::Reschedule => {
+                            ScanStepOutcome::Reschedule => {
                                 executor.mark_runnable(task_id);
                                 executor.enqueue_local(worker, task_id);
                             }
-                            FileStepOutcome::Blocked { ready_at } => {
+                            ScanStepOutcome::Blocked { ready_at } => {
                                 executor.mark_blocked(task_id);
                                 io_waiters.entry(ready_at).or_default().push(task_id);
                             }
@@ -362,19 +492,28 @@ impl ScannerSimRunner {
             if let Some(files) = discover_spawn {
                 // Spawn file scan tasks deterministically in discovered order.
                 for entry in files {
-                    let state =
-                        FileScanState::new(entry.path.clone(), entry.file_id, engine, overlap);
+                    let state = ObjectScanState::new(
+                        entry.path.clone(),
+                        entry.file_id,
+                        entry.archive_kind,
+                        engine,
+                        overlap,
+                    );
 
                     let spawned_id = executor.spawn_local(
                         worker,
                         SimTask {
-                            kind: TaskKind::FileScan as u16,
+                            kind: TaskKind::ObjectScan as u16,
                         },
                     );
+                    trace.record(TraceEvent::TaskSpawn {
+                        task_id: spawned_id.index() as u32,
+                        kind: TaskKind::ObjectScan as u16,
+                    });
                     insert_task(
                         &mut tasks,
                         spawned_id,
-                        ScannerTask::FileScan(Box::new(state)),
+                        ScannerTask::ObjectScan(Box::new(state)),
                     );
 
                     in_flight_objects = match in_flight_objects.checked_add(1) {
@@ -432,17 +571,20 @@ impl ScannerSimRunner {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_oracles(
         &self,
         scenario: &Scenario,
         engine: &Engine,
-        files: &[SimPath],
-        findings: &[FindingRec],
-        summaries: &[FileSummary],
+        vpaths: &VirtualPathTable,
+        archive_roots: &[ArchiveRootSummary],
+        findings: &CollectedFindings,
+        summaries: &[ObjectSummary],
         step: u64,
     ) -> Result<(), FailureReport> {
-        oracle_ground_truth(scenario, files, findings, summaries, step)?;
-        oracle_differential(scenario, files, engine, findings, summaries, step)?;
+        oracle_ground_truth(scenario, vpaths, &findings.recs, summaries, step)?;
+        oracle_differential(scenario, vpaths, engine, findings, summaries, step)?;
+        oracle_archive_outcomes(archive_roots, summaries, &self.cfg.archive, vpaths, step)?;
         Ok(())
     }
 }
@@ -451,7 +593,7 @@ impl ScannerSimRunner {
 /// Task classification for the executor (used for tracing/debugging).
 enum TaskKind {
     Discover = 1,
-    FileScan = 2,
+    ObjectScan = 2,
 }
 
 /// Normalized finding identity used for dedupe and stability checks.
@@ -488,25 +630,71 @@ impl From<&FindingRec> for FindingKey {
     }
 }
 
+/// Findings plus leaf transform metadata for differential normalization.
+///
+/// `leaf_transforms` is aligned with `recs` by index. Entries are `None` for
+/// root findings or chains that contain no transform steps (e.g., UTF-16 only).
+#[derive(Clone, Debug)]
+struct CollectedFindings {
+    recs: Vec<FindingRec>,
+    leaf_transforms: Vec<Option<TransformId>>,
+}
+
 /// Output collector that enforces a no-duplicates invariant.
 ///
 /// Set `SCANNER_SIM_DUP_DEBUG=1` to print diagnostic details when duplicate
 /// findings are detected.
 struct OutputCollector {
     findings: Vec<FindingRec>,
+    leaf_transforms: Vec<Option<TransformId>>,
     seen: BTreeSet<FindingKey>,
+}
+
+fn leaf_transform_id(
+    engine: &Engine,
+    scratch: &mut ScanScratch,
+    rec: &FindingRec,
+) -> Option<TransformId> {
+    // Leaf transform is the last transform step in the decode chain (if any).
+    if rec.step_id == STEP_ROOT {
+        return None;
+    }
+    let steps = scratch.materialize_decode_steps(rec.step_id);
+    steps.iter().rev().find_map(|step| match step {
+        DecodeStep::Transform { transform_idx, .. } => Some(engine.transform_id(*transform_idx)),
+        DecodeStep::Utf16Window { .. } => None,
+    })
+}
+
+fn append_leaf_transforms(
+    engine: &Engine,
+    scratch: &mut ScanScratch,
+    recs: &[FindingRec],
+    out: &mut Vec<Option<TransformId>>,
+) {
+    out.reserve(recs.len());
+    for rec in recs {
+        out.push(leaf_transform_id(engine, scratch, rec));
+    }
 }
 
 impl OutputCollector {
     fn new() -> Self {
         Self {
             findings: Vec::new(),
+            leaf_transforms: Vec::new(),
             seen: BTreeSet::new(),
         }
     }
 
     /// Append a batch of findings, rejecting duplicates by normalized key.
-    fn append(&mut self, batch: &mut Vec<FindingRec>, step: u64) -> Result<(), FailureReport> {
+    fn append(
+        &mut self,
+        batch: &mut Vec<FindingRec>,
+        engine: &Engine,
+        scratch: &mut ScanScratch,
+        step: u64,
+    ) -> Result<(), FailureReport> {
         let mut local_seen: BTreeSet<FindingKey> = BTreeSet::new();
         for rec in batch.drain(..) {
             let key = FindingKey::from(&rec);
@@ -535,39 +723,62 @@ impl OutputCollector {
                     step,
                 });
             }
+            let leaf_transform = leaf_transform_id(engine, scratch, &rec);
             self.findings.push(rec);
+            self.leaf_transforms.push(leaf_transform);
         }
         Ok(())
     }
 
     /// Finish and return findings in emission order.
-    fn finish(self) -> Vec<FindingRec> {
-        self.findings
+    fn finish(self) -> CollectedFindings {
+        CollectedFindings {
+            recs: self.findings,
+            leaf_transforms: self.leaf_transforms,
+        }
     }
 }
 
 enum ScannerTask {
     Discover(DiscoverState),
-    FileScan(Box<FileScanState>),
+    ObjectScan(Box<ObjectScanState>),
 }
 
-/// Summary of the bytes observed for a file during simulation.
+/// Summary of the bytes observed for a scanned object during simulation.
 ///
 /// `ground_truth_ok` is false if any data-affecting fault (error/cancel/corrupt)
 /// occurred, which causes ground-truth checks to skip this file.
 #[derive(Clone, Debug)]
-struct FileSummary {
+struct ObjectSummary {
     file_id: FileId,
+    root_file_id: FileId,
     observed: Vec<u8>,
     ground_truth_ok: bool,
 }
 
+/// Per-root archive outcome + stats.
+#[derive(Clone, Debug)]
+struct ArchiveRootSummary {
+    root_file_id: FileId,
+    outcome: ArchiveEnd,
+    stats: ArchiveStats,
+}
+
 /// Result of executing one file-task quantum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FileStepOutcome {
+enum ScanStepOutcome {
     Done,
     Reschedule,
     Blocked { ready_at: u64 },
+}
+
+enum ScanMode {
+    Plain(Box<FileScanState>),
+    Archive(ArchiveScanState),
+}
+
+struct ObjectScanState {
+    mode: ScanMode,
 }
 
 /// Pending IO read submitted with latency.
@@ -589,21 +800,25 @@ struct DiscoverState {
 struct DiscoveredFile {
     file_id: FileId,
     path: SimPath,
+    archive_kind: Option<ArchiveKind>,
 }
 
 impl DiscoverState {
-    fn new(mut files: Vec<SimPath>) -> Self {
-        files.sort_by(|a, b| a.bytes.cmp(&b.bytes));
-        let files = files
-            .into_iter()
-            .enumerate()
-            .map(|(idx, path)| DiscoveredFile {
-                file_id: FileId(idx as u32),
-                path,
-            })
-            .collect();
-        Self { files }
+    fn new(mut files: Vec<DiscoveredFile>) -> Self {
+        files.sort_by(|a, b| a.path.bytes.cmp(&b.path.bytes));
+        Self {
+            files: files.into(),
+        }
     }
+}
+
+/// Archive scanning state for a single root file.
+struct ArchiveScanState {
+    file_id: FileId,
+    path: SimPath,
+    kind: ArchiveKind,
+    open_fault: Option<IoFault>,
+    open_fault_used: bool,
 }
 
 /// Per-file scanning state for deterministic chunked scans.
@@ -666,7 +881,7 @@ impl FileScanState {
         output: &mut OutputCollector,
         step: u64,
         now: u64,
-    ) -> Result<FileStepOutcome, FailureReport> {
+    ) -> Result<ScanStepOutcome, FailureReport> {
         if chunk_size == 0 {
             return Err(FailureReport {
                 kind: FailureKind::InvariantViolation { code: 11 },
@@ -684,12 +899,12 @@ impl FileScanState {
                 match fault {
                     IoFault::ErrKind { .. } => {
                         self.ground_truth_ok = false;
-                        return Ok(FileStepOutcome::Done);
+                        return Ok(ScanStepOutcome::Done);
                     }
                     IoFault::EIntrOnce => {
                         if !self.open_fault_used {
                             self.open_fault_used = true;
-                            return Ok(FileStepOutcome::Reschedule);
+                            return Ok(ScanStepOutcome::Reschedule);
                         }
                     }
                     IoFault::PartialRead { .. } => {}
@@ -709,12 +924,12 @@ impl FileScanState {
                 });
             }
             if handle.len == 0 {
-                return Ok(FileStepOutcome::Done);
+                return Ok(ScanStepOutcome::Done);
             }
             if handle.len > max_file_size {
                 // Size-cap skip: return Done so the runner releases the permit.
                 self.ground_truth_ok = false;
-                return Ok(FileStepOutcome::Done);
+                return Ok(ScanStepOutcome::Done);
             }
             self.handle = Some(handle);
         }
@@ -758,7 +973,7 @@ impl FileScanState {
 
         let remaining = handle.len.saturating_sub(handle.cursor);
         if remaining == 0 {
-            return Ok(FileStepOutcome::Done);
+            return Ok(ScanStepOutcome::Done);
         }
         let requested = chunk_size.min(remaining as usize);
         let fault = faults.on_read(&self.path.bytes);
@@ -775,7 +990,7 @@ impl FileScanState {
                 ready_at,
                 cancel_after,
             });
-            return Ok(FileStepOutcome::Blocked { ready_at });
+            return Ok(ScanStepOutcome::Blocked { ready_at });
         }
 
         self.complete_read(
@@ -801,7 +1016,7 @@ impl FileScanState {
         fault: ReadFault,
         requested: usize,
         cancel_after: bool,
-    ) -> Result<FileStepOutcome, FailureReport> {
+    ) -> Result<ScanStepOutcome, FailureReport> {
         let Some(handle) = self.handle.as_mut() else {
             return Err(FailureReport {
                 kind: FailureKind::InvariantViolation { code: 17 },
@@ -834,14 +1049,14 @@ impl FileScanState {
         match io_fault {
             Some(IoFault::ErrKind { .. }) => {
                 self.ground_truth_ok = false;
-                Ok(FileStepOutcome::Done)
+                Ok(ScanStepOutcome::Done)
             }
             Some(IoFault::EIntrOnce) => {
                 if cancel_after && handle.cursor < handle.len {
                     self.ground_truth_ok = false;
-                    return Ok(FileStepOutcome::Done);
+                    return Ok(ScanStepOutcome::Done);
                 }
-                Ok(FileStepOutcome::Reschedule)
+                Ok(ScanStepOutcome::Reschedule)
             }
             Some(IoFault::PartialRead { max_len }) => {
                 let capped = (max_len as usize).min(requested);
@@ -880,7 +1095,7 @@ impl FileScanState {
         requested: usize,
         corruption: Option<Corruption>,
         cancel_after: bool,
-    ) -> Result<FileStepOutcome, FailureReport> {
+    ) -> Result<ScanStepOutcome, FailureReport> {
         let Some(handle) = self.handle.as_mut() else {
             return Err(FailureReport {
                 kind: FailureKind::InvariantViolation { code: 20 },
@@ -893,7 +1108,7 @@ impl FileScanState {
             if handle.cursor < handle.len {
                 self.ground_truth_ok = false;
             }
-            return Ok(FileStepOutcome::Done);
+            return Ok(ScanStepOutcome::Done);
         }
 
         let read_offset = handle.cursor;
@@ -917,7 +1132,7 @@ impl FileScanState {
             if handle.cursor < handle.len {
                 self.ground_truth_ok = false;
             }
-            return Ok(FileStepOutcome::Done);
+            return Ok(ScanStepOutcome::Done);
         }
 
         // Track the exact byte stream presented to the engine.
@@ -960,7 +1175,7 @@ impl FileScanState {
                 }
             }
         }
-        output.append(&mut self.batch, step)?;
+        output.append(&mut self.batch, engine, &mut self.scratch, step)?;
 
         let total_len = chunk.len();
         let keep = overlap.min(total_len);
@@ -980,13 +1195,436 @@ impl FileScanState {
 
         if cancel_after && handle.cursor < handle.len {
             self.ground_truth_ok = false;
-            return Ok(FileStepOutcome::Done);
+            return Ok(ScanStepOutcome::Done);
         }
 
         if handle.cursor < handle.len {
-            Ok(FileStepOutcome::Reschedule)
+            Ok(ScanStepOutcome::Reschedule)
         } else {
-            Ok(FileStepOutcome::Done)
+            Ok(ScanStepOutcome::Done)
+        }
+    }
+
+    fn take_summary(&mut self) -> ObjectSummary {
+        ObjectSummary {
+            file_id: self.file_id,
+            root_file_id: self.file_id,
+            observed: std::mem::take(&mut self.observed),
+            ground_truth_ok: self.ground_truth_ok,
+        }
+    }
+}
+
+struct ArchiveEntryState {
+    file_id: FileId,
+    observed: Vec<u8>,
+    ground_truth_ok: bool,
+}
+
+struct SimArchiveSink<'a> {
+    engine: &'a Engine,
+    output: &'a mut OutputCollector,
+    scratch: &'a mut ScanScratch,
+    batch: &'a mut Vec<FindingRec>,
+    vpaths: &'a mut VirtualPathTable,
+    summaries: &'a mut Vec<ObjectSummary>,
+    root_file_id: FileId,
+    trace: &'a mut TraceCollector,
+    current: Option<ArchiveEntryState>,
+    step: u64,
+}
+
+impl<'a> SimArchiveSink<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        engine: &'a Engine,
+        output: &'a mut OutputCollector,
+        scratch: &'a mut ScanScratch,
+        batch: &'a mut Vec<FindingRec>,
+        vpaths: &'a mut VirtualPathTable,
+        summaries: &'a mut Vec<ObjectSummary>,
+        root_file_id: FileId,
+        trace: &'a mut TraceCollector,
+        step: u64,
+    ) -> Self {
+        Self {
+            engine,
+            output,
+            scratch,
+            batch,
+            vpaths,
+            summaries,
+            root_file_id,
+            trace,
+            current: None,
+            step,
+        }
+    }
+}
+
+impl ArchiveEntrySink for SimArchiveSink<'_> {
+    type Error = FailureReport;
+
+    fn on_entry_start(&mut self, meta: &EntryMeta<'_>) -> Result<(), Self::Error> {
+        let file_id = self
+            .vpaths
+            .try_insert_virtual(meta.display_path)
+            .ok_or_else(|| FailureReport {
+                kind: FailureKind::InvariantViolation { code: 50 },
+                message: "virtual path budget exceeded".to_string(),
+                step: self.step,
+            })?;
+
+        self.current = Some(ArchiveEntryState {
+            file_id,
+            observed: Vec::new(),
+            ground_truth_ok: true,
+        });
+        self.trace.record(TraceEvent::ArchiveEntryStart {
+            root: self.root_file_id.0,
+            entry: file_id.0,
+        });
+        Ok(())
+    }
+
+    fn on_entry_chunk(&mut self, chunk: EntryChunk<'_>) -> Result<(), Self::Error> {
+        let entry = self.current.as_mut().ok_or_else(|| FailureReport {
+            kind: FailureKind::InvariantViolation { code: 51 },
+            message: "archive entry chunk before start".to_string(),
+            step: self.step,
+        })?;
+
+        self.engine
+            .scan_chunk_into(chunk.data, entry.file_id, chunk.base_offset, self.scratch);
+        self.scratch.drop_prefix_findings(chunk.new_bytes_start);
+
+        let findings = self.scratch.findings();
+        let drop_hints = self.scratch.drop_hint_end();
+        for (_rec, drop_end) in findings.iter().zip(drop_hints.iter()) {
+            if *drop_end <= chunk.new_bytes_start {
+                return Err(FailureReport {
+                    kind: FailureKind::InvariantViolation { code: 52 },
+                    message: "archive prefix dedupe failed".to_string(),
+                    step: self.step,
+                });
+            }
+        }
+
+        self.scratch.drain_findings_into(self.batch);
+        if chunk.base_offset != 0 {
+            let base_offset_u32 = chunk.base_offset.min(u32::MAX as u64) as u32;
+            for rec in &mut *self.batch {
+                if rec.step_id == STEP_ROOT {
+                    rec.span_start = rec.span_start.saturating_add(base_offset_u32);
+                    rec.span_end = rec.span_end.saturating_add(base_offset_u32);
+                }
+            }
+        }
+        self.output
+            .append(self.batch, self.engine, self.scratch, self.step)?;
+
+        let prefix = chunk.new_bytes_start.saturating_sub(chunk.base_offset) as usize;
+        let new_end = prefix.saturating_add(chunk.new_bytes_len);
+        if new_end > chunk.data.len() {
+            return Err(FailureReport {
+                kind: FailureKind::InvariantViolation { code: 53 },
+                message: "archive chunk bounds invalid".to_string(),
+                step: self.step,
+            });
+        }
+        entry
+            .observed
+            .extend_from_slice(&chunk.data[prefix..new_end]);
+
+        Ok(())
+    }
+
+    fn on_entry_end(&mut self) -> Result<(), Self::Error> {
+        let entry = self.current.take().ok_or_else(|| FailureReport {
+            kind: FailureKind::InvariantViolation { code: 54 },
+            message: "archive entry end without start".to_string(),
+            step: self.step,
+        })?;
+
+        self.summaries.push(ObjectSummary {
+            file_id: entry.file_id,
+            root_file_id: self.root_file_id,
+            observed: entry.observed,
+            ground_truth_ok: entry.ground_truth_ok,
+        });
+        self.trace.record(TraceEvent::ArchiveEntryEnd {
+            root: self.root_file_id.0,
+            entry: entry.file_id.0,
+        });
+        Ok(())
+    }
+}
+
+impl ArchiveScanState {
+    fn new(path: SimPath, file_id: FileId, kind: ArchiveKind) -> Self {
+        Self {
+            file_id,
+            path,
+            kind,
+            open_fault: None,
+            open_fault_used: false,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn step(
+        &mut self,
+        engine: &Engine,
+        fs: &SimFs,
+        faults: &mut FaultInjector,
+        archive_cfg: &ArchiveConfig,
+        max_file_size: u64,
+        output: &mut OutputCollector,
+        summaries: &mut Vec<ObjectSummary>,
+        vpaths: &mut VirtualPathTable,
+        scratch: &mut ArchiveScratch<std::io::Cursor<Arc<[u8]>>>,
+        archive_roots: &mut Vec<ArchiveRootSummary>,
+        trace: &mut TraceCollector,
+        step: u64,
+    ) -> Result<ScanStepOutcome, FailureReport> {
+        let trace_root = self.file_id.0;
+        let trace_kind = archive_kind_code(self.kind);
+        if self.open_fault.is_none() {
+            self.open_fault = faults.on_open(&self.path.bytes);
+        }
+        if let Some(fault) = self.open_fault.clone() {
+            match fault {
+                IoFault::ErrKind { .. } => {
+                    let mut stats = ArchiveStats::default();
+                    stats.record_archive_seen();
+                    stats.record_archive_skipped(
+                        ArchiveSkipReason::IoError,
+                        &self.path.bytes,
+                        false,
+                    );
+                    trace.record(TraceEvent::ArchiveStart {
+                        root: trace_root,
+                        kind: trace_kind,
+                    });
+                    trace.record(TraceEvent::ArchiveEnd {
+                        root: trace_root,
+                        outcome: archive_end_code(ArchiveEnd::Skipped(ArchiveSkipReason::IoError)),
+                    });
+                    archive_roots.push(ArchiveRootSummary {
+                        root_file_id: self.file_id,
+                        outcome: ArchiveEnd::Skipped(ArchiveSkipReason::IoError),
+                        stats,
+                    });
+                    return Ok(ScanStepOutcome::Done);
+                }
+                IoFault::EIntrOnce => {
+                    if !self.open_fault_used {
+                        self.open_fault_used = true;
+                        return Ok(ScanStepOutcome::Reschedule);
+                    }
+                }
+                IoFault::PartialRead { .. } => {}
+            }
+        }
+
+        let handle = fs.open_file(&self.path).map_err(|e| FailureReport {
+            kind: FailureKind::InvariantViolation { code: 40 },
+            message: format!("open {:?}: {e}", self.path.bytes),
+            step,
+        })?;
+        if handle.len > max_file_size {
+            let mut stats = ArchiveStats::default();
+            stats.record_archive_seen();
+            stats.record_archive_skipped(ArchiveSkipReason::IoError, &self.path.bytes, false);
+            trace.record(TraceEvent::ArchiveStart {
+                root: trace_root,
+                kind: trace_kind,
+            });
+            trace.record(TraceEvent::ArchiveEnd {
+                root: trace_root,
+                outcome: archive_end_code(ArchiveEnd::Skipped(ArchiveSkipReason::IoError)),
+            });
+            archive_roots.push(ArchiveRootSummary {
+                root_file_id: self.file_id,
+                outcome: ArchiveEnd::Skipped(ArchiveSkipReason::IoError),
+                stats,
+            });
+            return Ok(ScanStepOutcome::Done);
+        }
+
+        let data = fs.file_bytes(&self.path).map_err(|e| FailureReport {
+            kind: FailureKind::InvariantViolation { code: 41 },
+            message: format!("read {:?}: {e}", self.path.bytes),
+            step,
+        })?;
+        let bytes: Arc<[u8]> = Arc::from(data);
+
+        let mut stats = ArchiveStats::default();
+        stats.record_archive_seen();
+
+        let mut entry_scratch = engine.new_scratch();
+        let mut batch = Vec::with_capacity(engine.tuning.max_findings_per_chunk);
+        let entry_start = summaries.len();
+        trace.record(TraceEvent::ArchiveStart {
+            root: trace_root,
+            kind: trace_kind,
+        });
+        let outcome = {
+            let mut sink = SimArchiveSink::new(
+                engine,
+                output,
+                &mut entry_scratch,
+                &mut batch,
+                vpaths,
+                summaries,
+                self.file_id,
+                trace,
+                step,
+            );
+            match self.kind {
+                ArchiveKind::Gzip => scan_gzip_stream(
+                    std::io::Cursor::new(bytes.clone()),
+                    &self.path.bytes,
+                    archive_cfg,
+                    scratch,
+                    &mut sink,
+                    &mut stats,
+                )?,
+                ArchiveKind::Tar => {
+                    let mut cursor = std::io::Cursor::new(bytes.clone());
+                    scan_tar_stream(
+                        &mut cursor,
+                        &self.path.bytes,
+                        archive_cfg,
+                        scratch,
+                        &mut sink,
+                        &mut stats,
+                        false,
+                    )?
+                }
+                ArchiveKind::TarGz => scan_targz_stream(
+                    std::io::Cursor::new(bytes.clone()),
+                    &self.path.bytes,
+                    archive_cfg,
+                    scratch,
+                    &mut sink,
+                    &mut stats,
+                )?,
+                ArchiveKind::Zip => scan_zip_source(
+                    std::io::Cursor::new(bytes),
+                    &self.path.bytes,
+                    archive_cfg,
+                    scratch,
+                    &mut sink,
+                    &mut stats,
+                )?,
+            }
+        };
+        trace.record(TraceEvent::ArchiveEnd {
+            root: trace_root,
+            outcome: archive_end_code(outcome),
+        });
+
+        match outcome {
+            ArchiveEnd::Scanned => stats.record_archive_scanned(),
+            ArchiveEnd::Skipped(reason) => {
+                stats.record_archive_skipped(reason, &self.path.bytes, false);
+            }
+            ArchiveEnd::Partial(reason) => {
+                stats.record_archive_partial(reason, &self.path.bytes, false);
+            }
+        }
+
+        if outcome != ArchiveEnd::Scanned {
+            for summary in &mut summaries[entry_start..] {
+                summary.ground_truth_ok = false;
+            }
+        }
+
+        archive_roots.push(ArchiveRootSummary {
+            root_file_id: self.file_id,
+            outcome,
+            stats,
+        });
+
+        if scratch.abort_run() {
+            return Err(FailureReport {
+                kind: FailureKind::InvariantViolation { code: 42 },
+                message: "archive scan requested abort_run".to_string(),
+                step,
+            });
+        }
+
+        Ok(ScanStepOutcome::Done)
+    }
+}
+
+impl ObjectScanState {
+    fn new(
+        path: SimPath,
+        file_id: FileId,
+        archive_kind: Option<ArchiveKind>,
+        engine: &Engine,
+        overlap: usize,
+    ) -> Self {
+        let mode = match archive_kind {
+            Some(kind) => ScanMode::Archive(ArchiveScanState::new(path, file_id, kind)),
+            None => ScanMode::Plain(Box::new(FileScanState::new(path, file_id, engine, overlap))),
+        };
+        Self { mode }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn step(
+        &mut self,
+        engine: &Engine,
+        fs: &SimFs,
+        faults: &mut FaultInjector,
+        overlap: usize,
+        chunk_size: usize,
+        archive_cfg: &ArchiveConfig,
+        max_file_size: u64,
+        output: &mut OutputCollector,
+        summaries: &mut Vec<ObjectSummary>,
+        vpaths: &mut VirtualPathTable,
+        scratch: &mut ArchiveScratch<std::io::Cursor<Arc<[u8]>>>,
+        archive_roots: &mut Vec<ArchiveRootSummary>,
+        trace: &mut TraceCollector,
+        step: u64,
+        now: u64,
+    ) -> Result<ScanStepOutcome, FailureReport> {
+        match &mut self.mode {
+            ScanMode::Plain(state) => {
+                let outcome = state.step(
+                    engine,
+                    fs,
+                    faults,
+                    overlap,
+                    chunk_size,
+                    max_file_size,
+                    output,
+                    step,
+                    now,
+                )?;
+                if matches!(outcome, ScanStepOutcome::Done) {
+                    summaries.push(state.take_summary());
+                }
+                Ok(outcome)
+            }
+            ScanMode::Archive(state) => state.step(
+                engine,
+                fs,
+                faults,
+                archive_cfg,
+                max_file_size,
+                output,
+                summaries,
+                vpaths,
+                scratch,
+                archive_roots,
+                trace,
+                step,
+            ),
         }
     }
 }
@@ -1006,21 +1644,6 @@ fn all_tasks_completed(executor: &SimExecutor, tasks: &[ScannerTask]) -> bool {
         .iter()
         .enumerate()
         .all(|(idx, _)| executor.state(SimTaskId::from_u32(idx as u32)) == SimTaskState::Completed)
-}
-
-fn take_file_summaries(tasks: &mut [ScannerTask]) -> Vec<FileSummary> {
-    let mut summaries = Vec::new();
-    for task in tasks {
-        if let ScannerTask::FileScan(state) = task {
-            summaries.push(FileSummary {
-                file_id: state.file_id,
-                observed: std::mem::take(&mut state.observed),
-                ground_truth_ok: state.ground_truth_ok,
-            });
-        }
-    }
-    summaries.sort_by_key(|s| s.file_id.0);
-    summaries
 }
 
 fn deliver_due_io(
@@ -1064,6 +1687,69 @@ fn estimate_fault_ops(plan: &FaultPlan) -> u64 {
     count
 }
 
+fn vpath_bytes_cap(files: &[SimPath], archive: &ArchiveConfig) -> usize {
+    let root_bytes: usize = files.iter().map(|p| p.bytes.len()).sum();
+    let per_archive = archive.max_virtual_path_bytes_per_archive;
+    let archive_total = per_archive.saturating_mul(files.len().max(1));
+    root_bytes.saturating_add(archive_total)
+}
+
+fn detect_archive_kind(fs: &SimFs, path: &SimPath) -> Option<ArchiveKind> {
+    if let Some(kind) = detect_kind_from_name_bytes(&path.bytes) {
+        return Some(kind);
+    }
+    let bytes = fs.file_bytes(path).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let header_len = TAR_BLOCK_LEN.min(bytes.len());
+    sniff_kind_from_header(&bytes[..header_len])
+}
+
+fn archive_kind_code(kind: ArchiveKind) -> u16 {
+    match kind {
+        ArchiveKind::Gzip => 1,
+        ArchiveKind::Tar => 2,
+        ArchiveKind::TarGz => 3,
+        ArchiveKind::Zip => 4,
+    }
+}
+
+fn archive_end_code(end: ArchiveEnd) -> u16 {
+    match end {
+        ArchiveEnd::Scanned => 1,
+        ArchiveEnd::Skipped(_) => 2,
+        ArchiveEnd::Partial(_) => 3,
+    }
+}
+
+fn build_discovered_files(
+    fs: &SimFs,
+    files: &[SimPath],
+    vpaths: &mut VirtualPathTable,
+    archive_enabled: bool,
+) -> Result<Vec<DiscoveredFile>, FailureReport> {
+    let mut out = Vec::with_capacity(files.len());
+    for path in files {
+        let file_id = vpaths.try_insert_root(&path.bytes).ok_or(FailureReport {
+            kind: FailureKind::InvariantViolation { code: 60 },
+            message: "virtual path budget exceeded for root file".to_string(),
+            step: 0,
+        })?;
+        let archive_kind = if archive_enabled {
+            detect_archive_kind(fs, path)
+        } else {
+            None
+        };
+        out.push(DiscoveredFile {
+            file_id,
+            path: path.clone(),
+            archive_kind,
+        });
+    }
+    Ok(out)
+}
+
 fn apply_corruption(buf: &mut Vec<u8>, corruption: &Corruption) {
     match corruption {
         Corruption::TruncateTo { new_len } => {
@@ -1095,6 +1781,7 @@ struct ExpectedEntry {
     rule_id: u32,
     span: SpanU32,
     repr: SecretRepr,
+    disposition: crate::sim_scanner::scenario::ExpectedDisposition,
     matched: bool,
 }
 
@@ -1110,13 +1797,22 @@ fn normalize_findings(findings: &[FindingRec]) -> BTreeSet<FindingKey> {
 /// checks:
 /// - Drop non-root findings that already have a covering root finding for the
 ///   same `(file_id, rule_id)` (avoid redundant duplicates).
+/// - Drop non-root findings whose root-hint span exceeds the guaranteed overlap;
+///   these are alignment-sensitive for long transform runs and are not stable
+///   across chunk boundaries.
 /// - Clamp remaining non-root hints to the last `required_overlap()` bytes so
 ///   the oracle focuses on semantic differences while staying consistent with
 ///   guaranteed overlap.
-fn normalize_findings_for_diff(engine: &Engine, findings: &[FindingRec]) -> BTreeSet<FindingKey> {
+/// - Normalize base64-derived `root_hint_end` when padding is elided so
+///   truncated spans (chunked) compare equal to padded spans (reference).
+fn normalize_findings_for_diff(
+    engine: &Engine,
+    findings: &CollectedFindings,
+) -> BTreeSet<FindingKey> {
+    debug_assert_eq!(findings.recs.len(), findings.leaf_transforms.len());
     let overlap = engine.required_overlap() as u64;
     let mut root_spans: BTreeMap<(u32, u32), Vec<(u64, u64)>> = BTreeMap::new();
-    for rec in findings {
+    for rec in &findings.recs {
         if rec.step_id == STEP_ROOT {
             root_spans
                 .entry((rec.file_id.0, rec.rule_id))
@@ -1125,14 +1821,43 @@ fn normalize_findings_for_diff(engine: &Engine, findings: &[FindingRec]) -> BTre
         }
     }
 
+    fn normalize_root_hint_end(rec: &FindingRec, leaf_transform: Option<TransformId>) -> u64 {
+        if rec.step_id == STEP_ROOT {
+            return rec.root_hint_end;
+        }
+        // Only Base64 uses 4/3 padding rules; other transforms must not normalize.
+        if leaf_transform != Some(TransformId::Base64) {
+            return rec.root_hint_end;
+        }
+        // Base64 decoding is padding-tolerant; chunked scans can surface a match
+        // before trailing '=' arrives. Normalize to the minimal encoded length
+        // when the observed span is within padding tolerance (<= 3 chars).
+        let decoded_len = rec.span_end.saturating_sub(rec.span_start) as u64;
+        let min_encoded = (decoded_len * 4).div_ceil(3);
+        let actual_encoded = rec.root_hint_end.saturating_sub(rec.root_hint_start);
+        if actual_encoded > min_encoded && actual_encoded <= min_encoded.saturating_add(3) {
+            rec.root_hint_start.saturating_add(min_encoded)
+        } else {
+            rec.root_hint_end
+        }
+    }
+
     findings
+        .recs
         .iter()
-        .filter_map(|rec| {
+        .zip(findings.leaf_transforms.iter())
+        .filter_map(|(rec, leaf_transform)| {
+            let normalized_end = normalize_root_hint_end(rec, *leaf_transform);
             if rec.step_id != STEP_ROOT {
+                let hint_len = normalized_end.saturating_sub(rec.root_hint_start);
+                if hint_len > overlap {
+                    return None;
+                }
                 if let Some(spans) = root_spans.get(&(rec.file_id.0, rec.rule_id)) {
-                    if spans.iter().any(|(start, end)| {
-                        rec.root_hint_start <= *start && rec.root_hint_end >= *end
-                    }) {
+                    if spans
+                        .iter()
+                        .any(|(start, end)| rec.root_hint_start <= *start && normalized_end >= *end)
+                    {
                         return None;
                     }
                 }
@@ -1145,7 +1870,7 @@ fn normalize_findings_for_diff(engine: &Engine, findings: &[FindingRec]) -> BTre
             let (root_hint_start, root_hint_end) = if rec.step_id == STEP_ROOT {
                 (rec.root_hint_start, rec.root_hint_end)
             } else {
-                (rec.root_hint_end.saturating_sub(overlap), rec.root_hint_end)
+                (normalized_end.saturating_sub(overlap), normalized_end)
             };
             Some(FindingKey {
                 file_id: rec.file_id.0,
@@ -1203,12 +1928,11 @@ fn discover_file_paths(fs: &SimFs, spec: &SimFsSpec, max_file_size: u64) -> Vec<
 /// ground-truth failure. Files marked `ground_truth_ok = false` are skipped.
 fn oracle_ground_truth(
     scenario: &Scenario,
-    files: &[SimPath],
+    vpaths: &VirtualPathTable,
     findings: &[FindingRec],
-    summaries: &[FileSummary],
+    summaries: &[ObjectSummary],
     step: u64,
 ) -> Result<(), FailureReport> {
-    let file_ids = build_file_id_map(files);
     let mut expected = Vec::with_capacity(scenario.expected.len());
     let mut index: BTreeMap<(u32, u32), Vec<usize>> = BTreeMap::new();
     let mut skip_files: BTreeSet<u32> = BTreeSet::new();
@@ -1221,8 +1945,8 @@ fn oracle_ground_truth(
     }
 
     for exp in &scenario.expected {
-        let file_id = match file_ids.get(&exp.path.bytes) {
-            Some(id) => *id,
+        let file_id = match vpaths.file_id_for_path(&exp.path.bytes) {
+            Some(id) => id,
             None => {
                 return Err(FailureReport {
                     kind: FailureKind::OracleMismatch,
@@ -1244,6 +1968,7 @@ fn oracle_ground_truth(
             rule_id: exp.rule_id,
             span: exp.root_span,
             repr: exp.repr.clone(),
+            disposition: exp.disposition.clone(),
             matched: false,
         });
         index.entry((file_id.0, exp.rule_id)).or_default().push(idx);
@@ -1258,8 +1983,9 @@ fn oracle_ground_truth(
                 kind: FailureKind::OracleMismatch,
                 message: format!(
                     "unexpected finding in {:?} (rule_id {}, root_hint {}..{})",
-                    path_for_file_id(files, rec.file_id)
-                        .map(|p| p.bytes.clone())
+                    vpaths
+                        .path_bytes(rec.file_id)
+                        .map(|p| p.to_vec())
                         .unwrap_or_default(),
                     rec.rule_id,
                     rec.root_hint_start,
@@ -1286,8 +2012,9 @@ fn oracle_ground_truth(
                 kind: FailureKind::OracleMismatch,
                 message: format!(
                     "unexpected finding in {:?} (rule_id {}, root_hint {}..{})",
-                    path_for_file_id(files, rec.file_id)
-                        .map(|p| p.bytes.clone())
+                    vpaths
+                        .path_bytes(rec.file_id)
+                        .map(|p| p.to_vec())
                         .unwrap_or_default(),
                     rec.rule_id,
                     rec.root_hint_start,
@@ -1298,7 +2025,10 @@ fn oracle_ground_truth(
         }
     }
 
-    if let Some(miss) = expected.iter().find(|e| !e.matched) {
+    if let Some(miss) = expected
+        .iter()
+        .find(|e| !e.matched && matches!(e.disposition, ExpectedDisposition::MustFind))
+    {
         return Err(FailureReport {
             kind: FailureKind::OracleMismatch,
             message: format!(
@@ -1315,10 +2045,10 @@ fn oracle_ground_truth(
 /// Compare chunked findings against a single-chunk reference scan.
 fn oracle_differential(
     scenario: &Scenario,
-    files: &[SimPath],
+    vpaths: &VirtualPathTable,
     engine: &Engine,
-    findings: &[FindingRec],
-    summaries: &[FileSummary],
+    findings: &CollectedFindings,
+    summaries: &[ObjectSummary],
     step: u64,
 ) -> Result<(), FailureReport> {
     let reference =
@@ -1424,10 +2154,9 @@ fn oracle_differential(
         }
     }
 
-    let file_ids = build_file_id_map(files);
     let mut expected_spans: BTreeMap<(u32, u32), Vec<SpanU32>> = BTreeMap::new();
     for exp in &scenario.expected {
-        if let Some(id) = file_ids.get(&exp.path.bytes) {
+        if let Some(id) = vpaths.file_id_for_path(&exp.path.bytes) {
             expected_spans
                 .entry((id.0, exp.rule_id))
                 .or_default()
@@ -1461,12 +2190,158 @@ fn oracle_differential(
     Ok(())
 }
 
+fn oracle_archive_outcomes(
+    archive_roots: &[ArchiveRootSummary],
+    summaries: &[ObjectSummary],
+    archive_cfg: &ArchiveConfig,
+    vpaths: &VirtualPathTable,
+    step: u64,
+) -> Result<(), FailureReport> {
+    if archive_roots.is_empty() {
+        return Ok(());
+    }
+
+    let mut observed: BTreeMap<u32, (u64, u64, u64)> = BTreeMap::new();
+    for summary in summaries {
+        let entry_bytes = summary.observed.len() as u64;
+        let entry = observed.entry(summary.root_file_id.0).or_insert((0, 0, 0));
+        entry.0 = entry.0.saturating_add(entry_bytes);
+        entry.1 = entry.1.max(entry_bytes);
+        entry.2 = entry.2.saturating_add(1);
+    }
+
+    for root in archive_roots {
+        let root_path = vpaths
+            .path_bytes(root.root_file_id)
+            .map(|p| p.to_vec())
+            .unwrap_or_default();
+        let (total_bytes, max_entry_bytes, _entry_count) = observed
+            .get(&root.root_file_id.0)
+            .copied()
+            .unwrap_or((0, 0, 0));
+
+        if max_entry_bytes > archive_cfg.max_uncompressed_bytes_per_entry {
+            return Err(FailureReport {
+                kind: FailureKind::OracleMismatch,
+                message: format!(
+                    "archive entry exceeds per-entry cap in {:?}: {} > {}",
+                    root_path, max_entry_bytes, archive_cfg.max_uncompressed_bytes_per_entry
+                ),
+                step,
+            });
+        }
+        if total_bytes > archive_cfg.max_total_uncompressed_bytes_per_root {
+            return Err(FailureReport {
+                kind: FailureKind::OracleMismatch,
+                message: format!(
+                    "archive root exceeds output cap in {:?}: {} > {}",
+                    root_path, total_bytes, archive_cfg.max_total_uncompressed_bytes_per_root
+                ),
+                step,
+            });
+        }
+
+        let total_entries = root
+            .stats
+            .entries_scanned
+            .saturating_add(root.stats.entries_skipped);
+        let max_entries = root
+            .stats
+            .archives_seen
+            .max(1)
+            .saturating_mul(archive_cfg.max_entries_per_archive as u64);
+        if total_entries > max_entries {
+            return Err(FailureReport {
+                kind: FailureKind::OracleMismatch,
+                message: format!(
+                    "archive entry count exceeds cap in {:?}: {} > {}",
+                    root_path, total_entries, max_entries
+                ),
+                step,
+            });
+        }
+
+        if root.stats.paths_truncated > total_entries {
+            return Err(FailureReport {
+                kind: FailureKind::OracleMismatch,
+                message: format!(
+                    "path truncation count exceeds entries in {:?}: {} > {}",
+                    root_path, root.stats.paths_truncated, total_entries
+                ),
+                step,
+            });
+        }
+        if root.stats.paths_had_traversal > total_entries {
+            return Err(FailureReport {
+                kind: FailureKind::OracleMismatch,
+                message: format!(
+                    "path traversal count exceeds entries in {:?}: {} > {}",
+                    root_path, root.stats.paths_had_traversal, total_entries
+                ),
+                step,
+            });
+        }
+        if root.stats.paths_component_cap_exceeded > total_entries {
+            return Err(FailureReport {
+                kind: FailureKind::OracleMismatch,
+                message: format!(
+                    "path component cap count exceeds entries in {:?}: {} > {}",
+                    root_path, root.stats.paths_component_cap_exceeded, total_entries
+                ),
+                step,
+            });
+        }
+
+        match root.outcome {
+            ArchiveEnd::Skipped(reason) => {
+                let idx = reason.as_usize();
+                if root.stats.archive_skip_reasons[idx] == 0 || root.stats.archives_skipped == 0 {
+                    return Err(FailureReport {
+                        kind: FailureKind::OracleMismatch,
+                        message: format!(
+                            "archive skip reason not recorded for {:?}: {:?}",
+                            root_path, reason
+                        ),
+                        step,
+                    });
+                }
+            }
+            ArchiveEnd::Partial(reason) => {
+                let idx = reason.as_usize();
+                if root.stats.partial_reasons[idx] == 0 || root.stats.archives_partial == 0 {
+                    return Err(FailureReport {
+                        kind: FailureKind::OracleMismatch,
+                        message: format!(
+                            "archive partial reason not recorded for {:?}: {:?}",
+                            root_path, reason
+                        ),
+                        step,
+                    });
+                }
+            }
+            ArchiveEnd::Scanned => {}
+        }
+
+        let entry_skip_total: u64 = root.stats.entry_skip_reasons.iter().sum();
+        if root.stats.entries_skipped > 0 && entry_skip_total == 0 {
+            return Err(FailureReport {
+                kind: FailureKind::OracleMismatch,
+                message: format!("entry skip reasons missing for {:?}", root_path),
+                step,
+            });
+        }
+    }
+
+    Ok(())
+}
+
 fn reference_findings_observed(
     engine: &Engine,
-    summaries: &[FileSummary],
-) -> Result<Vec<FindingRec>, String> {
+    summaries: &[ObjectSummary],
+) -> Result<CollectedFindings, String> {
     let mut scratch = engine.new_scratch();
     let mut out = Vec::with_capacity(engine.tuning.max_findings_per_chunk);
+    let mut out_transforms = Vec::with_capacity(engine.tuning.max_findings_per_chunk);
     let mut batch = Vec::with_capacity(engine.tuning.max_findings_per_chunk);
 
     for summary in summaries {
@@ -1482,22 +2357,14 @@ fn reference_findings_observed(
         }
         engine.scan_chunk_into(&summary.observed, summary.file_id, 0, &mut scratch);
         scratch.drain_findings_into(&mut batch);
+        append_leaf_transforms(engine, &mut scratch, &batch, &mut out_transforms);
         out.append(&mut batch);
     }
 
-    Ok(out)
-}
-
-fn build_file_id_map(files: &[SimPath]) -> BTreeMap<Vec<u8>, FileId> {
-    let mut map = BTreeMap::new();
-    for (idx, path) in files.iter().enumerate() {
-        map.insert(path.bytes.clone(), FileId(idx as u32));
-    }
-    map
-}
-
-fn path_for_file_id(files: &[SimPath], file_id: FileId) -> Option<&SimPath> {
-    files.get(file_id.0 as usize)
+    Ok(CollectedFindings {
+        recs: out,
+        leaf_transforms: out_transforms,
+    })
 }
 
 fn span_matches_expected(span: SpanU32, start: u64, end: u64, repr: &SecretRepr) -> bool {
@@ -1551,5 +2418,168 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
         s.clone()
     } else {
         "panic payload".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_findings_for_diff, CollectedFindings};
+    use crate::api::{FileId, FindingRec, StepId, TransformId, STEP_ROOT};
+    use crate::archive::ArchiveConfig;
+    use crate::sim_scanner::generator::build_engine_from_suite;
+    use crate::sim_scanner::scenario::{RuleSuiteSpec, RunConfig, SyntheticRuleSpec};
+
+    fn test_engine() -> crate::Engine {
+        let suite = RuleSuiteSpec {
+            schema_version: 1,
+            rules: vec![SyntheticRuleSpec {
+                rule_id: 0,
+                name: "test_rule".to_string(),
+                anchors: vec![b"TEST".to_vec()],
+                radius: 16,
+                regex: "TEST[0-9]{4}".to_string(),
+            }],
+        };
+        let run_cfg = RunConfig {
+            workers: 1,
+            chunk_size: 64,
+            overlap: 64,
+            max_in_flight_objects: 1,
+            buffer_pool_cap: 1,
+            max_file_size: u64::MAX,
+            max_steps: 0,
+            max_transform_depth: 2,
+            scan_utf16_variants: false,
+            archive: ArchiveConfig::default(),
+            stability_runs: 1,
+        };
+        build_engine_from_suite(&suite, &run_cfg).expect("engine build")
+    }
+
+    fn non_root_rec(
+        span_len: u32,
+        root_hint_start: u64,
+        root_hint_end: u64,
+        step_id: StepId,
+    ) -> FindingRec {
+        FindingRec {
+            file_id: FileId(0),
+            rule_id: 0,
+            span_start: 0,
+            span_end: span_len,
+            root_hint_start,
+            root_hint_end,
+            dedupe_with_span: false,
+            step_id,
+        }
+    }
+
+    fn root_rec(span_start: u32, span_end: u32) -> FindingRec {
+        FindingRec {
+            file_id: FileId(0),
+            rule_id: 0,
+            span_start,
+            span_end,
+            root_hint_start: span_start as u64,
+            root_hint_end: span_end as u64,
+            dedupe_with_span: true,
+            step_id: STEP_ROOT,
+        }
+    }
+
+    #[test]
+    fn normalize_findings_for_diff_uses_normalized_end_for_overlap_filter() {
+        let engine = test_engine();
+        let overlap = engine.required_overlap() as u64;
+
+        let mut decoded_len = 1u64;
+        let (min_encoded, decoded_len) = loop {
+            let min_encoded = (decoded_len * 4).div_ceil(3);
+            if min_encoded <= overlap && min_encoded + 3 > overlap {
+                break (min_encoded, decoded_len);
+            }
+            decoded_len = decoded_len.saturating_add(1);
+            assert!(decoded_len < 4096);
+        };
+
+        let root_hint_start: u64 = 100;
+        let actual_encoded = overlap.saturating_add(1);
+        let root_hint_end = root_hint_start.saturating_add(actual_encoded);
+        assert!(actual_encoded > min_encoded);
+        assert!(actual_encoded <= min_encoded.saturating_add(3));
+
+        let rec = non_root_rec(
+            decoded_len as u32,
+            root_hint_start,
+            root_hint_end,
+            StepId(0),
+        );
+        let findings = CollectedFindings {
+            recs: vec![rec],
+            leaf_transforms: vec![Some(TransformId::Base64)],
+        };
+
+        let normalized = normalize_findings_for_diff(&engine, &findings);
+        assert_eq!(normalized.len(), 1);
+        let key = normalized.iter().next().unwrap();
+        assert_eq!(key.root_hint_end, root_hint_start + min_encoded);
+    }
+
+    #[test]
+    fn normalize_findings_for_diff_uses_normalized_end_for_coverage_filter() {
+        let engine = test_engine();
+        let overlap = engine.required_overlap() as u64;
+
+        let decoded_len = 1u64;
+        let min_encoded = (decoded_len * 4).div_ceil(3);
+        assert!(overlap >= min_encoded);
+
+        let root_hint_start: u64 = 0;
+        let actual_encoded = min_encoded.saturating_add(3);
+        let root_hint_end = root_hint_start.saturating_add(actual_encoded);
+        let root_span_end = (min_encoded + 1) as u32;
+        assert!(root_span_end as u64 <= actual_encoded);
+        assert!(root_span_end as u64 > min_encoded);
+
+        let root = root_rec(0, root_span_end);
+        let non_root = non_root_rec(
+            decoded_len as u32,
+            root_hint_start,
+            root_hint_end,
+            StepId(1),
+        );
+        let findings = CollectedFindings {
+            recs: vec![root, non_root],
+            leaf_transforms: vec![None, Some(TransformId::Base64)],
+        };
+
+        let normalized = normalize_findings_for_diff(&engine, &findings);
+        assert_eq!(normalized.len(), 2);
+        assert!(normalized
+            .iter()
+            .any(|key| key.span_start == 0 && key.span_end == 0));
+        assert!(normalized
+            .iter()
+            .any(|key| key.span_start != 0 || key.span_end != 0));
+    }
+
+    #[test]
+    fn normalize_findings_for_diff_skips_base64_padding_for_non_base64() {
+        let engine = test_engine();
+        let overlap = engine.required_overlap() as u64;
+        assert!(overlap >= 3);
+
+        let root_hint_start = 50;
+        let root_hint_end = root_hint_start + 3;
+        let rec = non_root_rec(1, root_hint_start, root_hint_end, StepId(2));
+        let findings = CollectedFindings {
+            recs: vec![rec],
+            leaf_transforms: vec![Some(TransformId::UrlPercent)],
+        };
+
+        let normalized = normalize_findings_for_diff(&engine, &findings);
+        assert_eq!(normalized.len(), 1);
+        let key = normalized.iter().next().unwrap();
+        assert_eq!(key.root_hint_end, root_hint_end);
     }
 }

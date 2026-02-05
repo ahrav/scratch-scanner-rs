@@ -91,6 +91,7 @@
 
 use super::local::{scan_local, FileSource, LocalConfig, LocalFile, LocalReport};
 use super::output_sink::OutputSink;
+use crate::archive::ArchiveConfig;
 use crate::engine::Engine;
 
 use std::io;
@@ -140,6 +141,9 @@ impl EntryLike for ignore::DirEntry {
 ///
 /// Discovery avoids per-file metadata when a type hint is available. Size caps
 /// are enforced at open time in `local.rs`.
+///
+/// When the fast type hint path is used, the file size is set to 0; open-time
+/// metadata determines the actual size and enforcement.
 ///
 /// Returns `None` on:
 /// - Non-file entries
@@ -276,6 +280,8 @@ pub struct ParallelScanConfig {
 
     /// Context mode for candidate-only lexical filtering.
     pub context_mode: crate::ContextMode,
+    /// Archive scanning configuration.
+    pub archive: ArchiveConfig,
 }
 
 impl Default for ParallelScanConfig {
@@ -293,6 +299,7 @@ impl Default for ParallelScanConfig {
             respect_gitignore: true,
             max_file_size: 100 * 1024 * 1024, // 100 MiB
             context_mode: crate::ContextMode::Off,
+            archive: ArchiveConfig::default(),
         }
     }
 }
@@ -315,6 +322,7 @@ impl ParallelScanConfig {
             seed: self.seed,
             dedupe_within_chunk: true,
             context_mode: self.context_mode,
+            archive: self.archive.clone(),
         }
     }
 }
@@ -324,6 +332,8 @@ impl ParallelScanConfig {
 // ============================================================================
 
 /// Report from a parallel directory scan.
+///
+/// This is currently identical to `LocalReport` (stats + metrics snapshot).
 pub type ParallelScanReport = LocalReport;
 
 // ============================================================================
@@ -642,6 +652,7 @@ mod tests {
             respect_gitignore: false,
             max_file_size: 10 * 1024 * 1024,
             context_mode: crate::ContextMode::Off,
+            archive: ArchiveConfig::default(),
         }
     }
 

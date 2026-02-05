@@ -9,6 +9,17 @@
 //! Stages are executed in a tight suggest/pump loop using fixed-capacity rings:
 //! Walker -> Reader -> Scanner -> Output.
 //!
+//! # Archive scanning
+//! - When enabled, archive detection runs in the reader stage (extension first,
+//!   then magic sniff) and scanning is performed via streaming decoders.
+//! - Archive findings bypass the chunk ring and are emitted directly to output,
+//!   while archive outcomes are recorded in `PipelineStats`.
+//!
+//! # Candidate-only lexical pass
+//! - When `PipelineConfig.context_mode != Off`, findings are buffered per file.
+//! - A second pass tokenizes the file to apply lexical context rules, failing
+//!   open on unknown language, size changes, or tokenization errors.
+//!
 //! # Invariants and budgets
 //! - Rings are fixed-capacity; every stage must tolerate backpressure.
 //! - Chunk overlap is set to `Engine::required_overlap()` to avoid missed
@@ -16,6 +27,15 @@
 //! - On Unix, path storage is a fixed-size arena; exceeding it is a hard error.
 //! - The pipeline is single-threaded and not Sync/Send by design.
 
+use crate::archive::formats::tar::TAR_BLOCK_LEN;
+use crate::archive::scan::{
+    scan_gzip_stream, scan_tar_stream, scan_targz_stream, scan_zip_source, ArchiveEnd,
+    ArchiveEntrySink, ArchiveScratch as ArchiveCoreScratch, EntryChunk, EntryMeta,
+};
+use crate::archive::{
+    detect_kind_from_path, sniff_kind_from_header, ArchiveConfig, ArchiveKind, ArchiveSkipReason,
+    ArchiveStats,
+};
 use crate::git_scan::path_policy::lexical_family_for_path;
 use crate::lexical::{LexRuns, DEFAULT_LEX_RUN_CAP};
 #[cfg(unix)]
@@ -31,7 +51,7 @@ use crate::{
 #[cfg(not(unix))]
 use std::fs;
 use std::fs::File;
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 #[cfg(not(unix))]
 use std::path::PathBuf;
@@ -107,6 +127,8 @@ pub struct PipelineConfig {
     pub path_bytes_cap: usize,
     /// Context mode for candidate-only lexical filtering.
     pub context_mode: ContextMode,
+    /// Archive scanning configuration.
+    pub archive: ArchiveConfig,
 }
 
 impl Default for PipelineConfig {
@@ -117,6 +139,7 @@ impl Default for PipelineConfig {
             max_files,
             path_bytes_cap: max_files.saturating_mul(PIPE_PATH_BYTES_PER_FILE),
             context_mode: ContextMode::Off,
+            archive: ArchiveConfig::default(),
         }
     }
 }
@@ -145,6 +168,8 @@ pub struct PipelineStats {
     /// Optional Base64 decode/gate instrumentation (feature: `b64-stats`).
     #[cfg(feature = "b64-stats")]
     pub base64: crate::Base64DecodeStats,
+    /// Archive scanning outcomes (when enabled).
+    pub archive: ArchiveStats,
 }
 
 /// Simple single-producer, single-consumer ring wrapper.
@@ -219,6 +244,11 @@ impl Walker {
             done: true,
             max_files,
         }
+    }
+
+    fn abort(&mut self) {
+        self.stack.clear();
+        self.done = true;
     }
 
     fn reset(
@@ -329,6 +359,8 @@ struct DirState {
 #[cfg(unix)]
 impl Drop for DirState {
     fn drop(&mut self) {
+        // SAFETY: `dirp` is owned by this `DirState` and was created by
+        // `fdopendir`. It is closed exactly once here.
         unsafe {
             libc::closedir(self.dirp);
         }
@@ -361,6 +393,12 @@ impl Walker {
         }
     }
 
+    fn abort(&mut self) {
+        self.stack.clear();
+        self.pending = None;
+        self.done = true;
+    }
+
     fn reset(
         &mut self,
         root: &Path,
@@ -378,12 +416,15 @@ impl Walker {
         }
 
         let root_span = files.alloc_path_span(root_bytes);
-        let st = with_c_path(root, |c_path| unsafe {
-            let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
-            if libc::lstat(c_path, st.as_mut_ptr()) != 0 {
-                return Err(io::Error::last_os_error());
+        let st = with_c_path(root, |c_path| {
+            // SAFETY: `c_path` is a NUL-terminated buffer valid for this call.
+            unsafe {
+                let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+                if libc::lstat(c_path, st.as_mut_ptr()) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(st.assume_init())
             }
-            Ok(st.assume_init())
         })?;
 
         let mode = st.st_mode & libc::S_IFMT;
@@ -445,6 +486,9 @@ impl Walker {
                 (entry.dirp, entry.fd, entry.path)
             };
 
+            // SAFETY: `dirp` is a live DIR* created by `fdopendir`. We call
+            // `readdir` serially on this thread, and consume the returned
+            // `dirent` immediately before the next `readdir` call.
             unsafe {
                 set_errno(0);
                 let ent = libc::readdir(dirp);
@@ -584,10 +628,335 @@ impl FileReader {
     }
 }
 
+/// Reusable scratch state for archive scanning inside the pipeline.
+///
+/// # Invariants
+/// - All buffers are preallocated and reused; per-entry allocations are avoided.
+/// - `next_virtual_file_id` stays in the high-bit namespace to avoid collisions
+///   with real file ids.
+struct ArchiveScratch {
+    core: ArchiveCoreScratch<File>,
+    scan_scratch: ScanScratch,
+    pending: Vec<FindingRec>,
+    entry_path_buf: Vec<u8>,
+    /// Monotonic virtual `FileId` generator for archive entries.
+    next_virtual_file_id: u32,
+}
+
+impl ArchiveScratch {
+    fn new(engine: &Engine, archive: &ArchiveConfig, chunk_size: usize) -> Self {
+        let overlap = engine.required_overlap();
+        let entry_path_cap = archive.max_virtual_path_len_per_entry;
+
+        Self {
+            core: ArchiveCoreScratch::new(archive, chunk_size, overlap),
+            scan_scratch: engine.new_scratch(),
+            pending: Vec::with_capacity(engine.tuning.max_findings_per_chunk),
+            entry_path_buf: Vec::with_capacity(entry_path_cap),
+            next_virtual_file_id: 0x8000_0000,
+        }
+    }
+}
+
+/// Allocate a virtual `FileId` for archive entries (high-bit namespace).
+///
+/// Wraps within the high-bit range; after ~2^31 entries, ids may repeat.
+#[inline]
+fn alloc_virtual_file_id(next_virtual_file_id: &mut u32) -> FileId {
+    const VIRTUAL_FILE_ID_BASE: u32 = 0x8000_0000;
+    const VIRTUAL_FILE_ID_MASK: u32 = 0x7FFF_FFFF;
+
+    let id = *next_virtual_file_id;
+    let next = (id.wrapping_add(1) & VIRTUAL_FILE_ID_MASK) | VIRTUAL_FILE_ID_BASE;
+    *next_virtual_file_id = next;
+    FileId(id)
+}
+
+struct PipelineArchiveSink<'a> {
+    engine: &'a Engine,
+    output: &'a mut OutputStage,
+    findings: &'a mut u64,
+    chunks: &'a mut u64,
+    bytes_scanned: &'a mut u64,
+    scan_scratch: &'a mut ScanScratch,
+    pending: &'a mut Vec<FindingRec>,
+    entry_path_buf: &'a mut Vec<u8>,
+    next_virtual_file_id: &'a mut u32,
+    current_file_id: Option<FileId>,
+}
+
+impl<'a> PipelineArchiveSink<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        engine: &'a Engine,
+        output: &'a mut OutputStage,
+        findings: &'a mut u64,
+        chunks: &'a mut u64,
+        bytes_scanned: &'a mut u64,
+        scan_scratch: &'a mut ScanScratch,
+        pending: &'a mut Vec<FindingRec>,
+        entry_path_buf: &'a mut Vec<u8>,
+        next_virtual_file_id: &'a mut u32,
+    ) -> Self {
+        Self {
+            engine,
+            output,
+            findings,
+            chunks,
+            bytes_scanned,
+            scan_scratch,
+            pending,
+            entry_path_buf,
+            next_virtual_file_id,
+            current_file_id: None,
+        }
+    }
+}
+
+impl ArchiveEntrySink for PipelineArchiveSink<'_> {
+    type Error = io::Error;
+
+    fn on_entry_start(&mut self, meta: &EntryMeta<'_>) -> Result<(), Self::Error> {
+        let file_id = alloc_virtual_file_id(self.next_virtual_file_id);
+        self.current_file_id = Some(file_id);
+
+        debug_assert!(
+            self.entry_path_buf.capacity() >= meta.display_path.len(),
+            "entry path buffer too small for display path"
+        );
+        self.entry_path_buf.clear();
+        self.entry_path_buf.extend_from_slice(meta.display_path);
+        Ok(())
+    }
+
+    fn on_entry_chunk(&mut self, chunk: EntryChunk<'_>) -> Result<(), Self::Error> {
+        let file_id = self
+            .current_file_id
+            .expect("archive entry chunk before start");
+
+        self.engine
+            .scan_chunk_into(chunk.data, file_id, chunk.base_offset, self.scan_scratch);
+        self.scan_scratch
+            .drop_prefix_findings(chunk.new_bytes_start);
+
+        self.pending.clear();
+        self.scan_scratch.drain_findings_into(self.pending);
+
+        self.output.emit_findings_direct(
+            self.engine,
+            self.entry_path_buf.as_slice(),
+            self.pending,
+            self.findings,
+        )?;
+
+        *self.chunks = self.chunks.saturating_add(1);
+        *self.bytes_scanned = self
+            .bytes_scanned
+            .saturating_add(chunk.new_bytes_len as u64);
+        Ok(())
+    }
+
+    fn on_entry_end(&mut self) -> Result<(), Self::Error> {
+        self.current_file_id = None;
+        Ok(())
+    }
+}
+
+fn scan_gzip_file(
+    path: &Path,
+    _file_id: FileId,
+    engine: &Engine,
+    archive: &ArchiveConfig,
+    scratch: &mut ArchiveScratch,
+    output: &mut OutputStage,
+    stats: &mut PipelineStats,
+) -> io::Result<ArchiveEnd> {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => {
+            stats.open_errors = stats.open_errors.saturating_add(1);
+            stats.errors = stats.errors.saturating_add(1);
+            return Ok(ArchiveEnd::Skipped(ArchiveSkipReason::IoError));
+        }
+    };
+
+    let parent_bytes = path.as_os_str().as_encoded_bytes();
+    let ArchiveScratch {
+        core,
+        scan_scratch,
+        pending,
+        entry_path_buf,
+        next_virtual_file_id,
+    } = scratch;
+    let stats_archive = &mut stats.archive;
+    let stats_findings = &mut stats.findings;
+    let stats_chunks = &mut stats.chunks;
+    let stats_bytes_scanned = &mut stats.bytes_scanned;
+    let mut sink = PipelineArchiveSink::new(
+        engine,
+        output,
+        stats_findings,
+        stats_chunks,
+        stats_bytes_scanned,
+        scan_scratch,
+        pending,
+        entry_path_buf,
+        next_virtual_file_id,
+    );
+    scan_gzip_stream(file, parent_bytes, archive, core, &mut sink, stats_archive)
+}
+
+fn scan_tar_file(
+    path: &Path,
+    engine: &Engine,
+    archive: &ArchiveConfig,
+    scratch: &mut ArchiveScratch,
+    output: &mut OutputStage,
+    stats: &mut PipelineStats,
+) -> io::Result<ArchiveEnd> {
+    let mut file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => {
+            stats.open_errors = stats.open_errors.saturating_add(1);
+            stats.errors = stats.errors.saturating_add(1);
+            return Ok(ArchiveEnd::Skipped(ArchiveSkipReason::IoError));
+        }
+    };
+
+    let parent_bytes = path.as_os_str().as_encoded_bytes();
+    let ArchiveScratch {
+        core,
+        scan_scratch,
+        pending,
+        entry_path_buf,
+        next_virtual_file_id,
+    } = scratch;
+    let stats_archive = &mut stats.archive;
+    let stats_findings = &mut stats.findings;
+    let stats_chunks = &mut stats.chunks;
+    let stats_bytes_scanned = &mut stats.bytes_scanned;
+    let mut sink = PipelineArchiveSink::new(
+        engine,
+        output,
+        stats_findings,
+        stats_chunks,
+        stats_bytes_scanned,
+        scan_scratch,
+        pending,
+        entry_path_buf,
+        next_virtual_file_id,
+    );
+    scan_tar_stream(
+        &mut file,
+        parent_bytes,
+        archive,
+        core,
+        &mut sink,
+        stats_archive,
+        false,
+    )
+}
+
+/// Process a `.tar.gz` file via gzip+tar streaming.
+fn scan_targz_file(
+    path: &Path,
+    engine: &Engine,
+    archive: &ArchiveConfig,
+    scratch: &mut ArchiveScratch,
+    output: &mut OutputStage,
+    stats: &mut PipelineStats,
+) -> io::Result<ArchiveEnd> {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => {
+            stats.open_errors = stats.open_errors.saturating_add(1);
+            stats.errors = stats.errors.saturating_add(1);
+            return Ok(ArchiveEnd::Skipped(ArchiveSkipReason::IoError));
+        }
+    };
+
+    let parent_bytes = path.as_os_str().as_encoded_bytes();
+    let ArchiveScratch {
+        core,
+        scan_scratch,
+        pending,
+        entry_path_buf,
+        next_virtual_file_id,
+    } = scratch;
+    let stats_archive = &mut stats.archive;
+    let stats_findings = &mut stats.findings;
+    let stats_chunks = &mut stats.chunks;
+    let stats_bytes_scanned = &mut stats.bytes_scanned;
+    let mut sink = PipelineArchiveSink::new(
+        engine,
+        output,
+        stats_findings,
+        stats_chunks,
+        stats_bytes_scanned,
+        scan_scratch,
+        pending,
+        entry_path_buf,
+        next_virtual_file_id,
+    );
+    scan_targz_stream(file, parent_bytes, archive, core, &mut sink, stats_archive)
+}
+
+/// Scan a ZIP file using file-backed random access.
+///
+/// # Design Notes
+/// - Central directory parsing is bounded by metadata budgets.
+/// - Only stored/deflated entries are scanned; others are skipped explicitly.
+fn scan_zip_file(
+    path: &Path,
+    engine: &Engine,
+    archive: &ArchiveConfig,
+    scratch: &mut ArchiveScratch,
+    output: &mut OutputStage,
+    stats: &mut PipelineStats,
+) -> io::Result<ArchiveEnd> {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => {
+            stats.open_errors = stats.open_errors.saturating_add(1);
+            stats.errors = stats.errors.saturating_add(1);
+            return Ok(ArchiveEnd::Skipped(ArchiveSkipReason::IoError));
+        }
+    };
+
+    let parent_bytes = path.as_os_str().as_encoded_bytes();
+    let ArchiveScratch {
+        core,
+        scan_scratch,
+        pending,
+        entry_path_buf,
+        next_virtual_file_id,
+    } = scratch;
+    let stats_archive = &mut stats.archive;
+    let stats_findings = &mut stats.findings;
+    let stats_chunks = &mut stats.chunks;
+    let stats_bytes_scanned = &mut stats.bytes_scanned;
+    let mut sink = PipelineArchiveSink::new(
+        engine,
+        output,
+        stats_findings,
+        stats_chunks,
+        stats_bytes_scanned,
+        scan_scratch,
+        pending,
+        entry_path_buf,
+        next_virtual_file_id,
+    );
+    scan_zip_source(file, parent_bytes, archive, core, &mut sink, stats_archive)
+}
+
 /// Stage that turns file ids into buffered chunks.
 ///
 /// Maintains a single active reader and a fixed overlap tail to keep IO
 /// sequential and memory bounded.
+///
+/// When archive scanning is enabled, this stage detects archive containers and
+/// routes them through the archive dispatch entrypoint instead of emitting
+/// chunks.
 struct ReaderStage {
     overlap: usize,
     chunk_size: usize,
@@ -595,6 +964,30 @@ struct ReaderStage {
     pending_done: Option<FileId>,
     tail: Vec<u8>,
     tail_len: usize,
+}
+
+/// Dispatch archive scanning by kind.
+///
+/// Currently gzip/tar/tar.gz are supported; other formats are skipped.
+///
+/// The caller is responsible for recording archive stats based on the result.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_archive_scan(
+    path: &Path,
+    file_id: FileId,
+    engine: &Engine,
+    archive: &ArchiveConfig,
+    scratch: &mut ArchiveScratch,
+    output: &mut OutputStage,
+    stats: &mut PipelineStats,
+    kind: ArchiveKind,
+) -> io::Result<ArchiveEnd> {
+    match kind {
+        ArchiveKind::Gzip => scan_gzip_file(path, file_id, engine, archive, scratch, output, stats),
+        ArchiveKind::Tar => scan_tar_file(path, engine, archive, scratch, output, stats),
+        ArchiveKind::TarGz => scan_targz_file(path, engine, archive, scratch, output, stats),
+        ArchiveKind::Zip => scan_zip_file(path, engine, archive, scratch, output, stats),
+    }
 }
 
 impl ReaderStage {
@@ -625,15 +1018,26 @@ impl ReaderStage {
         false
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn pump<const FILE_CAP: usize, const CHUNK_CAP: usize>(
         &mut self,
         file_ring: &mut SpscRing<FileId, FILE_CAP>,
         chunk_ring: &mut SpscRing<ScanItem, CHUNK_CAP>,
         pool: &BufferPool,
         files: &FileTable,
+        engine: &Engine,
+        archive: &ArchiveConfig,
+        archive_scratch: &mut ArchiveScratch,
+        output: &mut OutputStage,
         stats: &mut PipelineStats,
     ) -> io::Result<bool> {
         let mut progressed = false;
+
+        if archive_scratch.core.abort_run() {
+            self.active = None;
+            self.tail_len = 0;
+            return Ok(progressed);
+        }
 
         while !chunk_ring.is_full() {
             if let Some(done_id) = self.pending_done {
@@ -658,7 +1062,40 @@ impl ReaderStage {
 
                 self.tail_len = 0;
                 let path = files.path(file_id);
-                let file = match File::open(path) {
+                let path_bytes = path.as_os_str().as_encoded_bytes();
+                let ext_kind = if archive.enabled {
+                    detect_kind_from_path(path)
+                } else {
+                    None
+                };
+                if let Some(kind) = ext_kind {
+                    stats.archive.record_archive_seen();
+                    let outcome = dispatch_archive_scan(
+                        path,
+                        file_id,
+                        engine,
+                        archive,
+                        archive_scratch,
+                        output,
+                        stats,
+                        kind,
+                    )?;
+                    match outcome {
+                        ArchiveEnd::Scanned => stats.archive.record_archive_scanned(),
+                        ArchiveEnd::Skipped(r) => {
+                            stats.archive.record_archive_skipped(r, path_bytes, false);
+                        }
+                        ArchiveEnd::Partial(r) => {
+                            stats.archive.record_archive_partial(r, path_bytes, false);
+                        }
+                    }
+                    if archive_scratch.core.abort_run() {
+                        return Ok(true);
+                    }
+                    continue;
+                }
+
+                let mut file = match File::open(path) {
                     Ok(file) => file,
                     Err(_) => {
                         stats.open_errors += 1;
@@ -666,6 +1103,49 @@ impl ReaderStage {
                         continue;
                     }
                 };
+
+                if archive.enabled {
+                    let mut header = [0u8; TAR_BLOCK_LEN];
+                    let n = match file.read(&mut header) {
+                        Ok(n) => n,
+                        Err(_) => {
+                            stats.errors += 1;
+                            continue;
+                        }
+                    };
+                    if n > 0 {
+                        if let Some(kind) = sniff_kind_from_header(&header[..n]) {
+                            stats.archive.record_archive_seen();
+                            let outcome = dispatch_archive_scan(
+                                path,
+                                file_id,
+                                engine,
+                                archive,
+                                archive_scratch,
+                                output,
+                                stats,
+                                kind,
+                            )?;
+                            match outcome {
+                                ArchiveEnd::Scanned => stats.archive.record_archive_scanned(),
+                                ArchiveEnd::Skipped(r) => {
+                                    stats.archive.record_archive_skipped(r, path_bytes, false);
+                                }
+                                ArchiveEnd::Partial(r) => {
+                                    stats.archive.record_archive_partial(r, path_bytes, false);
+                                }
+                            }
+                            if archive_scratch.core.abort_run() {
+                                return Ok(true);
+                            }
+                            continue;
+                        }
+                    }
+                    if file.seek(SeekFrom::Start(0)).is_err() {
+                        stats.errors += 1;
+                        continue;
+                    }
+                }
 
                 self.active = Some(FileReader::new(file_id, file));
             }
@@ -745,6 +1225,10 @@ impl ScanStage {
 
     fn has_buffered_file(&self) -> bool {
         self.active_file.is_some() || !self.file_findings.is_empty()
+    }
+
+    fn has_pending(&self) -> bool {
+        self.has_pending_emit() || self.has_buffered_file()
     }
 
     fn flush_pending<const OUT_CAP: usize>(
@@ -927,6 +1411,11 @@ fn write_path<W: Write>(out: &mut W, path: &Path) -> io::Result<()> {
     }
 }
 
+#[inline]
+fn write_path_bytes<W: Write>(out: &mut W, bytes: &[u8]) -> io::Result<()> {
+    out.write_all(bytes)
+}
+
 /// Stage that formats findings to stdout.
 ///
 /// Output format: `path:start-end rule` (one finding per line).
@@ -967,6 +1456,36 @@ impl OutputStage {
         Ok(progressed)
     }
 
+    /// Emit findings for an already-canonicalized display path.
+    ///
+    /// Used by archive scanning to bypass `FileTable` lookups; `display_path`
+    /// is treated as a pre-bounded byte slice (not necessarily UTF-8).
+    fn emit_findings_direct(
+        &mut self,
+        engine: &Engine,
+        display_path: &[u8],
+        findings: &[FindingRec],
+        findings_count: &mut u64,
+    ) -> io::Result<()> {
+        if findings.is_empty() {
+            return Ok(());
+        }
+
+        for rec in findings {
+            let rule = engine.rule_name(rec.rule_id);
+            write_path_bytes(&mut self.out, display_path)?;
+            write!(
+                self.out,
+                ":{}-{} {}",
+                rec.root_hint_start, rec.root_hint_end, rule
+            )?;
+            self.out.write_all(b"\n")?;
+            *findings_count = findings_count.wrapping_add(1);
+        }
+
+        Ok(())
+    }
+
     fn flush(&mut self) -> io::Result<()> {
         self.out.flush()
     }
@@ -988,6 +1507,7 @@ pub struct Pipeline<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP
     walker: Walker,
     reader: ReaderStage,
     scanner: ScanStage,
+    archive_scratch: ArchiveScratch,
     output: OutputStage,
 }
 
@@ -1011,6 +1531,9 @@ impl<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize>
         if config.path_bytes_cap == 0 {
             config.path_bytes_cap = config.max_files.saturating_mul(PIPE_PATH_BYTES_PER_FILE);
         }
+        if let Err(err) = config.archive.validate() {
+            panic!("archive config invalid: {err}");
+        }
 
         let buf_len = overlap.saturating_add(config.chunk_size);
         assert!(buf_len <= BUFFER_LEN_MAX);
@@ -1019,6 +1542,7 @@ impl<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize>
         let max_files = config.max_files;
         let path_bytes_cap = config.path_bytes_cap;
         let scanner = ScanStage::new(&engine, config.context_mode, buf_len);
+        let archive_scratch = ArchiveScratch::new(&engine, &config.archive, chunk_size);
         let pool = BufferPool::new(default_pool_capacity());
         Self {
             engine,
@@ -1032,6 +1556,7 @@ impl<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize>
             walker: Walker::new(max_files),
             reader: ReaderStage::new(overlap, chunk_size),
             scanner,
+            archive_scratch,
             output: OutputStage::new(),
         }
     }
@@ -1041,6 +1566,7 @@ impl<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize>
         self.file_ring.clear();
         self.chunk_ring.clear();
         self.out_ring.clear();
+        self.archive_scratch.core.clear_abort();
         self.walker.reset(path, &mut self.files, stats)?;
         self.reader.reset();
         self.scanner.reset();
@@ -1058,24 +1584,39 @@ impl<const FILE_CAP: usize, const CHUNK_CAP: usize, const OUT_CAP: usize>
                 &mut self.out_ring,
                 stats,
             );
-            progressed |= self.reader.pump(
-                &mut self.file_ring,
-                &mut self.chunk_ring,
-                &self.pool,
-                &self.files,
-                stats,
-            )?;
-            progressed |= self
-                .walker
-                .pump(&mut self.files, &mut self.file_ring, stats)?;
+            if !self.archive_scratch.core.abort_run() {
+                progressed |= self.reader.pump(
+                    &mut self.file_ring,
+                    &mut self.chunk_ring,
+                    &self.pool,
+                    &self.files,
+                    self.engine.as_ref(),
+                    &self.config.archive,
+                    &mut self.archive_scratch,
+                    &mut self.output,
+                    stats,
+                )?;
+                progressed |= self
+                    .walker
+                    .pump(&mut self.files, &mut self.file_ring, stats)?;
+            } else {
+                self.reader.reset();
+                self.walker.abort();
+                self.file_ring.clear();
+                self.chunk_ring.clear();
+            }
 
-            let done = self.walker.is_done()
-                && self.reader.is_idle()
-                && self.file_ring.is_empty()
-                && self.chunk_ring.is_empty()
-                && !self.scanner.has_pending_emit()
-                && !self.scanner.has_buffered_file()
-                && self.out_ring.is_empty();
+            let aborting = self.archive_scratch.core.abort_run();
+            let done = if aborting {
+                !self.scanner.has_pending() && self.out_ring.is_empty()
+            } else {
+                self.walker.is_done()
+                    && self.reader.is_idle()
+                    && self.file_ring.is_empty()
+                    && self.chunk_ring.is_empty()
+                    && !self.scanner.has_pending()
+                    && self.out_ring.is_empty()
+            };
 
             if done {
                 break;
@@ -1138,14 +1679,17 @@ fn dev_inode_from_stat(st: &libc::stat) -> (u64, u64) {
 #[cfg(unix)]
 fn errno_ptr() -> *mut libc::c_int {
     #[cfg(target_os = "macos")]
+    // SAFETY: libc provides a thread-local errno pointer on this platform.
     unsafe {
         libc::__error()
     }
     #[cfg(target_os = "linux")]
+    // SAFETY: libc provides a thread-local errno pointer on this platform.
     unsafe {
         libc::__errno_location()
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    // SAFETY: libc provides a thread-local errno pointer on this platform.
     unsafe {
         libc::__errno_location()
     }
@@ -1153,6 +1697,7 @@ fn errno_ptr() -> *mut libc::c_int {
 
 #[cfg(unix)]
 fn set_errno(value: libc::c_int) {
+    // SAFETY: writing thread-local errno is safe and confined to this thread.
     unsafe {
         *errno_ptr() = value;
     }
@@ -1162,6 +1707,10 @@ fn set_errno(value: libc::c_int) {
 ///
 /// Rejects paths containing NUL or longer than `PATH_MAX` to avoid heap
 /// allocation when invoking libc APIs.
+///
+/// # Safety
+/// The pointer passed to `f` is only valid for the duration of the call; `f`
+/// must not store it or use it after returning.
 #[cfg(unix)]
 fn with_c_path<T>(
     path: &Path,
@@ -1184,6 +1733,8 @@ fn with_c_path<T>(
 
 #[cfg(unix)]
 fn open_dir(path: *const libc::c_char, span: PathSpan) -> io::Result<DirState> {
+    // SAFETY: `path` is expected to be NUL-terminated. The returned DIR* and fd
+    // are owned by the `DirState` and closed on drop.
     unsafe {
         let fd = libc::open(path, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC);
         if fd < 0 {
@@ -1205,6 +1756,8 @@ fn open_dir(path: *const libc::c_char, span: PathSpan) -> io::Result<DirState> {
 
 #[cfg(unix)]
 fn open_dir_at(dirfd: RawFd, name: *const libc::c_char, span: PathSpan) -> io::Result<DirState> {
+    // SAFETY: `name` is expected to be NUL-terminated and relative to `dirfd`.
+    // The returned DIR* and fd are owned by the `DirState` and closed on drop.
     unsafe {
         let fd = libc::openat(
             dirfd,
@@ -1243,11 +1796,15 @@ fn dev_inode(meta: &std::fs::Metadata) -> (u64, u64) {
 mod tests {
     use super::*;
     use crate::api::{LexicalClassSet, LexicalContextSpec, RuleSpec, ValidatorKind};
+    use crate::archive::PartialReason;
     use crate::demo::demo_tuning;
     use crate::scheduler::output_sink::VecSink;
     use crate::scheduler::{scan_local, LocalConfig, LocalFile, VecFileSource};
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
     use regex::bytes::Regex;
     use std::fs;
+    use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
@@ -1368,6 +1925,10 @@ mod tests {
                 &mut pipeline.chunk_ring,
                 &pipeline.pool,
                 &pipeline.files,
+                &pipeline.engine,
+                &pipeline.config.archive,
+                &mut pipeline.archive_scratch,
+                &mut pipeline.output,
                 &mut stats,
             )?;
             progressed |=
@@ -1375,13 +1936,17 @@ mod tests {
                     .walker
                     .pump(&mut pipeline.files, &mut pipeline.file_ring, &mut stats)?;
 
-            let done = pipeline.walker.is_done()
-                && pipeline.reader.is_idle()
-                && pipeline.file_ring.is_empty()
-                && pipeline.chunk_ring.is_empty()
-                && !pipeline.scanner.has_pending_emit()
-                && !pipeline.scanner.has_buffered_file()
-                && pipeline.out_ring.is_empty();
+            let aborting = pipeline.archive_scratch.core.abort_run();
+            let done = if aborting {
+                !pipeline.scanner.has_pending() && pipeline.out_ring.is_empty()
+            } else {
+                pipeline.walker.is_done()
+                    && pipeline.reader.is_idle()
+                    && pipeline.file_ring.is_empty()
+                    && pipeline.chunk_ring.is_empty()
+                    && !pipeline.scanner.has_pending()
+                    && pipeline.out_ring.is_empty()
+            };
 
             if done {
                 break;
@@ -1482,6 +2047,77 @@ mod tests {
         scheduler_lines.sort();
 
         assert_eq!(pipeline_lines, scheduler_lines);
+        Ok(())
+    }
+
+    #[test]
+    fn pipeline_skips_archive_when_enabled() -> io::Result<()> {
+        let tmp = make_temp_dir("scanner_archive_skip")?;
+        let path = tmp.path().join("sample.zip");
+        fs::write(&path, b"SECRET")?;
+
+        let engine = Arc::new(crate::demo_engine());
+        let mut cfg = PipelineConfig::default();
+        cfg.archive.enabled = true;
+        let mut pipeline: Pipeline<PIPE_FILE_RING_CAP, PIPE_CHUNK_RING_CAP, PIPE_OUT_RING_CAP> =
+            Pipeline::new(engine, cfg);
+
+        let stats = pipeline.scan_path(&path)?;
+
+        assert_eq!(stats.archive.archives_seen, 1);
+        assert_eq!(stats.archive.archives_partial, 1);
+        assert_eq!(
+            stats.archive.partial_reasons[PartialReason::MalformedZip.as_usize()],
+            1
+        );
+        assert_eq!(stats.bytes_scanned, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn pipeline_scans_archive_extension_when_disabled() -> io::Result<()> {
+        let tmp = make_temp_dir("scanner_archive_disabled")?;
+        let path = tmp.path().join("sample.zip");
+        let payload = b"plain bytes with SECRET marker";
+        fs::write(&path, payload)?;
+
+        let engine = Arc::new(crate::demo_engine());
+        let mut cfg = PipelineConfig::default();
+        cfg.archive.enabled = false;
+        let mut pipeline: Pipeline<PIPE_FILE_RING_CAP, PIPE_CHUNK_RING_CAP, PIPE_OUT_RING_CAP> =
+            Pipeline::new(engine, cfg);
+
+        let stats = pipeline.scan_path(&path)?;
+
+        assert_eq!(stats.archive.archives_seen, 0);
+        assert_eq!(stats.archive.archives_skipped, 0);
+        assert!(stats.bytes_scanned >= payload.len() as u64);
+        Ok(())
+    }
+
+    #[test]
+    fn pipeline_scans_gzip_when_enabled() -> io::Result<()> {
+        let tmp = make_temp_dir("scanner_gzip_scan")?;
+        let path = tmp.path().join("payload.txt.gz");
+
+        let payload = b"payload SECRET inside";
+        let f = fs::File::create(&path)?;
+        let mut enc = GzEncoder::new(f, Compression::default());
+        enc.write_all(payload)?;
+        enc.finish()?;
+
+        let engine = Arc::new(crate::demo_engine());
+        let mut cfg = PipelineConfig::default();
+        cfg.archive.enabled = true;
+        let mut pipeline: Pipeline<PIPE_FILE_RING_CAP, PIPE_CHUNK_RING_CAP, PIPE_OUT_RING_CAP> =
+            Pipeline::new(engine, cfg);
+
+        let stats = pipeline.scan_path(&path)?;
+
+        assert_eq!(stats.archive.archives_seen, 1);
+        assert_eq!(stats.archive.archives_scanned, 1);
+        assert!(stats.archive.entries_scanned > 0);
+        assert!(stats.bytes_scanned > 0);
         Ok(())
     }
 }

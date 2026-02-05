@@ -1205,6 +1205,11 @@ impl Engine {
             .saturating_add(self.max_prefilter_width.saturating_sub(1))
     }
 
+    /// Returns the transform id for a transform index.
+    pub(crate) fn transform_id(&self, idx: usize) -> TransformId {
+        self.transforms[idx].id
+    }
+
     /// Returns the rule name for a rule id used in [`FindingRec`].
     pub fn rule_name(&self, rule_id: u32) -> &str {
         self.rules

@@ -2,13 +2,22 @@
 //!
 //! These tests build a minimal in-memory MIDX and validate that the bridge
 //! maps known OIDs to pack offsets while leaving unknown OIDs as loose.
+//!
+//! # Invariants
+//! - MIDX objects are sorted by OID to satisfy lookup expectations.
+//! - Pack ids reflect PNAM order in the constructed MIDX.
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use scanner_rs::git_scan::{
-    ByteArena, ByteRef, ChangeKind, CollectingPackCandidateSink, MappingBridge,
-    MappingBridgeConfig, MidxView, ObjectFormat, OidBytes, UniqueBlob, UniqueBlobSink,
+    ByteArena, ByteRef, CappedPackCandidateSink, ChangeKind, CollectingPackCandidateSink,
+    MappingBridge, MappingBridgeConfig, MappingCandidateKind, MidxView, ObjectFormat, OidBytes,
+    SpillError, UniqueBlob, UniqueBlobSink,
 };
 
 /// Helper for constructing a minimal SHA-1 MIDX buffer.
+///
+/// Only the chunks needed by `MidxView` lookups are populated.
 #[derive(Default)]
 struct MidxBuilder {
     pack_names: Vec<Vec<u8>>,
@@ -68,6 +77,7 @@ impl MidxBuilder {
         let mut ooff = Vec::with_capacity(objects.len() * 8);
         for (_, pack_id, offset) in &objects {
             ooff.extend_from_slice(&(*pack_id as u32).to_be_bytes());
+            // OOFF stores 32-bit offsets in this minimal builder (no large offsets).
             ooff.extend_from_slice(&(*offset as u32).to_be_bytes());
         }
 
@@ -137,6 +147,8 @@ fn mapping_bridge_emits_pack_and_loose() {
         sink,
         MappingBridgeConfig {
             path_arena_capacity: 1024,
+            max_packed_candidates: 128,
+            max_loose_candidates: 128,
         },
     );
 
@@ -149,6 +161,7 @@ fn mapping_bridge_emits_pack_and_loose() {
 
     bridge.emit(&blob_a, &src_paths).unwrap();
     bridge.emit(&blob_b, &src_paths).unwrap();
+    // The sink is finished via the `UniqueBlobSink` trait before consuming the bridge.
     UniqueBlobSink::finish(&mut bridge).unwrap();
 
     let (stats, sink, arena) = bridge.finish().unwrap();
@@ -167,4 +180,119 @@ fn mapping_bridge_emits_pack_and_loose() {
 
     assert_eq!(sink.loose[0].oid, OidBytes::sha1([0x33; 20]));
     assert_eq!(arena.get(sink.loose[0].ctx.path_ref), b"README.md");
+}
+
+#[test]
+fn mapping_bridge_enforces_packed_cap() {
+    let mut builder = MidxBuilder::default();
+    builder.add_pack(b"pack-test");
+    builder.add_object([0x11; 20], 0, 100);
+    builder.add_object([0x22; 20], 0, 200);
+    let midx_bytes = builder.build();
+
+    let midx = MidxView::parse(&midx_bytes, ObjectFormat::Sha1).unwrap();
+    let sink = CappedPackCandidateSink::new(1, 10);
+    let mut bridge = MappingBridge::new(
+        &midx,
+        sink,
+        MappingBridgeConfig {
+            path_arena_capacity: 1024,
+            max_packed_candidates: 1,
+            max_loose_candidates: 10,
+        },
+    );
+
+    let mut src_paths = ByteArena::with_capacity(128);
+    let path_ref_a = src_paths.intern(b"src/a.txt").unwrap();
+    let path_ref_b = src_paths.intern(b"src/b.txt").unwrap();
+
+    let blob_a = make_blob(OidBytes::sha1([0x11; 20]), path_ref_a);
+    let blob_b = make_blob(OidBytes::sha1([0x22; 20]), path_ref_b);
+
+    bridge.emit(&blob_a, &src_paths).unwrap();
+    let err = bridge.emit(&blob_b, &src_paths).unwrap_err();
+
+    assert!(matches!(
+        err,
+        SpillError::MappingCandidateLimitExceeded {
+            kind: MappingCandidateKind::Packed,
+            max: 1,
+            observed: 2
+        }
+    ));
+}
+
+#[test]
+fn mapping_bridge_matches_find_oid_oracle() {
+    let mut builder = MidxBuilder::default();
+    builder.add_pack(b"pack-a");
+    builder.add_pack(b"pack-b");
+    builder.add_object([0x01; 20], 0, 111);
+    builder.add_object([0x10; 20], 1, 222);
+    builder.add_object([0x80; 20], 0, 333);
+    let midx_bytes = builder.build();
+
+    let midx = MidxView::parse(&midx_bytes, ObjectFormat::Sha1).unwrap();
+    let sink = CollectingPackCandidateSink::default();
+    let mut bridge = MappingBridge::new(
+        &midx,
+        sink,
+        MappingBridgeConfig {
+            path_arena_capacity: 2048,
+            max_packed_candidates: 128,
+            max_loose_candidates: 128,
+        },
+    );
+
+    let mut src_paths = ByteArena::with_capacity(512);
+    let mut inputs = vec![
+        OidBytes::sha1([0x00; 20]),
+        OidBytes::sha1([0x01; 20]),
+        OidBytes::sha1([0x05; 20]),
+        OidBytes::sha1([0x10; 20]),
+        OidBytes::sha1([0x20; 20]),
+        OidBytes::sha1([0x80; 20]),
+        OidBytes::sha1([0xff; 20]),
+    ];
+    inputs.sort();
+
+    for (idx, oid) in inputs.iter().enumerate() {
+        let path = format!("path-{idx}").into_bytes();
+        let path_ref = src_paths.intern(&path).unwrap();
+        let blob = make_blob(*oid, path_ref);
+        bridge.emit(&blob, &src_paths).unwrap();
+    }
+
+    UniqueBlobSink::finish(&mut bridge).unwrap();
+    let (_stats, sink, _arena) = bridge.finish().unwrap();
+
+    let mut expected_packed = BTreeMap::new();
+    let mut expected_loose = BTreeSet::new();
+    for oid in inputs {
+        match midx.find_oid(&oid).unwrap() {
+            Some(idx) => {
+                let (pack_id, offset) = midx.offset_at(idx).unwrap();
+                expected_packed.insert(oid, (pack_id, offset));
+            }
+            None => {
+                expected_loose.insert(oid);
+            }
+        }
+    }
+
+    assert_eq!(sink.packed.len(), expected_packed.len());
+    for candidate in sink.packed {
+        let Some((pack_id, offset)) = expected_packed.remove(&candidate.oid) else {
+            panic!("unexpected packed oid: {}", candidate.oid);
+        };
+        assert_eq!(candidate.pack_id, pack_id);
+        assert_eq!(candidate.offset, offset);
+    }
+    assert!(expected_packed.is_empty());
+
+    assert_eq!(sink.loose.len(), expected_loose.len());
+    for candidate in sink.loose {
+        assert!(expected_loose.remove(&candidate.oid));
+    }
+    assert!(expected_loose.is_empty());
 }

@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 
+use scanner_rs::archive::ArchiveConfig;
 use scanner_rs::sim::{FaultPlan, SimNodeSpec};
 use scanner_rs::sim_scanner::{
     build_engine_from_suite, generate_scenario, RunConfig, RunOutcome, ScannerSimRunner,
@@ -67,6 +68,7 @@ fn budget_invariance_with_size_cap_gating() {
         max_steps: 0,
         max_transform_depth: 2,
         scan_utf16_variants: true,
+        archive: ArchiveConfig::default(),
         // Two schedules to catch budget leaks or ordering dependence.
         stability_runs: 2,
     };

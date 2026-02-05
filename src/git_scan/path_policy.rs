@@ -21,31 +21,41 @@ use crate::lexical::LexicalFamily;
 pub struct PathClass(u8);
 
 impl PathClass {
+    /// Marks paths that look like source files by extension.
     pub const SOURCE: Self = Self(1 << 0);
+    /// Marks paths under test-related directories.
     pub const TEST: Self = Self(1 << 1);
+    /// Marks paths under vendor or third-party directories.
     pub const VENDOR: Self = Self(1 << 2);
+    /// Marks paths under generated/build output directories.
     pub const GENERATED: Self = Self(1 << 3);
+    /// Marks paths that look like binary assets by extension.
     pub const BINARY: Self = Self(1 << 4);
+    /// Marks paths that did not match any heuristic.
     pub const UNKNOWN: Self = Self(1 << 5);
 
+    /// Returns an empty classification (no bits set).
     #[inline]
     #[must_use]
     pub const fn empty() -> Self {
         Self(0)
     }
 
+    /// Returns the raw bitset value as a `u16`.
     #[inline]
     #[must_use]
     pub const fn bits(self) -> u16 {
         self.0 as u16
     }
 
+    /// Returns true if no classification bits are set.
     #[inline]
     #[must_use]
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
 
+    /// Returns true if all bits in `other` are set in `self`.
     #[inline]
     #[must_use]
     pub const fn contains(self, other: Self) -> bool {
@@ -97,6 +107,18 @@ pub fn classify_path(path: &[u8]) -> PathClass {
         PathClass::UNKNOWN
     } else {
         class
+    }
+}
+
+/// Returns true if the path should be excluded under the given policy version.
+///
+/// Version 1: no exclusions (default behavior).
+/// Version 2+: exclude binary-classified paths.
+#[must_use]
+pub fn is_excluded_path(path: &[u8], version: u32) -> bool {
+    match version {
+        0 | 1 => false,
+        _ => classify_path(path).contains(PathClass::BINARY),
     }
 }
 

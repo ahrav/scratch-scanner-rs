@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use scanner_rs::archive::ArchiveConfig;
 use scanner_rs::sim::FaultPlan;
 use scanner_rs::sim::SimNodeSpec;
 use scanner_rs::sim_scanner::{
@@ -42,6 +43,7 @@ fn discovery_falls_back_when_type_hint_missing() {
         max_steps: 0,
         max_transform_depth: 2,
         scan_utf16_variants: true,
+        archive: ArchiveConfig::default(),
         stability_runs: 1,
     };
 
