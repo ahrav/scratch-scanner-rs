@@ -299,14 +299,7 @@ fn main() -> io::Result<()> {
         Some(&persist_store),
         &config,
     ) {
-        Ok(GitScanResult::NeedsMaintenance { repo }) => {
-            eprintln!(
-                "needs_maintenance artifact_status={:?}",
-                repo.artifact_status
-            );
-            std::process::exit(3);
-        }
-        Ok(GitScanResult::Completed(report)) => {
+        Ok(GitScanResult(report)) => {
             let (status, skipped) = match report.finalize.outcome {
                 scanner_rs::git_scan::FinalizeOutcome::Complete => ("complete", 0),
                 scanner_rs::git_scan::FinalizeOutcome::Partial { skipped_count } => {

@@ -106,7 +106,7 @@ pub mod work_items;
 
 pub use alloc_guard::{enabled as alloc_guard_enabled, set_enabled as set_alloc_guard_enabled};
 pub use artifact_acquire::{
-    acquire_commit_graph, acquire_midx, ArtifactAcquireError, ArtifactBuildLimits, ArtifactPolicy,
+    acquire_commit_graph, acquire_midx, ArtifactAcquireError, ArtifactBuildLimits,
     CommitGraphSource, MidxAcquireResult,
 };
 pub use blob_introducer::{BlobIntroStats, BlobIntroducer, SeenSets};

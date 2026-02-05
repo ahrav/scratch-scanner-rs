@@ -34,8 +34,6 @@ use std::path::{Path, PathBuf};
 
 use super::errors::RepoOpenError;
 use super::limits::RepoOpenLimits;
-use super::preflight_error::PreflightError;
-use super::preflight_limits::PreflightLimits;
 
 /// Limits required for repository path resolution.
 pub trait RepoLimits {
@@ -47,24 +45,6 @@ pub trait RepoLimits {
     fn max_alternates_file_bytes(&self) -> u32;
     /// Maximum number of alternates to accept.
     fn max_alternates_count(&self) -> u8;
-}
-
-impl RepoLimits for PreflightLimits {
-    fn max_dot_git_file_bytes(&self) -> u32 {
-        self.max_dot_git_file_bytes
-    }
-
-    fn max_commondir_file_bytes(&self) -> u32 {
-        self.max_commondir_file_bytes
-    }
-
-    fn max_alternates_file_bytes(&self) -> u32 {
-        self.max_alternates_file_bytes
-    }
-
-    fn max_alternates_count(&self) -> u8 {
-        self.max_alternates_count
-    }
 }
 
 impl RepoLimits for RepoOpenLimits {
@@ -107,48 +87,6 @@ pub trait RepoError: Sized {
     fn alternate_not_dir() -> Self;
     /// File exceeds size limit.
     fn file_too_large(size: u64, limit: u32) -> Self;
-}
-
-impl RepoError for PreflightError {
-    fn io(err: io::Error) -> Self {
-        Self::io(err)
-    }
-
-    fn canonicalization(err: io::Error) -> Self {
-        Self::canonicalization(err)
-    }
-
-    fn not_a_repository() -> Self {
-        Self::NotARepository
-    }
-
-    fn malformed_gitdir_file() -> Self {
-        Self::MalformedGitdirFile
-    }
-
-    fn gitdir_target_not_dir() -> Self {
-        Self::GitdirTargetNotDir
-    }
-
-    fn malformed_commondir_file() -> Self {
-        Self::MalformedCommondirFile
-    }
-
-    fn common_dir_not_dir() -> Self {
-        Self::CommonDirNotDir
-    }
-
-    fn objects_dir_not_dir() -> Self {
-        Self::ObjectsDirNotDir
-    }
-
-    fn alternate_not_dir() -> Self {
-        Self::AlternateNotDir
-    }
-
-    fn file_too_large(size: u64, limit: u32) -> Self {
-        Self::FileTooLarge { size, limit }
-    }
 }
 
 impl RepoError for RepoOpenError {
