@@ -10,7 +10,7 @@ and maintains zero allocations during the hot path. Memory scales with worker co
 ### Memory Breakdown by Worker Count
 
 | Workers | Per-Worker | Buffer Pool | **Total** |
-|---------|------------|-------------|-----------|
+| ------- | ---------- | ----------- | --------- |
 | 4       | 75.3 MiB   | 5.0 MiB     | ~80 MiB   |
 | 8       | 150.5 MiB  | 10.0 MiB    | ~161 MiB  |
 | 12      | 225.8 MiB  | 15.0 MiB    | ~241 MiB  |
@@ -18,13 +18,13 @@ and maintains zero allocations during the hot path. Memory scales with worker co
 
 ### Per-Worker Allocation (~18.8 MiB each)
 
-| Component | Size | % of Total |
-|-----------|------|------------|
-| **HitAccPool.windows** | 15.68 MiB | 83.3% |
-| FixedSet128 (seen_findings) | 768 KiB | 4.0% |
-| FindingRec buffers (out + tmp) | 640 KiB | 3.3% |
-| DecodeSlab | 512 KiB | 2.6% |
-| Other (ByteRing, TimingWheel, etc.) | ~1.2 MiB | 6.8% |
+| Component                           | Size      | % of Total |
+| ----------------------------------- | --------- | ---------- |
+| **HitAccPool.windows**              | 15.68 MiB | 83.3%      |
+| FixedSet128 (seen_findings)         | 768 KiB   | 4.0%       |
+| FindingRec buffers (out + tmp)      | 640 KiB   | 3.3%       |
+| DecodeSlab                          | 512 KiB   | 2.6%       |
+| Other (ByteRing, TimingWheel, etc.) | ~1.2 MiB  | 6.8%       |
 
 **Key insight**: HitAccPool dominates at 83.3% of per-worker memory. This is
 sized for worst-case: 669 (rule,variant) pairs × 2048 max hits × 12 bytes/SpanU32.
