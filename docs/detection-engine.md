@@ -240,13 +240,18 @@ Selection detail:
 
 See `docs/transform-chain.md` for diagrams and the gating sequence.
 
-## Keyword + Entropy Gates
+## Keyword + Local Context + Entropy Gates
 
 Some rules benefit from additional semantic filters beyond anchors + regex:
 
 - **Keyword gate (any-of)**: at least one keyword must appear inside the same
   validation window as the regex. This is a cheap memmem filter that reduces
   false positives without requiring global context.
+- **Local context gate (rule-selective)**: after regex matching and secret
+  extraction, inspect a bounded same-line lookaround slice for micro-context
+  such as assignment separators, required key names, and/or matching quotes.
+  This gate is fail-open when line boundaries are missing in the window to
+  avoid false negatives at chunk edges.
 - **Entropy gate**: after a regex match, compute Shannon entropy (bits/byte)
   of the matched bytes. Low-entropy matches are rejected as likely false
   positives (e.g., repeated characters or structured IDs).
@@ -254,6 +259,8 @@ Some rules benefit from additional semantic filters beyond anchors + regex:
 These gates are designed to be **local and bounded**:
 - Keywords are checked *before* regex, and for UTF-16 windows the check happens
   **before decoding** to avoid wasting decode budget.
+- Local context uses bounded lookaround windows and operates on decoded UTF-8
+  bytes for UTF-16 variants, preserving fail-open semantics at boundaries.
 - Entropy runs only on the regex match and is capped by `max_len` to keep cost
   predictable.
 

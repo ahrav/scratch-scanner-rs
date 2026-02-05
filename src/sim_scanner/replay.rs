@@ -5,13 +5,23 @@
 //! structured "unimplemented" failure.
 
 use crate::sim::artifact::ReproArtifact;
-use crate::sim_scanner::runner::{FailureKind, FailureReport, RunOutcome};
+use crate::sim_scanner::generator::build_engine_from_suite;
+use crate::sim_scanner::runner::{FailureKind, FailureReport, RunOutcome, ScannerSimRunner};
 
 /// Replay a previously captured artifact.
-pub fn replay_artifact(_artifact: &ReproArtifact) -> RunOutcome {
-    RunOutcome::Failed(FailureReport {
-        kind: FailureKind::Unimplemented,
-        message: "replay not implemented".to_string(),
-        step: 0,
-    })
+pub fn replay_artifact(artifact: &ReproArtifact) -> RunOutcome {
+    let engine = match build_engine_from_suite(&artifact.scenario.rule_suite, &artifact.run_config)
+    {
+        Ok(engine) => engine,
+        Err(err) => {
+            return RunOutcome::Failed(FailureReport {
+                kind: FailureKind::InvariantViolation { code: 900 },
+                message: format!("failed to rebuild engine: {err}"),
+                step: 0,
+            })
+        }
+    };
+
+    let runner = ScannerSimRunner::new(artifact.run_config.clone(), artifact.schedule_seed);
+    runner.run(&artifact.scenario, &engine, &artifact.fault_plan)
 }

@@ -40,6 +40,7 @@ flowchart LR
 
 - Preflight and repo open read metadata only; no blob payloads are read before pack decoding.
 - Preflight/repo open detect maintenance lock files and capture artifact fingerprints; runner revalidates before pack exec.
+- Metadata artifacts are accessed through read-only byte views (mmap-backed in production).
 - Preflight reports pack-count maintenance recommendations separately; pack count does not block scans.
 - Pack execution mmaps are bounded by explicit pack count and total byte limits.
 - Candidate ordering is deterministic and stable across spill boundaries.
@@ -50,6 +51,7 @@ flowchart LR
   missing loose objects are recorded as explicit skips.
 - Any decode skips or missing/corrupt loose objects result in `FinalizeOutcome::Partial`.
 - Skipped candidates are reported with explicit reasons; pack exec reports contain detailed decode errors.
+- Pack decoding can be driven via a read-at reader for deterministic fault injection.
 
 ## Concurrency and Backpressure
 
@@ -76,8 +78,26 @@ Persist commits `data_ops` and (when complete) `watermark_ops` in a single
 atomic batch. If the run is partial, watermark ops are skipped to avoid
 advancing ref tips past unscanned blobs.
 
+## Simulation Harness
+
+The Git simulation harness exercises this pipeline deterministically using a
+semantic repo model and optional pack artifacts. It replays `.case.json`
+artifacts and supports bounded random runs.
+
+```bash
+# Replay Git simulation corpus
+cargo test --features sim-harness --test simulation git_scan_corpus
+
+# Run bounded random Git simulations
+cargo test --features sim-harness --test simulation git_scan_random
+```
+
+Corpus cases live in `tests/corpus/git_scan/*.case.json`. Replay failures emit
+artifacts to `tests/failures/` for triage and minimization.
+
 ## Related Docs
 
 - `docs/architecture-overview.md`
 - `docs/detection-engine.md`
 - `docs/git-scan-pack-exec-merge-fast-path.md`
+- `docs/git_simulation_harness_guide.md`

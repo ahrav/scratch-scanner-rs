@@ -140,6 +140,9 @@ fn pack_exec_matches_git_cat_file() {
     let repo = tmp.path();
 
     run_git(repo, &["init"]);
+    // Configure identity locally so commits work in CI without global git config.
+    run_git(repo, &["config", "user.email", "test@example.com"]);
+    run_git(repo, &["config", "user.name", "Test User"]);
     write_file(&repo.join("a.txt"), "alpha");
     write_file(&repo.join("b.txt"), "bravo");
     run_git(repo, &["add", "."]);

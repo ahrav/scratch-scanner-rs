@@ -79,6 +79,7 @@ OPTIONS:
     --merge=all|first-parent  Merge diff mode (default: all)
     --anchors=manual|derived  Anchor mode (default: manual)
     --pack-exec-workers=<N> Pack exec worker threads (default: 1)
+    --tree-delta-cache-mb=<N> Tree delta cache size in MB (default: 64)
     --max-transform-depth=<N> Maximum decode depth (default: demo tuning)
     --debug                 Emit stage statistics to stderr
     --help, -h              Show this help message",
@@ -97,6 +98,7 @@ fn main() -> io::Result<()> {
     let mut anchor_mode = AnchorMode::Manual;
     let mut max_transform_depth: Option<usize> = None;
     let mut pack_exec_workers: Option<usize> = None;
+    let mut tree_delta_cache_mb: Option<u32> = None;
     let mut debug = false;
 
     for arg in args {
@@ -136,6 +138,18 @@ fn main() -> io::Result<()> {
                     std::process::exit(2);
                 }
                 pack_exec_workers = Some(parsed);
+                continue;
+            }
+            if let Some(value) = flag.strip_prefix("--tree-delta-cache-mb=") {
+                let parsed: u32 = value.parse().unwrap_or_else(|_| {
+                    eprintln!("invalid --tree-delta-cache-mb value: {}", value);
+                    std::process::exit(2);
+                });
+                if parsed == 0 {
+                    eprintln!("--tree-delta-cache-mb must be >= 1");
+                    std::process::exit(2);
+                }
+                tree_delta_cache_mb = Some(parsed);
                 continue;
             }
             if let Some(value) = flag.strip_prefix("--mode=") {
@@ -195,6 +209,14 @@ fn main() -> io::Result<()> {
     }
 
     let base_config = GitScanConfig::default();
+    let tree_delta_cache_bytes = tree_delta_cache_mb.map(|mb| {
+        let bytes = mb as u64 * 1024 * 1024;
+        if bytes > u64::from(u32::MAX) {
+            eprintln!("--tree-delta-cache-mb exceeds max bytes for this build");
+            std::process::exit(2);
+        }
+        bytes as u32
+    });
 
     let policy = policy_hash(
         &rules,
@@ -222,7 +244,7 @@ fn main() -> io::Result<()> {
     let watermark_store = EmptyWatermarkStore;
     let persist_store = InMemoryPersistenceStore::default();
 
-    let config = GitScanConfig {
+    let mut config = GitScanConfig {
         scan_mode,
         repo_id,
         merge_diff_mode: merge_mode,
@@ -231,6 +253,9 @@ fn main() -> io::Result<()> {
         pack_exec_workers: pack_exec_workers.unwrap_or(base_config.pack_exec_workers),
         ..base_config
     };
+    if let Some(bytes) = tree_delta_cache_bytes {
+        config.tree_diff.max_tree_delta_cache_bytes = bytes;
+    }
 
     match run_git_scan(
         &repo,

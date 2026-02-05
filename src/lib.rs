@@ -37,6 +37,7 @@
 //!
 //! For a longer design walkthrough, see `docs/architecture.md`.
 
+pub mod archive;
 pub mod async_io;
 pub mod b64_yara_gate;
 pub mod git_scan;
@@ -48,6 +49,10 @@ pub mod scheduler;
 pub mod scratch_memory;
 #[cfg(feature = "sim-harness")]
 pub mod sim;
+#[cfg(feature = "sim-harness")]
+pub mod sim_archive;
+#[cfg(feature = "sim-harness")]
+pub mod sim_git_scan;
 #[cfg(feature = "sim-harness")]
 pub mod sim_scanner;
 #[cfg(feature = "sim-harness")]
@@ -68,8 +73,9 @@ mod runtime;
 pub use api::Base64DecodeStats;
 pub use api::{
     AnchorPolicy, DecodeStep, DecodeSteps, DelimAfter, EntropySpec, FileId, Finding, FindingRec,
-    Gate, RuleSpec, StepId, TailCharset, TransformConfig, TransformId, TransformMode, Tuning,
-    TwoPhaseSpec, Utf16Endianness, ValidatorKind, MAX_DECODE_STEPS,
+    Gate, LocalContextSpec, RuleSpec, StepId, TailCharset, TransformConfig, TransformId,
+    TransformMode, Tuning, TwoPhaseSpec, Utf16Endianness, ValidatorKind,
+    LOCAL_CONTEXT_MAX_LOOKAROUND, MAX_DECODE_STEPS,
 };
 
 pub use demo::{

@@ -34,12 +34,13 @@
 //! - Metadata stages (preflight through pack planning) do not read blob payloads.
 //! - Pack execution and engine adaptation read and scan blob bytes with explicit limits.
 //! - File reads are bounded by explicit limits.
-//! - Outputs are deterministic for identical repo state.
+//! - Outputs are deterministic for identical repo state and configuration.
 
 pub mod alloc_guard;
 pub mod blob_introducer;
 pub mod blob_spill;
 pub mod byte_arena;
+pub mod bytes;
 pub mod commit_graph;
 pub mod commit_walk;
 pub mod commit_walk_limits;
@@ -62,6 +63,7 @@ pub mod pack_inflate;
 pub mod pack_io;
 pub mod pack_plan;
 pub mod pack_plan_model;
+pub mod pack_reader;
 pub mod path_policy;
 pub mod perf;
 pub mod persist;
@@ -99,6 +101,7 @@ pub mod work_items;
 pub use alloc_guard::{enabled as alloc_guard_enabled, set_enabled as set_alloc_guard_enabled};
 pub use blob_introducer::{BlobIntroStats, BlobIntroducer, SeenSets};
 pub use byte_arena::{ByteArena, ByteRef};
+pub use bytes::BytesView;
 pub use commit_graph::CommitGraphIndex;
 pub use commit_walk::{
     introduced_by_plan, topo_order_positions, CommitGraph, CommitGraphView, CommitPlanIter,
@@ -130,9 +133,9 @@ pub use pack_decode::{entry_header_at, inflate_entry_payload, PackDecodeError, P
 pub use pack_delta::{apply_delta, DeltaError};
 pub use pack_exec::{
     aggregate_cache_reject_histogram, build_candidate_ranges, execute_pack_plan,
-    execute_pack_plan_with_scratch_indices, merge_pack_exec_reports, CacheRejectHistogram,
-    ExternalBase, ExternalBaseProvider, PackExecError, PackExecReport, PackExecStats,
-    PackObjectSink, SkipReason, SkipRecord, CACHE_REJECT_BUCKETS,
+    execute_pack_plan_with_reader, execute_pack_plan_with_scratch_indices, merge_pack_exec_reports,
+    CacheRejectHistogram, ExternalBase, ExternalBaseProvider, PackExecError, PackExecReport,
+    PackExecStats, PackObjectSink, SkipReason, SkipRecord, CACHE_REJECT_BUCKETS,
 };
 pub use pack_io::{PackIo, PackIoError, PackIoLimits};
 pub use pack_plan::{build_pack_plans, OidResolver, PackPlanConfig, PackPlanError, PackView};
@@ -140,6 +143,7 @@ pub use pack_plan_model::{
     BaseLoc, CandidateAtOffset, Cluster, DeltaDep, DeltaKind, PackPlan, PackPlanStats,
     CLUSTER_GAP_BYTES,
 };
+pub use pack_reader::{PackReadError, PackReader, SlicePackReader};
 pub use path_policy::PathClass;
 pub use perf::{reset as reset_git_perf, snapshot as git_perf_snapshot, GitPerfStats};
 pub use persist::{persist_finalize_output, InMemoryPersistenceStore, PersistenceStore};

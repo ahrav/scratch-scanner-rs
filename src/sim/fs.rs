@@ -154,6 +154,14 @@ impl SimFs {
         Ok(&data[start..end])
     }
 
+    /// Return the full file contents for a path.
+    pub fn file_bytes(&self, path: &SimPath) -> std::io::Result<&[u8]> {
+        self.files
+            .get(&path.bytes)
+            .map(|v| v.as_slice())
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "file missing"))
+    }
+
     /// Read from the handle's current cursor and advance it by the bytes read.
     pub fn read_next(&self, handle: &mut SimFileHandle, len: usize) -> std::io::Result<&[u8]> {
         let offset = handle.cursor;

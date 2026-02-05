@@ -21,6 +21,7 @@
 //! - If watermark is missing or not an ancestor of tip, treat as full history.
 //! - `visited_commit` bitset deduplicates **emission** across refs.
 //! - Deterministic: identical repo state yields identical output.
+//! - Parent iteration order must be deterministic across runs.
 //!
 //! # Memory model
 //! - `VisitedCommitBitset`: 1 bit per commit.
@@ -87,6 +88,10 @@ pub trait CommitGraph {
     /// Implementations must clear `scratch` before populating it. The
     /// resulting slice from `scratch.as_slice()` is valid until the next
     /// call that mutates the scratch.
+    ///
+    /// # Ordering
+    /// Parent order must be deterministic. It is used for traversal order
+    /// and therefore impacts output stability.
     fn collect_parents(
         &self,
         pos: Position,
@@ -454,6 +459,10 @@ impl RefScratch {
 /// # Complexity
 /// O(V + E) in the reachable subgraph, with early exits when generation
 /// numbers prove the ancestor cannot be reached.
+///
+/// # Notes
+/// This is a best-effort ancestry check using generation numbers for pruning;
+/// incorrect generation data can cause missed ancestry detection.
 fn is_ancestor<CG: CommitGraph>(
     cg: &CG,
     ancestor: Position,
@@ -745,6 +754,8 @@ impl<'a, CG: CommitGraph> CommitPlanIter<'a, CG> {
     /// This marks every commit reachable from the watermark with generation
     /// `>= target_gen` as uninteresting, so the interesting frontier can
     /// safely emit any commit of that generation without missing exclusions.
+    ///
+    /// Heap growth is bounded by `limits.max_heap_entries`.
     fn advance_uninteresting(&mut self, target_gen: u32) -> Result<(), CommitPlanError> {
         while let Some(&top_u) = self.walker.heap_uninteresting.peek() {
             if top_u.gen < target_gen {

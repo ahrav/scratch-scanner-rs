@@ -78,7 +78,7 @@ graph TB
 
 ## Component Descriptions
 
-| Component           | Location                       | Purpose                                                              |
+| Component | Location | Purpose |
 | ------------------- | ------------------------------ | -------------------------------------------------------------------- |
 | **CLI Layer**       | `src/main.rs`                  | Entry point that parses args and invokes the pipeline                |
 | **Engine**          | `src/engine/core.rs:154`       | Compiled scanning engine with anchor patterns, rules, and transforms |
@@ -87,6 +87,7 @@ graph TB
 | **AhoCorasick**     | External crate                 | Multi-pattern anchor scanning (raw + UTF-16 variants)                |
 | **TransformConfig** | `src/api.rs:132`               | Transform stage configuration (URL percent, Base64)                  |
 | **Pipeline**        | `src/pipeline.rs:831`          | 4-stage cooperative pipeline coordinator                             |
+| **Archive Core**    | `src/archive/` (`scan.rs`, `budget.rs`, `path.rs`, `formats/*`) | Archive scanning config, budgets, outcomes, path canonicalization, and sink-driven scan core |
 | **Walker**          | `src/pipeline.rs:331`          | Recursive file system traversal (Unix primary; fallback at line 196) |
 | **ReaderStage**     | `src/pipeline.rs:579`          | File chunking with overlap preservation                              |
 | **ScanStage**       | `src/pipeline.rs:680`          | Detection engine invocation                                          |
@@ -136,11 +137,15 @@ graph TB
 | **WorkItems**       | `src/git_scan/work_items.rs`  | SoA candidate metadata tables for sorting without moving structs    |
 | **Policy Hash**     | `src/git_scan/policy_hash.rs`  | Canonical BLAKE3 identity over rules, transforms, and tuning         |
 
-## Git Scanning Preflight
 
-The preflight module runs before any Git blob scanning and determines whether
-maintenance artifacts are ready. The `ArtifactStatus` output gates later Git
-scanning stages and surfaces missing commit-graph/MIDX or excessive pack counts.
+## Archive Scanning Notes
+
+- Nested archive expansion is streaming-only and bounded by `ArchiveConfig::max_archive_depth`.
+- Policy enforcement is deterministic: `FailArchive` stops the current container, `FailRun` aborts the scan.
+- Archive entries use virtual `FileId` values (high-bit namespace) to isolate per-file engine state.
+- Archive parsing and expansion are centralized in `src/archive/scan.rs` and delegated to a sink (`ArchiveEntrySink`) for entry scanning.
+- Hardening expectations and review findings are tracked in
+  `docs/archive-hardening-checklist.md` and `docs/archive-review-checklist.md`.
 
 ## Git Repo Open
 
@@ -277,15 +282,39 @@ for both scanner and scheduler testing. See `docs/scanner_test_harness_guide.md`
 
 Scanner harness code lives in `src/sim_scanner/` with shared primitives in `src/sim/`.
 
-| Component             | Location                             | Purpose                                                        |
-| --------------------- | ------------------------------------ | -------------------------------------------------------------- |
-| **SimExecutor**       | `src/sim/executor.rs`                | Deterministic single-thread work-stealing model for simulation |
-| **SimFs**             | `src/sim/fs.rs`                      | Deterministic in-memory filesystem used by scenarios           |
-| **ScenarioGenerator** | `src/sim_scanner/generator.rs`       | Synthetic scenario builder with expected-secret ground truth   |
-| **Scanner Oracles**   | `src/sim_scanner/runner.rs`          | Ground-truth and differential checks for scanner simulations   |
-| **SimRng / SimClock** | `src/sim/rng.rs`, `src/sim/clock.rs` | Stable RNG and simulated time source                           |
-| **TraceRing**         | `src/sim/trace.rs`                   | Bounded trace buffer for replay and debugging                  |
-| **Minimizer**         | `src/sim/minimize.rs`                | Deterministic shrink passes for failing scanner artifacts      |
+| Component             | Location                             | Purpose                                                                |
+| --------------------- | ------------------------------------ | ---------------------------------------------------------------------- |
+| **SimExecutor**       | `src/sim/executor.rs`                | Deterministic single-thread work-stealing model for simulation         |
+| **SimFs**             | `src/sim/fs.rs`                      | Deterministic in-memory filesystem used by scenarios                   |
+| **ScenarioGenerator** | `src/sim_scanner/generator.rs`       | Synthetic scenario builder with expected-secret ground truth           |
+| **SimArchive**        | `src/sim_archive/`                   | Deterministic archive builders + virtual path materialization for sims |
+| **Scanner Oracles**   | `src/sim_scanner/runner.rs`          | Ground-truth and differential checks for scanner simulations           |
+| **SimRng / SimClock** | `src/sim/rng.rs`, `src/sim/clock.rs` | Stable RNG and simulated time source                                   |
+| **TraceRing**         | `src/sim/trace.rs`                   | Bounded trace buffer for replay and debugging                          |
+| **Minimizer**         | `src/sim/minimize.rs`                | Deterministic shrink passes for failing scanner artifacts              |
+
+### Git Simulation Harness (`sim-harness` feature)
+
+Git simulation harness code lives in `src/sim_git_scan/` with shared primitives in `src/sim/`.
+
+| Component                  | Location                           | Purpose                                                            |
+| -------------------------- | ---------------------------------- | ------------------------------------------------------------------ |
+| **Git Scenario Schema**    | `src/sim_git_scan/scenario.rs`     | Repo model + artifact bytes schema for deterministic Git scenarios |
+| **Git Scenario Generator** | `src/sim_git_scan/generator.rs`    | Synthetic Git repo generator for bounded random tests              |
+| **Git Runner**             | `src/sim_git_scan/runner.rs`       | Deterministic stage runner and failure taxonomy                    |
+| **Git Trace Ring**         | `src/sim_git_scan/trace.rs`        | Bounded trace buffer for Git simulation replay                     |
+| **Git Artifact Schema**    | `src/sim_git_scan/artifact.rs`     | Reproducible artifact format for Git sim failures                  |
+| **Git Fault Plan**         | `src/sim_git_scan/fault.rs`        | Deterministic fault injection plan keyed by logical Git resources  |
+| **Git Replay**             | `src/sim_git_scan/replay.rs`       | Load + replay `.case.json` artifacts deterministically             |
+| **Git Minimizer**          | `src/sim_git_scan/minimize.rs`     | Deterministic shrink passes for failing Git artifacts              |
+| **Git Persist Store**      | `src/sim_git_scan/persist.rs`      | Two-phase persistence simulation with fault injection              |
+| **Sim Commit Graph**       | `src/sim_git_scan/commit_graph.rs` | In-memory commit-graph adapter for deterministic commit walks      |
+| **Sim Start Set**          | `src/sim_git_scan/start_set.rs`    | Start set + watermark adapters for simulated refs                  |
+| **Sim Tree Source**        | `src/sim_git_scan/tree_source.rs`  | Tree-source adapter that encodes semantic trees into raw bytes     |
+| **Sim Pack Bytes**         | `src/sim_git_scan/pack_bytes.rs`   | In-memory pack bytes and pack-view adapter                         |
+| **Sim Pack I/O**           | `src/sim_git_scan/pack_io.rs`      | External base resolver over in-memory pack bytes                   |
+| **SimExecutor**            | `src/sim/executor.rs`              | Shared deterministic executor used for schedule control            |
+
 
 ### Scheduler Simulation Harness (`scheduler-sim` feature)
 

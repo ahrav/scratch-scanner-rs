@@ -4,14 +4,8 @@
 //! sensitive credentials, API keys, and other secrets using pattern matching
 //! with optional Base64/URL decoding.
 //!
-//! # Execution Modes
-//!
-//! - **Parallel (default)**: Work-stealing scheduler with N workers doing
-//!   concurrent file I/O and scanning. Best for multi-core machines and SSDs.
-//!
-//! - **Single-threaded** (`--workers=1` or `--single-threaded`): Legacy pipeline
-//!   mode that processes files sequentially. Useful for debugging or when
-//!   parallelism overhead exceeds benefit (very small scans).
+//! Uses a work-stealing scheduler with N parallel workers for concurrent file
+//! I/O and scanning. Best for multi-core machines and SSDs.
 //!
 //! # Output Format
 //!
@@ -25,7 +19,6 @@
 //! - `0`: Success (regardless of findings count)
 //! - `2`: Invalid arguments or configuration error
 
-use scanner_rs::pipeline::scan_path_default;
 use scanner_rs::scheduler::{parallel_scan_dir, ParallelScanConfig, StdoutSink};
 use scanner_rs::{
     demo_engine_with_anchor_mode, demo_engine_with_anchor_mode_and_max_transform_depth, AnchorMode,
@@ -36,44 +29,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-/// Worker configuration determining parallelism strategy.
-///
-/// The scanner supports two fundamentally different execution paths:
-/// - Parallel: Work-stealing scheduler (any `workers >= 2`)
-/// - Single-threaded: Legacy sequential pipeline (forces `workers == 1`)
-///
-/// The distinction matters because single-threaded mode uses a different
-/// code path (the pipeline module) which may behave differently in edge cases.
-enum WorkerConfig {
-    /// Auto-detect based on CPU count (parallel mode).
-    ///
-    /// Uses `num_cpus::get()` to determine worker count, falling back to at
-    /// least 1. On most systems this equals the number of logical cores.
-    Auto,
-    /// Use explicit worker count (parallel mode if N >= 2).
-    ///
-    /// Setting `Explicit(1)` is semantically equivalent to `SingleThreaded`.
-    Explicit(usize),
-    /// Force single-threaded mode using the legacy pipeline.
-    ///
-    /// This bypasses the work-stealing scheduler entirely, using the older
-    /// sequential pipeline from `scanner_rs::pipeline`. Useful for:
-    /// - Debugging scheduler vs engine issues
-    /// - Baseline comparison benchmarks
-    /// - Environments where threading is problematic
-    SingleThreaded,
-}
-
 fn print_usage(exe: &std::ffi::OsStr) {
     eprintln!(
         "usage: {} [OPTIONS] <path>
 
 OPTIONS:
-    --workers=<N>           Use N parallel workers (default: auto-detect CPU count)
-    --workers=1             Force single-threaded mode (same as --single-threaded)
-    --single-threaded       Force single-threaded mode (legacy pipeline)
-    --anchors=manual|derived  Anchor extraction mode (default: manual)
-    --max-transform-depth=<N> Maximum decode depth (default: 2)
+    --workers=<N>           Number of parallel workers (default: auto-detect CPU count)
+    --decode-depth=<N>      Maximum decode depth (default: 2)
+    --no-archives           Disable archive scanning (zip, tar, gz, etc.)
     --help, -h              Show this help message",
         exe.to_string_lossy()
     );
@@ -82,10 +45,10 @@ OPTIONS:
 fn main() -> io::Result<()> {
     let mut args = env::args_os();
     let exe = args.next().unwrap_or_else(|| "scanner-rs".into());
-    let mut anchor_mode = AnchorMode::Manual;
     let mut path: Option<PathBuf> = None;
-    let mut worker_config = WorkerConfig::Auto;
-    let mut max_transform_depth: Option<usize> = None;
+    let mut workers: Option<usize> = None;
+    let mut decode_depth: Option<usize> = None;
+    let mut no_archives = false;
 
     for arg in args {
         if let Some(flag) = arg.to_str() {
@@ -98,45 +61,19 @@ fn main() -> io::Result<()> {
                     eprintln!("--workers must be >= 1");
                     std::process::exit(2);
                 }
-                worker_config = if n == 1 {
-                    WorkerConfig::SingleThreaded
-                } else {
-                    WorkerConfig::Explicit(n)
-                };
-                continue;
-            }
-            if let Some(value) = flag.strip_prefix("--max-transform-depth=") {
-                max_transform_depth = Some(value.parse().unwrap_or_else(|_| {
-                    eprintln!("invalid --max-transform-depth value: {}", value);
-                    std::process::exit(2);
-                }));
+                workers = Some(n);
                 continue;
             }
             if let Some(value) = flag.strip_prefix("--decode-depth=") {
-                max_transform_depth = Some(value.parse().unwrap_or_else(|_| {
+                decode_depth = Some(value.parse().unwrap_or_else(|_| {
                     eprintln!("invalid --decode-depth value: {}", value);
                     std::process::exit(2);
                 }));
                 continue;
             }
-            if let Some(value) = flag.strip_prefix("--max-decode-depth=") {
-                max_transform_depth = Some(value.parse().unwrap_or_else(|_| {
-                    eprintln!("invalid --max-decode-depth value: {}", value);
-                    std::process::exit(2);
-                }));
-                continue;
-            }
             match flag {
-                "--single-threaded" => {
-                    worker_config = WorkerConfig::SingleThreaded;
-                    continue;
-                }
-                "--anchors=manual" => {
-                    anchor_mode = AnchorMode::Manual;
-                    continue;
-                }
-                "--anchors=derived" | "--derive-anchors" => {
-                    anchor_mode = AnchorMode::Derived;
+                "--no-archives" => {
+                    no_archives = true;
                     continue;
                 }
                 "--help" | "-h" => {
@@ -164,81 +101,43 @@ fn main() -> io::Result<()> {
         std::process::exit(2);
     };
 
-    let engine = Arc::new(match max_transform_depth {
-        Some(depth) => demo_engine_with_anchor_mode_and_max_transform_depth(anchor_mode, depth),
-        None => demo_engine_with_anchor_mode(anchor_mode),
+    let workers = workers.unwrap_or_else(|| num_cpus::get().max(1));
+
+    let engine = Arc::new(match decode_depth {
+        Some(depth) => {
+            demo_engine_with_anchor_mode_and_max_transform_depth(AnchorMode::Manual, depth)
+        }
+        None => demo_engine_with_anchor_mode(AnchorMode::Manual),
     });
     let start = Instant::now();
 
-    // Determine number of workers
-    let workers = match worker_config {
-        WorkerConfig::Auto => num_cpus::get().max(1),
-        WorkerConfig::Explicit(n) => n,
-        WorkerConfig::SingleThreaded => 1, // Will use legacy pipeline below
+    let mut config = ParallelScanConfig {
+        workers,
+        skip_hidden: false,
+        respect_gitignore: false,
+        ..Default::default()
     };
-
-    // Unified statistics structure to normalize output between execution modes.
-    //
-    // The parallel scheduler and legacy pipeline return different stat types,
-    // so we map both into this common representation for consistent output.
-    struct ScanStats {
-        /// Total files processed (or enqueued for parallel mode).
-        files: u64,
-        /// Total chunks scanned across all files.
-        chunks: u64,
-        /// Total payload bytes scanned (excluding overlap re-scans).
-        bytes_scanned: u64,
-        /// Number of secret findings emitted.
-        findings: u64,
-        /// I/O errors encountered during scanning.
-        errors: u64,
+    if no_archives {
+        config.archive.enabled = false;
     }
+    let sink = Arc::new(StdoutSink::new());
+    let report = parallel_scan_dir(&path, Arc::clone(&engine), config, sink)?;
 
-    let stats = if matches!(worker_config, WorkerConfig::SingleThreaded) {
-        // Legacy single-threaded mode
-        let pipeline_stats = scan_path_default(&path, Arc::clone(&engine))?;
-        ScanStats {
-            files: pipeline_stats.files,
-            chunks: pipeline_stats.chunks,
-            bytes_scanned: pipeline_stats.bytes_scanned,
-            findings: pipeline_stats.findings,
-            errors: pipeline_stats.errors,
-        }
-    } else {
-        // Parallel mode (default)
-        let config = ParallelScanConfig {
-            workers,
-            skip_hidden: false,       // Scan all files including hidden
-            respect_gitignore: false, // Don't skip gitignored files
-            ..Default::default()
-        };
-        let sink = Arc::new(StdoutSink::new());
-        let report = parallel_scan_dir(&path, Arc::clone(&engine), config, sink)?;
-
-        // Map LocalReport to our unified stats
-        ScanStats {
-            files: report.stats.files_enqueued,
-            chunks: report.metrics.chunks_scanned,
-            bytes_scanned: report.metrics.bytes_scanned,
-            findings: report.metrics.findings_emitted,
-            errors: report.stats.io_errors,
-        }
-    };
     let elapsed = start.elapsed();
     let elapsed_secs = elapsed.as_secs_f64();
     let throughput_mib = if elapsed_secs > 0.0 {
-        (stats.bytes_scanned as f64 / (1024.0 * 1024.0)) / elapsed_secs
+        (report.metrics.bytes_scanned as f64 / (1024.0 * 1024.0)) / elapsed_secs
     } else {
         0.0
     };
 
     eprintln!(
         "files={} chunks={} bytes={} findings={} errors={} elapsed_ms={} throughput_mib_s={:.2} workers={}",
-        stats.files,
-        stats.chunks,
-        stats.bytes_scanned,
-        stats.findings,
-        stats.errors,
+        report.stats.files_enqueued,
+        report.metrics.chunks_scanned,
+        report.metrics.bytes_scanned,
+        report.metrics.findings_emitted,
+        report.stats.io_errors,
         elapsed.as_millis(),
         throughput_mib,
         workers
@@ -262,9 +161,6 @@ fn main() -> io::Result<()> {
             vs.anchor_skipped
         );
     }
-
-    // Note: b64-stats feature is only available in single-threaded mode
-    // For parallel mode, per-chunk stats would need to be aggregated across workers
 
     Ok(())
 }

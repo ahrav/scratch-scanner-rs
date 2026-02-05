@@ -31,6 +31,16 @@
 //! The executor treats decode failures as per-offset skips and only returns
 //! fatal errors for pack parsing or sink failures. External base provider
 //! errors are recorded as skips for the affected offsets.
+//!
+//! # Plan assumptions
+//! - `need_offsets` is sorted ascending.
+//! - `candidate_offsets` is sorted ascending by offset and grouped per offset.
+//! - `exec_order`, when present, indexes into `need_offsets`.
+//!
+//! # Buffer ownership
+//! - `PackCache` stores decoded bytes when space permits.
+//! - Otherwise, bytes live in a scratch buffer that is overwritten per offset.
+//! - Sinks must consume `bytes` within the `emit` call.
 
 use std::fmt;
 use std::path::Path;
@@ -50,6 +60,7 @@ use super::pack_inflate::{
     EntryKind, ObjectKind, PackFile, PackParseError,
 };
 use super::pack_plan_model::{BaseLoc, DeltaDep, PackPlan, NONE_U32};
+use super::pack_reader::PackReader;
 use super::perf;
 
 /// External base object for REF deltas.
@@ -83,6 +94,7 @@ pub trait PackObjectSink {
     /// The `bytes` slice is only valid for the duration of the call and may
     /// be backed by either a cache entry or a scratch buffer. Implementations
     /// must copy if they need to retain the bytes.
+    /// `path` points into the caller-owned arena.
     ///
     /// When the allocation guard is enabled, `emit` must avoid heap
     /// allocation to preserve hot-path guarantees.
@@ -106,6 +118,8 @@ pub trait PackObjectSink {
 pub enum PackExecError {
     /// Pack header or index parsing failed.
     PackParse(PackParseError),
+    /// Pack bytes could not be read.
+    PackRead(String),
     /// The sink rejected an emitted blob.
     Sink(String),
     /// External base provider returned a fatal error.
@@ -118,6 +132,7 @@ impl fmt::Display for PackExecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::PackParse(err) => write!(f, "{err}"),
+            Self::PackRead(msg) => write!(f, "pack read error: {msg}"),
             Self::Sink(msg) => write!(f, "sink error: {msg}"),
             Self::ExternalBase(msg) => write!(f, "external base error: {msg}"),
             Self::Spill(msg) => write!(f, "spill error: {msg}"),
@@ -470,6 +485,40 @@ struct DeltaFrame {
     header: EntryHeader,
 }
 
+/// Executes a pack plan against a `PackReader`.
+///
+/// The reader is used to materialize a contiguous pack byte buffer. This
+/// enables deterministic fault injection for simulation without changing
+/// the core decode logic.
+///
+/// Note: this reads the entire pack into memory; very large packs may exceed
+/// addressable memory on 32-bit platforms. Spill-backed decoding uses the
+/// process temp directory.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_pack_plan_with_reader<S: PackObjectSink, B: ExternalBaseProvider, R: PackReader>(
+    plan: &PackPlan,
+    reader: &mut R,
+    paths: &ByteArena,
+    limits: &PackDecodeLimits,
+    cache: &mut PackCache,
+    external: &mut B,
+    sink: &mut S,
+) -> Result<PackExecReport, PackExecError> {
+    let mut pack_bytes = Vec::new();
+    read_pack_bytes(reader, &mut pack_bytes)?;
+    let spill_dir = std::env::temp_dir();
+    execute_pack_plan(
+        plan,
+        &pack_bytes,
+        paths,
+        limits,
+        cache,
+        external,
+        sink,
+        &spill_dir,
+    )
+}
+
 /// Executes a pack plan against pack bytes.
 ///
 /// The plan's `exec_order` is respected when present to satisfy forward
@@ -768,10 +817,28 @@ pub fn execute_pack_plan_with_scratch_indices<S: PackObjectSink, B: ExternalBase
     Ok(report)
 }
 
+/// Read the entire pack into `out`, returning a fatal error on short reads.
+fn read_pack_bytes<R: PackReader>(reader: &mut R, out: &mut Vec<u8>) -> Result<(), PackExecError> {
+    let len_u64 = reader.len();
+    let len = usize::try_from(len_u64).map_err(|_| {
+        PackExecError::PackRead(format!("pack length {len_u64} exceeds addressable memory"))
+    })?;
+    out.clear();
+    out.resize(len, 0);
+    if len == 0 {
+        return Ok(());
+    }
+    reader
+        .read_exact_at(0, out)
+        .map_err(|err| PackExecError::PackRead(err.to_string()))
+}
+
 /// Build candidate index ranges for each `need_offsets` entry.
 ///
 /// This is used only when `exec_order` reorders offsets; it avoids repeated
 /// scans of the candidate list by leveraging sorted candidate offsets.
+///
+/// Assumes `candidate_offsets` is sorted ascending by offset.
 pub fn build_candidate_ranges(plan: &PackPlan, ranges: &mut Vec<Option<(usize, usize)>>) {
     // Single pass over sorted offsets; each need offset maps to a contiguous
     // range in `candidate_offsets` (if any). Requires plan invariants:
@@ -2950,6 +3017,7 @@ run with --test-threads=1 to enable"
             must_contain: None,
             keywords_any: None,
             entropy: None,
+            local_context: None,
             secret_group: Some(1),
             re: Regex::new(r"TOK_([A-Z0-9]{8})").unwrap(),
         };

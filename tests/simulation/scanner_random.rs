@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 
+use scanner_rs::archive::ArchiveConfig;
 use scanner_rs::sim::fault::{Corruption, FaultPlan, FileFaultPlan, IoFault, ReadFault};
 use scanner_rs::sim::{ReproArtifact, SimRng, TraceDump};
 use scanner_rs::sim_scanner::{
@@ -114,7 +115,8 @@ fn bounded_random_scanner_sims() {
         let schedule_seed = seed.wrapping_add(0xC0FF_EE00);
         let runner = ScannerSimRunner::new(run_cfg.clone(), schedule_seed);
 
-        match runner.run(&scenario, &engine, &fault_plan) {
+        let (outcome, trace) = runner.run_with_trace(&scenario, &engine, &fault_plan);
+        match outcome {
             RunOutcome::Ok { .. } => {}
             RunOutcome::Failed(fail) => {
                 if std::env::var_os("DUMP_SIM_FAIL").is_some() {
@@ -131,6 +133,7 @@ fn bounded_random_scanner_sims() {
                         &scenario,
                         &fault_plan,
                         &fail,
+                        &trace,
                     );
                 }
                 panic!("scanner sim failed (seed {seed}): {fail:?}");
@@ -171,6 +174,7 @@ fn random_run_config(rng: &mut SimRng, deep: bool) -> RunConfig {
         max_steps,
         max_transform_depth,
         scan_utf16_variants,
+        archive: ArchiveConfig::default(),
         stability_runs,
     }
 }
@@ -246,6 +250,7 @@ fn write_failure_artifact(
     scenario: &scanner_rs::sim_scanner::Scenario,
     fault_plan: &FaultPlan,
     failure: &scanner_rs::sim_scanner::FailureReport,
+    trace: &TraceDump,
 ) {
     let artifact = ReproArtifact {
         schema_version: 1,
@@ -258,10 +263,7 @@ fn write_failure_artifact(
         scenario: scenario.clone(),
         fault_plan: fault_plan.clone(),
         failure: failure.clone(),
-        trace: TraceDump {
-            ring: Vec::new(),
-            full: None,
-        },
+        trace: trace.clone(),
     };
 
     let out_dir = "tests/failures";

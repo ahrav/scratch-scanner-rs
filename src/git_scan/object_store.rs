@@ -43,17 +43,20 @@
 //! and never deletes entries; once full, it is disabled and lookups fall back
 //! to pack/loose reads.
 //!
+//! # Error semantics
+//! - Missing objects surface as `TreeDiffError::TreeNotFound`.
+//! - Non-tree objects surface as `TreeDiffError::NotATree`.
+//! - Corrupt loose objects surface as `TreeDiffError::CorruptTree`.
+//!
 //! # Ordering
 //! Pack lookup is attempted before loose objects. This mirrors typical Git
 //! layouts where packs are the primary store and loose objects are a fallback.
 
+use super::bytes::BytesView;
 use std::fs;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
-use memmap2::Mmap;
 
 use super::errors::TreeDiffError;
 use super::midx::MidxView;
@@ -207,6 +210,11 @@ pub trait TreeSource {
     /// Returned bytes are treated as read-only and are not retained by the
     /// caller beyond the `TreeBytes` value.
     ///
+    /// # Contract
+    /// - The returned bytes are the tree payload only (no loose header).
+    /// - Missing objects should map to `TreeDiffError::TreeNotFound`.
+    /// - Objects that are not trees should map to `TreeDiffError::NotATree`.
+    ///
     /// # Errors
     /// - `TreeNotFound` if the object doesn't exist
     /// - `NotATree` if the object exists but isn't a tree
@@ -295,9 +303,9 @@ struct LoadedObject {
 
 /// Pack/loose object store for tree loading.
 ///
-/// Holds a borrowed MIDX view (tied to the repo job's mmap lifetime) and
-/// lazily mmaps pack files on demand. Pack mmaps are cached in `Arc` so
-/// recursive delta resolution can borrow pack bytes without aliasing `self`.
+/// Holds a borrowed MIDX view (tied to the repo job's bytes view lifetime) and
+/// lazily maps pack files on demand. Pack bytes are cached so recursive delta
+/// resolution can borrow pack data without aliasing `self`.
 ///
 /// The tree cache stores decompressed payloads; cache hits return pinned
 /// handles so callers can borrow the bytes without copying.
@@ -307,7 +315,7 @@ pub struct ObjectStore<'a> {
     max_object_bytes: usize,
     midx: MidxView<'a>,
     pack_paths: Vec<PathBuf>,
-    pack_cache: Vec<Option<Arc<Mmap>>>,
+    pack_cache: Vec<Option<BytesView>>,
     loose_dirs: Vec<PathBuf>,
     tree_cache: TreeCache,
     tree_delta_cache: TreeDeltaCache,
@@ -328,6 +336,9 @@ impl<'a> ObjectStore<'a> {
     /// The store resolves pack paths from the MIDX and uses a best-effort
     /// tree cache sized by `TreeDiffLimits`.
     ///
+    /// Verifies that the MIDX covers all pack files found in pack directories,
+    /// including alternates, so pack lookups are complete.
+    ///
     /// `spill_dir` is used for the spill arena backing file; it should be on
     /// a fast local disk to keep large-tree reads predictable.
     ///
@@ -345,15 +356,16 @@ impl<'a> ObjectStore<'a> {
             });
         }
 
-        let midx_mmap =
+        let midx_bytes =
             repo.mmaps
                 .midx
                 .as_ref()
                 .ok_or_else(|| TreeDiffError::ObjectStoreError {
-                    detail: "midx mmap missing".to_string(),
+                    detail: "midx bytes missing".to_string(),
                 })?;
 
-        let midx = MidxView::parse(midx_mmap.as_ref(), repo.object_format).map_err(store_error)?;
+        let midx =
+            MidxView::parse(midx_bytes.as_slice(), repo.object_format).map_err(store_error)?;
 
         let pack_dirs = collect_pack_dirs(&repo.paths);
         let pack_names = list_pack_files(&pack_dirs)?;
@@ -408,6 +420,10 @@ impl<'a> ObjectStore<'a> {
         Ok((loaded.kind, loaded.bytes, loaded.source))
     }
 
+    /// Loads an object with an explicit remaining delta depth.
+    ///
+    /// `depth` counts remaining delta edges; when it reaches 0, delta
+    /// resolution stops and the call fails with a depth error.
     fn load_object_with_depth(
         &mut self,
         oid: &OidBytes,
@@ -699,6 +715,7 @@ impl<'a> ObjectStore<'a> {
             let mut out = Vec::with_capacity(max_out);
             inflate_limited(&data, &mut out, max_out).map_err(store_error)?;
 
+            // Parse and validate the loose header before returning the payload.
             let (kind, payload) = parse_loose_object(&out, self.max_object_bytes)?;
             return Ok(Some((kind, payload)));
         }
@@ -706,9 +723,10 @@ impl<'a> ObjectStore<'a> {
         Ok(None)
     }
 
-    fn pack_data(&mut self, pack_id: u16) -> Result<Arc<Mmap>, TreeDiffError> {
-        // Pack files are immutable during the scan. Cache their mmaps so
-        // recursive delta resolution can reuse pack bytes cheaply.
+    /// Returns cached pack bytes for the given pack id, mapping if needed.
+    fn pack_data(&mut self, pack_id: u16) -> Result<BytesView, TreeDiffError> {
+        // Pack files are immutable during the scan. Cache their bytes so
+        // recursive delta resolution can reuse pack data cheaply.
         let idx = pack_id as usize;
         let path = self
             .pack_paths
@@ -731,16 +749,16 @@ impl<'a> ObjectStore<'a> {
             // SAFETY: The pack file is immutable for the duration of a repo
             // job. We map it read-only and never mutate through the mapping.
             let mmap = unsafe {
-                Mmap::map(&file).map_err(|err| TreeDiffError::ObjectStoreError {
+                memmap2::Mmap::map(&file).map_err(|err| TreeDiffError::ObjectStoreError {
                     detail: format!("failed to mmap pack {}: {err}", path.display()),
                 })?
             };
-            self.pack_cache[idx] = Some(Arc::new(mmap));
+            self.pack_cache[idx] = Some(BytesView::from_mmap(mmap));
         }
 
         Ok(self.pack_cache[idx]
             .as_ref()
-            .expect("pack mmap present")
+            .expect("pack bytes present")
             .clone())
     }
 
@@ -980,11 +998,12 @@ fn strip_pack_suffix(name: &[u8]) -> Vec<u8> {
     }
 }
 
-/// Parses a loose object payload into kind and raw bytes.
+/// Parses an inflated loose object into kind + payload.
 ///
-/// Expects the inflated loose format `<type> <size>\0<payload>` and verifies
-/// that the payload size matches the header. Payloads larger than
-/// `max_payload` are rejected.
+/// Expects the loose format `<type> <size>\0<payload>` and verifies that the
+/// payload size matches the header. Returns an error if the header is
+/// malformed, the size mismatches the payload, or the object kind is unknown.
+/// Payloads larger than `max_payload` are rejected.
 fn parse_loose_object(
     bytes: &[u8],
     max_payload: usize,

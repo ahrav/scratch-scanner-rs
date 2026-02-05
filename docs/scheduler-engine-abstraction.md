@@ -55,6 +55,10 @@ This design allows the scheduler logic to remain engine-agnostic while supportin
 
 **Contract**: Findings are reported with absolute byte offsets (not relative to the chunk). The scheduler is responsible for deduplication via `scratch.drop_prefix_findings()`.
 
+**Archive note**: When scanning archive entries, the scheduler supplies **virtual `FileId` values**
+in a dedicated high‑bit namespace. This ensures per-entry engine state isolation and prevents
+collisions with real filesystem file IDs.
+
 #### `rule_name(&self, rule_id: u32) -> &str`
 
 **Purpose**: Retrieves the human-readable name of a rule by its ID.

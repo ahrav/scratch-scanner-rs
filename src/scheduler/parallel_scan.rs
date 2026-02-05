@@ -91,6 +91,7 @@
 
 use super::local::{scan_local, FileSource, LocalConfig, LocalFile, LocalReport};
 use super::output_sink::OutputSink;
+use crate::archive::ArchiveConfig;
 use crate::engine::Engine;
 
 use std::io;
@@ -140,6 +141,9 @@ impl EntryLike for ignore::DirEntry {
 ///
 /// Discovery avoids per-file metadata when a type hint is available. Size caps
 /// are enforced at open time in `local.rs`.
+///
+/// When the fast type hint path is used, the file size is set to 0; open-time
+/// metadata determines the actual size and enforcement.
 ///
 /// Returns `None` on:
 /// - Non-file entries
@@ -273,6 +277,9 @@ pub struct ParallelScanConfig {
     /// large binaries, media files, or database dumps that are unlikely
     /// to contain secrets but would consume significant scan time.
     pub max_file_size: u64,
+
+    /// Archive scanning configuration.
+    pub archive: ArchiveConfig,
 }
 
 impl Default for ParallelScanConfig {
@@ -289,6 +296,7 @@ impl Default for ParallelScanConfig {
             skip_hidden: true,
             respect_gitignore: true,
             max_file_size: 100 * 1024 * 1024, // 100 MiB
+            archive: ArchiveConfig::default(),
         }
     }
 }
@@ -310,6 +318,7 @@ impl ParallelScanConfig {
             max_file_size: self.max_file_size,
             seed: self.seed,
             dedupe_within_chunk: true,
+            archive: self.archive.clone(),
         }
     }
 }
@@ -319,6 +328,8 @@ impl ParallelScanConfig {
 // ============================================================================
 
 /// Report from a parallel directory scan.
+///
+/// This is currently identical to `LocalReport` (stats + metrics snapshot).
 pub type ParallelScanReport = LocalReport;
 
 // ============================================================================
@@ -611,6 +622,7 @@ mod tests {
             must_contain: None,
             keywords_any: None,
             entropy: None,
+            local_context: None,
             secret_group: None,
             re: Regex::new(r"SECRET[A-Z0-9]{8}").unwrap(),
         }
@@ -628,6 +640,7 @@ mod tests {
             skip_hidden: true,
             respect_gitignore: false,
             max_file_size: 10 * 1024 * 1024,
+            archive: ArchiveConfig::default(),
         }
     }
 
