@@ -222,7 +222,9 @@ pub struct GitScanConfig {
     /// Pack cache size in bytes (must fit in `u32`).
     pub pack_cache_bytes: usize,
     /// Pack exec worker count (1 = single-threaded).
-    /// Default is tuned for throughput; override only with perf data.
+    ///
+    /// Default oversubscribes 2x cores (capped at 24) to hide pack IO + decode
+    /// stalls while avoiding unbounded memory-bandwidth contention.
     pub pack_exec_workers: usize,
     /// Optional spill directory override. When `None`, a unique temp directory is used.
     pub spill_dir: Option<PathBuf>,
@@ -251,10 +253,23 @@ impl Default for GitScanConfig {
             engine_adapter: EngineAdapterConfig::default(),
             pack_mmap: PackMmapLimits::DEFAULT,
             pack_cache_bytes: 64 * 1024 * 1024,
-            pack_exec_workers: 24,
+            pack_exec_workers: default_pack_exec_workers(),
             spill_dir: None,
         }
     }
+}
+
+/// Chooses a throughput-optimized pack exec worker count.
+///
+/// We oversubscribe 2x cores to mask IO/decode latency, but cap at 24 to avoid
+/// cache thrash and memory-bandwidth collapse on large machines.
+fn default_pack_exec_workers() -> usize {
+    let parallelism = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    let doubled = parallelism.saturating_mul(2);
+    let capped = if doubled > 24 { 24 } else { doubled };
+    capped.max(1)
 }
 
 /// Git scan execution mode.

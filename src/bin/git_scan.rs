@@ -86,7 +86,7 @@ OPTIONS:
     --mode=diff|odb-blob    Scan mode (default: odb-blob)
     --merge=all|first-parent  Merge diff mode (default: all)
     --anchors=manual|derived  Anchor mode (default: manual)
-    --pack-exec-workers=<N> Pack exec worker threads (default: 24)
+    --pack-exec-workers=<N> Pack exec worker threads (default: min(24, 2x cores))
     --tree-delta-cache-mb=<N> Tree delta cache size in MB (default: 64)
     --engine-chunk-mb=<N> Engine scan chunk size in MB (default: 1)
     --max-transform-depth=<N> Maximum decode depth (default: demo tuning)
