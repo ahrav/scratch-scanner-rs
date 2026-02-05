@@ -19,6 +19,8 @@
 //! This matches Git's commit-graph generation semantics.
 //! Parents outside the loaded set are treated as generation 0 and are
 //! not stored in the parent list.
+//! Generation assignment uses a single topological propagation pass
+//! (`O(N+E)` over in-set commit edges).
 //!
 //! # Invalid Input
 //! Cycles are not expected in valid Git history. If a cycle (or unresolved
@@ -30,7 +32,7 @@
 //! deterministic positions. This ensures stable traversal order.
 //! Parent order is preserved from the loaded commit list when stored.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use gix_commitgraph::Position;
 
@@ -76,6 +78,10 @@ impl CommitGraphMem {
     /// Currently infallible; the error type is reserved for future validation.
     /// Parents that are missing from the loaded set are dropped and treated
     /// as external roots for generation computation.
+    ///
+    /// # Complexity
+    /// `O(N+E)` to propagate generations over in-set parent edges, plus
+    /// `O(N log N)` for deterministic `(generation, oid)` position sorting.
     pub fn build(
         commits: Vec<LoadedCommit>,
         format: ObjectFormat,
@@ -93,59 +99,73 @@ impl CommitGraphMem {
             oid_to_idx.insert(commit.oid, idx);
         }
 
-        // Compute generation numbers
-        let mut generations = vec![0u32; n];
-        let mut pending: Vec<usize> = (0..n).collect();
-        let mut resolved = vec![false; n];
-
-        // Fixed-point iteration handles DAG ordering naturally:
-        // each pass resolves commits whose parents are already resolved.
-        let mut made_progress = true;
-        while made_progress {
-            made_progress = false;
-            let mut next_pending = Vec::new();
-
-            for idx in pending {
-                if resolved[idx] {
-                    continue;
-                }
-
-                let commit = &commits[idx];
-
-                let mut all_parents_resolved = true;
-                let mut max_parent_gen = 0u32;
-
-                for parent_oid in &commit.parents {
-                    if let Some(&parent_idx) = oid_to_idx.get(parent_oid) {
-                        if resolved[parent_idx] {
-                            max_parent_gen = max_parent_gen.max(generations[parent_idx]);
-                        } else {
-                            all_parents_resolved = false;
-                            break;
-                        }
-                    }
-                    // Parents not in our set are treated as having gen=0
-                    // (they're outside the traversed commit set)
-                }
-
-                if all_parents_resolved {
-                    generations[idx] = max_parent_gen.saturating_add(1);
-                    resolved[idx] = true;
-                    made_progress = true;
-                } else {
-                    next_pending.push(idx);
+        // Build in-set edge topology: parent -> child adjacency and in-degree.
+        // Parents outside our loaded set are treated as generation-0 external roots.
+        let mut in_degree = vec![0u32; n];
+        let mut child_counts = vec![0u32; n];
+        let mut edge_count = 0usize;
+        for (child_idx, commit) in commits.iter().enumerate() {
+            for parent_oid in &commit.parents {
+                if let Some(&parent_idx) = oid_to_idx.get(parent_oid) {
+                    in_degree[child_idx] = in_degree[child_idx].saturating_add(1);
+                    child_counts[parent_idx] = child_counts[parent_idx].saturating_add(1);
+                    edge_count = edge_count.saturating_add(1);
                 }
             }
-
-            pending = next_pending;
         }
 
-        // Check for unresolved commits (cycle or missing parents)
-        if !pending.is_empty() {
-            // Force-resolve remaining with gen=1 (shouldn't happen in valid repos)
-            for idx in pending {
-                if !resolved[idx] {
-                    generations[idx] = 1;
+        // CSR-style child adjacency for cache-friendly O(N+E) propagation.
+        let mut child_start = vec![0u32; n + 1];
+        for idx in 0..n {
+            child_start[idx + 1] = child_start[idx].saturating_add(child_counts[idx]);
+        }
+        let mut children = vec![0u32; edge_count];
+        let mut child_cursor = child_start[..n].to_vec();
+        for (child_idx, commit) in commits.iter().enumerate() {
+            for parent_oid in &commit.parents {
+                if let Some(&parent_idx) = oid_to_idx.get(parent_oid) {
+                    let insert_at = child_cursor[parent_idx] as usize;
+                    children[insert_at] = child_idx as u32;
+                    child_cursor[parent_idx] = child_cursor[parent_idx].saturating_add(1);
+                }
+            }
+        }
+
+        // Topological generation propagation:
+        // gen(node) = 1 + max(gen(parent)) over in-set parents.
+        let mut generations = vec![0u32; n];
+        let mut max_parent_gen = vec![0u32; n];
+        let mut ready = VecDeque::with_capacity(n);
+        for (idx, &degree) in in_degree.iter().enumerate() {
+            if degree == 0 {
+                ready.push_back(idx);
+            }
+        }
+
+        let mut resolved_count = 0usize;
+        while let Some(idx) = ready.pop_front() {
+            let gen = max_parent_gen[idx].saturating_add(1);
+            generations[idx] = gen;
+            resolved_count = resolved_count.saturating_add(1);
+
+            let start = child_start[idx] as usize;
+            let end = child_start[idx + 1] as usize;
+            for &child in &children[start..end] {
+                let child_idx = child as usize;
+                max_parent_gen[child_idx] = max_parent_gen[child_idx].max(gen);
+                debug_assert!(in_degree[child_idx] > 0);
+                in_degree[child_idx] -= 1;
+                if in_degree[child_idx] == 0 {
+                    ready.push_back(child_idx);
+                }
+            }
+        }
+
+        // Force-resolve remaining commits (cycle or unresolved in-set parent chain).
+        if resolved_count != n {
+            for gen in &mut generations {
+                if *gen == 0 {
+                    *gen = 1;
                 }
             }
         }
@@ -413,6 +433,147 @@ mod tests {
         let pos2_a = graph1.lookup(&OidBytes::sha1([2; 20])).unwrap().unwrap();
         let pos2_b = graph2.lookup(&OidBytes::sha1([2; 20])).unwrap().unwrap();
         assert_eq!(pos2_a, pos2_b);
+    }
+
+    #[test]
+    fn non_trivial_dag_generations_and_missing_parent_semantics() {
+        // a(root)      b(root)      j(missing-parent only)
+        //   |            |            |
+        //   c            |            |
+        //   | \          |            |
+        //   d  \         |            |
+        //    \  \        |            |
+        //      \ e <-----+            |
+        //       \ \                    |
+        //        \ f                   |
+        //         \|                   |
+        //          g                   |
+        //          | \                 |
+        //          |  h (also has missing parent)
+        //          | /
+        //          i
+        let missing_1 = [250; 20];
+        let missing_2 = [251; 20];
+
+        let a = make_commit([1; 20], [11; 20], &[], 1);
+        let b = make_commit([2; 20], [12; 20], &[], 2);
+        let c = make_commit([3; 20], [13; 20], &[[1; 20]], 3);
+        let d = make_commit([4; 20], [14; 20], &[[1; 20]], 4);
+        let e = make_commit([5; 20], [15; 20], &[[3; 20], [2; 20]], 5);
+        let f = make_commit([6; 20], [16; 20], &[[4; 20], [5; 20]], 6);
+        let g = make_commit([7; 20], [17; 20], &[[5; 20]], 7);
+        let h = make_commit([8; 20], [18; 20], &[missing_1, [7; 20]], 8);
+        let i = make_commit([9; 20], [19; 20], &[[6; 20], [8; 20]], 9);
+        let j = make_commit([10; 20], [20; 20], &[missing_2], 10);
+
+        let graph =
+            CommitGraphMem::build(vec![h, d, i, b, g, f, j, c, e, a], ObjectFormat::Sha1).unwrap();
+
+        let pos_a = graph.lookup(&OidBytes::sha1([1; 20])).unwrap().unwrap();
+        let pos_b = graph.lookup(&OidBytes::sha1([2; 20])).unwrap().unwrap();
+        let pos_c = graph.lookup(&OidBytes::sha1([3; 20])).unwrap().unwrap();
+        let pos_d = graph.lookup(&OidBytes::sha1([4; 20])).unwrap().unwrap();
+        let pos_e = graph.lookup(&OidBytes::sha1([5; 20])).unwrap().unwrap();
+        let pos_f = graph.lookup(&OidBytes::sha1([6; 20])).unwrap().unwrap();
+        let pos_g = graph.lookup(&OidBytes::sha1([7; 20])).unwrap().unwrap();
+        let pos_h = graph.lookup(&OidBytes::sha1([8; 20])).unwrap().unwrap();
+        let pos_i = graph.lookup(&OidBytes::sha1([9; 20])).unwrap().unwrap();
+        let pos_j = graph.lookup(&OidBytes::sha1([10; 20])).unwrap().unwrap();
+
+        assert_eq!(graph.generation(pos_a), 1);
+        assert_eq!(graph.generation(pos_b), 1);
+        assert_eq!(graph.generation(pos_j), 1);
+        assert_eq!(graph.generation(pos_c), 2);
+        assert_eq!(graph.generation(pos_d), 2);
+        assert_eq!(graph.generation(pos_e), 3);
+        assert_eq!(graph.generation(pos_f), 4);
+        assert_eq!(graph.generation(pos_g), 4);
+        assert_eq!(graph.generation(pos_h), 5);
+        assert_eq!(graph.generation(pos_i), 6);
+
+        // Missing parents are dropped from stored parent lists.
+        let mut scratch = ParentScratch::new();
+        graph.collect_parents(pos_h, 16, &mut scratch).unwrap();
+        assert_eq!(scratch.as_slice(), &[pos_g]);
+
+        graph.collect_parents(pos_j, 16, &mut scratch).unwrap();
+        assert!(scratch.as_slice().is_empty());
+    }
+
+    #[test]
+    fn deterministic_positions_on_non_trivial_dag() {
+        let missing_1 = [250; 20];
+        let missing_2 = [251; 20];
+
+        let a = make_commit([1; 20], [11; 20], &[], 1);
+        let b = make_commit([2; 20], [12; 20], &[], 2);
+        let c = make_commit([3; 20], [13; 20], &[[1; 20]], 3);
+        let d = make_commit([4; 20], [14; 20], &[[1; 20]], 4);
+        let e = make_commit([5; 20], [15; 20], &[[3; 20], [2; 20]], 5);
+        let f = make_commit([6; 20], [16; 20], &[[4; 20], [5; 20]], 6);
+        let g = make_commit([7; 20], [17; 20], &[[5; 20]], 7);
+        let h = make_commit([8; 20], [18; 20], &[missing_1, [7; 20]], 8);
+        let i = make_commit([9; 20], [19; 20], &[[6; 20], [8; 20]], 9);
+        let j = make_commit([10; 20], [20; 20], &[missing_2], 10);
+
+        let graph1 = CommitGraphMem::build(
+            vec![
+                a.clone(),
+                b.clone(),
+                c.clone(),
+                d.clone(),
+                e.clone(),
+                f.clone(),
+                g.clone(),
+                h.clone(),
+                i.clone(),
+                j.clone(),
+            ],
+            ObjectFormat::Sha1,
+        )
+        .unwrap();
+        let graph2 =
+            CommitGraphMem::build(vec![i, d, h, c, j, g, a, f, b, e], ObjectFormat::Sha1).unwrap();
+
+        assert_eq!(graph1.num_commits(), graph2.num_commits());
+        for pos_idx in 0..graph1.num_commits() {
+            let pos = Position(pos_idx);
+            assert_eq!(graph1.commit_oid(pos), graph2.commit_oid(pos));
+            assert_eq!(graph1.generation(pos), graph2.generation(pos));
+        }
+
+        // Concrete ordering check: sorted by (generation, oid).
+        let ordered_oids: Vec<OidBytes> = (0..graph1.num_commits())
+            .map(|pos_idx| graph1.commit_oid(Position(pos_idx)))
+            .collect();
+        assert_eq!(
+            ordered_oids,
+            vec![
+                OidBytes::sha1([1; 20]),
+                OidBytes::sha1([2; 20]),
+                OidBytes::sha1([10; 20]),
+                OidBytes::sha1([3; 20]),
+                OidBytes::sha1([4; 20]),
+                OidBytes::sha1([5; 20]),
+                OidBytes::sha1([6; 20]),
+                OidBytes::sha1([7; 20]),
+                OidBytes::sha1([8; 20]),
+                OidBytes::sha1([9; 20]),
+            ]
+        );
+    }
+
+    #[test]
+    fn cycle_falls_back_to_generation_one() {
+        // Invalid cycle: a <-> b. Existing semantics force unresolved commits to gen=1.
+        let a = make_commit([1; 20], [11; 20], &[[2; 20]], 1);
+        let b = make_commit([2; 20], [12; 20], &[[1; 20]], 2);
+
+        let graph = CommitGraphMem::build(vec![a, b], ObjectFormat::Sha1).unwrap();
+        let pos_a = graph.lookup(&OidBytes::sha1([1; 20])).unwrap().unwrap();
+        let pos_b = graph.lookup(&OidBytes::sha1([2; 20])).unwrap().unwrap();
+        assert_eq!(graph.generation(pos_a), 1);
+        assert_eq!(graph.generation(pos_b), 1);
     }
 
     #[test]

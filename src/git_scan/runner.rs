@@ -1775,11 +1775,11 @@ pub fn run_git_scan(
         .pack_cache_bytes
         .try_into()
         .map_err(|_| io::Error::other("pack cache size exceeds u32::MAX"))?;
-    let mut cache = PackCache::new(pack_cache_bytes);
-    let mut external = PackIo::open(&repo, config.pack_io)?;
-    let mut adapter = EngineAdapter::new(engine, config.engine_adapter);
-    adapter.reserve_results(packed_len.saturating_add(loose_len));
-    let mut pack_exec_reports = Vec::with_capacity(plans.len());
+    let pack_exec_workers = config.pack_exec_workers.max(1);
+    let pack_exec_strategy = select_pack_exec_strategy(pack_exec_workers, plans.len());
+    let plan_count = plans.len();
+    let loose_dirs = collect_loose_dirs(&repo.paths);
+    let mut pack_exec_reports = Vec::with_capacity(plan_count);
     let mut skipped_candidates = Vec::new();
     let mut scanned = ScannedBlobs {
         blobs: Vec::with_capacity(packed_len.saturating_add(loose_len)),

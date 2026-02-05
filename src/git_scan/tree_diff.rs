@@ -309,7 +309,7 @@ impl TreeDiffWalker {
     ///
     /// Call this when starting a new repository scan to get fresh stats.
     /// The internal buffers (stack, path_buf) are retained for reuse.
-    /// The tree-bytes budget is enforced on in-flight bytes across calls.
+    /// Each diff call releases all in-flight tree bytes before returning.
     pub fn reset_stats(&mut self) {
         debug_assert!(
             self.stack.is_empty(),
@@ -346,7 +346,8 @@ impl TreeDiffWalker {
     /// - Candidate paths are borrowed from an internal buffer and are only
     ///   valid until the next emission.
     /// - Stats are cumulative across calls; `reset_stats()` clears counters.
-    /// - The tree-bytes budget is enforced on in-flight bytes across calls until reset.
+    /// - All retained tree-byte charges are released before return, including
+    ///   early-error exits, so retries start from a clean budget state.
     pub fn diff_trees<S: TreeSource, C: CandidateSink>(
         &mut self,
         source: &mut S,
@@ -360,8 +361,7 @@ impl TreeDiffWalker {
             return Ok(());
         }
 
-        self.path_buf.clear();
-        self.stack.clear();
+        self.cleanup_after_diff_call();
         let mut name_scratch = std::mem::take(&mut self.name_scratch);
         name_scratch.clear();
         debug_assert!(
@@ -478,6 +478,7 @@ impl TreeDiffWalker {
         })();
 
         self.name_scratch = name_scratch;
+        self.cleanup_after_diff_call();
 
         result
     }
@@ -519,6 +520,22 @@ impl TreeDiffWalker {
 
     fn release_tree_bytes(&mut self, len: u64) {
         self.tree_bytes_in_flight = self.tree_bytes_in_flight.saturating_sub(len);
+    }
+
+    /// Releases any tree-byte charges retained after a `diff_trees` call.
+    ///
+    /// Normally the walk loop pops all frames and releases in-flight bytes as
+    /// it goes. Early errors can exit before that unwind completes (or before
+    /// the root frame is pushed), so this cleanup makes retries on the same
+    /// walker start from a clean budget state.
+    fn cleanup_after_diff_call(&mut self) {
+        while let Some(frame) = self.stack.pop() {
+            self.release_tree_bytes(frame.new_cursor.in_flight_len());
+            self.release_tree_bytes(frame.old_cursor.in_flight_len());
+        }
+
+        self.path_buf.clear();
+        self.tree_bytes_in_flight = 0;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1051,6 +1068,119 @@ mod tests {
             result,
             Err(TreeDiffError::MaxTreeDepthExceeded { max_depth: 2 })
         ));
+    }
+
+    #[test]
+    fn budget_error_releases_in_flight_bytes_for_retry() {
+        let mut source = MockTreeSource::new();
+
+        let new_oid = test_oid(1);
+        let new_data = make_entry(b"100644", b"new.txt", &[0xaa; 20]);
+        source.add_tree(new_oid, new_data.clone());
+
+        let old_oid = test_oid(2);
+        let old_data = make_entry(b"100644", b"old.txt", &[0xbb; 20]);
+        source.add_tree(old_oid, old_data);
+
+        let limits = TreeDiffLimits {
+            max_tree_bytes_in_flight: new_data.len() as u64,
+            ..test_limits()
+        };
+        let mut walker = TreeDiffWalker::new(&limits, 20);
+
+        let mut first_candidates = CandidateBuffer::new(&limits, 20);
+        let first = walker.diff_trees(
+            &mut source,
+            &mut first_candidates,
+            Some(&new_oid),
+            Some(&old_oid),
+            1,
+            0,
+        );
+        assert!(matches!(
+            first,
+            Err(TreeDiffError::TreeBytesBudgetExceeded { .. })
+        ));
+        assert_eq!(walker.tree_bytes_in_flight, 0);
+
+        let mut retry_candidates = CandidateBuffer::new(&limits, 20);
+        walker
+            .diff_trees(
+                &mut source,
+                &mut retry_candidates,
+                Some(&new_oid),
+                None,
+                2,
+                0,
+            )
+            .unwrap();
+
+        let resolved: Vec<_> = retry_candidates.iter_resolved().collect();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].path, b"new.txt");
+        assert_eq!(resolved[0].change_kind, ChangeKind::Add);
+    }
+
+    #[test]
+    fn depth_error_releases_in_flight_bytes_for_retry() {
+        let mut source = MockTreeSource::new();
+
+        let file_oid = [0xab; 20];
+
+        let c_tree = test_oid(13);
+        source.add_tree(c_tree, make_entry(b"100644", b"file.txt", &file_oid));
+
+        let b_tree = test_oid(12);
+        source.add_tree(b_tree, make_entry(b"40000", b"c", c_tree.as_slice()));
+
+        let a_tree = test_oid(11);
+        source.add_tree(a_tree, make_entry(b"40000", b"b", b_tree.as_slice()));
+
+        let deep_root = test_oid(1);
+        source.add_tree(deep_root, make_entry(b"40000", b"a", a_tree.as_slice()));
+
+        let retry_root = test_oid(3);
+        source.add_tree(retry_root, make_entry(b"100644", b"retry.txt", &[0xcd; 20]));
+
+        let limits = TreeDiffLimits {
+            max_tree_depth: 2,
+            max_tree_bytes_in_flight: 64,
+            ..test_limits()
+        };
+        let mut walker = TreeDiffWalker::new(&limits, 20);
+
+        let mut first_candidates = CandidateBuffer::new(&limits, 20);
+        let first = walker.diff_trees(
+            &mut source,
+            &mut first_candidates,
+            Some(&deep_root),
+            None,
+            1,
+            0,
+        );
+        assert!(matches!(
+            first,
+            Err(TreeDiffError::MaxTreeDepthExceeded { max_depth: 2 })
+        ));
+        assert!(walker.stack.is_empty());
+        assert_eq!(walker.tree_bytes_in_flight, 0);
+
+        let mut retry_candidates = CandidateBuffer::new(&limits, 20);
+        walker
+            .diff_trees(
+                &mut source,
+                &mut retry_candidates,
+                Some(&retry_root),
+                None,
+                2,
+                0,
+            )
+            .unwrap();
+
+        let resolved: Vec<_> = retry_candidates.iter_resolved().collect();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].path, b"retry.txt");
+        assert_eq!(resolved[0].change_kind, ChangeKind::Add);
     }
 
     #[test]
