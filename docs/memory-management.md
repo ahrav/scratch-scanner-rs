@@ -59,6 +59,12 @@ After startup allocation, the scan phase is allocation-free:
 - Buffer pool provides fixed I/O buffers (TsBufferPool)
 - Findings use pre-sized vectors that are reused across chunks
 
+Path storage is also bounded: `FileTable` maintains a fixed-capacity byte arena
+for Unix paths. Archive expansion uses fallible `try_*` insertion APIs plus
+per-archive path budgets so hostile inputs cannot panic the scanner.
+See `docs/archive-hardening-checklist.md` for the release-mode capacity guards
+and archive-specific allocation constraints.
+
 Run diagnostic tests to verify: `cargo test --test diagnostic -- --ignored --nocapture --test-threads=1`
 
 ---

@@ -100,6 +100,10 @@ let config = GlobalResourcePoolConfig {
 | Delta Cache | 0 | No delta resolution needed |
 | Spill Permission | Depends on job | Only if extraction may exceed memory |
 
+**Zip note:** current ZIP scanning is file-backed random access and reuses
+per-worker buffers; it does not yet acquire a fat-job permit unless spill
+materialization is introduced for nested archives.
+
 **Configuration Example**:
 ```rust
 // For archive processing

@@ -95,6 +95,14 @@ File size is captured at `open()` time via `metadata().len()`. This means:
 - **TOCTOU safety**: No time-of-check-time-of-use race on file size
 - **Size cap enforcement**: `max_file_size` is checked against the open-time size
 
+### Archive Detection
+
+When archive scanning is enabled, each file is classified by extension and
+optional header sniffing. Archive candidates are routed to archive handling
+paths (and otherwise scanned as regular files).
+See `docs/archive-scanning-plan.md` and `docs/archive-review-checklist.md`
+for the archive path semantics and hardening expectations.
+
 ### Work-Conserving Semantics
 
 Every discovered file is enqueued with a `CountBudget` permit. Workers block on buffer acquisition, never skip files due to backpressure. This ensures:
@@ -114,6 +122,7 @@ pub struct LocalConfig {
     pub max_file_size: u64,          // Max bytes to scan (open-time enforced)
     pub seed: u64,                   // Deterministic executor seed
     pub dedupe_within_chunk: bool,   // Deduplicate findings per chunk
+    pub archive: ArchiveConfig,      // Archive scanning policy + limits
 }
 ```
 
@@ -134,6 +143,10 @@ The `validate()` method checks:
 - All sizes are positive
 - `chunk_size + overlap <= BUFFER_LEN_MAX` (2 MiB)
 - Warns if `pool_buffers < workers` (potential contention)
+- Archive config invariants via `ArchiveConfig::validate()`
+
+Archive entry paths (when enabled) are canonicalized and bounded; arena/path
+budget overruns are handled as partial outcomes instead of panics.
 
 ## File Sources and Discovery
 
@@ -194,6 +207,9 @@ pub struct LocalReport {
     pub metrics: MetricsSnapshot,  // chunks_scanned, bytes_scanned, timing
 }
 ```
+
+`MetricsSnapshot` now also aggregates archive outcomes via `ArchiveStats`
+(all zeros when archive scanning is disabled).
 
 ### process_file()
 

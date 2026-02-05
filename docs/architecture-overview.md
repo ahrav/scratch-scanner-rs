@@ -87,6 +87,7 @@ graph TB
 | **AhoCorasick**     | External crate                 | Multi-pattern anchor scanning (raw + UTF-16 variants)                |
 | **TransformConfig** | `src/api.rs:132`               | Transform stage configuration (URL percent, Base64)                  |
 | **Pipeline**        | `src/pipeline.rs:831`          | 4-stage cooperative pipeline coordinator                             |
+| **Archive Core**    | `src/archive/mod.rs`           | Archive scanning config, budgets, outcomes, path canonicalization, and format helpers |
 | **Walker**          | `src/pipeline.rs:331`          | Recursive file system traversal (Unix primary; fallback at line 196) |
 | **ReaderStage**     | `src/pipeline.rs:579`          | File chunking with overlap preservation                              |
 | **ScanStage**       | `src/pipeline.rs:680`          | Detection engine invocation                                          |
@@ -183,6 +184,14 @@ The policy hash is a canonical BLAKE3 identity over:
 - Tuning parameters
 - Merge diff mode
 - Path policy version
+
+## Archive Scanning Notes
+
+- Nested archive expansion is streaming-only and bounded by `ArchiveConfig::max_archive_depth`.
+- Policy enforcement is deterministic: `FailArchive` stops the current container, `FailRun` aborts the scan.
+- Archive entries use virtual `FileId` values (high-bit namespace) to isolate per-file engine state.
+- Hardening expectations and review findings are tracked in
+  `docs/archive-hardening-checklist.md` and `docs/archive-review-checklist.md`.
 
 ## Testing Harnesses
 

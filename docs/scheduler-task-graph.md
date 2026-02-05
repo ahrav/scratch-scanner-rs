@@ -146,6 +146,17 @@ if detection_finds_archive(buffer) {
 
 The nested enumeration acquires its own frontier permits independently.
 
+**Dispatch note:** in the local scheduler (filesystem backend), archive
+containers are detected by extension/magic and routed through the archive
+dispatch entrypoint. In Phase 3 this dispatch is a skip path; later phases
+replace it with actual archive scanning while preserving the same task
+boundaries.
+
+**Abort policy note:** when archive policies trigger `FailRun`, the local
+scheduler sets a shared abort flag. Discovery stops enqueuing new files and
+workers skip further processing, providing a deterministic run-wide abort
+without leaking permits.
+
 ### Re-enqueueing on Backpressure
 
 When the frontier is at capacity, `Enumerate` does not block or drop work:
