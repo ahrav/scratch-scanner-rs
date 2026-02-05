@@ -1,13 +1,15 @@
 //! Synthetic scenario generator for scanner simulations.
 //!
-//! The generator produces deterministic filesystem contents with known secrets
-//! and an accompanying rule suite that should detect only those secrets. It is
-//! intended for differential + ground-truth oracles in the sim harness.
+//! The generator produces deterministic filesystem contents (including archives)
+//! with known secrets and an accompanying rule suite that should detect only
+//! those secrets. It is intended for differential + ground-truth oracles in
+//! the sim harness.
 //!
 //! Invariants:
 //! - Rule prefixes are ASCII and included in anchors; regexes match `prefix + tail`.
 //! - Noise bytes are lowercase `x` to avoid accidental prefix matches.
 //! - `ExpectedSecret.root_span` refers to the encoded bytes stored in `SimFs`.
+//! - Archive entry spans refer to uncompressed entry payload bytes.
 
 use regex::bytes::Regex;
 
@@ -15,10 +17,14 @@ use crate::api::{
     AnchorPolicy, Gate, RuleSpec, TransformConfig, TransformId, TransformMode, Tuning,
     ValidatorKind,
 };
+use crate::archive::ArchiveConfig;
 use crate::sim::fs::{SimFsSpec, SimNodeSpec, SimPath, SimTypeHint};
 use crate::sim::rng::SimRng;
+use crate::sim_archive::{entry_paths, materialize_archive};
 use crate::sim_scanner::scenario::{
-    ExpectedSecret, RuleSuiteSpec, RunConfig, Scenario, SecretRepr, SpanU32, SyntheticRuleSpec,
+    ArchiveEntrySpec, ArchiveFileSpec, ArchiveKindSpec, EntryCompressionSpec, EntryKindSpec,
+    ExpectedDisposition, ExpectedSecret, RuleSuiteSpec, RunConfig, Scenario, SecretRepr, SpanU32,
+    SyntheticRuleSpec,
 };
 use crate::Engine;
 
@@ -45,6 +51,14 @@ pub struct ScenarioGenConfig {
     pub max_noise_len: u32,
     /// Allowed secret representations to choose from.
     pub representations: Vec<SecretRepr>,
+    /// Number of archive files to generate.
+    pub archive_count: u32,
+    /// Number of entries per archive file.
+    pub archive_entries: u32,
+    /// Allowed archive kinds to choose from.
+    pub archive_kinds: Vec<ArchiveKindSpec>,
+    /// Archive config used to compute virtual paths for expected secrets.
+    pub archive: ArchiveConfig,
 }
 
 impl Default for ScenarioGenConfig {
@@ -64,6 +78,15 @@ impl Default for ScenarioGenConfig {
                 SecretRepr::Utf16Le,
                 SecretRepr::Utf16Be,
             ],
+            archive_count: 0,
+            archive_entries: 2,
+            archive_kinds: vec![
+                ArchiveKindSpec::Tar,
+                ArchiveKindSpec::TarGz,
+                ArchiveKindSpec::Zip,
+                ArchiveKindSpec::Gzip,
+            ],
+            archive: ArchiveConfig::default(),
         }
     }
 }
@@ -73,8 +96,8 @@ impl ScenarioGenConfig {
         if self.rule_count == 0 {
             return Err("rule_count must be > 0".to_string());
         }
-        if self.file_count == 0 {
-            return Err("file_count must be > 0".to_string());
+        if self.file_count == 0 && self.archive_count == 0 {
+            return Err("file_count or archive_count must be > 0".to_string());
         }
         if self.token_len == 0 {
             return Err("token_len must be > 0".to_string());
@@ -84,6 +107,9 @@ impl ScenarioGenConfig {
         }
         if self.representations.is_empty() {
             return Err("representations must be non-empty".to_string());
+        }
+        if self.archive_count > 0 && self.archive_entries == 0 {
+            return Err("archive_entries must be > 0 when archive_count > 0".to_string());
         }
         Ok(())
     }
@@ -99,9 +125,11 @@ pub fn generate_scenario(seed: u64, cfg: &ScenarioGenConfig) -> Result<Scenario,
     let mut rng = SimRng::new(seed);
     let rule_suite = build_rule_suite(cfg);
 
-    let mut nodes = Vec::with_capacity(cfg.file_count as usize);
+    let total_files = cfg.file_count.saturating_add(cfg.archive_count);
+    let mut nodes = Vec::with_capacity(total_files as usize);
     let mut expected =
         Vec::with_capacity((cfg.file_count.saturating_mul(cfg.secrets_per_file)) as usize);
+    let mut archives = Vec::with_capacity(cfg.archive_count as usize);
 
     for file_idx in 0..cfg.file_count {
         let path = SimPath::new(format!("file_{file_idx}.txt").into_bytes());
@@ -124,6 +152,7 @@ pub fn generate_scenario(seed: u64, cfg: &ScenarioGenConfig) -> Result<Scenario,
                 rule_id,
                 root_span: SpanU32::new(start, end),
                 repr,
+                disposition: ExpectedDisposition::MustFind,
             });
         }
 
@@ -137,12 +166,175 @@ pub fn generate_scenario(seed: u64, cfg: &ScenarioGenConfig) -> Result<Scenario,
         });
     }
 
+    if cfg.archive_count > 0 {
+        let kinds = effective_archive_kinds(cfg);
+        for archive_idx in 0..cfg.archive_count {
+            let kind = pick_archive_kind(&mut rng, &kinds);
+            let root_path = SimPath::new(format_archive_name(archive_idx, kind).into_bytes());
+            let entries_per_archive = if kind == ArchiveKindSpec::Gzip {
+                1
+            } else {
+                cfg.archive_entries
+            };
+
+            let mut entries = Vec::with_capacity(entries_per_archive as usize);
+            let mut pending = Vec::new();
+
+            for entry_idx in 0..entries_per_archive {
+                let name_bytes = format!("entry_{archive_idx}_{entry_idx}.txt").into_bytes();
+                let mut payload = Vec::new();
+
+                for _ in 0..cfg.secrets_per_file {
+                    append_noise(&mut rng, cfg, &mut payload);
+
+                    let rule_id = rng.gen_range(0, cfg.rule_count);
+                    let repr = pick_repr(&mut rng, &cfg.representations);
+                    let token = make_token(rule_id, cfg.token_len, &mut rng);
+                    let encoded = encode_secret(&token, &repr);
+
+                    let start = payload.len() as u32;
+                    payload.extend_from_slice(&encoded);
+                    let end = payload.len() as u32;
+
+                    pending.push(PendingExpected {
+                        entry_idx,
+                        rule_id,
+                        span: SpanU32::new(start, end),
+                        repr,
+                    });
+                }
+
+                append_noise(&mut rng, cfg, &mut payload);
+
+                let compression = match kind {
+                    ArchiveKindSpec::Zip => {
+                        if rng.gen_bool(1, 2) {
+                            EntryCompressionSpec::Deflate
+                        } else {
+                            EntryCompressionSpec::Store
+                        }
+                    }
+                    _ => EntryCompressionSpec::Store,
+                };
+
+                entries.push(ArchiveEntrySpec {
+                    name_bytes,
+                    payload,
+                    compression,
+                    encrypted: false,
+                    kind: EntryKindSpec::RegularFile,
+                });
+            }
+
+            let spec = ArchiveFileSpec {
+                root_path: root_path.clone(),
+                kind,
+                entries,
+                corruption: None,
+            };
+
+            let materialized =
+                materialize_archive(&spec).map_err(|e| format!("archive build failed: {e}"))?;
+            let entry_paths = entry_paths(&spec, &materialized, &cfg.archive)
+                .map_err(|e| format!("archive entry path computation failed: {e}"))?;
+
+            for item in pending {
+                let path_bytes = entry_paths
+                    .get(item.entry_idx as usize)
+                    .ok_or_else(|| "missing archive entry path".to_string())?;
+                let disposition = disposition_for_entry(&spec, item.entry_idx)?;
+                expected.push(ExpectedSecret {
+                    path: SimPath::new(path_bytes.clone()),
+                    rule_id: item.rule_id,
+                    root_span: item.span,
+                    repr: item.repr,
+                    disposition,
+                });
+            }
+
+            nodes.push(SimNodeSpec::File {
+                path: root_path,
+                contents: materialized.bytes,
+                discovery_len_hint: None,
+                type_hint: SimTypeHint::File,
+            });
+            archives.push(spec);
+        }
+    }
+
     Ok(Scenario {
         schema_version: cfg.schema_version,
         fs: SimFsSpec { nodes },
         rule_suite,
         expected,
+        archives,
     })
+}
+
+#[derive(Clone, Debug)]
+struct PendingExpected {
+    entry_idx: u32,
+    rule_id: u32,
+    span: SpanU32,
+    repr: SecretRepr,
+}
+
+fn effective_archive_kinds(cfg: &ScenarioGenConfig) -> Vec<ArchiveKindSpec> {
+    if cfg.archive_kinds.is_empty() {
+        vec![
+            ArchiveKindSpec::Tar,
+            ArchiveKindSpec::TarGz,
+            ArchiveKindSpec::Zip,
+            ArchiveKindSpec::Gzip,
+        ]
+    } else {
+        cfg.archive_kinds.clone()
+    }
+}
+
+fn pick_archive_kind(rng: &mut SimRng, kinds: &[ArchiveKindSpec]) -> ArchiveKindSpec {
+    let idx = if kinds.len() <= 1 {
+        0
+    } else {
+        rng.gen_range(0, kinds.len() as u32) as usize
+    };
+    kinds[idx]
+}
+
+fn format_archive_name(idx: u32, kind: ArchiveKindSpec) -> String {
+    match kind {
+        ArchiveKindSpec::Gzip => format!("archive_{idx}.gz"),
+        ArchiveKindSpec::Tar => format!("archive_{idx}.tar"),
+        ArchiveKindSpec::TarGz => format!("archive_{idx}.tar.gz"),
+        ArchiveKindSpec::Zip => format!("archive_{idx}.zip"),
+    }
+}
+
+fn disposition_for_entry(
+    spec: &ArchiveFileSpec,
+    entry_idx: u32,
+) -> Result<ExpectedDisposition, String> {
+    let entry = spec
+        .entries
+        .get(entry_idx as usize)
+        .ok_or_else(|| "missing archive entry".to_string())?;
+
+    if entry.encrypted {
+        return Ok(ExpectedDisposition::MayMiss {
+            reason: "encrypted entry".to_string(),
+        });
+    }
+    if entry.kind != EntryKindSpec::RegularFile {
+        return Ok(ExpectedDisposition::MayMiss {
+            reason: "non-regular entry".to_string(),
+        });
+    }
+    if spec.corruption.is_some() {
+        return Ok(ExpectedDisposition::MayMiss {
+            reason: "archive corruption".to_string(),
+        });
+    }
+    Ok(ExpectedDisposition::MustFind)
 }
 
 /// Build a deterministic engine from a synthetic rule suite.
@@ -390,5 +582,6 @@ mod tests {
         assert_eq!(a.expected.len(), b.expected.len());
         assert_eq!(a.fs.nodes.len(), b.fs.nodes.len());
         assert_eq!(a.rule_suite.rules.len(), b.rule_suite.rules.len());
+        assert_eq!(a.archives.len(), b.archives.len());
     }
 }

@@ -15,6 +15,7 @@ pub mod detect;
 pub mod formats;
 pub mod outcome;
 pub mod path;
+pub mod scan;
 
 pub use budget::{ArchiveBudgets, BudgetHit, ChargeResult};
 pub use config::{ArchiveConfig, ArchiveConfigError, EncryptedPolicy, UnsupportedPolicy};
@@ -28,4 +29,8 @@ pub use outcome::{
 };
 pub use path::{
     CanonicalPath, EntryPathCanonicalizer, VirtualPath, VirtualPathBuilder, DEFAULT_MAX_COMPONENTS,
+};
+pub use scan::{
+    scan_gzip_stream, scan_tar_stream, scan_targz_stream, scan_zip_source, ArchiveEnd,
+    ArchiveEntrySink, ArchiveScratch, EntryChunk, EntryMeta,
 };

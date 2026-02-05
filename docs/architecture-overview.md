@@ -87,7 +87,7 @@ graph TB
 | **AhoCorasick** | External crate | Multi-pattern anchor scanning (raw + UTF-16 variants) |
 | **TransformConfig** | `src/api.rs:132` | Transform stage configuration (URL percent, Base64) |
 | **Pipeline** | `src/pipeline.rs:831` | 4-stage cooperative pipeline coordinator |
-| **Archive Core** | `src/archive/mod.rs` | Archive scanning config, budgets, outcomes, path canonicalization, and format helpers |
+| **Archive Core** | `src/archive/` (`scan.rs`, `budget.rs`, `path.rs`, `formats/*`) | Archive scanning config, budgets, outcomes, path canonicalization, and sink-driven scan core |
 | **Walker** | `src/pipeline.rs:331` | Recursive file system traversal (Unix primary; fallback at line 196) |
 | **ReaderStage** | `src/pipeline.rs:579` | File chunking with overlap preservation |
 | **ScanStage** | `src/pipeline.rs:680` | Detection engine invocation |
@@ -104,6 +104,7 @@ graph TB
 - Nested archive expansion is streaming-only and bounded by `ArchiveConfig::max_archive_depth`.
 - Policy enforcement is deterministic: `FailArchive` stops the current container, `FailRun` aborts the scan.
 - Archive entries use virtual `FileId` values (high-bit namespace) to isolate per-file engine state.
+- Archive parsing and expansion are centralized in `src/archive/scan.rs` and delegated to a sink (`ArchiveEntrySink`) for entry scanning.
 - Hardening expectations and review findings are tracked in
   `docs/archive-hardening-checklist.md` and `docs/archive-review-checklist.md`.
 
@@ -122,6 +123,7 @@ Scanner harness code lives in `src/sim_scanner/` with shared primitives in `src/
 | **SimExecutor** | `src/sim/executor.rs` | Deterministic single-thread work-stealing model for simulation |
 | **SimFs** | `src/sim/fs.rs` | Deterministic in-memory filesystem used by scenarios |
 | **ScenarioGenerator** | `src/sim_scanner/generator.rs` | Synthetic scenario builder with expected-secret ground truth |
+| **SimArchive** | `src/sim_archive/` | Deterministic archive builders + virtual path materialization for sims |
 | **Scanner Oracles** | `src/sim_scanner/runner.rs` | Ground-truth and differential checks for scanner simulations |
 | **SimRng / SimClock** | `src/sim/rng.rs`, `src/sim/clock.rs` | Stable RNG and simulated time source |
 | **TraceRing** | `src/sim/trace.rs` | Bounded trace buffer for replay and debugging |

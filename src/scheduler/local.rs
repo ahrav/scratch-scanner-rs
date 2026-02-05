@@ -314,7 +314,7 @@ struct LocalScratch<E: ScanEngine> {
     /// Per-depth TAR cursors (one per nested depth).
     tar_cursors: Vec<TarCursor>,
     /// Reused ZIP cursor with preallocated buffers.
-    zip_cursor: ZipCursor,
+    zip_cursor: ZipCursor<File>,
     /// Scratch buffer for entry display bytes when we need to append a hash suffix.
     entry_display_buf: Vec<u8>,
     /// Scratch buffer for gzip header peeking (bounded).

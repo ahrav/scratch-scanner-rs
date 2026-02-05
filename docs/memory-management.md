@@ -58,6 +58,7 @@ After startup allocation, the scan phase is allocation-free:
 - All per-worker scratch is pre-allocated (ScanScratch, LocalScratch)
 - Buffer pool provides fixed I/O buffers (TsBufferPool)
 - Findings use pre-sized vectors that are reused across chunks
+- Archive scanning reuses `archive::scan::ArchiveScratch` buffers (path builders, tar/zip cursors, gzip header/name buffers) and per-sink scratch for entry scanning
 
 Path storage is also bounded: `FileTable` maintains a fixed-capacity byte arena
 for Unix paths. Archive expansion uses fallible `try_*` insertion APIs plus

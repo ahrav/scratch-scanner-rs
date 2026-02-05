@@ -32,6 +32,10 @@ cargo test --features sim-harness --test simulation scanner_corpus
 # Run bounded random simulations
 cargo test --features sim-harness --test simulation scanner_random
 
+# Run archive corpus and random simulations
+cargo test --features sim-harness --test simulation scanner_archive_corpus
+cargo test --features sim-harness --test simulation scanner_archive_random
+
 # Scale via environment variables
 SIM_SCANNER_SEED_COUNT=100 cargo test --features sim-harness --test simulation scanner_random
 
@@ -60,6 +64,10 @@ Configuration for generating synthetic scanner scenarios.
 | `min_noise_len` | u32 | 8 | Minimum padding bytes between secrets |
 | `max_noise_len` | u32 | 32 | Maximum padding bytes between secrets |
 | `representations` | `Vec<SecretRepr>` | all variants | Allowed secret encodings to choose from |
+| `archive_count` | u32 | 0 | Number of archive files to generate |
+| `archive_entries` | u32 | 2 | Entries per generated archive |
+| `archive_kinds` | `Vec<ArchiveKindSpec>` | tar, tar.gz, zip, gzip | Archive formats to include |
+| `archive` | `ArchiveConfig` | default | Archive config used to compute virtual paths |
 
 **Example:**
 ```rust
@@ -90,6 +98,7 @@ Configuration for a single simulation run.
 | `max_steps` | u64 | auto | Simulation step limit (0 = auto-derived) |
 | `max_transform_depth` | u32 | 3 | Maximum decode nesting depth |
 | `scan_utf16_variants` | bool | true | Enable UTF-16 LE/BE scanning |
+| `archive` | ArchiveConfig | default | Archive scanning configuration (shared with production) |
 | `stability_runs` | u32 | 2 | Runs per scenario with different schedule seeds |
 
 **Example:**
@@ -103,6 +112,7 @@ let run_cfg = RunConfig {
     max_steps: 0,  // auto
     max_transform_depth: 3,
     scan_utf16_variants: true,
+    archive: ArchiveConfig::default(),
     stability_runs: 3,
 };
 ```
@@ -223,10 +233,17 @@ Use small chunks to force many boundary crossings.
 
 ```rust
 let run_cfg = RunConfig {
+    workers: 2,
     chunk_size: 32,
     overlap: 16,
-    workers: 2,
-    ..Default::default()
+    max_in_flight_objects: 8,
+    buffer_pool_cap: 8,
+    max_file_size: u64::MAX,
+    max_steps: 0,
+    max_transform_depth: 3,
+    scan_utf16_variants: true,
+    archive: ArchiveConfig::default(),
+    stability_runs: 1,
 };
 ```
 
@@ -274,8 +291,17 @@ let gen_cfg = ScenarioGenConfig {
     ..Default::default()
 };
 let run_cfg = RunConfig {
+    workers: 2,
+    chunk_size: 64,
+    overlap: 32,
+    max_in_flight_objects: 8,
+    buffer_pool_cap: 8,
+    max_file_size: u64::MAX,
+    max_steps: 0,
+    max_transform_depth: 3,
     scan_utf16_variants: true,
-    ..Default::default()
+    archive: ArchiveConfig::default(),
+    stability_runs: 1,
 };
 ```
 
