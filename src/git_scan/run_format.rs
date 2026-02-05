@@ -44,6 +44,8 @@ pub struct RunHeader {
 
 impl RunHeader {
     /// Creates a new header for the given OID length and record count.
+    ///
+    /// The reader trusts `record_count` to bound iteration.
     pub fn new(oid_len: u8, record_count: u32) -> Result<Self, SpillError> {
         if oid_len != 20 && oid_len != 32 {
             return Err(SpillError::OidLengthMismatch {
@@ -148,6 +150,29 @@ impl RunRecord {
             })
             .then_with(|| self.ctx.ctx_flags.cmp(&other.ctx.ctx_flags))
             .then_with(|| self.ctx.cand_flags.cmp(&other.ctx.cand_flags))
+    }
+
+    /// Creates a reusable scratch record with a preallocated path buffer.
+    ///
+    /// If `oid_len` is invalid, this falls back to a zero SHA-1 OID; callers
+    /// should pass validated lengths from `RunHeader`.
+    pub fn scratch(oid_len: u8, path_capacity: usize) -> Self {
+        let oid = match oid_len {
+            20 => OidBytes::sha1([0u8; 20]),
+            32 => OidBytes::sha256([0u8; 32]),
+            _ => OidBytes::sha1([0u8; 20]),
+        };
+        Self {
+            oid,
+            ctx: RunContext {
+                commit_id: 0,
+                parent_idx: 0,
+                change_kind: ChangeKind::Add,
+                ctx_flags: 0,
+                cand_flags: 0,
+            },
+            path: Vec::with_capacity(path_capacity),
+        }
     }
 }
 

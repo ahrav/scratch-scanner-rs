@@ -23,6 +23,8 @@
 use std::fs;
 use std::fs::File;
 use std::io;
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -411,6 +413,7 @@ impl<'a> PackIo<'a> {
             let file = File::open(path)?;
             // SAFETY: pack files are immutable for the duration of a repo job.
             let mmap = unsafe { Mmap::map(&file)? };
+            advise_sequential(&file, &mmap);
             self.pack_cache[idx] = Some(Arc::new(mmap));
         }
 
@@ -420,6 +423,24 @@ impl<'a> PackIo<'a> {
             .clone())
     }
 }
+
+#[cfg(unix)]
+fn advise_sequential(file: &File, reader: &Mmap) {
+    unsafe {
+        #[cfg(target_os = "linux")]
+        let _ = libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+        #[cfg(not(target_os = "linux"))]
+        let _ = file;
+        let _ = libc::madvise(
+            reader.as_ptr() as *mut libc::c_void,
+            reader.len(),
+            libc::MADV_SEQUENTIAL,
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn advise_sequential(_file: &File, _reader: &Mmap) {}
 
 impl ExternalBaseProvider for PackIo<'_> {
     fn load_base(&mut self, oid: &OidBytes) -> Result<Option<ExternalBase>, PackExecError> {
@@ -431,24 +452,21 @@ impl ExternalBaseProvider for PackIo<'_> {
     }
 }
 
+/// Inflate and apply a delta entry, enforcing decode and output limits.
+///
+/// The delta payload is bounded by `limits.max_delta_bytes`; the final object
+/// is capped at `limits.max_object_bytes`.
 fn apply_delta_entry(
     pack: &PackFile<'_>,
     header: &super::pack_inflate::EntryHeader,
     base_bytes: &[u8],
     limits: &PackDecodeLimits,
 ) -> Result<Vec<u8>, PackIoError> {
-    // Inflate the delta payload with a hard cap, then apply it to the base.
     let mut delta = Vec::with_capacity(limits.max_delta_bytes);
     inflate_entry_payload(pack, header, &mut delta, limits)?;
 
-    let mut out = Vec::with_capacity(header.size as usize);
-    apply_delta(
-        base_bytes,
-        &delta,
-        &mut out,
-        header.size as usize,
-        limits.max_object_bytes,
-    )?;
+    let mut out = Vec::new();
+    apply_delta(base_bytes, &delta, &mut out, limits.max_object_bytes)?;
 
     Ok(out)
 }

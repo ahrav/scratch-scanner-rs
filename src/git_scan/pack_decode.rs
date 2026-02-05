@@ -5,6 +5,9 @@
 //! on its own; callers should use `pack_delta` to apply deltas and enforce
 //! depth limits at a higher level.
 //!
+//! For delta entries, `EntryHeader.size` is the uncompressed delta payload
+//! size; the delta stream itself encodes base and result sizes.
+//!
 //! The helpers here do not verify pack checksums; they operate on already
 //! loaded pack bytes and return precise errors for size and parsing issues.
 
@@ -14,6 +17,10 @@ use super::pack_inflate::{inflate_exact, inflate_limited, EntryHeader, EntryKind
 use super::pack_inflate::{InflateError, PackParseError};
 
 /// Limits for pack object decoding.
+///
+/// `max_delta_bytes` caps the inflated delta stream (not the final object).
+/// Callers typically set it to the same value as `max_object_bytes` to keep
+/// delta buffers bounded.
 #[derive(Clone, Copy, Debug)]
 pub struct PackDecodeLimits {
     /// Maximum header bytes to parse for an entry.
@@ -51,6 +58,8 @@ pub enum PackDecodeError {
     Inflate(InflateError),
     /// Object size exceeds the configured cap.
     ObjectTooLarge { size: u64, max: usize },
+    /// Delta payload size exceeds the configured cap (delta stream size).
+    DeltaTooLarge { size: u64, max: usize },
 }
 
 impl fmt::Display for PackDecodeError {
@@ -60,6 +69,9 @@ impl fmt::Display for PackDecodeError {
             Self::Inflate(err) => write!(f, "{err}"),
             Self::ObjectTooLarge { size, max } => {
                 write!(f, "object size {size} exceeds cap {max}")
+            }
+            Self::DeltaTooLarge { size, max } => {
+                write!(f, "delta payload size {size} exceeds cap {max}")
             }
         }
     }
@@ -91,18 +103,31 @@ impl From<InflateError> for PackDecodeError {
 ///
 /// # Errors
 /// - `PackDecodeError::PackParse` on invalid header data.
-/// - `PackDecodeError::ObjectTooLarge` if the entry size exceeds the limit.
+/// - `PackDecodeError::ObjectTooLarge` if a non-delta entry exceeds the limit.
+/// - `PackDecodeError::DeltaTooLarge` if a delta payload exceeds the limit.
 pub fn entry_header_at(
     pack: &PackFile<'_>,
     offset: u64,
     limits: &PackDecodeLimits,
 ) -> Result<EntryHeader, PackDecodeError> {
     let header = pack.entry_header_at(offset, limits.max_header_bytes)?;
-    if header.size > limits.max_object_bytes as u64 {
-        return Err(PackDecodeError::ObjectTooLarge {
-            size: header.size,
-            max: limits.max_object_bytes,
-        });
+    match header.kind {
+        EntryKind::NonDelta { .. } => {
+            if header.size > limits.max_object_bytes as u64 {
+                return Err(PackDecodeError::ObjectTooLarge {
+                    size: header.size,
+                    max: limits.max_object_bytes,
+                });
+            }
+        }
+        EntryKind::OfsDelta { .. } | EntryKind::RefDelta { .. } => {
+            if header.size > limits.max_delta_bytes as u64 {
+                return Err(PackDecodeError::DeltaTooLarge {
+                    size: header.size,
+                    max: limits.max_delta_bytes,
+                });
+            }
+        }
     }
     Ok(header)
 }

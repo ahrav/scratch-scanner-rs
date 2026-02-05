@@ -168,13 +168,7 @@ fn apply_delta_entry(
     inflate_entry_payload(pack, header, &mut delta, limits)?;
 
     let mut out = Vec::with_capacity(header.size as usize);
-    apply_delta(
-        base_bytes,
-        &delta,
-        &mut out,
-        header.size as usize,
-        limits.max_object_bytes,
-    )?;
+    apply_delta(base_bytes, &delta, &mut out, limits.max_object_bytes)?;
 
     Ok(out)
 }

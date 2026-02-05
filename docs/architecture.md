@@ -30,7 +30,7 @@ is explicit and memory usage stays bounded.
 
 ```
 Root buffer
-  -> Anchor scan (raw + UTF-16 variants, Aho-Corasick)
+  -> Anchor scan (raw + UTF-16 variants, Vectorscan)
   -> Window build and merge/coalesce
   -> Optional two-phase confirm + expand
   -> Regex validation (bytes regex)

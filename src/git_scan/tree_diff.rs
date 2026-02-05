@@ -38,6 +38,14 @@
 //! - No blob reads (OID comparison only)
 //! - Fixed-size stack allocation (bounded depth)
 //! - Stack is reused across diff_trees calls (no per-call allocation)
+//! - Large or spill-backed trees are parsed with a streaming buffer
+//!   to keep the working set bounded
+//!
+//! # Invariants
+//! - `TreeSource` returns raw tree payload bytes (no object header) in
+//!   canonical Git tree order.
+//! - The configured `oid_len` is authoritative; mismatches are errors.
+//! - `reset_stats()` must be called only when the diff stack is empty.
 //!
 //! # Output Ordering
 //! Candidates are emitted in Git tree order for each diff. For merge commits,
@@ -45,36 +53,42 @@
 //! the candidate with which parent diff produced it.
 //!
 //! # Budgeting
-//! The tree-bytes budget is enforced cumulatively via `TreeDiffStats`. Call
-//! `reset_stats()` when starting a new repo job to reset the budget counter.
+//! The tree-bytes budget is enforced on in-flight bytes retained by the
+//! walker. Call `reset_stats()` when starting a new repo job; the in-flight
+//! tracker is reset and the diff stack must be empty.
 
 use std::cmp::Ordering;
 
 use super::errors::TreeDiffError;
 use super::object_id::OidBytes;
-use super::object_store::TreeSource;
-use super::path_policy::classify_path;
+use super::object_store::{TreeBytes, TreeSource};
 use super::tree_candidate::{CandidateSink, ChangeKind};
 use super::tree_diff_limits::TreeDiffLimits;
-use super::tree_entry::{EntryKind, TreeEntry, TreeEntryIter};
+use super::tree_entry::{parse_entry, EntryKind, ParseOutcome, ParsedTreeEntry, TreeEntry};
 use super::tree_order::git_tree_name_cmp;
+use super::tree_stream::{TreeBytesReader, TreeStream};
 
 /// Maximum path length in bytes.
 ///
 /// This matches common filesystem limits (PATH_MAX on Linux/macOS).
 /// Paths exceeding this are rejected to prevent DoS via deeply nested trees.
 const MAX_PATH_LEN: usize = 4096;
+/// Streaming tree entry buffer size (bytes).
+const TREE_STREAM_BUF_BYTES: usize = 16 * 1024;
 
 /// Counters for tree diff operations.
 ///
 /// Statistics are cumulative until `reset_stats()` is called. The
-/// `tree_bytes_loaded` counter is used to enforce the per-job budget.
+/// `tree_bytes_loaded` counter is informational; the in-flight budget
+/// is enforced separately via the walker.
 #[derive(Clone, Debug, Default)]
 pub struct TreeDiffStats {
     /// Number of trees loaded.
     pub trees_loaded: u64,
     /// Total bytes loaded from trees.
     pub tree_bytes_loaded: u64,
+    /// Peak in-flight tree bytes retained by the walker.
+    pub tree_bytes_in_flight_peak: u64,
     /// Number of candidates emitted.
     pub candidates_emitted: u64,
     /// Number of subtrees skipped (same OID).
@@ -85,14 +99,10 @@ pub struct TreeDiffStats {
 
 /// Stack frame for iterative tree diff.
 struct DiffFrame {
-    /// New tree bytes (owned to avoid lifetime issues).
-    new_bytes: Vec<u8>,
-    /// Old tree bytes (owned).
-    old_bytes: Vec<u8>,
-    /// Position in new_bytes.
-    new_pos: usize,
-    /// Position in old_bytes.
-    old_pos: usize,
+    /// Cursor over the new tree.
+    new_cursor: TreeCursor,
+    /// Cursor over the old tree.
+    old_cursor: TreeCursor,
     /// Path prefix length (where to truncate path_buf).
     prefix_len: usize,
 }
@@ -105,43 +115,143 @@ struct DiffFrame {
 enum Action {
     /// Pop the current frame (both trees exhausted).
     Pop,
-    /// Entry only in new tree: advance new_pos and process.
+    /// Entry only in new tree: advance new cursor and process.
     AddedEntry {
-        new_end: usize,
         oid: OidBytes,
-        name_copy: Vec<u8>,
         kind: EntryKind,
         mode: u32,
     },
-    /// Entry only in old tree: advance old_pos (deletion, skip).
-    DeletedEntry { old_end: usize },
+    /// Entry only in old tree (deletion, skip).
+    DeletedEntry,
     /// Entries match (same name+type in ordering), names lexically equal.
     MatchedEntries {
-        new_end: usize,
-        old_end: usize,
         new_oid: OidBytes,
         old_oid: OidBytes,
         new_kind: EntryKind,
         old_kind: EntryKind,
-        name_copy: Vec<u8>,
         new_mode: u32,
     },
     /// new < old in tree ordering: entry added in new tree.
     NewBeforeOld {
-        new_end: usize,
         oid: OidBytes,
-        name_copy: Vec<u8>,
         kind: EntryKind,
         mode: u32,
     },
     /// new > old in tree ordering: entry deleted from old tree.
-    OldBeforeNew { old_end: usize },
+    OldBeforeNew,
+}
+
+/// Buffered tree cursor (slice-backed).
+struct BufferedCursor {
+    bytes: TreeBytes,
+    pos: usize,
+    cached: Option<ParsedTreeEntry>,
+    oid_len: u8,
+}
+
+impl BufferedCursor {
+    fn new(bytes: TreeBytes, oid_len: u8) -> Self {
+        Self {
+            bytes,
+            pos: 0,
+            cached: None,
+            oid_len,
+        }
+    }
+
+    fn peek_entry(&mut self) -> Result<Option<TreeEntry<'_>>, TreeDiffError> {
+        if let Some(parsed) = self.cached {
+            return Ok(Some(
+                parsed.materialize(self.bytes.as_slice(), self.oid_len),
+            ));
+        }
+
+        if self.pos >= self.bytes.len() {
+            return Ok(None);
+        }
+
+        let remaining = &self.bytes.as_slice()[self.pos..];
+        match parse_entry(remaining, self.oid_len)? {
+            ParseOutcome::Complete(mut parsed) => {
+                parsed.offset_by(self.pos);
+                self.cached = Some(parsed);
+                Ok(Some(
+                    parsed.materialize(self.bytes.as_slice(), self.oid_len),
+                ))
+            }
+            ParseOutcome::Incomplete(stage) => Err(TreeDiffError::CorruptTree {
+                detail: stage.error_detail(),
+            }),
+        }
+    }
+
+    fn advance(&mut self) -> Result<(), TreeDiffError> {
+        if self.cached.is_none() {
+            let _ = self.peek_entry()?;
+        }
+        if let Some(parsed) = self.cached.take() {
+            self.pos = self.pos.saturating_add(parsed.entry_len);
+        }
+        Ok(())
+    }
+
+    fn in_flight_len(&self) -> u64 {
+        self.bytes.in_flight_len() as u64
+    }
+}
+
+/// Tree cursor selecting buffered vs streaming parsing.
+enum TreeCursor {
+    Buffered(BufferedCursor),
+    Stream(TreeStream<TreeBytesReader>),
+}
+
+impl TreeCursor {
+    /// Builds a cursor, selecting streaming for large or spill-backed trees.
+    fn new(bytes: TreeBytes, oid_len: u8, stream_threshold: usize) -> Self {
+        let use_stream = bytes.len() >= stream_threshold || matches!(bytes, TreeBytes::Spilled(_));
+        if use_stream {
+            let reader = TreeBytesReader::new(bytes);
+            let stream = TreeStream::new(reader, oid_len, TREE_STREAM_BUF_BYTES);
+            Self::Stream(stream)
+        } else {
+            Self::Buffered(BufferedCursor::new(bytes, oid_len))
+        }
+    }
+
+    /// Returns an empty cursor with the configured OID length.
+    fn empty(oid_len: u8) -> Self {
+        Self::Buffered(BufferedCursor::new(TreeBytes::empty(), oid_len))
+    }
+
+    fn peek_entry(&mut self) -> Result<Option<TreeEntry<'_>>, TreeDiffError> {
+        match self {
+            Self::Buffered(cursor) => cursor.peek_entry(),
+            Self::Stream(stream) => stream.peek_entry(),
+        }
+    }
+
+    fn advance(&mut self) -> Result<(), TreeDiffError> {
+        match self {
+            Self::Buffered(cursor) => cursor.advance(),
+            Self::Stream(stream) => stream.advance(),
+        }
+    }
+
+    fn in_flight_len(&self) -> u64 {
+        match self {
+            Self::Buffered(cursor) => cursor.in_flight_len(),
+            Self::Stream(stream) => stream.in_flight_len() as u64,
+        }
+    }
 }
 
 /// Tree diff walker configuration and state.
 ///
-/// The walker maintains internal state (stack, path buffer) that is reused
-/// across multiple `diff_trees` calls for efficiency.
+/// The walker maintains internal state (stack, path buffer, name scratch)
+/// that is reused across multiple `diff_trees` calls for efficiency.
+/// Candidate paths are assembled in a reusable buffer; sinks must copy
+/// the provided path if they need to retain it.
 ///
 /// # Invariants
 /// - `stack.len() <= max_depth`
@@ -153,12 +263,18 @@ pub struct TreeDiffWalker {
     oid_len: u8,
     /// Path buffer (reused across entries).
     path_buf: Vec<u8>,
+    /// Reused entry-name scratch to avoid per-diff allocations.
+    name_scratch: Vec<u8>,
     /// Diff stack (reused across calls).
     stack: Vec<DiffFrame>,
     /// Statistics.
     stats: TreeDiffStats,
-    /// Total tree bytes budget.
-    tree_bytes_budget: u64,
+    /// In-flight tree bytes budget.
+    tree_bytes_in_flight_limit: u64,
+    /// Current in-flight tree bytes retained by stack frames.
+    tree_bytes_in_flight: u64,
+    /// Threshold for switching to streaming parsing.
+    stream_threshold: usize,
 }
 
 impl TreeDiffWalker {
@@ -174,9 +290,12 @@ impl TreeDiffWalker {
             max_depth: limits.max_tree_depth,
             oid_len,
             path_buf: Vec::with_capacity(4096),
+            name_scratch: Vec::with_capacity(256),
             stack: Vec::with_capacity(limits.max_tree_depth as usize),
             stats: TreeDiffStats::default(),
-            tree_bytes_budget: limits.max_tree_bytes_per_job,
+            tree_bytes_in_flight_limit: limits.max_tree_bytes_in_flight,
+            tree_bytes_in_flight: 0,
+            stream_threshold: limits.max_tree_cache_bytes.max(1) as usize,
         }
     }
 
@@ -190,8 +309,14 @@ impl TreeDiffWalker {
     ///
     /// Call this when starting a new repository scan to get fresh stats.
     /// The internal buffers (stack, path_buf) are retained for reuse.
+    /// The tree-bytes budget is enforced on in-flight bytes across calls.
     pub fn reset_stats(&mut self) {
+        debug_assert!(
+            self.stack.is_empty(),
+            "reset_stats must be called with an empty diff stack"
+        );
         self.stats = TreeDiffStats::default();
+        self.tree_bytes_in_flight = 0;
     }
 
     /// Diffs two trees, emitting candidates for changed blobs.
@@ -218,8 +343,10 @@ impl TreeDiffWalker {
     /// - If `new_tree == old_tree`, this is a no-op.
     /// - `parent_idx` is preserved in candidate context for later merge/dedupe.
     /// - The candidate sink is appended to; it is not cleared by this call.
+    /// - Candidate paths are borrowed from an internal buffer and are only
+    ///   valid until the next emission.
     /// - Stats are cumulative across calls; `reset_stats()` clears counters.
-    /// - The tree-bytes budget is enforced across calls until reset.
+    /// - The tree-bytes budget is enforced on in-flight bytes across calls until reset.
     pub fn diff_trees<S: TreeSource, C: CandidateSink>(
         &mut self,
         source: &mut S,
@@ -235,112 +362,163 @@ impl TreeDiffWalker {
 
         self.path_buf.clear();
         self.stack.clear();
+        let mut name_scratch = std::mem::take(&mut self.name_scratch);
+        name_scratch.clear();
+        debug_assert!(
+            name_scratch.is_empty(),
+            "name_scratch must be cleared before diff_trees"
+        );
 
-        let new_bytes = self.load_tree_bytes(source, new_tree)?;
-        let old_bytes = self.load_tree_bytes(source, old_tree)?;
+        let result = (|| {
+            let new_cursor = self.load_tree_cursor(source, new_tree)?;
+            let old_cursor = self.load_tree_cursor(source, old_tree)?;
 
-        self.stack.push(DiffFrame {
-            new_bytes,
-            old_bytes,
-            new_pos: 0,
-            old_pos: 0,
-            prefix_len: 0,
-        });
+            self.stack.push(DiffFrame {
+                new_cursor,
+                old_cursor,
+                prefix_len: 0,
+            });
 
-        while !self.stack.is_empty() {
-            let depth = self.stack.len() as u16;
-            self.stats.max_depth_reached = self.stats.max_depth_reached.max(depth);
+            while !self.stack.is_empty() {
+                let depth = self.stack.len() as u16;
+                self.stats.max_depth_reached = self.stats.max_depth_reached.max(depth);
 
-            let frame = self.stack.last_mut().expect("frame exists");
+                let action = {
+                    let frame = self.stack.last_mut().expect("frame exists");
+                    let new_entry = frame.new_cursor.peek_entry()?;
+                    let old_entry = frame.old_cursor.peek_entry()?;
 
-            let new_entry = next_entry(&frame.new_bytes, frame.new_pos, self.oid_len)?;
-            let old_entry = next_entry(&frame.old_bytes, frame.old_pos, self.oid_len)?;
+                    let action = compute_action(new_entry, old_entry, self.oid_len)?;
+                    if matches!(
+                        action,
+                        Action::AddedEntry { .. }
+                            | Action::MatchedEntries { .. }
+                            | Action::NewBeforeOld { .. }
+                    ) {
+                        let entry = new_entry.expect("name requires new entry");
+                        name_scratch.clear();
+                        name_scratch.extend_from_slice(entry.name);
+                    }
+                    action
+                };
 
-            let action = compute_action(new_entry, old_entry, self.oid_len)?;
-
-            match action {
-                Action::Pop => {
-                    let frame = self.stack.pop().expect("frame exists");
-                    self.path_buf.truncate(frame.prefix_len);
-                }
-                Action::AddedEntry {
-                    new_end,
-                    oid,
-                    name_copy,
-                    kind,
-                    mode,
-                } => {
-                    frame.new_pos = new_end;
-                    self.handle_new_entry(
-                        source, candidates, &oid, &name_copy, kind, mode, commit_id, parent_idx,
-                    )?;
-                }
-                Action::DeletedEntry { old_end } => {
-                    frame.old_pos = old_end;
-                }
-                Action::MatchedEntries {
-                    new_end,
-                    old_end,
-                    new_oid,
-                    old_oid,
-                    new_kind,
-                    old_kind,
-                    name_copy,
-                    new_mode,
-                } => {
-                    frame.new_pos = new_end;
-                    frame.old_pos = old_end;
-                    self.handle_matched_entries(
-                        source, candidates, &new_oid, &old_oid, &name_copy, new_kind, old_kind,
-                        new_mode, commit_id, parent_idx,
-                    )?;
-                }
-                Action::NewBeforeOld {
-                    new_end,
-                    oid,
-                    name_copy,
-                    kind,
-                    mode,
-                } => {
-                    frame.new_pos = new_end;
-                    self.handle_new_entry(
-                        source, candidates, &oid, &name_copy, kind, mode, commit_id, parent_idx,
-                    )?;
-                }
-                Action::OldBeforeNew { old_end } => {
-                    frame.old_pos = old_end;
+                match action {
+                    Action::Pop => {
+                        let frame = self.stack.pop().expect("frame exists");
+                        self.release_tree_bytes(frame.new_cursor.in_flight_len());
+                        self.release_tree_bytes(frame.old_cursor.in_flight_len());
+                        self.path_buf.truncate(frame.prefix_len);
+                    }
+                    Action::AddedEntry { oid, kind, mode } => {
+                        debug_assert!(!name_scratch.is_empty());
+                        let frame = self.stack.last_mut().expect("frame exists");
+                        frame.new_cursor.advance()?;
+                        self.handle_new_entry(
+                            source,
+                            candidates,
+                            &oid,
+                            &name_scratch,
+                            kind,
+                            mode,
+                            commit_id,
+                            parent_idx,
+                        )?;
+                    }
+                    Action::DeletedEntry => {
+                        let frame = self.stack.last_mut().expect("frame exists");
+                        frame.old_cursor.advance()?;
+                    }
+                    Action::MatchedEntries {
+                        new_oid,
+                        old_oid,
+                        new_kind,
+                        old_kind,
+                        new_mode,
+                    } => {
+                        debug_assert!(!name_scratch.is_empty());
+                        let frame = self.stack.last_mut().expect("frame exists");
+                        frame.new_cursor.advance()?;
+                        frame.old_cursor.advance()?;
+                        self.handle_matched_entries(
+                            source,
+                            candidates,
+                            &new_oid,
+                            &old_oid,
+                            &name_scratch,
+                            new_kind,
+                            old_kind,
+                            new_mode,
+                            commit_id,
+                            parent_idx,
+                        )?;
+                    }
+                    Action::NewBeforeOld { oid, kind, mode } => {
+                        debug_assert!(!name_scratch.is_empty());
+                        let frame = self.stack.last_mut().expect("frame exists");
+                        frame.new_cursor.advance()?;
+                        self.handle_new_entry(
+                            source,
+                            candidates,
+                            &oid,
+                            &name_scratch,
+                            kind,
+                            mode,
+                            commit_id,
+                            parent_idx,
+                        )?;
+                    }
+                    Action::OldBeforeNew => {
+                        let frame = self.stack.last_mut().expect("frame exists");
+                        frame.old_cursor.advance()?;
+                    }
                 }
             }
-        }
 
-        Ok(())
+            Ok(())
+        })();
+
+        self.name_scratch = name_scratch;
+
+        result
     }
 
-    /// Loads tree bytes and updates cumulative stats and budget.
+    /// Loads tree data and updates cumulative stats and in-flight budget.
     ///
     /// `None` yields an empty tree without incrementing counters.
-    fn load_tree_bytes<S: TreeSource>(
+    fn load_tree_cursor<S: TreeSource>(
         &mut self,
         source: &mut S,
         oid: Option<&OidBytes>,
-    ) -> Result<Vec<u8>, TreeDiffError> {
-        // Loading a tree increments stats and enforces the cumulative budget.
+    ) -> Result<TreeCursor, TreeDiffError> {
+        // Loading a tree increments stats and enforces the in-flight budget.
         if let Some(oid) = oid {
             let bytes = source.load_tree(oid)?;
+            let bytes_len = bytes.len() as u64;
+            let in_flight_len = bytes.in_flight_len() as u64;
+            let new_in_flight = self.tree_bytes_in_flight.saturating_add(in_flight_len);
             self.stats.trees_loaded += 1;
-            self.stats.tree_bytes_loaded += bytes.len() as u64;
+            self.stats.tree_bytes_loaded = self.stats.tree_bytes_loaded.saturating_add(bytes_len);
 
-            if self.stats.tree_bytes_loaded > self.tree_bytes_budget {
+            if new_in_flight > self.tree_bytes_in_flight_limit {
                 return Err(TreeDiffError::TreeBytesBudgetExceeded {
-                    loaded: self.stats.tree_bytes_loaded,
-                    budget: self.tree_bytes_budget,
+                    loaded: new_in_flight,
+                    budget: self.tree_bytes_in_flight_limit,
                 });
             }
+            self.tree_bytes_in_flight = new_in_flight;
+            self.stats.tree_bytes_in_flight_peak = self
+                .stats
+                .tree_bytes_in_flight_peak
+                .max(self.tree_bytes_in_flight);
 
-            Ok(bytes)
+            Ok(TreeCursor::new(bytes, self.oid_len, self.stream_threshold))
         } else {
-            Ok(Vec::new())
+            Ok(TreeCursor::empty(self.oid_len))
         }
+    }
+
+    fn release_tree_bytes(&mut self, len: u64) {
+        self.tree_bytes_in_flight = self.tree_bytes_in_flight.saturating_sub(len);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -471,14 +649,12 @@ impl TreeDiffWalker {
         self.path_buf.extend_from_slice(name);
         self.path_buf.push(b'/');
 
-        let new_bytes = self.load_tree_bytes(source, Some(new_oid))?;
-        let old_bytes = self.load_tree_bytes(source, old_oid)?;
+        let new_cursor = self.load_tree_cursor(source, Some(new_oid))?;
+        let old_cursor = self.load_tree_cursor(source, old_oid)?;
 
         self.stack.push(DiffFrame {
-            new_bytes,
-            old_bytes,
-            new_pos: 0,
-            old_pos: 0,
+            new_cursor,
+            old_cursor,
             prefix_len,
         });
 
@@ -513,7 +689,8 @@ impl TreeDiffWalker {
         self.path_buf.extend_from_slice(name);
 
         let mode_u16 = mode as u16;
-        let cand_flags = classify_path(&self.path_buf).bits();
+        // Path classification is deferred until post-dedupe to avoid per-candidate work.
+        let cand_flags = 0;
 
         candidates.emit(
             *oid,
@@ -535,27 +712,25 @@ impl TreeDiffWalker {
 
 /// Computes the next action by comparing tree entries in Git tree order.
 fn compute_action(
-    new_entry: Option<(TreeEntry<'_>, usize)>,
-    old_entry: Option<(TreeEntry<'_>, usize)>,
+    new_entry: Option<TreeEntry<'_>>,
+    old_entry: Option<TreeEntry<'_>>,
     oid_len: u8,
 ) -> Result<Action, TreeDiffError> {
     match (new_entry, old_entry) {
         (None, None) => Ok(Action::Pop),
 
-        (Some((new_ent, new_end)), None) => {
+        (Some(new_ent), None) => {
             let oid = convert_oid(new_ent.oid_bytes, oid_len)?;
             Ok(Action::AddedEntry {
-                new_end,
                 oid,
-                name_copy: new_ent.name.to_vec(),
                 kind: new_ent.kind,
                 mode: new_ent.mode,
             })
         }
 
-        (None, Some((_, old_end))) => Ok(Action::DeletedEntry { old_end }),
+        (None, Some(_)) => Ok(Action::DeletedEntry),
 
-        (Some((new_ent, new_end)), Some((old_ent, old_end))) => {
+        (Some(new_ent), Some(old_ent)) => {
             let cmp = git_tree_name_cmp(
                 new_ent.name,
                 new_ent.kind.is_tree(),
@@ -567,50 +742,25 @@ fn compute_action(
                 Ordering::Less => {
                     let oid = convert_oid(new_ent.oid_bytes, oid_len)?;
                     Ok(Action::NewBeforeOld {
-                        new_end,
                         oid,
-                        name_copy: new_ent.name.to_vec(),
                         kind: new_ent.kind,
                         mode: new_ent.mode,
                     })
                 }
-                Ordering::Greater => Ok(Action::OldBeforeNew { old_end }),
+                Ordering::Greater => Ok(Action::OldBeforeNew),
                 Ordering::Equal => {
                     let new_oid = convert_oid(new_ent.oid_bytes, oid_len)?;
                     let old_oid = convert_oid(old_ent.oid_bytes, oid_len)?;
                     Ok(Action::MatchedEntries {
-                        new_end,
-                        old_end,
                         new_oid,
                         old_oid,
                         new_kind: new_ent.kind,
                         old_kind: old_ent.kind,
-                        name_copy: new_ent.name.to_vec(),
                         new_mode: new_ent.mode,
                     })
                 }
             }
         }
-    }
-}
-
-/// Parses the next tree entry at `pos`, returning it and the next position.
-fn next_entry(
-    bytes: &[u8],
-    pos: usize,
-    oid_len: u8,
-) -> Result<Option<(TreeEntry<'_>, usize)>, TreeDiffError> {
-    if pos >= bytes.len() {
-        return Ok(None);
-    }
-
-    let mut iter = TreeEntryIter::new(&bytes[pos..], oid_len as usize);
-    let entry = iter.next_entry()?;
-    if let Some(entry) = entry {
-        let end = pos + iter.position();
-        Ok(Some((entry, end)))
-    } else {
-        Ok(None)
     }
 }
 
@@ -646,10 +796,11 @@ mod tests {
     }
 
     impl TreeSource for MockTreeSource {
-        fn load_tree(&mut self, oid: &OidBytes) -> Result<Vec<u8>, TreeDiffError> {
+        fn load_tree(&mut self, oid: &OidBytes) -> Result<TreeBytes, TreeDiffError> {
             self.trees
                 .get(oid)
                 .cloned()
+                .map(TreeBytes::Owned)
                 .ok_or(TreeDiffError::TreeNotFound)
         }
     }
@@ -672,7 +823,7 @@ mod tests {
         TreeDiffLimits {
             max_candidates: 1000,
             max_tree_depth: 64,
-            max_tree_bytes_per_job: 1024 * 1024,
+            max_tree_bytes_in_flight: 1024 * 1024,
             ..TreeDiffLimits::RESTRICTIVE
         }
     }

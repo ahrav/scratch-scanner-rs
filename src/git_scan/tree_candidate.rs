@@ -24,6 +24,7 @@ pub enum ChangeKind {
 }
 
 impl ChangeKind {
+    /// Returns the stable numeric encoding used in run records and spill files.
     #[inline]
     #[must_use]
     pub const fn as_u8(self) -> u8 {
@@ -66,7 +67,7 @@ pub struct TreeCandidate {
 pub struct ResolvedCandidate<'a> {
     /// Blob object ID.
     pub oid: OidBytes,
-    /// Full path bytes.
+    /// Full path bytes (borrowed from the candidate buffer).
     pub path: &'a [u8],
     /// Commit-graph position identifying the introducing commit.
     pub commit_id: u32,
@@ -81,6 +82,9 @@ pub struct ResolvedCandidate<'a> {
 }
 
 /// Sink for tree diff candidates.
+///
+/// Implementations should treat `path` as ephemeral input and copy/intern it
+/// if it needs to persist beyond the call.
 pub trait CandidateSink {
     /// Receives a candidate blob.
     #[allow(clippy::too_many_arguments)]
@@ -149,7 +153,7 @@ impl CandidateBuffer {
     /// `ByteRef` values and resolved path slices.
     pub fn clear(&mut self) {
         self.candidates.clear();
-        self.path_arena = ByteArena::with_capacity(self.path_arena.capacity());
+        self.path_arena.clear_keep_capacity();
     }
 
     /// Pushes a new candidate.

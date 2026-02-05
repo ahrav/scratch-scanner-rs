@@ -37,8 +37,11 @@
 //! - Outputs are deterministic for identical repo state and configuration.
 
 pub mod alloc_guard;
+pub mod blob_introducer;
+pub mod blob_spill;
 pub mod byte_arena;
 pub mod bytes;
+pub mod commit_graph;
 pub mod commit_walk;
 pub mod commit_walk_limits;
 pub mod engine_adapter;
@@ -50,6 +53,7 @@ pub mod midx;
 pub mod midx_error;
 pub mod object_id;
 pub mod object_store;
+pub mod oid_index;
 pub mod pack_cache;
 pub mod pack_candidates;
 pub mod pack_decode;
@@ -76,6 +80,7 @@ pub mod run_writer;
 pub mod runner;
 pub mod seen_store;
 pub mod snapshot_plan;
+pub mod spill_arena;
 pub mod spill_chunk;
 pub mod spill_limits;
 pub mod spill_merge;
@@ -83,17 +88,21 @@ pub mod spiller;
 pub mod start_set;
 pub mod tree_cache;
 pub mod tree_candidate;
+pub mod tree_delta_cache;
 pub mod tree_diff;
 pub mod tree_diff_limits;
 pub mod tree_entry;
 pub mod tree_order;
+pub mod tree_stream;
 pub mod unique_blob;
 pub mod watermark_keys;
 pub mod work_items;
 
 pub use alloc_guard::{enabled as alloc_guard_enabled, set_enabled as set_alloc_guard_enabled};
+pub use blob_introducer::{BlobIntroStats, BlobIntroducer, SeenSets};
 pub use byte_arena::{ByteArena, ByteRef};
 pub use bytes::BytesView;
+pub use commit_graph::CommitGraphIndex;
 pub use commit_walk::{
     introduced_by_plan, topo_order_positions, CommitGraph, CommitGraphView, CommitPlanIter,
     ParentScratch, PlannedCommit,
@@ -101,7 +110,7 @@ pub use commit_walk::{
 pub use commit_walk_limits::CommitWalkLimits;
 pub use engine_adapter::{
     scan_blob_chunked, EngineAdapter, EngineAdapterConfig, EngineAdapterError, FindingKey,
-    FindingSpan, ScannedBlob, ScannedBlobs, DEFAULT_CHUNK_BYTES, DEFAULT_PATH_ARENA_BYTES,
+    FindingSpan, ScannedBlob, ScannedBlobs, DEFAULT_CHUNK_BYTES,
 };
 pub use errors::PersistError;
 pub use errors::{CommitPlanError, MappingCandidateKind, RepoOpenError, SpillError, TreeDiffError};
@@ -113,7 +122,8 @@ pub use limits::RepoOpenLimits;
 pub use mapping_bridge::{MappingBridge, MappingBridgeConfig, MappingStats};
 pub use midx::MidxView;
 pub use object_id::{ObjectFormat, OidBytes};
-pub use object_store::{ObjectStore, TreeSource};
+pub use object_store::{ObjectStore, TreeBytes, TreeSource};
+pub use oid_index::OidIndex;
 pub use pack_cache::{CachedObject, PackCache};
 pub use pack_candidates::{
     CappedPackCandidateSink, CollectingPackCandidateSink, LooseCandidate, PackCandidate,
@@ -122,8 +132,10 @@ pub use pack_candidates::{
 pub use pack_decode::{entry_header_at, inflate_entry_payload, PackDecodeError, PackDecodeLimits};
 pub use pack_delta::{apply_delta, DeltaError};
 pub use pack_exec::{
-    execute_pack_plan, execute_pack_plan_with_reader, ExternalBase, ExternalBaseProvider,
-    PackExecError, PackExecReport, PackExecStats, PackObjectSink, SkipReason, SkipRecord,
+    aggregate_cache_reject_histogram, build_candidate_ranges, execute_pack_plan,
+    execute_pack_plan_with_reader, execute_pack_plan_with_scratch_indices, merge_pack_exec_reports,
+    CacheRejectHistogram, ExternalBase, ExternalBaseProvider, PackExecError, PackExecReport,
+    PackExecStats, PackObjectSink, SkipReason, SkipRecord, CACHE_REJECT_BUCKETS,
 };
 pub use pack_io::{PackIo, PackIoError, PackIoLimits};
 pub use pack_plan::{build_pack_plans, OidResolver, PackPlanConfig, PackPlanError, PackView};
@@ -150,7 +162,8 @@ pub use run_format::{RunContext, RunHeader, RunRecord};
 pub use run_reader::RunReader;
 pub use run_writer::RunWriter;
 pub use runner::{
-    run_git_scan, CandidateSkipReason, GitScanConfig, GitScanError, GitScanReport, GitScanResult,
+    run_git_scan, CandidateSkipReason, GitScanAllocStats, GitScanConfig, GitScanError,
+    GitScanMetricsSnapshot, GitScanMode, GitScanReport, GitScanResult, GitScanStageNanos,
     PackMmapLimits, SkippedCandidate,
 };
 pub use seen_store::{AlwaysSeenStore, InMemorySeenStore, NeverSeenStore, SeenBlobStore};

@@ -11,6 +11,8 @@
 //!
 //! # Complexity
 //! - `find_oid` is `O(log N)` via fanout-bucketed binary search.
+//! - `find_oid_sorted` is `O(k)` over the traversed fanout bucket with
+//!   galloping search, reusing a cursor for sorted input.
 //! - `offset_at` is `O(1)` and may follow a LOFF indirection.
 
 use std::collections::HashSet;
@@ -51,7 +53,8 @@ const MAX_MIDX_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 /// - All chunk slices are validated to lie within the MIDX buffer.
 /// - `object_count` equals the last value in the fanout table.
 /// - `oid_len` matches the repository object format.
-#[derive(Debug)]
+/// - Base MIDX layers are not supported; only the top-level index is parsed.
+#[derive(Debug, Clone, Copy)]
 pub struct MidxView<'a> {
     format: ObjectFormat,
     pack_count: u32,
@@ -63,6 +66,16 @@ pub struct MidxView<'a> {
     loff: Option<&'a [u8]>,
 }
 
+/// Cursor state for streaming sorted OID lookups.
+///
+/// `next_idx` advances monotonically within the current fanout bucket.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MidxCursor {
+    next_idx: u32,
+    bucket_end: u32,
+    bucket_first: Option<u8>,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ChunkLoc {
     id: [u8; 4],
@@ -72,6 +85,9 @@ struct ChunkLoc {
 
 impl<'a> MidxView<'a> {
     /// Parses a MIDX from raw bytes.
+    ///
+    /// This parser is zero-copy: all returned slices borrow from `data`.
+    /// The trailing MIDX checksum is not validated.
     ///
     /// # Errors
     /// Returns `MidxError` if the file is malformed, has unsupported version,
@@ -237,6 +253,9 @@ impl<'a> MidxView<'a> {
     /// `pack_id` is a u16 pack position in PNAM order. `offset` is a byte
     /// offset within the pack file. For large offsets, an LOFF indirection
     /// is resolved.
+    ///
+    /// # Errors
+    /// Returns `LoffIndexOutOfBounds` if the LOFF indirection is invalid.
     pub fn offset_at(&self, idx: u32) -> Result<(u16, u64), MidxError> {
         debug_assert!(idx < self.object_count, "offset index out of bounds");
 
@@ -338,6 +357,116 @@ impl<'a> MidxView<'a> {
         }
 
         Ok(None)
+    }
+
+    /// Finds a sorted OID using a streaming cursor.
+    ///
+    /// The cursor is advanced monotonically and assumes inputs are strictly
+    /// increasing. This enables a merge-join style mapping that avoids a
+    /// full binary search per OID.
+    ///
+    /// If the input OID moves to a new fanout bucket, the cursor is clamped
+    /// to that bucket's range.
+    pub fn find_oid_sorted(
+        &self,
+        cursor: &mut MidxCursor,
+        oid: &OidBytes,
+    ) -> Result<Option<u32>, MidxError> {
+        if oid.len() != self.oid_len() {
+            return Err(MidxError::InputOidLengthMismatch {
+                got: oid.len(),
+                expected: self.oid_len(),
+            });
+        }
+
+        let bytes = oid.as_slice();
+        let first = bytes[0];
+        if cursor.bucket_first != Some(first) {
+            let (start, end) = self.bucket_range(first);
+            cursor.bucket_first = Some(first);
+            cursor.bucket_end = end;
+            if cursor.next_idx < start {
+                cursor.next_idx = start;
+            } else if cursor.next_idx > end {
+                cursor.next_idx = end;
+            }
+        }
+
+        Ok(self.seek_oid_from(bytes, &mut cursor.next_idx, cursor.bucket_end))
+    }
+
+    #[inline]
+    fn bucket_range(&self, first_byte: u8) -> (u32, u32) {
+        let end = self.fanout(first_byte);
+        let start = if first_byte == 0 {
+            0
+        } else {
+            self.fanout(first_byte - 1)
+        };
+        (start, end)
+    }
+
+    fn seek_oid_from(&self, target: &[u8], cursor: &mut u32, bucket_end: u32) -> Option<u32> {
+        // Galloping search from the cursor, then binary search within range.
+        if *cursor >= bucket_end {
+            return None;
+        }
+
+        let idx = *cursor;
+        match target.cmp(self.oid_at(idx)) {
+            std::cmp::Ordering::Equal => {
+                *cursor = idx.saturating_add(1);
+                return Some(idx);
+            }
+            std::cmp::Ordering::Greater => {}
+            std::cmp::Ordering::Less => {
+                return None;
+            }
+        }
+
+        let mut lo = idx.saturating_add(1);
+        let mut hi = lo;
+        let mut step = 1_u32;
+
+        while hi < bucket_end {
+            match target.cmp(self.oid_at(hi)) {
+                std::cmp::Ordering::Equal => {
+                    *cursor = hi.saturating_add(1);
+                    return Some(hi);
+                }
+                std::cmp::Ordering::Greater => {
+                    lo = hi.saturating_add(1);
+                    step = step.saturating_mul(2);
+                    hi = hi.saturating_add(step);
+                }
+                std::cmp::Ordering::Less => break,
+            }
+        }
+
+        if hi > bucket_end {
+            hi = bucket_end;
+        }
+        if lo >= hi {
+            *cursor = lo.min(bucket_end);
+            return None;
+        }
+
+        let mut left = lo;
+        let mut right = hi;
+        while left < right {
+            let mid = left + ((right - left) / 2);
+            match target.cmp(self.oid_at(mid)) {
+                std::cmp::Ordering::Less => right = mid,
+                std::cmp::Ordering::Greater => left = mid + 1,
+                std::cmp::Ordering::Equal => {
+                    *cursor = mid.saturating_add(1);
+                    return Some(mid);
+                }
+            }
+        }
+
+        *cursor = left.min(bucket_end);
+        None
     }
 
     /// Resolves a LOFF (large offset) indirection to a 64-bit pack offset.
@@ -638,6 +767,36 @@ mod tests {
         let (pack_id, offset) = midx.offset_at(idx).unwrap();
         assert_eq!(pack_id, 0);
         assert_eq!(offset, 200);
+    }
+
+    #[test]
+    fn find_oid_sorted_matches_find_oid() {
+        let mut builder = MidxBuilder::new();
+        builder.add_pack(b"pack-abc123");
+        builder.add_object([0x01; 20], 0, 100);
+        builder.add_object([0x10; 20], 0, 200);
+        builder.add_object([0x80; 20], 0, 300);
+        let data = builder.build();
+
+        let midx = MidxView::parse(&data, ObjectFormat::Sha1).unwrap();
+
+        let mut inputs = vec![
+            OidBytes::sha1([0x00; 20]),
+            OidBytes::sha1([0x01; 20]),
+            OidBytes::sha1([0x05; 20]),
+            OidBytes::sha1([0x10; 20]),
+            OidBytes::sha1([0x20; 20]),
+            OidBytes::sha1([0x80; 20]),
+            OidBytes::sha1([0xff; 20]),
+        ];
+        inputs.sort();
+
+        let mut cursor = MidxCursor::default();
+        for oid in inputs {
+            let streamed = midx.find_oid_sorted(&mut cursor, &oid).unwrap();
+            let binary = midx.find_oid(&oid).unwrap();
+            assert_eq!(streamed, binary, "oid {}", oid);
+        }
     }
 
     #[test]

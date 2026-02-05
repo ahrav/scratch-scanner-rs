@@ -1,5 +1,16 @@
 #![no_main]
 
+//! Fuzz target for pack header parsing and delta application.
+//!
+//! Exercises:
+//! - pack header parsing at random offsets,
+//! - bounded inflation of arbitrary payloads, and
+//! - delta application with length-checked inputs.
+//!
+//! The harness is intentionally permissive: it ignores decode errors and only
+//! enforces conservative size caps so the fuzzer can explore edge cases without
+//! allocating unbounded memory.
+
 use libfuzzer_sys::fuzz_target;
 use scanner_rs::git_scan::pack_inflate::{apply_delta, inflate_limited, PackFile};
 
@@ -8,6 +19,9 @@ const MAX_OUT: usize = 64 * 1024;
 const MAX_BASE: usize = 32 * 1024;
 const MAX_HEADER_BYTES: usize = 64;
 
+/// Read a bounded LEB128-style varint from `data`.
+///
+/// Returns `None` if the encoding is truncated or exceeds 64 bits.
 fn read_varint(data: &[u8], pos: &mut usize) -> Option<u64> {
     let mut shift: u32 = 0;
     let mut value: u64 = 0;
@@ -34,6 +48,7 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
 
+    // Fuzz pack header parsing and entry header decoding.
     let oid_len = if (data[0] & 1) == 0 { 20 } else { 32 };
     if let Ok(pack) = PackFile::parse(data, oid_len) {
         let len = data.len();
@@ -45,9 +60,11 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 
+    // Fuzz generic inflate with a fixed output cap.
     let mut inflate_out = Vec::with_capacity(256);
     let _ = inflate_limited(data, &mut inflate_out, MAX_OUT);
 
+    // Fuzz delta apply with independent base/delta slices and size guards.
     let split = (data[1] as usize) % (data.len() - 1) + 1;
     let (base, delta) = data.split_at(split);
     let mut pos = 0usize;

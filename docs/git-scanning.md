@@ -55,17 +55,26 @@ flowchart LR
 
 ## Concurrency and Backpressure
 
-Git scanning executes **single-threaded** today. There are no in-flight queues
-between stages; instead, each stage enforces explicit bounds:
+Stages before pack execution (preflight, repo open, commit walk, tree diff,
+spill/dedupe, mapping) run **single-threaded**. Pack planning and pack
+execution introduce parallelism:
+
+- **Pack planning** runs on a dedicated thread (`std::thread::scope`) that
+  streams `PackPlan` values through a bounded `sync_channel(1)` while the
+  main thread consumes and executes plans.
+- **Pack execution** shards each plan's candidate indices across
+  `pack_exec_workers` threads (default 24) using `shard_ranges()`. Each
+  worker owns its own `PackCache` and `EngineAdapter`; results are merged in
+  shard order to preserve deterministic output.
+
+There are no in-flight queues between the serial stages; instead, each stage
+enforces explicit bounds:
 
 - Spill/dedupe caps (`SpillLimits`) limit candidate count and spill bytes.
 - Mapping caps (`MappingBridgeConfig`) bound packed/loose candidate buffers.
 - Pack planning limits (`PackPlanConfig`) bound delta expansion worklists.
 - Pack execution limits (`PackMmapLimits`, `PackDecodeLimits`) bound mmaps and
   inflate sizes.
-
-These limits provide deterministic backpressure and serve as the queue/budget
-boundaries for any future parallelization.
 
 ## Persistence Contract
 
@@ -99,5 +108,4 @@ artifacts to `tests/failures/` for triage and minimization.
 
 - `docs/architecture-overview.md`
 - `docs/detection-engine.md`
-- `docs/git-scan-pack-exec-merge-fast-path.md`
 - `docs/git_simulation_harness_guide.md`

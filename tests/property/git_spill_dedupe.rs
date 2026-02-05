@@ -288,7 +288,7 @@ proptest! {
         let mut merger = RunMerger::new(readers).unwrap();
         let mut actual = Vec::new();
         while let Some(record) = merger.next_unique().unwrap() {
-            actual.push(record);
+            actual.push(record.clone());
         }
 
         prop_assert_eq!(actual, expected);

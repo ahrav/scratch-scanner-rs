@@ -192,6 +192,7 @@ mod tests {
         let plan = PackPlan {
             pack_id: 0,
             oid_len: 20,
+            max_delta_depth: 0,
             candidates: vec![PackCandidate {
                 oid: crate::git_scan::OidBytes::sha1([0x11; 20]),
                 ctx: CandidateContext {
@@ -211,6 +212,7 @@ mod tests {
             }],
             need_offsets: vec![offsets[0]],
             delta_deps: Vec::new(),
+            delta_dep_index: Vec::new(),
             exec_order: None,
             clusters: Vec::new(),
             stats: PackPlanStats {

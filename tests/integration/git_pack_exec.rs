@@ -196,8 +196,8 @@ fn pack_exec_matches_git_cat_file() {
 
     let resolver = Resolver { map: resolver_map };
     let plans = build_pack_plans(
-        &candidates,
-        &[pack_view],
+        candidates,
+        &[Some(pack_view)],
         &resolver,
         &PackPlanConfig::default(),
     )
@@ -209,6 +209,7 @@ fn pack_exec_matches_git_cat_file() {
     let mut cache = PackCache::new(4 * 1024 * 1024);
     let mut external = NoExternalBases { calls: 0 };
     let mut sink = CollectingSink::default();
+    let spill_dir = tempfile::tempdir().unwrap();
 
     let report = execute_pack_plan(
         &plan,
@@ -218,6 +219,7 @@ fn pack_exec_matches_git_cat_file() {
         &mut cache,
         &mut external,
         &mut sink,
+        spill_dir.path(),
     )
     .unwrap();
 

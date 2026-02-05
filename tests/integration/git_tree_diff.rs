@@ -4,19 +4,25 @@
 //! compare tree-diff behavior against `git diff-tree` output or explicit
 //! expectations. They also exercise spill partitioning and corrupt-tree
 //! error reporting.
+//!
+//! # Test Harness
+//! These tests require a `git` CLI with multi-pack-index support; otherwise
+//! they skip. Repos are fully packed and have commit-graph/MIDX artifacts
+//! because the object store requires those ready artifacts.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 
 use scanner_rs::git_scan::{
-    introduced_by_plan, repo_open, CandidateBuffer, CandidateSink, ChangeKind, CollectedUniqueBlob,
-    CollectingUniqueBlobSink, CommitGraph, CommitGraphView, CommitWalkLimits, MergeDiffMode,
-    NeverSeenStore, ObjectStore, ParentScratch, RefWatermarkStore, RepoArtifactStatus,
-    RepoOpenError, RepoOpenLimits, SpillLimits, Spiller, StartSetConfig, StartSetResolver,
-    TreeDiffError, TreeDiffLimits, TreeDiffWalker,
+    introduced_by_plan, repo_open, BlobIntroducer, CandidateBuffer, CandidateSink, ChangeKind,
+    CollectedUniqueBlob, CollectingUniqueBlobSink, CommitGraph, CommitGraphIndex, CommitGraphView,
+    CommitWalkLimits, MergeDiffMode, MidxView, NeverSeenStore, ObjectStore, OidIndex,
+    ParentScratch, RefWatermarkStore, RepoArtifactStatus, RepoOpenError, RepoOpenLimits,
+    SpillLimits, Spiller, StartSetConfig, StartSetResolver, TreeBytes, TreeDiffError,
+    TreeDiffLimits, TreeDiffWalker, TreeSource,
 };
 use scanner_rs::git_scan::{OidBytes, PlannedCommit, RepoJobState};
 use tempfile::TempDir;
@@ -28,6 +34,8 @@ fn git_available() -> bool {
 
 /// Returns true when this git build supports the MIDX command.
 fn git_supports_midx() -> bool {
+    // Some Git builds omit the multi-pack-index command; probing `--help`
+    // keeps the check fast and portable.
     Command::new("git")
         .args(["multi-pack-index", "--help"])
         .output()
@@ -126,6 +134,34 @@ fn prepare_repo_with_commits() -> TempDir {
     run_git(tmp.path(), &["add", "-A"]);
     run_git(tmp.path(), &["commit", "-m", "c2"]);
 
+    // Prepare artifacts expected by the object store.
+    run_git(tmp.path(), &["commit-graph", "write", "--reachable"]);
+    run_git(tmp.path(), &["repack", "-ad"]);
+    run_git(tmp.path(), &["multi-pack-index", "write"]);
+
+    tmp
+}
+
+/// Create a repo with many files to force large tree payloads.
+fn prepare_repo_with_many_files(count: usize) -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    run_git(tmp.path(), &["init", "-b", "main"]);
+    run_git(tmp.path(), &["config", "user.email", "test@example.com"]);
+    run_git(tmp.path(), &["config", "user.name", "Test User"]);
+
+    for idx in 0..count {
+        let path = tmp.path().join(format!("file_{idx:04}.txt"));
+        fs::write(path, format!("line {idx}\n")).unwrap();
+    }
+
+    run_git(tmp.path(), &["add", "."]);
+    run_git(tmp.path(), &["commit", "-m", "initial"]);
+
+    // Modify one file to create a second commit.
+    fs::write(tmp.path().join("file_0000.txt"), "updated\n").unwrap();
+    run_git(tmp.path(), &["add", "."]);
+    run_git(tmp.path(), &["commit", "-m", "update"]);
+
     run_git(tmp.path(), &["commit-graph", "write", "--reachable"]);
     run_git(tmp.path(), &["repack", "-ad"]);
     run_git(tmp.path(), &["multi-pack-index", "write"]);
@@ -166,6 +202,59 @@ fn prepare_repo_with_merge() -> TempDir {
     tmp
 }
 
+/// Create a repo where a blob appears under an excluded path first, then a non-excluded path.
+fn prepare_repo_with_excluded_blob_paths() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    run_git(tmp.path(), &["init", "-b", "main"]);
+    run_git(tmp.path(), &["config", "user.email", "test@example.com"]);
+    run_git(tmp.path(), &["config", "user.name", "Test User"]);
+
+    let content = b"secret payload\n";
+    fs::write(tmp.path().join("image.png"), content).unwrap();
+    run_git(tmp.path(), &["add", "."]);
+    run_git(tmp.path(), &["commit", "-m", "c1"]);
+
+    fs::create_dir_all(tmp.path().join("src")).unwrap();
+    fs::write(tmp.path().join("src/secret.txt"), content).unwrap();
+    run_git(tmp.path(), &["add", "."]);
+    run_git(tmp.path(), &["commit", "-m", "c2"]);
+
+    run_git(tmp.path(), &["commit-graph", "write", "--reachable"]);
+    run_git(tmp.path(), &["repack", "-ad"]);
+    run_git(tmp.path(), &["multi-pack-index", "write"]);
+
+    tmp
+}
+
+/// Create a repo with loose blobs not present in the MIDX.
+fn prepare_repo_with_loose_blobs() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    run_git(tmp.path(), &["init", "-b", "main"]);
+    run_git(tmp.path(), &["config", "user.email", "test@example.com"]);
+    run_git(tmp.path(), &["config", "user.name", "Test User"]);
+
+    fs::write(tmp.path().join("packed.txt"), "packed\n").unwrap();
+    run_git(tmp.path(), &["add", "."]);
+    run_git(tmp.path(), &["commit", "-m", "c1"]);
+
+    run_git(tmp.path(), &["commit-graph", "write", "--reachable"]);
+    run_git(tmp.path(), &["repack", "-ad"]);
+    run_git(tmp.path(), &["multi-pack-index", "write"]);
+
+    fs::write(tmp.path().join("loose.txt"), "loose\n").unwrap();
+    run_git(tmp.path(), &["add", "."]);
+    run_git(tmp.path(), &["commit", "-m", "c2"]);
+
+    fs::write(tmp.path().join("loose_dup.txt"), "loose\n").unwrap();
+    run_git(tmp.path(), &["add", "."]);
+    run_git(tmp.path(), &["commit", "-m", "c3"]);
+
+    // Update commit-graph for new commits, but keep MIDX stale so blobs stay loose.
+    run_git(tmp.path(), &["commit-graph", "write", "--reachable"]);
+
+    tmp
+}
+
 /// Open repo state with commit-graph and MIDX artifacts ready.
 fn open_repo_state(repo: &Path) -> RepoJobState {
     let head = git_output(repo, &["rev-parse", "HEAD"]);
@@ -174,6 +263,7 @@ fn open_repo_state(repo: &Path) -> RepoJobState {
     let resolver = TestResolver {
         refs: vec![(b"refs/heads/main".to_vec(), head_oid)],
     };
+    // Keep the start set consistent with the resolver: only the default branch.
     let start_set_id = StartSetConfig::DefaultBranchOnly.id();
 
     let state = repo_open(
@@ -192,6 +282,8 @@ fn open_repo_state(repo: &Path) -> RepoJobState {
 }
 
 /// Collect tree diff change kinds into a map keyed by UTF-8 path.
+///
+/// The repo fixtures use ASCII paths, so the UTF-8 conversion is lossless.
 fn diff_paths(
     store: &mut ObjectStore,
     limits: &TreeDiffLimits,
@@ -232,7 +324,8 @@ fn tree_diff_matches_git_diff_tree() {
     let state = open_repo_state(tmp.path());
 
     let limits = TreeDiffLimits::RESTRICTIVE;
-    let mut store = ObjectStore::open(&state, &limits).unwrap();
+    let spill = tempfile::tempdir().unwrap();
+    let mut store = ObjectStore::open(&state, &limits, spill.path()).unwrap();
     let mut walker = TreeDiffWalker::new(&limits, state.object_format.oid_len());
     let mut candidates = CandidateBuffer::new(&limits, state.object_format.oid_len());
 
@@ -293,6 +386,307 @@ fn tree_diff_matches_git_diff_tree() {
 }
 
 #[test]
+fn blob_introducer_matches_diff_history_unique_oids() {
+    if !git_available() || !git_supports_midx() {
+        eprintln!("git or multi-pack-index not available; skipping blob introducer test");
+        return;
+    }
+
+    let tmp = prepare_repo_with_commits();
+    let state = open_repo_state(tmp.path());
+
+    let limits = TreeDiffLimits::RESTRICTIVE;
+    let spill = tempfile::tempdir().unwrap();
+    let mut store = ObjectStore::open(&state, &limits, spill.path()).unwrap();
+    let cg = CommitGraphView::open_repo(&state).unwrap();
+    let commit_limits = CommitWalkLimits::RESTRICTIVE;
+    let plan = introduced_by_plan(&state, &cg, commit_limits).unwrap();
+
+    let mut diff_set = BTreeSet::new();
+    let mut walker = TreeDiffWalker::new(&limits, state.object_format.oid_len());
+    let mut candidates = CandidateBuffer::new(&limits, state.object_format.oid_len());
+    let mut parent_scratch = ParentScratch::new();
+
+    for PlannedCommit { pos, .. } in &plan {
+        let commit_id = pos.0;
+        let new_tree = cg.root_tree_oid(*pos).unwrap();
+
+        parent_scratch.clear();
+        cg.collect_parents(
+            *pos,
+            commit_limits.max_parents_per_commit,
+            &mut parent_scratch,
+        )
+        .unwrap();
+        let parents = parent_scratch.as_slice();
+
+        if parents.is_empty() {
+            walker
+                .diff_trees(
+                    &mut store,
+                    &mut candidates,
+                    Some(&new_tree),
+                    None,
+                    commit_id,
+                    0,
+                )
+                .unwrap();
+        } else {
+            for (idx, parent_pos) in parents.iter().enumerate() {
+                let old_tree = cg.root_tree_oid(*parent_pos).unwrap();
+                walker
+                    .diff_trees(
+                        &mut store,
+                        &mut candidates,
+                        Some(&new_tree),
+                        Some(&old_tree),
+                        commit_id,
+                        idx as u8,
+                    )
+                    .unwrap();
+            }
+        }
+
+        for cand in candidates.iter_resolved() {
+            diff_set.insert(cand.oid);
+        }
+        candidates.clear();
+    }
+
+    let midx_bytes = state.mmaps.midx.as_ref().unwrap().as_ref();
+    let midx = MidxView::parse(midx_bytes, state.object_format).unwrap();
+    let oid_index = OidIndex::from_midx(&midx);
+
+    let cg_index = CommitGraphIndex::build(&cg).unwrap();
+    let mut introducer = BlobIntroducer::new(
+        &limits,
+        state.object_format.oid_len(),
+        midx.object_count(),
+        1,
+        limits.max_candidates,
+    );
+    let mut intro_candidates = CandidateBuffer::new(&limits, state.object_format.oid_len());
+    introducer
+        .introduce(
+            &mut store,
+            &cg_index,
+            &plan,
+            &oid_index,
+            &mut intro_candidates,
+        )
+        .unwrap();
+
+    let mut intro_set = BTreeSet::new();
+    for cand in intro_candidates.iter_resolved() {
+        intro_set.insert(cand.oid);
+    }
+
+    assert_eq!(diff_set, intro_set);
+}
+
+#[test]
+fn blob_introducer_prefers_first_non_excluded_path() {
+    if !git_available() || !git_supports_midx() {
+        eprintln!("git or multi-pack-index not available; skipping path policy test");
+        return;
+    }
+
+    let tmp = prepare_repo_with_excluded_blob_paths();
+    let state = open_repo_state(tmp.path());
+
+    let limits = TreeDiffLimits::RESTRICTIVE;
+    let spill = tempfile::tempdir().unwrap();
+    let mut store = ObjectStore::open(&state, &limits, spill.path()).unwrap();
+    let cg = CommitGraphView::open_repo(&state).unwrap();
+    let commit_limits = CommitWalkLimits::RESTRICTIVE;
+    let plan = introduced_by_plan(&state, &cg, commit_limits).unwrap();
+
+    let midx_bytes = state.mmaps.midx.as_ref().unwrap().as_ref();
+    let midx = MidxView::parse(midx_bytes, state.object_format).unwrap();
+    let oid_index = OidIndex::from_midx(&midx);
+    let cg_index = CommitGraphIndex::build(&cg).unwrap();
+
+    let mut introducer = BlobIntroducer::new(
+        &limits,
+        state.object_format.oid_len(),
+        midx.object_count(),
+        2,
+        limits.max_candidates,
+    );
+    let mut intro_candidates = CandidateBuffer::new(&limits, state.object_format.oid_len());
+    introducer
+        .introduce(
+            &mut store,
+            &cg_index,
+            &plan,
+            &oid_index,
+            &mut intro_candidates,
+        )
+        .unwrap();
+
+    let mut paths: Vec<String> = intro_candidates
+        .iter_resolved()
+        .map(|cand| String::from_utf8_lossy(cand.path).into_owned())
+        .collect();
+    paths.sort();
+
+    assert!(paths.contains(&"src/secret.txt".to_string()));
+    assert!(!paths.contains(&"image.png".to_string()));
+    assert_eq!(paths.len(), 1);
+}
+
+#[test]
+fn blob_introducer_dedupes_loose_oids() {
+    if !git_available() || !git_supports_midx() {
+        eprintln!("git or multi-pack-index not available; skipping loose oid test");
+        return;
+    }
+
+    let tmp = prepare_repo_with_loose_blobs();
+    let state = open_repo_state(tmp.path());
+
+    let limits = TreeDiffLimits::RESTRICTIVE;
+    let spill = tempfile::tempdir().unwrap();
+    let mut store = ObjectStore::open(&state, &limits, spill.path()).unwrap();
+    let cg = CommitGraphView::open_repo(&state).unwrap();
+    let commit_limits = CommitWalkLimits::RESTRICTIVE;
+    let plan = introduced_by_plan(&state, &cg, commit_limits).unwrap();
+
+    let midx_bytes = state.mmaps.midx.as_ref().unwrap().as_ref();
+    let midx = MidxView::parse(midx_bytes, state.object_format).unwrap();
+    let oid_index = OidIndex::from_midx(&midx);
+    let cg_index = CommitGraphIndex::build(&cg).unwrap();
+
+    let mut introducer = BlobIntroducer::new(
+        &limits,
+        state.object_format.oid_len(),
+        midx.object_count(),
+        1,
+        limits.max_candidates,
+    );
+    let mut intro_candidates = CandidateBuffer::new(&limits, state.object_format.oid_len());
+    introducer
+        .introduce(
+            &mut store,
+            &cg_index,
+            &plan,
+            &oid_index,
+            &mut intro_candidates,
+        )
+        .unwrap();
+
+    let loose_oid = oid_from_hex(&git_output(tmp.path(), &["hash-object", "loose.txt"]));
+    let mut paths = Vec::new();
+    for cand in intro_candidates.iter_resolved() {
+        if cand.oid == loose_oid {
+            paths.push(String::from_utf8_lossy(cand.path).into_owned());
+        }
+    }
+
+    assert_eq!(paths.len(), 1);
+    assert_eq!(paths[0], "loose.txt");
+}
+
+#[test]
+fn tree_diff_spill_path_uses_spill_arena() {
+    if !git_available() || !git_supports_midx() {
+        eprintln!("git or multi-pack-index not available; skipping spill path test");
+        return;
+    }
+
+    let tmp = prepare_repo_with_many_files(128);
+    let state = open_repo_state(tmp.path());
+
+    // Force spill behavior by keeping the cache tiny.
+    let mut limits = TreeDiffLimits::RESTRICTIVE;
+    limits.max_tree_cache_bytes = 64;
+    limits.max_tree_spill_bytes = 1024 * 1024;
+    limits.max_tree_bytes_in_flight = 8 * 1024 * 1024;
+    limits.max_path_arena_bytes = 1024 * 1024;
+
+    let spill = tempfile::tempdir().unwrap();
+    let mut store = ObjectStore::open(&state, &limits, spill.path()).unwrap();
+
+    let new_tree = oid_from_hex(&git_output(
+        tmp.path(),
+        &["show", "-s", "--format=%T", "HEAD"],
+    ));
+    let old_tree = oid_from_hex(&git_output(
+        tmp.path(),
+        &["show", "-s", "--format=%T", "HEAD~1"],
+    ));
+
+    let bytes = store.load_tree(&new_tree).unwrap();
+    assert!(matches!(bytes, TreeBytes::Spilled(_)));
+
+    let mut walker = TreeDiffWalker::new(&limits, state.object_format.oid_len());
+    let mut candidates = CandidateBuffer::new(&limits, state.object_format.oid_len());
+
+    walker
+        .diff_trees(
+            &mut store,
+            &mut candidates,
+            Some(&new_tree),
+            Some(&old_tree),
+            0,
+            0,
+        )
+        .unwrap();
+
+    assert!(!candidates.is_empty());
+}
+
+#[test]
+fn tree_diff_streaming_matches_buffered() {
+    if !git_available() || !git_supports_midx() {
+        eprintln!("git or multi-pack-index not available; skipping streaming test");
+        return;
+    }
+
+    let tmp = prepare_repo_with_many_files(128);
+    let state = open_repo_state(tmp.path());
+
+    let new_tree = oid_from_hex(&git_output(
+        tmp.path(),
+        &["show", "-s", "--format=%T", "HEAD"],
+    ));
+    let old_tree = oid_from_hex(&git_output(
+        tmp.path(),
+        &["show", "-s", "--format=%T", "HEAD~1"],
+    ));
+
+    // Streaming limits: tiny cache/spill budgets to maximize re-reads.
+    let mut limits_stream = TreeDiffLimits::RESTRICTIVE;
+    limits_stream.max_tree_cache_bytes = 64;
+    limits_stream.max_tree_spill_bytes = 1;
+    limits_stream.max_tree_bytes_in_flight = 8 * 1024 * 1024;
+    limits_stream.max_path_arena_bytes = 1024 * 1024;
+
+    // Buffered limits: large cache/spill budgets to maximize reuse.
+    let mut limits_buffered = limits_stream;
+    limits_buffered.max_tree_cache_bytes = 8 * 1024 * 1024;
+    limits_buffered.max_tree_spill_bytes = 8 * 1024 * 1024;
+
+    let spill_stream = tempfile::tempdir().unwrap();
+    let spill_buffered = tempfile::tempdir().unwrap();
+
+    let mut store_stream = ObjectStore::open(&state, &limits_stream, spill_stream.path()).unwrap();
+    let mut store_buffered =
+        ObjectStore::open(&state, &limits_buffered, spill_buffered.path()).unwrap();
+
+    let out_stream = diff_paths(&mut store_stream, &limits_stream, &new_tree, &old_tree, 0);
+    let out_buffered = diff_paths(
+        &mut store_buffered,
+        &limits_buffered,
+        &new_tree,
+        &old_tree,
+        0,
+    );
+
+    assert_eq!(out_stream, out_buffered);
+}
+
+#[test]
 fn corrupt_tree_is_reported() {
     if !git_available() || !git_supports_midx() {
         eprintln!("git or multi-pack-index not available; skipping corrupt tree test");
@@ -303,7 +697,8 @@ fn corrupt_tree_is_reported() {
     let state = open_repo_state(tmp.path());
 
     let limits = TreeDiffLimits::RESTRICTIVE;
-    let mut store = ObjectStore::open(&state, &limits).unwrap();
+    let spill = tempfile::tempdir().unwrap();
+    let mut store = ObjectStore::open(&state, &limits, spill.path()).unwrap();
     let mut walker = TreeDiffWalker::new(&limits, state.object_format.oid_len());
     let mut candidates = CandidateBuffer::new(&limits, state.object_format.oid_len());
 
@@ -330,7 +725,8 @@ fn merge_diff_modes_emit_expected_candidates() {
     let parent2_tree = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD^2^{tree}"]));
 
     let limits = TreeDiffLimits::RESTRICTIVE;
-    let mut store = ObjectStore::open(&state, &limits).unwrap();
+    let spill = tempfile::tempdir().unwrap();
+    let mut store = ObjectStore::open(&state, &limits, spill.path()).unwrap();
 
     let first_parent = diff_paths(&mut store, &limits, &merge_tree, &parent1_tree, 0);
     let second_parent = diff_paths(&mut store, &limits, &merge_tree, &parent2_tree, 1);
@@ -354,6 +750,7 @@ fn merge_diff_modes_emit_expected_candidates() {
     assert!(first_only.contains_key("feature.txt"));
 }
 
+/// Merge diff mode helper: compose expected per-parent change maps.
 fn collect_merge_candidates(
     mode: MergeDiffMode,
     first_parent: &BTreeMap<String, ChangeKind>,
@@ -370,16 +767,19 @@ fn collect_merge_candidates(
 }
 
 /// Collect unique blobs via spill with the supplied limits.
+///
+/// This uses streaming candidate emission into `Spiller` to exercise the
+/// spill partitioning logic under tight limits.
 fn collect_unique_blobs(state: &RepoJobState, limits: SpillLimits) -> Vec<CollectedUniqueBlob> {
     let cg = CommitGraphView::open_repo(state).unwrap();
     let plan = introduced_by_plan(state, &cg, CommitWalkLimits::RESTRICTIVE).unwrap();
 
     let tree_limits = TreeDiffLimits::RESTRICTIVE;
-    let mut store = ObjectStore::open(state, &tree_limits).unwrap();
+    let tmp = TempDir::new().unwrap();
+    let mut store = ObjectStore::open(state, &tree_limits, tmp.path()).unwrap();
     let mut walker = TreeDiffWalker::new(&tree_limits, state.object_format.oid_len());
     let mut parent_scratch = ParentScratch::new();
 
-    let tmp = TempDir::new().unwrap();
     let mut spiller = Spiller::new(limits, state.object_format.oid_len(), tmp.path()).unwrap();
 
     struct SpillSink<'a> {
@@ -397,6 +797,7 @@ fn collect_unique_blobs(state: &RepoJobState, limits: SpillLimits) -> Vec<Collec
             ctx_flags: u16,
             cand_flags: u16,
         ) -> Result<(), TreeDiffError> {
+            // Translate candidate emission into spiller pushes.
             self.spiller
                 .push(
                     oid,
@@ -484,6 +885,110 @@ fn collect_unique_blobs(state: &RepoJobState, limits: SpillLimits) -> Vec<Collec
     sink.blobs
 }
 
+/// Collect unique blobs using a buffered candidate path before spilling.
+///
+/// This mirrors `collect_unique_blobs` but uses `CandidateBuffer` to ensure
+/// buffered and streaming paths are equivalent.
+fn collect_unique_blobs_buffered(
+    state: &RepoJobState,
+    limits: SpillLimits,
+) -> Vec<CollectedUniqueBlob> {
+    let cg = CommitGraphView::open_repo(state).unwrap();
+    let plan = introduced_by_plan(state, &cg, CommitWalkLimits::RESTRICTIVE).unwrap();
+
+    let tree_limits = TreeDiffLimits::RESTRICTIVE;
+    let tmp = TempDir::new().unwrap();
+    let mut store = ObjectStore::open(state, &tree_limits, tmp.path()).unwrap();
+    let mut walker = TreeDiffWalker::new(&tree_limits, state.object_format.oid_len());
+    let mut parent_scratch = ParentScratch::new();
+    let mut buffer = CandidateBuffer::new(&tree_limits, state.object_format.oid_len());
+    let mut spiller = Spiller::new(limits, state.object_format.oid_len(), tmp.path()).unwrap();
+
+    for PlannedCommit { pos, snapshot_root } in &plan {
+        let commit_id = pos.0;
+        let new_tree = cg.root_tree_oid(*pos).unwrap();
+
+        if *snapshot_root {
+            walker
+                .diff_trees(&mut store, &mut buffer, Some(&new_tree), None, commit_id, 0)
+                .unwrap();
+            continue;
+        }
+
+        parent_scratch.clear();
+        cg.collect_parents(
+            *pos,
+            CommitWalkLimits::RESTRICTIVE.max_parents_per_commit,
+            &mut parent_scratch,
+        )
+        .unwrap();
+        let parents = parent_scratch.as_slice();
+
+        if parents.is_empty() {
+            walker
+                .diff_trees(&mut store, &mut buffer, Some(&new_tree), None, commit_id, 0)
+                .unwrap();
+            continue;
+        }
+
+        for (idx, parent_pos) in parents.iter().enumerate() {
+            let old_tree = cg.root_tree_oid(*parent_pos).unwrap();
+            walker
+                .diff_trees(
+                    &mut store,
+                    &mut buffer,
+                    Some(&new_tree),
+                    Some(&old_tree),
+                    commit_id,
+                    idx as u8,
+                )
+                .unwrap();
+        }
+    }
+
+    for cand in buffer.iter_resolved() {
+        spiller
+            .push(
+                cand.oid,
+                cand.path,
+                cand.commit_id,
+                cand.parent_idx,
+                cand.change_kind,
+                cand.ctx_flags,
+                cand.cand_flags,
+            )
+            .unwrap();
+    }
+
+    let store = NeverSeenStore;
+    let mut sink = CollectingUniqueBlobSink::default();
+    spiller.finalize(&store, &mut sink).unwrap();
+    sink.blobs
+}
+
+fn sort_unique_blobs(blobs: &mut [CollectedUniqueBlob]) {
+    blobs.sort_by(|a, b| {
+        (
+            a.oid,
+            a.ctx.commit_id,
+            a.ctx.parent_idx,
+            a.ctx.change_kind.as_u8(),
+            a.ctx.ctx_flags,
+            a.ctx.cand_flags,
+            &a.path,
+        )
+            .cmp(&(
+                b.oid,
+                b.ctx.commit_id,
+                b.ctx.parent_idx,
+                b.ctx.change_kind.as_u8(),
+                b.ctx.ctx_flags,
+                b.ctx.cand_flags,
+                &b.path,
+            ))
+    });
+}
+
 #[test]
 fn spill_limits_streaming_is_partition_invariant() {
     if !git_available() || !git_supports_midx() {
@@ -508,52 +1013,35 @@ fn spill_limits_streaming_is_partition_invariant() {
     let mut out_small = collect_unique_blobs(&state, limits_small);
     let mut out_large = collect_unique_blobs(&state, limits_large);
 
-    out_small.sort_by(|a, b| {
-        (
-            a.oid,
-            a.ctx.commit_id,
-            a.ctx.parent_idx,
-            a.ctx.change_kind.as_u8(),
-            a.ctx.ctx_flags,
-            a.ctx.cand_flags,
-            &a.path,
-        )
-            .cmp(&(
-                b.oid,
-                b.ctx.commit_id,
-                b.ctx.parent_idx,
-                b.ctx.change_kind.as_u8(),
-                b.ctx.ctx_flags,
-                b.ctx.cand_flags,
-                &b.path,
-            ))
-    });
-    out_large.sort_by(|a, b| {
-        (
-            a.oid,
-            a.ctx.commit_id,
-            a.ctx.parent_idx,
-            a.ctx.change_kind.as_u8(),
-            a.ctx.ctx_flags,
-            a.ctx.cand_flags,
-            &a.path,
-        )
-            .cmp(&(
-                b.oid,
-                b.ctx.commit_id,
-                b.ctx.parent_idx,
-                b.ctx.change_kind.as_u8(),
-                b.ctx.ctx_flags,
-                b.ctx.cand_flags,
-                &b.path,
-            ))
-    });
+    sort_unique_blobs(&mut out_small);
+    sort_unique_blobs(&mut out_large);
 
     assert_eq!(out_small, out_large);
 }
 
+#[test]
+fn buffered_vs_streaming_candidates_match() {
+    if !git_available() || !git_supports_midx() {
+        eprintln!("git or multi-pack-index not available; skipping buffered vs streaming test");
+        return;
+    }
+
+    let tmp = prepare_repo_with_commits();
+    let state = open_repo_state(tmp.path());
+
+    let limits = SpillLimits::RESTRICTIVE;
+    let mut out_stream = collect_unique_blobs(&state, limits);
+    let mut out_buffered = collect_unique_blobs_buffered(&state, limits);
+
+    sort_unique_blobs(&mut out_stream);
+    sort_unique_blobs(&mut out_buffered);
+
+    assert_eq!(out_stream, out_buffered);
+}
+
 /// Write a corrupt tree object into the object database.
 fn write_corrupt_tree(objects_dir: &Path, oid: &OidBytes) {
+    // Missing the trailing OID bytes, so the tree entry is truncated.
     let payload = b"100644 file\0";
     let mut data = format!("tree {}\0", payload.len()).into_bytes();
     data.extend_from_slice(payload);

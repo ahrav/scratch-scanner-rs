@@ -582,8 +582,9 @@ fn stage_pack_exec(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
     let pack_views = pack_bytes
         .pack_views()
         .map_err(|err| failure_inv(36, err))?;
+    let pack_views = pack_views.into_iter().map(Some).collect::<Vec<_>>();
     let plans = build_pack_plans(
-        &pack_candidates,
+        pack_candidates,
         &pack_views,
         &midx_view,
         &PackPlanConfig::default(),
@@ -1290,6 +1291,7 @@ mod tests {
         let plan = PackPlan {
             pack_id: 0,
             oid_len: 20,
+            max_delta_depth: 0,
             candidates: vec![PackCandidate {
                 oid: crate::git_scan::OidBytes::sha1([0x11; 20]),
                 ctx: CandidateContext {
@@ -1309,6 +1311,7 @@ mod tests {
             }],
             need_offsets: vec![offsets[0]],
             delta_deps: Vec::new(),
+            delta_dep_index: Vec::new(),
             exec_order: None,
             clusters: Vec::new(),
             stats: PackPlanStats {

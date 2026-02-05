@@ -13,16 +13,16 @@
 //! 2. Parse entry headers for candidate offsets and resolve REF deltas.
 //! 3. Expand a pack-local base closure up to `max_delta_depth`.
 //! 4. Materialize sorted `need_offsets`, delta dependencies, exec order,
-//!    and offset clusters.
+//!    and (optionally) offset clusters.
 //!
 //! # Invariants
 //! - `need_offsets` is sorted and unique.
 //! - `candidate_offsets` is sorted by offset (ties by candidate index).
 //! - `exec_order` indices refer to `need_offsets`.
 //! - `clusters` are contiguous ranges within `need_offsets` split by
-//!   `CLUSTER_GAP_BYTES`.
+//!   `CLUSTER_GAP_BYTES` when clustering is enabled.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 
 use super::midx::MidxView;
@@ -32,13 +32,13 @@ use super::pack_candidates::PackCandidate;
 use super::pack_inflate::{EntryKind, PackFile, PackParseError};
 use super::pack_plan_model::{
     BaseLoc, CandidateAtOffset, Cluster, DeltaDep, DeltaKind, PackPlan, PackPlanStats,
-    CLUSTER_GAP_BYTES,
+    CLUSTER_GAP_BYTES, NONE_U32,
 };
 
 /// Default safety bound for pack entry headers.
 const DEFAULT_MAX_HEADER_BYTES: usize = 64;
 /// Default maximum delta chain depth.
-const DEFAULT_MAX_DELTA_DEPTH: u8 = 16;
+const DEFAULT_MAX_DELTA_DEPTH: u8 = 64;
 /// Default maximum offsets tracked during planning.
 const DEFAULT_MAX_WORKLIST_ENTRIES: usize = 1_000_000;
 /// Default maximum REF base lookups during planning.
@@ -254,16 +254,17 @@ struct WorkItem {
 /// same pack offset; they are preserved as distinct entries in
 /// `PackPlan.candidates` while `need_offsets` is deduplicated.
 ///
-/// `packs` must be indexed by `pack_id` (PNAM order). Missing pack views
-/// result in `PackIdOutOfRange`.
+/// `packs` must be indexed by `pack_id` (PNAM order). Unused pack slots may
+/// be `None`; referenced pack IDs must be `Some`, otherwise
+/// `PackIdOutOfRange` is returned.
 ///
 /// # Errors
 ///
 /// Returns `PackPlanError` for invalid pack headers, out-of-range offsets,
 /// or resolver failures.
 pub fn build_pack_plans<'a, R: OidResolver>(
-    candidates: &[PackCandidate],
-    packs: &[PackView<'a>],
+    mut candidates: Vec<PackCandidate>,
+    packs: &[Option<PackView<'a>>],
     resolver: &R,
     config: &PackPlanConfig,
 ) -> Result<Vec<PackPlan>, PackPlanError> {
@@ -271,30 +272,46 @@ pub fn build_pack_plans<'a, R: OidResolver>(
         return Ok(Vec::new());
     }
 
-    let mut by_pack: BTreeMap<u16, Vec<PackCandidate>> = BTreeMap::new();
-    for cand in candidates {
-        by_pack.entry(cand.pack_id).or_default().push(*cand);
-    }
+    let (mut buckets, pack_ids) = bucket_pack_candidates(candidates.drain(..), packs.len())?;
 
-    let mut plans = Vec::with_capacity(by_pack.len());
-    for (pack_id, pack_candidates) in by_pack {
+    let mut plans = Vec::with_capacity(pack_ids.len());
+    for pack_id in pack_ids {
         let pack_idx = pack_id as usize;
-        let pack = packs.get(pack_idx).ok_or(PackPlanError::PackIdOutOfRange {
-            pack_id,
-            pack_count: packs.len(),
-        })?;
+        let pack = packs.get(pack_idx).and_then(|pack| pack.as_ref()).ok_or(
+            PackPlanError::PackIdOutOfRange {
+                pack_id,
+                pack_count: packs.len(),
+            },
+        )?;
+        let pack_candidates = std::mem::take(&mut buckets[pack_idx]);
 
-        let plan = build_pack_plan_for_pack(pack_id, pack, &pack_candidates, resolver, config)?;
+        let plan = build_pack_plan_for_pack(pack_id, pack, pack_candidates, resolver, config)?;
         plans.push(plan);
     }
 
     Ok(plans)
 }
 
-fn build_pack_plan_for_pack<'a, R: OidResolver>(
+/// Build a pack plan for a single pack and its candidates.
+///
+/// # Preconditions
+/// - `pack_id` must index `pack` in PNAM order.
+/// - `candidates` must all refer to `pack_id`.
+///
+/// # Effects
+/// - Expands delta bases up to `config.max_delta_depth`.
+/// - Deduplicates candidate offsets into `need_offsets`.
+///
+/// # Errors
+/// - Candidate offsets that are out of range return `CandidateOffsetOutOfRange`.
+/// - Pack corruption or resolver failures return `PackPlanError`.
+///
+/// # Complexity
+/// - `O(N log N)` for `N` candidates due to sorting and hash lookups.
+pub(crate) fn build_pack_plan_for_pack<'a, R: OidResolver>(
     pack_id: u16,
     pack: &PackView<'a>,
-    candidates: &[PackCandidate],
+    candidates: Vec<PackCandidate>,
     resolver: &R,
     config: &PackPlanConfig,
 ) -> Result<PackPlan, PackPlanError> {
@@ -423,8 +440,10 @@ fn build_pack_plan_for_pack<'a, R: OidResolver>(
     );
 
     let delta_deps = build_delta_deps(&need_offsets, &entry_cache, pack_id);
+    let delta_dep_index = build_delta_dep_index(&need_offsets, &delta_deps);
     let exec_order = build_exec_order(&need_offsets, &delta_deps, pack_id)?;
-    let clusters = cluster_offsets(&need_offsets);
+    // Pack exec does not currently consume clustering hints; skip computation.
+    let clusters = Vec::new();
 
     let external_bases = delta_deps
         .iter()
@@ -446,14 +465,53 @@ fn build_pack_plan_for_pack<'a, R: OidResolver>(
     Ok(PackPlan {
         pack_id,
         oid_len: pack.oid_len(),
-        candidates: candidates.to_vec(),
+        max_delta_depth: config.max_delta_depth,
+        candidates,
         candidate_offsets,
         need_offsets,
         delta_deps,
+        delta_dep_index,
         exec_order,
         clusters,
         stats,
     })
+}
+
+/// Bucket pack candidates by pack id and return the active pack ids.
+///
+/// The returned bucket vector is sized to `pack_count` so callers can index
+/// directly by pack id. `pack_ids` contains the unique pack ids that received
+/// candidates, sorted ascending for deterministic planning.
+///
+/// # Errors
+/// Returns `PackPlanError::PackIdOutOfRange` if any candidate references a
+/// pack id outside `[0, pack_count)`.
+pub(crate) fn bucket_pack_candidates<I>(
+    candidates: I,
+    pack_count: usize,
+) -> Result<(Vec<Vec<PackCandidate>>, Vec<u16>), PackPlanError>
+where
+    I: IntoIterator<Item = PackCandidate>,
+{
+    let mut buckets: Vec<Vec<PackCandidate>> = vec![Vec::new(); pack_count];
+    let mut pack_ids: Vec<u16> = Vec::new();
+
+    for cand in candidates {
+        let pack_idx = cand.pack_id as usize;
+        if pack_idx >= pack_count {
+            return Err(PackPlanError::PackIdOutOfRange {
+                pack_id: cand.pack_id,
+                pack_count,
+            });
+        }
+        if buckets[pack_idx].is_empty() {
+            pack_ids.push(cand.pack_id);
+        }
+        buckets[pack_idx].push(cand);
+    }
+
+    pack_ids.sort_unstable();
+    Ok((buckets, pack_ids))
 }
 
 /// Parse an entry header at `offset` and cache the result.
@@ -540,6 +598,30 @@ fn build_delta_deps(
         }
     }
     deps
+}
+
+fn build_delta_dep_index(need_offsets: &[u64], delta_deps: &[DeltaDep]) -> Vec<u32> {
+    let mut index = vec![NONE_U32; need_offsets.len()];
+    if delta_deps.is_empty() {
+        return index;
+    }
+
+    let mut dep_idx = 0usize;
+    for (need_idx, &offset) in need_offsets.iter().enumerate() {
+        while dep_idx < delta_deps.len() && delta_deps[dep_idx].offset < offset {
+            dep_idx += 1;
+        }
+        if dep_idx < delta_deps.len() && delta_deps[dep_idx].offset == offset {
+            index[need_idx] = dep_idx as u32;
+            dep_idx += 1;
+        }
+    }
+
+    debug_assert!(
+        dep_idx <= delta_deps.len(),
+        "delta_dep_index ran past delta_deps"
+    );
+    index
 }
 
 /// Build an execution order that respects forward delta dependencies.
@@ -717,5 +799,26 @@ mod tests {
             order.iter().position(|&o| o == idx as u32).unwrap()
         };
         assert!(pos(50) < pos(10));
+    }
+
+    #[test]
+    fn delta_dep_index_maps_need_offsets() {
+        let need_offsets = vec![10, 20, 30, 40];
+        let deps = vec![
+            DeltaDep {
+                offset: 20,
+                kind: DeltaKind::Ofs,
+                base: BaseLoc::Offset(10),
+            },
+            DeltaDep {
+                offset: 40,
+                kind: DeltaKind::Ref,
+                base: BaseLoc::External {
+                    oid: OidBytes::sha1([0x11; 20]),
+                },
+            },
+        ];
+        let index = build_delta_dep_index(&need_offsets, &deps);
+        assert_eq!(index, vec![NONE_U32, 0, NONE_U32, 1]);
     }
 }

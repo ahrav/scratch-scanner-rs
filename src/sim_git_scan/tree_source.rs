@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::git_scan::{ObjectFormat, OidBytes, TreeDiffError, TreeSource};
+use crate::git_scan::{ObjectFormat, OidBytes, TreeBytes, TreeDiffError, TreeSource};
 
 use super::convert::{to_object_format, to_oid_bytes};
 use super::error::SimGitError;
@@ -61,7 +61,7 @@ impl SimTreeSource {
 }
 
 impl TreeSource for SimTreeSource {
-    fn load_tree(&mut self, oid: &OidBytes) -> Result<Vec<u8>, TreeDiffError> {
+    fn load_tree(&mut self, oid: &OidBytes) -> Result<TreeBytes, TreeDiffError> {
         if oid.len() != self.oid_len {
             return Err(TreeDiffError::InvalidOidLength {
                 len: oid.len() as usize,
@@ -70,7 +70,7 @@ impl TreeSource for SimTreeSource {
         }
 
         if let Some(bytes) = self.trees.get(oid) {
-            return Ok(bytes.clone());
+            return Ok(TreeBytes::Owned(bytes.clone()));
         }
 
         if self.blobs.contains(oid) {

@@ -22,7 +22,7 @@
 //! # Invariants
 //! - Results are returned in candidate order.
 //! - `ScannedBlob.findings` indexes into the adapter's findings arena.
-//! - Path refs in results point into the adapter's path arena.
+//! - Path refs in results point into the mapping arena supplied by the caller.
 //! - When the debug allocation guard is enabled, scanning must not allocate.
 
 use std::fmt;
@@ -31,7 +31,6 @@ use crate::scheduler::AllocGuard;
 use crate::{Engine, FileId, NormHash, ScanScratch};
 
 use super::alloc_guard;
-use super::byte_arena::{ByteArena, ByteRef};
 use super::object_id::OidBytes;
 use super::pack_candidates::{LooseCandidate, PackCandidate};
 use super::pack_exec::{PackExecError, PackObjectSink};
@@ -40,8 +39,6 @@ use super::tree_candidate::CandidateContext;
 
 /// Default chunk window size for adapter scanning (1 MiB).
 pub const DEFAULT_CHUNK_BYTES: usize = 1 << 20;
-/// Default capacity for the adapter path arena (4 MiB).
-pub const DEFAULT_PATH_ARENA_BYTES: u32 = 4 * 1024 * 1024;
 
 /// Engine adapter configuration.
 #[derive(Clone, Copy, Debug)]
@@ -51,18 +48,12 @@ pub struct EngineAdapterConfig {
     /// The adapter will clamp this to at least `required_overlap + 1`.
     /// Use `0` to select the default (`DEFAULT_CHUNK_BYTES`).
     pub chunk_bytes: usize,
-    /// Maximum bytes for the adapter path arena.
-    ///
-    /// Paths longer than `ByteRef::MAX_LEN` still fail even if the arena has
-    /// capacity.
-    pub path_arena_bytes: u32,
 }
 
 impl Default for EngineAdapterConfig {
     fn default() -> Self {
         Self {
             chunk_bytes: DEFAULT_CHUNK_BYTES,
-            path_arena_bytes: DEFAULT_PATH_ARENA_BYTES,
         }
     }
 }
@@ -87,6 +78,9 @@ pub struct FindingKey {
 }
 
 /// Range into the adapter findings arena for a single blob.
+///
+/// The span indexes into `ScannedBlobs.finding_arena` (or the adapter's
+/// internal arena prior to `take_results`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FindingSpan {
     /// Start index in the findings arena.
@@ -96,17 +90,22 @@ pub struct FindingSpan {
 }
 
 /// Blob scanned by the engine adapter.
+///
+/// The `ctx.path_ref` points into the mapping arena owned by the caller.
 #[derive(Clone, Debug)]
 pub struct ScannedBlob {
     /// Blob object ID.
     pub oid: OidBytes,
-    /// Canonical context with path reference (adapter-owned arena).
+    /// Canonical context with path reference (mapping arena).
     pub ctx: CandidateContext,
     /// Sorted + deduped findings span in the adapter findings arena.
     pub findings: FindingSpan,
 }
 
 /// Collected scan results with a shared findings arena.
+///
+/// The findings arena is shared across blobs; individual blobs reference it
+/// via `FindingSpan`.
 #[derive(Clone, Debug)]
 pub struct ScannedBlobs {
     /// Blobs scanned in candidate order.
@@ -118,10 +117,6 @@ pub struct ScannedBlobs {
 /// Engine adapter error taxonomy.
 #[derive(Debug)]
 pub enum EngineAdapterError {
-    /// Path length exceeds `ByteRef` limits.
-    PathTooLong { len: usize, max: u16 },
-    /// Path arena is out of space.
-    PathArenaFull { needed: usize, remaining: u32 },
     /// Finding offsets exceed `u32` bounds.
     FindingOffsetOverflow { start: u64, end: u64 },
     /// Findings arena index exceeds `u32` bounds.
@@ -131,15 +126,6 @@ pub enum EngineAdapterError {
 impl fmt::Display for EngineAdapterError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::PathTooLong { len, max } => {
-                write!(f, "path length {len} exceeds max {max}")
-            }
-            Self::PathArenaFull { needed, remaining } => {
-                write!(
-                    f,
-                    "path arena full (needed {needed} bytes, remaining {remaining})"
-                )
-            }
             Self::FindingOffsetOverflow { start, end } => {
                 write!(f, "finding offsets exceed u32: {start}..{end}")
             }
@@ -161,13 +147,13 @@ impl From<EngineAdapterError> for PackExecError {
 /// Git engine adapter that implements `PackObjectSink`.
 ///
 /// The adapter reuses a ring chunker and scratch space across blobs to
-/// minimize allocations on hot paths.
+/// minimize allocations on hot paths. Results accumulate until
+/// `take_results` or `clear_results` is called.
 pub struct EngineAdapter<'a> {
     engine: &'a Engine,
     scratch: ScanScratch,
     overlap: usize,
     chunk_bytes: usize,
-    path_arena: ByteArena,
     results: Vec<ScannedBlob>,
     findings_arena: Vec<FindingKey>,
     findings_buf: Vec<FindingKey>,
@@ -187,7 +173,6 @@ impl<'a> EngineAdapter<'a> {
             scratch: engine.new_scratch(),
             overlap,
             chunk_bytes,
-            path_arena: ByteArena::with_capacity(config.path_arena_bytes),
             results: Vec::new(),
             findings_arena: Vec::new(),
             findings_buf: Vec::with_capacity(64),
@@ -219,16 +204,13 @@ impl<'a> EngineAdapter<'a> {
     }
 
     /// Clears accumulated results while preserving allocated capacity.
+    ///
+    /// This does not reset the file-id counter; file ids continue to
+    /// monotonically wrap.
     pub fn clear_results(&mut self) {
         self.results.clear();
         self.findings_arena.clear();
         self.findings_buf.clear();
-    }
-
-    /// Returns the adapter-owned path arena.
-    #[must_use]
-    pub fn path_arena(&self) -> &ByteArena {
-        &self.path_arena
     }
 
     /// Reserves capacity for upcoming blob results.
@@ -252,18 +234,13 @@ impl<'a> EngineAdapter<'a> {
     /// packed candidates.
     ///
     /// # Errors
-    /// - `PathTooLong` or `PathArenaFull` if the path cannot be interned.
     /// - `FindingOffsetOverflow` or `FindingArenaOverflow` for oversized blobs.
     pub fn emit_loose(
         &mut self,
         candidate: &LooseCandidate,
-        path: &[u8],
+        _path: &[u8],
         bytes: &[u8],
     ) -> Result<(), PackExecError> {
-        let path_ref = self.intern_path(path)?;
-        let mut ctx = candidate.ctx;
-        ctx.path_ref = path_ref;
-
         let file_id = FileId(self.next_file_id);
         self.next_file_id = self.next_file_id.wrapping_add(1);
 
@@ -271,25 +248,10 @@ impl<'a> EngineAdapter<'a> {
         let span = self.record_findings()?;
         self.results.push(ScannedBlob {
             oid: candidate.oid,
-            ctx,
+            ctx: candidate.ctx,
             findings: span,
         });
         Ok(())
-    }
-
-    fn intern_path(&mut self, path: &[u8]) -> Result<ByteRef, EngineAdapterError> {
-        if path.len() > ByteRef::MAX_LEN as usize {
-            return Err(EngineAdapterError::PathTooLong {
-                len: path.len(),
-                max: ByteRef::MAX_LEN,
-            });
-        }
-        self.path_arena
-            .intern(path)
-            .ok_or(EngineAdapterError::PathArenaFull {
-                needed: path.len(),
-                remaining: self.path_arena.remaining(),
-            })
     }
 
     fn scan_blob_into_buf(
@@ -330,13 +292,9 @@ impl PackObjectSink for EngineAdapter<'_> {
     fn emit(
         &mut self,
         candidate: &PackCandidate,
-        path: &[u8],
+        _path: &[u8],
         bytes: &[u8],
     ) -> Result<(), PackExecError> {
-        let path_ref = self.intern_path(path)?;
-        let mut ctx = candidate.ctx;
-        ctx.path_ref = path_ref;
-
         let file_id = FileId(self.next_file_id);
         self.next_file_id = self.next_file_id.wrapping_add(1);
 
@@ -344,7 +302,7 @@ impl PackObjectSink for EngineAdapter<'_> {
         let span = self.record_findings()?;
         self.results.push(ScannedBlob {
             oid: candidate.oid,
-            ctx,
+            ctx: candidate.ctx,
             findings: span,
         });
         Ok(())
@@ -378,6 +336,10 @@ pub fn scan_blob_chunked(
     Ok(out)
 }
 
+/// Clamp requested chunk sizes for overlap and offset safety.
+///
+/// Ensures `chunk_bytes > overlap` and caps the result at `u32::MAX` so
+/// finding offsets can safely downcast to `u32`.
 fn effective_chunk_bytes(requested: usize, overlap: usize) -> usize {
     // Enforce progress and clamp to u32::MAX for offset conversion safety.
     // Finding offsets are stored as `u32`, so chunking must preserve bounds.
@@ -404,6 +366,10 @@ fn scan_blob_chunked_into(
 }
 
 /// Scan a blob using a reusable chunker and optional allocation guard.
+///
+/// The chunker is reset before use and must have the same overlap as the
+/// caller-provided `overlap`. `out` is cleared and populated with sorted,
+/// deduped findings.
 ///
 /// When the debug allocation guard is enabled, `assert_no_alloc()` is called
 /// after the scan to verify no heap allocations occurred in the hot path.
@@ -544,6 +510,9 @@ impl RingChunker {
         self.is_first = true;
     }
 
+    /// Stream data into fixed windows and invoke the callback per full chunk.
+    ///
+    /// Each window is `chunk_bytes` long and includes the overlap prefix.
     fn feed(&mut self, mut data: &[u8], mut on_chunk: impl FnMut(ChunkView<'_>)) {
         while !data.is_empty() {
             let space = self.chunk_bytes - self.filled;
@@ -574,6 +543,7 @@ impl RingChunker {
         }
     }
 
+    /// Emit the final partial chunk (if any), then reset internal state.
     fn flush(&mut self, mut on_chunk: impl FnMut(ChunkView<'_>)) {
         if self.filled == 0 {
             return;
@@ -589,5 +559,47 @@ impl RingChunker {
             window: &self.buf[..self.filled],
         });
         self.reset();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git_scan::alloc_guard;
+    use crate::git_scan::pack_candidates::LooseCandidate;
+    use crate::git_scan::tree_candidate::{CandidateContext, ChangeKind};
+    use crate::git_scan::ByteRef;
+    use crate::{demo_engine_with_anchor_mode, AnchorMode};
+
+    #[test]
+    fn scan_alloc_guard_no_alloc_after_warmup() {
+        let engine = demo_engine_with_anchor_mode(AnchorMode::Manual);
+        let mut adapter = EngineAdapter::new(&engine, EngineAdapterConfig::default());
+
+        let ctx = CandidateContext {
+            commit_id: 0,
+            parent_idx: 0,
+            change_kind: ChangeKind::Add,
+            ctx_flags: 0,
+            cand_flags: 0,
+            path_ref: ByteRef::new(0, 0),
+        };
+        let candidate = LooseCandidate {
+            oid: OidBytes::from_slice(&[0u8; 20]),
+            ctx,
+        };
+        let path = b"test.txt";
+        let blob = b"no findings here";
+
+        alloc_guard::set_enabled(false);
+        adapter
+            .emit_loose(&candidate, path, blob)
+            .expect("warmup scan");
+
+        alloc_guard::set_enabled(true);
+        adapter
+            .emit_loose(&candidate, path, blob)
+            .expect("guarded scan");
+        alloc_guard::set_enabled(false);
     }
 }

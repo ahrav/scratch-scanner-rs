@@ -47,14 +47,21 @@ impl<R: Read> RunReader<R> {
         self.header
     }
 
-    /// Reads the next record, or `Ok(None)` at end of run.
+    /// Returns the maximum allowed path length.
+    #[must_use]
+    pub const fn max_path_len(&self) -> u16 {
+        self.max_path_len
+    }
+
+    /// Reads the next record into the provided scratch buffer.
     ///
-    /// # Errors
-    /// Returns `CorruptRunFile` on unexpected EOF or malformed fields, and
-    /// `RunPathTooLong` if the path exceeds `max_path_len`.
-    pub fn next_record(&mut self) -> Result<Option<RunRecord>, SpillError> {
+    /// The supplied `record` is overwritten in-place; its path buffer is
+    /// resized to the exact encoded length.
+    ///
+    /// Returns `Ok(false)` when the run is exhausted.
+    pub fn read_next_into(&mut self, record: &mut RunRecord) -> Result<bool, SpillError> {
         if self.remaining == 0 {
-            return Ok(None);
+            return Ok(false);
         }
 
         let oid = self.read_oid()?;
@@ -78,22 +85,34 @@ impl<R: Read> RunReader<R> {
                 max: self.max_path_len as usize,
             });
         }
-        let mut path = vec![0u8; path_len as usize];
-        self.read_exact(&mut path)?;
+
+        record.oid = oid;
+        record.ctx = RunContext {
+            commit_id,
+            parent_idx,
+            change_kind,
+            ctx_flags,
+            cand_flags,
+        };
+        record.path.clear();
+        record.path.resize(path_len as usize, 0);
+        self.read_exact(&mut record.path)?;
 
         self.remaining -= 1;
+        Ok(true)
+    }
 
-        Ok(Some(RunRecord {
-            oid,
-            ctx: RunContext {
-                commit_id,
-                parent_idx,
-                change_kind,
-                ctx_flags,
-                cand_flags,
-            },
-            path,
-        }))
+    /// Reads the next record, or `Ok(None)` at end of run.
+    ///
+    /// # Errors
+    /// Returns `CorruptRunFile` on unexpected EOF or malformed fields, and
+    /// `RunPathTooLong` if the path exceeds `max_path_len`.
+    pub fn next_record(&mut self) -> Result<Option<RunRecord>, SpillError> {
+        let mut record = RunRecord::scratch(self.header.oid_len, self.max_path_len as usize);
+        if !self.read_next_into(&mut record)? {
+            return Ok(None);
+        }
+        Ok(Some(record))
     }
 
     fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), SpillError> {
@@ -123,8 +142,9 @@ impl<R: Read> RunReader<R> {
     }
 
     fn read_oid(&mut self) -> Result<OidBytes, SpillError> {
-        let mut buf = vec![0u8; self.header.oid_len as usize];
-        self.read_exact(&mut buf)?;
-        OidBytes::try_from_slice(&buf).ok_or(SpillError::InvalidRunHeader)
+        let mut buf = [0u8; OidBytes::MAX_LEN as usize];
+        let len = self.header.oid_len as usize;
+        self.read_exact(&mut buf[..len])?;
+        OidBytes::try_from_slice(&buf[..len]).ok_or(SpillError::InvalidRunHeader)
     }
 }

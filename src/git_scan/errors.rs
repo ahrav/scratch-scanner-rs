@@ -191,7 +191,7 @@ pub enum TreeDiffError {
     InvalidOidLength { len: usize, expected: usize },
     /// Maximum tree recursion depth exceeded.
     MaxTreeDepthExceeded { max_depth: u16 },
-    /// Total tree bytes budget exceeded.
+    /// In-flight tree bytes budget exceeded.
     TreeBytesBudgetExceeded { loaded: u64, budget: u64 },
     /// Path exceeds length limit.
     PathTooLong { len: usize, max: usize },
@@ -199,6 +199,12 @@ pub enum TreeDiffError {
     CandidateBufferFull,
     /// Path arena capacity exceeded.
     PathArenaFull,
+    /// Candidate cap exceeded.
+    CandidateLimitExceeded {
+        kind: MappingCandidateKind,
+        max: u32,
+        observed: u32,
+    },
     /// Candidate sink failed.
     CandidateSinkError { detail: String },
     /// Object store failure (MIDX, pack, or loose object decode).
@@ -220,7 +226,7 @@ impl fmt::Display for TreeDiffError {
             Self::TreeBytesBudgetExceeded { loaded, budget } => {
                 write!(
                     f,
-                    "tree bytes budget exceeded: loaded {loaded}, budget {budget}"
+                    "tree bytes in-flight budget exceeded: loaded {loaded}, budget {budget}"
                 )
             }
             Self::PathTooLong { len, max } => {
@@ -228,6 +234,14 @@ impl fmt::Display for TreeDiffError {
             }
             Self::CandidateBufferFull => write!(f, "candidate buffer full"),
             Self::PathArenaFull => write!(f, "path arena full"),
+            Self::CandidateLimitExceeded {
+                kind,
+                max,
+                observed,
+            } => write!(
+                f,
+                "candidate limit exceeded: kind={kind} observed={observed} max={max}"
+            ),
             Self::CandidateSinkError { detail } => write!(f, "candidate sink error: {detail}"),
             Self::ObjectStoreError { detail } => write!(f, "object store error: {detail}"),
         }

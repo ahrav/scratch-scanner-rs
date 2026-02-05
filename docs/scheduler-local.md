@@ -100,8 +100,7 @@ File size is captured at `open()` time via `metadata().len()`. This means:
 When archive scanning is enabled, each file is classified by extension and
 optional header sniffing. Archive candidates are routed to archive handling
 paths (and otherwise scanned as regular files).
-See `docs/archive-scanning-plan.md` and `docs/archive-review-checklist.md`
-for the archive path semantics and hardening expectations.
+See `src/archive/` for the archive path semantics and hardening expectations.
 
 ### Work-Conserving Semantics
 

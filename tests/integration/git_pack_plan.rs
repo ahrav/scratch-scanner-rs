@@ -1,3 +1,10 @@
+//! Integration tests for pack planning against synthetic pack bytes.
+//!
+//! These tests construct minimal PACK buffers with explicit delta chains so
+//! the pack planner can be validated without relying on real repositories.
+//! The PACK trailers are dummy-sized (OID length only); checksums are not
+//! verified by the planner.
+
 use std::collections::HashMap;
 
 use scanner_rs::git_scan::{
@@ -35,6 +42,7 @@ fn ctx() -> CandidateContext {
     }
 }
 
+/// Encodes a minimal pack object header for the given type/size.
 fn encode_obj_header(obj_type: u8, mut size: u64) -> Vec<u8> {
     let mut out = Vec::new();
     let mut first = ((obj_type & 0x07) << 4) | ((size & 0x0f) as u8);
@@ -54,6 +62,7 @@ fn encode_obj_header(obj_type: u8, mut size: u64) -> Vec<u8> {
     out
 }
 
+/// Encodes an OFS_DELTA base distance using Git's pack format.
 fn encode_ofs_distance(mut dist: u64) -> Vec<u8> {
     assert!(dist > 0);
     let mut bytes = Vec::new();
@@ -68,6 +77,7 @@ fn encode_ofs_distance(mut dist: u64) -> Vec<u8> {
     bytes
 }
 
+/// Builds a minimal PACK buffer with room for the trailing checksum bytes.
 fn build_pack(oid_len: usize, entries: &[(u64, Vec<u8>)]) -> Vec<u8> {
     let mut max_end = 12u64;
     for (offset, bytes) in entries {
@@ -127,8 +137,9 @@ fn ofs_delta_chain_includes_base_closure() {
         ..Default::default()
     };
 
-    let plan =
-        unpack_plan(build_pack_plans(&[cand], &[pack_view], &NoopResolver, &config).unwrap());
+    let plan = unpack_plan(
+        build_pack_plans(vec![cand], &[Some(pack_view)], &NoopResolver, &config).unwrap(),
+    );
     assert_eq!(
         plan.need_offsets,
         vec![base_offset, delta1_offset, delta2_offset]
@@ -169,8 +180,9 @@ fn ofs_delta_chain_respects_depth_limit() {
         ..Default::default()
     };
 
-    let plan =
-        unpack_plan(build_pack_plans(&[cand], &[pack_view], &NoopResolver, &config).unwrap());
+    let plan = unpack_plan(
+        build_pack_plans(vec![cand], &[Some(pack_view)], &NoopResolver, &config).unwrap(),
+    );
     assert_eq!(plan.need_offsets, vec![delta1_offset, delta2_offset]);
 }
 
@@ -202,7 +214,7 @@ fn worklist_limit_exceeded_on_delta_expansion() {
         ..Default::default()
     };
 
-    let err = build_pack_plans(&[cand], &[pack_view], &NoopResolver, &config).unwrap_err();
+    let err = build_pack_plans(vec![cand], &[Some(pack_view)], &NoopResolver, &config).unwrap_err();
     assert!(matches!(
         err,
         PackPlanError::WorklistLimitExceeded {
@@ -237,7 +249,13 @@ fn ref_delta_inside_pack_is_resolved() {
     };
 
     let plan = unpack_plan(
-        build_pack_plans(&[cand], &[pack_view], &resolver, &PackPlanConfig::default()).unwrap(),
+        build_pack_plans(
+            vec![cand],
+            &[Some(pack_view)],
+            &resolver,
+            &PackPlanConfig::default(),
+        )
+        .unwrap(),
     );
     assert_eq!(plan.need_offsets, vec![base_offset, ref_offset]);
 
@@ -275,7 +293,13 @@ fn ref_delta_outside_pack_is_external() {
     };
 
     let plan = unpack_plan(
-        build_pack_plans(&[cand], &[pack_view], &resolver, &PackPlanConfig::default()).unwrap(),
+        build_pack_plans(
+            vec![cand],
+            &[Some(pack_view)],
+            &resolver,
+            &PackPlanConfig::default(),
+        )
+        .unwrap(),
     );
     assert_eq!(plan.need_offsets, vec![ref_offset]);
     assert_eq!(plan.stats.external_bases, 1);
@@ -311,8 +335,8 @@ fn ref_delta_missing_base_is_external() {
 
     let plan = unpack_plan(
         build_pack_plans(
-            &[cand],
-            &[pack_view],
+            vec![cand],
+            &[Some(pack_view)],
             &NoopResolver,
             &PackPlanConfig::default(),
         )
@@ -355,7 +379,7 @@ fn ref_delta_base_lookup_limit_enforced() {
         ..Default::default()
     };
 
-    let err = build_pack_plans(&[cand], &[pack_view], &NoopResolver, &config).unwrap_err();
+    let err = build_pack_plans(vec![cand], &[Some(pack_view)], &NoopResolver, &config).unwrap_err();
     assert!(matches!(
         err,
         PackPlanError::BaseLookupLimitExceeded {

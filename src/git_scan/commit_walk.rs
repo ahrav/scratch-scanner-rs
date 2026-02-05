@@ -162,6 +162,24 @@ impl CommitGraphView {
         );
         Ok(oid)
     }
+
+    /// Returns the commit OID for the commit at `pos`.
+    pub fn commit_oid(&self, pos: Position) -> Result<OidBytes, CommitPlanError> {
+        let commit = self.commit(pos);
+        let oid = OidBytes::from_slice(commit.id().as_bytes());
+        debug_assert_eq!(
+            oid.len(),
+            self.object_format.oid_len(),
+            "commit oid length mismatch"
+        );
+        Ok(oid)
+    }
+
+    /// Returns the committer timestamp (seconds since epoch) for the commit at `pos`.
+    #[inline(always)]
+    pub fn committer_timestamp(&self, pos: Position) -> u64 {
+        self.commit(pos).committer_timestamp()
+    }
 }
 
 impl CommitGraph for CommitGraphView {

@@ -7,13 +7,17 @@
 //! # Requirements
 //! - Each input run must already be sorted by `RunRecord` ordering.
 //! - All runs must use the same OID length.
+//!
+//! # Dedupe
+//! Duplicate records across runs become adjacent in the merged order, so the
+//! merger only compares against the last emitted record.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::io::Read;
 
 use super::errors::SpillError;
-use super::run_format::{RunHeader, RunRecord};
+use super::run_format::{RunContext, RunHeader, RunRecord};
 use super::run_reader::RunReader;
 
 /// K-way merge reader for spill runs.
@@ -21,14 +25,25 @@ use super::run_reader::RunReader;
 /// The merger performs dedupe by suppressing adjacent equal records in the
 /// merged order.
 pub struct RunMerger<R: Read> {
+    /// Per-run readers and their scratch buffers.
     cursors: Vec<RunCursor<R>>,
+    /// Min-heap of the next record from each cursor.
     heap: BinaryHeap<HeapItem>,
-    last: Option<RunRecord>,
+    /// Key of the last emitted record for dedupe.
+    last: Option<RunRecordKey>,
+    /// Current record returned to the caller (reused across calls).
+    current: Option<RunRecord>,
+    /// Cursor index that produced `current`; advanced on the next call.
+    pending_cursor: Option<usize>,
+    /// Shared OID length for all runs.
     oid_len: u8,
 }
 
 impl<R: Read> RunMerger<R> {
     /// Creates a new merger from run readers.
+    ///
+    /// Each reader contributes a single scratch record to minimize per-record
+    /// allocations; records are reused as the cursor advances.
     ///
     /// # Errors
     /// Returns `OidLengthMismatch` if run headers disagree on OID length.
@@ -50,9 +65,9 @@ impl<R: Read> RunMerger<R> {
                 _ => {}
             }
 
-            let mut cursor = RunCursor { reader, next: None };
-            cursor.advance()?;
-            if let Some(record) = cursor.next.take() {
+            let mut cursor = RunCursor { reader };
+            let scratch = RunRecord::scratch(header.oid_len, cursor.reader.max_path_len() as usize);
+            if let Some(record) = cursor.advance_with(scratch)? {
                 heap.push(HeapItem {
                     record,
                     cursor: idx,
@@ -65,6 +80,8 @@ impl<R: Read> RunMerger<R> {
             cursors,
             heap,
             last: None,
+            current: None,
+            pending_cursor: None,
             oid_len: oid_len.unwrap_or(20),
         })
     }
@@ -77,42 +94,101 @@ impl<R: Read> RunMerger<R> {
 
     /// Returns the next unique record, or `Ok(None)` when exhausted.
     ///
+    /// The returned reference is valid until the next call, when the internal
+    /// scratch record may be reused.
+    ///
     /// The dedupe logic only compares against the last emitted record, which
     /// is sufficient because inputs are globally ordered.
-    pub fn next_unique(&mut self) -> Result<Option<RunRecord>, SpillError> {
+    pub fn next_unique(&mut self) -> Result<Option<&RunRecord>, SpillError> {
+        if let Some(cursor_idx) = self.pending_cursor.take() {
+            if let Some(record) = self.current.take() {
+                if let Some(next) = self.cursors[cursor_idx].advance_with(record)? {
+                    self.heap.push(HeapItem {
+                        record: next,
+                        cursor: cursor_idx,
+                    });
+                }
+            }
+        }
+
         while let Some(item) = self.heap.pop() {
             let cursor_idx = item.cursor;
             let record = item.record;
 
-            if let Some(next) = self.cursors[cursor_idx].advance()? {
-                self.heap.push(HeapItem {
-                    record: next,
-                    cursor: cursor_idx,
-                });
-            }
-
             if let Some(last) = &self.last {
-                if last == &record {
+                if last.matches(&record) {
+                    if let Some(next) = self.cursors[cursor_idx].advance_with(record)? {
+                        self.heap.push(HeapItem {
+                            record: next,
+                            cursor: cursor_idx,
+                        });
+                    }
                     continue;
                 }
             }
-            self.last = Some(record.clone());
-            return Ok(Some(record));
+
+            match &mut self.last {
+                Some(last) => last.update_from(&record),
+                None => self.last = Some(RunRecordKey::from_record(&record)),
+            }
+
+            self.current = Some(record);
+            self.pending_cursor = Some(cursor_idx);
+            return Ok(self.current.as_ref());
         }
+
         Ok(None)
     }
 }
 
 struct RunCursor<R: Read> {
+    /// Reader for a single run (expects sorted records).
     reader: RunReader<R>,
-    next: Option<RunRecord>,
 }
 
 impl<R: Read> RunCursor<R> {
-    fn advance(&mut self) -> Result<Option<RunRecord>, SpillError> {
-        let record = self.reader.next_record()?;
-        self.next = record.clone();
-        Ok(record)
+    /// Reads the next record into the provided buffer and returns it.
+    ///
+    /// The buffer is reused by the merger to avoid per-record allocations.
+    fn advance_with(&mut self, mut record: RunRecord) -> Result<Option<RunRecord>, SpillError> {
+        if self.reader.read_next_into(&mut record)? {
+            Ok(Some(record))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RunRecordKey {
+    oid: super::object_id::OidBytes,
+    ctx: RunContext,
+    path: Vec<u8>,
+}
+
+impl RunRecordKey {
+    /// Creates a key that owns the path bytes for dedupe comparisons.
+    fn from_record(record: &RunRecord) -> Self {
+        let mut path = Vec::with_capacity(record.path.len());
+        path.extend_from_slice(&record.path);
+        Self {
+            oid: record.oid,
+            ctx: record.ctx,
+            path,
+        }
+    }
+
+    /// Returns true if the record matches this key exactly.
+    fn matches(&self, record: &RunRecord) -> bool {
+        self.oid == record.oid && self.ctx == record.ctx && self.path == record.path
+    }
+
+    /// Updates the key to match the provided record.
+    fn update_from(&mut self, record: &RunRecord) {
+        self.oid = record.oid;
+        self.ctx = record.ctx;
+        self.path.clear();
+        self.path.extend_from_slice(&record.path);
     }
 }
 
@@ -125,6 +201,7 @@ struct HeapItem {
 impl Ord for HeapItem {
     fn cmp(&self, other: &Self) -> Ordering {
         // Reverse order for min-heap behavior.
+        // Tie-break on cursor index for deterministic ordering across runs.
         other
             .record
             .cmp(&self.record)
@@ -154,7 +231,7 @@ pub fn merge_all<R: Read>(readers: Vec<RunReader<R>>) -> Result<Vec<RunRecord>, 
     let mut merger = RunMerger::new(readers)?;
     let mut out = Vec::new();
     while let Some(record) = merger.next_unique()? {
-        out.push(record);
+        out.push(record.clone());
     }
     Ok(out)
 }
@@ -162,6 +239,7 @@ pub fn merge_all<R: Read>(readers: Vec<RunReader<R>>) -> Result<Vec<RunRecord>, 
 /// Validates headers for a set of run readers.
 ///
 /// Returns the shared OID length if all headers are consistent.
+/// Empty input defaults to 20.
 pub fn validate_headers(headers: &[RunHeader]) -> Result<u8, SpillError> {
     let mut oid_len = None;
     for header in headers {
