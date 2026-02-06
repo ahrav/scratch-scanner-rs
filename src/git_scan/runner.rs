@@ -32,61 +32,42 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
 
-use crate::scheduler::{alloc_stats, AllocStats, AllocStatsDelta};
+use crate::scheduler::AllocStatsDelta;
 use crate::Engine;
 
 use super::artifact_acquire::{
     acquire_commit_graph, acquire_midx, ArtifactAcquireError, ArtifactBuildLimits,
 };
-use super::blob_introducer::BlobIntroducer;
 use super::byte_arena::ByteArena;
 use super::commit_graph::CommitGraphIndex;
-use super::commit_walk::{introduced_by_plan, CommitGraph, ParentScratch, PlannedCommit};
+use super::commit_walk::introduced_by_plan;
 use super::commit_walk_limits::CommitWalkLimits;
-use super::engine_adapter::{EngineAdapter, EngineAdapterConfig, ScannedBlobs};
+use super::engine_adapter::{EngineAdapterConfig, ScannedBlobs};
 use super::errors::{CommitPlanError, PersistError, RepoOpenError, SpillError, TreeDiffError};
 use super::finalize::{build_finalize_ops, FinalizeInput, FinalizeOutput};
 use super::limits::RepoOpenLimits;
-use super::mapping_bridge::{MappingBridge, MappingBridgeConfig, MappingStats};
+use super::mapping_bridge::{MappingBridgeConfig, MappingStats};
 use super::midx::MidxView;
 use super::midx_error::MidxError;
 use super::object_id::OidBytes;
-use super::object_store::ObjectStore;
-use super::oid_index::OidIndex;
-use super::pack_cache::PackCache;
-use super::pack_candidates::{CappedPackCandidateSink, PackCandidateCollector};
 use super::pack_decode::PackDecodeLimits;
-use super::pack_exec::{
-    build_candidate_ranges, execute_pack_plan_with_scratch, execute_pack_plan_with_scratch_indices,
-    merge_pack_exec_reports, PackExecError, PackExecReport, PackExecScratch, SkipReason,
-};
-use super::pack_io::{PackIo, PackIoError, PackIoLimits};
-use super::pack_plan::{
-    bucket_pack_candidates, build_pack_plan_for_pack, build_pack_plans, PackPlanConfig,
-    PackPlanError,
-};
-use super::pack_plan_model::{PackPlan, PackPlanStats};
+use super::pack_exec::{PackExecError, PackExecReport, SkipReason};
+use super::pack_io::{PackIoError, PackIoLimits};
+use super::pack_plan::{PackPlanConfig, PackPlanError};
+use super::pack_plan_model::PackPlanStats;
 use super::persist::{persist_finalize_output, PersistenceStore};
 use super::policy_hash::MergeDiffMode;
 use super::repo_open::{repo_open, RefWatermarkStore, StartSetResolver};
 use super::seen_store::SeenBlobStore;
 use super::spill_limits::SpillLimits;
-use super::spiller::{SpillStats, Spiller};
+use super::spiller::SpillStats;
 use super::start_set::StartSetConfig;
-use super::tree_diff::{TreeDiffStats, TreeDiffWalker};
+use super::tree_diff::TreeDiffStats;
 use super::tree_diff_limits::TreeDiffLimits;
 
-use super::runner_exec::{
-    append_scanned_blobs, build_exec_indices, build_pack_views, build_ref_entries,
-    collect_loose_dirs, collect_pack_dirs, collect_skipped_candidates, estimate_pack_cache_bytes,
-    estimate_path_arena_capacity, list_pack_files, load_midx, make_spill_dir, merge_scanned_blobs,
-    mmap_pack_files, resolve_pack_paths, scan_loose_candidates, select_pack_exec_strategy,
-    shard_ranges, summarize_pack_plan_deps, PackExecStrategy, SpillCandidateSink,
-};
+use super::runner_exec::build_ref_entries;
 
 /// Limits for pack file mmapping during scan execution.
 #[derive(Clone, Copy, Debug)]
@@ -936,9 +917,6 @@ pub fn run_git_scan(
 ) -> Result<GitScanResult, GitScanError> {
     super::perf::reset();
 
-    let mut stage_nanos = GitScanStageNanos::default();
-    let mut alloc_deltas = GitScanAllocStats::default();
-
     let start_set_id = config.start_set.id();
     let mut repo = repo_open(
         repo_root,
@@ -959,81 +937,31 @@ pub fn run_git_scan(
         &config.artifact_build,
     )?;
 
-    if config.scan_mode == GitScanMode::OdbBlobFast {
-        let plan_start = Instant::now();
-        let plan = introduced_by_plan(&repo, &cg, config.commit_walk)?;
-        stage_nanos.commit_plan = plan_start.elapsed().as_nanos() as u64;
-        let cg_index = CommitGraphIndex::build(&cg)?;
-
-        let mut output = super::runner_odb_blob::run_odb_blob(
-            &repo, engine, seen_store, &cg_index, &plan, config,
-        )?;
-        output.stage_nanos.commit_plan = stage_nanos.commit_plan;
-
-        // Post-execution artifact check.
-        if !repo.artifacts_unchanged()? {
-            return Err(GitScanError::ConcurrentMaintenance);
-        }
-
-        // Finalize + persist.
-        let refs = build_ref_entries(&repo);
-        let skipped_candidate_oids = output
-            .skipped_candidates
-            .iter()
-            .map(|entry| entry.oid)
-            .collect();
-        let finalize = build_finalize_ops(FinalizeInput {
-            repo_id: config.repo_id,
-            policy_hash: config.policy_hash,
-            start_set_id,
-            refs,
-            scanned_blobs: output.scanned.blobs,
-            finding_arena: &output.scanned.finding_arena,
-            skipped_candidate_oids,
-            path_arena: &output.path_arena,
-        });
-
-        if let Some(store) = persist_store {
-            persist_finalize_output(store, &finalize)?;
-        }
-
-        let perf_stats = super::perf::snapshot();
-        output.stage_nanos.mapping = perf_stats.mapping_nanos;
-        output.stage_nanos.scan = perf_stats.scan_nanos;
-
-        return Ok(GitScanResult(GitScanReport {
-            commit_count: plan.len(),
-            tree_diff_stats: output.tree_diff_stats,
-            spill_stats: output.spill_stats,
-            mapping_stats: output.mapping_stats,
-            pack_plan_stats: output.pack_plan_stats,
-            pack_plan_config: output.pack_plan_config,
-            pack_plan_delta_deps_total: output.pack_plan_delta_deps_total,
-            pack_plan_delta_deps_max: output.pack_plan_delta_deps_max,
-            pack_exec_reports: output.pack_exec_reports,
-            skipped_candidates: output.skipped_candidates,
-            finalize,
-            stage_nanos: output.stage_nanos,
-            perf_stats,
-            alloc_stats: output.alloc_stats,
-        }));
-    }
-
-    // Diff-history mode.
+    // Commit plan (shared across both modes).
     let plan_start = Instant::now();
     let plan = introduced_by_plan(&repo, &cg, config.commit_walk)?;
-    stage_nanos.commit_plan = plan_start.elapsed().as_nanos() as u64;
+    let commit_plan_nanos = plan_start.elapsed().as_nanos() as u64;
 
-    let mut output = super::runner_diff_history::run_diff_history(
-        &repo, engine, seen_store, &cg, &plan, config,
-    )?;
-    output.stage_nanos.commit_plan = stage_nanos.commit_plan;
+    // Dispatch to mode-specific pipeline.
+    let mut output = match config.scan_mode {
+        GitScanMode::OdbBlobFast => {
+            let cg_index = CommitGraphIndex::build(&cg)?;
+            super::runner_odb_blob::run_odb_blob(
+                &repo, engine, seen_store, &cg_index, &plan, config,
+            )?
+        }
+        GitScanMode::DiffHistory => super::runner_diff_history::run_diff_history(
+            &repo, engine, seen_store, &cg, &plan, config,
+        )?,
+    };
+    output.stage_nanos.commit_plan = commit_plan_nanos;
 
-    // Post-execution artifact check.
+    // Post-execution artifact stability check.
     if !repo.artifacts_unchanged()? {
         return Err(GitScanError::ConcurrentMaintenance);
     }
 
+    // Finalize + persist.
     let refs = build_ref_entries(&repo);
     let skipped_candidate_oids = output
         .skipped_candidates
@@ -1055,6 +983,7 @@ pub fn run_git_scan(
         persist_finalize_output(store, &finalize)?;
     }
 
+    // Perf snapshot + report.
     let perf_stats = super::perf::snapshot();
     output.stage_nanos.mapping = perf_stats.mapping_nanos;
     output.stage_nanos.scan = perf_stats.scan_nanos;
