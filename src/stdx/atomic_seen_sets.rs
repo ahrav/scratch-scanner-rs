@@ -215,18 +215,18 @@ mod loom_tests {
 }
 
 // ---------------------------------------------------------------------------
-// Miri / concurrent smoke tests
+// Concurrent smoke tests (also valid under Miri / cargo miri test)
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod miri_tests {
+mod concurrent_tests {
     use super::*;
     use std::sync::Arc;
     use std::thread;
 
     /// 4 threads concurrently marking all three bitsets.
     #[test]
-    fn miri_concurrent_all_three_bitsets() {
+    fn concurrent_all_three_bitsets() {
         let seen = Arc::new(AtomicSeenSets::new(64, 64));
         let handles: Vec<_> = (0..4)
             .map(|t| {
@@ -253,7 +253,7 @@ mod miri_tests {
 
     /// Threads targeting different bitsets (trees vs blobs).
     #[test]
-    fn miri_threads_target_different_bitsets() {
+    fn threads_target_different_bitsets() {
         let seen = Arc::new(AtomicSeenSets::new(64, 64));
         let seen2 = seen.clone();
         let seen3 = seen.clone();
@@ -280,7 +280,7 @@ mod miri_tests {
 
     /// Threads targeting same bitset with overlapping indices.
     #[test]
-    fn miri_overlapping_indices_same_bitset() {
+    fn overlapping_indices_same_bitset() {
         let seen = Arc::new(AtomicSeenSets::new(16, 16));
         let handles: Vec<_> = (0..4)
             .map(|_| {
@@ -303,7 +303,7 @@ mod miri_tests {
 
     /// Clear after concurrent sets.
     #[test]
-    fn miri_clear_after_concurrent_sets() {
+    fn clear_after_concurrent_sets() {
         let seen = Arc::new(AtomicSeenSets::new(64, 64));
         let handles: Vec<_> = (0..4)
             .map(|t| {
