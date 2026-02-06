@@ -24,8 +24,8 @@ pub use detect::{
     sniff_kind_from_header, ArchiveKind,
 };
 pub use outcome::{
-    ArchiveSample, ArchiveSampleRing, ArchiveSkipReason, ArchiveStats,
-    EntrySkipReason, PartialReason, SampleKind, ARCHIVE_SAMPLE_MAX, ARCHIVE_SAMPLE_PATH_PREFIX_MAX,
+    ArchiveSample, ArchiveSampleRing, ArchiveSkipReason, ArchiveStats, EntrySkipReason,
+    PartialReason, SampleKind, ARCHIVE_SAMPLE_MAX, ARCHIVE_SAMPLE_PATH_PREFIX_MAX,
 };
 pub use path::{
     CanonicalPath, EntryPathCanonicalizer, VirtualPath, VirtualPathBuilder, DEFAULT_MAX_COMPONENTS,

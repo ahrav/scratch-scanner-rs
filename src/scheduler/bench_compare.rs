@@ -481,7 +481,6 @@ impl BenchBaseline {
         baseline.config_fingerprint = Some(config_fingerprint.into());
         baseline
     }
-
 }
 
 /// Get current Unix timestamp as string.
