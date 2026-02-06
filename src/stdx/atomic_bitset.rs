@@ -49,6 +49,15 @@ pub struct AtomicBitSet {
 unsafe impl Send for AtomicBitSet {}
 unsafe impl Sync for AtomicBitSet {}
 
+impl std::fmt::Debug for AtomicBitSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AtomicBitSet")
+            .field("bit_length", &self.bit_length)
+            .field("count", &self.count())
+            .finish()
+    }
+}
+
 impl AtomicBitSet {
     /// Creates an empty bitset with capacity for `bit_length` bits, all
     /// initialized to zero.

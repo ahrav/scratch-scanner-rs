@@ -13,6 +13,7 @@
 //!
 //! # Module map
 //! - `atomic_bitset`: lock-free bitset with atomic test-and-set for concurrent dedup.
+//! - `atomic_seen_sets`: composite concurrent dedup tracker wrapping three `AtomicBitSet`s.
 //! - `bitset`: fixed-size and dynamic bitsets with word-level operations.
 //! - `byte_ring`: internal byte ring keyed by absolute stream offsets.
 //! - `fixed_set`: fixed-capacity hash set with epoch-based O(1) reset.
@@ -26,6 +27,7 @@
 //! their module docs. Read those before extending or reusing the internals.
 
 pub mod atomic_bitset;
+pub mod atomic_seen_sets;
 pub mod bitset;
 pub mod byte_ring;
 pub mod fastrange;
@@ -36,6 +38,7 @@ pub mod ring_buffer;
 pub mod timing_wheel;
 
 pub use atomic_bitset::AtomicBitSet;
+pub use atomic_seen_sets::AtomicSeenSets;
 pub use bitset::{words_for_bits, DynamicBitSet, DynamicBitSetIterator};
 pub(crate) use byte_ring::ByteRing;
 pub use fixed_set::FixedSet128;
