@@ -126,8 +126,6 @@ impl AtomicBitSet {
     #[inline]
     pub fn count(&self) -> usize {
         let len = self.words.len();
-
-        let len = self.words.len();
         let mut total = 0usize;
 
         // All words except the last — no masking needed.
