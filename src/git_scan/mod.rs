@@ -79,6 +79,7 @@ pub mod run_format;
 pub mod run_reader;
 pub mod run_writer;
 pub mod runner;
+pub mod runner_diff_history;
 pub mod runner_exec;
 pub mod runner_odb_blob;
 pub mod seen_store;
