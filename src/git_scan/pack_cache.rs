@@ -11,8 +11,13 @@ use super::pack_inflate::ObjectKind;
 
 /// Default slot size for small cached pack objects (64 KiB).
 const DEFAULT_SMALL_SLOT_SIZE: u32 = 64 * 1024;
-/// Default slot size for large cached pack objects (512 KiB).
-const DEFAULT_LARGE_SLOT_SIZE: u32 = 512 * 1024;
+/// Default slot size for large cached pack objects (2 MiB).
+///
+/// Objects between 64 KiB and 2 MiB (common delta bases in large repos) are
+/// cached in the large tier. The previous 512 KiB limit silently rejected
+/// popular bases in the 512 KiB–2 MiB range, causing repeated fallback
+/// decodes and degraded cache hit rates on large repositories.
+const DEFAULT_LARGE_SLOT_SIZE: u32 = 2 * 1024 * 1024;
 /// Minimum bytes reserved for the large tier when enabled.
 const MIN_LARGE_TIER_BYTES: u32 = 32 * 1024 * 1024;
 /// Minimum slot size (prevents tiny, inefficient caches).
@@ -20,12 +25,22 @@ const MIN_SLOT_SIZE: u32 = 1024;
 /// Number of ways per set.
 const WAYS: usize = 4;
 
+/// Metadata for one cache slot within a set-associative tier.
+///
+/// Each slot maps a pack offset to a contiguous region in the tier's
+/// backing `storage` buffer. The `clock` bit drives CLOCK eviction:
+/// it is set on access and cleared during victim selection sweeps.
 #[derive(Clone, Copy, Debug)]
 struct Slot {
+    /// Pack-file byte offset that identifies this entry.
     offset: u64,
+    /// Inflated object length stored in the slot (may be less than `slot_size`).
     len: u32,
+    /// Git object type (blob, tree, commit, tag).
     kind: ObjectKind,
+    /// CLOCK reference bit: 1 = recently accessed, 0 = eligible for eviction.
     clock: u8,
+    /// Whether this slot contains a valid entry.
     valid: bool,
 }
 
@@ -181,13 +196,23 @@ impl PackCacheTier {
         }
     }
 
+    /// Maps a pack offset to a set index via [`hash_offset`] and a bitmask.
+    ///
+    /// Requires `self.sets` to be a power of two so the mask `sets - 1`
+    /// produces a uniform distribution over set indices.
     #[inline]
     fn set_index(&self, offset: u64) -> usize {
         let hash = hash_offset(offset);
         hash as usize & (self.sets - 1)
     }
 
-    /// Selects a victim slot using CLOCK within a set.
+    /// Selects a victim slot within a set using the CLOCK algorithm.
+    ///
+    /// Scans the set starting from the persisted hand position. Slots with
+    /// `clock == 0` (or invalid) are immediately chosen as victims. Slots
+    /// with `clock == 1` have their bit cleared ("second chance") and the
+    /// hand advances. If all `WAYS` slots survive a full sweep, the slot
+    /// under the hand after the sweep is evicted unconditionally.
     fn select_victim(&mut self, base: usize, set: usize) -> usize {
         let mut hand = self.clock_hands[set] as usize % WAYS;
         for _ in 0..WAYS {
@@ -218,6 +243,8 @@ impl PackCacheTier {
         slot.valid = true;
     }
 
+    /// Returns `true` if this tier was initialized in a disabled state
+    /// (zero sets) and will always miss on lookups.
     #[inline]
     fn is_disabled(&self) -> bool {
         self.sets == 0
@@ -254,7 +281,11 @@ impl PackCache {
             return Self::single_tier(capacity_bytes, DEFAULT_SMALL_SLOT_SIZE);
         }
 
-        let mut large_bytes = (capacity_bytes / 4).max(MIN_LARGE_TIER_BYTES);
+        // Give the large tier half the budget so it can hold enough 2 MiB
+        // slots for good hash distribution (e.g. 32 MiB → 16 slots at 64 MiB
+        // total).  The previous 1/4 split left too few large slots when the
+        // slot size was raised from 512 KiB to 2 MiB.
+        let mut large_bytes = (capacity_bytes / 2).max(MIN_LARGE_TIER_BYTES);
         if large_bytes > capacity_bytes {
             large_bytes = capacity_bytes;
         }
@@ -312,6 +343,8 @@ impl PackCache {
         false
     }
 
+    /// Builds a cache with only the small tier enabled, using the full
+    /// capacity. Used when total capacity is below [`MIN_LARGE_TIER_BYTES`].
     fn single_tier(capacity_bytes: u32, slot_size: u32) -> Self {
         Self {
             small: PackCacheTier::new_with_slot(capacity_bytes, slot_size),
@@ -320,8 +353,12 @@ impl PackCache {
     }
 }
 
+/// Hashes a pack offset to a 32-bit value for set-index computation.
+///
+/// Uses the MurmurHash3 64-bit finalizer (fmix64) to spread sequential
+/// pack offsets uniformly across cache sets, then folds the 64-bit result
+/// to 32 bits with an XOR.
 fn hash_offset(offset: u64) -> u32 {
-    // 64-bit mix to spread nearby offsets across sets.
     let mut x = offset;
     x ^= x >> 33;
     x = x.wrapping_mul(0xff51afd7ed558ccd);
@@ -331,6 +368,11 @@ fn hash_offset(offset: u64) -> u32 {
     (x as u32) ^ ((x >> 32) as u32)
 }
 
+/// Rounds `value` down to the largest power of two ≤ `value`.
+///
+/// Returns 0 for an input of 0. Uses bit-smearing to fill all bits
+/// below the highest set bit, then subtracts the smeared value shifted
+/// right by one to isolate the leading bit.
 fn round_down_power_of_two_usize(mut value: usize) -> usize {
     if value == 0 {
         return 0;
@@ -346,6 +388,10 @@ fn round_down_power_of_two_usize(mut value: usize) -> usize {
     value - (value >> 1)
 }
 
+/// Rounds `value` down to the largest power of two ≤ `value`.
+///
+/// Returns 0 for an input of 0. 32-bit variant of
+/// [`round_down_power_of_two_usize`].
 fn round_down_power_of_two_u32(mut value: u32) -> u32 {
     if value == 0 {
         return 0;
@@ -375,8 +421,9 @@ mod tests {
 
     #[test]
     fn cache_large_tier_insert() {
+        // Large tier needs at least WAYS (4) × 2 MiB = 8 MiB for one set.
         let small = PackCacheTier::new_with_slot(256 * 1024, DEFAULT_SMALL_SLOT_SIZE);
-        let large = PackCacheTier::new_with_slot(2 * 1024 * 1024, DEFAULT_LARGE_SLOT_SIZE);
+        let large = PackCacheTier::new_with_slot(16 * 1024 * 1024, DEFAULT_LARGE_SLOT_SIZE);
         let mut cache = PackCache { small, large };
         let data = vec![0x22u8; 128 * 1024];
         assert!(cache.insert(200, ObjectKind::Blob, &data));

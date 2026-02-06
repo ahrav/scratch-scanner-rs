@@ -519,6 +519,33 @@ fn main() -> io::Result<()> {
                     "  chunker_bypass: {} ({:.1}%)  binary_skip: {}  prefilter_bypass: {} ({:.1}%)",
                     bypass, bypass_pct, binary_skip, prefilter_bypass, prefilter_bypass_pct
                 );
+
+                // Cache configuration.
+                let workers = config.pack_exec_workers;
+                let budget = config.pack_cache_bytes;
+                let total_cache = budget.saturating_mul(workers);
+                eprintln!("\ncache config:");
+                eprintln!("  budget_per_worker: {} MiB", budget / (1024 * 1024));
+                eprintln!("  workers: {}", workers);
+                eprintln!("  total_cache_memory: {} MiB", total_cache / (1024 * 1024));
+                eprintln!("  large_slot: 2 MiB");
+                eprintln!("  small_slot: 64 KiB");
+
+                // Cache reject histogram.
+                let cache_reject_hist = scanner_rs::git_scan::aggregate_cache_reject_histogram(
+                    &report.pack_exec_reports,
+                );
+                eprintln!("\ncache rejects:");
+                eprintln!("  total_rejects: {}", cache_reject_hist.rejects);
+                eprintln!(
+                    "  reject_bytes_total: {} KiB",
+                    cache_reject_hist.bytes_total / 1024
+                );
+                eprintln!(
+                    "  reject_bytes_max: {} KiB",
+                    cache_reject_hist.bytes_max / 1024
+                );
+                eprintln!("  top_buckets: {}", cache_reject_hist.format_top(5));
             }
             Ok(())
         }

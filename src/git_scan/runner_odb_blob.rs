@@ -25,9 +25,9 @@
 //!    - *Per-pack parallel* (`pack_count >= workers`): each worker pulls
 //!      whole pack plans from a shared work queue; results carry a sequence
 //!      number and are reassembled in plan order for determinism.
-//!    - *Intra-pack shard* (few packs, many candidates): the exec-index
-//!      array for each plan is split into contiguous shards so workers
-//!      share the same pack bytes but decode disjoint regions.
+//!    - *Underfilled worker pool* (`pack_count < workers`): the small plan
+//!      set is buffered, then a shared stats-free selector chooses serial
+//!      execution for tiny work or adaptive intra-pack sharding otherwise.
 //!
 //! 4. **Loose scan** -- loose object candidates that did not map to any
 //!    pack are scanned after all pack plans complete.
@@ -70,9 +70,10 @@ use super::tree_diff::TreeDiffStats;
 
 use super::runner_exec::{
     append_scanned_blobs, build_exec_indices, build_pack_views, collect_loose_dirs,
-    collect_pack_dirs, collect_skipped_candidates, estimate_pack_cache_bytes,
-    estimate_path_arena_capacity, list_pack_files, load_midx, make_spill_dir, merge_scanned_blobs,
-    mmap_pack_files, resolve_pack_paths, scan_loose_candidates, shard_ranges, SpillCandidateSink,
+    collect_pack_dirs, collect_skipped_candidates, estimate_path_arena_capacity, list_pack_files,
+    load_midx, make_spill_dir, merge_scanned_blobs, mmap_pack_files, per_worker_cache_bytes,
+    resolve_pack_paths, scan_loose_candidates, select_pack_exec_strategy, select_plan_shard_count,
+    shard_count_for_pack, shard_ranges, PackExecStrategy, SpillCandidateSink,
 };
 
 use super::repo_open::RepoJobState;
@@ -266,8 +267,12 @@ pub(super) fn run_odb_blob(
 
     // Execute pack plans + scan.
     let pack_exec_workers = config.pack_exec_workers.max(1);
-    let pack_cache_target =
-        estimate_pack_cache_bytes(config.pack_cache_bytes, &pack_mmaps, &used_pack_ids);
+    let pack_cache_target = per_worker_cache_bytes(
+        config.pack_cache_bytes,
+        &pack_mmaps,
+        &used_pack_ids,
+        config.pack_exec_workers,
+    );
     let pack_cache_bytes: u32 = pack_cache_target
         .try_into()
         .map_err(|_| io::Error::other("pack cache size exceeds u32::MAX"))?;
@@ -305,12 +310,12 @@ pub(super) fn run_odb_blob(
         let (mut buckets, pack_ids) = bucket_pack_candidates(packed.drain(..), pack_views.len())?;
         let pack_plan_count = pack_ids.len();
 
-        // Execution strategy selection:
-        //   - `pack_exec_workers == 1` → single-threaded (branch below)
-        //   - `pack_plan_count >= workers` → one pack per worker; each
-        //     worker gets exclusive sequential access to its pack bytes.
-        //   - otherwise → intra-pack sharding; workers share the same
-        //     pack mmap but decode disjoint exec-index ranges.
+        // Strategy preselection for streamed planning:
+        //   - `pack_exec_workers == 1` → single-threaded execution.
+        //   - `pack_plan_count >= workers` → one plan per worker, preserving
+        //     planning/execution overlap via the work queue.
+        //   - otherwise → collect the small plan set and run the shared
+        //     stats-free selector before execution.
         let prefer_pack_parallelism = pack_exec_workers > 1 && pack_plan_count >= pack_exec_workers;
 
         // Bounded(1) channel: the planner blocks after producing one plan
@@ -489,7 +494,7 @@ pub(super) fn run_odb_blob(
                                     })?
                                     .as_ref();
 
-                                adapter.reserve_results(plan.stats.candidate_count as usize);
+                                adapter.reserve_results(plan.candidate_offsets.len());
                                 let report = execute_pack_plan_with_scratch(
                                     &plan,
                                     pack_bytes,
@@ -577,12 +582,12 @@ pub(super) fn run_odb_blob(
                     skipped_candidates.extend(skipped);
                     append_scanned_blobs(&mut scanned, scanned_pack);
                 }
-            // ── Strategy C: intra-pack shard execution ─────────────
-            // Fewer packs than workers: partition each plan's exec-index
-            // array into contiguous shards so workers decode disjoint
-            // regions of the same pack.  Shard outputs are merged in
-            // shard-index order to preserve determinism.
+            // ── Strategy C: underfilled worker pool ────────────────
+            // Fewer plans than workers. Buffer this small plan set, run the
+            // shared stats-free selector, then execute either serially (tiny
+            // work) or with adaptive per-plan sharding.
             } else {
+                let mut queued_plans = Vec::with_capacity(pack_plan_count);
                 for plan in rx {
                     let plan = plan?;
                     pack_plan_stats.push(plan.stats);
@@ -590,123 +595,185 @@ pub(super) fn run_odb_blob(
                     pack_plan_delta_deps_total =
                         pack_plan_delta_deps_total.saturating_add(deps_len as u64);
                     pack_plan_delta_deps_max = pack_plan_delta_deps_max.max(deps_len);
+                    queued_plans.push(plan);
+                }
 
-                    start_pack_exec();
+                match select_pack_exec_strategy(pack_exec_workers, &queued_plans) {
+                    PackExecStrategy::Serial | PackExecStrategy::PackParallel => {
+                        if !queued_plans.is_empty() {
+                            start_pack_exec();
+                        }
+                        let mut cache = PackCache::new(pack_cache_bytes);
+                        let mut external = PackIo::from_parts(
+                            *midx,
+                            pack_paths.clone(),
+                            loose_dirs.clone(),
+                            config.pack_io,
+                        )
+                        .map_err(GitScanError::PackIo)?;
+                        let mut adapter = EngineAdapter::new(engine, config.engine_adapter);
+                        adapter.reserve_results(packed_len.saturating_add(loose_len));
+                        let mut exec_scratch = PackExecScratch::default();
+                        for plan in &queued_plans {
+                            let pack_id = plan.pack_id as usize;
+                            let pack_bytes = pack_mmaps
+                                .get(pack_id)
+                                .and_then(|mmap| mmap.as_ref())
+                                .ok_or(GitScanError::PackPlan(PackPlanError::PackIdOutOfRange {
+                                    pack_id: plan.pack_id,
+                                    pack_count: pack_mmaps.len(),
+                                }))?
+                                .as_ref();
 
-                    let plan_ref = &plan;
-                    let pack_id = plan_ref.pack_id as usize;
-                    let pack_bytes = pack_mmaps
-                        .get(pack_id)
-                        .and_then(|mmap| mmap.as_ref())
-                        .ok_or(GitScanError::PackPlan(PackPlanError::PackIdOutOfRange {
-                            pack_id: plan_ref.pack_id,
-                            pack_count: pack_mmaps.len(),
-                        }))?
-                        .as_ref();
-
-                    let exec_indices = build_exec_indices(plan_ref);
-                    if exec_indices.is_empty() {
-                        continue;
+                            let report = execute_pack_plan_with_scratch(
+                                plan,
+                                pack_bytes,
+                                &path_arena,
+                                &config.pack_decode,
+                                &mut cache,
+                                &mut external,
+                                &mut adapter,
+                                &spill_dir,
+                                &mut exec_scratch,
+                            )?;
+                            collect_skipped_candidates(
+                                plan,
+                                &report.skips,
+                                &mut skipped_candidates,
+                            );
+                            pack_exec_reports.push(report);
+                        }
+                        append_scanned_blobs(&mut scanned, adapter.take_results());
                     }
+                    PackExecStrategy::IntraPackSharded { shard_counts } => {
+                        for plan in &queued_plans {
+                            start_pack_exec();
 
-                    let mut candidate_ranges = Vec::new();
-                    build_candidate_ranges(plan_ref, &mut candidate_ranges);
+                            let plan_ref = plan;
+                            let pack_id = plan_ref.pack_id as usize;
+                            let pack_bytes = pack_mmaps
+                                .get(pack_id)
+                                .and_then(|mmap| mmap.as_ref())
+                                .ok_or(GitScanError::PackPlan(PackPlanError::PackIdOutOfRange {
+                                    pack_id: plan_ref.pack_id,
+                                    pack_count: pack_mmaps.len(),
+                                }))?
+                                .as_ref();
 
-                    let ranges = shard_ranges(exec_indices.len(), pack_exec_workers);
-                    let shard_outputs =
-                        std::thread::scope(
-                            |scope| -> Result<
-                                Vec<(usize, PackExecReport, ScannedBlobs)>,
-                                PackExecError,
-                            > {
-                                let mut handles = Vec::with_capacity(ranges.len());
-                                for (shard_idx, (start, end)) in ranges.iter().enumerate() {
-                                    let exec_slice = &exec_indices[*start..*end];
-                                    let candidate_ranges = &candidate_ranges;
-                                    let pack_paths = pack_paths.clone();
-                                    let loose_dirs = loose_dirs.clone();
-                                    let pack_decode = config.pack_decode;
-                                    let pack_io_limits = config.pack_io;
-                                    let adapter_cfg = config.engine_adapter;
-                                    let paths = &path_arena;
-                                    let spill_dir = &spill_dir;
+                            let exec_indices = build_exec_indices(plan_ref);
+                            if exec_indices.is_empty() {
+                                continue;
+                            }
 
-                                    handles.push(scope.spawn(move || {
-                                        let mut cache = PackCache::new(pack_cache_bytes);
-                                        let mut external = PackIo::from_parts(
-                                            *midx,
-                                            pack_paths,
-                                            loose_dirs,
-                                            pack_io_limits,
-                                        )
-                                        .map_err(|err| {
-                                            PackExecError::ExternalBase(err.to_string())
-                                        })?;
-                                        let mut adapter = EngineAdapter::new(engine, adapter_cfg);
-                                        let shard_candidates: usize = exec_slice
-                                            .iter()
-                                            .filter_map(|idx| {
-                                                candidate_ranges[*idx].map(|(s, e)| e - s)
-                                            })
-                                            .sum();
-                                        adapter.reserve_results(shard_candidates);
-                                        let mut scratch = PackExecScratch::default();
-                                        let report = execute_pack_plan_with_scratch_indices(
-                                            plan_ref,
-                                            pack_bytes,
-                                            paths,
-                                            &pack_decode,
-                                            &mut cache,
-                                            &mut external,
-                                            &mut adapter,
-                                            spill_dir,
-                                            &mut scratch,
-                                            exec_slice,
-                                            candidate_ranges,
-                                        )?;
-                                        Ok::<_, PackExecError>((
-                                            shard_idx,
-                                            report,
-                                            adapter.take_results(),
-                                        ))
-                                    }));
+                            let mut candidate_ranges = Vec::new();
+                            build_candidate_ranges(plan_ref, &mut candidate_ranges);
+
+                            let assigned_shards = {
+                                let assigned =
+                                    shard_count_for_pack(&shard_counts, plan_ref.pack_id);
+                                if assigned == 1 {
+                                    select_plan_shard_count(pack_exec_workers, plan_ref)
+                                } else {
+                                    assigned
                                 }
+                            };
+                            let ranges = shard_ranges(exec_indices.len(), assigned_shards);
+                            let shard_outputs = std::thread::scope(
+                                |scope| -> Result<
+                                    Vec<(usize, PackExecReport, ScannedBlobs)>,
+                                    PackExecError,
+                                > {
+                                    let mut handles = Vec::with_capacity(ranges.len());
+                                    for (shard_idx, (start, end)) in ranges.iter().enumerate() {
+                                        let exec_slice = &exec_indices[*start..*end];
+                                        let candidate_ranges = &candidate_ranges;
+                                        let pack_paths = pack_paths.clone();
+                                        let loose_dirs = loose_dirs.clone();
+                                        let pack_decode = config.pack_decode;
+                                        let pack_io_limits = config.pack_io;
+                                        let adapter_cfg = config.engine_adapter;
+                                        let paths = &path_arena;
+                                        let spill_dir = &spill_dir;
 
-                                let mut outputs = Vec::with_capacity(handles.len());
-                                for handle in handles {
-                                    let joined =
-                                        handle.join().expect("pack exec worker panicked")?;
-                                    outputs.push(joined);
-                                }
-                                Ok(outputs)
-                            },
-                        )?;
+                                        handles.push(scope.spawn(move || {
+                                            let mut cache = PackCache::new(pack_cache_bytes);
+                                            let mut external = PackIo::from_parts(
+                                                *midx,
+                                                pack_paths,
+                                                loose_dirs,
+                                                pack_io_limits,
+                                            )
+                                            .map_err(|err| {
+                                                PackExecError::ExternalBase(err.to_string())
+                                            })?;
+                                            let mut adapter =
+                                                EngineAdapter::new(engine, adapter_cfg);
+                                            let shard_candidates: usize = exec_slice
+                                                .iter()
+                                                .filter_map(|idx| {
+                                                    candidate_ranges[*idx].map(|(s, e)| e - s)
+                                                })
+                                                .sum();
+                                            adapter.reserve_results(shard_candidates);
+                                            let mut scratch = PackExecScratch::default();
+                                            let report = execute_pack_plan_with_scratch_indices(
+                                                plan_ref,
+                                                pack_bytes,
+                                                paths,
+                                                &pack_decode,
+                                                &mut cache,
+                                                &mut external,
+                                                &mut adapter,
+                                                spill_dir,
+                                                &mut scratch,
+                                                exec_slice,
+                                                candidate_ranges,
+                                            )?;
+                                            Ok::<_, PackExecError>((
+                                                shard_idx,
+                                                report,
+                                                adapter.take_results(),
+                                            ))
+                                        }));
+                                    }
 
-                    let mut outputs: Vec<Option<(PackExecReport, ScannedBlobs)>> =
-                        (0..ranges.len()).map(|_| None).collect();
-                    for (shard_idx, report, scanned_shard) in shard_outputs {
-                        outputs[shard_idx] = Some((report, scanned_shard));
+                                    let mut outputs = Vec::with_capacity(handles.len());
+                                    for handle in handles {
+                                        let joined =
+                                            handle.join().expect("pack exec worker panicked")?;
+                                        outputs.push(joined);
+                                    }
+                                    Ok(outputs)
+                                },
+                            )?;
+
+                            let mut outputs: Vec<Option<(PackExecReport, ScannedBlobs)>> =
+                                (0..ranges.len()).map(|_| None).collect();
+                            for (shard_idx, report, scanned_shard) in shard_outputs {
+                                outputs[shard_idx] = Some((report, scanned_shard));
+                            }
+
+                            let mut reports = Vec::with_capacity(outputs.len());
+                            let mut scanned_shards = Vec::with_capacity(outputs.len());
+                            for output in outputs.into_iter() {
+                                let (report, scanned_shard) =
+                                    output.expect("missing pack exec shard output");
+                                reports.push(report);
+                                scanned_shards.push(scanned_shard);
+                            }
+
+                            let merged_report = merge_pack_exec_reports(reports);
+                            collect_skipped_candidates(
+                                plan_ref,
+                                &merged_report.skips,
+                                &mut skipped_candidates,
+                            );
+                            pack_exec_reports.push(merged_report);
+
+                            let merged_scanned = merge_scanned_blobs(scanned_shards);
+                            append_scanned_blobs(&mut scanned, merged_scanned);
+                        }
                     }
-
-                    let mut reports = Vec::with_capacity(outputs.len());
-                    let mut scanned_shards = Vec::with_capacity(outputs.len());
-                    for output in outputs.into_iter() {
-                        let (report, scanned_shard) =
-                            output.expect("missing pack exec shard output");
-                        reports.push(report);
-                        scanned_shards.push(scanned_shard);
-                    }
-
-                    let merged_report = merge_pack_exec_reports(reports);
-                    collect_skipped_candidates(
-                        plan_ref,
-                        &merged_report.skips,
-                        &mut skipped_candidates,
-                    );
-                    pack_exec_reports.push(merged_report);
-
-                    let merged_scanned = merge_scanned_blobs(scanned_shards);
-                    append_scanned_blobs(&mut scanned, merged_scanned);
                 }
 
                 if !loose.is_empty() {

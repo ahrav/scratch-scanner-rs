@@ -35,13 +35,13 @@
 //! # Execution strategies
 //!
 //! The `PackExecStrategy` enum selects one of three modes based on worker
-//! count and plan volume:
+//! count and plan structure:
 //!
 //! | Strategy | Condition | Parallelism |
 //! |---|---|---|
-//! | `Serial` | 1 worker or 0 plans | Single-threaded, minimal overhead |
-//! | `PackParallel` | plans ≥ workers | One plan per worker, work-stealing via shared channel |
-//! | `IntraPackSharded` | plans < workers | Shard each plan's offset indices across workers |
+//! | `Serial` | 1 worker, 0 plans, or tiny total decode work | Single-threaded, minimal overhead |
+//! | `PackParallel` | enough plans to saturate workers | One plan per worker, work-stealing via shared channel |
+//! | `IntraPackSharded` | fewer plans than workers, non-trivial decode work | Shard each plan with adaptive shard counts |
 //!
 //! All three strategies produce **deterministic output order** by reassembling
 //! results in planned sequence, regardless of worker completion order.
@@ -79,9 +79,9 @@ use super::tree_diff::TreeDiffWalker;
 use super::runner_exec::{
     append_scanned_blobs, build_exec_indices, build_pack_views, collect_loose_dirs,
     collect_pack_dirs, collect_skipped_candidates, list_pack_files, load_midx, make_spill_dir,
-    merge_scanned_blobs, mmap_pack_files, resolve_pack_paths, scan_loose_candidates,
-    select_pack_exec_strategy, shard_ranges, summarize_pack_plan_deps, PackExecStrategy,
-    SpillCandidateSink,
+    merge_scanned_blobs, mmap_pack_files, per_worker_cache_bytes, resolve_pack_paths,
+    scan_loose_candidates, select_pack_exec_strategy, shard_count_for_pack, shard_ranges,
+    summarize_pack_plan_deps, PackExecStrategy, SpillCandidateSink,
 };
 
 /// Runs the diff-history scan pipeline.
@@ -276,12 +276,17 @@ pub(super) fn run_diff_history(
     }
 
     // ── Stage 5: Pack execution + scan ───────────────────────────────────
-    let pack_cache_bytes: u32 = config
-        .pack_cache_bytes
+    let pack_cache_target = per_worker_cache_bytes(
+        config.pack_cache_bytes,
+        &pack_mmaps,
+        &used_pack_ids,
+        config.pack_exec_workers,
+    );
+    let pack_cache_bytes: u32 = pack_cache_target
         .try_into()
         .map_err(|_| io::Error::other("pack cache size exceeds u32::MAX"))?;
     let pack_exec_workers = config.pack_exec_workers.max(1);
-    let pack_exec_strategy = select_pack_exec_strategy(pack_exec_workers, plans.len());
+    let pack_exec_strategy = select_pack_exec_strategy(pack_exec_workers, &plans);
     let plan_count = plans.len();
     let loose_dirs = collect_loose_dirs(&repo.paths);
     let mut pack_exec_reports = Vec::with_capacity(plan_count);
@@ -413,7 +418,7 @@ pub(super) fn run_diff_history(
                                     })?
                                     .as_ref();
 
-                                adapter.reserve_results(plan.stats.candidate_count as usize);
+                                adapter.reserve_results(plan.candidate_offsets.len());
                                 let report = execute_pack_plan_with_scratch(
                                     &plan,
                                     pack_bytes,
@@ -515,7 +520,7 @@ pub(super) fn run_diff_history(
                 append_scanned_blobs(&mut scanned, adapter.take_results());
             }
         }
-        PackExecStrategy::IntraPackSharded => {
+        PackExecStrategy::IntraPackSharded { shard_counts } => {
             // When there are fewer plans than workers, we shard each plan's
             // offset indices across workers so all cores stay busy. Each
             // shard decodes a disjoint slice of the plan's need_offsets and
@@ -540,7 +545,8 @@ pub(super) fn run_diff_history(
                 let mut candidate_ranges = Vec::new();
                 build_candidate_ranges(plan_ref, &mut candidate_ranges);
 
-                let ranges = shard_ranges(exec_indices.len(), pack_exec_workers);
+                let shard_count = shard_count_for_pack(&shard_counts, plan_ref.pack_id);
+                let ranges = shard_ranges(exec_indices.len(), shard_count);
                 let shard_outputs = std::thread::scope(
                     |scope| -> Result<Vec<(usize, PackExecReport, ScannedBlobs)>, PackExecError> {
                         let mut handles = Vec::with_capacity(ranges.len());

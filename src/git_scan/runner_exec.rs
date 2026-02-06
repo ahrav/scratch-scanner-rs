@@ -9,7 +9,7 @@
 //! - **Mmap management** — map pack files, apply sequential access hints.
 //! - **Pack view parsing** — validate headers, build `PackView`s for planning.
 //! - **Loose scanning** — decode loose objects and feed them to the engine.
-//! - **Threading utilities** — strategy selection, index sharding, result merging.
+//! - **Threading utilities** — stats-free strategy selection, index sharding, result merging.
 //! - **Spill adapter** — [`SpillCandidateSink`] bridges [`CandidateSink`] to [`Spiller`].
 //!
 //! # Design note
@@ -42,7 +42,7 @@ use super::pack_exec::SkipRecord;
 use super::pack_inflate::ObjectKind;
 use super::pack_io::{PackIo, PackIoError};
 use super::pack_plan::{PackPlanError, PackView};
-use super::pack_plan_model::PackPlan;
+use super::pack_plan_model::{BaseLoc, PackPlan};
 use super::repo::GitRepoPaths;
 use super::repo_open::RepoJobState;
 use super::runner::{CandidateSkipReason, GitScanError, PackMmapLimits, SkippedCandidate};
@@ -62,15 +62,32 @@ pub(super) const PATH_BYTES_PER_CANDIDATE_ESTIMATE: u64 = 64;
 
 /// Denominator for the pack cache sizing fraction.
 ///
-/// The pack cache receives `total_mapped_bytes / 64` (~1.6 % of pack data),
-/// enough to hold delta base chains without competing with mmap for RSS.
-/// See [`estimate_pack_cache_bytes`].
-pub(super) const PACK_CACHE_FRACTION_DENOM: u64 = 64;
+/// The pack cache receives `total_mapped_bytes / 16` (~6.25 % of pack data).
+/// The previous 1/64 fraction (~1.6 %) was insufficient for large working
+/// sets, causing 49–51 % hit rates on repos > 5 GiB. The increased fraction
+/// is bounded by [`PACK_CACHE_TOTAL_MAX_BYTES`] so aggregate memory stays
+/// controlled.
+pub(super) const PACK_CACHE_FRACTION_DENOM: u64 = 16;
 
-/// Hard upper bound for the pack cache (2 GiB).
+/// Hard upper bound per worker for the pack cache (2 GiB).
 ///
 /// Prevents runaway allocation on repos with many large packs.
 pub(super) const PACK_CACHE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Aggregate memory cap across all workers (4 GiB).
+///
+/// With N workers each sizing caches independently, the old formula could
+/// allocate N × budget (e.g. 24 × 800 MiB = 19.2 GiB on a 50 GiB repo).
+/// This cap divides evenly across workers so total cache memory stays
+/// bounded regardless of pack size or worker count.
+pub(super) const PACK_CACHE_TOTAL_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Minimum per-worker cache budget (32 MiB).
+///
+/// Ensures each worker has a functional cache even when the total cap is
+/// divided among many workers. Below this threshold, cache sets are too few
+/// to maintain reasonable hit rates.
+pub(super) const PACK_CACHE_PER_WORKER_MIN: u64 = 32 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // SpillCandidateSink
@@ -153,12 +170,16 @@ pub(super) fn estimate_path_arena_capacity(base: u32, packed: u32, loose: u32) -
     base.max(est)
 }
 
-/// Estimate a pack cache size from mapped pack bytes.
+/// Estimate a raw pack cache size from mapped pack bytes.
 ///
-/// Returns `clamp(total_used_bytes / 64, base, PACK_CACHE_MAX_BYTES)`.
+/// Returns `clamp(total_used_bytes / PACK_CACHE_FRACTION_DENOM, base, PACK_CACHE_MAX_BYTES)`.
 /// Only packs referenced by `used_pack_ids` contribute to `total_used_bytes`.
 /// Returns `base` unchanged when no used packs are mapped (e.g. loose-only
 /// repos).
+///
+/// This is the *raw* estimate before per-worker and total-memory capping.
+/// Prefer [`per_worker_cache_bytes`] in pipeline code to respect aggregate
+/// memory limits.
 pub(super) fn estimate_pack_cache_bytes(
     base: usize,
     pack_mmaps: &[Option<Mmap>],
@@ -176,6 +197,39 @@ pub(super) fn estimate_pack_cache_bytes(
 
     let target = total_bytes / PACK_CACHE_FRACTION_DENOM;
     let target = target.min(PACK_CACHE_MAX_BYTES).max(base as u64);
+    target as usize
+}
+
+/// Compute bounded per-worker pack cache bytes.
+///
+/// 1. Starts from the raw estimate (`estimate_pack_cache_bytes`).
+/// 2. Caps at `PACK_CACHE_TOTAL_MAX_BYTES / workers` so aggregate memory
+///    across all workers stays bounded (4 GiB by default).
+/// 3. Floors at `PACK_CACHE_PER_WORKER_MIN` (32 MiB) so each worker
+///    retains a functional cache.
+/// 4. Clamps to `PACK_CACHE_MAX_BYTES` (2 GiB per-worker hard cap).
+///
+/// This function should be used by both scan pipelines instead of calling
+/// `estimate_pack_cache_bytes` directly.
+pub(super) fn per_worker_cache_bytes(
+    base: usize,
+    pack_mmaps: &[Option<Mmap>],
+    used_pack_ids: &[u16],
+    workers: usize,
+) -> usize {
+    let raw = estimate_pack_cache_bytes(base, pack_mmaps, used_pack_ids);
+    let workers = workers.max(1) as u64;
+
+    // Cap: total memory across all workers must not exceed PACK_CACHE_TOTAL_MAX_BYTES.
+    let per_worker_cap = PACK_CACHE_TOTAL_MAX_BYTES / workers;
+    let target = (raw as u64).min(per_worker_cap);
+
+    // Floor: each worker needs at least a minimal functional cache.
+    let target = target.max(PACK_CACHE_PER_WORKER_MIN);
+
+    // Hard per-worker ceiling.
+    let target = target.min(PACK_CACHE_MAX_BYTES);
+
     target as usize
 }
 
@@ -458,40 +512,180 @@ pub(super) fn summarize_pack_plan_deps(plans: &[PackPlan]) -> (u64, u32) {
     (total, max)
 }
 
+/// Minimum decoded offsets before multi-threaded pack exec is considered.
+const MIN_TOTAL_NEED_FOR_PARALLEL: usize = 512;
+/// Minimum decoded offsets per shard to avoid oversharding tiny plans.
+const MIN_NEED_PER_SHARD: usize = 1_024;
+/// Minimum offset span per shard to avoid over-partitioning narrow ranges.
+const MIN_SPAN_PER_SHARD: u64 = 4 * 1024 * 1024;
+/// Cap shard fan-out when dependency pressure is high.
+const MAX_SHARDS_WITH_DEP_PRESSURE: usize = 2;
+
+/// Stats-free cost hint derived from core `PackPlan` structure.
+///
+/// This intentionally avoids `plan.stats` so strategy selection remains
+/// independent of optional perf/debug instrumentation surfaces. The hint
+/// captures only structural properties visible from `need_offsets` and
+/// `delta_deps`, which are sufficient for shard-count and strategy decisions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlanCostHint {
+    /// Pack index this plan targets.
+    pack_id: u16,
+    /// Number of offsets that need decoding (`plan.need_offsets.len()`).
+    need_count: usize,
+    /// Byte span from first to last need offset; drives minimum-span-per-shard.
+    span_bytes: u64,
+    /// Delta deps where the base offset is *after* the dependent offset.
+    /// Forward deps penalize sharding because a shard boundary could place
+    /// a base in a different shard from its dependent.
+    forward_deps: usize,
+    /// Delta deps resolved via external OID lookup (not by offset).
+    external_deps: usize,
+}
+
 /// Diff-history pack execution strategy for a planned pack set.
 ///
-/// Selected by [`select_pack_exec_strategy`] based on worker count and plan
-/// count. The three variants form a hierarchy: serial is always correct,
-/// pack-parallel scales linearly with pack count, and intra-pack sharding
-/// extracts parallelism within a single large pack.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Selected by [`select_pack_exec_strategy`] from worker count and per-plan
+/// structural hints derived from `PackPlan` internals.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum PackExecStrategy {
     /// Single-threaded execution. Used when `workers <= 1` or no plans exist.
     Serial,
     /// One plan per worker with deterministic sequence reassembly.
     /// Chosen when `plan_count >= workers`.
     PackParallel,
-    /// Intra-pack index sharding: splits a single plan's `need_offsets`
-    /// across workers. Chosen when `plan_count < workers` so idle workers
-    /// can contribute within a pack.
-    IntraPackSharded,
+    /// Intra-pack index sharding with per-pack shard count assignments.
+    IntraPackSharded {
+        /// `(pack_id, shard_count)` assignments for plans selected for sharding.
+        shard_counts: Vec<(u16, usize)>,
+    },
 }
 
-/// Select diff-history pack execution strategy from worker and plan counts.
+/// Extract a [`PlanCostHint`] from a plan's structural fields.
+///
+/// Counts forward delta dependencies (base offset > dependent offset) and
+/// external dependencies (resolved by OID, not offset). These counts feed
+/// the shard-count heuristic: high dependency pressure caps the number of
+/// shards to avoid cross-shard decode ordering issues.
+fn build_plan_cost_hint(plan: &PackPlan) -> PlanCostHint {
+    let mut forward_deps = 0usize;
+    let mut external_deps = 0usize;
+    for dep in &plan.delta_deps {
+        match dep.base {
+            BaseLoc::Offset(base_offset) => {
+                if base_offset > dep.offset {
+                    forward_deps = forward_deps.saturating_add(1);
+                }
+            }
+            BaseLoc::External { .. } => {
+                external_deps = external_deps.saturating_add(1);
+            }
+        }
+    }
+
+    let span_bytes = plan
+        .need_offsets
+        .first()
+        .zip(plan.need_offsets.last())
+        .map_or(0, |(start, end)| end.saturating_sub(*start));
+
+    PlanCostHint {
+        pack_id: plan.pack_id,
+        need_count: plan.need_offsets.len(),
+        span_bytes,
+        forward_deps,
+        external_deps,
+    }
+}
+
+/// Select the shard count for one pack plan based on structural heuristics.
+///
+/// The shard count is the minimum of several independent caps:
+/// 1. **Worker count** — never more shards than available workers.
+/// 2. **`need_count / MIN_NEED_PER_SHARD`** — avoids oversharding tiny plans.
+/// 3. **`span_bytes / MIN_SPAN_PER_SHARD`** — avoids splitting narrow byte ranges.
+/// 4. **Dependency pressure** — if more than half the need offsets have forward
+///    or external deps, the shard count is capped to [`MAX_SHARDS_WITH_DEP_PRESSURE`]
+///    to reduce cross-shard ordering hazards.
+///
+/// Returns 1 for single-worker execution or degenerate plans (≤ 1 offset).
+#[inline(always)]
+pub(super) fn select_plan_shard_count(workers: usize, plan: &PackPlan) -> usize {
+    let workers = workers.max(1);
+    if workers == 1 {
+        return 1;
+    }
+
+    let hint = build_plan_cost_hint(plan);
+    if hint.need_count <= 1 {
+        return 1;
+    }
+
+    let mut shard_cap = workers.min(hint.need_count);
+    let by_need = hint.need_count / MIN_NEED_PER_SHARD;
+    shard_cap = if by_need == 0 {
+        1
+    } else {
+        shard_cap.min(by_need.max(1))
+    };
+
+    if hint.span_bytes > 0 {
+        let by_span = (hint.span_bytes / MIN_SPAN_PER_SHARD) as usize;
+        shard_cap = if by_span == 0 {
+            1
+        } else {
+            shard_cap.min(by_span.max(1))
+        };
+    }
+
+    let dep_pressure = hint.forward_deps.saturating_add(hint.external_deps);
+    if dep_pressure > (hint.need_count / 2) {
+        shard_cap = shard_cap.min(MAX_SHARDS_WITH_DEP_PRESSURE);
+    }
+
+    shard_cap.max(1).min(hint.need_count)
+}
+
+/// Returns assigned shard count for `pack_id` or `1` if not present.
+#[inline(always)]
+pub(super) fn shard_count_for_pack(shard_counts: &[(u16, usize)], pack_id: u16) -> usize {
+    shard_counts
+        .iter()
+        .find_map(|(id, shards)| (*id == pack_id).then_some(*shards))
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// Select diff-history pack execution strategy from workers and plan structure.
 ///
 /// Decision boundaries:
 /// - `workers <= 1` or `plans == 0` → [`PackExecStrategy::Serial`]
+/// - tiny total decode work → [`PackExecStrategy::Serial`]
 /// - `plans >= workers` → [`PackExecStrategy::PackParallel`]
-/// - otherwise → [`PackExecStrategy::IntraPackSharded`]
+/// - otherwise → [`PackExecStrategy::IntraPackSharded`] with adaptive shards
 #[inline(always)]
-pub(super) fn select_pack_exec_strategy(workers: usize, plan_count: usize) -> PackExecStrategy {
+pub(super) fn select_pack_exec_strategy(workers: usize, plans: &[PackPlan]) -> PackExecStrategy {
     let workers = workers.max(1);
-    if workers == 1 || plan_count == 0 {
-        PackExecStrategy::Serial
-    } else if plan_count >= workers {
+    if workers == 1 || plans.is_empty() {
+        return PackExecStrategy::Serial;
+    } else {
+        let total_need: usize = plans
+            .iter()
+            .map(|plan| build_plan_cost_hint(plan).need_count)
+            .sum();
+        if total_need < MIN_TOTAL_NEED_FOR_PARALLEL {
+            return PackExecStrategy::Serial;
+        }
+    }
+
+    if plans.len() >= workers {
         PackExecStrategy::PackParallel
     } else {
-        PackExecStrategy::IntraPackSharded
+        let mut shard_counts = Vec::with_capacity(plans.len());
+        for plan in plans {
+            shard_counts.push((plan.pack_id, select_plan_shard_count(workers, plan)));
+        }
+        PackExecStrategy::IntraPackSharded { shard_counts }
     }
 }
 
@@ -676,6 +870,7 @@ mod tests {
     use super::*;
     use crate::git_scan::object_id::OidBytes;
     use crate::git_scan::pack_decode::PackDecodeLimits;
+    use crate::git_scan::pack_plan_model::{BaseLoc, DeltaDep, DeltaKind, PackPlanStats, NONE_U32};
     use crate::git_scan::{ByteRef, CandidateContext, ChangeKind};
     use crate::{
         demo_tuning, AnchorPolicy, Engine, Gate, RuleSpec, TransformConfig, TransformId,
@@ -690,34 +885,120 @@ mod tests {
     use crate::git_scan::engine_adapter::{EngineAdapter, EngineAdapterConfig};
     use crate::git_scan::midx::MidxView;
     use crate::git_scan::object_id::ObjectFormat;
+    use crate::git_scan::pack_candidates::PackCandidate;
     use crate::git_scan::pack_io::{PackIo, PackIoLimits};
 
+    fn synthetic_plan(
+        pack_id: u16,
+        need_count: usize,
+        span_bytes: u64,
+        forward_deps: usize,
+        external_deps: usize,
+    ) -> PackPlan {
+        let effective_span = span_bytes.max(need_count.saturating_sub(1) as u64);
+        let step = if need_count <= 1 {
+            0
+        } else {
+            (effective_span / (need_count as u64 - 1)).max(1)
+        };
+        let need_offsets: Vec<u64> = (0..need_count)
+            .map(|idx| (idx as u64).saturating_mul(step))
+            .collect();
+
+        let mut delta_deps = Vec::with_capacity(forward_deps.saturating_add(external_deps));
+        for idx in 0..forward_deps {
+            let offset = idx as u64;
+            delta_deps.push(DeltaDep {
+                offset,
+                kind: DeltaKind::Ofs,
+                base: BaseLoc::Offset(offset.saturating_add(1)),
+            });
+        }
+        for idx in 0..external_deps {
+            let offset = forward_deps.saturating_add(idx) as u64;
+            delta_deps.push(DeltaDep {
+                offset,
+                kind: DeltaKind::Ref,
+                base: BaseLoc::External {
+                    oid: OidBytes::default(),
+                },
+            });
+        }
+        delta_deps.sort_by_key(|dep| dep.offset);
+
+        PackPlan {
+            pack_id,
+            oid_len: 20,
+            max_delta_depth: 64,
+            candidates: Vec::<PackCandidate>::new(),
+            candidate_offsets: Vec::new(),
+            need_offsets,
+            delta_deps,
+            delta_dep_index: vec![NONE_U32; need_count],
+            exec_order: None,
+            clusters: Vec::new(),
+            stats: PackPlanStats::empty(),
+        }
+    }
+
     #[test]
-    fn diff_history_pack_exec_strategy_honors_worker_setting() {
+    fn select_pack_exec_strategy_handles_serial_boundaries() {
+        let empty: Vec<PackPlan> = Vec::new();
         assert_eq!(
-            select_pack_exec_strategy(0, 4),
+            select_pack_exec_strategy(0, &empty),
             PackExecStrategy::Serial,
-            "worker=0 should fallback to serial",
+            "empty plans should remain serial",
         );
+
+        let single = vec![synthetic_plan(0, 2_048, 64 * 1024 * 1024, 0, 0)];
         assert_eq!(
-            select_pack_exec_strategy(1, 4),
+            select_pack_exec_strategy(1, &single),
             PackExecStrategy::Serial,
             "worker=1 must remain serial",
         );
         assert_eq!(
-            select_pack_exec_strategy(4, 0),
+            select_pack_exec_strategy(8, &[synthetic_plan(0, 100, 4 * 1024 * 1024, 0, 0)]),
             PackExecStrategy::Serial,
-            "no plans should remain serial",
+            "tiny total work should stay serial",
         );
+    }
+
+    #[test]
+    fn select_pack_exec_strategy_prefers_pack_parallel_with_enough_plans() {
+        let plans = vec![
+            synthetic_plan(0, 1_500, 64 * 1024 * 1024, 0, 0),
+            synthetic_plan(1, 1_500, 64 * 1024 * 1024, 0, 0),
+            synthetic_plan(2, 1_500, 64 * 1024 * 1024, 0, 0),
+        ];
         assert_eq!(
-            select_pack_exec_strategy(2, 1),
-            PackExecStrategy::IntraPackSharded,
-            "workers>plans should shard within pack",
-        );
-        assert_eq!(
-            select_pack_exec_strategy(2, 2),
+            select_pack_exec_strategy(3, &plans),
             PackExecStrategy::PackParallel,
-            "matching workers/plans should use pack-parallel",
+            "plans>=workers should use pack-parallel",
+        );
+    }
+
+    #[test]
+    fn select_pack_exec_strategy_assigns_adaptive_shards() {
+        let plans = vec![
+            synthetic_plan(7, 8_192, 256 * 1024 * 1024, 0, 0),
+            synthetic_plan(8, 200, 512 * 1024, 0, 0),
+        ];
+        match select_pack_exec_strategy(8, &plans) {
+            PackExecStrategy::IntraPackSharded { shard_counts } => {
+                assert_eq!(shard_count_for_pack(&shard_counts, 7), 8);
+                assert_eq!(shard_count_for_pack(&shard_counts, 8), 1);
+            }
+            other => panic!("expected IntraPackSharded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn select_plan_shard_count_caps_dependency_heavy_plans() {
+        let dependency_heavy = synthetic_plan(0, 4_096, 64 * 1024 * 1024, 2_200, 0);
+        assert_eq!(
+            select_plan_shard_count(8, &dependency_heavy),
+            2,
+            "dependency pressure should cap shard fan-out",
         );
     }
 
