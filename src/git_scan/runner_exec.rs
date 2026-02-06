@@ -10,7 +10,15 @@
 //! - **Pack view parsing** — validate headers, build `PackView`s for planning.
 //! - **Loose scanning** — decode loose objects and feed them to the engine.
 //! - **Threading utilities** — strategy selection, index sharding, result merging.
-//! - **Spill adapter** — `SpillCandidateSink` bridges `CandidateSink` to `Spiller`.
+//! - **Spill adapter** — [`SpillCandidateSink`] bridges [`CandidateSink`] to [`Spiller`].
+//!
+//! # Design note
+//!
+//! Functions here are intentionally stateless: they accept explicit inputs and
+//! return values rather than mutating shared runner state. This keeps the
+//! mode-specific pipelines testable in isolation and makes threading boundaries
+//! explicit (e.g. `merge_scanned_blobs` expects shards produced by independent
+//! workers).
 
 use std::fs;
 use std::fs::File;
@@ -45,15 +53,23 @@ use super::tree_candidate::CandidateSink;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Heuristic bytes-per-candidate for path arena sizing in ODB-blob mode.
+/// Heuristic bytes-per-candidate for path arena sizing.
 ///
-/// This is a safety cushion to keep path arenas from overflowing when
-/// candidates greatly exceed default caps, while still bounding capacity
-/// to `u32::MAX`.
+/// Average git path length is ~40 bytes; 64 adds headroom for longer paths
+/// without over-allocating for small repos. The estimate is multiplied by
+/// candidate count and clamped to `u32::MAX` in [`estimate_path_arena_capacity`].
 pub(super) const PATH_BYTES_PER_CANDIDATE_ESTIMATE: u64 = 64;
-/// Denominator for pack cache sizing heuristic (total_bytes / denom).
+
+/// Denominator for the pack cache sizing fraction.
+///
+/// The pack cache receives `total_mapped_bytes / 64` (~1.6 % of pack data),
+/// enough to hold delta base chains without competing with mmap for RSS.
+/// See [`estimate_pack_cache_bytes`].
 pub(super) const PACK_CACHE_FRACTION_DENOM: u64 = 64;
-/// Upper bound for pack cache sizing in ODB-blob mode (2 GiB).
+
+/// Hard upper bound for the pack cache (2 GiB).
+///
+/// Prevents runaway allocation on repos with many large packs.
 pub(super) const PACK_CACHE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
@@ -62,8 +78,10 @@ pub(super) const PACK_CACHE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Candidate sink that forwards tree-diff output to the spill/dedupe stage.
 ///
-/// Adapts `CandidateSink` to `Spiller::push`, translating tree-diff errors
-/// into the common `TreeDiffError` type.
+/// Bridges [`CandidateSink`] (the trait consumed by tree-diff walkers) to
+/// [`Spiller::push`], translating spill I/O errors into [`TreeDiffError`].
+/// This lets the diff-history pipeline emit candidates directly into the
+/// spiller without an intermediate buffer.
 pub(super) struct SpillCandidateSink<'a> {
     spiller: &'a mut Spiller,
 }
@@ -107,7 +125,9 @@ impl CandidateSink for SpillCandidateSink<'_> {
 
 /// Create a unique spill directory under the OS temp directory.
 ///
-/// The directory name is derived from the PID and a nanosecond timestamp.
+/// The directory name is derived from the PID and a nanosecond timestamp
+/// to avoid collisions between concurrent scans. The caller owns the
+/// directory and is responsible for cleanup (typically via [`Spiller`] drop).
 pub(super) fn make_spill_dir() -> Result<PathBuf, io::Error> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
     let mut path = std::env::temp_dir();
@@ -122,8 +142,9 @@ pub(super) fn make_spill_dir() -> Result<PathBuf, io::Error> {
 
 /// Estimate a path arena capacity based on candidate volume.
 ///
-/// Uses a bytes-per-candidate heuristic and returns at least `base`,
-/// clamped to `u32::MAX`.
+/// Returns `max(base, (packed + loose) * PATH_BYTES_PER_CANDIDATE_ESTIMATE)`,
+/// clamped to `u32::MAX`. The heuristic avoids arena overflow when candidate
+/// counts greatly exceed the default `base` capacity.
 pub(super) fn estimate_path_arena_capacity(base: u32, packed: u32, loose: u32) -> u32 {
     let total = packed as u64 + loose as u64;
     let est = total
@@ -134,9 +155,10 @@ pub(super) fn estimate_path_arena_capacity(base: u32, packed: u32, loose: u32) -
 
 /// Estimate a pack cache size from mapped pack bytes.
 ///
-/// Uses a fixed fraction of total mapped pack size, clamped to the configured
-/// minimum and an upper safety bound. Only packs referenced by `used_pack_ids`
-/// contribute to the estimate.
+/// Returns `clamp(total_used_bytes / 64, base, PACK_CACHE_MAX_BYTES)`.
+/// Only packs referenced by `used_pack_ids` contribute to `total_used_bytes`.
+/// Returns `base` unchanged when no used packs are mapped (e.g. loose-only
+/// repos).
 pub(super) fn estimate_pack_cache_bytes(
     base: usize,
     pack_mmaps: &[Option<Mmap>],
@@ -160,9 +182,13 @@ pub(super) fn estimate_pack_cache_bytes(
 /// Load the MIDX view for the repository.
 ///
 /// The parser uses the repo's object format to validate OID lengths.
+///
+/// # Preconditions
+///
 /// `acquire_midx` must have been called to populate `repo.mmaps.midx`.
 ///
 /// # Errors
+///
 /// Returns `GitScanError::Midx` if the MIDX bytes are missing or corrupted.
 pub(super) fn load_midx(repo: &RepoJobState) -> Result<MidxView<'_>, GitScanError> {
     let midx_bytes = repo
@@ -173,9 +199,11 @@ pub(super) fn load_midx(repo: &RepoJobState) -> Result<MidxView<'_>, GitScanErro
     Ok(MidxView::parse(midx_bytes.as_slice(), repo.object_format)?)
 }
 
-/// Convert the repo start set into finalize `RefEntry` values.
+/// Convert the repo start set into finalize [`RefEntry`] values.
 ///
-/// The ref names are taken from the repo's shared name table.
+/// Each start-set entry's ref name is resolved through the repo's shared
+/// name table so the resulting `RefEntry` vector carries owned byte names
+/// suitable for the finalize stage.
 pub(super) fn build_ref_entries(repo: &RepoJobState) -> Vec<RefEntry> {
     let mut refs = Vec::with_capacity(repo.start_set.len());
     for r in &repo.start_set {
@@ -189,8 +217,9 @@ pub(super) fn build_ref_entries(repo: &RepoJobState) -> Vec<RefEntry> {
 
 /// Collect pack directories, including alternates.
 ///
-/// Alternates that resolve to the main objects dir are ignored.
-/// The primary pack dir is returned first.
+/// The primary `pack_dir` is returned first, followed by `<alternate>/pack`
+/// for each alternate objects directory. Alternates equal to the main objects
+/// dir are skipped to avoid duplicate scanning.
 pub(super) fn collect_pack_dirs(paths: &GitRepoPaths) -> Vec<PathBuf> {
     let mut dirs = Vec::with_capacity(1 + paths.alternate_object_dirs.len());
     dirs.push(paths.pack_dir.clone());
@@ -205,8 +234,9 @@ pub(super) fn collect_pack_dirs(paths: &GitRepoPaths) -> Vec<PathBuf> {
 
 /// Collect loose object directories, including alternates.
 ///
-/// Alternates that resolve to the main objects dir are ignored.
-/// The primary objects dir is returned first.
+/// The primary objects dir is returned first, followed by each alternate.
+/// Alternates equal to the main objects dir are skipped to avoid duplicate
+/// scanning.
 pub(super) fn collect_loose_dirs(paths: &GitRepoPaths) -> Vec<PathBuf> {
     let mut dirs = Vec::with_capacity(1 + paths.alternate_object_dirs.len());
     dirs.push(paths.objects_dir.clone());
@@ -248,9 +278,14 @@ pub(super) fn list_pack_files(pack_dirs: &[PathBuf]) -> Result<Vec<Vec<u8>>, Git
 
 /// Resolve pack file paths referenced by the MIDX.
 ///
-/// The MIDX stores pack basenames; we add the `.pack` suffix and search
-/// each pack directory until a match is found. The first match wins, so
-/// `pack_dirs` order is significant.
+/// The MIDX stores pack basenames (with `.idx` suffix); this function strips
+/// the suffix, appends `.pack`, and searches `pack_dirs` in order. The first
+/// match wins, so `pack_dirs` order is significant (primary before alternates).
+///
+/// # Errors
+///
+/// Returns `GitScanError::Io(NotFound)` if any MIDX-referenced pack cannot be
+/// located in the provided directories.
 pub(super) fn resolve_pack_paths(
     midx: &MidxView<'_>,
     pack_dirs: &[PathBuf],
@@ -283,6 +318,8 @@ pub(super) fn resolve_pack_paths(
 }
 
 /// Strip a `.pack` or `.idx` suffix from a pack-related file name.
+///
+/// Returns the input unchanged (as a new `Vec`) if neither suffix matches.
 pub(super) fn strip_pack_suffix(name: &[u8]) -> Vec<u8> {
     if name.ends_with(b".pack") {
         name[..name.len() - 5].to_vec()
@@ -295,14 +332,22 @@ pub(super) fn strip_pack_suffix(name: &[u8]) -> Vec<u8> {
 
 /// Memory-map pack files for zero-copy decoding.
 ///
-/// The mappings are read-only and may outlive the file handles.
-/// Returns `GitScanError::ResourceLimit` if pack counts or total bytes exceed
-/// the configured mmap limits.
+/// Only packs whose IDs appear in `used_pack_ids` are mapped; the returned
+/// vector has the same length as `pack_paths` with `None` for unmapped slots,
+/// preserving pack-ID-to-index correspondence.
 ///
-/// Callers must pass de-duplicated `used_pack_ids`; duplicates would
-/// double-count bytes and re-map the same pack.
+/// # Preconditions
 ///
-/// The returned vector matches `pack_paths` length so pack IDs remain stable.
+/// `used_pack_ids` must be de-duplicated. Duplicates would double-count
+/// mapped bytes against `limits.max_total_bytes` and re-map the same file.
+///
+/// # Errors
+///
+/// - `GitScanError::ResourceLimit` — pack count or cumulative file size
+///   exceeds `limits`.
+/// - `GitScanError::PackPlan(PackIdOutOfRange)` — a pack ID falls outside
+///   `pack_paths`.
+/// - `GitScanError::Io` — file metadata or mmap syscall failure.
 pub(super) fn mmap_pack_files(
     pack_paths: &[PathBuf],
     used_pack_ids: &[u16],
@@ -396,7 +441,10 @@ pub(super) fn build_pack_views<'a>(
     Ok(views)
 }
 
-/// Returns total delta dependency count and the maximum deps in any plan.
+/// Returns `(total_delta_deps, max_deps_in_single_plan)` across all plans.
+///
+/// Used by the pipeline to log planning diagnostics and decide whether
+/// intra-pack sharding is viable (high per-plan deps penalize sharding).
 pub(super) fn summarize_pack_plan_deps(plans: &[PackPlan]) -> (u64, u32) {
     let mut total = 0u64;
     let mut max = 0u32;
@@ -411,17 +459,30 @@ pub(super) fn summarize_pack_plan_deps(plans: &[PackPlan]) -> (u64, u32) {
 }
 
 /// Diff-history pack execution strategy for a planned pack set.
+///
+/// Selected by [`select_pack_exec_strategy`] based on worker count and plan
+/// count. The three variants form a hierarchy: serial is always correct,
+/// pack-parallel scales linearly with pack count, and intra-pack sharding
+/// extracts parallelism within a single large pack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PackExecStrategy {
-    /// Single-threaded execution (default and worker fallback).
+    /// Single-threaded execution. Used when `workers <= 1` or no plans exist.
     Serial,
     /// One plan per worker with deterministic sequence reassembly.
+    /// Chosen when `plan_count >= workers`.
     PackParallel,
-    /// Intra-pack index sharding when plan count is below worker count.
+    /// Intra-pack index sharding: splits a single plan's `need_offsets`
+    /// across workers. Chosen when `plan_count < workers` so idle workers
+    /// can contribute within a pack.
     IntraPackSharded,
 }
 
-/// Selects diff-history pack execution strategy from worker and plan counts.
+/// Select diff-history pack execution strategy from worker and plan counts.
+///
+/// Decision boundaries:
+/// - `workers <= 1` or `plans == 0` → [`PackExecStrategy::Serial`]
+/// - `plans >= workers` → [`PackExecStrategy::PackParallel`]
+/// - otherwise → [`PackExecStrategy::IntraPackSharded`]
 #[inline(always)]
 pub(super) fn select_pack_exec_strategy(workers: usize, plan_count: usize) -> PackExecStrategy {
     let workers = workers.max(1);
@@ -436,8 +497,10 @@ pub(super) fn select_pack_exec_strategy(workers: usize, plan_count: usize) -> Pa
 
 /// Returns execution indices in deterministic order for a plan.
 ///
-/// When `exec_order` is present, it is used to handle forward delta
-/// dependencies. Otherwise the offsets are executed sequentially.
+/// When `exec_order` is present it is used to honour forward delta
+/// dependencies (base before dependent). Otherwise offsets are visited
+/// in natural `need_offsets` order, which is correct when all bases
+/// precede their deltas in the pack.
 pub(super) fn build_exec_indices(plan: &PackPlan) -> Vec<usize> {
     if let Some(order) = plan.exec_order.as_ref() {
         order.iter().map(|&idx| idx as usize).collect()
@@ -446,9 +509,11 @@ pub(super) fn build_exec_indices(plan: &PackPlan) -> Vec<usize> {
     }
 }
 
-/// Splits a range into `shards` contiguous ranges covering `[0, len)`.
+/// Split `[0, len)` into `shards` contiguous `(start, end)` ranges.
 ///
-/// The first `len % shards` ranges receive one extra element.
+/// The first `len % shards` ranges receive one extra element to distribute
+/// remainder evenly. Returns an empty vec when `len == 0`.
+/// `shards` is clamped to `[1, len]`.
 pub(super) fn shard_ranges(len: usize, shards: usize) -> Vec<(usize, usize)> {
     if len == 0 {
         return Vec::new();
@@ -469,9 +534,13 @@ pub(super) fn shard_ranges(len: usize, shards: usize) -> Vec<(usize, usize)> {
     out
 }
 
-/// Merge per-shard results in shard order, rebasing finding spans.
+/// Merge per-shard scan results into a single [`ScannedBlobs`], rebasing
+/// finding spans so arena indices remain valid in the merged output.
 ///
-/// Shards should already be ordered deterministically (for example by pack id).
+/// Each shard's `finding_arena` is appended to the merged arena and every
+/// blob's `findings.start` is offset by the arena length at the time of
+/// append. Shards must be in deterministic order (e.g. by pack id) to
+/// produce reproducible output.
 pub(super) fn merge_scanned_blobs(mut shards: Vec<ScannedBlobs>) -> ScannedBlobs {
     let total_blobs: usize = shards.iter().map(|s| s.blobs.len()).sum();
     let total_findings: usize = shards.iter().map(|s| s.finding_arena.len()).sum();
@@ -493,7 +562,9 @@ pub(super) fn merge_scanned_blobs(mut shards: Vec<ScannedBlobs>) -> ScannedBlobs
     merged
 }
 
-/// Append scanned blobs while rebasing finding spans.
+/// Append `src` blobs into `dst`, rebasing finding spans into `dst`'s arena.
+///
+/// Same rebasing logic as [`merge_scanned_blobs`] but operates in-place.
 pub(super) fn append_scanned_blobs(dst: &mut ScannedBlobs, mut src: ScannedBlobs) {
     let base = dst.finding_arena.len() as u32;
     dst.finding_arena.extend_from_slice(&src.finding_arena);
@@ -503,14 +574,18 @@ pub(super) fn append_scanned_blobs(dst: &mut ScannedBlobs, mut src: ScannedBlobs
     }
 }
 
-/// Load loose candidates and scan blob payloads.
+/// Load loose candidate objects and scan their blob payloads.
 ///
-/// Missing or undecodable loose objects are recorded as skips so the run can
-/// complete with partial results. Paths are re-interned into the adapter's
-/// arena via `emit_loose`.
+/// For each candidate the loose object is decoded via `pack_io`. Blobs are
+/// forwarded to `adapter.emit_loose`; non-blobs, missing objects, and decode
+/// failures are recorded in `skipped` so the run can complete with partial
+/// results.
 ///
-/// Missing objects, decode errors, and non-blob kinds are recorded as skips.
-/// Unexpected pack I/O errors are returned as fatal scan errors.
+/// # Errors
+///
+/// Returns `GitScanError::PackIo` only for unexpected I/O errors (e.g. a
+/// permission failure on the objects directory). Recoverable per-object
+/// problems are captured in `skipped` instead.
 pub(super) fn scan_loose_candidates(
     candidates: &[LooseCandidate],
     paths: &ByteArena,
@@ -548,11 +623,13 @@ pub(super) fn scan_loose_candidates(
     Ok(())
 }
 
-/// Collect candidates that were skipped during pack execution.
+/// Map pack-level skip records back to candidate-level skip entries.
 ///
-/// The skip records are offsets into the pack stream; we map them back to
-/// candidate offsets and record the corresponding OIDs with a reason.
-/// If multiple candidates share an offset, each one is recorded.
+/// [`SkipRecord`]s carry raw pack offsets; this function binary-searches
+/// `plan.candidate_offsets` (which are sorted by offset) to find every
+/// candidate at each skipped offset. Multiple candidates can share an
+/// offset (e.g. identical blobs referenced by different paths), and each
+/// one produces a separate [`SkippedCandidate`] entry in `out`.
 pub(super) fn collect_skipped_candidates(
     plan: &PackPlan,
     skips: &[SkipRecord],
@@ -561,10 +638,11 @@ pub(super) fn collect_skipped_candidates(
     if skips.is_empty() {
         return;
     }
-    // `candidate_offsets` are sorted by pack offset, enabling binary partitioning.
     let offsets = &plan.candidate_offsets;
     for skip in skips {
         let reason = CandidateSkipReason::from_pack_skip(&skip.reason);
+        // Two partition_points carve out the equal-range [start..end) of
+        // candidates at this offset (sorted invariant of candidate_offsets).
         let start = offsets.partition_point(|c| c.offset < skip.offset);
         let end = offsets.partition_point(|c| c.offset <= skip.offset);
         for cand in &offsets[start..end] {

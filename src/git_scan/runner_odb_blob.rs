@@ -4,10 +4,36 @@
 //! pack order. If candidate caps or path arena limits are exceeded during
 //! blob introduction, retries via the spill/dedupe pipeline.
 //!
-//! # Streaming Plan Generation
-//! Pack plans are generated on a background thread and streamed to the
-//! execution loop via a bounded channel, overlapping planning with
-//! pack decode + scan.
+//! # Pipeline Stages
+//!
+//! 1. **Blob introduction** -- walks the commit graph and emits
+//!    (oid, pack_id, path) candidates for blobs first introduced by each
+//!    commit.  On success the candidates land directly in the
+//!    `PackCandidateCollector`; on overflow (`CandidateLimitExceeded` /
+//!    `PathArenaFull`) the introducer's seen-set is reset and the walk is
+//!    re-run through a `Spiller` → `MappingBridge` dedupe pipeline.
+//!
+//! 2. **Pack planning** -- candidates are bucketed by pack id, then a
+//!    per-pack plan (topologically sorted decode order including delta base
+//!    dependencies) is built on a **background thread** and streamed to the
+//!    execution loop via a bounded channel (`sync_channel(1)`), overlapping
+//!    planning I/O with decode + scan.
+//!
+//! 3. **Pack execution** -- one of three strategies is selected at runtime:
+//!    - *Single-threaded* (`pack_exec_workers == 1`): plans are consumed
+//!      serially with a single cache and engine adapter.
+//!    - *Per-pack parallel* (`pack_count >= workers`): each worker pulls
+//!      whole pack plans from a shared work queue; results carry a sequence
+//!      number and are reassembled in plan order for determinism.
+//!    - *Intra-pack shard* (few packs, many candidates): the exec-index
+//!      array for each plan is split into contiguous shards so workers
+//!      share the same pack bytes but decode disjoint regions.
+//!
+//! 4. **Loose scan** -- loose object candidates that did not map to any
+//!    pack are scanned after all pack plans complete.
+//!
+//! All outputs are merged deterministically regardless of worker count so
+//! that the same input always produces the same `ScanModeOutput`.
 
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -53,13 +79,24 @@ use super::repo_open::RepoJobState;
 
 /// Runs the ODB-blob fast-path scan pipeline.
 ///
-/// Computes first-introduced blobs from the commit graph and scans them in
-/// pack order. If candidate caps or path arena limits are exceeded during
-/// blob introduction, retries via the spill/dedupe pipeline.
+/// Walks the commit graph to identify first-introduced blobs, maps them to
+/// pack offsets via the MIDX, builds per-pack decode plans, then decodes
+/// and scans blob contents through the detection engine.  See the module
+/// docs for the full stage breakdown and parallelism strategies.
 ///
-/// Returns a `ScanModeOutput` containing scanned blobs, path arena, skip
-/// records, pack execution reports, and stage timing data. The caller
-/// (dispatcher) is responsible for finalize, persist, and perf snapshot.
+/// # Spill / retry
+///
+/// If the in-memory candidate collector exceeds its capacity or path-arena
+/// budget during blob introduction, the fast-path aborts and the function
+/// retries the entire introduction through the spill/dedupe pipeline
+/// (`Spiller` → `MappingBridge`).  The introducer's seen-set is reset
+/// before the retry so every candidate is re-emitted.
+///
+/// # Determinism
+///
+/// Regardless of worker count, outputs are reassembled in pack-plan order
+/// (and, for intra-pack sharding, in shard order) so that the same input
+/// always produces identical `ScanModeOutput`.
 ///
 /// # Parameters
 /// - `repo`: opened repository job state (paths, object format, artifacts).
@@ -71,8 +108,8 @@ use super::repo_open::RepoJobState;
 ///
 /// # Errors
 /// Returns `GitScanError` on MIDX, pack plan, pack exec, or I/O failures.
-/// Returns `GitScanError::ConcurrentMaintenance` if artifacts change during
-/// planning (pre-execution check).
+/// Returns `GitScanError::ConcurrentMaintenance` if artifacts change
+/// between planning start and execution start.
 pub(super) fn run_odb_blob(
     repo: &RepoJobState,
     engine: &Engine,
@@ -108,6 +145,11 @@ pub(super) fn run_odb_blob(
         mapping_cfg.max_loose_candidates,
     );
 
+    // ── Stage 1: blob introduction ───────────────────────────────────
+    // Attempt the fast path first (in-memory collector).  On capacity
+    // overflow, fall back to the spill/dedupe pipeline which writes
+    // candidates to disk, deduplicates via `seen_store`, then maps back
+    // through a `MappingBridge`.
     let intro_start = Instant::now();
     let (intro_stats, mut packed, loose, path_arena, spill_stats, mapping_stats) = {
         let mut collector = PackCandidateCollector::new(
@@ -191,7 +233,7 @@ pub(super) fn run_odb_blob(
         }
     };
 
-    // Pack planning + execution.
+    // ── Stage 2 + 3: pack planning + execution ──────────────────────
     let pack_plan_start = Instant::now();
     let pack_dirs = collect_pack_dirs(&repo.paths);
     let pack_names = list_pack_files(&pack_dirs)?;
@@ -237,12 +279,14 @@ pub(super) fn run_odb_blob(
         finding_arena: Vec::new(),
     };
 
+    // Lazy timing gate: we only start the pack-exec stopwatch the first
+    // time work is actually dispatched.  This avoids charging planning or
+    // setup time to the pack-exec stage metric.
     let mut pack_exec_started = false;
     let mut pack_exec_start = Instant::now();
     let mut pack_exec_alloc_before = AllocStats::default();
     let mut start_pack_exec = || {
         if !pack_exec_started {
-            // Start timing/alloc counters only if we actually execute work.
             pack_exec_started = true;
             pack_exec_start = Instant::now();
             pack_exec_alloc_before = alloc_stats();
@@ -250,18 +294,28 @@ pub(super) fn run_odb_blob(
     };
 
     if packed_len > 0 {
-        // Scale plan caps for large candidate sets in ODB-blob mode.
+        // ODB-blob mode may produce very large candidate sets (one per
+        // first-introduced blob); scale the plan builder's internal
+        // worklist/lookup caps to at least 2x the candidate count so it
+        // doesn't hit artificial limits.
         let scaled = packed_len.saturating_mul(2);
         pack_plan_cfg.max_worklist_entries = pack_plan_cfg.max_worklist_entries.max(scaled);
         pack_plan_cfg.max_base_lookups = pack_plan_cfg.max_base_lookups.max(scaled);
 
         let (mut buckets, pack_ids) = bucket_pack_candidates(packed.drain(..), pack_views.len())?;
         let pack_plan_count = pack_ids.len();
-        // Prefer one worker per pack when enough packs are available to
-        // preserve sequential access and avoid intra-pack sharding.
+
+        // Execution strategy selection:
+        //   - `pack_exec_workers == 1` → single-threaded (branch below)
+        //   - `pack_plan_count >= workers` → one pack per worker; each
+        //     worker gets exclusive sequential access to its pack bytes.
+        //   - otherwise → intra-pack sharding; workers share the same
+        //     pack mmap but decode disjoint exec-index ranges.
         let prefer_pack_parallelism = pack_exec_workers > 1 && pack_plan_count >= pack_exec_workers;
-        // Stream per-pack plans to overlap planning with execution while
-        // keeping deterministic pack order.
+
+        // Bounded(1) channel: the planner blocks after producing one plan
+        // until the executor consumes it, bounding memory to at most two
+        // plans in flight (one being built, one being executed).
         let (tx, rx) = mpsc::sync_channel::<Result<PackPlan, PackPlanError>>(1);
 
         std::thread::scope(|scope| -> Result<(), GitScanError> {
@@ -306,6 +360,7 @@ pub(super) fn run_odb_blob(
                 }
             });
 
+            // ── Strategy A: single-threaded execution ──────────────
             if pack_exec_workers == 1 {
                 let mut cache = PackCache::new(pack_cache_bytes);
                 let mut external = PackIo::from_parts(
@@ -367,6 +422,11 @@ pub(super) fn run_odb_blob(
                 }
 
                 scanned = adapter.take_results();
+            // ── Strategy B: per-pack parallel execution ────────────
+            // Workers pull whole pack plans from a shared queue.
+            // Each (seq, plan) pair carries a sequence number assigned
+            // by the dispatcher so results can be slotted back in plan
+            // order during reassembly.
             } else if prefer_pack_parallelism {
                 let (work_tx, work_rx) = mpsc::sync_channel::<(usize, PackPlan)>(pack_exec_workers);
                 let work_rx = Arc::new(Mutex::new(work_rx));
@@ -457,8 +517,12 @@ pub(super) fn run_odb_blob(
                     }));
                 }
 
+                // Drop the sender half owned by the dispatcher thread so
+                // workers see channel closure once all plans are consumed.
                 drop(result_tx);
 
+                // Dispatch plans to the work queue, tagging each with a
+                // monotonic sequence number for deterministic reassembly.
                 let mut plan_count = 0usize;
                 for plan in rx {
                     let plan = plan?;
@@ -513,9 +577,12 @@ pub(super) fn run_odb_blob(
                     skipped_candidates.extend(skipped);
                     append_scanned_blobs(&mut scanned, scanned_pack);
                 }
+            // ── Strategy C: intra-pack shard execution ─────────────
+            // Fewer packs than workers: partition each plan's exec-index
+            // array into contiguous shards so workers decode disjoint
+            // regions of the same pack.  Shard outputs are merged in
+            // shard-index order to preserve determinism.
             } else {
-                // Not enough packs to keep workers busy: shard within a
-                // single pack while preserving deterministic shard order.
                 for plan in rx {
                     let plan = plan?;
                     pack_plan_stats.push(plan.stats);
@@ -668,6 +735,8 @@ pub(super) fn run_odb_blob(
 
             Ok(())
         })?;
+    // ── Stage 4: loose-only fallback ────────────────────────────────
+    // No packed candidates at all; scan only loose objects.
     } else if !loose.is_empty() {
         start_pack_exec();
         let mut adapter = EngineAdapter::new(engine, config.engine_adapter);
@@ -687,6 +756,9 @@ pub(super) fn run_odb_blob(
         append_scanned_blobs(&mut scanned, adapter.take_results());
     }
 
+    // ── Metrics assembly ────────────────────────────────────────────
+    // pack_plan time = serial prelude (MIDX verify, mmap, etc.) + the
+    // wall-clock time the background planner thread spent building plans.
     stage_nanos.pack_plan =
         pack_plan_prelude_nanos.saturating_add(pack_plan_thread_nanos.load(Ordering::Relaxed));
 

@@ -1,22 +1,50 @@
-//! Core scanning engine implementation.
+//! Core scanning engine: compilation, prefiltering, and scan orchestration.
 //!
-//! Purpose: compile rules/transforms into prefilter and gating databases, then
-//! drive bounded scans over raw and decoded buffers.
+//! ## Purpose
 //!
-//! Invariants / safety rules:
+//! Compile rule specs and transform configs into prefilter databases (Vectorscan),
+//! gating structures (Base64 YARA gate, keyword/entropy gates), and compiled
+//! regexes. Then drive bounded scans over raw and decoded buffers.
+//!
+//! ## Invariants
+//!
 //! - Inputs passed to `scan_*` must be chunked so `buf.len() <= u32::MAX`.
 //! - [`ScanScratch`] is single-threaded and must not be shared across threads.
+//! - The decode slab does not reallocate during a scan; all `unsafe` slice
+//!   construction relies on this property.
 //!
-//! High-level algorithm:
-//! 1. Build anchor sets (manual and/or derived) and Vectorscan prefilter DBs.
-//! 2. For each buffer, prefilter -> build windows -> validate regexes.
-//! 3. Optionally decode transform spans (gated and deduped) and rescan via a
-//!    work queue while enforcing per-scan budgets.
+//! ## Algorithm
 //!
-//! Design choices:
-//! - Engine construction fails fast if prefilter DBs cannot be built.
-//! - Base64 pre-gates are conservative and only avoid decode work; they never
-//!   replace decoded-space validation.
+//! ### Build phase (`new` / `new_with_anchor_policy`)
+//!
+//! 1. Compile each [`RuleSpec`](crate::api::RuleSpec) into a [`RuleCompiled`]
+//!    with precompiled regexes and optional gates.
+//! 2. Derive anchor patterns from regex analysis (or use manual anchors per
+//!    policy). Build deduped pattern maps for raw + UTF-16 variants.
+//! 3. Construct Vectorscan prefilter DBs (raw, UTF-16, stream, gate) and
+//!    the Base64 YARA pre-gate.
+//!
+//! ### Scan phase (`scan_chunk_into`)
+//!
+//! 1. Run Vectorscan prefilter on root buffer to populate touched pairs.
+//! 2. Enqueue `ScanBuf(root)` into the work queue.
+//! 3. Process work items in FIFO order:
+//!    - `ScanBuf`: validate regexes in prefilter windows (see
+//!      [`buffer_scan`](super::buffer_scan)), then discover transform spans
+//!      and enqueue `DecodeSpan` items.
+//!    - `DecodeSpan`: decode the span, then enqueue a `ScanBuf` for the
+//!      decoded output.
+//! 4. Budgets (decode bytes, work items, depth) are enforced per-item so no
+//!    single input forces unbounded work.
+//!
+//! ## Design choices
+//!
+//! - Engine construction fails fast if required prefilter DBs cannot be built.
+//! - Base64 pre-gates are conservative: they only skip decode work when no
+//!   anchor *could* appear. Decoded-space validation remains authoritative.
+//! - Raw regex patterns are included in the Vectorscan prefilter DB only for
+//!   rules with weak or missing literal anchors (< 5 bytes). Rules with strong
+//!   anchors rely on anchor-pattern matching alone, reducing DB size.
 
 use crate::api::*;
 use crate::b64_yara_gate::{Base64YaraGate, Base64YaraGateConfig, PaddingPolicy, WhitespacePolicy};
@@ -294,7 +322,12 @@ impl Engine {
             })
             .collect::<Vec<_>>();
 
-        // Build deduped anchor patterns: pattern -> targets
+        // Build deduped anchor pattern maps.
+        //
+        // `pat_map_all` holds raw + UTF-16 patterns (used for the prefilter DB
+        // and Base64 YARA gate). `pat_map_utf16` holds only UTF-16 patterns
+        // (used for the standalone UTF-16 anchor DB). Each map entry maps a
+        // byte pattern to the list of (rule, variant) targets it covers.
         let mut pat_map_all: AHashMap<Vec<u8>, Vec<Target>> =
             AHashMap::with_capacity(rules.len().saturating_mul(3).max(16));
         let mut pat_map_utf16: AHashMap<Vec<u8>, Vec<Target>> =
@@ -548,17 +581,23 @@ impl Engine {
             .max()
             .unwrap_or(0);
 
-        // Compute per-rule flags for whether to include raw regex in prefilter DB.
-        // Rules with strong literal anchors (5+ bytes, all anchors) can skip raw regex
-        // prefiltering and rely on anchor patterns instead. This reduces Vectorscan DB
-        // size and improves clean-data throughput.
+        // Decide per-rule whether to include the raw regex in the Vectorscan
+        // prefilter DB. The tradeoff:
         //
-        // We require 5+ bytes (not 4) to be conservative:
-        // - Short anchors may have case-sensitivity mismatches with the regex
-        // - Longer anchors are more likely to be unique and correctly case-matched
+        //   Include regex  → Vectorscan can match directly, but DB is larger
+        //                     and compilation/scan time scales with pattern count.
+        //   Omit regex     → rely on literal anchor patterns alone, which is
+        //                     cheaper but only works if anchors are strong enough
+        //                     to avoid false negatives.
         //
-        // We also keep raw prefilter for case-insensitive regexes since anchor patterns
-        // are byte-exact and won't match different-case variants.
+        // A rule can safely omit its raw regex from the prefilter when:
+        //   • It has at least one anchor pattern.
+        //   • Every anchor is ≥ 5 bytes (short anchors risk case-sensitivity
+        //     mismatches with the regex — anchor patterns are byte-exact).
+        //   • The regex is NOT case-insensitive (byte-exact anchors cannot
+        //     match alternate casings that the regex would accept).
+        //
+        // Rules that fail any check keep their regex in the prefilter DB.
         let use_raw_prefilter: Vec<bool> = rules
             .iter()
             .map(|r| {
@@ -816,11 +855,66 @@ impl Engine {
         base_offset: u64,
         scratch: &mut ScanScratch,
     ) {
+        // ── Step A: ensure VS scratch capacity (first call only) ────────
+        scratch.ensure_capacity(self);
+
+        // ── Step B: clear only prefilter state ──────────────────────────
+        scratch
+            .hit_acc_pool
+            .reset_touched(scratch.touched_pairs.as_slice());
+        scratch.touched_pairs.clear();
+
+        // ── Step C: overlap tracking (always needed, cheap) ─────────────
+        scratch.update_chunk_overlap(file_id, base_offset, root_buf.len());
+
+        // ── Step D: run Vectorscan prefilter directly on root buffer ────
+        let vs = self
+            .vs
+            .as_ref()
+            .expect("vectorscan prefilter database unavailable (fallback disabled)");
+        let mut vs_scratch_owned = scratch
+            .vs_scratch
+            .take()
+            .expect("vectorscan scratch missing");
+        #[cfg(feature = "stats")]
+        self.vs_stats
+            .scans_attempted
+            .fetch_add(1, Ordering::Relaxed);
+        let (result, _vs_nanos) =
+            crate::git_scan::perf::time(|| vs.scan_raw(root_buf, scratch, &mut vs_scratch_owned));
+        crate::git_scan::perf::record_scan_vs_prefilter(_vs_nanos);
+        scratch.vs_scratch = Some(vs_scratch_owned);
+        let saw_utf16 = match result {
+            Ok(saw) => {
+                #[cfg(feature = "stats")]
+                self.vs_stats.scans_ok.fetch_add(1, Ordering::Relaxed);
+                saw
+            }
+            Err(err) => {
+                #[cfg(feature = "stats")]
+                self.vs_stats.scans_err.fetch_add(1, Ordering::Relaxed);
+                panic!("vectorscan scan failed with fallback disabled: {err}");
+            }
+        };
+
+        // ── Step E: FAST PATH — zero hits → skip everything ─────────────
+        if scratch.touched_pairs.is_empty() {
+            crate::git_scan::perf::record_scan_prefilter_bypass();
+            crate::git_scan::perf::record_scan_zero_hit_chunk();
+            scratch.out.clear();
+            scratch.norm_hash.clear();
+            scratch.drop_hint_end.clear();
+            return;
+        }
+
+        // ── Step F: HIT PATH — selective reset, set one-shot flag ───────
+        scratch.root_prefilter_saw_utf16 = saw_utf16;
+        scratch.root_prefilter_done = true;
         let ((), _reset_nanos) = crate::git_scan::perf::time(|| {
-            scratch.reset_for_scan(self);
+            scratch.reset_for_scan_after_prefilter(self);
         });
         crate::git_scan::perf::record_scan_reset(_reset_nanos);
-        scratch.update_chunk_overlap(file_id, base_offset, root_buf.len());
+
         scratch.work_q.push(WorkItem::ScanBuf {
             buf: BufRef::Root,
             step_id: STEP_ROOT,
@@ -830,9 +924,18 @@ impl Engine {
             depth: 0,
         });
 
+        // ── Work-queue loop ────────────────────────────────────────────
+        //
+        // Process items in FIFO order. Each `ScanBuf` may enqueue `DecodeSpan`
+        // items (for transforms), and each `DecodeSpan` enqueues a `ScanBuf`
+        // for the decoded output. This breadth-first traversal replaces
+        // recursion, making depth and budget limits trivially enforceable.
+        //
+        // Budget gates checked per-iteration:
+        //   • `total_decode_output_bytes` vs `max_total_decode_output_bytes`
+        //   • `work_items_enqueued` vs `max_work_items` (inside ScanBuf arm)
+        //   • `depth` vs `max_transform_depth` (inside ScanBuf arm)
         while scratch.work_head < scratch.work_q.len() {
-            // Work-queue traversal avoids recursion and makes transform depth
-            // and total work item budgets explicit and enforceable.
             if scratch.total_decode_output_bytes >= self.tuning.max_total_decode_output_bytes {
                 break;
             }
@@ -850,23 +953,28 @@ impl Engine {
                     depth,
                 } => {
                     let before = scratch.out.len();
+                    // Resolve the buffer reference to a raw pointer + length.
+                    //
+                    // We use raw pointers (and reconstruct a slice below) to avoid
+                    // holding a borrow on `scratch.slab` while we pass `scratch` mutably
+                    // into `scan_rules_on_buffer`. This is sound because:
+                    //
+                    //   1. The slab is pre-allocated and never reallocated during a scan,
+                    //      so the pointer remains valid.
+                    //   2. `scan_rules_on_buffer` writes only to scratch output buffers
+                    //      (findings, hit accumulators), never to the slab region backing
+                    //      `cur_buf`. No aliasing violation occurs.
+                    //   3. `root_buf` is caller-owned and immutable for the scan duration.
                     let (buf_ptr, buf_len, buf_offset) = match &buf {
                         BufRef::Root => (root_buf.as_ptr(), root_buf.len(), 0usize),
                         BufRef::Slab(range) => unsafe {
                             debug_assert!(range.end <= scratch.slab.buf.len());
-                            // SAFETY: `range` is sourced from decode output and stays in-bounds.
-                            // The slab does not grow or reallocate during a scan (capacity is
-                            // pre-allocated), and `scan_rules_on_buffer` never writes to the
-                            // slab region backing `cur_buf`, so no aliasing violation occurs.
                             let ptr = scratch.slab.buf.as_ptr().add(range.start);
                             (ptr, range.end.saturating_sub(range.start), range.start)
                         },
                     };
 
-                    // SAFETY: `buf_ptr` points into `root_buf` (caller-owned, immutable for
-                    // the duration of the scan) or the decode slab (pre-allocated, not
-                    // reallocated during a scan). `buf_len` is bounded by the checked range.
-                    // No mutable references alias `cur_buf` while it is live.
+                    // SAFETY: see the comment block above for the full aliasing argument.
                     let cur_buf = unsafe { std::slice::from_raw_parts(buf_ptr, buf_len) };
 
                     // Build mapping context to translate decoded-space offsets back to root buffer
@@ -1011,6 +1119,19 @@ impl Engine {
                                 }
                             }
 
+                            // Base64 alignment shifts.
+                            //
+                            // A Base64-encoded span may not start on a 4-character boundary
+                            // relative to the original encoding. Shifting by 0..3 characters
+                            // tries each possible alignment and produces up to 4 decode
+                            // sub-spans. Non-Base64 transforms always produce a single span.
+                            //
+                            // For each shift, `base64_skip_chars` returns the byte offset to
+                            // skip leading non-alphabet chars (whitespace, padding) plus
+                            // `shift` alignment chars. If the remaining encoded characters
+                            // are fewer than `min_len`, the shift is skipped. Duplicate start
+                            // offsets (which can occur when whitespace collapses shifts) are
+                            // also deduplicated.
                             let mut span_starts = [0usize; 4];
                             let mut span_ends = [0usize; 4];
                             let mut span_count = 0usize;
@@ -1126,10 +1247,13 @@ impl Engine {
                         continue;
                     }
 
+                    // Resolve the encoded span to a raw pointer + length.
+                    // Same aliasing argument as the ScanBuf arm: root_buf is
+                    // immutable; the slab is pre-allocated and not reallocated.
+                    // Bounds are checked before pointer arithmetic.
                     let (enc_ptr, enc_len) = match &enc_ref {
                         EncRef::Root(r) => {
                             if r.end <= root_buf.len() {
-                                // SAFETY: bounds are checked against `root_buf`.
                                 let ptr = unsafe { root_buf.as_ptr().add(r.start) };
                                 (ptr, r.end - r.start)
                             } else {
@@ -1138,8 +1262,6 @@ impl Engine {
                         }
                         EncRef::Slab(r) => {
                             if r.end <= scratch.slab.buf.len() {
-                                // SAFETY: bounds are checked against the slab; it does not
-                                // reallocate during a scan.
                                 let ptr = unsafe { scratch.slab.buf.as_ptr().add(r.start) };
                                 (ptr, r.end - r.start)
                             } else {
@@ -1147,8 +1269,6 @@ impl Engine {
                             }
                         }
                     };
-                    // SAFETY: `enc_ptr` points into `root_buf` or the decode slab. Both remain
-                    // valid for the duration of this scan and are not reallocated.
                     let enc = unsafe { std::slice::from_raw_parts(enc_ptr, enc_len) };
                     let root_hint_maps_encoded = match (&enc_ref, &root_hint) {
                         (EncRef::Root(span), Some(hint)) => {

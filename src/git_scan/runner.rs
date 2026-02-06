@@ -271,6 +271,10 @@ pub enum CandidateSkipReason {
 }
 
 impl CandidateSkipReason {
+    /// Converts a pack-execution [`SkipReason`] into the public skip taxonomy.
+    ///
+    /// Lossy: the inner error payload is discarded. Callers that need the
+    /// original error should retain the `SkipReason` separately.
     pub(super) fn from_pack_skip(reason: &SkipReason) -> Self {
         match reason {
             SkipReason::PackParse(_) => Self::PackParse,
@@ -368,9 +372,20 @@ pub struct GitScanMetricsSnapshot {
 }
 
 impl GitScanMetricsSnapshot {
-    /// Formats metrics as stable key=value lines.
+    /// Formats metrics as machine-parseable `key=value\n` lines.
     ///
-    /// `cycles_per_byte` uses `GIT_SCAN_CPU_HZ` when set; otherwise it is `0`.
+    /// Output sections (in order):
+    /// 1. **stage.\*** — wall-clock nanoseconds per pipeline stage.
+    /// 2. **tree_diff/tree_load/tree_cache/tree_object/tree_inflate/tree_delta_\*** —
+    ///    tree-walk throughput and cache counters.
+    /// 3. **pack_inflate/delta_apply/scan** — pack-decode throughput with optional
+    ///    `cycles_per_byte` (requires `GIT_SCAN_CPU_HZ` env var; `0` when unset).
+    /// 4. **mapping** — mapping bridge call count and latency.
+    /// 5. **spill/alloc** — spill IO and allocator deltas.
+    ///
+    /// All throughput helpers return `0` when the denominator is zero (no
+    /// division-by-zero). The format is append-only: new keys may be added at the
+    /// end, but existing keys and their order are stable across versions.
     #[must_use]
     pub fn format(&self) -> String {
         fn bytes_per_sec(bytes: u64, nanos: u64) -> u64 {
@@ -615,6 +630,8 @@ impl GitScanMetricsSnapshot {
 
         push_line(&mut out, "mapping.calls", self.perf.mapping_calls);
         push_line(&mut out, "mapping.nanos", self.perf.mapping_nanos);
+        // Reuse nanos_per_byte as a generic nanos/count divider.
+        // .max(1) avoids div-by-zero when no mapping calls were recorded.
         push_line(
             &mut out,
             "mapping.ns_per_call",
@@ -713,12 +730,15 @@ impl GitScanReport {
 /// consider splitting into a hot accumulator (scanned, skips, reports) and
 /// cold stats (everything else) for cache locality.
 pub(super) struct ScanModeOutput {
+    // -- Hot during finalize: touched when building FinalizeInput. --
     /// Scanned blob results and finding arena.
     pub scanned: ScannedBlobs,
     /// Path arena used for candidate path storage.
     pub path_arena: ByteArena,
     /// Candidates skipped with explicit reasons.
     pub skipped_candidates: Vec<SkippedCandidate>,
+
+    // -- Execution reports: forwarded verbatim into GitScanReport. --
     /// Pack decode + scan reports, one per pack plan.
     pub pack_exec_reports: Vec<PackExecReport>,
     /// Per-pack-plan statistics.
@@ -729,6 +749,8 @@ pub(super) struct ScanModeOutput {
     pub pack_plan_delta_deps_total: u64,
     /// Maximum delta dependency count in a single pack plan.
     pub pack_plan_delta_deps_max: u32,
+
+    // -- Cold stats: read once when assembling the report. --
     /// Tree diff stage statistics.
     pub tree_diff_stats: TreeDiffStats,
     /// Spill/dedupe stage statistics.
@@ -988,7 +1010,9 @@ pub fn run_git_scan(
         persist_finalize_output(store, &finalize)?;
     }
 
-    // Perf snapshot + report.
+    // Perf snapshot: mapping and scan timings live in thread-local perf
+    // counters (accumulated across pack-exec workers), not wall-clock
+    // `Instant` measurements, so we patch them into stage_nanos here.
     let perf_stats = super::perf::snapshot();
     output.stage_nanos.mapping = perf_stats.mapping_nanos;
     output.stage_nanos.scan = perf_stats.scan_nanos;

@@ -509,9 +509,15 @@ fn main() -> io::Result<()> {
                     "  blobs: {}  chunks: {}  zero_hit_chunks: {} ({:.1}%)  findings: {}",
                     blobs, chunks, zero_hit, zero_pct, findings
                 );
+                let prefilter_bypass = perf.scan_prefilter_bypass_count;
+                let prefilter_bypass_pct = if chunks > 0 {
+                    (prefilter_bypass as f64 / chunks as f64) * 100.0
+                } else {
+                    0.0
+                };
                 eprintln!(
-                    "  chunker_bypass: {} ({:.1}%)  binary_skip: {}",
-                    bypass, bypass_pct, binary_skip
+                    "  chunker_bypass: {} ({:.1}%)  binary_skip: {}  prefilter_bypass: {} ({:.1}%)",
+                    bypass, bypass_pct, binary_skip, prefilter_bypass, prefilter_bypass_pct
                 );
             }
             Ok(())

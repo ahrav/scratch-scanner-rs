@@ -4,10 +4,47 @@
 //! spills and deduplicates candidates, then batch-plans and executes pack
 //! decode + scan.
 //!
-//! # Batch Planning
+//! # Pipeline stages
+//!
+//! ```text
+//! PlannedCommits ──► TreeDiff ──► Spill/Dedupe ──► MappingBridge ──► PackPlan ──► PackExec
+//!   (topo order)    (blob OIDs)   (seen filter)    (OID→pack loc)   (per-pack)   (decode+scan)
+//! ```
+//!
+//! 1. **Tree diff** – walks each planned commit, diffs its tree against parent
+//!    trees (or the empty tree for snapshot roots) to discover changed blob
+//!    OIDs. Candidates stream directly into the spiller to bound memory.
+//! 2. **Spill / dedupe** – the spiller externalizes candidates to disk when the
+//!    in-memory budget is exceeded, then replays them through the seen-blob
+//!    store to drop already-scanned OIDs.
+//! 3. **Mapping bridge** – maps surviving OIDs to pack locations via the MIDX,
+//!    partitioning into packed and loose candidate sets. Produces a `ByteArena`
+//!    of file paths that pack-exec and loose-scan reference by `ByteRef`.
+//! 4. **Pack planning** – groups packed candidates by pack file and builds a
+//!    topologically-sorted decode plan that respects delta chains.
+//! 5. **Pack execution** – decodes pack entries, resolves deltas, and feeds
+//!    reconstructed blobs to the detection engine for scanning.
+//!
+//! # Batch planning
+//!
 //! Unlike the ODB-blob path, all pack plans are built before execution begins.
-//! The `PackExecStrategy` enum selects serial, pack-parallel, or intra-pack
-//! sharded execution based on worker count and plan volume.
+//! This enables a pre-execution artifact staleness check: if `git gc` or
+//! `git repack` ran between planning and execution, the function bails with
+//! `ConcurrentMaintenance` rather than reading corrupt pack offsets.
+//!
+//! # Execution strategies
+//!
+//! The `PackExecStrategy` enum selects one of three modes based on worker
+//! count and plan volume:
+//!
+//! | Strategy | Condition | Parallelism |
+//! |---|---|---|
+//! | `Serial` | 1 worker or 0 plans | Single-threaded, minimal overhead |
+//! | `PackParallel` | plans ≥ workers | One plan per worker, work-stealing via shared channel |
+//! | `IntraPackSharded` | plans < workers | Shard each plan's offset indices across workers |
+//!
+//! All three strategies produce **deterministic output order** by reassembling
+//! results in planned sequence, regardless of worker completion order.
 
 use std::io;
 use std::sync::{mpsc, Arc, Mutex};
@@ -51,24 +88,33 @@ use super::runner_exec::{
 ///
 /// Walks planned commits, diffs trees to discover changed blobs, streams
 /// candidates through the spill/dedupe pipeline, then batch-plans and
-/// executes pack decode + scan.
+/// executes pack decode + scan. See the [module docs](self) for the full
+/// pipeline diagram and execution strategy selection.
 ///
-/// Returns a `ScanModeOutput` containing scanned blobs, path arena, skip
-/// records, pack execution reports, and stage timing data. The caller
-/// (dispatcher) is responsible for finalize, persist, and perf snapshot.
+/// The caller (dispatcher) is responsible for finalize, persist, and perf
+/// snapshot on the returned output.
 ///
-/// # Parameters
-/// - `repo`: opened repository job state (paths, object format, artifacts).
-/// - `engine`: detection engine instance for scanning blob contents.
-/// - `seen_store`: seen-blob store for deduplication during spill/dedupe.
-/// - `cg`: commit graph for tree root lookups and parent traversal.
-/// - `plan`: commit plan (planned commits from `introduced_by_plan`).
-/// - `config`: scan configuration (limits, worker counts, etc.).
+/// # Determinism
+///
+/// Output order is deterministic for identical inputs regardless of worker
+/// count. Parallel strategies reassemble results by planned sequence index,
+/// and loose candidates are always appended after all packed results.
+///
+/// # Lifetime of the returned path arena
+///
+/// The `path_arena` in the returned [`ScanModeOutput`] owns all file-path
+/// bytes referenced by `ByteRef` handles in the scanned blobs and skipped
+/// candidates. It must outlive any downstream consumer that dereferences
+/// those handles.
 ///
 /// # Errors
-/// Returns `GitScanError` on MIDX, pack plan, pack exec, or I/O failures.
-/// Returns `GitScanError::ConcurrentMaintenance` if artifacts change between
-/// planning and execution (pre-execution check).
+///
+/// - MIDX load, completeness, or OID resolution failures.
+/// - Pack plan errors (out-of-range pack IDs, corrupt headers).
+/// - Pack exec errors (decode failures, delta resolution, I/O).
+/// - `GitScanError::ConcurrentMaintenance` if repository artifacts (pack
+///   files, indices) changed between pack planning and pack execution,
+///   indicating a concurrent `git gc` or `git repack`.
 pub(super) fn run_diff_history(
     repo: &RepoJobState,
     engine: &Engine,
@@ -90,8 +136,14 @@ pub(super) fn run_diff_history(
     let mut spiller = Spiller::new(config.spill, repo.object_format.oid_len(), &spill_dir)?;
     let mut object_store = ObjectStore::open(repo, &config.tree_diff, &spill_dir)?;
     let mut walker = TreeDiffWalker::new(&config.tree_diff, repo.object_format.oid_len());
+    // Reused across commits to avoid per-commit allocation for parent position lists.
     let mut parent_scratch = ParentScratch::new();
 
+    // ── Stage 1: Tree diff ──────────────────────────────────────────────
+    // Walk each planned commit and diff its tree against parent trees to
+    // discover changed blob OIDs. The SpillCandidateSink streams candidates
+    // directly into the spiller, bounding memory even for repositories with
+    // millions of changed blobs.
     {
         let diff_start = Instant::now();
         let mut sink = SpillCandidateSink::new(&mut spiller);
@@ -99,6 +151,9 @@ pub(super) fn run_diff_history(
             let commit_id = pos.0;
             let new_tree = cg.root_tree_oid(*pos)?;
 
+            // Snapshot roots are diffed against the empty tree (old_tree=None),
+            // treating every blob in the tree as a new addition. This is used
+            // for orphan commits and forced snapshot points in the commit plan.
             if *snapshot_root {
                 walker.diff_trees(
                     &mut object_store,
@@ -119,6 +174,8 @@ pub(super) fn run_diff_history(
             )?;
             let parents = parent_scratch.as_slice();
 
+            // Parentless commits (e.g. grafted roots) use the same empty-tree
+            // diff as snapshot roots—every blob is considered introduced.
             if parents.is_empty() {
                 walker.diff_trees(
                     &mut object_store,
@@ -161,6 +218,13 @@ pub(super) fn run_diff_history(
         stage_nanos.tree_diff = diff_start.elapsed().as_nanos() as u64;
     }
 
+    // ── Stages 2–3: Spill/dedupe → mapping bridge ──────────────────────
+    // Finalize the spiller: flush any on-disk runs, merge-sort, and replay
+    // unique (unseen) OIDs through the mapping bridge. The bridge resolves
+    // each OID to a pack location via the MIDX, splitting candidates into
+    // packed (with pack_id + offset) and loose (fan-out directory lookup).
+    // The returned path arena owns all file-path bytes for the rest of the
+    // pipeline.
     let spill_start = Instant::now();
     let midx = load_midx(repo)?;
     let mut bridge = MappingBridge::new(
@@ -175,16 +239,17 @@ pub(super) fn run_diff_history(
     stage_nanos.spill = spill_start.elapsed().as_nanos() as u64;
     let (mapping_stats, mut sink, mapping_arena) = bridge.finish()?;
 
-    // Pack planning.
+    // ── Stage 4: Pack planning ───────────────────────────────────────────
     let pack_plan_start = Instant::now();
     let pack_dirs = collect_pack_dirs(&repo.paths);
     let pack_names = list_pack_files(&pack_dirs)?;
     midx.verify_completeness(pack_names.iter().map(|n| n.as_slice()))?;
     let pack_paths = resolve_pack_paths(&midx, &pack_dirs)?;
+    // Only mmap packs that contain at least one candidate. This avoids
+    // wasting address space on multi-pack repos where most packs are idle.
     let mut used_pack_ids: Vec<u16> = sink.packed.iter().map(|cand| cand.pack_id).collect();
     used_pack_ids.sort_unstable();
     used_pack_ids.dedup();
-    // Enforce pack mmap limits before decoding to cap address space usage.
     let pack_mmaps = mmap_pack_files(&pack_paths, &used_pack_ids, config.pack_mmap)?;
     let pack_views = build_pack_views(&pack_mmaps, repo.object_format)?;
 
@@ -193,6 +258,8 @@ pub(super) fn run_diff_history(
     let packed_len = sink.packed.len();
     let loose_len = sink.loose.len();
     if !sink.packed.is_empty() {
+        // Move candidates out of the sink to avoid cloning the potentially
+        // large candidate vec; the sink's packed field is left empty.
         let packed = std::mem::take(&mut sink.packed);
         let mut pack_plans = build_pack_plans(packed, &pack_views, &midx, &config.pack_plan)?;
         pack_plan_stats.extend(pack_plans.iter().map(|p| p.stats));
@@ -201,12 +268,14 @@ pub(super) fn run_diff_history(
     let (pack_plan_delta_deps_total, pack_plan_delta_deps_max) = summarize_pack_plan_deps(&plans);
     stage_nanos.pack_plan = pack_plan_start.elapsed().as_nanos() as u64;
 
-    // Validate artifacts before decoding packs to avoid scanning during maintenance.
+    // Gate between planning and execution: if pack files or indices were
+    // rewritten by a concurrent `git gc` / `git repack`, the offsets in our
+    // plans are stale. Bail early rather than reading garbage.
     if !repo.artifacts_unchanged()? {
         return Err(GitScanError::ConcurrentMaintenance);
     }
 
-    // Execute pack plans + scan.
+    // ── Stage 5: Pack execution + scan ───────────────────────────────────
     let pack_cache_bytes: u32 = config
         .pack_cache_bytes
         .try_into()
@@ -224,8 +293,11 @@ pub(super) fn run_diff_history(
 
     let pack_exec_start = Instant::now();
     let pack_exec_alloc_before: AllocStats = alloc_stats();
-    // Keep result assembly deterministic across all execution strategies so
-    // finalize output is stable regardless of worker count.
+    // All three branches below produce identical output for identical inputs.
+    // Parallel branches reassemble results in plan-sequence order to preserve
+    // determinism. Loose candidates are always scanned after packed plans,
+    // outside the parallel scope, because loose reads go through the object
+    // fan-out directory and are not contention-free across threads.
     match pack_exec_strategy {
         PackExecStrategy::Serial => {
             let mut cache = PackCache::new(pack_cache_bytes);
@@ -272,6 +344,10 @@ pub(super) fn run_diff_history(
             scanned = adapter.take_results();
         }
         PackExecStrategy::PackParallel => {
+            // Work-stealing: a bounded sync_channel acts as a shared queue.
+            // Workers pull the next plan when idle, naturally balancing load
+            // when pack sizes vary. The channel bound (= worker count) caps
+            // the number of in-flight plans to avoid over-committing memory.
             std::thread::scope(|scope| -> Result<(), GitScanError> {
                 let (work_tx, work_rx) = mpsc::sync_channel::<(usize, PackPlan)>(pack_exec_workers);
                 let work_rx = Arc::new(Mutex::new(work_rx));
@@ -365,8 +441,13 @@ pub(super) fn run_diff_history(
                     }));
                 }
 
+                // Drop the producer's clone of result_tx so the result channel
+                // closes once all workers finish, allowing the recv loop below
+                // to terminate.
                 drop(result_tx);
 
+                // Eagerly validate pack IDs before sending to workers so the
+                // producer thread surfaces the error, not a worker.
                 for (seq, plan) in plans.into_iter().enumerate() {
                     let pack_id = plan.pack_id as usize;
                     pack_mmaps
@@ -385,7 +466,8 @@ pub(super) fn run_diff_history(
                 }
                 drop(work_tx);
 
-                // Reassemble worker outputs by planned sequence.
+                // Reassemble worker outputs by planned sequence index to
+                // guarantee deterministic result order.
                 let mut outputs: Vec<
                     Option<(PackExecReport, ScannedBlobs, Vec<SkippedCandidate>)>,
                 > = (0..plan_count).map(|_| None).collect();
@@ -434,6 +516,10 @@ pub(super) fn run_diff_history(
             }
         }
         PackExecStrategy::IntraPackSharded => {
+            // When there are fewer plans than workers, we shard each plan's
+            // offset indices across workers so all cores stay busy. Each
+            // shard decodes a disjoint slice of the plan's need_offsets and
+            // the per-shard reports are merged back into a single report.
             for plan in &plans {
                 let plan_ref = plan;
                 let pack_id = plan_ref.pack_id as usize;
