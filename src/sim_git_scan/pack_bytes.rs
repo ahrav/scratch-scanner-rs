@@ -214,7 +214,6 @@ mod tests {
             delta_deps: Vec::new(),
             delta_dep_index: Vec::new(),
             exec_order: None,
-            clusters: Vec::new(),
             stats: PackPlanStats {
                 candidate_count: 1,
                 need_count: 1,

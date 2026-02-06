@@ -936,7 +936,6 @@ mod tests {
             delta_deps,
             delta_dep_index: vec![NONE_U32; need_count],
             exec_order: None,
-            clusters: Vec::new(),
             stats: PackPlanStats::empty(),
         }
     }

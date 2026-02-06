@@ -197,8 +197,6 @@ and the delta-base closure:
   resolver calls to prevent unbounded MIDX lookups.
 - Exec order: optional `Vec<u32>` of indices into `need_offsets` when forward
   dependencies exist.
-- Clusters: ranges over `need_offsets` split when gaps exceed
-  `CLUSTER_GAP_BYTES` (currently omitted because pack exec does not use them).
 
 Memory is linear in `candidates.len()` + `need_offsets.len()` with explicit
 caps on closure expansion and header parsing.

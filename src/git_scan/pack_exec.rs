@@ -2077,7 +2077,6 @@ mod tests {
             delta_deps: Vec::new(),
             delta_dep_index: vec![NONE_U32; stats.need_count as usize],
             exec_order,
-            clusters: Vec::new(),
             stats,
         }
     }
@@ -2224,7 +2223,6 @@ mod tests {
             delta_deps,
             delta_dep_index,
             exec_order: None,
-            clusters: Vec::new(),
             stats: PackPlanStats {
                 candidate_count: 1,
                 need_count: 2,
@@ -2555,7 +2553,6 @@ mod tests {
             delta_deps,
             delta_dep_index,
             exec_order: None,
-            clusters: Vec::new(),
             stats: PackPlanStats {
                 candidate_count: 1,
                 need_count: 2,
@@ -2639,7 +2636,6 @@ mod tests {
             delta_deps,
             delta_dep_index,
             exec_order: None,
-            clusters: Vec::new(),
             stats: PackPlanStats {
                 candidate_count: 1,
                 need_count: 2,
@@ -2721,7 +2717,6 @@ mod tests {
             delta_deps,
             delta_dep_index,
             exec_order: None,
-            clusters: Vec::new(),
             stats: PackPlanStats {
                 candidate_count: 1,
                 need_count: 2,
@@ -2803,7 +2798,6 @@ mod tests {
             delta_deps,
             delta_dep_index,
             exec_order: None,
-            clusters: Vec::new(),
             stats: PackPlanStats {
                 candidate_count: 1,
                 need_count: 2,
@@ -2883,7 +2877,6 @@ mod tests {
             delta_deps,
             delta_dep_index,
             exec_order: None,
-            clusters: Vec::new(),
             stats: PackPlanStats {
                 candidate_count: 1,
                 need_count: 1,

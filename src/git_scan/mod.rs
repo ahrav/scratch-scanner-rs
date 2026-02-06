@@ -156,8 +156,7 @@ pub use pack_idx::{IdxError, IdxOidIter, IdxView};
 pub use pack_io::{PackIo, PackIoError, PackIoLimits};
 pub use pack_plan::{build_pack_plans, OidResolver, PackPlanConfig, PackPlanError, PackView};
 pub use pack_plan_model::{
-    BaseLoc, CandidateAtOffset, Cluster, DeltaDep, DeltaKind, PackPlan, PackPlanStats,
-    CLUSTER_GAP_BYTES,
+    BaseLoc, CandidateAtOffset, DeltaDep, DeltaKind, PackPlan, PackPlanStats,
 };
 pub use pack_reader::{PackReadError, PackReader, SlicePackReader};
 pub use path_policy::PathClass;
