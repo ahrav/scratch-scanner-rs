@@ -125,9 +125,7 @@ impl AtomicBitSet {
     /// `test_and_set` calls may or may not be reflected.
     #[inline]
     pub fn count(&self) -> usize {
-        if self.words.is_empty() {
-            return 0;
-        }
+        let len = self.words.len();
 
         let len = self.words.len();
         let mut total = 0usize;
