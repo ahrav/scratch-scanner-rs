@@ -12,7 +12,6 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 // Import from the library crate
 use scanner_rs::scheduler::bench::{run_benchmark, BenchConfig, BenchReport};
@@ -22,7 +21,6 @@ use scanner_rs::scheduler::bench_local::LocalScanBenchmark;
 use scanner_rs::scheduler::bench_synthetic::{FileSizeDistribution, SyntheticConfig};
 use scanner_rs::scheduler::engine_stub::{MockEngine, MockRule};
 use scanner_rs::scheduler::local::LocalConfig;
-use scanner_rs::scheduler::output_sink::{FileSink, NullSink, OutputSink, StdoutSink};
 
 // ============================================================================
 // Argument Parsing
@@ -36,8 +34,6 @@ struct Args {
     files: Option<usize>,
     file_size: Option<usize>,
     secret_density: Option<f64>,
-    sink: SinkKind,
-    sink_path: Option<PathBuf>,
     tasks: Option<usize>,
     work_ns: Option<u64>,
     warmup: Option<usize>,
@@ -66,24 +62,6 @@ enum Preset {
     Stress,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum SinkKind {
-    Null,
-    Stdout,
-    File,
-}
-
-impl std::fmt::Display for SinkKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            SinkKind::Null => "null",
-            SinkKind::Stdout => "stdout",
-            SinkKind::File => "file",
-        };
-        f.write_str(s)
-    }
-}
-
 impl Default for Args {
     fn default() -> Self {
         Self {
@@ -93,8 +71,6 @@ impl Default for Args {
             files: None,
             file_size: None,
             secret_density: None,
-            sink: SinkKind::Null,
-            sink_path: None,
             tasks: None,
             work_ns: None,
             warmup: None,
@@ -223,24 +199,6 @@ fn parse_args() -> Args {
                 args.secret_density = Some(parse_num(&val, "--secret-density"));
             }
 
-            "--sink" => {
-                let val = next_value(&mut it, "--sink");
-                args.sink = match val.as_str() {
-                    "null" => SinkKind::Null,
-                    "stdout" => SinkKind::Stdout,
-                    "file" => SinkKind::File,
-                    _ => die(&format!(
-                        "Unknown sink: '{}' (expected 'null', 'stdout', or 'file')",
-                        val
-                    )),
-                };
-            }
-
-            "--sink-path" => {
-                let val = next_value(&mut it, "--sink-path");
-                args.sink_path = Some(PathBuf::from(val));
-            }
-
             "--tasks" | "-t" => {
                 let val = next_value(&mut it, "--tasks");
                 let n: usize = parse_num(&val, "--tasks");
@@ -314,9 +272,6 @@ fn validate_arg_combinations(args: &Args) {
             if args.work_ns.is_some() {
                 die("--work-ns is only valid with --bench executor");
             }
-            if args.sink_path.is_some() && args.sink != SinkKind::File {
-                die("--sink-path is only valid with --sink file");
-            }
         }
         BenchType::Executor => {
             if args.files.is_some() {
@@ -327,9 +282,6 @@ fn validate_arg_combinations(args: &Args) {
             }
             if args.secret_density.is_some() {
                 die("--secret-density is only valid with --bench local");
-            }
-            if args.sink != SinkKind::Null || args.sink_path.is_some() {
-                die("--sink/--sink-path are only valid with --bench local");
             }
         }
     }
@@ -361,8 +313,6 @@ LOCAL SCAN OPTIONS (--bench local only):
     -f, --files N           Number of synthetic files
     --file-size SIZE        File size (e.g., 64k, 1m, 2g)
     --secret-density N      Secrets per KB (e.g., 0.01 = ~10 secrets/MB)
-    --sink TYPE             Output sink: null (default), stdout, file
-    --sink-path PATH        Output file path (only with --sink file)
 
 EXECUTOR OPTIONS (--bench executor only):
     -t, --tasks N           Number of tasks
@@ -387,9 +337,6 @@ EXAMPLES:
     # Detailed local scan profiling with 4 workers
     bench --bench local --preset detailed --workers 4
 
-    # Output-heavy scan to stress sink contention
-    bench --bench local --files 1000 --file-size 64k --secret-density 0.05 --sink file
-
     # Executor microbenchmark
     bench --bench executor --tasks 1000000 --work-ns 100
 
@@ -405,42 +352,6 @@ NOTE:
     For CI pipelines, typically use BOTH: bench --preset ci --ci
 "#
     );
-}
-
-// ============================================================================
-// Output Sink Helpers
-// ============================================================================
-
-fn default_sink_path() -> PathBuf {
-    let mut path = std::env::temp_dir();
-    let pid = std::process::id();
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    path.push(format!("scanner-bench-{}-{}.out", pid, nanos));
-    path
-}
-
-fn build_output_sink(args: &Args) -> Arc<dyn OutputSink> {
-    match args.sink {
-        SinkKind::Null => Arc::new(NullSink::new()),
-        SinkKind::Stdout => Arc::new(StdoutSink::new()),
-        SinkKind::File => {
-            let path = args.sink_path.clone().unwrap_or_else(default_sink_path);
-            if args.verbose {
-                eprintln!("Benchmark output sink: file {}", path.display());
-            }
-            let sink = FileSink::create(&path).unwrap_or_else(|e| {
-                die(&format!(
-                    "Failed to create sink file {}: {}",
-                    path.display(),
-                    e
-                ))
-            });
-            Arc::new(sink)
-        }
-    }
 }
 
 // ============================================================================
@@ -626,7 +537,6 @@ fn run_local_bench(args: &Args) {
 
     // Create engine and benchmark
     let engine = Arc::new(default_engine());
-    let output_sink = build_output_sink(args);
 
     if args.verbose {
         eprintln!(
@@ -635,11 +545,10 @@ fn run_local_bench(args: &Args) {
         );
     }
 
-    let mut bench = match LocalScanBenchmark::new_with_output_sink(
+    let mut bench = match LocalScanBenchmark::new(
         Arc::clone(&engine),
         synthetic_config.clone(),
         local_config.clone(),
-        output_sink,
     ) {
         Ok(b) => b,
         Err(e) => {
@@ -670,14 +579,13 @@ fn run_local_bench(args: &Args) {
 
     // Config fingerprint for baseline comparison
     let config_fingerprint = format!(
-        "local:workers={},files={},file_size={:?},chunk={},seed={},density={},sink={}",
+        "local:workers={},files={},file_size={:?},chunk={},seed={},density={}",
         local_config.workers,
         synthetic_config.file_count,
         synthetic_config.file_size,
         local_config.chunk_size,
         local_config.seed,
         synthetic_config.secret_density,
-        args.sink,
     );
 
     handle_baseline(args, &report, "local_scan", &config_fingerprint);

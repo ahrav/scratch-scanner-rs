@@ -47,11 +47,11 @@ use super::rng::XorShift64;
 use super::ts_buffer_pool::{TsBufferHandle, TsBufferPool, TsBufferPoolConfig};
 use crate::perf_stats;
 use crate::scheduler::engine_stub::{FileId, FindingRec, MockEngine, ScanScratch, BUFFER_LEN_MAX};
-use crate::scheduler::output_sink::OutputSink;
+use crate::unified::events::{EventSink, FindingEvent, ScanEvent};
+use crate::unified::SourceKind;
 
 use crossbeam_channel as chan;
 
-use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -395,11 +395,10 @@ enum CpuTask {
 /// Per-CPU-worker scratch space.
 struct CpuScratch {
     engine: Arc<MockEngine>,
-    out: Arc<dyn OutputSink>,
+    event_sink: Arc<dyn EventSink>,
 
     scratch: ScanScratch,
     pending: Vec<FindingRec>,
-    out_buf: Vec<u8>,
 
     dedupe_within_chunk: bool,
 }
@@ -440,11 +439,10 @@ fn dedupe_pending_in_place(p: &mut Vec<FindingRec>) {
     });
 }
 
-/// Formats findings into `out_buf` and flushes them to the output sink.
-fn emit_findings_formatted(
+/// Emit findings as structured events.
+fn emit_findings(
     engine: &MockEngine,
-    out: &Arc<dyn OutputSink>,
-    out_buf: &mut Vec<u8>,
+    event_sink: &dyn EventSink,
     display: &[u8],
     recs: &[FindingRec],
 ) {
@@ -452,22 +450,18 @@ fn emit_findings_formatted(
         return;
     }
 
-    out_buf.clear();
-
     for rec in recs {
-        out_buf.extend_from_slice(display);
-        let rule = engine.rule_name(rec.rule_id);
-
-        // Vec<u8> implements io::Write
-        writeln!(
-            out_buf,
-            ":{}-{} {}",
-            rec.root_hint_start, rec.root_hint_end, rule
-        )
-        .expect("write to Vec<u8> cannot fail");
+        event_sink.emit(ScanEvent::Finding(FindingEvent {
+            source: SourceKind::Fs,
+            object_path: display,
+            start: rec.root_hint_start,
+            end: rec.root_hint_end,
+            rule_id: rec.rule_id.0 as u32,
+            rule_name: engine.rule_name(rec.rule_id),
+            commit_id: None,
+            change_kind: None,
+        }));
     }
-
-    out.write_all(out_buf.as_slice());
 }
 
 /// Executes a single scan-chunk task on a CPU worker thread.
@@ -499,10 +493,9 @@ fn cpu_runner(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScratch>) {
                 dedupe_pending_in_place(&mut ctx.scratch.pending);
             }
 
-            emit_findings_formatted(
+            emit_findings(
                 engine,
-                &ctx.scratch.out,
-                &mut ctx.scratch.out_buf,
+                &*ctx.scratch.event_sink,
                 &token.display,
                 &ctx.scratch.pending,
             );
@@ -818,7 +811,7 @@ fn io_worker_loop<B: RemoteBackend>(
 /// ```ignore
 /// let engine = Arc::new(MockEngine::new(rules, 16));
 /// let backend = Arc::new(MyS3Backend::new(bucket));
-/// let sink = Arc::new(VecSink::new());
+/// let sink = Arc::new(scanner_rs::unified::events::VecEventSink::new());
 ///
 /// let (report, metrics) = scan_remote(engine, backend, RemoteConfig::default(), sink)?;
 /// ```
@@ -826,7 +819,7 @@ pub fn scan_remote<B: RemoteBackend>(
     engine: Arc<MockEngine>,
     backend: Arc<B>,
     cfg: RemoteConfig,
-    out: Arc<dyn OutputSink>,
+    event_sink: Arc<dyn EventSink>,
 ) -> Result<(RemoteRunReport, MetricsSnapshot), RemoteRunError<B::Error>> {
     cfg.validate(&engine);
 
@@ -856,14 +849,13 @@ pub fn scan_remote<B: RemoteBackend>(
         },
         {
             let engine = Arc::clone(&engine);
-            let out = Arc::clone(&out);
+            let event_sink = Arc::clone(&event_sink);
             let dedupe = cfg.dedupe_within_chunk;
             move |_wid| CpuScratch {
                 engine: Arc::clone(&engine),
-                out: Arc::clone(&out),
+                event_sink: Arc::clone(&event_sink),
                 scratch: engine.new_scratch(),
                 pending: Vec::with_capacity(engine.tuning.max_findings_per_chunk),
-                out_buf: Vec::with_capacity(64 * 1024),
                 dedupe_within_chunk: dedupe,
             }
         },
@@ -979,7 +971,7 @@ pub fn scan_remote<B: RemoteBackend>(
     // All I/O work done; join CPU executor
     let cpu_metrics = ex.join();
 
-    out.flush();
+    event_sink.flush();
 
     Ok((report, cpu_metrics))
 }
@@ -992,7 +984,7 @@ pub fn scan_remote<B: RemoteBackend>(
 mod tests {
     use super::*;
     use crate::scheduler::engine_stub::MockRule;
-    use crate::scheduler::output_sink::VecSink;
+    use crate::unified::events::VecEventSink;
 
     // ========================================================================
     // Mock Backend
@@ -1175,7 +1167,7 @@ mod tests {
                 data: b"hello SECRET world".to_vec(),
             }],
         });
-        let sink = Arc::new(VecSink::new());
+        let sink = Arc::new(VecEventSink::new());
 
         let (report, _metrics) =
             scan_remote(engine, backend, small_config(), sink.clone()).unwrap();
@@ -1206,7 +1198,7 @@ mod tests {
                 data: data.to_vec(),
             }],
         });
-        let sink = Arc::new(VecSink::new());
+        let sink = Arc::new(VecEventSink::new());
 
         let cfg = RemoteConfig {
             chunk_size: 8,
@@ -1240,7 +1232,7 @@ mod tests {
     fn remote_pipeline_handles_empty_backend() {
         let engine = Arc::new(test_engine(16));
         let backend = Arc::new(MockBackend { objs: vec![] });
-        let sink = Arc::new(VecSink::new());
+        let sink = Arc::new(VecEventSink::new());
 
         let (report, _metrics) =
             scan_remote(engine, backend, small_config(), sink.clone()).unwrap();
@@ -1261,7 +1253,7 @@ mod tests {
             .collect();
 
         let backend = Arc::new(MockBackend { objs });
-        let sink = Arc::new(VecSink::new());
+        let sink = Arc::new(VecEventSink::new());
 
         let (report, _metrics) =
             scan_remote(engine, backend, small_config(), sink.clone()).unwrap();
@@ -1289,7 +1281,7 @@ mod tests {
             fail_first_n: std::sync::atomic::AtomicU32::new(2), // Fail twice, succeed on third
         });
 
-        let sink = Arc::new(VecSink::new());
+        let sink = Arc::new(VecEventSink::new());
 
         let cfg = RemoteConfig {
             retry: RetryPolicy {
@@ -1443,7 +1435,7 @@ mod tests {
             bytes_per_read: 17,
         });
 
-        let sink = Arc::new(VecSink::new());
+        let sink = Arc::new(VecEventSink::new());
 
         let cfg = RemoteConfig {
             chunk_size: 64, // Larger than bytes_per_read
@@ -1522,7 +1514,7 @@ mod tests {
             },
         });
 
-        let sink = Arc::new(VecSink::new());
+        let sink = Arc::new(VecEventSink::new());
 
         let (report, _metrics) =
             scan_remote(engine, backend, small_config(), sink.clone()).unwrap();
@@ -1547,7 +1539,7 @@ mod tests {
             fail_first_n: std::sync::atomic::AtomicU32::new(100), // More than max_attempts
         });
 
-        let sink = Arc::new(VecSink::new());
+        let sink = Arc::new(VecEventSink::new());
 
         let cfg = RemoteConfig {
             retry: RetryPolicy {

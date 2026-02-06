@@ -355,6 +355,25 @@ impl<'a> ObjectStore<'a> {
         limits: &TreeDiffLimits,
         spill_dir: &Path,
     ) -> Result<Self, TreeDiffError> {
+        let tree_delta_cache = TreeDeltaCache::new(limits.max_tree_delta_cache_bytes);
+        Self::open_with_tree_delta_cache(repo, limits, spill_dir, tree_delta_cache)
+    }
+
+    /// Opens an object store with a caller-provided tree delta cache.
+    ///
+    /// This allows runners to auto-size the cache based on repository
+    /// metadata while preserving the default behavior of [`Self::open`].
+    ///
+    /// # Errors
+    /// Returns `TreeDiffError::ObjectStoreError` if the MIDX is malformed
+    /// or pack files cannot be resolved. `acquire_midx` must have been
+    /// called to populate `repo.mmaps.midx`.
+    pub fn open_with_tree_delta_cache(
+        repo: &'a RepoJobState,
+        limits: &TreeDiffLimits,
+        spill_dir: &Path,
+        tree_delta_cache: TreeDeltaCache,
+    ) -> Result<Self, TreeDiffError> {
         let midx_bytes =
             repo.mmaps
                 .midx
@@ -378,7 +397,6 @@ impl<'a> ObjectStore<'a> {
 
         let loose_dirs = collect_loose_dirs(&repo.paths);
         let tree_cache = TreeCache::new(limits.max_tree_cache_bytes);
-        let tree_delta_cache = TreeDeltaCache::new(limits.max_tree_delta_cache_bytes);
         let max_object_bytes = limits.max_tree_bytes_in_flight.min(usize::MAX as u64) as usize;
         let spill = SpillArena::new(spill_dir, limits.max_tree_spill_bytes).map_err(store_error)?;
         let spill_min_bytes = limits.max_tree_cache_bytes.max(1) as usize;

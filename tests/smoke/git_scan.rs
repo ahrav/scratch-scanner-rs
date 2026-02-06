@@ -59,10 +59,17 @@ fn find_release_binary(name: &str) -> PathBuf {
     PathBuf::from("target").join("release").join(bin_name)
 }
 
-fn extract_metric(line: &str, key: &str) -> Option<u64> {
-    for part in line.split_whitespace() {
-        if let Some(rest) = part.strip_prefix(key) {
-            return rest.parse().ok();
+fn extract_summary_findings(stdout: &str) -> Option<u64> {
+    for line in stdout.lines() {
+        if !line.contains("\"type\":\"summary\"") || !line.contains("\"source\":\"git\"") {
+            continue;
+        }
+        if let Some(idx) = line.find("\"findings\":") {
+            let tail = &line[idx + "\"findings\":".len()..];
+            let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !digits.is_empty() {
+                return digits.parse().ok();
+            }
         }
     }
     None
@@ -102,13 +109,17 @@ fn git_scan_binary_finds_secrets() {
     }
 
     let status = Command::new("cargo")
-        .args(["build", "--release", "--bin", "git_scan"])
+        .args(["build", "--release"])
         .status()
         .unwrap();
-    assert!(status.success(), "Failed to build git_scan");
+    assert!(status.success(), "Failed to build scanner-rs");
 
-    let binary = find_release_binary("git_scan");
-    let output = Command::new(&binary).arg(&repo).output().unwrap();
+    let binary = find_release_binary("scanner-rs");
+    let output = Command::new(&binary)
+        .args(["scan", "git"])
+        .arg(&repo)
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "git_scan failed: stderr={}",
@@ -116,8 +127,11 @@ fn git_scan_binary_finds_secrets() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("status="), "missing status in stdout");
-    let findings = extract_metric(&stdout, "findings=").unwrap_or(0);
+    assert!(
+        stdout.contains("\"type\":\"summary\"") && stdout.contains("\"source\":\"git\""),
+        "missing git summary JSONL event in stdout: {stdout}"
+    );
+    let findings = extract_summary_findings(&stdout).unwrap_or(0);
     if perf_stats_enabled() {
         assert!(findings > 0, "expected findings > 0, got {findings}");
     } else {

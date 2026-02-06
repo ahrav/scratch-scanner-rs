@@ -71,7 +71,6 @@ use crate::archive::{
     EntrySkipReason, PartialReason, VirtualPathBuilder, DEFAULT_MAX_COMPONENTS,
 };
 use crate::scheduler::engine_stub::BUFFER_LEN_MAX;
-use crate::scheduler::output_sink::OutputSink;
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -91,7 +90,7 @@ use std::sync::Arc;
 /// - `pool_buffers`: Bound peak memory. Should be >= `workers` to avoid starvation.
 /// - `max_in_flight_objects`: Bound discovery depth. Too high = memory for paths/metadata.
 /// - `max_file_size`: Open-time size cap; oversized files are skipped.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LocalConfig {
     /// Number of CPU worker threads.
     pub workers: usize,
@@ -132,6 +131,11 @@ pub struct LocalConfig {
 
     /// Archive scanning configuration.
     pub archive: ArchiveConfig,
+
+    /// Structured event sink for finding output.
+    ///
+    /// All findings are emitted as `ScanEvent::Finding` through this sink.
+    pub event_sink: Arc<dyn crate::unified::events::EventSink>,
 }
 
 impl Default for LocalConfig {
@@ -146,7 +150,25 @@ impl Default for LocalConfig {
             seed: 0x853c49e6748fea9b,
             dedupe_within_chunk: true,
             archive: ArchiveConfig::default(),
+            event_sink: Arc::new(crate::unified::events::NullEventSink),
         }
+    }
+}
+
+impl std::fmt::Debug for LocalConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalConfig")
+            .field("workers", &self.workers)
+            .field("chunk_size", &self.chunk_size)
+            .field("pool_buffers", &self.pool_buffers)
+            .field("local_queue_cap", &self.local_queue_cap)
+            .field("max_in_flight_objects", &self.max_in_flight_objects)
+            .field("max_file_size", &self.max_file_size)
+            .field("seed", &self.seed)
+            .field("dedupe_within_chunk", &self.dedupe_within_chunk)
+            .field("archive", &self.archive)
+            .field("event_sink", &"<dyn EventSink>")
+            .finish()
     }
 }
 
@@ -294,14 +316,11 @@ struct FileTask {
 struct LocalScratch<E: ScanEngine> {
     engine: Arc<E>,
     pool: TsBufferPool,
-    out: Arc<dyn OutputSink>,
 
     /// Per-worker engine scratch.
     scan_scratch: E::Scratch,
     /// Per-worker findings buffer (avoids alloc per chunk).
     pending: Vec<<E::Scratch as EngineScratch>::Finding>,
-    /// Per-worker output formatting buffer.
-    out_buf: Vec<u8>,
 
     /// Archive path canonicalization scratch.
     canon: EntryPathCanonicalizer,
@@ -325,6 +344,9 @@ struct LocalScratch<E: ScanEngine> {
     next_virtual_file_id: u32,
     /// Shared abort flag set when `FailRun` policy triggers.
     abort_run: Arc<AtomicBool>,
+
+    /// Structured event sink for finding output.
+    event_sink: Arc<dyn crate::unified::events::EventSink>,
 
     /// Configuration flags.
     dedupe_within_chunk: bool,
@@ -417,23 +439,15 @@ fn dedupe_findings<F: FindingRecord>(findings: &mut Vec<F>) {
     });
 }
 
-/// Format and emit findings to the output sink.
+/// Emit structured finding events via the [`EventSink`].
 ///
-/// # Output Format
+/// Emits one [`ScanEvent::Finding`] per finding record.
 ///
-/// Each finding is formatted as: `<path>:<start>-<end> <rule_name>\n`
-///
-/// Example: `/home/user/code/config.js:42-68 aws-access-key`
-///
-/// # Buffer Reuse
-///
-/// The `out_buf` is reused across calls to avoid allocation per file.
-/// It's cleared at the start of each call.
+/// [`EventSink`]: crate::unified::events::EventSink
 #[inline]
 fn emit_findings<E: ScanEngine, F: FindingRecord>(
     engine: &E,
-    out: &Arc<dyn OutputSink>,
-    out_buf: &mut Vec<u8>,
+    event_sink: &dyn crate::unified::events::EventSink,
     path: &[u8],
     findings: &[F],
 ) {
@@ -441,26 +455,20 @@ fn emit_findings<E: ScanEngine, F: FindingRecord>(
         return;
     }
 
-    out_buf.clear();
-
     for rec in findings {
-        // Format: path:start-end rulename\n
-        out_buf.extend_from_slice(path);
-        out_buf.push(b':');
-
-        // Simple integer formatting to avoid allocation
-        use std::io::Write;
-        writeln!(
-            out_buf,
-            "{}-{} {}",
-            rec.root_hint_start(),
-            rec.root_hint_end(),
-            engine.rule_name(rec.rule_id())
-        )
-        .expect("write to Vec<u8> cannot fail");
+        event_sink.emit(crate::unified::events::ScanEvent::Finding(
+            crate::unified::events::FindingEvent {
+                source: crate::unified::SourceKind::Fs,
+                object_path: path,
+                start: rec.root_hint_start(),
+                end: rec.root_hint_end(),
+                rule_id: rec.rule_id(),
+                rule_name: engine.rule_name(rec.rule_id()),
+                commit_id: None,
+                change_kind: None,
+            },
+        ));
     }
-
-    out.write_all(out_buf);
 }
 
 /// Allocate a virtual `FileId` for archive entries (high-bit namespace).
@@ -577,10 +585,9 @@ fn budget_hit_to_archive_end(hit: BudgetHit) -> ArchiveEnd {
 struct ArchiveScanCtx<'a, E: ScanEngine> {
     engine: &'a Arc<E>,
     pool: &'a TsBufferPool,
-    out: &'a Arc<dyn OutputSink>,
+    event_sink: &'a dyn crate::unified::events::EventSink,
     scan_scratch: &'a mut E::Scratch,
     pending: &'a mut Vec<<E::Scratch as EngineScratch>::Finding>,
-    out_buf: &'a mut Vec<u8>,
     budgets: &'a mut ArchiveBudgets,
     canon: &'a mut EntryPathCanonicalizer,
     vpaths: &'a mut [VirtualPathBuilder],
@@ -601,10 +608,9 @@ impl<'a, E: ScanEngine> ArchiveScanCtx<'a, E> {
         Self {
             engine: &scratch.engine,
             pool: &scratch.pool,
-            out: &scratch.out,
+            event_sink: &*scratch.event_sink,
             scan_scratch: &mut scratch.scan_scratch,
             pending: &mut scratch.pending,
-            out_buf: &mut scratch.out_buf,
             budgets: &mut scratch.budgets,
             canon: &mut scratch.canon,
             vpaths: scratch.vpaths.as_mut_slice(),
@@ -902,8 +908,7 @@ fn process_gzip_file<E: ScanEngine>(
 
         emit_findings(
             engine.as_ref(),
-            &scratch.out,
-            &mut scratch.out_buf,
+            &*scratch.event_sink,
             path_bytes,
             &scratch.pending,
         );
@@ -1052,13 +1057,7 @@ fn scan_gzip_stream_nested<E: ScanEngine, R: Read>(
             .findings_emitted
             .wrapping_add(scan.pending.len() as u64);
 
-        emit_findings(
-            scan.engine.as_ref(),
-            scan.out,
-            scan.out_buf,
-            display,
-            scan.pending,
-        );
+        emit_findings(scan.engine.as_ref(), scan.event_sink, display, scan.pending);
 
         scan.metrics.chunks_scanned = scan.metrics.chunks_scanned.saturating_add(1);
         scan.metrics.bytes_scanned = scan.metrics.bytes_scanned.saturating_add(allowed);
@@ -1270,10 +1269,9 @@ fn scan_tar_stream_nested<E: ScanEngine>(
                                 let mut child = ArchiveScanCtx {
                                     engine: scan.engine,
                                     pool: scan.pool,
-                                    out: scan.out,
+                                    event_sink: scan.event_sink,
                                     scan_scratch: scan.scan_scratch,
                                     pending: scan.pending,
-                                    out_buf: scan.out_buf,
                                     budgets,
                                     canon: scan.canon,
                                     vpaths: vpaths_tail,
@@ -1348,10 +1346,9 @@ fn scan_tar_stream_nested<E: ScanEngine>(
                                 let mut child = ArchiveScanCtx {
                                     engine: scan.engine,
                                     pool: scan.pool,
-                                    out: scan.out,
+                                    event_sink: scan.event_sink,
                                     scan_scratch: scan.scan_scratch,
                                     pending: scan.pending,
-                                    out_buf: scan.out_buf,
                                     budgets,
                                     canon: scan.canon,
                                     vpaths: rest_vpaths,
@@ -1380,10 +1377,9 @@ fn scan_tar_stream_nested<E: ScanEngine>(
                                 let mut child = ArchiveScanCtx {
                                     engine: scan.engine,
                                     pool: scan.pool,
-                                    out: scan.out,
+                                    event_sink: scan.event_sink,
                                     scan_scratch: scan.scan_scratch,
                                     pending: scan.pending,
-                                    out_buf: scan.out_buf,
                                     budgets,
                                     canon: scan.canon,
                                     vpaths: rest_vpaths,
@@ -1596,8 +1592,7 @@ fn scan_tar_stream_nested<E: ScanEngine>(
                 .wrapping_add(scan.pending.len() as u64);
             emit_findings(
                 scan.engine.as_ref(),
-                scan.out,
-                scan.out_buf,
+                scan.event_sink,
                 entry_display,
                 scan.pending,
             );
@@ -1732,10 +1727,9 @@ fn process_zip_file<E: ScanEngine>(
     let LocalScratch {
         engine,
         pool,
-        out,
+        event_sink,
         scan_scratch,
         pending,
-        out_buf,
         archive,
         canon,
         vpaths,
@@ -2091,7 +2085,7 @@ fn process_zip_file<E: ScanEngine>(
             }
 
             metrics.findings_emitted = metrics.findings_emitted.wrapping_add(pending.len() as u64);
-            emit_findings(engine.as_ref(), out, out_buf, path_bytes, pending);
+            emit_findings(engine.as_ref(), &**event_sink, path_bytes, pending);
 
             metrics.chunks_scanned = metrics.chunks_scanned.saturating_add(1);
             metrics.bytes_scanned = metrics.bytes_scanned.saturating_add(allowed);
@@ -2375,8 +2369,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
         // Emit findings
         emit_findings(
             engine.as_ref(),
-            &scratch.out,
-            &mut scratch.out_buf,
+            &*scratch.event_sink,
             path_bytes,
             &scratch.pending,
         );
@@ -2443,8 +2436,7 @@ fn read_some(file: &mut File, dst: &mut [u8]) -> io::Result<usize> {
 ///
 /// - `engine`: Detection engine (determines overlap, provides scan logic)
 /// - `source`: Iterator of files to scan (e.g., [`VecFileSource`])
-/// - `cfg`: Configuration for workers, chunking, and memory budgets
-/// - `out`: Output sink for findings (e.g., [`VecSink`](super::output_sink::VecSink))
+/// - `cfg`: Configuration for workers, chunking, and memory budgets (includes `event_sink`)
 ///
 /// # Returns
 ///
@@ -2483,20 +2475,14 @@ fn read_some(file: &mut File, dst: &mut [u8]) -> io::Result<usize> {
 /// let engine = Arc::new(MockEngine::new(rules, 16));
 /// let files = vec![LocalFile { path: "test.txt".into(), size: 1024 }];
 /// let source = VecFileSource::new(files);
-/// let sink = Arc::new(VecSink::new());
 ///
-/// let report = scan_local(engine, source, LocalConfig::default(), sink);
+/// let report = scan_local(engine, source, LocalConfig::default());
 ///
 /// // With real Engine (for production):
 /// let engine = Arc::new(Engine::new(rules, transforms, tuning));
-/// let report = scan_local(engine, source, LocalConfig::default(), sink);
+/// let report = scan_local(engine, source, LocalConfig::default());
 /// ```
-pub fn scan_local<E, S>(
-    engine: Arc<E>,
-    mut source: S,
-    cfg: LocalConfig,
-    out: Arc<dyn OutputSink>,
-) -> LocalReport
+pub fn scan_local<E, S>(engine: Arc<E>, mut source: S, cfg: LocalConfig) -> LocalReport
 where
     E: ScanEngine,
     S: FileSource,
@@ -2523,6 +2509,7 @@ where
     // Capture config values before moving into closure
     let dedupe = cfg.dedupe_within_chunk;
     let chunk_size = cfg.chunk_size;
+    let event_sink = cfg.event_sink.clone();
 
     // Create executor
     let ex = Executor::<FileTask>::new(
@@ -2534,7 +2521,6 @@ where
         {
             let engine = Arc::clone(&engine);
             let pool = pool.clone();
-            let out = Arc::clone(&out);
             let abort_run = Arc::clone(&abort_run);
             move |_wid| {
                 let scan_scratch = engine.new_scratch();
@@ -2561,10 +2547,8 @@ where
                 LocalScratch {
                     engine: Arc::clone(&engine),
                     pool: pool.clone(),
-                    out: Arc::clone(&out),
                     scan_scratch,
                     pending: Vec::with_capacity(4096), // Reasonable default
-                    out_buf: Vec::with_capacity(64 * 1024),
                     canon: EntryPathCanonicalizer::with_capacity(
                         DEFAULT_MAX_COMPONENTS,
                         archive_cfg.max_virtual_path_len_per_entry,
@@ -2579,6 +2563,7 @@ where
                     gzip_name_buf: Vec::with_capacity(gzip_name_cap),
                     next_virtual_file_id: 0x8000_0000,
                     abort_run: Arc::clone(&abort_run),
+                    event_sink: Arc::clone(&event_sink),
                     dedupe_within_chunk: dedupe,
                     chunk_size,
                     max_file_size: cfg.max_file_size,
@@ -2643,8 +2628,6 @@ where
     // Wait for all files to complete
     let metrics = ex.join();
 
-    out.flush();
-
     // Aggregate I/O errors from worker metrics into stats
     stats.io_errors = metrics.io_errors;
 
@@ -2660,7 +2643,7 @@ mod tests {
     use super::*;
     use crate::archive::PartialReason;
     use crate::scheduler::engine_stub::{MockEngine, MockRule};
-    use crate::scheduler::output_sink::VecSink;
+    use crate::unified::events::VecEventSink;
     use std::fs;
     use std::io::Write;
     use tempfile::{NamedTempFile, TempDir};
@@ -2681,7 +2664,7 @@ mod tests {
         )
     }
 
-    fn small_config() -> LocalConfig {
+    fn small_config_with_sink(sink: Arc<VecEventSink>) -> LocalConfig {
         LocalConfig {
             workers: 2,
             chunk_size: 64, // Tiny for testing
@@ -2692,7 +2675,12 @@ mod tests {
             seed: 12345,
             dedupe_within_chunk: true,
             archive: ArchiveConfig::default(),
+            event_sink: sink,
         }
+    }
+
+    fn small_config() -> LocalConfig {
+        small_config_with_sink(Arc::new(VecEventSink::new()))
     }
 
     fn assert_perf_u64(actual: u64, expected: u64) {
@@ -2741,7 +2729,7 @@ mod tests {
     #[test]
     fn scans_single_file_with_findings() {
         let engine = Arc::new(test_engine());
-        let sink = Arc::new(VecSink::new());
+        let sink = Arc::new(VecEventSink::new());
 
         // Create temp file with secret
         let mut tmp = NamedTempFile::new().unwrap();
@@ -2753,7 +2741,7 @@ mod tests {
 
         let source = VecFileSource::new(vec![LocalFile { path, size }]);
 
-        let report = scan_local(engine, source, small_config(), sink.clone());
+        let report = scan_local(engine, source, small_config_with_sink(sink.clone()));
 
         assert_eq!(report.stats.files_enqueued, 1);
         assert!(report.metrics.chunks_scanned >= 1);
@@ -2766,14 +2754,14 @@ mod tests {
     #[test]
     fn handles_empty_file() {
         let engine = Arc::new(test_engine());
-        let sink = Arc::new(VecSink::new());
+        let sink = Arc::new(VecEventSink::new());
 
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
 
         let source = VecFileSource::new(vec![LocalFile { path, size: 0 }]);
 
-        let report = scan_local(engine, source, small_config(), sink.clone());
+        let report = scan_local(engine, source, small_config_with_sink(sink.clone()));
 
         assert_eq!(report.stats.files_enqueued, 1);
         assert!(sink.take().is_empty());
@@ -2782,7 +2770,7 @@ mod tests {
     #[test]
     fn enforces_max_file_size_at_open_time() {
         let engine = Arc::new(test_engine());
-        let sink = Arc::new(VecSink::new());
+        let sink = Arc::new(VecEventSink::new());
 
         let mut tmp = NamedTempFile::new().unwrap();
         writeln!(tmp, "SECRETABCD1234").unwrap();
@@ -2791,10 +2779,10 @@ mod tests {
         let path = tmp.path().to_path_buf();
         let source = VecFileSource::new(vec![LocalFile { path, size: 4 }]);
 
-        let mut cfg = small_config();
+        let mut cfg = small_config_with_sink(sink.clone());
         cfg.max_file_size = 4; // Smaller than actual file size at open time.
 
-        let report = scan_local(engine, source, cfg, sink.clone());
+        let report = scan_local(engine, source, cfg);
 
         assert_eq!(report.stats.files_enqueued, 1);
         assert_eq!(report.metrics.bytes_scanned, 0);
@@ -2804,11 +2792,10 @@ mod tests {
     #[test]
     fn handles_no_files() {
         let engine = Arc::new(test_engine());
-        let sink = Arc::new(VecSink::new());
 
         let source = VecFileSource::new(vec![]);
 
-        let report = scan_local(engine, source, small_config(), sink.clone());
+        let report = scan_local(engine, source, small_config());
 
         assert_eq!(report.stats.files_enqueued, 0);
         assert_eq!(report.metrics.chunks_scanned, 0);
@@ -2817,7 +2804,7 @@ mod tests {
     #[test]
     fn finds_boundary_spanning_secret() {
         let engine = Arc::new(test_engine());
-        let sink = Arc::new(VecSink::new());
+        let sink = Arc::new(VecEventSink::new());
 
         // Create file where SECRET spans chunk boundary
         // With chunk_size=64 and overlap=16, secret at position ~60 will span
@@ -2833,7 +2820,7 @@ mod tests {
 
         let source = VecFileSource::new(vec![LocalFile { path, size }]);
 
-        let report = scan_local(engine, source, small_config(), sink.clone());
+        let report = scan_local(engine, source, small_config_with_sink(sink.clone()));
 
         assert!(report.metrics.chunks_scanned >= 2);
 
@@ -2852,7 +2839,7 @@ mod tests {
     #[test]
     fn processes_multiple_files() {
         let engine = Arc::new(test_engine());
-        let sink = Arc::new(VecSink::new());
+        let sink = Arc::new(VecEventSink::new());
 
         let mut files = Vec::new();
         let mut temps = Vec::new();
@@ -2870,7 +2857,7 @@ mod tests {
 
         let source = VecFileSource::new(files);
 
-        let report = scan_local(engine, source, small_config(), sink.clone());
+        let report = scan_local(engine, source, small_config_with_sink(sink.clone()));
 
         assert_eq!(report.stats.files_enqueued, 5);
 
@@ -2909,7 +2896,6 @@ mod tests {
     #[test]
     fn metrics_track_bytes() {
         let engine = Arc::new(test_engine());
-        let sink = Arc::new(VecSink::new());
 
         let mut tmp = NamedTempFile::new().unwrap();
         let data = vec![b'a'; 1000];
@@ -2921,7 +2907,7 @@ mod tests {
 
         let source = VecFileSource::new(vec![LocalFile { path, size }]);
 
-        let report = scan_local(engine, source, small_config(), sink);
+        let report = scan_local(engine, source, small_config());
 
         // bytes_scanned should be ~1000 (the actual payload scanned)
         assert!(report.metrics.bytes_scanned >= 1000);
@@ -2930,7 +2916,6 @@ mod tests {
     #[test]
     fn archive_detection_skips_when_enabled() {
         let engine = Arc::new(test_engine());
-        let sink = Arc::new(VecSink::new());
 
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("sample.zip");
@@ -2941,7 +2926,7 @@ mod tests {
         let mut cfg = small_config();
         cfg.archive.enabled = true;
 
-        let report = scan_local(engine, source, cfg, sink);
+        let report = scan_local(engine, source, cfg);
 
         if cfg!(all(feature = "perf-stats", debug_assertions)) {
             assert_eq!(report.metrics.archive.archives_seen, 1);
@@ -2963,7 +2948,7 @@ mod tests {
     #[test]
     fn archive_extension_scans_when_disabled() {
         let engine = Arc::new(test_engine());
-        let sink = Arc::new(VecSink::new());
+        let sink = Arc::new(VecEventSink::new());
 
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("sample.zip");
@@ -2971,10 +2956,10 @@ mod tests {
         let size = fs::metadata(&path).unwrap().len();
 
         let source = VecFileSource::new(vec![LocalFile { path, size }]);
-        let mut cfg = small_config();
+        let mut cfg = small_config_with_sink(sink.clone());
         cfg.archive.enabled = false;
 
-        let report = scan_local(engine, source, cfg, sink.clone());
+        let report = scan_local(engine, source, cfg);
 
         assert_perf_u64(report.metrics.archive.archives_seen, 0);
 

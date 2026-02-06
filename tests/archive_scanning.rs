@@ -6,7 +6,8 @@
 //! `scheduler::local` execution path.
 //!
 //! # Assumptions
-//! - Findings are emitted in the `VecSink` format: `<path>:<start>-<end> <rule>`.
+//! - Findings are emitted as JSONL via the `VecEventSink`:
+//!   `{"type":"finding","source":"fs","path":"...","start":N,"end":N,"rule_id":N,"rule":"..."}`.
 //! - Virtual paths are displayed as `parent::entry`.
 //! - Archive bytes are synthesized with minimal headers plus targeted
 //!   corruption for ZIP edge cases.
@@ -22,7 +23,7 @@ use scanner_rs::scheduler::engine_trait::{EngineScratch, FindingRecord, ScanEngi
 use scanner_rs::scheduler::local::{
     scan_local, LocalConfig, LocalFile, LocalReport, VecFileSource,
 };
-use scanner_rs::scheduler::output_sink::VecSink;
+use scanner_rs::unified::events::VecEventSink;
 use scanner_rs::FileId;
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -38,32 +39,51 @@ struct FindingLine {
     start: u64,
 }
 
-/// Parse the sink output into `(path, start)` pairs.
+/// Extract a JSON string value for a given key from a single JSON line.
+///
+/// This is a minimal parser that handles backslash-escaped quotes.
+fn extract_json_string(json: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{}\":\"", key);
+    let start = json.find(&needle)? + needle.len();
+    let rest = &json[start..];
+    let bytes = rest.as_bytes();
+    let mut end = 0;
+    while end < bytes.len() {
+        if bytes[end] == b'\\' {
+            end += 2;
+        } else if bytes[end] == b'"' {
+            break;
+        } else {
+            end += 1;
+        }
+    }
+    Some(rest[..end].to_string())
+}
+
+/// Extract a JSON numeric value for a given key from a single JSON line.
+fn extract_json_u64(json: &str, key: &str) -> Option<u64> {
+    let needle = format!("\"{}\":", key);
+    let start = json.find(&needle)? + needle.len();
+    let rest = &json[start..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+/// Parse JSONL finding lines into `(path, start)` pairs.
 ///
 /// This is intentionally lossy: end offsets and rule names are ignored because
 /// the tests only assert path attribution and the start position.
 fn parse_findings(output: &str) -> Vec<FindingLine> {
     let mut out = Vec::new();
     for line in output.lines() {
-        if line.trim().is_empty() {
+        if !line.contains("\"type\":\"finding\"") {
             continue;
         }
-        // Format: <path>:<start>-<end> <rule>
-        let mut parts = line.splitn(2, ' ');
-        let left = parts.next().unwrap_or("");
-        let mut left_parts = left.rsplitn(2, ':');
-        let range = left_parts.next().unwrap_or("0-0");
-        let path = left_parts.next().unwrap_or("");
-        let mut range_parts = range.splitn(2, '-');
-        let start = range_parts
-            .next()
-            .unwrap_or("0")
-            .parse::<u64>()
-            .unwrap_or(0);
-        out.push(FindingLine {
-            path: path.to_string(),
-            start,
-        });
+        let path = extract_json_string(line, "path").unwrap_or_default();
+        let start = extract_json_u64(line, "start").unwrap_or(0);
+        out.push(FindingLine { path, start });
     }
     out
 }
@@ -529,8 +549,8 @@ fn cfg_archives_enabled() -> LocalConfig {
     cfg
 }
 
-/// Run a local scan with a single "SECRET" rule and return sink output + report.
-fn run_scan(files: Vec<LocalFile>, cfg: LocalConfig) -> (String, LocalReport) {
+/// Run a local scan with a single "SECRET" rule and return JSONL output + report.
+fn run_scan(files: Vec<LocalFile>, mut cfg: LocalConfig) -> (String, LocalReport) {
     let engine = Arc::new(MockEngine::new(
         vec![MockRule {
             name: "secret".into(),
@@ -538,8 +558,9 @@ fn run_scan(files: Vec<LocalFile>, cfg: LocalConfig) -> (String, LocalReport) {
         }],
         16,
     ));
-    let sink = Arc::new(VecSink::new());
-    let report = scan_local(engine, VecFileSource::new(files), cfg, sink.clone());
+    let sink = Arc::new(VecEventSink::new());
+    cfg.event_sink = Arc::clone(&sink) as Arc<dyn scanner_rs::unified::events::EventSink>;
+    let report = scan_local(engine, VecFileSource::new(files), cfg);
     let out = String::from_utf8_lossy(&sink.take()).to_string();
     (out, report)
 }
@@ -996,13 +1017,11 @@ fn archive_entries_use_unique_virtual_file_ids() {
     let engine = Arc::new(IdEngine {
         seen: Arc::clone(&seen),
     });
-    let sink = Arc::new(VecSink::new());
     let cfg = cfg_archives_enabled();
     let _report = scan_local(
         engine,
         VecFileSource::new(vec![file_from_path(&tar_path)]),
         cfg,
-        sink,
     );
 
     let mut ids = seen.lock().unwrap().clone();

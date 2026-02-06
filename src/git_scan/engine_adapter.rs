@@ -26,8 +26,11 @@
 //! - When the debug allocation guard is enabled, scanning must not allocate.
 
 use std::fmt;
+use std::sync::Arc;
 
 use crate::scheduler::AllocGuard;
+use crate::unified::events::{EventSink, FindingEvent, NullEventSink, ScanEvent};
+use crate::unified::SourceKind;
 use crate::{Engine, FileId, NormHash, ScanScratch};
 
 use super::alloc_guard;
@@ -149,6 +152,10 @@ impl From<EngineAdapterError> for PackExecError {
 /// The adapter reuses a ring chunker and scratch space across blobs to
 /// minimize allocations on hot paths. Results accumulate until
 /// `take_results` or `clear_results` is called.
+///
+/// When an `EventSink` is configured, findings are also streamed as
+/// structured [`ScanEvent::Finding`] events during scanning (in addition
+/// to being recorded in `ScannedBlobs` for persistence).
 pub struct EngineAdapter<'a> {
     engine: &'a Engine,
     scratch: ScanScratch,
@@ -160,6 +167,8 @@ pub struct EngineAdapter<'a> {
     chunker: RingChunker,
     // Monotone ID for this adapter instance; wraps on overflow.
     next_file_id: u32,
+    /// Structured event sink for streaming findings.
+    event_sink: Arc<dyn EventSink>,
 }
 
 impl<'a> EngineAdapter<'a> {
@@ -171,6 +180,19 @@ impl<'a> EngineAdapter<'a> {
     /// all subsequent `emit` / `emit_loose` calls.
     #[must_use]
     pub fn new(engine: &'a Engine, config: EngineAdapterConfig) -> Self {
+        Self::new_with_event_sink(engine, config, Arc::new(NullEventSink))
+    }
+
+    /// Creates a new adapter with a structured event sink.
+    ///
+    /// Findings are streamed as JSONL events during scanning (in addition to
+    /// being accumulated in `ScannedBlobs` for persistence).
+    #[must_use]
+    pub fn new_with_event_sink(
+        engine: &'a Engine,
+        config: EngineAdapterConfig,
+        event_sink: Arc<dyn EventSink>,
+    ) -> Self {
         let overlap = engine.required_overlap();
         let chunk_bytes = effective_chunk_bytes(config.chunk_bytes, overlap);
         Self {
@@ -183,6 +205,7 @@ impl<'a> EngineAdapter<'a> {
             findings_buf: Vec::with_capacity(64),
             chunker: RingChunker::new(chunk_bytes, overlap),
             next_file_id: 0,
+            event_sink,
         }
     }
 
@@ -243,13 +266,14 @@ impl<'a> EngineAdapter<'a> {
     pub fn emit_loose(
         &mut self,
         candidate: &LooseCandidate,
-        _path: &[u8],
+        path: &[u8],
         bytes: &[u8],
     ) -> Result<(), PackExecError> {
         let file_id = FileId(self.next_file_id);
         self.next_file_id = self.next_file_id.wrapping_add(1);
 
         self.scan_blob_into_buf(file_id, bytes)?;
+        self.stream_findings(path);
         let span = self.record_findings()?;
         self.results.push(ScannedBlob {
             oid: candidate.oid,
@@ -257,6 +281,26 @@ impl<'a> EngineAdapter<'a> {
             findings: span,
         });
         Ok(())
+    }
+
+    /// Stream findings from `findings_buf` to the event sink.
+    ///
+    /// Called after `scan_blob_into_buf` and before `record_findings`.
+    /// Findings are emitted as structured events without allocation;
+    /// the event sink handles its own serialization buffers.
+    fn stream_findings(&self, path: &[u8]) {
+        for f in &self.findings_buf {
+            self.event_sink.emit(ScanEvent::Finding(FindingEvent {
+                source: SourceKind::Git,
+                object_path: path,
+                start: u64::from(f.start),
+                end: u64::from(f.end),
+                rule_id: f.rule_id,
+                rule_name: self.engine.rule_name(f.rule_id),
+                commit_id: None,
+                change_kind: None,
+            }));
+        }
     }
 
     fn scan_blob_into_buf(
@@ -301,13 +345,14 @@ impl PackObjectSink for EngineAdapter<'_> {
     fn emit(
         &mut self,
         candidate: &PackCandidate,
-        _path: &[u8],
+        path: &[u8],
         bytes: &[u8],
     ) -> Result<(), PackExecError> {
         let file_id = FileId(self.next_file_id);
         self.next_file_id = self.next_file_id.wrapping_add(1);
 
         self.scan_blob_into_buf(file_id, bytes)?;
+        self.stream_findings(path);
         let span = self.record_findings()?;
         self.results.push(ScannedBlob {
             oid: candidate.oid,

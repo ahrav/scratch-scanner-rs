@@ -10,6 +10,7 @@ use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Instant;
 
 use scanner_rs::git_scan::policy_hash;
@@ -18,6 +19,7 @@ use scanner_rs::git_scan::{
     run_git_scan, GitScanConfig, GitScanError, GitScanResult, MergeDiffMode, NeverSeenStore,
     RefWatermarkStore, RepoOpenError, StartSetConfig, StartSetResolver,
 };
+use scanner_rs::unified::events::NullEventSink;
 use scanner_rs::{demo_rules, demo_transforms, demo_tuning, AnchorMode, AnchorPolicy, Engine};
 
 #[derive(Debug)]
@@ -236,7 +238,7 @@ OPTIONS:\n\
 fn run_git_scan_once(
     repo: &Path,
     scan_config: &GitScanConfig,
-    engine: &Engine,
+    engine: &Arc<Engine>,
     resolver: &GitCliResolver,
 ) -> Result<IterSample, GitScanError> {
     let seen_store = NeverSeenStore;
@@ -245,12 +247,13 @@ fn run_git_scan_once(
     let start = Instant::now();
     let result = run_git_scan(
         repo,
-        engine,
+        Arc::clone(engine),
         resolver,
         &seen_store,
         &watermark_store,
         None,
         scan_config,
+        std::sync::Arc::new(NullEventSink),
     )?;
     let wall_nanos = start.elapsed().as_nanos() as u64;
 
@@ -321,14 +324,14 @@ fn main() {
         base_config.path_policy_version,
     );
 
-    let engine = match cfg.anchor_mode {
+    let engine = Arc::new(match cfg.anchor_mode {
         AnchorMode::Manual => {
             Engine::new_with_anchor_policy(rules, transforms, tuning, AnchorPolicy::ManualOnly)
         }
         AnchorMode::Derived => {
             Engine::new_with_anchor_policy(rules, transforms, tuning, AnchorPolicy::DerivedOnly)
         }
-    };
+    });
 
     let start_set = StartSetConfig::DefaultBranchOnly;
     let resolver = GitCliResolver {

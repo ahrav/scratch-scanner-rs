@@ -71,7 +71,11 @@ fn scanner_binary_finds_secrets() {
     // This respects CARGO_TARGET_DIR and cross-compilation settings.
     let binary = find_release_binary();
 
-    let output = Command::new(&binary).arg(&tmp).output().unwrap();
+    let output = Command::new(&binary)
+        .args(["scan", "fs"])
+        .arg(&tmp)
+        .output()
+        .unwrap();
 
     assert!(
         output.status.success(),
@@ -84,8 +88,13 @@ fn scanner_binary_finds_secrets() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
+        stdout.contains("\"type\":\"finding\""),
+        "Expected JSONL finding in stdout, got: {}",
+        stdout
+    );
+    assert!(
         stdout.contains("slack"),
-        "Expected slack token finding in stdout, got: {}",
+        "Expected slack rule in finding output, got: {}",
         stdout
     );
 

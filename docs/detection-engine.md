@@ -138,6 +138,17 @@ scans overlapping chunks with the core `Engine`. The overlap length is
 is the absolute byte offset of the new (non-overlap) region. This guarantees
 chunking invariance without re-materializing full blobs in the scanner.
 
+## Unified Event Integration
+
+Detection semantics are unchanged by unified CLI routing. The same engine
+outputs are now emitted as structured events:
+
+- Filesystem path: findings are emitted via `EventSink` from scheduler workers.
+- Git path: `EngineAdapter` emits `ScanEvent::Finding` during blob scanning.
+
+See [`scanner-unification.md`](scanner-unification.md) for entrypoint and
+orchestration details.
+
 ## Git Tree Diff Streaming
 
 Git tree diffing now uses a streaming entry parser for spill-backed or large
