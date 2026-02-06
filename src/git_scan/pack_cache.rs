@@ -14,9 +14,8 @@ const DEFAULT_SMALL_SLOT_SIZE: u32 = 64 * 1024;
 /// Default slot size for large cached pack objects (2 MiB).
 ///
 /// Objects between 64 KiB and 2 MiB (common delta bases in large repos) are
-/// cached in the large tier. The previous 512 KiB limit silently rejected
-/// popular bases in the 512 KiB–2 MiB range, causing repeated fallback
-/// decodes and degraded cache hit rates on large repositories.
+/// cached in the large tier. This covers the bulk of popular delta bases,
+/// avoiding repeated fallback decodes.
 const DEFAULT_LARGE_SLOT_SIZE: u32 = 2 * 1024 * 1024;
 /// Minimum bytes reserved for the large tier when enabled.
 const MIN_LARGE_TIER_BYTES: u32 = 32 * 1024 * 1024;
@@ -249,6 +248,21 @@ impl PackCacheTier {
     fn is_disabled(&self) -> bool {
         self.sets == 0
     }
+
+    /// Invalidates all entries without releasing storage.
+    ///
+    /// After reset, the tier retains its allocated `storage`, `slots`, and
+    /// `clock_hands` buffers. All slots are marked invalid and clock hands
+    /// are zeroed, making the tier behave as freshly constructed.
+    fn reset(&mut self) {
+        for slot in &mut self.slots {
+            *slot = Slot::empty();
+        }
+        for hand in &mut self.clock_hands {
+            *hand = 0;
+        }
+        // storage bytes are stale but will be overwritten on insert — no need to zero.
+    }
 }
 
 /// Tiered cache for decoded pack objects.
@@ -281,11 +295,11 @@ impl PackCache {
             return Self::single_tier(capacity_bytes, DEFAULT_SMALL_SLOT_SIZE);
         }
 
-        // Give the large tier half the budget so it can hold enough 2 MiB
-        // slots for good hash distribution (e.g. 32 MiB → 16 slots at 64 MiB
-        // total).  The previous 1/4 split left too few large slots when the
-        // slot size was raised from 512 KiB to 2 MiB.
-        let mut large_bytes = (capacity_bytes / 2).max(MIN_LARGE_TIER_BYTES);
+        // Give the large tier 1/3 of the budget. This balances large-slot
+        // capacity (enough 2 MiB slots for good hash distribution) against
+        // small-tier slot count (2/3 of capacity preserves a dense small-
+        // object working set with minimal evictions).
+        let mut large_bytes = (capacity_bytes / 3).max(MIN_LARGE_TIER_BYTES);
         if large_bytes > capacity_bytes {
             large_bytes = capacity_bytes;
         }
@@ -341,6 +355,34 @@ impl PackCache {
             return self.large.insert(offset, kind, bytes);
         }
         false
+    }
+
+    /// Clears all cached entries without releasing allocated memory.
+    ///
+    /// This is the Tiger-Style equivalent of creating a fresh cache:
+    /// the backing storage is retained so no allocations occur on the
+    /// next scan. Call this between repo scans or between pack plans
+    /// that should not share cached data.
+    pub fn reset(&mut self) {
+        self.small.reset();
+        self.large.reset();
+    }
+
+    /// Grows the cache to at least `capacity_bytes` if currently smaller.
+    ///
+    /// If the current capacity is already >= `capacity_bytes`, this is a
+    /// no-op (no allocation). If growth is needed, the cache is
+    /// reconstructed with the new capacity. Follows the
+    /// `PackExecScratch::prepare()` pattern: only grows, never shrinks.
+    pub fn ensure_capacity(&mut self, capacity_bytes: u32) {
+        if self.capacity_bytes() >= capacity_bytes {
+            // Already large enough — just reset entries for the new scan.
+            self.reset();
+            return;
+        }
+        // Need more space — reconstruct. This allocates but only happens
+        // when a larger repo is encountered for the first time.
+        *self = Self::new(capacity_bytes);
     }
 
     /// Builds a cache with only the small tier enabled, using the full

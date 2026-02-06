@@ -697,6 +697,8 @@ pub struct GitScanReport {
     pub perf_stats: super::perf::GitPerfStats,
     /// Allocation deltas for hot stages.
     pub alloc_stats: GitScanAllocStats,
+    /// Actual computed per-worker pack cache budget (bytes).
+    pub pack_cache_per_worker_bytes: usize,
 }
 
 impl GitScanReport {
@@ -761,6 +763,8 @@ pub(super) struct ScanModeOutput {
     pub stage_nanos: GitScanStageNanos,
     /// Allocation deltas for hot stages.
     pub alloc_stats: GitScanAllocStats,
+    /// Actual computed per-worker pack cache budget (bytes).
+    pub pack_cache_per_worker_bytes: usize,
 }
 
 /// Git scan error taxonomy.
@@ -1032,6 +1036,7 @@ pub fn run_git_scan(
         stage_nanos: output.stage_nanos,
         perf_stats,
         alloc_stats: output.alloc_stats,
+        pack_cache_per_worker_bytes: output.pack_cache_per_worker_bytes,
     }))
 }
 

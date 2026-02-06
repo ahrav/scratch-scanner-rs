@@ -522,7 +522,7 @@ fn main() -> io::Result<()> {
 
                 // Cache configuration.
                 let workers = config.pack_exec_workers;
-                let budget = config.pack_cache_bytes;
+                let budget = report.pack_cache_per_worker_bytes;
                 let total_cache = budget.saturating_mul(workers);
                 eprintln!("\ncache config:");
                 eprintln!("  budget_per_worker: {} MiB", budget / (1024 * 1024));

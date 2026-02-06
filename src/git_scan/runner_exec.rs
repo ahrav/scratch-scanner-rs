@@ -8,6 +8,8 @@
 //! - **Directory discovery** — pack dirs, loose dirs, pack file listing.
 //! - **Mmap management** — map pack files, apply sequential access hints.
 //! - **Pack view parsing** — validate headers, build `PackView`s for planning.
+//! - **Pack cache sizing** — layered heuristic (`estimate_pack_cache_bytes` →
+//!   [`per_worker_cache_bytes`]) that balances hit-rate against aggregate memory.
 //! - **Loose scanning** — decode loose objects and feed them to the engine.
 //! - **Threading utilities** — stats-free strategy selection, index sharding, result merging.
 //! - **Spill adapter** — [`SpillCandidateSink`] bridges [`CandidateSink`] to [`Spiller`].
@@ -53,6 +55,17 @@ use super::tree_candidate::CandidateSink;
 // Constants
 // ---------------------------------------------------------------------------
 
+// Pack cache sizing forms a layered hierarchy applied by `per_worker_cache_bytes`:
+//
+//   raw estimate  = total_pack_bytes / PACK_CACHE_FRACTION_DENOM  (~6.25 %)
+//   per-worker cap = PACK_CACHE_TOTAL_MAX_BYTES / workers         (aggregate bound)
+//   per-worker min = PACK_CACHE_PER_WORKER_MIN                    (functional floor)
+//   hard ceiling   = PACK_CACHE_MAX_BYTES                         (per-worker cap)
+//
+// The min-floor can exceed the per-worker cap, which is intentional: a
+// worker with too little cache is worse than slightly exceeding the
+// aggregate target.
+
 /// Heuristic bytes-per-candidate for path arena sizing.
 ///
 /// Average git path length is ~40 bytes; 64 adds headroom for longer paths
@@ -63,9 +76,8 @@ pub(super) const PATH_BYTES_PER_CANDIDATE_ESTIMATE: u64 = 64;
 /// Denominator for the pack cache sizing fraction.
 ///
 /// The pack cache receives `total_mapped_bytes / 16` (~6.25 % of pack data).
-/// The previous 1/64 fraction (~1.6 %) was insufficient for large working
-/// sets, causing 49–51 % hit rates on repos > 5 GiB. The increased fraction
-/// is bounded by [`PACK_CACHE_TOTAL_MAX_BYTES`] so aggregate memory stays
+/// This fraction provides sufficient working-set coverage for large repos
+/// while remaining bounded by [`PACK_CACHE_TOTAL_MAX_BYTES`] so aggregate memory stays
 /// controlled.
 pub(super) const PACK_CACHE_FRACTION_DENOM: u64 = 16;
 
@@ -74,13 +86,14 @@ pub(super) const PACK_CACHE_FRACTION_DENOM: u64 = 16;
 /// Prevents runaway allocation on repos with many large packs.
 pub(super) const PACK_CACHE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Aggregate memory cap across all workers (4 GiB).
+/// Aggregate memory cap across all workers (16 GiB).
 ///
-/// With N workers each sizing caches independently, the old formula could
-/// allocate N × budget (e.g. 24 × 800 MiB = 19.2 GiB on a 50 GiB repo).
-/// This cap divides evenly across workers so total cache memory stays
-/// bounded regardless of pack size or worker count.
-pub(super) const PACK_CACHE_TOTAL_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// With N workers each sizing caches independently, the per-worker estimate
+/// could sum to excessive totals (e.g. 24 × 800 MiB = 19.2 GiB on a 50 GiB
+/// repo). This cap divides evenly across workers so total cache memory stays
+/// bounded regardless of pack size or worker count. With 20 workers each
+/// gets up to 819 MiB — enough for large repos without starving small ones.
+pub(super) const PACK_CACHE_TOTAL_MAX_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
 /// Minimum per-worker cache budget (32 MiB).
 ///
@@ -146,6 +159,7 @@ impl CandidateSink for SpillCandidateSink<'_> {
 /// to avoid collisions between concurrent scans. The caller owns the
 /// directory and is responsible for cleanup (typically via [`Spiller`] drop).
 pub(super) fn make_spill_dir() -> Result<PathBuf, io::Error> {
+    // unwrap: SystemTime::now() is always ≥ UNIX_EPOCH on any supported platform.
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
     let mut path = std::env::temp_dir();
     path.push(format!(
@@ -202,14 +216,18 @@ pub(super) fn estimate_pack_cache_bytes(
 
 /// Compute bounded per-worker pack cache bytes.
 ///
-/// 1. Starts from the raw estimate (`estimate_pack_cache_bytes`).
+/// 1. Starts from the raw estimate ([`estimate_pack_cache_bytes`]).
 /// 2. Caps at `PACK_CACHE_TOTAL_MAX_BYTES / workers` so aggregate memory
-///    across all workers stays bounded (4 GiB by default).
+///    across all workers stays bounded (16 GiB by default).
 /// 3. Floors at `PACK_CACHE_PER_WORKER_MIN` (32 MiB) so each worker
 ///    retains a functional cache.
 /// 4. Clamps to `PACK_CACHE_MAX_BYTES` (2 GiB per-worker hard cap).
 ///
-/// This function should be used by both scan pipelines instead of calling
+/// Step 3 can exceed the per-worker cap from step 2 — this is intentional:
+/// a worker with too little cache degrades hit-rate more than marginally
+/// exceeding the aggregate target.
+///
+/// Both scan pipelines should call this instead of
 /// `estimate_pack_cache_bytes` directly.
 pub(super) fn per_worker_cache_bytes(
     base: usize,
@@ -255,9 +273,10 @@ pub(super) fn load_midx(repo: &RepoJobState) -> Result<MidxView<'_>, GitScanErro
 
 /// Convert the repo start set into finalize [`RefEntry`] values.
 ///
-/// Each start-set entry's ref name is resolved through the repo's shared
-/// name table so the resulting `RefEntry` vector carries owned byte names
-/// suitable for the finalize stage.
+/// The "start set" is the set of branch/tag tips that the walk begins from
+/// (populated during repo discovery). Each entry's ref name is resolved
+/// through the repo's shared name table so the resulting `RefEntry` vector
+/// carries owned byte names suitable for the finalize stage.
 pub(super) fn build_ref_entries(repo: &RepoJobState) -> Vec<RefEntry> {
     let mut refs = Vec::with_capacity(repo.start_set.len());
     for r in &repo.start_set {
@@ -305,8 +324,10 @@ pub(super) fn collect_loose_dirs(paths: &GitRepoPaths) -> Vec<PathBuf> {
 
 /// List pack file names from the provided pack directories.
 ///
-/// Returns raw file names (as bytes) for `.pack` files. Missing pack
-/// directories are ignored; other IO errors are returned.
+/// Returns raw file names (as bytes) for `.pack` files. Names are converted
+/// through [`OsStr::to_string_lossy`], so non-UTF-8 bytes are replaced with
+/// U+FFFD — acceptable because git pack file names are always ASCII hex.
+/// Missing pack directories are ignored; other IO errors are returned.
 pub(super) fn list_pack_files(pack_dirs: &[PathBuf]) -> Result<Vec<Vec<u8>>, GitScanError> {
     let mut names = Vec::new();
     for dir in pack_dirs {
@@ -497,8 +518,11 @@ pub(super) fn build_pack_views<'a>(
 
 /// Returns `(total_delta_deps, max_deps_in_single_plan)` across all plans.
 ///
-/// Used by the pipeline to log planning diagnostics and decide whether
-/// intra-pack sharding is viable (high per-plan deps penalize sharding).
+/// Delta deps are pack entries that require decoding another object first
+/// (the "base"). High dependency counts penalize sharding because shard
+/// boundaries can separate a delta from its base, forcing cross-shard
+/// resolution. The pipeline uses these numbers for logging and to inform
+/// the strategy chosen by [`select_pack_exec_strategy`].
 pub(super) fn summarize_pack_plan_deps(plans: &[PackPlan]) -> (u64, u32) {
     let mut total = 0u64;
     let mut max = 0u32;
@@ -511,6 +535,10 @@ pub(super) fn summarize_pack_plan_deps(plans: &[PackPlan]) -> (u64, u32) {
     }
     (total, max)
 }
+
+// Sharding heuristic thresholds — these parameterize `select_plan_shard_count`
+// and `select_pack_exec_strategy`. Each constant represents one independent
+// cap; the shard count is the *minimum* across all of them.
 
 /// Minimum decoded offsets before multi-threaded pack exec is considered.
 const MIN_TOTAL_NEED_FOR_PARALLEL: usize = 512;
@@ -691,10 +719,10 @@ pub(super) fn select_pack_exec_strategy(workers: usize, plans: &[PackPlan]) -> P
 
 /// Returns execution indices in deterministic order for a plan.
 ///
-/// When `exec_order` is present it is used to honour forward delta
-/// dependencies (base before dependent). Otherwise offsets are visited
-/// in natural `need_offsets` order, which is correct when all bases
-/// precede their deltas in the pack.
+/// When `exec_order` is present (set by the planner when forward delta
+/// dependencies exist) it is used to decode bases before their dependents.
+/// Otherwise offsets are visited in natural `need_offsets` order, which is
+/// correct when all bases precede their deltas in the pack file.
 pub(super) fn build_exec_indices(plan: &PackPlan) -> Vec<usize> {
     if let Some(order) = plan.exec_order.as_ref() {
         order.iter().map(|&idx| idx as usize).collect()
@@ -708,6 +736,8 @@ pub(super) fn build_exec_indices(plan: &PackPlan) -> Vec<usize> {
 /// The first `len % shards` ranges receive one extra element to distribute
 /// remainder evenly. Returns an empty vec when `len == 0`.
 /// `shards` is clamped to `[1, len]`.
+///
+/// Example: `shard_ranges(10, 3)` → `[(0,4), (4,7), (7,10)]`.
 pub(super) fn shard_ranges(len: usize, shards: usize) -> Vec<(usize, usize)> {
     if len == 0 {
         return Vec::new();
@@ -728,13 +758,15 @@ pub(super) fn shard_ranges(len: usize, shards: usize) -> Vec<(usize, usize)> {
     out
 }
 
-/// Merge per-shard scan results into a single [`ScannedBlobs`], rebasing
-/// finding spans so arena indices remain valid in the merged output.
+/// Merge per-shard scan results into a single [`ScannedBlobs`].
 ///
-/// Each shard's `finding_arena` is appended to the merged arena and every
-/// blob's `findings.start` is offset by the arena length at the time of
-/// append. Shards must be in deterministic order (e.g. by pack id) to
-/// produce reproducible output.
+/// Each blob stores its findings as a `Range<u32>` into a flat
+/// `finding_arena`. When arenas are concatenated the range start indices
+/// become stale, so every blob's `findings.start` is shifted ("rebased")
+/// by the arena length at the time its shard is appended.
+///
+/// Shards must be in deterministic order (e.g. by pack id) to produce
+/// reproducible output.
 pub(super) fn merge_scanned_blobs(mut shards: Vec<ScannedBlobs>) -> ScannedBlobs {
     let total_blobs: usize = shards.iter().map(|s| s.blobs.len()).sum();
     let total_findings: usize = shards.iter().map(|s| s.finding_arena.len()).sum();
@@ -824,6 +856,9 @@ pub(super) fn scan_loose_candidates(
 /// candidate at each skipped offset. Multiple candidates can share an
 /// offset (e.g. identical blobs referenced by different paths), and each
 /// one produces a separate [`SkippedCandidate`] entry in `out`.
+///
+/// Complexity: O(S × log N) where S = `skips.len()` and N =
+/// `candidate_offsets.len()` (two `partition_point` calls per skip).
 pub(super) fn collect_skipped_candidates(
     plan: &PackPlan,
     skips: &[SkipRecord],

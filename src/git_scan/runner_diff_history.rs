@@ -303,13 +303,22 @@ pub(super) fn run_diff_history(
     // determinism. Loose candidates are always scanned after packed plans,
     // outside the parallel scope, because loose reads go through the object
     // fan-out directory and are not contention-free across threads.
+    // Pre-allocate cache and scratch pools before strategy dispatch so no
+    // allocation happens inside worker closures (Tiger Style).
+    let mut prealloc_caches: Vec<PackCache> = (0..pack_exec_workers)
+        .map(|_| PackCache::new(pack_cache_bytes))
+        .collect();
+    let mut prealloc_scratches: Vec<PackExecScratch> = (0..pack_exec_workers)
+        .map(|_| PackExecScratch::default())
+        .collect();
+
     match pack_exec_strategy {
         PackExecStrategy::Serial => {
-            let mut cache = PackCache::new(pack_cache_bytes);
+            let mut cache = prealloc_caches.swap_remove(0);
             let mut external = PackIo::open(repo, config.pack_io)?;
             let mut adapter = EngineAdapter::new(engine, config.engine_adapter);
             adapter.reserve_results(packed_len.saturating_add(loose_len));
-            let mut exec_scratch = PackExecScratch::default();
+            let mut exec_scratch = prealloc_scratches.swap_remove(0);
             for plan in &plans {
                 let pack_id = plan.pack_id as usize;
                 let pack_bytes = pack_mmaps
@@ -364,7 +373,9 @@ pub(super) fn run_diff_history(
                 >();
                 let mut handles = Vec::with_capacity(pack_exec_workers);
 
-                for _ in 0..pack_exec_workers {
+                for (mut cache, mut scratch) in
+                    prealloc_caches.drain(..).zip(prealloc_scratches.drain(..))
+                {
                     let work_rx = Arc::clone(&work_rx);
                     let result_tx = result_tx.clone();
                     let pack_paths = pack_paths.clone();
@@ -377,7 +388,6 @@ pub(super) fn run_diff_history(
                     let pack_mmaps = &pack_mmaps;
 
                     handles.push(scope.spawn(move || {
-                        let mut cache = PackCache::new(pack_cache_bytes);
                         let mut external = match PackIo::from_parts(
                             midx,
                             pack_paths,
@@ -392,7 +402,6 @@ pub(super) fn run_diff_history(
                             }
                         };
                         let mut adapter = EngineAdapter::new(engine, adapter_cfg);
-                        let mut scratch = PackExecScratch::default();
 
                         loop {
                             let work = {
@@ -547,10 +556,22 @@ pub(super) fn run_diff_history(
 
                 let shard_count = shard_count_for_pack(&shard_counts, plan_ref.pack_id);
                 let ranges = shard_ranges(exec_indices.len(), shard_count);
+
+                // Reset pre-allocated shard caches for this plan.
+                for sc in prealloc_caches.iter_mut().take(ranges.len()) {
+                    sc.ensure_capacity(pack_cache_bytes);
+                }
+
                 let shard_outputs = std::thread::scope(
                     |scope| -> Result<Vec<(usize, PackExecReport, ScannedBlobs)>, PackExecError> {
                         let mut handles = Vec::with_capacity(ranges.len());
-                        for (shard_idx, (start, end)) in ranges.iter().enumerate() {
+                        let cache_slice = &mut prealloc_caches[..ranges.len()];
+                        let scratch_slice = &mut prealloc_scratches[..ranges.len()];
+                        for ((shard_idx, (start, end)), (cache, scratch)) in ranges
+                            .iter()
+                            .enumerate()
+                            .zip(cache_slice.iter_mut().zip(scratch_slice.iter_mut()))
+                        {
                             let exec_slice = &exec_indices[*start..*end];
                             let candidate_ranges = &candidate_ranges;
                             let pack_paths = pack_paths.clone();
@@ -562,7 +583,6 @@ pub(super) fn run_diff_history(
                             let spill_dir = &spill_dir;
 
                             handles.push(scope.spawn(move || {
-                                let mut cache = PackCache::new(pack_cache_bytes);
                                 let mut external = PackIo::from_parts(
                                     midx,
                                     pack_paths,
@@ -576,17 +596,16 @@ pub(super) fn run_diff_history(
                                     .filter_map(|idx| candidate_ranges[*idx].map(|(s, e)| e - s))
                                     .sum();
                                 adapter.reserve_results(shard_candidates);
-                                let mut scratch = PackExecScratch::default();
                                 let report = execute_pack_plan_with_scratch_indices(
                                     plan_ref,
                                     pack_bytes,
                                     paths,
                                     &pack_decode,
-                                    &mut cache,
+                                    cache,
                                     &mut external,
                                     &mut adapter,
                                     spill_dir,
-                                    &mut scratch,
+                                    scratch,
                                     exec_slice,
                                     candidate_ranges,
                                 )?;
@@ -664,5 +683,6 @@ pub(super) fn run_diff_history(
         mapping_stats,
         stage_nanos,
         alloc_stats: alloc_deltas,
+        pack_cache_per_worker_bytes: pack_cache_target,
     })
 }

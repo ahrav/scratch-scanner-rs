@@ -365,9 +365,14 @@ pub(super) fn run_odb_blob(
                 }
             });
 
+            // Pre-allocate cache and scratch before the strategy branch so
+            // no allocation happens inside worker closures (Tiger Style).
+            let prealloc_cache = PackCache::new(pack_cache_bytes);
+            let prealloc_scratch = PackExecScratch::default();
+
             // ── Strategy A: single-threaded execution ──────────────
             if pack_exec_workers == 1 {
-                let mut cache = PackCache::new(pack_cache_bytes);
+                let mut cache = prealloc_cache;
                 let mut external = PackIo::from_parts(
                     *midx,
                     pack_paths.clone(),
@@ -377,7 +382,7 @@ pub(super) fn run_odb_blob(
                 .map_err(GitScanError::PackIo)?;
                 let mut adapter = EngineAdapter::new(engine, config.engine_adapter);
                 adapter.reserve_results(packed_len.saturating_add(loose_len));
-                let mut exec_scratch = PackExecScratch::default();
+                let mut exec_scratch = prealloc_scratch;
                 for plan in rx {
                     let plan = plan?;
                     pack_plan_stats.push(plan.stats);
@@ -433,6 +438,15 @@ pub(super) fn run_odb_blob(
             // by the dispatcher so results can be slotted back in plan
             // order during reassembly.
             } else if prefer_pack_parallelism {
+                // Pre-allocate cache and scratch pools before spawning
+                // workers (Tiger Style: allocate at startup, not in closures).
+                let mut cache_pool: Vec<PackCache> = (0..pack_exec_workers)
+                    .map(|_| PackCache::new(pack_cache_bytes))
+                    .collect();
+                let mut scratch_pool: Vec<PackExecScratch> = (0..pack_exec_workers)
+                    .map(|_| PackExecScratch::default())
+                    .collect();
+
                 let (work_tx, work_rx) = mpsc::sync_channel::<(usize, PackPlan)>(pack_exec_workers);
                 let work_rx = Arc::new(Mutex::new(work_rx));
                 let (result_tx, result_rx) = mpsc::channel::<
@@ -443,7 +457,7 @@ pub(super) fn run_odb_blob(
                 >();
                 let mut handles = Vec::with_capacity(pack_exec_workers);
 
-                for _ in 0..pack_exec_workers {
+                for (mut cache, mut scratch) in cache_pool.drain(..).zip(scratch_pool.drain(..)) {
                     let work_rx = Arc::clone(&work_rx);
                     let result_tx = result_tx.clone();
                     let pack_paths = pack_paths.clone();
@@ -456,7 +470,6 @@ pub(super) fn run_odb_blob(
                     let pack_mmaps = &pack_mmaps;
 
                     handles.push(scope.spawn(move || {
-                        let mut cache = PackCache::new(pack_cache_bytes);
                         let mut external =
                             match PackIo::from_parts(*midx, pack_paths, loose_dirs, pack_io_limits)
                             {
@@ -468,7 +481,6 @@ pub(super) fn run_odb_blob(
                                 }
                             };
                         let mut adapter = EngineAdapter::new(engine, adapter_cfg);
-                        let mut scratch = PackExecScratch::default();
 
                         loop {
                             let work = {
@@ -598,12 +610,23 @@ pub(super) fn run_odb_blob(
                     queued_plans.push(plan);
                 }
 
+                // Pre-allocate shard caches + scratches for the sharded
+                // branch. For Serial/PackParallel the first entry is used
+                // directly; extras are harmless (zero-cost default).
+                let mut shard_caches: Vec<PackCache> = (0..pack_exec_workers)
+                    .map(|_| PackCache::new(pack_cache_bytes))
+                    .collect();
+                let mut shard_scratches: Vec<PackExecScratch> = (0..pack_exec_workers)
+                    .map(|_| PackExecScratch::default())
+                    .collect();
+
                 match select_pack_exec_strategy(pack_exec_workers, &queued_plans) {
                     PackExecStrategy::Serial | PackExecStrategy::PackParallel => {
                         if !queued_plans.is_empty() {
                             start_pack_exec();
                         }
-                        let mut cache = PackCache::new(pack_cache_bytes);
+                        // Reuse first pre-allocated cache and scratch.
+                        let mut cache = shard_caches.swap_remove(0);
                         let mut external = PackIo::from_parts(
                             *midx,
                             pack_paths.clone(),
@@ -613,7 +636,7 @@ pub(super) fn run_odb_blob(
                         .map_err(GitScanError::PackIo)?;
                         let mut adapter = EngineAdapter::new(engine, config.engine_adapter);
                         adapter.reserve_results(packed_len.saturating_add(loose_len));
-                        let mut exec_scratch = PackExecScratch::default();
+                        let mut exec_scratch = shard_scratches.swap_remove(0);
                         for plan in &queued_plans {
                             let pack_id = plan.pack_id as usize;
                             let pack_bytes = pack_mmaps
@@ -678,13 +701,30 @@ pub(super) fn run_odb_blob(
                                 }
                             };
                             let ranges = shard_ranges(exec_indices.len(), assigned_shards);
+
+                            // Reset pre-allocated shard caches for this plan
+                            // (ensure_capacity only allocates if a larger
+                            // budget is needed; otherwise it just clears).
+                            for sc in shard_caches.iter_mut().take(ranges.len()) {
+                                sc.ensure_capacity(pack_cache_bytes);
+                            }
+
                             let shard_outputs = std::thread::scope(
                                 |scope| -> Result<
                                     Vec<(usize, PackExecReport, ScannedBlobs)>,
                                     PackExecError,
                                 > {
                                     let mut handles = Vec::with_capacity(ranges.len());
-                                    for (shard_idx, (start, end)) in ranges.iter().enumerate() {
+                                    // Split the pre-allocated pools into
+                                    // disjoint &mut slices so the borrow
+                                    // checker can verify no aliasing.
+                                    let cache_slice = &mut shard_caches[..ranges.len()];
+                                    let scratch_slice = &mut shard_scratches[..ranges.len()];
+                                    for ((shard_idx, (start, end)), (cache, scratch)) in ranges
+                                        .iter()
+                                        .enumerate()
+                                        .zip(cache_slice.iter_mut().zip(scratch_slice.iter_mut()))
+                                    {
                                         let exec_slice = &exec_indices[*start..*end];
                                         let candidate_ranges = &candidate_ranges;
                                         let pack_paths = pack_paths.clone();
@@ -696,7 +736,6 @@ pub(super) fn run_odb_blob(
                                         let spill_dir = &spill_dir;
 
                                         handles.push(scope.spawn(move || {
-                                            let mut cache = PackCache::new(pack_cache_bytes);
                                             let mut external = PackIo::from_parts(
                                                 *midx,
                                                 pack_paths,
@@ -715,17 +754,16 @@ pub(super) fn run_odb_blob(
                                                 })
                                                 .sum();
                                             adapter.reserve_results(shard_candidates);
-                                            let mut scratch = PackExecScratch::default();
                                             let report = execute_pack_plan_with_scratch_indices(
                                                 plan_ref,
                                                 pack_bytes,
                                                 paths,
                                                 &pack_decode,
-                                                &mut cache,
+                                                cache,
                                                 &mut external,
                                                 &mut adapter,
                                                 spill_dir,
-                                                &mut scratch,
+                                                scratch,
                                                 exec_slice,
                                                 candidate_ranges,
                                             )?;
@@ -849,5 +887,6 @@ pub(super) fn run_odb_blob(
         mapping_stats,
         stage_nanos,
         alloc_stats: alloc_deltas,
+        pack_cache_per_worker_bytes: pack_cache_target,
     })
 }
