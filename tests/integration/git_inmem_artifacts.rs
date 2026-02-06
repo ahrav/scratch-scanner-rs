@@ -19,10 +19,11 @@ use std::process::Command;
 
 use scanner_rs::git_scan::{
     acquire_commit_graph, acquire_midx, build_midx_bytes, collect_pack_dirs,
-    load_commits_from_tips, resolve_pack_paths_from_midx, ArtifactBuildLimits, CommitGraph,
-    CommitGraphMem, CommitLoadLimits, CommitPlanIter, CommitWalkLimits, GitRepoPaths,
-    MidxBuildLimits, MidxView, ObjectFormat, OidBytes, ParentScratch, RefWatermarkStore,
-    RepoOpenError, RepoOpenLimits, StartSetConfig, StartSetResolver,
+    load_commits_from_tips, resolve_pack_paths_from_midx, ArtifactAcquireError,
+    ArtifactBuildLimits, CommitGraph, CommitGraphMem, CommitLoadLimits, CommitPlanIter,
+    CommitWalkLimits, GitRepoPaths, MidxBuildLimits, MidxView, ObjectFormat, OidBytes,
+    ParentScratch, RefWatermarkStore, RepoOpenError, RepoOpenLimits, StartSetConfig,
+    StartSetResolver,
 };
 use tempfile::TempDir;
 
@@ -548,6 +549,159 @@ fn inmem_artifacts_produce_correct_commit_plan() {
         expected_oids, mem_oids,
         "in-memory plan should produce the same commit OIDs as git rev-list"
     );
+}
+
+#[test]
+fn acquire_commit_graph_errors_when_start_set_empty_but_refs_exist() {
+    if !git_available() {
+        eprintln!("git not available; skipping");
+        return;
+    }
+
+    let tmp = create_repo_with_linear_history(3);
+    let git_dir = tmp.path().join(".git");
+    let objects_dir = git_dir.join("objects");
+
+    // Simulate missing maintenance artifacts so this path relies on in-memory builds.
+    let _ = fs::remove_file(objects_dir.join("pack").join("multi-pack-index"));
+    let _ = fs::remove_file(objects_dir.join("info").join("commit-graph"));
+    let _ = fs::remove_file(
+        objects_dir
+            .join("info")
+            .join("commit-graphs")
+            .join("commit-graph-chain"),
+    );
+
+    let resolver = TestResolver { refs: vec![] };
+    let start_set_id = StartSetConfig::DefaultBranchOnly.id();
+    let mut state = scanner_rs::git_scan::repo_open(
+        tmp.path(),
+        1,
+        [0u8; 32],
+        start_set_id,
+        &resolver,
+        &NoWatermarkStore,
+        RepoOpenLimits::DEFAULT,
+    )
+    .unwrap();
+
+    let limits = ArtifactBuildLimits::default();
+    let midx_result = acquire_midx(&mut state, &limits).unwrap();
+    let midx_view = MidxView::parse(midx_result.bytes.as_slice(), state.object_format).unwrap();
+
+    let err = acquire_commit_graph(&state, &midx_view, &midx_result.pack_paths, &limits)
+        .expect_err("empty start-set on a repo with refs must fail explicitly");
+    assert!(
+        matches!(err, ArtifactAcquireError::EmptyStartSetWithRefs),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn acquire_commit_graph_loads_loose_tip_chain_not_in_midx() {
+    if !git_available() {
+        eprintln!("git not available; skipping");
+        return;
+    }
+
+    let tmp = create_repo_with_linear_history(1);
+    run_git(tmp.path(), &["commit", "--allow-empty", "-m", "loose-1"]);
+    run_git(tmp.path(), &["commit", "--allow-empty", "-m", "loose-2"]);
+
+    let loose_head = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD"]));
+    let loose_parent = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD~1"]));
+    let packed_base = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD~2"]));
+
+    let resolver = TestResolver {
+        refs: vec![(b"refs/heads/main".to_vec(), loose_head)],
+    };
+    let start_set_id = StartSetConfig::DefaultBranchOnly.id();
+    let mut state = scanner_rs::git_scan::repo_open(
+        tmp.path(),
+        2,
+        [0u8; 32],
+        start_set_id,
+        &resolver,
+        &NoWatermarkStore,
+        RepoOpenLimits::DEFAULT,
+    )
+    .unwrap();
+
+    let limits = ArtifactBuildLimits::default();
+    let midx_result = acquire_midx(&mut state, &limits).unwrap();
+    let midx_view = MidxView::parse(midx_result.bytes.as_slice(), state.object_format).unwrap();
+
+    assert!(
+        midx_view.find_oid(&loose_head).unwrap().is_none(),
+        "fixture expects loose HEAD commit to be absent from MIDX"
+    );
+    assert!(
+        midx_view.find_oid(&loose_parent).unwrap().is_none(),
+        "fixture expects loose parent commit to be absent from MIDX"
+    );
+    assert!(
+        midx_view.find_oid(&packed_base).unwrap().is_some(),
+        "fixture expects packed base commit to be present in MIDX"
+    );
+
+    let cg = acquire_commit_graph(&state, &midx_view, &midx_result.pack_paths, &limits)
+        .expect("loose-tip chain should load via loose-object fallback");
+    let expected_commits = rev_list_all(tmp.path());
+
+    assert_eq!(cg.num_commits(), expected_commits.len() as u32);
+    for oid in &expected_commits {
+        assert!(
+            cg.lookup(oid).unwrap().is_some(),
+            "expected commit {oid} to be present in in-memory graph"
+        );
+    }
+}
+
+#[test]
+fn acquire_commit_graph_loads_packed_parent_with_loose_head() {
+    if !git_available() {
+        eprintln!("git not available; skipping");
+        return;
+    }
+
+    let tmp = create_repo_with_linear_history(2);
+    let packed_parent = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD"]));
+    run_git(tmp.path(), &["commit", "--allow-empty", "-m", "loose-head"]);
+    let loose_head = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD"]));
+
+    let resolver = TestResolver {
+        refs: vec![(b"refs/heads/main".to_vec(), loose_head)],
+    };
+    let start_set_id = StartSetConfig::DefaultBranchOnly.id();
+    let mut state = scanner_rs::git_scan::repo_open(
+        tmp.path(),
+        3,
+        [0u8; 32],
+        start_set_id,
+        &resolver,
+        &NoWatermarkStore,
+        RepoOpenLimits::DEFAULT,
+    )
+    .unwrap();
+
+    let limits = ArtifactBuildLimits::default();
+    let midx_result = acquire_midx(&mut state, &limits).unwrap();
+    let midx_view = MidxView::parse(midx_result.bytes.as_slice(), state.object_format).unwrap();
+
+    assert!(
+        midx_view.find_oid(&loose_head).unwrap().is_none(),
+        "fixture expects loose HEAD commit to be absent from MIDX"
+    );
+    assert!(
+        midx_view.find_oid(&packed_parent).unwrap().is_some(),
+        "fixture expects parent commit to be present in MIDX"
+    );
+
+    let cg = acquire_commit_graph(&state, &midx_view, &midx_result.pack_paths, &limits)
+        .expect("mixed packed-parent + loose-head history should load successfully");
+
+    assert!(cg.lookup(&loose_head).unwrap().is_some());
+    assert!(cg.lookup(&packed_parent).unwrap().is_some());
 }
 
 #[test]

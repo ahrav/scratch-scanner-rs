@@ -25,6 +25,8 @@
 //! - Some budget caps are hard limits and can drop work when exceeded; tune for your
 //!   desired balance of throughput and completeness.
 
+#[cfg(feature = "b64-stats")]
+use crate::perf_stats;
 use crate::stdx::FixedVec;
 use regex::bytes::Regex;
 use std::ops::Range;
@@ -188,6 +190,10 @@ impl TransformConfig {
 
 /// Base64 decode/gate instrumentation counters.
 ///
+/// Requires `b64-stats` feature (which implies `perf-stats`).  Methods
+/// are additionally gated on `perf_stats::enabled()` so the struct
+/// compiles but remains inert in release builds.
+///
 /// # Guarantees
 /// - Counters saturate on overflow.
 #[cfg(feature = "b64-stats")]
@@ -228,11 +234,18 @@ pub struct Base64DecodeStats {
 impl Base64DecodeStats {
     /// Resets all counters to zero.
     pub(crate) fn reset(&mut self) {
+        if !perf_stats::enabled() {
+            return;
+        }
         *self = Self::default();
     }
 
     /// Accumulates counters from `other` into `self` with saturating arithmetic.
     pub(crate) fn add(&mut self, other: &Self) {
+        if !perf_stats::enabled() {
+            let _ = other;
+            return;
+        }
         self.spans = self.spans.saturating_add(other.spans);
         self.span_bytes = self.span_bytes.saturating_add(other.span_bytes);
 

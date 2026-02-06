@@ -23,6 +23,8 @@
 
 use std::cmp::Ordering;
 
+use crate::perf_stats;
+
 use super::byte_arena::{ByteArena, ByteRef};
 use super::errors::SpillError;
 use super::midx::{MidxCursor, MidxView};
@@ -69,6 +71,8 @@ impl Default for MappingBridgeConfig {
 ///
 /// `unique_blobs_in` should equal `packed_matched + loose_unmatched` after
 /// a successful `finish`.
+///
+/// Populated only when `perf-stats` is enabled in debug builds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MappingStats {
     /// Total unique blobs processed.
@@ -205,7 +209,7 @@ impl<S: PackCandidateSink> UniqueBlobSink for MappingBridge<'_, S> {
                 ..blob.ctx
             };
 
-            self.stats.unique_blobs_in += 1;
+            perf_stats::sat_add_u64(&mut self.stats.unique_blobs_in, 1);
 
             match self
                 .midx
@@ -220,12 +224,12 @@ impl<S: PackCandidateSink> UniqueBlobSink for MappingBridge<'_, S> {
                         offset,
                     };
                     self.sink.emit_packed(&candidate)?;
-                    self.stats.packed_matched += 1;
+                    perf_stats::sat_add_u64(&mut self.stats.packed_matched, 1);
                 }
                 None => {
                     let candidate = LooseCandidate { oid: blob.oid, ctx };
                     self.sink.emit_loose(&candidate)?;
-                    self.stats.loose_unmatched += 1;
+                    perf_stats::sat_add_u64(&mut self.stats.loose_unmatched, 1);
                 }
             }
 

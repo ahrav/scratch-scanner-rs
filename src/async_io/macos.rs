@@ -64,6 +64,7 @@
 //! - **Leak-free cleanup**: `Drop` drains all in-flight requests before freeing buffers.
 
 use super::*;
+use crate::perf_stats;
 use crate::{BufferPool, Chunk, Engine, FindingRec, ScanScratch};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
@@ -339,8 +340,8 @@ impl MacosAioScanner {
                 Ok(()) => {}
                 Err(err) => {
                     if err.kind() == io::ErrorKind::NotFound {
-                        stats.open_errors += 1;
-                        stats.errors += 1;
+                        perf_stats::sat_add_u64(&mut stats.open_errors, 1);
+                        perf_stats::sat_add_u64(&mut stats.errors, 1);
                         continue;
                     }
                     return Err(err);
@@ -381,8 +382,8 @@ fn scan_file(
 
     while let Some(chunk) = reader.next_chunk(pool)? {
         let payload_len = chunk.len.saturating_sub(chunk.prefix_len) as u64;
-        stats.bytes_scanned = stats.bytes_scanned.saturating_add(payload_len);
-        stats.chunks += 1;
+        perf_stats::sat_add_u64(&mut stats.bytes_scanned, payload_len);
+        perf_stats::sat_add_u64(&mut stats.chunks, 1);
 
         engine.scan_chunk_into(chunk.data(), chunk.file_id, chunk.base_offset, scratch);
         let new_bytes_start = chunk.base_offset + chunk.prefix_len as u64;
@@ -398,7 +399,7 @@ fn scan_file(
                 rec.root_hint_start, rec.root_hint_end, rule
             )?;
             out.write_all(b"\n")?;
-            stats.findings += 1;
+            perf_stats::sat_add_u64(&mut stats.findings, 1);
         }
     }
 

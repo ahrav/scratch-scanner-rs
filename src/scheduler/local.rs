@@ -70,6 +70,7 @@ use crate::archive::{
     ArchiveConfig, ArchiveKind, ArchiveSkipReason, BudgetHit, ChargeResult, EntryPathCanonicalizer,
     EntrySkipReason, PartialReason, VirtualPathBuilder, DEFAULT_MAX_COMPONENTS,
 };
+use crate::perf_stats;
 use crate::scheduler::engine_stub::BUFFER_LEN_MAX;
 use crate::scheduler::output_sink::OutputSink;
 
@@ -338,6 +339,9 @@ struct LocalScratch<E: ScanEngine> {
 // ============================================================================
 
 /// Statistics from a local scan run.
+///
+/// Populated only when `perf-stats` is enabled in debug builds. Otherwise
+/// these counters remain zero.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LocalStats {
     /// Files discovered and enqueued.
@@ -356,8 +360,8 @@ pub struct LocalStats {
 
 /// Complete report from a local scan.
 ///
-/// `metrics` are aggregated from worker threads; `stats.io_errors` is derived
-/// from those metrics for convenience.
+/// `metrics` are aggregated from worker threads when perf stats are enabled.
+/// `stats.io_errors` is derived from those metrics for convenience.
 #[derive(Debug, Default)]
 pub struct LocalReport {
     pub stats: LocalStats,
@@ -724,7 +728,7 @@ fn process_gzip_file<E: ScanEngine>(
     let file = match File::open(&task.path) {
         Ok(f) => f,
         Err(_) => {
-            metrics.io_errors = metrics.io_errors.saturating_add(1);
+            perf_stats::sat_add_u64(&mut metrics.io_errors, 1);
             return ArchiveEnd::Skipped(ArchiveSkipReason::IoError);
         }
     };
@@ -743,7 +747,7 @@ fn process_gzip_file<E: ScanEngine>(
     ) {
         Ok(v) => v,
         Err(_) => {
-            metrics.io_errors = metrics.io_errors.saturating_add(1);
+            perf_stats::sat_add_u64(&mut metrics.io_errors, 1);
             return ArchiveEnd::Skipped(ArchiveSkipReason::IoError);
         }
     };
@@ -891,9 +895,7 @@ fn process_gzip_file<E: ScanEngine>(
             dedupe_findings(&mut scratch.pending);
         }
 
-        metrics.findings_emitted = metrics
-            .findings_emitted
-            .wrapping_add(scratch.pending.len() as u64);
+        perf_stats::wrap_add_u64(&mut metrics.findings_emitted, scratch.pending.len() as u64);
 
         emit_findings(
             engine.as_ref(),
@@ -903,8 +905,8 @@ fn process_gzip_file<E: ScanEngine>(
             &scratch.pending,
         );
 
-        metrics.chunks_scanned = metrics.chunks_scanned.saturating_add(1);
-        metrics.bytes_scanned = metrics.bytes_scanned.saturating_add(allowed);
+        perf_stats::sat_add_u64(&mut metrics.chunks_scanned, 1);
+        perf_stats::sat_add_u64(&mut metrics.bytes_scanned, allowed);
 
         offset = offset.saturating_add(allowed);
         have = read_len;
@@ -1042,10 +1044,10 @@ fn scan_gzip_stream_nested<E: ScanEngine, R: Read>(
             dedupe_findings(scan.pending);
         }
 
-        scan.metrics.findings_emitted = scan
-            .metrics
-            .findings_emitted
-            .wrapping_add(scan.pending.len() as u64);
+        perf_stats::wrap_add_u64(
+            &mut scan.metrics.findings_emitted,
+            scan.pending.len() as u64,
+        );
 
         emit_findings(
             scan.engine.as_ref(),
@@ -1055,8 +1057,8 @@ fn scan_gzip_stream_nested<E: ScanEngine, R: Read>(
             scan.pending,
         );
 
-        scan.metrics.chunks_scanned = scan.metrics.chunks_scanned.saturating_add(1);
-        scan.metrics.bytes_scanned = scan.metrics.bytes_scanned.saturating_add(allowed);
+        perf_stats::sat_add_u64(&mut scan.metrics.chunks_scanned, 1);
+        perf_stats::sat_add_u64(&mut scan.metrics.bytes_scanned, allowed);
 
         offset = offset.saturating_add(allowed);
         have = read_len;
@@ -1585,10 +1587,10 @@ fn scan_tar_stream_nested<E: ScanEngine>(
                 dedupe_findings(scan.pending);
             }
 
-            scan.metrics.findings_emitted = scan
-                .metrics
-                .findings_emitted
-                .wrapping_add(scan.pending.len() as u64);
+            perf_stats::wrap_add_u64(
+                &mut scan.metrics.findings_emitted,
+                scan.pending.len() as u64,
+            );
             emit_findings(
                 scan.engine.as_ref(),
                 scan.out,
@@ -1597,8 +1599,8 @@ fn scan_tar_stream_nested<E: ScanEngine>(
                 scan.pending,
             );
 
-            scan.metrics.chunks_scanned = scan.metrics.chunks_scanned.saturating_add(1);
-            scan.metrics.bytes_scanned = scan.metrics.bytes_scanned.saturating_add(allowed);
+            perf_stats::sat_add_u64(&mut scan.metrics.chunks_scanned, 1);
+            perf_stats::sat_add_u64(&mut scan.metrics.bytes_scanned, allowed);
 
             offset = offset.saturating_add(allowed);
             have = read_len;
@@ -1685,7 +1687,7 @@ fn process_tar_file<E: ScanEngine>(
     let file = match File::open(&task.path) {
         Ok(f) => f,
         Err(_) => {
-            ctx.metrics.io_errors = ctx.metrics.io_errors.saturating_add(1);
+            perf_stats::sat_add_u64(&mut ctx.metrics.io_errors, 1);
             return ArchiveEnd::Skipped(ArchiveSkipReason::IoError);
         }
     };
@@ -1700,7 +1702,7 @@ fn process_targz_file<E: ScanEngine>(
     let file = match File::open(&task.path) {
         Ok(f) => f,
         Err(_) => {
-            ctx.metrics.io_errors = ctx.metrics.io_errors.saturating_add(1);
+            perf_stats::sat_add_u64(&mut ctx.metrics.io_errors, 1);
             return ArchiveEnd::Skipped(ArchiveSkipReason::IoError);
         }
     };
@@ -1747,7 +1749,7 @@ fn process_zip_file<E: ScanEngine>(
     let file = match File::open(&task.path) {
         Ok(f) => f,
         Err(_) => {
-            metrics.io_errors = metrics.io_errors.saturating_add(1);
+            perf_stats::sat_add_u64(&mut metrics.io_errors, 1);
             return ArchiveEnd::Skipped(ArchiveSkipReason::IoError);
         }
     };
@@ -2085,11 +2087,11 @@ fn process_zip_file<E: ScanEngine>(
                 dedupe_findings(pending);
             }
 
-            metrics.findings_emitted = metrics.findings_emitted.wrapping_add(pending.len() as u64);
+            perf_stats::wrap_add_u64(&mut metrics.findings_emitted, pending.len() as u64);
             emit_findings(engine.as_ref(), out, out_buf, path_bytes, pending);
 
-            metrics.chunks_scanned = metrics.chunks_scanned.saturating_add(1);
-            metrics.bytes_scanned = metrics.bytes_scanned.saturating_add(allowed);
+            perf_stats::sat_add_u64(&mut metrics.chunks_scanned, 1);
+            perf_stats::sat_add_u64(&mut metrics.bytes_scanned, allowed);
 
             offset = offset.saturating_add(allowed);
 
@@ -2213,7 +2215,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
     let mut file = match File::open(&task.path) {
         Ok(f) => f,
         Err(e) => {
-            ctx.metrics.io_errors = ctx.metrics.io_errors.saturating_add(1);
+            perf_stats::sat_add_u64(&mut ctx.metrics.io_errors, 1);
             #[cfg(debug_assertions)]
             eprintln!("[local] Failed to open file {:?}: {}", task.path, e);
             let _ = e;
@@ -2227,7 +2229,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
     let file_size = match file.metadata() {
         Ok(m) => m.len(),
         Err(e) => {
-            ctx.metrics.io_errors = ctx.metrics.io_errors.saturating_add(1);
+            perf_stats::sat_add_u64(&mut ctx.metrics.io_errors, 1);
             #[cfg(debug_assertions)]
             eprintln!("[local] Failed to get metadata {:?}: {}", task.path, e);
             let _ = e;
@@ -2251,7 +2253,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
         let n = match file.read(&mut header) {
             Ok(n) => n,
             Err(e) => {
-                ctx.metrics.io_errors = ctx.metrics.io_errors.saturating_add(1);
+                perf_stats::sat_add_u64(&mut ctx.metrics.io_errors, 1);
                 #[cfg(debug_assertions)]
                 eprintln!("[local] Failed to read header {:?}: {}", task.path, e);
                 let _ = e;
@@ -2277,7 +2279,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
             }
         }
         if let Err(e) = file.seek(SeekFrom::Start(0)) {
-            ctx.metrics.io_errors = ctx.metrics.io_errors.saturating_add(1);
+            perf_stats::sat_add_u64(&mut ctx.metrics.io_errors, 1);
             #[cfg(debug_assertions)]
             eprintln!("[local] Failed to rewind {:?}: {}", task.path, e);
             let _ = e;
@@ -2318,7 +2320,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
         let n = match read_some(&mut file, dst) {
             Ok(n) => n,
             Err(e) => {
-                ctx.metrics.io_errors = ctx.metrics.io_errors.saturating_add(1);
+                perf_stats::sat_add_u64(&mut ctx.metrics.io_errors, 1);
                 #[cfg(debug_assertions)]
                 eprintln!("[local] Read failed for {:?}: {}", task.path, e);
                 let _ = e;
@@ -2362,10 +2364,10 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
         }
 
         // Count findings before emitting (pending.len() is the count for this chunk)
-        ctx.metrics.findings_emitted = ctx
-            .metrics
-            .findings_emitted
-            .wrapping_add(scratch.pending.len() as u64);
+        perf_stats::wrap_add_u64(
+            &mut ctx.metrics.findings_emitted,
+            scratch.pending.len() as u64,
+        );
 
         // Emit findings
         emit_findings(
@@ -2378,11 +2380,8 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
 
         // Update metrics with ACTUAL bytes scanned (not planned)
         let actual_payload = n; // New bytes read this iteration
-        ctx.metrics.chunks_scanned = ctx.metrics.chunks_scanned.saturating_add(1);
-        ctx.metrics.bytes_scanned = ctx
-            .metrics
-            .bytes_scanned
-            .saturating_add(actual_payload as u64);
+        perf_stats::sat_add_u64(&mut ctx.metrics.chunks_scanned, 1);
+        perf_stats::sat_add_u64(&mut ctx.metrics.bytes_scanned, actual_payload as u64);
 
         // Advance offset by actual payload read
         offset = offset.saturating_add(actual_payload as u64);
@@ -2609,8 +2608,8 @@ where
         let file_id = FileId(next_file_id);
         next_file_id = next_file_id.wrapping_add(1);
 
-        stats.files_enqueued += 1;
-        stats.bytes_enqueued += file.size;
+        perf_stats::sat_add_u64(&mut stats.files_enqueued, 1);
+        perf_stats::sat_add_u64(&mut stats.bytes_enqueued, file.size);
 
         // Enqueue task
         let task = FileTask {
@@ -2641,7 +2640,7 @@ where
     out.flush();
 
     // Aggregate I/O errors from worker metrics into stats
-    stats.io_errors = metrics.io_errors;
+    perf_stats::set_u64(&mut stats.io_errors, metrics.io_errors);
 
     LocalReport { stats, metrics }
 }

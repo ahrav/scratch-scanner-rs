@@ -14,6 +14,7 @@
 //!   read via buffered IO to avoid short reads and alignment traps.
 
 use super::*;
+use crate::perf_stats;
 use crate::{BufferPool, Chunk, Engine, FindingRec, ScanScratch};
 use io_uring::{opcode, types, IoUring};
 use std::fs::File;
@@ -140,8 +141,8 @@ impl UringScanner {
                 Ok(()) => {}
                 Err(err) => {
                     if err.kind() == io::ErrorKind::NotFound {
-                        stats.open_errors += 1;
-                        stats.errors += 1;
+                        perf_stats::sat_add_u64(&mut stats.open_errors, 1);
+                        perf_stats::sat_add_u64(&mut stats.errors, 1);
                         continue;
                     }
                     return Err(err);
@@ -199,8 +200,8 @@ fn scan_file<W: Write>(
         let submitted = reader.submit_next_from_current(&current)?;
 
         let payload_len = current.len.saturating_sub(current.prefix_len) as u64;
-        stats.bytes_scanned = stats.bytes_scanned.saturating_add(payload_len);
-        stats.chunks += 1;
+        perf_stats::sat_add_u64(&mut stats.bytes_scanned, payload_len);
+        perf_stats::sat_add_u64(&mut stats.chunks, 1);
 
         engine.scan_chunk_into(
             current.data(),
@@ -225,7 +226,7 @@ fn scan_file<W: Write>(
                 rec.root_hint_start, rec.root_hint_end, rule
             )?;
             out.write_all(b"\n")?;
-            stats.findings += 1;
+            perf_stats::sat_add_u64(&mut stats.findings, 1);
         }
 
         match next {

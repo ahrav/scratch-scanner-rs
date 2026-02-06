@@ -23,7 +23,7 @@
 //! the check is best-effort and does not guard against all races.
 
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 
 use super::byte_arena::{ByteArena, ByteRef};
@@ -413,6 +413,75 @@ fn resolve_start_set_with_watermarks(
         .collect();
 
     Ok((ref_names, start_set))
+}
+
+/// Returns true if the repository currently advertises any reachable refs.
+///
+/// This check is used as a guardrail for empty start-set handling in the
+/// in-memory artifact path:
+/// - Loose refs are detected by walking `common_dir/refs` recursively.
+/// - Packed refs are detected by scanning `common_dir/packed-refs` entries.
+///
+/// Pseudo-refs (like `HEAD`) are intentionally excluded; this function is about
+/// named refs that define start-set coverage.
+pub(crate) fn repo_has_reachable_refs(paths: &GitRepoPaths) -> Result<bool, RepoOpenError> {
+    if has_loose_refs(&paths.common_dir.join("refs"))? {
+        return Ok(true);
+    }
+    has_packed_refs(&paths.common_dir.join("packed-refs"))
+}
+
+fn has_loose_refs(refs_dir: &Path) -> Result<bool, RepoOpenError> {
+    let mut stack = vec![refs_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(RepoOpenError::io(err)),
+        };
+
+        for entry in entries {
+            let entry = entry.map_err(RepoOpenError::io)?;
+            let file_type = entry.file_type().map_err(RepoOpenError::io)?;
+            if file_type.is_dir() {
+                stack.push(entry.path());
+                continue;
+            }
+            if file_type.is_file() || file_type.is_symlink() {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn has_packed_refs(packed_refs_path: &Path) -> Result<bool, RepoOpenError> {
+    let file = match File::open(packed_refs_path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(RepoOpenError::io(err)),
+    };
+
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = reader.read_line(&mut line).map_err(RepoOpenError::io)?;
+        if read == 0 {
+            break;
+        }
+
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
+            continue;
+        }
+
+        if line.split_once(' ').is_some() || line.split_once('\t').is_some() {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 fn has_lock_files(

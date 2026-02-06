@@ -67,7 +67,25 @@ mod api;
 mod demo;
 mod engine;
 mod gitleaks_rules;
+mod perf_stats;
 mod runtime;
+
+// Guard: stat instrumentation features carry non-trivial overhead and must
+// never ship in release binaries.  The `perf_stats` module compiles its
+// helpers to no-ops when the gate is off, but the structs themselves still
+// occupy memory; this fence catches accidental feature-flag leaks in CI.
+#[cfg(all(
+    not(debug_assertions),
+    any(
+        feature = "perf-stats",
+        feature = "stats",
+        feature = "b64-stats",
+        feature = "git-perf"
+    )
+))]
+compile_error!(
+    "perf/stat instrumentation features are debug-only; disable them for release builds"
+);
 
 #[cfg(feature = "b64-stats")]
 pub use api::Base64DecodeStats;

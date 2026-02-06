@@ -237,6 +237,13 @@ pub struct Engine {
     /// Used by the zero-hit prefilter bypass to decide whether transforms
     /// could discover encoded secrets invisible to the raw-buffer prefilter.
     has_active_transforms: bool,
+    /// Active transform indices for ScanBuf path split by mode/id.
+    ///
+    /// Bucketing by mode/id avoids hot-loop branches on `tc.mode` and `tc.id`.
+    scanbuf_transform_idxs_active_non_base64: Vec<usize>,
+    scanbuf_transform_idxs_active_base64: Vec<usize>,
+    scanbuf_transform_idxs_always_non_base64: Vec<usize>,
+    scanbuf_transform_idxs_always_base64: Vec<usize>,
 }
 
 impl Engine {
@@ -752,9 +759,32 @@ impl Engine {
                 }
             }
         };
-        let has_active_transforms = transforms
-            .iter()
-            .any(|tc| tc.mode != TransformMode::Disabled);
+        let mut scanbuf_transform_idxs_active_non_base64 =
+            Vec::with_capacity(transforms.len().min(8));
+        let mut scanbuf_transform_idxs_active_base64 = Vec::with_capacity(transforms.len().min(8));
+        let mut scanbuf_transform_idxs_always_non_base64 =
+            Vec::with_capacity(transforms.len().min(8));
+        let mut scanbuf_transform_idxs_always_base64 = Vec::with_capacity(transforms.len().min(8));
+        for (idx, tc) in transforms.iter().enumerate() {
+            if tc.mode == TransformMode::Disabled {
+                continue;
+            }
+            let is_base64 = tc.id == TransformId::Base64;
+            if is_base64 {
+                scanbuf_transform_idxs_active_base64.push(idx);
+            } else {
+                scanbuf_transform_idxs_active_non_base64.push(idx);
+            }
+            if tc.mode == TransformMode::Always {
+                if is_base64 {
+                    scanbuf_transform_idxs_always_base64.push(idx);
+                } else {
+                    scanbuf_transform_idxs_always_non_base64.push(idx);
+                }
+            }
+        }
+        let has_active_transforms = !scanbuf_transform_idxs_active_non_base64.is_empty()
+            || !scanbuf_transform_idxs_active_base64.is_empty();
 
         Self {
             rules: rules_compiled,
@@ -777,6 +807,10 @@ impl Engine {
             max_prefilter_width,
             stream_ring_bytes,
             has_active_transforms,
+            scanbuf_transform_idxs_active_non_base64,
+            scanbuf_transform_idxs_active_base64,
+            scanbuf_transform_idxs_always_non_base64,
+            scanbuf_transform_idxs_always_base64,
         }
     }
 
@@ -798,6 +832,21 @@ impl Engine {
     /// The slice contains `(rule_index, reason)` pairs in original rule order.
     pub fn unfilterable_rules(&self) -> &[(usize, UnfilterableReason)] {
         &self.unfilterable_rules
+    }
+
+    #[inline(always)]
+    fn scanbuf_transform_buckets(&self, found_any_in_this_buf: bool) -> (&[usize], &[usize]) {
+        if found_any_in_this_buf {
+            (
+                &self.scanbuf_transform_idxs_always_non_base64,
+                &self.scanbuf_transform_idxs_always_base64,
+            )
+        } else {
+            (
+                &self.scanbuf_transform_idxs_active_non_base64,
+                &self.scanbuf_transform_idxs_active_base64,
+            )
+        }
     }
 
     /// Single-buffer scan helper (allocation-free after startup).
@@ -922,12 +971,24 @@ impl Engine {
             crate::git_scan::perf::record_scan_zero_hit_chunk();
 
             let needs_transform_scan = self.has_active_transforms
-                && self.transforms.iter().any(|tc| {
-                    tc.mode != TransformMode::Disabled
-                        && root_buf.len() >= tc.min_len
-                        && super::transform::transform_quick_trigger(tc, root_buf)
-                        && self.base64_buffer_gate(tc, root_buf)
-                });
+                && (self
+                    .scanbuf_transform_idxs_active_non_base64
+                    .iter()
+                    .any(|&tidx| {
+                        let tc = &self.transforms[tidx];
+                        root_buf.len() >= tc.min_len
+                            && super::transform::transform_quick_trigger(tc, root_buf)
+                            && self.base64_buffer_gate(tc, root_buf)
+                    })
+                    || self
+                        .scanbuf_transform_idxs_active_base64
+                        .iter()
+                        .any(|&tidx| {
+                            let tc = &self.transforms[tidx];
+                            root_buf.len() >= tc.min_len
+                                && super::transform::transform_quick_trigger(tc, root_buf)
+                                && self.base64_buffer_gate(tc, root_buf)
+                        }));
 
             if !needs_transform_scan {
                 crate::git_scan::perf::record_scan_prefilter_bypass();
@@ -1070,14 +1131,97 @@ impl Engine {
                 if scratch.work_items_enqueued >= self.tuning.max_work_items {
                     continue;
                 }
+                // Decode bytes are only produced in the DecodeSpan arm, so this
+                // budget is invariant while processing a ScanBuf item.
+                if scratch.total_decode_output_bytes >= self.tuning.max_total_decode_output_bytes {
+                    continue;
+                }
+                // Keep a local decrementing budget to avoid repeated loads of
+                // `work_items_enqueued` and `max_work_items` in span inner loops.
+                let mut remaining_work_items = self
+                    .tuning
+                    .max_work_items
+                    .saturating_sub(scratch.work_items_enqueued);
+                if remaining_work_items == 0 {
+                    continue;
+                }
+                let (non_base64_tidxs, base64_tidxs) =
+                    self.scanbuf_transform_buckets(found_any_in_this_buf);
 
-                for (tidx, tc) in self.transforms.iter().enumerate() {
-                    if tc.mode == TransformMode::Disabled {
+                for &tidx in non_base64_tidxs {
+                    if remaining_work_items == 0 {
+                        break;
+                    }
+                    let tc = &self.transforms[tidx];
+                    if cur_buf.len() < tc.min_len {
                         continue;
                     }
-                    if tc.mode == TransformMode::IfNoFindingsInThisBuffer && found_any_in_this_buf {
+                    if !super::transform::transform_quick_trigger(tc, cur_buf) {
                         continue;
                     }
+
+                    super::transform::find_spans_into(tc, cur_buf, &mut scratch.spans);
+                    if scratch.spans.is_empty() {
+                        continue;
+                    }
+
+                    let span_len = scratch.spans.len().min(tc.max_spans_per_buffer);
+                    for i in 0..span_len {
+                        if remaining_work_items == 0 {
+                            break;
+                        }
+
+                        let enc_span = scratch.spans[i].to_range();
+                        let child_step_id = scratch.step_arena.push(
+                            step_id,
+                            DecodeStep::Transform {
+                                transform_idx: tidx,
+                                parent_span: enc_span.clone(),
+                            },
+                        );
+
+                        // Compute the child's root hint. For nested transforms, use the
+                        // mapping context to translate the encoded span back to root-buffer
+                        // coordinates. This ensures findings report offsets into the original
+                        // input, not intermediate decoded buffers.
+                        let child_root_hint: Option<Range<usize>> =
+                            if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
+                                Some(ctx.map_span(enc_span.clone()))
+                            } else if root_hint.is_none() {
+                                Some(enc_span.clone())
+                            } else {
+                                root_hint.clone()
+                            };
+
+                        let child_enc_ref = if buf_is_slab {
+                            let start = buf_offset.saturating_add(enc_span.start);
+                            let end = buf_offset.saturating_add(enc_span.end);
+                            EncRef::slab(start as u32..end as u32)
+                        } else {
+                            EncRef::root(enc_span.start as u32..enc_span.end as u32)
+                        };
+
+                        let child_root_hint_u64: Option<Range<u64>> = child_root_hint
+                            .as_ref()
+                            .map(|r| r.start as u64..r.end as u64);
+
+                        scratch.work_q.push(WorkItem::decode_span(
+                            tidx as u16,
+                            child_enc_ref,
+                            child_step_id,
+                            child_root_hint_u64,
+                            (depth + 1) as u8,
+                        ));
+                        scratch.work_items_enqueued += 1;
+                        remaining_work_items -= 1;
+                    }
+                }
+
+                for &tidx in base64_tidxs {
+                    if remaining_work_items == 0 {
+                        break;
+                    }
+                    let tc = &self.transforms[tidx];
                     if cur_buf.len() < tc.min_len {
                         continue;
                     }
@@ -1095,57 +1239,48 @@ impl Engine {
 
                     let span_len = scratch.spans.len().min(tc.max_spans_per_buffer);
                     for i in 0..span_len {
-                        if scratch.work_items_enqueued >= self.tuning.max_work_items {
-                            break;
-                        }
-                        if scratch.total_decode_output_bytes
-                            >= self.tuning.max_total_decode_output_bytes
-                        {
+                        if remaining_work_items == 0 {
                             break;
                         }
 
                         let enc_span = scratch.spans[i].to_range();
                         let enc = &cur_buf[enc_span.clone()];
-                        if tc.id == TransformId::Base64 {
-                            // Base64-only prefilter: cheap encoded-space gate.
-                            // This is only used when the decoded gate is enabled, and it never
-                            // replaces the decoded check. It exists to avoid paying decode cost
-                            // when a span cannot possibly contain any anchor after decoding.
-                            #[cfg(feature = "b64-stats")]
-                            {
-                                scratch.base64_stats.spans =
-                                    scratch.base64_stats.spans.saturating_add(1);
-                                scratch.base64_stats.span_bytes = scratch
-                                    .base64_stats
-                                    .span_bytes
-                                    .saturating_add(enc.len() as u64);
-                            }
-                            if tc.gate == Gate::AnchorsInDecoded {
-                                if let Some(gate) = &self.b64_gate {
+                        // Base64-only prefilter: cheap encoded-space gate.
+                        // This is only used when the decoded gate is enabled, and it never
+                        // replaces the decoded check. It exists to avoid paying decode cost
+                        // when a span cannot possibly contain any anchor after decoding.
+                        #[cfg(feature = "b64-stats")]
+                        {
+                            scratch.base64_stats.spans =
+                                scratch.base64_stats.spans.saturating_add(1);
+                            scratch.base64_stats.span_bytes = scratch
+                                .base64_stats
+                                .span_bytes
+                                .saturating_add(enc.len() as u64);
+                        }
+                        if tc.gate == Gate::AnchorsInDecoded {
+                            if let Some(gate) = &self.b64_gate {
+                                #[cfg(feature = "b64-stats")]
+                                {
+                                    scratch.base64_stats.pre_gate_checks =
+                                        scratch.base64_stats.pre_gate_checks.saturating_add(1);
+                                }
+                                if !gate.hits(enc) {
                                     #[cfg(feature = "b64-stats")]
                                     {
-                                        scratch.base64_stats.pre_gate_checks =
-                                            scratch.base64_stats.pre_gate_checks.saturating_add(1);
+                                        scratch.base64_stats.pre_gate_skip =
+                                            scratch.base64_stats.pre_gate_skip.saturating_add(1);
+                                        scratch.base64_stats.pre_gate_skip_bytes = scratch
+                                            .base64_stats
+                                            .pre_gate_skip_bytes
+                                            .saturating_add(enc.len() as u64);
                                     }
-                                    if !gate.hits(enc) {
-                                        #[cfg(feature = "b64-stats")]
-                                        {
-                                            scratch.base64_stats.pre_gate_skip = scratch
-                                                .base64_stats
-                                                .pre_gate_skip
-                                                .saturating_add(1);
-                                            scratch.base64_stats.pre_gate_skip_bytes = scratch
-                                                .base64_stats
-                                                .pre_gate_skip_bytes
-                                                .saturating_add(enc.len() as u64);
-                                        }
-                                        continue;
-                                    }
-                                    #[cfg(feature = "b64-stats")]
-                                    {
-                                        scratch.base64_stats.pre_gate_pass =
-                                            scratch.base64_stats.pre_gate_pass.saturating_add(1);
-                                    }
+                                    continue;
+                                }
+                                #[cfg(feature = "b64-stats")]
+                                {
+                                    scratch.base64_stats.pre_gate_pass =
+                                        scratch.base64_stats.pre_gate_pass.saturating_add(1);
                                 }
                             }
                         }
@@ -1154,8 +1289,7 @@ impl Engine {
                         //
                         // A Base64-encoded span may not start on a 4-character boundary
                         // relative to the original encoding. Shifting by 0..3 characters
-                        // tries each possible alignment and produces up to 4 decode
-                        // sub-spans. Non-Base64 transforms always produce a single span.
+                        // tries each possible alignment and produces up to 4 decode sub-spans.
                         //
                         // For each shift, `base64_skip_chars` returns the byte offset to
                         // skip leading non-alphabet chars (whitespace, padding) plus
@@ -1166,50 +1300,36 @@ impl Engine {
                         let mut span_starts = [0usize; 4];
                         let mut span_ends = [0usize; 4];
                         let mut span_count = 0usize;
-
-                        if tc.id == TransformId::Base64 {
-                            let allow_space_ws = tc.base64_allow_space_ws;
-                            for shift in 0..4usize {
-                                let Some(rel) =
-                                    super::transform::base64_skip_chars(enc, shift, allow_space_ws)
-                                else {
-                                    break;
-                                };
-                                let start = enc_span.start.saturating_add(rel);
-                                if start >= enc_span.end {
-                                    continue;
-                                }
-                                if span_starts[..span_count].contains(&start) {
-                                    continue;
-                                }
-                                let enc_aligned = &cur_buf[start..enc_span.end];
-                                let remaining_chars = super::transform::base64_char_count(
-                                    enc_aligned,
-                                    allow_space_ws,
-                                );
-                                if remaining_chars < tc.min_len {
-                                    continue;
-                                }
-                                span_starts[span_count] = start;
-                                span_ends[span_count] = enc_span.end;
-                                span_count += 1;
-                                if span_count >= span_starts.len() {
-                                    break;
-                                }
+                        let allow_space_ws = tc.base64_allow_space_ws;
+                        for shift in 0..4usize {
+                            let Some(rel) =
+                                super::transform::base64_skip_chars(enc, shift, allow_space_ws)
+                            else {
+                                break;
+                            };
+                            let start = enc_span.start.saturating_add(rel);
+                            if start >= enc_span.end {
+                                continue;
                             }
-                        } else {
-                            span_starts[0] = enc_span.start;
-                            span_ends[0] = enc_span.end;
-                            span_count = 1;
+                            if span_starts[..span_count].contains(&start) {
+                                continue;
+                            }
+                            let enc_aligned = &cur_buf[start..enc_span.end];
+                            let remaining_chars =
+                                super::transform::base64_char_count(enc_aligned, allow_space_ws);
+                            if remaining_chars < tc.min_len {
+                                continue;
+                            }
+                            span_starts[span_count] = start;
+                            span_ends[span_count] = enc_span.end;
+                            span_count += 1;
+                            if span_count >= span_starts.len() {
+                                break;
+                            }
                         }
 
                         for idx in 0..span_count {
-                            if scratch.work_items_enqueued >= self.tuning.max_work_items {
-                                break;
-                            }
-                            if scratch.total_decode_output_bytes
-                                >= self.tuning.max_total_decode_output_bytes
-                            {
+                            if remaining_work_items == 0 {
                                 break;
                             }
 
@@ -1255,6 +1375,7 @@ impl Engine {
                                 (depth + 1) as u8,
                             ));
                             scratch.work_items_enqueued += 1;
+                            remaining_work_items -= 1;
                         }
                     }
                 }

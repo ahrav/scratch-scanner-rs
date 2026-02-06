@@ -160,12 +160,14 @@ pub struct GitScanConfig {
     pub pack_mmap: PackMmapLimits,
     /// Pack cache size in bytes (must fit in `u32`).
     pub pack_cache_bytes: usize,
-    /// Pack exec worker count (1 = single-threaded).
+    /// Symmetric pack-exec threads per worker.
     ///
-    /// Default oversubscribes 2x cores (capped at 24) to hide pack IO + decode
-    /// stalls while avoiding unbounded memory-bandwidth contention.
+    /// Each top-level worker that scans a git repo spawns this many threads
+    /// for pack execution. Both threads handle I/O (page faults) and compute
+    /// (decode + scan), keeping caches hot. Default is 2 to overlap IO latency
+    /// without multiplicative thread explosion across concurrent repo scans.
     ///
-    /// Applies to both scan modes (`odb-blob` and `diff-history`).
+    /// Total pack threads in the system ≤ scheduler_workers × pack_exec_workers.
     pub pack_exec_workers: usize,
     /// Optional spill directory override. When `None`, a unique temp directory is used.
     pub spill_dir: Option<PathBuf>,
@@ -205,17 +207,19 @@ impl Default for GitScanConfig {
     }
 }
 
-/// Chooses a throughput-optimized pack exec worker count.
+/// Per-worker pack exec thread budget.
 ///
-/// We oversubscribe 2x cores to mask IO/decode latency, but cap at 24 to avoid
-/// cache thrash and memory-bandwidth collapse on large machines.
+/// Oversubscribes 2× cores to mask IO/decode latency, capped at 24 to
+/// avoid cache thrash and memory-bandwidth collapse on large machines.
+/// Floor of 12 ensures sufficient parallelism even on low-core-count
+/// machines.
 fn default_pack_exec_workers() -> usize {
     let parallelism = std::thread::available_parallelism()
         .map(|count| count.get())
         .unwrap_or(1);
     let doubled = parallelism.saturating_mul(2);
     let capped = if doubled > 24 { 24 } else { doubled };
-    capped.max(1)
+    capped.max(12)
 }
 
 /// Git scan execution mode.

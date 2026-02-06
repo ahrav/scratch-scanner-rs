@@ -26,15 +26,15 @@ use std::path::PathBuf;
 use super::bytes::BytesView;
 use super::commit_graph_mem::CommitGraphMem;
 use super::commit_loader::{
-    collect_pack_dirs, load_commits_from_tips, resolve_pack_paths_from_midx, CommitLoadError,
-    CommitLoadLimits,
+    collect_loose_dirs, collect_pack_dirs, load_commits_from_tips_with_loose_dirs,
+    resolve_pack_paths_from_midx, CommitLoadError, CommitLoadLimits,
 };
 use super::errors::{CommitPlanError, RepoOpenError};
 use super::midx::MidxView;
 use super::midx_build::{build_midx_bytes, MidxBuildError, MidxBuildLimits};
 use super::midx_error::MidxError;
 use super::object_id::OidBytes;
-use super::repo_open::{RepoArtifactFingerprint, RepoJobState};
+use super::repo_open::{repo_has_reachable_refs, RepoArtifactFingerprint, RepoJobState};
 
 /// Limits for in-memory artifact construction.
 ///
@@ -64,6 +64,11 @@ pub enum ArtifactAcquireError {
     CommitGraphBuild(CommitPlanError),
     /// Repo open error (e.g., fingerprint computation).
     RepoOpen(RepoOpenError),
+    /// Start set resolved to zero tips while repository refs are present.
+    ///
+    /// This is treated as an explicit error so scans cannot silently become
+    /// no-ops on repositories that still advertise reachable refs.
+    EmptyStartSetWithRefs,
     /// Concurrent maintenance detected.
     ConcurrentMaintenance,
 }
@@ -77,6 +82,12 @@ impl fmt::Display for ArtifactAcquireError {
             Self::CommitLoad(err) => write!(f, "commit loading failed: {err}"),
             Self::CommitGraphBuild(err) => write!(f, "commit graph build failed: {err}"),
             Self::RepoOpen(err) => write!(f, "repo open error: {err}"),
+            Self::EmptyStartSetWithRefs => {
+                write!(
+                    f,
+                    "empty start set while repository refs exist (refusing silent no-op scan)"
+                )
+            }
             Self::ConcurrentMaintenance => write!(f, "concurrent maintenance detected"),
         }
     }
@@ -188,8 +199,14 @@ pub fn acquire_midx(
 ///
 /// # Behavior
 /// Loads commits via BFS from the start set tips and builds `CommitGraphMem`.
+/// Commit lookup prefers MIDX-backed packs and falls back to loose object
+/// directories when a tip/parent OID is absent from MIDX.
 /// The graph contains only commits reachable from `repo.start_set` tips.
 /// Parents outside that set are treated as external roots.
+///
+/// If `repo.start_set` is empty but repository refs still exist, this returns
+/// `ArtifactAcquireError::EmptyStartSetWithRefs` instead of silently producing
+/// an empty graph.
 ///
 /// Bounded by `limits.commit_load`.
 pub fn acquire_commit_graph(
@@ -201,15 +218,21 @@ pub fn acquire_commit_graph(
     let tips: Vec<OidBytes> = repo.start_set.iter().map(|r| r.tip).collect();
 
     if tips.is_empty() {
-        // No tips to traverse; return empty graph
+        if repo_has_reachable_refs(&repo.paths)? {
+            return Err(ArtifactAcquireError::EmptyStartSetWithRefs);
+        }
+
+        // Repository has no reachable refs; empty graph is expected.
         return CommitGraphMem::build(vec![], repo.object_format)
             .map_err(ArtifactAcquireError::CommitGraphBuild);
     }
 
-    let commits = load_commits_from_tips(
+    let loose_dirs = collect_loose_dirs(&repo.paths);
+    let commits = load_commits_from_tips_with_loose_dirs(
         &tips,
         midx,
         pack_paths,
+        &loose_dirs,
         repo.object_format,
         &limits.commit_load,
         None, // No progress callback for now

@@ -63,7 +63,7 @@ execution introduce parallelism:
   streams `PackPlan` values through a bounded `sync_channel(1)` while the
   main thread consumes and executes plans.
 - **Pack execution** shards each plan's candidate indices across
-  `pack_exec_workers` threads (default 24) using `shard_ranges()`. Each
+  `pack_exec_workers` threads (default 2) using `shard_ranges()`. Each
   worker owns its own `PackCache` and `EngineAdapter`; results are merged in
   shard order to preserve deterministic output.
 

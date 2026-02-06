@@ -31,6 +31,7 @@ use crate::archive::{
     detect_kind_from_path, sniff_kind_from_header, ArchiveConfig, ArchiveKind, ArchiveSkipReason,
     ArchiveStats,
 };
+use crate::perf_stats;
 #[cfg(unix)]
 use crate::runtime::PathSpan;
 #[cfg(unix)]
@@ -135,8 +136,8 @@ impl Default for PipelineConfig {
 
 /// Summary counters for a pipeline run.
 ///
-/// These counters are always compiled in for lightweight performance and health
-/// reporting (throughput, error rates) and are monotonic within a run.
+/// Counters are collected only when `perf-stats` is enabled in debug builds.
+/// Outside that mode, fields remain zeroed and update paths compile to no-ops.
 /// `errors` is an aggregate that includes `walk_errors` and `open_errors`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PipelineStats {
@@ -272,8 +273,8 @@ impl Walker {
                     let meta = match fs::symlink_metadata(&path) {
                         Ok(meta) => meta,
                         Err(_) => {
-                            stats.walk_errors += 1;
-                            stats.errors += 1;
+                            perf_stats::sat_add_u64(&mut stats.walk_errors, 1);
+                            perf_stats::sat_add_u64(&mut stats.errors, 1);
                             continue;
                         }
                     };
@@ -287,8 +288,8 @@ impl Walker {
                         match fs::read_dir(&path) {
                             Ok(rd) => self.stack.push(WalkEntry::Dir(rd)),
                             Err(_) => {
-                                stats.walk_errors += 1;
-                                stats.errors += 1;
+                                perf_stats::sat_add_u64(&mut stats.walk_errors, 1);
+                                perf_stats::sat_add_u64(&mut stats.errors, 1);
                             }
                         }
                         continue;
@@ -307,7 +308,7 @@ impl Walker {
                     let dev_inode = dev_inode(&meta);
                     let id = files.push(path, size, dev_inode, 0);
                     file_ring.push_assume_capacity(id);
-                    stats.files += 1;
+                    perf_stats::sat_add_u64(&mut stats.files, 1);
                     progressed = true;
                 }
                 WalkEntry::Dir(mut rd) => match rd.next() {
@@ -316,8 +317,8 @@ impl Walker {
                         self.stack.push(WalkEntry::Path(entry.path()));
                     }
                     Some(Err(_)) => {
-                        stats.walk_errors += 1;
-                        stats.errors += 1;
+                        perf_stats::sat_add_u64(&mut stats.walk_errors, 1);
+                        perf_stats::sat_add_u64(&mut stats.errors, 1);
                         self.stack.push(WalkEntry::Dir(rd));
                     }
                     None => {}
@@ -428,7 +429,7 @@ impl Walker {
                 return Ok(());
             }
             let id = files.push_span(root_span, st.st_size as u64, dev_inode_from_stat(&st), 0);
-            stats.files += 1;
+            perf_stats::sat_add_u64(&mut stats.files, 1);
             self.pending = Some(id);
             return Ok(());
         }
@@ -478,8 +479,8 @@ impl Walker {
                 if ent.is_null() {
                     let err = io::Error::last_os_error();
                     if err.raw_os_error().unwrap_or(0) != 0 {
-                        stats.walk_errors += 1;
-                        stats.errors += 1;
+                        perf_stats::sat_add_u64(&mut stats.walk_errors, 1);
+                        perf_stats::sat_add_u64(&mut stats.errors, 1);
                     }
                     self.stack.pop();
                     continue;
@@ -499,8 +500,8 @@ impl Walker {
                     libc::AT_SYMLINK_NOFOLLOW,
                 ) != 0
                 {
-                    stats.walk_errors += 1;
-                    stats.errors += 1;
+                    perf_stats::sat_add_u64(&mut stats.walk_errors, 1);
+                    perf_stats::sat_add_u64(&mut stats.errors, 1);
                     continue;
                 }
                 let st = st.assume_init();
@@ -515,8 +516,8 @@ impl Walker {
                     if let Ok(child) = child {
                         self.stack.push(child);
                     } else {
-                        stats.walk_errors += 1;
-                        stats.errors += 1;
+                        perf_stats::sat_add_u64(&mut stats.walk_errors, 1);
+                        perf_stats::sat_add_u64(&mut stats.errors, 1);
                     }
                     continue;
                 }
@@ -533,7 +534,7 @@ impl Walker {
                 let file_span = files.join_path_span(dir_path, name_bytes);
                 let id = files.push_span(file_span, st.st_size as u64, dev_inode_from_stat(&st), 0);
                 file_ring.push_assume_capacity(id);
-                stats.files += 1;
+                perf_stats::sat_add_u64(&mut stats.files, 1);
                 progressed = true;
             }
         }
@@ -732,10 +733,8 @@ impl ArchiveEntrySink for PipelineArchiveSink<'_> {
             self.findings,
         )?;
 
-        *self.chunks = self.chunks.saturating_add(1);
-        *self.bytes_scanned = self
-            .bytes_scanned
-            .saturating_add(chunk.new_bytes_len as u64);
+        perf_stats::sat_add_u64(self.chunks, 1);
+        perf_stats::sat_add_u64(self.bytes_scanned, chunk.new_bytes_len as u64);
         Ok(())
     }
 
@@ -757,8 +756,8 @@ fn scan_gzip_file(
     let file = match File::open(path) {
         Ok(f) => f,
         Err(_) => {
-            stats.open_errors = stats.open_errors.saturating_add(1);
-            stats.errors = stats.errors.saturating_add(1);
+            perf_stats::sat_add_u64(&mut stats.open_errors, 1);
+            perf_stats::sat_add_u64(&mut stats.errors, 1);
             return Ok(ArchiveEnd::Skipped(ArchiveSkipReason::IoError));
         }
     };
@@ -800,8 +799,8 @@ fn scan_tar_file(
     let mut file = match File::open(path) {
         Ok(f) => f,
         Err(_) => {
-            stats.open_errors = stats.open_errors.saturating_add(1);
-            stats.errors = stats.errors.saturating_add(1);
+            perf_stats::sat_add_u64(&mut stats.open_errors, 1);
+            perf_stats::sat_add_u64(&mut stats.errors, 1);
             return Ok(ArchiveEnd::Skipped(ArchiveSkipReason::IoError));
         }
     };
@@ -852,8 +851,8 @@ fn scan_targz_file(
     let file = match File::open(path) {
         Ok(f) => f,
         Err(_) => {
-            stats.open_errors = stats.open_errors.saturating_add(1);
-            stats.errors = stats.errors.saturating_add(1);
+            perf_stats::sat_add_u64(&mut stats.open_errors, 1);
+            perf_stats::sat_add_u64(&mut stats.errors, 1);
             return Ok(ArchiveEnd::Skipped(ArchiveSkipReason::IoError));
         }
     };
@@ -900,8 +899,8 @@ fn scan_zip_file(
     let file = match File::open(path) {
         Ok(f) => f,
         Err(_) => {
-            stats.open_errors = stats.open_errors.saturating_add(1);
-            stats.errors = stats.errors.saturating_add(1);
+            perf_stats::sat_add_u64(&mut stats.open_errors, 1);
+            perf_stats::sat_add_u64(&mut stats.errors, 1);
             return Ok(ArchiveEnd::Skipped(ArchiveSkipReason::IoError));
         }
     };
@@ -1069,8 +1068,8 @@ impl ReaderStage {
                 let mut file = match File::open(path) {
                     Ok(file) => file,
                     Err(_) => {
-                        stats.open_errors += 1;
-                        stats.errors += 1;
+                        perf_stats::sat_add_u64(&mut stats.open_errors, 1);
+                        perf_stats::sat_add_u64(&mut stats.errors, 1);
                         continue;
                     }
                 };
@@ -1080,7 +1079,7 @@ impl ReaderStage {
                     let n = match file.read(&mut header) {
                         Ok(n) => n,
                         Err(_) => {
-                            stats.errors += 1;
+                            perf_stats::sat_add_u64(&mut stats.errors, 1);
                             continue;
                         }
                     };
@@ -1113,7 +1112,7 @@ impl ReaderStage {
                         }
                     }
                     if file.seek(SeekFrom::Start(0)).is_err() {
-                        stats.errors += 1;
+                        perf_stats::sat_add_u64(&mut stats.errors, 1);
                         continue;
                     }
                 }
@@ -1132,9 +1131,9 @@ impl ReaderStage {
             )? {
                 Some(chunk) => {
                     let new_bytes = u64::from(chunk.len.saturating_sub(chunk.prefix_len));
-                    stats.bytes_scanned = stats.bytes_scanned.saturating_add(new_bytes);
+                    perf_stats::sat_add_u64(&mut stats.bytes_scanned, new_bytes);
                     chunk_ring.push_assume_capacity(chunk);
-                    stats.chunks += 1;
+                    perf_stats::sat_add_u64(&mut stats.chunks, 1);
                     progressed = true;
                 }
                 None => {
@@ -1292,7 +1291,7 @@ impl OutputStage {
                 rec.root_hint_start, rec.root_hint_end, rule
             )?;
             self.out.write_all(b"\n")?;
-            stats.findings += 1;
+            perf_stats::sat_add_u64(&mut stats.findings, 1);
             progressed = true;
         }
 
@@ -1323,7 +1322,7 @@ impl OutputStage {
                 rec.root_hint_start, rec.root_hint_end, rule
             )?;
             self.out.write_all(b"\n")?;
-            *findings_count = findings_count.wrapping_add(1);
+            perf_stats::wrap_add_u64(findings_count, 1);
         }
 
         Ok(())

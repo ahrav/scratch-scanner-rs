@@ -17,9 +17,9 @@ use std::process::Command;
 
 use scanner_rs::git_scan::OidBytes;
 use scanner_rs::git_scan::{
-    acquire_commit_graph, acquire_midx, repo_open, ArtifactBuildLimits, CommitGraph,
-    CommitGraphMem, CommitPlanIter, CommitWalkLimits, MidxView, RefWatermarkStore, RepoOpenError,
-    RepoOpenLimits, StartSetConfig, StartSetResolver,
+    acquire_commit_graph, acquire_midx, repo_open, ArtifactAcquireError, ArtifactBuildLimits,
+    CommitGraph, CommitGraphMem, CommitPlanIter, CommitWalkLimits, MidxView, RefWatermarkStore,
+    RepoOpenError, RepoOpenLimits, StartSetConfig, StartSetResolver,
 };
 use tempfile::TempDir;
 
@@ -110,6 +110,30 @@ fn init_repo_with_branches() -> TempDir {
     run_git(tmp.path(), &["repack", "-ad"]);
 
     tmp
+}
+
+fn remove_disk_artifacts(repo: &Path) {
+    let objects_dir = repo.join(".git").join("objects");
+    let midx_path = objects_dir.join("pack").join("multi-pack-index");
+    let commit_graph_path = objects_dir.join("info").join("commit-graph");
+    let chain_path = objects_dir
+        .join("info")
+        .join("commit-graphs")
+        .join("commit-graph-chain");
+
+    let _ = fs::remove_file(&midx_path);
+    let _ = fs::remove_file(&commit_graph_path);
+    let _ = fs::remove_file(&chain_path);
+
+    assert!(!midx_path.exists(), "midx should be absent in fixture");
+    assert!(
+        !commit_graph_path.exists(),
+        "commit-graph should be absent in fixture"
+    );
+    assert!(
+        !chain_path.exists(),
+        "commit-graph chain should be absent in fixture"
+    );
 }
 
 struct TestResolver {
@@ -308,4 +332,182 @@ fn commit_walk_watermark_not_ancestor_scans_full_history() {
     expected.sort_unstable();
 
     assert_eq!(actual, expected);
+}
+
+/// With missing on-disk artifacts, a resolvable non-empty start set should be
+/// handled safely: either build a non-empty graph or return an explicit
+/// `EmptyStartSetWithRefs` error.
+#[test]
+fn commit_walk_missing_artifacts_with_resolved_start_set_is_safe() {
+    if !git_available() {
+        eprintln!("git not available; skipping commit walk integration test");
+        return;
+    }
+
+    let tmp = init_repo_with_commits(4);
+    remove_disk_artifacts(tmp.path());
+
+    let tip_oid = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD"]));
+    let start_set_id = StartSetConfig::DefaultBranchOnly.id();
+    let run_once = || -> Result<Vec<u32>, ArtifactAcquireError> {
+        let resolver = TestResolver {
+            refs: vec![(b"refs/heads/main".to_vec(), tip_oid)],
+        };
+        let watermark_store = TestWatermarkStore { watermarks: vec![] };
+
+        let mut state = repo_open(
+            tmp.path(),
+            9,
+            [0u8; 32],
+            start_set_id,
+            &resolver,
+            &watermark_store,
+            RepoOpenLimits::DEFAULT,
+        )
+        .unwrap();
+
+        assert!(
+            !state.start_set.is_empty(),
+            "resolver should provide a non-empty start set"
+        );
+
+        let limits = ArtifactBuildLimits::default();
+        let midx_result = acquire_midx(&mut state, &limits).unwrap();
+        let midx_view = MidxView::parse(midx_result.bytes.as_slice(), state.object_format).unwrap();
+        let cg = acquire_commit_graph(&state, &midx_view, &midx_result.pack_paths, &limits)?;
+
+        assert!(
+            cg.num_commits() > 0,
+            "non-empty start set should yield non-empty commit graph"
+        );
+
+        let mut actual: Vec<u32> = CommitPlanIter::new(&state, &cg, CommitWalkLimits::RESTRICTIVE)
+            .unwrap()
+            .map(|item| item.unwrap().pos.0)
+            .collect();
+        actual.sort_unstable();
+
+        let expected_oids = rev_list(tmp.path(), "HEAD");
+        let mut expected: Vec<u32> = expected_oids
+            .iter()
+            .map(|oid| cg.lookup(oid).unwrap().unwrap().0)
+            .collect();
+        expected.sort_unstable();
+
+        assert_eq!(actual, expected);
+        Ok(actual)
+    };
+
+    let first = run_once();
+    let second = run_once();
+    match (first, second) {
+        (Ok(left), Ok(right)) => assert_eq!(left, right, "commit plan must be deterministic"),
+        (Err(left), Err(right)) => {
+            assert!(
+                matches!(left, ArtifactAcquireError::EmptyStartSetWithRefs),
+                "unexpected first error: {left:?}"
+            );
+            assert!(
+                matches!(right, ArtifactAcquireError::EmptyStartSetWithRefs),
+                "unexpected second error: {right:?}"
+            );
+        }
+        (left, right) => panic!("nondeterministic outcome: left={left:?}, right={right:?}"),
+    }
+}
+
+#[test]
+fn commit_graph_builds_with_loose_tip_chain_not_in_midx() {
+    if !git_available() {
+        eprintln!("git not available; skipping commit walk integration test");
+        return;
+    }
+
+    let tmp = init_repo_with_commits(1);
+    run_git(tmp.path(), &["commit", "--allow-empty", "-m", "loose-1"]);
+    run_git(tmp.path(), &["commit", "--allow-empty", "-m", "loose-2"]);
+
+    let head = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD"]));
+    let resolver = TestResolver {
+        refs: vec![(b"refs/heads/main".to_vec(), head)],
+    };
+    let watermark_store = TestWatermarkStore { watermarks: vec![] };
+    let start_set_id = StartSetConfig::DefaultBranchOnly.id();
+
+    let mut state = repo_open(
+        tmp.path(),
+        9,
+        [0u8; 32],
+        start_set_id,
+        &resolver,
+        &watermark_store,
+        RepoOpenLimits::DEFAULT,
+    )
+    .unwrap();
+
+    let limits = ArtifactBuildLimits::default();
+    let midx_result = acquire_midx(&mut state, &limits).unwrap();
+    let midx_view = MidxView::parse(midx_result.bytes.as_slice(), state.object_format).unwrap();
+    assert!(
+        midx_view.find_oid(&head).unwrap().is_none(),
+        "fixture expects loose HEAD commit missing from MIDX"
+    );
+
+    let cg = acquire_commit_graph(&state, &midx_view, &midx_result.pack_paths, &limits).unwrap();
+    let expected = rev_list(tmp.path(), "HEAD");
+
+    assert_eq!(cg.num_commits(), expected.len() as u32);
+    for oid in &expected {
+        assert!(
+            cg.lookup(oid).unwrap().is_some(),
+            "expected commit {oid} to be present in in-memory graph"
+        );
+    }
+}
+
+#[test]
+fn commit_graph_builds_with_packed_parent_and_loose_head() {
+    if !git_available() {
+        eprintln!("git not available; skipping commit walk integration test");
+        return;
+    }
+
+    let tmp = init_repo_with_commits(2);
+    let packed_parent = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD"]));
+    run_git(tmp.path(), &["commit", "--allow-empty", "-m", "loose-head"]);
+    let loose_head = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD"]));
+
+    let resolver = TestResolver {
+        refs: vec![(b"refs/heads/main".to_vec(), loose_head)],
+    };
+    let watermark_store = TestWatermarkStore { watermarks: vec![] };
+    let start_set_id = StartSetConfig::DefaultBranchOnly.id();
+
+    let mut state = repo_open(
+        tmp.path(),
+        10,
+        [0u8; 32],
+        start_set_id,
+        &resolver,
+        &watermark_store,
+        RepoOpenLimits::DEFAULT,
+    )
+    .unwrap();
+
+    let limits = ArtifactBuildLimits::default();
+    let midx_result = acquire_midx(&mut state, &limits).unwrap();
+    let midx_view = MidxView::parse(midx_result.bytes.as_slice(), state.object_format).unwrap();
+    assert!(
+        midx_view.find_oid(&loose_head).unwrap().is_none(),
+        "fixture expects loose HEAD commit missing from MIDX"
+    );
+    assert!(
+        midx_view.find_oid(&packed_parent).unwrap().is_some(),
+        "fixture expects parent commit present in MIDX"
+    );
+
+    let cg = acquire_commit_graph(&state, &midx_view, &midx_result.pack_paths, &limits).unwrap();
+
+    assert!(cg.lookup(&loose_head).unwrap().is_some());
+    assert!(cg.lookup(&packed_parent).unwrap().is_some());
 }

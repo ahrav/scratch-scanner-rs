@@ -59,6 +59,8 @@
 
 use std::cmp::Ordering;
 
+use crate::perf_stats;
+
 use super::errors::TreeDiffError;
 use super::object_id::OidBytes;
 use super::object_store::{TreeBytes, TreeSource};
@@ -81,6 +83,8 @@ const TREE_STREAM_BUF_BYTES: usize = 16 * 1024;
 /// Statistics are cumulative until `reset_stats()` is called. The
 /// `tree_bytes_loaded` counter is informational; the in-flight budget
 /// is enforced separately via the walker.
+///
+/// Populated only when `perf-stats` is enabled in debug builds.
 #[derive(Clone, Debug, Default)]
 pub struct TreeDiffStats {
     /// Number of trees loaded.
@@ -381,7 +385,9 @@ impl TreeDiffWalker {
 
             while !self.stack.is_empty() {
                 let depth = self.stack.len() as u16;
-                self.stats.max_depth_reached = self.stats.max_depth_reached.max(depth);
+                if perf_stats::enabled() {
+                    self.stats.max_depth_reached = self.stats.max_depth_reached.max(depth);
+                }
 
                 let action = {
                     let frame = self.stack.last_mut().expect("frame exists");
@@ -497,8 +503,8 @@ impl TreeDiffWalker {
             let bytes_len = bytes.len() as u64;
             let in_flight_len = bytes.in_flight_len() as u64;
             let new_in_flight = self.tree_bytes_in_flight.saturating_add(in_flight_len);
-            self.stats.trees_loaded += 1;
-            self.stats.tree_bytes_loaded = self.stats.tree_bytes_loaded.saturating_add(bytes_len);
+            perf_stats::sat_add_u64(&mut self.stats.trees_loaded, 1);
+            perf_stats::sat_add_u64(&mut self.stats.tree_bytes_loaded, bytes_len);
 
             if new_in_flight > self.tree_bytes_in_flight_limit {
                 return Err(TreeDiffError::TreeBytesBudgetExceeded {
@@ -507,10 +513,10 @@ impl TreeDiffWalker {
                 });
             }
             self.tree_bytes_in_flight = new_in_flight;
-            self.stats.tree_bytes_in_flight_peak = self
-                .stats
-                .tree_bytes_in_flight_peak
-                .max(self.tree_bytes_in_flight);
+            perf_stats::max_u64(
+                &mut self.stats.tree_bytes_in_flight_peak,
+                self.tree_bytes_in_flight,
+            );
 
             Ok(TreeCursor::new(bytes, self.oid_len, self.stream_threshold))
         } else {
@@ -581,7 +587,7 @@ impl TreeDiffWalker {
         parent_idx: u8,
     ) -> Result<(), TreeDiffError> {
         if new_oid == old_oid && new_kind.is_tree() && old_kind.is_tree() {
-            self.stats.subtrees_skipped += 1;
+            perf_stats::sat_add_u64(&mut self.stats.subtrees_skipped, 1);
             return Ok(());
         }
 
@@ -719,7 +725,7 @@ impl TreeDiffWalker {
             cand_flags,
         )?;
 
-        self.stats.candidates_emitted += 1;
+        perf_stats::sat_add_u64(&mut self.stats.candidates_emitted, 1);
 
         self.path_buf.truncate(path_start);
 

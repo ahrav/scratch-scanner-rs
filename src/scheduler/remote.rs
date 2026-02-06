@@ -45,6 +45,7 @@ use super::executor::{Executor, ExecutorConfig, ExecutorHandle, WorkerCtx};
 use super::metrics::MetricsSnapshot;
 use super::rng::XorShift64;
 use super::ts_buffer_pool::{TsBufferHandle, TsBufferPool, TsBufferPoolConfig};
+use crate::perf_stats;
 use crate::scheduler::engine_stub::{FileId, FindingRec, MockEngine, ScanScratch, BUFFER_LEN_MAX};
 use crate::scheduler::output_sink::OutputSink;
 
@@ -294,6 +295,8 @@ pub trait RemoteBackend: Send + Sync + 'static {
 // ============================================================================
 
 /// I/O thread statistics (per-thread, merged at end).
+///
+/// Populated only when `perf-stats` is enabled in debug builds.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IoStats {
     pub objects_started: u64,
@@ -311,6 +314,10 @@ pub struct IoStats {
 
 impl IoStats {
     fn merge(&mut self, other: IoStats) {
+        if !perf_stats::enabled() {
+            let _ = other;
+            return;
+        }
         self.objects_started += other.objects_started;
         self.objects_completed += other.objects_completed;
         self.objects_failed += other.objects_failed;
@@ -500,8 +507,8 @@ fn cpu_runner(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScratch>) {
 
             // Metrics: count payload bytes only
             let payload = (len as u64).saturating_sub(prefix_len as u64);
-            ctx.metrics.chunks_scanned = ctx.metrics.chunks_scanned.saturating_add(1);
-            ctx.metrics.bytes_scanned = ctx.metrics.bytes_scanned.saturating_add(payload);
+            perf_stats::sat_add_u64(&mut ctx.metrics.chunks_scanned, 1);
+            perf_stats::sat_add_u64(&mut ctx.metrics.bytes_scanned, payload);
 
             // Buffer returned to pool on drop
             drop(buf);
@@ -608,7 +615,7 @@ fn io_worker_loop<B: RemoteBackend>(
             break;
         }
 
-        stats.objects_started += 1;
+        perf_stats::sat_add_u64(&mut stats.objects_started, 1);
         let started = Instant::now();
 
         let size = work.size;
@@ -686,7 +693,7 @@ fn io_worker_loop<B: RemoteBackend>(
                             if end_offset != size {
                                 // Partial read that doesn't reach EOF = contract violation
                                 // Backend should have either filled exactly or returned error
-                                stats.permanent_errors += 1;
+                                perf_stats::sat_add_u64(&mut stats.permanent_errors, 1);
                                 failed = true;
                                 drop(buf);
                                 break 'chunk_loop;
@@ -714,8 +721,11 @@ fn io_worker_loop<B: RemoteBackend>(
                             break 'chunk_loop;
                         }
 
-                        stats.chunks_fetched += 1;
-                        stats.payload_bytes_fetched += actual_payload as u64;
+                        perf_stats::sat_add_u64(&mut stats.chunks_fetched, 1);
+                        perf_stats::sat_add_u64(
+                            &mut stats.payload_bytes_fetched,
+                            actual_payload as u64,
+                        );
 
                         // Advance by actual payload, not planned
                         offset = offset.saturating_add(actual_payload as u64);
@@ -727,12 +737,12 @@ fn io_worker_loop<B: RemoteBackend>(
 
                         match backend.classify_error(&err) {
                             ErrorClass::Permanent => {
-                                stats.permanent_errors += 1;
+                                perf_stats::sat_add_u64(&mut stats.permanent_errors, 1);
                                 failed = true;
                                 break 'chunk_loop;
                             }
                             ErrorClass::Retryable => {
-                                stats.retryable_errors += 1;
+                                perf_stats::sat_add_u64(&mut stats.retryable_errors, 1);
                                 if attempt >= cfg.retry.max_attempts {
                                     failed = true;
                                     break 'chunk_loop;
@@ -753,7 +763,7 @@ fn io_worker_loop<B: RemoteBackend>(
                                     }
                                 }
 
-                                stats.retries += 1;
+                                perf_stats::sat_add_u64(&mut stats.retries, 1);
                                 std::thread::sleep(backoff);
                                 continue; // Retry (will re-acquire buffer)
                             }
@@ -764,10 +774,10 @@ fn io_worker_loop<B: RemoteBackend>(
         }
 
         if failed {
-            stats.objects_failed += 1;
+            perf_stats::sat_add_u64(&mut stats.objects_failed, 1);
             // work.token dropped here; permit releases when all enqueued chunks finish
         } else {
-            stats.objects_completed += 1;
+            perf_stats::sat_add_u64(&mut stats.objects_completed, 1);
         }
     }
 

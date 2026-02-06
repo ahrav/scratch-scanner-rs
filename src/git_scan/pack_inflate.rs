@@ -231,12 +231,25 @@ pub struct PackFile<'a> {
     data_end: usize,
 }
 
+/// Cached pack header metadata for repeated entry parsing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PackHeader {
+    oid_len: usize,
+    data_end: usize,
+}
+
 impl<'a> PackFile<'a> {
     /// Parse and validate a pack file header.
     ///
     /// Expects the full pack bytes including the trailing hash.
     /// The trailing hash is excluded from `data_end` to prevent misparsing.
     pub fn parse(bytes: &'a [u8], oid_len: usize) -> Result<Self, PackParseError> {
+        let header = Self::parse_header(bytes, oid_len)?;
+        Ok(Self::from_header(bytes, header))
+    }
+
+    /// Parse and validate a pack file header for caching.
+    pub fn parse_header(bytes: &[u8], oid_len: usize) -> Result<PackHeader, PackParseError> {
         debug_assert!(oid_len == 20 || oid_len == 32, "oid_len must be 20 or 32");
 
         let min_size = PACK_HEADER_SIZE + oid_len;
@@ -254,11 +267,16 @@ impl<'a> PackFile<'a> {
         let data_end = bytes.len() - oid_len;
         debug_assert!(data_end >= PACK_HEADER_SIZE);
 
-        Ok(Self {
+        Ok(PackHeader { oid_len, data_end })
+    }
+
+    /// Construct a pack view from cached header metadata.
+    pub fn from_header(bytes: &'a [u8], header: PackHeader) -> Self {
+        Self {
             bytes,
-            oid_len,
-            data_end,
-        })
+            oid_len: header.oid_len,
+            data_end: header.data_end,
+        }
     }
 
     /// Parse the entry header at `offset`.

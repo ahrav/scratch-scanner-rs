@@ -45,6 +45,7 @@
 use std::fmt;
 use std::path::Path;
 
+use crate::perf_stats;
 use crate::scheduler::AllocGuard;
 
 use super::alloc_guard;
@@ -187,6 +188,8 @@ pub struct SkipRecord {
 }
 
 /// Execution statistics.
+///
+/// Populated only when `perf-stats` is enabled in debug builds.
 #[derive(Debug, Default)]
 pub struct PackExecStats {
     /// Offsets successfully decoded (including bases and non-blob kinds).
@@ -221,7 +224,8 @@ pub struct PackExecStats {
     pub large_blob_spilled_count: u32,
     /// Total bytes across large blob handling (stream + spill).
     pub large_blob_bytes: u64,
-    // Timing fields (nanoseconds) - populated when git-perf feature enabled
+    // --- Timing fields (nanoseconds) ---
+    // Populated only when the `git-perf` feature is enabled; otherwise zero.
     /// Wall-clock nanoseconds spent in cache.get() lookups.
     pub cache_lookup_nanos: u64,
     /// Wall-clock nanoseconds spent in fallback base resolution.
@@ -279,17 +283,20 @@ impl CacheRejectHistogram {
 impl PackExecStats {
     #[inline]
     fn record_cache_reject(&mut self, size: usize) {
-        self.cache_insert_rejects = self.cache_insert_rejects.saturating_add(1);
-        self.cache_reject_bytes_total = self.cache_reject_bytes_total.saturating_add(size as u64);
+        perf_stats::sat_add_u32(&mut self.cache_insert_rejects, 1);
+        perf_stats::sat_add_u64(&mut self.cache_reject_bytes_total, size as u64);
         let size_u32 = size.min(u32::MAX as usize) as u32;
-        self.cache_reject_bytes_max = self.cache_reject_bytes_max.max(size_u32);
+        perf_stats::max_u32(&mut self.cache_reject_bytes_max, size_u32);
         let bucket = cache_reject_bucket_index(size_u32);
-        self.cache_reject_size_buckets[bucket] =
-            self.cache_reject_size_buckets[bucket].saturating_add(1);
+        perf_stats::sat_add_u64(&mut self.cache_reject_size_buckets[bucket], 1);
     }
 
     #[inline]
     fn merge_from(&mut self, other: &PackExecStats) {
+        if !perf_stats::enabled() {
+            let _ = other;
+            return;
+        }
         self.decoded_offsets = self.decoded_offsets.saturating_add(other.decoded_offsets);
         self.emitted_candidates = self
             .emitted_candidates
@@ -341,7 +348,12 @@ impl PackExecStats {
     }
 }
 
-/// Accumulate timing into stats field (no-op when git-perf disabled).
+/// Accumulate wall-clock nanoseconds into a timing field.
+///
+/// Gated on `cfg(feature = "git-perf")` — compiles to a no-op in normal
+/// builds so that `perf::time()` call-sites are free.  Follows the same
+/// pattern as `perf_stats::sat_add_*` but uses a separate feature flag
+/// because timing probes have higher overhead than simple counter bumps.
 #[inline(always)]
 fn record_timing(field: &mut u64, nanos: u64) {
     #[cfg(feature = "git-perf")]
@@ -378,8 +390,8 @@ fn cache_reject_bucket_range(idx: usize) -> (u32, u32) {
 #[inline]
 fn record_fallback_chain(stats: &mut PackExecStats, chain_len: usize) {
     let chain_len = chain_len.min(u32::MAX as usize) as u32;
-    stats.fallback_chain_len_sum = stats.fallback_chain_len_sum.saturating_add(chain_len);
-    stats.fallback_chain_len_max = stats.fallback_chain_len_max.max(chain_len);
+    perf_stats::sat_add_u32(&mut stats.fallback_chain_len_sum, chain_len);
+    perf_stats::max_u32(&mut stats.fallback_chain_len_max, chain_len);
 }
 
 /// Aggregate cache reject histogram across pack-exec reports.
@@ -679,14 +691,14 @@ pub fn execute_pack_plan_with_scratch<S: PackObjectSink, B: ExternalBaseProvider
                         offset,
                         reason: SkipReason::NotBlob,
                     });
-                    report.stats.skipped_offsets += 1;
+                    perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
                     continue;
                 }
                 let path = paths.get(candidate.ctx.path_ref);
                 let (emit_result, emit_nanos) = perf::time(|| sink.emit(candidate, path, bytes));
                 emit_result?;
                 record_timing(&mut report.stats.sink_emit_nanos, emit_nanos);
-                report.stats.emitted_candidates += 1;
+                perf_stats::sat_add_u32(&mut report.stats.emitted_candidates, 1);
             }
         }
 
@@ -824,14 +836,14 @@ pub fn execute_pack_plan_with_scratch_indices<S: PackObjectSink, B: ExternalBase
                         offset,
                         reason: SkipReason::NotBlob,
                     });
-                    report.stats.skipped_offsets += 1;
+                    perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
                     continue;
                 }
                 let path = paths.get(candidate.ctx.path_ref);
                 let (emit_result, emit_nanos) = perf::time(|| sink.emit(candidate, path, bytes));
                 emit_result?;
                 record_timing(&mut report.stats.sink_emit_nanos, emit_nanos);
-                report.stats.emitted_candidates += 1;
+                perf_stats::sat_add_u32(&mut report.stats.emitted_candidates, 1);
             }
         }
 
@@ -996,7 +1008,7 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                 offset,
                 reason: SkipReason::Decode(err),
             });
-            report.stats.skipped_offsets += 1;
+            perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
             return Ok(None);
         }
     };
@@ -1010,7 +1022,7 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                         offset,
                         reason: SkipReason::Decode(err),
                     });
-                    report.stats.skipped_offsets += 1;
+                    perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
                     return Ok(None);
                 }
             };
@@ -1027,11 +1039,11 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                         offset,
                         reason: SkipReason::Decode(err),
                     });
-                    report.stats.skipped_offsets += 1;
+                    perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
                     return Ok(None);
                 }
                 perf::record_pack_inflate(result_buf.len(), nanos);
-                report.stats.decoded_offsets += 1;
+                perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
 
                 if cache.insert(offset, kind, result_buf) {
                     Ok(Some(DecodedObject {
@@ -1061,19 +1073,17 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                         offset,
                         reason: SkipReason::Decode(PackDecodeError::Inflate(err)),
                     });
-                    report.stats.skipped_offsets += 1;
+                    perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
                     return Ok(None);
                 }
                 writer
                     .finish()
                     .map_err(|err| PackExecError::Spill(err.to_string()))?;
                 perf::record_pack_inflate(size, nanos);
-                report.stats.decoded_offsets += 1;
+                perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
                 report.stats.record_cache_reject(size);
-                report.stats.large_blob_spilled_count =
-                    report.stats.large_blob_spilled_count.saturating_add(1);
-                report.stats.large_blob_bytes =
-                    report.stats.large_blob_bytes.saturating_add(size as u64);
+                perf_stats::sat_add_u32(&mut report.stats.large_blob_spilled_count, 1);
+                perf_stats::sat_add_u64(&mut report.stats.large_blob_bytes, size as u64);
 
                 Ok(Some(DecodedObject {
                     kind,
@@ -1085,14 +1095,14 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
             let (base_kind, storage, out_len) = {
                 let base = match cache.get(base_offset) {
                     Some(base) => {
-                        report.stats.base_cache_hits += 1;
+                        perf_stats::sat_add_u32(&mut report.stats.base_cache_hits, 1);
                         BaseBytes {
                             kind: base.kind,
                             storage: BaseStorage::Slice(base.bytes),
                         }
                     }
                     None => {
-                        report.stats.base_cache_misses += 1;
+                        perf_stats::sat_add_u32(&mut report.stats.base_cache_misses, 1);
                         let (result, resolve_nanos) = perf::time(|| {
                             decode_base_from_pack(
                                 pack,
@@ -1117,7 +1127,7 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                             Ok(base) => base,
                             Err(reason) => {
                                 report.skips.push(SkipRecord { offset, reason });
-                                report.stats.skipped_offsets += 1;
+                                perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
                                 return Ok(None);
                             }
                         }
@@ -1149,7 +1159,7 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                                 });
                             }
                         }
-                        report.stats.skipped_offsets += 1;
+                        perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
                         return Ok(None);
                     }
                 };
@@ -1157,12 +1167,10 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                 (base.kind, storage, out_len)
             };
 
-            report.stats.decoded_offsets += 1;
+            perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
             if matches!(&storage, DecodedStorage::Spill(_)) {
-                report.stats.large_blob_spilled_count =
-                    report.stats.large_blob_spilled_count.saturating_add(1);
-                report.stats.large_blob_bytes =
-                    report.stats.large_blob_bytes.saturating_add(out_len as u64);
+                perf_stats::sat_add_u32(&mut report.stats.large_blob_spilled_count, 1);
+                perf_stats::sat_add_u64(&mut report.stats.large_blob_bytes, out_len as u64);
             }
             match storage {
                 DecodedStorage::Cache | DecodedStorage::Scratch => {
@@ -1195,14 +1203,14 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                     let (base_kind, storage, out_len) = {
                         let base = match cache.get(base_offset) {
                             Some(base) => {
-                                report.stats.base_cache_hits += 1;
+                                perf_stats::sat_add_u32(&mut report.stats.base_cache_hits, 1);
                                 BaseBytes {
                                     kind: base.kind,
                                     storage: BaseStorage::Slice(base.bytes),
                                 }
                             }
                             None => {
-                                report.stats.base_cache_misses += 1;
+                                perf_stats::sat_add_u32(&mut report.stats.base_cache_misses, 1);
                                 let (result, resolve_nanos) = perf::time(|| {
                                     decode_base_from_pack(
                                         pack,
@@ -1230,7 +1238,10 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                                     Ok(base) => base,
                                     Err(reason) => {
                                         report.skips.push(SkipRecord { offset, reason });
-                                        report.stats.skipped_offsets += 1;
+                                        perf_stats::sat_add_u32(
+                                            &mut report.stats.skipped_offsets,
+                                            1,
+                                        );
                                         return Ok(None);
                                     }
                                 }
@@ -1262,7 +1273,7 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                                         });
                                     }
                                 }
-                                report.stats.skipped_offsets += 1;
+                                perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
                                 return Ok(None);
                             }
                         };
@@ -1270,12 +1281,10 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                         (base.kind, storage, out_len)
                     };
 
-                    report.stats.decoded_offsets += 1;
+                    perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
                     if matches!(&storage, DecodedStorage::Spill(_)) {
-                        report.stats.large_blob_spilled_count =
-                            report.stats.large_blob_spilled_count.saturating_add(1);
-                        report.stats.large_blob_bytes =
-                            report.stats.large_blob_bytes.saturating_add(out_len as u64);
+                        perf_stats::sat_add_u32(&mut report.stats.large_blob_spilled_count, 1);
+                        perf_stats::sat_add_u64(&mut report.stats.large_blob_bytes, out_len as u64);
                     }
                     match storage {
                         DecodedStorage::Cache | DecodedStorage::Scratch => {
@@ -1303,7 +1312,7 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                 }
                 Some(BaseLoc::External { .. }) | None => {
                     let base_oid = oid_or_base(base_oid, dep.as_ref());
-                    report.stats.external_base_calls += 1;
+                    perf_stats::sat_add_u32(&mut report.stats.external_base_calls, 1);
                     match external.load_base(&base_oid) {
                         Ok(Some(base)) => {
                             let base_bytes = BaseBytes {
@@ -1335,17 +1344,21 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                                             });
                                         }
                                     }
-                                    report.stats.skipped_offsets += 1;
+                                    perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
                                     return Ok(None);
                                 }
                             };
 
-                            report.stats.decoded_offsets += 1;
+                            perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
                             if matches!(&storage, DecodedStorage::Spill(_)) {
-                                report.stats.large_blob_spilled_count =
-                                    report.stats.large_blob_spilled_count.saturating_add(1);
-                                report.stats.large_blob_bytes =
-                                    report.stats.large_blob_bytes.saturating_add(out_len as u64);
+                                perf_stats::sat_add_u32(
+                                    &mut report.stats.large_blob_spilled_count,
+                                    1,
+                                );
+                                perf_stats::sat_add_u64(
+                                    &mut report.stats.large_blob_bytes,
+                                    out_len as u64,
+                                );
                             }
                             match storage {
                                 DecodedStorage::Cache | DecodedStorage::Scratch => {
@@ -1376,7 +1389,7 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                                 offset,
                                 reason: SkipReason::ExternalBaseMissing { oid: base_oid },
                             });
-                            report.stats.skipped_offsets += 1;
+                            perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
                             Ok(None)
                         }
                         Err(_) => {
@@ -1384,7 +1397,7 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                                 offset,
                                 reason: SkipReason::ExternalBaseError,
                             });
-                            report.stats.skipped_offsets += 1;
+                            perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
                             Ok(None)
                         }
                     }
@@ -1502,7 +1515,7 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
 
     delta_stack.clear();
     let mut current_offset = offset;
-    report.stats.fallback_base_decodes = report.stats.fallback_base_decodes.saturating_add(1);
+    perf_stats::sat_add_u32(&mut report.stats.fallback_base_decodes, 1);
 
     loop {
         if delta_stack.len() >= max_delta_depth as usize {
@@ -1544,7 +1557,7 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
                         return Err(SkipReason::Decode(err));
                     }
                     perf::record_pack_inflate(base_buf.len(), nanos);
-                    report.stats.decoded_offsets += 1;
+                    perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
                     if !cache.insert(current_offset, kind, base_buf) {
                         report.stats.record_cache_reject(base_buf.len());
                     }
@@ -1577,7 +1590,7 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
                         )));
                     }
                     perf::record_pack_inflate(size, nanos);
-                    report.stats.decoded_offsets += 1;
+                    perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
                     report.stats.record_cache_reject(size);
                     base_spill = Some(spill);
                 }
@@ -1605,7 +1618,7 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
                         }
                     })?;
 
-                    report.stats.decoded_offsets += 1;
+                    perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
                     match storage {
                         DecodedStorage::Cache | DecodedStorage::Scratch => {
                             std::mem::swap(base_buf, result_buf);
@@ -1661,7 +1674,7 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
                             offset: current_offset,
                             header,
                         });
-                        report.stats.external_base_calls += 1;
+                        perf_stats::sat_add_u32(&mut report.stats.external_base_calls, 1);
                         match external.load_base(&oid) {
                             Ok(Some(base)) => {
                                 let base_len = base.bytes.len();
@@ -1672,7 +1685,7 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
                                         base_buf.reserve(base_len - base_buf.capacity());
                                     }
                                     base_buf.extend_from_slice(&base.bytes);
-                                    report.stats.decoded_offsets += 1;
+                                    perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
                                 } else {
                                     let mut spill = match BlobSpill::new(spill_dir, base_len) {
                                         Ok(spill) => spill,
@@ -1701,7 +1714,7 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
                                             super::pack_inflate::InflateError::Backend,
                                         )));
                                     }
-                                    report.stats.decoded_offsets += 1;
+                                    perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
                                     report.stats.record_cache_reject(base_len);
                                     base_spill = Some(spill);
                                 };
@@ -1731,7 +1744,7 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
                                         }
                                     })?;
 
-                                    report.stats.decoded_offsets += 1;
+                                    perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
                                     match storage {
                                         DecodedStorage::Cache | DecodedStorage::Scratch => {
                                             std::mem::swap(base_buf, result_buf);

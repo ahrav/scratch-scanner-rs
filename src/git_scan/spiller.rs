@@ -20,6 +20,8 @@ use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 
+use crate::perf_stats;
+
 use super::byte_arena::{ByteArena, ByteRef};
 use super::errors::SpillError;
 use super::object_id::OidBytes;
@@ -40,6 +42,7 @@ const IO_BUFFER_SIZE: usize = 256 * 1024;
 ///
 /// Counts are derived after global dedupe. `unique_blobs` counts distinct OIDs
 /// before seen-store filtering; `emitted_blobs` counts those that were unseen.
+/// Populated only when `perf-stats` is enabled in debug builds.
 #[derive(Debug, Clone, Default)]
 pub struct SpillStats {
     /// Total candidates received.
@@ -128,7 +131,7 @@ impl Spiller {
             cand_flags,
         ) {
             Ok(()) => {
-                self.candidates_received += 1;
+                perf_stats::sat_add_u64(&mut self.candidates_received, 1);
                 Ok(())
             }
             Err(SpillError::ArenaOverflow) => {
@@ -142,7 +145,7 @@ impl Spiller {
                     ctx_flags,
                     cand_flags,
                 )?;
-                self.candidates_received += 1;
+                perf_stats::sat_add_u64(&mut self.candidates_received, 1);
                 Ok(())
             }
             Err(err) => Err(err),
@@ -225,8 +228,8 @@ impl Spiller {
             self.process_chunk_only(seen_store, sink, &mut stats)?;
         } else {
             self.spill_chunk()?;
-            stats.spill_runs = self.runs.len();
-            stats.spill_bytes = self.spill_bytes;
+            perf_stats::set_usize(&mut stats.spill_runs, self.runs.len());
+            perf_stats::set_u64(&mut stats.spill_bytes, self.spill_bytes);
             self.process_with_merge(seen_store, sink, &mut stats)?;
         }
 
@@ -397,7 +400,7 @@ impl Spiller {
         seen_store: &S,
         sink: &mut B,
     ) -> Result<(), SpillError> {
-        stats.unique_blobs += 1;
+        perf_stats::sat_add_u64(&mut stats.unique_blobs, 1);
 
         if !batch.can_fit(path.len()) {
             self.flush_batch(batch, stats, seen_store, sink)?;
@@ -441,10 +444,10 @@ impl Spiller {
 
         for (idx, blob) in batch.blobs().iter().enumerate() {
             if seen_flags[idx] {
-                stats.seen_blobs += 1;
+                perf_stats::sat_add_u64(&mut stats.seen_blobs, 1);
             } else {
                 sink.emit(blob, batch.paths())?;
-                stats.emitted_blobs += 1;
+                perf_stats::sat_add_u64(&mut stats.emitted_blobs, 1);
             }
         }
 

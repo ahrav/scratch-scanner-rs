@@ -45,6 +45,7 @@ use super::executor::{Executor, ExecutorConfig, ExecutorHandle, WorkerCtx};
 use super::metrics::MetricsSnapshot;
 use super::output_sink::OutputSink;
 use crate::api::FileId;
+use crate::perf_stats;
 
 use crossbeam_channel as chan;
 use crossbeam_queue::ArrayQueue;
@@ -230,6 +231,8 @@ impl LocalFsUringConfig {
 // ============================================================================
 
 /// Discovery and I/O counters (no identifiers logged for security).
+///
+/// Populated only when `perf-stats` is enabled in debug builds.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LocalFsSummary {
     pub files_seen: u64,
@@ -241,6 +244,8 @@ pub struct LocalFsSummary {
 }
 
 /// Per-I/O-thread counters.
+///
+/// Populated only when `perf-stats` is enabled in debug builds.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UringIoStats {
     pub files_started: u64,
@@ -374,6 +379,10 @@ impl Drop for FixedBufferHandle {
 
 impl UringIoStats {
     fn merge(&mut self, other: UringIoStats) {
+        if !perf_stats::enabled() {
+            let _ = other;
+            return;
+        }
         self.files_started += other.files_started;
         self.files_open_failed += other.files_open_failed;
         self.open_ops_submitted += other.open_ops_submitted;
@@ -576,8 +585,8 @@ fn cpu_runner<E: ScanEngine>(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScra
 
             // Metrics: payload bytes only (exclude overlap prefix).
             let payload = (len as u64).saturating_sub(prefix_len as u64);
-            ctx.metrics.chunks_scanned += 1;
-            ctx.metrics.bytes_scanned += payload;
+            perf_stats::sat_add_u64(&mut ctx.metrics.chunks_scanned, 1);
+            perf_stats::sat_add_u64(&mut ctx.metrics.bytes_scanned, payload);
 
             // Buffer returns to pool on drop (RAII).
             drop(buf);
@@ -683,15 +692,15 @@ fn drain_in_flight(
                     Op::Read(op) => {
                         // Buffer dropped here, returned to pool
                         drop(op.buf);
-                        stats.reads_completed += 1;
+                        perf_stats::sat_add_u64(&mut stats.reads_completed, 1);
                         if res < 0 {
-                            stats.read_errors += 1;
+                            perf_stats::sat_add_u64(&mut stats.read_errors, 1);
                         }
                     }
                     Op::Open(_op) => {
-                        stats.open_ops_completed += 1;
+                        perf_stats::sat_add_u64(&mut stats.open_ops_completed, 1);
                         if res < 0 {
-                            stats.open_failures += 1;
+                            perf_stats::sat_add_u64(&mut stats.open_failures, 1);
                         } else {
                             // Prevent fd leak on shutdown path.
                             unsafe {
@@ -700,9 +709,9 @@ fn drain_in_flight(
                         }
                     }
                     Op::Stat(_op) => {
-                        stats.stat_ops_completed += 1;
+                        perf_stats::sat_add_u64(&mut stats.stat_ops_completed, 1);
                         if res < 0 {
-                            stats.stat_failures += 1;
+                            perf_stats::sat_add_u64(&mut stats.stat_failures, 1);
                         }
                     }
                 }
@@ -807,7 +816,7 @@ fn io_worker_loop<E: ScanEngine>(
     }
 
     if open_stat_fallback {
-        stats.open_stat_fallbacks += 1;
+        perf_stats::sat_add_u64(&mut stats.open_stat_fallbacks, 1);
     }
 
     if cfg.use_registered_buffers {
@@ -848,7 +857,7 @@ fn io_worker_loop<E: ScanEngine>(
         let file = match open_file_safe(path, cfg.follow_symlinks) {
             Ok(f) => f,
             Err(_) => {
-                stats.files_open_failed += 1;
+                perf_stats::sat_add_u64(&mut stats.files_open_failed, 1);
                 return BlockingOutcome::Failed;
             }
         };
@@ -858,7 +867,7 @@ fn io_worker_loop<E: ScanEngine>(
         let size = match file.metadata() {
             Ok(m) => m.len(),
             Err(_) => {
-                stats.files_open_failed += 1;
+                perf_stats::sat_add_u64(&mut stats.files_open_failed, 1);
                 return BlockingOutcome::Failed;
             }
         };
@@ -889,7 +898,7 @@ fn io_worker_loop<E: ScanEngine>(
                     free_file_slots: &mut Vec<usize>,
                     open_ready: &mut VecDeque<usize>,
                     read_ready: &mut VecDeque<usize>| {
-        stats.files_started += 1;
+        perf_stats::sat_add_u64(&mut stats.files_started, 1);
 
         if open_stat_supported {
             let slot = free_file_slots.pop().unwrap_or_else(|| {
@@ -1069,7 +1078,7 @@ fn io_worker_loop<E: ScanEngine>(
 
                             in_flight_ops += 1;
                             submitted_this_round += 1;
-                            stats.reads_submitted += 1;
+                            perf_stats::sat_add_u64(&mut stats.reads_submitted, 1);
 
                             st.in_flight = 1; // Exactly 1 - single in-flight per file
                             rs.next_offset = rs.next_offset.saturating_add(payload_len as u64);
@@ -1160,7 +1169,7 @@ fn io_worker_loop<E: ScanEngine>(
 
                 in_flight_ops += 1;
                 submitted_this_round += 1;
-                stats.stat_ops_submitted += 1;
+                perf_stats::sat_add_u64(&mut stats.stat_ops_submitted, 1);
                 st.in_flight = 1;
                 scheduled = true;
             }
@@ -1207,8 +1216,8 @@ fn io_worker_loop<E: ScanEngine>(
                 let path_cstr = match CString::new(path.as_os_str().as_bytes()) {
                     Ok(s) => s,
                     Err(_) => {
-                        stats.files_open_failed += 1;
-                        stats.open_failures += 1;
+                        perf_stats::sat_add_u64(&mut stats.files_open_failed, 1);
+                        perf_stats::sat_add_u64(&mut stats.open_failures, 1);
                         st.failed = true;
                         st.done = true;
                         files[file_slot] = None;
@@ -1260,7 +1269,7 @@ fn io_worker_loop<E: ScanEngine>(
 
                 in_flight_ops += 1;
                 submitted_this_round += 1;
-                stats.open_ops_submitted += 1;
+                perf_stats::sat_add_u64(&mut stats.open_ops_submitted, 1);
                 st.in_flight = 1;
                 scheduled = true;
             }
@@ -1360,7 +1369,7 @@ fn io_worker_loop<E: ScanEngine>(
             in_flight_ops = in_flight_ops.saturating_sub(1);
             match op {
                 Op::Read(op) => {
-                    stats.reads_completed += 1;
+                    perf_stats::sat_add_u64(&mut stats.reads_completed, 1);
                     let Some(st) = files.get_mut(op.file_slot).and_then(|s| s.as_mut()) else {
                         // File already cleaned up (shouldn't happen with 1-in-flight).
                         drop(op.buf);
@@ -1376,7 +1385,7 @@ fn io_worker_loop<E: ScanEngine>(
 
                     if res < 0 {
                         // Read syscall failed.
-                        stats.read_errors += 1;
+                        perf_stats::sat_add_u64(&mut stats.read_errors, 1);
                         st.failed = true;
                         st.done = true;
                         drop(op.buf);
@@ -1384,7 +1393,7 @@ fn io_worker_loop<E: ScanEngine>(
                         let n = res as usize;
                         if n == 0 {
                             // Unexpected EOF (empty read).
-                            stats.read_errors += 1;
+                            perf_stats::sat_add_u64(&mut stats.read_errors, 1);
                             st.failed = true;
                             st.done = true;
                             drop(op.buf);
@@ -1393,7 +1402,7 @@ fn io_worker_loop<E: ScanEngine>(
                                 // Short read: file likely shrank. Treat as truncation.
                                 // We scan what we got, but mark file done since we can't
                                 // trust our offset calculations for subsequent chunks.
-                                stats.short_reads += 1;
+                                perf_stats::sat_add_u64(&mut stats.short_reads, 1);
                                 st.done = true;
                             }
 
@@ -1442,7 +1451,7 @@ fn io_worker_loop<E: ScanEngine>(
                     }
                 }
                 Op::Open(op) => {
-                    stats.open_ops_completed += 1;
+                    perf_stats::sat_add_u64(&mut stats.open_ops_completed, 1);
                     let Some(st) = files.get_mut(op.file_slot).and_then(|s| s.as_mut()) else {
                         if res >= 0 {
                             unsafe {
@@ -1455,13 +1464,13 @@ fn io_worker_loop<E: ScanEngine>(
                     st.in_flight = 0;
 
                     if res < 0 {
-                        stats.open_failures += 1;
+                        perf_stats::sat_add_u64(&mut stats.open_failures, 1);
                         let errno = -res;
                         let can_fallback = cfg.open_stat_mode != OpenStatMode::UringRequired
                             && (errno == libc::EINVAL || errno == libc::EOPNOTSUPP);
 
                         if can_fallback {
-                            stats.open_stat_fallbacks += 1;
+                            perf_stats::sat_add_u64(&mut stats.open_stat_fallbacks, 1);
                             let path = match &mut st.phase {
                                 FilePhase::PendingOpen { path } => std::mem::take(path),
                                 _ => PathBuf::new(),
@@ -1481,7 +1490,7 @@ fn io_worker_loop<E: ScanEngine>(
                                 }
                             }
                         } else {
-                            stats.files_open_failed += 1;
+                            perf_stats::sat_add_u64(&mut stats.files_open_failed, 1);
                             st.failed = true;
                             st.done = true;
                         }
@@ -1499,7 +1508,7 @@ fn io_worker_loop<E: ScanEngine>(
                     }
                 }
                 Op::Stat(op) => {
-                    stats.stat_ops_completed += 1;
+                    perf_stats::sat_add_u64(&mut stats.stat_ops_completed, 1);
                     let Some(st) = files.get_mut(op.file_slot).and_then(|s| s.as_mut()) else {
                         continue;
                     };
@@ -1507,13 +1516,13 @@ fn io_worker_loop<E: ScanEngine>(
                     st.in_flight = 0;
 
                     if res < 0 {
-                        stats.stat_failures += 1;
+                        perf_stats::sat_add_u64(&mut stats.stat_failures, 1);
                         let errno = -res;
                         let can_fallback = cfg.open_stat_mode != OpenStatMode::UringRequired
                             && (errno == libc::EINVAL || errno == libc::EOPNOTSUPP);
 
                         if can_fallback {
-                            stats.open_stat_fallbacks += 1;
+                            perf_stats::sat_add_u64(&mut stats.open_stat_fallbacks, 1);
                             let file = match &mut st.phase {
                                 FilePhase::PendingStat { file } => file.as_ref(),
                                 _ => None,
@@ -1663,7 +1672,7 @@ fn walk_and_send_files(
             match fs::metadata(&path) {
                 Ok(m) => m,
                 Err(_) => {
-                    summary.walk_errors += 1;
+                    perf_stats::sat_add_u64(&mut summary.walk_errors, 1);
                     continue;
                 }
             }
@@ -1676,7 +1685,7 @@ fn walk_and_send_files(
                     m
                 }
                 Err(_) => {
-                    summary.walk_errors += 1;
+                    perf_stats::sat_add_u64(&mut summary.walk_errors, 1);
                     continue;
                 }
             }
@@ -1686,7 +1695,7 @@ fn walk_and_send_files(
             let rd = match fs::read_dir(&path) {
                 Ok(rd) => rd,
                 Err(_) => {
-                    summary.walk_errors += 1;
+                    perf_stats::sat_add_u64(&mut summary.walk_errors, 1);
                     continue;
                 }
             };
@@ -1694,7 +1703,7 @@ fn walk_and_send_files(
             for ent in rd {
                 match ent {
                     Ok(ent) => stack.push(ent.path()),
-                    Err(_) => summary.walk_errors += 1,
+                    Err(_) => perf_stats::sat_add_u64(&mut summary.walk_errors, 1),
                 }
             }
             continue;
@@ -1704,13 +1713,13 @@ fn walk_and_send_files(
             continue;
         }
 
-        summary.files_seen += 1;
+        perf_stats::sat_add_u64(&mut summary.files_seen, 1);
 
         let size = meta.len();
 
         if let Some(max_sz) = cfg.max_file_size {
             if size > max_sz {
-                summary.files_skipped_size += 1;
+                perf_stats::sat_add_u64(&mut summary.files_skipped_size, 1);
                 continue;
             }
         }
@@ -1739,7 +1748,7 @@ fn walk_and_send_files(
         tx.send(FileWork { path, size, token })
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "io threads stopped"))?;
 
-        summary.files_enqueued += 1;
+        perf_stats::sat_add_u64(&mut summary.files_enqueued, 1);
     }
 
     Ok(())
@@ -1859,8 +1868,8 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
         }
     }
 
-    summary.open_errors = io_stats.files_open_failed;
-    summary.read_errors = io_stats.read_errors;
+    perf_stats::set_u64(&mut summary.open_errors, io_stats.files_open_failed);
+    perf_stats::set_u64(&mut summary.read_errors, io_stats.read_errors);
 
     // Join CPU executor.
     let cpu_metrics = ex.join();
