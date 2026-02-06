@@ -1774,11 +1774,7 @@ mod tests {
 
         assert_eq!(stats.archive.archives_seen, 0);
         assert_eq!(stats.archive.archives_skipped, 0);
-        if cfg!(all(feature = "perf-stats", debug_assertions)) {
-            assert!(stats.bytes_scanned >= payload.len() as u64);
-        } else {
-            assert_eq!(stats.bytes_scanned, 0);
-        }
+        assert!(stats.bytes_scanned >= payload.len() as u64);
         Ok(())
     }
 
@@ -1801,16 +1797,17 @@ mod tests {
 
         let stats = pipeline.scan_path(&path)?;
 
+        // Core metrics are always populated.
+        assert!(stats.bytes_scanned > 0);
+        // Archive stats are perf-only.
         if cfg!(all(feature = "perf-stats", debug_assertions)) {
             assert_eq!(stats.archive.archives_seen, 1);
             assert_eq!(stats.archive.archives_scanned, 1);
             assert!(stats.archive.entries_scanned > 0);
-            assert!(stats.bytes_scanned > 0);
         } else {
             assert_eq!(stats.archive.archives_seen, 0);
             assert_eq!(stats.archive.archives_scanned, 0);
             assert_eq!(stats.archive.entries_scanned, 0);
-            assert_eq!(stats.bytes_scanned, 0);
         }
         Ok(())
     }

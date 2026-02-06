@@ -915,13 +915,8 @@ mod tests {
             unique_addrs
         );
 
-        // Validate: work was done
-        if cfg!(all(feature = "perf-stats", debug_assertions)) {
-            assert_eq!(metrics.chunks_scanned, tasks as u64);
-            assert_eq!(metrics.bytes_scanned, (tasks * 1024) as u64);
-        } else {
-            assert_eq!(metrics.chunks_scanned, 0);
-            assert_eq!(metrics.bytes_scanned, 0);
-        }
+        // Validate: work was done (core metrics are always populated)
+        assert_eq!(metrics.chunks_scanned, tasks as u64);
+        assert_eq!(metrics.bytes_scanned, (tasks * 1024) as u64);
     }
 }

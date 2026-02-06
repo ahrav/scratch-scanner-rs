@@ -2703,17 +2703,6 @@ mod tests {
         }
     }
 
-    fn assert_perf_ge(actual: u64, min_expected: u64) {
-        if cfg!(all(feature = "perf-stats", debug_assertions)) {
-            assert!(
-                actual >= min_expected,
-                "expected >= {min_expected}, got {actual}"
-            );
-        } else {
-            assert_eq!(actual, 0);
-        }
-    }
-
     #[test]
     fn zip_budget_clamp_charges_discarded_bytes() {
         let cfg = ArchiveConfig {
@@ -2935,7 +2924,7 @@ mod tests {
         let report = scan_local(engine, source, small_config(), sink);
 
         // bytes_scanned should be ~1000 (the actual payload scanned)
-        assert_perf_ge(report.metrics.bytes_scanned, 1000);
+        assert!(report.metrics.bytes_scanned >= 1000);
     }
 
     #[test]

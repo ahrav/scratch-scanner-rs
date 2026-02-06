@@ -700,10 +700,10 @@ fn tar_boundary_spanning_secret_once() {
     cfg.chunk_size = 6;
 
     let (out, report) = run_scan(vec![file_from_path(&tar_path)], cfg);
-    assert_perf!(
+    assert!(
         report.metrics.chunks_scanned >= 2,
-        report.metrics.chunks_scanned == 0,
-        "expected chunk counters to be gated by perf-stats"
+        "expected >= 2 chunks, got {}",
+        report.metrics.chunks_scanned
     );
     let count = out.matches("secret").count();
     assert_eq!(count, 1, "output: {out}");
@@ -769,10 +769,10 @@ fn nested_gzip_boundary_spanning_secret_once() {
     cfg.chunk_size = 6;
 
     let (out, report) = run_scan(vec![file_from_path(&tar_path)], cfg);
-    assert_perf!(
+    assert!(
         report.metrics.chunks_scanned >= 2,
-        report.metrics.chunks_scanned == 0,
-        "expected chunk counters to be gated by perf-stats"
+        "expected >= 2 chunks, got {}",
+        report.metrics.chunks_scanned
     );
     let count = out.matches("secret").count();
     assert_eq!(count, 1, "output: {out}");
@@ -866,10 +866,10 @@ fn zip_boundary_spanning_secret_once() {
     cfg.chunk_size = 6;
 
     let (out, report) = run_scan(vec![file_from_path(&zip_path)], cfg);
-    assert_perf!(
+    assert!(
         report.metrics.chunks_scanned >= 2,
-        report.metrics.chunks_scanned == 0,
-        "expected chunk counters to be gated by perf-stats"
+        "expected >= 2 chunks, got {}",
+        report.metrics.chunks_scanned
     );
     let count = out.matches("secret").count();
     assert_eq!(count, 1, "output: {out}");

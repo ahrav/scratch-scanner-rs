@@ -537,22 +537,14 @@ mod tests {
 
         // Each iteration should scan all 5 files
         for iter in &report.iterations {
-            if cfg!(all(feature = "perf-stats", debug_assertions)) {
-                assert!(
-                    iter.files >= 5,
-                    "iteration scanned {} files, expected >= 5",
-                    iter.files
-                );
-            } else {
-                assert_eq!(iter.files, 0);
-            }
+            assert!(
+                iter.files >= 5,
+                "iteration scanned {} files, expected >= 5",
+                iter.files
+            );
         }
 
-        if cfg!(all(feature = "perf-stats", debug_assertions)) {
-            assert!(report.total_bytes() > 0);
-        } else {
-            assert_eq!(report.total_bytes(), 0);
-        }
+        assert!(report.total_bytes() > 0);
     }
 
     #[test]
