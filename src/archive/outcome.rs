@@ -579,70 +579,6 @@ impl ArchiveStats {
     }
 }
 
-// -----------------------------
-// Fixed-array counters (legacy)
-// -----------------------------
-
-/// Fixed-array counters for archive outcomes (legacy path).
-///
-/// Prefer [`ArchiveStats`] for new code; this type is retained for
-/// call-sites that only need simple per-reason counting.
-///
-/// Uses **saturating** arithmetic (unlike `ArchiveStats` which wraps).
-#[derive(Clone, Debug)]
-pub struct ArchiveOutcomeCounters {
-    pub archives_seen: u64,
-    pub archives_scanned: u64,
-    pub archives_skipped: u64,
-    pub archives_partial: u64,
-
-    pub entries_scanned: u64,
-    pub entries_skipped: u64,
-
-    pub archive_skip_reasons: [u64; ArchiveSkipReason::COUNT],
-    pub entry_skip_reasons: [u64; EntrySkipReason::COUNT],
-    pub partial_reasons: [u64; PartialReason::COUNT],
-}
-
-impl Default for ArchiveOutcomeCounters {
-    fn default() -> Self {
-        Self {
-            archives_seen: 0,
-            archives_scanned: 0,
-            archives_skipped: 0,
-            archives_partial: 0,
-            entries_scanned: 0,
-            entries_skipped: 0,
-            archive_skip_reasons: [0; ArchiveSkipReason::COUNT],
-            entry_skip_reasons: [0; EntrySkipReason::COUNT],
-            partial_reasons: [0; PartialReason::COUNT],
-        }
-    }
-}
-
-impl ArchiveOutcomeCounters {
-    #[inline(always)]
-    pub fn inc_archive_skip(&mut self, reason: ArchiveSkipReason) {
-        self.archives_skipped = self.archives_skipped.saturating_add(1);
-        self.archive_skip_reasons[reason.as_usize()] =
-            self.archive_skip_reasons[reason.as_usize()].saturating_add(1);
-    }
-
-    #[inline(always)]
-    pub fn inc_entry_skip(&mut self, reason: EntrySkipReason) {
-        self.entries_skipped = self.entries_skipped.saturating_add(1);
-        self.entry_skip_reasons[reason.as_usize()] =
-            self.entry_skip_reasons[reason.as_usize()].saturating_add(1);
-    }
-
-    #[inline(always)]
-    pub fn inc_partial(&mut self, reason: PartialReason) {
-        self.archives_partial = self.archives_partial.saturating_add(1);
-        self.partial_reasons[reason.as_usize()] =
-            self.partial_reasons[reason.as_usize()].saturating_add(1);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,28 +597,6 @@ mod tests {
             PartialReason::COUNT,
             PartialReason::UnsupportedFeature as usize + 1
         );
-    }
-
-    #[test]
-    fn counters_are_fixed_and_indexable() {
-        let mut c = ArchiveOutcomeCounters::default();
-        c.inc_archive_skip(ArchiveSkipReason::UnsupportedFormat);
-        c.inc_entry_skip(EntrySkipReason::EncryptedEntry);
-        c.inc_partial(PartialReason::GzipCorrupt);
-
-        assert_eq!(c.archives_skipped, 1);
-        assert_eq!(c.entries_skipped, 1);
-        assert_eq!(c.archives_partial, 1);
-
-        assert_eq!(
-            c.archive_skip_reasons[ArchiveSkipReason::UnsupportedFormat as usize],
-            1
-        );
-        assert_eq!(
-            c.entry_skip_reasons[EntrySkipReason::EncryptedEntry as usize],
-            1
-        );
-        assert_eq!(c.partial_reasons[PartialReason::GzipCorrupt as usize], 1);
     }
 
     #[test]

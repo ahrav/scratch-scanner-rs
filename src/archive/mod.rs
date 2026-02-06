@@ -24,7 +24,7 @@ pub use detect::{
     sniff_kind_from_header, ArchiveKind,
 };
 pub use outcome::{
-    ArchiveOutcomeCounters, ArchiveSample, ArchiveSampleRing, ArchiveSkipReason, ArchiveStats,
+    ArchiveSample, ArchiveSampleRing, ArchiveSkipReason, ArchiveStats,
     EntrySkipReason, PartialReason, SampleKind, ARCHIVE_SAMPLE_MAX, ARCHIVE_SAMPLE_PATH_PREFIX_MAX,
 };
 pub use path::{
