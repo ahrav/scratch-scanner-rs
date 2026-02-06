@@ -14,7 +14,7 @@ crossbeam-channel = "0.5"
 crossbeam-deque = "0.8"
 crossbeam-queue = "0.3"
 crossbeam-utils = "0.8"
-flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
+flate2 = { version = "1.0", default-features = false, features = ["zlib-ng"] }
 libc = "0.2"
 memchr = "2.6"
 memmap2 = "0.9"
