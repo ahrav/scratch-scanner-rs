@@ -238,8 +238,12 @@ fn write_f64(n: f64, buf: &mut Vec<u8>) {
     }
     let negative = n < 0.0;
     let abs = n.abs();
-    let integer = abs as u64;
-    let frac = ((abs - integer as f64) * 100.0).round() as u64;
+    let mut integer = abs as u64;
+    let mut frac = ((abs - integer as f64) * 100.0).round() as u64;
+    if frac >= 100 {
+        integer += 1;
+        frac -= 100;
+    }
 
     if negative {
         buf.push(b'-');
@@ -598,6 +602,25 @@ mod tests {
         buf.clear();
         write_f64(-2.50, &mut buf);
         assert_eq!(&buf, b"-2.50");
+    }
+
+    #[test]
+    fn write_f64_frac_rounds_to_100() {
+        let mut buf = Vec::new();
+        write_f64(99.996, &mut buf);
+        assert_eq!(&buf, b"100.00");
+
+        buf.clear();
+        write_f64(1.995, &mut buf);
+        assert_eq!(&buf, b"2.00");
+
+        buf.clear();
+        write_f64(0.999, &mut buf);
+        assert_eq!(&buf, b"1.00");
+
+        buf.clear();
+        write_f64(-0.999, &mut buf);
+        assert_eq!(&buf, b"-1.00");
     }
 
     #[test]
