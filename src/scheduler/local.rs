@@ -2766,8 +2766,8 @@ mod tests {
 
         let report = scan_local(engine, source, small_config(), sink.clone());
 
-        assert_perf_u64(report.stats.files_enqueued, 1);
-        assert_perf_ge(report.metrics.chunks_scanned, 1);
+        assert_eq!(report.stats.files_enqueued, 1);
+        assert!(report.metrics.chunks_scanned >= 1);
 
         let output = sink.take();
         let output_str = String::from_utf8_lossy(&output);
@@ -2786,7 +2786,7 @@ mod tests {
 
         let report = scan_local(engine, source, small_config(), sink.clone());
 
-        assert_perf_u64(report.stats.files_enqueued, 1);
+        assert_eq!(report.stats.files_enqueued, 1);
         assert!(sink.take().is_empty());
     }
 
@@ -2807,8 +2807,8 @@ mod tests {
 
         let report = scan_local(engine, source, cfg, sink.clone());
 
-        assert_perf_u64(report.stats.files_enqueued, 1);
-        assert_perf_u64(report.metrics.bytes_scanned, 0);
+        assert_eq!(report.stats.files_enqueued, 1);
+        assert_eq!(report.metrics.bytes_scanned, 0);
         assert!(sink.take().is_empty());
     }
 
@@ -2821,8 +2821,8 @@ mod tests {
 
         let report = scan_local(engine, source, small_config(), sink.clone());
 
-        assert_perf_u64(report.stats.files_enqueued, 0);
-        assert_perf_u64(report.metrics.chunks_scanned, 0);
+        assert_eq!(report.stats.files_enqueued, 0);
+        assert_eq!(report.metrics.chunks_scanned, 0);
     }
 
     #[test]
@@ -2846,7 +2846,7 @@ mod tests {
 
         let report = scan_local(engine, source, small_config(), sink.clone());
 
-        assert_perf_ge(report.metrics.chunks_scanned, 2);
+        assert!(report.metrics.chunks_scanned >= 2);
 
         let output = sink.take();
         let output_str = String::from_utf8_lossy(&output);
@@ -2883,7 +2883,7 @@ mod tests {
 
         let report = scan_local(engine, source, small_config(), sink.clone());
 
-        assert_perf_u64(report.stats.files_enqueued, 5);
+        assert_eq!(report.stats.files_enqueued, 5);
 
         let output = sink.take();
         let output_str = String::from_utf8_lossy(&output);
