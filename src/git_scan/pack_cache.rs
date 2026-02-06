@@ -1,11 +1,17 @@
 //! Tiered set-associative cache for decoded pack objects.
 //!
 //! Stores inflated object bytes in fixed-size slots keyed by pack offset.
-//! The cache is set-associative with CLOCK eviction and does not allocate
-//! on the hot path after initialization.
+//! Two tiers handle different object size ranges:
 //!
-//! Oversize entries are not cached. Individual tiers are disabled if the
-//! configured capacity cannot fit at least one full set (WAYS * MIN_SLOT_SIZE).
+//! - **Small tier** (≤ 64 KiB slots) — holds the majority of objects; receives
+//!   ~2/3 of the total capacity budget.
+//! - **Large tier** (≤ 2 MiB slots) — covers popular delta bases in the
+//!   64 KiB–2 MiB range; receives ~1/3 of the budget.
+//!
+//! Both tiers are 4-way set-associative with CLOCK eviction and do not
+//! allocate on the hot path after initialization. Oversize entries (> 2 MiB)
+//! are not cached. Individual tiers are disabled if the configured capacity
+//! cannot fit at least one full set (`WAYS × slot_size`).
 
 use super::pack_inflate::ObjectKind;
 
@@ -21,7 +27,11 @@ const DEFAULT_LARGE_SLOT_SIZE: u32 = 2 * 1024 * 1024;
 const MIN_LARGE_TIER_BYTES: u32 = 32 * 1024 * 1024;
 /// Minimum slot size (prevents tiny, inefficient caches).
 const MIN_SLOT_SIZE: u32 = 1024;
-/// Number of ways per set.
+/// Number of ways per set (4-way associativity).
+///
+/// 4-way is a practical compromise: enough associativity to avoid frequent
+/// conflict misses on clustered offsets, but few enough ways that the
+/// CLOCK sweep per set is cheap.
 const WAYS: usize = 4;
 
 /// Metadata for one cache slot within a set-associative tier.
@@ -158,7 +168,12 @@ impl PackCacheTier {
 
     /// Inserts bytes for an offset into the cache.
     ///
-    /// Returns true if the entry was cached. Oversize entries are ignored.
+    /// If an entry with the same offset already exists in the set, it is
+    /// overwritten in place (no duplicate slots). Otherwise a victim is
+    /// selected via CLOCK eviction.
+    ///
+    /// Returns `true` if the entry was cached. Oversize entries (bytes >
+    /// `slot_size`) are silently rejected and return `false`.
     fn insert(&mut self, offset: u64, kind: ObjectKind, bytes: &[u8]) -> bool {
         if self.sets == 0 {
             return false;
@@ -169,6 +184,7 @@ impl PackCacheTier {
 
         let set = self.set_index(offset);
         let base = set * WAYS;
+        // Dedup: if the offset already exists, overwrite in place.
         for way in 0..WAYS {
             let idx = base + way;
             if self.slots[idx].valid && self.slots[idx].offset == offset {
@@ -339,7 +355,8 @@ impl PackCache {
 
     /// Looks up cached bytes by pack offset.
     ///
-    /// A hit updates the CLOCK bit for the slot.
+    /// Searches the small tier first, then the large tier. A hit in either
+    /// tier updates that slot's CLOCK reference bit.
     pub fn get(&mut self, offset: u64) -> Option<CachedObject<'_>> {
         self.small.get(offset).or_else(|| self.large.get(offset))
     }

@@ -310,7 +310,11 @@ pub(super) fn run_odb_blob(
         let (mut buckets, pack_ids) = bucket_pack_candidates(packed.drain(..), pack_views.len())?;
         let pack_plan_count = pack_ids.len();
 
-        // Strategy preselection for streamed planning:
+        // Strategy preselection: decided *before* plans are built so we know
+        // whether to stream plans to workers (pack-parallel) or buffer them
+        // for the stats-free selector (underfilled pool). This heuristic
+        // uses only the plan count (= number of distinct used packs), which
+        // is available before planning starts.
         //   - `pack_exec_workers == 1` → single-threaded execution.
         //   - `pack_plan_count >= workers` → one plan per worker, preserving
         //     planning/execution overlap via the work queue.
@@ -691,6 +695,11 @@ pub(super) fn run_odb_blob(
                             let mut candidate_ranges = Vec::new();
                             build_candidate_ranges(plan_ref, &mut candidate_ranges);
 
+                            // The strategy's shard_counts were computed from
+                            // the *buffered* plan set. If a pack wasn't
+                            // present in shard_counts (returns default 1),
+                            // re-evaluate with the full heuristic now that
+                            // we have the concrete plan.
                             let assigned_shards = {
                                 let assigned =
                                     shard_count_for_pack(&shard_counts, plan_ref.pack_id);
