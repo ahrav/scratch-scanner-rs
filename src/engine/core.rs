@@ -65,8 +65,9 @@ use super::transform::STREAM_DECODE_CHUNK_BYTES;
 use super::vectorscan_prefilter::{
     AnchorInput, VsAnchorDb, VsGateDb, VsPrefilterDb, VsStreamDb, VsUtf16StreamDb,
 };
-use super::work_items::{BufRef, EncRef, WorkItem};
+use super::work_items::{EncRef, WorkItem};
 use crate::api::{Gate, TransformConfig, TransformId, TransformMode};
+use std::ops::Range;
 
 // --------------------------
 // Statistics types
@@ -948,14 +949,7 @@ impl Engine {
         });
         crate::git_scan::perf::record_scan_reset(_reset_nanos);
 
-        scratch.work_q.push(WorkItem::ScanBuf {
-            buf: BufRef::Root,
-            step_id: STEP_ROOT,
-            root_hint: None,
-            transform_idx: None,
-            enc_ref: None,
-            depth: 0,
-        });
+        scratch.work_q.push(WorkItem::scan_root());
 
         // ── Work-queue loop ────────────────────────────────────────────
         //
@@ -976,123 +970,240 @@ impl Engine {
             let item = std::mem::take(&mut scratch.work_q[scratch.work_head]);
             scratch.work_head += 1;
 
-            match item {
-                WorkItem::ScanBuf {
-                    buf,
-                    step_id,
-                    root_hint,
-                    transform_idx,
-                    enc_ref,
-                    depth,
-                } => {
-                    let before = scratch.out.len();
-                    // Resolve the buffer reference to a raw pointer + length.
-                    //
-                    // We use raw pointers (and reconstruct a slice below) to avoid
-                    // holding a borrow on `scratch.slab` while we pass `scratch` mutably
-                    // into `scan_rules_on_buffer`. This is sound because:
-                    //
-                    //   1. The slab is pre-allocated and never reallocated during a scan,
-                    //      so the pointer remains valid.
-                    //   2. `scan_rules_on_buffer` writes only to scratch output buffers
-                    //      (findings, hit accumulators), never to the slab region backing
-                    //      `cur_buf`. No aliasing violation occurs.
-                    //   3. `root_buf` is caller-owned and immutable for the scan duration.
-                    let (buf_ptr, buf_len, buf_offset) = match &buf {
-                        BufRef::Root => (root_buf.as_ptr(), root_buf.len(), 0usize),
-                        BufRef::Slab(range) => unsafe {
-                            debug_assert!(range.end <= scratch.slab.buf.len());
-                            let ptr = scratch.slab.buf.as_ptr().add(range.start);
-                            (ptr, range.end.saturating_sub(range.start), range.start)
-                        },
+            if !item.is_decode_span() {
+                // ── ScanBuf path ──────────────────────────────────────────
+                let step_id = item.step_id();
+                let depth = item.depth() as usize;
+                let transform_idx = item.transform_idx().map(|v| v as usize);
+                let enc_ref = item.enc_ref();
+                let root_hint: Option<Range<usize>> =
+                    item.root_hint().map(|r| r.start as usize..r.end as usize);
+                let buf_is_slab = item.buf_slab_range().is_some();
+
+                let before = scratch.out.len();
+                // Resolve the buffer reference to a raw pointer + length.
+                //
+                // We use raw pointers (and reconstruct a slice below) to avoid
+                // holding a borrow on `scratch.slab` while we pass `scratch` mutably
+                // into `scan_rules_on_buffer`. This is sound because:
+                //
+                //   1. The slab is pre-allocated and never reallocated during a scan,
+                //      so the pointer remains valid.
+                //   2. `scan_rules_on_buffer` writes only to scratch output buffers
+                //      (findings, hit accumulators), never to the slab region backing
+                //      `cur_buf`. No aliasing violation occurs.
+                //   3. `root_buf` is caller-owned and immutable for the scan duration.
+                let (buf_ptr, buf_len, buf_offset) = if let Some(slab_range) = item.buf_slab_range()
+                {
+                    let start = slab_range.start as usize;
+                    let end = slab_range.end as usize;
+                    unsafe {
+                        debug_assert!(end <= scratch.slab.buf.len());
+                        let ptr = scratch.slab.buf.as_ptr().add(start);
+                        (ptr, end.saturating_sub(start), start)
+                    }
+                } else {
+                    (root_buf.as_ptr(), root_buf.len(), 0usize)
+                };
+
+                // SAFETY: see the comment block above for the full aliasing argument.
+                let cur_buf = unsafe { std::slice::from_raw_parts(buf_ptr, buf_len) };
+
+                // Build mapping context to translate decoded-space offsets back to root buffer
+                // positions. This is used when reporting findings: the `root_hint` in a finding
+                // should point to the *original* bytes in the root buffer, not intermediate
+                // decoded buffers.
+                //
+                // For nested transforms (e.g., URL inside Base64), we need to map through
+                // each decode layer. The context is only valid when the encoded span maps
+                // 1:1 with the root hint (either directly from root, or through a slab
+                // where lengths match).
+                scratch.root_span_map_ctx =
+                    match (transform_idx, enc_ref.as_ref(), root_hint.as_ref()) {
+                        // Encoded bytes come directly from root buffer.
+                        (Some(tidx), Some(er), Some(hint))
+                            if !er.is_slab
+                                && hint.start == er.lo as usize
+                                && hint.end == er.hi as usize =>
+                        {
+                            let span = er.range_usize();
+                            Some(RootSpanMapCtx::new(
+                                &self.transforms[tidx],
+                                &root_buf[span],
+                                hint.start,
+                                scratch.chunk_overlap_backscan,
+                            ))
+                        }
+                        // Encoded bytes are in the slab (from a prior decode). The hint length
+                        // must match the span length to ensure correct offset translation.
+                        (Some(tidx), Some(er), Some(hint))
+                            if er.is_slab
+                                && (er.hi as usize) <= scratch.slab.buf.len()
+                                && hint.end.saturating_sub(hint.start)
+                                    == (er.hi as usize).saturating_sub(er.lo as usize) =>
+                        {
+                            let span = er.range_usize();
+                            Some(RootSpanMapCtx::new(
+                                &self.transforms[tidx],
+                                &scratch.slab.buf[span],
+                                hint.start,
+                                scratch.chunk_overlap_backscan,
+                            ))
+                        }
+                        _ => None,
                     };
 
-                    // SAFETY: see the comment block above for the full aliasing argument.
-                    let cur_buf = unsafe { std::slice::from_raw_parts(buf_ptr, buf_len) };
+                self.scan_rules_on_buffer(
+                    cur_buf,
+                    step_id,
+                    root_hint.clone(),
+                    base_offset,
+                    file_id,
+                    scratch,
+                );
+                scratch.root_span_map_ctx = None;
+                let found_any_in_this_buf = scratch.out.len() > before;
 
-                    // Build mapping context to translate decoded-space offsets back to root buffer
-                    // positions. This is used when reporting findings: the `root_hint` in a finding
-                    // should point to the *original* bytes in the root buffer, not intermediate
-                    // decoded buffers.
-                    //
-                    // For nested transforms (e.g., URL inside Base64), we need to map through
-                    // each decode layer. The context is only valid when the encoded span maps
-                    // 1:1 with the root hint (either directly from root, or through a slab
-                    // where lengths match).
-                    scratch.root_span_map_ctx =
-                        match (transform_idx, enc_ref.as_ref(), root_hint.as_ref()) {
-                            // Encoded bytes come directly from root buffer.
-                            (Some(tidx), Some(EncRef::Root(span)), Some(hint))
-                                if hint.start == span.start && hint.end == span.end =>
-                            {
-                                Some(RootSpanMapCtx::new(
-                                    &self.transforms[tidx],
-                                    &root_buf[span.clone()],
-                                    hint.start,
-                                    scratch.chunk_overlap_backscan,
-                                ))
-                            }
-                            // Encoded bytes are in the slab (from a prior decode). The hint length
-                            // must match the span length to ensure correct offset translation.
-                            (Some(tidx), Some(EncRef::Slab(span)), Some(hint))
-                                if span.end <= scratch.slab.buf.len()
-                                    && hint.end.saturating_sub(hint.start)
-                                        == span.end.saturating_sub(span.start) =>
-                            {
-                                Some(RootSpanMapCtx::new(
-                                    &self.transforms[tidx],
-                                    &scratch.slab.buf[span.clone()],
-                                    hint.start,
-                                    scratch.chunk_overlap_backscan,
-                                ))
-                            }
-                            _ => None,
-                        };
+                if depth >= self.tuning.max_transform_depth {
+                    continue;
+                }
+                if scratch.work_items_enqueued >= self.tuning.max_work_items {
+                    continue;
+                }
 
-                    self.scan_rules_on_buffer(
-                        cur_buf,
-                        step_id,
-                        root_hint.clone(),
-                        base_offset,
-                        file_id,
-                        scratch,
-                    );
-                    scratch.root_span_map_ctx = None;
-                    let found_any_in_this_buf = scratch.out.len() > before;
-
-                    if depth >= self.tuning.max_transform_depth {
+                for (tidx, tc) in self.transforms.iter().enumerate() {
+                    if tc.mode == TransformMode::Disabled {
                         continue;
                     }
-                    if scratch.work_items_enqueued >= self.tuning.max_work_items {
+                    if tc.mode == TransformMode::IfNoFindingsInThisBuffer && found_any_in_this_buf {
+                        continue;
+                    }
+                    if cur_buf.len() < tc.min_len {
+                        continue;
+                    }
+                    if !super::transform::transform_quick_trigger(tc, cur_buf) {
+                        continue;
+                    }
+                    if !self.base64_buffer_gate(tc, cur_buf) {
                         continue;
                     }
 
-                    for (tidx, tc) in self.transforms.iter().enumerate() {
-                        if tc.mode == TransformMode::Disabled {
-                            continue;
+                    super::transform::find_spans_into(tc, cur_buf, &mut scratch.spans);
+                    if scratch.spans.is_empty() {
+                        continue;
+                    }
+
+                    let span_len = scratch.spans.len().min(tc.max_spans_per_buffer);
+                    for i in 0..span_len {
+                        if scratch.work_items_enqueued >= self.tuning.max_work_items {
+                            break;
                         }
-                        if tc.mode == TransformMode::IfNoFindingsInThisBuffer
-                            && found_any_in_this_buf
+                        if scratch.total_decode_output_bytes
+                            >= self.tuning.max_total_decode_output_bytes
                         {
-                            continue;
-                        }
-                        if cur_buf.len() < tc.min_len {
-                            continue;
-                        }
-                        if !super::transform::transform_quick_trigger(tc, cur_buf) {
-                            continue;
-                        }
-                        if !self.base64_buffer_gate(tc, cur_buf) {
-                            continue;
+                            break;
                         }
 
-                        super::transform::find_spans_into(tc, cur_buf, &mut scratch.spans);
-                        if scratch.spans.is_empty() {
-                            continue;
+                        let enc_span = scratch.spans[i].to_range();
+                        let enc = &cur_buf[enc_span.clone()];
+                        if tc.id == TransformId::Base64 {
+                            // Base64-only prefilter: cheap encoded-space gate.
+                            // This is only used when the decoded gate is enabled, and it never
+                            // replaces the decoded check. It exists to avoid paying decode cost
+                            // when a span cannot possibly contain any anchor after decoding.
+                            #[cfg(feature = "b64-stats")]
+                            {
+                                scratch.base64_stats.spans =
+                                    scratch.base64_stats.spans.saturating_add(1);
+                                scratch.base64_stats.span_bytes = scratch
+                                    .base64_stats
+                                    .span_bytes
+                                    .saturating_add(enc.len() as u64);
+                            }
+                            if tc.gate == Gate::AnchorsInDecoded {
+                                if let Some(gate) = &self.b64_gate {
+                                    #[cfg(feature = "b64-stats")]
+                                    {
+                                        scratch.base64_stats.pre_gate_checks =
+                                            scratch.base64_stats.pre_gate_checks.saturating_add(1);
+                                    }
+                                    if !gate.hits(enc) {
+                                        #[cfg(feature = "b64-stats")]
+                                        {
+                                            scratch.base64_stats.pre_gate_skip = scratch
+                                                .base64_stats
+                                                .pre_gate_skip
+                                                .saturating_add(1);
+                                            scratch.base64_stats.pre_gate_skip_bytes = scratch
+                                                .base64_stats
+                                                .pre_gate_skip_bytes
+                                                .saturating_add(enc.len() as u64);
+                                        }
+                                        continue;
+                                    }
+                                    #[cfg(feature = "b64-stats")]
+                                    {
+                                        scratch.base64_stats.pre_gate_pass =
+                                            scratch.base64_stats.pre_gate_pass.saturating_add(1);
+                                    }
+                                }
+                            }
                         }
 
-                        let span_len = scratch.spans.len().min(tc.max_spans_per_buffer);
-                        for i in 0..span_len {
+                        // Base64 alignment shifts.
+                        //
+                        // A Base64-encoded span may not start on a 4-character boundary
+                        // relative to the original encoding. Shifting by 0..3 characters
+                        // tries each possible alignment and produces up to 4 decode
+                        // sub-spans. Non-Base64 transforms always produce a single span.
+                        //
+                        // For each shift, `base64_skip_chars` returns the byte offset to
+                        // skip leading non-alphabet chars (whitespace, padding) plus
+                        // `shift` alignment chars. If the remaining encoded characters
+                        // are fewer than `min_len`, the shift is skipped. Duplicate start
+                        // offsets (which can occur when whitespace collapses shifts) are
+                        // also deduplicated.
+                        let mut span_starts = [0usize; 4];
+                        let mut span_ends = [0usize; 4];
+                        let mut span_count = 0usize;
+
+                        if tc.id == TransformId::Base64 {
+                            let allow_space_ws = tc.base64_allow_space_ws;
+                            for shift in 0..4usize {
+                                let Some(rel) =
+                                    super::transform::base64_skip_chars(enc, shift, allow_space_ws)
+                                else {
+                                    break;
+                                };
+                                let start = enc_span.start.saturating_add(rel);
+                                if start >= enc_span.end {
+                                    continue;
+                                }
+                                if span_starts[..span_count].contains(&start) {
+                                    continue;
+                                }
+                                let enc_aligned = &cur_buf[start..enc_span.end];
+                                let remaining_chars = super::transform::base64_char_count(
+                                    enc_aligned,
+                                    allow_space_ws,
+                                );
+                                if remaining_chars < tc.min_len {
+                                    continue;
+                                }
+                                span_starts[span_count] = start;
+                                span_ends[span_count] = enc_span.end;
+                                span_count += 1;
+                                if span_count >= span_starts.len() {
+                                    break;
+                                }
+                            }
+                        } else {
+                            span_starts[0] = enc_span.start;
+                            span_ends[0] = enc_span.end;
+                            span_count = 1;
+                        }
+
+                        for idx in 0..span_count {
                             if scratch.work_items_enqueued >= self.tuning.max_work_items {
                                 break;
                             }
@@ -1102,249 +1213,134 @@ impl Engine {
                                 break;
                             }
 
-                            let enc_span = scratch.spans[i].to_range();
-                            let enc = &cur_buf[enc_span.clone()];
-                            if tc.id == TransformId::Base64 {
-                                // Base64-only prefilter: cheap encoded-space gate.
-                                // This is only used when the decoded gate is enabled, and it never
-                                // replaces the decoded check. It exists to avoid paying decode cost
-                                // when a span cannot possibly contain any anchor after decoding.
-                                #[cfg(feature = "b64-stats")]
-                                {
-                                    scratch.base64_stats.spans =
-                                        scratch.base64_stats.spans.saturating_add(1);
-                                    scratch.base64_stats.span_bytes = scratch
-                                        .base64_stats
-                                        .span_bytes
-                                        .saturating_add(enc.len() as u64);
-                                }
-                                if tc.gate == Gate::AnchorsInDecoded {
-                                    if let Some(gate) = &self.b64_gate {
-                                        #[cfg(feature = "b64-stats")]
-                                        {
-                                            scratch.base64_stats.pre_gate_checks = scratch
-                                                .base64_stats
-                                                .pre_gate_checks
-                                                .saturating_add(1);
-                                        }
-                                        if !gate.hits(enc) {
-                                            #[cfg(feature = "b64-stats")]
-                                            {
-                                                scratch.base64_stats.pre_gate_skip = scratch
-                                                    .base64_stats
-                                                    .pre_gate_skip
-                                                    .saturating_add(1);
-                                                scratch.base64_stats.pre_gate_skip_bytes = scratch
-                                                    .base64_stats
-                                                    .pre_gate_skip_bytes
-                                                    .saturating_add(enc.len() as u64);
-                                            }
-                                            continue;
-                                        }
-                                        #[cfg(feature = "b64-stats")]
-                                        {
-                                            scratch.base64_stats.pre_gate_pass = scratch
-                                                .base64_stats
-                                                .pre_gate_pass
-                                                .saturating_add(1);
-                                        }
-                                    }
-                                }
-                            }
+                            let enc_span = span_starts[idx]..span_ends[idx];
+                            let child_step_id = scratch.step_arena.push(
+                                step_id,
+                                DecodeStep::Transform {
+                                    transform_idx: tidx,
+                                    parent_span: enc_span.clone(),
+                                },
+                            );
 
-                            // Base64 alignment shifts.
-                            //
-                            // A Base64-encoded span may not start on a 4-character boundary
-                            // relative to the original encoding. Shifting by 0..3 characters
-                            // tries each possible alignment and produces up to 4 decode
-                            // sub-spans. Non-Base64 transforms always produce a single span.
-                            //
-                            // For each shift, `base64_skip_chars` returns the byte offset to
-                            // skip leading non-alphabet chars (whitespace, padding) plus
-                            // `shift` alignment chars. If the remaining encoded characters
-                            // are fewer than `min_len`, the shift is skipped. Duplicate start
-                            // offsets (which can occur when whitespace collapses shifts) are
-                            // also deduplicated.
-                            let mut span_starts = [0usize; 4];
-                            let mut span_ends = [0usize; 4];
-                            let mut span_count = 0usize;
-
-                            if tc.id == TransformId::Base64 {
-                                let allow_space_ws = tc.base64_allow_space_ws;
-                                for shift in 0..4usize {
-                                    let Some(rel) = super::transform::base64_skip_chars(
-                                        enc,
-                                        shift,
-                                        allow_space_ws,
-                                    ) else {
-                                        break;
-                                    };
-                                    let start = enc_span.start.saturating_add(rel);
-                                    if start >= enc_span.end {
-                                        continue;
-                                    }
-                                    if span_starts[..span_count].contains(&start) {
-                                        continue;
-                                    }
-                                    let enc_aligned = &cur_buf[start..enc_span.end];
-                                    let remaining_chars = super::transform::base64_char_count(
-                                        enc_aligned,
-                                        allow_space_ws,
-                                    );
-                                    if remaining_chars < tc.min_len {
-                                        continue;
-                                    }
-                                    span_starts[span_count] = start;
-                                    span_ends[span_count] = enc_span.end;
-                                    span_count += 1;
-                                    if span_count >= span_starts.len() {
-                                        break;
-                                    }
-                                }
-                            } else {
-                                span_starts[0] = enc_span.start;
-                                span_ends[0] = enc_span.end;
-                                span_count = 1;
-                            }
-
-                            for idx in 0..span_count {
-                                if scratch.work_items_enqueued >= self.tuning.max_work_items {
-                                    break;
-                                }
-                                if scratch.total_decode_output_bytes
-                                    >= self.tuning.max_total_decode_output_bytes
-                                {
-                                    break;
-                                }
-
-                                let enc_span = span_starts[idx]..span_ends[idx];
-                                let child_step_id = scratch.step_arena.push(
-                                    step_id,
-                                    DecodeStep::Transform {
-                                        transform_idx: tidx,
-                                        parent_span: enc_span.clone(),
-                                    },
-                                );
-
-                                // Compute the child's root hint. For nested transforms, use the
-                                // mapping context to translate the encoded span back to root-buffer
-                                // coordinates. This ensures findings report offsets into the original
-                                // input, not intermediate decoded buffers.
-                                let child_root_hint =
-                                    if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
-                                        Some(ctx.map_span(enc_span.clone()))
-                                    } else if root_hint.is_none() {
-                                        Some(enc_span.clone())
-                                    } else {
-                                        root_hint.clone()
-                                    };
-
-                                let enc_ref = match &buf {
-                                    BufRef::Root => EncRef::Root(enc_span.clone()),
-                                    BufRef::Slab(_) => {
-                                        let start = buf_offset.saturating_add(enc_span.start);
-                                        let end = buf_offset.saturating_add(enc_span.end);
-                                        EncRef::Slab(start..end)
-                                    }
+                            // Compute the child's root hint. For nested transforms, use the
+                            // mapping context to translate the encoded span back to root-buffer
+                            // coordinates. This ensures findings report offsets into the original
+                            // input, not intermediate decoded buffers.
+                            let child_root_hint: Option<Range<usize>> =
+                                if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
+                                    Some(ctx.map_span(enc_span.clone()))
+                                } else if root_hint.is_none() {
+                                    Some(enc_span.clone())
+                                } else {
+                                    root_hint.clone()
                                 };
 
-                                scratch.work_q.push(WorkItem::DecodeSpan {
-                                    transform_idx: tidx,
-                                    enc_ref,
-                                    step_id: child_step_id,
-                                    root_hint: child_root_hint,
-                                    depth: depth + 1,
-                                });
-                                scratch.work_items_enqueued += 1;
-                            }
+                            let child_enc_ref = if buf_is_slab {
+                                let start = buf_offset.saturating_add(enc_span.start);
+                                let end = buf_offset.saturating_add(enc_span.end);
+                                EncRef::slab(start as u32..end as u32)
+                            } else {
+                                EncRef::root(enc_span.start as u32..enc_span.end as u32)
+                            };
+
+                            let child_root_hint_u64: Option<Range<u64>> = child_root_hint
+                                .as_ref()
+                                .map(|r| r.start as u64..r.end as u64);
+
+                            scratch.work_q.push(WorkItem::decode_span(
+                                tidx as u16,
+                                child_enc_ref,
+                                child_step_id,
+                                child_root_hint_u64,
+                                (depth + 1) as u8,
+                            ));
+                            scratch.work_items_enqueued += 1;
                         }
                     }
                 }
-                WorkItem::DecodeSpan {
-                    transform_idx,
-                    enc_ref,
-                    step_id,
-                    root_hint,
-                    depth,
-                } => {
-                    #[cfg(feature = "git-perf")]
-                    let _transform_start = std::time::Instant::now();
+            } else {
+                // ── DecodeSpan path ───────────────────────────────────────
+                let step_id = item.step_id();
+                let depth = item.depth() as usize;
+                let transform_idx = item.transform_idx().unwrap_or(0) as usize;
+                let enc_ref = item.enc_ref().unwrap();
+                let root_hint: Option<Range<usize>> =
+                    item.root_hint().map(|r| r.start as usize..r.end as usize);
 
-                    if scratch.total_decode_output_bytes
-                        >= self.tuning.max_total_decode_output_bytes
-                    {
-                        continue;
-                    }
-                    let tc = &self.transforms[transform_idx];
-                    if tc.mode == TransformMode::Disabled {
-                        continue;
-                    }
+                #[cfg(feature = "git-perf")]
+                let _transform_start = std::time::Instant::now();
 
-                    // Resolve the encoded span to a raw pointer + length.
-                    // Same aliasing argument as the ScanBuf arm: root_buf is
-                    // immutable; the slab is pre-allocated and not reallocated.
-                    // Bounds are checked before pointer arithmetic.
-                    let (enc_ptr, enc_len) = match &enc_ref {
-                        EncRef::Root(r) => {
-                            if r.end <= root_buf.len() {
-                                let ptr = unsafe { root_buf.as_ptr().add(r.start) };
-                                (ptr, r.end - r.start)
-                            } else {
-                                continue;
-                            }
-                        }
-                        EncRef::Slab(r) => {
-                            if r.end <= scratch.slab.buf.len() {
-                                let ptr = unsafe { scratch.slab.buf.as_ptr().add(r.start) };
-                                (ptr, r.end - r.start)
-                            } else {
-                                continue;
-                            }
-                        }
-                    };
-                    let enc = unsafe { std::slice::from_raw_parts(enc_ptr, enc_len) };
-                    let root_hint_maps_encoded = match (&enc_ref, &root_hint) {
-                        (EncRef::Root(span), Some(hint)) => {
-                            hint.start == span.start && hint.end == span.end
-                        }
-                        _ => false,
-                    };
+                if scratch.total_decode_output_bytes >= self.tuning.max_total_decode_output_bytes {
+                    continue;
+                }
+                let tc = &self.transforms[transform_idx];
+                if tc.mode == TransformMode::Disabled {
+                    continue;
+                }
 
-                    if let Some(vs_stream) = self.vs_stream.as_ref() {
-                        self.decode_stream_and_scan(
-                            vs_stream,
-                            tc,
-                            transform_idx,
-                            &enc_ref,
-                            enc,
-                            step_id,
-                            root_hint,
-                            root_hint_maps_encoded,
-                            depth,
-                            base_offset,
-                            file_id,
-                            scratch,
-                        );
+                // Resolve the encoded span to a raw pointer + length.
+                // Same aliasing argument as the ScanBuf arm: root_buf is
+                // immutable; the slab is pre-allocated and not reallocated.
+                // Bounds are checked before pointer arithmetic.
+                let r = enc_ref.range_usize();
+                let (enc_ptr, enc_len) = if !enc_ref.is_slab {
+                    if r.end <= root_buf.len() {
+                        let ptr = unsafe { root_buf.as_ptr().add(r.start) };
+                        (ptr, r.end - r.start)
                     } else {
-                        self.decode_span_fallback(
-                            tc,
-                            transform_idx,
-                            &enc_ref,
-                            enc,
-                            step_id,
-                            root_hint,
-                            depth,
-                            base_offset,
-                            file_id,
-                            scratch,
-                        );
+                        continue;
                     }
+                } else if r.end <= scratch.slab.buf.len() {
+                    let ptr = unsafe { scratch.slab.buf.as_ptr().add(r.start) };
+                    (ptr, r.end - r.start)
+                } else {
+                    continue;
+                };
+                let enc = unsafe { std::slice::from_raw_parts(enc_ptr, enc_len) };
+                let root_hint_maps_encoded = if !enc_ref.is_slab {
+                    if let Some(hint) = root_hint.as_ref() {
+                        hint.start == r.start && hint.end == r.end
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
 
-                    #[cfg(feature = "git-perf")]
-                    crate::git_scan::perf::record_scan_transform(
-                        _transform_start.elapsed().as_nanos() as u64,
+                if let Some(vs_stream) = self.vs_stream.as_ref() {
+                    self.decode_stream_and_scan(
+                        vs_stream,
+                        tc,
+                        transform_idx,
+                        &enc_ref,
+                        enc,
+                        step_id,
+                        root_hint,
+                        root_hint_maps_encoded,
+                        depth,
+                        base_offset,
+                        file_id,
+                        scratch,
+                    );
+                } else {
+                    self.decode_span_fallback(
+                        tc,
+                        transform_idx,
+                        &enc_ref,
+                        enc,
+                        step_id,
+                        root_hint,
+                        depth,
+                        base_offset,
+                        file_id,
+                        scratch,
                     );
                 }
+
+                #[cfg(feature = "git-perf")]
+                crate::git_scan::perf::record_scan_transform(
+                    _transform_start.elapsed().as_nanos() as u64
+                );
             }
         }
     }

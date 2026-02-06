@@ -199,6 +199,12 @@ impl RootSpanMapCtx {
     }
 }
 
+// SAFETY: RootSpanMapCtx stores raw const pointers to Engine-owned data
+// (TransformConfig, encoded bytes). The Engine is immutable and outlives
+// all scratch instances. The context is always None between scans
+// (cleared after each buffer scan in core.rs).
+unsafe impl Send for RootSpanMapCtx {}
+
 impl EntropyScratch {
     /// Returns a zeroed histogram with no tracked byte values.
     pub(super) fn new() -> Self {

@@ -61,7 +61,7 @@ use super::vectorscan_prefilter::{
     VsStreamDb, VsStreamMatchCtx, VsUtf16StreamMatchCtx,
 };
 use super::work_items::{
-    BufRef, EncRef, PendingDecodeSpan, PendingWindow, SpanStreamEntry, SpanStreamState, WorkItem,
+    EncRef, PendingDecodeSpan, PendingWindow, SpanStreamEntry, SpanStreamState, WorkItem,
 };
 use crate::api::{Gate, TransformConfig, TransformId, TransformMode};
 
@@ -173,14 +173,14 @@ impl Engine {
             return;
         }
 
-        scratch.work_q.push(WorkItem::ScanBuf {
-            buf: BufRef::Slab(decoded_range),
+        scratch.work_q.push(WorkItem::scan_slab(
+            decoded_range.start as u32..decoded_range.end as u32,
             step_id,
-            root_hint,
-            transform_idx: Some(transform_idx),
-            enc_ref: Some(enc_ref.clone()),
-            depth,
-        });
+            root_hint.as_ref().map(|r| r.start as u64..r.end as u64),
+            Some(transform_idx as u16),
+            Some(*enc_ref),
+            depth as u8,
+        ));
         scratch.work_items_enqueued = scratch.work_items_enqueued.saturating_add(1);
 
         let _ = (base_offset, file_id, transform_idx);
@@ -893,13 +893,13 @@ impl Engine {
                                 Some(parent_span)
                             };
 
-                            scratch.pending_spans.push(PendingDecodeSpan {
-                                transform_idx: entry.transform_idx,
-                                range: aligned_start..span_end,
-                                step_id: child_step_id,
-                                root_hint: child_root_hint,
-                                depth: depth + 1,
-                            });
+                            scratch.pending_spans.push(PendingDecodeSpan::new(
+                                entry.transform_idx as u16,
+                                aligned_start as u32..span_end as u32,
+                                child_step_id,
+                                child_root_hint.map(|r| r.start as u64..r.end as u64),
+                                (depth + 1) as u8,
+                            ));
                             enqueued_any = true;
                         }
                         if !enqueued_any {
@@ -1172,13 +1172,13 @@ impl Engine {
                             } else {
                                 Some(parent_span)
                             };
-                            scratch.pending_spans.push(PendingDecodeSpan {
-                                transform_idx: entry.transform_idx,
-                                range: aligned_start..span_end,
-                                step_id: child_step_id,
-                                root_hint: child_root_hint,
-                                depth: depth + 1,
-                            });
+                            scratch.pending_spans.push(PendingDecodeSpan::new(
+                                entry.transform_idx as u16,
+                                aligned_start as u32..span_end as u32,
+                                child_step_id,
+                                child_root_hint.map(|r| r.start as u64..r.end as u64),
+                                (depth + 1) as u8,
+                            ));
                             enqueued_any = true;
                         }
                         if !enqueued_any {
@@ -1519,20 +1519,20 @@ impl Engine {
         let found_any_in_buf = found_any;
         let mut enqueued = 0usize;
         for pending in scratch.pending_spans.drain(..) {
-            let mode = self.transforms[pending.transform_idx].mode;
+            let mode = self.transforms[pending.transform_idx as usize].mode;
             if mode == TransformMode::IfNoFindingsInThisBuffer && found_any_in_buf {
                 continue;
             }
             if scratch.work_items_enqueued >= self.tuning.max_work_items {
                 break;
             }
-            scratch.work_q.push(WorkItem::DecodeSpan {
-                transform_idx: pending.transform_idx,
-                enc_ref: EncRef::Slab(pending.range),
-                step_id: pending.step_id,
-                root_hint: pending.root_hint,
-                depth: pending.depth,
-            });
+            scratch.work_q.push(WorkItem::decode_span(
+                pending.transform_idx,
+                EncRef::slab(pending.range()),
+                pending.step_id,
+                pending.root_hint(),
+                pending.depth,
+            ));
             scratch.work_items_enqueued += 1;
             enqueued += 1;
         }

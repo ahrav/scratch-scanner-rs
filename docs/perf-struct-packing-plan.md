@@ -7,11 +7,14 @@ Validation will require both correctness and performance evidence.
 
 ## Current Hotspot Baseline (from repo inspection)
 - `ScanScratch`: `2792B` (`src/engine/scratch.rs`), contains both hot-loop fields and large cold/stateful members.
-- `WorkItem`: `104B` (`src/engine/work_items.rs`), inflated by `Option<Range<usize>>` and enum layout.
-- `VsStreamWindow`: `40B` (`src/engine/vectorscan_prefilter.rs`), has avoidable padding and separate flag bytes.
-- `PendingWindow`: `32B` (`src/engine/work_items.rs`), mostly tight already.
+- `WorkItem`: ~~`104B`~~ → **`40B`** (`src/engine/work_items.rs`). **DONE**: flat packed struct with flag byte + sentinels. See `work_items.rs` module docs for layout.
+- `VsStreamWindow`: ~~`40B`~~ → **`32B`** (`src/engine/vectorscan_prefilter.rs`). **DONE**: reordered fields under `#[repr(C)]` (u64 first).
+- `FindingRec`: already at **`40B`** — no change needed (plan assumed 48B).
+- `PendingDecodeSpan`: ~~`64B`~~ → **`32B`** (`src/engine/work_items.rs`). **DONE**: packed alongside WorkItem.
+- `PendingWindow`: `32B` (`src/engine/work_items.rs`), already tight.
 - `HitAccPool`: `144B` header (`src/engine/hit_pool.rs`), backing vectors dominate runtime memory.
 - `Engine`: `640B` (`src/engine/core.rs`), not first optimization priority.
+- `ScanScratch` hot/cold split: **SKIPPED** — end-to-end binary scans showed no >1% improvement from WorkItem+VsStreamWindow packing, indicating the bottleneck is elsewhere. Gate condition not met.
 
 ## Public API / Type Changes
 - Breaking API changes are allowed for this work.

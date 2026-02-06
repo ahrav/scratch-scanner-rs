@@ -521,7 +521,7 @@ The overlap ensures patterns that span chunk boundaries are detected:
 ```rust
 pub struct ScanScratch {
     out: Vec<FindingRec>,           // Output findings
-    work_q: Vec<WorkItem>,          // Transform work queue
+    work_q: Vec<WorkItem>,          // Transform work queue (40B/item, packed flat struct)
     work_head: usize,               // Current work item index
     slab: DecodeSlab,               // Decoded buffer storage
     seen: FixedSet128,              // Deduplication set

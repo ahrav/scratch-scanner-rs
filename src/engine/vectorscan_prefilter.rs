@@ -206,6 +206,11 @@ impl VsScratch {
     }
 }
 
+// SAFETY: VsScratch exclusively owns its hs_scratch_t allocation.
+// Transfer to another thread is safe; concurrent use is not (we don't impl Sync).
+// Same ownership model as VsPrefilterDb/VsStreamDb Send impls above.
+unsafe impl Send for VsScratch {}
+
 /// Opaque stream handle for stream-mode scanning.
 ///
 /// Must be closed with `close_stream` to flush end-of-stream matches.
@@ -401,7 +406,10 @@ impl VsStreamDb {
     }
 }
 
-/// Stream match event used by decoded-byte scanning.
+/// Stream match event used by decoded-byte scanning (32 bytes, `#[repr(C)]`).
+///
+/// Produced by Vectorscan stream callbacks and consumed by `decode_stream_and_scan`
+/// to drive windowed rule validation on decoded byte streams.
 ///
 /// `lo`/`hi` bound the candidate window (decoded-byte offsets, half-open
 /// `[lo, hi)`) to verify.
@@ -412,16 +420,23 @@ impl VsStreamDb {
 ///
 /// `anchor_hint` is Vectorscan's `from` match offset, preserved to start regex
 /// searches near the anchor instead of at window start.
+///
+/// # Layout
+/// Fields are ordered largest-first (`u64` before `u32` before `u8`) under
+/// `#[repr(C)]` to eliminate internal alignment padding (32B vs 40B naive).
 #[repr(C)]
 pub(crate) struct VsStreamWindow {
-    pub(crate) rule_id: u32,
     pub(crate) lo: u64,
     pub(crate) hi: u64,
-    pub(crate) variant_idx: u8,
-    pub(crate) force_full: bool,
     /// Anchor hint from Vectorscan's `from` offset.
     pub(crate) anchor_hint: u64,
+    pub(crate) rule_id: u32,
+    pub(crate) variant_idx: u8,
+    pub(crate) force_full: bool,
+    // 2B tail padding
 }
+
+const _: () = assert!(std::mem::size_of::<VsStreamWindow>() == 32);
 
 /// Callback context for stream-mode scans on decoded byte streams.
 ///

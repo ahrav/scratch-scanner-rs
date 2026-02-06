@@ -666,6 +666,16 @@ impl RingChunker {
     }
 }
 
+// Compile-time assertion: EngineAdapter must be Send so it can be pooled
+// across scoped thread boundaries (same pattern as PackCache/PackExecScratch).
+#[cfg(test)]
+const _: () = {
+    fn assert_send<T: Send>() {}
+    fn check() {
+        assert_send::<super::EngineAdapter<'_>>();
+    }
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
