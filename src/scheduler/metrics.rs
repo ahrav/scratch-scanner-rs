@@ -1,7 +1,9 @@
 //! # Metrics Module
 //!
 //! Cheap, deterministic metrics collection for scheduler observability.
-//! Metrics recording is always enabled for scheduler counters.
+//! Metrics recording is enabled only with
+//! `all(feature = "perf-stats", debug_assertions)`.
+//! Outside that mode, update paths are no-ops and snapshots stay zeroed.
 //!
 //! ## Design
 //!
@@ -66,6 +68,11 @@ impl Default for Log2Hist {
 }
 
 impl Log2Hist {
+    #[inline(always)]
+    fn recording_enabled() -> bool {
+        cfg!(all(feature = "perf-stats", debug_assertions))
+    }
+
     /// Create a new empty histogram.
     pub fn new() -> Self {
         Self {
@@ -83,6 +90,10 @@ impl Log2Hist {
     /// - ~3-5 cycles on modern x86-64
     #[inline(always)]
     pub fn record(&mut self, v: u64) {
+        if !Self::recording_enabled() {
+            let _ = v;
+            return;
+        }
         let b = bucket_index(v);
         // SAFETY: bucket_index always returns 0..63 (see its implementation).
         // The index is derived from leading_zeros which is 0..64 for u64,
@@ -101,6 +112,10 @@ impl Log2Hist {
     /// Same as `record()` - useful when you have a count of events at the same value.
     #[inline(always)]
     pub fn record_n(&mut self, v: u64, n: u64) {
+        if !Self::recording_enabled() {
+            let _ = (v, n);
+            return;
+        }
         if n == 0 {
             return;
         }
@@ -176,6 +191,10 @@ impl Log2Hist {
 
     /// Merge another histogram into this one.
     pub fn merge(&mut self, other: &Log2Hist) {
+        if !Self::recording_enabled() {
+            let _ = other;
+            return;
+        }
         for i in 0..64 {
             self.buckets[i] = self.buckets[i].wrapping_add(other.buckets[i]);
         }
@@ -419,6 +438,11 @@ pub struct MetricsSnapshot {
 }
 
 impl MetricsSnapshot {
+    #[inline(always)]
+    fn recording_enabled() -> bool {
+        cfg!(all(feature = "perf-stats", debug_assertions))
+    }
+
     /// Create a new empty snapshot.
     pub fn new() -> Self {
         Self {
@@ -452,6 +476,10 @@ impl MetricsSnapshot {
     ///
     /// O(1) for counters + O(64) for histogram merge. Total ~70 additions.
     pub fn merge_worker(&mut self, w: &WorkerMetricsLocal) {
+        if !Self::recording_enabled() {
+            let _ = w;
+            return;
+        }
         self.tasks_enqueued = self.tasks_enqueued.wrapping_add(w.tasks_enqueued);
         self.tasks_executed = self.tasks_executed.wrapping_add(w.tasks_executed);
         self.bytes_scanned = self.bytes_scanned.wrapping_add(w.bytes_scanned);
@@ -580,6 +608,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "perf-stats", debug_assertions))]
     fn log2_hist_basic() {
         let mut h = Log2Hist::new();
         h.record(0);
@@ -595,6 +624,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "perf-stats", debug_assertions))]
     fn log2_hist_record_n() {
         let mut h = Log2Hist::new();
         h.record_n(100, 5); // 5 values of 100
@@ -605,6 +635,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "perf-stats", debug_assertions))]
     fn log2_hist_percentile_bounds() {
         let mut h = Log2Hist::new();
         // 100 values around 10
@@ -636,6 +667,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "perf-stats", debug_assertions))]
     fn log2_hist_merge() {
         let mut h1 = Log2Hist::new();
         let mut h2 = Log2Hist::new();
@@ -678,6 +710,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "perf-stats", debug_assertions))]
     fn snapshot_merge_workers() {
         let mut w1 = WorkerMetricsLocal::new();
         let mut w2 = WorkerMetricsLocal::new();

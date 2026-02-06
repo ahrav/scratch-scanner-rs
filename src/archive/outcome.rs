@@ -348,7 +348,8 @@ impl ArchiveSampleRing {
 /// # Guarantees
 /// - Counters are monotonic (wrapping on overflow).
 /// - Arrays are indexed by the stable reason discriminants.
-/// - Recording/merge operations always mutate the counters.
+/// - Recording/merge operations mutate counters only when
+///   `all(feature = "perf-stats", debug_assertions)` is enabled.
 #[derive(Clone, Copy, Debug)]
 pub struct ArchiveStats {
     pub archives_seen: u64,
@@ -389,6 +390,11 @@ impl Default for ArchiveStats {
 }
 
 impl ArchiveStats {
+    #[inline(always)]
+    fn recording_enabled() -> bool {
+        cfg!(all(feature = "perf-stats", debug_assertions))
+    }
+
     #[inline]
     pub fn has_activity(&self) -> bool {
         self.archives_seen != 0
@@ -404,11 +410,17 @@ impl ArchiveStats {
 
     #[inline]
     pub fn record_archive_seen(&mut self) {
+        if !Self::recording_enabled() {
+            return;
+        }
         self.archives_seen = self.archives_seen.wrapping_add(1);
     }
 
     #[inline]
     pub fn record_archive_scanned(&mut self) {
+        if !Self::recording_enabled() {
+            return;
+        }
         self.archives_scanned = self.archives_scanned.wrapping_add(1);
     }
 
@@ -419,6 +431,10 @@ impl ArchiveStats {
         display_path: &[u8],
         sample: bool,
     ) {
+        if !Self::recording_enabled() {
+            let _ = (reason, display_path, sample);
+            return;
+        }
         self.archives_skipped = self.archives_skipped.wrapping_add(1);
         let idx = reason.as_usize();
         self.archive_skip_reasons[idx] = self.archive_skip_reasons[idx].wrapping_add(1);
@@ -436,6 +452,10 @@ impl ArchiveStats {
         display_path: &[u8],
         sample: bool,
     ) {
+        if !Self::recording_enabled() {
+            let _ = (reason, display_path, sample);
+            return;
+        }
         self.archives_partial = self.archives_partial.wrapping_add(1);
         let idx = reason.as_usize();
         self.partial_reasons[idx] = self.partial_reasons[idx].wrapping_add(1);
@@ -448,6 +468,9 @@ impl ArchiveStats {
 
     #[inline]
     pub fn record_entry_scanned(&mut self) {
+        if !Self::recording_enabled() {
+            return;
+        }
         self.entries_scanned = self.entries_scanned.wrapping_add(1);
     }
 
@@ -458,6 +481,10 @@ impl ArchiveStats {
         display_path: &[u8],
         sample: bool,
     ) {
+        if !Self::recording_enabled() {
+            let _ = (reason, display_path, sample);
+            return;
+        }
         self.entries_skipped = self.entries_skipped.wrapping_add(1);
         let idx = reason.as_usize();
         self.entry_skip_reasons[idx] = self.entry_skip_reasons[idx].wrapping_add(1);
@@ -475,6 +502,10 @@ impl ArchiveStats {
         display_path: &[u8],
         sample: bool,
     ) {
+        if !Self::recording_enabled() {
+            let _ = (reason, display_path, sample);
+            return;
+        }
         let idx = reason.as_usize();
         self.partial_reasons[idx] = self.partial_reasons[idx].wrapping_add(1);
 
@@ -486,16 +517,25 @@ impl ArchiveStats {
 
     #[inline]
     pub fn record_path_truncated(&mut self) {
+        if !Self::recording_enabled() {
+            return;
+        }
         self.paths_truncated = self.paths_truncated.wrapping_add(1);
     }
 
     #[inline]
     pub fn record_path_had_traversal(&mut self) {
+        if !Self::recording_enabled() {
+            return;
+        }
         self.paths_had_traversal = self.paths_had_traversal.wrapping_add(1);
     }
 
     #[inline]
     pub fn record_component_cap_exceeded(&mut self) {
+        if !Self::recording_enabled() {
+            return;
+        }
         self.paths_component_cap_exceeded = self.paths_component_cap_exceeded.wrapping_add(1);
     }
 
@@ -504,6 +544,10 @@ impl ArchiveStats {
     /// All counters are merged via wrapping addition; samples respect the
     /// local `ARCHIVE_SAMPLE_MAX` capacity.
     pub fn merge_from(&mut self, other: &ArchiveStats) {
+        if !Self::recording_enabled() {
+            let _ = other;
+            return;
+        }
         self.archives_seen = self.archives_seen.wrapping_add(other.archives_seen);
         self.archives_scanned = self.archives_scanned.wrapping_add(other.archives_scanned);
         self.archives_skipped = self.archives_skipped.wrapping_add(other.archives_skipped);

@@ -964,6 +964,10 @@ pub fn run_git_scan(
     )?;
 
     let midx_result = acquire_midx(&mut repo, &config.artifact_build)?;
+    // Fail fast if maintenance races with in-memory artifact build.
+    if !repo.artifacts_unchanged()? {
+        return Err(GitScanError::ConcurrentMaintenance);
+    }
     let midx_view = MidxView::parse(midx_result.bytes.as_slice(), repo.object_format)?;
     let cg = acquire_commit_graph(
         &repo,

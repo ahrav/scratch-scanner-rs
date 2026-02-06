@@ -2689,6 +2689,25 @@ mod tests {
         }
     }
 
+    fn assert_perf_u64(actual: u64, expected: u64) {
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            assert_eq!(actual, expected);
+        } else {
+            assert_eq!(actual, 0);
+        }
+    }
+
+    fn assert_perf_ge(actual: u64, min_expected: u64) {
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            assert!(
+                actual >= min_expected,
+                "expected >= {min_expected}, got {actual}"
+            );
+        } else {
+            assert_eq!(actual, 0);
+        }
+    }
+
     #[test]
     fn zip_budget_clamp_charges_discarded_bytes() {
         let cfg = ArchiveConfig {
@@ -2741,8 +2760,8 @@ mod tests {
 
         let report = scan_local(engine, source, small_config(), sink.clone());
 
-        assert_eq!(report.stats.files_enqueued, 1);
-        assert!(report.metrics.chunks_scanned >= 1);
+        assert_perf_u64(report.stats.files_enqueued, 1);
+        assert_perf_ge(report.metrics.chunks_scanned, 1);
 
         let output = sink.take();
         let output_str = String::from_utf8_lossy(&output);
@@ -2761,7 +2780,7 @@ mod tests {
 
         let report = scan_local(engine, source, small_config(), sink.clone());
 
-        assert_eq!(report.stats.files_enqueued, 1);
+        assert_perf_u64(report.stats.files_enqueued, 1);
         assert!(sink.take().is_empty());
     }
 
@@ -2782,8 +2801,8 @@ mod tests {
 
         let report = scan_local(engine, source, cfg, sink.clone());
 
-        assert_eq!(report.stats.files_enqueued, 1);
-        assert_eq!(report.metrics.bytes_scanned, 0);
+        assert_perf_u64(report.stats.files_enqueued, 1);
+        assert_perf_u64(report.metrics.bytes_scanned, 0);
         assert!(sink.take().is_empty());
     }
 
@@ -2796,8 +2815,8 @@ mod tests {
 
         let report = scan_local(engine, source, small_config(), sink.clone());
 
-        assert_eq!(report.stats.files_enqueued, 0);
-        assert_eq!(report.metrics.chunks_scanned, 0);
+        assert_perf_u64(report.stats.files_enqueued, 0);
+        assert_perf_u64(report.metrics.chunks_scanned, 0);
     }
 
     #[test]
@@ -2821,10 +2840,7 @@ mod tests {
 
         let report = scan_local(engine, source, small_config(), sink.clone());
 
-        assert!(
-            report.metrics.chunks_scanned >= 2,
-            "should need multiple chunks"
-        );
+        assert_perf_ge(report.metrics.chunks_scanned, 2);
 
         let output = sink.take();
         let output_str = String::from_utf8_lossy(&output);
@@ -2861,7 +2877,7 @@ mod tests {
 
         let report = scan_local(engine, source, small_config(), sink.clone());
 
-        assert_eq!(report.stats.files_enqueued, 5);
+        assert_perf_u64(report.stats.files_enqueued, 5);
 
         let output = sink.take();
         let output_str = String::from_utf8_lossy(&output);
@@ -2913,7 +2929,7 @@ mod tests {
         let report = scan_local(engine, source, small_config(), sink);
 
         // bytes_scanned should be ~1000 (the actual payload scanned)
-        assert!(report.metrics.bytes_scanned >= 1000);
+        assert_perf_ge(report.metrics.bytes_scanned, 1000);
     }
 
     #[test]
@@ -2932,12 +2948,21 @@ mod tests {
 
         let report = scan_local(engine, source, cfg, sink);
 
-        assert_eq!(report.metrics.archive.archives_seen, 1);
-        assert_eq!(report.metrics.archive.archives_partial, 1);
-        assert_eq!(
-            report.metrics.archive.partial_reasons[PartialReason::MalformedZip.as_usize()],
-            1
-        );
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            assert_eq!(report.metrics.archive.archives_seen, 1);
+            assert_eq!(report.metrics.archive.archives_partial, 1);
+            assert_eq!(
+                report.metrics.archive.partial_reasons[PartialReason::MalformedZip.as_usize()],
+                1
+            );
+        } else {
+            assert_eq!(report.metrics.archive.archives_seen, 0);
+            assert_eq!(report.metrics.archive.archives_partial, 0);
+            assert_eq!(
+                report.metrics.archive.partial_reasons[PartialReason::MalformedZip.as_usize()],
+                0
+            );
+        }
     }
 
     #[test]
@@ -2956,7 +2981,7 @@ mod tests {
 
         let report = scan_local(engine, source, cfg, sink.clone());
 
-        assert_eq!(report.metrics.archive.archives_seen, 0);
+        assert_perf_u64(report.metrics.archive.archives_seen, 0);
 
         let output = sink.take();
         let output_str = String::from_utf8_lossy(&output);

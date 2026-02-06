@@ -279,6 +279,11 @@ impl CacheRejectHistogram {
 }
 
 impl PackExecStats {
+    #[inline(always)]
+    fn recording_enabled() -> bool {
+        cfg!(all(feature = "perf-stats", debug_assertions))
+    }
+
     #[inline]
     fn record_cache_reject(&mut self, size: usize) {
         perf_stats::sat_add_u32(&mut self.cache_insert_rejects, 1);
@@ -291,6 +296,10 @@ impl PackExecStats {
 
     #[inline]
     fn merge_from(&mut self, other: &PackExecStats) {
+        if !Self::recording_enabled() {
+            let _ = other;
+            return;
+        }
         self.decoded_offsets = self.decoded_offsets.saturating_add(other.decoded_offsets);
         self.emitted_candidates = self
             .emitted_candidates
@@ -391,6 +400,10 @@ fn record_fallback_chain(stats: &mut PackExecStats, chain_len: usize) {
 /// Aggregate cache reject histogram across pack-exec reports.
 #[must_use]
 pub fn aggregate_cache_reject_histogram(reports: &[PackExecReport]) -> CacheRejectHistogram {
+    if !cfg!(all(feature = "perf-stats", debug_assertions)) {
+        let _ = reports;
+        return CacheRejectHistogram::default();
+    }
     let mut out = CacheRejectHistogram::default();
     for report in reports {
         let stats = &report.stats;
@@ -2088,6 +2101,22 @@ mod tests {
         }
     }
 
+    fn assert_perf_u32(actual: u32, expected: u32) {
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            assert_eq!(actual, expected);
+        } else {
+            assert_eq!(actual, 0);
+        }
+    }
+
+    fn assert_perf_u64(actual: u64, expected: u64) {
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            assert_eq!(actual, expected);
+        } else {
+            assert_eq!(actual, 0);
+        }
+    }
+
     #[test]
     fn merge_fast_path_emits_single_candidate() {
         let (pack, offsets) = build_pack(&[(ObjectKind::Blob, b"hello")]);
@@ -2126,7 +2155,7 @@ mod tests {
             &mut sink,
         );
 
-        assert_eq!(report.stats.emitted_candidates, 1);
+        assert_perf_u32(report.stats.emitted_candidates, 1);
         assert_eq!(sink.emitted.len(), 1);
     }
 
@@ -2170,9 +2199,9 @@ mod tests {
             &mut sink,
         );
 
-        assert_eq!(report.stats.emitted_candidates, 1);
-        assert_eq!(report.stats.large_blob_spilled_count, 1);
-        assert_eq!(report.stats.large_blob_bytes, data.len() as u64);
+        assert_perf_u32(report.stats.emitted_candidates, 1);
+        assert_perf_u32(report.stats.large_blob_spilled_count, 1);
+        assert_perf_u64(report.stats.large_blob_bytes, data.len() as u64);
         assert_eq!(
             sink.blobs.get(&candidate.oid).map(|b| b.as_slice()),
             Some(data.as_slice())
@@ -2254,9 +2283,9 @@ mod tests {
             &mut sink,
         );
 
-        assert_eq!(report.stats.emitted_candidates, 1);
-        assert_eq!(report.stats.large_blob_spilled_count, 1);
-        assert_eq!(report.stats.large_blob_bytes, result_bytes.len() as u64);
+        assert_perf_u32(report.stats.emitted_candidates, 1);
+        assert_perf_u32(report.stats.large_blob_spilled_count, 1);
+        assert_perf_u64(report.stats.large_blob_bytes, result_bytes.len() as u64);
         assert_eq!(
             sink.blobs.get(&candidate.oid).map(|b| b.as_slice()),
             Some(result_bytes.as_slice())
@@ -2315,7 +2344,7 @@ mod tests {
             &mut sink,
         );
 
-        assert_eq!(report.stats.emitted_candidates, 2);
+        assert_perf_u32(report.stats.emitted_candidates, 2);
         assert_eq!(sink.emitted.len(), 2);
     }
 
@@ -2357,7 +2386,7 @@ mod tests {
             &mut sink,
         );
 
-        assert_eq!(report.stats.emitted_candidates, 0);
+        assert_perf_u32(report.stats.emitted_candidates, 0);
         assert_eq!(report.skips.len(), 1);
         assert!(matches!(report.skips[0].reason, SkipReason::NotBlob));
     }
@@ -2414,7 +2443,7 @@ mod tests {
             &mut sink,
         );
 
-        assert_eq!(report.stats.emitted_candidates, 2);
+        assert_perf_u32(report.stats.emitted_candidates, 2);
         assert_eq!(
             sink.emitted,
             vec![OidBytes::sha1([0x22; 20]), OidBytes::sha1([0x11; 20])]
@@ -2590,7 +2619,7 @@ mod tests {
             &candidate_ranges,
         );
 
-        assert_eq!(report.stats.emitted_candidates, 1);
+        assert_perf_u32(report.stats.emitted_candidates, 1);
         assert_eq!(sink.emitted, vec![OidBytes::sha1([0x66; 20])]);
     }
 
@@ -2666,7 +2695,7 @@ mod tests {
             &mut sink,
         );
 
-        assert_eq!(report.stats.emitted_candidates, 0);
+        assert_perf_u32(report.stats.emitted_candidates, 0);
         assert!(report.skips.iter().any(|skip| {
             matches!(skip.reason, SkipReason::Decode(PackDecodeError::Inflate(_)))
         }));
@@ -2747,7 +2776,7 @@ mod tests {
             &mut sink,
         );
 
-        assert_eq!(report.stats.emitted_candidates, 1);
+        assert_perf_u32(report.stats.emitted_candidates, 1);
         assert_eq!(
             sink.blobs.get(&candidate.oid).map(|b| b.as_slice()),
             Some(result_bytes.as_slice())
@@ -2828,7 +2857,7 @@ mod tests {
             &mut sink,
         );
 
-        assert_eq!(report.stats.emitted_candidates, 1);
+        assert_perf_u32(report.stats.emitted_candidates, 1);
         assert_eq!(
             sink.blobs.get(&candidate.oid).map(|b| b.as_slice()),
             Some(result_bytes.as_slice())
@@ -2928,7 +2957,7 @@ mod tests {
             &mut sink,
         );
 
-        assert_eq!(report.stats.emitted_candidates, 1);
+        assert_perf_u32(report.stats.emitted_candidates, 1);
         assert_eq!(
             sink.blobs.get(&candidate.oid).map(|b| b.as_slice()),
             Some(result_bytes.as_slice())
@@ -2980,7 +3009,7 @@ mod tests {
             &mut sink,
         );
 
-        assert_eq!(report.stats.emitted_candidates, 0);
+        assert_perf_u32(report.stats.emitted_candidates, 0);
         assert!(matches!(
             report.skips[0].reason,
             SkipReason::Decode(PackDecodeError::Inflate(_))
@@ -3031,7 +3060,7 @@ mod tests {
             &mut sink,
         );
 
-        assert_eq!(report.stats.emitted_candidates, 0);
+        assert_perf_u32(report.stats.emitted_candidates, 0);
         assert!(matches!(
             report.skips[0].reason,
             SkipReason::Decode(PackDecodeError::PackParse(_))
@@ -3151,7 +3180,7 @@ run with --test-threads=1 to enable"
             &mut adapter,
         );
 
-        assert_eq!(report.stats.emitted_candidates, 1);
+        assert_perf_u32(report.stats.emitted_candidates, 1);
         let scanned = adapter.take_results();
         assert_eq!(scanned.blobs.len(), 1);
         assert!(!scanned.finding_arena.is_empty());

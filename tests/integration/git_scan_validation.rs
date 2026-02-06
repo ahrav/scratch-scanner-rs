@@ -19,6 +19,10 @@ use scanner_rs::git_scan::{
 use scanner_rs::{demo_tuning, AnchorPolicy, Engine, Gate, RuleSpec, TransformConfig, TransformId};
 use scanner_rs::{TransformMode, ValidatorKind};
 
+fn perf_stats_enabled() -> bool {
+    cfg!(all(feature = "perf-stats", debug_assertions))
+}
+
 /// Returns true when the `git` CLI is available on the host.
 fn git_available() -> bool {
     Command::new("git").arg("--version").output().is_ok()
@@ -248,7 +252,11 @@ fn loose_only_candidate_scans_complete() {
     let GitScanResult(report) = result;
     assert_eq!(report.finalize.outcome, FinalizeOutcome::Complete);
     assert!(report.skipped_candidates.is_empty());
-    assert!(report.finalize.stats.total_findings >= 1);
+    if perf_stats_enabled() {
+        assert!(report.finalize.stats.total_findings >= 1);
+    } else {
+        assert_eq!(report.finalize.stats.total_findings, 0);
+    }
 }
 
 #[test]
@@ -302,7 +310,11 @@ fn packed_and_loose_candidates_scan_complete() {
     let GitScanResult(report) = result;
     assert_eq!(report.finalize.outcome, FinalizeOutcome::Complete);
     assert!(report.skipped_candidates.is_empty());
-    assert!(report.finalize.stats.total_findings >= 2);
+    if perf_stats_enabled() {
+        assert!(report.finalize.stats.total_findings >= 2);
+    } else {
+        assert_eq!(report.finalize.stats.total_findings, 0);
+    }
 }
 
 #[test]

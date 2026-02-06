@@ -15,6 +15,10 @@ use scanner_rs::git_scan::{
 };
 use scanner_rs::git_scan::{ExternalBase, ExternalBaseProvider, PackExecError, PackObjectSink};
 
+fn perf_stats_enabled() -> bool {
+    cfg!(all(feature = "perf-stats", debug_assertions))
+}
+
 /// External base provider that always reports missing bases.
 struct NoExternalBases {
     calls: u32,
@@ -224,7 +228,11 @@ fn pack_exec_matches_git_cat_file() {
     .unwrap();
 
     assert_eq!(report.stats.external_base_calls, external.calls);
-    assert!(report.stats.emitted_candidates > 0);
+    if perf_stats_enabled() {
+        assert!(report.stats.emitted_candidates > 0);
+    } else {
+        assert_eq!(report.stats.emitted_candidates, 0);
+    }
 
     for (oid, _) in sample {
         let hex = to_hex(oid.as_slice());

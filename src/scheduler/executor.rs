@@ -1068,6 +1068,14 @@ mod tests {
         }
     }
 
+    fn assert_perf_metric_u64(actual: u64, expected: u64) {
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            assert_eq!(actual, expected);
+        } else {
+            assert_eq!(actual, 0);
+        }
+    }
+
     #[test]
     fn executor_runs_all_external_tasks() {
         let counter = Arc::new(AtomicUsize::new(0));
@@ -1088,7 +1096,7 @@ mod tests {
 
         let metrics = ex.join();
         assert_eq!(counter.load(Ordering::Relaxed), n);
-        assert_eq!(metrics.tasks_executed, n as u64);
+        assert_perf_metric_u64(metrics.tasks_executed, n as u64);
     }
 
     #[test]
@@ -1110,7 +1118,7 @@ mod tests {
 
         let metrics = ex.join();
         assert_eq!(counter.load(Ordering::Relaxed), n);
-        assert_eq!(metrics.tasks_executed, n as u64);
+        assert_perf_metric_u64(metrics.tasks_executed, n as u64);
     }
 
     #[test]
@@ -1145,7 +1153,7 @@ mod tests {
 
         // 1 root + 10_000 children
         assert_eq!(counter.load(Ordering::Relaxed), 10_001);
-        assert_eq!(metrics.tasks_executed, 10_001);
+        assert_perf_metric_u64(metrics.tasks_executed, 10_001);
     }
 
     #[test]
@@ -1259,7 +1267,7 @@ mod tests {
         }
 
         let metrics = ex.join();
-        assert_eq!(metrics.tasks_executed, 1000);
+        assert_perf_metric_u64(metrics.tasks_executed, 1000);
         // With 4 workers and 1000 tasks, there should be some stealing
         // (not guaranteed, but highly likely)
     }

@@ -565,7 +565,7 @@ impl BlobIntroducer {
             cursor,
             in_flight_len,
         });
-        self.stats.max_depth_reached = self.stats.max_depth_reached.max(self.stack.len() as u16);
+        perf_stats::max_u16(&mut self.stats.max_depth_reached, self.stack.len() as u16);
         Ok(())
     }
 

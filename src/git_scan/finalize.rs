@@ -623,6 +623,14 @@ mod tests {
         }
     }
 
+    fn assert_perf_u64(actual: u64, expected: u64) {
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            assert_eq!(actual, expected);
+        } else {
+            assert_eq!(actual, 0);
+        }
+    }
+
     #[test]
     fn complete_run_produces_all_ops() {
         let mut arena = ByteArena::with_capacity(1024);
@@ -691,7 +699,7 @@ mod tests {
         };
 
         let out = build_finalize_ops(input);
-        assert_eq!(out.stats.unique_blobs, 1);
+        assert_perf_u64(out.stats.unique_blobs, 1);
 
         let ctx_op = out
             .data_ops
@@ -775,8 +783,8 @@ mod tests {
         };
 
         let out = build_finalize_ops(input);
-        assert_eq!(out.stats.total_findings, 1);
-        assert_eq!(out.stats.findings_deduped, 1);
+        assert_perf_u64(out.stats.total_findings, 1);
+        assert_perf_u64(out.stats.findings_deduped, 1);
     }
 
     #[test]
@@ -808,8 +816,8 @@ mod tests {
         };
 
         let out = build_finalize_ops(input);
-        assert_eq!(out.stats.total_findings, 3);
-        assert_eq!(out.stats.findings_deduped, 0);
+        assert_perf_u64(out.stats.total_findings, 3);
+        assert_perf_u64(out.stats.findings_deduped, 0);
     }
 
     #[test]

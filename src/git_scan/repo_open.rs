@@ -153,8 +153,8 @@ impl RepoArtifactFingerprint {
         }
 
         // Collect and sort pack/idx file metadata for deterministic hashing
-        let mut pack_entries: Vec<(Vec<u8>, u64, u64)> = Vec::new();
-        let mut idx_entries: Vec<(Vec<u8>, u64, u64)> = Vec::new();
+        let mut pack_entries: Vec<(Vec<u8>, u64, i64)> = Vec::new();
+        let mut idx_entries: Vec<(Vec<u8>, u64, i64)> = Vec::new();
 
         for pack_dir in &pack_dirs {
             let entries = match fs::read_dir(pack_dir) {
@@ -175,12 +175,7 @@ impl RepoArtifactFingerprint {
                 let ext = path.extension().and_then(|e| e.to_str());
 
                 let metadata = entry.metadata().map_err(RepoOpenError::io)?;
-                let mtime = metadata
-                    .modified()
-                    .map_err(RepoOpenError::io)?
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
+                let mtime = mtime_epoch_seconds(metadata.modified().map_err(RepoOpenError::io)?);
 
                 let basename = file_name.as_encoded_bytes().to_vec();
                 let size = metadata.len();
@@ -218,6 +213,14 @@ impl RepoArtifactFingerprint {
             packs_hash,
             idx_hash,
         })
+    }
+}
+
+#[inline]
+fn mtime_epoch_seconds(mtime: std::time::SystemTime) -> i64 {
+    match mtime.duration_since(std::time::UNIX_EPOCH) {
+        Ok(delta) => delta.as_secs().min(i64::MAX as u64) as i64,
+        Err(err) => -(err.duration().as_secs().min(i64::MAX as u64) as i64),
     }
 }
 
@@ -610,4 +613,22 @@ fn read_bounded_file(path: &Path, max_bytes: u32) -> Result<Vec<u8>, RepoOpenErr
 #[inline]
 fn is_file(path: &Path) -> bool {
     fs::metadata(path).map(|m| m.is_file()).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mtime_epoch_seconds;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn mtime_epoch_seconds_preserves_post_epoch_values() {
+        let t = UNIX_EPOCH + Duration::from_secs(42);
+        assert_eq!(mtime_epoch_seconds(t), 42);
+    }
+
+    #[test]
+    fn mtime_epoch_seconds_preserves_pre_epoch_values() {
+        let t = UNIX_EPOCH - Duration::from_secs(7);
+        assert_eq!(mtime_epoch_seconds(t), -7);
+    }
 }

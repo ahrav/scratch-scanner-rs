@@ -760,10 +760,13 @@ where
 
     /// Looks up `key` and returns its slot index, updating counters on hit/miss.
     pub fn get_index(&self, key: C::Key) -> Option<usize> {
+        let metrics_enabled = cfg!(all(feature = "perf-stats", debug_assertions));
         let set = self.associate(key);
         if let Some(way) = self.search(set, key) {
-            let metrics = self.metric_ref();
-            metrics.hits.set(metrics.hits.get() + 1);
+            if metrics_enabled {
+                let metrics = self.metric_ref();
+                metrics.hits.set(metrics.hits.get() + 1);
+            }
 
             let idx = set.offset + way as u64;
             let count = self.counts_get(idx);
@@ -771,8 +774,10 @@ where
             self.counts_set(idx, next);
             Some(Self::index_usize(idx))
         } else {
-            let metrics = self.metric_ref();
-            metrics.misses.set(metrics.misses.get() + 1);
+            if metrics_enabled {
+                let metrics = self.metric_ref();
+                metrics.misses.set(metrics.misses.get() + 1);
+            }
             None
         }
     }

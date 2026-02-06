@@ -883,8 +883,8 @@ mod tests {
 
                     // Simulate scanning: touch bytes
                     b.as_mut_slice()[..n].fill(0xAB);
-                    ctx.metrics.bytes_scanned = ctx.metrics.bytes_scanned.saturating_add(n as u64);
-                    ctx.metrics.chunks_scanned = ctx.metrics.chunks_scanned.saturating_add(1);
+                    crate::perf_stats::sat_add_u64(&mut ctx.metrics.bytes_scanned, n as u64);
+                    crate::perf_stats::sat_add_u64(&mut ctx.metrics.chunks_scanned, 1);
 
                     // Track unique backing pointers to prove reuse
                     let ptr = b.ptr_usize();
@@ -916,7 +916,12 @@ mod tests {
         );
 
         // Validate: work was done
-        assert_eq!(metrics.chunks_scanned, tasks as u64);
-        assert_eq!(metrics.bytes_scanned, (tasks * 1024) as u64);
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            assert_eq!(metrics.chunks_scanned, tasks as u64);
+            assert_eq!(metrics.bytes_scanned, (tasks * 1024) as u64);
+        } else {
+            assert_eq!(metrics.chunks_scanned, 0);
+            assert_eq!(metrics.bytes_scanned, 0);
+        }
     }
 }

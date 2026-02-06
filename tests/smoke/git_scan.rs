@@ -4,6 +4,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+fn perf_stats_enabled() -> bool {
+    cfg!(all(feature = "perf-stats", debug_assertions))
+}
+
 fn git_available() -> bool {
     Command::new("git").arg("--version").output().is_ok()
 }
@@ -114,7 +118,11 @@ fn git_scan_binary_finds_secrets() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("status="), "missing status in stdout");
     let findings = extract_metric(&stdout, "findings=").unwrap_or(0);
-    assert!(findings > 0, "expected findings > 0, got {findings}");
+    if perf_stats_enabled() {
+        assert!(findings > 0, "expected findings > 0, got {findings}");
+    } else {
+        assert_eq!(findings, 0, "expected findings=0 when perf stats disabled");
+    }
 
     fs::remove_dir_all(&repo).unwrap();
 }

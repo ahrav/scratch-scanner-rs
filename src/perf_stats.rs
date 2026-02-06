@@ -2,6 +2,9 @@
 //!
 //! These helpers centralize saturating/wrapping/max/set update patterns so
 //! hot paths stay concise and consistent.
+//! They only mutate counters when
+//! `all(feature = "perf-stats", debug_assertions)` is enabled; otherwise all
+//! helpers compile to no-ops.
 //!
 //! # Why wrapping vs. saturating?
 //!
@@ -17,19 +20,53 @@
 /// Saturating add for a `u64` counter.
 #[inline(always)]
 pub fn sat_add_u64(counter: &mut u64, delta: u64) {
-    *counter = counter.saturating_add(delta);
+    #[cfg(all(feature = "perf-stats", debug_assertions))]
+    {
+        *counter = counter.saturating_add(delta);
+    }
+    #[cfg(not(all(feature = "perf-stats", debug_assertions)))]
+    {
+        let _ = (counter, delta);
+    }
 }
 
 /// Saturating add for a `u32` counter.
 #[inline(always)]
 pub fn sat_add_u32(counter: &mut u32, delta: u32) {
-    *counter = counter.saturating_add(delta);
+    #[cfg(all(feature = "perf-stats", debug_assertions))]
+    {
+        *counter = counter.saturating_add(delta);
+    }
+    #[cfg(not(all(feature = "perf-stats", debug_assertions)))]
+    {
+        let _ = (counter, delta);
+    }
 }
 
 /// Saturating add for a `usize` counter.
 #[inline(always)]
 pub fn sat_add_usize(counter: &mut usize, delta: usize) {
-    *counter = counter.saturating_add(delta);
+    #[cfg(all(feature = "perf-stats", debug_assertions))]
+    {
+        *counter = counter.saturating_add(delta);
+    }
+    #[cfg(not(all(feature = "perf-stats", debug_assertions)))]
+    {
+        let _ = (counter, delta);
+    }
+}
+
+/// Saturating add for a `u16` counter.
+#[inline(always)]
+pub fn sat_add_u16(counter: &mut u16, delta: u16) {
+    #[cfg(all(feature = "perf-stats", debug_assertions))]
+    {
+        *counter = counter.saturating_add(delta);
+    }
+    #[cfg(not(all(feature = "perf-stats", debug_assertions)))]
+    {
+        let _ = (counter, delta);
+    }
 }
 
 /// Wrapping add for a `u64` counter.
@@ -39,19 +76,53 @@ pub fn sat_add_usize(counter: &mut usize, delta: usize) {
 /// under wrap-around (e.g. cumulative finding counts).
 #[inline(always)]
 pub fn wrap_add_u64(counter: &mut u64, delta: u64) {
-    *counter = counter.wrapping_add(delta);
+    #[cfg(all(feature = "perf-stats", debug_assertions))]
+    {
+        *counter = counter.wrapping_add(delta);
+    }
+    #[cfg(not(all(feature = "perf-stats", debug_assertions)))]
+    {
+        let _ = (counter, delta);
+    }
 }
 
 /// High-water-mark update for a `u64` counter.
 #[inline(always)]
 pub fn max_u64(counter: &mut u64, value: u64) {
-    *counter = (*counter).max(value);
+    #[cfg(all(feature = "perf-stats", debug_assertions))]
+    {
+        *counter = (*counter).max(value);
+    }
+    #[cfg(not(all(feature = "perf-stats", debug_assertions)))]
+    {
+        let _ = (counter, value);
+    }
 }
 
 /// High-water-mark update for a `u32` counter.
 #[inline(always)]
 pub fn max_u32(counter: &mut u32, value: u32) {
-    *counter = (*counter).max(value);
+    #[cfg(all(feature = "perf-stats", debug_assertions))]
+    {
+        *counter = (*counter).max(value);
+    }
+    #[cfg(not(all(feature = "perf-stats", debug_assertions)))]
+    {
+        let _ = (counter, value);
+    }
+}
+
+/// High-water-mark update for a `u16` counter.
+#[inline(always)]
+pub fn max_u16(counter: &mut u16, value: u16) {
+    #[cfg(all(feature = "perf-stats", debug_assertions))]
+    {
+        *counter = (*counter).max(value);
+    }
+    #[cfg(not(all(feature = "perf-stats", debug_assertions)))]
+    {
+        let _ = (counter, value);
+    }
 }
 
 /// Unconditional assignment for a `u64` counter.
@@ -59,11 +130,25 @@ pub fn max_u32(counter: &mut u32, value: u32) {
 /// Use when the final value is known (e.g. total op count after a batch).
 #[inline(always)]
 pub fn set_u64(counter: &mut u64, value: u64) {
-    *counter = value;
+    #[cfg(all(feature = "perf-stats", debug_assertions))]
+    {
+        *counter = value;
+    }
+    #[cfg(not(all(feature = "perf-stats", debug_assertions)))]
+    {
+        let _ = (counter, value);
+    }
 }
 
 /// Unconditional assignment for a `usize` counter.
 #[inline(always)]
 pub fn set_usize(counter: &mut usize, value: usize) {
-    *counter = value;
+    #[cfg(all(feature = "perf-stats", debug_assertions))]
+    {
+        *counter = value;
+    }
+    #[cfg(not(all(feature = "perf-stats", debug_assertions)))]
+    {
+        let _ = (counter, value);
+    }
 }

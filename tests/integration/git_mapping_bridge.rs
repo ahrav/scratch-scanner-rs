@@ -15,6 +15,10 @@ use scanner_rs::git_scan::{
     SpillError, UniqueBlob, UniqueBlobSink,
 };
 
+fn perf_stats_enabled() -> bool {
+    cfg!(all(feature = "perf-stats", debug_assertions))
+}
+
 /// Helper for constructing a minimal SHA-1 MIDX buffer.
 ///
 /// Only the chunks needed by `MidxView` lookups are populated.
@@ -166,9 +170,15 @@ fn mapping_bridge_emits_pack_and_loose() {
 
     let (stats, sink, arena) = bridge.finish().unwrap();
 
-    assert_eq!(stats.unique_blobs_in, 2);
-    assert_eq!(stats.packed_matched, 1);
-    assert_eq!(stats.loose_unmatched, 1);
+    if perf_stats_enabled() {
+        assert_eq!(stats.unique_blobs_in, 2);
+        assert_eq!(stats.packed_matched, 1);
+        assert_eq!(stats.loose_unmatched, 1);
+    } else {
+        assert_eq!(stats.unique_blobs_in, 0);
+        assert_eq!(stats.packed_matched, 0);
+        assert_eq!(stats.loose_unmatched, 0);
+    }
 
     assert_eq!(sink.packed.len(), 1);
     assert_eq!(sink.loose.len(), 1);

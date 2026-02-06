@@ -1738,12 +1738,21 @@ mod tests {
 
         let stats = pipeline.scan_path(&path)?;
 
-        assert_eq!(stats.archive.archives_seen, 1);
-        assert_eq!(stats.archive.archives_partial, 1);
-        assert_eq!(
-            stats.archive.partial_reasons[PartialReason::MalformedZip.as_usize()],
-            1
-        );
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            assert_eq!(stats.archive.archives_seen, 1);
+            assert_eq!(stats.archive.archives_partial, 1);
+            assert_eq!(
+                stats.archive.partial_reasons[PartialReason::MalformedZip.as_usize()],
+                1
+            );
+        } else {
+            assert_eq!(stats.archive.archives_seen, 0);
+            assert_eq!(stats.archive.archives_partial, 0);
+            assert_eq!(
+                stats.archive.partial_reasons[PartialReason::MalformedZip.as_usize()],
+                0
+            );
+        }
         assert_eq!(stats.bytes_scanned, 0);
         Ok(())
     }
@@ -1765,7 +1774,11 @@ mod tests {
 
         assert_eq!(stats.archive.archives_seen, 0);
         assert_eq!(stats.archive.archives_skipped, 0);
-        assert!(stats.bytes_scanned >= payload.len() as u64);
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            assert!(stats.bytes_scanned >= payload.len() as u64);
+        } else {
+            assert_eq!(stats.bytes_scanned, 0);
+        }
         Ok(())
     }
 
@@ -1788,10 +1801,17 @@ mod tests {
 
         let stats = pipeline.scan_path(&path)?;
 
-        assert_eq!(stats.archive.archives_seen, 1);
-        assert_eq!(stats.archive.archives_scanned, 1);
-        assert!(stats.archive.entries_scanned > 0);
-        assert!(stats.bytes_scanned > 0);
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            assert_eq!(stats.archive.archives_seen, 1);
+            assert_eq!(stats.archive.archives_scanned, 1);
+            assert!(stats.archive.entries_scanned > 0);
+            assert!(stats.bytes_scanned > 0);
+        } else {
+            assert_eq!(stats.archive.archives_seen, 0);
+            assert_eq!(stats.archive.archives_scanned, 0);
+            assert_eq!(stats.archive.entries_scanned, 0);
+            assert_eq!(stats.bytes_scanned, 0);
+        }
         Ok(())
     }
 }

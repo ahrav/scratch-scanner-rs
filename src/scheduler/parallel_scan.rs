@@ -644,6 +644,14 @@ mod tests {
         }
     }
 
+    fn assert_perf_u64(actual: u64, expected: u64) {
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            assert_eq!(actual, expected);
+        } else {
+            assert_eq!(actual, 0);
+        }
+    }
+
     #[test]
     fn scans_directory_with_files() {
         let rules = vec![simple_rule()];
@@ -661,7 +669,7 @@ mod tests {
 
         let report = parallel_scan_dir(dir.path(), engine, small_config(), sink.clone()).unwrap();
 
-        assert_eq!(report.stats.files_enqueued, 2);
+        assert_perf_u64(report.stats.files_enqueued, 2);
 
         let output = sink.take();
         let output_str = String::from_utf8_lossy(&output);
@@ -681,7 +689,7 @@ mod tests {
 
         let report = parallel_scan_dir(dir.path(), engine, small_config(), sink.clone()).unwrap();
 
-        assert_eq!(report.stats.files_enqueued, 0);
+        assert_perf_u64(report.stats.files_enqueued, 0);
         assert!(sink.take().is_empty());
     }
 
@@ -723,8 +731,12 @@ mod tests {
         let report = parallel_scan_dir(dir.path(), engine, config, sink.clone()).unwrap();
 
         // Discovery enqueues both; open-time enforcement skips the large file.
-        assert_eq!(report.stats.files_enqueued, 2);
-        assert!(report.metrics.bytes_scanned < large_content.len() as u64);
+        assert_perf_u64(report.stats.files_enqueued, 2);
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            assert!(report.metrics.bytes_scanned < large_content.len() as u64);
+        } else {
+            assert_eq!(report.metrics.bytes_scanned, 0);
+        }
     }
 
     #[test]
@@ -797,7 +809,7 @@ mod tests {
         // Discovery errors (unreadable subdir) are logged in debug builds
         assert!(result.is_ok());
         let report = result.unwrap();
-        assert_eq!(report.stats.files_enqueued, 1);
+        assert_perf_u64(report.stats.files_enqueued, 1);
     }
 
     #[test]
@@ -816,7 +828,7 @@ mod tests {
 
         assert!(result.is_ok());
         let report = result.unwrap();
-        assert_eq!(report.stats.files_enqueued, 1);
+        assert_perf_u64(report.stats.files_enqueued, 1);
 
         let output = sink.take();
         let output_str = String::from_utf8_lossy(&output);
@@ -844,8 +856,8 @@ mod tests {
         assert!(result.is_ok());
         let report = result.unwrap();
         // File is too large, should be skipped at open time.
-        assert_eq!(report.stats.files_enqueued, 1);
-        assert_eq!(report.metrics.bytes_scanned, 0);
+        assert_perf_u64(report.stats.files_enqueued, 1);
+        assert_perf_u64(report.metrics.bytes_scanned, 0);
         assert!(sink.take().is_empty());
     }
 
@@ -866,8 +878,8 @@ mod tests {
         assert!(result.is_ok());
         let report = result.unwrap();
         // Empty file should be skipped at open time.
-        assert_eq!(report.stats.files_enqueued, 1);
-        assert_eq!(report.metrics.bytes_scanned, 0);
+        assert_perf_u64(report.stats.files_enqueued, 1);
+        assert_perf_u64(report.metrics.bytes_scanned, 0);
         assert!(sink.take().is_empty());
     }
 }

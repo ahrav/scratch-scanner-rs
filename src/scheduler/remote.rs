@@ -312,14 +312,14 @@ pub struct IoStats {
 
 impl IoStats {
     fn merge(&mut self, other: IoStats) {
-        self.objects_started += other.objects_started;
-        self.objects_completed += other.objects_completed;
-        self.objects_failed += other.objects_failed;
-        self.chunks_fetched += other.chunks_fetched;
-        self.payload_bytes_fetched += other.payload_bytes_fetched;
-        self.retryable_errors += other.retryable_errors;
-        self.permanent_errors += other.permanent_errors;
-        self.retries += other.retries;
+        perf_stats::sat_add_u64(&mut self.objects_started, other.objects_started);
+        perf_stats::sat_add_u64(&mut self.objects_completed, other.objects_completed);
+        perf_stats::sat_add_u64(&mut self.objects_failed, other.objects_failed);
+        perf_stats::sat_add_u64(&mut self.chunks_fetched, other.chunks_fetched);
+        perf_stats::sat_add_u64(&mut self.payload_bytes_fetched, other.payload_bytes_fetched);
+        perf_stats::sat_add_u64(&mut self.retryable_errors, other.retryable_errors);
+        perf_stats::sat_add_u64(&mut self.permanent_errors, other.permanent_errors);
+        perf_stats::sat_add_u64(&mut self.retries, other.retries);
     }
 }
 
@@ -912,7 +912,7 @@ pub fn scan_remote<B: RemoteBackend>(
         }
 
         for obj in page {
-            report.remote.objects_discovered += 1;
+            perf_stats::sat_add_u64(&mut report.remote.objects_discovered, 1);
 
             // Check stop flag before acquiring permit
             if stop.load(Ordering::Relaxed) {
@@ -949,7 +949,7 @@ pub fn scan_remote<B: RemoteBackend>(
 
                 match tx.send_timeout(w, Duration::from_millis(100)) {
                     Ok(()) => {
-                        report.remote.objects_enqueued += 1;
+                        perf_stats::sat_add_u64(&mut report.remote.objects_enqueued, 1);
                         break; // Success, exit send loop
                     }
                     Err(chan::SendTimeoutError::Timeout(returned)) => {
@@ -1154,6 +1154,14 @@ mod tests {
         }
     }
 
+    fn assert_perf_u64(actual: u64, expected: u64) {
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            assert_eq!(actual, expected);
+        } else {
+            assert_eq!(actual, 0);
+        }
+    }
+
     // ========================================================================
     // Tests
     // ========================================================================
@@ -1172,9 +1180,9 @@ mod tests {
         let (report, _metrics) =
             scan_remote(engine, backend, small_config(), sink.clone()).unwrap();
 
-        assert_eq!(report.remote.objects_discovered, 1);
-        assert_eq!(report.remote.objects_enqueued, 1);
-        assert_eq!(report.io.objects_completed, 1);
+        assert_perf_u64(report.remote.objects_discovered, 1);
+        assert_perf_u64(report.remote.objects_enqueued, 1);
+        assert_perf_u64(report.io.objects_completed, 1);
 
         let out = sink.take();
         let out_str = String::from_utf8_lossy(&out);
@@ -1207,7 +1215,7 @@ mod tests {
 
         let (report, _metrics) = scan_remote(engine, backend, cfg, sink.clone()).unwrap();
 
-        assert_eq!(report.io.objects_completed, 1);
+        assert_perf_u64(report.io.objects_completed, 1);
 
         let out = sink.take();
         let out_str = String::from_utf8_lossy(&out);
@@ -1237,8 +1245,8 @@ mod tests {
         let (report, _metrics) =
             scan_remote(engine, backend, small_config(), sink.clone()).unwrap();
 
-        assert_eq!(report.remote.objects_discovered, 0);
-        assert_eq!(report.io.objects_completed, 0);
+        assert_perf_u64(report.remote.objects_discovered, 0);
+        assert_perf_u64(report.io.objects_completed, 0);
     }
 
     #[test]
@@ -1258,8 +1266,8 @@ mod tests {
         let (report, _metrics) =
             scan_remote(engine, backend, small_config(), sink.clone()).unwrap();
 
-        assert_eq!(report.remote.objects_discovered, 10);
-        assert_eq!(report.io.objects_completed, 10);
+        assert_perf_u64(report.remote.objects_discovered, 10);
+        assert_perf_u64(report.io.objects_completed, 10);
 
         let out = sink.take();
         let out_str = String::from_utf8_lossy(&out);
@@ -1295,9 +1303,9 @@ mod tests {
 
         let (report, _metrics) = scan_remote(engine, backend, cfg, sink.clone()).unwrap();
 
-        assert_eq!(report.io.objects_completed, 1);
-        assert_eq!(report.io.retryable_errors, 2);
-        assert_eq!(report.io.retries, 2);
+        assert_perf_u64(report.io.objects_completed, 1);
+        assert_perf_u64(report.io.retryable_errors, 2);
+        assert_perf_u64(report.io.retries, 2);
 
         let out = sink.take();
         assert!(
@@ -1445,11 +1453,18 @@ mod tests {
         let (report, _metrics) = scan_remote(engine, backend, cfg, sink.clone()).unwrap();
 
         // Object should fail because partial reads violate the contract
-        assert_eq!(
-            report.io.objects_failed, 1,
-            "partial reads should cause object failure"
-        );
-        assert_eq!(report.io.objects_completed, 0);
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            assert_eq!(
+                report.io.objects_failed, 1,
+                "partial reads should cause object failure"
+            );
+        } else {
+            assert_eq!(
+                report.io.objects_failed, 0,
+                "partial reads should cause object failure"
+            );
+        }
+        assert_perf_u64(report.io.objects_completed, 0);
     }
 
     // ========================================================================
@@ -1512,11 +1527,11 @@ mod tests {
         let (report, _metrics) =
             scan_remote(engine, backend, small_config(), sink.clone()).unwrap();
 
-        assert_eq!(report.io.objects_failed, 1);
-        assert_eq!(report.io.objects_completed, 0);
-        assert_eq!(report.io.permanent_errors, 1);
+        assert_perf_u64(report.io.objects_failed, 1);
+        assert_perf_u64(report.io.objects_completed, 0);
+        assert_perf_u64(report.io.permanent_errors, 1);
         // No retries for permanent errors
-        assert_eq!(report.io.retries, 0);
+        assert_perf_u64(report.io.retries, 0);
     }
 
     #[test]
@@ -1546,11 +1561,11 @@ mod tests {
 
         let (report, _metrics) = scan_remote(engine, backend, cfg, sink.clone()).unwrap();
 
-        assert_eq!(report.io.objects_failed, 1);
-        assert_eq!(report.io.objects_completed, 0);
+        assert_perf_u64(report.io.objects_failed, 1);
+        assert_perf_u64(report.io.objects_completed, 0);
         // Should have 3 retryable errors (initial + 2 retries)
-        assert_eq!(report.io.retryable_errors, 3);
+        assert_perf_u64(report.io.retryable_errors, 3);
         // Retries = attempts - 1 = 2
-        assert_eq!(report.io.retries, 2);
+        assert_perf_u64(report.io.retries, 2);
     }
 }

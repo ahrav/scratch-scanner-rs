@@ -338,7 +338,7 @@ impl SyntheticFileSource {
             perf_stats::sat_add_usize(&mut stats.secrets_injected, secrets);
         }
 
-        stats.generation_ms = start.elapsed().as_millis() as u64;
+        perf_stats::set_u64(&mut stats.generation_ms, start.elapsed().as_millis() as u64);
 
         Ok(Self {
             temp_dir,

@@ -433,13 +433,14 @@ fn build_midx_in_memory(
         }
     }
 
-    let mut prev_oid: Option<&[u8]> = None;
+    let mut prev_oid = vec![0u8; oid_len];
+    let mut has_prev_oid = false;
     let mut output_idx = 0u32;
 
     while let Some(entry) = heap.pop() {
         // Check for duplicate OID; the heap ordering ensures the lowest
         // pack_id is emitted first for equal OIDs.
-        let is_duplicate = prev_oid.is_some_and(|prev| prev == entry.oid);
+        let is_duplicate = has_prev_oid && prev_oid.as_slice() == entry.oid;
 
         if !is_duplicate {
             // Emit this object
@@ -469,15 +470,8 @@ fn build_midx_in_memory(
             let first_byte = entry.oid[0] as usize;
             fanout[first_byte] += 1;
 
-            prev_oid = Some(unsafe {
-                // SAFETY: `oidl` pre-allocates `total_objects * oid_len`, so
-                // pushes do not reallocate and the base pointer stays stable.
-                // The slice length is `oid_len`.
-                std::slice::from_raw_parts(
-                    oidl.as_ptr().add(output_idx as usize * oid_len),
-                    oid_len,
-                )
-            });
+            prev_oid.copy_from_slice(entry.oid);
+            has_prev_oid = true;
             output_idx += 1;
         }
 
