@@ -33,7 +33,6 @@
 
 use crate::scheduler::bench::BenchReport;
 use std::sync::OnceLock;
-use std::time::Duration;
 
 // ============================================================================
 // Tolerance Multipliers (documented rationale)
@@ -584,6 +583,7 @@ impl MultiComparison {
 mod tests {
     use super::*;
     use crate::scheduler::bench::{BenchConfig, BenchIter, BenchReport};
+    use std::time::Duration;
 
     fn make_report(throughput_mibs: f64, p50_ms: f64, rss_mb: f64) -> BenchReport {
         let wall_time = Duration::from_millis(p50_ms as u64);
