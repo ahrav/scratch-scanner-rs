@@ -12,7 +12,7 @@
 //! Findings are written to stdout as: `<path>:<start>-<end> <rule_name>`
 //!
 //! Statistics are written to stderr upon completion:
-//! `files=N chunks=N bytes=N findings=N errors=N elapsed_ms=N throughput_mib_s=N workers=N`
+//! `files=N chunks=N bytes=N findings=N errors=N init_ms=N scan_ms=N elapsed_ms=N throughput_mib_s=N workers=N`
 //!
 //! # Exit Codes
 //!
@@ -103,14 +103,16 @@ fn main() -> io::Result<()> {
 
     let workers = workers.unwrap_or_else(|| num_cpus::get().max(1));
 
+    let t0 = Instant::now();
     let engine = Arc::new(match decode_depth {
         Some(depth) => {
             demo_engine_with_anchor_mode_and_max_transform_depth(AnchorMode::Manual, depth)
         }
         None => demo_engine_with_anchor_mode(AnchorMode::Manual),
     });
-    let start = Instant::now();
+    let init_elapsed = t0.elapsed();
 
+    let scan_start = Instant::now();
     let mut config = ParallelScanConfig {
         workers,
         skip_hidden: false,
@@ -123,22 +125,25 @@ fn main() -> io::Result<()> {
     let sink = Arc::new(StdoutSink::new());
     let report = parallel_scan_dir(&path, Arc::clone(&engine), config, sink)?;
 
-    let elapsed = start.elapsed();
-    let elapsed_secs = elapsed.as_secs_f64();
-    let throughput_mib = if elapsed_secs > 0.0 {
-        (report.metrics.bytes_scanned as f64 / (1024.0 * 1024.0)) / elapsed_secs
+    let scan_elapsed = scan_start.elapsed();
+    let total_elapsed = t0.elapsed();
+    let scan_secs = scan_elapsed.as_secs_f64();
+    let throughput_mib = if scan_secs > 0.0 {
+        (report.metrics.bytes_scanned as f64 / (1024.0 * 1024.0)) / scan_secs
     } else {
         0.0
     };
 
     eprintln!(
-        "files={} chunks={} bytes={} findings={} errors={} elapsed_ms={} throughput_mib_s={:.2} workers={}",
+        "files={} chunks={} bytes={} findings={} errors={} init_ms={} scan_ms={} elapsed_ms={} throughput_mib_s={:.2} workers={}",
         report.stats.files_enqueued,
         report.metrics.chunks_scanned,
         report.metrics.bytes_scanned,
         report.metrics.findings_emitted,
         report.stats.io_errors,
-        elapsed.as_millis(),
+        init_elapsed.as_millis(),
+        scan_elapsed.as_millis(),
+        total_elapsed.as_millis(),
         throughput_mib,
         workers
     );

@@ -883,8 +883,8 @@ mod tests {
 
                     // Simulate scanning: touch bytes
                     b.as_mut_slice()[..n].fill(0xAB);
-                    crate::perf_stats::sat_add_u64(&mut ctx.metrics.bytes_scanned, n as u64);
-                    crate::perf_stats::sat_add_u64(&mut ctx.metrics.chunks_scanned, 1);
+                    ctx.metrics.bytes_scanned = ctx.metrics.bytes_scanned.saturating_add(n as u64);
+                    ctx.metrics.chunks_scanned = ctx.metrics.chunks_scanned.saturating_add(1);
 
                     // Track unique backing pointers to prove reuse
                     let ptr = b.ptr_usize();

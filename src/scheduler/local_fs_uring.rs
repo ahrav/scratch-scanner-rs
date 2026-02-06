@@ -577,8 +577,8 @@ fn cpu_runner<E: ScanEngine>(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScra
 
             // Metrics: payload bytes only (exclude overlap prefix).
             let payload = (len as u64).saturating_sub(prefix_len as u64);
-            perf_stats::sat_add_u64(&mut ctx.metrics.chunks_scanned, 1);
-            perf_stats::sat_add_u64(&mut ctx.metrics.bytes_scanned, payload);
+            ctx.metrics.chunks_scanned = ctx.metrics.chunks_scanned.saturating_add(1);
+            ctx.metrics.bytes_scanned = ctx.metrics.bytes_scanned.saturating_add(payload);
 
             // Buffer returns to pool on drop (RAII).
             drop(buf);
@@ -1668,7 +1668,7 @@ fn walk_and_send_files(
             match fs::metadata(&path) {
                 Ok(m) => m,
                 Err(_) => {
-                    perf_stats::sat_add_u64(&mut summary.walk_errors, 1);
+                    summary.walk_errors = summary.walk_errors.saturating_add(1);
                     continue;
                 }
             }
@@ -1681,7 +1681,7 @@ fn walk_and_send_files(
                     m
                 }
                 Err(_) => {
-                    perf_stats::sat_add_u64(&mut summary.walk_errors, 1);
+                    summary.walk_errors = summary.walk_errors.saturating_add(1);
                     continue;
                 }
             }
@@ -1691,7 +1691,7 @@ fn walk_and_send_files(
             let rd = match fs::read_dir(&path) {
                 Ok(rd) => rd,
                 Err(_) => {
-                    perf_stats::sat_add_u64(&mut summary.walk_errors, 1);
+                    summary.walk_errors = summary.walk_errors.saturating_add(1);
                     continue;
                 }
             };
@@ -1699,7 +1699,7 @@ fn walk_and_send_files(
             for ent in rd {
                 match ent {
                     Ok(ent) => stack.push(ent.path()),
-                    Err(_) => perf_stats::sat_add_u64(&mut summary.walk_errors, 1),
+                    Err(_) => summary.walk_errors = summary.walk_errors.saturating_add(1),
                 }
             }
             continue;
@@ -1709,13 +1709,13 @@ fn walk_and_send_files(
             continue;
         }
 
-        perf_stats::sat_add_u64(&mut summary.files_seen, 1);
+        summary.files_seen = summary.files_seen.saturating_add(1);
 
         let size = meta.len();
 
         if let Some(max_sz) = cfg.max_file_size {
             if size > max_sz {
-                perf_stats::sat_add_u64(&mut summary.files_skipped_size, 1);
+                summary.files_skipped_size = summary.files_skipped_size.saturating_add(1);
                 continue;
             }
         }
@@ -1744,7 +1744,7 @@ fn walk_and_send_files(
         tx.send(FileWork { path, size, token })
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "io threads stopped"))?;
 
-        perf_stats::sat_add_u64(&mut summary.files_enqueued, 1);
+        summary.files_enqueued = summary.files_enqueued.saturating_add(1);
     }
 
     Ok(())
@@ -1864,8 +1864,8 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
         }
     }
 
-    perf_stats::set_u64(&mut summary.open_errors, io_stats.files_open_failed);
-    perf_stats::set_u64(&mut summary.read_errors, io_stats.read_errors);
+    summary.open_errors = io_stats.files_open_failed;
+    summary.read_errors = io_stats.read_errors;
 
     // Join CPU executor.
     let cpu_metrics = ex.join();

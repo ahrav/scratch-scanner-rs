@@ -1,9 +1,17 @@
 //! # Metrics Module
 //!
 //! Cheap, deterministic metrics collection for scheduler observability.
-//! Metrics recording is enabled only with
-//! `all(feature = "perf-stats", debug_assertions)`.
-//! Outside that mode, update paths are no-ops and snapshots stay zeroed.
+//!
+//! ## Core vs. perf-only metrics
+//!
+//! **Core operational metrics** (`bytes_scanned`, `chunks_scanned`, `io_errors`,
+//! `findings_emitted`, `worker_count`) are always recorded and merged so that
+//! release builds report non-zero counters.
+//!
+//! **Perf-only metrics** (steal rates, histograms, parking stats, archive
+//! counters) are recorded only when
+//! `all(feature = "perf-stats", debug_assertions)` is enabled.
+//! Outside that mode their update paths are no-ops and snapshots stay zeroed.
 //!
 //! ## Design
 //!
@@ -469,21 +477,28 @@ impl MetricsSnapshot {
 
     /// Merge a worker's local metrics into this aggregate snapshot.
     ///
-    /// Accumulates all counters and merges histograms. Call once per worker
-    /// after workers have joined. Increments `worker_count` automatically.
+    /// Core operational metrics (`bytes_scanned`, `chunks_scanned`,
+    /// `io_errors`, `findings_emitted`, `worker_count`) are always merged.
+    /// Perf-only metrics (steal rates, histograms, parking stats) are merged
+    /// only when `recording_enabled()` is true.
     ///
     /// # Performance
     ///
     /// O(1) for counters + O(64) for histogram merge. Total ~70 additions.
     pub fn merge_worker(&mut self, w: &WorkerMetricsLocal) {
+        // Core operational metrics — always merge.
+        self.bytes_scanned = self.bytes_scanned.wrapping_add(w.bytes_scanned);
+        self.chunks_scanned = self.chunks_scanned.wrapping_add(w.chunks_scanned);
+        self.io_errors = self.io_errors.wrapping_add(w.io_errors);
+        self.findings_emitted = self.findings_emitted.wrapping_add(w.findings_emitted);
+        self.worker_count = self.worker_count.wrapping_add(1);
+
+        // Perf-only metrics — gated.
         if !Self::recording_enabled() {
-            let _ = w;
             return;
         }
         self.tasks_enqueued = self.tasks_enqueued.wrapping_add(w.tasks_enqueued);
         self.tasks_executed = self.tasks_executed.wrapping_add(w.tasks_executed);
-        self.bytes_scanned = self.bytes_scanned.wrapping_add(w.bytes_scanned);
-        self.chunks_scanned = self.chunks_scanned.wrapping_add(w.chunks_scanned);
         self.objects_completed = self.objects_completed.wrapping_add(w.objects_completed);
 
         self.local_pops = self.local_pops.wrapping_add(w.local_pops);
@@ -496,11 +511,7 @@ impl MetricsSnapshot {
 
         self.idle_spins = self.idle_spins.wrapping_add(w.idle_spins);
         self.park_count = self.park_count.wrapping_add(w.park_count);
-        self.io_errors = self.io_errors.wrapping_add(w.io_errors);
-        self.findings_emitted = self.findings_emitted.wrapping_add(w.findings_emitted);
         self.archive.merge_from(&w.archive);
-
-        self.worker_count = self.worker_count.wrapping_add(1);
     }
 
     /// Aggregate local hit rate: `local_pops / (local_pops + injector_pops + steal_successes)`.
@@ -710,8 +721,34 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_merge_workers_core() {
+        let mut w1 = WorkerMetricsLocal::new();
+        let mut w2 = WorkerMetricsLocal::new();
+
+        w1.bytes_scanned = 1000;
+        w1.chunks_scanned = 5;
+        w1.io_errors = 1;
+        w1.findings_emitted = 3;
+
+        w2.bytes_scanned = 2000;
+        w2.chunks_scanned = 10;
+        w2.io_errors = 2;
+        w2.findings_emitted = 7;
+
+        let mut snap = MetricsSnapshot::new();
+        snap.merge_worker(&w1);
+        snap.merge_worker(&w2);
+
+        assert_eq!(snap.bytes_scanned, 3000);
+        assert_eq!(snap.chunks_scanned, 15);
+        assert_eq!(snap.io_errors, 3);
+        assert_eq!(snap.findings_emitted, 10);
+        assert_eq!(snap.worker_count, 2);
+    }
+
+    #[test]
     #[cfg(all(feature = "perf-stats", debug_assertions))]
-    fn snapshot_merge_workers() {
+    fn snapshot_merge_workers_perf() {
         let mut w1 = WorkerMetricsLocal::new();
         let mut w2 = WorkerMetricsLocal::new();
 

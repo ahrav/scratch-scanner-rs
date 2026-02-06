@@ -509,8 +509,8 @@ fn cpu_runner(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScratch>) {
 
             // Metrics: count payload bytes only
             let payload = (len as u64).saturating_sub(prefix_len as u64);
-            perf_stats::sat_add_u64(&mut ctx.metrics.chunks_scanned, 1);
-            perf_stats::sat_add_u64(&mut ctx.metrics.bytes_scanned, payload);
+            ctx.metrics.chunks_scanned = ctx.metrics.chunks_scanned.saturating_add(1);
+            ctx.metrics.bytes_scanned = ctx.metrics.bytes_scanned.saturating_add(payload);
 
             // Buffer returned to pool on drop
             drop(buf);

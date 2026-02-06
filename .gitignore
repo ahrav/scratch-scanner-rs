@@ -33,6 +33,10 @@ fuzz/Cargo.lock
 
 perf.data
 
+# Linux only ignores
+build.rs
+config.toml
+
 # Internal design docs (scanner harness planning)
 docs/test_harness.md
 docs/test_harness_work_units.md
