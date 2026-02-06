@@ -5,7 +5,7 @@ edition = "2021"
 
 # Allow Kani's cfg flag (set automatically by cargo kani)
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)'] }
 
 [dependencies]
 aegis = "0.9"
@@ -64,6 +64,7 @@ git-perf = ["perf-stats"]  # Git pack-exec timing probes (implies perf-stats)
 [dev-dependencies]
 base64 = "0.22"
 crc32fast = "1.4"
+loom = "0.7"
 proptest = "1.4"
 criterion = "0.5"
 serde_json = "1.0"

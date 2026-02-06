@@ -12,6 +12,7 @@
 //! - Deterministic iteration/reset behavior for reuse in hot loops.
 //!
 //! # Module map
+//! - `atomic_bitset`: lock-free bitset with atomic test-and-set for concurrent dedup.
 //! - `bitset`: fixed-size and dynamic bitsets with word-level operations.
 //! - `byte_ring`: internal byte ring keyed by absolute stream offsets.
 //! - `fixed_set`: fixed-capacity hash set with epoch-based O(1) reset.
@@ -24,6 +25,7 @@
 //! Several types use `unsafe` internally and rely on invariants called out in
 //! their module docs. Read those before extending or reusing the internals.
 
+pub mod atomic_bitset;
 pub mod bitset;
 pub mod byte_ring;
 pub mod fastrange;
@@ -33,6 +35,7 @@ pub mod released_set;
 pub mod ring_buffer;
 pub mod timing_wheel;
 
+pub use atomic_bitset::AtomicBitSet;
 pub use bitset::{words_for_bits, DynamicBitSet, DynamicBitSetIterator};
 pub(crate) use byte_ring::ByteRing;
 pub use fixed_set::FixedSet128;
