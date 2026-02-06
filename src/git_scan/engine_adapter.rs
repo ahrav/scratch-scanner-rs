@@ -685,8 +685,25 @@ mod tests {
     use crate::git_scan::ByteRef;
     use crate::{demo_engine_with_anchor_mode, AnchorMode};
 
+    /// Verify that the scan hot path allocates nothing after warmup.
+    ///
+    /// The alloc guard uses **global** counters, so allocations from any
+    /// thread are visible. Run with:
+    ///
+    /// ```sh
+    /// SCANNER_RS_ALLOC_GUARD=1 cargo test --lib scan_alloc_guard_no_alloc_after_warmup \
+    ///     -- --test-threads=1
+    /// ```
     #[test]
     fn scan_alloc_guard_no_alloc_after_warmup() {
+        if std::env::var("SCANNER_RS_ALLOC_GUARD").ok().as_deref() != Some("1") {
+            eprintln!(
+                "alloc guard test skipped; set SCANNER_RS_ALLOC_GUARD=1 and \
+                 run with --test-threads=1 to enable"
+            );
+            return;
+        }
+
         let engine = demo_engine_with_anchor_mode(AnchorMode::Manual);
         let mut adapter = EngineAdapter::new(&engine, EngineAdapterConfig::default());
 
