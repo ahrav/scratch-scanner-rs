@@ -1,8 +1,16 @@
-//! Shared helper functions for Git scan execution.
+//! Shared pack execution helpers for the Git scan runner.
 //!
-//! Contains standalone utilities used by both scan modes (diff-history and
-//! ODB-blob). These were extracted from `runner.rs` to keep the main
-//! orchestrator focused on the pipeline dispatch.
+//! Contains standalone building-block functions used by both scan mode
+//! pipelines ([`runner_odb_blob`](super::runner_odb_blob) and
+//! [`runner_diff_history`](super::runner_diff_history)). Each mode file
+//! owns its execution loop; this module provides the pieces they call:
+//!
+//! - **Directory discovery** — pack dirs, loose dirs, pack file listing.
+//! - **Mmap management** — map pack files, apply sequential access hints.
+//! - **Pack view parsing** — validate headers, build `PackView`s for planning.
+//! - **Loose scanning** — decode loose objects and feed them to the engine.
+//! - **Threading utilities** — strategy selection, index sharding, result merging.
+//! - **Spill adapter** — `SpillCandidateSink` bridges `CandidateSink` to `Spiller`.
 
 use std::fs;
 use std::fs::File;
@@ -571,10 +579,12 @@ pub(super) fn collect_skipped_candidates(
     }
 }
 
+/// Returns `true` if the file name has a `.pack` extension.
 pub(super) fn is_pack_file(name: &std::ffi::OsStr) -> bool {
     Path::new(name).extension().is_some_and(|ext| ext == "pack")
 }
 
+/// Returns `true` if `path` exists and is a regular file.
 pub(super) fn is_file(path: &Path) -> bool {
     fs::metadata(path).map(|m| m.is_file()).unwrap_or(false)
 }

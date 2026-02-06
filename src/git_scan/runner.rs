@@ -1,24 +1,29 @@
-//! End-to-end Git scan runner.
+//! End-to-end Git scan runner — types, config, and thin dispatcher.
 //!
-//! Orchestrates repo open, commit walk, tree diff, spill/dedupe, pack planning,
-//! pack decode + scan, finalize, and persistence.
+//! This module defines the public types (`GitScanConfig`, `GitScanError`,
+//! `GitScanReport`, etc.) and the [`run_git_scan`] entry point, which is a
+//! thin dispatcher that delegates to mode-specific pipeline modules:
+//!
+//! | Module | Purpose |
+//! |--------|---------|
+//! | [`runner_odb_blob`](super::runner_odb_blob) | ODB-blob fast-path pipeline |
+//! | [`runner_diff_history`](super::runner_diff_history) | Diff-history pipeline |
+//! | [`runner_exec`](super::runner_exec) | Shared pack execution helpers |
 //!
 //! # Pipeline
 //! 1. Open the repo (start set resolution, watermarks, artifact readiness check).
-//! 2. Plan commits, diff trees, and collect candidate blobs.
-//! 3. Spill/dedupe candidates and map them to pack entries.
-//! 4. Plan packs, decode + scan, then finalize and optionally persist.
-//!
-//! # Artifact Construction
-//! The runner always builds MIDX and commit-graph in memory from pack/idx
-//! files via `artifact_acquire` before scanning.
+//! 2. Build MIDX and commit-graph in memory via `artifact_acquire`.
+//! 3. Build commit plan (`introduced_by_plan`).
+//! 4. Dispatch to mode-specific pipeline (ODB-blob or diff-history).
+//! 5. Post-execution artifact stability check.
+//! 6. Finalize, optionally persist, and return report.
 //!
 //! # Modes
-//! - Diff-history: walk commits, diff trees, spill/dedupe candidates, then plan
-//!   packs for decode + scan.
-//! - ODB-blob fast: compute first-introduced blobs from the commit graph, then
-//!   scan in pack order; if candidate caps or path arena limits are exceeded,
-//!   retry via the spill/dedupe pipeline.
+//! - **Diff-history**: walk commits, diff trees, spill/dedupe candidates, then
+//!   batch-plan and execute pack decode + scan.
+//! - **ODB-blob fast**: compute first-introduced blobs from the commit graph,
+//!   then scan in pack order with streaming plan generation; retries via
+//!   spill/dedupe on candidate cap overflow.
 //!
 //! # Invariants
 //! - MIDX completeness is verified before pack execution.
