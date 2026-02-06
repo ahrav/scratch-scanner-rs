@@ -128,6 +128,16 @@ canonicalized separately in the archive subsystem and do not affect transform
 logic or decode limits.
 See `src/archive/` for archive-specific invariants and budget guardrails.
 
+## Unified Scanner Output Integration
+
+Transform findings produced by the engine flow through the unified event
+contract (`ScanEvent::Finding`) in both filesystem and git scan modes. The
+decode/transform decision logic and budgets in this document are unchanged;
+only emission/reporting wiring changed.
+
+See [`scanner-unification.md`](scanner-unification.md) for routing/output
+details.
+
 | Limit | Default | Purpose |
 |-------|---------|---------|
 | `max_transform_depth` | 3 | Maximum decode chain length |

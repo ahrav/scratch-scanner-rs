@@ -16,6 +16,7 @@ use scanner_rs::git_scan::{
     GitScanResult, InMemoryPersistenceStore, MappingCandidateKind, NeverSeenStore, OidBytes,
     RefWatermarkStore, RepoOpenError, SpillError, StartSetConfig, StartSetResolver, WriteOp,
 };
+use scanner_rs::unified::events::NullEventSink;
 use scanner_rs::{demo_tuning, AnchorPolicy, Engine, Gate, RuleSpec, TransformConfig, TransformId};
 use scanner_rs::{TransformMode, ValidatorKind};
 
@@ -193,12 +194,13 @@ fn run_scan_with_config(
 
     run_git_scan(
         repo,
-        &engine,
+        std::sync::Arc::new(engine),
         &resolver,
         &NeverSeenStore,
         &watermark_store,
         Some(&persist_store),
         &config,
+        std::sync::Arc::new(NullEventSink),
     )
 }
 

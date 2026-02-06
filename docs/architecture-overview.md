@@ -80,7 +80,10 @@ graph TB
 
 | Component | Location | Purpose |
 | ------------------- | ------------------------------ | -------------------------------------------------------------------- |
-| **CLI Layer**       | `src/main.rs`                  | Entry point that parses args and invokes the pipeline                |
+| **CLI Layer**       | `src/main.rs`                  | Entry point that delegates to unified scan routing                   |
+| **Unified CLI**     | `src/unified/cli.rs`           | Subcommand parser for `scan fs|git` and source-specific flags        |
+| **Unified Orchestrator** | `src/unified/orchestrator.rs` | Dispatches sources and wires structured event sinks               |
+| **Unified Events**  | `src/unified/events.rs`        | Structured `ScanEvent` model and JSONL sink                          |
 | **Engine**          | `src/engine/core.rs:154`       | Compiled scanning engine with anchor patterns, rules, and transforms |
 | **RuleSpec**        | `src/api.rs:519`               | Rule definitions and specification for rule-based scanning           |
 | **RuleCompiled**    | `src/engine/rule_repr.rs:268`  | Compiled rule representation with hot data and validation gates      |
@@ -133,7 +136,6 @@ graph TB
 | **Persistence Store** | `src/git_scan/persist.rs` | Two-phase persistence contract for data ops then watermarks |
 | **RocksDB Store** | `src/git_scan/persist_rocksdb.rs` | RocksDB adapter for persistence, seen-blob checks, and watermarks |
 | **Git Scan Runner** | `src/git_scan/runner.rs` | End-to-end orchestration across all Git scan stages |
-| **Git Scan CLI** | `src/bin/git_scan.rs` | CLI entrypoint for Git scanning pipeline |
 | **WorkItems**       | `src/git_scan/work_items.rs`  | SoA candidate metadata tables for sorting without moving structs    |
 | **Policy Hash**     | `src/git_scan/policy_hash.rs`  | Canonical BLAKE3 identity over rules, transforms, and tuning         |
 

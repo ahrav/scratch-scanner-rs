@@ -43,9 +43,10 @@ use super::engine_stub::BUFFER_LEN_MAX;
 use super::engine_trait::{EngineScratch, FindingRecord, ScanEngine};
 use super::executor::{Executor, ExecutorConfig, ExecutorHandle, WorkerCtx};
 use super::metrics::MetricsSnapshot;
-use super::output_sink::OutputSink;
 use crate::api::FileId;
 use crate::perf_stats;
+use crate::unified::events::{EventSink, FindingEvent, ScanEvent};
+use crate::unified::SourceKind;
 
 use crossbeam_channel as chan;
 use crossbeam_queue::ArrayQueue;
@@ -465,10 +466,9 @@ enum CpuTask {
 /// Per-CPU-worker scratch space.
 struct CpuScratch<E: ScanEngine> {
     engine: Arc<E>,
-    out: Arc<dyn OutputSink>,
+    event_sink: Arc<dyn EventSink>,
     scratch: E::Scratch,
     pending: Vec<<E::Scratch as EngineScratch>::Finding>,
-    out_buf: Vec<u8>,
     dedupe_within_chunk: bool,
 }
 
@@ -501,11 +501,10 @@ fn dedupe_pending_in_place<F: FindingRecord>(p: &mut Vec<F>) {
     });
 }
 
-/// Format and emit findings to output sink.
-fn emit_findings_formatted<E: ScanEngine, F: FindingRecord>(
+/// Emit findings as structured events.
+fn emit_findings<E: ScanEngine, F: FindingRecord>(
     engine: &E,
-    out: &Arc<dyn OutputSink>,
-    out_buf: &mut Vec<u8>,
+    event_sink: &dyn EventSink,
     display: &[u8],
     recs: &[F],
 ) {
@@ -513,23 +512,18 @@ fn emit_findings_formatted<E: ScanEngine, F: FindingRecord>(
         return;
     }
 
-    out_buf.clear();
-
     for rec in recs {
-        out_buf.extend_from_slice(display);
-        let rule = engine.rule_name(rec.rule_id());
-
-        use std::io::Write as _;
-        let _ = writeln!(
-            out_buf,
-            ":{}-{} {}",
-            rec.root_hint_start(),
-            rec.root_hint_end(),
-            rule
-        );
+        event_sink.emit(ScanEvent::Finding(FindingEvent {
+            source: SourceKind::Fs,
+            object_path: display,
+            start: rec.root_hint_start(),
+            end: rec.root_hint_end(),
+            rule_id: rec.rule_id(),
+            rule_name: engine.rule_name(rec.rule_id()),
+            commit_id: None,
+            change_kind: None,
+        }));
     }
-
-    out.write_all(out_buf.as_slice());
 }
 
 // ============================================================================
@@ -567,10 +561,9 @@ fn cpu_runner<E: ScanEngine>(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScra
                 dedupe_pending_in_place(&mut ctx.scratch.pending);
             }
 
-            emit_findings_formatted(
+            emit_findings(
                 engine,
-                &ctx.scratch.out,
-                &mut ctx.scratch.out_buf,
+                &*ctx.scratch.event_sink,
                 &token.display,
                 &ctx.scratch.pending,
             );
@@ -1761,7 +1754,7 @@ fn walk_and_send_files(
 /// - `engine`: Detection engine implementing [`ScanEngine`]
 /// - `roots`: Root directories to scan
 /// - `cfg`: Configuration
-/// - `out`: Output sink for findings
+/// - `event_sink`: Event sink for findings
 ///
 /// # Returns
 ///
@@ -1774,7 +1767,7 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
     engine: Arc<E>,
     roots: &[PathBuf],
     cfg: LocalFsUringConfig,
-    out: Arc<dyn OutputSink>,
+    event_sink: Arc<dyn EventSink>,
 ) -> io::Result<(LocalFsSummary, UringIoStats, MetricsSnapshot)> {
     cfg.validate(engine.as_ref());
 
@@ -1796,16 +1789,15 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
         },
         {
             let engine = Arc::clone(&engine);
-            let out = Arc::clone(&out);
+            let event_sink = Arc::clone(&event_sink);
             let dedupe = cfg.dedupe_within_chunk;
             move |_wid| CpuScratch {
                 engine: Arc::clone(&engine),
-                out: Arc::clone(&out),
+                event_sink: Arc::clone(&event_sink),
                 scratch: engine.new_scratch(),
                 // Match the local scan default: avoid steady-state allocs without
                 // relying on engine-specific tuning details.
                 pending: Vec::with_capacity(4096),
-                out_buf: Vec::with_capacity(64 * 1024),
                 dedupe_within_chunk: dedupe,
             }
         },
@@ -1870,7 +1862,7 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
     // Join CPU executor.
     let cpu_metrics = ex.join();
 
-    out.flush();
+    event_sink.flush();
 
     Ok((summary, io_stats, cpu_metrics))
 }
@@ -1882,9 +1874,9 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
 #[cfg(test)]
 mod tests {
     use super::super::engine_stub::{EngineTuning, MockEngine, MockRule};
-    use super::super::output_sink::VecSink;
     use super::super::{TsBufferPool, TsBufferPoolConfig};
     use super::*;
+    use crate::unified::events::VecEventSink;
     use tempfile::tempdir;
 
     #[test]
@@ -1912,7 +1904,7 @@ mod tests {
         let content = b"xxxxSECRETyyyyyy";
         std::fs::write(&file_path, content)?;
 
-        let sink = Arc::new(VecSink::new());
+        let sink = Arc::new(VecEventSink::new());
 
         let cfg = LocalFsUringConfig {
             cpu_workers: 2,
@@ -2003,7 +1995,7 @@ mod tests {
             dedupe_within_chunk: true,
         };
 
-        let sink_blocking = Arc::new(VecSink::new());
+        let sink_blocking = Arc::new(VecEventSink::new());
         let (_summary, _io_stats, _cpu_metrics) = scan_local_fs_uring(
             Arc::clone(&engine),
             &[dir.path().to_path_buf()],
@@ -2012,7 +2004,7 @@ mod tests {
         )?;
         let out_blocking = sink_blocking.take();
 
-        let sink_uring = Arc::new(VecSink::new());
+        let sink_uring = Arc::new(VecEventSink::new());
         let mut uring_cfg = base_cfg;
         uring_cfg.open_stat_mode = OpenStatMode::UringPreferred;
         let (_summary, _io_stats, _cpu_metrics) = scan_local_fs_uring(
@@ -2067,7 +2059,7 @@ mod tests {
             dedupe_within_chunk: true,
         };
 
-        let sink = Arc::new(VecSink::new());
+        let sink = Arc::new(VecEventSink::new());
         let (_summary, io_stats, _cpu_metrics) =
             scan_local_fs_uring(engine, &[dir.path().to_path_buf()], cfg, sink)?;
 

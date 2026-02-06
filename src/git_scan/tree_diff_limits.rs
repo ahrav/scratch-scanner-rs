@@ -16,10 +16,10 @@
 //! | Candidate buffer | 1M entries x ~50 bytes = 50 MB | Per-repo job |
 //! | Path arena       | 64 MB       | Shared across all candidates        |
 //! | Tree cache       | 64 MB       | Tree payload cache (fixed slots)    |
-//! | Tree delta cache | 64 MB       | Tree delta base cache (fixed slots) |
+//! | Tree delta cache | 128 MB      | Tree delta base cache (fixed slots) |
 //! | Diff stack       | 256 frames x ~100 bytes = 25 KB | Per-diff operation |
 //!
-//! Total default budget: ~243 MB per repo job (excluding mmapped data).
+//! Total default budget: ~307 MB per repo job (excluding mmapped data).
 
 /// Hard caps for tree diff and candidate collection.
 ///
@@ -62,7 +62,7 @@ pub struct TreeDiffLimits {
     /// larger than a slot are not cached. This avoids repeated base inflates
     /// during tree delta chains.
     ///
-    /// Default: 64 MB.
+    /// Default: 128 MB.
     pub max_tree_delta_cache_bytes: u32,
 
     /// Maximum candidates in the in-memory buffer.
@@ -97,12 +97,12 @@ pub struct TreeDiffLimits {
 impl TreeDiffLimits {
     /// Safe defaults suitable for large monorepos.
     ///
-    /// Memory budget: ~179 MB per repo job (excluding mmapped data).
+    /// Memory budget: ~307 MB per repo job (excluding mmapped data).
     pub const DEFAULT: Self = Self {
         max_tree_bytes_in_flight: 2 * 1024 * 1024 * 1024, // 2 GB
         max_tree_spill_bytes: 8 * 1024 * 1024 * 1024,     // 8 GB
         max_tree_cache_bytes: 64 * 1024 * 1024,           // 64 MB
-        max_tree_delta_cache_bytes: 64 * 1024 * 1024,     // 64 MB
+        max_tree_delta_cache_bytes: 128 * 1024 * 1024,    // 128 MB
         max_candidates: 1_048_576,                        // 1M
         max_path_arena_bytes: 64 * 1024 * 1024,           // 64 MB
         max_tree_depth: 256,

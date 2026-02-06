@@ -10,9 +10,7 @@
 use scanner_rs::pipeline::{
     Pipeline, PipelineConfig, PIPE_CHUNK_RING_CAP, PIPE_FILE_RING_CAP, PIPE_OUT_RING_CAP,
 };
-use scanner_rs::scheduler::{
-    scan_local, LocalConfig, LocalFile, NullSink, OutputSink, VecFileSource,
-};
+use scanner_rs::scheduler::{scan_local, LocalConfig, LocalFile, VecFileSource};
 use scanner_rs::{demo_engine, ScannerConfig, ScannerRuntime};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fs;
@@ -383,7 +381,6 @@ fn allocs_after_startup_in_scan_local_multicore() -> io::Result<()> {
     }
 
     let engine = Arc::new(demo_engine());
-    let sink: Arc<dyn OutputSink> = Arc::new(NullSink);
 
     // Configure for multi-core (use at least 2 workers to test parallelism)
     let workers = std::thread::available_parallelism()
@@ -411,7 +408,7 @@ fn allocs_after_startup_in_scan_local_multicore() -> io::Result<()> {
     // First run: measures total allocation for one scan
     reset_counts();
     let source1 = VecFileSource::new(files.clone());
-    let _ = scan_local(Arc::clone(&engine), source1, cfg.clone(), Arc::clone(&sink));
+    let _ = scan_local(Arc::clone(&engine), source1, cfg.clone());
 
     let first_counts = snapshot_counts();
     let first_mib = first_counts.alloc_bytes as f64 / 1024.0 / 1024.0;
@@ -434,7 +431,7 @@ fn allocs_after_startup_in_scan_local_multicore() -> io::Result<()> {
     // Second run: should be similar to first (new Executor each time)
     reset_counts();
     let source2 = VecFileSource::new(files);
-    let _ = scan_local(Arc::clone(&engine), source2, cfg, Arc::clone(&sink));
+    let _ = scan_local(Arc::clone(&engine), source2, cfg);
 
     let second_counts = snapshot_counts();
     let second_mib = second_counts.alloc_bytes as f64 / 1024.0 / 1024.0;

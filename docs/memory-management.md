@@ -66,6 +66,17 @@ allocation constraints.
 
 Run diagnostic tests to verify: `cargo test --test diagnostic -- --ignored --nocapture --test-threads=1`
 
+## Unified Event Output Memory Notes
+
+The unified scanner writes findings through a streaming `EventSink`
+(`src/unified/events.rs`) instead of building a run-global stdout buffer.
+This keeps output-path memory bounded to sink/writer buffers plus per-worker
+scratch vectors.
+
+Git scanning still retains per-run metadata required for deterministic
+finalize/persist (`ScannedBlobs`), but finding emission to stdout is streamed.
+See [`scanner-unification.md`](scanner-unification.md).
+
 ---
 
 ## Git Tree Loading Budgets

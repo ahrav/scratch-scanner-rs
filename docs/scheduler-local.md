@@ -32,7 +32,7 @@ flowchart TB
     end
 
     subgraph Output["Output"]
-        Sink["OutputSink<br/>(e.g., VecSink)"]
+        Sink["EventSink<br/>(e.g., JsonlEventSink)"]
     end
 
     Source --> Enqueue
@@ -237,9 +237,10 @@ pub fn scan_local<E, S>(
     engine: Arc<E>,
     source: S,
     cfg: LocalConfig,
-    out: Arc<dyn OutputSink>,
 ) -> LocalReport
 ```
+
+The `EventSink` for structured output is configured via `LocalConfig::event_sink` (defaults to `NullEventSink`).
 
 **Execution model**:
 1. Main thread discovers files via `source.next_file()`
@@ -302,24 +303,15 @@ Optional within-chunk deduplication (if `dedupe_within_chunk = true`):
 ## Output Formatting
 
 ```rust
-fn emit_findings<E, F>(
+fn emit_findings<E: ScanEngine, F: FindingRecord>(
     engine: &E,
-    out: &Arc<dyn OutputSink>,
-    out_buf: &mut Vec<u8>,
+    event_sink: &dyn EventSink,
     path: &[u8],
     findings: &[F],
 )
 ```
 
-**Output format**: `<path>:<start>-<end> <rule_name>\n`
-
-Example:
-```
-/home/user/.env:42-68 aws-access-key
-/home/user/.env:100-120 slack-token
-```
-
-The `out_buf` is reused across calls to avoid per-chunk allocation.
+Each finding is emitted as a `ScanEvent::Finding` through the configured `EventSink`. The default `JsonlEventSink` serializes findings as one JSON line per event, with zero-alloc formatting.
 
 ## Performance Characteristics
 
@@ -363,21 +355,24 @@ The `out_buf` is reused across calls to avoid per-chunk allocation.
 use std::sync::Arc;
 use scheduler::engine_stub::MockEngine;
 use scheduler::local::{LocalConfig, LocalFile, VecFileSource, scan_local};
-use scheduler::output_sink::VecSink;
+use unified::events::{VecEventSink, EventSink};
 
 let engine = Arc::new(MockEngine::new(rules, 16));
 let files = vec![LocalFile { path: "test.txt".into(), size: 1024 }];
 let source = VecFileSource::new(files);
-let sink = Arc::new(VecSink::new());
+let sink = Arc::new(VecEventSink::new());
 
-let report = scan_local(engine, source, LocalConfig::default(), sink.clone());
+let mut cfg = LocalConfig::default();
+cfg.event_sink = sink.clone();
+
+let report = scan_local(engine, source, cfg);
 
 println!("Files: {}", report.stats.files_enqueued);
 println!("Errors: {}", report.stats.io_errors);
 println!("Chunks: {}", report.metrics.chunks_scanned);
 
-let output = sink.take();
-// Process findings
+let events = sink.take();
+// Process finding events
 ```
 
 ### Custom Configuration
@@ -396,7 +391,7 @@ let cfg = LocalConfig {
 
 cfg.validate(&engine);  // Panics on invalid config
 
-let report = scan_local(engine, source, cfg, sink);
+let report = scan_local(engine, source, cfg);
 ```
 
 ### Custom FileSource
@@ -414,7 +409,7 @@ impl FileSource for MyFileSource {
 }
 
 let source = MyFileSource { pending: vec![...] };
-let report = scan_local(engine, source, LocalConfig::default(), sink);
+let report = scan_local(engine, source, LocalConfig::default());
 ```
 
 ## Invariants and Guarantees

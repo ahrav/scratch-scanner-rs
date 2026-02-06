@@ -943,12 +943,13 @@ impl From<ArtifactAcquireError> for GitScanError {
 #[allow(clippy::too_many_arguments)]
 pub fn run_git_scan(
     repo_root: &Path,
-    engine: &Engine,
+    engine: std::sync::Arc<Engine>,
     resolver: &dyn StartSetResolver,
     seen_store: &dyn SeenBlobStore,
     watermark_store: &dyn RefWatermarkStore,
     persist_store: Option<&dyn PersistenceStore>,
     config: &GitScanConfig,
+    event_sink: std::sync::Arc<dyn crate::unified::events::EventSink>,
 ) -> Result<GitScanResult, GitScanError> {
     super::perf::reset();
 
@@ -986,11 +987,23 @@ pub fn run_git_scan(
         GitScanMode::OdbBlobFast => {
             let cg_index = CommitGraphIndex::build(&cg)?;
             super::runner_odb_blob::run_odb_blob(
-                &repo, engine, seen_store, &cg_index, &plan, config,
+                &repo,
+                std::sync::Arc::clone(&engine),
+                seen_store,
+                &cg_index,
+                &plan,
+                config,
+                std::sync::Arc::clone(&event_sink),
             )?
         }
         GitScanMode::DiffHistory => super::runner_diff_history::run_diff_history(
-            &repo, engine, seen_store, &cg, &plan, config,
+            &repo,
+            std::sync::Arc::clone(&engine),
+            seen_store,
+            &cg,
+            &plan,
+            config,
+            std::sync::Arc::clone(&event_sink),
         )?,
     };
     output.stage_nanos.commit_plan = commit_plan_nanos;

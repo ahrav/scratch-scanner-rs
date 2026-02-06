@@ -43,17 +43,14 @@
 //! use std::sync::Arc;
 //! use scanner_rs::engine::Engine;
 //! use scanner_rs::scheduler::parallel_scan::{parallel_scan_dir, ParallelScanConfig};
-//! use scanner_rs::scheduler::output_sink::StdoutSink;
 //!
 //! let engine = Arc::new(Engine::new(rules, transforms, tuning));
 //! let config = ParallelScanConfig::default();
-//! let sink = Arc::new(StdoutSink::new());
 //!
 //! let report = parallel_scan_dir(
 //!     "/path/to/scan",
 //!     engine,
 //!     config,
-//!     sink,
 //! )?;
 //!
 //! println!("Scanned {} files, {} bytes", report.stats.files_enqueued, report.metrics.bytes_scanned);
@@ -90,7 +87,6 @@
 //! With defaults (workers=N, pool=4N, chunk=256K, overlap≈256): ~1 MiB per worker.
 
 use super::local::{scan_local, FileSource, LocalConfig, LocalFile, LocalReport};
-use super::output_sink::OutputSink;
 use crate::archive::ArchiveConfig;
 use crate::engine::Engine;
 
@@ -209,7 +205,7 @@ fn local_file_from_entry<E: EntryLike>(entry: E) -> Option<LocalFile> {
 /// - Peak: ~8 MiB for buffers
 ///
 /// Additional memory for file metadata: ~200 bytes per in-flight file.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ParallelScanConfig {
     /// Number of worker threads for parallel scanning.
     ///
@@ -280,6 +276,12 @@ pub struct ParallelScanConfig {
 
     /// Archive scanning configuration.
     pub archive: ArchiveConfig,
+
+    /// Structured event sink for finding output.
+    ///
+    /// All findings are emitted as structured events through this sink.
+    /// Defaults to [`NullEventSink`](crate::unified::events::NullEventSink).
+    pub event_sink: Arc<dyn crate::unified::events::EventSink>,
 }
 
 impl Default for ParallelScanConfig {
@@ -297,7 +299,27 @@ impl Default for ParallelScanConfig {
             respect_gitignore: true,
             max_file_size: 100 * 1024 * 1024, // 100 MiB
             archive: ArchiveConfig::default(),
+            event_sink: Arc::new(crate::unified::events::NullEventSink),
         }
+    }
+}
+
+impl std::fmt::Debug for ParallelScanConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParallelScanConfig")
+            .field("workers", &self.workers)
+            .field("chunk_size", &self.chunk_size)
+            .field("pool_buffers", &self.pool_buffers)
+            .field("max_in_flight_objects", &self.max_in_flight_objects)
+            .field("local_queue_cap", &self.local_queue_cap)
+            .field("seed", &self.seed)
+            .field("follow_symlinks", &self.follow_symlinks)
+            .field("skip_hidden", &self.skip_hidden)
+            .field("respect_gitignore", &self.respect_gitignore)
+            .field("max_file_size", &self.max_file_size)
+            .field("archive", &self.archive)
+            .field("event_sink", &"<dyn EventSink>")
+            .finish()
     }
 }
 
@@ -319,6 +341,7 @@ impl ParallelScanConfig {
             seed: self.seed,
             dedupe_within_chunk: true,
             archive: self.archive.clone(),
+            event_sink: self.event_sink.clone(),
         }
     }
 }
@@ -487,16 +510,13 @@ impl FileSource for SingleFileSource {
 /// use std::sync::Arc;
 /// use scanner_rs::engine::Engine;
 /// use scanner_rs::scheduler::parallel_scan::{parallel_scan_dir, ParallelScanConfig};
-/// use scanner_rs::scheduler::output_sink::VecSink;
 ///
 /// let engine = Arc::new(Engine::new(rules, transforms, tuning));
-/// let sink = Arc::new(VecSink::new());
 ///
 /// let report = parallel_scan_dir(
 ///     "/path/to/scan",
 ///     engine,
 ///     ParallelScanConfig::default(),
-///     sink,
 /// )?;
 ///
 /// println!("Files: {}, Bytes: {}, I/O errors: {}",
@@ -508,7 +528,6 @@ pub fn parallel_scan_dir(
     root: impl AsRef<Path>,
     engine: Arc<Engine>,
     config: ParallelScanConfig,
-    output: Arc<dyn OutputSink>,
 ) -> io::Result<ParallelScanReport> {
     let root = root.as_ref();
 
@@ -522,7 +541,7 @@ pub fn parallel_scan_dir(
 
     // Handle single-file case: don't use DirWalker for one file
     if root.is_file() {
-        return scan_single_file(root, engine, &config, output);
+        return scan_single_file(root, engine, &config);
     }
 
     // Verify directory is readable (early permission check)
@@ -537,7 +556,7 @@ pub fn parallel_scan_dir(
     let walker = DirWalker::new(root, &config);
 
     let local_config = config.to_local_config();
-    Ok(scan_local(engine, walker, local_config, output))
+    Ok(scan_local(engine, walker, local_config))
 }
 
 /// Scan a single file.
@@ -547,7 +566,6 @@ fn scan_single_file(
     path: &Path,
     engine: Arc<Engine>,
     config: &ParallelScanConfig,
-    output: Arc<dyn OutputSink>,
 ) -> io::Result<ParallelScanReport> {
     let meta = std::fs::metadata(path)?;
     let size = meta.len();
@@ -559,7 +577,7 @@ fn scan_single_file(
     };
     let source = SingleFileSource(Some(file));
     let local_config = config.to_local_config();
-    Ok(scan_local(engine, source, local_config, output))
+    Ok(scan_local(engine, source, local_config))
 }
 
 // ============================================================================
@@ -570,7 +588,7 @@ fn scan_single_file(
 mod tests {
     use super::*;
     use crate::api::{RuleSpec, TransformConfig, Tuning, ValidatorKind};
-    use crate::scheduler::output_sink::VecSink;
+    use crate::unified::events::VecEventSink;
     use regex::bytes::Regex;
     use std::fs;
     use tempfile::TempDir;
@@ -641,7 +659,16 @@ mod tests {
             respect_gitignore: false,
             max_file_size: 10 * 1024 * 1024,
             archive: ArchiveConfig::default(),
+            event_sink: Arc::new(crate::unified::events::NullEventSink),
         }
+    }
+
+    /// Create a config with a `VecEventSink` for output assertions.
+    fn config_with_sink() -> (ParallelScanConfig, Arc<VecEventSink>) {
+        let sink = Arc::new(VecEventSink::new());
+        let mut cfg = small_config();
+        cfg.event_sink = Arc::clone(&sink) as Arc<dyn crate::unified::events::EventSink>;
+        (cfg, sink)
     }
 
     #[test]
@@ -649,7 +676,7 @@ mod tests {
         let rules = vec![simple_rule()];
         let transforms: Vec<TransformConfig> = vec![];
         let engine = Arc::new(Engine::new(rules, transforms, test_tuning()));
-        let sink = Arc::new(VecSink::new());
+        let (config, sink) = config_with_sink();
 
         // Create temp directory with files
         let dir = TempDir::new().unwrap();
@@ -659,7 +686,7 @@ mod tests {
         fs::write(&file1, "contains SECRETABCD1234 here").unwrap();
         fs::write(&file2, "another SECRETEFGH5678 secret").unwrap();
 
-        let report = parallel_scan_dir(dir.path(), engine, small_config(), sink.clone()).unwrap();
+        let report = parallel_scan_dir(dir.path(), engine, config).unwrap();
 
         assert_eq!(report.stats.files_enqueued, 2);
 
@@ -675,11 +702,11 @@ mod tests {
         let rules = vec![simple_rule()];
         let transforms: Vec<TransformConfig> = vec![];
         let engine = Arc::new(Engine::new(rules, transforms, test_tuning()));
-        let sink = Arc::new(VecSink::new());
+        let (config, sink) = config_with_sink();
 
         let dir = TempDir::new().unwrap();
 
-        let report = parallel_scan_dir(dir.path(), engine, small_config(), sink.clone()).unwrap();
+        let report = parallel_scan_dir(dir.path(), engine, config).unwrap();
 
         assert_eq!(report.stats.files_enqueued, 0);
         assert!(sink.take().is_empty());
@@ -705,7 +732,7 @@ mod tests {
         let rules = vec![simple_rule()];
         let transforms: Vec<TransformConfig> = vec![];
         let engine = Arc::new(Engine::new(rules, transforms, test_tuning()));
-        let sink = Arc::new(VecSink::new());
+        let (mut config, _sink) = config_with_sink();
 
         let dir = TempDir::new().unwrap();
         let small_file = dir.path().join("small.txt");
@@ -714,13 +741,12 @@ mod tests {
         fs::write(&small_file, "SECRETABCD1234").unwrap();
 
         // Create a file larger than max_file_size
-        let mut config = small_config();
         config.max_file_size = 100;
 
         let large_content = vec![b'x'; 1000];
         fs::write(&large_file, &large_content).unwrap();
 
-        let report = parallel_scan_dir(dir.path(), engine, config, sink.clone()).unwrap();
+        let report = parallel_scan_dir(dir.path(), engine, config).unwrap();
 
         // Discovery enqueues both; open-time enforcement skips the large file.
         assert_eq!(report.stats.files_enqueued, 2);
@@ -732,9 +758,8 @@ mod tests {
         let rules = vec![simple_rule()];
         let transforms: Vec<TransformConfig> = vec![];
         let engine = Arc::new(Engine::new(rules, transforms, test_tuning()));
-        let sink = Arc::new(VecSink::new());
 
-        let result = parallel_scan_dir("/nonexistent/path", engine, small_config(), sink);
+        let result = parallel_scan_dir("/nonexistent/path", engine, small_config());
 
         assert!(result.is_err());
     }
@@ -754,9 +779,8 @@ mod tests {
         let rules = vec![simple_rule()];
         let transforms: Vec<TransformConfig> = vec![];
         let engine = Arc::new(Engine::new(rules, transforms, test_tuning()));
-        let sink = Arc::new(VecSink::new());
 
-        let result = parallel_scan_dir(&unreadable, engine, small_config(), sink);
+        let result = parallel_scan_dir(&unreadable, engine, small_config());
 
         // Restore permissions before assertions (for cleanup)
         let _ = fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o755));
@@ -786,9 +810,8 @@ mod tests {
         let rules = vec![simple_rule()];
         let transforms: Vec<TransformConfig> = vec![];
         let engine = Arc::new(Engine::new(rules, transforms, test_tuning()));
-        let sink = Arc::new(VecSink::new());
 
-        let result = parallel_scan_dir(dir.path(), engine, small_config(), sink.clone());
+        let result = parallel_scan_dir(dir.path(), engine, small_config());
 
         // Restore permissions before assertions
         let _ = fs::set_permissions(&subdir, fs::Permissions::from_mode(0o755));
@@ -805,14 +828,14 @@ mod tests {
         let rules = vec![simple_rule()];
         let transforms: Vec<TransformConfig> = vec![];
         let engine = Arc::new(Engine::new(rules, transforms, test_tuning()));
-        let sink = Arc::new(VecSink::new());
+        let (config, sink) = config_with_sink();
 
         let dir = TempDir::new().unwrap();
         let file = dir.path().join("single.txt");
         fs::write(&file, "SECRETABCD1234").unwrap();
 
         // Pass file path directly (not directory)
-        let result = parallel_scan_dir(&file, engine, small_config(), sink.clone());
+        let result = parallel_scan_dir(&file, engine, config);
 
         assert!(result.is_ok());
         let report = result.unwrap();
@@ -828,18 +851,17 @@ mod tests {
         let rules = vec![simple_rule()];
         let transforms: Vec<TransformConfig> = vec![];
         let engine = Arc::new(Engine::new(rules, transforms, test_tuning()));
-        let sink = Arc::new(VecSink::new());
+        let (mut config, sink) = config_with_sink();
 
         let dir = TempDir::new().unwrap();
         let file = dir.path().join("large.txt");
         let content = vec![b'x'; 1000];
         fs::write(&file, &content).unwrap();
 
-        let mut config = small_config();
         config.max_file_size = 100; // Smaller than file
 
         // Pass file path directly
-        let result = parallel_scan_dir(&file, engine, config, sink.clone());
+        let result = parallel_scan_dir(&file, engine, config);
 
         assert!(result.is_ok());
         let report = result.unwrap();
@@ -854,14 +876,14 @@ mod tests {
         let rules = vec![simple_rule()];
         let transforms: Vec<TransformConfig> = vec![];
         let engine = Arc::new(Engine::new(rules, transforms, test_tuning()));
-        let sink = Arc::new(VecSink::new());
+        let (config, sink) = config_with_sink();
 
         let dir = TempDir::new().unwrap();
         let file = dir.path().join("empty.txt");
         fs::write(&file, "").unwrap();
 
         // Pass empty file path directly
-        let result = parallel_scan_dir(&file, engine, small_config(), sink.clone());
+        let result = parallel_scan_dir(&file, engine, config);
 
         assert!(result.is_ok());
         let report = result.unwrap();

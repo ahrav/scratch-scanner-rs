@@ -39,15 +39,15 @@
 //!
 //! | Strategy | Condition | Parallelism |
 //! |---|---|---|
-//! | `Serial` | 1 worker, 0 plans, or tiny total decode work | Single-threaded, minimal overhead |
-//! | `PackParallel` | enough plans to saturate workers | One plan per worker, work-stealing via shared channel |
-//! | `IntraPackSharded` | fewer plans than workers, non-trivial decode work | Shard each plan with adaptive shard counts |
+//! | `Serial` | 1 worker, 0 plans, or tiny total decode work | Scheduler executes pack tasks with 1 worker |
+//! | `PackParallel` | enough plans to saturate workers | Scheduler executes pack tasks with `pack_exec_workers` |
+//! | `IntraPackSharded` | fewer plans than workers, non-trivial decode work | Scheduler executes pack tasks with `pack_exec_workers` |
 //!
 //! All three strategies produce **deterministic output order** by reassembling
 //! results in planned sequence, regardless of worker completion order.
 
 use std::io;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::scheduler::{alloc_stats, AllocStats};
@@ -57,31 +57,25 @@ use super::commit_walk::{CommitGraph, ParentScratch, PlannedCommit};
 use super::engine_adapter::{EngineAdapter, ScannedBlobs};
 use super::mapping_bridge::{MappingBridge, MappingBridgeConfig};
 use super::object_store::ObjectStore;
-use super::pack_cache::PackCache;
 use super::pack_candidates::CappedPackCandidateSink;
-use super::pack_exec::{
-    build_candidate_ranges, execute_pack_plan_with_scratch, execute_pack_plan_with_scratch_indices,
-    merge_pack_exec_reports, PackExecError, PackExecReport, PackExecScratch,
-};
 use super::pack_io::PackIo;
-use super::pack_plan::{build_pack_plans, PackPlanError};
-use super::pack_plan_model::PackPlan;
+use super::pack_plan::build_pack_plans;
 use super::policy_hash::MergeDiffMode;
 use super::repo_open::RepoJobState;
 use super::runner::{
     GitScanAllocStats, GitScanConfig, GitScanError, GitScanStageNanos, ScanModeOutput,
-    SkippedCandidate,
 };
 use super::seen_store::SeenBlobStore;
 use super::spiller::Spiller;
+use super::tree_delta_cache::TreeDeltaCache;
 use super::tree_diff::TreeDiffWalker;
 
 use super::runner_exec::{
-    append_scanned_blobs, build_exec_indices, build_pack_views, collect_loose_dirs,
-    collect_pack_dirs, collect_skipped_candidates, list_pack_files, load_midx, make_spill_dir,
-    merge_scanned_blobs, mmap_pack_files, per_worker_cache_bytes, resolve_pack_paths,
-    scan_loose_candidates, select_pack_exec_strategy, shard_count_for_pack, shard_ranges,
-    summarize_pack_plan_deps, PackExecStrategy, SpillCandidateSink,
+    append_scanned_blobs, auto_tree_delta_cache_bytes, build_pack_views, collect_loose_dirs,
+    collect_pack_dirs, execute_pack_plans_with_scheduler, list_pack_files, load_midx,
+    make_spill_dir, mmap_pack_files, per_worker_cache_bytes, resolve_pack_paths,
+    scan_loose_candidates, select_pack_exec_strategy, summarize_pack_plan_deps, PackExecStrategy,
+    SpillCandidateSink,
 };
 
 /// Runs the diff-history scan pipeline.
@@ -117,11 +111,12 @@ use super::runner_exec::{
 ///   indicating a concurrent `git gc` or `git repack`.
 pub(super) fn run_diff_history(
     repo: &RepoJobState,
-    engine: &Engine,
+    engine: Arc<Engine>,
     seen_store: &dyn SeenBlobStore,
     cg: &dyn CommitGraph,
     plan: &[PlannedCommit],
     config: &GitScanConfig,
+    event_sink: std::sync::Arc<dyn crate::unified::events::EventSink>,
 ) -> Result<ScanModeOutput, GitScanError> {
     let mut stage_nanos = GitScanStageNanos::default();
     let mut alloc_deltas = GitScanAllocStats::default();
@@ -134,7 +129,20 @@ pub(super) fn run_diff_history(
     };
 
     let mut spiller = Spiller::new(config.spill, repo.object_format.oid_len(), &spill_dir)?;
-    let mut object_store = ObjectStore::open(repo, &config.tree_diff, &spill_dir)?;
+    let midx = load_midx(repo)?;
+    // Scale tree delta-cache to repo size to reduce repeated base decode work
+    // while staying within the configured max cache budget.
+    let auto_cache_bytes = auto_tree_delta_cache_bytes(
+        midx.object_count(),
+        config.tree_diff.max_tree_delta_cache_bytes,
+    );
+    let tree_delta_cache = TreeDeltaCache::new(auto_cache_bytes);
+    let mut object_store = ObjectStore::open_with_tree_delta_cache(
+        repo,
+        &config.tree_diff,
+        &spill_dir,
+        tree_delta_cache,
+    )?;
     let mut walker = TreeDiffWalker::new(&config.tree_diff, repo.object_format.oid_len());
     // Reused across commits to avoid per-commit allocation for parent position lists.
     let mut parent_scratch = ParentScratch::new();
@@ -226,7 +234,6 @@ pub(super) fn run_diff_history(
     // The returned path arena owns all file-path bytes for the rest of the
     // pipeline.
     let spill_start = Instant::now();
-    let midx = load_midx(repo)?;
     let mut mapping_cfg = config.mapping;
     let default_mapping_cfg = MappingBridgeConfig::default();
     if mapping_cfg.max_packed_candidates >= default_mapping_cfg.max_packed_candidates {
@@ -246,6 +253,7 @@ pub(super) fn run_diff_history(
     let spill_stats = spiller.finalize(seen_store, &mut bridge)?;
     stage_nanos.spill = spill_start.elapsed().as_nanos() as u64;
     let (mapping_stats, mut sink, mapping_arena) = bridge.finish()?;
+    let mapping_arena = Arc::new(mapping_arena);
 
     // ── Stage 4: Pack planning ───────────────────────────────────────────
     let pack_plan_start = Instant::now();
@@ -296,7 +304,10 @@ pub(super) fn run_diff_history(
     let pack_exec_workers = config.pack_exec_workers.max(1);
     let pack_exec_strategy = select_pack_exec_strategy(pack_exec_workers, &plans);
     let plan_count = plans.len();
-    let loose_dirs = collect_loose_dirs(&repo.paths);
+    let loose_dirs = Arc::new(collect_loose_dirs(&repo.paths));
+    let pack_paths = Arc::new(pack_paths);
+    let pack_mmaps = Arc::new(pack_mmaps);
+    let spill_dir = Arc::new(spill_dir);
     let mut pack_exec_reports = Vec::with_capacity(plan_count);
     let mut skipped_candidates = Vec::new();
     let mut scanned = ScannedBlobs {
@@ -306,413 +317,63 @@ pub(super) fn run_diff_history(
 
     let pack_exec_start = Instant::now();
     let pack_exec_alloc_before: AllocStats = alloc_stats();
-    // All three branches below produce identical output for identical inputs.
-    // Parallel branches reassemble results in plan-sequence order to preserve
-    // determinism. Loose candidates are always scanned after packed plans,
-    // outside the parallel scope, because loose reads go through the object
-    // fan-out directory and are not contention-free across threads.
-    // Pre-allocate cache and scratch pools before strategy dispatch so no
-    // allocation happens inside worker closures (Tiger Style).
-    let mut prealloc_caches: Vec<PackCache> = (0..pack_exec_workers)
-        .map(|_| PackCache::new(pack_cache_bytes))
-        .collect();
-    let mut prealloc_scratches: Vec<PackExecScratch> = (0..pack_exec_workers)
-        .map(|_| PackExecScratch::default())
-        .collect();
-    let mut prealloc_adapters: Vec<EngineAdapter<'_>> = (0..pack_exec_workers)
-        .map(|_| EngineAdapter::new(engine, config.engine_adapter))
-        .collect();
-    let mut prealloc_externals: Vec<PackIo<'_>> = (0..pack_exec_workers)
-        .map(|_| PackIo::from_parts(midx, pack_paths.clone(), loose_dirs.clone(), config.pack_io))
-        .collect::<Result<Vec<_>, _>>()
+    if !plans.is_empty() {
+        let scheduler_workers = match pack_exec_strategy {
+            PackExecStrategy::Serial => 1,
+            PackExecStrategy::PackParallel | PackExecStrategy::IntraPackSharded { .. } => {
+                pack_exec_workers
+            }
+        };
+        let midx_bytes = repo
+            .mmaps
+            .midx
+            .clone()
+            .ok_or_else(|| GitScanError::Io(io::Error::other("midx bytes missing")))?;
+        let outputs = execute_pack_plans_with_scheduler(
+            Arc::clone(&engine),
+            event_sink.clone(),
+            midx_bytes,
+            repo.object_format,
+            Arc::clone(&pack_paths),
+            Arc::clone(&loose_dirs),
+            Arc::clone(&pack_mmaps),
+            Arc::clone(&mapping_arena),
+            Arc::clone(&spill_dir),
+            plans,
+            config.pack_decode,
+            config.pack_io,
+            config.engine_adapter,
+            pack_cache_bytes,
+            scheduler_workers,
+        )?;
+        for output in outputs {
+            pack_exec_reports.push(output.report);
+            skipped_candidates.extend(output.skipped);
+            append_scanned_blobs(&mut scanned, output.scanned);
+        }
+    }
+    if !sink.loose.is_empty() {
+        let mut adapter = EngineAdapter::new_with_event_sink(
+            engine.as_ref(),
+            config.engine_adapter,
+            event_sink.clone(),
+        );
+        adapter.reserve_results(sink.loose.len());
+        let mut external = PackIo::from_parts(
+            midx,
+            (*pack_paths).clone(),
+            (*loose_dirs).clone(),
+            config.pack_io,
+        )
         .map_err(GitScanError::PackIo)?;
-
-    match pack_exec_strategy {
-        PackExecStrategy::Serial => {
-            let mut cache = prealloc_caches.swap_remove(0);
-            let external = &mut prealloc_externals[0];
-            let adapter = &mut prealloc_adapters[0];
-            adapter.reserve_results(packed_len.saturating_add(loose_len));
-            let mut exec_scratch = prealloc_scratches.swap_remove(0);
-            for plan in &plans {
-                let pack_id = plan.pack_id as usize;
-                let pack_bytes = pack_mmaps
-                    .get(pack_id)
-                    .and_then(|mmap| mmap.as_ref())
-                    .ok_or(GitScanError::PackPlan(PackPlanError::PackIdOutOfRange {
-                        pack_id: plan.pack_id,
-                        pack_count: pack_mmaps.len(),
-                    }))?
-                    .as_ref();
-
-                let report = execute_pack_plan_with_scratch(
-                    plan,
-                    pack_bytes,
-                    &mapping_arena,
-                    &config.pack_decode,
-                    &mut cache,
-                    external,
-                    adapter,
-                    &spill_dir,
-                    &mut exec_scratch,
-                )?;
-                collect_skipped_candidates(plan, &report.skips, &mut skipped_candidates);
-                pack_exec_reports.push(report);
-            }
-
-            if !sink.loose.is_empty() {
-                scan_loose_candidates(
-                    &sink.loose,
-                    &mapping_arena,
-                    adapter,
-                    external,
-                    &mut skipped_candidates,
-                )?;
-            }
-
-            scanned = adapter.take_results();
-        }
-        PackExecStrategy::PackParallel => {
-            // Work-stealing: a bounded sync_channel acts as a shared queue.
-            // Workers pull the next plan when idle, naturally balancing load
-            // when pack sizes vary. The channel bound (= worker count) caps
-            // the number of in-flight plans to avoid over-committing memory.
-            std::thread::scope(|scope| -> Result<(), GitScanError> {
-                let (work_tx, work_rx) = mpsc::sync_channel::<(usize, PackPlan)>(pack_exec_workers);
-                let work_rx = Arc::new(Mutex::new(work_rx));
-                let (result_tx, result_rx) = mpsc::channel::<
-                    Result<
-                        (usize, PackExecReport, ScannedBlobs, Vec<SkippedCandidate>),
-                        PackExecError,
-                    >,
-                >();
-                let mut handles = Vec::with_capacity(pack_exec_workers);
-
-                for (mut cache, mut scratch) in
-                    prealloc_caches.drain(..).zip(prealloc_scratches.drain(..))
-                {
-                    let work_rx = Arc::clone(&work_rx);
-                    let result_tx = result_tx.clone();
-                    let pack_paths = pack_paths.clone();
-                    let loose_dirs = loose_dirs.clone();
-                    let pack_decode = config.pack_decode;
-                    let pack_io_limits = config.pack_io;
-                    let adapter_cfg = config.engine_adapter;
-                    let paths = &mapping_arena;
-                    let spill_dir = &spill_dir;
-                    let pack_mmaps = &pack_mmaps;
-
-                    handles.push(scope.spawn(move || {
-                        let mut external = match PackIo::from_parts(
-                            midx,
-                            pack_paths,
-                            loose_dirs,
-                            pack_io_limits,
-                        ) {
-                            Ok(external) => external,
-                            Err(err) => {
-                                let _ = result_tx
-                                    .send(Err(PackExecError::ExternalBase(err.to_string())));
-                                return;
-                            }
-                        };
-                        let mut adapter = EngineAdapter::new(engine, adapter_cfg);
-
-                        loop {
-                            let work = {
-                                let rx = work_rx.lock().expect("pack exec work queue poisoned");
-                                rx.recv()
-                            };
-                            let (seq, plan) = match work {
-                                Ok(work) => work,
-                                Err(_) => break,
-                            };
-
-                            let work_result = (|| {
-                                let pack_id = plan.pack_id as usize;
-                                let pack_bytes = pack_mmaps
-                                    .get(pack_id)
-                                    .and_then(|mmap| mmap.as_ref())
-                                    .ok_or_else(|| {
-                                        PackExecError::PackRead(format!(
-                                            "pack id {} out of range (pack count {})",
-                                            plan.pack_id,
-                                            pack_mmaps.len()
-                                        ))
-                                    })?
-                                    .as_ref();
-
-                                adapter.reserve_results(plan.candidate_offsets.len());
-                                let report = execute_pack_plan_with_scratch(
-                                    &plan,
-                                    pack_bytes,
-                                    paths,
-                                    &pack_decode,
-                                    &mut cache,
-                                    &mut external,
-                                    &mut adapter,
-                                    spill_dir,
-                                    &mut scratch,
-                                )?;
-
-                                let scanned = adapter.take_results();
-                                let mut skipped = Vec::new();
-                                collect_skipped_candidates(&plan, &report.skips, &mut skipped);
-
-                                Ok((seq, report, scanned, skipped))
-                            })();
-
-                            let should_break = work_result.is_err();
-                            if result_tx.send(work_result).is_err() || should_break {
-                                break;
-                            }
-                        }
-                    }));
-                }
-
-                // Drop the producer's clone of result_tx so the result channel
-                // closes once all workers finish, allowing the recv loop below
-                // to terminate.
-                drop(result_tx);
-
-                // Eagerly validate pack IDs before sending to workers so the
-                // producer thread surfaces the error, not a worker.
-                for (seq, plan) in plans.into_iter().enumerate() {
-                    let pack_id = plan.pack_id as usize;
-                    pack_mmaps
-                        .get(pack_id)
-                        .and_then(|mmap| mmap.as_ref())
-                        .ok_or(GitScanError::PackPlan(PackPlanError::PackIdOutOfRange {
-                            pack_id: plan.pack_id,
-                            pack_count: pack_mmaps.len(),
-                        }))?;
-
-                    if work_tx.send((seq, plan)).is_err() {
-                        return Err(GitScanError::PackExec(PackExecError::PackRead(
-                            "pack exec work queue closed".to_string(),
-                        )));
-                    }
-                }
-                drop(work_tx);
-
-                // Reassemble worker outputs by planned sequence index to
-                // guarantee deterministic result order.
-                let mut outputs: Vec<
-                    Option<(PackExecReport, ScannedBlobs, Vec<SkippedCandidate>)>,
-                > = (0..plan_count).map(|_| None).collect();
-                for _ in 0..plan_count {
-                    let output = result_rx.recv().map_err(|_| {
-                        GitScanError::PackExec(PackExecError::PackRead(
-                            "pack exec worker channel closed".to_string(),
-                        ))
-                    })?;
-                    let (seq, report, scanned_pack, skipped) = output?;
-                    outputs[seq] = Some((report, scanned_pack, skipped));
-                }
-
-                for handle in handles {
-                    handle.join().expect("pack exec worker panicked");
-                }
-
-                for output in outputs.into_iter() {
-                    let (report, scanned_pack, skipped) = output.expect("missing pack exec output");
-                    pack_exec_reports.push(report);
-                    skipped_candidates.extend(skipped);
-                    append_scanned_blobs(&mut scanned, scanned_pack);
-                }
-
-                Ok(())
-            })?;
-
-            if !sink.loose.is_empty() {
-                let mut adapter = EngineAdapter::new(engine, config.engine_adapter);
-                adapter.reserve_results(sink.loose.len());
-                let mut external = PackIo::from_parts(
-                    midx,
-                    pack_paths.clone(),
-                    loose_dirs.clone(),
-                    config.pack_io,
-                )
-                .map_err(GitScanError::PackIo)?;
-                scan_loose_candidates(
-                    &sink.loose,
-                    &mapping_arena,
-                    &mut adapter,
-                    &mut external,
-                    &mut skipped_candidates,
-                )?;
-                append_scanned_blobs(&mut scanned, adapter.take_results());
-            }
-        }
-        PackExecStrategy::IntraPackSharded { shard_counts } => {
-            // ── Pre-compute per-plan work on the main thread ──────
-            struct PlanWork<'a> {
-                plan: &'a PackPlan,
-                pack_bytes: &'a [u8],
-                exec_indices: Vec<usize>,
-                candidate_ranges: Vec<Option<(usize, usize)>>,
-                shard_ranges: Vec<(usize, usize)>,
-            }
-            let mut candidate_ranges_buf = Vec::new();
-            let plan_work: Vec<PlanWork<'_>> = plans
-                .iter()
-                .filter_map(|plan| {
-                    let pack_id = plan.pack_id as usize;
-                    let pack_bytes = pack_mmaps
-                        .get(pack_id)
-                        .and_then(|mmap| mmap.as_ref())?
-                        .as_ref();
-                    let exec_indices = build_exec_indices(plan);
-                    if exec_indices.is_empty() {
-                        return None;
-                    }
-                    build_candidate_ranges(plan, &mut candidate_ranges_buf);
-                    let candidate_ranges = candidate_ranges_buf.clone();
-                    let sc = shard_count_for_pack(&shard_counts, plan.pack_id);
-                    let sr = shard_ranges(exec_indices.len(), sc);
-                    Some(PlanWork {
-                        plan,
-                        pack_bytes,
-                        exec_indices,
-                        candidate_ranges,
-                        shard_ranges: sr,
-                    })
-                })
-                .collect();
-
-            let max_shards = plan_work
-                .iter()
-                .map(|pw| pw.shard_ranges.len())
-                .max()
-                .unwrap_or(0);
-            let actual_workers = pack_exec_workers.min(max_shards);
-
-            if actual_workers > 0 {
-                struct ShardOutput {
-                    plan_idx: usize,
-                    report: PackExecReport,
-                    scanned: ScannedBlobs,
-                    skipped: Vec<SkippedCandidate>,
-                }
-
-                // ── Single scope: spawn workers once ─────────────
-                let plan_work = &plan_work;
-                let shard_outputs =
-                    std::thread::scope(|scope| -> Result<Vec<Vec<ShardOutput>>, PackExecError> {
-                        let cache_slice = &mut prealloc_caches[..actual_workers];
-                        let scratch_slice = &mut prealloc_scratches[..actual_workers];
-                        let adapter_slice = &mut prealloc_adapters[..actual_workers];
-                        let external_slice = &mut prealloc_externals[..actual_workers];
-
-                        let handles: Vec<_> = cache_slice
-                            .iter_mut()
-                            .zip(scratch_slice.iter_mut())
-                            .zip(adapter_slice.iter_mut())
-                            .zip(external_slice.iter_mut())
-                            .enumerate()
-                            .map(|(worker_idx, (((cache, scratch), adapter), external))| {
-                                let paths = &mapping_arena;
-                                let spill_dir = &spill_dir;
-                                let pack_decode = config.pack_decode;
-
-                                scope.spawn(move || {
-                                    let mut outputs = Vec::new();
-                                    for (plan_idx, pw) in plan_work.iter().enumerate() {
-                                        if worker_idx >= pw.shard_ranges.len() {
-                                            continue;
-                                        }
-                                        let (start, end) = pw.shard_ranges[worker_idx];
-                                        let exec_slice = &pw.exec_indices[start..end];
-
-                                        let shard_candidates: usize = exec_slice
-                                            .iter()
-                                            .filter_map(|idx| {
-                                                pw.candidate_ranges[*idx].map(|(s, e)| e - s)
-                                            })
-                                            .sum();
-                                        adapter.clear_results();
-                                        adapter.reserve_results(shard_candidates);
-
-                                        cache.ensure_capacity(pack_cache_bytes);
-
-                                        let report = execute_pack_plan_with_scratch_indices(
-                                            pw.plan,
-                                            pw.pack_bytes,
-                                            paths,
-                                            &pack_decode,
-                                            cache,
-                                            external,
-                                            adapter,
-                                            spill_dir,
-                                            scratch,
-                                            exec_slice,
-                                            &pw.candidate_ranges,
-                                        )?;
-
-                                        let mut skipped = Vec::new();
-                                        collect_skipped_candidates(
-                                            pw.plan,
-                                            &report.skips,
-                                            &mut skipped,
-                                        );
-
-                                        outputs.push(ShardOutput {
-                                            plan_idx,
-                                            report,
-                                            scanned: adapter.take_results(),
-                                            skipped,
-                                        });
-                                    }
-                                    Ok(outputs)
-                                })
-                            })
-                            .collect();
-
-                        handles
-                            .into_iter()
-                            .map(|h| h.join().expect("pack exec worker panicked"))
-                            .collect()
-                    })?;
-
-                // ── Merge in plan-order then shard-order ─────────
-                let num_plans = plan_work.len();
-                let mut per_plan_reports: Vec<Vec<PackExecReport>> =
-                    (0..num_plans).map(|_| Vec::new()).collect();
-                let mut per_plan_shards: Vec<Vec<ScannedBlobs>> =
-                    (0..num_plans).map(|_| Vec::new()).collect();
-
-                for worker_outputs in shard_outputs {
-                    for output in worker_outputs {
-                        skipped_candidates.extend(output.skipped);
-                        per_plan_reports[output.plan_idx].push(output.report);
-                        per_plan_shards[output.plan_idx].push(output.scanned);
-                    }
-                }
-
-                for plan_idx in 0..num_plans {
-                    let reports = std::mem::take(&mut per_plan_reports[plan_idx]);
-                    let shards = std::mem::take(&mut per_plan_shards[plan_idx]);
-                    pack_exec_reports.push(merge_pack_exec_reports(reports));
-                    append_scanned_blobs(&mut scanned, merge_scanned_blobs(shards));
-                }
-            }
-
-            // ── Loose scan: reuse pooled adapter + PackIo ────────
-            if !sink.loose.is_empty() {
-                let loose_adapter = &mut prealloc_adapters[0];
-                loose_adapter.clear_results();
-                loose_adapter.reserve_results(sink.loose.len());
-                let external = &mut prealloc_externals[0];
-                scan_loose_candidates(
-                    &sink.loose,
-                    &mapping_arena,
-                    loose_adapter,
-                    external,
-                    &mut skipped_candidates,
-                )?;
-                append_scanned_blobs(&mut scanned, loose_adapter.take_results());
-            }
-        }
+        scan_loose_candidates(
+            &sink.loose,
+            mapping_arena.as_ref(),
+            &mut adapter,
+            &mut external,
+            &mut skipped_candidates,
+        )?;
+        append_scanned_blobs(&mut scanned, adapter.take_results());
     }
     stage_nanos.pack_exec = pack_exec_start.elapsed().as_nanos() as u64;
     let pack_exec_alloc_after = alloc_stats();
@@ -720,7 +381,8 @@ pub(super) fn run_diff_history(
 
     Ok(ScanModeOutput {
         scanned,
-        path_arena: mapping_arena,
+        path_arena: Arc::try_unwrap(mapping_arena)
+            .map_err(|_| GitScanError::Io(io::Error::other("path arena still shared")))?,
         skipped_candidates,
         pack_exec_reports,
         pack_plan_stats,

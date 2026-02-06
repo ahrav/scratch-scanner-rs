@@ -60,7 +60,6 @@
 //! |--------|---------|
 //! | [`count_budget`] | Integer-based permits (e.g., max concurrent fetches) |
 //! | [`findings`] | Per-worker finding buffers with dedup via [`SecretHash`] |
-//! | [`output_sink`] | Pluggable finding destinations (stdout, file, vec) |
 //! | [`ts_buffer_pool`] | Thread-safe buffer recycling to avoid allocation churn |
 //! | [`ts_chunk`] | Thread-safe chunk wrapper for cross-thread handoff |
 //! | [`worker_id`] | Thread-local worker ID for metrics/debugging |
@@ -207,8 +206,7 @@
 //!
 //! - **Core**: [`Executor`], [`ExecutorConfig`], [`WorkerCtx`], [`ByteBudget`],
 //!   [`TokenBudget`], [`ChunkParams`], [`RunConfig`], [`Limits`]
-//! - **Supporting**: [`CountBudget`], [`TsBufferPool`], [`OutputSink`] variants,
-//!   [`WorkerFindingsBuffer`]
+//! - **Supporting**: [`CountBudget`], [`TsBufferPool`], [`WorkerFindingsBuffer`]
 //! - **Local scanning**: [`scan_local`], [`LocalConfig`], [`scan_local_fs_uring`] (Linux)
 //! - **Advanced**: [`affinity`] functions, [`failure`] types, [`sim`] harness
 
@@ -227,7 +225,6 @@ pub mod engine_impl;
 pub mod engine_stub;
 pub mod engine_trait;
 pub mod findings;
-pub mod output_sink;
 pub mod ts_buffer_pool;
 pub mod ts_chunk;
 pub mod worker_id;
@@ -283,7 +280,6 @@ pub use engine_stub::{
 };
 pub use engine_trait::{EngineScratch, FindingRecord, ScanEngine};
 pub use findings::{GlobalFindingsCollector, SecretHash, WorkerFindingsBuffer};
-pub use output_sink::{FileSink, NullSink, OutputSink, StdoutSink, VecSink};
 pub use ts_buffer_pool::{TsBufferHandle, TsBufferPool, TsBufferPoolConfig};
 pub use ts_chunk::TsChunk;
 pub use worker_id::{current_worker_id, set_current_worker_id};

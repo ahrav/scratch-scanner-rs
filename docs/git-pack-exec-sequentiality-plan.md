@@ -448,8 +448,6 @@ scan stats:
 
 3. ~~**Binary blob detection**~~ — ✅ DONE (Item 2.5c). See results below.
 
-4. ~~**Fast-path for zero-hit chunks**~~ — ✅ DONE (Item 2.5d). See results below.
-
 ### Implementation Details
 
 **Counters added (behind `git-perf` feature flag):**
@@ -702,285 +700,25 @@ scan stats:
 
 6. **Next bottleneck: per-chunk orchestration overhead** — With the memcpy eliminated, the remaining "other" is dominated by the per-chunk cost of entering and exiting `scan_chunk_into`. For repos with 600K+ zero-hit chunks (tensorflow: 619K), this adds up to >100s of intrinsic overhead. Further optimization requires either (a) reducing per-chunk cost in the engine itself or (b) skipping chunks entirely when possible.
 
-### Item 2.5d — Zero-Hit Chunk Prefilter Bypass
+### Cumulative Impact: Items 2.5a through 2.5c
 
-**Date:** 2026-02-05
-
-**Goal:** Eliminate per-chunk orchestration overhead for zero-hit chunks (62-95% of all chunks) by hoisting the Vectorscan prefilter above `reset_for_scan()` in `scan_chunk_into`. If zero hits, return immediately — skipping scratch reset, work-queue setup, and the entire orchestration layer.
-
-**Changes implemented:**
-
-1. **Hoist prefilter above reset** — Run Vectorscan `scan_raw()` directly in `scan_chunk_into` *before* `reset_for_scan()`. Only the prefilter accumulator state (`touched_pairs`, `hit_acc_pool`) and VS scratch are needed; everything else is deferred.
-
-2. **Fast path for zero-hit chunks** — When `touched_pairs.is_empty()` after prefilter, clear only `out`/`norm_hash`/`drop_hint_end` (what callers read) and return immediately. Skips: scratch reset (~28 fields), work-queue push/dispatch, `scan_rules_on_buffer` entry, transform loop, finding extraction.
-
-3. **Selective reset for hit path** — New `reset_for_scan_after_prefilter()` clears all scratch state *except* `hit_acc_pool`/`touched_pairs`, preserving prefilter results. One-shot flag `root_prefilter_done` signals `scan_rules_on_buffer` to skip its redundant prefilter run for the root buffer.
-
-4. **Extract `ensure_capacity()`** — Idempotent capacity validation extracted from `reset_for_scan` into its own method, called once at the top of `scan_chunk_into`.
-
-**New perf counter:** `scan_prefilter_bypass_count` — tracks how often the fast path fires.
-
-**Files modified:**
-- `src/engine/scratch.rs` — `root_prefilter_done`, `root_prefilter_saw_utf16` fields; `ensure_capacity()` extraction; `reset_for_scan_after_prefilter()` method
-- `src/engine/core.rs` — Restructured `scan_chunk_into` preamble with prefilter-first gate (Steps A-F)
-- `src/engine/buffer_scan.rs` — Skip-prefilter gate consuming one-shot flag; removed dead `used_vectorscan` variable
-- `src/git_scan/perf.rs` — `scan_prefilter_bypass_count` counter (static, field, record fn, snapshot, reset)
-- `src/bin/git_scan.rs` — Display prefilter bypass stats in `--perf-breakdown`
-
-#### Post-Optimization Results (Post-2.5d)
-
-##### Scan Sub-Stage Breakdown (Post-2.5d)
-
-| Repository  | vs_prefilter       | validate          | transform       | reset        | sort_dedup   | **other**            |
-|-------------|-------------------|-------------------|-----------------|--------------|--------------|----------------------|
-| gitleaks    | 30.8% (0.231s)    | 45.4% (0.341s)    | 4.6% (0.035s)  | 0.0% (0.000s)| 0.0% (0.000s)| **19.2% (0.144s)**  |
-| go-git      | 67.5% (0.114s)    | 9.9% (0.017s)     | 2.1% (0.004s)  | 0.0% (0.000s)| 0.1% (0.000s)| **20.4% (0.034s)**  |
-| rocksdb     | 35.7% (5.375s)    | 2.0% (0.294s)     | 0.5% (0.076s)  | 0.1% (0.011s)| 0.0% (0.001s)| **61.8% (9.296s)**  |
-| react       | 48.2% (2.534s)    | 11.1% (0.587s)    | 0.2% (0.011s)  | 0.0% (0.000s)| 0.1% (0.003s)| **40.4% (2.127s)**  |
-| node        | 47.6% (25.838s)   | 4.0% (2.188s)     | 0.7% (0.391s)  | 0.0% (0.001s)| 0.0% (0.014s)| **47.6% (25.797s)** |
-| vscode      | 35.1% (19.439s)   | 26.9% (14.904s)   | 0.5% (0.273s)  | 0.0% (0.005s)| 0.0% (0.018s)| **37.5% (20.773s)** |
-| tensorflow  | 52.7% (36.602s)   | 2.6% (1.785s)     | 0.3% (0.228s)  | 0.0% (0.003s)| 0.0% (0.023s)| **44.4% (30.835s)** |
-
-##### Scan Stats (Post-2.5d)
-
-| Repository  | blobs    | chunks   | zero_hit_chunks (%)    | findings  | chunker_bypass (%) | binary_skip | prefilter_bypass (%) |
-|-------------|----------|----------|------------------------|-----------|--------------------|-------------|----------------------|
-| gitleaks    | 5,747    | 5,748    | 3,749 (65.2%)          | 9,446     | 5,746 (100.0%)     | 177         | 3,749 (65.2%)        |
-| go-git      | 9,548    | 9,548    | 9,039 (94.7%)          | 80        | 9,548 (100.0%)     | 2           | 9,039 (94.7%)        |
-| rocksdb     | 65,131   | 65,134   | 46,747 (71.8%)         | 71        | 65,128 (100.0%)    | 140         | 46,747 (71.8%)       |
-| react       | 107,232  | 107,232  | 98,943 (92.3%)         | 3,070     | 107,232 (100.0%)   | 363         | 98,943 (92.3%)       |
-| node        | 493,851  | 494,954  | 451,217 (91.2%)        | 11,464    | 493,220 (99.9%)    | 1,208       | 451,217 (91.2%)      |
-| vscode      | 443,973  | 444,226  | 277,207 (62.4%)        | 98,565    | 443,768 (100.0%)   | 973         | 277,207 (62.4%)      |
-| tensorflow  | 693,490  | 694,694  | 619,416 (89.2%)        | 14,604    | 692,351 (99.8%)    | 1,050       | 619,416 (89.2%)      |
-
-##### Before/After Comparison: sink_emit total time
-
-| Repository  | Before (sink_emit) | After (sink_emit) | Delta (s)   | Delta (%)  |
-|-------------|--------------------|--------------------|-------------|------------|
-| gitleaks    | 1.093s             | 0.753s             | **-0.340s** | **-31.1%** |
-| go-git      | 0.547s             | 0.185s             | **-0.362s** | **-66.2%** |
-| rocksdb     | 23.326s            | 15.096s            | **-8.230s** | **-35.3%** |
-| react       | 10.311s            | 5.321s             | **-4.990s** | **-48.4%** |
-| node        | 102.066s           | 54.579s            | **-47.487s**| **-46.5%** |
-| vscode      | 74.477s            | 55.769s            | **-18.708s**| **-25.1%** |
-| tensorflow  | 150.505s           | 69.962s            | **-80.543s**| **-53.5%** |
-
-##### Before/After Comparison: scan sub-stage "other"
-
-| Repository  | Before (other %)  | Before (other s) | After (other %) | After (other s) | Delta (s)    | Delta (%)  |
-|-------------|-------------------|-------------------|-----------------|-----------------|--------------|------------|
-| gitleaks    | 33.3%             | 0.360s            | 19.2%           | 0.144s          | **-0.216s**  | **-60.0%** |
-| go-git      | 75.2%             | 0.409s            | 20.4%           | 0.034s          | **-0.375s**  | **-91.7%** |
-| rocksdb     | 74.0%             | 17.238s           | 61.8%           | 9.296s          | **-7.942s**  | **-46.1%** |
-| react       | 68.8%             | 7.024s            | 40.4%           | 2.127s          | **-4.897s**  | **-69.7%** |
-| node        | 68.8%             | 69.900s           | 47.6%           | 25.797s         | **-44.103s** | **-63.1%** |
-| vscode      | 49.7%             | 36.810s           | 37.5%           | 20.773s         | **-16.037s** | **-43.6%** |
-| tensorflow  | 74.3%             | 111.319s          | 44.4%           | 30.835s         | **-80.484s** | **-72.3%** |
-
-##### Full `--perf-breakdown` Output (Post-2.5d)
-
-**gitleaks:**
-```
-pack_exec breakdown:
-  decode: 176.5% (0.252s)
-  cache_lookup: 0.2% (0.000s)
-  fallback_resolve: 86.9% (0.124s)
-  sink_emit: 527.4% (0.753s)
-cache efficiency:
-  base_cache_hit_rate: 70.9% (2933/4137)
-  fallback_rate: 14.5%
-scan breakdown (within sink_emit):
-  vs_prefilter:  30.8% (0.231s)
-  validate:      45.4% (0.341s)
-  transform:     4.6% (0.035s)
-  reset:         0.0% (0.000s)
-  sort_dedup:    0.0% (0.000s)
-  other:         19.2% (0.144s)
-scan stats:
-  blobs: 5747  chunks: 5748  zero_hit_chunks: 3749 (65.2%)  findings: 9446
-  chunker_bypass: 5746 (100.0%)  binary_skip: 177  prefilter_bypass: 3749 (65.2%)
-```
-
-**go-git:**
-```
-pack_exec breakdown:
-  decode: 558.4% (0.353s)
-  cache_lookup: 0.6% (0.000s)
-  fallback_resolve: 337.1% (0.213s)
-  sink_emit: 293.5% (0.185s)
-cache efficiency:
-  base_cache_hit_rate: 67.0% (5489/8189)
-  fallback_rate: 18.0%
-scan breakdown (within sink_emit):
-  vs_prefilter:  67.5% (0.114s)
-  validate:      9.9% (0.017s)
-  transform:     2.1% (0.004s)
-  reset:         0.0% (0.000s)
-  sort_dedup:    0.1% (0.000s)
-  other:         20.4% (0.034s)
-scan stats:
-  blobs: 9548  chunks: 9548  zero_hit_chunks: 9039 (94.7%)  findings: 80
-  chunker_bypass: 9548 (100.0%)  binary_skip: 2  prefilter_bypass: 9039 (94.7%)
-```
-
-**rocksdb:**
-```
-pack_exec breakdown:
-  decode: 631.6% (11.876s)
-  cache_lookup: 0.3% (0.006s)
-  fallback_resolve: 420.7% (7.911s)
-  sink_emit: 802.9% (15.096s)
-cache efficiency:
-  base_cache_hit_rate: 56.7% (33758/59512)
-  fallback_rate: 22.8%
-scan breakdown (within sink_emit):
-  vs_prefilter:  35.7% (5.375s)
-  validate:      2.0% (0.294s)
-  transform:     0.5% (0.076s)
-  reset:         0.1% (0.011s)
-  sort_dedup:    0.0% (0.001s)
-  other:         61.8% (9.296s)
-scan stats:
-  blobs: 65131  chunks: 65134  zero_hit_chunks: 46747 (71.8%)  findings: 71
-  chunker_bypass: 65128 (100.0%)  binary_skip: 140  prefilter_bypass: 46747 (71.8%)
-```
-
-**react:**
-```
-pack_exec breakdown:
-  decode: 650.7% (9.052s)
-  cache_lookup: 0.4% (0.006s)
-  fallback_resolve: 565.6% (7.869s)
-  sink_emit: 382.4% (5.321s)
-cache efficiency:
-  base_cache_hit_rate: 66.6% (63309/95028)
-  fallback_rate: 7.4%
-scan breakdown (within sink_emit):
-  vs_prefilter:  48.2% (2.534s)
-  validate:      11.1% (0.587s)
-  transform:     0.2% (0.011s)
-  reset:         0.0% (0.000s)
-  sort_dedup:    0.1% (0.003s)
-  other:         40.4% (2.127s)
-scan stats:
-  blobs: 107232  chunks: 107232  zero_hit_chunks: 98943 (92.3%)  findings: 3070
-  chunker_bypass: 107232 (100.0%)  binary_skip: 363  prefilter_bypass: 98943 (92.3%)
-```
-
-**node:**
-```
-pack_exec breakdown:
-  decode: 814.2% (77.938s)
-  cache_lookup: 0.5% (0.050s)
-  fallback_resolve: 589.0% (56.388s)
-  sink_emit: 570.1% (54.579s)
-cache efficiency:
-  base_cache_hit_rate: 51.1% (201298/393956)
-  fallback_rate: 20.6%
-scan breakdown (within sink_emit):
-  vs_prefilter:  47.6% (25.838s)
-  validate:      4.0% (2.188s)
-  transform:     0.7% (0.391s)
-  reset:         0.0% (0.001s)
-  sort_dedup:    0.0% (0.014s)
-  other:         47.6% (25.797s)
-scan stats:
-  blobs: 493851  chunks: 494954  zero_hit_chunks: 451217 (91.2%)  findings: 11464
-  chunker_bypass: 493220 (99.9%)  binary_skip: 1208  prefilter_bypass: 451217 (91.2%)
-```
-
-**vscode:**
-```
-pack_exec breakdown:
-  decode: 704.6% (54.065s)
-  cache_lookup: 0.4% (0.029s)
-  fallback_resolve: 416.5% (31.960s)
-  sink_emit: 726.8% (55.769s)
-cache efficiency:
-  base_cache_hit_rate: 49.0% (152775/311479)
-  fallback_rate: 20.8%
-scan breakdown (within sink_emit):
-  vs_prefilter:  35.1% (19.439s)
-  validate:      26.9% (14.904s)
-  transform:     0.5% (0.273s)
-  reset:         0.0% (0.005s)
-  sort_dedup:    0.0% (0.018s)
-  other:         37.5% (20.773s)
-scan stats:
-  blobs: 443973  chunks: 444226  zero_hit_chunks: 277207 (62.4%)  findings: 98565
-  chunker_bypass: 443768 (100.0%)  binary_skip: 973  prefilter_bypass: 277207 (62.4%)
-```
-
-**tensorflow:**
-```
-pack_exec breakdown:
-  decode: 771.0% (113.965s)
-  cache_lookup: 0.4% (0.055s)
-  fallback_resolve: 616.2% (91.086s)
-  sink_emit: 473.3% (69.962s)
-cache efficiency:
-  base_cache_hit_rate: 49.5% (303642/613300)
-  fallback_rate: 18.6%
-scan breakdown (within sink_emit):
-  vs_prefilter:  52.7% (36.602s)
-  validate:      2.6% (1.785s)
-  transform:     0.3% (0.228s)
-  reset:         0.0% (0.003s)
-  sort_dedup:    0.0% (0.023s)
-  other:         44.4% (30.835s)
-scan stats:
-  blobs: 693490  chunks: 694694  zero_hit_chunks: 619416 (89.2%)  findings: 14604
-  chunker_bypass: 692351 (99.8%)  binary_skip: 1050  prefilter_bypass: 619416 (89.2%)
-```
-
-#### Key Findings from Item 2.5d
-
-1. **Prefilter bypass fires at the same rate as zero-hit chunks** — 62-95% of chunks across all 7 repos. The `prefilter_bypass` counter exactly matches `zero_hit_chunks`, confirming the fast path triggers correctly for every zero-hit chunk.
-
-2. **"Other" reduced 44-92% in absolute time** — The most impactful optimization yet:
-   - **go-git:** -91.7% (0.409s → 0.034s) — 94.7% zero-hit chunks, nearly all overhead eliminated
-   - **tensorflow:** -72.3% (111.3s → 30.8s) — 80.5s saved, by far the largest absolute reduction
-   - **react:** -69.7% (7.0s → 2.1s) — 92.3% zero-hit chunks
-   - **node:** -63.1% (69.9s → 25.8s) — 44.1s saved
-   - **gitleaks:** -60.0% (0.36s → 0.14s) — even with only 65% zero-hit chunks
-   - **rocksdb:** -46.1% (17.2s → 9.3s)
-   - **vscode:** -43.6% (36.8s → 20.8s) — lowest improvement due to lowest zero-hit rate (62.4%)
-
-3. **sink_emit total time reduced 25-66%** — Because "other" was the dominant component of sink_emit, eliminating it has a massive compounding effect:
-   - **go-git:** -66.2% (0.547s → 0.185s)
-   - **tensorflow:** -53.5% (150.5s → 70.0s)
-   - **react:** -48.4% (10.3s → 5.3s)
-   - **node:** -46.5% (102.1s → 54.6s)
-   - **rocksdb:** -35.3% (23.3s → 15.1s)
-   - **gitleaks:** -31.1% (1.09s → 0.75s)
-   - **vscode:** -25.1% (74.5s → 55.8s)
-
-4. **"Other" is no longer the dominant component** for most repos. Vectorscan prefilter is now the largest single component in 5 of 7 repos (go-git 67.5%, tensorflow 52.7%, react 48.2%, node 47.6%, rocksdb 35.7%). For gitleaks and vscode, validate dominates (45.4% and 26.9%) because they have high finding density.
-
-5. **Improvement correlates with zero-hit chunk ratio** — go-git (94.7% zero-hit) sees the biggest relative "other" reduction (-91.7%). vscode (62.4% zero-hit) sees the smallest (-43.6%). This confirms the optimization works precisely as designed: the more zero-hit chunks, the more overhead is eliminated.
-
-6. **No correctness regressions** — Finding counts are identical (gitleaks: 9,446, go-git: 80, rocksdb: 71, react: 3,070, node: 11,464, vscode: 98,565, tensorflow: 14,604). Blob/chunk counts unchanged. Cache hit rates unchanged. The optimization is purely about skipping unnecessary work on zero-hit chunks.
-
-7. **Remaining "other" is now the residual per-hit-chunk orchestration** — For hit chunks (5-38% of total), the work-queue dispatch, finding extraction, and transform loop overhead still exists. This is expected and proportional to actual work done. Further reduction would require restructuring the hit-path pipeline itself.
-
-### Cumulative Impact: Items 2.5a through 2.5d
-
-| Repository  | Original "other" (s) | Post-2.5a/b/c (s) | Post-2.5d (s) | Total reduction | Total reduction (%) |
-|-------------|----------------------|--------------------|---------------|-----------------|---------------------|
-| gitleaks    | 0.371s               | 0.360s             | 0.144s        | -0.227s         | -61.2%              |
-| go-git      | 0.508s               | 0.409s             | 0.034s        | -0.474s         | -93.3%              |
-| rocksdb     | 19.418s              | 17.238s            | 9.296s        | -10.122s        | -52.1%              |
-| react       | 9.070s               | 7.024s             | 2.127s        | -6.943s         | -76.5%              |
-| node        | 74.019s              | 69.900s            | 25.797s       | -48.222s        | -65.1%              |
-| vscode      | 37.289s              | 36.810s            | 20.773s       | -16.516s        | -44.3%              |
-| tensorflow  | 113.740s             | 111.319s           | 30.835s       | -82.905s        | -72.9%              |
+| Repository  | Original "other" (s) | Post-2.5a/b/c (s) | Total reduction | Total reduction (%) |
+|-------------|----------------------|--------------------|-----------------|---------------------|
+| gitleaks    | 0.371s               | 0.360s             | -0.011s         | -3.0%               |
+| go-git      | 0.508s               | 0.409s             | -0.099s         | -19.5%              |
+| rocksdb     | 19.418s              | 17.238s            | -2.180s         | -11.2%              |
+| react       | 9.070s               | 7.024s             | -2.046s         | -22.6%              |
+| node        | 74.019s              | 69.900s            | -4.119s         | -5.6%               |
+| vscode      | 37.289s              | 36.810s            | -0.479s         | -1.3%               |
+| tensorflow  | 113.740s             | 111.319s           | -2.421s         | -2.1%               |
 
 ### Next Steps
 
-- **Vectorscan prefilter is now the dominant cost** (35-68% of scan time) for low-finding-density repos. This is the inherent O(blob_bytes x pattern_complexity) DFA traversal — reducible only by optimizing the pattern set or reducing bytes scanned.
-- **Validate path is the dominant cost** for high-finding-density repos (gitleaks 45.4%, vscode 26.9%). Regex optimization or finding deduplication could help here.
+- **"Other" (scan_chunk_into orchestration) remains the dominant cost** (50-75% of scan time) for most repos. The RingChunker bypass eliminated memcpy overhead, but per-chunk orchestration (scratch reset, Vectorscan stream open/close, work-queue dispatch, finding extraction) is the remaining bottleneck.
+- **Validate path is the dominant cost** for high-finding-density repos (gitleaks 39%, vscode 20.9%). Regex optimization or finding deduplication could help here.
+- **Vectorscan prefilter is ~22-28% of scan time** — inherent O(blob_bytes × pattern_complexity) cost, reducible only by optimizing the pattern set.
 - Consider item 3 (cache under-provisioning) for large repos where cache hit rate is 49-51%
-- Re-evaluate whether further scan-path optimization has diminishing returns vs addressing `fallback_resolve` (32-91s on large repos)
+- Re-evaluate whether further scan-path optimization has diminishing returns vs addressing `fallback_resolve` (32-94s on large repos)
 
 ---
 
@@ -1655,13 +1393,12 @@ Based on sub-stage profiling across 7 repos showing **"other" (scan_chunk_into o
 4. ~~Item 2.5a (RingChunker bypass for small blobs)~~ - ✅ DONE (2025-02-05) - 99.8-100% of blobs take bypass. Reduced "other" by 1-23% absolute time.
 5. ~~Item 2.5b (Skip redundant capacity revalidation)~~ - ✅ DONE (2025-02-05) - `reset_for_scan` capacity checks skipped after first call. Reset overhead now 0.0%.
 6. ~~Item 2.5c (Binary blob detection)~~ - ✅ DONE (2025-02-05) - NUL-byte detection skips 2-1,208 binary blobs per repo.
-7. ~~Item 2.5d (Zero-hit chunk prefilter bypass)~~ - ✅ DONE (2026-02-05) - Hoists Vectorscan prefilter above reset. "Other" reduced 44-92% across 7 repos. sink_emit reduced 25-66%. **Most impactful single optimization.**
-8. ~~Item 4 (Pack-level vs intra-pack parallelism heuristic)~~ - ✅ DONE (2026-02-06) - Shipped stats-free adaptive selector + per-pack shard assignments in both scan modes.
-9. **Vectorscan pattern optimization** — Vectorscan prefilter is now the dominant cost (35-68%) for low-finding-density repos. Further scan-path optimization has diminishing returns.
-10. Item 3 (Cache under-provisioning in sharding) - May still be relevant for large repos (49-51% hit rate)
-11. Item 6 (External base prefetch) - fallback_resolve is 33-94s on large repos
-12. Item 7 (Parallelism tuning) - Lower priority
-13. Items 8-11 - Re-evaluate after addressing scan overhead
+7. ~~Item 4 (Pack-level vs intra-pack parallelism heuristic)~~ - ✅ DONE (2026-02-06) - Shipped stats-free adaptive selector + per-pack shard assignments in both scan modes.
+8. **Scan orchestration overhead** — "Other" (per-chunk orchestration in scan_chunk_into) remains the dominant scan cost (50-75%). Further optimization requires reducing per-chunk overhead or skipping chunks entirely.
+9. Item 3 (Cache under-provisioning in sharding) - May still be relevant for large repos (49-51% hit rate)
+10. Item 6 (External base prefetch) - fallback_resolve is 33-94s on large repos
+11. Item 7 (Parallelism tuning) - Lower priority
+12. Items 8-11 - Re-evaluate after addressing scan overhead
 
 ### Key Insights
 
