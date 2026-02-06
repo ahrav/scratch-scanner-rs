@@ -49,6 +49,15 @@ pub struct AtomicBitSet {
 unsafe impl Send for AtomicBitSet {}
 unsafe impl Sync for AtomicBitSet {}
 
+impl std::fmt::Debug for AtomicBitSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AtomicBitSet")
+            .field("bit_length", &self.bit_length)
+            .field("words_len", &self.words.len())
+            .finish()
+    }
+}
+
 impl AtomicBitSet {
     /// Creates an empty bitset with capacity for `bit_length` bits, all
     /// initialized to zero.
@@ -227,19 +236,19 @@ mod loom_tests {
 }
 
 // ---------------------------------------------------------------------------
-// Miri / concurrent smoke tests
+// Concurrent smoke tests (also valid under Miri / cargo miri test)
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod miri_tests {
+mod concurrent_tests {
     use super::*;
     use std::sync::Arc;
     use std::thread;
 
-    /// Basic single-threaded ops — Miri checks for UB in allocation,
-    /// indexing, and atomic ops.
+    /// Basic single-threaded ops — validates allocation, indexing,
+    /// and atomic ops.
     #[test]
-    fn miri_single_thread_ops() {
+    fn single_thread_ops() {
         let bs = AtomicBitSet::empty(128);
         assert!(bs.test_and_set(0));
         assert!(bs.test_and_set(63));
@@ -255,9 +264,9 @@ mod miri_tests {
         assert!(!bs.is_set(0));
     }
 
-    /// 4 threads race on overlapping bits — no data races, no UB.
+    /// 4 threads race on overlapping bits — no lost updates.
     #[test]
-    fn miri_concurrent_test_and_set() {
+    fn concurrent_test_and_set() {
         let bs = Arc::new(AtomicBitSet::empty(64));
         let handles: Vec<_> = (0..4)
             .map(|t| {
@@ -278,9 +287,9 @@ mod miri_tests {
         assert!(bs.count() > 0);
     }
 
-    /// Threads target different words — no false-sharing UB.
+    /// Threads target different words — no lost updates across words.
     #[test]
-    fn miri_concurrent_different_words() {
+    fn concurrent_different_words() {
         let bs = Arc::new(AtomicBitSet::empty(256));
         let handles: Vec<_> = (0..4)
             .map(|t| {
@@ -301,9 +310,9 @@ mod miri_tests {
         assert_eq!(bs.count(), 64); // 4 threads × 16 bits
     }
 
-    /// Set bits from threads, join, then clear — no UB in store-after-fetch_or.
+    /// Set bits from threads, join, then clear — validates clear after concurrent sets.
     #[test]
-    fn miri_clear_after_concurrent_sets() {
+    fn clear_after_concurrent_sets() {
         let bs = Arc::new(AtomicBitSet::empty(128));
         let handles: Vec<_> = (0..4)
             .map(|t| {
@@ -325,9 +334,9 @@ mod miri_tests {
         assert_eq!(bs.count(), 0);
     }
 
-    /// Small bitset (8 bits) with 4 threads doing many ops — stress under Miri.
+    /// Small bitset (8 bits) with 4 threads doing many ops — stress test.
     #[test]
-    fn miri_stress_small() {
+    fn stress_small() {
         let bs = Arc::new(AtomicBitSet::empty(8));
         let handles: Vec<_> = (0..4)
             .map(|_| {
