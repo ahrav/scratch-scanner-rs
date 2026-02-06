@@ -48,7 +48,7 @@ use super::commit_graph::CommitGraphIndex;
 use super::commit_walk::PlannedCommit;
 use super::engine_adapter::{EngineAdapter, ScannedBlobs};
 use super::errors::TreeDiffError;
-use super::mapping_bridge::{MappingBridge, MappingStats};
+use super::mapping_bridge::{MappingBridge, MappingBridgeConfig, MappingStats};
 use super::object_store::ObjectStore;
 use super::oid_index::OidIndex;
 use super::pack_cache::PackCache;
@@ -130,6 +130,13 @@ pub(super) fn run_odb_blob(
 
     let midx = load_midx(repo)?;
     let mut mapping_cfg = config.mapping;
+    let default_mapping_cfg = MappingBridgeConfig::default();
+    if mapping_cfg.max_packed_candidates >= default_mapping_cfg.max_packed_candidates {
+        // Default-or-higher caps are treated as soft budgets; scale to the
+        // repository object count so mapping does not fail on large repos.
+        mapping_cfg.max_packed_candidates =
+            mapping_cfg.max_packed_candidates.max(midx.object_count());
+    }
     mapping_cfg.path_arena_capacity = estimate_path_arena_capacity(
         mapping_cfg.path_arena_capacity,
         mapping_cfg.max_packed_candidates,

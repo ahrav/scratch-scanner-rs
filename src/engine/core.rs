@@ -232,6 +232,10 @@ pub struct Engine {
     /// Ring buffer size for stream-mode decoded scanning.
     /// Must accommodate the largest possible match span.
     pub(super) stream_ring_bytes: usize,
+    /// True when at least one transform has a non-`Disabled` mode.
+    /// Used by the zero-hit prefilter bypass to decide whether transforms
+    /// could discover encoded secrets invisible to the raw-buffer prefilter.
+    has_active_transforms: bool,
 }
 
 impl Engine {
@@ -747,6 +751,10 @@ impl Engine {
                 }
             }
         };
+        let has_active_transforms = transforms
+            .iter()
+            .any(|tc| tc.mode != TransformMode::Disabled);
+
         Self {
             rules: rules_compiled,
             transforms,
@@ -767,6 +775,7 @@ impl Engine {
             max_window_diameter_bytes,
             max_prefilter_width,
             stream_ring_bytes,
+            has_active_transforms,
         }
     }
 
@@ -897,14 +906,38 @@ impl Engine {
             }
         };
 
-        // ── Step E: FAST PATH — zero hits → skip everything ─────────────
+        // ── Step E: zero prefilter hits ───────────────────────────────────
+        //
+        // No Vectorscan pattern matched the root buffer. This means no regex
+        // validation is needed. However, transform discovery (Base64, URL-percent)
+        // MUST still run — encoded content may decode to secrets whose anchors
+        // are invisible in the raw bytes.
+        //
+        // Fast-path bypass is only safe when:
+        //   (a) no transforms are active, OR
+        //   (b) every active transform's buffer-level gate rejects this buffer
+        //       (meaning no anchor could appear in decoded form).
         if scratch.touched_pairs.is_empty() {
-            crate::git_scan::perf::record_scan_prefilter_bypass();
             crate::git_scan::perf::record_scan_zero_hit_chunk();
-            scratch.out.clear();
-            scratch.norm_hash.clear();
-            scratch.drop_hint_end.clear();
-            return;
+
+            let needs_transform_scan = self.has_active_transforms
+                && self.transforms.iter().any(|tc| {
+                    tc.mode != TransformMode::Disabled
+                        && root_buf.len() >= tc.min_len
+                        && super::transform::transform_quick_trigger(tc, root_buf)
+                        && self.base64_buffer_gate(tc, root_buf)
+                });
+
+            if !needs_transform_scan {
+                crate::git_scan::perf::record_scan_prefilter_bypass();
+                scratch.out.clear();
+                scratch.norm_hash.clear();
+                scratch.drop_hint_end.clear();
+                return;
+            }
+
+            // Fall through: transforms need to scan this buffer.
+            // scan_rules_on_buffer will be fast (zero touched_pairs = no regex work).
         }
 
         // ── Step F: HIT PATH — selective reset, set one-shot flag ───────

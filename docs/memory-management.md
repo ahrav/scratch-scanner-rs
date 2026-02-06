@@ -147,8 +147,10 @@ collects pack/loose candidates for downstream planning:
 - **Path arena**: bounded by `MappingBridgeConfig.path_arena_capacity`.
 - **Candidate caps**: `MappingBridgeConfig.max_packed_candidates` and
   `MappingBridgeConfig.max_loose_candidates` bound the in-memory vectors.
-- **Failure mode**: exceeding either cap returns
-  `SpillError::MappingCandidateLimitExceeded` and aborts the run before
+- **Overflow handling**: for default-or-higher packed caps, the runner scales
+  packed-candidate capacity with `midx.object_count` before mapping.
+- **Failure mode**: explicitly reduced caps are still hard limits; exceeding
+  either cap returns `SpillError::MappingCandidateLimitExceeded` before
   watermark advancement.
 
 ## ODB-Blob Scan Budgets

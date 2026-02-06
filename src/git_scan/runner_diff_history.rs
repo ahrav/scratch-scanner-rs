@@ -55,7 +55,7 @@ use crate::Engine;
 
 use super::commit_walk::{CommitGraph, ParentScratch, PlannedCommit};
 use super::engine_adapter::{EngineAdapter, ScannedBlobs};
-use super::mapping_bridge::MappingBridge;
+use super::mapping_bridge::{MappingBridge, MappingBridgeConfig};
 use super::object_store::ObjectStore;
 use super::pack_cache::PackCache;
 use super::pack_candidates::CappedPackCandidateSink;
@@ -227,13 +227,21 @@ pub(super) fn run_diff_history(
     // pipeline.
     let spill_start = Instant::now();
     let midx = load_midx(repo)?;
+    let mut mapping_cfg = config.mapping;
+    let default_mapping_cfg = MappingBridgeConfig::default();
+    if mapping_cfg.max_packed_candidates >= default_mapping_cfg.max_packed_candidates {
+        // Keep explicit low caps as hard limits; only scale default-or-higher
+        // caps to handle very large repositories.
+        mapping_cfg.max_packed_candidates =
+            mapping_cfg.max_packed_candidates.max(midx.object_count());
+    }
     let mut bridge = MappingBridge::new(
         &midx,
         CappedPackCandidateSink::new(
-            config.mapping.max_packed_candidates,
-            config.mapping.max_loose_candidates,
+            mapping_cfg.max_packed_candidates,
+            mapping_cfg.max_loose_candidates,
         ),
-        config.mapping,
+        mapping_cfg,
     );
     let spill_stats = spiller.finalize(seen_store, &mut bridge)?;
     stage_nanos.spill = spill_start.elapsed().as_nanos() as u64;
