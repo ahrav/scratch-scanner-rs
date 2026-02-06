@@ -106,11 +106,13 @@ Invoked during stream-mode scanning of decoded bytes:
 
 **Decoded-byte coordinate system:**
 ```
-VsStreamWindow {
+VsStreamWindow {           // 32B, #[repr(C)], fields ordered for minimal padding
   lo: u64,              // Window start (decoded bytes)
   hi: u64,              // Window end (decoded bytes)
-  force_full: bool,     // Request full decode scan if unbounded
   anchor_hint: u64,     // Hint for regex search start
+  rule_id: u32,         // Compiled rule identifier
+  variant_idx: u8,      // Variant::idx() (Raw/UTF-16LE/UTF-16BE)
+  force_full: bool,     // Request full decode scan if unbounded
 }
 ```
 

@@ -147,8 +147,10 @@ collects pack/loose candidates for downstream planning:
 - **Path arena**: bounded by `MappingBridgeConfig.path_arena_capacity`.
 - **Candidate caps**: `MappingBridgeConfig.max_packed_candidates` and
   `MappingBridgeConfig.max_loose_candidates` bound the in-memory vectors.
-- **Failure mode**: exceeding either cap returns
-  `SpillError::MappingCandidateLimitExceeded` and aborts the run before
+- **Overflow handling**: for default-or-higher packed caps, the runner scales
+  packed-candidate capacity with `midx.object_count` before mapping.
+- **Failure mode**: explicitly reduced caps are still hard limits; exceeding
+  either cap returns `SpillError::MappingCandidateLimitExceeded` before
   watermark advancement.
 
 ## ODB-Blob Scan Budgets
@@ -197,8 +199,6 @@ and the delta-base closure:
   resolver calls to prevent unbounded MIDX lookups.
 - Exec order: optional `Vec<u32>` of indices into `need_offsets` when forward
   dependencies exist.
-- Clusters: ranges over `need_offsets` split when gaps exceed
-  `CLUSTER_GAP_BYTES` (currently omitted because pack exec does not use them).
 
 Memory is linear in `candidates.len()` + `need_offsets.len()` with explicit
 caps on closure expansion and header parsing.
@@ -521,7 +521,7 @@ The overlap ensures patterns that span chunk boundaries are detected:
 ```rust
 pub struct ScanScratch {
     out: Vec<FindingRec>,           // Output findings
-    work_q: Vec<WorkItem>,          // Transform work queue
+    work_q: Vec<WorkItem>,          // Transform work queue (40B/item, packed flat struct)
     work_head: usize,               // Current work item index
     slab: DecodeSlab,               // Decoded buffer storage
     seen: FixedSet128,              // Deduplication set

@@ -3,7 +3,7 @@
 //! Builds per-pack plans that describe which offsets must be decoded to
 //! satisfy candidate blobs, including pack-local delta bases up to a
 //! configured depth. The plan also records delta dependencies and basic
-//! clustering hints for later execution strategies.
+//! execution metadata for later execution strategies.
 //!
 //! REF deltas whose base is missing from the current pack are treated as
 //! external dependencies and are not expanded further.
@@ -12,15 +12,12 @@
 //! 1. Group candidates by `pack_id`.
 //! 2. Parse entry headers for candidate offsets and resolve REF deltas.
 //! 3. Expand a pack-local base closure up to `max_delta_depth`.
-//! 4. Materialize sorted `need_offsets`, delta dependencies, exec order,
-//!    and (optionally) offset clusters.
+//! 4. Materialize sorted `need_offsets`, delta dependencies, and exec order.
 //!
 //! # Invariants
 //! - `need_offsets` is sorted and unique.
 //! - `candidate_offsets` is sorted by offset (ties by candidate index).
 //! - `exec_order` indices refer to `need_offsets`.
-//! - `clusters` are contiguous ranges within `need_offsets` split by
-//!   `CLUSTER_GAP_BYTES` when clustering is enabled.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -31,8 +28,7 @@ use super::object_id::OidBytes;
 use super::pack_candidates::PackCandidate;
 use super::pack_inflate::{EntryKind, PackFile, PackParseError};
 use super::pack_plan_model::{
-    BaseLoc, CandidateAtOffset, Cluster, DeltaDep, DeltaKind, PackPlan, PackPlanStats,
-    CLUSTER_GAP_BYTES, NONE_U32,
+    BaseLoc, CandidateAtOffset, DeltaDep, DeltaKind, PackPlan, PackPlanStats, NONE_U32,
 };
 
 /// Default safety bound for pack entry headers.
@@ -442,8 +438,6 @@ pub(crate) fn build_pack_plan_for_pack<'a, R: OidResolver>(
     let delta_deps = build_delta_deps(&need_offsets, &entry_cache, pack_id);
     let delta_dep_index = build_delta_dep_index(&need_offsets, &delta_deps);
     let exec_order = build_exec_order(&need_offsets, &delta_deps, pack_id)?;
-    // Pack exec does not currently consume clustering hints; skip computation.
-    let clusters = Vec::new();
 
     let external_bases = delta_deps
         .iter()
@@ -472,7 +466,6 @@ pub(crate) fn build_pack_plan_for_pack<'a, R: OidResolver>(
         delta_deps,
         delta_dep_index,
         exec_order,
-        clusters,
         stats,
     })
 }
@@ -703,43 +696,6 @@ fn build_exec_order(
     Ok(Some(order))
 }
 
-/// Cluster nearby offsets to reduce large seek gaps during execution.
-fn cluster_offsets(need_offsets: &[u64]) -> Vec<Cluster> {
-    // Split into clusters to limit seek gaps during pack reads.
-    if need_offsets.is_empty() {
-        return Vec::new();
-    }
-
-    let mut clusters = Vec::new();
-    let mut start_idx = 0usize;
-    let mut start_offset = need_offsets[0];
-    let mut last_offset = need_offsets[0];
-
-    for (idx, &offset) in need_offsets.iter().enumerate().skip(1) {
-        debug_assert!(offset >= last_offset, "need_offsets must be sorted");
-        if offset - last_offset > CLUSTER_GAP_BYTES {
-            clusters.push(Cluster {
-                start_idx: start_idx as u32,
-                end_idx: idx as u32,
-                start_offset,
-                end_offset: last_offset,
-            });
-            start_idx = idx;
-            start_offset = offset;
-        }
-        last_offset = offset;
-    }
-
-    clusters.push(Cluster {
-        start_idx: start_idx as u32,
-        end_idx: need_offsets.len() as u32,
-        start_offset,
-        end_offset: last_offset,
-    });
-
-    clusters
-}
-
 /// Span (last - first) for a sorted offset list.
 fn span_from_sorted(offsets: &[u64]) -> u64 {
     if offsets.is_empty() {
@@ -757,19 +713,6 @@ fn is_sorted_unique(offsets: &[u64]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn cluster_offsets_splits_on_gap() {
-        let offsets = vec![10, 20, 30, 1_048_700, 1_048_900, 3_200_000];
-        let clusters = cluster_offsets(&offsets);
-        assert_eq!(clusters.len(), 3);
-        assert_eq!(clusters[0].start_idx, 0);
-        assert_eq!(clusters[0].end_idx, 3);
-        assert_eq!(clusters[1].start_idx, 3);
-        assert_eq!(clusters[1].end_idx, 5);
-        assert_eq!(clusters[2].start_idx, 5);
-        assert_eq!(clusters[2].end_idx, 6);
-    }
 
     #[test]
     fn exec_order_emits_only_with_forward_deps() {

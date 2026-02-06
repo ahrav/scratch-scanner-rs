@@ -31,13 +31,12 @@
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::path::Path;
 
-use gix_commitgraph::{Graph, Position};
+use gix_commitgraph::Position;
 
 use super::commit_walk_limits::CommitWalkLimits;
 use super::errors::CommitPlanError;
-use super::object_id::{ObjectFormat, OidBytes};
+use super::object_id::OidBytes;
 use super::repo_open::{RepoJobState, StartSetRef};
 
 // =========================================================================
@@ -98,127 +97,12 @@ pub trait CommitGraph {
         max_parents: u32,
         scratch: &mut ParentScratch,
     ) -> Result<(), CommitPlanError>;
-}
-
-/// Thin wrapper around `gix_commitgraph::Graph` that validates OID lengths
-/// and provides consistent errors.
-pub struct CommitGraphView {
-    graph: Graph,
-    object_format: ObjectFormat,
-    num_commits: u32,
-}
-
-impl CommitGraphView {
-    /// Opens the commit-graph from the objects/info directory.
-    ///
-    /// # Arguments
-    ///
-    /// * `info_dir` - Path to `<repo>/objects/info/`
-    /// * `object_format` - SHA-1 or SHA-256 (for OID length validation)
-    ///
-    /// # Errors
-    ///
-    /// Returns `CommitGraphOpen` if the commit-graph file is missing,
-    /// corrupt, or uses an incompatible format version.
-    pub fn open(info_dir: &Path, object_format: ObjectFormat) -> Result<Self, CommitPlanError> {
-        let graph = Graph::at(info_dir).map_err(|e| CommitPlanError::CommitGraphOpen {
-            reason: e.to_string(),
-        })?;
-        let num_commits = graph.num_commits();
-
-        Ok(Self {
-            graph,
-            object_format,
-            num_commits,
-        })
-    }
-
-    /// Opens the commit-graph for a repo job state.
-    pub fn open_repo(repo: &RepoJobState) -> Result<Self, CommitPlanError> {
-        let info_dir = repo.paths.objects_dir.join("info");
-        Self::open(&info_dir, repo.object_format)
-    }
-
-    #[inline(always)]
-    fn commit(&self, pos: Position) -> gix_commitgraph::file::Commit<'_> {
-        debug_assert!(
-            pos.0 < self.num_commits,
-            "commit position {} out of range (graph has {} commits)",
-            pos.0,
-            self.num_commits,
-        );
-        self.graph.commit_at(pos)
-    }
-
     /// Returns the root tree OID for the commit at `pos`.
-    pub fn root_tree_oid(&self, pos: Position) -> Result<OidBytes, CommitPlanError> {
-        let commit = self.commit(pos);
-        let tree = commit.root_tree_id();
-        let oid = OidBytes::from_slice(tree.as_bytes());
-        debug_assert_eq!(
-            oid.len(),
-            self.object_format.oid_len(),
-            "tree oid length mismatch"
-        );
-        Ok(oid)
-    }
-
+    fn root_tree_oid(&self, pos: Position) -> Result<OidBytes, CommitPlanError>;
     /// Returns the commit OID for the commit at `pos`.
-    pub fn commit_oid(&self, pos: Position) -> Result<OidBytes, CommitPlanError> {
-        let commit = self.commit(pos);
-        let oid = OidBytes::from_slice(commit.id().as_bytes());
-        debug_assert_eq!(
-            oid.len(),
-            self.object_format.oid_len(),
-            "commit oid length mismatch"
-        );
-        Ok(oid)
-    }
-
+    fn commit_oid(&self, pos: Position) -> Result<OidBytes, CommitPlanError>;
     /// Returns the committer timestamp (seconds since epoch) for the commit at `pos`.
-    #[inline(always)]
-    pub fn committer_timestamp(&self, pos: Position) -> u64 {
-        self.commit(pos).committer_timestamp()
-    }
-}
-
-impl CommitGraph for CommitGraphView {
-    #[inline(always)]
-    fn num_commits(&self) -> u32 {
-        self.num_commits
-    }
-
-    #[inline(always)]
-    fn lookup(&self, oid: &OidBytes) -> Result<Option<Position>, CommitPlanError> {
-        let expected = self.object_format.oid_len() as usize;
-        let len = oid.len() as usize;
-        if len != expected {
-            return Err(CommitPlanError::InvalidOidLength { len, expected });
-        }
-        let gix_oid = gix_hash::oid::try_from_bytes(oid.as_slice())
-            .map_err(|_| CommitPlanError::InvalidOidLength { len, expected })?;
-        Ok(self.graph.lookup(gix_oid))
-    }
-
-    #[inline(always)]
-    fn generation(&self, pos: Position) -> u32 {
-        self.commit(pos).generation()
-    }
-
-    fn collect_parents(
-        &self,
-        pos: Position,
-        max_parents: u32,
-        scratch: &mut ParentScratch,
-    ) -> Result<(), CommitPlanError> {
-        scratch.clear();
-        let commit = self.commit(pos);
-        for p_result in commit.iter_parents() {
-            let p = p_result.map_err(|_| CommitPlanError::ParentDecodeFailed)?;
-            scratch.push(p, max_parents)?;
-        }
-        Ok(())
-    }
+    fn committer_timestamp(&self, pos: Position) -> u64;
 }
 
 // =========================================================================
@@ -350,6 +234,9 @@ impl VisitedCommitBitset {
     }
 
     /// Tests whether the bit at `pos` is set.
+    ///
+    /// # Panics
+    /// Panics (debug assertion) if `pos >= capacity`.
     #[inline(always)]
     pub fn test(&self, pos: Position) -> bool {
         debug_assert!(
@@ -368,6 +255,9 @@ impl VisitedCommitBitset {
     ///
     /// Returns `true` if this call newly marked the bit (was previously unset).
     /// Returns `false` if the bit was already set.
+    ///
+    /// # Panics
+    /// Panics (debug assertion) if `pos >= capacity`.
     #[inline(always)]
     pub fn test_and_set(&mut self, pos: Position) -> bool {
         debug_assert!(
@@ -587,7 +477,7 @@ impl RefRangeWalker {
 /// # Errors
 /// The iterator yields `Err` on commit-graph corruption or limit violations.
 /// Callers should stop consuming after the first error.
-pub struct CommitPlanIter<'a, CG: CommitGraph = CommitGraphView> {
+pub struct CommitPlanIter<'a, CG: CommitGraph> {
     cg: &'a CG,
     limits: CommitWalkLimits,
 
@@ -609,8 +499,9 @@ impl<'a, CG: CommitGraph> CommitPlanIter<'a, CG> {
     /// Creates a new introduced-by-commit iterator.
     ///
     /// # Errors
-    ///
-    /// Returns `CommitGraphTooLarge` if the graph exceeds the limit.
+    /// Returns `CommitGraphTooLarge` if the graph exceeds the configured limit.
+    /// Additional errors (e.g., `TipNotFound`, `HeapLimitExceeded`) are yielded
+    /// during iteration as `Err` items.
     pub fn new(
         repo: &'a RepoJobState,
         cg: &'a CG,
@@ -865,6 +756,13 @@ impl<CG: CommitGraph> Iterator for CommitPlanIter<'_, CG> {
 ///
 /// This is the safe default for "first introduction" semantics: ancestors
 /// are always emitted before descendants, even across merges.
+///
+/// # Errors
+/// Returns `CommitPlanError` if:
+/// - The commit-graph exceeds `limits.max_commits_in_graph`
+/// - A commit-graph lookup fails (corruption)
+/// - Heap size exceeds `limits.max_heap_entries`
+/// - Topological sort detects a cycle
 pub fn introduced_by_plan<CG: CommitGraph>(
     repo: &RepoJobState,
     cg: &CG,
@@ -903,6 +801,12 @@ pub fn introduced_by_plan<CG: CommitGraph>(
 /// # Guarantees
 /// - Parents appear before children (ancestor-first).
 /// - Deterministic order for identical inputs.
+///
+/// # Errors
+/// Returns `CommitPlanError` if:
+/// - The commit-graph exceeds `limits.max_commits_in_graph`
+/// - Parent collection fails for any commit
+/// - A cycle is detected in the subgraph (`TopoSortCycle`)
 pub fn topo_order_positions<CG: CommitGraph>(
     cg: &CG,
     positions: &[Position],

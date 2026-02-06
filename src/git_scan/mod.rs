@@ -1,24 +1,19 @@
 //! Git scanning pipeline modules.
 //!
-//! The preflight module performs a repository maintenance check: resolve repo
-//! layout, verify required artifacts (commit-graph and MIDX), and enforce pack
-//! count limits. Preflight must not read object contents.
-//!
-//! The repo_open module produces `RepoJobState`: it resolves repo paths,
-//! detects object format, memory-maps commit-graph and MIDX, records artifact
-//! fingerprints, and loads the start set plus watermarks needed for incremental
-//! Git scanning.
+//! The `repo_open` module produces `RepoJobState`: it resolves repo paths,
+//! detects object format, and loads the start set plus watermarks needed for
+//! incremental Git scanning. Artifacts (MIDX, commit-graph) are always built
+//! in memory by `artifact_acquire`.
 //!
 //! Pipeline overview:
-//! 1. `preflight` verifies repository layout and artifacts.
-//! 2. `repo_open` loads commit-graph/MIDX metadata and start set state.
-//! 3. `commit_walk` builds the commit plan.
-//! 4. `tree_diff` extracts candidate blobs and paths.
-//! 5. `spill` dedupes and filters candidates against the seen store.
-//! 6. `mapping_bridge` maps unique blobs to pack/loose candidates.
-//! 7. `pack_plan` builds per-pack decode plans from pack candidates.
-//! 8. `pack_exec` decodes blobs and streams bytes into `engine_adapter`.
-//! 9. `finalize` builds persistence ops, and `persist` commits them atomically.
+//! 1. `repo_open` loads commit-graph/MIDX metadata and start set state.
+//! 2. `commit_walk` builds the commit plan.
+//! 3. `tree_diff` extracts candidate blobs and paths.
+//! 4. `spill` dedupes and filters candidates against the seen store.
+//! 5. `mapping_bridge` maps unique blobs to pack/loose candidates.
+//! 6. `pack_plan` builds per-pack decode plans from pack candidates.
+//! 7. `pack_exec` decodes blobs and streams bytes into `engine_adapter`.
+//! 8. `finalize` builds persistence ops, and `persist` commits them atomically.
 //!
 //! # Output model
 //! - Metadata phases emit stable plans and candidate lists without reading blobs.
@@ -31,17 +26,21 @@
 //! - `git-perf` enables performance counters for pack decode and scan stages.
 //!
 //! # Invariants
-//! - Metadata stages (preflight through pack planning) do not read blob payloads.
+//! - Metadata stages (repo open through pack planning) do not read blob payloads.
 //! - Pack execution and engine adaptation read and scan blob bytes with explicit limits.
 //! - File reads are bounded by explicit limits.
 //! - Outputs are deterministic for identical repo state and configuration.
 
 pub mod alloc_guard;
+pub mod artifact_acquire;
 pub mod blob_introducer;
 pub mod blob_spill;
 pub mod byte_arena;
 pub mod bytes;
 pub mod commit_graph;
+pub mod commit_graph_mem;
+pub mod commit_loader;
+pub mod commit_parse;
 pub mod commit_walk;
 pub mod commit_walk_limits;
 pub mod engine_adapter;
@@ -50,6 +49,7 @@ pub mod finalize;
 pub mod limits;
 pub mod mapping_bridge;
 pub mod midx;
+pub mod midx_build;
 pub mod midx_error;
 pub mod object_id;
 pub mod object_store;
@@ -59,6 +59,7 @@ pub mod pack_candidates;
 pub mod pack_decode;
 pub mod pack_delta;
 pub mod pack_exec;
+pub mod pack_idx;
 pub mod pack_inflate;
 pub mod pack_io;
 pub mod pack_plan;
@@ -78,6 +79,9 @@ pub mod run_format;
 pub mod run_reader;
 pub mod run_writer;
 pub mod runner;
+pub mod runner_diff_history;
+pub mod runner_exec;
+pub mod runner_odb_blob;
 pub mod seen_store;
 pub mod snapshot_plan;
 pub mod spill_arena;
@@ -99,13 +103,23 @@ pub mod watermark_keys;
 pub mod work_items;
 
 pub use alloc_guard::{enabled as alloc_guard_enabled, set_enabled as set_alloc_guard_enabled};
+pub use artifact_acquire::{
+    acquire_commit_graph, acquire_midx, ArtifactAcquireError, ArtifactBuildLimits,
+    MidxAcquireResult,
+};
 pub use blob_introducer::{BlobIntroStats, BlobIntroducer, SeenSets};
 pub use byte_arena::{ByteArena, ByteRef};
 pub use bytes::BytesView;
 pub use commit_graph::CommitGraphIndex;
+pub use commit_graph_mem::CommitGraphMem;
+pub use commit_loader::{
+    collect_pack_dirs, load_commits_from_tips, resolve_pack_paths_from_midx, CommitLoadError,
+    CommitLoadLimits, LoadedCommit,
+};
+pub use commit_parse::{parse_commit, CommitParseError, CommitParseLimits, ParsedCommit};
 pub use commit_walk::{
-    introduced_by_plan, topo_order_positions, CommitGraph, CommitGraphView, CommitPlanIter,
-    ParentScratch, PlannedCommit,
+    introduced_by_plan, topo_order_positions, CommitGraph, CommitPlanIter, ParentScratch,
+    PlannedCommit,
 };
 pub use commit_walk_limits::CommitWalkLimits;
 pub use engine_adapter::{
@@ -121,6 +135,7 @@ pub use finalize::{
 pub use limits::RepoOpenLimits;
 pub use mapping_bridge::{MappingBridge, MappingBridgeConfig, MappingStats};
 pub use midx::MidxView;
+pub use midx_build::{build_midx_bytes, MidxBuildError, MidxBuildLimits};
 pub use object_id::{ObjectFormat, OidBytes};
 pub use object_store::{ObjectStore, TreeBytes, TreeSource};
 pub use oid_index::OidIndex;
@@ -137,11 +152,11 @@ pub use pack_exec::{
     CacheRejectHistogram, ExternalBase, ExternalBaseProvider, PackExecError, PackExecReport,
     PackExecStats, PackObjectSink, SkipReason, SkipRecord, CACHE_REJECT_BUCKETS,
 };
+pub use pack_idx::{IdxError, IdxOidIter, IdxView};
 pub use pack_io::{PackIo, PackIoError, PackIoLimits};
 pub use pack_plan::{build_pack_plans, OidResolver, PackPlanConfig, PackPlanError, PackView};
 pub use pack_plan_model::{
-    BaseLoc, CandidateAtOffset, Cluster, DeltaDep, DeltaKind, PackPlan, PackPlanStats,
-    CLUSTER_GAP_BYTES,
+    BaseLoc, CandidateAtOffset, DeltaDep, DeltaKind, PackPlan, PackPlanStats,
 };
 pub use pack_reader::{PackReadError, PackReader, SlicePackReader};
 pub use path_policy::PathClass;
@@ -155,8 +170,8 @@ pub use preflight_error::PreflightError;
 pub use preflight_limits::PreflightLimits;
 pub use repo::{GitRepoPaths, RepoKind};
 pub use repo_open::{
-    repo_open, ArtifactFingerprint, RefWatermarkStore, RepoArtifactFingerprint, RepoArtifactMmaps,
-    RepoArtifactPaths, RepoArtifactStatus, RepoJobState, StartSetRef, StartSetResolver,
+    repo_open, RefWatermarkStore, RepoArtifactFingerprint, RepoArtifactMmaps, RepoArtifactPaths,
+    RepoJobState, StartSetRef, StartSetResolver,
 };
 pub use run_format::{RunContext, RunHeader, RunRecord};
 pub use run_reader::RunReader;

@@ -1,9 +1,10 @@
-//! Per-scan scratch state and entropy histogram.
+//! Per-scan scratch state, entropy histogram, and root-span coordinate mapping.
 //!
-//! This module hosts `ScanScratch`, the primary allocation amortization vehicle
-//! for scans, and `EntropyScratch` for entropy gating calculations. Scratch
-//! state is single-threaded and reused across chunks to keep the hot path
-//! allocation-free.
+//! This module hosts [`ScanScratch`], the primary allocation amortization
+//! vehicle for scans, [`EntropyScratch`] for entropy gating calculations, and
+//! [`RootSpanMapCtx`] for translating decoded-byte offsets back to root-buffer
+//! coordinates during transform scans. Scratch state is single-threaded and
+//! reused across chunks to keep the hot path allocation-free.
 
 use crate::api::{DecodeStep, FileId, FindingRec, StepId, TransformConfig, TransformId, STEP_ROOT};
 use crate::scratch_memory::ScratchVec;
@@ -20,7 +21,6 @@ use super::vectorscan_prefilter::{VsScratch, VsStreamWindow};
 use super::work_items::{PendingDecodeSpan, PendingWindow, SpanStreamEntry, WorkItem};
 use regex::bytes::CaptureLocations;
 
-// Forward declaration for Engine (will be used via super::)
 use super::Engine;
 
 /// Normalized secret hash bytes (BLAKE3 output).
@@ -68,6 +68,10 @@ pub(super) struct RootSpanMapCtx {
 }
 
 impl RootSpanMapCtx {
+    /// Creates a new mapping context for the given transform and encoded span.
+    ///
+    /// The caller must ensure `tc` and `encoded` remain valid and unmodified
+    /// for the lifetime of this context (typically one scan invocation).
     pub(super) fn new(
         tc: &TransformConfig,
         encoded: &[u8],
@@ -83,6 +87,7 @@ impl RootSpanMapCtx {
         }
     }
 
+    /// Maps a decoded-byte span back to absolute root-buffer coordinates.
     pub(super) fn map_span(&self, span: std::ops::Range<usize>) -> std::ops::Range<usize> {
         // Map decoded offsets back to absolute root-buffer offsets.
         // SAFETY: The engine-owned transform config lives for the duration
@@ -95,8 +100,10 @@ impl RootSpanMapCtx {
         (root_start + start)..(root_start + end)
     }
 
-    // Returns true if a URL-percent trigger appears within the match span or
-    // within the guaranteed overlap prefix immediately preceding it.
+    /// Returns whether a URL-percent trigger (`%` or `+`) appears within the
+    /// match span or within the guaranteed overlap prefix preceding it.
+    ///
+    /// Returns `None` if this context is not for a URL-percent transform.
     pub(super) fn has_trigger_before_or_in_match(
         &self,
         root_span: std::ops::Range<usize>,
@@ -192,7 +199,14 @@ impl RootSpanMapCtx {
     }
 }
 
+// SAFETY: RootSpanMapCtx stores raw const pointers to Engine-owned data
+// (TransformConfig, encoded bytes). The Engine is immutable and outlives
+// all scratch instances. The context is always None between scans
+// (cleared after each buffer scan in core.rs).
+unsafe impl Send for RootSpanMapCtx {}
+
 impl EntropyScratch {
+    /// Returns a zeroed histogram with no tracked byte values.
     pub(super) fn new() -> Self {
         Self {
             counts: [0u32; 256],
@@ -331,7 +345,20 @@ pub struct ScanScratch {
     /// reconstruct the full decode path. This buffer holds the reversed chain
     /// during materialization. Capacity is bounded by `max_transform_depth`.
     pub(super) steps_buf: ScratchVec<DecodeStep>,
+    /// Active decoded→root coordinate mapping context (set during transform scans).
+    ///
+    /// Set by the scan loop before scanning a decoded buffer and cleared after
+    /// each buffer scan completes. When `Some`, findings from decoded buffers
+    /// use this context to map spans back to root-buffer offsets.
     pub(super) root_span_map_ctx: Option<RootSpanMapCtx>,
+    /// Set by `scan_chunk_into` after running the Vectorscan prefilter on the
+    /// root buffer. Consumed (one-shot) by the first `scan_rules_on_buffer`
+    /// call so that the root buffer skips redundant prefiltering. Transform
+    /// buffer calls see `false` and run the full prefilter as normal.
+    pub(super) root_prefilter_done: bool,
+    /// Whether the root prefilter detected UTF-16 anchor hits. Paired with
+    /// `root_prefilter_done`; only meaningful when that flag is `true`.
+    pub(super) root_prefilter_saw_utf16: bool,
     /// Overlap size inferred from the previous chunk in the same file.
     ///
     /// Used to determine whether a transform trigger before a match would have
@@ -362,9 +389,19 @@ pub struct ScanScratch {
     pub(super) vs_gate_scratch: Option<VsScratch>,
     #[cfg(feature = "b64-stats")]
     pub(super) base64_stats: Base64DecodeStats, // Base64 decode/gate instrumentation.
+    /// Set after the first `reset_for_scan` validates capacities.
+    ///
+    /// Since the `Engine` is immutable after construction, capacity checks
+    /// are idempotent — they only matter on the first call. Subsequent calls
+    /// skip the validation block for reduced per-chunk overhead.
+    capacity_validated: bool,
 }
 
 impl ScanScratch {
+    /// Allocates scratch state sized to the given engine's rules and tuning.
+    ///
+    /// All fixed-capacity buffers are pre-allocated here. Subsequent scans
+    /// reuse these allocations unless the engine's configuration has grown.
     pub(super) fn new(engine: &Engine) -> Self {
         let rules_len = engine.rules.len();
         let max_spans = engine
@@ -475,12 +512,15 @@ impl ScanScratch {
                     .expect("vectorscan gate scratch allocation failed")
             }),
             root_span_map_ctx: None,
+            root_prefilter_done: false,
+            root_prefilter_saw_utf16: false,
             chunk_overlap_backscan: 0,
             last_chunk_start: 0,
             last_chunk_len: 0,
             last_file_id: None,
             #[cfg(feature = "b64-stats")]
             base64_stats: Base64DecodeStats::default(),
+            capacity_validated: false,
         }
     }
 
@@ -489,7 +529,11 @@ impl ScanScratch {
     /// This may reallocate scratch buffers if the engine's tuning, rule set, or
     /// Vectorscan databases grew since the last scan. All previously returned
     /// slices into scratch buffers are invalid after this call.
+    ///
+    /// After the first successful call, capacity validation is skipped because
+    /// `Engine` is immutable after construction — all checks are idempotent.
     pub(super) fn reset_for_scan(&mut self, engine: &Engine) {
+        // ── Per-scan state clears (must always run) ──────────────────────
         self.out.clear();
         self.norm_hash.clear();
         self.drop_hint_end.clear();
@@ -523,6 +567,77 @@ impl ScanScratch {
         #[cfg(feature = "b64-stats")]
         self.base64_stats.reset();
 
+        // ── Per-scan accumulator resets (must always run) ────────────────
+        self.hit_acc_pool
+            .reset_touched(self.touched_pairs.as_slice());
+        self.touched_pairs.clear();
+        self.windows.clear();
+        self.expanded.clear();
+        self.spans.clear();
+
+        self.ensure_capacity(engine);
+    }
+
+    /// Resets per-scan state like `reset_for_scan` but **preserves** the
+    /// prefilter results already stored in `hit_acc_pool` and `touched_pairs`.
+    ///
+    /// Called on the hit path of `scan_chunk_into` after the hoisted
+    /// Vectorscan prefilter has populated accumulator state. Everything else
+    /// (output buffers, work queue, decode slab, etc.) is cleared normally.
+    pub(super) fn reset_for_scan_after_prefilter(&mut self, engine: &Engine) {
+        // ── Per-scan state clears (same as reset_for_scan) ──────────────
+        self.out.clear();
+        self.norm_hash.clear();
+        self.drop_hint_end.clear();
+        self.findings_dropped = 0;
+        self.work_q.clear();
+        self.work_head = 0;
+        self.slab.reset();
+        self.seen.reset();
+        self.seen_findings_scan.reset();
+        self.total_decode_output_bytes = 0;
+        self.work_items_enqueued = 0;
+        self.decode_ring.reset();
+        self.window_bytes.clear();
+        self.pending_windows.reset();
+        self.vs_stream_matches.clear();
+        self.pending_spans.clear();
+        self.span_streams.clear();
+        self.tmp_findings.clear();
+        self.tmp_drop_hint_end.clear();
+        self.tmp_norm_hash.clear();
+        for idx in self.stream_hit_touched.drain() {
+            let slot = idx as usize;
+            if let Some(hit) = self.stream_hit_counts.get_mut(slot) {
+                *hit = 0;
+            }
+        }
+        self.step_arena.reset();
+        self.utf16_buf.clear();
+        self.entropy_scratch.reset();
+        self.root_span_map_ctx = None;
+        #[cfg(feature = "b64-stats")]
+        self.base64_stats.reset();
+
+        // ── Skip hit_acc_pool / touched_pairs reset ─────────────────────
+        // Prefilter results are preserved; only clear the auxiliary buffers.
+        self.windows.clear();
+        self.expanded.clear();
+        self.spans.clear();
+
+        self.ensure_capacity(engine);
+    }
+
+    /// Idempotent capacity / Vectorscan-scratch validation.
+    ///
+    /// On the first call, validates and potentially reallocates all scratch
+    /// buffers to match the engine's current tuning and rule set. Subsequent
+    /// calls are no-ops because `Engine` is immutable after construction.
+    pub(super) fn ensure_capacity(&mut self, engine: &Engine) {
+        if self.capacity_validated {
+            return;
+        }
+
         match engine.vs.as_ref() {
             Some(db) => {
                 let need_alloc = match self.vs_scratch.as_ref() {
@@ -537,7 +652,6 @@ impl ScanScratch {
                 }
             }
             None => {
-                // Drop scratch if the engine no longer has vectorscan enabled.
                 self.vs_scratch = None;
             }
         }
@@ -609,12 +723,6 @@ impl ScanScratch {
                 self.vs_gate_scratch = None;
             }
         }
-        self.hit_acc_pool
-            .reset_touched(self.touched_pairs.as_slice());
-        self.touched_pairs.clear();
-        self.windows.clear();
-        self.expanded.clear();
-        self.spans.clear();
 
         let expected_pairs = engine.rules.len().saturating_mul(3);
         let max_hits_u32 =
@@ -754,6 +862,8 @@ impl ScanScratch {
                 .map(|rule| Some(rule.re.capture_locations()))
                 .collect();
         }
+
+        self.capacity_validated = true;
     }
 
     /// Updates inferred overlap metadata for the current chunk.
@@ -890,7 +1000,9 @@ impl ScanScratch {
             if drop_end > new_bytes_start {
                 if write_idx != read_idx {
                     // Move the element to the write position.
-                    // SAFETY: Both indices are in bounds and non-overlapping.
+                    // SAFETY: `write_idx <= read_idx` is maintained by the compaction
+                    // loop (write_idx only increments when read_idx advances past it),
+                    // so src and dst never alias the same element.
                     let src = &self.out[read_idx] as *const FindingRec;
                     let dst = &mut self.out[write_idx] as *mut FindingRec;
                     unsafe {
@@ -908,10 +1020,12 @@ impl ScanScratch {
         self.norm_hash.truncate(write_idx);
     }
 
+    /// Returns the drop-boundary offsets aligned 1:1 with [`findings()`].
     pub(crate) fn drop_hint_end(&self) -> &[u64] {
         self.drop_hint_end.as_slice()
     }
 
+    /// Returns the normalized secret hashes aligned 1:1 with [`findings()`].
     pub(crate) fn norm_hashes(&self) -> &[NormHash] {
         self.norm_hash.as_slice()
     }
@@ -936,6 +1050,7 @@ impl ScanScratch {
         self.findings_dropped
     }
 
+    /// Records a finding using `root_hint_end` as the default drop boundary.
     pub(super) fn push_finding(&mut self, rec: FindingRec, norm_hash: NormHash) {
         self.push_finding_with_drop_hint(rec, norm_hash, rec.root_hint_end, rec.dedupe_with_span);
     }
@@ -988,6 +1103,7 @@ impl ScanScratch {
         drop_hint_end: u64,
         include_span: bool,
     ) {
+        crate::git_scan::perf::record_scan_finding();
         debug_assert_eq!(
             self.out.len(),
             self.norm_hash.len(),

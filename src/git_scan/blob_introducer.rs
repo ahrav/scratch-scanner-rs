@@ -12,6 +12,7 @@
 //! - Paths are assembled in a reusable buffer and must not exceed
 //!   `MAX_PATH_LEN`.
 
+use crate::perf_stats;
 use crate::stdx::bitset::DynamicBitSet;
 
 use super::errors::{MappingCandidateKind, TreeDiffError};
@@ -498,13 +499,13 @@ impl BlobIntroducer {
 
         let result = (|| {
             for PlannedCommit { pos, .. } in plan {
-                self.stats.commits_visited += 1;
+                perf_stats::sat_add_u64(&mut self.stats.commits_visited, 1);
                 let commit_id = pos.0;
                 let root_oid = cg.root_tree_oid(*pos);
 
                 if let Some(idx) = oid_index.get(&root_oid) {
                     if !self.seen.mark_tree(idx) {
-                        self.stats.subtrees_skipped += 1;
+                        perf_stats::sat_add_u64(&mut self.stats.subtrees_skipped, 1);
                         continue;
                     }
                 }
@@ -542,11 +543,8 @@ impl BlobIntroducer {
         }
 
         let bytes = source.load_tree(oid)?;
-        self.stats.trees_loaded += 1;
-        self.stats.tree_bytes_loaded = self
-            .stats
-            .tree_bytes_loaded
-            .saturating_add(bytes.len() as u64);
+        perf_stats::sat_add_u64(&mut self.stats.trees_loaded, 1);
+        perf_stats::sat_add_u64(&mut self.stats.tree_bytes_loaded, bytes.len() as u64);
 
         let cursor = TreeCursor::new(bytes, self.oid_len, self.stream_threshold);
         let in_flight_len = cursor.in_flight_len();
@@ -558,16 +556,16 @@ impl BlobIntroducer {
             });
         }
         self.tree_bytes_in_flight = new_in_flight;
-        self.stats.tree_bytes_in_flight_peak = self
-            .stats
-            .tree_bytes_in_flight_peak
-            .max(self.tree_bytes_in_flight);
+        perf_stats::max_u64(
+            &mut self.stats.tree_bytes_in_flight_peak,
+            self.tree_bytes_in_flight,
+        );
 
         self.stack.push(TreeFrame {
             cursor,
             in_flight_len,
         });
-        self.stats.max_depth_reached = self.stats.max_depth_reached.max(self.stack.len() as u16);
+        perf_stats::max_u16(&mut self.stats.max_depth_reached, self.stack.len() as u16);
         Ok(())
     }
 
@@ -608,7 +606,7 @@ impl BlobIntroducer {
                 EntryKind::Tree => {
                     if let Some(idx) = oid_index.get(&oid) {
                         if !self.seen.mark_tree(idx) {
-                            self.stats.subtrees_skipped += 1;
+                            perf_stats::sat_add_u64(&mut self.stats.subtrees_skipped, 1);
                             continue;
                         }
                     }
@@ -663,7 +661,7 @@ impl BlobIntroducer {
                         mode_u16,
                         cand_flags,
                     )?;
-                    self.stats.blobs_emitted += 1;
+                    perf_stats::sat_add_u64(&mut self.stats.blobs_emitted, 1);
                     self.path_builder.pop_leaf(leaf_start);
                 }
                 EntryKind::Gitlink | EntryKind::Unknown => {}

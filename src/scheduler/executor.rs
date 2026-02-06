@@ -58,6 +58,7 @@ use super::executor_core::{
 };
 use super::metrics::WorkerMetricsLocal;
 use super::rng::XorShift64;
+use crate::perf_stats;
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use crossbeam_utils::sync::{Parker, Unparker};
 use std::any::Any;
@@ -539,7 +540,7 @@ impl<T: Send + 'static, S> WorkerCtx<T, S> {
     pub fn spawn_local(&mut self, task: T) {
         // Workers don't need to check accepting - they only run when executor is live
         increment_count(&self.shared.state);
-        self.metrics.tasks_enqueued = self.metrics.tasks_enqueued.saturating_add(1);
+        perf_stats::sat_add_u64(&mut self.metrics.tasks_enqueued, 1);
         self.local.push(task);
 
         // Wake-on-hoard: if we've spawned many tasks locally, wake a sibling
@@ -563,7 +564,7 @@ impl<T: Send + 'static, S> WorkerCtx<T, S> {
     #[inline]
     pub fn spawn_global(&mut self, task: T) {
         increment_count(&self.shared.state);
-        self.metrics.tasks_enqueued = self.metrics.tasks_enqueued.saturating_add(1);
+        perf_stats::sat_add_u64(&mut self.metrics.tasks_enqueued, 1);
         self.shared.injector.push(task);
         self.shared.unpark_one();
     }
@@ -674,11 +675,11 @@ impl<T, S> WorkerCtxLike<T, S> for WorkerCtx<T, S> {
     }
 
     fn record_steal_attempt(&mut self) {
-        self.metrics.steal_attempts = self.metrics.steal_attempts.saturating_add(1);
+        perf_stats::sat_add_u64(&mut self.metrics.steal_attempts, 1);
     }
 
     fn record_steal_success(&mut self) {
-        self.metrics.steal_successes = self.metrics.steal_successes.saturating_add(1);
+        perf_stats::sat_add_u64(&mut self.metrics.steal_successes, 1);
     }
 }
 
@@ -980,7 +981,7 @@ fn worker_loop<T, S, RunnerFn>(
     loop {
         match worker_step(&cfg, &mut run, ctx, &mut idle, &mut trace) {
             WorkerStepResult::RanTask { .. } => {
-                ctx.metrics.tasks_executed = ctx.metrics.tasks_executed.saturating_add(1);
+                perf_stats::sat_add_u64(&mut ctx.metrics.tasks_executed, 1);
             }
             WorkerStepResult::NoWork => {}
             WorkerStepResult::ShouldPark { timeout } => ctx.parker.park_timeout(timeout),
@@ -1067,6 +1068,14 @@ mod tests {
         }
     }
 
+    fn assert_perf_metric_u64(actual: u64, expected: u64) {
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            assert_eq!(actual, expected);
+        } else {
+            assert_eq!(actual, 0);
+        }
+    }
+
     #[test]
     fn executor_runs_all_external_tasks() {
         let counter = Arc::new(AtomicUsize::new(0));
@@ -1087,7 +1096,7 @@ mod tests {
 
         let metrics = ex.join();
         assert_eq!(counter.load(Ordering::Relaxed), n);
-        assert_eq!(metrics.tasks_executed, n as u64);
+        assert_perf_metric_u64(metrics.tasks_executed, n as u64);
     }
 
     #[test]
@@ -1109,7 +1118,7 @@ mod tests {
 
         let metrics = ex.join();
         assert_eq!(counter.load(Ordering::Relaxed), n);
-        assert_eq!(metrics.tasks_executed, n as u64);
+        assert_perf_metric_u64(metrics.tasks_executed, n as u64);
     }
 
     #[test]
@@ -1144,7 +1153,7 @@ mod tests {
 
         // 1 root + 10_000 children
         assert_eq!(counter.load(Ordering::Relaxed), 10_001);
-        assert_eq!(metrics.tasks_executed, 10_001);
+        assert_perf_metric_u64(metrics.tasks_executed, 10_001);
     }
 
     #[test]
@@ -1258,7 +1267,7 @@ mod tests {
         }
 
         let metrics = ex.join();
-        assert_eq!(metrics.tasks_executed, 1000);
+        assert_perf_metric_u64(metrics.tasks_executed, 1000);
         // With 4 workers and 1000 tasks, there should be some stealing
         // (not guaranteed, but highly likely)
     }

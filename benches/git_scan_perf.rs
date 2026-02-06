@@ -254,15 +254,7 @@ fn run_git_scan_once(
     )?;
     let wall_nanos = start.elapsed().as_nanos() as u64;
 
-    let report = match result {
-        GitScanResult::Completed(report) => report,
-        GitScanResult::NeedsMaintenance { preflight } => {
-            return Err(GitScanError::ResourceLimit(format!(
-                "needs maintenance: {:?}",
-                preflight.status
-            )));
-        }
-    };
+    let GitScanResult(report) = result;
 
     let scan_bytes = report.perf_stats.scan_bytes;
 

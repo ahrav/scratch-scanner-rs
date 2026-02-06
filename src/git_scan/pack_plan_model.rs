@@ -2,7 +2,7 @@
 //!
 //! Pack plans group candidates by pack and describe which offsets must be
 //! decoded (candidates plus pack-local bases), along with delta dependency
-//! metadata and clustering hints for later execution strategies.
+//! metadata for later execution strategies.
 //!
 //! Execution order is optional: it is only required when forward delta
 //! dependencies exist (a base offset greater than its dependent offset).
@@ -11,18 +11,12 @@
 //! - `need_offsets` is sorted and unique.
 //! - `candidate_offsets` is sorted by offset (ties by candidate index).
 //! - `exec_order` indices refer to `need_offsets`.
-//! - `clusters` are contiguous ranges within `need_offsets`.
 //! - `delta_deps` is sorted by offset (subset of `need_offsets`).
 //! - `delta_dep_index` maps `need_offsets` index -> `delta_deps` index or NONE_U32.
 
 use super::object_id::OidBytes;
 use super::pack_candidates::PackCandidate;
 
-/// Gap threshold for offset clustering.
-///
-/// Offsets separated by more than this value start a new cluster to limit
-/// seek distance during pack reads.
-pub const CLUSTER_GAP_BYTES: u64 = 1024 * 1024;
 /// Sentinel for missing `u32` indices.
 pub const NONE_U32: u32 = u32::MAX;
 
@@ -64,22 +58,6 @@ pub struct CandidateAtOffset {
     pub offset: u64,
     /// Index into `PackPlan.candidates`.
     pub cand_idx: u32,
-}
-
-/// Cluster of offsets within `need_offsets`.
-///
-/// `start_idx..end_idx` is a half-open range in `PackPlan.need_offsets`.
-/// `start_offset`/`end_offset` are the first/last offsets in the cluster.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Cluster {
-    /// Start index (inclusive) into `need_offsets`.
-    pub start_idx: u32,
-    /// End index (exclusive) into `need_offsets`.
-    pub end_idx: u32,
-    /// First offset in the cluster.
-    pub start_offset: u64,
-    /// Last offset in the cluster.
-    pub end_offset: u64,
 }
 
 /// Pack plan summary statistics.
@@ -138,8 +116,6 @@ pub struct PackPlan {
     pub delta_dep_index: Vec<u32>,
     /// Optional execution order (indices into `need_offsets`).
     pub exec_order: Option<Vec<u32>>,
-    /// Clusters within `need_offsets`.
-    pub clusters: Vec<Cluster>,
     /// Summary statistics for strategy selection.
     pub stats: PackPlanStats,
 }

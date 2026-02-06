@@ -915,7 +915,7 @@ mod tests {
             unique_addrs
         );
 
-        // Validate: work was done
+        // Validate: work was done (core metrics are always populated)
         assert_eq!(metrics.chunks_scanned, tasks as u64);
         assert_eq!(metrics.bytes_scanned, (tasks * 1024) as u64);
     }

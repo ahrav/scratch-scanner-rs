@@ -446,12 +446,14 @@ impl Benchmarkable for ExecutorMicrobench {
         };
 
         // Postcondition: verify all tasks executed
-        debug_assert!(
-            stats.tasks_completed() as usize >= self.config.effective_task_count(),
-            "task count mismatch: {} < {}",
-            stats.tasks_completed(),
-            self.config.effective_task_count(),
-        );
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            debug_assert!(
+                stats.tasks_completed() as usize >= self.config.effective_task_count(),
+                "task count mismatch: {} < {}",
+                stats.tasks_completed(),
+                self.config.effective_task_count(),
+            );
+        }
 
         stats
     }
@@ -549,6 +551,14 @@ pub fn run_executor_microbench(config: ExecutorMicrobenchConfig) -> MicrobenchSt
 mod tests {
     use super::*;
 
+    fn assert_perf_tasks(actual: u64, expected: u64) {
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            assert_eq!(actual, expected);
+        } else {
+            assert_eq!(actual, 0);
+        }
+    }
+
     #[test]
     fn calibration_produces_nonzero() {
         let cal = calibrate_spin();
@@ -576,7 +586,7 @@ mod tests {
 
         let stats = run_executor_microbench(config);
 
-        assert_eq!(stats.tasks_completed(), 500);
+        assert_perf_tasks(stats.tasks_completed(), 500);
     }
 
     #[test]
@@ -592,7 +602,7 @@ mod tests {
 
         let stats = run_executor_microbench(config);
 
-        assert_eq!(stats.tasks_completed(), 1000);
+        assert_perf_tasks(stats.tasks_completed(), 1000);
     }
 
     #[test]
@@ -608,7 +618,7 @@ mod tests {
 
         let stats = run_executor_microbench(config);
 
-        assert_eq!(stats.tasks_completed(), 1000);
+        assert_perf_tasks(stats.tasks_completed(), 1000);
     }
 
     #[test]
@@ -626,7 +636,7 @@ mod tests {
         let stats = run_executor_microbench(config);
 
         // Should complete all 1000 tasks despite uneven division
-        assert_eq!(stats.tasks_completed(), 1000);
+        assert_perf_tasks(stats.tasks_completed(), 1000);
     }
 
     #[test]

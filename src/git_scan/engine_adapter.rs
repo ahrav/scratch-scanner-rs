@@ -163,7 +163,12 @@ pub struct EngineAdapter<'a> {
 }
 
 impl<'a> EngineAdapter<'a> {
-    /// Creates a new adapter.
+    /// Creates a new adapter bound to the given engine.
+    ///
+    /// The adapter computes overlap from `engine.required_overlap()` and
+    /// clamps `config.chunk_bytes` to ensure forward progress. Scratch
+    /// space and the ring chunker are allocated once and reused across
+    /// all subsequent `emit` / `emit_loose` calls.
     #[must_use]
     pub fn new(engine: &'a Engine, config: EngineAdapterConfig) -> Self {
         let overlap = engine.required_overlap();
@@ -260,6 +265,10 @@ impl<'a> EngineAdapter<'a> {
         bytes: &[u8],
     ) -> Result<(), EngineAdapterError> {
         self.findings_buf.clear();
+        if is_likely_binary(bytes, 8192) {
+            perf::record_scan_binary_skip();
+            return Ok(());
+        }
         scan_blob_chunked_with_chunker(
             self.engine,
             &mut self.scratch,
@@ -365,6 +374,20 @@ fn scan_blob_chunked_into(
     scan_blob_chunked_with_chunker(engine, scratch, file_id, blob, overlap, &mut chunker, out)
 }
 
+/// Returns `true` if the first `check_len` bytes of `data` contain a NUL byte,
+/// indicating the blob is likely binary (images, compiled objects, etc.).
+///
+/// Uses `memchr` for SIMD-accelerated scanning, matching Git's own
+/// `buffer_is_binary` heuristic. Empty blobs are not considered binary.
+#[inline]
+fn is_likely_binary(data: &[u8], check_len: usize) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+    let end = data.len().min(check_len);
+    memchr::memchr(0, &data[..end]).is_some()
+}
+
 /// Scan a blob using a reusable chunker and optional allocation guard.
 ///
 /// The chunker is reset before use and must have the same overlap as the
@@ -382,6 +405,58 @@ fn scan_blob_chunked_with_chunker(
     chunker: &mut RingChunker,
     out: &mut Vec<FindingKey>,
 ) -> Result<(), EngineAdapterError> {
+    perf::record_scan_blob();
+
+    // Fast path: blob fits in a single chunk — skip the ring buffer memcpy.
+    // When blob.len() <= chunk_bytes, feed() emits at most one full chunk and
+    // flush() emits the remainder. Either way it's exactly one chunk, so we
+    // can construct the ChunkView directly on the blob bytes.
+    if blob.len() <= chunker.chunk_bytes() {
+        perf::record_scan_chunker_bypass();
+        let (res, nanos) = perf::time(|| {
+            let guard = if alloc_guard::enabled() {
+                Some(AllocGuard::new())
+            } else {
+                None
+            };
+
+            out.clear();
+            let mut err: Option<EngineAdapterError> = None;
+
+            let view = ChunkView {
+                base: 0,
+                is_first: true,
+                window: blob,
+            };
+            scan_chunk(engine, scratch, file_id, overlap, view, out, &mut err);
+
+            if let Some(err) = err {
+                return Err(err);
+            }
+
+            let ((), _sd_nanos) = perf::time(|| {
+                if !out.is_empty() {
+                    out.sort_unstable();
+                    out.dedup();
+                }
+            });
+            perf::record_scan_sort_dedup(_sd_nanos);
+
+            if let Some(guard) = guard {
+                guard.assert_no_alloc();
+            }
+
+            Ok(())
+        });
+
+        if res.is_ok() {
+            perf::record_scan(blob.len(), nanos);
+        }
+
+        return res;
+    }
+
+    // Slow path: blob spans multiple chunks — stream through the ring buffer.
     let (res, nanos) = perf::time(|| {
         let guard = if alloc_guard::enabled() {
             Some(AllocGuard::new())
@@ -411,8 +486,13 @@ fn scan_blob_chunked_with_chunker(
             return Err(err);
         }
 
-        out.sort_unstable();
-        out.dedup();
+        let ((), _sd_nanos) = perf::time(|| {
+            if !out.is_empty() {
+                out.sort_unstable();
+                out.dedup();
+            }
+        });
+        perf::record_scan_sort_dedup(_sd_nanos);
 
         if let Some(guard) = guard {
             guard.assert_no_alloc();
@@ -428,6 +508,12 @@ fn scan_blob_chunked_with_chunker(
     res
 }
 
+/// Scan a single chunk window and collect findings into `out`.
+///
+/// After scanning, findings wholly within the overlap prefix are dropped
+/// to avoid cross-chunk duplication. Remaining findings are converted to
+/// `FindingKey` values and appended to `out`. If any finding offset
+/// exceeds `u32` bounds, `err` is set and the function returns early.
 fn scan_chunk(
     engine: &Engine,
     scratch: &mut ScanScratch,
@@ -437,6 +523,7 @@ fn scan_chunk(
     out: &mut Vec<FindingKey>,
     err: &mut Option<EngineAdapterError>,
 ) {
+    perf::record_scan_chunk();
     engine.scan_chunk_into(view.window, file_id, view.base, scratch);
     // Skip findings that are fully contained in the overlap prefix.
     // This keeps each match while avoiding duplicate reporting.
@@ -467,6 +554,11 @@ fn scan_chunk(
     }
 }
 
+/// A single chunk window produced by the ring chunker.
+///
+/// Each view represents a contiguous slice of a blob, potentially including
+/// an overlap prefix from the previous window. The `is_first` flag prevents
+/// the first window's prefix from being treated as overlap.
 struct ChunkView<'a> {
     /// Absolute start offset of `window` within the blob.
     base: u64,
@@ -476,7 +568,15 @@ struct ChunkView<'a> {
     window: &'a [u8],
 }
 
-/// Fixed-size ring chunker for streaming blob bytes.
+/// Fixed-size ring chunker for streaming blob bytes into scan windows.
+///
+/// Accepts arbitrary-length input via `feed`, emitting full chunk windows
+/// as they fill. The ring retains `overlap` trailing bytes between windows
+/// so the scan engine can detect secrets that straddle chunk boundaries.
+/// A final partial window is emitted by `flush`.
+///
+/// # Invariant
+/// `chunk_bytes > overlap`, enforced at construction.
 struct RingChunker {
     chunk_bytes: usize,
     overlap: usize,
@@ -498,6 +598,10 @@ impl RingChunker {
             base: 0,
             is_first: true,
         }
+    }
+
+    fn chunk_bytes(&self) -> usize {
+        self.chunk_bytes
     }
 
     fn overlap(&self) -> usize {
@@ -562,6 +666,16 @@ impl RingChunker {
     }
 }
 
+// Compile-time assertion: EngineAdapter must be Send so it can be pooled
+// across scoped thread boundaries (same pattern as PackCache/PackExecScratch).
+#[cfg(test)]
+const _: () = {
+    fn assert_send<T: Send>() {}
+    fn check() {
+        assert_send::<super::EngineAdapter<'_>>();
+    }
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,8 +685,25 @@ mod tests {
     use crate::git_scan::ByteRef;
     use crate::{demo_engine_with_anchor_mode, AnchorMode};
 
+    /// Verify that the scan hot path allocates nothing after warmup.
+    ///
+    /// The alloc guard uses **global** counters, so allocations from any
+    /// thread are visible. Run with:
+    ///
+    /// ```sh
+    /// SCANNER_RS_ALLOC_GUARD=1 cargo test --lib scan_alloc_guard_no_alloc_after_warmup \
+    ///     -- --test-threads=1
+    /// ```
     #[test]
     fn scan_alloc_guard_no_alloc_after_warmup() {
+        if std::env::var("SCANNER_RS_ALLOC_GUARD").ok().as_deref() != Some("1") {
+            eprintln!(
+                "alloc guard test skipped; set SCANNER_RS_ALLOC_GUARD=1 and \
+                 run with --test-threads=1 to enable"
+            );
+            return;
+        }
+
         let engine = demo_engine_with_anchor_mode(AnchorMode::Manual);
         let mut adapter = EngineAdapter::new(&engine, EngineAdapterConfig::default());
 
@@ -601,5 +732,102 @@ mod tests {
             .emit_loose(&candidate, path, blob)
             .expect("guarded scan");
         alloc_guard::set_enabled(false);
+    }
+
+    fn make_candidate() -> LooseCandidate {
+        let ctx = CandidateContext {
+            commit_id: 0,
+            parent_idx: 0,
+            change_kind: ChangeKind::Add,
+            ctx_flags: 0,
+            cand_flags: 0,
+            path_ref: ByteRef::new(0, 0),
+        };
+        LooseCandidate {
+            oid: OidBytes::from_slice(&[0u8; 20]),
+            ctx,
+        }
+    }
+
+    /// Blob of exactly chunk_bytes takes the bypass path (single chunk).
+    #[test]
+    fn chunker_bypass_exact_chunk_size() {
+        let engine = demo_engine_with_anchor_mode(AnchorMode::Manual);
+        let config = EngineAdapterConfig::default();
+        let mut adapter = EngineAdapter::new(&engine, config);
+        let candidate = make_candidate();
+
+        // Blob exactly chunk_bytes long — should take bypass (one chunk).
+        let blob = vec![b'a'; config.chunk_bytes];
+        adapter
+            .emit_loose(&candidate, b"test.txt", &blob)
+            .expect("exact chunk_bytes scan");
+        assert_eq!(adapter.results().len(), 1);
+    }
+
+    /// Blob of chunk_bytes + 1 takes the slow path (two chunks).
+    #[test]
+    fn chunker_slow_path_chunk_size_plus_one() {
+        let engine = demo_engine_with_anchor_mode(AnchorMode::Manual);
+        let config = EngineAdapterConfig::default();
+        let mut adapter = EngineAdapter::new(&engine, config);
+        let candidate = make_candidate();
+
+        // Blob one byte over chunk_bytes — must use the ring chunker.
+        let blob = vec![b'a'; config.chunk_bytes + 1];
+        adapter
+            .emit_loose(&candidate, b"test.txt", &blob)
+            .expect("chunk_bytes+1 scan");
+        assert_eq!(adapter.results().len(), 1);
+    }
+
+    /// Binary blob (contains NUL byte) is skipped entirely.
+    #[test]
+    fn binary_blob_skipped() {
+        let engine = demo_engine_with_anchor_mode(AnchorMode::Manual);
+        let mut adapter = EngineAdapter::new(&engine, EngineAdapterConfig::default());
+        let candidate = make_candidate();
+
+        let mut blob = vec![b'a'; 1024];
+        blob[512] = 0; // NUL byte at offset 512
+        adapter
+            .emit_loose(&candidate, b"image.png", &blob)
+            .expect("binary scan");
+        // Should have a result entry with zero findings.
+        assert_eq!(adapter.results().len(), 1);
+        assert_eq!(adapter.results()[0].findings.len, 0);
+    }
+
+    /// Pure-text blob is not skipped.
+    #[test]
+    fn text_blob_not_skipped() {
+        let engine = demo_engine_with_anchor_mode(AnchorMode::Manual);
+        let mut adapter = EngineAdapter::new(&engine, EngineAdapterConfig::default());
+        let candidate = make_candidate();
+
+        let blob = b"this is plain text with no NUL bytes";
+        adapter
+            .emit_loose(&candidate, b"readme.txt", blob)
+            .expect("text scan");
+        assert_eq!(adapter.results().len(), 1);
+    }
+
+    /// is_likely_binary edge cases.
+    #[test]
+    fn is_likely_binary_edge_cases() {
+        // Empty blob is not binary.
+        assert!(!is_likely_binary(b"", 8192));
+        // All-text is not binary.
+        assert!(!is_likely_binary(b"hello world", 8192));
+        // NUL at first byte.
+        assert!(is_likely_binary(b"\0hello", 8192));
+        // NUL beyond check_len is not detected.
+        let mut data = vec![b'a'; 100];
+        data.push(0);
+        assert!(!is_likely_binary(&data, 100));
+        // NUL at exact boundary.
+        let mut data2 = vec![b'a'; 99];
+        data2.push(0);
+        assert!(is_likely_binary(&data2, 100));
     }
 }

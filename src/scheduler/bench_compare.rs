@@ -33,7 +33,6 @@
 
 use crate::scheduler::bench::BenchReport;
 use std::sync::OnceLock;
-use std::time::Duration;
 
 // ============================================================================
 // Tolerance Multipliers (documented rationale)
@@ -278,18 +277,6 @@ impl BenchComparison {
             || self.is_memory_regression(threshold_pct * MEMORY_TOLERANCE_MULTIPLIER)
     }
 
-    /// Backwards-compatible alias for `has_regression`.
-    ///
-    /// Note: Only checks throughput for backwards compatibility.
-    /// Prefer `has_regression()` for comprehensive checks.
-    #[deprecated(
-        since = "0.1.0",
-        note = "Use has_regression() for comprehensive checks"
-    )]
-    pub fn is_regression(&self, throughput_threshold_pct: f64) -> bool {
-        self.is_throughput_regression(throughput_threshold_pct)
-    }
-
     /// Returns a human-readable summary with regression markers.
     ///
     /// Markers use the provided threshold (with tolerance multipliers for latency/memory).
@@ -493,35 +480,6 @@ impl BenchBaseline {
         baseline.config_fingerprint = Some(config_fingerprint.into());
         baseline
     }
-
-    /// Convert to a synthetic BenchReport for backwards compatibility.
-    ///
-    /// **Warning**: The synthetic report has only one iteration, so percentile
-    /// methods will return identical values. Prefer `BenchComparison::compare_baseline()`
-    /// for accurate comparisons.
-    #[deprecated(
-        since = "0.1.0",
-        note = "Use BenchComparison::compare_baseline() instead for accurate percentile comparisons"
-    )]
-    pub fn to_synthetic_report(&self) -> BenchReport {
-        use crate::scheduler::bench::{BenchConfig, BenchIter};
-
-        let iter = BenchIter {
-            wall_time: Duration::from_nanos(self.p50_ns),
-            cpu_usage: crate::scheduler::rusage::ProcUsageDelta {
-                user_time: Duration::from_nanos(self.p50_ns), // Simplified
-                sys_time: Duration::ZERO,
-                ending_max_rss_bytes: self.peak_rss_bytes,
-            },
-            files: 0,
-            bytes: (self.throughput_mibs * 1024.0 * 1024.0 * (self.p50_ns as f64 / 1_000_000_000.0))
-                as u64,
-            findings: 0,
-            errors: 0,
-        };
-
-        BenchReport::from_iterations(vec![iter], BenchConfig::default())
-    }
 }
 
 /// Get current Unix timestamp as string.
@@ -625,6 +583,7 @@ impl MultiComparison {
 mod tests {
     use super::*;
     use crate::scheduler::bench::{BenchConfig, BenchIter, BenchReport};
+    use std::time::Duration;
 
     fn make_report(throughput_mibs: f64, p50_ms: f64, rss_mb: f64) -> BenchReport {
         let wall_time = Duration::from_millis(p50_ms as u64);

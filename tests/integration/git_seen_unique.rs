@@ -7,6 +7,10 @@ use scanner_rs::git_scan::{
 };
 use tempfile::TempDir;
 
+fn perf_stats_enabled() -> bool {
+    cfg!(all(feature = "perf-stats", debug_assertions))
+}
+
 #[derive(Default)]
 struct RecordingSeenStore {
     batches: RefCell<Vec<usize>>,
@@ -43,7 +47,11 @@ fn seen_store_batches_by_count() {
     let stats = spiller.finalize(&store, &mut sink).unwrap();
 
     assert_eq!(store.batches.borrow().as_slice(), &[3, 3, 1]);
-    assert_eq!(stats.emitted_blobs, 7);
+    if perf_stats_enabled() {
+        assert_eq!(stats.emitted_blobs, 7);
+    } else {
+        assert_eq!(stats.emitted_blobs, 0);
+    }
     assert_eq!(sink.blobs.len(), 7);
 }
 

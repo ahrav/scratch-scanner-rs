@@ -14,7 +14,7 @@ crossbeam-channel = "0.5"
 crossbeam-deque = "0.8"
 crossbeam-queue = "0.3"
 crossbeam-utils = "0.8"
-flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
+flate2 = { version = "1.0", default-features = false, features = ["zlib-ng"] }
 libc = "0.2"
 memchr = "2.6"
 memmap2 = "0.9"
@@ -48,8 +48,9 @@ aegis = { version = "0.9", features = ["pure-rust"] }
 [features]
 stdx-proptest = []
 kgram-gate = []
-stats = []
-b64-stats = ["stats"]
+perf-stats = []  # Debug-only: enable perf counter instrumentation (compile_error in release)
+stats = ["perf-stats"]  # Alias: enables perf-stats
+b64-stats = ["stats"]  # Base64 decode/gate instrumentation (implies stats)
 bench = []
 tiger-harness = []
 sim-harness = ["serde_json"]
@@ -58,7 +59,7 @@ scheduler-affinity = ["core_affinity"]  # Thread pinning support for scheduler
 io-uring = []  # Enable io_uring scanner on Linux
 scheduler-sim = []  # Enable longer-running scheduler simulation tests
 rocksdb = ["dep:rocksdb"]
-git-perf = []
+git-perf = ["perf-stats"]  # Git pack-exec timing probes (implies perf-stats)
 
 [dev-dependencies]
 base64 = "0.22"
@@ -125,6 +126,14 @@ harness = false
 
 [[bench]]
 name = "git_scan_perf"
+harness = false
+
+[[bench]]
+name = "commit_graph_generation"
+harness = false
+
+[[bench]]
+name = "midx_build_scaling"
 harness = false
 
 [[bench]]

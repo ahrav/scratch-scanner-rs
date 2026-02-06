@@ -57,7 +57,7 @@ pub struct PackIoLimits {
 }
 
 impl PackIoLimits {
-    /// Creates a new pack I/O limits struct.
+    /// Constructs limits from decode settings and a cross-pack delta depth cap.
     #[must_use]
     pub const fn new(decode: PackDecodeLimits, max_delta_depth: u8) -> Self {
         Self {
@@ -70,8 +70,6 @@ impl PackIoLimits {
 /// Errors from pack I/O.
 #[derive(Debug)]
 pub enum PackIoError {
-    /// Repository artifacts are not ready.
-    ArtifactsNotReady,
     /// MIDX bytes are missing.
     MissingMidx,
     /// MIDX parsing or lookup failed.
@@ -99,7 +97,6 @@ pub enum PackIoError {
 impl std::fmt::Display for PackIoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ArtifactsNotReady => write!(f, "repo artifacts not ready"),
             Self::MissingMidx => write!(f, "midx bytes missing"),
             Self::Midx(err) => write!(f, "{err}"),
             Self::Io(err) => write!(f, "pack I/O error: {err}"),
@@ -189,10 +186,6 @@ impl<'a> PackIo<'a> {
     /// Returns `PackIoError` if artifacts are missing, the MIDX is invalid,
     /// or pack files cannot be resolved.
     pub fn open(repo: &'a RepoJobState, limits: PackIoLimits) -> Result<Self, PackIoError> {
-        if !repo.artifact_status.is_ready() {
-            return Err(PackIoError::ArtifactsNotReady);
-        }
-
         let midx_bytes = repo.mmaps.midx.as_ref().ok_or(PackIoError::MissingMidx)?;
         let midx = MidxView::parse(midx_bytes.as_slice(), repo.object_format)?;
 
@@ -426,6 +419,9 @@ impl<'a> PackIo<'a> {
 
 #[cfg(unix)]
 fn advise_sequential(file: &File, reader: &Mmap) {
+    // SAFETY: The file descriptor is valid for the duration of `fadvise`,
+    // and the mmap pointer/length are valid for `madvise`. Both calls are
+    // advisory; errors are silently ignored.
     unsafe {
         #[cfg(target_os = "linux")]
         let _ = libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);

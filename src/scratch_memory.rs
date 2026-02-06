@@ -343,6 +343,10 @@ impl<T> Drop for ScratchVec<T> {
     }
 }
 
+// SAFETY: ScratchVec exclusively owns its allocation, same as Vec<T>.
+// When T: Send, the owned data is safe to transfer between threads.
+unsafe impl<T: Send> Send for ScratchVec<T> {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

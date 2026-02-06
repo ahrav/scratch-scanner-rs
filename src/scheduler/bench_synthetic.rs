@@ -34,6 +34,7 @@
 
 use super::local::{LocalFile, VecFileSource};
 use super::rng::XorShift64;
+use crate::perf_stats;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -231,6 +232,8 @@ impl FileSizeDistribution {
 // ============================================================================
 
 /// Statistics from synthetic file generation.
+///
+/// Populated only when `perf-stats` is enabled in debug builds.
 #[derive(Clone, Debug, Default)]
 pub struct GenerationStats {
     /// Number of files generated.
@@ -330,12 +333,12 @@ impl SyntheticFileSource {
                 size: size as u64,
             });
 
-            stats.files_generated += 1;
-            stats.bytes_written += size as u64;
-            stats.secrets_injected += secrets;
+            perf_stats::sat_add_usize(&mut stats.files_generated, 1);
+            perf_stats::sat_add_u64(&mut stats.bytes_written, size as u64);
+            perf_stats::sat_add_usize(&mut stats.secrets_injected, secrets);
         }
 
-        stats.generation_ms = start.elapsed().as_millis() as u64;
+        perf_stats::set_u64(&mut stats.generation_ms, start.elapsed().as_millis() as u64);
 
         Ok(Self {
             temp_dir,

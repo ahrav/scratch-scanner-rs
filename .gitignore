@@ -28,6 +28,14 @@ fuzz/Cargo.lock
 
 .DS_Store
 .worktrees/
+*.tar.*
+*.bin
+
+perf.data
+
+# Linux only ignores
+build.rs
+config.toml
 
 # Internal design docs (scanner harness planning)
 docs/test_harness.md
@@ -51,5 +59,3 @@ docs/throughput_investigation.md
 tests/failures/
 
 # Scanner scenario tracking (internal progress document)
-
-git_perf_agent_md/*

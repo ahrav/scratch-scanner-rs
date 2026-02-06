@@ -59,6 +59,8 @@
 
 use std::cmp::Ordering;
 
+use crate::perf_stats;
+
 use super::errors::TreeDiffError;
 use super::object_id::OidBytes;
 use super::object_store::{TreeBytes, TreeSource};
@@ -141,7 +143,11 @@ enum Action {
     OldBeforeNew,
 }
 
-/// Buffered tree cursor (slice-backed).
+/// Buffered tree cursor (slice-backed) with peek-one-entry lookahead.
+///
+/// `peek_entry` parses and caches the next entry; `advance` consumes
+/// the cache and moves `pos` forward. This avoids re-parsing when the
+/// diff loop peeks the same entry multiple times.
 struct BufferedCursor {
     bytes: TreeBytes,
     pos: usize,
@@ -201,6 +207,10 @@ impl BufferedCursor {
 }
 
 /// Tree cursor selecting buffered vs streaming parsing.
+///
+/// Trees smaller than `stream_threshold` use `Buffered` (single slice).
+/// Larger or spill-backed trees use `Stream` to avoid loading the
+/// entire tree into memory at once.
 enum TreeCursor {
     Buffered(BufferedCursor),
     Stream(TreeStream<TreeBytesReader>),
@@ -309,7 +319,7 @@ impl TreeDiffWalker {
     ///
     /// Call this when starting a new repository scan to get fresh stats.
     /// The internal buffers (stack, path_buf) are retained for reuse.
-    /// The tree-bytes budget is enforced on in-flight bytes across calls.
+    /// Each diff call releases all in-flight tree bytes before returning.
     pub fn reset_stats(&mut self) {
         debug_assert!(
             self.stack.is_empty(),
@@ -346,7 +356,8 @@ impl TreeDiffWalker {
     /// - Candidate paths are borrowed from an internal buffer and are only
     ///   valid until the next emission.
     /// - Stats are cumulative across calls; `reset_stats()` clears counters.
-    /// - The tree-bytes budget is enforced on in-flight bytes across calls until reset.
+    /// - All retained tree-byte charges are released before return, including
+    ///   early-error exits, so retries start from a clean budget state.
     pub fn diff_trees<S: TreeSource, C: CandidateSink>(
         &mut self,
         source: &mut S,
@@ -360,8 +371,7 @@ impl TreeDiffWalker {
             return Ok(());
         }
 
-        self.path_buf.clear();
-        self.stack.clear();
+        self.cleanup_after_diff_call();
         let mut name_scratch = std::mem::take(&mut self.name_scratch);
         name_scratch.clear();
         debug_assert!(
@@ -381,7 +391,7 @@ impl TreeDiffWalker {
 
             while !self.stack.is_empty() {
                 let depth = self.stack.len() as u16;
-                self.stats.max_depth_reached = self.stats.max_depth_reached.max(depth);
+                perf_stats::max_u16(&mut self.stats.max_depth_reached, depth);
 
                 let action = {
                     let frame = self.stack.last_mut().expect("frame exists");
@@ -478,6 +488,7 @@ impl TreeDiffWalker {
         })();
 
         self.name_scratch = name_scratch;
+        self.cleanup_after_diff_call();
 
         result
     }
@@ -496,8 +507,8 @@ impl TreeDiffWalker {
             let bytes_len = bytes.len() as u64;
             let in_flight_len = bytes.in_flight_len() as u64;
             let new_in_flight = self.tree_bytes_in_flight.saturating_add(in_flight_len);
-            self.stats.trees_loaded += 1;
-            self.stats.tree_bytes_loaded = self.stats.tree_bytes_loaded.saturating_add(bytes_len);
+            perf_stats::sat_add_u64(&mut self.stats.trees_loaded, 1);
+            perf_stats::sat_add_u64(&mut self.stats.tree_bytes_loaded, bytes_len);
 
             if new_in_flight > self.tree_bytes_in_flight_limit {
                 return Err(TreeDiffError::TreeBytesBudgetExceeded {
@@ -506,10 +517,10 @@ impl TreeDiffWalker {
                 });
             }
             self.tree_bytes_in_flight = new_in_flight;
-            self.stats.tree_bytes_in_flight_peak = self
-                .stats
-                .tree_bytes_in_flight_peak
-                .max(self.tree_bytes_in_flight);
+            perf_stats::max_u64(
+                &mut self.stats.tree_bytes_in_flight_peak,
+                self.tree_bytes_in_flight,
+            );
 
             Ok(TreeCursor::new(bytes, self.oid_len, self.stream_threshold))
         } else {
@@ -521,6 +532,26 @@ impl TreeDiffWalker {
         self.tree_bytes_in_flight = self.tree_bytes_in_flight.saturating_sub(len);
     }
 
+    /// Releases any tree-byte charges retained after a `diff_trees` call.
+    ///
+    /// Normally the walk loop pops all frames and releases in-flight bytes as
+    /// it goes. Early errors can exit before that unwind completes (or before
+    /// the root frame is pushed), so this cleanup makes retries on the same
+    /// walker start from a clean budget state.
+    fn cleanup_after_diff_call(&mut self) {
+        while let Some(frame) = self.stack.pop() {
+            self.release_tree_bytes(frame.new_cursor.in_flight_len());
+            self.release_tree_bytes(frame.old_cursor.in_flight_len());
+        }
+
+        self.path_buf.clear();
+        self.tree_bytes_in_flight = 0;
+    }
+
+    /// Processes an entry present only in the new tree.
+    ///
+    /// Trees are recursed into; blob-like entries emit an `Add` candidate.
+    /// Gitlinks and unknown kinds are silently skipped.
     #[allow(clippy::too_many_arguments)]
     fn handle_new_entry<S: TreeSource, C: CandidateSink>(
         &mut self,
@@ -549,6 +580,16 @@ impl TreeDiffWalker {
         Ok(())
     }
 
+    /// Processes a pair of entries with the same name in old and new trees.
+    ///
+    /// Implements the four-way kind matrix:
+    /// - **tree / tree**: recurse if OIDs differ, skip if identical.
+    /// - **non-tree / tree**: treat new subtree as entirely added.
+    /// - **tree / non-tree**: emit the new blob as `Add`.
+    /// - **non-tree / non-tree**: emit `Modify` if OIDs differ, skip if equal.
+    ///
+    /// Gitlinks on either side are handled implicitly: a gitlink-to-blob
+    /// change emits the blob; a blob-to-gitlink change is skipped.
     #[allow(clippy::too_many_arguments)]
     fn handle_matched_entries<S: TreeSource, C: CandidateSink>(
         &mut self,
@@ -564,7 +605,7 @@ impl TreeDiffWalker {
         parent_idx: u8,
     ) -> Result<(), TreeDiffError> {
         if new_oid == old_oid && new_kind.is_tree() && old_kind.is_tree() {
-            self.stats.subtrees_skipped += 1;
+            perf_stats::sat_add_u64(&mut self.stats.subtrees_skipped, 1);
             return Ok(());
         }
 
@@ -623,6 +664,10 @@ impl TreeDiffWalker {
     }
 
     /// Pushes a subtree frame, extending `path_buf` with `name/`.
+    ///
+    /// Enforces the depth limit and path length limit. Loads both new
+    /// and old trees (when `old_oid` is `Some`), charging the in-flight
+    /// byte budget for each.
     fn push_subtree_frame<S: TreeSource>(
         &mut self,
         source: &mut S,
@@ -702,7 +747,7 @@ impl TreeDiffWalker {
             cand_flags,
         )?;
 
-        self.stats.candidates_emitted += 1;
+        perf_stats::sat_add_u64(&mut self.stats.candidates_emitted, 1);
 
         self.path_buf.truncate(path_start);
 
@@ -825,6 +870,14 @@ mod tests {
             max_tree_depth: 64,
             max_tree_bytes_in_flight: 1024 * 1024,
             ..TreeDiffLimits::RESTRICTIVE
+        }
+    }
+
+    fn assert_perf_u64(actual: u64, expected: u64) {
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            assert_eq!(actual, expected);
+        } else {
+            assert_eq!(actual, 0);
         }
     }
 
@@ -1017,7 +1070,7 @@ mod tests {
             .unwrap();
 
         assert!(candidates.is_empty());
-        assert_eq!(walker.stats().subtrees_skipped, 1);
+        assert_perf_u64(walker.stats().subtrees_skipped, 1);
     }
 
     #[test]
@@ -1051,6 +1104,119 @@ mod tests {
             result,
             Err(TreeDiffError::MaxTreeDepthExceeded { max_depth: 2 })
         ));
+    }
+
+    #[test]
+    fn budget_error_releases_in_flight_bytes_for_retry() {
+        let mut source = MockTreeSource::new();
+
+        let new_oid = test_oid(1);
+        let new_data = make_entry(b"100644", b"new.txt", &[0xaa; 20]);
+        source.add_tree(new_oid, new_data.clone());
+
+        let old_oid = test_oid(2);
+        let old_data = make_entry(b"100644", b"old.txt", &[0xbb; 20]);
+        source.add_tree(old_oid, old_data);
+
+        let limits = TreeDiffLimits {
+            max_tree_bytes_in_flight: new_data.len() as u64,
+            ..test_limits()
+        };
+        let mut walker = TreeDiffWalker::new(&limits, 20);
+
+        let mut first_candidates = CandidateBuffer::new(&limits, 20);
+        let first = walker.diff_trees(
+            &mut source,
+            &mut first_candidates,
+            Some(&new_oid),
+            Some(&old_oid),
+            1,
+            0,
+        );
+        assert!(matches!(
+            first,
+            Err(TreeDiffError::TreeBytesBudgetExceeded { .. })
+        ));
+        assert_eq!(walker.tree_bytes_in_flight, 0);
+
+        let mut retry_candidates = CandidateBuffer::new(&limits, 20);
+        walker
+            .diff_trees(
+                &mut source,
+                &mut retry_candidates,
+                Some(&new_oid),
+                None,
+                2,
+                0,
+            )
+            .unwrap();
+
+        let resolved: Vec<_> = retry_candidates.iter_resolved().collect();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].path, b"new.txt");
+        assert_eq!(resolved[0].change_kind, ChangeKind::Add);
+    }
+
+    #[test]
+    fn depth_error_releases_in_flight_bytes_for_retry() {
+        let mut source = MockTreeSource::new();
+
+        let file_oid = [0xab; 20];
+
+        let c_tree = test_oid(13);
+        source.add_tree(c_tree, make_entry(b"100644", b"file.txt", &file_oid));
+
+        let b_tree = test_oid(12);
+        source.add_tree(b_tree, make_entry(b"40000", b"c", c_tree.as_slice()));
+
+        let a_tree = test_oid(11);
+        source.add_tree(a_tree, make_entry(b"40000", b"b", b_tree.as_slice()));
+
+        let deep_root = test_oid(1);
+        source.add_tree(deep_root, make_entry(b"40000", b"a", a_tree.as_slice()));
+
+        let retry_root = test_oid(3);
+        source.add_tree(retry_root, make_entry(b"100644", b"retry.txt", &[0xcd; 20]));
+
+        let limits = TreeDiffLimits {
+            max_tree_depth: 2,
+            max_tree_bytes_in_flight: 64,
+            ..test_limits()
+        };
+        let mut walker = TreeDiffWalker::new(&limits, 20);
+
+        let mut first_candidates = CandidateBuffer::new(&limits, 20);
+        let first = walker.diff_trees(
+            &mut source,
+            &mut first_candidates,
+            Some(&deep_root),
+            None,
+            1,
+            0,
+        );
+        assert!(matches!(
+            first,
+            Err(TreeDiffError::MaxTreeDepthExceeded { max_depth: 2 })
+        ));
+        assert!(walker.stack.is_empty());
+        assert_eq!(walker.tree_bytes_in_flight, 0);
+
+        let mut retry_candidates = CandidateBuffer::new(&limits, 20);
+        walker
+            .diff_trees(
+                &mut source,
+                &mut retry_candidates,
+                Some(&retry_root),
+                None,
+                2,
+                0,
+            )
+            .unwrap();
+
+        let resolved: Vec<_> = retry_candidates.iter_resolved().collect();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].path, b"retry.txt");
+        assert_eq!(resolved[0].change_kind, ChangeKind::Add);
     }
 
     #[test]
@@ -1246,9 +1412,13 @@ mod tests {
             .unwrap();
 
         let stats = walker.stats();
-        assert_eq!(stats.trees_loaded, 1);
-        assert_eq!(stats.tree_bytes_loaded as usize, data.len());
-        assert_eq!(stats.candidates_emitted, 1);
+        assert_perf_u64(stats.trees_loaded, 1);
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            assert_eq!(stats.tree_bytes_loaded as usize, data.len());
+        } else {
+            assert_eq!(stats.tree_bytes_loaded, 0);
+        }
+        assert_perf_u64(stats.candidates_emitted, 1);
     }
 
     #[test]
@@ -1264,7 +1434,7 @@ mod tests {
         walker
             .diff_trees(&mut source, &mut candidates, Some(&oid), None, 1, 0)
             .unwrap();
-        assert_eq!(walker.stats().candidates_emitted, 1);
+        assert_perf_u64(walker.stats().candidates_emitted, 1);
 
         walker.reset_stats();
         assert_eq!(walker.stats().candidates_emitted, 0);

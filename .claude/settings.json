@@ -26,6 +26,10 @@
           {
             "type": "command",
             "command": "if [[ \"$CLAUDE_FILE_PATH\" == *gitleaks_rules.rs ]]; then echo '⚠️  WARNING: gitleaks_rules.rs contains generated patterns. Confirm intentional edit.' >&2; fi"
+          },
+          {
+            "type": "command",
+            "command": "if [[ \"$CLAUDE_FILE_PATH\" == *src/engine/* ]] || [[ \"$CLAUDE_FILE_PATH\" == *src/scheduler/* ]] || [[ \"$CLAUDE_FILE_PATH\" == *src/stdx/* ]]; then echo '⚠️  HOT PATH: Run /perf-regression before merging changes to this file.' >&2; fi"
           }
         ]
       }

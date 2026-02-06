@@ -12,12 +12,16 @@ use regex::bytes::Regex;
 use tempfile::TempDir;
 
 use scanner_rs::git_scan::{
-    run_git_scan, CandidateSkipReason, FinalizeOutcome, GitScanConfig, GitScanError, GitScanMode,
+    run_git_scan, FinalizeOutcome, GitScanConfig, GitScanError, GitScanMode, GitScanReport,
     GitScanResult, InMemoryPersistenceStore, MappingCandidateKind, NeverSeenStore, OidBytes,
-    RefWatermarkStore, RepoOpenError, SpillError, StartSetConfig, StartSetResolver,
+    RefWatermarkStore, RepoOpenError, SpillError, StartSetConfig, StartSetResolver, WriteOp,
 };
 use scanner_rs::{demo_tuning, AnchorPolicy, Engine, Gate, RuleSpec, TransformConfig, TransformId};
 use scanner_rs::{TransformMode, ValidatorKind};
+
+fn perf_stats_enabled() -> bool {
+    cfg!(all(feature = "perf-stats", debug_assertions))
+}
 
 /// Returns true when the `git` CLI is available on the host.
 fn git_available() -> bool {
@@ -82,16 +86,14 @@ fn commit_file(repo: &Path, name: &str, contents: &str, msg: &str) {
     run_git(repo, &["commit", "-m", msg]);
 }
 
-/// Ensure commit-graph and multi-pack-index artifacts exist.
+/// Ensure all objects are packed and indexed.
 fn ensure_artifacts(repo: &Path) {
     run_git(repo, &["gc"]);
-    run_git(repo, &["multi-pack-index", "write"]);
-    run_git(repo, &["commit-graph", "write", "--reachable"]);
 }
 
-/// Update the commit-graph after new commits without repacking objects.
-fn update_commit_graph(repo: &Path) {
-    run_git(repo, &["commit-graph", "write", "--reachable"]);
+/// Repack after new commits so in-memory artifact builders can find them.
+fn repack_all(repo: &Path) {
+    run_git(repo, &["repack", "-ad"]);
 }
 
 /// Build a tiny engine that detects TOK_ secrets (and Base64 variants).
@@ -200,6 +202,36 @@ fn run_scan_with_config(
     )
 }
 
+fn assert_write_ops_equal(left: &[WriteOp], right: &[WriteOp]) {
+    assert_eq!(left.len(), right.len(), "write op length mismatch");
+    for (idx, (lhs, rhs)) in left.iter().zip(right.iter()).enumerate() {
+        assert_eq!(lhs.key, rhs.key, "write op key mismatch at index {idx}");
+        assert_eq!(
+            lhs.value, rhs.value,
+            "write op value mismatch at index {idx}"
+        );
+    }
+}
+
+fn assert_scan_outputs_equal(left: &GitScanReport, right: &GitScanReport) {
+    assert_eq!(left.skipped_candidates, right.skipped_candidates);
+    assert_eq!(left.finalize.outcome, right.finalize.outcome);
+    assert_eq!(
+        left.finalize.stats.unique_blobs,
+        right.finalize.stats.unique_blobs
+    );
+    assert_eq!(
+        left.finalize.stats.total_findings,
+        right.finalize.stats.total_findings
+    );
+    assert_eq!(
+        left.finalize.stats.findings_deduped,
+        right.finalize.stats.findings_deduped
+    );
+    assert_write_ops_equal(&left.finalize.data_ops, &right.finalize.data_ops);
+    assert_write_ops_equal(&left.finalize.watermark_ops, &right.finalize.watermark_ops);
+}
+
 #[test]
 fn loose_only_candidate_scans_complete() {
     if !git_available() {
@@ -212,18 +244,18 @@ fn loose_only_candidate_scans_complete() {
     ensure_artifacts(tmp.path());
     // Commit after artifacts so the new blob remains loose.
     commit_file(tmp.path(), "secret.txt", "TOK_ABCDEFGH\n", "secret");
-    update_commit_graph(tmp.path());
+    repack_all(tmp.path());
 
     let watermark = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD~1"]));
     let result = run_scan(tmp.path(), Some(watermark));
 
-    match result {
-        GitScanResult::Completed(report) => {
-            assert_eq!(report.finalize.outcome, FinalizeOutcome::Complete);
-            assert!(report.skipped_candidates.is_empty());
-            assert!(report.finalize.stats.total_findings >= 1);
-        }
-        GitScanResult::NeedsMaintenance { .. } => panic!("expected completed scan"),
+    let GitScanResult(report) = result;
+    assert_eq!(report.finalize.outcome, FinalizeOutcome::Complete);
+    assert!(report.skipped_candidates.is_empty());
+    if perf_stats_enabled() {
+        assert!(report.finalize.stats.total_findings >= 1);
+    } else {
+        assert_eq!(report.finalize.stats.total_findings, 0);
     }
 }
 
@@ -271,55 +303,69 @@ fn packed_and_loose_candidates_scan_complete() {
     ensure_artifacts(tmp.path());
     // Base blob is packed; secret blob remains loose.
     commit_file(tmp.path(), "secret.txt", "TOK_ABCDEFGH\n", "secret");
-    update_commit_graph(tmp.path());
+    repack_all(tmp.path());
 
     let result = run_scan(tmp.path(), None);
 
-    match result {
-        GitScanResult::Completed(report) => {
-            assert_eq!(report.finalize.outcome, FinalizeOutcome::Complete);
-            assert!(report.skipped_candidates.is_empty());
-            assert!(report.finalize.stats.total_findings >= 2);
-        }
-        GitScanResult::NeedsMaintenance { .. } => panic!("expected completed scan"),
+    let GitScanResult(report) = result;
+    assert_eq!(report.finalize.outcome, FinalizeOutcome::Complete);
+    assert!(report.skipped_candidates.is_empty());
+    if perf_stats_enabled() {
+        assert!(report.finalize.stats.total_findings >= 2);
+    } else {
+        assert_eq!(report.finalize.stats.total_findings, 0);
     }
 }
 
 #[test]
-fn missing_loose_object_yields_partial() {
+fn diff_history_pack_exec_workers_preserve_deterministic_output() {
     if !git_available() {
-        eprintln!("git not available; skipping git scan validation test");
+        eprintln!("git not available; skipping diff-history worker test");
         return;
     }
 
     let tmp = init_repo();
-    commit_file(tmp.path(), "base.txt", "base\n", "base");
+    let payloads = [
+        "TOK_ABCDEFGH\n",
+        "TOK_IJKLMNOP\n",
+        "TOK_QRSTUVWX\n",
+        "TOK_YZABCDEF\n",
+        "TOK_GHIJKLMN\n",
+        "TOK_OPQRSTUV\n",
+        "TOK_WXYZ1234\n",
+        "TOK_5678ABCD\n",
+    ];
+    for (idx, payload) in payloads.iter().enumerate() {
+        let name = format!("secret-{idx}.txt");
+        let msg = format!("c{idx}");
+        commit_file(tmp.path(), &name, payload, &msg);
+    }
     ensure_artifacts(tmp.path());
 
-    commit_file(tmp.path(), "secret.txt", "TOK_ABCDEFGH\n", "secret");
-    update_commit_graph(tmp.path());
-    let blob_hex = git_output(tmp.path(), &["rev-parse", "HEAD:secret.txt"]);
-    let blob_oid = oid_from_hex(&blob_hex);
+    let mut serial_cfg = base_config();
+    serial_cfg.scan_mode = GitScanMode::DiffHistory;
+    serial_cfg.pack_exec_workers = 1;
 
-    let hex = blob_hex.trim();
-    let (dir, file) = hex.split_at(2);
-    let obj_path = tmp.path().join(".git/objects").join(dir).join(file);
-    // Delete the loose object to force a missing-blob partial outcome.
-    fs::remove_file(obj_path).unwrap();
+    let mut parallel_cfg = serial_cfg.clone();
+    parallel_cfg.pack_exec_workers = 4;
 
-    let watermark = oid_from_hex(&git_output(tmp.path(), &["rev-parse", "HEAD~1"]));
-    let result = run_scan(tmp.path(), Some(watermark));
+    let GitScanResult(serial_report) = run_scan_with_config(tmp.path(), None, serial_cfg).unwrap();
+    let GitScanResult(parallel_report) =
+        run_scan_with_config(tmp.path(), None, parallel_cfg).unwrap();
 
-    match result {
-        GitScanResult::Completed(report) => {
-            assert!(matches!(
-                report.finalize.outcome,
-                FinalizeOutcome::Partial { .. }
-            ));
-            assert!(report.skipped_candidates.iter().any(|skip| {
-                skip.oid == blob_oid && skip.reason == CandidateSkipReason::LooseMissing
-            }));
-        }
-        GitScanResult::NeedsMaintenance { .. } => panic!("expected completed scan"),
-    }
+    assert_eq!(serial_report.finalize.outcome, FinalizeOutcome::Complete);
+    assert_eq!(parallel_report.finalize.outcome, FinalizeOutcome::Complete);
+    assert!(
+        !serial_report.pack_exec_reports.is_empty(),
+        "expected packed candidates in diff-history test fixture"
+    );
+
+    assert_scan_outputs_equal(&serial_report, &parallel_report);
 }
+
+// NOTE: `missing_loose_object_yields_partial` was removed because the
+// in-memory artifact builder requires all commits to be in packs (`repack
+// -ad`), which also packs every blob. There is no reliable way to create a
+// loose-only blob whose commit is still in a pack using normal Git
+// operations. The `LooseMissing` code path is covered by the unit test in
+// `runner.rs` (see `scan_loose_candidates_missing_object_skipped`).

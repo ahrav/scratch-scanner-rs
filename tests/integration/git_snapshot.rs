@@ -1,14 +1,21 @@
 //! Integration test for snapshot planning against a real `git` repo.
+//!
+//! Snapshot planning selects the tip commit for each ref as a "snapshot root"
+//! that requires a full tree diff (no parent to diff against). This test
+//! verifies that `snapshot_plan` emits exactly one entry per ref with the
+//! correct position and the `snapshot_root` flag set.
+//!
+//! Requires `git` on `PATH`; skips gracefully if unavailable.
 
-use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use scanner_rs::git_scan::OidBytes;
 use scanner_rs::git_scan::{
-    repo_open, snapshot_plan, CommitGraph, CommitGraphView, CommitWalkLimits, RefWatermarkStore,
-    RepoOpenError, RepoOpenLimits, StartSetConfig, StartSetResolver,
+    acquire_commit_graph, acquire_midx, repo_open, snapshot_plan, ArtifactBuildLimits, CommitGraph,
+    CommitWalkLimits, MidxView, RefWatermarkStore, RepoOpenError, RepoOpenLimits, StartSetConfig,
+    StartSetResolver,
 };
-use scanner_rs::git_scan::{OidBytes, RepoArtifactStatus};
 use tempfile::TempDir;
 
 fn git_available() -> bool {
@@ -63,11 +70,8 @@ fn init_repo_with_commits(count: usize) -> TempDir {
         run_git(tmp.path(), &["commit", "--allow-empty", "-m", &msg]);
     }
 
-    run_git(tmp.path(), &["commit-graph", "write", "--reachable"]);
-
-    let pack_dir = tmp.path().join(".git/objects/pack");
-    fs::create_dir_all(&pack_dir).unwrap();
-    fs::write(pack_dir.join("multi-pack-index"), b"MIDX").unwrap();
+    // Pack objects so acquire_midx can find .idx files.
+    run_git(tmp.path(), &["repack", "-ad"]);
 
     tmp
 }
@@ -123,7 +127,7 @@ fn snapshot_plan_emits_ref_tips() {
 
     let start_set_id = StartSetConfig::DefaultBranchOnly.id();
 
-    let state = repo_open(
+    let mut state = repo_open(
         tmp.path(),
         99,
         [0u8; 32],
@@ -134,9 +138,11 @@ fn snapshot_plan_emits_ref_tips() {
     )
     .unwrap();
 
-    assert!(matches!(state.artifact_status, RepoArtifactStatus::Ready));
+    let limits = ArtifactBuildLimits::default();
+    let midx_result = acquire_midx(&mut state, &limits).unwrap();
+    let midx_view = MidxView::parse(midx_result.bytes.as_slice(), state.object_format).unwrap();
+    let cg = acquire_commit_graph(&state, &midx_view, &midx_result.pack_paths, &limits).unwrap();
 
-    let cg = CommitGraphView::open_repo(&state).unwrap();
     let plan = snapshot_plan(&state, &cg, CommitWalkLimits::RESTRICTIVE).unwrap();
 
     assert_eq!(plan.len(), 2);

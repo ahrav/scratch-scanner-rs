@@ -361,6 +361,11 @@ pub struct GlobalFindingsCollector {
 }
 
 impl GlobalFindingsCollector {
+    #[inline(always)]
+    fn recording_enabled() -> bool {
+        cfg!(all(feature = "perf-stats", debug_assertions))
+    }
+
     /// Create a new collector with the given configuration.
     pub fn new(config: CollectorConfig) -> Self {
         Self {
@@ -386,9 +391,11 @@ impl GlobalFindingsCollector {
             findings.extend(batch);
         }
 
-        self.batches_received.fetch_add(1, AtomicOrdering::Relaxed);
-        self.total_received
-            .fetch_add(count, AtomicOrdering::Relaxed);
+        if Self::recording_enabled() {
+            self.batches_received.fetch_add(1, AtomicOrdering::Relaxed);
+            self.total_received
+                .fetch_add(count, AtomicOrdering::Relaxed);
+        }
     }
 
     /// Receive a batch of findings from a worker (in-place, retains caller's capacity).
@@ -407,13 +414,18 @@ impl GlobalFindingsCollector {
             findings.append(batch); // Moves elements, retains batch's capacity
         }
 
-        self.batches_received.fetch_add(1, AtomicOrdering::Relaxed);
-        self.total_received
-            .fetch_add(count, AtomicOrdering::Relaxed);
+        if Self::recording_enabled() {
+            self.batches_received.fetch_add(1, AtomicOrdering::Relaxed);
+            self.total_received
+                .fetch_add(count, AtomicOrdering::Relaxed);
+        }
     }
 
     /// Get current stats without finalizing.
     pub fn stats(&self) -> CollectorStats {
+        if !Self::recording_enabled() {
+            return CollectorStats::default();
+        }
         CollectorStats {
             total_received: self.total_received.load(AtomicOrdering::Relaxed),
             batches_received: self.batches_received.load(AtomicOrdering::Relaxed),
@@ -469,7 +481,11 @@ impl GlobalFindingsCollector {
 
         let stats = CollectorStats {
             total_received: total_received as u64,
-            batches_received: self.batches_received.load(AtomicOrdering::Relaxed),
+            batches_received: if Self::recording_enabled() {
+                self.batches_received.load(AtomicOrdering::Relaxed)
+            } else {
+                0
+            },
             duplicates_removed,
             final_count: findings.len() as u64,
         };
@@ -772,8 +788,13 @@ mod tests {
 
         // Check stats - should have flushed once
         let stats = collector.stats();
-        assert_eq!(stats.batches_received, 1);
-        assert_eq!(stats.total_received, 5);
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            assert_eq!(stats.batches_received, 1);
+            assert_eq!(stats.total_received, 5);
+        } else {
+            assert_eq!(stats.batches_received, 0);
+            assert_eq!(stats.total_received, 0);
+        }
 
         // 2 still buffered
         assert_eq!(sink.buffered(), 2);
@@ -791,7 +812,11 @@ mod tests {
 
         // Should have flushed on drop
         let stats = collector.stats();
-        assert_eq!(stats.total_received, 1);
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            assert_eq!(stats.total_received, 1);
+        } else {
+            assert_eq!(stats.total_received, 0);
+        }
     }
 
     #[test]

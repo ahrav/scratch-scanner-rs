@@ -61,6 +61,7 @@ pub enum MidxError {
     /// MIDX doesn't reference all pack files.
     MidxIncomplete {
         missing_count: usize,
+        /// Sample of missing pack basenames (bounded by `MAX_MISSING_PACK_NAMES`).
         missing_packs: Vec<String>,
     },
     /// Required MIDX chunk is missing.
@@ -84,8 +85,13 @@ pub enum MidxError {
     /// LOFF index out of bounds.
     LoffIndexOutOfBounds { index: u32, count: u32 },
     /// Input OIDs are not strictly sorted.
+    ///
+    /// Used when validating sorted OID streams (for example, during in-memory
+    /// MIDX construction).
     InputNotSorted,
     /// Duplicate input OID.
+    ///
+    /// Used when validating de-duplication requirements for input streams.
     DuplicateInputOid,
 }
 

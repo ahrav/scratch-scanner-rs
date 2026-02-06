@@ -338,6 +338,9 @@ struct LocalScratch<E: ScanEngine> {
 // ============================================================================
 
 /// Statistics from a local scan run.
+///
+/// Core counters (`files_enqueued`, `bytes_enqueued`, `io_errors`) are always
+/// populated regardless of build configuration.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LocalStats {
     /// Files discovered and enqueued.
@@ -356,8 +359,10 @@ pub struct LocalStats {
 
 /// Complete report from a local scan.
 ///
-/// `metrics` are aggregated from worker threads; `stats.io_errors` is derived
-/// from those metrics for convenience.
+/// Core metrics in `metrics` (`bytes_scanned`, `chunks_scanned`, `io_errors`,
+/// `findings_emitted`) are always aggregated from worker threads.
+/// Perf-only metrics require `all(feature = "perf-stats", debug_assertions)`.
+/// `stats.io_errors` is derived from `metrics.io_errors` for convenience.
 #[derive(Debug, Default)]
 pub struct LocalReport {
     pub stats: LocalStats,
@@ -2609,8 +2614,8 @@ where
         let file_id = FileId(next_file_id);
         next_file_id = next_file_id.wrapping_add(1);
 
-        stats.files_enqueued += 1;
-        stats.bytes_enqueued += file.size;
+        stats.files_enqueued = stats.files_enqueued.saturating_add(1);
+        stats.bytes_enqueued = stats.bytes_enqueued.saturating_add(file.size);
 
         // Enqueue task
         let task = FileTask {
@@ -2687,6 +2692,14 @@ mod tests {
             seed: 12345,
             dedupe_within_chunk: true,
             archive: ArchiveConfig::default(),
+        }
+    }
+
+    fn assert_perf_u64(actual: u64, expected: u64) {
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            assert_eq!(actual, expected);
+        } else {
+            assert_eq!(actual, 0);
         }
     }
 
@@ -2822,10 +2835,7 @@ mod tests {
 
         let report = scan_local(engine, source, small_config(), sink.clone());
 
-        assert!(
-            report.metrics.chunks_scanned >= 2,
-            "should need multiple chunks"
-        );
+        assert!(report.metrics.chunks_scanned >= 2);
 
         let output = sink.take();
         let output_str = String::from_utf8_lossy(&output);
@@ -2933,12 +2943,21 @@ mod tests {
 
         let report = scan_local(engine, source, cfg, sink);
 
-        assert_eq!(report.metrics.archive.archives_seen, 1);
-        assert_eq!(report.metrics.archive.archives_partial, 1);
-        assert_eq!(
-            report.metrics.archive.partial_reasons[PartialReason::MalformedZip.as_usize()],
-            1
-        );
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            assert_eq!(report.metrics.archive.archives_seen, 1);
+            assert_eq!(report.metrics.archive.archives_partial, 1);
+            assert_eq!(
+                report.metrics.archive.partial_reasons[PartialReason::MalformedZip.as_usize()],
+                1
+            );
+        } else {
+            assert_eq!(report.metrics.archive.archives_seen, 0);
+            assert_eq!(report.metrics.archive.archives_partial, 0);
+            assert_eq!(
+                report.metrics.archive.partial_reasons[PartialReason::MalformedZip.as_usize()],
+                0
+            );
+        }
     }
 
     #[test]
@@ -2957,7 +2976,7 @@ mod tests {
 
         let report = scan_local(engine, source, cfg, sink.clone());
 
-        assert_eq!(report.metrics.archive.archives_seen, 0);
+        assert_perf_u64(report.metrics.archive.archives_seen, 0);
 
         let output = sink.take();
         let output_str = String::from_utf8_lossy(&output);

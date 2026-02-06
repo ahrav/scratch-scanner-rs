@@ -45,6 +45,7 @@
 use std::fmt;
 use std::path::Path;
 
+use crate::perf_stats;
 use crate::scheduler::AllocGuard;
 
 use super::alloc_guard;
@@ -195,12 +196,10 @@ pub struct PackExecStats {
     pub emitted_candidates: u32,
     /// Skip records emitted (may exceed unique offsets).
     pub skipped_offsets: u32,
-    /// Cache hits on pack offsets.
-    pub cache_hits: u32,
-    /// Cache misses on pack offsets.
-    pub cache_misses: u32,
-    /// Cache inserts skipped by admission policy.
-    pub cache_admission_skips: u32,
+    /// Cache hits when looking up delta base offsets.
+    pub base_cache_hits: u32,
+    /// Cache misses when looking up delta base offsets.
+    pub base_cache_misses: u32,
     /// External base provider calls for REF deltas.
     pub external_base_calls: u32,
     /// On-demand base decode attempts triggered by cache misses.
@@ -223,6 +222,14 @@ pub struct PackExecStats {
     pub large_blob_spilled_count: u32,
     /// Total bytes across large blob handling (stream + spill).
     pub large_blob_bytes: u64,
+    // --- Timing fields (nanoseconds) ---
+    // Populated only when the `git-perf` feature is enabled; otherwise zero.
+    /// Wall-clock nanoseconds spent in cache.get() lookups.
+    pub cache_lookup_nanos: u64,
+    /// Wall-clock nanoseconds spent in fallback base resolution.
+    pub fallback_resolve_nanos: u64,
+    /// Wall-clock nanoseconds spent in sink.emit() calls.
+    pub sink_emit_nanos: u64,
 }
 
 /// Pack execution report.
@@ -272,29 +279,36 @@ impl CacheRejectHistogram {
 }
 
 impl PackExecStats {
+    #[inline(always)]
+    fn recording_enabled() -> bool {
+        cfg!(all(feature = "perf-stats", debug_assertions))
+    }
+
     #[inline]
     fn record_cache_reject(&mut self, size: usize) {
-        self.cache_insert_rejects = self.cache_insert_rejects.saturating_add(1);
-        self.cache_reject_bytes_total = self.cache_reject_bytes_total.saturating_add(size as u64);
+        perf_stats::sat_add_u32(&mut self.cache_insert_rejects, 1);
+        perf_stats::sat_add_u64(&mut self.cache_reject_bytes_total, size as u64);
         let size_u32 = size.min(u32::MAX as usize) as u32;
-        self.cache_reject_bytes_max = self.cache_reject_bytes_max.max(size_u32);
+        perf_stats::max_u32(&mut self.cache_reject_bytes_max, size_u32);
         let bucket = cache_reject_bucket_index(size_u32);
-        self.cache_reject_size_buckets[bucket] =
-            self.cache_reject_size_buckets[bucket].saturating_add(1);
+        perf_stats::sat_add_u64(&mut self.cache_reject_size_buckets[bucket], 1);
     }
 
     #[inline]
     fn merge_from(&mut self, other: &PackExecStats) {
+        if !Self::recording_enabled() {
+            let _ = other;
+            return;
+        }
         self.decoded_offsets = self.decoded_offsets.saturating_add(other.decoded_offsets);
         self.emitted_candidates = self
             .emitted_candidates
             .saturating_add(other.emitted_candidates);
         self.skipped_offsets = self.skipped_offsets.saturating_add(other.skipped_offsets);
-        self.cache_hits = self.cache_hits.saturating_add(other.cache_hits);
-        self.cache_misses = self.cache_misses.saturating_add(other.cache_misses);
-        self.cache_admission_skips = self
-            .cache_admission_skips
-            .saturating_add(other.cache_admission_skips);
+        self.base_cache_hits = self.base_cache_hits.saturating_add(other.base_cache_hits);
+        self.base_cache_misses = self
+            .base_cache_misses
+            .saturating_add(other.base_cache_misses);
         self.external_base_calls = self
             .external_base_calls
             .saturating_add(other.external_base_calls);
@@ -327,6 +341,31 @@ impl PackExecStats {
             .large_blob_spilled_count
             .saturating_add(other.large_blob_spilled_count);
         self.large_blob_bytes = self.large_blob_bytes.saturating_add(other.large_blob_bytes);
+        self.cache_lookup_nanos = self
+            .cache_lookup_nanos
+            .saturating_add(other.cache_lookup_nanos);
+        self.fallback_resolve_nanos = self
+            .fallback_resolve_nanos
+            .saturating_add(other.fallback_resolve_nanos);
+        self.sink_emit_nanos = self.sink_emit_nanos.saturating_add(other.sink_emit_nanos);
+    }
+}
+
+/// Accumulate wall-clock nanoseconds into a timing field.
+///
+/// Gated on `cfg(feature = "git-perf")` — compiles to a no-op in normal
+/// builds so that `perf::time()` call-sites are free.  Follows the same
+/// pattern as `perf_stats::sat_add_*` but uses a separate feature flag
+/// because timing probes have higher overhead than simple counter bumps.
+#[inline(always)]
+fn record_timing(field: &mut u64, nanos: u64) {
+    #[cfg(feature = "git-perf")]
+    {
+        *field = field.saturating_add(nanos);
+    }
+    #[cfg(not(feature = "git-perf"))]
+    {
+        let _ = (field, nanos);
     }
 }
 
@@ -354,13 +393,17 @@ fn cache_reject_bucket_range(idx: usize) -> (u32, u32) {
 #[inline]
 fn record_fallback_chain(stats: &mut PackExecStats, chain_len: usize) {
     let chain_len = chain_len.min(u32::MAX as usize) as u32;
-    stats.fallback_chain_len_sum = stats.fallback_chain_len_sum.saturating_add(chain_len);
-    stats.fallback_chain_len_max = stats.fallback_chain_len_max.max(chain_len);
+    perf_stats::sat_add_u32(&mut stats.fallback_chain_len_sum, chain_len);
+    perf_stats::max_u32(&mut stats.fallback_chain_len_max, chain_len);
 }
 
 /// Aggregate cache reject histogram across pack-exec reports.
 #[must_use]
 pub fn aggregate_cache_reject_histogram(reports: &[PackExecReport]) -> CacheRejectHistogram {
+    if !cfg!(all(feature = "perf-stats", debug_assertions)) {
+        let _ = reports;
+        return CacheRejectHistogram::default();
+    }
     let mut out = CacheRejectHistogram::default();
     for report in reports {
         let stats = &report.stats;
@@ -397,8 +440,6 @@ pub struct PackExecScratch {
     base_buf: Vec<u8>,
     delta_stack: Vec<DeltaFrame>,
     candidate_ranges: Vec<Option<(usize, usize)>>,
-    /// Base reference counts per `need_offsets` index for cache admission.
-    base_ref_counts: Vec<u16>,
 }
 
 impl PackExecScratch {
@@ -435,17 +476,6 @@ impl PackExecScratch {
         }
         self.delta_stack.clear();
         self.candidate_ranges.clear();
-
-        self.base_ref_counts.clear();
-        self.base_ref_counts.resize(plan.need_offsets.len(), 0);
-        for dep in &plan.delta_deps {
-            if let BaseLoc::Offset(base_offset) = dep.base {
-                if let Ok(idx) = plan.need_offsets.binary_search(&base_offset) {
-                    let count = &mut self.base_ref_counts[idx];
-                    *count = count.saturating_add(1);
-                }
-            }
-        }
     }
 }
 
@@ -460,19 +490,6 @@ enum DecodedStorage {
     ///
     /// The spill must outlive any use of the returned slice.
     Spill(BlobSpill),
-}
-
-#[inline]
-fn should_cache_at_index(base_ref_counts: &[u16], need_idx: usize) -> bool {
-    base_ref_counts.get(need_idx).copied().unwrap_or(0) > 0
-}
-
-#[inline]
-fn should_cache_for_offset(need_offsets: &[u64], base_ref_counts: &[u16], offset: u64) -> bool {
-    match need_offsets.binary_search(&offset) {
-        Ok(idx) => should_cache_at_index(base_ref_counts, idx),
-        Err(_) => false,
-    }
 }
 
 /// Metadata for a decoded offset (kind + storage location).
@@ -620,7 +637,6 @@ pub fn execute_pack_plan_with_scratch<S: PackObjectSink, B: ExternalBaseProvider
     scratch.prepare(plan, limits);
     let inflate_buf = &mut scratch.inflate_buf;
     let result_buf = &mut scratch.result_buf;
-    let base_ref_counts = &scratch.base_ref_counts;
 
     let mut handle_idx = |idx: usize, range: Option<(usize, usize)>| -> Result<(), PackExecError> {
         let guard = if alloc_guard_enabled {
@@ -630,12 +646,12 @@ pub fn execute_pack_plan_with_scratch<S: PackObjectSink, B: ExternalBaseProvider
         };
         let offset = plan.need_offsets[idx];
 
-        let (obj_kind, storage) = if let Some(hit) = cache.get(offset) {
-            report.stats.cache_hits += 1;
+        let (cache_result, lookup_nanos) = perf::time(|| cache.get(offset));
+        record_timing(&mut report.stats.cache_lookup_nanos, lookup_nanos);
+        let (obj_kind, storage) = if let Some(hit) = cache_result {
             perf::record_cache_hit();
             (hit.kind, DecodedStorage::Cache)
         } else {
-            report.stats.cache_misses += 1;
             perf::record_cache_miss();
             let decoded = decode_offset(
                 &pack,
@@ -648,7 +664,6 @@ pub fn execute_pack_plan_with_scratch<S: PackObjectSink, B: ExternalBaseProvider
                 external,
                 &plan.delta_deps,
                 &plan.delta_dep_index,
-                base_ref_counts,
                 &mut report,
                 inflate_buf,
                 result_buf,
@@ -683,12 +698,14 @@ pub fn execute_pack_plan_with_scratch<S: PackObjectSink, B: ExternalBaseProvider
                         offset,
                         reason: SkipReason::NotBlob,
                     });
-                    report.stats.skipped_offsets += 1;
+                    perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
                     continue;
                 }
                 let path = paths.get(candidate.ctx.path_ref);
-                sink.emit(candidate, path, bytes)?;
-                report.stats.emitted_candidates += 1;
+                let (emit_result, emit_nanos) = perf::time(|| sink.emit(candidate, path, bytes));
+                emit_result?;
+                record_timing(&mut report.stats.sink_emit_nanos, emit_nanos);
+                perf_stats::sat_add_u32(&mut report.stats.emitted_candidates, 1);
             }
         }
 
@@ -765,7 +782,6 @@ pub fn execute_pack_plan_with_scratch_indices<S: PackObjectSink, B: ExternalBase
     scratch.prepare(plan, limits);
     let inflate_buf = &mut scratch.inflate_buf;
     let result_buf = &mut scratch.result_buf;
-    let base_ref_counts = &scratch.base_ref_counts;
 
     let mut handle_idx = |idx: usize| -> Result<(), PackExecError> {
         let guard = if alloc_guard_enabled {
@@ -776,12 +792,12 @@ pub fn execute_pack_plan_with_scratch_indices<S: PackObjectSink, B: ExternalBase
         let offset = plan.need_offsets[idx];
         let range = candidate_ranges[idx];
 
-        let (obj_kind, storage) = if let Some(hit) = cache.get(offset) {
-            report.stats.cache_hits += 1;
+        let (cache_result, lookup_nanos) = perf::time(|| cache.get(offset));
+        record_timing(&mut report.stats.cache_lookup_nanos, lookup_nanos);
+        let (obj_kind, storage) = if let Some(hit) = cache_result {
             perf::record_cache_hit();
             (hit.kind, DecodedStorage::Cache)
         } else {
-            report.stats.cache_misses += 1;
             perf::record_cache_miss();
             let decoded = decode_offset(
                 &pack,
@@ -794,7 +810,6 @@ pub fn execute_pack_plan_with_scratch_indices<S: PackObjectSink, B: ExternalBase
                 external,
                 &plan.delta_deps,
                 &plan.delta_dep_index,
-                base_ref_counts,
                 &mut report,
                 inflate_buf,
                 result_buf,
@@ -828,12 +843,14 @@ pub fn execute_pack_plan_with_scratch_indices<S: PackObjectSink, B: ExternalBase
                         offset,
                         reason: SkipReason::NotBlob,
                     });
-                    report.stats.skipped_offsets += 1;
+                    perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
                     continue;
                 }
                 let path = paths.get(candidate.ctx.path_ref);
-                sink.emit(candidate, path, bytes)?;
-                report.stats.emitted_candidates += 1;
+                let (emit_result, emit_nanos) = perf::time(|| sink.emit(candidate, path, bytes));
+                emit_result?;
+                record_timing(&mut report.stats.sink_emit_nanos, emit_nanos);
+                perf_stats::sat_add_u32(&mut report.stats.emitted_candidates, 1);
             }
         }
 
@@ -984,7 +1001,6 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
     external: &'a mut B,
     delta_deps: &'a [DeltaDep],
     delta_dep_index: &'a [u32],
-    base_ref_counts: &'a [u16],
     report: &'a mut PackExecReport,
     inflate_buf: &'a mut Vec<u8>,
     result_buf: &'a mut Vec<u8>,
@@ -999,7 +1015,7 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                 offset,
                 reason: SkipReason::Decode(err),
             });
-            report.stats.skipped_offsets += 1;
+            perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
             return Ok(None);
         }
     };
@@ -1013,7 +1029,7 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                         offset,
                         reason: SkipReason::Decode(err),
                     });
-                    report.stats.skipped_offsets += 1;
+                    perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
                     return Ok(None);
                 }
             };
@@ -1030,25 +1046,19 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                         offset,
                         reason: SkipReason::Decode(err),
                     });
-                    report.stats.skipped_offsets += 1;
+                    perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
                     return Ok(None);
                 }
                 perf::record_pack_inflate(result_buf.len(), nanos);
-                report.stats.decoded_offsets += 1;
+                perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
 
-                let should_cache = should_cache_at_index(base_ref_counts, need_idx);
-                if should_cache && cache.insert(offset, kind, result_buf) {
+                if cache.insert(offset, kind, result_buf) {
                     Ok(Some(DecodedObject {
                         kind,
                         storage: DecodedStorage::Cache,
                     }))
                 } else {
-                    if should_cache {
-                        report.stats.record_cache_reject(result_buf.len());
-                    } else {
-                        report.stats.cache_admission_skips =
-                            report.stats.cache_admission_skips.saturating_add(1);
-                    }
+                    report.stats.record_cache_reject(result_buf.len());
                     Ok(Some(DecodedObject {
                         kind,
                         storage: DecodedStorage::Scratch,
@@ -1070,19 +1080,17 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                         offset,
                         reason: SkipReason::Decode(PackDecodeError::Inflate(err)),
                     });
-                    report.stats.skipped_offsets += 1;
+                    perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
                     return Ok(None);
                 }
                 writer
                     .finish()
                     .map_err(|err| PackExecError::Spill(err.to_string()))?;
                 perf::record_pack_inflate(size, nanos);
-                report.stats.decoded_offsets += 1;
+                perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
                 report.stats.record_cache_reject(size);
-                report.stats.large_blob_spilled_count =
-                    report.stats.large_blob_spilled_count.saturating_add(1);
-                report.stats.large_blob_bytes =
-                    report.stats.large_blob_bytes.saturating_add(size as u64);
+                perf_stats::sat_add_u32(&mut report.stats.large_blob_spilled_count, 1);
+                perf_stats::sat_add_u64(&mut report.stats.large_blob_bytes, size as u64);
 
                 Ok(Some(DecodedObject {
                     kind,
@@ -1093,35 +1101,44 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
         EntryKind::OfsDelta { base_offset } => {
             let (base_kind, storage, out_len) = {
                 let base = match cache.get(base_offset) {
-                    Some(base) => BaseBytes {
-                        kind: base.kind,
-                        storage: BaseStorage::Slice(base.bytes),
-                    },
-                    None => match decode_base_from_pack(
-                        pack,
-                        base_offset,
-                        need_offsets,
-                        limits,
-                        max_delta_depth,
-                        cache,
-                        external,
-                        delta_deps,
-                        delta_dep_index,
-                        base_ref_counts,
-                        report,
-                        inflate_buf,
-                        result_buf,
-                        base_buf,
-                        delta_stack,
-                        spill_dir,
-                    ) {
-                        Ok(base) => base,
-                        Err(reason) => {
-                            report.skips.push(SkipRecord { offset, reason });
-                            report.stats.skipped_offsets += 1;
-                            return Ok(None);
+                    Some(base) => {
+                        perf_stats::sat_add_u32(&mut report.stats.base_cache_hits, 1);
+                        BaseBytes {
+                            kind: base.kind,
+                            storage: BaseStorage::Slice(base.bytes),
                         }
-                    },
+                    }
+                    None => {
+                        perf_stats::sat_add_u32(&mut report.stats.base_cache_misses, 1);
+                        let (result, resolve_nanos) = perf::time(|| {
+                            decode_base_from_pack(
+                                pack,
+                                base_offset,
+                                need_offsets,
+                                limits,
+                                max_delta_depth,
+                                cache,
+                                external,
+                                delta_deps,
+                                delta_dep_index,
+                                report,
+                                inflate_buf,
+                                result_buf,
+                                base_buf,
+                                delta_stack,
+                                spill_dir,
+                            )
+                        });
+                        record_timing(&mut report.stats.fallback_resolve_nanos, resolve_nanos);
+                        match result {
+                            Ok(base) => base,
+                            Err(reason) => {
+                                report.skips.push(SkipRecord { offset, reason });
+                                perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
+                                return Ok(None);
+                            }
+                        }
+                    }
                 };
 
                 let (storage, out_len) = match decode_delta_output(
@@ -1149,7 +1166,7 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                                 });
                             }
                         }
-                        report.stats.skipped_offsets += 1;
+                        perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
                         return Ok(None);
                     }
                 };
@@ -1157,28 +1174,20 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                 (base.kind, storage, out_len)
             };
 
-            report.stats.decoded_offsets += 1;
+            perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
             if matches!(&storage, DecodedStorage::Spill(_)) {
-                report.stats.large_blob_spilled_count =
-                    report.stats.large_blob_spilled_count.saturating_add(1);
-                report.stats.large_blob_bytes =
-                    report.stats.large_blob_bytes.saturating_add(out_len as u64);
+                perf_stats::sat_add_u32(&mut report.stats.large_blob_spilled_count, 1);
+                perf_stats::sat_add_u64(&mut report.stats.large_blob_bytes, out_len as u64);
             }
             match storage {
                 DecodedStorage::Cache | DecodedStorage::Scratch => {
-                    let should_cache = should_cache_at_index(base_ref_counts, need_idx);
-                    if should_cache && cache.insert(offset, base_kind, result_buf) {
+                    if cache.insert(offset, base_kind, result_buf) {
                         Ok(Some(DecodedObject {
                             kind: base_kind,
                             storage: DecodedStorage::Cache,
                         }))
                     } else {
-                        if should_cache {
-                            report.stats.record_cache_reject(out_len);
-                        } else {
-                            report.stats.cache_admission_skips =
-                                report.stats.cache_admission_skips.saturating_add(1);
-                        }
+                        report.stats.record_cache_reject(out_len);
                         Ok(Some(DecodedObject {
                             kind: base_kind,
                             storage: DecodedStorage::Scratch,
@@ -1200,35 +1209,50 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                 Some(BaseLoc::Offset(base_offset)) => {
                     let (base_kind, storage, out_len) = {
                         let base = match cache.get(base_offset) {
-                            Some(base) => BaseBytes {
-                                kind: base.kind,
-                                storage: BaseStorage::Slice(base.bytes),
-                            },
-                            None => match decode_base_from_pack(
-                                pack,
-                                base_offset,
-                                need_offsets,
-                                limits,
-                                max_delta_depth,
-                                cache,
-                                external,
-                                delta_deps,
-                                delta_dep_index,
-                                base_ref_counts,
-                                report,
-                                inflate_buf,
-                                result_buf,
-                                base_buf,
-                                delta_stack,
-                                spill_dir,
-                            ) {
-                                Ok(base) => base,
-                                Err(reason) => {
-                                    report.skips.push(SkipRecord { offset, reason });
-                                    report.stats.skipped_offsets += 1;
-                                    return Ok(None);
+                            Some(base) => {
+                                perf_stats::sat_add_u32(&mut report.stats.base_cache_hits, 1);
+                                BaseBytes {
+                                    kind: base.kind,
+                                    storage: BaseStorage::Slice(base.bytes),
                                 }
-                            },
+                            }
+                            None => {
+                                perf_stats::sat_add_u32(&mut report.stats.base_cache_misses, 1);
+                                let (result, resolve_nanos) = perf::time(|| {
+                                    decode_base_from_pack(
+                                        pack,
+                                        base_offset,
+                                        need_offsets,
+                                        limits,
+                                        max_delta_depth,
+                                        cache,
+                                        external,
+                                        delta_deps,
+                                        delta_dep_index,
+                                        report,
+                                        inflate_buf,
+                                        result_buf,
+                                        base_buf,
+                                        delta_stack,
+                                        spill_dir,
+                                    )
+                                });
+                                record_timing(
+                                    &mut report.stats.fallback_resolve_nanos,
+                                    resolve_nanos,
+                                );
+                                match result {
+                                    Ok(base) => base,
+                                    Err(reason) => {
+                                        report.skips.push(SkipRecord { offset, reason });
+                                        perf_stats::sat_add_u32(
+                                            &mut report.stats.skipped_offsets,
+                                            1,
+                                        );
+                                        return Ok(None);
+                                    }
+                                }
+                            }
                         };
 
                         let (storage, out_len) = match decode_delta_output(
@@ -1256,7 +1280,7 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                                         });
                                     }
                                 }
-                                report.stats.skipped_offsets += 1;
+                                perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
                                 return Ok(None);
                             }
                         };
@@ -1264,28 +1288,20 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                         (base.kind, storage, out_len)
                     };
 
-                    report.stats.decoded_offsets += 1;
+                    perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
                     if matches!(&storage, DecodedStorage::Spill(_)) {
-                        report.stats.large_blob_spilled_count =
-                            report.stats.large_blob_spilled_count.saturating_add(1);
-                        report.stats.large_blob_bytes =
-                            report.stats.large_blob_bytes.saturating_add(out_len as u64);
+                        perf_stats::sat_add_u32(&mut report.stats.large_blob_spilled_count, 1);
+                        perf_stats::sat_add_u64(&mut report.stats.large_blob_bytes, out_len as u64);
                     }
                     match storage {
                         DecodedStorage::Cache | DecodedStorage::Scratch => {
-                            let should_cache = should_cache_at_index(base_ref_counts, need_idx);
-                            if should_cache && cache.insert(offset, base_kind, result_buf) {
+                            if cache.insert(offset, base_kind, result_buf) {
                                 Ok(Some(DecodedObject {
                                     kind: base_kind,
                                     storage: DecodedStorage::Cache,
                                 }))
                             } else {
-                                if should_cache {
-                                    report.stats.record_cache_reject(out_len);
-                                } else {
-                                    report.stats.cache_admission_skips =
-                                        report.stats.cache_admission_skips.saturating_add(1);
-                                }
+                                report.stats.record_cache_reject(out_len);
                                 Ok(Some(DecodedObject {
                                     kind: base_kind,
                                     storage: DecodedStorage::Scratch,
@@ -1303,7 +1319,7 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                 }
                 Some(BaseLoc::External { .. }) | None => {
                     let base_oid = oid_or_base(base_oid, dep.as_ref());
-                    report.stats.external_base_calls += 1;
+                    perf_stats::sat_add_u32(&mut report.stats.external_base_calls, 1);
                     match external.load_base(&base_oid) {
                         Ok(Some(base)) => {
                             let base_bytes = BaseBytes {
@@ -1335,36 +1351,31 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                                             });
                                         }
                                     }
-                                    report.stats.skipped_offsets += 1;
+                                    perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
                                     return Ok(None);
                                 }
                             };
 
-                            report.stats.decoded_offsets += 1;
+                            perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
                             if matches!(&storage, DecodedStorage::Spill(_)) {
-                                report.stats.large_blob_spilled_count =
-                                    report.stats.large_blob_spilled_count.saturating_add(1);
-                                report.stats.large_blob_bytes =
-                                    report.stats.large_blob_bytes.saturating_add(out_len as u64);
+                                perf_stats::sat_add_u32(
+                                    &mut report.stats.large_blob_spilled_count,
+                                    1,
+                                );
+                                perf_stats::sat_add_u64(
+                                    &mut report.stats.large_blob_bytes,
+                                    out_len as u64,
+                                );
                             }
                             match storage {
                                 DecodedStorage::Cache | DecodedStorage::Scratch => {
-                                    let should_cache =
-                                        should_cache_at_index(base_ref_counts, need_idx);
-                                    if should_cache && cache.insert(offset, base.kind, result_buf) {
+                                    if cache.insert(offset, base.kind, result_buf) {
                                         Ok(Some(DecodedObject {
                                             kind: base.kind,
                                             storage: DecodedStorage::Cache,
                                         }))
                                     } else {
-                                        if should_cache {
-                                            report.stats.record_cache_reject(out_len);
-                                        } else {
-                                            report.stats.cache_admission_skips = report
-                                                .stats
-                                                .cache_admission_skips
-                                                .saturating_add(1);
-                                        }
+                                        report.stats.record_cache_reject(out_len);
                                         Ok(Some(DecodedObject {
                                             kind: base.kind,
                                             storage: DecodedStorage::Scratch,
@@ -1385,7 +1396,7 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                                 offset,
                                 reason: SkipReason::ExternalBaseMissing { oid: base_oid },
                             });
-                            report.stats.skipped_offsets += 1;
+                            perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
                             Ok(None)
                         }
                         Err(_) => {
@@ -1393,7 +1404,7 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                                 offset,
                                 reason: SkipReason::ExternalBaseError,
                             });
-                            report.stats.skipped_offsets += 1;
+                            perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
                             Ok(None)
                         }
                     }
@@ -1496,7 +1507,6 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
     external: &'a mut B,
     delta_deps: &'a [DeltaDep],
     delta_dep_index: &'a [u32],
-    base_ref_counts: &'a [u16],
     report: &'a mut PackExecReport,
     inflate_buf: &mut Vec<u8>,
     result_buf: &mut Vec<u8>,
@@ -1512,7 +1522,7 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
 
     delta_stack.clear();
     let mut current_offset = offset;
-    report.stats.fallback_base_decodes = report.stats.fallback_base_decodes.saturating_add(1);
+    perf_stats::sat_add_u32(&mut report.stats.fallback_base_decodes, 1);
 
     loop {
         if delta_stack.len() >= max_delta_depth as usize {
@@ -1554,16 +1564,9 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
                         return Err(SkipReason::Decode(err));
                     }
                     perf::record_pack_inflate(base_buf.len(), nanos);
-                    report.stats.decoded_offsets += 1;
-                    let should_cache =
-                        should_cache_for_offset(need_offsets, base_ref_counts, current_offset);
-                    if should_cache {
-                        if !cache.insert(current_offset, kind, base_buf) {
-                            report.stats.record_cache_reject(base_buf.len());
-                        }
-                    } else {
-                        report.stats.cache_admission_skips =
-                            report.stats.cache_admission_skips.saturating_add(1);
+                    perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
+                    if !cache.insert(current_offset, kind, base_buf) {
+                        report.stats.record_cache_reject(base_buf.len());
                     }
                 } else {
                     let mut spill = match BlobSpill::new(spill_dir, size) {
@@ -1594,7 +1597,7 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
                         )));
                     }
                     perf::record_pack_inflate(size, nanos);
-                    report.stats.decoded_offsets += 1;
+                    perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
                     report.stats.record_cache_reject(size);
                     base_spill = Some(spill);
                 }
@@ -1622,23 +1625,13 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
                         }
                     })?;
 
-                    report.stats.decoded_offsets += 1;
+                    perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
                     match storage {
                         DecodedStorage::Cache | DecodedStorage::Scratch => {
                             std::mem::swap(base_buf, result_buf);
                             base_spill = None;
-                            let should_cache = should_cache_for_offset(
-                                need_offsets,
-                                base_ref_counts,
-                                frame.offset,
-                            );
-                            if should_cache {
-                                if !cache.insert(frame.offset, base_kind, base_buf) {
-                                    report.stats.record_cache_reject(base_buf.len());
-                                }
-                            } else {
-                                report.stats.cache_admission_skips =
-                                    report.stats.cache_admission_skips.saturating_add(1);
+                            if !cache.insert(frame.offset, base_kind, base_buf) {
+                                report.stats.record_cache_reject(base_buf.len());
                             }
                         }
                         DecodedStorage::Spill(spill) => {
@@ -1688,7 +1681,7 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
                             offset: current_offset,
                             header,
                         });
-                        report.stats.external_base_calls += 1;
+                        perf_stats::sat_add_u32(&mut report.stats.external_base_calls, 1);
                         match external.load_base(&oid) {
                             Ok(Some(base)) => {
                                 let base_len = base.bytes.len();
@@ -1699,7 +1692,7 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
                                         base_buf.reserve(base_len - base_buf.capacity());
                                     }
                                     base_buf.extend_from_slice(&base.bytes);
-                                    report.stats.decoded_offsets += 1;
+                                    perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
                                 } else {
                                     let mut spill = match BlobSpill::new(spill_dir, base_len) {
                                         Ok(spill) => spill,
@@ -1728,7 +1721,7 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
                                             super::pack_inflate::InflateError::Backend,
                                         )));
                                     }
-                                    report.stats.decoded_offsets += 1;
+                                    perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
                                     report.stats.record_cache_reject(base_len);
                                     base_spill = Some(spill);
                                 };
@@ -1758,7 +1751,7 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
                                         }
                                     })?;
 
-                                    report.stats.decoded_offsets += 1;
+                                    perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
                                     match storage {
                                         DecodedStorage::Cache | DecodedStorage::Scratch => {
                                             std::mem::swap(base_buf, result_buf);
@@ -2104,8 +2097,23 @@ mod tests {
             delta_deps: Vec::new(),
             delta_dep_index: vec![NONE_U32; stats.need_count as usize],
             exec_order,
-            clusters: Vec::new(),
             stats,
+        }
+    }
+
+    fn assert_perf_u32(actual: u32, expected: u32) {
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            assert_eq!(actual, expected);
+        } else {
+            assert_eq!(actual, 0);
+        }
+    }
+
+    fn assert_perf_u64(actual: u64, expected: u64) {
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            assert_eq!(actual, expected);
+        } else {
+            assert_eq!(actual, 0);
         }
     }
 
@@ -2147,7 +2155,7 @@ mod tests {
             &mut sink,
         );
 
-        assert_eq!(report.stats.emitted_candidates, 1);
+        assert_perf_u32(report.stats.emitted_candidates, 1);
         assert_eq!(sink.emitted.len(), 1);
     }
 
@@ -2191,9 +2199,9 @@ mod tests {
             &mut sink,
         );
 
-        assert_eq!(report.stats.emitted_candidates, 1);
-        assert_eq!(report.stats.large_blob_spilled_count, 1);
-        assert_eq!(report.stats.large_blob_bytes, data.len() as u64);
+        assert_perf_u32(report.stats.emitted_candidates, 1);
+        assert_perf_u32(report.stats.large_blob_spilled_count, 1);
+        assert_perf_u64(report.stats.large_blob_bytes, data.len() as u64);
         assert_eq!(
             sink.blobs.get(&candidate.oid).map(|b| b.as_slice()),
             Some(data.as_slice())
@@ -2251,7 +2259,6 @@ mod tests {
             delta_deps,
             delta_dep_index,
             exec_order: None,
-            clusters: Vec::new(),
             stats: PackPlanStats {
                 candidate_count: 1,
                 need_count: 2,
@@ -2276,9 +2283,9 @@ mod tests {
             &mut sink,
         );
 
-        assert_eq!(report.stats.emitted_candidates, 1);
-        assert_eq!(report.stats.large_blob_spilled_count, 1);
-        assert_eq!(report.stats.large_blob_bytes, result_bytes.len() as u64);
+        assert_perf_u32(report.stats.emitted_candidates, 1);
+        assert_perf_u32(report.stats.large_blob_spilled_count, 1);
+        assert_perf_u64(report.stats.large_blob_bytes, result_bytes.len() as u64);
         assert_eq!(
             sink.blobs.get(&candidate.oid).map(|b| b.as_slice()),
             Some(result_bytes.as_slice())
@@ -2337,7 +2344,7 @@ mod tests {
             &mut sink,
         );
 
-        assert_eq!(report.stats.emitted_candidates, 2);
+        assert_perf_u32(report.stats.emitted_candidates, 2);
         assert_eq!(sink.emitted.len(), 2);
     }
 
@@ -2379,7 +2386,7 @@ mod tests {
             &mut sink,
         );
 
-        assert_eq!(report.stats.emitted_candidates, 0);
+        assert_perf_u32(report.stats.emitted_candidates, 0);
         assert_eq!(report.skips.len(), 1);
         assert!(matches!(report.skips[0].reason, SkipReason::NotBlob));
     }
@@ -2436,7 +2443,7 @@ mod tests {
             &mut sink,
         );
 
-        assert_eq!(report.stats.emitted_candidates, 2);
+        assert_perf_u32(report.stats.emitted_candidates, 2);
         assert_eq!(
             sink.emitted,
             vec![OidBytes::sha1([0x22; 20]), OidBytes::sha1([0x11; 20])]
@@ -2582,7 +2589,6 @@ mod tests {
             delta_deps,
             delta_dep_index,
             exec_order: None,
-            clusters: Vec::new(),
             stats: PackPlanStats {
                 candidate_count: 1,
                 need_count: 2,
@@ -2613,7 +2619,7 @@ mod tests {
             &candidate_ranges,
         );
 
-        assert_eq!(report.stats.emitted_candidates, 1);
+        assert_perf_u32(report.stats.emitted_candidates, 1);
         assert_eq!(sink.emitted, vec![OidBytes::sha1([0x66; 20])]);
     }
 
@@ -2666,7 +2672,6 @@ mod tests {
             delta_deps,
             delta_dep_index,
             exec_order: None,
-            clusters: Vec::new(),
             stats: PackPlanStats {
                 candidate_count: 1,
                 need_count: 2,
@@ -2690,7 +2695,7 @@ mod tests {
             &mut sink,
         );
 
-        assert_eq!(report.stats.emitted_candidates, 0);
+        assert_perf_u32(report.stats.emitted_candidates, 0);
         assert!(report.skips.iter().any(|skip| {
             matches!(skip.reason, SkipReason::Decode(PackDecodeError::Inflate(_)))
         }));
@@ -2748,7 +2753,6 @@ mod tests {
             delta_deps,
             delta_dep_index,
             exec_order: None,
-            clusters: Vec::new(),
             stats: PackPlanStats {
                 candidate_count: 1,
                 need_count: 2,
@@ -2772,7 +2776,7 @@ mod tests {
             &mut sink,
         );
 
-        assert_eq!(report.stats.emitted_candidates, 1);
+        assert_perf_u32(report.stats.emitted_candidates, 1);
         assert_eq!(
             sink.blobs.get(&candidate.oid).map(|b| b.as_slice()),
             Some(result_bytes.as_slice())
@@ -2830,7 +2834,6 @@ mod tests {
             delta_deps,
             delta_dep_index,
             exec_order: None,
-            clusters: Vec::new(),
             stats: PackPlanStats {
                 candidate_count: 1,
                 need_count: 2,
@@ -2854,7 +2857,7 @@ mod tests {
             &mut sink,
         );
 
-        assert_eq!(report.stats.emitted_candidates, 1);
+        assert_perf_u32(report.stats.emitted_candidates, 1);
         assert_eq!(
             sink.blobs.get(&candidate.oid).map(|b| b.as_slice()),
             Some(result_bytes.as_slice())
@@ -2910,7 +2913,6 @@ mod tests {
             delta_deps,
             delta_dep_index,
             exec_order: None,
-            clusters: Vec::new(),
             stats: PackPlanStats {
                 candidate_count: 1,
                 need_count: 1,
@@ -2955,7 +2957,7 @@ mod tests {
             &mut sink,
         );
 
-        assert_eq!(report.stats.emitted_candidates, 1);
+        assert_perf_u32(report.stats.emitted_candidates, 1);
         assert_eq!(
             sink.blobs.get(&candidate.oid).map(|b| b.as_slice()),
             Some(result_bytes.as_slice())
@@ -3007,7 +3009,7 @@ mod tests {
             &mut sink,
         );
 
-        assert_eq!(report.stats.emitted_candidates, 0);
+        assert_perf_u32(report.stats.emitted_candidates, 0);
         assert!(matches!(
             report.skips[0].reason,
             SkipReason::Decode(PackDecodeError::Inflate(_))
@@ -3058,7 +3060,7 @@ mod tests {
             &mut sink,
         );
 
-        assert_eq!(report.stats.emitted_candidates, 0);
+        assert_perf_u32(report.stats.emitted_candidates, 0);
         assert!(matches!(
             report.skips[0].reason,
             SkipReason::Decode(PackDecodeError::PackParse(_))
@@ -3178,7 +3180,7 @@ run with --test-threads=1 to enable"
             &mut adapter,
         );
 
-        assert_eq!(report.stats.emitted_candidates, 1);
+        assert_perf_u32(report.stats.emitted_candidates, 1);
         let scanned = adapter.take_results();
         assert_eq!(scanned.blobs.len(), 1);
         assert!(!scanned.finding_arena.is_empty());

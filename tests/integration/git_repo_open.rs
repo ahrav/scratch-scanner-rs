@@ -1,30 +1,32 @@
 //! Integration tests for repo_open's filesystem discovery and artifact handling.
 //!
-//! The commit-graph and MIDX files contain placeholder bytes; repo_open only
-//! checks for presence and mmaps them during these tests.
+//! Tests use either synthetic `.git` layouts (for path/ref resolution) or real
+//! repos created via `git init` (for pack-based fingerprinting).
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
+use scanner_rs::git_scan::OidBytes;
 use scanner_rs::git_scan::{
-    repo_open, RefWatermarkStore, RepoOpenError, RepoOpenLimits, StartSetConfig, StartSetResolver,
+    acquire_midx, repo_open, ArtifactBuildLimits, RefWatermarkStore, RepoOpenError, RepoOpenLimits,
+    StartSetConfig, StartSetResolver,
 };
-use scanner_rs::git_scan::{OidBytes, RepoArtifactStatus};
 use tempfile::TempDir;
 
-// Writes a minimal commit-graph marker file (not a valid commit-graph).
+/// Writes a minimal commit-graph marker file (not a valid commit-graph).
 fn write_commit_graph(objects_dir: &Path) {
     let info_dir = objects_dir.join("info");
     fs::create_dir_all(&info_dir).unwrap();
     fs::write(info_dir.join("commit-graph"), b"CGPH").unwrap();
 }
 
-// Writes a minimal multi-pack-index marker file (not a valid MIDX).
+/// Writes a minimal multi-pack-index marker file (not a valid MIDX).
 fn write_midx(pack_dir: &Path) {
     fs::create_dir_all(pack_dir).unwrap();
     fs::write(pack_dir.join("multi-pack-index"), b"MIDX").unwrap();
 }
 
-// Creates a minimal worktree .git layout with HEAD, objects, and refs dirs.
+/// Creates a minimal worktree .git layout with HEAD, objects, and refs dirs.
 fn create_main_repo(root: &Path) -> PathBuf {
     let git_dir = root.join(".git");
     fs::create_dir_all(git_dir.join("objects").join("pack")).unwrap();
@@ -33,7 +35,7 @@ fn create_main_repo(root: &Path) -> PathBuf {
     git_dir
 }
 
-// Creates a linked worktree with a .git file pointing at worktrees/<name>.
+/// Creates a linked worktree with a .git file pointing at worktrees/<name>.
 fn create_linked_worktree(worktree_root: &Path, main_git_dir: &Path, name: &str) -> PathBuf {
     fs::create_dir_all(worktree_root).unwrap();
 
@@ -47,7 +49,7 @@ fn create_linked_worktree(worktree_root: &Path, main_git_dir: &Path, name: &str)
     wt_git_dir
 }
 
-// Writes an info/alternates file with one path per line.
+/// Writes an info/alternates file with one path per line.
 fn write_alternates(objects_dir: &Path, alternates: &[PathBuf]) {
     let alternates_path = objects_dir.join("info").join("alternates");
     fs::create_dir_all(alternates_path.parent().unwrap()).unwrap();
@@ -132,12 +134,6 @@ fn repo_open_linked_worktree_and_alternates() {
     assert!(state.paths.is_linked_worktree());
     assert_eq!(state.paths.alternate_object_dirs.len(), 1);
     assert!(state.paths.alternate_object_dirs[0].ends_with("alt-objects"));
-
-    assert!(state.artifact_status.is_ready());
-    assert!(matches!(state.artifact_status, RepoArtifactStatus::Ready));
-    assert!(state.mmaps.commit_graph.is_some());
-    assert!(state.mmaps.midx.is_some());
-    assert!(state.artifact_fingerprint.is_some());
 }
 
 #[test]
@@ -171,7 +167,6 @@ fn repo_open_sorts_refs_and_loads_watermarks() {
     )
     .unwrap();
 
-    assert!(matches!(state.artifact_status, RepoArtifactStatus::Ready));
     assert_eq!(state.start_set.len(), 3);
 
     let names: Vec<&[u8]> = state
@@ -215,31 +210,35 @@ fn repo_open_detects_lock_files() {
     )
     .unwrap();
 
-    match state.artifact_status {
-        RepoArtifactStatus::NeedsMaintenance { lock_present, .. } => {
-            assert!(lock_present, "lock should be detected");
-        }
-        RepoArtifactStatus::Ready => panic!("expected NeedsMaintenance"),
-    }
-    assert!(state.mmaps.commit_graph.is_none());
+    // Lock files signal ongoing maintenance; the repo reports no usable
+    // MIDX or artifact fingerprint when they are present.
     assert!(state.mmaps.midx.is_none());
     assert!(state.artifact_fingerprint.is_none());
 }
 
 #[test]
 fn repo_open_detects_artifact_changes() {
-    let tmp = TempDir::new().unwrap();
-    let git_dir = create_main_repo(tmp.path());
+    // Skip if git is not available.
+    if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("git not available; skipping artifact change detection test");
+        return;
+    }
 
-    let objects_dir = git_dir.join("objects");
-    let pack_dir = objects_dir.join("pack");
-    write_commit_graph(&objects_dir);
-    write_midx(&pack_dir);
+    let tmp = TempDir::new().unwrap();
+
+    // Create a real repo with a commit so there are pack files.
+    run_git_cmd(tmp.path(), &["init", "-b", "main"]);
+    run_git_cmd(tmp.path(), &["config", "user.email", "test@example.com"]);
+    run_git_cmd(tmp.path(), &["config", "user.name", "Test User"]);
+    fs::write(tmp.path().join("file.txt"), "data\n").unwrap();
+    run_git_cmd(tmp.path(), &["add", "."]);
+    run_git_cmd(tmp.path(), &["commit", "-m", "initial"]);
+    run_git_cmd(tmp.path(), &["repack", "-ad"]);
 
     let resolver = TestResolver { refs: vec![] };
     let start_set_id = StartSetConfig::DefaultBranchOnly.id();
 
-    let state = repo_open(
+    let mut state = repo_open(
         tmp.path(),
         1,
         [0u8; 32],
@@ -250,10 +249,30 @@ fn repo_open_detects_artifact_changes() {
     )
     .unwrap();
 
+    // Before acquire_midx, fingerprint is None → unchanged returns false.
+    assert!(!state.artifacts_unchanged().unwrap());
+
+    // Build MIDX in memory, which sets the PackSet fingerprint.
+    let _midx = acquire_midx(&mut state, &ArtifactBuildLimits::default()).unwrap();
+    assert!(state.artifact_fingerprint.is_some());
     assert!(state.artifacts_unchanged().unwrap());
 
-    let commit_graph_path = objects_dir.join("info").join("commit-graph");
-    fs::write(commit_graph_path, b"CGPH2").unwrap();
+    // Add a new commit and repack so the pack files change on disk.
+    fs::write(tmp.path().join("file2.txt"), "more\n").unwrap();
+    run_git_cmd(tmp.path(), &["add", "."]);
+    run_git_cmd(tmp.path(), &["commit", "-m", "second"]);
+    run_git_cmd(tmp.path(), &["repack", "-ad"]);
 
+    // The fingerprint should now differ from the new pack set.
     assert!(!state.artifacts_unchanged().unwrap());
+}
+
+/// Run a git command and assert success.
+fn run_git_cmd(repo: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .status()
+        .expect("failed to run git");
+    assert!(status.success(), "git command failed: {args:?}");
 }

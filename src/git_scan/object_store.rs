@@ -198,10 +198,12 @@ impl SpillIndex {
     }
 }
 
-/// Trait for loading tree object bytes.
+/// Abstraction for loading raw tree payloads by OID.
 ///
-/// Implement this with your object store (packed or loose).
-/// The returned bytes must be the decompressed tree payload (no header).
+/// Implementations resolve a Git tree object and return its decompressed
+/// payload (without the `tree <size>\0` header). The `ObjectStore` in this
+/// module is the primary implementation, backed by MIDX pack lookups, loose
+/// objects, and a tree cache.
 pub trait TreeSource {
     /// Loads a tree object by OID.
     ///
@@ -260,10 +262,11 @@ impl TreeBytes {
         self.as_slice().len()
     }
 
-    /// Returns the in-flight length (RAM-resident bytes).
+    /// Returns the RAM-resident byte count of this payload.
     ///
-    /// Spilled bytes are treated as 0 in-flight because they live in the
-    /// spill arena, not in RAM.
+    /// Spilled payloads return 0 because their bytes live in the memory-mapped
+    /// spill arena and do not count against the in-flight memory budget.
+    /// Cached and owned payloads return their full length.
     #[must_use]
     pub fn in_flight_len(&self) -> usize {
         match self {
@@ -339,23 +342,19 @@ impl<'a> ObjectStore<'a> {
     /// Verifies that the MIDX covers all pack files found in pack directories,
     /// including alternates, so pack lookups are complete.
     ///
-    /// `spill_dir` is used for the spill arena backing file; it should be on
-    /// a fast local disk to keep large-tree reads predictable.
+    /// `spill_dir` must be an existing directory used for the spill arena
+    /// backing file. It should be on a fast local filesystem (e.g., tmpfs or
+    /// local SSD) to keep large-tree reads predictable.
     ///
     /// # Errors
-    /// Returns `TreeDiffError::ObjectStoreError` if artifacts are missing,
-    /// the MIDX is malformed, or pack files cannot be resolved.
+    /// Returns `TreeDiffError::ObjectStoreError` if the MIDX is malformed
+    /// or pack files cannot be resolved. `acquire_midx` must have been
+    /// called to populate `repo.mmaps.midx`.
     pub fn open(
         repo: &'a RepoJobState,
         limits: &TreeDiffLimits,
         spill_dir: &Path,
     ) -> Result<Self, TreeDiffError> {
-        if !repo.artifact_status.is_ready() {
-            return Err(TreeDiffError::ObjectStoreError {
-                detail: "repo artifacts not ready".to_string(),
-            });
-        }
-
         let midx_bytes =
             repo.mmaps
                 .midx
@@ -746,8 +745,12 @@ impl<'a> ObjectStore<'a> {
             let file = File::open(&path).map_err(|err| TreeDiffError::ObjectStoreError {
                 detail: format!("failed to open pack {}: {err}", path.display()),
             })?;
-            // SAFETY: The pack file is immutable for the duration of a repo
-            // job. We map it read-only and never mutate through the mapping.
+            // SAFETY: `Mmap::map` requires that the file is not concurrently
+            // truncated or modified while mapped. Pack files are immutable in
+            // a well-formed Git repository (writes create new packs). We also
+            // detect concurrent maintenance via lock-file and fingerprint checks
+            // in `artifacts_unchanged`. The mapping is read-only; we never
+            // mutate through it.
             let mmap = unsafe {
                 memmap2::Mmap::map(&file).map_err(|err| TreeDiffError::ObjectStoreError {
                     detail: format!("failed to mmap pack {}: {err}", path.display()),

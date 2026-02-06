@@ -2,29 +2,29 @@
 //!
 //! This stage prepares a repository for scanning by:
 //! - Resolving repository paths (worktree, bare, linked worktree)
-//! - Checking artifact readiness (commit-graph, MIDX)
 //! - Detecting maintenance lock files and recording artifact fingerprints
-//! - Memory-mapping metadata files (commit-graph, MIDX only - not packs)
 //! - Resolving start set tips (refs to scan)
 //! - Loading persisted watermarks for incremental scanning
 //!
+//! Artifacts (MIDX, commit-graph) are always built in memory from pack/idx
+//! files in later phases (`artifact_acquire`). This module does not mmap or
+//! check for disk-based commit-graph or MIDX files.
+//!
 //! Packs are not mmapped here. They are opened on demand in later phases
 //! per pack plan to avoid unnecessary FD and VMA pressure.
-//! # Invariants
-//! - Missing artifacts yield `NeedsMaintenance` with empty `mmaps` and `start_set`.
-//! - When artifacts are ready, fingerprints are captured for maintenance checks.
-//! - Start set refs are sorted deterministically by name.
 //!
-//! This stage performs minimal validation of metadata files: it checks for
-//! presence and mmaps commit-graph and MIDX, but parsing and structural
-//! validation are done by later phases.
+//! # Invariants
+//! - Start set refs are sorted deterministically by name.
+//! - Fingerprints are `PackSet` only, derived from pack/idx metadata.
+//!
+//! # Concurrency
+//! Repo maintenance must not mutate artifacts during a scan. We detect
+//! maintenance by comparing fingerprints and checking for lock files;
+//! the check is best-effort and does not guard against all races.
 
-use std::fs::{self, File, Metadata};
-use std::io::Read;
+use std::fs::{self, File};
+use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
-
-use memmap2::Mmap;
 
 use super::byte_arena::{ByteArena, ByteRef};
 use super::bytes::BytesView;
@@ -34,71 +34,36 @@ use super::object_id::{ObjectFormat, OidBytes};
 use super::repo::GitRepoPaths;
 use super::start_set::StartSetId;
 
-/// Status of required artifacts (commit-graph, MIDX).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RepoArtifactStatus {
-    /// All required artifacts are present and can be mmapped.
-    Ready,
-    /// One or more artifacts are missing; repo needs maintenance.
-    NeedsMaintenance {
-        /// True if commit-graph is missing.
-        missing_commit_graph: bool,
-        /// True if multi-pack-index is missing.
-        missing_midx: bool,
-        /// True if a Git maintenance lock file is present.
-        lock_present: bool,
-    },
-}
-
-impl RepoArtifactStatus {
-    /// Returns true if all artifacts are ready.
-    #[inline]
-    #[must_use]
-    pub const fn is_ready(&self) -> bool {
-        matches!(self, Self::Ready)
-    }
-}
-
-/// Paths to required artifact files.
+/// Paths to artifact files used for lock-file detection.
 #[derive(Clone, Debug)]
 pub struct RepoArtifactPaths {
-    /// Path to the commit-graph file.
+    /// Path to the commit-graph file (used for lock detection only).
     pub commit_graph: PathBuf,
-    /// Path to the multi-pack-index file.
+    /// Path to the multi-pack-index file (used for lock detection only).
     pub midx: PathBuf,
 }
 
-/// Artifact bytes for required metadata files.
+/// Artifact bytes populated by `artifact_acquire`.
 ///
-/// Only populated when `RepoArtifactStatus::Ready`.
-/// Views are read-only and expected to remain valid for the duration of
-/// a repo job (maintenance must not run concurrently).
+/// The MIDX is stored here after `acquire_midx` builds it in memory.
+/// The commit-graph is handled separately via `CommitGraphMem`.
 #[derive(Debug, Default)]
 pub struct RepoArtifactMmaps {
-    /// Commit-graph bytes (mmap or in-memory).
-    pub commit_graph: Option<BytesView>,
-    /// Multi-pack-index bytes (mmap or in-memory).
+    /// Multi-pack-index bytes (built in-memory by `acquire_midx`).
     pub midx: Option<BytesView>,
 }
 
-/// Fingerprint of an artifact file.
+/// Fingerprint for artifact change detection.
 ///
-/// This is a lightweight change detector (length + mtime), not a content hash.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ArtifactFingerprint {
-    /// File length in bytes.
-    pub len: u64,
-    /// Last modification time.
-    pub modified: SystemTime,
-}
-
-/// Fingerprints for commit-graph and MIDX.
-///
-/// Used to detect concurrent maintenance between repo open and later phases.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Uses hashes of pack/idx metadata (basename, size, mtime) to detect
+/// changes without re-reading artifact files. It is a coarse detector
+/// and does not verify pack contents.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepoArtifactFingerprint {
-    pub commit_graph: ArtifactFingerprint,
-    pub midx: ArtifactFingerprint,
+    /// Hash of `(pack_basename, size, mtime)` for all pack files.
+    pub packs_hash: [u8; 32],
+    /// Hash of `(idx_basename, size, mtime)` for all idx files.
+    pub idx_hash: [u8; 32],
 }
 
 /// A ref in the start set with its resolved tip and optional watermark.
@@ -117,7 +82,13 @@ pub struct StartSetRef {
 /// This struct contains everything needed for later Git phases without
 /// additional file opens (except pack files in pack processing phases). It
 /// also records artifact fingerprints used to detect concurrent maintenance.
-/// When artifacts are missing, `start_set` is empty and `mmaps` is unset.
+///
+/// Artifacts (MIDX, commit-graph) are built in memory by `artifact_acquire`
+/// after repo open. The `mmaps.midx` field is populated by `acquire_midx`.
+///
+/// # Invariants
+/// - `start_set` is sorted lexicographically by ref name.
+/// - `mmaps.midx` is `None` until `acquire_midx` populates it.
 #[derive(Debug)]
 pub struct RepoJobState {
     /// Resolved repository paths.
@@ -126,16 +97,13 @@ pub struct RepoJobState {
     /// Object ID format (SHA-1 or SHA-256).
     pub object_format: ObjectFormat,
 
-    /// Paths to artifact files.
+    /// Paths to artifact files (used for lock-file detection).
     pub artifact_paths: RepoArtifactPaths,
 
-    /// Artifact readiness status.
-    pub artifact_status: RepoArtifactStatus,
-
-    /// Artifact bytes (only if `artifact_status.is_ready()`).
+    /// Artifact bytes populated by `artifact_acquire`.
     pub mmaps: RepoArtifactMmaps,
 
-    /// Artifact fingerprints captured at repo open (only if artifacts were ready).
+    /// Artifact fingerprints (set by `acquire_midx` from pack/idx metadata).
     pub artifact_fingerprint: Option<RepoArtifactFingerprint>,
 
     /// Arena for ref name storage.
@@ -144,16 +112,19 @@ pub struct RepoJobState {
     /// Start set refs, sorted deterministically by name.
     ///
     /// Invariant: sorted by `ref_names.get(r.name)` lexicographically.
-    /// Empty when `artifact_status` is `NeedsMaintenance`.
     pub start_set: Vec<StartSetRef>,
 }
 
 impl RepoJobState {
-    /// Returns true if artifacts remain unchanged and no lock files are present.
+    /// Returns true if pack/idx files remain unchanged and no lock files are present.
     ///
-    /// Returns `false` if no baseline fingerprint was captured (artifacts not ready).
+    /// Returns `false` if no baseline fingerprint was captured.
+    ///
+    /// # Errors
+    /// Returns `RepoOpenError` if filesystem operations fail (e.g., reading
+    /// pack directory metadata or checking for lock files).
     pub fn artifacts_unchanged(&self) -> Result<bool, RepoOpenError> {
-        let Some(expected) = self.artifact_fingerprint else {
+        let Some(ref expected) = self.artifact_fingerprint else {
             return Ok(false);
         };
 
@@ -161,17 +132,95 @@ impl RepoJobState {
             return Ok(false);
         }
 
-        let current = RepoArtifactFingerprint::from_paths(&self.artifact_paths)?;
-        Ok(current == expected)
+        let current = RepoArtifactFingerprint::from_pack_dirs(&self.paths)?;
+        Ok(&current == expected)
     }
 }
 
 impl RepoArtifactFingerprint {
-    fn from_paths(paths: &RepoArtifactPaths) -> Result<Self, RepoOpenError> {
+    /// Creates a fingerprint from pack directories.
+    ///
+    /// Hashes the metadata (basename, size, mtime) of all pack and idx files.
+    pub fn from_pack_dirs(paths: &GitRepoPaths) -> Result<Self, RepoOpenError> {
+        use sha2::{Digest, Sha256};
+
+        let mut pack_dirs = Vec::with_capacity(1 + paths.alternate_object_dirs.len());
+        pack_dirs.push(paths.pack_dir.clone());
+        for alternate in &paths.alternate_object_dirs {
+            if alternate != &paths.objects_dir {
+                pack_dirs.push(alternate.join("pack"));
+            }
+        }
+
+        // Collect and sort pack/idx file metadata for deterministic hashing
+        let mut pack_entries: Vec<(Vec<u8>, u64, i64)> = Vec::new();
+        let mut idx_entries: Vec<(Vec<u8>, u64, i64)> = Vec::new();
+
+        for pack_dir in &pack_dirs {
+            let entries = match fs::read_dir(pack_dir) {
+                Ok(e) => e,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(RepoOpenError::io(err)),
+            };
+
+            for entry in entries {
+                let entry = entry.map_err(RepoOpenError::io)?;
+                let file_type = entry.file_type().map_err(RepoOpenError::io)?;
+                if !file_type.is_file() {
+                    continue;
+                }
+
+                let file_name = entry.file_name();
+                let path = entry.path();
+                let ext = path.extension().and_then(|e| e.to_str());
+
+                let metadata = entry.metadata().map_err(RepoOpenError::io)?;
+                let mtime = mtime_epoch_seconds(metadata.modified().map_err(RepoOpenError::io)?);
+
+                let basename = file_name.as_encoded_bytes().to_vec();
+                let size = metadata.len();
+
+                match ext {
+                    Some("pack") => pack_entries.push((basename, size, mtime)),
+                    Some("idx") => idx_entries.push((basename, size, mtime)),
+                    _ => {}
+                }
+            }
+        }
+
+        pack_entries.sort();
+        idx_entries.sort();
+
+        let mut pack_hasher = Sha256::new();
+        for (basename, size, mtime) in &pack_entries {
+            pack_hasher.update(basename);
+            pack_hasher.update(b"\0");
+            pack_hasher.update(size.to_le_bytes());
+            pack_hasher.update(mtime.to_le_bytes());
+        }
+        let packs_hash: [u8; 32] = pack_hasher.finalize().into();
+
+        let mut idx_hasher = Sha256::new();
+        for (basename, size, mtime) in &idx_entries {
+            idx_hasher.update(basename);
+            idx_hasher.update(b"\0");
+            idx_hasher.update(size.to_le_bytes());
+            idx_hasher.update(mtime.to_le_bytes());
+        }
+        let idx_hash: [u8; 32] = idx_hasher.finalize().into();
+
         Ok(Self {
-            commit_graph: fingerprint_path(&paths.commit_graph)?,
-            midx: fingerprint_path(&paths.midx)?,
+            packs_hash,
+            idx_hash,
         })
+    }
+}
+
+#[inline]
+fn mtime_epoch_seconds(mtime: std::time::SystemTime) -> i64 {
+    match mtime.duration_since(std::time::UNIX_EPOCH) {
+        Ok(delta) => delta.as_secs().min(i64::MAX as u64) as i64,
+        Err(err) => -(err.duration().as_secs().min(i64::MAX as u64) as i64),
     }
 }
 
@@ -235,7 +284,8 @@ pub trait RefWatermarkStore {
 ///
 /// # Returns
 ///
-/// A `RepoJobState` ready for later Git phases.
+/// A `RepoJobState` ready for later Git phases. Callers must call
+/// `acquire_midx` and `acquire_commit_graph` before scanning.
 ///
 /// # Errors
 ///
@@ -243,11 +293,6 @@ pub trait RefWatermarkStore {
 /// - Repository paths cannot be resolved
 /// - Start set exceeds limits
 /// - Watermark store returns wrong count
-///
-/// Note: Missing artifacts is not an error. Check `artifact_status` and
-/// run maintenance if needed before proceeding to later phases. When
-/// artifacts are missing, `mmaps` and `start_set` are empty; rerun
-/// `repo_open` after maintenance to populate them.
 pub fn repo_open(
     repo_root: &Path,
     repo_id: u64,
@@ -263,27 +308,9 @@ pub fn repo_open(
     let object_format = detect_object_format(&paths, &limits)?;
 
     let artifact_paths = RepoArtifactPaths {
-        commit_graph: paths.objects_dir.join("info").join("commit-graph"),
+        commit_graph: commit_graph_path(&paths.objects_dir),
         midx: paths.pack_dir.join("multi-pack-index"),
     };
-
-    let lock_present = has_lock_files(&paths, &artifact_paths)?;
-    let artifact_status = check_artifact_status(&artifact_paths, lock_present);
-
-    if !artifact_status.is_ready() {
-        return Ok(RepoJobState {
-            paths,
-            object_format,
-            artifact_paths,
-            artifact_status,
-            mmaps: RepoArtifactMmaps::default(),
-            artifact_fingerprint: None,
-            ref_names: ByteArena::with_capacity(0),
-            start_set: Vec::new(),
-        });
-    }
-
-    let (mmaps, artifact_fingerprint) = mmap_artifacts(&artifact_paths)?;
 
     let (ref_names, start_set) = resolve_start_set_with_watermarks(
         repo_id,
@@ -299,71 +326,20 @@ pub fn repo_open(
         paths,
         object_format,
         artifact_paths,
-        artifact_status,
-        mmaps,
-        artifact_fingerprint: Some(artifact_fingerprint),
+        mmaps: RepoArtifactMmaps::default(),
+        artifact_fingerprint: None,
         ref_names,
         start_set,
     })
 }
 
-/// Checks for the presence of required artifact files.
-///
-/// This is a fast existence check only; file contents are not validated here.
-/// Any detected maintenance lock forces `NeedsMaintenance`.
-fn check_artifact_status(
-    artifact_paths: &RepoArtifactPaths,
-    lock_present: bool,
-) -> RepoArtifactStatus {
-    let missing_commit_graph = !is_file(&artifact_paths.commit_graph);
-    let missing_midx = !is_file(&artifact_paths.midx);
-
-    if missing_commit_graph || missing_midx || lock_present {
-        RepoArtifactStatus::NeedsMaintenance {
-            missing_commit_graph,
-            missing_midx,
-            lock_present,
-        }
+fn commit_graph_path(objects_dir: &Path) -> PathBuf {
+    let info_dir = objects_dir.join("info");
+    let split_chain = info_dir.join("commit-graphs").join("commit-graph-chain");
+    if is_file(&split_chain) {
+        split_chain
     } else {
-        RepoArtifactStatus::Ready
-    }
-}
-
-/// Memory-maps the artifact files for later read-only access.
-///
-/// Assumes `check_artifact_status` returned `Ready`. The returned fingerprint
-/// is captured from the file metadata used for the mapping.
-fn mmap_artifacts(
-    artifact_paths: &RepoArtifactPaths,
-) -> Result<(RepoArtifactMmaps, RepoArtifactFingerprint), RepoOpenError> {
-    let (commit_graph, commit_graph_fp) = mmap_file(&artifact_paths.commit_graph)?;
-    let (midx, midx_fp) = mmap_file(&artifact_paths.midx)?;
-
-    Ok((
-        RepoArtifactMmaps {
-            commit_graph: Some(commit_graph),
-            midx: Some(midx),
-        },
-        RepoArtifactFingerprint {
-            commit_graph: commit_graph_fp,
-            midx: midx_fp,
-        },
-    ))
-}
-
-/// Maps a file read-only and returns a byte view plus a metadata fingerprint.
-fn mmap_file(path: &Path) -> Result<(BytesView, ArtifactFingerprint), RepoOpenError> {
-    let file = File::open(path).map_err(RepoOpenError::io)?;
-    let metadata = file.metadata().map_err(RepoOpenError::io)?;
-    let fingerprint = fingerprint_metadata(&metadata)?;
-
-    #[allow(unsafe_code)]
-    unsafe {
-        // SAFETY: We map the file read-only and treat it as immutable during the scan.
-        // Repo maintenance is expected to be quiescent; if the file is truncated
-        // or replaced while mapped, the OS may signal a fault. That risk is accepted.
-        let mmap = Mmap::map(&file).map_err(RepoOpenError::io)?;
-        Ok((BytesView::from_mmap(mmap), fingerprint))
+        info_dir.join("commit-graph")
     }
 }
 
@@ -442,17 +418,73 @@ fn resolve_start_set_with_watermarks(
     Ok((ref_names, start_set))
 }
 
-fn fingerprint_path(path: &Path) -> Result<ArtifactFingerprint, RepoOpenError> {
-    let metadata = fs::metadata(path).map_err(RepoOpenError::io)?;
-    fingerprint_metadata(&metadata)
+/// Returns true if the repository currently advertises any reachable refs.
+///
+/// This check is used as a guardrail for empty start-set handling in the
+/// in-memory artifact path:
+/// - Loose refs are detected by walking `common_dir/refs` recursively.
+/// - Packed refs are detected by scanning `common_dir/packed-refs` entries.
+///
+/// Pseudo-refs (like `HEAD`) are intentionally excluded; this function is about
+/// named refs that define start-set coverage.
+pub(crate) fn repo_has_reachable_refs(paths: &GitRepoPaths) -> Result<bool, RepoOpenError> {
+    if has_loose_refs(&paths.common_dir.join("refs"))? {
+        return Ok(true);
+    }
+    has_packed_refs(&paths.common_dir.join("packed-refs"))
 }
 
-fn fingerprint_metadata(metadata: &Metadata) -> Result<ArtifactFingerprint, RepoOpenError> {
-    let modified = metadata.modified().map_err(RepoOpenError::io)?;
-    Ok(ArtifactFingerprint {
-        len: metadata.len(),
-        modified,
-    })
+fn has_loose_refs(refs_dir: &Path) -> Result<bool, RepoOpenError> {
+    let mut stack = vec![refs_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(RepoOpenError::io(err)),
+        };
+
+        for entry in entries {
+            let entry = entry.map_err(RepoOpenError::io)?;
+            let file_type = entry.file_type().map_err(RepoOpenError::io)?;
+            if file_type.is_dir() {
+                stack.push(entry.path());
+                continue;
+            }
+            if file_type.is_file() || file_type.is_symlink() {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn has_packed_refs(packed_refs_path: &Path) -> Result<bool, RepoOpenError> {
+    let file = match File::open(packed_refs_path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(RepoOpenError::io(err)),
+    };
+
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = reader.read_line(&mut line).map_err(RepoOpenError::io)?;
+        if read == 0 {
+            break;
+        }
+
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
+            continue;
+        }
+
+        if line.split_once(' ').is_some() || line.split_once('\t').is_some() {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 fn has_lock_files(
@@ -517,13 +549,14 @@ fn lock_path(path: &Path) -> PathBuf {
 
 /// Detects the repository object format via config.
 ///
-/// This is a lightweight scan, not a full Git config parser. It:
-/// - Reads the first existing config path
-/// - Ignores comments/blank lines
-/// - Treats any line containing both "objectformat" and "sha256"
-///   (case-insensitive) as a SHA-256 repo
+/// Returns `ObjectFormat::Sha256` if any config file contains a line matching
+/// `objectformat` and `sha256` (case-insensitive). **Defaults to SHA-1** if
+/// no config file is found or no matching line exists.
 ///
-/// Anything else defaults to SHA-1.
+/// This is a lightweight heuristic scan, not a full Git config parser. It:
+/// - Reads the first existing config path
+/// - Ignores comments and blank lines
+/// - Does not parse sections or handle multi-line values
 fn detect_object_format(
     paths: &GitRepoPaths,
     limits: &RepoOpenLimits,
@@ -580,4 +613,22 @@ fn read_bounded_file(path: &Path, max_bytes: u32) -> Result<Vec<u8>, RepoOpenErr
 #[inline]
 fn is_file(path: &Path) -> bool {
     fs::metadata(path).map(|m| m.is_file()).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mtime_epoch_seconds;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn mtime_epoch_seconds_preserves_post_epoch_values() {
+        let t = UNIX_EPOCH + Duration::from_secs(42);
+        assert_eq!(mtime_epoch_seconds(t), 42);
+    }
+
+    #[test]
+    fn mtime_epoch_seconds_preserves_pre_epoch_values() {
+        let t = UNIX_EPOCH - Duration::from_secs(7);
+        assert_eq!(mtime_epoch_seconds(t), -7);
+    }
 }

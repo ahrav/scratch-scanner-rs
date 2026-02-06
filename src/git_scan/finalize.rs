@@ -36,6 +36,8 @@
 
 use std::cmp::Ordering;
 
+use crate::perf_stats;
+
 use super::byte_arena::ByteArena;
 use super::engine_adapter::{FindingKey, FindingSpan, ScannedBlob};
 use super::object_id::OidBytes;
@@ -147,6 +149,7 @@ pub struct FinalizeOutput {
 /// Finalize statistics.
 ///
 /// Counts are derived from the persisted data, not from raw scan input.
+/// Populated only when `perf-stats` is enabled in debug builds.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FinalizeStats {
     /// Unique blob OIDs processed.
@@ -445,7 +448,10 @@ pub fn build_finalize_ops(mut input: FinalizeInput<'_>) -> FinalizeOutput {
         let pre_dedup = blob_findings.len();
         blob_findings.sort_unstable();
         blob_findings.dedup();
-        stats.findings_deduped += (pre_dedup - blob_findings.len()) as u64;
+        perf_stats::sat_add_u64(
+            &mut stats.findings_deduped,
+            (pre_dedup - blob_findings.len()) as u64,
+        );
 
         for f in &blob_findings {
             ops_finding.push(WriteOp {
@@ -453,7 +459,7 @@ pub fn build_finalize_ops(mut input: FinalizeInput<'_>) -> FinalizeOutput {
                 value: marker_value(),
             });
         }
-        stats.total_findings += blob_findings.len() as u64;
+        perf_stats::sat_add_u64(&mut stats.total_findings, blob_findings.len() as u64);
 
         // --- 3. seen_blob (namespace "sb\0") ---
         ops_seen.push(WriteOp {
@@ -461,7 +467,7 @@ pub fn build_finalize_ops(mut input: FinalizeInput<'_>) -> FinalizeOutput {
             value: marker_value(),
         });
 
-        stats.unique_blobs += 1;
+        perf_stats::sat_add_u64(&mut stats.unique_blobs, 1);
         i = j;
     }
 
@@ -469,7 +475,7 @@ pub fn build_finalize_ops(mut input: FinalizeInput<'_>) -> FinalizeOutput {
     let mut data_ops = ops_ctx;
     data_ops.append(&mut ops_finding);
     data_ops.append(&mut ops_seen);
-    stats.data_ops_count = data_ops.len() as u64;
+    perf_stats::set_u64(&mut stats.data_ops_count, data_ops.len() as u64);
 
     debug_assert!(
         data_ops.windows(2).all(|w| w[0].key <= w[1].key),
@@ -493,7 +499,7 @@ pub fn build_finalize_ops(mut input: FinalizeInput<'_>) -> FinalizeOutput {
             });
         }
     }
-    stats.watermark_ops_count = watermark_ops.len() as u64;
+    perf_stats::set_u64(&mut stats.watermark_ops_count, watermark_ops.len() as u64);
 
     debug_assert!(
         watermark_ops.windows(2).all(|w| w[0].key <= w[1].key),
@@ -617,6 +623,14 @@ mod tests {
         }
     }
 
+    fn assert_perf_u64(actual: u64, expected: u64) {
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            assert_eq!(actual, expected);
+        } else {
+            assert_eq!(actual, 0);
+        }
+    }
+
     #[test]
     fn complete_run_produces_all_ops() {
         let mut arena = ByteArena::with_capacity(1024);
@@ -685,7 +699,7 @@ mod tests {
         };
 
         let out = build_finalize_ops(input);
-        assert_eq!(out.stats.unique_blobs, 1);
+        assert_perf_u64(out.stats.unique_blobs, 1);
 
         let ctx_op = out
             .data_ops
@@ -769,8 +783,8 @@ mod tests {
         };
 
         let out = build_finalize_ops(input);
-        assert_eq!(out.stats.total_findings, 1);
-        assert_eq!(out.stats.findings_deduped, 1);
+        assert_perf_u64(out.stats.total_findings, 1);
+        assert_perf_u64(out.stats.findings_deduped, 1);
     }
 
     #[test]
@@ -802,8 +816,8 @@ mod tests {
         };
 
         let out = build_finalize_ops(input);
-        assert_eq!(out.stats.total_findings, 3);
-        assert_eq!(out.stats.findings_deduped, 0);
+        assert_perf_u64(out.stats.total_findings, 3);
+        assert_perf_u64(out.stats.findings_deduped, 0);
     }
 
     #[test]

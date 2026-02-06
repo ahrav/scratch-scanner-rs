@@ -68,6 +68,20 @@ fn parse_findings(output: &str) -> Vec<FindingLine> {
     out
 }
 
+fn perf_stats_enabled() -> bool {
+    cfg!(all(feature = "perf-stats", debug_assertions))
+}
+
+macro_rules! assert_perf {
+    ($on:expr, $off:expr, $($arg:tt)*) => {
+        if perf_stats_enabled() {
+            assert!($on, $($arg)*);
+        } else {
+            assert!($off, $($arg)*);
+        }
+    };
+}
+
 fn assert_locator(path: &str, kind: char) {
     let needle = format!("@{kind}");
     let idx = path
@@ -643,9 +657,11 @@ fn gzip_entry_byte_cap_prevents_unbounded_work_and_is_reported() {
         "expected no findings due to cap; got: {out}"
     );
 
-    assert!(
+    assert_perf!(
         report.metrics.archive.partial_reasons[PartialReason::EntryOutputBudgetExceeded.as_usize()]
             > 0,
+        report.metrics.archive.partial_reasons[PartialReason::EntryOutputBudgetExceeded.as_usize()]
+            == 0,
         "expected entry output budget partial to be recorded; metrics={:?}",
         report.metrics.archive
     );
@@ -684,7 +700,11 @@ fn tar_boundary_spanning_secret_once() {
     cfg.chunk_size = 6;
 
     let (out, report) = run_scan(vec![file_from_path(&tar_path)], cfg);
-    assert!(report.metrics.chunks_scanned >= 2);
+    assert!(
+        report.metrics.chunks_scanned >= 2,
+        "expected >= 2 chunks, got {}",
+        report.metrics.chunks_scanned
+    );
     let count = out.matches("secret").count();
     assert_eq!(count, 1, "output: {out}");
 }
@@ -749,7 +769,11 @@ fn nested_gzip_boundary_spanning_secret_once() {
     cfg.chunk_size = 6;
 
     let (out, report) = run_scan(vec![file_from_path(&tar_path)], cfg);
-    assert!(report.metrics.chunks_scanned >= 2);
+    assert!(
+        report.metrics.chunks_scanned >= 2,
+        "expected >= 2 chunks, got {}",
+        report.metrics.chunks_scanned
+    );
     let count = out.matches("secret").count();
     assert_eq!(count, 1, "output: {out}");
 }
@@ -777,8 +801,9 @@ fn nested_zip_in_tar_is_not_expanded_and_is_counted() {
     assert!(out.trim().is_empty(), "expected no findings; got: {out}");
 
     let idx = ArchiveSkipReason::NeedsRandomAccessNoSpill.as_usize();
-    assert!(
+    assert_perf!(
         report.metrics.archive.archive_skip_reasons[idx] > 0,
+        report.metrics.archive.archive_skip_reasons[idx] == 0,
         "expected needs_random_access_no_spill to be counted: {:?}",
         report.metrics.archive
     );
@@ -798,8 +823,9 @@ fn tar_path_budget_exceeded_is_reported() {
     cfg.archive.max_virtual_path_bytes_per_archive = 8;
 
     let (_out, report) = run_scan(vec![file_from_path(&tar_path)], cfg);
-    assert!(
+    assert_perf!(
         report.metrics.archive.partial_reasons[PartialReason::PathBudgetExceeded.as_usize()] > 0,
+        report.metrics.archive.partial_reasons[PartialReason::PathBudgetExceeded.as_usize()] == 0,
         "expected path budget partial to be recorded; metrics={:?}",
         report.metrics.archive
     );
@@ -840,7 +866,11 @@ fn zip_boundary_spanning_secret_once() {
     cfg.chunk_size = 6;
 
     let (out, report) = run_scan(vec![file_from_path(&zip_path)], cfg);
-    assert!(report.metrics.chunks_scanned >= 2);
+    assert!(
+        report.metrics.chunks_scanned >= 2,
+        "expected >= 2 chunks, got {}",
+        report.metrics.chunks_scanned
+    );
     let count = out.matches("secret").count();
     assert_eq!(count, 1, "output: {out}");
 }
@@ -859,9 +889,11 @@ fn zip_respects_entry_output_budget() {
     let (out, report) = run_scan(vec![file_from_path(&zip_path)], cfg);
     assert!(out.trim().is_empty(), "expected no findings; got: {out}");
 
-    assert!(
+    assert_perf!(
         report.metrics.archive.partial_reasons[PartialReason::EntryOutputBudgetExceeded.as_usize()]
             > 0,
+        report.metrics.archive.partial_reasons[PartialReason::EntryOutputBudgetExceeded.as_usize()]
+            == 0,
         "expected entry output budget partial to be recorded; metrics={:?}",
         report.metrics.archive
     );
@@ -892,8 +924,9 @@ fn zip_corrupt_entry_does_not_abort_archive() {
 
     let (out, report) = run_scan(vec![file_from_path(&zip_path)], cfg_archives_enabled());
     assert!(out.contains("good.txt"), "output: {out}");
-    assert!(
+    assert_perf!(
         report.metrics.archive.entry_skip_reasons[EntrySkipReason::CorruptEntry.as_usize()] > 0,
+        report.metrics.archive.entry_skip_reasons[EntrySkipReason::CorruptEntry.as_usize()] == 0,
         "expected corrupt entry skip to be recorded; metrics={:?}",
         report.metrics.archive
     );
@@ -943,8 +976,9 @@ fn zip_encrypted_policy_fail_run_aborts_scan() {
     assert!(out.trim().is_empty(), "expected no findings; got: {out}");
 
     let idx = ArchiveSkipReason::EncryptedArchive.as_usize();
-    assert!(
+    assert_perf!(
         report.metrics.archive.archive_skip_reasons[idx] > 0,
+        report.metrics.archive.archive_skip_reasons[idx] == 0,
         "expected encrypted archive skip to be recorded: {:?}",
         report.metrics.archive
     );
@@ -1066,9 +1100,11 @@ fn tar_entry_cap_allows_later_entries() {
         "expected finding in later entry; output: {out}"
     );
     assert_locator(&hit.unwrap().path, 't');
-    assert!(
+    assert_perf!(
         report.metrics.archive.partial_reasons[PartialReason::EntryOutputBudgetExceeded.as_usize()]
             > 0,
+        report.metrics.archive.partial_reasons[PartialReason::EntryOutputBudgetExceeded.as_usize()]
+            == 0,
         "expected entry output budget partial to be recorded; metrics={:?}",
         report.metrics.archive
     );
@@ -1093,10 +1129,13 @@ fn tar_discard_archive_cap_stops_enumeration() {
         out.trim().is_empty(),
         "expected no findings after archive cap stop; output: {out}"
     );
-    assert!(
+    assert_perf!(
         report.metrics.archive.partial_reasons
             [PartialReason::ArchiveOutputBudgetExceeded.as_usize()]
             > 0,
+        report.metrics.archive.partial_reasons
+            [PartialReason::ArchiveOutputBudgetExceeded.as_usize()]
+            == 0,
         "expected archive output budget partial to be recorded; metrics={:?}",
         report.metrics.archive
     );
@@ -1125,9 +1164,11 @@ fn tar_nested_gzip_ratio_partial_allows_later_entries() {
         "expected finding in later entry; output: {out}"
     );
     assert_locator(&hit.unwrap().path, 't');
-    assert!(
+    assert_perf!(
         report.metrics.archive.partial_reasons[PartialReason::InflationRatioExceeded.as_usize()]
             > 0,
+        report.metrics.archive.partial_reasons[PartialReason::InflationRatioExceeded.as_usize()]
+            == 0,
         "expected inflation ratio partial to be recorded; metrics={:?}",
         report.metrics.archive
     );
@@ -1296,8 +1337,9 @@ fn zip_long_name_increments_truncation_counter() {
     cfg.archive.max_virtual_path_len_per_entry = 32;
 
     let (out, report) = run_scan(vec![file_from_path(&zip_path)], cfg);
-    assert!(
+    assert_perf!(
         report.metrics.archive.paths_truncated > 0,
+        report.metrics.archive.paths_truncated == 0,
         "expected truncation counter to increment: {:?}",
         report.metrics.archive
     );
@@ -1339,8 +1381,9 @@ fn zip_corrupt_entry_is_skipped_and_later_entry_scanned() {
         "expected finding in later entry; output: {out}"
     );
     assert_locator(&good_hit.unwrap().path, 'z');
-    assert!(
+    assert_perf!(
         report.metrics.archive.entry_skip_reasons[EntrySkipReason::CorruptEntry.as_usize()] > 0,
+        report.metrics.archive.entry_skip_reasons[EntrySkipReason::CorruptEntry.as_usize()] == 0,
         "expected corrupt entry skip to be recorded; metrics={:?}",
         report.metrics.archive
     );
@@ -1366,8 +1409,9 @@ fn zip64_cdfh_sentinel_is_unsupported_feature() {
     fs::write(&zip_path, zip_bytes).unwrap();
 
     let (_out, report) = run_scan(vec![file_from_path(&zip_path)], cfg_archives_enabled());
-    assert!(
+    assert_perf!(
         report.metrics.archive.partial_reasons[PartialReason::UnsupportedFeature.as_usize()] > 0,
+        report.metrics.archive.partial_reasons[PartialReason::UnsupportedFeature.as_usize()] == 0,
         "expected unsupported feature partial to be recorded; metrics={:?}",
         report.metrics.archive
     );
@@ -1390,10 +1434,13 @@ fn zip64_eocd_sentinel_is_unsupported_feature() {
     fs::write(&zip_path, zip_bytes).unwrap();
 
     let (_out, report) = run_scan(vec![file_from_path(&zip_path)], cfg_archives_enabled());
-    assert!(
+    assert_perf!(
         report.metrics.archive.archive_skip_reasons
             [ArchiveSkipReason::UnsupportedFeature.as_usize()]
             > 0,
+        report.metrics.archive.archive_skip_reasons
+            [ArchiveSkipReason::UnsupportedFeature.as_usize()]
+            == 0,
         "expected unsupported feature skip to be recorded; metrics={:?}",
         report.metrics.archive
     );
@@ -1411,8 +1458,9 @@ fn encrypted_zip_entry_is_skipped_and_counted() {
     let (out, report) = run_scan(vec![file_from_path(&zip_path)], cfg_archives_enabled());
     assert!(out.trim().is_empty(), "expected no findings; got: {out}");
 
-    assert!(
+    assert_perf!(
         report.metrics.archive.entry_skip_reasons[EntrySkipReason::EncryptedEntry.as_usize()] > 0,
+        report.metrics.archive.entry_skip_reasons[EntrySkipReason::EncryptedEntry.as_usize()] == 0,
         "expected encrypted skip counter to increment: {:?}",
         report.metrics.archive
     );
@@ -1454,8 +1502,9 @@ fn zip_encrypted_entry_is_skipped_but_plain_entry_scanned() {
         "expected finding in plain entry; output: {out}"
     );
     assert_locator(&good_hit.unwrap().path, 'z');
-    assert!(
+    assert_perf!(
         report.metrics.archive.entry_skip_reasons[EntrySkipReason::EncryptedEntry.as_usize()] > 0,
+        report.metrics.archive.entry_skip_reasons[EntrySkipReason::EncryptedEntry.as_usize()] == 0,
         "expected encrypted skip counter to increment: {:?}",
         report.metrics.archive
     );
@@ -1490,9 +1539,11 @@ fn zip_encrypted_policy_fail_archive_stops_scanning() {
 
     let (out, report) = run_scan(vec![file_from_path(&zip_path)], cfg);
     assert!(out.trim().is_empty(), "expected no findings; output: {out}");
-    assert!(
+    assert_perf!(
         report.metrics.archive.archive_skip_reasons[ArchiveSkipReason::EncryptedArchive.as_usize()]
             > 0,
+        report.metrics.archive.archive_skip_reasons[ArchiveSkipReason::EncryptedArchive.as_usize()]
+            == 0,
         "expected encrypted archive skip to be recorded: {:?}",
         report.metrics.archive
     );
@@ -1533,10 +1584,13 @@ fn zip_unsupported_compression_is_skipped_and_plain_entry_scanned() {
         "expected finding in plain entry; output: {out}"
     );
     assert_locator(&good_hit.unwrap().path, 'z');
-    assert!(
+    assert_perf!(
         report.metrics.archive.entry_skip_reasons
             [EntrySkipReason::UnsupportedCompression.as_usize()]
             > 0,
+        report.metrics.archive.entry_skip_reasons
+            [EntrySkipReason::UnsupportedCompression.as_usize()]
+            == 0,
         "expected unsupported compression skip to be recorded: {:?}",
         report.metrics.archive
     );
@@ -1563,9 +1617,11 @@ fn zip_extra_field_hits_metadata_budget() {
 
     let (out, report) = run_scan(vec![file_from_path(&zip_path)], cfg);
     assert!(out.trim().is_empty(), "expected no findings; output: {out}");
-    assert!(
+    assert_perf!(
         report.metrics.archive.partial_reasons[PartialReason::MetadataBudgetExceeded.as_usize()]
             > 0,
+        report.metrics.archive.partial_reasons[PartialReason::MetadataBudgetExceeded.as_usize()]
+            == 0,
         "expected metadata budget partial to be recorded; metrics={:?}",
         report.metrics.archive
     );
@@ -1598,8 +1654,9 @@ fn zip_traversal_names_are_sanitized_in_virtual_paths() {
         f.path
     );
     assert_locator(&f.path, 'z');
-    assert!(
+    assert_perf!(
         report.metrics.archive.paths_had_traversal > 0,
+        report.metrics.archive.paths_had_traversal == 0,
         "expected traversal counter to increment: {:?}",
         report.metrics.archive
     );
@@ -1678,8 +1735,9 @@ fn zip_component_cap_exceeded_is_reported_and_scanned() {
         f.path
     );
     assert_locator(&f.path, 'z');
-    assert!(
+    assert_perf!(
         report.metrics.archive.paths_component_cap_exceeded > 0,
+        report.metrics.archive.paths_component_cap_exceeded == 0,
         "expected component cap counter to increment: {:?}",
         report.metrics.archive
     );
@@ -1739,8 +1797,9 @@ fn nested_container_entry_is_counted_as_scanned() {
 
     let (_out, report) = run_scan(vec![file_from_path(&tar_path)], cfg_archives_enabled());
 
-    assert!(
+    assert_perf!(
         report.metrics.archive.entries_scanned >= 2,
+        report.metrics.archive.entries_scanned == 0,
         "expected container entry to be counted; metrics={:?}",
         report.metrics.archive
     );
@@ -1763,8 +1822,9 @@ fn nested_depth_limit_is_recorded() {
     let (_out, report) = run_scan(vec![file_from_path(&tar_path)], cfg);
 
     let idx = ArchiveSkipReason::DepthExceeded.as_usize();
-    assert!(
+    assert_perf!(
         report.metrics.archive.archive_skip_reasons[idx] > 0,
+        report.metrics.archive.archive_skip_reasons[idx] == 0,
         "expected depth_exceeded to be counted: {:?}",
         report.metrics.archive
     );

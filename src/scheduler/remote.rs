@@ -45,6 +45,7 @@ use super::executor::{Executor, ExecutorConfig, ExecutorHandle, WorkerCtx};
 use super::metrics::MetricsSnapshot;
 use super::rng::XorShift64;
 use super::ts_buffer_pool::{TsBufferHandle, TsBufferPool, TsBufferPoolConfig};
+use crate::perf_stats;
 use crate::scheduler::engine_stub::{FileId, FindingRec, MockEngine, ScanScratch, BUFFER_LEN_MAX};
 use crate::scheduler::output_sink::OutputSink;
 
@@ -311,28 +312,33 @@ pub struct IoStats {
 
 impl IoStats {
     fn merge(&mut self, other: IoStats) {
-        self.objects_started += other.objects_started;
-        self.objects_completed += other.objects_completed;
-        self.objects_failed += other.objects_failed;
-        self.chunks_fetched += other.chunks_fetched;
-        self.payload_bytes_fetched += other.payload_bytes_fetched;
-        self.retryable_errors += other.retryable_errors;
-        self.permanent_errors += other.permanent_errors;
-        self.retries += other.retries;
+        perf_stats::sat_add_u64(&mut self.objects_started, other.objects_started);
+        perf_stats::sat_add_u64(&mut self.objects_completed, other.objects_completed);
+        perf_stats::sat_add_u64(&mut self.objects_failed, other.objects_failed);
+        perf_stats::sat_add_u64(&mut self.chunks_fetched, other.chunks_fetched);
+        perf_stats::sat_add_u64(&mut self.payload_bytes_fetched, other.payload_bytes_fetched);
+        perf_stats::sat_add_u64(&mut self.retryable_errors, other.retryable_errors);
+        perf_stats::sat_add_u64(&mut self.permanent_errors, other.permanent_errors);
+        perf_stats::sat_add_u64(&mut self.retries, other.retries);
     }
 }
 
 /// Discovery thread statistics.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RemoteStats {
+    /// Objects returned by `list_page` calls.
     pub objects_discovered: u64,
+    /// Objects sent to the I/O channel (may be fewer if pipeline stops
+    /// mid-discovery).
     pub objects_enqueued: u64,
 }
 
 /// End-of-run report.
 #[derive(Debug, Default)]
 pub struct RemoteRunReport {
+    /// Discovery-side stats (listing).
     pub remote: RemoteStats,
+    /// I/O-thread-side stats (fetch, retry, scan).
     pub io: IoStats,
 }
 
@@ -402,6 +408,7 @@ struct CpuScratch {
 // CPU Worker Logic
 // ============================================================================
 
+/// In-place dedupe of findings by `(rule_id, root_hint, span)`.
 fn dedupe_pending_in_place(p: &mut Vec<FindingRec>) {
     if p.len() <= 1 {
         return;
@@ -433,6 +440,7 @@ fn dedupe_pending_in_place(p: &mut Vec<FindingRec>) {
     });
 }
 
+/// Formats findings into `out_buf` and flushes them to the output sink.
 fn emit_findings_formatted(
     engine: &MockEngine,
     out: &Arc<dyn OutputSink>,
@@ -462,6 +470,7 @@ fn emit_findings_formatted(
     out.write_all(out_buf.as_slice());
 }
 
+/// Executes a single scan-chunk task on a CPU worker thread.
 fn cpu_runner(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScratch>) {
     match task {
         CpuTask::ScanChunk {
@@ -513,6 +522,11 @@ fn cpu_runner(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScratch>) {
 // Retry Logic
 // ============================================================================
 
+/// Computes exponential backoff with jitter.
+///
+/// `attempt` is 1-based (1 = first retry). Delay is
+/// `base_delay * 2^(attempt-1)`, capped at `max_delay`, then jittered
+/// by `+/- jitter_pct%` uniform.
 fn compute_backoff(attempt: u32, policy: RetryPolicy, rng: &mut XorShift64) -> Duration {
     // attempt starts at 1 for the first try
     let exp = attempt.saturating_sub(1).min(30);
@@ -608,7 +622,7 @@ fn io_worker_loop<B: RemoteBackend>(
             break;
         }
 
-        stats.objects_started += 1;
+        perf_stats::sat_add_u64(&mut stats.objects_started, 1);
         let started = Instant::now();
 
         let size = work.size;
@@ -686,7 +700,7 @@ fn io_worker_loop<B: RemoteBackend>(
                             if end_offset != size {
                                 // Partial read that doesn't reach EOF = contract violation
                                 // Backend should have either filled exactly or returned error
-                                stats.permanent_errors += 1;
+                                perf_stats::sat_add_u64(&mut stats.permanent_errors, 1);
                                 failed = true;
                                 drop(buf);
                                 break 'chunk_loop;
@@ -714,8 +728,11 @@ fn io_worker_loop<B: RemoteBackend>(
                             break 'chunk_loop;
                         }
 
-                        stats.chunks_fetched += 1;
-                        stats.payload_bytes_fetched += actual_payload as u64;
+                        perf_stats::sat_add_u64(&mut stats.chunks_fetched, 1);
+                        perf_stats::sat_add_u64(
+                            &mut stats.payload_bytes_fetched,
+                            actual_payload as u64,
+                        );
 
                         // Advance by actual payload, not planned
                         offset = offset.saturating_add(actual_payload as u64);
@@ -727,12 +744,12 @@ fn io_worker_loop<B: RemoteBackend>(
 
                         match backend.classify_error(&err) {
                             ErrorClass::Permanent => {
-                                stats.permanent_errors += 1;
+                                perf_stats::sat_add_u64(&mut stats.permanent_errors, 1);
                                 failed = true;
                                 break 'chunk_loop;
                             }
                             ErrorClass::Retryable => {
-                                stats.retryable_errors += 1;
+                                perf_stats::sat_add_u64(&mut stats.retryable_errors, 1);
                                 if attempt >= cfg.retry.max_attempts {
                                     failed = true;
                                     break 'chunk_loop;
@@ -753,7 +770,7 @@ fn io_worker_loop<B: RemoteBackend>(
                                     }
                                 }
 
-                                stats.retries += 1;
+                                perf_stats::sat_add_u64(&mut stats.retries, 1);
                                 std::thread::sleep(backoff);
                                 continue; // Retry (will re-acquire buffer)
                             }
@@ -764,10 +781,10 @@ fn io_worker_loop<B: RemoteBackend>(
         }
 
         if failed {
-            stats.objects_failed += 1;
+            perf_stats::sat_add_u64(&mut stats.objects_failed, 1);
             // work.token dropped here; permit releases when all enqueued chunks finish
         } else {
-            stats.objects_completed += 1;
+            perf_stats::sat_add_u64(&mut stats.objects_completed, 1);
         }
     }
 
@@ -895,7 +912,7 @@ pub fn scan_remote<B: RemoteBackend>(
         }
 
         for obj in page {
-            report.remote.objects_discovered += 1;
+            perf_stats::sat_add_u64(&mut report.remote.objects_discovered, 1);
 
             // Check stop flag before acquiring permit
             if stop.load(Ordering::Relaxed) {
@@ -932,7 +949,7 @@ pub fn scan_remote<B: RemoteBackend>(
 
                 match tx.send_timeout(w, Duration::from_millis(100)) {
                     Ok(()) => {
-                        report.remote.objects_enqueued += 1;
+                        perf_stats::sat_add_u64(&mut report.remote.objects_enqueued, 1);
                         break; // Success, exit send loop
                     }
                     Err(chan::SendTimeoutError::Timeout(returned)) => {
@@ -1137,6 +1154,14 @@ mod tests {
         }
     }
 
+    fn assert_perf_u64(actual: u64, expected: u64) {
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            assert_eq!(actual, expected);
+        } else {
+            assert_eq!(actual, 0);
+        }
+    }
+
     // ========================================================================
     // Tests
     // ========================================================================
@@ -1155,9 +1180,9 @@ mod tests {
         let (report, _metrics) =
             scan_remote(engine, backend, small_config(), sink.clone()).unwrap();
 
-        assert_eq!(report.remote.objects_discovered, 1);
-        assert_eq!(report.remote.objects_enqueued, 1);
-        assert_eq!(report.io.objects_completed, 1);
+        assert_perf_u64(report.remote.objects_discovered, 1);
+        assert_perf_u64(report.remote.objects_enqueued, 1);
+        assert_perf_u64(report.io.objects_completed, 1);
 
         let out = sink.take();
         let out_str = String::from_utf8_lossy(&out);
@@ -1190,7 +1215,7 @@ mod tests {
 
         let (report, _metrics) = scan_remote(engine, backend, cfg, sink.clone()).unwrap();
 
-        assert_eq!(report.io.objects_completed, 1);
+        assert_perf_u64(report.io.objects_completed, 1);
 
         let out = sink.take();
         let out_str = String::from_utf8_lossy(&out);
@@ -1220,8 +1245,8 @@ mod tests {
         let (report, _metrics) =
             scan_remote(engine, backend, small_config(), sink.clone()).unwrap();
 
-        assert_eq!(report.remote.objects_discovered, 0);
-        assert_eq!(report.io.objects_completed, 0);
+        assert_perf_u64(report.remote.objects_discovered, 0);
+        assert_perf_u64(report.io.objects_completed, 0);
     }
 
     #[test]
@@ -1241,8 +1266,8 @@ mod tests {
         let (report, _metrics) =
             scan_remote(engine, backend, small_config(), sink.clone()).unwrap();
 
-        assert_eq!(report.remote.objects_discovered, 10);
-        assert_eq!(report.io.objects_completed, 10);
+        assert_perf_u64(report.remote.objects_discovered, 10);
+        assert_perf_u64(report.io.objects_completed, 10);
 
         let out = sink.take();
         let out_str = String::from_utf8_lossy(&out);
@@ -1278,9 +1303,9 @@ mod tests {
 
         let (report, _metrics) = scan_remote(engine, backend, cfg, sink.clone()).unwrap();
 
-        assert_eq!(report.io.objects_completed, 1);
-        assert_eq!(report.io.retryable_errors, 2);
-        assert_eq!(report.io.retries, 2);
+        assert_perf_u64(report.io.objects_completed, 1);
+        assert_perf_u64(report.io.retryable_errors, 2);
+        assert_perf_u64(report.io.retries, 2);
 
         let out = sink.take();
         assert!(
@@ -1428,11 +1453,18 @@ mod tests {
         let (report, _metrics) = scan_remote(engine, backend, cfg, sink.clone()).unwrap();
 
         // Object should fail because partial reads violate the contract
-        assert_eq!(
-            report.io.objects_failed, 1,
-            "partial reads should cause object failure"
-        );
-        assert_eq!(report.io.objects_completed, 0);
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            assert_eq!(
+                report.io.objects_failed, 1,
+                "partial reads should cause object failure"
+            );
+        } else {
+            assert_eq!(
+                report.io.objects_failed, 0,
+                "partial reads should cause object failure"
+            );
+        }
+        assert_perf_u64(report.io.objects_completed, 0);
     }
 
     // ========================================================================
@@ -1495,11 +1527,11 @@ mod tests {
         let (report, _metrics) =
             scan_remote(engine, backend, small_config(), sink.clone()).unwrap();
 
-        assert_eq!(report.io.objects_failed, 1);
-        assert_eq!(report.io.objects_completed, 0);
-        assert_eq!(report.io.permanent_errors, 1);
+        assert_perf_u64(report.io.objects_failed, 1);
+        assert_perf_u64(report.io.objects_completed, 0);
+        assert_perf_u64(report.io.permanent_errors, 1);
         // No retries for permanent errors
-        assert_eq!(report.io.retries, 0);
+        assert_perf_u64(report.io.retries, 0);
     }
 
     #[test]
@@ -1529,11 +1561,11 @@ mod tests {
 
         let (report, _metrics) = scan_remote(engine, backend, cfg, sink.clone()).unwrap();
 
-        assert_eq!(report.io.objects_failed, 1);
-        assert_eq!(report.io.objects_completed, 0);
+        assert_perf_u64(report.io.objects_failed, 1);
+        assert_perf_u64(report.io.objects_completed, 0);
         // Should have 3 retryable errors (initial + 2 retries)
-        assert_eq!(report.io.retryable_errors, 3);
+        assert_perf_u64(report.io.retryable_errors, 3);
         // Retries = attempts - 1 = 2
-        assert_eq!(report.io.retries, 2);
+        assert_perf_u64(report.io.retries, 2);
     }
 }

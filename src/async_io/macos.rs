@@ -339,8 +339,8 @@ impl MacosAioScanner {
                 Ok(()) => {}
                 Err(err) => {
                     if err.kind() == io::ErrorKind::NotFound {
-                        stats.open_errors += 1;
-                        stats.errors += 1;
+                        stats.open_errors = stats.open_errors.saturating_add(1);
+                        stats.errors = stats.errors.saturating_add(1);
                         continue;
                     }
                     return Err(err);
@@ -382,7 +382,7 @@ fn scan_file(
     while let Some(chunk) = reader.next_chunk(pool)? {
         let payload_len = chunk.len.saturating_sub(chunk.prefix_len) as u64;
         stats.bytes_scanned = stats.bytes_scanned.saturating_add(payload_len);
-        stats.chunks += 1;
+        stats.chunks = stats.chunks.saturating_add(1);
 
         engine.scan_chunk_into(chunk.data(), chunk.file_id, chunk.base_offset, scratch);
         let new_bytes_start = chunk.base_offset + chunk.prefix_len as u64;
@@ -398,7 +398,7 @@ fn scan_file(
                 rec.root_hint_start, rec.root_hint_end, rule
             )?;
             out.write_all(b"\n")?;
-            stats.findings += 1;
+            stats.findings = stats.findings.saturating_add(1);
         }
     }
 

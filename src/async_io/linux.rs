@@ -140,8 +140,8 @@ impl UringScanner {
                 Ok(()) => {}
                 Err(err) => {
                     if err.kind() == io::ErrorKind::NotFound {
-                        stats.open_errors += 1;
-                        stats.errors += 1;
+                        stats.open_errors = stats.open_errors.saturating_add(1);
+                        stats.errors = stats.errors.saturating_add(1);
                         continue;
                     }
                     return Err(err);
@@ -200,7 +200,7 @@ fn scan_file<W: Write>(
 
         let payload_len = current.len.saturating_sub(current.prefix_len) as u64;
         stats.bytes_scanned = stats.bytes_scanned.saturating_add(payload_len);
-        stats.chunks += 1;
+        stats.chunks = stats.chunks.saturating_add(1);
 
         engine.scan_chunk_into(
             current.data(),
@@ -225,7 +225,7 @@ fn scan_file<W: Write>(
                 rec.root_hint_start, rec.root_hint_end, rule
             )?;
             out.write_all(b"\n")?;
-            stats.findings += 1;
+            stats.findings = stats.findings.saturating_add(1);
         }
 
         match next {

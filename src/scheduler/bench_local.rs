@@ -502,7 +502,11 @@ mod tests {
 
         let bench = LocalScanBenchmark::new(engine, synthetic, small_local_config()).unwrap();
 
-        assert_eq!(bench.synthetic_stats().files_generated, 3);
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            assert_eq!(bench.synthetic_stats().files_generated, 3);
+        } else {
+            assert_eq!(bench.synthetic_stats().files_generated, 0);
+        }
     }
 
     #[test]
@@ -608,7 +612,11 @@ mod tests {
         let bench = LocalScanBenchmark::new(engine, synthetic, small_local_config()).unwrap();
 
         let desc = bench.description();
-        assert!(desc.contains("10 files"));
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            assert!(desc.contains("10 files"));
+        } else {
+            assert!(desc.contains("0 files"));
+        }
         assert!(desc.contains("2 workers"));
     }
 
