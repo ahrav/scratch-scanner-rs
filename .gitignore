@@ -29,6 +29,9 @@ fuzz/Cargo.lock
 .DS_Store
 .worktrees/
 *.tar.*
+*.bin
+
+perf.data
 
 # Internal design docs (scanner harness planning)
 docs/test_harness.md
