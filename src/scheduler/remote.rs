@@ -295,8 +295,6 @@ pub trait RemoteBackend: Send + Sync + 'static {
 // ============================================================================
 
 /// I/O thread statistics (per-thread, merged at end).
-///
-/// Populated only when `perf-stats` is enabled in debug builds.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IoStats {
     pub objects_started: u64,
@@ -314,10 +312,6 @@ pub struct IoStats {
 
 impl IoStats {
     fn merge(&mut self, other: IoStats) {
-        if !perf_stats::enabled() {
-            let _ = other;
-            return;
-        }
         self.objects_started += other.objects_started;
         self.objects_completed += other.objects_completed;
         self.objects_failed += other.objects_failed;
@@ -332,14 +326,19 @@ impl IoStats {
 /// Discovery thread statistics.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RemoteStats {
+    /// Objects returned by `list_page` calls.
     pub objects_discovered: u64,
+    /// Objects sent to the I/O channel (may be fewer if pipeline stops
+    /// mid-discovery).
     pub objects_enqueued: u64,
 }
 
 /// End-of-run report.
 #[derive(Debug, Default)]
 pub struct RemoteRunReport {
+    /// Discovery-side stats (listing).
     pub remote: RemoteStats,
+    /// I/O-thread-side stats (fetch, retry, scan).
     pub io: IoStats,
 }
 
@@ -409,6 +408,7 @@ struct CpuScratch {
 // CPU Worker Logic
 // ============================================================================
 
+/// In-place dedupe of findings by `(rule_id, root_hint, span)`.
 fn dedupe_pending_in_place(p: &mut Vec<FindingRec>) {
     if p.len() <= 1 {
         return;
@@ -440,6 +440,7 @@ fn dedupe_pending_in_place(p: &mut Vec<FindingRec>) {
     });
 }
 
+/// Formats findings into `out_buf` and flushes them to the output sink.
 fn emit_findings_formatted(
     engine: &MockEngine,
     out: &Arc<dyn OutputSink>,
@@ -469,6 +470,7 @@ fn emit_findings_formatted(
     out.write_all(out_buf.as_slice());
 }
 
+/// Executes a single scan-chunk task on a CPU worker thread.
 fn cpu_runner(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScratch>) {
     match task {
         CpuTask::ScanChunk {
@@ -520,6 +522,11 @@ fn cpu_runner(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScratch>) {
 // Retry Logic
 // ============================================================================
 
+/// Computes exponential backoff with jitter.
+///
+/// `attempt` is 1-based (1 = first retry). Delay is
+/// `base_delay * 2^(attempt-1)`, capped at `max_delay`, then jittered
+/// by `+/- jitter_pct%` uniform.
 fn compute_backoff(attempt: u32, policy: RetryPolicy, rng: &mut XorShift64) -> Duration {
     // attempt starts at 1 for the first try
     let exp = attempt.saturating_sub(1).min(30);

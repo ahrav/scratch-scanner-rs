@@ -231,8 +231,6 @@ impl LocalFsUringConfig {
 // ============================================================================
 
 /// Discovery and I/O counters (no identifiers logged for security).
-///
-/// Populated only when `perf-stats` is enabled in debug builds.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LocalFsSummary {
     pub files_seen: u64,
@@ -244,8 +242,6 @@ pub struct LocalFsSummary {
 }
 
 /// Per-I/O-thread counters.
-///
-/// Populated only when `perf-stats` is enabled in debug builds.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UringIoStats {
     pub files_started: u64,
@@ -310,11 +306,11 @@ impl FixedBufferPool {
         })
     }
 
-    /// Build iovec list for io_uring registration.
+    /// Builds iovec list for `register_buffers`.
     ///
-    /// # Safety
-    ///
-    /// Callers must ensure buffers outlive the registration.
+    /// The returned iovecs borrow the pool's heap buffers. The pool
+    /// must outlive the io_uring registration (call `unregister_buffers`
+    /// before dropping the pool).
     fn iovecs(&self) -> Vec<libc::iovec> {
         self.buffers
             .iter()
@@ -379,10 +375,6 @@ impl Drop for FixedBufferHandle {
 
 impl UringIoStats {
     fn merge(&mut self, other: UringIoStats) {
-        if !perf_stats::enabled() {
-            let _ = other;
-            return;
-        }
         self.files_started += other.files_started;
         self.files_open_failed += other.files_open_failed;
         self.open_ops_submitted += other.open_ops_submitted;
@@ -1033,6 +1025,8 @@ fn io_worker_loop<E: ScanEngine>(
 
                             let op_slot = free_ops.pop().unwrap();
                             let fd = rs.file.as_raw_fd();
+                            // SAFETY: `prefix_len < buffer_len` (clamped above), so
+                            // `add(prefix_len)` stays within the buffer allocation.
                             let ptr = unsafe { buf.as_mut_slice().as_mut_ptr().add(prefix_len) };
 
                             let entry = if cfg.use_registered_buffers {
@@ -1137,6 +1131,8 @@ fn io_worker_loop<E: ScanEngine>(
                     "file in stat queue should not have in-flight ops"
                 );
 
+                // SAFETY: `libc::statx` is a C struct where all-zeros is a valid
+                // representation. The kernel overwrites the fields we need.
                 let mut statx_buf = Box::new(unsafe { std::mem::zeroed::<libc::statx>() });
                 let statx_ptr = statx_buf.as_mut() as *mut libc::statx as *mut types::statx;
                 let empty_path = b"\0";

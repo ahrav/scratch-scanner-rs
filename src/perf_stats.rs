@@ -1,18 +1,7 @@
-//! Compile-time gated helpers for scan-time perf/stat counters.
+//! Small arithmetic helpers for scan-time counters.
 //!
-//! Every stats struct in the codebase (`PipelineStats`, `PackExecStats`,
-//! `ArchiveStats`, `WorkerMetricsLocal`, etc.) is updated exclusively through
-//! the functions in this module.  When the `perf-stats` feature is **off** (or
-//! the build is `--release`), every function here compiles to a no-op — the
-//! counter fields stay at their `Default` value and the optimizer eliminates
-//! the dead stores entirely.
-//!
-//! # Gate
-//!
-//! `cfg!(all(feature = "perf-stats", debug_assertions))`
-//!
-//! A `compile_error!` in `lib.rs` prevents accidentally shipping stat
-//! instrumentation in release binaries.
+//! These helpers centralize saturating/wrapping/max/set update patterns so
+//! hot paths stay concise and consistent.
 //!
 //! # Why wrapping vs. saturating?
 //!
@@ -25,123 +14,56 @@
 //! * **`set_*`** — final-value assignment (e.g. total op counts known after a
 //!   batch completes).
 
-/// Returns `true` when perf-stat recording is active (debug + feature flag).
-///
-/// Callers that need a runtime branch (e.g. for `max` updates that cannot use
-/// a separate `#[cfg]` body) should use this.  For the common case of a
-/// single counter bump, prefer the helper functions below — they already
-/// contain the `#[cfg]` gate and avoid the branch entirely.
-#[inline(always)]
-pub const fn enabled() -> bool {
-    cfg!(all(feature = "perf-stats", debug_assertions))
-}
-
-/// Saturating add for a `u64` counter. No-op when stats are disabled.
+/// Saturating add for a `u64` counter.
 #[inline(always)]
 pub fn sat_add_u64(counter: &mut u64, delta: u64) {
-    #[cfg(all(feature = "perf-stats", debug_assertions))]
-    {
-        *counter = counter.saturating_add(delta);
-    }
-    #[cfg(not(all(feature = "perf-stats", debug_assertions)))]
-    {
-        let _ = (counter, delta);
-    }
+    *counter = counter.saturating_add(delta);
 }
 
-/// Saturating add for a `u32` counter. No-op when stats are disabled.
+/// Saturating add for a `u32` counter.
 #[inline(always)]
 pub fn sat_add_u32(counter: &mut u32, delta: u32) {
-    #[cfg(all(feature = "perf-stats", debug_assertions))]
-    {
-        *counter = counter.saturating_add(delta);
-    }
-    #[cfg(not(all(feature = "perf-stats", debug_assertions)))]
-    {
-        let _ = (counter, delta);
-    }
+    *counter = counter.saturating_add(delta);
 }
 
-/// Saturating add for a `usize` counter. No-op when stats are disabled.
+/// Saturating add for a `usize` counter.
 #[inline(always)]
 pub fn sat_add_usize(counter: &mut usize, delta: usize) {
-    #[cfg(all(feature = "perf-stats", debug_assertions))]
-    {
-        *counter = counter.saturating_add(delta);
-    }
-    #[cfg(not(all(feature = "perf-stats", debug_assertions)))]
-    {
-        let _ = (counter, delta);
-    }
+    *counter = counter.saturating_add(delta);
 }
 
-/// Wrapping add for a `u64` counter. No-op when stats are disabled.
+/// Wrapping add for a `u64` counter.
 ///
 /// Use for counters where overflow is expected or where the consumer
 /// computes deltas (`after.wrapping_sub(before)`) that remain correct
 /// under wrap-around (e.g. cumulative finding counts).
 #[inline(always)]
 pub fn wrap_add_u64(counter: &mut u64, delta: u64) {
-    #[cfg(all(feature = "perf-stats", debug_assertions))]
-    {
-        *counter = counter.wrapping_add(delta);
-    }
-    #[cfg(not(all(feature = "perf-stats", debug_assertions)))]
-    {
-        let _ = (counter, delta);
-    }
+    *counter = counter.wrapping_add(delta);
 }
 
-/// High-water-mark update for a `u64` counter. No-op when stats are disabled.
+/// High-water-mark update for a `u64` counter.
 #[inline(always)]
 pub fn max_u64(counter: &mut u64, value: u64) {
-    #[cfg(all(feature = "perf-stats", debug_assertions))]
-    {
-        *counter = (*counter).max(value);
-    }
-    #[cfg(not(all(feature = "perf-stats", debug_assertions)))]
-    {
-        let _ = (counter, value);
-    }
+    *counter = (*counter).max(value);
 }
 
-/// High-water-mark update for a `u32` counter. No-op when stats are disabled.
+/// High-water-mark update for a `u32` counter.
 #[inline(always)]
 pub fn max_u32(counter: &mut u32, value: u32) {
-    #[cfg(all(feature = "perf-stats", debug_assertions))]
-    {
-        *counter = (*counter).max(value);
-    }
-    #[cfg(not(all(feature = "perf-stats", debug_assertions)))]
-    {
-        let _ = (counter, value);
-    }
+    *counter = (*counter).max(value);
 }
 
-/// Unconditional assignment for a `u64` counter. No-op when stats are disabled.
+/// Unconditional assignment for a `u64` counter.
 ///
 /// Use when the final value is known (e.g. total op count after a batch).
 #[inline(always)]
 pub fn set_u64(counter: &mut u64, value: u64) {
-    #[cfg(all(feature = "perf-stats", debug_assertions))]
-    {
-        *counter = value;
-    }
-    #[cfg(not(all(feature = "perf-stats", debug_assertions)))]
-    {
-        let _ = (counter, value);
-    }
+    *counter = value;
 }
 
-/// Unconditional assignment for a `usize` counter. No-op when stats are disabled.
+/// Unconditional assignment for a `usize` counter.
 #[inline(always)]
 pub fn set_usize(counter: &mut usize, value: usize) {
-    #[cfg(all(feature = "perf-stats", debug_assertions))]
-    {
-        *counter = value;
-    }
-    #[cfg(not(all(feature = "perf-stats", debug_assertions)))]
-    {
-        let _ = (counter, value);
-    }
+    *counter = value;
 }

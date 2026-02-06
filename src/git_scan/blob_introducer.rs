@@ -217,8 +217,6 @@ impl LooseOidSet {
 }
 
 /// Statistics for the blob introducer.
-///
-/// Populated only when `perf-stats` is enabled in debug builds.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct BlobIntroStats {
     /// Number of commits visited.
@@ -567,10 +565,7 @@ impl BlobIntroducer {
             cursor,
             in_flight_len,
         });
-        if perf_stats::enabled() {
-            self.stats.max_depth_reached =
-                self.stats.max_depth_reached.max(self.stack.len() as u16);
-        }
+        self.stats.max_depth_reached = self.stats.max_depth_reached.max(self.stack.len() as u16);
         Ok(())
     }
 

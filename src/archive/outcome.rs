@@ -13,7 +13,6 @@
 
 #![allow(dead_code)]
 
-use crate::perf_stats;
 use core::fmt;
 
 // -----------------------------
@@ -231,6 +230,8 @@ const PARTIAL_REASONS: [PartialReason; PartialReason::COUNT] = [
 // Bounded samples (optional)
 // -----------------------------
 
+/// Classifies a bounded sample by granularity (archive vs entry) and
+/// outcome (skipped vs partial).
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SampleKind {
@@ -251,11 +252,13 @@ impl SampleKind {
     }
 }
 
+/// Maximum samples retained in an [`ArchiveSampleRing`].
 pub const ARCHIVE_SAMPLE_MAX: usize = 32;
+/// Maximum path prefix bytes stored per sample (truncated beyond this).
 pub const ARCHIVE_SAMPLE_PATH_PREFIX_MAX: usize = 192;
 
-#[derive(Clone, Copy, Debug)]
 /// Bounded sample of a skip/partial outcome with a path prefix.
+#[derive(Clone, Copy, Debug)]
 pub struct ArchiveSample {
     pub kind: SampleKind,
     /// Reason enum discriminant (ArchiveSkipReason/EntrySkipReason/PartialReason).
@@ -345,8 +348,7 @@ impl ArchiveSampleRing {
 /// # Guarantees
 /// - Counters are monotonic (wrapping on overflow).
 /// - Arrays are indexed by the stable reason discriminants.
-/// - Recording/merge methods are no-ops unless `perf-stats` is enabled in
-///   debug builds.
+/// - Recording/merge operations always mutate the counters.
 #[derive(Clone, Copy, Debug)]
 pub struct ArchiveStats {
     pub archives_seen: u64,
@@ -402,17 +404,11 @@ impl ArchiveStats {
 
     #[inline]
     pub fn record_archive_seen(&mut self) {
-        if !perf_stats::enabled() {
-            return;
-        }
         self.archives_seen = self.archives_seen.wrapping_add(1);
     }
 
     #[inline]
     pub fn record_archive_scanned(&mut self) {
-        if !perf_stats::enabled() {
-            return;
-        }
         self.archives_scanned = self.archives_scanned.wrapping_add(1);
     }
 
@@ -423,10 +419,6 @@ impl ArchiveStats {
         display_path: &[u8],
         sample: bool,
     ) {
-        if !perf_stats::enabled() {
-            let _ = (reason, display_path, sample);
-            return;
-        }
         self.archives_skipped = self.archives_skipped.wrapping_add(1);
         let idx = reason.as_usize();
         self.archive_skip_reasons[idx] = self.archive_skip_reasons[idx].wrapping_add(1);
@@ -444,10 +436,6 @@ impl ArchiveStats {
         display_path: &[u8],
         sample: bool,
     ) {
-        if !perf_stats::enabled() {
-            let _ = (reason, display_path, sample);
-            return;
-        }
         self.archives_partial = self.archives_partial.wrapping_add(1);
         let idx = reason.as_usize();
         self.partial_reasons[idx] = self.partial_reasons[idx].wrapping_add(1);
@@ -460,9 +448,6 @@ impl ArchiveStats {
 
     #[inline]
     pub fn record_entry_scanned(&mut self) {
-        if !perf_stats::enabled() {
-            return;
-        }
         self.entries_scanned = self.entries_scanned.wrapping_add(1);
     }
 
@@ -473,10 +458,6 @@ impl ArchiveStats {
         display_path: &[u8],
         sample: bool,
     ) {
-        if !perf_stats::enabled() {
-            let _ = (reason, display_path, sample);
-            return;
-        }
         self.entries_skipped = self.entries_skipped.wrapping_add(1);
         let idx = reason.as_usize();
         self.entry_skip_reasons[idx] = self.entry_skip_reasons[idx].wrapping_add(1);
@@ -494,10 +475,6 @@ impl ArchiveStats {
         display_path: &[u8],
         sample: bool,
     ) {
-        if !perf_stats::enabled() {
-            let _ = (reason, display_path, sample);
-            return;
-        }
         let idx = reason.as_usize();
         self.partial_reasons[idx] = self.partial_reasons[idx].wrapping_add(1);
 
@@ -509,25 +486,16 @@ impl ArchiveStats {
 
     #[inline]
     pub fn record_path_truncated(&mut self) {
-        if !perf_stats::enabled() {
-            return;
-        }
         self.paths_truncated = self.paths_truncated.wrapping_add(1);
     }
 
     #[inline]
     pub fn record_path_had_traversal(&mut self) {
-        if !perf_stats::enabled() {
-            return;
-        }
         self.paths_had_traversal = self.paths_had_traversal.wrapping_add(1);
     }
 
     #[inline]
     pub fn record_component_cap_exceeded(&mut self) {
-        if !perf_stats::enabled() {
-            return;
-        }
         self.paths_component_cap_exceeded = self.paths_component_cap_exceeded.wrapping_add(1);
     }
 
@@ -536,10 +504,6 @@ impl ArchiveStats {
     /// All counters are merged via wrapping addition; samples respect the
     /// local `ARCHIVE_SAMPLE_MAX` capacity.
     pub fn merge_from(&mut self, other: &ArchiveStats) {
-        if !perf_stats::enabled() {
-            let _ = other;
-            return;
-        }
         self.archives_seen = self.archives_seen.wrapping_add(other.archives_seen);
         self.archives_scanned = self.archives_scanned.wrapping_add(other.archives_scanned);
         self.archives_skipped = self.archives_skipped.wrapping_add(other.archives_skipped);
@@ -619,10 +583,12 @@ impl ArchiveStats {
 // Fixed-array counters (legacy)
 // -----------------------------
 
-/// Fixed-array counters for archive outcomes.
+/// Fixed-array counters for archive outcomes (legacy path).
 ///
-/// This is intentionally dumb and cache-friendly.
-/// Increment methods are no-ops unless `perf-stats` is enabled in debug builds.
+/// Prefer [`ArchiveStats`] for new code; this type is retained for
+/// call-sites that only need simple per-reason counting.
+///
+/// Uses **saturating** arithmetic (unlike `ArchiveStats` which wraps).
 #[derive(Clone, Debug)]
 pub struct ArchiveOutcomeCounters {
     pub archives_seen: u64,
@@ -657,10 +623,6 @@ impl Default for ArchiveOutcomeCounters {
 impl ArchiveOutcomeCounters {
     #[inline(always)]
     pub fn inc_archive_skip(&mut self, reason: ArchiveSkipReason) {
-        if !perf_stats::enabled() {
-            let _ = reason;
-            return;
-        }
         self.archives_skipped = self.archives_skipped.saturating_add(1);
         self.archive_skip_reasons[reason.as_usize()] =
             self.archive_skip_reasons[reason.as_usize()].saturating_add(1);
@@ -668,10 +630,6 @@ impl ArchiveOutcomeCounters {
 
     #[inline(always)]
     pub fn inc_entry_skip(&mut self, reason: EntrySkipReason) {
-        if !perf_stats::enabled() {
-            let _ = reason;
-            return;
-        }
         self.entries_skipped = self.entries_skipped.saturating_add(1);
         self.entry_skip_reasons[reason.as_usize()] =
             self.entry_skip_reasons[reason.as_usize()].saturating_add(1);
@@ -679,10 +637,6 @@ impl ArchiveOutcomeCounters {
 
     #[inline(always)]
     pub fn inc_partial(&mut self, reason: PartialReason) {
-        if !perf_stats::enabled() {
-            let _ = reason;
-            return;
-        }
         self.archives_partial = self.archives_partial.saturating_add(1);
         self.partial_reasons[reason.as_usize()] =
             self.partial_reasons[reason.as_usize()].saturating_add(1);

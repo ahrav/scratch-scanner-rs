@@ -188,8 +188,6 @@ pub struct SkipRecord {
 }
 
 /// Execution statistics.
-///
-/// Populated only when `perf-stats` is enabled in debug builds.
 #[derive(Debug, Default)]
 pub struct PackExecStats {
     /// Offsets successfully decoded (including bases and non-blob kinds).
@@ -293,10 +291,6 @@ impl PackExecStats {
 
     #[inline]
     fn merge_from(&mut self, other: &PackExecStats) {
-        if !perf_stats::enabled() {
-            let _ = other;
-            return;
-        }
         self.decoded_offsets = self.decoded_offsets.saturating_add(other.decoded_offsets);
         self.emitted_candidates = self
             .emitted_candidates

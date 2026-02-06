@@ -83,8 +83,6 @@ const TREE_STREAM_BUF_BYTES: usize = 16 * 1024;
 /// Statistics are cumulative until `reset_stats()` is called. The
 /// `tree_bytes_loaded` counter is informational; the in-flight budget
 /// is enforced separately via the walker.
-///
-/// Populated only when `perf-stats` is enabled in debug builds.
 #[derive(Clone, Debug, Default)]
 pub struct TreeDiffStats {
     /// Number of trees loaded.
@@ -145,7 +143,11 @@ enum Action {
     OldBeforeNew,
 }
 
-/// Buffered tree cursor (slice-backed).
+/// Buffered tree cursor (slice-backed) with peek-one-entry lookahead.
+///
+/// `peek_entry` parses and caches the next entry; `advance` consumes
+/// the cache and moves `pos` forward. This avoids re-parsing when the
+/// diff loop peeks the same entry multiple times.
 struct BufferedCursor {
     bytes: TreeBytes,
     pos: usize,
@@ -205,6 +207,10 @@ impl BufferedCursor {
 }
 
 /// Tree cursor selecting buffered vs streaming parsing.
+///
+/// Trees smaller than `stream_threshold` use `Buffered` (single slice).
+/// Larger or spill-backed trees use `Stream` to avoid loading the
+/// entire tree into memory at once.
 enum TreeCursor {
     Buffered(BufferedCursor),
     Stream(TreeStream<TreeBytesReader>),
@@ -385,9 +391,7 @@ impl TreeDiffWalker {
 
             while !self.stack.is_empty() {
                 let depth = self.stack.len() as u16;
-                if perf_stats::enabled() {
-                    self.stats.max_depth_reached = self.stats.max_depth_reached.max(depth);
-                }
+                self.stats.max_depth_reached = self.stats.max_depth_reached.max(depth);
 
                 let action = {
                     let frame = self.stack.last_mut().expect("frame exists");
@@ -544,6 +548,10 @@ impl TreeDiffWalker {
         self.tree_bytes_in_flight = 0;
     }
 
+    /// Processes an entry present only in the new tree.
+    ///
+    /// Trees are recursed into; blob-like entries emit an `Add` candidate.
+    /// Gitlinks and unknown kinds are silently skipped.
     #[allow(clippy::too_many_arguments)]
     fn handle_new_entry<S: TreeSource, C: CandidateSink>(
         &mut self,
@@ -572,6 +580,16 @@ impl TreeDiffWalker {
         Ok(())
     }
 
+    /// Processes a pair of entries with the same name in old and new trees.
+    ///
+    /// Implements the four-way kind matrix:
+    /// - **tree / tree**: recurse if OIDs differ, skip if identical.
+    /// - **non-tree / tree**: treat new subtree as entirely added.
+    /// - **tree / non-tree**: emit the new blob as `Add`.
+    /// - **non-tree / non-tree**: emit `Modify` if OIDs differ, skip if equal.
+    ///
+    /// Gitlinks on either side are handled implicitly: a gitlink-to-blob
+    /// change emits the blob; a blob-to-gitlink change is skipped.
     #[allow(clippy::too_many_arguments)]
     fn handle_matched_entries<S: TreeSource, C: CandidateSink>(
         &mut self,
@@ -646,6 +664,10 @@ impl TreeDiffWalker {
     }
 
     /// Pushes a subtree frame, extending `path_buf` with `name/`.
+    ///
+    /// Enforces the depth limit and path length limit. Loads both new
+    /// and old trees (when `old_oid` is `Some`), charging the in-flight
+    /// byte budget for each.
     fn push_subtree_frame<S: TreeSource>(
         &mut self,
         source: &mut S,

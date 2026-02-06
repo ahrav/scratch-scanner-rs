@@ -1,8 +1,7 @@
 //! # Metrics Module
 //!
 //! Cheap, deterministic metrics collection for scheduler observability.
-//! Metrics recording is enabled only when `perf-stats` is on in debug builds.
-//! Outside that mode, record/merge operations are no-ops.
+//! Metrics recording is always enabled for scheduler counters.
 //!
 //! ## Design
 //!
@@ -35,7 +34,6 @@
 //! For higher precision, consider linear-log hybrid histograms (future work).
 
 use crate::archive::ArchiveStats;
-use crate::perf_stats;
 
 /// Log2 histogram for cheap p95/p99-ish tracking.
 ///
@@ -85,10 +83,6 @@ impl Log2Hist {
     /// - ~3-5 cycles on modern x86-64
     #[inline(always)]
     pub fn record(&mut self, v: u64) {
-        if !perf_stats::enabled() {
-            let _ = v;
-            return;
-        }
         let b = bucket_index(v);
         // SAFETY: bucket_index always returns 0..63 (see its implementation).
         // The index is derived from leading_zeros which is 0..64 for u64,
@@ -107,10 +101,6 @@ impl Log2Hist {
     /// Same as `record()` - useful when you have a count of events at the same value.
     #[inline(always)]
     pub fn record_n(&mut self, v: u64, n: u64) {
-        if !perf_stats::enabled() {
-            let _ = (v, n);
-            return;
-        }
         if n == 0 {
             return;
         }
@@ -186,10 +176,6 @@ impl Log2Hist {
 
     /// Merge another histogram into this one.
     pub fn merge(&mut self, other: &Log2Hist) {
-        if !perf_stats::enabled() {
-            let _ = other;
-            return;
-        }
         for i in 0..64 {
             self.buckets[i] = self.buckets[i].wrapping_add(other.buckets[i]);
         }
@@ -258,9 +244,6 @@ fn bucket_lower_bound(bucket: usize) -> u64 {
 ///
 /// All updates are plain integer ops with wrapping arithmetic.
 /// No atomics, no locks, no bounds checks on histograms.
-///
-/// When perf stats are disabled, update paths compile to no-ops and this
-/// struct remains zeroed.
 #[derive(Clone, Debug, Default)]
 #[repr(align(64))] // Cache line alignment - prevents false sharing
 pub struct WorkerMetricsLocal {
@@ -381,8 +364,6 @@ impl WorkerMetricsLocal {
 /// Like `WorkerMetricsLocal`, this is **not thread-safe**. Intended for
 /// single-threaded aggregation after parallel work completes.
 ///
-/// Merge operations are no-ops when perf stats are disabled.
-///
 /// # Example
 ///
 /// ```ignore
@@ -471,10 +452,6 @@ impl MetricsSnapshot {
     ///
     /// O(1) for counters + O(64) for histogram merge. Total ~70 additions.
     pub fn merge_worker(&mut self, w: &WorkerMetricsLocal) {
-        if !perf_stats::enabled() {
-            let _ = w;
-            return;
-        }
         self.tasks_enqueued = self.tasks_enqueued.wrapping_add(w.tasks_enqueued);
         self.tasks_executed = self.tasks_executed.wrapping_add(w.tasks_executed);
         self.bytes_scanned = self.bytes_scanned.wrapping_add(w.bytes_scanned);

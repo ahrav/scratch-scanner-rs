@@ -166,7 +166,6 @@ const LARGE_OFFSET_FLAG: u32 = 0x8000_0000;
 ///
 /// # Errors
 /// Returns `MidxBuildError` if:
-/// - No packs are found
 /// - Too many packs or objects
 /// - MIDX would exceed size limits (heuristic precheck + final serialized cap)
 /// - Any `.idx` file fails to parse
@@ -177,10 +176,6 @@ pub fn build_midx_bytes(
 ) -> Result<BytesView, MidxBuildError> {
     // Step 1: Enumerate .idx files in deterministic order
     let idx_paths = enumerate_idx_files(repo, limits.max_packs as usize)?;
-
-    if idx_paths.is_empty() {
-        return Err(MidxBuildError::NoPacksFound);
-    }
 
     if idx_paths.len() > limits.max_packs as usize {
         return Err(MidxBuildError::TooManyPacks {
@@ -748,6 +743,31 @@ mod tests {
         assert!(!is_idx_file(OsStr::new("pack-abc.pack")));
         assert!(!is_idx_file(OsStr::new("pack-abc")));
         assert!(!is_idx_file(OsStr::new(".idx")));
+    }
+
+    #[test]
+    fn build_midx_bytes_with_no_packs_builds_empty_midx() {
+        let temp = tempdir().unwrap();
+        let git_dir = temp.path().join(".git");
+        let objects_dir = git_dir.join("objects");
+        let pack_dir = objects_dir.join("pack");
+        fs::create_dir_all(&pack_dir).unwrap();
+
+        let repo = GitRepoPaths {
+            kind: RepoKind::Worktree,
+            worktree_root: Some(temp.path().to_path_buf()),
+            git_dir: git_dir.clone(),
+            common_dir: git_dir,
+            objects_dir,
+            pack_dir,
+            alternate_object_dirs: Vec::new(),
+        };
+
+        let bytes = build_midx_bytes(&repo, ObjectFormat::Sha1, &MidxBuildLimits::default())
+            .expect("zero-pack repository should produce an empty MIDX");
+        let midx = MidxView::parse(bytes.as_slice(), ObjectFormat::Sha1).unwrap();
+        assert_eq!(midx.pack_count(), 0);
+        assert_eq!(midx.object_count(), 0);
     }
 
     #[test]
