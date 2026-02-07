@@ -42,8 +42,8 @@
 //! [`EventSink`] (which has internal synchronization).
 //!
 //! ```text
-//! Shard 0:  [TsBufferPool] [SPSC<8>]  [crossbeam Receiver]
-//! Shard 1:  [TsBufferPool] [SPSC<8>]  [crossbeam Receiver]
+//! Shard 0:  [TsBufferPool] [SPSC<64>]  [crossbeam Receiver]
+//! Shard 1:  [TsBufferPool] [SPSC<64>]  [crossbeam Receiver]
 //!   ...no shared mutable state between shards...
 //! ```
 
@@ -73,17 +73,22 @@ use crate::unified::SourceKind;
 
 /// SPSC ring capacity (must be power of 2).
 ///
-/// 8 slots provides enough buffering for the I/O thread to stay ahead of the
-/// scan thread without excessive memory commitment. Each slot holds one
-/// `ScanChunk` which contains a `TsBufferHandle` (the actual bulk allocation).
-pub(super) const SHARD_SPSC_CAP: usize = 8;
+/// 64 slots allows the I/O thread to read-ahead substantially before the scan
+/// thread catches up, reducing `yield_now()` context switches on large files.
+/// A 50 MiB file at 256 KiB chunks produces ~195 chunks; with 8 slots the I/O
+/// thread blocked after every 8 reads, generating thousands of yield-induced
+/// context switches. At 64, most files fit entirely in the ring.
+///
+/// Memory cost per shard is 64 × `size_of::<ScanChunk>()` (a few KiB);
+/// the bulk allocation lives in the `TsBufferPool`, not the ring slots.
+pub(super) const SHARD_SPSC_CAP: usize = 64;
 
 /// Number of spin iterations before yielding when a ring operation fails.
 ///
 /// Brief spin avoids the cost of a full `thread::yield_now()` context switch
-/// on transient contention. After `SPIN_ITERS` attempts, we yield to the OS
-/// scheduler.
-pub(super) const SPIN_ITERS: u32 = 16;
+/// on transient contention. After `SPIN_ITERS` spin-loop hints, we retry the
+/// operation once before falling back to `thread::yield_now()`.
+pub(super) const SPIN_ITERS: u32 = 32;
 
 /// Header sniff buffer size for archive detection.
 ///
@@ -100,16 +105,17 @@ pub(super) const SNIFF_HEADER_LEN: usize = 8;
 ///
 /// | Parameter | Default | Guidance |
 /// |-----------|---------|----------|
-/// | `shards` | `num_cpus / 2` | One I/O + one scan thread per shard |
+/// | `shards` | `num_cpus` | One I/O + one scan thread per shard |
 /// | `chunk_size` | 256 KiB | Larger = fewer syscalls, more memory per file |
 /// | `max_file_size` | 100 MiB | Skip files larger than this |
-/// | `pool_buffers_per_shard` | 8 | Bounds peak memory per shard |
+/// | `pool_buffers_per_shard` | 32 | Bounds peak memory per shard |
 /// | `max_in_flight_per_shard` | 64 | Bounds discovered-but-not-scanned files |
-/// | `spsc_capacity` | 8 | Power-of-2 SPSC ring depth |
+/// | `spsc_capacity` | 64 | Power-of-2 SPSC ring depth |
 pub struct ShardedFsConfig {
     /// Number of shards (each shard = 1 I/O thread + 1 scan thread).
     ///
-    /// Default: `num_cpus / 2` (so total threads = num_cpus).
+    /// Default: `num_cpus` (2× oversubscription). I/O threads spend most
+    /// time in blocking syscalls, so scan threads rarely compete for CPU.
     pub shards: usize,
 
     /// Payload bytes per chunk (excluding overlap).
@@ -362,10 +368,10 @@ fn emit_findings<E: ScanEngine, F: FindingRecord>(
 ///
 /// # Wait Strategy
 ///
-/// When the SPSC ring is empty, the scan thread spins briefly (16 iterations
-/// with `core::hint::spin_loop()`) then yields to the OS scheduler. This
-/// balances latency (fast wakeup on new data) with CPU efficiency (no busy-wait
-/// when the I/O thread is blocked on disk).
+/// When the SPSC ring is empty, the scan thread spins briefly (32 iterations
+/// of `core::hint::spin_loop()` hints), retries once, then yields to the OS
+/// scheduler. This balances latency (fast wakeup on new data) with CPU
+/// efficiency (no busy-wait when the I/O thread is blocked on disk).
 ///
 /// # Chunk Processing
 ///
@@ -393,53 +399,17 @@ pub(super) fn shard_scan_loop<E: ScanEngine>(
         let chunk = match consumer.try_pop() {
             Some(c) => c,
             None => {
-                // Ring empty: spin briefly, then yield.
-                let mut got = false;
+                // Ring empty: spin (hint only), retry once, then yield.
                 for _ in 0..SPIN_ITERS {
                     core::hint::spin_loop();
-                    if let Some(c) = consumer.try_pop() {
-                        // Process the chunk we just got (handled below via match).
-                        // We need to break out of spin and process it.
-                        // Re-assign and break.
-                        match c {
-                            ScanChunk::Shutdown => return stats,
-                            ScanChunk::EndOfFile => {
-                                scratch.clear();
-                                got = true;
-                                break;
-                            }
-                            ScanChunk::Chunk {
-                                buf,
-                                base_offset,
-                                prefix_len,
-                                len,
-                                display,
-                                file_id,
-                            } => {
-                                process_scan_chunk(
-                                    engine.as_ref(),
-                                    &*event_sink,
-                                    &mut scratch,
-                                    &mut pending,
-                                    &mut stats,
-                                    buf,
-                                    base_offset,
-                                    prefix_len,
-                                    len,
-                                    &display,
-                                    file_id,
-                                    dedupe,
-                                );
-                                got = true;
-                                break;
-                            }
-                        }
+                }
+                match consumer.try_pop() {
+                    Some(c) => c,
+                    None => {
+                        std::thread::yield_now();
+                        continue;
                     }
                 }
-                if !got {
-                    std::thread::yield_now();
-                }
-                continue;
             }
         };
 
@@ -477,8 +447,8 @@ pub(super) fn shard_scan_loop<E: ScanEngine>(
 
 /// Process a single scan chunk: scan, dedup, emit findings, update stats.
 ///
-/// Extracted from the scan loop to keep the main loop readable and to allow
-/// reuse from both the fast path (immediate pop) and the spin-loop path.
+/// Extracted from the scan loop to keep the main loop body small and the
+/// chunk-processing logic in one place.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn process_scan_chunk<E: ScanEngine>(
@@ -814,27 +784,33 @@ fn read_full(file: &mut File, dst: &mut [u8]) -> io::Result<usize> {
 /// This never fails; it retries until the consumer makes room. The scan thread
 /// must always be consuming (or the system would deadlock), so this eventually
 /// succeeds.
+///
+/// Wait strategy: try push → spin (hint only, no retry) → retry once → yield.
+/// This avoids the O(SPIN_ITERS) retries-per-spin that caused excessive context
+/// switches with small ring capacities.
 #[inline]
 pub(super) fn push_with_backoff<T: Send + 'static, const N: usize>(
     producer: &mut OwnedSpscProducer<T, N>,
     mut value: T,
 ) {
+    // Fast path: ring likely has room.
+    match producer.try_push(value) {
+        Ok(()) => return,
+        Err(v) => value = v,
+    }
+
     loop {
+        // Spin with CPU hint (no retry during spin — just wait for cache line).
+        for _ in 0..SPIN_ITERS {
+            core::hint::spin_loop();
+        }
+        // Retry once after spin.
         match producer.try_push(value) {
             Ok(()) => return,
-            Err(v) => {
-                value = v;
-                // Brief spin before yielding.
-                for _ in 0..SPIN_ITERS {
-                    core::hint::spin_loop();
-                    match producer.try_push(value) {
-                        Ok(()) => return,
-                        Err(v) => value = v,
-                    }
-                }
-                std::thread::yield_now();
-            }
+            Err(v) => value = v,
         }
+        // Yield to OS scheduler before next spin round.
+        std::thread::yield_now();
     }
 }
 
@@ -843,18 +819,21 @@ pub(super) fn push_with_backoff<T: Send + 'static, const N: usize>(
 /// This never fails; it retries until a buffer becomes available. The scan
 /// thread drops buffers (returning them to the pool) as it processes chunks,
 /// so this eventually succeeds.
+///
+/// Wait strategy: try acquire → spin (hint only) → retry once → yield.
 #[inline]
 pub(super) fn acquire_buffer_with_backoff(pool: &TsBufferPool) -> TsBufferHandle {
+    // Fast path: pool likely has a buffer.
+    if let Some(buf) = pool.try_acquire() {
+        return buf;
+    }
+
     loop {
-        if let Some(buf) = pool.try_acquire() {
-            return buf;
-        }
-        // Brief spin before yielding.
         for _ in 0..SPIN_ITERS {
             core::hint::spin_loop();
-            if let Some(buf) = pool.try_acquire() {
-                return buf;
-            }
+        }
+        if let Some(buf) = pool.try_acquire() {
+            return buf;
         }
         std::thread::yield_now();
     }
@@ -875,7 +854,7 @@ pub(super) fn acquire_buffer_with_backoff(pool: &TsBufferPool) -> TsBufferHandle
 ///   |  2. Create N count budgets (one per shard)
 ///   |  3. For each shard, spawn:
 ///   |     - TsBufferPool (per-shard, 2 workers)
-///   |     - SPSC ring (capacity 8)
+///   |     - SPSC ring (capacity SHARD_SPSC_CAP)
 ///   |     - I/O thread (shard_io_blocking)
 ///   |     - Scan thread (shard_scan_loop)
 ///   |  4. Round-robin files across shards

@@ -3,7 +3,9 @@
 //! Dispatches to the appropriate source driver based on the parsed
 //! CLI configuration:
 //!
-//! - **FS** → [`parallel_scan_dir`] (work-stealing executor, streaming directory walk)
+//! - **FS (blocking)** → [`parallel_scan_dir`] (work-stealing executor, streaming directory walk)
+//! - **FS (sharded)** → [`scan_local_fs_sharded`](crate::scheduler::scan_local_fs_sharded)
+//!   (per-shard share-nothing I/O + scan threads, parallel streaming walk)
 //! - **Git** → [`run_git_scan`] (pack execution, tree diffs, loose scan)
 //!
 //! Both paths share a common [`EventSink`](super::events::EventSink) for
@@ -124,8 +126,10 @@ fn run_fs_blocking(cfg: FsScanConfig, event_format: EventFormat) -> io::Result<(
 
 /// Sharded I/O backend — delegates to `scan_local_fs_sharded` (or io_uring variant on Linux).
 ///
-/// Walks the directory tree, then round-robins files across shards. Each shard
+/// Streams files from a parallel directory walker via a bounded channel into
+/// `scan_local_fs_sharded`, which round-robins them across shards. Each shard
 /// has a dedicated I/O thread and scan thread connected by a SPSC ring buffer.
+/// Discovery and scanning overlap — no upfront `.collect()` of the file list.
 fn run_fs_sharded(cfg: FsScanConfig, event_format: EventFormat) -> io::Result<()> {
     // On Linux with io_uring feature, prefer the io_uring per-shard backend.
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
@@ -152,8 +156,13 @@ fn run_fs_blocking_sharded(cfg: FsScanConfig, event_format: EventFormat) -> io::
 
     let event_sink = build_event_sink(event_format);
 
-    // Determine shard count: workers / 2 (each shard uses 2 threads).
-    let shards = (cfg.workers / 2).max(1);
+    // Use one shard per worker. Each shard spawns an I/O thread + a scan
+    // thread (2× oversubscription), but I/O threads spend most time blocked
+    // in kernel syscalls, so they rarely compete with scan threads for CPU.
+    // With workers/2 shards, small-file-heavy workloads (e.g. Linux kernel:
+    // 92K files, nearly all single-chunk) had half the I/O parallelism of
+    // the blocking backend, causing a 2× wall-time regression.
+    let shards = cfg.workers.max(1);
 
     let mut archive_cfg = ArchiveConfig::default();
     if cfg.no_archives {
@@ -164,17 +173,16 @@ fn run_fs_blocking_sharded(cfg: FsScanConfig, event_format: EventFormat) -> io::
         shards,
         chunk_size: 256 * 1024,           // 256 KiB
         max_file_size: 100 * 1024 * 1024, // 100 MiB
-        pool_buffers_per_shard: 8,
+        pool_buffers_per_shard: 32,
         local_queue_cap: 4,
         max_in_flight_per_shard: 64,
-        spsc_capacity: 8,
+        spsc_capacity: 64,
         dedupe_within_chunk: true,
         archive: archive_cfg,
         event_sink: Arc::clone(&event_sink),
         pin_threads: false,
     };
 
-    // Walk the directory tree and collect files into an iterator.
     let root = &cfg.root;
 
     if !root.exists() {
@@ -184,12 +192,13 @@ fn run_fs_blocking_sharded(cfg: FsScanConfig, event_format: EventFormat) -> io::
         ));
     }
 
-    let files: Vec<crate::scheduler::LocalFile> = if root.is_file() {
+    let report = if root.is_file() {
         let meta = std::fs::metadata(root)?;
-        vec![crate::scheduler::LocalFile {
+        let files = vec![crate::scheduler::LocalFile {
             path: root.to_path_buf(),
             size: meta.len(),
-        }]
+        }];
+        scan_local_fs_sharded(engine, files.into_iter(), sharded_cfg)?
     } else {
         // Verify directory is readable.
         std::fs::read_dir(root).map_err(|e| {
@@ -199,31 +208,42 @@ fn run_fs_blocking_sharded(cfg: FsScanConfig, event_format: EventFormat) -> io::
             )
         })?;
 
-        // Use ignore crate for parallel directory walking.
-        let walker = ignore::WalkBuilder::new(root)
-            .follow_links(false)
-            .hidden(false)
-            .git_ignore(false)
-            .git_global(false)
-            .git_exclude(false)
-            .build();
+        // Stream files via parallel walker + bounded channel.
+        // This overlaps directory discovery with scanning (no upfront .collect()).
+        let (tx, rx) = crossbeam_channel::bounded::<crate::scheduler::LocalFile>(1024);
+        let walk_root = root.to_path_buf();
+        std::thread::spawn(move || {
+            let walker = ignore::WalkBuilder::new(&walk_root)
+                .follow_links(false)
+                .hidden(false)
+                .git_ignore(false)
+                .git_global(false)
+                .git_exclude(false)
+                .build_parallel();
 
-        walker
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                if !entry.file_type()?.is_file() {
-                    return None;
-                }
-                Some(crate::scheduler::LocalFile {
-                    path: entry.into_path(),
-                    size: 0, // Size checked at open time.
+            walker.run(|| {
+                let tx = tx.clone();
+                Box::new(move |result| {
+                    if let Ok(entry) = result {
+                        if entry.file_type().is_none_or(|ft| !ft.is_file()) {
+                            return ignore::WalkState::Continue;
+                        }
+                        let file = crate::scheduler::LocalFile {
+                            path: entry.into_path(),
+                            size: 0,
+                        };
+                        if tx.send(file).is_err() {
+                            return ignore::WalkState::Quit;
+                        }
+                    }
+                    ignore::WalkState::Continue
                 })
-            })
-            .collect()
-    };
+            });
+            // tx dropped here → channel closes → rx.into_iter() ends
+        });
 
-    let file_count = files.len() as u64;
-    let report = scan_local_fs_sharded(engine, files.into_iter(), sharded_cfg)?;
+        scan_local_fs_sharded(engine, rx.into_iter(), sharded_cfg)?
+    };
 
     let scan_elapsed = scan_start.elapsed();
     let total_elapsed = t0.elapsed();
@@ -249,7 +269,7 @@ fn run_fs_blocking_sharded(cfg: FsScanConfig, event_format: EventFormat) -> io::
     // Also write machine-readable stats to stderr for compatibility.
     eprintln!(
         "files={} chunks={} bytes={} findings={} errors={} init_ms={} scan_ms={} elapsed_ms={} throughput_mib_s={:.2} shards={} backend=sharded",
-        file_count,
+        report.files_enqueued,
         report.metrics.chunks_scanned,
         report.metrics.bytes_scanned,
         report.metrics.findings_emitted,
@@ -285,13 +305,13 @@ fn run_fs_uring_sharded(cfg: FsScanConfig, event_format: EventFormat) -> io::Res
 
     let event_sink = build_event_sink(event_format);
 
-    let shards = (cfg.workers / 2).max(1);
+    let shards = cfg.workers.max(1);
 
     let uring_cfg = ShardedFsUringConfig {
         shards,
         chunk_size: 256 * 1024,
         max_file_size: 100 * 1024 * 1024,
-        pool_buffers_per_shard: 8,
+        pool_buffers_per_shard: 32,
         local_queue_cap: 4,
         max_in_flight_per_shard: 64,
         dedupe_within_chunk: true,
@@ -313,12 +333,13 @@ fn run_fs_uring_sharded(cfg: FsScanConfig, event_format: EventFormat) -> io::Res
         ));
     }
 
-    let files: Vec<crate::scheduler::LocalFile> = if root.is_file() {
+    let report = if root.is_file() {
         let meta = std::fs::metadata(root)?;
-        vec![crate::scheduler::LocalFile {
+        let files = vec![crate::scheduler::LocalFile {
             path: root.to_path_buf(),
             size: meta.len(),
-        }]
+        }];
+        scan_local_fs_uring_sharded(engine, files.into_iter(), uring_cfg)?
     } else {
         std::fs::read_dir(root).map_err(|e| {
             io::Error::new(
@@ -327,30 +348,39 @@ fn run_fs_uring_sharded(cfg: FsScanConfig, event_format: EventFormat) -> io::Res
             )
         })?;
 
-        let walker = ignore::WalkBuilder::new(root)
-            .follow_links(false)
-            .hidden(false)
-            .git_ignore(false)
-            .git_global(false)
-            .git_exclude(false)
-            .build();
+        let (tx, rx) = crossbeam_channel::bounded::<crate::scheduler::LocalFile>(1024);
+        let walk_root = root.to_path_buf();
+        std::thread::spawn(move || {
+            let walker = ignore::WalkBuilder::new(&walk_root)
+                .follow_links(false)
+                .hidden(false)
+                .git_ignore(false)
+                .git_global(false)
+                .git_exclude(false)
+                .build_parallel();
 
-        walker
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                if !entry.file_type()?.is_file() {
-                    return None;
-                }
-                Some(crate::scheduler::LocalFile {
-                    path: entry.into_path(),
-                    size: 0,
+            walker.run(|| {
+                let tx = tx.clone();
+                Box::new(move |result| {
+                    if let Ok(entry) = result {
+                        if entry.file_type().is_none_or(|ft| !ft.is_file()) {
+                            return ignore::WalkState::Continue;
+                        }
+                        let file = crate::scheduler::LocalFile {
+                            path: entry.into_path(),
+                            size: 0,
+                        };
+                        if tx.send(file).is_err() {
+                            return ignore::WalkState::Quit;
+                        }
+                    }
+                    ignore::WalkState::Continue
                 })
-            })
-            .collect()
-    };
+            });
+        });
 
-    let file_count = files.len() as u64;
-    let report = scan_local_fs_uring_sharded(engine, files.into_iter(), uring_cfg)?;
+        scan_local_fs_uring_sharded(engine, rx.into_iter(), uring_cfg)?
+    };
 
     let scan_elapsed = scan_start.elapsed();
     let total_elapsed = t0.elapsed();
@@ -374,7 +404,7 @@ fn run_fs_uring_sharded(cfg: FsScanConfig, event_format: EventFormat) -> io::Res
 
     eprintln!(
         "files={} chunks={} bytes={} findings={} errors={} init_ms={} scan_ms={} elapsed_ms={} throughput_mib_s={:.2} shards={} backend=uring-sharded",
-        file_count,
+        report.files_enqueued,
         report.metrics.chunks_scanned,
         report.metrics.bytes_scanned,
         report.metrics.findings_emitted,

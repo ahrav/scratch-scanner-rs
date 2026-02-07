@@ -93,12 +93,26 @@ fn parse_fs_args(args: env::ArgsOs) -> io::Result<ScanConfig> {
     let mut no_archives = false;
     let mut anchor_mode = AnchorMode::Manual;
     let mut event_format = EventFormat::Jsonl;
-    let io_backend = super::IoBackend::default();
+    let mut io_backend = super::IoBackend::default();
 
     for arg in args {
         if let Some(flag) = arg.to_str() {
             if let Some(rest) = flag.strip_prefix("--path=") {
                 path = Some(PathBuf::from(rest));
+                continue;
+            }
+            if let Some(rest) = flag.strip_prefix("--backend=") {
+                io_backend = match rest {
+                    "blocking" => super::IoBackend::Blocking,
+                    "sharded" => super::IoBackend::Sharded,
+                    _ => {
+                        eprintln!(
+                            "invalid --backend value: {} (expected blocking|sharded)",
+                            rest
+                        );
+                        std::process::exit(2);
+                    }
+                };
                 continue;
             }
             if let Some(rest) = flag.strip_prefix("--workers=") {
@@ -373,6 +387,7 @@ OPTIONS:
     --decode-depth=<N>      Max decode depth (default: 2)
     --no-archives           Disable archive scanning
     --anchors=manual|derived  Anchor mode (default: manual)
+    --backend=blocking|sharded  I/O backend (default: sharded)
     --event-format=jsonl    Output format (default: jsonl)
     --help, -h              Show this help"
     );
