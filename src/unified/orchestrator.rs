@@ -89,59 +89,41 @@ fn run_fs(cfg: FsScanConfig, event_format: EventFormat) -> io::Result<()> {
         ));
     }
 
-    let report = if root.is_file() {
-        let meta = std::fs::metadata(root)?;
-        let files = vec![crate::scheduler::LocalFile {
-            path: root.to_path_buf(),
-            size: meta.len(),
-        }];
-        scan_local_fs_sharded(engine, files.into_iter(), sharded_cfg)?
-    } else {
-        // Verify directory is readable.
-        std::fs::read_dir(root).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!("Cannot read root directory '{}': {}", root.display(), e),
-            )
-        })?;
+    // WalkBuilder handles both files and directories: if given a file it
+    // yields that single entry, if a directory it walks recursively.
+    let (walk_tx, walk_rx) = crossbeam_channel::bounded::<crate::scheduler::LocalFile>(1024);
 
-        // Streaming parallel walk: discovery starts immediately and runs
-        // concurrently with scanning. Files are sent through a bounded
-        // channel — no upfront Vec<LocalFile> allocation.
-        let (walk_tx, walk_rx) = crossbeam_channel::bounded::<crate::scheduler::LocalFile>(1024);
+    let walk_root = root.to_path_buf();
+    std::thread::spawn(move || {
+        let walker = ignore::WalkBuilder::new(&walk_root)
+            .follow_links(false)
+            .hidden(false)
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .build_parallel();
 
-        let walk_root = root.to_path_buf();
-        std::thread::spawn(move || {
-            let walker = ignore::WalkBuilder::new(&walk_root)
-                .follow_links(false)
-                .hidden(false)
-                .git_ignore(false)
-                .git_global(false)
-                .git_exclude(false)
-                .build_parallel();
-
-            walker.run(|| {
-                let tx = walk_tx.clone();
-                Box::new(move |result| {
-                    if let Ok(entry) = result {
-                        if entry.file_type().is_some_and(|ft| ft.is_file()) {
-                            let file = crate::scheduler::LocalFile {
-                                path: entry.into_path(),
-                                size: 0, // Size checked at open time.
-                            };
-                            if tx.send(file).is_err() {
-                                return ignore::WalkState::Quit;
-                            }
+        walker.run(|| {
+            let tx = walk_tx.clone();
+            Box::new(move |result| {
+                if let Ok(entry) = result {
+                    if entry.file_type().is_some_and(|ft| ft.is_file()) {
+                        let file = crate::scheduler::LocalFile {
+                            path: entry.into_path(),
+                            size: 0, // Size checked at open time.
+                        };
+                        if tx.send(file).is_err() {
+                            return ignore::WalkState::Quit;
                         }
                     }
-                    ignore::WalkState::Continue
-                })
-            });
-            // walk_tx dropped here → walk_rx disconnects → iterator ends
+                }
+                ignore::WalkState::Continue
+            })
         });
+        // walk_tx dropped here → walk_rx disconnects → iterator ends
+    });
 
-        scan_local_fs_sharded(engine, walk_rx.into_iter(), sharded_cfg)?
-    };
+    let report = scan_local_fs_sharded(engine, walk_rx.into_iter(), sharded_cfg)?;
 
     let file_count = report.files_enqueued;
 
