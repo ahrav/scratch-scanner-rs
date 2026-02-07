@@ -885,7 +885,11 @@ impl<'a> BlobIntroWorker<'a> {
             }
 
             self.push_tree(source, &root_oid)?;
-            self.walk_stack(source, oid_index, sink, commit_id)?;
+            match self.walk_stack(source, oid_index, sink, commit_id) {
+                Ok(()) => {}
+                Err(TreeDiffError::Aborted) => break,
+                Err(err) => return Err(err),
+            }
         }
         Ok(())
     }
@@ -973,7 +977,7 @@ impl<'a> BlobIntroWorker<'a> {
             entry_count = entry_count.wrapping_add(1);
             if entry_count & 0xFFF == 0 && self.abort.load(Ordering::Relaxed) {
                 self.reset_run_state();
-                return Ok(());
+                return Err(TreeDiffError::Aborted);
             }
 
             match kind {
@@ -1122,6 +1126,8 @@ pub(super) fn introduce_parallel<'a>(
         (config.tree_diff.max_tree_delta_cache_bytes / worker_count as u32).max(4 * 1024 * 1024); // 4 MB floor
     let per_worker_spill = config.tree_diff.max_tree_spill_bytes / worker_count as u64;
     let per_worker_spill = per_worker_spill.max(64 * 1024 * 1024); // 64 MB floor
+    let per_worker_in_flight =
+        (config.tree_diff.max_tree_bytes_in_flight / worker_count as u64).max(64 * 1024 * 1024); // 64 MB floor
     let per_worker_loose = per_worker_loose_limit(mapping_cfg_max_loose, worker_count);
     let per_worker_path_arena = (mapping_cfg_path_arena_capacity / worker_count as u32)
         .max(64 * 1024)
@@ -1135,6 +1141,7 @@ pub(super) fn introduce_parallel<'a>(
         max_tree_cache_bytes: per_worker_tree_cache,
         max_tree_delta_cache_bytes: per_worker_delta_cache,
         max_tree_spill_bytes: per_worker_spill,
+        max_tree_bytes_in_flight: per_worker_in_flight,
         ..config.tree_diff
     };
 
