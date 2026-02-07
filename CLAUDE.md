@@ -115,3 +115,4 @@ Calculate average throughput delta per repository:
 - Average throughput delta per test repository
 - Criterion benchmark comparison summary
 - Justification for any regression >2%
+Use 'bd' for task tracking
