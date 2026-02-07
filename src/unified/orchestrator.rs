@@ -54,8 +54,12 @@ fn run_fs(cfg: FsScanConfig, event_format: EventFormat) -> io::Result<()> {
 
     let scan_start = Instant::now();
 
-    // Structured event sink: JSONL findings to stdout.
-    let event_sink = build_event_sink(event_format);
+    // Structured event sink: JSONL findings to stdout, or null sink for diagnostics.
+    let event_sink: Arc<dyn super::events::EventSink> = if cfg.null_sink {
+        Arc::new(super::events::NullEventSink)
+    } else {
+        build_event_sink(event_format)
+    };
 
     let mut ps_config = ParallelScanConfig {
         workers: cfg.workers,
@@ -67,7 +71,6 @@ fn run_fs(cfg: FsScanConfig, event_format: EventFormat) -> io::Result<()> {
     if cfg.no_archives {
         ps_config.archive.enabled = false;
     }
-
     let report = parallel_scan_dir(&cfg.root, engine, ps_config)?;
 
     let scan_elapsed = scan_start.elapsed();
@@ -488,6 +491,10 @@ fn print_git_perf_breakdown(report: &git_scan::GitScanReport, config: &GitScanCo
 }
 
 /// Build the detection engine with the given anchor mode and optional decode depth.
+///
+/// Uses the built-in demo rules, transforms, and tuning defaults.
+/// If `decode_depth` is `Some`, it overrides the default max transform
+/// depth (number of Base64 / URL-decode passes the engine will attempt).
 fn build_engine(anchor_mode: AnchorMode, decode_depth: Option<usize>) -> Engine {
     match decode_depth {
         Some(depth) => demo_engine_with_anchor_mode_and_max_transform_depth(anchor_mode, depth),

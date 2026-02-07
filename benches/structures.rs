@@ -1,9 +1,8 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use scanner_rs::stdx::{DynamicBitSet, FixedSet128, ReleasedSet};
+use scanner_rs::stdx::{DynamicBitSet, FixedSet128};
 
 const SET_CAP_POW2: usize = 1 << 14; // 16384 slots
 const FIXED_SET_LOAD: usize = (SET_CAP_POW2 * 3) / 4; // 75% load
-const RELEASED_SET_CAP: usize = 8192;
 const BITSET_BITS: usize = 1 << 16; // 65536 bits
 const BITSET_TOGGLES: usize = 1 << 12; // 4096 toggles
 
@@ -46,15 +45,6 @@ fn make_u128_keys(count: usize, seed: u64) -> Vec<u128> {
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
         out.push(rng.next_u128());
-    }
-    out
-}
-
-fn make_u64_keys(count: usize, seed: u64) -> Vec<u64> {
-    let mut rng = XorShift64::new(seed);
-    let mut out = Vec::with_capacity(count);
-    for _ in 0..count {
-        out.push(rng.next_u64());
     }
     out
 }
@@ -103,28 +93,6 @@ fn bench_fixed_set128(c: &mut Criterion) {
             for &k in &keys {
                 black_box(set.insert(k));
             }
-        })
-    });
-    group.finish();
-}
-
-fn bench_released_set(c: &mut Criterion) {
-    let keys = make_u64_keys(RELEASED_SET_CAP, 0x0f0e_0d0c_0b0a_0908);
-    let mut set = ReleasedSet::with_capacity(RELEASED_SET_CAP);
-
-    let mut group = c.benchmark_group("released_set");
-    group.throughput(Throughput::Elements(keys.len() as u64));
-    group.bench_function("insert_pop", |b| {
-        b.iter(|| {
-            set.clear_retaining_capacity();
-            for &k in &keys {
-                set.insert(k);
-            }
-            let mut acc = 0u64;
-            while let Some(k) = set.pop() {
-                acc ^= k;
-            }
-            black_box(acc);
         })
     });
     group.finish();
@@ -451,12 +419,7 @@ fn bench_bitset_mixed_read_write(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_fixed_set128,
-    bench_released_set,
-    bench_dynamic_bitset,
-);
+criterion_group!(benches, bench_fixed_set128, bench_dynamic_bitset,);
 
 criterion_group!(
     bitset_benches,

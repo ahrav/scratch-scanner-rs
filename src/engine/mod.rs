@@ -64,10 +64,11 @@ mod buffer_scan;
 mod stream_decode;
 mod window_validate;
 
-// Existing modules
+// Supporting modules
 mod helpers;
 mod transform;
-mod vectorscan_prefilter;
+mod vectorscan_prefilter; // Vectorscan/Hyperscan prefilter DBs and FFI callbacks
+mod vs_cache; // On-disk cache for serialized Vectorscan databases
 
 #[cfg(test)]
 mod tests;
@@ -81,3 +82,6 @@ pub use core::{AnchorPlanStats, VectorscanStats};
 
 #[cfg(feature = "bench")]
 pub use core::{bench_find_spans_into, bench_stream_decode_base64, bench_stream_decode_url};
+
+#[cfg(feature = "tiger-harness")]
+pub use vs_cache::fuzz_try_load;

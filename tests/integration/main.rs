@@ -3,6 +3,8 @@
 //! Run with: `cargo test --test integration`
 
 mod anchor_optimization;
+mod archive_scanning;
+mod fs_cli_archives;
 mod git_commit_walk;
 mod git_engine_adapter;
 mod git_inmem_artifacts;

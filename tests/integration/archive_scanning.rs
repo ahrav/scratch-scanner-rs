@@ -3,7 +3,7 @@
 //! # Scope
 //! These tests exercise archive expansion (gzip, tar, tar.gz), virtual path
 //! attribution, boundary overlap, and budget enforcement when using the
-//! `scheduler::local` execution path.
+//! `scheduler::local_fs_owner` execution path.
 //!
 //! # Assumptions
 //! - Findings are emitted as JSONL via the `VecEventSink`:
@@ -20,7 +20,7 @@ use scanner_rs::archive::{
 };
 use scanner_rs::scheduler::engine_stub::{MockEngine, MockRule};
 use scanner_rs::scheduler::engine_trait::{EngineScratch, FindingRecord, ScanEngine};
-use scanner_rs::scheduler::local::{
+use scanner_rs::scheduler::local_fs_owner::{
     scan_local, LocalConfig, LocalFile, LocalReport, VecFileSource,
 };
 use scanner_rs::unified::events::VecEventSink;

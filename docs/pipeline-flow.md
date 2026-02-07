@@ -43,8 +43,8 @@ flowchart LR
         SW["BufWriter<Stdout>"]
     end
 
-    subgraph Pool["BufferPool<br/>capacity: 136"]
-        BP[("2MB Aligned Buffers<br/>NodePoolType")]
+    subgraph Pool["BufferPool<br/>capacity: derived from pool byte target"]
+        BP[("8MiB Aligned Buffers<br/>NodePoolType")]
     end
 
     Path --> WP
@@ -98,7 +98,7 @@ aggregation when archive scanning is enabled.
 - **State**: `active: Option<FileReader>`, `overlap`, `chunk_size`
 - **Behavior**:
   - Opens files via FileTable path lookup
-  - Reads 1MB chunks with configurable overlap
+  - Reads configured chunks with overlap (`PipelineConfig.chunk_size`)
   - Preserves overlap for cross-boundary pattern matching
   - Archive handling is gated by `PipelineConfig.archive` (enabled by default)
   - When enabled, ReaderStage detects archives by extension and header sniff
@@ -154,10 +154,17 @@ sequenceDiagram
 ## Pool Sizing
 
 ```
-PIPE_POOL_CAP = PIPE_CHUNK_RING_CAP + 8
-             = 128 + 8
-             = 136 buffers
-             = 136 * 2MB = 272MB max
+default_pool_capacity =
+  clamp(
+    PIPE_POOL_TARGET_BYTES / BUFFER_LEN_MAX,
+    PIPE_POOL_MIN,
+    PIPE_CHUNK_RING_CAP + 8
+  )
+
+Current defaults:
+  PIPE_POOL_TARGET_BYTES = 256MiB
+  BUFFER_LEN_MAX = 8MiB
+  => default_pool_capacity = 32 buffers (~256MiB aggregate)
 ```
 
 The pool is sized to allow the chunk ring to be full plus a small headroom for in-flight reads.

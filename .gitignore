@@ -58,4 +58,7 @@ docs/throughput_investigation.md
 # Scheduler simulation stress test failures (generated)
 tests/failures/
 
+# Proptest regression files (generated)
+proptest-regressions/
+
 # Scanner scenario tracking (internal progress document)

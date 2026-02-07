@@ -270,7 +270,6 @@ pub struct UringIoStats {
 /// io_uring via `register_buffers`. Handles return buffers to a global free
 /// queue on drop.
 struct FixedBufferPool {
-    buffer_len: usize,
     buffers: Vec<Box<[u8]>>,
     free: ArrayQueue<usize>,
 }
@@ -287,16 +286,7 @@ impl FixedBufferPool {
             free.push(idx).expect("fixed buffer free queue overflow");
         }
 
-        Arc::new(Self {
-            buffer_len,
-            buffers,
-            free,
-        })
-    }
-
-    #[inline]
-    fn buffer_len(&self) -> usize {
-        self.buffer_len
+        Arc::new(Self { buffers, free })
     }
 
     #[inline]
@@ -448,7 +438,6 @@ struct FileToken {
 /// Work item for I/O threads.
 struct FileWork {
     path: PathBuf,
-    size: u64,
     token: Arc<FileToken>,
 }
 
@@ -632,7 +621,9 @@ enum Op {
 
 struct OpenOp {
     file_slot: usize,
+    #[allow(dead_code)]
     path: CString,
+    #[allow(dead_code)]
     open_how: Option<Box<types::OpenHow>>,
 }
 
@@ -655,7 +646,14 @@ struct ReadOp {
 
 /// Drain all in-flight operations before returning.
 ///
-/// SAFETY: This MUST be called before dropping the ring/ops if any operations
+/// Waits for every outstanding CQE and disposes of the associated `Op`.
+/// For `Read` ops the `FixedBufferHandle` is dropped, returning it to the
+/// pool. For `Open` ops with a successful result the returned fd is closed
+/// to prevent leaks. No scan tasks are spawned — this is a shutdown path.
+///
+/// # Safety requirement
+///
+/// This MUST be called before dropping the ring/ops if any operations
 /// are in-flight, otherwise the kernel may write to freed memory.
 fn drain_in_flight(
     ring: &mut IoUring,
@@ -831,9 +829,14 @@ fn io_worker_loop<E: ScanEngine>(
     let mut stopping = false;
     let mut channel_closed = false;
 
+    /// Result of blocking open + fstat for files when io_uring open/stat
+    /// ops are unsupported or the mode is `BlockingOnly`.
     enum BlockingOutcome {
+        /// File opened and sized; ready for read submissions.
         Ready(ReadState),
+        /// File skipped (empty or exceeds `max_file_size`).
         Skipped,
+        /// Open or fstat failed.
         Failed,
     }
 
@@ -1734,7 +1737,7 @@ fn walk_and_send_files(
         });
 
         // Backpressure: bounded channel send blocks here.
-        tx.send(FileWork { path, size, token })
+        tx.send(FileWork { path, token })
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "io threads stopped"))?;
 
         summary.files_enqueued = summary.files_enqueued.saturating_add(1);

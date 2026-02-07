@@ -16,7 +16,7 @@ use crate::api::Base64DecodeStats;
 use super::decode_state::{DecodeSlab, StepArena};
 use super::helpers::{hash128, pow2_at_least};
 use super::hit_pool::{HitAccPool, SpanU32};
-use super::transform::{map_decoded_offset, STREAM_DECODE_CHUNK_BYTES};
+use super::transform::{is_url_trigger, map_decoded_offset, STREAM_DECODE_CHUNK_BYTES};
 use super::vectorscan_prefilter::{VsScratch, VsStreamWindow};
 use super::work_items::{PendingDecodeSpan, PendingWindow, SpanStreamEntry, WorkItem};
 use regex::bytes::CaptureLocations;
@@ -137,7 +137,7 @@ impl RootSpanMapCtx {
 
         let mut has_trigger = false;
         for &b in &encoded[scan_start..scan_end] {
-            if b == b'%' || (plus_to_space && b == b'+') {
+            if is_url_trigger(b, plus_to_space) {
                 has_trigger = true;
                 break;
             }
@@ -190,7 +190,7 @@ impl RootSpanMapCtx {
         }
 
         for (idx, &b) in encoded[span_end..].iter().enumerate() {
-            if b == b'%' || (plus_to_space && b == b'+') {
+            if is_url_trigger(b, plus_to_space) {
                 return Some(self.root_start + span_end + idx + 1);
             }
         }
@@ -532,6 +532,7 @@ impl ScanScratch {
     ///
     /// After the first successful call, capacity validation is skipped because
     /// `Engine` is immutable after construction — all checks are idempotent.
+    #[allow(dead_code)] // Standalone reset entry point for external scratch consumers
     pub(super) fn reset_for_scan(&mut self, engine: &Engine) {
         // ── Per-scan state clears (must always run) ──────────────────────
         self.out.clear();
@@ -950,6 +951,7 @@ impl ScanScratch {
     /// Materialize decode steps for a finding into the scratch buffer.
     ///
     /// The returned slice is valid until the next call that materializes steps.
+    #[allow(dead_code)] // Used by sim_scanner for finding provenance tracking
     pub(crate) fn materialize_decode_steps(&mut self, step_id: StepId) -> &[DecodeStep] {
         self.step_arena.materialize(step_id, &mut self.steps_buf);
         self.steps_buf.as_slice()
@@ -1021,6 +1023,7 @@ impl ScanScratch {
     }
 
     /// Returns the drop-boundary offsets aligned 1:1 with [`findings()`].
+    #[allow(dead_code)] // Used by sim_scanner for overlap deduplication
     pub(crate) fn drop_hint_end(&self) -> &[u64] {
         self.drop_hint_end.as_slice()
     }
@@ -1051,6 +1054,7 @@ impl ScanScratch {
     }
 
     /// Records a finding using `root_hint_end` as the default drop boundary.
+    #[allow(dead_code)] // Convenience wrapper for push_finding_with_drop_hint
     pub(super) fn push_finding(&mut self, rec: FindingRec, norm_hash: NormHash) {
         self.push_finding_with_drop_hint(rec, norm_hash, rec.root_hint_end, rec.dedupe_with_span);
     }

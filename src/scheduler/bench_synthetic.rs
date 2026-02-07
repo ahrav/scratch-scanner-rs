@@ -32,7 +32,7 @@
 //! platform. Cross-platform determinism is NOT guaranteed due to floating-point
 //! differences in size distribution sampling.
 
-use super::local::{LocalFile, VecFileSource};
+use super::local_fs_owner::{LocalFile, VecFileSource};
 use super::rng::XorShift64;
 use crate::perf_stats;
 use std::fs::{self, File};

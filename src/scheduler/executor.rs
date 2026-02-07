@@ -983,11 +983,19 @@ fn worker_loop<T, S, RunnerFn>(
             WorkerStepResult::RanTask { .. } => {
                 perf_stats::sat_add_u64(&mut ctx.metrics.tasks_executed, 1);
             }
-            WorkerStepResult::NoWork => {}
-            WorkerStepResult::ShouldPark { timeout } => ctx.parker.park_timeout(timeout),
+            WorkerStepResult::NoWork => {
+                ctx.metrics.idle_spins = ctx.metrics.idle_spins.saturating_add(1);
+            }
+            WorkerStepResult::ShouldPark { timeout } => {
+                ctx.metrics.park_count = ctx.metrics.park_count.saturating_add(1);
+                ctx.parker.park_timeout(timeout);
+            }
             WorkerStepResult::ExitDone | WorkerStepResult::ExitPanicked => break,
         }
     }
+
+    // Copy yield count from TieredIdle into worker metrics for reporting.
+    ctx.metrics.yield_count = ctx.metrics.yield_count.saturating_add(idle.yield_count);
 }
 
 /// Tiered idle strategy used by the production worker loop.
@@ -996,11 +1004,15 @@ fn worker_loop<T, S, RunnerFn>(
 /// park with timeout.
 struct TieredIdle {
     idle_rounds: u32,
+    yield_count: u64,
 }
 
 impl TieredIdle {
     fn new() -> Self {
-        Self { idle_rounds: 0 }
+        Self {
+            idle_rounds: 0,
+            yield_count: 0,
+        }
     }
 }
 
@@ -1017,7 +1029,11 @@ impl IdleHooks for TieredIdle {
             return IdleAction::Continue;
         }
 
+        // Yield every 16th iteration past the spin threshold.
+        // 16 is a heuristic: frequent enough to avoid monopolising the core,
+        // rare enough that the yield syscall doesn't dominate idle cost.
         if (self.idle_rounds & 0xF) == 0 {
+            self.yield_count = self.yield_count.saturating_add(1);
             thread::yield_now();
         }
 

@@ -20,7 +20,7 @@ use scanner_rs::scheduler::bench_executor::{ExecutorMicrobench, ExecutorMicroben
 use scanner_rs::scheduler::bench_local::LocalScanBenchmark;
 use scanner_rs::scheduler::bench_synthetic::{FileSizeDistribution, SyntheticConfig};
 use scanner_rs::scheduler::engine_stub::{MockEngine, MockRule};
-use scanner_rs::scheduler::local::LocalConfig;
+use scanner_rs::scheduler::local_fs_owner::LocalConfig;
 
 // ============================================================================
 // Argument Parsing

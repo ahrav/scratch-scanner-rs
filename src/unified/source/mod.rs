@@ -7,8 +7,8 @@
 //!
 //! Both source modes delegate to their existing execution backends:
 //!
-//! - **FS** — `parallel_scan_dir()` with an `EventSink` wired through
-//!   `ParallelScanConfig`. Findings are emitted as structured JSONL.
+//! - **FS** — `parallel_scan_dir()` with iterator-based walking and
+//!   the local filesystem scheduler.
 //!
 //! - **Git** — `run_git_scan()` with an `EventSink` threaded through
 //!   to `EngineAdapter`. Findings stream during pack/loose scanning.

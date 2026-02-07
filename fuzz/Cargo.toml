@@ -13,6 +13,7 @@ libfuzzer-sys = "0.4"
 base64 = "0.22"
 regex = { version = "1", features = ["std"] }
 memchr = "2"
+tempfile = "3"
 
 [dependencies.scanner-rs]
 path = ".."
@@ -70,6 +71,13 @@ bench = false
 [[bin]]
 name = "fuzz_atomic_bitset"
 path = "fuzz_targets/fuzz_atomic_bitset.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_vs_cache_load"
+path = "fuzz_targets/fuzz_vs_cache_load.rs"
 test = false
 doc = false
 bench = false

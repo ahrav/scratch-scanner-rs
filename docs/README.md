@@ -25,6 +25,7 @@ Documentation index for the scanner-rs secret scanning engine. This guide helps 
 | [architecture.md](architecture.md) | Data flow | Walker→Reader→Scanner→Output, transform worklist |
 | [pipeline-flow.md](pipeline-flow.md) | 4-stage cooperative pipeline | Ring buffers, backpressure, RAII |
 | [pipeline-state-machine.md](pipeline-state-machine.md) | State transitions & termination | Reverse pump order, stall detection |
+| [git-scanning.md](git-scanning.md) | End-to-end Git scanning pipeline | Pipeline stages, persistence contract, ODB-blob mode |
 
 #### Detection Engine
 | Document | Focus | Key Concepts |
@@ -57,7 +58,6 @@ Documentation index for the scanner-rs secret scanning engine. This guide helps 
 #### Core Scheduler
 | Document | Module | Description |
 |----------|--------|-------------|
-| [scheduler-local.md](scheduler-local.md) | `src/scheduler/local.rs` | FileSource trait, blocking reads, overlap carry, backpressure |
 | [scheduler-task-graph.md](scheduler-task-graph.md) | `src/scheduler/task_graph.rs` | Object lifecycle FSM (enumerate→fetch→scan→done), work-conserving semantics |
 
 #### Scheduler Integration
@@ -81,8 +81,18 @@ Documentation index for the scanner-rs secret scanning engine. This guide helps 
 
 | Document | Focus | Key Concepts |
 |----------|-------|--------------|
-| [memory-management.md](memory-management.md) | Buffer lifecycle & pools | BufferPool, RAII, 136×2MB buffers, DecodeSlab, ScanScratch |
+| [memory-management.md](memory-management.md) | Buffer lifecycle & pools | BufferPool, RAII, 8MiB fixed buffers sized from pool byte targets, DecodeSlab, ScanScratch |
 | [kani-verification.md](kani-verification.md) | Formal verification | Kani model checking for TimingWheel (8 proofs), Bitset2 (5 proofs) |
+
+---
+
+### 6. Testing Harnesses
+
+| Document | Focus | Key Concepts |
+|----------|-------|--------------|
+| [scanner_harness_modes.md](scanner_harness_modes.md) | Mode 1 (synthetic stress) vs Mode 2 (real ruleset) | Test strategy overview |
+| [real_rules_harness_plan.md](real_rules_harness_plan.md) | Real-ruleset baseline snapshot approach | Baseline workflow, normalization |
+| [real_rules_fixture_design.md](real_rules_fixture_design.md) | Fixture corpus design | Coverage axes, rule families |
 
 ---
 
@@ -95,7 +105,7 @@ Documentation index for the scanner-rs secret scanning engine. This guide helps 
 | Learn how detection works | [detection-engine.md](detection-engine.md) |
 | Add a new detection rule | [detection-rules.md](detection-rules.md) |
 | Understand the pipeline | [pipeline-flow.md](pipeline-flow.md) → [pipeline-state-machine.md](pipeline-state-machine.md) |
-| Work on the scheduler | [scheduler-local.md](scheduler-local.md) → [scheduler-task-graph.md](scheduler-task-graph.md) |
+| Work on the scheduler | [scheduler-engine-abstraction.md](scheduler-engine-abstraction.md) → [scheduler-task-graph.md](scheduler-task-graph.md) |
 | Debug memory issues | [memory-management.md](memory-management.md) |
 | Add transform support | [engine-transforms.md](engine-transforms.md) → [transform-chain.md](transform-chain.md) |
 | Understand window validation | [engine-window-validation.md](engine-window-validation.md) |

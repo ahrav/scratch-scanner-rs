@@ -75,40 +75,22 @@ impl Variant {
 /// into `u32` to keep the fanout table cache-friendly and avoid extra pointer
 /// chasing.
 ///
-/// Flags encoded in the low bits record whether the anchor is match-start
-/// aligned (required by fast validators) and whether keyword gates are implied
-/// by this specific anchor (so the validator can remain authoritative).
-///
-/// Layout (low bits): [variant (2)] [match_start] [keyword_implied] [rule_id...]
+/// Layout (low bits): [variant (2)] [rule_id...]
 ///
 /// # Invariants
 /// - `rule_id` fits in the upper bits after `VARIANT_SHIFT`.
-/// - The low-bit layout is stable and must match `variant()` and flag accessors.
+/// - The low-bit layout is stable and must match `variant()`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Target(u32);
 
 impl Target {
     const VARIANT_MASK: u32 = 0b11;
-    const MATCH_START_MASK: u32 = 1 << 2;
-    const KEYWORD_IMPLIED_MASK: u32 = 1 << 3;
-    const VARIANT_SHIFT: u32 = 4;
+    const VARIANT_SHIFT: u32 = 2;
 
-    /// Pack a (rule_id, variant) and small flags into a single `u32`.
-    pub(super) fn new(
-        rule_id: u32,
-        variant: Variant,
-        match_start: bool,
-        keyword_implied: bool,
-    ) -> Self {
+    /// Pack a (rule_id, variant) into a single `u32`.
+    pub(super) fn new(rule_id: u32, variant: Variant) -> Self {
         assert!(rule_id <= (u32::MAX >> Self::VARIANT_SHIFT));
-        let mut v = (rule_id << Self::VARIANT_SHIFT) | variant.idx() as u32;
-        if match_start {
-            v |= Self::MATCH_START_MASK;
-        }
-        if keyword_implied {
-            v |= Self::KEYWORD_IMPLIED_MASK;
-        }
-        Self(v)
+        Self((rule_id << Self::VARIANT_SHIFT) | variant.idx() as u32)
     }
 
     pub(super) fn rule_id(self) -> usize {
@@ -483,19 +465,10 @@ mod tests {
         let mut map: AHashMap<Vec<u8>, Vec<Target>> = AHashMap::new();
         map.insert(
             b"b".to_vec(),
-            vec![
-                Target::new(2, Variant::Raw, false, false),
-                Target::new(1, Variant::Raw, false, false),
-            ],
+            vec![Target::new(2, Variant::Raw), Target::new(1, Variant::Raw)],
         );
-        map.insert(
-            b"a".to_vec(),
-            vec![Target::new(3, Variant::Utf16Le, false, false)],
-        );
-        map.insert(
-            b"aa".to_vec(),
-            vec![Target::new(1, Variant::Raw, true, false)],
-        );
+        map.insert(b"a".to_vec(), vec![Target::new(3, Variant::Utf16Le)]);
+        map.insert(b"aa".to_vec(), vec![Target::new(1, Variant::Raw)]);
 
         let (patterns, flat, offsets) = map_to_patterns(map);
 
@@ -504,10 +477,10 @@ mod tests {
         assert_eq!(
             flat,
             vec![
-                Target::new(3, Variant::Utf16Le, false, false),
-                Target::new(1, Variant::Raw, true, false),
-                Target::new(1, Variant::Raw, false, false),
-                Target::new(2, Variant::Raw, false, false),
+                Target::new(3, Variant::Utf16Le),
+                Target::new(1, Variant::Raw),
+                Target::new(1, Variant::Raw),
+                Target::new(2, Variant::Raw),
             ]
         );
     }

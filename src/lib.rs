@@ -1,4 +1,3 @@
-#![allow(dead_code)] // Public API surface is intentionally broader than internal use.
 //! High-throughput content scanner with bounded decoding and explicit provenance.
 //!
 //! ## Scope
@@ -25,7 +24,6 @@
 //! ## Notable entry points
 //! - `Engine` / `ScanScratch`: low-level chunk scanning.
 //! - `ScannerRuntime` / `ScannerConfig`: staged pipeline for file scanning.
-//! - `AsyncScanner` and platform scanners: async file scanning (platform-gated).
 //! - `RuleSpec`, `TwoPhaseSpec`, `TransformConfig`: rule and transform definitions.
 //! - `FindingRec` (hot-path) and `Finding` (materialized output).
 //! - `git_scan`: Git repository scanning pipeline with persistence support.
@@ -38,7 +36,6 @@
 //! For a longer design walkthrough, see `docs/architecture.md`.
 
 pub mod archive;
-pub mod async_io;
 pub mod b64_yara_gate;
 pub mod git_scan;
 pub mod lsm;
@@ -103,25 +100,21 @@ pub use demo::{
     demo_rules, demo_transforms, demo_tuning, AnchorMode,
 };
 
-/// Returns the built-in gitleaks rule set (bench feature only).
-#[cfg(feature = "bench")]
+/// Returns the built-in gitleaks rule set.
+///
+/// Gated behind `bench` or `real-rules-harness` to avoid shipping in production.
+#[cfg(any(feature = "bench", feature = "real-rules-harness"))]
 pub fn gitleaks_rules() -> Vec<RuleSpec> {
     crate::gitleaks_rules::gitleaks_rules()
 }
 
+#[cfg(feature = "tiger-harness")]
+pub use engine::fuzz_try_load;
 #[cfg(feature = "bench")]
 pub use engine::{bench_find_spans_into, bench_stream_decode_base64, bench_stream_decode_url};
 #[cfg(feature = "stats")]
 pub use engine::{AnchorPlanStats, VectorscanStats};
 pub use engine::{Engine, NormHash, ScanScratch};
-
-pub use async_io::AsyncIoConfig;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub use async_io::AsyncScanner;
-#[cfg(target_os = "linux")]
-pub use async_io::UringScanner;
-#[cfg(target_os = "macos")]
-pub use async_io::{AioScanner, MacosAioScanner};
 
 pub use runtime::{
     read_file_chunks, BufferHandle, BufferPool, Chunk, FileTable, ScannerConfig, ScannerRuntime,

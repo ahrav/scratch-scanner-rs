@@ -2,6 +2,17 @@
 
 Buffer lifecycle and pool management in scanner-rs.
 
+## Unified FS Owner-Compute Model
+
+The unified filesystem entrypoint (`scanner-rs scan fs`) now uses
+`src/scheduler/local_fs_owner.rs`:
+
+- One thread per worker.
+- Round-robin dispatch assigns discovered files to workers.
+- Each worker owns and reuses its own chunk buffer, overlap state, pending
+  findings vector, and scan scratch.
+- There is no cross-thread chunk handoff between I/O and scan stages.
+
 ## Multi-Core Production Memory Model
 
 The production multi-core scanner (`scan_local`) allocates memory at startup
@@ -54,9 +65,13 @@ ParallelScanConfig {
 
 After startup allocation, the scan phase is allocation-free:
 - All per-worker scratch is pre-allocated (ScanScratch, LocalScratch)
-- Buffer pool provides fixed I/O buffers (TsBufferPool)
+- Unified FS owner-compute workers reuse worker-local I/O buffers
 - Findings use pre-sized vectors that are reused across chunks
 - Archive scanning reuses `archive::scan::ArchiveScratch` buffers (path builders, tar/zip cursors, gzip header/name buffers) and per-sink scratch for entry scanning
+
+Startup may perform best-effort Vectorscan DB cache I/O (deserialize on hit,
+serialize on miss) for raw prefilter and decoded-stream prefilter databases.
+This affects startup latency only; hot-path scan memory behavior is unchanged.
 
 Path storage is also bounded: `FileTable` maintains a fixed-capacity byte arena
 for Unix paths. Archive expansion uses fallible `try_*` insertion APIs plus
@@ -75,8 +90,6 @@ scratch vectors.
 
 Git scanning still retains per-run metadata required for deterministic
 finalize/persist (`ScannedBlobs`), but finding emission to stdout is streamed.
-See [`scanner-unification.md`](scanner-unification.md).
-
 ---
 
 ## Git Tree Loading Budgets
@@ -181,8 +194,8 @@ ODB-blob mode allocates fixed-capacity data structures once at startup:
   loose candidate budget.
 - **Path builder**: reusable path buffer + segment stack with a hard
   `MAX_PATH_LEN` guard (4096 bytes) to avoid per-entry allocation.
-- **Symbol table (planned)**: interns filename segments to reduce repeated
-  allocations and improve cache locality during deep tree traversal.
+- **Path bytes storage**: path bytes are stored in `ByteArena` slabs for
+  deterministic growth and reset behavior across large traversals.
 - **Pack candidate collector**: bounded `Vec<PackCandidate>`/`Vec<LooseCandidate>`
   sized by `MappingBridgeConfig.max_*_candidates`. In ODB-blob mode the runner
   raises `max_packed_candidates` to at least `midx.object_count()` and scales
@@ -304,21 +317,21 @@ verify no heap activity after warmup.
 ## Single-Threaded Pipeline Memory Model
 
 > **Note**: The diagrams below describe the single-threaded `Pipeline` API, which uses
-> different buffer sizes (2 MiB vs 256 KiB). For production multi-core scanning, see
+> different sizing defaults than the owner-compute scheduler. For production multi-core scanning, see
 > the section above.
 
 ```mermaid
 flowchart TB
     subgraph Init["Initialization"]
-        PoolInit["BufferPool::new(136)"]
-        NodeInit["NodePoolType::init(136)"]
-        BitInit["DynamicBitSet::empty(136)"]
-        Alloc["alloc(136 * 2MB, 4096)"]
+        PoolInit["BufferPool::new(default_pool_capacity())"]
+        NodeInit["NodePoolType::init(pool_cap)"]
+        BitInit["DynamicBitSet::empty(pool_cap)"]
+        Alloc["alloc(pool_cap * 8MiB, 4096)"]
     end
 
     subgraph Pool["BufferPool State"]
         Inner["BufferPoolInner"]
-        NodePool["NodePoolType<br/>2MB nodes, 4KB align"]
+        NodePool["NodePoolType<br/>BUFFER_LEN_MAX nodes, 4KB align"]
         Available["available: Cell&lt;u32&gt;"]
         Bitset["DynamicBitSet<br/>free slot tracking"]
     end
@@ -437,17 +450,17 @@ classDiagram
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                    NodePoolType Buffer                           │
-│                    (136 * 2MB = 272MB)                          │
+│                    (pool_cap * 8MiB)                            │
 ├─────────────┬─────────────┬─────────────┬───────┬─────────────┤
-│   Node 0    │   Node 1    │   Node 2    │  ...  │   Node 135  │
-│   2MB       │   2MB       │   2MB       │       │   2MB       │
+│   Node 0    │   Node 1    │   Node 2    │  ...  │   Node N-1  │
+│   8MiB      │   8MiB      │   8MiB      │       │   8MiB      │
 │   align=4K  │   align=4K  │   align=4K  │       │   align=4K  │
 └─────────────┴─────────────┴─────────────┴───────┴─────────────┘
 
-DynamicBitSet (136 bits = 3 u64 words):
+DynamicBitSet (pool_cap bits):
 ┌─────────────────────────────────────────────────────────────────┐
-│ word[0]: bits 0-63    │ word[1]: bits 64-127 │ word[2]: 128-135│
-│ 1=free, 0=acquired    │                      │ (8 valid bits)  │
+│ word[0..k]: free-slot bitmap                                   │
+│ 1=free, 0=acquired                                             │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -463,16 +476,18 @@ The pool is deliberately large and aligned:
 - **Predictable reclamation**: `BufferHandle` is RAII; dropping the chunk is the
   only way to return a buffer. This makes lifecycle bugs easy to spot.
 
-If you need a smaller footprint, see `docs/perf.md` for sizing trade-offs.
+To reduce memory footprint, tune pipeline `chunk_size` and
+`PIPE_POOL_TARGET_BYTES` based on workload.
 
 ## Constants
 
 ```rust
-pub const BUFFER_LEN_MAX: usize = 2 * 1024 * 1024;  // 2MB per buffer
+pub const BUFFER_LEN_MAX: usize = 8 * 1024 * 1024;  // 8MiB per buffer
 pub const BUFFER_ALIGN: usize = 4096;               // 4KB alignment
 
 pub const PIPE_CHUNK_RING_CAP: usize = 128;         // Max chunks in flight
-pub const PIPE_POOL_CAP: usize = PIPE_CHUNK_RING_CAP + 8;  // 136 buffers
+pub const PIPE_POOL_TARGET_BYTES: usize = 256 * 1024 * 1024;
+pub const PIPE_POOL_MIN: usize = 16;
 ```
 
 ## Chunk Structure

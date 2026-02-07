@@ -125,8 +125,6 @@ impl Engine {
         step_id: StepId,
         root_hint: Option<Range<usize>>,
         depth: usize,
-        base_offset: u64,
-        file_id: FileId,
         scratch: &mut ScanScratch,
     ) {
         if enc.len() < tc.min_len {
@@ -182,8 +180,6 @@ impl Engine {
             depth as u8,
         ));
         scratch.work_items_enqueued = scratch.work_items_enqueued.saturating_add(1);
-
-        let _ = (base_offset, file_id, transform_idx);
     }
 
     /// Re-decodes the decoded-byte window `[lo, hi)` into `out`.
@@ -989,8 +985,6 @@ impl Engine {
                 step_id,
                 root_hint,
                 depth,
-                base_offset,
-                file_id,
                 scratch,
             );
             return;
@@ -1233,8 +1227,6 @@ impl Engine {
                 step_id,
                 root_hint,
                 depth,
-                base_offset,
-                file_id,
                 scratch,
             );
             return;

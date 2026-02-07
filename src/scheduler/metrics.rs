@@ -76,6 +76,13 @@ impl Default for Log2Hist {
 }
 
 impl Log2Hist {
+    /// Whether histogram recording is active.
+    ///
+    /// Requires both `feature = "perf-stats"` AND `debug_assertions`.
+    /// The feature gate lets release builds opt-in to the code, while the
+    /// debug-assertions guard ensures the recording paths (wrapping adds,
+    /// unchecked indexing) are exercised only in builds where overflow and
+    /// bounds-check issues would surface as panics rather than silent UB.
     #[inline(always)]
     fn recording_enabled() -> bool {
         cfg!(all(feature = "perf-stats", debug_assertions))
@@ -305,9 +312,14 @@ pub struct WorkerMetricsLocal {
     pub io_errors: u64,
     /// Total findings emitted by this worker.
     pub findings_emitted: u64,
-    // Padding to separate from histograms
-    _pad: [u64; 3],
-    // 8 * 8 = 64 bytes (second cache line)
+    /// Cumulative nanoseconds spent in open + stat syscalls (perf-stats only).
+    pub open_stat_ns: u64,
+    /// Cumulative nanoseconds spent in read syscalls (perf-stats only).
+    pub read_ns: u64,
+    /// Cumulative nanoseconds spent in scan_chunk_into (perf-stats only).
+    pub scan_ns: u64,
+    /// Times worker yielded to OS scheduler (TieredIdle yield path).
+    pub yield_count: u64,
 
     // ===== COLD DATA (histograms - rarely read during execution) =====
     /// Time-in-queue observations in nanoseconds.
@@ -341,7 +353,10 @@ impl WorkerMetricsLocal {
             park_count: 0,
             io_errors: 0,
             findings_emitted: 0,
-            _pad: [0; 3],
+            open_stat_ns: 0,
+            read_ns: 0,
+            scan_ns: 0,
+            yield_count: 0,
             queue_time_ns: Log2Hist::new(),
             task_time_ns: Log2Hist::new(),
             archive: ArchiveStats::default(),
@@ -432,12 +447,21 @@ pub struct MetricsSnapshot {
     pub idle_spins: u64,
     /// Total park count.
     pub park_count: u64,
+    /// Total yield count (TieredIdle yield path).
+    pub yield_count: u64,
     /// Total I/O errors (file open, read, metadata failures).
     pub io_errors: u64,
     /// Total findings emitted across all workers.
     pub findings_emitted: u64,
     /// Aggregate archive scanning outcomes.
     pub archive: ArchiveStats,
+
+    /// Cumulative nanoseconds spent in open + stat syscalls (always merged for diagnostics).
+    pub open_stat_ns: u64,
+    /// Cumulative nanoseconds spent in read syscalls (always merged for diagnostics).
+    pub read_ns: u64,
+    /// Cumulative nanoseconds spent in scan_chunk_into (always merged for diagnostics).
+    pub scan_ns: u64,
 
     /// Number of workers merged.
     pub worker_count: u32,
@@ -467,9 +491,13 @@ impl MetricsSnapshot {
             task_time_ns: Log2Hist::new(),
             idle_spins: 0,
             park_count: 0,
+            yield_count: 0,
             io_errors: 0,
             findings_emitted: 0,
             archive: ArchiveStats::default(),
+            open_stat_ns: 0,
+            read_ns: 0,
+            scan_ns: 0,
             worker_count: 0,
             duration_ns: 0,
         }
@@ -493,6 +521,14 @@ impl MetricsSnapshot {
         self.findings_emitted = self.findings_emitted.wrapping_add(w.findings_emitted);
         self.worker_count = self.worker_count.wrapping_add(1);
 
+        // Timing fields — always merged for diagnostics (not gated behind perf-stats).
+        self.open_stat_ns = self.open_stat_ns.wrapping_add(w.open_stat_ns);
+        self.read_ns = self.read_ns.wrapping_add(w.read_ns);
+        self.scan_ns = self.scan_ns.wrapping_add(w.scan_ns);
+        self.idle_spins = self.idle_spins.wrapping_add(w.idle_spins);
+        self.park_count = self.park_count.wrapping_add(w.park_count);
+        self.yield_count = self.yield_count.wrapping_add(w.yield_count);
+
         // Perf-only metrics — gated.
         if !Self::recording_enabled() {
             return;
@@ -509,8 +545,6 @@ impl MetricsSnapshot {
         self.queue_time_ns.merge(&w.queue_time_ns);
         self.task_time_ns.merge(&w.task_time_ns);
 
-        self.idle_spins = self.idle_spins.wrapping_add(w.idle_spins);
-        self.park_count = self.park_count.wrapping_add(w.park_count);
         self.archive.merge_from(&w.archive);
     }
 

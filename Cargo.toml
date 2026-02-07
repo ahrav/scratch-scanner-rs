@@ -26,7 +26,6 @@ blake3 = "1.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", optional = true }
 gix-commitgraph = "0.29"
-gix-hash = "0.19"
 rocksdb = { version = "0.22", optional = true }
 
 # Directory walking and parallel scanning
@@ -60,6 +59,7 @@ io-uring = []  # Enable io_uring scanner on Linux
 scheduler-sim = []  # Enable longer-running scheduler simulation tests
 rocksdb = ["dep:rocksdb"]
 git-perf = ["perf-stats"]  # Git pack-exec timing probes (implies perf-stats)
+real-rules-harness = []  # Real-ruleset regression harness (simulation test)
 
 [dev-dependencies]
 base64 = "0.22"
@@ -98,10 +98,6 @@ harness = false
 
 [[bench]]
 name = "fixed_vec"
-harness = false
-
-[[bench]]
-name = "released_set"
 harness = false
 
 [[bench]]
@@ -152,6 +148,14 @@ harness = false
 
 [[bench]]
 name = "throughput_comparison"
+harness = false
+
+[[bench]]
+name = "regex_complexity"
+harness = false
+
+[[bench]]
+name = "rule_isolation"
 harness = false
 
 [profile.dev]

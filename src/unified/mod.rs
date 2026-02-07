@@ -68,6 +68,9 @@ pub struct FsScanConfig {
     pub no_archives: bool,
     /// Anchor extraction mode for rule matching.
     pub anchor_mode: AnchorMode,
+    /// Use a no-op event sink (drops all findings). For measuring scan overhead
+    /// without JSON encoding + stdout I/O.
+    pub null_sink: bool,
 }
 
 /// Git repository scan configuration.

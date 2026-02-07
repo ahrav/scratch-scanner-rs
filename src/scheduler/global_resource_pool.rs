@@ -134,6 +134,7 @@ enum SpillGrant {
     /// Spilling is unlimited (no slots configured in pool).
     Unlimited,
     /// Spilling is permitted via a counted slot.
+    #[allow(dead_code)] // Used by upcoming remote scanning pipeline
     Limited(CountPermit),
 }
 

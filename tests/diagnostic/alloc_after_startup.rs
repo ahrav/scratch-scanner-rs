@@ -7,9 +7,6 @@
 //! IMPORTANT: Use `--test-threads=1` because tests share global allocation
 //! counters and will interfere with each other if run in parallel.
 
-use scanner_rs::pipeline::{
-    Pipeline, PipelineConfig, PIPE_CHUNK_RING_CAP, PIPE_FILE_RING_CAP, PIPE_OUT_RING_CAP,
-};
 use scanner_rs::scheduler::{scan_local, LocalConfig, LocalFile, VecFileSource};
 use scanner_rs::{demo_engine, ScannerConfig, ScannerRuntime};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -247,100 +244,6 @@ fn allocs_after_startup_in_scanner_runtime_scan_file_sync() -> io::Result<()> {
     assert!(
         counts.alloc_bytes <= MAX_ALLOC_BYTES,
         "expected <= {} bytes allocated after warm-up during scan_file_sync, got {}",
-        MAX_ALLOC_BYTES,
-        counts.alloc_bytes
-    );
-
-    Ok(())
-}
-
-#[test]
-#[ignore]
-fn allocs_after_startup_in_pipeline_scan_path() -> io::Result<()> {
-    let tmp = make_temp_dir("scanner_alloc_pipe")?;
-    let _ = write_sample_file(&tmp, "sample.txt", b"xoxr-1234567890abcdef")?;
-
-    let engine = Arc::new(demo_engine());
-    let mut pipeline: Pipeline<PIPE_FILE_RING_CAP, PIPE_CHUNK_RING_CAP, PIPE_OUT_RING_CAP> =
-        Pipeline::new(engine, PipelineConfig::default());
-
-    // Warm up external caches before counting allocations.
-    pipeline.scan_path(tmp.path())?;
-
-    reset_counts();
-    pipeline.scan_path(tmp.path())?;
-    let counts = snapshot_counts();
-
-    eprintln!(
-        "Pipeline::scan_path allocs: calls={} bytes={} reallocs={} realloc_bytes={} deallocs={}",
-        counts.alloc_calls,
-        counts.alloc_bytes,
-        counts.realloc_calls,
-        counts.realloc_bytes,
-        counts.dealloc_calls
-    );
-
-    // Allow minimal allocations from regex library internals.
-    const MAX_ALLOC_CALLS: usize = 10;
-    const MAX_ALLOC_BYTES: usize = 1024;
-
-    assert!(
-        counts.total_alloc_calls() <= MAX_ALLOC_CALLS,
-        "expected <= {} allocation calls after warm-up during pipeline scan, got {}",
-        MAX_ALLOC_CALLS,
-        counts.total_alloc_calls()
-    );
-
-    assert!(
-        counts.alloc_bytes <= MAX_ALLOC_BYTES,
-        "expected <= {} bytes allocated after warm-up during pipeline scan, got {}",
-        MAX_ALLOC_BYTES,
-        counts.alloc_bytes
-    );
-
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-#[ignore]
-fn allocs_after_startup_in_macos_aio_scan_path() -> io::Result<()> {
-    let tmp = make_temp_dir("scanner_alloc_aio")?;
-    let _ = write_sample_file(&tmp, "sample.txt", b"xoxa-1234567890abcdef")?;
-
-    let engine = Arc::new(demo_engine());
-    let mut scanner = scanner_rs::AioScanner::new(engine, scanner_rs::AsyncIoConfig::default())?;
-
-    // Warm up external caches before counting allocations.
-    scanner.scan_path(tmp.path())?;
-
-    reset_counts();
-    scanner.scan_path(tmp.path())?;
-    let counts = snapshot_counts();
-
-    eprintln!(
-        "MacosAioScanner::scan_path allocs: calls={} bytes={} reallocs={} realloc_bytes={} deallocs={}",
-        counts.alloc_calls,
-        counts.alloc_bytes,
-        counts.realloc_calls,
-        counts.realloc_bytes,
-        counts.dealloc_calls
-    );
-
-    // Allow minimal allocations from regex library internals.
-    const MAX_ALLOC_CALLS: usize = 10;
-    const MAX_ALLOC_BYTES: usize = 1024;
-
-    assert!(
-        counts.total_alloc_calls() <= MAX_ALLOC_CALLS,
-        "expected <= {} allocation calls after warm-up during macOS AIO scan, got {}",
-        MAX_ALLOC_CALLS,
-        counts.total_alloc_calls()
-    );
-
-    assert!(
-        counts.alloc_bytes <= MAX_ALLOC_BYTES,
-        "expected <= {} bytes allocated after warm-up during macOS AIO scan, got {}",
         MAX_ALLOC_BYTES,
         counts.alloc_bytes
     );

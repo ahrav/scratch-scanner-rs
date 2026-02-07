@@ -62,7 +62,7 @@
 //! println!("{}", report.detailed());
 //! ```
 
-use super::local::{scan_local, FileSource, LocalConfig, LocalReport, VecFileSource};
+use super::local_fs_owner::{scan_local, FileSource, LocalConfig, LocalReport, VecFileSource};
 use crate::scheduler::bench::{BenchIterMetrics, Benchmarkable};
 use crate::scheduler::bench_synthetic::{SyntheticConfig, SyntheticFileSource};
 use crate::scheduler::engine_stub::MockEngine;
@@ -299,7 +299,7 @@ struct BoxedFileSourceAdapter {
 }
 
 impl FileSource for BoxedFileSourceAdapter {
-    fn next_file(&mut self) -> Option<super::local::LocalFile> {
+    fn next_file(&mut self) -> Option<super::local_fs_owner::LocalFile> {
         self.inner.next_file()
     }
 }

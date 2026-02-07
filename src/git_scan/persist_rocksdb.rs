@@ -17,6 +17,7 @@ use super::finalize::build_ref_wm_key;
 #[cfg(feature = "rocksdb")]
 use super::finalize::FinalizeOutcome;
 use super::finalize::FinalizeOutput;
+#[cfg(any(feature = "rocksdb", test))]
 use super::finalize::NS_SEEN_BLOB;
 use super::object_id::OidBytes;
 use super::persist::PersistenceStore;
@@ -47,6 +48,7 @@ pub struct RocksDbStore {
 }
 
 /// Returns the byte length of a seen-blob key for the given OID length.
+#[cfg(any(feature = "rocksdb", test))]
 fn seen_blob_key_len(oid_len: u8) -> usize {
     3 + 8 + 32 + oid_len as usize
 }
@@ -54,6 +56,7 @@ fn seen_blob_key_len(oid_len: u8) -> usize {
 /// Writes a `seen_blob` key into the provided buffer.
 ///
 /// Layout: namespace prefix + repo_id + policy_hash + oid bytes.
+#[cfg(any(feature = "rocksdb", test))]
 fn write_seen_blob_key(buf: &mut [u8], repo_id: u64, policy_hash: &[u8; 32], oid: &OidBytes) {
     debug_assert_eq!(buf.len(), seen_blob_key_len(oid.len()));
     let mut offset = 0;

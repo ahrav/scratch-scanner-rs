@@ -41,6 +41,10 @@ cargo kani --features kani --harness verify_never_fires_early
 cargo kani --features kani --harness verify_pool_coherence --verbose
 ```
 
+CI note:
+- Nightly scheduled CI runs Kani in `.github/workflows/ci.yml` via the `kani` job.
+- Local runs should use the same command shape as CI for consistency.
+
 ## Verified Properties
 
 ### TimingWheel Proofs
