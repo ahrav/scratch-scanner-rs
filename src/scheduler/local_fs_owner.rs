@@ -1,193 +1,2450 @@
-//! Owner-Compute Filesystem Scanner
+//! Local Filesystem Scanner
 //!
 //! # Architecture
 //!
-//! This module provides two execution modes:
-//! - owner-compute: a coordinator feeds files to a shared worker queue
-//! - inline walk+scan: walker threads discover and scan files directly
+//! - CPU workers do both I/O and scan (no separate I/O threads)
+//! - Uses `LocalFirst` buffer pool policy (same thread acquires and releases)
+//! - Sequential reads with overlap carry (no seeks, no re-reading overlap)
+//! - Discovery thread enqueues files; workers process entire files
 //!
-//! Each worker owns its I/O buffer, engine scratch, and findings vec.
-//! Workers perform both blocking file I/O and scanning on the same thread,
-//! keeping data hot in L1/L2 cache between read and scan:
+//! # Why Blocking Reads First?
+//!
+//! 1. **Strong baseline**: Kernel page cache is highly optimized; often hits memory
+//! 2. **Minimal complexity**: No async runtime, no completion queues
+//! 3. **Measureable**: Establish baseline before adding io_uring complexity
+//!
+//! # Correctness Invariants
+//!
+//! - **Work-conserving**: Every discovered file is scanned (blocking buffer acquire)
+//! - **Chunk overlap**: `engine.required_overlap()` bytes overlap between chunks
+//! - **Budget bounded**: `max_in_flight_objects` limits discovered-but-not-complete files
+//! - **Buffer bounded**: `pool_buffers` limits peak memory
+//! - **Snapshot semantics**: File size taken at open time (consistent point-in-time)
+//!
+//! # Performance Characteristics
+//!
+//! | Workload | Expected Behavior |
+//! |----------|-------------------|
+//! | Hot cache (small files) | CPU-bound, near memory bandwidth |
+//! | Cold cache (SSD) | I/O-bound, ~3-5 GB/s with good SSD |
+//! | Cold cache (HDD) | I/O-bound, ~150-200 MB/s sequential |
+//!
+//! # I/O Pattern: Overlap Carry
+//!
+//! Instead of seeking back for each chunk's overlap:
+//! 1. Acquire ONE buffer per file (blocking)
+//! 2. Read sequentially, carry overlap bytes forward via `copy_within`
+//! 3. Eliminates: seeks, re-reading overlap from kernel, per-chunk pool churn
 //!
 //! ```text
-//! Coordinator (main thread)
-//!   |  files via shared bounded channel (cold path, per-file granularity)
-//!   v
-//! Worker 0: recv file → open → [fadvise + read → scan → emit] loop → next file
-//! Worker 1: recv file → open → [fadvise + read → scan → emit] loop → next file
-//!   ...
-//! Worker N-1: file_rx exhausted → exit
+//! Iteration 1:                    Iteration 2:
+//! ┌─────────────────────────┐     ┌─────────────────────────┐
+//! │      payload bytes      │     │overlap│  new payload    │
+//! │      (from read)        │     │(copy) │  (from read)    │
+//! └─────────────────────────┘     └─────────────────────────┘
+//!                           │            ▲
+//!                           └────────────┘
+//!                         copy_within(tail → head)
 //! ```
 //!
-//! Per-worker (share-nothing):
-//!   - ONE `Vec<u8>` allocated at thread start, reused across all files
-//!   - own engine scratch (reused across all files)
-//!   - own findings Vec (reused across all chunks)
+//! # When to Consider io_uring
 //!
-//! # Invariants
-//!
-//! - A file is scanned by at most one worker in a given run.
-//! - Worker-local scan state (`Vec<u8>`, scratch, pending findings) is never shared.
-//! - Per-file open/read failures are counted in stats and do not stop the scan.
-//!
-//! # File Distribution
-//!
-//! Files are distributed via a single shared bounded channel. Workers compete
-//! for files, providing natural load balancing: fast workers automatically
-//! pick up more files. This avoids the imbalance risk of round-robin dispatch
-//! when file sizes vary.
-//!
-//! # posix_fadvise (Linux only)
-//!
-//! - `FADV_SEQUENTIAL` once at file open → kernel uses aggressive readahead
-//! - `FADV_WILLNEED` before scanning each chunk, for *next* chunk's range →
-//!   kernel prefetches during scan, overlapping I/O with CPU work
-//!
-//! # Error Model
-//!
-//! Per-file failures are reflected in `OwnerWorkerStats::io_errors`.
-//! Public entry points only return `io::Error` for orchestration failures
-//! (for example worker thread spawn/join failure in owner-compute mode).
+//! Profile first. If workers show significant idle time waiting on reads
+//! (visible in `perf` as time in `read` syscall), io_uring may help.
+//! For page-cache-hot workloads, blocking reads are competitive.
 
-use std::cell::UnsafeCell;
-use std::fs::File;
-use std::io::{self, Read, Seek};
-use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::thread;
-use std::time::Instant;
-
-use crossbeam_utils::CachePadded;
-
-use super::engine_stub::BUFFER_LEN_MAX;
+use super::count_budget::CountBudget;
 use super::engine_trait::{EngineScratch, FindingRecord, ScanEngine};
-use super::local::LocalFile;
-use super::metrics::MetricsSnapshot;
+use super::executor::{Executor, ExecutorConfig, WorkerCtx};
+use super::metrics::{MetricsSnapshot, WorkerMetricsLocal};
+use super::ts_buffer_pool::{TsBufferPool, TsBufferPoolConfig};
 use crate::api::FileId;
-use crate::archive::{detect_kind_from_path, sniff_kind_from_header, ArchiveConfig};
-use crate::scheduler::affinity::pin_current_thread_to_core;
-use crate::unified::events::{EventSink, FindingEvent, ScanEvent};
-use crate::unified::SourceKind;
+use crate::archive::formats::zip::LimitedRead;
+use crate::archive::formats::{
+    tar::TAR_BLOCK_LEN, GzipStream, TarCursor, TarInput, TarNext, TarRead, ZipCursor, ZipEntryMeta,
+    ZipNext, ZipOpen,
+};
+use crate::archive::path::apply_hash_suffix_truncation;
+use crate::archive::{
+    detect_kind_from_name_bytes, detect_kind_from_path, sniff_kind_from_header, ArchiveBudgets,
+    ArchiveConfig, ArchiveKind, ArchiveSkipReason, BudgetHit, ChargeResult, EntryPathCanonicalizer,
+    EntrySkipReason, PartialReason, VirtualPathBuilder, DEFAULT_MAX_COMPONENTS,
+};
+use crate::scheduler::engine_stub::BUFFER_LEN_MAX;
 
-/// Header sniff buffer size for archive detection.
-const SNIFF_HEADER_LEN: usize = 8;
-
-// ============================================================================
-// posix_fadvise helpers
-// ============================================================================
-
-/// Hint the kernel to use aggressive sequential readahead for the file.
-#[cfg(target_os = "linux")]
-fn fadvise_sequential(file: &File) {
-    use std::os::unix::io::AsRawFd;
-    // Safety: the fd comes from a live `File`, and `posix_fadvise` neither
-    // retains pointers nor mutates Rust-owned memory.
-    unsafe {
-        libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn fadvise_sequential(_file: &File) {}
-
-/// Hint the kernel to prefetch bytes at `[offset, offset+len)`.
-#[cfg(target_os = "linux")]
-fn fadvise_willneed(file: &File, offset: i64, len: i64) {
-    use std::os::unix::io::AsRawFd;
-    // Safety: same as `fadvise_sequential`; arguments are plain value hints.
-    unsafe {
-        libc::posix_fadvise(file.as_raw_fd(), offset, len, libc::POSIX_FADV_WILLNEED);
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn fadvise_willneed(_file: &File, _offset: i64, _len: i64) {}
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 // ============================================================================
 // Configuration
 // ============================================================================
 
-/// Configuration for owner-compute filesystem scanning.
-pub struct OwnerComputeFsConfig {
-    /// Number of owner-compute workers.
+/// Configuration for local filesystem scanning.
+///
+/// # Sizing Guidelines
+///
+/// - `chunk_size`: 64-256 KiB typical. Larger = fewer syscalls, more memory per file.
+/// - `pool_buffers`: Bound peak memory. Should be >= `workers` to avoid starvation.
+/// - `max_in_flight_objects`: Bound discovery depth. Too high = memory for paths/metadata.
+/// - `max_file_size`: Open-time size cap; oversized files are skipped.
+#[derive(Clone)]
+pub struct LocalConfig {
+    /// Number of CPU worker threads.
     pub workers: usize,
+
     /// Payload bytes per chunk (excluding overlap).
+    ///
+    /// Actual buffer size = `chunk_size + engine.required_overlap()`.
     pub chunk_size: usize,
-    /// Maximum file size to scan (bytes). Larger files are skipped.
+
+    /// Total buffers in the pool.
+    ///
+    /// Bounds peak memory: `pool_buffers * (chunk_size + overlap)`.
+    pub pool_buffers: usize,
+
+    /// Per-worker local queue capacity in buffer pool.
+    pub local_queue_cap: usize,
+
+    /// Max discovered-but-not-complete files.
+    ///
+    /// Controls discovery backpressure. Higher = more path metadata in memory.
+    pub max_in_flight_objects: usize,
+
+    /// Maximum file size in bytes to scan.
+    ///
+    /// Files larger than this are skipped after `open()` based on the
+    /// snapshot size from `metadata().len()`.
     pub max_file_size: u64,
-    /// Capacity of the shared bounded file channel from coordinator to workers.
-    pub file_channel_cap: usize,
-    /// Enable within-chunk finding deduplication.
+
+    /// Seed for deterministic executor behavior.
+    pub seed: u64,
+
+    /// If true, deduplicate findings within each chunk.
+    ///
+    /// This is a defense-in-depth measure for engines that might emit
+    /// duplicate findings for the same match (e.g., overlapping patterns).
+    /// Cross-chunk deduplication is handled separately by `drop_prefix_findings`.
     pub dedupe_within_chunk: bool,
+
     /// Archive scanning configuration.
     pub archive: ArchiveConfig,
-    /// Shared event sink for finding output.
-    pub event_sink: Arc<dyn EventSink>,
-    /// Whether to pin each worker thread to a CPU core (best effort).
-    pub pin_threads: bool,
+
+    /// Structured event sink for finding output.
+    ///
+    /// All findings are emitted as `ScanEvent::Finding` through this sink.
+    pub event_sink: Arc<dyn crate::unified::events::EventSink>,
+}
+
+impl Default for LocalConfig {
+    fn default() -> Self {
+        Self {
+            workers: 8,
+            chunk_size: 64 * 1024, // 64 KiB
+            pool_buffers: 32,
+            local_queue_cap: 4,
+            max_in_flight_objects: 256,
+            max_file_size: u64::MAX,
+            seed: 0x853c49e6748fea9b,
+            dedupe_within_chunk: true,
+            archive: ArchiveConfig::default(),
+            event_sink: Arc::new(crate::unified::events::NullEventSink),
+        }
+    }
+}
+
+impl std::fmt::Debug for LocalConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalConfig")
+            .field("workers", &self.workers)
+            .field("chunk_size", &self.chunk_size)
+            .field("pool_buffers", &self.pool_buffers)
+            .field("local_queue_cap", &self.local_queue_cap)
+            .field("max_in_flight_objects", &self.max_in_flight_objects)
+            .field("max_file_size", &self.max_file_size)
+            .field("seed", &self.seed)
+            .field("dedupe_within_chunk", &self.dedupe_within_chunk)
+            .field("archive", &self.archive)
+            .field("event_sink", &"<dyn EventSink>")
+            .finish()
+    }
+}
+
+impl LocalConfig {
+    /// Validate configuration against engine constraints.
+    ///
+    /// # Panics
+    ///
+    /// Panics if configuration violates invariants.
+    pub fn validate<E: ScanEngine>(&self, engine: &E) {
+        assert!(self.workers > 0, "workers must be > 0");
+        assert!(self.chunk_size > 0, "chunk_size must be > 0");
+        assert!(self.pool_buffers > 0, "pool_buffers must be > 0");
+        assert!(self.local_queue_cap > 0, "local_queue_cap must be > 0");
+        assert!(
+            self.max_in_flight_objects > 0,
+            "max_in_flight_objects must be > 0"
+        );
+        if let Err(err) = self.archive.validate() {
+            panic!("archive config invalid: {err}");
+        }
+
+        let overlap = engine.required_overlap();
+        let buf_len = self.chunk_size.saturating_add(overlap);
+        assert!(
+            buf_len <= BUFFER_LEN_MAX,
+            "chunk_size ({}) + overlap ({}) = {} exceeds BUFFER_LEN_MAX ({})",
+            self.chunk_size,
+            overlap,
+            buf_len,
+            BUFFER_LEN_MAX
+        );
+
+        // Warn if pool is undersized
+        #[cfg(debug_assertions)]
+        if self.pool_buffers < self.workers {
+            eprintln!(
+                "[LocalConfig] Warning: pool_buffers ({}) < workers ({}). \
+                 Workers may contend heavily for buffers.",
+                self.pool_buffers, self.workers
+            );
+        }
+    }
+
+    /// Compute buffer length including overlap.
+    pub fn buffer_len<E: ScanEngine>(&self, engine: &E) -> usize {
+        self.chunk_size.saturating_add(engine.required_overlap())
+    }
+
+    /// Compute peak memory usage for buffers.
+    pub fn peak_buffer_memory<E: ScanEngine>(&self, engine: &E) -> usize {
+        self.pool_buffers.saturating_mul(self.buffer_len(engine))
+    }
 }
 
 // ============================================================================
-// Per-Worker Statistics
+// Local File Discovery
 // ============================================================================
 
-/// Per-worker statistics for owner-compute scanning.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct OwnerWorkerStats {
-    /// Files successfully processed.
-    pub files_processed: u64,
-    /// Total chunks scanned by this worker.
-    pub chunks_scanned: u64,
-    /// Total payload bytes scanned by this worker.
-    pub bytes_scanned: u64,
-    /// Findings emitted by this worker.
-    pub findings_emitted: u64,
-    /// File I/O errors encountered.
-    pub io_errors: u64,
-    /// Files skipped because they are archives.
-    pub archives_skipped: u64,
-    /// Cumulative open+metadata time (nanoseconds).
-    pub open_stat_ns: u64,
-    /// Cumulative read syscall time (nanoseconds).
-    pub read_ns: u64,
-    /// Cumulative scan time (nanoseconds).
-    pub scan_ns: u64,
+/// A file to be scanned.
+#[derive(Debug, Clone)]
+pub struct LocalFile {
+    /// Path to the file.
+    pub path: PathBuf,
+    /// File size hint in bytes.
+    ///
+    /// Discovery may skip per-file metadata for performance, so this can be 0.
+    /// Open-time metadata determines the actual size and enforcement.
+    pub size: u64,
 }
 
-// ============================================================================
-// Report
-// ============================================================================
+/// Iterator over files to scan.
+///
+/// This is a simple wrapper; real implementations would walk directories,
+/// filter by extension, respect gitignore, etc.
+pub trait FileSource: Send + 'static {
+    /// Get the next file to scan, if any.
+    fn next_file(&mut self) -> Option<LocalFile>;
+}
 
-/// Aggregated report from owner-compute scanning.
+/// Simple file source from a list of paths.
 #[derive(Debug)]
-pub struct OwnerComputeFsReport {
-    /// Per-worker stats in worker index order.
-    pub worker_stats: Vec<OwnerWorkerStats>,
-    /// Total files enqueued by discovery.
+pub struct VecFileSource {
+    files: std::vec::IntoIter<LocalFile>,
+}
+
+impl VecFileSource {
+    pub fn new(files: Vec<LocalFile>) -> Self {
+        Self {
+            files: files.into_iter(),
+        }
+    }
+
+    /// Create from an Arc slice by cloning the inner data.
+    ///
+    /// This allows multiple iterations over the same file list without
+    /// modifying the original data. The clone happens at source creation
+    /// time, not during iteration.
+    pub fn from_arc(files: std::sync::Arc<[LocalFile]>) -> Self {
+        Self::new(files.to_vec())
+    }
+}
+
+impl FileSource for VecFileSource {
+    fn next_file(&mut self) -> Option<LocalFile> {
+        self.files.next()
+    }
+}
+
+// ============================================================================
+// Task Types
+// ============================================================================
+
+/// A file task for the executor.
+#[derive(Debug)]
+struct FileTask {
+    /// Run-scoped file ID.
+    file_id: FileId,
+    /// Path to open.
+    path: PathBuf,
+    /// File size hint from discovery (not used in processing).
+    ///
+    /// May be 0 if discovery skipped metadata for performance.
+    ///
+    /// Processing uses `file.metadata().len()` for snapshot-at-open semantics.
+    /// Kept for logging/debugging the discovery phase.
+    #[allow(dead_code)]
+    size: u64,
+    /// In-flight permit (released when task completes).
+    _permit: super::count_budget::CountPermit,
+}
+
+// ============================================================================
+// Per-Worker Scratch
+// ============================================================================
+
+/// Per-worker scratch state for local scanning.
+///
+/// # Invariants
+/// - Buffers are preallocated and reused to avoid per-chunk allocations.
+/// - Per-depth vectors (`vpaths`, `tar_cursors`, `path_budget_used`) are sized
+///   to `max_archive_depth + 2` and indexed by depth.
+/// - `next_virtual_file_id` stays in the high-bit namespace to avoid collisions
+///   with real file ids.
+struct LocalScratch<E: ScanEngine> {
+    engine: Arc<E>,
+    pool: TsBufferPool,
+
+    /// Per-worker engine scratch.
+    scan_scratch: E::Scratch,
+    /// Per-worker findings buffer (avoids alloc per chunk).
+    pending: Vec<<E::Scratch as EngineScratch>::Finding>,
+
+    /// Archive path canonicalization scratch.
+    canon: EntryPathCanonicalizer,
+    /// Preallocated virtual path builders (depth 0..max_depth+1).
+    vpaths: Vec<VirtualPathBuilder>,
+    /// Per-depth path budget usage counters.
+    path_budget_used: Vec<usize>,
+    /// Reused archive budgets (no per-archive allocation).
+    budgets: ArchiveBudgets,
+    /// Per-depth TAR cursors (one per nested depth).
+    tar_cursors: Vec<TarCursor>,
+    /// Reused ZIP cursor with preallocated buffers.
+    zip_cursor: ZipCursor<File>,
+    /// Scratch buffer for entry display bytes when we need to append a hash suffix.
+    entry_display_buf: Vec<u8>,
+    /// Scratch buffer for gzip header peeking (bounded).
+    gzip_header_buf: Vec<u8>,
+    /// Scratch buffer for gzip header filename (bounded).
+    gzip_name_buf: Vec<u8>,
+    /// Monotonic virtual `FileId` generator for archive entries.
+    next_virtual_file_id: u32,
+    /// Shared abort flag set when `FailRun` policy triggers.
+    abort_run: Arc<AtomicBool>,
+
+    /// Structured event sink for finding output.
+    event_sink: Arc<dyn crate::unified::events::EventSink>,
+
+    /// Configuration flags.
+    dedupe_within_chunk: bool,
+    chunk_size: usize,
+    max_file_size: u64,
+    archive: ArchiveConfig,
+}
+
+// ============================================================================
+// Run Statistics
+// ============================================================================
+
+/// Statistics from a local scan run.
+///
+/// Core counters (`files_enqueued`, `bytes_enqueued`, `io_errors`) are always
+/// populated regardless of build configuration.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LocalStats {
+    /// Files discovered and enqueued.
     pub files_enqueued: u64,
-    /// End-to-end wall time (nanoseconds).
-    pub wall_time_ns: u64,
-    /// Aggregated metrics for compatibility with existing consumers.
+    /// Total bytes across all enqueued files (hint-based).
+    ///
+    /// If discovery skipped metadata, this may undercount and should not be
+    /// treated as authoritative for throughput calculations.
+    pub bytes_enqueued: u64,
+    /// Files that failed to process due to I/O errors.
+    ///
+    /// This includes file open failures, metadata read failures, and
+    /// read errors during scanning. Aggregated from worker metrics.
+    pub io_errors: u64,
+}
+
+/// Complete report from a local scan.
+///
+/// Core metrics in `metrics` (`bytes_scanned`, `chunks_scanned`, `io_errors`,
+/// `findings_emitted`) are always aggregated from worker threads.
+/// Perf-only metrics require `all(feature = "perf-stats", debug_assertions)`.
+/// `stats.io_errors` is derived from `metrics.io_errors` for convenience.
+#[derive(Debug, Default)]
+pub struct LocalReport {
+    pub stats: LocalStats,
     pub metrics: MetricsSnapshot,
-    /// Wall-clock nanoseconds the coordinator spent in the feed loop
-    /// (iterating the file iterator + sending to the shared channel).
-    pub feed_elapsed_ns: u64,
-    /// Cumulative nanoseconds the coordinator blocked inside `file_tx.send()`.
-    /// High ratio to `feed_elapsed_ns` means workers are keeping up (channel full).
-    pub feed_block_ns: u64,
 }
 
 // ============================================================================
 // Helpers
 // ============================================================================
 
-/// `EINTR`-retrying wrapper around [`File::read`].
+/// Deduplicate findings in place by (rule_id, root_hint).
 ///
-/// Loops on `ErrorKind::Interrupted` so callers never see spurious
-/// zero-byte returns from signal delivery.
+/// # Algorithm
+///
+/// 1. Sort by `(rule_id, root_hint_start, root_hint_end)` — O(n log n)
+/// 2. Dedup adjacent elements with matching keys — O(n)
+///
+/// Total: O(n log n) vs O(n²) for pairwise comparison.
+///
+/// # Why Sort Before Dedup?
+///
+/// `Vec::dedup_by` only removes *adjacent* duplicates. Sorting brings
+/// identical findings together, ensuring all duplicates are removed.
+/// The sort key ordering also provides stable, deterministic output ordering.
+///
+/// # When This Is Needed
+///
+/// This handles within-chunk duplicates (same finding emitted multiple times
+/// by the engine). Cross-chunk duplicates are handled by `drop_prefix_findings`.
+#[inline]
+fn dedupe_findings<F: FindingRecord>(findings: &mut Vec<F>) {
+    if findings.len() <= 1 {
+        return;
+    }
+
+    findings.sort_unstable_by_key(|f| {
+        (
+            f.rule_id(),
+            f.root_hint_start(),
+            f.root_hint_end(),
+            f.span_start(),
+            f.span_end(),
+        )
+    });
+
+    findings.dedup_by(|a, b| {
+        a.rule_id() == b.rule_id()
+            && a.root_hint_start() == b.root_hint_start()
+            && a.root_hint_end() == b.root_hint_end()
+            && a.span_start() == b.span_start()
+            && a.span_end() == b.span_end()
+    });
+}
+
+/// Emit structured finding events via the [`EventSink`].
+///
+/// Emits one [`ScanEvent::Finding`] per finding record.
+///
+/// [`EventSink`]: crate::unified::events::EventSink
+#[inline]
+fn emit_findings<E: ScanEngine, F: FindingRecord>(
+    engine: &E,
+    event_sink: &dyn crate::unified::events::EventSink,
+    path: &[u8],
+    findings: &[F],
+) {
+    if findings.is_empty() {
+        return;
+    }
+
+    for rec in findings {
+        event_sink.emit(crate::unified::events::ScanEvent::Finding(
+            crate::unified::events::FindingEvent {
+                source: crate::unified::SourceKind::Fs,
+                object_path: path,
+                start: rec.root_hint_start(),
+                end: rec.root_hint_end(),
+                rule_id: rec.rule_id(),
+                rule_name: engine.rule_name(rec.rule_id()),
+                commit_id: None,
+                change_kind: None,
+            },
+        ));
+    }
+}
+
+/// Allocate a virtual `FileId` for archive entries (high-bit namespace).
+///
+/// Wraps within the high-bit range; after ~2^31 entries, ids may repeat.
+#[inline]
+fn alloc_virtual_file_id(next_virtual_file_id: &mut u32) -> FileId {
+    const VIRTUAL_FILE_ID_BASE: u32 = 0x8000_0000;
+    const VIRTUAL_FILE_ID_MASK: u32 = 0x7FFF_FFFF;
+
+    let id = *next_virtual_file_id;
+    let next = (id.wrapping_add(1) & VIRTUAL_FILE_ID_MASK) | VIRTUAL_FILE_ID_BASE;
+    *next_virtual_file_id = next;
+    FileId(id)
+}
+
+const LOCATOR_LEN: usize = 18;
+
 #[inline(always)]
+fn write_u64_hex_lower(x: u64, out16: &mut [u8]) {
+    debug_assert_eq!(out16.len(), 16);
+    for (i, out) in out16.iter_mut().enumerate().take(16) {
+        let shift = (15 - i) * 4;
+        let nyb = ((x >> shift) & 0xF) as u8;
+        *out = match nyb {
+            0..=9 => b'0' + nyb,
+            _ => b'a' + (nyb - 10),
+        };
+    }
+}
+
+#[inline]
+fn build_locator(out: &mut [u8; LOCATOR_LEN], kind: u8, value: u64) -> &[u8] {
+    out[0] = b'@';
+    out[1] = kind;
+    write_u64_hex_lower(value, &mut out[2..]);
+    out
+}
+
+#[inline]
+/// Dispatch archive scanning by kind.
+///
+/// Currently gzip/tar/tar.gz are supported; other formats are skipped.
+///
+/// The caller is responsible for recording archive stats based on the result.
+fn dispatch_archive_scan<E: ScanEngine>(
+    task: &FileTask,
+    ctx: &mut WorkerCtx<FileTask, LocalScratch<E>>,
+    kind: ArchiveKind,
+) -> ArchiveEnd {
+    match kind {
+        ArchiveKind::Gzip => process_gzip_file(task, ctx),
+        ArchiveKind::Tar => process_tar_file(task, ctx),
+        ArchiveKind::TarGz => process_targz_file(task, ctx),
+        ArchiveKind::Zip => process_zip_file(task, ctx),
+    }
+}
+
+/// Hard cap on per-read output for archive streams.
+const ARCHIVE_STREAM_READ_MAX: usize = 256 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArchiveEnd {
+    Scanned,
+    Skipped(ArchiveSkipReason),
+    Partial(PartialReason),
+}
+
+#[inline(always)]
+fn map_archive_skip_to_partial(reason: ArchiveSkipReason) -> PartialReason {
+    match reason {
+        ArchiveSkipReason::MetadataBudgetExceeded => PartialReason::MetadataBudgetExceeded,
+        ArchiveSkipReason::PathBudgetExceeded => PartialReason::PathBudgetExceeded,
+        ArchiveSkipReason::EntryCountExceeded => PartialReason::EntryCountExceeded,
+        ArchiveSkipReason::ArchiveOutputBudgetExceeded => {
+            PartialReason::ArchiveOutputBudgetExceeded
+        }
+        ArchiveSkipReason::RootOutputBudgetExceeded => PartialReason::RootOutputBudgetExceeded,
+        ArchiveSkipReason::InflationRatioExceeded => PartialReason::InflationRatioExceeded,
+        ArchiveSkipReason::UnsupportedFeature => PartialReason::UnsupportedFeature,
+        _ => PartialReason::MalformedZip,
+    }
+}
+
+#[inline(always)]
+fn budget_hit_to_partial_reason(hit: BudgetHit) -> PartialReason {
+    match hit {
+        BudgetHit::PartialArchive(r) => r,
+        BudgetHit::StopRoot(r) => r,
+        BudgetHit::SkipArchive(r) => map_archive_skip_to_partial(r),
+        BudgetHit::SkipEntry(_) => PartialReason::EntryOutputBudgetExceeded,
+    }
+}
+
+#[inline(always)]
+fn budget_hit_to_archive_end(hit: BudgetHit) -> ArchiveEnd {
+    match hit {
+        BudgetHit::SkipArchive(r) => ArchiveEnd::Skipped(r),
+        BudgetHit::PartialArchive(r) => ArchiveEnd::Partial(r),
+        BudgetHit::StopRoot(r) => ArchiveEnd::Partial(r),
+        BudgetHit::SkipEntry(_) => ArchiveEnd::Partial(PartialReason::EntryOutputBudgetExceeded),
+    }
+}
+
+/// Shared scratch references for archive scanning (scheduler path).
+///
+/// # Invariants
+/// - All buffers are preallocated in `LocalScratch` and must not grow.
+/// - Nested scans borrow disjoint slices of scratch buffers (no aliasing).
+/// - `budgets` is shared across nested scans to enforce global caps.
+/// - `path_budget_used` tracks per-archive virtual path byte usage.
+/// - `abort_run` is set when `FailRun` policies trigger; callers must stop
+///   dispatching new files once it becomes true.
+struct ArchiveScanCtx<'a, E: ScanEngine> {
+    engine: &'a Arc<E>,
+    pool: &'a TsBufferPool,
+    event_sink: &'a dyn crate::unified::events::EventSink,
+    scan_scratch: &'a mut E::Scratch,
+    pending: &'a mut Vec<<E::Scratch as EngineScratch>::Finding>,
+    budgets: &'a mut ArchiveBudgets,
+    canon: &'a mut EntryPathCanonicalizer,
+    vpaths: &'a mut [VirtualPathBuilder],
+    path_budget_used: &'a mut [usize],
+    tar_cursors: &'a mut [TarCursor],
+    gzip_header_buf: &'a mut Vec<u8>,
+    gzip_name_buf: &'a mut Vec<u8>,
+    next_virtual_file_id: &'a mut u32,
+    metrics: &'a mut WorkerMetricsLocal,
+    archive: &'a ArchiveConfig,
+    dedupe: bool,
+    chunk_size: usize,
+    abort_run: &'a AtomicBool,
+}
+
+impl<'a, E: ScanEngine> ArchiveScanCtx<'a, E> {
+    fn new(scratch: &'a mut LocalScratch<E>, metrics: &'a mut WorkerMetricsLocal) -> Self {
+        Self {
+            engine: &scratch.engine,
+            pool: &scratch.pool,
+            event_sink: &*scratch.event_sink,
+            scan_scratch: &mut scratch.scan_scratch,
+            pending: &mut scratch.pending,
+            budgets: &mut scratch.budgets,
+            canon: &mut scratch.canon,
+            vpaths: scratch.vpaths.as_mut_slice(),
+            path_budget_used: scratch.path_budget_used.as_mut_slice(),
+            tar_cursors: scratch.tar_cursors.as_mut_slice(),
+            gzip_header_buf: &mut scratch.gzip_header_buf,
+            gzip_name_buf: &mut scratch.gzip_name_buf,
+            next_virtual_file_id: &mut scratch.next_virtual_file_id,
+            metrics,
+            archive: &scratch.archive,
+            dedupe: scratch.dedupe_within_chunk,
+            chunk_size: scratch.chunk_size,
+            abort_run: scratch.abort_run.as_ref(),
+        }
+    }
+}
+
+/// Charge decompressed bytes that were read but not scanned (entry truncation).
+#[inline(always)]
+fn charge_discarded_bytes(budgets: &mut ArchiveBudgets, bytes: u64) -> Result<(), PartialReason> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    match budgets.charge_discarded_out(bytes) {
+        ChargeResult::Ok => Ok(()),
+        ChargeResult::Clamp { hit, .. } => Err(budget_hit_to_partial_reason(hit)),
+    }
+}
+
+/// Apply decompressed-output budgeting for a read of `n` bytes.
+///
+/// Returns `(allowed, clamped)` where:
+/// - `allowed` is the prefix length to scan/emits.
+/// - `clamped` signals the caller must stop after this iteration.
+///
+/// If the decoder produced more bytes than allowed, the extra bytes are charged
+/// as discarded output so archive/root caps remain accurate.
+#[inline(always)]
+fn apply_entry_budget_clamp(
+    budgets: &mut ArchiveBudgets,
+    n: usize,
+    entry_partial_reason: &mut Option<PartialReason>,
+    outcome: &mut ArchiveEnd,
+    stop_archive: &mut bool,
+) -> (u64, bool) {
+    let mut allowed = n as u64;
+    if let ChargeResult::Clamp { allowed: a, hit } = budgets.charge_decompressed_out(allowed) {
+        let r = budget_hit_to_partial_reason(hit);
+        allowed = a;
+        *entry_partial_reason = Some(r);
+        if !matches!(hit, BudgetHit::SkipEntry(_)) {
+            *outcome = ArchiveEnd::Partial(r);
+            *stop_archive = true;
+        }
+    }
+
+    if allowed == 0 {
+        if let Err(r) = charge_discarded_bytes(budgets, n as u64) {
+            if entry_partial_reason.is_none() {
+                *entry_partial_reason = Some(r);
+            }
+            *outcome = ArchiveEnd::Partial(r);
+            *stop_archive = true;
+        }
+        return (0, true);
+    }
+
+    if allowed < n as u64 {
+        let extra = (n as u64).saturating_sub(allowed);
+        if let Err(r) = charge_discarded_bytes(budgets, extra) {
+            if entry_partial_reason.is_none() {
+                *entry_partial_reason = Some(r);
+            }
+            *outcome = ArchiveEnd::Partial(r);
+            *stop_archive = true;
+        }
+        return (allowed, true);
+    }
+
+    (allowed, false)
+}
+
+/// Drain remaining tar entry payload bytes to realign the stream.
+fn discard_remaining_payload(
+    input: &mut dyn TarRead,
+    budgets: &mut ArchiveBudgets,
+    buf: &mut [u8],
+    mut remaining: u64,
+) -> Result<(), PartialReason> {
+    while remaining > 0 {
+        let step = buf.len().min(remaining as usize);
+        let n = match input.read(&mut buf[..step]) {
+            Ok(n) => n,
+            Err(_) => return Err(PartialReason::MalformedTar),
+        };
+        if n == 0 {
+            return Err(PartialReason::MalformedTar);
+        }
+        budgets.charge_compressed_in(input.take_compressed_delta());
+        charge_discarded_bytes(budgets, n as u64)?;
+        remaining = remaining.saturating_sub(n as u64);
+    }
+    Ok(())
+}
+
+/// Scan a `.gz` file as a single virtual entry (`<gunzip>`).
+///
+/// # Invariants
+/// - Offsets are decompressed byte offsets.
+/// - Concatenated gzip members are treated as one stream.
+fn process_gzip_file<E: ScanEngine>(
+    task: &FileTask,
+    ctx: &mut WorkerCtx<FileTask, LocalScratch<E>>,
+) -> ArchiveEnd {
+    let scratch = &mut ctx.scratch;
+    let metrics = &mut ctx.metrics;
+    let engine = &scratch.engine;
+    let overlap = engine.required_overlap();
+    let chunk_size = scratch.chunk_size.min(ARCHIVE_STREAM_READ_MAX);
+    let dedupe = scratch.dedupe_within_chunk;
+
+    let file = match File::open(&task.path) {
+        Ok(f) => f,
+        Err(_) => {
+            metrics.io_errors = metrics.io_errors.saturating_add(1);
+            return ArchiveEnd::Skipped(ArchiveSkipReason::IoError);
+        }
+    };
+
+    let parent_bytes = task.path.as_os_str().as_encoded_bytes();
+    let max_len = scratch.archive.max_virtual_path_len_per_entry;
+    debug_assert!(scratch.vpaths.len() > 1);
+    debug_assert!(scratch.path_budget_used.len() > 1);
+    scratch.path_budget_used[1] = 0;
+
+    let (mut gz, name_len) = match GzipStream::new_with_header(
+        file,
+        &mut scratch.gzip_header_buf,
+        &mut scratch.gzip_name_buf,
+        max_len,
+    ) {
+        Ok(v) => v,
+        Err(_) => {
+            metrics.io_errors = metrics.io_errors.saturating_add(1);
+            return ArchiveEnd::Skipped(ArchiveSkipReason::IoError);
+        }
+    };
+
+    let entry_name_bytes = if let Some(len) = name_len {
+        let c = scratch.canon.canonicalize(
+            &scratch.gzip_name_buf[..len],
+            DEFAULT_MAX_COMPONENTS,
+            max_len,
+        );
+        if c.had_traversal {
+            metrics.archive.record_path_had_traversal();
+        }
+        if c.component_cap_exceeded {
+            metrics.archive.record_component_cap_exceeded();
+        }
+        if c.truncated {
+            metrics.archive.record_path_truncated();
+        }
+        c.bytes
+    } else {
+        b"<gunzip>"
+    };
+
+    let path_bytes = scratch.vpaths[1]
+        .build(parent_bytes, entry_name_bytes, max_len)
+        .bytes;
+    let need = path_bytes.len();
+    if scratch.path_budget_used[1].saturating_add(need)
+        > scratch.archive.max_virtual_path_bytes_per_archive
+    {
+        let (_inner, hdr_buf) = gz.into_inner().into_parts();
+        scratch.gzip_header_buf = hdr_buf;
+        return ArchiveEnd::Partial(PartialReason::PathBudgetExceeded);
+    }
+    scratch.path_budget_used[1] = scratch.path_budget_used[1].saturating_add(need);
+
+    scratch.budgets.reset();
+    if let Err(hit) = scratch.budgets.enter_archive() {
+        let (_inner, hdr_buf) = gz.into_inner().into_parts();
+        scratch.gzip_header_buf = hdr_buf;
+        return budget_hit_to_archive_end(hit);
+    }
+    if let Err(hit) = scratch.budgets.begin_entry() {
+        scratch.budgets.exit_archive();
+        let (_inner, hdr_buf) = gz.into_inner().into_parts();
+        scratch.gzip_header_buf = hdr_buf;
+        return budget_hit_to_archive_end(hit);
+    }
+
+    let mut buf = scratch.pool.acquire();
+
+    let entry_file_id = alloc_virtual_file_id(&mut scratch.next_virtual_file_id);
+    let mut offset: u64 = 0;
+    let mut carry: usize = 0;
+    let mut have: usize = 0;
+    let mut outcome = ArchiveEnd::Scanned;
+    let mut entry_scanned = false;
+    let mut entry_partial_reason: Option<PartialReason> = None;
+
+    loop {
+        if carry > 0 && have > 0 {
+            buf.as_mut_slice().copy_within(have - carry..have, 0);
+        }
+
+        let allowance = scratch
+            .budgets
+            .remaining_decompressed_allowance_with_ratio_probe(true);
+        if allowance == 0 {
+            if let ChargeResult::Clamp { hit, .. } = scratch.budgets.charge_decompressed_out(1) {
+                let r = budget_hit_to_partial_reason(hit);
+                outcome = ArchiveEnd::Partial(r);
+                entry_partial_reason = Some(r);
+            }
+            break;
+        }
+
+        let read_max = chunk_size
+            .min(buf.len().saturating_sub(carry))
+            .min(allowance.min(u64::from(u32::MAX)) as usize);
+
+        if read_max == 0 {
+            if let ChargeResult::Clamp { hit, .. } = scratch.budgets.charge_decompressed_out(1) {
+                let r = budget_hit_to_partial_reason(hit);
+                outcome = ArchiveEnd::Partial(r);
+                entry_partial_reason = Some(r);
+            }
+            break;
+        }
+
+        let dst = &mut buf.as_mut_slice()[carry..carry + read_max];
+
+        let n = match gz.read(dst) {
+            Ok(n) => n,
+            Err(_) => {
+                outcome = ArchiveEnd::Partial(PartialReason::GzipCorrupt);
+                entry_partial_reason = Some(PartialReason::GzipCorrupt);
+                break;
+            }
+        };
+
+        if n == 0 {
+            break;
+        }
+
+        scratch
+            .budgets
+            .charge_compressed_in(gz.take_compressed_delta());
+
+        let mut allowed = n as u64;
+        if let ChargeResult::Clamp { allowed: a, hit } =
+            scratch.budgets.charge_decompressed_out(allowed)
+        {
+            let r = budget_hit_to_partial_reason(hit);
+            allowed = a;
+            outcome = ArchiveEnd::Partial(r);
+            entry_partial_reason = Some(r);
+        }
+
+        if allowed == 0 {
+            break;
+        }
+
+        let allowed_usize = allowed as usize;
+        let read_len = carry + allowed_usize;
+
+        let base_offset = offset.saturating_sub(carry as u64);
+        let data = &buf.as_slice()[..read_len];
+
+        engine.scan_chunk_into(data, entry_file_id, base_offset, &mut scratch.scan_scratch);
+        if !entry_scanned {
+            metrics.archive.record_entry_scanned();
+            entry_scanned = true;
+        }
+
+        let new_bytes_start = offset;
+        scratch.scan_scratch.drop_prefix_findings(new_bytes_start);
+
+        scratch.pending.clear();
+        scratch
+            .scan_scratch
+            .drain_findings_into(&mut scratch.pending);
+
+        if dedupe && scratch.pending.len() > 1 {
+            dedupe_findings(&mut scratch.pending);
+        }
+
+        metrics.findings_emitted = metrics
+            .findings_emitted
+            .wrapping_add(scratch.pending.len() as u64);
+
+        emit_findings(
+            engine.as_ref(),
+            &*scratch.event_sink,
+            path_bytes,
+            &scratch.pending,
+        );
+
+        metrics.chunks_scanned = metrics.chunks_scanned.saturating_add(1);
+        metrics.bytes_scanned = metrics.bytes_scanned.saturating_add(allowed);
+
+        offset = offset.saturating_add(allowed);
+        have = read_len;
+        carry = overlap.min(read_len);
+
+        if allowed_usize < n {
+            break;
+        }
+    }
+
+    scratch.budgets.end_entry(offset > 0);
+    scratch.budgets.exit_archive();
+
+    let (_inner, hdr_buf) = gz.into_inner().into_parts();
+    scratch.gzip_header_buf = hdr_buf;
+
+    if !entry_scanned && outcome == ArchiveEnd::Scanned {
+        outcome = ArchiveEnd::Partial(PartialReason::GzipCorrupt);
+        entry_partial_reason = Some(PartialReason::GzipCorrupt);
+    }
+
+    if let Some(r) = entry_partial_reason {
+        metrics.archive.record_entry_partial(r, path_bytes, false);
+    }
+
+    outcome
+}
+
+/// Scan a gzip stream as a single virtual entry.
+///
+/// # Invariants
+/// - Offsets are decompressed byte offsets.
+/// - Budget clamps stop scanning deterministically.
+fn scan_gzip_stream_nested<E: ScanEngine, R: Read>(
+    scan: &mut ArchiveScanCtx<'_, E>,
+    gz: &mut GzipStream<R>,
+    display: &[u8],
+) -> ArchiveEnd {
+    let budgets = &mut *scan.budgets;
+    let chunk_size = scan.chunk_size.min(ARCHIVE_STREAM_READ_MAX);
+    let dedupe = scan.dedupe;
+    let overlap = scan.engine.required_overlap();
+    let file_id = alloc_virtual_file_id(scan.next_virtual_file_id);
+
+    if let Err(hit) = budgets.begin_entry() {
+        return budget_hit_to_archive_end(hit);
+    }
+
+    let mut buf = scan.pool.acquire();
+
+    let mut offset: u64 = 0;
+    let mut carry: usize = 0;
+    let mut have: usize = 0;
+    let mut outcome = ArchiveEnd::Scanned;
+    let mut entry_scanned = false;
+    let mut entry_partial_reason: Option<PartialReason> = None;
+
+    loop {
+        if carry > 0 && have > 0 {
+            buf.as_mut_slice().copy_within(have - carry..have, 0);
+        }
+
+        let allowance = budgets.remaining_decompressed_allowance_with_ratio_probe(true);
+        if allowance == 0 {
+            if let ChargeResult::Clamp { hit, .. } = budgets.charge_decompressed_out(1) {
+                let r = budget_hit_to_partial_reason(hit);
+                outcome = ArchiveEnd::Partial(r);
+                entry_partial_reason = Some(r);
+            }
+            break;
+        }
+
+        let read_max = chunk_size
+            .min(buf.len().saturating_sub(carry))
+            .min(allowance.min(u64::from(u32::MAX)) as usize);
+
+        if read_max == 0 {
+            if let ChargeResult::Clamp { hit, .. } = budgets.charge_decompressed_out(1) {
+                let r = budget_hit_to_partial_reason(hit);
+                outcome = ArchiveEnd::Partial(r);
+                entry_partial_reason = Some(r);
+            }
+            break;
+        }
+
+        let dst = &mut buf.as_mut_slice()[carry..carry + read_max];
+
+        let n = match gz.read(dst) {
+            Ok(n) => n,
+            Err(_) => {
+                outcome = ArchiveEnd::Partial(PartialReason::GzipCorrupt);
+                entry_partial_reason = Some(PartialReason::GzipCorrupt);
+                break;
+            }
+        };
+
+        if n == 0 {
+            break;
+        }
+
+        budgets.charge_compressed_in(gz.take_compressed_delta());
+
+        let mut allowed = n as u64;
+        if let ChargeResult::Clamp { allowed: a, hit } = budgets.charge_decompressed_out(allowed) {
+            let r = budget_hit_to_partial_reason(hit);
+            allowed = a;
+            outcome = ArchiveEnd::Partial(r);
+            entry_partial_reason = Some(r);
+        }
+
+        if allowed == 0 {
+            break;
+        }
+
+        let allowed_usize = allowed as usize;
+        let read_len = carry + allowed_usize;
+
+        let base_offset = offset.saturating_sub(carry as u64);
+        let data = &buf.as_slice()[..read_len];
+
+        scan.engine
+            .scan_chunk_into(data, file_id, base_offset, scan.scan_scratch);
+        if !entry_scanned {
+            scan.metrics.archive.record_entry_scanned();
+            entry_scanned = true;
+        }
+
+        let new_bytes_start = offset;
+        scan.scan_scratch.drop_prefix_findings(new_bytes_start);
+
+        scan.pending.clear();
+        scan.scan_scratch.drain_findings_into(scan.pending);
+
+        if dedupe && scan.pending.len() > 1 {
+            dedupe_findings(scan.pending);
+        }
+
+        scan.metrics.findings_emitted = scan
+            .metrics
+            .findings_emitted
+            .wrapping_add(scan.pending.len() as u64);
+
+        emit_findings(scan.engine.as_ref(), scan.event_sink, display, scan.pending);
+
+        scan.metrics.chunks_scanned = scan.metrics.chunks_scanned.saturating_add(1);
+        scan.metrics.bytes_scanned = scan.metrics.bytes_scanned.saturating_add(allowed);
+
+        offset = offset.saturating_add(allowed);
+        have = read_len;
+        carry = overlap.min(read_len);
+
+        if allowed_usize < n {
+            break;
+        }
+    }
+
+    budgets.end_entry(offset > 0);
+    if !entry_scanned && outcome == ArchiveEnd::Scanned {
+        outcome = ArchiveEnd::Partial(PartialReason::GzipCorrupt);
+        entry_partial_reason = Some(PartialReason::GzipCorrupt);
+    }
+    if let Some(r) = entry_partial_reason {
+        scan.metrics.archive.record_entry_partial(r, display, false);
+    }
+
+    outcome
+}
+
+/// Scan a tar stream (plain or gzip-wrapped), optionally recursing into nested archives.
+///
+/// # Invariants
+/// - Entry payloads are scanned with chunk+overlap semantics.
+/// - Non-regular entries are skipped explicitly.
+/// - Malformed headers or payload reads yield `PartialReason::MalformedTar`.
+/// - Caller has already entered the archive budget for this container.
+/// - `depth` is 1-based; nested expansion stops at `max_archive_depth`.
+fn scan_tar_stream_nested<E: ScanEngine>(
+    scan: &mut ArchiveScanCtx<'_, E>,
+    input: &mut dyn TarRead,
+    container_display: &[u8],
+    depth: u8,
+    ratio_active: bool,
+) -> ArchiveEnd {
+    let budgets = &mut *scan.budgets;
+    let chunk_size = scan.chunk_size.min(ARCHIVE_STREAM_READ_MAX);
+    let dedupe = scan.dedupe;
+    let overlap = scan.engine.required_overlap();
+    let max_len = scan.archive.max_virtual_path_len_per_entry;
+    let max_depth = scan.archive.max_archive_depth;
+
+    let (cur_vpath, rest_vpaths) = scan
+        .vpaths
+        .split_first_mut()
+        .expect("vpath scratch exhausted");
+    let (cur_path_used, rest_path_used) = scan
+        .path_budget_used
+        .split_first_mut()
+        .expect("path budget scratch exhausted");
+    let (cur_cursor, rest_cursors) = scan
+        .tar_cursors
+        .split_first_mut()
+        .expect("tar cursor scratch exhausted");
+
+    cur_cursor.reset();
+    *cur_path_used = 0;
+
+    let mut buf = scan.pool.acquire();
+    let mut outcome = ArchiveEnd::Scanned;
+
+    loop {
+        let (entry_display, entry_size, entry_pad, entry_typeflag, nested_kind) = {
+            let meta = match cur_cursor.next_entry(input, budgets, scan.archive) {
+                Ok(TarNext::End) => break,
+                Ok(TarNext::Stop(r)) => {
+                    outcome = ArchiveEnd::Partial(r);
+                    break;
+                }
+                Ok(TarNext::Entry(m)) => m,
+                Err(_) => {
+                    outcome = ArchiveEnd::Partial(PartialReason::MalformedTar);
+                    break;
+                }
+            };
+
+            let mut locator_buf = [0u8; LOCATOR_LEN];
+            let locator = build_locator(&mut locator_buf, b't', meta.header_block_index);
+            let entry_display = {
+                let c = scan
+                    .canon
+                    .canonicalize(meta.name, DEFAULT_MAX_COMPONENTS, max_len);
+                if c.had_traversal {
+                    scan.metrics.archive.record_path_had_traversal();
+                }
+                if c.component_cap_exceeded {
+                    scan.metrics.archive.record_component_cap_exceeded();
+                }
+                if c.truncated {
+                    scan.metrics.archive.record_path_truncated();
+                }
+                cur_vpath
+                    .build_with_suffix(container_display, c.bytes, locator, max_len)
+                    .bytes
+            };
+
+            let need = entry_display.len();
+            if cur_path_used.saturating_add(need) > scan.archive.max_virtual_path_bytes_per_archive
+            {
+                outcome = ArchiveEnd::Partial(PartialReason::PathBudgetExceeded);
+                break;
+            }
+            *cur_path_used = cur_path_used.saturating_add(need);
+
+            let nested_kind = detect_kind_from_name_bytes(meta.name);
+
+            (
+                entry_display,
+                meta.size,
+                meta.pad,
+                meta.typeflag,
+                nested_kind,
+            )
+        };
+
+        let is_regular = entry_typeflag == 0 || entry_typeflag == b'0';
+        if !is_regular {
+            scan.metrics.archive.record_entry_skipped(
+                EntrySkipReason::NonRegular,
+                entry_display,
+                false,
+            );
+            match cur_cursor.skip_payload_and_pad(input, budgets, entry_size, entry_pad) {
+                Ok(Ok(())) => continue,
+                _ => {
+                    outcome = ArchiveEnd::Partial(PartialReason::MalformedTar);
+                    break;
+                }
+            }
+        }
+
+        budgets.begin_entry_scan();
+        let mut stop_archive = false;
+
+        if let Some(kind) = nested_kind {
+            match kind {
+                ArchiveKind::Zip => {
+                    scan.metrics.archive.record_archive_skipped(
+                        ArchiveSkipReason::NeedsRandomAccessNoSpill,
+                        entry_display,
+                        false,
+                    );
+                    match scan.archive.unsupported_policy {
+                        crate::archive::UnsupportedPolicy::SkipWithTelemetry => {
+                            // Fall back to scanning raw bytes.
+                        }
+                        crate::archive::UnsupportedPolicy::FailArchive => {
+                            scan.metrics.archive.record_entry_skipped(
+                                EntrySkipReason::UnsupportedFeature,
+                                entry_display,
+                                false,
+                            );
+                            budgets.end_entry(false);
+                            outcome =
+                                ArchiveEnd::Skipped(ArchiveSkipReason::NeedsRandomAccessNoSpill);
+                            break;
+                        }
+                        crate::archive::UnsupportedPolicy::FailRun => {
+                            scan.abort_run.store(true, Ordering::Relaxed);
+                            scan.metrics.archive.record_entry_skipped(
+                                EntrySkipReason::UnsupportedFeature,
+                                entry_display,
+                                false,
+                            );
+                            budgets.end_entry(false);
+                            outcome =
+                                ArchiveEnd::Skipped(ArchiveSkipReason::NeedsRandomAccessNoSpill);
+                            break;
+                        }
+                    }
+                }
+                ArchiveKind::Gzip | ArchiveKind::Tar | ArchiveKind::TarGz => {
+                    if depth >= max_depth {
+                        scan.metrics.archive.record_archive_skipped(
+                            ArchiveSkipReason::DepthExceeded,
+                            entry_display,
+                            false,
+                        );
+                    } else if let Err(hit) = budgets.enter_archive() {
+                        let r = budget_hit_to_archive_end(hit);
+                        match r {
+                            ArchiveEnd::Skipped(reason) => scan
+                                .metrics
+                                .archive
+                                .record_archive_skipped(reason, entry_display, false),
+                            ArchiveEnd::Partial(reason) => scan
+                                .metrics
+                                .archive
+                                .record_archive_partial(reason, entry_display, false),
+                            _ => {}
+                        }
+                    } else {
+                        scan.metrics.archive.record_archive_seen();
+                        scan.metrics.archive.record_entry_scanned();
+
+                        let nested_outcome = match kind {
+                            ArchiveKind::Gzip => {
+                                let (gunzip_vpath, vpaths_tail) = rest_vpaths
+                                    .split_first_mut()
+                                    .expect("vpath scratch exhausted");
+                                let (gunzip_path_used, path_used_tail) = rest_path_used
+                                    .split_first_mut()
+                                    .expect("path budget scratch exhausted");
+                                let mut child = ArchiveScanCtx {
+                                    engine: scan.engine,
+                                    pool: scan.pool,
+                                    event_sink: scan.event_sink,
+                                    scan_scratch: scan.scan_scratch,
+                                    pending: scan.pending,
+                                    budgets,
+                                    canon: scan.canon,
+                                    vpaths: vpaths_tail,
+                                    path_budget_used: path_used_tail,
+                                    tar_cursors: rest_cursors,
+                                    gzip_header_buf: scan.gzip_header_buf,
+                                    gzip_name_buf: scan.gzip_name_buf,
+                                    next_virtual_file_id: scan.next_virtual_file_id,
+                                    metrics: scan.metrics,
+                                    archive: scan.archive,
+                                    dedupe: scan.dedupe,
+                                    chunk_size: scan.chunk_size,
+                                    abort_run: scan.abort_run,
+                                };
+
+                                let (mut gz, name_len) = match GzipStream::new_with_header(
+                                    LimitedRead::new(input, entry_size),
+                                    child.gzip_header_buf,
+                                    child.gzip_name_buf,
+                                    max_len,
+                                ) {
+                                    Ok(v) => v,
+                                    Err(_) => {
+                                        outcome = ArchiveEnd::Partial(PartialReason::MalformedTar);
+                                        budgets.exit_archive();
+                                        budgets.end_entry(true);
+                                        break;
+                                    }
+                                };
+                                let entry_name_bytes = if let Some(len) = name_len {
+                                    let c = child.canon.canonicalize(
+                                        &child.gzip_name_buf[..len],
+                                        DEFAULT_MAX_COMPONENTS,
+                                        max_len,
+                                    );
+                                    if c.had_traversal {
+                                        child.metrics.archive.record_path_had_traversal();
+                                    }
+                                    if c.component_cap_exceeded {
+                                        child.metrics.archive.record_component_cap_exceeded();
+                                    }
+                                    if c.truncated {
+                                        child.metrics.archive.record_path_truncated();
+                                    }
+                                    c.bytes
+                                } else {
+                                    b"<gunzip>"
+                                };
+                                let gunzip_display = gunzip_vpath
+                                    .build(entry_display, entry_name_bytes, max_len)
+                                    .bytes;
+                                *gunzip_path_used = 0;
+                                let need = gunzip_display.len();
+                                if gunzip_path_used.saturating_add(need)
+                                    > scan.archive.max_virtual_path_bytes_per_archive
+                                {
+                                    outcome =
+                                        ArchiveEnd::Partial(PartialReason::PathBudgetExceeded);
+                                    budgets.exit_archive();
+                                    budgets.end_entry(true);
+                                    break;
+                                }
+                                *gunzip_path_used = gunzip_path_used.saturating_add(need);
+
+                                let out =
+                                    scan_gzip_stream_nested(&mut child, &mut gz, gunzip_display);
+                                let (entry_reader, hdr_buf) = gz.into_inner().into_parts();
+                                *child.gzip_header_buf = hdr_buf;
+                                (out, entry_reader.remaining())
+                            }
+                            ArchiveKind::Tar => {
+                                let mut child = ArchiveScanCtx {
+                                    engine: scan.engine,
+                                    pool: scan.pool,
+                                    event_sink: scan.event_sink,
+                                    scan_scratch: scan.scan_scratch,
+                                    pending: scan.pending,
+                                    budgets,
+                                    canon: scan.canon,
+                                    vpaths: rest_vpaths,
+                                    path_budget_used: rest_path_used,
+                                    tar_cursors: rest_cursors,
+                                    gzip_header_buf: scan.gzip_header_buf,
+                                    gzip_name_buf: scan.gzip_name_buf,
+                                    next_virtual_file_id: scan.next_virtual_file_id,
+                                    metrics: scan.metrics,
+                                    archive: scan.archive,
+                                    dedupe: scan.dedupe,
+                                    chunk_size: scan.chunk_size,
+                                    abort_run: scan.abort_run,
+                                };
+                                let mut entry_reader = LimitedRead::new(input, entry_size);
+                                let out = scan_tar_stream_nested(
+                                    &mut child,
+                                    &mut entry_reader,
+                                    entry_display,
+                                    depth + 1,
+                                    ratio_active,
+                                );
+                                (out, entry_reader.remaining())
+                            }
+                            ArchiveKind::TarGz => {
+                                let mut child = ArchiveScanCtx {
+                                    engine: scan.engine,
+                                    pool: scan.pool,
+                                    event_sink: scan.event_sink,
+                                    scan_scratch: scan.scan_scratch,
+                                    pending: scan.pending,
+                                    budgets,
+                                    canon: scan.canon,
+                                    vpaths: rest_vpaths,
+                                    path_budget_used: rest_path_used,
+                                    tar_cursors: rest_cursors,
+                                    gzip_header_buf: scan.gzip_header_buf,
+                                    gzip_name_buf: scan.gzip_name_buf,
+                                    next_virtual_file_id: scan.next_virtual_file_id,
+                                    metrics: scan.metrics,
+                                    archive: scan.archive,
+                                    dedupe: scan.dedupe,
+                                    chunk_size: scan.chunk_size,
+                                    abort_run: scan.abort_run,
+                                };
+                                let entry_reader = LimitedRead::new(input, entry_size);
+                                let mut gz = GzipStream::new(entry_reader);
+                                let out = scan_tar_stream_nested(
+                                    &mut child,
+                                    &mut gz,
+                                    entry_display,
+                                    depth + 1,
+                                    true,
+                                );
+                                let entry_reader = gz.into_inner();
+                                (out, entry_reader.remaining())
+                            }
+                            ArchiveKind::Zip => unreachable!(),
+                        };
+
+                        budgets.exit_archive();
+
+                        let mut entry_partial_reason = match nested_outcome.0 {
+                            ArchiveEnd::Partial(r) => Some(r),
+                            ArchiveEnd::Skipped(r) => Some(map_archive_skip_to_partial(r)),
+                            ArchiveEnd::Scanned => None,
+                        };
+
+                        match nested_outcome.0 {
+                            ArchiveEnd::Scanned => scan.metrics.archive.record_archive_scanned(),
+                            ArchiveEnd::Skipped(r) => {
+                                scan.metrics
+                                    .archive
+                                    .record_archive_skipped(r, entry_display, false)
+                            }
+                            ArchiveEnd::Partial(r) => {
+                                scan.metrics.archive.record_archive_partial(
+                                    r,
+                                    entry_display,
+                                    false,
+                                );
+                            }
+                        }
+
+                        budgets.end_entry(true);
+
+                        let stop_reason = match nested_outcome.0 {
+                            ArchiveEnd::Partial(r) => Some(r),
+                            ArchiveEnd::Skipped(r) => Some(map_archive_skip_to_partial(r)),
+                            ArchiveEnd::Scanned => None,
+                        };
+                        if let Some(r) = stop_reason {
+                            if matches!(r, PartialReason::RootOutputBudgetExceeded) {
+                                outcome = ArchiveEnd::Partial(r);
+                                stop_archive = true;
+                            }
+                        }
+
+                        if !stop_archive && nested_outcome.1 > 0 {
+                            if entry_partial_reason.is_none() {
+                                entry_partial_reason = Some(PartialReason::MalformedTar);
+                            }
+                            if let Err(r) = discard_remaining_payload(
+                                input,
+                                budgets,
+                                buf.as_mut_slice(),
+                                nested_outcome.1,
+                            ) {
+                                if entry_partial_reason.is_none() {
+                                    entry_partial_reason = Some(r);
+                                }
+                                outcome = ArchiveEnd::Partial(r);
+                                stop_archive = true;
+                            }
+                        }
+
+                        if let Some(r) = entry_partial_reason {
+                            scan.metrics
+                                .archive
+                                .record_entry_partial(r, entry_display, false);
+                        }
+
+                        if !stop_archive {
+                            match cur_cursor.skip_padding_only(input, budgets, entry_pad) {
+                                Ok(Ok(())) => {}
+                                _ => {
+                                    outcome = ArchiveEnd::Partial(PartialReason::MalformedTar);
+                                    stop_archive = true;
+                                }
+                            }
+                        }
+
+                        if stop_archive {
+                            break;
+                        }
+
+                        cur_cursor.advance_entry_blocks(entry_size, entry_pad);
+                        continue;
+                    }
+                }
+            }
+        }
+
+        let entry_file_id = alloc_virtual_file_id(scan.next_virtual_file_id);
+        let mut remaining = entry_size;
+        let mut offset: u64 = 0;
+        let mut carry: usize = 0;
+        let mut have: usize = 0;
+        let mut entry_scanned = false;
+        let mut entry_partial_reason: Option<PartialReason> = None;
+        let mut stop_archive = false;
+
+        while remaining > 0 {
+            if carry > 0 && have > 0 {
+                buf.as_mut_slice().copy_within(have - carry..have, 0);
+            }
+
+            let allow = budgets.remaining_decompressed_allowance_with_ratio_probe(ratio_active);
+            if allow == 0 {
+                if let ChargeResult::Clamp { hit, .. } = budgets.charge_decompressed_out(1) {
+                    let r = budget_hit_to_partial_reason(hit);
+                    entry_partial_reason = Some(r);
+                    if !matches!(hit, BudgetHit::SkipEntry(_)) {
+                        outcome = ArchiveEnd::Partial(r);
+                        stop_archive = true;
+                    }
+                }
+                break;
+            }
+
+            let read_max = chunk_size
+                .min(buf.as_mut_slice().len().saturating_sub(carry))
+                .min(allow.min(remaining).min(u64::from(u32::MAX)) as usize);
+            if read_max == 0 {
+                if let ChargeResult::Clamp { hit, .. } = budgets.charge_decompressed_out(1) {
+                    let r = budget_hit_to_partial_reason(hit);
+                    entry_partial_reason = Some(r);
+                    if !matches!(hit, BudgetHit::SkipEntry(_)) {
+                        outcome = ArchiveEnd::Partial(r);
+                        stop_archive = true;
+                    }
+                }
+                break;
+            }
+
+            let dst = &mut buf.as_mut_slice()[carry..carry + read_max];
+            let n = match input.read(dst) {
+                Ok(n) => n,
+                Err(_) => {
+                    outcome = ArchiveEnd::Partial(PartialReason::MalformedTar);
+                    entry_partial_reason = Some(PartialReason::MalformedTar);
+                    stop_archive = true;
+                    break;
+                }
+            };
+            budgets.charge_compressed_in(input.take_compressed_delta());
+            if n == 0 {
+                outcome = ArchiveEnd::Partial(PartialReason::MalformedTar);
+                entry_partial_reason = Some(PartialReason::MalformedTar);
+                stop_archive = true;
+                break;
+            }
+            remaining = remaining.saturating_sub(n as u64);
+
+            let (allowed, clamped) = apply_entry_budget_clamp(
+                budgets,
+                n,
+                &mut entry_partial_reason,
+                &mut outcome,
+                &mut stop_archive,
+            );
+            if allowed == 0 {
+                break;
+            }
+
+            let allowed_usize = allowed as usize;
+            let read_len = carry + allowed_usize;
+            let base_offset = offset.saturating_sub(carry as u64);
+            let data = &buf.as_slice()[..read_len];
+
+            scan.engine
+                .scan_chunk_into(data, entry_file_id, base_offset, scan.scan_scratch);
+            if !entry_scanned {
+                scan.metrics.archive.record_entry_scanned();
+                entry_scanned = true;
+            }
+
+            let new_bytes_start = offset;
+            scan.scan_scratch.drop_prefix_findings(new_bytes_start);
+
+            scan.pending.clear();
+            scan.scan_scratch.drain_findings_into(scan.pending);
+
+            if dedupe && scan.pending.len() > 1 {
+                dedupe_findings(scan.pending);
+            }
+
+            scan.metrics.findings_emitted = scan
+                .metrics
+                .findings_emitted
+                .wrapping_add(scan.pending.len() as u64);
+            emit_findings(
+                scan.engine.as_ref(),
+                scan.event_sink,
+                entry_display,
+                scan.pending,
+            );
+
+            scan.metrics.chunks_scanned = scan.metrics.chunks_scanned.saturating_add(1);
+            scan.metrics.bytes_scanned = scan.metrics.bytes_scanned.saturating_add(allowed);
+
+            offset = offset.saturating_add(allowed);
+            have = read_len;
+            carry = overlap.min(read_len);
+
+            if clamped {
+                break;
+            }
+        }
+
+        if !stop_archive && remaining > 0 {
+            if let Err(r) = discard_remaining_payload(input, budgets, buf.as_mut_slice(), remaining)
+            {
+                if entry_partial_reason.is_none() {
+                    entry_partial_reason = Some(r);
+                }
+                outcome = ArchiveEnd::Partial(r);
+                stop_archive = true;
+            }
+        }
+
+        budgets.end_entry(offset > 0);
+        if let Some(r) = entry_partial_reason {
+            scan.metrics
+                .archive
+                .record_entry_partial(r, entry_display, false);
+        }
+
+        if stop_archive {
+            break;
+        }
+
+        match cur_cursor.skip_padding_only(input, budgets, entry_pad) {
+            Ok(Ok(())) => {}
+            Ok(Err(r)) => {
+                outcome = ArchiveEnd::Partial(r);
+                break;
+            }
+            Err(_) => {
+                outcome = ArchiveEnd::Partial(PartialReason::MalformedTar);
+                break;
+            }
+        }
+        cur_cursor.advance_entry_blocks(entry_size, entry_pad);
+    }
+
+    outcome
+}
+
+/// Scan a `.tar` or `.tar.gz` root by wiring budgets + tar stream scanning.
+fn process_tar_like<E: ScanEngine>(
+    task: &FileTask,
+    ctx: &mut WorkerCtx<FileTask, LocalScratch<E>>,
+    mut input: TarInput,
+) -> ArchiveEnd {
+    let parent_bytes = task.path.as_os_str().as_encoded_bytes();
+
+    let (scratch, metrics) = {
+        let WorkerCtx {
+            scratch, metrics, ..
+        } = ctx;
+        (scratch, metrics)
+    };
+
+    let mut scan = ArchiveScanCtx::new(scratch, metrics);
+
+    scan.budgets.reset();
+    if let Err(hit) = scan.budgets.enter_archive() {
+        return budget_hit_to_archive_end(hit);
+    }
+
+    let ratio_active = matches!(input, TarInput::Gzip(_));
+    let outcome = scan_tar_stream_nested(&mut scan, &mut input, parent_bytes, 1, ratio_active);
+
+    scan.budgets.exit_archive();
+    outcome
+}
+
+/// Process a plain `.tar` file.
+fn process_tar_file<E: ScanEngine>(
+    task: &FileTask,
+    ctx: &mut WorkerCtx<FileTask, LocalScratch<E>>,
+) -> ArchiveEnd {
+    let file = match File::open(&task.path) {
+        Ok(f) => f,
+        Err(_) => {
+            ctx.metrics.io_errors = ctx.metrics.io_errors.saturating_add(1);
+            return ArchiveEnd::Skipped(ArchiveSkipReason::IoError);
+        }
+    };
+    process_tar_like::<E>(task, ctx, TarInput::Plain(file))
+}
+
+/// Process a `.tar.gz` file via gzip+tar streaming.
+fn process_targz_file<E: ScanEngine>(
+    task: &FileTask,
+    ctx: &mut WorkerCtx<FileTask, LocalScratch<E>>,
+) -> ArchiveEnd {
+    let file = match File::open(&task.path) {
+        Ok(f) => f,
+        Err(_) => {
+            ctx.metrics.io_errors = ctx.metrics.io_errors.saturating_add(1);
+            return ArchiveEnd::Skipped(ArchiveSkipReason::IoError);
+        }
+    };
+    process_tar_like::<E>(task, ctx, TarInput::Gzip(GzipStream::new(file)))
+}
+
+/// Scan a ZIP file using file-backed random access.
+///
+/// # Design Notes
+/// - Central directory parsing is bounded by metadata budgets.
+/// - Only stored/deflated entries are scanned; others are skipped explicitly.
+fn process_zip_file<E: ScanEngine>(
+    task: &FileTask,
+    ctx: &mut WorkerCtx<FileTask, LocalScratch<E>>,
+) -> ArchiveEnd {
+    let (scratch, metrics) = {
+        let WorkerCtx {
+            scratch, metrics, ..
+        } = ctx;
+        (scratch, metrics)
+    };
+    let chunk_size = scratch.chunk_size.min(ARCHIVE_STREAM_READ_MAX);
+    let dedupe = scratch.dedupe_within_chunk;
+    let LocalScratch {
+        engine,
+        pool,
+        event_sink,
+        scan_scratch,
+        pending,
+        archive,
+        canon,
+        vpaths,
+        path_budget_used,
+        budgets,
+        zip_cursor,
+        entry_display_buf,
+        next_virtual_file_id,
+        abort_run,
+        ..
+    } = scratch;
+    let overlap = engine.required_overlap();
+
+    let file = match File::open(&task.path) {
+        Ok(f) => f,
+        Err(_) => {
+            metrics.io_errors = metrics.io_errors.saturating_add(1);
+            return ArchiveEnd::Skipped(ArchiveSkipReason::IoError);
+        }
+    };
+
+    budgets.reset();
+    if let Err(hit) = budgets.enter_archive() {
+        return budget_hit_to_archive_end(hit);
+    }
+
+    let cursor = zip_cursor;
+    let open = match cursor.open(file, budgets, archive) {
+        Ok(open) => open,
+        Err(_) => {
+            budgets.exit_archive();
+            return ArchiveEnd::Skipped(ArchiveSkipReason::IoError);
+        }
+    };
+
+    match open {
+        ZipOpen::Ready => {}
+        ZipOpen::Skip(r) => {
+            budgets.exit_archive();
+            if r == ArchiveSkipReason::UnsupportedFeature {
+                match archive.unsupported_policy {
+                    crate::archive::UnsupportedPolicy::SkipWithTelemetry
+                    | crate::archive::UnsupportedPolicy::FailArchive => {
+                        return ArchiveEnd::Skipped(r);
+                    }
+                    crate::archive::UnsupportedPolicy::FailRun => {
+                        abort_run.store(true, Ordering::Relaxed);
+                        return ArchiveEnd::Skipped(r);
+                    }
+                }
+            }
+            return ArchiveEnd::Skipped(r);
+        }
+        ZipOpen::Stop(r) => {
+            budgets.exit_archive();
+            return ArchiveEnd::Partial(r);
+        }
+    }
+
+    let parent_bytes = task.path.as_os_str().as_encoded_bytes();
+    let max_len = archive.max_virtual_path_len_per_entry;
+    debug_assert!(path_budget_used.len() > 1);
+    path_budget_used[1] = 0;
+
+    let mut buf = pool.acquire();
+    let mut outcome = ArchiveEnd::Scanned;
+
+    loop {
+        let (
+            flags,
+            method,
+            compressed_size,
+            uncompressed_size,
+            local_header_offset,
+            cdfh_offset,
+            lfh_offset_valid,
+            is_dir,
+            name_truncated,
+            name_hash64,
+            entry_display,
+        ) = {
+            let meta = match cursor.next_entry(budgets, archive) {
+                Ok(ZipNext::End) => break,
+                Ok(ZipNext::Stop(r)) => {
+                    outcome = ArchiveEnd::Partial(r);
+                    break;
+                }
+                Ok(ZipNext::Entry(m)) => m,
+                Err(_) => {
+                    outcome = ArchiveEnd::Partial(PartialReason::MalformedZip);
+                    break;
+                }
+            };
+
+            let (locator_kind, locator_value) = if meta.lfh_offset_valid {
+                (b'z', meta.local_header_offset)
+            } else {
+                (b'c', meta.cdfh_offset)
+            };
+            let mut locator_buf = [0u8; LOCATOR_LEN];
+            let locator = build_locator(&mut locator_buf, locator_kind, locator_value);
+            let entry_display = {
+                let c = canon.canonicalize(meta.name, DEFAULT_MAX_COMPONENTS, max_len);
+                if c.had_traversal {
+                    metrics.archive.record_path_had_traversal();
+                }
+                if c.component_cap_exceeded {
+                    metrics.archive.record_component_cap_exceeded();
+                }
+                let entry_bytes = if meta.name_truncated {
+                    metrics.archive.record_path_truncated();
+                    entry_display_buf.clear();
+                    entry_display_buf.extend_from_slice(c.bytes);
+                    apply_hash_suffix_truncation(entry_display_buf, meta.name_hash64, max_len);
+                    entry_display_buf.as_slice()
+                } else {
+                    if c.truncated {
+                        metrics.archive.record_path_truncated();
+                    }
+                    c.bytes
+                };
+                vpaths[1]
+                    .build_with_suffix(parent_bytes, entry_bytes, locator, max_len)
+                    .bytes
+            };
+
+            let need = entry_display.len();
+            if path_budget_used[1].saturating_add(need) > archive.max_virtual_path_bytes_per_archive
+            {
+                outcome = ArchiveEnd::Partial(PartialReason::PathBudgetExceeded);
+                break;
+            }
+            path_budget_used[1] = path_budget_used[1].saturating_add(need);
+
+            if meta.is_dir {
+                metrics.archive.record_entry_skipped(
+                    EntrySkipReason::NonRegular,
+                    entry_display,
+                    false,
+                );
+                continue;
+            }
+
+            if meta.is_encrypted() {
+                metrics.archive.record_entry_skipped(
+                    EntrySkipReason::EncryptedEntry,
+                    entry_display,
+                    false,
+                );
+                match archive.encrypted_policy {
+                    crate::archive::EncryptedPolicy::SkipWithTelemetry => {
+                        continue;
+                    }
+                    crate::archive::EncryptedPolicy::FailArchive => {
+                        outcome = ArchiveEnd::Skipped(ArchiveSkipReason::EncryptedArchive);
+                        break;
+                    }
+                    crate::archive::EncryptedPolicy::FailRun => {
+                        abort_run.store(true, Ordering::Relaxed);
+                        outcome = ArchiveEnd::Skipped(ArchiveSkipReason::EncryptedArchive);
+                        break;
+                    }
+                }
+            }
+            if !meta.compression_supported() {
+                metrics.archive.record_entry_skipped(
+                    EntrySkipReason::UnsupportedCompression,
+                    entry_display,
+                    false,
+                );
+                match archive.unsupported_policy {
+                    crate::archive::UnsupportedPolicy::SkipWithTelemetry => {
+                        continue;
+                    }
+                    crate::archive::UnsupportedPolicy::FailArchive => {
+                        outcome = ArchiveEnd::Skipped(ArchiveSkipReason::UnsupportedFeature);
+                        break;
+                    }
+                    crate::archive::UnsupportedPolicy::FailRun => {
+                        abort_run.store(true, Ordering::Relaxed);
+                        outcome = ArchiveEnd::Skipped(ArchiveSkipReason::UnsupportedFeature);
+                        break;
+                    }
+                }
+            }
+
+            (
+                meta.flags,
+                meta.method,
+                meta.compressed_size,
+                meta.uncompressed_size,
+                meta.local_header_offset,
+                meta.cdfh_offset,
+                meta.lfh_offset_valid,
+                meta.is_dir,
+                meta.name_truncated,
+                meta.name_hash64,
+                entry_display,
+            )
+        };
+
+        let meta = ZipEntryMeta {
+            name: b"",
+            flags,
+            method,
+            compressed_size,
+            uncompressed_size,
+            local_header_offset,
+            cdfh_offset,
+            lfh_offset_valid,
+            is_dir,
+            name_truncated,
+            name_hash64,
+        };
+
+        budgets.begin_entry_scan();
+
+        let mut reader = match cursor.open_entry_reader(&meta, budgets) {
+            Ok(Ok(r)) => r,
+            Ok(Err(r)) => {
+                if r == PartialReason::MalformedZip {
+                    metrics.archive.record_entry_skipped(
+                        EntrySkipReason::CorruptEntry,
+                        entry_display,
+                        false,
+                    );
+                    budgets.end_entry(false);
+                    continue;
+                }
+                outcome = ArchiveEnd::Partial(r);
+                budgets.end_entry(false);
+                break;
+            }
+            Err(_) => {
+                outcome = ArchiveEnd::Skipped(ArchiveSkipReason::IoError);
+                budgets.end_entry(false);
+                break;
+            }
+        };
+
+        let path_bytes = entry_display;
+        let entry_file_id = alloc_virtual_file_id(next_virtual_file_id);
+
+        let mut last_comp = 0u64;
+        let ratio_active = meta.method == 8;
+
+        let mut offset: u64 = 0;
+        let mut carry: usize = 0;
+        let mut have: usize = 0;
+        let mut entry_scanned = false;
+        let mut entry_partial_reason: Option<PartialReason> = None;
+        let mut stop_archive = false;
+
+        loop {
+            if carry > 0 && have > 0 {
+                buf.as_mut_slice().copy_within(have - carry..have, 0);
+            }
+
+            let allowance = budgets.remaining_decompressed_allowance_with_ratio_probe(ratio_active);
+            if allowance == 0 {
+                if let ChargeResult::Clamp { hit, .. } = budgets.charge_decompressed_out(1) {
+                    let r = budget_hit_to_partial_reason(hit);
+                    entry_partial_reason = Some(r);
+                    if !matches!(hit, BudgetHit::SkipEntry(_)) {
+                        outcome = ArchiveEnd::Partial(r);
+                        stop_archive = true;
+                    }
+                }
+                break;
+            }
+
+            let read_max = chunk_size
+                .min(buf.len().saturating_sub(carry))
+                .min(allowance.min(u64::from(u32::MAX)) as usize);
+
+            if read_max == 0 {
+                if let ChargeResult::Clamp { hit, .. } = budgets.charge_decompressed_out(1) {
+                    let r = budget_hit_to_partial_reason(hit);
+                    entry_partial_reason = Some(r);
+                    if !matches!(hit, BudgetHit::SkipEntry(_)) {
+                        outcome = ArchiveEnd::Partial(r);
+                        stop_archive = true;
+                    }
+                }
+                break;
+            }
+
+            let dst = &mut buf.as_mut_slice()[carry..carry + read_max];
+
+            let n = match reader.read_decompressed(dst) {
+                Ok(n) => n,
+                Err(_) => {
+                    outcome = ArchiveEnd::Partial(PartialReason::MalformedZip);
+                    entry_partial_reason = Some(PartialReason::MalformedZip);
+                    break;
+                }
+            };
+
+            let now = reader.total_compressed();
+            let delta = now.saturating_sub(last_comp);
+            last_comp = now;
+            if delta > 0 {
+                budgets.charge_compressed_in(delta);
+            }
+
+            if n == 0 {
+                break;
+            }
+
+            let mut allowed = n as u64;
+            if let ChargeResult::Clamp { allowed: a, hit } =
+                budgets.charge_decompressed_out(allowed)
+            {
+                let r = budget_hit_to_partial_reason(hit);
+                allowed = a;
+                entry_partial_reason = Some(r);
+                if !matches!(hit, BudgetHit::SkipEntry(_)) {
+                    outcome = ArchiveEnd::Partial(r);
+                    stop_archive = true;
+                }
+            }
+            if allowed == 0 {
+                if let Err(r) = charge_discarded_bytes(budgets, n as u64) {
+                    if entry_partial_reason.is_none() {
+                        entry_partial_reason = Some(r);
+                    }
+                    outcome = ArchiveEnd::Partial(r);
+                    stop_archive = true;
+                }
+                break;
+            }
+
+            let allowed_usize = allowed as usize;
+            let read_len = carry + allowed_usize;
+
+            let base_offset = offset.saturating_sub(carry as u64);
+            let data = &buf.as_slice()[..read_len];
+
+            engine.scan_chunk_into(data, entry_file_id, base_offset, scan_scratch);
+            if !entry_scanned {
+                metrics.archive.record_entry_scanned();
+                entry_scanned = true;
+            }
+
+            let new_bytes_start = offset;
+            scan_scratch.drop_prefix_findings(new_bytes_start);
+
+            pending.clear();
+            scan_scratch.drain_findings_into(pending);
+
+            if dedupe && pending.len() > 1 {
+                dedupe_findings(pending);
+            }
+
+            metrics.findings_emitted = metrics.findings_emitted.wrapping_add(pending.len() as u64);
+            emit_findings(engine.as_ref(), &**event_sink, path_bytes, pending);
+
+            metrics.chunks_scanned = metrics.chunks_scanned.saturating_add(1);
+            metrics.bytes_scanned = metrics.bytes_scanned.saturating_add(allowed);
+
+            offset = offset.saturating_add(allowed);
+
+            have = read_len;
+            carry = overlap.min(read_len);
+
+            if allowed_usize < n {
+                let extra = (n - allowed_usize) as u64;
+                if let Err(r) = charge_discarded_bytes(budgets, extra) {
+                    if entry_partial_reason.is_none() {
+                        entry_partial_reason = Some(r);
+                    }
+                    outcome = ArchiveEnd::Partial(r);
+                    stop_archive = true;
+                }
+                break;
+            }
+        }
+
+        budgets.end_entry(offset > 0);
+        if let Some(r) = entry_partial_reason {
+            metrics.archive.record_entry_partial(r, path_bytes, false);
+        }
+        if stop_archive {
+            break;
+        }
+    }
+
+    budgets.exit_archive();
+    outcome
+}
+
+// ============================================================================
+// File Processing
+// ============================================================================
+
+/// Process a single file: open, chunk, scan, close.
+///
+/// When archive scanning is enabled, archive containers are detected by
+/// extension/magic and routed through the archive dispatch path before any
+/// chunk reads are issued.
+///
+/// # Design: Sequential Read with Overlap Carry
+///
+/// Instead of seeking back for each chunk's overlap, we:
+/// 1. Acquire ONE buffer for the entire file (blocking)
+/// 2. Read sequentially, carrying overlap bytes forward via `copy_within`
+/// 3. No seeks, no re-reading overlap from kernel, no per-chunk pool churn
+///
+/// # File Size Semantics
+///
+/// Uses file size from metadata after open (not discovery hint).
+/// This gives point-in-time snapshot semantics:
+/// - Truncated files: we stop at actual EOF
+/// - Growing files: we stop at size-at-open (consistent snapshot)
+///
+/// # Chunk Processing Loop
+///
+/// ```text
+/// ┌────────────────────────────────────────────────────────────────────┐
+/// │                        process_file() flow                         │
+/// └────────────────────────────────────────────────────────────────────┘
+///
+/// open(path) ─► metadata.len() ─► acquire_buffer()
+///                    │
+///                    ▼
+///     ┌──────────────────────────────┐
+///     │     for each chunk:          │◄──────────────────┐
+///     │  1. copy_within(overlap)     │                   │
+///     │  2. read(new_bytes)          │                   │
+///     │  3. scan_chunk_into()        │                   │
+///     │  4. drop_prefix_findings()   │                   │
+///     │  5. emit_findings()          │                   │
+///     └──────────────┬───────────────┘                   │
+///                    │                                   │
+///                    ▼                                   │
+///            offset < file_size? ───yes──────────────────┘
+///                    │
+///                    no
+///                    ▼
+///             release_buffer()
+/// ```
+///
+/// # Error Handling
+///
+/// I/O errors are logged but do not propagate (fail-soft per file).
+/// The executor continues with remaining files.
+fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, LocalScratch<E>>) {
+    if ctx.scratch.abort_run.load(Ordering::Relaxed) {
+        return;
+    }
+    let scratch = &mut ctx.scratch;
+    let engine = &scratch.engine;
+    let overlap = engine.required_overlap();
+    let chunk_size = scratch.chunk_size;
+    let path_bytes = task.path.as_os_str().as_encoded_bytes();
+    let ext_kind = if scratch.archive.enabled {
+        detect_kind_from_path(&task.path)
+    } else {
+        None
+    };
+
+    if let Some(kind) = ext_kind {
+        ctx.metrics.archive.record_archive_seen();
+        let outcome = dispatch_archive_scan(&task, ctx, kind);
+        match outcome {
+            ArchiveEnd::Scanned => ctx.metrics.archive.record_archive_scanned(),
+            ArchiveEnd::Skipped(r) => ctx
+                .metrics
+                .archive
+                .record_archive_skipped(r, path_bytes, false),
+            ArchiveEnd::Partial(r) => ctx
+                .metrics
+                .archive
+                .record_archive_partial(r, path_bytes, false),
+        }
+        return;
+    }
+
+    // Open file
+    #[cfg(all(feature = "perf-stats", debug_assertions))]
+    let open_start = std::time::Instant::now();
+
+    let mut file = match File::open(&task.path) {
+        Ok(f) => f,
+        Err(e) => {
+            ctx.metrics.io_errors = ctx.metrics.io_errors.saturating_add(1);
+            #[cfg(debug_assertions)]
+            eprintln!("[local] Failed to open file {:?}: {}", task.path, e);
+            let _ = e;
+
+            return;
+        }
+    };
+
+    // Use actual file size after open (snapshot semantics)
+    // Discovery size is just a hint; file may have changed
+    let file_size = match file.metadata() {
+        Ok(m) => m.len(),
+        Err(e) => {
+            ctx.metrics.io_errors = ctx.metrics.io_errors.saturating_add(1);
+            #[cfg(debug_assertions)]
+            eprintln!("[local] Failed to get metadata {:?}: {}", task.path, e);
+            let _ = e;
+
+            return;
+        }
+    };
+
+    #[cfg(all(feature = "perf-stats", debug_assertions))]
+    {
+        ctx.metrics.open_stat_ns = ctx
+            .metrics
+            .open_stat_ns
+            .saturating_add(open_start.elapsed().as_nanos() as u64);
+    }
+
+    // Empty file: nothing to scan
+    if file_size == 0 {
+        return;
+    }
+
+    // Enforce size cap at open time for snapshot semantics.
+    if file_size > scratch.max_file_size {
+        return;
+    }
+
+    if scratch.archive.enabled {
+        let mut header = [0u8; TAR_BLOCK_LEN];
+        let n = match file.read(&mut header) {
+            Ok(n) => n,
+            Err(e) => {
+                ctx.metrics.io_errors = ctx.metrics.io_errors.saturating_add(1);
+                #[cfg(debug_assertions)]
+                eprintln!("[local] Failed to read header {:?}: {}", task.path, e);
+                let _ = e;
+                return;
+            }
+        };
+        if n > 0 {
+            if let Some(kind) = sniff_kind_from_header(&header[..n]) {
+                ctx.metrics.archive.record_archive_seen();
+                let outcome = dispatch_archive_scan(&task, ctx, kind);
+                match outcome {
+                    ArchiveEnd::Scanned => ctx.metrics.archive.record_archive_scanned(),
+                    ArchiveEnd::Skipped(r) => ctx
+                        .metrics
+                        .archive
+                        .record_archive_skipped(r, path_bytes, false),
+                    ArchiveEnd::Partial(r) => ctx
+                        .metrics
+                        .archive
+                        .record_archive_partial(r, path_bytes, false),
+                }
+                return;
+            }
+        }
+        if let Err(e) = file.seek(SeekFrom::Start(0)) {
+            ctx.metrics.io_errors = ctx.metrics.io_errors.saturating_add(1);
+            #[cfg(debug_assertions)]
+            eprintln!("[local] Failed to rewind {:?}: {}", task.path, e);
+            let _ = e;
+            return;
+        }
+    }
+
+    // Acquire ONE buffer for the entire file (blocking, never skip)
+    // This is correct because:
+    // 1. CountBudget limits in-flight files, so pool sizing should accommodate
+    // 2. Blocking is the right primitive for work-conserving semantics
+    let mut buf = scratch.pool.acquire();
+
+    // State for overlap carry pattern
+    let mut offset: u64 = 0; // Logical offset of next "new" bytes
+    let mut carry: usize = 0; // Bytes of overlap prefix for next scan
+    let mut have: usize = 0; // Total bytes in buffer from last iteration
+
+    loop {
+        // Move tail overlap bytes to front as next prefix
+        // This is a tiny copy (overlap bytes, typically 16-256)
+        if carry > 0 && have > 0 {
+            buf.as_mut_slice().copy_within(have - carry..have, 0);
+        }
+
+        // Read next payload bytes after the prefix.
+        // Cap by remaining snapshot size to maintain point-in-time semantics:
+        // if the file grows after open, we only scan up to the original size.
+        let read_start = carry;
+        let remaining_in_snapshot = file_size.saturating_sub(offset) as usize;
+        if remaining_in_snapshot == 0 {
+            // Reached snapshot boundary - done with this file
+            break;
+        }
+        let read_max = chunk_size.min(buf.len() - carry).min(remaining_in_snapshot);
+        let dst = &mut buf.as_mut_slice()[read_start..read_start + read_max];
+
+        #[cfg(all(feature = "perf-stats", debug_assertions))]
+        let read_start_t = std::time::Instant::now();
+
+        let n = match read_some(&mut file, dst) {
+            Ok(n) => n,
+            Err(e) => {
+                ctx.metrics.io_errors = ctx.metrics.io_errors.saturating_add(1);
+                #[cfg(debug_assertions)]
+                eprintln!("[local] Read failed for {:?}: {}", task.path, e);
+                let _ = e;
+
+                break;
+            }
+        };
+
+        #[cfg(all(feature = "perf-stats", debug_assertions))]
+        {
+            ctx.metrics.read_ns = ctx
+                .metrics
+                .read_ns
+                .saturating_add(read_start_t.elapsed().as_nanos() as u64);
+        }
+
+        // EOF: done with this file
+        if n == 0 {
+            break;
+        }
+
+        let read_len = carry + n; // Total bytes available for scanning
+        let _prefix_len = carry; // (for debugging/tracing)
+
+        // base_offset: absolute file offset of buf[0]
+        // For first chunk: base_offset = 0, prefix_len = 0
+        // For subsequent: base_offset = offset - carry
+        let base_offset = offset.saturating_sub(carry as u64);
+
+        // Scan the chunk
+        #[cfg(all(feature = "perf-stats", debug_assertions))]
+        let scan_start_t = std::time::Instant::now();
+
+        let data = &buf.as_slice()[..read_len];
+        engine.scan_chunk_into(data, task.file_id, base_offset, &mut scratch.scan_scratch);
+
+        #[cfg(all(feature = "perf-stats", debug_assertions))]
+        {
+            ctx.metrics.scan_ns = ctx
+                .metrics
+                .scan_ns
+                .saturating_add(scan_start_t.elapsed().as_nanos() as u64);
+        }
+
+        // Drop findings whose root_hint_end is in the prefix region.
+        // These will be (or were) found by the chunk that "owns" those bytes.
+        // new_bytes_start == offset (the first truly new byte in this scan)
+        let new_bytes_start = offset;
+        scratch.scan_scratch.drop_prefix_findings(new_bytes_start);
+
+        // Extract findings
+        scratch.pending.clear();
+        scratch
+            .scan_scratch
+            .drain_findings_into(&mut scratch.pending);
+
+        // Optional within-chunk dedupe (only needed if engine can emit duplicates)
+        if scratch.dedupe_within_chunk && scratch.pending.len() > 1 {
+            dedupe_findings(&mut scratch.pending);
+        }
+
+        // Count findings before emitting (pending.len() is the count for this chunk)
+        ctx.metrics.findings_emitted = ctx
+            .metrics
+            .findings_emitted
+            .wrapping_add(scratch.pending.len() as u64);
+
+        // Emit findings
+        emit_findings(
+            engine.as_ref(),
+            &*scratch.event_sink,
+            path_bytes,
+            &scratch.pending,
+        );
+
+        // Update metrics with ACTUAL bytes scanned (not planned)
+        let actual_payload = n; // New bytes read this iteration
+        ctx.metrics.chunks_scanned = ctx.metrics.chunks_scanned.saturating_add(1);
+        ctx.metrics.bytes_scanned = ctx
+            .metrics
+            .bytes_scanned
+            .saturating_add(actual_payload as u64);
+
+        // Advance offset by actual payload read
+        offset = offset.saturating_add(actual_payload as u64);
+        have = read_len;
+        carry = overlap.min(read_len);
+
+        // Stop at snapshot size (consistent point-in-time semantics)
+        if offset >= file_size {
+            break;
+        }
+    }
+
+    // Buffer returned to pool on drop
+    // Permit released when FileTask drops
+}
+
+/// Read some bytes, handling EINTR.
+///
+/// Returns number of bytes read (0 at EOF).
+///
+/// # Why not `read_exact`?
+///
+/// We want partial reads at EOF (to handle final chunk), while `read_exact`
+/// returns `UnexpectedEof` on short reads. This wrapper gives us EINTR-safe
+/// partial-read semantics.
+///
+/// # Signal Handling
+///
+/// `EINTR` (interrupted system call) can occur when a signal is delivered
+/// during the read. This wrapper retries automatically, which is the standard
+/// Unix idiom for non-interruptible reads.
 fn read_some(file: &mut File, dst: &mut [u8]) -> io::Result<usize> {
     loop {
         match file.read(dst) {
@@ -198,627 +2455,757 @@ fn read_some(file: &mut File, dst: &mut [u8]) -> io::Result<usize> {
     }
 }
 
-/// Sort+dedup findings by `(rule_id, root_hint_start, root_hint_end, span_start, span_end)`.
-///
-/// Eliminates duplicate findings within a single chunk that share the same
-/// rule and span coordinates. Operates in-place to avoid allocation.
-///
-/// Complexity: `O(n log n)` from sort, `O(n)` dedup pass.
-fn dedupe_pending_in_place<F: FindingRecord>(p: &mut Vec<F>) {
-    if p.len() <= 1 {
-        return;
-    }
+// ============================================================================
+// Entry Point
+// ============================================================================
 
-    p.sort_unstable_by_key(|f| {
-        (
-            f.rule_id(),
-            f.root_hint_start(),
-            f.root_hint_end(),
-            f.span_start(),
-            f.span_end(),
-        )
+/// Scan local files with blocking reads.
+///
+/// This is the low-level entry point for local filesystem scanning. For most
+/// use cases, prefer [`parallel_scan_dir`](super::parallel_scan::parallel_scan_dir)
+/// which handles directory walking and gitignore.
+///
+/// # Arguments
+///
+/// - `engine`: Detection engine (determines overlap, provides scan logic)
+/// - `source`: Iterator of files to scan (e.g., [`VecFileSource`])
+/// - `cfg`: Configuration for workers, chunking, and memory budgets (includes `event_sink`)
+///
+/// # Returns
+///
+/// [`LocalReport`] containing:
+/// - `stats`: Discovery statistics (files enqueued, bytes, I/O errors)
+/// - `metrics`: Executor metrics (chunks scanned, bytes scanned, timing)
+///
+/// # Execution Model
+///
+/// ```text
+/// ┌─────────────────────────────────────────────────────────────────────┐
+/// │                           scan_local()                              │
+/// └─────────────────────────────────────────────────────────────────────┘
+///                    │
+///         ┌─────────┴─────────┐
+///         ▼                   ▼
+///   ┌───────────────┐   ┌───────────────────────────────────────────┐
+///   │  main thread  │   │              Executor                     │
+///   │  (discovery)  │   │  ┌─────────┐ ┌─────────┐ ┌─────────┐     │
+///   │               │──►│  │Worker 0 │ │Worker 1 │ │Worker N │     │
+///   │  next_file()  │   │  └─────────┘ └─────────┘ └─────────┘     │
+///   │  in loop      │   │       │           │           │          │
+///   └───────────────┘   │       ▼           ▼           ▼          │
+///                       │  process_file() process_file() ...       │
+///                       └───────────────────────────────────────────┘
+/// ```
+///
+/// The main thread pulls files from `source` and enqueues them. Workers
+/// process files in parallel using work-stealing. The `CountBudget` limits
+/// how far ahead discovery can run.
+///
+/// # Example
+///
+/// ```ignore
+/// // With MockEngine (for testing):
+/// let engine = Arc::new(MockEngine::new(rules, 16));
+/// let files = vec![LocalFile { path: "test.txt".into(), size: 1024 }];
+/// let source = VecFileSource::new(files);
+///
+/// let report = scan_local(engine, source, LocalConfig::default());
+///
+/// // With real Engine (for production):
+/// let engine = Arc::new(Engine::new(rules, transforms, tuning));
+/// let report = scan_local(engine, source, LocalConfig::default());
+/// ```
+pub fn scan_local<E, S>(engine: Arc<E>, mut source: S, cfg: LocalConfig) -> LocalReport
+where
+    E: ScanEngine,
+    S: FileSource,
+{
+    cfg.validate(engine.as_ref());
+
+    let overlap = engine.required_overlap();
+    let buf_len = cfg.chunk_size.saturating_add(overlap);
+
+    // Create buffer pool (workers acquire and release via local queues)
+    let pool = TsBufferPool::new(TsBufferPoolConfig {
+        buffer_len: buf_len,
+        total_buffers: cfg.pool_buffers,
+        workers: cfg.workers,
+        local_queue_cap: cfg.local_queue_cap,
     });
 
-    p.dedup_by(|a, b| {
-        a.rule_id() == b.rule_id()
-            && a.root_hint_start() == b.root_hint_start()
-            && a.root_hint_end() == b.root_hint_end()
-            && a.span_start() == b.span_start()
-            && a.span_end() == b.span_end()
-    });
-}
+    // Object budget for discovery backpressure
+    let budget = CountBudget::new(cfg.max_in_flight_objects);
 
-/// Emits each finding as a [`FindingEvent`] through the event sink.
-///
-/// Side effect: sends one event per finding to `event_sink`.
-fn emit_findings<E: ScanEngine, F: FindingRecord>(
-    engine: &E,
-    event_sink: &dyn EventSink,
-    display: &[u8],
-    recs: &[F],
-) {
-    if recs.is_empty() {
-        return;
-    }
+    let archive_cfg = cfg.archive.clone();
+    let abort_run = Arc::new(AtomicBool::new(false));
 
-    for rec in recs {
-        event_sink.emit(ScanEvent::Finding(FindingEvent {
-            source: SourceKind::Fs,
-            object_path: display,
-            start: rec.root_hint_start(),
-            end: rec.root_hint_end(),
-            rule_id: rec.rule_id(),
-            rule_name: engine.rule_name(rec.rule_id()),
-            commit_id: None,
-            change_kind: None,
-        }));
-    }
-}
-
-// ============================================================================
-// Per-File Processing
-// ============================================================================
-
-/// Read and scan a single file in chunked passes.
-///
-/// Opens the file, checks size limits, detects (and skips) archives, then
-/// loops over payload-sized reads feeding each chunk to the engine.
-///
-/// Overlap between consecutive chunks is maintained in `buf[0..carry]` so
-/// that matches spanning a chunk boundary are not missed. Findings whose
-/// root hint falls entirely within the overlap prefix are dropped to avoid
-/// double-reporting from the previous chunk.
-///
-/// Errors on open, metadata, or mid-file reads are counted in `stats` and
-/// do not propagate — the caller simply moves on to the next file.
-///
-/// # Preconditions
-/// - `buf.len() >= overlap + chunk_size`
-/// - `pending` and `scratch` are worker-local and can be freely reused
-#[allow(clippy::too_many_arguments)]
-fn process_file<E: ScanEngine>(
-    engine: &E,
-    event_sink: &dyn EventSink,
-    local_file: LocalFile,
-    file_id: FileId,
-    chunk_size: usize,
-    overlap: usize,
-    max_file_size: u64,
-    archive_cfg: &ArchiveConfig,
-    dedupe: bool,
-    buf: &mut [u8],
-    pending: &mut Vec<<E::Scratch as EngineScratch>::Finding>,
-    scratch: &mut E::Scratch,
-    stats: &mut OwnerWorkerStats,
-) {
-    scratch.clear();
-
-    // --- Open + stat ---
-    #[cfg(feature = "stats")]
-    let t_open = Instant::now();
-    let mut file = match File::open(&local_file.path) {
-        Ok(f) => f,
-        Err(_) => {
-            stats.io_errors = stats.io_errors.saturating_add(1);
-            return;
-        }
-    };
-
-    let meta = match file.metadata() {
-        Ok(m) => m,
-        Err(_) => {
-            stats.io_errors = stats.io_errors.saturating_add(1);
-            return;
-        }
-    };
-    #[cfg(feature = "stats")]
-    {
-        stats.open_stat_ns = stats
-            .open_stat_ns
-            .saturating_add(t_open.elapsed().as_nanos() as u64);
-    }
-
-    let file_size = meta.len();
-    if file_size == 0 || file_size > max_file_size {
-        return;
-    }
-
-    // --- Archive detection ---
-    if archive_cfg.enabled {
-        // Fast path: extension/path-based archive detection avoids an I/O read.
-        // Fallback: sniff first bytes, then seek back so chunk scanning starts at 0.
-        let is_archive = detect_kind_from_path(&local_file.path).is_some() || {
-            let mut header = [0u8; SNIFF_HEADER_LEN];
-            let sniffed = match read_some(&mut file, &mut header) {
-                Ok(n) => sniff_kind_from_header(&header[..n]).is_some(),
-                Err(_) => false,
-            };
-            let _ = file.seek(io::SeekFrom::Start(0));
-            sniffed
-        };
-        if is_archive {
-            stats.archives_skipped = stats.archives_skipped.saturating_add(1);
-            return;
-        }
-    }
-
-    // --- posix_fadvise: sequential readahead for entire file ---
-    fadvise_sequential(&file);
-
-    let path_bytes = local_file.path.as_os_str().as_encoded_bytes();
-    let mut offset: u64 = 0;
-    let mut carry: usize = 0;
-    let mut have: usize = 0;
-
-    loop {
-        if carry > 0 && have > 0 {
-            // Preserve overlap suffix from previous read as prefix for next scan window.
-            buf.copy_within(have - carry..have, 0);
-        }
-
-        let remaining = file_size.saturating_sub(offset) as usize;
-        if remaining == 0 {
-            break;
-        }
-
-        let read_max = chunk_size
-            .min(buf.len().saturating_sub(carry))
-            .min(remaining);
-
-        // Prefetch next chunk while we're about to read this one.
-        let next_offset = offset.saturating_add(read_max as u64);
-        if next_offset < file_size {
-            fadvise_willneed(&file, next_offset as i64, chunk_size as i64);
-        }
-
-        #[cfg(feature = "stats")]
-        let t_read = Instant::now();
-        let n = match read_some(&mut file, &mut buf[carry..carry + read_max]) {
-            Ok(n) => n,
-            Err(_) => {
-                stats.io_errors = stats.io_errors.saturating_add(1);
-                break;
-            }
-        };
-        #[cfg(feature = "stats")]
-        {
-            stats.read_ns = stats
-                .read_ns
-                .saturating_add(t_read.elapsed().as_nanos() as u64);
-        }
-
-        if n == 0 {
-            break;
-        }
-
-        let read_len = carry + n;
-        // Base offset points to buffer index 0, which may include overlap carried forward.
-        let base_offset = offset.saturating_sub(carry as u64);
-
-        #[cfg(feature = "stats")]
-        let t_scan = Instant::now();
-        engine.scan_chunk_into(&buf[..read_len], file_id, base_offset, scratch);
-        #[cfg(feature = "stats")]
-        {
-            stats.scan_ns = stats
-                .scan_ns
-                .saturating_add(t_scan.elapsed().as_nanos() as u64);
-        }
-
-        // Drop findings wholly in overlap prefix.
-        // They were already emitted in the previous iteration's chunk.
-        scratch.drop_prefix_findings(offset);
-        pending.clear();
-        scratch.drain_findings_into(pending);
-        if dedupe {
-            dedupe_pending_in_place(pending);
-        }
-        emit_findings(engine, event_sink, path_bytes, pending);
-
-        stats.findings_emitted = stats.findings_emitted.saturating_add(pending.len() as u64);
-        stats.chunks_scanned = stats.chunks_scanned.saturating_add(1);
-        stats.bytes_scanned = stats.bytes_scanned.saturating_add(n as u64);
-
-        offset = offset.saturating_add(n as u64);
-        have = read_len;
-        carry = overlap.min(read_len);
-
-        if offset >= file_size {
-            break;
-        }
-    }
-
-    stats.files_processed = stats.files_processed.saturating_add(1);
-}
-
-// ============================================================================
-// Coordinator Entry Point
-// ============================================================================
-
-/// Scan local filesystem files with owner-compute workers.
-///
-/// Files are distributed via a single shared bounded channel. Workers compete
-/// for files, providing natural load balancing when file sizes vary. Each
-/// worker performs open/read/scan/emit on its own thread using a single
-/// reusable `Vec<u8>` buffer (zero per-file allocation).
-///
-/// # Preconditions
-/// - `cfg.file_channel_cap > 0`
-/// - `cfg.chunk_size + engine.required_overlap() <= BUFFER_LEN_MAX`
-///
-/// # Errors
-/// - returns `io::Error` if a worker thread fails to spawn
-/// - returns `io::Error` if a worker thread panics while processing
-///
-/// # Panics
-/// - if preconditions above are violated
-pub fn scan_local_fs_owner_compute<E: ScanEngine>(
-    engine: Arc<E>,
-    files: impl Iterator<Item = LocalFile>,
-    cfg: OwnerComputeFsConfig,
-) -> io::Result<OwnerComputeFsReport> {
-    let worker_count = cfg.workers.max(1);
-    let overlap = engine.required_overlap();
-    let buf_len = overlap.saturating_add(cfg.chunk_size);
-    assert!(
-        buf_len <= BUFFER_LEN_MAX,
-        "chunk_size + overlap ({}) exceeds BUFFER_LEN_MAX ({})",
-        buf_len,
-        BUFFER_LEN_MAX
-    );
-    assert!(cfg.file_channel_cap > 0, "file_channel_cap must be > 0");
-
-    let wall_start = Instant::now();
-
-    // Single shared channel — workers compete for files (natural load balancing).
-    let (file_tx, file_rx) = crossbeam_channel::bounded::<LocalFile>(cfg.file_channel_cap);
-
-    let mut handles = Vec::with_capacity(worker_count);
-    for worker_idx in 0..worker_count {
-        let rx = file_rx.clone();
-        let worker_engine = Arc::clone(&engine);
-        let worker_sink = Arc::clone(&cfg.event_sink);
-        let worker_archive = cfg.archive.clone();
-        let worker_chunk_size = cfg.chunk_size;
-        let worker_max_file_size = cfg.max_file_size;
-        let worker_dedupe = cfg.dedupe_within_chunk;
-        let worker_pin = cfg.pin_threads;
-
-        let handle = thread::Builder::new()
-            .name(format!("owner-worker-{worker_idx}"))
-            .spawn(move || {
-                if worker_pin {
-                    let _ = pin_current_thread_to_core(worker_idx);
-                }
-
-                let mut stats = OwnerWorkerStats::default();
-                let mut scratch = worker_engine.new_scratch();
-                let mut pending: Vec<<E::Scratch as EngineScratch>::Finding> =
-                    Vec::with_capacity(4096);
-                let mut buf = vec![0u8; buf_len];
-                // Stripe file IDs by worker to avoid collisions across threads.
-                let mut file_seq = worker_idx as u32;
-                let stride = worker_count as u32;
-
-                for local_file in rx.iter() {
-                    let file_id = FileId(file_seq);
-                    file_seq = file_seq.wrapping_add(stride.max(1));
-                    process_file(
-                        worker_engine.as_ref(),
-                        &*worker_sink,
-                        local_file,
-                        file_id,
-                        worker_chunk_size,
-                        overlap,
-                        worker_max_file_size,
-                        &worker_archive,
-                        worker_dedupe,
-                        &mut buf,
-                        &mut pending,
-                        &mut scratch,
-                        &mut stats,
-                    );
-                }
-
-                // Return worker-local totals for final aggregation by coordinator.
-                stats
-            })
-            .map_err(io::Error::other)?;
-        handles.push(handle);
-    }
-
-    // Drop coordinator's clone so channel disconnection is driven by worker exits.
-    drop(file_rx);
-
-    // --- Feed files into the shared channel ---
-    let mut files_enqueued = 0u64;
-    #[cfg(feature = "stats")]
-    let mut feed_block_ns = 0u64;
-    #[cfg(feature = "stats")]
-    let feed_start = Instant::now();
-
-    for local_file in files {
-        #[cfg(feature = "stats")]
-        let send_t = Instant::now();
-        if file_tx.send(local_file).is_err() {
-            // All receivers are gone (worker panicked/exited); stop feeding.
-            break;
-        }
-        #[cfg(feature = "stats")]
-        {
-            feed_block_ns = feed_block_ns.saturating_add(send_t.elapsed().as_nanos() as u64);
-        }
-        files_enqueued = files_enqueued.saturating_add(1);
-    }
-
-    #[cfg(feature = "stats")]
-    let feed_elapsed_ns = feed_start.elapsed().as_nanos() as u64;
-    #[cfg(not(feature = "stats"))]
-    let (feed_elapsed_ns, feed_block_ns) = (0u64, 0u64);
-
-    // Drop sender: workers drain remaining files, then exit.
-    drop(file_tx);
-
-    let mut worker_stats = Vec::with_capacity(worker_count);
-    for handle in handles {
-        match handle.join() {
-            Ok(s) => worker_stats.push(s),
-            // Surface panic as I/O-style orchestration failure to caller.
-            Err(_) => return Err(io::Error::other("owner worker thread panicked")),
-        }
-    }
-
-    let wall_time_ns = wall_start.elapsed().as_nanos() as u64;
-    cfg.event_sink.flush();
-
-    let mut metrics = MetricsSnapshot::new();
-    for s in &worker_stats {
-        metrics.bytes_scanned = metrics.bytes_scanned.saturating_add(s.bytes_scanned);
-        metrics.chunks_scanned = metrics.chunks_scanned.saturating_add(s.chunks_scanned);
-        metrics.findings_emitted = metrics.findings_emitted.saturating_add(s.findings_emitted);
-        metrics.io_errors = metrics.io_errors.saturating_add(s.io_errors);
-        #[cfg(feature = "stats")]
-        {
-            metrics.open_stat_ns = metrics.open_stat_ns.saturating_add(s.open_stat_ns);
-            metrics.read_ns = metrics.read_ns.saturating_add(s.read_ns);
-            metrics.scan_ns = metrics.scan_ns.saturating_add(s.scan_ns);
-        }
-    }
-    metrics.worker_count = worker_count as u32;
-    metrics.duration_ns = wall_time_ns;
-
-    Ok(OwnerComputeFsReport {
-        worker_stats,
-        files_enqueued,
-        wall_time_ns,
-        metrics,
-        feed_elapsed_ns,
-        feed_block_ns,
-    })
-}
-
-// ============================================================================
-// Inline Walk+Scan (single thread pool)
-// ============================================================================
-
-/// Configuration for inline walk+scan filesystem scanning.
-///
-/// Unlike [`OwnerComputeFsConfig`], there is no file channel — the walker
-/// threads ARE the scanner threads. Directory-level work-stealing from the
-/// `ignore` crate provides load balancing.
-pub struct InlineWalkScanConfig {
-    /// Number of walker/scanner threads.
-    pub workers: usize,
-    /// Payload bytes per chunk (excluding overlap).
-    pub chunk_size: usize,
-    /// Maximum file size to scan (bytes). Larger files are skipped.
-    pub max_file_size: u64,
-    /// Enable within-chunk finding deduplication.
-    pub dedupe_within_chunk: bool,
-    /// Archive scanning configuration.
-    pub archive: ArchiveConfig,
-    /// Shared event sink for finding output.
-    pub event_sink: Arc<dyn EventSink>,
-}
-
-/// Report from inline walk+scan.
-///
-/// Like [`OwnerComputeFsReport`] but without coordinator feed timing
-/// (there is no channel — walker threads scan directly).
-#[derive(Debug)]
-pub struct InlineWalkScanReport {
-    /// Per-worker stats in slot-claim order.
-    pub worker_stats: Vec<OwnerWorkerStats>,
-    /// Total files discovered by the walker (includes skipped).
-    pub files_discovered: u64,
-    /// End-to-end wall time (nanoseconds).
-    pub wall_time_ns: u64,
-    /// Aggregated metrics for compatibility with existing consumers.
-    pub metrics: MetricsSnapshot,
-}
-
-/// Pre-allocated, cache-line-padded stats slots for zero-contention aggregation.
-///
-/// Each walker thread claims one slot via `fetch_add` at init time.
-/// After `walker.run()` returns, the main thread reads `next` to know
-/// how many slots were used and iterates them to produce the aggregate.
-struct StatsSlots {
-    slots: Vec<CachePadded<UnsafeCell<OwnerWorkerStats>>>,
-    next: AtomicUsize,
-}
-
-/// # Safety
-///
-/// Each slot is exclusively owned by one thread after claiming via
-/// `fetch_add`; no two threads share a slot. The main thread only reads
-/// slots after all walker threads have joined (`walker.run()` blocks
-/// until completion), establishing a happens-before edge.
-///
-/// Slot capacity is `worker_count + 1`, which accounts for the `ignore`
-/// crate potentially spawning one extra thread. If more threads are
-/// spawned than capacity, the `slots[slot_idx]` access panics at
-/// runtime — a deliberate fail-loud rather than UB.
-unsafe impl Sync for StatsSlots {}
-
-impl StatsSlots {
-    /// Create fixed-capacity stats slots for walker threads.
-    ///
-    /// Callers must size `capacity` to the maximum number of walker threads
-    /// that may claim a slot during one `scan_local_fs_inline` run.
-    fn new(capacity: usize) -> Self {
-        let mut slots = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
-            slots.push(CachePadded::new(UnsafeCell::new(
-                OwnerWorkerStats::default(),
-            )));
-        }
-        Self {
-            slots,
-            next: AtomicUsize::new(0),
-        }
-    }
-}
-
-/// Scan a filesystem tree by walking and scanning inline on the same threads.
-///
-/// Uses `ignore::WalkBuilder::build_parallel()` to walk the directory tree
-/// with work-stealing at directory granularity. Each walker thread allocates
-/// its own engine scratch, I/O buffer, and stats slot at init time, then
-/// scans every file it discovers — no channel, no second thread pool.
-///
-/// This preserves directory locality (the thread that discovers a file scans
-/// it immediately) and eliminates all per-file synchronization.
-///
-/// # Preconditions
-/// - `cfg.chunk_size + engine.required_overlap() <= BUFFER_LEN_MAX`
-///
-/// # Panics
-/// - if the precondition above is violated
-pub fn scan_local_fs_inline<E: ScanEngine>(
-    engine: Arc<E>,
-    root: &Path,
-    cfg: InlineWalkScanConfig,
-) -> io::Result<InlineWalkScanReport> {
-    let worker_count = cfg.workers.max(1);
-    let overlap = engine.required_overlap();
-    let buf_len = overlap.saturating_add(cfg.chunk_size);
-    assert!(
-        buf_len <= BUFFER_LEN_MAX,
-        "chunk_size + overlap ({}) exceeds BUFFER_LEN_MAX ({})",
-        buf_len,
-        BUFFER_LEN_MAX,
-    );
-
-    let wall_start = Instant::now();
-
-    // +1 slot to handle ignore crate potentially spawning an extra thread.
-    let stats_slots = Arc::new(StatsSlots::new(worker_count + 1));
-    let files_discovered = Arc::new(AtomicUsize::new(0));
-
-    let chunk_size = cfg.chunk_size;
-    let max_file_size = cfg.max_file_size;
+    // Capture config values before moving into closure
     let dedupe = cfg.dedupe_within_chunk;
-    let archive_cfg = cfg.archive;
-    let event_sink = cfg.event_sink;
+    let chunk_size = cfg.chunk_size;
+    let event_sink = cfg.event_sink.clone();
 
-    let walker = ignore::WalkBuilder::new(root)
-        .threads(worker_count)
-        .follow_links(false)
-        .hidden(false)
-        .git_ignore(false)
-        .git_global(false)
-        .git_exclude(false)
-        .build_parallel();
+    // Create executor
+    let ex = Executor::<FileTask>::new(
+        ExecutorConfig {
+            workers: cfg.workers,
+            seed: cfg.seed,
+            ..ExecutorConfig::default()
+        },
+        {
+            let engine = Arc::clone(&engine);
+            let pool = pool.clone();
+            let abort_run = Arc::clone(&abort_run);
+            move |_wid| {
+                let scan_scratch = engine.new_scratch();
+                let depth_cap = archive_cfg.max_archive_depth as usize + 2;
+                let mut vpaths = Vec::with_capacity(depth_cap);
+                for _ in 0..depth_cap {
+                    vpaths.push(VirtualPathBuilder::with_capacity(
+                        archive_cfg.max_virtual_path_len_per_entry,
+                    ));
+                }
+                let path_budget_used = vec![0usize; depth_cap];
+                let mut tar_cursors = Vec::with_capacity(depth_cap);
+                for _ in 0..depth_cap {
+                    tar_cursors.push(TarCursor::with_capacity(&archive_cfg));
+                }
+                let entry_display_cap = archive_cfg.max_virtual_path_len_per_entry;
+                let gzip_name_cap = archive_cfg.max_virtual_path_len_per_entry;
+                let gzip_header_cap = archive_cfg
+                    .max_virtual_path_len_per_entry
+                    .saturating_add(256)
+                    .min(archive_cfg.max_archive_metadata_bytes as usize)
+                    .clamp(64, 64 * 1024);
 
-    walker.run(|| {
-        // Factory: called once per walker thread — allocate per-thread state.
-        let engine = Arc::clone(&engine);
-        let event_sink = Arc::clone(&event_sink);
-        let archive_cfg = archive_cfg.clone();
-        let stats_slots = Arc::clone(&stats_slots);
-        let files_discovered = Arc::clone(&files_discovered);
-
-        let mut scratch = engine.new_scratch();
-        let mut buf = vec![0u8; buf_len];
-        let mut pending = Vec::with_capacity(4096);
-
-        // Claim an exclusive stats slot — no contention after this point.
-        // Relaxed ordering is sufficient: uniqueness comes from atomic RMW itself.
-        let slot_idx = stats_slots.next.fetch_add(1, Ordering::Relaxed);
-        // Safety: slot_idx < capacity (one slot per thread), exclusively owned.
-        let stats: &mut OwnerWorkerStats = unsafe { &mut *stats_slots.slots[slot_idx].get() };
-
-        let mut file_seq = 0u32;
-
-        // Per-entry: called for every dir entry — scan files inline.
-        Box::new(move |result: Result<ignore::DirEntry, ignore::Error>| {
-            if let Ok(entry) = result {
-                if entry.file_type().is_some_and(|ft| ft.is_file()) {
-                    // Discovery count is approximate-in-time but exact at completion.
-                    files_discovered.fetch_add(1, Ordering::Relaxed);
-                    let local_file = LocalFile {
-                        path: entry.into_path(),
-                        size: 0, // Size checked at open time via fstat.
-                    };
-                    // IDs are only required to be stable within this walker thread.
-                    let file_id = FileId(file_seq);
-                    file_seq = file_seq.wrapping_add(1);
-                    process_file(
-                        engine.as_ref(),
-                        &*event_sink,
-                        local_file,
-                        file_id,
-                        chunk_size,
-                        overlap,
-                        max_file_size,
-                        &archive_cfg,
-                        dedupe,
-                        &mut buf,
-                        &mut pending,
-                        &mut scratch,
-                        stats,
-                    );
+                LocalScratch {
+                    engine: Arc::clone(&engine),
+                    pool: pool.clone(),
+                    scan_scratch,
+                    pending: Vec::with_capacity(4096), // Reasonable default
+                    canon: EntryPathCanonicalizer::with_capacity(
+                        DEFAULT_MAX_COMPONENTS,
+                        archive_cfg.max_virtual_path_len_per_entry,
+                    ),
+                    vpaths,
+                    path_budget_used,
+                    budgets: ArchiveBudgets::new(&archive_cfg),
+                    tar_cursors,
+                    zip_cursor: ZipCursor::with_capacity(&archive_cfg),
+                    entry_display_buf: Vec::with_capacity(entry_display_cap),
+                    gzip_header_buf: vec![0u8; gzip_header_cap],
+                    gzip_name_buf: Vec::with_capacity(gzip_name_cap),
+                    next_virtual_file_id: 0x8000_0000,
+                    abort_run: Arc::clone(&abort_run),
+                    event_sink: Arc::clone(&event_sink),
+                    dedupe_within_chunk: dedupe,
+                    chunk_size,
+                    max_file_size: cfg.max_file_size,
+                    archive: archive_cfg.clone(),
                 }
             }
-            ignore::WalkState::Continue
-        })
-    });
+        },
+        process_file::<E>,
+    );
 
-    // walker.run() blocks until all threads complete.
-    let wall_time_ns = wall_start.elapsed().as_nanos() as u64;
-    let total_discovered = files_discovered.load(Ordering::Relaxed) as u64;
+    // Discovery loop
+    let mut stats = LocalStats::default();
+    let mut next_file_id: u32 = 0;
+    // Batch discovery injections to amortize wakeups and injector contention.
+    // Keep the batch small to avoid large bursts of in-flight work.
+    let batch_cap = cfg.max_in_flight_objects.clamp(1, 64);
+    let mut batch: Vec<FileTask> = Vec::with_capacity(batch_cap);
 
-    event_sink.flush();
+    let mut aborted = false;
+    while let Some(file) = source.next_file() {
+        if abort_run.load(Ordering::Relaxed) {
+            aborted = true;
+            break;
+        }
+        // Acquire in-flight permit (blocks if at capacity)
+        let permit = budget.acquire(1);
+        if abort_run.load(Ordering::Relaxed) {
+            aborted = true;
+            drop(permit);
+            break;
+        }
 
-    // Aggregate per-worker stats.
-    // `used` is the number of successfully claimed slots.
-    let used = stats_slots.next.load(Ordering::Relaxed);
-    let mut worker_stats = Vec::with_capacity(used);
-    let mut metrics = MetricsSnapshot::new();
+        let file_id = FileId(next_file_id);
+        next_file_id = next_file_id.wrapping_add(1);
 
-    for i in 0..used {
-        // Safety: all walker threads have joined; we have exclusive access.
-        let s = unsafe { &*stats_slots.slots[i].get() };
-        worker_stats.push(*s);
+        stats.files_enqueued = stats.files_enqueued.saturating_add(1);
+        stats.bytes_enqueued = stats.bytes_enqueued.saturating_add(file.size);
 
-        metrics.bytes_scanned = metrics.bytes_scanned.saturating_add(s.bytes_scanned);
-        metrics.chunks_scanned = metrics.chunks_scanned.saturating_add(s.chunks_scanned);
-        metrics.findings_emitted = metrics.findings_emitted.saturating_add(s.findings_emitted);
-        metrics.io_errors = metrics.io_errors.saturating_add(s.io_errors);
-        #[cfg(feature = "stats")]
-        {
-            metrics.open_stat_ns = metrics.open_stat_ns.saturating_add(s.open_stat_ns);
-            metrics.read_ns = metrics.read_ns.saturating_add(s.read_ns);
-            metrics.scan_ns = metrics.scan_ns.saturating_add(s.scan_ns);
+        // Enqueue task
+        let task = FileTask {
+            file_id,
+            path: file.path,
+            size: file.size,
+            _permit: permit,
+        };
+
+        batch.push(task);
+        if batch.len() >= batch_cap {
+            // This should not fail since we haven't called join() yet.
+            ex.spawn_external_batch(std::mem::take(&mut batch))
+                .expect("executor rejected task batch before join");
         }
     }
-    metrics.worker_count = used as u32;
-    metrics.duration_ns = wall_time_ns;
 
-    Ok(InlineWalkScanReport {
-        worker_stats,
-        files_discovered: total_discovered,
-        wall_time_ns,
-        metrics,
-    })
+    if !aborted && !batch.is_empty() {
+        ex.spawn_external_batch(batch)
+            .expect("executor rejected task batch before join");
+    } else if aborted {
+        batch.clear();
+    }
+
+    // Wait for all files to complete
+    let metrics = ex.join();
+
+    // Aggregate I/O errors from worker metrics into stats
+    stats.io_errors = metrics.io_errors;
+
+    LocalReport { stats, metrics }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::archive::PartialReason;
+    use crate::scheduler::engine_stub::{FindingRec, MockEngine, MockRule, RuleId};
+    use crate::unified::events::VecEventSink;
+    use std::fs;
+    use std::io::Write;
+    use tempfile::{NamedTempFile, TempDir};
+
+    fn test_engine() -> MockEngine {
+        MockEngine::new(
+            vec![
+                MockRule {
+                    name: "secret".into(),
+                    pattern: b"SECRET".to_vec(),
+                },
+                MockRule {
+                    name: "password".into(),
+                    pattern: b"PASSWORD".to_vec(),
+                },
+            ],
+            16, // 16 byte overlap
+        )
+    }
+
+    fn small_config_with_sink(sink: Arc<VecEventSink>) -> LocalConfig {
+        LocalConfig {
+            workers: 2,
+            chunk_size: 64, // Tiny for testing
+            pool_buffers: 8,
+            local_queue_cap: 2,
+            max_in_flight_objects: 8,
+            max_file_size: u64::MAX,
+            seed: 12345,
+            dedupe_within_chunk: true,
+            archive: ArchiveConfig::default(),
+            event_sink: sink,
+        }
+    }
+
+    fn small_config() -> LocalConfig {
+        small_config_with_sink(Arc::new(VecEventSink::new()))
+    }
+
+    fn assert_perf_u64(actual: u64, expected: u64) {
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            assert_eq!(actual, expected);
+        } else {
+            assert_eq!(actual, 0);
+        }
+    }
+
+    #[test]
+    fn zip_budget_clamp_charges_discarded_bytes() {
+        let cfg = ArchiveConfig {
+            max_uncompressed_bytes_per_entry: 4,
+            max_total_uncompressed_bytes_per_archive: 5,
+            max_total_uncompressed_bytes_per_root: 5,
+            ..ArchiveConfig::default()
+        };
+
+        let mut budgets = ArchiveBudgets::new(&cfg);
+        assert!(budgets.enter_archive().is_ok());
+        budgets.begin_entry_scan();
+
+        let mut entry_partial_reason = None;
+        let mut outcome = ArchiveEnd::Scanned;
+        let mut stop_archive = false;
+
+        let (allowed, clamped) = apply_entry_budget_clamp(
+            &mut budgets,
+            6,
+            &mut entry_partial_reason,
+            &mut outcome,
+            &mut stop_archive,
+        );
+
+        assert_eq!(allowed, 4);
+        assert!(clamped);
+        assert!(stop_archive);
+        assert_eq!(budgets.root_decompressed_out(), 5);
+        assert_eq!(
+            outcome,
+            ArchiveEnd::Partial(PartialReason::ArchiveOutputBudgetExceeded)
+        );
+    }
+
+    #[test]
+    fn scans_single_file_with_findings() {
+        let engine = Arc::new(test_engine());
+        let sink = Arc::new(VecEventSink::new());
+
+        // Create temp file with secret
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, "hello SECRET world").unwrap();
+        tmp.flush().unwrap();
+
+        let path = tmp.path().to_path_buf();
+        let size = tmp.as_file().metadata().unwrap().len();
+
+        let source = VecFileSource::new(vec![LocalFile { path, size }]);
+
+        let report = scan_local(engine, source, small_config_with_sink(sink.clone()));
+
+        assert_eq!(report.stats.files_enqueued, 1);
+        assert!(report.metrics.chunks_scanned >= 1);
+
+        let output = sink.take();
+        let output_str = String::from_utf8_lossy(&output);
+        assert!(output_str.contains("secret"), "output: {}", output_str);
+    }
+
+    #[test]
+    fn handles_empty_file() {
+        let engine = Arc::new(test_engine());
+        let sink = Arc::new(VecEventSink::new());
+
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let source = VecFileSource::new(vec![LocalFile { path, size: 0 }]);
+
+        let report = scan_local(engine, source, small_config_with_sink(sink.clone()));
+
+        assert_eq!(report.stats.files_enqueued, 1);
+        assert!(sink.take().is_empty());
+    }
+
+    #[test]
+    fn enforces_max_file_size_at_open_time() {
+        let engine = Arc::new(test_engine());
+        let sink = Arc::new(VecEventSink::new());
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, "SECRETABCD1234").unwrap();
+        tmp.flush().unwrap();
+
+        let path = tmp.path().to_path_buf();
+        let source = VecFileSource::new(vec![LocalFile { path, size: 4 }]);
+
+        let mut cfg = small_config_with_sink(sink.clone());
+        cfg.max_file_size = 4; // Smaller than actual file size at open time.
+
+        let report = scan_local(engine, source, cfg);
+
+        assert_eq!(report.stats.files_enqueued, 1);
+        assert_eq!(report.metrics.bytes_scanned, 0);
+        assert!(sink.take().is_empty());
+    }
+
+    #[test]
+    fn handles_no_files() {
+        let engine = Arc::new(test_engine());
+
+        let source = VecFileSource::new(vec![]);
+
+        let report = scan_local(engine, source, small_config());
+
+        assert_eq!(report.stats.files_enqueued, 0);
+        assert_eq!(report.metrics.chunks_scanned, 0);
+    }
+
+    #[test]
+    fn finds_boundary_spanning_secret() {
+        let engine = Arc::new(test_engine());
+        let sink = Arc::new(VecEventSink::new());
+
+        // Create file where SECRET spans chunk boundary
+        // With chunk_size=64 and overlap=16, secret at position ~60 will span
+        let mut tmp = NamedTempFile::new().unwrap();
+        let padding = vec![b'x'; 60];
+        tmp.write_all(&padding).unwrap();
+        tmp.write_all(b"SECRET").unwrap();
+        tmp.write_all(&[b'y'; 100]).unwrap();
+        tmp.flush().unwrap();
+
+        let path = tmp.path().to_path_buf();
+        let size = tmp.as_file().metadata().unwrap().len();
+
+        let source = VecFileSource::new(vec![LocalFile { path, size }]);
+
+        let report = scan_local(engine, source, small_config_with_sink(sink.clone()));
+
+        assert!(report.metrics.chunks_scanned >= 2);
+
+        let output = sink.take();
+        let output_str = String::from_utf8_lossy(&output);
+
+        // Should find exactly one SECRET (not duplicated due to overlap)
+        let count = output_str.matches("secret").count();
+        assert_eq!(
+            count, 1,
+            "expected 1 finding, got {}: {}",
+            count, output_str
+        );
+    }
+
+    #[test]
+    fn processes_multiple_files() {
+        let engine = Arc::new(test_engine());
+        let sink = Arc::new(VecEventSink::new());
+
+        let mut files = Vec::new();
+        let mut temps = Vec::new();
+
+        for i in 0..5 {
+            let mut tmp = NamedTempFile::new().unwrap();
+            writeln!(tmp, "file {} contains SECRET", i).unwrap();
+            tmp.flush().unwrap();
+
+            let path = tmp.path().to_path_buf();
+            let size = tmp.as_file().metadata().unwrap().len();
+            files.push(LocalFile { path, size });
+            temps.push(tmp); // Keep alive
+        }
+
+        let source = VecFileSource::new(files);
+
+        let report = scan_local(engine, source, small_config_with_sink(sink.clone()));
+
+        assert_eq!(report.stats.files_enqueued, 5);
+
+        let output = sink.take();
+        let output_str = String::from_utf8_lossy(&output);
+        let count = output_str.matches("secret").count();
+        assert_eq!(
+            count, 5,
+            "expected 5 findings, got {}: {}",
+            count, output_str
+        );
+    }
+
+    #[test]
+    fn config_validation() {
+        let engine = test_engine();
+
+        // Valid config
+        let cfg = LocalConfig::default();
+        cfg.validate(&engine);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds BUFFER_LEN_MAX")]
+    fn config_validation_rejects_oversized_chunk() {
+        let engine = test_engine();
+
+        // Invalid: chunk_size + overlap > BUFFER_LEN_MAX
+        let bad_cfg = LocalConfig {
+            chunk_size: BUFFER_LEN_MAX, // Will exceed with overlap
+            ..Default::default()
+        };
+        bad_cfg.validate(&engine); // Should panic
+    }
+
+    #[test]
+    fn metrics_track_bytes() {
+        let engine = Arc::new(test_engine());
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        let data = vec![b'a'; 1000];
+        tmp.write_all(&data).unwrap();
+        tmp.flush().unwrap();
+
+        let path = tmp.path().to_path_buf();
+        let size = tmp.as_file().metadata().unwrap().len();
+
+        let source = VecFileSource::new(vec![LocalFile { path, size }]);
+
+        let report = scan_local(engine, source, small_config());
+
+        // bytes_scanned should be ~1000 (the actual payload scanned)
+        assert!(report.metrics.bytes_scanned >= 1000);
+    }
+
+    #[test]
+    fn archive_detection_skips_when_enabled() {
+        let engine = Arc::new(test_engine());
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("sample.zip");
+        fs::write(&path, b"SECRET").unwrap();
+        let size = fs::metadata(&path).unwrap().len();
+
+        let source = VecFileSource::new(vec![LocalFile { path, size }]);
+        let mut cfg = small_config();
+        cfg.archive.enabled = true;
+
+        let report = scan_local(engine, source, cfg);
+
+        if cfg!(all(feature = "perf-stats", debug_assertions)) {
+            assert_eq!(report.metrics.archive.archives_seen, 1);
+            assert_eq!(report.metrics.archive.archives_partial, 1);
+            assert_eq!(
+                report.metrics.archive.partial_reasons[PartialReason::MalformedZip.as_usize()],
+                1
+            );
+        } else {
+            assert_eq!(report.metrics.archive.archives_seen, 0);
+            assert_eq!(report.metrics.archive.archives_partial, 0);
+            assert_eq!(
+                report.metrics.archive.partial_reasons[PartialReason::MalformedZip.as_usize()],
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn archive_extension_scans_when_disabled() {
+        let engine = Arc::new(test_engine());
+        let sink = Arc::new(VecEventSink::new());
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("sample.zip");
+        fs::write(&path, b"hello SECRET world").unwrap();
+        let size = fs::metadata(&path).unwrap().len();
+
+        let source = VecFileSource::new(vec![LocalFile { path, size }]);
+        let mut cfg = small_config_with_sink(sink.clone());
+        cfg.archive.enabled = false;
+
+        let report = scan_local(engine, source, cfg);
+
+        assert_perf_u64(report.metrics.archive.archives_seen, 0);
+
+        let output = sink.take();
+        let output_str = String::from_utf8_lossy(&output);
+        assert!(
+            output_str.contains("secret"),
+            "expected finding for archive extension when disabled; output: {output_str}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // dedupe_findings unit tests
+    // ---------------------------------------------------------------
+
+    fn finding(rule: u16, start: u64, end: u64) -> FindingRec {
+        FindingRec {
+            rule_id: RuleId(rule),
+            root_hint_start: start,
+            root_hint_end: end,
+            span_start: start,
+            span_end: end,
+        }
+    }
+
+    #[test]
+    fn dedupe_empty_vec() {
+        let mut v: Vec<FindingRec> = Vec::new();
+        dedupe_findings(&mut v);
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn dedupe_single_element() {
+        let mut v = vec![finding(0, 10, 16)];
+        dedupe_findings(&mut v);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].root_hint_start, 10);
+    }
+
+    #[test]
+    fn dedupe_removes_exact_duplicates() {
+        let mut v = vec![
+            finding(0, 10, 16),
+            finding(0, 10, 16), // dup
+            finding(1, 20, 28),
+            finding(1, 20, 28), // dup
+            finding(2, 50, 56),
+        ];
+        dedupe_findings(&mut v);
+        assert_eq!(v.len(), 3);
+    }
+
+    #[test]
+    fn dedupe_preserves_different_rules_same_offsets() {
+        let mut v = vec![finding(0, 10, 16), finding(1, 10, 16), finding(2, 10, 16)];
+        dedupe_findings(&mut v);
+        assert_eq!(v.len(), 3, "distinct rule_ids should all be kept");
+    }
+
+    #[test]
+    fn dedupe_preserves_same_rule_different_offsets() {
+        let mut v = vec![finding(0, 10, 16), finding(0, 20, 26), finding(0, 30, 36)];
+        dedupe_findings(&mut v);
+        assert_eq!(v.len(), 3, "distinct offsets should all be kept");
+    }
+
+    // ---------------------------------------------------------------
+    // scan_local: overlap dedup, exact-size, multi-secret, reuse
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn overlap_dedup_no_double_report() {
+        // Place SECRET so it falls entirely within the overlap region between
+        // chunk 1 and chunk 2. With chunk_size=64 and overlap=16, SECRET at
+        // offset 50 spans [50..56]. In chunk 2 (overlap carry from [48..64]),
+        // drop_prefix_findings(64) drops it since root_hint_end=56 < 64.
+        let engine = Arc::new(test_engine());
+        let sink = Arc::new(VecEventSink::new());
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        let mut data = vec![b'x'; 50];
+        data.extend_from_slice(b"SECRET");
+        data.extend_from_slice(&[b'y'; 100]); // ensure >1 chunk
+        tmp.write_all(&data).unwrap();
+        tmp.flush().unwrap();
+
+        let path = tmp.path().to_path_buf();
+        let size = tmp.as_file().metadata().unwrap().len();
+
+        let source = VecFileSource::new(vec![LocalFile { path, size }]);
+        let report = scan_local(engine, source, small_config_with_sink(sink.clone()));
+
+        assert!(report.metrics.chunks_scanned >= 2);
+        let output = sink.take();
+        let output_str = String::from_utf8_lossy(&output);
+        let count = output_str.matches("secret").count();
+        assert_eq!(
+            count, 1,
+            "SECRET in overlap region must be reported exactly once, got {count}: {output_str}"
+        );
+    }
+
+    #[test]
+    fn file_exactly_chunk_size() {
+        // File of exactly chunk_size bytes should be scanned in one chunk.
+        let engine = Arc::new(test_engine());
+        let sink = Arc::new(VecEventSink::new());
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        // chunk_size=64 in small_config; place SECRET in the middle.
+        let mut data = vec![b'x'; 20];
+        data.extend_from_slice(b"SECRET");
+        data.resize(64, b'z');
+        tmp.write_all(&data).unwrap();
+        tmp.flush().unwrap();
+
+        let path = tmp.path().to_path_buf();
+        let size = tmp.as_file().metadata().unwrap().len();
+
+        let source = VecFileSource::new(vec![LocalFile { path, size }]);
+        let report = scan_local(engine, source, small_config_with_sink(sink.clone()));
+
+        assert_eq!(report.metrics.chunks_scanned, 1);
+        let output = sink.take();
+        let output_str = String::from_utf8_lossy(&output);
+        assert_eq!(
+            output_str.matches("secret").count(),
+            1,
+            "single chunk should find SECRET"
+        );
+    }
+
+    #[test]
+    fn multiple_secrets_across_chunks_in_one_file() {
+        // One file spanning 3+ chunks, each containing a SECRET well away
+        // from overlap boundaries.
+        let engine = Arc::new(test_engine());
+        let sink = Arc::new(VecEventSink::new());
+
+        // chunk_size=64, overlap=16.
+        // Place SECRETs at offsets 4, 100, and 196 — each solidly within
+        // the "new bytes" region of their respective chunks.
+        let mut tmp = NamedTempFile::new().unwrap();
+        let mut data = vec![b'A'; 4];
+        data.extend_from_slice(b"SECRET"); // offset 4..10
+        data.resize(100, b'B');
+        data.extend_from_slice(b"SECRET"); // offset 100..106
+        data.resize(196, b'C');
+        data.extend_from_slice(b"SECRET"); // offset 196..202
+        data.resize(256, b'D'); // ensure 3+ chunks
+        tmp.write_all(&data).unwrap();
+        tmp.flush().unwrap();
+
+        let path = tmp.path().to_path_buf();
+        let size = tmp.as_file().metadata().unwrap().len();
+
+        let source = VecFileSource::new(vec![LocalFile { path, size }]);
+        let report = scan_local(engine, source, small_config_with_sink(sink.clone()));
+
+        assert!(
+            report.metrics.chunks_scanned >= 3,
+            "need at least 3 chunks, got {}",
+            report.metrics.chunks_scanned
+        );
+        let output = sink.take();
+        let output_str = String::from_utf8_lossy(&output);
+        let count = output_str.matches("secret").count();
+        assert_eq!(
+            count, 3,
+            "each SECRET in its own chunk region should be found; got {count}: {output_str}"
+        );
+    }
+
+    #[test]
+    fn two_files_no_cross_contamination() {
+        // Scan two files back-to-back and verify findings are correct for each.
+        // Tests that per-worker scratch is properly cleared between files.
+        let engine = Arc::new(test_engine());
+        let sink = Arc::new(VecEventSink::new());
+
+        let dir = TempDir::new().unwrap();
+        let p1 = dir.path().join("first.txt");
+        let p2 = dir.path().join("second.txt");
+        fs::write(&p1, b"first SECRET here").unwrap();
+        fs::write(&p2, b"second PASSWORD there").unwrap();
+
+        let s1 = fs::metadata(&p1).unwrap().len();
+        let s2 = fs::metadata(&p2).unwrap().len();
+        let files = vec![
+            LocalFile { path: p1, size: s1 },
+            LocalFile { path: p2, size: s2 },
+        ];
+
+        let source = VecFileSource::new(files);
+        let cfg = LocalConfig {
+            workers: 1,
+            ..small_config_with_sink(sink.clone())
+        };
+        let report = scan_local(engine, source, cfg);
+
+        assert_eq!(report.stats.files_enqueued, 2);
+        let output = sink.take();
+        let output_str = String::from_utf8_lossy(&output);
+        assert_eq!(
+            output_str.matches("secret").count(),
+            1,
+            "first file's SECRET"
+        );
+        assert_eq!(
+            output_str.matches("password").count(),
+            1,
+            "second file's PASSWORD"
+        );
+    }
 }

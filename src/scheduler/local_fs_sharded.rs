@@ -57,7 +57,7 @@ use std::time::Instant;
 use super::count_budget::{CountBudget, CountPermit};
 use super::engine_stub::BUFFER_LEN_MAX;
 use super::engine_trait::{EngineScratch, FindingRecord, ScanEngine};
-use super::local::LocalFile;
+use super::local_fs_owner::LocalFile;
 use super::metrics::MetricsSnapshot;
 use super::ts_buffer_pool::{TsBufferHandle, TsBufferPool, TsBufferPoolConfig};
 use crate::api::FileId;
@@ -575,13 +575,19 @@ fn shard_io_blocking<E: ScanEngine>(
     );
 
     let mut stats = ShardIoStats::default();
+    let mut next_file_id: u32 = 0;
 
     // Stack-local overlap carry buffer. Reused across files to avoid allocation.
     let mut overlap_buf = vec![0u8; overlap];
 
     for work in file_rx.iter() {
+        // Use a unique FileId per file so engine overlap/dedupe state cannot
+        // leak across different files when scratch is reused.
+        let file_id = FileId(next_file_id);
+        next_file_id = next_file_id.wrapping_add(1);
         process_file(
             &work,
+            file_id,
             &mut producer,
             &pool,
             overlap,
@@ -605,6 +611,7 @@ fn shard_io_blocking<E: ScanEngine>(
 #[allow(clippy::too_many_arguments)]
 fn process_file(
     work: &ShardFileWork,
+    file_id: FileId,
     producer: &mut OwnedSpscProducer<ScanChunk, SHARD_SPSC_CAP>,
     pool: &TsBufferPool,
     overlap: usize,
@@ -654,7 +661,12 @@ fn process_file(
     let mut local_acquire_yields: u64 = 0;
 
     // --- Archive detection ---
-    // Check extension first (cheap), then sniff the header if needed.
+    // TODO(ahrav): The sharded path does not yet support archive extraction
+    // (gzip/tar/zip). When archive scanning is enabled we detect and skip archives
+    // to avoid scanning compressed binary data that would produce false positives.
+    // This means secrets inside archives are not found in this code path — a known
+    // limitation vs the full `local_fs_owner.rs` scanner which extracts and scans archive
+    // contents. Tracked for follow-up implementation.
     if archive_cfg.enabled {
         let is_archive = detect_kind_from_path(&work.path).is_some() || {
             // Sniff header bytes for magic signatures.
@@ -696,11 +708,6 @@ fn process_file(
         .to_vec()
         .into_boxed_slice()
         .into();
-
-    // FileId(0) is a placeholder — the sharded scanner does not use FileId for
-    // cross-file deduplication. Each file's findings are deduplicated independently
-    // within the scan thread via overlap prefix drop + within-chunk dedup.
-    let file_id = FileId(0);
 
     // --- Read loop with overlap carry ---
     let mut file_offset: u64 = 0;
@@ -1129,4 +1136,152 @@ pub fn scan_local_fs_sharded<E: ScanEngine>(
         wall_time_ns,
         metrics,
     })
+}
+
+#[cfg(test)]
+mod file_id_tests {
+    use super::*;
+    use crate::scheduler::engine_trait::{EngineScratch, FindingRecord, ScanEngine};
+    use crate::unified::events::NullEventSink;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    #[derive(Clone)]
+    struct TestFinding {
+        start: u64,
+        end: u64,
+    }
+
+    impl FindingRecord for TestFinding {
+        fn rule_id(&self) -> u32 {
+            0
+        }
+
+        fn root_hint_start(&self) -> u64 {
+            self.start
+        }
+
+        fn root_hint_end(&self) -> u64 {
+            self.end
+        }
+
+        fn span_start(&self) -> u64 {
+            self.start
+        }
+
+        fn span_end(&self) -> u64 {
+            self.end
+        }
+    }
+
+    struct TestScratch {
+        findings: Vec<TestFinding>,
+        seen: HashSet<(u32, u64, u64)>,
+    }
+
+    impl EngineScratch for TestScratch {
+        type Finding = TestFinding;
+
+        fn clear(&mut self) {
+            // Intentionally keep `seen` across files to model engines that keep
+            // file-scoped dedupe state outside the drain buffer.
+            self.findings.clear();
+        }
+
+        fn drop_prefix_findings(&mut self, new_bytes_start: u64) {
+            self.findings
+                .retain(|f| f.root_hint_end() >= new_bytes_start);
+        }
+
+        fn drain_findings_into(&mut self, out: &mut Vec<Self::Finding>) {
+            out.append(&mut self.findings);
+        }
+    }
+
+    struct FileScopedDedupeEngine;
+
+    impl ScanEngine for FileScopedDedupeEngine {
+        type Scratch = TestScratch;
+
+        fn required_overlap(&self) -> usize {
+            0
+        }
+
+        fn new_scratch(&self) -> Self::Scratch {
+            TestScratch {
+                findings: Vec::new(),
+                seen: HashSet::new(),
+            }
+        }
+
+        fn scan_chunk_into(
+            &self,
+            data: &[u8],
+            file_id: FileId,
+            base_offset: u64,
+            scratch: &mut Self::Scratch,
+        ) {
+            const NEEDLE: &[u8] = b"SECRET";
+            if data.len() < NEEDLE.len() {
+                return;
+            }
+
+            for i in 0..=data.len() - NEEDLE.len() {
+                if &data[i..i + NEEDLE.len()] != NEEDLE {
+                    continue;
+                }
+                let start = base_offset + i as u64;
+                let end = start + NEEDLE.len() as u64;
+                if scratch.seen.insert((file_id.0, start, end)) {
+                    scratch.findings.push(TestFinding { start, end });
+                }
+            }
+        }
+
+        fn rule_name(&self, _rule_id: u32) -> &str {
+            "test-rule"
+        }
+    }
+
+    #[test]
+    fn sharded_scanner_assigns_distinct_file_ids_per_file() {
+        let dir = tempdir().expect("tempdir");
+        let p1 = dir.path().join("a.txt");
+        let p2 = dir.path().join("b.txt");
+        std::fs::write(&p1, b"SECRET").expect("write a");
+        std::fs::write(&p2, b"SECRET").expect("write b");
+
+        let files = vec![
+            LocalFile { path: p1, size: 6 },
+            LocalFile { path: p2, size: 6 },
+        ];
+
+        let report = scan_local_fs_sharded(
+            Arc::new(FileScopedDedupeEngine),
+            files.into_iter(),
+            ShardedFsConfig {
+                shards: 1,
+                chunk_size: 64 * 1024,
+                max_file_size: u64::MAX,
+                pool_buffers_per_shard: 4,
+                local_queue_cap: 2,
+                max_in_flight_per_shard: 8,
+                spsc_capacity: SHARD_SPSC_CAP,
+                dedupe_within_chunk: false,
+                archive: ArchiveConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                event_sink: Arc::new(NullEventSink),
+                pin_threads: false,
+            },
+        )
+        .expect("scan should succeed");
+
+        assert_eq!(
+            report.metrics.findings_emitted, 2,
+            "distinct FileIds per file are required to avoid cross-file dedupe suppression"
+        );
+    }
 }

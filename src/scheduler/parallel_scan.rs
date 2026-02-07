@@ -1,7 +1,7 @@
 //! High-Level Parallel Filesystem Scanning API
 //!
 //! This module provides a batteries-included entry point for parallel filesystem
-//! scanning. It wraps the lower-level [`local`](super::local) scheduler with
+//! scanning. It wraps the lower-level [`local`](super::local_fs_owner) scheduler with
 //! streaming directory walking, gitignore support, and sensible defaults.
 //!
 //! # Architecture
@@ -86,7 +86,7 @@
 //! Peak memory ≈ `pool_buffers × (chunk_size + overlap)` + file metadata overhead.
 //! With defaults (workers=N, pool=4N, chunk=256K, overlap≈256): ~1 MiB per worker.
 
-use super::local::{scan_local, FileSource, LocalConfig, LocalFile, LocalReport};
+use super::local_fs_owner::{scan_local, FileSource, LocalConfig, LocalFile, LocalReport};
 use crate::archive::ArchiveConfig;
 use crate::engine::Engine;
 
@@ -136,7 +136,7 @@ impl EntryLike for ignore::DirEntry {
 /// on platforms that do not supply file type in directory entries.
 ///
 /// Discovery avoids per-file metadata when a type hint is available. Size caps
-/// are enforced at open time in `local.rs`.
+/// are enforced at open time in `local_fs_owner.rs`.
 ///
 /// When the fast type hint path is used, the file size is set to 0; open-time
 /// metadata determines the actual size and enforcement.
@@ -183,7 +183,7 @@ fn local_file_from_entry<E: EntryLike>(entry: E) -> Option<LocalFile> {
 ///
 /// This struct combines directory walking options (gitignore, symlinks, etc.)
 /// with scheduler tuning parameters. Internally, scheduler parameters are
-/// converted to [`LocalConfig`](super::local::LocalConfig) for the executor.
+/// converted to [`LocalConfig`](super::local_fs_owner::LocalConfig) for the executor.
 ///
 /// # Defaults
 ///
@@ -324,7 +324,7 @@ impl std::fmt::Debug for ParallelScanConfig {
 }
 
 impl ParallelScanConfig {
-    /// Convert to [`LocalConfig`](super::local::LocalConfig) for the scheduler.
+    /// Convert to [`LocalConfig`](super::local_fs_owner::LocalConfig) for the scheduler.
     ///
     /// This extracts only the scheduler-relevant parameters; directory walking
     /// options (`follow_symlinks`, `skip_hidden`, `respect_gitignore`) are handled
@@ -540,7 +540,7 @@ fn scan_single_file(
     let meta = std::fs::metadata(path)?;
     let size = meta.len();
 
-    // Size is only a discovery hint here; open-time enforcement happens in local.rs.
+    // Size is only a discovery hint here; open-time enforcement happens in local_fs_owner.rs.
     let file = LocalFile {
         path: path.to_path_buf(),
         size,

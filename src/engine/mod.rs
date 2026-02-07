@@ -82,3 +82,6 @@ pub use core::{AnchorPlanStats, VectorscanStats};
 
 #[cfg(feature = "bench")]
 pub use core::{bench_find_spans_into, bench_stream_decode_base64, bench_stream_decode_url};
+
+#[cfg(feature = "tiger-harness")]
+pub use vs_cache::fuzz_try_load;

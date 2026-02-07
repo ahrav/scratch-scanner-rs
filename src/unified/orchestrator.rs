@@ -3,9 +3,7 @@
 //! Dispatches to the appropriate source driver based on the parsed
 //! CLI configuration:
 //!
-//! - **FS** → Inline walk+scan via [`scan_local_fs_inline`], where walker
-//!   threads are the scanner threads (no channel; directory-level
-//!   work-stealing via the `ignore` crate provides load balancing)
+//! - **FS** → [`parallel_scan_dir`] (work-stealing executor, streaming directory walk)
 //! - **Git** → [`run_git_scan`] (pack execution, tree diffs, loose scan)
 //!
 //! Both paths share a common [`EventSink`](super::events::EventSink) for
@@ -17,12 +15,11 @@ use std::io;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::archive::ArchiveConfig;
 use crate::git_scan::{
     self, run_git_scan, GitScanConfig, GitScanResult, InMemoryPersistenceStore, NeverSeenStore,
     StartSetConfig,
 };
-use crate::scheduler::{scan_local_fs_inline, InlineWalkScanConfig};
+use crate::scheduler::{parallel_scan_dir, ParallelScanConfig};
 use crate::{
     demo_engine_with_anchor_mode, demo_engine_with_anchor_mode_and_max_transform_depth, demo_rules,
     demo_transforms, demo_tuning, AnchorMode, AnchorPolicy, Engine,
@@ -43,10 +40,10 @@ pub fn run(config: ScanConfig) -> io::Result<()> {
     }
 }
 
-/// Filesystem scan — owner-compute workers with posix_fadvise prefetch.
+/// Filesystem scan path — delegates to `parallel_scan_dir`.
 ///
-/// Each worker thread does both I/O and scan, keeping data hot in L1/L2 cache.
-/// Files are distributed via a shared bounded channel (cold path, per-file).
+/// Findings are emitted as structured JSONL events to stdout via the
+/// [`EventSink`]. Summary stats are written to stderr.
 fn run_fs(cfg: FsScanConfig, event_format: EventFormat) -> io::Result<()> {
     use super::events::{ScanEvent, SummaryEvent};
     use super::SourceKind;
@@ -64,32 +61,17 @@ fn run_fs(cfg: FsScanConfig, event_format: EventFormat) -> io::Result<()> {
         build_event_sink(event_format)
     };
 
-    let workers = cfg.workers.max(1);
-
-    let mut archive_cfg = ArchiveConfig::default();
-    if cfg.no_archives {
-        archive_cfg.enabled = false;
-    }
-
-    let root = &cfg.root;
-
-    if !root.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("Root path does not exist: {}", root.display()),
-        ));
-    }
-
-    let inline_cfg = InlineWalkScanConfig {
-        workers,
-        chunk_size: 256 * 1024, // 256 KiB — fits L2 with overlap headroom
-        max_file_size: 100 * 1024 * 1024, // 100 MiB — skip very large files
-        dedupe_within_chunk: true,
-        archive: archive_cfg,
+    let mut ps_config = ParallelScanConfig {
+        workers: cfg.workers,
+        skip_hidden: false,
+        respect_gitignore: false,
         event_sink: Arc::clone(&event_sink),
+        ..Default::default()
     };
-
-    let report = scan_local_fs_inline(engine, root, inline_cfg)?;
+    if cfg.no_archives {
+        ps_config.archive.enabled = false;
+    }
+    let report = parallel_scan_dir(&cfg.root, engine, ps_config)?;
 
     let scan_elapsed = scan_start.elapsed();
     let total_elapsed = t0.elapsed();
@@ -107,47 +89,25 @@ fn run_fs(cfg: FsScanConfig, event_format: EventFormat) -> io::Result<()> {
         elapsed_ms: scan_elapsed.as_millis() as u64,
         bytes_scanned: report.metrics.bytes_scanned,
         findings_emitted: report.metrics.findings_emitted,
-        errors: report.metrics.io_errors,
+        errors: report.stats.io_errors,
         throughput_mib_s: throughput_mib,
     }));
     event_sink.flush();
 
-    // Machine-readable stats to stderr.
+    // Also write machine-readable stats to stderr for compatibility.
     eprintln!(
         "files={} chunks={} bytes={} findings={} errors={} init_ms={} scan_ms={} elapsed_ms={} throughput_mib_s={:.2} workers={}",
-        report.files_discovered,
+        report.stats.files_enqueued,
         report.metrics.chunks_scanned,
         report.metrics.bytes_scanned,
         report.metrics.findings_emitted,
-        report.metrics.io_errors,
+        report.stats.io_errors,
         init_elapsed.as_millis(),
         scan_elapsed.as_millis(),
         total_elapsed.as_millis(),
         throughput_mib,
-        workers,
+        cfg.workers,
     );
-
-    // Per-worker utilization breakdown (stats feature only).
-    #[cfg(feature = "stats")]
-    {
-        for (idx, ws) in report.worker_stats.iter().enumerate() {
-            let active_ns = ws.open_stat_ns + ws.read_ns + ws.scan_ns;
-            let busy_pct = if report.wall_time_ns > 0 {
-                (active_ns as f64 / report.wall_time_ns as f64) * 100.0
-            } else {
-                0.0
-            };
-            eprintln!(
-                "  worker[{}]: busy={:.1}% files={} open={:.1}ms read={:.1}ms scan={:.1}ms",
-                idx,
-                busy_pct,
-                ws.files_processed,
-                ws.open_stat_ns as f64 / 1e6,
-                ws.read_ns as f64 / 1e6,
-                ws.scan_ns as f64 / 1e6,
-            );
-        }
-    }
 
     Ok(())
 }

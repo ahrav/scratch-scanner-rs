@@ -290,7 +290,7 @@ impl VsStreamDb {
 
         let cache = VsDbCache::new();
         let cache_key = cache.cache_key(&CacheKeyInput {
-            kind: b"stream",
+            kind: b"vs-stream-db:stream",
             mode: vs::HS_MODE_STREAM as c_uint,
             platform: &platform,
             patterns: &c_patterns,
@@ -941,7 +941,7 @@ impl VsAnchorDb {
 
         let cache = VsDbCache::new();
         let cache_key = cache.cache_key(&CacheKeyInput {
-            kind: b"anchor-block",
+            kind: b"vs-anchor-db:block",
             mode: vs::HS_MODE_BLOCK as c_uint,
             platform: &platform,
             patterns: &data.patterns,
@@ -1123,7 +1123,7 @@ impl VsUtf16StreamDb {
 
         let cache = VsDbCache::new();
         let cache_key = cache.cache_key(&CacheKeyInput {
-            kind: b"anchor-stream",
+            kind: b"vs-utf16-stream-db:stream",
             mode: vs::HS_MODE_STREAM as c_uint,
             platform: &platform,
             patterns: &data.patterns,
@@ -1342,7 +1342,7 @@ impl VsGateDb {
 
         let cache = VsDbCache::new();
         let cache_key = cache.cache_key(&CacheKeyInput {
-            kind: b"gate",
+            kind: b"vs-gate-db:stream",
             mode: vs::HS_MODE_STREAM as c_uint,
             platform: &platform,
             patterns: &c_patterns,
@@ -1612,7 +1612,7 @@ impl VsPrefilterDb {
             }
 
             let cache_key = cache.cache_key(&CacheKeyInput {
-                kind: b"prefilter",
+                kind: b"vs-prefilter-db:block",
                 mode: vs::HS_MODE_BLOCK as c_uint,
                 platform: &platform,
                 patterns: &c_patterns,

@@ -42,10 +42,10 @@ use super::count_budget::{CountBudget, CountPermit};
 use super::engine_stub::BUFFER_LEN_MAX;
 use super::engine_trait::{EngineScratch, FindingRecord, ScanEngine};
 use super::executor::{Executor, ExecutorConfig, ExecutorHandle, WorkerCtx};
-use super::local::LocalFile;
+use super::local_fs_owner::LocalFile;
 use super::local_fs_sharded::{
-    acquire_buffer_with_backoff, push_with_backoff, shard_scan_loop, ScanChunk, ShardFileWork,
-    ShardIoStats, ShardScanStats, ShardedFsReport, SHARD_SPSC_CAP, SNIFF_HEADER_LEN, SPIN_ITERS,
+    push_with_backoff, shard_scan_loop, ScanChunk, ShardFileWork, ShardIoStats, ShardScanStats,
+    ShardedFsReport, SHARD_SPSC_CAP,
 };
 use super::metrics::MetricsSnapshot;
 use super::ts_buffer_pool::{TsBufferHandle, TsBufferPool, TsBufferPoolConfig};
@@ -2059,6 +2059,7 @@ fn shard_io_uring_loop<E: ScanEngine>(
 
     let mut in_flight_ops: usize = 0;
     let mut channel_closed = false;
+    let mut next_file_id: u32 = 0;
 
     // --- Blocking open+stat fallback (reused from io_worker_loop) ---
 
@@ -2116,7 +2117,8 @@ fn shard_io_uring_loop<E: ScanEngine>(
          free_file_slots: &mut Vec<usize>,
          open_ready: &mut VecDeque<usize>,
          read_ready: &mut VecDeque<usize>,
-         producer: &mut OwnedSpscProducer<ScanChunk, SHARD_SPSC_CAP>| {
+         next_file_id: &mut u32,
+         _producer: &mut OwnedSpscProducer<ScanChunk, SHARD_SPSC_CAP>| {
             // Build display path for finding attribution.
             let display: Arc<[u8]> = w
                 .path
@@ -2125,7 +2127,9 @@ fn shard_io_uring_loop<E: ScanEngine>(
                 .to_vec()
                 .into_boxed_slice()
                 .into();
-            let file_id = FileId(0);
+            // FileId scopes engine overlap/dedupe state; keep it unique per file.
+            let file_id = FileId(*next_file_id);
+            *next_file_id = next_file_id.wrapping_add(1);
             let token = Arc::new(FileToken {
                 _permit: w._permit,
                 file_id,
@@ -2193,6 +2197,7 @@ fn shard_io_uring_loop<E: ScanEngine>(
                         &mut free_file_slots,
                         &mut open_ready,
                         &mut read_ready,
+                        &mut next_file_id,
                         &mut producer,
                     ),
                     Err(crossbeam_channel::TryRecvError::Empty) => break,
@@ -2502,12 +2507,12 @@ fn shard_io_uring_loop<E: ScanEngine>(
                             &mut free_file_slots,
                             &mut open_ready,
                             &mut read_ready,
+                            &mut next_file_id,
                             &mut producer,
                         );
                         continue;
                     }
                     Err(_) => {
-                        channel_closed = true;
                         break;
                     }
                 }
@@ -2523,12 +2528,8 @@ fn shard_io_uring_loop<E: ScanEngine>(
             let cq = ring.completion();
             cq.is_empty()
         };
-        if cq_empty {
-            if submitted_this_round == 0 {
-                ring.submit_and_wait(1)?;
-            } else if in_flight_ops >= cfg.io_depth {
-                ring.submit_and_wait(1)?;
-            }
+        if cq_empty && (submitted_this_round == 0 || in_flight_ops >= cfg.io_depth) {
+            ring.submit_and_wait(1)?;
         }
 
         // Drain completions.

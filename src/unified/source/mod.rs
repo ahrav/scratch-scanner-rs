@@ -7,8 +7,8 @@
 //!
 //! Both source modes delegate to their existing execution backends:
 //!
-//! - **FS** — owner-compute worker scheduler (`scan_local_fs_owner_compute`)
-//!   with round-robin worker dispatch and worker-local I/O+scan state.
+//! - **FS** — `parallel_scan_dir()` with iterator-based walking and
+//!   the local filesystem scheduler.
 //!
 //! - **Git** — `run_git_scan()` with an `EventSink` threaded through
 //!   to `EngineAdapter`. Findings stream during pack/loose scanning.

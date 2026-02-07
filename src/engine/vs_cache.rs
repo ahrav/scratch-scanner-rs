@@ -352,6 +352,34 @@ fn hash_u64(hasher: &mut blake3::Hasher, v: u64) {
     hasher.update(&v.to_le_bytes());
 }
 
+// ---------------------------------------------------------------------------
+// Fuzz entry point
+// ---------------------------------------------------------------------------
+
+/// Fuzz entry point: attempts to load a cache file from arbitrary bytes.
+///
+/// Writes `data` as a cache file under `dir` with a fixed key, then calls
+/// `try_load`. Returns `true` if a database was successfully deserialized
+/// (caller is responsible for nothing — the database is freed internally).
+#[cfg(feature = "tiger-harness")]
+pub fn fuzz_try_load(dir: &std::path::Path, data: &[u8]) -> bool {
+    let key = "fuzz-key";
+    let path = dir.join(format!("{key}.hsdb"));
+    if std::fs::write(&path, data).is_err() {
+        return false;
+    }
+    let cache = VsDbCache {
+        dir: Some(dir.to_path_buf()),
+    };
+    match cache.try_load(key) {
+        Some(db) => {
+            unsafe { vs::hs_free_database(db) };
+            true
+        }
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -583,5 +611,349 @@ mod tests {
     fn disabled_cache_always_misses() {
         let cache = VsDbCache { dir: None };
         assert!(cache.try_load("anything").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Gap-fill tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cache_key_changes_on_mode() {
+        let platform = test_platform();
+        let pats = [CString::new("abc").unwrap()];
+        let flags = [vs::HS_FLAG_PREFILTER as c_uint];
+        let ids = [0u32];
+        let cache = VsDbCache { dir: None };
+
+        let i1 = CacheKeyInput {
+            kind: b"test",
+            mode: vs::HS_MODE_BLOCK as c_uint,
+            platform: &platform,
+            patterns: &pats,
+            flags: Some(&flags),
+            ids: &ids,
+        };
+        let i2 = CacheKeyInput {
+            kind: b"test",
+            mode: vs::HS_MODE_STREAM as c_uint,
+            platform: &platform,
+            patterns: &pats,
+            flags: Some(&flags),
+            ids: &ids,
+        };
+        assert_ne!(cache.cache_key(&i1), cache.cache_key(&i2));
+    }
+
+    #[test]
+    fn cache_key_changes_on_platform() {
+        let mut p1 = test_platform();
+        let mut p2 = test_platform();
+        p1.tune = 0;
+        p2.tune = 1;
+        let pats = [CString::new("abc").unwrap()];
+        let flags = [vs::HS_FLAG_PREFILTER as c_uint];
+        let ids = [0u32];
+        let cache = VsDbCache { dir: None };
+
+        let i1 = test_cache_input(b"test", &pats, &flags, &ids, &p1);
+        let i2 = test_cache_input(b"test", &pats, &flags, &ids, &p2);
+        assert_ne!(cache.cache_key(&i1), cache.cache_key(&i2));
+
+        let mut p3 = test_platform();
+        let mut p4 = test_platform();
+        p3.cpu_features = 0;
+        p4.cpu_features = 1;
+        let i3 = test_cache_input(b"test", &pats, &flags, &ids, &p3);
+        let i4 = test_cache_input(b"test", &pats, &flags, &ids, &p4);
+        assert_ne!(cache.cache_key(&i3), cache.cache_key(&i4));
+    }
+
+    #[test]
+    fn cache_key_changes_on_ids() {
+        let platform = test_platform();
+        let pats = [CString::new("abc").unwrap()];
+        let flags = [vs::HS_FLAG_PREFILTER as c_uint];
+        let cache = VsDbCache { dir: None };
+
+        let ids1 = [0u32];
+        let ids2 = [1u32];
+        let i1 = test_cache_input(b"test", &pats, &flags, &ids1, &platform);
+        let i2 = test_cache_input(b"test", &pats, &flags, &ids2, &platform);
+        assert_ne!(cache.cache_key(&i1), cache.cache_key(&i2));
+
+        let ids3 = [0u32, 1];
+        let i3 = test_cache_input(b"test", &pats, &flags, &ids3, &platform);
+        assert_ne!(cache.cache_key(&i1), cache.cache_key(&i3));
+    }
+
+    #[test]
+    fn cache_key_empty_patterns() {
+        let platform = test_platform();
+        let pats_empty: [CString; 0] = [];
+        let pats_one = [CString::new("x").unwrap()];
+        let flags: [c_uint; 0] = [];
+        let flags_one = [vs::HS_FLAG_PREFILTER as c_uint];
+        let ids: [u32; 0] = [];
+        let ids_one = [0u32];
+        let cache = VsDbCache { dir: None };
+
+        let i1 = test_cache_input(b"test", &pats_empty, &flags, &ids, &platform);
+        let i2 = test_cache_input(b"test", &pats_one, &flags_one, &ids_one, &platform);
+        assert_ne!(cache.cache_key(&i1), cache.cache_key(&i2));
+
+        let i3 = test_cache_input(b"test", &pats_empty, &flags, &ids, &platform);
+        assert_eq!(cache.cache_key(&i1), cache.cache_key(&i3));
+    }
+
+    #[test]
+    fn bad_magic_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = VsDbCache {
+            dir: Some(dir.path().to_path_buf()),
+        };
+        let db = compile_trivial_db();
+        let key = "test-bad-magic";
+
+        cache.try_store(key, db as *const vs::hs_database_t);
+        unsafe { vs::hs_free_database(db) };
+
+        let path = dir.path().join(format!("{key}.hsdb"));
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[..8].copy_from_slice(b"BADMAGIC");
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert!(cache.try_load(key).is_none(), "bad magic should miss");
+        assert!(!path.exists(), "file with bad magic should be deleted");
+    }
+
+    #[test]
+    fn bad_payload_len_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = VsDbCache {
+            dir: Some(dir.path().to_path_buf()),
+        };
+        let db = compile_trivial_db();
+        let key = "test-bad-payload-len";
+
+        cache.try_store(key, db as *const vs::hs_database_t);
+        unsafe { vs::hs_free_database(db) };
+
+        let path = dir.path().join(format!("{key}.hsdb"));
+        let mut bytes = std::fs::read(&path).unwrap();
+        let huge_len: u64 = (bytes.len() * 10) as u64;
+        bytes[8..16].copy_from_slice(&huge_len.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert!(cache.try_load(key).is_none(), "bad payload_len should miss");
+        assert!(
+            !path.exists(),
+            "file with bad payload_len should be deleted"
+        );
+    }
+
+    #[test]
+    fn store_skips_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = VsDbCache {
+            dir: Some(dir.path().to_path_buf()),
+        };
+        let db = compile_trivial_db();
+        let key = "test-skip-existing";
+
+        cache.try_store(key, db as *const vs::hs_database_t);
+        let path = dir.path().join(format!("{key}.hsdb"));
+        let original = std::fs::read(&path).unwrap();
+
+        cache.try_store(key, db as *const vs::hs_database_t);
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(original, after, "second store should not modify the file");
+
+        unsafe { vs::hs_free_database(db) };
+    }
+
+    #[test]
+    fn corrupted_key_hash_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = VsDbCache {
+            dir: Some(dir.path().to_path_buf()),
+        };
+        let db = compile_trivial_db();
+        let key = "test-corrupt-keyhash";
+
+        cache.try_store(key, db as *const vs::hs_database_t);
+        unsafe { vs::hs_free_database(db) };
+
+        let path = dir.path().join(format!("{key}.hsdb"));
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[16] ^= 0xFF;
+        bytes[30] ^= 0x0F;
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert!(
+            cache.try_load(key).is_none(),
+            "corrupted key hash should miss"
+        );
+        assert!(
+            !path.exists(),
+            "file with corrupted key hash should be deleted"
+        );
+    }
+
+    #[test]
+    fn zero_length_payload_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "test-zero-payload";
+        let path = dir.path().join(format!("{key}.hsdb"));
+
+        // Valid header + MAC with zero-length payload (not a valid Vectorscan DB).
+        let key_hash = *blake3::hash(key.as_bytes()).as_bytes();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(MAGIC);
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&key_hash);
+        let mac = compute_mac(&key_hash, &buf);
+        buf.extend_from_slice(&mac);
+
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(&path, &buf).unwrap();
+
+        let cache = VsDbCache {
+            dir: Some(dir.path().to_path_buf()),
+        };
+        assert!(
+            cache.try_load(key).is_none(),
+            "zero-length payload should miss"
+        );
+        assert!(
+            !path.exists(),
+            "file with zero-length payload should be deleted"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Property tests (proptest)
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, feature = "stdx-proptest"))]
+mod prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::ffi::CString;
+    use std::mem::MaybeUninit;
+
+    fn test_platform() -> vs::hs_platform_info_t {
+        let mut platform = MaybeUninit::<vs::hs_platform_info_t>::zeroed();
+        unsafe {
+            let _ = vs::hs_populate_platform(platform.as_mut_ptr());
+            platform.assume_init()
+        }
+    }
+
+    /// Generates a non-empty `Vec<CString>` of lowercase ASCII patterns with
+    /// matching-length flags and ids vecs.
+    fn arb_pats_flags_ids() -> impl Strategy<Value = (Vec<CString>, Vec<u32>, Vec<u32>)> {
+        (1..8usize).prop_flat_map(|n| {
+            (
+                prop::collection::vec("[a-z]{1,8}", n)
+                    .prop_map(|v| v.into_iter().map(|s| CString::new(s).unwrap()).collect()),
+                prop::collection::vec(any::<u32>(), n),
+                prop::collection::vec(any::<u32>(), n),
+            )
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Same input always produces the same key.
+        #[test]
+        fn cache_key_deterministic(
+            kind in prop::collection::vec(any::<u8>(), 1..32),
+            mode in any::<u32>(),
+            (pats, flags, ids) in arb_pats_flags_ids(),
+        ) {
+            let platform = test_platform();
+            let input = CacheKeyInput {
+                kind: &kind,
+                mode,
+                platform: &platform,
+                patterns: &pats,
+                flags: Some(&flags),
+                ids: &ids,
+            };
+            let cache = VsDbCache { dir: None };
+            prop_assert_eq!(cache.cache_key(&input), cache.cache_key(&input));
+        }
+
+        /// Changing `kind` always changes the key.
+        #[test]
+        fn cache_key_sensitive_to_kind(
+            kind1 in prop::collection::vec(any::<u8>(), 1..32),
+            kind2 in prop::collection::vec(any::<u8>(), 1..32),
+            mode in any::<u32>(),
+            (pats, flags, ids) in arb_pats_flags_ids(),
+        ) {
+            prop_assume!(kind1 != kind2);
+            let platform = test_platform();
+            let cache = VsDbCache { dir: None };
+            let i1 = CacheKeyInput { kind: &kind1, mode, platform: &platform, patterns: &pats, flags: Some(&flags), ids: &ids };
+            let i2 = CacheKeyInput { kind: &kind2, mode, platform: &platform, patterns: &pats, flags: Some(&flags), ids: &ids };
+            prop_assert_ne!(cache.cache_key(&i1), cache.cache_key(&i2));
+        }
+
+        /// Changing `mode` always changes the key.
+        #[test]
+        fn cache_key_sensitive_to_mode(
+            mode1 in any::<u32>(),
+            mode2 in any::<u32>(),
+            (pats, flags, ids) in arb_pats_flags_ids(),
+        ) {
+            prop_assume!(mode1 != mode2);
+            let platform = test_platform();
+            let cache = VsDbCache { dir: None };
+            let i1 = CacheKeyInput { kind: b"test", mode: mode1, platform: &platform, patterns: &pats, flags: Some(&flags), ids: &ids };
+            let i2 = CacheKeyInput { kind: b"test", mode: mode2, platform: &platform, patterns: &pats, flags: Some(&flags), ids: &ids };
+            prop_assert_ne!(cache.cache_key(&i1), cache.cache_key(&i2));
+        }
+
+        /// Length-prefix disambiguation: `["ab", "c"]` differs from `["a", "bc"]`.
+        #[test]
+        fn cache_key_length_prefix_disambiguation(
+            a in "[a-z]{1,4}",
+            b in "[a-z]{1,4}",
+        ) {
+            prop_assume!(a.len() > 1);
+            let split = a.len() / 2;
+            let pats1 = vec![
+                CString::new(&a[..split]).unwrap(),
+                CString::new(format!("{}{b}", &a[split..])).unwrap(),
+            ];
+            let pats2 = vec![
+                CString::new(a.as_str()).unwrap(),
+                CString::new(b.as_str()).unwrap(),
+            ];
+            prop_assume!(pats1 != pats2);
+
+            let platform = test_platform();
+            let cache = VsDbCache { dir: None };
+            let flags = [0u32; 2];
+            let ids = [0u32, 1];
+            let i1 = CacheKeyInput { kind: b"test", mode: 0, platform: &platform, patterns: &pats1, flags: Some(&flags), ids: &ids };
+            let i2 = CacheKeyInput { kind: b"test", mode: 0, platform: &platform, patterns: &pats2, flags: Some(&flags), ids: &ids };
+            prop_assert_ne!(cache.cache_key(&i1), cache.cache_key(&i2));
+        }
+
+        /// `flags: None` always differs from `flags: Some(&[])`.
+        #[test]
+        fn cache_key_none_vs_some_flags(
+            (pats, _flags, ids) in arb_pats_flags_ids(),
+        ) {
+            let platform = test_platform();
+            let cache = VsDbCache { dir: None };
+            let i1 = CacheKeyInput { kind: b"test", mode: 0, platform: &platform, patterns: &pats, flags: None, ids: &ids };
+            let i2 = CacheKeyInput { kind: b"test", mode: 0, platform: &platform, patterns: &pats, flags: Some(&[]), ids: &ids };
+            prop_assert_ne!(cache.cache_key(&i1), cache.cache_key(&i2));
+        }
     }
 }

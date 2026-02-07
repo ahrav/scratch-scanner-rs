@@ -18,7 +18,7 @@
 //! - **Cache-line padded**: Head and tail indices live on separate cache lines
 //!   to prevent false sharing between producer and consumer threads.
 //! - **Power-of-2 capacity**: Bitwise AND masking for O(1) index calculation.
-//! - **Zero heap allocation**: Stack-allocated `[MaybeUninit<T>; N]` storage.
+//! - **Single heap allocation**: One `Box`-allocated ring shared via `Arc`.
 //!
 //! # Wait strategy
 //!
@@ -321,9 +321,8 @@ impl<'a, T, const N: usize> SpscConsumer<'a, T, N> {
 /// Returns a `(SpscProducer, SpscConsumer)` pair. The producer and consumer
 /// may be sent to different threads (they implement `Send`).
 ///
-/// The returned handles borrow from a `Box`-allocated shared ring, which is
-/// leaked to give the handles `'static` lifetime. The ring is reclaimed when
-/// both handles are dropped (via the custom `Drop` on `SpscHandle`).
+/// The returned handles share an `Arc<OwnedSpscInner>`-managed ring.
+/// The ring is reclaimed when both handles are dropped.
 ///
 /// # Panics
 ///
