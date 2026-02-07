@@ -751,15 +751,15 @@ impl Engine {
                 continue;
             }
             let is_base64 = tc.id == TransformId::Base64;
-            // `active` = all enabled transforms (superset); used on the hit path
-            // when no findings have been found yet in this buffer.
+            // `active` = all enabled transforms (superset); used on the zero-hit
+            // bypass path and on the hit path when no findings have been found yet.
             if is_base64 {
                 scanbuf_transform_idxs_active_base64.push(idx);
             } else {
                 scanbuf_transform_idxs_active_non_base64.push(idx);
             }
             // `always` = only Always-mode transforms; used on the hit path when
-            // findings have already been found (IfNoFindings transforms are skipped).
+            // findings have already been found (IfNoFindingsInThisBuffer transforms are skipped).
             if tc.mode == TransformMode::Always {
                 if is_base64 {
                     scanbuf_transform_idxs_always_base64.push(idx);
@@ -771,7 +771,10 @@ impl Engine {
         let has_active_transforms = !scanbuf_transform_idxs_active_non_base64.is_empty()
             || !scanbuf_transform_idxs_active_base64.is_empty();
 
-        // Build anchor byte set for URL-percent gating.
+        // Build anchor byte set for URL-percent gating. A decoded `%XX` byte can
+        // only contribute to an anchor match if that byte value appears somewhere
+        // in at least one anchor pattern. This is a superset check (no false
+        // negatives, possible false positives for multi-byte patterns).
         let mut anchor_byte_set = [0u64; 4];
         for pat in &anchor_patterns_all {
             for &b in pat.as_slice() {
@@ -983,7 +986,7 @@ impl Engine {
                             && super::transform::transform_quick_trigger(tc, root_buf)
                             && self.base64_buffer_gate(tc, root_buf)
                             && (tc.id != TransformId::UrlPercent
-                                || self.url_percent_buffer_gate(root_buf))
+                                || self.url_percent_buffer_gate(tc, root_buf))
                     })
                     || self
                         .scanbuf_transform_idxs_active_base64
@@ -1537,34 +1540,18 @@ impl Engine {
 
     /// Cheap gate for URL-percent transforms on the zero-hit path.
     ///
-    /// Returns `true` only if at least one `%XX` triplet in the buffer decodes
-    /// to a byte present in any anchor pattern. This filters out buffers where
-    /// `%` appears only in format specifiers (`%d`, `%s`) or other non-URL
-    /// contexts that cannot produce anchor bytes after decoding.
+    /// Returns `true` when the anchor byte set is empty (conservative fallback)
+    /// or when at least one `%XX` triplet in the buffer decodes to a byte
+    /// present in any anchor pattern.
     ///
-    /// Conservative: returns `true` if the anchor byte set is empty (no anchors
-    /// compiled) to avoid false negatives.
+    /// Also accepts when `plus_to_space` is enabled and `'+'` is present with
+    /// space in the anchor byte set.
+    ///
+    /// This filters out buffers where `%` appears only in format specifiers
+    /// (`%d`, `%s`) and no decoded anchor byte can be produced.
     #[inline]
-    fn url_percent_buffer_gate(&self, buf: &[u8]) -> bool {
-        if self.anchor_byte_set == [0u64; 4] {
-            return true;
-        }
-        let bytes = buf;
-        let mut i = 0;
-        while i + 2 < bytes.len() {
-            if bytes[i] == b'%' {
-                if let Some(decoded) = decode_hex_pair(bytes[i + 1], bytes[i + 2]) {
-                    if self.anchor_byte_set[(decoded >> 6) as usize] & (1u64 << (decoded & 63)) != 0
-                    {
-                        return true;
-                    }
-                    i += 3;
-                    continue;
-                }
-            }
-            i += 1;
-        }
-        false
+    fn url_percent_buffer_gate(&self, tc: &TransformConfig, buf: &[u8]) -> bool {
+        url_percent_gate_check(&self.anchor_byte_set, tc.plus_to_space, buf)
     }
 
     /// Drains compact findings from scratch and materializes provenance.
@@ -1594,7 +1581,7 @@ impl Engine {
 ///
 /// Returns `None` if either digit is not valid hexadecimal.
 #[inline(always)]
-fn decode_hex_pair(hi: u8, lo: u8) -> Option<u8> {
+pub(super) fn decode_hex_pair(hi: u8, lo: u8) -> Option<u8> {
     let h = match hi {
         b'0'..=b'9' => hi - b'0',
         b'A'..=b'F' => hi - b'A' + 10,
@@ -1610,6 +1597,48 @@ fn decode_hex_pair(hi: u8, lo: u8) -> Option<u8> {
     Some((h << 4) | l)
 }
 
+/// Standalone gate check for URL-percent transforms.
+///
+/// Returns `true` if decoding could plausibly produce any anchor byte, or if
+/// the set is empty (conservative).
+pub(super) fn url_percent_gate_check(
+    anchor_byte_set: &[u64; 4],
+    plus_to_space: bool,
+    buf: &[u8],
+) -> bool {
+    if *anchor_byte_set == [0u64; 4] {
+        return true;
+    }
+    // When plus_to_space is enabled, '+' decodes to space (0x20) without any
+    // `%XX` escape. If space is an anchor byte, a bare '+' is enough to
+    // require the full transform pass.
+    if plus_to_space
+        && memchr::memchr(b'+', buf).is_some()
+        && (anchor_byte_set[(b' ' >> 6) as usize] & (1u64 << (b' ' & 63)) != 0)
+    {
+        return true;
+    }
+    let bytes = buf;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 < bytes.len() {
+                if let Some(decoded) = decode_hex_pair(bytes[i + 1], bytes[i + 2]) {
+                    if anchor_byte_set[(decoded >> 6) as usize] & (1u64 << (decoded & 63)) != 0 {
+                        return true;
+                    }
+                    i += 3;
+                    continue;
+                }
+            } else {
+                return true; // truncated %XX — conservatively allow scan
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Benchmark helper to expose span detection for transform configs.
 #[cfg(feature = "bench")]
 pub fn bench_find_spans_into(
@@ -1622,3 +1651,130 @@ pub fn bench_find_spans_into(
 
 #[cfg(feature = "bench")]
 pub use super::transform::{bench_stream_decode_base64, bench_stream_decode_url};
+
+#[cfg(test)]
+mod url_gate_tests {
+    use super::*;
+
+    /// Build a 256-bit anchor byte set containing exactly the given bytes.
+    fn make_anchor_set(bytes: &[u8]) -> [u64; 4] {
+        let mut set = [0u64; 4];
+        for &b in bytes {
+            set[(b >> 6) as usize] |= 1u64 << (b & 63);
+        }
+        set
+    }
+
+    // Boundary coverage for `%XX` handling in the standalone gate helper.
+
+    #[test]
+    fn gate_triplet_at_end_of_buffer() {
+        // %20 decodes to 0x20 (space). Anchor set contains space.
+        let set = make_anchor_set(b" ");
+        // Buffer is exactly the 3-byte triplet — nothing before or after.
+        assert!(
+            url_percent_gate_check(&set, false, b"%20"),
+            "gate must detect %XX triplet at the very end of the buffer"
+        );
+    }
+
+    #[test]
+    fn gate_triplet_at_end_after_plain_bytes() {
+        let set = make_anchor_set(b"k");
+        // 0x6B == 'k'
+        assert!(
+            url_percent_gate_check(&set, false, b"hello%6B"),
+            "gate must detect %XX triplet at end preceded by plain text"
+        );
+    }
+
+    #[test]
+    fn gate_triplet_not_at_boundary_still_works() {
+        // Sanity: triplet NOT at the boundary should still work.
+        let set = make_anchor_set(b" ");
+        assert!(url_percent_gate_check(&set, false, b"%20xyz"));
+    }
+
+    #[test]
+    fn gate_no_anchor_bytes_returns_false() {
+        let set = make_anchor_set(b"A");
+        // %20 decodes to space, which is NOT in the anchor set.
+        assert!(!url_percent_gate_check(&set, false, b"%20"));
+    }
+
+    #[test]
+    fn gate_plus_to_space_without_percent_triplet() {
+        let set = make_anchor_set(b" ");
+        assert!(
+            url_percent_gate_check(&set, true, b"TOK+ABCD"),
+            "plus-to-space must pass even when no %XX escapes are present"
+        );
+        assert!(
+            !url_percent_gate_check(&set, false, b"TOK+ABCD"),
+            "without plus-to-space, '+' should not affect the gate"
+        );
+    }
+
+    #[test]
+    fn gate_empty_anchor_set_returns_true() {
+        let empty = [0u64; 4];
+        assert!(
+            url_percent_gate_check(&empty, false, b"anything"),
+            "empty anchor set is conservative — always returns true"
+        );
+    }
+
+    // ---- decode_hex_pair coverage ----
+
+    #[test]
+    fn hex_pair_valid_digits() {
+        assert_eq!(decode_hex_pair(b'0', b'0'), Some(0x00));
+        assert_eq!(decode_hex_pair(b'F', b'F'), Some(0xFF));
+        assert_eq!(decode_hex_pair(b'f', b'f'), Some(0xFF));
+        assert_eq!(decode_hex_pair(b'4', b'1'), Some(0x41)); // 'A'
+        assert_eq!(decode_hex_pair(b'6', b'B'), Some(0x6B)); // 'k'
+    }
+
+    #[test]
+    fn hex_pair_mixed_case() {
+        assert_eq!(decode_hex_pair(b'a', b'B'), Some(0xAB));
+        assert_eq!(decode_hex_pair(b'C', b'd'), Some(0xCD));
+    }
+
+    #[test]
+    fn hex_pair_invalid_hi() {
+        assert_eq!(decode_hex_pair(b'G', b'0'), None);
+        assert_eq!(decode_hex_pair(b'/', b'0'), None); // just below '0'
+        assert_eq!(decode_hex_pair(b':', b'0'), None); // just above '9'
+    }
+
+    #[test]
+    fn hex_pair_invalid_lo() {
+        assert_eq!(decode_hex_pair(b'0', b'g'), None);
+        assert_eq!(decode_hex_pair(b'0', b' '), None);
+    }
+
+    // ---- gate edge cases ----
+
+    #[test]
+    fn gate_truncated_triplet_at_end() {
+        let set = make_anchor_set(b" ");
+        // Buffer ends with `%2` — not enough bytes to form a triplet.
+        // Conservatively returns true (the truncated escape might decode to
+        // an anchor byte with more data).
+        assert!(url_percent_gate_check(&set, false, b"hello%2"));
+    }
+
+    #[test]
+    fn gate_percent_with_invalid_hex() {
+        let set = make_anchor_set(&[0x00]); // any byte would match 0x00
+                                            // `%ZZ` is not valid hex — should skip, not panic.
+        assert!(!url_percent_gate_check(&set, false, b"%ZZ"));
+    }
+
+    #[test]
+    fn gate_empty_buffer() {
+        let set = make_anchor_set(b"A");
+        assert!(!url_percent_gate_check(&set, false, b""));
+    }
+}
