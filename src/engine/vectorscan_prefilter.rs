@@ -66,7 +66,7 @@
 //! - If multi-compile fails for raw rules, we fall back to per-rule compilation
 //!   to pinpoint rejects; any rejected pattern returns an error.
 //! - Empty UTF-16/gate pattern sets return an error early.
-use crate::api::{RuleSpec, Tuning};
+use crate::api::RuleSpec;
 use libc::{c_char, c_int, c_uint, c_void};
 use std::ffi::CString;
 use std::mem::MaybeUninit;
@@ -913,7 +913,6 @@ impl VsAnchorDb {
         pat_offsets: &[u32],
         seed_radius_raw: &[u32],
         seed_radius_utf16: &[u32],
-        _tuning: &Tuning,
     ) -> Result<Self, String> {
         let debug = std::env::var("SCANNER_VS_UTF16_DEBUG").is_ok();
         let data = build_anchor_data(
@@ -1095,7 +1094,6 @@ impl VsUtf16StreamDb {
         pat_offsets: &[u32],
         seed_radius_raw: &[u32],
         seed_radius_utf16: &[u32],
-        _tuning: &Tuning,
     ) -> Result<Self, String> {
         let debug = std::env::var("SCANNER_VS_UTF16_DEBUG").is_ok();
         let data = build_anchor_data(
@@ -1491,7 +1489,6 @@ impl VsPrefilterDb {
     ///
     /// # Arguments
     /// * `rules` - Rule specifications to compile
-    /// * `_tuning` - Tuning parameters (currently unused)
     /// * `anchor` - Optional anchor patterns to include as exact literals
     /// * `use_raw_prefilter` - Per-rule flags indicating whether to include raw regex.
     ///   When `None`, all rules use raw regex prefiltering. When `Some`, only rules
@@ -1503,7 +1500,6 @@ impl VsPrefilterDb {
     /// recompile patterns individually to surface the specific rule errors.
     pub(crate) fn try_new(
         rules: &[RuleSpec],
-        _tuning: &Tuning,
         anchor: Option<AnchorInput<'_>>,
         use_raw_prefilter: Option<&[bool]>,
     ) -> Result<Self, String> {

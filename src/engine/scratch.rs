@@ -16,7 +16,7 @@ use crate::api::Base64DecodeStats;
 use super::decode_state::{DecodeSlab, StepArena};
 use super::helpers::{hash128, pow2_at_least};
 use super::hit_pool::{HitAccPool, SpanU32};
-use super::transform::{map_decoded_offset, STREAM_DECODE_CHUNK_BYTES};
+use super::transform::{is_url_trigger, map_decoded_offset, STREAM_DECODE_CHUNK_BYTES};
 use super::vectorscan_prefilter::{VsScratch, VsStreamWindow};
 use super::work_items::{PendingDecodeSpan, PendingWindow, SpanStreamEntry, WorkItem};
 use regex::bytes::CaptureLocations;
@@ -137,7 +137,7 @@ impl RootSpanMapCtx {
 
         let mut has_trigger = false;
         for &b in &encoded[scan_start..scan_end] {
-            if b == b'%' || (plus_to_space && b == b'+') {
+            if is_url_trigger(b, plus_to_space) {
                 has_trigger = true;
                 break;
             }
@@ -190,7 +190,7 @@ impl RootSpanMapCtx {
         }
 
         for (idx, &b) in encoded[span_end..].iter().enumerate() {
-            if b == b'%' || (plus_to_space && b == b'+') {
+            if is_url_trigger(b, plus_to_space) {
                 return Some(self.root_start + span_end + idx + 1);
             }
         }

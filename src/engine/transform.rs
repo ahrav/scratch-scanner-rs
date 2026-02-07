@@ -63,6 +63,11 @@ fn is_hex(b: u8) -> bool {
     b.is_ascii_hexdigit()
 }
 
+#[inline(always)]
+pub(super) fn is_url_trigger(b: u8, plus_to_space: bool) -> bool {
+    b == b'%' || (plus_to_space && b == b'+')
+}
+
 // Caller must check `is_hex` first; non-hex bytes map to 0.
 fn hex_val(b: u8) -> u8 {
     match b {
@@ -265,7 +270,7 @@ impl UrlSpanStream {
 
             if urlish {
                 self.run_len += 1;
-                if b == b'%' || (self.plus_to_space && b == b'+') {
+                if is_url_trigger(b, self.plus_to_space) {
                     self.triggers += 1;
                 }
                 i += 1;
@@ -664,7 +669,7 @@ pub(super) fn find_url_spans_into(
             if (flags & URLISH) == 0 {
                 break;
             }
-            if b == b'%' || (plus_to_space && b == b'+') {
+            if is_url_trigger(b, plus_to_space) {
                 triggers += 1;
             }
             i += 1;

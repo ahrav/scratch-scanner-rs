@@ -365,15 +365,6 @@ impl Engine {
         for (rid, r) in rules.iter().enumerate() {
             assert!(rid <= u32::MAX as usize);
             let rid_u32 = rid as u32;
-            let validator_match_start = r.validator != ValidatorKind::None;
-            // If an anchor is also a keyword, the keyword gate is already satisfied
-            // at that hit and the validator can remain authoritative.
-            let keyword_implied_for_anchor = |anchor: &[u8]| -> bool {
-                match r.keywords_any {
-                    None => true,
-                    Some(kws) => kws.contains(&anchor),
-                }
-            };
             let mut manual_used = false;
             let mut add_manual =
                 |pat_map_all: &mut AHashMap<Vec<u8>, Vec<Target>>,
@@ -391,56 +382,26 @@ impl Engine {
                             anchor_plan_stats.manual_rules.saturating_add(1);
                     }
                     for &a in r.anchors {
-                        let keyword_implied = keyword_implied_for_anchor(a);
-                        add_pat_raw(
-                            pat_map_all,
-                            a,
-                            Target::new(
-                                rid_u32,
-                                Variant::Raw,
-                                validator_match_start,
-                                keyword_implied,
-                            ),
-                        );
+                        add_pat_raw(pat_map_all, a, Target::new(rid_u32, Variant::Raw));
                         add_pat_owned(
                             pat_map_all,
                             utf16le_bytes(a),
-                            Target::new(
-                                rid_u32,
-                                Variant::Utf16Le,
-                                validator_match_start,
-                                keyword_implied,
-                            ),
+                            Target::new(rid_u32, Variant::Utf16Le),
                         );
                         add_pat_owned(
                             pat_map_all,
                             utf16be_bytes(a),
-                            Target::new(
-                                rid_u32,
-                                Variant::Utf16Be,
-                                validator_match_start,
-                                keyword_implied,
-                            ),
+                            Target::new(rid_u32, Variant::Utf16Be),
                         );
                         add_pat_owned(
                             pat_map_utf16,
                             utf16le_bytes(a),
-                            Target::new(
-                                rid_u32,
-                                Variant::Utf16Le,
-                                validator_match_start,
-                                keyword_implied,
-                            ),
+                            Target::new(rid_u32, Variant::Utf16Le),
                         );
                         add_pat_owned(
                             pat_map_utf16,
                             utf16be_bytes(a),
-                            Target::new(
-                                rid_u32,
-                                Variant::Utf16Be,
-                                validator_match_start,
-                                keyword_implied,
-                            ),
+                            Target::new(rid_u32, Variant::Utf16Be),
                         );
                     }
                 };
@@ -481,31 +442,30 @@ impl Engine {
                             anchor_plan_stats.derived_rules.saturating_add(1);
                     }
                     for anchor in anchors {
-                        let keyword_implied = keyword_implied_for_anchor(&anchor);
                         add_pat_raw(
                             &mut pat_map_all,
                             &anchor,
-                            Target::new(rid_u32, Variant::Raw, false, keyword_implied),
+                            Target::new(rid_u32, Variant::Raw),
                         );
                         add_pat_owned(
                             &mut pat_map_all,
                             utf16le_bytes(&anchor),
-                            Target::new(rid_u32, Variant::Utf16Le, false, keyword_implied),
+                            Target::new(rid_u32, Variant::Utf16Le),
                         );
                         add_pat_owned(
                             &mut pat_map_all,
                             utf16be_bytes(&anchor),
-                            Target::new(rid_u32, Variant::Utf16Be, false, keyword_implied),
+                            Target::new(rid_u32, Variant::Utf16Be),
                         );
                         add_pat_owned(
                             &mut pat_map_utf16,
                             utf16le_bytes(&anchor),
-                            Target::new(rid_u32, Variant::Utf16Le, false, keyword_implied),
+                            Target::new(rid_u32, Variant::Utf16Le),
                         );
                         add_pat_owned(
                             &mut pat_map_utf16,
                             utf16be_bytes(&anchor),
-                            Target::new(rid_u32, Variant::Utf16Be, false, keyword_implied),
+                            Target::new(rid_u32, Variant::Utf16Be),
                         );
                     }
                 }
@@ -684,7 +644,7 @@ impl Engine {
         };
         let t_vs = Instant::now();
         let vs = Some(
-            VsPrefilterDb::try_new(&rules, &tuning, anchor_input, Some(&use_raw_prefilter))
+            VsPrefilterDb::try_new(&rules, anchor_input, Some(&use_raw_prefilter))
                 .expect("vectorscan prefilter db build failed (fallback disabled)"),
         );
         let vs_ms = t_vs.elapsed().as_millis();
@@ -737,7 +697,6 @@ impl Engine {
                 &pat_offsets_utf16,
                 &raw_seed_radius_bytes,
                 &utf16_seed_radius_bytes,
-                &tuning,
             ) {
                 Ok(db) => Some(db),
                 Err(err) => {
@@ -759,7 +718,6 @@ impl Engine {
                 &pat_offsets_utf16,
                 &raw_seed_radius_bytes,
                 &utf16_seed_radius_bytes,
-                &tuning,
             ) {
                 Ok(db) => Some(db),
                 Err(err) => {

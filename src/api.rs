@@ -429,6 +429,9 @@ impl TwoPhaseSpec {
 /// representation (i.e., `anchor_start` is the regex match start). If this
 /// cannot be guaranteed for a rule, set [`ValidatorKind::None`].
 ///
+/// The built-in gitleaks-derived rule set currently uses `ValidatorKind::None`
+/// for all rules; non-`None` variants remain available for custom rule sets.
+///
 /// # Preconditions
 /// - Only use fast validators when anchors are match-start aligned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -605,6 +608,8 @@ pub struct RuleSpec {
     /// expected to be match-start aligned in raw bytes. The engine will attempt
     /// to validate at each anchor hit and may skip window/regex work entirely
     /// when the validator is authoritative.
+    ///
+    /// Built-in rules currently set this to [`ValidatorKind::None`].
     pub validator: ValidatorKind,
 
     /// Optional two-phase confirm + expand configuration.

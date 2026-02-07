@@ -4065,3 +4065,23 @@ pub(crate) fn gitleaks_rules() -> Vec<RuleSpec> {
         },
     ]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::gitleaks_rules;
+    use crate::api::ValidatorKind;
+
+    #[test]
+    fn gitleaks_rules_use_no_fast_validators() {
+        let rules = gitleaks_rules();
+        assert!(!rules.is_empty(), "gitleaks rule set should not be empty");
+        for rule in rules {
+            assert_eq!(
+                rule.validator,
+                ValidatorKind::None,
+                "rule '{}' unexpectedly enables fast validator",
+                rule.name
+            );
+        }
+    }
+}
