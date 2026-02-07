@@ -169,6 +169,19 @@ pub struct GitScanConfig {
     ///
     /// Total pack threads in the system ≤ scheduler_workers × pack_exec_workers.
     pub pack_exec_workers: usize,
+
+    /// Number of threads for parallel blob introduction (Stage 1).
+    ///
+    /// Workers share an `AtomicSeenSets` bitmap for deduplication and each
+    /// get their own `ObjectStore`, tree cache, and candidate collector.
+    /// Cache budgets are divided by this count to keep total memory constant.
+    ///
+    /// Set to 1 to disable parallel blob intro (serial path).
+    /// Capped at 8 because inflate is memory-bandwidth-bound and shows
+    /// diminishing returns beyond that.
+    ///
+    /// Default: min(available_parallelism, 8), clamped to at least 1.
+    pub blob_intro_workers: usize,
     /// Optional spill directory override. When `None`, a unique temp directory is used.
     pub spill_dir: Option<PathBuf>,
     /// Limits for in-memory artifact construction.
@@ -201,6 +214,7 @@ impl Default for GitScanConfig {
             pack_mmap: PackMmapLimits::DEFAULT,
             pack_cache_bytes: 64 * 1024 * 1024,
             pack_exec_workers: default_pack_exec_workers(),
+            blob_intro_workers: default_blob_intro_workers(),
             spill_dir: None,
             artifact_build: ArtifactBuildLimits::default(),
         }
@@ -209,10 +223,11 @@ impl Default for GitScanConfig {
 
 /// Per-worker pack exec thread budget.
 ///
-/// Oversubscribes 2× cores to mask IO/decode latency, capped at 24 to
-/// avoid cache thrash and memory-bandwidth collapse on large machines.
-/// Floor of 12 ensures sufficient parallelism even on low-core-count
-/// machines.
+/// Oversubscribes 2× cores to mask IO latency (page faults from mmap'd
+/// packs interleave with inflate + scan compute). Capped at 24 to avoid
+/// memory-bandwidth collapse on large machines where inflate throughput
+/// saturates. Floor of 12 ensures sufficient parallelism even on
+/// low-core-count machines (e.g., CI runners).
 fn default_pack_exec_workers() -> usize {
     let parallelism = std::thread::available_parallelism()
         .map(|count| count.get())
@@ -220,6 +235,16 @@ fn default_pack_exec_workers() -> usize {
     let doubled = parallelism.saturating_mul(2);
     let capped = if doubled > 24 { 24 } else { doubled };
     capped.max(12)
+}
+
+/// Blob-intro worker count.
+///
+/// Uses available parallelism capped at 8. Falls back to 1 on error.
+fn default_blob_intro_workers() -> usize {
+    let parallelism = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    parallelism.clamp(1, 8)
 }
 
 /// Git scan execution mode.
@@ -1037,7 +1062,8 @@ pub fn run_git_scan(
 
     // Perf snapshot: mapping and scan timings live in thread-local perf
     // counters (accumulated across pack-exec workers), not wall-clock
-    // `Instant` measurements, so we patch them into stage_nanos here.
+    // `Instant` measurements. We patch them into `stage_nanos` here so
+    // they appear alongside the wall-clock stages in the final report.
     let perf_stats = super::perf::snapshot();
     output.stage_nanos.mapping = perf_stats.mapping_nanos;
     output.stage_nanos.scan = perf_stats.scan_nanos;

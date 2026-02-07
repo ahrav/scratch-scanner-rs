@@ -118,7 +118,9 @@ graph TB
 | **Tree Spill Index** | `src/git_scan/object_store.rs` | Fixed-size OID index for reusing spilled tree payloads               |
 | **MIDX Mapping**    | `src/git_scan/midx.rs`, `src/git_scan/mapping_bridge.rs` | MIDX parsing and blob-to-pack mapping                     |
 | **Tree Diff Walker** | `src/git_scan/tree_diff.rs` | OID-only tree diffs that emit candidate blobs with context          |
-| **Blob Introducer** | `src/git_scan/blob_introducer.rs` | First-introduced blob walk for ODB-blob scan mode (no per-commit diffs) |
+| **Blob Introducer** | `src/git_scan/blob_introducer.rs` | First-introduced blob walk for ODB-blob scan mode; supports parallel mode via `introduce_parallel` |
+| **BlobIntroWorker** | `src/git_scan/blob_introducer.rs` | Per-thread worker for parallel blob introduction with own `ObjectStore` and `PackCandidateCollector` |
+| **AtomicSeenSets** | `src/stdx/atomic_seen_sets.rs` | Lock-free bitmap pair (trees + blobs) sized to MIDX object count for parallel dedup |
 | **Pack Candidate Collector** | `src/git_scan/pack_candidates.rs` | Direct blob-to-pack/loose candidate mapping for ODB-blob mode |
 | **Tree Stream Parser** | `src/git_scan/tree_stream.rs` | Streaming tree entry parser with bounded buffer                     |
 | **Pack Executor**   | `src/git_scan/pack_exec.rs` | Executes pack plans to decode candidate blobs with bounded buffers |

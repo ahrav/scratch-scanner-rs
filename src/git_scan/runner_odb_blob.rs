@@ -34,15 +34,19 @@ use std::time::Instant;
 use crate::scheduler::{alloc_stats, AllocStats};
 use crate::Engine;
 
-use super::blob_introducer::BlobIntroducer;
+use super::blob_introducer::{introduce_parallel, BlobIntroStats, BlobIntroducer};
+use super::byte_arena::ByteArena;
 use super::commit_graph::CommitGraphIndex;
 use super::commit_walk::PlannedCommit;
 use super::engine_adapter::{EngineAdapter, ScannedBlobs};
 use super::errors::TreeDiffError;
 use super::mapping_bridge::{MappingBridge, MappingBridgeConfig, MappingStats};
+use super::midx::MidxView;
 use super::object_store::ObjectStore;
 use super::oid_index::OidIndex;
-use super::pack_candidates::{CappedPackCandidateSink, PackCandidateCollector};
+use super::pack_candidates::{
+    CappedPackCandidateSink, LooseCandidate, PackCandidate, PackCandidateCollector,
+};
 use super::pack_io::PackIo;
 use super::pack_plan::{bucket_pack_candidates, build_pack_plan_for_pack, PackPlanError};
 use super::runner::{
@@ -90,6 +94,7 @@ use super::repo_open::RepoJobState;
 /// - `cg_index`: commit graph index built from the commit graph.
 /// - `plan`: commit plan (planned commits from `introduced_by_plan`).
 /// - `config`: scan configuration (limits, worker counts, etc.).
+/// - `event_sink`: event sink for streaming scan progress and diagnostics.
 ///
 /// # Errors
 /// Returns `GitScanError` on MIDX, pack plan, pack exec, or I/O failures.
@@ -142,101 +147,141 @@ pub(super) fn run_odb_blob(
         tree_delta_cache,
     )?;
 
-    let mut introducer = BlobIntroducer::new(
-        &config.tree_diff,
-        repo.object_format.oid_len(),
-        midx.object_count(),
-        config.path_policy_version,
-        mapping_cfg.max_loose_candidates,
-    );
-
     // ── Stage 1: blob introduction ───────────────────────────────────
-    // Attempt the fast path first (in-memory collector).  On capacity
-    // overflow, fall back to the spill/dedupe pipeline which writes
-    // candidates to disk, deduplicates via `seen_store`, then maps back
-    // through a `MappingBridge`.
+    // When blob_intro_workers > 1, use the parallel path with shared
+    // AtomicSeenSets. The parallel path does not support the spill/retry
+    // fallback (which is serial-only); on capacity overflow it returns an
+    // error that falls through to the serial spill retry below.
     let intro_start = Instant::now();
-    let (intro_stats, mut packed, loose, path_arena, spill_stats, mapping_stats) = {
-        let mut collector = PackCandidateCollector::new(
-            &midx,
-            &oid_index,
-            mapping_cfg.path_arena_capacity,
-            mapping_cfg.max_packed_candidates,
-            mapping_cfg.max_loose_candidates,
-        );
+    // Clamp workers: at least 1, at most the plan length (no empty chunks),
+    // and at most 8 because inflate is memory-bandwidth-bound and shows
+    // diminishing returns beyond ~8 threads on current hardware.
+    let effective_workers = config
+        .blob_intro_workers
+        .max(1)
+        .min(plan.len().max(1))
+        .min(8);
 
-        match introducer.introduce(
-            &mut object_store,
-            cg_index,
-            plan,
-            &oid_index,
-            &mut collector,
-        ) {
-            Ok(stats) => {
-                stage_nanos.blob_intro = intro_start.elapsed().as_nanos() as u64;
-                let collect_start = Instant::now();
-                let (packed, loose, path_arena) = collector.finish();
-                stage_nanos.pack_collect = collect_start.elapsed().as_nanos() as u64;
-                let mapping_stats = MappingStats {
-                    unique_blobs_in: packed.len().saturating_add(loose.len()) as u64,
-                    packed_matched: packed.len() as u64,
-                    loose_unmatched: loose.len() as u64,
-                };
-                (
-                    stats,
-                    packed,
-                    loose,
-                    path_arena,
-                    SpillStats::default(),
-                    mapping_stats,
-                )
+    let (intro_stats, mut packed, loose, path_arena, spill_stats, mapping_stats) =
+        if effective_workers > 1 {
+            // ── Parallel blob introduction ──
+            match introduce_parallel(
+                effective_workers,
+                repo,
+                config,
+                &spill_dir,
+                cg_index,
+                plan,
+                &midx,
+                &oid_index,
+                mapping_cfg.path_arena_capacity,
+                mapping_cfg.max_packed_candidates,
+                mapping_cfg.max_loose_candidates,
+            ) {
+                Ok(result) => {
+                    stage_nanos.blob_intro = intro_start.elapsed().as_nanos() as u64;
+                    let mapping_stats = MappingStats {
+                        unique_blobs_in: result.packed.len().saturating_add(result.loose.len())
+                            as u64,
+                        packed_matched: result.packed.len() as u64,
+                        loose_unmatched: result.loose.len() as u64,
+                    };
+                    (
+                        result.stats,
+                        result.packed,
+                        result.loose,
+                        result.path_arena,
+                        SpillStats::default(),
+                        mapping_stats,
+                    )
+                }
+                Err(
+                    TreeDiffError::CandidateLimitExceeded { .. } | TreeDiffError::PathArenaFull,
+                ) => {
+                    // Parallel path overflowed — fall back to serial spill/retry.
+                    run_serial_spill_retry(
+                        repo,
+                        config,
+                        &spill_dir,
+                        cg_index,
+                        plan,
+                        &midx,
+                        &oid_index,
+                        &mapping_cfg,
+                        seen_store,
+                        &mut object_store,
+                        &mut stage_nanos,
+                        intro_start,
+                    )?
+                }
+                Err(err) => return Err(err.into()),
             }
-            Err(TreeDiffError::CandidateLimitExceeded { .. } | TreeDiffError::PathArenaFull) => {
-                let first_elapsed = intro_start.elapsed().as_nanos() as u64;
-                // The fast path may have recorded a partial seen-set; reset
-                // so the spill/dedupe retry can re-emit every candidate.
-                introducer.reset_seen();
+        } else {
+            // ── Serial blob introduction (original path) ──
+            let mut introducer = BlobIntroducer::new(
+                &config.tree_diff,
+                repo.object_format.oid_len(),
+                midx.object_count(),
+                config.path_policy_version,
+                mapping_cfg.max_loose_candidates,
+            );
 
-                let retry_start = Instant::now();
-                let mut spiller =
-                    Spiller::new(config.spill, repo.object_format.oid_len(), &spill_dir)?;
-                let mut sink = SpillCandidateSink::new(&mut spiller);
-                let stats = introducer.introduce(
-                    &mut object_store,
-                    cg_index,
-                    plan,
-                    &oid_index,
-                    &mut sink,
-                )?;
-                let retry_elapsed = retry_start.elapsed().as_nanos() as u64;
-                stage_nanos.blob_intro = first_elapsed.saturating_add(retry_elapsed);
+            let mut collector = PackCandidateCollector::new(
+                &midx,
+                &oid_index,
+                mapping_cfg.path_arena_capacity,
+                mapping_cfg.max_packed_candidates,
+                mapping_cfg.max_loose_candidates,
+            );
 
-                let spill_start = Instant::now();
-                let mut bridge = MappingBridge::new(
-                    &midx,
-                    CappedPackCandidateSink::new(
-                        mapping_cfg.max_packed_candidates,
-                        mapping_cfg.max_loose_candidates,
-                    ),
-                    mapping_cfg,
-                );
-                let spill_stats = spiller.finalize(seen_store, &mut bridge)?;
-                stage_nanos.spill = spill_start.elapsed().as_nanos() as u64;
-                let (mapping_stats, mut sink, mapping_arena) = bridge.finish()?;
-                let packed = std::mem::take(&mut sink.packed);
-                let loose = std::mem::take(&mut sink.loose);
-                (
-                    stats,
-                    packed,
-                    loose,
-                    mapping_arena,
-                    spill_stats,
-                    mapping_stats,
-                )
+            match introducer.introduce(
+                &mut object_store,
+                cg_index,
+                plan,
+                &oid_index,
+                &mut collector,
+            ) {
+                Ok(stats) => {
+                    stage_nanos.blob_intro = intro_start.elapsed().as_nanos() as u64;
+                    let collect_start = Instant::now();
+                    let (packed, loose, path_arena) = collector.finish();
+                    stage_nanos.pack_collect = collect_start.elapsed().as_nanos() as u64;
+                    let mapping_stats = MappingStats {
+                        unique_blobs_in: packed.len().saturating_add(loose.len()) as u64,
+                        packed_matched: packed.len() as u64,
+                        loose_unmatched: loose.len() as u64,
+                    };
+                    (
+                        stats,
+                        packed,
+                        loose,
+                        path_arena,
+                        SpillStats::default(),
+                        mapping_stats,
+                    )
+                }
+                Err(
+                    TreeDiffError::CandidateLimitExceeded { .. } | TreeDiffError::PathArenaFull,
+                ) => {
+                    // Serial fast path overflowed — retry with spill pipeline.
+                    run_serial_spill_retry(
+                        repo,
+                        config,
+                        &spill_dir,
+                        cg_index,
+                        plan,
+                        &midx,
+                        &oid_index,
+                        &mapping_cfg,
+                        seen_store,
+                        &mut object_store,
+                        &mut stage_nanos,
+                        intro_start,
+                    )?
+                }
+                Err(err) => return Err(err.into()),
             }
-            Err(err) => return Err(err.into()),
-        }
-    };
+        };
 
     // ── Stage 2 + 3: pack planning + execution ──────────────────────
     let pack_plan_start = Instant::now();
@@ -262,6 +307,9 @@ pub(super) fn run_odb_blob(
     let mut pack_plan_delta_deps_total: u64 = 0;
     let mut pack_plan_delta_deps_max: u32 = 0;
 
+    // Guard against concurrent `git gc` / `git repack`: if maintenance
+    // ran between the MIDX load and here, pack files may have been
+    // repacked or deleted, making the pack views and plans stale.
     if !repo.artifacts_unchanged()? {
         return Err(GitScanError::ConcurrentMaintenance);
     }
@@ -297,6 +345,9 @@ pub(super) fn run_odb_blob(
     };
 
     if packed_len > 0 {
+        // Scale worklist/base-lookup caps to 2× candidate count: delta base
+        // dependencies can roughly double the entries in the worst case
+        // (every candidate is a delta whose base is also enqueued).
         let scaled = packed_len.saturating_mul(2);
         pack_plan_cfg.max_worklist_entries = pack_plan_cfg.max_worklist_entries.max(scaled);
         pack_plan_cfg.max_base_lookups = pack_plan_cfg.max_base_lookups.max(scaled);
@@ -440,4 +491,103 @@ pub(super) fn run_odb_blob(
         alloc_stats: alloc_deltas,
         pack_cache_per_worker_bytes: pack_cache_target,
     })
+}
+
+/// Tuple returned by Stage 1 blob introduction (both serial and parallel paths).
+///
+/// Fields (in order):
+/// 0. `BlobIntroStats` -- commit/tree/blob counters from the walk.
+/// 1. `Vec<PackCandidate>` -- blobs mapped to MIDX pack offsets.
+/// 2. `Vec<LooseCandidate>` -- blobs not in any pack (loose objects).
+/// 3. `ByteArena` -- interned file paths referenced by candidates.
+/// 4. `SpillStats` -- spill pipeline stats (zeroed when fast path succeeds).
+/// 5. `MappingStats` -- mapping bridge stats (synthetic when no bridge used).
+type IntroResult = (
+    BlobIntroStats,
+    Vec<PackCandidate>,
+    Vec<LooseCandidate>,
+    ByteArena,
+    SpillStats,
+    MappingStats,
+);
+
+/// Runs the serial spill/retry pipeline when the fast path overflows.
+///
+/// Used by both the parallel and serial blob introduction paths as a
+/// fallback when `CandidateLimitExceeded` or `PathArenaFull` is hit.
+///
+/// # Two-phase approach
+///
+/// 1. **Re-introduce**: a fresh `BlobIntroducer` re-walks the commit plan,
+///    this time emitting candidates into a `Spiller` (disk-backed) instead
+///    of the in-memory `PackCandidateCollector`.
+/// 2. **Finalize + map**: the spiller is finalized through `seen_store`
+///    dedup and piped into a `MappingBridge` which maps OIDs to pack
+///    offsets and produces the final `PackCandidate` / `LooseCandidate`
+///    vectors.
+///
+/// A fresh introducer is needed because the prior one's seen sets may
+/// have accumulated partial state from the failed fast-path attempt.
+/// The spiller uses uncapped disk storage, so this path does not overflow.
+///
+/// # Timing
+///
+/// `stage_nanos.blob_intro` is set to the sum of the failed first attempt
+/// and the successful retry, so callers see the total wall-clock cost.
+#[allow(clippy::too_many_arguments)]
+fn run_serial_spill_retry(
+    repo: &RepoJobState,
+    config: &GitScanConfig,
+    spill_dir: &std::path::Path,
+    cg_index: &CommitGraphIndex,
+    plan: &[super::commit_walk::PlannedCommit],
+    midx: &MidxView<'_>,
+    oid_index: &OidIndex,
+    mapping_cfg: &MappingBridgeConfig,
+    seen_store: &dyn SeenBlobStore,
+    object_store: &mut ObjectStore<'_>,
+    stage_nanos: &mut GitScanStageNanos,
+    intro_start: Instant,
+) -> Result<IntroResult, GitScanError> {
+    let first_elapsed = intro_start.elapsed().as_nanos() as u64;
+
+    // Build a fresh serial introducer for the retry.
+    let mut introducer = BlobIntroducer::new(
+        &config.tree_diff,
+        repo.object_format.oid_len(),
+        midx.object_count(),
+        config.path_policy_version,
+        mapping_cfg.max_loose_candidates,
+    );
+
+    let retry_start = Instant::now();
+    let mut spiller = Spiller::new(config.spill, repo.object_format.oid_len(), spill_dir)?;
+    let mut sink = SpillCandidateSink::new(&mut spiller);
+    let stats = introducer.introduce(object_store, cg_index, plan, oid_index, &mut sink)?;
+    let retry_elapsed = retry_start.elapsed().as_nanos() as u64;
+    stage_nanos.blob_intro = first_elapsed.saturating_add(retry_elapsed);
+
+    let spill_start = Instant::now();
+    let mut bridge = MappingBridge::new(
+        midx,
+        CappedPackCandidateSink::new(
+            mapping_cfg.max_packed_candidates,
+            mapping_cfg.max_loose_candidates,
+        ),
+        *mapping_cfg,
+    );
+    let spill_stats = spiller.finalize(seen_store, &mut bridge)?;
+    stage_nanos.spill = spill_start.elapsed().as_nanos() as u64;
+    let (mapping_stats, mut sink, mapping_arena) = bridge.finish()?;
+    let packed = std::mem::take(&mut sink.packed);
+    let loose = std::mem::take(&mut sink.loose);
+
+    Ok((
+        stats,
+        packed,
+        loose,
+        mapping_arena,
+        spill_stats,
+        mapping_stats,
+    ))
 }
