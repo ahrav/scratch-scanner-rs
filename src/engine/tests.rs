@@ -596,6 +596,50 @@ fn url_span_includes_prefix_and_finds_ghp() {
 }
 
 #[test]
+fn zero_hit_url_plus_to_space_still_scans_transforms() {
+    let rule = RuleSpec {
+        name: "url-plus-space",
+        anchors: &[b"TOK "],
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        entropy: None,
+        local_context: None,
+        secret_group: None,
+        re: Regex::new(r"TOK [A-Z]{4}").unwrap(),
+    };
+    let transforms = vec![TransformConfig {
+        id: TransformId::UrlPercent,
+        mode: TransformMode::Always,
+        gate: Gate::AnchorsInDecoded,
+        min_len: 4,
+        max_spans_per_buffer: 16,
+        max_encoded_len: 1024,
+        max_decoded_bytes: 1024,
+        plus_to_space: true,
+        base64_allow_space_ws: false,
+    }];
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        transforms,
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Raw bytes contain "TOK+ABCD" (no "%XX"), so only URL plus-to-space decode
+    // can produce the anchored token "TOK ABCD".
+    let hay = b"prefix TOK+ABCD suffix";
+    let hits = scan_chunk_findings(&engine, hay);
+    assert!(
+        hits.iter().any(|h| h.rule == "url-plus-space"),
+        "expected plus-to-space URL transform to decode and match"
+    );
+}
+
+#[test]
 fn base64_utf16_aws_key_is_detected() {
     let eng = demo_engine();
 
@@ -4048,5 +4092,148 @@ mod proptests {
 
             prop_assert_eq!(actual.as_slice(), expected.as_slice());
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `decode_hex_pair` unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod decode_hex_pair_tests {
+    use super::super::core::decode_hex_pair;
+
+    #[test]
+    fn valid_uppercase() {
+        assert_eq!(decode_hex_pair(b'4', b'1'), Some(0x41)); // 'A'
+        assert_eq!(decode_hex_pair(b'F', b'F'), Some(0xFF));
+        assert_eq!(decode_hex_pair(b'0', b'0'), Some(0x00));
+        assert_eq!(decode_hex_pair(b'A', b'B'), Some(0xAB));
+    }
+
+    #[test]
+    fn valid_lowercase() {
+        assert_eq!(decode_hex_pair(b'4', b'1'), Some(0x41));
+        assert_eq!(decode_hex_pair(b'f', b'f'), Some(0xFF));
+        assert_eq!(decode_hex_pair(b'a', b'b'), Some(0xAB));
+    }
+
+    #[test]
+    fn valid_mixed_case() {
+        assert_eq!(decode_hex_pair(b'a', b'B'), Some(0xAB));
+        assert_eq!(decode_hex_pair(b'F', b'0'), Some(0xF0));
+        assert_eq!(decode_hex_pair(b'0', b'f'), Some(0x0F));
+    }
+
+    #[test]
+    fn invalid_chars() {
+        assert_eq!(decode_hex_pair(b'g', b'0'), None);
+        assert_eq!(decode_hex_pair(b'0', b'z'), None);
+        assert_eq!(decode_hex_pair(b'%', b'%'), None);
+        assert_eq!(decode_hex_pair(b' ', b' '), None);
+        assert_eq!(decode_hex_pair(b'/', b'0'), None);
+        assert_eq!(decode_hex_pair(b'G', b'0'), None);
+    }
+
+    #[test]
+    fn one_valid_one_invalid() {
+        assert_eq!(decode_hex_pair(b'A', b'g'), None);
+        assert_eq!(decode_hex_pair(b'z', b'A'), None);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `url_percent_gate_check` unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod url_percent_gate_check_tests {
+    use super::super::core::url_percent_gate_check;
+
+    /// Build a 256-bit anchor byte set containing exactly the given bytes.
+    fn make_anchor_set(bytes: &[u8]) -> [u64; 4] {
+        let mut set = [0u64; 4];
+        for &b in bytes {
+            set[(b >> 6) as usize] |= 1u64 << (b & 63);
+        }
+        set
+    }
+
+    #[test]
+    fn empty_anchor_set_returns_true() {
+        let empty = [0u64; 4];
+        assert!(url_percent_gate_check(&empty, false, b"anything"));
+    }
+
+    #[test]
+    fn no_percent_returns_false() {
+        let set = make_anchor_set(b"A");
+        assert!(!url_percent_gate_check(
+            &set,
+            false,
+            b"plain text no percent"
+        ));
+    }
+
+    #[test]
+    fn matching_triplet_returns_true() {
+        let set = make_anchor_set(b"A");
+        assert!(url_percent_gate_check(&set, false, b"data%41more"));
+    }
+
+    #[test]
+    fn nonmatching_triplet_returns_false() {
+        let set = make_anchor_set(b"Z");
+        // %41 decodes to 'A', which is NOT in the set (only 'Z' is).
+        assert!(!url_percent_gate_check(&set, false, b"data%41more"));
+    }
+
+    #[test]
+    fn invalid_hex_skipped() {
+        let set = make_anchor_set(b"A");
+        // %zz is not valid hex — should not match and should not panic.
+        assert!(!url_percent_gate_check(&set, false, b"%zz"));
+    }
+
+    #[test]
+    fn multiple_triplets_later_match() {
+        let set = make_anchor_set(b"B");
+        // %41='A' (not in set), %42='B' (in set)
+        assert!(url_percent_gate_check(&set, false, b"%41%42"));
+    }
+
+    #[test]
+    fn empty_buffer_returns_false() {
+        let set = make_anchor_set(b"A");
+        assert!(!url_percent_gate_check(&set, false, b""));
+    }
+
+    #[test]
+    fn plus_to_space() {
+        let set = make_anchor_set(b" ");
+        assert!(url_percent_gate_check(&set, true, b"key+val"));
+        assert!(!url_percent_gate_check(&set, false, b"key+val"));
+    }
+
+    // --- Trailing-% bug test (should FAIL before the fix) ---
+
+    #[test]
+    fn trailing_percent_is_conservative() {
+        let set = make_anchor_set(b"A");
+        // Sanity: full triplet works.
+        assert!(
+            url_percent_gate_check(&set, false, b"data%41more"),
+            "full %41 triplet with 'A' in set must return true"
+        );
+        // Trailing `%` with no hex digits — must be conservative (return true).
+        assert!(
+            url_percent_gate_check(&set, false, b"data%"),
+            "trailing %% with no hex digits must conservatively return true"
+        );
+        // Trailing `%X` with only one hex digit — must be conservative (return true).
+        assert!(
+            url_percent_gate_check(&set, false, b"data%4"),
+            "trailing %%X with one hex digit must conservatively return true"
+        );
     }
 }
