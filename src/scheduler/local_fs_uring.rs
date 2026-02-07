@@ -286,10 +286,7 @@ impl FixedBufferPool {
             free.push(idx).expect("fixed buffer free queue overflow");
         }
 
-        Arc::new(Self {
-            buffers,
-            free,
-        })
+        Arc::new(Self { buffers, free })
     }
 
     #[inline]
