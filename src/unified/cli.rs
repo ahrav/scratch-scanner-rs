@@ -93,8 +93,6 @@ fn parse_fs_args(args: env::ArgsOs) -> io::Result<ScanConfig> {
     let mut no_archives = false;
     let mut anchor_mode = AnchorMode::Manual;
     let mut event_format = EventFormat::Jsonl;
-    let io_backend = super::IoBackend::default();
-
     for arg in args {
         if let Some(flag) = arg.to_str() {
             if let Some(rest) = flag.strip_prefix("--path=") {
@@ -161,7 +159,6 @@ fn parse_fs_args(args: env::ArgsOs) -> io::Result<ScanConfig> {
             decode_depth,
             no_archives,
             anchor_mode,
-            io_backend,
         }),
         event_format,
     })
@@ -368,13 +365,13 @@ fn print_fs_usage() {
         "usage: scanner-rs scan fs --path <dir|file> [OPTIONS]
 
 OPTIONS:
-    --path=<dir|file>       Path to scan (also accepted as positional arg)
-    --workers=<N>           Worker threads (default: CPU count)
-    --decode-depth=<N>      Max decode depth (default: 2)
-    --no-archives           Disable archive scanning
-    --anchors=manual|derived  Anchor mode (default: manual)
-    --event-format=jsonl    Output format (default: jsonl)
-    --help, -h              Show this help"
+    --path=<dir|file>             Path to scan (also accepted as positional arg)
+    --workers=<N>                 Worker threads (default: CPU count)
+    --decode-depth=<N>            Max decode depth (default: 2)
+    --no-archives                 Disable archive scanning
+    --anchors=manual|derived      Anchor mode (default: manual)
+    --event-format=jsonl          Output format (default: jsonl)
+    --help, -h                    Show this help"
     );
 }
 

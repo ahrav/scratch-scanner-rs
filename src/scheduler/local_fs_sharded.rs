@@ -1,51 +1,36 @@
-//! Per-Shard Share-Nothing Filesystem Scanner
+//! Share-Nothing Filesystem Scanner with posix_fadvise Prefetch
 //!
 //! # Architecture
 //!
-//! Each shard is a pair of threads connected by a wait-free SPSC ring buffer:
+//! Each worker thread does both I/O and scan, keeping data hot in L1/L2 cache.
+//! Only a file channel is shared (cold path, per-file granularity).
 //!
 //! ```text
-//! Discovery (round-robins files across shards)
-//!     +---> Shard 0: [file_rx] --> I/O thread --SPSC--> Scan thread
-//!     +---> Shard 1: [file_rx] --> I/O thread --SPSC--> Scan thread
-//!     +---> Shard N: [file_rx] --> I/O thread --SPSC--> Scan thread
+//! Coordinator (main thread)
+//!   |  files via shared bounded channel (cold path, per-file granularity)
+//!   v
+//! Worker 0: recv file → open → [fadvise + read → scan → emit] loop → next file
+//! Worker 1: recv file → open → [fadvise + read → scan → emit] loop → next file
+//!   ...
+//! Worker N-1: file_rx exhausted → exit
+//!
+//! Per-worker (share-nothing):
+//!   - worker_id → own local queue in TsBufferPool (zero contention)
+//!   - own engine scratch (reused across all files)
+//!   - own findings Vec (reused across all chunks)
+//!   - ONE buffer per file, copy_within for overlap carry
 //! ```
-//!
-//! ## I/O Thread
-//!
-//! Blocking `open` + `fstat` + sequential `read` using standard library I/O.
-//! Reads file data in chunks with overlap carry, pushes filled buffers as
-//! [`ScanChunk::Chunk`] into the SPSC ring. Sends [`ScanChunk::EndOfFile`]
-//! after each file and [`ScanChunk::Shutdown`] after draining its file channel.
-//!
-//! ## Scan Thread
-//!
-//! Consumes chunks from the SPSC ring, runs the scan engine, deduplicates
-//! findings across chunk boundaries (overlap prefix drop), and emits findings
-//! through the [`EventSink`].
 //!
 //! # Backpressure
 //!
-//! - **File-level**: [`CountBudget`] per shard limits discovered-but-not-scanned files.
-//! - **Chunk-level**: SPSC ring capacity (power-of-2) limits buffered chunks.
-//! - **Buffer-level**: [`TsBufferPool`] per shard limits peak memory.
+//! - **File-level**: Bounded file channel (coordinator → workers).
+//! - **Buffer-level**: Per-worker local queue in [`TsBufferPool`] limits peak memory.
 //!
-//! # Platform
+//! # posix_fadvise
 //!
-//! This module uses only standard library I/O (no `io_uring`, no platform-specific
-//! APIs). It works on all platforms supported by Rust.
-//!
-//! # Performance
-//!
-//! The share-nothing design eliminates cross-shard contention. Each shard has its
-//! own buffer pool, SPSC ring, and file channel. The only shared state is the
-//! [`EventSink`] (which has internal synchronization).
-//!
-//! ```text
-//! Shard 0:  [TsBufferPool] [SPSC<8>]  [crossbeam Receiver]
-//! Shard 1:  [TsBufferPool] [SPSC<8>]  [crossbeam Receiver]
-//!   ...no shared mutable state between shards...
-//! ```
+//! - `FADV_SEQUENTIAL` once at file open → kernel uses aggressive readahead
+//! - `FADV_WILLNEED` before scanning each chunk, for *next* chunk's range →
+//!   kernel prefetches during scan, overlapping I/O with CPU work
 
 use std::fs::File;
 use std::io::{self, Read, Seek};
@@ -54,7 +39,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
-use super::count_budget::{CountBudget, CountPermit};
 use super::engine_stub::BUFFER_LEN_MAX;
 use super::engine_trait::{EngineScratch, FindingRecord, ScanEngine};
 use super::local::LocalFile;
@@ -63,7 +47,7 @@ use super::ts_buffer_pool::{TsBufferHandle, TsBufferPool, TsBufferPoolConfig};
 use crate::api::FileId;
 use crate::archive::{detect_kind_from_path, sniff_kind_from_header, ArchiveConfig};
 use crate::scheduler::affinity::pin_current_thread_to_core;
-use crate::stdx::spsc::{spsc_channel, OwnedSpscConsumer, OwnedSpscProducer};
+use crate::scheduler::worker_id::set_current_worker_id;
 use crate::unified::events::{EventSink, FindingEvent, ScanEvent};
 use crate::unified::SourceKind;
 
@@ -71,46 +55,27 @@ use crate::unified::SourceKind;
 // Constants
 // ============================================================================
 
-/// SPSC ring capacity (must be power of 2).
-///
-/// 8 slots provides enough buffering for the I/O thread to stay ahead of the
-/// scan thread without excessive memory commitment. Each slot holds one
-/// `ScanChunk` which contains a `TsBufferHandle` (the actual bulk allocation).
-pub(super) const SHARD_SPSC_CAP: usize = 8;
-
-/// Number of spin iterations before yielding when a ring operation fails.
-///
-/// Brief spin avoids the cost of a full `thread::yield_now()` context switch
-/// on transient contention. After `SPIN_ITERS` attempts, we yield to the OS
-/// scheduler.
-pub(super) const SPIN_ITERS: u32 = 16;
-
 /// Header sniff buffer size for archive detection.
-///
-/// 8 bytes is sufficient to detect ZIP, GZIP, and tar magic bytes.
-pub(super) const SNIFF_HEADER_LEN: usize = 8;
+const SNIFF_HEADER_LEN: usize = 8;
 
 // ============================================================================
 // Configuration
 // ============================================================================
 
-/// Configuration for the sharded filesystem scanner.
+/// Configuration for the share-nothing filesystem scanner.
 ///
 /// # Sizing Guidelines
 ///
 /// | Parameter | Default | Guidance |
 /// |-----------|---------|----------|
-/// | `shards` | `num_cpus / 2` | One I/O + one scan thread per shard |
+/// | `workers` | CPU count | One thread per core, each doing I/O+scan |
 /// | `chunk_size` | 256 KiB | Larger = fewer syscalls, more memory per file |
 /// | `max_file_size` | 100 MiB | Skip files larger than this |
-/// | `pool_buffers_per_shard` | 8 | Bounds peak memory per shard |
-/// | `max_in_flight_per_shard` | 64 | Bounds discovered-but-not-scanned files |
-/// | `spsc_capacity` | 8 | Power-of-2 SPSC ring depth |
+/// | `pool_buffers_per_worker` | 4 | Per-worker local queue size |
+/// | `file_channel_cap` | 256 | Bounded file channel depth |
 pub struct ShardedFsConfig {
-    /// Number of shards (each shard = 1 I/O thread + 1 scan thread).
-    ///
-    /// Default: `num_cpus / 2` (so total threads = num_cpus).
-    pub shards: usize,
+    /// Number of worker threads, each doing both I/O and scan.
+    pub workers: usize,
 
     /// Payload bytes per chunk (excluding overlap).
     ///
@@ -120,163 +85,118 @@ pub struct ShardedFsConfig {
     /// Maximum file size to scan (bytes). Files larger than this are skipped.
     pub max_file_size: u64,
 
-    /// Number of buffers allocated per shard's pool.
-    ///
-    /// Bounds peak memory per shard: `pool_buffers_per_shard * buffer_len`.
-    pub pool_buffers_per_shard: usize,
+    /// Number of buffers per worker in the pool's local queue.
+    pub pool_buffers_per_worker: usize,
 
     /// Per-worker local queue capacity in the buffer pool.
-    ///
-    /// Each shard has 2 workers (I/O + scan), so keep this small (2-4).
     pub local_queue_cap: usize,
 
-    /// Maximum in-flight files per shard (CountBudget capacity).
-    ///
-    /// Discovery blocks when this many files are queued/scanning in a shard.
-    pub max_in_flight_per_shard: usize,
-
-    /// SPSC ring capacity (must be power of 2).
-    ///
-    /// This is advisory; the actual capacity is the const generic `SHARD_SPSC_CAP`.
-    pub spsc_capacity: usize,
+    /// Capacity of the bounded file channel from coordinator to workers.
+    pub file_channel_cap: usize,
 
     /// Enable within-chunk finding deduplication.
-    ///
-    /// When true, findings within the same chunk are deduplicated by
-    /// `(rule_id, root_hint, span)` before emission.
     pub dedupe_within_chunk: bool,
 
     /// Archive scanning configuration.
-    ///
-    /// Archives are detected but skipped in this implementation (future work).
     pub archive: ArchiveConfig,
 
     /// Event sink for emitting findings and progress events.
     pub event_sink: Arc<dyn EventSink>,
 
-    /// Whether to attempt pinning I/O and scan threads to CPU cores.
-    ///
-    /// On platforms that do not support affinity (e.g., macOS), pinning is
-    /// attempted and silently ignored on failure.
+    /// Whether to attempt pinning worker threads to CPU cores.
     pub pin_threads: bool,
 }
 
 // ============================================================================
-// ScanChunk — payload traveling through the SPSC ring
+// FileWork — what the coordinator sends to workers
 // ============================================================================
 
-/// A unit of work traveling from the I/O thread to the scan thread through
-/// the SPSC ring buffer.
-///
-/// ```text
-/// I/O thread                          SPSC ring                    Scan thread
-///   open+read ----> Chunk { buf, ... } ----> scan_chunk_into()
-///   EOF        ----> EndOfFile         ----> reset scratch
-///   done       ----> Shutdown          ----> exit loop
-/// ```
-pub(super) enum ScanChunk {
-    /// A filled buffer ready for scanning.
-    Chunk {
-        /// Pooled buffer containing overlap prefix + payload bytes.
-        buf: TsBufferHandle,
-        /// Absolute byte offset of `buf[0]` in the file.
-        base_offset: u64,
-        /// Number of overlap prefix bytes at the start of the buffer.
-        /// These bytes were carried from the tail of the previous chunk.
-        prefix_len: u32,
-        /// Total valid bytes in the buffer (prefix + payload).
-        len: u32,
-        /// File path bytes for finding attribution (shared, no per-finding alloc).
-        display: Arc<[u8]>,
-        /// File ID for engine scan attribution.
-        file_id: FileId,
-    },
-    /// Sentinel: no more chunks for the current file.
-    ///
-    /// The scan thread uses this to clear per-file scratch state.
-    EndOfFile,
-    /// Sentinel: the I/O thread has drained its file channel and is exiting.
-    ///
-    /// The scan thread should exit its loop after receiving this.
-    Shutdown,
+/// A file work item sent from the coordinator to worker threads.
+struct FileWork {
+    path: PathBuf,
 }
 
 // ============================================================================
-// ShardFileWork — what the coordinator sends to each shard's I/O thread
+// Per-Worker Statistics
 // ============================================================================
 
-/// A file work item sent from the coordinator to a shard's I/O thread.
-///
-/// The `_permit` field holds a [`CountPermit`] that is automatically released
-/// when this work item is dropped (after the file has been fully processed
-/// or skipped).
-pub(super) struct ShardFileWork {
-    /// Absolute path to the file.
-    pub(super) path: PathBuf,
-    /// Discovery-time file size hint (re-checked at open time).
-    pub(super) size: u64,
-    /// Backpressure permit — released on drop.
-    pub(super) _permit: CountPermit,
-}
-
-// ============================================================================
-// Per-Shard Statistics
-// ============================================================================
-
-/// I/O thread statistics for a single shard.
+/// Per-worker statistics (each worker does both I/O and scan).
 #[derive(Clone, Copy, Debug, Default)]
-pub struct ShardIoStats {
-    /// Number of files fully processed (opened, read, chunks pushed).
+pub struct WorkerStats {
+    /// Number of files fully processed.
     pub files_processed: u64,
-    /// Total bytes read from disk across all files.
+    /// Total bytes read from disk.
     pub bytes_read: u64,
+    /// Total bytes scanned (payload only, excluding overlap prefix).
+    pub bytes_scanned: u64,
+    /// Number of chunks scanned.
+    pub chunks_scanned: u64,
+    /// Total findings emitted.
+    pub findings_emitted: u64,
     /// Number of I/O errors (open, stat, read failures).
     pub io_errors: u64,
-    /// Cumulative nanoseconds spent in open + fstat syscalls.
+    /// Number of files skipped because they are archives.
+    pub archives_skipped: u64,
+    /// Cumulative nanoseconds spent in open + fstat.
     pub open_stat_ns: u64,
     /// Cumulative nanoseconds spent in read syscalls.
     pub read_ns: u64,
-    /// Number of files skipped because they are archives.
-    pub archives_skipped: u64,
-}
-
-/// Scan thread statistics for a single shard.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ShardScanStats {
-    /// Number of chunks scanned.
-    pub chunks_scanned: u64,
-    /// Total bytes scanned (payload only, excluding overlap prefix).
-    pub bytes_scanned: u64,
-    /// Total findings emitted.
-    pub findings_emitted: u64,
-    /// Cumulative nanoseconds spent in `scan_chunk_into`.
+    /// Cumulative nanoseconds spent in scan_chunk_into.
     pub scan_ns: u64,
 }
 
-/// Aggregated report from a sharded filesystem scan.
+/// Aggregated report from a filesystem scan.
 #[derive(Debug)]
 pub struct ShardedFsReport {
-    /// Per-shard I/O thread statistics.
-    pub io_stats: Vec<ShardIoStats>,
-    /// Per-shard scan thread statistics.
-    pub scan_stats: Vec<ShardScanStats>,
-    /// Total number of files enqueued across all shards.
+    /// Per-worker statistics (each worker does both I/O and scan).
+    pub worker_stats: Vec<WorkerStats>,
+    /// Total number of files enqueued.
     pub files_enqueued: u64,
     /// Wall-clock time of the entire scan in nanoseconds.
     pub wall_time_ns: u64,
     /// Aggregated metrics compatible with existing `MetricsSnapshot` consumers.
     pub metrics: MetricsSnapshot,
+    /// Wall-clock nanoseconds the coordinator spent in the feed loop
+    /// (iterating `walk_rx` + sending to `file_tx`).
+    pub feed_elapsed_ns: u64,
+    /// Cumulative nanoseconds the coordinator blocked inside `file_tx.send()`.
+    /// High ratio to `feed_elapsed_ns` means workers are keeping up (channel full).
+    pub feed_block_ns: u64,
 }
+
+// ============================================================================
+// posix_fadvise helpers
+// ============================================================================
+
+/// Hint the kernel to use aggressive sequential readahead for the file.
+#[cfg(target_os = "linux")]
+fn fadvise_sequential(file: &File) {
+    use std::os::unix::io::AsRawFd;
+    unsafe {
+        libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn fadvise_sequential(_file: &File) {}
+
+/// Hint the kernel to prefetch bytes at `[offset, offset+len)`.
+#[cfg(target_os = "linux")]
+fn fadvise_willneed(file: &File, offset: i64, len: i64) {
+    use std::os::unix::io::AsRawFd;
+    unsafe {
+        libc::posix_fadvise(file.as_raw_fd(), offset, len, libc::POSIX_FADV_WILLNEED);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn fadvise_willneed(_file: &File, _offset: i64, _len: i64) {}
 
 // ============================================================================
 // EINTR-safe read helper
 // ============================================================================
 
 /// Read into `dst`, retrying on `EINTR`.
-///
-/// Standard `File::read` can return `ErrorKind::Interrupted` on signal delivery.
-/// This helper transparently retries, matching POSIX `read(2)` semantics that
-/// most callers expect.
 #[inline(always)]
 fn read_some(file: &mut File, dst: &mut [u8]) -> io::Result<usize> {
     loop {
@@ -293,10 +213,6 @@ fn read_some(file: &mut File, dst: &mut [u8]) -> io::Result<usize> {
 // ============================================================================
 
 /// In-place deduplication of findings by `(rule_id, root_hint, span)`.
-///
-/// Sorts findings by their dedup key and removes consecutive duplicates.
-/// This handles the case where the same secret is found multiple times
-/// within a single chunk (e.g., via different transform paths).
 fn dedupe_pending_in_place<F: FindingRecord>(p: &mut Vec<F>) {
     if p.len() <= 1 {
         return;
@@ -322,10 +238,6 @@ fn dedupe_pending_in_place<F: FindingRecord>(p: &mut Vec<F>) {
 }
 
 /// Emit findings as structured events through the event sink.
-///
-/// Each finding is emitted as a `ScanEvent::Finding` with `SourceKind::Fs`.
-/// The `display` bytes are used as the object path (avoiding per-finding
-/// allocation since the path is shared across all chunks of a file).
 fn emit_findings<E: ScanEngine, F: FindingRecord>(
     engine: &E,
     event_sink: &dyn EventSink,
@@ -351,279 +263,86 @@ fn emit_findings<E: ScanEngine, F: FindingRecord>(
 }
 
 // ============================================================================
-// Scan Thread
+// Buffer acquisition with backoff
 // ============================================================================
 
-/// Scan thread main loop for a single shard.
-///
-/// Consumes [`ScanChunk`] values from the SPSC ring, runs the scan engine on
-/// each chunk, handles overlap-based deduplication, and emits findings through
-/// the event sink.
-///
-/// # Wait Strategy
-///
-/// When the SPSC ring is empty, the scan thread spins briefly (16 iterations
-/// with `core::hint::spin_loop()`) then yields to the OS scheduler. This
-/// balances latency (fast wakeup on new data) with CPU efficiency (no busy-wait
-/// when the I/O thread is blocked on disk).
-///
-/// # Chunk Processing
-///
-/// ```text
-/// for each Chunk:
-///   1. scan_chunk_into(data, file_id, base_offset, scratch)
-///   2. drop_prefix_findings(base_offset + prefix_len)  // overlap dedup
-///   3. drain_findings_into(pending)
-///   4. dedupe_pending_in_place(pending)                 // within-chunk dedup
-///   5. emit_findings(pending)
-///   6. accumulate stats
-/// ```
-pub(super) fn shard_scan_loop<E: ScanEngine>(
-    mut consumer: OwnedSpscConsumer<ScanChunk, SHARD_SPSC_CAP>,
-    engine: Arc<E>,
-    event_sink: Arc<dyn EventSink>,
-    dedupe: bool,
-) -> ShardScanStats {
-    let mut stats = ShardScanStats::default();
-    let mut scratch = engine.new_scratch();
-    let mut pending: Vec<<E::Scratch as EngineScratch>::Finding> = Vec::with_capacity(4096);
-
+/// Acquire a buffer from the pool, spinning briefly then yielding when empty.
+#[inline]
+fn acquire_buffer_with_backoff(pool: &TsBufferPool) -> TsBufferHandle {
+    if let Some(buf) = pool.try_acquire() {
+        return buf;
+    }
     loop {
-        // Try to pop a chunk from the SPSC ring.
-        let chunk = match consumer.try_pop() {
-            Some(c) => c,
-            None => {
-                // Ring empty: spin briefly, then yield.
-                let mut got = false;
-                for _ in 0..SPIN_ITERS {
-                    core::hint::spin_loop();
-                    if let Some(c) = consumer.try_pop() {
-                        // Process the chunk we just got (handled below via match).
-                        // We need to break out of spin and process it.
-                        // Re-assign and break.
-                        match c {
-                            ScanChunk::Shutdown => return stats,
-                            ScanChunk::EndOfFile => {
-                                scratch.clear();
-                                got = true;
-                                break;
-                            }
-                            ScanChunk::Chunk {
-                                buf,
-                                base_offset,
-                                prefix_len,
-                                len,
-                                display,
-                                file_id,
-                            } => {
-                                process_scan_chunk(
-                                    engine.as_ref(),
-                                    &*event_sink,
-                                    &mut scratch,
-                                    &mut pending,
-                                    &mut stats,
-                                    buf,
-                                    base_offset,
-                                    prefix_len,
-                                    len,
-                                    &display,
-                                    file_id,
-                                    dedupe,
-                                );
-                                got = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if !got {
-                    std::thread::yield_now();
-                }
-                continue;
-            }
-        };
-
-        match chunk {
-            ScanChunk::Shutdown => return stats,
-            ScanChunk::EndOfFile => {
-                scratch.clear();
-            }
-            ScanChunk::Chunk {
-                buf,
-                base_offset,
-                prefix_len,
-                len,
-                display,
-                file_id,
-            } => {
-                process_scan_chunk(
-                    engine.as_ref(),
-                    &*event_sink,
-                    &mut scratch,
-                    &mut pending,
-                    &mut stats,
-                    buf,
-                    base_offset,
-                    prefix_len,
-                    len,
-                    &display,
-                    file_id,
-                    dedupe,
-                );
+        for _ in 0..16 {
+            core::hint::spin_loop();
+            if let Some(buf) = pool.try_acquire() {
+                return buf;
             }
         }
+        std::thread::yield_now();
     }
 }
 
-/// Process a single scan chunk: scan, dedup, emit findings, update stats.
+// ============================================================================
+// Worker Thread — share-nothing I/O + scan
+// ============================================================================
+
+/// Worker thread main loop: receives files, does I/O and scan inline.
 ///
-/// Extracted from the scan loop to keep the main loop readable and to allow
-/// reuse from both the fast path (immediate pop) and the spin-loop path.
+/// Each worker owns its engine scratch, findings buffer, and buffer pool
+/// local queue. Data read from disk stays hot in L1/L2 when scanned
+/// immediately.
 #[allow(clippy::too_many_arguments)]
-#[inline(always)]
-fn process_scan_chunk<E: ScanEngine>(
-    engine: &E,
-    event_sink: &dyn EventSink,
-    scratch: &mut E::Scratch,
-    pending: &mut Vec<<E::Scratch as EngineScratch>::Finding>,
-    stats: &mut ShardScanStats,
-    buf: TsBufferHandle,
-    base_offset: u64,
-    prefix_len: u32,
-    len: u32,
-    display: &[u8],
-    file_id: FileId,
-    dedupe: bool,
-) {
-    let len_usize = len as usize;
-    let data = &buf.as_slice()[..len_usize];
-
-    let t0 = Instant::now();
-    engine.scan_chunk_into(data, file_id, base_offset, scratch);
-    let scan_elapsed = t0.elapsed().as_nanos() as u64;
-
-    // Drop findings fully contained in the overlap prefix.
-    let new_bytes_start = base_offset + prefix_len as u64;
-    scratch.drop_prefix_findings(new_bytes_start);
-
-    // Drain findings from scratch into the pending buffer.
-    // CRITICAL: Clear pending before drain to avoid accumulating across chunks.
-    pending.clear();
-    scratch.drain_findings_into(pending);
-
-    if dedupe {
-        dedupe_pending_in_place(pending);
-    }
-
-    emit_findings(engine, event_sink, display, pending);
-
-    // Metrics: payload bytes only (exclude overlap prefix).
-    let payload = (len as u64).saturating_sub(prefix_len as u64);
-    stats.chunks_scanned = stats.chunks_scanned.saturating_add(1);
-    stats.bytes_scanned = stats.bytes_scanned.saturating_add(payload);
-    stats.findings_emitted = stats.findings_emitted.saturating_add(pending.len() as u64);
-    stats.scan_ns = stats.scan_ns.saturating_add(scan_elapsed);
-
-    // Buffer returns to pool on drop (RAII).
-    drop(buf);
-}
-
-// ============================================================================
-// I/O Thread
-// ============================================================================
-
-/// I/O thread main loop for a single shard.
-///
-/// Receives file work items from the coordinator via a `crossbeam_channel`,
-/// opens each file, reads it in chunks with overlap carry, and pushes filled
-/// buffers into the SPSC ring for the scan thread.
-///
-/// # I/O Pattern: Overlap Carry
-///
-/// ```text
-/// Chunk 1:                        Chunk 2:
-/// +-------------------------+     +--------+------------------+
-/// |      payload bytes      |     |overlap |  new payload     |
-/// |      (from read)        |     |(stack) |  (from read)     |
-/// +-------------------------+     +--------+------------------+
-///                           |            ^
-///                           +------------+
-///                        copied from tail of chunk 1
-/// ```
-///
-/// The overlap bytes are carried in a stack-local buffer (not re-read from
-/// disk), eliminating seeks and reducing syscall overhead.
-///
-/// # Archive Detection
-///
-/// Files are checked for archive signatures (extension-based, then header-based
-/// sniffing). Archives are currently skipped (counted in stats). Future work
-/// will dispatch archive entries for recursive scanning.
-///
-/// # Shutdown Protocol
-///
-/// 1. The coordinator drops the `crossbeam_channel::Sender` when all files
-///    have been enqueued.
-/// 2. The I/O thread drains remaining files from the channel.
-/// 3. After the channel is exhausted, the I/O thread pushes
-///    [`ScanChunk::Shutdown`] into the SPSC ring.
-/// 4. The scan thread receives `Shutdown` and exits.
-fn shard_io_blocking<E: ScanEngine>(
-    file_rx: crossbeam_channel::Receiver<ShardFileWork>,
-    mut producer: OwnedSpscProducer<ScanChunk, SHARD_SPSC_CAP>,
+fn worker<E: ScanEngine>(
+    file_rx: crossbeam_channel::Receiver<FileWork>,
+    engine: Arc<E>,
     pool: TsBufferPool,
-    engine: &E,
-    cfg: &ShardedFsConfig,
-) -> ShardIoStats {
+    event_sink: Arc<dyn EventSink>,
+    chunk_size: usize,
+    max_file_size: u64,
+    archive_cfg: ArchiveConfig,
+    dedupe: bool,
+) -> WorkerStats {
     let overlap = engine.required_overlap();
-    let chunk_size = cfg.chunk_size;
-    let buf_len = overlap.saturating_add(chunk_size);
-    debug_assert!(
-        buf_len <= BUFFER_LEN_MAX,
-        "chunk_size + overlap ({}) exceeds BUFFER_LEN_MAX ({})",
-        buf_len,
-        BUFFER_LEN_MAX
-    );
-
-    let mut stats = ShardIoStats::default();
-
-    // Stack-local overlap carry buffer. Reused across files to avoid allocation.
-    let mut overlap_buf = vec![0u8; overlap];
+    let mut stats = WorkerStats::default();
+    let mut scratch = engine.new_scratch();
+    let mut pending: Vec<<E::Scratch as EngineScratch>::Finding> = Vec::with_capacity(4096);
 
     for work in file_rx.iter() {
         process_file(
             &work,
-            &mut producer,
+            engine.as_ref(),
             &pool,
+            &*event_sink,
             overlap,
             chunk_size,
-            cfg.max_file_size,
-            &cfg.archive,
-            &mut overlap_buf,
+            max_file_size,
+            &archive_cfg,
+            dedupe,
+            &mut scratch,
+            &mut pending,
             &mut stats,
         );
     }
 
-    // Channel drained. Push shutdown sentinel.
-    push_with_backoff(&mut producer, ScanChunk::Shutdown);
     stats
 }
 
-/// Process a single file: open, stat, detect archives, read chunks, push to SPSC.
-///
-/// This function encapsulates the per-file I/O logic. Errors on individual files
-/// are counted in stats but do not abort the scan.
+/// Process a single file: open, stat, detect archives, read+scan chunks inline.
 #[allow(clippy::too_many_arguments)]
-fn process_file(
-    work: &ShardFileWork,
-    producer: &mut OwnedSpscProducer<ScanChunk, SHARD_SPSC_CAP>,
+fn process_file<E: ScanEngine>(
+    work: &FileWork,
+    engine: &E,
     pool: &TsBufferPool,
+    event_sink: &dyn EventSink,
     overlap: usize,
     chunk_size: usize,
     max_file_size: u64,
     archive_cfg: &ArchiveConfig,
-    overlap_buf: &mut [u8],
-    stats: &mut ShardIoStats,
+    dedupe: bool,
+    scratch: &mut E::Scratch,
+    pending: &mut Vec<<E::Scratch as EngineScratch>::Finding>,
+    stats: &mut WorkerStats,
 ) {
     // --- Open + stat ---
     let t_open = Instant::now();
@@ -645,38 +364,35 @@ fn process_file(
     let open_stat_elapsed = t_open.elapsed().as_nanos() as u64;
     stats.open_stat_ns = stats.open_stat_ns.saturating_add(open_stat_elapsed);
 
-    let size = meta.len();
+    let file_size = meta.len();
 
-    // Size enforcement: skip empty files and files exceeding the cap.
-    if size == 0 {
+    if file_size == 0 {
         return;
     }
-    if size > max_file_size {
+    if file_size > max_file_size {
         return;
     }
 
     // --- Archive detection ---
-    // Check extension first (cheap), then sniff the header if needed.
     if archive_cfg.enabled {
         let is_archive = detect_kind_from_path(&work.path).is_some() || {
-            // Sniff header bytes for magic signatures.
             let mut header = [0u8; SNIFF_HEADER_LEN];
             let sniffed = match read_some(&mut file, &mut header) {
                 Ok(n) => sniff_kind_from_header(&header[..n]).is_some(),
                 Err(_) => false,
             };
-            // Always seek back to the start after reading header bytes,
-            // regardless of whether an archive was detected.
             let _ = file.seek(io::SeekFrom::Start(0));
             sniffed
         };
 
         if is_archive {
             stats.archives_skipped = stats.archives_skipped.saturating_add(1);
-            push_with_backoff(producer, ScanChunk::EndOfFile);
             return;
         }
     }
+
+    // --- posix_fadvise: sequential readahead for entire file ---
+    fadvise_sequential(&file);
 
     // --- Build display path (shared across all chunks of this file) ---
     #[cfg(unix)]
@@ -698,219 +414,126 @@ fn process_file(
         .into_boxed_slice()
         .into();
 
-    // FileId(0) is a placeholder — the sharded scanner does not use FileId for
-    // cross-file deduplication. Each file's findings are deduplicated independently
-    // within the scan thread via overlap prefix drop + within-chunk dedup.
     let file_id = FileId(0);
 
-    // --- Read loop with overlap carry ---
-    let mut file_offset: u64 = 0;
-    let mut overlap_len: usize = 0;
-    let mut first_chunk = true;
+    // --- Acquire ONE buffer for the entire file ---
+    let mut buf = acquire_buffer_with_backoff(pool);
+
+    // --- Read+scan loop with overlap carry (copy_within pattern) ---
+    let mut offset: u64 = 0; // Logical offset of next "new" bytes
+    let mut carry: usize = 0; // Bytes of overlap prefix for next scan
+    let mut have: usize = 0; // Total bytes in buffer from last iteration
 
     loop {
-        if file_offset >= size {
+        // Move tail overlap bytes to front as next prefix (tiny, in-cache).
+        if carry > 0 && have > 0 {
+            buf.as_mut_slice().copy_within(have - carry..have, 0);
+        }
+
+        // Cap by remaining file size.
+        let remaining = file_size.saturating_sub(offset) as usize;
+        if remaining == 0 {
             break;
         }
 
-        // Acquire a buffer from the pool (blocking spin+yield).
-        let mut buf = acquire_buffer_with_backoff(pool);
+        let read_max = chunk_size.min(buf.len() - carry).min(remaining);
+        let dst = &mut buf.as_mut_slice()[carry..carry + read_max];
 
-        // Copy overlap prefix from the carry buffer into the head of the buffer.
-        let prefix_len = if first_chunk {
-            first_chunk = false;
-            0
-        } else {
-            let pl = overlap_len;
-            if pl > 0 {
-                buf.as_mut_slice()[..pl].copy_from_slice(&overlap_buf[..pl]);
-            }
-            pl
-        };
+        // Prefetch next chunk while we're about to read this one.
+        let next_offset = offset.saturating_add(read_max as u64);
+        if next_offset < file_size {
+            fadvise_willneed(&file, next_offset as i64, chunk_size as i64);
+        }
 
-        // Compute how many payload bytes to read.
-        let remaining = size.saturating_sub(file_offset);
-        let payload_want = (remaining as usize).min(chunk_size);
-
-        // Read payload bytes into the buffer after the overlap prefix.
+        // --- Read ---
         let t_read = Instant::now();
-        let payload_got = match read_full(
-            &mut file,
-            &mut buf.as_mut_slice()[prefix_len..prefix_len + payload_want],
-        ) {
+        let n = match read_some(&mut file, dst) {
             Ok(n) => n,
             Err(_) => {
                 stats.io_errors = stats.io_errors.saturating_add(1);
-                // Drop the buffer (returns to pool) and abort this file.
-                drop(buf);
                 break;
             }
         };
         let read_elapsed = t_read.elapsed().as_nanos() as u64;
         stats.read_ns = stats.read_ns.saturating_add(read_elapsed);
 
-        if payload_got == 0 {
-            // Unexpected EOF (file shrank between stat and read).
-            drop(buf);
+        if n == 0 {
             break;
         }
 
-        let total_len = prefix_len + payload_got;
+        let total_len = carry + n;
+        let base_offset = offset.saturating_sub(carry as u64);
 
-        // Update overlap carry buffer for the next iteration.
-        if overlap > 0 {
-            let ol = overlap.min(total_len);
-            let start = total_len - ol;
-            overlap_buf[..ol].copy_from_slice(&buf.as_slice()[start..start + ol]);
-            overlap_len = ol;
+        // --- Scan --- (data is hot in L1/L2 from the read above)
+        let data = &buf.as_slice()[..total_len];
+
+        let t_scan = Instant::now();
+        engine.scan_chunk_into(data, file_id, base_offset, scratch);
+        let scan_elapsed = t_scan.elapsed().as_nanos() as u64;
+        stats.scan_ns = stats.scan_ns.saturating_add(scan_elapsed);
+
+        // Drop findings fully contained in the overlap prefix.
+        let new_bytes_start = offset;
+        scratch.drop_prefix_findings(new_bytes_start);
+
+        // Drain findings.
+        pending.clear();
+        scratch.drain_findings_into(pending);
+
+        if dedupe && pending.len() > 1 {
+            dedupe_pending_in_place(pending);
         }
 
-        let base_offset = if prefix_len > 0 {
-            file_offset.saturating_sub(prefix_len as u64)
-        } else {
-            file_offset
-        };
+        emit_findings(engine, event_sink, &display, pending);
 
-        stats.bytes_read = stats.bytes_read.saturating_add(payload_got as u64);
-        file_offset = file_offset.saturating_add(payload_got as u64);
+        // Metrics: payload bytes only.
+        stats.chunks_scanned = stats.chunks_scanned.saturating_add(1);
+        stats.bytes_scanned = stats.bytes_scanned.saturating_add(n as u64);
+        stats.bytes_read = stats.bytes_read.saturating_add(n as u64);
+        stats.findings_emitted = stats.findings_emitted.saturating_add(pending.len() as u64);
 
-        // Push chunk into SPSC ring (with backoff on full).
-        push_with_backoff(
-            producer,
-            ScanChunk::Chunk {
-                buf,
-                base_offset,
-                prefix_len: prefix_len as u32,
-                len: total_len as u32,
-                display: Arc::clone(&display),
-                file_id,
-            },
-        );
+        // Advance.
+        offset = offset.saturating_add(n as u64);
+        have = total_len;
+        carry = overlap.min(total_len);
+
+        if offset >= file_size {
+            break;
+        }
     }
 
-    // Send EndOfFile sentinel so the scan thread knows to reset per-file state.
-    push_with_backoff(producer, ScanChunk::EndOfFile);
+    // Buffer returns to pool on drop.
+    drop(buf);
+
     stats.files_processed = stats.files_processed.saturating_add(1);
-}
-
-/// Read exactly `dst.len()` bytes, retrying on short reads and EINTR.
-///
-/// Returns the total number of bytes read. May return less than `dst.len()`
-/// only at EOF.
-fn read_full(file: &mut File, dst: &mut [u8]) -> io::Result<usize> {
-    let mut total = 0;
-    while total < dst.len() {
-        match read_some(file, &mut dst[total..]) {
-            Ok(0) => break, // EOF
-            Ok(n) => total += n,
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(total)
-}
-
-/// Push a value into the SPSC producer, spinning briefly then yielding on full.
-///
-/// This never fails; it retries until the consumer makes room. The scan thread
-/// must always be consuming (or the system would deadlock), so this eventually
-/// succeeds.
-#[inline]
-pub(super) fn push_with_backoff<T: Send + 'static, const N: usize>(
-    producer: &mut OwnedSpscProducer<T, N>,
-    mut value: T,
-) {
-    loop {
-        match producer.try_push(value) {
-            Ok(()) => return,
-            Err(v) => {
-                value = v;
-                // Brief spin before yielding.
-                for _ in 0..SPIN_ITERS {
-                    core::hint::spin_loop();
-                    match producer.try_push(value) {
-                        Ok(()) => return,
-                        Err(v) => value = v,
-                    }
-                }
-                std::thread::yield_now();
-            }
-        }
-    }
-}
-
-/// Acquire a buffer from the pool, spinning briefly then yielding when empty.
-///
-/// This never fails; it retries until a buffer becomes available. The scan
-/// thread drops buffers (returning them to the pool) as it processes chunks,
-/// so this eventually succeeds.
-#[inline]
-pub(super) fn acquire_buffer_with_backoff(pool: &TsBufferPool) -> TsBufferHandle {
-    loop {
-        if let Some(buf) = pool.try_acquire() {
-            return buf;
-        }
-        // Brief spin before yielding.
-        for _ in 0..SPIN_ITERS {
-            core::hint::spin_loop();
-            if let Some(buf) = pool.try_acquire() {
-                return buf;
-            }
-        }
-        std::thread::yield_now();
-    }
 }
 
 // ============================================================================
 // Coordinator Entry Point
 // ============================================================================
 
-/// Scan local filesystem files using a sharded share-nothing architecture.
+/// Scan local filesystem files using share-nothing worker threads.
 ///
 /// # Architecture
 ///
 /// ```text
 /// scan_local_fs_sharded()
 ///   |
-///   |  1. Create N shard file channels
-///   |  2. Create N count budgets (one per shard)
-///   |  3. For each shard, spawn:
-///   |     - TsBufferPool (per-shard, 2 workers)
-///   |     - SPSC ring (capacity 8)
-///   |     - I/O thread (shard_io_blocking)
-///   |     - Scan thread (shard_scan_loop)
-///   |  4. Round-robin files across shards
-///   |  5. Drop senders -> I/O threads drain -> Shutdown -> scan threads exit
+///   |  1. Create shared file channel
+///   |  2. Create shared TsBufferPool (per-worker local queues)
+///   |  3. Spawn N worker threads (each does I/O + scan)
+///   |  4. Feed files into file channel
+///   |  5. Drop file sender → workers drain → exit
 ///   |  6. Join all threads, collect stats
 ///   v
 /// ShardedFsReport
 /// ```
-///
-/// # Arguments
-///
-/// * `engine` - Detection engine (shared across all shards via `Arc`)
-/// * `files` - Iterator of files to scan (consumed by the coordinator)
-/// * `cfg` - Sharded scanner configuration
-///
-/// # Blocking
-///
-/// This function blocks the calling thread until all files have been enqueued,
-/// all shard I/O threads have drained their file channels, and all scan threads
-/// have exited. Typical usage is to call this from a dedicated coordinator
-/// thread or from `main`.
-///
-/// # Returns
-///
-/// A [`ShardedFsReport`] containing per-shard statistics and aggregated metrics.
-///
-/// # Errors
-///
-/// Returns `io::Error` if thread spawning fails or a thread panics.
 pub fn scan_local_fs_sharded<E: ScanEngine>(
     engine: Arc<E>,
     files: impl Iterator<Item = LocalFile>,
     cfg: ShardedFsConfig,
 ) -> io::Result<ShardedFsReport> {
-    let num_shards = cfg.shards.max(1);
+    let num_workers = cfg.workers.max(1);
     let overlap = engine.required_overlap();
     let buf_len = overlap.saturating_add(cfg.chunk_size);
     assert!(
@@ -922,184 +545,128 @@ pub fn scan_local_fs_sharded<E: ScanEngine>(
 
     let wall_start = Instant::now();
 
-    // --- Create per-shard infrastructure ---
+    // --- Shared infrastructure ---
 
-    // File channels: coordinator sends file work items to each shard's I/O thread.
-    let mut shard_senders: Vec<crossbeam_channel::Sender<ShardFileWork>> =
-        Vec::with_capacity(num_shards);
-    let mut shard_receivers: Vec<crossbeam_channel::Receiver<ShardFileWork>> =
-        Vec::with_capacity(num_shards);
+    // File channel: coordinator → workers (all workers compete for files).
+    let (file_tx, file_rx) = crossbeam_channel::bounded::<FileWork>(cfg.file_channel_cap);
 
-    // Count budgets: one per shard for file-level backpressure.
-    let mut shard_budgets: Vec<Arc<CountBudget>> = Vec::with_capacity(num_shards);
+    // Shared buffer pool with per-worker local queues.
+    let pool = TsBufferPool::new(TsBufferPoolConfig {
+        buffer_len: buf_len,
+        total_buffers: num_workers * cfg.pool_buffers_per_worker,
+        workers: num_workers,
+        local_queue_cap: cfg.local_queue_cap,
+    });
 
-    for _ in 0..num_shards {
-        let (tx, rx) = crossbeam_channel::bounded(cfg.max_in_flight_per_shard);
-        shard_senders.push(tx);
-        shard_receivers.push(rx);
-        shard_budgets.push(CountBudget::new(cfg.max_in_flight_per_shard));
-    }
+    // --- Spawn worker threads ---
 
-    // --- Spawn shard threads ---
+    let mut handles: Vec<thread::JoinHandle<WorkerStats>> = Vec::with_capacity(num_workers);
 
-    let mut io_handles: Vec<thread::JoinHandle<ShardIoStats>> = Vec::with_capacity(num_shards);
-    let mut scan_handles: Vec<thread::JoinHandle<ShardScanStats>> = Vec::with_capacity(num_shards);
-
-    for (shard_idx, file_rx) in shard_receivers.iter().enumerate() {
-        // Per-shard buffer pool: 2 workers (I/O thread + scan thread).
-        let pool = TsBufferPool::new(TsBufferPoolConfig {
-            buffer_len: buf_len,
-            total_buffers: cfg.pool_buffers_per_shard,
-            workers: 2,
-            local_queue_cap: cfg.local_queue_cap,
-        });
-
-        // SPSC channel connecting I/O thread -> scan thread.
-        let (spsc_producer, spsc_consumer) = spsc_channel::<ScanChunk, SHARD_SPSC_CAP>();
-
+    for idx in 0..num_workers {
         let file_rx = file_rx.clone();
-        let engine_io = Arc::clone(&engine);
-        let engine_scan = Arc::clone(&engine);
+        let worker_pool = pool.clone();
+        let engine_ref = Arc::clone(&engine);
         let event_sink = Arc::clone(&cfg.event_sink);
+        let chunk_size = cfg.chunk_size;
+        let max_file_size = cfg.max_file_size;
+        let archive_cfg = cfg.archive.clone();
         let dedupe = cfg.dedupe_within_chunk;
         let pin_threads = cfg.pin_threads;
 
-        // Capture config values needed by the I/O thread.
-        let io_chunk_size = cfg.chunk_size;
-        let io_max_file_size = cfg.max_file_size;
-        let io_archive = cfg.archive.clone();
-
-        // I/O thread
-        let io_pool = pool.clone();
-        let io_handle = thread::Builder::new()
-            .name(format!("shard-{shard_idx}-io"))
+        let handle = thread::Builder::new()
+            .name(format!("worker-{idx}"))
             .spawn(move || {
-                // Attempt CPU pinning (best-effort).
+                // Set worker ID for buffer pool local queue routing.
+                set_current_worker_id(Some(idx));
+
                 if pin_threads {
-                    let core = shard_idx * 2;
-                    let _ = pin_current_thread_to_core(core);
+                    let _ = pin_current_thread_to_core(idx);
                 }
 
-                // Build a lightweight config view for the I/O function.
-                let io_cfg = ShardedFsConfig {
-                    shards: 0, // unused inside I/O thread
-                    chunk_size: io_chunk_size,
-                    max_file_size: io_max_file_size,
-                    pool_buffers_per_shard: 0,  // unused
-                    local_queue_cap: 0,         // unused
-                    max_in_flight_per_shard: 0, // unused
-                    spsc_capacity: 0,           // unused
-                    dedupe_within_chunk: false, // unused by I/O thread
-                    archive: io_archive,
-                    event_sink: Arc::new(crate::unified::events::NullEventSink),
-                    pin_threads: false, // already pinned above
-                };
+                let stats = worker::<E>(
+                    file_rx,
+                    engine_ref,
+                    worker_pool,
+                    event_sink,
+                    chunk_size,
+                    max_file_size,
+                    archive_cfg,
+                    dedupe,
+                );
 
-                shard_io_blocking::<E>(file_rx, spsc_producer, io_pool, engine_io.as_ref(), &io_cfg)
+                // Clear worker ID before exit.
+                set_current_worker_id(None);
+
+                stats
             })
             .map_err(io::Error::other)?;
 
-        // Scan thread
-        let scan_handle = thread::Builder::new()
-            .name(format!("shard-{shard_idx}-scan"))
-            .spawn(move || {
-                // Attempt CPU pinning (best-effort).
-                if pin_threads {
-                    let core = shard_idx * 2 + 1;
-                    let _ = pin_current_thread_to_core(core);
-                }
-
-                shard_scan_loop(spsc_consumer, engine_scan, event_sink, dedupe)
-            })
-            .map_err(io::Error::other)?;
-
-        io_handles.push(io_handle);
-        scan_handles.push(scan_handle);
+        handles.push(handle);
     }
 
-    // Drop extra receiver clones (each shard's I/O thread owns one).
-    drop(shard_receivers);
+    // Drop coordinator's clone of file_rx so channel disconnection is
+    // driven solely by thread exits.
+    drop(file_rx);
 
-    // --- Round-robin files across shards ---
+    // --- Feed files into the file channel ---
 
     let mut files_enqueued: u64 = 0;
-    let mut shard_rr: usize = 0;
+    let mut feed_block_ns: u64 = 0;
+    let feed_start = Instant::now();
 
     for local_file in files {
-        let shard_idx = shard_rr % num_shards;
-        shard_rr = shard_rr.wrapping_add(1);
-
-        // Acquire backpressure permit for this shard (blocks if at capacity).
-        let permit = shard_budgets[shard_idx].acquire(1);
-
-        let work = ShardFileWork {
+        let work = FileWork {
             path: local_file.path,
-            size: local_file.size,
-            _permit: permit,
         };
 
-        // Send to the shard's file channel. This blocks if the channel is full
-        // (bounded channel provides additional backpressure).
-        if shard_senders[shard_idx].send(work).is_err() {
-            // I/O thread dropped its receiver (unexpected). Stop enqueuing.
+        let send_t = Instant::now();
+        if file_tx.send(work).is_err() {
             break;
         }
-
+        feed_block_ns = feed_block_ns.saturating_add(send_t.elapsed().as_nanos() as u64);
         files_enqueued = files_enqueued.saturating_add(1);
     }
 
-    // Drop senders: I/O threads will drain remaining files, then see channel
-    // closed and push Shutdown sentinel.
-    drop(shard_senders);
+    let feed_elapsed_ns = feed_start.elapsed().as_nanos() as u64;
+
+    // Drop file sender: workers drain remaining files, then exit.
+    drop(file_tx);
 
     // --- Join all threads and collect stats ---
 
-    let mut io_stats: Vec<ShardIoStats> = Vec::with_capacity(num_shards);
-    let mut scan_stats: Vec<ShardScanStats> = Vec::with_capacity(num_shards);
+    let mut worker_stats: Vec<WorkerStats> = Vec::with_capacity(num_workers);
 
-    for handle in io_handles {
+    for handle in handles {
         match handle.join() {
-            Ok(s) => io_stats.push(s),
-            Err(_) => return Err(io::Error::other("shard I/O thread panicked")),
-        }
-    }
-
-    for handle in scan_handles {
-        match handle.join() {
-            Ok(s) => scan_stats.push(s),
-            Err(_) => return Err(io::Error::other("shard scan thread panicked")),
+            Ok(s) => worker_stats.push(s),
+            Err(_) => return Err(io::Error::other("worker thread panicked")),
         }
     }
 
     let wall_time_ns = wall_start.elapsed().as_nanos() as u64;
 
-    // Flush the event sink.
     cfg.event_sink.flush();
 
-    // --- Aggregate metrics into MetricsSnapshot ---
+    // --- Aggregate metrics ---
 
     let mut metrics = MetricsSnapshot::new();
 
-    for io_s in &io_stats {
-        metrics.io_errors = metrics.io_errors.saturating_add(io_s.io_errors);
+    for ws in &worker_stats {
+        metrics.io_errors = metrics.io_errors.saturating_add(ws.io_errors);
+        metrics.bytes_scanned = metrics.bytes_scanned.saturating_add(ws.bytes_scanned);
+        metrics.chunks_scanned = metrics.chunks_scanned.saturating_add(ws.chunks_scanned);
+        metrics.findings_emitted = metrics.findings_emitted.saturating_add(ws.findings_emitted);
     }
 
-    for scan_s in &scan_stats {
-        metrics.bytes_scanned = metrics.bytes_scanned.saturating_add(scan_s.bytes_scanned);
-        metrics.chunks_scanned = metrics.chunks_scanned.saturating_add(scan_s.chunks_scanned);
-        metrics.findings_emitted = metrics
-            .findings_emitted
-            .saturating_add(scan_s.findings_emitted);
-    }
-
-    metrics.worker_count = (num_shards * 2) as u32; // I/O + scan threads
+    metrics.worker_count = num_workers as u32;
     metrics.duration_ns = wall_time_ns;
 
     Ok(ShardedFsReport {
-        io_stats,
-        scan_stats,
+        worker_stats,
         files_enqueued,
         wall_time_ns,
         metrics,
+        feed_elapsed_ns,
+        feed_block_ns,
     })
 }

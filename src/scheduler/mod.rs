@@ -289,9 +289,7 @@ pub use worker_id::{current_worker_id, set_current_worker_id};
 pub use local::{
     scan_local, FileSource, LocalConfig, LocalFile, LocalReport, LocalStats, VecFileSource,
 };
-pub use local_fs_sharded::{
-    scan_local_fs_sharded, ShardIoStats, ShardScanStats, ShardedFsConfig, ShardedFsReport,
-};
+pub use local_fs_sharded::{scan_local_fs_sharded, ShardedFsConfig, ShardedFsReport, WorkerStats};
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub use local_fs_uring::{
     scan_local_fs_uring, scan_local_fs_uring_sharded, LocalFsUringConfig, ShardedFsUringConfig,

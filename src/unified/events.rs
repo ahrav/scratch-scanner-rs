@@ -363,17 +363,23 @@ impl<W: Write + Send> JsonlEventSink<W> {
 
 impl<W: Write + Send + 'static> EventSink for JsonlEventSink<W> {
     fn emit(&self, event: ScanEvent<'_>) {
-        // Format into a stack-local buffer, then write under lock.
-        let mut buf = Vec::with_capacity(256);
-        self.encoder.encode(&event, &mut buf);
-
-        let mut writer = self.writer.lock().expect("jsonl sink mutex poisoned");
-        if let Err(e) = writer.write_all(&buf) {
-            if e.kind() == ErrorKind::BrokenPipe {
-                return;
-            }
-            panic!("jsonl event sink write failed: {}", e);
+        // Reuse a thread-local buffer to avoid per-emit allocation.
+        thread_local! {
+            static ENCODE_BUF: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::with_capacity(256));
         }
+        ENCODE_BUF.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            buf.clear();
+            self.encoder.encode(&event, &mut buf);
+
+            let mut writer = self.writer.lock().expect("jsonl sink mutex poisoned");
+            if let Err(e) = writer.write_all(&buf) {
+                if e.kind() == ErrorKind::BrokenPipe {
+                    return;
+                }
+                panic!("jsonl event sink write failed: {}", e);
+            }
+        });
     }
 
     fn flush(&self) {
@@ -435,10 +441,16 @@ impl Default for VecEventSink {
 
 impl EventSink for VecEventSink {
     fn emit(&self, event: ScanEvent<'_>) {
-        let mut tmp = Vec::with_capacity(256);
-        self.encoder.encode(&event, &mut tmp);
-        let mut buf = self.buf.lock().expect("vec event sink mutex poisoned");
-        buf.extend_from_slice(&tmp);
+        thread_local! {
+            static ENCODE_BUF: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::with_capacity(256));
+        }
+        ENCODE_BUF.with(|cell| {
+            let mut tmp = cell.borrow_mut();
+            tmp.clear();
+            self.encoder.encode(&event, &mut tmp);
+            let mut buf = self.buf.lock().expect("vec event sink mutex poisoned");
+            buf.extend_from_slice(&tmp);
+        });
     }
 
     fn flush(&self) {}
