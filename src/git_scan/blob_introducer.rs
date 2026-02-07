@@ -1073,8 +1073,10 @@ pub(super) struct ParallelIntroResult {
 ///
 /// Post-merge:
 /// - Packed/loose candidates are concatenated.
-/// - Path arenas are merged with offset rebasing (checked_add overflow).
+/// - Path arenas are merged with offset rebasing (checked_add overflow),
+///   bounded by the global `mapping_cfg_path_arena_capacity`.
 /// - Loose candidates are deduplicated by OID.
+/// - Global packed/loose caps are re-validated after merge.
 /// - Stats use saturating sum for counters and max for peaks.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn introduce_parallel<'a>(
@@ -1120,7 +1122,13 @@ pub(super) fn introduce_parallel<'a>(
         (config.tree_diff.max_tree_delta_cache_bytes / worker_count as u32).max(4 * 1024 * 1024); // 4 MB floor
     let per_worker_spill = config.tree_diff.max_tree_spill_bytes / worker_count as u64;
     let per_worker_spill = per_worker_spill.max(64 * 1024 * 1024); // 64 MB floor
-    let per_worker_loose = (mapping_cfg_max_loose / worker_count as u32).max(1024);
+    let per_worker_loose = per_worker_loose_limit(mapping_cfg_max_loose, worker_count);
+    let per_worker_path_arena = (mapping_cfg_path_arena_capacity / worker_count as u32)
+        .max(64 * 1024)
+        .min(mapping_cfg_path_arena_capacity); // never exceed the original cap
+    let per_worker_max_packed = (mapping_cfg_max_packed / worker_count as u32)
+        .max(1024)
+        .min(mapping_cfg_max_packed); // never exceed the original cap
 
     // Build per-worker limits with divided budgets.
     let per_worker_limits = TreeDiffLimits {
@@ -1154,12 +1162,12 @@ pub(super) fn introduce_parallel<'a>(
                         tree_delta_cache,
                     )?;
 
-                    // Per-worker candidate collector.
+                    // Per-worker candidate collector with divided limits.
                     let mut collector = PackCandidateCollector::new(
                         midx,
                         oid_index,
-                        mapping_cfg_path_arena_capacity,
-                        mapping_cfg_max_packed,
+                        per_worker_path_arena,
+                        per_worker_max_packed,
                         per_worker_loose,
                     );
 
@@ -1211,19 +1219,11 @@ pub(super) fn introduce_parallel<'a>(
             .collect()
     });
 
-    // Merge results.
-    let mut all_packed = Vec::new();
-    let mut all_loose = Vec::new();
-    let mut merged_stats = BlobIntroStats::default();
     let mut first_error: Option<TreeDiffError> = None;
-
-    // Estimate total arena capacity needed.
-    let mut total_arena_bytes: u64 = 0;
     let mut worker_results = Vec::new();
     for result in results {
         match result {
             Ok(wr) => {
-                total_arena_bytes = total_arena_bytes.saturating_add(wr.path_arena.len() as u64);
                 worker_results.push(wr);
             }
             Err(err) => {
@@ -1238,8 +1238,28 @@ pub(super) fn introduce_parallel<'a>(
         return Err(err);
     }
 
-    let merged_capacity = total_arena_bytes.min(u32::MAX as u64) as u32;
-    let mut merged_arena = ByteArena::with_capacity(merged_capacity);
+    merge_worker_results(
+        worker_results,
+        mapping_cfg_path_arena_capacity,
+        mapping_cfg_max_packed,
+        mapping_cfg_max_loose,
+    )
+}
+
+/// Merge per-worker introduction outputs and enforce global candidate/arena caps.
+///
+/// The merged path arena is created with `path_arena_capacity` so parallel
+/// mode honors the same global arena budget as the serial collector path.
+fn merge_worker_results(
+    worker_results: Vec<WorkerResult>,
+    path_arena_capacity: u32,
+    max_packed: u32,
+    max_loose: u32,
+) -> Result<ParallelIntroResult, TreeDiffError> {
+    let mut all_packed = Vec::new();
+    let mut all_loose = Vec::new();
+    let mut merged_stats = BlobIntroStats::default();
+    let mut merged_arena = ByteArena::with_capacity(path_arena_capacity);
 
     for mut wr in worker_results {
         // Rebase path arena references in candidates.
@@ -1296,12 +1316,41 @@ pub(super) fn introduce_parallel<'a>(
     // Deduplicate loose candidates by OID (keep first occurrence).
     dedup_loose_by_oid(&mut all_loose);
 
+    // Post-merge validation: ensure the merged totals respect the global caps.
+    // Per-worker limits are divided approximations; the merged result can exceed
+    // the original budget, so we re-check here.
+    if all_packed.len() as u64 > max_packed as u64 {
+        return Err(TreeDiffError::CandidateLimitExceeded {
+            kind: MappingCandidateKind::Packed,
+            max: max_packed,
+            observed: all_packed.len().min(u32::MAX as usize) as u32,
+        });
+    }
+    if all_loose.len() as u64 > max_loose as u64 {
+        return Err(TreeDiffError::CandidateLimitExceeded {
+            kind: MappingCandidateKind::Loose,
+            max: max_loose,
+            observed: all_loose.len().min(u32::MAX as usize) as u32,
+        });
+    }
+
     Ok(ParallelIntroResult {
         packed: all_packed,
         loose: all_loose,
         path_arena: merged_arena,
         stats: merged_stats,
     })
+}
+
+/// Returns the loose-candidate budget used by each parallel worker.
+///
+/// The returned value is always in `0..=max_loose`.
+fn per_worker_loose_limit(max_loose: u32, worker_count: usize) -> u32 {
+    if max_loose == 0 {
+        return 0;
+    }
+    let workers = worker_count.max(1) as u32;
+    max_loose.div_ceil(workers).max(1).min(max_loose)
 }
 
 /// Deduplicates loose candidates by OID, keeping the first occurrence.
@@ -1315,7 +1364,58 @@ fn dedup_loose_by_oid(loose: &mut Vec<LooseCandidate>) {
 
 #[cfg(test)]
 mod tests {
-    use super::SeenSets;
+    use super::{
+        merge_worker_results, per_worker_loose_limit, BlobIntroStats, SeenSets, WorkerResult,
+    };
+    use crate::git_scan::byte_arena::{ByteArena, ByteRef};
+    use crate::git_scan::errors::{MappingCandidateKind, TreeDiffError};
+    use crate::git_scan::object_id::OidBytes;
+    use crate::git_scan::pack_candidates::{LooseCandidate, PackCandidate};
+    use crate::git_scan::tree_candidate::{CandidateContext, ChangeKind};
+
+    fn oid(byte: u8) -> OidBytes {
+        OidBytes::sha1([byte; 20])
+    }
+
+    fn empty_ctx() -> CandidateContext {
+        CandidateContext {
+            commit_id: 0,
+            parent_idx: 0,
+            change_kind: ChangeKind::Add,
+            ctx_flags: 0,
+            cand_flags: 0,
+            path_ref: ByteRef::new(0, 0),
+        }
+    }
+
+    fn packed_candidate(byte: u8) -> PackCandidate {
+        PackCandidate {
+            oid: oid(byte),
+            ctx: empty_ctx(),
+            pack_id: 0,
+            offset: byte as u64,
+        }
+    }
+
+    fn loose_candidate(byte: u8) -> LooseCandidate {
+        LooseCandidate {
+            oid: oid(byte),
+            ctx: empty_ctx(),
+        }
+    }
+
+    fn worker_result_with_paths(path: &[u8]) -> WorkerResult {
+        let mut arena = ByteArena::with_capacity(path.len() as u32);
+        if !path.is_empty() {
+            arena.intern(path).expect("path intern");
+        }
+        WorkerResult {
+            packed: Vec::new(),
+            loose: Vec::new(),
+            path_arena: arena,
+            stats: BlobIntroStats::default(),
+        }
+    }
 
     #[test]
     fn seen_sets_mark_and_query() {
@@ -1329,5 +1429,87 @@ mod tests {
         assert!(seen.mark_blob(3));
         assert!(seen.is_blob_seen(3));
         assert!(!seen.mark_blob(3));
+    }
+
+    #[test]
+    fn merge_enforces_global_path_arena_capacity() {
+        let workers = vec![
+            worker_result_with_paths(b"abcd"),
+            worker_result_with_paths(b"wxyz"),
+        ];
+        match merge_worker_results(workers, 6, 10, 10) {
+            Err(err) => assert!(matches!(err, TreeDiffError::PathArenaFull)),
+            Ok(_) => panic!("expected path cap error"),
+        }
+    }
+
+    #[test]
+    fn merge_enforces_global_packed_candidate_cap() {
+        let worker_a = WorkerResult {
+            packed: vec![packed_candidate(1)],
+            loose: Vec::new(),
+            path_arena: ByteArena::with_capacity(0),
+            stats: BlobIntroStats::default(),
+        };
+        let worker_b = WorkerResult {
+            packed: vec![packed_candidate(2)],
+            loose: Vec::new(),
+            path_arena: ByteArena::with_capacity(0),
+            stats: BlobIntroStats::default(),
+        };
+
+        match merge_worker_results(vec![worker_a, worker_b], 0, 1, 10) {
+            Err(TreeDiffError::CandidateLimitExceeded {
+                kind,
+                max,
+                observed,
+            }) => {
+                assert_eq!(kind, MappingCandidateKind::Packed);
+                assert_eq!(max, 1);
+                assert_eq!(observed, 2);
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+            Ok(_) => panic!("expected packed cap error"),
+        }
+    }
+
+    #[test]
+    fn per_worker_loose_limit_never_exceeds_configured_max() {
+        assert_eq!(per_worker_loose_limit(0, 8), 0);
+        assert_eq!(per_worker_loose_limit(3, 8), 1);
+        assert_eq!(per_worker_loose_limit(100, 8), 13);
+        assert_eq!(per_worker_loose_limit(100, 1), 100);
+        assert!(per_worker_loose_limit(100, 8) <= 100);
+        assert!(per_worker_loose_limit(3, 8) <= 3);
+    }
+
+    #[test]
+    fn merge_enforces_global_loose_candidate_cap_after_dedup() {
+        let worker_a = WorkerResult {
+            packed: Vec::new(),
+            loose: vec![loose_candidate(1), loose_candidate(2)],
+            path_arena: ByteArena::with_capacity(0),
+            stats: BlobIntroStats::default(),
+        };
+        let worker_b = WorkerResult {
+            packed: Vec::new(),
+            loose: vec![loose_candidate(2), loose_candidate(3)],
+            path_arena: ByteArena::with_capacity(0),
+            stats: BlobIntroStats::default(),
+        };
+
+        match merge_worker_results(vec![worker_a, worker_b], 0, 10, 2) {
+            Err(TreeDiffError::CandidateLimitExceeded {
+                kind,
+                max,
+                observed,
+            }) => {
+                assert_eq!(kind, MappingCandidateKind::Loose);
+                assert_eq!(max, 2);
+                assert_eq!(observed, 3);
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+            Ok(_) => panic!("expected loose cap error"),
+        }
     }
 }
