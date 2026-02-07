@@ -2,6 +2,10 @@
 //!
 //! # Architecture
 //!
+//! This module provides two execution modes:
+//! - owner-compute: a coordinator feeds files to a shared worker queue
+//! - inline walk+scan: walker threads discover and scan files directly
+//!
 //! Each worker owns its I/O buffer, engine scratch, and findings vec.
 //! Workers perform both blocking file I/O and scanning on the same thread,
 //! keeping data hot in L1/L2 cache between read and scan:
@@ -21,6 +25,12 @@
 //!   - own engine scratch (reused across all files)
 //!   - own findings Vec (reused across all chunks)
 //!
+//! # Invariants
+//!
+//! - A file is scanned by at most one worker in a given run.
+//! - Worker-local scan state (`Vec<u8>`, scratch, pending findings) is never shared.
+//! - Per-file open/read failures are counted in stats and do not stop the scan.
+//!
 //! # File Distribution
 //!
 //! Files are distributed via a single shared bounded channel. Workers compete
@@ -33,12 +43,23 @@
 //! - `FADV_SEQUENTIAL` once at file open → kernel uses aggressive readahead
 //! - `FADV_WILLNEED` before scanning each chunk, for *next* chunk's range →
 //!   kernel prefetches during scan, overlapping I/O with CPU work
+//!
+//! # Error Model
+//!
+//! Per-file failures are reflected in `OwnerWorkerStats::io_errors`.
+//! Public entry points only return `io::Error` for orchestration failures
+//! (for example worker thread spawn/join failure in owner-compute mode).
 
+use std::cell::UnsafeCell;
 use std::fs::File;
 use std::io::{self, Read, Seek};
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
+
+use crossbeam_utils::CachePadded;
 
 use super::engine_stub::BUFFER_LEN_MAX;
 use super::engine_trait::{EngineScratch, FindingRecord, ScanEngine};
@@ -61,6 +82,8 @@ const SNIFF_HEADER_LEN: usize = 8;
 #[cfg(target_os = "linux")]
 fn fadvise_sequential(file: &File) {
     use std::os::unix::io::AsRawFd;
+    // Safety: the fd comes from a live `File`, and `posix_fadvise` neither
+    // retains pointers nor mutates Rust-owned memory.
     unsafe {
         libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
     }
@@ -73,6 +96,7 @@ fn fadvise_sequential(_file: &File) {}
 #[cfg(target_os = "linux")]
 fn fadvise_willneed(file: &File, offset: i64, len: i64) {
     use std::os::unix::io::AsRawFd;
+    // Safety: same as `fadvise_sequential`; arguments are plain value hints.
     unsafe {
         libc::posix_fadvise(file.as_raw_fd(), offset, len, libc::POSIX_FADV_WILLNEED);
     }
@@ -159,6 +183,10 @@ pub struct OwnerComputeFsReport {
 // Helpers
 // ============================================================================
 
+/// `EINTR`-retrying wrapper around [`File::read`].
+///
+/// Loops on `ErrorKind::Interrupted` so callers never see spurious
+/// zero-byte returns from signal delivery.
 #[inline(always)]
 fn read_some(file: &mut File, dst: &mut [u8]) -> io::Result<usize> {
     loop {
@@ -170,6 +198,12 @@ fn read_some(file: &mut File, dst: &mut [u8]) -> io::Result<usize> {
     }
 }
 
+/// Sort+dedup findings by `(rule_id, root_hint_start, root_hint_end, span_start, span_end)`.
+///
+/// Eliminates duplicate findings within a single chunk that share the same
+/// rule and span coordinates. Operates in-place to avoid allocation.
+///
+/// Complexity: `O(n log n)` from sort, `O(n)` dedup pass.
 fn dedupe_pending_in_place<F: FindingRecord>(p: &mut Vec<F>) {
     if p.len() <= 1 {
         return;
@@ -194,6 +228,9 @@ fn dedupe_pending_in_place<F: FindingRecord>(p: &mut Vec<F>) {
     });
 }
 
+/// Emits each finding as a [`FindingEvent`] through the event sink.
+///
+/// Side effect: sends one event per finding to `event_sink`.
 fn emit_findings<E: ScanEngine, F: FindingRecord>(
     engine: &E,
     event_sink: &dyn EventSink,
@@ -234,6 +271,10 @@ fn emit_findings<E: ScanEngine, F: FindingRecord>(
 ///
 /// Errors on open, metadata, or mid-file reads are counted in `stats` and
 /// do not propagate — the caller simply moves on to the next file.
+///
+/// # Preconditions
+/// - `buf.len() >= overlap + chunk_size`
+/// - `pending` and `scratch` are worker-local and can be freely reused
 #[allow(clippy::too_many_arguments)]
 fn process_file<E: ScanEngine>(
     engine: &E,
@@ -284,6 +325,8 @@ fn process_file<E: ScanEngine>(
 
     // --- Archive detection ---
     if archive_cfg.enabled {
+        // Fast path: extension/path-based archive detection avoids an I/O read.
+        // Fallback: sniff first bytes, then seek back so chunk scanning starts at 0.
         let is_archive = detect_kind_from_path(&local_file.path).is_some() || {
             let mut header = [0u8; SNIFF_HEADER_LEN];
             let sniffed = match read_some(&mut file, &mut header) {
@@ -309,6 +352,7 @@ fn process_file<E: ScanEngine>(
 
     loop {
         if carry > 0 && have > 0 {
+            // Preserve overlap suffix from previous read as prefix for next scan window.
             buf.copy_within(have - carry..have, 0);
         }
 
@@ -348,6 +392,7 @@ fn process_file<E: ScanEngine>(
         }
 
         let read_len = carry + n;
+        // Base offset points to buffer index 0, which may include overlap carried forward.
         let base_offset = offset.saturating_sub(carry as u64);
 
         #[cfg(feature = "stats")]
@@ -361,6 +406,7 @@ fn process_file<E: ScanEngine>(
         }
 
         // Drop findings wholly in overlap prefix.
+        // They were already emitted in the previous iteration's chunk.
         scratch.drop_prefix_findings(offset);
         pending.clear();
         scratch.drain_findings_into(pending);
@@ -395,6 +441,17 @@ fn process_file<E: ScanEngine>(
 /// for files, providing natural load balancing when file sizes vary. Each
 /// worker performs open/read/scan/emit on its own thread using a single
 /// reusable `Vec<u8>` buffer (zero per-file allocation).
+///
+/// # Preconditions
+/// - `cfg.file_channel_cap > 0`
+/// - `cfg.chunk_size + engine.required_overlap() <= BUFFER_LEN_MAX`
+///
+/// # Errors
+/// - returns `io::Error` if a worker thread fails to spawn
+/// - returns `io::Error` if a worker thread panics while processing
+///
+/// # Panics
+/// - if preconditions above are violated
 pub fn scan_local_fs_owner_compute<E: ScanEngine>(
     engine: Arc<E>,
     files: impl Iterator<Item = LocalFile>,
@@ -439,6 +496,7 @@ pub fn scan_local_fs_owner_compute<E: ScanEngine>(
                 let mut pending: Vec<<E::Scratch as EngineScratch>::Finding> =
                     Vec::with_capacity(4096);
                 let mut buf = vec![0u8; buf_len];
+                // Stripe file IDs by worker to avoid collisions across threads.
                 let mut file_seq = worker_idx as u32;
                 let stride = worker_count as u32;
 
@@ -462,6 +520,7 @@ pub fn scan_local_fs_owner_compute<E: ScanEngine>(
                     );
                 }
 
+                // Return worker-local totals for final aggregation by coordinator.
                 stats
             })
             .map_err(io::Error::other)?;
@@ -482,6 +541,7 @@ pub fn scan_local_fs_owner_compute<E: ScanEngine>(
         #[cfg(feature = "stats")]
         let send_t = Instant::now();
         if file_tx.send(local_file).is_err() {
+            // All receivers are gone (worker panicked/exited); stop feeding.
             break;
         }
         #[cfg(feature = "stats")]
@@ -503,6 +563,7 @@ pub fn scan_local_fs_owner_compute<E: ScanEngine>(
     for handle in handles {
         match handle.join() {
             Ok(s) => worker_stats.push(s),
+            // Surface panic as I/O-style orchestration failure to caller.
             Err(_) => return Err(io::Error::other("owner worker thread panicked")),
         }
     }
@@ -533,5 +594,231 @@ pub fn scan_local_fs_owner_compute<E: ScanEngine>(
         metrics,
         feed_elapsed_ns,
         feed_block_ns,
+    })
+}
+
+// ============================================================================
+// Inline Walk+Scan (single thread pool)
+// ============================================================================
+
+/// Configuration for inline walk+scan filesystem scanning.
+///
+/// Unlike [`OwnerComputeFsConfig`], there is no file channel — the walker
+/// threads ARE the scanner threads. Directory-level work-stealing from the
+/// `ignore` crate provides load balancing.
+pub struct InlineWalkScanConfig {
+    /// Number of walker/scanner threads.
+    pub workers: usize,
+    /// Payload bytes per chunk (excluding overlap).
+    pub chunk_size: usize,
+    /// Maximum file size to scan (bytes). Larger files are skipped.
+    pub max_file_size: u64,
+    /// Enable within-chunk finding deduplication.
+    pub dedupe_within_chunk: bool,
+    /// Archive scanning configuration.
+    pub archive: ArchiveConfig,
+    /// Shared event sink for finding output.
+    pub event_sink: Arc<dyn EventSink>,
+}
+
+/// Report from inline walk+scan.
+///
+/// Like [`OwnerComputeFsReport`] but without coordinator feed timing
+/// (there is no channel — walker threads scan directly).
+#[derive(Debug)]
+pub struct InlineWalkScanReport {
+    /// Per-worker stats in slot-claim order.
+    pub worker_stats: Vec<OwnerWorkerStats>,
+    /// Total files discovered by the walker (includes skipped).
+    pub files_discovered: u64,
+    /// End-to-end wall time (nanoseconds).
+    pub wall_time_ns: u64,
+    /// Aggregated metrics for compatibility with existing consumers.
+    pub metrics: MetricsSnapshot,
+}
+
+/// Pre-allocated, cache-line-padded stats slots for zero-contention aggregation.
+///
+/// Each walker thread claims one slot via `fetch_add` at init time.
+/// After `walker.run()` returns, the main thread reads `next` to know
+/// how many slots were used and iterates them to produce the aggregate.
+struct StatsSlots {
+    slots: Vec<CachePadded<UnsafeCell<OwnerWorkerStats>>>,
+    next: AtomicUsize,
+}
+
+/// # Safety
+///
+/// Each slot is exclusively owned by one thread after claiming via
+/// `fetch_add`; no two threads share a slot. The main thread only reads
+/// slots after all walker threads have joined (`walker.run()` blocks
+/// until completion), establishing a happens-before edge.
+///
+/// Slot capacity is `worker_count + 1`, which accounts for the `ignore`
+/// crate potentially spawning one extra thread. If more threads are
+/// spawned than capacity, the `slots[slot_idx]` access panics at
+/// runtime — a deliberate fail-loud rather than UB.
+unsafe impl Sync for StatsSlots {}
+
+impl StatsSlots {
+    /// Create fixed-capacity stats slots for walker threads.
+    ///
+    /// Callers must size `capacity` to the maximum number of walker threads
+    /// that may claim a slot during one `scan_local_fs_inline` run.
+    fn new(capacity: usize) -> Self {
+        let mut slots = Vec::with_capacity(capacity);
+        for _ in 0..capacity {
+            slots.push(CachePadded::new(UnsafeCell::new(
+                OwnerWorkerStats::default(),
+            )));
+        }
+        Self {
+            slots,
+            next: AtomicUsize::new(0),
+        }
+    }
+}
+
+/// Scan a filesystem tree by walking and scanning inline on the same threads.
+///
+/// Uses `ignore::WalkBuilder::build_parallel()` to walk the directory tree
+/// with work-stealing at directory granularity. Each walker thread allocates
+/// its own engine scratch, I/O buffer, and stats slot at init time, then
+/// scans every file it discovers — no channel, no second thread pool.
+///
+/// This preserves directory locality (the thread that discovers a file scans
+/// it immediately) and eliminates all per-file synchronization.
+///
+/// # Preconditions
+/// - `cfg.chunk_size + engine.required_overlap() <= BUFFER_LEN_MAX`
+///
+/// # Panics
+/// - if the precondition above is violated
+pub fn scan_local_fs_inline<E: ScanEngine>(
+    engine: Arc<E>,
+    root: &Path,
+    cfg: InlineWalkScanConfig,
+) -> io::Result<InlineWalkScanReport> {
+    let worker_count = cfg.workers.max(1);
+    let overlap = engine.required_overlap();
+    let buf_len = overlap.saturating_add(cfg.chunk_size);
+    assert!(
+        buf_len <= BUFFER_LEN_MAX,
+        "chunk_size + overlap ({}) exceeds BUFFER_LEN_MAX ({})",
+        buf_len,
+        BUFFER_LEN_MAX,
+    );
+
+    let wall_start = Instant::now();
+
+    // +1 slot to handle ignore crate potentially spawning an extra thread.
+    let stats_slots = Arc::new(StatsSlots::new(worker_count + 1));
+    let files_discovered = Arc::new(AtomicUsize::new(0));
+
+    let chunk_size = cfg.chunk_size;
+    let max_file_size = cfg.max_file_size;
+    let dedupe = cfg.dedupe_within_chunk;
+    let archive_cfg = cfg.archive;
+    let event_sink = cfg.event_sink;
+
+    let walker = ignore::WalkBuilder::new(root)
+        .threads(worker_count)
+        .follow_links(false)
+        .hidden(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .build_parallel();
+
+    walker.run(|| {
+        // Factory: called once per walker thread — allocate per-thread state.
+        let engine = Arc::clone(&engine);
+        let event_sink = Arc::clone(&event_sink);
+        let archive_cfg = archive_cfg.clone();
+        let stats_slots = Arc::clone(&stats_slots);
+        let files_discovered = Arc::clone(&files_discovered);
+
+        let mut scratch = engine.new_scratch();
+        let mut buf = vec![0u8; buf_len];
+        let mut pending = Vec::with_capacity(4096);
+
+        // Claim an exclusive stats slot — no contention after this point.
+        // Relaxed ordering is sufficient: uniqueness comes from atomic RMW itself.
+        let slot_idx = stats_slots.next.fetch_add(1, Ordering::Relaxed);
+        // Safety: slot_idx < capacity (one slot per thread), exclusively owned.
+        let stats: &mut OwnerWorkerStats = unsafe { &mut *stats_slots.slots[slot_idx].get() };
+
+        let mut file_seq = 0u32;
+
+        // Per-entry: called for every dir entry — scan files inline.
+        Box::new(move |result: Result<ignore::DirEntry, ignore::Error>| {
+            if let Ok(entry) = result {
+                if entry.file_type().is_some_and(|ft| ft.is_file()) {
+                    // Discovery count is approximate-in-time but exact at completion.
+                    files_discovered.fetch_add(1, Ordering::Relaxed);
+                    let local_file = LocalFile {
+                        path: entry.into_path(),
+                        size: 0, // Size checked at open time via fstat.
+                    };
+                    // IDs are only required to be stable within this walker thread.
+                    let file_id = FileId(file_seq);
+                    file_seq = file_seq.wrapping_add(1);
+                    process_file(
+                        engine.as_ref(),
+                        &*event_sink,
+                        local_file,
+                        file_id,
+                        chunk_size,
+                        overlap,
+                        max_file_size,
+                        &archive_cfg,
+                        dedupe,
+                        &mut buf,
+                        &mut pending,
+                        &mut scratch,
+                        stats,
+                    );
+                }
+            }
+            ignore::WalkState::Continue
+        })
+    });
+
+    // walker.run() blocks until all threads complete.
+    let wall_time_ns = wall_start.elapsed().as_nanos() as u64;
+    let total_discovered = files_discovered.load(Ordering::Relaxed) as u64;
+
+    event_sink.flush();
+
+    // Aggregate per-worker stats.
+    // `used` is the number of successfully claimed slots.
+    let used = stats_slots.next.load(Ordering::Relaxed);
+    let mut worker_stats = Vec::with_capacity(used);
+    let mut metrics = MetricsSnapshot::new();
+
+    for i in 0..used {
+        // Safety: all walker threads have joined; we have exclusive access.
+        let s = unsafe { &*stats_slots.slots[i].get() };
+        worker_stats.push(*s);
+
+        metrics.bytes_scanned = metrics.bytes_scanned.saturating_add(s.bytes_scanned);
+        metrics.chunks_scanned = metrics.chunks_scanned.saturating_add(s.chunks_scanned);
+        metrics.findings_emitted = metrics.findings_emitted.saturating_add(s.findings_emitted);
+        metrics.io_errors = metrics.io_errors.saturating_add(s.io_errors);
+        #[cfg(feature = "stats")]
+        {
+            metrics.open_stat_ns = metrics.open_stat_ns.saturating_add(s.open_stat_ns);
+            metrics.read_ns = metrics.read_ns.saturating_add(s.read_ns);
+            metrics.scan_ns = metrics.scan_ns.saturating_add(s.scan_ns);
+        }
+    }
+    metrics.worker_count = used as u32;
+    metrics.duration_ns = wall_time_ns;
+
+    Ok(InlineWalkScanReport {
+        worker_stats,
+        files_discovered: total_discovered,
+        wall_time_ns,
+        metrics,
     })
 }

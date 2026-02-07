@@ -64,10 +64,11 @@ mod buffer_scan;
 mod stream_decode;
 mod window_validate;
 
-// Existing modules
+// Supporting modules
 mod helpers;
 mod transform;
-mod vectorscan_prefilter;
+mod vectorscan_prefilter; // Vectorscan/Hyperscan prefilter DBs and FFI callbacks
+mod vs_cache; // On-disk cache for serialized Vectorscan databases
 
 #[cfg(test)]
 mod tests;

@@ -69,7 +69,7 @@
 //! | Module | Purpose |
 //! |--------|---------|
 //! | [`local`] | Low-level filesystem scanning with `std::fs` |
-//! | [`local_fs_owner`] | Owner-compute filesystem scanning (shared channel, fadvise, worker-local I/O + scan) |
+//! | [`local_fs_owner`] | Owner-compute filesystem scanning: shared-channel dispatch (`scan_local_fs_owner_compute`) and inline walk+scan (`scan_local_fs_inline`) |
 //! | [`local_fs_sharded`] | Legacy sharded I/O+scan thread pairs (used by io_uring only) |
 //! | [`parallel_scan`] | High-level directory scanning with gitignore support |
 //! | [`local_fs_uring`] | Linux-only io_uring backend (feature `io-uring`) |
@@ -293,7 +293,8 @@ pub use local::{
     scan_local, FileSource, LocalConfig, LocalFile, LocalReport, LocalStats, VecFileSource,
 };
 pub use local_fs_owner::{
-    scan_local_fs_owner_compute, OwnerComputeFsConfig, OwnerComputeFsReport, OwnerWorkerStats,
+    scan_local_fs_inline, scan_local_fs_owner_compute, InlineWalkScanConfig, InlineWalkScanReport,
+    OwnerComputeFsConfig, OwnerComputeFsReport, OwnerWorkerStats,
 };
 // local_fs_sharded types are not re-exported; used only by local_fs_uring internally.
 #[cfg(all(target_os = "linux", feature = "io-uring"))]

@@ -3,8 +3,9 @@
 //! Dispatches to the appropriate source driver based on the parsed
 //! CLI configuration:
 //!
-//! - **FS** → Owner-compute workers via [`scan_local_fs_owner_compute`],
-//!   shared channel dispatch with posix_fadvise prefetch
+//! - **FS** → Inline walk+scan via [`scan_local_fs_inline`], where walker
+//!   threads are the scanner threads (no channel; directory-level
+//!   work-stealing via the `ignore` crate provides load balancing)
 //! - **Git** → [`run_git_scan`] (pack execution, tree diffs, loose scan)
 //!
 //! Both paths share a common [`EventSink`](super::events::EventSink) for
@@ -21,7 +22,7 @@ use crate::git_scan::{
     self, run_git_scan, GitScanConfig, GitScanResult, InMemoryPersistenceStore, NeverSeenStore,
     StartSetConfig,
 };
-use crate::scheduler::{scan_local_fs_owner_compute, LocalFile, OwnerComputeFsConfig};
+use crate::scheduler::{scan_local_fs_inline, InlineWalkScanConfig};
 use crate::{
     demo_engine_with_anchor_mode, demo_engine_with_anchor_mode_and_max_transform_depth, demo_rules,
     demo_transforms, demo_tuning, AnchorMode, AnchorPolicy, Engine,
@@ -70,17 +71,6 @@ fn run_fs(cfg: FsScanConfig, event_format: EventFormat) -> io::Result<()> {
         archive_cfg.enabled = false;
     }
 
-    let owner_cfg = OwnerComputeFsConfig {
-        workers,
-        chunk_size: 256 * 1024,
-        max_file_size: 100 * 1024 * 1024,
-        file_channel_cap: 256,
-        dedupe_within_chunk: true,
-        archive: archive_cfg,
-        event_sink: Arc::clone(&event_sink),
-        pin_threads: false,
-    };
-
     let root = &cfg.root;
 
     if !root.exists() {
@@ -90,40 +80,16 @@ fn run_fs(cfg: FsScanConfig, event_format: EventFormat) -> io::Result<()> {
         ));
     }
 
-    // WalkBuilder handles both files and directories: if given a file it
-    // yields that single entry, if a directory it walks recursively.
-    let (walk_tx, walk_rx) = crossbeam_channel::bounded::<LocalFile>(1024);
-    let walk_root = root.to_path_buf();
-    std::thread::spawn(move || {
-        let walker = ignore::WalkBuilder::new(&walk_root)
-            .follow_links(false)
-            .hidden(false)
-            .git_ignore(false)
-            .git_global(false)
-            .git_exclude(false)
-            .build_parallel();
+    let inline_cfg = InlineWalkScanConfig {
+        workers,
+        chunk_size: 256 * 1024, // 256 KiB — fits L2 with overlap headroom
+        max_file_size: 100 * 1024 * 1024, // 100 MiB — skip very large files
+        dedupe_within_chunk: true,
+        archive: archive_cfg,
+        event_sink: Arc::clone(&event_sink),
+    };
 
-        walker.run(|| {
-            let tx = walk_tx.clone();
-            Box::new(move |result| {
-                if let Ok(entry) = result {
-                    if entry.file_type().is_some_and(|ft| ft.is_file()) {
-                        let file = LocalFile {
-                            path: entry.into_path(),
-                            size: 0, // Size checked at open time via fstat.
-                        };
-                        if tx.send(file).is_err() {
-                            return ignore::WalkState::Quit;
-                        }
-                    }
-                }
-                ignore::WalkState::Continue
-            })
-        });
-        // walk_tx dropped here → walk_rx disconnects → iterator ends
-    });
-
-    let report = scan_local_fs_owner_compute(engine, walk_rx.into_iter(), owner_cfg)?;
+    let report = scan_local_fs_inline(engine, root, inline_cfg)?;
 
     let scan_elapsed = scan_start.elapsed();
     let total_elapsed = t0.elapsed();
@@ -149,7 +115,7 @@ fn run_fs(cfg: FsScanConfig, event_format: EventFormat) -> io::Result<()> {
     // Machine-readable stats to stderr.
     eprintln!(
         "files={} chunks={} bytes={} findings={} errors={} init_ms={} scan_ms={} elapsed_ms={} throughput_mib_s={:.2} workers={}",
-        report.files_enqueued,
+        report.files_discovered,
         report.metrics.chunks_scanned,
         report.metrics.bytes_scanned,
         report.metrics.findings_emitted,
@@ -181,22 +147,6 @@ fn run_fs(cfg: FsScanConfig, event_format: EventFormat) -> io::Result<()> {
                 ws.scan_ns as f64 / 1e6,
             );
         }
-    }
-
-    // Coordinator feed timing (stats feature only).
-    #[cfg(feature = "stats")]
-    {
-        let feed_pct = if report.feed_elapsed_ns > 0 {
-            (report.feed_block_ns as f64 / report.feed_elapsed_ns as f64) * 100.0
-        } else {
-            0.0
-        };
-        eprintln!(
-            "  coordinator: feed_ms={:.1} send_blocked_ms={:.1} send_blocked%={:.1}%",
-            report.feed_elapsed_ns as f64 / 1e6,
-            report.feed_block_ns as f64 / 1e6,
-            feed_pct,
-        );
     }
 
     Ok(())
