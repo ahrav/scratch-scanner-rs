@@ -24,7 +24,7 @@ graph TB
     end
 
     subgraph Memory["Memory Management"]
-        BufferPool["BufferPool<br/>2MB Buffer Pool"]
+        BufferPool["BufferPool<br/>8MiB Buffer Pool"]
         NodePool["NodePoolType<br/>Pre-allocated Buffers"]
         DecodeSlab["DecodeSlab<br/>Decoded Output Storage"]
     end

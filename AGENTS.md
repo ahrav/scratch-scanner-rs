@@ -1,4 +1,4 @@
-# AGENTS.md
+# Repository Guidance
 
 ## Project Overview
 Rust-based secret scanning engine with pattern matching, transforms (URL/Base64), and streaming decode.
@@ -61,7 +61,6 @@ After modifying rules in `src/gitleaks_rules.rs`:
 - Prefer structured prefixes (e.g., `sgp_`, `hvs.`) over keyword anchors like service names
 
 ## Performance Regression Workflow
-
 Before merging any feature that touches hot paths (`src/engine/`, regex changes, validation logic):
 
 ### 1. Stash Changes and Build Baseline
@@ -105,15 +104,14 @@ Calculate average throughput delta per repository:
 ```
 
 ### Acceptance Criteria
-| Regression Level | Action |
-|------------------|--------|
-| None (<2%) | Ship as-is |
-| Minor (2-5%) | Document reason, acceptable for correctness |
-| Moderate (5-10%) | Requires compelling justification |
-| Major (>10%) | Must investigate and optimize |
+| Regression Level | Action                                      |
+| ---------------- | ------------------------------------------- |
+| None (<2%)       | Ship as-is                                  |
+| Minor (2-5%)     | Document reason, acceptable for correctness |
+| Moderate (5-10%) | Requires compelling justification           |
+| Major (>10%)     | Must investigate and optimize               |
 
 ### PR Documentation
-Include in PR description:
 - Average throughput delta per test repository
 - Criterion benchmark comparison summary
 - Justification for any regression >2%

@@ -225,6 +225,7 @@ pub(super) fn decode_span_fallback(
     &self,
     tc: &TransformConfig,
     transform_idx: usize,
+    enc_ref: &EncRef,
     enc: &[u8],
     ...
 )
@@ -334,9 +335,11 @@ pub(super) fn decode_stream_and_scan(
     vs_stream: &VsStreamDb,
     tc: &TransformConfig,
     transform_idx: usize,
+    enc_ref: &EncRef,
     encoded: &[u8],
     step_id: StepId,
     root_hint: Option<Range<usize>>,
+    root_hint_maps_encoded: bool,
     depth: usize,
     base_offset: u64,
     file_id: FileId,
@@ -369,12 +372,11 @@ pub(super) fn decode_span_fallback(
     &self,
     tc: &TransformConfig,
     transform_idx: usize,
+    enc_ref: &EncRef,
     enc: &[u8],
     step_id: StepId,
     root_hint: Option<Range<usize>>,
     depth: usize,
-    base_offset: u64,
-    file_id: FileId,
     scratch: &mut ScanScratch,
 )
 ```

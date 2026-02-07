@@ -1358,7 +1358,6 @@ dependencies = [
  "crossbeam-utils",
  "flate2",
  "gix-commitgraph",
- "gix-hash",
  "ignore",
  "io-uring",
  "libc",

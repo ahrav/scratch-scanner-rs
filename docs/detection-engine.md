@@ -302,7 +302,6 @@ These gates are designed to be **local and bounded**:
 | `max_work_items` | 256 | Cap on queued decode work items per scan |
 | `max_findings_per_chunk` | 8192 | Hard cap on findings per chunk |
 | `scan_utf16_variants` | true | Enable UTF-16 anchor variants |
-| `raw_prefilter_mode` | `RegexAndAnchors` | Raw prefilter policy (regex+anchors vs anchor-only for anchored rules) |
 
 Derived (non-config) limits used by streaming decode:
 - `pending_window_horizon_bytes = max_window_radius + STREAM_DECODE_CHUNK_BYTES`
