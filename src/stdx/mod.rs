@@ -35,6 +35,7 @@ pub mod fixed_set;
 pub mod fixed_vec;
 pub mod released_set;
 pub mod ring_buffer;
+pub mod spsc;
 pub mod timing_wheel;
 
 pub use atomic_bitset::AtomicBitSet;
@@ -45,4 +46,5 @@ pub use fixed_set::FixedSet128;
 pub use fixed_vec::FixedVec;
 pub use released_set::ReleasedSet;
 pub use ring_buffer::RingBuffer;
+pub use spsc::{spsc_channel, OwnedSpscConsumer, OwnedSpscProducer};
 pub use timing_wheel::{Bitset2, PushError, PushOutcome, TimingWheel};

@@ -40,11 +40,24 @@ pub fn run(config: ScanConfig) -> io::Result<()> {
     }
 }
 
-/// Filesystem scan path — delegates to `parallel_scan_dir`.
+/// Filesystem scan path — dispatches to the selected I/O backend.
+///
+/// - `Blocking`: Work-stealing executor via `parallel_scan_dir`.
+/// - `Sharded`: Per-shard share-nothing model via `scan_local_fs_sharded`.
 ///
 /// Findings are emitted as structured JSONL events to stdout via the
 /// [`EventSink`]. Summary stats are written to stderr.
 fn run_fs(cfg: FsScanConfig, event_format: EventFormat) -> io::Result<()> {
+    use super::IoBackend;
+
+    match cfg.io_backend {
+        IoBackend::Blocking => run_fs_blocking(cfg, event_format),
+        IoBackend::Sharded => run_fs_sharded(cfg, event_format),
+    }
+}
+
+/// Blocking I/O backend — delegates to `parallel_scan_dir`.
+fn run_fs_blocking(cfg: FsScanConfig, event_format: EventFormat) -> io::Result<()> {
     use super::events::{ScanEvent, SummaryEvent};
     use super::SourceKind;
 
@@ -104,6 +117,273 @@ fn run_fs(cfg: FsScanConfig, event_format: EventFormat) -> io::Result<()> {
         total_elapsed.as_millis(),
         throughput_mib,
         cfg.workers,
+    );
+
+    Ok(())
+}
+
+/// Sharded I/O backend — delegates to `scan_local_fs_sharded` (or io_uring variant on Linux).
+///
+/// Walks the directory tree, then round-robins files across shards. Each shard
+/// has a dedicated I/O thread and scan thread connected by a SPSC ring buffer.
+fn run_fs_sharded(cfg: FsScanConfig, event_format: EventFormat) -> io::Result<()> {
+    // On Linux with io_uring feature, prefer the io_uring per-shard backend.
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    {
+        return run_fs_uring_sharded(cfg, event_format);
+    }
+
+    #[allow(unreachable_code)]
+    run_fs_blocking_sharded(cfg, event_format)
+}
+
+/// Blocking sharded I/O backend — delegates to `scan_local_fs_sharded`.
+fn run_fs_blocking_sharded(cfg: FsScanConfig, event_format: EventFormat) -> io::Result<()> {
+    use super::events::{ScanEvent, SummaryEvent};
+    use super::SourceKind;
+    use crate::archive::ArchiveConfig;
+    use crate::scheduler::{scan_local_fs_sharded, ShardedFsConfig};
+
+    let t0 = Instant::now();
+    let engine = Arc::new(build_engine(cfg.anchor_mode, cfg.decode_depth));
+    let init_elapsed = t0.elapsed();
+
+    let scan_start = Instant::now();
+
+    let event_sink = build_event_sink(event_format);
+
+    // Determine shard count: workers / 2 (each shard uses 2 threads).
+    let shards = (cfg.workers / 2).max(1);
+
+    let mut archive_cfg = ArchiveConfig::default();
+    if cfg.no_archives {
+        archive_cfg.enabled = false;
+    }
+
+    let sharded_cfg = ShardedFsConfig {
+        shards,
+        chunk_size: 256 * 1024,           // 256 KiB
+        max_file_size: 100 * 1024 * 1024, // 100 MiB
+        pool_buffers_per_shard: 8,
+        local_queue_cap: 4,
+        max_in_flight_per_shard: 64,
+        spsc_capacity: 8,
+        dedupe_within_chunk: true,
+        archive: archive_cfg,
+        event_sink: Arc::clone(&event_sink),
+        pin_threads: false,
+    };
+
+    // Walk the directory tree and collect files into an iterator.
+    let root = &cfg.root;
+
+    if !root.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Root path does not exist: {}", root.display()),
+        ));
+    }
+
+    let files: Vec<crate::scheduler::LocalFile> = if root.is_file() {
+        let meta = std::fs::metadata(root)?;
+        vec![crate::scheduler::LocalFile {
+            path: root.to_path_buf(),
+            size: meta.len(),
+        }]
+    } else {
+        // Verify directory is readable.
+        std::fs::read_dir(root).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("Cannot read root directory '{}': {}", root.display(), e),
+            )
+        })?;
+
+        // Use ignore crate for parallel directory walking.
+        let walker = ignore::WalkBuilder::new(root)
+            .follow_links(false)
+            .hidden(false)
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .build();
+
+        walker
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                if !entry.file_type()?.is_file() {
+                    return None;
+                }
+                Some(crate::scheduler::LocalFile {
+                    path: entry.into_path(),
+                    size: 0, // Size checked at open time.
+                })
+            })
+            .collect()
+    };
+
+    let file_count = files.len() as u64;
+    let report = scan_local_fs_sharded(engine, files.into_iter(), sharded_cfg)?;
+
+    let scan_elapsed = scan_start.elapsed();
+    let total_elapsed = t0.elapsed();
+    let scan_secs = scan_elapsed.as_secs_f64();
+    let throughput_mib = if scan_secs > 0.0 {
+        (report.metrics.bytes_scanned as f64 / (1024.0 * 1024.0)) / scan_secs
+    } else {
+        0.0
+    };
+
+    // Emit structured summary event.
+    event_sink.emit(ScanEvent::Summary(SummaryEvent {
+        source: SourceKind::Fs,
+        status: "complete",
+        elapsed_ms: scan_elapsed.as_millis() as u64,
+        bytes_scanned: report.metrics.bytes_scanned,
+        findings_emitted: report.metrics.findings_emitted,
+        errors: report.metrics.io_errors,
+        throughput_mib_s: throughput_mib,
+    }));
+    event_sink.flush();
+
+    // Also write machine-readable stats to stderr for compatibility.
+    eprintln!(
+        "files={} chunks={} bytes={} findings={} errors={} init_ms={} scan_ms={} elapsed_ms={} throughput_mib_s={:.2} shards={} backend=sharded",
+        file_count,
+        report.metrics.chunks_scanned,
+        report.metrics.bytes_scanned,
+        report.metrics.findings_emitted,
+        report.metrics.io_errors,
+        init_elapsed.as_millis(),
+        scan_elapsed.as_millis(),
+        total_elapsed.as_millis(),
+        throughput_mib,
+        shards,
+    );
+
+    Ok(())
+}
+
+/// io_uring sharded I/O backend — delegates to `scan_local_fs_uring_sharded`.
+///
+/// Each shard has a per-shard io_uring ring for I/O and a scan thread connected
+/// by a wait-free SPSC ring buffer. Falls back to blocking open+stat when the
+/// kernel lacks io_uring open/stat opcode support.
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+fn run_fs_uring_sharded(cfg: FsScanConfig, event_format: EventFormat) -> io::Result<()> {
+    use super::events::{ScanEvent, SummaryEvent};
+    use super::SourceKind;
+    use crate::scheduler::{
+        scan_local_fs_uring_sharded, OpenStatMode, ResolvePolicy, ShardedFsUringConfig,
+    };
+
+    let t0 = Instant::now();
+    let engine = Arc::new(build_engine(cfg.anchor_mode, cfg.decode_depth));
+    let init_elapsed = t0.elapsed();
+
+    let scan_start = Instant::now();
+
+    let event_sink = build_event_sink(event_format);
+
+    let shards = (cfg.workers / 2).max(1);
+
+    let uring_cfg = ShardedFsUringConfig {
+        shards,
+        chunk_size: 256 * 1024,
+        max_file_size: 100 * 1024 * 1024,
+        pool_buffers_per_shard: 8,
+        local_queue_cap: 4,
+        max_in_flight_per_shard: 64,
+        dedupe_within_chunk: true,
+        event_sink: Arc::clone(&event_sink),
+        pin_threads: false,
+        ring_entries: 256,
+        io_depth: 128,
+        open_stat_mode: OpenStatMode::UringPreferred,
+        resolve_policy: ResolvePolicy::Default,
+        follow_symlinks: false,
+    };
+
+    let root = &cfg.root;
+
+    if !root.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Root path does not exist: {}", root.display()),
+        ));
+    }
+
+    let files: Vec<crate::scheduler::LocalFile> = if root.is_file() {
+        let meta = std::fs::metadata(root)?;
+        vec![crate::scheduler::LocalFile {
+            path: root.to_path_buf(),
+            size: meta.len(),
+        }]
+    } else {
+        std::fs::read_dir(root).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("Cannot read root directory '{}': {}", root.display(), e),
+            )
+        })?;
+
+        let walker = ignore::WalkBuilder::new(root)
+            .follow_links(false)
+            .hidden(false)
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .build();
+
+        walker
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                if !entry.file_type()?.is_file() {
+                    return None;
+                }
+                Some(crate::scheduler::LocalFile {
+                    path: entry.into_path(),
+                    size: 0,
+                })
+            })
+            .collect()
+    };
+
+    let file_count = files.len() as u64;
+    let report = scan_local_fs_uring_sharded(engine, files.into_iter(), uring_cfg)?;
+
+    let scan_elapsed = scan_start.elapsed();
+    let total_elapsed = t0.elapsed();
+    let scan_secs = scan_elapsed.as_secs_f64();
+    let throughput_mib = if scan_secs > 0.0 {
+        (report.metrics.bytes_scanned as f64 / (1024.0 * 1024.0)) / scan_secs
+    } else {
+        0.0
+    };
+
+    event_sink.emit(ScanEvent::Summary(SummaryEvent {
+        source: SourceKind::Fs,
+        status: "complete",
+        elapsed_ms: scan_elapsed.as_millis() as u64,
+        bytes_scanned: report.metrics.bytes_scanned,
+        findings_emitted: report.metrics.findings_emitted,
+        errors: report.metrics.io_errors,
+        throughput_mib_s: throughput_mib,
+    }));
+    event_sink.flush();
+
+    eprintln!(
+        "files={} chunks={} bytes={} findings={} errors={} init_ms={} scan_ms={} elapsed_ms={} throughput_mib_s={:.2} shards={} backend=uring-sharded",
+        file_count,
+        report.metrics.chunks_scanned,
+        report.metrics.bytes_scanned,
+        report.metrics.findings_emitted,
+        report.metrics.io_errors,
+        init_elapsed.as_millis(),
+        scan_elapsed.as_millis(),
+        total_elapsed.as_millis(),
+        throughput_mib,
+        shards,
     );
 
     Ok(())

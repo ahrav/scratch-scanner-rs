@@ -231,6 +231,7 @@ pub mod worker_id;
 
 // I/O backends
 pub mod local;
+pub mod local_fs_sharded;
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub mod local_fs_uring;
 pub mod parallel_scan;
@@ -288,8 +289,14 @@ pub use worker_id::{current_worker_id, set_current_worker_id};
 pub use local::{
     scan_local, FileSource, LocalConfig, LocalFile, LocalReport, LocalStats, VecFileSource,
 };
+pub use local_fs_sharded::{
+    scan_local_fs_sharded, ShardIoStats, ShardScanStats, ShardedFsConfig, ShardedFsReport,
+};
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
-pub use local_fs_uring::{scan_local_fs_uring, LocalFsUringConfig, UringIoStats};
+pub use local_fs_uring::{
+    scan_local_fs_uring, scan_local_fs_uring_sharded, LocalFsUringConfig, ShardedFsUringConfig,
+    UringIoStats,
+};
 pub use parallel_scan::{parallel_scan_dir, ParallelScanConfig, ParallelScanReport};
 pub use remote::{ErrorClass, RemoteBackend, RemoteConfig, RetryPolicy};
 

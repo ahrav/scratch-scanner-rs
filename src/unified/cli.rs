@@ -93,6 +93,7 @@ fn parse_fs_args(args: env::ArgsOs) -> io::Result<ScanConfig> {
     let mut no_archives = false;
     let mut anchor_mode = AnchorMode::Manual;
     let mut event_format = EventFormat::Jsonl;
+    let io_backend = super::IoBackend::default();
 
     for arg in args {
         if let Some(flag) = arg.to_str() {
@@ -160,6 +161,7 @@ fn parse_fs_args(args: env::ArgsOs) -> io::Result<ScanConfig> {
             decode_depth,
             no_archives,
             anchor_mode,
+            io_backend,
         }),
         event_format,
     })

@@ -305,8 +305,12 @@ pub struct WorkerMetricsLocal {
     pub io_errors: u64,
     /// Total findings emitted by this worker.
     pub findings_emitted: u64,
-    // Padding to separate from histograms
-    _pad: [u64; 3],
+    /// Cumulative nanoseconds spent in open + stat syscalls (perf-stats only).
+    pub open_stat_ns: u64,
+    /// Cumulative nanoseconds spent in read syscalls (perf-stats only).
+    pub read_ns: u64,
+    /// Cumulative nanoseconds spent in scan_chunk_into (perf-stats only).
+    pub scan_ns: u64,
     // 8 * 8 = 64 bytes (second cache line)
 
     // ===== COLD DATA (histograms - rarely read during execution) =====
@@ -341,7 +345,9 @@ impl WorkerMetricsLocal {
             park_count: 0,
             io_errors: 0,
             findings_emitted: 0,
-            _pad: [0; 3],
+            open_stat_ns: 0,
+            read_ns: 0,
+            scan_ns: 0,
             queue_time_ns: Log2Hist::new(),
             task_time_ns: Log2Hist::new(),
             archive: ArchiveStats::default(),

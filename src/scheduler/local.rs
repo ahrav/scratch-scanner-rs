@@ -2209,6 +2209,9 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
     }
 
     // Open file
+    #[cfg(all(feature = "perf-stats", debug_assertions))]
+    let open_start = std::time::Instant::now();
+
     let mut file = match File::open(&task.path) {
         Ok(f) => f,
         Err(e) => {
@@ -2234,6 +2237,14 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
             return;
         }
     };
+
+    #[cfg(all(feature = "perf-stats", debug_assertions))]
+    {
+        ctx.metrics.open_stat_ns = ctx
+            .metrics
+            .open_stat_ns
+            .saturating_add(open_start.elapsed().as_nanos() as u64);
+    }
 
     // Empty file: nothing to scan
     if file_size == 0 {
@@ -2314,6 +2325,9 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
         let read_max = chunk_size.min(buf.len() - carry).min(remaining_in_snapshot);
         let dst = &mut buf.as_mut_slice()[read_start..read_start + read_max];
 
+        #[cfg(all(feature = "perf-stats", debug_assertions))]
+        let read_start_t = std::time::Instant::now();
+
         let n = match read_some(&mut file, dst) {
             Ok(n) => n,
             Err(e) => {
@@ -2325,6 +2339,14 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
                 break;
             }
         };
+
+        #[cfg(all(feature = "perf-stats", debug_assertions))]
+        {
+            ctx.metrics.read_ns = ctx
+                .metrics
+                .read_ns
+                .saturating_add(read_start_t.elapsed().as_nanos() as u64);
+        }
 
         // EOF: done with this file
         if n == 0 {
@@ -2340,8 +2362,19 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
         let base_offset = offset.saturating_sub(carry as u64);
 
         // Scan the chunk
+        #[cfg(all(feature = "perf-stats", debug_assertions))]
+        let scan_start_t = std::time::Instant::now();
+
         let data = &buf.as_slice()[..read_len];
         engine.scan_chunk_into(data, task.file_id, base_offset, &mut scratch.scan_scratch);
+
+        #[cfg(all(feature = "perf-stats", debug_assertions))]
+        {
+            ctx.metrics.scan_ns = ctx
+                .metrics
+                .scan_ns
+                .saturating_add(scan_start_t.elapsed().as_nanos() as u64);
+        }
 
         // Drop findings whose root_hint_end is in the prefix region.
         // These will be (or were) found by the chunk that "owns" those bytes.
