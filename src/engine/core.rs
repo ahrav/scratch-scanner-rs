@@ -1479,8 +1479,6 @@ impl Engine {
                         step_id,
                         root_hint,
                         depth,
-                        base_offset,
-                        file_id,
                         scratch,
                     );
                 }

@@ -69,7 +69,6 @@
 //! | Module | Purpose |
 //! |--------|---------|
 //! | [`local_fs_owner`] | Canonical local filesystem scanning path (chunked I/O + archive expansion) |
-//! | [`local_fs_sharded`] | Legacy sharded I/O+scan thread pairs (used by io_uring only) |
 //! | [`parallel_scan`] | High-level directory scanning with gitignore support |
 //! | [`local_fs_uring`] | Linux-only io_uring backend (feature `io-uring`) |
 //! | [`remote`] | HTTP/object-store backend with retry policies |
@@ -231,9 +230,8 @@ pub mod ts_chunk;
 pub mod worker_id;
 
 // I/O backends
-pub mod local;
 pub mod local_fs_owner;
-pub mod local_fs_sharded;
+pub use local_fs_owner as local;
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub mod local_fs_uring;
 pub mod parallel_scan;
@@ -291,12 +289,8 @@ pub use worker_id::{current_worker_id, set_current_worker_id};
 pub use local_fs_owner::{
     scan_local, FileSource, LocalConfig, LocalFile, LocalReport, LocalStats, VecFileSource,
 };
-// local_fs_sharded types are not re-exported; used only by local_fs_uring internally.
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
-pub use local_fs_uring::{
-    scan_local_fs_uring, scan_local_fs_uring_sharded, LocalFsUringConfig, ShardedFsUringConfig,
-    UringIoStats,
-};
+pub use local_fs_uring::{scan_local_fs_uring, LocalFsUringConfig, UringIoStats};
 pub use parallel_scan::{parallel_scan_dir, ParallelScanConfig, ParallelScanReport};
 pub use remote::{ErrorClass, RemoteBackend, RemoteConfig, RetryPolicy};
 

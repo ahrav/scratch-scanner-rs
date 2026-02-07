@@ -1,4 +1,4 @@
-//! Local Filesystem Scanner
+//! Canonical Local Filesystem Scanner
 //!
 //! # Architecture
 //!
@@ -6,6 +6,12 @@
 //! - Uses `LocalFirst` buffer pool policy (same thread acquires and releases)
 //! - Sequential reads with overlap carry (no seeks, no re-reading overlap)
 //! - Discovery thread enqueues files; workers process entire files
+//!
+//! # Module Role
+//!
+//! This is the single local-filesystem scan path used by the scheduler. The
+//! module name is retained for historical reasons, but all local scan entry
+//! points (`scan_local`, `LocalConfig`, `LocalFile`) live here.
 //!
 //! # Why Blocking Reads First?
 //!
