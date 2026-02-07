@@ -548,6 +548,7 @@ pub(super) fn u64_to_usize(v: u64) -> usize {
 ///
 /// # Panics
 /// Panics if group 0 does not exist (impossible for a successful match).
+#[cfg(test)]
 #[inline]
 pub(super) fn extract_secret_span(
     captures: &regex::bytes::Captures<'_>,

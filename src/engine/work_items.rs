@@ -290,6 +290,7 @@ impl EncRef {
         }
     }
 
+    #[allow(dead_code)] // Symmetric accessor with range_usize; used in tests
     #[inline(always)]
     pub(super) fn range(&self) -> Range<u32> {
         self.lo..self.hi

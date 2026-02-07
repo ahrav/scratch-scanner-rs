@@ -143,9 +143,6 @@ For filesystem scans, this emission happens from owner-compute workers in
 `src/scheduler/local_fs_owner.rs` (each worker performs both I/O and scanning
 with worker-local reusable state).
 
-See [`scanner-unification.md`](scanner-unification.md) for routing/output
-details.
-
 | Limit | Default | Purpose |
 |-------|---------|---------|
 | `max_transform_depth` | 3 | Maximum decode chain length |

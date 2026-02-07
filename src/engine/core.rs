@@ -1481,6 +1481,7 @@ impl Engine {
     ///
     /// # Panics
     /// Panics if `idx >= self.transforms.len()`.
+    #[allow(dead_code)] // Used by sim_scanner for finding provenance tracking
     pub(crate) fn transform_id(&self, idx: usize) -> TransformId {
         self.transforms[idx].id
     }

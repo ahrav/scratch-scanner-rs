@@ -532,6 +532,7 @@ impl ScanScratch {
     ///
     /// After the first successful call, capacity validation is skipped because
     /// `Engine` is immutable after construction — all checks are idempotent.
+    #[allow(dead_code)] // Standalone reset entry point for external scratch consumers
     pub(super) fn reset_for_scan(&mut self, engine: &Engine) {
         // ── Per-scan state clears (must always run) ──────────────────────
         self.out.clear();
@@ -950,6 +951,7 @@ impl ScanScratch {
     /// Materialize decode steps for a finding into the scratch buffer.
     ///
     /// The returned slice is valid until the next call that materializes steps.
+    #[allow(dead_code)] // Used by sim_scanner for finding provenance tracking
     pub(crate) fn materialize_decode_steps(&mut self, step_id: StepId) -> &[DecodeStep] {
         self.step_arena.materialize(step_id, &mut self.steps_buf);
         self.steps_buf.as_slice()
@@ -1021,6 +1023,7 @@ impl ScanScratch {
     }
 
     /// Returns the drop-boundary offsets aligned 1:1 with [`findings()`].
+    #[allow(dead_code)] // Used by sim_scanner for overlap deduplication
     pub(crate) fn drop_hint_end(&self) -> &[u64] {
         self.drop_hint_end.as_slice()
     }
@@ -1051,6 +1054,7 @@ impl ScanScratch {
     }
 
     /// Records a finding using `root_hint_end` as the default drop boundary.
+    #[allow(dead_code)] // Convenience wrapper for push_finding_with_drop_hint
     pub(super) fn push_finding(&mut self, rec: FindingRec, norm_hash: NormHash) {
         self.push_finding_with_drop_hint(rec, norm_hash, rec.root_hint_end, rec.dedupe_with_span);
     }

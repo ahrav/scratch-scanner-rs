@@ -90,8 +90,6 @@ scratch vectors.
 
 Git scanning still retains per-run metadata required for deterministic
 finalize/persist (`ScannedBlobs`), but finding emission to stdout is streamed.
-See [`scanner-unification.md`](scanner-unification.md).
-
 ---
 
 ## Git Tree Loading Budgets

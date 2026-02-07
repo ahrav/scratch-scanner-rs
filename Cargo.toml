@@ -59,6 +59,7 @@ io-uring = []  # Enable io_uring scanner on Linux
 scheduler-sim = []  # Enable longer-running scheduler simulation tests
 rocksdb = ["dep:rocksdb"]
 git-perf = ["perf-stats"]  # Git pack-exec timing probes (implies perf-stats)
+real-rules-harness = []  # Real-ruleset regression harness (simulation test)
 
 [dev-dependencies]
 base64 = "0.22"
@@ -147,6 +148,14 @@ harness = false
 
 [[bench]]
 name = "throughput_comparison"
+harness = false
+
+[[bench]]
+name = "regex_complexity"
+harness = false
+
+[[bench]]
+name = "rule_isolation"
 harness = false
 
 [profile.dev]

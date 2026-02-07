@@ -158,9 +158,6 @@ outputs are now emitted as structured events:
   performs both file I/O and scanning with worker-local scratch.
 - Git path: `EngineAdapter` emits `ScanEvent::Finding` during blob scanning.
 
-See [`scanner-unification.md`](scanner-unification.md) for entrypoint and
-orchestration details.
-
 ## Git Tree Diff Streaming
 
 Git tree diffing now uses a streaming entry parser for spill-backed or large

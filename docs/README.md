@@ -25,6 +25,7 @@ Documentation index for the scanner-rs secret scanning engine. This guide helps 
 | [architecture.md](architecture.md) | Data flow | Walker→Reader→Scanner→Output, transform worklist |
 | [pipeline-flow.md](pipeline-flow.md) | 4-stage cooperative pipeline | Ring buffers, backpressure, RAII |
 | [pipeline-state-machine.md](pipeline-state-machine.md) | State transitions & termination | Reverse pump order, stall detection |
+| [git-scanning.md](git-scanning.md) | End-to-end Git scanning pipeline | Pipeline stages, persistence contract, ODB-blob mode |
 
 #### Detection Engine
 | Document | Focus | Key Concepts |
@@ -82,6 +83,16 @@ Documentation index for the scanner-rs secret scanning engine. This guide helps 
 |----------|-------|--------------|
 | [memory-management.md](memory-management.md) | Buffer lifecycle & pools | BufferPool, RAII, 8MiB fixed buffers sized from pool byte targets, DecodeSlab, ScanScratch |
 | [kani-verification.md](kani-verification.md) | Formal verification | Kani model checking for TimingWheel (8 proofs), Bitset2 (5 proofs) |
+
+---
+
+### 6. Testing Harnesses
+
+| Document | Focus | Key Concepts |
+|----------|-------|--------------|
+| [scanner_harness_modes.md](scanner_harness_modes.md) | Mode 1 (synthetic stress) vs Mode 2 (real ruleset) | Test strategy overview |
+| [real_rules_harness_plan.md](real_rules_harness_plan.md) | Real-ruleset baseline snapshot approach | Baseline workflow, normalization |
+| [real_rules_fixture_design.md](real_rules_fixture_design.md) | Fixture corpus design | Coverage axes, rule families |
 
 ---
 
