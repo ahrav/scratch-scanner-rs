@@ -142,5 +142,4 @@ cases before adding them to the corpus.
 ## Related Docs
 
 - `docs/architecture-overview.md`
-- `docs/git_simulation_tester_design.md`
 - `docs/scanner_test_harness_guide.md`

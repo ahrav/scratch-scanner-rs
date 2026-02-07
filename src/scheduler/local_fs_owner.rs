@@ -1,4 +1,4 @@
-//! Local Filesystem Scanner
+//! Canonical Local Filesystem Scanner
 //!
 //! # Architecture
 //!
@@ -6,6 +6,12 @@
 //! - Uses `LocalFirst` buffer pool policy (same thread acquires and releases)
 //! - Sequential reads with overlap carry (no seeks, no re-reading overlap)
 //! - Discovery thread enqueues files; workers process entire files
+//!
+//! # Module Role
+//!
+//! This is the single local-filesystem scan path used by the scheduler. The
+//! module name is retained for historical reasons, but all local scan entry
+//! points (`scan_local`, `LocalConfig`, `LocalFile`) live here.
 //!
 //! # Why Blocking Reads First?
 //!
@@ -2209,6 +2215,9 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
     }
 
     // Open file
+    #[cfg(all(feature = "perf-stats", debug_assertions))]
+    let open_start = std::time::Instant::now();
+
     let mut file = match File::open(&task.path) {
         Ok(f) => f,
         Err(e) => {
@@ -2234,6 +2243,14 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
             return;
         }
     };
+
+    #[cfg(all(feature = "perf-stats", debug_assertions))]
+    {
+        ctx.metrics.open_stat_ns = ctx
+            .metrics
+            .open_stat_ns
+            .saturating_add(open_start.elapsed().as_nanos() as u64);
+    }
 
     // Empty file: nothing to scan
     if file_size == 0 {
@@ -2314,6 +2331,9 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
         let read_max = chunk_size.min(buf.len() - carry).min(remaining_in_snapshot);
         let dst = &mut buf.as_mut_slice()[read_start..read_start + read_max];
 
+        #[cfg(all(feature = "perf-stats", debug_assertions))]
+        let read_start_t = std::time::Instant::now();
+
         let n = match read_some(&mut file, dst) {
             Ok(n) => n,
             Err(e) => {
@@ -2325,6 +2345,14 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
                 break;
             }
         };
+
+        #[cfg(all(feature = "perf-stats", debug_assertions))]
+        {
+            ctx.metrics.read_ns = ctx
+                .metrics
+                .read_ns
+                .saturating_add(read_start_t.elapsed().as_nanos() as u64);
+        }
 
         // EOF: done with this file
         if n == 0 {
@@ -2340,8 +2368,19 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
         let base_offset = offset.saturating_sub(carry as u64);
 
         // Scan the chunk
+        #[cfg(all(feature = "perf-stats", debug_assertions))]
+        let scan_start_t = std::time::Instant::now();
+
         let data = &buf.as_slice()[..read_len];
         engine.scan_chunk_into(data, task.file_id, base_offset, &mut scratch.scan_scratch);
+
+        #[cfg(all(feature = "perf-stats", debug_assertions))]
+        {
+            ctx.metrics.scan_ns = ctx
+                .metrics
+                .scan_ns
+                .saturating_add(scan_start_t.elapsed().as_nanos() as u64);
+        }
 
         // Drop findings whose root_hint_end is in the prefix region.
         // These will be (or were) found by the chunk that "owns" those bytes.
@@ -2642,7 +2681,7 @@ where
 mod tests {
     use super::*;
     use crate::archive::PartialReason;
-    use crate::scheduler::engine_stub::{MockEngine, MockRule};
+    use crate::scheduler::engine_stub::{FindingRec, MockEngine, MockRule, RuleId};
     use crate::unified::events::VecEventSink;
     use std::fs;
     use std::io::Write;
@@ -2968,6 +3007,211 @@ mod tests {
         assert!(
             output_str.contains("secret"),
             "expected finding for archive extension when disabled; output: {output_str}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // dedupe_findings unit tests
+    // ---------------------------------------------------------------
+
+    fn finding(rule: u16, start: u64, end: u64) -> FindingRec {
+        FindingRec {
+            rule_id: RuleId(rule),
+            root_hint_start: start,
+            root_hint_end: end,
+            span_start: start,
+            span_end: end,
+        }
+    }
+
+    #[test]
+    fn dedupe_empty_vec() {
+        let mut v: Vec<FindingRec> = Vec::new();
+        dedupe_findings(&mut v);
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn dedupe_single_element() {
+        let mut v = vec![finding(0, 10, 16)];
+        dedupe_findings(&mut v);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].root_hint_start, 10);
+    }
+
+    #[test]
+    fn dedupe_removes_exact_duplicates() {
+        let mut v = vec![
+            finding(0, 10, 16),
+            finding(0, 10, 16), // dup
+            finding(1, 20, 28),
+            finding(1, 20, 28), // dup
+            finding(2, 50, 56),
+        ];
+        dedupe_findings(&mut v);
+        assert_eq!(v.len(), 3);
+    }
+
+    #[test]
+    fn dedupe_preserves_different_rules_same_offsets() {
+        let mut v = vec![finding(0, 10, 16), finding(1, 10, 16), finding(2, 10, 16)];
+        dedupe_findings(&mut v);
+        assert_eq!(v.len(), 3, "distinct rule_ids should all be kept");
+    }
+
+    #[test]
+    fn dedupe_preserves_same_rule_different_offsets() {
+        let mut v = vec![finding(0, 10, 16), finding(0, 20, 26), finding(0, 30, 36)];
+        dedupe_findings(&mut v);
+        assert_eq!(v.len(), 3, "distinct offsets should all be kept");
+    }
+
+    // ---------------------------------------------------------------
+    // scan_local: overlap dedup, exact-size, multi-secret, reuse
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn overlap_dedup_no_double_report() {
+        // Place SECRET so it falls entirely within the overlap region between
+        // chunk 1 and chunk 2. With chunk_size=64 and overlap=16, SECRET at
+        // offset 50 spans [50..56]. In chunk 2 (overlap carry from [48..64]),
+        // drop_prefix_findings(64) drops it since root_hint_end=56 < 64.
+        let engine = Arc::new(test_engine());
+        let sink = Arc::new(VecEventSink::new());
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        let mut data = vec![b'x'; 50];
+        data.extend_from_slice(b"SECRET");
+        data.extend_from_slice(&[b'y'; 100]); // ensure >1 chunk
+        tmp.write_all(&data).unwrap();
+        tmp.flush().unwrap();
+
+        let path = tmp.path().to_path_buf();
+        let size = tmp.as_file().metadata().unwrap().len();
+
+        let source = VecFileSource::new(vec![LocalFile { path, size }]);
+        let report = scan_local(engine, source, small_config_with_sink(sink.clone()));
+
+        assert!(report.metrics.chunks_scanned >= 2);
+        let output = sink.take();
+        let output_str = String::from_utf8_lossy(&output);
+        let count = output_str.matches("secret").count();
+        assert_eq!(
+            count, 1,
+            "SECRET in overlap region must be reported exactly once, got {count}: {output_str}"
+        );
+    }
+
+    #[test]
+    fn file_exactly_chunk_size() {
+        // File of exactly chunk_size bytes should be scanned in one chunk.
+        let engine = Arc::new(test_engine());
+        let sink = Arc::new(VecEventSink::new());
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        // chunk_size=64 in small_config; place SECRET in the middle.
+        let mut data = vec![b'x'; 20];
+        data.extend_from_slice(b"SECRET");
+        data.resize(64, b'z');
+        tmp.write_all(&data).unwrap();
+        tmp.flush().unwrap();
+
+        let path = tmp.path().to_path_buf();
+        let size = tmp.as_file().metadata().unwrap().len();
+
+        let source = VecFileSource::new(vec![LocalFile { path, size }]);
+        let report = scan_local(engine, source, small_config_with_sink(sink.clone()));
+
+        assert_eq!(report.metrics.chunks_scanned, 1);
+        let output = sink.take();
+        let output_str = String::from_utf8_lossy(&output);
+        assert_eq!(
+            output_str.matches("secret").count(),
+            1,
+            "single chunk should find SECRET"
+        );
+    }
+
+    #[test]
+    fn multiple_secrets_across_chunks_in_one_file() {
+        // One file spanning 3+ chunks, each containing a SECRET well away
+        // from overlap boundaries.
+        let engine = Arc::new(test_engine());
+        let sink = Arc::new(VecEventSink::new());
+
+        // chunk_size=64, overlap=16.
+        // Place SECRETs at offsets 4, 100, and 196 — each solidly within
+        // the "new bytes" region of their respective chunks.
+        let mut tmp = NamedTempFile::new().unwrap();
+        let mut data = vec![b'A'; 4];
+        data.extend_from_slice(b"SECRET"); // offset 4..10
+        data.resize(100, b'B');
+        data.extend_from_slice(b"SECRET"); // offset 100..106
+        data.resize(196, b'C');
+        data.extend_from_slice(b"SECRET"); // offset 196..202
+        data.resize(256, b'D'); // ensure 3+ chunks
+        tmp.write_all(&data).unwrap();
+        tmp.flush().unwrap();
+
+        let path = tmp.path().to_path_buf();
+        let size = tmp.as_file().metadata().unwrap().len();
+
+        let source = VecFileSource::new(vec![LocalFile { path, size }]);
+        let report = scan_local(engine, source, small_config_with_sink(sink.clone()));
+
+        assert!(
+            report.metrics.chunks_scanned >= 3,
+            "need at least 3 chunks, got {}",
+            report.metrics.chunks_scanned
+        );
+        let output = sink.take();
+        let output_str = String::from_utf8_lossy(&output);
+        let count = output_str.matches("secret").count();
+        assert_eq!(
+            count, 3,
+            "each SECRET in its own chunk region should be found; got {count}: {output_str}"
+        );
+    }
+
+    #[test]
+    fn two_files_no_cross_contamination() {
+        // Scan two files back-to-back and verify findings are correct for each.
+        // Tests that per-worker scratch is properly cleared between files.
+        let engine = Arc::new(test_engine());
+        let sink = Arc::new(VecEventSink::new());
+
+        let dir = TempDir::new().unwrap();
+        let p1 = dir.path().join("first.txt");
+        let p2 = dir.path().join("second.txt");
+        fs::write(&p1, b"first SECRET here").unwrap();
+        fs::write(&p2, b"second PASSWORD there").unwrap();
+
+        let s1 = fs::metadata(&p1).unwrap().len();
+        let s2 = fs::metadata(&p2).unwrap().len();
+        let files = vec![
+            LocalFile { path: p1, size: s1 },
+            LocalFile { path: p2, size: s2 },
+        ];
+
+        let source = VecFileSource::new(files);
+        let cfg = LocalConfig {
+            workers: 1,
+            ..small_config_with_sink(sink.clone())
+        };
+        let report = scan_local(engine, source, cfg);
+
+        assert_eq!(report.stats.files_enqueued, 2);
+        let output = sink.take();
+        let output_str = String::from_utf8_lossy(&output);
+        assert_eq!(
+            output_str.matches("secret").count(),
+            1,
+            "first file's SECRET"
+        );
+        assert_eq!(
+            output_str.matches("password").count(),
+            1,
+            "second file's PASSWORD"
         );
     }
 }

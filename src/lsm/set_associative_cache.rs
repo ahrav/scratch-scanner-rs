@@ -989,6 +989,7 @@ where
     }
 
     /// Compresses a byte-wise movemask into one bit per u16 lane.
+    #[allow(dead_code)] // Used by upcoming streaming dedupe stage
     #[inline(always)]
     fn compress_u16_mask(mask: u16) -> u16 {
         // Keep even bits (lane LSBs), then pack them into the low 8 bits.

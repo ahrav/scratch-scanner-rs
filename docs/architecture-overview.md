@@ -24,7 +24,7 @@ graph TB
     end
 
     subgraph Memory["Memory Management"]
-        BufferPool["BufferPool<br/>2MB Buffer Pool"]
+        BufferPool["BufferPool<br/>8MiB Buffer Pool"]
         NodePool["NodePoolType<br/>Pre-allocated Buffers"]
         DecodeSlab["DecodeSlab<br/>Decoded Output Storage"]
     end
@@ -84,10 +84,12 @@ graph TB
 | **Unified CLI**     | `src/unified/cli.rs`           | Subcommand parser for `scan fs|git` and source-specific flags        |
 | **Unified Orchestrator** | `src/unified/orchestrator.rs` | Dispatches sources and wires structured event sinks               |
 | **Unified Events**  | `src/unified/events.rs`        | Structured `ScanEvent` model and JSONL sink                          |
+| **FS Owner-Compute Scheduler** | `src/scheduler/local_fs_owner.rs` | Round-robin file dispatch with per-worker owned I/O+scan state |
 | **Engine**          | `src/engine/core.rs:154`       | Compiled scanning engine with anchor patterns, rules, and transforms |
 | **RuleSpec**        | `src/api.rs:519`               | Rule definitions and specification for rule-based scanning           |
 | **RuleCompiled**    | `src/engine/rule_repr.rs:268`  | Compiled rule representation with hot data and validation gates      |
 | **Vectorscan**      | `vectorscan-rs-sys` crate      | Multi-pattern anchor prefilter (raw + UTF-16 variants)               |
+| **Vectorscan DB Cache** | `src/engine/vectorscan_prefilter.rs` | Best-effort on-disk cache for serialized prefilter/stream DBs |
 | **TransformConfig** | `src/api.rs:132`               | Transform stage configuration (URL percent, Base64)                  |
 | **Pipeline**        | `src/pipeline.rs`              | 4-stage cooperative pipeline coordinator                             |
 | **Archive Core**    | `src/archive/` (`scan.rs`, `budget.rs`, `path.rs`, `formats/*`) | Archive scanning config, budgets, outcomes, path canonicalization, and sink-driven scan core |

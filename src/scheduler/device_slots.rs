@@ -471,6 +471,7 @@ impl DeviceSlots {
 #[derive(Debug)]
 #[must_use = "DeviceSlotPermit releases on drop; not holding it defeats fairness"]
 pub struct DeviceSlotPermit {
+    #[allow(dead_code)] // Used by upcoming remote scanning pipeline
     inner: CountPermit,
     device: DeviceId,
 }

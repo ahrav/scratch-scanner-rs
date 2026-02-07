@@ -160,7 +160,6 @@ pub struct EngineAdapter<'a> {
     engine: &'a Engine,
     scratch: ScanScratch,
     overlap: usize,
-    chunk_bytes: usize,
     results: Vec<ScannedBlob>,
     findings_arena: Vec<FindingKey>,
     findings_buf: Vec<FindingKey>,
@@ -199,7 +198,6 @@ impl<'a> EngineAdapter<'a> {
             engine,
             scratch: engine.new_scratch(),
             overlap,
-            chunk_bytes,
             results: Vec::new(),
             findings_arena: Vec::new(),
             findings_buf: Vec::with_capacity(64),
@@ -713,11 +711,10 @@ impl RingChunker {
 
 // Compile-time assertion: EngineAdapter must be Send so it can be pooled
 // across scoped thread boundaries (same pattern as PackCache/PackExecScratch).
-#[cfg(test)]
 const _: () = {
-    fn assert_send<T: Send>() {}
-    fn check() {
-        assert_send::<super::EngineAdapter<'_>>();
+    fn _assert_send<T: Send>() {}
+    fn _check() {
+        _assert_send::<super::EngineAdapter<'_>>();
     }
 };
 

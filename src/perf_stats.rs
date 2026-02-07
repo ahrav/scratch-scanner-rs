@@ -10,9 +10,6 @@
 //!
 //! * **`sat_add_*`** — most counters: clamping at `MAX` is safer than silent
 //!   wrap-around for values displayed to operators.
-//! * **`wrap_add_u64`** — finding counts that are later differenced
-//!   (`after - before`), where wrapping arithmetic produces the correct delta
-//!   even on overflow.
 //! * **`max_*`** — high-water-mark tracking (peak in-flight bytes, max depth).
 //! * **`set_*`** — final-value assignment (e.g. total op counts known after a
 //!   batch completes).
@@ -49,36 +46,6 @@ pub fn sat_add_usize(counter: &mut usize, delta: usize) {
     #[cfg(all(feature = "perf-stats", debug_assertions))]
     {
         *counter = counter.saturating_add(delta);
-    }
-    #[cfg(not(all(feature = "perf-stats", debug_assertions)))]
-    {
-        let _ = (counter, delta);
-    }
-}
-
-/// Saturating add for a `u16` counter.
-#[inline(always)]
-pub fn sat_add_u16(counter: &mut u16, delta: u16) {
-    #[cfg(all(feature = "perf-stats", debug_assertions))]
-    {
-        *counter = counter.saturating_add(delta);
-    }
-    #[cfg(not(all(feature = "perf-stats", debug_assertions)))]
-    {
-        let _ = (counter, delta);
-    }
-}
-
-/// Wrapping add for a `u64` counter.
-///
-/// Use for counters where overflow is expected or where the consumer
-/// computes deltas (`after.wrapping_sub(before)`) that remain correct
-/// under wrap-around (e.g. cumulative finding counts).
-#[inline(always)]
-pub fn wrap_add_u64(counter: &mut u64, delta: u64) {
-    #[cfg(all(feature = "perf-stats", debug_assertions))]
-    {
-        *counter = counter.wrapping_add(delta);
     }
     #[cfg(not(all(feature = "perf-stats", debug_assertions)))]
     {

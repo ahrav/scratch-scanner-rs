@@ -97,7 +97,6 @@ classDiagram
         +usize max_work_items
         +usize max_findings_per_chunk
         +bool scan_utf16_variants
-        +RawPrefilterMode raw_prefilter_mode
     }
 
     class ScanScratch {

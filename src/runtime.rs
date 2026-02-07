@@ -164,16 +164,6 @@ impl FileTable {
         self.push_span(span, size, dev_inode, flags)
     }
 
-    /// Attempts to reserve space for path bytes and returns a span (Unix only).
-    ///
-    /// This is the non-panicking variant used by archive expansion.
-    /// Returns `None` if the path arena would overflow or if spans would
-    /// not fit in `u32`.
-    #[cfg(unix)]
-    pub(crate) fn try_push_path_bytes(&mut self, bytes: &[u8]) -> Option<PathSpan> {
-        self.try_alloc_path_span(bytes)
-    }
-
     /// Reserves space for a path and returns its span (Unix only).
     ///
     /// Bytes are appended verbatim to the arena (no separators inserted).
@@ -218,59 +208,6 @@ impl FileTable {
             offset: start as u32,
             len: bytes.len() as u32,
         })
-    }
-
-    /// Appends `parent` + "/" + `name` into the path arena (Unix only).
-    ///
-    /// This mirrors `Path::join` without normalization: it inserts a `/` only
-    /// when `parent` is non-empty and does not already end with `/`.
-    /// Panics if the arena would overflow.
-    ///
-    /// # Panics
-    /// Panics if `parent` does not refer to bytes inside this arena or if the
-    /// arena would overflow.
-    #[cfg(unix)]
-    pub(crate) fn join_path_span(&mut self, parent: PathSpan, name: &[u8]) -> PathSpan {
-        let parent_start = parent.offset as usize;
-        let parent_len = parent.len as usize;
-        assert!(
-            parent_start.saturating_add(parent_len) <= self.path_bytes.len(),
-            "parent path span out of bounds"
-        );
-
-        let need_sep = if parent_len == 0 {
-            false
-        } else {
-            let last = *self
-                .path_bytes
-                .get(parent_start + parent_len - 1)
-                .expect("parent path span empty");
-            last != b'/'
-        };
-
-        let start = self.path_bytes.len();
-        let extra = if need_sep { 1 } else { 0 };
-        let new_len = start
-            .saturating_add(parent_len)
-            .saturating_add(extra)
-            .saturating_add(name.len());
-        assert!(
-            new_len <= self.path_bytes.capacity(),
-            "path arena exhausted"
-        );
-        assert!(new_len <= u32::MAX as usize, "path bytes overflow u32");
-
-        self.path_bytes
-            .extend_from_self_range(parent_start, parent_len);
-        if need_sep {
-            self.path_bytes.push(b'/');
-        }
-        self.path_bytes.extend_from_slice(name);
-
-        PathSpan {
-            offset: start as u32,
-            len: (parent_len + extra + name.len()) as u32,
-        }
     }
 
     /// Inserts a new file record using a previously allocated span (Unix only).
@@ -893,13 +830,6 @@ impl ScannerRuntime {
 #[cfg(all(test, unix))]
 mod tests_filetable_try {
     use super::*;
-
-    #[test]
-    fn try_push_path_bytes_respects_arena_budget() {
-        let mut t = FileTable::with_capacity_and_path_bytes(1, 4);
-        assert!(t.try_push_path_bytes(b"abcd").is_some());
-        assert!(t.try_push_path_bytes(b"e").is_none());
-    }
 
     #[test]
     fn try_insert_virtual_respects_file_capacity() {

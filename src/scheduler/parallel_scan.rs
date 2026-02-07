@@ -1,7 +1,7 @@
 //! High-Level Parallel Filesystem Scanning API
 //!
 //! This module provides a batteries-included entry point for parallel filesystem
-//! scanning. It wraps the lower-level [`local`](super::local) scheduler with
+//! scanning. It wraps the lower-level [`local`](super::local_fs_owner) scheduler with
 //! streaming directory walking, gitignore support, and sensible defaults.
 //!
 //! # Architecture
@@ -14,12 +14,12 @@
 //!                    ┌─────────────────────────────┴─────────────────────────────┐
 //!                    ▼                                                           ▼
 //!          ┌─────────────────────┐                                    ┌──────────────────┐
-//!          │     DirWalker       │                                    │  LocalConfig     │
-//!          │ (streaming via      │                                    │  (from config)   │
-//!          │  bounded channel)   │                                    └────────┬─────────┘
+//!          │    IterWalker       │                                    │  LocalConfig     │
+//!          │ (inline iterator,   │                                    │  (from config)   │
+//!          │  single-threaded)   │                                    └────────┬─────────┘
 //!          └─────────┬───────────┘                                             │
 //!                    │                                                         │
-//!                    │ LocalFile (streamed)                                    │
+//!                    │ LocalFile (on demand)                                   │
 //!                    └────────────────────┬────────────────────────────────────┘
 //!                                         │
 //!                                         ▼
@@ -86,7 +86,7 @@
 //! Peak memory ≈ `pool_buffers × (chunk_size + overlap)` + file metadata overhead.
 //! With defaults (workers=N, pool=4N, chunk=256K, overlap≈256): ~1 MiB per worker.
 
-use super::local::{scan_local, FileSource, LocalConfig, LocalFile, LocalReport};
+use super::local_fs_owner::{scan_local, FileSource, LocalConfig, LocalFile, LocalReport};
 use crate::archive::ArchiveConfig;
 use crate::engine::Engine;
 
@@ -96,7 +96,7 @@ use std::sync::Arc;
 
 /// Minimal entry adapter so discovery classification can be unit-tested.
 ///
-/// This keeps the DirWalker logic centralized while letting tests inject
+/// This keeps the IterWalker logic centralized while letting tests inject
 /// `file_type()`-missing cases without depending on platform-specific behavior.
 trait EntryLike {
     fn file_type(&self) -> Option<std::fs::FileType>;
@@ -136,7 +136,7 @@ impl EntryLike for ignore::DirEntry {
 /// on platforms that do not supply file type in directory entries.
 ///
 /// Discovery avoids per-file metadata when a type hint is available. Size caps
-/// are enforced at open time in `local.rs`.
+/// are enforced at open time in `local_fs_owner.rs`.
 ///
 /// When the fast type hint path is used, the file size is set to 0; open-time
 /// metadata determines the actual size and enforcement.
@@ -160,7 +160,7 @@ fn local_file_from_entry<E: EntryLike>(entry: E) -> Option<LocalFile> {
         Ok(meta) => meta,
         Err(_e) => {
             #[cfg(debug_assertions)]
-            eprintln!("[DirWalker] Metadata error for {:?}: {}", entry.path(), _e);
+            eprintln!("[IterWalker] Metadata error for {:?}: {}", entry.path(), _e);
             return None;
         }
     };
@@ -183,7 +183,7 @@ fn local_file_from_entry<E: EntryLike>(entry: E) -> Option<LocalFile> {
 ///
 /// This struct combines directory walking options (gitignore, symlinks, etc.)
 /// with scheduler tuning parameters. Internally, scheduler parameters are
-/// converted to [`LocalConfig`](super::local::LocalConfig) for the executor.
+/// converted to [`LocalConfig`](super::local_fs_owner::LocalConfig) for the executor.
 ///
 /// # Defaults
 ///
@@ -324,7 +324,7 @@ impl std::fmt::Debug for ParallelScanConfig {
 }
 
 impl ParallelScanConfig {
-    /// Convert to [`LocalConfig`](super::local::LocalConfig) for the scheduler.
+    /// Convert to [`LocalConfig`](super::local_fs_owner::LocalConfig) for the scheduler.
     ///
     /// This extracts only the scheduler-relevant parameters; directory walking
     /// options (`follow_symlinks`, `skip_hidden`, `respect_gitignore`) are handled
@@ -359,93 +359,65 @@ pub type ParallelScanReport = LocalReport;
 // Directory Walker File Source
 // ============================================================================
 
-/// File source that walks a directory tree using parallel discovery.
+/// File source that walks a directory tree using a single-threaded iterator.
 ///
 /// # Design
 ///
-/// Uses `ignore::WalkParallel` for multi-threaded directory traversal, sending
-/// discovered files through a bounded channel. This allows discovery to run
-/// ahead of scanning (up to `max_in_flight_objects` files).
+/// Uses `ignore::Walk` (single-threaded DFS iterator) instead of the parallel
+/// walker. Discovery happens inline on the caller thread — each call to
+/// `next_file()` advances the iterator until a file entry is found.
 ///
-/// # Why Streaming Matters
+/// Scanning remains parallel via the work-stealing executor in `scan_local()`.
+/// This gives a simpler thread model: **one caller thread does discovery,
+/// N executor threads do file I/O + scanning**.
 ///
-/// For very large directory trees (millions of files), collecting upfront:
-/// - Delays scan start until discovery completes
-/// - Uses memory for all file paths simultaneously
+/// # Why Single-Threaded Discovery
 ///
-/// Streaming discovery allows scanning to begin immediately and bounds
-/// path metadata memory to `max_in_flight_objects`.
+/// The parallel walker (`WalkParallel`) parallelizes at the directory level,
+/// which fails pathologically for large flat directories — a single directory
+/// with 100K files gets walked by one thread while other walker threads sit
+/// idle. The single-threaded iterator avoids this issue and removes the need
+/// for a crossbeam channel + background thread.
 ///
-/// # Thread Lifecycle
+/// # Backpressure
 ///
-/// The walker thread runs until:
-/// - Discovery completes (all files enumerated)
-/// - The receiver is dropped (scanner finished or errored) - walker quits early
-struct DirWalker {
-    /// Channel receiving discovered files from the walker thread.
-    receiver: crossbeam_channel::Receiver<LocalFile>,
+/// With the previous `DirWalker`, backpressure was applied by both the bounded
+/// channel capacity and `CountBudget`. Now only `CountBudget` (in `scan_local`)
+/// limits how far ahead discovery can get, providing a single, exact bound.
+struct IterWalker {
+    walk: ignore::Walk,
 }
 
-impl DirWalker {
-    /// Create a new directory walker.
-    ///
-    /// Spawns a background thread that walks the directory tree and sends
-    /// files through a bounded channel. The channel capacity matches
-    /// `config.max_in_flight_objects` to provide backpressure.
-    ///
-    /// # Thread Lifecycle
-    ///
-    /// The walker thread runs until:
-    /// - Discovery completes (all files enumerated)
-    /// - The receiver is dropped (scanner finished or errored) - sends fail, walker quits
-    ///
-    /// The thread is detached (not joined), so it will be terminated when
-    /// the process exits even if discovery is incomplete.
+impl IterWalker {
     fn new(root: &Path, config: &ParallelScanConfig) -> Self {
         let mut builder = ignore::WalkBuilder::new(root);
-
         builder
             .follow_links(config.follow_symlinks)
             .hidden(config.skip_hidden)
             .git_ignore(config.respect_gitignore)
             .git_global(config.respect_gitignore)
             .git_exclude(config.respect_gitignore);
-
-        // Use parallel walker for faster discovery
-        let walker = builder.build_parallel();
-
-        let (sender, receiver) = crossbeam_channel::bounded(config.max_in_flight_objects);
-        // Spawn walker thread
-        std::thread::spawn(move || {
-            walker.run(|| {
-                let sender = sender.clone();
-                Box::new(move |result| {
-                    match result {
-                        Ok(entry) => {
-                            if let Some(file) = local_file_from_entry(entry) {
-                                // Stop walking if receiver dropped (scanner finished)
-                                if sender.send(file).is_err() {
-                                    return ignore::WalkState::Quit;
-                                }
-                            }
-                        }
-                        Err(_e) => {
-                            #[cfg(debug_assertions)]
-                            eprintln!("[DirWalker] Discovery error: {}", _e);
-                        }
-                    }
-                    ignore::WalkState::Continue
-                })
-            });
-        });
-
-        Self { receiver }
+        Self {
+            walk: builder.build(),
+        }
     }
 }
 
-impl FileSource for DirWalker {
+impl FileSource for IterWalker {
     fn next_file(&mut self) -> Option<LocalFile> {
-        self.receiver.recv().ok()
+        loop {
+            match self.walk.next()? {
+                Ok(entry) => {
+                    if let Some(file) = local_file_from_entry(entry) {
+                        return Some(file);
+                    }
+                }
+                Err(_e) => {
+                    #[cfg(debug_assertions)]
+                    eprintln!("[IterWalker] Discovery error: {}", _e);
+                }
+            }
+        }
     }
 }
 
@@ -469,17 +441,16 @@ impl FileSource for SingleFileSource {
 ///
 /// This is the main entry point for filesystem scanning. It:
 /// 1. Validates the root path exists and is accessible
-/// 2. Streams files via `DirWalker` (respecting gitignore, size limits, etc.)
+/// 2. Discovers files via `IterWalker` (respecting gitignore, size limits, etc.)
 /// 3. Scans files in parallel using the work-stealing executor
 /// 4. Returns statistics and metrics
 ///
-/// # Streaming Discovery
+/// # Inline Discovery
 ///
-/// Unlike implementations that collect all files upfront, this uses streaming
-/// discovery via `DirWalker`. Benefits:
-/// - Scanning starts immediately (doesn't wait for full directory enumeration)
-/// - Bounded memory: only `max_in_flight_objects` file paths in memory at once
-/// - ~1000x memory reduction for large scans (1M files: 200KB vs 200MB)
+/// File discovery uses a single-threaded `IterWalker` that runs inline on
+/// the caller thread. The executor's `CountBudget` bounds how far ahead
+/// discovery can get, keeping path metadata memory proportional to the
+/// number of in-flight files rather than the total file count.
 ///
 /// # Arguments
 ///
@@ -539,7 +510,7 @@ pub fn parallel_scan_dir(
         ));
     }
 
-    // Handle single-file case: don't use DirWalker for one file
+    // Handle single-file case: don't use IterWalker for one file
     if root.is_file() {
         return scan_single_file(root, engine, &config);
     }
@@ -552,8 +523,7 @@ pub fn parallel_scan_dir(
         )
     })?;
 
-    // Create streaming walker (returns immediately, spawns background thread)
-    let walker = DirWalker::new(root, &config);
+    let walker = IterWalker::new(root, &config);
 
     let local_config = config.to_local_config();
     Ok(scan_local(engine, walker, local_config))
@@ -570,7 +540,7 @@ fn scan_single_file(
     let meta = std::fs::metadata(path)?;
     let size = meta.len();
 
-    // Size is only a discovery hint here; open-time enforcement happens in local.rs.
+    // Size is only a discovery hint here; open-time enforcement happens in local_fs_owner.rs.
     let file = LocalFile {
         path: path.to_path_buf(),
         size,

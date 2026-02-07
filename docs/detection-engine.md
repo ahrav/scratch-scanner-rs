@@ -105,6 +105,16 @@ Each anchor is stored in three variants:
 - **UTF-16LE**: Little-endian encoding (e.g., `g\0h\0p\0_\0`)
 - **UTF-16BE**: Big-endian encoding (e.g., `\0g\0h\0p\0_`)
 
+### Vectorscan Startup Cache
+
+Engine startup can reuse serialized Vectorscan databases for the raw prefilter
+and decoded-stream prefilter paths. Cache lookups are keyed by compile mode,
+platform fingerprint, Vectorscan version, and exact pattern inputs.
+
+- `SCANNER_VS_DB_CACHE=0|false|off|no` disables cache use.
+- `SCANNER_VS_DB_CACHE_DIR=/path` overrides cache location.
+- Cache misses/failures fall back to normal compile (no behavior change).
+
 ### Window Building
 
 Windows are accumulated per (rule, variant) pair:
@@ -143,11 +153,10 @@ chunking invariance without re-materializing full blobs in the scanner.
 Detection semantics are unchanged by unified CLI routing. The same engine
 outputs are now emitted as structured events:
 
-- Filesystem path: findings are emitted via `EventSink` from scheduler workers.
+- Filesystem path: findings are emitted via `EventSink` from owner-compute
+  scheduler workers (`src/scheduler/local_fs_owner.rs`), where each worker
+  performs both file I/O and scanning with worker-local scratch.
 - Git path: `EngineAdapter` emits `ScanEvent::Finding` during blob scanning.
-
-See [`scanner-unification.md`](scanner-unification.md) for entrypoint and
-orchestration details.
 
 ## Git Tree Diff Streaming
 
@@ -290,7 +299,6 @@ These gates are designed to be **local and bounded**:
 | `max_work_items` | 256 | Cap on queued decode work items per scan |
 | `max_findings_per_chunk` | 8192 | Hard cap on findings per chunk |
 | `scan_utf16_variants` | true | Enable UTF-16 anchor variants |
-| `raw_prefilter_mode` | `RegexAndAnchors` | Raw prefilter policy (regex+anchors vs anchor-only for anchored rules) |
 
 Derived (non-config) limits used by streaming decode:
 - `pending_window_horizon_bytes = max_window_radius + STREAM_DECODE_CHUNK_BYTES`

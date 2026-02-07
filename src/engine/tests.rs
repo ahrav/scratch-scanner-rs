@@ -2073,6 +2073,7 @@ struct TokenCase {
 
 #[derive(Clone, Debug)]
 struct InputCase {
+    #[allow(dead_code)] // Retained for Debug output in test failures.
     rule_name: &'static str,
     buf: Vec<u8>,
 }

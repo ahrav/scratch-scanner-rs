@@ -49,13 +49,24 @@
 //! - UTF-16 scanning always uses anchor databases; Vectorscan only gates
 //!   raw-byte and decoded-stream variants.
 //!
+//! # Startup DB cache
+//! - `VsPrefilterDb` and `VsStreamDb` optionally use an on-disk cache of
+//!   serialized Vectorscan databases to reduce repeated process startup time.
+//! - Cache keys include compile mode, platform fingerprint, Vectorscan version,
+//!   and exact pattern/flag/id lists.
+//! - Cache misses or deserialize failures always fall back to normal compile;
+//!   cache I/O is best-effort and never a correctness dependency.
+//! - Environment controls:
+//!   - `SCANNER_VS_DB_CACHE=0|false|off|no` disables cache use.
+//!   - `SCANNER_VS_DB_CACHE_DIR=/path` overrides cache location.
+//!
 //! # Limits and fallback behavior
 //! - Scan APIs accept `u32` lengths; we return errors when a haystack exceeds
 //!   that bound.
 //! - If multi-compile fails for raw rules, we fall back to per-rule compilation
 //!   to pinpoint rejects; any rejected pattern returns an error.
 //! - Empty UTF-16/gate pattern sets return an error early.
-use crate::api::{RuleSpec, Tuning};
+use crate::api::RuleSpec;
 use libc::{c_char, c_int, c_uint, c_void};
 use std::ffi::CString;
 use std::mem::MaybeUninit;
@@ -143,6 +154,8 @@ pub(crate) struct VsGateDb {
     /// Compiled Vectorscan stream-mode database for gate detection.
     db: *mut vs::hs_database_t,
 }
+
+use super::vs_cache::{CacheKeyInput, VsDbCache};
 
 // Safe because hs_database_t is immutable after compilation, and we require per-thread scratch.
 unsafe impl Send for VsStreamDb {}
@@ -275,6 +288,22 @@ impl VsStreamDb {
         }
         let platform = unsafe { platform.assume_init() };
 
+        let cache = VsDbCache::new();
+        let cache_key = cache.cache_key(&CacheKeyInput {
+            kind: b"vs-stream-db:stream",
+            mode: vs::HS_MODE_STREAM as c_uint,
+            platform: &platform,
+            patterns: &c_patterns,
+            flags: Some(&flags),
+            ids: &ids,
+        });
+        if let Some(cached_db) = cache.try_load(&cache_key) {
+            return Ok(Self {
+                db: cached_db,
+                meta,
+            });
+        }
+
         let mut db: *mut vs::hs_database_t = ptr::null_mut();
         let mut compile_err: *mut vs::hs_compile_error_t = ptr::null_mut();
         let rc = unsafe {
@@ -312,6 +341,7 @@ impl VsStreamDb {
             return Err(msg);
         }
 
+        cache.try_store(&cache_key, db as *const vs::hs_database_t);
         Ok(Self { db, meta })
     }
 
@@ -426,12 +456,17 @@ impl VsStreamDb {
 /// `#[repr(C)]` to eliminate internal alignment padding (32B vs 40B naive).
 #[repr(C)]
 pub(crate) struct VsStreamWindow {
+    /// Decoded-byte offset of the window start (inclusive).
     pub(crate) lo: u64,
+    /// Decoded-byte offset of the window end (exclusive, not clamped).
     pub(crate) hi: u64,
-    /// Anchor hint from Vectorscan's `from` offset.
+    /// Anchor hint from Vectorscan's `from` offset, clamped to `[lo, to]`.
     pub(crate) anchor_hint: u64,
+    /// Rule id that produced this match.
     pub(crate) rule_id: u32,
+    /// Variant index matching `Variant::idx()` (0=raw, 1=utf16-le, 2=utf16-be).
     pub(crate) variant_idx: u8,
+    /// When `true`, caller should scan the full decoded stream instead of `[lo, hi)`.
     pub(crate) force_full: bool,
     // 2B tail padding
 }
@@ -534,6 +569,9 @@ unsafe extern "C" fn vs_on_stream_match(
     0
 }
 
+/// Returns the stream-mode match callback for decoded-byte scanning.
+///
+/// The callback expects a `*mut VsStreamMatchCtx` as the `ctx` parameter.
 pub(crate) fn stream_match_callback() -> vs::match_event_handler {
     Some(vs_on_stream_match)
 }
@@ -558,6 +596,10 @@ unsafe extern "C" fn vs_gate_on_match(
     0
 }
 
+/// Returns the decoded-space gate callback.
+///
+/// The callback expects a `*mut u8` flag as the `ctx` parameter; it sets the
+/// flag to `1` on any match.
 pub(crate) fn gate_match_callback() -> vs::match_event_handler {
     Some(vs_gate_on_match)
 }
@@ -618,6 +660,9 @@ unsafe extern "C" fn vs_utf16_stream_on_match(
     0
 }
 
+/// Returns the UTF-16 stream-mode match callback for anchor scanning.
+///
+/// The callback expects a `*mut VsUtf16StreamMatchCtx` as the `ctx` parameter.
 pub(crate) fn utf16_stream_match_callback() -> vs::match_event_handler {
     Some(vs_utf16_stream_on_match)
 }
@@ -868,7 +913,6 @@ impl VsAnchorDb {
         pat_offsets: &[u32],
         seed_radius_raw: &[u32],
         seed_radius_utf16: &[u32],
-        _tuning: &Tuning,
     ) -> Result<Self, String> {
         let debug = std::env::var("SCANNER_VS_UTF16_DEBUG").is_ok();
         let data = build_anchor_data(
@@ -893,6 +937,24 @@ impl VsAnchorDb {
             let _ = vs::hs_populate_platform(platform.as_mut_ptr());
         }
         let platform = unsafe { platform.assume_init() };
+
+        let cache = VsDbCache::new();
+        let cache_key = cache.cache_key(&CacheKeyInput {
+            kind: b"vs-anchor-db:block",
+            mode: vs::HS_MODE_BLOCK as c_uint,
+            platform: &platform,
+            patterns: &data.patterns,
+            flags: None,
+            ids: &ids,
+        });
+        if let Some(cached_db) = cache.try_load(&cache_key) {
+            return Ok(Self {
+                db: cached_db,
+                targets: data.targets,
+                pat_offsets: data.pat_offsets,
+                pat_lens: data.pat_lens,
+            });
+        }
 
         let mut db: *mut vs::hs_database_t = ptr::null_mut();
         let mut compile_err: *mut vs::hs_compile_error_t = ptr::null_mut();
@@ -939,6 +1001,7 @@ impl VsAnchorDb {
             return Err(msg);
         }
 
+        cache.try_store(&cache_key, db as *const vs::hs_database_t);
         Ok(Self {
             db,
             targets: data.targets,
@@ -947,6 +1010,7 @@ impl VsAnchorDb {
         })
     }
 
+    /// Allocates a new scratch space bound to this anchor database.
     pub(crate) fn alloc_scratch(&self) -> Result<VsScratch, String> {
         let mut scratch: *mut vs::hs_scratch_t = ptr::null_mut();
         let rc =
@@ -960,6 +1024,7 @@ impl VsAnchorDb {
         })
     }
 
+    /// Returns the raw database pointer for scratch binding checks.
     #[inline]
     pub(crate) fn db_ptr(&self) -> *mut vs::hs_database_t {
         self.db
@@ -1029,7 +1094,6 @@ impl VsUtf16StreamDb {
         pat_offsets: &[u32],
         seed_radius_raw: &[u32],
         seed_radius_utf16: &[u32],
-        _tuning: &Tuning,
     ) -> Result<Self, String> {
         let debug = std::env::var("SCANNER_VS_UTF16_DEBUG").is_ok();
         let data = build_anchor_data(
@@ -1054,6 +1118,24 @@ impl VsUtf16StreamDb {
             let _ = vs::hs_populate_platform(platform.as_mut_ptr());
         }
         let platform = unsafe { platform.assume_init() };
+
+        let cache = VsDbCache::new();
+        let cache_key = cache.cache_key(&CacheKeyInput {
+            kind: b"vs-utf16-stream-db:stream",
+            mode: vs::HS_MODE_STREAM as c_uint,
+            platform: &platform,
+            patterns: &data.patterns,
+            flags: None,
+            ids: &ids,
+        });
+        if let Some(cached_db) = cache.try_load(&cache_key) {
+            return Ok(Self {
+                db: cached_db,
+                targets: data.targets,
+                pat_offsets: data.pat_offsets,
+                pat_lens: data.pat_lens,
+            });
+        }
 
         let mut db: *mut vs::hs_database_t = ptr::null_mut();
         let mut compile_err: *mut vs::hs_compile_error_t = ptr::null_mut();
@@ -1093,6 +1175,7 @@ impl VsUtf16StreamDb {
             return Err(msg);
         }
 
+        cache.try_store(&cache_key, db as *const vs::hs_database_t);
         Ok(Self {
             db,
             targets: data.targets,
@@ -1101,6 +1184,7 @@ impl VsUtf16StreamDb {
         })
     }
 
+    /// Allocates a new scratch space bound to this UTF-16 stream database.
     pub(crate) fn alloc_scratch(&self) -> Result<VsScratch, String> {
         let mut scratch: *mut vs::hs_scratch_t = ptr::null_mut();
         let rc =
@@ -1120,6 +1204,7 @@ impl VsUtf16StreamDb {
         &self.targets
     }
 
+    /// Returns the raw database pointer for scratch binding checks.
     #[inline]
     pub(crate) fn db_ptr(&self) -> *mut vs::hs_database_t {
         self.db
@@ -1137,6 +1222,7 @@ impl VsUtf16StreamDb {
         &self.pat_lens
     }
 
+    /// Opens a new stream handle bound to this database.
     pub(crate) fn open_stream(&self) -> Result<VsStream, String> {
         let mut stream: *mut vs::hs_stream_t = ptr::null_mut();
         let rc = unsafe { vs::hs_open_stream(self.db, 0, &mut stream) };
@@ -1148,10 +1234,10 @@ impl VsUtf16StreamDb {
 
     /// Scans a decoded stream chunk for UTF-16 anchor hits.
     ///
-    /// The chunk length must fit in `u32` (Vectorscan API constraint).
-    /// `scratch` must be allocated for this database; `ctx` must remain valid
-    /// for the duration of the call. `HS_SCAN_TERMINATED` is treated as success to
-    /// allow early termination in callbacks.
+    /// Returns an error if `chunk` exceeds `u32::MAX` bytes (Vectorscan API
+    /// constraint). `scratch` must be allocated for this database; `ctx` must
+    /// remain valid for the duration of the call. `HS_SCAN_TERMINATED` is
+    /// treated as success to allow early termination in callbacks.
     pub(crate) fn scan_stream(
         &self,
         stream: &mut VsStream,
@@ -1160,11 +1246,15 @@ impl VsUtf16StreamDb {
         on_event: vs::match_event_handler,
         ctx: *mut c_void,
     ) -> Result<(), String> {
+        let len_u32: c_uint = chunk
+            .len()
+            .try_into()
+            .map_err(|_| format!("buffer too large for hs_scan_stream: {} bytes", chunk.len()))?;
         let rc = unsafe {
             vs::hs_scan_stream(
                 stream.stream,
                 chunk.as_ptr().cast::<c_char>(),
-                chunk.len() as c_uint,
+                len_u32,
                 0,
                 scratch.scratch,
                 on_event,
@@ -1178,6 +1268,12 @@ impl VsUtf16StreamDb {
         }
     }
 
+    /// Closes a stream, flushing end-of-stream matches via `on_event`.
+    ///
+    /// Unlike [`VsGateDb::close_stream`], this does **not** treat
+    /// `HS_SCAN_TERMINATED` as success — early termination during close is
+    /// considered an error for UTF-16 anchor streams because partial flush
+    /// can drop match events.
     pub(crate) fn close_stream(
         &self,
         stream: VsStream,
@@ -1242,6 +1338,19 @@ impl VsGateDb {
         }
         let platform = unsafe { platform.assume_init() };
 
+        let cache = VsDbCache::new();
+        let cache_key = cache.cache_key(&CacheKeyInput {
+            kind: b"vs-gate-db:stream",
+            mode: vs::HS_MODE_STREAM as c_uint,
+            platform: &platform,
+            patterns: &c_patterns,
+            flags: Some(&flags),
+            ids: &ids,
+        });
+        if let Some(cached_db) = cache.try_load(&cache_key) {
+            return Ok(Self { db: cached_db });
+        }
+
         let mut db: *mut vs::hs_database_t = ptr::null_mut();
         let mut compile_err: *mut vs::hs_compile_error_t = ptr::null_mut();
         let rc = unsafe {
@@ -1279,6 +1388,7 @@ impl VsGateDb {
             return Err(msg);
         }
 
+        cache.try_store(&cache_key, db as *const vs::hs_database_t);
         Ok(Self { db })
     }
 
@@ -1379,7 +1489,6 @@ impl VsPrefilterDb {
     ///
     /// # Arguments
     /// * `rules` - Rule specifications to compile
-    /// * `_tuning` - Tuning parameters (currently unused)
     /// * `anchor` - Optional anchor patterns to include as exact literals
     /// * `use_raw_prefilter` - Per-rule flags indicating whether to include raw regex.
     ///   When `None`, all rules use raw regex prefiltering. When `Some`, only rules
@@ -1391,7 +1500,6 @@ impl VsPrefilterDb {
     /// recompile patterns individually to surface the specific rule errors.
     pub(crate) fn try_new(
         rules: &[RuleSpec],
-        _tuning: &Tuning,
         anchor: Option<AnchorInput<'_>>,
         use_raw_prefilter: Option<&[bool]>,
     ) -> Result<Self, String> {
@@ -1467,6 +1575,8 @@ impl VsPrefilterDb {
         }
         let platform = unsafe { platform.assume_init() };
 
+        let cache = VsDbCache::new();
+
         let compile_db = |raw: &[RawPattern<'_>]| -> Result<*mut vs::hs_database_t, String> {
             let anchor_len = anchor_data.as_ref().map_or(0, |d| d.pat_lens.len());
             let mut c_patterns: Vec<CString> =
@@ -1495,6 +1605,18 @@ impl VsPrefilterDb {
 
             if expr_ptrs.is_empty() {
                 return Err("no patterns to compile".to_string());
+            }
+
+            let cache_key = cache.cache_key(&CacheKeyInput {
+                kind: b"vs-prefilter-db:block",
+                mode: vs::HS_MODE_BLOCK as c_uint,
+                platform: &platform,
+                patterns: &c_patterns,
+                flags: Some(&flags),
+                ids: &ids,
+            });
+            if let Some(cached_db) = cache.try_load(&cache_key) {
+                return Ok(cached_db);
             }
 
             let mut db: *mut vs::hs_database_t = ptr::null_mut();
@@ -1534,6 +1656,7 @@ impl VsPrefilterDb {
                 return Err(msg);
             }
 
+            cache.try_store(&cache_key, db as *const vs::hs_database_t);
             Ok(db)
         };
 

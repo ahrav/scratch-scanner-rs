@@ -68,7 +68,7 @@
 //!
 //! | Module | Purpose |
 //! |--------|---------|
-//! | [`local`] | Low-level filesystem scanning with `std::fs` |
+//! | [`local_fs_owner`] | Canonical local filesystem scanning path (chunked I/O + archive expansion) |
 //! | [`parallel_scan`] | High-level directory scanning with gitignore support |
 //! | [`local_fs_uring`] | Linux-only io_uring backend (feature `io-uring`) |
 //! | [`remote`] | HTTP/object-store backend with retry policies |
@@ -230,7 +230,8 @@ pub mod ts_chunk;
 pub mod worker_id;
 
 // I/O backends
-pub mod local;
+pub mod local_fs_owner;
+pub use local_fs_owner as local;
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub mod local_fs_uring;
 pub mod parallel_scan;
@@ -285,7 +286,7 @@ pub use ts_chunk::TsChunk;
 pub use worker_id::{current_worker_id, set_current_worker_id};
 
 // I/O backends
-pub use local::{
+pub use local_fs_owner::{
     scan_local, FileSource, LocalConfig, LocalFile, LocalReport, LocalStats, VecFileSource,
 };
 #[cfg(all(target_os = "linux", feature = "io-uring"))]

@@ -42,9 +42,12 @@ use super::count_budget::{CountBudget, CountPermit};
 use super::engine_stub::BUFFER_LEN_MAX;
 use super::engine_trait::{EngineScratch, FindingRecord, ScanEngine};
 use super::executor::{Executor, ExecutorConfig, ExecutorHandle, WorkerCtx};
+use super::local_fs_owner::LocalFile;
 use super::metrics::MetricsSnapshot;
+use super::ts_buffer_pool::{TsBufferHandle, TsBufferPool, TsBufferPoolConfig};
 use crate::api::FileId;
 use crate::perf_stats;
+use crate::scheduler::affinity::pin_current_thread_to_core;
 use crate::unified::events::{EventSink, FindingEvent, ScanEvent};
 use crate::unified::SourceKind;
 
@@ -655,7 +658,14 @@ struct ReadOp {
 
 /// Drain all in-flight operations before returning.
 ///
-/// SAFETY: This MUST be called before dropping the ring/ops if any operations
+/// Waits for every outstanding CQE and disposes of the associated `Op`.
+/// For `Read` ops the `FixedBufferHandle` is dropped, returning it to the
+/// pool. For `Open` ops with a successful result the returned fd is closed
+/// to prevent leaks. No scan tasks are spawned — this is a shutdown path.
+///
+/// # Safety requirement
+///
+/// This MUST be called before dropping the ring/ops if any operations
 /// are in-flight, otherwise the kernel may write to freed memory.
 fn drain_in_flight(
     ring: &mut IoUring,
@@ -831,9 +841,14 @@ fn io_worker_loop<E: ScanEngine>(
     let mut stopping = false;
     let mut channel_closed = false;
 
+    /// Result of blocking open + fstat for files when io_uring open/stat
+    /// ops are unsupported or the mode is `BlockingOnly`.
     enum BlockingOutcome {
+        /// File opened and sized; ready for read submissions.
         Ready(ReadState),
+        /// File skipped (empty or exceeds `max_file_size`).
         Skipped,
+        /// Open or fstat failed.
         Failed,
     }
 
