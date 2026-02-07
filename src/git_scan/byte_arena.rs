@@ -1,17 +1,23 @@
 //! Byte arena for Git scanning.
 //!
 //! Provides compact storage for variable-length byte sequences with
-//! stable `ByteRef` handles.
+//! stable `ByteRef` handles. Primarily used to intern file paths
+//! discovered during blob introduction so that `PackCandidate` and
+//! `LooseCandidate` records can reference paths without per-candidate
+//! heap allocation.
 //!
 //! # Design
 //! - Append-only: bytes are never removed, so references remain valid.
-//! - References are offsets, not pointers, so Vec reallocation does not
+//! - References are offsets, not pointers, so `Vec` reallocation does not
 //!   invalidate them.
 //! - No deduplication is performed; repeated inserts store repeated bytes.
+//! - Capacity is a hard `u32` limit (max ~4 GiB), bounded at creation.
+//!   Pre-allocation is capped at 1 MiB to avoid large upfront reservations
+//!   on small repos.
 //!
 //! # Complexity
-//! - `intern` is `O(n)` in the inserted length.
-//! - `get` is `O(1)`.
+//! - `intern` is `O(n)` in the inserted length (memcpy).
+//! - `get` is `O(1)` (slice index).
 
 /// Reference to bytes stored in a `ByteArena`.
 ///
@@ -194,6 +200,33 @@ impl ByteArena {
         self.capacity
     }
 
+    /// Returns the backing bytes as a slice.
+    #[inline]
+    #[must_use]
+    pub fn backing_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Appends all bytes from `other` into this arena.
+    ///
+    /// Returns the base offset that was used for the appended region.
+    /// Callers must rebase `ByteRef` values from `other` by adding
+    /// this base to their `off` field (using `checked_add` to detect
+    /// overflow).
+    ///
+    /// Returns `None` if the combined size would exceed this arena's
+    /// capacity or overflow `u32`.
+    pub fn append_arena(&mut self, other: &ByteArena) -> Option<u32> {
+        let base = self.bytes.len() as u32;
+        let other_len = other.bytes.len() as u32;
+        let new_total = base.checked_add(other_len)?;
+        if new_total > self.capacity {
+            return None;
+        }
+        self.bytes.extend_from_slice(&other.bytes);
+        Some(base)
+    }
+
     /// Clears all stored bytes while preserving allocated capacity.
     ///
     /// All previously returned `ByteRef` values become invalid after this call.
@@ -263,5 +296,43 @@ mod tests {
     fn byte_ref_checked_end_overflow() {
         let r = ByteRef::new(u32::MAX - 10, 100);
         assert!(r.checked_end().is_none());
+    }
+
+    #[test]
+    fn append_arena_rebases_correctly() {
+        let mut dst = ByteArena::with_capacity(1024);
+        let r1 = dst.intern(b"hello").unwrap();
+
+        let mut src = ByteArena::with_capacity(1024);
+        let r2 = src.intern(b"world").unwrap();
+
+        let base = dst.append_arena(&src).unwrap();
+        assert_eq!(base, 5);
+
+        // Original ref still valid.
+        assert_eq!(dst.get(r1), b"hello");
+
+        // Rebased ref from src.
+        let rebased = ByteRef::new(r2.off.checked_add(base).unwrap(), r2.len);
+        assert_eq!(dst.get(rebased), b"world");
+    }
+
+    #[test]
+    fn append_arena_capacity_exceeded() {
+        let mut dst = ByteArena::with_capacity(8);
+        dst.intern(b"hello").unwrap();
+
+        let mut src = ByteArena::with_capacity(1024);
+        src.intern(b"world").unwrap();
+
+        // 5 + 5 = 10 > 8: should fail.
+        assert!(dst.append_arena(&src).is_none());
+    }
+
+    #[test]
+    fn backing_bytes_returns_content() {
+        let mut arena = ByteArena::with_capacity(1024);
+        arena.intern(b"abc").unwrap();
+        assert_eq!(arena.backing_bytes(), b"abc");
     }
 }

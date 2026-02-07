@@ -4,6 +4,19 @@
 //! unique blob exactly once. It maintains seen-set bitmaps keyed by MIDX
 //! indices so repeated trees/blobs are skipped without re-parsing.
 //!
+//! # Serial vs Parallel
+//!
+//! [`BlobIntroducer`] is the serial entry point — one thread processes all
+//! commits sequentially using per-instance [`SeenSets`] (non-atomic
+//! `DynamicBitSet`).
+//!
+//! [`introduce_parallel`] partitions the commit plan into chunks and
+//! spawns multiple [`BlobIntroWorker`]s that share a single
+//! [`AtomicSeenSets`]. Each tree/blob is claimed by exactly one worker
+//! via `fetch_or` (mark-then-traverse), matching the GC mark-phase
+//! architecture. Commit attribution is non-deterministic (race winner),
+//! but the blob SET is identical to the serial path.
+//!
 //! # Invariants
 //! - Seen sets are sized to `midx.object_count` and never grow.
 //! - OID indices must be validated before use (caller responsibility).
@@ -11,26 +24,48 @@
 //!   independently to avoid false positives.
 //! - Paths are assembled in a reusable buffer and must not exceed
 //!   `MAX_PATH_LEN`.
+//! - In parallel mode, each tree/blob object is processed by exactly one
+//!   worker (guaranteed by `AtomicBitSet::test_and_set` atomicity).
 
 use crate::perf_stats;
+use crate::stdx::atomic_seen_sets::AtomicSeenSets;
 use crate::stdx::bitset::DynamicBitSet;
 
+use super::byte_arena::ByteArena;
 use super::errors::{MappingCandidateKind, TreeDiffError};
+use super::midx::MidxView;
 use super::object_id::OidBytes;
-use super::object_store::TreeBytes;
+use super::object_store::{ObjectStore, TreeBytes};
 use super::oid_index::OidIndex;
+use super::pack_candidates::{LooseCandidate, PackCandidate, PackCandidateCollector};
 use super::path_policy::{classify_path, is_excluded_path};
+use super::repo_open::RepoJobState;
+use super::runner::GitScanConfig;
 use super::tree_candidate::{CandidateSink, ChangeKind};
+use super::tree_delta_cache::TreeDeltaCache;
 use super::tree_diff::TreeDiffStats;
 use super::tree_diff_limits::TreeDiffLimits;
 use super::tree_entry::{parse_entry, EntryKind, ParseOutcome, ParsedTreeEntry, TreeEntry};
 use super::tree_stream::{TreeBytesReader, TreeStream};
 use super::{CommitGraphIndex, PlannedCommit, TreeSource};
 
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
 const TREE_STREAM_BUF_BYTES: usize = 16 * 1024;
 const MAX_PATH_LEN: usize = 4096;
 
 /// Seen-set bitmaps for trees and blobs keyed by MIDX index.
+///
+/// Three independent bitsets are maintained:
+/// - `trees` — tracks visited tree objects to skip entire subtrees.
+/// - `blobs` — tracks emitted blob candidates (non-excluded).
+/// - `blobs_excluded` — tracks blobs matched by path-exclusion policy.
+///
+/// Blobs and excluded blobs are tracked separately because a blob OID may
+/// appear under both an excluded and a non-excluded path. If exclusion
+/// shared the `blobs` set, the first encounter under an excluded path would
+/// mark the blob as "seen" and suppress the legitimate non-excluded emit.
 #[derive(Debug)]
 pub struct SeenSets {
     trees: DynamicBitSet,
@@ -129,7 +164,15 @@ impl LooseEntry {
     }
 }
 
-/// Fixed-capacity open addressing set for loose OIDs.
+/// Fixed-capacity open-addressing hash set for loose OIDs.
+///
+/// Used for blobs not present in the MIDX (loose objects). The table uses
+/// linear probing with a 70% load factor and power-of-two sizing for fast
+/// modular indexing via bitmask. A one-byte tag (high bits of the hash)
+/// provides early rejection before full 20/32-byte OID comparison.
+///
+/// The set is deliberately simple: no tombstones or deletion support,
+/// matching the append-only nature of blob introduction.
 #[derive(Debug)]
 struct LooseOidSet {
     entries: Vec<LooseEntry>,
@@ -249,6 +292,15 @@ impl From<BlobIntroStats> for TreeDiffStats {
 }
 
 /// Reusable path builder for tree traversal.
+///
+/// Assembles file paths incrementally as the tree walk descends into
+/// subtrees. Directory components are pushed via `push_dir` and popped
+/// via `pop_dir`; leaf filenames are appended/removed with `push_leaf` /
+/// `pop_leaf`. The `stack` records buffer positions at each directory
+/// boundary so `pop_dir` can truncate back to the parent prefix.
+///
+/// Paths are capped at `MAX_PATH_LEN` bytes to bound memory and prevent
+/// pathological trees from causing unbounded growth.
 #[derive(Debug)]
 struct PathBuilder {
     buf: Vec<u8>,
@@ -369,6 +421,11 @@ impl BufferedCursor {
 }
 
 /// Tree cursor selecting buffered vs streaming parsing.
+///
+/// Small trees (below `stream_threshold`) are kept fully in memory as a
+/// `BufferedCursor` for random-access-friendly parsing. Large trees or
+/// spilled trees use `TreeStream` to parse entries on demand without
+/// buffering the entire payload, keeping the in-flight byte budget bounded.
 enum TreeCursor {
     Buffered(BufferedCursor),
     Stream(TreeStream<TreeBytesReader>),
@@ -413,7 +470,27 @@ struct TreeFrame {
     in_flight_len: u64,
 }
 
-/// Blob introducer state.
+/// Serial blob introducer: walks commits in plan order and discovers each
+/// unique blob exactly once.
+///
+/// # Algorithm
+///
+/// For each commit, the root tree OID is resolved and walked depth-first.
+/// At every tree/blob entry the MIDX index is checked:
+///
+/// - **Packed objects** (present in MIDX): deduped via the bitmap `SeenSets`.
+/// - **Loose objects** (not in MIDX): deduped via the hash-based `LooseOidSet`.
+///
+/// Trees whose OID has already been visited are skipped entirely, pruning
+/// the walk. Blobs whose path matches the exclusion policy are tracked
+/// separately in `blobs_excluded` / `loose_excluded` to avoid suppressing
+/// legitimate non-excluded paths for the same OID.
+///
+/// # Reusability
+///
+/// A single `BlobIntroducer` can be reused across multiple runs by calling
+/// `reset_seen` (clears dedup state) and/or `reset_stats`. The transient
+/// stack/path state is always cleaned up before `introduce` returns.
 pub struct BlobIntroducer {
     max_depth: u16,
     oid_len: u8,
@@ -578,6 +655,12 @@ impl BlobIntroducer {
         self.path_builder.pop_dir();
     }
 
+    /// Iteratively processes all tree frames on the stack, emitting blob
+    /// candidates into `sink`.
+    ///
+    /// Uses the instance `SeenSets` for tree/blob dedup. On encountering a
+    /// subtree, pushes a new frame; on exhausting a tree, pops it. Blob
+    /// entries are checked against the path exclusion policy before emission.
     fn walk_stack<S: CandidateSink>(
         &mut self,
         source: &mut impl TreeSource,
@@ -672,6 +755,10 @@ impl BlobIntroducer {
     }
 }
 
+/// Returns the power-of-two table size for `count` items at ≤70% load.
+///
+/// A 70% load factor balances probe length (avg ~1.5 with linear probing)
+/// against memory. Power-of-two sizing enables bitmask indexing.
 fn table_size_for_count(count: usize) -> usize {
     const LOAD_FACTOR_NUM: usize = 7;
     const LOAD_FACTOR_DEN: usize = 10;
@@ -681,6 +768,11 @@ fn table_size_for_count(count: usize) -> usize {
     min_capacity.max(1).next_power_of_two()
 }
 
+/// Hashes an OID for the `LooseOidSet` hash table.
+///
+/// XORs the first and last 8 bytes (rotated) to mix positional entropy,
+/// then applies a Stafford variant 13 finalizer (`mix64`). The high byte
+/// of the result is used as a one-byte tag for early rejection.
 #[inline]
 fn hash_oid(oid: &OidBytes) -> u64 {
     let bytes = oid.as_slice();
@@ -691,6 +783,7 @@ fn hash_oid(oid: &OidBytes) -> u64 {
     mix64(h)
 }
 
+/// Stafford variant 13 bit mixer — bijective finalizer for 64-bit hashes.
 #[inline]
 fn mix64(mut x: u64) -> u64 {
     x ^= x >> 30;
@@ -700,9 +793,636 @@ fn mix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
+// ---------------------------------------------------------------------------
+// Parallel blob introduction
+// ---------------------------------------------------------------------------
+
+/// Per-worker results from parallel blob introduction.
+pub(super) struct WorkerResult {
+    pub packed: Vec<PackCandidate>,
+    pub loose: Vec<LooseCandidate>,
+    pub path_arena: ByteArena,
+    pub stats: BlobIntroStats,
+}
+
+/// Parallel blob introduction worker.
+///
+/// Each worker holds its own `ObjectStore`, `PathBuilder`, `LooseOidSet`,
+/// and `PackCandidateCollector`. The shared `AtomicSeenSets` provides
+/// lock-free deduplication across workers: when a worker calls
+/// `mark_tree(idx)` / `mark_blob(idx)`, the `fetch_or` guarantees exactly
+/// one winner per bit.
+///
+/// Workers process disjoint chunks of `PlannedCommit` and produce per-worker
+/// candidate lists that are merged after all workers finish.
+struct BlobIntroWorker<'a> {
+    max_depth: u16,
+    oid_len: u8,
+    path_builder: PathBuilder,
+    name_scratch: Vec<u8>,
+    stack: Vec<TreeFrame>,
+    stats: BlobIntroStats,
+    tree_bytes_in_flight_limit: u64,
+    tree_bytes_in_flight: u64,
+    stream_threshold: usize,
+    seen: &'a AtomicSeenSets,
+    loose_seen: LooseOidSet,
+    loose_excluded: LooseOidSet,
+    path_policy_version: u32,
+    abort: &'a AtomicBool,
+}
+
+impl<'a> BlobIntroWorker<'a> {
+    fn new(
+        limits: &TreeDiffLimits,
+        oid_len: u8,
+        path_policy_version: u32,
+        max_loose_oids: u32,
+        seen: &'a AtomicSeenSets,
+        abort: &'a AtomicBool,
+    ) -> Self {
+        Self {
+            max_depth: limits.max_tree_depth,
+            oid_len,
+            path_builder: PathBuilder::new(4096),
+            name_scratch: Vec::with_capacity(256),
+            stack: Vec::with_capacity(limits.max_tree_depth as usize),
+            stats: BlobIntroStats::default(),
+            tree_bytes_in_flight_limit: limits.max_tree_bytes_in_flight,
+            tree_bytes_in_flight: 0,
+            stream_threshold: limits.max_tree_cache_bytes.max(1) as usize,
+            seen,
+            loose_seen: LooseOidSet::new(max_loose_oids, oid_len, MappingCandidateKind::Loose),
+            loose_excluded: LooseOidSet::new(max_loose_oids, oid_len, MappingCandidateKind::Loose),
+            path_policy_version,
+            abort,
+        }
+    }
+
+    /// Processes a slice of planned commits, emitting candidates into `sink`.
+    fn introduce_chunk<S: CandidateSink>(
+        &mut self,
+        source: &mut impl TreeSource,
+        cg: &CommitGraphIndex,
+        chunk: &[PlannedCommit],
+        oid_index: &OidIndex,
+        sink: &mut S,
+    ) -> Result<(), TreeDiffError> {
+        for PlannedCommit { pos, .. } in chunk {
+            if self.abort.load(Ordering::Relaxed) {
+                break;
+            }
+
+            perf_stats::sat_add_u64(&mut self.stats.commits_visited, 1);
+            let commit_id = pos.0;
+            let root_oid = cg.root_tree_oid(*pos);
+
+            if let Some(idx) = oid_index.get(&root_oid) {
+                if !self.seen.mark_tree(idx as usize) {
+                    perf_stats::sat_add_u64(&mut self.stats.subtrees_skipped, 1);
+                    continue;
+                }
+            }
+
+            self.push_tree(source, &root_oid)?;
+            match self.walk_stack(source, oid_index, sink, commit_id) {
+                Ok(()) => {}
+                Err(TreeDiffError::Aborted) => break,
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
+    }
+
+    /// Loads a tree by OID and pushes it onto the walk stack.
+    ///
+    /// Tracks in-flight byte budget and records perf stats.
+    fn push_tree(
+        &mut self,
+        source: &mut impl TreeSource,
+        oid: &OidBytes,
+    ) -> Result<(), TreeDiffError> {
+        if self.stack.len() >= self.max_depth as usize {
+            return Err(TreeDiffError::MaxTreeDepthExceeded {
+                max_depth: self.max_depth,
+            });
+        }
+
+        let bytes = source.load_tree(oid)?;
+        perf_stats::sat_add_u64(&mut self.stats.trees_loaded, 1);
+        perf_stats::sat_add_u64(&mut self.stats.tree_bytes_loaded, bytes.len() as u64);
+
+        let cursor = TreeCursor::new(bytes, self.oid_len, self.stream_threshold);
+        let in_flight_len = cursor.in_flight_len();
+        let new_in_flight = self.tree_bytes_in_flight.saturating_add(in_flight_len);
+        if new_in_flight > self.tree_bytes_in_flight_limit {
+            return Err(TreeDiffError::TreeBytesBudgetExceeded {
+                loaded: new_in_flight,
+                budget: self.tree_bytes_in_flight_limit,
+            });
+        }
+        self.tree_bytes_in_flight = new_in_flight;
+        perf_stats::max_u64(
+            &mut self.stats.tree_bytes_in_flight_peak,
+            self.tree_bytes_in_flight,
+        );
+
+        self.stack.push(TreeFrame {
+            cursor,
+            in_flight_len,
+        });
+        perf_stats::max_u16(&mut self.stats.max_depth_reached, self.stack.len() as u16);
+        Ok(())
+    }
+
+    fn pop_tree(&mut self) {
+        if let Some(frame) = self.stack.pop() {
+            self.tree_bytes_in_flight = self
+                .tree_bytes_in_flight
+                .saturating_sub(frame.in_flight_len);
+        }
+        self.path_builder.pop_dir();
+    }
+
+    /// Iteratively walks all frames on the stack, emitting blob candidates.
+    ///
+    /// Uses the shared `AtomicSeenSets` for tree/blob dedup. Checks the
+    /// abort flag every 4096 tree entries for responsiveness on large trees.
+    fn walk_stack<S: CandidateSink>(
+        &mut self,
+        source: &mut impl TreeSource,
+        oid_index: &OidIndex,
+        sink: &mut S,
+        commit_id: u32,
+    ) -> Result<(), TreeDiffError> {
+        let mut entry_count: u32 = 0;
+        while let Some(frame) = self.stack.last_mut() {
+            let entry = match frame.cursor.peek_entry()? {
+                Some(entry) => entry,
+                None => {
+                    self.pop_tree();
+                    continue;
+                }
+            };
+
+            self.name_scratch.clear();
+            self.name_scratch.extend_from_slice(entry.name);
+            let kind = entry.kind;
+            let mode = entry.mode;
+            let oid = entry.oid()?;
+
+            frame.cursor.advance()?;
+
+            // Check abort every 4096 tree entries for large-tree responsiveness.
+            entry_count = entry_count.wrapping_add(1);
+            if entry_count & 0xFFF == 0 && self.abort.load(Ordering::Relaxed) {
+                self.reset_run_state();
+                return Err(TreeDiffError::Aborted);
+            }
+
+            match kind {
+                EntryKind::Tree => {
+                    if let Some(idx) = oid_index.get(&oid) {
+                        if !self.seen.mark_tree(idx as usize) {
+                            perf_stats::sat_add_u64(&mut self.stats.subtrees_skipped, 1);
+                            continue;
+                        }
+                    }
+
+                    self.path_builder.push_dir(&self.name_scratch)?;
+                    if let Err(err) = self.push_tree(source, &oid) {
+                        self.path_builder.pop_dir();
+                        return Err(err);
+                    }
+                }
+                EntryKind::RegularFile | EntryKind::ExecutableFile | EntryKind::Symlink => {
+                    let leaf_start = self.path_builder.push_leaf(&self.name_scratch)?;
+                    let path = self.path_builder.as_slice();
+                    let excluded = is_excluded_path(path, self.path_policy_version);
+                    let idx = oid_index.get(&oid);
+
+                    if excluded {
+                        if let Some(idx) = idx {
+                            if self.seen.is_blob_excluded(idx as usize) {
+                                self.path_builder.pop_leaf(leaf_start);
+                                continue;
+                            }
+                            self.seen.mark_blob_excluded(idx as usize);
+                        } else {
+                            if self.loose_excluded.contains(&oid) {
+                                self.path_builder.pop_leaf(leaf_start);
+                                continue;
+                            }
+                            self.loose_excluded.insert(&oid)?;
+                        }
+                        self.path_builder.pop_leaf(leaf_start);
+                        continue;
+                    }
+
+                    if let Some(idx) = idx {
+                        if !self.seen.mark_blob(idx as usize) {
+                            self.path_builder.pop_leaf(leaf_start);
+                            continue;
+                        }
+                    } else if !self.loose_seen.insert(&oid)? {
+                        self.path_builder.pop_leaf(leaf_start);
+                        continue;
+                    }
+                    let cand_flags = classify_path(path).bits();
+                    let mode_u16 = mode as u16;
+                    sink.emit(
+                        oid,
+                        path,
+                        commit_id,
+                        0,
+                        ChangeKind::Add,
+                        mode_u16,
+                        cand_flags,
+                    )?;
+                    perf_stats::sat_add_u64(&mut self.stats.blobs_emitted, 1);
+                    self.path_builder.pop_leaf(leaf_start);
+                }
+                EntryKind::Gitlink | EntryKind::Unknown => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    fn reset_run_state(&mut self) {
+        self.stack.clear();
+        self.path_builder.clear();
+        self.tree_bytes_in_flight = 0;
+    }
+}
+
+/// Merged results from parallel blob introduction.
+pub(super) struct ParallelIntroResult {
+    pub packed: Vec<PackCandidate>,
+    pub loose: Vec<LooseCandidate>,
+    pub path_arena: ByteArena,
+    pub stats: BlobIntroStats,
+}
+
+/// Runs blob introduction across multiple workers using shared `AtomicSeenSets`.
+///
+/// Pre-partitions `plan` into `~4 × worker_count` chunks. Workers claim
+/// chunks via an atomic counter (work-stealing pattern). Each worker has
+/// its own `ObjectStore` and `PackCandidateCollector`; dedup is shared
+/// through `AtomicSeenSets`.
+///
+/// Cache budgets (`max_tree_cache_bytes`, `max_tree_delta_cache_bytes`,
+/// `max_tree_spill_bytes`) are divided by `worker_count` with a floor
+/// of 4 MB / 4 MB / 64 MB respectively.
+///
+/// Post-merge:
+/// - Packed/loose candidates are concatenated.
+/// - Path arenas are merged with offset rebasing (checked_add overflow),
+///   bounded by the global `mapping_cfg_path_arena_capacity`.
+/// - Loose candidates are deduplicated by OID.
+/// - Global packed/loose caps are re-validated after merge.
+/// - Stats use saturating sum for counters and max for peaks.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn introduce_parallel<'a>(
+    worker_count: usize,
+    repo: &RepoJobState,
+    config: &GitScanConfig,
+    spill_dir: &Path,
+    cg: &CommitGraphIndex,
+    plan: &[PlannedCommit],
+    midx: &MidxView<'a>,
+    oid_index: &OidIndex,
+    mapping_cfg_path_arena_capacity: u32,
+    mapping_cfg_max_packed: u32,
+    mapping_cfg_max_loose: u32,
+) -> Result<ParallelIntroResult, TreeDiffError> {
+    let worker_count = worker_count.max(1).min(plan.len().max(1));
+
+    if plan.is_empty() {
+        return Ok(ParallelIntroResult {
+            packed: Vec::new(),
+            loose: Vec::new(),
+            path_arena: ByteArena::with_capacity(0),
+            stats: BlobIntroStats::default(),
+        });
+    }
+
+    // Pre-partition plan into ~4× worker_count chunks.
+    let chunk_count = (worker_count * 4).min(plan.len());
+    let chunk_size = plan.len().div_ceil(chunk_count);
+    let chunks: Vec<&[PlannedCommit]> = plan.chunks(chunk_size).collect();
+    let next_chunk = AtomicUsize::new(0);
+    let abort = AtomicBool::new(false);
+
+    let object_count = midx.object_count();
+
+    // Shared AtomicSeenSets sized to MIDX object count.
+    let seen = AtomicSeenSets::new(object_count as usize, object_count as usize);
+
+    // Per-worker budget division.
+    let per_worker_tree_cache =
+        (config.tree_diff.max_tree_cache_bytes / worker_count as u32).max(4 * 1024 * 1024); // 4 MB floor
+    let per_worker_delta_cache =
+        (config.tree_diff.max_tree_delta_cache_bytes / worker_count as u32).max(4 * 1024 * 1024); // 4 MB floor
+    let per_worker_spill = config.tree_diff.max_tree_spill_bytes / worker_count as u64;
+    let per_worker_spill = per_worker_spill.max(64 * 1024 * 1024); // 64 MB floor
+    let per_worker_in_flight =
+        (config.tree_diff.max_tree_bytes_in_flight / worker_count as u64).max(64 * 1024 * 1024); // 64 MB floor
+    let per_worker_loose = per_worker_loose_limit(mapping_cfg_max_loose, worker_count);
+    let per_worker_path_arena = (mapping_cfg_path_arena_capacity / worker_count as u32)
+        .max(64 * 1024)
+        .min(mapping_cfg_path_arena_capacity); // never exceed the original cap
+    let per_worker_max_packed = (mapping_cfg_max_packed / worker_count as u32)
+        .max(1024)
+        .min(mapping_cfg_max_packed); // never exceed the original cap
+
+    // Build per-worker limits with divided budgets.
+    let per_worker_limits = TreeDiffLimits {
+        max_tree_cache_bytes: per_worker_tree_cache,
+        max_tree_delta_cache_bytes: per_worker_delta_cache,
+        max_tree_spill_bytes: per_worker_spill,
+        max_tree_bytes_in_flight: per_worker_in_flight,
+        ..config.tree_diff
+    };
+
+    let auto_cache_fn = super::runner_exec::auto_tree_delta_cache_bytes;
+
+    // Spawn workers with std::thread::scope.
+    let results: Vec<Result<WorkerResult, TreeDiffError>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..worker_count)
+            .map(|_| {
+                let chunks = &chunks;
+                let next_chunk = &next_chunk;
+                let abort = &abort;
+                let seen = &seen;
+                let per_worker_limits = &per_worker_limits;
+
+                s.spawn(move || {
+                    // Per-worker ObjectStore.
+                    let auto_cache_bytes =
+                        auto_cache_fn(object_count, per_worker_limits.max_tree_delta_cache_bytes);
+                    let tree_delta_cache = TreeDeltaCache::new(auto_cache_bytes);
+                    let mut object_store = ObjectStore::open_with_tree_delta_cache(
+                        repo,
+                        per_worker_limits,
+                        spill_dir,
+                        tree_delta_cache,
+                    )?;
+
+                    // Per-worker candidate collector with divided limits.
+                    let mut collector = PackCandidateCollector::new(
+                        midx,
+                        oid_index,
+                        per_worker_path_arena,
+                        per_worker_max_packed,
+                        per_worker_loose,
+                    );
+
+                    let mut worker = BlobIntroWorker::new(
+                        per_worker_limits,
+                        repo.object_format.oid_len(),
+                        config.path_policy_version,
+                        per_worker_loose,
+                        seen,
+                        abort,
+                    );
+
+                    // Claim and process chunks.
+                    loop {
+                        let idx = next_chunk.fetch_add(1, Ordering::Relaxed);
+                        if idx >= chunks.len() {
+                            break;
+                        }
+                        if let Err(err) = worker.introduce_chunk(
+                            &mut object_store,
+                            cg,
+                            chunks[idx],
+                            oid_index,
+                            &mut collector,
+                        ) {
+                            abort.store(true, Ordering::Relaxed);
+                            return Err(err);
+                        }
+                    }
+
+                    let (packed, loose, path_arena) = collector.finish();
+                    Ok(WorkerResult {
+                        packed,
+                        loose,
+                        path_arena,
+                        stats: worker.stats,
+                    })
+                })
+            })
+            .collect();
+
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join().unwrap_or(Err(TreeDiffError::CorruptTree {
+                    detail: "blob intro worker panicked",
+                }))
+            })
+            .collect()
+    });
+
+    let mut first_error: Option<TreeDiffError> = None;
+    let mut worker_results = Vec::new();
+    for result in results {
+        match result {
+            Ok(wr) => {
+                worker_results.push(wr);
+            }
+            Err(err) => {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+    }
+
+    if let Some(err) = first_error {
+        return Err(err);
+    }
+
+    merge_worker_results(
+        worker_results,
+        mapping_cfg_path_arena_capacity,
+        mapping_cfg_max_packed,
+        mapping_cfg_max_loose,
+    )
+}
+
+/// Merge per-worker introduction outputs and enforce global candidate/arena caps.
+///
+/// The merged path arena is created with `path_arena_capacity` so parallel
+/// mode honors the same global arena budget as the serial collector path.
+fn merge_worker_results(
+    worker_results: Vec<WorkerResult>,
+    path_arena_capacity: u32,
+    max_packed: u32,
+    max_loose: u32,
+) -> Result<ParallelIntroResult, TreeDiffError> {
+    let mut all_packed = Vec::new();
+    let mut all_loose = Vec::new();
+    let mut merged_stats = BlobIntroStats::default();
+    let mut merged_arena = ByteArena::with_capacity(path_arena_capacity);
+
+    for mut wr in worker_results {
+        // Rebase path arena references in candidates.
+        let base = merged_arena
+            .append_arena(&wr.path_arena)
+            .ok_or(TreeDiffError::PathArenaFull)?;
+
+        if base > 0 {
+            for cand in &mut wr.packed {
+                cand.ctx.path_ref.off = cand
+                    .ctx
+                    .path_ref
+                    .off
+                    .checked_add(base)
+                    .ok_or(TreeDiffError::PathArenaFull)?;
+            }
+            for cand in &mut wr.loose {
+                cand.ctx.path_ref.off = cand
+                    .ctx
+                    .path_ref
+                    .off
+                    .checked_add(base)
+                    .ok_or(TreeDiffError::PathArenaFull)?;
+            }
+        }
+
+        all_packed.extend(wr.packed);
+        all_loose.extend(wr.loose);
+
+        // Merge stats: sum for counters, max for peaks.
+        merged_stats.commits_visited = merged_stats
+            .commits_visited
+            .saturating_add(wr.stats.commits_visited);
+        merged_stats.trees_loaded = merged_stats
+            .trees_loaded
+            .saturating_add(wr.stats.trees_loaded);
+        merged_stats.tree_bytes_loaded = merged_stats
+            .tree_bytes_loaded
+            .saturating_add(wr.stats.tree_bytes_loaded);
+        merged_stats.blobs_emitted = merged_stats
+            .blobs_emitted
+            .saturating_add(wr.stats.blobs_emitted);
+        merged_stats.subtrees_skipped = merged_stats
+            .subtrees_skipped
+            .saturating_add(wr.stats.subtrees_skipped);
+        merged_stats.tree_bytes_in_flight_peak = merged_stats
+            .tree_bytes_in_flight_peak
+            .max(wr.stats.tree_bytes_in_flight_peak);
+        merged_stats.max_depth_reached = merged_stats
+            .max_depth_reached
+            .max(wr.stats.max_depth_reached);
+    }
+
+    // Deduplicate loose candidates by OID (keep first occurrence).
+    dedup_loose_by_oid(&mut all_loose);
+
+    // Post-merge validation: ensure the merged totals respect the global caps.
+    // Per-worker limits are divided approximations; the merged result can exceed
+    // the original budget, so we re-check here.
+    if all_packed.len() as u64 > max_packed as u64 {
+        return Err(TreeDiffError::CandidateLimitExceeded {
+            kind: MappingCandidateKind::Packed,
+            max: max_packed,
+            observed: all_packed.len().min(u32::MAX as usize) as u32,
+        });
+    }
+    if all_loose.len() as u64 > max_loose as u64 {
+        return Err(TreeDiffError::CandidateLimitExceeded {
+            kind: MappingCandidateKind::Loose,
+            max: max_loose,
+            observed: all_loose.len().min(u32::MAX as usize) as u32,
+        });
+    }
+
+    Ok(ParallelIntroResult {
+        packed: all_packed,
+        loose: all_loose,
+        path_arena: merged_arena,
+        stats: merged_stats,
+    })
+}
+
+/// Returns the loose-candidate budget used by each parallel worker.
+///
+/// The returned value is always in `0..=max_loose`.
+fn per_worker_loose_limit(max_loose: u32, worker_count: usize) -> u32 {
+    if max_loose == 0 {
+        return 0;
+    }
+    let workers = worker_count.max(1) as u32;
+    max_loose.div_ceil(workers).max(1).min(max_loose)
+}
+
+/// Deduplicates loose candidates by OID, keeping the first occurrence.
+fn dedup_loose_by_oid(loose: &mut Vec<LooseCandidate>) {
+    if loose.len() <= 1 {
+        return;
+    }
+    loose.sort_unstable_by(|a, b| a.oid.cmp(&b.oid));
+    loose.dedup_by(|a, b| a.oid == b.oid);
+}
+
 #[cfg(test)]
 mod tests {
-    use super::SeenSets;
+    use super::{
+        merge_worker_results, per_worker_loose_limit, BlobIntroStats, SeenSets, WorkerResult,
+    };
+    use crate::git_scan::byte_arena::{ByteArena, ByteRef};
+    use crate::git_scan::errors::{MappingCandidateKind, TreeDiffError};
+    use crate::git_scan::object_id::OidBytes;
+    use crate::git_scan::pack_candidates::{LooseCandidate, PackCandidate};
+    use crate::git_scan::tree_candidate::{CandidateContext, ChangeKind};
+
+    fn oid(byte: u8) -> OidBytes {
+        OidBytes::sha1([byte; 20])
+    }
+
+    fn empty_ctx() -> CandidateContext {
+        CandidateContext {
+            commit_id: 0,
+            parent_idx: 0,
+            change_kind: ChangeKind::Add,
+            ctx_flags: 0,
+            cand_flags: 0,
+            path_ref: ByteRef::new(0, 0),
+        }
+    }
+
+    fn packed_candidate(byte: u8) -> PackCandidate {
+        PackCandidate {
+            oid: oid(byte),
+            ctx: empty_ctx(),
+            pack_id: 0,
+            offset: byte as u64,
+        }
+    }
+
+    fn loose_candidate(byte: u8) -> LooseCandidate {
+        LooseCandidate {
+            oid: oid(byte),
+            ctx: empty_ctx(),
+        }
+    }
+
+    fn worker_result_with_paths(path: &[u8]) -> WorkerResult {
+        let mut arena = ByteArena::with_capacity(path.len() as u32);
+        if !path.is_empty() {
+            arena.intern(path).expect("path intern");
+        }
+        WorkerResult {
+            packed: Vec::new(),
+            loose: Vec::new(),
+            path_arena: arena,
+            stats: BlobIntroStats::default(),
+        }
+    }
 
     #[test]
     fn seen_sets_mark_and_query() {
@@ -716,5 +1436,87 @@ mod tests {
         assert!(seen.mark_blob(3));
         assert!(seen.is_blob_seen(3));
         assert!(!seen.mark_blob(3));
+    }
+
+    #[test]
+    fn merge_enforces_global_path_arena_capacity() {
+        let workers = vec![
+            worker_result_with_paths(b"abcd"),
+            worker_result_with_paths(b"wxyz"),
+        ];
+        match merge_worker_results(workers, 6, 10, 10) {
+            Err(err) => assert!(matches!(err, TreeDiffError::PathArenaFull)),
+            Ok(_) => panic!("expected path cap error"),
+        }
+    }
+
+    #[test]
+    fn merge_enforces_global_packed_candidate_cap() {
+        let worker_a = WorkerResult {
+            packed: vec![packed_candidate(1)],
+            loose: Vec::new(),
+            path_arena: ByteArena::with_capacity(0),
+            stats: BlobIntroStats::default(),
+        };
+        let worker_b = WorkerResult {
+            packed: vec![packed_candidate(2)],
+            loose: Vec::new(),
+            path_arena: ByteArena::with_capacity(0),
+            stats: BlobIntroStats::default(),
+        };
+
+        match merge_worker_results(vec![worker_a, worker_b], 0, 1, 10) {
+            Err(TreeDiffError::CandidateLimitExceeded {
+                kind,
+                max,
+                observed,
+            }) => {
+                assert_eq!(kind, MappingCandidateKind::Packed);
+                assert_eq!(max, 1);
+                assert_eq!(observed, 2);
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+            Ok(_) => panic!("expected packed cap error"),
+        }
+    }
+
+    #[test]
+    fn per_worker_loose_limit_never_exceeds_configured_max() {
+        assert_eq!(per_worker_loose_limit(0, 8), 0);
+        assert_eq!(per_worker_loose_limit(3, 8), 1);
+        assert_eq!(per_worker_loose_limit(100, 8), 13);
+        assert_eq!(per_worker_loose_limit(100, 1), 100);
+        assert!(per_worker_loose_limit(100, 8) <= 100);
+        assert!(per_worker_loose_limit(3, 8) <= 3);
+    }
+
+    #[test]
+    fn merge_enforces_global_loose_candidate_cap_after_dedup() {
+        let worker_a = WorkerResult {
+            packed: Vec::new(),
+            loose: vec![loose_candidate(1), loose_candidate(2)],
+            path_arena: ByteArena::with_capacity(0),
+            stats: BlobIntroStats::default(),
+        };
+        let worker_b = WorkerResult {
+            packed: Vec::new(),
+            loose: vec![loose_candidate(2), loose_candidate(3)],
+            path_arena: ByteArena::with_capacity(0),
+            stats: BlobIntroStats::default(),
+        };
+
+        match merge_worker_results(vec![worker_a, worker_b], 0, 10, 2) {
+            Err(TreeDiffError::CandidateLimitExceeded {
+                kind,
+                max,
+                observed,
+            }) => {
+                assert_eq!(kind, MappingCandidateKind::Loose);
+                assert_eq!(max, 2);
+                assert_eq!(observed, 3);
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+            Ok(_) => panic!("expected loose cap error"),
+        }
     }
 }

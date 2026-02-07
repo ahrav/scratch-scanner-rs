@@ -207,6 +207,39 @@ ODB-blob mode allocates fixed-capacity data structures once at startup:
   ODB-blob replays the introducer and streams candidates into the existing
   spill + dedupe pipeline, reusing `SpillLimits` for disk-backed buffering.
 
+### Parallel ODB-Blob Mode (`blob_intro_workers > 1`)
+
+When parallel blob introduction is enabled, the memory model changes:
+
+- **AtomicSeenSets**: replaces the serial `DynamicBitSet` pair with a
+  lock-free `AtomicBitSet` pair (trees + blobs) sized identically to
+  `midx.object_count`. Memory footprint is the same (1 bit per object per
+  set); the only overhead is atomic operations on the backing words.
+- **Per-worker budget division**: global budgets are divided by
+  `worker_count` with floor/cap clamping to avoid undersized allocations:
+
+  | Budget | Division | Floor | Cap |
+  | --- | --- | --- | --- |
+  | `max_tree_cache_bytes` | `÷ workers` | 4 MiB | — |
+  | `max_tree_delta_cache_bytes` | `÷ workers` | 4 MiB | — |
+  | `max_tree_spill_bytes` | `÷ workers` | 64 MiB | — |
+  | `max_tree_bytes_in_flight` | `÷ workers` | 64 MiB | — |
+  | `max_packed_candidates` | `÷ workers` | 1024 | original cap |
+  | `max_loose_candidates` | `÷ workers` (ceil) | 0 | original cap |
+  | `path_arena_capacity` | `÷ workers` | 64 KiB | original cap |
+
+- **Post-merge global cap re-validation**: after worker results are
+  concatenated, `merge_worker_results` enforces the original global caps:
+  - Packed candidates are truncated to `mapping_cfg_max_packed`.
+  - Path arena bytes are bounded by `mapping_cfg_path_arena_capacity`
+    (overflow during arena merge returns an error).
+  - Loose candidates are deduplicated by OID, then truncated to
+    `mapping_cfg_max_loose`.
+- **Per-worker isolation**: each worker owns its own `ObjectStore` (with
+  tree cache, delta cache, and spill arena) and `PackCandidateCollector`.
+  No per-worker state is shared except the `AtomicSeenSets` and the
+  work-stealing chunk counter.
+
 ## Git Pack Planning Budgets
 
 Pack planning builds per-pack `PackPlan` buffers sized to the candidate set

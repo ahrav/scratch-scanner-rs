@@ -209,6 +209,8 @@ pub enum TreeDiffError {
     CandidateSinkError { detail: String },
     /// Object store failure (MIDX, pack, or loose object decode).
     ObjectStoreError { detail: String },
+    /// Cooperative abort signalled by another worker.
+    Aborted,
 }
 
 impl fmt::Display for TreeDiffError {
@@ -244,6 +246,7 @@ impl fmt::Display for TreeDiffError {
             ),
             Self::CandidateSinkError { detail } => write!(f, "candidate sink error: {detail}"),
             Self::ObjectStoreError { detail } => write!(f, "object store error: {detail}"),
+            Self::Aborted => write!(f, "aborted by cooperative cancellation"),
         }
     }
 }

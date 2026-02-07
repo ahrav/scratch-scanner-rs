@@ -3,11 +3,30 @@
 //! Provides an append-only, preallocated, memory-mapped file used to store
 //! tree bytes on disk while keeping RAM usage bounded. The arena is designed
 //! for sequential writes and read-only slices by offset/length.
+//!
+//! # Dual-mapping strategy
+//!
+//! The backing file is mapped twice:
+//! - **`writer` (`MmapMut`)** — used by the owning thread to append bytes
+//!   via `copy_from_slice`. The cursor advances monotonically.
+//! - **`reader` (`Arc<Mmap>`)** — a read-only mapping shared (via `Arc`)
+//!   with all `SpillSlice` handles. Reads see writes because both mappings
+//!   refer to the same file and the kernel ensures page-cache coherence.
+//!
+//! This split avoids handing out mutable references while readers exist
+//! and lets `SpillSlice` outlive the arena without lifetime coupling.
+//!
+//! # File lifecycle
+//!
+//! The spill file is created with a fixed size (`capacity`) and is *not*
+//! deleted by this type. The caller (usually the spill directory cleanup)
+//! is responsible for removing the file or directory after the scan.
 
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use memmap2::{Mmap, MmapMut};
@@ -94,6 +113,17 @@ impl From<io::Error> for SpillArenaError {
 }
 
 /// Append-only spill arena backed by a memory-mapped file.
+///
+/// The arena pre-allocates the full file on creation and writes
+/// sequentially via the mutable mapping. Reads go through `Arc<Mmap>`
+/// handles embedded in `SpillSlice`, so returned slices remain valid
+/// even after the arena itself is dropped.
+///
+/// # Thread safety
+///
+/// `SpillArena` is `!Sync` — only one thread may append. The returned
+/// `SpillSlice` handles are `Send + Sync` because they hold an `Arc`
+/// to the immutable read mapping.
 #[derive(Debug)]
 pub struct SpillArena {
     path: PathBuf,
@@ -112,12 +142,15 @@ impl SpillArena {
         let path = make_spill_path(dir);
         let file = open_spill_file(&path, capacity)?;
 
-        // SAFETY: The spill file length is fixed at creation and remains
-        // immutable for the duration of the job. We only write through the
-        // mutable mapping and never resize the file.
+        // SAFETY: The file length is set once at creation (`set_len`) and
+        // never resized. Only this arena writes to the file (through
+        // `writer`), and the write cursor advances monotonically without
+        // re-visiting earlier regions. No external process modifies the
+        // file during the scan lifetime.
         let writer = unsafe { MmapMut::map_mut(&file)? };
-        // SAFETY: The read-only mapping shares the same immutable-length file
-        // and is only used for immutable reads.
+        // SAFETY: Same fixed-length file. The read mapping is immutable
+        // and only observes bytes previously written through `writer`.
+        // Kernel page-cache coherence ensures visibility of prior writes.
         let reader = Arc::new(unsafe { Mmap::map(&file)? });
 
         advise_sequential(&file, &reader);
@@ -186,19 +219,31 @@ impl SpillArena {
     }
 }
 
+/// Monotonic counter to prevent path collisions when multiple
+/// `ObjectStore` instances are constructed concurrently (parallel blob
+/// intro). The PID + timestamp alone can collide within the same
+/// nanosecond on fast thread spawns.
+static SPILL_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Construct a unique spill file path within `dir`.
+///
+/// Includes PID, timestamp, and a monotonic counter to avoid collisions.
 fn make_spill_path(dir: &Path) -> PathBuf {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap();
+        .unwrap_or_default();
+    let counter = SPILL_COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut path = dir.to_path_buf();
     path.push(format!(
-        "tree_spill_{}_{}",
+        "tree_spill_{}_{}_{}",
         std::process::id(),
-        now.as_nanos()
+        now.as_nanos(),
+        counter
     ));
     path
 }
 
+/// Creates (or truncates) the spill file and sets its length to `capacity`.
 fn open_spill_file(path: &Path, capacity: u64) -> Result<File, SpillArenaError> {
     let file = OpenOptions::new()
         .read(true)
@@ -211,6 +256,12 @@ fn open_spill_file(path: &Path, capacity: u64) -> Result<File, SpillArenaError> 
     Ok(file)
 }
 
+/// Hints the OS that the spill file will be accessed sequentially.
+///
+/// On Linux, calls `posix_fadvise(SEQUENTIAL)` on the file descriptor and
+/// `madvise(SEQUENTIAL)` on the read mapping. On other Unix platforms,
+/// only the madvise hint is issued. Failures are silently ignored because
+/// these are advisory-only and do not affect correctness.
 #[cfg(unix)]
 fn advise_sequential(file: &File, reader: &Mmap) {
     unsafe {

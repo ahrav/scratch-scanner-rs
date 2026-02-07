@@ -55,9 +55,19 @@ flowchart LR
 
 ## Concurrency and Backpressure
 
-Stages before pack execution (preflight, repo open, commit walk, tree diff,
-spill/dedupe, mapping) run **single-threaded**. Pack planning and pack
-execution introduce parallelism:
+Most stages before pack execution (preflight, repo open, commit walk, tree diff,
+spill/dedupe, mapping) run **single-threaded**. Blob introduction (ODB-blob
+mode) and pack planning/execution introduce parallelism:
+
+- **Blob introduction** (ODB-blob mode only) can run in parallel when
+  `blob_intro_workers > 1`. The commit plan is pre-partitioned into
+  `~4 × worker_count` chunks. Workers claim chunks via an atomic counter
+  (work-stealing pattern), each with its own `ObjectStore` and
+  `PackCandidateCollector`. A shared `AtomicSeenSets` (lock-free bitmap)
+  ensures each tree/blob is claimed by exactly one worker. Cache budgets
+  (tree cache, delta cache, spill arena, packed cap, loose cap, path arena)
+  are divided per worker with floor/cap clamping. After all workers finish,
+  results are merged and global caps are re-validated.
 
 - **Pack planning** runs on a dedicated thread (`std::thread::scope`) that
   streams `PackPlan` values through a bounded `sync_channel(1)` while the
