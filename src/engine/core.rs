@@ -68,6 +68,7 @@ use super::vectorscan_prefilter::{
 use super::work_items::{EncRef, WorkItem};
 use crate::api::{Gate, TransformConfig, TransformId, TransformMode};
 use std::ops::Range;
+use std::time::Instant;
 
 // --------------------------
 // Statistics types
@@ -587,6 +588,7 @@ impl Engine {
             .map(|tc| tc.max_decoded_bytes)
             .max()
             .unwrap_or(0);
+        let init_diag = std::env::var_os("SCANNER_INIT_DIAG").is_some();
         let max_encoded_len = transforms
             .iter()
             .map(|tc| tc.max_encoded_len)
@@ -680,26 +682,32 @@ impl Engine {
         } else {
             None
         };
+        let t_vs = Instant::now();
         let vs = Some(
             VsPrefilterDb::try_new(&rules, &tuning, anchor_input, Some(&use_raw_prefilter))
                 .expect("vectorscan prefilter db build failed (fallback disabled)"),
         );
+        let vs_ms = t_vs.elapsed().as_millis();
         let max_regex_width = vs
             .as_ref()
             .and_then(|db| db.max_match_width_bounded())
             .map(|w| w as usize);
         // Prefer Vectorscan's bounded width; fall back to longest anchor length.
         let max_prefilter_width = max_regex_width.unwrap_or(max_anchor_pat_len);
+        let t_vs_stream = Instant::now();
         let vs_stream = VsStreamDb::try_new_stream(&rules, max_decoded_cap).ok();
+        let vs_stream_ms = t_vs_stream.elapsed().as_millis();
         let needs_decoded_gate = transforms
             .iter()
             .any(|tc| tc.gate == Gate::AnchorsInDecoded);
+        let t_vs_gate = Instant::now();
         let vs_gate =
             if needs_decoded_gate && !anchor_patterns_all.is_empty() && vs_stream.is_some() {
                 VsGateDb::try_new_gate(&anchor_patterns_all).ok()
             } else {
                 None
             };
+        let vs_gate_ms = t_vs_gate.elapsed().as_millis();
         let max_stream_window_bytes = vs_stream
             .as_ref()
             .and_then(|db| {
@@ -719,6 +727,7 @@ impl Engine {
             .max(max_anchor_window_bytes)
             .max(STREAM_DECODE_CHUNK_BYTES)
             .max(1);
+        let t_vs_utf16 = Instant::now();
         let vs_utf16 = if !has_utf16_anchors {
             None
         } else {
@@ -739,6 +748,8 @@ impl Engine {
                 }
             }
         };
+        let vs_utf16_ms = t_vs_utf16.elapsed().as_millis();
+        let t_vs_utf16_stream = Instant::now();
         let vs_utf16_stream = if !has_utf16_anchors {
             None
         } else {
@@ -759,6 +770,13 @@ impl Engine {
                 }
             }
         };
+        let vs_utf16_stream_ms = t_vs_utf16_stream.elapsed().as_millis();
+        if init_diag {
+            eprintln!(
+                "init_diag: vs_ms={} vs_stream_ms={} vs_gate_ms={} vs_utf16_ms={} vs_utf16_stream_ms={}",
+                vs_ms, vs_stream_ms, vs_gate_ms, vs_utf16_ms, vs_utf16_stream_ms,
+            );
+        }
         let mut scanbuf_transform_idxs_active_non_base64 =
             Vec::with_capacity(transforms.len().min(8));
         let mut scanbuf_transform_idxs_active_base64 = Vec::with_capacity(transforms.len().min(8));
@@ -834,6 +852,15 @@ impl Engine {
         &self.unfilterable_rules
     }
 
+    /// Select which transform index buckets to iterate for a `ScanBuf` work item.
+    ///
+    /// When `found_any_in_this_buf` is true (a finding was produced), only
+    /// `Always`-mode transforms run — `Active`-mode transforms are skipped
+    /// because the prefilter already covered them. When false, all active
+    /// transforms run to discover encoded secrets invisible to the raw prefilter.
+    ///
+    /// Returns `(non_base64_indices, base64_indices)`. Base64 transforms are
+    /// separated so the caller can apply the pre-decode gate only to Base64 spans.
     #[inline(always)]
     fn scanbuf_transform_buckets(&self, found_any_in_this_buf: bool) -> (&[usize], &[usize]) {
         if found_any_in_this_buf {

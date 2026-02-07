@@ -244,6 +244,10 @@ pub struct ShardIoStats {
     pub read_ns: u64,
     /// Number of files skipped because they are archives.
     pub archives_skipped: u64,
+    /// `yield_now()` calls in `push_with_backoff` slow path.
+    pub push_yields: u64,
+    /// `yield_now()` calls in `acquire_buffer_with_backoff` slow path.
+    pub acquire_yields: u64,
 }
 
 /// Scan thread statistics for a single shard.
@@ -257,6 +261,12 @@ pub struct ShardScanStats {
     pub findings_emitted: u64,
     /// Cumulative nanoseconds spent in `scan_chunk_into`.
     pub scan_ns: u64,
+    /// `yield_now()` calls while waiting for the SPSC ring.
+    /// Each yield is a syscall (~2-5μs). Multiply by estimated cost
+    /// to approximate total wait time without per-call `Instant::now()` overhead.
+    pub pop_yields: u64,
+    /// `try_pop` succeeded on first attempt (no spin needed).
+    pub pop_immediate: u64,
 }
 
 /// Aggregated report from a sharded filesystem scan.
@@ -397,7 +407,10 @@ pub(super) fn shard_scan_loop<E: ScanEngine>(
     loop {
         // Try to pop a chunk from the SPSC ring.
         let chunk = match consumer.try_pop() {
-            Some(c) => c,
+            Some(c) => {
+                stats.pop_immediate += 1;
+                c
+            }
             None => {
                 // Ring empty: spin (hint only), retry once, then yield.
                 for _ in 0..SPIN_ITERS {
@@ -406,6 +419,7 @@ pub(super) fn shard_scan_loop<E: ScanEngine>(
                 match consumer.try_pop() {
                     Some(c) => c,
                     None => {
+                        stats.pop_yields += 1;
                         std::thread::yield_now();
                         continue;
                     }
@@ -468,8 +482,10 @@ fn process_scan_chunk<E: ScanEngine>(
     let len_usize = len as usize;
     let data = &buf.as_slice()[..len_usize];
 
+    #[cfg(feature = "stats")]
     let t0 = Instant::now();
     engine.scan_chunk_into(data, file_id, base_offset, scratch);
+    #[cfg(feature = "stats")]
     let scan_elapsed = t0.elapsed().as_nanos() as u64;
 
     // Drop findings fully contained in the overlap prefix.
@@ -492,7 +508,10 @@ fn process_scan_chunk<E: ScanEngine>(
     stats.chunks_scanned = stats.chunks_scanned.saturating_add(1);
     stats.bytes_scanned = stats.bytes_scanned.saturating_add(payload);
     stats.findings_emitted = stats.findings_emitted.saturating_add(pending.len() as u64);
-    stats.scan_ns = stats.scan_ns.saturating_add(scan_elapsed);
+    #[cfg(feature = "stats")]
+    {
+        stats.scan_ns = stats.scan_ns.saturating_add(scan_elapsed);
+    }
 
     // Buffer returns to pool on drop (RAII).
     drop(buf);
@@ -575,7 +594,7 @@ fn shard_io_blocking<E: ScanEngine>(
     }
 
     // Channel drained. Push shutdown sentinel.
-    push_with_backoff(&mut producer, ScanChunk::Shutdown);
+    push_with_backoff(&mut producer, ScanChunk::Shutdown, &mut stats.push_yields);
     stats
 }
 
@@ -596,6 +615,7 @@ fn process_file(
     stats: &mut ShardIoStats,
 ) {
     // --- Open + stat ---
+    #[cfg(feature = "stats")]
     let t_open = Instant::now();
     let mut file = match File::open(&work.path) {
         Ok(f) => f,
@@ -612,8 +632,11 @@ fn process_file(
             return;
         }
     };
-    let open_stat_elapsed = t_open.elapsed().as_nanos() as u64;
-    stats.open_stat_ns = stats.open_stat_ns.saturating_add(open_stat_elapsed);
+    #[cfg(feature = "stats")]
+    {
+        let open_stat_elapsed = t_open.elapsed().as_nanos() as u64;
+        stats.open_stat_ns = stats.open_stat_ns.saturating_add(open_stat_elapsed);
+    }
 
     let size = meta.len();
 
@@ -624,6 +647,11 @@ fn process_file(
     if size > max_file_size {
         return;
     }
+
+    // Local backoff counters — accumulated into stats at the end of this function,
+    // avoiding split-borrow issues with `stats` and its fields.
+    let mut local_push_yields: u64 = 0;
+    let mut local_acquire_yields: u64 = 0;
 
     // --- Archive detection ---
     // Check extension first (cheap), then sniff the header if needed.
@@ -643,7 +671,8 @@ fn process_file(
 
         if is_archive {
             stats.archives_skipped = stats.archives_skipped.saturating_add(1);
-            push_with_backoff(producer, ScanChunk::EndOfFile);
+            push_with_backoff(producer, ScanChunk::EndOfFile, &mut local_push_yields);
+            stats.push_yields = stats.push_yields.saturating_add(local_push_yields);
             return;
         }
     }
@@ -684,7 +713,7 @@ fn process_file(
         }
 
         // Acquire a buffer from the pool (blocking spin+yield).
-        let mut buf = acquire_buffer_with_backoff(pool);
+        let mut buf = acquire_buffer_with_backoff(pool, &mut local_acquire_yields);
 
         // Copy overlap prefix from the carry buffer into the head of the buffer.
         let prefix_len = if first_chunk {
@@ -703,6 +732,7 @@ fn process_file(
         let payload_want = (remaining as usize).min(chunk_size);
 
         // Read payload bytes into the buffer after the overlap prefix.
+        #[cfg(feature = "stats")]
         let t_read = Instant::now();
         let payload_got = match read_full(
             &mut file,
@@ -716,8 +746,11 @@ fn process_file(
                 break;
             }
         };
-        let read_elapsed = t_read.elapsed().as_nanos() as u64;
-        stats.read_ns = stats.read_ns.saturating_add(read_elapsed);
+        #[cfg(feature = "stats")]
+        {
+            let read_elapsed = t_read.elapsed().as_nanos() as u64;
+            stats.read_ns = stats.read_ns.saturating_add(read_elapsed);
+        }
 
         if payload_got == 0 {
             // Unexpected EOF (file shrank between stat and read).
@@ -755,12 +788,17 @@ fn process_file(
                 display: Arc::clone(&display),
                 file_id,
             },
+            &mut local_push_yields,
         );
     }
 
     // Send EndOfFile sentinel so the scan thread knows to reset per-file state.
-    push_with_backoff(producer, ScanChunk::EndOfFile);
+    push_with_backoff(producer, ScanChunk::EndOfFile, &mut local_push_yields);
     stats.files_processed = stats.files_processed.saturating_add(1);
+
+    // Accumulate local backoff counters into per-shard stats.
+    stats.push_yields = stats.push_yields.saturating_add(local_push_yields);
+    stats.acquire_yields = stats.acquire_yields.saturating_add(local_acquire_yields);
 }
 
 /// Read exactly `dst.len()` bytes, retrying on short reads and EINTR.
@@ -788,10 +826,13 @@ fn read_full(file: &mut File, dst: &mut [u8]) -> io::Result<usize> {
 /// Wait strategy: try push → spin (hint only, no retry) → retry once → yield.
 /// This avoids the O(SPIN_ITERS) retries-per-spin that caused excessive context
 /// switches with small ring capacities.
+///
+/// `push_yields` is incremented on each `yield_now()` call in the slow path.
 #[inline]
 pub(super) fn push_with_backoff<T: Send + 'static, const N: usize>(
     producer: &mut OwnedSpscProducer<T, N>,
     mut value: T,
+    push_yields: &mut u64,
 ) {
     // Fast path: ring likely has room.
     match producer.try_push(value) {
@@ -809,6 +850,7 @@ pub(super) fn push_with_backoff<T: Send + 'static, const N: usize>(
             Ok(()) => return,
             Err(v) => value = v,
         }
+        *push_yields += 1;
         // Yield to OS scheduler before next spin round.
         std::thread::yield_now();
     }
@@ -821,8 +863,13 @@ pub(super) fn push_with_backoff<T: Send + 'static, const N: usize>(
 /// so this eventually succeeds.
 ///
 /// Wait strategy: try acquire → spin (hint only) → retry once → yield.
+///
+/// `acquire_yields` is incremented on each `yield_now()` call in the slow path.
 #[inline]
-pub(super) fn acquire_buffer_with_backoff(pool: &TsBufferPool) -> TsBufferHandle {
+pub(super) fn acquire_buffer_with_backoff(
+    pool: &TsBufferPool,
+    acquire_yields: &mut u64,
+) -> TsBufferHandle {
     // Fast path: pool likely has a buffer.
     if let Some(buf) = pool.try_acquire() {
         return buf;
@@ -835,6 +882,7 @@ pub(super) fn acquire_buffer_with_backoff(pool: &TsBufferPool) -> TsBufferHandle
         if let Some(buf) = pool.try_acquire() {
             return buf;
         }
+        *acquire_yields += 1;
         std::thread::yield_now();
     }
 }

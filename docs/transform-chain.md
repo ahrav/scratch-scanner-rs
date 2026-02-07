@@ -2,6 +2,10 @@
 
 Recursive decoding flow for URL percent-encoding and Base64 transforms.
 
+Startup note: the decoded-stream Vectorscan database used by transform gating
+can be loaded from the on-disk Vectorscan DB cache (`SCANNER_VS_DB_CACHE*`).
+Cache behavior only affects startup time; runtime transform semantics are unchanged.
+
 ```mermaid
 flowchart TB
     subgraph WorkQueue["Work Queue Processing"]
@@ -134,6 +138,10 @@ Transform findings produced by the engine flow through the unified event
 contract (`ScanEvent::Finding`) in both filesystem and git scan modes. The
 decode/transform decision logic and budgets in this document are unchanged;
 only emission/reporting wiring changed.
+
+For filesystem scans, this emission happens from owner-compute workers in
+`src/scheduler/local_fs_owner.rs` (each worker performs both I/O and scanning
+with worker-local reusable state).
 
 See [`scanner-unification.md`](scanner-unification.md) for routing/output
 details.

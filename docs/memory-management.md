@@ -2,6 +2,17 @@
 
 Buffer lifecycle and pool management in scanner-rs.
 
+## Unified FS Owner-Compute Model
+
+The unified filesystem entrypoint (`scanner-rs scan fs`) now uses
+`src/scheduler/local_fs_owner.rs`:
+
+- One thread per worker.
+- Round-robin dispatch assigns discovered files to workers.
+- Each worker owns and reuses its own chunk buffer, overlap state, pending
+  findings vector, and scan scratch.
+- There is no cross-thread chunk handoff between I/O and scan stages.
+
 ## Multi-Core Production Memory Model
 
 The production multi-core scanner (`scan_local`) allocates memory at startup
@@ -54,9 +65,13 @@ ParallelScanConfig {
 
 After startup allocation, the scan phase is allocation-free:
 - All per-worker scratch is pre-allocated (ScanScratch, LocalScratch)
-- Buffer pool provides fixed I/O buffers (TsBufferPool)
+- Unified FS owner-compute workers reuse worker-local I/O buffers
 - Findings use pre-sized vectors that are reused across chunks
 - Archive scanning reuses `archive::scan::ArchiveScratch` buffers (path builders, tar/zip cursors, gzip header/name buffers) and per-sink scratch for entry scanning
+
+Startup may perform best-effort Vectorscan DB cache I/O (deserialize on hit,
+serialize on miss) for raw prefilter and decoded-stream prefilter databases.
+This affects startup latency only; hot-path scan memory behavior is unchanged.
 
 Path storage is also bounded: `FileTable` maintains a fixed-capacity byte arena
 for Unix paths. Archive expansion uses fallible `try_*` insertion APIs plus

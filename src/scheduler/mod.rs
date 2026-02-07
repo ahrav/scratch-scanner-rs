@@ -69,6 +69,8 @@
 //! | Module | Purpose |
 //! |--------|---------|
 //! | [`local`] | Low-level filesystem scanning with `std::fs` |
+//! | [`local_fs_owner`] | Owner-compute filesystem scanning (shared channel, fadvise, worker-local I/O + scan) |
+//! | [`local_fs_sharded`] | Legacy sharded I/O+scan thread pairs (used by io_uring only) |
 //! | [`parallel_scan`] | High-level directory scanning with gitignore support |
 //! | [`local_fs_uring`] | Linux-only io_uring backend (feature `io-uring`) |
 //! | [`remote`] | HTTP/object-store backend with retry policies |
@@ -231,6 +233,7 @@ pub mod worker_id;
 
 // I/O backends
 pub mod local;
+pub mod local_fs_owner;
 pub mod local_fs_sharded;
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub mod local_fs_uring;
@@ -289,9 +292,10 @@ pub use worker_id::{current_worker_id, set_current_worker_id};
 pub use local::{
     scan_local, FileSource, LocalConfig, LocalFile, LocalReport, LocalStats, VecFileSource,
 };
-pub use local_fs_sharded::{
-    scan_local_fs_sharded, ShardIoStats, ShardScanStats, ShardedFsConfig, ShardedFsReport,
+pub use local_fs_owner::{
+    scan_local_fs_owner_compute, OwnerComputeFsConfig, OwnerComputeFsReport, OwnerWorkerStats,
 };
+// local_fs_sharded types are not re-exported; used only by local_fs_uring internally.
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub use local_fs_uring::{
     scan_local_fs_uring, scan_local_fs_uring_sharded, LocalFsUringConfig, ShardedFsUringConfig,

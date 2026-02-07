@@ -86,33 +86,22 @@ pub fn parse_args() -> io::Result<ScanConfig> {
     }
 }
 
+/// Parse `--path`, `--workers`, and other FS-specific flags from the
+/// remaining argument iterator. Accepts `--path=<dir>` or a bare positional
+/// path. Exits with code 2 on unrecognised flags or missing `--path`.
 fn parse_fs_args(args: env::ArgsOs) -> io::Result<ScanConfig> {
     let mut path: Option<PathBuf> = None;
     let mut workers: Option<usize> = None;
     let mut decode_depth: Option<usize> = None;
     let mut no_archives = false;
+    let mut null_sink = false;
     let mut anchor_mode = AnchorMode::Manual;
     let mut event_format = EventFormat::Jsonl;
-    let mut io_backend = super::IoBackend::default();
 
     for arg in args {
         if let Some(flag) = arg.to_str() {
             if let Some(rest) = flag.strip_prefix("--path=") {
                 path = Some(PathBuf::from(rest));
-                continue;
-            }
-            if let Some(rest) = flag.strip_prefix("--backend=") {
-                io_backend = match rest {
-                    "blocking" => super::IoBackend::Blocking,
-                    "sharded" => super::IoBackend::Sharded,
-                    _ => {
-                        eprintln!(
-                            "invalid --backend value: {} (expected blocking|sharded)",
-                            rest
-                        );
-                        std::process::exit(2);
-                    }
-                };
                 continue;
             }
             if let Some(rest) = flag.strip_prefix("--workers=") {
@@ -139,6 +128,10 @@ fn parse_fs_args(args: env::ArgsOs) -> io::Result<ScanConfig> {
             match flag {
                 "--no-archives" => {
                     no_archives = true;
+                    continue;
+                }
+                "--null-sink" => {
+                    null_sink = true;
                     continue;
                 }
                 "--help" | "-h" => {
@@ -175,12 +168,15 @@ fn parse_fs_args(args: env::ArgsOs) -> io::Result<ScanConfig> {
             decode_depth,
             no_archives,
             anchor_mode,
-            io_backend,
+            null_sink,
         }),
         event_format,
     })
 }
 
+/// Parse `--repo`, `--mode`, and other git-specific flags from the
+/// remaining argument iterator. Accepts `--repo=<path>` or a bare positional
+/// path. Exits with code 2 on unrecognised flags or missing `--repo`.
 fn parse_git_args(args: env::ArgsOs) -> io::Result<ScanConfig> {
     let mut repo: Option<PathBuf> = None;
     let mut repo_id: u64 = 1;
@@ -324,6 +320,7 @@ fn parse_git_args(args: env::ArgsOs) -> io::Result<ScanConfig> {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Parse a string value into `T`, or exit with code 2 on parse failure.
 fn parse_or_exit<T: std::str::FromStr>(s: &str, flag: &str) -> T {
     s.parse().unwrap_or_else(|_| {
         eprintln!("invalid {} value: {}", flag, s);
@@ -386,8 +383,8 @@ OPTIONS:
     --workers=<N>           Worker threads (default: CPU count)
     --decode-depth=<N>      Max decode depth (default: 2)
     --no-archives           Disable archive scanning
+    --null-sink             Drop all findings (measure scan overhead only)
     --anchors=manual|derived  Anchor mode (default: manual)
-    --backend=blocking|sharded  I/O backend (default: sharded)
     --event-format=jsonl    Output format (default: jsonl)
     --help, -h              Show this help"
     );

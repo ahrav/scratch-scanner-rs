@@ -663,7 +663,14 @@ struct ReadOp {
 
 /// Drain all in-flight operations before returning.
 ///
-/// SAFETY: This MUST be called before dropping the ring/ops if any operations
+/// Waits for every outstanding CQE and disposes of the associated `Op`.
+/// For `Read` ops the `FixedBufferHandle` is dropped, returning it to the
+/// pool. For `Open` ops with a successful result the returned fd is closed
+/// to prevent leaks. No scan tasks are spawned — this is a shutdown path.
+///
+/// # Safety requirement
+///
+/// This MUST be called before dropping the ring/ops if any operations
 /// are in-flight, otherwise the kernel may write to freed memory.
 fn drain_in_flight(
     ring: &mut IoUring,
@@ -839,9 +846,14 @@ fn io_worker_loop<E: ScanEngine>(
     let mut stopping = false;
     let mut channel_closed = false;
 
+    /// Result of blocking open + fstat for files when io_uring open/stat
+    /// ops are unsupported or the mode is `BlockingOnly`.
     enum BlockingOutcome {
+        /// File opened and sized; ready for read submissions.
         Ready(ReadState),
+        /// File skipped (empty or exceeds `max_file_size`).
         Skipped,
+        /// Open or fstat failed.
         Failed,
     }
 
@@ -1990,6 +2002,10 @@ fn shard_io_uring_loop<E: ScanEngine>(
     let mut ring = IoUring::new(cfg.ring_entries)?;
     let mut stats = ShardIoStats::default();
 
+    // Local backoff counter passed to push_with_backoff.
+    // Accumulated into stats at the end.
+    let mut local_push_yields: u64 = 0;
+
     // Probe once per ring to decide open/stat eligibility.
     let mut open_stat_fallback = false;
     let open_stat_caps = match cfg.open_stat_mode {
@@ -2046,9 +2062,13 @@ fn shard_io_uring_loop<E: ScanEngine>(
 
     // --- Blocking open+stat fallback (reused from io_worker_loop) ---
 
+    /// Result of blocking open + fstat (same semantics as in `io_worker_loop`).
     enum BlockingOutcome {
+        /// File opened and sized; ready for shard I/O submission.
         Ready(ReadState),
+        /// File skipped (empty or exceeds `max_file_size`).
         Skipped,
+        /// Open or fstat failed.
         Failed,
     }
 
@@ -2203,7 +2223,7 @@ fn shard_io_uring_loop<E: ScanEngine>(
                 if st.failed || st.done {
                     st.done = true;
                     // Push EndOfFile so scan thread resets per-file state.
-                    push_with_backoff(&mut producer, ScanChunk::EndOfFile);
+                    push_with_backoff(&mut producer, ScanChunk::EndOfFile, &mut local_push_yields);
                     files[file_slot] = None;
                     free_file_slots.push(file_slot);
                     continue;
@@ -2215,7 +2235,11 @@ fn shard_io_uring_loop<E: ScanEngine>(
 
                         if rs.next_offset >= rs.size {
                             st.done = true;
-                            push_with_backoff(&mut producer, ScanChunk::EndOfFile);
+                            push_with_backoff(
+                                &mut producer,
+                                ScanChunk::EndOfFile,
+                                &mut local_push_yields,
+                            );
                             files[file_slot] = None;
                             free_file_slots.push(file_slot);
                             continue;
@@ -2585,6 +2609,7 @@ fn shard_io_uring_loop<E: ScanEngine>(
                                     display: Arc::clone(&st.token.display),
                                     file_id: st.token.file_id,
                                 },
+                                &mut local_push_yields,
                             );
 
                             if !st.done && !st.failed && rs.next_offset < rs.size {
@@ -2596,7 +2621,11 @@ fn shard_io_uring_loop<E: ScanEngine>(
                     }
 
                     if st.done && st.in_flight == 0 {
-                        push_with_backoff(&mut producer, ScanChunk::EndOfFile);
+                        push_with_backoff(
+                            &mut producer,
+                            ScanChunk::EndOfFile,
+                            &mut local_push_yields,
+                        );
                         stats.files_processed = stats.files_processed.saturating_add(1);
                         files[op.file_slot] = None;
                         free_file_slots.push(op.file_slot);
@@ -2817,7 +2846,10 @@ fn shard_io_uring_loop<E: ScanEngine>(
     }
 
     // Push shutdown sentinel for the scan thread.
-    push_with_backoff(&mut producer, ScanChunk::Shutdown);
+    push_with_backoff(&mut producer, ScanChunk::Shutdown, &mut local_push_yields);
+
+    // Accumulate backoff counters into stats.
+    stats.push_yields = stats.push_yields.saturating_add(local_push_yields);
 
     Ok(stats)
 }

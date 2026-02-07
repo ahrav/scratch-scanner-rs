@@ -56,20 +56,6 @@ pub enum SourceConfig {
     Git(GitSourceConfig),
 }
 
-/// I/O backend selection for filesystem scanning.
-///
-/// Selectable via `--backend=blocking|sharded`. The default is `Sharded`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum IoBackend {
-    /// Work-stealing executor with inline I/O + scan per worker (legacy).
-    Blocking,
-    /// Per-shard share-nothing model: separate I/O and scan threads per shard,
-    /// connected by a wait-free SPSC ring buffer. Eliminates I/O-blocking
-    /// stalls in the scan engine (default).
-    #[default]
-    Sharded,
-}
-
 /// Filesystem scan configuration.
 pub struct FsScanConfig {
     /// Directory or file path to scan.
@@ -82,8 +68,9 @@ pub struct FsScanConfig {
     pub no_archives: bool,
     /// Anchor extraction mode for rule matching.
     pub anchor_mode: AnchorMode,
-    /// I/O backend selection (default: `Sharded`).
-    pub io_backend: IoBackend,
+    /// Use a no-op event sink (drops all findings). For measuring scan overhead
+    /// without JSON encoding + stdout I/O.
+    pub null_sink: bool,
 }
 
 /// Git repository scan configuration.
