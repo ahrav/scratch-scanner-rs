@@ -206,6 +206,7 @@ impl ScannerSimRunner {
     }
 
     // Wrap a single run to convert panics into a structured failure.
+    #[allow(dead_code)] // Convenience wrapper; used in future test expansions.
     fn run_once_catch(
         &self,
         scenario: &Scenario,
@@ -1777,6 +1778,7 @@ fn apply_corruption(buf: &mut Vec<u8>, corruption: &Corruption) {
 #[derive(Clone, Debug)]
 struct ExpectedEntry {
     path: SimPath,
+    #[allow(dead_code)] // Retained for Debug output.
     file_id: FileId,
     rule_id: u32,
     span: SpanU32,

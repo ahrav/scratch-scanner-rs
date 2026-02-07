@@ -238,6 +238,7 @@ impl Base64DecodeStats {
     }
 
     /// Accumulates counters from `other` into `self` with saturating arithmetic.
+    #[allow(dead_code)] // Building block for multi-worker stat aggregation.
     pub(crate) fn add(&mut self, other: &Self) {
         #[cfg(not(all(feature = "perf-stats", debug_assertions)))]
         {
