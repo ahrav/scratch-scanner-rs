@@ -238,6 +238,11 @@ pub struct Engine {
     /// Used by the zero-hit prefilter bypass to decide whether transforms
     /// could discover encoded secrets invisible to the raw-buffer prefilter.
     has_active_transforms: bool,
+    /// Byte-set of all anchor-pattern bytes across all rules. On the zero-hit
+    /// path, URL-percent transforms only need to scan if at least one `%XX`
+    /// triplet decodes to a byte in this set — otherwise no anchor could appear
+    /// in decoded output. 256-bit bitmap indexed by byte value.
+    anchor_byte_set: [u64; 4],
     /// Active transform indices for ScanBuf path split by mode/id.
     ///
     /// Bucketing by mode/id avoids hot-loop branches on `tc.mode` and `tc.id`.
@@ -746,11 +751,15 @@ impl Engine {
                 continue;
             }
             let is_base64 = tc.id == TransformId::Base64;
+            // `active` = all enabled transforms (superset); used on the hit path
+            // when no findings have been found yet in this buffer.
             if is_base64 {
                 scanbuf_transform_idxs_active_base64.push(idx);
             } else {
                 scanbuf_transform_idxs_active_non_base64.push(idx);
             }
+            // `always` = only Always-mode transforms; used on the hit path when
+            // findings have already been found (IfNoFindings transforms are skipped).
             if tc.mode == TransformMode::Always {
                 if is_base64 {
                     scanbuf_transform_idxs_always_base64.push(idx);
@@ -761,6 +770,14 @@ impl Engine {
         }
         let has_active_transforms = !scanbuf_transform_idxs_active_non_base64.is_empty()
             || !scanbuf_transform_idxs_active_base64.is_empty();
+
+        // Build anchor byte set for URL-percent gating.
+        let mut anchor_byte_set = [0u64; 4];
+        for pat in &anchor_patterns_all {
+            for &b in pat.as_slice() {
+                anchor_byte_set[(b >> 6) as usize] |= 1u64 << (b & 63);
+            }
+        }
 
         Self {
             rules: rules_compiled,
@@ -783,6 +800,7 @@ impl Engine {
             max_prefilter_width,
             stream_ring_bytes,
             has_active_transforms,
+            anchor_byte_set,
             scanbuf_transform_idxs_active_non_base64,
             scanbuf_transform_idxs_active_base64,
             scanbuf_transform_idxs_always_non_base64,
@@ -964,6 +982,8 @@ impl Engine {
                         root_buf.len() >= tc.min_len
                             && super::transform::transform_quick_trigger(tc, root_buf)
                             && self.base64_buffer_gate(tc, root_buf)
+                            && (tc.id != TransformId::UrlPercent
+                                || self.url_percent_buffer_gate(root_buf))
                     })
                     || self
                         .scanbuf_transform_idxs_active_base64
@@ -1515,6 +1535,38 @@ impl Engine {
         }
     }
 
+    /// Cheap gate for URL-percent transforms on the zero-hit path.
+    ///
+    /// Returns `true` only if at least one `%XX` triplet in the buffer decodes
+    /// to a byte present in any anchor pattern. This filters out buffers where
+    /// `%` appears only in format specifiers (`%d`, `%s`) or other non-URL
+    /// contexts that cannot produce anchor bytes after decoding.
+    ///
+    /// Conservative: returns `true` if the anchor byte set is empty (no anchors
+    /// compiled) to avoid false negatives.
+    #[inline]
+    fn url_percent_buffer_gate(&self, buf: &[u8]) -> bool {
+        if self.anchor_byte_set == [0u64; 4] {
+            return true;
+        }
+        let bytes = buf;
+        let mut i = 0;
+        while i + 2 < bytes.len() {
+            if bytes[i] == b'%' {
+                if let Some(decoded) = decode_hex_pair(bytes[i + 1], bytes[i + 2]) {
+                    if self.anchor_byte_set[(decoded >> 6) as usize] & (1u64 << (decoded & 63)) != 0
+                    {
+                        return true;
+                    }
+                    i += 3;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        false
+    }
+
     /// Drains compact findings from scratch and materializes provenance.
     ///
     /// This consumes `scratch.out` and appends to `out` without clearing it.
@@ -1536,6 +1588,26 @@ impl Engine {
         scratch.norm_hash.clear();
         scratch.drop_hint_end.clear();
     }
+}
+
+/// Decode a pair of ASCII hex digits into a byte value.
+///
+/// Returns `None` if either digit is not valid hexadecimal.
+#[inline(always)]
+fn decode_hex_pair(hi: u8, lo: u8) -> Option<u8> {
+    let h = match hi {
+        b'0'..=b'9' => hi - b'0',
+        b'A'..=b'F' => hi - b'A' + 10,
+        b'a'..=b'f' => hi - b'a' + 10,
+        _ => return None,
+    };
+    let l = match lo {
+        b'0'..=b'9' => lo - b'0',
+        b'A'..=b'F' => lo - b'A' + 10,
+        b'a'..=b'f' => lo - b'a' + 10,
+        _ => return None,
+    };
+    Some((h << 4) | l)
 }
 
 /// Benchmark helper to expose span detection for transform configs.
