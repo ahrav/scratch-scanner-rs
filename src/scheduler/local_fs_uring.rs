@@ -42,12 +42,9 @@ use super::count_budget::{CountBudget, CountPermit};
 use super::engine_stub::BUFFER_LEN_MAX;
 use super::engine_trait::{EngineScratch, FindingRecord, ScanEngine};
 use super::executor::{Executor, ExecutorConfig, ExecutorHandle, WorkerCtx};
-use super::local_fs_owner::LocalFile;
 use super::metrics::MetricsSnapshot;
-use super::ts_buffer_pool::{TsBufferHandle, TsBufferPool, TsBufferPoolConfig};
 use crate::api::FileId;
 use crate::perf_stats;
-use crate::scheduler::affinity::pin_current_thread_to_core;
 use crate::unified::events::{EventSink, FindingEvent, ScanEvent};
 use crate::unified::SourceKind;
 
@@ -273,7 +270,6 @@ pub struct UringIoStats {
 /// io_uring via `register_buffers`. Handles return buffers to a global free
 /// queue on drop.
 struct FixedBufferPool {
-    buffer_len: usize,
     buffers: Vec<Box<[u8]>>,
     free: ArrayQueue<usize>,
 }
@@ -291,15 +287,9 @@ impl FixedBufferPool {
         }
 
         Arc::new(Self {
-            buffer_len,
             buffers,
             free,
         })
-    }
-
-    #[inline]
-    fn buffer_len(&self) -> usize {
-        self.buffer_len
     }
 
     #[inline]
@@ -451,7 +441,6 @@ struct FileToken {
 /// Work item for I/O threads.
 struct FileWork {
     path: PathBuf,
-    size: u64,
     token: Arc<FileToken>,
 }
 
@@ -635,7 +624,9 @@ enum Op {
 
 struct OpenOp {
     file_slot: usize,
+    #[allow(dead_code)]
     path: CString,
+    #[allow(dead_code)]
     open_how: Option<Box<types::OpenHow>>,
 }
 
@@ -1749,7 +1740,7 @@ fn walk_and_send_files(
         });
 
         // Backpressure: bounded channel send blocks here.
-        tx.send(FileWork { path, size, token })
+        tx.send(FileWork { path, token })
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "io threads stopped"))?;
 
         summary.files_enqueued = summary.files_enqueued.saturating_add(1);
