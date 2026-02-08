@@ -1,107 +1,124 @@
 # Detection Rules
 
-Mind map of rule coverage in scanner-rs's `demo_engine()`.
+Representative view of the current built-in detection rules used by scanner-rs.
+
+## Source of Truth
+
+- [default_rules.yaml](../default_rules.yaml)
+- [src/rules/yaml.rs](../src/rules/yaml.rs)
+- [src/rules/mod.rs](../src/rules/mod.rs)
+- [src/demo.rs](../src/demo.rs)
+- [src/unified/orchestrator.rs](../src/unified/orchestrator.rs)
+
+## Current Snapshot
+
+The values below are from the current repository snapshot:
+
+- Built-in rules: `223`
+- `two_phase` enabled: `2` rules (`private-key`, `vault-service-token-legacy`)
+- `entropy` enabled: `131` rules
+- `local_context` enabled: `1` rule (`generic-api-key`)
+- `secret_group` enabled: `2` rules (`microsoft-teams-webhook`, `sonar-api-token`)
+- `must_contain` enabled: `0` rules
+- `keywords_any` enabled: `223` rules
+
+Rule loading order:
+
+1. Explicit `--rules=<path>`
+2. `default_rules.yaml` next to the scanner binary
+3. Compiled-in fallback (`include_str!("../../default_rules.yaml")`)
+
+## Rule Families (Representative Only)
+
+Categories in this document are organizational only. The YAML schema does not
+contain a category field.
 
 ```mermaid
 mindmap
     root((Detection Rules))
         Cloud
-            AWS
-                aws-access-token
-                    Anchors: A3T, AKIA, AGPA, AIDA, AROA, AIPA, ANPA, ANVA, ASIA
-                    Radius: 64 bytes
-                    Pattern: [A3T[A-Z0-9]|AKIA|...])[A-Z0-9]{16}
+            aws-access-token
+                Anchors: A3T, AKIA, ASIA, ABIA, ACCA
+                Radius: 256 bytes
+                Pattern: (?:A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z2-7]{16}
         Source Control
-            GitHub
-                github-pat
-                    Anchor: ghp_
-                    Radius: 96 bytes
-                    Pattern: ghp_[0-9a-zA-Z]{36}
-                github-oauth
-                    Anchor: gho_
-                    Radius: 96 bytes
-                    Pattern: gho_[0-9a-zA-Z]{36}
-                github-app-token
-                    Anchors: ghu_, ghs_
-                    Radius: 96 bytes
-                    Pattern: [ghu|ghs]_[0-9a-zA-Z]{36}
-            GitLab
-                gitlab-pat
-                    Anchor: glpat-
-                    Radius: 64 bytes
-                    Pattern: glpat-[0-9a-zA-Z\\-\\_]{20}
+            github-pat
+                Anchor: ghp_
+                Radius: 256 bytes
+            github-oauth
+                Anchor: gho_
+                Radius: 256 bytes
+            github-app-token
+                Anchors: ghu_, ghs_
+                Radius: 256 bytes
+            gitlab-pat
+                Anchor: glpat-
+                Radius: 256 bytes
         Communication
-            Slack
-                slack-access-token
-                    Anchors: xoxb-, xoxa-, xoxp-, xoxr-, xoxs-
-                    Radius: 96 bytes
-                    Pattern: xox[baprs]-[0-9a-zA-Z]{10,48}
-                slack-web-hook
-                    Anchor: hooks.slack.com/services/
-                    Radius: 160 bytes
-                    Pattern: https://hooks.slack.com/services/[A-Za-z0-9+/]{44,46}
+            slack-bot-token
+                Anchor: xoxb
+                Radius: 2048 bytes
+            slack-webhook-url
+                Anchor: hooks.slack.com
+                Radius: 256 bytes
         Payment
-            Stripe
-                stripe-access-token
-                    Anchors: sk_test_, sk_live_, pk_test_, pk_live_
-                    Radius: 96 bytes
-                    Pattern: [sk|pk]_[test|live]_[0-9a-z]{10,32}
-        Email
-            SendGrid
-                sendgrid-api-token
-                    Anchors: SG., sg.
-                    Radius: 128 bytes
-                    Pattern: SG\\.[a-z0-9=_\\-\\.]{66}
-        Package Managers
-            npm
-                npm-access-token
-                    Anchor: npm_
-                    Radius: 96 bytes
-                    Pattern: npm_[a-z0-9]{36}
+            stripe-access-token
+                Anchors: sk_test, sk_live, sk_prod, rk_test, rk_live, rk_prod
+                Radius: 256 bytes
         Data Platforms
-            Databricks
-                databricks-api-token
-                    Anchors: dapi, DAPI
-                    Radius: 96 bytes
-                    Pattern: dapi[a-h0-9]{32}
+            databricks-api-token
+                Anchor: dapi
+                Radius: 256 bytes
+        Package Managers
+            npm-access-token
+                Anchors: npm_, NPM_
+                Radius: 256 bytes
         Cryptographic
-            Private Keys
-                private-key
-                    Anchor: -----BEGIN
-                    Two-Phase: Yes
-                    Seed: 256 bytes
-                    Full: 16KB
-                    Confirm: PRIVATE KEY
-                    Pattern: -----BEGIN...PRIVATE KEY-----...-----END...PRIVATE KEY-----
+            private-key
+                Anchors: -----begin, -----BEGIN
+                Two-Phase: Yes
+                Seed: 256 bytes
+                Full: 16KB
+            vault-service-token-legacy
+                Anchors: vault, VAULT, Vault
+                Two-Phase: Yes
+                Seed: 128 bytes
+                Full: 512 bytes
 ```
 
-## Rule Table
+## Rule Table (Representative)
 
-| Rule Name | Category | Anchors | Radius | Two-Phase | Notes |
-|-----------|----------|---------|--------|-----------|-------|
-| `aws-access-token` | Cloud | A3T, AKIA, AGPA, AIDA, AROA, AIPA, ANPA, ANVA, ASIA | 64 | No | Standard AWS access key prefixes |
-| `github-pat` | Source Control | ghp_ | 96 | No | GitHub personal access tokens |
-| `github-oauth` | Source Control | gho_ | 96 | No | GitHub OAuth tokens |
-| `github-app-token` | Source Control | ghu_, ghs_ | 96 | No | GitHub App installation tokens |
-| `gitlab-pat` | Source Control | glpat- | 64 | No | GitLab personal access tokens |
-| `slack-access-token` | Communication | xoxb-, xoxa-, xoxp-, xoxr-, xoxs- | 96 | No | Slack bot/user tokens |
-| `slack-web-hook` | Communication | hooks.slack.com/services/ | 160 | No | Slack incoming webhooks |
-| `stripe-access-token` | Payment | sk_test_, sk_live_, pk_test_, pk_live_ | 96 | No | Stripe API keys |
-| `sendgrid-api-token` | Email | SG., sg. | 128 | No | SendGrid API tokens |
-| `npm-access-token` | Package Managers | npm_ | 96 | No | npm authentication tokens |
-| `databricks-api-token` | Data Platforms | dapi, DAPI | 96 | No | Databricks personal access tokens |
-| `private-key` | Cryptographic | -----BEGIN | seed=256, full=16KB | Yes | PEM-encoded private keys |
+| Rule Name | Category (doc-only) | Anchors | Radius | Two-Phase | Notes |
+|-----------|---------------------|---------|--------|-----------|-------|
+| `aws-access-token` | Cloud | A3T, AKIA, ASIA, ABIA, ACCA | 256 | No | AWS access key id variants |
+| `github-pat` | Source Control | ghp_ | 256 | No | GitHub personal access token |
+| `github-oauth` | Source Control | gho_ | 256 | No | GitHub OAuth token |
+| `github-app-token` | Source Control | ghu_, ghs_ | 256 | No | GitHub app token |
+| `gitlab-pat` | Source Control | glpat- | 256 | No | GitLab personal access token |
+| `slack-bot-token` | Communication | xoxb | 2048 | No | Slack bot token |
+| `slack-webhook-url` | Communication | hooks.slack.com | 256 | No | Slack incoming webhook URL |
+| `stripe-access-token` | Payment | sk_test, sk_live, sk_prod, rk_test, rk_live, rk_prod | 256 | No | Stripe API token |
+| `sendgrid-api-token` | Email | SG. | 256 | No | SendGrid API token |
+| `npm-access-token` | Package Managers | npm_, NPM_ | 256 | No | npm token |
+| `databricks-api-token` | Data Platforms | dapi | 256 | No | Databricks PAT |
+| `private-key` | Cryptographic | -----begin, -----BEGIN | 0 | Yes (`256`/`16384`) | PEM private key |
+| `vault-service-token-legacy` | Secrets Management | vault, VAULT, Vault | 512 | Yes (`128`/`512`) | Legacy Vault service token |
 
 ## Rule Anatomy
 
 ```mermaid
 graph TB
-    subgraph RuleSpec["RuleSpec Structure"]
+    subgraph RuleSpec["RuleSpec"]
         Name["name: &'static str"]
         Anchors["anchors: &'static [&'static [u8]]"]
         Radius["radius: usize"]
-        TwoPhase["two_phase: Option&lt;TwoPhaseSpec&gt;"]
-        MustContain["must_contain: Option&lt;&'static [u8]&gt;"]
+        Validator["validator: ValidatorKind"]
+        TwoPhase["two_phase: Option<TwoPhaseSpec>"]
+        MustContain["must_contain: Option<&'static [u8]>"]
+        KeywordsAny["keywords_any: Option<&'static [&'static [u8]]>"]
+        Entropy["entropy: Option<EntropySpec>"]
+        LocalContext["local_context: Option<LocalContextSpec>"]
+        SecretGroup["secret_group: Option<u16>"]
         Regex["re: Regex"]
     end
 
@@ -111,152 +128,131 @@ graph TB
         ConfirmAny["confirm_any: &'static [&'static [u8]]"]
     end
 
-    TwoPhase --> TwoPhaseSpec
+    subgraph EntropySpec["EntropySpec (optional)"]
+        MinBpb["min_bits_per_byte: f32"]
+        MinLen["min_len: usize"]
+        MaxLen["max_len: usize"]
+    end
 
-    style RuleSpec fill:#e3f2fd
-    style TwoPhaseSpec fill:#fff3e0
+    subgraph LocalContextSpec["LocalContextSpec (optional)"]
+        Lookbehind["lookbehind: usize"]
+        Lookahead["lookahead: usize"]
+        SameLine["require_same_line_assignment: bool"]
+        Quoted["require_quoted: bool"]
+        KeyNames["key_names_any: Option<&'static [&'static [u8]]>"]
+    end
 ```
 
-## Two-Phase Detection (Private Keys)
+`ValidatorKind` is intentionally not part of the YAML schema today. YAML-loaded
+rules default to `ValidatorKind::None`.
+
+## Two-Phase Detection
+
+Current two-phase rules:
+
+| Rule | Seed Radius | Full Radius | Confirm Literals |
+|------|-------------|-------------|------------------|
+| `private-key` | 256 | 16384 | `PRIVATE KEY` |
+| `vault-service-token-legacy` | 128 | 512 | `s.` |
 
 ```mermaid
 sequenceDiagram
     participant VS as Vectorscan
-    participant Seed as Seed Window (256B)
-    participant Confirm as Confirmation
-    participant Full as Full Window (16KB)
+    participant Seed as Seed Window
+    participant Confirm as confirm_any check
+    participant Full as Expanded Window
     participant Regex as Regex
 
-    Note over VS: Anchor "-----BEGIN" found at offset 1000
-    VS->>Seed: Extract bytes 1000-256..1000+256
-
-    Seed->>Confirm: Search for "PRIVATE KEY"
-    alt Found
-        Confirm->>Full: Expand to bytes 1000-16KB..1000+16KB
-        Full->>Regex: Match BEGIN...END block
-        alt Regex matches
-            Regex-->>Output: FindingRec
-        end
-    else Not found
-        Confirm--xSeed: Skip (false positive)
+    VS->>Seed: Anchor hit seeds initial window
+    Seed->>Confirm: Search confirm_any literals
+    alt Confirmed
+        Confirm->>Full: Expand to full_radius
+        Full->>Regex: Validate full pattern
+        Regex-->>Output: FindingRec
+    else Not confirmed
+        Confirm--xSeed: Drop candidate
     end
 ```
 
-**Why two-phase?**
-- `-----BEGIN` is a common header (certificates, public keys, etc.)
-- Only `-----BEGIN ... PRIVATE KEY-----` is sensitive
-- Seed window (256B) quickly confirms before expensive 16KB regex
-
 ## Anchor Variants
 
-Each anchor is compiled into three variants for detection:
+Each anchor is compiled into three byte variants for matching:
 
 ```mermaid
 graph LR
     subgraph Variants["Anchor: ghp_"]
-        Raw["Raw: ghp_<br/>(4 bytes)"]
-        LE["UTF-16LE: g\\0h\\0p\\0_\\0<br/>(8 bytes)"]
-        BE["UTF-16BE: \\0g\\0h\\0p\\0_<br/>(8 bytes)"]
+        Raw["Raw: ghp_"]
+        LE["UTF-16LE: g\\0h\\0p\\0_\\0"]
+        BE["UTF-16BE: \\0g\\0h\\0p\\0_"]
     end
-
-    VS["Vectorscan<br/>Prefilter"] --> Raw
-    VS --> LE
-    VS --> BE
-
-    style Variants fill:#e8f5e9
 ```
 
-This enables detection in:
-- Plain text files (Raw)
-- UTF-16LE encoded files (Windows default)
-- UTF-16BE encoded files (some network protocols)
+This allows the same rule to detect plain ASCII and UTF-16 encoded content.
 
 ## Why Anchors and Radii Matter
 
-Anchors are not just a convenience; they are the primary cost control mechanism.
-The scanner only runs regex validation inside windows around anchor hits. The
-radius determines how wide those windows are:
+Anchors are the primary cost-control mechanism. Regex validation only runs in
+windows around anchor hits.
 
-- **Too small**: you may miss matches where the anchor and the full pattern are
-  farther apart than expected.
-- **Too large**: you increase regex work and can hurt performance on noisy inputs.
+- Too small radius: can miss valid matches
+- Too large radius: increases regex cost on noisy inputs
 
-Anchors should be short but distinctive, and radii should match the expected
-distance from anchor to full token. This is why rules like private keys use
-two-phase validation: a cheap anchor + confirm narrows the expensive regex work.
+Current radius distribution is heavily centered at `256` bytes (`202` of `223`
+rules), with targeted outliers for long/noisy formats.
 
 ## Transform Detection
 
-Secrets may be encoded. The demo engine handles:
+Demo transforms (from `src/demo.rs`) decode:
 
-```mermaid
-graph TB
-    subgraph Encoding["Encoded Secret"]
-        Original["ghp_abc123...xyz"]
-        URLEnc["ghp%5Fabc123...xyz"]
-        B64Enc["Z2hwX2FiYzEyMy4uLnh5eg=="]
-    end
+- URL percent-encoding
+- Base64
 
-    subgraph Detection["Detection Flow"]
-        URL["URL Percent Decode"]
-        B64["Base64 Decode"]
-        Scan["Anchor Scan"]
-    end
+Both use decoded-anchor gating (`Gate::AnchorsInDecoded`) to limit unnecessary
+secondary scans.
 
-    URLEnc --> URL
-    B64Enc --> B64
-    URL --> Scan
-    B64 --> Scan
-    Original --> Scan
+## Regex Patterns (Representative, Exact)
 
-    Scan --> |"ghp_ found"| Rule["github-pat rule"]
-
-    style Encoding fill:#ffebee
-    style Detection fill:#e8f5e9
-```
-
-## Regex Patterns
-
-| Rule | Pattern | Notes |
-|------|---------|-------|
-| `aws-access-token` | `(A3T[A-Z0-9]\|AKIA\|AGPA\|AIDA\|AROA\|AIPA\|ANPA\|ANVA\|ASIA)[A-Z0-9]{16}` | 20-char uppercase |
-| `github-pat` | `ghp_[0-9a-zA-Z]{36}` | 40-char total |
-| `github-oauth` | `gho_[0-9a-zA-Z]{36}` | 40-char total |
-| `github-app-token` | `(ghu\|ghs)_[0-9a-zA-Z]{36}` | 40-char total |
-| `gitlab-pat` | `glpat-[0-9a-zA-Z\-\_]{20}` | 26-char total |
-| `slack-access-token` | `xox[baprs]-([0-9a-zA-Z]{10,48})` | Variable length |
-| `slack-web-hook` | `https://hooks.slack.com/services/[A-Za-z0-9+/]{44,46}` | Full URL |
-| `stripe-access-token` | `(?i)(sk\|pk)_(test\|live)_[0-9a-z]{10,32}` | Case insensitive |
-| `sendgrid-api-token` | `(?i)\b(SG\.(?i)[a-z0-9=_\-\.]{66})` | 69-char total |
-| `npm-access-token` | `(?i)\b(npm_[a-z0-9]{36})` | 40-char total |
-| `databricks-api-token` | `(?i)\b(dapi[a-h0-9]{32})` | 36-char total |
-| `private-key` | `(?is)-----BEGIN...PRIVATE KEY-----.*?-----END...PRIVATE KEY-----` | Multi-line PEM |
+| Rule | Pattern |
+|------|---------|
+| `aws-access-token` | `\b((?:A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z2-7]{16})\b` |
+| `github-pat` | `ghp_[0-9a-zA-Z]{36}` |
+| `gitlab-pat` | `glpat-[\w-]{20}` |
+| `slack-webhook-url` | `(?:https?://)?hooks.slack.com/(?:services|workflows|triggers)/[A-Za-z0-9+/]{43,56}` |
+| `stripe-access-token` | `\b((?:sk|rk)_(?:test|live|prod)_[a-zA-Z0-9]{10,99})(?:[\x60'"\s;]|\\[nr]|$)` |
+| `sendgrid-api-token` | `\b(SG\.(?i)[a-z0-9=_\-\.]{66})(?:[\x60'"\s;]|\\[nr]|$)` |
+| `npm-access-token` | `(?i)\b(npm_[a-z0-9]{36})(?:[\x60'"\s;]|\\[nr]|$)` |
+| `databricks-api-token` | `\b(dapi[a-f0-9]{32}(?:-\d)?)(?:[\x60'"\s;]|\\[nr]|$)` |
+| `private-key` | `(?i)-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----[\s\S-]{64,}?KEY(?: BLOCK)?-----` |
 
 ## Adding New Rules
 
-To add a new rule to `demo_engine()`:
+Built-in rule changes are made in `default_rules.yaml` (not in `demo_engine()`,
+which now just returns `builtin_rules()`).
 
-```rust
-RuleSpec {
-    name: "my-new-token",
-    // Unique byte sequences that appear in the token
-    anchors: &[b"mytoken_"],
-    // Search radius around anchor hits
-    radius: 64,
-    // Optional two-phase for noisy anchors
-    two_phase: None,
-    // Optional fast filter before regex
-    must_contain: None,
-    // Final validation regex
-    re: Regex::new(r"mytoken_[a-z0-9]{32}").unwrap(),
-}
+YAML template:
+
+```yaml
+rules:
+- name: my-new-token
+  regex: \b(mytok_[A-Za-z0-9]{32})\b
+  anchors:
+  - mytok_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - mytok_
+  entropy: null
+  two_phase: null
+  local_context: null
+  secret_group: null
 ```
 
 Guidelines:
-1. **Anchors**: Choose distinctive prefixes (4+ bytes)
-2. **Radius**: 2x expected token length is usually safe
-3. **Two-phase**: Use for anchors that appear in non-sensitive contexts
-4. **must_contain**: Fast filter if token has additional required substrings
-5. **Derived anchors**: When anchor derivation is enabled, mandatory literal
-   islands in the regex are compiled into a `confirm_all` AND gate.
-6. **Regex**: Should be anchored (no `.*` prefix) for performance
+
+1. Use distinctive anchors to reduce noisy windows.
+2. Set radius to cover expected anchor-to-secret distance.
+3. Use `two_phase` only when anchors are noisy.
+4. Keep `keywords_any` aligned with reliable context tokens.
+5. Set `secret_group` when the secret is not the full match.
+6. Derived anchors are enabled by default (`AnchorPolicy::PreferDerived`) and
+   may produce a compiled `confirm_all` gate from regex literal islands.

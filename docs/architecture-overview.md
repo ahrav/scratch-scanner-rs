@@ -6,6 +6,8 @@ High-level C4-style component diagram showing the scanner-rs secret scanning eng
 graph TB
     subgraph CLI["CLI Layer"]
         Main["main.rs<br/>Entry Point"]
+        UCLI["unified/cli.rs<br/>Subcommand Parser"]
+        Orch["unified/orchestrator.rs<br/>Source Dispatcher"]
     end
 
     subgraph Core["Core Engine"]
@@ -16,15 +18,20 @@ graph TB
         Tuning["Tuning<br/>DoS Protection"]
     end
 
-    subgraph Pipeline["Pipeline Layer"]
-        Walker["Walker<br/>File Discovery"]
-        Reader["ReaderStage<br/>Chunking"]
-        Scanner["ScanStage<br/>Detection"]
-        Output["OutputStage<br/>Reporting"]
+    subgraph FsPath["Filesystem Scan Path"]
+        PScan["parallel_scan_dir()<br/>High-level FS entry"]
+        Walker["IterWalker<br/>File Discovery"]
+        Scanner["scan_local()<br/>Owner-Compute Scan"]
+        Events["EventSink<br/>JSONL/Text/JSON/SARIF"]
+    end
+
+    subgraph GitPath["Git Scan Path"]
+        GitRunner["run_git_scan()<br/>Git Pipeline Runner"]
     end
 
     subgraph Memory["Memory Management"]
-        BufferPool["BufferPool<br/>8MiB Buffer Pool"]
+        TsBufferPool["TsBufferPool<br/>Scheduler Buffer Pool"]
+        BufferPool["BufferPool<br/>Runtime Buffer Pool"]
         NodePool["NodePoolType<br/>Pre-allocated Buffers"]
         DecodeSlab["DecodeSlab<br/>Decoded Output Storage"]
     end
@@ -42,35 +49,43 @@ graph TB
         TimingWheel["TimingWheel&lt;PendingWindow, 1&gt;<br/>Window Expiration Scheduler"]
     end
 
-    Main --> |"Arc&lt;Engine&gt;"| Engine
-    Main --> |"scan_path_default()"| Walker
+    Main --> UCLI
+    UCLI --> Orch
+
+    Orch --> |"scan fs"| PScan
+    Orch --> |"scan git"| GitRunner
+
+    PScan --> Walker
+    PScan --> Scanner
+    Walker --> Scanner
+    Scanner --> Events
+
+    Scanner --> Engine
+    Scanner --> TsBufferPool
+    GitRunner --> Engine
+    GitRunner --> Events
 
     Engine --> Rules
     Engine --> VS
     Engine --> Transforms
     Engine --> Tuning
 
-    Walker --> |"FileId"| FileTable
-    Walker --> |"file_ring"| Reader
-    Reader --> |"chunk_ring"| Scanner
-    Scanner --> |"out_ring"| Output
-
-    Reader --> BufferPool
+    BufferPool --> FileTable
     BufferPool --> NodePool
     NodePool --> BitSet
 
-    Scanner --> Engine
     Scanner --> ScanScratch
     ScanScratch --> DecodeSlab
     ScanScratch --> StepArena
     ScanScratch --> FixedSet128
     ScanScratch --> TimingWheel
 
-    RingBuffer --> |"Inter-stage<br/>Communication"| Pipeline
+    RingBuffer --> |"Shared utility<br/>queue type"| FsPath
 
     style CLI fill:#e1f5fe
     style Core fill:#fff3e0
-    style Pipeline fill:#e8f5e9
+    style FsPath fill:#e8f5e9
+    style GitPath fill:#ede7f6
     style Memory fill:#fce4ec
     style DataStructures fill:#f3e5f5
     style State fill:#fff8e1
@@ -84,25 +99,26 @@ graph TB
 | **Unified CLI**     | `src/unified/cli.rs`           | Subcommand parser for `scan fs|git` and source-specific flags        |
 | **Unified Orchestrator** | `src/unified/orchestrator.rs` | Dispatches sources and wires structured event sinks               |
 | **Unified Events**  | `src/unified/events.rs`        | Structured `ScanEvent` model and JSONL sink                          |
+| **parallel_scan_dir** | `src/scheduler/parallel_scan.rs` | High-level FS scan entrypoint (walker + scheduler wiring)         |
 | **FS Owner-Compute Scheduler** | `src/scheduler/local_fs_owner.rs` | Round-robin file dispatch with per-worker owned I/O+scan state |
 | **Engine**          | `src/engine/core.rs`           | Compiled scanning engine with anchor patterns, rules, and transforms |
-| **RuleSpec**        | `src/api.rs:519`               | Rule definitions and specification for rule-based scanning           |
+| **RuleSpec**        | `src/api.rs:596`               | Rule definitions and specification for rule-based scanning           |
 | **RuleCompiled**    | `src/engine/rule_repr.rs`  | Hot compiled rule representation used in scan-loop validation      |
 | **RuleCold**        | `src/engine/rule_repr.rs`  | Cold per-rule metadata (`name`) stored parallel to hot rules       |
 | **Vectorscan**      | `vectorscan-rs-sys` crate      | Multi-pattern anchor prefilter (raw + UTF-16 variants)               |
-| **Vectorscan DB Cache** | `src/engine/vectorscan_prefilter.rs` | Best-effort on-disk cache for serialized prefilter/stream DBs |
+| **Vectorscan DB Cache** | `src/engine/vs_cache.rs` | Best-effort on-disk cache for serialized prefilter/stream DBs        |
 | **TransformConfig** | `src/api.rs:132`               | Transform stage configuration (URL percent, Base64)                  |
-| **Pipeline**        | `src/pipeline.rs`              | 4-stage cooperative pipeline coordinator                             |
+| **Pipeline Config/Stats** | `src/pipeline.rs`         | Shared pipeline constants and reporting types used by runtime paths  |
 | **Archive Core**    | `src/archive/` (`scan.rs`, `budget.rs`, `path.rs`, `formats/*`) | Archive scanning config, budgets, outcomes, path canonicalization, and sink-driven scan core |
-| **Walker**          | `src/pipeline.rs`              | Recursive file system traversal (Unix primary with fallback)         |
-| **ReaderStage**     | `src/pipeline.rs`              | File chunking with overlap preservation                              |
-| **ScanStage**       | `src/pipeline.rs`              | Detection engine invocation                                          |
-| **OutputStage**     | `src/pipeline.rs`              | Finding output to stdout                                             |
-| **BufferPool**      | `src/runtime.rs:468`           | Fixed-capacity aligned buffer pool                                   |
+| **IterWalker**      | `src/scheduler/parallel_scan.rs` | Recursive file traversal with gitignore/hidden-file controls      |
+| **scan_local**      | `src/scheduler/local_fs_owner.rs` | Worker-owned I/O + scanning with overlap dedupe                   |
+| **EventSink**       | `src/unified/events.rs`        | Thread-safe structured event emission to stdout sinks                |
+| **BufferPool**      | `src/runtime.rs:518`           | Fixed-capacity aligned buffer pool (single-threaded runtime path)    |
+| **TsBufferPool**    | `src/scheduler/ts_buffer_pool.rs` | Thread-safe buffer pool used by scheduler workers                 |
 | **NodePoolType**    | `src/pool/node_pool.rs:49`     | Generic pre-allocated node pool                                      |
 | **RingBuffer**      | `src/stdx/ring_buffer.rs:45`   | Fixed-capacity SPSC queue                                            |
 | **DynamicBitSet**   | `src/stdx/bitset.rs:51`        | Runtime-sized bitset for pool tracking                               |
-| **ScanScratch**     | `src/engine/scratch.rs:83`     | Per-scan reusable scratch state                                      |
+| **ScanScratch**     | `src/engine/scratch.rs:308`    | Per-scan reusable scratch state                                      |
 | **TimingWheel**     | `src/stdx/timing_wheel.rs:479` | Hashed timing wheel for window expiration scheduling                 |
 | **Git Preflight**   | `src/git_scan/preflight.rs`    | Maintenance readiness check for commit-graph, MIDX, and pack count   |
 | **ArtifactStatus**  | `src/git_scan/preflight.rs`    | `Ready` vs `NeedsMaintenance` flag produced by Git preflight         |
@@ -110,7 +126,8 @@ graph TB
 | **RepoJobState**    | `src/git_scan/repo_open.rs`    | Bundled repo metadata for downstream Git scan phases                 |
 | **StartSetId**      | `src/git_scan/start_set.rs`    | Deterministic identity for start set configuration                   |
 | **Watermark Keys**  | `src/git_scan/watermark_keys.rs` | Stable ref watermark key/value encoding                            |
-| **Commit Graph View** | `src/git_scan/commit_walk.rs` | Commit-graph adapter with deterministic position lookup              |
+| **CommitGraph trait** | `src/git_scan/commit_walk.rs` | Deterministic commit graph interface used by traversal/topo planning |
+| **CommitGraphMem**  | `src/git_scan/commit_graph_mem.rs` | In-memory commit graph built from loaded commits                  |
 | **Commit Graph Index** | `src/git_scan/commit_graph.rs` | Cache-friendly SoA tables for commit OIDs, root trees, and timestamps |
 | **Commit Walk**     | `src/git_scan/commit_walk.rs`  | `(watermark, tip]` traversal for introduced-by commit selection      |
 | **Commit Walk Limits** | `src/git_scan/commit_walk_limits.rs` | Hard caps for commit traversal and ordering                   |
@@ -337,12 +354,12 @@ Scheduler harness code lives in `src/scheduler/sim_executor_harness.rs`.
 
 ## Data Flow
 
-1. **Input**: File path from CLI
-2. **Walker**: Discovers files, populates FileTable, enqueues FileIds
-3. **Reader**: Opens files, reads chunks with overlap, acquires buffers
-4. **Scanner**: Runs Engine on each chunk, produces FindingRecs
-5. **Output**: Formats and writes findings to stdout
-6. **Memory**: Buffers flow through pool acquire/release lifecycle
+1. **Input**: CLI parses `scan fs`/`scan git` and builds unified config
+2. **Dispatch**: Unified orchestrator routes to `parallel_scan_dir` or `run_git_scan`
+3. **FS Discovery**: `IterWalker` discovers files and `scan_local` assigns work to workers
+4. **Scanning**: Workers read overlap-aware chunks, run `Engine`, and dedupe overlap findings
+5. **Output**: Findings stream through `EventSink` implementations to stdout
+6. **Memory**: Scheduler/runtime buffer pools and engine scratch structures are reused per run
 
 ## Design Principles
 

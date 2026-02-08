@@ -1,25 +1,27 @@
 # Data Type Relationships
 
 Class diagram showing the key types in scanner-rs and their relationships.
+Verified against:
+`src/api.rs`, `src/engine/core.rs`, `src/engine/rule_repr.rs`,
+`src/engine/scratch.rs`, `src/runtime.rs`, `src/pipeline.rs`,
+`src/pool/node_pool.rs`, and `src/stdx/{bitset,ring_buffer}.rs`.
 
 ```mermaid
 classDiagram
     direction TB
 
     class Engine {
-        -Vec~RuleCompiled~ rules
-        -Vec~RuleMeta~ rule_meta
+        -Vec~RuleCompiled~ rules_hot
+        -Vec~RuleCold~ rules_cold
         -Vec~TransformConfig~ transforms
         -Tuning tuning
         -Option~VsPrefilterDb~ vs
         -Option~Base64YaraGate~ b64_gate
-        -Vec~Target~ pat_targets
-        -Vec~u32~ pat_offsets
-        -usize max_anchor_pat_len
         -usize max_window_diameter_bytes
+        -usize max_prefilter_width
         +new(rules, transforms, tuning) Engine
-        +scan_chunk(hay: &[u8]) Vec~Finding~
-        +scan_chunk_into(buf, file_id, offset, scratch)
+        +scan_chunk_into(root_buf, file_id, base_offset, scratch)
+        +scan_chunk_records(buf, file_id, base_offset, scratch) &[FindingRec]
         +required_overlap() usize
         +rule_name(rule_id) &str
         +new_scratch() ScanScratch
@@ -29,21 +31,30 @@ classDiagram
         +&'static str name
         +&'static [&'static [u8]] anchors
         +usize radius
+        +ValidatorKind validator
         +Option~TwoPhaseSpec~ two_phase
         +Option~&'static [u8]~ must_contain
+        +Option~&'static [&'static [u8]]~ keywords_any
+        +Option~EntropySpec~ entropy
+        +Option~LocalContextSpec~ local_context
+        +Option~u16~ secret_group
         +Regex re
     }
 
     class RuleCompiled {
-        -usize radius
-        -Option~&'static [u8]~ must_contain
         -Regex re
-        -Option~TwoPhaseCompiled~ two_phase
+        -Option~&'static [u8]~ must_contain
+        -bool needs_assignment_shape_check
+        -Option~u16~ secret_group
+        -Option~u32~ confirm_all
+        -Option~u32~ keywords
+        -Option~u32~ entropy
+        -Option~u32~ local_context
+        -Option~u32~ two_phase
     }
 
-    class RuleMeta {
+    class RuleCold {
         -&'static str name
-        -ValidatorKind validator
     }
 
     class TwoPhaseCompiled {
@@ -53,8 +64,8 @@ classDiagram
     }
 
     class PackedPatterns {
-        -Vec~u8~ bytes
-        -Vec~u32~ offsets
+        -Box~[u8]~ bytes
+        -Box~[u32]~ offsets
     }
 
     class Target {
@@ -100,18 +111,18 @@ classDiagram
     }
 
     class ScanScratch {
-        -Vec~FindingRec~ out
-        -Vec~WorkItem~ work_q
+        -ScratchVec~FindingRec~ out
+        -ScratchVec~WorkItem~ work_q
         -usize work_head
         -DecodeSlab slab
-        -FixedSet128 seen
+        -FixedSet128 seen_findings_scan
         -HitAccPool hit_acc_pool
         -ScratchVec~u32~ touched_pairs
         -ScratchVec~SpanU32~ windows
         -ScratchVec~SpanU32~ expanded
         -ScratchVec~SpanU32~ spans
         -StepArena step_arena
-        +drain_findings() Vec~FindingRec~
+        +drain_findings(out)
         +drain_findings_into(out)
         +findings() &[FindingRec]
     }
@@ -120,7 +131,7 @@ classDiagram
         +&'static str rule
         +Range~usize~ span
         +Range~usize~ root_span_hint
-        +Vec~DecodeStep~ decode_steps
+        +DecodeSteps decode_steps
     }
 
     class FindingRec {
@@ -130,6 +141,7 @@ classDiagram
         +u32 span_end
         +u64 root_hint_start
         +u64 root_hint_end
+        +bool dedupe_with_span
         +StepId step_id
     }
 
@@ -148,13 +160,13 @@ classDiagram
     }
 
     Engine --> RuleCompiled : contains
-    Engine --> RuleMeta : contains
+    Engine --> RuleCold : contains
     Engine --> TransformConfig : contains
     Engine --> Tuning : contains
     Engine --> ScanScratch : creates
 
     RuleSpec --> TwoPhaseSpec : optional
-    RuleCompiled --> TwoPhaseCompiled : compiled
+    RuleCompiled --> TwoPhaseCompiled : optional gate index
     TwoPhaseCompiled --> PackedPatterns : uses
 
     ScanScratch --> FindingRec : produces
@@ -165,40 +177,57 @@ classDiagram
     FindingRec --> StepId : references
 ```
 
-## Pipeline Types
+## Pipeline and Runtime Types
 
 ```mermaid
 classDiagram
     direction TB
 
-    class Pipeline {
+    class ScannerRuntime {
         -Arc~Engine~ engine
-        -PipelineConfig config
+        -ScannerConfig config
         -usize overlap
         -BufferPool pool
-        +new(engine, config) Pipeline
-        +scan_path(path) Result~PipelineStats~
+        -ScanScratch scratch
+        -Vec~Finding~ out
+        -Vec~u8~ tail
+        +new(engine, config) ScannerRuntime
+        +scan_file_sync(file_id, path) Result~&[Finding]~
+    }
+
+    class ScannerConfig {
+        +usize chunk_size
+        +usize io_queue
+        +usize reader_threads
+        +usize scan_threads
+        +usize max_findings_per_file
+        +pool_capacity() usize
     }
 
     class PipelineConfig {
         +usize chunk_size
         +usize max_files
+        +usize path_bytes_cap
+        +ArchiveConfig archive
     }
 
     class PipelineStats {
         +u64 files
         +u64 chunks
+        +u64 bytes_scanned
         +u64 findings
+        +u64 walk_errors
+        +u64 open_errors
         +u64 errors
+        +ArchiveStats archive
     }
 
     class FileTable {
-        -Vec~PathBuf~ paths
         -Vec~u64~ sizes
         -Vec~(u64, u64)~ dev_inodes
         -Vec~u32~ flags
         +push(path, size, dev_inode, flags) FileId
-        +path(id) &PathBuf
+        +path(id) &Path
         +size(id) u64
         +flags(id) u32
     }
@@ -209,12 +238,13 @@ classDiagram
         +u32 len
         +u32 prefix_len
         +BufferHandle buf
+        +u32 buf_offset
         +data() &[u8]
         +payload() &[u8]
     }
 
     class BufferPool {
-        -Rc~BufferPoolInner~ inner
+        -Rc~BufferPoolInner~ pool
         +new(capacity) BufferPool
         +try_acquire() Option~BufferHandle~
         +acquire() BufferHandle
@@ -226,12 +256,12 @@ classDiagram
         -NonNull~u8~ ptr
         +as_slice() &[u8]
         +as_mut_slice() &mut [u8]
+        +clear()
     }
 
-    Pipeline --> PipelineConfig : uses
-    Pipeline --> BufferPool : owns
-    Pipeline --> FileTable : creates
-    Pipeline --> Chunk : processes
+    ScannerRuntime --> ScannerConfig : uses
+    ScannerRuntime --> BufferPool : owns
+    ScannerRuntime --> Chunk : processes
 
     Chunk --> BufferHandle : owns
     BufferHandle --> BufferPool : returns to
@@ -244,6 +274,10 @@ classDiagram
 - `Engine.b64_gate` is an optional encoded-space pre-gate for Base64 spans. It
   is built from the same anchor patterns as `vs` and is only used to
   skip wasteful decodes; the decoded-space gate still enforces correctness.
+- `Engine.required_overlap()` is computed as:
+  `max_window_diameter_bytes + (max_prefilter_width - 1)`.
+- `StepId` and `FindingRec.step_id` are only valid while the originating
+  `ScanScratch` step arena is alive and not reset.
 
 ## Memory Pool Types
 
@@ -251,15 +285,13 @@ classDiagram
 classDiagram
     direction TB
 
-    class NodePoolType~NODE_SIZE, NODE_ALIGN~ {
+    class NodePoolType~NODE_SIZE, NODE_ALIGNMENT~ {
         -NonNull~u8~ buffer
         -usize len
         -DynamicBitSet free
         +init(node_count) Self
         +acquire() NonNull~u8~
         +release(node)
-        +reset()
-        +deinit()
     }
 
     class DynamicBitSet {
@@ -275,22 +307,10 @@ classDiagram
         +iter_set() Iterator
     }
 
-    class BitSet~N, WORDS~ {
-        -[u64; WORDS] words
-        +empty() BitSet
-        +full() BitSet
-        +is_set(idx) bool
-        +set(idx)
-        +unset(idx)
-        +first_set() Option~usize~
-        +first_unset() Option~usize~
-        +iter() Iterator
-    }
-
     class ScratchVec~T~ {
-        -NonNull~T~ ptr
-        -usize len
-        -usize cap
+        -NonNull~MaybeUninit<T>~ ptr
+        -u32 len
+        -u32 cap
         +with_capacity(cap) ScratchVec
         +push(value)
         +clear()
@@ -305,7 +325,7 @@ classDiagram
         +new() RingBuffer
         +push_back(value) Result
         +pop_front() Option~T~
-        +front() Option~&T~
+        +clear()
         +is_full() bool
         +is_empty() bool
     }
@@ -348,12 +368,6 @@ classDiagram
         Le
         Be
     }
-
-    class BufRef {
-        <<enumeration>>
-        Root
-        Slab(Range~usize~)
-    }
 ```
 
 ## Key Relationships Summary
@@ -361,11 +375,11 @@ classDiagram
 | Source | Relationship | Target | Description |
 |--------|--------------|--------|-------------|
 | `Engine` | contains | `RuleCompiled` | Compiled detection rules |
-| `Engine` | contains | `RuleMeta` | Cold rule metadata (name, validator) |
+| `Engine` | contains | `RuleCold` | Cold rule metadata (`name`) |
 | `Engine` | contains | `TransformConfig` | Transform configurations |
 | `Engine` | creates | `ScanScratch` | Per-scan scratch state |
-| `Pipeline` | owns | `BufferPool` | Buffer memory pool |
-| `Pipeline` | creates | `FileTable` | File metadata store |
+| `ScannerRuntime` | owns | `BufferPool` | Buffer memory pool |
+| `FileTable` | produces | `FileId` | File metadata IDs |
 | `Chunk` | owns | `BufferHandle` | Buffer with RAII release |
 | `FindingRec` | references | `FileId` | Source file identifier |
 | `FindingRec` | references | `StepId` | Decode provenance chain |

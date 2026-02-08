@@ -120,19 +120,21 @@ The gate chain for each transform on the zero-hit path:
 needs_transform_scan = has_active_transforms
     AND buffer >= min_len
     AND transform_quick_trigger(tc, buf)       -- cheap sniff
-    AND base64_buffer_gate(tc, buf)            -- Vectorscan-based gate
-    AND url_percent_buffer_gate(buf)           -- NEW: anchor byte set gate
+    AND base64_buffer_gate(tc, buf)            -- encoded-space Base64 gate
+    AND (tc.id != UrlPercent OR url_percent_buffer_gate(tc, buf))
 ```
 
-**URL-percent cost:** `transform_quick_trigger` uses `memchr(b'%', buf)` which
-fires on ~69% of chunks (format specifiers like `%d`, `%s`, `%02x`). Each
-triggered chunk enters `find_url_spans_into()` for span detection — expensive
-even when no spans are found.
+**URL-percent cost:** `transform_quick_trigger` checks `%` (and `+` when
+`plus_to_space` is enabled). In this setup (`plus_to_space: false`), that is
+effectively `memchr(b'%', buf)`, which fires on ~69% of chunks (format
+specifiers like `%d`, `%s`, `%02x`). Each triggered chunk enters
+`find_url_spans_into()` for span detection — expensive even when no spans are
+found.
 
 **Base64 cost:** `transform_quick_trigger` always returns `true` (every buffer
-could contain base64). The `base64_buffer_gate` runs a Vectorscan scan on encoded
-anchor patterns — cheaper than full span finding but still significant per-chunk
-overhead.
+could contain base64). The `base64_buffer_gate` runs a `Base64YaraGate`
+encoded-space automaton scan over anchor-derived patterns — cheaper than full
+span finding but still significant per-chunk overhead.
 
 ### Cost breakdown (single-core, full rules)
 
@@ -140,7 +142,7 @@ overhead.
 | --------------------------------- | -------------------: |
 | Vectorscan prefilter (`hs_scan`)  |                 ~15% |
 | URL-percent span finding          |                 ~25% |
-| Base64 buffer gate (VS scan)      |                 ~20% |
+| Base64 buffer gate (encoded scan) |                 ~20% |
 | I/O (read + walker + metadata)    |                  ~8% |
 | Bookkeeping (scratch reset, etc.) |                  ~5% |
 | Regex validation + findings       |                  ~2% |
@@ -168,15 +170,15 @@ anchor pattern bytes).
 
 2. **Base64 gating is more expensive than URL-percent.** Base64-only (4.6 GiB/s)
    is slower than URL-percent-only (5.3 GiB/s) because the base64 buffer gate
-   runs a Vectorscan scan on every chunk, while URL-percent's `memchr` trigger is
-   cheaper.
+   runs an encoded-space automaton scan on every chunk, while URL-percent's
+   `memchr` trigger is cheaper.
 
 3. **The URL-percent buffer gate helps modestly with full rules** (+5%) but
    significantly with sparse rules (+23%) where the anchor byte set is selective.
 
-4. **A user-facing `--transforms` flag** (SCA-97) would let users who know their
+4. **A user-facing `--transforms` flag** (SCA-97) now lets users who know their
    data skip transform overhead entirely, achieving the no-transform throughput
-   ceiling. Default behavior remains unchanged.
+   ceiling. Default behavior remains unchanged (`--transforms=all`).
 
 5. **Scaling is near-linear.** The ratio between variants is consistent across 1
    and 12 cores — the bottleneck is per-chunk CPU, not thread contention or I/O.

@@ -5,7 +5,7 @@ Epic: `scratch-scanner-rs-22c`
 
 ## Scope
 Executed the Phase 2 benchmark suite after all Phase 2 implementation tasks were closed, then compared against the Phase 1 reference run:
-- `scanner_throughput` (includes tier2 + tier3 + workload mixes)
+- `scanner_throughput` (default suite: tier1 + tier2 + tier3 + tier4 + workload_comparison + buffer_scaling)
 - `rule_scaling`
 - `vectorscan_overhead`
 
@@ -80,7 +80,7 @@ Aggregate:
 ## Decision
 - Keep the Phase 2 data-layout changes.
 - Rationale:
-  - Tier2 throughput improved by `+3.95%` (within the requested meaningful `3-5%` gain band).
+  - Tier2 throughput improved by `+3.95%`.
   - Tier3 throughput is modestly positive (`+0.95%`) with no regressions in selected core cases.
   - Transform-heavy and full workload cases improved substantially (`+10.36%` and `+5.61%` means).
   - `rule_scaling` synthetic unique/grouped mixes regressed in several cases and should be optimized in follow-up work.

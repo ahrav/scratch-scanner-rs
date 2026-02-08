@@ -248,18 +248,20 @@ After raw/UTF-16 scanning, the engine may generate derived buffers by decoding
 URL-percent or Base64 spans. These transforms are expensive, so they are gated:
 
 - **Decoded-space gate**: stream-decode and check for any anchor in the decoded
-  bytes. If no anchor is found, the transform is skipped. This is conservative
-  and avoids a full decode when the span is irrelevant.
+  bytes using the decoded gate stream (`vs_gate`) when available. If no anchor
+  is found, the transform is skipped.
+- **Gate fallback semantics**: if decoded-gate DB setup/scan fails, the engine
+  falls back to raw prefilter evidence and may relax gate enforcement when
+  UTF-16 anchors are enabled to avoid false negatives.
 - **Base64 pre-gate (encoded-space)**: Base64 uses an additional, cheaper prefilter
   that runs on the encoded bytes. It uses YARA-style base64 permutations of the
   anchors to cheaply reject spans that cannot possibly decode to an anchor. The
   decoded-space gate still runs afterward to preserve correctness.
 
 Selection detail:
-- The decoded-space gate chooses between a raw-only and a combined (raw + UTF-16)
-  anchor automaton based on whether the decoded window contains any NUL bytes.
-  This avoids UTF-16 overhead on NUL-free data while keeping a single pass on
-  NUL-heavy buffers.
+- UTF-16 decoded-stream anchor scanning for candidate windows is activated
+  lazily on the first NUL byte; if the UTF-16 stream DB is unavailable, the
+  engine falls back to a post-stream UTF-16 block scan.
 
 See `docs/transform-chain.md` for diagrams and the gating sequence.
 
@@ -294,7 +296,7 @@ These gates are designed to be **local and bounded**:
 | `merge_gap` | 64 | Merge adjacent windows within this byte gap |
 | `max_windows_per_rule_variant` | 16 | Max windows per (rule, variant) before pressure coalescing |
 | `pressure_gap_start` | 128 | Starting gap for pressure coalescing |
-| `max_anchor_hits_per_rule_variant` | 2048 | Cap on raw anchor hits before collapsing |
+| `max_anchor_hits_per_rule_variant` | 2048 | Cap on anchor hits before collapsing |
 | `max_utf16_decoded_bytes_per_window` | 64 KiB | UTF-16 decode output limit per window |
 | `max_transform_depth` | 3 | Max nested decode steps (root + transforms) |
 | `max_total_decode_output_bytes` | 512 KiB | Global decoded output budget per scan |
@@ -303,8 +305,8 @@ These gates are designed to be **local and bounded**:
 | `scan_utf16_variants` | true | Enable UTF-16 anchor variants |
 
 Derived (non-config) limits used by streaming decode:
-- `pending_window_horizon_bytes = max_window_radius + STREAM_DECODE_CHUNK_BYTES`
-- `pending_window_cap = rules × 3 × max_windows_per_rule_variant`
+- `pending_window_horizon_bytes = (max_window_diameter_bytes / 2) + STREAM_DECODE_CHUNK_BYTES`
+- `pending_window_cap = max(16, rules × 3 × max_windows_per_rule_variant)`
 
 ## Stream Decode Window Scheduling
 

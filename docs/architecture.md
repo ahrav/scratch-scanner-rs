@@ -6,25 +6,31 @@ This crate scans byte streams for secret-like patterns using an anchor-first
 approach. The design favors explicit memory budgets, bounded decoding, and
 reusable scratch buffers so large scans do not trigger per-chunk allocations.
 
-## Pipeline Flow
+## Filesystem Flow (scan fs)
 
 ```
-Path
-  |
-Walker -> FileTable -> ReaderStage -> Chunk -> Engine -> FindingRec -> OutputStage -> stdout
-             ^            |
-             |            +-- BufferPool (fixed-size aligned buffers)
-             +-- FileId (stable indexing into metadata)
+scanner-rs scan fs
+  -> run_fs (src/unified/orchestrator.rs)
+  -> parallel_scan_dir (src/scheduler/parallel_scan.rs)
+  -> IterWalker (single-threaded discovery)
+  -> scan_local (src/scheduler/local_fs_owner.rs)
+       -> assign FileId per file task
+       -> read chunk + overlap with TsBufferPool
+       -> Engine::scan_chunk_into(...)
+       -> drop_prefix_findings(...) for overlap dedupe
+       -> emit ScanEvent::Finding via EventSink
 ```
 
-- Walker traverses the filesystem and enqueues FileId values.
-- ReaderStage pulls FileId values, reads files in fixed-size chunks with
-  overlap, and returns Chunk values backed by the BufferPool.
-- Engine scans each Chunk and produces FindingRec entries.
-- OutputStage formats findings for stdout.
+- `IterWalker` yields `LocalFile` values; `scan_local` assigns monotonic
+  `FileId` values as work is enqueued.
+- Workers do both file I/O and scanning in the same stage (no separate
+  `ReaderStage`/`OutputStage` handoff in this path).
+- Findings are written through `EventSink` implementations
+  (JSONL/Text/JSON/SARIF), and a final summary event is emitted by the
+  orchestrator.
 
-The pipeline is intentionally staged with fixed-capacity rings so backpressure
-is explicit and memory usage stays bounded.
+For direct synchronous library use, `src/runtime.rs` still provides
+`ScannerRuntime` + `read_file_chunks` with overlap-aware chunking.
 
 ## Engine Flow (per buffer)
 
@@ -55,9 +61,14 @@ Key details:
 
 ## Core Data Structures
 
-- BufferPool / BufferHandle
-  Fixed-capacity pool of aligned buffers sized for file chunks. The pool is
-  Rc-backed (single-threaded) and buffers are returned automatically on drop.
+- TsBufferPool / TsBufferHandle
+  Thread-safe fixed-capacity pool used by scheduler workers. Buffers are
+  preallocated, worker-local queues are used on the fast path, and handles
+  return buffers automatically on drop.
+
+- BufferPool / BufferHandle (runtime path)
+  Rc-backed single-threaded fixed-capacity pool used by `ScannerRuntime` and
+  `read_file_chunks`.
 
 - DecodeSlab
   Pre-allocated slab for decoded bytes. Transform decoders append into the slab

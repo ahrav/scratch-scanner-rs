@@ -31,7 +31,7 @@ Documentation index for the scanner-rs secret scanning engine. This guide helps 
 | Document | Focus | Key Concepts |
 |----------|-------|--------------|
 | [detection-engine.md](detection-engine.md) | Multi-stage pattern matching | Anchor scan, window building, two-phase, regex confirmation |
-| [detection-rules.md](detection-rules.md) | Rule coverage & anatomy | 223 rules across 12 categories, anchors, two-phase |
+| [detection-rules.md](detection-rules.md) | Rule anatomy | Anchor strategy, representative patterns, two-phase examples |
 | [transform-chain.md](transform-chain.md) | Recursive decoding flow | URL/Base64 transforms, TimingWheel scheduling |
 
 ---
@@ -70,7 +70,7 @@ Documentation index for the scanner-rs secret scanning engine. This guide helps 
 | Document | Module | Description |
 |----------|--------|-------------|
 | [scheduler-remote-backend.md](scheduler-remote-backend.md) | `src/scheduler/remote.rs` | HTTP/object-store backend, retry policies, transport abstraction |
-| [scheduler-local-fs-uring.md](scheduler-local-fs-uring.md) | `src/scheduler/local_fs_uring.rs` | Linux io_uring async I/O, SQE/CQE queue management, 2-50× throughput |
+| [scheduler-local-fs-uring.md](scheduler-local-fs-uring.md) | `src/scheduler/local_fs_uring.rs` | Linux io_uring async I/O, SQE/CQE queue management, and backend tradeoffs |
 | [scheduler-ts-buffer-pool.md](scheduler-ts-buffer-pool.md) | `src/scheduler/ts_buffer_pool.rs` | Thread-safe buffer recycling, per-worker caching, work-conserving stealing |
 | [scheduler-device-slots.md](scheduler-device-slots.md) | `src/scheduler/device_slots.rs` | Per-device I/O concurrency limits, slot allocation, backpressure |
 | [scheduler-global-resource-pool.md](scheduler-global-resource-pool.md) | `src/scheduler/global_resource_pool.rs` | Centralized permits for "fat" jobs, SLAs, memory management |
@@ -82,7 +82,7 @@ Documentation index for the scanner-rs secret scanning engine. This guide helps 
 | Document | Focus | Key Concepts |
 |----------|-------|--------------|
 | [memory-management.md](memory-management.md) | Buffer lifecycle & pools | BufferPool, RAII, 8MiB fixed buffers sized from pool byte targets, DecodeSlab, ScanScratch |
-| [kani-verification.md](kani-verification.md) | Formal verification | Kani model checking for TimingWheel (8 proofs), Bitset2 (5 proofs) |
+| [kani-verification.md](kani-verification.md) | Formal verification | Kani model checking for TimingWheel (7 proofs), Bitset2 (5 proofs) |
 
 ---
 
@@ -91,8 +91,9 @@ Documentation index for the scanner-rs secret scanning engine. This guide helps 
 | Document | Focus | Key Concepts |
 |----------|-------|--------------|
 | [scanner_harness_modes.md](scanner_harness_modes.md) | Mode 1 (synthetic stress) vs Mode 2 (real ruleset) | Test strategy overview |
-| [real_rules_harness_plan.md](real_rules_harness_plan.md) | Real-ruleset baseline snapshot approach | Baseline workflow, normalization |
-| [real_rules_fixture_design.md](real_rules_fixture_design.md) | Fixture corpus design | Coverage axes, rule families |
+| [scanner_test_harness_guide.md](scanner_test_harness_guide.md) | Scanner simulation harness usage | Corpus replay, random stress runs, deterministic oracles |
+| [scheduler_test_harness_guide.md](scheduler_test_harness_guide.md) | Scheduler simulation harness usage | Work-stealing policy checks and deterministic replay |
+| [git_simulation_harness_guide.md](git_simulation_harness_guide.md) | Git simulation harness usage | Stage model, fault injection, and corpus replay |
 
 ---
 
