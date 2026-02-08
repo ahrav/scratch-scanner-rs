@@ -1,12 +1,12 @@
 ---
 name: rule-optimize
-description: Workflow for modifying and benchmarking gitleaks rules
+description: Workflow for modifying and benchmarking detection rules
 disable-model-invocation: true
 ---
 
 # Rule Optimization Workflow
 
-Use after modifying rules in `src/gitleaks_rules.rs`.
+Use after modifying rules in `default_rules.yaml` (loaded by `src/rules/`).
 
 ## Checklist
 

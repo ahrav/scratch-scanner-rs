@@ -18,7 +18,7 @@ execution details. See `detection-rules.md` for the real ruleset context.
 | Synthetic scenario generator | `src/sim_scanner/generator.rs` | Build deterministic in-memory files, rules, and expected spans from a seed |
 | Random sim harness | `tests/simulation/scanner_random.rs` | Seeded stress testing of engine invariants under faults and chunking |
 | Corpus replay harness | `tests/simulation/scanner_corpus.rs` | Replays minimized regression artifacts |
-| Real ruleset | `src/gitleaks_rules.rs` | Production detection rules (not used by sim harness today) |
+| Real ruleset | `default_rules.yaml` (loaded by `src/rules/`) | Production detection rules (not used by sim harness today) |
 | Harness guide | `docs/scanner_test_harness_guide.md` | How to run and debug the harness |
 
 ## Mode 1: Synthetic Engine Stress (Current)
@@ -42,7 +42,7 @@ Each seed deterministically builds:
 - Ground-truth spans for every inserted secret
 
 No real repo files or production rules are involved. The simulator does not
-test the correctness of `src/gitleaks_rules.rs`; it tests the engine behavior.
+test the correctness of `default_rules.yaml`; it tests the engine behavior.
 
 ### Oracles and invariants
 
@@ -76,7 +76,7 @@ A real-rules harness can provide:
 
 ### Proposed scope
 
-Use the production ruleset from `src/gitleaks_rules.rs` and run one or more
+Use the production ruleset from `default_rules.yaml` and run one or more
 of the following scenario types:
 
 1. Curated fixture corpus (preferred)

@@ -14,7 +14,7 @@ Invoke this skill when modifying:
 - `src/engine/` modules (scratch.rs, stream_decode.rs, work_items.rs)
 - Regex patterns or validation logic
 - Data structures in `src/stdx/`
-- Rule definitions in `gitleaks_rules.rs`
+- Rule definitions in `default_rules.yaml` or `src/rules/`
 
 ## Workflow Steps
 

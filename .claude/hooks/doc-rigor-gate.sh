@@ -27,8 +27,8 @@ FILE_PATH="${CLAUDE_FILE_PATH:-}"
 [[ "$FILE_PATH" == *_tests.rs ]] && exit 0
 [[ "$FILE_PATH" == */tests/* ]] && exit 0
 
-# Skip generated or rule files
-[[ "$FILE_PATH" == *gitleaks_rules.rs ]] && exit 0
+# Skip rule definition files (YAML rules, rule loader)
+[[ "$FILE_PATH" == *default_rules.yaml ]] && exit 0
 
 # Track cumulative changes in a session temp file
 SESSION_TRACKER="/tmp/claude-doc-rigor-$$"
