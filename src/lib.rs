@@ -64,7 +64,6 @@ pub mod unified;
 mod api;
 mod demo;
 mod engine;
-mod gitleaks_rules;
 mod perf_stats;
 mod rules;
 mod runtime;
@@ -101,13 +100,6 @@ pub use demo::{
     demo_rules, demo_transforms, demo_tuning, AnchorMode,
 };
 
-/// Returns the built-in gitleaks rule set.
-///
-/// Gated behind `bench` or `real-rules-harness` to avoid shipping in production.
-#[cfg(any(feature = "bench", feature = "real-rules-harness"))]
-pub fn gitleaks_rules() -> Vec<RuleSpec> {
-    crate::gitleaks_rules::gitleaks_rules()
-}
 
 #[cfg(feature = "tiger-harness")]
 pub use engine::fuzz_try_load;

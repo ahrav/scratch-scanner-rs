@@ -159,9 +159,10 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gitleaks_rules::gitleaks_rules;
+    use crate::api::ValidatorKind;
+    use crate::rules::builtin_rules;
 
-    /// Convert existing `RuleSpec` values back to YAML intermediate types.
+    /// Convert `RuleSpec` back to YAML intermediate type for round-trip testing.
     fn rulespec_to_yaml(rule: &RuleSpec) -> YamlRule {
         let anchors: Vec<String> = rule
             .anchors
@@ -222,20 +223,8 @@ mod tests {
     }
 
     #[test]
-    fn generate_default_rules_yaml() {
-        let rules = gitleaks_rules();
-        let yaml_rules: Vec<YamlRule> = rules.iter().map(rulespec_to_yaml).collect();
-        let file = YamlRulesFile { rules: yaml_rules };
-        let yaml_str = serde_yml::to_string(&file).expect("serialize to YAML");
-
-        let out_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("default_rules.yaml");
-        std::fs::write(&out_path, &yaml_str).expect("write default_rules.yaml");
-        eprintln!("wrote {} bytes to {}", yaml_str.len(), out_path.display());
-    }
-
-    #[test]
-    fn roundtrip_gitleaks_rules() {
-        let original_rules = gitleaks_rules();
+    fn roundtrip_builtin_rules() {
+        let original_rules = builtin_rules();
 
         // Convert to YAML and back.
         let yaml_rules: Vec<YamlRule> = original_rules.iter().map(rulespec_to_yaml).collect();
@@ -394,13 +383,33 @@ mod tests {
                 orig.name
             );
 
-            // Validator (always None for gitleaks rules).
+            // Validator (always None for builtin rules).
             assert_eq!(
                 orig.validator, parsed.validator,
                 "validator mismatch for {}",
                 orig.name
             );
         }
+    }
+
+    #[test]
+    fn builtin_rules_use_no_fast_validators() {
+        let rules = builtin_rules();
+        assert!(!rules.is_empty(), "builtin rule set should not be empty");
+        for rule in rules {
+            assert_eq!(
+                rule.validator,
+                ValidatorKind::None,
+                "rule '{}' unexpectedly enables fast validator",
+                rule.name
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_rules_count() {
+        let rules = builtin_rules();
+        assert_eq!(rules.len(), 223, "expected 223 builtin rules");
     }
 
     #[test]

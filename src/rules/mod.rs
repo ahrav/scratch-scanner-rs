@@ -1,7 +1,7 @@
-//! External rule loading for the scanner.
+//! Rule loading for the scanner.
 //!
-//! Supports loading detection rules from YAML files instead of the
-//! compiled-in `gitleaks_rules()` set. The YAML schema mirrors `RuleSpec`
+//! Rules can be loaded from an external YAML file at runtime, or from the
+//! built-in set embedded via `include_str!`. The YAML schema mirrors `RuleSpec`
 //! fields and uses the same `build_regex()` + `assert_valid()` validation.
 
 pub(crate) mod yaml;
@@ -136,4 +136,15 @@ pub(crate) fn default_rules_path() -> Option<PathBuf> {
         .parent()?
         .join("default_rules.yaml")
         .into()
+}
+
+/// The built-in rule set, embedded from `default_rules.yaml` at compile time.
+const BUILTIN_RULES_YAML: &str = include_str!("../../default_rules.yaml");
+
+/// Parse and return the built-in rule set.
+///
+/// This replaces the old `gitleaks_rules()` function. Rules are compiled
+/// from the embedded YAML on each call (regex compilation dominates cost).
+pub(crate) fn builtin_rules() -> Vec<RuleSpec> {
+    yaml::parse_yaml_rules(BUILTIN_RULES_YAML).expect("built-in rules YAML must be valid")
 }

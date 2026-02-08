@@ -400,8 +400,8 @@ fn allocs_after_startup_in_scan_local_multicore() -> io::Result<()> {
 fn report_multicore_memory_allocation() {
     eprintln!("\n=== Multi-core Memory Allocation Report ===\n");
 
-    // Rule count from gitleaks_rules (223 rules as of this writing)
-    // Update if rules change: `grep -c "RuleSpec {" src/gitleaks_rules.rs`
+    // Rule count from default_rules.yaml (223 rules as of this writing)
+    // Update if rules change: `grep -c '^- name:' default_rules.yaml`
     let rules_len = 223usize;
     let pair_count = rules_len * 3; // raw, utf16, stream variants
 
