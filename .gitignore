@@ -62,3 +62,6 @@ tests/failures/
 proptest-regressions/
 
 # Scanner scenario tracking (internal progress document)
+
+# bv (beads viewer) local config and caches
+.bv/
