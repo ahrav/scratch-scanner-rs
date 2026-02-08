@@ -7,7 +7,7 @@
 //! reused across chunks to keep the hot path allocation-free.
 
 use crate::api::{
-    DecodeStep, FileId, FindingRec, StepId, TransformConfig, TransformId, Utf16Endianness,
+    DecodeStep, FileId, FindingRec, StepId, TransformConfig, TransformId,
     STEP_ROOT,
 };
 use crate::scratch_memory::ScratchVec;
