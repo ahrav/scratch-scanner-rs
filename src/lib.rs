@@ -66,6 +66,7 @@ mod demo;
 mod engine;
 mod gitleaks_rules;
 mod perf_stats;
+mod rules;
 mod runtime;
 
 // Guard: stat instrumentation features carry non-trivial overhead and must

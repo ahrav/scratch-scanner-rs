@@ -23,6 +23,10 @@ use super::{EventFormat, FsScanConfig, GitSourceConfig, SourceConfig};
 pub struct ScanConfig {
     pub source: SourceConfig,
     pub event_format: EventFormat,
+    /// Optional path to a YAML rules file. When `None`, the orchestrator
+    /// falls back to `default_rules.yaml` next to the binary, then the
+    /// compiled-in demo rules.
+    pub rules_file: Option<PathBuf>,
 }
 
 /// Parse `std::env::args_os()` into a [`ScanConfig`].
@@ -97,9 +101,14 @@ fn parse_fs_args(args: env::ArgsOs) -> io::Result<ScanConfig> {
     let mut null_sink = false;
     let mut anchor_mode = AnchorMode::Manual;
     let mut event_format = EventFormat::Jsonl;
+    let mut rules_file: Option<PathBuf> = None;
 
     for arg in args {
         if let Some(flag) = arg.to_str() {
+            if let Some(rest) = flag.strip_prefix("--rules=") {
+                rules_file = Some(PathBuf::from(rest));
+                continue;
+            }
             if let Some(rest) = flag.strip_prefix("--path=") {
                 path = Some(PathBuf::from(rest));
                 continue;
@@ -171,6 +180,7 @@ fn parse_fs_args(args: env::ArgsOs) -> io::Result<ScanConfig> {
             null_sink,
         }),
         event_format,
+        rules_file,
     })
 }
 
@@ -190,9 +200,14 @@ fn parse_git_args(args: env::ArgsOs) -> io::Result<ScanConfig> {
     let mut debug = false;
     let mut perf_breakdown = false;
     let mut event_format = EventFormat::Jsonl;
+    let mut rules_file: Option<PathBuf> = None;
 
     for arg in args {
         if let Some(flag) = arg.to_str() {
+            if let Some(rest) = flag.strip_prefix("--rules=") {
+                rules_file = Some(PathBuf::from(rest));
+                continue;
+            }
             if let Some(rest) = flag.strip_prefix("--repo=") {
                 repo = Some(PathBuf::from(rest));
                 continue;
@@ -313,6 +328,7 @@ fn parse_git_args(args: env::ArgsOs) -> io::Result<ScanConfig> {
             perf_breakdown,
         }),
         event_format,
+        rules_file,
     })
 }
 
@@ -380,6 +396,7 @@ fn print_fs_usage() {
 
 OPTIONS:
     --path=<dir|file>       Path to scan (also accepted as positional arg)
+    --rules=<path>          YAML rules file (default: default_rules.yaml next to binary)
     --workers=<N>           Worker threads (default: CPU count)
     --decode-depth=<N>      Max decode depth (default: 2)
     --no-archives           Disable archive scanning
@@ -397,6 +414,7 @@ fn print_git_usage() {
 OPTIONS:
     --repo=<path>             Repository path (also accepted as positional arg)
     --repo-id=<N>             Repository id (default: 1)
+    --rules=<path>            YAML rules file (default: default_rules.yaml next to binary)
     --mode=diff|odb-blob      Scan mode (default: odb-blob)
     --merge=all|first-parent  Merge diff mode (default: all)
     --pack-exec-workers=<N>   Pack exec workers

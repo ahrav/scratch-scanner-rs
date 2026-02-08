@@ -8,6 +8,9 @@ At session end: close finished work, file new issues, run `bd sync`, then `git p
 
 For graph-aware triage: `bv --robot-triage` (never bare `bv`).
 
+When working in plan mode, always include bd status updates
+in the plan (update to in_progress at start, close at end).
+
 <!-- bv-agent-instructions-v1 -->
 
 ### Using bv as an AI sidecar

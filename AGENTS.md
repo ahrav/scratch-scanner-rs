@@ -1,5 +1,8 @@
 # Repository Guidance
 
+When working in plan mode, always include bd status updates
+in the plan (update to in_progress at start, close at end).
+
 ## Task Management
 
 This project uses `bd` (Beads) for issue tracking. Issues live in `.beads/`.
