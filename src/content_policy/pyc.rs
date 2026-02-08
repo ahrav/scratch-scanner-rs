@@ -40,7 +40,8 @@
 //!   by their known byte sizes.
 //! - **Container types** (`tuple`, `list`, `set`, `dict`): we skip only the
 //!   element-count prefix; the contained objects follow inline and will be
-//!   picked up by subsequent iterations.
+//!   picked up by subsequent iterations. Dict key/value pairs are terminated
+//!   by `TYPE_NULL` (`'0'`), which we treat as a zero-size sentinel.
 //! - **`TYPE_CODE`**: skips the 24-byte numeric prefix (argcount through
 //!   flags — the layout used by Python 3.8+). The code object's sub-fields
 //!   (bytecode, constants, names, etc.) are themselves marshal objects and
@@ -444,6 +445,53 @@ mod tests {
         assert_eq!(result, ExtractResult::Ok);
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("secret"));
+    }
+
+    #[test]
+    fn supports_python36_timestamp_header() {
+        let mut data = Vec::new();
+        // Python 3.6-style header (12 bytes): magic + timestamp + source size.
+        data.extend_from_slice(&[0x33, 0x0d, 0x0d, 0x0a]);
+        data.extend_from_slice(&[0, 0, 0, 0]); // timestamp
+        data.extend_from_slice(&[0, 0, 0, 0]); // source size
+                                               // Marshal: TYPE_SHORT_ASCII("secret")
+        data.push(TYPE_SHORT_ASCII);
+        data.push(6);
+        data.extend_from_slice(b"secret");
+
+        let mut out = Vec::new();
+        let result = PycExtractor.extract(&data, &mut out, &mut Vec::new());
+        assert_eq!(result, ExtractResult::Ok);
+        assert!(
+            String::from_utf8(out).unwrap().contains("secret"),
+            "expected string from marshal payload after 12-byte header"
+        );
+    }
+
+    #[test]
+    fn dict_terminator_does_not_abort_scan() {
+        let mut marshal = Vec::new();
+        // Dict with one key/value pair, then terminator, then another string.
+        marshal.push(TYPE_DICT);
+        marshal.push(TYPE_SHORT_ASCII);
+        marshal.push(1);
+        marshal.extend_from_slice(b"k");
+        marshal.push(TYPE_SHORT_ASCII);
+        marshal.push(1);
+        marshal.extend_from_slice(b"v");
+        marshal.push(TYPE_NULL); // dict terminator
+        marshal.push(TYPE_SHORT_ASCII);
+        marshal.push(5);
+        marshal.extend_from_slice(b"after");
+        let pyc = make_pyc(&marshal);
+
+        let mut out = Vec::new();
+        let result = PycExtractor.extract(&pyc, &mut out, &mut Vec::new());
+        assert_eq!(result, ExtractResult::Ok);
+        assert!(
+            String::from_utf8(out).unwrap().contains("after"),
+            "dict terminator should not end the whole marshal walk"
+        );
     }
 
     #[test]

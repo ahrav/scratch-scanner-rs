@@ -69,10 +69,11 @@ pub fn is_likely_binary(data: &[u8], check_len: usize) -> bool {
 /// Classify content by inspecting bytes and the file path extension.
 ///
 /// 1. Check for NUL bytes in the first `check_len` bytes.
-/// 2. If no NUL bytes: check extension for extractable formats (e.g. `.ipynb`
-///    is JSON text but should be routed through the extractor). If matched →
-///    [`ContentVerdict::BinaryExtractable`]; otherwise → [`ContentVerdict::Text`].
-/// 3. If NUL bytes present: check extension for extractable formats →
+/// 2. If no NUL bytes:
+///    - `.ipynb` is [`ContentVerdict::BinaryExtractable`] when
+///      `binary-extract` is enabled, so code/markdown cells can be extracted.
+///    - otherwise classify as [`ContentVerdict::Text`].
+/// 3. If NUL bytes are present: check extension for extractable formats →
 ///    [`ContentVerdict::BinaryExtractable`]; otherwise → [`ContentVerdict::Binary`].
 ///
 /// Empty data always returns [`ContentVerdict::Text`] (nothing to skip).
@@ -81,9 +82,11 @@ pub fn classify_content(data: &[u8], path: &[u8], check_len: usize) -> ContentVe
     if !is_likely_binary(data, check_len) {
         // .ipynb files are JSON (text) but we still want to classify them as
         // extractable so the extractor can pull code cells only (ignoring
-        // output blobs). Check extension even for text content.
-        if let Some(fmt) = match_extractable_extension(path) {
-            return ContentVerdict::BinaryExtractable(fmt);
+        // output blobs). Other extractable extensions should remain Text
+        // unless the content is actually binary.
+        #[cfg(feature = "binary-extract")]
+        if let Some(ExtractableFormat::Ipynb) = match_extractable_extension(path) {
+            return ContentVerdict::BinaryExtractable(ExtractableFormat::Ipynb);
         }
         return ContentVerdict::Text;
     }
@@ -198,11 +201,40 @@ mod tests {
     }
 
     #[test]
+    fn nul_free_extractable_binary_extensions_classify_as_text() {
+        let data = b"SECRET in plain text";
+        for path in [
+            b"Foo.class".as_slice(),
+            b"app.jar".as_slice(),
+            b"app.war".as_slice(),
+            b"module.pyc".as_slice(),
+        ] {
+            assert_eq!(
+                classify_content(data, path, CHECK_LEN),
+                ContentVerdict::Text,
+                "expected text classification for path {:?}",
+                String::from_utf8_lossy(path)
+            );
+        }
+    }
+
+    #[cfg(feature = "binary-extract")]
+    #[test]
     fn ipynb_text_content_classified_as_extractable() {
         let data = b"{\"cells\": []}";
         assert_eq!(
             classify_content(data, b"notebook.ipynb", CHECK_LEN),
             ContentVerdict::BinaryExtractable(ExtractableFormat::Ipynb)
+        );
+    }
+
+    #[cfg(not(feature = "binary-extract"))]
+    #[test]
+    fn ipynb_text_content_classified_as_text() {
+        let data = b"{\"cells\": []}";
+        assert_eq!(
+            classify_content(data, b"notebook.ipynb", CHECK_LEN),
+            ContentVerdict::Text
         );
     }
 
