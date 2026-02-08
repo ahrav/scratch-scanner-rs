@@ -3,6 +3,7 @@
 //! Run with: `cargo test --test property`
 
 mod archive_path_canonicalization;
+mod binary_classification;
 mod git_commit_walk;
 mod git_engine_adapter;
 mod git_spill_dedupe;

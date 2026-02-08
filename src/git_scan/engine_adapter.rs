@@ -177,6 +177,9 @@ pub struct EngineAdapter<'a> {
     /// Reusable buffer for binary format text extraction.
     #[cfg(feature = "binary-extract")]
     extract_buf: Vec<u8>,
+    /// Temporary workspace for extractors (e.g. per-entry reads in JARs).
+    #[cfg(feature = "binary-extract")]
+    extract_scratch: Vec<u8>,
 }
 
 impl<'a> EngineAdapter<'a> {
@@ -215,7 +218,9 @@ impl<'a> EngineAdapter<'a> {
             event_sink,
             scan_binary: config.scan_binary,
             #[cfg(feature = "binary-extract")]
-            extract_buf: Vec::new(),
+            extract_buf: Vec::with_capacity(crate::content_policy::extract::EXTRACT_OUTPUT_CAP),
+            #[cfg(feature = "binary-extract")]
+            extract_scratch: Vec::with_capacity(crate::content_policy::extract::JAR_ENTRY_CAP),
         }
     }
 
@@ -330,7 +335,7 @@ impl<'a> EngineAdapter<'a> {
                     #[cfg(feature = "binary-extract")]
                     {
                         use crate::content_policy::extract::{extract_content, ExtractResult};
-                        if extract_content(_fmt, bytes, &mut self.extract_buf) == ExtractResult::Ok
+                        if extract_content(_fmt, bytes, &mut self.extract_buf, &mut self.extract_scratch) == ExtractResult::Ok
                         {
                             perf::record_scan_binary_extract();
                             return scan_blob_chunked_with_chunker(

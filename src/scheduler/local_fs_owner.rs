@@ -369,9 +369,15 @@ struct LocalScratch<E: ScanEngine> {
     skip_binary: bool,
     /// Probe buffer for binary detection when archive sniffing is disabled.
     binary_probe_buf: [u8; crate::content_policy::CHECK_LEN],
-    /// Reusable buffer for binary format text extraction.
+    /// Reusable buffer for reading extractable binary files (input).
     #[cfg(feature = "binary-extract")]
     extract_buf: Vec<u8>,
+    /// Reusable buffer for extraction output.
+    #[cfg(feature = "binary-extract")]
+    extract_out_buf: Vec<u8>,
+    /// Temporary workspace for extractors (e.g. per-entry reads in JARs).
+    #[cfg(feature = "binary-extract")]
+    extract_scratch: Vec<u8>,
 }
 
 // ============================================================================
@@ -2222,33 +2228,32 @@ fn extract_and_scan_file<E: ScanEngine>(
     // Read the entire file into a temporary buffer.
     let read_limit = file_size.min(64 * 1024 * 1024) as usize; // 64 MiB cap
     let scratch = &mut ctx.scratch;
-    let extract_buf = &mut scratch.extract_buf;
-    extract_buf.clear();
-    extract_buf.reserve(read_limit);
+    scratch.extract_buf.clear();
+    scratch.extract_buf.reserve(read_limit);
     if file
         .take(read_limit as u64)
-        .read_to_end(extract_buf)
+        .read_to_end(&mut scratch.extract_buf)
         .is_err()
     {
         return;
     }
 
-    // Extract scannable text.
-    let mut scan_buf = std::mem::take(extract_buf);
-    let mut out_buf = Vec::new();
-    let result = extract_content(fmt, &scan_buf, &mut out_buf);
+    // Extract scannable text using pre-allocated buffers (split borrows).
+    scratch.extract_out_buf.clear();
+    let result = extract_content(
+        fmt,
+        &scratch.extract_buf,
+        &mut scratch.extract_out_buf,
+        &mut scratch.extract_scratch,
+    );
 
-    // Return the buffers.
-    scan_buf.clear();
-    *extract_buf = scan_buf;
-
-    if result != ExtractResult::Ok || out_buf.is_empty() {
+    if result != ExtractResult::Ok || scratch.extract_out_buf.is_empty() {
         return;
     }
 
     // Scan the extracted text as a single chunk.
     let engine = &scratch.engine;
-    engine.scan_chunk_into(&out_buf, task.file_id, 0, &mut scratch.scan_scratch);
+    engine.scan_chunk_into(&scratch.extract_out_buf, task.file_id, 0, &mut scratch.scan_scratch);
 
     scratch.pending.clear();
     scratch
@@ -2271,7 +2276,7 @@ fn extract_and_scan_file<E: ScanEngine>(
     ctx.metrics.bytes_scanned = ctx
         .metrics
         .bytes_scanned
-        .saturating_add(out_buf.len() as u64);
+        .saturating_add(scratch.extract_out_buf.len() as u64);
     ctx.metrics.chunks_scanned = ctx.metrics.chunks_scanned.saturating_add(1);
 }
 
@@ -2785,7 +2790,11 @@ where
                     skip_binary: cfg.skip_binary,
                     binary_probe_buf: [0u8; crate::content_policy::CHECK_LEN],
                     #[cfg(feature = "binary-extract")]
-                    extract_buf: Vec::new(),
+                    extract_buf: Vec::with_capacity(crate::content_policy::extract::EXTRACT_INPUT_CAP),
+                    #[cfg(feature = "binary-extract")]
+                    extract_out_buf: Vec::with_capacity(crate::content_policy::extract::EXTRACT_OUTPUT_CAP),
+                    #[cfg(feature = "binary-extract")]
+                    extract_scratch: Vec::with_capacity(crate::content_policy::extract::JAR_ENTRY_CAP),
                 }
             }
         },

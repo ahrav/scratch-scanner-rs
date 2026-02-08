@@ -57,7 +57,7 @@ const CONSTANT_MODULE: u8 = 19;
 const CONSTANT_PACKAGE: u8 = 20;
 
 impl Extractor for JavaClassExtractor {
-    fn extract(&self, data: &[u8], out: &mut Vec<u8>) -> ExtractResult {
+    fn extract(&self, data: &[u8], out: &mut Vec<u8>, _scratch: &mut Vec<u8>) -> ExtractResult {
         if data.len() < 10 || data[..4] != MAGIC {
             return ExtractResult::ParseError;
         }
@@ -156,7 +156,7 @@ mod tests {
     fn extracts_utf8_strings() {
         let class = make_class(&[b"com/example/App", b"SECRET_KEY"]);
         let mut out = Vec::new();
-        let result = JavaClassExtractor.extract(&class, &mut out);
+        let result = JavaClassExtractor.extract(&class, &mut out, &mut Vec::new());
         assert_eq!(result, ExtractResult::Ok);
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("com/example/App"));
@@ -167,7 +167,7 @@ mod tests {
     fn rejects_non_class() {
         let mut out = Vec::new();
         assert_eq!(
-            JavaClassExtractor.extract(b"not a class", &mut out),
+            JavaClassExtractor.extract(b"not a class", &mut out, &mut Vec::new()),
             ExtractResult::ParseError
         );
     }
@@ -180,7 +180,105 @@ mod tests {
         data.extend_from_slice(&1u16.to_be_bytes()); // cp_count=1 means no entries
         let mut out = Vec::new();
         assert_eq!(
-            JavaClassExtractor.extract(&data, &mut out),
+            JavaClassExtractor.extract(&data, &mut out, &mut Vec::new()),
+            ExtractResult::Empty
+        );
+    }
+
+    #[test]
+    fn skips_long_and_double_entries() {
+        // Long and Double consume two constant pool slots.
+        // Layout: LONG(8 bytes, 2 slots) + UTF8("found")
+        // cp_count = 4 (index 1=long, 2=phantom, 3=utf8)
+        let mut data = Vec::new();
+        data.extend_from_slice(&MAGIC);
+        data.extend_from_slice(&[0, 0, 0, 52]);
+        data.extend_from_slice(&4u16.to_be_bytes()); // cp_count=4
+        // Entry 1: CONSTANT_Long (takes slots 1 and 2)
+        data.push(CONSTANT_LONG);
+        data.extend_from_slice(&[0u8; 8]);
+        // Entry 3: CONSTANT_Utf8
+        data.push(CONSTANT_UTF8);
+        data.extend_from_slice(&5u16.to_be_bytes());
+        data.extend_from_slice(b"found");
+
+        let mut out = Vec::new();
+        let result = JavaClassExtractor.extract(&data, &mut out, &mut Vec::new());
+        assert_eq!(result, ExtractResult::Ok);
+        assert!(String::from_utf8(out).unwrap().contains("found"));
+    }
+
+    #[test]
+    fn skips_method_handle() {
+        // CONSTANT_MethodHandle is 3 bytes (unique size).
+        // Layout: MethodHandle(3 bytes) + UTF8("after_handle")
+        let mut data = Vec::new();
+        data.extend_from_slice(&MAGIC);
+        data.extend_from_slice(&[0, 0, 0, 52]);
+        data.extend_from_slice(&3u16.to_be_bytes());
+        // Entry 1: CONSTANT_MethodHandle (1 byte ref_kind + 2 byte ref_index)
+        data.push(CONSTANT_METHOD_HANDLE);
+        data.extend_from_slice(&[5, 0, 1]); // ref_kind=5, ref_index=1
+        // Entry 2: CONSTANT_Utf8
+        data.push(CONSTANT_UTF8);
+        data.extend_from_slice(&12u16.to_be_bytes());
+        data.extend_from_slice(b"after_handle");
+
+        let mut out = Vec::new();
+        let result = JavaClassExtractor.extract(&data, &mut out, &mut Vec::new());
+        assert_eq!(result, ExtractResult::Ok);
+        assert!(String::from_utf8(out).unwrap().contains("after_handle"));
+    }
+
+    #[test]
+    fn truncated_utf8_entry_bails() {
+        // Data ends in the middle of a UTF8 string's content.
+        let mut data = Vec::new();
+        data.extend_from_slice(&MAGIC);
+        data.extend_from_slice(&[0, 0, 0, 52]);
+        data.extend_from_slice(&2u16.to_be_bytes());
+        data.push(CONSTANT_UTF8);
+        data.extend_from_slice(&10u16.to_be_bytes()); // claims 10 bytes
+        data.extend_from_slice(b"short"); // only 5 bytes
+
+        let mut out = Vec::new();
+        let result = JavaClassExtractor.extract(&data, &mut out, &mut Vec::new());
+        // Should bail without extracting the truncated string.
+        assert_eq!(result, ExtractResult::Empty);
+    }
+
+    #[test]
+    fn unknown_tag_bails_gracefully() {
+        // An unknown tag (e.g. 99) should stop parsing without panic.
+        let mut data = Vec::new();
+        data.extend_from_slice(&MAGIC);
+        data.extend_from_slice(&[0, 0, 0, 52]);
+        data.extend_from_slice(&3u16.to_be_bytes());
+        // Entry 1: UTF8 (extracted)
+        data.push(CONSTANT_UTF8);
+        data.extend_from_slice(&5u16.to_be_bytes());
+        data.extend_from_slice(b"hello");
+        // Entry 2: unknown tag
+        data.push(99);
+        data.extend_from_slice(&[0; 10]); // trailing garbage
+
+        let mut out = Vec::new();
+        let result = JavaClassExtractor.extract(&data, &mut out, &mut Vec::new());
+        // Should have extracted the first string before bailing.
+        assert_eq!(result, ExtractResult::Ok);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("hello"));
+    }
+
+    #[test]
+    fn cp_count_zero_returns_empty() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&MAGIC);
+        data.extend_from_slice(&[0, 0, 0, 52]);
+        data.extend_from_slice(&0u16.to_be_bytes()); // cp_count=0
+        let mut out = Vec::new();
+        assert_eq!(
+            JavaClassExtractor.extract(&data, &mut out, &mut Vec::new()),
             ExtractResult::Empty
         );
     }

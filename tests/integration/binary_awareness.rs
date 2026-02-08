@@ -192,6 +192,130 @@ fn fs_scan_ipynb_extraction() {
     );
 }
 
+/// .class files should be detected as extractable and have their constant pool strings scanned.
+#[cfg(feature = "binary-extract")]
+#[test]
+fn fs_scan_java_class_extraction() {
+    let dir = TempDir::new().unwrap();
+
+    // Build a minimal .class file with SECRET in the constant pool.
+    let class_path = dir.path().join("App.class");
+    let mut class_data = Vec::new();
+    // CAFEBABE magic.
+    class_data.extend_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]);
+    // Minor/major version (Java 8).
+    class_data.extend_from_slice(&[0, 0, 0, 52]);
+    // Constant pool count = 2 (one entry at index 1).
+    class_data.extend_from_slice(&2u16.to_be_bytes());
+    // Entry 1: CONSTANT_Utf8 containing "SECRET"
+    class_data.push(1); // tag
+    class_data.extend_from_slice(&6u16.to_be_bytes());
+    class_data.extend_from_slice(b"SECRET");
+    std::fs::write(&class_path, &class_data).unwrap();
+    let size = std::fs::metadata(&class_path).unwrap().len();
+
+    let files = vec![lf(class_path, size)];
+    let (output, report) = run_scan_with_config(files, default_cfg());
+    let paths = finding_paths(&output);
+
+    assert!(
+        paths.iter().any(|p| p.contains("App.class")),
+        "class extraction should find secret: {output}"
+    );
+    assert!(
+        report.metrics.binary_extracted > 0,
+        "expected binary_extracted > 0, got {}",
+        report.metrics.binary_extracted
+    );
+}
+
+/// .jar files should be detected as extractable and have embedded .class strings scanned.
+/// Archive scanning is disabled so the JAR goes through the binary-extract path.
+#[cfg(feature = "binary-extract")]
+#[test]
+fn fs_scan_jar_extraction() {
+    let dir = TempDir::new().unwrap();
+
+    // Build a minimal .class file with SECRET.
+    let mut class_data = Vec::new();
+    class_data.extend_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]);
+    class_data.extend_from_slice(&[0, 0, 0, 52]);
+    class_data.extend_from_slice(&2u16.to_be_bytes());
+    class_data.push(1);
+    class_data.extend_from_slice(&6u16.to_be_bytes());
+    class_data.extend_from_slice(b"SECRET");
+
+    // Wrap in a JAR (ZIP).
+    let jar_path = dir.path().join("app.jar");
+    let buf = Vec::new();
+    let cursor = std::io::Cursor::new(buf);
+    let mut writer = zip::ZipWriter::new(cursor);
+    let options =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    writer.start_file("com/example/App.class", options).unwrap();
+    std::io::Write::write_all(&mut writer, &class_data).unwrap();
+    let cursor = writer.finish().unwrap();
+    std::fs::write(&jar_path, cursor.into_inner()).unwrap();
+    let size = std::fs::metadata(&jar_path).unwrap().len();
+
+    let files = vec![lf(jar_path, size)];
+    // Disable archive scanning so the JAR hits the binary-extract path
+    // (otherwise ZIP magic routes it through archive scanning instead).
+    let mut cfg = default_cfg();
+    cfg.archive.enabled = false;
+    let (output, report) = run_scan_with_config(files, cfg);
+    let paths = finding_paths(&output);
+
+    assert!(
+        paths.iter().any(|p| p.contains("app.jar")),
+        "jar extraction should find secret: {output}"
+    );
+    assert!(
+        report.metrics.binary_extracted > 0,
+        "expected binary_extracted > 0, got {}",
+        report.metrics.binary_extracted
+    );
+}
+
+/// .pyc files should be detected as extractable and have their marshal strings scanned.
+#[cfg(feature = "binary-extract")]
+#[test]
+fn fs_scan_pyc_extraction() {
+    let dir = TempDir::new().unwrap();
+
+    // Build a minimal .pyc with a marshal string containing SECRET.
+    let pyc_path = dir.path().join("module.pyc");
+    let mut pyc_data = Vec::new();
+    // Magic for Python 3.8 (0x550d) + \r\n.
+    pyc_data.extend_from_slice(&[0x55, 0x0d, 0x0d, 0x0a]);
+    // Flags = 0.
+    pyc_data.extend_from_slice(&[0, 0, 0, 0]);
+    // Timestamp.
+    pyc_data.extend_from_slice(&[0, 0, 0, 0]);
+    // Source size.
+    pyc_data.extend_from_slice(&[0, 0, 0, 0]);
+    // Marshal: TYPE_SHORT_ASCII (0x7a), length=6, "SECRET".
+    pyc_data.push(0x7a); // 'z' = TYPE_SHORT_ASCII
+    pyc_data.push(6);
+    pyc_data.extend_from_slice(b"SECRET");
+    std::fs::write(&pyc_path, &pyc_data).unwrap();
+    let size = std::fs::metadata(&pyc_path).unwrap().len();
+
+    let files = vec![lf(pyc_path, size)];
+    let (output, report) = run_scan_with_config(files, default_cfg());
+    let paths = finding_paths(&output);
+
+    assert!(
+        paths.iter().any(|p| p.contains("module.pyc")),
+        "pyc extraction should find secret: {output}"
+    );
+    assert!(
+        report.metrics.binary_extracted > 0,
+        "expected binary_extracted > 0, got {}",
+        report.metrics.binary_extracted
+    );
+}
+
 /// Stats should report correct binary skip counts.
 #[test]
 fn binary_skip_stats_correct() {

@@ -95,7 +95,7 @@ const FLAG_REF: u8 = 0x80;
 const MIN_HEADER: usize = 16;
 
 impl Extractor for PycExtractor {
-    fn extract(&self, data: &[u8], out: &mut Vec<u8>) -> ExtractResult {
+    fn extract(&self, data: &[u8], out: &mut Vec<u8>, _scratch: &mut Vec<u8>) -> ExtractResult {
         if data.len() < MIN_HEADER {
             return ExtractResult::ParseError;
         }
@@ -323,7 +323,7 @@ mod tests {
         let pyc = make_pyc(&marshal);
 
         let mut out = Vec::new();
-        let result = PycExtractor.extract(&pyc, &mut out);
+        let result = PycExtractor.extract(&pyc, &mut out, &mut Vec::new());
         assert_eq!(result, ExtractResult::Ok);
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("hello"));
@@ -339,7 +339,7 @@ mod tests {
         let pyc = make_pyc(&marshal);
 
         let mut out = Vec::new();
-        let result = PycExtractor.extract(&pyc, &mut out);
+        let result = PycExtractor.extract(&pyc, &mut out, &mut Vec::new());
         assert_eq!(result, ExtractResult::Ok);
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("secret123"));
@@ -354,7 +354,7 @@ mod tests {
         let pyc = make_pyc(&marshal);
 
         let mut out = Vec::new();
-        let result = PycExtractor.extract(&pyc, &mut out);
+        let result = PycExtractor.extract(&pyc, &mut out, &mut Vec::new());
         assert_eq!(result, ExtractResult::Ok);
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("API_KEY"));
@@ -370,7 +370,7 @@ mod tests {
         let pyc = make_pyc(&marshal);
 
         let mut out = Vec::new();
-        let result = PycExtractor.extract(&pyc, &mut out);
+        let result = PycExtractor.extract(&pyc, &mut out, &mut Vec::new());
         assert_eq!(result, ExtractResult::Ok);
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("abc"));
@@ -392,7 +392,7 @@ mod tests {
         let pyc = make_pyc(&marshal);
 
         let mut out = Vec::new();
-        let result = PycExtractor.extract(&pyc, &mut out);
+        let result = PycExtractor.extract(&pyc, &mut out, &mut Vec::new());
         assert_eq!(result, ExtractResult::Ok);
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("pass"));
@@ -402,7 +402,7 @@ mod tests {
     fn rejects_non_pyc() {
         let mut out = Vec::new();
         assert_eq!(
-            PycExtractor.extract(b"not a pyc file", &mut out),
+            PycExtractor.extract(b"not a pyc file", &mut out, &mut Vec::new()),
             ExtractResult::ParseError
         );
     }
@@ -411,7 +411,7 @@ mod tests {
     fn too_short_returns_parse_error() {
         let mut out = Vec::new();
         assert_eq!(
-            PycExtractor.extract(b"\x55\x0d\x0d\x0a", &mut out),
+            PycExtractor.extract(b"\x55\x0d\x0d\x0a", &mut out, &mut Vec::new()),
             ExtractResult::ParseError
         );
     }
@@ -420,7 +420,7 @@ mod tests {
     fn empty_marshal_returns_empty() {
         let pyc = make_pyc(&[]);
         let mut out = Vec::new();
-        assert_eq!(PycExtractor.extract(&pyc, &mut out), ExtractResult::Empty);
+        assert_eq!(PycExtractor.extract(&pyc, &mut out, &mut Vec::new()), ExtractResult::Empty);
     }
 
     #[test]
@@ -438,9 +438,148 @@ mod tests {
         data.extend_from_slice(b"secret");
 
         let mut out = Vec::new();
-        let result = PycExtractor.extract(&data, &mut out);
+        let result = PycExtractor.extract(&data, &mut out, &mut Vec::new());
         assert_eq!(result, ExtractResult::Ok);
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("secret"));
+    }
+
+    #[test]
+    fn extracts_type_string() {
+        // TYPE_STRING uses u32 LE length prefix.
+        let mut marshal = Vec::new();
+        marshal.push(TYPE_STRING);
+        marshal.extend_from_slice(&11u32.to_le_bytes());
+        marshal.extend_from_slice(b"hello_world");
+        let pyc = make_pyc(&marshal);
+
+        let mut out = Vec::new();
+        let result = PycExtractor.extract(&pyc, &mut out, &mut Vec::new());
+        assert_eq!(result, ExtractResult::Ok);
+        assert!(String::from_utf8(out).unwrap().contains("hello_world"));
+    }
+
+    #[test]
+    fn extracts_ascii_and_ascii_interned() {
+        let mut marshal = Vec::new();
+        // TYPE_ASCII (u32 LE length)
+        marshal.push(TYPE_ASCII);
+        marshal.extend_from_slice(&3u32.to_le_bytes());
+        marshal.extend_from_slice(b"foo");
+        // TYPE_ASCII_INTERNED (u32 LE length)
+        marshal.push(TYPE_ASCII_INTERNED);
+        marshal.extend_from_slice(&3u32.to_le_bytes());
+        marshal.extend_from_slice(b"bar");
+        let pyc = make_pyc(&marshal);
+
+        let mut out = Vec::new();
+        let result = PycExtractor.extract(&pyc, &mut out, &mut Vec::new());
+        assert_eq!(result, ExtractResult::Ok);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("foo"));
+        assert!(text.contains("bar"));
+    }
+
+    #[test]
+    fn skips_small_tuple_and_tuple() {
+        let mut marshal = Vec::new();
+        // SMALL_TUPLE with 1 element (the element is a string).
+        marshal.push(TYPE_SMALL_TUPLE);
+        marshal.push(1); // 1-byte count
+        marshal.push(TYPE_SHORT_ASCII);
+        marshal.push(5);
+        marshal.extend_from_slice(b"inner");
+        // TUPLE with 1 element.
+        marshal.push(TYPE_TUPLE);
+        marshal.extend_from_slice(&1u32.to_le_bytes()); // 4-byte count
+        marshal.push(TYPE_SHORT_ASCII);
+        marshal.push(5);
+        marshal.extend_from_slice(b"outer");
+        let pyc = make_pyc(&marshal);
+
+        let mut out = Vec::new();
+        let result = PycExtractor.extract(&pyc, &mut out, &mut Vec::new());
+        assert_eq!(result, ExtractResult::Ok);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("inner"));
+        assert!(text.contains("outer"));
+    }
+
+    #[test]
+    fn skips_long_type() {
+        // TYPE_LONG: i32 digit count, each digit is 2 bytes.
+        // Negative digit count means negative number.
+        let mut marshal = Vec::new();
+        marshal.push(TYPE_LONG);
+        marshal.extend_from_slice(&(-2i32).to_le_bytes()); // negative, 2 digits
+        marshal.extend_from_slice(&[0xAB, 0xCD, 0xEF, 0x01]); // 2 × 2 bytes
+        // String after the long.
+        marshal.push(TYPE_SHORT_ASCII);
+        marshal.push(10);
+        marshal.extend_from_slice(b"after_long");
+        let pyc = make_pyc(&marshal);
+
+        let mut out = Vec::new();
+        let result = PycExtractor.extract(&pyc, &mut out, &mut Vec::new());
+        assert_eq!(result, ExtractResult::Ok);
+        assert!(String::from_utf8(out).unwrap().contains("after_long"));
+    }
+
+    #[test]
+    fn skips_legacy_float() {
+        // TYPE_FLOAT: 1-byte length + ASCII chars.
+        let mut marshal = Vec::new();
+        marshal.push(TYPE_FLOAT);
+        marshal.push(4); // 4 ASCII chars
+        marshal.extend_from_slice(b"3.14");
+        // String after the float.
+        marshal.push(TYPE_SHORT_ASCII);
+        marshal.push(11);
+        marshal.extend_from_slice(b"after_float");
+        let pyc = make_pyc(&marshal);
+
+        let mut out = Vec::new();
+        let result = PycExtractor.extract(&pyc, &mut out, &mut Vec::new());
+        assert_eq!(result, ExtractResult::Ok);
+        assert!(String::from_utf8(out).unwrap().contains("after_float"));
+    }
+
+    #[test]
+    fn skips_legacy_complex() {
+        // TYPE_COMPLEX: two legacy floats (1-byte length + ASCII each).
+        let mut marshal = Vec::new();
+        marshal.push(TYPE_COMPLEX);
+        marshal.push(3); // real part: 3 chars
+        marshal.extend_from_slice(b"1.0");
+        marshal.push(3); // imaginary part: 3 chars
+        marshal.extend_from_slice(b"2.0");
+        // String after the complex.
+        marshal.push(TYPE_SHORT_ASCII);
+        marshal.push(13);
+        marshal.extend_from_slice(b"after_complex");
+        let pyc = make_pyc(&marshal);
+
+        let mut out = Vec::new();
+        let result = PycExtractor.extract(&pyc, &mut out, &mut Vec::new());
+        assert_eq!(result, ExtractResult::Ok);
+        assert!(String::from_utf8(out).unwrap().contains("after_complex"));
+    }
+
+    #[test]
+    fn skips_code_object() {
+        // TYPE_CODE: 24-byte numeric prefix, then sub-objects follow inline.
+        let mut marshal = Vec::new();
+        marshal.push(TYPE_CODE);
+        marshal.extend_from_slice(&[0u8; 24]); // 6 × u32 numeric prefix
+        // After the prefix, sub-fields are marshal objects.
+        marshal.push(TYPE_SHORT_ASCII);
+        marshal.push(10);
+        marshal.extend_from_slice(b"after_code");
+        let pyc = make_pyc(&marshal);
+
+        let mut out = Vec::new();
+        let result = PycExtractor.extract(&pyc, &mut out, &mut Vec::new());
+        assert_eq!(result, ExtractResult::Ok);
+        assert!(String::from_utf8(out).unwrap().contains("after_code"));
     }
 }

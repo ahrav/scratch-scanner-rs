@@ -27,39 +27,49 @@
 //!   cell boundaries are visible to line-oriented scan rules.
 //! - Output blobs (`outputs` key) are deliberately ignored — they are
 //!   large, noisy, and rarely contain secrets.
-//! - Cells without a `source` key are silently skipped.
+//! - Cells without a `source` key default to an empty array.
+
+use serde::Deserialize;
 
 use super::extract::{ExtractResult, Extractor};
 
 /// Extracts source text from all cell types in a Jupyter Notebook.
 pub struct IpynbExtractor;
 
+/// Minimal typed representation of a notebook — only the fields we need.
+/// All other fields (metadata, outputs, execution_count, etc.) are silently
+/// ignored by serde, avoiding BTreeMap/key allocations from `Value`.
+#[derive(Deserialize)]
+struct Notebook {
+    #[serde(default)]
+    cells: Vec<Cell>,
+}
+
+#[derive(Deserialize)]
+struct Cell {
+    #[serde(default)]
+    source: Vec<String>,
+}
+
 impl Extractor for IpynbExtractor {
-    fn extract(&self, data: &[u8], out: &mut Vec<u8>) -> ExtractResult {
-        let parsed: serde_json::Value = match serde_json::from_slice(data) {
+    fn extract(&self, data: &[u8], out: &mut Vec<u8>, _scratch: &mut Vec<u8>) -> ExtractResult {
+        let notebook: Notebook = match serde_json::from_slice(data) {
             Ok(v) => v,
             Err(_) => return ExtractResult::ParseError,
         };
 
-        let cells = match parsed.get("cells").and_then(|c| c.as_array()) {
-            Some(arr) => arr,
-            None => return ExtractResult::Empty,
-        };
+        if notebook.cells.is_empty() {
+            return ExtractResult::Empty;
+        }
 
         let start_len = out.len();
 
-        for cell in cells {
-            let source = match cell.get("source").and_then(|s| s.as_array()) {
-                Some(arr) => arr,
-                None => continue,
-            };
-            for line in source {
-                if let Some(s) = line.as_str() {
-                    out.extend_from_slice(s.as_bytes());
-                }
+        for cell in &notebook.cells {
+            for line in &cell.source {
+                out.extend_from_slice(line.as_bytes());
             }
             // Separate cells with a newline.
-            if !source.is_empty() {
+            if !cell.source.is_empty() {
                 out.push(b'\n');
             }
         }
@@ -87,7 +97,7 @@ mod tests {
             ]
         }"##;
         let mut out = Vec::new();
-        let result = IpynbExtractor.extract(notebook.as_bytes(), &mut out);
+        let result = IpynbExtractor.extract(notebook.as_bytes(), &mut out, &mut Vec::new());
         assert_eq!(result, ExtractResult::Ok);
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("SECRET_KEY"));
@@ -113,7 +123,7 @@ mod tests {
             ]
         }"##;
         let mut out = Vec::new();
-        let result = IpynbExtractor.extract(notebook.as_bytes(), &mut out);
+        let result = IpynbExtractor.extract(notebook.as_bytes(), &mut out, &mut Vec::new());
         assert_eq!(result, ExtractResult::Ok);
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("x = 1"));
@@ -126,7 +136,7 @@ mod tests {
         let notebook = r#"{"cells": []}"#;
         let mut out = Vec::new();
         assert_eq!(
-            IpynbExtractor.extract(notebook.as_bytes(), &mut out),
+            IpynbExtractor.extract(notebook.as_bytes(), &mut out, &mut Vec::new()),
             ExtractResult::Empty
         );
     }
@@ -136,7 +146,7 @@ mod tests {
         let data = r#"{"metadata": {}}"#;
         let mut out = Vec::new();
         assert_eq!(
-            IpynbExtractor.extract(data.as_bytes(), &mut out),
+            IpynbExtractor.extract(data.as_bytes(), &mut out, &mut Vec::new()),
             ExtractResult::Empty
         );
     }
@@ -145,7 +155,7 @@ mod tests {
     fn invalid_json_returns_parse_error() {
         let mut out = Vec::new();
         assert_eq!(
-            IpynbExtractor.extract(b"not json", &mut out),
+            IpynbExtractor.extract(b"not json", &mut out, &mut Vec::new()),
             ExtractResult::ParseError
         );
     }
@@ -159,7 +169,7 @@ mod tests {
             ]
         }"##;
         let mut out = Vec::new();
-        let result = IpynbExtractor.extract(notebook.as_bytes(), &mut out);
+        let result = IpynbExtractor.extract(notebook.as_bytes(), &mut out, &mut Vec::new());
         assert_eq!(result, ExtractResult::Ok);
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("found"));
