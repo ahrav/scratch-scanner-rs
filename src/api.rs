@@ -732,6 +732,10 @@ impl EntropySpec {
     /// Internal invariant checks used at engine build time.
     pub(crate) fn assert_valid(&self) {
         assert!(
+            !self.min_bits_per_byte.is_nan(),
+            "entropy min_bits_per_byte must not be NaN"
+        );
+        assert!(
             self.min_bits_per_byte >= 0.0,
             "entropy min_bits_per_byte must be >= 0"
         );

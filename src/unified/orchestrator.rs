@@ -53,7 +53,7 @@ fn run_fs(
     use super::SourceKind;
 
     let t0 = Instant::now();
-    let rules = load_rules_for_scan(rules_file.as_deref())?;
+    let rules = load_rules_for_scan(rules_file.as_deref());
     let transforms = demo_transforms();
     let mut tuning = demo_tuning();
     if let Some(depth) = cfg.decode_depth {
@@ -139,7 +139,7 @@ fn run_git(
     event_format: EventFormat,
     rules_file: Option<PathBuf>,
 ) -> io::Result<()> {
-    let rules = load_rules_for_scan(rules_file.as_deref())?;
+    let rules = load_rules_for_scan(rules_file.as_deref());
     let transforms = demo_transforms();
     let mut tuning = demo_tuning();
     if let Some(depth) = cfg.decode_depth {
@@ -512,10 +512,8 @@ fn print_git_perf_breakdown(report: &git_scan::GitScanReport, config: &GitScanCo
 
 /// Load rules from a YAML file, falling back to the compiled-in set.
 ///
-/// When `rules_file` is `None`, falls back to `default_rules.yaml` next to
-/// the binary, then the compiled-in `demo_rules()`. When an explicit path is
-/// given but fails to load, returns an error.
-fn load_rules_for_scan(rules_file: Option<&Path>) -> io::Result<Vec<RuleSpec>> {
+/// Fallback chain: explicit path > `default_rules.yaml` next to binary > `demo_rules()`.
+fn load_rules_for_scan(rules_file: Option<&Path>) -> Vec<RuleSpec> {
     let path = match rules_file {
         Some(p) => p.to_path_buf(),
         None => match crate::rules::default_rules_path() {
@@ -524,21 +522,20 @@ fn load_rules_for_scan(rules_file: Option<&Path>) -> io::Result<Vec<RuleSpec>> {
                 p
             }
             _ => {
-                eprintln!("info: no external rules file found; using compiled-in rules");
-                return Ok(demo_rules());
+                let rules = demo_rules();
+                eprintln!("info: using compiled-in rule set ({} rules)", rules.len());
+                return rules;
             }
         },
     };
     match crate::rules::load_rules(&path) {
         Ok(rules) => {
             eprintln!("info: loaded {} rules from {}", rules.len(), path.display());
-            Ok(rules)
+            rules
         }
         Err(e) => {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("failed to load rules from {}: {e}", path.display()),
-            ))
+            eprintln!("error: failed to load rules from {}: {e}", path.display());
+            std::process::exit(2);
         }
     }
 }

@@ -2,7 +2,6 @@ use crate::api::{
     AnchorPolicy, Gate, RuleSpec, TransformConfig, TransformId, TransformMode, Tuning,
 };
 use crate::engine::Engine;
-use crate::gitleaks_rules::gitleaks_rules;
 
 // --------------------------
 // Demo engine (rules + transforms)
@@ -55,7 +54,7 @@ pub fn demo_engine_with_anchor_mode_and_max_transform_depth(
 }
 
 pub fn demo_rules() -> Vec<RuleSpec> {
-    gitleaks_rules()
+    crate::rules::builtin_rules()
 }
 
 pub fn demo_transforms() -> Vec<TransformConfig> {

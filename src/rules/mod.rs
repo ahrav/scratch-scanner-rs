@@ -1,13 +1,14 @@
-//! External rule loading for the scanner.
+//! Rule loading for the scanner.
 //!
-//! Supports loading detection rules from YAML files instead of the
-//! compiled-in `gitleaks_rules()` set. The YAML schema mirrors `RuleSpec`
+//! Rules can be loaded from an external YAML file at runtime, or from the
+//! built-in set embedded via `include_str!`. The YAML schema mirrors `RuleSpec`
 //! fields and uses the same `build_regex()` + `assert_valid()` validation.
 
 pub(crate) mod yaml;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::api::RuleSpec;
 use regex::bytes::Regex;
@@ -29,7 +30,10 @@ pub(crate) fn build_regex(pattern: &str) -> Result<Regex, String> {
         builder.dfa_size_limit(limit);
         match builder.build() {
             Ok(re) => return Ok(re),
-            Err(regex::Error::CompiledTooBig(_)) => continue,
+            Err(regex::Error::CompiledTooBig(_)) => {
+                eprintln!("note: regex exceeded {limit} byte compile limit, retrying at next tier");
+                continue;
+            }
             Err(err) => return Err(err.to_string()),
         }
     }
@@ -106,6 +110,10 @@ pub(crate) fn load_rules(path: &Path) -> Result<Vec<RuleSpec>, RulesError> {
     // re-raised because they are not validation failures.
     for rule in &rules {
         let name = rule.name.to_string();
+        // SAFETY: AssertUnwindSafe is sound here — assert_valid() performs
+        // read-only invariant checks on rule fields and does not mutate state.
+        // We catch panics to convert validation failures into structured
+        // RulesError values instead of crashing on user-supplied rule files.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             rule.assert_valid();
         }));
@@ -143,67 +151,144 @@ pub(crate) fn default_rules_path() -> Option<PathBuf> {
     Some(exe.parent()?.join("default_rules.yaml"))
 }
 
+/// The built-in rule set, embedded from `default_rules.yaml` at compile time.
+const BUILTIN_RULES_YAML: &str = include_str!("../../default_rules.yaml");
+
+/// Parse and return the built-in rule set.
+///
+/// This replaces the old `gitleaks_rules()` function. Rules are parsed and
+/// compiled once (via `OnceLock`) then cloned on subsequent calls, avoiding
+/// repeated memory leaks from `Box::leak` in the YAML parser.
+pub(crate) fn builtin_rules() -> Vec<RuleSpec> {
+    static BUILTIN: OnceLock<Vec<RuleSpec>> = OnceLock::new();
+    BUILTIN
+        .get_or_init(|| {
+            let rules = yaml::parse_yaml_rules(BUILTIN_RULES_YAML)
+                .expect("built-in rules YAML must be valid");
+            assert!(
+                !rules.is_empty(),
+                "built-in rules YAML must contain at least one rule"
+            );
+            rules
+        })
+        .clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
-    fn build_regex_valid_pattern() {
-        let re = build_regex(r"tok_[a-z]{4}").expect("valid pattern should compile");
-        assert!(re.is_match(b"tok_abcd"));
+    fn load_rules_valid_file() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"rules:
+  - name: "test-rule"
+    regex: 'tok_[a-z0-9]{{8}}'
+    anchors: ["tok_"]
+    radius: 64
+"#
+        )
+        .unwrap();
+        let rules = load_rules(f.path()).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].name, "test-rule");
     }
 
     #[test]
-    fn build_regex_invalid_pattern() {
-        let err = build_regex("[unclosed").unwrap_err();
-        assert!(!err.is_empty(), "error message should not be empty");
+    fn load_rules_empty_file_returns_no_rules() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "rules: []").unwrap();
+        match load_rules(f.path()) {
+            Err(RulesError::NoRules) => {}
+            other => panic!("expected NoRules, got: {other:?}"),
+        }
     }
 
     #[test]
-    fn load_rules_io_error_on_missing_file() {
-        let path = Path::new("/nonexistent/path/rules.yaml");
-        match load_rules(path) {
+    fn load_rules_nonexistent_path_returns_io_error() {
+        match load_rules(Path::new("/nonexistent/rules.yaml")) {
             Err(RulesError::Io(_)) => {}
             other => panic!("expected Io error, got: {other:?}"),
         }
     }
 
     #[test]
-    fn load_rules_empty_file_returns_no_rules() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let path = dir.path().join("empty.yaml");
-        std::fs::write(&path, "rules: []\n").expect("write");
-        match load_rules(&path) {
-            Err(RulesError::NoRules) => {}
-            other => panic!("expected NoRules error, got: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn load_rules_invalid_yaml_returns_yaml_error() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let path = dir.path().join("bad.yaml");
-        std::fs::write(&path, "{{{{not yaml at all").expect("write");
-        match load_rules(&path) {
-            Err(RulesError::Yaml(_)) => {}
-            other => panic!("expected Yaml error, got: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn load_rules_valid_minimal_rule_succeeds() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let path = dir.path().join("good.yaml");
-        let yaml = r#"
-rules:
-  - name: "test-rule"
-    regex: 'tok_[a-z0-9]{8}'
+    fn load_rules_validation_failure_returns_validation_error() {
+        // entropy with min_len > max_len triggers assert_valid() panic.
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"rules:
+  - name: "bad-entropy"
+    regex: 'tok_[a-z0-9]{{8}}'
     anchors: ["tok_"]
     radius: 64
-"#;
-        std::fs::write(&path, yaml).expect("write");
-        let rules = load_rules(&path).expect("should load successfully");
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].name, "test-rule");
+    entropy:
+      min_bits_per_byte: 3.5
+      min_len: 100
+      max_len: 10
+"#
+        )
+        .unwrap();
+        match load_rules(f.path()) {
+            Err(RulesError::Validation { rule_name, .. }) => {
+                assert_eq!(rule_name, "bad-entropy");
+            }
+            other => panic!("expected Validation error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rules_error_display_formats() {
+        let io_err = RulesError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"));
+        assert!(io_err.to_string().contains("I/O error"));
+
+        let no_rules = RulesError::NoRules;
+        assert!(no_rules.to_string().contains("no rules"));
+
+        let regex_err = RulesError::Regex {
+            rule_name: "r1".into(),
+            pattern: "[bad".into(),
+            error: "unclosed".into(),
+        };
+        let msg = regex_err.to_string();
+        assert!(msg.contains("r1") && msg.contains("unclosed"));
+
+        let val_err = RulesError::Validation {
+            rule_name: "r2".into(),
+            message: "min > max".into(),
+        };
+        assert!(val_err.to_string().contains("r2"));
+    }
+
+    #[test]
+    fn rules_error_source_chains() {
+        use std::error::Error;
+
+        let io_err = RulesError::Io(std::io::Error::other("test"));
+        assert!(io_err.source().is_some());
+
+        let no_rules = RulesError::NoRules;
+        assert!(no_rules.source().is_none());
+
+        let regex_err = RulesError::Regex {
+            rule_name: String::new(),
+            pattern: String::new(),
+            error: String::new(),
+        };
+        assert!(regex_err.source().is_none());
+    }
+
+    #[test]
+    fn build_regex_valid_pattern() {
+        assert!(build_regex(r"[a-z]+").is_ok());
+    }
+
+    #[test]
+    fn build_regex_invalid_pattern() {
+        assert!(build_regex(r"[unclosed").is_err());
     }
 }

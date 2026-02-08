@@ -169,7 +169,7 @@ impl Drop for VsDb {
 }
 
 fn build_full_rule_patterns(include_generic: bool) -> Vec<String> {
-    let mut rules: Vec<RuleSpec> = scanner_rs::gitleaks_rules();
+    let mut rules: Vec<RuleSpec> = scanner_rs::demo_rules();
     if !include_generic {
         rules.retain(|r| r.name != "generic-api-key");
     }

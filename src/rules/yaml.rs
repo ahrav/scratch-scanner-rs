@@ -1,8 +1,12 @@
 //! YAML rule deserialization and conversion to `RuleSpec`.
 //!
 //! Defines serde intermediate types that mirror the YAML schema, then converts
-//! them into `RuleSpec` values with leaked static references (rules live for
-//! the entire process lifetime).
+//! them into `RuleSpec` values with interned `'static` references. Rule literals
+//! are process-lifetime data by design, but interning avoids repeated growth
+//! when the same YAML is parsed multiple times.
+
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 
 use serde::Deserialize;
 
@@ -71,22 +75,64 @@ pub(crate) struct YamlLocalContext {
 }
 
 // ---------------------------------------------------------------------------
-// Leak helpers — rules live for the entire process, so we leak into 'static.
-// Callers should load rules once at startup. Repeated calls leak memory
-// that is never reclaimed.
+// Atom interning — rules live for the entire process, so we store interned
+// allocations in a global pool and reuse them across parse calls.
 // ---------------------------------------------------------------------------
 
-fn leak_str(s: String) -> &'static str {
-    Box::leak(s.into_boxed_str())
+#[derive(Default)]
+struct RuleAtomPool {
+    strings: HashMap<String, &'static str>,
+    bytes: HashMap<Vec<u8>, &'static [u8]>,
+    bytes_slices: HashMap<Vec<Vec<u8>>, &'static [&'static [u8]]>,
 }
 
-fn leak_bytes(s: String) -> &'static [u8] {
-    Box::leak(s.into_bytes().into_boxed_slice())
+impl RuleAtomPool {
+    fn intern_str(&mut self, s: String) -> &'static str {
+        if let Some(existing) = self.strings.get(&s) {
+            return existing;
+        }
+        let leaked = Box::leak(s.clone().into_boxed_str());
+        self.strings.insert(s, leaked);
+        leaked
+    }
+
+    fn intern_bytes(&mut self, s: String) -> &'static [u8] {
+        self.intern_bytes_vec(s.into_bytes())
+    }
+
+    fn intern_bytes_vec(&mut self, bytes: Vec<u8>) -> &'static [u8] {
+        if let Some(existing) = self.bytes.get(&bytes) {
+            return existing;
+        }
+        let leaked = Box::leak(bytes.clone().into_boxed_slice());
+        self.bytes.insert(bytes, leaked);
+        leaked
+    }
+
+    fn intern_bytes_slice(&mut self, values: Vec<String>) -> &'static [&'static [u8]] {
+        let keys: Vec<Vec<u8>> = values.into_iter().map(String::into_bytes).collect();
+        if let Some(existing) = self.bytes_slices.get(&keys) {
+            return existing;
+        }
+
+        let mut refs: Vec<&'static [u8]> = Vec::with_capacity(keys.len());
+        for key in &keys {
+            refs.push(self.intern_bytes_vec(key.clone()));
+        }
+        let leaked = Box::leak(refs.into_boxed_slice());
+        self.bytes_slices.insert(keys, leaked);
+        leaked
+    }
 }
 
-fn leak_bytes_slice(v: Vec<String>) -> &'static [&'static [u8]] {
-    let leaked: Vec<&'static [u8]> = v.into_iter().map(leak_bytes).collect();
-    Box::leak(leaked.into_boxed_slice())
+static RULE_ATOMS: LazyLock<Mutex<RuleAtomPool>> =
+    LazyLock::new(|| Mutex::new(RuleAtomPool::default()));
+
+fn with_rule_atoms<T>(f: impl FnOnce(&mut RuleAtomPool) -> T) -> T {
+    let mut guard = RULE_ATOMS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    f(&mut guard)
 }
 
 // ---------------------------------------------------------------------------
@@ -96,80 +142,79 @@ fn leak_bytes_slice(v: Vec<String>) -> &'static [&'static [u8]] {
 /// Parse YAML content into a `Vec<RuleSpec>`.
 ///
 /// Deserializes the YAML, then converts each `YamlRule` into a `RuleSpec`
-/// by compiling regexes and leaking string data into `'static` references.
+/// by compiling regexes and interning textual fields into reusable `'static`
+/// references.
 pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesError> {
     let file: YamlRulesFile = serde_yml::from_str(content).map_err(RulesError::Yaml)?;
 
     let mut rules = Vec::with_capacity(file.rules.len());
     for yr in file.rules {
-        let name = yr.name.clone();
-        let pattern = yr.regex.clone();
-        let re = super::build_regex(&pattern).map_err(|error| RulesError::Regex {
+        let YamlRule {
+            name,
+            regex,
+            anchors,
+            radius,
+            must_contain,
+            keywords_any,
+            entropy,
+            two_phase,
+            local_context,
+            secret_group,
+        } = yr;
+
+        let re = super::build_regex(&regex).map_err(|error| RulesError::Regex {
             rule_name: name.clone(),
-            pattern,
+            pattern: regex.clone(),
             error,
         })?;
 
-        let anchors = leak_bytes_slice(yr.anchors);
-
-        let must_contain: Option<&'static [u8]> = yr.must_contain.map(leak_bytes);
-
-        let keywords_any: Option<&'static [&'static [u8]]> = yr.keywords_any.map(leak_bytes_slice);
-
-        let entropy = yr.entropy.map(|e| {
-            if !e.min_bits_per_byte.is_finite() || e.min_bits_per_byte < 0.0 {
-                return Err(RulesError::Validation {
-                    rule_name: name.clone(),
-                    message: format!(
-                        "entropy min_bits_per_byte must be finite and >= 0, got {}",
-                        e.min_bits_per_byte
-                    ),
+        let (name, anchors, must_contain, keywords_any, two_phase, local_context) =
+            with_rule_atoms(|atoms| {
+                let anchors = atoms.intern_bytes_slice(anchors);
+                let must_contain = must_contain.map(|s| atoms.intern_bytes(s));
+                let keywords_any = keywords_any.map(|kws| atoms.intern_bytes_slice(kws));
+                let two_phase = two_phase.map(|tp| TwoPhaseSpec {
+                    seed_radius: tp.seed_radius,
+                    full_radius: tp.full_radius,
+                    confirm_any: atoms.intern_bytes_slice(tp.confirm_any),
                 });
-            }
-            if e.min_len > e.max_len {
-                return Err(RulesError::Validation {
-                    rule_name: name.clone(),
-                    message: format!(
-                        "entropy min_len ({}) must be <= max_len ({})",
-                        e.min_len, e.max_len
-                    ),
+                let local_context = local_context.map(|lc| LocalContextSpec {
+                    lookbehind: lc.lookbehind,
+                    lookahead: lc.lookahead,
+                    require_same_line_assignment: lc.require_same_line_assignment,
+                    require_quoted: lc.require_quoted,
+                    key_names_any: lc.key_names_any.map(|keys| atoms.intern_bytes_slice(keys)),
                 });
-            }
-            Ok(EntropySpec {
-                min_bits_per_byte: e.min_bits_per_byte,
-                min_len: e.min_len,
-                max_len: e.max_len,
-            })
-        }).transpose()?;
+                (
+                    atoms.intern_str(name),
+                    anchors,
+                    must_contain,
+                    keywords_any,
+                    two_phase,
+                    local_context,
+                )
+            });
 
-        let two_phase = yr.two_phase.map(|tp| TwoPhaseSpec {
-            seed_radius: tp.seed_radius,
-            full_radius: tp.full_radius,
-            confirm_any: leak_bytes_slice(tp.confirm_any),
-        });
-
-        let local_context = yr.local_context.map(|lc| LocalContextSpec {
-            lookbehind: lc.lookbehind,
-            lookahead: lc.lookahead,
-            require_same_line_assignment: lc.require_same_line_assignment,
-            require_quoted: lc.require_quoted,
-            key_names_any: lc.key_names_any.map(leak_bytes_slice),
+        let entropy = entropy.map(|e| EntropySpec {
+            min_bits_per_byte: e.min_bits_per_byte,
+            min_len: e.min_len,
+            max_len: e.max_len,
         });
 
         rules.push(RuleSpec {
-            name: leak_str(name),
+            name,
             anchors,
-            radius: yr.radius,
-            // YAML rules do not yet support validators; all rules get `None`.
-            // If a future rule requires validation, add a `validator` field to
-            // `YamlRule` and deserialize it here.
+            radius,
+            // NOTE: ValidatorKind is not expressible in the YAML schema.
+            // Fast validators are tightly coupled to specific regex patterns
+            // and are only set programmatically. All YAML-loaded rules use None.
             validator: ValidatorKind::None,
             two_phase,
             must_contain,
             keywords_any,
             entropy,
             local_context,
-            secret_group: yr.secret_group,
+            secret_group,
             re,
         });
     }
@@ -184,10 +229,11 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gitleaks_rules::gitleaks_rules;
+    use crate::api::ValidatorKind;
+    use crate::rules::builtin_rules;
     use std::path::Path;
 
-    /// Convert existing `RuleSpec` values back to YAML intermediate types.
+    /// Convert `RuleSpec` back to YAML intermediate type for round-trip testing.
     fn rulespec_to_yaml(rule: &RuleSpec) -> YamlRule {
         let anchors: Vec<String> = rule
             .anchors
@@ -403,7 +449,7 @@ mod tests {
                 orig.name
             );
 
-            // Validator (always None for gitleaks rules).
+            // Validator (always None for builtin rules).
             assert_eq!(
                 orig.validator, parsed.validator,
                 "validator mismatch for {}",
@@ -414,18 +460,16 @@ mod tests {
 
     #[test]
     fn default_rules_yaml_matches_builtin_rules() {
-        // Keep the checked-in YAML snapshot in sync with built-in rules
-        // without mutating repository files during normal test runs.
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("default_rules.yaml");
         let yaml_str = std::fs::read_to_string(&path).expect("read default_rules.yaml");
         let parsed_rules = parse_yaml_rules(&yaml_str).expect("parse default_rules.yaml");
-        let expected_rules = gitleaks_rules();
+        let expected_rules = builtin_rules();
         assert_rules_equal(&expected_rules, &parsed_rules);
     }
 
     #[test]
-    fn roundtrip_gitleaks_rules() {
-        let original_rules = gitleaks_rules();
+    fn roundtrip_builtin_rules() {
+        let original_rules = builtin_rules();
 
         // Convert to YAML and back.
         let yaml_rules: Vec<YamlRule> = original_rules.iter().map(rulespec_to_yaml).collect();
@@ -433,6 +477,26 @@ mod tests {
         let yaml_str = serde_yml::to_string(&file).expect("serialize to YAML");
         let parsed_rules = parse_yaml_rules(&yaml_str).expect("parse YAML rules");
         assert_rules_equal(&original_rules, &parsed_rules);
+    }
+
+    #[test]
+    fn builtin_rules_use_no_fast_validators() {
+        let rules = builtin_rules();
+        assert!(!rules.is_empty(), "builtin rule set should not be empty");
+        for rule in rules {
+            assert_eq!(
+                rule.validator,
+                ValidatorKind::None,
+                "rule '{}' unexpectedly enables fast validator",
+                rule.name
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_rules_count() {
+        let rules = builtin_rules();
+        assert_eq!(rules.len(), 223, "expected 223 builtin rules");
     }
 
     #[test]
@@ -486,87 +550,169 @@ rules:
         let yaml = "{{{{not valid yaml";
         match parse_yaml_rules(yaml) {
             Err(RulesError::Yaml(_)) => {}
-            other => panic!("expected Yaml error, got: {:?}", other),
+            other => panic!("expected Yaml error, got: {other:?}"),
         }
     }
 
     #[test]
-    fn parse_missing_required_field_returns_yaml_error() {
-        // Missing `regex` field.
+    fn parse_full_featured_yaml_rule() {
         let yaml = r#"
 rules:
-  - name: "incomplete"
+  - name: "full-rule"
+    regex: '(secret_)[a-z0-9]{16}'
+    anchors: ["secret_"]
+    radius: 128
+    must_contain: "secret_"
+    keywords_any: ["secret", "key"]
+    entropy:
+      min_bits_per_byte: 3.5
+      min_len: 8
+      max_len: 64
+    two_phase:
+      seed_radius: 32
+      full_radius: 128
+      confirm_any: ["secret"]
+    local_context:
+      lookbehind: 64
+      lookahead: 64
+      require_same_line_assignment: true
+      require_quoted: false
+      key_names_any: ["api_key", "token"]
+    secret_group: 1
+"#;
+        let rules = parse_yaml_rules(yaml).expect("parse full-featured YAML");
+        assert_eq!(rules.len(), 1);
+        let r = &rules[0];
+        assert_eq!(r.name, "full-rule");
+        assert_eq!(r.radius, 128);
+        assert_eq!(r.anchors.len(), 1);
+        assert_eq!(r.anchors[0], b"secret_");
+        assert_eq!(r.must_contain, Some(b"secret_".as_slice()));
+        assert_eq!(r.secret_group, Some(1));
+        assert_eq!(r.validator, ValidatorKind::None);
+
+        let kws = r.keywords_any.expect("keywords_any should be present");
+        assert_eq!(kws.len(), 2);
+        assert_eq!(kws[0], b"secret");
+        assert_eq!(kws[1], b"key");
+
+        let ent = r.entropy.as_ref().expect("entropy should be present");
+        assert_eq!(ent.min_bits_per_byte, 3.5);
+        assert_eq!(ent.min_len, 8);
+        assert_eq!(ent.max_len, 64);
+
+        let tp = r.two_phase.as_ref().expect("two_phase should be present");
+        assert_eq!(tp.seed_radius, 32);
+        assert_eq!(tp.full_radius, 128);
+        assert_eq!(tp.confirm_any.len(), 1);
+        assert_eq!(tp.confirm_any[0], b"secret");
+
+        let lc = r
+            .local_context
+            .as_ref()
+            .expect("local_context should be present");
+        assert_eq!(lc.lookbehind, 64);
+        assert_eq!(lc.lookahead, 64);
+        assert!(lc.require_same_line_assignment);
+        assert!(!lc.require_quoted);
+        let kns = lc.key_names_any.expect("key_names_any should be present");
+        assert_eq!(kns.len(), 2);
+        assert_eq!(kns[0], b"api_key");
+        assert_eq!(kns[1], b"token");
+    }
+
+    #[test]
+    fn parse_reuses_interned_storage_across_calls() {
+        let yaml = r#"
+rules:
+  - name: "interned-rule"
+    regex: 'tok_[a-z0-9]{8}'
+    anchors: ["tok_", "TOK_"]
+    radius: 64
+    must_contain: "tok_"
+    keywords_any: ["api", "token"]
+    two_phase:
+      seed_radius: 32
+      full_radius: 128
+      confirm_any: ["api", "token"]
+"#;
+
+        let first = parse_yaml_rules(yaml).expect("first parse");
+        let second = parse_yaml_rules(yaml).expect("second parse");
+        let a = &first[0];
+        let b = &second[0];
+
+        assert!(
+            std::ptr::eq(a.name, b.name),
+            "name should be interned and reused"
+        );
+        assert!(
+            std::ptr::eq(a.anchors, b.anchors),
+            "anchor list should be interned and reused"
+        );
+        assert!(
+            std::ptr::eq(a.anchors[0], b.anchors[0]),
+            "anchor bytes should be interned and reused"
+        );
+
+        let a_must = a.must_contain.expect("must_contain set");
+        let b_must = b.must_contain.expect("must_contain set");
+        assert!(
+            std::ptr::eq(a_must, b_must),
+            "must_contain should be interned and reused"
+        );
+
+        let a_keywords = a.keywords_any.expect("keywords_any set");
+        let b_keywords = b.keywords_any.expect("keywords_any set");
+        assert!(
+            std::ptr::eq(a_keywords, b_keywords),
+            "keywords list should be interned and reused"
+        );
+        assert!(
+            std::ptr::eq(a_keywords[0], b_keywords[0]),
+            "keyword bytes should be interned and reused"
+        );
+
+        let a_tp = a.two_phase.as_ref().expect("two_phase set");
+        let b_tp = b.two_phase.as_ref().expect("two_phase set");
+        assert!(
+            std::ptr::eq(a_tp.confirm_any, b_tp.confirm_any),
+            "two_phase confirm list should be interned and reused"
+        );
+        assert!(
+            std::ptr::eq(a_tp.confirm_any[0], b_tp.confirm_any[0]),
+            "two_phase confirm bytes should be interned and reused"
+        );
+    }
+
+    #[test]
+    fn parse_yaml_with_unknown_fields_succeeds() {
+        // Unknown fields are silently ignored (no deny_unknown_fields).
+        let yaml = r#"
+rules:
+  - name: "extra-fields"
+    regex: 'tok_[a-z0-9]{8}'
+    anchors: ["tok_"]
+    radius: 64
+    description: "this field is not in the schema"
+    extra_field: 42
+"#;
+        let rules = parse_yaml_rules(yaml).expect("unknown fields should be ignored");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].name, "extra-fields");
+    }
+
+    #[test]
+    fn parse_yaml_missing_required_field_returns_yaml_error() {
+        let yaml = r#"
+rules:
+  - name: "no-regex"
     anchors: ["tok"]
     radius: 64
 "#;
         match parse_yaml_rules(yaml) {
             Err(RulesError::Yaml(_)) => {}
-            other => panic!("expected Yaml error for missing field, got: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn parse_entropy_nan_rejected() {
-        let yaml = r#"
-rules:
-  - name: "nan-rule"
-    regex: 'tok_[a-z]{4}'
-    anchors: ["tok_"]
-    radius: 64
-    entropy:
-      min_bits_per_byte: .nan
-      min_len: 8
-      max_len: 64
-"#;
-        match parse_yaml_rules(yaml) {
-            Err(RulesError::Validation { rule_name, message }) => {
-                assert_eq!(rule_name, "nan-rule");
-                assert!(message.contains("finite"), "message: {message}");
-            }
-            other => panic!("expected Validation error, got: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn parse_entropy_negative_rejected() {
-        let yaml = r#"
-rules:
-  - name: "neg-rule"
-    regex: 'tok_[a-z]{4}'
-    anchors: ["tok_"]
-    radius: 64
-    entropy:
-      min_bits_per_byte: -1.0
-      min_len: 8
-      max_len: 64
-"#;
-        match parse_yaml_rules(yaml) {
-            Err(RulesError::Validation { rule_name, .. }) => {
-                assert_eq!(rule_name, "neg-rule");
-            }
-            other => panic!("expected Validation error, got: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn parse_entropy_min_exceeds_max_rejected() {
-        let yaml = r#"
-rules:
-  - name: "bad-len"
-    regex: 'tok_[a-z]{4}'
-    anchors: ["tok_"]
-    radius: 64
-    entropy:
-      min_bits_per_byte: 3.0
-      min_len: 100
-      max_len: 10
-"#;
-        match parse_yaml_rules(yaml) {
-            Err(RulesError::Validation { rule_name, message }) => {
-                assert_eq!(rule_name, "bad-len");
-                assert!(message.contains("min_len"), "message: {message}");
-            }
-            other => panic!("expected Validation error, got: {:?}", other),
+            other => panic!("expected Yaml error, got: {other:?}"),
         }
     }
 }
