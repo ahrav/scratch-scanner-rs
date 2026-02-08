@@ -1,6 +1,6 @@
 # Kani Bounded Model Checking
 
-This document describes how scanner-rs uses [Kani](https://model-checking.github.io/kani/) for formal verification of data structure invariants.
+This document describes how scanner-rs uses [Kani](https://model-checking.github.io/kani/) for formal verification of `stdx` data structure invariants.
 
 ## What is Kani?
 
@@ -47,6 +47,15 @@ CI note:
 
 ## Verified Properties
 
+Current source inventory (`#[kani::proof]`): **35 harnesses**.
+
+| Suite | Source file | Harnesses |
+|-------|-------------|-----------|
+| TimingWheel + Bitset2 | `src/stdx/timing_wheel_tests.rs` | 12 |
+| DynamicBitSet | `src/stdx/bitset_tests.rs` | 12 |
+| AtomicBitSet | `src/stdx/atomic_bitset_tests.rs` | 6 |
+| AtomicSeenSets | `src/stdx/atomic_seen_sets_tests.rs` | 5 |
+
 ### TimingWheel Proofs
 
 Located in `src/stdx/timing_wheel_tests.rs` under `#[cfg(kani)] mod kani_proofs`.
@@ -72,6 +81,16 @@ Located in `src/stdx/timing_wheel_tests.rs` under `#[cfg(kani)] mod kani_proofs`
 | `verify_bitset_any_count` | `any()` accurately tracks whether bits are set | 64 bits, set/clear cycle |
 | `verify_bitset_clear_all` | `clear_all()` resets all state | 64 bits, 2 symbolic indices |
 | `verify_bitset_find_ordering` | `find_next_set_ge()` returns smallest index >= from | 64 bits, 2 ordered indices |
+
+### Additional Proof Suites
+
+All of the following live under `#[cfg(kani)] mod kani_proofs`:
+
+| Suite | Source file | Harnesses | Coverage focus |
+|-------|-------------|-----------|----------------|
+| DynamicBitSet | `src/stdx/bitset_tests.rs` | 12 | set/unset roundtrips, padding invariant preservation, count/clear correctness, iterator consistency |
+| AtomicBitSet | `src/stdx/atomic_bitset_tests.rs` | 6 | test_and_set idempotency, bit independence, count bounds, clear correctness |
+| AtomicSeenSets | `src/stdx/atomic_seen_sets_tests.rs` | 5 | mark/is_seen roundtrips, cross-bitset independence, clear correctness |
 
 ## Bounded Sizes Rationale
 
@@ -215,5 +234,8 @@ Reduce bounds or add more `kani::assume()` constraints to limit state space.
 
 - [Kani Documentation](https://model-checking.github.io/kani/)
 - [Kani Tutorial](https://model-checking.github.io/kani/tutorial.html)
-- Source: `src/stdx/timing_wheel_tests.rs` (Kani proofs in `mod kani_proofs`)
-- Related: `src/stdx/timing_wheel.rs` (TimingWheel implementation)
+- Source: `src/stdx/timing_wheel_tests.rs` (`TimingWheel` + `Bitset2` proofs)
+- Source: `src/stdx/bitset_tests.rs` (`DynamicBitSet` proofs)
+- Source: `src/stdx/atomic_bitset_tests.rs` (`AtomicBitSet` proofs)
+- Source: `src/stdx/atomic_seen_sets_tests.rs` (`AtomicSeenSets` proofs)
+- Related: `src/stdx/timing_wheel.rs`, `src/stdx/bitset.rs`, `src/stdx/atomic_bitset.rs`, `src/stdx/atomic_seen_sets.rs`

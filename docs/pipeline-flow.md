@@ -1,206 +1,131 @@
 # Pipeline Flow
 
-The scanner-rs pipeline is a 4-stage cooperative pipeline using ring buffers for inter-stage communication.
+The active `scan fs` pipeline is orchestrated in `src/unified/orchestrator.rs`
+and executed by the scheduler in `src/scheduler/`. It does not use
+`file_ring/chunk_ring/out_ring` stage queues in the current filesystem path.
 
 ```mermaid
 flowchart LR
-    subgraph Input
-        Path["Path"]
-    end
+    Path["Path / root"] --> Orch["run_fs()"]
+    Orch --> PScan["parallel_scan_dir()"]
 
-    subgraph Walker["Walker Stage"]
-        WP["Walker::pump()"]
-        FS["fs::read_dir()"]
-        FT["FileTable"]
-    end
+    PScan --> Walker["IterWalker::next_file()"]
+    Walker --> Budget["CountBudget<br/>(max_in_flight_objects)"]
+    Budget --> Exec["Executor<FileTask>"]
 
-    subgraph FileRing["file_ring<br/>capacity: 1024"]
-        FR[("FileId Queue<br/>SpscRing")]
-    end
+    Exec --> Worker["process_file()"]
+    Worker --> Detect["Archive detect<br/>(extension -> header sniff)"]
+    Detect -->|archive| Arch["dispatch_archive_scan()"]
+    Detect -->|regular file| ChunkLoop["Sequential read + overlap carry"]
+    ChunkLoop --> Engine["Engine::scan_chunk_into()"]
+    Engine --> Emit["ScanEvent::Finding via EventSink"]
 
-    subgraph Reader["Reader Stage"]
-        RP["ReaderStage::pump()"]
-        FO["File::open()"]
-        RC["read_next_chunk()"]
-    end
+    Pool["TsBufferPool"] -.->|"acquire()"| ChunkLoop
+    ChunkLoop -.->|"TsBufferHandle::drop()"| Pool
 
-    subgraph ChunkRing["chunk_ring<br/>capacity: 128"]
-        CR[("Chunk Queue<br/>SpscRing")]
-    end
-
-    subgraph Scanner["Scan Stage"]
-        SP["ScanStage::pump()"]
-        ENG["Engine::scan_chunk_into()"]
-        SS["ScanScratch"]
-    end
-
-    subgraph OutRing["out_ring<br/>capacity: 8192"]
-        OR[("FindingRec Queue<br/>SpscRing")]
-    end
-
-    subgraph Output["Output Stage"]
-        OP["OutputStage::pump()"]
-        SW["BufWriter<Stdout>"]
-    end
-
-    subgraph Pool["BufferPool<br/>capacity: derived from pool byte target"]
-        BP[("8MiB Aligned Buffers<br/>NodePoolType")]
-    end
-
-    Path --> WP
-    WP --> FS
-    FS --> FT
-    WP --> FR
-
-    FR --> RP
-    RP --> FO
-    FO --> RC
-    RC --> CR
-
-    BP -.->|"acquire()"| RC
-    RC -.->|"BufferHandle"| CR
-
-    CR --> SP
-    SP --> ENG
-    ENG --> SS
-    SP --> OR
-
-    CR -.->|"drop(Chunk)"| BP
-
-    OR --> OP
-    OP --> SW
-
-    style Input fill:#e3f2fd
-    style Walker fill:#fff3e0
-    style FileRing fill:#e8eaf6
-    style Reader fill:#e8f5e9
-    style ChunkRing fill:#e8eaf6
-    style Scanner fill:#ffebee
-    style OutRing fill:#e8eaf6
-    style Output fill:#f3e5f5
-    style Pool fill:#fce4ec
+    Emit --> Summary["Summary event + sink.flush()"]
 ```
 
 ## Stage Details
 
-### Walker Stage
-- **Input**: Root path
-- **Output**: `file_ring` (FileId queue, cap=1024)
-- **State**: `stack: Vec<WalkEntry>`, `done: bool`
-- **Behavior**: DFS traversal, skips symlinks, respects `max_files` limit
+### Orchestration (`src/unified/orchestrator.rs`)
+- Entry point: `run_fs(...)`
+- Builds engine and event sink, then calls `parallel_scan_dir(...)`
+- Emits final `ScanEvent::Summary` and flushes the sink
 
-`PipelineStats` now includes `archive: ArchiveStats` for archive outcome
-aggregation when archive scanning is enabled.
+### Discovery (`src/scheduler/parallel_scan.rs`)
+- `IterWalker` performs single-threaded filesystem discovery
+- Produces `LocalFile` values
+- Respects walker config (`follow_symlinks`, hidden files, gitignore)
 
-### Reader Stage
-- **Input**: `file_ring` (FileId queue)
-- **Output**: `chunk_ring` (Chunk queue, cap=128)
-- **State**: `active: Option<FileReader>`, `overlap`, `chunk_size`
-- **Behavior**:
-  - Opens files via FileTable path lookup
-  - Reads configured chunks with overlap (`PipelineConfig.chunk_size`)
-  - Preserves overlap for cross-boundary pattern matching
-  - Archive handling is gated by `PipelineConfig.archive` (enabled by default)
-  - When enabled, ReaderStage detects archives by extension and header sniff
-  - Archive budgets and path canonicalization are defined in `src/archive/`
+### Scheduling + Scanning (`src/scheduler/local_fs_owner.rs`)
+- `scan_local(...)` enqueues `FileTask` values and runs `Executor<FileTask>`
+- `CountBudget` enforces discovery backpressure (`max_in_flight_objects`)
+- Workers run `process_file(...)`:
+  - Archive detection by extension, then header sniff when enabled
+  - Binary skip/extract gate (content-policy based)
+  - Sequential read with overlap carry (`copy_within` tail -> head)
+  - `Engine::scan_chunk_into(...)` + `drop_prefix_findings(...)`
+  - Optional within-chunk dedupe + `ScanEvent::Finding` emission
 
-### Scan Stage
-- **Input**: `chunk_ring` (Chunk queue)
-- **Output**: `out_ring` (FindingRec queue, cap=8192)
-- **State**: `scratch: ScanScratch`, `pending: Vec<FindingRec>`
-- **Behavior**:
-  - Invokes `Engine::scan_chunk_into()` on each chunk
-  - Drains findings to pending buffer
-  - Flushes pending to out_ring (handles backpressure)
+### Output
+- Findings are emitted directly through `EventSink` (JSONL/Text/JSON/SARIF)
+- No filesystem-path `OutputStage` queue in the scheduler flow
 
-### Output Stage
-- **Input**: `out_ring` (FindingRec queue)
-- **Output**: stdout via BufWriter
-- **State**: `out: BufWriter<Stdout>`
-- **Behavior**: Formats `path:start-end rule_name` and writes
+`PipelineStats` in `src/pipeline.rs` includes `archive: ArchiveStats`, while
+the active scheduler report type is `LocalReport`/`MetricsSnapshot`.
 
-## Buffer Lifecycle
+## Buffer Lifecycle (Scheduler Path)
 
 ```mermaid
 sequenceDiagram
-    participant Pool as BufferPool
-    participant Reader as ReaderStage
-    participant Chunk as Chunk
-    participant Scanner as ScanStage
+    participant Pool as TsBufferPool
+    participant Worker as process_file()
+    participant File as std::fs::File
+    participant Engine as Engine
+    participant Sink as EventSink
 
-    Reader->>Pool: try_acquire()
-    Pool-->>Reader: BufferHandle
-    Reader->>Reader: file.read(&mut buf)
-    Reader->>Chunk: Chunk { buf: handle, ... }
-    Reader->>ChunkRing: push(chunk)
-
-    Scanner->>ChunkRing: pop()
-    ChunkRing-->>Scanner: Chunk
-    Scanner->>Scanner: engine.scan_chunk_into()
-    Scanner->>Scanner: drain_findings()
-    Note over Scanner,Chunk: Chunk dropped here
-    Chunk->>Pool: BufferHandle::drop()
-    Pool->>Pool: release_slot(ptr)
+    Worker->>Pool: acquire()
+    Pool-->>Worker: TsBufferHandle
+    loop until EOF or snapshot boundary
+        Worker->>File: read(payload after overlap carry)
+        Worker->>Engine: scan_chunk_into(data, file_id, base_offset, scratch)
+        Worker->>Worker: drop_prefix_findings + optional dedupe
+        Worker->>Sink: emit ScanEvent::Finding
+    end
+    Worker->>Pool: TsBufferHandle::drop()
 ```
 
-## Ring Buffer Capacities
+## Capacities and Limits
 
-| Ring | Capacity | Type | Purpose |
-|------|----------|------|---------|
-| `file_ring` | 1024 | `SpscRing<FileId>` | File discovery queue |
-| `chunk_ring` | 128 | `SpscRing<Chunk>` | Read chunk queue |
-| `out_ring` | 8192 | `SpscRing<FindingRec>` | Finding output queue |
+Active filesystem defaults (high-level API):
 
-## Pool Sizing
+| Setting | Default | Source |
+|---------|---------|--------|
+| `ParallelScanConfig.chunk_size` | `256 KiB` | `src/scheduler/parallel_scan.rs` |
+| `ParallelScanConfig.pool_buffers` | `workers * 4` | `src/scheduler/parallel_scan.rs` |
+| `ParallelScanConfig.max_in_flight_objects` | `1024` | `src/scheduler/parallel_scan.rs` |
+| `ParallelScanConfig.local_queue_cap` | `4` | `src/scheduler/parallel_scan.rs` |
+
+`scan_local` memory bound is approximately:
 
 ```
-default_pool_capacity =
-  clamp(
-    PIPE_POOL_TARGET_BYTES / BUFFER_LEN_MAX,
-    PIPE_POOL_MIN,
-    PIPE_CHUNK_RING_CAP + 8
-  )
-
-Current defaults:
-  PIPE_POOL_TARGET_BYTES = 256MiB
-  BUFFER_LEN_MAX = 8MiB
-  => default_pool_capacity = 32 buffers (~256MiB aggregate)
+peak_buffer_bytes ~= pool_buffers * (chunk_size + engine.required_overlap())
 ```
 
-The pool is sized to allow the chunk ring to be full plus a small headroom for in-flight reads.
+Legacy/shared pipeline constants still defined in `src/pipeline.rs`:
 
-## Design Rationale
+| Constant | Value |
+|----------|-------|
+| `PIPE_FILE_RING_CAP` | `1024` |
+| `PIPE_CHUNK_RING_CAP` | `128` |
+| `PIPE_OUT_RING_CAP` | `8192` |
+| `PIPE_POOL_TARGET_BYTES` | `256 MiB` |
+| `PIPE_POOL_MIN` | `16` |
 
-The pipeline is intentionally staged and bounded, even though it runs in a
-single thread:
+For direct library usage, `src/runtime.rs` still provides a single-threaded
+`ScannerRuntime` + `read_file_chunks(...)` path with `BufferPool`.
 
-- **Explicit backpressure**: fixed-capacity rings make it obvious when a stage
-  is producing faster than the next stage can consume.
-- **Deterministic memory**: the ring sizes and buffer pool define a hard ceiling
-  on in-flight data. This makes memory usage predictable for large repos.
-- **Clear ownership**: chunks own their buffers via `BufferHandle`, and drop
-  returns them to the pool. This keeps lifetimes and reuse unambiguous.
+## Design Rationale (Current FS Path)
 
-These choices trade some peak throughput for debuggability and predictable
-resource usage, which matters for a scanner that may run on arbitrary inputs.
+- Backpressure is explicit via `CountBudget` and fixed-capacity `TsBufferPool`
+- Discovery is single-threaded and bounded; scanning is parallel owner-compute
+- Buffer ownership is RAII (`TsBufferHandle`), so release is deterministic on drop
 
-## Git Scan Concurrency & Backpressure
+## Git Scan Concurrency and Backpressure
 
-The Git scanning pipeline is **single-threaded** today: each stage executes
-serially inside the runner with no internal queues or cross-thread handoff.
-Backpressure is enforced through explicit limits rather than runtime channels.
+Git scanning is staged and resource-bounded, but not strictly single-threaded:
 
-Key bounded points:
+- Parallelism knobs:
+  - `GitScanConfig.pack_exec_workers` (pack decode/scan workers)
+  - `GitScanConfig.blob_intro_workers` (parallel blob introduction)
+- Deterministic output ordering is preserved by ordered merge/reassembly in the runner
+- Key bounded points:
+  - `SpillLimits` (spill bytes, chunk candidates, run caps)
+  - `MappingBridgeConfig` (`path_arena_capacity`, candidate caps)
+  - `PackPlanConfig` (`max_worklist_entries`, `max_delta_depth`)
+  - `PackMmapLimits` (`max_open_packs`, `max_total_bytes`)
+  - `PackDecodeLimits` (header/delta/object byte limits)
 
-- **Spill + dedupe**: `SpillLimits` cap candidate count, spill bytes, and run counts.
-- **Mapping bridge**: `MappingBridgeConfig.max_{packed,loose}_candidates` and
-  `path_arena_capacity` cap in-memory candidate sets and path bytes.
-- **Pack planning**: `PackPlanConfig.max_worklist_entries` and
-  `max_delta_depth` bound delta closure expansion.
-- **Pack execution**: `PackMmapLimits` cap open packs + total mmap bytes;
-  `PackDecodeLimits` cap header bytes, delta bytes, and object bytes.
-
-If any limit is exceeded, the scan fails explicitly and produces no watermark
-advance. This makes the single-threaded execution deterministic and resource
-bounded, and it provides clear queue/budget boundaries to carry forward if
-parallelization is added later.
+When limits are hit, runs can fail or become partial; watermark writes are only
+advanced on complete finalize outcomes.

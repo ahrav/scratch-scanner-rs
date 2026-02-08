@@ -1,272 +1,143 @@
 # Pipeline State Machine
 
-Cooperative scheduling loop and state transitions in the scanner-rs pipeline.
+Current filesystem scanning uses the scheduler path:
+
+`unified::orchestrator::run` -> `parallel_scan_dir` -> `scan_local` -> `Executor<FileTask>`.
+
+The older single-thread `pump()` ring model (`file_ring`, `chunk_ring`,
+`out_ring`) is not present in current `src/` code.
+
+## Top-Level Dispatch
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Running: scan_path() called
+    [*] --> OrchestratorRun: run(config)
+    OrchestratorRun --> FsPath: SourceConfig::Fs
+    OrchestratorRun --> GitPath: SourceConfig::Git
 
-    state Running {
-        [*] --> PumpOutput
+    FsPath --> BuildEngine: run_fs()
+    BuildEngine --> BuildSink
+    BuildSink --> ParallelScanDir: parallel_scan_dir(...)
 
-        PumpOutput --> PumpScanner: output.pump()
-        PumpScanner --> PumpReader: scanner.pump()
-        PumpReader --> PumpWalker: reader.pump()
-        PumpWalker --> CheckProgress: walker.pump()
+    ParallelScanDir --> RootError: !root.exists() or read_dir() fails
+    ParallelScanDir --> SingleFile: root.is_file()
+    ParallelScanDir --> DirWalker: root.is_dir()
 
-        CheckProgress --> PumpOutput: progressed = true
-        CheckProgress --> CheckDone: progressed = false
+    SingleFile --> ScanLocal: scan_single_file() -> SingleFileSource
+    DirWalker --> ScanLocal: IterWalker::next_file()
 
-        CheckDone --> PumpOutput: !done
-        CheckDone --> [*]: done
-    }
+    ScanLocal --> EmitSummary: report -> SummaryEvent
+    EmitSummary --> [*]
 
-    Running --> Done: all stages idle
-    Running --> Stalled: no progress & not done
-
-    Done --> [*]: return Ok(stats)
-    Stalled --> [*]: return Err("pipeline stalled")
+    RootError --> [*]
+    GitPath --> [*]: run_git_scan(...)
 ```
 
-## Pump Order
-
-The pipeline processes stages in **reverse order** (output to input) to maximize throughput:
-
-```mermaid
-sequenceDiagram
-    participant Loop as Main Loop
-    participant Output as OutputStage
-    participant Scanner as ScanStage
-    participant Reader as ReaderStage
-    participant Walker as Walker
-
-    loop Every iteration
-        Loop->>Output: pump() - drain findings
-        Output-->>Loop: progressed?
-
-        Loop->>Scanner: pump() - scan chunks
-        Scanner-->>Loop: progressed?
-
-        Loop->>Reader: pump() - read files
-        Reader-->>Loop: progressed?
-
-        Loop->>Walker: pump() - discover files
-        Walker-->>Loop: progressed?
-
-        Loop->>Loop: Check termination
-    end
-```
-
-**Why reverse order?**
-1. Output first creates space in `out_ring`
-2. Scanner can then emit new findings
-3. Reader can push chunks when `chunk_ring` has space
-4. Walker fills `file_ring` with more work
-
-This prevents deadlocks where upstream stages block on full queues.
-
-**Archive note:** when archive scanning is enabled, archive entries emit findings
-directly with precomputed virtual path bytes (no `FileTable` insertion). Path
-budget exhaustion results in explicit partial outcomes rather than panics.
-
-**Archive dispatch note:** `ReaderStage` performs archive detection when
-`archive.enabled` is true. If a gzip/tar/tar.gz archive is detected, it invokes
-the archive dispatch entrypoint and does not emit chunks for that file; normal
-chunked scanning continues for non-archive inputs and unsupported formats are
-explicitly skipped.
-
-## Stage States
+## scan_local Main-Thread States
 
 ```mermaid
 stateDiagram-v2
-    state Walker {
-        [*] --> Walking
-        Walking --> Walking: found directory
-        Walking --> Walking: found file
-        Walking --> Done: stack empty
-        Walking --> Done: max_files reached
-    }
+    [*] --> Init: validate + pool + budget + executor
+    Init --> Discovery
 
-    state ReaderStage {
-        [*] --> Idle
-        Idle --> Reading: file_ring.pop()
-        Reading --> Reading: more chunks
-        Reading --> Idle: EOF reached
-    }
+    Discovery --> Abort: abort_run == true
+    Discovery --> DoneDiscovery: source.next_file() == None
+    Discovery --> AcquirePermit: next_file() -> LocalFile
 
-    state ScanStage {
-        [*] --> Scanning
-        Scanning --> Flushing: chunk scanned
-        Flushing --> Scanning: pending drained
-    }
+    AcquirePermit --> QueueTask: CountBudget::acquire(1)
+    QueueTask --> FlushBatch: batch.len() >= batch_cap
+    QueueTask --> Discovery: batch.len() < batch_cap
+    FlushBatch --> Discovery: spawn_external_batch(...)
 
-    state OutputStage {
-        [*] --> Outputting
-        Outputting --> Outputting: findings available
-    }
+    DoneDiscovery --> Join
+    Abort --> Join
+    Join --> [*]: ex.join() + aggregate metrics
 ```
 
-## Termination Conditions
+`batch_cap` is `cfg.max_in_flight_objects.clamp(1, 64)`.
 
-```rust
-let done = walker.is_done()           // No more files to discover
-    && reader.is_idle()               // No active file being read
-    && file_ring.is_empty()           // No pending file IDs
-    && chunk_ring.is_empty()          // No pending chunks
-    && !scanner.has_pending()         // No buffered findings
-    && out_ring.is_empty();           // All findings written
-```
+## Worker Task States (`process_file`)
 
 ```mermaid
-graph TB
-    subgraph Termination["Termination Check"]
-        WD["walker.is_done()"]
-        RI["reader.is_idle()"]
-        FE["file_ring.is_empty()"]
-        CE["chunk_ring.is_empty()"]
-        NP["!scanner.has_pending()"]
-        OE["out_ring.is_empty()"]
-    end
+stateDiagram-v2
+    [*] --> CheckAbort
+    CheckAbort --> [*]: abort_run == true
+    CheckAbort --> DetectByPath
 
-    WD --> AND
-    RI --> AND
-    FE --> AND
-    CE --> AND
-    NP --> AND
-    OE --> AND
+    DetectByPath --> ArchiveDispatch: detect_kind_from_path(...) == Some
+    DetectByPath --> OpenFile: no extension match
 
-    AND{{"ALL true?"}}
-    AND --> |yes| Done["Break loop"]
-    AND --> |no| Continue["Next iteration"]
+    OpenFile --> [*]: open/metadata error (io_errors += 1)
+    OpenFile --> SkipFile: empty or size > max_file_size
+    OpenFile --> DetectByHeader: archive.enabled
+    OpenFile --> BinaryProbe: !archive.enabled and skip_binary
+    OpenFile --> ChunkLoop: otherwise
 
-    style Termination fill:#e8f5e9
+    DetectByHeader --> ArchiveDispatch: sniff_kind_from_header(...) == Some
+    DetectByHeader --> BinaryProbe: no archive match
+    BinaryProbe --> SkipFile: Binary / unsupported extraction
+    BinaryProbe --> ChunkLoop: Text
+
+    ArchiveDispatch --> [*]: ArchiveEnd::Scanned/Skipped/Partial
+    ChunkLoop --> [*]: EOF or read error
+    SkipFile --> [*]
 ```
 
-## Progress Tracking
+Notes:
+- Archive scan dispatch is `dispatch_archive_scan(...)` and records
+  `ArchiveEnd::{Scanned, Skipped, Partial}`.
+- Regular file scanning uses overlap-carry chunks and `engine.scan_chunk_into(...)`.
+- `drop_prefix_findings(new_bytes_start)` keeps overlap dedupe deterministic.
 
-Each `pump()` returns a boolean indicating whether progress was made:
+## Executor Termination States
 
-```rust
-loop {
-    let mut progressed = false;
+The executor uses a combined atomic state `(in_flight << 1) | accepting`.
 
-    progressed |= output.pump(&engine, &files, &mut out_ring, &mut stats)?;
-    progressed |= scanner.pump(&engine, &mut chunk_ring, &mut out_ring);
-    progressed |= reader.pump(&mut file_ring, &mut chunk_ring, &pool, &files, &mut stats)?;
-    progressed |= walker.pump(&mut files, &mut file_ring, &mut stats)?;
-
-    // ... termination check ...
-
-    if !progressed {
-        return Err(io::Error::new(io::ErrorKind::Other, "pipeline stalled"));
-    }
-}
-```
-
-This check prevents a silent busy loop when rings are full/empty in a way that
-should not be possible. It surfaces deadlocks early during development.
-
-## Stall Detection
-
-A stall occurs when:
-- No stage made progress (`progressed = false`)
-- Termination conditions not met
-
-This indicates a logic error (e.g., deadlock) rather than empty input:
+Constants:
+- `ACCEPTING_BIT = 1`
+- `COUNT_UNIT = 2`
 
 ```mermaid
-graph TB
-    subgraph StallScenario["Stall Scenario (Bug)"]
-        FR["file_ring: FULL"]
-        CR["chunk_ring: FULL"]
-        OR["out_ring: FULL"]
-
-        Walker["Walker: blocked<br/>(file_ring full)"]
-        Reader["Reader: blocked<br/>(chunk_ring full)"]
-        Scanner["Scanner: blocked<br/>(out_ring full)"]
-        Output["Output: blocked<br/>(??? - should drain)"]
-    end
-
-    style StallScenario fill:#ffebee
+stateDiagram-v2
+    [*] --> Open0: state=0x01 (accepting, count=0)
+    Open0 --> OpenN: spawn (+COUNT_UNIT)
+    OpenN --> OpenN: spawn / complete
+    OpenN --> ClosedN: join() clears accepting bit
+    ClosedN --> ClosedN: task completion (count--)
+    ClosedN --> Closed0: count reaches 0 -> initiate_done()
+    Closed0 --> [*]
 ```
 
-In practice, stalls shouldn't occur because:
-- Ring buffer sizes are chosen to prevent blocking
-- Output stage always drains when data is available
-- Pool size exceeds chunk ring capacity
+There is no explicit "pipeline stalled" error state in this path. Completion is
+driven by source exhaustion + `join()` + executor in-flight drain.
 
-## Backpressure Handling
+## Current Names and Constants
 
-```mermaid
-sequenceDiagram
-    participant Scanner as ScanStage
-    participant OutRing as out_ring
-    participant Output as OutputStage
+| Symbol / Type | Value / Meaning | Location |
+| --- | --- | --- |
+| `ParallelScanConfig::default().chunk_size` | `256 * 1024` bytes | `src/scheduler/parallel_scan.rs` |
+| `ParallelScanConfig::default().pool_buffers` | `workers * 4` | `src/scheduler/parallel_scan.rs` |
+| `ParallelScanConfig::default().max_in_flight_objects` | `1024` | `src/scheduler/parallel_scan.rs` |
+| `LocalConfig::default().chunk_size` | `64 * 1024` bytes | `src/scheduler/local_fs_owner.rs` |
+| `LocalConfig::default().max_in_flight_objects` | `256` | `src/scheduler/local_fs_owner.rs` |
+| `ARCHIVE_STREAM_READ_MAX` | `256 * 1024` bytes | `src/scheduler/local_fs_owner.rs` |
+| `ACCEPTING_BIT` / `COUNT_UNIT` | `1` / `2` | `src/scheduler/executor_core.rs` |
 
-    Note over Scanner: scan_chunk_into() produces 100 findings
-    Scanner->>Scanner: drain_findings_into(pending)
+## Metrics and Summary Wiring
 
-    loop While pending.len() > 0
-        Scanner->>OutRing: push(finding)
-        alt Ring full
-            OutRing-->>Scanner: Err(finding)
-            Note over Scanner: pending_idx stays put
-            Scanner-->>Scanner: Break, try next iteration
-        else Ring has space
-            OutRing-->>Scanner: Ok(())
-            Scanner->>Scanner: pending_idx += 1
-        end
-    end
+- `scan_local(...)` returns `LocalReport { stats: LocalStats, metrics: MetricsSnapshot }`.
+- `stats.io_errors` is set from `metrics.io_errors` at the end of `scan_local`.
+- `run_fs(...)` emits `SummaryEvent` using:
+  - `report.metrics.bytes_scanned`
+  - `report.metrics.findings_emitted`
+  - `report.stats.io_errors`
+  - elapsed wall-clock timing
 
-    Note over Output: Next pump() iteration
-    Output->>OutRing: pop()
-    OutRing-->>Output: FindingRec
-    Output->>Output: write to stdout
-```
+## Source of Truth (Paths)
 
-The `ScanStage` buffers findings in `pending` when `out_ring` is full, ensuring no findings are dropped.
-
-## Ring Buffer Flow Control
-
-```mermaid
-graph LR
-    subgraph Capacities
-        FR["file_ring<br/>cap=1024"]
-        CR["chunk_ring<br/>cap=128"]
-        OR["out_ring<br/>cap=8192"]
-    end
-
-    subgraph FlowControl
-        WC{{"file_ring.is_full()?"}}
-        RC{{"chunk_ring.is_full()?"}}
-        SC{{"out_ring.is_full()?"}}
-    end
-
-    Walker --> WC
-    WC --> |no| FR
-    WC --> |yes| WaitW["Wait next iteration"]
-
-    Reader --> RC
-    RC --> |no| CR
-    RC --> |yes| WaitR["Wait next iteration"]
-
-    Scanner --> SC
-    SC --> |no| OR
-    SC --> |yes| Buffer["Buffer in pending"]
-```
-
-## Statistics Collection
-
-```rust
-pub struct PipelineStats {
-    pub files: u64,     // Files discovered by Walker
-    pub chunks: u64,    // Chunks read by Reader
-    pub findings: u64,  // Findings written by Output
-    pub errors: u64,    // File open/read errors
-}
-```
-
-Stats are updated atomically at each stage:
-- `Walker::pump()`: `stats.files += 1` per file
-- `Reader::pump()`: `stats.chunks += 1` per chunk, `stats.errors += 1` on open failure
-- `Output::pump()`: `stats.findings += 1` per finding written
+- `src/unified/orchestrator.rs`
+- `src/scheduler/parallel_scan.rs`
+- `src/scheduler/local_fs_owner.rs`
+- `src/scheduler/executor.rs`
+- `src/scheduler/executor_core.rs`
+- `src/scheduler/metrics.rs`

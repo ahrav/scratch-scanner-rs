@@ -27,6 +27,9 @@ and maintains zero allocations during the hot path. Memory scales with worker co
 | 12      | 225.8 MiB  | 15.0 MiB    | ~241 MiB  |
 | 16      | 301.1 MiB  | 20.0 MiB    | ~321 MiB  |
 
+These figures are from the diagnostic sizing model (`223` builtin rules,
+`max_anchor_hits_per_rule_variant = 2048`, and a `64 KiB` overlap estimate).
+
 ### Per-Worker Allocation (~18.8 MiB each)
 
 | Component                           | Size      | % of Total |
@@ -46,14 +49,14 @@ sized for worst-case: 669 (rule,variant) pairs × 2048 max hits × 12 bytes/Span
 ### Buffer Pool (System-Wide)
 
 - **Buffers**: `workers × 4` (e.g., 32 buffers for 8 workers)
-- **Buffer size**: `chunk_size + overlap` = 256 KiB + 64 KiB = 320 KiB
-- **Total**: ~10 MiB for 8 workers
+- **Buffer size (example)**: `chunk_size + overlap` = 256 KiB + 64 KiB = 320 KiB
+- **Total (example)**: ~10 MiB for 8 workers
 
 ### Production Configuration (ParallelScanConfig)
 
 ```rust
 ParallelScanConfig {
-    workers: num_cpus::get(),     // Auto-detect CPU count
+    workers: num_cpus::get().max(1), // Auto-detect CPU count
     chunk_size: 256 * 1024,       // 256 KiB chunks
     pool_buffers: workers * 4,    // 4 buffers per worker
     max_in_flight_objects: 1024,
@@ -284,18 +287,20 @@ Pack decode uses bounded buffers and a fixed-size cache:
   without requiring larger caches.
 - **Header parsing**: entry headers are bounded by
   `PackDecodeLimits.max_header_bytes`.
-- **Pack cache (tiered)**: `PackCacheTiered` stores decoded objects in
-  size-segregated fixed-size slots using two internal `PackCache` instances.
-  Tier A uses 64 KiB slots; Tier B uses 512 KiB slots. Entries larger than
-  Tier B are not cached. Each tier is 4-way set associative with CLOCK
-  eviction, and all storage is preallocated.
+- **Pack cache (tiered)**: `PackCache` stores decoded objects in two
+  size-segregated fixed-slot tiers. The small tier uses 64 KiB slots; the
+  large tier uses 2 MiB slots. Entries larger than 2 MiB are not cached.
+  Each tier is 4-way set associative with CLOCK eviction, and all storage is
+  preallocated.
 - **Sequential hints**: pack mmaps use `posix_fadvise`/`madvise` (when
   available) to hint sequential access and improve readahead without
   changing memory caps.
-- **ODB-blob cache sizing**: pack cache bytes are raised to approximately
-  `total_pack_bytes / 64` (capped at 2 GiB) to keep delta bases hot when
-  scanning full history. The default split is 75% Tier A / 25% Tier B,
-  with a minimum of 32 MiB reserved for Tier B.
+- **ODB-blob cache sizing**: pack cache bytes are targeted from
+  `total_used_pack_bytes / 16`, then clamped by per-worker/global bounds:
+  `16 GiB / workers` aggregate cap, 32 MiB per-worker floor, and 2 GiB
+  per-worker hard cap. The default split is roughly 2/3 small tier and 1/3
+  large tier, with a minimum of 32 MiB reserved for the large tier when
+  enabled.
 - **Parallel pack exec memory**: each worker owns its own pack cache and
   scratch buffers. A global scheduler caps total workers and enforces
   per-repo memory ceilings: `workers * (pack_cache_bytes + scratch_bytes)`.
@@ -320,14 +325,15 @@ verify no heap activity after warmup.
 
 ## Single-Threaded Pipeline Memory Model
 
-> **Note**: The diagrams below describe the single-threaded `Pipeline` API, which uses
-> different sizing defaults than the owner-compute scheduler. For production multi-core scanning, see
-> the section above.
+> **Note**: The diagrams below describe the single-threaded runtime types in
+> `src/runtime.rs` (`ScannerRuntime`, `BufferPool`, `Chunk`), which use
+> different sizing defaults than the owner-compute scheduler. For production
+> multi-core scanning, see the section above.
 
 ```mermaid
 flowchart TB
     subgraph Init["Initialization"]
-        PoolInit["BufferPool::new(default_pool_capacity())"]
+        PoolInit["BufferPool::new(config.pool_capacity())"]
         NodeInit["NodePoolType::init(pool_cap)"]
         BitInit["DynamicBitSet::empty(pool_cap)"]
         Alloc["alloc(pool_cap * 8MiB, 4096)"]
@@ -422,8 +428,6 @@ classDiagram
         +init(node_count: u32) Self
         +acquire() NonNull~u8~
         +release(node: NonNull~u8~)
-        +reset()
-        +deinit()
     }
 
     class BufferHandle {
@@ -522,17 +526,22 @@ pub struct Chunk {
     pub len: u32,            // Total bytes (prefix + payload)
     pub prefix_len: u32,     // Overlap bytes from previous chunk
     pub buf: BufferHandle,   // Owned buffer handle
+    pub buf_offset: u32,     // Start offset into buf where chunk data begins
 }
 
 impl Chunk {
     // Full data including overlap prefix
     pub fn data(&self) -> &[u8] {
-        &self.buf.as_slice()[..self.len as usize]
+        let start = self.buf_offset as usize;
+        let end = start + self.len as usize;
+        &self.buf.as_slice()[start..end]
     }
 
     // Payload only (excludes overlap)
     pub fn payload(&self) -> &[u8] {
-        &self.buf.as_slice()[self.prefix_len as usize..self.len as usize]
+        let start = self.buf_offset as usize + self.prefix_len as usize;
+        let end = self.buf_offset as usize + self.len as usize;
+        &self.buf.as_slice()[start..end]
     }
 }
 ```
@@ -577,7 +586,7 @@ sequenceDiagram
 
 The overlap ensures patterns that span chunk boundaries are detected:
 - `overlap = engine.required_overlap()`
-- `required_overlap = max_window_diameter_bytes + max_anchor_pat_len - 1`
+- `required_overlap = max_window_diameter_bytes + max_prefilter_width - 1`
 
 ## ScanScratch Per-Chunk State
 

@@ -21,7 +21,7 @@ Stages:
 1. Repo open (build simulated start set, commit graph, tree source)
 2. Commit walk (plan commits)
 3. Tree diff (emit candidates)
-4. Pack exec (optional, uses in-memory artifacts if present)
+4. Pack exec (uses in-memory artifacts when present; falls back to semantic scan)
 5. Finalize (determine complete vs partial outcome)
 
 Stage boundaries emit trace events so failures can be replayed and minimized.
@@ -42,8 +42,8 @@ deterministic interleaving.
 - Termination: runs complete within `max_steps` or return `FailureKind::Hang`.
 - Determinism: identical `{scenario, seed}` yields identical trace hash.
 - Stability: multiple schedule seeds compare normalized outputs and outcome.
-- Gating: `FinalizeOutcome::Complete` requires zero skips; `Partial` requires
-  non-zero skips.
+- Gating: `FinalizeOutcome::Complete` requires zero skips;
+  `FinalizeOutcome::Partial { skipped_count }` requires non-zero skips.
 
 ## Fault Plan
 
@@ -92,14 +92,13 @@ order they are issued and enforces the two-phase contract:
 ## Running Tests
 
 The Git simulation tests are wired behind the `sim-harness` feature alongside
-scanner simulation tests. As the harness expands, the following commands will
-become the primary entry points:
+scanner simulation tests. Primary entry points:
 
 ```bash
 # Random Git simulation runs (bounded)
 cargo test --features sim-harness --test simulation git_scan_random
 
-# Replay minimized Git simulation corpus
+# Replay Git simulation corpus
 cargo test --features sim-harness --test simulation git_scan_corpus
 ```
 
@@ -111,8 +110,9 @@ Optional knobs for random runs:
 - `SIM_GIT_SCAN_DEEP=1` (larger scenarios)
 - `SIM_GIT_SCAN_SEED_START` / `SIM_GIT_SCAN_SEED_COUNT`
 - `SIM_GIT_SCENARIO_COMMITS`, `SIM_GIT_SCENARIO_REFS`, `SIM_GIT_SCENARIO_BLOBS_PER_TREE`
-- `SIM_GIT_RUN_WORKERS`, `SIM_GIT_RUN_MAX_STEPS`, `SIM_GIT_RUN_STABILITY_RUNS`,
-  `SIM_GIT_RUN_TRACE_CAP`
+- `SIM_GIT_RUN_WORKERS`, `SIM_GIT_RUN_WORKERS_MIN`, `SIM_GIT_RUN_WORKERS_MAX`
+- `SIM_GIT_RUN_MAX_STEPS`, `SIM_GIT_RUN_STABILITY_RUNS`, `SIM_GIT_RUN_TRACE_CAP`
+- `GIT_SIM_WRITE_FAIL=1` (write failing artifacts to `tests/failures/`)
 
 ## CI Expectations
 
