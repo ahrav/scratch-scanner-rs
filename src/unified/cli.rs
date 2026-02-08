@@ -486,9 +486,8 @@ mod tests {
             "non-UTF8 --rules= path must not be silently ignored"
         );
         let got = config.rules_file.unwrap();
-        let expected = std::path::PathBuf::from(OsString::from_vec(
-            b"/tmp/\xff/rules.yaml".to_vec(),
-        ));
+        let expected =
+            std::path::PathBuf::from(OsString::from_vec(b"/tmp/\xff/rules.yaml".to_vec()));
         assert_eq!(got, expected);
     }
 
