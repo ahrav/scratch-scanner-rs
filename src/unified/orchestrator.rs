@@ -517,12 +517,22 @@ fn load_rules_for_scan(rules_file: Option<&Path>) -> Vec<RuleSpec> {
     let path = match rules_file {
         Some(p) => p.to_path_buf(),
         None => match crate::rules::default_rules_path() {
-            Some(p) if p.exists() => p,
-            _ => return demo_rules(),
+            Some(p) if p.exists() => {
+                eprintln!("info: loading rules from {}", p.display());
+                p
+            }
+            _ => {
+                let rules = demo_rules();
+                eprintln!("info: using compiled-in rule set ({} rules)", rules.len());
+                return rules;
+            }
         },
     };
     match crate::rules::load_rules(&path) {
-        Ok(rules) => rules,
+        Ok(rules) => {
+            eprintln!("info: loaded {} rules from {}", rules.len(), path.display());
+            rules
+        }
         Err(e) => {
             eprintln!("error: failed to load rules from {}: {e}", path.display());
             std::process::exit(2);
