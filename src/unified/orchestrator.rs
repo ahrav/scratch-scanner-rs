@@ -519,29 +519,16 @@ fn print_git_perf_breakdown(report: &git_scan::GitScanReport, config: &GitScanCo
 /// Filtering happens *before* engine construction. In the git scan path
 /// this is also before policy hashing, so disabling a transform correctly
 /// invalidates the incremental-scan cache key.
-///
-/// # Name mapping
-///
-/// The `TransformId` → CLI-name mapping here must stay in sync with
-/// `KNOWN_TRANSFORMS` in `cli.rs`.
 fn apply_transform_filter(
     transforms: Vec<crate::api::TransformConfig>,
     filter: &TransformFilter,
 ) -> Vec<crate::api::TransformConfig> {
-    use crate::api::TransformId;
-
     match filter {
         TransformFilter::All => transforms,
         TransformFilter::None => Vec::new(),
-        TransformFilter::Only(names) => transforms
+        TransformFilter::Only(ref ids) => transforms
             .into_iter()
-            .filter(|t| {
-                let tag = match t.id {
-                    TransformId::UrlPercent => "url",
-                    TransformId::Base64 => "base64",
-                };
-                names.iter().any(|n| n == tag)
-            })
+            .filter(|t| ids.contains(&t.id))
             .collect(),
     }
 }
@@ -606,21 +593,21 @@ mod tests {
 
     #[test]
     fn filter_only_base64() {
-        let filter = TransformFilter::Only(vec!["base64".to_string()]);
+        let filter = TransformFilter::Only(vec![TransformId::Base64]);
         let result = apply_transform_filter(test_transforms(), &filter);
         assert_eq!(ids(&result), vec![TransformId::Base64]);
     }
 
     #[test]
     fn filter_only_url() {
-        let filter = TransformFilter::Only(vec!["url".to_string()]);
+        let filter = TransformFilter::Only(vec![TransformId::UrlPercent]);
         let result = apply_transform_filter(test_transforms(), &filter);
         assert_eq!(ids(&result), vec![TransformId::UrlPercent]);
     }
 
     #[test]
     fn filter_both_preserves_order() {
-        let filter = TransformFilter::Only(vec!["url".to_string(), "base64".to_string()]);
+        let filter = TransformFilter::Only(vec![TransformId::UrlPercent, TransformId::Base64]);
         let result = apply_transform_filter(test_transforms(), &filter);
         assert_eq!(
             ids(&result),
@@ -631,16 +618,6 @@ mod tests {
     #[test]
     fn filter_none_on_empty_input() {
         let result = apply_transform_filter(vec![], &TransformFilter::All);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn filter_unmatched_name_returns_empty() {
-        // If a name doesn't match any transform, that name is simply a no-op.
-        // (CLI validation rejects unknown names before we get here, but the
-        // filter itself should handle it gracefully.)
-        let filter = TransformFilter::Only(vec!["rot13".to_string()]);
-        let result = apply_transform_filter(test_transforms(), &filter);
         assert!(result.is_empty());
     }
 }

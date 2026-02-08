@@ -14,6 +14,7 @@ use std::env;
 use std::io;
 use std::path::PathBuf;
 
+use crate::api::TransformId;
 use crate::git_scan::{GitScanMode, MergeDiffMode};
 use crate::AnchorMode;
 
@@ -38,9 +39,7 @@ use super::{EventFormat, FsScanConfig, GitSourceConfig, SourceConfig};
 ///
 /// # Mapping to engine types
 ///
-/// Names in [`Only`](TransformFilter::Only) are matched against
-/// [`TransformId`](crate::api::TransformId) variants via
-/// `KNOWN_TRANSFORMS`:
+/// CLI names are defined by [`TransformId::cli_name()`]:
 ///
 /// | CLI name   | `TransformId` variant |
 /// |------------|-----------------------|
@@ -53,8 +52,8 @@ pub enum TransformFilter {
     All,
     /// Disable all transforms — scan raw buffers only.
     None,
-    /// Enable only the named transforms (validated against `KNOWN_TRANSFORMS`).
-    Only(Vec<String>),
+    /// Enable only the listed transforms (converted from CLI names at parse time).
+    Only(Vec<TransformId>),
 }
 
 /// Top-level scan configuration produced by CLI parsing.
@@ -446,55 +445,61 @@ fn parse_event_format(s: &str) -> EventFormat {
     }
 }
 
-/// Canonical CLI names for each [`TransformId`](crate::api::TransformId) variant.
-///
-/// This table defines the accepted CLI names for the `--transforms` flag.
-/// It must be kept in sync with the `TransformId`-to-name mapping in
-/// `apply_transform_filter` (in `orchestrator.rs`).
-const KNOWN_TRANSFORMS: &[&str] = &["base64", "url"];
-
 /// Parse the value of `--transforms=<value>` into a [`TransformFilter`].
 ///
-/// Accepts `"all"`, `"none"`, or a comma-separated list of names from
-/// `KNOWN_TRANSFORMS`. Input is case-insensitive (including `all`/`none`)
-/// and whitespace around commas is trimmed. Exits with code 2 on
-/// unrecognised names.
+/// Accepts `"all"`, `"none"`, or a comma-separated list of CLI names
+/// defined by [`TransformId::cli_name()`]. Validation iterates
+/// [`TransformId::ALL`], so adding a new variant there is sufficient
+/// to accept it here.
+///
+/// Input is case-insensitive (including `all`/`none`) and whitespace
+/// around commas is trimmed. Duplicate names are silently deduplicated
+/// (first occurrence wins, preserving user-specified order). Exits with
+/// code 2 on unrecognised names.
 fn parse_transforms(s: &str) -> TransformFilter {
+    let known_csv: String = TransformId::ALL
+        .iter()
+        .map(|id| id.cli_name())
+        .collect::<Vec<_>>()
+        .join(", ");
+
     let normalized = s.trim().to_lowercase();
     match normalized.as_str() {
         "" => {
             eprintln!(
-                "error: --transforms requires a value (all, none, or comma-separated: {})",
-                KNOWN_TRANSFORMS.join(", ")
+                "error: --transforms requires a value (all, none, or comma-separated: {known_csv})"
             );
             std::process::exit(2);
         }
         "all" => TransformFilter::All,
         "none" => TransformFilter::None,
         _ => {
-            let names: Vec<String> = normalized
+            let tokens: Vec<&str> = normalized
                 .split(',')
-                .map(|n| n.trim().to_string())
+                .map(|n| n.trim())
                 .filter(|n| !n.is_empty())
                 .collect();
-            if names.is_empty() {
+            if tokens.is_empty() {
                 eprintln!(
-                    "error: --transforms requires at least one transform name (known: {})",
-                    KNOWN_TRANSFORMS.join(", ")
+                    "error: --transforms requires at least one transform name (known: {known_csv})"
                 );
                 std::process::exit(2);
             }
-            for name in &names {
-                if !KNOWN_TRANSFORMS.contains(&name.as_str()) {
-                    eprintln!(
-                        "invalid --transforms value: '{}' (known: {})",
-                        name,
-                        KNOWN_TRANSFORMS.join(", ")
-                    );
-                    std::process::exit(2);
+            let mut ids = Vec::new();
+            for tok in tokens {
+                let id = TransformId::ALL
+                    .iter()
+                    .find(|id| id.cli_name() == tok)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        eprintln!("invalid --transforms value: '{}' (known: {known_csv})", tok);
+                        std::process::exit(2);
+                    });
+                if !ids.contains(&id) {
+                    ids.push(id);
                 }
             }
-            TransformFilter::Only(names)
+            TransformFilter::Only(ids)
         }
     }
 }
@@ -656,7 +661,7 @@ mod tests {
         let config = parse_fs_args(args.into_iter()).unwrap();
         assert_eq!(
             config.transform_filter,
-            TransformFilter::Only(vec!["base64".to_string()])
+            TransformFilter::Only(vec![TransformId::Base64])
         );
     }
 
@@ -669,7 +674,7 @@ mod tests {
         let config = parse_fs_args(args.into_iter()).unwrap();
         assert_eq!(
             config.transform_filter,
-            TransformFilter::Only(vec!["url".to_string(), "base64".to_string()])
+            TransformFilter::Only(vec![TransformId::UrlPercent, TransformId::Base64])
         );
     }
 
@@ -721,25 +726,37 @@ mod tests {
         assert_eq!(parse_transforms("NoNe"), TransformFilter::None);
         assert_eq!(
             parse_transforms("base64"),
-            TransformFilter::Only(vec!["base64".to_string()])
+            TransformFilter::Only(vec![TransformId::Base64])
         );
         assert_eq!(
             parse_transforms("url,base64"),
-            TransformFilter::Only(vec!["url".to_string(), "base64".to_string()])
+            TransformFilter::Only(vec![TransformId::UrlPercent, TransformId::Base64])
         );
         assert_eq!(
             parse_transforms(" URL , Base64 "),
-            TransformFilter::Only(vec!["url".to_string(), "base64".to_string()])
+            TransformFilter::Only(vec![TransformId::UrlPercent, TransformId::Base64])
         );
         // Trailing comma: empty segments are filtered out.
         assert_eq!(
             parse_transforms("base64,"),
-            TransformFilter::Only(vec!["base64".to_string()])
+            TransformFilter::Only(vec![TransformId::Base64])
         );
         // Leading comma.
         assert_eq!(
             parse_transforms(",url"),
-            TransformFilter::Only(vec!["url".to_string()])
+            TransformFilter::Only(vec![TransformId::UrlPercent])
+        );
+    }
+
+    #[test]
+    fn parse_transforms_deduplicates() {
+        assert_eq!(
+            parse_transforms("base64,base64"),
+            TransformFilter::Only(vec![TransformId::Base64])
+        );
+        assert_eq!(
+            parse_transforms("url,base64,url"),
+            TransformFilter::Only(vec![TransformId::UrlPercent, TransformId::Base64])
         );
     }
 
@@ -757,7 +774,7 @@ mod tests {
         let config = parse_fs_args(args.into_iter()).unwrap();
         assert_eq!(
             config.transform_filter,
-            TransformFilter::Only(vec!["base64".to_string()])
+            TransformFilter::Only(vec![TransformId::Base64])
         );
     }
 
