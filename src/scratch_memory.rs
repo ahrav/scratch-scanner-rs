@@ -264,7 +264,7 @@ impl<T> ScratchVec<T> {
     /// This is the fixed-capacity equivalent of `Vec::pop`. The capacity remains
     /// unchanged; only the logical length decreases.
     pub fn pop(&mut self) -> Option<T> {
-        if self.len == 0 {
+        if self.is_empty() {
             return None;
         }
         self.len = self.len.saturating_sub(1);
@@ -449,6 +449,14 @@ mod tests {
         vec.clear();
         vec.extend_from_slice(&[]);
         assert!(vec.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "scratch vec capacity exceeded")]
+    fn scratch_vec_push_overflow_panics() {
+        let mut vec = ScratchVec::<u8>::with_capacity(1).unwrap();
+        vec.push(1);
+        vec.push(2);
     }
 
     #[test]
