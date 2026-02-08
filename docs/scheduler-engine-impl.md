@@ -16,7 +16,7 @@ The `engine_impl` module provides **trait implementations** that bridge the gap 
 This decoupling allows:
 - The scheduler to remain engine-agnostic (can work with mock or real engine)
 - The engine implementation to evolve independently
-- Testing to proceed in parallel (mock engine in `engine_stub.rs`)
+- Testing to proceed in parallel (mock engine in `src/scheduler/engine_stub.rs`)
 - Clear contract documentation through traits
 
 **Key principle**: The scheduler doesn't directly call `Engine::scan_chunk_into()`. Instead, it calls through the `ScanEngine` trait, which is implemented here to forward to the real engine.
@@ -73,12 +73,12 @@ The key insight: `RealEngineScratch` wraps the engine's native `ScanScratch` and
 
 ### The Challenge
 
-The real engine's `ScanScratch::reset_for_scan()` method requires an `&Engine` reference:
+The real engine's scratch reset methods require an `&Engine` reference:
 
 ```rust
 impl ScanScratch {
-    fn reset_for_scan(&mut self, engine: &Engine) {
-        // Resets internal pattern match state using engine data
+    fn reset_for_scan_after_prefilter(&mut self, engine: &Engine) {
+        // Resets per-scan state using engine data while preserving prefilter hits
     }
 }
 ```
@@ -101,9 +101,9 @@ Instead of fighting the design, the module implements a **lazy reset** approach 
    - This is a no-op for the real scratch's internal state
 
 2. **In `Engine::scan_chunk_into()`** (line 194-203):
-   - The engine itself calls `reset_for_scan()` internally before scanning
-   - This happens in the real engine code, not here
-   - The engine has the reference it needs
+   - The real engine owns scratch lifecycle internally (capacity validation + per-scan state reset on scan path)
+   - This happens in the real engine code, not in the trait adapter
+   - The engine has the `&Engine` reference needed for its reset methods
 
 ### Lifecycle Per Worker
 
@@ -115,10 +115,10 @@ Worker Thread Creation:
   └─ Stored in WorkerCtx (thread-local)
 
 For Each File:
-  ├─ scratch.clear() → clears findings_buf only
+  ├─ Optional: scratch.clear() → clears findings_buf only
   └─ For Each Chunk:
      ├─ scan_chunk_into()
-     │  ├─ Engine calls reset_for_scan() internally
+     │  ├─ Engine handles internal scratch reset/validation as part of scan
      │  ├─ Scans chunk, appends to real ScanScratch
      │  └─ Findings now in scratch.scratch
      ├─ drop_prefix_findings() → delegates to real scratch
@@ -129,9 +129,9 @@ For Each File:
 
 ### Why This Works
 
-- **Zero additional resets**: The engine's internal state is reset at the right time (before scanning)
+- **Zero adapter-level resets**: Scratch reset logic stays inside the engine scan path
 - **Clean trait interface**: The scheduler doesn't need to know engine internals
-- **No redundant work**: Buffer clearing happens once per file, not per chunk
+- **Low overhead**: The drain buffer is reused across chunks to avoid repeated allocations
 
 ---
 
@@ -169,7 +169,7 @@ This module is a classic **Adapter** pattern (also called **Wrapper**):
 
 | Problem | Solution |
 |---------|----------|
-| Trait needs `&mut Self::Scratch` in `clear()`, but engine's `reset_for_scan()` needs `&Engine` | Lazy reset pattern |
+| Trait needs `&mut Self::Scratch` in `clear()`, but engine reset methods need `&Engine` | Lazy reset pattern |
 | Finding types differ slightly (u32 vs u16 for rule_id) | Type conversion in trait impl |
 | Engine returns `ScanScratch`, trait expects `RealEngineScratch` | `RealEngineScratch::new()` wrapper |
 | Findings need extraction from engine scratch | `drain_findings_into()` buffer pattern |
@@ -211,7 +211,7 @@ pub struct RealEngineScratch {
 Not defined here, but conceptually:
 - Holds internal Vectorscan pattern state
 - Accumulates findings during scanning
-- Provides `reset_for_scan()`, `drop_prefix_findings()`, `drain_findings()`
+- Provides reset/validation helpers (`reset_for_scan_after_prefilter()`, `ensure_capacity()`), plus finding APIs (`drop_prefix_findings()`, `drain_findings()`)
 
 ### `ApiFindingRec` (from `crate::api`)
 
@@ -235,7 +235,7 @@ Maps directly to the `FindingRecord` trait methods.
 
 ## 6. Performance Considerations
 
-### Zero-Copy Findings Extraction
+### Buffered Findings Extraction
 
 **The Pattern** (lines 160-174):
 
@@ -244,7 +244,7 @@ fn drain_findings_into(&mut self, out: &mut Vec<Self::Finding>) {
     // Ensure capacity
     if self.findings_buf.capacity() >= self.scratch.pending_findings_len() {
         self.scratch.drain_findings(&mut self.findings_buf);
-        out.append(&mut self.findings_buf);  // ← Vec::append = pointer swap
+        out.append(&mut self.findings_buf);
     } else {
         self.findings_buf.reserve(...);
         // ...
@@ -254,10 +254,10 @@ fn drain_findings_into(&mut self, out: &mut Vec<Self::Finding>) {
 
 **How it works**:
 1. `self.scratch.drain_findings()` moves findings into `findings_buf`
-2. `out.append()` swaps the buffer pointers (no copying)
-3. Only the buffer metadata changes; the heap-allocated data moves
+2. `out.append()` moves `findings_buf` into `out` without per-record cloning
+3. `findings_buf` is then empty but retains its capacity for reuse
 
-**Cost**: O(1) for extraction (amortized), not O(n)
+**Cost**: O(n) moves for `drain_findings()` + `append()`, typically without extra allocations once buffers are sized
 
 ### Thread-Local Scratch Benefits
 
@@ -323,7 +323,7 @@ impl EngineScratch for ScanScratch { ... }
 ### Key Differences
 
 **Mock is simpler** because:
-- `ScanScratch` directly contains findings (no extraction needed)
+- `ScanScratch` directly contains findings (no intermediate extraction buffer needed)
 - Finding types are simple and match trait exactly
 - No engine reference complexity (no lazy reset needed)
 
@@ -337,11 +337,19 @@ impl EngineScratch for ScanScratch { ... }
 The scheduler code is identical for both:
 
 ```rust
-let engine: Arc<dyn ScanEngine> = /* either real or mock */;
-let mut scratch = engine.new_scratch();
-engine.scan_chunk_into(data, file_id, offset, &mut scratch);
-scratch.drop_prefix_findings(new_bytes_start);
-scratch.drain_findings_into(&mut out);
+fn scan_one_chunk<E: ScanEngine>(
+    engine: &E,
+    data: &[u8],
+    file_id: FileId,
+    offset: u64,
+    new_bytes_start: u64,
+    out: &mut Vec<<E::Scratch as EngineScratch>::Finding>,
+) {
+    let mut scratch = engine.new_scratch();
+    engine.scan_chunk_into(data, file_id, offset, &mut scratch);
+    scratch.drop_prefix_findings(new_bytes_start);
+    scratch.drain_findings_into(out);
+}
 ```
 
 This is the power of the adapter pattern.
@@ -372,7 +380,7 @@ These tests confirm that the real engine works correctly through the trait inter
 1. **Enables production use** of the scheduler with the real scanning engine
 2. **Maintains trait abstraction** so scheduler stays engine-agnostic
 3. **Solves impedance mismatches** through lazy reset and buffer patterns
-4. **Preserves performance** with zero-copy extraction and thread-local scratch
+4. **Preserves performance** with buffer reuse and thread-local scratch
 5. **Provides parallel testability** by coexisting with the mock engine
 
 The adapter pattern keeps concerns separated: the engine focuses on pattern matching, the scheduler focuses on chunking and deduplication, and this module keeps them talking.

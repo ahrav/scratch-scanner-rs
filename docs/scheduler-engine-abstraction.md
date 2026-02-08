@@ -76,7 +76,7 @@ collisions with real filesystem file IDs.
 ### Key Characteristics
 
 - **Thread-Local**: One instance per worker, never shared across threads
-- **Reusable**: Scratch is cleared and reused across chunks to minimize allocations
+- **Reusable**: Scratch is reused across chunks to minimize allocations
 - **Deduplication-Aware**: Provides methods to manage findings at chunk boundaries
 
 ### Associated Type
@@ -93,7 +93,7 @@ Specifies the finding type produced by this scratch. This associated type allows
 
 **Contract**: After calling `clear()`, `drain_findings_into()` yields no findings.
 
-**Typical Usage**: Called once per file before processing that file's chunks.
+**Typical Usage**: Available as an implementation reset hook. Current scheduler scan loops call `scan_chunk_into()`, `drop_prefix_findings()`, and `drain_findings_into()` per chunk.
 
 #### `drop_prefix_findings(&mut self, new_bytes_start: u64)`
 
@@ -145,7 +145,7 @@ Specifies the finding type produced by this scratch. This associated type allows
 
 **Purpose**: Returns the start byte offset of the finding in the original buffer.
 
-**Usage**: Used for cross-chunk deduplication. A finding belongs to a previous chunk if its `root_hint_end <= overlap_boundary`.
+**Usage**: Used for cross-chunk deduplication. Under the trait contract, findings with `root_hint_end < new_bytes_start` are dropped.
 
 #### `root_hint_end(&self) -> u64`
 
@@ -206,9 +206,11 @@ The traits bridge type differences between implementations:
 | Aspect | Mock Engine | Real Engine |
 |--------|-------------|-------------|
 | Rule ID | `RuleId(u16)` | `u32` |
-| Offsets | `u64` | `u32` |
+| Span Offsets | `u64` | `u32` (exposed as `u64` via trait) |
+| Root Hint Offsets | `u64` | `u64` |
 | Finding Type | `FindingRec` | `api::FindingRec` |
-| File ID | (N/A in mock) | `FileId` |
+| File ID in finding record | Not stored | `FileId` |
+| Decode step/provenance | Not stored | `StepId` |
 
 The traits normalize these via their method signatures (all return `u32` for rule IDs, `u64` for offsets).
 
@@ -249,8 +251,6 @@ Findings with root_hint_end >= 900 → kept (new in chunk 2)
 
 ```rust
 for file in files {
-    scratch.clear();  // Reset for new file
-
     for chunk in file.chunks() {
         engine.scan_chunk_into(&chunk, file_id, offset, &mut scratch);
         scratch.drop_prefix_findings(new_bytes_start);  // Dedup
@@ -272,24 +272,24 @@ This pattern achieves:
 
 ```rust
 // tests use MockEngine which:
-// - Predefines findings
-// - Requires no real scanning
-// - Enables deterministic testing
+// - Uses simple substring matching
+// - Requires no production engine wiring
+// - Enables deterministic scheduler tests
 
-let engine = MockEngine::new(vec![/* presets */]);
-let finding = engine.scan_chunk_into(...);
-// Findings are controlled and predictable
+let engine = MockEngine::new(vec![/* MockRule values */], 16);
+let mut scratch = engine.new_scratch();
+engine.scan_chunk_into(b"SECRET123", FileId(0), 0, &mut scratch);
 ```
 
 ### 2. **Real Engine Implementation**
 
 ```rust
-// Production uses engine_impl::RealEngine which:
-// - Wraps the actual scanning library
-// - Maps native types to trait types
-// - Provides optimized scanning
+// Production uses crate::engine::Engine with trait impls from engine_impl:
+// - impl ScanEngine for Engine
+// - impl EngineScratch for RealEngineScratch
+// - impl FindingRecord for api::FindingRec
 
-let engine = RealEngine::wrap(crate::engine::Engine::new(...));
+let engine = crate::engine::Engine::new(rules, transforms, tuning);
 // Same scheduler code, different backend
 ```
 
@@ -308,11 +308,12 @@ Trait methods enable targeted testing:
 ```rust
 #[test]
 fn test_overlap_deduplication() {
-    let scratch = MockScratch::new();
-    // Add findings spanning overlap boundary
+    let engine = MockEngine::new(vec![], 16);
+    let mut scratch = engine.new_scratch();
     scratch.drop_prefix_findings(900);
-    // Verify deduplication
-    assert_eq!(scratch.findings_count(), expected);
+    let mut out = Vec::new();
+    scratch.drain_findings_into(&mut out);
+    assert!(out.is_empty());
 }
 ```
 

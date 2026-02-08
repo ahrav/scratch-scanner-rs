@@ -2,7 +2,7 @@
 
 ## Module Purpose
 
-The `ts_buffer_pool` module implements a **thread-safe, allocation-free buffer recycling system** for the remote backend scheduler. It solves the critical problem of efficient I/O buffer management in high-throughput, multi-worker environments by:
+The `ts_buffer_pool` module implements a **thread-safe, allocation-free buffer recycling system** for scheduler pipelines. It solves the critical problem of efficient I/O buffer management in high-throughput environments by:
 
 1. **Pre-allocating all buffers upfront** - Eliminates allocation overhead in hot paths
 2. **Per-worker local caching** - Reduces contention by giving each worker its own queue
@@ -10,7 +10,7 @@ The `ts_buffer_pool` module implements a **thread-safe, allocation-free buffer r
 4. **Work-conserving stealing** - Prevents starvation by allowing non-worker threads to steal from idle worker queues
 5. **RAII guarantees** - Automatic buffer return via `Drop` trait, preventing leaks
 
-This design is critical for remote backend performance, as network I/O tasks frequently acquire/release buffers at rates exceeding millions per second.
+The pool is used by both local and remote scheduler paths. In the current remote pipeline (`src/scheduler/remote.rs`), it is configured with `workers=1` and `local_queue_cap=1`, so behavior is mostly global-queue based.
 
 ---
 
@@ -156,6 +156,10 @@ try_acquire() {
 }
 ```
 
+Current wiring note: the worker-local fast path requires threads to set
+`worker_id` TLS (`set_current_worker_id(Some(id))`). No current scheduler
+path calls this, so production routing is typically global pop then steal.
+
 ### Release Routing
 
 ```
@@ -202,7 +206,7 @@ The pool uses **lock-free queues** (from `crossbeam_queue`) to achieve thread sa
 
 1. **`ArrayQueue<T>`** - Bounded MPMC queue using compare-and-swap (CAS) atomics
    - No allocation on acquire/release (fixed capacity)
-   - Wait-free pops and pushes (or fast backoff)
+   - Lock-free pops and pushes (or fast backoff)
 
 2. **`CachePadded<T>`** - Wraps each per-worker queue to prevent false sharing
    - Pads to cache line size (128 bytes = 2x64-byte cache lines)
@@ -241,9 +245,9 @@ if global_queue.push(buf).is_ok()  {     // Release: flush any writes before ret
    ```
    This is **not a performance panic** but an assert for correctness.
 
-3. **Fixed capacity**: At any point, `available_total() == total_buffers`
-   - Buffers either in some queue OR in a `TsBufferHandle`
-   - Never lost, never created
+3. **Fixed capacity**: Queue inventory plus in-flight handles is constant
+   - `available_total() <= total_buffers` at runtime
+   - `available_total() == total_buffers` only when no `TsBufferHandle` is in-flight
 
 4. **Work-conserving**: `try_acquire()` returns `None` only when all queues are empty
    - Stealing path guarantees non-worker threads don't starve
@@ -258,41 +262,42 @@ The buffer pool is used in remote backend **I/O task execution** to provide buff
 ### Task Flow
 
 ```
-RemoteBackendTask
+scan_remote(...)
   │
-  ├─ spawn_on_remote()
-  │   ├─ Allocate Token permit (bounds in-flight work)
-  │   └─ Spawn AsyncReadTask with token
+  ├─ Discovery thread
+  │   ├─ CountBudget::acquire(1) for object lifecycle
+  │   └─ send ObjectWork on bounded channel
   │
-  └─ AsyncReadTask::execute()
-      ├─ buf = pool.acquire()         ← TsBufferHandle (RAII)
-      ├─ bytes_read = read_from_socket(buf)
-      ├─ Process chunk...
-      └─ drop(buf)                    ← Automatic return to pool
-         │                               via TsBufferHandle::Drop
-         └─ Per-worker local queue if on worker thread
-            Else: Global queue or steal from worker locals
+  ├─ I/O thread (io_worker_loop)
+  │   ├─ buf = acquire_buffer_blocking(pool, stop)
+  │   │        (spin/park loop around pool.try_acquire())
+  │   ├─ fetch_range(..., &mut buf[..request_len])
+  │   └─ cpu.spawn(CpuTask::ScanChunk { buf, ... })
+  │
+  └─ CPU worker
+      ├─ scan chunk
+      └─ drop(buf)                    ← Automatic return via TsBufferHandle::Drop
 ```
 
 ### Backpressure Mechanism
 
-Buffer acquisition is **gated by token permits**:
+Buffer acquisition is **bounded by the pool itself** (not by a separate buffer token budget):
 
 ```rust
-// In executor or scheduler:
-let permit = token_budget.acquire().await?;  // Bounds in-flight buffers
-let pool = buffer_pool.clone();
-
-spawn_async_work(move || {
-    let buf = pool.acquire();  // Guaranteed to succeed if permit obtained
-    let bytes = read_socket(&buf)?;
-    process_chunk(&buf, bytes)?;
-    drop(buf);  // Return buffer, permit dropped on scope exit
-    Ok(())
-});
+// remote.rs
+let mut buf = match acquire_buffer_blocking(&pool, &stop) {
+    Some(b) => b,
+    None => return, // stop requested
+};
+let dst = &mut buf.as_mut_slice()[..request_len];
+let fetched = backend.fetch_range(&work.handle, base_offset, dst)?;
+cpu.spawn(CpuTask::ScanChunk { buf, ... })?;
 ```
 
-This prevents **buffer pool exhaustion** by ensuring `in_flight_permits <= total_buffers`.
+Remote backpressure chain in current code:
+- `CountBudget` bounds discovered-but-not-complete objects.
+- Bounded channel (`object_queue_cap`) bounds discovery to I/O queue depth.
+- `TsBufferPool` bounds in-flight chunk buffers; I/O threads block in `acquire_buffer_blocking()` when empty.
 
 ### Memory Accounting
 
@@ -343,7 +348,7 @@ pub struct TsBufferPoolConfig {
 ✓ workers > 0
 ✓ local_queue_cap > 0
 ✓ total_buffers >= workers
-⚠ (debug only) total_buffers >= workers * local_queue_cap
+⚠ debug warning when `total_buffers < workers * local_queue_cap`
 ```
 
 ### `TsBufferPool`
@@ -551,8 +556,8 @@ fn stealing_prevents_starvation() {
     // Non-worker thread (no TLS worker_id) acquires via stealing
     assert!(pool.try_acquire().is_some());
 
-    // Can acquire all 8 buffers despite empty global
-    for _ in 0..8 {
+    // One buffer already acquired above; 7 remain
+    for _ in 1..8 {
         assert!(pool.try_acquire().is_some());
     }
 }
@@ -562,13 +567,13 @@ fn stealing_prevents_starvation() {
 
 ## Summary
 
-The `TsBufferPool` module provides a **high-performance, thread-safe buffer recycling system** specifically designed for remote backend I/O tasks. Its key properties:
+The `TsBufferPool` module provides a **high-performance, thread-safe buffer recycling system** used across scheduler paths. Its key properties:
 
 - **Zero-allocation hot path** - All buffers pre-allocated; acquire/release are lock-free CAS operations
-- **Per-worker local caching** - Reduces contention from millions of operations/second
+- **Per-worker local caching** - Active when caller threads set `worker_id` TLS
 - **Work-conserving stealing** - Prevents starvation of non-worker threads
 - **Memory-bounded** - Fixed peak memory usage, controlled by configuration
 - **Leak-free RAII** - Automatic buffer return on `Drop`, no manual tracking
 - **Correct** - Invariants maintained: no leaks, no double-release, no starvation
 
-Integration with remote backend ensures that **buffer acquisition is never a performance bottleneck** and memory usage is predictable and bounded.
+In the current remote backend wiring (`workers=1`, `local_queue_cap=1`), the pool primarily acts as a bounded global lifecycle tracker, while preserving the same leak-free/work-conserving guarantees.

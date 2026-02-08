@@ -2,9 +2,9 @@
 
 ## Overview
 
-The **Device Slots** module provides fairness control for mmap-based data sources (Git repositories, large archives) that share the same physical storage device. It prevents page cache thrashing and I/O collapse when multiple concurrent jobs perform memory-mapped operations on the same filesystem.
+The **Device Slots** module provides fairness control for mmap-based data sources (Git repositories, large archives) that share the same filesystem or mount point (`st_dev` on Unix). It prevents page cache thrashing and I/O collapse when multiple concurrent jobs perform memory-mapped operations on the same filesystem.
 
-**Location:** `/src/scheduler/device_slots.rs`
+**Location:** `src/scheduler/device_slots.rs`
 
 **Key Responsibility:** Limit concurrent mmap-heavy operations per storage device to maintain consistent throughput and prevent resource exhaustion.
 
@@ -70,12 +70,12 @@ let slots = DeviceSlots::new(config);
 
 ### Fair Allocation Algorithm
 
-The device slots system implements **fair proportional admission control**:
+The device slots system implements **per-device admission control**:
 
 1. **Per-Device Budgets**: Each unique `DeviceId` gets an independent `CountBudget`
 2. **Lazy Initialization**: Budgets created on first access to a device
 3. **Slot Limits**: Budget size = configured slots for that device
-4. **FIFO Fairness**: Within a device, slots are allocated FIFO (via `CountBudget`)
+4. **No strict waiter ordering**: `try_acquire()` is non-blocking and `acquire()` waits via condvar; fairness comes from bounded per-device concurrency, not FIFO guarantees
 
 ### Slot Lifecycle
 
@@ -167,6 +167,8 @@ Device slots are **advisory**—they limit concurrency but don't enforce hard I/
 
 ## Integration with Backend Systems
 
+Current status: this module defines the contract and API, but scheduler backends are not yet wired to call `DeviceSlots` directly in production paths.
+
 ### Local Backend Integration
 
 **mmap-Based Sources** (Git pack files, large archives):
@@ -252,9 +254,9 @@ impl DeviceSlots {
     pub fn new(config: DeviceSlotsConfig) -> Arc<Self>
     pub fn uniform(slots: usize) -> Arc<Self>
 
-    pub fn try_acquire(&Arc self, device: DeviceId) -> Option<DeviceSlotPermit>
-    pub fn acquire(&Arc self, device: DeviceId) -> DeviceSlotPermit
-    pub fn try_acquire_for_path(&Arc self, path: &Path) -> Option<DeviceSlotPermit>
+    pub fn try_acquire(self: &Arc<Self>, device: DeviceId) -> Option<DeviceSlotPermit>
+    pub fn acquire(self: &Arc<Self>, device: DeviceId) -> DeviceSlotPermit
+    pub fn try_acquire_for_path(self: &Arc<Self>, path: &Path) -> Option<DeviceSlotPermit>
 
     pub fn available(&self, device: DeviceId) -> Option<usize>
     pub fn total(&self, device: DeviceId) -> usize
@@ -319,7 +321,7 @@ impl DeviceId {
 - Poison recovery ensures continued operation if thread panics
 
 ### Memory Overhead
-- Per-device budget: ~48 bytes (DeviceSlotPermit size)
+- `DeviceSlotPermit` size is tested to stay <= 48 bytes
 - Budget map grows monotonically (acceptable for CI/CD, problematic for long-running daemons)
 - No automatic cleanup of unused devices
 

@@ -14,9 +14,9 @@ The remote backend module provides a complete scanning pipeline for remote data 
 - Retry policies with exponential backoff
 - Backpressure via bounded queues and budget constraints
 - Buffer pooling and lifecycle management
-- Finding deduplication and output formatting
+- Finding deduplication and structured event emission
 
-**Key insight:** Network latency and CPU scanning are naturally decoupled—I/O threads fetch while CPU workers scan independently.
+**Key insight:** Network latency and CPU scanning are naturally decoupled: I/O threads fetch while CPU workers scan independently.
 
 ---
 
@@ -150,8 +150,8 @@ Key: **Buffers are dropped before sleeping** to avoid starving other workers.
 ```rust
 pub trait RemoteBackend: Send + Sync + 'static {
     type Object: Send + 'static;      // Handle (S3 key, HTTP URL, etc.)
-    type Cursor: Default + Send;      // Pagination state
-    type Error: Debug + Send + Sync;  // Error type
+    type Cursor: Default + Send + 'static;      // Pagination state
+    type Error: Debug + Send + Sync + 'static;  // Error type
 
     /// List up to `max` objects starting from cursor.
     /// Returns empty when enumeration is complete, updates cursor for next page.
@@ -269,7 +269,7 @@ pub fn scan_remote<B: RemoteBackend>(
     engine: Arc<MockEngine>,
     backend: Arc<B>,
     cfg: RemoteConfig,
-    out: Arc<dyn OutputSink>,
+    event_sink: Arc<dyn EventSink>,
 ) -> Result<(RemoteRunReport, MetricsSnapshot), RemoteRunError<B::Error>>
 ```
 
@@ -284,7 +284,7 @@ pub fn scan_remote<B: RemoteBackend>(
    - Send `ObjectWork` to I/O threads
 5. Wait for I/O threads to drain
 6. Join CPU executor
-7. Return report + metrics
+7. Flush event sink and return report + metrics
 
 ---
 
@@ -297,7 +297,7 @@ pub fn scan_remote<B: RemoteBackend>(
 | `ObjectToken` | Holds in-flight permit and file metadata. Released when last Arc drops (all chunks done). |
 | `ObjectWork<H>` | Sent from discovery to I/O threads. Contains object handle, size, and token. |
 | `CpuTask` | Task sent to CPU executor. Wraps buffer, offset, and findings info. |
-| `CpuScratch` | Per-worker state: engine, output sink, scanning scratch space. |
+| `CpuScratch` | Per-worker state: engine, event sink, scanning scratch space. |
 
 ### Public Functions
 
@@ -308,7 +308,7 @@ impl RemoteConfig {
     pub fn validate(&self, engine: &MockEngine) {
         // Checks:
         // - All thread counts > 0
-        // - Pool size sufficient
+        // - retry.max_attempts > 0 and retry.jitter_pct <= 100
         // - chunk_size + overlap <= BUFFER_LEN_MAX
     }
 }
@@ -369,7 +369,7 @@ fn cpu_runner(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScratch>) {
     // 1. Scan chunk: engine.scan_chunk_into()
     // 2. Drop findings in prefix (overlap)
     // 3. Optionally dedupe within chunk
-    // 4. Emit findings: path:line-col rule_name
+    // 4. Emit findings as ScanEvent::Finding through EventSink
     // 5. Return buffer to pool (on drop)
 }
 
@@ -378,14 +378,13 @@ fn dedupe_pending_in_place(p: &mut Vec<FindingRec>) {
     // Dedup by these fields
 }
 
-fn emit_findings_formatted(
+fn emit_findings(
     engine: &MockEngine,
-    out: &Arc<dyn OutputSink>,
-    out_buf: &mut Vec<u8>,
+    event_sink: &dyn EventSink,
     display: &[u8],
     recs: &[FindingRec],
 ) {
-    // Format: display:root_hint_start-root_hint_end rule_name\n
+    // Emits FindingEvent with SourceKind::Fs, object path, offsets, and rule metadata
 }
 ```
 
@@ -434,7 +433,7 @@ Stop flag is checked:
 - Before each discovery iteration
 - Before each send
 
-When set, workers drain queued work and exit cleanly.
+When set, workers stop quickly; any already-enqueued CPU scan tasks may still finish.
 
 ---
 
@@ -519,7 +518,7 @@ Blocking calls on dedicated I/O threads is simpler than async for moderate concu
 ## 11. Example: Custom S3 Backend
 
 ```rust
-use scan_remote::{RemoteBackend, RemoteObject, ErrorClass};
+use scanner_rs::scheduler::remote::{ErrorClass, RemoteBackend, RemoteObject};
 
 pub struct S3Backend {
     client: S3Client,

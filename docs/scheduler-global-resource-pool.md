@@ -2,7 +2,9 @@
 
 ## Overview
 
-The `GlobalResourcePool` module provides centralized resource management for "fat" jobs in the scheduler—operations that require significant memory allocations beyond per-object tracking. This includes Git repository scanning, archive extraction, and multi-file container operations.
+The `GlobalResourcePool` module provides centralized resource management for "fat" jobs in the scheduler: operations that require significant memory allocations beyond per-object tracking. This includes Git repository scanning, archive extraction, and multi-file container operations.
+
+Current status: this module is implemented and tested in `src/scheduler/global_resource_pool.rs`, but there are no non-test call sites in the scheduler yet.
 
 ## 1. Module Purpose
 
@@ -248,9 +250,9 @@ permit.spill_is_limited() // true only if Limited
 
 ---
 
-## 5. Integration with Scheduler
+## 5. Integration Pattern with Scheduler
 
-### Scheduler Workflow
+### Intended Scheduler Workflow
 
 ```
 ┌─────────────────────────────────────────┐
@@ -284,7 +286,7 @@ permit.spill_is_limited() // true only if Limited
 
 ### Backpressure Strategy
 
-The module supports **negative feedback** to the scheduler:
+When wired into a scheduler path, the module provides **negative feedback** to the scheduler:
 
 1. **Job Acquisition Fails** → `try_acquire_fat_job_permit()` returns `None`
 2. **Scheduler Response** → Re-enqueue job with backoff delay
@@ -297,7 +299,7 @@ loop {
 
     loop {
         // Attempt acquisition
-        match pool.try_acquire_fat_job_permit(&job.resource_request()) {
+        match pool.try_acquire_fat_job_permit(job.resource_request()) {
             Some(permit) => {
                 job.permit = permit;
                 execute_job(job);
@@ -333,8 +335,8 @@ Scheduler Flow:
 ```
 
 **Key Insight**: Both limits can trigger backpressure:
-- Global pool full → job re-enqueued
-- ObjectFrontier full → job waits for blob completions, then acquires next
+- Global pool full -> job re-enqueued (intended integration behavior)
+- ObjectFrontier full -> job waits for blob completions, then acquires next
 
 ---
 
@@ -534,20 +536,20 @@ When permit is dropped:
 
 | Operation | Implementation | Cost |
 |-----------|----------------|------|
-| `try_acquire_fat_job_permit()` | 3 atomic CAS (scan ring + delta cache + spill slot) | O(1), ~2-3 CAS operations |
-| Release via Drop | 2 atomic decrements | O(1), ~2 memory stores |
+| `try_acquire_fat_job_permit()` | Up to 3 atomic acquire attempts (scan ring + delta cache + optional spill slot) | O(1), typically 2-3 atomic ops |
+| Release via Drop | 2 byte-budget releases + optional spill-slot release | O(1), constant-time |
 
 ### Scalability Notes
 
 - **Job-level backpressure**: Designed for tens of acquisitions per second (job-level), not objects per second
 - **Atomic contention**: Low contention because acquisitions are job-scoped, not per-object
-- **No allocation**: FatJobPermit is stack-allocated, ~80 bytes
+- **No allocation**: FatJobPermit is stack-allocated (size guard: <= 80 bytes in tests)
 
 ### Memory Overhead
 
-- `FatJobPermit` size: ~80 bytes
-- `GlobalResourcePool` size: ~64 bytes (3 Arc pointers)
-- One `ByteBudget` + `CountBudget` per pool: ~16 bytes each
+- `FatJobPermit` size: platform-dependent; unit test asserts it stays <= 80 bytes
+- `GlobalResourcePool` size: platform-dependent (three Arc-backed budgets)
+- Budget object sizes are implementation-dependent; avoid hard-coding byte counts
 
 ---
 
@@ -618,6 +620,7 @@ The module includes comprehensive tests covering:
 ### Helper Constructors
 - `git_repo_helper` - `FatJobRequest::git_repo()` builds correct request
 - `archive_helper` - `FatJobRequest::archive()` builds correct request
+- `permit_size_is_reasonable` - guards `FatJobPermit` size ceiling
 
 ### Configuration Validation
 - Config validation rejects zero scan ring, delta cache, spill slots
@@ -668,7 +671,7 @@ let config = GlobalResourcePoolConfig {
 
 ## 11. See Also
 
-- `ByteBudget` - Per-resource byte budget with atomic tracking
-- `CountBudget` - Counted slot budget (for spill concurrency)
-- `ObjectFrontier` - Per-object concurrency and memory limits
-- `Scheduler` - Main scheduler loop that uses this module
+- `ByteBudget` (`src/scheduler/budget.rs`) - Per-resource byte budget with atomic tracking
+- `CountBudget` (`src/scheduler/count_budget.rs`) - Counted slot budget (for spill concurrency)
+- `ObjectFrontier` (`src/scheduler/task_graph.rs`) - Per-object concurrency and memory limits
+- Scheduler resource-control modules (`src/scheduler/`) - module export is in place; runtime wiring is still pending
