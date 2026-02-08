@@ -825,7 +825,7 @@ fn derived_confirm_all_is_compiled() {
         other => panic!("expected anchored plan, got {other:?}"),
     };
 
-    let compiled = &eng.rules[0];
+    let compiled = &eng.rules_hot[0];
     let compiled_confirm_idx = compiled.confirm_all;
     if expected.is_empty() {
         assert!(
@@ -2555,11 +2555,12 @@ fn validate_findings(engine: &Engine, root: &[u8], findings: &[Finding]) -> Resu
             ));
         }
 
-        let rule = engine
-            .rules
+        let rule_idx = engine
+            .rules_cold
             .iter()
-            .find(|r| r.name == finding.rule)
+            .position(|r| r.name == finding.rule)
             .ok_or_else(|| format!("rule not found: {}", finding.rule))?;
+        let rule = &engine.rules_hot[rule_idx];
 
         let mut matched = false;
         for caps in rule.re.captures_iter(&buf) {

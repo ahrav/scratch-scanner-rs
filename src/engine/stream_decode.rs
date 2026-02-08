@@ -65,22 +65,28 @@ use super::work_items::{
 };
 use crate::api::{Gate, TransformConfig, TransformId, TransformMode};
 
-/// RAII guard that clears `root_span_map_ctx` on all exit paths.
+/// RAII guard that clears `root_span_map_ctx` on drop.
+///
+/// Ensures the raw-pointer-based root-span mapping context does not outlive
+/// the encoded buffer it references, even on early returns or panics.
 ///
 /// # Safety
-/// `scratch` must point to the `ScanScratch` passed to the current
-/// `decode_stream_and_scan` call and must outlive the guard.
+/// The caller must guarantee:
+/// - `scratch` points to the `ScanScratch` passed to the enclosing
+///   `decode_stream_and_scan` call.
+/// - The `ScanScratch` outlives this guard (i.e., the guard is dropped
+///   before the scratch reference goes out of scope).
 struct RootSpanMapGuard {
     scratch: *mut ScanScratch,
 }
 
 /// Mix the root span into a decoded-content hash.
 ///
-/// This prevents dedupe collisions when identical decoded bytes originate from
-/// different root spans (important for accurate root-hint attribution).
+/// Identical decoded bytes at different root positions must be scanned
+/// independently because findings carry root-buffer coordinates for dedup.
+/// XOR with a second 128-bit hash is sufficient because both halves are
+/// independently high-entropy (SipHash-1-3 / AEGIS-128L).
 fn mix_root_hint_hash(h: u128, root_hint: &Option<Range<usize>>) -> u128 {
-    // Mix the root hint into the hash so identical decoded bytes at different
-    // positions are not deduped across buffers.
     let Some(hint) = root_hint.as_ref() else {
         return h;
     };
@@ -102,19 +108,27 @@ impl Drop for RootSpanMapGuard {
 impl Engine {
     /// Decodes an encoded span in full, dedupes it, and enqueues it for scanning.
     ///
-    /// This is the fallback path when stream decoding is unavailable or fails.
+    /// This is the fallback path used when:
+    /// - No Vectorscan stream DB exists for this transform, or
+    /// - `decode_stream_and_scan` bailed out via `force_full`.
     ///
-    /// The decoded buffer is hashed (128-bit) to avoid re-scanning identical
-    /// output across transforms.
+    /// The full decoded output is hashed (128-bit SipHash via `hash128`) so
+    /// identical decoded content from different encoded spans is scanned at
+    /// most once per buffer.
     ///
     /// # Preconditions
-    /// - `enc` comes from the current scan buffer or decode slab.
-    /// - `scratch` has been reset for the current scan.
+    /// - `enc` slices into the root scan buffer or the decode slab (must remain
+    ///   valid for the duration of this call).
+    /// - `scratch.slab` is append-only at this point in the scan; the caller
+    ///   must not have outstanding references into the slab.
     ///
     /// # Effects
-    /// - May append decoded bytes to the slab and enqueue a `ScanBuf` work item.
-    /// - Updates per-scan decode budgets and dedupe state.
-    /// - On dedupe hits, rolls back the slab and skips enqueueing.
+    /// - Appends decoded bytes to `scratch.slab` and enqueues a `ScanBuf`
+    ///   work item on success.
+    /// - Enforces both per-transform (`tc.max_decoded_bytes`) and per-scan
+    ///   (`max_total_decode_output_bytes`) decode budgets.
+    /// - On dedupe hit or budget exhaustion, truncates the slab back and
+    ///   returns without enqueueing.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn decode_span_fallback(
         &self,
@@ -182,17 +196,21 @@ impl Engine {
         scratch.work_items_enqueued = scratch.work_items_enqueued.saturating_add(1);
     }
 
-    /// Re-decodes the decoded-byte window `[lo, hi)` into `out`.
+    /// Re-decodes the decoded-byte window `[lo, hi)` from `encoded` into `out`.
     ///
-    /// This is used when the ring buffer no longer holds the full window.
+    /// Called when the ring buffer has evicted the needed bytes. The function
+    /// replays `stream_decode` from the beginning of `encoded`, skipping
+    /// decoded bytes before `lo` and stopping as soon as `hi` is reached.
     ///
     /// # Returns
-    /// - `true` if exactly `hi - lo` bytes were reconstructed.
-    /// - `false` if decoding fails, truncates, or exceeds `max_out`.
+    /// - `true`  — exactly `hi - lo` bytes were reconstructed in `out`.
+    /// - `false` — decoding failed, the transform truncated output, or
+    ///   cumulative decoded bytes exceeded `max_out` before reaching `hi`.
     ///
-    /// # Notes
-    /// - `out` is cleared and filled with the decoded bytes in `[lo, hi)`.
-    /// - Decoding stops early once `hi` is reached.
+    /// # Performance
+    /// O(encoded.len()) — the entire encoded span is re-decoded even though
+    /// only `[lo, hi)` is retained. This is the slow path; the ring-buffer
+    /// extraction in `process_window` is preferred.
     pub(super) fn redecode_window_into(
         &self,
         tc: &TransformConfig,
@@ -249,45 +267,69 @@ impl Engine {
     ///
     /// # Strategy
     ///
-    /// 1. Feed decoded chunks into a ring buffer and a Vectorscan stream DB.
+    /// 1. Feed decoded chunks into a ring buffer (`decode_ring`) and a
+    ///    Vectorscan stream DB (`vs_stream`).
     /// 2. Vectorscan callbacks emit `PendingWindow` entries into a timing wheel
-    ///    keyed by `hi` (the window end in decoded-byte space).
+    ///    (granularity G=1) keyed by `hi` — the window-end in decoded-byte space.
     /// 3. As `decoded_offset` advances, the timing wheel drains eligible windows.
-    /// 4. Each window is materialized from the ring (preferred) or by re-decoding
-    ///    from the encoded source. If neither succeeds, `force_full` is set.
-    /// 5. Materialized windows are evaluated by `run_rule_on_{raw,utf16}_window_into`.
+    /// 4. Each window is materialized from the ring (zero-copy, preferred) or by
+    ///    re-decoding from `encoded` (O(encoded.len()), fallback). If neither
+    ///    succeeds, `force_full` is set to abort streaming.
+    /// 5. Materialized windows are evaluated by
+    ///    `run_rule_on_{raw,utf16}_window_into`.
+    ///
+    /// ## Coordinate spaces
+    ///
+    /// Three coordinate spaces are in play:
+    /// - **Encoded-byte space** — offsets into `encoded`.
+    /// - **Decoded-byte space** — monotonically increasing offsets produced by
+    ///   `stream_decode`; used by the ring buffer, timing wheel, and Vectorscan
+    ///   stream callbacks.
+    /// - **Root-buffer space** — absolute offsets in the original scan input;
+    ///   used for finding deduplication and output via `RootSpanMapCtx`.
     ///
     /// ## Deferred finding commit
     ///
-    /// Findings discovered during streaming are staged in `tmp_findings` (not
-    /// committed to `scratch.out`) until the entire stream succeeds and passes
-    /// dedupe. This prevents partial results from leaking when the function
-    /// rolls back to `decode_span_fallback`.
+    /// Findings are staged in `scratch.tmp_findings` (not `scratch.out`) until
+    /// the entire stream succeeds and passes dedupe. On `force_full` or error
+    /// the staged findings are discarded and `decode_span_fallback` re-scans
+    /// from scratch. This all-or-nothing protocol prevents partial/duplicate
+    /// results from leaking into output.
     ///
     /// ## UTF-16 scanning paths
     ///
     /// Two paths handle UTF-16 anchors in decoded streams:
     /// - **Stream path** (`use_utf16_stream`): a dedicated Vectorscan stream DB
-    ///   scans decoded chunks for UTF-16 patterns incrementally.
+    ///   scans decoded chunks incrementally. Lazily activated on the first NUL
+    ///   byte (UTF-16 ASCII always contains NULs), replaying the ring buffer's
+    ///   current contents to catch up the automaton.
     /// - **Block path** (fallback): decoded bytes are buffered in the slab and
     ///   scanned in a single block pass after streaming completes. Only activated
-    ///   when a NUL byte suggests wide-character content.
+    ///   when a NUL byte is observed and the stream DB is unavailable.
     ///
-    /// # Gate behavior
-    /// - When `tc.gate == Gate::AnchorsInDecoded`, enforce decoded-space gating
-    ///   when possible; otherwise fall back to prefilter-based gating.
-    /// - Gate enforcement is relaxed when the gate DB failed or when UTF-16
-    ///   anchors exist but the gate DB only covers raw patterns, to avoid
-    ///   false negatives on wide-encoded content.
+    /// ## Gate behavior
+    ///
+    /// When `tc.gate == Gate::AnchorsInDecoded`:
+    /// - **Preferred**: a dedicated Vectorscan gate stream (`vs_gate`) scans
+    ///   decoded chunks for anchor literals.
+    /// - **Fallback**: if the gate DB fails, enforcement is relaxed (false
+    ///   rejection is worse than a redundant scan).
+    /// - **UTF-16 caveat**: when UTF-16 anchors exist but the gate DB only
+    ///   covers raw patterns, enforcement is also relaxed to avoid false
+    ///   negatives on wide-encoded content.
     ///
     /// # Preconditions
-    /// - `encoded` is the bytes for the current decode span.
-    /// - `scratch` belongs to the current scan and has been reset.
+    /// - `encoded` slices into the root buffer or decode slab and must remain
+    ///   valid for this call.
+    /// - `scratch` belongs to the current scan. The following fields are reset
+    ///   at entry: `decode_ring`, `pending_windows`, `vs_stream_matches`,
+    ///   `pending_spans`, `span_streams`, `tmp_findings`.
     ///
     /// # Effects
-    /// - Populates `scratch` findings and pending decode spans.
-    /// - Falls back to `decode_span_fallback` if the stream path becomes unsafe
-    ///   (window cap exceeded or a window/span cannot be reconstructed).
+    /// - Populates `scratch.tmp_findings` (committed at end) and `pending_spans`
+    ///   (promoted to `work_q`). Updates decode budgets and dedupe state.
+    /// - On `force_full`, rolls back all streaming state (slab, budgets, staging
+    ///   buffers) and falls through to `decode_span_fallback`.
     /// - All Vectorscan scratch/stream resources are returned to `scratch` on
     ///   every exit path (normal, error, and force-full).
     #[allow(clippy::too_many_arguments)]
@@ -306,7 +348,8 @@ impl Engine {
         file_id: FileId,
         scratch: &mut ScanScratch,
     ) {
-        // Reset only touched counters to avoid clearing the full per-rule array.
+        // Reset only the per-(rule,variant) hit counters that were incremented in the
+        // previous stream call. This is O(touched) rather than O(rules×3).
         for idx in scratch.stream_hit_touched.drain() {
             let slot = idx as usize;
             if let Some(hit) = scratch.stream_hit_counts.get_mut(slot) {
@@ -408,13 +451,14 @@ impl Engine {
         let mut utf16_stream_ctx: Option<VsUtf16StreamMatchCtx> = None;
         let utf16_stream_cb = utf16_stream_match_callback();
 
-        // Materialize a decoded window and run the matching rule on it.
+        // Materialize the decoded window [lo, hi) and run the matched rule.
         //
-        // Resolution cascade:
-        //   1. Try to extract [lo, hi) from the decode ring (zero-copy).
-        //   2. If the ring has evicted those bytes, re-decode from `encoded`.
-        //   3. If re-decode also fails, set `force_full` to abort streaming
-        //      and fall back to full-buffer decode.
+        // Resolution cascade (cheapest first):
+        //   1. Ring buffer extraction — O(hi−lo), zero-copy when contiguous.
+        //   2. Re-decode from `encoded` — O(encoded.len()), replays the
+        //      transform to reconstruct evicted bytes.
+        //   3. Abort — sets `force_full`, causing the caller to discard all
+        //      streaming state and fall back to `decode_span_fallback`.
         let process_window = |win: PendingWindow,
                               hi: u64,
                               scratch: &mut ScanScratch,
@@ -454,7 +498,7 @@ impl Engine {
             // scratch fields. `window_bytes` is not mutated until after this slice is consumed,
             // and the slice never escapes this function.
             let bytes = unsafe { std::slice::from_raw_parts(bytes_ptr, bytes_len) };
-            let rule = &self.rules[win.rule_id as usize];
+            let rule = &self.rules_hot[win.rule_id as usize];
             match win.variant {
                 Variant::Raw => {
                     self.run_rule_on_raw_window_into(
@@ -492,11 +536,15 @@ impl Engine {
             }
         };
 
-        // Raw pointers avoid holding a `&mut ScanScratch` borrow while
-        // `pending_windows` (a field of `ScanScratch`) is mutably borrowed by
-        // `advance_and_drain`. The callback only touches *other* scratch fields
-        // (`window_bytes`, `out`, etc.), so there is no aliasing violation.
-        // All pointers are derived from stack locals and never escape this function.
+        // Raw pointers used in `advance_and_drain` callbacks.
+        //
+        // `advance_and_drain` holds `&mut scratch.pending_windows`. The callback
+        // must access other scratch fields (`window_bytes`, `tmp_findings`, etc.)
+        // through a raw pointer to avoid a double `&mut ScanScratch` borrow.
+        //
+        // SAFETY: No aliasing violation because the callback never touches
+        // `pending_windows` (the field under the existing `&mut`). All pointers
+        // derive from stack locals in this function and do not escape it.
         let scratch_ptr = scratch as *mut ScanScratch;
         let found_any_ptr = &mut found_any as *mut bool;
         let local_dropped_ptr = &mut local_dropped as *mut usize;
@@ -543,10 +591,12 @@ impl Engine {
         };
 
         let mut decoded_offset: u64 = 0;
-        // Streamed 128-bit MAC: computes a hash over all decoded bytes
-        // incrementally (chunk by chunk) so we can dedupe without buffering the
-        // entire decoded output. The fixed zero key is fine because this is a
-        // collision-resistant fingerprint, not a cryptographic authenticator.
+        // Streamed 128-bit fingerprint via AEGIS-128L MAC.
+        //
+        // Avoids buffering the full decoded output just for deduplication:
+        // each decoded chunk is fed to `mac.update()` and the final digest
+        // is checked against `scratch.seen`. A fixed zero key is acceptable
+        // because we need collision resistance, not authentication.
         let key = [0u8; 16];
         let mut mac = aegis::aegis128l::Aegis128LMac::<16>::new(&key);
 
@@ -635,12 +685,16 @@ impl Engine {
                 if let Some(db) = self.vs_utf16_stream.as_ref() {
                     let mut scanned_chunk = false;
                     if utf16_stream.is_none() && memchr(0, chunk).is_some() {
-                        // Lazily start the UTF-16 stream the first time we see a NUL byte.
-                        // UTF-16 encoded ASCII always contains NUL bytes (the high byte of
-                        // each code unit), so their absence means the decoded content is
-                        // purely single-byte and UTF-16 scanning would be wasted work.
-                        // When the stream starts late, we replay the ring buffer's current
-                        // contents (seg1/seg2) so the Vectorscan automaton catches up.
+                        // Lazily start the UTF-16 stream on the first NUL byte.
+                        //
+                        // Why NUL ⇒ UTF-16: every UTF-16 code unit for ASCII is two bytes
+                        // (e.g., 'A' = 0x41 0x00 LE or 0x00 0x41 BE), so a NUL-free
+                        // decoded stream cannot contain UTF-16-encoded ASCII and scanning
+                        // would be wasted work.
+                        //
+                        // Late start: replay the ring buffer's current contents (seg1/seg2)
+                        // so the Vectorscan automaton sees all decoded bytes produced before
+                        // this chunk.
                         let mut vs_utf16_scratch = match scratch.vs_utf16_stream_scratch.take() {
                             Some(s) => s,
                             None => match db.alloc_scratch() {
@@ -1370,7 +1424,7 @@ impl Engine {
                             if variant == Variant::Raw {
                                 continue;
                             }
-                            let rule = &self.rules[rid];
+                            let rule = &self.rules_hot[rid];
 
                             scratch.hit_acc_pool.take_into(pair, &mut scratch.windows);
                             if scratch.windows.is_empty() {
@@ -1489,21 +1543,22 @@ impl Engine {
         // Gate enforcement decision.
         //
         // The gate answers: "does the decoded content contain at least one
-        // anchor pattern?"  Three sources of evidence exist:
+        // anchor pattern?"  Three evidence sources, in priority order:
         //
-        // 1. `gate_hit != 0`        — the dedicated Vectorscan gate stream
-        //                              matched (highest confidence).
-        // 2. `prefilter_gate_hit`    — a Raw-variant anchor hit from the main
-        //                              prefilter stream (moderate confidence:
-        //                              covers raw but not UTF-16-only anchors).
-        // 3. Neither fired           — we can only enforce the gate safely when
-        //                              no UTF-16 anchors exist, because the
-        //                              prefilter may not have UTF-16 patterns.
+        // 1. `gate_hit != 0`        — dedicated Vectorscan gate stream matched.
+        //                              Highest confidence; covers both raw and
+        //                              UTF-16 anchors.
+        // 2. `prefilter_gate_hit`    — a Raw-variant anchor from the main
+        //                              prefilter stream. Moderate confidence:
+        //                              covers raw anchors only.
+        // 3. Neither fired           — safe to enforce only when no UTF-16
+        //                              anchors exist (prefilter has no
+        //                              wide-encoded patterns).
         //
-        // We relax enforcement (set `enforce_gate = false`) when:
-        // - the gate DB failed to open/scan (avoid false rejection), or
-        // - we have UTF-16 anchors but only prefilter evidence, since the
-        //   prefilter might miss wide-encoded content.
+        // Enforcement is relaxed (`enforce_gate = false`) when:
+        // - Gate DB failed to open/scan (avoid false rejection), or
+        // - UTF-16 anchors exist but only prefilter evidence is available
+        //   (prefilter cannot see wide-encoded content → false negatives).
         let gate_satisfied = if gate_db_active || gate_hit != 0 {
             gate_hit != 0
         } else {
@@ -1557,16 +1612,8 @@ impl Engine {
         if local_dropped > 0 {
             scratch.findings_dropped = scratch.findings_dropped.saturating_add(local_dropped);
         }
-        // Commit staged findings.
-        //
-        // During streaming, `run_rule_on_*_window_into` writes to `tmp_findings`
-        // rather than `scratch.out` directly. This lets us discard all findings
-        // atomically if the stream later triggers `force_full` or fails dedupe.
-        // Now that the stream succeeded and the dedupe check passed, we move the
-        // staged records into the permanent output.
-        //
-        // `std::mem::take` + put-back avoids reborrowing `scratch` while
-        // iterating over the findings vec.
+        // Commit staged findings now that streaming succeeded and dedupe passed.
+        // `mem::take` + put-back avoids double-borrowing `scratch` while draining.
         let mut tmp_findings = std::mem::take(&mut scratch.tmp_findings);
         let mut tmp_drop_hint_end = std::mem::take(&mut scratch.tmp_drop_hint_end);
         let mut tmp_norm_hash = std::mem::take(&mut scratch.tmp_norm_hash);
@@ -1583,11 +1630,9 @@ impl Engine {
         scratch.tmp_drop_hint_end = tmp_drop_hint_end;
         scratch.tmp_norm_hash = tmp_norm_hash;
 
-        // Promote pending child decode spans into the work queue.
-        //
-        // Spans discovered by streaming span detectors (Base64/URL) were
-        // deferred until now because `IfNoFindingsInThisBuffer` transforms
-        // should be skipped if the current buffer already yielded findings.
+        // Promote deferred child spans into the work queue.
+        // Deferred because `IfNoFindingsInThisBuffer` transforms must see the
+        // final `found_any` state before deciding whether to enqueue.
         let found_any_in_buf = found_any;
         let mut enqueued = 0usize;
         for pending in scratch.pending_spans.drain(..) {

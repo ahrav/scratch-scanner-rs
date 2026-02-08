@@ -10,8 +10,8 @@
 //! # Pattern id layout
 //! - Raw rule expressions are compiled first; their ids are `0..raw_rule_count`.
 //! - Optional anchor literal patterns are appended; their ids start at `anchor_id_base`.
-//! - `raw_rule_ids` maps raw pattern index -> rule id; anchor patterns map via
-//!   the `anchor_*` tables.
+//! - `raw_meta` maps raw pattern index -> (`rule_id`, `max_width`, `seed_radius`);
+//!   anchor patterns map via the `anchor_*` tables.
 //!
 //! # Coordinate systems
 //! - Raw/UTF-16 anchor scans operate on raw-byte offsets in the scanned buffer.
@@ -83,21 +83,26 @@ use super::scratch::ScanScratch;
 /// The database is immutable after compilation and can be shared across
 /// threads, but each thread must allocate its own `VsScratch`.
 ///
-/// Raw pattern ids follow compile order; `raw_rule_ids` maps expression index
-/// -> rule id. If we fall back to per-rule compilation, `raw_missing_rules`
-/// records rejected rules (and the build fails). Optional UTF-16 anchor patterns are
-/// appended after raw patterns and resolved via the `anchor_*` mapping tables.
+/// Raw pattern ids follow compile order; `raw_meta` maps expression index to
+/// scan metadata (`rule_id`, `max_width`, `seed_radius`) in one AoS load. If
+/// we fall back to per-rule compilation, `raw_missing_rules` records rejected
+/// rules (and the build fails). Optional UTF-16 anchor patterns are appended
+/// after raw patterns and resolved via the `anchor_*` mapping tables.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct RawPatternMeta {
+    rule_id: u32,
+    match_width: u32,
+    seed_radius: u32,
+}
+
 pub(crate) struct VsPrefilterDb {
     /// Compiled Vectorscan block-mode database.
     db: *mut vs::hs_database_t,
     /// Number of raw rule patterns in the database.
     raw_rule_count: u32,
-    /// Per-raw-pattern seed radius for window expansion.
-    raw_seed_radius: Vec<u32>,
-    /// Maps raw pattern index to rule id.
-    raw_rule_ids: Vec<u32>,
-    /// Per-raw-pattern maximum match width from `hs_expression_info`.
-    raw_match_widths: Vec<u32>,
+    /// Per-raw-pattern metadata (rule id + width + seed radius).
+    raw_meta: Vec<RawPatternMeta>,
     /// Rule ids that failed individual compilation (fallback path).
     raw_missing_rules: Vec<u32>,
     /// Pattern id where anchor literals begin (equals `raw_rule_count`).
@@ -1743,9 +1748,14 @@ impl VsPrefilterDb {
             }
         };
 
-        let raw_rule_ids: Vec<u32> = raw_kept.iter().map(|p| p.rule_id).collect();
-        let raw_seed_radius: Vec<u32> = raw_kept.iter().map(|p| p.seed_radius).collect();
-        let raw_match_widths: Vec<u32> = raw_kept.iter().map(|p| p.max_width).collect();
+        let raw_meta: Vec<RawPatternMeta> = raw_kept
+            .iter()
+            .map(|p| RawPatternMeta {
+                rule_id: p.rule_id,
+                match_width: p.max_width,
+                seed_radius: p.seed_radius,
+            })
+            .collect();
         let raw_rule_count = raw_kept.len() as u32;
 
         let (anchor_id_base, anchor_pat_count, anchor_targets, anchor_pat_offsets, anchor_pat_lens) =
@@ -1769,9 +1779,7 @@ impl VsPrefilterDb {
         Ok(Self {
             db,
             raw_rule_count,
-            raw_seed_radius,
-            raw_rule_ids,
-            raw_match_widths,
+            raw_meta,
             raw_missing_rules,
             anchor_id_base,
             anchor_pat_count,
@@ -1846,9 +1854,7 @@ impl VsPrefilterDb {
             scratch: scratch as *mut ScanScratch,
             hay_len: len_u32,
             raw_rule_count: self.raw_rule_count,
-            raw_seed_radius: self.raw_seed_radius.as_ptr(),
-            raw_rule_ids: self.raw_rule_ids.as_ptr(),
-            raw_match_widths: self.raw_match_widths.as_ptr(),
+            raw_meta: self.raw_meta.as_ptr(),
             anchor_id_base: self.anchor_id_base,
             anchor_pat_count: self.anchor_pat_count,
             anchor_targets: self.anchor_targets.as_ptr(),
@@ -1885,15 +1891,12 @@ impl VsPrefilterDb {
 /// - `hay_len` matches the length passed to `hs_scan`.
 /// - If `anchor_pat_count > 0`, the anchor mapping tables are valid and
 ///   `anchor_pat_offsets` has length `anchor_pat_count + 1`.
-/// - `raw_rule_ids`/`raw_seed_radius`/`raw_match_widths` each have length
-///   `raw_rule_count`.
+/// - `raw_meta` has length `raw_rule_count`.
 struct VsMatchCtx {
     scratch: *mut ScanScratch,
     hay_len: u32,
     raw_rule_count: u32,
-    raw_seed_radius: *const u32,
-    raw_rule_ids: *const u32,
-    raw_match_widths: *const u32,
+    raw_meta: *const RawPatternMeta,
     anchor_id_base: u32,
     anchor_pat_count: u32,
     anchor_targets: *const VsAnchorTarget,
@@ -1943,7 +1946,8 @@ extern "C" fn vs_on_match(
     let c = unsafe { &mut *(ctx as *mut VsMatchCtx) };
     if id < c.raw_rule_count {
         let raw_idx = id as usize;
-        let rid = unsafe { *c.raw_rule_ids.add(raw_idx) as usize };
+        let meta = unsafe { *c.raw_meta.add(raw_idx) };
+        let rid = meta.rule_id as usize;
 
         // SAFETY: `scratch` is valid for the duration of the scan and is not used concurrently.
         let scratch = unsafe { &mut *c.scratch };
@@ -1954,13 +1958,13 @@ extern "C" fn vs_on_match(
         if end > c.hay_len {
             return 0;
         }
-        let max_width = unsafe { *c.raw_match_widths.add(raw_idx) };
+        let max_width = meta.match_width;
         let start = if max_width == u32::MAX {
             0
         } else {
             end.saturating_sub(max_width)
         };
-        let seed = unsafe { *c.raw_seed_radius.add(raw_idx) };
+        let seed = meta.seed_radius;
         let lo = start.saturating_sub(seed);
         let hi = end.saturating_add(seed).min(c.hay_len);
 

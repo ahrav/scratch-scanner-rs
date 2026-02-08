@@ -429,7 +429,7 @@ generates many overlapping windows.
 ```rust
 FindingRec {
     file_id: FileId(0),
-    rule_id: 1,              // Index into Engine.rules
+    rule_id: 1,              // Index into Engine.rules_hot / Engine.rules_cold
     span_start: 100,
     span_end: 140,
     root_hint_start: 100,    // Offset in original file

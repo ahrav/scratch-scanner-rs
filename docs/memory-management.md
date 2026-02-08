@@ -607,7 +607,7 @@ pub struct ScanScratch {
     seen_findings: FixedSet128,
     decode_ring: ByteRing,
     pending_windows: TimingWheel<PendingWindow, 1>,
-    entropy_scratch: EntropyScratch,
+    entropy_scratch: Option<Box<EntropyScratch>>,
     root_span_map_ctx: Option<RootSpanMapCtx>,
     // ... additional cold fields omitted ...
 }
@@ -619,3 +619,5 @@ All vectors are reused across chunks via `reset_for_scan()`:
 - Avoids per-chunk allocation overhead
 - `#[repr(C)]` + `_cold_boundary` guarantees the first cold field starts on a
   64-byte boundary, reducing hot/cold cache-line interference
+- `entropy_scratch` is only allocated when the engine has entropy-gated rules
+- Streaming scratch vectors/ring are pre-sized only when active transforms exist
