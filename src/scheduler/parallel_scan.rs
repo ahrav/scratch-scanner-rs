@@ -101,6 +101,7 @@ use std::sync::Arc;
 trait EntryLike {
     fn file_type(&self) -> Option<std::fs::FileType>;
     fn metadata(&self) -> io::Result<std::fs::Metadata>;
+    #[cfg(debug_assertions)]
     fn path(&self) -> &Path;
     fn into_path(self) -> std::path::PathBuf
     where
@@ -118,6 +119,7 @@ impl EntryLike for ignore::DirEntry {
         ignore::DirEntry::metadata(self).map_err(io::Error::other)
     }
 
+    #[cfg(debug_assertions)]
     #[inline(always)]
     fn path(&self) -> &Path {
         ignore::DirEntry::path(self)
