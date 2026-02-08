@@ -24,6 +24,7 @@ use crate::git_scan::{
 use crate::scheduler::{parallel_scan_dir, ParallelScanConfig};
 use crate::{demo_rules, demo_transforms, demo_tuning, AnchorMode, AnchorPolicy, Engine};
 
+use super::cli::TransformFilter;
 use super::source::git::{EmptyWatermarkStore, GitCliResolver};
 use super::{EventFormat, FsScanConfig, GitSourceConfig, ScanConfig, SourceConfig};
 
@@ -34,9 +35,10 @@ use super::{EventFormat, FsScanConfig, GitSourceConfig, ScanConfig, SourceConfig
 pub fn run(config: ScanConfig) -> io::Result<()> {
     let event_format = config.event_format;
     let rules_file = config.rules_file;
+    let transform_filter = config.transform_filter;
     match config.source {
-        SourceConfig::Fs(fs_cfg) => run_fs(fs_cfg, event_format, rules_file),
-        SourceConfig::Git(git_cfg) => run_git(git_cfg, event_format, rules_file),
+        SourceConfig::Fs(fs_cfg) => run_fs(fs_cfg, event_format, rules_file, &transform_filter),
+        SourceConfig::Git(git_cfg) => run_git(git_cfg, event_format, rules_file, &transform_filter),
     }
 }
 
@@ -48,13 +50,14 @@ fn run_fs(
     cfg: FsScanConfig,
     event_format: EventFormat,
     rules_file: Option<PathBuf>,
+    transform_filter: &TransformFilter,
 ) -> io::Result<()> {
     use super::events::{ScanEvent, SummaryEvent};
     use super::SourceKind;
 
     let t0 = Instant::now();
     let rules = load_rules_for_scan(rules_file.as_deref());
-    let transforms = demo_transforms();
+    let transforms = apply_transform_filter(demo_transforms(), transform_filter);
     let mut tuning = demo_tuning();
     if let Some(depth) = cfg.decode_depth {
         tuning.max_transform_depth = depth;
@@ -138,9 +141,10 @@ fn run_git(
     cfg: GitSourceConfig,
     event_format: EventFormat,
     rules_file: Option<PathBuf>,
+    transform_filter: &TransformFilter,
 ) -> io::Result<()> {
     let rules = load_rules_for_scan(rules_file.as_deref());
-    let transforms = demo_transforms();
+    let transforms = apply_transform_filter(demo_transforms(), transform_filter);
     let mut tuning = demo_tuning();
     if let Some(depth) = cfg.decode_depth {
         tuning.max_transform_depth = depth;
@@ -508,6 +512,101 @@ fn print_git_perf_breakdown(report: &git_scan::GitScanReport, config: &GitScanCo
         cache_reject_hist.bytes_max / 1024
     );
     eprintln!("  top_buckets: {}", cache_reject_hist.format_top(5));
+}
+
+/// Retain only the transforms selected by the CLI `--transforms` flag.
+///
+/// Filtering happens *before* engine construction and policy hashing, so
+/// disabling a transform correctly affects both the scan and the git
+/// incremental-scan cache key.
+///
+/// # Name mapping
+///
+/// The `TransformId` → CLI-name mapping here must stay in sync with
+/// [`KNOWN_TRANSFORMS`](super::cli::KNOWN_TRANSFORMS).
+fn apply_transform_filter(
+    transforms: Vec<crate::api::TransformConfig>,
+    filter: &TransformFilter,
+) -> Vec<crate::api::TransformConfig> {
+    use crate::api::TransformId;
+
+    match filter {
+        TransformFilter::All => transforms,
+        TransformFilter::None => Vec::new(),
+        TransformFilter::Only(names) => transforms
+            .into_iter()
+            .filter(|t| {
+                let tag = match t.id {
+                    TransformId::UrlPercent => "url",
+                    TransformId::Base64 => "base64",
+                };
+                names.iter().any(|n| n == tag)
+            })
+            .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::{TransformConfig, TransformId};
+
+    fn test_transforms() -> Vec<TransformConfig> {
+        crate::demo_transforms()
+    }
+
+    fn ids(ts: &[TransformConfig]) -> Vec<TransformId> {
+        ts.iter().map(|t| t.id).collect()
+    }
+
+    #[test]
+    fn filter_all_keeps_both() {
+        let result = apply_transform_filter(test_transforms(), &TransformFilter::All);
+        assert_eq!(ids(&result), vec![TransformId::UrlPercent, TransformId::Base64]);
+    }
+
+    #[test]
+    fn filter_none_returns_empty() {
+        let result = apply_transform_filter(test_transforms(), &TransformFilter::None);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn filter_only_base64() {
+        let filter = TransformFilter::Only(vec!["base64".to_string()]);
+        let result = apply_transform_filter(test_transforms(), &filter);
+        assert_eq!(ids(&result), vec![TransformId::Base64]);
+    }
+
+    #[test]
+    fn filter_only_url() {
+        let filter = TransformFilter::Only(vec!["url".to_string()]);
+        let result = apply_transform_filter(test_transforms(), &filter);
+        assert_eq!(ids(&result), vec![TransformId::UrlPercent]);
+    }
+
+    #[test]
+    fn filter_both_preserves_order() {
+        let filter = TransformFilter::Only(vec!["url".to_string(), "base64".to_string()]);
+        let result = apply_transform_filter(test_transforms(), &filter);
+        assert_eq!(ids(&result), vec![TransformId::UrlPercent, TransformId::Base64]);
+    }
+
+    #[test]
+    fn filter_none_on_empty_input() {
+        let result = apply_transform_filter(vec![], &TransformFilter::All);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn filter_unmatched_name_returns_empty() {
+        // If a name doesn't match any transform, that name is simply a no-op.
+        // (CLI validation rejects unknown names before we get here, but the
+        // filter itself should handle it gracefully.)
+        let filter = TransformFilter::Only(vec!["rot13".to_string()]);
+        let result = apply_transform_filter(test_transforms(), &filter);
+        assert!(result.is_empty());
+    }
 }
 
 /// Load rules from a YAML file, falling back to the compiled-in set.
