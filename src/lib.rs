@@ -37,6 +37,7 @@
 
 pub mod archive;
 pub mod b64_yara_gate;
+pub mod content_policy;
 pub mod git_scan;
 pub mod lsm;
 pub mod pipeline;

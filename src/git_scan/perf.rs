@@ -109,6 +109,8 @@ pub struct GitPerfStats {
     pub scan_chunker_bypass_count: u64,
     /// Blobs skipped because they appear to be binary (NUL byte detected).
     pub scan_binary_skip_count: u64,
+    /// Blobs where text was extracted from a known binary format (.ipynb, .class, etc.).
+    pub scan_binary_extract_count: u64,
     /// Chunks where the hoisted prefilter bypassed reset+work-queue setup.
     pub scan_prefilter_bypass_count: u64,
 }
@@ -205,6 +207,8 @@ static SCAN_CHUNKER_BYPASS_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "git-perf")]
 static SCAN_BINARY_SKIP_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "git-perf")]
+static SCAN_BINARY_EXTRACT_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "git-perf")]
 static SCAN_PREFILTER_BYPASS_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Reset all counters to zero.
@@ -258,6 +262,7 @@ pub fn reset() {
         SCAN_FINDINGS_COUNT.store(0, Ordering::Relaxed);
         SCAN_CHUNKER_BYPASS_COUNT.store(0, Ordering::Relaxed);
         SCAN_BINARY_SKIP_COUNT.store(0, Ordering::Relaxed);
+        SCAN_BINARY_EXTRACT_COUNT.store(0, Ordering::Relaxed);
         SCAN_PREFILTER_BYPASS_COUNT.store(0, Ordering::Relaxed);
     }
 }
@@ -315,6 +320,7 @@ pub fn snapshot() -> GitPerfStats {
             scan_findings_count: SCAN_FINDINGS_COUNT.load(Ordering::Relaxed),
             scan_chunker_bypass_count: SCAN_CHUNKER_BYPASS_COUNT.load(Ordering::Relaxed),
             scan_binary_skip_count: SCAN_BINARY_SKIP_COUNT.load(Ordering::Relaxed),
+            scan_binary_extract_count: SCAN_BINARY_EXTRACT_COUNT.load(Ordering::Relaxed),
             scan_prefilter_bypass_count: SCAN_PREFILTER_BYPASS_COUNT.load(Ordering::Relaxed),
         }
     }
@@ -657,6 +663,14 @@ pub fn record_scan_binary_skip() {
     #[cfg(feature = "git-perf")]
     {
         SCAN_BINARY_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Record a blob where text was extracted from a known binary format.
+pub fn record_scan_binary_extract() {
+    #[cfg(feature = "git-perf")]
+    {
+        SCAN_BINARY_EXTRACT_COUNT.fetch_add(1, Ordering::Relaxed);
     }
 }
 

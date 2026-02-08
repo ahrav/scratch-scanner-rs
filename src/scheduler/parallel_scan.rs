@@ -279,6 +279,10 @@ pub struct ParallelScanConfig {
     /// Archive scanning configuration.
     pub archive: ArchiveConfig,
 
+    /// When `true`, skip files that appear to be binary (NUL byte heuristic).
+    /// Defaults to `true`. Set to `false` via `--scan-binary` to scan everything.
+    pub skip_binary: bool,
+
     /// Structured event sink for finding output.
     ///
     /// All findings are emitted as structured events through this sink.
@@ -301,6 +305,7 @@ impl Default for ParallelScanConfig {
             respect_gitignore: true,
             max_file_size: 100 * 1024 * 1024, // 100 MiB
             archive: ArchiveConfig::default(),
+            skip_binary: true,
             event_sink: Arc::new(crate::unified::events::NullEventSink),
         }
     }
@@ -320,6 +325,7 @@ impl std::fmt::Debug for ParallelScanConfig {
             .field("respect_gitignore", &self.respect_gitignore)
             .field("max_file_size", &self.max_file_size)
             .field("archive", &self.archive)
+            .field("skip_binary", &self.skip_binary)
             .field("event_sink", &"<dyn EventSink>")
             .finish()
     }
@@ -343,6 +349,7 @@ impl ParallelScanConfig {
             seed: self.seed,
             dedupe_within_chunk: true,
             archive: self.archive.clone(),
+            skip_binary: self.skip_binary,
             event_sink: self.event_sink.clone(),
         }
     }
@@ -632,6 +639,7 @@ mod tests {
             respect_gitignore: false,
             max_file_size: 10 * 1024 * 1024,
             archive: ArchiveConfig::default(),
+            skip_binary: true,
             event_sink: Arc::new(crate::unified::events::NullEventSink),
         }
     }

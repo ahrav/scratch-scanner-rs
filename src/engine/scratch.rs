@@ -6,10 +6,7 @@
 //! coordinates during transform scans. Scratch state is single-threaded and
 //! reused across chunks to keep the hot path allocation-free.
 
-use crate::api::{
-    DecodeStep, FileId, FindingRec, StepId, TransformConfig, TransformId,
-    STEP_ROOT,
-};
+use crate::api::{DecodeStep, FileId, FindingRec, StepId, TransformConfig, TransformId, STEP_ROOT};
 use crate::scratch_memory::ScratchVec;
 use crate::stdx::{ByteRing, FixedSet128, TimingWheel};
 

@@ -28,6 +28,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use crate::content_policy::{self, ContentVerdict};
 use crate::scheduler::AllocGuard;
 use crate::unified::events::{EventSink, FindingEvent, NullEventSink, ScanEvent};
 use crate::unified::SourceKind;
@@ -51,12 +52,15 @@ pub struct EngineAdapterConfig {
     /// The adapter will clamp this to at least `required_overlap + 1`.
     /// Use `0` to select the default (`DEFAULT_CHUNK_BYTES`).
     pub chunk_bytes: usize,
+    /// When `true`, scan binary blobs instead of skipping them.
+    pub scan_binary: bool,
 }
 
 impl Default for EngineAdapterConfig {
     fn default() -> Self {
         Self {
             chunk_bytes: DEFAULT_CHUNK_BYTES,
+            scan_binary: false,
         }
     }
 }
@@ -168,6 +172,14 @@ pub struct EngineAdapter<'a> {
     next_file_id: u32,
     /// Structured event sink for streaming findings.
     event_sink: Arc<dyn EventSink>,
+    /// When `true`, skip the binary content check and scan everything.
+    scan_binary: bool,
+    /// Reusable buffer for binary format text extraction.
+    #[cfg(feature = "binary-extract")]
+    extract_buf: Vec<u8>,
+    /// Temporary workspace for extractors (e.g. per-entry reads in JARs).
+    #[cfg(feature = "binary-extract")]
+    extract_scratch: Vec<u8>,
 }
 
 impl<'a> EngineAdapter<'a> {
@@ -204,6 +216,11 @@ impl<'a> EngineAdapter<'a> {
             chunker: RingChunker::new(chunk_bytes, overlap),
             next_file_id: 0,
             event_sink,
+            scan_binary: config.scan_binary,
+            #[cfg(feature = "binary-extract")]
+            extract_buf: Vec::with_capacity(crate::content_policy::extract::EXTRACT_OUTPUT_CAP),
+            #[cfg(feature = "binary-extract")]
+            extract_scratch: Vec::with_capacity(crate::content_policy::extract::JAR_ENTRY_CAP),
         }
     }
 
@@ -270,7 +287,7 @@ impl<'a> EngineAdapter<'a> {
         let file_id = FileId(self.next_file_id);
         self.next_file_id = self.next_file_id.wrapping_add(1);
 
-        self.scan_blob_into_buf(file_id, bytes)?;
+        self.scan_blob_into_buf(file_id, path, bytes)?;
         self.stream_findings(path);
         let span = self.record_findings()?;
         self.results.push(ScannedBlob {
@@ -301,15 +318,58 @@ impl<'a> EngineAdapter<'a> {
         }
     }
 
+    /// Classify, optionally extract, and scan a single blob into `findings_buf`.
+    ///
+    /// When `scan_binary` is false the blob is classified via
+    /// [`content_policy::classify_content`]. Text blobs are scanned directly;
+    /// extractable binary formats (`.class`, `.pyc`, etc.) have their text
+    /// extracted first (feature-gated on `binary-extract`); opaque binaries
+    /// are skipped entirely.
+    ///
+    /// On return, `self.findings_buf` contains the sorted+deduped findings
+    /// for this blob. The caller is responsible for streaming them to the
+    /// event sink and recording them in the findings arena.
     fn scan_blob_into_buf(
         &mut self,
         file_id: FileId,
+        path: &[u8],
         bytes: &[u8],
     ) -> Result<(), EngineAdapterError> {
         self.findings_buf.clear();
-        if is_likely_binary(bytes, 8192) {
-            perf::record_scan_binary_skip();
-            return Ok(());
+        if !self.scan_binary {
+            match content_policy::classify_content(bytes, path, content_policy::CHECK_LEN) {
+                ContentVerdict::Binary => {
+                    perf::record_scan_binary_skip();
+                    return Ok(());
+                }
+                ContentVerdict::BinaryExtractable(_fmt) => {
+                    #[cfg(feature = "binary-extract")]
+                    {
+                        use crate::content_policy::extract::{extract_content, ExtractResult};
+                        if extract_content(
+                            _fmt,
+                            bytes,
+                            &mut self.extract_buf,
+                            &mut self.extract_scratch,
+                        ) == ExtractResult::Ok
+                        {
+                            perf::record_scan_binary_extract();
+                            return scan_blob_chunked_with_chunker(
+                                self.engine,
+                                &mut self.scratch,
+                                file_id,
+                                &self.extract_buf,
+                                self.overlap,
+                                &mut self.chunker,
+                                &mut self.findings_buf,
+                            );
+                        }
+                    }
+                    perf::record_scan_binary_skip();
+                    return Ok(());
+                }
+                ContentVerdict::Text => {}
+            }
         }
         scan_blob_chunked_with_chunker(
             self.engine,
@@ -349,7 +409,7 @@ impl PackObjectSink for EngineAdapter<'_> {
         let file_id = FileId(self.next_file_id);
         self.next_file_id = self.next_file_id.wrapping_add(1);
 
-        self.scan_blob_into_buf(file_id, bytes)?;
+        self.scan_blob_into_buf(file_id, path, bytes)?;
         self.stream_findings(path);
         let span = self.record_findings()?;
         self.results.push(ScannedBlob {
@@ -415,20 +475,6 @@ fn scan_blob_chunked_into(
 ) -> Result<(), EngineAdapterError> {
     let mut chunker = RingChunker::new(chunk_bytes, overlap);
     scan_blob_chunked_with_chunker(engine, scratch, file_id, blob, overlap, &mut chunker, out)
-}
-
-/// Returns `true` if the first `check_len` bytes of `data` contain a NUL byte,
-/// indicating the blob is likely binary (images, compiled objects, etc.).
-///
-/// Uses `memchr` for SIMD-accelerated scanning, matching Git's own
-/// `buffer_is_binary` heuristic. Empty blobs are not considered binary.
-#[inline]
-fn is_likely_binary(data: &[u8], check_len: usize) -> bool {
-    if data.is_empty() {
-        return false;
-    }
-    let end = data.len().min(check_len);
-    memchr::memchr(0, &data[..end]).is_some()
 }
 
 /// Scan a blob using a reusable chunker and optional allocation guard.
@@ -600,8 +646,10 @@ fn scan_chunk(
 /// A single chunk window produced by the ring chunker.
 ///
 /// Each view represents a contiguous slice of a blob, potentially including
-/// an overlap prefix from the previous window. The `is_first` flag prevents
-/// the first window's prefix from being treated as overlap.
+/// an overlap prefix from the previous window. After scanning, findings
+/// whose `root_hint_end` falls within the overlap prefix are dropped to
+/// prevent double-reporting — except for the first window (`is_first`),
+/// where no prior window exists to own those bytes.
 struct ChunkView<'a> {
     /// Absolute start offset of `window` within the blob.
     base: u64,
@@ -617,6 +665,19 @@ struct ChunkView<'a> {
 /// as they fill. The ring retains `overlap` trailing bytes between windows
 /// so the scan engine can detect secrets that straddle chunk boundaries.
 /// A final partial window is emitted by `flush`.
+///
+/// # Usage protocol
+///
+/// 1. Construct once with `new(chunk_bytes, overlap)`.
+/// 2. Call `feed(data, callback)` — may invoke the callback zero or more
+///    times, once per full `chunk_bytes` window.
+/// 3. Call `flush(callback)` — emits the final partial window (if any)
+///    and resets internal state for reuse.
+/// 4. To reuse across blobs, call `reset()` before the next `feed` cycle.
+///
+/// The first emitted window has `is_first = true`, which tells the scan
+/// layer not to drop findings in the overlap prefix (there is no prior
+/// window whose "new bytes" region owns them).
 ///
 /// # Invariant
 /// `chunk_bytes > overlap`, enforced at construction.
@@ -854,9 +915,10 @@ mod tests {
         assert_eq!(adapter.results().len(), 1);
     }
 
-    /// is_likely_binary edge cases.
+    /// is_likely_binary edge cases (delegated to content_policy).
     #[test]
     fn is_likely_binary_edge_cases() {
+        use crate::content_policy::is_likely_binary;
         // Empty blob is not binary.
         assert!(!is_likely_binary(b"", 8192));
         // All-text is not binary.
