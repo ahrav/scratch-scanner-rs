@@ -260,7 +260,7 @@ mod tests {
     fn rules_error_source_chains() {
         use std::error::Error;
 
-        let io_err = RulesError::Io(std::io::Error::new(std::io::ErrorKind::Other, "test"));
+        let io_err = RulesError::Io(std::io::Error::other("test"));
         assert!(io_err.source().is_some());
 
         let no_rules = RulesError::NoRules;
