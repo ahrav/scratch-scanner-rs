@@ -62,7 +62,7 @@ flowchart LR
 
 Span finders execute **single-pass scans** to identify candidate encoding spans:
 
-- **URL Percent**: Scans URL-ish runs (RFC3986 unreserved/reserved + '%' and '+'), keeps runs containing at least one escape
+- **URL Percent**: Scans URL-ish runs (RFC3986 unreserved/reserved + '%' and '+'), keeps runs containing at least one trigger byte (`%`, and `+` when `plus_to_space` is enabled)
 - **Base64**: Scans base64 alphabet runs (including allowed whitespace), trims trailing whitespace
 
 Both finders:
@@ -77,7 +77,7 @@ Streaming decoders process each span:
 - **Single-pass, O(1) memory**: No intermediate buffers; output emitted in chunks
 - **Bounded chunks**: 16 KiB output buffer (`STREAM_DECODE_CHUNK_BYTES`)
 - **Callback-based**: Emit decoded bytes via `on_bytes` callbacks; caller can abort early via `ControlFlow::Break()`
-- **Error handling**: Errors stop the stream; some bytes may have been emitted before error
+- **Error handling**: URL decode is infallible; Base64 decode errors stop the stream and some bytes may have been emitted before error
 
 ## Span Detection Details
 
@@ -90,8 +90,8 @@ The URL span finder identifies runs of "URL-ish" characters that contain at leas
 ```rust
 // A span qualifies if:
 // 1. Run is entirely URL-ish (RFC3986 unreserved/reserved + '%' + '+')
-// 2. Contains at least one '%' (required always)
-// 3. Contains at least one '+' (required if plus_to_space enabled)
+// 2. Contains at least one trigger byte
+// 3. Trigger is '%' always; '+' is also a trigger when plus_to_space is enabled
 // 4. Run length >= min_len and <= max_len
 ```
 
@@ -108,7 +108,7 @@ URL-ish bytes include:
 For streaming input, `UrlSpanStream` maintains state across chunk boundaries:
 
 ```rust
-pub struct UrlSpanStream {
+pub(super) struct UrlSpanStream {
     min_len: usize,              // Minimum span size
     max_len: usize,              // Maximum span size (splits long runs)
     plus_to_space: bool,         // '+' counts as trigger
@@ -123,13 +123,13 @@ pub struct UrlSpanStream {
 **Example: Span Finding**
 
 ```
-Input: "query=%48%65%6C%6C%6F+not_encoded"
-       ^^^^^^ URL-ish run with 3 '%' triggers
+Input: "query=%48%65%6C%6C%6F next"
+       ^^^^^^ URL-ish run with 5 '%' triggers
 
 Output spans:
-  [6, 22)  → "%48%65%6C%6C%6F" (triggers > 0, len >= min_len)
+  [6, 21)  → "%48%65%6C%6C%6F" (triggers > 0, len >= min_len)
 
-Note: "+not_encoded" skipped (no '%' trigger, '+' alone insufficient)
+Note: `'+'` is only a trigger when `plus_to_space=true`.
 ```
 
 ### Base64-Encoding Spans
@@ -141,7 +141,7 @@ The Base64 span finder identifies runs of base64 alphabet with optional allowed 
 ```rust
 // A span qualifies if:
 // 1. Run is base64 alphabet (A-Za-z0-9+/-_=) + allowed whitespace
-// 2. Contains at least min_chars base64 alphabet bytes
+// 2. Contains at least min_chars non-padding base64 chars
 // 3. Span trimmed to last base64 byte (trailing whitespace removed)
 // 4. Total run length <= max_len
 ```
@@ -150,20 +150,22 @@ The Base64 span finder identifies runs of base64 alphabet with optional allowed 
 
 - **Base64 alphabet**: `[A-Za-z0-9+/=-_]` (standard + URL-safe variants)
 - **Allowed whitespace**: `\t`, `\r`, `\n`, optionally space (if `base64_allow_space_ws`)
-- **Whitespace not counted** toward `min_chars` or `max_len`
+- **Whitespace not counted** toward `min_chars` (but it does count toward `max_len`)
 
 **Chunked Processing: `Base64SpanStream`**
 
 ```rust
-pub struct Base64SpanStream {
-    min_chars: usize,            // Min base64 alphabet bytes (excludes whitespace)
+pub(super) struct Base64SpanStream {
+    min_chars: usize,            // Min non-padding base64 chars (excludes whitespace and '=')
     max_len: usize,              // Max run length including whitespace
     allow_space_ws: bool,        // Include space in allowed whitespace
     in_run: bool,                // Currently in base64 run
+    pad_seen: bool,              // Seen '=' in current run (padding-tail mode)
     start: u64,                  // Absolute start offset
     run_len: usize,              // Total run length
-    b64_chars: usize,            // Count of base64 alphabet bytes
-    last_b64: u64,               // Offset of last base64 byte (for trimming)
+    b64_chars: usize,            // Count of non-padding base64 chars
+    have_b64: bool,              // Seen at least one non-padding base64 char
+    last_b64: u64,               // Offset of last base64 byte (including '=')
     done: bool,                  // Stream stopped early
 }
 ```
@@ -175,7 +177,7 @@ Input: "data:SGVsbG8gV29y bGQ=extra"
         ^^^^^^^^^^^^^^^^^^^^^ base64 run (includes space)
 
 Alphabet count: 16 (spaces not counted)
-Output span: [5, 24)  → "SGVsbG8gV29y bGQ=" (trimmed to last base64 byte)
+Output span: [5, 22)  → "SGVsbG8gV29y bGQ=" (trimmed to last base64 byte)
 ```
 
 ## Decoding Logic
@@ -347,6 +349,9 @@ Long runs are split at `max_len` boundaries to bound worst-case O(N) scans:
 - No intermediate allocations
 - Chunks emitted via callback
 
+The module does not enforce per-span output caps itself. Engine callers enforce
+`TransformConfig::max_decoded_bytes` (for example via `DecodeSlab::append_stream_decode`).
+
 **Caller responsibility:**
 
 ```rust
@@ -368,7 +373,7 @@ on_bytes = |chunk| {
 Before expensive span scanning, a quick prefilter checks for trigger bytes:
 
 ```rust
-pub fn transform_quick_trigger(tc: &TransformConfig, buf: &[u8]) -> bool {
+pub(super) fn transform_quick_trigger(tc: &TransformConfig, buf: &[u8]) -> bool {
     match tc.id {
         TransformId::UrlPercent => {
             // URL spans require at least one '%'
@@ -393,7 +398,7 @@ pub fn transform_quick_trigger(tc: &TransformConfig, buf: &[u8]) -> bool {
 Spans are collected into a flexible `SpanSink` trait:
 
 ```rust
-pub trait SpanSink {
+pub(super) trait SpanSink {
     fn clear(&mut self);
     fn len(&self) -> usize;
     fn push(&mut self, span: Range<usize>);
@@ -413,14 +418,14 @@ pub trait SpanSink {
 The dispatch functions route to appropriate implementations based on `TransformConfig::id`:
 
 ```rust
-pub fn find_spans_into(tc: &TransformConfig, buf: &[u8], out: &mut impl SpanSink) {
+pub(super) fn find_spans_into(tc: &TransformConfig, buf: &[u8], out: &mut impl SpanSink) {
     match tc.id {
         TransformId::UrlPercent => find_url_spans_into(...),
         TransformId::Base64 => find_base64_spans_into(...),
     }
 }
 
-pub fn stream_decode(
+pub(super) fn stream_decode(
     tc: &TransformConfig,
     input: &[u8],
     on_bytes: impl FnMut(&[u8]) -> ControlFlow<()>,
@@ -437,28 +442,28 @@ pub fn stream_decode(
 
 ## Gate Policy: AnchorsInDecoded
 
-The module integrates with the engine's **gate policy** through callback-based control flow.
+`transform.rs` provides the streaming decode primitive, but gate enforcement is
+implemented in `src/engine/core.rs` and `src/engine/stream_decode.rs`.
 
-When the engine applies the `AnchorsInDecoded` gate (anchor pattern validation after decoding):
+For `Gate::AnchorsInDecoded`:
+- Base64 may first use `Engine::base64_buffer_gate()` on encoded bytes.
+- URL zero-hit paths may use `url_percent_buffer_gate()` on encoded bytes.
+- Decoded chunks are streamed through the decoded gate (`vs_gate`) and tracked across chunks.
+- If gate DB setup/scan fails, enforcement can be relaxed to avoid false negatives.
 
 ```rust
-// Engine pseudocode:
-spans = find_spans_into(tc, buf);
-for span in spans {
-    stream_decode(tc, &buf[span.start..span.end], |decoded_chunk| {
-        // Gate check: do anchors appear in this decoded chunk?
-        if !anchors.find_overlapping_iter(decoded_chunk).next() {
-            // Anchors not found in decoded chunk
-            return ControlFlow::Break(());  // Early exit
-        }
-        ControlFlow::Continue(())
-    });
+// Simplified engine behavior
+let mut gate_hit = false;
+stream_decode(tc, encoded_span, |decoded_chunk| {
+    gate_hit |= gate_scan(decoded_chunk_with_tail);
+    ControlFlow::Continue(())
+})?;
+if gate_is_enforced && !gate_hit {
+    discard_decoded_span();
 }
 ```
 
-**Effect:** Decoded data is validated chunk-by-chunk; processing stops early if gate rejects a chunk.
-
-**Note:** The transform module does not implement gate logic; it provides streaming infrastructure for gates to be applied downstream.
+**Note:** The transform module itself does not decide gate outcomes; it only emits decoded chunks.
 
 ## Key Functions and Data Structures
 
@@ -498,7 +503,7 @@ if v == B64_INVALID {
 Stateful scanner for URL spans over chunked input:
 
 ```rust
-pub struct UrlSpanStream {
+pub(super) struct UrlSpanStream {
     min_len: usize,
     max_len: usize,
     plus_to_space: bool,
@@ -510,10 +515,10 @@ pub struct UrlSpanStream {
 }
 
 impl UrlSpanStream {
-    pub fn new(tc: &TransformConfig) -> Self { ... }
-    pub fn feed<F>(&mut self, chunk: &[u8], base_offset: u64, on_span: F)
+    pub(super) fn new(tc: &TransformConfig) -> Self { ... }
+    pub(super) fn feed<F>(&mut self, chunk: &[u8], base_offset: u64, on_span: F)
     where F: FnMut(u64, u64) -> bool { ... }
-    pub fn finish<F>(&mut self, end_offset: u64, on_span: F)
+    pub(super) fn finish<F>(&mut self, end_offset: u64, on_span: F)
     where F: FnMut(u64, u64) -> bool { ... }
 }
 ```
@@ -523,23 +528,25 @@ impl UrlSpanStream {
 Stateful scanner for Base64 spans over chunked input:
 
 ```rust
-pub struct Base64SpanStream {
+pub(super) struct Base64SpanStream {
     min_chars: usize,
     max_len: usize,
     allow_space_ws: bool,
     in_run: bool,
+    pad_seen: bool,
     start: u64,          // Absolute offset
     run_len: usize,
-    b64_chars: usize,    // Alphabet bytes only (excludes whitespace)
-    last_b64: u64,       // Offset of last base64 byte
+    b64_chars: usize,    // Non-padding alphabet bytes only
+    have_b64: bool,
+    last_b64: u64,       // Offset of last base64 byte (including '=')
     done: bool,
 }
 
 impl Base64SpanStream {
-    pub fn new(tc: &TransformConfig) -> Self { ... }
-    pub fn feed<F>(&mut self, chunk: &[u8], base_offset: u64, on_span: F)
+    pub(super) fn new(tc: &TransformConfig) -> Self { ... }
+    pub(super) fn feed<F>(&mut self, chunk: &[u8], base_offset: u64, on_span: F)
     where F: FnMut(u64, u64) -> bool { ... }
-    pub fn finish<F>(&mut self, _end_offset: u64, on_span: F)
+    pub(super) fn finish<F>(&mut self, _end_offset: u64, on_span: F)
     where F: FnMut(u64, u64) -> bool { ... }
 }
 ```
@@ -559,18 +566,24 @@ fn stream_decode_base64(
 ) -> Result<(), Base64DecodeError>;
 ```
 
-### Public Dispatch Functions
+### Internal Dispatch Functions
 
 ```rust
-pub fn transform_quick_trigger(tc: &TransformConfig, buf: &[u8]) -> bool;
+pub(super) fn transform_quick_trigger(tc: &TransformConfig, buf: &[u8]) -> bool;
 
-pub fn find_spans_into(tc: &TransformConfig, buf: &[u8], out: &mut impl SpanSink);
+pub(super) fn find_spans_into(tc: &TransformConfig, buf: &[u8], out: &mut impl SpanSink);
 
-pub fn stream_decode(
+pub(super) fn stream_decode(
     tc: &TransformConfig,
     input: &[u8],
     on_bytes: impl FnMut(&[u8]) -> ControlFlow<()>,
 ) -> Result<(), ()>;
+
+pub(super) fn map_decoded_offset(
+    tc: &TransformConfig,
+    encoded: &[u8],
+    decoded_offset: usize,
+) -> usize;
 ```
 
 ## Edge Cases and Trade-offs
@@ -580,16 +593,14 @@ pub fn stream_decode(
 **Issue:** Long runs are split at `max_len` boundaries, which may cut through encoding quanta.
 
 ```
-Input (max_len=8):
-  "%48%656C"  (12 bytes: 4 + 8 + more)
-   12345678901...
+Input (max_len=4): "%41%42"
+Splits:
+  Span 1: "%41%"
+  Span 2: "42"
 
-Splits at boundary 8:
-  Span 1: "%48%656"    (6 bytes, but ends with "%65")
-  Span 2: "6C..."      (remainder)
-
-Decoder sees "%65" in Span 1 → passes through as literal (incomplete)
-Decoder sees "6C" in Span 2 → invalid quantum
+Decoder behavior:
+  Span 1 -> "A%"   (trailing '%' is incomplete, stays literal)
+  Span 2 -> "42"   (no leading '%', stays literal)
 ```
 
 **Rationale:** Single-pass scanning must stay bounded; downstream decode inherits imprecision trade-off.
@@ -598,23 +609,20 @@ Decoder sees "6C" in Span 2 → invalid quantum
 
 ### Whitespace Handling in Base64
 
-**Issue:** Whitespace is allowed but not counted toward `min_chars` or `max_len`.
+**Issue:** Whitespace is ignored for `min_chars`, but it still consumes `max_len` budget.
 
 ```
 Input:  "SGVs\nbG8="  (8 alphabet bytes + 1 newline + padding)
 Config: min_chars=4, max_len=8
 
 Result:
-  b64_chars=8 (alphabet only)
-  run_len=10  (includes newline and padding)
+  b64_chars counts only non-padding alphabet bytes
+  run_len counts all allowed bytes (alphabet + whitespace + '=')
 
-  Counted: 8 >= 4 ✓
-  Length:  10 >= 8 ✓
-
-Output span: valid (despite run_len exceeding max_len in total bytes)
+  The run can split earlier because whitespace and '=' still advance run_len.
 ```
 
-**Rationale:** Whitespace is transparent to Base64 semantics; not counting it allows longer logical content per span.
+**Rationale:** `min_chars` tracks meaningful base64 content while `max_len` still bounds scan work.
 
 ### Callback Early Exit
 
@@ -641,9 +649,12 @@ Transform behavior is controlled via `TransformConfig`:
 ```rust
 pub struct TransformConfig {
     pub id: TransformId,                    // UrlPercent or Base64
+    pub mode: TransformMode,                // Disabled | IfNoFindingsInThisBuffer | Always
+    pub gate: Gate,                         // None | AnchorsInDecoded
     pub min_len: usize,                     // Minimum span size
-    pub max_encoded_len: usize,             // Maximum span size (splits long runs)
     pub max_spans_per_buffer: usize,        // Stop after N spans
+    pub max_encoded_len: usize,             // Maximum span size (splits long runs)
+    pub max_decoded_bytes: usize,           // Per-span decoded output cap (enforced by engine callers)
     pub plus_to_space: bool,                // URL: '+' → space
     pub base64_allow_space_ws: bool,        // Base64: allow space in whitespace
 }
@@ -661,8 +672,8 @@ pub struct TransformConfig {
 
 **Memory Usage:**
 
-- Span finder state: ~50-60 bytes (per stream instance)
-- Decode buffer: 16 KiB (stack-allocated, shared across calls)
+- Span finder state: fixed-size per stream instance (no heap allocations)
+- Decode buffer: 16 KiB stack allocation per decode call
 - No heap allocations during decode
 - Allocations via `SpanSink` (caller responsibility)
 
@@ -705,6 +716,7 @@ Returns bytes successfully decoded (to verify computation wasn't optimized away)
 
 - **`engine::hit_pool`** - Span data structures (`SpanU32`)
 - **`api::TransformConfig`** - Configuration schema
+- **`engine::core` / `engine::stream_decode`** - Gate enforcement and streaming transform integration
 - **`scratch_memory::ScratchVec`** - Reusable buffer allocations
 - **`memchr`** - Fast byte searching (prefilter)
 

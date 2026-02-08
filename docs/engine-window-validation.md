@@ -4,7 +4,7 @@
 
 ## Module Purpose
 
-The window validation module executes compiled detection rules against fixed-size byte windows extracted from scanned data. It performs the critical "hot path" validation where patterns are matched, gates are enforced, and findings are recorded. The module handles both raw binary data and UTF-16 encoded content, applying progressive filtering through cheap gates before expensive regex matching.
+The window validation module executes compiled detection rules against bounded byte windows extracted from scanned data. It performs the critical "hot path" validation where patterns are matched, gates are enforced, and findings are recorded. The module handles both raw binary data and UTF-16 encoded content, applying progressive filtering through cheap gates before expensive regex matching.
 
 Two entry styles are supported:
 - **Engine hot path**: `run_rule_on_window` writes findings directly into `ScanScratch` and performs dedupe bookkeeping immediately.
@@ -22,14 +22,14 @@ Two entry styles are supported:
 
 ## Window Building Algorithm
 
-Windows are provided externally (typically from anchor hits detected by Vectorscan) and represent fixed byte ranges within a buffer. The module does not build windows but validates them according to this pattern:
+Windows are provided externally (typically from anchor hits detected by Vectorscan) and represent bounded byte ranges within a buffer. The module does not build windows but validates them according to this pattern:
 
 ```
 Input: Window [w.start..w.end) in buffer
   ↓
-[Gate 1] Apply cheap byte gates (must-contain, confirm-all, keywords)
+[Gate 1] Apply cheap byte gates (confirm-all, keywords; plus must-contain for Raw)
   ↓
-[Gate 2] For UTF-16: Check decode budget + decode to UTF-8
+[Gate 2] For UTF-16: Check decode budget + decode to UTF-8 + must-contain
   ↓
 [Gate 3] Apply assignment-shape precheck (if rule-specific)
   ↓
@@ -54,7 +54,7 @@ let search_start = hint_in_window.saturating_sub(BACK_SCAN_MARGIN);
 let search_window = &window[search_start..];
 ```
 
-This margin accounts for patterns where the anchor may appear in the middle of the full regex match (e.g., backward-looking patterns like `(?<=[A-Z])secret[a-z]+`).
+This margin accounts for patterns where the anchor may appear in the middle of the full regex match (e.g., the `ghp_` anchor in `([A-Za-z_]+\s*=\s*)(ghp_[A-Za-z0-9]{36})`).
 
 ---
 
@@ -138,7 +138,7 @@ if let Some(needle) = rule.must_contain {
 ### 2. confirm_all Gate
 
 ```rust
-if let Some(confirm) = &rule.confirm_all {
+if let Some(confirm) = self.confirm_all_gate(rule.confirm_all) {
     let vidx = Variant::Raw.idx();
     if let Some(primary) = &confirm.primary[vidx] {
         if memmem::find(window, primary).is_none() {
@@ -164,7 +164,7 @@ if let Some(confirm) = &rule.confirm_all {
 ### 3. keywords_any Gate
 
 ```rust
-if let Some(kws) = &rule.keywords {
+if let Some(kws) = self.keyword_gate(rule.keywords) {
     if !contains_any_memmem(window, &kws.any[Variant::Raw.idx()]) {
         return;
     }
@@ -244,32 +244,37 @@ O(window.len()) byte scan; conservative filter that only produces true rejection
 
 ## Regex Execution
 
-The regex engine is Hyperscan/Vectorscan, accessed via `rule.re.captures_iter()`:
+Window validation uses Rust `regex::bytes::Regex` with reusable capture locations (not Hyperscan) to avoid per-match allocations:
 
 ```rust
-for caps in rule.re.captures_iter(search_window) {
-    let full_match = caps.get(0).expect("group 0 always exists");
-    let match_start = search_start + full_match.start();
-    let match_end = search_start + full_match.end();
+let mut locs = scratch.capture_locs[rule_id as usize]
+    .take()
+    .expect("capture locations missing for rule");
 
+for_each_capture_match(&rule.re, &mut locs, search_window, |locs, start, end| {
+    let match_start = search_start + start;
+    let match_end = search_start + end;
+    let (_secret_start, _secret_end) = extract_secret_span_locs(locs, rule.secret_group);
     // Process match...
-}
+});
+
+scratch.capture_locs[rule_id as usize] = Some(locs);
 ```
 
 ### Key Points
 
 - **Capture groups**: The regex stores named and positional capture groups
-- **Full match**: Group 0 (accessed via `caps.get(0)`) always contains the complete match
+- **Full match**: Callback `start..end` is group 0 (full match)
 - **Search window**: For Raw variant, regex starts at `search_start` (anchor hint minus back-scan margin)
-- **Multiple matches**: `captures_iter()` yields all non-overlapping matches
+- **Multiple matches**: Helper iteration walks non-overlapping matches and handles empty-width progress safely
 
 ### Coordinate Adjustment
 
 Regex offsets are relative to `search_window`, so they must be re-based to window coordinates:
 
 ```rust
-let match_start = search_start + full_match.start();
-let match_end = search_start + full_match.end();
+let match_start = search_start + start;
+let match_end = search_start + end;
 ```
 
 Then again adjusted to buffer coordinates for finding recording:
@@ -292,7 +297,7 @@ if let Some(ent) = entropy {
     if !entropy_gate_passes(
         &ent,
         mbytes,
-        &mut scratch.entropy_scratch,
+        scratch.ensure_entropy_scratch(),
         &self.entropy_log2,
     ) {
         continue;  // Skip to next match, not full return
@@ -311,7 +316,7 @@ if let Some(ent) = entropy {
 
 - Evaluates entropy only on the **full regex match** (group 0), not the secret span or window
 - Rejects matches with entropy below configured threshold
-- Rejects matches shorter than configured minimum length (often 5-8 bytes)
+- Matches shorter than configured minimum length automatically pass (entropy is noisy on tiny samples)
 - On failure, **continues to next match** (not an early return) via `continue`
 
 ### Rationale
@@ -325,7 +330,7 @@ Entropy gating kept separate from gate checks because:
 
 ## Secret Span Extraction
 
-The `extract_secret_span()` helper extracts the sensitive portion of the match using a priority hierarchy:
+The `extract_secret_span_locs()` helper extracts the sensitive portion of the match using a priority hierarchy:
 
 ### Extraction Priority
 
@@ -372,6 +377,7 @@ scratch.push_finding_with_drop_hint(
     span_end: span_in_buf.end as u32,
     root_hint_start: base_offset + root_span_hint.start as u64,
     root_hint_end: base_offset + root_span_hint.end as u64,
+    dedupe_with_span,
     step_id,
     },
     norm_hash,
@@ -443,15 +449,16 @@ Two budget limits:
 
 ```rust
 let decoded = match variant {
-    Variant::Utf16Le => decode_utf16le_to_buf(&buf[w.clone()], max_out, &mut scratch.utf16_buf),
-    Variant::Utf16Be => decode_utf16be_to_buf(&buf[w.clone()], max_out, &mut scratch.utf16_buf),
+    Variant::Utf16Le => decode_utf16le_to_buf(raw_win, max_out, &mut scratch.utf16_buf),
+    Variant::Utf16Be => decode_utf16be_to_buf(raw_win, max_out, &mut scratch.utf16_buf),
     _ => unreachable!(),
 };
 ```
 
 Decoding:
 - Outputs to reusable scratch buffer (`scratch.utf16_buf`) to avoid allocation
-- Returns on error (invalid UTF-16 sequences)
+- Returns on decode-cap overflow (`Utf16DecodeError::OutputTooLarge`)
+- Invalid UTF-16 sequences are replaced with U+FFFD during decoding
 - Returns if output is empty (no valid data decoded)
 
 ### Gate Ordering for UTF-16
@@ -504,7 +511,8 @@ For externally-managed windows (already extracted from buffer). Used when:
 - Caller tracks window starting offset
 - Caller needs to know if any match passed gates
 
-Returns via output parameters rather than scratches.
+Uses output parameters (`dropped`, `found_any`) and stages accepted findings in
+`scratch.tmp_findings` with aligned sidecars (`tmp_drop_hint_end`, `tmp_norm_hash`).
 
 ### run_rule_on_utf16_window_into
 
@@ -522,6 +530,8 @@ pub(super) fn run_rule_on_utf16_window_into(
 ```
 
 Similar to above but for UTF-16 windows. Handles decoding and validation within caller's window management context.
+The function uses `anchor_hint` parity to scan the hinted alignment first, then
+the opposite alignment.
 
 ---
 
@@ -535,7 +545,7 @@ The module includes comprehensive tests for `has_assignment_value_shape`:
 - ✓ Boundary conditions: exactly 10 chars passes, 9 chars fails
 - ✓ Negative cases: no separator, short tokens, empty values
 
-Located at `/src/engine/window_validate.rs:648-724`
+Located in `src/engine/window_validate.rs` (tests starting around line 1136).
 
 ---
 
@@ -547,13 +557,13 @@ Accounts for patterns with backward context or mid-match anchors. 64 bytes balan
 
 ### Gate Ordering
 
-Gates progress from cheapest (memmem) to most expensive (regex):
-1. must_contain / confirm_all: O(n) byte search
-2. keywords: O(n) byte search with early exit
-3. assignment-shape: O(n) byte scan
-4. regex: O(n × complexity)
+Gates progress from cheapest (memmem) to most expensive (regex), with slight
+variant-specific ordering:
+1. Raw: must_contain -> confirm_all -> keywords -> assignment-shape
+2. UTF-16: confirm_all -> keywords -> decode -> must_contain -> assignment-shape
+3. Regex: O(n x complexity)
 
-Early failures save expensive regex compilation/execution.
+Early failures save expensive regex execution.
 
 ### Entropy on Full Match
 
@@ -583,7 +593,7 @@ Findings written to scratch buffers (not directly to results) because:
 2. For Raw variant, match spans are in raw byte space
 3. For UTF-16 variants, match spans are in decoded UTF-8 byte space
 4. root_hint (when present) is in the same coordinate space as base_offset
-5. anchor_hint is in buffer coordinates for Raw variant
+5. anchor_hint is in window/buffer coordinates (Raw back-scan and UTF-16 parity selection)
 6. All early returns occur before findings are recorded
 7. Findings are appended to scratch (never removed or reordered during function execution)
 8. Entropy gates continue to next match (not early return)

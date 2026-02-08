@@ -9,16 +9,16 @@ Cache behavior only affects startup time; runtime transform semantics are unchan
 ```mermaid
 flowchart TB
     subgraph WorkQueue["Work Queue Processing"]
-        WQ["work_q: Vec&lt;WorkItem&gt;"]
+        WQ["work_q: ScratchVec&lt;WorkItem&gt;"]
         WH["work_head: usize"]
         Loop["while work_head < work_q.len()"]
     end
 
     subgraph WorkItem["WorkItem Structure"]
-        BufRef["buf: BufRef<br/>(Root | Slab)"]
+        Layout["packed fields + flags<br/>(root/slab + decode refs)"]
         StepId["step_id: StepId"]
-        RootHint["root_hint: Option&lt;Range&gt;"]
-        Depth["depth: usize"]
+        RootHint["root_hint: Option&lt;Range&lt;u64&gt;&gt;"]
+        Depth["depth: u8"]
     end
 
     subgraph Scan["Scan Current Buffer"]
@@ -42,14 +42,15 @@ flowchart TB
         CheckB64{{"transform == Base64?"}}
         PreGate["b64_yara_gate.hits()<br/>(YARA-style encoded prefilter)"]
         Gate{{"gate == AnchorsInDecoded?"}}
-        StreamGate["decoded anchor gate<br/>stream_decode + VS"]
-        VSMatch["vs_gate anchor check"]
+        StreamGate["decoded gate stream<br/>(vs_gate, if available)"]
+        GateFallback["fallback evidence<br/>(prefilter/raw anchors)"]
+        GateDecision["enforce/relax gate<br/>(DB health + UTF-16 caveat)"]
     end
 
     subgraph Decode["Decode & Dedupe"]
         StreamDecode["stream_decode()"]
         Slab["DecodeSlab::append_stream_decode()"]
-        Hash["hash128(decoded)"]
+        Hash["mix_root_hint_hash(128-bit hash,<br/>root_hint)"]
         Seen["seen.insert(hash)"]
     end
 
@@ -80,9 +81,10 @@ flowchart TB
     PreGate --> |"pass"| Gate
     PreGate --> |"fail"| ForTransform
     Gate --> |"yes"| StreamGate
-    StreamGate --> VSMatch
-    VSMatch --> |"no anchor"| ForTransform
-    VSMatch --> |"anchor found"| Decode
+    StreamGate --> GateFallback
+    GateFallback --> GateDecision
+    GateDecision --> |"reject"| ForTransform
+    GateDecision --> |"accept"| Decode
     Gate --> |"no"| Decode
 
     Decode --> StreamDecode
@@ -115,10 +117,10 @@ flowchart TB
 graph LR
     subgraph Limits["DoS Protection Limits"]
         MaxDepth["max_transform_depth: 3"]
-        MaxOutput["max_total_decode_output_bytes: 512KB"]
+        MaxOutput["max_total_decode_output_bytes: 512 KiB"]
         MaxItems["max_work_items: 256"]
         MaxSpans["max_spans_per_buffer: 8"]
-        MaxDecoded["max_decoded_bytes: 64KB per span"]
+        MaxDecoded["max_decoded_bytes: 64 KiB per span"]
     end
 
     style Limits fill:#ffebee
@@ -146,10 +148,10 @@ with worker-local reusable state).
 | Limit | Default | Purpose |
 |-------|---------|---------|
 | `max_transform_depth` | 3 | Maximum decode chain length |
-| `max_total_decode_output_bytes` | 512KB | Global decode output budget |
+| `max_total_decode_output_bytes` | 512 KiB | Global decode output budget |
 | `max_work_items` | 256 | Maximum queued decoded buffers |
 | `max_spans_per_buffer` | 8 | Candidate spans per transform per buffer |
-| `max_decoded_bytes` | 64KB | Output limit per span decode |
+| `max_decoded_bytes` | 64 KiB | Output limit per span decode |
 
 ## Transform Types
 
@@ -218,31 +220,25 @@ For Base64 spans, there is **also** an encoded-space pre-gate that runs first:
 sequenceDiagram
     participant Transform as Transform
     participant Pre as b64_yara_gate (encoded prefilter)
-    participant Gate as decoded gate
     participant Stream as stream_decode()
-    participant VS as Vectorscan
+    participant VS as vs_gate (Vectorscan stream)
+    participant PF as prefilter stream evidence
+    participant Decide as gate decision
     participant Budget as total_decode_output_bytes
 
     Note over Transform,Pre: Base64 only
     Transform->>Pre: Encoded pre-gate
     Pre-->>Transform: pass/fail
-    Transform->>Gate: Decoded gate (if enabled)
-    Gate->>Stream: Start streaming decode
+    Transform->>Stream: Start streaming decode
 
     loop Each chunk
-        Stream-->>Gate: decoded chunk
-        Gate->>Budget: Add chunk.len()
-        Gate->>Gate: Prepend tail from previous chunk
-        Gate->>VS: is_match(tail + chunk)?
-        alt Anchor found
-            Gate-->>Transform: true (proceed with full decode)
-        else Budget exceeded
-            Gate-->>Transform: false (skip)
-        end
-        Gate->>Gate: Keep tail (max_anchor_pat_len - 1)
+        Stream->>Budget: Add chunk.len()
+        Stream->>VS: scan_stream(chunk) (if gate DB active)
+        Stream->>PF: collect raw prefilter anchor evidence
     end
 
-    Gate-->>Transform: false (no anchor found)
+    Transform->>Decide: combine gate DB, prefilter, UTF-16 caveat
+    Decide-->>Transform: accept or reject decoded output
 ```
 
 ## Stream Decode Window Scheduling
@@ -296,19 +292,21 @@ graph TB
     style Root fill:#e8f5e9
 ```
 
-The StepArena enables zero-copy finding records by storing decode provenance as a linked chain:
+The StepArena enables zero-copy finding records by storing decode provenance as a linked chain.
+Actual storage uses a compact step payload (`CompactDecodeStep`) in
+`src/engine/decode_state.rs`; below is the materialization shape:
 
 ```rust
 struct StepNode {
     parent: StepId,      // Links to parent step (or STEP_ROOT)
-    step: DecodeStep,    // Transform or Utf16Window
+    step: CompactDecodeStep, // Compact transform/Utf16Window payload
 }
 
 // Materialization walks the chain backwards
-fn materialize(&self, mut id: StepId, out: &mut Vec<DecodeStep>) {
+fn materialize(&self, mut id: StepId, out: &mut ScratchVec<DecodeStep>) {
     while id != STEP_ROOT {
         let node = &self.nodes[id.0 as usize];
-        out.push(node.step.clone());
+        out.push(node.step.to_decode_step());
         id = node.parent;
     }
     out.reverse();
@@ -317,12 +315,12 @@ fn materialize(&self, mut id: StepId, out: &mut Vec<DecodeStep>) {
 
 ## Deduplication
 
-The `FixedSet128` provides O(1) hash-based deduplication with generation-based reset:
+The `FixedSet128` provides O(1) hash-based deduplication with generation-based reset.
+Current layout in `src/stdx/fixed_set.rs`:
 
 ```rust
 struct FixedSet128 {
-    keys: Vec<u128>,    // Hash keys
-    gen: Vec<u32>,      // Generation counters
+    slots: Vec<Slot128>, // Interleaved key + generation
     cur: u32,           // Current generation
     mask: usize,        // Capacity mask (power of 2)
 }
@@ -331,11 +329,14 @@ struct FixedSet128 {
 fn reset(&mut self) {
     self.cur = self.cur.wrapping_add(1);
     if self.cur == 0 {
-        self.gen.fill(0);  // Handle wraparound
+        for slot in &mut self.slots {
+            slot.gen = 0; // Handle wraparound
+        }
         self.cur = 1;
     }
 }
 ```
 
 This prevents re-scanning identical decoded content (e.g., same Base64 blob appearing multiple times).
-The engine hashes decoded buffers with a 128-bit AEGIS-128L tag for collision resistance.
+The engine dedupe key is a 128-bit hash (AEGIS-128L MAC path) mixed with
+`root_hint` so identical decoded bytes at different root offsets do not collide.

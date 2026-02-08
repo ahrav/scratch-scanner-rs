@@ -21,7 +21,7 @@ Pattern IDs:
   (anchor_id_base + anchor_pat_count - 1)
 ```
 
-- `raw_rule_ids` maps raw pattern array index → rule ID
+- `raw_meta` maps raw pattern array index -> (`rule_id`, `match_width`, `seed_radius`)
 - `anchor_*` mapping tables resolve anchor patterns to their target (rule, variant) pairs
 - `anchor_id_base` always equals `raw_rule_count` for easy arithmetic
 
@@ -44,7 +44,22 @@ Anchor patterns are literal byte sequences:
 2. **Encoding**: Each pattern is converted to a `\xNN` regex literal so Vectorscan treats it as raw bytes
 3. **Compilation**: Patterns are appended to raw rules in the same database
 
-When `SCANNER_VS_UTF16_DEBUG` environment variable is set, build-time debug output logs pattern statistics (counts, min/max lengths, leading NUL bytes).
+When `SCANNER_VS_UTF16_DEBUG` environment variable is set, runtime debug output logs pattern statistics (counts, min/max lengths, leading NUL bytes).
+
+### DB Cache Integration
+
+All Vectorscan DB constructors in this module use `VsDbCache` (`src/engine/vs_cache.rs`) for best-effort on-disk reuse of serialized databases.
+
+- Environment controls:
+  - `SCANNER_VS_DB_CACHE=0|false|off|no` disables cache use
+  - `SCANNER_VS_DB_CACHE_DIR=/path` overrides cache directory
+  - Default cache directory: `$HOME/.cache/scanner-rs/vsdb` (fallback: `$TMPDIR/scanner-rs-vsdb`)
+- Cache key kind tags used by this module:
+  - `vs-prefilter-db:block`
+  - `vs-stream-db:stream`
+  - `vs-anchor-db:block`
+  - `vs-utf16-stream-db:stream`
+  - `vs-gate-db:stream`
 
 ## Pattern Types
 
@@ -67,7 +82,9 @@ Block-mode DB pattern with ID 0..N-1
 
 - **Format**: Literal byte sequences, encoded as `\xNN` regexes
 - **Flag**: None (literal matching; `HS_FLAG_SINGLEMATCH` used only for gate databases)
-- **Coordinate system**: Same as their variant (raw bytes for Raw, decoded bytes for UTF-16)
+- **Coordinate system**:
+  - Block DBs (`VsPrefilterDb`, `VsAnchorDb`): raw-byte offsets
+  - Stream DB (`VsUtf16StreamDb`): decoded-byte offsets
 - **Mapping**: Multiple targets per pattern via prefix-sum offset table
 
 **Example:**
@@ -174,14 +191,14 @@ Different seed radii accommodate the different coordinate systems (raw bytes vs.
 
 ### Decoded-Space Gating
 
-The `VsGateDb` optimizes common scenarios where full decoded-stream scanning should only proceed if certain anchor patterns are observed:
+The `VsGateDb` optimizes common scenarios by gating downstream decoded-window validation on anchor presence:
 
 ```
-Scan encoded stream for gate anchors
+Scan decoded stream for gate anchors
   ↓
-No anchors found → Skip full decode scan
+No anchors found → Skip downstream window validation
   ↓
-Anchors found → Proceed with full decode scan
+Anchors found → Proceed with downstream validation
 ```
 
 ### Gate Database Construction
@@ -201,13 +218,13 @@ gate_db = VsGateDb::try_new_gate(&anchor_patterns)?;
 gate_stream = gate_db.open_stream()?;
 gate_hit = false;
 gate_db.scan_stream(&mut gate_stream, chunk, &mut scratch,
-    Some(vs_gate_on_match), &mut gate_hit)?;
+    gate_match_callback(), (&mut gate_hit as *mut u8).cast())?;
 
-// Only proceed if anchors were found
+// Only keep downstream decode-window work if anchors were found
 if gate_hit {
-    // Decode and scan full stream
+    // Continue downstream validation
 } else {
-    // Skip scanning
+    // Drop/skip downstream validation work
 }
 ```
 
@@ -215,7 +232,7 @@ if gate_hit {
 
 ### VsPrefilterDb
 
-**`try_new(rules, tuning, anchor, use_raw_prefilter)`**
+**`try_new(rules, anchor, use_raw_prefilter)`**
 - Compiles raw rules and optional anchor patterns into a single block-mode database
 - Fallback per-rule compilation on multi-compile failure
 - Returns error if no patterns survive compilation
@@ -251,7 +268,7 @@ if gate_hit {
 
 ### VsAnchorDb
 
-**`try_new_utf16(patterns, pat_targets, pat_offsets, seed_radius_raw, seed_radius_utf16, tuning)`**
+**`try_new_utf16(patterns, pat_targets, pat_offsets, seed_radius_raw, seed_radius_utf16)`**
 - Builds block-mode database for UTF-16 anchor prefiltering
 - Empty patterns filtered; offsets compacted
 - Patterns encoded as `\xNN` literals
@@ -280,7 +297,7 @@ if gate_hit {
 
 **`scan_stream(stream, data, scratch, on_event, ctx)`**
 - Stream-mode gate detection
-- Callback sets a boolean flag on first hit
+- Callback sets a hit flag (`u8`)
 
 ### VsScratch
 
@@ -288,7 +305,7 @@ if gate_hit {
 - Returns the database pointer this scratch is bound to
 - Used for validation that scratch and DB match
 
-Thread-safe (Send/Sync) because Vectorscan DB is immutable post-compilation.
+Database wrappers (`VsPrefilterDb`, `VsStreamDb`, `VsGateDb`, `VsUtf16StreamDb`) are `Send + Sync` because compiled Vectorscan DBs are immutable post-compilation. `VsScratch` is `Send` only (not `Sync`).
 
 ## Design Tradeoffs
 
@@ -298,7 +315,8 @@ Thread-safe (Send/Sync) because Vectorscan DB is immutable post-compilation.
 
 **Rationale:**
 - Prefiltering is conservative; over-seeding is safe
-- On overflow, fall back to whole-buffer windows (set `force_full=true`)
+- Window math uses saturating arithmetic and buffer-end clamps to avoid under-seeding on overflow
+- Whole-buffer fallback (`force_full=true`) is used for unbounded stream-width cases
 - Avoids underflow bugs that could miss matches
 
 **Example:**
@@ -341,7 +359,7 @@ hi = end.saturating_add(radius).min(haystack_len)
 
 **Rationale:**
 - Pinpoint which rules are problematic (better error messages)
-- Allows partial success: some rules compile, others rejected
+- Keeps compile diagnostics specific to the rejecting rules
 - Return error early rather than masking issues
 
 ### 6. Two Seed Radius Types (Raw, UTF-16)
@@ -375,7 +393,7 @@ hi = end.saturating_add(radius).min(haystack_len)
 1. Attempt multi-compile of all patterns
 2. If fails, compile each pattern individually
 3. Collect error messages from failing rules
-4. Return aggregated error or partial success
+4. Return aggregated error if any rule is rejected
 
 **Error message format:**
 ```
@@ -431,7 +449,7 @@ use engine::vectorscan_prefilter::*;
 // 1. Compile raw rules and anchors
 let rules = vec![/* RuleSpec entries */];
 let anchor_input = AnchorInput { /* ... */ };
-let db = VsPrefilterDb::try_new(&rules, &tuning, Some(anchor_input), None)?;
+let db = VsPrefilterDb::try_new(&rules, Some(anchor_input), None)?;
 
 // 2. Allocate per-thread scratch
 let mut scratch = db.alloc_scratch()?;
@@ -441,10 +459,7 @@ let haystack = b"some binary data";
 let saw_utf16 = db.scan_raw(haystack, &mut scan_scratch, &mut scratch)?;
 
 // 4. Windows are seeded into scan_scratch.hit_acc_pool
-// Caller processes windows for full regex matching
-for (rule_id, variant_idx, window) in scan_scratch.extract_windows() {
-    // Full regex match on window
-}
+// Caller processes hit_acc_pool/touched_pairs in the engine scan loop.
 ```
 
 ## Coordinate Systems Summary
@@ -456,4 +471,3 @@ for (rule_id, variant_idx, window) in scan_scratch.extract_windows() {
 | `VsStreamDb` (stream) | Decoded stream | Decoded-byte offsets | Decoded-byte offsets |
 | `VsUtf16StreamDb` (stream) | Decoded UTF-16 stream | Decoded-byte offsets | Decoded-byte offsets + base_offset |
 | `VsGateDb` (stream) | Any decoded stream | N/A (presence only) | N/A |
-

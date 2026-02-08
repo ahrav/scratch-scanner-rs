@@ -10,7 +10,7 @@ The decode state module serves two critical functions:
 
 1. **Provenance Tracking**: Records how each decoded buffer was produced via a chain of transforms, so findings can be reported with their full transformation history without storing complete vectors per finding.
 
-2. **Decoded Byte Storage**: Provides a bounded, monotonic append-only buffer for storing all decoded output, allowing work items to carry references to decoded ranges instead of owning independent allocations.
+2. **Decoded Byte Storage**: Provides a bounded decode buffer for storing decoded output, allowing work items to carry references to decoded ranges instead of owning independent allocations.
 
 Both data structures are reset between scans to maintain the correctness of `StepId` and range indices, and are sized to support bounded memory usage even under adversarial input.
 
@@ -19,7 +19,7 @@ Both data structures are reset between scans to maintain the correctness of `Ste
 ### The Parent-Linked Arena Model
 
 Decode steps are stored in a parent-linked arena (`StepArena`), where each node contains:
-- A single `DecodeStep` describing a transformation (which transform was applied and the span in the parent buffer)
+- A compact internal step payload (`CompactDecodeStep`) that round-trips to `DecodeStep`
 - A back-pointer (`parent`) to the previous step in the chain
 - An index (`StepId`) into the arena's nodes
 
@@ -99,27 +99,31 @@ Represents a local UTF-16 reinterpretation used when an anchor variant (UTF-16LE
 When a finding is emitted, its `StepId` is traced through the arena:
 
 ```rust
-pub fn materialize(&self, mut id: StepId, out: &mut ScratchVec<DecodeStep>) {
+pub(super) fn materialize(&self, mut id: StepId, out: &mut ScratchVec<DecodeStep>) {
     out.clear();
     while id != STEP_ROOT {
-        let node = &self.nodes[id.0 as usize];
-        out.push(node.step.clone());
+        let cur = id;
+        let node = &self.nodes[cur.0 as usize];
+        out.push(node.step.to_decode_step());
         id = node.parent;
     }
     // Reverse to root-to-leaf order
-    out.as_mut_slice().reverse();
+    let len = out.len();
+    for i in 0..len / 2 {
+        out.as_mut_slice().swap(i, len - 1 - i);
+    }
 }
 ```
 
-This is O(depth) where depth ≤ 8 (the maximum transform chain length).
+This is O(depth), and depth is bounded by `MAX_DECODE_STEPS` (8).
 
 ## Arena Allocation
 
 ### StepArena Structure
 
 ```rust
-pub struct StepArena {
-    pub nodes: ScratchVec<StepNode>,
+pub(super) struct StepArena {
+    pub(super) nodes: ScratchVec<StepNode>,
 }
 ```
 
@@ -133,13 +137,13 @@ The arena stores nodes in a `ScratchVec`, which is a reusable allocation buffer.
 
 Each `StepNode` contains:
 ```rust
-pub struct StepNode {
-    pub parent: StepId,      // 4 bytes (u32)
-    pub step: DecodeStep,    // 32 bytes (enum + Range + metadata)
+pub(super) struct StepNode {
+    pub(super) parent: StepId, // 4 bytes
+    step: CompactDecodeStep,   // 12 bytes
 }
 ```
 
-Total: ~36 bytes per step. With a typical 8-step maximum depth and many findings sharing chains, the arena is far more efficient than storing full step vectors per finding.
+Total: 16 bytes per step (`assert!(size_of::<StepNode>() == 16)` in code). `CompactDecodeStep` is used because public `DecodeStep` is larger on 64-bit targets.
 
 ### Performance Characteristics
 
@@ -151,12 +155,12 @@ Total: ~36 bytes per step. With a typical 8-step maximum depth and many findings
 
 ### Purpose
 
-The `DecodeSlab` is a monotonic append-only buffer that stores all decoded bytes produced during a scan:
+The `DecodeSlab` stores decoded bytes in an append-first buffer with rollback truncation on failure/dedupe:
 
 ```rust
-pub struct DecodeSlab {
-    pub buf: Vec<u8>,
-    pub limit: usize,
+pub(super) struct DecodeSlab {
+    pub(super) buf: Vec<u8>,
+    pub(super) limit: usize,
 }
 ```
 
@@ -174,7 +178,7 @@ Instead of each transform allocation returning a new `Vec<u8>`, decoders append 
 The slab enforces a three-level budget hierarchy:
 
 ```rust
-pub fn append_stream_decode(
+pub(super) fn append_stream_decode(
     &mut self,
     tc: &TransformConfig,
     input: &[u8],
@@ -209,7 +213,7 @@ This ensures partial decodes don't pollute the slab.
 
 Ranges returned from `append_stream_decode` are valid:
 - Until the slab is reset (between scans)
-- Until explicit truncation (not typically done during a scan)
+- Until explicit truncation (rollback/dedupe paths can truncate during a scan)
 
 All ranges are invalidated atomically when `reset()` is called, preventing use-after-reset bugs.
 
@@ -221,9 +225,9 @@ Both `StepArena` and `DecodeSlab` are owned by `ScanScratch`, the per-scan scrat
 
 ```rust
 pub struct ScanScratch {
-    pub slab: DecodeSlab,
-    pub step_arena: StepArena,
-    pub steps_buf: ScratchVec<DecodeStep>,  // Temp buffer for materialization
+    pub(super) slab: DecodeSlab,
+    pub(super) step_arena: StepArena,
+    pub(super) steps_buf: ScratchVec<DecodeStep>, // Temp buffer for materialization
     // ... other scan state
 }
 ```
@@ -252,7 +256,6 @@ Between scans (or chunks with independent decode budgets):
 ```rust
 step_arena.reset();    // Clear all nodes; invalidate all StepIds
 slab.reset();          // Clear all decoded bytes; invalidate all ranges
-steps_buf.clear();     // Clear temp buffer for re-use
 ```
 
 This atomically invalidates all references, preventing use-after-reset bugs.
@@ -269,7 +272,7 @@ This atomically invalidates all references, preventing use-after-reset bugs.
 
 ### StepNode
 - **Purpose**: Node in the arena, linking a decode step to its parent.
-- **Contents**: `parent: StepId` and `step: DecodeStep`.
+- **Contents**: `parent: StepId` and compact `step: CompactDecodeStep`.
 
 ### StepId
 - **Purpose**: Opaque handle to a step in the arena.
@@ -304,7 +307,7 @@ This atomically invalidates all references, preventing use-after-reset bugs.
 | `StepArena::materialize` | O(depth) | Temp (steps_buf) | Depth ≤ 8; no allocation if pre-sized |
 | `DecodeSlab::append_stream_decode` | O(decoded_len) | No (if in budget) | Streaming decode; budgets enforced |
 | `DecodeSlab::reset` | O(1) | No | Clears buffer; invalidates ranges |
-| Finding materialization | O(depth) | No (heap for Finding) | Provenance chain reconstructed once |
+| Finding materialization | O(depth) | Caller-dependent | Provenance chain reconstructed once |
 
 ## Design Rationale
 
@@ -320,9 +323,9 @@ This atomically invalidates all references, preventing use-after-reset bugs.
 
 **Problem**: Decode spans are data-dependent and unpredictable; pre-allocation wastes memory or fails.
 
-**Solution**: Monotonic append-only slab with streaming decode allows on-demand allocation within budgets.
+**Solution**: A streaming slab appends decoded bytes and rolls back on errors/dedupe, enabling on-demand decode within strict budgets.
 
-**Benefit**: Bounded memory usage; no per-span allocation overhead; ranges remain valid for the scan lifetime.
+**Benefit**: Bounded memory usage and no per-span allocation overhead, with range lifetimes defined by reset/truncation boundaries.
 
 ### Why Reset Between Scans?
 
@@ -334,14 +337,14 @@ This atomically invalidates all references, preventing use-after-reset bugs.
 
 ## Constraints and Limits
 
-- **MAX_DECODE_STEPS**: Hard cap of 8 steps per finding chain. Configured at engine build time.
+- **MAX_DECODE_STEPS**: Compile-time hard cap of 8 steps per finding chain. Engine build asserts `tuning.max_transform_depth + 1 <= MAX_DECODE_STEPS`.
 - **Slab Capacity**: Set to the global decode budget; enforced at decode time.
-- **Arena Capacity**: Bounded by the maximum expected depth and work items. Overflow is checked at engine build time.
+- **Arena Capacity**: Pre-sized from tuning/rule counts in scratch setup; `ScratchVec` is fixed-capacity, so overrun is a logic error (debug-asserted).
 - **Budget Overflow**: If any budget is exceeded during a decode, the decode is aborted and rolled back; no partial state is retained.
 
 ## Related Modules
 
 - `scratch.rs`: Owns and manages `ScanScratch`, which embeds both `StepArena` and `DecodeSlab`.
 - `work_items.rs`: Carries decoded spans (ranges) during work distribution.
-- `transform.rs`: Implements `stream_decode`, which appends to the slab.
+- `transform.rs`: Implements `stream_decode`, which emits decode chunks consumed by `DecodeSlab::append_stream_decode`.
 - `core.rs`: Orchestrates the scan loop and coordinates reset.

@@ -10,7 +10,7 @@ The `stream_decode` module implements incremental, streaming decoding of transfo
 - Maintains decoded bytes in a **ring buffer** to avoid full materialization
 - Emits candidate **pattern match windows** via Vectorscan stream databases
 - Re-decodes windows on-demand when they fall outside the ring buffer
-- Falls back to full decode when streaming becomes unsafe
+- Falls back to full decode only on `force_full` safety violations; truncation/error paths abort the current span
 
 The module provides two primary paths:
 1. **Streaming path** (`decode_stream_and_scan`): Preferred, memory-efficient streaming decode
@@ -35,11 +35,11 @@ The module provides two primary paths:
 ### Budget Enforcement
 - Per-transform and per-scan decode budget checks on **every chunk**
 - Prevents runaway decode operations that would saturate resources
-- Budget exhaustion triggers safe fallback to full decode
+- Budget exhaustion aborts the current stream decode and drops that span's staged output
 
 ### Gate Optimization (Base64 Anchors)
-- For `Gate::AnchorsInDecoded` Base64 transforms, streaming gate database skips early if no anchor matches found
-- Avoids decoding and scanning when patterns cannot match decoded space
+- For `Gate::AnchorsInDecoded` Base64 transforms, a decoded-space gate stream is scanned alongside the main stream
+- Final gate enforcement can discard staged output when no anchor evidence is found
 
 ## 3. Bounds and Chunking
 
@@ -203,14 +203,15 @@ let mut mac = aegis::aegis128l::Aegis128LMac::<16>::new(&key);
 // Per chunk:
 mac.update(chunk);
 // Final:
-let h = u128::from_le_bytes(mac.finalize());
+let h = mix_root_hint_hash(u128::from_le_bytes(mac.finalize()), &root_hint);
 if !scratch.seen.insert(h) {
     // Duplicate detected; discard
 }
 ```
 
 - Incremental MAC computation over streaming chunks
-- Final hash checked against seen set for deduplication
+- Final hash is mixed with `root_hint` so identical decoded bytes at different root spans are treated independently
+- Mixed hash checked against seen set for deduplication
 - No need to buffer entire decoded output for hashing
 
 ## 5. Integration with transform.rs
@@ -514,9 +515,9 @@ pub struct ScanScratch {
 - Tracks targets, pattern offsets, pattern lens
 - Base offset for absolute positioning
 
-## 7. Fallback Triggers
+## 7. Fallback and Abort Triggers
 
-The streaming path triggers fallback to full decode when:
+### `force_full` triggers (falls back to `decode_span_fallback`)
 
 1. **Window cap exceeded** (line 642-648):
    ```rust
@@ -539,7 +540,13 @@ The streaming path triggers fallback to full decode when:
    - Re-decode also failed or exceeded limits
    - Cannot reliably materialize the window
 
-3. **Decode budget exceeded** (lines 453-464):
+3. **Child span cannot be materialized from ring** (stream/end-of-stream span emission):
+   - Nested transform span bytes must be present in the decode ring
+   - Missing bytes force `force_full = true` to preserve correctness
+
+### Stream-abort triggers (no full-decode fallback for this span)
+
+1. **Decode budget exceeded** (lines 453-464):
    ```rust
    if local_out.saturating_add(chunk.len()) > max_out {
        truncated = true;
@@ -548,7 +555,7 @@ The streaming path triggers fallback to full decode when:
    - Per-transform budget exhausted
    - Further decoding halted
 
-4. **Total decode budget exceeded** (lines 457-464):
+2. **Total decode budget exceeded** (lines 457-464):
    ```rust
    if scratch.total_decode_output_bytes.saturating_add(chunk.len())
        > self.tuning.max_total_decode_output_bytes
@@ -559,7 +566,7 @@ The streaming path triggers fallback to full decode when:
    - Per-scan global budget exhausted
    - No more decoding across any transform
 
-5. **Stream decoder error** (lines 487-498):
+3. **Stream decode/scan error** (lines 487-498):
    ```rust
    if vs_stream.scan_stream(...).is_err() {
        truncated = true;
@@ -568,14 +575,16 @@ The streaming path triggers fallback to full decode when:
    - Vectorscan streaming failed
    - Cannot continue pattern matching
 
-6. **Gate database failure** (lines 501-521):
+### Gate DB failure behavior (does not force fallback)
+
+1. **Gate database failure** (lines 501-521):
    ```rust
    if db.scan_stream(...).is_err() {
        gate_db_active = false;
        gate_db_failed = true;
    }
    ```
-   - Gate scanning failed; relax gate enforcement
+   - Gate scanning failed; gate enforcement is relaxed to avoid false negatives
 
 ## 8. Gate Behavior (`Gate::AnchorsInDecoded`)
 
@@ -596,13 +605,13 @@ if gate_enabled {
 
 **Benefits:**
 - Gate patterns evaluated in decoded space (more accurate)
-- Early exit if no anchor patterns match
-- Skips pattern scanning entirely for non-matching regions
+- Gate stream scanning stops after first hit (`gate_hit != 0`)
+- Prevents committing non-gated decoded output when enforcement is active
 
 **Per-chunk gate scanning:**
 - Gate database scanned alongside main pattern database
-- If gate matches (`gate_hit != 0`), continue to pattern scanning
-- If gate never matches, discard all decoded bytes
+- Pattern scanning continues regardless; `gate_hit` drives final enforcement
+- If gate is enforced and never matches, staged decoded output is discarded
 
 ### Fallback: Prefilter-Based Gating
 
@@ -679,12 +688,17 @@ Entry: decode_stream_and_scan()
   |
   +-> Exit
 
-On fallback (force_full || truncated):
+On fallback (`force_full`):
   +-> Truncate slab to pre-decode state
   |
   +-> Reset state collections
   |
   +-> Call decode_span_fallback()
+
+On stream abort (`truncated` or decode/scan error):
+  +-> Truncate slab to pre-decode state
+  |
+  +-> Return without full-decode fallback
 ```
 
 ## 10. Performance Considerations
