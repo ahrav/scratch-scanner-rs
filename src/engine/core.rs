@@ -354,18 +354,22 @@ impl Engine {
         for spec in rules.iter() {
             let (mut rule, gates) = compile_rule(spec);
             if let Some(tp) = gates.two_phase {
+                debug_assert!(two_phase_gates.len() <= u32::MAX as usize);
                 rule.two_phase = Some(two_phase_gates.len() as u32);
                 two_phase_gates.push(tp);
             }
             if let Some(kw) = gates.keywords {
+                debug_assert!(keyword_gates.len() <= u32::MAX as usize);
                 rule.keywords = Some(keyword_gates.len() as u32);
                 keyword_gates.push(kw);
             }
             if let Some(ent) = gates.entropy {
+                debug_assert!(entropy_gates.len() <= u32::MAX as usize);
                 rule.entropy = Some(entropy_gates.len() as u32);
                 entropy_gates.push(ent);
             }
             if let Some(ctx) = gates.local_context {
+                debug_assert!(local_context_gates.len() <= u32::MAX as usize);
                 rule.local_context = Some(local_context_gates.len() as u32);
                 local_context_gates.push(ctx);
             }
@@ -507,6 +511,7 @@ impl Engine {
                         confirm_all.retain(|c| c.as_slice() != needle);
                     }
                     if let Some(compiled) = compile_confirm_all(confirm_all) {
+                        debug_assert!(confirm_all_gates.len() <= u32::MAX as usize);
                         rules_compiled[rid].confirm_all = Some(confirm_all_gates.len() as u32);
                         confirm_all_gates.push(compiled);
                     }
@@ -905,6 +910,39 @@ impl Engine {
     /// The slice contains `(rule_index, reason)` pairs in original rule order.
     pub fn unfilterable_rules(&self) -> &[(usize, UnfilterableReason)] {
         &self.unfilterable_rules
+    }
+
+    // ── Gate pool accessors ────────────────────────────────────────────
+    //
+    // Centralised helpers that resolve `Option<u32>` gate indices into pool
+    // references with a descriptive panic on out-of-bounds access.
+
+    #[inline(always)]
+    pub(super) fn confirm_all_gate(&self, idx: Option<u32>) -> Option<&ConfirmAllCompiled> {
+        idx.map(|i| &self.confirm_all_gates[i as usize])
+    }
+
+    #[inline(always)]
+    pub(super) fn keyword_gate(&self, idx: Option<u32>) -> Option<&KeywordsCompiled> {
+        idx.map(|i| &self.keyword_gates[i as usize])
+    }
+
+    #[inline(always)]
+    pub(super) fn entropy_gate(&self, idx: Option<u32>) -> Option<EntropyCompiled> {
+        idx.map(|i| self.entropy_gates[i as usize])
+    }
+
+    #[inline(always)]
+    pub(super) fn local_context_gate(
+        &self,
+        idx: Option<u32>,
+    ) -> Option<crate::api::LocalContextSpec> {
+        idx.map(|i| self.local_context_gates[i as usize])
+    }
+
+    #[inline(always)]
+    pub(super) fn two_phase_gate(&self, idx: Option<u32>) -> Option<&TwoPhaseCompiled> {
+        idx.map(|i| &self.two_phase_gates[i as usize])
     }
 
     /// Select which transform index buckets to iterate for a `ScanBuf` work item.

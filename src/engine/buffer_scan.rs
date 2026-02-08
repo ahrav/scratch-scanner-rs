@@ -217,7 +217,7 @@ impl Engine {
             // match in *any* superset of that window — so widening after a miss
             // would be wasted work. This lets us reject ~80-95% of noisy
             // prefilter hits before paying the regex cost.
-            if let Some(tp) = rule.two_phase.map(|i| &self.two_phase_gates[i as usize]) {
+            if let Some(tp) = self.two_phase_gate(rule.two_phase) {
                 let seed_radius_bytes = tp.seed_radius.saturating_mul(variant.scale());
                 let full_radius_bytes = tp.full_radius.saturating_mul(variant.scale());
                 let extra = full_radius_bytes.saturating_sub(seed_radius_bytes);

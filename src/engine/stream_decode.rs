@@ -1392,9 +1392,7 @@ impl Engine {
                                 self.tuning.max_windows_per_rule_variant,
                             );
 
-                            if let Some(tp) =
-                                rule.two_phase.map(|i| &self.two_phase_gates[i as usize])
-                            {
+                            if let Some(tp) = self.two_phase_gate(rule.two_phase) {
                                 let seed_radius_bytes =
                                     tp.seed_radius.saturating_mul(variant.scale());
                                 let full_radius_bytes =

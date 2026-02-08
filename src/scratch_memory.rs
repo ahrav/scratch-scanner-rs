@@ -411,10 +411,13 @@ impl<T> Drop for ScratchVec<T> {
 // scratch use within one scan.
 unsafe impl<T: Send> Send for ScratchVec<T> {}
 
-// Compile-time size guard: `ScratchVec<u8>` is exactly `ptr + len + cap` = 24
-// bytes. This catches accidental field additions (e.g., storing a `Layout`)
+// Compile-time size guard: `ScratchVec<u8>` must be exactly `ptr + len + cap`
+// (3 words). This catches accidental field additions (e.g., storing a `Layout`)
 // that would bloat every scratch buffer in the engine.
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<ScratchVec<u8>>() == 24);
+#[cfg(target_pointer_width = "32")]
+const _: () = assert!(size_of::<ScratchVec<u8>>() == 12);
 
 #[cfg(test)]
 mod tests {

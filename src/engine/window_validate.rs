@@ -349,7 +349,7 @@ impl Engine {
                     }
                 }
 
-                if let Some(kws) = rule.keywords.map(|i| &self.keyword_gates[i as usize]) {
+                if let Some(kws) = self.keyword_gate(rule.keywords) {
                     // Keyword gate is a cheap pre-regex filter: if none of the
                     // keywords appear in this window, the regex cannot be relevant.
                     if !contains_any_memmem(window, &kws.any[Variant::Raw.idx()]) {
@@ -368,7 +368,7 @@ impl Engine {
                 let search_start = hint_in_window.saturating_sub(BACK_SCAN_MARGIN);
                 let search_window = &window[search_start..];
 
-                let entropy = rule.entropy.map(|i| self.entropy_gates[i as usize]);
+                let entropy = self.entropy_gate(rule.entropy);
                 // Take the pre-allocated CaptureLocations out of scratch so the
                 // closure can borrow `locs` mutably without also borrowing `scratch`.
                 // Restored after the loop to keep the slot populated for the next call.
@@ -401,9 +401,8 @@ impl Engine {
                         let secret_start = search_start + secret_start;
                         let secret_end = search_start + secret_end;
 
-                        let context_ok = if let Some(ctx) = rule
-                            .local_context
-                            .map(|i| self.local_context_gates[i as usize])
+                        let context_ok = if let Some(ctx) =
+                            self.local_context_gate(rule.local_context)
                         {
                             local_context_passes(window, secret_start, secret_end, ctx)
                         } else {
@@ -528,10 +527,7 @@ impl Engine {
 
         let raw_win = &buf[decode_range.clone()];
 
-        if let Some(confirm) = rule
-            .confirm_all
-            .map(|i| &self.confirm_all_gates[i as usize])
-        {
+        if let Some(confirm) = self.confirm_all_gate(rule.confirm_all) {
             // Confirm-all literals are encoded like anchors/keywords so we can
             // cheaply reject UTF-16 windows before decoding.
             let vidx = variant.idx();
@@ -545,7 +541,7 @@ impl Engine {
             }
         }
 
-        if let Some(kws) = rule.keywords.map(|i| &self.keyword_gates[i as usize]) {
+        if let Some(kws) = self.keyword_gate(rule.keywords) {
             // For UTF-16 variants, apply the keyword gate on the raw UTF-16 bytes
             // *before* decoding to avoid spending decode budget on windows that
             // could never pass the keyword check.
@@ -620,7 +616,7 @@ impl Engine {
             },
         );
 
-        let entropy = rule.entropy.map(|i| self.entropy_gates[i as usize]);
+        let entropy = self.entropy_gate(rule.entropy);
         let mut locs = scratch.capture_locs[rule_id as usize]
             .take()
             .expect("capture locations missing for rule");
@@ -645,9 +641,8 @@ impl Engine {
                 // Extract secret span using capture group logic.
                 let (secret_start, secret_end) = extract_secret_span_locs(locs, rule.secret_group);
 
-                let context_ok = if let Some(ctx) = rule
-                    .local_context
-                    .map(|i| self.local_context_gates[i as usize])
+                let context_ok = if let Some(ctx) =
+                    self.local_context_gate(rule.local_context)
                 {
                     local_context_passes(decoded, secret_start, secret_end, ctx)
                 } else {
@@ -745,10 +740,7 @@ impl Engine {
             }
         }
 
-        if let Some(confirm) = rule
-            .confirm_all
-            .map(|i| &self.confirm_all_gates[i as usize])
-        {
+        if let Some(confirm) = self.confirm_all_gate(rule.confirm_all) {
             let vidx = Variant::Raw.idx();
             if let Some(primary) = &confirm.primary[vidx] {
                 if memmem::find(window, primary).is_none() {
@@ -760,7 +752,7 @@ impl Engine {
             }
         }
 
-        if let Some(kws) = rule.keywords.map(|i| &self.keyword_gates[i as usize]) {
+        if let Some(kws) = self.keyword_gate(rule.keywords) {
             if !contains_any_memmem(window, &kws.any[Variant::Raw.idx()]) {
                 return;
             }
@@ -779,7 +771,7 @@ impl Engine {
 
         let max_findings = scratch.max_findings;
         let out = &mut scratch.tmp_findings;
-        let entropy = rule.entropy.map(|i| self.entropy_gates[i as usize]);
+        let entropy = self.entropy_gate(rule.entropy);
         let mut locs = scratch.capture_locs[rule_id as usize]
             .take()
             .expect("capture locations missing for rule");
@@ -806,9 +798,8 @@ impl Engine {
                 let secret_start = search_start + secret_start;
                 let secret_end = search_start + secret_end;
 
-                let context_ok = if let Some(ctx) = rule
-                    .local_context
-                    .map(|i| self.local_context_gates[i as usize])
+                let context_ok = if let Some(ctx) =
+                    self.local_context_gate(rule.local_context)
                 {
                     local_context_passes(window, secret_start, secret_end, ctx)
                 } else {
@@ -913,10 +904,7 @@ impl Engine {
             return;
         }
 
-        if let Some(confirm) = rule
-            .confirm_all
-            .map(|i| &self.confirm_all_gates[i as usize])
-        {
+        if let Some(confirm) = self.confirm_all_gate(rule.confirm_all) {
             let vidx = variant.idx();
             if let Some(primary) = &confirm.primary[vidx] {
                 if memmem::find(raw_win, primary).is_none() {
@@ -928,7 +916,7 @@ impl Engine {
             }
         }
 
-        if let Some(kws) = rule.keywords.map(|i| &self.keyword_gates[i as usize]) {
+        if let Some(kws) = self.keyword_gate(rule.keywords) {
             let vidx = variant.idx();
             if !contains_any_memmem(raw_win, &kws.any[vidx]) {
                 return;
@@ -994,7 +982,7 @@ impl Engine {
 
         let max_findings = scratch.max_findings;
         let out = &mut scratch.tmp_findings;
-        let entropy = rule.entropy.map(|i| self.entropy_gates[i as usize]);
+        let entropy = self.entropy_gate(rule.entropy);
         let mut locs = scratch.capture_locs[rule_id as usize]
             .take()
             .expect("capture locations missing for rule");
@@ -1017,9 +1005,8 @@ impl Engine {
                 // Extract secret span using capture group logic.
                 let (secret_start, secret_end) = extract_secret_span_locs(locs, rule.secret_group);
 
-                let context_ok = if let Some(ctx) = rule
-                    .local_context
-                    .map(|i| self.local_context_gates[i as usize])
+                let context_ok = if let Some(ctx) =
+                    self.local_context_gate(rule.local_context)
                 {
                     local_context_passes(decoded, secret_start, secret_end, ctx)
                 } else {

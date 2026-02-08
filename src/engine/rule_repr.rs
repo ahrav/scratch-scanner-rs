@@ -203,6 +203,11 @@ impl PackedPatternsBuilder {
 
     /// Freeze into an immutable `PackedPatterns`.
     pub(super) fn build(self) -> PackedPatterns {
+        debug_assert_eq!(
+            *self.offsets.last().unwrap() as usize,
+            self.bytes.len(),
+            "PackedPatternsBuilder: last offset must equal bytes length"
+        );
         PackedPatterns {
             bytes: self.bytes.into_boxed_slice(),
             offsets: self.offsets.into_boxed_slice(),
@@ -326,7 +331,7 @@ pub(super) struct RuleCompiled {
     pub(super) two_phase: Option<u32>,
 }
 
-// Compile-time size guard: gate index is 8 bytes (Option<u32> with niche).
+// Compile-time size guard: gate index is 8 bytes (Option<u32> without niche).
 const _: () = assert!(std::mem::size_of::<Option<u32>>() == 8);
 
 // --------------------------
