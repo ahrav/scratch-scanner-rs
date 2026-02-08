@@ -562,7 +562,10 @@ mod tests {
     #[test]
     fn filter_all_keeps_both() {
         let result = apply_transform_filter(test_transforms(), &TransformFilter::All);
-        assert_eq!(ids(&result), vec![TransformId::UrlPercent, TransformId::Base64]);
+        assert_eq!(
+            ids(&result),
+            vec![TransformId::UrlPercent, TransformId::Base64]
+        );
     }
 
     #[test]
@@ -589,7 +592,10 @@ mod tests {
     fn filter_both_preserves_order() {
         let filter = TransformFilter::Only(vec!["url".to_string(), "base64".to_string()]);
         let result = apply_transform_filter(test_transforms(), &filter);
-        assert_eq!(ids(&result), vec![TransformId::UrlPercent, TransformId::Base64]);
+        assert_eq!(
+            ids(&result),
+            vec![TransformId::UrlPercent, TransformId::Base64]
+        );
     }
 
     #[test]
