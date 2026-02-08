@@ -16,17 +16,18 @@
 //!
 //! ```text
 //! Bytes 0-3:  magic (2 bytes) + \r\n (2 bytes) — identifies Python version
-//! Bytes 4-7:  flags (u32 LE) — PEP 552 (Python 3.7+)
 //!
-//! If flags & 0x1 (hash-based validation):
-//!     Bytes 8-15: 64-bit source hash → header_size = 16
-//! Else (timestamp-based):
-//!     Bytes 8-11: timestamp, bytes 12-15: source size → header_size = 16
+//! Python 3.6:
+//!     Bytes 4-7:  timestamp
+//!     Bytes 8-11: source size        → header_size = 12
+//!
+//! Python 3.7+ (PEP 552):
+//!     Bytes 4-7:  flags
+//!     Bytes 8-15: hash OR timestamp+size → header_size = 16
 //! ```
 //!
-//! Both paths produce a 16-byte header. Pre-3.7 files have `flags = 0`
-//! so the timestamp path handles them correctly (the "flags" field is
-//! simply the old timestamp position, and we skip past it either way).
+//! Header size is selected from the magic number: pre-3.7 uses 12 bytes,
+//! 3.7+ uses 16 bytes.
 //!
 //! # Marshal walk strategy
 //!
@@ -66,6 +67,7 @@ const TYPE_UNICODE: u8 = b'u';
 const TYPE_INTERNED: u8 = b't';
 
 // Marshal type codes we skip.
+const TYPE_NULL: u8 = b'0';
 const TYPE_NONE: u8 = b'N';
 const TYPE_FALSE: u8 = b'F';
 const TYPE_TRUE: u8 = b'T';
@@ -91,8 +93,10 @@ const TYPE_ASCII_INTERNED: u8 = b'A';
 // The FLAG_REF bit can be OR'd onto any type code.
 const FLAG_REF: u8 = 0x80;
 
-/// Minimum pyc header size: magic(4) + flags(4) + timestamp(4) + size(4) = 16.
-const MIN_HEADER: usize = 16;
+/// Minimum pyc header size: magic(4) + timestamp(4) + source-size(4) = 12.
+const MIN_HEADER: usize = 12;
+/// First CPython magic number that uses the PEP 552 16-byte header (Python 3.7+).
+const PY37_MAGIC_MIN: u16 = 3390;
 
 impl Extractor for PycExtractor {
     fn extract(&self, data: &[u8], out: &mut Vec<u8>, _scratch: &mut Vec<u8>) -> ExtractResult {
@@ -105,17 +109,10 @@ impl Extractor for PycExtractor {
             return ExtractResult::ParseError;
         }
 
-        // Both hash-based and timestamp-based headers are 16 bytes total.
-        // Pre-3.7 files have a 12-byte header (magic + timestamp + size), but
-        // their "flags" field reads as the old timestamp (non-zero, bit 0 may
-        // be set either way). Using 16 unconditionally skips 4 extra bytes
-        // into the marshal stream for pre-3.7 files, which is safe: we may
-        // miss one leading marshal object but won't produce garbage.
-        let flags = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-        // Both hash-based (magic+flags+hash = 4+4+8) and timestamp-based
-        // (magic+flags+timestamp+size = 4+4+4+4) headers are 16 bytes.
-        let _ = flags;
-        let header_size = 16;
+        // Python 3.6 uses a 12-byte header; Python 3.7+ uses 16 bytes.
+        // We branch on the CPython magic value (bytes 0-1, little-endian).
+        let magic = u16::from_le_bytes([data[0], data[1]]);
+        let header_size = if magic < PY37_MAGIC_MIN { 12 } else { 16 };
 
         if data.len() < header_size {
             return ExtractResult::ParseError;
@@ -189,7 +186,7 @@ impl Extractor for PycExtractor {
                 }
 
                 // --- Fixed-size types we skip ---
-                TYPE_NONE | TYPE_FALSE | TYPE_TRUE | TYPE_STOPITER | TYPE_ELLIPSIS => {
+                TYPE_NULL | TYPE_NONE | TYPE_FALSE | TYPE_TRUE | TYPE_STOPITER | TYPE_ELLIPSIS => {
                     // Zero-size sentinel types.
                 }
                 TYPE_INT => {

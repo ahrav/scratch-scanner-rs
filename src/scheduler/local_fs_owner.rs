@@ -2267,6 +2267,8 @@ fn extract_and_scan_file<E: ScanEngine>(
         return;
     }
 
+    ctx.metrics.binary_extracted = ctx.metrics.binary_extracted.wrapping_add(1);
+
     // Scan the extracted text as a single chunk.
     let engine = &scratch.engine;
     engine.scan_chunk_into(
@@ -2440,8 +2442,6 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
                     crate::content_policy::ContentVerdict::BinaryExtractable(_fmt) => {
                         #[cfg(feature = "binary-extract")]
                         {
-                            ctx.metrics.binary_extracted =
-                                ctx.metrics.binary_extracted.wrapping_add(1);
                             extract_and_scan_file(
                                 &task, ctx, &mut file, file_size, path_bytes, _fmt,
                             );
