@@ -240,7 +240,11 @@ mod tests {
 
         for (orig, parsed) in original_rules.iter().zip(parsed_rules.iter()) {
             assert_eq!(orig.name, parsed.name, "name mismatch");
-            assert_eq!(orig.radius, parsed.radius, "radius mismatch for {}", orig.name);
+            assert_eq!(
+                orig.radius, parsed.radius,
+                "radius mismatch for {}",
+                orig.name
+            );
             assert_eq!(
                 orig.re.as_str(),
                 parsed.re.as_str(),
