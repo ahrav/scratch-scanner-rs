@@ -8,9 +8,9 @@
 //!
 //! # Supported versions
 //!
-//! Targets Python 3.6+ `.pyc` files. Older Python 2 `.pyc` files have a
-//! different header layout and are not supported (they will yield
-//! `ParseError` because bytes 2-3 won't be `\r\n`).
+//! Targets Python 3.6+ `.pyc` files. Python 2 `.pyc` files use an 8-byte
+//! header (magic + timestamp), so they are parsed with a wrong header
+//! offset and will likely extract no useful strings (yielding `Empty`).
 //!
 //! # Header format
 //!
