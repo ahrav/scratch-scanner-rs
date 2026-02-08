@@ -6,7 +6,10 @@
 //! coordinates during transform scans. Scratch state is single-threaded and
 //! reused across chunks to keep the hot path allocation-free.
 
-use crate::api::{DecodeStep, FileId, FindingRec, StepId, TransformConfig, TransformId, STEP_ROOT};
+use crate::api::{
+    DecodeStep, FileId, FindingRec, StepId, TransformConfig, TransformId, Utf16Endianness,
+    STEP_ROOT,
+};
 use crate::scratch_memory::ScratchVec;
 use crate::stdx::{ByteRing, FixedSet128, TimingWheel};
 
@@ -1064,13 +1067,13 @@ impl ScanScratch {
     ///
     /// # Deduplication Strategy
     ///
-    /// Findings are keyed by a 32-byte composite:
+    /// Findings are keyed by a 33-byte composite:
     ///
     /// ```text
-    /// ┌────────┬────────┬────────────┬──────────┬─────────────────┬───────────────┐
-    /// │file_id │rule_id │ span_start │ span_end │ root_hint_start │ root_hint_end │
-    /// │ 4B     │ 4B     │ 4B         │ 4B       │ 8B              │ 8B            │
-    /// └────────┴────────┴────────────┴──────────┴─────────────────┴───────────────┘
+    /// ┌────────┬────────┬────────────┬──────────┬─────────────────┬───────────────┬─────────┐
+    /// │file_id │rule_id │ span_start │ span_end │ root_hint_start │ root_hint_end │ variant │
+    /// │ 4B     │ 4B     │ 4B         │ 4B       │ 8B              │ 8B            │ 1B      │
+    /// └────────┴────────┴────────────┴──────────┴─────────────────┴───────────────┴─────────┘
     /// ```
     ///
     /// For transform-derived findings (`step_id != STEP_ROOT`), span coordinates
@@ -1143,14 +1146,26 @@ impl ScanScratch {
             }
         };
 
-        // Build a 32-byte dedup key and hash to 128 bits.
-        let mut key_bytes = [0u8; 32];
+        // Variant discriminator: distinguishes UTF-16 LE/BE findings that
+        // otherwise share the same span and root_hint. Without this, both
+        // endianness variants would hash to the same dedup key and one would
+        // be falsely suppressed. The discriminator is stable across chunks
+        // because it depends only on the decode step type, not arena indices.
+        let variant_disc: u8 = if rec.step_id != STEP_ROOT {
+            self.step_arena.nodes[rec.step_id.0 as usize].variant_discriminant()
+        } else {
+            0
+        };
+
+        // Build a 33-byte dedup key and hash to 128 bits.
+        let mut key_bytes = [0u8; 33];
         key_bytes[0..4].copy_from_slice(&rec.file_id.0.to_le_bytes());
         key_bytes[4..8].copy_from_slice(&rec.rule_id.to_le_bytes());
         key_bytes[8..12].copy_from_slice(&span_start.to_le_bytes());
         key_bytes[12..16].copy_from_slice(&span_end.to_le_bytes());
         key_bytes[16..24].copy_from_slice(&rec.root_hint_start.to_le_bytes());
         key_bytes[24..32].copy_from_slice(&normalized_root_hint_end.to_le_bytes());
+        key_bytes[32] = variant_disc;
 
         let hash = hash128(&key_bytes);
         let seen_in_scan = !self.seen_findings_scan.insert(hash);
