@@ -398,13 +398,12 @@ impl Engine {
                         let secret_start = search_start + secret_start;
                         let secret_end = search_start + secret_end;
 
-                        let context_ok = if let Some(ctx) =
-                            self.local_context_gate(rule.local_context)
-                        {
-                            local_context_passes(window, secret_start, secret_end, ctx)
-                        } else {
-                            true
-                        };
+                        let context_ok =
+                            if let Some(ctx) = self.local_context_gate(rule.local_context) {
+                                local_context_passes(window, secret_start, secret_end, ctx)
+                            } else {
+                                true
+                            };
 
                         if context_ok {
                             let span_in_buf = (w.start + secret_start)..(w.start + secret_end);
@@ -638,9 +637,7 @@ impl Engine {
                 // Extract secret span using capture group logic.
                 let (secret_start, secret_end) = extract_secret_span_locs(locs, rule.secret_group);
 
-                let context_ok = if let Some(ctx) =
-                    self.local_context_gate(rule.local_context)
-                {
+                let context_ok = if let Some(ctx) = self.local_context_gate(rule.local_context) {
                     local_context_passes(decoded, secret_start, secret_end, ctx)
                 } else {
                     true
@@ -795,9 +792,7 @@ impl Engine {
                 let secret_start = search_start + secret_start;
                 let secret_end = search_start + secret_end;
 
-                let context_ok = if let Some(ctx) =
-                    self.local_context_gate(rule.local_context)
-                {
+                let context_ok = if let Some(ctx) = self.local_context_gate(rule.local_context) {
                     local_context_passes(window, secret_start, secret_end, ctx)
                 } else {
                     true
@@ -1002,9 +997,7 @@ impl Engine {
                 // Extract secret span using capture group logic.
                 let (secret_start, secret_end) = extract_secret_span_locs(locs, rule.secret_group);
 
-                let context_ok = if let Some(ctx) =
-                    self.local_context_gate(rule.local_context)
-                {
+                let context_ok = if let Some(ctx) = self.local_context_gate(rule.local_context) {
                     local_context_passes(decoded, secret_start, secret_end, ctx)
                 } else {
                     true

@@ -47,8 +47,14 @@ impl CompactDecodeStep {
                     transform_idx,
                     (1u32 << 31) - 1
                 );
-                debug_assert!(parent_span.start <= u32::MAX as usize, "span_start overflows u32");
-                debug_assert!(parent_span.end <= u32::MAX as usize, "span_end overflows u32");
+                debug_assert!(
+                    parent_span.start <= u32::MAX as usize,
+                    "span_start overflows u32"
+                );
+                debug_assert!(
+                    parent_span.end <= u32::MAX as usize,
+                    "span_end overflows u32"
+                );
                 Self {
                     tag_and_idx: *transform_idx as u32,
                     span_start: parent_span.start as u32,
@@ -59,8 +65,14 @@ impl CompactDecodeStep {
                 endianness,
                 parent_span,
             } => {
-                debug_assert!(parent_span.start <= u32::MAX as usize, "span_start overflows u32");
-                debug_assert!(parent_span.end <= u32::MAX as usize, "span_end overflows u32");
+                debug_assert!(
+                    parent_span.start <= u32::MAX as usize,
+                    "span_start overflows u32"
+                );
+                debug_assert!(
+                    parent_span.end <= u32::MAX as usize,
+                    "span_end overflows u32"
+                );
                 let e = match endianness {
                     Utf16Endianness::Le => 0u32,
                     Utf16Endianness::Be => 1u32,
