@@ -1,4 +1,4 @@
-//! First-introduced blob walk for ODB-blob scan mode.
+//! Blob introduction walk for ODB-blob scan mode.
 //!
 //! This module traverses commits in topological order and discovers each
 //! unique blob exactly once. It maintains seen-set bitmaps keyed by MIDX
@@ -21,7 +21,8 @@
 //!
 //! # Invariants
 //! - Seen sets are sized from `midx.object_count` and never grow
-//!   (`AtomicSeenSets` uses a capacity floor of 1 when the MIDX is empty).
+//!   (the caller applies a capacity floor of 1 when the MIDX is empty
+//!   because `AtomicSeenSets` panics on zero capacity).
 //! - OID indices must be validated before use (caller responsibility).
 //! - Tree and blob indices share the same index space but are tracked
 //!   independently to avoid false positives.
@@ -563,7 +564,7 @@ impl BlobIntroducer {
         self.loose_excluded.clear();
     }
 
-    /// Walks the commit plan and emits first-introduced blob candidates.
+    /// Walks the commit plan and emits unique blob candidates.
     ///
     /// On error, clears traversal state so the introducer can be reused after
     /// handling the failure. Seen sets are preserved; call `reset_seen` if needed.
@@ -1130,10 +1131,17 @@ pub(super) fn introduce_parallel<'a>(
     let seen = AtomicSeenSets::new(seen_len, seen_len);
 
     // Per-worker budget division.
-    let per_worker_tree_cache =
-        (config.tree_diff.max_tree_cache_bytes / worker_count as u32).max(4 * 1024 * 1024); // 4 MB floor
-    let per_worker_delta_cache =
-        (config.tree_diff.max_tree_delta_cache_bytes / worker_count as u32).max(4 * 1024 * 1024); // 4 MB floor
+    let divided_tree_cache = config.tree_diff.max_tree_cache_bytes / worker_count as u32;
+    let per_worker_tree_cache = divided_tree_cache.max(4 * 1024 * 1024); // 4 MB floor
+    let divided_delta_cache = config.tree_diff.max_tree_delta_cache_bytes / worker_count as u32;
+    let per_worker_delta_cache = divided_delta_cache.max(4 * 1024 * 1024); // 4 MB floor
+    if per_worker_delta_cache > divided_delta_cache {
+        eprintln!(
+            "note: per-worker delta cache floor (4 MiB) exceeds divided budget ({} KiB); \
+             total memory will exceed configured max",
+            divided_delta_cache / 1024,
+        );
+    }
     let per_worker_spill = config.tree_diff.max_tree_spill_bytes / worker_count as u64;
     let per_worker_spill = per_worker_spill.max(64 * 1024 * 1024); // 64 MB floor
     let per_worker_in_flight =
@@ -1374,7 +1382,8 @@ fn per_worker_loose_limit(max_loose: u32, worker_count: usize) -> u32 {
 ///
 /// Ordering is:
 /// `oid`, `commit_id`, `path bytes`, `parent_idx`, `change_kind`,
-/// `ctx_flags`, `cand_flags`.
+/// `ctx_flags`, `cand_flags`, `path_ref.off`, `path_ref.len`.
+/// See [`cmp_loose_dedup_key`] for the full ordering rationale.
 fn dedup_loose_by_oid(loose: &mut Vec<LooseCandidate>, path_arena: &ByteArena) {
     if loose.len() <= 1 {
         return;
@@ -1670,6 +1679,23 @@ mod tests {
         assert_eq!(
             merged_ab.path_arena.get(winner_ab.ctx.path_ref),
             b"alpha/path"
+        );
+    }
+
+    #[test]
+    fn merge_loose_dedup_prefers_lowest_commit_id() {
+        let path = b"same/path";
+        let workers = vec![
+            worker_result_with_loose_context(7, path, 100, 0, ChangeKind::Add, 0, 0),
+            worker_result_with_loose_context(7, path, 10, 0, ChangeKind::Add, 0, 0),
+            worker_result_with_loose_context(7, path, 50, 0, ChangeKind::Add, 0, 0),
+        ];
+
+        let merged = merge_worker_results(workers, 256, 10, 10).expect("merge succeeds");
+        assert_eq!(merged.loose.len(), 1);
+        assert_eq!(
+            merged.loose[0].ctx.commit_id, 10,
+            "dedup should keep the entry with the lowest commit_id"
         );
     }
 }

@@ -199,8 +199,9 @@ pub(super) fn estimate_path_arena_capacity(base: u32, packed: u32, loose: u32) -
 /// Heuristic: ~15% of objects are trees in typical repos. Each tree delta
 /// base needs ~4 KiB (one slot). 4-way associativity needs ~2x entries to
 /// avoid thrashing. The result is clamped between an 8 MiB floor and
-/// `configured_max` ceiling. When `configured_max` is below 8 MiB, the
-/// configured cap is treated as the effective floor.
+/// `configured_max` ceiling. When `configured_max` is below the 8 MiB
+/// floor, the floor is reduced to `configured_max` so the clamp range
+/// remains valid.
 pub(super) fn auto_tree_delta_cache_bytes(object_count: u32, configured_max: u32) -> u32 {
     let estimated_trees = (object_count as u64).saturating_mul(15) / 100;
     let estimated_bytes = estimated_trees.saturating_mul(4096 * 2);

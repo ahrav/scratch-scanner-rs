@@ -192,7 +192,7 @@ keeps only a bounded buffer of tree bytes in RAM while iterating entries.
 
 ## Git Scan Modes
 
-**Diff-history mode (default)** uses tree diffs across the commit plan to emit
+**Diff-history mode** uses tree diffs across the commit plan to emit
 candidate blobs with per-commit context. This path feeds the spill/dedupe and
 mapping stages before pack planning and execution.
 

@@ -100,7 +100,10 @@ pub(crate) fn load_rules(path: &Path) -> Result<Vec<RuleSpec>, RulesError> {
         return Err(RulesError::NoRules);
     }
 
-    // Validate each rule, catching panics from assert_valid().
+    // Validate each rule, catching assertion panics from assert_valid().
+    // Only string-typed panics (from assert!/panic! macros) are treated as
+    // validation errors. Other panic types (OOM, stack overflow, etc.) are
+    // re-raised because they are not validation failures.
     for rule in &rules {
         let name = rule.name.to_string();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -112,7 +115,8 @@ pub(crate) fn load_rules(path: &Path) -> Result<Vec<RuleSpec>, RulesError> {
             } else if let Some(s) = payload.downcast_ref::<String>() {
                 s.clone()
             } else {
-                "unknown validation panic".to_string()
+                // Not an assertion failure — re-raise the original panic.
+                std::panic::resume_unwind(payload);
             };
             return Err(RulesError::Validation {
                 rule_name: name,
@@ -126,11 +130,80 @@ pub(crate) fn load_rules(path: &Path) -> Result<Vec<RuleSpec>, RulesError> {
 
 /// Returns the default rules file path next to the current executable.
 ///
-/// Returns `None` if the executable path cannot be determined.
+/// Returns `None` if the executable path cannot be determined (e.g., `/proc`
+/// not mounted in containers, or the binary has no parent directory).
 pub(crate) fn default_rules_path() -> Option<PathBuf> {
-    std::env::current_exe()
-        .ok()?
-        .parent()?
-        .join("default_rules.yaml")
-        .into()
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("warning: cannot determine executable path: {e}");
+            return None;
+        }
+    };
+    Some(exe.parent()?.join("default_rules.yaml"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_regex_valid_pattern() {
+        let re = build_regex(r"tok_[a-z]{4}").expect("valid pattern should compile");
+        assert!(re.is_match(b"tok_abcd"));
+    }
+
+    #[test]
+    fn build_regex_invalid_pattern() {
+        let err = build_regex("[unclosed").unwrap_err();
+        assert!(!err.is_empty(), "error message should not be empty");
+    }
+
+    #[test]
+    fn load_rules_io_error_on_missing_file() {
+        let path = Path::new("/nonexistent/path/rules.yaml");
+        match load_rules(path) {
+            Err(RulesError::Io(_)) => {}
+            other => panic!("expected Io error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_rules_empty_file_returns_no_rules() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("empty.yaml");
+        std::fs::write(&path, "rules: []\n").expect("write");
+        match load_rules(&path) {
+            Err(RulesError::NoRules) => {}
+            other => panic!("expected NoRules error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_rules_invalid_yaml_returns_yaml_error() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("bad.yaml");
+        std::fs::write(&path, "{{{{not yaml at all").expect("write");
+        match load_rules(&path) {
+            Err(RulesError::Yaml(_)) => {}
+            other => panic!("expected Yaml error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_rules_valid_minimal_rule_succeeds() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("good.yaml");
+        let yaml = r#"
+rules:
+  - name: "test-rule"
+    regex: 'tok_[a-z0-9]{8}'
+    anchors: ["tok_"]
+    radius: 64
+"#;
+        std::fs::write(&path, yaml).expect("write");
+        let rules = load_rules(&path).expect("should load successfully");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].name, "test-rule");
+    }
 }

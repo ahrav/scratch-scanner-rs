@@ -72,6 +72,8 @@ pub(crate) struct YamlLocalContext {
 
 // ---------------------------------------------------------------------------
 // Leak helpers — rules live for the entire process, so we leak into 'static.
+// Callers should load rules once at startup. Repeated calls leak memory
+// that is never reclaimed.
 // ---------------------------------------------------------------------------
 
 fn leak_str(s: String) -> &'static str {
@@ -114,11 +116,31 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
 
         let keywords_any: Option<&'static [&'static [u8]]> = yr.keywords_any.map(leak_bytes_slice);
 
-        let entropy = yr.entropy.map(|e| EntropySpec {
-            min_bits_per_byte: e.min_bits_per_byte,
-            min_len: e.min_len,
-            max_len: e.max_len,
-        });
+        let entropy = yr.entropy.map(|e| {
+            if !e.min_bits_per_byte.is_finite() || e.min_bits_per_byte < 0.0 {
+                return Err(RulesError::Validation {
+                    rule_name: name.clone(),
+                    message: format!(
+                        "entropy min_bits_per_byte must be finite and >= 0, got {}",
+                        e.min_bits_per_byte
+                    ),
+                });
+            }
+            if e.min_len > e.max_len {
+                return Err(RulesError::Validation {
+                    rule_name: name.clone(),
+                    message: format!(
+                        "entropy min_len ({}) must be <= max_len ({})",
+                        e.min_len, e.max_len
+                    ),
+                });
+            }
+            Ok(EntropySpec {
+                min_bits_per_byte: e.min_bits_per_byte,
+                min_len: e.min_len,
+                max_len: e.max_len,
+            })
+        }).transpose()?;
 
         let two_phase = yr.two_phase.map(|tp| TwoPhaseSpec {
             seed_radius: tp.seed_radius,
@@ -138,6 +160,9 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
             name: leak_str(name),
             anchors,
             radius: yr.radius,
+            // YAML rules do not yet support validators; all rules get `None`.
+            // If a future rule requires validation, add a `validator` field to
+            // `YamlRule` and deserialize it here.
             validator: ValidatorKind::None,
             two_phase,
             must_contain,
@@ -160,6 +185,7 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
 mod tests {
     use super::*;
     use crate::gitleaks_rules::gitleaks_rules;
+    use std::path::Path;
 
     /// Convert existing `RuleSpec` values back to YAML intermediate types.
     fn rulespec_to_yaml(rule: &RuleSpec) -> YamlRule {
@@ -221,28 +247,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn generate_default_rules_yaml() {
-        let rules = gitleaks_rules();
-        let yaml_rules: Vec<YamlRule> = rules.iter().map(rulespec_to_yaml).collect();
-        let file = YamlRulesFile { rules: yaml_rules };
-        let yaml_str = serde_yml::to_string(&file).expect("serialize to YAML");
-
-        let out_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("default_rules.yaml");
-        std::fs::write(&out_path, &yaml_str).expect("write default_rules.yaml");
-        eprintln!("wrote {} bytes to {}", yaml_str.len(), out_path.display());
-    }
-
-    #[test]
-    fn roundtrip_gitleaks_rules() {
-        let original_rules = gitleaks_rules();
-
-        // Convert to YAML and back.
-        let yaml_rules: Vec<YamlRule> = original_rules.iter().map(rulespec_to_yaml).collect();
-        let file = YamlRulesFile { rules: yaml_rules };
-        let yaml_str = serde_yml::to_string(&file).expect("serialize to YAML");
-        let parsed_rules = parse_yaml_rules(&yaml_str).expect("parse YAML rules");
-
+    fn assert_rules_equal(original_rules: &[RuleSpec], parsed_rules: &[RuleSpec]) {
         assert_eq!(
             original_rules.len(),
             parsed_rules.len(),
@@ -408,6 +413,29 @@ mod tests {
     }
 
     #[test]
+    fn default_rules_yaml_matches_builtin_rules() {
+        // Keep the checked-in YAML snapshot in sync with built-in rules
+        // without mutating repository files during normal test runs.
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("default_rules.yaml");
+        let yaml_str = std::fs::read_to_string(&path).expect("read default_rules.yaml");
+        let parsed_rules = parse_yaml_rules(&yaml_str).expect("parse default_rules.yaml");
+        let expected_rules = gitleaks_rules();
+        assert_rules_equal(&expected_rules, &parsed_rules);
+    }
+
+    #[test]
+    fn roundtrip_gitleaks_rules() {
+        let original_rules = gitleaks_rules();
+
+        // Convert to YAML and back.
+        let yaml_rules: Vec<YamlRule> = original_rules.iter().map(rulespec_to_yaml).collect();
+        let file = YamlRulesFile { rules: yaml_rules };
+        let yaml_str = serde_yml::to_string(&file).expect("serialize to YAML");
+        let parsed_rules = parse_yaml_rules(&yaml_str).expect("parse YAML rules");
+        assert_rules_equal(&original_rules, &parsed_rules);
+    }
+
+    #[test]
     fn parse_minimal_yaml() {
         let yaml = r#"
 rules:
@@ -451,5 +479,94 @@ rules:
         // load_rules catches the NoRules case.
         let rules = parse_yaml_rules(yaml).expect("parse empty rules");
         assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn parse_invalid_yaml_returns_yaml_error() {
+        let yaml = "{{{{not valid yaml";
+        match parse_yaml_rules(yaml) {
+            Err(RulesError::Yaml(_)) => {}
+            other => panic!("expected Yaml error, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_missing_required_field_returns_yaml_error() {
+        // Missing `regex` field.
+        let yaml = r#"
+rules:
+  - name: "incomplete"
+    anchors: ["tok"]
+    radius: 64
+"#;
+        match parse_yaml_rules(yaml) {
+            Err(RulesError::Yaml(_)) => {}
+            other => panic!("expected Yaml error for missing field, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_entropy_nan_rejected() {
+        let yaml = r#"
+rules:
+  - name: "nan-rule"
+    regex: 'tok_[a-z]{4}'
+    anchors: ["tok_"]
+    radius: 64
+    entropy:
+      min_bits_per_byte: .nan
+      min_len: 8
+      max_len: 64
+"#;
+        match parse_yaml_rules(yaml) {
+            Err(RulesError::Validation { rule_name, message }) => {
+                assert_eq!(rule_name, "nan-rule");
+                assert!(message.contains("finite"), "message: {message}");
+            }
+            other => panic!("expected Validation error, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_entropy_negative_rejected() {
+        let yaml = r#"
+rules:
+  - name: "neg-rule"
+    regex: 'tok_[a-z]{4}'
+    anchors: ["tok_"]
+    radius: 64
+    entropy:
+      min_bits_per_byte: -1.0
+      min_len: 8
+      max_len: 64
+"#;
+        match parse_yaml_rules(yaml) {
+            Err(RulesError::Validation { rule_name, .. }) => {
+                assert_eq!(rule_name, "neg-rule");
+            }
+            other => panic!("expected Validation error, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_entropy_min_exceeds_max_rejected() {
+        let yaml = r#"
+rules:
+  - name: "bad-len"
+    regex: 'tok_[a-z]{4}'
+    anchors: ["tok_"]
+    radius: 64
+    entropy:
+      min_bits_per_byte: 3.0
+      min_len: 100
+      max_len: 10
+"#;
+        match parse_yaml_rules(yaml) {
+            Err(RulesError::Validation { rule_name, message }) => {
+                assert_eq!(rule_name, "bad-len");
+                assert!(message.contains("min_len"), "message: {message}");
+            }
+            other => panic!("expected Validation error, got: {:?}", other),
+        }
     }
 }
