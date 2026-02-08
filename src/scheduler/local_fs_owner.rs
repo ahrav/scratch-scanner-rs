@@ -2251,11 +2251,11 @@ fn extract_and_scan_file<E: ScanEngine>(
         .read_to_end(&mut scratch.extract_buf)
         .is_err()
     {
+        ctx.metrics.io_errors = ctx.metrics.io_errors.saturating_add(1);
         return;
     }
 
-    // Extract scannable text using pre-allocated buffers (split borrows).
-    scratch.extract_out_buf.clear();
+    // Extract scannable text (extract_content clears out before dispatch).
     let result = extract_content(
         fmt,
         &scratch.extract_buf,

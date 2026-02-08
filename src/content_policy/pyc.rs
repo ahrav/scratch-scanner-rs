@@ -205,7 +205,11 @@ impl Extractor for PycExtractor {
                         break;
                     }
                     let n = data[pos] as usize;
-                    pos += 1 + n;
+                    pos += 1;
+                    if pos + n > data.len() {
+                        break;
+                    }
+                    pos += n;
                 }
                 TYPE_COMPLEX => {
                     // Legacy complex: two legacy floats.
@@ -213,15 +217,23 @@ impl Extractor for PycExtractor {
                         break;
                     }
                     let n1 = data[pos] as usize;
-                    pos += 1 + n1;
+                    pos += 1;
+                    if pos + n1 > data.len() {
+                        break;
+                    }
+                    pos += n1;
                     if pos >= data.len() {
                         break;
                     }
                     let n2 = data[pos] as usize;
-                    pos += 1 + n2;
+                    pos += 1;
+                    if pos + n2 > data.len() {
+                        break;
+                    }
+                    pos += n2;
                 }
                 TYPE_LONG => {
-                    // Variable-length long: i32 count of 15-bit digits.
+                    // Variable-length long: i32 count of 15-bit digits (2 bytes each).
                     if pos + 4 > data.len() {
                         break;
                     }
@@ -232,7 +244,15 @@ impl Extractor for PycExtractor {
                         data[pos + 3],
                     ])
                     .unsigned_abs() as usize;
-                    pos += 4 + n * 2;
+                    pos += 4;
+                    let byte_len = match n.checked_mul(2) {
+                        Some(v) => v,
+                        None => break,
+                    };
+                    if pos + byte_len > data.len() {
+                        break;
+                    }
+                    pos += byte_len;
                 }
                 TYPE_REF => {
                     pos += 4;
@@ -532,12 +552,8 @@ mod tests {
 
     #[test]
     fn skips_small_tuple_and_tuple() {
-        let mut marshal = Vec::new();
         // SMALL_TUPLE with 1 element (the element is a string).
-        marshal.push(TYPE_SMALL_TUPLE);
-        marshal.push(1); // 1-byte count
-        marshal.push(TYPE_SHORT_ASCII);
-        marshal.push(5);
+        let mut marshal = vec![TYPE_SMALL_TUPLE, 1, TYPE_SHORT_ASCII, 5];
         marshal.extend_from_slice(b"inner");
         // TUPLE with 1 element.
         marshal.push(TYPE_TUPLE);

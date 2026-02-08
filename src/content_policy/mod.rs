@@ -82,8 +82,10 @@ pub fn classify_content(data: &[u8], path: &[u8], check_len: usize) -> ContentVe
     if !is_likely_binary(data, check_len) {
         // .ipynb files are JSON (text) but we still want to classify them as
         // extractable so the extractor can pull code cells only (ignoring
-        // output blobs). Other extractable extensions should remain Text
-        // unless the content is actually binary.
+        // output blobs). Other extractable extensions (.class, .jar, .war,
+        // .pyc) should only trigger extraction when the data actually
+        // contains NUL bytes — otherwise a misnamed text file would be
+        // silently skipped instead of scanned.
         #[cfg(feature = "binary-extract")]
         if let Some(ExtractableFormat::Ipynb) = match_extractable_extension(path) {
             return ContentVerdict::BinaryExtractable(ExtractableFormat::Ipynb);
