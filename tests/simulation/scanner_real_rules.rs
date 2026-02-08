@@ -94,7 +94,7 @@ fn collect_files(dir: &Path, out: &mut Vec<LocalFile>) {
 
 /// Build an `Engine` from the real gitleaks ruleset with production transforms and tuning.
 fn build_real_engine() -> Engine {
-    let rules = scanner_rs::gitleaks_rules();
+    let rules = scanner_rs::demo_rules();
     Engine::new(rules, demo_transforms(), demo_tuning())
 }
 

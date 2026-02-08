@@ -294,6 +294,13 @@ impl Engine {
         );
         for r in &rules {
             r.assert_valid();
+            if policy == AnchorPolicy::ManualOnly {
+                assert!(
+                    !r.anchors.is_empty(),
+                    "rule {:?}: anchors must not be empty when using ManualOnly policy",
+                    r.name,
+                );
+            }
         }
         for tc in &transforms {
             tc.assert_valid();

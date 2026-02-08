@@ -1240,9 +1240,7 @@ fn local_context_gate_applies_in_utf16_path() {
 fn secret_extraction_sonar_extracts_token_not_keyword() {
     // Regression test: sonar-api-token was extracting "login"|"token" (group 1)
     // instead of the actual secret (group 2). Verify we extract the token.
-    use crate::gitleaks_rules::gitleaks_rules;
-
-    let rules = gitleaks_rules();
+    let rules = crate::rules::builtin_rules();
     let sonar_rule = rules
         .iter()
         .find(|r| r.name == "sonar-api-token")
@@ -1280,9 +1278,7 @@ fn secret_extraction_sonar_extracts_token_not_keyword() {
 fn secret_extraction_teams_webhook_extracts_full_url() {
     // Regression test: microsoft-teams-webhook was extracting GUID fragment
     // (from capture groups used for repetition) instead of the full URL.
-    use crate::gitleaks_rules::gitleaks_rules;
-
-    let rules = gitleaks_rules();
+    let rules = crate::rules::builtin_rules();
     let teams_rule = rules
         .iter()
         .find(|r| r.name == "microsoft-teams-webhook")

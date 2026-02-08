@@ -12,18 +12,17 @@
 
 use std::collections::BTreeMap;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::api::RuleSpec;
 use crate::git_scan::{
     self, run_git_scan, GitScanConfig, GitScanResult, InMemoryPersistenceStore, NeverSeenStore,
     StartSetConfig,
 };
 use crate::scheduler::{parallel_scan_dir, ParallelScanConfig};
-use crate::{
-    demo_engine_with_anchor_mode, demo_engine_with_anchor_mode_and_max_transform_depth, demo_rules,
-    demo_transforms, demo_tuning, AnchorMode, AnchorPolicy, Engine,
-};
+use crate::{demo_rules, demo_transforms, demo_tuning, AnchorMode, AnchorPolicy, Engine};
 
 use super::source::git::{EmptyWatermarkStore, GitCliResolver};
 use super::{EventFormat, FsScanConfig, GitSourceConfig, ScanConfig, SourceConfig};
@@ -34,9 +33,10 @@ use super::{EventFormat, FsScanConfig, GitSourceConfig, ScanConfig, SourceConfig
 /// detection engine, selects the source driver, and runs the scan.
 pub fn run(config: ScanConfig) -> io::Result<()> {
     let event_format = config.event_format;
+    let rules_file = config.rules_file;
     match config.source {
-        SourceConfig::Fs(fs_cfg) => run_fs(fs_cfg, event_format),
-        SourceConfig::Git(git_cfg) => run_git(git_cfg, event_format),
+        SourceConfig::Fs(fs_cfg) => run_fs(fs_cfg, event_format, rules_file),
+        SourceConfig::Git(git_cfg) => run_git(git_cfg, event_format, rules_file),
     }
 }
 
@@ -44,12 +44,28 @@ pub fn run(config: ScanConfig) -> io::Result<()> {
 ///
 /// Findings are emitted as structured JSONL events to stdout via the
 /// [`EventSink`]. Summary stats are written to stderr.
-fn run_fs(cfg: FsScanConfig, event_format: EventFormat) -> io::Result<()> {
+fn run_fs(
+    cfg: FsScanConfig,
+    event_format: EventFormat,
+    rules_file: Option<PathBuf>,
+) -> io::Result<()> {
     use super::events::{ScanEvent, SummaryEvent};
     use super::SourceKind;
 
     let t0 = Instant::now();
-    let engine = Arc::new(build_engine(cfg.anchor_mode, cfg.decode_depth));
+    let rules = load_rules_for_scan(rules_file.as_deref());
+    let transforms = demo_transforms();
+    let mut tuning = demo_tuning();
+    if let Some(depth) = cfg.decode_depth {
+        tuning.max_transform_depth = depth;
+    }
+    let policy = match cfg.anchor_mode {
+        AnchorMode::Manual => AnchorPolicy::ManualOnly,
+        AnchorMode::Derived => AnchorPolicy::DerivedOnly,
+    };
+    let engine = Arc::new(Engine::new_with_anchor_policy(
+        rules, transforms, tuning, policy,
+    ));
     let init_elapsed = t0.elapsed();
 
     let scan_start = Instant::now();
@@ -118,8 +134,12 @@ fn run_fs(cfg: FsScanConfig, event_format: EventFormat) -> io::Result<()> {
 /// resolves the start set via `git` CLI commands, and runs the scan.
 /// Findings stream through the [`EventSink`](super::events::EventSink);
 /// summary + optional debug/perf output goes to stderr.
-fn run_git(cfg: GitSourceConfig, event_format: EventFormat) -> io::Result<()> {
-    let rules = demo_rules();
+fn run_git(
+    cfg: GitSourceConfig,
+    event_format: EventFormat,
+    rules_file: Option<PathBuf>,
+) -> io::Result<()> {
+    let rules = load_rules_for_scan(rules_file.as_deref());
     let transforms = demo_transforms();
     let mut tuning = demo_tuning();
     if let Some(depth) = cfg.decode_depth {
@@ -490,14 +510,32 @@ fn print_git_perf_breakdown(report: &git_scan::GitScanReport, config: &GitScanCo
     eprintln!("  top_buckets: {}", cache_reject_hist.format_top(5));
 }
 
-/// Build the detection engine with the given anchor mode and optional decode depth.
+/// Load rules from a YAML file, falling back to the compiled-in set.
 ///
-/// Uses the built-in demo rules, transforms, and tuning defaults.
-/// If `decode_depth` is `Some`, it overrides the default max transform
-/// depth (number of Base64 / URL-decode passes the engine will attempt).
-fn build_engine(anchor_mode: AnchorMode, decode_depth: Option<usize>) -> Engine {
-    match decode_depth {
-        Some(depth) => demo_engine_with_anchor_mode_and_max_transform_depth(anchor_mode, depth),
-        None => demo_engine_with_anchor_mode(anchor_mode),
+/// Fallback chain: explicit path > `default_rules.yaml` next to binary > `demo_rules()`.
+fn load_rules_for_scan(rules_file: Option<&Path>) -> Vec<RuleSpec> {
+    let path = match rules_file {
+        Some(p) => p.to_path_buf(),
+        None => match crate::rules::default_rules_path() {
+            Some(p) if p.exists() => {
+                eprintln!("info: loading rules from {}", p.display());
+                p
+            }
+            _ => {
+                let rules = demo_rules();
+                eprintln!("info: using compiled-in rule set ({} rules)", rules.len());
+                return rules;
+            }
+        },
+    };
+    match crate::rules::load_rules(&path) {
+        Ok(rules) => {
+            eprintln!("info: loaded {} rules from {}", rules.len(), path.display());
+            rules
+        }
+        Err(e) => {
+            eprintln!("error: failed to load rules from {}: {e}", path.display());
+            std::process::exit(2);
+        }
     }
 }

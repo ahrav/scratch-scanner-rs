@@ -23,6 +23,10 @@ use super::{EventFormat, FsScanConfig, GitSourceConfig, SourceConfig};
 pub struct ScanConfig {
     pub source: SourceConfig,
     pub event_format: EventFormat,
+    /// Optional path to a YAML rules file. When `None`, the orchestrator
+    /// falls back to `default_rules.yaml` next to the binary, then the
+    /// compiled-in demo rules.
+    pub rules_file: Option<PathBuf>,
 }
 
 /// Parse `std::env::args_os()` into a [`ScanConfig`].
@@ -89,7 +93,7 @@ pub fn parse_args() -> io::Result<ScanConfig> {
 /// Parse `--path`, `--workers`, and other FS-specific flags from the
 /// remaining argument iterator. Accepts `--path=<dir>` or a bare positional
 /// path. Exits with code 2 on unrecognised flags or missing `--path`.
-fn parse_fs_args(args: env::ArgsOs) -> io::Result<ScanConfig> {
+fn parse_fs_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<ScanConfig> {
     let mut path: Option<PathBuf> = None;
     let mut workers: Option<usize> = None;
     let mut decode_depth: Option<usize> = None;
@@ -97,8 +101,19 @@ fn parse_fs_args(args: env::ArgsOs) -> io::Result<ScanConfig> {
     let mut null_sink = false;
     let mut anchor_mode = AnchorMode::Manual;
     let mut event_format = EventFormat::Jsonl;
+    let mut rules_file: Option<PathBuf> = None;
 
     for arg in args {
+        // Handle --rules= before UTF-8 conversion since paths may be non-UTF8.
+        if let Some(rest) = strip_os_prefix(&arg, "--rules=") {
+            if rest.is_empty() {
+                eprintln!("error: --rules requires a file path");
+                std::process::exit(2);
+            }
+            rules_file = Some(PathBuf::from(rest));
+            continue;
+        }
+
         if let Some(flag) = arg.to_str() {
             if let Some(rest) = flag.strip_prefix("--path=") {
                 path = Some(PathBuf::from(rest));
@@ -171,13 +186,14 @@ fn parse_fs_args(args: env::ArgsOs) -> io::Result<ScanConfig> {
             null_sink,
         }),
         event_format,
+        rules_file,
     })
 }
 
 /// Parse `--repo`, `--mode`, and other git-specific flags from the
 /// remaining argument iterator. Accepts `--repo=<path>` or a bare positional
 /// path. Exits with code 2 on unrecognised flags or missing `--repo`.
-fn parse_git_args(args: env::ArgsOs) -> io::Result<ScanConfig> {
+fn parse_git_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<ScanConfig> {
     let mut repo: Option<PathBuf> = None;
     let mut repo_id: u64 = 1;
     let mut scan_mode = GitScanMode::OdbBlobFast;
@@ -190,8 +206,19 @@ fn parse_git_args(args: env::ArgsOs) -> io::Result<ScanConfig> {
     let mut debug = false;
     let mut perf_breakdown = false;
     let mut event_format = EventFormat::Jsonl;
+    let mut rules_file: Option<PathBuf> = None;
 
     for arg in args {
+        // Handle --rules= before UTF-8 conversion since paths may be non-UTF8.
+        if let Some(rest) = strip_os_prefix(&arg, "--rules=") {
+            if rest.is_empty() {
+                eprintln!("error: --rules requires a file path");
+                std::process::exit(2);
+            }
+            rules_file = Some(PathBuf::from(rest));
+            continue;
+        }
+
         if let Some(flag) = arg.to_str() {
             if let Some(rest) = flag.strip_prefix("--repo=") {
                 repo = Some(PathBuf::from(rest));
@@ -313,6 +340,7 @@ fn parse_git_args(args: env::ArgsOs) -> io::Result<ScanConfig> {
             perf_breakdown,
         }),
         event_format,
+        rules_file,
     })
 }
 
@@ -353,6 +381,20 @@ fn parse_event_format(s: &str) -> EventFormat {
 // Usage text
 // ---------------------------------------------------------------------------
 
+/// Extract the value from a `--flag=value` OsString without requiring UTF-8.
+///
+/// Returns the portion after `prefix` if the arg starts with it, or `None`.
+fn strip_os_prefix<'a>(arg: &'a std::ffi::OsStr, prefix: &str) -> Option<&'a std::ffi::OsStr> {
+    let bytes = arg.as_encoded_bytes();
+    if bytes.starts_with(prefix.as_bytes()) {
+        // SAFETY: `prefix` is pure ASCII, so splitting at its byte boundary
+        // cannot break a valid platform OsStr encoding.
+        Some(unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(&bytes[prefix.len()..]) })
+    } else {
+        None
+    }
+}
+
 fn print_top_usage(exe: &std::ffi::OsStr) {
     eprintln!(
         "usage: {} scan <source> [OPTIONS]
@@ -380,6 +422,7 @@ fn print_fs_usage() {
 
 OPTIONS:
     --path=<dir|file>       Path to scan (also accepted as positional arg)
+    --rules=<path>          YAML rules file (default: default_rules.yaml next to binary)
     --workers=<N>           Worker threads (default: CPU count)
     --decode-depth=<N>      Max decode depth (default: 2)
     --no-archives           Disable archive scanning
@@ -397,6 +440,7 @@ fn print_git_usage() {
 OPTIONS:
     --repo=<path>             Repository path (also accepted as positional arg)
     --repo-id=<N>             Repository id (default: 1)
+    --rules=<path>            YAML rules file (default: default_rules.yaml next to binary)
     --mode=diff|odb-blob      Scan mode (default: odb-blob)
     --merge=all|first-parent  Merge diff mode (default: all)
     --pack-exec-workers=<N>   Pack exec workers
@@ -409,4 +453,77 @@ OPTIONS:
     --event-format=jsonl      Output format (default: jsonl)
     --help, -h                Show this help"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    #[test]
+    fn fs_rules_utf8_path_parsed() {
+        let args = vec![
+            OsString::from("--path=/some/dir"),
+            OsString::from("--rules=/tmp/rules.yaml"),
+        ];
+        let config = parse_fs_args(args.into_iter()).unwrap();
+        assert_eq!(
+            config.rules_file.as_deref(),
+            Some(std::path::Path::new("/tmp/rules.yaml")),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_rules_non_utf8_path_parsed() {
+        use std::os::unix::ffi::OsStringExt;
+        // --rules=/tmp/\xff/rules.yaml  (byte 0xFF is invalid UTF-8)
+        let rules_arg = OsString::from_vec(b"--rules=/tmp/\xff/rules.yaml".to_vec());
+        let args = vec![OsString::from("--path=/some/dir"), rules_arg];
+        let config = parse_fs_args(args.into_iter()).unwrap();
+        assert!(
+            config.rules_file.is_some(),
+            "non-UTF8 --rules= path must not be silently ignored"
+        );
+        let got = config.rules_file.unwrap();
+        let expected =
+            std::path::PathBuf::from(OsString::from_vec(b"/tmp/\xff/rules.yaml".to_vec()));
+        assert_eq!(got, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_rules_non_utf8_path_parsed() {
+        use std::os::unix::ffi::OsStringExt;
+        let rules_arg = OsString::from_vec(b"--rules=/tmp/\xff/rules.yaml".to_vec());
+        let args = vec![OsString::from("--repo=/some/repo"), rules_arg];
+        let config = parse_git_args(args.into_iter()).unwrap();
+        assert!(
+            config.rules_file.is_some(),
+            "non-UTF8 --rules= path must not be silently ignored"
+        );
+    }
+
+    #[test]
+    fn strip_os_prefix_matches() {
+        let arg = std::ffi::OsStr::new("--rules=/foo/bar");
+        let val = strip_os_prefix(arg, "--rules=").unwrap();
+        assert_eq!(val, "/foo/bar");
+    }
+
+    #[test]
+    fn strip_os_prefix_no_match() {
+        let arg = std::ffi::OsStr::new("--path=/foo");
+        assert!(strip_os_prefix(arg, "--rules=").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strip_os_prefix_non_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+        let arg = OsString::from_vec(b"--rules=/tmp/\xff/r.yaml".to_vec());
+        let val = strip_os_prefix(&arg, "--rules=").unwrap();
+        let expected = OsString::from_vec(b"/tmp/\xff/r.yaml".to_vec());
+        assert_eq!(val, &*expected);
+    }
 }
