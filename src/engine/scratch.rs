@@ -227,6 +227,17 @@ impl EntropyScratch {
     }
 }
 
+#[repr(align(64))]
+struct CachelineBoundary {
+    _pad: [u8; 0],
+}
+
+impl CachelineBoundary {
+    const fn new() -> Self {
+        Self { _pad: [] }
+    }
+}
+
 /// Per-scan scratch state reused across chunks.
 ///
 /// This is the main allocation amortization vehicle: it owns buffers for window
@@ -246,7 +257,16 @@ impl EntropyScratch {
 /// # Performance
 /// - Fixed-capacity buffers cap per-scan work; overflow increments
 ///   [`ScanScratch::dropped_findings`].
+///
+/// # Layout
+/// - `#[repr(C)]` preserves declared field order so the explicit 64-byte
+///   boundary between hot and cold regions remains stable.
+/// - The `_cold_boundary` marker forces the first cold field (`slab`) to begin
+///   at a cache-line boundary, reducing hot/cold false sharing within the
+///   per-worker scratch object.
+#[repr(C)]
 pub struct ScanScratch {
+    // ---------------- Hot scan-loop region ----------------
     /// Per-chunk finding records awaiting materialization.
     ///
     /// Compact records are stored here during scanning; they are expanded into
@@ -266,26 +286,7 @@ pub struct ScanScratch {
     /// Fixed capacity ensures no allocations during the scan loop; the tuning
     /// parameter `max_work_items` determines the upper bound.
     pub(super) work_q: ScratchVec<WorkItem>,
-    pub(super) work_head: usize,  // Cursor into work_q.
-    pub(super) slab: DecodeSlab,  // Decoded output storage.
-    pub(super) seen: FixedSet128, // Dedupe for decoded buffers.
-    /// Bloom-style deduplication for output findings within a file.
-    ///
-    /// Prevents emitting the same finding multiple times when overlapping chunks
-    /// or transform re-scans produce identical matches. The set is reset on file
-    /// boundary transitions (new file or `base_offset == 0`).
-    ///
-    /// Key composition (32 bytes → 128-bit hash):
-    /// - `file_id` (4 bytes) — scoped to current file
-    /// - `rule_id` (4 bytes) — distinguishes rule matches
-    /// - `span_start`, `span_end` (8 bytes) — root-level span (zeroed for mapped transforms)
-    /// - `root_hint_start`, `root_hint_end` (16 bytes) — dedupe boundary in root coordinates
-    ///
-    /// Transform-derived findings use zeroed span coordinates when a precise
-    /// root-span mapping exists because the same encoded region can decode to
-    /// different offsets across chunk boundaries. When mapping is unavailable,
-    /// the decoded span is included to keep distinct matches separate.
-    pub(super) seen_findings: FixedSet128,
+    pub(super) work_head: usize, // Cursor into work_q.
     /// Per-scan dedupe set used to detect duplicates within a single chunk scan.
     ///
     /// This resets every `scan_chunk_into` and lets us prefer more informative
@@ -293,26 +294,6 @@ pub struct ScanScratch {
     pub(super) seen_findings_scan: FixedSet128,
     pub(super) total_decode_output_bytes: usize, // Global decode budget tracker.
     pub(super) work_items_enqueued: usize,       // Work queue budget tracker.
-    /// Streaming decoded-byte ring buffer for window capture.
-    pub(super) decode_ring: ByteRing,
-    /// Temporary buffer for materializing decoded windows from the ring.
-    pub(super) window_bytes: Vec<u8>,
-    /// Pending window timing wheel (exact, G=1) keyed by `hi` for decoded stream verification.
-    pub(super) pending_windows: TimingWheel<PendingWindow, 1>,
-    /// Max window horizon used to size the timing wheel (max window radius + stream chunk).
-    pub(super) pending_window_horizon_bytes: u64,
-    /// Match windows produced by the Vectorscan stream callback.
-    pub(super) vs_stream_matches: Vec<VsStreamWindow>,
-    /// Pending decode spans captured during streaming decode.
-    pub(super) pending_spans: Vec<PendingDecodeSpan>,
-    /// Span detectors for nested transforms in decoded streams.
-    pub(super) span_streams: Vec<SpanStreamEntry>,
-    /// Temporary findings buffer for a decoded stream (dedupe-aware).
-    pub(super) tmp_findings: Vec<FindingRec>,
-    /// Drop boundaries aligned with `tmp_findings`.
-    pub(super) tmp_drop_hint_end: Vec<u64>,
-    /// Normalized hashes aligned with `tmp_findings`.
-    pub(super) tmp_norm_hash: Vec<NormHash>,
     /// Per-rule regex capture locations (reused to avoid per-scan allocations).
     pub(super) capture_locs: Vec<Option<CaptureLocations>>,
     /// Per-rule stream hit counts for decoded-window seeding.
@@ -338,19 +319,12 @@ pub struct ScanScratch {
     /// capacity sized to the maximum window size ensures no allocation during
     /// variant scanning.
     pub(super) utf16_buf: ScratchVec<u8>,
-    pub(super) entropy_scratch: EntropyScratch, // Entropy histogram scratch.
     /// Scratch buffer for materializing decode step chains.
     ///
     /// When a finding is emitted, its `StepId` is traced through the arena to
     /// reconstruct the full decode path. This buffer holds the reversed chain
     /// during materialization. Capacity is bounded by `max_transform_depth`.
     pub(super) steps_buf: ScratchVec<DecodeStep>,
-    /// Active decoded→root coordinate mapping context (set during transform scans).
-    ///
-    /// Set by the scan loop before scanning a decoded buffer and cleared after
-    /// each buffer scan completes. When `Some`, findings from decoded buffers
-    /// use this context to map spans back to root-buffer offsets.
-    pub(super) root_span_map_ctx: Option<RootSpanMapCtx>,
     /// Set by `scan_chunk_into` after running the Vectorscan prefilter on the
     /// root buffer. Consumed (one-shot) by the first `scan_rules_on_buffer`
     /// call so that the root buffer skips redundant prefiltering. Transform
@@ -365,6 +339,63 @@ pub struct ScanScratch {
     /// appeared in the prior chunk, so dedupe boundaries can be widened only
     /// when needed.
     pub(super) chunk_overlap_backscan: usize,
+    /// Set after the first `reset_for_scan` validates capacities.
+    ///
+    /// Since the `Engine` is immutable after construction, capacity checks
+    /// are idempotent — they only matter on the first call. Subsequent calls
+    /// skip the validation block for reduced per-chunk overhead.
+    capacity_validated: bool,
+
+    // --------------- Cache-line boundary ----------------
+    _cold_boundary: CachelineBoundary,
+
+    // ---------------- Cold / conditional region ----------------
+    pub(super) slab: DecodeSlab,  // Decoded output storage.
+    pub(super) seen: FixedSet128, // Dedupe for decoded buffers.
+    /// Bloom-style deduplication for output findings within a file.
+    ///
+    /// Prevents emitting the same finding multiple times when overlapping chunks
+    /// or transform re-scans produce identical matches. The set is reset on file
+    /// boundary transitions (new file or `base_offset == 0`).
+    ///
+    /// Key composition (32 bytes → 128-bit hash):
+    /// - `file_id` (4 bytes) — scoped to current file
+    /// - `rule_id` (4 bytes) — distinguishes rule matches
+    /// - `span_start`, `span_end` (8 bytes) — root-level span (zeroed for mapped transforms)
+    /// - `root_hint_start`, `root_hint_end` (16 bytes) — dedupe boundary in root coordinates
+    ///
+    /// Transform-derived findings use zeroed span coordinates when a precise
+    /// root-span mapping exists because the same encoded region can decode to
+    /// different offsets across chunk boundaries. When mapping is unavailable,
+    /// the decoded span is included to keep distinct matches separate.
+    pub(super) seen_findings: FixedSet128,
+    /// Streaming decoded-byte ring buffer for window capture.
+    pub(super) decode_ring: ByteRing,
+    /// Temporary buffer for materializing decoded windows from the ring.
+    pub(super) window_bytes: Vec<u8>,
+    /// Pending window timing wheel (exact, G=1) keyed by `hi` for decoded stream verification.
+    pub(super) pending_windows: TimingWheel<PendingWindow, 1>,
+    /// Max window horizon used to size the timing wheel (max window radius + stream chunk).
+    pub(super) pending_window_horizon_bytes: u64,
+    /// Match windows produced by the Vectorscan stream callback.
+    pub(super) vs_stream_matches: Vec<VsStreamWindow>,
+    /// Pending decode spans captured during streaming decode.
+    pub(super) pending_spans: Vec<PendingDecodeSpan>,
+    /// Span detectors for nested transforms in decoded streams.
+    pub(super) span_streams: Vec<SpanStreamEntry>,
+    /// Temporary findings buffer for a decoded stream (dedupe-aware).
+    pub(super) tmp_findings: Vec<FindingRec>,
+    /// Drop boundaries aligned with `tmp_findings`.
+    pub(super) tmp_drop_hint_end: Vec<u64>,
+    /// Normalized hashes aligned with `tmp_findings`.
+    pub(super) tmp_norm_hash: Vec<NormHash>,
+    pub(super) entropy_scratch: EntropyScratch, // Entropy histogram scratch.
+    /// Active decoded→root coordinate mapping context (set during transform scans).
+    ///
+    /// Set by the scan loop before scanning a decoded buffer and cleared after
+    /// each buffer scan completes. When `Some`, findings from decoded buffers
+    /// use this context to map spans back to root-buffer offsets.
+    pub(super) root_span_map_ctx: Option<RootSpanMapCtx>,
     /// Last scanned chunk metadata (used to infer overlap).
     pub(super) last_chunk_start: u64,
     pub(super) last_chunk_len: usize,
@@ -389,12 +420,6 @@ pub struct ScanScratch {
     pub(super) vs_gate_scratch: Option<VsScratch>,
     #[cfg(feature = "b64-stats")]
     pub(super) base64_stats: Base64DecodeStats, // Base64 decode/gate instrumentation.
-    /// Set after the first `reset_for_scan` validates capacities.
-    ///
-    /// Since the `Engine` is immutable after construction, capacity checks
-    /// are idempotent — they only matter on the first call. Subsequent calls
-    /// skip the validation block for reduced per-chunk overhead.
-    capacity_validated: bool,
 }
 
 impl ScanScratch {
@@ -515,12 +540,13 @@ impl ScanScratch {
             root_prefilter_done: false,
             root_prefilter_saw_utf16: false,
             chunk_overlap_backscan: 0,
+            capacity_validated: false,
+            _cold_boundary: CachelineBoundary::new(),
             last_chunk_start: 0,
             last_chunk_len: 0,
             last_file_id: None,
             #[cfg(feature = "b64-stats")]
             base64_stats: Base64DecodeStats::default(),
-            capacity_validated: false,
         }
     }
 
@@ -1258,5 +1284,23 @@ impl ScanScratch {
         } else {
             self.findings_dropped = self.findings_dropped.saturating_add(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CachelineBoundary, ScanScratch};
+
+    #[test]
+    fn scanscratch_cold_region_is_cacheline_aligned() {
+        assert_eq!(std::mem::align_of::<CachelineBoundary>(), 64);
+        assert_eq!(std::mem::align_of::<ScanScratch>() % 64, 0);
+
+        let cold_boundary_offset = std::mem::offset_of!(ScanScratch, _cold_boundary);
+        let slab_offset = std::mem::offset_of!(ScanScratch, slab);
+
+        assert_eq!(cold_boundary_offset % 64, 0);
+        assert_eq!(slab_offset % 64, 0);
+        assert!(slab_offset >= cold_boundary_offset);
     }
 }

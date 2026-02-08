@@ -582,24 +582,34 @@ The overlap ensures patterns that span chunk boundaries are detected:
 ## ScanScratch Per-Chunk State
 
 ```rust
+#[repr(C)]
 pub struct ScanScratch {
-    out: Vec<FindingRec>,           // Output findings
-    work_q: Vec<WorkItem>,          // Transform work queue (40B/item, packed flat struct)
-    work_head: usize,               // Current work item index
-    slab: DecodeSlab,               // Decoded buffer storage
-    seen: FixedSet128,              // Deduplication set
-    total_decode_output_bytes: usize,
-    work_items_enqueued: usize,
-    hit_acc_pool: HitAccPool,       // Per-(rule, variant) accumulator pool
-    touched_pairs: ScratchVec<u32>, // Scratch list of touched (rule, variant)
-    windows: ScratchVec<SpanU32>,   // Temp window storage
-    expanded: ScratchVec<SpanU32>,  // Expanded two-phase windows
-    spans: ScratchVec<SpanU32>,     // Transform span candidates
-    gate: GateScratch,              // Gate streaming scratch
-    step_arena: StepArena,          // Decode provenance
-    pending_windows: TimingWheel<PendingWindow, 1>,  // Window expiration scheduler
-    utf16_buf: Vec<u8>,             // UTF-16 decode output
-    steps_buf: Vec<DecodeStep>,     // Finding materialization temp
+    // Hot scan-loop region (always touched)
+    out: ScratchVec<FindingRec>,
+    norm_hash: ScratchVec<NormHash>,
+    drop_hint_end: ScratchVec<u64>,
+    work_q: ScratchVec<WorkItem>,
+    hit_acc_pool: HitAccPool,
+    touched_pairs: ScratchVec<u32>,
+    windows: ScratchVec<SpanU32>,
+    expanded: ScratchVec<SpanU32>,
+    spans: ScratchVec<SpanU32>,
+    step_arena: StepArena,
+    utf16_buf: ScratchVec<u8>,
+    steps_buf: ScratchVec<DecodeStep>,
+
+    // Cache-line split between hot and cold regions.
+    _cold_boundary: CachelineBoundary, // #[repr(align(64))]
+
+    // Cold / conditional region (streaming, transform, instrumentation)
+    slab: DecodeSlab,
+    seen: FixedSet128,
+    seen_findings: FixedSet128,
+    decode_ring: ByteRing,
+    pending_windows: TimingWheel<PendingWindow, 1>,
+    entropy_scratch: EntropyScratch,
+    root_span_map_ctx: Option<RootSpanMapCtx>,
+    // ... additional cold fields omitted ...
 }
 ```
 
@@ -607,3 +617,5 @@ All vectors are reused across chunks via `reset_for_scan()`:
 - Vectors are cleared but retain capacity
 - `seen` uses generation-based O(1) reset
 - Avoids per-chunk allocation overhead
+- `#[repr(C)]` + `_cold_boundary` guarantees the first cold field starts on a
+  64-byte boundary, reducing hot/cold cache-line interference
