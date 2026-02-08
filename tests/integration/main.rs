@@ -4,6 +4,7 @@
 
 mod anchor_optimization;
 mod archive_scanning;
+mod binary_awareness;
 mod fs_cli_archives;
 mod git_commit_walk;
 mod git_engine_adapter;

@@ -138,6 +138,10 @@ pub struct LocalConfig {
     /// Archive scanning configuration.
     pub archive: ArchiveConfig,
 
+    /// When `true`, skip files that appear to be binary (NUL byte heuristic).
+    /// Defaults to `true`. Set to `false` via `--scan-binary` to scan everything.
+    pub skip_binary: bool,
+
     /// Structured event sink for finding output.
     ///
     /// All findings are emitted as `ScanEvent::Finding` through this sink.
@@ -156,6 +160,7 @@ impl Default for LocalConfig {
             seed: 0x853c49e6748fea9b,
             dedupe_within_chunk: true,
             archive: ArchiveConfig::default(),
+            skip_binary: true,
             event_sink: Arc::new(crate::unified::events::NullEventSink),
         }
     }
@@ -173,6 +178,7 @@ impl std::fmt::Debug for LocalConfig {
             .field("seed", &self.seed)
             .field("dedupe_within_chunk", &self.dedupe_within_chunk)
             .field("archive", &self.archive)
+            .field("skip_binary", &self.skip_binary)
             .field("event_sink", &"<dyn EventSink>")
             .finish()
     }
@@ -359,6 +365,19 @@ struct LocalScratch<E: ScanEngine> {
     chunk_size: usize,
     max_file_size: u64,
     archive: ArchiveConfig,
+    /// When `true`, skip files that appear to be binary.
+    skip_binary: bool,
+    /// Probe buffer for binary detection when archive sniffing is disabled.
+    binary_probe_buf: [u8; crate::content_policy::CHECK_LEN],
+    /// Reusable buffer for reading extractable binary files (input).
+    #[cfg(feature = "binary-extract")]
+    extract_buf: Vec<u8>,
+    /// Reusable buffer for extraction output.
+    #[cfg(feature = "binary-extract")]
+    extract_out_buf: Vec<u8>,
+    /// Temporary workspace for extractors (e.g. per-entry reads in JARs).
+    #[cfg(feature = "binary-extract")]
+    extract_scratch: Vec<u8>,
 }
 
 // ============================================================================
@@ -514,12 +533,15 @@ fn build_locator(out: &mut [u8; LOCATOR_LEN], kind: u8, value: u64) -> &[u8] {
     out
 }
 
-#[inline]
 /// Dispatch archive scanning by kind.
 ///
-/// Currently gzip/tar/tar.gz are supported; other formats are skipped.
+/// Routes to `process_gzip_file`, `process_tar_file`, `process_targz_file`,
+/// or `process_zip_file` based on the detected [`ArchiveKind`].
 ///
-/// The caller is responsible for recording archive stats based on the result.
+/// The caller is responsible for recording archive-level stats
+/// (`record_archive_scanned` / `record_archive_skipped` / `record_archive_partial`)
+/// based on the returned [`ArchiveEnd`].
+#[inline]
 fn dispatch_archive_scan<E: ScanEngine>(
     task: &FileTask,
     ctx: &mut WorkerCtx<FileTask, LocalScratch<E>>,
@@ -2177,11 +2199,123 @@ fn process_zip_file<E: ScanEngine>(
 ///                    ▼
 ///             release_buffer()
 /// ```
+/// Read a file with an extractable binary format, extract text, and scan it.
+///
+/// Reads the entire file (up to 64 MiB) into `extract_buf`, runs the
+/// format-specific extractor, then scans the extracted text through the
+/// engine as a single chunk.
+///
+/// # Prerequisites
+///
+/// - The file must already be open. This function rewinds to position 0
+///   before reading (the caller's probe/header read may have advanced it).
+///
+/// # Failure modes
+///
+/// - I/O errors (seek, read) increment `ctx.metrics.io_errors` and return
+///   without scanning.
+/// - Extraction failure (`ParseError` or `Empty`) returns without scanning.
+///   No error is recorded because the file was already classified as
+///   extractable by extension; a parse failure simply means the content
+///   didn't match (e.g. a `.class` file with corrupt magic).
+#[cfg(feature = "binary-extract")]
+fn extract_and_scan_file<E: ScanEngine>(
+    task: &FileTask,
+    ctx: &mut WorkerCtx<FileTask, LocalScratch<E>>,
+    file: &mut File,
+    file_size: u64,
+    path_bytes: &[u8],
+    fmt: crate::content_policy::ExtractableFormat,
+) {
+    use crate::content_policy::extract::{extract_content, ExtractResult};
+
+    // Seek back to start — the probe/header read may have advanced the position.
+    if let Err(e) = file.seek(SeekFrom::Start(0)) {
+        ctx.metrics.io_errors = ctx.metrics.io_errors.saturating_add(1);
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[local] Failed to rewind for extraction {:?}: {}",
+            task.path, e
+        );
+        let _ = e;
+        return;
+    }
+
+    // Read the entire file into a temporary buffer.
+    let read_limit = file_size.min(64 * 1024 * 1024) as usize; // 64 MiB cap
+    let scratch = &mut ctx.scratch;
+    scratch.extract_buf.clear();
+    scratch.extract_buf.reserve(read_limit);
+    if file
+        .take(read_limit as u64)
+        .read_to_end(&mut scratch.extract_buf)
+        .is_err()
+    {
+        ctx.metrics.io_errors = ctx.metrics.io_errors.saturating_add(1);
+        return;
+    }
+
+    // Extract scannable text (extract_content clears out before dispatch).
+    let result = extract_content(
+        fmt,
+        &scratch.extract_buf,
+        &mut scratch.extract_out_buf,
+        &mut scratch.extract_scratch,
+    );
+
+    if result != ExtractResult::Ok || scratch.extract_out_buf.is_empty() {
+        return;
+    }
+
+    ctx.metrics.binary_extracted = ctx.metrics.binary_extracted.wrapping_add(1);
+
+    // Scan the extracted text as a single chunk.
+    let engine = &scratch.engine;
+    engine.scan_chunk_into(
+        &scratch.extract_out_buf,
+        task.file_id,
+        0,
+        &mut scratch.scan_scratch,
+    );
+
+    scratch.pending.clear();
+    scratch
+        .scan_scratch
+        .drain_findings_into(&mut scratch.pending);
+
+    if scratch.dedupe_within_chunk {
+        dedupe_findings(&mut scratch.pending);
+    }
+    if !scratch.pending.is_empty() {
+        emit_findings(
+            engine.as_ref(),
+            &*scratch.event_sink,
+            path_bytes,
+            &scratch.pending,
+        );
+        let count = scratch.pending.len() as u64;
+        ctx.metrics.findings_emitted = ctx.metrics.findings_emitted.saturating_add(count);
+    }
+    ctx.metrics.bytes_scanned = ctx
+        .metrics
+        .bytes_scanned
+        .saturating_add(scratch.extract_out_buf.len() as u64);
+    ctx.metrics.chunks_scanned = ctx.metrics.chunks_scanned.saturating_add(1);
+}
+
+/// Process a single file: open, classify, chunk-scan, close.
+///
+/// This is the per-task entry point called by each executor worker. The flow:
+/// 1. Check abort flag.
+/// 2. Detect archive format by extension, then by header magic.
+/// 3. If archive: dispatch to `dispatch_archive_scan` and return.
+/// 4. If binary-skip enabled: probe for NUL bytes / extractable format.
+/// 5. Otherwise: sequential chunk+overlap scan via the buffer pool.
 ///
 /// # Error Handling
 ///
-/// I/O errors are logged but do not propagate (fail-soft per file).
-/// The executor continues with remaining files.
+/// I/O errors are logged (debug builds) but do not propagate — fail-soft
+/// per file. The executor continues with remaining files.
 fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, LocalScratch<E>>) {
     if ctx.scratch.abort_run.load(Ordering::Relaxed) {
         return;
@@ -2190,6 +2324,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
     let engine = &scratch.engine;
     let overlap = engine.required_overlap();
     let chunk_size = scratch.chunk_size;
+    let skip_binary = scratch.skip_binary;
     let path_bytes = task.path.as_os_str().as_encoded_bytes();
     let ext_kind = if scratch.archive.enabled {
         detect_kind_from_path(&task.path)
@@ -2290,6 +2425,81 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
                         .record_archive_partial(r, path_bytes, false),
                 }
                 return;
+            }
+
+            // Reuse the already-read header bytes for binary classification.
+            if skip_binary {
+                let verdict = crate::content_policy::classify_content(
+                    &header[..n],
+                    path_bytes,
+                    crate::content_policy::CHECK_LEN,
+                );
+                match verdict {
+                    crate::content_policy::ContentVerdict::Binary => {
+                        ctx.metrics.binary_skipped = ctx.metrics.binary_skipped.wrapping_add(1);
+                        return;
+                    }
+                    crate::content_policy::ContentVerdict::BinaryExtractable(_fmt) => {
+                        #[cfg(feature = "binary-extract")]
+                        {
+                            extract_and_scan_file(
+                                &task, ctx, &mut file, file_size, path_bytes, _fmt,
+                            );
+                        }
+                        #[cfg(not(feature = "binary-extract"))]
+                        {
+                            ctx.metrics.binary_skipped = ctx.metrics.binary_skipped.wrapping_add(1);
+                        }
+                        return;
+                    }
+                    crate::content_policy::ContentVerdict::Text => {}
+                }
+            }
+        }
+        if let Err(e) = file.seek(SeekFrom::Start(0)) {
+            ctx.metrics.io_errors = ctx.metrics.io_errors.saturating_add(1);
+            #[cfg(debug_assertions)]
+            eprintln!("[local] Failed to rewind {:?}: {}", task.path, e);
+            let _ = e;
+            return;
+        }
+    } else if skip_binary {
+        // No archive sniffing — read a small probe for binary detection.
+        let probe_buf = &mut scratch.binary_probe_buf;
+        let n = match file.read(probe_buf.as_mut_slice()) {
+            Ok(n) => n,
+            Err(e) => {
+                ctx.metrics.io_errors = ctx.metrics.io_errors.saturating_add(1);
+                #[cfg(debug_assertions)]
+                eprintln!("[local] Failed to read probe {:?}: {}", task.path, e);
+                let _ = e;
+                return;
+            }
+        };
+        if n > 0 {
+            let verdict = crate::content_policy::classify_content(
+                &probe_buf[..n],
+                path_bytes,
+                crate::content_policy::CHECK_LEN,
+            );
+            match verdict {
+                crate::content_policy::ContentVerdict::Binary => {
+                    ctx.metrics.binary_skipped = ctx.metrics.binary_skipped.wrapping_add(1);
+                    return;
+                }
+                crate::content_policy::ContentVerdict::BinaryExtractable(_fmt) => {
+                    #[cfg(feature = "binary-extract")]
+                    {
+                        ctx.metrics.binary_extracted = ctx.metrics.binary_extracted.wrapping_add(1);
+                        extract_and_scan_file(&task, ctx, &mut file, file_size, path_bytes, _fmt);
+                    }
+                    #[cfg(not(feature = "binary-extract"))]
+                    {
+                        ctx.metrics.binary_skipped = ctx.metrics.binary_skipped.wrapping_add(1);
+                    }
+                    return;
+                }
+                crate::content_policy::ContentVerdict::Text => {}
             }
         }
         if let Err(e) = file.seek(SeekFrom::Start(0)) {
@@ -2607,6 +2817,20 @@ where
                     chunk_size,
                     max_file_size: cfg.max_file_size,
                     archive: archive_cfg.clone(),
+                    skip_binary: cfg.skip_binary,
+                    binary_probe_buf: [0u8; crate::content_policy::CHECK_LEN],
+                    #[cfg(feature = "binary-extract")]
+                    extract_buf: Vec::with_capacity(
+                        crate::content_policy::extract::EXTRACT_INPUT_CAP,
+                    ),
+                    #[cfg(feature = "binary-extract")]
+                    extract_out_buf: Vec::with_capacity(
+                        crate::content_policy::extract::EXTRACT_OUTPUT_CAP,
+                    ),
+                    #[cfg(feature = "binary-extract")]
+                    extract_scratch: Vec::with_capacity(
+                        crate::content_policy::extract::JAR_ENTRY_CAP,
+                    ),
                 }
             }
         },
@@ -2714,6 +2938,7 @@ mod tests {
             seed: 12345,
             dedupe_within_chunk: true,
             archive: ArchiveConfig::default(),
+            skip_binary: true,
             event_sink: sink,
         }
     }

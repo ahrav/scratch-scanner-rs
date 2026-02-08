@@ -17,7 +17,7 @@ tempfile = "3"
 
 [dependencies.scanner-rs]
 path = ".."
-features = ["tiger-harness"]
+features = ["tiger-harness", "binary-extract"]
 
 # Prevent this from interfering with workspaces
 [workspace]
@@ -78,6 +78,20 @@ bench = false
 [[bin]]
 name = "fuzz_vs_cache_load"
 path = "fuzz_targets/fuzz_vs_cache_load.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_pyc_extract"
+path = "fuzz_targets/fuzz_pyc_extract.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_java_class_extract"
+path = "fuzz_targets/fuzz_java_class_extract.rs"
 test = false
 doc = false
 bench = false

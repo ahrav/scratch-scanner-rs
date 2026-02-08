@@ -141,6 +141,7 @@ fn parse_fs_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<S
     let mut decode_depth: Option<usize> = None;
     let mut no_archives = false;
     let mut null_sink = false;
+    let mut scan_binary = false;
     let mut anchor_mode = AnchorMode::Manual;
     let mut event_format = EventFormat::Jsonl;
     let mut rules_file: Option<PathBuf> = None;
@@ -203,6 +204,10 @@ fn parse_fs_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<S
                     null_sink = true;
                     continue;
                 }
+                "--scan-binary" => {
+                    scan_binary = true;
+                    continue;
+                }
                 "--help" | "-h" => {
                     print_fs_usage();
                     std::process::exit(0);
@@ -238,6 +243,7 @@ fn parse_fs_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<S
             no_archives,
             anchor_mode,
             null_sink,
+            scan_binary,
         }),
         event_format,
         rules_file,
@@ -260,6 +266,7 @@ fn parse_git_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<
     let mut engine_chunk_mb: Option<u32> = None;
     let mut debug = false;
     let mut perf_breakdown = false;
+    let mut scan_binary = false;
     let mut event_format = EventFormat::Jsonl;
     let mut rules_file: Option<PathBuf> = None;
     let mut transform_filter = TransformFilter::All;
@@ -365,6 +372,10 @@ fn parse_git_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<
                     perf_breakdown = true;
                     continue;
                 }
+                "--scan-binary" => {
+                    scan_binary = true;
+                    continue;
+                }
                 "--help" | "-h" => {
                     print_git_usage();
                     std::process::exit(0);
@@ -405,6 +416,7 @@ fn parse_git_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<
             engine_chunk_mb,
             debug,
             perf_breakdown,
+            scan_binary,
         }),
         event_format,
         rules_file,
@@ -556,6 +568,7 @@ OPTIONS:
                             Comma-separated: base64, url (case-insensitive)
     --no-archives           Disable archive scanning
     --null-sink             Drop all findings (measure scan overhead only)
+    --scan-binary           Scan binary files instead of skipping them
     --anchors=manual|derived  Anchor mode (default: manual)
     --event-format=jsonl    Output format (default: jsonl)
     --help, -h              Show this help"
@@ -581,6 +594,7 @@ OPTIONS:
     --anchors=manual|derived  Anchor mode (default: manual)
     --debug                   Verbose stage stats to stderr
     --perf-breakdown          Pack execution timing breakdown
+    --scan-binary             Scan binary blobs instead of skipping them
     --event-format=jsonl      Output format (default: jsonl)
     --help, -h                Show this help"
     );
