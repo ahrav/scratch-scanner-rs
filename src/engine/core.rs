@@ -58,7 +58,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::helpers::u64_to_usize;
 use super::rule_repr::{
     add_pat_owned, add_pat_raw, compile_confirm_all, compile_rule, map_to_patterns, utf16be_bytes,
-    utf16le_bytes, RuleCompiled, Target, Variant,
+    utf16le_bytes, ConfirmAllCompiled, EntropyCompiled, KeywordsCompiled, RuleCompiled, Target,
+    TwoPhaseCompiled, Variant,
 };
 use super::scratch::{RootSpanMapCtx, ScanScratch};
 use super::transform::STREAM_DECODE_CHUNK_BYTES;
@@ -187,37 +188,59 @@ pub struct Engine {
     pub(super) transforms: Vec<TransformConfig>,
     pub(crate) tuning: Tuning,
 
-    // Log2 lookup table for entropy gating.
+    /// Gate pools — indexed by `Option<u32>` gate IDs stored in [`RuleCompiled`].
+    ///
+    /// Each rule holds an `Option<u32>` index into the relevant pool. This
+    /// indirection keeps `RuleCompiled` small (no inline allocations) while
+    /// allowing gate data to be shared or deduplicated in the future.
+    pub(super) confirm_all_gates: Vec<ConfirmAllCompiled>,
+    pub(super) keyword_gates: Vec<KeywordsCompiled>,
+    pub(super) entropy_gates: Vec<EntropyCompiled>,
+    pub(super) two_phase_gates: Vec<TwoPhaseCompiled>,
+    pub(super) local_context_gates: Vec<crate::api::LocalContextSpec>,
+
+    /// Pre-computed `ln(i)/ln(2)` table for Shannon entropy calculation.
+    ///
+    /// Sized to `max(entropy_gate.max_len)` across all rules. Avoids
+    /// per-window `f64::log2` calls in the entropy gate hot path.
     pub(super) entropy_log2: Vec<f32>,
 
-    // Unified Vectorscan/Hyperscan prefilter DB for raw scanning.
-    //
-    // Combines literal anchors with regex patterns into a single DB for efficient
-    // multi-pattern matching. Built during engine construction; failures are fatal.
+    /// Unified Vectorscan prefilter DB for raw + anchor scanning.
+    ///
+    /// Combines literal anchor patterns with raw regex patterns (for rules
+    /// with weak anchors) into a single multi-pattern DB. Always present
+    /// after construction — build failures are fatal.
     pub(super) vs: Option<VsPrefilterDb>,
-    // Optional Vectorscan DB for UTF-16 anchor scanning.
-    //
-    // When present, this prefilters UTF-16 variants using literal anchors.
+    /// Block-mode Vectorscan DB for UTF-16 anchor scanning.
+    ///
+    /// Only built when at least one rule has UTF-16 anchor variants.
+    /// Absent when no UTF-16 anchors exist or compilation fails (non-fatal).
     pub(super) vs_utf16: Option<VsAnchorDb>,
-    // Vectorscan stream-mode DB for UTF-16 anchor scanning in decoded streams.
+    /// Stream-mode Vectorscan DB for UTF-16 anchor scanning in decoded streams.
     pub(super) vs_utf16_stream: Option<VsUtf16StreamDb>,
-    // Vectorscan stream-mode DB for decoded-byte scanning.
+    /// Stream-mode Vectorscan DB for scanning decoded byte output.
     pub(super) vs_stream: Option<VsStreamDb>,
-    // Vectorscan stream-mode DB for decoded-space anchor gating.
+    /// Stream-mode Vectorscan DB for decoded-space anchor gating.
+    ///
+    /// Used with `Gate::AnchorsInDecoded` transforms to check whether
+    /// decoded output contains any anchor before committing to full decode.
     pub(super) vs_gate: Option<VsGateDb>,
-    // Base64 pre-decode gate built from anchor patterns.
-    //
-    // This runs in *encoded space* and is deliberately conservative:
-    // if a decoded buffer contains an anchor, at least one YARA-style base64
-    // permutation of that anchor must appear in the encoded stream. We still
-    // perform the decoded-space gate for correctness; this pre-gate exists
-    // purely to skip wasteful span scans/decodes when no anchor could possibly appear.
+    /// Base64 pre-decode gate built from anchor patterns.
+    ///
+    /// Runs in *encoded space* and is deliberately conservative: if a decoded
+    /// buffer would contain an anchor, at least one YARA-style base64
+    /// permutation must appear in the encoded stream. False positives are
+    /// allowed; false negatives are not. The decoded-space gate remains
+    /// authoritative — this pre-gate only avoids wasteful decode work.
     pub(super) b64_gate: Option<Base64YaraGate>,
 
-    // Rules that cannot be given a sound prefilter gate under the policy.
+    /// Rules whose regex could not be given a sound prefilter gate.
+    ///
+    /// Contains `(rule_index, reason)` pairs in original rule order.
+    /// These rules require full-buffer validation on every scan.
     unfilterable_rules: Vec<(usize, UnfilterableReason)>,
     #[cfg(feature = "stats")]
-    // Build-time summary of anchor selection decisions.
+    /// Build-time summary of anchor selection decisions.
     anchor_plan_stats: AnchorPlanStats,
     #[cfg(feature = "stats")]
     pub(super) vs_stats: VectorscanCounters,
@@ -225,27 +248,41 @@ pub struct Engine {
     /// True if any rule has UTF-16 anchor variants compiled.
     /// Controls whether UTF-16 scanning paths are active.
     pub(super) has_utf16_anchors: bool,
-    /// Maximum window size (in bytes) across all rules.
-    /// Determines buffer sizing for validation windows.
+    /// Maximum window diameter (in bytes) across all rules and variants.
+    ///
+    /// For a rule with radius `R`, the diameter is `2R` (raw) or `4R` (UTF-16).
+    /// Used to size validation buffers and compute required chunk overlap.
     pub(super) max_window_diameter_bytes: usize,
-    /// Maximum prefilter width reported by Vectorscan for any pattern.
-    /// Used for window expansion around match offsets.
+    /// Maximum match width reported by Vectorscan for any compiled pattern.
+    ///
+    /// Used to expand prefilter hit offsets into candidate windows. Falls
+    /// back to the longest anchor pattern length when Vectorscan reports
+    /// unbounded width.
     pub(super) max_prefilter_width: usize,
     /// Ring buffer size for stream-mode decoded scanning.
-    /// Must accommodate the largest possible match span.
+    ///
+    /// Must accommodate the largest possible match span across all stream
+    /// patterns, the longest encoded span, and the stream decode chunk size.
     pub(super) stream_ring_bytes: usize,
     /// True when at least one transform has a non-`Disabled` mode.
-    /// Used by the zero-hit prefilter bypass to decide whether transforms
-    /// could discover encoded secrets invisible to the raw-buffer prefilter.
-    has_active_transforms: bool,
-    /// Byte-set of all anchor-pattern bytes across all rules. On the zero-hit
-    /// path, URL-percent transforms only need to scan if at least one `%XX`
-    /// triplet decodes to a byte in this set — otherwise no anchor could appear
-    /// in decoded output. 256-bit bitmap indexed by byte value.
-    anchor_byte_set: [u64; 4],
-    /// Active transform indices for ScanBuf path split by mode/id.
     ///
-    /// Bucketing by mode/id avoids hot-loop branches on `tc.mode` and `tc.id`.
+    /// When false, the zero-hit prefilter bypass can skip transform discovery
+    /// entirely — no encoded secrets are possible if transforms are inactive.
+    has_active_transforms: bool,
+    /// 256-bit bitmap of all bytes appearing in any anchor pattern.
+    ///
+    /// Indexed as `set[byte >> 6] & (1 << (byte & 63))`. On the zero-hit
+    /// path, URL-percent transforms only need to scan when at least one
+    /// `%XX` triplet decodes to a byte in this set — otherwise no anchor
+    /// could appear in decoded output.
+    anchor_byte_set: [u64; 4],
+    /// Pre-bucketed transform indices for the `ScanBuf` work-item path.
+    ///
+    /// Split by `(mode, id)` to avoid hot-loop branches:
+    /// - `active_*`: all enabled transforms (used on zero-hit and no-findings paths)
+    /// - `always_*`: only `TransformMode::Always` (used when findings already found)
+    /// - `*_base64` / `*_non_base64`: separated so the caller can apply the
+    ///   pre-decode gate only to Base64 spans
     scanbuf_transform_idxs_active_non_base64: Vec<usize>,
     scanbuf_transform_idxs_active_base64: Vec<usize>,
     scanbuf_transform_idxs_always_non_base64: Vec<usize>,
@@ -306,12 +343,36 @@ impl Engine {
             tc.assert_valid();
         }
 
-        let mut rules_compiled = rules.iter().map(compile_rule).collect::<Vec<_>>();
-        let max_entropy_len = rules_compiled
-            .iter()
-            .filter_map(|r| r.entropy.map(|e| e.max_len))
-            .max()
-            .unwrap_or(0);
+        // Compile rules and pool gate objects into Engine-owned vectors.
+        let mut confirm_all_gates: Vec<ConfirmAllCompiled> = Vec::new();
+        let mut keyword_gates: Vec<KeywordsCompiled> = Vec::new();
+        let mut entropy_gates: Vec<EntropyCompiled> = Vec::new();
+        let mut two_phase_gates: Vec<TwoPhaseCompiled> = Vec::new();
+        let mut local_context_gates: Vec<crate::api::LocalContextSpec> = Vec::new();
+
+        let mut rules_compiled: Vec<RuleCompiled> = Vec::with_capacity(rules.len());
+        for spec in rules.iter() {
+            let (mut rule, gates) = compile_rule(spec);
+            if let Some(tp) = gates.two_phase {
+                rule.two_phase = Some(two_phase_gates.len() as u32);
+                two_phase_gates.push(tp);
+            }
+            if let Some(kw) = gates.keywords {
+                rule.keywords = Some(keyword_gates.len() as u32);
+                keyword_gates.push(kw);
+            }
+            if let Some(ent) = gates.entropy {
+                rule.entropy = Some(entropy_gates.len() as u32);
+                entropy_gates.push(ent);
+            }
+            if let Some(ctx) = gates.local_context {
+                rule.local_context = Some(local_context_gates.len() as u32);
+                local_context_gates.push(ctx);
+            }
+            rules_compiled.push(rule);
+        }
+
+        let max_entropy_len = entropy_gates.iter().map(|e| e.max_len).max().unwrap_or(0);
         let entropy_log2 = super::helpers::build_log2_table(max_entropy_len);
 
         let raw_seed_radius_bytes = rules
@@ -446,7 +507,8 @@ impl Engine {
                         confirm_all.retain(|c| c.as_slice() != needle);
                     }
                     if let Some(compiled) = compile_confirm_all(confirm_all) {
-                        rules_compiled[rid].confirm_all = Some(compiled);
+                        rules_compiled[rid].confirm_all = Some(confirm_all_gates.len() as u32);
+                        confirm_all_gates.push(compiled);
                     }
                     #[cfg(feature = "stats")]
                     {
@@ -578,8 +640,10 @@ impl Engine {
         //
         // A rule can safely omit its raw regex from the prefilter when:
         //   • It has at least one anchor pattern.
-        //   • Every anchor is ≥ 5 bytes (short anchors risk case-sensitivity
-        //     mismatches with the regex — anchor patterns are byte-exact).
+        //   • Every anchor is ≥ 5 bytes. The threshold is a heuristic: shorter
+        //     literals have high false-positive rates in Vectorscan's Aho-Corasick
+        //     automaton and risk case-sensitivity mismatches (anchor patterns are
+        //     byte-exact while the regex may accept alternate casings).
         //   • The regex is NOT case-insensitive (byte-exact anchors cannot
         //     match alternate casings that the regex would accept).
         //
@@ -793,6 +857,11 @@ impl Engine {
             rules: rules_compiled,
             transforms,
             tuning,
+            confirm_all_gates,
+            keyword_gates,
+            entropy_gates,
+            two_phase_gates,
+            local_context_gates,
             entropy_log2,
             vs,
             vs_utf16,
@@ -840,13 +909,18 @@ impl Engine {
 
     /// Select which transform index buckets to iterate for a `ScanBuf` work item.
     ///
-    /// When `found_any_in_this_buf` is true (a finding was produced), only
-    /// `Always`-mode transforms run — `Active`-mode transforms are skipped
-    /// because the prefilter already covered them. When false, all active
-    /// transforms run to discover encoded secrets invisible to the raw prefilter.
+    /// The split implements a finding-aware optimization:
+    /// - **No findings yet** (`found_any_in_this_buf = false`): run *all* enabled
+    ///   transforms (`Active` + `Always` modes). Encoded secrets invisible to
+    ///   the raw prefilter may exist in transform output.
+    /// - **Findings found** (`found_any_in_this_buf = true`): run only
+    ///   `TransformMode::Always` transforms. `IfNoFindingsInThisBuffer`
+    ///   transforms are skipped because the raw prefilter already found
+    ///   something — further transform work is unlikely to add value.
     ///
     /// Returns `(non_base64_indices, base64_indices)`. Base64 transforms are
-    /// separated so the caller can apply the pre-decode gate only to Base64 spans.
+    /// separated so the caller can apply the encoded-space pre-gate only to
+    /// Base64 spans without branching per-transform.
     #[inline(always)]
     fn scanbuf_transform_buckets(&self, found_any_in_this_buf: bool) -> (&[usize], &[usize]) {
         if found_any_in_this_buf {

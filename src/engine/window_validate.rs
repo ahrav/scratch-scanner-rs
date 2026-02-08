@@ -64,14 +64,30 @@ use super::scratch::ScanScratch;
 
 /// Number of bytes to scan backward from the anchor hint position.
 ///
-/// This margin accounts for patterns where the anchor may be in the middle
-/// of the match (e.g., backward-looking patterns). 64 bytes is sufficient
-/// for most secret patterns while keeping overhead low.
+/// The anchor hint from Vectorscan points to where the *anchor literal* was
+/// found, which may be in the middle or end of the full regex match (e.g.,
+/// `password\s*=\s*([A-Za-z0-9]+)` anchors on "password" but the match
+/// extends left of the anchor for context-heavy patterns).
+///
+/// 64 bytes covers the longest observed prefix in production rule sets while
+/// keeping the extra regex scan window small relative to typical window sizes
+/// (4–16 KiB).
 const BACK_SCAN_MARGIN: usize = 64;
 
 /// Iterate capture matches without allocating by reusing `CaptureLocations`.
 ///
-/// Advances by one byte on empty matches to mirror `captures_iter` semantics.
+/// This is the allocation-free alternative to `Regex::captures_iter`, which
+/// allocates a fresh `Captures` per match. By reusing a single `CaptureLocations`,
+/// the hot path stays in the per-rule scratch buffer with zero heap traffic.
+///
+/// # Termination
+/// - Returns when the regex finds no further match.
+/// - Advances by one byte on empty-width matches to avoid infinite loops,
+///   mirroring `captures_iter` semantics.
+///
+/// # Callback
+/// `on_match(locs, start, end)` receives the full match span (`start..end`)
+/// relative to `hay[0]`. Capture groups are accessible through `locs`.
 #[inline]
 fn for_each_capture_match(
     re: &regex::bytes::Regex,
@@ -136,14 +152,23 @@ fn has_assignment_value_shape(window: &[u8]) -> bool {
         .take_while(|&&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
         .count();
 
+    // 10 is the minimum plausible secret length: shorter tokens are overwhelmingly
+    // variable names or config values, not secrets. This threshold was chosen to
+    // reject noise without risking false negatives on real API keys/tokens.
     token_len >= 10
 }
 
-/// Returns the (line_start, line_end) bounds around `secret_start` when both
-/// newline boundaries are found within the lookaround window.
+/// Returns the `(line_start, line_end)` byte offsets of the line containing
+/// `secret_start`, searching within bounded lookaround windows.
 ///
-/// If either boundary is missing within the bounded lookaround, returns `None`
-/// to preserve fail-open behavior at chunk/window edges.
+/// `line_start` points to the byte *after* the preceding `\n` (or to index 0
+/// if `\n` is not found within lookbehind bytes). `line_end` points to the
+/// `\n` byte itself, not past it.
+///
+/// Returns `None` when either boundary is not found within the lookaround.
+/// This implements **fail-open** semantics: at chunk/window edges where line
+/// boundaries are ambiguous, the caller should allow the match rather than
+/// risk dropping a legitimate finding.
 #[inline]
 fn find_line_bounds(
     hay: &[u8],
@@ -176,11 +201,20 @@ fn find_line_bounds(
     }
 }
 
+/// Checks whether `line` contains any assignment separator (`=`, `:`, `>`).
+///
+/// Used by [`local_context_passes`] to enforce `require_same_line_assignment`.
+/// Kept separate from `has_assignment_value_shape` because context checks
+/// operate on the line *before* the secret, not on the full window.
 #[inline]
 fn has_assignment_sep(line: &[u8]) -> bool {
     line.iter().any(|&b| b == b'=' || b == b':' || b == b'>')
 }
 
+/// Returns `true` if `hay` contains any of the `needles` (short-circuit OR).
+///
+/// Used by [`local_context_passes`] for `key_names_any` matching. Each needle
+/// is a key name literal; a single hit is sufficient to pass the gate.
 #[inline]
 fn contains_any_literal(hay: &[u8], needles: &[&[u8]]) -> bool {
     for &needle in needles {
@@ -191,6 +225,12 @@ fn contains_any_literal(hay: &[u8], needles: &[&[u8]]) -> bool {
     false
 }
 
+/// Checks whether the secret at `hay[secret_start..secret_end]` is wrapped
+/// in matching quote characters (`'`, `"`, or `` ` ``).
+///
+/// Returns `Some(true)` when the byte immediately before and after the secret
+/// are the same quote character, `Some(false)` when they differ or aren't
+/// quotes, and `None` when either boundary is out of bounds (fail-open).
 #[inline]
 fn is_quoted_at(hay: &[u8], secret_start: usize, secret_end: usize) -> Option<bool> {
     let left = secret_start.checked_sub(1)?;
@@ -202,8 +242,17 @@ fn is_quoted_at(hay: &[u8], secret_start: usize, secret_end: usize) -> Option<bo
 
 /// Bounded, fail-open local context gate.
 ///
-/// Returns `false` only when the required context is definitively absent within
-/// the bounded lookaround window. Missing line boundaries result in `true`.
+/// Evaluates up to three orthogonal sub-gates in order:
+///
+/// 1. **`require_quoted`** — secret must be wrapped in matching quotes.
+/// 2. **`require_same_line_assignment`** — the line before the secret must
+///    contain an assignment separator (`=`, `:`, `>`).
+/// 3. **`key_names_any`** — the line before the secret must contain at least
+///    one of the configured key-name literals.
+///
+/// Returns `false` only when a required sub-gate definitively fails within
+/// the bounded lookaround window. When line boundaries are ambiguous (e.g.,
+/// at chunk edges), the gate returns `true` to avoid false negatives.
 #[inline]
 fn local_context_passes(
     window: &[u8],
@@ -285,7 +334,10 @@ impl Engine {
                     }
                 }
 
-                if let Some(confirm) = &rule.confirm_all {
+                if let Some(confirm) = rule
+                    .confirm_all
+                    .map(|i| &self.confirm_all_gates[i as usize])
+                {
                     let vidx = Variant::Raw.idx();
                     if let Some(primary) = &confirm.primary[vidx] {
                         if memmem::find(window, primary).is_none() {
@@ -297,7 +349,7 @@ impl Engine {
                     }
                 }
 
-                if let Some(kws) = &rule.keywords {
+                if let Some(kws) = rule.keywords.map(|i| &self.keyword_gates[i as usize]) {
                     // Keyword gate is a cheap pre-regex filter: if none of the
                     // keywords appear in this window, the regex cannot be relevant.
                     if !contains_any_memmem(window, &kws.any[Variant::Raw.idx()]) {
@@ -316,7 +368,10 @@ impl Engine {
                 let search_start = hint_in_window.saturating_sub(BACK_SCAN_MARGIN);
                 let search_window = &window[search_start..];
 
-                let entropy = rule.entropy;
+                let entropy = rule.entropy.map(|i| self.entropy_gates[i as usize]);
+                // Take the pre-allocated CaptureLocations out of scratch so the
+                // closure can borrow `locs` mutably without also borrowing `scratch`.
+                // Restored after the loop to keep the slot populated for the next call.
                 let mut locs = scratch.capture_locs[rule_id as usize]
                     .take()
                     .expect("capture locations missing for rule");
@@ -346,7 +401,10 @@ impl Engine {
                         let secret_start = search_start + secret_start;
                         let secret_end = search_start + secret_end;
 
-                        let context_ok = if let Some(ctx) = rule.local_context {
+                        let context_ok = if let Some(ctx) = rule
+                            .local_context
+                            .map(|i| self.local_context_gates[i as usize])
+                        {
                             local_context_passes(window, secret_start, secret_end, ctx)
                         } else {
                             true
@@ -408,8 +466,11 @@ impl Engine {
             }
 
             Variant::Utf16Le | Variant::Utf16Be => {
-                // UTF-16 anchors can appear at either byte parity; merged windows may
-                // cover both. Run both alignments to avoid dropping opposite-parity hits.
+                // UTF-16 code units are 2 bytes, so a valid decode must start on the
+                // correct byte parity. The anchor hint tells us where Vectorscan found
+                // the anchor literal, which gives us one parity. But merged windows may
+                // contain anchors at both parities, so we try the hinted parity first
+                // (most likely to contain findings) and then the opposite.
                 let parity = anchor_hint.saturating_sub(w.start) & 1;
                 let offsets = [parity, parity ^ 1];
                 for offset in offsets {
@@ -467,7 +528,10 @@ impl Engine {
 
         let raw_win = &buf[decode_range.clone()];
 
-        if let Some(confirm) = &rule.confirm_all {
+        if let Some(confirm) = rule
+            .confirm_all
+            .map(|i| &self.confirm_all_gates[i as usize])
+        {
             // Confirm-all literals are encoded like anchors/keywords so we can
             // cheaply reject UTF-16 windows before decoding.
             let vidx = variant.idx();
@@ -481,7 +545,7 @@ impl Engine {
             }
         }
 
-        if let Some(kws) = &rule.keywords {
+        if let Some(kws) = rule.keywords.map(|i| &self.keyword_gates[i as usize]) {
             // For UTF-16 variants, apply the keyword gate on the raw UTF-16 bytes
             // *before* decoding to avoid spending decode budget on windows that
             // could never pass the keyword check.
@@ -506,12 +570,18 @@ impl Engine {
             return;
         }
 
-        // Create a slice that doesn't carry the borrow from `scratch`, allowing us to
-        // call mutable methods on `scratch` while iterating over `decoded`. A simple
-        // `scratch.utf16_buf.as_slice()` would hold an immutable borrow of `scratch`
-        // for the slice's lifetime, preventing the mutable borrow needed for push_finding.
-        // SAFETY: `utf16_buf` is not mutated while `decoded` is in use - the mutable
-        // methods only modify `out`, `drop_hint_end`, `seen_findings`, not `utf16_buf`.
+        // Reborrow `utf16_buf` through a raw pointer to decouple it from the
+        // `scratch` borrow. Without this, `scratch.utf16_buf.as_slice()` would
+        // hold an immutable borrow of *all* of `scratch` for the slice lifetime,
+        // preventing the mutable borrows needed by `push_finding_with_drop_hint`.
+        //
+        // SAFETY: The resulting `decoded` slice is valid because:
+        // 1. `utf16_buf` was just populated and its length is stable.
+        // 2. No code path between here and the last use of `decoded` writes to,
+        //    resizes, or reallocates `utf16_buf` — the mutable methods below
+        //    touch only `out`, `drop_hint_end`, `seen_findings`, and
+        //    `total_decode_output_bytes`.
+        // 3. The pointer and length are captured atomically before any mutation.
         let decoded_len = scratch.utf16_buf.len();
         let decoded_ptr = scratch.utf16_buf.as_slice().as_ptr();
         let decoded = unsafe { std::slice::from_raw_parts(decoded_ptr, decoded_len) };
@@ -550,7 +620,7 @@ impl Engine {
             },
         );
 
-        let entropy = rule.entropy;
+        let entropy = rule.entropy.map(|i| self.entropy_gates[i as usize]);
         let mut locs = scratch.capture_locs[rule_id as usize]
             .take()
             .expect("capture locations missing for rule");
@@ -575,7 +645,10 @@ impl Engine {
                 // Extract secret span using capture group logic.
                 let (secret_start, secret_end) = extract_secret_span_locs(locs, rule.secret_group);
 
-                let context_ok = if let Some(ctx) = rule.local_context {
+                let context_ok = if let Some(ctx) = rule
+                    .local_context
+                    .map(|i| self.local_context_gates[i as usize])
+                {
                     local_context_passes(decoded, secret_start, secret_end, ctx)
                 } else {
                     true
@@ -672,7 +745,10 @@ impl Engine {
             }
         }
 
-        if let Some(confirm) = &rule.confirm_all {
+        if let Some(confirm) = rule
+            .confirm_all
+            .map(|i| &self.confirm_all_gates[i as usize])
+        {
             let vidx = Variant::Raw.idx();
             if let Some(primary) = &confirm.primary[vidx] {
                 if memmem::find(window, primary).is_none() {
@@ -684,7 +760,7 @@ impl Engine {
             }
         }
 
-        if let Some(kws) = &rule.keywords {
+        if let Some(kws) = rule.keywords.map(|i| &self.keyword_gates[i as usize]) {
             if !contains_any_memmem(window, &kws.any[Variant::Raw.idx()]) {
                 return;
             }
@@ -703,7 +779,7 @@ impl Engine {
 
         let max_findings = scratch.max_findings;
         let out = &mut scratch.tmp_findings;
-        let entropy = rule.entropy;
+        let entropy = rule.entropy.map(|i| self.entropy_gates[i as usize]);
         let mut locs = scratch.capture_locs[rule_id as usize]
             .take()
             .expect("capture locations missing for rule");
@@ -730,7 +806,10 @@ impl Engine {
                 let secret_start = search_start + secret_start;
                 let secret_end = search_start + secret_end;
 
-                let context_ok = if let Some(ctx) = rule.local_context {
+                let context_ok = if let Some(ctx) = rule
+                    .local_context
+                    .map(|i| self.local_context_gates[i as usize])
+                {
                     local_context_passes(window, secret_start, secret_end, ctx)
                 } else {
                     true
@@ -834,7 +913,10 @@ impl Engine {
             return;
         }
 
-        if let Some(confirm) = &rule.confirm_all {
+        if let Some(confirm) = rule
+            .confirm_all
+            .map(|i| &self.confirm_all_gates[i as usize])
+        {
             let vidx = variant.idx();
             if let Some(primary) = &confirm.primary[vidx] {
                 if memmem::find(raw_win, primary).is_none() {
@@ -846,7 +928,7 @@ impl Engine {
             }
         }
 
-        if let Some(kws) = &rule.keywords {
+        if let Some(kws) = rule.keywords.map(|i| &self.keyword_gates[i as usize]) {
             let vidx = variant.idx();
             if !contains_any_memmem(raw_win, &kws.any[vidx]) {
                 return;
@@ -867,12 +949,9 @@ impl Engine {
             return;
         }
 
-        // Create a slice that doesn't carry the borrow from `scratch`, allowing us to
-        // call mutable methods on `scratch` while iterating over `decoded`. A simple
-        // `scratch.utf16_buf.as_slice()` would hold an immutable borrow of `scratch`
-        // for the slice's lifetime, preventing the mutable borrow needed for push_finding.
-        // SAFETY: `utf16_buf` is not mutated while `decoded` is in use - the mutable
-        // methods only modify `out`, `drop_hint_end`, `seen_findings`, not `utf16_buf`.
+        // Reborrow `utf16_buf` through a raw pointer — same technique and safety
+        // argument as `run_rule_on_utf16_window_aligned`. See that method for the
+        // full SAFETY justification.
         let decoded_len = scratch.utf16_buf.len();
         let decoded_ptr = scratch.utf16_buf.as_slice().as_ptr();
         let decoded = unsafe { std::slice::from_raw_parts(decoded_ptr, decoded_len) };
@@ -915,7 +994,7 @@ impl Engine {
 
         let max_findings = scratch.max_findings;
         let out = &mut scratch.tmp_findings;
-        let entropy = rule.entropy;
+        let entropy = rule.entropy.map(|i| self.entropy_gates[i as usize]);
         let mut locs = scratch.capture_locs[rule_id as usize]
             .take()
             .expect("capture locations missing for rule");
@@ -938,7 +1017,10 @@ impl Engine {
                 // Extract secret span using capture group logic.
                 let (secret_start, secret_end) = extract_secret_span_locs(locs, rule.secret_group);
 
-                let context_ok = if let Some(ctx) = rule.local_context {
+                let context_ok = if let Some(ctx) = rule
+                    .local_context
+                    .map(|i| self.local_context_gates[i as usize])
+                {
                     local_context_passes(decoded, secret_start, secret_end, ctx)
                 } else {
                     true

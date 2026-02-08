@@ -22,6 +22,11 @@ use std::alloc::{alloc, dealloc, Layout};
 use std::mem::{align_of, size_of, MaybeUninit};
 use std::ptr::NonNull;
 
+/// Minimum alignment for scratch allocations.
+///
+/// Page alignment (4 KiB) keeps buffers SIMD-friendly and avoids alignment
+/// faults when scratch buffers are reused for vectorised byte operations.
+/// This is a conservative lower bound; the actual OS page size may be larger.
 const PAGE_SIZE_MIN: usize = 4096;
 
 /// Errors returned by scratch allocators.
@@ -50,10 +55,22 @@ pub struct ScratchVec<T> {
     ptr: NonNull<MaybeUninit<T>>,
     len: usize,
     cap: usize,
-    layout: Layout,
 }
 
 impl<T> ScratchVec<T> {
+    /// Recompute the deallocation layout from stored capacity.
+    ///
+    /// Only called in `drop()` for non-zero-capacity vectors. The layout is
+    /// guaranteed valid because `with_capacity` already validated `cap *
+    /// size_of::<T>()` does not overflow and `size_of::<T>() > 0` — the
+    /// `unwrap` here cannot panic for values that passed construction.
+    fn dealloc_layout(cap: usize) -> Layout {
+        let align = PAGE_SIZE_MIN.max(align_of::<T>());
+        // SAFETY: this was validated at construction time — size_of::<T>() > 0
+        // and cap * size_of::<T>() did not overflow.
+        Layout::from_size_align(cap * size_of::<T>(), align).unwrap()
+    }
+
     /// Allocate a fixed-capacity scratch vector.
     ///
     /// # Errors
@@ -70,8 +87,6 @@ impl<T> ScratchVec<T> {
                 ptr: NonNull::dangling(),
                 len: 0,
                 cap: 0,
-                layout: Layout::from_size_align(1, 1)
-                    .map_err(|_| ScratchMemoryError::InvalidLayout)?,
             });
         }
 
@@ -98,7 +113,6 @@ impl<T> ScratchVec<T> {
             ptr: ptr.cast(),
             len: 0,
             cap,
-            layout,
         })
     }
 
@@ -125,6 +139,9 @@ impl<T> ScratchVec<T> {
     /// logic error that can write out of bounds.
     pub fn push(&mut self, value: T) {
         debug_assert!(self.len < self.cap, "scratch vec capacity exceeded");
+        // SAFETY: `len < cap` (asserted above in debug, caller invariant in
+        // release), so `ptr + len` is within the allocated region. The slot at
+        // `len` is uninitialized and we write a valid `MaybeUninit<T>`.
         unsafe {
             self.ptr
                 .as_ptr()
@@ -141,6 +158,9 @@ impl<T> ScratchVec<T> {
     /// error that can leave the vector with uninitialized elements.
     pub fn truncate(&mut self, new_len: usize) {
         debug_assert!(new_len <= self.len, "scratch vec truncate out of bounds");
+        // SAFETY: Elements `new_len..self.len` are initialized (invariant: all
+        // elements in `0..len` are initialized). We drop each in-place and then
+        // lower `len`, which leaves no dangling initialized memory.
         unsafe {
             for i in new_len..self.len {
                 std::ptr::drop_in_place(self.ptr.as_ptr().add(i).cast::<T>());
@@ -150,10 +170,14 @@ impl<T> ScratchVec<T> {
     }
 
     pub fn as_slice(&self) -> &[T] {
+        // SAFETY: `ptr` is valid for `cap` elements, `len <= cap`, and all
+        // elements in `0..len` are initialized. The `&self` borrow ensures no
+        // concurrent mutation.
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().cast::<T>(), self.len) }
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [T] {
+        // SAFETY: Same as `as_slice`; `&mut self` guarantees exclusive access.
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr().cast::<T>(), self.len) }
     }
 
@@ -176,6 +200,11 @@ impl<T> ScratchVec<T> {
             new_len <= self.cap,
             "scratch vec capacity exceeded on extend_from_slice"
         );
+        // SAFETY: `new_len <= cap` (debug-asserted), so `ptr + len` through
+        // `ptr + new_len - 1` is within bounds. Source and destination do not
+        // overlap because `slice` is an external reference and the destination
+        // is the uninitialized tail of our allocation. `T: Copy` means no
+        // drop glue and bitwise copy is sufficient.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 slice.as_ptr(),
@@ -211,6 +240,10 @@ impl<T> ScratchVec<T> {
             new_len <= self.cap,
             "scratch vec capacity exceeded on extend_from_self_range"
         );
+        // SAFETY: Source range `start..start+len` is within `0..self.len`
+        // (debug-asserted) and destination starts at `self.len`. These ranges
+        // may overlap when the source tail reaches into the destination, so we
+        // use `copy` (memmove) rather than `copy_nonoverlapping`.
         unsafe {
             std::ptr::copy(
                 self.ptr.as_ptr().add(start).cast::<T>(),
@@ -230,15 +263,19 @@ impl<T> ScratchVec<T> {
             return None;
         }
         self.len -= 1;
-        // SAFETY: We just confirmed len > 0, so self.len (now decremented) is a valid index.
-        // The element is initialized; we read and return it without dropping (caller owns it).
+        // SAFETY: `self.len` (post-decrement) was the last valid index. The
+        // element is initialized. `read()` performs a bitwise copy without
+        // dropping the source — ownership transfers to the caller. The slot
+        // is now logically uninitialized and excluded by the lowered `len`.
         unsafe { Some(self.ptr.as_ptr().add(self.len).cast::<T>().read()) }
     }
 
     /// Returns a reference to the element at `index`, or `None` if out of bounds.
     pub fn get(&self, index: usize) -> Option<&T> {
         if index < self.len {
-            // SAFETY: index is in bounds and element is initialized.
+            // SAFETY: `index < len <= cap`, so the pointer arithmetic is in
+            // bounds and the element is initialized. The `&self` borrow prevents
+            // concurrent mutation.
             unsafe { Some(&*self.ptr.as_ptr().add(index).cast::<T>()) }
         } else {
             None
@@ -248,7 +285,7 @@ impl<T> ScratchVec<T> {
     /// Returns a mutable reference to the element at `index`, or `None` if out of bounds.
     pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
         if index < self.len {
-            // SAFETY: index is in bounds and element is initialized.
+            // SAFETY: Same as `get`; `&mut self` guarantees exclusive access.
             unsafe { Some(&mut *self.ptr.as_ptr().add(index).cast::<T>()) }
         } else {
             None
@@ -259,10 +296,13 @@ impl<T> ScratchVec<T> {
     ///
     /// After the iterator is dropped (or fully consumed), the vector is empty.
     /// This is the fixed-capacity equivalent of `Vec::drain(..)`.
+    ///
+    /// # Ownership
+    /// Length is set to 0 *before* creating the iterator, transferring
+    /// ownership of all `len` elements to `Drain`. This ensures the vector
+    /// is in a consistent (empty) state even if the caller leaks the `Drain`.
     pub fn drain(&mut self) -> Drain<'_, T> {
         let len = self.len;
-        // Set length to 0 immediately; Drain owns the elements and will drop
-        // any remaining on its own drop.
         self.len = 0;
         Drain {
             ptr: self.ptr.cast::<T>(),
@@ -278,6 +318,17 @@ impl<T> ScratchVec<T> {
 /// Yields elements by value and drops any remaining elements when the iterator
 /// is dropped. After iteration completes (or the iterator is dropped), the
 /// source `ScratchVec` is empty.
+///
+/// # Design
+/// The parent `ScratchVec::len` is set to 0 *before* creating `Drain`. This
+/// means the `Drain` owns all `len` elements and is solely responsible for
+/// either yielding or dropping them — there is no double-drop risk even if
+/// the consumer panics mid-iteration (the `Drop` impl handles the tail).
+///
+/// # Safety
+/// `ptr` points into the parent's allocation, which remains valid for `'a`.
+/// The `PhantomData<&'a mut T>` ties the iterator's lifetime to the parent's
+/// exclusive borrow, preventing use-after-free and aliased mutation.
 pub struct Drain<'a, T> {
     ptr: NonNull<T>,
     idx: usize,
@@ -292,7 +343,9 @@ impl<'a, T> Iterator for Drain<'a, T> {
         if self.idx >= self.len {
             return None;
         }
-        // SAFETY: idx < len, so the element is valid and initialized.
+        // SAFETY: `idx < len` and each index is yielded exactly once (idx is
+        // monotonically incremented). `read()` transfers ownership to the caller
+        // without running drop on the source; the `Drop` impl skips yielded indices.
         let val = unsafe { self.ptr.as_ptr().add(self.idx).read() };
         self.idx += 1;
         Some(val)
@@ -333,19 +386,35 @@ impl<T> std::ops::IndexMut<usize> for ScratchVec<T> {
 
 impl<T> Drop for ScratchVec<T> {
     fn drop(&mut self) {
+        // Drop all initialized elements first.
         self.truncate(0);
         if self.cap == 0 {
             return;
         }
+        // SAFETY: `ptr` was allocated with the same layout computed by
+        // `dealloc_layout(cap)`. All elements have been dropped by `truncate(0)`
+        // above, so we only free the backing memory.
         unsafe {
-            dealloc(self.ptr.as_ptr().cast::<u8>(), self.layout);
+            dealloc(
+                self.ptr.as_ptr().cast::<u8>(),
+                Self::dealloc_layout(self.cap),
+            );
         }
     }
 }
 
-// SAFETY: ScratchVec exclusively owns its allocation, same as Vec<T>.
-// When T: Send, the owned data is safe to transfer between threads.
+// SAFETY: `ScratchVec<T>` exclusively owns its allocation (no shared or aliased
+// pointers). When `T: Send`, transferring the vector to another thread is safe
+// because all owned data moves with it — identical reasoning to `Vec<T>: Send`.
+// Note: we intentionally do *not* implement `Sync` because the debug-only
+// bounds checks are not atomic and the type is designed for single-threaded
+// scratch use within one scan.
 unsafe impl<T: Send> Send for ScratchVec<T> {}
+
+// Compile-time size guard: `ScratchVec<u8>` is exactly `ptr + len + cap` = 24
+// bytes. This catches accidental field additions (e.g., storing a `Layout`)
+// that would bloat every scratch buffer in the engine.
+const _: () = assert!(size_of::<ScratchVec<u8>>() == 24);
 
 #[cfg(test)]
 mod tests {
