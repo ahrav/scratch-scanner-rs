@@ -1031,6 +1031,26 @@ impl TransformConfig {
 }
 
 impl TransformId {
+    /// Every variant in this enum, in definition order.
+    ///
+    /// Used by CLI parsing to validate `--transforms` names and by help text
+    /// to list accepted values. When a new variant is added to `TransformId`,
+    /// it **must** be appended here and given a `cli_name()` mapping.
+    pub const ALL: &[TransformId] = &[TransformId::UrlPercent, TransformId::Base64];
+
+    /// Canonical CLI name accepted by the `--transforms` flag.
+    ///
+    /// This is the **single source of truth** for the name ↔ variant
+    /// mapping. `parse_transforms` in `cli.rs` and the help text both
+    /// derive their accepted names from this method, so adding a new
+    /// variant here is sufficient to wire it through the CLI.
+    pub fn cli_name(self) -> &'static str {
+        match self {
+            TransformId::UrlPercent => "url",
+            TransformId::Base64 => "base64",
+        }
+    }
+
     /// Encodes this transform id into a stable tag.
     pub(crate) fn encode_policy(self, out: &mut Vec<u8>) {
         let tag = match self {

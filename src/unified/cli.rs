@@ -14,10 +14,47 @@ use std::env;
 use std::io;
 use std::path::PathBuf;
 
+use crate::api::TransformId;
 use crate::git_scan::{GitScanMode, MergeDiffMode};
 use crate::AnchorMode;
 
 use super::{EventFormat, FsScanConfig, GitSourceConfig, SourceConfig};
+
+/// Controls which transform decoders are active during a scan.
+///
+/// The scanner supports multiple transform types (URL percent-decoding,
+/// Base64 decoding) that produce derived buffers for secondary scanning.
+/// This filter lets the user selectively enable/disable individual
+/// transforms — e.g., to measure per-transform overhead, debug false
+/// positives from a specific decoder, or skip transforms entirely for
+/// raw-only scanning.
+///
+/// # Relationship to `--decode-depth`
+///
+/// `--decode-depth` controls how many *layers* of recursive decoding are
+/// applied; `TransformFilter` controls *which* decoders participate at
+/// every layer. The two are orthogonal: `--transforms=base64` with
+/// `--decode-depth=3` still recurses up to 3 levels, but only using
+/// the Base64 decoder.
+///
+/// # Mapping to engine types
+///
+/// CLI names are defined by [`TransformId::cli_name()`]:
+///
+/// | CLI name   | `TransformId` variant |
+/// |------------|-----------------------|
+/// | `"url"`    | `UrlPercent`          |
+/// | `"base64"` | `Base64`              |
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum TransformFilter {
+    /// Enable all available transforms (default).
+    #[default]
+    All,
+    /// Disable all transforms — scan raw buffers only.
+    None,
+    /// Enable only the listed transforms (converted from CLI names at parse time).
+    Only(Vec<TransformId>),
+}
 
 /// Top-level scan configuration produced by CLI parsing.
 pub struct ScanConfig {
@@ -27,6 +64,11 @@ pub struct ScanConfig {
     /// falls back to `default_rules.yaml` next to the binary, then the
     /// compiled-in demo rules.
     pub rules_file: Option<PathBuf>,
+    /// Which transform decoders to enable. Applied as a pre-engine filter
+    /// on [`demo_transforms()`](crate::demo_transforms) output. In git
+    /// scans, the filtered list also feeds into the policy hash, so
+    /// disabling a transform correctly invalidates cached scan results.
+    pub transform_filter: TransformFilter,
 }
 
 /// Parse `std::env::args_os()` into a [`ScanConfig`].
@@ -102,6 +144,7 @@ fn parse_fs_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<S
     let mut anchor_mode = AnchorMode::Manual;
     let mut event_format = EventFormat::Jsonl;
     let mut rules_file: Option<PathBuf> = None;
+    let mut transform_filter = TransformFilter::All;
 
     for arg in args {
         // Handle --rules= before UTF-8 conversion since paths may be non-UTF8.
@@ -111,6 +154,17 @@ fn parse_fs_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<S
                 std::process::exit(2);
             }
             rules_file = Some(PathBuf::from(rest));
+            continue;
+        }
+
+        // Handle --transforms= before UTF-8 gate so non-UTF-8 args aren't
+        // silently misinterpreted as positional paths.
+        if let Some(rest) = strip_os_prefix(&arg, "--transforms=") {
+            let value = rest.to_str().unwrap_or_else(|| {
+                eprintln!("error: --transforms value must be valid UTF-8");
+                std::process::exit(2);
+            });
+            transform_filter = parse_transforms(value);
             continue;
         }
 
@@ -187,6 +241,7 @@ fn parse_fs_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<S
         }),
         event_format,
         rules_file,
+        transform_filter,
     })
 }
 
@@ -207,6 +262,7 @@ fn parse_git_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<
     let mut perf_breakdown = false;
     let mut event_format = EventFormat::Jsonl;
     let mut rules_file: Option<PathBuf> = None;
+    let mut transform_filter = TransformFilter::All;
 
     for arg in args {
         // Handle --rules= before UTF-8 conversion since paths may be non-UTF8.
@@ -216,6 +272,17 @@ fn parse_git_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<
                 std::process::exit(2);
             }
             rules_file = Some(PathBuf::from(rest));
+            continue;
+        }
+
+        // Handle --transforms= before UTF-8 gate so non-UTF-8 args aren't
+        // silently misinterpreted as positional paths.
+        if let Some(rest) = strip_os_prefix(&arg, "--transforms=") {
+            let value = rest.to_str().unwrap_or_else(|| {
+                eprintln!("error: --transforms value must be valid UTF-8");
+                std::process::exit(2);
+            });
+            transform_filter = parse_transforms(value);
             continue;
         }
 
@@ -341,6 +408,7 @@ fn parse_git_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<
         }),
         event_format,
         rules_file,
+        transform_filter,
     })
 }
 
@@ -373,6 +441,65 @@ fn parse_event_format(s: &str) -> EventFormat {
         _ => {
             eprintln!("invalid --event-format value: {} (expected jsonl)", s);
             std::process::exit(2);
+        }
+    }
+}
+
+/// Parse the value of `--transforms=<value>` into a [`TransformFilter`].
+///
+/// Accepts `"all"`, `"none"`, or a comma-separated list of CLI names
+/// defined by [`TransformId::cli_name()`]. Validation iterates
+/// [`TransformId::ALL`], so adding a new variant there is sufficient
+/// to accept it here.
+///
+/// Input is case-insensitive (including `all`/`none`) and whitespace
+/// around commas is trimmed. Duplicate names are silently deduplicated
+/// (first occurrence wins, preserving user-specified order). Exits with
+/// code 2 on unrecognised names.
+fn parse_transforms(s: &str) -> TransformFilter {
+    let known_csv: String = TransformId::ALL
+        .iter()
+        .map(|id| id.cli_name())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let normalized = s.trim().to_lowercase();
+    match normalized.as_str() {
+        "" => {
+            eprintln!(
+                "error: --transforms requires a value (all, none, or comma-separated: {known_csv})"
+            );
+            std::process::exit(2);
+        }
+        "all" => TransformFilter::All,
+        "none" => TransformFilter::None,
+        _ => {
+            let tokens: Vec<&str> = normalized
+                .split(',')
+                .map(|n| n.trim())
+                .filter(|n| !n.is_empty())
+                .collect();
+            if tokens.is_empty() {
+                eprintln!(
+                    "error: --transforms requires at least one transform name (known: {known_csv})"
+                );
+                std::process::exit(2);
+            }
+            let mut ids = Vec::new();
+            for tok in tokens {
+                let id = TransformId::ALL
+                    .iter()
+                    .find(|id| id.cli_name() == tok)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        eprintln!("invalid --transforms value: '{}' (known: {known_csv})", tok);
+                        std::process::exit(2);
+                    });
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+            TransformFilter::Only(ids)
         }
     }
 }
@@ -425,6 +552,8 @@ OPTIONS:
     --rules=<path>          YAML rules file (default: default_rules.yaml next to binary)
     --workers=<N>           Worker threads (default: CPU count)
     --decode-depth=<N>      Max decode depth (default: 2)
+    --transforms=all|none|<list>  Transforms to enable (default: all)
+                            Comma-separated: base64, url (case-insensitive)
     --no-archives           Disable archive scanning
     --null-sink             Drop all findings (measure scan overhead only)
     --anchors=manual|derived  Anchor mode (default: manual)
@@ -447,6 +576,8 @@ OPTIONS:
     --tree-delta-cache-mb=<N> Tree delta cache (default: 128)
     --engine-chunk-mb=<N>     Engine chunk size (default: 1)
     --decode-depth=<N>        Max decode depth (default: 2)
+    --transforms=all|none|<list>  Transforms to enable (default: all)
+                              Comma-separated: base64, url (case-insensitive)
     --anchors=manual|derived  Anchor mode (default: manual)
     --debug                   Verbose stage stats to stderr
     --perf-breakdown          Pack execution timing breakdown
@@ -501,6 +632,149 @@ mod tests {
         assert!(
             config.rules_file.is_some(),
             "non-UTF8 --rules= path must not be silently ignored"
+        );
+    }
+
+    #[test]
+    fn fs_transforms_default_is_all() {
+        let args = vec![OsString::from("--path=/some/dir")];
+        let config = parse_fs_args(args.into_iter()).unwrap();
+        assert_eq!(config.transform_filter, TransformFilter::All);
+    }
+
+    #[test]
+    fn fs_transforms_none() {
+        let args = vec![
+            OsString::from("--path=/some/dir"),
+            OsString::from("--transforms=none"),
+        ];
+        let config = parse_fs_args(args.into_iter()).unwrap();
+        assert_eq!(config.transform_filter, TransformFilter::None);
+    }
+
+    #[test]
+    fn fs_transforms_single() {
+        let args = vec![
+            OsString::from("--path=/some/dir"),
+            OsString::from("--transforms=base64"),
+        ];
+        let config = parse_fs_args(args.into_iter()).unwrap();
+        assert_eq!(
+            config.transform_filter,
+            TransformFilter::Only(vec![TransformId::Base64])
+        );
+    }
+
+    #[test]
+    fn fs_transforms_comma_list() {
+        let args = vec![
+            OsString::from("--path=/some/dir"),
+            OsString::from("--transforms=url,base64"),
+        ];
+        let config = parse_fs_args(args.into_iter()).unwrap();
+        assert_eq!(
+            config.transform_filter,
+            TransformFilter::Only(vec![TransformId::UrlPercent, TransformId::Base64])
+        );
+    }
+
+    #[test]
+    fn fs_transforms_all_explicit() {
+        let args = vec![
+            OsString::from("--path=/some/dir"),
+            OsString::from("--transforms=all"),
+        ];
+        let config = parse_fs_args(args.into_iter()).unwrap();
+        assert_eq!(config.transform_filter, TransformFilter::All);
+    }
+
+    #[test]
+    fn fs_transforms_all_case_insensitive() {
+        let args = vec![
+            OsString::from("--path=/some/dir"),
+            OsString::from("--transforms=ALL"),
+        ];
+        let config = parse_fs_args(args.into_iter()).unwrap();
+        assert_eq!(config.transform_filter, TransformFilter::All);
+    }
+
+    #[test]
+    fn git_transforms_none() {
+        let args = vec![
+            OsString::from("--repo=/some/repo"),
+            OsString::from("--transforms=none"),
+        ];
+        let config = parse_git_args(args.into_iter()).unwrap();
+        assert_eq!(config.transform_filter, TransformFilter::None);
+    }
+
+    #[test]
+    fn git_transforms_none_case_insensitive() {
+        let args = vec![
+            OsString::from("--repo=/some/repo"),
+            OsString::from("--transforms=NoNe"),
+        ];
+        let config = parse_git_args(args.into_iter()).unwrap();
+        assert_eq!(config.transform_filter, TransformFilter::None);
+    }
+
+    #[test]
+    fn parse_transforms_helper() {
+        assert_eq!(parse_transforms("all"), TransformFilter::All);
+        assert_eq!(parse_transforms(" ALL "), TransformFilter::All);
+        assert_eq!(parse_transforms("none"), TransformFilter::None);
+        assert_eq!(parse_transforms("NoNe"), TransformFilter::None);
+        assert_eq!(
+            parse_transforms("base64"),
+            TransformFilter::Only(vec![TransformId::Base64])
+        );
+        assert_eq!(
+            parse_transforms("url,base64"),
+            TransformFilter::Only(vec![TransformId::UrlPercent, TransformId::Base64])
+        );
+        assert_eq!(
+            parse_transforms(" URL , Base64 "),
+            TransformFilter::Only(vec![TransformId::UrlPercent, TransformId::Base64])
+        );
+        // Trailing comma: empty segments are filtered out.
+        assert_eq!(
+            parse_transforms("base64,"),
+            TransformFilter::Only(vec![TransformId::Base64])
+        );
+        // Leading comma.
+        assert_eq!(
+            parse_transforms(",url"),
+            TransformFilter::Only(vec![TransformId::UrlPercent])
+        );
+    }
+
+    #[test]
+    fn parse_transforms_deduplicates() {
+        assert_eq!(
+            parse_transforms("base64,base64"),
+            TransformFilter::Only(vec![TransformId::Base64])
+        );
+        assert_eq!(
+            parse_transforms("url,base64,url"),
+            TransformFilter::Only(vec![TransformId::UrlPercent, TransformId::Base64])
+        );
+    }
+
+    // Verify --transforms= is handled via strip_os_prefix (before the UTF-8
+    // gate), so valid values still parse correctly through the new code path.
+    // The non-UTF-8 case (e.g. --transforms=\xff) now calls process::exit(2)
+    // with "error: --transforms value must be valid UTF-8" instead of being
+    // silently misinterpreted as a positional path argument.
+    #[test]
+    fn fs_transforms_parsed_before_utf8_gate() {
+        let args = vec![
+            OsString::from("--path=/some/dir"),
+            OsString::from("--transforms=base64"),
+        ];
+        let config = parse_fs_args(args.into_iter()).unwrap();
+        assert_eq!(
+            config.transform_filter,
+            TransformFilter::Only(vec![TransformId::Base64])
         );
     }
 
