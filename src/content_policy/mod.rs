@@ -68,10 +68,12 @@ pub fn is_likely_binary(data: &[u8], check_len: usize) -> bool {
 
 /// Classify content by inspecting bytes and the file path extension.
 ///
-/// 1. If no NUL byte is found in the first `check_len` bytes → [`ContentVerdict::Text`].
-/// 2. If NUL bytes are present but the extension matches a known extractable
-///    format → [`ContentVerdict::BinaryExtractable`].
-/// 3. Otherwise → [`ContentVerdict::Binary`].
+/// 1. Check for NUL bytes in the first `check_len` bytes.
+/// 2. If no NUL bytes: check extension for extractable formats (e.g. `.ipynb`
+///    is JSON text but should be routed through the extractor). If matched →
+///    [`ContentVerdict::BinaryExtractable`]; otherwise → [`ContentVerdict::Text`].
+/// 3. If NUL bytes present: check extension for extractable formats →
+///    [`ContentVerdict::BinaryExtractable`]; otherwise → [`ContentVerdict::Binary`].
 ///
 /// Empty data always returns [`ContentVerdict::Text`] (nothing to skip).
 #[inline]
