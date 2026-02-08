@@ -5,25 +5,32 @@
 //! across transforms and UTF-16 variants.
 
 use super::core::Engine;
-use super::helpers::{
-    decode_utf16be_to_vec, decode_utf16le_to_vec, entropy_gate_passes, extract_secret_span, hash128,
-};
+#[cfg(feature = "stdx-proptest")]
+use super::helpers::entropy_gate_passes;
+use super::helpers::{decode_utf16be_to_vec, decode_utf16le_to_vec, extract_secret_span, hash128};
 #[cfg(all(test, feature = "stdx-proptest"))]
 use super::hit_pool::{HitAccPool, SpanU32};
-use super::rule_repr::{utf16be_bytes, utf16le_bytes, EntropyCompiled, PackedPatterns, Variant};
+#[cfg(feature = "stdx-proptest")]
+use super::rule_repr::EntropyCompiled;
+use super::rule_repr::{utf16be_bytes, utf16le_bytes, PackedPatterns, Variant};
+#[cfg(feature = "stdx-proptest")]
 use super::scratch::EntropyScratch;
 #[cfg(all(test, feature = "stdx-proptest"))]
 use super::transform::find_url_spans_into;
+#[cfg(feature = "stdx-proptest")]
 use super::transform::{
-    base64_char_count, base64_skip_chars, decode_to_vec, find_base64_spans_into, find_spans_into,
-    transform_quick_trigger,
+    base64_char_count, base64_skip_chars, find_spans_into, transform_quick_trigger,
 };
+use super::transform::{decode_to_vec, find_base64_spans_into};
+#[cfg(feature = "stdx-proptest")]
 use super::vectorscan_prefilter::{
     gate_match_callback, stream_match_callback, VsStreamMatchCtx, VsStreamWindow,
 };
+#[cfg(feature = "stdx-proptest")]
+use crate::api::Tuning;
 use crate::api::{
     AnchorPolicy, DecodeStep, EntropySpec, FileId, Finding, FindingRec, Gate, LocalContextSpec,
-    RuleSpec, TransformConfig, TransformId, TransformMode, Tuning, Utf16Endianness, ValidatorKind,
+    RuleSpec, TransformConfig, TransformId, TransformMode, Utf16Endianness, ValidatorKind,
     STEP_ROOT,
 };
 use crate::demo::{demo_engine, demo_rules, demo_tuning};
@@ -37,16 +44,20 @@ use crate::tiger_harness::{
 #[cfg(all(test, feature = "stdx-proptest"))]
 use crate::tiger_harness::{maybe_write_regression, ChunkPattern};
 use crate::{ScannerConfig, ScannerRuntime};
+#[cfg(feature = "stdx-proptest")]
 use memchr::memmem;
+#[cfg(feature = "stdx-proptest")]
 use proptest::prelude::*;
 use regex::bytes::Regex;
 use std::collections::HashSet;
+#[cfg(feature = "stdx-proptest")]
 use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "stdx-proptest")]
 fn decoded_prefilter_hit(engine: &Engine, decoded: &[u8]) -> bool {
     if let Some(vs_gate) = engine.vs_gate.as_ref() {
         let mut scratch = match vs_gate.alloc_scratch() {
@@ -444,18 +455,22 @@ fn b64_encode(input: &[u8]) -> String {
     out
 }
 
+#[cfg(feature = "stdx-proptest")]
 fn is_b64_char_ref(b: u8) -> bool {
     matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' | b'=' | b'-' | b'_')
 }
 
+#[cfg(feature = "stdx-proptest")]
 fn is_b64_ws_ref(b: u8, allow_space_ws: bool) -> bool {
     matches!(b, b'\n' | b'\r' | b'\t') || (allow_space_ws && b == b' ')
 }
 
+#[cfg(feature = "stdx-proptest")]
 fn is_b64_or_ws_ref(b: u8, allow_space_ws: bool) -> bool {
     is_b64_char_ref(b) || is_b64_ws_ref(b, allow_space_ws)
 }
 
+#[cfg(feature = "stdx-proptest")]
 fn find_base64_spans_reference(
     hay: &[u8],
     min_chars: usize,
@@ -1572,12 +1587,14 @@ fn write_temp_file(bytes: &[u8]) -> std::io::Result<TempFile> {
     Ok(TempFile { path })
 }
 
+#[cfg(feature = "stdx-proptest")]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum StepKind {
     Transform { idx: usize },
     Utf16 { le: bool },
 }
 
+#[cfg(feature = "stdx-proptest")]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct FindingKey {
     rule: &'static str,
@@ -1586,6 +1603,7 @@ struct FindingKey {
 }
 
 // Normalize findings into a hashable form for equivalence checks.
+#[cfg(feature = "stdx-proptest")]
 fn findings_to_keys(findings: &[Finding]) -> HashSet<FindingKey> {
     findings
         .iter()
@@ -1611,6 +1629,7 @@ fn findings_to_keys(findings: &[Finding]) -> HashSet<FindingKey> {
         .collect()
 }
 
+#[cfg(feature = "stdx-proptest")]
 #[derive(Clone)]
 struct RefWorkItem {
     buf: Vec<u8>,
@@ -1619,6 +1638,7 @@ struct RefWorkItem {
 }
 
 // Slow, allocation-heavy reference scan that mirrors the engine's semantics.
+#[cfg(feature = "stdx-proptest")]
 fn reference_scan_keys(engine: &Engine, rules: &[RuleSpec], buf: &[u8]) -> HashSet<FindingKey> {
     let mut out = HashSet::new();
     let mut entropy_scratch = EntropyScratch::new();
@@ -1802,6 +1822,7 @@ fn reference_scan_keys(engine: &Engine, rules: &[RuleSpec], buf: &[u8]) -> HashS
 }
 
 // Reference rule scan over raw + UTF-16 variants for a single buffer.
+#[cfg(feature = "stdx-proptest")]
 fn scan_rules_reference(
     engine: &Engine,
     rules: &[RuleSpec],
@@ -1955,6 +1976,7 @@ fn scan_rules_reference(
 }
 
 // Build windows using the same merge/pressure logic as the engine.
+#[cfg(feature = "stdx-proptest")]
 fn collect_windows_for_variant(
     buf: &[u8],
     rule: &RuleSpec,
@@ -2035,6 +2057,7 @@ fn collect_windows_for_variant(
     expanded
 }
 
+#[cfg(feature = "stdx-proptest")]
 fn push_anchor_windows(
     buf: &[u8],
     anchors: &[Vec<u8>],
@@ -2061,6 +2084,7 @@ fn push_anchor_windows(
     }
 }
 
+#[cfg(feature = "stdx-proptest")]
 fn merge_ranges_with_gap(ranges: &mut Vec<Range<usize>>, gap: usize) {
     if ranges.len() <= 1 {
         return;
@@ -2083,6 +2107,7 @@ fn merge_ranges_with_gap(ranges: &mut Vec<Range<usize>>, gap: usize) {
     *ranges = merged;
 }
 
+#[cfg(feature = "stdx-proptest")]
 fn coalesce_under_pressure(
     ranges: &mut Vec<Range<usize>>,
     hay_len: usize,
@@ -2106,12 +2131,14 @@ fn coalesce_under_pressure(
     }
 }
 
+#[cfg(feature = "stdx-proptest")]
 #[derive(Clone, Debug)]
 struct TokenCase {
     rule_name: &'static str,
     token: Vec<u8>,
 }
 
+#[cfg(feature = "stdx-proptest")]
 #[derive(Clone, Debug)]
 struct InputCase {
     #[allow(dead_code)] // Retained for Debug output in test failures.
@@ -2119,6 +2146,7 @@ struct InputCase {
     buf: Vec<u8>,
 }
 
+#[cfg(feature = "stdx-proptest")]
 #[derive(Clone, Copy, Debug)]
 enum BaseEncoding {
     Raw,
@@ -2126,6 +2154,7 @@ enum BaseEncoding {
     Utf16Be,
 }
 
+#[cfg(feature = "stdx-proptest")]
 #[derive(Clone, Copy, Debug)]
 enum TransformChain {
     None,
@@ -2150,6 +2179,7 @@ const TOKEN_RULE_NAMES: &[&str] = &[
     "private-key",
 ];
 
+#[cfg(feature = "stdx-proptest")]
 fn token_strategy() -> BoxedStrategy<TokenCase> {
     const ALNUM_UPPER: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     const ALNUM_LOWER: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
@@ -2284,6 +2314,7 @@ fn token_strategy() -> BoxedStrategy<TokenCase> {
     .boxed()
 }
 
+#[cfg(feature = "stdx-proptest")]
 fn base_encoding_strategy() -> BoxedStrategy<BaseEncoding> {
     prop_oneof![
         Just(BaseEncoding::Raw),
@@ -2293,6 +2324,7 @@ fn base_encoding_strategy() -> BoxedStrategy<BaseEncoding> {
     .boxed()
 }
 
+#[cfg(feature = "stdx-proptest")]
 fn transform_chain_strategy() -> BoxedStrategy<TransformChain> {
     prop_oneof![
         Just(TransformChain::None),
@@ -2304,6 +2336,7 @@ fn transform_chain_strategy() -> BoxedStrategy<TransformChain> {
     .boxed()
 }
 
+#[cfg(feature = "stdx-proptest")]
 fn input_case_strategy() -> BoxedStrategy<InputCase> {
     (
         token_strategy(),
@@ -2330,6 +2363,7 @@ fn input_case_strategy() -> BoxedStrategy<InputCase> {
         .boxed()
 }
 
+#[cfg(feature = "stdx-proptest")]
 fn map_bytes(bytes: &[u8], charset: &[u8]) -> Vec<u8> {
     bytes
         .iter()
@@ -2337,6 +2371,7 @@ fn map_bytes(bytes: &[u8], charset: &[u8]) -> Vec<u8> {
         .collect()
 }
 
+#[cfg(feature = "stdx-proptest")]
 fn apply_encoding(token: &[u8], base: BaseEncoding, chain: TransformChain) -> Vec<u8> {
     let bytes = match base {
         BaseEncoding::Raw => token.to_vec(),
@@ -2370,6 +2405,7 @@ fn url_percent_encode_all(input: &[u8]) -> Vec<u8> {
     out
 }
 
+#[cfg(feature = "stdx-proptest")]
 fn requires_trailing_delimiter(rule_name: &str) -> bool {
     matches!(
         rule_name,
@@ -2377,6 +2413,7 @@ fn requires_trailing_delimiter(rule_name: &str) -> bool {
     )
 }
 
+#[cfg(feature = "stdx-proptest")]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct RecKey {
     rule_id: u32,
@@ -2431,6 +2468,7 @@ fn scan_in_chunks(engine: &Engine, buf: &[u8], chunk_size: usize) -> Vec<Finding
     scan_in_chunks_with_overlap(engine, buf, chunk_size, engine.required_overlap())
 }
 
+#[cfg(feature = "stdx-proptest")]
 fn recs_to_keys(recs: &[FindingRec]) -> HashSet<RecKey> {
     recs.iter()
         .map(|rec| RecKey {

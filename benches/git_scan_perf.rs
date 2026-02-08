@@ -270,6 +270,7 @@ fn run_git_scan_once(
 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // Variants are conditionally constructed behind feature flags.
 enum PinStatus {
     None,
     Applied(usize),

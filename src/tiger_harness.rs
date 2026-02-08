@@ -348,11 +348,15 @@ mod regressions {
     use serde::{Deserialize, Serialize};
     use std::fs;
     use std::path::{Path, PathBuf};
+    #[cfg(feature = "stdx-proptest")]
     use std::sync::atomic::{AtomicU64, Ordering};
+    #[cfg(feature = "stdx-proptest")]
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[cfg(feature = "stdx-proptest")]
     const DEFAULT_DIR: &str = "tests/regressions/tiger_chunking";
 
+    #[cfg(feature = "stdx-proptest")]
     static REG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     /// Parsed regression case with raw input bytes and the exact chunk plan.
@@ -438,6 +442,7 @@ mod regressions {
     }
 
     impl RegressionFile {
+        #[cfg(feature = "stdx-proptest")]
         fn from_case(label: &str, seed: u64, plan: &ChunkPlan, input: &[u8]) -> Self {
             Self {
                 label: Some(label.to_string()),
@@ -468,6 +473,7 @@ mod regressions {
     /// Behavior:
     /// - No-op unless `SCANNER_WRITE_REGRESSIONS=1`.
     /// - Best-effort; failures are logged to stderr instead of panicking.
+    #[cfg(feature = "stdx-proptest")]
     pub(crate) fn maybe_write_regression(label: &str, seed: u64, plan: &ChunkPlan, buf: &[u8]) {
         if !capture_enabled() {
             return;
@@ -526,6 +532,7 @@ mod regressions {
         Ok(out)
     }
 
+    #[cfg(feature = "stdx-proptest")]
     fn capture_enabled() -> bool {
         match std::env::var("SCANNER_WRITE_REGRESSIONS") {
             Ok(value) => matches!(
@@ -536,12 +543,14 @@ mod regressions {
         }
     }
 
+    #[cfg(feature = "stdx-proptest")]
     fn regression_dir() -> PathBuf {
         std::env::var("SCANNER_REGRESSION_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(DEFAULT_DIR))
     }
 
+    #[cfg(feature = "stdx-proptest")]
     fn regression_filename(label: &str) -> String {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -552,6 +561,7 @@ mod regressions {
         format!("{}_{}_{}_{}.json", sanitize_label(label), ts, pid, n)
     }
 
+    #[cfg(feature = "stdx-proptest")]
     fn sanitize_label(label: &str) -> String {
         label
             .chars()

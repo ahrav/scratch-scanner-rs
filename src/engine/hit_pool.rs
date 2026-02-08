@@ -260,22 +260,22 @@ impl HitAccPool {
     }
 
     // Test-only accessors for internal state verification
-    #[cfg(test)]
+    #[cfg(all(test, feature = "stdx-proptest"))]
     pub(super) fn coalesced_set(&self) -> &[u8] {
         &self.coalesced_set
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "stdx-proptest"))]
     pub(super) fn coalesced(&self) -> &[SpanU32] {
         &self.coalesced
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "stdx-proptest"))]
     pub(super) fn lens(&self) -> &[u32] {
         &self.lens
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "stdx-proptest"))]
     pub(super) fn windows(&self) -> &[SpanU32] {
         &self.windows
     }
