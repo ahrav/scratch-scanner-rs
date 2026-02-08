@@ -334,10 +334,7 @@ impl Engine {
                     }
                 }
 
-                if let Some(confirm) = rule
-                    .confirm_all
-                    .map(|i| &self.confirm_all_gates[i as usize])
-                {
+                if let Some(confirm) = self.confirm_all_gate(rule.confirm_all) {
                     let vidx = Variant::Raw.idx();
                     if let Some(primary) = &confirm.primary[vidx] {
                         if memmem::find(window, primary).is_none() {
