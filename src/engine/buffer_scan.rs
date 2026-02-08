@@ -46,18 +46,28 @@ use super::scratch::ScanScratch;
 impl Engine {
     /// Applies the prefilter/gating pipeline to a single buffer variant.
     ///
+    /// This is the inner scan loop called once per buffer (root or decoded).
+    /// It processes only the `(rule, variant)` pairs that the Vectorscan
+    /// prefilter touched, keeping work proportional to hits rather than to
+    /// the total rule count.
+    ///
     /// # Preconditions
-    /// - `buf.len() <= u32::MAX`.
+    /// - `buf.len() <= u32::MAX` (spans are stored as [`SpanU32`]).
     /// - `scratch` belongs to the current scan and is not shared concurrently.
-    /// - `root_hint` (if provided) is a range into `buf` (relative to this buffer).
+    /// - `root_hint` (if provided) is a byte range into `buf`'s coordinate
+    ///   space, used to anchor findings back to the original input.
     ///
     /// # Effects
-    /// - Populates per-rule hit windows and emits findings into `scratch`.
-    /// - May decode UTF-16 windows for validation when enabled.
+    /// - Populates per-rule hit windows and emits findings into `scratch.out`.
+    /// - Resets `touched_pairs` and hit accumulators at the end so the next
+    ///   buffer starts clean.
     ///
     /// # Performance
-    /// - Work scales with the number of touched (rule, variant) pairs rather than
-    ///   all rules in the engine.
+    /// - Work scales with the number of touched (rule, variant) pairs rather
+    ///   than all rules in the engine.
+    /// - Sorting is conditional: raw windows always need sorting (Vectorscan
+    ///   fires in match-end order), but UTF-16 windows from literal-anchor
+    ///   matching arrive pre-sorted and skip the sort.
     pub(super) fn scan_rules_on_buffer(
         &self,
         buf: &[u8],
@@ -165,7 +175,7 @@ impl Engine {
             let rid = pair / 3;
             let vidx = pair % 3;
             let variant = VARIANTS[vidx];
-            let rule = &self.rules[rid];
+            let rule = &self.rules_hot[rid];
 
             scratch.hit_acc_pool.take_into(pair, &mut scratch.windows);
             if scratch.windows.is_empty() {
@@ -211,12 +221,16 @@ impl Engine {
             //   to full_radius (the actual regex validation radius). The extra
             //   padding is `(full_radius - seed_radius) * variant.scale()`.
             //
-            // Soundness: confirm patterns are derived from mandatory literal
-            // sub-expressions of the regex (see `compile_trigger_plan`). If the
-            // confirm literal is absent in the seed window, the regex cannot
-            // match in *any* superset of that window — so widening after a miss
-            // would be wasted work. This lets us reject ~80-95% of noisy
-            // prefilter hits before paying the regex cost.
+            // Soundness argument: confirm patterns are mandatory literal
+            // sub-expressions extracted from the regex AST (see
+            // `compile_trigger_plan`). Because these literals *must* appear in
+            // any valid regex match, their absence in the seed window proves
+            // no match exists in any superset — widening after a miss would be
+            // wasted work. This rejects ~80-95% of noisy prefilter hits before
+            // paying the O(regex) cost.
+            //
+            // The confirm set is indexed by `vidx` (variant index) so the
+            // memmem check uses the correct byte encoding (raw vs UTF-16).
             if let Some(tp) = self.two_phase_gate(rule.two_phase) {
                 let seed_radius_bytes = tp.seed_radius.saturating_mul(variant.scale());
                 let full_radius_bytes = tp.full_radius.saturating_mul(variant.scale());
@@ -295,9 +309,12 @@ impl Engine {
             }
         }
         // Reset accumulators for all pairs touched in this buffer so the next
-        // buffer starts with zeroed hit lists. This must happen *after* the
-        // validation loop because `take_into` moves hits out of the accumulator
-        // — resetting earlier would discard hits before they are consumed.
+        // buffer starts with zeroed hit lists.
+        //
+        // Ordering constraint: this must happen *after* the validation loop
+        // because `take_into` moves hits out of the accumulator into
+        // `scratch.windows`. Resetting earlier would discard hits that haven't
+        // been consumed yet.
         scratch
             .hit_acc_pool
             .reset_touched(scratch.touched_pairs.as_slice());

@@ -92,11 +92,16 @@ impl Variant {
 /// into `u32` to keep the fanout table cache-friendly and avoid extra pointer
 /// chasing.
 ///
-/// Layout (low bits): [variant (2)] [rule_id...]
+/// Layout (low bits): `[variant (2 bits)] [rule_id (30 bits)]`
 ///
 /// # Invariants
-/// - `rule_id` fits in the upper bits after `VARIANT_SHIFT`.
+/// - `rule_id` fits in 30 bits (max ~1 billion rules).
 /// - The low-bit layout is stable and must match `variant()`.
+///
+/// # Ordering
+/// `Ord` is derived on the raw `u32`, which sorts by (rule_id, variant).
+/// [`map_to_patterns`] sorts each pattern's target list by this order to
+/// ensure deterministic output across compilations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Target(u32);
 
@@ -137,10 +142,18 @@ impl Target {
 /// confirm patterns contiguous for cache-friendly memmem checks (both ANY and
 /// ALL gates).
 ///
+/// # Accessing patterns
+///
+/// Pattern `i` is `bytes[offsets[i] as usize .. offsets[i+1] as usize]`.
+/// The number of patterns is `offsets.len() - 1`. Callers in `buffer_scan.rs`
+/// and `window_validate.rs` iterate this way rather than through a method,
+/// because the memmem inner loops inline the slice indexing directly.
+///
 /// # Invariants
 /// - `offsets[0] == 0` and the last offset equals `bytes.len()`.
 /// - `offsets` is monotonically non-decreasing.
 /// - `bytes.len() <= u32::MAX`.
+/// - Empty pattern sets are valid: `offsets == [0]`, `bytes == []`.
 ///
 /// # Performance
 /// - Contiguous storage enables cache-friendly `memmem` gates without
@@ -288,17 +301,28 @@ pub(super) struct EntropyCompiled {
     pub(super) max_len: usize,
 }
 
-/// Compiled rule representation used during scanning.
+/// Hot compiled rule representation used during scanning.
 ///
 /// This keeps precompiled regexes and optional gate pool indices to minimize
 /// work in the hot path. Large gate structures are stored in pool vectors on
 /// `Engine` and accessed via `Option<u32>` indices here, keeping this struct
 /// compact for cache-friendly iteration.
 ///
-/// Field layout: hot fields that the scan loop touches on every candidate
-/// (`re`, `must_contain`, `needs_assignment_shape_check`) are placed first.
-/// Cold gate-pool indices follow; they are only dereferenced when a candidate
-/// survives the earlier checks.
+/// Cold per-rule metadata (e.g., rule name) is stored in the parallel
+/// [`RuleCold`] array at `Engine::rules_cold`, indexed identically so that
+/// `rules_hot[i]` and `rules_cold[i]` always describe the same rule.
+///
+/// # Field layout rationale
+///
+/// Fields are ordered by access frequency in the scan loop:
+///
+/// 1. **Every candidate**: `re`, `must_contain`, `needs_assignment_shape_check`
+///    — touched for every merged window to decide if the regex runs.
+/// 2. **Post-match only**: `secret_group` — read only when the regex matches.
+/// 3. **Gate indices**: `confirm_all`, `keywords`, `entropy`, `local_context`,
+///    `two_phase` — dereferenced through `Engine` pool accessors only when
+///    the corresponding gate is present (`Some`). Most rules have 0–2 gates,
+///    so these are cold for the majority of candidates.
 ///
 /// # Gate pool access
 ///
@@ -315,20 +339,29 @@ pub(super) struct EntropyCompiled {
 /// # Invariants
 /// - All fields are derived from a validated `RuleSpec`.
 /// - Gate indices, when `Some`, are valid into the corresponding pool vectors.
-/// - `Option<u32>` is 8 bytes (niche optimization does not apply here).
+/// - `Option<u32>` is 8 bytes (niche optimization does not apply here because
+///   `u32` has no niche — all bit patterns are valid values).
 #[derive(Clone, Debug)]
 pub(super) struct RuleCompiled {
     pub(super) re: Regex,
     pub(super) must_contain: Option<&'static [u8]>,
     pub(super) needs_assignment_shape_check: bool,
     pub(super) secret_group: Option<u16>,
-    pub(super) name: &'static str,
     // Gate pool indices — dereference through Engine pool vectors.
     pub(super) confirm_all: Option<u32>,
     pub(super) keywords: Option<u32>,
     pub(super) entropy: Option<u32>,
     pub(super) local_context: Option<u32>,
     pub(super) two_phase: Option<u32>,
+}
+
+/// Cold rule metadata used outside the validation hot path.
+///
+/// Kept in a parallel array with [`RuleCompiled`] (`rules_hot`) to keep
+/// scan-loop iteration focused on fields needed for gating and regex checks.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct RuleCold {
+    pub(super) name: &'static str,
 }
 
 // Compile-time size guard: gate index is 8 bytes (Option<u32> without niche).
@@ -415,7 +448,6 @@ pub(super) fn compile_rule(spec: &RuleSpec) -> (RuleCompiled, CompiledGates) {
         must_contain: spec.must_contain,
         needs_assignment_shape_check,
         secret_group: spec.secret_group,
-        name: spec.name,
         confirm_all: None,
         keywords: None,
         entropy: None,
@@ -497,9 +529,13 @@ pub(super) fn add_pat_owned(
 /// - `flat_targets[offsets[i]..offsets[i+1]]` are the targets for pattern `i`,
 /// - `offsets` has length `patterns.len() + 1` (prefix-sum layout).
 ///
-/// Deterministic ordering: patterns are sorted by bytes, and each pattern's
-/// target list is sorted by packed `Target` value. This ensures stable
-/// pattern-id assignment across compilations.
+/// # Why deterministic ordering matters
+///
+/// Patterns are sorted by bytes and each pattern's target list is sorted by
+/// packed `Target` value. This guarantees stable pattern-id assignment across
+/// compilations, which is critical because Vectorscan pattern ids are
+/// positional — the same pattern must always get the same id for the
+/// prefilter callback to route hits to the correct rule/variant accumulator.
 pub(super) fn map_to_patterns(
     map: AHashMap<Vec<u8>, Vec<Target>>,
 ) -> (Vec<Vec<u8>>, Vec<Target>, Vec<u32>) {

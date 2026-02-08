@@ -58,8 +58,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::helpers::u64_to_usize;
 use super::rule_repr::{
     add_pat_owned, add_pat_raw, compile_confirm_all, compile_rule, map_to_patterns, utf16be_bytes,
-    utf16le_bytes, ConfirmAllCompiled, EntropyCompiled, KeywordsCompiled, RuleCompiled, Target,
-    TwoPhaseCompiled, Variant,
+    utf16le_bytes, ConfirmAllCompiled, EntropyCompiled, KeywordsCompiled, RuleCold, RuleCompiled,
+    Target, TwoPhaseCompiled, Variant,
 };
 use super::scratch::{RootSpanMapCtx, ScanScratch};
 use super::transform::STREAM_DECODE_CHUNK_BYTES;
@@ -121,21 +121,48 @@ pub struct VectorscanStats {
     pub stream_window_cap_exceeded: u64,
 }
 
+/// Cache-line padded atomic counter to reduce false sharing between workers.
+///
+/// Each instance occupies exactly one 64-byte cache line so that concurrent
+/// increments from different threads never contend on the same line. Without
+/// this padding, adjacent `AtomicU64` counters in `VectorscanCounters` would
+/// share a cache line and trigger false-sharing invalidations on every store.
+#[cfg(feature = "stats")]
+#[repr(align(64))]
+#[derive(Default)]
+pub(super) struct CachePaddedAtomicU64(AtomicU64);
+
+#[cfg(feature = "stats")]
+impl std::ops::Deref for CachePaddedAtomicU64 {
+    type Target = AtomicU64;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+// Compile-time size/alignment guard: each counter occupies exactly one cache line.
+#[cfg(feature = "stats")]
+const _: () = assert!(
+    std::mem::align_of::<CachePaddedAtomicU64>() == 64
+        && std::mem::size_of::<CachePaddedAtomicU64>() == 64
+);
+
 /// Internal atomic counters used to build `VectorscanStats`.
 #[cfg(feature = "stats")]
 #[derive(Default)]
 pub(super) struct VectorscanCounters {
-    pub(super) scans_attempted: AtomicU64,
-    pub(super) scans_ok: AtomicU64,
-    pub(super) scans_err: AtomicU64,
-    pub(super) utf16_scans_attempted: AtomicU64,
-    pub(super) utf16_scans_ok: AtomicU64,
-    pub(super) utf16_scans_err: AtomicU64,
-    pub(super) anchor_only: AtomicU64,
-    pub(super) anchor_after_vs: AtomicU64,
-    pub(super) anchor_skipped: AtomicU64,
-    pub(super) stream_force_full: AtomicU64,
-    pub(super) stream_window_cap_exceeded: AtomicU64,
+    pub(super) scans_attempted: CachePaddedAtomicU64,
+    pub(super) scans_ok: CachePaddedAtomicU64,
+    pub(super) scans_err: CachePaddedAtomicU64,
+    pub(super) utf16_scans_attempted: CachePaddedAtomicU64,
+    pub(super) utf16_scans_ok: CachePaddedAtomicU64,
+    pub(super) utf16_scans_err: CachePaddedAtomicU64,
+    pub(super) anchor_only: CachePaddedAtomicU64,
+    pub(super) anchor_after_vs: CachePaddedAtomicU64,
+    pub(super) anchor_skipped: CachePaddedAtomicU64,
+    pub(super) stream_force_full: CachePaddedAtomicU64,
+    pub(super) stream_window_cap_exceeded: CachePaddedAtomicU64,
 }
 
 #[cfg(feature = "stats")]
@@ -184,7 +211,10 @@ impl VectorscanCounters {
 /// # Failure modes
 /// - Construction panics if required prefilter DBs cannot be built.
 pub struct Engine {
-    pub(super) rules: Vec<RuleCompiled>,
+    /// Hot rule representation used in scan-loop validation.
+    pub(super) rules_hot: Vec<RuleCompiled>,
+    /// Cold per-rule metadata indexed in parallel with `rules_hot`.
+    pub(super) rules_cold: Vec<RuleCold>,
     pub(super) transforms: Vec<TransformConfig>,
     pub(crate) tuning: Tuning,
 
@@ -351,6 +381,7 @@ impl Engine {
         let mut local_context_gates: Vec<crate::api::LocalContextSpec> = Vec::new();
 
         let mut rules_compiled: Vec<RuleCompiled> = Vec::with_capacity(rules.len());
+        let mut rules_cold: Vec<RuleCold> = Vec::with_capacity(rules.len());
         for spec in rules.iter() {
             let (mut rule, gates) = compile_rule(spec);
             if let Some(tp) = gates.two_phase {
@@ -374,7 +405,9 @@ impl Engine {
                 local_context_gates.push(ctx);
             }
             rules_compiled.push(rule);
+            rules_cold.push(RuleCold { name: spec.name });
         }
+        debug_assert_eq!(rules_compiled.len(), rules_cold.len());
 
         let max_entropy_len = entropy_gates.iter().map(|e| e.max_len).max().unwrap_or(0);
         let entropy_log2 = super::helpers::build_log2_table(max_entropy_len);
@@ -643,16 +676,18 @@ impl Engine {
         //                     cheaper but only works if anchors are strong enough
         //                     to avoid false negatives.
         //
-        // A rule can safely omit its raw regex from the prefilter when:
-        //   • It has at least one anchor pattern.
-        //   • Every anchor is ≥ 5 bytes. The threshold is a heuristic: shorter
-        //     literals have high false-positive rates in Vectorscan's Aho-Corasick
-        //     automaton and risk case-sensitivity mismatches (anchor patterns are
-        //     byte-exact while the regex may accept alternate casings).
-        //   • The regex is NOT case-insensitive (byte-exact anchors cannot
-        //     match alternate casings that the regex would accept).
+        // A rule can safely omit its raw regex from the prefilter when ALL of:
+        //   1. It has at least one anchor pattern (otherwise nothing triggers).
+        //   2. Every anchor is >= 5 bytes. Below this, Vectorscan's Aho-Corasick
+        //      automaton produces high false-positive rates, and short byte-exact
+        //      anchors risk case-sensitivity mismatches with the regex.
+        //   3. The regex is NOT case-insensitive. Byte-exact anchors cannot
+        //      match the alternate casings that `(?i)` would accept, so relying
+        //      on anchors alone would cause false negatives.
         //
         // Rules that fail any check keep their regex in the prefilter DB.
+        // The 5-byte threshold is empirically chosen; it may need revisiting if
+        // rule sets change significantly.
         let use_raw_prefilter: Vec<bool> = rules
             .iter()
             .map(|r| {
@@ -847,10 +882,16 @@ impl Engine {
         let has_active_transforms = !scanbuf_transform_idxs_active_non_base64.is_empty()
             || !scanbuf_transform_idxs_active_base64.is_empty();
 
-        // Build anchor byte set for URL-percent gating. A decoded `%XX` byte can
-        // only contribute to an anchor match if that byte value appears somewhere
-        // in at least one anchor pattern. This is a superset check (no false
-        // negatives, possible false positives for multi-byte patterns).
+        // Build anchor byte set for URL-percent gating.
+        //
+        // A decoded `%XX` byte can only contribute to an anchor match if that
+        // byte value appears somewhere in at least one anchor pattern. This is a
+        // superset check (no false negatives, possible false positives for
+        // multi-byte patterns).
+        //
+        // Encoding: a 256-bit bitmap split across four `u64` words. Byte `b`
+        // maps to `set[b >> 6] & (1 << (b & 63))`. The same encoding is used
+        // by `url_percent_gate_check` at scan time.
         let mut anchor_byte_set = [0u64; 4];
         for pat in &anchor_patterns_all {
             for &b in pat.as_slice() {
@@ -859,7 +900,8 @@ impl Engine {
         }
 
         Self {
-            rules: rules_compiled,
+            rules_hot: rules_compiled,
+            rules_cold,
             transforms,
             tuning,
             confirm_all_gates,
@@ -956,9 +998,13 @@ impl Engine {
     ///   transforms are skipped because the raw prefilter already found
     ///   something — further transform work is unlikely to add value.
     ///
-    /// Returns `(non_base64_indices, base64_indices)`. Base64 transforms are
-    /// separated so the caller can apply the encoded-space pre-gate only to
-    /// Base64 spans without branching per-transform.
+    /// Returns `(non_base64_indices, base64_indices)` where each slice contains
+    /// indices into `self.transforms`. The two-bucket split lets the caller
+    /// apply the encoded-space pre-gate (`b64_gate`) only to Base64 spans
+    /// without branching per-transform in the span loop.
+    ///
+    /// The returned slices are disjoint and together cover exactly the
+    /// transforms that should run for the given finding state.
     #[inline(always)]
     fn scanbuf_transform_buckets(&self, found_any_in_this_buf: bool) -> (&[usize], &[usize]) {
         if found_any_in_this_buf {
@@ -1008,6 +1054,10 @@ impl Engine {
 
     /// Scans a buffer and appends findings into the provided scratch state.
     ///
+    /// This is the top-level entry point for scanning a single chunk. It
+    /// orchestrates the full pipeline: prefilter → regex validation →
+    /// transform discovery → decode → recursive scan via a work queue.
+    ///
     /// The scratch is reset before use and reuses its buffers to avoid per-call
     /// allocations. Findings are stored as compact [`FindingRec`] entries.
     /// When the per-chunk finding cap is exceeded, extra findings are dropped
@@ -1017,21 +1067,31 @@ impl Engine {
     /// or stream and is used to compute `root_hint_*` fields for findings.
     ///
     /// # Preconditions
-    /// - `root_buf.len() <= u32::MAX`.
+    /// - `root_buf.len() <= u32::MAX` (spans and offsets are `u32`-addressed).
     /// - `scratch` is exclusively owned for the duration of the call.
     ///
     /// # High-level flow
-    /// 1. Prefilter the current buffer and build windows.
-    /// 2. Run regex validation inside those windows (raw + UTF-16 variants).
-    /// 3. Optionally decode transform spans (gated + deduped) and enqueue work
-    ///    items for recursive scanning.
+    /// 1. Run Vectorscan prefilter on the root buffer.
+    /// 2. On zero hits: check if transform discovery is needed; if not, return
+    ///    immediately. This is the common fast path.
+    /// 3. On hits: reset per-scan state, enqueue root `ScanBuf`.
+    /// 4. Process the work queue in FIFO order (BFS over decode layers):
+    ///    - `ScanBuf`: validate regexes in windows, discover transform spans,
+    ///      enqueue `DecodeSpan` items.
+    ///    - `DecodeSpan`: decode the span, enqueue a `ScanBuf` for output.
     ///
-    /// Budgets (decode bytes, work items, depth) are enforced on the fly so no
-    /// single input can force unbounded work.
+    /// Budget gates (decode bytes, work items, depth) are enforced per iteration
+    /// so no single input can force unbounded work.
     ///
     /// # Effects
     /// - Resets `scratch`, overwriting any pending findings.
     /// - Enqueues decode work items and updates per-scan counters.
+    ///
+    /// # Aliasing model
+    /// The work queue loop resolves buffer references to raw pointers to avoid
+    /// holding borrows on `scratch.slab` while passing `scratch` mutably into
+    /// `scan_rules_on_buffer`. See the inline `// SAFETY` comments for the full
+    /// aliasing argument.
     pub fn scan_chunk_into(
         &self,
         root_buf: &[u8],
@@ -1608,8 +1668,20 @@ impl Engine {
 
     /// Returns the required overlap between chunks for correctness.
     ///
-    /// This ensures verification windows (including two-phase expansions) fit
-    /// across chunk boundaries. When scanning overlapping chunks, call
+    /// The overlap must be large enough that any match straddling a chunk
+    /// boundary is fully contained in at least one chunk. The formula is:
+    ///
+    /// ```text
+    /// overlap = max_window_diameter + (max_prefilter_width - 1)
+    /// ```
+    ///
+    /// - `max_window_diameter`: the largest validation window (2 × radius ×
+    ///   variant scale) across all rules.
+    /// - `max_prefilter_width - 1`: accounts for the widest prefilter pattern
+    ///   straddling the boundary (a pattern of width W needs W-1 overlap bytes
+    ///   to guarantee its start falls in the previous chunk).
+    ///
+    /// When scanning overlapping chunks, call
     /// [`ScanScratch::drop_prefix_findings`] with the new start offset to avoid
     /// emitting duplicates from the overlap prefix. The returned value is in
     /// bytes and already accounts for UTF-16 window scaling.
@@ -1630,7 +1702,7 @@ impl Engine {
 
     /// Returns the rule name for a rule id used in [`FindingRec`].
     pub fn rule_name(&self, rule_id: u32) -> &str {
-        self.rules
+        self.rules_cold
             .get(rule_id as usize)
             .map(|r| r.name)
             .unwrap_or("<unknown-rule>")
@@ -1675,10 +1747,16 @@ impl Engine {
 
     /// Drains compact findings from scratch and materializes provenance.
     ///
-    /// This consumes `scratch.out` and appends to `out` without clearing it.
+    /// Converts each [`FindingRec`] (compact, arena-backed) into a [`Finding`]
+    /// (owned, with materialized decode steps) by walking the step arena.
+    /// Appends to `out` without clearing it — the caller is responsible for
+    /// clearing `out` if a fresh result set is desired.
+    ///
+    /// After draining, the normalization hash and drop-hint bookkeeping are
+    /// cleared so `scratch` is ready for the next scan.
     pub fn drain_findings_materialized(&self, scratch: &mut ScanScratch, out: &mut Vec<Finding>) {
         for rec in scratch.out.drain() {
-            let rule = &self.rules[rec.rule_id as usize];
+            let rule = &self.rules_cold[rec.rule_id as usize];
             scratch
                 .step_arena
                 .materialize(rec.step_id, &mut scratch.steps_buf);
@@ -1718,8 +1796,16 @@ pub(super) fn decode_hex_pair(hi: u8, lo: u8) -> Option<u8> {
 
 /// Standalone gate check for URL-percent transforms.
 ///
-/// Returns `true` if decoding could plausibly produce any anchor byte, or if
-/// the set is empty (conservative).
+/// Scans `buf` for `%XX` triplets and checks whether any decoded byte value
+/// appears in the anchor byte set. Returns `true` (allow scan) if:
+/// - The anchor byte set is empty (conservative: no anchors compiled).
+/// - `plus_to_space` is enabled, `'+'` appears, and space is an anchor byte.
+/// - Any `%XX` triplet decodes to a byte in the anchor set.
+/// - A truncated `%` triplet is at end-of-buffer (conservative).
+///
+/// Returns `false` only when we can prove no decoded byte would match any
+/// anchor — this is the common case for format-specifier-heavy buffers
+/// (`%d`, `%s`) that don't encode anchor-relevant bytes.
 pub(super) fn url_percent_gate_check(
     anchor_byte_set: &[u64; 4],
     plus_to_space: bool,

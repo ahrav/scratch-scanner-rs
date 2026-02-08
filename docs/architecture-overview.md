@@ -10,7 +10,7 @@ graph TB
 
     subgraph Core["Core Engine"]
         Engine["Engine<br/>Pattern Matching"]
-        Rules["RuleSpec / RuleCompiled / RuleMeta<br/>Detection Rules"]
+        Rules["RuleSpec / RuleCompiled(hot) / RuleCold<br/>Detection Rules"]
         VS["Vectorscan<br/>Anchor Prefilter"]
         Transforms["TransformConfig<br/>URL/Base64 Decoding"]
         Tuning["Tuning<br/>DoS Protection"]
@@ -85,9 +85,10 @@ graph TB
 | **Unified Orchestrator** | `src/unified/orchestrator.rs` | Dispatches sources and wires structured event sinks               |
 | **Unified Events**  | `src/unified/events.rs`        | Structured `ScanEvent` model and JSONL sink                          |
 | **FS Owner-Compute Scheduler** | `src/scheduler/local_fs_owner.rs` | Round-robin file dispatch with per-worker owned I/O+scan state |
-| **Engine**          | `src/engine/core.rs:154`       | Compiled scanning engine with anchor patterns, rules, and transforms |
+| **Engine**          | `src/engine/core.rs`           | Compiled scanning engine with anchor patterns, rules, and transforms |
 | **RuleSpec**        | `src/api.rs:519`               | Rule definitions and specification for rule-based scanning           |
-| **RuleCompiled**    | `src/engine/rule_repr.rs:268`  | Compiled rule representation with hot data and validation gates      |
+| **RuleCompiled**    | `src/engine/rule_repr.rs`  | Hot compiled rule representation used in scan-loop validation      |
+| **RuleCold**        | `src/engine/rule_repr.rs`  | Cold per-rule metadata (`name`) stored parallel to hot rules       |
 | **Vectorscan**      | `vectorscan-rs-sys` crate      | Multi-pattern anchor prefilter (raw + UTF-16 variants)               |
 | **Vectorscan DB Cache** | `src/engine/vectorscan_prefilter.rs` | Best-effort on-disk cache for serialized prefilter/stream DBs |
 | **TransformConfig** | `src/api.rs:132`               | Transform stage configuration (URL percent, Base64)                  |

@@ -53,8 +53,8 @@ pub enum ScratchMemoryError {
 /// Capacity overruns are treated as bugs and only checked in debug builds.
 pub struct ScratchVec<T> {
     ptr: NonNull<MaybeUninit<T>>,
-    len: usize,
-    cap: usize,
+    len: u32,
+    cap: u32,
 }
 
 impl<T> ScratchVec<T> {
@@ -64,8 +64,9 @@ impl<T> ScratchVec<T> {
     /// guaranteed valid because `with_capacity` already validated `cap *
     /// size_of::<T>()` does not overflow and `size_of::<T>() > 0` — the
     /// `unwrap` here cannot panic for values that passed construction.
-    fn dealloc_layout(cap: usize) -> Layout {
+    fn dealloc_layout(cap: u32) -> Layout {
         let align = PAGE_SIZE_MIN.max(align_of::<T>());
+        let cap = cap as usize;
         // SAFETY: this was validated at construction time — size_of::<T>() > 0
         // and cap * size_of::<T>() did not overflow.
         Layout::from_size_align(cap * size_of::<T>(), align).unwrap()
@@ -94,6 +95,9 @@ impl<T> ScratchVec<T> {
         if elem_size == 0 {
             return Err(ScratchMemoryError::SizeZero);
         }
+        if cap > u32::MAX as usize {
+            return Err(ScratchMemoryError::InvalidLayout);
+        }
 
         let size = cap
             .checked_mul(elem_size)
@@ -112,16 +116,16 @@ impl<T> ScratchVec<T> {
         Ok(Self {
             ptr: ptr.cast(),
             len: 0,
-            cap,
+            cap: cap as u32,
         })
     }
 
     pub fn len(&self) -> usize {
-        self.len
+        self.len as usize
     }
 
     pub fn capacity(&self) -> usize {
-        self.cap
+        self.cap as usize
     }
 
     pub fn is_empty(&self) -> bool {
@@ -145,7 +149,7 @@ impl<T> ScratchVec<T> {
         unsafe {
             self.ptr
                 .as_ptr()
-                .add(self.len)
+                .add(self.len())
                 .write(MaybeUninit::new(value));
         }
         self.len += 1;
@@ -157,28 +161,29 @@ impl<T> ScratchVec<T> {
     /// Panics if `new_len > self.len()`. In release builds this is a logic
     /// error that can leave the vector with uninitialized elements.
     pub fn truncate(&mut self, new_len: usize) {
-        debug_assert!(new_len <= self.len, "scratch vec truncate out of bounds");
+        debug_assert!(new_len <= self.len(), "scratch vec truncate out of bounds");
+        let new_len_u32 = u32::try_from(new_len).expect("scratch vec len exceeds u32");
         // SAFETY: Elements `new_len..self.len` are initialized (invariant: all
         // elements in `0..len` are initialized). We drop each in-place and then
         // lower `len`, which leaves no dangling initialized memory.
         unsafe {
-            for i in new_len..self.len {
+            for i in new_len..self.len() {
                 std::ptr::drop_in_place(self.ptr.as_ptr().add(i).cast::<T>());
             }
         }
-        self.len = new_len;
+        self.len = new_len_u32;
     }
 
     pub fn as_slice(&self) -> &[T] {
         // SAFETY: `ptr` is valid for `cap` elements, `len <= cap`, and all
         // elements in `0..len` are initialized. The `&self` borrow ensures no
         // concurrent mutation.
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().cast::<T>(), self.len) }
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().cast::<T>(), self.len()) }
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [T] {
         // SAFETY: Same as `as_slice`; `&mut self` guarantees exclusive access.
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr().cast::<T>(), self.len) }
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr().cast::<T>(), self.len()) }
     }
 
     /// Appends all elements from `slice` to the vector.
@@ -195,9 +200,9 @@ impl<T> ScratchVec<T> {
     where
         T: Copy,
     {
-        let new_len = self.len.saturating_add(slice.len());
+        let new_len = self.len().saturating_add(slice.len());
         debug_assert!(
-            new_len <= self.cap,
+            new_len <= self.capacity(),
             "scratch vec capacity exceeded on extend_from_slice"
         );
         // SAFETY: `new_len <= cap` (debug-asserted), so `ptr + len` through
@@ -208,11 +213,11 @@ impl<T> ScratchVec<T> {
         unsafe {
             std::ptr::copy_nonoverlapping(
                 slice.as_ptr(),
-                self.ptr.as_ptr().add(self.len).cast::<T>(),
+                self.ptr.as_ptr().add(self.len()).cast::<T>(),
                 slice.len(),
             );
         }
-        self.len = new_len;
+        self.len = u32::try_from(new_len).expect("scratch vec len exceeds u32");
     }
 
     /// Appends a range from this vector's existing contents.
@@ -230,14 +235,14 @@ impl<T> ScratchVec<T> {
     where
         T: Copy,
     {
-        debug_assert!(start <= self.len, "scratch vec range start out of bounds");
+        debug_assert!(start <= self.len(), "scratch vec range start out of bounds");
         debug_assert!(
-            start.saturating_add(len) <= self.len,
+            start.saturating_add(len) <= self.len(),
             "scratch vec range end out of bounds"
         );
-        let new_len = self.len.saturating_add(len);
+        let new_len = self.len().saturating_add(len);
         debug_assert!(
-            new_len <= self.cap,
+            new_len <= self.capacity(),
             "scratch vec capacity exceeded on extend_from_self_range"
         );
         // SAFETY: Source range `start..start+len` is within `0..self.len`
@@ -247,11 +252,11 @@ impl<T> ScratchVec<T> {
         unsafe {
             std::ptr::copy(
                 self.ptr.as_ptr().add(start).cast::<T>(),
-                self.ptr.as_ptr().add(self.len).cast::<T>(),
+                self.ptr.as_ptr().add(self.len()).cast::<T>(),
                 len,
             );
         }
-        self.len = new_len;
+        self.len = u32::try_from(new_len).expect("scratch vec len exceeds u32");
     }
 
     /// Removes and returns the last element, or `None` if empty.
@@ -259,7 +264,7 @@ impl<T> ScratchVec<T> {
     /// This is the fixed-capacity equivalent of `Vec::pop`. The capacity remains
     /// unchanged; only the logical length decreases.
     pub fn pop(&mut self) -> Option<T> {
-        if self.len == 0 {
+        if self.is_empty() {
             return None;
         }
         self.len -= 1;
@@ -267,12 +272,12 @@ impl<T> ScratchVec<T> {
         // element is initialized. `read()` performs a bitwise copy without
         // dropping the source — ownership transfers to the caller. The slot
         // is now logically uninitialized and excluded by the lowered `len`.
-        unsafe { Some(self.ptr.as_ptr().add(self.len).cast::<T>().read()) }
+        unsafe { Some(self.ptr.as_ptr().add(self.len()).cast::<T>().read()) }
     }
 
     /// Returns a reference to the element at `index`, or `None` if out of bounds.
     pub fn get(&self, index: usize) -> Option<&T> {
-        if index < self.len {
+        if index < self.len() {
             // SAFETY: `index < len <= cap`, so the pointer arithmetic is in
             // bounds and the element is initialized. The `&self` borrow prevents
             // concurrent mutation.
@@ -284,7 +289,7 @@ impl<T> ScratchVec<T> {
 
     /// Returns a mutable reference to the element at `index`, or `None` if out of bounds.
     pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
-        if index < self.len {
+        if index < self.len() {
             // SAFETY: Same as `get`; `&mut self` guarantees exclusive access.
             unsafe { Some(&mut *self.ptr.as_ptr().add(index).cast::<T>()) }
         } else {
@@ -302,7 +307,7 @@ impl<T> ScratchVec<T> {
     /// ownership of all `len` elements to `Drain`. This ensures the vector
     /// is in a consistent (empty) state even if the caller leaks the `Drain`.
     pub fn drain(&mut self) -> Drain<'_, T> {
-        let len = self.len;
+        let len = self.len();
         self.len = 0;
         Drain {
             ptr: self.ptr.cast::<T>(),
@@ -411,11 +416,10 @@ impl<T> Drop for ScratchVec<T> {
 // scratch use within one scan.
 unsafe impl<T: Send> Send for ScratchVec<T> {}
 
-// Compile-time size guard: `ScratchVec<u8>` must be exactly `ptr + len + cap`
-// (3 words). This catches accidental field additions (e.g., storing a `Layout`)
-// that would bloat every scratch buffer in the engine.
+// Compile-time size guard: `ScratchVec<u8>` should remain pointer + 2x u32
+// (plus alignment padding). This catches accidental field additions.
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(size_of::<ScratchVec<u8>>() == 24);
+const _: () = assert!(size_of::<ScratchVec<u8>>() == 16);
 #[cfg(target_pointer_width = "32")]
 const _: () = assert!(size_of::<ScratchVec<u8>>() == 12);
 
@@ -445,6 +449,14 @@ mod tests {
         vec.clear();
         vec.extend_from_slice(&[]);
         assert!(vec.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "scratch vec capacity exceeded")]
+    fn scratch_vec_push_overflow_panics() {
+        let mut vec = ScratchVec::<u8>::with_capacity(1).unwrap();
+        vec.push(1);
+        vec.push(2);
     }
 
     #[test]
@@ -527,6 +539,12 @@ mod tests {
         let drained: Vec<u32> = vec.drain().collect();
         assert!(drained.is_empty());
         assert!(vec.is_empty());
+    }
+
+    #[test]
+    fn with_capacity_beyond_u32_max_returns_err() {
+        let result = ScratchVec::<u8>::with_capacity(u32::MAX as usize + 1);
+        assert!(result.is_err());
     }
 }
 
