@@ -311,6 +311,43 @@ fn loose_only_candidate_scans_complete() {
 }
 
 #[test]
+fn odb_blob_parallel_intro_handles_empty_midx_without_panic() {
+    if !git_available() {
+        eprintln!("git not available; skipping empty-midx parallel intro test");
+        return;
+    }
+
+    let tmp = init_repo();
+    // Keep all objects loose (no gc/repack), with >1 commits so parallel intro
+    // is selected when blob_intro_workers > 1.
+    commit_file(tmp.path(), "a.txt", "TOK_ABCDEFGH\n", "c1");
+    commit_file(tmp.path(), "b.txt", "TOK_IJKLMNOP\n", "c2");
+
+    let pack_dir = tmp.path().join(".git").join("objects").join("pack");
+    let has_pack = fs::read_dir(&pack_dir)
+        .expect("pack directory should exist")
+        .filter_map(Result::ok)
+        .any(|entry| entry.file_name().to_string_lossy().ends_with(".pack"));
+    assert!(
+        !has_pack,
+        "fixture requires no pack files so MIDX object_count is zero"
+    );
+
+    let mut config = base_config();
+    config.scan_mode = GitScanMode::OdbBlobFast;
+    config.blob_intro_workers = 4;
+
+    let GitScanResult(report) = run_scan_with_config(tmp.path(), None, config)
+        .expect("parallel ODB blob intro should not panic with empty MIDX");
+    assert_eq!(report.finalize.outcome, FinalizeOutcome::Complete);
+    assert!(
+        report.pack_exec_reports.is_empty(),
+        "empty MIDX should produce no packed candidates"
+    );
+    assert!(report.skipped_candidates.is_empty());
+}
+
+#[test]
 fn odb_blob_respects_packed_candidate_cap() {
     if !git_available() {
         eprintln!("git not available; skipping packed candidate cap test");

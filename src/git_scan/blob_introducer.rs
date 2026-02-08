@@ -20,7 +20,8 @@
 //! The blob SET is identical to the serial path.
 //!
 //! # Invariants
-//! - Seen sets are sized to `midx.object_count` and never grow.
+//! - Seen sets are sized from `midx.object_count` and never grow
+//!   (`AtomicSeenSets` uses a capacity floor of 1 when the MIDX is empty).
 //! - OID indices must be validated before use (caller responsibility).
 //! - Tree and blob indices share the same index space but are tracked
 //!   independently to avoid false positives.
@@ -1120,9 +1121,13 @@ pub(super) fn introduce_parallel<'a>(
     let abort = AtomicBool::new(false);
 
     let object_count = midx.object_count();
+    let seen_len = (object_count as usize).max(1);
 
     // Shared AtomicSeenSets sized to MIDX object count.
-    let seen = AtomicSeenSets::new(object_count as usize, object_count as usize);
+    // `AtomicSeenSets` disallows zero capacity, but a valid MIDX can have zero
+    // objects when a repository has no packs. In that case all lookups miss and
+    // packed indices are never marked, so a capacity floor of 1 is safe.
+    let seen = AtomicSeenSets::new(seen_len, seen_len);
 
     // Per-worker budget division.
     let per_worker_tree_cache =
