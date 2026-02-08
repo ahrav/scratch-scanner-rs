@@ -578,6 +578,7 @@ mod tests {
             fs::metadata(&self.path)
         }
 
+        #[cfg(debug_assertions)]
         fn path(&self) -> &std::path::Path {
             &self.path
         }
