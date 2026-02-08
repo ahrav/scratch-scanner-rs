@@ -546,6 +546,36 @@ fn apply_transform_filter(
     }
 }
 
+/// Load rules from a YAML file, falling back to the compiled-in set.
+///
+/// Fallback chain: explicit path > `default_rules.yaml` next to binary > `demo_rules()`.
+fn load_rules_for_scan(rules_file: Option<&Path>) -> Vec<RuleSpec> {
+    let path = match rules_file {
+        Some(p) => p.to_path_buf(),
+        None => match crate::rules::default_rules_path() {
+            Some(p) if p.exists() => {
+                eprintln!("info: loading rules from {}", p.display());
+                p
+            }
+            _ => {
+                let rules = demo_rules();
+                eprintln!("info: using compiled-in rule set ({} rules)", rules.len());
+                return rules;
+            }
+        },
+    };
+    match crate::rules::load_rules(&path) {
+        Ok(rules) => {
+            eprintln!("info: loaded {} rules from {}", rules.len(), path.display());
+            rules
+        }
+        Err(e) => {
+            eprintln!("error: failed to load rules from {}: {e}", path.display());
+            std::process::exit(2);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -612,35 +642,5 @@ mod tests {
         let filter = TransformFilter::Only(vec!["rot13".to_string()]);
         let result = apply_transform_filter(test_transforms(), &filter);
         assert!(result.is_empty());
-    }
-}
-
-/// Load rules from a YAML file, falling back to the compiled-in set.
-///
-/// Fallback chain: explicit path > `default_rules.yaml` next to binary > `demo_rules()`.
-fn load_rules_for_scan(rules_file: Option<&Path>) -> Vec<RuleSpec> {
-    let path = match rules_file {
-        Some(p) => p.to_path_buf(),
-        None => match crate::rules::default_rules_path() {
-            Some(p) if p.exists() => {
-                eprintln!("info: loading rules from {}", p.display());
-                p
-            }
-            _ => {
-                let rules = demo_rules();
-                eprintln!("info: using compiled-in rule set ({} rules)", rules.len());
-                return rules;
-            }
-        },
-    };
-    match crate::rules::load_rules(&path) {
-        Ok(rules) => {
-            eprintln!("info: loaded {} rules from {}", rules.len(), path.display());
-            rules
-        }
-        Err(e) => {
-            eprintln!("error: failed to load rules from {}: {e}", path.display());
-            std::process::exit(2);
-        }
     }
 }
