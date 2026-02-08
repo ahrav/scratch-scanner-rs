@@ -318,6 +318,17 @@ impl<'a> EngineAdapter<'a> {
         }
     }
 
+    /// Classify, optionally extract, and scan a single blob into `findings_buf`.
+    ///
+    /// When `scan_binary` is false the blob is classified via
+    /// [`content_policy::classify_content`]. Text blobs are scanned directly;
+    /// extractable binary formats (`.class`, `.pyc`, etc.) have their text
+    /// extracted first (feature-gated on `binary-extract`); opaque binaries
+    /// are skipped entirely.
+    ///
+    /// On return, `self.findings_buf` contains the sorted+deduped findings
+    /// for this blob. The caller is responsible for streaming them to the
+    /// event sink and recording them in the findings arena.
     fn scan_blob_into_buf(
         &mut self,
         file_id: FileId,
@@ -630,8 +641,10 @@ fn scan_chunk(
 /// A single chunk window produced by the ring chunker.
 ///
 /// Each view represents a contiguous slice of a blob, potentially including
-/// an overlap prefix from the previous window. The `is_first` flag prevents
-/// the first window's prefix from being treated as overlap.
+/// an overlap prefix from the previous window. After scanning, findings
+/// whose `root_hint_end` falls within the overlap prefix are dropped to
+/// prevent double-reporting — except for the first window (`is_first`),
+/// where no prior window exists to own those bytes.
 struct ChunkView<'a> {
     /// Absolute start offset of `window` within the blob.
     base: u64,
@@ -647,6 +660,19 @@ struct ChunkView<'a> {
 /// as they fill. The ring retains `overlap` trailing bytes between windows
 /// so the scan engine can detect secrets that straddle chunk boundaries.
 /// A final partial window is emitted by `flush`.
+///
+/// # Usage protocol
+///
+/// 1. Construct once with `new(chunk_bytes, overlap)`.
+/// 2. Call `feed(data, callback)` — may invoke the callback zero or more
+///    times, once per full `chunk_bytes` window.
+/// 3. Call `flush(callback)` — emits the final partial window (if any)
+///    and resets internal state for reuse.
+/// 4. To reuse across blobs, call `reset()` before the next `feed` cycle.
+///
+/// The first emitted window has `is_first = true`, which tells the scan
+/// layer not to drop findings in the overlap prefix (there is no prior
+/// window whose "new bytes" region owns them).
 ///
 /// # Invariant
 /// `chunk_bytes > overlap`, enforced at construction.

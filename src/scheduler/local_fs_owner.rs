@@ -533,12 +533,15 @@ fn build_locator(out: &mut [u8; LOCATOR_LEN], kind: u8, value: u64) -> &[u8] {
     out
 }
 
-#[inline]
 /// Dispatch archive scanning by kind.
 ///
-/// Currently gzip/tar/tar.gz are supported; other formats are skipped.
+/// Routes to `process_gzip_file`, `process_tar_file`, `process_targz_file`,
+/// or `process_zip_file` based on the detected [`ArchiveKind`].
 ///
-/// The caller is responsible for recording archive stats based on the result.
+/// The caller is responsible for recording archive-level stats
+/// (`record_archive_scanned` / `record_archive_skipped` / `record_archive_partial`)
+/// based on the returned [`ArchiveEnd`].
+#[inline]
 fn dispatch_archive_scan<E: ScanEngine>(
     task: &FileTask,
     ctx: &mut WorkerCtx<FileTask, LocalScratch<E>>,
@@ -2196,12 +2199,26 @@ fn process_zip_file<E: ScanEngine>(
 ///                    ▼
 ///             release_buffer()
 /// ```
-///
+
 /// Read a file with an extractable binary format, extract text, and scan it.
 ///
-/// Reads the entire file into `extract_buf`, runs the format extractor, then
-/// scans the extracted text through the engine. The file must already be open
-/// and seeked to position 0. Falls back to a no-op when extraction fails.
+/// Reads the entire file (up to 64 MiB) into `extract_buf`, runs the
+/// format-specific extractor, then scans the extracted text through the
+/// engine as a single chunk.
+///
+/// # Prerequisites
+///
+/// - The file must already be open. This function rewinds to position 0
+///   before reading (the caller's probe/header read may have advanced it).
+///
+/// # Failure modes
+///
+/// - I/O errors (seek, read) increment `ctx.metrics.io_errors` and return
+///   without scanning.
+/// - Extraction failure (`ParseError` or `Empty`) returns without scanning.
+///   No error is recorded because the file was already classified as
+///   extractable by extension; a parse failure simply means the content
+///   didn't match (e.g. a `.class` file with corrupt magic).
 #[cfg(feature = "binary-extract")]
 fn extract_and_scan_file<E: ScanEngine>(
     task: &FileTask,
@@ -2280,10 +2297,19 @@ fn extract_and_scan_file<E: ScanEngine>(
     ctx.metrics.chunks_scanned = ctx.metrics.chunks_scanned.saturating_add(1);
 }
 
+/// Process a single file: open, classify, chunk-scan, close.
+///
+/// This is the per-task entry point called by each executor worker. The flow:
+/// 1. Check abort flag.
+/// 2. Detect archive format by extension, then by header magic.
+/// 3. If archive: dispatch to `dispatch_archive_scan` and return.
+/// 4. If binary-skip enabled: probe for NUL bytes / extractable format.
+/// 5. Otherwise: sequential chunk+overlap scan via the buffer pool.
+///
 /// # Error Handling
 ///
-/// I/O errors are logged but do not propagate (fail-soft per file).
-/// The executor continues with remaining files.
+/// I/O errors are logged (debug builds) but do not propagate — fail-soft
+/// per file. The executor continues with remaining files.
 fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, LocalScratch<E>>) {
     if ctx.scratch.abort_run.load(Ordering::Relaxed) {
         return;

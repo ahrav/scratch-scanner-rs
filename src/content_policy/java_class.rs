@@ -79,6 +79,8 @@ impl Extractor for JavaClassExtractor {
             let tag = data[pos];
             pos += 1;
 
+            // Tags are grouped by their payload byte-size so each arm
+            // advances `pos` by the correct amount (JVM spec §4.4).
             match tag {
                 CONSTANT_UTF8 => {
                     if pos + 2 > data.len() {

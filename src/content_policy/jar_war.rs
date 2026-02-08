@@ -25,6 +25,15 @@
 //!
 //! When any budget is exceeded, extraction stops gracefully — whatever
 //! text was already appended is kept.
+//!
+//! # Scratch buffer reuse
+//!
+//! The caller-provided `scratch` buffer is reused across entries to hold
+//! decompressed `.class` bytes. This avoids a per-entry allocation and
+//! lets the buffer grow to the high-water mark once.
+//! [`JavaClassExtractor`](super::java_class::JavaClassExtractor) itself
+//! does not use `scratch`, so a zero-capacity stack Vec is passed as its
+//! scratch parameter.
 
 use super::extract::{ExtractResult, Extractor};
 use super::java_class::JavaClassExtractor;
@@ -50,8 +59,8 @@ impl Extractor for JarWarExtractor {
         let start_len = out.len();
         let class_extractor = JavaClassExtractor;
         let entry_count = archive.len().min(MAX_ENTRIES);
-        // JavaClassExtractor ignores its scratch param, so a stack-only
-        // Vec (no heap until written to, which never happens) suffices.
+        // JavaClassExtractor ignores its scratch param. A stack-only Vec
+        // (zero capacity, no heap allocation) satisfies the signature.
         let mut no_scratch = Vec::new();
 
         for i in 0..entry_count {
@@ -60,7 +69,8 @@ impl Extractor for JarWarExtractor {
                 Err(_) => continue,
             };
 
-            // Only process .class files.
+            // Only process .class files. Uses rsplit to grab the final
+            // extension segment, handling nested paths like "com/Foo.class".
             let is_class = entry
                 .name()
                 .rsplit('.')

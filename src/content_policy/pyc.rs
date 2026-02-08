@@ -105,17 +105,17 @@ impl Extractor for PycExtractor {
             return ExtractResult::ParseError;
         }
 
-        // Determine header size based on flags field (PEP 552, Python 3.7+).
+        // Both hash-based and timestamp-based headers are 16 bytes total.
+        // Pre-3.7 files have a 12-byte header (magic + timestamp + size), but
+        // their "flags" field reads as the old timestamp (non-zero, bit 0 may
+        // be set either way). Using 16 unconditionally skips 4 extra bytes
+        // into the marshal stream for pre-3.7 files, which is safe: we may
+        // miss one leading marshal object but won't produce garbage.
         let flags = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
         let header_size = if flags & 0x1 != 0 {
-            // Hash-based validation: magic(4) + flags(4) + hash(8) = 16.
-            16
+            16 // Hash-based: magic(4) + flags(4) + hash(8)
         } else {
-            // Timestamp-based: magic(4) + flags(4) + timestamp(4) + size(4) = 16.
-            // Pre-3.7 files have flags=0 so this path works for them too
-            // (magic(4) + timestamp(4) + size(4) = 12, but flags field is the timestamp).
-            // We conservatively use 16 which skips a bit extra but is safe.
-            16
+            16 // Timestamp-based: magic(4) + flags(4) + timestamp(4) + size(4)
         };
 
         if data.len() < header_size {
@@ -269,9 +269,12 @@ impl Extractor for PycExtractor {
                     // them up automatically.
                     //
                     // Python 3.7 and earlier omit posonlyargcount (5 × u32
-                    // = 20 bytes), so we may consume 4 bytes into the first
-                    // sub-object. This is acceptable: the worst case is
-                    // skipping one string, not producing garbage output.
+                    // = 20 bytes), so we over-skip by 4 bytes into the
+                    // first sub-object (typically the bytecode string).
+                    // Worst case: we lose that one sub-object's content.
+                    // We never produce garbage because the next opcode byte
+                    // is either valid (and parsing continues) or unknown
+                    // (and we bail out cleanly).
                     if pos + 24 > data.len() {
                         break;
                     }

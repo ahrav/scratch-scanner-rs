@@ -28,6 +28,19 @@
 //! - Output blobs (`outputs` key) are deliberately ignored — they are
 //!   large, noisy, and rarely contain secrets.
 //! - Cells without a `source` key default to an empty array.
+//!
+//! # Output encoding
+//!
+//! Source lines are serialised as UTF-8 by serde, so the output buffer is
+//! valid UTF-8 in practice. The extractor trait makes no UTF-8 guarantee,
+//! however, so consumers must treat the bytes as opaque.
+//!
+//! # Why `.ipynb` is extractable even when it looks like text
+//!
+//! Notebook JSON is technically text (no NUL bytes), but
+//! [`classify_content`](super::classify_content) still routes it through
+//! extraction so the scan engine sees **only code/markdown cells**, not the
+//! surrounding JSON structural noise or bulky `outputs` blobs.
 
 use serde::Deserialize;
 

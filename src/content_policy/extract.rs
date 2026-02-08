@@ -43,13 +43,15 @@ pub const JAR_ENTRY_CAP: usize = 32 * 1024;
 /// # Contract
 ///
 /// - Implementations **append** to `out`; they must not clear it.
+///   (`extract_content` handles clearing before dispatch.)
 /// - On [`ExtractResult::ParseError`] or [`ExtractResult::Empty`], `out`
 ///   must be left unchanged from its state at entry.
 /// - Implementations must not panic on arbitrary input. Malformed data
 ///   should yield `ParseError`, not a crash.
 /// - `scratch` is a caller-provided temporary workspace that extractors
-///   may use for intermediate allocations. Callers should pass a
-///   pre-allocated buffer; extractors that don't need it simply ignore it.
+///   may use for intermediate allocations (e.g. decompressing JAR entries).
+///   Callers should pass a pre-allocated buffer; extractors that don't
+///   need it simply ignore it.
 pub trait Extractor {
     /// Append scannable text extracted from `data` to `out`.
     ///
@@ -63,8 +65,10 @@ pub trait Extractor {
 /// Dispatch extraction to the appropriate format handler.
 ///
 /// Clears `out` before dispatching so callers always receive a clean
-/// buffer. This is the only public entry point — callers should not
-/// instantiate individual extractors directly.
+/// buffer. Individual extractor types are public (for testing and
+/// benchmarking) but production code should use this function — it
+/// owns the clear-before-dispatch invariant that [`Extractor::extract`]
+/// relies on.
 pub fn extract_content(
     format: ExtractableFormat,
     data: &[u8],
