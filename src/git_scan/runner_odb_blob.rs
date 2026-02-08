@@ -1,14 +1,14 @@
 //! ODB-blob fast-path scan pipeline.
 //!
-//! Computes first-introduced blobs from the commit graph and scans them in
-//! pack order. If candidate caps or path arena limits are exceeded during
-//! blob introduction, retries via the spill/dedupe pipeline.
+//! Computes the unique blob set from the commit graph and scans it in pack
+//! order. If candidate caps or path arena limits are exceeded during blob
+//! introduction, retries via the spill/dedupe pipeline.
 //!
 //! # Pipeline Stages
 //!
 //! 1. **Blob introduction** -- walks the commit graph and emits
-//!    (oid, pack_id, path) candidates for blobs first introduced by each
-//!    commit.  On success the candidates land directly in the
+//!    (oid, pack_id, path) candidates for each unique blob. On success the
+//!    candidates land directly in the
 //!    `PackCandidateCollector`; on overflow (`CandidateLimitExceeded` /
 //!    `PathArenaFull`) the introducer's seen-set is reset and the walk is
 //!    re-run through a `Spiller` → `MappingBridge` dedupe pipeline.
@@ -24,8 +24,10 @@
 //! 4. **Loose scan** -- loose object candidates that did not map to any
 //!    pack are scanned after all pack plans complete.
 //!
-//! All outputs are merged deterministically regardless of worker count so
-//! that the same input always produces the same `ScanModeOutput`.
+//! Outputs are merged in deterministic pack-plan order. In parallel blob
+//! introduction mode (`blob_intro_workers > 1`), the selected blob attribution
+//! context (`commit_id`, `path`, flags) is race-winner based and may differ
+//! across runs or worker counts.
 
 use std::io;
 use std::sync::Arc;
@@ -42,7 +44,7 @@ use super::engine_adapter::{EngineAdapter, ScannedBlobs};
 use super::errors::TreeDiffError;
 use super::mapping_bridge::{MappingBridge, MappingBridgeConfig, MappingStats};
 use super::midx::MidxView;
-use super::object_store::ObjectStore;
+use super::object_store::{ObjectStore, ObjectStoreLayout};
 use super::oid_index::OidIndex;
 use super::pack_candidates::{
     CappedPackCandidateSink, LooseCandidate, PackCandidate, PackCandidateCollector,
@@ -69,9 +71,9 @@ use super::repo_open::RepoJobState;
 
 /// Runs the ODB-blob fast-path scan pipeline.
 ///
-/// Walks the commit graph to identify first-introduced blobs, maps them to
-/// pack offsets via the MIDX, builds per-pack decode plans, then decodes
-/// and scans blob contents through the detection engine.  See the module
+/// Walks the commit graph to identify unique blobs, maps them to pack offsets
+/// via the MIDX, builds per-pack decode plans, then decodes and scans blob
+/// contents through the detection engine. See the module
 /// docs for the full stage breakdown and parallelism strategies.
 ///
 /// # Spill / retry
@@ -84,8 +86,10 @@ use super::repo_open::RepoJobState;
 ///
 /// # Determinism
 ///
-/// Regardless of worker count, outputs are reassembled in pack-plan order
-/// so that the same input always produces identical `ScanModeOutput`.
+/// Pack execution output order is deterministic for a fixed set of candidates.
+/// In parallel blob introduction mode, the selected blob context may vary with
+/// scheduling. Consumers must not treat `commit_id`/`path` attribution in this
+/// mode as deterministic across worker counts.
 ///
 /// # Parameters
 /// - `repo`: opened repository job state (paths, object format, artifacts).
@@ -132,6 +136,7 @@ pub(super) fn run_odb_blob(
         mapping_cfg.max_packed_candidates,
         mapping_cfg.max_loose_candidates,
     );
+    let object_store_layout = ObjectStoreLayout::from_midx(repo, midx)?;
     let oid_index = OidIndex::from_midx(&midx);
     // Scale tree delta-cache to repo size to reduce base re-inflate churn on
     // large histories while respecting the configured upper bound.
@@ -139,13 +144,17 @@ pub(super) fn run_odb_blob(
         midx.object_count(),
         config.tree_diff.max_tree_delta_cache_bytes,
     );
-    let tree_delta_cache = TreeDeltaCache::new(auto_cache_bytes);
-    let mut object_store = ObjectStore::open_with_tree_delta_cache(
-        repo,
-        &config.tree_diff,
-        &spill_dir,
-        tree_delta_cache,
-    )?;
+    // Build mutable caches only when serial intro or serial fallback is used.
+    // Parallel-intro success avoids constructing an otherwise unused store.
+    let open_object_store = || {
+        let tree_delta_cache = TreeDeltaCache::new(auto_cache_bytes);
+        ObjectStore::open_with_layout(
+            &object_store_layout,
+            &config.tree_diff,
+            &spill_dir,
+            tree_delta_cache,
+        )
+    };
 
     // ── Stage 1: blob introduction ───────────────────────────────────
     // When blob_intro_workers > 1, use the parallel path with shared
@@ -170,6 +179,7 @@ pub(super) fn run_odb_blob(
                 repo,
                 config,
                 &spill_dir,
+                &object_store_layout,
                 cg_index,
                 plan,
                 &midx,
@@ -199,6 +209,7 @@ pub(super) fn run_odb_blob(
                     TreeDiffError::CandidateLimitExceeded { .. } | TreeDiffError::PathArenaFull,
                 ) => {
                     // Parallel path overflowed — fall back to serial spill/retry.
+                    let mut object_store = open_object_store()?;
                     run_serial_spill_retry(
                         repo,
                         config,
@@ -218,6 +229,7 @@ pub(super) fn run_odb_blob(
             }
         } else {
             // ── Serial blob introduction (original path) ──
+            let mut object_store = open_object_store()?;
             let mut introducer = BlobIntroducer::new(
                 &config.tree_diff,
                 repo.object_format.oid_len(),

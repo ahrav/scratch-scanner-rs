@@ -22,9 +22,7 @@ use crate::git_scan::{
     StartSetConfig,
 };
 use crate::scheduler::{parallel_scan_dir, ParallelScanConfig};
-use crate::{
-    demo_rules, demo_transforms, demo_tuning, AnchorMode, AnchorPolicy, Engine,
-};
+use crate::{demo_rules, demo_transforms, demo_tuning, AnchorMode, AnchorPolicy, Engine};
 
 use super::source::git::{EmptyWatermarkStore, GitCliResolver};
 use super::{EventFormat, FsScanConfig, GitSourceConfig, ScanConfig, SourceConfig};
@@ -65,7 +63,9 @@ fn run_fs(
         AnchorMode::Manual => AnchorPolicy::ManualOnly,
         AnchorMode::Derived => AnchorPolicy::DerivedOnly,
     };
-    let engine = Arc::new(Engine::new_with_anchor_policy(rules, transforms, tuning, policy));
+    let engine = Arc::new(Engine::new_with_anchor_policy(
+        rules, transforms, tuning, policy,
+    ));
     let init_elapsed = t0.elapsed();
 
     let scan_start = Instant::now();

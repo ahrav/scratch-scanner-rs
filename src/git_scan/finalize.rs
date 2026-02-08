@@ -1,6 +1,6 @@
 //! Finalize + persist builder.
 //!
-//! Transforms scan results into deterministic write operations for the
+//! Transforms scan results into stably ordered write operations for the
 //! persistence layer. This module is a pure builder: it performs no I/O.
 //! Callers must write data ops before watermark ops to avoid advancing
 //! watermarks past unscanned blobs.
@@ -12,6 +12,8 @@
 //!   `ctx_flags`, `cand_flags`.
 //! - Findings are deduped by `(start, end, rule_id, norm_hash)` within each
 //!   blob OID before persistence.
+//! - Determinism is defined over the provided `FinalizeInput`; if upstream
+//!   candidate attribution differs, `blob_ctx` values may differ too.
 //!
 //! # Invariants
 //! - `path_arena` and `finding_arena` must cover all references in

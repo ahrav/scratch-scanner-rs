@@ -167,11 +167,13 @@ preserving Git tree order before candidates reach the engine adapter.
 ## Git Path Policy (ODB-Blob)
 
 ODB-blob mode applies path policy during blob introduction, before any blob
-bytes are decoded. A blob is emitted with the **first non-excluded path** it
-appears under. If the blob appears only under excluded paths (for example,
-binary-classified files when `path_policy_version >= 2`), it is skipped. This
-ensures deterministic attribution while avoiding false negatives when the same
-blob content shows up under both excluded and non-excluded paths.
+bytes are decoded. A blob is emitted with the first non-excluded path observed
+by the introducer. If the blob appears only under excluded paths (for example,
+binary-classified files when `path_policy_version >= 2`), it is skipped. In
+serial introduction this attribution is deterministic; in parallel introduction
+it is race-winner based and may vary across worker counts. The blob set remains
+unchanged, avoiding false negatives when the same blob content shows up under
+both excluded and non-excluded paths.
 
 ## FindingKey Hashing
 

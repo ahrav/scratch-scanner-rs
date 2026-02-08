@@ -53,10 +53,7 @@ pub(crate) enum RulesError {
         error: String,
     },
     /// Rule validation failure (e.g., invalid invariants).
-    Validation {
-        rule_name: String,
-        message: String,
-    },
+    Validation { rule_name: String, message: String },
     /// The rules file contained no rules.
     NoRules,
 }

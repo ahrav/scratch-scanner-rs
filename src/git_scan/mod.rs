@@ -18,7 +18,7 @@
 //! # Output model
 //! - Metadata phases emit stable plans and candidate lists without reading blobs.
 //! - Execution phases decode blobs with explicit limits and report per-offset
-//!   skips while keeping output deterministic.
+//!   skips with deterministic ordering guarantees for staged outputs.
 //! - Finalization emits write ops for data and (on complete runs) watermarks.
 //!
 //! # Feature gates
@@ -29,7 +29,10 @@
 //! - Metadata stages (repo open through pack planning) do not read blob payloads.
 //! - Pack execution and engine adaptation read and scan blob bytes with explicit limits.
 //! - File reads are bounded by explicit limits.
-//! - Outputs are deterministic for identical repo state and configuration.
+//! - `seen_blob`/`finding` persistence keys are deterministic for identical repo
+//!   state and configuration.
+//! - In ODB-blob mode with parallel introduction, blob attribution context
+//!   (`commit_id`, path, flags) is not guaranteed deterministic.
 
 pub mod alloc_guard;
 pub mod artifact_acquire;
