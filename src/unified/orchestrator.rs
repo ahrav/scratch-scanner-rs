@@ -7,8 +7,18 @@
 //! - **Git** → [`run_git_scan`] (pack execution, tree diffs, loose scan)
 //!
 //! Both paths share a common [`EventSink`](super::events::EventSink) for
-//! structured JSONL output to stdout, and emit a summary event at completion.
-//! Human-readable stats go to stderr.
+//! structured output to stdout (format selected via `--event-format`),
+//! and emit a `Summary` event at completion. Human-readable stats are
+//! also written to stderr for backward-compatible machine parsing.
+//!
+//! # Lifecycle
+//!
+//! 1. Load rules (YAML file → fallback to compiled-in set).
+//! 2. Apply `--transforms` filter and build the detection [`Engine`].
+//! 3. Construct the [`EventSink`] for the selected output format.
+//! 4. Run the source driver (FS or Git), which emits `Finding` /
+//!    `Progress` events through the sink.
+//! 5. Emit a final `Summary` event and call `sink.flush()`.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -34,11 +44,20 @@ use super::{EventFormat, FsScanConfig, GitSourceConfig, ScanConfig, SourceConfig
 /// detection engine, selects the source driver, and runs the scan.
 pub fn run(config: ScanConfig) -> io::Result<()> {
     let event_format = config.event_format;
+    let verbose = config.verbose;
     let rules_file = config.rules_file;
     let transform_filter = config.transform_filter;
     match config.source {
-        SourceConfig::Fs(fs_cfg) => run_fs(fs_cfg, event_format, rules_file, &transform_filter),
-        SourceConfig::Git(git_cfg) => run_git(git_cfg, event_format, rules_file, &transform_filter),
+        SourceConfig::Fs(fs_cfg) => {
+            run_fs(fs_cfg, event_format, verbose, rules_file, &transform_filter)
+        }
+        SourceConfig::Git(git_cfg) => run_git(
+            git_cfg,
+            event_format,
+            verbose,
+            rules_file,
+            &transform_filter,
+        ),
     }
 }
 
@@ -49,6 +68,7 @@ pub fn run(config: ScanConfig) -> io::Result<()> {
 fn run_fs(
     cfg: FsScanConfig,
     event_format: EventFormat,
+    verbose: bool,
     rules_file: Option<PathBuf>,
     transform_filter: &TransformFilter,
 ) -> io::Result<()> {
@@ -77,7 +97,7 @@ fn run_fs(
     let event_sink: Arc<dyn super::events::EventSink> = if cfg.null_sink {
         Arc::new(super::events::NullEventSink)
     } else {
-        build_event_sink(event_format)
+        build_event_sink(event_format, verbose)
     };
 
     let mut ps_config = ParallelScanConfig {
@@ -145,6 +165,7 @@ fn run_fs(
 fn run_git(
     cfg: GitSourceConfig,
     event_format: EventFormat,
+    verbose: bool,
     rules_file: Option<PathBuf>,
     transform_filter: &TransformFilter,
 ) -> io::Result<()> {
@@ -190,7 +211,7 @@ fn run_git(
         }
     });
 
-    let event_sink = build_event_sink(event_format);
+    let event_sink = build_event_sink(event_format, verbose);
 
     let start_set = StartSetConfig::DefaultBranchOnly;
     let resolver = GitCliResolver::new(cfg.repo_root.clone(), start_set.clone());
@@ -259,9 +280,15 @@ fn print_git_report(
 }
 
 /// Construct the [`EventSink`] for the requested output format.
-fn build_event_sink(event_format: EventFormat) -> Arc<dyn super::events::EventSink> {
+///
+/// All sinks write to stdout. The `verbose` flag only affects the
+/// [`TextEventSink`](super::text_sink::TextEventSink) (compact vs verbose).
+fn build_event_sink(event_format: EventFormat, verbose: bool) -> Arc<dyn super::events::EventSink> {
     match event_format {
         EventFormat::Jsonl => Arc::new(super::events::JsonlEventSink::new(io::stdout())),
+        EventFormat::Text => Arc::new(super::text_sink::TextEventSink::new(io::stdout(), verbose)),
+        EventFormat::Json => Arc::new(super::json_sink::JsonEventSink::new(io::stdout())),
+        EventFormat::Sarif => Arc::new(super::sarif_sink::SarifEventSink::new(io::stdout())),
     }
 }
 

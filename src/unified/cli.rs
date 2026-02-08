@@ -60,6 +60,8 @@ pub enum TransformFilter {
 pub struct ScanConfig {
     pub source: SourceConfig,
     pub event_format: EventFormat,
+    /// Enable verbose output (used by text event format).
+    pub verbose: bool,
     /// Optional path to a YAML rules file. When `None`, the orchestrator
     /// falls back to `default_rules.yaml` next to the binary, then the
     /// compiled-in demo rules.
@@ -142,6 +144,7 @@ fn parse_fs_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<S
     let mut no_archives = false;
     let mut null_sink = false;
     let mut scan_binary = false;
+    let mut verbose = false;
     let mut anchor_mode = AnchorMode::Manual;
     let mut event_format = EventFormat::Jsonl;
     let mut rules_file: Option<PathBuf> = None;
@@ -208,6 +211,10 @@ fn parse_fs_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<S
                     scan_binary = true;
                     continue;
                 }
+                "--verbose" => {
+                    verbose = true;
+                    continue;
+                }
                 "--help" | "-h" => {
                     print_fs_usage();
                     std::process::exit(0);
@@ -246,6 +253,7 @@ fn parse_fs_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<S
             scan_binary,
         }),
         event_format,
+        verbose,
         rules_file,
         transform_filter,
     })
@@ -267,6 +275,7 @@ fn parse_git_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<
     let mut debug = false;
     let mut perf_breakdown = false;
     let mut scan_binary = false;
+    let mut verbose = false;
     let mut event_format = EventFormat::Jsonl;
     let mut rules_file: Option<PathBuf> = None;
     let mut transform_filter = TransformFilter::All;
@@ -376,6 +385,10 @@ fn parse_git_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<
                     scan_binary = true;
                     continue;
                 }
+                "--verbose" => {
+                    verbose = true;
+                    continue;
+                }
                 "--help" | "-h" => {
                     print_git_usage();
                     std::process::exit(0);
@@ -419,6 +432,7 @@ fn parse_git_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<
             scan_binary,
         }),
         event_format,
+        verbose,
         rules_file,
         transform_filter,
     })
@@ -450,8 +464,14 @@ fn parse_anchor_mode(s: &str) -> AnchorMode {
 fn parse_event_format(s: &str) -> EventFormat {
     match s {
         "jsonl" => EventFormat::Jsonl,
+        "text" => EventFormat::Text,
+        "json" => EventFormat::Json,
+        "sarif" => EventFormat::Sarif,
         _ => {
-            eprintln!("invalid --event-format value: {} (expected jsonl)", s);
+            eprintln!(
+                "invalid --event-format value: {} (expected jsonl|text|json|sarif)",
+                s
+            );
             std::process::exit(2);
         }
     }

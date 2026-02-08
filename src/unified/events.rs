@@ -18,10 +18,42 @@
 //! from per-worker scratch). The mutex is held only for the `write_all`
 //! call, not during formatting.
 
+use std::cell::RefCell;
 use std::io::{BufWriter, ErrorKind, Write};
 use std::sync::Mutex;
 
+use super::json_write::{write_f64, write_json_bytes, write_json_str, write_source, write_u64};
 use super::SourceKind;
+
+thread_local! {
+    static EMIT_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(256));
+}
+
+/// Format into a thread-local scratch buffer, then pass the filled bytes to `f`.
+///
+/// This two-phase design keeps the expensive formatting work *outside* any
+/// sink mutex — the sink only holds its lock for the cheap `write_all`.
+///
+/// Falls back to a heap-allocated `Vec` if the thread-local is already
+/// borrowed (reentrant call within the same thread, which shouldn't happen
+/// in practice but is safe if it does).
+pub(crate) fn with_format_buf<F>(encode: impl FnOnce(&mut Vec<u8>), f: F)
+where
+    F: FnOnce(&[u8]),
+{
+    EMIT_BUF.with(|cell| {
+        if let Ok(mut buf) = cell.try_borrow_mut() {
+            buf.clear();
+            encode(&mut buf);
+            f(&buf);
+        } else {
+            // Reentrant call — allocate a one-off buffer.
+            let mut buf = Vec::with_capacity(256);
+            encode(&mut buf);
+            f(&buf);
+        }
+    });
+}
 
 // ============================================================================
 // Event types
@@ -88,6 +120,13 @@ pub struct DiagnosticEvent<'a> {
 /// Implementations must be safe to call from multiple worker threads
 /// concurrently. Internal synchronization (mutex, lock-free buffer)
 /// is the implementor's responsibility.
+///
+/// # Error contract
+///
+/// All built-in sinks silently swallow `BrokenPipe` (the downstream
+/// consumer hung up) and panic on any other I/O error. This is
+/// intentional: a scan should not silently lose findings to a transient
+/// write failure.
 pub trait EventSink: Send + Sync {
     /// Serialize and write a single event. Must not block indefinitely.
     fn emit(&self, event: ScanEvent<'_>);
@@ -95,10 +134,11 @@ pub trait EventSink: Send + Sync {
     fn flush(&self);
 }
 
-/// Encodes a [`ScanEvent`] into bytes.
+/// Stateless encoder: appends a wire-format representation of one event to `buf`.
 ///
-/// Default implementation is JSONL. Future implementations could use
-/// a zero-copy binary format.
+/// Separated from [`EventSink`] so the encoding logic can be tested and
+/// reused without I/O. [`JsonlEncoder`] is the only implementation today;
+/// a future binary format would add a second.
 pub trait EventEncoder: Send + Sync {
     /// Append the encoded representation of `event` to `buf`.
     fn encode(&self, event: &ScanEvent<'_>, buf: &mut Vec<u8>);
@@ -135,7 +175,7 @@ impl EventEncoder for JsonlEncoder {
     }
 }
 
-fn encode_finding(f: &FindingEvent<'_>, buf: &mut Vec<u8>) {
+pub(crate) fn encode_finding(f: &FindingEvent<'_>, buf: &mut Vec<u8>) {
     buf.extend_from_slice(b"{\"type\":\"finding\",\"source\":\"");
     write_source(f.source, buf);
     buf.extend_from_slice(b"\",\"path\":\"");
@@ -161,7 +201,7 @@ fn encode_finding(f: &FindingEvent<'_>, buf: &mut Vec<u8>) {
     buf.push(b'}');
 }
 
-fn encode_progress(p: &ProgressEvent, buf: &mut Vec<u8>) {
+pub(crate) fn encode_progress(p: &ProgressEvent, buf: &mut Vec<u8>) {
     buf.extend_from_slice(b"{\"type\":\"progress\",\"source\":\"");
     write_source(p.source, buf);
     buf.extend_from_slice(b"\",\"stage\":\"");
@@ -175,7 +215,7 @@ fn encode_progress(p: &ProgressEvent, buf: &mut Vec<u8>) {
     buf.push(b'}');
 }
 
-fn encode_summary(s: &SummaryEvent, buf: &mut Vec<u8>) {
+pub(crate) fn encode_summary(s: &SummaryEvent, buf: &mut Vec<u8>) {
     buf.extend_from_slice(b"{\"type\":\"summary\",\"source\":\"");
     write_source(s.source, buf);
     buf.extend_from_slice(b"\",\"status\":\"");
@@ -193,147 +233,13 @@ fn encode_summary(s: &SummaryEvent, buf: &mut Vec<u8>) {
     buf.push(b'}');
 }
 
-fn encode_diagnostic(d: &DiagnosticEvent<'_>, buf: &mut Vec<u8>) {
+pub(crate) fn encode_diagnostic(d: &DiagnosticEvent<'_>, buf: &mut Vec<u8>) {
     buf.extend_from_slice(b"{\"type\":\"diagnostic\",\"level\":\"");
     write_json_str(d.level, buf);
     buf.extend_from_slice(b"\",\"message\":\"");
     write_json_str(d.message, buf);
     buf.extend_from_slice(b"\"}");
 }
-
-// ============================================================================
-// JSON primitives (no serde)
-// ============================================================================
-
-fn write_source(kind: SourceKind, buf: &mut Vec<u8>) {
-    match kind {
-        SourceKind::Fs => buf.extend_from_slice(b"fs"),
-        SourceKind::Git => buf.extend_from_slice(b"git"),
-    }
-}
-
-/// Write a u64 as decimal ASCII.
-fn write_u64(n: u64, buf: &mut Vec<u8>) {
-    // itoa-style: write digits in reverse, then reverse.
-    if n == 0 {
-        buf.push(b'0');
-        return;
-    }
-    let start = buf.len();
-    let mut v = n;
-    while v > 0 {
-        buf.push(b'0' + (v % 10) as u8);
-        v /= 10;
-    }
-    buf[start..].reverse();
-}
-
-/// Write an f64 with 2 decimal places.
-fn write_f64(n: f64, buf: &mut Vec<u8>) {
-    // Format as integer part + 2 decimal places.
-    // Handles NaN/Inf as 0.00 to avoid invalid JSON.
-    if n.is_nan() || n.is_infinite() {
-        buf.extend_from_slice(b"0.00");
-        return;
-    }
-    let negative = n < 0.0;
-    let abs = n.abs();
-    let mut integer = abs as u64;
-    let mut frac = ((abs - integer as f64) * 100.0).round() as u64;
-    if frac >= 100 {
-        integer += 1;
-        frac -= 100;
-    }
-
-    if negative {
-        buf.push(b'-');
-    }
-    write_u64(integer, buf);
-    buf.push(b'.');
-    if frac < 10 {
-        buf.push(b'0');
-    }
-    write_u64(frac, buf);
-}
-
-/// Write a JSON-escaped UTF-8 string.
-fn write_json_str(s: &str, buf: &mut Vec<u8>) {
-    for byte in s.bytes() {
-        match byte {
-            b'"' => buf.extend_from_slice(b"\\\""),
-            b'\\' => buf.extend_from_slice(b"\\\\"),
-            b'\n' => buf.extend_from_slice(b"\\n"),
-            b'\r' => buf.extend_from_slice(b"\\r"),
-            b'\t' => buf.extend_from_slice(b"\\t"),
-            0x00..=0x1f => {
-                // Control characters: \u00XX
-                buf.extend_from_slice(b"\\u00");
-                buf.push(HEX_DIGITS[(byte >> 4) as usize]);
-                buf.push(HEX_DIGITS[(byte & 0xf) as usize]);
-            }
-            _ => buf.push(byte),
-        }
-    }
-}
-
-/// Write raw bytes as a JSON string value.
-///
-/// Valid UTF-8 sequences are written as-is. Invalid bytes are escaped
-/// as `\uXXXX` using the Unicode replacement character approach:
-/// each invalid byte is written as `\u00XX`.
-fn write_json_bytes(bytes: &[u8], buf: &mut Vec<u8>) {
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        match b {
-            // JSON special characters.
-            b'"' => buf.extend_from_slice(b"\\\""),
-            b'\\' => buf.extend_from_slice(b"\\\\"),
-            b'\n' => buf.extend_from_slice(b"\\n"),
-            b'\r' => buf.extend_from_slice(b"\\r"),
-            b'\t' => buf.extend_from_slice(b"\\t"),
-            0x00..=0x1f => {
-                buf.extend_from_slice(b"\\u00");
-                buf.push(HEX_DIGITS[(b >> 4) as usize]);
-                buf.push(HEX_DIGITS[(b & 0xf) as usize]);
-            }
-            // ASCII printable: pass through.
-            0x20..=0x7e => buf.push(b),
-            // Potential multi-byte UTF-8 start: validate and pass through if valid.
-            _ => {
-                let remaining = &bytes[i..];
-                match std::str::from_utf8(remaining) {
-                    Ok(s) => {
-                        // Rest is valid UTF-8 — write it and done.
-                        write_json_str(s, buf);
-                        return;
-                    }
-                    Err(e) => {
-                        let valid_up_to = e.valid_up_to();
-                        if valid_up_to > 0 {
-                            // Write the valid prefix.
-                            // SAFETY: `from_utf8` above proved `remaining[..valid_up_to]`
-                            // is valid UTF-8; `valid_up_to` is the boundary returned by
-                            // `Utf8Error::valid_up_to()`.
-                            let valid =
-                                unsafe { std::str::from_utf8_unchecked(&remaining[..valid_up_to]) };
-                            write_json_str(valid, buf);
-                            i += valid_up_to;
-                            continue;
-                        }
-                        // Invalid byte: escape as \u00XX.
-                        buf.extend_from_slice(b"\\u00");
-                        buf.push(HEX_DIGITS[(b >> 4) as usize]);
-                        buf.push(HEX_DIGITS[(b & 0xf) as usize]);
-                    }
-                }
-            }
-        }
-        i += 1;
-    }
-}
-
-const HEX_DIGITS: [u8; 16] = *b"0123456789abcdef";
 
 // ============================================================================
 // JSONL event sink
@@ -363,17 +269,18 @@ impl<W: Write + Send> JsonlEventSink<W> {
 
 impl<W: Write + Send + 'static> EventSink for JsonlEventSink<W> {
     fn emit(&self, event: ScanEvent<'_>) {
-        // Format into a stack-local buffer, then write under lock.
-        let mut buf = Vec::with_capacity(256);
-        self.encoder.encode(&event, &mut buf);
-
-        let mut writer = self.writer.lock().expect("jsonl sink mutex poisoned");
-        if let Err(e) = writer.write_all(&buf) {
-            if e.kind() == ErrorKind::BrokenPipe {
-                return;
-            }
-            panic!("jsonl event sink write failed: {}", e);
-        }
+        with_format_buf(
+            |buf| self.encoder.encode(&event, buf),
+            |bytes| {
+                let mut writer = self.writer.lock().expect("jsonl sink mutex poisoned");
+                if let Err(e) = writer.write_all(bytes) {
+                    if e.kind() == ErrorKind::BrokenPipe {
+                        return;
+                    }
+                    panic!("jsonl event sink write failed: {}", e);
+                }
+            },
+        );
     }
 
     fn flush(&self) {
@@ -435,10 +342,13 @@ impl Default for VecEventSink {
 
 impl EventSink for VecEventSink {
     fn emit(&self, event: ScanEvent<'_>) {
-        let mut tmp = Vec::with_capacity(256);
-        self.encoder.encode(&event, &mut tmp);
-        let mut buf = self.buf.lock().expect("vec event sink mutex poisoned");
-        buf.extend_from_slice(&tmp);
+        with_format_buf(
+            |tmp| self.encoder.encode(&event, tmp),
+            |bytes| {
+                let mut buf = self.buf.lock().expect("vec event sink mutex poisoned");
+                buf.extend_from_slice(bytes);
+            },
+        );
     }
 
     fn flush(&self) {}
@@ -568,59 +478,6 @@ mod tests {
         assert!(line.contains("\\\""));
         assert!(line.contains("\\\\"));
         assert!(line.contains("\\n"));
-    }
-
-    #[test]
-    fn write_u64_values() {
-        let mut buf = Vec::new();
-        write_u64(0, &mut buf);
-        assert_eq!(&buf, b"0");
-
-        buf.clear();
-        write_u64(42, &mut buf);
-        assert_eq!(&buf, b"42");
-
-        buf.clear();
-        write_u64(u64::MAX, &mut buf);
-        assert_eq!(std::str::from_utf8(&buf).unwrap(), u64::MAX.to_string());
-    }
-
-    #[test]
-    fn write_f64_values() {
-        let mut buf = Vec::new();
-        write_f64(0.0, &mut buf);
-        assert_eq!(&buf, b"0.00");
-
-        buf.clear();
-        write_f64(81.23, &mut buf);
-        assert_eq!(&buf, b"81.23");
-
-        buf.clear();
-        write_f64(f64::NAN, &mut buf);
-        assert_eq!(&buf, b"0.00");
-
-        buf.clear();
-        write_f64(-2.50, &mut buf);
-        assert_eq!(&buf, b"-2.50");
-    }
-
-    #[test]
-    fn write_f64_frac_rounds_to_100() {
-        let mut buf = Vec::new();
-        write_f64(99.996, &mut buf);
-        assert_eq!(&buf, b"100.00");
-
-        buf.clear();
-        write_f64(1.995, &mut buf);
-        assert_eq!(&buf, b"2.00");
-
-        buf.clear();
-        write_f64(0.999, &mut buf);
-        assert_eq!(&buf, b"1.00");
-
-        buf.clear();
-        write_f64(-0.999, &mut buf);
-        assert_eq!(&buf, b"-1.00");
     }
 
     #[test]

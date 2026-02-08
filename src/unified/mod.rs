@@ -8,15 +8,25 @@
 //!
 //! | Module | Purpose |
 //! |--------|---------|
-//! | [`cli`] | Subcommand argument parsing |
-//! | [`events`] | `ScanEvent`, `EventSink`, JSONL encoder |
-//! | [`orchestrator`] | Top-level dispatch (`run()`) |
-//! | [`source`] | Source drivers (FS, Git) |
+//! | [`cli`] | Subcommand argument parsing (hand-rolled, no clap) |
+//! | [`events`] | `ScanEvent` types, `EventSink` trait, JSONL encoder + sink |
+//! | [`json_write`] | Shared JSON primitives (escaping, numbers, byte-paths) — no serde |
+//! | [`json_sink`] | Streaming JSON array (`[{...},{...}]`) event sink |
+//! | [`sarif_sink`] | SARIF 2.1.0 event sink (findings only) |
+//! | [`text_sink`] | Human-readable text sink (compact / verbose) |
+//! | [`orchestrator`] | Top-level dispatch: engine build → source driver → event sink |
+//! | [`source`] | Source drivers (FS directory walk, Git pack/loose scan) |
 
 pub mod cli;
 pub mod events;
+pub mod json_sink;
+pub mod json_write;
 pub mod orchestrator;
+pub mod sarif_sink;
+#[cfg(test)]
+mod sink_stress_tests;
 pub mod source;
+pub mod text_sink;
 
 use std::path::PathBuf;
 
@@ -109,4 +119,10 @@ pub enum EventFormat {
     /// One JSON object per line (default).
     #[default]
     Jsonl,
+    /// Human-readable text output.
+    Text,
+    /// Single JSON array document.
+    Json,
+    /// SARIF 2.1.0 for GitHub Code Scanning and security tools.
+    Sarif,
 }
