@@ -597,6 +597,7 @@ pub struct ScanScratch {
     step_arena: StepArena,
     utf16_buf: ScratchVec<u8>,
     steps_buf: ScratchVec<DecodeStep>,
+    // ... additional hot fields omitted for brevity ...
 
     // Cache-line split between hot and cold regions.
     _cold_boundary: CachelineBoundary, // #[repr(align(64))]

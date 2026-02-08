@@ -35,18 +35,13 @@ pub type NormHash = [u8; 32];
 /// The histogram is populated per candidate match and reset immediately
 /// after the gate check.
 ///
-/// # Performance
-/// Reset is O(distinct bytes) via the `used` list instead of O(256).
-/// Typical secret candidates are 20–80 bytes with ~30–60 distinct byte
-/// values, so the sparse reset is 4–8× cheaper than `memset(counts, 0, 1 KiB)`.
-///
 /// # Invariants
 /// - `used_len <= 256`.
-/// - `used[0..used_len]` lists byte values whose counters were incremented
-///   since the last reset.
+/// - `used[0..used_len]` tracks which counters were incremented since
+///   the last reset.
 /// - **All counters outside the `used` set must be zero.** Violating this
-///   (e.g., forgetting to call `reset()`) produces silently wrong entropy
-///   calculations because leftover counts inflate the histogram.
+///   produces silently wrong entropy calculations because leftover counts
+///   inflate the histogram.
 #[derive(Clone, Copy)]
 pub(super) struct EntropyScratch {
     // Histogram for byte frequencies (256 bins).
@@ -63,11 +58,8 @@ pub(super) struct EntropyScratch {
 /// can be translated back to root-buffer offsets for deduplication and output.
 ///
 /// # Safety
-/// - `tc` points to an `Engine`-owned `TransformConfig` that outlives the scan.
-/// - `encoded_ptr`/`encoded_len` describe the encoded span being decoded;
-///   the referenced bytes must remain valid while this context is set.
-/// - This context is only valid for the duration of a single scan; it is
-///   cleared after each buffer scan completes.
+/// - `tc` and `encoded_ptr`/`encoded_len` must remain valid while this
+///   context is set (cleared after each buffer scan completes).
 #[derive(Clone, Copy)]
 pub(super) struct RootSpanMapCtx {
     tc: *const TransformConfig,
@@ -81,9 +73,6 @@ pub(super) struct RootSpanMapCtx {
 
 impl RootSpanMapCtx {
     /// Creates a new mapping context for the given transform and encoded span.
-    ///
-    /// The caller must ensure `tc` and `encoded` remain valid and unmodified
-    /// for the lifetime of this context (typically one scan invocation).
     pub(super) fn new(
         tc: &TransformConfig,
         encoded: &[u8],
@@ -262,14 +251,9 @@ impl EntropyScratch {
     }
 }
 
-/// Zero-sized type whose only purpose is forcing 64-byte alignment.
-///
-/// Placed between the hot and cold regions of [`ScanScratch`] so that the
-/// cold region starts on a new cache line. Because `#[repr(C)]` lays out
-/// fields in declaration order, inserting this ZST before the first cold
-/// field (`slab`) causes the compiler to pad the preceding hot region up
-/// to a 64-byte boundary. The `[u8; 0]` field keeps the type zero-sized
-/// while the `#[repr(align(64))]` forces the alignment.
+/// Zero-sized type that forces 64-byte alignment between the hot and cold
+/// regions of [`ScanScratch`], ensuring the cold region starts on a fresh
+/// cache line.
 #[repr(align(64))]
 struct CachelineBoundary {
     _pad: [u8; 0],
@@ -313,7 +297,7 @@ impl CachelineBoundary {
 ///
 /// **Cold region** (after `_cold_boundary`): fields touched only when a
 /// transform fires (decode slab, ring buffer, pending windows, stream
-/// state), when deduplicating across chunks (`seen_findings`), or for
+/// state), when emitting findings for cross-chunk deduplication (`seen_findings`), or for
 /// Vectorscan scratch management. Separating them avoids polluting the
 /// hot cache lines when transforms are inactive (the common case for
 /// many file types).
@@ -655,6 +639,13 @@ impl ScanScratch {
         }
     }
 
+    /// Returns a mutable reference to the entropy scratch histogram,
+    /// allocating it on first use.
+    ///
+    /// `entropy_scratch` is stored as `Option<Box<EntropyScratch>>` so
+    /// engines with no entropy gates pay zero heap cost for the 1 KiB
+    /// histogram. The first call from an entropy gate allocates the box;
+    /// subsequent calls return the existing allocation.
     #[inline(always)]
     pub(super) fn ensure_entropy_scratch(&mut self) -> &mut EntropyScratch {
         self.entropy_scratch
@@ -1451,5 +1442,23 @@ mod tests {
         assert_eq!(cold_boundary_offset % 64, 0);
         assert_eq!(slab_offset % 64, 0);
         assert!(slab_offset >= cold_boundary_offset);
+
+        // Key hot fields must live before the cold boundary.
+        let out_offset = std::mem::offset_of!(ScanScratch, out);
+        let work_q_offset = std::mem::offset_of!(ScanScratch, work_q);
+        let steps_buf_offset = std::mem::offset_of!(ScanScratch, steps_buf);
+
+        assert!(
+            out_offset < cold_boundary_offset,
+            "out (findings) must be in the hot region"
+        );
+        assert!(
+            work_q_offset < cold_boundary_offset,
+            "work_q must be in the hot region"
+        );
+        assert!(
+            steps_buf_offset < cold_boundary_offset,
+            "steps_buf must be in the hot region"
+        );
     }
 }

@@ -85,7 +85,7 @@ graph TB
 | **Unified Orchestrator** | `src/unified/orchestrator.rs` | Dispatches sources and wires structured event sinks               |
 | **Unified Events**  | `src/unified/events.rs`        | Structured `ScanEvent` model and JSONL sink                          |
 | **FS Owner-Compute Scheduler** | `src/scheduler/local_fs_owner.rs` | Round-robin file dispatch with per-worker owned I/O+scan state |
-| **Engine**          | `src/engine/core.rs:154`       | Compiled scanning engine with anchor patterns, rules, and transforms |
+| **Engine**          | `src/engine/core.rs`           | Compiled scanning engine with anchor patterns, rules, and transforms |
 | **RuleSpec**        | `src/api.rs:519`               | Rule definitions and specification for rule-based scanning           |
 | **RuleCompiled**    | `src/engine/rule_repr.rs`  | Hot compiled rule representation used in scan-loop validation      |
 | **RuleCold**        | `src/engine/rule_repr.rs`  | Cold per-rule metadata (`name`) stored parallel to hot rules       |

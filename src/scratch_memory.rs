@@ -152,7 +152,7 @@ impl<T> ScratchVec<T> {
                 .add(self.len())
                 .write(MaybeUninit::new(value));
         }
-        self.len = self.len.saturating_add(1);
+        self.len += 1;
     }
 
     /// Shorten the vector to `new_len`, dropping elements above the new length.
@@ -267,7 +267,7 @@ impl<T> ScratchVec<T> {
         if self.is_empty() {
             return None;
         }
-        self.len = self.len.saturating_sub(1);
+        self.len -= 1;
         // SAFETY: `self.len` (post-decrement) was the last valid index. The
         // element is initialized. `read()` performs a bitwise copy without
         // dropping the source — ownership transfers to the caller. The slot
@@ -539,6 +539,12 @@ mod tests {
         let drained: Vec<u32> = vec.drain().collect();
         assert!(drained.is_empty());
         assert!(vec.is_empty());
+    }
+
+    #[test]
+    fn with_capacity_beyond_u32_max_returns_err() {
+        let result = ScratchVec::<u8>::with_capacity(u32::MAX as usize + 1);
+        assert!(result.is_err());
     }
 }
 

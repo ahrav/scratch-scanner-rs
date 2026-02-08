@@ -308,6 +308,10 @@ pub(super) struct EntropyCompiled {
 /// `Engine` and accessed via `Option<u32>` indices here, keeping this struct
 /// compact for cache-friendly iteration.
 ///
+/// Cold per-rule metadata (e.g., rule name) is stored in the parallel
+/// [`RuleCold`] array at `Engine::rules_cold`, indexed identically so that
+/// `rules_hot[i]` and `rules_cold[i]` always describe the same rule.
+///
 /// # Field layout rationale
 ///
 /// Fields are ordered by access frequency in the scan loop:

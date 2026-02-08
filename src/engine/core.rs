@@ -122,6 +122,11 @@ pub struct VectorscanStats {
 }
 
 /// Cache-line padded atomic counter to reduce false sharing between workers.
+///
+/// Each instance occupies exactly one 64-byte cache line so that concurrent
+/// increments from different threads never contend on the same line. Without
+/// this padding, adjacent `AtomicU64` counters in `VectorscanCounters` would
+/// share a cache line and trigger false-sharing invalidations on every store.
 #[cfg(feature = "stats")]
 #[repr(align(64))]
 #[derive(Default)]
@@ -135,6 +140,13 @@ impl std::ops::Deref for CachePaddedAtomicU64 {
         &self.0
     }
 }
+
+// Compile-time size/alignment guard: each counter occupies exactly one cache line.
+#[cfg(feature = "stats")]
+const _: () = assert!(
+    std::mem::align_of::<CachePaddedAtomicU64>() == 64
+        && std::mem::size_of::<CachePaddedAtomicU64>() == 64
+);
 
 /// Internal atomic counters used to build `VectorscanStats`.
 #[cfg(feature = "stats")]
@@ -1059,10 +1071,10 @@ impl Engine {
     /// - `scratch` is exclusively owned for the duration of the call.
     ///
     /// # High-level flow
-    /// 1. Run Vectorscan prefilter on the root buffer (Step D).
+    /// 1. Run Vectorscan prefilter on the root buffer.
     /// 2. On zero hits: check if transform discovery is needed; if not, return
-    ///    immediately (Step E). This is the common fast path.
-    /// 3. On hits: reset per-scan state, enqueue root `ScanBuf` (Steps F–G).
+    ///    immediately. This is the common fast path.
+    /// 3. On hits: reset per-scan state, enqueue root `ScanBuf`.
     /// 4. Process the work queue in FIFO order (BFS over decode layers):
     ///    - `ScanBuf`: validate regexes in windows, discover transform spans,
     ///      enqueue `DecodeSpan` items.

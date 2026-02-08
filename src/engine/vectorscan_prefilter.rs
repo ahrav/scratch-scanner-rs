@@ -96,6 +96,9 @@ struct RawPatternMeta {
     seed_radius: u32,
 }
 
+// Compile-time size guard: 3 × u32 = 12 bytes, no padding under #[repr(C)].
+const _: () = assert!(std::mem::size_of::<RawPatternMeta>() == 12);
+
 pub(crate) struct VsPrefilterDb {
     /// Compiled Vectorscan block-mode database.
     db: *mut vs::hs_database_t,

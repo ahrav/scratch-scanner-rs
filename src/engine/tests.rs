@@ -611,6 +611,16 @@ fn url_span_includes_prefix_and_finds_ghp() {
 }
 
 #[test]
+fn rules_hot_and_cold_have_equal_length() {
+    let eng = demo_engine();
+    assert_eq!(
+        eng.rules_hot.len(),
+        eng.rules_cold.len(),
+        "rules_hot and rules_cold must be parallel arrays of equal length"
+    );
+}
+
+#[test]
 fn zero_hit_url_plus_to_space_still_scans_transforms() {
     let rule = RuleSpec {
         name: "url-plus-space",
