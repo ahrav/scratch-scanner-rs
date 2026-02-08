@@ -348,6 +348,30 @@ fn odb_blob_parallel_intro_handles_empty_midx_without_panic() {
 }
 
 #[test]
+fn odb_blob_parallel_intro_handles_low_delta_cache_budget() {
+    if !git_available() {
+        eprintln!("git not available; skipping low delta-cache budget test");
+        return;
+    }
+
+    let tmp = init_repo();
+    // Keep all objects loose (no gc/repack), with >1 commits so parallel intro
+    // is selected when blob_intro_workers > 1.
+    commit_file(tmp.path(), "a.txt", "TOK_ABCDEFGH\n", "c1");
+    commit_file(tmp.path(), "b.txt", "TOK_IJKLMNOP\n", "c2");
+
+    let mut config = base_config();
+    config.scan_mode = GitScanMode::OdbBlobFast;
+    config.blob_intro_workers = 4;
+    config.tree_diff.max_tree_delta_cache_bytes = 8 * 1024 * 1024;
+
+    let GitScanResult(report) = run_scan_with_config(tmp.path(), None, config)
+        .expect("parallel ODB blob intro should not fail with 8MiB total delta cache");
+    assert_eq!(report.finalize.outcome, FinalizeOutcome::Complete);
+    assert!(report.skipped_candidates.is_empty());
+}
+
+#[test]
 fn odb_blob_respects_packed_candidate_cap() {
     if !git_available() {
         eprintln!("git not available; skipping packed candidate cap test");

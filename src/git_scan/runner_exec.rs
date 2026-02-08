@@ -199,13 +199,16 @@ pub(super) fn estimate_path_arena_capacity(base: u32, packed: u32, loose: u32) -
 /// Heuristic: ~15% of objects are trees in typical repos. Each tree delta
 /// base needs ~4 KiB (one slot). 4-way associativity needs ~2x entries to
 /// avoid thrashing. The result is clamped between an 8 MiB floor and
-/// `configured_max` ceiling.
+/// `configured_max` ceiling. When `configured_max` is below 8 MiB, the
+/// configured cap is treated as the effective floor.
 pub(super) fn auto_tree_delta_cache_bytes(object_count: u32, configured_max: u32) -> u32 {
     let estimated_trees = (object_count as u64).saturating_mul(15) / 100;
     let estimated_bytes = estimated_trees.saturating_mul(4096 * 2);
 
     let min_cache = 8 * 1024 * 1024_u64; // 8 MiB floor
-    estimated_bytes.clamp(min_cache, configured_max as u64) as u32
+    let max_cache = configured_max as u64;
+    let effective_min_cache = min_cache.min(max_cache);
+    estimated_bytes.clamp(effective_min_cache, max_cache) as u32
 }
 
 /// Estimate a raw pack cache size from mapped pack bytes.
@@ -1586,6 +1589,16 @@ mod tests {
     fn auto_tree_delta_cache_bytes_large_repo_respects_cap() {
         let bytes = auto_tree_delta_cache_bytes(1_000_000, 32 * 1024 * 1024);
         assert_eq!(bytes, 32 * 1024 * 1024, "result must honor configured cap");
+    }
+
+    #[test]
+    fn auto_tree_delta_cache_bytes_allows_cap_below_floor() {
+        let bytes = auto_tree_delta_cache_bytes(3_000, 4 * 1024 * 1024);
+        assert_eq!(
+            bytes,
+            4 * 1024 * 1024,
+            "configured cap below floor should not panic and must be honored",
+        );
     }
 
     /// Helper for constructing a minimal SHA-1 MIDX buffer.
