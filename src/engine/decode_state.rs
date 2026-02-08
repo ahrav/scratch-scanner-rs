@@ -86,6 +86,19 @@ impl CompactDecodeStep {
         }
     }
 
+    /// Returns a variant discriminant for dedup: 1=UTF-16 LE, 2=UTF-16 BE, 0=other.
+    fn variant_discriminant(self) -> u8 {
+        if self.tag_and_idx & TAG_UTF16 != 0 {
+            match self.tag_and_idx & !TAG_UTF16 {
+                0 => 1, // Le
+                1 => 2, // Be
+                _ => 0,
+            }
+        } else {
+            0
+        }
+    }
+
     fn to_decode_step(self) -> DecodeStep {
         let span = (self.span_start as usize)..(self.span_end as usize);
         if self.tag_and_idx & TAG_UTF16 == 0 {
@@ -118,6 +131,13 @@ pub(super) struct StepNode {
     /// Parent step in the provenance chain, or [`STEP_ROOT`] for root-level steps.
     pub(super) parent: StepId,
     step: CompactDecodeStep,
+}
+
+impl StepNode {
+    /// Variant discriminant for dedup: 1=UTF-16 LE, 2=UTF-16 BE, 0=other.
+    pub(super) fn variant_discriminant(&self) -> u8 {
+        self.step.variant_discriminant()
+    }
 }
 
 // Compile-time size guards for compact arena types.

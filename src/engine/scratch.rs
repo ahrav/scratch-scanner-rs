@@ -1152,13 +1152,7 @@ impl ScanScratch {
         // be falsely suppressed. The discriminator is stable across chunks
         // because it depends only on the decode step type, not arena indices.
         let variant_disc: u8 = if rec.step_id != STEP_ROOT {
-            match &self.step_arena.nodes[rec.step_id.0 as usize].step {
-                DecodeStep::Utf16Window { endianness, .. } => match endianness {
-                    Utf16Endianness::Le => 1,
-                    Utf16Endianness::Be => 2,
-                },
-                _ => 0,
-            }
+            self.step_arena.nodes[rec.step_id.0 as usize].variant_discriminant()
         } else {
             0
         };
