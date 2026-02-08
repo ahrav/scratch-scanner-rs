@@ -811,18 +811,19 @@ fn derived_confirm_all_is_compiled() {
     };
 
     let compiled = &eng.rules[0];
-    let compiled_confirm = compiled.confirm_all.as_ref();
+    let compiled_confirm_idx = compiled.confirm_all;
     if expected.is_empty() {
         assert!(
-            compiled_confirm.is_none(),
+            compiled_confirm_idx.is_none(),
             "confirm_all should be omitted when no extra literals are required"
         );
     } else {
-        let confirm = compiled_confirm.expect("confirm_all should be compiled");
+        let idx = compiled_confirm_idx.expect("confirm_all should be compiled");
+        let confirm = &eng.confirm_all_gates[idx as usize];
         let primary = confirm.primary[Variant::Raw.idx()]
             .as_ref()
             .expect("confirm_all primary must be set");
-        let mut literals = vec![primary.clone()];
+        let mut literals = vec![primary.to_vec()];
         literals.extend(unpack_patterns(&confirm.rest[Variant::Raw.idx()]));
 
         let expected_set: HashSet<Vec<u8>> = expected.into_iter().collect();

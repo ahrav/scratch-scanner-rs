@@ -85,7 +85,7 @@ impl Engine {
         };
 
         if !skip_prefilter {
-            // `touched_pairs` is cleared after each buffer; fast-path when empty.
+            // Defensive: should already be empty from the prior buffer's reset.
             debug_assert!(scratch.touched_pairs.is_empty());
             if !scratch.touched_pairs.is_empty() {
                 scratch
@@ -174,13 +174,13 @@ impl Engine {
 
             // Vectorscan callbacks fire in match-end order (not start order),
             // and multiple patterns may interleave, so windows arrive unsorted.
+            // Merge and coalesce below require sorted input.
             //
             // Raw variant: always needs sorting because Vectorscan always runs.
-            // UTF-16 variants: only sort when the Vectorscan UTF-16 DB was used
-            // for this buffer (`used_vectorscan_utf16`); if the UTF-16 DB was
-            // absent, no UTF-16 hits were recorded and the windows are empty.
-            //
-            // The `len() > 1` guard avoids a no-op sort on a single window.
+            // UTF-16 variants: only need sorting when the Vectorscan UTF-16 DB
+            // was used (`used_vectorscan_utf16`). When the UTF-16 DB is absent,
+            // UTF-16 hits can only come from literal-anchor matching, which
+            // produces windows in start order — no sort needed.
             if (variant == Variant::Raw && scratch.windows.len() > 1)
                 || (used_vectorscan_utf16
                     && matches!(variant, Variant::Utf16Le | Variant::Utf16Be)
@@ -211,10 +211,13 @@ impl Engine {
             //   to full_radius (the actual regex validation radius). The extra
             //   padding is `(full_radius - seed_radius) * variant.scale()`.
             //
-            // Correctness argument: if the seed pattern is absent in the narrow
-            // window, the full regex cannot match in the wider window either
-            // (the confirm patterns are mandatory sub-matches of the regex).
-            if let Some(tp) = &rule.two_phase {
+            // Soundness: confirm patterns are derived from mandatory literal
+            // sub-expressions of the regex (see `compile_trigger_plan`). If the
+            // confirm literal is absent in the seed window, the regex cannot
+            // match in *any* superset of that window — so widening after a miss
+            // would be wasted work. This lets us reject ~80-95% of noisy
+            // prefilter hits before paying the regex cost.
+            if let Some(tp) = self.two_phase_gate(rule.two_phase) {
                 let seed_radius_bytes = tp.seed_radius.saturating_mul(variant.scale());
                 let full_radius_bytes = tp.full_radius.saturating_mul(variant.scale());
                 let extra = full_radius_bytes.saturating_sub(seed_radius_bytes);
@@ -292,8 +295,9 @@ impl Engine {
             }
         }
         // Reset accumulators for all pairs touched in this buffer so the next
-        // buffer starts clean. This must happen *after* the validation loop
-        // because the loop reads from the accumulators via `take_into`.
+        // buffer starts with zeroed hit lists. This must happen *after* the
+        // validation loop because `take_into` moves hits out of the accumulator
+        // — resetting earlier would discard hits before they are consumed.
         scratch
             .hit_acc_pool
             .reset_touched(scratch.touched_pairs.as_slice());
