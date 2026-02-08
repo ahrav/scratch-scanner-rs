@@ -46,20 +46,15 @@ use super::{EventFormat, FsScanConfig, GitSourceConfig, SourceConfig};
 /// |------------|-----------------------|
 /// | `"url"`    | `UrlPercent`          |
 /// | `"base64"` | `Base64`              |
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum TransformFilter {
     /// Enable all available transforms (default).
+    #[default]
     All,
     /// Disable all transforms — scan raw buffers only.
     None,
     /// Enable only the named transforms (validated against [`KNOWN_TRANSFORMS`]).
     Only(Vec<String>),
-}
-
-impl Default for TransformFilter {
-    fn default() -> Self {
-        TransformFilter::All
-    }
 }
 
 /// Top-level scan configuration produced by CLI parsing.
