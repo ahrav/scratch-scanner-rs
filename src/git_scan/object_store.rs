@@ -57,6 +57,7 @@ use std::fs;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::errors::TreeDiffError;
 use super::midx::MidxView;
@@ -304,6 +305,62 @@ struct LoadedObject {
     chain_len: u8,
 }
 
+/// Immutable repository layout shared by object store instances.
+///
+/// This contains repo-level metadata that is expensive to recompute and does
+/// not change per worker: parsed MIDX view, resolved pack paths, and loose
+/// object directories. Callers can build one layout and open multiple
+/// per-worker [`ObjectStore`] instances from it.
+#[derive(Debug, Clone)]
+pub(super) struct ObjectStoreLayout<'a> {
+    oid_len: u8,
+    midx: MidxView<'a>,
+    pack_paths: Arc<[PathBuf]>,
+    loose_dirs: Arc<[PathBuf]>,
+}
+
+impl<'a> ObjectStoreLayout<'a> {
+    /// Builds shared object-store layout from repository artifacts.
+    ///
+    /// This performs MIDX parse/validation plus pack/loose directory
+    /// resolution once so worker-local stores can skip repeating it.
+    pub(super) fn from_repo(repo: &'a RepoJobState) -> Result<Self, TreeDiffError> {
+        let midx_bytes =
+            repo.mmaps
+                .midx
+                .as_ref()
+                .ok_or_else(|| TreeDiffError::ObjectStoreError {
+                    detail: "midx bytes missing".to_string(),
+                })?;
+        let midx =
+            MidxView::parse(midx_bytes.as_slice(), repo.object_format).map_err(store_error)?;
+        Self::from_midx(repo, midx)
+    }
+
+    /// Builds shared object-store layout using a pre-parsed MIDX view.
+    pub(super) fn from_midx(
+        repo: &RepoJobState,
+        midx: MidxView<'a>,
+    ) -> Result<Self, TreeDiffError> {
+        let pack_dirs = collect_pack_dirs(&repo.paths);
+        let pack_names = list_pack_files(&pack_dirs)?;
+        // Ensure every on-disk pack file is represented in the MIDX so
+        // pack lookups are complete across alternates.
+        midx.verify_completeness(pack_names.iter().map(|n| n.as_slice()))
+            .map_err(store_error)?;
+
+        let pack_paths = Arc::<[PathBuf]>::from(resolve_pack_paths(&midx, &pack_dirs)?);
+        let loose_dirs = Arc::<[PathBuf]>::from(collect_loose_dirs(&repo.paths));
+
+        Ok(Self {
+            oid_len: repo.object_format.oid_len(),
+            midx,
+            pack_paths,
+            loose_dirs,
+        })
+    }
+}
+
 /// Pack/loose object store for tree loading.
 ///
 /// Holds a borrowed MIDX view (tied to the repo job's bytes view lifetime) and
@@ -317,9 +374,9 @@ pub struct ObjectStore<'a> {
     oid_len: u8,
     max_object_bytes: usize,
     midx: MidxView<'a>,
-    pack_paths: Vec<PathBuf>,
+    pack_paths: Arc<[PathBuf]>,
     pack_cache: Vec<Option<BytesView>>,
-    loose_dirs: Vec<PathBuf>,
+    loose_dirs: Arc<[PathBuf]>,
     tree_cache: TreeCache,
     tree_delta_cache: TreeDeltaCache,
     spill: Option<SpillArena>,
@@ -374,28 +431,20 @@ impl<'a> ObjectStore<'a> {
         spill_dir: &Path,
         tree_delta_cache: TreeDeltaCache,
     ) -> Result<Self, TreeDiffError> {
-        let midx_bytes =
-            repo.mmaps
-                .midx
-                .as_ref()
-                .ok_or_else(|| TreeDiffError::ObjectStoreError {
-                    detail: "midx bytes missing".to_string(),
-                })?;
+        let layout = ObjectStoreLayout::from_repo(repo)?;
+        Self::open_with_layout(&layout, limits, spill_dir, tree_delta_cache)
+    }
 
-        let midx =
-            MidxView::parse(midx_bytes.as_slice(), repo.object_format).map_err(store_error)?;
-
-        let pack_dirs = collect_pack_dirs(&repo.paths);
-        let pack_names = list_pack_files(&pack_dirs)?;
-        // Ensure every on-disk pack file is represented in the MIDX so
-        // pack lookups are complete across alternates.
-        midx.verify_completeness(pack_names.iter().map(|n| n.as_slice()))
-            .map_err(store_error)?;
-
-        let pack_paths = resolve_pack_paths(&midx, &pack_dirs)?;
-        let pack_cache = vec![None; pack_paths.len()];
-
-        let loose_dirs = collect_loose_dirs(&repo.paths);
+    /// Opens an object store from a shared immutable layout.
+    ///
+    /// This avoids recomputing repo/pack discovery work for each store.
+    pub(super) fn open_with_layout(
+        layout: &ObjectStoreLayout<'a>,
+        limits: &TreeDiffLimits,
+        spill_dir: &Path,
+        tree_delta_cache: TreeDeltaCache,
+    ) -> Result<Self, TreeDiffError> {
+        let pack_cache = vec![None; layout.pack_paths.len()];
         let tree_cache = TreeCache::new(limits.max_tree_cache_bytes);
         let max_object_bytes = limits.max_tree_bytes_in_flight.min(usize::MAX as u64) as usize;
         let spill = SpillArena::new(spill_dir, limits.max_tree_spill_bytes).map_err(store_error)?;
@@ -404,12 +453,12 @@ impl<'a> ObjectStore<'a> {
         let spill_index = SpillIndex::new(spill_index_entries);
 
         Ok(Self {
-            oid_len: repo.object_format.oid_len(),
+            oid_len: layout.oid_len,
             max_object_bytes,
-            midx,
-            pack_paths,
+            midx: layout.midx,
+            pack_paths: Arc::clone(&layout.pack_paths),
             pack_cache,
-            loose_dirs,
+            loose_dirs: Arc::clone(&layout.loose_dirs),
             tree_cache,
             tree_delta_cache,
             spill: Some(spill),
@@ -716,7 +765,7 @@ impl<'a> ObjectStore<'a> {
         let dir_name = String::from_utf8_lossy(dir);
         let file_name = String::from_utf8_lossy(file);
 
-        for base in &self.loose_dirs {
+        for base in self.loose_dirs.iter() {
             let path = base.join(dir_name.as_ref()).join(file_name.as_ref());
             let data = match fs::read(&path) {
                 Ok(data) => data,
@@ -750,8 +799,7 @@ impl<'a> ObjectStore<'a> {
             .get(idx)
             .ok_or_else(|| TreeDiffError::ObjectStoreError {
                 detail: format!("pack id {pack_id} out of bounds"),
-            })?
-            .clone();
+            })?;
 
         if self.pack_cache.get(idx).is_none() {
             return Err(TreeDiffError::ObjectStoreError {
@@ -760,7 +808,7 @@ impl<'a> ObjectStore<'a> {
         }
 
         if self.pack_cache[idx].is_none() {
-            let file = File::open(&path).map_err(|err| TreeDiffError::ObjectStoreError {
+            let file = File::open(path).map_err(|err| TreeDiffError::ObjectStoreError {
                 detail: format!("failed to open pack {}: {err}", path.display()),
             })?;
             // SAFETY: `Mmap::map` requires that the file is not concurrently

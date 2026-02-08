@@ -107,7 +107,7 @@ impl RunHeader {
 /// runs to allow dedupe and merge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RunContext {
-    /// Commit-graph position identifying the introducing commit.
+    /// Commit-graph position associated with this serialized candidate context.
     pub commit_id: u32,
     /// Parent index in the commit's parent list.
     pub parent_idx: u8,

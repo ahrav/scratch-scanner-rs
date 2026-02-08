@@ -1,7 +1,7 @@
 # Git Scanning Pipeline
 
-This document describes the end-to-end Git scanning pipeline and its
-deterministic persistence contract.
+This document describes the end-to-end Git scanning pipeline, its persistence
+contract, and ODB-blob attribution semantics.
 
 ## Flow Diagram
 
@@ -43,10 +43,17 @@ flowchart LR
 - Metadata artifacts are accessed through read-only byte views (mmap-backed in production).
 - Preflight reports pack-count maintenance recommendations separately; pack count does not block scans.
 - Pack execution mmaps are bounded by explicit pack count and total byte limits.
-- Candidate ordering is deterministic and stable across spill boundaries.
+- Candidate ordering is deterministic through diff-history spill/merge and
+  pack-exec reassembly.
+- In ODB-blob mode with `blob_intro_workers > 1`, unique blob discovery is
+  stable, but blob attribution context (`commit_id`, path, flags) is
+  race-winner based and can vary across worker counts.
 - Findings are deduped per blob and stored as `(start, end, rule_id, norm_hash)`.
 - No raw secret bytes are persisted; only hashes and metadata are stored.
 - Persistence is atomic: data ops and (when complete) watermark ops are committed together.
+- Incremental correctness depends on `seen_blob` markers and ref watermarks;
+  `blob_ctx` is metadata and is not a deterministic contract in parallel
+  ODB-blob mode.
 - Loose candidates are scanned via bounded loose-object decode; non-blob or
   missing loose objects are recorded as explicit skips.
 - Any decode skips or missing/corrupt loose objects result in `FinalizeOutcome::Partial`.
@@ -67,7 +74,9 @@ mode) and pack planning/execution introduce parallelism:
   ensures each tree/blob is claimed by exactly one worker. Cache budgets
   (tree cache, delta cache, spill arena, packed cap, loose cap, path arena)
   are divided per worker with floor/cap clamping. After all workers finish,
-  results are merged and global caps are re-validated.
+  results are merged and global caps are re-validated. The worker that first
+  claims a blob determines that blob's emitted context (`commit_id`, path,
+  flags), so attribution is not deterministic across worker counts.
 
 - **Pack planning** runs on a dedicated thread (`std::thread::scope`) that
   streams `PackPlan` values through a bounded `sync_channel(1)` while the
@@ -96,6 +105,10 @@ Finalize produces two batches:
 Persist commits `data_ops` and (when complete) `watermark_ops` in a single
 atomic batch. If the run is partial, watermark ops are skipped to avoid
 advancing ref tips past unscanned blobs.
+
+`blob_ctx` (`bc\0`) values are persisted metadata. They are not used for seen
+filtering or watermark advancement and are not a cross-worker determinism
+contract in parallel ODB-blob mode.
 
 ## Simulation Harness
 

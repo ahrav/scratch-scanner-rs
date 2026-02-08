@@ -136,7 +136,7 @@ graph TB
 | **Run Merger**      | `src/git_scan/spill_merge.rs` | K-way merge of spill runs with canonical dedupe                     |
 | **Spiller**         | `src/git_scan/spiller.rs`     | Orchestrates chunking, spilling, and global merge                   |
 | **Seen Blob Store** | `src/git_scan/seen_store.rs`  | Batched seen-blob checks for filtering already scanned blobs         |
-| **Finalize Builder** | `src/git_scan/finalize.rs` | Builds deterministic blob_ctx/finding/seen_blob + ref_watermark ops |
+| **Finalize Builder** | `src/git_scan/finalize.rs` | Builds stably ordered blob_ctx/finding/seen_blob + ref_watermark ops |
 | **Persistence Store** | `src/git_scan/persist.rs` | Two-phase persistence contract for data ops then watermarks |
 | **RocksDB Store** | `src/git_scan/persist_rocksdb.rs` | RocksDB adapter for persistence, seen-blob checks, and watermarks |
 | **Git Scan Runner** | `src/git_scan/runner.rs` | End-to-end orchestration across all Git scan stages |
@@ -192,15 +192,16 @@ keeps only a bounded buffer of tree bytes in RAM while iterating entries.
 
 ## Git Scan Modes
 
-**Diff-history mode (default)** uses tree diffs across the commit plan to emit
+**Diff-history mode** uses tree diffs across the commit plan to emit
 candidate blobs with per-commit context. This path feeds the spill/dedupe and
 mapping stages before pack planning and execution.
 
-**ODB-blob mode** replaces per-commit diffs with a single pass that
-discovers each unique blob once (first-introduced semantics) and then scans blobs
-in pack-offset order. Attribution is default in this mode: blobs are tagged with
-the first-seen commit position and a representative path, derived from a
-commit-graph traversal. It reuses the same pack decode and engine adapter stages
+**ODB-blob mode** replaces per-commit diffs with a single pass that discovers
+each unique blob once and then scans blobs in pack-offset order. In serial
+introduction, attribution uses introducing-commit traversal context. In parallel
+introduction (`blob_intro_workers > 1`), the blob set is unchanged but selected
+`(commit_id, path, flags)` context is race-winner based and not deterministic
+across worker counts. It reuses the same pack decode and engine adapter stages
 but eliminates redundant tree diff work.
 
 ## Git Blob Introducer (ODB-blob mode)
@@ -213,8 +214,9 @@ Loose blobs missing from the MIDX are deduped in fixed-capacity open-addressing
 sets. Paths are assembled in a reusable buffer and classified via `PathClass`
 to set candidate flags. Excluded paths are tracked separately so a blob can
 still be emitted when it later appears under a non-excluded path. The
-introducer emits candidates with `ChangeKind::Add` and uses the introducing
-commit position for attribution.
+introducer emits candidates with `ChangeKind::Add`. Serial mode uses
+introducing-commit attribution; parallel mode uses the context from whichever
+worker first claims the blob/tree in shared seen sets.
 
 ## Pack Candidate Collector (ODB-blob mode)
 
@@ -264,7 +266,7 @@ in shard order to preserve deterministic output.
 
 ## Git Finalize + Persist
 
-Finalize converts scanned blob results into deterministic write ops for
+Finalize converts scanned blob results into stably ordered write ops for
 blob_ctx, finding, and seen_blob namespaces plus ref watermark updates.
 Persistence writes data ops first, then advances ref watermarks only for
 complete runs to avoid skipping unscanned blobs.

@@ -21,7 +21,7 @@
 //! # Modes
 //! - **Diff-history**: walk commits, diff trees, spill/dedupe candidates, then
 //!   batch-plan and execute pack decode + scan.
-//! - **ODB-blob fast**: compute first-introduced blobs from the commit graph,
+//! - **ODB-blob fast**: compute the unique blob set from the commit graph,
 //!   then scan in pack order with streaming plan generation; retries via
 //!   spill/dedupe on candidate cap overflow.
 //!
@@ -175,6 +175,8 @@ pub struct GitScanConfig {
     /// Workers share an `AtomicSeenSets` bitmap for deduplication and each
     /// get their own `ObjectStore`, tree cache, and candidate collector.
     /// Cache budgets are divided by this count to keep total memory constant.
+    /// In parallel mode, blob attribution context (`commit_id`, path, flags)
+    /// is race-winner based and not deterministic across worker counts.
     ///
     /// Set to 1 to disable parallel blob intro (serial path).
     /// Capped at 8 because inflate is memory-bandwidth-bound and shows
@@ -252,7 +254,7 @@ fn default_blob_intro_workers() -> usize {
 pub enum GitScanMode {
     /// Current diff-history pipeline (tree diff + spill + mapping + pack plan).
     DiffHistory,
-    /// ODB-blob fast path (first-introduced blob walk + pack-order scan).
+    /// ODB-blob fast path (unique-blob walk + pack-order scan).
     #[default]
     OdbBlobFast,
 }

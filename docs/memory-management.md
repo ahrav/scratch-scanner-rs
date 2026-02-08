@@ -88,8 +88,8 @@ The unified scanner writes findings through a streaming `EventSink`
 This keeps output-path memory bounded to sink/writer buffers plus per-worker
 scratch vectors.
 
-Git scanning still retains per-run metadata required for deterministic
-finalize/persist (`ScannedBlobs`), but finding emission to stdout is streamed.
+Git scanning still retains per-run metadata required for finalize/persist
+(`ScannedBlobs`), but finding emission to stdout is streamed.
 ---
 
 ## Git Tree Loading Budgets
@@ -186,7 +186,7 @@ ODB-blob mode allocates fixed-capacity data structures once at startup:
   lookup structure used by the blob introducer.
 - **Commit graph index**: SoA arrays (commit OID, root tree OID, committer
   timestamp) sized to `commit_graph.num_commits` for cache-friendly lookups
-  during first-seen attribution.
+  during blob attribution.
 - **Seen sets**: two `DynamicBitSet`s (trees + blobs) sized to
   `midx.object_count` to guarantee each tree or blob is processed once.
 - **Loose OID sets**: open-addressed tables for loose blob OIDs (seen +
@@ -237,6 +237,10 @@ When parallel blob introduction is enabled, the memory model changes:
   tree cache, delta cache, and spill arena) and `PackCandidateCollector`.
   No per-worker state is shared except the `AtomicSeenSets` and the
   work-stealing chunk counter.
+- **Attribution semantics**: parallel mode keeps the same unique blob set as
+  serial mode, but emitted context (`commit_id`, path, flags) is race-winner
+  based and not deterministic across worker counts. This does not change any
+  of the memory bounds above.
 
 ## Git Pack Planning Budgets
 

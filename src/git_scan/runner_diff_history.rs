@@ -56,7 +56,7 @@ use crate::Engine;
 use super::commit_walk::{CommitGraph, ParentScratch, PlannedCommit};
 use super::engine_adapter::{EngineAdapter, ScannedBlobs};
 use super::mapping_bridge::{MappingBridge, MappingBridgeConfig};
-use super::object_store::ObjectStore;
+use super::object_store::{ObjectStore, ObjectStoreLayout};
 use super::pack_candidates::CappedPackCandidateSink;
 use super::pack_io::PackIo;
 use super::pack_plan::build_pack_plans;
@@ -130,6 +130,7 @@ pub(super) fn run_diff_history(
 
     let mut spiller = Spiller::new(config.spill, repo.object_format.oid_len(), &spill_dir)?;
     let midx = load_midx(repo)?;
+    let object_store_layout = ObjectStoreLayout::from_midx(repo, midx)?;
     // Scale tree delta-cache to repo size to reduce repeated base decode work
     // while staying within the configured max cache budget.
     let auto_cache_bytes = auto_tree_delta_cache_bytes(
@@ -137,8 +138,8 @@ pub(super) fn run_diff_history(
         config.tree_diff.max_tree_delta_cache_bytes,
     );
     let tree_delta_cache = TreeDeltaCache::new(auto_cache_bytes);
-    let mut object_store = ObjectStore::open_with_tree_delta_cache(
-        repo,
+    let mut object_store = ObjectStore::open_with_layout(
+        &object_store_layout,
         &config.tree_diff,
         &spill_dir,
         tree_delta_cache,

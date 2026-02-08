@@ -231,6 +231,7 @@ mod tests {
     use super::*;
     use crate::api::ValidatorKind;
     use crate::rules::builtin_rules;
+    use std::path::Path;
 
     /// Convert `RuleSpec` back to YAML intermediate type for round-trip testing.
     fn rulespec_to_yaml(rule: &RuleSpec) -> YamlRule {
@@ -292,16 +293,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn roundtrip_builtin_rules() {
-        let original_rules = builtin_rules();
-
-        // Convert to YAML and back.
-        let yaml_rules: Vec<YamlRule> = original_rules.iter().map(rulespec_to_yaml).collect();
-        let file = YamlRulesFile { rules: yaml_rules };
-        let yaml_str = serde_yml::to_string(&file).expect("serialize to YAML");
-        let parsed_rules = parse_yaml_rules(&yaml_str).expect("parse YAML rules");
-
+    fn assert_rules_equal(original_rules: &[RuleSpec], parsed_rules: &[RuleSpec]) {
         assert_eq!(
             original_rules.len(),
             parsed_rules.len(),
@@ -467,6 +459,27 @@ mod tests {
     }
 
     #[test]
+    fn default_rules_yaml_matches_builtin_rules() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("default_rules.yaml");
+        let yaml_str = std::fs::read_to_string(&path).expect("read default_rules.yaml");
+        let parsed_rules = parse_yaml_rules(&yaml_str).expect("parse default_rules.yaml");
+        let expected_rules = builtin_rules();
+        assert_rules_equal(&expected_rules, &parsed_rules);
+    }
+
+    #[test]
+    fn roundtrip_builtin_rules() {
+        let original_rules = builtin_rules();
+
+        // Convert to YAML and back.
+        let yaml_rules: Vec<YamlRule> = original_rules.iter().map(rulespec_to_yaml).collect();
+        let file = YamlRulesFile { rules: yaml_rules };
+        let yaml_str = serde_yml::to_string(&file).expect("serialize to YAML");
+        let parsed_rules = parse_yaml_rules(&yaml_str).expect("parse YAML rules");
+        assert_rules_equal(&original_rules, &parsed_rules);
+    }
+
+    #[test]
     fn builtin_rules_use_no_fast_validators() {
         let rules = builtin_rules();
         assert!(!rules.is_empty(), "builtin rule set should not be empty");
@@ -530,6 +543,15 @@ rules:
         // load_rules catches the NoRules case.
         let rules = parse_yaml_rules(yaml).expect("parse empty rules");
         assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn parse_invalid_yaml_returns_yaml_error() {
+        let yaml = "{{{{not valid yaml";
+        match parse_yaml_rules(yaml) {
+            Err(RulesError::Yaml(_)) => {}
+            other => panic!("expected Yaml error, got: {other:?}"),
+        }
     }
 
     #[test]

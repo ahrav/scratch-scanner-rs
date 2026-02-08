@@ -39,7 +39,11 @@ impl ChangeKind {
 /// identical serialized context.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CandidateContext {
-    /// Commit-graph position identifying which commit introduced this blob.
+    /// Commit-graph position for this candidate context.
+    ///
+    /// In serial introduced-by walks this is the introducing commit position.
+    /// In parallel ODB-blob introduction, this can be the race-winner
+    /// observation context.
     pub commit_id: u32,
     /// Index of the parent in the commit's parent list.
     pub parent_idx: u8,
@@ -69,7 +73,7 @@ pub struct ResolvedCandidate<'a> {
     pub oid: OidBytes,
     /// Full path bytes (borrowed from the candidate buffer).
     pub path: &'a [u8],
-    /// Commit-graph position identifying the introducing commit.
+    /// Commit-graph position associated with this emitted candidate context.
     pub commit_id: u32,
     /// Parent index in the commit's parent list.
     pub parent_idx: u8,

@@ -1,4 +1,4 @@
-//! First-introduced blob walk for ODB-blob scan mode.
+//! Blob introduction walk for ODB-blob scan mode.
 //!
 //! This module traverses commits in topological order and discovers each
 //! unique blob exactly once. It maintains seen-set bitmaps keyed by MIDX
@@ -14,11 +14,15 @@
 //! spawns multiple [`BlobIntroWorker`]s that share a single
 //! [`AtomicSeenSets`]. Each tree/blob is claimed by exactly one worker
 //! via `fetch_or` (mark-then-traverse), matching the GC mark-phase
-//! architecture. Commit attribution is non-deterministic (race winner),
-//! but the blob SET is identical to the serial path.
+//! architecture. Commit attribution is not a deterministic contract in
+//! parallel mode (packed attribution is race-winner). For loose blobs,
+//! per-worker duplicates are merged with deterministic context tie-breakers.
+//! The blob SET is identical to the serial path.
 //!
 //! # Invariants
-//! - Seen sets are sized to `midx.object_count` and never grow.
+//! - Seen sets are sized from `midx.object_count` and never grow
+//!   (the caller applies a capacity floor of 1 when the MIDX is empty
+//!   because `AtomicSeenSets` panics on zero capacity).
 //! - OID indices must be validated before use (caller responsibility).
 //! - Tree and blob indices share the same index space but are tracked
 //!   independently to avoid false positives.
@@ -35,7 +39,7 @@ use super::byte_arena::ByteArena;
 use super::errors::{MappingCandidateKind, TreeDiffError};
 use super::midx::MidxView;
 use super::object_id::OidBytes;
-use super::object_store::{ObjectStore, TreeBytes};
+use super::object_store::{ObjectStore, ObjectStoreLayout, TreeBytes};
 use super::oid_index::OidIndex;
 use super::pack_candidates::{LooseCandidate, PackCandidate, PackCandidateCollector};
 use super::path_policy::{classify_path, is_excluded_path};
@@ -560,7 +564,7 @@ impl BlobIntroducer {
         self.loose_excluded.clear();
     }
 
-    /// Walks the commit plan and emits first-introduced blob candidates.
+    /// Walks the commit plan and emits unique blob candidates.
     ///
     /// On error, clears traversal state so the introducer can be reused after
     /// handling the failure. Seen sets are preserved; call `reset_seen` if needed.
@@ -1003,11 +1007,12 @@ impl<'a> BlobIntroWorker<'a> {
 
                     if excluded {
                         if let Some(idx) = idx {
-                            if self.seen.is_blob_excluded(idx as usize) {
+                            // `mark_blob_excluded` is a test-and-set in the atomic
+                            // seen set; use it directly to avoid a separate atomic read.
+                            if !self.seen.mark_blob_excluded(idx as usize) {
                                 self.path_builder.pop_leaf(leaf_start);
                                 continue;
                             }
-                            self.seen.mark_blob_excluded(idx as usize);
                         } else {
                             if self.loose_excluded.contains(&oid) {
                                 self.path_builder.pop_leaf(leaf_start);
@@ -1068,8 +1073,9 @@ pub(super) struct ParallelIntroResult {
 ///
 /// Pre-partitions `plan` into `~4 × worker_count` chunks. Workers claim
 /// chunks via an atomic counter (work-stealing pattern). Each worker has
-/// its own `ObjectStore` and `PackCandidateCollector`; dedup is shared
-/// through `AtomicSeenSets`.
+/// its own mutable `ObjectStore` caches and `PackCandidateCollector`; shared
+/// immutable repo/pack layout is reused via [`ObjectStoreLayout`]. Dedup is
+/// shared through `AtomicSeenSets`.
 ///
 /// Cache budgets (`max_tree_cache_bytes`, `max_tree_delta_cache_bytes`,
 /// `max_tree_spill_bytes`) are divided by `worker_count` with a floor
@@ -1079,7 +1085,7 @@ pub(super) struct ParallelIntroResult {
 /// - Packed/loose candidates are concatenated.
 /// - Path arenas are merged with offset rebasing (checked_add overflow),
 ///   bounded by the global `mapping_cfg_path_arena_capacity`.
-/// - Loose candidates are deduplicated by OID.
+/// - Loose candidates are deduplicated by OID with deterministic context tie-breakers.
 /// - Global packed/loose caps are re-validated after merge.
 /// - Stats use saturating sum for counters and max for peaks.
 #[allow(clippy::too_many_arguments)]
@@ -1088,6 +1094,7 @@ pub(super) fn introduce_parallel<'a>(
     repo: &RepoJobState,
     config: &GitScanConfig,
     spill_dir: &Path,
+    object_store_layout: &ObjectStoreLayout<'a>,
     cg: &CommitGraphIndex,
     plan: &[PlannedCommit],
     midx: &MidxView<'a>,
@@ -1115,15 +1122,26 @@ pub(super) fn introduce_parallel<'a>(
     let abort = AtomicBool::new(false);
 
     let object_count = midx.object_count();
+    let seen_len = (object_count as usize).max(1);
 
     // Shared AtomicSeenSets sized to MIDX object count.
-    let seen = AtomicSeenSets::new(object_count as usize, object_count as usize);
+    // `AtomicSeenSets` disallows zero capacity, but a valid MIDX can have zero
+    // objects when a repository has no packs. In that case all lookups miss and
+    // packed indices are never marked, so a capacity floor of 1 is safe.
+    let seen = AtomicSeenSets::new(seen_len, seen_len);
 
     // Per-worker budget division.
-    let per_worker_tree_cache =
-        (config.tree_diff.max_tree_cache_bytes / worker_count as u32).max(4 * 1024 * 1024); // 4 MB floor
-    let per_worker_delta_cache =
-        (config.tree_diff.max_tree_delta_cache_bytes / worker_count as u32).max(4 * 1024 * 1024); // 4 MB floor
+    let divided_tree_cache = config.tree_diff.max_tree_cache_bytes / worker_count as u32;
+    let per_worker_tree_cache = divided_tree_cache.max(4 * 1024 * 1024); // 4 MB floor
+    let divided_delta_cache = config.tree_diff.max_tree_delta_cache_bytes / worker_count as u32;
+    let per_worker_delta_cache = divided_delta_cache.max(4 * 1024 * 1024); // 4 MB floor
+    if per_worker_delta_cache > divided_delta_cache {
+        eprintln!(
+            "note: per-worker delta cache floor (4 MiB) exceeds divided budget ({} KiB); \
+             total memory will exceed configured max",
+            divided_delta_cache / 1024,
+        );
+    }
     let per_worker_spill = config.tree_diff.max_tree_spill_bytes / worker_count as u64;
     let per_worker_spill = per_worker_spill.max(64 * 1024 * 1024); // 64 MB floor
     let per_worker_in_flight =
@@ -1162,8 +1180,8 @@ pub(super) fn introduce_parallel<'a>(
                     let auto_cache_bytes =
                         auto_cache_fn(object_count, per_worker_limits.max_tree_delta_cache_bytes);
                     let tree_delta_cache = TreeDeltaCache::new(auto_cache_bytes);
-                    let mut object_store = ObjectStore::open_with_tree_delta_cache(
-                        repo,
+                    let mut object_store = ObjectStore::open_with_layout(
+                        object_store_layout,
                         per_worker_limits,
                         spill_dir,
                         tree_delta_cache,
@@ -1320,8 +1338,8 @@ fn merge_worker_results(
             .max(wr.stats.max_depth_reached);
     }
 
-    // Deduplicate loose candidates by OID (keep first occurrence).
-    dedup_loose_by_oid(&mut all_loose);
+    // Deduplicate loose candidates by OID with deterministic context tie-breakers.
+    dedup_loose_by_oid(&mut all_loose, &merged_arena);
 
     // Post-merge validation: ensure the merged totals respect the global caps.
     // Per-worker limits are divided approximations; the merged result can exceed
@@ -1360,13 +1378,63 @@ fn per_worker_loose_limit(max_loose: u32, worker_count: usize) -> u32 {
     max_loose.div_ceil(workers).max(1).min(max_loose)
 }
 
-/// Deduplicates loose candidates by OID, keeping the first occurrence.
-fn dedup_loose_by_oid(loose: &mut Vec<LooseCandidate>) {
+/// Deduplicates loose candidates by OID with deterministic context tie-breakers.
+///
+/// Ordering is:
+/// `oid`, `commit_id`, `path bytes`, `parent_idx`, `change_kind`,
+/// `ctx_flags`, `cand_flags`, `path_ref.off`, `path_ref.len`.
+/// See [`cmp_loose_dedup_key`] for the full ordering rationale.
+fn dedup_loose_by_oid(loose: &mut Vec<LooseCandidate>, path_arena: &ByteArena) {
     if loose.len() <= 1 {
         return;
     }
-    loose.sort_unstable_by(|a, b| a.oid.cmp(&b.oid));
+    loose.sort_unstable_by(|a, b| cmp_loose_dedup_key(a, b, path_arena));
     loose.dedup_by(|a, b| a.oid == b.oid);
+}
+
+/// Total ordering for [`LooseCandidate`] used by [`dedup_loose_by_oid`].
+///
+/// Primary key is `oid` so that `dedup_by` (which removes *consecutive*
+/// duplicates) collapses all entries for the same blob.  The secondary
+/// chain is a tie-breaker that decides *which* context survives dedup:
+/// `sort_unstable_by` is not stable, but the first element in each
+/// equal-oid run is kept by `dedup_by`, so the tie-breaker controls
+/// which observation context wins.
+///
+/// Tie-breaker order (most-significant first):
+///
+/// 1. `commit_id` — prefer the earliest commit-graph position.
+/// 2. path bytes  — lexicographic on the raw path (resolved from arena).
+/// 3. `parent_idx` — prefer the first parent diff.
+/// 4. `change_kind` — Add before Modify (lower discriminant wins).
+/// 5. `ctx_flags` / `cand_flags` — deterministic but rarely differ.
+/// 6. `path_ref.off` / `path_ref.len` — arena coordinates break ties
+///    when two arena entries hold byte-identical paths at different
+///    offsets (possible after cross-worker arena merges).  Without this,
+///    the ordering would be partial and `sort_unstable_by` could yield
+///    non-deterministic survivor selection across runs.
+#[inline]
+fn cmp_loose_dedup_key(
+    a: &LooseCandidate,
+    b: &LooseCandidate,
+    path_arena: &ByteArena,
+) -> std::cmp::Ordering {
+    a.oid.cmp(&b.oid).then_with(|| {
+        let a_path = path_arena.get(a.ctx.path_ref);
+        let b_path = path_arena.get(b.ctx.path_ref);
+        a.ctx
+            .commit_id
+            .cmp(&b.ctx.commit_id)
+            .then_with(|| a_path.cmp(b_path))
+            .then_with(|| a.ctx.parent_idx.cmp(&b.ctx.parent_idx))
+            .then_with(|| a.ctx.change_kind.as_u8().cmp(&b.ctx.change_kind.as_u8()))
+            .then_with(|| a.ctx.ctx_flags.cmp(&b.ctx.ctx_flags))
+            .then_with(|| a.ctx.cand_flags.cmp(&b.ctx.cand_flags))
+            // Arena coordinates make the ordering total when two entries
+            // share byte-identical paths at different arena offsets.
+            .then_with(|| a.ctx.path_ref.off.cmp(&b.ctx.path_ref.off))
+            .then_with(|| a.ctx.path_ref.len.cmp(&b.ctx.path_ref.len))
+    })
 }
 
 #[cfg(test)]
@@ -1419,6 +1487,40 @@ mod tests {
         WorkerResult {
             packed: Vec::new(),
             loose: Vec::new(),
+            path_arena: arena,
+            stats: BlobIntroStats::default(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn worker_result_with_loose_context(
+        oid_byte: u8,
+        path: &[u8],
+        commit_id: u32,
+        parent_idx: u8,
+        change_kind: ChangeKind,
+        ctx_flags: u16,
+        cand_flags: u16,
+    ) -> WorkerResult {
+        let mut arena = ByteArena::with_capacity(path.len() as u32);
+        let path_ref = if path.is_empty() {
+            ByteRef::new(0, 0)
+        } else {
+            arena.intern(path).expect("path intern")
+        };
+        WorkerResult {
+            packed: Vec::new(),
+            loose: vec![LooseCandidate {
+                oid: oid(oid_byte),
+                ctx: CandidateContext {
+                    commit_id,
+                    parent_idx,
+                    change_kind,
+                    ctx_flags,
+                    cand_flags,
+                    path_ref,
+                },
+            }],
             path_arena: arena,
             stats: BlobIntroStats::default(),
         }
@@ -1518,5 +1620,82 @@ mod tests {
             Err(other) => panic!("unexpected error: {other:?}"),
             Ok(_) => panic!("expected loose cap error"),
         }
+    }
+
+    #[test]
+    fn merge_loose_dedup_uses_deterministic_context_tiebreaker() {
+        let path = b"shared/path";
+        let workers = vec![
+            worker_result_with_loose_context(7, path, 42, 2, ChangeKind::Modify, 10, 10),
+            worker_result_with_loose_context(7, path, 42, 1, ChangeKind::Modify, 10, 10),
+            worker_result_with_loose_context(7, path, 42, 1, ChangeKind::Add, 11, 10),
+            worker_result_with_loose_context(7, path, 42, 1, ChangeKind::Add, 1, 10),
+            worker_result_with_loose_context(7, path, 42, 1, ChangeKind::Add, 1, 1),
+        ];
+
+        let merged = merge_worker_results(workers, 256, 10, 10).expect("merge succeeds");
+        assert_eq!(merged.loose.len(), 1);
+        let winner = merged.loose[0];
+        assert_eq!(winner.ctx.commit_id, 42);
+        assert_eq!(winner.ctx.parent_idx, 1);
+        assert_eq!(winner.ctx.change_kind, ChangeKind::Add);
+        assert_eq!(winner.ctx.ctx_flags, 1);
+        assert_eq!(winner.ctx.cand_flags, 1);
+        assert_eq!(merged.path_arena.get(winner.ctx.path_ref), path);
+    }
+
+    #[test]
+    fn merge_loose_dedup_is_input_order_invariant() {
+        let a = worker_result_with_loose_context(9, b"zeta/path", 5, 0, ChangeKind::Add, 0, 0);
+        let b = worker_result_with_loose_context(9, b"alpha/path", 5, 2, ChangeKind::Modify, 9, 9);
+
+        let merged_ab = merge_worker_results(vec![a, b], 256, 10, 10).expect("merge succeeds");
+        let merged_ba = merge_worker_results(
+            vec![
+                worker_result_with_loose_context(9, b"alpha/path", 5, 2, ChangeKind::Modify, 9, 9),
+                worker_result_with_loose_context(9, b"zeta/path", 5, 0, ChangeKind::Add, 0, 0),
+            ],
+            256,
+            10,
+            10,
+        )
+        .expect("merge succeeds");
+
+        assert_eq!(merged_ab.loose.len(), 1);
+        assert_eq!(merged_ba.loose.len(), 1);
+
+        let winner_ab = merged_ab.loose[0];
+        let winner_ba = merged_ba.loose[0];
+        assert_eq!(winner_ab.oid, winner_ba.oid);
+        assert_eq!(winner_ab.ctx.commit_id, winner_ba.ctx.commit_id);
+        assert_eq!(winner_ab.ctx.parent_idx, winner_ba.ctx.parent_idx);
+        assert_eq!(winner_ab.ctx.change_kind, winner_ba.ctx.change_kind);
+        assert_eq!(winner_ab.ctx.ctx_flags, winner_ba.ctx.ctx_flags);
+        assert_eq!(winner_ab.ctx.cand_flags, winner_ba.ctx.cand_flags);
+        assert_eq!(
+            merged_ab.path_arena.get(winner_ab.ctx.path_ref),
+            merged_ba.path_arena.get(winner_ba.ctx.path_ref),
+        );
+        assert_eq!(
+            merged_ab.path_arena.get(winner_ab.ctx.path_ref),
+            b"alpha/path"
+        );
+    }
+
+    #[test]
+    fn merge_loose_dedup_prefers_lowest_commit_id() {
+        let path = b"same/path";
+        let workers = vec![
+            worker_result_with_loose_context(7, path, 100, 0, ChangeKind::Add, 0, 0),
+            worker_result_with_loose_context(7, path, 10, 0, ChangeKind::Add, 0, 0),
+            worker_result_with_loose_context(7, path, 50, 0, ChangeKind::Add, 0, 0),
+        ];
+
+        let merged = merge_worker_results(workers, 256, 10, 10).expect("merge succeeds");
+        assert_eq!(merged.loose.len(), 1);
+        assert_eq!(
+            merged.loose[0].ctx.commit_id, 10,
+            "dedup should keep the entry with the lowest commit_id"
+        );
     }
 }

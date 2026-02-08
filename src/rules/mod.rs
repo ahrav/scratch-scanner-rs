@@ -104,7 +104,10 @@ pub(crate) fn load_rules(path: &Path) -> Result<Vec<RuleSpec>, RulesError> {
         return Err(RulesError::NoRules);
     }
 
-    // Validate each rule, catching panics from assert_valid().
+    // Validate each rule, catching assertion panics from assert_valid().
+    // Only string-typed panics (from assert!/panic! macros) are treated as
+    // validation errors. Other panic types (OOM, stack overflow, etc.) are
+    // re-raised because they are not validation failures.
     for rule in &rules {
         let name = rule.name.to_string();
         // SAFETY: AssertUnwindSafe is sound here — assert_valid() performs
@@ -120,7 +123,8 @@ pub(crate) fn load_rules(path: &Path) -> Result<Vec<RuleSpec>, RulesError> {
             } else if let Some(s) = payload.downcast_ref::<String>() {
                 s.clone()
             } else {
-                "unknown validation panic".to_string()
+                // Not an assertion failure — re-raise the original panic.
+                std::panic::resume_unwind(payload);
             };
             return Err(RulesError::Validation {
                 rule_name: name,
@@ -134,13 +138,17 @@ pub(crate) fn load_rules(path: &Path) -> Result<Vec<RuleSpec>, RulesError> {
 
 /// Returns the default rules file path next to the current executable.
 ///
-/// Returns `None` if the executable path cannot be determined.
+/// Returns `None` if the executable path cannot be determined (e.g., `/proc`
+/// not mounted in containers, or the binary has no parent directory).
 pub(crate) fn default_rules_path() -> Option<PathBuf> {
-    std::env::current_exe()
-        .ok()?
-        .parent()?
-        .join("default_rules.yaml")
-        .into()
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("warning: cannot determine executable path: {e}");
+            return None;
+        }
+    };
+    Some(exe.parent()?.join("default_rules.yaml"))
 }
 
 /// The built-in rule set, embedded from `default_rules.yaml` at compile time.
