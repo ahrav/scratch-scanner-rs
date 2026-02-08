@@ -2199,7 +2199,6 @@ fn process_zip_file<E: ScanEngine>(
 ///                    ▼
 ///             release_buffer()
 /// ```
-
 /// Read a file with an extractable binary format, extract text, and scan it.
 ///
 /// Reads the entire file (up to 64 MiB) into `extract_buf`, runs the
@@ -2270,7 +2269,12 @@ fn extract_and_scan_file<E: ScanEngine>(
 
     // Scan the extracted text as a single chunk.
     let engine = &scratch.engine;
-    engine.scan_chunk_into(&scratch.extract_out_buf, task.file_id, 0, &mut scratch.scan_scratch);
+    engine.scan_chunk_into(
+        &scratch.extract_out_buf,
+        task.file_id,
+        0,
+        &mut scratch.scan_scratch,
+    );
 
     scratch.pending.clear();
     scratch
@@ -2816,11 +2820,17 @@ where
                     skip_binary: cfg.skip_binary,
                     binary_probe_buf: [0u8; crate::content_policy::CHECK_LEN],
                     #[cfg(feature = "binary-extract")]
-                    extract_buf: Vec::with_capacity(crate::content_policy::extract::EXTRACT_INPUT_CAP),
+                    extract_buf: Vec::with_capacity(
+                        crate::content_policy::extract::EXTRACT_INPUT_CAP,
+                    ),
                     #[cfg(feature = "binary-extract")]
-                    extract_out_buf: Vec::with_capacity(crate::content_policy::extract::EXTRACT_OUTPUT_CAP),
+                    extract_out_buf: Vec::with_capacity(
+                        crate::content_policy::extract::EXTRACT_OUTPUT_CAP,
+                    ),
                     #[cfg(feature = "binary-extract")]
-                    extract_scratch: Vec::with_capacity(crate::content_policy::extract::JAR_ENTRY_CAP),
+                    extract_scratch: Vec::with_capacity(
+                        crate::content_policy::extract::JAR_ENTRY_CAP,
+                    ),
                 }
             }
         },

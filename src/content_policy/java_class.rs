@@ -196,7 +196,7 @@ mod tests {
         data.extend_from_slice(&MAGIC);
         data.extend_from_slice(&[0, 0, 0, 52]);
         data.extend_from_slice(&4u16.to_be_bytes()); // cp_count=4
-        // Entry 1: CONSTANT_Long (takes slots 1 and 2)
+                                                     // Entry 1: CONSTANT_Long (takes slots 1 and 2)
         data.push(CONSTANT_LONG);
         data.extend_from_slice(&[0u8; 8]);
         // Entry 3: CONSTANT_Utf8
@@ -221,7 +221,7 @@ mod tests {
         // Entry 1: CONSTANT_MethodHandle (1 byte ref_kind + 2 byte ref_index)
         data.push(CONSTANT_METHOD_HANDLE);
         data.extend_from_slice(&[5, 0, 1]); // ref_kind=5, ref_index=1
-        // Entry 2: CONSTANT_Utf8
+                                            // Entry 2: CONSTANT_Utf8
         data.push(CONSTANT_UTF8);
         data.extend_from_slice(&12u16.to_be_bytes());
         data.extend_from_slice(b"after_handle");

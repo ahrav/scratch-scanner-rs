@@ -346,7 +346,12 @@ impl<'a> EngineAdapter<'a> {
                     #[cfg(feature = "binary-extract")]
                     {
                         use crate::content_policy::extract::{extract_content, ExtractResult};
-                        if extract_content(_fmt, bytes, &mut self.extract_buf, &mut self.extract_scratch) == ExtractResult::Ok
+                        if extract_content(
+                            _fmt,
+                            bytes,
+                            &mut self.extract_buf,
+                            &mut self.extract_scratch,
+                        ) == ExtractResult::Ok
                         {
                             perf::record_scan_binary_extract();
                             return scan_blob_chunked_with_chunker(

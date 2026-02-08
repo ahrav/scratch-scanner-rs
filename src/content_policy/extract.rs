@@ -96,7 +96,12 @@ mod tests {
         let mut out = Vec::new();
         let mut scratch = Vec::new();
         assert_eq!(
-            extract_content(ExtractableFormat::JavaClass, b"\xCA\xFE", &mut out, &mut scratch),
+            extract_content(
+                ExtractableFormat::JavaClass,
+                b"\xCA\xFE",
+                &mut out,
+                &mut scratch
+            ),
             ExtractResult::ParseError
         );
         assert!(out.is_empty());
@@ -119,7 +124,12 @@ mod tests {
         let mut out = Vec::new();
         let mut scratch = Vec::new();
         assert_eq!(
-            extract_content(ExtractableFormat::JarWar, b"not a zip", &mut out, &mut scratch),
+            extract_content(
+                ExtractableFormat::JarWar,
+                b"not a zip",
+                &mut out,
+                &mut scratch
+            ),
             ExtractResult::ParseError
         );
     }

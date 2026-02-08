@@ -112,11 +112,10 @@ impl Extractor for PycExtractor {
         // into the marshal stream for pre-3.7 files, which is safe: we may
         // miss one leading marshal object but won't produce garbage.
         let flags = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-        let header_size = if flags & 0x1 != 0 {
-            16 // Hash-based: magic(4) + flags(4) + hash(8)
-        } else {
-            16 // Timestamp-based: magic(4) + flags(4) + timestamp(4) + size(4)
-        };
+        // Both hash-based (magic+flags+hash = 4+4+8) and timestamp-based
+        // (magic+flags+timestamp+size = 4+4+4+4) headers are 16 bytes.
+        let _ = flags;
+        let header_size = 16;
 
         if data.len() < header_size {
             return ExtractResult::ParseError;
@@ -423,7 +422,10 @@ mod tests {
     fn empty_marshal_returns_empty() {
         let pyc = make_pyc(&[]);
         let mut out = Vec::new();
-        assert_eq!(PycExtractor.extract(&pyc, &mut out, &mut Vec::new()), ExtractResult::Empty);
+        assert_eq!(
+            PycExtractor.extract(&pyc, &mut out, &mut Vec::new()),
+            ExtractResult::Empty
+        );
     }
 
     #[test]
@@ -516,7 +518,7 @@ mod tests {
         marshal.push(TYPE_LONG);
         marshal.extend_from_slice(&(-2i32).to_le_bytes()); // negative, 2 digits
         marshal.extend_from_slice(&[0xAB, 0xCD, 0xEF, 0x01]); // 2 × 2 bytes
-        // String after the long.
+                                                              // String after the long.
         marshal.push(TYPE_SHORT_ASCII);
         marshal.push(10);
         marshal.extend_from_slice(b"after_long");
@@ -574,7 +576,7 @@ mod tests {
         let mut marshal = Vec::new();
         marshal.push(TYPE_CODE);
         marshal.extend_from_slice(&[0u8; 24]); // 6 × u32 numeric prefix
-        // After the prefix, sub-fields are marshal objects.
+                                               // After the prefix, sub-fields are marshal objects.
         marshal.push(TYPE_SHORT_ASCII);
         marshal.push(10);
         marshal.extend_from_slice(b"after_code");
