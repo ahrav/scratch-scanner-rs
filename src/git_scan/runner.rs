@@ -1159,6 +1159,7 @@ mod tests {
                 scan_findings_count: 0,
                 scan_chunker_bypass_count: 0,
                 scan_binary_skip_count: 0,
+                scan_binary_extract_count: 0,
                 scan_prefilter_bypass_count: 0,
             },
             tree_diff_bytes: 1_000,

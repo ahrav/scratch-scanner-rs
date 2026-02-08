@@ -87,6 +87,9 @@ fn run_fs(
     if cfg.no_archives {
         ps_config.archive.enabled = false;
     }
+    if cfg.scan_binary {
+        ps_config.skip_binary = false;
+    }
     let report = parallel_scan_dir(&cfg.root, engine, ps_config)?;
 
     let scan_elapsed = scan_start.elapsed();
@@ -112,12 +115,14 @@ fn run_fs(
 
     // Also write machine-readable stats to stderr for compatibility.
     eprintln!(
-        "files={} chunks={} bytes={} findings={} errors={} init_ms={} scan_ms={} elapsed_ms={} throughput_mib_s={:.2} workers={}",
+        "files={} chunks={} bytes={} findings={} errors={} binary_skipped={} binary_extracted={} init_ms={} scan_ms={} elapsed_ms={} throughput_mib_s={:.2} workers={}",
         report.stats.files_enqueued,
         report.metrics.chunks_scanned,
         report.metrics.bytes_scanned,
         report.metrics.findings_emitted,
         report.stats.io_errors,
+        report.metrics.binary_skipped,
+        report.metrics.binary_extracted,
         init_elapsed.as_millis(),
         scan_elapsed.as_millis(),
         total_elapsed.as_millis(),
@@ -205,6 +210,9 @@ fn run_git(
     }
     if let Some(bytes) = engine_chunk_bytes {
         config.engine_adapter.chunk_bytes = bytes;
+    }
+    if cfg.scan_binary {
+        config.engine_adapter.scan_binary = true;
     }
 
     let scan_start = Instant::now();
@@ -479,9 +487,10 @@ fn print_git_perf_breakdown(report: &git_scan::GitScanReport, config: &GitScanCo
     } else {
         0.0
     };
+    let binary_extract = perf.scan_binary_extract_count;
     eprintln!(
-        "  chunker_bypass: {} ({:.1}%)  binary_skip: {}  prefilter_bypass: {} ({:.1}%)",
-        bypass, bypass_pct, binary_skip, prefilter_bypass, prefilter_bypass_pct
+        "  chunker_bypass: {} ({:.1}%)  binary_skip: {}  binary_extract: {}  prefilter_bypass: {} ({:.1}%)",
+        bypass, bypass_pct, binary_skip, binary_extract, prefilter_bypass, prefilter_bypass_pct
     );
 
     // Cache configuration.

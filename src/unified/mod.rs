@@ -71,6 +71,8 @@ pub struct FsScanConfig {
     /// Use a no-op event sink (drops all findings). For measuring scan overhead
     /// without JSON encoding + stdout I/O.
     pub null_sink: bool,
+    /// When `true`, scan binary files instead of skipping them.
+    pub scan_binary: bool,
 }
 
 /// Git repository scan configuration.
@@ -97,6 +99,8 @@ pub struct GitSourceConfig {
     pub debug: bool,
     /// Emit pack execution timing breakdown to stderr.
     pub perf_breakdown: bool,
+    /// When `true`, scan binary blobs instead of skipping them.
+    pub scan_binary: bool,
 }
 
 /// Output event format selection.

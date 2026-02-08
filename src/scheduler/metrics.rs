@@ -320,6 +320,10 @@ pub struct WorkerMetricsLocal {
     pub scan_ns: u64,
     /// Times worker yielded to OS scheduler (TieredIdle yield path).
     pub yield_count: u64,
+    /// Files skipped because they appear to be binary.
+    pub binary_skipped: u64,
+    /// Files where text was extracted from a known binary format.
+    pub binary_extracted: u64,
 
     // ===== COLD DATA (histograms - rarely read during execution) =====
     /// Time-in-queue observations in nanoseconds.
@@ -357,6 +361,8 @@ impl WorkerMetricsLocal {
             read_ns: 0,
             scan_ns: 0,
             yield_count: 0,
+            binary_skipped: 0,
+            binary_extracted: 0,
             queue_time_ns: Log2Hist::new(),
             task_time_ns: Log2Hist::new(),
             archive: ArchiveStats::default(),
@@ -453,6 +459,10 @@ pub struct MetricsSnapshot {
     pub io_errors: u64,
     /// Total findings emitted across all workers.
     pub findings_emitted: u64,
+    /// Total files skipped because they appear to be binary.
+    pub binary_skipped: u64,
+    /// Total files where text was extracted from a known binary format.
+    pub binary_extracted: u64,
     /// Aggregate archive scanning outcomes.
     pub archive: ArchiveStats,
 
@@ -494,6 +504,8 @@ impl MetricsSnapshot {
             yield_count: 0,
             io_errors: 0,
             findings_emitted: 0,
+            binary_skipped: 0,
+            binary_extracted: 0,
             archive: ArchiveStats::default(),
             open_stat_ns: 0,
             read_ns: 0,
@@ -519,6 +531,8 @@ impl MetricsSnapshot {
         self.chunks_scanned = self.chunks_scanned.wrapping_add(w.chunks_scanned);
         self.io_errors = self.io_errors.wrapping_add(w.io_errors);
         self.findings_emitted = self.findings_emitted.wrapping_add(w.findings_emitted);
+        self.binary_skipped = self.binary_skipped.wrapping_add(w.binary_skipped);
+        self.binary_extracted = self.binary_extracted.wrapping_add(w.binary_extracted);
         self.worker_count = self.worker_count.wrapping_add(1);
 
         // Timing fields — always merged for diagnostics (not gated behind perf-stats).
