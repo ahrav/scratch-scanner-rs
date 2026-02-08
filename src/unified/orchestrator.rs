@@ -516,14 +516,14 @@ fn print_git_perf_breakdown(report: &git_scan::GitScanReport, config: &GitScanCo
 
 /// Retain only the transforms selected by the CLI `--transforms` flag.
 ///
-/// Filtering happens *before* engine construction and policy hashing, so
-/// disabling a transform correctly affects both the scan and the git
-/// incremental-scan cache key.
+/// Filtering happens *before* engine construction. In the git scan path
+/// this is also before policy hashing, so disabling a transform correctly
+/// invalidates the incremental-scan cache key.
 ///
 /// # Name mapping
 ///
 /// The `TransformId` → CLI-name mapping here must stay in sync with
-/// [`KNOWN_TRANSFORMS`](super::cli::KNOWN_TRANSFORMS).
+/// `KNOWN_TRANSFORMS` in `cli.rs`.
 fn apply_transform_filter(
     transforms: Vec<crate::api::TransformConfig>,
     filter: &TransformFilter,
