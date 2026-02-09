@@ -39,8 +39,8 @@
 //! After a clean shutdown, no `.open` files remain.
 
 use super::format::{
-    encode_record, LogDurabilityMode, LogFindingBatch, LogFindingRecord, LogRecord, LogRuleDef,
-    LogRunEnd, LogRunStart, DEFAULT_MAX_FRAME_PAYLOAD_BYTES, LOG_FORMAT_VERSION,
+    encode_record, FrameType, LogDurabilityMode, LogRecord, LogRuleDef, LogRunEnd, LogRunStart,
+    DEFAULT_MAX_FRAME_PAYLOAD_BYTES, FRAME_HEADER_BYTES, LOG_FORMAT_VERSION,
 };
 use crate::api::RuleSpec;
 use crate::store::identity::{rule_fingerprint, secret_hash};
@@ -61,6 +61,8 @@ const SEGMENT_PREFIX: &str = "segment-";
 const SEGMENT_OPEN_EXT: &str = "open";
 const SEGMENT_BIN_EXT: &str = "bin";
 const FINDING_ID_DOMAIN: &[u8] = b"scanner.store.log.v1.finding_id";
+const FINDING_BATCH_BASE_PAYLOAD_BYTES: usize = 8; // object_path_len + findings_count
+const FINDING_RECORD_WIRE_BYTES: usize = 132;
 
 /// Environment override for FS append-log root directory.
 pub const SCANNER_FS_LOG_DIR_ENV: &str = "SCANNER_FS_LOG_DIR";
@@ -199,15 +201,76 @@ impl AppendLogStoreProducer {
         &self.inner.cfg.root_dir
     }
 
+    /// Encode a [`FsFindingBatch`] directly into a framed wire buffer.
+    ///
+    /// Unlike `RunStart`/`RuleDef`/`RunEnd` frames (which go through
+    /// [`encode_record`]), finding frames are built inline here to avoid an
+    /// intermediate `LogFindingBatch` allocation. The hot path is:
+    ///
+    /// 1. Reserve a `Vec` with exact capacity (`FRAME_HEADER_BYTES + body`).
+    /// 2. Write a placeholder 8-byte header (filled in step 5).
+    /// 3. Stream the type byte, path, and per-finding fields while keeping a
+    ///    running CRC-32 in lockstep via [`frame_extend_crc`].
+    /// 4. Derive a deterministic `finding_id` per finding using a cloned
+    ///    BLAKE3 prefix hasher (amortises the object-path hash across the
+    ///    batch).
+    /// 5. Back-patch the header with `body_len` and `crc32`.
+    ///
+    /// The resulting buffer is ready for `SegmentWriter::write_frame` with no
+    /// further copies.
     fn build_finding_frame(&self, batch: FsFindingBatch<'_>) -> Result<Vec<u8>, FsStoreError> {
-        if batch.object_path.len() > u32::MAX as usize {
-            return Err(FsStoreError::backend(format!(
+        let object_path_len = u32::try_from(batch.object_path.len()).map_err(|_| {
+            FsStoreError::backend(format!(
                 "object_path too large: {} bytes",
                 batch.object_path.len()
-            )));
+            ))
+        })?;
+        let findings_count_u32 = u32::try_from(batch.findings.len())
+            .map_err(|_| FsStoreError::backend("findings length exceeds u32".to_string()))?;
+
+        let findings_bytes = batch
+            .findings
+            .len()
+            .checked_mul(FINDING_RECORD_WIRE_BYTES)
+            .ok_or_else(|| FsStoreError::backend("finding payload length overflow"))?;
+        let payload_len = FINDING_BATCH_BASE_PAYLOAD_BYTES
+            .checked_add(batch.object_path.len())
+            .and_then(|n| n.checked_add(findings_bytes))
+            .ok_or_else(|| FsStoreError::backend("finding frame payload length overflow"))?;
+        if payload_len > self.inner.cfg.max_frame_payload_bytes as usize {
+            let len = u32::try_from(payload_len).unwrap_or(u32::MAX);
+            return Err(map_format_err(super::format::FormatError::FrameTooLarge {
+                len,
+                max: self.inner.cfg.max_frame_payload_bytes,
+            }));
         }
 
-        let mut findings = Vec::with_capacity(batch.findings.len());
+        let body_len = payload_len
+            .checked_add(1)
+            .ok_or_else(|| FsStoreError::backend("finding frame body length overflow"))?;
+        let body_len_u32 = u32::try_from(body_len)
+            .map_err(|_| FsStoreError::backend("finding frame body exceeds u32::MAX"))?;
+
+        // Encode directly into the framed buffer to avoid building an
+        // intermediate `LogFindingBatch` payload and re-copying it.
+        let mut frame = Vec::with_capacity(FRAME_HEADER_BYTES + body_len);
+        frame.resize(FRAME_HEADER_BYTES, 0);
+        let frame_type = FrameType::FindingBatch as u8;
+        frame.push(frame_type);
+
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(&[frame_type]);
+
+        let path_len_bytes = object_path_len.to_le_bytes();
+        frame_extend_crc(&mut frame, &mut crc, &path_len_bytes);
+        frame_extend_crc(&mut frame, &mut crc, batch.object_path);
+        frame_extend_crc(&mut frame, &mut crc, &findings_count_u32.to_le_bytes());
+
+        let finding_id_prefix = finding_id_prefix_hasher(
+            self.inner.keys.metadata_key(),
+            object_path_len,
+            batch.object_path,
+        );
         for finding in batch.findings {
             let rule_idx = finding.rule_id as usize;
             let Some(rule_fp) = self.inner.rule_fingerprints_by_id.get(rule_idx) else {
@@ -217,35 +280,27 @@ impl AppendLogStoreProducer {
                 )));
             };
             let secret = secret_hash(&finding.norm_hash, &self.inner.keys);
-            let finding_id = derive_finding_id(
-                self.inner.keys.metadata_key(),
-                batch.object_path,
-                finding,
-                rule_fp,
-                &secret,
-            )?;
-            findings.push(LogFindingRecord {
-                rule_id: finding.rule_id,
-                rule_fingerprint: *rule_fp,
-                secret_hash: secret,
-                finding_id,
-                root_hint_start: finding.root_hint_start,
-                root_hint_end: finding.root_hint_end,
-                span_start: finding.span_start,
-                span_end: finding.span_end,
-            });
+            let finding_id = derive_finding_id(&finding_id_prefix, finding, rule_fp, &secret);
+
+            frame_extend_crc(&mut frame, &mut crc, &finding.rule_id.to_le_bytes());
+            frame_extend_crc(&mut frame, &mut crc, rule_fp);
+            frame_extend_crc(&mut frame, &mut crc, &secret);
+            frame_extend_crc(&mut frame, &mut crc, &finding_id);
+            frame_extend_crc(&mut frame, &mut crc, &finding.root_hint_start.to_le_bytes());
+            frame_extend_crc(&mut frame, &mut crc, &finding.root_hint_end.to_le_bytes());
+            frame_extend_crc(&mut frame, &mut crc, &finding.span_start.to_le_bytes());
+            frame_extend_crc(&mut frame, &mut crc, &finding.span_end.to_le_bytes());
         }
 
-        let record = LogRecord::FindingBatch(LogFindingBatch {
-            object_path: batch.object_path.to_vec(),
-            findings,
-        });
-        let mut frame = Vec::with_capacity(512);
-        encode_record(&record, self.inner.cfg.max_frame_payload_bytes, &mut frame)
-            .map_err(map_format_err)?;
+        let crc32 = crc.finalize();
+        frame[..4].copy_from_slice(&body_len_u32.to_le_bytes());
+        frame[4..FRAME_HEADER_BYTES].copy_from_slice(&crc32.to_le_bytes());
+
+        debug_assert_eq!(frame.len(), FRAME_HEADER_BYTES + body_len);
         Ok(frame)
     }
 
+    /// Encode a `RunEnd` frame via the generic [`encode_record`] path.
     fn build_run_end_frame(&self, loss: FsRunLoss) -> Result<Vec<u8>, FsStoreError> {
         let record = LogRecord::RunEnd(LogRunEnd {
             ended_unix_ms: now_unix_ms(),
@@ -259,6 +314,16 @@ impl AppendLogStoreProducer {
         Ok(frame)
     }
 
+    /// Block until both inflight budgets (batch count and byte count) have
+    /// room for one more frame of `frame_bytes` size.
+    ///
+    /// Returns immediately with an error if the frame alone exceeds the byte
+    /// budget (it can never fit). Otherwise spins on the [`Condvar`] until
+    /// the writer thread calls `release_inflight`, which decrements both
+    /// counters and wakes all waiters.
+    ///
+    /// Also returns `Err` if the writer has been marked closed (normal
+    /// shutdown or terminal error) while we were waiting.
     fn reserve_inflight(&self, frame_bytes: usize) -> Result<(), FsStoreError> {
         if frame_bytes > self.inner.cfg.max_inflight_bytes {
             return Err(FsStoreError::backend(format!(
@@ -289,6 +354,9 @@ impl AppendLogStoreProducer {
         }
     }
 
+    /// Delegate to the free-standing `release_inflight`; exists so
+    /// `emit_fs_batch` can release budget on a send failure without
+    /// reaching into `self.inner.shared` directly.
     fn release_inflight(&self, frame_bytes: usize) {
         release_inflight(&self.inner.shared, frame_bytes);
     }
@@ -369,27 +437,61 @@ impl StoreProducer for AppendLogStoreProducer {
     }
 }
 
+/// Shared-ownership core behind [`AppendLogStoreProducer`].
+///
+/// Split from the public struct so an `Arc<Inner>` can be handed to
+/// concurrent emitter threads and the writer-thread closure without
+/// exposing internals.
 struct Inner {
     tx: Sender<WriterCommand>,
     cfg: LogWriterConfig,
     run_id: u64,
     keys: StoreKeys,
     shared: Arc<SharedState>,
+    /// `None` after [`StoreProducer::record_fs_run_loss`] takes it.
     writer_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Index `[rule_id]` → 32-byte BLAKE3 fingerprint.
     rule_fingerprints_by_id: Box<[[u8; 32]]>,
 }
 
+/// Producer ↔ writer synchronisation.
+///
+/// This is a condition-variable protocol with two roles:
+///
+/// - **Producers** (multiple) call `reserve_inflight` which blocks on
+///   `cv` when the budget is full, and rechecks after each notify.
+/// - **Writer** (single) calls `release_inflight` after writing each
+///   finding frame, decrementing budgets and waking all waiters.
+///
+/// Shutdown signals flow through `mark_closed` (clean exit) or
+/// `set_terminal_error` (I/O failure), both of which set
+/// `closed = true` and `notify_all` so producers unblock and observe
+/// the shutdown.
 #[derive(Default)]
 struct SharedState {
     state: Mutex<InflightState>,
     cv: Condvar,
 }
 
+/// Mutable state guarded by [`SharedState::state`].
+///
+/// # Invariants
+///
+/// - `inflight_batches` and `inflight_bytes` are monotonically adjusted
+///   by matched `reserve` / `release` pairs. They may be zeroed on
+///   terminal error.
+/// - Once `closed` is set it is never unset.
+/// - `terminal_error` is write-once; the first error wins.
 #[derive(Debug, Default)]
 struct InflightState {
+    /// Number of finding frames queued but not yet written to disk.
     inflight_batches: usize,
+    /// Total encoded bytes of queued finding frames.
     inflight_bytes: usize,
+    /// Set on clean shutdown or terminal error; checked by
+    /// `reserve_inflight` to reject new work.
     closed: bool,
+    /// Root-cause message from the writer thread, if it failed.
     terminal_error: Option<String>,
 }
 
@@ -568,6 +670,11 @@ impl SegmentWriter {
     }
 }
 
+/// Create a new `.open` segment file with `O_CREAT | O_EXCL` semantics.
+///
+/// `create_new(true)` ensures the call fails if the file already exists,
+/// which guards against accidental double-opens after a crash that left
+/// a stale `.open` file behind.
 fn open_segment_file(segments_dir: &Path, seq: u64) -> std::io::Result<(File, PathBuf)> {
     let name = format!("{SEGMENT_PREFIX}{seq:020}.{SEGMENT_OPEN_EXT}");
     let path = segments_dir.join(name);
@@ -578,6 +685,14 @@ fn open_segment_file(segments_dir: &Path, seq: u64) -> std::io::Result<(File, Pa
     Ok((file, path))
 }
 
+/// Fsync the directory itself so that rename metadata reaches stable storage.
+///
+/// After `rename(.open → .bin)`, the directory entry update lives only in
+/// the page cache until the directory inode is fsynced. Without this,
+/// a power loss could leave the old `.open` name on disk despite a
+/// successful rename return.
+///
+/// No-op on non-Unix platforms where directory fsync is unsupported.
 #[cfg(unix)]
 fn sync_dir(path: &Path) -> std::io::Result<()> {
     File::open(path)?.sync_all()
@@ -588,6 +703,13 @@ fn sync_dir(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Compute fingerprints and build the sorted `RuleDef` frame list.
+///
+/// Returns two parallel data structures:
+/// - `Vec<LogRuleDef>` sorted by `(rule_fingerprint, rule_id)` — the order
+///   in which `RuleDef` frames are written to the log.
+/// - `Vec<[u8; 32]>` indexed by `rule_id` — a lookup table used by
+///   `build_finding_frame` to map engine rule indices to fingerprints.
 fn build_rule_defs(rules: &[RuleSpec], keys: &StoreKeys) -> (Vec<LogRuleDef>, Vec<[u8; 32]>) {
     let mut by_id = Vec::with_capacity(rules.len());
     let mut defs = Vec::with_capacity(rules.len());
@@ -608,6 +730,8 @@ fn build_rule_defs(rules: &[RuleSpec], keys: &StoreKeys) -> (Vec<LogRuleDef>, Ve
     (defs, by_id)
 }
 
+/// Snapshot current config, key metadata, and wallclock into a
+/// [`LogRunStart`] record. Written as the first frame in every run.
 fn build_run_start(cfg: &LogWriterConfig, keys: &StoreKeys, run_id: u64) -> LogRunStart {
     LogRunStart {
         version: LOG_FORMAT_VERSION,
@@ -622,6 +746,12 @@ fn build_run_start(cfg: &LogWriterConfig, keys: &StoreKeys, run_id: u64) -> LogR
     }
 }
 
+/// Reject obviously invalid configurations at construction time.
+///
+/// Beyond per-field zero checks, enforces the cross-field invariant that
+/// the largest possible frame (`max_frame_payload_bytes + FRAME_HEADER_BYTES`)
+/// must fit inside a single segment. Without this check, the writer would
+/// fail on the very first frame write.
 fn validate_config(cfg: &LogWriterConfig) -> Result<(), FsStoreError> {
     if cfg.max_inflight_batches == 0 {
         return Err(FsStoreError::backend(
@@ -659,40 +789,60 @@ fn validate_config(cfg: &LogWriterConfig) -> Result<(), FsStoreError> {
     Ok(())
 }
 
-/// Derive a deterministic 32-byte finding identifier via BLAKE3-keyed hash.
+/// Append bytes to the frame payload while keeping CRC in lockstep.
+#[inline(always)]
+fn frame_extend_crc(frame: &mut Vec<u8>, crc: &mut crc32fast::Hasher, bytes: &[u8]) {
+    frame.extend_from_slice(bytes);
+    crc.update(bytes);
+}
+
+/// Build the batch-invariant finding-id hash prefix.
 ///
-/// The hash input is domain-separated (`FINDING_ID_DOMAIN` + NUL byte) and
-/// includes the full set of finding coordinates: object path, rule
-/// fingerprint, secret hash, and byte-offset ranges. This ensures the ID
-/// is stable across runs when the same secret key is used, enabling
-/// cross-run correlation and deduplication.
-fn derive_finding_id(
+/// All per-batch fields are absorbed once (`domain`, `path_len`, `path`) and
+/// cloned per finding to avoid rehashing the object path in the hot loop.
+#[inline(always)]
+fn finding_id_prefix_hasher(
     metadata_key: &[u8; 32],
+    object_path_len: u32,
     object_path: &[u8],
-    finding: &FsFindingRecord,
-    rule_fingerprint: &[u8; 32],
-    secret_hash: &[u8; 32],
-) -> Result<[u8; 32], FsStoreError> {
-    let path_len = u32::try_from(object_path.len())
-        .map_err(|_| FsStoreError::backend("object_path length exceeds u32"))?;
+) -> blake3::Hasher {
     let mut hasher = blake3::Hasher::new_keyed(metadata_key);
     hasher.update(FINDING_ID_DOMAIN);
     hasher.update(&[0]);
-    hasher.update(&path_len.to_le_bytes());
+    hasher.update(&object_path_len.to_le_bytes());
     hasher.update(object_path);
+    hasher
+}
+
+/// Derive a deterministic finding ID by extending a cloned batch prefix.
+#[inline(always)]
+fn derive_finding_id(
+    prefix_hasher: &blake3::Hasher,
+    finding: &FsFindingRecord,
+    rule_fingerprint: &[u8; 32],
+    secret_hash: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = prefix_hasher.clone();
     hasher.update(rule_fingerprint);
     hasher.update(secret_hash);
     hasher.update(&finding.root_hint_start.to_le_bytes());
     hasher.update(&finding.root_hint_end.to_le_bytes());
     hasher.update(&finding.span_start.to_le_bytes());
     hasher.update(&finding.span_end.to_le_bytes());
-    Ok(*hasher.finalize().as_bytes())
+    *hasher.finalize().as_bytes()
 }
 
 fn map_format_err(err: super::format::FormatError) -> FsStoreError {
     FsStoreError::backend(format!("log format error: {err}"))
 }
 
+/// Generate a run identifier unique within this process.
+///
+/// Combines truncated nanosecond wallclock with a process-global
+/// monotonic counter. **Not guaranteed unique across processes** — two
+/// processes starting near-simultaneously may collide. Cross-process
+/// uniqueness is not required because each process writes to its own
+/// run directory.
 fn next_run_id() -> u64 {
     static RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
     let t = SystemTime::now()
@@ -714,6 +864,10 @@ fn now_unix_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Acquire the inflight-state lock, mapping poison to [`FsStoreError`].
+///
+/// Used by producer-side paths (`reserve_inflight`) that must surface
+/// errors to callers rather than unwinding.
 fn lock_state(
     shared: &SharedState,
 ) -> Result<std::sync::MutexGuard<'_, InflightState>, FsStoreError> {
@@ -723,6 +877,8 @@ fn lock_state(
         .map_err(|_| FsStoreError::backend("append-log state mutex poisoned"))
 }
 
+/// Build a user-facing error from a closed [`InflightState`], including
+/// the root-cause message when a terminal error was recorded.
 fn closed_error(state: &InflightState) -> FsStoreError {
     if let Some(err) = &state.terminal_error {
         FsStoreError::backend(format!("append-log writer closed: {err}"))
@@ -731,6 +887,13 @@ fn closed_error(state: &InflightState) -> FsStoreError {
     }
 }
 
+/// Decrement inflight budgets and wake all blocked producers.
+///
+/// Called by the writer thread after each finding frame is persisted.
+/// Uses `unwrap_or_else(PoisonError::into_inner)` rather than
+/// propagating poison because budget release is critical-path: if it
+/// fails, every producer blocks forever. Accepting a potentially
+/// inconsistent inner state is preferable to a deadlock.
 fn release_inflight(shared: &SharedState, bytes: usize) {
     let mut guard = shared.state.lock().unwrap_or_else(|e| e.into_inner());
     debug_assert!(
@@ -743,6 +906,12 @@ fn release_inflight(shared: &SharedState, bytes: usize) {
     shared.cv.notify_all();
 }
 
+/// Record a fatal writer-thread error and wake all producers.
+///
+/// Sets `closed = true`, zeros the inflight budgets (so no producer
+/// remains blocked on a budget check), and stores the root-cause
+/// message for later retrieval by `terminal_result`. Only the first
+/// error is kept; subsequent calls are no-ops for the message.
 fn set_terminal_error(shared: &SharedState, err: String) {
     let mut guard = shared.state.lock().unwrap_or_else(|e| e.into_inner());
     if guard.terminal_error.is_none() {
@@ -755,6 +924,11 @@ fn set_terminal_error(shared: &SharedState, err: String) {
     shared.cv.notify_all();
 }
 
+/// Signal clean shutdown — no terminal error, just `closed = true`.
+///
+/// Called by the writer thread on its normal exit path. Like
+/// `release_inflight`, recovers through a poisoned mutex to ensure
+/// the close signal is always delivered.
 fn mark_closed(shared: &SharedState) {
     let mut guard = shared.state.lock().unwrap_or_else(|e| e.into_inner());
     guard.closed = true;
@@ -762,6 +936,11 @@ fn mark_closed(shared: &SharedState) {
     shared.cv.notify_all();
 }
 
+/// Return `Ok(())` if the writer exited cleanly, or `Err` with the
+/// stored root-cause message if a terminal error was recorded.
+///
+/// Called by `record_fs_run_loss` after joining the writer thread to
+/// surface any I/O or panic error to the caller.
 fn terminal_result(shared: &SharedState) -> Result<(), FsStoreError> {
     let guard = shared
         .state
@@ -857,6 +1036,10 @@ fn io_to_store_err(err: std::io::Error) -> FsStoreError {
     FsStoreError::backend(format!("append-log io error: {err}"))
 }
 
+/// Replace non-portable characters with `_` for use in directory names.
+///
+/// Keeps ASCII alphanumerics, `-`, `_`, and `.`. Returns `"scan-root"`
+/// for empty input.
 fn sanitize_component(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for ch in raw.chars() {
