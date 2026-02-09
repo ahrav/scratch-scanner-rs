@@ -432,6 +432,7 @@ domain strings.
 
 | Document | Relevance |
 |---|---|
+| [fs-persistence-pipeline.md](fs-persistence-pipeline.md) | FS write-side plumbing (StoreProducer, FsFindingBatch, loss accounting) |
 | [detection-engine.md](detection-engine.md) | FindingRec output, norm_hash computation |
 | [transform-chain.md](transform-chain.md) | Identity canonicalization link for transforms |
 | [memory-management.md](memory-management.md) | Store key bootstrap memory notes |
