@@ -1273,8 +1273,7 @@ fn value_suppressor_works_with_full_match_fallback() {
     let hay_suppressed = b"prefix TOK_AAAABBBB suffix";
     let hits = scan_chunk_findings(&engine, hay_suppressed);
     assert!(
-        !hits.iter()
-            .any(|h| h.rule == "value-suppressor-full-match"),
+        !hits.iter().any(|h| h.rule == "value-suppressor-full-match"),
         "suppressor should filter full-match secret"
     );
 
@@ -1282,8 +1281,7 @@ fn value_suppressor_works_with_full_match_fallback() {
     let hay_pass = b"prefix TOK_CCCCDDDD suffix";
     let hits = scan_chunk_findings(&engine, hay_pass);
     assert!(
-        hits.iter()
-            .any(|h| h.rule == "value-suppressor-full-match"),
+        hits.iter().any(|h| h.rule == "value-suppressor-full-match"),
         "non-matching full-match secret should pass"
     );
 }
@@ -1316,7 +1314,8 @@ fn value_suppressor_single_byte_pattern() {
     let hay_with_x = b"prefix TOK_ABCDXFGH suffix";
     let hits = scan_chunk_findings(&engine, hay_with_x);
     assert!(
-        !hits.iter()
+        !hits
+            .iter()
             .any(|h| h.rule == "value-suppressor-single-byte"),
         "single-byte suppressor should match and filter"
     );
