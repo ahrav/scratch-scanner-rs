@@ -19,7 +19,9 @@ use scanner_rs::archive::{
     ArchiveSkipReason, EncryptedPolicy, EntrySkipReason, PartialReason, UnsupportedPolicy,
 };
 use scanner_rs::scheduler::engine_stub::{MockEngine, MockRule};
-use scanner_rs::scheduler::engine_trait::{EngineScratch, FindingRecord, ScanEngine};
+use scanner_rs::scheduler::engine_trait::{
+    EngineScratch, FindingRecord, FindingWithHashRecord, ScanEngine,
+};
 use scanner_rs::scheduler::local_fs_owner::{
     scan_local, LocalConfig, LocalFile, LocalReport, VecFileSource,
 };
@@ -583,6 +585,13 @@ impl FindingRecord for DummyFinding {
     }
     fn span_end(&self) -> u64 {
         0
+    }
+}
+
+impl FindingWithHashRecord for DummyFinding {
+    fn norm_hash(&self) -> &scanner_rs::NormHash {
+        const ZERO: scanner_rs::NormHash = [0; 32];
+        &ZERO
     }
 }
 

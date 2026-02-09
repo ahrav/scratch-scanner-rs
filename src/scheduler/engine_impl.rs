@@ -95,6 +95,8 @@ pub struct RealEngineScratch {
     scratch: RealScanScratch,
     /// Temporary buffer for draining findings.
     findings_buf: Vec<ApiFindingRec>,
+    /// Temporary buffer for draining normalized hashes aligned with findings.
+    norm_hash_buf: Vec<crate::engine::NormHash>,
 }
 
 // SAFETY: RealEngineScratch wraps ScanScratch which is not automatically Send because
@@ -132,10 +134,15 @@ impl RealEngineScratch {
         Self {
             scratch,
             findings_buf: Vec::with_capacity(max_findings),
+            norm_hash_buf: Vec::with_capacity(max_findings),
         }
     }
 
     /// Get mutable access to the underlying scratch for scanning.
+    ///
+    /// Only meaningful inside [`ScanEngine::scan_chunk_into`], which calls
+    /// `reset_for_scan()` on the inner scratch before scanning. Calling this
+    /// outside that context may observe stale internal state.
     pub fn inner_mut(&mut self) -> &mut RealScanScratch {
         &mut self.scratch
     }
@@ -151,6 +158,7 @@ impl EngineScratch for RealEngineScratch {
         //
         // We only clear our temporary drain buffer here.
         self.findings_buf.clear();
+        self.norm_hash_buf.clear();
     }
 
     fn drop_prefix_findings(&mut self, new_bytes_start: u64) {
@@ -158,25 +166,38 @@ impl EngineScratch for RealEngineScratch {
     }
 
     fn drain_findings_into(&mut self, out: &mut Vec<Self::Finding>) {
-        // The real scratch has drain_findings which requires a pre-sized output.
-        // We first drain into our buffer, then append to out.
+        // The real `ScanScratch::drain_findings_with_hashes` clears its
+        // outputs, so we stage through local buffers to preserve append
+        // semantics for `out`.
         self.findings_buf.clear();
-        if self.findings_buf.capacity() >= self.scratch.pending_findings_len() {
-            self.scratch.drain_findings(&mut self.findings_buf);
-        } else {
-            // Reserve more capacity if needed
-            self.findings_buf
-                .reserve(self.scratch.pending_findings_len());
-            self.scratch.drain_findings(&mut self.findings_buf);
+        self.norm_hash_buf.clear();
+        let pending = self.scratch.pending_findings_len();
+        if self.findings_buf.capacity() < pending {
+            self.findings_buf.reserve(pending);
         }
+        if self.norm_hash_buf.capacity() < pending {
+            self.norm_hash_buf.reserve(pending);
+        }
+        self.scratch
+            .drain_findings_with_hashes(&mut self.findings_buf, &mut self.norm_hash_buf);
 
+        debug_assert_eq!(
+            self.findings_buf.len(),
+            self.norm_hash_buf.len(),
+            "finding/hash drain length mismatch"
+        );
         out.reserve(self.findings_buf.len());
-        // Phase B task 6hu.2.1 introduces the carrier type first.
-        // Hash-aware draining is added in task 6hu.2.2; use a stable
-        // placeholder until then to keep trait plumbing compile-clean.
-        for finding in self.findings_buf.drain(..) {
-            out.push(FindingWithHash::new(finding, [0; 32]));
+        for (finding, norm_hash) in self
+            .findings_buf
+            .drain(..)
+            .zip(self.norm_hash_buf.drain(..))
+        {
+            out.push(FindingWithHash::new(finding, norm_hash));
         }
+    }
+
+    fn dropped_findings(&self) -> u64 {
+        self.scratch.dropped_findings() as u64
     }
 }
 
@@ -272,7 +293,7 @@ mod tests {
         scratch.drain_findings_into(&mut findings);
 
         assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].norm_hash, [0; 32]);
+        assert_ne!(findings[0].norm_hash, [0; 32]);
         assert_eq!(
             <Engine as ScanEngine>::rule_name(&engine, findings[0].rule_id()),
             "test-secret"

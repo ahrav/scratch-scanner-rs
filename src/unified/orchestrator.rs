@@ -32,6 +32,7 @@ use crate::git_scan::{
     StartSetConfig,
 };
 use crate::scheduler::{parallel_scan_dir, ParallelScanConfig};
+use crate::store::{NullStoreProducer, StoreProducer};
 use crate::{demo_rules, demo_transforms, demo_tuning, AnchorMode, AnchorPolicy, Engine};
 
 use super::cli::TransformFilter;
@@ -107,6 +108,9 @@ fn run_fs(
         event_sink: Arc::clone(&event_sink),
         ..Default::default()
     };
+    if cfg.persist_findings {
+        ps_config.store_producer = Some(Arc::new(NullStoreProducer) as Arc<dyn StoreProducer>);
+    }
     if cfg.no_archives {
         ps_config.archive.enabled = false;
     }
@@ -123,11 +127,16 @@ fn run_fs(
     } else {
         0.0
     };
+    let status = if report.stats.persistence_incomplete {
+        "partial"
+    } else {
+        "complete"
+    };
 
     // Emit structured summary event.
     event_sink.emit(ScanEvent::Summary(SummaryEvent {
         source: SourceKind::Fs,
-        status: "complete",
+        status,
         elapsed_ms: scan_elapsed.as_millis() as u64,
         bytes_scanned: report.metrics.bytes_scanned,
         findings_emitted: report.metrics.findings_emitted,
@@ -138,12 +147,15 @@ fn run_fs(
 
     // Also write machine-readable stats to stderr for compatibility.
     eprintln!(
-        "files={} chunks={} bytes={} findings={} errors={} binary_skipped={} binary_extracted={} init_ms={} scan_ms={} elapsed_ms={} throughput_mib_s={:.2} workers={}",
+        "files={} chunks={} bytes={} findings={} errors={} dropped_findings={} persist_emit_failures={} persist_incomplete={} binary_skipped={} binary_extracted={} init_ms={} scan_ms={} elapsed_ms={} throughput_mib_s={:.2} workers={}",
         report.stats.files_enqueued,
         report.metrics.chunks_scanned,
         report.metrics.bytes_scanned,
         report.metrics.findings_emitted,
         report.stats.io_errors,
+        report.stats.dropped_findings,
+        report.stats.persistence_emit_failures,
+        report.stats.persistence_incomplete,
         report.metrics.binary_skipped,
         report.metrics.binary_extracted,
         init_elapsed.as_millis(),

@@ -338,6 +338,7 @@ mod tests {
             archive: ArchiveConfig::default(),
             skip_binary: true,
             event_sink: Arc::new(crate::unified::events::NullEventSink),
+            store_producer: None,
         }
     }
 

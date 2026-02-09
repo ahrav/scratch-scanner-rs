@@ -83,6 +83,11 @@ pub struct FsScanConfig {
     pub null_sink: bool,
     /// When `true`, scan binary files instead of skipping them.
     pub scan_binary: bool,
+    /// When `true`, wire a [`StoreProducer`](crate::store::StoreProducer) into
+    /// the parallel scan so post-dedupe findings are emitted to the persistence
+    /// backend. Currently uses [`NullStoreProducer`](crate::store::NullStoreProducer)
+    /// (no-op) as a placeholder until a real backend is connected.
+    pub persist_findings: bool,
 }
 
 /// Git repository scan configuration.

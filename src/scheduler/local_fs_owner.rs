@@ -60,7 +60,7 @@
 //! For page-cache-hot workloads, blocking reads are competitive.
 
 use super::count_budget::CountBudget;
-use super::engine_trait::{EngineScratch, FindingRecord, ScanEngine};
+use super::engine_trait::{EngineScratch, FindingRecord, FindingWithHashRecord, ScanEngine};
 use super::executor::{Executor, ExecutorConfig, WorkerCtx};
 use super::metrics::{MetricsSnapshot, WorkerMetricsLocal};
 use super::ts_buffer_pool::{TsBufferPool, TsBufferPoolConfig};
@@ -77,6 +77,7 @@ use crate::archive::{
     EntrySkipReason, PartialReason, VirtualPathBuilder, DEFAULT_MAX_COMPONENTS,
 };
 use crate::scheduler::engine_stub::BUFFER_LEN_MAX;
+use crate::store::{FsFindingBatch, FsFindingRecord, FsRunLoss, StoreProducer};
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -146,6 +147,9 @@ pub struct LocalConfig {
     ///
     /// All findings are emitted as `ScanEvent::Finding` through this sink.
     pub event_sink: Arc<dyn crate::unified::events::EventSink>,
+
+    /// Optional persistence producer for post-dedupe FS finding batches.
+    pub store_producer: Option<Arc<dyn StoreProducer>>,
 }
 
 impl Default for LocalConfig {
@@ -162,6 +166,7 @@ impl Default for LocalConfig {
             archive: ArchiveConfig::default(),
             skip_binary: true,
             event_sink: Arc::new(crate::unified::events::NullEventSink),
+            store_producer: None,
         }
     }
 }
@@ -180,6 +185,10 @@ impl std::fmt::Debug for LocalConfig {
             .field("archive", &self.archive)
             .field("skip_binary", &self.skip_binary)
             .field("event_sink", &"<dyn EventSink>")
+            .field(
+                "store_producer",
+                &self.store_producer.as_ref().map(|_| "<dyn StoreProducer>"),
+            )
             .finish()
     }
 }
@@ -333,6 +342,8 @@ struct LocalScratch<E: ScanEngine> {
     scan_scratch: E::Scratch,
     /// Per-worker findings buffer (avoids alloc per chunk).
     pending: Vec<<E::Scratch as EngineScratch>::Finding>,
+    /// Per-worker persistence batch buffer (avoids alloc per chunk).
+    persist_batch: Vec<FsFindingRecord>,
 
     /// Archive path canonicalization scratch.
     canon: EntryPathCanonicalizer,
@@ -359,6 +370,8 @@ struct LocalScratch<E: ScanEngine> {
 
     /// Structured event sink for finding output.
     event_sink: Arc<dyn crate::unified::events::EventSink>,
+    /// Optional persistence producer for post-dedupe findings.
+    store_producer: Option<Arc<dyn StoreProducer>>,
 
     /// Configuration flags.
     dedupe_within_chunk: bool,
@@ -387,7 +400,8 @@ struct LocalScratch<E: ScanEngine> {
 /// Statistics from a local scan run.
 ///
 /// Core counters (`files_enqueued`, `bytes_enqueued`, `io_errors`) are always
-/// populated regardless of build configuration.
+/// populated regardless of build configuration. Persistence-loss counters are
+/// populated when FS persistence plumbing is enabled.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LocalStats {
     /// Files discovered and enqueued.
@@ -402,6 +416,12 @@ pub struct LocalStats {
     /// This includes file open failures, metadata read failures, and
     /// read errors during scanning. Aggregated from worker metrics.
     pub io_errors: u64,
+    /// Findings dropped by engine max-findings caps.
+    pub dropped_findings: u64,
+    /// Persistence batch emission failures observed during scan loops.
+    pub persistence_emit_failures: u64,
+    /// Whether run-loss counters indicate an incomplete persistence run.
+    pub persistence_incomplete: bool,
 }
 
 /// Complete report from a local scan.
@@ -420,11 +440,11 @@ pub struct LocalReport {
 // Helpers
 // ============================================================================
 
-/// Deduplicate findings in place by (rule_id, root_hint).
+/// Deduplicate findings in place by (rule_id, root_hint, span, norm_hash).
 ///
 /// # Algorithm
 ///
-/// 1. Sort by `(rule_id, root_hint_start, root_hint_end)` — O(n log n)
+/// 1. Sort by `(rule_id, root_hint_start, root_hint_end, span_start, span_end, norm_hash)` — O(n log n)
 /// 2. Dedup adjacent elements with matching keys — O(n)
 ///
 /// Total: O(n log n) vs O(n²) for pairwise comparison.
@@ -439,8 +459,14 @@ pub struct LocalReport {
 ///
 /// This handles within-chunk duplicates (same finding emitted multiple times
 /// by the engine). Cross-chunk duplicates are handled by `drop_prefix_findings`.
+///
+/// # Consistency with git-scan path
+///
+/// The git-scan path uses `FindingKey` (which includes `norm_hash`) for dedup.
+/// Including `norm_hash` here ensures two findings at the same span but with
+/// different secret hashes are preserved (not incorrectly collapsed).
 #[inline]
-fn dedupe_findings<F: FindingRecord>(findings: &mut Vec<F>) {
+fn dedupe_findings<F: FindingWithHashRecord>(findings: &mut Vec<F>) {
     if findings.len() <= 1 {
         return;
     }
@@ -452,6 +478,7 @@ fn dedupe_findings<F: FindingRecord>(findings: &mut Vec<F>) {
             f.root_hint_end(),
             f.span_start(),
             f.span_end(),
+            *f.norm_hash(),
         )
     });
 
@@ -461,6 +488,7 @@ fn dedupe_findings<F: FindingRecord>(findings: &mut Vec<F>) {
             && a.root_hint_end() == b.root_hint_end()
             && a.span_start() == b.span_start()
             && a.span_end() == b.span_end()
+            && a.norm_hash() == b.norm_hash()
     });
 }
 
@@ -496,9 +524,65 @@ fn emit_findings<E: ScanEngine, F: FindingRecord>(
     }
 }
 
-/// Allocate a virtual `FileId` for archive entries (high-bit namespace).
+#[inline]
+fn build_persistence_batch<F: FindingWithHashRecord>(
+    findings: &[F],
+    out: &mut Vec<FsFindingRecord>,
+) {
+    out.clear();
+    out.reserve(findings.len());
+    for finding in findings {
+        out.push(FsFindingRecord {
+            rule_id: finding.rule_id(),
+            root_hint_start: finding.root_hint_start(),
+            root_hint_end: finding.root_hint_end(),
+            span_start: finding.span_start(),
+            span_end: finding.span_end(),
+            norm_hash: *finding.norm_hash(),
+        });
+    }
+}
+
+#[inline]
+fn emit_persistence_batch<F: FindingWithHashRecord>(
+    store_producer: Option<&dyn StoreProducer>,
+    event_sink: &dyn crate::unified::events::EventSink,
+    path: &[u8],
+    findings: &[F],
+    persist_batch: &mut Vec<FsFindingRecord>,
+    metrics: &mut WorkerMetricsLocal,
+) {
+    let Some(producer) = store_producer else {
+        return;
+    };
+    if findings.is_empty() {
+        return;
+    }
+
+    build_persistence_batch(findings, persist_batch);
+    if let Err(err) = producer.emit_fs_batch(FsFindingBatch {
+        object_path: path,
+        findings: persist_batch.as_slice(),
+    }) {
+        metrics.persistence_emit_failures = metrics.persistence_emit_failures.saturating_add(1);
+        metrics.io_errors = metrics.io_errors.saturating_add(1);
+        let msg = format!("fs persistence batch emit failed: {}", err.detail());
+        event_sink.emit(crate::unified::events::ScanEvent::Diagnostic(
+            crate::unified::events::DiagnosticEvent {
+                level: "error",
+                message: &msg,
+            },
+        ));
+    }
+}
+
+/// Allocate a virtual `FileId` for archive entries.
 ///
-/// Wraps within the high-bit range; after ~2^31 entries, ids may repeat.
+/// Virtual IDs live in the high-bit namespace (`0x8000_0000..=0xFFFF_FFFF`)
+/// to avoid collision with real file IDs (which start at 0 and grow upward).
+/// The counter wraps after ~2^31 entries, but collisions are tolerable:
+/// `FileId` is only used by the engine for internal attribution, not for
+/// deduplication or correctness in the scheduler.
 #[inline]
 fn alloc_virtual_file_id(next_virtual_file_id: &mut u32) -> FileId {
     const VIRTUAL_FILE_ID_BASE: u32 = 0x8000_0000;
@@ -510,8 +594,17 @@ fn alloc_virtual_file_id(next_virtual_file_id: &mut u32) -> FileId {
     FileId(id)
 }
 
+/// Length of a locator suffix: `@` + kind byte + 16 hex digits = 18 bytes.
+///
+/// Locators are appended to virtual path segments to disambiguate entries
+/// that share the same display name within an archive. The format is
+/// `@<kind><hex64>` where `kind` identifies the offset type:
+/// - `t` = tar header block index
+/// - `z` = ZIP local file header offset (when valid)
+/// - `c` = ZIP central directory file header offset (fallback)
 const LOCATOR_LEN: usize = 18;
 
+/// Write a `u64` as 16 lowercase hex digits into `out16`.
 #[inline(always)]
 fn write_u64_hex_lower(x: u64, out16: &mut [u8]) {
     debug_assert_eq!(out16.len(), 16);
@@ -525,6 +618,9 @@ fn write_u64_hex_lower(x: u64, out16: &mut [u8]) {
     }
 }
 
+/// Format a locator suffix into `out` and return the full slice.
+///
+/// See [`LOCATOR_LEN`] for format description.
 #[inline]
 fn build_locator(out: &mut [u8; LOCATOR_LEN], kind: u8, value: u64) -> &[u8] {
     out[0] = b'@';
@@ -555,13 +651,29 @@ fn dispatch_archive_scan<E: ScanEngine>(
     }
 }
 
-/// Hard cap on per-read output for archive streams.
+/// Hard cap on per-read output for archive streams (256 KiB).
+///
+/// Archive entry reads are clamped to this value even when the pool buffer
+/// is larger. This bounds decompressor output per iteration, keeping
+/// inflation-ratio checks responsive and limiting peak stack/heap pressure
+/// from a single decompression call.
 const ARCHIVE_STREAM_READ_MAX: usize = 256 * 1024;
 
+/// Outcome of scanning an archive container.
+///
+/// Used by `dispatch_archive_scan` and its callees to communicate
+/// whether the archive was fully consumed, entirely skipped, or
+/// partially scanned (budget exhaustion, corruption, etc.).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ArchiveEnd {
+    /// All entries in the archive were scanned to completion.
     Scanned,
+    /// The archive was not scanned at all (e.g., I/O error, encrypted,
+    /// unsupported format). The reason is recorded for telemetry.
     Skipped(ArchiveSkipReason),
+    /// Scanning stopped partway through the archive (budget exceeded,
+    /// malformed entry, inflation ratio exceeded). Some entries may
+    /// have been fully scanned before the stop.
     Partial(PartialReason),
 }
 
@@ -601,25 +713,38 @@ fn budget_hit_to_archive_end(hit: BudgetHit) -> ArchiveEnd {
     }
 }
 
-/// Shared scratch references for archive scanning (scheduler path).
+/// Borrowed view into [`LocalScratch`] for archive scanning.
+///
+/// Splits the per-worker scratch into disjoint borrows so nested archive
+/// scans can recurse without aliasing. Each nesting level consumes the
+/// head element of `vpaths`, `path_budget_used`, and `tar_cursors` via
+/// `split_first_mut`, passing the tail to the child `ArchiveScanCtx`.
 ///
 /// # Invariants
 /// - All buffers are preallocated in `LocalScratch` and must not grow.
 /// - Nested scans borrow disjoint slices of scratch buffers (no aliasing).
 /// - `budgets` is shared across nested scans to enforce global caps.
-/// - `path_budget_used` tracks per-archive virtual path byte usage.
+/// - `path_budget_used` tracks per-depth virtual path byte usage.
 /// - `abort_run` is set when `FailRun` policies trigger; callers must stop
 ///   dispatching new files once it becomes true.
 struct ArchiveScanCtx<'a, E: ScanEngine> {
     engine: &'a Arc<E>,
     pool: &'a TsBufferPool,
     event_sink: &'a dyn crate::unified::events::EventSink,
+    store_producer: Option<&'a dyn StoreProducer>,
     scan_scratch: &'a mut E::Scratch,
+    /// Reusable findings drain buffer (cleared before each `drain_findings_into`).
     pending: &'a mut Vec<<E::Scratch as EngineScratch>::Finding>,
+    /// Reusable persistence batch buffer.
+    persist_batch: &'a mut Vec<FsFindingRecord>,
+    /// Shared budget tracker — enforces archive, entry, and root output caps.
     budgets: &'a mut ArchiveBudgets,
     canon: &'a mut EntryPathCanonicalizer,
+    /// Per-depth virtual path builders. Head is consumed at this depth.
     vpaths: &'a mut [VirtualPathBuilder],
+    /// Per-depth byte counters for virtual path budget enforcement.
     path_budget_used: &'a mut [usize],
+    /// Per-depth tar header cursors. Head is consumed at this depth.
     tar_cursors: &'a mut [TarCursor],
     gzip_header_buf: &'a mut Vec<u8>,
     gzip_name_buf: &'a mut Vec<u8>,
@@ -628,6 +753,7 @@ struct ArchiveScanCtx<'a, E: ScanEngine> {
     archive: &'a ArchiveConfig,
     dedupe: bool,
     chunk_size: usize,
+    /// Shared abort flag; set by `FailRun` policy handlers.
     abort_run: &'a AtomicBool,
 }
 
@@ -637,8 +763,10 @@ impl<'a, E: ScanEngine> ArchiveScanCtx<'a, E> {
             engine: &scratch.engine,
             pool: &scratch.pool,
             event_sink: &*scratch.event_sink,
+            store_producer: scratch.store_producer.as_deref(),
             scan_scratch: &mut scratch.scan_scratch,
             pending: &mut scratch.pending,
+            persist_batch: &mut scratch.persist_batch,
             budgets: &mut scratch.budgets,
             canon: &mut scratch.canon,
             vpaths: scratch.vpaths.as_mut_slice(),
@@ -913,6 +1041,9 @@ fn process_gzip_file<E: ScanEngine>(
         let data = &buf.as_slice()[..read_len];
 
         engine.scan_chunk_into(data, entry_file_id, base_offset, &mut scratch.scan_scratch);
+        metrics.findings_dropped = metrics
+            .findings_dropped
+            .saturating_add(scratch.scan_scratch.dropped_findings());
         if !entry_scanned {
             metrics.archive.record_entry_scanned();
             entry_scanned = true;
@@ -934,6 +1065,14 @@ fn process_gzip_file<E: ScanEngine>(
             .findings_emitted
             .wrapping_add(scratch.pending.len() as u64);
 
+        emit_persistence_batch(
+            scratch.store_producer.as_deref(),
+            &*scratch.event_sink,
+            path_bytes,
+            &scratch.pending,
+            &mut scratch.persist_batch,
+            metrics,
+        );
         emit_findings(
             engine.as_ref(),
             &*scratch.event_sink,
@@ -1065,6 +1204,10 @@ fn scan_gzip_stream_nested<E: ScanEngine, R: Read>(
 
         scan.engine
             .scan_chunk_into(data, file_id, base_offset, scan.scan_scratch);
+        scan.metrics.findings_dropped = scan
+            .metrics
+            .findings_dropped
+            .saturating_add(scan.scan_scratch.dropped_findings());
         if !entry_scanned {
             scan.metrics.archive.record_entry_scanned();
             entry_scanned = true;
@@ -1085,6 +1228,14 @@ fn scan_gzip_stream_nested<E: ScanEngine, R: Read>(
             .findings_emitted
             .wrapping_add(scan.pending.len() as u64);
 
+        emit_persistence_batch(
+            scan.store_producer,
+            scan.event_sink,
+            display,
+            scan.pending,
+            scan.persist_batch,
+            scan.metrics,
+        );
         emit_findings(scan.engine.as_ref(), scan.event_sink, display, scan.pending);
 
         scan.metrics.chunks_scanned = scan.metrics.chunks_scanned.saturating_add(1);
@@ -1298,8 +1449,10 @@ fn scan_tar_stream_nested<E: ScanEngine>(
                                     engine: scan.engine,
                                     pool: scan.pool,
                                     event_sink: scan.event_sink,
+                                    store_producer: scan.store_producer,
                                     scan_scratch: scan.scan_scratch,
                                     pending: scan.pending,
+                                    persist_batch: scan.persist_batch,
                                     budgets,
                                     canon: scan.canon,
                                     vpaths: vpaths_tail,
@@ -1375,8 +1528,10 @@ fn scan_tar_stream_nested<E: ScanEngine>(
                                     engine: scan.engine,
                                     pool: scan.pool,
                                     event_sink: scan.event_sink,
+                                    store_producer: scan.store_producer,
                                     scan_scratch: scan.scan_scratch,
                                     pending: scan.pending,
+                                    persist_batch: scan.persist_batch,
                                     budgets,
                                     canon: scan.canon,
                                     vpaths: rest_vpaths,
@@ -1406,8 +1561,10 @@ fn scan_tar_stream_nested<E: ScanEngine>(
                                     engine: scan.engine,
                                     pool: scan.pool,
                                     event_sink: scan.event_sink,
+                                    store_producer: scan.store_producer,
                                     scan_scratch: scan.scan_scratch,
                                     pending: scan.pending,
+                                    persist_batch: scan.persist_batch,
                                     budgets,
                                     canon: scan.canon,
                                     vpaths: rest_vpaths,
@@ -1599,6 +1756,10 @@ fn scan_tar_stream_nested<E: ScanEngine>(
 
             scan.engine
                 .scan_chunk_into(data, entry_file_id, base_offset, scan.scan_scratch);
+            scan.metrics.findings_dropped = scan
+                .metrics
+                .findings_dropped
+                .saturating_add(scan.scan_scratch.dropped_findings());
             if !entry_scanned {
                 scan.metrics.archive.record_entry_scanned();
                 entry_scanned = true;
@@ -1618,6 +1779,14 @@ fn scan_tar_stream_nested<E: ScanEngine>(
                 .metrics
                 .findings_emitted
                 .wrapping_add(scan.pending.len() as u64);
+            emit_persistence_batch(
+                scan.store_producer,
+                scan.event_sink,
+                entry_display,
+                scan.pending,
+                scan.persist_batch,
+                scan.metrics,
+            );
             emit_findings(
                 scan.engine.as_ref(),
                 scan.event_sink,
@@ -1756,8 +1925,10 @@ fn process_zip_file<E: ScanEngine>(
         engine,
         pool,
         event_sink,
+        store_producer,
         scan_scratch,
         pending,
+        persist_batch,
         archive,
         canon,
         vpaths,
@@ -2097,6 +2268,9 @@ fn process_zip_file<E: ScanEngine>(
             let data = &buf.as_slice()[..read_len];
 
             engine.scan_chunk_into(data, entry_file_id, base_offset, scan_scratch);
+            metrics.findings_dropped = metrics
+                .findings_dropped
+                .saturating_add(scan_scratch.dropped_findings());
             if !entry_scanned {
                 metrics.archive.record_entry_scanned();
                 entry_scanned = true;
@@ -2113,6 +2287,14 @@ fn process_zip_file<E: ScanEngine>(
             }
 
             metrics.findings_emitted = metrics.findings_emitted.wrapping_add(pending.len() as u64);
+            emit_persistence_batch(
+                store_producer.as_deref(),
+                &**event_sink,
+                path_bytes,
+                pending,
+                persist_batch,
+                metrics,
+            );
             emit_findings(engine.as_ref(), &**event_sink, path_bytes, pending);
 
             metrics.chunks_scanned = metrics.chunks_scanned.saturating_add(1);
@@ -2153,52 +2335,6 @@ fn process_zip_file<E: ScanEngine>(
 // File Processing
 // ============================================================================
 
-/// Process a single file: open, chunk, scan, close.
-///
-/// When archive scanning is enabled, archive containers are detected by
-/// extension/magic and routed through the archive dispatch path before any
-/// chunk reads are issued.
-///
-/// # Design: Sequential Read with Overlap Carry
-///
-/// Instead of seeking back for each chunk's overlap, we:
-/// 1. Acquire ONE buffer for the entire file (blocking)
-/// 2. Read sequentially, carrying overlap bytes forward via `copy_within`
-/// 3. No seeks, no re-reading overlap from kernel, no per-chunk pool churn
-///
-/// # File Size Semantics
-///
-/// Uses file size from metadata after open (not discovery hint).
-/// This gives point-in-time snapshot semantics:
-/// - Truncated files: we stop at actual EOF
-/// - Growing files: we stop at size-at-open (consistent snapshot)
-///
-/// # Chunk Processing Loop
-///
-/// ```text
-/// ┌────────────────────────────────────────────────────────────────────┐
-/// │                        process_file() flow                         │
-/// └────────────────────────────────────────────────────────────────────┘
-///
-/// open(path) ─► metadata.len() ─► acquire_buffer()
-///                    │
-///                    ▼
-///     ┌──────────────────────────────┐
-///     │     for each chunk:          │◄──────────────────┐
-///     │  1. copy_within(overlap)     │                   │
-///     │  2. read(new_bytes)          │                   │
-///     │  3. scan_chunk_into()        │                   │
-///     │  4. drop_prefix_findings()   │                   │
-///     │  5. emit_findings()          │                   │
-///     └──────────────┬───────────────┘                   │
-///                    │                                   │
-///                    ▼                                   │
-///            offset < file_size? ───yes──────────────────┘
-///                    │
-///                    no
-///                    ▼
-///             release_buffer()
-/// ```
 /// Read a file with an extractable binary format, extract text, and scan it.
 ///
 /// Reads the entire file (up to 64 MiB) into `extract_buf`, runs the
@@ -2277,6 +2413,10 @@ fn extract_and_scan_file<E: ScanEngine>(
         0,
         &mut scratch.scan_scratch,
     );
+    ctx.metrics.findings_dropped = ctx
+        .metrics
+        .findings_dropped
+        .saturating_add(scratch.scan_scratch.dropped_findings());
 
     scratch.pending.clear();
     scratch
@@ -2287,6 +2427,14 @@ fn extract_and_scan_file<E: ScanEngine>(
         dedupe_findings(&mut scratch.pending);
     }
     if !scratch.pending.is_empty() {
+        emit_persistence_batch(
+            scratch.store_producer.as_deref(),
+            &*scratch.event_sink,
+            path_bytes,
+            &scratch.pending,
+            &mut scratch.persist_batch,
+            &mut ctx.metrics,
+        );
         emit_findings(
             engine.as_ref(),
             &*scratch.event_sink,
@@ -2311,6 +2459,47 @@ fn extract_and_scan_file<E: ScanEngine>(
 /// 3. If archive: dispatch to `dispatch_archive_scan` and return.
 /// 4. If binary-skip enabled: probe for NUL bytes / extractable format.
 /// 5. Otherwise: sequential chunk+overlap scan via the buffer pool.
+///
+/// # Design: Sequential Read with Overlap Carry
+///
+/// Instead of seeking back for each chunk's overlap, we:
+/// 1. Acquire ONE buffer for the entire file (blocking)
+/// 2. Read sequentially, carrying overlap bytes forward via `copy_within`
+/// 3. No seeks, no re-reading overlap from kernel, no per-chunk pool churn
+///
+/// # File Size Semantics
+///
+/// Uses file size from metadata after open (not discovery hint).
+/// This gives point-in-time snapshot semantics:
+/// - Truncated files: we stop at actual EOF
+/// - Growing files: we stop at size-at-open (consistent snapshot)
+///
+/// # Chunk Processing Loop
+///
+/// ```text
+/// ┌────────────────────────────────────────────────────────────────────┐
+/// │                        process_file() flow                         │
+/// └────────────────────────────────────────────────────────────────────┘
+///
+/// open(path) ─► metadata.len() ─► acquire_buffer()
+///                    │
+///                    ▼
+///     ┌──────────────────────────────┐
+///     │     for each chunk:          │◄──────────────────┐
+///     │  1. copy_within(overlap)     │                   │
+///     │  2. read(new_bytes)          │                   │
+///     │  3. scan_chunk_into()        │                   │
+///     │  4. drop_prefix_findings()   │                   │
+///     │  5. emit_findings()          │                   │
+///     └──────────────┬───────────────┘                   │
+///                    │                                   │
+///                    ▼                                   │
+///            offset < file_size? ───yes──────────────────┘
+///                    │
+///                    no
+///                    ▼
+///             release_buffer()
+/// ```
 ///
 /// # Error Handling
 ///
@@ -2583,6 +2772,10 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
 
         let data = &buf.as_slice()[..read_len];
         engine.scan_chunk_into(data, task.file_id, base_offset, &mut scratch.scan_scratch);
+        ctx.metrics.findings_dropped = ctx
+            .metrics
+            .findings_dropped
+            .saturating_add(scratch.scan_scratch.dropped_findings());
 
         #[cfg(all(feature = "perf-stats", debug_assertions))]
         {
@@ -2615,6 +2808,14 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
             .findings_emitted
             .wrapping_add(scratch.pending.len() as u64);
 
+        emit_persistence_batch(
+            scratch.store_producer.as_deref(),
+            &*scratch.event_sink,
+            path_bytes,
+            &scratch.pending,
+            &mut scratch.persist_batch,
+            &mut ctx.metrics,
+        );
         // Emit findings
         emit_findings(
             engine.as_ref(),
@@ -2759,6 +2960,7 @@ where
     let dedupe = cfg.dedupe_within_chunk;
     let chunk_size = cfg.chunk_size;
     let event_sink = cfg.event_sink.clone();
+    let store_producer = cfg.store_producer.clone();
 
     // Create executor
     let ex = Executor::<FileTask>::new(
@@ -2771,6 +2973,7 @@ where
             let engine = Arc::clone(&engine);
             let pool = pool.clone();
             let abort_run = Arc::clone(&abort_run);
+            let store_producer = store_producer.clone();
             move |_wid| {
                 let scan_scratch = engine.new_scratch();
                 let depth_cap = archive_cfg.max_archive_depth as usize + 2;
@@ -2798,6 +3001,7 @@ where
                     pool: pool.clone(),
                     scan_scratch,
                     pending: Vec::with_capacity(4096), // Reasonable default
+                    persist_batch: Vec::with_capacity(4096),
                     canon: EntryPathCanonicalizer::with_capacity(
                         DEFAULT_MAX_COMPONENTS,
                         archive_cfg.max_virtual_path_len_per_entry,
@@ -2813,6 +3017,7 @@ where
                     next_virtual_file_id: 0x8000_0000,
                     abort_run: Arc::clone(&abort_run),
                     event_sink: Arc::clone(&event_sink),
+                    store_producer: store_producer.clone(),
                     dedupe_within_chunk: dedupe,
                     chunk_size,
                     max_file_size: cfg.max_file_size,
@@ -2893,6 +3098,23 @@ where
 
     // Aggregate I/O errors from worker metrics into stats
     stats.io_errors = metrics.io_errors;
+    stats.dropped_findings = metrics.findings_dropped;
+    stats.persistence_emit_failures = metrics.persistence_emit_failures;
+    stats.persistence_incomplete =
+        stats.dropped_findings > 0 || stats.persistence_emit_failures > 0;
+
+    if let Some(producer) = store_producer.as_deref() {
+        let run_loss = FsRunLoss {
+            dropped_findings: stats.dropped_findings,
+            persistence_emit_failures: stats.persistence_emit_failures,
+            incomplete: stats.persistence_incomplete,
+        };
+        if producer.record_fs_run_loss(run_loss).is_err() {
+            stats.io_errors = stats.io_errors.saturating_add(1);
+            stats.persistence_emit_failures = stats.persistence_emit_failures.saturating_add(1);
+            stats.persistence_incomplete = true;
+        }
+    }
 
     LocalReport { stats, metrics }
 }
@@ -2904,10 +3126,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::{RuleSpec, TransformConfig, Tuning, ValidatorKind};
     use crate::archive::PartialReason;
     use crate::scheduler::engine_stub::{FindingRec, MockEngine, MockRule, RuleId};
     use crate::scheduler::engine_trait::FindingWithHash;
+    use crate::store::InMemoryStoreProducer;
     use crate::unified::events::VecEventSink;
+    use crate::Engine;
+    use regex::bytes::Regex;
     use std::fs;
     use std::io::Write;
     use tempfile::{NamedTempFile, TempDir};
@@ -2941,11 +3167,44 @@ mod tests {
             archive: ArchiveConfig::default(),
             skip_binary: true,
             event_sink: sink,
+            store_producer: None,
         }
     }
 
     fn small_config() -> LocalConfig {
         small_config_with_sink(Arc::new(VecEventSink::new()))
+    }
+
+    fn real_test_tuning(max_findings_per_chunk: usize) -> Tuning {
+        Tuning {
+            merge_gap: 64,
+            max_windows_per_rule_variant: 64,
+            pressure_gap_start: 128,
+            max_anchor_hits_per_rule_variant: 256,
+            max_utf16_decoded_bytes_per_window: 4096,
+            max_transform_depth: 2,
+            max_total_decode_output_bytes: 1024 * 1024,
+            max_work_items: 64,
+            max_findings_per_chunk,
+            scan_utf16_variants: true,
+        }
+    }
+
+    fn real_simple_rule() -> RuleSpec {
+        RuleSpec {
+            name: "secret",
+            anchors: &[b"SECRET"],
+            radius: 32,
+            validator: ValidatorKind::None,
+            two_phase: None,
+            must_contain: None,
+            keywords_any: None,
+            value_suppressors_any: None,
+            entropy: None,
+            local_context: None,
+            secret_group: None,
+            re: Regex::new(r"SECRET[A-Z0-9]{8}").unwrap(),
+        }
     }
 
     fn assert_perf_u64(actual: u64, expected: u64) {
@@ -3250,29 +3509,34 @@ mod tests {
         }
     }
 
+    /// Wrap a `FindingRec` with a default norm_hash for dedupe tests.
+    fn hashed(f: FindingRec) -> FindingWithHash<FindingRec> {
+        FindingWithHash::new(f, [0; 32])
+    }
+
     #[test]
     fn dedupe_empty_vec() {
-        let mut v: Vec<FindingRec> = Vec::new();
+        let mut v: Vec<FindingWithHash<FindingRec>> = Vec::new();
         dedupe_findings(&mut v);
         assert!(v.is_empty());
     }
 
     #[test]
     fn dedupe_single_element() {
-        let mut v = vec![finding(0, 10, 16)];
+        let mut v = vec![hashed(finding(0, 10, 16))];
         dedupe_findings(&mut v);
         assert_eq!(v.len(), 1);
-        assert_eq!(v[0].root_hint_start, 10);
+        assert_eq!(v[0].finding.root_hint_start, 10);
     }
 
     #[test]
     fn dedupe_removes_exact_duplicates() {
         let mut v = vec![
-            finding(0, 10, 16),
-            finding(0, 10, 16), // dup
-            finding(1, 20, 28),
-            finding(1, 20, 28), // dup
-            finding(2, 50, 56),
+            hashed(finding(0, 10, 16)),
+            hashed(finding(0, 10, 16)), // dup
+            hashed(finding(1, 20, 28)),
+            hashed(finding(1, 20, 28)), // dup
+            hashed(finding(2, 50, 56)),
         ];
         dedupe_findings(&mut v);
         assert_eq!(v.len(), 3);
@@ -3280,14 +3544,22 @@ mod tests {
 
     #[test]
     fn dedupe_preserves_different_rules_same_offsets() {
-        let mut v = vec![finding(0, 10, 16), finding(1, 10, 16), finding(2, 10, 16)];
+        let mut v = vec![
+            hashed(finding(0, 10, 16)),
+            hashed(finding(1, 10, 16)),
+            hashed(finding(2, 10, 16)),
+        ];
         dedupe_findings(&mut v);
         assert_eq!(v.len(), 3, "distinct rule_ids should all be kept");
     }
 
     #[test]
     fn dedupe_preserves_same_rule_different_offsets() {
-        let mut v = vec![finding(0, 10, 16), finding(0, 20, 26), finding(0, 30, 36)];
+        let mut v = vec![
+            hashed(finding(0, 10, 16)),
+            hashed(finding(0, 20, 26)),
+            hashed(finding(0, 30, 36)),
+        ];
         dedupe_findings(&mut v);
         assert_eq!(v.len(), 3, "distinct offsets should all be kept");
     }
@@ -3303,6 +3575,93 @@ mod tests {
         assert_eq!(v.len(), 2);
         assert_eq!(v[0].finding.rule_id, RuleId(0));
         assert_eq!(v[1].finding.rule_id, RuleId(1));
+    }
+
+    #[test]
+    fn persistence_batches_emitted_for_regular_fs_loop() {
+        let engine = Arc::new(test_engine());
+        let sink = Arc::new(VecEventSink::new());
+        let producer = Arc::new(InMemoryStoreProducer::default());
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(b"SECRET one SECRET two").unwrap();
+        tmp.flush().unwrap();
+        let path = tmp.path().to_path_buf();
+        let size = tmp.as_file().metadata().unwrap().len();
+
+        let source = VecFileSource::new(vec![LocalFile { path, size }]);
+        let mut cfg = small_config_with_sink(sink);
+        cfg.store_producer = Some(producer.clone());
+
+        let report = scan_local(engine, source, cfg);
+        let batches = producer.batches();
+        let persisted: usize = batches.iter().map(|b| b.findings.len()).sum();
+
+        assert!(!batches.is_empty(), "expected persisted fs finding batches");
+        assert_eq!(persisted as u64, report.metrics.findings_emitted);
+    }
+
+    #[test]
+    fn dropped_findings_roll_up_into_persistence_run_loss() {
+        let engine = Arc::new(Engine::new(
+            vec![real_simple_rule()],
+            Vec::<TransformConfig>::new(),
+            real_test_tuning(1), // force max-findings drops
+        ));
+        let producer = Arc::new(InMemoryStoreProducer::default());
+        let sink = Arc::new(VecEventSink::new());
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(b"SECRET12345678 and SECRETABCDEFGH").unwrap();
+        tmp.flush().unwrap();
+        let path = tmp.path().to_path_buf();
+        let size = tmp.as_file().metadata().unwrap().len();
+
+        let source = VecFileSource::new(vec![LocalFile { path, size }]);
+        let mut cfg = small_config_with_sink(sink);
+        cfg.chunk_size = 1024;
+        cfg.store_producer = Some(producer.clone());
+        let report = scan_local(engine, source, cfg);
+
+        assert!(report.stats.dropped_findings > 0);
+        assert!(report.stats.persistence_incomplete);
+
+        let losses = producer.losses();
+        assert_eq!(losses.len(), 1);
+        assert_eq!(losses[0].dropped_findings, report.stats.dropped_findings);
+        assert_eq!(
+            losses[0].persistence_emit_failures,
+            report.stats.persistence_emit_failures
+        );
+        assert!(losses[0].incomplete);
+    }
+
+    #[test]
+    fn dedupe_same_span_different_hash_preserves_both() {
+        let mut v = vec![
+            FindingWithHash::new(finding(0, 10, 16), [0xAA; 32]),
+            FindingWithHash::new(finding(0, 10, 16), [0xBB; 32]),
+        ];
+        dedupe_findings(&mut v);
+        assert_eq!(
+            v.len(),
+            2,
+            "same span but different norm_hash must be preserved"
+        );
+    }
+
+    #[test]
+    fn dedupe_same_span_same_hash_collapses() {
+        let mut v = vec![
+            FindingWithHash::new(finding(0, 10, 16), [0xCC; 32]),
+            FindingWithHash::new(finding(0, 10, 16), [0xCC; 32]),
+        ];
+        dedupe_findings(&mut v);
+        assert_eq!(
+            v.len(),
+            1,
+            "identical span and norm_hash should collapse to one"
+        );
     }
 
     // ---------------------------------------------------------------
