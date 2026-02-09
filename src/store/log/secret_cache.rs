@@ -85,6 +85,12 @@ pub struct SecretHashCache {
     entries: [CacheEntry; SECRET_HASH_CACHE_ENTRIES],
 }
 
+impl Default for SecretHashCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SecretHashCache {
     /// Create an empty cache with all slots invalid.
     #[inline]
