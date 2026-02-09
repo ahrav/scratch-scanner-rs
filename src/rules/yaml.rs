@@ -542,7 +542,7 @@ mod tests {
     }
 
     fn lcg_next(state: &mut u64) -> u64 {
-        // Deterministic stream for repeatable "property-style" coverage in unit tests.
+        // Knuth's MMIX LCG (TAOCP Vol 2): a = 6364136223846793005, c = 1442695040888963407.
         *state = state
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
@@ -550,7 +550,7 @@ mod tests {
     }
 
     fn deterministic_secret(state: &mut u64, len: usize) -> String {
-        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
         let mut out = String::with_capacity(len);
         for _ in 0..len {
             let next = lcg_next(state);
@@ -761,7 +761,7 @@ rules:
         let mut checked = 0usize;
         for _ in 0..192 {
             let secret = deterministic_secret(&mut seed, 24);
-            // Skip generated values that intentionally collide with suppressor literals.
+            // Skip generated values that happen to contain a suppressor substring.
             if suppressors.iter().any(|sup| secret.contains(sup)) {
                 continue;
             }
@@ -902,6 +902,40 @@ rules:
         );
     }
 
+    /// Regression test for PR #43 review comment:
+    /// Reviewer claimed URL text like "example.com" in a curl command could
+    /// trigger the "example" suppressor and hide a real bearer token.
+    /// The regex only captures the token inside the header value, so the URL
+    /// is never part of the extracted secret.
+    #[test]
+    fn curl_auth_header_url_with_example_does_not_suppress_real_token() {
+        let rule_name = "curl-auth-header";
+        // Real token + URL containing "example" — should still be reported.
+        let hay =
+            br#"curl https://api.example.com -H "Authorization: Bearer a8f2k9x7m4p1q6w3b5n0j4c9""#;
+        let hits = scan_single_builtin_rule(rule_name, hay);
+        assert!(
+            has_rule_hit(&hits, rule_name),
+            "URL containing 'example' must not suppress a real bearer token"
+        );
+    }
+
+    /// Regression test for PR #43 review comment:
+    /// Reviewer claimed "password" was in hashicorp-tf-password's
+    /// value_suppressors_any, which would suppress real passwords containing
+    /// that substring. In fact, "password" is NOT a suppressor for this rule.
+    #[test]
+    fn hashicorp_tf_password_suppressors_do_not_include_password() {
+        let rule = builtin_rule_by_name("hashicorp-tf-password");
+        let suppressors = rule
+            .value_suppressors_any
+            .expect("hashicorp-tf-password should have value suppressors");
+        assert!(
+            !suppressors.iter().any(|s| s == b"password"),
+            "literal 'password' must not be a value suppressor — it would cause false negatives"
+        );
+    }
+
     #[test]
     fn atlassian_api_token_suppresses_placeholder_value() {
         let rule_name = "atlassian-api-token";
@@ -921,6 +955,104 @@ rules:
         assert!(
             has_rule_hit(&hits, rule_name),
             "expected real-looking atlassian token to be reported"
+        );
+    }
+
+    #[test]
+    fn curl_auth_header_random_high_entropy_values_are_not_suppressed() {
+        let rule_name = "curl-auth-header";
+        let rule = builtin_rule_by_name(rule_name);
+        let suppressors = rule
+            .value_suppressors_any
+            .expect("curl-auth-header should have value suppressors");
+        let suppressors: Vec<&str> = suppressors
+            .iter()
+            .map(|s| std::str::from_utf8(s).expect("suppressor should be valid UTF-8"))
+            .collect();
+
+        let mut seed = 0xDEADBEEFCAFEBABE_u64;
+        let mut checked = 0usize;
+        for _ in 0..192 {
+            let secret = deterministic_secret(&mut seed, 24);
+            // Skip generated values that happen to contain a suppressor substring.
+            if suppressors
+                .iter()
+                .any(|sup| secret.to_ascii_lowercase().contains(&sup.to_ascii_lowercase()))
+            {
+                continue;
+            }
+
+            let distinct = secret
+                .as_bytes()
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<u8>>()
+                .len();
+            if distinct < 8 {
+                continue;
+            }
+
+            let hay = format!("curl -H \"Authorization: Bearer {secret}\" https://api.internal");
+            let hits = scan_single_builtin_rule(rule_name, hay.as_bytes());
+            assert!(
+                has_rule_hit(&hits, rule_name),
+                "expected randomized bearer token '{secret}' to be reported"
+            );
+            checked += 1;
+        }
+
+        assert!(
+            checked >= 96,
+            "expected to validate at least 96 randomized bearer tokens, got {checked}"
+        );
+    }
+
+    #[test]
+    fn curl_auth_user_random_high_entropy_values_are_not_suppressed() {
+        let rule_name = "curl-auth-user";
+        let rule = builtin_rule_by_name(rule_name);
+        let suppressors = rule
+            .value_suppressors_any
+            .expect("curl-auth-user should have value suppressors");
+        let suppressors: Vec<&str> = suppressors
+            .iter()
+            .map(|s| std::str::from_utf8(s).expect("suppressor should be valid UTF-8"))
+            .collect();
+
+        let mut seed = 0xA5A5A5A5B4B4B4B4_u64;
+        let mut checked = 0usize;
+        for _ in 0..192 {
+            let secret = deterministic_secret(&mut seed, 20);
+            // Skip generated values that happen to contain a suppressor substring.
+            if suppressors
+                .iter()
+                .any(|sup| secret.to_ascii_lowercase().contains(&sup.to_ascii_lowercase()))
+            {
+                continue;
+            }
+
+            let distinct = secret
+                .as_bytes()
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<u8>>()
+                .len();
+            if distinct < 8 {
+                continue;
+            }
+
+            let hay = format!("curl -u deploy_svc:{secret} https://registry.internal");
+            let hits = scan_single_builtin_rule(rule_name, hay.as_bytes());
+            assert!(
+                has_rule_hit(&hits, rule_name),
+                "expected randomized curl -u password '{secret}' to be reported"
+            );
+            checked += 1;
+        }
+
+        assert!(
+            checked >= 96,
+            "expected to validate at least 96 randomized curl -u passwords, got {checked}"
         );
     }
 

@@ -530,8 +530,10 @@ pub(super) fn u64_to_usize(v: u64) -> usize {
 /// # Priority
 /// 1. **Configured group**: If `secret_group` is set and that group matched
 ///    non-empty content, use it. This allows rules with unconventional layouts.
-/// 2. **Gitleaks convention**: If capture group 1 exists and is non-empty, use it.
-///    Gitleaks rules place the secret in group 1 by convention.
+/// 2. **First non-empty capture group**: Scan groups 1..N and use the first
+///    one with non-empty content. This handles rules with alternation where
+///    different groups fire depending on input (e.g., `curl-auth-header` has
+///    8 groups for different auth types, only one fires per match).
 /// 3. **Full match fallback**: Otherwise, use group 0 (the entire match).
 ///
 /// Groups that did not participate in the match (`None`) or captured an empty
@@ -574,11 +576,14 @@ pub(super) fn extract_secret_span(
         }
     }
 
-    // Priority 2: Use capture group 1 (gitleaks convention).
-    // Skip if empty to handle optional groups like `([A-Z]*)`.
-    if let Some(m) = captures.get(1) {
-        if m.start() < m.end() {
-            return (m.start(), m.end());
+    // Priority 2: Use the first non-empty capture group (1..N).
+    // Gitleaks convention places the secret in group 1, but rules with
+    // alternation (e.g., curl-auth-header) may fire a higher group.
+    for gi in 1..captures.len() {
+        if let Some(m) = captures.get(gi) {
+            if m.start() < m.end() {
+                return (m.start(), m.end());
+            }
         }
     }
 
@@ -612,9 +617,12 @@ pub(super) fn extract_secret_span_locs(
         }
     }
 
-    if let Some((start, end)) = locs.get(1) {
-        if start < end {
-            return (start, end);
+    // Scan groups 1..N for the first non-empty capture.
+    for gi in 1..locs.len() {
+        if let Some((start, end)) = locs.get(gi) {
+            if start < end {
+                return (start, end);
+            }
         }
     }
 

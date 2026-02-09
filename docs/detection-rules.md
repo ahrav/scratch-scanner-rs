@@ -18,7 +18,7 @@ The values below are from the current repository snapshot:
 - `two_phase` enabled: `2` rules (`private-key`, `vault-service-token-legacy`)
 - `entropy` enabled: `131` rules
 - `local_context` enabled: `1` rule (`generic-api-key`)
-- `value_suppressors_any` enabled: `0` rules
+- `value_suppressors_any` enabled: `5` rules (`generic-api-key`, `hashicorp-tf-password`, `curl-auth-header`, `curl-auth-user`, `atlassian-api-token`)
 - `secret_group` enabled: `2` rules (`microsoft-teams-webhook`, `sonar-api-token`)
 - `must_contain` enabled: `0` rules
 - `keywords_any` enabled: `223` rules
@@ -260,5 +260,5 @@ Guidelines:
    (e.g., `EXAMPLE`, `DUMMY_TOKEN`) that regex and entropy cannot distinguish
    from real secrets. Patterns are case-sensitive and matched on extracted secret bytes.
 6. Set `secret_group` when the secret is not the full match.
-6. Derived anchors are enabled by default (`AnchorPolicy::PreferDerived`) and
+7. Derived anchors are enabled by default (`AnchorPolicy::PreferDerived`) and
    may produce a compiled `confirm_all` gate from regex literal islands.
