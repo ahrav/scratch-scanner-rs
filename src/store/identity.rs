@@ -1,10 +1,37 @@
 //! Phase A persistence identity contracts.
 //!
 //! This module defines versioned, deterministic contracts for:
-//! - `rule_fingerprint`: canonical policy identity for a rule.
-//! - `secret_hash`: keyed hash over existing engine `norm_hash`.
-//! - `occurrence_id`: canonical finding identity that mirrors current dedupe
+//! - [`rule_fingerprint`]: canonical policy identity for a rule.
+//! - [`secret_hash`]: keyed hash over existing engine `norm_hash`.
+//! - [`occurrence_id`]: canonical finding identity that mirrors current dedupe
 //!   semantics (root-hint normalization + UTF-16 variant discrimination).
+//!
+//! # Algorithm
+//!
+//! All three derivations follow the same pattern:
+//! 1. Build a canonical byte payload from the input fields.
+//! 2. Feed the payload through `keyed_hash` — a domain-separated BLAKE3 keyed
+//!    hash using one of the subkeys from [`StoreKeys`].
+//!
+//! Domain separation (a NUL-terminated domain string prepended to the payload)
+//! ensures that identical byte payloads used in different contexts produce
+//! distinct hashes, preventing cross-contract collisions.
+//!
+//! `occurrence_id` additionally normalizes its inputs before hashing to absorb
+//! benign variation that the engine's existing dedupe logic already collapses:
+//! - **Root-hint end normalization**: base64 padding bytes (1–3 trailing `=`)
+//!   cause the encoded-region length to vary for identical decoded content;
+//!   `normalize_root_hint_end` snaps the end offset to the padding-free minimum
+//!   so both padded and unpadded encodings hash identically.
+//! - **Non-root span erasure**: for transform-derived findings, the decoded-buffer
+//!   span is unstable across chunk boundaries, so it is zeroed out; only the
+//!   root-hint window participates in identity.
+//!
+//! # Versioning
+//!
+//! [`IDENTITY_CONTRACT_VERSION`] is embedded in every canonical payload. Changing
+//! any encoding detail requires bumping this version so that old and new hashes
+//! never collide silently.
 
 use crate::api::{FindingRec, RuleSpec, StepId, STEP_ROOT};
 
@@ -26,10 +53,21 @@ pub type OccurrenceId = [u8; 32];
 
 /// UTF-16 variant discriminator for occurrence identity.
 ///
+/// The engine can discover the same secret in raw bytes and again inside a
+/// UTF-16 LE or BE re-encoding of the same region. Each encoding produces a
+/// distinct finding that must hash to a distinct [`OccurrenceId`], so the
+/// variant is included in the canonical payload.
+///
 /// Values intentionally match the discriminant semantics from decode-state:
 /// - 0: no UTF-16 variant
 /// - 1: UTF-16 LE
 /// - 2: UTF-16 BE
+///
+/// # Invariant
+///
+/// Root-step findings (`step_id == STEP_ROOT`) must always use [`None`](Self::None).
+/// UTF-16 variants only arise from transform-derived buffers, so a root finding
+/// with a non-`None` variant is a caller bug, rejected by `IdentityFlags::from_parts`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum VariantDiscriminant {
@@ -43,8 +81,24 @@ pub enum VariantDiscriminant {
 
 /// Identity flags encoded into canonical occurrence payloads.
 ///
-/// This explicit flags word supports strict validation and forward-compatible
-/// evolution of occurrence semantics.
+/// Rather than encoding boolean properties implicitly via which payload fields
+/// are zero, flags make every semantic dimension explicit and machine-checkable.
+/// This prevents silent breakage if a new dimension is added: unknown bits
+/// cause [`from_bits_strict`](Self::from_bits_strict) to reject the payload.
+///
+/// # Layout
+///
+/// ```text
+/// bit 0   FLAG_ROOT_STEP              — finding is from the root buffer
+/// bit 1   FLAG_SPAN_INCLUDED          — decoded-buffer span participates in identity
+/// bit 2   FLAG_ROOT_HINT_END_NORMALIZED — root_hint_end was padding-normalized
+/// bits 8–9  UTF-16 variant (mutually exclusive)
+///   bit 8   FLAG_UTF16_LE
+///   bit 9   FLAG_UTF16_BE
+/// ```
+///
+/// Bits 3–7 and 10–31 are reserved; setting any of them is rejected as unknown.
+/// Bits 8 and 9 are mutually exclusive; setting both is a contradictory state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IdentityFlags(u32);
 
@@ -72,14 +126,30 @@ impl IdentityFlags {
         Ok(Self(bits))
     }
 
-    fn from_parts(step_id: StepId, variant: VariantDiscriminant) -> Result<Self, IdentityError> {
+    /// Derives flags from `(step_id, include_span, variant)`, enforcing structural
+    /// invariants:
+    ///
+    /// - Root findings (`STEP_ROOT`) always set `ROOT_STEP` and include span.
+    /// - Transform findings (non-root) set `ROOT_HINT_END_NORMALIZED` because
+    ///   their root-hint end may have been snapped by padding normalization.
+    /// - Span inclusion follows engine dedupe semantics (`dedupe_with_span`):
+    ///   included when root-span mapping is unavailable, excluded otherwise.
+    /// - A root finding with a UTF-16 variant is rejected as a caller bug.
+    fn from_parts(
+        step_id: StepId,
+        include_span: bool,
+        variant: VariantDiscriminant,
+    ) -> Result<Self, IdentityError> {
         if step_id == STEP_ROOT && !matches!(variant, VariantDiscriminant::None) {
             return Err(IdentityError::RootStepHasVariant { variant });
         }
 
         let mut bits = 0u32;
         if step_id == STEP_ROOT {
-            bits |= Self::FLAG_ROOT_STEP | Self::FLAG_SPAN_INCLUDED;
+            bits |= Self::FLAG_ROOT_STEP;
+        }
+        if include_span {
+            bits |= Self::FLAG_SPAN_INCLUDED;
         }
         if step_id != STEP_ROOT {
             bits |= Self::FLAG_ROOT_HINT_END_NORMALIZED;
@@ -130,14 +200,20 @@ impl std::fmt::Display for IdentityError {
 impl std::error::Error for IdentityError {}
 
 /// Input payload for occurrence identity derivation.
+///
+/// The caller is responsible for computing [`rule_fingerprint`] and
+/// [`secret_hash`] before constructing this struct. `object_key` must be a
+/// stable, canonical byte representation of the scanned object (e.g. a
+/// repo-relative path); using non-canonical keys (such as an absolute
+/// filesystem path that varies by machine) will produce non-reproducible IDs.
 pub struct OccurrenceInput<'a> {
-    /// Stable object identity bytes (for example canonical path key).
+    /// Stable object identity bytes (e.g. canonical repo-relative path).
     pub object_key: &'a [u8],
-    /// Engine finding record.
+    /// Engine finding record for this occurrence.
     pub finding: &'a FindingRec,
-    /// Precomputed rule fingerprint.
+    /// Precomputed rule fingerprint (from [`rule_fingerprint`]).
     pub rule_fingerprint: &'a RuleFingerprint,
-    /// Precomputed secret hash.
+    /// Precomputed secret hash (from [`secret_hash`]).
     pub secret_hash: &'a SecretHash,
     /// UTF-16 variant discriminator from decode provenance.
     pub variant: VariantDiscriminant,
@@ -188,27 +264,43 @@ pub fn occurrence_id(
     ))
 }
 
+/// Normalized snapshot of the identity-relevant fields from a [`FindingRec`].
+///
+/// This intermediate separates normalization (which may fail) from encoding
+/// (which is infallible), keeping each step testable in isolation.
+/// Fields that do not participate in identity for a given finding class are
+/// zeroed during construction (e.g. `span_start`/`span_end` for non-root).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CanonicalFinding {
     flags: IdentityFlags,
+    /// Decoded-buffer span; zero for non-root findings (unstable across chunks).
     span_start: u32,
     span_end: u32,
     root_hint_start: u64,
+    /// May have been snapped by [`normalize_root_hint_end`] for non-root findings.
     root_hint_end: u64,
     variant: VariantDiscriminant,
 }
 
+/// Normalize a [`FindingRec`] into identity-canonical form.
+///
+/// Two normalizations are applied:
+/// 1. Non-root spans are zeroed (they shift with chunk alignment and must not
+///    affect identity).
+/// 2. `root_hint_end` is snapped to the padding-free minimum for non-root
+///    findings whose encoded length falls in the base64 padding window.
 fn canonicalize_finding(
     finding: &FindingRec,
     variant: VariantDiscriminant,
 ) -> Result<CanonicalFinding, IdentityError> {
     let root_hint_end = normalize_root_hint_end(finding);
-    let (span_start, span_end) = if finding.step_id == STEP_ROOT {
+    let include_span = finding.dedupe_with_span || finding.step_id == STEP_ROOT;
+    let (span_start, span_end) = if include_span {
         (finding.span_start, finding.span_end)
     } else {
         (0, 0)
     };
-    let flags = IdentityFlags::from_parts(finding.step_id, variant)?;
+    let flags = IdentityFlags::from_parts(finding.step_id, include_span, variant)?;
 
     Ok(CanonicalFinding {
         flags,
@@ -220,6 +312,26 @@ fn canonicalize_finding(
     })
 }
 
+/// Snap `root_hint_end` to remove base64 padding jitter for non-root findings.
+///
+/// # Problem
+///
+/// Base64 encodes 3 raw bytes into 4 encoded characters. When the raw length
+/// is not a multiple of 3, the encoder appends 1–3 `=` padding characters.
+/// Different base64 implementations (or the same implementation across
+/// versions) may or may not include the padding, causing `root_hint_end` to
+/// vary by up to 3 bytes for identical decoded content.
+///
+/// # Solution
+///
+/// For non-root findings, compute the minimum encoded length that could
+/// represent the decoded span (`ceil(decoded_len * 4 / 3)`). If the actual
+/// encoded region length exceeds this minimum by 1–3 bytes — exactly the
+/// padding window — snap `root_hint_end` back to the minimum. Differences
+/// outside this window are left untouched because they indicate a genuinely
+/// different encoded region, not mere padding variation.
+///
+/// Root findings are returned unchanged because their spans are authoritative.
 fn normalize_root_hint_end(finding: &FindingRec) -> u64 {
     if finding.step_id == STEP_ROOT {
         return finding.root_hint_end;
@@ -236,6 +348,16 @@ fn normalize_root_hint_end(finding: &FindingRec) -> u64 {
     finding.root_hint_end
 }
 
+/// Serialize a canonical occurrence payload into `out`.
+///
+/// The encoding uses NUL-terminated ASCII tags before each field group so that
+/// the byte stream is self-describing and unambiguous even without a length
+/// prefix on every field. Tag ordering is fixed and must not be reordered;
+/// doing so changes the hash and requires a version bump.
+///
+/// The payload begins with a fixed header (`"occurrence_canonical\0"` +
+/// version byte) followed by tagged fields in this order: flags, object,
+/// rule_fingerprint, secret_hash, span, root_hint, variant.
 fn encode_occurrence_canonical(
     out: &mut Vec<u8>,
     object_key: &[u8],
@@ -272,6 +394,13 @@ fn encode_occurrence_canonical(
     out.push(finding.variant as u8);
 }
 
+/// Domain-separated BLAKE3 keyed hash: `H_key(domain ‖ 0x00 ‖ payload)`.
+///
+/// The NUL byte between domain and payload prevents ambiguity when a domain
+/// string is a prefix of another (e.g. `"foo"` vs `"foobar"`). Because BLAKE3
+/// keyed mode accepts exactly 32-byte keys and provides PRF security, this
+/// construction gives collision resistance across all `(domain, payload)` pairs
+/// under the same key.
 fn keyed_hash(key: &[u8; 32], domain: &[u8], payload: &[u8]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_keyed(key);
     hasher.update(domain);
@@ -546,6 +675,53 @@ mod tests {
         .expect("valid occurrence");
 
         assert_eq!(id_a, id_b);
+    }
+
+    #[test]
+    fn occurrence_id_distinguishes_non_root_span_when_dedupe_with_span_true() {
+        let keys = test_keys();
+        let rule_fp = rand_arr(&mut 21);
+        let secret = rand_arr(&mut 22);
+        let finding_a = FindingRec {
+            file_id: FileId(19),
+            rule_id: 3,
+            span_start: 100,
+            span_end: 116,
+            root_hint_start: 20_000,
+            root_hint_end: 20_024,
+            dedupe_with_span: true,
+            step_id: StepId(4),
+        };
+        let finding_b = FindingRec {
+            span_start: 900,
+            span_end: 916,
+            ..finding_a
+        };
+
+        let id_a = occurrence_id(
+            OccurrenceInput {
+                object_key: b"repo:src/engine/stream_decode.rs",
+                finding: &finding_a,
+                rule_fingerprint: &rule_fp,
+                secret_hash: &secret,
+                variant: VariantDiscriminant::None,
+            },
+            &keys,
+        )
+        .expect("valid occurrence");
+        let id_b = occurrence_id(
+            OccurrenceInput {
+                object_key: b"repo:src/engine/stream_decode.rs",
+                finding: &finding_b,
+                rule_fingerprint: &rule_fp,
+                secret_hash: &secret,
+                variant: VariantDiscriminant::None,
+            },
+            &keys,
+        )
+        .expect("valid occurrence");
+
+        assert_ne!(id_a, id_b);
     }
 
     #[test]

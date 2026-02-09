@@ -2,13 +2,33 @@
 //!
 //! This module owns persistence identity key material. It loads the optional
 //! `SCANNER_SECRET_KEY` environment variable and always returns derived subkeys:
-//! - `identity_key` for rule/occurrence identifiers.
-//! - `secret_key` for per-finding secret hashing.
-//! - `metadata_key` for run metadata authentication/derivation.
+//! - `identity_key` — used by [`identity::rule_fingerprint`](super::identity::rule_fingerprint)
+//!   and [`identity::occurrence_id`](super::identity::occurrence_id).
+//! - `secret_key` — used by [`identity::secret_hash`](super::identity::secret_hash).
+//! - `metadata_key` — available for run metadata authentication/derivation.
 //!
 //! Missing or invalid env input falls back to an ephemeral per-process key and
 //! marks run metadata accordingly so downstream consumers can avoid assuming
 //! cross-run correlation.
+//!
+//! # Key Derivation Model
+//!
+//! Subkeys are derived via [`blake3::derive_key`], which implements BLAKE3's
+//! key-derivation function (KDF) mode. Unlike `new_keyed` (which is a PRF/MAC),
+//! `derive_key` accepts an arbitrary-length context string and is purpose-built
+//! for deriving independent subkeys from a single root key. Each subkey's
+//! context string (e.g. [`KEY_DERIVE_CONTEXT_IDENTITY_V1`]) acts as a
+//! domain separator, ensuring that subkeys are cryptographically independent
+//! even though they share the same root material.
+//!
+//! # Ephemeral Fallback
+//!
+//! When the environment variable is missing or invalid, the module generates a
+//! one-time random root key (preferring `/dev/urandom`, with a deterministic
+//! entropy-mixing fallback). The resulting [`RunModeMetadata`] advertises
+//! [`CorrelationMode::Ephemeral`] so that callers know the derived IDs are
+//! only meaningful within the current process and cannot be correlated across
+//! runs.
 
 use std::ffi::OsStr;
 use std::fmt;
@@ -108,8 +128,16 @@ impl fmt::Debug for StoreKeys {
 impl StoreKeys {
     /// Bootstrap store keys from `SCANNER_SECRET_KEY` with ephemeral fallback.
     ///
-    /// `SCANNER_SECRET_KEY` must be standard base64 that decodes to exactly 32 bytes.
-    /// Any missing/invalid value produces an ephemeral per-process key.
+    /// `SCANNER_SECRET_KEY` must be standard base64 (RFC 4648 §4) that decodes to
+    /// exactly 32 bytes. Any missing, non-UTF-8, incorrectly-sized, or
+    /// non-base64 value produces an ephemeral per-process key; check
+    /// [`RunModeMetadata::key_source`] to distinguish these cases.
+    ///
+    /// # Thread Safety
+    ///
+    /// This reads `std::env::var_os` which is not synchronized against
+    /// concurrent `set_var` calls. In production this is fine (env is set once
+    /// before threads spawn); tests that mutate the env must serialize access.
     #[must_use]
     pub fn bootstrap_from_env() -> Self {
         Self::bootstrap_from_os_value(std::env::var_os(SCANNER_SECRET_KEY_ENV).as_deref())
@@ -134,6 +162,10 @@ impl StoreKeys {
         )
     }
 
+    /// Derive all three subkeys from `root_key` using BLAKE3 KDF mode.
+    ///
+    /// Each subkey uses a distinct context string, so the three keys are
+    /// cryptographically independent even though they share the same root.
     fn from_root_key(root_key: [u8; 32], run_mode: RunModeMetadata) -> Self {
         let identity_key = blake3::derive_key(KEY_DERIVE_CONTEXT_IDENTITY_V1, &root_key);
         let secret_key = blake3::derive_key(KEY_DERIVE_CONTEXT_SECRET_V1, &root_key);
@@ -191,6 +223,22 @@ fn parse_root_key(raw: &OsStr) -> Option<[u8; 32]> {
     Some(out)
 }
 
+/// Generate a one-time ephemeral root key.
+///
+/// Prefers `/dev/urandom` (cryptographically strong on all supported platforms).
+/// If that fails (e.g. sandboxed environment without filesystem access), falls
+/// back to BLAKE3-mixing several low-quality entropy sources:
+///
+/// - **Domain tag** — prevents collisions with other BLAKE3 uses.
+/// - **PID** — unique within a boot epoch.
+/// - **Wall-clock nanos** — high-resolution monotonic-ish timestamp.
+/// - **Stack pointer** — ASLR-randomized virtual address.
+/// - **Thread ID** — distinguishes concurrent bootstrap calls.
+///
+/// This fallback is *not* cryptographically strong (an attacker who knows the
+/// process state can predict the key), but it is sufficient for the ephemeral
+/// use case: the IDs are only valid within the current process and are never
+/// persisted or shared.
 fn generate_ephemeral_root_key() -> [u8; 32] {
     let mut key = [0u8; 32];
     if fill_from_urandom(&mut key).is_ok() {
@@ -211,10 +259,24 @@ fn generate_ephemeral_root_key() -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
+/// Read 32 bytes from `/dev/urandom`.
+///
+/// Uses the filesystem path rather than the `getrandom` crate to avoid an
+/// extra dependency for a single call site. `/dev/urandom` is non-blocking
+/// and available on all Linux/macOS targets this scanner supports.
+#[cfg(unix)]
 fn fill_from_urandom(out: &mut [u8; 32]) -> std::io::Result<()> {
     let mut f = std::fs::File::open("/dev/urandom")?;
     f.read_exact(out)?;
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn fill_from_urandom(_out: &mut [u8; 32]) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "urandom not available on this platform",
+    ))
 }
 
 #[cfg(test)]

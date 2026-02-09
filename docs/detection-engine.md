@@ -212,8 +212,9 @@ Filesystem persistence now has a separate identity contract in `src/store/`:
   bytes (no hot-path raw-secret rehash rewrite).
 - `store::identity::occurrence_id` reuses dedupe semantics from
   `push_finding_with_drop_hint`: transform root-hint end normalization for
-  base64 padding tolerance, root-only span contribution, and UTF-16 LE/BE
-  variant discrimination.
+  base64 padding tolerance, span contribution only when dedupe includes span
+  (`step_id == STEP_ROOT` or `dedupe_with_span`), and UTF-16 LE/BE variant
+  discrimination.
 
 **Pressure Coalescing**: If windows exceed `max_windows_per_rule_variant` (16), the gap doubles until windows fit, or everything merges into one.
 

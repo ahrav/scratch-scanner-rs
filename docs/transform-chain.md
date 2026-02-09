@@ -150,7 +150,8 @@ with worker-local reusable state).
 For persistence IDs (`src/store/identity.rs`), transform-derived findings use:
 
 - Root-hint end normalization tolerant to base64 padding variance (`min..min+3`).
-- Root-only span contribution (`step_id == STEP_ROOT`).
+- Span contribution when dedupe includes span (`step_id == STEP_ROOT` or
+  `dedupe_with_span`).
 - UTF-16 LE/BE variant discriminator carried into `occurrence_id`.
 
 These rules intentionally mirror dedupe semantics in

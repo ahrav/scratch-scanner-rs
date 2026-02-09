@@ -1,8 +1,10 @@
 //! Persistence store contracts shared by filesystem persistence phases.
 //!
 //! Phase A provides:
-//! - key bootstrap and run metadata (`keys`)
-//! - versioned identity derivation (`identity`)
+//! - [`keys`] — key bootstrap from `SCANNER_SECRET_KEY` (or ephemeral fallback)
+//!   and [`RunModeMetadata`] describing the correlation semantics of this run.
+//! - [`identity`] — versioned, deterministic derivation of [`RuleFingerprint`],
+//!   [`SecretHash`], and [`OccurrenceId`] from engine findings and store keys.
 
 pub mod identity;
 pub mod keys;
