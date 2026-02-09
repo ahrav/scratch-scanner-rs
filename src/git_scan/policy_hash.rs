@@ -191,6 +191,22 @@ mod tests {
     }
 
     #[test]
+    fn policy_hash_is_sensitive_to_value_suppressors_any() {
+        let mut r1 = rule("a", "a", &[b"a"]);
+        let mut r2 = rule("a", "a", &[b"a"]);
+        r1.value_suppressors_any = None;
+        r2.value_suppressors_any = Some(&[b"EXAMPLE"]);
+        let tuning = demo_tuning();
+
+        let h1 = policy_hash(&[r1], &transforms(), &tuning, MergeDiffMode::AllParents, 1);
+        let h2 = policy_hash(&[r2], &transforms(), &tuning, MergeDiffMode::AllParents, 1);
+        assert_ne!(
+            h1, h2,
+            "changing value_suppressors_any must change the policy hash"
+        );
+    }
+
+    #[test]
     fn policy_hash_is_order_invariant_for_rules() {
         let r1 = rule("a", "a", &[b"a"]);
         let r2 = rule("b", "b", &[b"b"]);

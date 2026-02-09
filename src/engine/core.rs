@@ -225,7 +225,7 @@ pub struct Engine {
     /// allowing gate data to be shared or deduplicated in the future.
     pub(super) confirm_all_gates: Vec<ConfirmAllCompiled>,
     pub(super) keyword_gates: Vec<KeywordsCompiled>,
-    // Accessed by runtime value-level suppression in `window_validate`.
+    /// Value-level suppression patterns checked against extracted secret bytes.
     pub(super) value_suppressor_gates: Vec<PackedPatterns>,
     pub(super) entropy_gates: Vec<EntropyCompiled>,
     pub(super) two_phase_gates: Vec<TwoPhaseCompiled>,

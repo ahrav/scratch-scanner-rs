@@ -1172,6 +1172,166 @@ fn value_suppressor_applies_in_base64_stream_decode_utf16_path() {
 }
 
 #[test]
+fn value_suppressor_filters_in_chunked_scan_path() {
+    let rule = RuleSpec {
+        name: "value-suppressor-chunked",
+        anchors: &[b"TOK_"],
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: Some(&[b"EXAMPLE"]),
+        entropy: None,
+        local_context: None,
+        secret_group: Some(1),
+        re: Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Two secrets: one suppressed, one not.
+    let hay = b"prefix TOK_AEXAMPLE9 middle TOK_LIVEKEY12 suffix";
+    let hits = scan_in_chunks(&engine, hay, 32);
+    let names: Vec<&str> = hits
+        .iter()
+        .filter(|r| r.rule_id == 0)
+        .map(|_| "value-suppressor-chunked")
+        .collect();
+    assert_eq!(
+        names.len(),
+        1,
+        "chunked scan: expected exactly one finding (suppressed secret filtered, live secret kept)"
+    );
+}
+
+#[test]
+fn value_suppressor_is_case_sensitive() {
+    let rule = RuleSpec {
+        name: "value-suppressor-case",
+        anchors: &[b"TOK_"],
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: Some(&[b"example"]),
+        entropy: None,
+        local_context: None,
+        secret_group: Some(1),
+        re: Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Secret contains "EXAMPLE" (uppercase) but suppressor is "example" (lowercase).
+    // Case-sensitive matching means the finding should NOT be suppressed.
+    let hay = b"prefix TOK_AEXAMPLE9 suffix";
+    let hits = scan_chunk_findings(&engine, hay);
+    assert!(
+        hits.iter().any(|h| h.rule == "value-suppressor-case"),
+        "case-sensitive suppressor should not match different-case secret"
+    );
+}
+
+#[test]
+fn value_suppressor_works_with_full_match_fallback() {
+    // No capture groups → secret_group: None falls back to the full match.
+    let rule = RuleSpec {
+        name: "value-suppressor-full-match",
+        anchors: &[b"TOK_"],
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: Some(&[b"TOK_AAAABBBB"]),
+        entropy: None,
+        local_context: None,
+        secret_group: None,
+        re: Regex::new(r"TOK_[A-Z]{8}").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // This secret matches the suppressor exactly.
+    let hay_suppressed = b"prefix TOK_AAAABBBB suffix";
+    let hits = scan_chunk_findings(&engine, hay_suppressed);
+    assert!(
+        !hits.iter()
+            .any(|h| h.rule == "value-suppressor-full-match"),
+        "suppressor should filter full-match secret"
+    );
+
+    // This secret does NOT match the suppressor.
+    let hay_pass = b"prefix TOK_CCCCDDDD suffix";
+    let hits = scan_chunk_findings(&engine, hay_pass);
+    assert!(
+        hits.iter()
+            .any(|h| h.rule == "value-suppressor-full-match"),
+        "non-matching full-match secret should pass"
+    );
+}
+
+#[test]
+fn value_suppressor_single_byte_pattern() {
+    let rule = RuleSpec {
+        name: "value-suppressor-single-byte",
+        anchors: &[b"TOK_"],
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: Some(&[b"X"]),
+        entropy: None,
+        local_context: None,
+        secret_group: Some(1),
+        re: Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Secret contains 'X' → should be suppressed.
+    let hay_with_x = b"prefix TOK_ABCDXFGH suffix";
+    let hits = scan_chunk_findings(&engine, hay_with_x);
+    assert!(
+        !hits.iter()
+            .any(|h| h.rule == "value-suppressor-single-byte"),
+        "single-byte suppressor should match and filter"
+    );
+
+    // Secret has no 'X' → should pass.
+    let hay_no_x = b"prefix TOK_ABCDEFGH suffix";
+    let hits = scan_chunk_findings(&engine, hay_no_x);
+    assert!(
+        hits.iter()
+            .any(|h| h.rule == "value-suppressor-single-byte"),
+        "single-byte suppressor should not match when absent"
+    );
+}
+
+#[test]
 fn entropy_gate_filters_low_entropy_matches() {
     const ANCHORS: &[&[u8]] = &[b"TOK_"];
     let rule = RuleSpec {

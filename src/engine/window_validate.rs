@@ -416,6 +416,8 @@ impl Engine {
                         let secret_end = search_start + secret_end;
                         let secret_bytes = &window[secret_start..secret_end];
 
+                        // Value suppressor gate: discard findings whose extracted
+                        // secret contains a known placeholder/example pattern.
                         if let Some(vs) = value_suppressors {
                             if contains_any_memmem(secret_bytes, vs) {
                                 return;
@@ -663,6 +665,7 @@ impl Engine {
                 let (secret_start, secret_end) = extract_secret_span_locs(locs, rule.secret_group);
                 let secret_bytes = &decoded[secret_start..secret_end];
 
+                // Value suppressor gate (see raw-path comment for rationale).
                 if let Some(vs) = value_suppressors {
                     if contains_any_memmem(secret_bytes, vs) {
                         return;
@@ -824,6 +827,7 @@ impl Engine {
                 let secret_end = search_start + secret_end;
                 let secret_bytes = &window[secret_start..secret_end];
 
+                // Value suppressor gate (see raw-path comment for rationale).
                 if let Some(vs) = value_suppressors {
                     if contains_any_memmem(secret_bytes, vs) {
                         return;
@@ -1039,6 +1043,7 @@ impl Engine {
                 let (secret_start, secret_end) = extract_secret_span_locs(locs, rule.secret_group);
                 let secret_bytes = &decoded[secret_start..secret_end];
 
+                // Value suppressor gate (see raw-path comment for rationale).
                 if let Some(vs) = value_suppressors {
                     if contains_any_memmem(secret_bytes, vs) {
                         return;

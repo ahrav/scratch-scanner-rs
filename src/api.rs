@@ -582,8 +582,8 @@ impl LocalContextSpec {
 ///
 /// # Invariants
 /// - `name` must be non-empty.
-/// - `two_phase`, `must_contain`, `keywords_any`, `value_suppressors_any`, and
-///   `entropy` must be valid when present.
+/// - `two_phase`, `must_contain`, `keywords_any`, `value_suppressors_any`,
+///   `entropy`, and `local_context` must be valid when present.
 ///
 /// # Design Notes
 /// - Anchors should be ASCII-ish; UTF-16 variants are derived automatically.
@@ -592,8 +592,11 @@ impl LocalContextSpec {
 ///
 /// # Performance
 /// - Smaller `radius` values reduce regex work but can miss matches if too small.
-/// - `must_contain`, `keywords_any`, `value_suppressors_any`, and `entropy` act as
-///   progressively cheaper filters.
+/// - `must_contain`, `keywords_any`, and `entropy` act as progressively cheaper
+///   pre-/post-regex filters evaluated on the match window.
+/// - `value_suppressors_any` is a post-extraction filter that runs after regex
+///   matching and entropy gating; it adds minimal cost per confirmed match but
+///   does not reduce regex work.
 #[derive(Clone, Debug)]
 pub struct RuleSpec {
     /// Rule name used for reporting.
@@ -638,8 +641,14 @@ pub struct RuleSpec {
     /// Optional value suppressor gate (any-of) checked on extracted secret bytes.
     ///
     /// This is a *post-match* filter: when any configured literal appears in the
-    /// extracted secret value, the finding is suppressed. Patterns are matched on
-    /// raw bytes and are currently case-sensitive.
+    /// extracted secret value, the finding is suppressed. Useful for suppressing
+    /// known placeholder or example values (e.g., `EXAMPLE`, `DUMMY_TOKEN`) that
+    /// regex and entropy gates cannot distinguish from real secrets.
+    ///
+    /// Patterns are matched on raw bytes and are case-sensitive. Unlike
+    /// `keywords_any`, which operates on the full window before regex execution,
+    /// value suppressors operate on the extracted secret span after regex
+    /// matching and entropy gating.
     pub value_suppressors_any: Option<&'static [&'static [u8]]>,
 
     /// Optional entropy gate evaluated on each regex match.

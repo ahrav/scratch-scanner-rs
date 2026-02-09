@@ -319,9 +319,10 @@ pub(super) struct EntropyCompiled {
 /// 1. **Every candidate**: `re`, `must_contain`, `needs_assignment_shape_check`
 ///    — touched for every merged window to decide if the regex runs.
 /// 2. **Post-match only**: `secret_group` — read only when the regex matches.
-/// 3. **Gate indices**: `confirm_all`, `keywords`, `entropy`, `local_context`,
-///    `two_phase` — dereferenced through `Engine` pool accessors only when
-///    the corresponding gate is present (`Some`). Most rules have 0–2 gates,
+/// 3. **Gate indices**: `confirm_all`, `keywords`, `value_suppressors`,
+///    `entropy`, `local_context`, `two_phase` — dereferenced through `Engine`
+///    pool accessors only when the corresponding gate is present (`Some`).
+///    Most rules have 0–2 gates,
 ///    so these are cold for the majority of candidates.
 ///
 /// # Gate pool access
@@ -436,6 +437,9 @@ pub(super) fn compile_rule(spec: &RuleSpec) -> (RuleCompiled, CompiledGates) {
         }
     });
 
+    // Value suppressors only need raw patterns: they are checked against
+    // extracted secret bytes (post-regex), which are always in decoded byte
+    // space, never raw UTF-16 window bytes.
     let value_suppressors = spec.value_suppressors_any.map(|suppressors| {
         let count = suppressors.len();
         let raw_bytes = suppressors.iter().map(|p| p.len()).sum::<usize>();
