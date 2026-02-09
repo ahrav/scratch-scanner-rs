@@ -1548,7 +1548,7 @@ mod tests {
         // Find and chmod the segments directory.
         let mut segments_dir = None;
         for entry in fs::read_dir(tmp.path()).unwrap().flatten() {
-            if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+            if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
                 let seg_dir = entry.path().join(SEGMENTS_DIR);
                 if seg_dir.exists() {
                     segments_dir = Some(seg_dir);
