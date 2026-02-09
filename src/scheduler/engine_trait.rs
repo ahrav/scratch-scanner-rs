@@ -51,6 +51,7 @@
 //! The engine is immutable and shared; scratch is per-worker and never shared.
 
 use crate::api::FileId;
+use crate::engine::NormHash;
 
 // ============================================================================
 // FindingRecord Trait
@@ -82,6 +83,7 @@ use crate::api::FileId;
 ///
 /// - [`engine_stub::FindingRec`](super::engine_stub::FindingRec) (mock)
 /// - [`crate::api::FindingRec`] (real engine)
+/// - [`FindingWithHash`] wrapper carrier (delegates to inner record)
 pub trait FindingRecord: Clone + Send + 'static {
     /// Rule index that produced this finding.
     fn rule_id(&self) -> u32;
@@ -103,6 +105,52 @@ pub trait FindingRecord: Clone + Send + 'static {
 
     /// Full match span end offset (byte position in original buffer).
     fn span_end(&self) -> u64;
+}
+
+/// Finding record bundled with normalized hash bytes.
+///
+/// This carrier preserves strict 1:1 alignment between finding metadata and the
+/// normalized secret hash emitted by the engine scratch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FindingWithHash<F: FindingRecord> {
+    /// Underlying engine finding record.
+    pub finding: F,
+    /// Normalized secret hash aligned with `finding`.
+    pub norm_hash: NormHash,
+}
+
+impl<F: FindingRecord> FindingWithHash<F> {
+    #[inline]
+    pub const fn new(finding: F, norm_hash: NormHash) -> Self {
+        Self { finding, norm_hash }
+    }
+}
+
+impl<F: FindingRecord> FindingRecord for FindingWithHash<F> {
+    #[inline]
+    fn rule_id(&self) -> u32 {
+        self.finding.rule_id()
+    }
+
+    #[inline]
+    fn root_hint_start(&self) -> u64 {
+        self.finding.root_hint_start()
+    }
+
+    #[inline]
+    fn root_hint_end(&self) -> u64 {
+        self.finding.root_hint_end()
+    }
+
+    #[inline]
+    fn span_start(&self) -> u64 {
+        self.finding.span_start()
+    }
+
+    #[inline]
+    fn span_end(&self) -> u64 {
+        self.finding.span_end()
+    }
 }
 
 // ============================================================================
@@ -222,4 +270,59 @@ pub trait ScanEngine: Send + Sync + 'static {
     ///
     /// Used for output formatting. Returns `"<unknown-rule>"` for invalid IDs.
     fn rule_name(&self, rule_id: u32) -> &str;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FindingRecord, FindingWithHash};
+
+    #[derive(Clone, Copy)]
+    struct DummyFinding {
+        rule: u32,
+        root_start: u64,
+        root_end: u64,
+        span_start: u64,
+        span_end: u64,
+    }
+
+    impl FindingRecord for DummyFinding {
+        fn rule_id(&self) -> u32 {
+            self.rule
+        }
+
+        fn root_hint_start(&self) -> u64 {
+            self.root_start
+        }
+
+        fn root_hint_end(&self) -> u64 {
+            self.root_end
+        }
+
+        fn span_start(&self) -> u64 {
+            self.span_start
+        }
+
+        fn span_end(&self) -> u64 {
+            self.span_end
+        }
+    }
+
+    #[test]
+    fn finding_with_hash_delegates_finding_record_methods() {
+        let inner = DummyFinding {
+            rule: 7,
+            root_start: 100,
+            root_end: 111,
+            span_start: 101,
+            span_end: 110,
+        };
+        let wrapped = FindingWithHash::new(inner, [0xAB; 32]);
+
+        assert_eq!(wrapped.rule_id(), inner.rule_id());
+        assert_eq!(wrapped.root_hint_start(), inner.root_hint_start());
+        assert_eq!(wrapped.root_hint_end(), inner.root_hint_end());
+        assert_eq!(wrapped.span_start(), inner.span_start());
+        assert_eq!(wrapped.span_end(), inner.span_end());
+        assert_eq!(wrapped.norm_hash, [0xAB; 32]);
+    }
 }
