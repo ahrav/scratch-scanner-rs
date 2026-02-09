@@ -56,6 +56,7 @@ pub mod sim_scanner;
 #[cfg(feature = "sim-harness")]
 pub mod sim_scheduler;
 pub mod stdx;
+pub mod store;
 #[cfg(test)]
 pub mod test_utils;
 #[cfg(any(test, feature = "tiger-harness"))]

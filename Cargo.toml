@@ -10,6 +10,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)'] }
 [dependencies]
 aegis = "0.9"
 ahash = "0.8"
+base64 = "0.22"
 crossbeam-channel = "0.5"
 crossbeam-deque = "0.8"
 crossbeam-queue = "0.3"
@@ -65,7 +66,6 @@ real-rules-harness = []  # Real-ruleset regression harness (simulation test)
 binary-extract = ["serde_json", "dep:zip"]  # Binary format text extraction (.ipynb, .class, .jar, .pyc)
 
 [dev-dependencies]
-base64 = "0.22"
 crc32fast = "1.4"
 loom = "0.7"
 proptest = "1.4"
