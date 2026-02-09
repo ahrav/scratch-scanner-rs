@@ -814,6 +814,17 @@ rules:
     }
 
     #[test]
+    fn hashicorp_tf_password_allows_real_value_with_password_substring() {
+        let rule_name = "hashicorp-tf-password";
+        let hay = br#"password = "prodpassword19""#;
+        let hits = scan_single_builtin_rule(rule_name, hay);
+        assert!(
+            has_rule_hit(&hits, rule_name),
+            "expected terraform password containing 'password' to be reported"
+        );
+    }
+
+    #[test]
     fn curl_auth_header_suppresses_placeholder_bearer_token() {
         let rule_name = "curl-auth-header";
         let hay = br#"curl -H "Authorization: Bearer YOUR_TOKEN_HERE" https://api.example.com"#;
@@ -866,6 +877,17 @@ rules:
         assert!(
             has_rule_hit(&hits, rule_name),
             "expected real-looking curl -u credentials to be reported"
+        );
+    }
+
+    #[test]
+    fn curl_auth_user_allows_real_password_with_password_substring() {
+        let rule_name = "curl-auth-user";
+        let hay = b"curl -u deploy_bot:password1234 https://registry.internal";
+        let hits = scan_single_builtin_rule(rule_name, hay);
+        assert!(
+            has_rule_hit(&hits, rule_name),
+            "expected curl -u credentials containing 'password' to be reported"
         );
     }
 
