@@ -319,7 +319,8 @@ mod tests {
         let data = b"test SECRET12345678 end";
         <Engine as ScanEngine>::scan_chunk_into(&engine, data, FileId(0), 0, &mut scratch);
 
-        let mut findings = Vec::new();
+        let max_findings = engine.max_findings_per_chunk();
+        let mut findings = Vec::with_capacity(max_findings);
         scratch.drain_findings_into(&mut findings);
 
         assert_eq!(findings.len(), 1);
@@ -347,7 +348,8 @@ mod tests {
         // Drop findings whose root_hint_end < 50
         scratch.drop_prefix_findings(50);
 
-        let mut findings = Vec::new();
+        let max_findings = engine.max_findings_per_chunk();
+        let mut findings = Vec::with_capacity(max_findings);
         scratch.drain_findings_into(&mut findings);
 
         // Should have dropped the finding since it ended before offset 50
