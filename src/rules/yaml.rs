@@ -36,6 +36,8 @@ pub(crate) struct YamlRule {
     #[serde(default)]
     pub keywords_any: Option<Vec<String>>,
     #[serde(default)]
+    pub value_suppressors_any: Option<Vec<String>>,
+    #[serde(default)]
     pub entropy: Option<YamlEntropy>,
     #[serde(default)]
     pub two_phase: Option<YamlTwoPhase>,
@@ -156,6 +158,7 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
             radius,
             must_contain,
             keywords_any,
+            value_suppressors_any,
             entropy,
             two_phase,
             local_context,
@@ -168,32 +171,42 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
             error,
         })?;
 
-        let (name, anchors, must_contain, keywords_any, two_phase, local_context) =
-            with_rule_atoms(|atoms| {
-                let anchors = atoms.intern_bytes_slice(anchors);
-                let must_contain = must_contain.map(|s| atoms.intern_bytes(s));
-                let keywords_any = keywords_any.map(|kws| atoms.intern_bytes_slice(kws));
-                let two_phase = two_phase.map(|tp| TwoPhaseSpec {
-                    seed_radius: tp.seed_radius,
-                    full_radius: tp.full_radius,
-                    confirm_any: atoms.intern_bytes_slice(tp.confirm_any),
-                });
-                let local_context = local_context.map(|lc| LocalContextSpec {
-                    lookbehind: lc.lookbehind,
-                    lookahead: lc.lookahead,
-                    require_same_line_assignment: lc.require_same_line_assignment,
-                    require_quoted: lc.require_quoted,
-                    key_names_any: lc.key_names_any.map(|keys| atoms.intern_bytes_slice(keys)),
-                });
-                (
-                    atoms.intern_str(name),
-                    anchors,
-                    must_contain,
-                    keywords_any,
-                    two_phase,
-                    local_context,
-                )
+        let (
+            name,
+            anchors,
+            must_contain,
+            keywords_any,
+            value_suppressors_any,
+            two_phase,
+            local_context,
+        ) = with_rule_atoms(|atoms| {
+            let anchors = atoms.intern_bytes_slice(anchors);
+            let must_contain = must_contain.map(|s| atoms.intern_bytes(s));
+            let keywords_any = keywords_any.map(|kws| atoms.intern_bytes_slice(kws));
+            let value_suppressors_any =
+                value_suppressors_any.map(|vs| atoms.intern_bytes_slice(vs));
+            let two_phase = two_phase.map(|tp| TwoPhaseSpec {
+                seed_radius: tp.seed_radius,
+                full_radius: tp.full_radius,
+                confirm_any: atoms.intern_bytes_slice(tp.confirm_any),
             });
+            let local_context = local_context.map(|lc| LocalContextSpec {
+                lookbehind: lc.lookbehind,
+                lookahead: lc.lookahead,
+                require_same_line_assignment: lc.require_same_line_assignment,
+                require_quoted: lc.require_quoted,
+                key_names_any: lc.key_names_any.map(|keys| atoms.intern_bytes_slice(keys)),
+            });
+            (
+                atoms.intern_str(name),
+                anchors,
+                must_contain,
+                keywords_any,
+                value_suppressors_any,
+                two_phase,
+                local_context,
+            )
+        });
 
         let entropy = entropy.map(|e| EntropySpec {
             min_bits_per_byte: e.min_bits_per_byte,
@@ -212,6 +225,7 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
             two_phase,
             must_contain,
             keywords_any,
+            value_suppressors_any,
             entropy,
             local_context,
             secret_group,
@@ -244,6 +258,11 @@ mod tests {
         let keywords_any = rule.keywords_any.map(|kws| {
             kws.iter()
                 .map(|k| String::from_utf8(k.to_vec()).expect("keywords should be ASCII"))
+                .collect()
+        });
+        let value_suppressors_any = rule.value_suppressors_any.map(|sups| {
+            sups.iter()
+                .map(|s| String::from_utf8(s.to_vec()).expect("value suppressors should be ASCII"))
                 .collect()
         });
 
@@ -286,6 +305,7 @@ mod tests {
             radius: rule.radius,
             must_contain,
             keywords_any,
+            value_suppressors_any,
             entropy,
             two_phase,
             local_context,
@@ -340,6 +360,23 @@ mod tests {
                 }
                 (None, None) => {}
                 _ => panic!("keywords_any presence mismatch for {}", orig.name),
+            }
+
+            // Value suppressors.
+            match (orig.value_suppressors_any, parsed.value_suppressors_any) {
+                (Some(os), Some(ps)) => {
+                    assert_eq!(
+                        os.len(),
+                        ps.len(),
+                        "value_suppressors_any count mismatch for {}",
+                        orig.name
+                    );
+                    for (ovs, pvs) in os.iter().zip(ps.iter()) {
+                        assert_eq!(*ovs, *pvs, "value_suppressor mismatch for {}", orig.name);
+                    }
+                }
+                (None, None) => {}
+                _ => panic!("value_suppressors_any presence mismatch for {}", orig.name),
             }
 
             // Entropy.
@@ -513,10 +550,47 @@ rules:
         assert_eq!(rules[0].name, "test-rule");
         assert_eq!(rules[0].radius, 64);
         assert!(rules[0].keywords_any.is_none());
+        assert!(rules[0].value_suppressors_any.is_none());
         assert!(rules[0].entropy.is_none());
         assert!(rules[0].two_phase.is_none());
         assert!(rules[0].local_context.is_none());
         assert!(rules[0].secret_group.is_none());
+    }
+
+    #[test]
+    fn parse_yaml_with_value_suppressors_any() {
+        let yaml = r#"
+rules:
+  - name: "suppressor-rule"
+    regex: '(tok_)[a-z0-9]{8}'
+    anchors: ["tok_"]
+    radius: 64
+    value_suppressors_any: ["EXAMPLE", "DUMMY_TOKEN"]
+"#;
+
+        let rules = parse_yaml_rules(yaml).expect("parse yaml with value_suppressors_any");
+        assert_eq!(rules.len(), 1);
+        let suppressors = rules[0]
+            .value_suppressors_any
+            .expect("value_suppressors_any should be present");
+        assert_eq!(suppressors.len(), 2);
+        assert_eq!(suppressors[0], b"EXAMPLE");
+        assert_eq!(suppressors[1], b"DUMMY_TOKEN");
+    }
+
+    #[test]
+    fn parse_yaml_without_value_suppressors_any_defaults_to_none() {
+        let yaml = r#"
+rules:
+  - name: "no-suppressor-rule"
+    regex: '(tok_)[a-z0-9]{8}'
+    anchors: ["tok_"]
+    radius: 64
+"#;
+
+        let rules = parse_yaml_rules(yaml).expect("parse yaml without value_suppressors_any");
+        assert_eq!(rules.len(), 1);
+        assert!(rules[0].value_suppressors_any.is_none());
     }
 
     #[test]
@@ -564,6 +638,7 @@ rules:
     radius: 128
     must_contain: "secret_"
     keywords_any: ["secret", "key"]
+    value_suppressors_any: ["EXAMPLE", "DUMMY_SECRET"]
     entropy:
       min_bits_per_byte: 3.5
       min_len: 8
@@ -595,6 +670,13 @@ rules:
         assert_eq!(kws.len(), 2);
         assert_eq!(kws[0], b"secret");
         assert_eq!(kws[1], b"key");
+
+        let suppressors = r
+            .value_suppressors_any
+            .expect("value_suppressors_any should be present");
+        assert_eq!(suppressors.len(), 2);
+        assert_eq!(suppressors[0], b"EXAMPLE");
+        assert_eq!(suppressors[1], b"DUMMY_SECRET");
 
         let ent = r.entropy.as_ref().expect("entropy should be present");
         assert_eq!(ent.min_bits_per_byte, 3.5);
@@ -631,6 +713,7 @@ rules:
     radius: 64
     must_contain: "tok_"
     keywords_any: ["api", "token"]
+    value_suppressors_any: ["EXAMPLE", "DUMMY_TOKEN"]
     two_phase:
       seed_radius: 32
       full_radius: 128
@@ -671,6 +754,17 @@ rules:
         assert!(
             std::ptr::eq(a_keywords[0], b_keywords[0]),
             "keyword bytes should be interned and reused"
+        );
+
+        let a_suppressors = a.value_suppressors_any.expect("value_suppressors_any set");
+        let b_suppressors = b.value_suppressors_any.expect("value_suppressors_any set");
+        assert!(
+            std::ptr::eq(a_suppressors, b_suppressors),
+            "value_suppressors_any list should be interned and reused"
+        );
+        assert!(
+            std::ptr::eq(a_suppressors[0], b_suppressors[0]),
+            "value_suppressors_any bytes should be interned and reused"
         );
 
         let a_tp = a.two_phase.as_ref().expect("two_phase set");

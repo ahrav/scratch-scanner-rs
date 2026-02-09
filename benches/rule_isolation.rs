@@ -121,6 +121,7 @@ fn generic_api_key_rule() -> RuleSpec {
             b"token",
             b"TOKEN",
         ]),
+        value_suppressors_any: None,
         entropy: Some(EntropySpec {
             min_bits_per_byte: 3.5,
             min_len: 16,
@@ -144,6 +145,7 @@ fn impossible_rule(name: &'static str) -> RuleSpec {
         two_phase: None,
         must_contain: None,
         keywords_any: None,
+        value_suppressors_any: None,
         entropy: None,
         local_context: None,
         secret_group: None,
@@ -161,6 +163,7 @@ fn github_pat_rule() -> RuleSpec {
         two_phase: None,
         must_contain: None,
         keywords_any: Some(&[b"ghp_"]),
+        value_suppressors_any: None,
         entropy: Some(EntropySpec {
             min_bits_per_byte: 3.0,
             min_len: 16,
@@ -182,6 +185,7 @@ fn aws_rule() -> RuleSpec {
         two_phase: None,
         must_contain: None,
         keywords_any: Some(&[b"AKIA", b"AGPA", b"AIDA", b"AROA", b"AIPA"]),
+        value_suppressors_any: None,
         entropy: None,
         local_context: None,
         secret_group: None,
@@ -394,6 +398,7 @@ fn bench_anchor_density(c: &mut Criterion) {
             two_phase: None,
             must_contain: None,
             keywords_any: Some(anchors_static),
+            value_suppressors_any: None,
             entropy: Some(EntropySpec {
                 min_bits_per_byte: 3.5,
                 min_len: 16,
