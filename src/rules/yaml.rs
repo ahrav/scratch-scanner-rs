@@ -245,6 +245,7 @@ mod tests {
     use super::*;
     use crate::api::ValidatorKind;
     use crate::rules::builtin_rules;
+    use crate::{demo_tuning, AnchorPolicy, Engine, Finding};
     use std::path::Path;
 
     /// Convert `RuleSpec` back to YAML intermediate type for round-trip testing.
@@ -262,7 +263,13 @@ mod tests {
         });
         let value_suppressors_any = rule.value_suppressors_any.map(|sups| {
             sups.iter()
-                .map(|s| String::from_utf8(s.to_vec()).expect("value suppressors should be ASCII"))
+                .map(|s| {
+                    // Suppressors originate from YAML string scalars, so they are
+                    // guaranteed to be valid UTF-8 on the round-trip path.
+                    std::str::from_utf8(s)
+                        .expect("value suppressors should be valid UTF-8")
+                        .to_owned()
+                })
                 .collect()
         });
 
@@ -495,6 +502,20 @@ mod tests {
         }
     }
 
+    fn scan_yaml_rules(yaml: &str, hay: &[u8]) -> Vec<Finding> {
+        let rules = parse_yaml_rules(yaml).expect("parse YAML rules");
+        let engine = Engine::new_with_anchor_policy(
+            rules,
+            Vec::new(),
+            demo_tuning(),
+            AnchorPolicy::ManualOnly,
+        );
+        let mut scratch = engine.new_scratch();
+        let mut findings = Vec::with_capacity(1024);
+        engine.scan_chunk_materialized(hay, &mut scratch, &mut findings);
+        findings
+    }
+
     #[test]
     fn default_rules_yaml_matches_builtin_rules() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("default_rules.yaml");
@@ -514,6 +535,102 @@ mod tests {
         let yaml_str = serde_yml::to_string(&file).expect("serialize to YAML");
         let parsed_rules = parse_yaml_rules(&yaml_str).expect("parse YAML rules");
         assert_rules_equal(&original_rules, &parsed_rules);
+    }
+
+    #[test]
+    fn rulespec_to_yaml_emits_value_suppressors_any_when_present() {
+        let yaml = r#"
+rules:
+  - name: "emit-value-suppressors"
+    regex: 'TOK_([A-Z0-9]{12})'
+    anchors: ["TOK_"]
+    radius: 32
+    value_suppressors_any: ["EXAMPLE", "DUMMY_TOKEN"]
+    secret_group: 1
+"#;
+        let parsed = parse_yaml_rules(yaml).expect("parse YAML into rulespec");
+        let yaml_rule = rulespec_to_yaml(&parsed[0]);
+
+        assert_eq!(
+            yaml_rule.value_suppressors_any,
+            Some(vec!["EXAMPLE".to_string(), "DUMMY_TOKEN".to_string()])
+        );
+    }
+
+    #[test]
+    fn rulespec_to_yaml_omits_value_suppressors_any_when_absent() {
+        let yaml = r#"
+rules:
+  - name: "omit-value-suppressors"
+    regex: 'TOK_([A-Z0-9]{12})'
+    anchors: ["TOK_"]
+    radius: 32
+    secret_group: 1
+"#;
+        let parsed = parse_yaml_rules(yaml).expect("parse YAML into rulespec");
+        let yaml_rule = rulespec_to_yaml(&parsed[0]);
+
+        assert!(yaml_rule.value_suppressors_any.is_none());
+    }
+
+    #[test]
+    fn roundtrip_yaml_preserves_value_suppressors_any() {
+        let yaml = r#"
+rules:
+  - name: "roundtrip-value-suppressors"
+    regex: 'TOK_([A-Z0-9]{12})'
+    anchors: ["TOK_"]
+    radius: 32
+    value_suppressors_any: ["EXAMPLE", "DUMMY_TOKEN"]
+    secret_group: 1
+"#;
+
+        let original_rules = parse_yaml_rules(yaml).expect("parse original YAML");
+        let yaml_rules: Vec<YamlRule> = original_rules.iter().map(rulespec_to_yaml).collect();
+        let file = YamlRulesFile { rules: yaml_rules };
+        let yaml_str = serde_yml::to_string(&file).expect("serialize to YAML");
+        let parsed_rules = parse_yaml_rules(&yaml_str).expect("parse round-tripped YAML");
+
+        assert_rules_equal(&original_rules, &parsed_rules);
+    }
+
+    #[test]
+    fn yaml_to_engine_suppresses_matching_secret_value() {
+        let yaml = r#"
+rules:
+  - name: "yaml-suppressor-e2e"
+    regex: 'TOK_([A-Z0-9]{12})'
+    anchors: ["TOK_"]
+    radius: 32
+    value_suppressors_any: ["EXAMPLE"]
+    secret_group: 1
+"#;
+
+        let hay = b"prefix TOK_AEXAMPLE1234 suffix";
+        let hits = scan_yaml_rules(yaml, hay);
+        assert!(
+            !hits.iter().any(|h| h.rule == "yaml-suppressor-e2e"),
+            "expected suppressor match to prevent finding emission"
+        );
+    }
+
+    #[test]
+    fn yaml_to_engine_emits_when_value_suppressor_absent() {
+        let yaml = r#"
+rules:
+  - name: "yaml-suppressor-e2e"
+    regex: 'TOK_([A-Z0-9]{12})'
+    anchors: ["TOK_"]
+    radius: 32
+    secret_group: 1
+"#;
+
+        let hay = b"prefix TOK_AEXAMPLE1234 suffix";
+        let hits = scan_yaml_rules(yaml, hay);
+        assert!(
+            hits.iter().any(|h| h.rule == "yaml-suppressor-e2e"),
+            "expected finding when suppressors are not configured"
+        );
     }
 
     #[test]
