@@ -1016,7 +1016,10 @@ mod tests {
         // Actually with our buffer size 16, the header check passes but
         // decode_frame_body checks frame_len == 0 → InvalidFrameLength.
         assert!(
-            matches!(err, FormatError::TruncatedHeader { .. } | FormatError::InvalidFrameLength { .. }),
+            matches!(
+                err,
+                FormatError::TruncatedHeader { .. } | FormatError::InvalidFrameLength { .. }
+            ),
             "expected TruncatedHeader or InvalidFrameLength, got: {err}"
         );
     }
@@ -1077,7 +1080,13 @@ mod tests {
 
         let err = decode_record(&buf, DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap_err();
         assert!(
-            matches!(err, FormatError::InvalidBool { field: "incomplete", value: 2 }),
+            matches!(
+                err,
+                FormatError::InvalidBool {
+                    field: "incomplete",
+                    value: 2
+                }
+            ),
             "expected InvalidBool for incomplete=2, got: {err}"
         );
     }
@@ -1122,7 +1131,13 @@ mod tests {
 
         let err = decode_record(&buf, DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap_err();
         assert!(
-            matches!(err, FormatError::InvalidEnum { field: "durability", value: 3 }),
+            matches!(
+                err,
+                FormatError::InvalidEnum {
+                    field: "durability",
+                    value: 3
+                }
+            ),
             "expected InvalidEnum for durability=3, got: {err}"
         );
     }
@@ -1136,8 +1151,7 @@ mod tests {
 
         // Append extra bytes inside the frame (modify frame_len and recompute CRC).
         // Read original frame_len.
-        let orig_frame_len =
-            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let orig_frame_len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         let new_frame_len = orig_frame_len + 2;
 
         // Rebuild: take body, append 2 bytes, recompute CRC.
@@ -1266,8 +1280,10 @@ mod tests {
         assert_eq!(&buf[..2], &prefix[..]);
 
         // Both frames decodable from offset 2.
-        let mut reader =
-            LogRecordReader::new(IoCursor::new(buf[2..].to_vec()), DEFAULT_MAX_FRAME_PAYLOAD_BYTES);
+        let mut reader = LogRecordReader::new(
+            IoCursor::new(buf[2..].to_vec()),
+            DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+        );
         let d1 = reader.next_record().unwrap().unwrap();
         let d2 = reader.next_record().unwrap().unwrap();
         assert_eq!(d1, rec1);

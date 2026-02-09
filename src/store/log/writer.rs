@@ -733,7 +733,10 @@ fn closed_error(state: &InflightState) -> FsStoreError {
 
 fn release_inflight(shared: &SharedState, bytes: usize) {
     let mut guard = shared.state.lock().unwrap_or_else(|e| e.into_inner());
-    debug_assert!(guard.inflight_batches > 0, "release without matching reserve");
+    debug_assert!(
+        guard.inflight_batches > 0,
+        "release without matching reserve"
+    );
     guard.inflight_batches = guard.inflight_batches.saturating_sub(1);
     guard.inflight_bytes = guard.inflight_bytes.saturating_sub(bytes);
     drop(guard);
@@ -1432,7 +1435,8 @@ mod tests {
         cfg.max_inflight_batches = 2;
         cfg.max_inflight_bytes = 16 * 1024 * 1024;
 
-        let producer = Arc::new(AppendLogStoreProducer::new(&[simple_rule()], cfg.clone()).unwrap());
+        let producer =
+            Arc::new(AppendLogStoreProducer::new(&[simple_rule()], cfg.clone()).unwrap());
         let max_payload = cfg.max_frame_payload_bytes;
 
         let num_threads = 8;
@@ -1588,9 +1592,9 @@ mod tests {
         );
         // At least one error should mention the root cause (I/O failure),
         // not just "disconnected".
-        let has_root_cause = all_errors
-            .iter()
-            .any(|e| e.contains("failed to") || e.contains("writer failed") || e.contains("writer closed"));
+        let has_root_cause = all_errors.iter().any(|e| {
+            e.contains("failed to") || e.contains("writer failed") || e.contains("writer closed")
+        });
         assert!(
             has_root_cause,
             "expected root cause in error messages, got: {all_errors:?}"
@@ -1680,10 +1684,7 @@ mod tests {
         // Unicode → underscores.
         assert_eq!(sanitize_component("café"), "caf_");
         // Valid chars preserved.
-        assert_eq!(
-            sanitize_component("my-project_v2.0"),
-            "my-project_v2.0"
-        );
+        assert_eq!(sanitize_component("my-project_v2.0"), "my-project_v2.0");
         // All non-ascii.
         assert_eq!(sanitize_component("日本語"), "___");
     }
@@ -1762,9 +1763,7 @@ mod tests {
         // Close from another thread — the writer thread drain will unblock
         // the emitter via release_inflight before the close signal arrives.
         let p3 = Arc::clone(&producer);
-        let closer = std::thread::spawn(move || {
-            p3.record_fs_run_loss(FsRunLoss::default())
-        });
+        let closer = std::thread::spawn(move || p3.record_fs_run_loss(FsRunLoss::default()));
 
         let emit_result = emitter.join().expect("emitter thread panicked");
         let close_result = closer.join().expect("closer thread panicked");
@@ -1820,10 +1819,7 @@ mod tests {
         let guard = shared.state.lock().unwrap();
         assert_eq!(guard.inflight_batches, 0);
         assert_eq!(guard.inflight_bytes, 0);
-        assert_eq!(
-            guard.terminal_error.as_deref(),
-            Some("test IO error")
-        );
+        assert_eq!(guard.terminal_error.as_deref(), Some("test IO error"));
     }
 
     /// PR Comment 3: next_run_id() uniqueness within a single process.

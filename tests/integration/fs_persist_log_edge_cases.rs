@@ -171,10 +171,7 @@ fn multiple_sequential_runs_in_same_store_root() {
     producer1.record_fs_run_loss(FsRunLoss::default()).unwrap();
 
     let bins_after_1 = list_finalized_segment_files(&store_root).unwrap();
-    assert!(
-        !bins_after_1.is_empty(),
-        "expected segments from first run"
-    );
+    assert!(!bins_after_1.is_empty(), "expected segments from first run");
 
     // Run 2.
     let cfg2 = LogWriterConfig::for_root(store_root.clone());
@@ -243,69 +240,63 @@ fn batch_durability_mode_writes_without_error() {
 #[test]
 fn finding_id_deterministic_across_producer_instances() {
     // Fixed SCANNER_SECRET_KEY, same rules/batch → identical finding_id values.
-    with_secret_key_env(
-        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-        || {
-            let tmp = TempDir::new().unwrap();
+    with_secret_key_env("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", || {
+        let tmp = TempDir::new().unwrap();
 
-            // Producer 1.
-            let cfg1 = LogWriterConfig::for_root(tmp.path().join("store1"));
-            let producer1 = AppendLogStoreProducer::new(&[simple_rule()], cfg1.clone()).unwrap();
-            let findings = vec![sample_finding(0, 42)];
-            producer1
-                .emit_fs_batch(FsFindingBatch {
-                    object_path: b"same-path.txt",
-                    findings: &findings,
-                })
-                .unwrap();
-            producer1.record_fs_run_loss(FsRunLoss::default()).unwrap();
+        // Producer 1.
+        let cfg1 = LogWriterConfig::for_root(tmp.path().join("store1"));
+        let producer1 = AppendLogStoreProducer::new(&[simple_rule()], cfg1.clone()).unwrap();
+        let findings = vec![sample_finding(0, 42)];
+        producer1
+            .emit_fs_batch(FsFindingBatch {
+                object_path: b"same-path.txt",
+                findings: &findings,
+            })
+            .unwrap();
+        producer1.record_fs_run_loss(FsRunLoss::default()).unwrap();
 
-            // Producer 2 (same key, same rules, same batch data).
-            let cfg2 = LogWriterConfig::for_root(tmp.path().join("store2"));
-            let producer2 = AppendLogStoreProducer::new(&[simple_rule()], cfg2.clone()).unwrap();
-            let findings = vec![sample_finding(0, 42)];
-            producer2
-                .emit_fs_batch(FsFindingBatch {
-                    object_path: b"same-path.txt",
-                    findings: &findings,
-                })
-                .unwrap();
-            producer2.record_fs_run_loss(FsRunLoss::default()).unwrap();
+        // Producer 2 (same key, same rules, same batch data).
+        let cfg2 = LogWriterConfig::for_root(tmp.path().join("store2"));
+        let producer2 = AppendLogStoreProducer::new(&[simple_rule()], cfg2.clone()).unwrap();
+        let findings = vec![sample_finding(0, 42)];
+        producer2
+            .emit_fs_batch(FsFindingBatch {
+                object_path: b"same-path.txt",
+                findings: &findings,
+            })
+            .unwrap();
+        producer2.record_fs_run_loss(FsRunLoss::default()).unwrap();
 
-            // Extract finding IDs from both stores.
-            let records1 = decode_all_records(&cfg1.root_dir, DEFAULT_MAX_FRAME_PAYLOAD_BYTES);
-            let records2 = decode_all_records(&cfg2.root_dir, DEFAULT_MAX_FRAME_PAYLOAD_BYTES);
+        // Extract finding IDs from both stores.
+        let records1 = decode_all_records(&cfg1.root_dir, DEFAULT_MAX_FRAME_PAYLOAD_BYTES);
+        let records2 = decode_all_records(&cfg2.root_dir, DEFAULT_MAX_FRAME_PAYLOAD_BYTES);
 
-            let ids1: Vec<[u8; 32]> = records1
-                .iter()
-                .filter_map(|r| match r {
-                    LogRecord::FindingBatch(b) => {
-                        Some(b.findings.iter().map(|f| f.finding_id).collect::<Vec<_>>())
-                    }
-                    _ => None,
-                })
-                .flatten()
-                .collect();
+        let ids1: Vec<[u8; 32]> = records1
+            .iter()
+            .filter_map(|r| match r {
+                LogRecord::FindingBatch(b) => {
+                    Some(b.findings.iter().map(|f| f.finding_id).collect::<Vec<_>>())
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
 
-            let ids2: Vec<[u8; 32]> = records2
-                .iter()
-                .filter_map(|r| match r {
-                    LogRecord::FindingBatch(b) => {
-                        Some(b.findings.iter().map(|f| f.finding_id).collect::<Vec<_>>())
-                    }
-                    _ => None,
-                })
-                .flatten()
-                .collect();
+        let ids2: Vec<[u8; 32]> = records2
+            .iter()
+            .filter_map(|r| match r {
+                LogRecord::FindingBatch(b) => {
+                    Some(b.findings.iter().map(|f| f.finding_id).collect::<Vec<_>>())
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
 
-            assert_eq!(
-                ids1, ids2,
-                "finding IDs should be identical across producer instances with same key"
-            );
-            assert!(
-                !ids1.is_empty(),
-                "expected at least one finding ID"
-            );
-        },
-    );
+        assert_eq!(
+            ids1, ids2,
+            "finding IDs should be identical across producer instances with same key"
+        );
+        assert!(!ids1.is_empty(), "expected at least one finding ID");
+    });
 }
