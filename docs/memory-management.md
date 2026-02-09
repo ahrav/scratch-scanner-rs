@@ -93,6 +93,17 @@ scratch vectors.
 
 Git scanning still retains per-run metadata required for finalize/persist
 (`ScannedBlobs`), but finding emission to stdout is streamed.
+
+## Store Key Bootstrap Memory Notes
+
+`src/store/keys.rs` runs key bootstrap once at startup:
+
+- Persistent mode decodes `SCANNER_SECRET_KEY` (base64, 32 bytes).
+- Missing/invalid input uses an ephemeral fallback key.
+- Three subkeys are derived (`identity`, `secret`, `metadata`) and reused.
+
+This flow is intentionally off the scan hot path and does not introduce
+per-finding or per-chunk allocations in engine loops.
 ---
 
 ## Git Tree Loading Budgets

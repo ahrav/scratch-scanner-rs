@@ -145,6 +145,18 @@ For filesystem scans, this emission happens from owner-compute workers in
 `src/scheduler/local_fs_owner.rs` (each worker performs both I/O and scanning
 with worker-local reusable state).
 
+### Identity Canonicalization Link
+
+For persistence IDs (`src/store/identity.rs`), transform-derived findings use:
+
+- Root-hint end normalization tolerant to base64 padding variance (`min..min+3`).
+- Span contribution when dedupe includes span (`step_id == STEP_ROOT` or
+  `dedupe_with_span`).
+- UTF-16 LE/BE variant discriminator carried into `occurrence_id`.
+
+These rules intentionally mirror dedupe semantics in
+`ScanScratch::push_finding_with_drop_hint`.
+
 | Limit | Default | Purpose |
 |-------|---------|---------|
 | `max_transform_depth` | 3 | Maximum decode chain length |

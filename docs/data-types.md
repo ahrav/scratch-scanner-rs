@@ -4,7 +4,8 @@ Class diagram showing the key types in scanner-rs and their relationships.
 Verified against:
 `src/api.rs`, `src/engine/core.rs`, `src/engine/rule_repr.rs`,
 `src/engine/scratch.rs`, `src/runtime.rs`, `src/pipeline.rs`,
-`src/pool/node_pool.rs`, and `src/stdx/{bitset,ring_buffer}.rs`.
+`src/pool/node_pool.rs`, `src/stdx/{bitset,ring_buffer}.rs`,
+`src/store/keys.rs`, and `src/store/identity.rs`.
 
 ```mermaid
 classDiagram
@@ -372,6 +373,90 @@ classDiagram
     }
 ```
 
+## Persistence Identity Types
+
+```mermaid
+classDiagram
+    direction TB
+
+    class StoreKeys {
+        -[u8; 32] identity_key
+        -[u8; 32] secret_key
+        -[u8; 32] metadata_key
+        -RunModeMetadata run_mode
+        +bootstrap_from_env() StoreKeys
+        +run_mode() RunModeMetadata
+        +metadata_key() &[u8; 32]
+    }
+
+    class RunModeMetadata {
+        +u8 version
+        +CorrelationMode correlation_mode
+        +KeySource key_source
+        +is_persistent() bool
+    }
+
+    class CorrelationMode {
+        <<enumeration>>
+        Persistent
+        Ephemeral
+    }
+
+    class KeySource {
+        <<enumeration>>
+        EnvVar
+        MissingEnvVar
+        InvalidEnvVar
+    }
+
+    class IdentityFlags {
+        -u32 bits
+        +from_bits_strict(bits) Result~IdentityFlags, IdentityError~
+        +bits() u32
+    }
+
+    class VariantDiscriminant {
+        <<enumeration>>
+        None = 0
+        Utf16Le = 1
+        Utf16Be = 2
+    }
+
+    class OccurrenceInput {
+        +&[u8] object_key
+        +&FindingRec finding
+        +&RuleFingerprint rule_fingerprint
+        +&SecretHash secret_hash
+        +VariantDiscriminant variant
+    }
+
+    class IdentityError {
+        <<enumeration>>
+        UnknownIdentityFlags
+        ConflictingUtf16Flags
+        RootStepHasVariant
+    }
+
+    StoreKeys --> RunModeMetadata : contains
+    RunModeMetadata --> CorrelationMode : contains
+    RunModeMetadata --> KeySource : contains
+    OccurrenceInput --> FindingRec : references
+    OccurrenceInput --> VariantDiscriminant : contains
+    IdentityFlags --> IdentityError : validated by
+```
+
+Verified against: `src/store/keys.rs`, `src/store/identity.rs`.
+
+**Identity derivation functions** (not shown as classes):
+
+| Function | Input | Output | Key Used |
+|---|---|---|---|
+| `rule_fingerprint(rule, keys)` | `RuleSpec` | `RuleFingerprint` (`[u8; 32]`) | `identity_key` |
+| `secret_hash(norm_hash, keys)` | `[u8; 32]` | `SecretHash` (`[u8; 32]`) | `secret_key` |
+| `occurrence_id(input, keys)` | `OccurrenceInput` | `OccurrenceId` (`[u8; 32]`) | `identity_key` |
+
+See [persistence-identity.md](persistence-identity.md) for contract details and normalization rules.
+
 ## Key Relationships Summary
 
 | Source | Relationship | Target | Description |
@@ -386,3 +471,6 @@ classDiagram
 | `FindingRec` | references | `FileId` | Source file identifier |
 | `FindingRec` | references | `StepId` | Decode provenance chain |
 | `NodePoolType` | uses | `DynamicBitSet` | Free slot tracking |
+| `StoreKeys` | contains | `RunModeMetadata` | Run correlation semantics |
+| `OccurrenceInput` | references | `FindingRec` | Finding to hash |
+| `OccurrenceInput` | contains | `VariantDiscriminant` | UTF-16 variant discrimination |

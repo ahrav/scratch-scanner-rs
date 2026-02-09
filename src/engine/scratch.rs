@@ -88,6 +88,17 @@ impl RootSpanMapCtx {
         }
     }
 
+    /// Returns the transform kind for this context.
+    ///
+    /// # Safety
+    ///
+    /// The `tc` pointer is valid for the duration of the scan (the engine
+    /// outlives all scan operations).
+    pub(super) fn transform_id(&self) -> TransformId {
+        // SAFETY: tc points to Engine-owned data valid for the scan duration.
+        unsafe { &*self.tc }.id
+    }
+
     /// Maps a decoded-byte span back to absolute root-buffer coordinates.
     pub(super) fn map_span(&self, span: std::ops::Range<usize>) -> std::ops::Range<usize> {
         // Map decoded offsets back to absolute root-buffer offsets.
@@ -460,6 +471,33 @@ pub struct ScanScratch {
     pub(super) vs_gate_scratch: Option<VsScratch>,
     #[cfg(feature = "b64-stats")]
     pub(super) base64_stats: Base64DecodeStats, // Base64 decode/gate instrumentation.
+}
+
+/// Normalize `root_hint_end` for dedup key construction.
+///
+/// Only Base64 transforms have 4/3 padding rules that cause the encoded-region
+/// length to vary by up to 3 bytes for identical decoded content. Other
+/// transforms (e.g. UrlPercent) preserve length exactly and must not be
+/// normalized.
+///
+/// For Base64 non-root findings, snaps `root_hint_end` to the padding-free
+/// minimum if the actual encoded length exceeds it by 1–3 bytes.
+#[inline(always)]
+fn normalize_root_hint_end_for_dedup(rec: &FindingRec, leaf_transform: Option<TransformId>) -> u64 {
+    if rec.step_id == STEP_ROOT {
+        return rec.root_hint_end;
+    }
+    if leaf_transform != Some(TransformId::Base64) {
+        return rec.root_hint_end;
+    }
+    let decoded_len = rec.span_end.saturating_sub(rec.span_start) as u64;
+    let min_encoded = (decoded_len * 4).div_ceil(3);
+    let actual_encoded = rec.root_hint_end.saturating_sub(rec.root_hint_start);
+    if actual_encoded > min_encoded && actual_encoded <= min_encoded.saturating_add(3) {
+        rec.root_hint_start.saturating_add(min_encoded)
+    } else {
+        rec.root_hint_end
+    }
 }
 
 impl ScanScratch {
@@ -1272,42 +1310,19 @@ impl ScanScratch {
         // For transform-derived findings with mapped root spans, zero the span
         // since decoded offsets can vary by chunk alignment. When mapping is
         // unavailable, include the span to preserve distinct matches.
-        //
-        // Additionally, normalize root_hint_end for base64 padding tolerance.
-        //
-        // Base64 encodes 3 bytes → 4 chars, so the minimum encoded length for
-        // `d` decoded bytes is ⌈d × 4/3⌉. Padding (`=`) can add up to 2 chars,
-        // and a trailing newline adds 1 more, so the actual encoded length can
-        // exceed the minimum by up to 3 chars.
-        //
-        // Example: 13 decoded bytes → min_encoded = ⌈52/3⌉ = 18 chars.
-        //   - Without padding: 18 chars ("AAAAAAAAAAAAAAAA..").
-        //   - With padding:    20 chars ("AAAAAAAAAAAAAAAA==").
-        //   Both decode to the same 13 bytes. Without normalization, the two
-        //   root_hint_end values would produce different dedup keys, causing
-        //   duplicate findings across chunks that see different padding.
-        //
-        // The guard `actual > min && actual <= min + 3` avoids clamping when the
-        // encoded region is too large to be padding variance (likely a different
-        // encoded span entirely).
         let include_span = include_span || rec.step_id == STEP_ROOT;
         let (span_start, span_end) = if include_span {
             (rec.span_start, rec.span_end)
         } else {
             (0, 0)
         };
-        let normalized_root_hint_end = if rec.step_id == STEP_ROOT {
-            rec.root_hint_end
-        } else {
-            let decoded_len = rec.span_end.saturating_sub(rec.span_start) as u64;
-            let min_encoded = (decoded_len * 4).div_ceil(3);
-            let actual_encoded = rec.root_hint_end.saturating_sub(rec.root_hint_start);
-            if actual_encoded > min_encoded && actual_encoded <= min_encoded.saturating_add(3) {
-                rec.root_hint_start.saturating_add(min_encoded)
-            } else {
-                rec.root_hint_end
-            }
-        };
+        // Derive the leaf transform from the active root-span mapping context.
+        // This is set during transform scans and cleared after each buffer scan.
+        let leaf_transform = self
+            .root_span_map_ctx
+            .as_ref()
+            .map(|ctx| ctx.transform_id());
+        let normalized_root_hint_end = normalize_root_hint_end_for_dedup(&rec, leaf_transform);
 
         // Variant discriminator: distinguishes UTF-16 LE/BE findings that
         // otherwise share the same span and root_hint. Without this, both
@@ -1370,23 +1385,8 @@ impl ScanScratch {
                         if existing.root_hint_start != rec.root_hint_start {
                             false
                         } else {
-                            // Compute normalized_end for existing
-                            let existing_decoded_len =
-                                existing.span_end.saturating_sub(existing.span_start) as u64;
-                            let existing_min_encoded = (existing_decoded_len * 4).div_ceil(3);
-                            let existing_actual_encoded = existing
-                                .root_hint_end
-                                .saturating_sub(existing.root_hint_start);
-                            let existing_normalized_end = if existing_actual_encoded
-                                > existing_min_encoded
-                                && existing_actual_encoded <= existing_min_encoded.saturating_add(3)
-                            {
-                                existing
-                                    .root_hint_start
-                                    .saturating_add(existing_min_encoded)
-                            } else {
-                                existing.root_hint_end
-                            };
+                            let existing_normalized_end =
+                                normalize_root_hint_end_for_dedup(existing, leaf_transform);
                             existing_normalized_end == normalized_root_hint_end
                         }
                     }
@@ -1429,7 +1429,8 @@ impl ScanScratch {
 
 #[cfg(test)]
 mod tests {
-    use super::{CachelineBoundary, ScanScratch};
+    use super::{normalize_root_hint_end_for_dedup, CachelineBoundary, ScanScratch};
+    use crate::api::{FileId, FindingRec, StepId, TransformId, STEP_ROOT};
 
     #[test]
     fn scanscratch_cold_region_is_cacheline_aligned() {
@@ -1460,5 +1461,56 @@ mod tests {
             steps_buf_offset < cold_boundary_offset,
             "steps_buf must be in the hot region"
         );
+    }
+
+    fn make_rec(
+        step_id: StepId,
+        span_start: u32,
+        span_end: u32,
+        root_hint_start: u64,
+        root_hint_end: u64,
+    ) -> FindingRec {
+        FindingRec {
+            file_id: FileId(0),
+            rule_id: 0,
+            span_start,
+            span_end,
+            root_hint_start,
+            root_hint_end,
+            dedupe_with_span: false,
+            step_id,
+        }
+    }
+
+    #[test]
+    fn engine_normalize_url_percent_not_snapped() {
+        // decoded_len=13, min_encoded(base64)=18
+        // root_hint_end = root_hint_start + 19 (min+1, in padding window)
+        let rec = make_rec(StepId(1), 200, 213, 1000, 1019);
+        let result = normalize_root_hint_end_for_dedup(&rec, Some(TransformId::UrlPercent));
+        // UrlPercent must NOT snap — returns original root_hint_end
+        assert_eq!(result, 1019);
+    }
+
+    #[test]
+    fn engine_normalize_base64_snaps() {
+        let rec = make_rec(StepId(1), 200, 213, 1000, 1019);
+        let result = normalize_root_hint_end_for_dedup(&rec, Some(TransformId::Base64));
+        // Base64: decoded_len=13, min_encoded=18, actual=19, snap to 1018
+        assert_eq!(result, 1018);
+    }
+
+    #[test]
+    fn engine_normalize_root_unchanged() {
+        let rec = make_rec(STEP_ROOT, 200, 213, 1000, 1019);
+        let result = normalize_root_hint_end_for_dedup(&rec, Some(TransformId::Base64));
+        assert_eq!(result, 1019);
+    }
+
+    #[test]
+    fn engine_normalize_none_transform_not_snapped() {
+        let rec = make_rec(StepId(1), 200, 213, 1000, 1019);
+        let result = normalize_root_hint_end_for_dedup(&rec, None);
+        assert_eq!(result, 1019);
     }
 }

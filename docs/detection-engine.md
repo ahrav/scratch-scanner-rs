@@ -200,6 +200,22 @@ The hash is stored in a scratch sidecar aligned with `FindingRec` indices and
 is used by Git persistence as part of the deterministic finding key
 `(start, end, rule_id, norm_hash)`. No raw secret bytes are stored.
 
+## FS Persistence Identity Contracts (Phase A)
+
+Filesystem persistence now has a separate identity contract in `src/store/`:
+
+- `store::keys` bootstraps root key material from `SCANNER_SECRET_KEY`
+  (base64, 32 bytes) with ephemeral fallback metadata.
+- `store::identity::rule_fingerprint` hashes canonical `RuleSpec::encode_policy`
+  bytes using a versioned keyed domain.
+- `store::identity::secret_hash` applies a keyed hash to existing `norm_hash`
+  bytes (no hot-path raw-secret rehash rewrite).
+- `store::identity::occurrence_id` reuses dedupe semantics from
+  `push_finding_with_drop_hint`: transform root-hint end normalization for
+  base64 padding tolerance, span contribution only when dedupe includes span
+  (`step_id == STEP_ROOT` or `dedupe_with_span`), and UTF-16 LE/BE variant
+  discrimination.
+
 **Pressure Coalescing**: If windows exceed `max_windows_per_rule_variant` (16), the gap doubles until windows fit, or everything merges into one.
 
 ### Seed Confirmation + Expansion

@@ -160,6 +160,8 @@ graph TB
 | **Git Scan Runner** | `src/git_scan/runner.rs` | End-to-end orchestration across all Git scan stages |
 | **WorkItems**       | `src/git_scan/work_items.rs`  | SoA candidate metadata tables for sorting without moving structs    |
 | **Policy Hash**     | `src/git_scan/policy_hash.rs`  | Canonical BLAKE3 identity over rules, transforms, and tuning         |
+| **Store Keys**      | `src/store/keys.rs`            | `SCANNER_SECRET_KEY` bootstrap, subkey derivation, and run correlation mode metadata |
+| **Store Identity**  | `src/store/identity.rs`        | Versioned `rule_fingerprint` / `secret_hash` / `occurrence_id` contracts for FS persistence |
 
 
 ## Archive Scanning Notes
