@@ -483,10 +483,7 @@ pub struct ScanScratch {
 /// For Base64 non-root findings, snaps `root_hint_end` to the padding-free
 /// minimum if the actual encoded length exceeds it by 1–3 bytes.
 #[inline(always)]
-fn normalize_root_hint_end_for_dedup(
-    rec: &FindingRec,
-    leaf_transform: Option<TransformId>,
-) -> u64 {
+fn normalize_root_hint_end_for_dedup(rec: &FindingRec, leaf_transform: Option<TransformId>) -> u64 {
     if rec.step_id == STEP_ROOT {
         return rec.root_hint_end;
     }
@@ -1325,8 +1322,7 @@ impl ScanScratch {
             .root_span_map_ctx
             .as_ref()
             .map(|ctx| ctx.transform_id());
-        let normalized_root_hint_end =
-            normalize_root_hint_end_for_dedup(&rec, leaf_transform);
+        let normalized_root_hint_end = normalize_root_hint_end_for_dedup(&rec, leaf_transform);
 
         // Variant discriminator: distinguishes UTF-16 LE/BE findings that
         // otherwise share the same span and root_hint. Without this, both

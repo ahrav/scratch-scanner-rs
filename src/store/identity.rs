@@ -319,8 +319,7 @@ fn canonicalize_finding(
     // it's a Base64 non-root finding), not "the value actually changed". This
     // ensures that pre-normalized values (already at min_encoded) produce the same
     // flags as values that were snapped, so both hash identically.
-    let normalized =
-        finding.step_id != STEP_ROOT && leaf_transform == Some(TransformId::Base64);
+    let normalized = finding.step_id != STEP_ROOT && leaf_transform == Some(TransformId::Base64);
     let include_span = finding.dedupe_with_span || finding.step_id == STEP_ROOT;
     let (span_start, span_end) = if include_span {
         (finding.span_start, finding.span_end)
@@ -842,7 +841,11 @@ mod tests {
                 root_hint_start + min_encoded + pad
             };
 
-            let leaf_transform = if root { None } else { Some(TransformId::Base64) };
+            let leaf_transform = if root {
+                None
+            } else {
+                Some(TransformId::Base64)
+            };
             cases.push(OccurrenceCase {
                 object_key: format!("obj-{}", lcg(&mut seed) % 23).into_bytes(),
                 finding: FindingRec {
@@ -914,7 +917,8 @@ mod tests {
         // span_end == span_start → decoded_len=0, min_encoded=0
         // Any 1-3 excess should snap to root_hint_start.
         let f = make_finding(StepId(1), 100, 100, 500, 502);
-        assert_eq!(normalize_root_hint_end(&f, Some(TransformId::Base64)), 500); // snapped: 502 - 500 = 2, 0 < 2 <= 3
+        assert_eq!(normalize_root_hint_end(&f, Some(TransformId::Base64)), 500);
+        // snapped: 502 - 500 = 2, 0 < 2 <= 3
     }
 
     #[test]
@@ -922,7 +926,8 @@ mod tests {
         // decoded_len = 12, min_encoded = ceil(12*4/3) = 16
         // actual_encoded = 16 (== min_encoded), condition is `> min_encoded`, so no snap.
         let f = make_finding(StepId(1), 0, 12, 1000, 1016);
-        assert_eq!(normalize_root_hint_end(&f, Some(TransformId::Base64)), 1016); // unchanged
+        assert_eq!(normalize_root_hint_end(&f, Some(TransformId::Base64)), 1016);
+        // unchanged
     }
 
     #[test]
@@ -930,7 +935,8 @@ mod tests {
         // decoded_len = 12, min_encoded = 16
         // actual_encoded = 19 (min + 3). 19 > 16 && 19 <= 16+3 → snap.
         let f = make_finding(StepId(1), 0, 12, 1000, 1019);
-        assert_eq!(normalize_root_hint_end(&f, Some(TransformId::Base64)), 1016); // snapped to start + min_encoded
+        assert_eq!(normalize_root_hint_end(&f, Some(TransformId::Base64)), 1016);
+        // snapped to start + min_encoded
     }
 
     #[test]
@@ -938,7 +944,8 @@ mod tests {
         // decoded_len = 12, min_encoded = 16
         // actual_encoded = 20 (min + 4). 20 > 16 but 20 > 16+3 → no snap.
         let f = make_finding(StepId(1), 0, 12, 1000, 1020);
-        assert_eq!(normalize_root_hint_end(&f, Some(TransformId::Base64)), 1020); // unchanged
+        assert_eq!(normalize_root_hint_end(&f, Some(TransformId::Base64)), 1020);
+        // unchanged
     }
 
     #[test]
@@ -1004,9 +1011,8 @@ mod tests {
     #[test]
     fn from_parts_non_root_utf16be_no_span_normalized_flags() {
         // Non-root, no span, BE, normalized → ROOT_HINT_END_NORMALIZED + UTF16_BE = 4+512 = 516
-        let flags =
-            IdentityFlags::from_parts(StepId(3), false, VariantDiscriminant::Utf16Be, true)
-                .unwrap();
+        let flags = IdentityFlags::from_parts(StepId(3), false, VariantDiscriminant::Utf16Be, true)
+            .unwrap();
         assert_eq!(flags.bits(), 516);
     }
 
@@ -1195,9 +1201,12 @@ mod tests {
             dedupe_with_span: false,
             step_id: StepId(1),
         };
-        let cf =
-            canonicalize_finding(&finding, VariantDiscriminant::None, Some(TransformId::Base64))
-                .unwrap();
+        let cf = canonicalize_finding(
+            &finding,
+            VariantDiscriminant::None,
+            Some(TransformId::Base64),
+        )
+        .unwrap();
         assert_eq!(cf.span_start, 0);
         assert_eq!(cf.span_end, 0);
         // Flags: ROOT_HINT_END_NORMALIZED = 4 (normalization fired for base64)
@@ -1217,9 +1226,12 @@ mod tests {
             dedupe_with_span: true,
             step_id: StepId(1),
         };
-        let cf =
-            canonicalize_finding(&finding, VariantDiscriminant::None, Some(TransformId::Base64))
-                .unwrap();
+        let cf = canonicalize_finding(
+            &finding,
+            VariantDiscriminant::None,
+            Some(TransformId::Base64),
+        )
+        .unwrap();
         assert_eq!(cf.span_start, 100);
         assert_eq!(cf.span_end, 116);
         // Flags: SPAN_INCLUDED | ROOT_HINT_END_NORMALIZED = 2 + 4 = 6
@@ -1251,9 +1263,7 @@ mod tests {
             }
         }
 
-        fn arb_leaf_transform_for_step(
-            step: StepId,
-        ) -> BoxedStrategy<Option<TransformId>> {
+        fn arb_leaf_transform_for_step(step: StepId) -> BoxedStrategy<Option<TransformId>> {
             if step == STEP_ROOT {
                 Just(None).boxed()
             } else {
@@ -1388,6 +1398,7 @@ mod tests {
                         rule_fingerprint: &rfp,
                         secret_hash: &sh,
                         variant,
+                        leaf_transform: leaf_tf,
                     },
                     &keys,
                 ).expect("valid");
@@ -1651,7 +1662,9 @@ mod tests {
             // We don't allocate: just verify the guard arithmetic is correct.
             let too_large = u32::MAX as usize + 1;
             let err = IdentityError::ObjectKeyTooLarge { len: too_large };
-            assert!(matches!(err, IdentityError::ObjectKeyTooLarge { len } if len > u32::MAX as usize));
+            assert!(
+                matches!(err, IdentityError::ObjectKeyTooLarge { len } if len > u32::MAX as usize)
+            );
         }
     }
 }
