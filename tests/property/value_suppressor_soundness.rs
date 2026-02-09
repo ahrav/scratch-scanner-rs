@@ -127,7 +127,7 @@ proptest! {
         secret.extend_from_slice(&suffix);
 
         let total_len = secret.len();
-        prop_assume!(total_len >= 10 && total_len <= 30);
+        prop_assume!((10..=30).contains(&total_len));
 
         let secret_str = std::str::from_utf8(&secret).unwrap();
 

@@ -1085,10 +1085,11 @@ rules:
         for _ in 0..192 {
             let secret = deterministic_secret(&mut seed, 24);
             // Skip generated values that happen to contain a suppressor substring.
-            if suppressors
-                .iter()
-                .any(|sup| secret.to_ascii_lowercase().contains(&sup.to_ascii_lowercase()))
-            {
+            if suppressors.iter().any(|sup| {
+                secret
+                    .to_ascii_lowercase()
+                    .contains(&sup.to_ascii_lowercase())
+            }) {
                 continue;
             }
 
@@ -1134,10 +1135,11 @@ rules:
         for _ in 0..192 {
             let secret = deterministic_secret(&mut seed, 20);
             // Skip generated values that happen to contain a suppressor substring.
-            if suppressors
-                .iter()
-                .any(|sup| secret.to_ascii_lowercase().contains(&sup.to_ascii_lowercase()))
-            {
+            if suppressors.iter().any(|sup| {
+                secret
+                    .to_ascii_lowercase()
+                    .contains(&sup.to_ascii_lowercase())
+            }) {
                 continue;
             }
 
