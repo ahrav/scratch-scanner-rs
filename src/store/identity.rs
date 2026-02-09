@@ -1,4 +1,4 @@
-//! Phase A persistence identity contracts.
+//! Persistence identity contracts.
 //!
 //! This module defines versioned, deterministic contracts for:
 //! - [`rule_fingerprint`]: canonical policy identity for a rule.
@@ -839,5 +839,542 @@ mod tests {
         partitioned.sort_unstable();
 
         assert_eq!(baseline, partitioned);
+    }
+
+    // ================================================================
+    // normalize_root_hint_end edge cases
+    // ================================================================
+
+    fn make_finding(
+        step_id: StepId,
+        span_start: u32,
+        span_end: u32,
+        root_hint_start: u64,
+        root_hint_end: u64,
+    ) -> FindingRec {
+        FindingRec {
+            file_id: FileId(0),
+            rule_id: 0,
+            span_start,
+            span_end,
+            root_hint_start,
+            root_hint_end,
+            dedupe_with_span: false,
+            step_id,
+        }
+    }
+
+    #[test]
+    fn normalize_root_hint_end_zero_decoded_len() {
+        // span_end == span_start → decoded_len=0, min_encoded=0
+        // Any 1-3 excess should snap to root_hint_start.
+        let f = make_finding(StepId(1), 100, 100, 500, 502);
+        assert_eq!(normalize_root_hint_end(&f), 500); // snapped: 502 - 500 = 2, 0 < 2 <= 3
+    }
+
+    #[test]
+    fn normalize_root_hint_end_exact_min_no_snap() {
+        // decoded_len = 12, min_encoded = ceil(12*4/3) = 16
+        // actual_encoded = 16 (== min_encoded), condition is `> min_encoded`, so no snap.
+        let f = make_finding(StepId(1), 0, 12, 1000, 1016);
+        assert_eq!(normalize_root_hint_end(&f), 1016); // unchanged
+    }
+
+    #[test]
+    fn normalize_root_hint_end_diff_exactly_3_snaps() {
+        // decoded_len = 12, min_encoded = 16
+        // actual_encoded = 19 (min + 3). 19 > 16 && 19 <= 16+3 → snap.
+        let f = make_finding(StepId(1), 0, 12, 1000, 1019);
+        assert_eq!(normalize_root_hint_end(&f), 1016); // snapped to start + min_encoded
+    }
+
+    #[test]
+    fn normalize_root_hint_end_diff_4_no_snap() {
+        // decoded_len = 12, min_encoded = 16
+        // actual_encoded = 20 (min + 4). 20 > 16 but 20 > 16+3 → no snap.
+        let f = make_finding(StepId(1), 0, 12, 1000, 1020);
+        assert_eq!(normalize_root_hint_end(&f), 1020); // unchanged
+    }
+
+    #[test]
+    fn normalize_root_hint_end_root_passthrough() {
+        // Root findings should return root_hint_end unchanged.
+        let f = make_finding(STEP_ROOT, 0, 12, 1000, 1099);
+        assert_eq!(normalize_root_hint_end(&f), 1099);
+    }
+
+    #[test]
+    fn normalize_root_hint_end_span_underflow() {
+        // span_start > span_end → saturating_sub yields 0, same as zero decoded len.
+        // No panic should occur.
+        let f = make_finding(StepId(1), 200, 100, 500, 502);
+        // decoded_len=0, min_encoded=0, actual_encoded=2, 0 < 2 <= 3 → snap
+        assert_eq!(normalize_root_hint_end(&f), 500);
+    }
+
+    // ================================================================
+    // IdentityFlags edge cases
+    // ================================================================
+
+    #[test]
+    fn from_parts_root_none_flags_are_0x03() {
+        // Root + None → ROOT_STEP | SPAN_INCLUDED = 1 + 2 = 3
+        let flags = IdentityFlags::from_parts(STEP_ROOT, true, VariantDiscriminant::None).unwrap();
+        assert_eq!(flags.bits(), 3);
+    }
+
+    #[test]
+    fn from_parts_non_root_no_span_flags_are_0x04() {
+        // Non-root, no span, None → ROOT_HINT_END_NORMALIZED = 4
+        let flags = IdentityFlags::from_parts(StepId(1), false, VariantDiscriminant::None).unwrap();
+        assert_eq!(flags.bits(), 4);
+    }
+
+    #[test]
+    fn from_parts_non_root_with_span_flags_are_0x06() {
+        // Non-root, span, None → SPAN_INCLUDED | ROOT_HINT_END_NORMALIZED = 2 + 4 = 6
+        let flags = IdentityFlags::from_parts(StepId(1), true, VariantDiscriminant::None).unwrap();
+        assert_eq!(flags.bits(), 6);
+    }
+
+    #[test]
+    fn from_parts_non_root_utf16le_with_span_flags() {
+        // Non-root, span, LE → SPAN_INCLUDED + ROOT_HINT_END_NORMALIZED + UTF16_LE = 2+4+256 = 262
+        let flags =
+            IdentityFlags::from_parts(StepId(2), true, VariantDiscriminant::Utf16Le).unwrap();
+        assert_eq!(flags.bits(), 262);
+    }
+
+    #[test]
+    fn from_parts_non_root_utf16be_no_span_flags() {
+        // Non-root, no span, BE → ROOT_HINT_END_NORMALIZED + UTF16_BE = 4+512 = 516
+        let flags =
+            IdentityFlags::from_parts(StepId(3), false, VariantDiscriminant::Utf16Be).unwrap();
+        assert_eq!(flags.bits(), 516);
+    }
+
+    #[test]
+    fn from_parts_root_utf16be_rejected() {
+        let err = IdentityFlags::from_parts(STEP_ROOT, true, VariantDiscriminant::Utf16Be)
+            .expect_err("root + BE must fail");
+        assert!(matches!(
+            err,
+            IdentityError::RootStepHasVariant {
+                variant: VariantDiscriminant::Utf16Be
+            }
+        ));
+    }
+
+    #[test]
+    fn from_bits_strict_conflicting_utf16() {
+        // Both bits 8+9 set → ConflictingUtf16Flags
+        let bits = (1 << 8) | (1 << 9);
+        let err = IdentityFlags::from_bits_strict(bits).expect_err("conflicting UTF-16");
+        assert!(matches!(err, IdentityError::ConflictingUtf16Flags { .. }));
+    }
+
+    #[test]
+    fn from_bits_strict_reserved_bit_3_rejected() {
+        let err = IdentityFlags::from_bits_strict(0x08).expect_err("bit 3 is reserved");
+        assert!(matches!(
+            err,
+            IdentityError::UnknownIdentityFlags { bits: 0x08 }
+        ));
+    }
+
+    #[test]
+    fn from_bits_strict_zero_is_valid() {
+        let flags = IdentityFlags::from_bits_strict(0).unwrap();
+        assert_eq!(flags.bits(), 0);
+    }
+
+    #[test]
+    fn from_bits_strict_all_known_non_conflicting() {
+        // ROOT_STEP + SPAN_INCLUDED + ROOT_HINT_END_NORMALIZED + UTF16_LE = 1+2+4+256 = 263
+        let flags = IdentityFlags::from_bits_strict(263).unwrap();
+        assert_eq!(flags.bits(), 263);
+    }
+
+    // ================================================================
+    // Domain separation & field contribution
+    // ================================================================
+
+    #[test]
+    fn domain_separation_same_payload_different_hashes() {
+        let key = &[0xAA; 32];
+        let payload = b"identical payload";
+        let h1 = keyed_hash(key, RULE_FINGERPRINT_DOMAIN, payload);
+        let h2 = keyed_hash(key, SECRET_HASH_DOMAIN, payload);
+        let h3 = keyed_hash(key, OCCURRENCE_ID_DOMAIN, payload);
+        assert_ne!(h1, h2);
+        assert_ne!(h1, h3);
+        assert_ne!(h2, h3);
+    }
+
+    fn base_occurrence_case() -> OccurrenceCase {
+        OccurrenceCase {
+            object_key: b"repo:src/main.rs".to_vec(),
+            finding: FindingRec {
+                file_id: FileId(1),
+                rule_id: 10,
+                span_start: 50,
+                span_end: 66,
+                root_hint_start: 2000,
+                root_hint_end: 2024,
+                dedupe_with_span: false,
+                step_id: StepId(1),
+            },
+            rule_fingerprint: [0xBB; 32],
+            secret_hash: [0xCC; 32],
+            variant: VariantDiscriminant::None,
+        }
+    }
+
+    fn compute_id(case: &OccurrenceCase, keys: &StoreKeys) -> OccurrenceId {
+        occurrence_id(
+            OccurrenceInput {
+                object_key: &case.object_key,
+                finding: &case.finding,
+                rule_fingerprint: &case.rule_fingerprint,
+                secret_hash: &case.secret_hash,
+                variant: case.variant,
+            },
+            keys,
+        )
+        .expect("valid occurrence")
+    }
+
+    #[test]
+    fn different_object_key_different_occurrence_id() {
+        let keys = test_keys();
+        let a = base_occurrence_case();
+        let mut b = a.clone();
+        b.object_key = b"repo:src/lib.rs".to_vec();
+        assert_ne!(compute_id(&a, &keys), compute_id(&b, &keys));
+    }
+
+    #[test]
+    fn different_rule_fp_different_occurrence_id() {
+        let keys = test_keys();
+        let a = base_occurrence_case();
+        let mut b = a.clone();
+        b.rule_fingerprint = [0xDD; 32];
+        assert_ne!(compute_id(&a, &keys), compute_id(&b, &keys));
+    }
+
+    #[test]
+    fn different_secret_hash_different_occurrence_id() {
+        let keys = test_keys();
+        let a = base_occurrence_case();
+        let mut b = a.clone();
+        b.secret_hash = [0xEE; 32];
+        assert_ne!(compute_id(&a, &keys), compute_id(&b, &keys));
+    }
+
+    #[test]
+    fn root_vs_non_root_different_ids() {
+        let keys = test_keys();
+        let a = base_occurrence_case(); // step_id = StepId(1)
+        let mut b = a.clone();
+        // Make root-compatible: span matches root_hint window, set root step
+        b.finding.step_id = STEP_ROOT;
+        b.finding.root_hint_start = 50;
+        b.finding.root_hint_end = 66;
+        // a is non-root, b is root — even with overlapping data, IDs differ
+        // (root vs non-root have different flags, normalization, etc.)
+        assert_ne!(compute_id(&a, &keys), compute_id(&b, &keys));
+    }
+
+    #[test]
+    fn empty_object_key_produces_valid_id() {
+        let keys = test_keys();
+        let mut case = base_occurrence_case();
+        case.object_key = vec![];
+        let id = compute_id(&case, &keys);
+        assert_eq!(id.len(), 32);
+    }
+
+    // ================================================================
+    // canonicalize_finding verification
+    // ================================================================
+
+    #[test]
+    fn canonicalize_root_preserves_all_spans() {
+        let finding = FindingRec {
+            file_id: FileId(0),
+            rule_id: 0,
+            span_start: 10,
+            span_end: 42,
+            root_hint_start: 100,
+            root_hint_end: 200,
+            dedupe_with_span: false,
+            step_id: STEP_ROOT,
+        };
+        let cf = canonicalize_finding(&finding, VariantDiscriminant::None).unwrap();
+        // Root always includes span
+        assert_eq!(cf.span_start, 10);
+        assert_eq!(cf.span_end, 42);
+        // Root hint unchanged for root
+        assert_eq!(cf.root_hint_start, 100);
+        assert_eq!(cf.root_hint_end, 200);
+        // Flags: ROOT_STEP | SPAN_INCLUDED = 3
+        assert_eq!(cf.flags.bits(), 3);
+        assert_eq!(cf.variant, VariantDiscriminant::None);
+    }
+
+    #[test]
+    fn canonicalize_non_root_zeroes_span_when_no_dedupe() {
+        let finding = FindingRec {
+            file_id: FileId(0),
+            rule_id: 0,
+            span_start: 100,
+            span_end: 116,
+            root_hint_start: 5000,
+            root_hint_end: 5024,
+            dedupe_with_span: false,
+            step_id: StepId(1),
+        };
+        let cf = canonicalize_finding(&finding, VariantDiscriminant::None).unwrap();
+        assert_eq!(cf.span_start, 0);
+        assert_eq!(cf.span_end, 0);
+        // Flags: ROOT_HINT_END_NORMALIZED = 4
+        assert_eq!(cf.flags.bits(), 4);
+    }
+
+    #[test]
+    fn canonicalize_non_root_preserves_span_when_dedupe() {
+        let finding = FindingRec {
+            file_id: FileId(0),
+            rule_id: 0,
+            span_start: 100,
+            span_end: 116,
+            root_hint_start: 5000,
+            root_hint_end: 5024,
+            dedupe_with_span: true,
+            step_id: StepId(1),
+        };
+        let cf = canonicalize_finding(&finding, VariantDiscriminant::None).unwrap();
+        assert_eq!(cf.span_start, 100);
+        assert_eq!(cf.span_end, 116);
+        // Flags: SPAN_INCLUDED | ROOT_HINT_END_NORMALIZED = 2 + 4 = 6
+        assert_eq!(cf.flags.bits(), 6);
+    }
+
+    // ================================================================
+    // Property-based tests
+    // ================================================================
+
+    mod prop {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_step_id() -> impl Strategy<Value = StepId> {
+            prop_oneof![Just(STEP_ROOT), (1u32..100).prop_map(StepId),]
+        }
+
+        fn arb_variant_for_step(step: StepId) -> BoxedStrategy<VariantDiscriminant> {
+            if step == STEP_ROOT {
+                Just(VariantDiscriminant::None).boxed()
+            } else {
+                prop_oneof![
+                    Just(VariantDiscriminant::None),
+                    Just(VariantDiscriminant::Utf16Le),
+                    Just(VariantDiscriminant::Utf16Be),
+                ]
+                .boxed()
+            }
+        }
+
+        fn arb_finding_rec() -> impl Strategy<Value = (FindingRec, VariantDiscriminant)> {
+            arb_step_id().prop_flat_map(|step_id| {
+                let variant_strat = arb_variant_for_step(step_id);
+                (
+                    (0u32..4096),    // span_start
+                    (8u32..64),      // span_len
+                    (0u64..100_000), // root_hint_start
+                    any::<bool>(),   // dedupe_with_span
+                    variant_strat,
+                )
+                    .prop_map(
+                        move |(span_start, span_len, root_hint_start, dedupe, variant)| {
+                            let span_end = span_start + span_len;
+                            let decoded_len = span_len as u64;
+                            let min_encoded = (decoded_len * 4).div_ceil(3);
+                            let root_hint_end = root_hint_start + min_encoded + 2;
+                            (
+                                FindingRec {
+                                    file_id: FileId(0),
+                                    rule_id: 0,
+                                    span_start,
+                                    span_end,
+                                    root_hint_start,
+                                    root_hint_end,
+                                    dedupe_with_span: dedupe,
+                                    step_id,
+                                },
+                                variant,
+                            )
+                        },
+                    )
+            })
+        }
+
+        proptest! {
+            #[test]
+            fn prop_normalize_root_hint_end_idempotent(
+                (finding, _variant) in arb_finding_rec()
+            ) {
+                let once = normalize_root_hint_end(&finding);
+                let mut finding2 = finding;
+                finding2.root_hint_end = once;
+                let twice = normalize_root_hint_end(&finding2);
+                prop_assert_eq!(once, twice);
+            }
+
+            #[test]
+            fn prop_occurrence_id_deterministic(
+                (finding, variant) in arb_finding_rec(),
+                obj_key in proptest::collection::vec(any::<u8>(), 0..64),
+                rule_fp in proptest::collection::vec(any::<u8>(), 32..=32),
+                secret in proptest::collection::vec(any::<u8>(), 32..=32),
+            ) {
+                let keys = test_keys();
+                let mut rfp = [0u8; 32];
+                rfp.copy_from_slice(&rule_fp);
+                let mut sh = [0u8; 32];
+                sh.copy_from_slice(&secret);
+
+                let id1 = occurrence_id(
+                    OccurrenceInput {
+                        object_key: &obj_key,
+                        finding: &finding,
+                        rule_fingerprint: &rfp,
+                        secret_hash: &sh,
+                        variant,
+                    },
+                    &keys,
+                ).expect("valid");
+
+                let id2 = occurrence_id(
+                    OccurrenceInput {
+                        object_key: &obj_key,
+                        finding: &finding,
+                        rule_fingerprint: &rfp,
+                        secret_hash: &sh,
+                        variant,
+                    },
+                    &keys,
+                ).expect("valid");
+
+                prop_assert_eq!(id1, id2);
+            }
+
+            #[test]
+            fn prop_distinct_single_field_change_different_id(
+                (finding, variant) in arb_finding_rec(),
+                extra_byte in any::<u8>(),
+            ) {
+                let keys = test_keys();
+                let rfp = [0xAA; 32];
+                let sh = [0xBB; 32];
+                let obj = b"test-object";
+
+                // Baseline ID
+                let id_base = occurrence_id(
+                    OccurrenceInput {
+                        object_key: obj,
+                        finding: &finding,
+                        rule_fingerprint: &rfp,
+                        secret_hash: &sh,
+                        variant,
+                    },
+                    &keys,
+                ).expect("valid");
+
+                // Change only object_key
+                let mut obj2 = obj.to_vec();
+                obj2.push(extra_byte);
+                let id_obj = occurrence_id(
+                    OccurrenceInput {
+                        object_key: &obj2,
+                        finding: &finding,
+                        rule_fingerprint: &rfp,
+                        secret_hash: &sh,
+                        variant,
+                    },
+                    &keys,
+                ).expect("valid");
+
+                prop_assert_ne!(id_base, id_obj);
+            }
+        }
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+    use crate::api::{FileId, StepId, STEP_ROOT};
+
+    /// For all u16 values cast to u32, `from_bits_strict` accepts iff no unknown
+    /// bits are set AND bits 8 and 9 are not both set.
+    #[kani::proof]
+    fn kani_from_bits_strict_accepts_iff_valid() {
+        let raw: u16 = kani::any();
+        let bits = raw as u32;
+
+        let known_mask = (1u32 << 0) | (1 << 1) | (1 << 2) | (1 << 8) | (1 << 9);
+        let has_unknown = (bits & !known_mask) != 0;
+        let has_both_utf16 = (bits & (1 << 8) != 0) && (bits & (1 << 9) != 0);
+
+        let result = IdentityFlags::from_bits_strict(bits);
+        if has_unknown {
+            kani::assert(
+                matches!(result, Err(IdentityError::UnknownIdentityFlags { .. })),
+                "unknown bits must be rejected",
+            );
+        } else if has_both_utf16 {
+            kani::assert(
+                matches!(result, Err(IdentityError::ConflictingUtf16Flags { .. })),
+                "conflicting UTF-16 must be rejected",
+            );
+        } else {
+            kani::assert(result.is_ok(), "valid bits must be accepted");
+            if let Ok(flags) = result {
+                kani::assert(flags.bits() == bits, "round-trip bits must match");
+            }
+        }
+    }
+
+    /// Bounded symbolic inputs to `normalize_root_hint_end` never cause panic.
+    #[kani::proof]
+    fn kani_normalize_root_hint_end_no_panic() {
+        let span_start: u32 = kani::any();
+        let span_end: u32 = kani::any();
+        let root_hint_start: u64 = kani::any();
+        let root_hint_end: u64 = kani::any();
+        let is_root: bool = kani::any();
+
+        // Bound the search space to keep verification tractable.
+        kani::assume(span_start <= 4096);
+        kani::assume(span_end <= 4096);
+        kani::assume(root_hint_start <= 100_000);
+        kani::assume(root_hint_end <= 100_100);
+
+        let step_id = if is_root { STEP_ROOT } else { StepId(1) };
+
+        let finding = FindingRec {
+            file_id: FileId(0),
+            rule_id: 0,
+            span_start,
+            span_end,
+            root_hint_start,
+            root_hint_end,
+            dedupe_with_span: false,
+            step_id,
+        };
+
+        // Must not panic.
+        let _ = normalize_root_hint_end(&finding);
     }
 }

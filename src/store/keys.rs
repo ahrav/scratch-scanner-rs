@@ -397,4 +397,86 @@ mod tests {
         assert!(persistent.is_persistent());
         assert!(!ephemeral.is_persistent());
     }
+
+    // ================================================================
+    // Subkey independence & env edge cases
+    // ================================================================
+
+    #[test]
+    fn subkeys_are_mutually_distinct() {
+        let keys = StoreKeys::from_test_root_key(
+            [0x5A; 32],
+            RunModeMetadata {
+                version: STORE_KEYS_VERSION,
+                correlation_mode: CorrelationMode::Persistent,
+                key_source: KeySource::EnvVar,
+            },
+        );
+        assert_ne!(keys.identity_key(), keys.secret_key());
+        assert_ne!(keys.identity_key(), keys.metadata_key());
+        assert_ne!(keys.secret_key(), keys.metadata_key());
+    }
+
+    #[test]
+    fn different_root_keys_produce_different_subkeys() {
+        let meta = RunModeMetadata {
+            version: STORE_KEYS_VERSION,
+            correlation_mode: CorrelationMode::Persistent,
+            key_source: KeySource::EnvVar,
+        };
+        let a = StoreKeys::from_test_root_key([0x11; 32], meta);
+        let b = StoreKeys::from_test_root_key([0x22; 32], meta);
+        // All 6 pairwise comparisons across the two key sets differ
+        assert_ne!(a.identity_key(), b.identity_key());
+        assert_ne!(a.secret_key(), b.secret_key());
+        assert_ne!(a.metadata_key(), b.metadata_key());
+        assert_ne!(a.identity_key(), b.secret_key());
+        assert_ne!(a.identity_key(), b.metadata_key());
+        assert_ne!(a.secret_key(), b.metadata_key());
+    }
+
+    #[test]
+    fn ephemeral_keys_are_unique_per_call() {
+        let a = StoreKeys::bootstrap_from_os_value(None);
+        let b = StoreKeys::bootstrap_from_os_value(None);
+        // Ephemeral keys should differ between calls (different random root)
+        assert_ne!(a.identity_key(), b.identity_key());
+    }
+
+    #[test]
+    fn empty_env_var_falls_back_to_ephemeral() {
+        // SCANNER_SECRET_KEY="" → empty string, base64 decodes to 0 bytes != 32
+        with_secret_key_env(Some(""), || {
+            let keys = StoreKeys::bootstrap_from_env();
+            assert_eq!(keys.run_mode().correlation_mode, CorrelationMode::Ephemeral);
+            assert_eq!(keys.run_mode().key_source, KeySource::InvalidEnvVar);
+        });
+    }
+
+    #[test]
+    fn over_length_key_33_bytes_falls_back() {
+        // 33 bytes base64-encoded → decoded length is 33 != 32
+        let encoded = base64::engine::general_purpose::STANDARD.encode([0x33; 33]);
+        with_secret_key_env(Some(&encoded), || {
+            let keys = StoreKeys::bootstrap_from_env();
+            assert_eq!(keys.run_mode().correlation_mode, CorrelationMode::Ephemeral);
+            assert_eq!(keys.run_mode().key_source, KeySource::InvalidEnvVar);
+        });
+    }
+
+    #[test]
+    fn url_safe_base64_falls_back() {
+        // URL-safe base64 uses '-' and '_' instead of '+' and '/'.
+        // The STANDARD decoder should reject this.
+        let encoded = base64::engine::general_purpose::URL_SAFE.encode([0x44; 32]);
+        // Only test if URL-safe encoding actually differs from standard for this input
+        let standard = base64::engine::general_purpose::STANDARD.encode([0x44; 32]);
+        if encoded != standard {
+            with_secret_key_env(Some(&encoded), || {
+                let keys = StoreKeys::bootstrap_from_env();
+                assert_eq!(keys.run_mode().correlation_mode, CorrelationMode::Ephemeral);
+                assert_eq!(keys.run_mode().key_source, KeySource::InvalidEnvVar);
+            });
+        }
+    }
 }
