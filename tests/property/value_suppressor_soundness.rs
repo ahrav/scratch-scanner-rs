@@ -6,7 +6,7 @@
 
 use proptest::prelude::*;
 use regex::bytes::Regex;
-use scanner_rs::{AnchorPolicy, Engine, Finding, RuleSpec, ValidatorKind, demo_tuning};
+use scanner_rs::{demo_tuning, AnchorPolicy, Engine, Finding, RuleSpec, ValidatorKind};
 
 fn scan_findings(engine: &Engine, hay: &[u8]) -> Vec<Finding> {
     let mut scratch = engine.new_scratch();
