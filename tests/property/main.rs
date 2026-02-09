@@ -4,6 +4,7 @@
 
 mod archive_path_canonicalization;
 mod binary_classification;
+mod fs_log_codec;
 mod git_commit_walk;
 mod git_engine_adapter;
 mod git_spill_dedupe;

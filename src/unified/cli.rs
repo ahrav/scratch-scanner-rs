@@ -599,7 +599,7 @@ OPTIONS:
     --no-archives           Disable archive scanning
     --null-sink             Drop all findings (measure scan overhead only)
     --scan-binary           Scan binary files instead of skipping them
-    --persist-findings      Enable FS persistence producer plumbing
+    --persist-findings      Persist FS findings to append-log segment files
     --anchors=manual|derived  Anchor mode (default: manual)
     --event-format=jsonl    Output format (default: jsonl)
     --help, -h              Show this help"
