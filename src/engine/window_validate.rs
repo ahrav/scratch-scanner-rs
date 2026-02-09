@@ -30,7 +30,9 @@
 //!
 //! The extraction priority is:
 //! 1. Configured `secret_group` if present and non-empty.
-//! 2. Capture group 1 if non-empty (gitleaks convention).
+//! 2. First non-empty capture group (1..N). Gitleaks convention places
+//!    secrets in group 1, but rules with alternation (e.g., `curl-auth-header`)
+//!    may fire a higher group.
 //! 3. Full match (group 0) as fallback.
 //!
 //! # Design Choices

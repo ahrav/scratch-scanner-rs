@@ -1331,6 +1331,333 @@ fn value_suppressor_single_byte_pattern() {
 }
 
 #[test]
+fn value_suppressor_targets_secret_group_not_full_match() {
+    // The suppressor must be checked against the *secret group* span, not the full regex
+    // match. Here group 1 = the part after "KEY_", so suppressor "KEY_" should only match
+    // if the captured group itself contains "KEY_".
+    let rule = RuleSpec {
+        name: "vs-group-target",
+        anchors: &[b"KEY_"],
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: Some(&[b"KEY_"]),
+        entropy: None,
+        local_context: None,
+        secret_group: Some(1),
+        re: Regex::new(r"KEY_([A-Za-z0-9]{8,16})").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Group 1 = "LIVEABCDEF" — does NOT contain "KEY_", so finding should be emitted.
+    let hay_pass = b"prefix KEY_LIVEABCDEF suffix";
+    let hits = scan_chunk_findings(&engine, hay_pass);
+    assert!(
+        hits.iter().any(|h| h.rule == "vs-group-target"),
+        "suppressor 'KEY_' should not match group 1 'LIVEABCDEF'"
+    );
+
+    // Group 1 = "AKEY_BCDEFG" — DOES contain "KEY_", so finding should be suppressed.
+    let hay_suppress = b"prefix KEY_AKEY_BCDEFG suffix";
+    let hits = scan_chunk_findings(&engine, hay_suppress);
+    assert!(
+        !hits.iter().any(|h| h.rule == "vs-group-target"),
+        "suppressor 'KEY_' should match group 1 'AKEY_BCDEFG' and suppress"
+    );
+}
+
+#[test]
+fn value_suppressor_is_substring_match_not_exact() {
+    // Verify that suppressor matching is substring-based: the suppressor pattern must be
+    // found anywhere in the secret span, not requiring an exact match.
+    let rule = RuleSpec {
+        name: "vs-substring",
+        anchors: &[b"TOK_"],
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: Some(&[b"ABC"]),
+        entropy: None,
+        local_context: None,
+        secret_group: Some(1),
+        re: Regex::new(r"TOK_([A-Za-z0-9]{8})").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Prefix match: "ABCDEFGH" — suppressed.
+    let hits = scan_chunk_findings(&engine, b"TOK_ABCDEFGH");
+    assert!(
+        !hits.iter().any(|h| h.rule == "vs-substring"),
+        "suppressor 'ABC' at prefix should suppress"
+    );
+
+    // Interior match: "XABCYZ12" — suppressed.
+    let hits = scan_chunk_findings(&engine, b"TOK_XABCYZ12");
+    assert!(
+        !hits.iter().any(|h| h.rule == "vs-substring"),
+        "suppressor 'ABC' in interior should suppress"
+    );
+
+    // Suffix match: "12345ABC" — suppressed.
+    let hits = scan_chunk_findings(&engine, b"TOK_12345ABC");
+    assert!(
+        !hits.iter().any(|h| h.rule == "vs-substring"),
+        "suppressor 'ABC' at suffix should suppress"
+    );
+
+    // No match: "XYZWVUQP" — emitted.
+    let hits = scan_chunk_findings(&engine, b"TOK_XYZWVUQP");
+    assert!(
+        hits.iter().any(|h| h.rule == "vs-substring"),
+        "suppressor 'ABC' absent from secret should not suppress"
+    );
+}
+
+#[test]
+fn value_suppressor_with_entropy_and_local_context_combined() {
+    // Rule with all three post-regex gates active: entropy, suppressor, and local context.
+    // Each vector tests a different gate filtering independently.
+    let rule = RuleSpec {
+        name: "vs-triple-gate",
+        anchors: &[b"KEY="],
+        radius: 64,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: Some(&[b"EXAMPLE"]),
+        entropy: Some(EntropySpec {
+            min_bits_per_byte: 3.0,
+            min_len: 8,
+            max_len: 32,
+        }),
+        local_context: Some(LocalContextSpec {
+            lookbehind: 64,
+            lookahead: 64,
+            require_same_line_assignment: true,
+            require_quoted: false,
+            key_names_any: None,
+        }),
+        secret_group: Some(1),
+        re: Regex::new(r"KEY=([A-Za-z0-9]{8,16})").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // (1) All gates pass: high-entropy secret, assignment present, no suppressor match → emitted.
+    let hits = scan_chunk_findings(&engine, b"api KEY=a8f2k9x7m4 tail");
+    assert!(
+        hits.iter().any(|h| h.rule == "vs-triple-gate"),
+        "all gates pass → finding should be emitted"
+    );
+
+    // (2) Entropy gate rejects: low-entropy secret.
+    let hits = scan_chunk_findings(&engine, b"api KEY=AAAAAAAA tail");
+    assert!(
+        !hits.iter().any(|h| h.rule == "vs-triple-gate"),
+        "low entropy should filter the finding"
+    );
+
+    // (3) Suppressor gate rejects: secret contains "EXAMPLE".
+    let hits = scan_chunk_findings(&engine, b"api KEY=aEXAMPLEz9 tail");
+    assert!(
+        !hits.iter().any(|h| h.rule == "vs-triple-gate"),
+        "suppressor match should filter the finding"
+    );
+
+    // (4) Local-context gate rejects: no assignment on same line (secret on a new line).
+    let hits = scan_chunk_findings(&engine, b"something\nKEY=a8f2k9x7m4 tail");
+    assert!(
+        hits.iter().any(|h| h.rule == "vs-triple-gate"),
+        "assignment is present on the same line after newline prefix"
+    );
+}
+
+#[test]
+fn value_suppressor_direct_utf16_window() {
+    // Encode a secret directly as UTF-16BE bytes (not via base64) and verify
+    // suppression works through the `run_rule_on_utf16_window_aligned` path.
+    let rule = RuleSpec {
+        name: "vs-direct-utf16",
+        anchors: &[b"TOK"],
+        radius: 0,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: Some(&[b"TOK"]),
+        entropy: None,
+        local_context: None,
+        secret_group: Some(0),
+        re: Regex::new("TOK").unwrap(),
+    };
+
+    let mut tuning = demo_tuning();
+    tuning.scan_utf16_variants = true;
+
+    let engine_suppress = Engine::new_with_anchor_policy(
+        vec![rule.clone()],
+        Vec::new(),
+        tuning.clone(),
+        AnchorPolicy::ManualOnly,
+    );
+    let engine_pass = Engine::new_with_anchor_policy(
+        vec![RuleSpec {
+            value_suppressors_any: None,
+            ..rule
+        }],
+        Vec::new(),
+        tuning,
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Raw UTF-16BE encoding of "TOK" (each ASCII char zero-extended to 2 bytes).
+    let utf16_hay = utf16be_bytes(b"TOK");
+
+    let hits_suppress = scan_chunk_findings(&engine_suppress, &utf16_hay);
+    assert!(
+        !hits_suppress.iter().any(|h| h.rule == "vs-direct-utf16"),
+        "suppressor should filter match in direct UTF-16 path"
+    );
+
+    let hits_pass = scan_chunk_findings(&engine_pass, &utf16_hay);
+    assert!(
+        hits_pass.iter().any(|h| h.rule == "vs-direct-utf16"),
+        "without suppressor, direct UTF-16 match should be emitted"
+    );
+}
+
+#[test]
+fn multiple_rules_different_suppressors_are_independent() {
+    // Two rules with different suppressors: verify no cross-contamination.
+    let rule_a = RuleSpec {
+        name: "rule-a",
+        anchors: &[b"AA_"],
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: Some(&[b"FOO"]),
+        entropy: None,
+        local_context: None,
+        secret_group: Some(1),
+        re: Regex::new(r"AA_([A-Za-z0-9]{8})").unwrap(),
+    };
+    let rule_b = RuleSpec {
+        name: "rule-b",
+        anchors: &[b"BB_"],
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: Some(&[b"BAR"]),
+        entropy: None,
+        local_context: None,
+        secret_group: Some(1),
+        re: Regex::new(r"BB_([A-Za-z0-9]{8})").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule_a, rule_b],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Rule A's secret contains "BAR" (Rule B's suppressor) — Rule A should NOT be suppressed.
+    // Rule B's secret contains "FOO" (Rule A's suppressor) — Rule B should NOT be suppressed.
+    let hay = b"AA_xBARyz12 BB_aFOObcd3";
+    let hits = scan_chunk_findings(&engine, hay);
+    assert!(
+        hits.iter().any(|h| h.rule == "rule-a"),
+        "Rule B's suppressor 'BAR' must not suppress Rule A"
+    );
+    assert!(
+        hits.iter().any(|h| h.rule == "rule-b"),
+        "Rule A's suppressor 'FOO' must not suppress Rule B"
+    );
+
+    // Now test that each rule's own suppressor DOES work.
+    let hay2 = b"AA_xFOOyz12 BB_aBAR1cd3";
+    let hits2 = scan_chunk_findings(&engine, hay2);
+    assert!(
+        !hits2.iter().any(|h| h.rule == "rule-a"),
+        "Rule A's own suppressor 'FOO' should suppress Rule A"
+    );
+    assert!(
+        !hits2.iter().any(|h| h.rule == "rule-b"),
+        "Rule B's own suppressor 'BAR' should suppress Rule B"
+    );
+}
+
+#[test]
+fn value_suppressor_with_explicit_secret_group_0() {
+    // Same pattern as `value_suppressor_works_with_full_match_fallback` but with
+    // `secret_group: Some(0)` explicitly set. Verifies that the explicit group 0
+    // path in `extract_secret_span_locs` behaves identically to the None fallback.
+    let rule = RuleSpec {
+        name: "vs-explicit-group0",
+        anchors: &[b"TOK_"],
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: Some(&[b"TOK_AAAABBBB"]),
+        entropy: None,
+        local_context: None,
+        secret_group: Some(0), // Explicit group 0 instead of None
+        re: Regex::new(r"TOK_[A-Z]{8}").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Suppressor matches the full match → should be suppressed.
+    let hay_suppress = b"prefix TOK_AAAABBBB suffix";
+    let hits = scan_chunk_findings(&engine, hay_suppress);
+    assert!(
+        !hits.iter().any(|h| h.rule == "vs-explicit-group0"),
+        "explicit group 0: suppressor should filter full-match secret"
+    );
+
+    // Secret doesn't match suppressor → should pass.
+    let hay_pass = b"prefix TOK_CCCCDDDD suffix";
+    let hits = scan_chunk_findings(&engine, hay_pass);
+    assert!(
+        hits.iter().any(|h| h.rule == "vs-explicit-group0"),
+        "explicit group 0: non-matching secret should pass"
+    );
+}
+
+#[test]
 fn entropy_gate_filters_low_entropy_matches() {
     const ANCHORS: &[&[u8]] = &[b"TOK_"];
     let rule = RuleSpec {

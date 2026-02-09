@@ -104,7 +104,10 @@ pub use demo::{
 #[cfg(feature = "tiger-harness")]
 pub use engine::fuzz_try_load;
 #[cfg(feature = "bench")]
-pub use engine::{bench_find_spans_into, bench_stream_decode_base64, bench_stream_decode_url};
+pub use engine::{
+    bench_contains_any_memmem, bench_find_spans_into, bench_pack_patterns_raw,
+    bench_stream_decode_base64, bench_stream_decode_url, BenchPackedPatterns,
+};
 #[cfg(feature = "stats")]
 pub use engine::{AnchorPlanStats, VectorscanStats};
 pub use engine::{Engine, NormHash, ScanScratch};
