@@ -34,6 +34,13 @@ flowchart TB
         UTF16Dec["UTF-16 Decode<br/>(for UTF-16 variants)"]
     end
 
+    subgraph PostMatch["Post-Match Gates"]
+        Entropy["Entropy gate<br/>(optional)"]
+        SecretExtract["Secret span extraction"]
+        ValueSuppressors["Value suppressor gate<br/>(optional, any-of)"]
+        LocalCtx["Local context gate<br/>(optional, fail-open)"]
+    end
+
     subgraph Output["Output"]
         FindingRec["FindingRec<br/>{ file_id, rule_id, span, step_id }"]
     end
@@ -60,16 +67,21 @@ flowchart TB
     RegexConfirm --> MustContain
     MustContain --> ConfirmAll
     ConfirmAll --> Regex
-    Regex --> |"Raw variant"| FindingRec
-
+    Regex --> |"Raw variant"| Entropy
     Regex --> |"UTF-16 variant"| UTF16Dec
-    UTF16Dec --> FindingRec
+    UTF16Dec --> Entropy
+
+    Entropy --> SecretExtract
+    SecretExtract --> ValueSuppressors
+    ValueSuppressors --> LocalCtx
+    LocalCtx --> FindingRec
 
     style Input fill:#e3f2fd
     style AnchorScan fill:#fff3e0
     style WindowBuild fill:#e8f5e9
     style SeedConfirm fill:#f3e5f5
     style RegexConfirm fill:#ffebee
+    style PostMatch fill:#fff8e1
     style Output fill:#e8eaf6
 ```
 
@@ -265,29 +277,38 @@ Selection detail:
 
 See `docs/transform-chain.md` for diagrams and the gating sequence.
 
-## Keyword + Local Context + Entropy Gates
+## Keyword + Local Context + Entropy + Value Suppressor Gates
 
 Some rules benefit from additional semantic filters beyond anchors + regex:
 
 - **Keyword gate (any-of)**: at least one keyword must appear inside the same
   validation window as the regex. This is a cheap memmem filter that reduces
   false positives without requiring global context.
+- **Entropy gate**: after a regex match, compute Shannon entropy (bits/byte)
+  of the matched bytes. Low-entropy matches are rejected as likely false
+  positives (e.g., repeated characters or structured IDs).
+- **Value suppressor gate (any-of)**: after regex matching, entropy gating,
+  and secret extraction, check if the extracted secret bytes contain any
+  configured suppressor pattern. If any pattern matches, the finding is
+  discarded. Useful for suppressing known placeholder or example values
+  (e.g., `EXAMPLE`, `DUMMY_TOKEN`) that regex and entropy cannot distinguish
+  from real secrets. Patterns are case-sensitive and matched via memmem on
+  raw secret bytes.
 - **Local context gate (rule-selective)**: after regex matching and secret
   extraction, inspect a bounded same-line lookaround slice for micro-context
   such as assignment separators, required key names, and/or matching quotes.
   This gate is fail-open when line boundaries are missing in the window to
   avoid false negatives at chunk edges.
-- **Entropy gate**: after a regex match, compute Shannon entropy (bits/byte)
-  of the matched bytes. Low-entropy matches are rejected as likely false
-  positives (e.g., repeated characters or structured IDs).
 
 These gates are designed to be **local and bounded**:
 - Keywords are checked *before* regex, and for UTF-16 windows the check happens
   **before decoding** to avoid wasting decode budget.
-- Local context uses bounded lookaround windows and operates on decoded UTF-8
-  bytes for UTF-16 variants, preserving fail-open semantics at boundaries.
 - Entropy runs only on the regex match and is capped by `max_len` to keep cost
   predictable.
+- Value suppressors run only on confirmed matches after secret extraction, so
+  they add minimal cost per finding but do not reduce regex work.
+- Local context uses bounded lookaround windows and operates on decoded UTF-8
+  bytes for UTF-16 variants, preserving fail-open semantics at boundaries.
 
 ## Tuning Parameters
 

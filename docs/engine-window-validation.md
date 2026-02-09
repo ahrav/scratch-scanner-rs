@@ -17,6 +17,7 @@ Two entry styles are supported:
 - **Budget enforcement**: Track and limit UTF-16 decoding resource consumption
 - **Finding extraction**: Record matches with proper span information and secret data extraction
 - **Entropy validation**: Gate findings on Shannon entropy of matched tokens
+- **Value suppression**: Discard findings whose extracted secret contains known placeholder/example patterns
 
 ---
 
@@ -39,7 +40,9 @@ Input: Window [w.start..w.end) in buffer
   ↓
 [Gate 6] Extract secret span from capture groups
   ↓
-[Gate 7] Apply local context checks (bounded, fail-open)
+[Gate 7] Apply value suppressors on extracted secret bytes (when configured)
+  ↓
+[Gate 8] Apply local context checks (bounded, fail-open)
   ↓
 Output: FindingRec with spans in appropriate coordinate space
 ```
@@ -193,7 +196,27 @@ if rule.needs_assignment_shape_check && !has_assignment_value_shape(window) {
 
 **When enabled**: When the rule regex expects an assignment-like structure.
 
-### 5. Local Context Gate (Design A)
+### 5. Value Suppressor Gate
+
+```rust
+if let Some(vs) = value_suppressors {
+    if contains_any_memmem(secret_bytes, vs) {
+        return; // suppress this match
+    }
+}
+```
+
+**Purpose**: Discard findings whose extracted secret value contains a known placeholder or example pattern (e.g., `EXAMPLE`, `DUMMY_TOKEN`).
+
+**When evaluated**: After regex matching, entropy gating, and secret span extraction — before local context checks.
+
+**Matching semantics**: Case-sensitive memmem on the extracted secret bytes (not the full window). Uses `PackedPatterns` for the pattern set.
+
+**Performance**: O(secret_len × pattern_count) memmem searches, only on confirmed matches. Does not reduce regex work but eliminates false positives that entropy/regex cannot distinguish.
+
+**Use case**: Suppressing well-known test/example values that structurally resemble real secrets.
+
+### 6. Local Context Gate (Design A)
 
 Local context gates run **after** regex matching and secret extraction. They
 inspect a bounded lookaround slice (same line) to validate micro-context such as
@@ -479,12 +502,15 @@ Gates are applied in a specific order to minimize decode work:
 [6] Apply assignment-shape check on decoded UTF-8
     ↓
 [7] Run regex on decoded UTF-8
+    ↓
+[8] Post-match: entropy → secret extraction → value suppressors → local context
 ```
 
 This ordering ensures:
 - Cheap gates run before expensive decoding
 - Keyword/confirm gates reject windows before wasting decode budget
 - must_contain gate runs on decoded UTF-8 (must check decoded content)
+- Value suppressors run on extracted secret bytes in decoded space (never raw UTF-16)
 
 ---
 
@@ -562,8 +588,10 @@ variant-specific ordering:
 1. Raw: must_contain -> confirm_all -> keywords -> assignment-shape
 2. UTF-16: confirm_all -> keywords -> decode -> must_contain -> assignment-shape
 3. Regex: O(n x complexity)
+4. Post-match: entropy -> secret extraction -> value suppressors -> local context
 
-Early failures save expensive regex execution.
+Early failures save expensive regex execution. Post-match gates run only on
+confirmed regex matches, so their cost scales with finding count, not window count.
 
 ### Entropy on Full Match
 

@@ -35,6 +35,7 @@ classDiagram
         +Option~TwoPhaseSpec~ two_phase
         +Option~&'static [u8]~ must_contain
         +Option~&'static [&'static [u8]]~ keywords_any
+        +Option~&'static [&'static [u8]]~ value_suppressors_any
         +Option~EntropySpec~ entropy
         +Option~LocalContextSpec~ local_context
         +Option~u16~ secret_group
@@ -48,6 +49,7 @@ classDiagram
         -Option~u16~ secret_group
         -Option~u32~ confirm_all
         -Option~u32~ keywords
+        -Option~u32~ value_suppressors
         -Option~u32~ entropy
         -Option~u32~ local_context
         -Option~u32~ two_phase
