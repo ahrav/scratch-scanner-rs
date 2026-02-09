@@ -34,6 +34,12 @@ Documentation index for the scanner-rs secret scanning engine. This guide helps 
 | [detection-rules.md](detection-rules.md) | Rule anatomy | Anchor strategy, representative patterns, two-phase examples |
 | [transform-chain.md](transform-chain.md) | Recursive decoding flow | URL/Base64 transforms, TimingWheel scheduling |
 
+#### Persistence
+| Document | Focus | Key Concepts |
+|----------|-------|--------------|
+| [persistence-identity.md](persistence-identity.md) | FS persistence identity contracts | Key bootstrap, rule fingerprint, secret hash, occurrence ID, normalization |
+| [git-scanning.md](git-scanning.md) | Git persistence pipeline | Two-phase persist, ref watermarks, seen-blob store |
+
 ---
 
 ### 3. Engine Internals
@@ -110,6 +116,8 @@ Documentation index for the scanner-rs secret scanning engine. This guide helps 
 | Debug memory issues | [memory-management.md](memory-management.md) |
 | Add transform support | [engine-transforms.md](engine-transforms.md) → [transform-chain.md](transform-chain.md) |
 | Understand window validation | [engine-window-validation.md](engine-window-validation.md) |
+| Understand persistence identity | [persistence-identity.md](persistence-identity.md) |
+| Configure `SCANNER_SECRET_KEY` | [persistence-identity.md](persistence-identity.md#key-bootstrap) |
 
 ---
 
