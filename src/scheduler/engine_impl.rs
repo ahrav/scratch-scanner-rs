@@ -35,7 +35,7 @@
 //!
 //! This preserves the trait's simplicity while satisfying the real engine's requirements.
 
-use super::engine_trait::{EngineScratch, FindingRecord, ScanEngine};
+use super::engine_trait::{EngineScratch, FindingRecord, FindingWithHash, ScanEngine};
 use crate::api::{FileId, FindingRec as ApiFindingRec};
 use crate::engine::{Engine, ScanScratch as RealScanScratch};
 
@@ -142,7 +142,7 @@ impl RealEngineScratch {
 }
 
 impl EngineScratch for RealEngineScratch {
-    type Finding = ApiFindingRec;
+    type Finding = FindingWithHash<ApiFindingRec>;
 
     fn clear(&mut self) {
         // Lazy reset pattern: the real scratch's `reset_for_scan()` is called inside
@@ -163,13 +163,19 @@ impl EngineScratch for RealEngineScratch {
         self.findings_buf.clear();
         if self.findings_buf.capacity() >= self.scratch.pending_findings_len() {
             self.scratch.drain_findings(&mut self.findings_buf);
-            out.append(&mut self.findings_buf);
         } else {
             // Reserve more capacity if needed
             self.findings_buf
                 .reserve(self.scratch.pending_findings_len());
             self.scratch.drain_findings(&mut self.findings_buf);
-            out.append(&mut self.findings_buf);
+        }
+
+        out.reserve(self.findings_buf.len());
+        // Phase B task 6hu.2.1 introduces the carrier type first.
+        // Hash-aware draining is added in task 6hu.2.2; use a stable
+        // placeholder until then to keep trait plumbing compile-clean.
+        for finding in self.findings_buf.drain(..) {
+            out.push(FindingWithHash::new(finding, [0; 32]));
         }
     }
 }
@@ -266,6 +272,7 @@ mod tests {
         scratch.drain_findings_into(&mut findings);
 
         assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].norm_hash, [0; 32]);
         assert_eq!(
             <Engine as ScanEngine>::rule_name(&engine, findings[0].rule_id()),
             "test-secret"

@@ -2906,6 +2906,7 @@ mod tests {
     use super::*;
     use crate::archive::PartialReason;
     use crate::scheduler::engine_stub::{FindingRec, MockEngine, MockRule, RuleId};
+    use crate::scheduler::engine_trait::FindingWithHash;
     use crate::unified::events::VecEventSink;
     use std::fs;
     use std::io::Write;
@@ -3289,6 +3290,19 @@ mod tests {
         let mut v = vec![finding(0, 10, 16), finding(0, 20, 26), finding(0, 30, 36)];
         dedupe_findings(&mut v);
         assert_eq!(v.len(), 3, "distinct offsets should all be kept");
+    }
+
+    #[test]
+    fn dedupe_works_for_finding_with_hash_carrier() {
+        let mut v = vec![
+            FindingWithHash::new(finding(0, 10, 16), [1; 32]),
+            FindingWithHash::new(finding(0, 10, 16), [1; 32]), // dup
+            FindingWithHash::new(finding(1, 20, 26), [2; 32]),
+        ];
+        dedupe_findings(&mut v);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].finding.rule_id, RuleId(0));
+        assert_eq!(v[1].finding.rule_id, RuleId(1));
     }
 
     // ---------------------------------------------------------------

@@ -333,7 +333,7 @@ impl MockEngine {
 // Trait Implementations
 // ============================================================================
 
-use super::engine_trait::{EngineScratch, FindingRecord, ScanEngine};
+use super::engine_trait::{EngineScratch, FindingRecord, FindingWithHash, ScanEngine};
 use crate::api::FileId as ApiFileId;
 
 impl FindingRecord for FindingRec {
@@ -364,7 +364,7 @@ impl FindingRecord for FindingRec {
 }
 
 impl EngineScratch for ScanScratch {
-    type Finding = FindingRec;
+    type Finding = FindingWithHash<FindingRec>;
 
     fn clear(&mut self) {
         self.clear();
@@ -375,7 +375,12 @@ impl EngineScratch for ScanScratch {
     }
 
     fn drain_findings_into(&mut self, out: &mut Vec<Self::Finding>) {
-        self.drain_findings_into(out);
+        out.reserve(self.findings.len());
+        // Stub engine doesn't compute normalized secret hashes.
+        // Keep a deterministic placeholder to exercise carrier plumbing.
+        for finding in self.findings.drain(..) {
+            out.push(FindingWithHash::new(finding, [0; 32]));
+        }
     }
 }
 
@@ -532,6 +537,27 @@ mod tests {
         let engine = simple_engine();
         assert_eq!(engine.rule_name(RuleId(0)), "secret");
         assert_eq!(engine.rule_name(RuleId(1)), "password");
+    }
+
+    #[test]
+    fn trait_surface_emits_finding_with_hash_carrier() {
+        let engine = simple_engine();
+        let mut scratch = <MockEngine as ScanEngine>::new_scratch(&engine);
+        <MockEngine as ScanEngine>::scan_chunk_into(
+            &engine,
+            b"SECRET",
+            ApiFileId(0),
+            0,
+            &mut scratch,
+        );
+
+        let mut findings: Vec<<<MockEngine as ScanEngine>::Scratch as EngineScratch>::Finding> =
+            Vec::new();
+        <ScanScratch as EngineScratch>::drain_findings_into(&mut scratch, &mut findings);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].finding.rule_id, RuleId(0));
+        assert_eq!(findings[0].norm_hash, [0; 32]);
     }
 
     #[test]

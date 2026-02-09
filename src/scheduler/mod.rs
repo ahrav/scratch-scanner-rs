@@ -279,7 +279,7 @@ pub use engine_impl::RealEngineScratch;
 pub use engine_stub::{
     FileId, FindingRec, MockEngine, RuleId, ScanScratch, BUFFER_ALIGN, BUFFER_LEN_MAX,
 };
-pub use engine_trait::{EngineScratch, FindingRecord, ScanEngine};
+pub use engine_trait::{EngineScratch, FindingRecord, FindingWithHash, ScanEngine};
 pub use findings::{GlobalFindingsCollector, SecretHash, WorkerFindingsBuffer};
 pub use ts_buffer_pool::{TsBufferHandle, TsBufferPool, TsBufferPoolConfig};
 pub use ts_chunk::TsChunk;
