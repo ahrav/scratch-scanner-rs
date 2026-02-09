@@ -649,7 +649,6 @@ fn emit_persistence_batch<F: FindingWithHashRecord>(
         findings: persist_batch.as_slice(),
     }) {
         metrics.persistence_emit_failures = metrics.persistence_emit_failures.saturating_add(1);
-        metrics.io_errors = metrics.io_errors.saturating_add(1);
         let mut msg = StackMsg::<256>::new();
         let _ = std::fmt::Write::write_fmt(
             &mut msg,
@@ -858,6 +857,10 @@ struct ArchiveScanCtx<'a, E: ScanEngine> {
 }
 
 impl<'a, E: ScanEngine> ArchiveScanCtx<'a, E> {
+    /// Create a top-level archive scan context from per-worker scratch.
+    ///
+    /// Borrows all depth-indexed slices at full length; nested calls peel off
+    /// the head element via `split_first_mut` before constructing child contexts.
     fn new(scratch: &'a mut LocalScratch<E>, metrics: &'a mut WorkerMetricsLocal) -> Self {
         Self {
             engine: &scratch.engine,
@@ -3430,10 +3433,11 @@ mod tests {
                 [0xAB; 32],
             );
             // Scheduler dedupe will collapse these to one.
+            // Scheduler dedupe will collapse these to one.  The engine
+            // emitted both copies so `dropped_findings` stays 0 — the
+            // "drop" is purely scheduler-side dedup, not an engine cap.
             scratch.findings.push(finding);
             scratch.findings.push(finding);
-            // Simulate one pre-dedupe dropped finding reported by engine.
-            scratch.dropped_findings = 1;
         }
 
         fn rule_name(&self, _rule_id: u32) -> &str {
@@ -3441,7 +3445,7 @@ mod tests {
         }
 
         fn max_findings_per_chunk(&self) -> usize {
-            1
+            4
         }
     }
 
@@ -4260,7 +4264,7 @@ mod tests {
         let hash = [0xDE; 32];
         let wrapped = FindingWithHash::new(finding, hash);
         let findings = vec![wrapped];
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(findings.len());
 
         build_persistence_batch(&findings, &mut out);
 
