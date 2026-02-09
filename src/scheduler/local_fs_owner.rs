@@ -536,9 +536,18 @@ fn dedupe_findings<F: FindingWithHashRecord>(findings: &mut Vec<F>) {
 
 /// Account for effective drop loss after scheduler-side pruning.
 ///
-/// The engine reports dropped findings before overlap-prefix pruning and
-/// within-chunk dedupe. Any findings removed by those scheduler passes are not
-/// lossful for persistence, so we subtract them from the engine-reported drops.
+/// The engine reports dropped findings (due to max-findings caps) *before*
+/// overlap-prefix pruning and within-chunk dedupe. Findings removed by those
+/// scheduler passes would have been discarded anyway and are not lossful for
+/// persistence, so we subtract them from the engine-reported drops.
+///
+/// ```text
+///   effective_drops = engine_reported_drops − scheduler_pruned
+/// ```
+///
+/// Without this adjustment a chunk where the engine dropped 2 findings and the
+/// scheduler pruned 2 duplicates would falsely report 2 drops, triggering the
+/// `persistence_incomplete` signal even though every unique finding was emitted.
 #[inline]
 fn account_effective_dropped_findings(
     metrics: &mut WorkerMetricsLocal,
@@ -581,6 +590,11 @@ fn emit_findings<E: ScanEngine, F: FindingRecord>(
     }
 }
 
+/// Convert engine-typed findings into the flat [`FsFindingRecord`] format
+/// expected by the persistence layer.
+///
+/// `out` is cleared and repopulated. It is pre-sized to
+/// `max_findings_per_chunk` at worker init, so no reallocation occurs.
 #[inline]
 fn build_persistence_batch<F: FindingWithHashRecord>(
     findings: &[F],
@@ -607,6 +621,12 @@ fn build_persistence_batch<F: FindingWithHashRecord>(
     }
 }
 
+/// Build and emit a persistence batch for one chunk's post-dedupe findings.
+///
+/// No-ops when `store_producer` is `None` or `findings` is empty.
+/// On emit failure, increments `persistence_emit_failures` and `io_errors`,
+/// and emits a diagnostic event. The scan continues — persistence errors are
+/// fail-soft per batch, not per run.
 #[inline]
 fn emit_persistence_batch<F: FindingWithHashRecord>(
     store_producer: Option<&dyn StoreProducer>,
@@ -745,6 +765,11 @@ enum ArchiveEnd {
     Partial(PartialReason),
 }
 
+/// Map an archive-level skip reason to the corresponding partial-scan reason.
+///
+/// Used when a nested archive is skipped mid-stream, promoting the skip into
+/// a partial outcome for the parent entry/archive. Unmapped variants fall
+/// through to `MalformedZip` as a conservative default.
 #[inline(always)]
 fn map_archive_skip_to_partial(reason: ArchiveSkipReason) -> PartialReason {
     match reason {
@@ -761,6 +786,10 @@ fn map_archive_skip_to_partial(reason: ArchiveSkipReason) -> PartialReason {
     }
 }
 
+/// Extract the [`PartialReason`] from a [`BudgetHit`].
+///
+/// Every budget violation carries a reason; this collapses the four `BudgetHit`
+/// variants into a flat `PartialReason` for recording in metrics and diagnostics.
 #[inline(always)]
 fn budget_hit_to_partial_reason(hit: BudgetHit) -> PartialReason {
     match hit {
@@ -771,6 +800,9 @@ fn budget_hit_to_partial_reason(hit: BudgetHit) -> PartialReason {
     }
 }
 
+/// Convert a [`BudgetHit`] into the corresponding [`ArchiveEnd`] outcome.
+///
+/// `SkipArchive` maps to `Skipped`; all others map to `Partial`.
 #[inline(always)]
 fn budget_hit_to_archive_end(hit: BudgetHit) -> ArchiveEnd {
     match hit {
@@ -853,6 +885,10 @@ impl<'a, E: ScanEngine> ArchiveScanCtx<'a, E> {
 }
 
 /// Charge decompressed bytes that were read but not scanned (entry truncation).
+///
+/// Discarded bytes still count against archive and root output budgets because
+/// the decompressor already produced them. Returns `Err` with the triggering
+/// [`PartialReason`] if charging the discard pushes a budget over its limit.
 #[inline(always)]
 fn charge_discarded_bytes(budgets: &mut ArchiveBudgets, bytes: u64) -> Result<(), PartialReason> {
     if bytes == 0 {
@@ -2861,10 +2897,8 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
 
         let data = &buf.as_slice()[..read_len];
         engine.scan_chunk_into(data, task.file_id, base_offset, &mut scratch.scan_scratch);
-        ctx.metrics.findings_dropped = ctx
-            .metrics
-            .findings_dropped
-            .saturating_add(scratch.scan_scratch.dropped_findings());
+        let engine_dropped = scratch.scan_scratch.dropped_findings();
+        let before_prefix = scratch.scan_scratch.pending_findings_len();
 
         #[cfg(all(feature = "perf-stats", debug_assertions))]
         {
@@ -2879,6 +2913,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
         // new_bytes_start == offset (the first truly new byte in this scan)
         let new_bytes_start = offset;
         scratch.scan_scratch.drop_prefix_findings(new_bytes_start);
+        let after_prefix = scratch.scan_scratch.pending_findings_len();
 
         // Extract findings
         scratch.pending.clear();
@@ -2887,9 +2922,14 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
             .drain_findings_into(&mut scratch.pending);
 
         // Optional within-chunk dedupe (only needed if engine can emit duplicates)
-        if scratch.dedupe_within_chunk && scratch.pending.len() > 1 {
+        let before_dedupe = scratch.pending.len();
+        if scratch.dedupe_within_chunk && before_dedupe > 1 {
             dedupe_findings(&mut scratch.pending);
         }
+        let scheduler_pruned = before_prefix
+            .saturating_sub(after_prefix)
+            .saturating_add(before_dedupe.saturating_sub(scratch.pending.len()));
+        account_effective_dropped_findings(&mut ctx.metrics, engine_dropped, scheduler_pruned);
 
         // Count findings before emitting (pending.len() is the count for this chunk)
         ctx.metrics.findings_emitted = ctx
