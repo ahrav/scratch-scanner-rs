@@ -516,6 +516,50 @@ mod tests {
         findings
     }
 
+    fn builtin_rule_by_name(rule_name: &str) -> RuleSpec {
+        builtin_rules()
+            .into_iter()
+            .find(|rule| rule.name == rule_name)
+            .unwrap_or_else(|| panic!("missing builtin rule: {rule_name}"))
+    }
+
+    fn scan_single_builtin_rule(rule_name: &str, hay: &[u8]) -> Vec<Finding> {
+        let rule = builtin_rule_by_name(rule_name);
+        let engine = Engine::new_with_anchor_policy(
+            vec![rule],
+            Vec::new(),
+            demo_tuning(),
+            AnchorPolicy::ManualOnly,
+        );
+        let mut scratch = engine.new_scratch();
+        let mut findings = Vec::with_capacity(16);
+        engine.scan_chunk_materialized(hay, &mut scratch, &mut findings);
+        findings
+    }
+
+    fn has_rule_hit(hits: &[Finding], rule_name: &str) -> bool {
+        hits.iter().any(|hit| hit.rule == rule_name)
+    }
+
+    fn lcg_next(state: &mut u64) -> u64 {
+        // Deterministic stream for repeatable "property-style" coverage in unit tests.
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *state
+    }
+
+    fn deterministic_secret(state: &mut u64, len: usize) -> String {
+        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+        let mut out = String::with_capacity(len);
+        for _ in 0..len {
+            let next = lcg_next(state);
+            let idx = (next % ALPHABET.len() as u64) as usize;
+            out.push(ALPHABET[idx] as char);
+        }
+        out
+    }
+
     #[test]
     fn default_rules_yaml_matches_builtin_rules() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("default_rules.yaml");
@@ -651,6 +695,211 @@ rules:
     fn builtin_rules_count() {
         let rules = builtin_rules();
         assert_eq!(rules.len(), 223, "expected 223 builtin rules");
+    }
+
+    #[test]
+    fn top_fp_rules_have_value_suppressors_configured() {
+        let target_rules = [
+            "generic-api-key",
+            "hashicorp-tf-password",
+            "curl-auth-header",
+            "curl-auth-user",
+            "atlassian-api-token",
+        ];
+
+        for rule_name in target_rules {
+            let rule = builtin_rule_by_name(rule_name);
+            let suppressors = rule
+                .value_suppressors_any
+                .unwrap_or_else(|| panic!("expected value_suppressors_any for {rule_name}"));
+            assert!(
+                !suppressors.is_empty(),
+                "expected non-empty value_suppressors_any for {rule_name}"
+            );
+            assert!(
+                suppressors.iter().any(|v| *v == b"example"),
+                "expected shared suppressor 'example' for {rule_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_api_key_suppresses_placeholder_value() {
+        let rule_name = "generic-api-key";
+        let hay = b"API_KEY=YOUR_EXAMPLE_1";
+        let hits = scan_single_builtin_rule(rule_name, hay);
+        assert!(
+            !has_rule_hit(&hits, rule_name),
+            "expected placeholder API key to be suppressed"
+        );
+    }
+
+    #[test]
+    fn generic_api_key_allows_real_value() {
+        let rule_name = "generic-api-key";
+        let hay = b"API_KEY=a8f2k9x7m4p1q6w3";
+        let hits = scan_single_builtin_rule(rule_name, hay);
+        assert!(
+            has_rule_hit(&hits, rule_name),
+            "expected real-looking API key to be reported"
+        );
+    }
+
+    #[test]
+    fn generic_api_key_random_high_entropy_values_are_not_suppressed() {
+        let rule_name = "generic-api-key";
+        let rule = builtin_rule_by_name(rule_name);
+        let suppressors = rule
+            .value_suppressors_any
+            .expect("generic-api-key should have value suppressors");
+        let suppressors: Vec<&str> = suppressors
+            .iter()
+            .map(|s| std::str::from_utf8(s).expect("suppressor should be valid UTF-8"))
+            .collect();
+
+        let mut seed = 0x9E3779B97F4A7C15_u64;
+        let mut checked = 0usize;
+        for _ in 0..192 {
+            let secret = deterministic_secret(&mut seed, 24);
+            // Skip generated values that intentionally collide with suppressor literals.
+            if suppressors.iter().any(|sup| secret.contains(sup)) {
+                continue;
+            }
+
+            let distinct = secret
+                .as_bytes()
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<u8>>()
+                .len();
+            if distinct < 8 {
+                continue;
+            }
+
+            let hay = format!("API_KEY={secret}");
+            let hits = scan_single_builtin_rule(rule_name, hay.as_bytes());
+            assert!(
+                has_rule_hit(&hits, rule_name),
+                "expected randomized secret '{secret}' to be reported"
+            );
+            checked += 1;
+        }
+
+        assert!(
+            checked >= 96,
+            "expected to validate at least 96 randomized secrets, got {checked}"
+        );
+    }
+
+    #[test]
+    fn hashicorp_tf_password_suppresses_placeholder_value() {
+        let rule_name = "hashicorp-tf-password";
+        let hay = br#"password = "changeme123""#;
+        let hits = scan_single_builtin_rule(rule_name, hay);
+        assert!(
+            !has_rule_hit(&hits, rule_name),
+            "expected placeholder terraform password to be suppressed"
+        );
+    }
+
+    #[test]
+    fn hashicorp_tf_password_allows_real_value() {
+        let rule_name = "hashicorp-tf-password";
+        let hay = br#"password = "a8f2k9x7m4p1q6w3""#;
+        let hits = scan_single_builtin_rule(rule_name, hay);
+        assert!(
+            has_rule_hit(&hits, rule_name),
+            "expected real-looking terraform password to be reported"
+        );
+    }
+
+    #[test]
+    fn curl_auth_header_suppresses_placeholder_bearer_token() {
+        let rule_name = "curl-auth-header";
+        let hay = br#"curl -H "Authorization: Bearer YOUR_TOKEN_HERE" https://api.example.com"#;
+        let hits = scan_single_builtin_rule(rule_name, hay);
+        assert!(
+            !has_rule_hit(&hits, rule_name),
+            "expected placeholder bearer token to be suppressed"
+        );
+    }
+
+    #[test]
+    fn curl_auth_header_allows_real_bearer_token() {
+        let rule_name = "curl-auth-header";
+        let hay =
+            br#"curl -H "Authorization: Bearer a8f2k9x7m4p1q6w3b5n0j4c9" https://api.internal"#;
+        let hits = scan_single_builtin_rule(rule_name, hay);
+        assert!(
+            has_rule_hit(&hits, rule_name),
+            "expected real-looking bearer token to be reported"
+        );
+    }
+
+    #[test]
+    fn curl_auth_header_suppresses_placeholder_api_key() {
+        let rule_name = "curl-auth-header";
+        let hay = br#"curl -H "X-Api-Key: EXAMPLE_KEY_12345" https://api.example.com"#;
+        let hits = scan_single_builtin_rule(rule_name, hay);
+        assert!(
+            !has_rule_hit(&hits, rule_name),
+            "expected placeholder X-Api-Key value to be suppressed"
+        );
+    }
+
+    #[test]
+    fn curl_auth_user_suppresses_placeholder_user_password() {
+        let rule_name = "curl-auth-user";
+        let hay = b"curl -u admin:changeme https://api.example.com";
+        let hits = scan_single_builtin_rule(rule_name, hay);
+        assert!(
+            !has_rule_hit(&hits, rule_name),
+            "expected placeholder user:password to be suppressed"
+        );
+    }
+
+    #[test]
+    fn curl_auth_user_allows_real_user_password() {
+        let rule_name = "curl-auth-user";
+        let hay = b"curl -u deploy_bot:a8f2k9x7m4p1q6w3 https://registry.internal";
+        let hits = scan_single_builtin_rule(rule_name, hay);
+        assert!(
+            has_rule_hit(&hits, rule_name),
+            "expected real-looking curl -u credentials to be reported"
+        );
+    }
+
+    #[test]
+    fn curl_auth_user_suppresses_literal_password_example() {
+        let rule_name = "curl-auth-user";
+        let hay = b"curl -u 'user:password' https://api.example.com";
+        let hits = scan_single_builtin_rule(rule_name, hay);
+        assert!(
+            !has_rule_hit(&hits, rule_name),
+            "expected user:password literal example to be suppressed"
+        );
+    }
+
+    #[test]
+    fn atlassian_api_token_suppresses_placeholder_value() {
+        let rule_name = "atlassian-api-token";
+        let hay = b"JIRA_TOKEN=yourexampletokenabcd1234";
+        let hits = scan_single_builtin_rule(rule_name, hay);
+        assert!(
+            !has_rule_hit(&hits, rule_name),
+            "expected placeholder atlassian token to be suppressed"
+        );
+    }
+
+    #[test]
+    fn atlassian_api_token_allows_real_value() {
+        let rule_name = "atlassian-api-token";
+        let hay = b"JIRA_TOKEN=a8f2k9x7m4p1q6w3b5n0c1d2";
+        let hits = scan_single_builtin_rule(rule_name, hay);
+        assert!(
+            has_rule_hit(&hits, rule_name),
+            "expected real-looking atlassian token to be reported"
+        );
     }
 
     #[test]
