@@ -85,8 +85,8 @@ pub struct FsScanConfig {
     pub scan_binary: bool,
     /// When `true`, wire a [`StoreProducer`](crate::store::StoreProducer) into
     /// the parallel scan so post-dedupe findings are emitted to the persistence
-    /// backend. Currently uses [`NullStoreProducer`](crate::store::NullStoreProducer)
-    /// (no-op) as a placeholder until a real backend is connected.
+    /// backend. The default backend writes append-only framed segment logs
+    /// under the configured store root.
     pub persist_findings: bool,
 }
 

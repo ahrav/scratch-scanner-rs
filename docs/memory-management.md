@@ -85,6 +85,17 @@ so backends must copy or serialize before returning. This is off the hot
 chunk-scanning path (occurs once per scanned object, after all chunks are
 processed).
 
+With the append-log backend (`src/store/log/writer.rs`), each worker then
+encodes owned finding frames and hands them to a single writer thread via a
+bounded queue:
+
+- `max_inflight_batches` caps queued frame count.
+- `max_inflight_bytes` caps queued encoded bytes.
+- Over-budget single frames fail explicitly instead of being dropped.
+
+These caps bound persistence-side memory independently of engine scanning
+budgets.
+
 Path storage is also bounded: `FileTable` maintains a fixed-capacity byte arena
 for Unix paths. Archive expansion uses fallible `try_*` insertion APIs plus
 per-archive path budgets so hostile inputs cannot panic the scanner.

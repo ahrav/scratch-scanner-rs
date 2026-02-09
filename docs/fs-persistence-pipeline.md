@@ -3,7 +3,8 @@
 Write-side plumbing that carries post-dedupe findings from the scheduler's
 FS scan loops into a persistence backend.
 
-**Source**: `src/store/fs.rs`, `src/scheduler/local_fs_owner.rs`,
+**Source**: `src/store/fs.rs`, `src/store/log/format.rs`,
+`src/store/log/writer.rs`, `src/scheduler/local_fs_owner.rs`,
 `src/scheduler/parallel_scan.rs`, `src/unified/orchestrator.rs`
 
 ## Purpose
@@ -11,8 +12,8 @@ FS scan loops into a persistence backend.
 The detection engine emits findings during scanning, but those findings are
 transient — they flow through the `EventSink` to stdout and are gone. The
 FS persistence pipeline adds a **durable write path** so post-dedupe findings
-can be stored in a backend (database, object store, etc.) for cross-run
-deduplication, tracking, and reporting.
+are persisted to append-only segment logs for cross-run deduplication,
+tracking, and reporting.
 
 This module defines the **producer-side contracts** (what the scheduler
 emits). The consumer side (actual backend storage) is plugged in via the
@@ -23,6 +24,8 @@ emits). The consumer side (actual backend storage) is plugged in via the
 | Module | Scope | Purpose |
 |--------|-------|---------|
 | `src/store/fs.rs` | FS persistence producer | Write-side trait + data types for FS scan findings |
+| `src/store/log/format.rs` | FS log codec | Framed on-disk record format (`len + crc32 + type + payload`) |
+| `src/store/log/writer.rs` | FS append-log backend | Bounded single-writer runtime with `.open` -> `.bin` finalize |
 | `src/store/identity.rs` | Identity contracts | Stable `RuleFingerprint`, `SecretHash`, `OccurrenceId` derivation |
 | `src/store/keys.rs` | Key bootstrap | `SCANNER_SECRET_KEY` KDF for keyed identity hashes |
 | `src/git_scan/persist.rs` | Git persistence | Two-phase persist contract for Git blob scan results |
@@ -64,10 +67,10 @@ the pipeline delivers `FsFindingRecord` batches, and the backend computes
                      │                         ▼                                   │
                      │                  StoreProducer::emit_fs_batch()             │
                      │                         │                                   │
-                     │           ┌─────────────┼─────────────┐                     │
-                     │           ▼             ▼             ▼                     │
-                     │     NullProducer  InMemoryProd   (future DB)                │
-                     │      (discard)    (test/diag)                               │
+                     │           ┌─────────────┼──────────────┬─────────────┐      │
+                     │           ▼             ▼              ▼             ▼      │
+                     │   AppendLogProducer  InMemoryProd  NullProducer   (custom)   │
+                     │    (.open/.bin)       (test/diag)    (discard)               │
                      └─────────────────────────────────────────────────────────────┘
 
                      At run end:
@@ -156,8 +159,27 @@ pub trait StoreProducer: Send + Sync + 'static {
 
 | Type | Purpose |
 |------|---------|
+| `AppendLogStoreProducer` | Default FS backend: bounded single-writer append-log with framed records and segment finalize |
 | `NullStoreProducer` | Default no-op — CLI default, feature-off, benchmarks |
 | `InMemoryStoreProducer` | Collects batches in memory for tests and diagnostics |
+
+### Append-Log Backend (Phase C)
+
+When `--persist-findings` is enabled for FS scans, the orchestrator now wires
+`AppendLogStoreProducer` by default. Behavior:
+
+- Writer runtime:
+  - Bounded MPSC ingestion with both batch-count and byte-budget limits.
+  - Explicit error on over-budget single frames (no silent drop).
+  - Single writer thread is the only mutator of segment files.
+- On-disk records:
+  - `RunStart`, `RuleDef`, `FindingBatch`, `RunEnd`.
+  - Frame header: `u32_le len`, `u32_le crc32`, `u8 frame_type`, payload.
+  - Rule definitions are emitted in fingerprint-sorted order for deterministic metadata ordering.
+- Segment lifecycle:
+  - Active segment is `segment-<seq>.open`.
+  - Rotation/finalize performs durable close (`sync_data`) and atomic rename to `.bin`.
+  - Reader/query paths consume finalized `.bin` segments only in MVP.
 
 ## Loss Accounting
 
@@ -218,8 +240,8 @@ scanner scan fs --path=/some/dir --persist-findings
 
 The `--persist-findings` flag sets `FsScanConfig.persist_findings = true`,
 which causes the orchestrator to wire a `StoreProducer` into the
-`ParallelScanConfig`. Currently this wires `NullStoreProducer` as a
-placeholder — a real backend is connected in a future phase.
+`ParallelScanConfig`. The default producer is `AppendLogStoreProducer`, which
+writes run directories under the append-log root.
 
 ### Wiring Path
 
@@ -231,7 +253,7 @@ FsScanConfig { persist_findings: true }
   │
   ▼
 run_fs() in orchestrator.rs
-  │  creates Arc<NullStoreProducer>  (placeholder)
+  │  creates Arc<AppendLogStoreProducer>
   ▼
 ParallelScanConfig { store_producer: Some(Arc<dyn StoreProducer>) }
   │
@@ -279,14 +301,12 @@ The `SummaryEvent.status` field is set to `"partial"` when
 
 ## What's NOT Included (Future Work)
 
-- **No real persistence backend** — `NullStoreProducer` is the only wired
-  implementation. A future phase adds a DB-backed producer.
-- **No schema/serialization** — `FsFindingRecord` is an in-memory struct,
-  not a wire format (protobuf, flatbuffers, etc.).
-- **No async/batched writes** — each object's findings are emitted
-  synchronously. A production backend may want buffered async writes.
-- **No identity computation** — the pipeline emits raw `norm_hash` values.
-  Computing `OccurrenceId` from `StoreKeys` is the backend's responsibility.
+- **No live `.open` readers in MVP** — query/replay is over finalized `.bin`
+  segments only.
+- **No mid-segment salvage** — malformed frame handling is stop-at-first-bad-frame;
+  advanced resync/recovery policy is handled in Phase D.
+- **No derived index yet** — logs are the source of truth; SQLite/indexed query
+  acceleration is post-MVP.
 
 ## Related Documentation
 

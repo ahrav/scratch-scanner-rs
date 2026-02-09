@@ -426,15 +426,21 @@ classDiagram
         +losses() Vec
     }
 
+    class AppendLogStoreProducer {
+        bounded writer thread
+        append-only .open/.bin segments
+    }
+
     FsFindingBatch --> FsFindingRecord : contains
     FsFindingRecord --> NormHash : carries
     StoreProducer <|.. NullStoreProducer : implements
     StoreProducer <|.. InMemoryStoreProducer : implements
+    StoreProducer <|.. AppendLogStoreProducer : implements
     StoreProducer ..> FsFindingBatch : receives
     StoreProducer ..> FsRunLoss : receives
 ```
 
-Verified against: `src/store/fs.rs`.
+Verified against: `src/store/fs.rs`, `src/store/log/writer.rs`.
 
 **Data flow**: After within-chunk dedup, the scheduler's `build_persistence_batch()`
 converts `FindingWithHash<F>` carriers into `FsFindingRecord` values. These are
@@ -450,6 +456,7 @@ so the backend can mark the run as incomplete when warranted.
 | `StoreProducer` | `Send + Sync` trait for FS finding persistence (`Arc<dyn StoreProducer>`) |
 | `NullStoreProducer` | Default no-op for CLI / feature-off paths |
 | `InMemoryStoreProducer` | Collects batches in memory for tests and diagnostics |
+| `AppendLogStoreProducer` | Default FS backend writing CRC-framed append-only segment logs |
 
 ## Persistence Identity Types
 

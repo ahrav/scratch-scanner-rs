@@ -6,6 +6,7 @@ mod anchor_optimization;
 mod archive_scanning;
 mod binary_awareness;
 mod fs_cli_archives;
+mod fs_persist_log;
 mod git_commit_walk;
 mod git_engine_adapter;
 mod git_inmem_artifacts;

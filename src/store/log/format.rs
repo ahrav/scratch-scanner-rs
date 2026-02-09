@@ -1,0 +1,984 @@
+//! On-disk frame format for append-only FS persistence logs.
+//!
+//! # Wire format
+//!
+//! Every record is wrapped in a fixed 8-byte header followed by the body:
+//!
+//! ```text
+//! ┌──────────────┬──────────────┬──────────┬─────────────────────┐
+//! │ frame_len    │ crc32        │ type     │ payload             │
+//! │ u32_le (4B)  │ u32_le (4B)  │ u8 (1B)  │ [frame_len - 1] B  │
+//! └──────────────┴──────────────┴──────────┴─────────────────────┘
+//! ```
+//!
+//! - **`frame_len`** — byte count of `type + payload` (i.e. body excluding the
+//!   8-byte header). Always ≥ 1 because the type byte is mandatory.
+//! - **`crc32`** — CRC-32/ISO-HDLC (polynomial 0x04C11DB7, same as zlib)
+//!   computed over the concatenation of the type byte and payload bytes.
+//!   Verified on read before any payload parsing.
+//! - **`type`** — [`FrameType`] discriminant identifying the payload schema.
+//! - **`payload`** — record-specific bytes; see the per-variant encode/decode
+//!   functions below.
+//!
+//! # Invariants
+//!
+//! - All multi-byte integers are **little-endian**.
+//! - Variable-length byte fields (e.g. `object_path`, `rule_name`) are
+//!   length-prefixed with a `u32_le` count.
+//! - A valid segment is a contiguous sequence of frames with no inter-frame
+//!   padding. The reader stops cleanly at EOF after consuming the last frame.
+//! - Frame payloads must not exceed [`DEFAULT_MAX_FRAME_PAYLOAD_BYTES`]
+//!   (configurable at the writer level) to bound memory allocation on read.
+
+use crate::store::keys::{CorrelationMode, KeySource};
+use std::fmt;
+use std::io::{self, Read};
+
+/// Log format version for run metadata payloads.
+pub const LOG_FORMAT_VERSION: u16 = 1;
+/// Default hard cap for frame payload bytes.
+pub const DEFAULT_MAX_FRAME_PAYLOAD_BYTES: u32 = 16 * 1024 * 1024;
+
+const FRAME_HEADER_BYTES: usize = 8;
+
+/// Frame discriminants written on disk.
+///
+/// A well-formed segment always begins with [`RunStart`](Self::RunStart),
+/// followed by zero or more [`RuleDef`](Self::RuleDef) frames in sorted
+/// fingerprint order, then zero or more interleaved
+/// [`FindingBatch`](Self::FindingBatch) frames, and is sealed by a single
+/// [`RunEnd`](Self::RunEnd). The writer enforces this ordering; the reader
+/// does **not** — it decodes frames in whatever order they appear.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FrameType {
+    /// Run metadata emitted once at the start of every segment chain.
+    RunStart = 1,
+    /// Declares one detection rule active during this run. Emitted in
+    /// ascending `rule_fingerprint` order immediately after `RunStart`.
+    RuleDef = 2,
+    /// One or more findings for a single scanned object path.
+    FindingBatch = 3,
+    /// Final frame closing the run. Contains loss counters and an
+    /// `incomplete` flag indicating whether the run finished cleanly.
+    RunEnd = 4,
+}
+
+impl FrameType {
+    #[inline]
+    fn from_u8(raw: u8) -> Result<Self, FormatError> {
+        match raw {
+            1 => Ok(Self::RunStart),
+            2 => Ok(Self::RuleDef),
+            3 => Ok(Self::FindingBatch),
+            4 => Ok(Self::RunEnd),
+            _ => Err(FormatError::UnknownFrameType { raw }),
+        }
+    }
+}
+
+/// Durability semantics recorded in [`LogRunStart`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum LogDurabilityMode {
+    /// `sync_data` at segment close/rotation only.
+    SegmentClose = 0,
+    /// `sync_data` after every finding batch frame.
+    Batch = 1,
+}
+
+impl LogDurabilityMode {
+    #[inline]
+    fn from_u8(raw: u8) -> Result<Self, FormatError> {
+        match raw {
+            0 => Ok(Self::SegmentClose),
+            1 => Ok(Self::Batch),
+            _ => Err(FormatError::InvalidEnum {
+                field: "durability",
+                value: raw,
+            }),
+        }
+    }
+}
+
+/// Run-start metadata frame.
+///
+/// Written once at the beginning of a segment chain. Captures the writer
+/// configuration snapshot so that a reader can validate compatibility and
+/// reconstruct the backpressure parameters that were active during the run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogRunStart {
+    /// Log format version ([`LOG_FORMAT_VERSION`]). Readers should reject
+    /// segments whose version they do not support.
+    pub version: u16,
+    /// Unique identifier for this scan run, derived from wall-clock time
+    /// XOR'd with a monotonic counter.
+    pub run_id: u64,
+    /// Wall-clock milliseconds since Unix epoch when the run began.
+    pub started_unix_ms: u64,
+    /// Fsync strategy used during writing.
+    pub durability: LogDurabilityMode,
+    /// Whether finding correlation keys are stable across runs
+    /// (persistent secret key) or ephemeral.
+    pub correlation_mode: CorrelationMode,
+    /// How the secret key was obtained (env var, missing, invalid).
+    pub key_source: KeySource,
+    /// Writer backpressure: max queued finding-batch frames.
+    pub max_inflight_batches: u32,
+    /// Writer backpressure: max queued encoded bytes.
+    pub max_inflight_bytes: u64,
+    /// Codec hard cap on a single frame's payload size.
+    pub max_frame_payload_bytes: u32,
+}
+
+/// Rule-definition metadata frame.
+///
+/// Emitted once per active rule, in ascending `rule_fingerprint` order, so
+/// that readers can reconstruct the rule table without needing access to the
+/// original rule YAML.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogRuleDef {
+    /// Engine-internal rule index (0-based). Maps to the position in the
+    /// `rules` slice passed to the engine constructor.
+    pub rule_id: u32,
+    /// BLAKE3-keyed fingerprint of the rule specification. Deterministic
+    /// for a given rule + store key pair; used as a stable correlation key
+    /// across runs.
+    pub rule_fingerprint: [u8; 32],
+    /// Human-readable rule name (UTF-8, length-prefixed on disk).
+    pub rule_name: Vec<u8>,
+}
+
+/// One persisted finding in a [`LogFindingBatch`].
+///
+/// Fixed-size (132 bytes on disk) per finding. All byte-offset fields refer
+/// to positions within the scanned object's content buffer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogFindingRecord {
+    /// Engine rule index that matched.
+    pub rule_id: u32,
+    /// BLAKE3-keyed rule fingerprint (redundant with [`LogRuleDef`] but
+    /// included per-finding so each record is self-describing).
+    pub rule_fingerprint: [u8; 32],
+    /// BLAKE3-keyed hash of the normalised secret value. Enables
+    /// cross-object deduplication without storing the raw secret.
+    pub secret_hash: [u8; 32],
+    /// Deterministic finding identifier derived from (object_path,
+    /// rule_fingerprint, secret_hash, hint range, span range) via
+    /// BLAKE3-keyed hashing. Stable across runs when using a persistent
+    /// secret key.
+    pub finding_id: [u8; 32],
+    /// Byte offset where the engine's root-level scan window begins
+    /// (inclusive). Together with `root_hint_end`, this brackets the
+    /// anchor region that triggered the rule.
+    pub root_hint_start: u64,
+    /// Byte offset where the root-level scan window ends (exclusive).
+    pub root_hint_end: u64,
+    /// Byte offset where the matched secret value begins (inclusive).
+    pub span_start: u64,
+    /// Byte offset where the matched secret value ends (exclusive).
+    pub span_end: u64,
+}
+
+/// Batch of findings for one scanned object path.
+///
+/// Each scanned file that produces at least one finding generates exactly
+/// one `FindingBatch` frame. The `object_path` is the raw byte path as
+/// seen by the scanner (typically a relative path from the scan root).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogFindingBatch {
+    /// Scanned object path (length-prefixed on disk). Byte content, not
+    /// necessarily valid UTF-8 on all platforms.
+    pub object_path: Vec<u8>,
+    /// Findings within this object, in the order the engine emitted them.
+    pub findings: Vec<LogFindingRecord>,
+}
+
+/// Run-end metadata frame.
+///
+/// Exactly one per run, written as the final frame before segment
+/// finalization. Contains loss counters that let readers detect whether
+/// any findings were dropped during the scan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogRunEnd {
+    /// Wall-clock milliseconds since Unix epoch when the run ended.
+    pub ended_unix_ms: u64,
+    /// Number of findings that the scanner produced but the persistence
+    /// layer was unable to emit (e.g. backpressure overflow).
+    pub dropped_findings: u64,
+    /// Number of `emit_fs_batch` calls that returned an error from the
+    /// persistence backend.
+    pub persistence_emit_failures: u64,
+    /// `true` when `dropped_findings > 0 || persistence_emit_failures > 0`,
+    /// indicating the persisted log does not capture every finding.
+    pub incomplete: bool,
+}
+
+/// Decoded log record — the in-memory representation of one frame's payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LogRecord {
+    RunStart(LogRunStart),
+    RuleDef(LogRuleDef),
+    FindingBatch(LogFindingBatch),
+    RunEnd(LogRunEnd),
+}
+
+impl LogRecord {
+    #[inline]
+    fn frame_type(&self) -> FrameType {
+        match self {
+            Self::RunStart(_) => FrameType::RunStart,
+            Self::RuleDef(_) => FrameType::RuleDef,
+            Self::FindingBatch(_) => FrameType::FindingBatch,
+            Self::RunEnd(_) => FrameType::RunEnd,
+        }
+    }
+
+    fn encode_payload(&self, out: &mut Vec<u8>) -> Result<(), FormatError> {
+        match self {
+            Self::RunStart(rec) => encode_run_start(rec, out),
+            Self::RuleDef(rec) => encode_rule_def(rec, out),
+            Self::FindingBatch(rec) => encode_finding_batch(rec, out),
+            Self::RunEnd(rec) => encode_run_end(rec, out),
+        }
+    }
+
+    fn decode_payload(frame_type: FrameType, payload: &[u8]) -> Result<Self, FormatError> {
+        match frame_type {
+            FrameType::RunStart => Ok(Self::RunStart(decode_run_start(payload)?)),
+            FrameType::RuleDef => Ok(Self::RuleDef(decode_rule_def(payload)?)),
+            FrameType::FindingBatch => Ok(Self::FindingBatch(decode_finding_batch(payload)?)),
+            FrameType::RunEnd => Ok(Self::RunEnd(decode_run_end(payload)?)),
+        }
+    }
+}
+
+/// Frame-format validation errors.
+///
+/// Returned during encoding (payload too large) or decoding (corruption,
+/// truncation, unknown discriminants). The [`Io`](Self::Io) variant wraps
+/// transport-level errors from the underlying reader.
+#[derive(Debug)]
+pub enum FormatError {
+    Io(io::Error),
+    FrameTooLarge {
+        len: u32,
+        max: u32,
+    },
+    InvalidFrameLength {
+        len: u32,
+    },
+    TruncatedHeader {
+        got: usize,
+    },
+    TruncatedFrame {
+        expected: usize,
+        got: usize,
+    },
+    CrcMismatch {
+        expected: u32,
+        actual: u32,
+    },
+    UnknownFrameType {
+        raw: u8,
+    },
+    InvalidEnum {
+        field: &'static str,
+        value: u8,
+    },
+    InvalidBool {
+        field: &'static str,
+        value: u8,
+    },
+    InvalidRecord {
+        frame_type: FrameType,
+        detail: &'static str,
+    },
+    LengthTooLarge {
+        field: &'static str,
+        len: usize,
+        max: usize,
+    },
+}
+
+impl fmt::Display for FormatError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(err) => write!(f, "{err}"),
+            Self::FrameTooLarge { len, max } => {
+                write!(f, "frame payload too large: {len} > {max}")
+            }
+            Self::InvalidFrameLength { len } => {
+                write!(f, "invalid frame length: {len} (must include type byte)")
+            }
+            Self::TruncatedHeader { got } => write!(f, "truncated frame header: got {got} bytes"),
+            Self::TruncatedFrame { expected, got } => {
+                write!(f, "truncated frame body: expected {expected}, got {got}")
+            }
+            Self::CrcMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "frame CRC mismatch: expected 0x{expected:08x}, got 0x{actual:08x}"
+                )
+            }
+            Self::UnknownFrameType { raw } => write!(f, "unknown frame type: {raw}"),
+            Self::InvalidEnum { field, value } => {
+                write!(f, "invalid enum value for {field}: {value}")
+            }
+            Self::InvalidBool { field, value } => {
+                write!(f, "invalid bool value for {field}: {value}")
+            }
+            Self::InvalidRecord { frame_type, detail } => {
+                write!(f, "invalid {frame_type:?} payload: {detail}")
+            }
+            Self::LengthTooLarge { field, len, max } => {
+                write!(f, "{field} length too large: {len} > {max}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for FormatError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<io::Error> for FormatError {
+    fn from(value: io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+/// Encode one log record as a framed blob and append to `out`.
+///
+/// Writes the 8-byte header (`frame_len` + `crc32`) followed by the type
+/// byte and encoded payload. Returns [`FormatError::FrameTooLarge`] if the
+/// serialised payload exceeds `max_payload_bytes`.
+///
+/// `out` is **not** cleared before writing; the frame is appended so that
+/// callers can build multi-frame buffers incrementally.
+pub fn encode_record(
+    record: &LogRecord,
+    max_payload_bytes: u32,
+    out: &mut Vec<u8>,
+) -> Result<(), FormatError> {
+    let mut payload = Vec::with_capacity(256);
+    record.encode_payload(&mut payload)?;
+
+    if payload.len() > max_payload_bytes as usize {
+        return Err(FormatError::FrameTooLarge {
+            len: payload.len() as u32,
+            max: max_payload_bytes,
+        });
+    }
+
+    let body_len = payload
+        .len()
+        .checked_add(1)
+        .ok_or(FormatError::InvalidFrameLength { len: u32::MAX })?;
+    let body_len_u32 =
+        u32::try_from(body_len).map_err(|_| FormatError::InvalidFrameLength { len: u32::MAX })?;
+
+    let frame_type = record.frame_type() as u8;
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(&[frame_type]);
+    crc.update(&payload);
+    let crc32 = crc.finalize();
+
+    out.reserve(FRAME_HEADER_BYTES + body_len);
+    out.extend_from_slice(&body_len_u32.to_le_bytes());
+    out.extend_from_slice(&crc32.to_le_bytes());
+    out.push(frame_type);
+    out.extend_from_slice(&payload);
+    Ok(())
+}
+
+/// Decode one framed record from `frame_bytes`.
+///
+/// `frame_bytes` must contain exactly one complete frame (header + body).
+/// The CRC is verified before any payload parsing.
+///
+/// Returns [`FormatError::FrameTooLarge`] if the declared payload exceeds
+/// `max_payload_bytes`, and [`FormatError::CrcMismatch`] on data corruption.
+pub fn decode_record(frame_bytes: &[u8], max_payload_bytes: u32) -> Result<LogRecord, FormatError> {
+    if frame_bytes.len() < FRAME_HEADER_BYTES + 1 {
+        return Err(FormatError::TruncatedHeader {
+            got: frame_bytes.len().min(FRAME_HEADER_BYTES),
+        });
+    }
+
+    let frame_len = u32::from_le_bytes([
+        frame_bytes[0],
+        frame_bytes[1],
+        frame_bytes[2],
+        frame_bytes[3],
+    ]);
+    let crc_expected = u32::from_le_bytes([
+        frame_bytes[4],
+        frame_bytes[5],
+        frame_bytes[6],
+        frame_bytes[7],
+    ]);
+    decode_frame_body(
+        frame_len,
+        crc_expected,
+        &frame_bytes[FRAME_HEADER_BYTES..],
+        max_payload_bytes,
+    )
+}
+
+/// Streaming frame reader over any [`Read`] source.
+///
+/// Reads frames sequentially, verifying the CRC of each before returning
+/// the decoded [`LogRecord`]. Reuses an internal buffer across frames to
+/// avoid per-frame allocation.
+///
+/// EOF handling: a clean EOF (zero bytes read at the start of a new header)
+/// returns `Ok(None)`. A partial header or truncated body is an error.
+pub struct LogRecordReader<R: Read> {
+    reader: R,
+    frame_buf: Vec<u8>,
+    max_payload_bytes: u32,
+}
+
+impl<R: Read> LogRecordReader<R> {
+    pub fn new(reader: R, max_payload_bytes: u32) -> Self {
+        Self {
+            reader,
+            frame_buf: Vec::new(),
+            max_payload_bytes,
+        }
+    }
+
+    /// Decode the next record.
+    ///
+    /// Returns `Ok(None)` on clean EOF before a new frame header starts.
+    pub fn next_record(&mut self) -> Result<Option<LogRecord>, FormatError> {
+        let mut header = [0u8; FRAME_HEADER_BYTES];
+        let mut got = 0usize;
+        while got < FRAME_HEADER_BYTES {
+            let n = self.reader.read(&mut header[got..])?;
+            if n == 0 {
+                if got == 0 {
+                    return Ok(None);
+                }
+                return Err(FormatError::TruncatedHeader { got });
+            }
+            got += n;
+        }
+
+        let frame_len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let crc_expected = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+        if frame_len == 0 {
+            return Err(FormatError::InvalidFrameLength { len: frame_len });
+        }
+        let payload_len = frame_len - 1;
+        if payload_len > self.max_payload_bytes {
+            return Err(FormatError::FrameTooLarge {
+                len: payload_len,
+                max: self.max_payload_bytes,
+            });
+        }
+
+        let want = frame_len as usize;
+        self.frame_buf.resize(want, 0);
+        let mut read = 0usize;
+        while read < want {
+            let n = self.reader.read(&mut self.frame_buf[read..])?;
+            if n == 0 {
+                return Err(FormatError::TruncatedFrame {
+                    expected: want,
+                    got: read,
+                });
+            }
+            read += n;
+        }
+
+        decode_frame_body(
+            frame_len,
+            crc_expected,
+            &self.frame_buf,
+            self.max_payload_bytes,
+        )
+        .map(Some)
+    }
+}
+
+fn decode_frame_body(
+    frame_len: u32,
+    crc_expected: u32,
+    body: &[u8],
+    max_payload_bytes: u32,
+) -> Result<LogRecord, FormatError> {
+    if frame_len == 0 {
+        return Err(FormatError::InvalidFrameLength { len: frame_len });
+    }
+    let payload_len = frame_len - 1;
+    if payload_len > max_payload_bytes {
+        return Err(FormatError::FrameTooLarge {
+            len: payload_len,
+            max: max_payload_bytes,
+        });
+    }
+    if body.len() != frame_len as usize {
+        return Err(FormatError::TruncatedFrame {
+            expected: frame_len as usize,
+            got: body.len(),
+        });
+    }
+
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(body);
+    let crc_actual = crc.finalize();
+    if crc_actual != crc_expected {
+        return Err(FormatError::CrcMismatch {
+            expected: crc_expected,
+            actual: crc_actual,
+        });
+    }
+
+    let frame_type = FrameType::from_u8(body[0])?;
+    LogRecord::decode_payload(frame_type, &body[1..])
+}
+
+fn encode_run_start(rec: &LogRunStart, out: &mut Vec<u8>) -> Result<(), FormatError> {
+    push_u16(out, rec.version);
+    push_u64(out, rec.run_id);
+    push_u64(out, rec.started_unix_ms);
+    out.push(rec.durability as u8);
+    out.push(encode_correlation_mode(rec.correlation_mode));
+    out.push(encode_key_source(rec.key_source));
+    push_u32(out, rec.max_inflight_batches);
+    push_u64(out, rec.max_inflight_bytes);
+    push_u32(out, rec.max_frame_payload_bytes);
+    Ok(())
+}
+
+fn decode_run_start(payload: &[u8]) -> Result<LogRunStart, FormatError> {
+    let mut c = Cursor::new(payload);
+    let version = c.take_u16(FrameType::RunStart, "version")?;
+    let run_id = c.take_u64(FrameType::RunStart, "run_id")?;
+    let started_unix_ms = c.take_u64(FrameType::RunStart, "started_unix_ms")?;
+    let durability = LogDurabilityMode::from_u8(c.take_u8(FrameType::RunStart, "durability")?)?;
+    let correlation_mode = decode_correlation_mode(
+        c.take_u8(FrameType::RunStart, "correlation_mode")?,
+        FrameType::RunStart,
+    )?;
+    let key_source = decode_key_source(
+        c.take_u8(FrameType::RunStart, "key_source")?,
+        FrameType::RunStart,
+    )?;
+    let max_inflight_batches = c.take_u32(FrameType::RunStart, "max_inflight_batches")?;
+    let max_inflight_bytes = c.take_u64(FrameType::RunStart, "max_inflight_bytes")?;
+    let max_frame_payload_bytes = c.take_u32(FrameType::RunStart, "max_frame_payload_bytes")?;
+    c.require_finished(FrameType::RunStart)?;
+    Ok(LogRunStart {
+        version,
+        run_id,
+        started_unix_ms,
+        durability,
+        correlation_mode,
+        key_source,
+        max_inflight_batches,
+        max_inflight_bytes,
+        max_frame_payload_bytes,
+    })
+}
+
+fn encode_rule_def(rec: &LogRuleDef, out: &mut Vec<u8>) -> Result<(), FormatError> {
+    push_u32(out, rec.rule_id);
+    out.extend_from_slice(&rec.rule_fingerprint);
+    push_len_prefixed_bytes(out, &rec.rule_name, "rule_name")?;
+    Ok(())
+}
+
+fn decode_rule_def(payload: &[u8]) -> Result<LogRuleDef, FormatError> {
+    let mut c = Cursor::new(payload);
+    let rule_id = c.take_u32(FrameType::RuleDef, "rule_id")?;
+    let rule_fingerprint = c.take_array_32(FrameType::RuleDef, "rule_fingerprint")?;
+    let rule_name = c.take_bytes(FrameType::RuleDef, "rule_name")?.to_vec();
+    c.require_finished(FrameType::RuleDef)?;
+    Ok(LogRuleDef {
+        rule_id,
+        rule_fingerprint,
+        rule_name,
+    })
+}
+
+fn encode_finding_batch(rec: &LogFindingBatch, out: &mut Vec<u8>) -> Result<(), FormatError> {
+    push_len_prefixed_bytes(out, &rec.object_path, "object_path")?;
+    let findings_len =
+        u32::try_from(rec.findings.len()).map_err(|_| FormatError::LengthTooLarge {
+            field: "findings",
+            len: rec.findings.len(),
+            max: u32::MAX as usize,
+        })?;
+    push_u32(out, findings_len);
+    for finding in &rec.findings {
+        push_u32(out, finding.rule_id);
+        out.extend_from_slice(&finding.rule_fingerprint);
+        out.extend_from_slice(&finding.secret_hash);
+        out.extend_from_slice(&finding.finding_id);
+        push_u64(out, finding.root_hint_start);
+        push_u64(out, finding.root_hint_end);
+        push_u64(out, finding.span_start);
+        push_u64(out, finding.span_end);
+    }
+    Ok(())
+}
+
+fn decode_finding_batch(payload: &[u8]) -> Result<LogFindingBatch, FormatError> {
+    let mut c = Cursor::new(payload);
+    let object_path = c
+        .take_bytes(FrameType::FindingBatch, "object_path")?
+        .to_vec();
+    let count = c.take_u32(FrameType::FindingBatch, "findings_count")? as usize;
+    let mut findings = Vec::with_capacity(count);
+    for _ in 0..count {
+        let rule_id = c.take_u32(FrameType::FindingBatch, "rule_id")?;
+        let rule_fingerprint = c.take_array_32(FrameType::FindingBatch, "rule_fingerprint")?;
+        let secret_hash = c.take_array_32(FrameType::FindingBatch, "secret_hash")?;
+        let finding_id = c.take_array_32(FrameType::FindingBatch, "finding_id")?;
+        let root_hint_start = c.take_u64(FrameType::FindingBatch, "root_hint_start")?;
+        let root_hint_end = c.take_u64(FrameType::FindingBatch, "root_hint_end")?;
+        let span_start = c.take_u64(FrameType::FindingBatch, "span_start")?;
+        let span_end = c.take_u64(FrameType::FindingBatch, "span_end")?;
+        findings.push(LogFindingRecord {
+            rule_id,
+            rule_fingerprint,
+            secret_hash,
+            finding_id,
+            root_hint_start,
+            root_hint_end,
+            span_start,
+            span_end,
+        });
+    }
+    c.require_finished(FrameType::FindingBatch)?;
+    Ok(LogFindingBatch {
+        object_path,
+        findings,
+    })
+}
+
+fn encode_run_end(rec: &LogRunEnd, out: &mut Vec<u8>) -> Result<(), FormatError> {
+    push_u64(out, rec.ended_unix_ms);
+    push_u64(out, rec.dropped_findings);
+    push_u64(out, rec.persistence_emit_failures);
+    out.push(u8::from(rec.incomplete));
+    Ok(())
+}
+
+fn decode_run_end(payload: &[u8]) -> Result<LogRunEnd, FormatError> {
+    let mut c = Cursor::new(payload);
+    let ended_unix_ms = c.take_u64(FrameType::RunEnd, "ended_unix_ms")?;
+    let dropped_findings = c.take_u64(FrameType::RunEnd, "dropped_findings")?;
+    let persistence_emit_failures = c.take_u64(FrameType::RunEnd, "persistence_emit_failures")?;
+    let incomplete = decode_bool(c.take_u8(FrameType::RunEnd, "incomplete")?, "incomplete")?;
+    c.require_finished(FrameType::RunEnd)?;
+    Ok(LogRunEnd {
+        ended_unix_ms,
+        dropped_findings,
+        persistence_emit_failures,
+        incomplete,
+    })
+}
+
+#[inline]
+fn push_u16(out: &mut Vec<u8>, value: u16) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+#[inline]
+fn push_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+#[inline]
+fn push_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_len_prefixed_bytes(
+    out: &mut Vec<u8>,
+    bytes: &[u8],
+    field: &'static str,
+) -> Result<(), FormatError> {
+    let len = u32::try_from(bytes.len()).map_err(|_| FormatError::LengthTooLarge {
+        field,
+        len: bytes.len(),
+        max: u32::MAX as usize,
+    })?;
+    push_u32(out, len);
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+#[inline]
+fn encode_correlation_mode(mode: CorrelationMode) -> u8 {
+    match mode {
+        CorrelationMode::Persistent => 0,
+        CorrelationMode::Ephemeral => 1,
+    }
+}
+
+fn decode_correlation_mode(raw: u8, frame_type: FrameType) -> Result<CorrelationMode, FormatError> {
+    match raw {
+        0 => Ok(CorrelationMode::Persistent),
+        1 => Ok(CorrelationMode::Ephemeral),
+        _ => Err(FormatError::InvalidRecord {
+            frame_type,
+            detail: "invalid correlation_mode",
+        }),
+    }
+}
+
+#[inline]
+fn encode_key_source(source: KeySource) -> u8 {
+    match source {
+        KeySource::EnvVar => 0,
+        KeySource::MissingEnvVar => 1,
+        KeySource::InvalidEnvVar => 2,
+    }
+}
+
+fn decode_key_source(raw: u8, frame_type: FrameType) -> Result<KeySource, FormatError> {
+    match raw {
+        0 => Ok(KeySource::EnvVar),
+        1 => Ok(KeySource::MissingEnvVar),
+        2 => Ok(KeySource::InvalidEnvVar),
+        _ => Err(FormatError::InvalidRecord {
+            frame_type,
+            detail: "invalid key_source",
+        }),
+    }
+}
+
+fn decode_bool(raw: u8, field: &'static str) -> Result<bool, FormatError> {
+    match raw {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(FormatError::InvalidBool { field, value: raw }),
+    }
+}
+
+struct Cursor<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    #[inline]
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+
+    #[inline]
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.pos)
+    }
+
+    fn take_exact(
+        &mut self,
+        n: usize,
+        frame_type: FrameType,
+        detail: &'static str,
+    ) -> Result<&'a [u8], FormatError> {
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or(FormatError::InvalidRecord { frame_type, detail })?;
+        if end > self.bytes.len() {
+            return Err(FormatError::InvalidRecord { frame_type, detail });
+        }
+        let out = &self.bytes[self.pos..end];
+        self.pos = end;
+        Ok(out)
+    }
+
+    #[inline]
+    fn take_u8(&mut self, frame_type: FrameType, detail: &'static str) -> Result<u8, FormatError> {
+        Ok(self.take_exact(1, frame_type, detail)?[0])
+    }
+
+    fn take_u16(
+        &mut self,
+        frame_type: FrameType,
+        detail: &'static str,
+    ) -> Result<u16, FormatError> {
+        let bytes = self.take_exact(2, frame_type, detail)?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn take_u32(
+        &mut self,
+        frame_type: FrameType,
+        detail: &'static str,
+    ) -> Result<u32, FormatError> {
+        let bytes = self.take_exact(4, frame_type, detail)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn take_u64(
+        &mut self,
+        frame_type: FrameType,
+        detail: &'static str,
+    ) -> Result<u64, FormatError> {
+        let bytes = self.take_exact(8, frame_type, detail)?;
+        Ok(u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
+    }
+
+    fn take_bytes(
+        &mut self,
+        frame_type: FrameType,
+        detail: &'static str,
+    ) -> Result<&'a [u8], FormatError> {
+        let len = self.take_u32(frame_type, detail)? as usize;
+        self.take_exact(len, frame_type, detail)
+    }
+
+    fn take_array_32(
+        &mut self,
+        frame_type: FrameType,
+        detail: &'static str,
+    ) -> Result<[u8; 32], FormatError> {
+        let bytes = self.take_exact(32, frame_type, detail)?;
+        let mut out = [0u8; 32];
+        out.copy_from_slice(bytes);
+        Ok(out)
+    }
+
+    fn require_finished(&self, frame_type: FrameType) -> Result<(), FormatError> {
+        if self.remaining() == 0 {
+            Ok(())
+        } else {
+            Err(FormatError::InvalidRecord {
+                frame_type,
+                detail: "trailing bytes",
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::keys::STORE_KEYS_VERSION;
+    use std::io::Cursor as IoCursor;
+
+    fn sample_run_start() -> LogRunStart {
+        LogRunStart {
+            version: STORE_KEYS_VERSION as u16,
+            run_id: 42,
+            started_unix_ms: 1234,
+            durability: LogDurabilityMode::SegmentClose,
+            correlation_mode: CorrelationMode::Persistent,
+            key_source: KeySource::EnvVar,
+            max_inflight_batches: 16,
+            max_inflight_bytes: 1 << 20,
+            max_frame_payload_bytes: DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+        }
+    }
+
+    fn sample_rule_def() -> LogRuleDef {
+        LogRuleDef {
+            rule_id: 7,
+            rule_fingerprint: [0xAB; 32],
+            rule_name: b"demo-rule".to_vec(),
+        }
+    }
+
+    fn sample_finding_batch() -> LogFindingBatch {
+        LogFindingBatch {
+            object_path: b"src/main.rs".to_vec(),
+            findings: vec![
+                LogFindingRecord {
+                    rule_id: 7,
+                    rule_fingerprint: [0x11; 32],
+                    secret_hash: [0x22; 32],
+                    finding_id: [0x33; 32],
+                    root_hint_start: 10,
+                    root_hint_end: 20,
+                    span_start: 11,
+                    span_end: 19,
+                },
+                LogFindingRecord {
+                    rule_id: 8,
+                    rule_fingerprint: [0x44; 32],
+                    secret_hash: [0x55; 32],
+                    finding_id: [0x66; 32],
+                    root_hint_start: 30,
+                    root_hint_end: 40,
+                    span_start: 31,
+                    span_end: 39,
+                },
+            ],
+        }
+    }
+
+    fn sample_run_end() -> LogRunEnd {
+        LogRunEnd {
+            ended_unix_ms: 9999,
+            dropped_findings: 3,
+            persistence_emit_failures: 1,
+            incomplete: true,
+        }
+    }
+
+    #[test]
+    fn roundtrip_all_frame_types() {
+        let records = vec![
+            LogRecord::RunStart(sample_run_start()),
+            LogRecord::RuleDef(sample_rule_def()),
+            LogRecord::FindingBatch(sample_finding_batch()),
+            LogRecord::RunEnd(sample_run_end()),
+        ];
+
+        let mut bytes = Vec::new();
+        for rec in &records {
+            encode_record(rec, DEFAULT_MAX_FRAME_PAYLOAD_BYTES, &mut bytes).unwrap();
+        }
+
+        let mut reader =
+            LogRecordReader::new(IoCursor::new(bytes), DEFAULT_MAX_FRAME_PAYLOAD_BYTES);
+        let mut decoded = Vec::new();
+        while let Some(rec) = reader.next_record().unwrap() {
+            decoded.push(rec);
+        }
+        assert_eq!(decoded, records);
+    }
+
+    #[test]
+    fn oversized_frame_is_rejected() {
+        let huge_name = vec![b'x'; (DEFAULT_MAX_FRAME_PAYLOAD_BYTES as usize) + 1];
+        let rec = LogRecord::RuleDef(LogRuleDef {
+            rule_id: 1,
+            rule_fingerprint: [0u8; 32],
+            rule_name: huge_name,
+        });
+
+        let mut out = Vec::new();
+        let err = encode_record(&rec, DEFAULT_MAX_FRAME_PAYLOAD_BYTES, &mut out).unwrap_err();
+        assert!(matches!(err, FormatError::FrameTooLarge { .. }));
+    }
+
+    #[test]
+    fn crc_mismatch_is_detected() {
+        let rec = LogRecord::RunEnd(sample_run_end());
+        let mut bytes = Vec::new();
+        encode_record(&rec, DEFAULT_MAX_FRAME_PAYLOAD_BYTES, &mut bytes).unwrap();
+
+        // Flip one payload bit.
+        let idx = FRAME_HEADER_BYTES + 1;
+        bytes[idx] ^= 0x01;
+
+        let err = decode_record(&bytes, DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap_err();
+        assert!(matches!(err, FormatError::CrcMismatch { .. }));
+    }
+}

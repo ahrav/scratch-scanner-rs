@@ -165,6 +165,8 @@ graph TB
 | **Store Keys**      | `src/store/keys.rs`            | `SCANNER_SECRET_KEY` bootstrap, subkey derivation, and run correlation mode metadata |
 | **Store Identity**  | `src/store/identity.rs`        | Versioned `rule_fingerprint` / `secret_hash` / `occurrence_id` contracts for FS persistence |
 | **StoreProducer**   | `src/store/fs.rs`              | Write-side trait for FS finding persistence; scheduler calls `emit_fs_batch` per object |
+| **FS Log Format**   | `src/store/log/format.rs`      | Framed FS persistence codec (`len + crc32 + type + payload`) for run metadata + finding batches |
+| **FS Log Writer**   | `src/store/log/writer.rs`      | Bounded single-writer append-log backend with deterministic `RuleDef` ordering and `.open` -> `.bin` finalize |
 | **FsFindingRecord** | `src/store/fs.rs`              | Backend-agnostic post-dedupe finding record with `norm_hash` |
 | **FsFindingBatch**  | `src/store/fs.rs`              | Borrowed batch grouping findings for a single scanned object |
 | **FsRunLoss**       | `src/store/fs.rs`              | Run-level drop/failure accounting for persistence completeness |
@@ -369,8 +371,9 @@ Scheduler harness code lives in `src/scheduler/sim_executor_harness.rs`.
 3. **FS Discovery**: `IterWalker` discovers files and `scan_local` assigns work to workers
 4. **Scanning**: Workers read overlap-aware chunks, run `Engine`, and dedupe overlap findings
 5. **Output**: Findings stream through `EventSink` implementations to stdout
-6. **Persistence**: When enabled (`--persist-findings`), post-dedupe findings are also emitted
-   to a `StoreProducer` backend; run-level loss accounting is recorded at scan end
+6. **Persistence**: When enabled (`--persist-findings`), post-dedupe findings are emitted
+   to a `StoreProducer` backend (default: append-log segments with CRC-framed records);
+   run-level loss accounting is recorded at scan end
 7. **Memory**: Scheduler/runtime buffer pools and engine scratch structures are reused per run
 
 ## Design Principles

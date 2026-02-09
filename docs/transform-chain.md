@@ -145,6 +145,12 @@ For filesystem scans, this emission happens from owner-compute workers in
 `src/scheduler/local_fs_owner.rs` (each worker performs both I/O and scanning
 with worker-local reusable state).
 
+When `--persist-findings` is enabled, the same post-dedupe finding set is also
+encoded into `FindingBatch` append-log frames (`src/store/log/format.rs`) and
+written by the bounded single-writer runtime (`src/store/log/writer.rs`). This
+keeps transform-derived and root findings consistent between stdout events and
+persistent log output.
+
 ### Identity Canonicalization Link
 
 For persistence IDs (`src/store/identity.rs`), transform-derived findings use:
