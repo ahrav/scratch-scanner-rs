@@ -1868,6 +1868,37 @@ pub fn bench_find_spans_into(
     super::transform::find_spans_into(tc, buf, out);
 }
 
+/// Benchmark helper that stores pre-packed literal patterns for memmem gates.
+///
+/// This wrapper lets benchmarks compile literals once and measure only the
+/// `contains_any_memmem` hot-path check per iteration.
+#[cfg(feature = "bench")]
+#[derive(Clone, Debug)]
+pub struct BenchPackedPatterns {
+    patterns: super::rule_repr::PackedPatterns,
+}
+
+/// Build packed raw literal patterns for benchmark-only memmem checks.
+#[cfg(feature = "bench")]
+pub fn bench_pack_patterns_raw(patterns: &[&[u8]]) -> BenchPackedPatterns {
+    let total_bytes = patterns.iter().map(|p| p.len()).sum();
+    let mut builder =
+        super::rule_repr::PackedPatternsBuilder::with_capacity(patterns.len(), total_bytes);
+    for pat in patterns {
+        builder.push_raw(pat);
+    }
+    BenchPackedPatterns {
+        patterns: builder.build(),
+    }
+}
+
+/// Benchmark helper that calls the same ANY-of memmem gate used in scan paths.
+#[cfg(feature = "bench")]
+#[inline(always)]
+pub fn bench_contains_any_memmem(hay: &[u8], needles: &BenchPackedPatterns) -> bool {
+    super::helpers::contains_any_memmem(hay, &needles.patterns)
+}
+
 #[cfg(feature = "bench")]
 pub use super::transform::{bench_stream_decode_base64, bench_stream_decode_url};
 
