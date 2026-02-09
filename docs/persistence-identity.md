@@ -1,25 +1,80 @@
 # Persistence Identity Contracts
 
-Deterministic, versioned identity contracts for filesystem persistence.
-These contracts let the scanner answer "have I seen this exact finding before?"
-across runs without storing raw secret bytes.
+Deterministic, versioned identity contracts for persistence across all
+scanner sources. These contracts let the scanner answer "have I seen this
+exact finding before?" across runs without storing raw secret bytes.
 
 **Source**: `src/store/keys.rs`, `src/store/identity.rs`
 
 ## Purpose
 
 The detection engine emits `FindingRec` records during scanning. To support
-cross-run deduplication, suppression, and incremental scanning on the
-filesystem path, each finding needs a **stable identity** that:
+cross-run deduplication, suppression, and incremental scanning, each finding
+needs a **stable identity** that:
 
 - Is deterministic: same inputs always produce the same ID.
 - Is keyed: IDs are meaningless without the operator's secret key.
 - Matches engine dedupe semantics: two findings the engine considers
   duplicates must hash to the same occurrence ID.
 - Never stores raw secret bytes: only keyed hashes are persisted.
+- Is source-agnostic: works for filesystem, Git, S3, archives, and any
+  future source without contract changes.
 
-Phase A provides the identity derivation contracts. Future phases will use
-these IDs to read/write a persistence store on disk.
+This module provides the identity derivation contracts. Current integration
+targets filesystem scanning, but the contracts are source-agnostic by
+design.
+
+## Source Agnosticism
+
+The identity contracts are deliberately source-neutral. Every input to the
+three derivation functions is either engine-provided (and therefore
+source-independent) or caller-provided via a generic byte slice:
+
+| Input | Type | Source-specific? |
+|---|---|---|
+| `object_key` | `&[u8]` | No — caller provides any stable byte ID |
+| `FindingRec` fields | buffer offsets (`u32`/`u64`) | No — engine produces these for all sources |
+| `norm_hash` | `[u8; 32]` | No — engine computes this on the hot path for every source |
+| `StoreKeys` | env var + KDF | No — per-process, not per-source |
+| `VariantDiscriminant` | encoding variant | No — engine-level concept |
+
+The `object_key` field is the source abstraction point. Its doc comment
+reads "stable object identity bytes **(e.g.** a canonical repo-relative
+path)" — the "e.g." is intentional. Any stable byte representation works.
+
+### How Each Source Provides object_key
+
+| Source | Example `object_key` | Stability guarantee |
+|---|---|---|
+| Filesystem | `fs:src/main.rs` | Repo-relative path (not absolute) |
+| Git | `git:<repo-id>:<blob-oid>` | Blob OID is content-addressed |
+| S3 | `s3://<bucket>/<key>@<version-id>` | Version ID is immutable |
+| Archive | `tar:<archive-path>:<entry-path>` | Entry path within archive |
+| Log | `log:<source-id>:<line-range>` | Source + position |
+
+**Collision safety**: `object_key` values must be globally unambiguous across
+sources. Using a scheme prefix (e.g. `fs:`, `git:`, `s3:`) prevents
+cross-source collisions. The contracts do not enforce a prefix — this is a
+caller responsibility.
+
+### What Future Sources Need
+
+To use the identity contracts, a new source needs:
+
+1. A canonical `object_key` byte representation (defined by the source driver).
+2. A `FindingRec` — the engine already produces this for any byte buffer.
+3. `norm_hash` — the engine already computes this during scanning.
+
+Zero changes to `identity.rs` or `keys.rs` are required.
+
+### SourceKind and Occurrence ID
+
+The codebase has `SourceKind { Fs, Git }` in `src/unified/mod.rs` for event
+routing. This enum is **not** part of the `occurrence_id` payload. Source
+identity flows through the `object_key`, not a separate discriminator field.
+This is intentional: adding a `SourceKind` field to the canonical payload
+would require a version bump and would not add value if `object_key` schemes
+are already unambiguous.
 
 ## Relationship to Git Persistence
 
@@ -27,17 +82,24 @@ Git scanning (`src/git_scan/persist.rs`) has its own persistence pipeline
 that uses `(start, end, rule_id, norm_hash)` as finding keys and writes
 through a two-phase contract (data ops then watermarks).
 
-The `src/store/` module is a **separate, parallel identity system** for
-filesystem scanning. The two systems share the same `norm_hash` concept
-(BLAKE3 of secret bytes) but differ in scope:
+The `src/store/` module is a **separate, parallel identity system** that
+currently targets FS scanning (Phases B-E) but can serve Git and other
+sources. The two systems share the same `norm_hash` concept (BLAKE3 of
+secret bytes) but differ in scope:
 
-| Aspect | Git persistence | FS persistence (Phase A) |
+| Aspect | Git persistence | Store identity contracts |
 |---|---|---|
 | Location | `src/git_scan/persist.rs` | `src/store/` |
 | Finding key | `(start, end, rule_id, norm_hash)` | `occurrence_id` (32-byte keyed hash) |
 | Key material | None (hashes are unkeyed) | `SCANNER_SECRET_KEY` with KDF |
 | Cross-run correlation | Via ref watermarks + seen-blob store | Via persistent key identity |
 | Secret protection | `norm_hash` is unkeyed BLAKE3 | `secret_hash` is keyed BLAKE3 |
+| Source scope | Git only | Any source |
+
+The `occurrence_id` contract is a strict superset of Git's current dedup
+key. Git could adopt `occurrence_id` to gain keyed hashing and stronger
+identity guarantees without breaking its existing pipeline. The
+`norm_hash` that Git already computes feeds directly into `secret_hash`.
 
 ## Key Bootstrap
 
