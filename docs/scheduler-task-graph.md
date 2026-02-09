@@ -6,6 +6,8 @@ The `task_graph` module defines a **typed, state-machine-based task model** for 
 
 **Core abstraction**: Objects flow through a deterministic state machine as they are discovered, fetched, and scanned. Each state transition is triggered by specific events (discovery, I/O completion, scan completion).
 
+This module defines the task/data model and frontier primitives. Backend-specific worker execution (for example, local filesystem archive dispatch) is implemented in scheduler runtime modules.
+
 ---
 
 ## State Machine: Object Lifecycle FSM
@@ -146,11 +148,10 @@ if detection_finds_archive(buffer) {
 
 The nested enumeration acquires its own frontier permits independently.
 
-**Dispatch note:** in the local scheduler (filesystem backend), archive
-containers are detected by extension/magic and routed through the archive
-dispatch entrypoint. In Phase 3 this dispatch is a skip path; later phases
-replace it with actual archive scanning while preserving the same task
-boundaries.
+**Dispatch note:** in the local filesystem scheduler, archive containers are
+detected by extension/magic and routed through `dispatch_archive_scan`, which
+performs real archive scanning for supported formats and policy-driven skip or
+partial behavior for unsupported/budget-limited cases.
 
 **Abort policy note:** when archive policies trigger `FailRun`, the local
 scheduler sets a shared abort flag. Discovery stops enqueuing new files and
@@ -221,8 +222,7 @@ Scan(1)       [count = 1, permit held]
 - **Mechanism**:
   - `ObjectRef` is 8 bytes (just an Arc pointer), not 24+ bytes (PathBuf).
   - Tasks are packed efficiently into deques.
-  - `MAX_FETCH_SPAWNS_PER_ENUM = ENUM_BATCH_SIZE = 32` limits spawning burst.
-- **Effect**: A single Enumerate can queue ≤ 32 FetchSync tasks, then re-enqueues itself.
+  - `MAX_FETCH_SPAWNS_PER_ENUM = ENUM_BATCH_SIZE = 32` defines the intended per-enumerate spawn cap for handlers that apply these constants.
 
 ### Non-Blocking Enumerate
 - **Guarantee**: Enumerate tasks never block on frontier.acquire().
@@ -262,7 +262,7 @@ Within a single file:
 
 **Overlap prefix** (prefix_len):
 - Allows patterns to span chunk boundaries
-- Scan task receives: `buffer[0..len]` where `buffer[0..prefix_len]` is copy-on-write from previous chunk
+- Scan task receives: `buffer[0..len]` where `buffer[0..prefix_len]` is overlap carried from prior bytes (copied in local-fs flow; range re-read in remote flow)
 - `bytes_scanned` metric counts only non-overlap bytes
 
 ---
@@ -329,11 +329,11 @@ ObjectPermit::drop()
 CountBudget::release(1)
 ```
 
-### Lock-Free Coordination
+### Coordination Model
 
-- **ObjectFrontier**: Backed by `Arc<CountBudget>` (atomic counter, no locks)
-- **ObjectRef cloning**: Atomic increment (no locks)
-- **Task enqueueing**: Work-stealing deque operations (minimal synchronization)
+- **ObjectFrontier**: Backed by `Arc<CountBudget>` (`Mutex` + `Condvar` budget; `try_acquire` is non-blocking but lock-based)
+- **ObjectRef cloning**: Atomic refcount increment via `Arc::clone` (no heap allocation)
+- **Task enqueueing**: Work-stealing deque operations in the executor
 
 ---
 
@@ -352,10 +352,10 @@ CountBudget::release(1)
 - **Type**: `Arc<ObjectCtx>`
 - **Role**: Cheap shared reference to object state
 - **Size**: 8 bytes (just a pointer)
-- **Clone cost**: Atomic increment (~10ns)
+- **Clone cost**: Atomic refcount increment (no allocation)
 
 ### Task Enum
-- **Size**: ~64-80 bytes (fits in 2 cache lines)
+- **Size**: 56 bytes in current unit tests (`task_size_is_reasonable`); asserted `<= 128` bytes
 - **Variants**:
   ```rust
   enum Task {
@@ -368,7 +368,7 @@ CountBudget::release(1)
 - **Advantage**: Introspectable for metrics; no heap indirection vs boxed closure
 
 ### ObjectDescriptor
-- **Size**: ~40 bytes
+- **Size**: 48 bytes in current unit tests (`object_descriptor_size_is_reasonable`); asserted `<= 64` bytes
 - **Role**: Metadata about discovered object
 - **Fields**:
   - `path: PathBuf` - filesystem or URI path
@@ -378,7 +378,7 @@ CountBudget::release(1)
 
 ### ObjectFrontier
 - **Role**: Bounded in-flight object quota
-- **Backed by**: `Arc<CountBudget>` (lock-free atomic counter)
+- **Backed by**: `Arc<CountBudget>` (`Mutex` + `Condvar` permit budget)
 - **API**:
   - `try_acquire_ctx()` - non-blocking, returns `Option<ObjectRef>`
   - `acquire()` - blocking, use only from non-executor threads
@@ -418,20 +418,18 @@ CountBudget::release(1)
 
 ## Performance Characteristics
 
-| Operation | Cost | Notes |
-|-----------|------|-------|
-| Task dispatch (match variant + call) | ~5ns | Single match statement, CPU branch prediction |
-| ObjectRef clone | ~10ns | Atomic increment, no allocation |
-| FetchSync spawning | ~20ns each | One Arc clone per task, queue enqueue |
-| Task enqueue | ~50ns | Work-stealing deque operation |
-| Frontier try_acquire | ~5ns | Atomic compare-and-swap, no lock |
-| Frontier permit drop | ~10ns | Atomic decrement |
+| Operation | Behavior | Notes |
+|-----------|----------|-------|
+| Task dispatch (match variant + call) | Enum pattern match | No task boxing in the task graph model |
+| ObjectRef clone | Atomic refcount increment | Cheap `Arc::clone`, no object metadata copy |
+| Frontier `try_acquire` | Lock + immediate return | `None` at capacity, no blocking wait |
+| Frontier `acquire` | Lock + condvar wait | Blocking API for non-executor producers |
+| Frontier permit drop | RAII release on drop | Returns one slot to `CountBudget` |
 
 **Memory Layout**:
-- Task enum: 64-80 bytes (fits 2 cache lines)
-- ObjectDescriptor: ~40 bytes
+- Task enum: 56 bytes in current unit tests (asserted `<= 128`)
+- ObjectDescriptor: 48 bytes in current unit tests (asserted `<= 64`)
 - ObjectRef: 8 bytes (just Arc pointer)
-- ObjectCtx: ~80 bytes (descriptor + permit + file_id)
 
 ---
 
@@ -476,7 +474,7 @@ CountBudget::release(1)
 
 ## Testing Strategy
 
-The module includes comprehensive tests validating state machine correctness:
+The module includes focused unit tests for frontier semantics, permit lifetime, and size budgets:
 
 1. **Frontier Acquisition**: `frontier_try_acquire_does_not_block()`
    - Verifies `try_acquire()` returns `None` at capacity
@@ -501,14 +499,14 @@ The module includes comprehensive tests validating state machine correctness:
 
 ## Summary
 
-The task graph module implements a **typed, state-machine-driven scheduler** with these key features:
+The task graph module defines a **typed, state-machine-driven task model** with these key features:
 
 1. **Explicit State Machine**: Enumerate → FetchSync → Scan → Completion
 2. **Refcounted Permits**: `Arc<ObjectCtx>` ensures permit release exactly once
 3. **Work-Conserving Backpressure**: Enumerate re-enqueues on frontier full, never drops work
-4. **Non-Blocking Coordination**: All frontier operations are non-blocking; Enumerate uses `try_acquire()`
+4. **Non-Blocking Enumerate Path**: Enumerate uses `try_acquire()`/`try_acquire_ctx()`; `acquire()` remains available for blocking producer contexts
 5. **Introspectable Tasks**: Typed enum enables metrics and debugging
 6. **Efficient Memory**: ObjectRef is 8 bytes, tasks fit in 2 cache lines
-7. **Lock-Free**: Atomic counters, no locks in critical paths
+7. **RAII Permit Safety**: Frontier slots are released by drop semantics without manual bookkeeping
 
-This design ensures memory safety, prevents deadlocks, bounds resource consumption, and makes correct behavior automatic through RAII.
+This design ensures memory safety, prevents deadlocks from blocking enumerate handlers, bounds resource consumption, and makes permit lifetime correctness automatic through RAII.

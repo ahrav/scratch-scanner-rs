@@ -14,7 +14,7 @@ The architecture emphasizes:
 - **High concurrency**: Hundreds of in-flight operations via efficient batch submission
 - **Work conservation**: Never drops discovered files; uses backpressure instead
 - **Correctness guarantees**: Chunk overlap, deduplication, exactly-once scanning semantics
-- **Platform parity**: Single unified interface with blocking `local.rs` backend
+- **Platform parity**: Single unified interface with blocking `local_fs_owner.rs` backend (`scan_local`)
 
 ## Why io_uring?
 
@@ -56,10 +56,10 @@ Traditional Blocking Reads:       io_uring Approach:
 
 | Scenario | Backend | Reason |
 |----------|---------|--------|
-| Everything in page cache | `local.rs` (blocking) | Syscall overhead dominates; kernel optimizations (hugepages, prefetch) shine |
-| Tiny files | `local.rs` | Context-switch overhead > I/O latency |
+| Everything in page cache | `local_fs_owner.rs` (`scan_local`) | Syscall overhead dominates; kernel optimizations (hugepages, prefetch) shine |
+| Tiny files | `local_fs_owner.rs` (`scan_local`) | Context-switch overhead > I/O latency |
 | Cold storage (NVMe, network) | `io_uring` | Kernel can parallelize; reduces thread count & context switches |
-| High concurrency (1000+ files) | `io_uring` | Single I/O thread handles what blocking needs 64+ threads for |
+| High concurrency (many files) | `io_uring` | I/O rings can sustain high fan-out without matching blocking thread counts |
 | Latency-sensitive | `io_uring` | Bounded by device, not thread scheduling |
 
 **Guidance**: Profile both backends on your actual workload. io_uring wins most on cold storage at high concurrency; blocking is simpler and sometimes faster on hot data.
@@ -69,7 +69,7 @@ Traditional Blocking Reads:       io_uring Approach:
 ```mermaid
 flowchart TB
     subgraph Discovery["Discovery Phase (main thread)"]
-        Source["FileSource trait<br/>(VecFileSource)"]
+        Source["roots: &[PathBuf]"]
         Walk["DFS file walk<br/>symlink-safe"]
         Budget["CountBudget<br/>max_in_flight_files"]
         Queue["Bounded channel<br/>file_queue_cap"]
@@ -97,11 +97,11 @@ flowchart TB
     subgraph Processing["Per-Chunk Processing"]
         Scan["engine.scan_chunk_into()"]
         DropPrefix["drop_prefix_findings()<br/>dedup overlap"]
-        Emit["emit_findings_formatted()"]
+        Emit["emit_findings()"]
     end
 
     subgraph Output["Output"]
-        Sink["OutputSink<br/>(stdout, file, vec)"]
+        Sink["EventSink<br/>(JSONL events)"]
     end
 
     Source --> Walk
@@ -144,7 +144,7 @@ let entry = opcode::Read::new(types::Fd(fd), ptr, len)
     .build()
     .user_data(op_slot as u64);  // Correlation ID
 
-// Push into SQ (user-space, lockfree)
+// Push into SQ (user-space)
 ring.submission().push(&entry)?;
 
 // Flush to kernel (syscall only if needed)
@@ -153,7 +153,7 @@ ring.submit()?;
 
 **Key properties**:
 - **User-space**: No syscall to add entries (until flush)
-- **Lockfree**: Thread-safe ring buffer; tail advances atomically
+- **Per-I/O-thread ring**: SQ memory updates happen in user-space; syscall occurs at `submit()`
 - **Correlation**: `user_data` field lets us match CQEs back to ops
 - **Batching**: Fill multiple SQEs before calling `submit()` (amortizes syscall)
 
@@ -179,7 +179,7 @@ for cqe in ring.completion() {
 
 **Key properties**:
 - **User-space readable**: No syscall to read CQEs
-- **Ordered**: Within each I/O thread, CQEs arrive in submission order
+- **Unordered completions**: CQEs may arrive out of submission order; `user_data` maps each CQE to its op slot
 - **Reusable**: After processing a CQE, the entry is freed for next operation
 - **Batched**: Loop reaps all pending CQEs; use `submit_and_wait(1)` if none available
 
@@ -197,7 +197,7 @@ for cqe in ring.completion() {
 │                                                  │
 │  ┌─────────────────────────┐                     │
 │  │  Completion Queue (CQ)  │  <-- Reap CQEs     │
-│  │  - Ordered results      │                     │
+│  │  - Completion order     │                     │
 │  │  - user_data matching   │                     │
 │  └─────────────────────────┘                     │
 └──────────────────────────────────────────────────┘
@@ -214,35 +214,33 @@ Invariant: io_depth <= ring_entries - 1
 
 ## Integration with Scheduler
 
-### FileSource Trait Integration
+### Discovery Integration
 
-Like the blocking `local.rs` backend, io_uring respects the `FileSource` trait for discovery:
-
-```rust
-pub trait FileSource: Send + 'static {
-    fn next_file(&mut self) -> Option<LocalFile>;
-}
-```
+Unlike `scan_local` in `local_fs_owner.rs`, this backend does not take a `FileSource`.
+`scan_local_fs_uring()` takes `roots: &[PathBuf]` and discovers files via
+`walk_and_send_files()`.
 
 **Discovery flow**:
-1. Main thread calls `source.next_file()` in a loop
-2. For each file, acquire a `CountBudget` permit (blocks if `max_in_flight_files` reached)
-3. Wrap file path + permit in `FileToken`, send to I/O thread
-4. I/O threads process files from bounded channel
-5. Token (and permit) stays alive until all chunks complete
+1. Main thread DFS-walks each root (`fs::symlink_metadata` or `fs::metadata` per `follow_symlinks`)
+2. For each regular file, increment `files_seen` and apply `max_file_size` filter
+3. Acquire a `CountBudget` permit (blocks when `max_in_flight_files` is reached)
+4. Wrap path + permit in `FileToken`, then send `FileWork` over bounded channel
+5. I/O workers keep the token alive until all chunk tasks for that file finish
 
-This ensures: **No discovered files are dropped; all eventually scanned or errored.**
+This still enforces work conservation: discovery blocks under backpressure instead of dropping files.
 
 ### CPU Task Spawning
 
 When a read completes, the I/O worker spawns a CPU task:
 
 ```rust
+let total_len = op.prefix_len.saturating_add(n);
+
 let task = CpuTask::ScanChunk {
     token: Arc::clone(&st.token),      // Keeps file permit alive
     base_offset: op.base_offset,       // Overlap bytes
-    prefix_len: actual_prefix as u32,  // Bytes to drop in findings
-    len,                               // Total buffer length
+    prefix_len: op.prefix_len as u32,  // Bytes to drop in findings
+    len: total_len as u32,             // prefix + payload bytes
     buf: op.buf,                       // Buffer handle (RAII)
 };
 
@@ -338,7 +336,7 @@ pub struct LocalFsUringConfig {
 
 Open/stat controls:
 - `open_stat_mode`: `UringPreferred` (default), `BlockingOnly`, or `UringRequired`.
-- `resolve_policy`: Only applies to `openat2` when supported. `Default` matches current behavior; `NoSymlinks` and `BeneathRoot` are opt-in. When `openat2` is unavailable, resolve policy is ignored and the blocking open path is used.
+- `resolve_policy`: Only applies when `OPENAT2` is used. If `OPENAT2` is unavailable, the worker submits `OPENAT` (without resolve bits). Blocking open/stat is used only when open/stat ops are unavailable or a fallback error (`EINVAL`/`EOPNOTSUPP`) is hit in non-`UringRequired` modes.
 
 ### Default Configuration
 
@@ -426,7 +424,7 @@ let pool = FixedBufferPool::new(
 - Global acquisition/release simplifies handoff
 - Required for optional `READ_FIXED` (registered buffers)
 
-**Memory bound**: Peak memory = `pool_buffers * (overlap + chunk_size)` ≈ 256 × 260 KB ≈ 67 MB
+**Memory bound**: Peak memory is bounded by `pool_buffers * (overlap + chunk_size)`.
 
 **Registered buffers**: When `use_registered_buffers` is true, `pool_buffers` must be <= `u16::MAX` (io_uring buffer table limit).
 
@@ -595,19 +593,19 @@ for cqe in ring.completion() {
         st.done = true;
     } else {
         let n = result as usize;
-        if n < op.requested_len {
+        if n < op.payload_len {
             // Short read (file truncated between reads)
             stats.short_reads += 1;
             st.done = true;  // Don't trust offset for next chunk
         }
 
         // Spawn CPU task to scan this chunk
-        let actual_prefix = op.prefix_len.min(n);
+        let total_len = op.prefix_len.saturating_add(n);
         let task = CpuTask::ScanChunk {
             token: Arc::clone(&st.token),
             base_offset: op.base_offset,
-            prefix_len: actual_prefix as u32,
-            len: n as u32,
+            prefix_len: op.prefix_len as u32,
+            len: total_len as u32,
             buf: op.buf,  // Ownership transfer to CPU task
         };
 
@@ -658,7 +656,7 @@ if result < 0 {
 If fewer bytes arrive than requested, the file is marked done:
 
 ```rust
-if n < op.requested_len {
+if n < op.payload_len {
     // File shrank between size check and read
     stats.short_reads += 1;
     st.done = true;  // Don't trust next_offset
@@ -717,11 +715,13 @@ fn drain_in_flight(
     while *in_flight_ops > 0 {
         ring.submit_and_wait(1)?;
         for cqe in ring.completion() {
-            // Reap and drop buffers
             let op_slot = cqe.user_data() as usize;
             if let Some(op) = ops.get_mut(op_slot).and_then(|o| o.take()) {
-                drop(op.buf);  // Buffer returns to pool
                 *in_flight_ops = in_flight_ops.saturating_sub(1);
+                match op {
+                    Op::Read(op) => drop(op.buf), // Buffer returns to pool
+                    Op::Open(_) | Op::Stat(_) => {}
+                }
             }
         }
     }
@@ -733,15 +733,13 @@ fn drain_in_flight(
 
 ## Platform Requirements
 
-### Kernel Version
+### Runtime Compatibility
 
-io_uring was introduced in **Linux 5.1 (2019)**. Minimum supported versions:
+This module does not hardcode a kernel version check. Runtime behavior is:
 
-- **5.1+**: Basic io_uring, `Read` opcode
-- **5.10+**: Faster ring polling, better edge cases
-- **5.15+**: Fully stable for production use
-
-Most modern distributions (Ubuntu 20.04+, Fedora 32+, RHEL 8.3+) meet requirements.
+- Ring creation must succeed: `IoUring::new(cfg.ring_entries)?`
+- Open/stat capability is probed per ring (`OPENAT`/`OPENAT2`/`STATX`)
+- `open_stat_mode` controls fallback vs hard failure when capabilities are missing
 
 ### Feature Gate
 
@@ -750,14 +748,14 @@ The module is **feature-gated** behind `io-uring`:
 ```toml
 # Cargo.toml
 [features]
-io-uring = ["io-uring-crate"]  # Conditional compilation
+io-uring = []  # Enable io_uring scanner on Linux
 ```
 
 ```rust
 #![cfg(all(target_os = "linux", feature = "io-uring"))]
 ```
 
-**Effect**: Code only compiles on Linux with feature enabled. On other platforms or without feature, `io_uring` backend is unavailable (blocking `local.rs` backend always available).
+**Effect**: Code only compiles on Linux with feature enabled. On other platforms or without feature, `io_uring` backend is unavailable (blocking `scan_local` in `local_fs_owner.rs` remains available).
 
 ### Kernel Capabilities
 
@@ -770,14 +768,14 @@ However, some workloads may be restricted by:
 
 ### Fallback on Unavailable Kernels
 
-If io_uring initialization fails (kernel too old, feature disabled), the error propagates:
+If io_uring initialization fails (for example unsupported kernel or blocked syscall), the error propagates:
 
 ```rust
 let mut ring = IoUring::new(cfg.ring_entries)?;
 // Returns io::Error if kernel doesn't support io_uring
 ```
 
-**Recommendation**: Use blocking `local.rs` backend as fallback on older systems, or add version detection to gate feature use.
+**Recommendation**: Use blocking `scan_local` (`local_fs_owner.rs`) as fallback when `io_uring` is unavailable or disallowed by policy.
 
 ## Key Types and Functions
 
@@ -843,16 +841,17 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
     engine: Arc<E>,
     roots: &[PathBuf],
     cfg: LocalFsUringConfig,
-    out: Arc<dyn OutputSink>,
+    event_sink: Arc<dyn EventSink>,
 ) -> io::Result<(LocalFsSummary, UringIoStats, MetricsSnapshot)>;
 ```
 
 **Returns**: Tuple of discovery summary, I/O thread stats, and CPU executor metrics (chunks scanned, bytes scanned, wall-clock time).
 
 **Errors**: Returns `io::Error` if:
-- io_uring initialization fails (kernel too old)
-- An I/O thread panics (unwrap/panic propagated)
-- File discovery fails (permission denied on root)
+- io_uring ring setup/submit/wait fails
+- `open_stat_mode = UringRequired` and open/stat opcodes are unsupported
+- An I/O thread returns an error or panics
+- Discovery cannot send to I/O workers (broken channel)
 
 ### Internal Types
 
@@ -865,7 +864,6 @@ struct FileToken {
 
 struct FileWork {
     path: PathBuf,                  // Path to open
-    size: u64,                      // Discovered size hint (open-time size enforced)
     token: Arc<FileToken>,          // Permit + ID
 }
 
@@ -968,11 +966,10 @@ fn cpu_runner<E: ScanEngine>(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScra
 // Deduplication helper
 fn dedupe_pending_in_place<F: FindingRecord>(p: &mut Vec<F>);
 
-// Output formatting
-fn emit_findings_formatted<E: ScanEngine, F: FindingRecord>(
+// Emit findings as structured events
+fn emit_findings<E: ScanEngine, F: FindingRecord>(
     engine: &E,
-    out: &Arc<dyn OutputSink>,
-    out_buf: &mut Vec<u8>,
+    event_sink: &dyn EventSink,
     display: &[u8],
     recs: &[F],
 );
@@ -983,6 +980,8 @@ fn emit_findings_formatted<E: ScanEngine, F: FindingRecord>(
 ```rust
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use crate::unified::events::VecEventSink;
 
 // Setup
 let engine = Arc::new(MockEngine::default());
@@ -1004,14 +1003,14 @@ let cfg = LocalFsUringConfig {
     seed: 1,
     dedupe_within_chunk: true,
 };
-let output = Arc::new(VecSink::new());
+let sink = Arc::new(VecEventSink::new());
 
 // Validate
 cfg.validate(&engine);
 
 // Scan
 let (summary, io_stats, cpu_metrics) =
-    scan_local_fs_uring(engine, &roots, cfg, output)?;
+    scan_local_fs_uring(engine, &roots, cfg, sink.clone())?;
 
 // Results
 println!("Files seen: {}", summary.files_seen);
@@ -1021,6 +1020,9 @@ println!("Stat ops submitted: {}", io_stats.stat_ops_submitted);
 println!("Open/stat fallbacks: {}", io_stats.open_stat_fallbacks);
 println!("Reads completed: {}", io_stats.reads_completed);
 println!("Chunks scanned: {}", cpu_metrics.chunks_scanned);
+
+let jsonl = String::from_utf8_lossy(&sink.take());
+println!("Findings/events bytes: {}", jsonl.len());
 ```
 
 ## Correctness and Invariants
@@ -1131,10 +1133,8 @@ fn global_only_pool_works() {
 
 ### Throughput
 
-io_uring typically achieves **higher throughput** than blocking I/O on:
-- Cold cache (NVMe, network mounts): 2–10x improvement
-- High concurrency (1000+ files): 5–50x improvement due to reduced thread count
-- Hot cache: Blocking I/O often comparable or faster (syscall batching overhead)
+io_uring often improves throughput on cold cache and high-concurrency workloads.
+On hot cache or tiny files, the blocking backend can be comparable or faster.
 
 ### Latency
 
@@ -1145,9 +1145,8 @@ io_uring provides **latency isolation**:
 
 ### Memory
 
-- **Peak memory**: `pool_buffers * (overlap + chunk_size)` ≈ 256 × 260 KB ≈ 67 MB
-- **Per-thread overhead**: ~1 MB for ring buffer + file table
-- **Total estimate**: 67 MB + 4 threads × 1 MB ≈ 71 MB
+- **Peak memory**: `pool_buffers * (overlap + chunk_size)` (exact value depends on engine overlap and config)
+- Additional memory comes from per-thread ring state and file/op tracking tables.
 
 ### Scalability
 

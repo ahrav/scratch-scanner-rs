@@ -66,7 +66,7 @@ Configuration for generating synthetic scanner scenarios.
 | `token_len`        | u32                    | 12                     | Random token length (appended to rule prefix)   |
 | `min_noise_len`    | u32                    | 8                      | Minimum padding bytes between secrets           |
 | `max_noise_len`    | u32                    | 32                     | Maximum padding bytes between secrets           |
-| `representations`  | `Vec<SecretRepr>`      | all variants           | Allowed secret encodings to choose from         |
+| `representations`  | `Vec<SecretRepr>`      | Raw, Base64, UrlPercent, Utf16Le, Utf16Be | Allowed secret encodings to choose from |
 | `archive_count`    | u32                    | 0                      | Number of archive files to generate             |
 | `archive_entries`  | u32                    | 2                      | Entries per generated archive                   |
 | `archive_kinds`    | `Vec<ArchiveKindSpec>` | tar, tar.gz, zip, gzip | Archive formats to include                      |
@@ -91,6 +91,8 @@ let scenario = generate_scenario(42, &gen_cfg)?;
 
 Configuration for a single simulation run.
 
+`RunConfig` does not implement `Default`; values below are the defaults used by `tests/simulation/scanner_random.rs`.
+
 | Field                   | Type          | Default  | Description                                                        |
 | ----------------------- | ------------- | -------- | ------------------------------------------------------------------ |
 | `workers`               | u32           | required | Number of simulated worker threads                                 |
@@ -98,6 +100,7 @@ Configuration for a single simulation run.
 | `overlap`               | u32           | required | Overlap bytes between chunks (must >= `engine.required_overlap()`) |
 | `max_in_flight_objects` | u32           | 16       | Maximum concurrent file operations                                 |
 | `buffer_pool_cap`       | u32           | 8        | Buffer pool capacity                                               |
+| `max_file_size`         | u64           | u64::MAX | Max file size to scan; oversized files are skipped                |
 | `max_steps`             | u64           | auto     | Simulation step limit (0 = auto-derived)                           |
 | `max_transform_depth`   | u32           | 3        | Maximum decode nesting depth                                       |
 | `scan_utf16_variants`   | bool          | true     | Enable UTF-16 LE/BE scanning                                       |
@@ -112,6 +115,7 @@ let run_cfg = RunConfig {
     overlap: 32,
     max_in_flight_objects: 16,
     buffer_pool_cap: 8,
+    max_file_size: u64::MAX,
     max_steps: 0,  // auto
     max_transform_depth: 3,
     scan_utf16_variants: true,
@@ -171,7 +175,7 @@ loading artifacts.
 
 | Variant                   | Description                                             |
 | ------------------------- | ------------------------------------------------------- |
-| `ErrKind { kind }`        | Return an I/O error (kind maps to `std::io::ErrorKind`) |
+| `ErrKind { kind }`        | Return an injected I/O error (`kind` is a numeric diagnostic code) |
 | `PartialRead { max_len }` | Return at most `max_len` bytes (short read)             |
 | `EIntrOnce`               | Single EINTR-style interruption                         |
 
@@ -208,6 +212,11 @@ let gen_cfg = ScenarioGenConfig {
 };
 let scenario = generate_scenario(42, &gen_cfg)?;
 let engine = build_engine_from_suite(&scenario.rule_suite, &run_cfg)?;
+let mut run_cfg = run_cfg;
+let required = engine.required_overlap() as u32;
+if run_cfg.overlap < required {
+    run_cfg.overlap = required;
+}
 let runner = ScannerSimRunner::new(run_cfg, 0xCAFE);
 match runner.run(&scenario, &engine, &FaultPlan::default()) {
     RunOutcome::Ok { findings } => { /* success */ }
@@ -250,6 +259,8 @@ let run_cfg = RunConfig {
 };
 ```
 
+Clamp `overlap` to `engine.required_overlap()` before running (as shown in Scenario 1).
+
 ### Scenario 4: Fault Injection
 
 Test I/O error handling and cancellation recovery.
@@ -262,7 +273,7 @@ let mut per_file = BTreeMap::new();
 per_file.insert(
     b"file_0.txt".to_vec(),
     FileFaultPlan {
-        open: Some(IoFault::ErrKind { kind: 2 }), // NotFound
+        open: Some(IoFault::ErrKind { kind: 2 }),
         reads: vec![],
         cancel_after_reads: None,
     }
@@ -308,6 +319,8 @@ let run_cfg = RunConfig {
 };
 ```
 
+Clamp `overlap` to `engine.required_overlap()` before running (as shown in Scenario 1).
+
 ## Workflow Guide
 
 ### When to Create New Test Cases
@@ -346,6 +359,7 @@ The minimizer applies deterministic shrink passes:
 1. Reduce worker count
 2. Remove fault entries (open, cancel, reads)
 3. Remove files from the scenario
+4. Remove archive roots/entries from the scenario
 
 ### Environment Variables
 
@@ -382,10 +396,20 @@ The minimizer applies deterministic shrink passes:
 | `SIM_RUN_CHUNK_MIN`           | 16            | Min chunk (random)     |
 | `SIM_RUN_CHUNK_MAX`           | 64 (128 deep) | Max chunk (random)     |
 | `SIM_RUN_OVERLAP`             | 64 (128 deep) | Overlap bytes          |
+| `SIM_RUN_MAX_IN_FLIGHT`       | 16 (32 deep)  | In-flight object cap   |
+| `SIM_RUN_BUFFER_POOL_CAP`     | 8 (16 deep)   | Buffer pool capacity   |
+| `SIM_RUN_MAX_FILE_SIZE`       | u64::MAX      | Max file size to scan  |
 | `SIM_RUN_MAX_STEPS`           | 0 (auto)      | Step limit             |
 | `SIM_RUN_MAX_TRANSFORM_DEPTH` | 3 (4 deep)    | Max decode depth       |
 | `SIM_RUN_SCAN_UTF16`          | true          | Enable UTF-16 variants |
 | `SIM_RUN_STABILITY_RUNS`      | 2 (4 deep)    | Stability replays      |
+
+**Harness debug knobs:**
+
+| Variable                | Default | Description                                             |
+| ----------------------- | ------- | ------------------------------------------------------- |
+| `SCANNER_SIM_DUP_DEBUG` | unset   | Print duplicate-finding diagnostics on dedupe failures |
+| `SIM_TRACE_FULL`        | unset   | Capture full trace events in addition to the trace ring |
 
 ## Oracles Checked
 
@@ -399,6 +423,7 @@ The harness validates these invariants during and after each run:
 | **No Duplicates**      | End of run  | Emitted findings have unique normalized keys                                                                          |
 | **Ground Truth**       | End of run  | Expected secrets found (for fully-observed files), no unexpected findings                                             |
 | **Differential**       | End of run  | Chunked results match single-chunk reference scan (root findings; non-root only with `SCANNER_SIM_STRICT_NON_ROOT=1`) |
+| **Archive Outcomes**   | End of run  | Archive budgets and archive outcome counters remain internally consistent                                              |
 | **Stability**          | Multi-run   | Same finding set across different schedule seeds                                                                      |
 
 ### Failure Kinds
@@ -410,6 +435,7 @@ The harness validates these invariants during and after each run:
 | `InvariantViolation { code }` | Internal invariant violated (see code for details)         |
 | `OracleMismatch`              | Ground-truth or differential oracle failed                 |
 | `StabilityMismatch`           | Different findings across schedule seeds                   |
+| `Unimplemented`               | Placeholder variant for future harness phases              |
 
 ## ReproArtifact Schema
 
@@ -457,7 +483,7 @@ A: `scenario_seed` determines file contents and secret placement. `schedule_seed
 
 **Q: Why does ground-truth skip some files?**
 
-A: Files with data-affecting faults (open errors, cancellations, corruption) are excluded from ground-truth checks because the engine didn't see the expected bytes.
+A: Files with data-affecting faults (open errors, cancellations, corruption), and files skipped by size caps, are excluded from ground-truth checks because the engine did not observe the expected bytes.
 
 **Q: What does `overlap` need to be?**
 

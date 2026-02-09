@@ -23,7 +23,7 @@ The scheduler test harness validates the **executor's work distribution policy**
 
 ```bash
 # Run corpus regression tests
-cargo test --features scheduler-sim scheduler_sim
+cargo test --features scheduler-sim scheduler_sim_replay_corpus
 
 # Run stress tests with random case generation
 cargo test --features scheduler-sim scheduler_sim_stress_smoke
@@ -155,9 +155,10 @@ Each choice is an index into the enabled action list at that step. Empty means u
 
 A 64-bit hash of the trace events. Replay must produce this exact hash, validating determinism.
 
-### failure - Expected Outcome
+### failure - Artifact Metadata
 
-For corpus artifacts, this describes the expected (non-violation) outcome:
+`failure` records the outcome captured when the artifact was created.
+Replay currently asserts `expected_trace_hash`; this field is metadata.
 
 ```json
 "failure": {
@@ -167,7 +168,8 @@ For corpus artifacts, this describes the expected (non-violation) outcome:
 }
 ```
 
-`"Timeout"` means the case ran to `max_steps` without invariant violation - a passing case.
+`"Timeout"` with `"corpus artifact"` is the common convention for non-violation corpus cases.
+Some corpus artifacts intentionally use other kinds (for example `"Panic"`).
 
 ## Bytecode Instruction Reference
 
@@ -412,7 +414,7 @@ cargo test --features scheduler-sim scheduler_sim_replay_corpus
 
 ### Interpreting Failure Artifacts
 
-When stress tests find a violation, they write an artifact to `tests/simulation/failures/`:
+When stress tests find a violation, they write an artifact to `tests/failures/`:
 
 ```json
 {
@@ -443,7 +445,7 @@ cargo test --features scheduler-sim scheduler_sim_stress_smoke
 
 # Reproduce a specific failure
 SCHEDULER_SIM_STRESS_SEEDS=1 \
-SCHEDULER_SIM_STRESS_SEED_BASE=0xDEADBEEF \
+SCHEDULER_SIM_STRESS_SEED_BASE=3735928559 \
 cargo test --features scheduler-sim scheduler_sim_stress_smoke
 ```
 
@@ -454,7 +456,7 @@ Environment variables:
 | `SCHEDULER_SIM_STRESS_MAX_STEPS` | 80 | Maximum steps per case |
 | `SCHEDULER_SIM_STRESS_MAX_PROGRAMS` | 4 | Maximum programs per case |
 | `SCHEDULER_SIM_STRESS_MAX_TASKS` | 4 | Maximum initial tasks per case |
-| `SCHEDULER_SIM_STRESS_SEED_BASE` | 0xD00D_BEEF | Base seed for RNG |
+| `SCHEDULER_SIM_STRESS_SEED_BASE` | 3490561775 (0xD00D_BEEF) | Base seed for RNG (env value is parsed as decimal) |
 
 ## Invariants Checked
 
@@ -462,12 +464,11 @@ The harness validates these invariants on every step:
 
 | Invariant | Violation Kind | Meaning |
 |-----------|---------------|---------|
-| In-flight accounting | `InFlightMismatch` | Task lost or double-counted |
 | Resource bounds | `ResourceOverflow` | Released more units than acquired |
-| Gate semantics | `GateViolation` | External spawn after `join()` or inconsistent done state |
+| Gate consistency | `GateViolation` | Gate closed with zero in-flight but `done` not set |
 | Bounded starvation | `RunnableStarvation` | Runnable task not executed within bound |
-| No lost wakeups | `LostWakeup` | All workers parked while runnable work exists |
-| Unblock correctness | `IllegalUnblock` | Task unblocked without matching event |
+
+Other `ViolationKind` variants exist in the enum (`InFlightMismatch`, `LostWakeup`, `IllegalUnblock`, etc.), but they are not emitted by the current oracle checks.
 
 ### Starvation Bound
 
@@ -485,13 +486,13 @@ A: Use `WaitIo { token: N }` in the program, then schedule `IoComplete { token: 
 
 **Q: Why does the corpus use "Timeout" as the failure kind?**
 
-A: Corpus artifacts are valid test cases that should pass. "Timeout" means "ran to max_steps without invariant violation" - this is the expected successful outcome.
+A: In corpus artifacts, `"Timeout"` is the common metadata convention for a non-violation case (`"corpus artifact"`). Replay correctness is enforced by `expected_trace_hash`.
 
 **Q: How do I debug a failing stress test?**
 
 A:
-1. Find the artifact in `tests/simulation/failures/`
-2. Set `SCHEDULER_SIM_STRESS_SEEDS=1` and `SCHEDULER_SIM_STRESS_SEED_BASE=<seed>` to reproduce
+1. Find the artifact in `tests/failures/`
+2. Set `SCHEDULER_SIM_STRESS_SEEDS=1` and `SCHEDULER_SIM_STRESS_SEED_BASE=<seed-as-decimal>` to reproduce
 3. Add the artifact to `tests/simulation/corpus/` to make it a permanent regression test
 
 **Q: Can I test the actual crossbeam queues?**
