@@ -393,6 +393,10 @@ impl EngineScratch for ScanScratch {
             out.push(FindingWithHash::new(finding, [0; 32]));
         }
     }
+
+    fn pending_findings_len(&self) -> usize {
+        self.findings.len()
+    }
 }
 
 impl ScanEngine for MockEngine {
@@ -419,6 +423,10 @@ impl ScanEngine for MockEngine {
 
     fn rule_name(&self, rule_id: u32) -> &str {
         self.rule_name(RuleId(rule_id as u16))
+    }
+
+    fn max_findings_per_chunk(&self) -> usize {
+        self.tuning.max_findings_per_chunk
     }
 }
 

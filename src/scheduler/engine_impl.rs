@@ -172,12 +172,25 @@ impl EngineScratch for RealEngineScratch {
         self.findings_buf.clear();
         self.norm_hash_buf.clear();
         let pending = self.scratch.pending_findings_len();
-        if self.findings_buf.capacity() < pending {
-            self.findings_buf.reserve(pending);
-        }
-        if self.norm_hash_buf.capacity() < pending {
-            self.norm_hash_buf.reserve(pending);
-        }
+
+        // Buffers were pre-sized to max_findings_per_chunk at startup.
+        // The engine enforces this cap, so pending must fit.  Allocating
+        // here would violate the zero-alloc-after-init invariant.
+        debug_assert!(
+            self.findings_buf.capacity() >= pending,
+            "findings_buf capacity ({}) < pending findings ({}); \
+             engine exceeded max_findings_per_chunk",
+            self.findings_buf.capacity(),
+            pending,
+        );
+        debug_assert!(
+            self.norm_hash_buf.capacity() >= pending,
+            "norm_hash_buf capacity ({}) < pending findings ({}); \
+             engine exceeded max_findings_per_chunk",
+            self.norm_hash_buf.capacity(),
+            pending,
+        );
+
         self.scratch
             .drain_findings_with_hashes(&mut self.findings_buf, &mut self.norm_hash_buf);
 
@@ -186,7 +199,16 @@ impl EngineScratch for RealEngineScratch {
             self.norm_hash_buf.len(),
             "finding/hash drain length mismatch"
         );
-        out.reserve(self.findings_buf.len());
+
+        // `out` is the per-worker `pending` vec, pre-sized to
+        // max_findings_per_chunk at worker init.  After `clear()` by the
+        // caller, capacity is guaranteed sufficient.
+        debug_assert!(
+            out.capacity() - out.len() >= self.findings_buf.len(),
+            "output vec remaining capacity ({}) < drained findings ({})",
+            out.capacity() - out.len(),
+            self.findings_buf.len(),
+        );
         for (finding, norm_hash) in self
             .findings_buf
             .drain(..)
@@ -194,6 +216,10 @@ impl EngineScratch for RealEngineScratch {
         {
             out.push(FindingWithHash::new(finding, norm_hash));
         }
+    }
+
+    fn pending_findings_len(&self) -> usize {
+        self.scratch.pending_findings_len()
     }
 
     fn dropped_findings(&self) -> u64 {
@@ -231,6 +257,10 @@ impl ScanEngine for Engine {
 
     fn rule_name(&self, rule_id: u32) -> &str {
         self.rule_name(rule_id)
+    }
+
+    fn max_findings_per_chunk(&self) -> usize {
+        self.tuning.max_findings_per_chunk
     }
 }
 

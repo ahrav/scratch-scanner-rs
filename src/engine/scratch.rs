@@ -1140,7 +1140,7 @@ impl ScanScratch {
     ) {
         findings_out.clear();
         norm_hash_out.clear();
-        debug_assert_eq!(
+        assert_eq!(
             self.out.len(),
             self.norm_hash.len(),
             "norm hash length mismatch"

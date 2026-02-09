@@ -80,8 +80,17 @@ pub struct FsRunLoss {
     pub dropped_findings: u64,
     /// Number of persistence batch emissions that failed.
     pub persistence_emit_failures: u64,
+}
+
+impl FsRunLoss {
     /// Whether the run should be treated as incomplete.
-    pub incomplete: bool,
+    ///
+    /// Returns `true` when any findings were dropped or any persistence
+    /// batch emission failed, indicating potential data loss.
+    #[inline]
+    pub fn incomplete(&self) -> bool {
+        self.dropped_findings > 0 || self.persistence_emit_failures > 0
+    }
 }
 
 /// Persistence producer error.
@@ -217,5 +226,217 @@ impl StoreProducer for InMemoryStoreProducer {
             .expect("in-memory fs store producer mutex poisoned")
             .push(loss);
         Ok(())
+    }
+}
+
+// ============================================================================
+// Test-only mock producers
+// ============================================================================
+
+/// Mock producer that fails on every call — for error-path testing.
+///
+/// Both `emit_fs_batch` and `record_fs_run_loss` return an `Err` with
+/// a descriptive detail string so callers can verify error propagation.
+#[cfg(test)]
+pub(crate) struct FailingStoreProducer;
+
+#[cfg(test)]
+impl StoreProducer for FailingStoreProducer {
+    fn emit_fs_batch(&self, _batch: FsFindingBatch<'_>) -> Result<(), FsStoreError> {
+        Err(FsStoreError::backend("injected emit failure"))
+    }
+
+    fn record_fs_run_loss(&self, _loss: FsRunLoss) -> Result<(), FsStoreError> {
+        Err(FsStoreError::backend("injected run-loss failure"))
+    }
+}
+
+/// Mock producer that succeeds on `emit_fs_batch` but fails on `record_fs_run_loss`.
+///
+/// Used to test the run-loss-failure error path in isolation, without
+/// triggering emit failures during the scan loop.
+#[cfg(test)]
+pub(crate) struct EmitOnlyStoreProducer {
+    inner: InMemoryStoreProducer,
+}
+
+#[cfg(test)]
+impl EmitOnlyStoreProducer {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: InMemoryStoreProducer::default(),
+        }
+    }
+
+    pub(crate) fn batches(&self) -> Vec<OwnedFsFindingBatch> {
+        self.inner.batches()
+    }
+}
+
+#[cfg(test)]
+impl StoreProducer for EmitOnlyStoreProducer {
+    fn emit_fs_batch(&self, batch: FsFindingBatch<'_>) -> Result<(), FsStoreError> {
+        self.inner.emit_fs_batch(batch)
+    }
+
+    fn record_fs_run_loss(&self, _loss: FsRunLoss) -> Result<(), FsStoreError> {
+        Err(FsStoreError::backend("injected run-loss failure"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------------------------------------------------------------
+    // NullStoreProducer
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn null_producer_emit_returns_ok() {
+        let producer = NullStoreProducer;
+        let batch = FsFindingBatch {
+            object_path: b"/tmp/test.txt",
+            findings: &[],
+        };
+        assert!(producer.emit_fs_batch(batch).is_ok());
+    }
+
+    #[test]
+    fn null_producer_run_loss_returns_ok() {
+        let producer = NullStoreProducer;
+        let loss = FsRunLoss {
+            dropped_findings: 42,
+            persistence_emit_failures: 7,
+        };
+        assert!(loss.incomplete());
+        assert!(producer.record_fs_run_loss(loss).is_ok());
+    }
+
+    // ---------------------------------------------------------------
+    // InMemoryStoreProducer
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn in_memory_producer_collects_batches() {
+        let producer = InMemoryStoreProducer::default();
+        let rec = FsFindingRecord {
+            rule_id: 1,
+            root_hint_start: 10,
+            root_hint_end: 20,
+            span_start: 12,
+            span_end: 18,
+            norm_hash: [0xAA; 32],
+        };
+        let batch1 = FsFindingBatch {
+            object_path: b"/file1.txt",
+            findings: &[rec],
+        };
+        let batch2 = FsFindingBatch {
+            object_path: b"/file2.txt",
+            findings: &[],
+        };
+        producer.emit_fs_batch(batch1).unwrap();
+        producer.emit_fs_batch(batch2).unwrap();
+
+        let batches = producer.batches();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].object_path, b"/file1.txt");
+        assert_eq!(batches[0].findings.len(), 1);
+        assert_eq!(batches[0].findings[0].rule_id, 1);
+        assert_eq!(batches[0].findings[0].norm_hash, [0xAA; 32]);
+        assert_eq!(batches[1].object_path, b"/file2.txt");
+        assert!(batches[1].findings.is_empty());
+    }
+
+    #[test]
+    fn in_memory_producer_records_losses() {
+        let producer = InMemoryStoreProducer::default();
+        let loss = FsRunLoss {
+            dropped_findings: 5,
+            persistence_emit_failures: 2,
+        };
+        producer.record_fs_run_loss(loss).unwrap();
+
+        let losses = producer.losses();
+        assert_eq!(losses.len(), 1);
+        assert_eq!(losses[0].dropped_findings, 5);
+        assert_eq!(losses[0].persistence_emit_failures, 2);
+        assert!(losses[0].incomplete());
+    }
+
+    // ---------------------------------------------------------------
+    // FsStoreError
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn fs_store_error_display_contains_detail() {
+        let err = FsStoreError::backend("disk full");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("disk full"),
+            "Display should contain detail: {msg}"
+        );
+        assert!(
+            msg.contains("fs persistence error"),
+            "Display should contain prefix: {msg}"
+        );
+    }
+
+    #[test]
+    fn fs_store_error_detail_accessor() {
+        let err = FsStoreError::backend("timeout");
+        assert_eq!(err.detail(), "timeout");
+    }
+
+    // ---------------------------------------------------------------
+    // FsRunLoss default
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn fs_run_loss_default_is_clean() {
+        let loss = FsRunLoss::default();
+        assert_eq!(loss.dropped_findings, 0);
+        assert_eq!(loss.persistence_emit_failures, 0);
+        assert!(!loss.incomplete());
+    }
+
+    // ---------------------------------------------------------------
+    // FailingStoreProducer
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn failing_producer_emit_returns_err() {
+        let producer = FailingStoreProducer;
+        let batch = FsFindingBatch {
+            object_path: b"/test",
+            findings: &[],
+        };
+        let err = producer.emit_fs_batch(batch).unwrap_err();
+        assert!(err.detail().contains("injected"));
+    }
+
+    #[test]
+    fn failing_producer_run_loss_returns_err() {
+        let producer = FailingStoreProducer;
+        let err = producer
+            .record_fs_run_loss(FsRunLoss::default())
+            .unwrap_err();
+        assert!(err.detail().contains("injected"));
+    }
+
+    // ---------------------------------------------------------------
+    // EmitOnlyStoreProducer
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn emit_only_producer_emit_succeeds_run_loss_fails() {
+        let producer = EmitOnlyStoreProducer::new();
+        let batch = FsFindingBatch {
+            object_path: b"/ok",
+            findings: &[],
+        };
+        assert!(producer.emit_fs_batch(batch).is_ok());
+        assert!(producer.record_fs_run_loss(FsRunLoss::default()).is_err());
     }
 }

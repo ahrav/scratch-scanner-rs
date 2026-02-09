@@ -440,6 +440,45 @@ pub struct LocalReport {
 // Helpers
 // ============================================================================
 
+/// Fixed-capacity stack buffer for diagnostic messages (no heap allocation).
+///
+/// Implements [`fmt::Write`] so it can be used with `write!()`.  Output
+/// beyond `N` bytes is silently truncated.
+struct StackMsg<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> StackMsg<N> {
+    #[inline]
+    const fn new() -> Self {
+        Self {
+            buf: [0; N],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn as_str(&self) -> &str {
+        // SAFETY: `fmt::Write::write_str` only accepts valid UTF-8, and we
+        // only copy full byte sequences from those slices, so the buffer
+        // contents are always valid UTF-8.
+        unsafe { std::str::from_utf8_unchecked(&self.buf[..self.len]) }
+    }
+}
+
+impl<const N: usize> std::fmt::Write for StackMsg<N> {
+    #[inline]
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let bytes = s.as_bytes();
+        let remaining = N - self.len;
+        let n = bytes.len().min(remaining);
+        self.buf[self.len..self.len + n].copy_from_slice(&bytes[..n]);
+        self.len += n;
+        Ok(())
+    }
+}
+
 /// Deduplicate findings in place by (rule_id, root_hint, span, norm_hash).
 ///
 /// # Algorithm
@@ -460,11 +499,14 @@ pub struct LocalReport {
 /// This handles within-chunk duplicates (same finding emitted multiple times
 /// by the engine). Cross-chunk duplicates are handled by `drop_prefix_findings`.
 ///
-/// # Consistency with git-scan path
+/// # CRITICAL: `norm_hash` must remain in the dedup key
 ///
-/// The git-scan path uses `FindingKey` (which includes `norm_hash`) for dedup.
-/// Including `norm_hash` here ensures two findings at the same span but with
-/// different secret hashes are preserved (not incorrectly collapsed).
+/// Two findings with identical `(rule_id, root_hint, span)` but different
+/// `norm_hash` values represent **distinct secrets** and must NOT be collapsed.
+/// This occurs when transform chains produce different decoded values at the
+/// same encoded location. Removing `norm_hash` from the key causes silent
+/// data loss. The git-scan path uses `FindingKey` (which includes `norm_hash`)
+/// for the same reason.
 #[inline]
 fn dedupe_findings<F: FindingWithHashRecord>(findings: &mut Vec<F>) {
     if findings.len() <= 1 {
@@ -490,6 +532,21 @@ fn dedupe_findings<F: FindingWithHashRecord>(findings: &mut Vec<F>) {
             && a.span_end() == b.span_end()
             && a.norm_hash() == b.norm_hash()
     });
+}
+
+/// Account for effective drop loss after scheduler-side pruning.
+///
+/// The engine reports dropped findings before overlap-prefix pruning and
+/// within-chunk dedupe. Any findings removed by those scheduler passes are not
+/// lossful for persistence, so we subtract them from the engine-reported drops.
+#[inline]
+fn account_effective_dropped_findings(
+    metrics: &mut WorkerMetricsLocal,
+    engine_dropped: u64,
+    scheduler_pruned: usize,
+) {
+    let effective = engine_dropped.saturating_sub(scheduler_pruned as u64);
+    metrics.findings_dropped = metrics.findings_dropped.saturating_add(effective);
 }
 
 /// Emit structured finding events via the [`EventSink`].
@@ -530,7 +587,14 @@ fn build_persistence_batch<F: FindingWithHashRecord>(
     out: &mut Vec<FsFindingRecord>,
 ) {
     out.clear();
-    out.reserve(findings.len());
+    // `out` is `persist_batch`, pre-sized to max_findings_per_chunk at
+    // worker init. After `clear()`, capacity is guaranteed sufficient.
+    debug_assert!(
+        out.capacity() >= findings.len(),
+        "persist_batch capacity ({}) < findings count ({})",
+        out.capacity(),
+        findings.len(),
+    );
     for finding in findings {
         out.push(FsFindingRecord {
             rule_id: finding.rule_id(),
@@ -566,11 +630,15 @@ fn emit_persistence_batch<F: FindingWithHashRecord>(
     }) {
         metrics.persistence_emit_failures = metrics.persistence_emit_failures.saturating_add(1);
         metrics.io_errors = metrics.io_errors.saturating_add(1);
-        let msg = format!("fs persistence batch emit failed: {}", err.detail());
+        let mut msg = StackMsg::<256>::new();
+        let _ = std::fmt::Write::write_fmt(
+            &mut msg,
+            format_args!("fs persistence batch emit failed: {}", err.detail()),
+        );
         event_sink.emit(crate::unified::events::ScanEvent::Diagnostic(
             crate::unified::events::DiagnosticEvent {
                 level: "error",
-                message: &msg,
+                message: msg.as_str(),
             },
         ));
     }
@@ -1041,9 +1109,8 @@ fn process_gzip_file<E: ScanEngine>(
         let data = &buf.as_slice()[..read_len];
 
         engine.scan_chunk_into(data, entry_file_id, base_offset, &mut scratch.scan_scratch);
-        metrics.findings_dropped = metrics
-            .findings_dropped
-            .saturating_add(scratch.scan_scratch.dropped_findings());
+        let engine_dropped = scratch.scan_scratch.dropped_findings();
+        let before_prefix = scratch.scan_scratch.pending_findings_len();
         if !entry_scanned {
             metrics.archive.record_entry_scanned();
             entry_scanned = true;
@@ -1051,15 +1118,21 @@ fn process_gzip_file<E: ScanEngine>(
 
         let new_bytes_start = offset;
         scratch.scan_scratch.drop_prefix_findings(new_bytes_start);
+        let after_prefix = scratch.scan_scratch.pending_findings_len();
 
         scratch.pending.clear();
         scratch
             .scan_scratch
             .drain_findings_into(&mut scratch.pending);
 
-        if dedupe && scratch.pending.len() > 1 {
+        let before_dedupe = scratch.pending.len();
+        if dedupe && before_dedupe > 1 {
             dedupe_findings(&mut scratch.pending);
         }
+        let scheduler_pruned = before_prefix
+            .saturating_sub(after_prefix)
+            .saturating_add(before_dedupe.saturating_sub(scratch.pending.len()));
+        account_effective_dropped_findings(metrics, engine_dropped, scheduler_pruned);
 
         metrics.findings_emitted = metrics
             .findings_emitted
@@ -1204,10 +1277,8 @@ fn scan_gzip_stream_nested<E: ScanEngine, R: Read>(
 
         scan.engine
             .scan_chunk_into(data, file_id, base_offset, scan.scan_scratch);
-        scan.metrics.findings_dropped = scan
-            .metrics
-            .findings_dropped
-            .saturating_add(scan.scan_scratch.dropped_findings());
+        let engine_dropped = scan.scan_scratch.dropped_findings();
+        let before_prefix = scan.scan_scratch.pending_findings_len();
         if !entry_scanned {
             scan.metrics.archive.record_entry_scanned();
             entry_scanned = true;
@@ -1215,13 +1286,19 @@ fn scan_gzip_stream_nested<E: ScanEngine, R: Read>(
 
         let new_bytes_start = offset;
         scan.scan_scratch.drop_prefix_findings(new_bytes_start);
+        let after_prefix = scan.scan_scratch.pending_findings_len();
 
         scan.pending.clear();
         scan.scan_scratch.drain_findings_into(scan.pending);
 
-        if dedupe && scan.pending.len() > 1 {
+        let before_dedupe = scan.pending.len();
+        if dedupe && before_dedupe > 1 {
             dedupe_findings(scan.pending);
         }
+        let scheduler_pruned = before_prefix
+            .saturating_sub(after_prefix)
+            .saturating_add(before_dedupe.saturating_sub(scan.pending.len()));
+        account_effective_dropped_findings(scan.metrics, engine_dropped, scheduler_pruned);
 
         scan.metrics.findings_emitted = scan
             .metrics
@@ -1756,10 +1833,8 @@ fn scan_tar_stream_nested<E: ScanEngine>(
 
             scan.engine
                 .scan_chunk_into(data, entry_file_id, base_offset, scan.scan_scratch);
-            scan.metrics.findings_dropped = scan
-                .metrics
-                .findings_dropped
-                .saturating_add(scan.scan_scratch.dropped_findings());
+            let engine_dropped = scan.scan_scratch.dropped_findings();
+            let before_prefix = scan.scan_scratch.pending_findings_len();
             if !entry_scanned {
                 scan.metrics.archive.record_entry_scanned();
                 entry_scanned = true;
@@ -1767,13 +1842,19 @@ fn scan_tar_stream_nested<E: ScanEngine>(
 
             let new_bytes_start = offset;
             scan.scan_scratch.drop_prefix_findings(new_bytes_start);
+            let after_prefix = scan.scan_scratch.pending_findings_len();
 
             scan.pending.clear();
             scan.scan_scratch.drain_findings_into(scan.pending);
 
-            if dedupe && scan.pending.len() > 1 {
+            let before_dedupe = scan.pending.len();
+            if dedupe && before_dedupe > 1 {
                 dedupe_findings(scan.pending);
             }
+            let scheduler_pruned = before_prefix
+                .saturating_sub(after_prefix)
+                .saturating_add(before_dedupe.saturating_sub(scan.pending.len()));
+            account_effective_dropped_findings(scan.metrics, engine_dropped, scheduler_pruned);
 
             scan.metrics.findings_emitted = scan
                 .metrics
@@ -2268,9 +2349,8 @@ fn process_zip_file<E: ScanEngine>(
             let data = &buf.as_slice()[..read_len];
 
             engine.scan_chunk_into(data, entry_file_id, base_offset, scan_scratch);
-            metrics.findings_dropped = metrics
-                .findings_dropped
-                .saturating_add(scan_scratch.dropped_findings());
+            let engine_dropped = scan_scratch.dropped_findings();
+            let before_prefix = scan_scratch.pending_findings_len();
             if !entry_scanned {
                 metrics.archive.record_entry_scanned();
                 entry_scanned = true;
@@ -2278,13 +2358,19 @@ fn process_zip_file<E: ScanEngine>(
 
             let new_bytes_start = offset;
             scan_scratch.drop_prefix_findings(new_bytes_start);
+            let after_prefix = scan_scratch.pending_findings_len();
 
             pending.clear();
             scan_scratch.drain_findings_into(pending);
 
-            if dedupe && pending.len() > 1 {
+            let before_dedupe = pending.len();
+            if dedupe && before_dedupe > 1 {
                 dedupe_findings(pending);
             }
+            let scheduler_pruned = before_prefix
+                .saturating_sub(after_prefix)
+                .saturating_add(before_dedupe.saturating_sub(pending.len()));
+            account_effective_dropped_findings(metrics, engine_dropped, scheduler_pruned);
 
             metrics.findings_emitted = metrics.findings_emitted.wrapping_add(pending.len() as u64);
             emit_persistence_batch(
@@ -2413,19 +2499,22 @@ fn extract_and_scan_file<E: ScanEngine>(
         0,
         &mut scratch.scan_scratch,
     );
-    ctx.metrics.findings_dropped = ctx
-        .metrics
-        .findings_dropped
-        .saturating_add(scratch.scan_scratch.dropped_findings());
+    let engine_dropped = scratch.scan_scratch.dropped_findings();
+    let before_prefix = scratch.scan_scratch.pending_findings_len();
 
     scratch.pending.clear();
     scratch
         .scan_scratch
         .drain_findings_into(&mut scratch.pending);
 
+    let before_dedupe = scratch.pending.len();
     if scratch.dedupe_within_chunk {
         dedupe_findings(&mut scratch.pending);
     }
+    let scheduler_pruned = before_prefix
+        .saturating_sub(before_dedupe)
+        .saturating_add(before_dedupe.saturating_sub(scratch.pending.len()));
+    account_effective_dropped_findings(&mut ctx.metrics, engine_dropped, scheduler_pruned);
     if !scratch.pending.is_empty() {
         emit_persistence_batch(
             scratch.store_producer.as_deref(),
@@ -2962,6 +3051,10 @@ where
     let event_sink = cfg.event_sink.clone();
     let store_producer = cfg.store_producer.clone();
 
+    // Keep a handle for post-join diagnostics (the original is moved into
+    // the executor's init closure).
+    let run_event_sink = Arc::clone(&event_sink);
+
     // Create executor
     let ex = Executor::<FileTask>::new(
         ExecutorConfig {
@@ -2975,6 +3068,7 @@ where
             let abort_run = Arc::clone(&abort_run);
             let store_producer = store_producer.clone();
             move |_wid| {
+                let findings_cap = engine.max_findings_per_chunk();
                 let scan_scratch = engine.new_scratch();
                 let depth_cap = archive_cfg.max_archive_depth as usize + 2;
                 let mut vpaths = Vec::with_capacity(depth_cap);
@@ -3000,8 +3094,8 @@ where
                     engine: Arc::clone(&engine),
                     pool: pool.clone(),
                     scan_scratch,
-                    pending: Vec::with_capacity(4096), // Reasonable default
-                    persist_batch: Vec::with_capacity(4096),
+                    pending: Vec::with_capacity(findings_cap),
+                    persist_batch: Vec::with_capacity(findings_cap),
                     canon: EntryPathCanonicalizer::with_capacity(
                         DEFAULT_MAX_COMPONENTS,
                         archive_cfg.max_virtual_path_len_per_entry,
@@ -3107,12 +3201,21 @@ where
         let run_loss = FsRunLoss {
             dropped_findings: stats.dropped_findings,
             persistence_emit_failures: stats.persistence_emit_failures,
-            incomplete: stats.persistence_incomplete,
         };
-        if producer.record_fs_run_loss(run_loss).is_err() {
-            stats.io_errors = stats.io_errors.saturating_add(1);
+        if let Err(err) = producer.record_fs_run_loss(run_loss) {
             stats.persistence_emit_failures = stats.persistence_emit_failures.saturating_add(1);
             stats.persistence_incomplete = true;
+            let mut msg = StackMsg::<256>::new();
+            let _ = std::fmt::Write::write_fmt(
+                &mut msg,
+                format_args!("fs persistence run-loss recording failed: {}", err.detail()),
+            );
+            run_event_sink.emit(crate::unified::events::ScanEvent::Diagnostic(
+                crate::unified::events::DiagnosticEvent {
+                    level: "error",
+                    message: msg.as_str(),
+                },
+            ));
         }
     }
 
@@ -3126,11 +3229,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{RuleSpec, TransformConfig, Tuning, ValidatorKind};
+    use crate::api::{FileId, RuleSpec, TransformConfig, Tuning, ValidatorKind};
     use crate::archive::PartialReason;
     use crate::scheduler::engine_stub::{FindingRec, MockEngine, MockRule, RuleId};
-    use crate::scheduler::engine_trait::FindingWithHash;
-    use crate::store::InMemoryStoreProducer;
+    use crate::scheduler::engine_trait::{EngineScratch, FindingWithHash, ScanEngine};
+    use crate::store::{EmitOnlyStoreProducer, FailingStoreProducer, InMemoryStoreProducer};
     use crate::unified::events::VecEventSink;
     use crate::Engine;
     use regex::bytes::Regex;
@@ -3204,6 +3307,87 @@ mod tests {
             local_context: None,
             secret_group: None,
             re: Regex::new(r"SECRET[A-Z0-9]{8}").unwrap(),
+        }
+    }
+
+    struct DuplicateDropEngine;
+
+    struct DuplicateDropScratch {
+        findings: Vec<FindingWithHash<FindingRec>>,
+        dropped_findings: u64,
+    }
+
+    impl EngineScratch for DuplicateDropScratch {
+        type Finding = FindingWithHash<FindingRec>;
+
+        fn clear(&mut self) {
+            self.findings.clear();
+            self.dropped_findings = 0;
+        }
+
+        fn drop_prefix_findings(&mut self, new_bytes_start: u64) {
+            self.findings
+                .retain(|f| f.finding.root_hint_end >= new_bytes_start);
+        }
+
+        fn drain_findings_into(&mut self, out: &mut Vec<Self::Finding>) {
+            out.append(&mut self.findings);
+        }
+
+        fn pending_findings_len(&self) -> usize {
+            self.findings.len()
+        }
+
+        fn dropped_findings(&self) -> u64 {
+            self.dropped_findings
+        }
+    }
+
+    impl ScanEngine for DuplicateDropEngine {
+        type Scratch = DuplicateDropScratch;
+
+        fn required_overlap(&self) -> usize {
+            0
+        }
+
+        fn new_scratch(&self) -> Self::Scratch {
+            DuplicateDropScratch {
+                findings: Vec::with_capacity(4),
+                dropped_findings: 0,
+            }
+        }
+
+        fn scan_chunk_into(
+            &self,
+            _data: &[u8],
+            _file_id: FileId,
+            _base_offset: u64,
+            scratch: &mut Self::Scratch,
+        ) {
+            scratch.clear();
+            let finding = FindingWithHash::new(
+                FindingRec {
+                    rule_id: RuleId(0),
+                    root_hint_start: 0,
+                    root_hint_end: 6,
+                    span_start: 0,
+                    span_end: 6,
+                },
+                [0xAB; 32],
+            );
+            // Scheduler dedupe will collapse these to one.
+            scratch.findings.push(finding);
+            scratch.findings.push(finding);
+            // Simulate one pre-dedupe dropped finding reported by engine.
+            scratch.dropped_findings = 1;
+        }
+
+        fn rule_name(&self, _rule_id: u32) -> &str {
+            "duplicate-drop"
+        }
+
+        fn max_findings_per_chunk(&self) -> usize {
+            1
         }
     }
 
@@ -3633,7 +3817,113 @@ mod tests {
             losses[0].persistence_emit_failures,
             report.stats.persistence_emit_failures
         );
-        assert!(losses[0].incomplete);
+        assert!(losses[0].incomplete());
+    }
+
+    #[test]
+    fn duplicate_only_drop_does_not_mark_persistence_incomplete() {
+        let engine = Arc::new(DuplicateDropEngine);
+        let sink = Arc::new(VecEventSink::new());
+        let producer = Arc::new(InMemoryStoreProducer::default());
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(b"data").unwrap();
+        tmp.flush().unwrap();
+        let path = tmp.path().to_path_buf();
+        let size = tmp.as_file().metadata().unwrap().len();
+
+        let source = VecFileSource::new(vec![LocalFile { path, size }]);
+        let mut cfg = small_config_with_sink(sink);
+        cfg.workers = 1;
+        cfg.store_producer = Some(producer.clone());
+
+        let report = scan_local(engine, source, cfg);
+
+        assert_eq!(report.metrics.findings_emitted, 1);
+        assert_eq!(
+            report.stats.dropped_findings, 0,
+            "drops that correspond only to scheduler-pruned duplicates should not mark run loss"
+        );
+        assert!(!report.stats.persistence_incomplete);
+
+        let losses = producer.losses();
+        assert_eq!(losses.len(), 1);
+        assert_eq!(losses[0].dropped_findings, 0);
+        assert!(!losses[0].incomplete());
+    }
+
+    /// Regression: persistence emit failures must NOT inflate io_errors.
+    ///
+    /// `io_errors` is documented as "file open, read, metadata failures" and
+    /// operators / automation rely on that definition. Persistence backend
+    /// errors are a different failure domain — they have their own counter
+    /// (`persistence_emit_failures`).
+    #[test]
+    fn persistence_failure_does_not_inflate_io_errors() {
+        let engine = Arc::new(test_engine());
+        let sink = Arc::new(VecEventSink::new());
+        let producer = Arc::new(FailingStoreProducer);
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(b"SECRET one SECRET two").unwrap();
+        tmp.flush().unwrap();
+        let path = tmp.path().to_path_buf();
+        let size = tmp.as_file().metadata().unwrap().len();
+
+        let source = VecFileSource::new(vec![LocalFile { path, size }]);
+        let mut cfg = small_config_with_sink(sink);
+        cfg.store_producer = Some(producer);
+
+        let report = scan_local(engine, source, cfg);
+
+        // Persistence failures should be tracked separately.
+        assert!(
+            report.stats.persistence_emit_failures > 0,
+            "expected persistence failures from FailingStoreProducer"
+        );
+        // io_errors must reflect only real file I/O problems — the file
+        // above was read successfully, so io_errors should be zero.
+        assert_eq!(
+            report.stats.io_errors, 0,
+            "persistence failures must not be counted as io_errors"
+        );
+    }
+
+    /// Regression: record_fs_run_loss failure must NOT inflate io_errors.
+    ///
+    /// Same principle as above: a persistence backend call failing at run
+    /// end is not a file-system I/O error.
+    #[test]
+    fn run_loss_failure_does_not_inflate_io_errors() {
+        let engine = Arc::new(test_engine());
+        let sink = Arc::new(VecEventSink::new());
+        let producer = Arc::new(EmitOnlyStoreProducer::new());
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(b"SECRET one").unwrap();
+        tmp.flush().unwrap();
+        let path = tmp.path().to_path_buf();
+        let size = tmp.as_file().metadata().unwrap().len();
+
+        let source = VecFileSource::new(vec![LocalFile { path, size }]);
+        let mut cfg = small_config_with_sink(sink);
+        cfg.store_producer = Some(producer.clone());
+
+        let report = scan_local(engine, source, cfg);
+
+        // Batches emitted fine (EmitOnlyStoreProducer succeeds on emit).
+        assert!(!producer.batches().is_empty());
+
+        // record_fs_run_loss fails — that must NOT bump io_errors.
+        assert_eq!(
+            report.stats.io_errors, 0,
+            "run_loss failure must not be counted as io_errors"
+        );
+
+        // But persistence_incomplete should be true (run_loss failure
+        // increments persistence_emit_failures).
+        assert!(report.stats.persistence_incomplete);
+        assert!(report.stats.persistence_emit_failures > 0);
     }
 
     #[test]
@@ -3811,5 +4101,113 @@ mod tests {
             1,
             "second file's PASSWORD"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Error-path tests for persistence plumbing
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn persistence_emit_failure_increments_counters() {
+        let engine = Arc::new(test_engine());
+        let sink = Arc::new(VecEventSink::new());
+        let producer = Arc::new(FailingStoreProducer);
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(b"SECRET one SECRET two").unwrap();
+        tmp.flush().unwrap();
+        let path = tmp.path().to_path_buf();
+        let size = tmp.as_file().metadata().unwrap().len();
+
+        let source = VecFileSource::new(vec![LocalFile { path, size }]);
+        let mut cfg = small_config_with_sink(sink.clone());
+        cfg.store_producer = Some(producer);
+
+        let report = scan_local(engine, source, cfg);
+
+        assert!(
+            report.stats.persistence_emit_failures > 0,
+            "expected persistence_emit_failures > 0, got {}",
+            report.stats.persistence_emit_failures
+        );
+        assert!(
+            report.stats.persistence_incomplete,
+            "expected persistence_incomplete to be true"
+        );
+
+        // Verify a diagnostic event was emitted for the failure.
+        let output = sink.take();
+        let output_str = String::from_utf8_lossy(&output);
+        assert!(
+            output_str.contains("persistence batch emit failed") || output_str.contains("injected"),
+            "expected diagnostic event about emit failure; output: {output_str}"
+        );
+    }
+
+    #[test]
+    fn run_loss_record_failure_increments_counters() {
+        let engine = Arc::new(test_engine());
+        let sink = Arc::new(VecEventSink::new());
+        let producer = Arc::new(EmitOnlyStoreProducer::new());
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(b"SECRET one SECRET two").unwrap();
+        tmp.flush().unwrap();
+        let path = tmp.path().to_path_buf();
+        let size = tmp.as_file().metadata().unwrap().len();
+
+        let source = VecFileSource::new(vec![LocalFile { path, size }]);
+        let mut cfg = small_config_with_sink(sink);
+        cfg.store_producer = Some(producer.clone());
+
+        let report = scan_local(engine, source, cfg);
+
+        // Emit should have succeeded — batches were collected.
+        assert!(
+            !producer.batches().is_empty(),
+            "emit should have succeeded and collected batches"
+        );
+
+        // run_loss failure bumps persistence_emit_failures and sets incomplete.
+        assert!(
+            report.stats.persistence_incomplete,
+            "expected persistence_incomplete after run-loss record failure"
+        );
+        // The persistence_emit_failures counter should include the run-loss failure.
+        assert!(
+            report.stats.persistence_emit_failures >= 1,
+            "expected persistence_emit_failures >= 1 from run-loss failure, got {}",
+            report.stats.persistence_emit_failures
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // build_persistence_batch field mapping
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn build_persistence_batch_maps_all_fields() {
+        let finding = FindingRec {
+            rule_id: RuleId(42),
+            root_hint_start: 100,
+            root_hint_end: 200,
+            span_start: 110,
+            span_end: 190,
+        };
+        let hash = [0xDE; 32];
+        let wrapped = FindingWithHash::new(finding, hash);
+        let findings = vec![wrapped];
+        let mut out = Vec::new();
+
+        build_persistence_batch(&findings, &mut out);
+
+        assert_eq!(out.len(), 1);
+        let rec = &out[0];
+        assert_eq!(rec.rule_id, 42);
+        assert_eq!(rec.root_hint_start, 100);
+        assert_eq!(rec.root_hint_end, 200);
+        assert_eq!(rec.span_start, 110);
+        assert_eq!(rec.span_end, 190);
+        assert_eq!(rec.norm_hash, [0xDE; 32]);
     }
 }

@@ -109,6 +109,7 @@ fn run_fs(
         ..Default::default()
     };
     if cfg.persist_findings {
+        eprintln!("WARNING: --persist-findings enabled but no persistence backend configured; findings will not be persisted");
         ps_config.store_producer = Some(Arc::new(NullStoreProducer) as Arc<dyn StoreProducer>);
     }
     if cfg.no_archives {

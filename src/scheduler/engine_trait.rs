@@ -130,8 +130,8 @@ pub trait FindingWithHashRecord: FindingRecord {
 ///
 /// # Hash Semantics
 ///
-/// `norm_hash` is a SHA-256 digest of the *normalized* secret text (whitespace-
-/// stripped, case-folded, etc.). Two findings with the same `norm_hash` matched
+/// `norm_hash` is a BLAKE3 digest of the *normalized* secret text (whitespace-
+/// collapsed, case-folded). Two findings with the same `norm_hash` matched
 /// the same logical secret, even if their byte spans differ due to surrounding
 /// context or transform chains. Real engine adapters carry the engine-computed
 /// hash; mock adapters may use a deterministic placeholder hash.
@@ -139,7 +139,7 @@ pub trait FindingWithHashRecord: FindingRecord {
 pub struct FindingWithHash<F: FindingRecord> {
     /// Underlying engine finding record.
     pub finding: F,
-    /// SHA-256 of the normalized secret.
+    /// BLAKE3 digest of the normalized secret.
     pub norm_hash: NormHash,
 }
 
@@ -244,6 +244,14 @@ pub trait EngineScratch: Send + 'static {
     /// when possible (e.g., `Vec::append` or `drain(..)` into `out`).
     fn drain_findings_into(&mut self, out: &mut Vec<Self::Finding>);
 
+    /// Current number of pending findings held by scratch.
+    ///
+    /// Used by the scheduler to account for overlap/prefix pruning before
+    /// drain. Implementations without efficient access can use the default.
+    fn pending_findings_len(&self) -> usize {
+        0
+    }
+
     /// Count of findings dropped by engine per-scan caps.
     ///
     /// Default implementation returns 0 for engines without drop accounting.
@@ -313,6 +321,13 @@ pub trait ScanEngine: Send + Sync + 'static {
     ///
     /// Used for output formatting. Returns `"<unknown-rule>"` for invalid IDs.
     fn rule_name(&self, rule_id: u32) -> &str;
+
+    /// Hard cap on findings per chunk scan.
+    ///
+    /// Used by the scheduler to pre-size per-worker buffers so that no
+    /// allocations occur after startup. The engine enforces this cap
+    /// internally; the scheduler trusts the value for capacity planning.
+    fn max_findings_per_chunk(&self) -> usize;
 }
 
 #[cfg(test)]

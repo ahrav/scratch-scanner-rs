@@ -12,6 +12,8 @@ pub mod fs;
 pub mod identity;
 pub mod keys;
 
+#[cfg(test)]
+pub(crate) use fs::{EmitOnlyStoreProducer, FailingStoreProducer};
 pub use fs::{
     FsFindingBatch, FsFindingRecord, FsRunLoss, FsStoreError, InMemoryStoreProducer,
     NullStoreProducer, OwnedFsFindingBatch, StoreProducer,
