@@ -874,6 +874,50 @@ fn derived_confirm_all_is_compiled() {
 }
 
 #[test]
+fn value_suppressor_gate_is_compiled_and_indexed() {
+    const ANCHORS: &[&[u8]] = &[b"TOK_"];
+    const SUPPRESSORS: &[&[u8]] = &[b"EXAMPLE", b"DUMMY_TOKEN"];
+    let rule = RuleSpec {
+        name: "value-suppressor-gate",
+        anchors: ANCHORS,
+        radius: 16,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: Some(SUPPRESSORS),
+        entropy: None,
+        local_context: None,
+        secret_group: None,
+        re: Regex::new(r"TOK_[A-Za-z0-9]{8}").unwrap(),
+    };
+
+    let eng = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let compiled = &eng.rules_hot[0];
+    let idx = compiled
+        .value_suppressors
+        .expect("value suppressor gate index should be populated");
+    let suppressor_gate = eng
+        .value_suppressor_gate(Some(idx))
+        .expect("value suppressor gate should be accessible");
+    assert!(
+        std::ptr::eq(suppressor_gate, &eng.value_suppressor_gates[idx as usize]),
+        "rule gate index should point to the pooled value suppressor gate"
+    );
+    assert_eq!(
+        unpack_patterns(suppressor_gate),
+        vec![b"EXAMPLE".to_vec(), b"DUMMY_TOKEN".to_vec()]
+    );
+    assert!(eng.value_suppressor_gate(None).is_none());
+}
+
+#[test]
 fn entropy_gate_filters_low_entropy_matches() {
     const ANCHORS: &[&[u8]] = &[b"TOK_"];
     let rule = RuleSpec {

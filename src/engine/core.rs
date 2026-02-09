@@ -58,8 +58,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::helpers::u64_to_usize;
 use super::rule_repr::{
     add_pat_owned, add_pat_raw, compile_confirm_all, compile_rule, map_to_patterns, utf16be_bytes,
-    utf16le_bytes, ConfirmAllCompiled, EntropyCompiled, KeywordsCompiled, RuleCold, RuleCompiled,
-    Target, TwoPhaseCompiled, Variant,
+    utf16le_bytes, ConfirmAllCompiled, EntropyCompiled, KeywordsCompiled, PackedPatterns, RuleCold,
+    RuleCompiled, Target, TwoPhaseCompiled, Variant,
 };
 use super::scratch::{RootSpanMapCtx, ScanScratch};
 use super::transform::STREAM_DECODE_CHUNK_BYTES;
@@ -225,6 +225,9 @@ pub struct Engine {
     /// allowing gate data to be shared or deduplicated in the future.
     pub(super) confirm_all_gates: Vec<ConfirmAllCompiled>,
     pub(super) keyword_gates: Vec<KeywordsCompiled>,
+    // Read in Task 3 runtime gate path (`window_validate`).
+    #[allow(dead_code)]
+    pub(super) value_suppressor_gates: Vec<PackedPatterns>,
     pub(super) entropy_gates: Vec<EntropyCompiled>,
     pub(super) two_phase_gates: Vec<TwoPhaseCompiled>,
     pub(super) local_context_gates: Vec<crate::api::LocalContextSpec>,
@@ -376,6 +379,7 @@ impl Engine {
         // Compile rules and pool gate objects into Engine-owned vectors.
         let mut confirm_all_gates: Vec<ConfirmAllCompiled> = Vec::new();
         let mut keyword_gates: Vec<KeywordsCompiled> = Vec::new();
+        let mut value_suppressor_gates: Vec<PackedPatterns> = Vec::new();
         let mut entropy_gates: Vec<EntropyCompiled> = Vec::new();
         let mut two_phase_gates: Vec<TwoPhaseCompiled> = Vec::new();
         let mut local_context_gates: Vec<crate::api::LocalContextSpec> = Vec::new();
@@ -393,6 +397,11 @@ impl Engine {
                 debug_assert!(keyword_gates.len() <= u32::MAX as usize);
                 rule.keywords = Some(keyword_gates.len() as u32);
                 keyword_gates.push(kw);
+            }
+            if let Some(suppressors) = gates.value_suppressors {
+                debug_assert!(value_suppressor_gates.len() <= u32::MAX as usize);
+                rule.value_suppressors = Some(value_suppressor_gates.len() as u32);
+                value_suppressor_gates.push(suppressors);
             }
             if let Some(ent) = gates.entropy {
                 debug_assert!(entropy_gates.len() <= u32::MAX as usize);
@@ -906,6 +915,7 @@ impl Engine {
             tuning,
             confirm_all_gates,
             keyword_gates,
+            value_suppressor_gates,
             entropy_gates,
             two_phase_gates,
             local_context_gates,
@@ -967,6 +977,12 @@ impl Engine {
     #[inline(always)]
     pub(super) fn keyword_gate(&self, idx: Option<u32>) -> Option<&KeywordsCompiled> {
         idx.map(|i| &self.keyword_gates[i as usize])
+    }
+
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub(super) fn value_suppressor_gate(&self, idx: Option<u32>) -> Option<&PackedPatterns> {
+        idx.map(|i| &self.value_suppressor_gates[i as usize])
     }
 
     #[inline(always)]
