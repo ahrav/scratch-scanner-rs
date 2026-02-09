@@ -225,8 +225,7 @@ pub struct Engine {
     /// allowing gate data to be shared or deduplicated in the future.
     pub(super) confirm_all_gates: Vec<ConfirmAllCompiled>,
     pub(super) keyword_gates: Vec<KeywordsCompiled>,
-    // Read in Task 3 runtime gate path (`window_validate`).
-    #[allow(dead_code)]
+    // Accessed by runtime value-level suppression in `window_validate`.
     pub(super) value_suppressor_gates: Vec<PackedPatterns>,
     pub(super) entropy_gates: Vec<EntropyCompiled>,
     pub(super) two_phase_gates: Vec<TwoPhaseCompiled>,
@@ -980,7 +979,6 @@ impl Engine {
     }
 
     #[inline(always)]
-    #[allow(dead_code)]
     pub(super) fn value_suppressor_gate(&self, idx: Option<u32>) -> Option<&PackedPatterns> {
         idx.map(|i| &self.value_suppressor_gates[i as usize])
     }

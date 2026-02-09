@@ -918,6 +918,260 @@ fn value_suppressor_gate_is_compiled_and_indexed() {
 }
 
 #[test]
+fn value_suppressor_filters_matching_secret_in_raw_path() {
+    let rule = RuleSpec {
+        name: "value-suppressor-raw-filter",
+        anchors: &[b"TOK_"],
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: Some(&[b"EXAMPLE"]),
+        entropy: None,
+        local_context: None,
+        secret_group: Some(1),
+        re: Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let hay = b"prefix TOK_AEXAMPLE9 suffix";
+    let hits = scan_chunk_findings(&engine, hay);
+    assert!(
+        !hits.iter().any(|h| h.rule == "value-suppressor-raw-filter"),
+        "expected matching suppressor to prevent emission"
+    );
+}
+
+#[test]
+fn value_suppressor_passes_non_matching_secret_in_raw_path() {
+    let rule = RuleSpec {
+        name: "value-suppressor-raw-pass",
+        anchors: &[b"TOK_"],
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: Some(&[b"EXAMPLE"]),
+        entropy: None,
+        local_context: None,
+        secret_group: Some(1),
+        re: Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let hay = b"prefix TOK_LIVEKEY12 suffix";
+    let hits = scan_chunk_findings(&engine, hay);
+    assert!(
+        hits.iter().any(|h| h.rule == "value-suppressor-raw-pass"),
+        "expected non-matching suppressor to allow emission"
+    );
+}
+
+#[test]
+fn value_suppressor_any_match_filters_with_multiple_patterns() {
+    let rule = RuleSpec {
+        name: "value-suppressor-raw-multi",
+        anchors: &[b"TOK_"],
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: Some(&[b"DUMMY", b"EXAMPLE"]),
+        entropy: None,
+        local_context: None,
+        secret_group: Some(1),
+        re: Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let hay = b"TOK_LIVEKEY12 TOK_ZDUMMY99";
+    let hits = scan_chunk_findings(&engine, hay);
+    let kept = hits
+        .iter()
+        .filter(|h| h.rule == "value-suppressor-raw-multi")
+        .count();
+    assert_eq!(
+        kept, 1,
+        "expected exactly one finding: non-suppressed secret should pass, suppressed secret should be filtered"
+    );
+}
+
+#[test]
+fn value_suppressor_absent_does_not_change_behavior() {
+    let rule = RuleSpec {
+        name: "value-suppressor-none",
+        anchors: &[b"TOK_"],
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        local_context: None,
+        secret_group: Some(1),
+        re: Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let hay = b"prefix TOK_AEXAMPLE9 suffix";
+    let hits = scan_chunk_findings(&engine, hay);
+    assert!(
+        hits.iter().any(|h| h.rule == "value-suppressor-none"),
+        "expected finding when no suppressors are configured"
+    );
+}
+
+#[test]
+fn value_suppressor_applies_in_base64_stream_decode_raw_path() {
+    let rule = RuleSpec {
+        name: "value-suppressor-b64-raw",
+        anchors: &[b"SECRET_"],
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: Some(&[b"ABCD"]),
+        entropy: None,
+        local_context: None,
+        secret_group: Some(1),
+        re: Regex::new(r"SECRET_([A-Z]{4})").unwrap(),
+    };
+    let transforms = vec![TransformConfig {
+        id: TransformId::Base64,
+        mode: TransformMode::Always,
+        gate: Gate::AnchorsInDecoded,
+        min_len: 8,
+        max_spans_per_buffer: 8,
+        max_encoded_len: 1024,
+        max_decoded_bytes: 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    }];
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        transforms,
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let suppressed_hay = b64_encode(b"prefix SECRET_ABCD suffix");
+    let suppressed_hits = scan_chunk_findings(&engine, suppressed_hay.as_bytes());
+    assert!(
+        !suppressed_hits
+            .iter()
+            .any(|h| h.rule == "value-suppressor-b64-raw"),
+        "expected suppressor to filter match in decoded base64 stream"
+    );
+
+    let kept_hay = b64_encode(b"prefix SECRET_WXYZ suffix");
+    let kept_hits = scan_chunk_findings(&engine, kept_hay.as_bytes());
+    assert!(
+        kept_hits
+            .iter()
+            .any(|h| h.rule == "value-suppressor-b64-raw"),
+        "expected non-suppressed secret to emit in decoded base64 stream"
+    );
+}
+
+#[test]
+fn value_suppressor_applies_in_base64_stream_decode_utf16_path() {
+    let with_suppressor = RuleSpec {
+        name: "value-suppressor-b64-utf16",
+        anchors: &[b"TOK"],
+        radius: 0,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: Some(&[b"TOK"]),
+        entropy: None,
+        local_context: None,
+        secret_group: Some(0),
+        re: Regex::new("TOK").unwrap(),
+    };
+    let without_suppressor = RuleSpec {
+        value_suppressors_any: None,
+        ..with_suppressor.clone()
+    };
+    let tc = TransformConfig {
+        id: TransformId::Base64,
+        mode: TransformMode::Always,
+        gate: Gate::AnchorsInDecoded,
+        min_len: 8,
+        max_spans_per_buffer: 8,
+        max_encoded_len: 8 * 1024,
+        max_decoded_bytes: 8 * 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    };
+
+    let mut tuning = demo_tuning();
+    tuning.scan_utf16_variants = true;
+    tuning.max_total_decode_output_bytes = tuning.max_total_decode_output_bytes.max(8 * 1024);
+
+    let engine_with_suppressor = Engine::new_with_anchor_policy(
+        vec![with_suppressor],
+        vec![tc.clone()],
+        tuning.clone(),
+        AnchorPolicy::ManualOnly,
+    );
+    let engine_without_suppressor = Engine::new_with_anchor_policy(
+        vec![without_suppressor],
+        vec![tc],
+        tuning,
+        AnchorPolicy::ManualOnly,
+    );
+
+    let encoded_utf16 = b64_encode(&utf16be_bytes(b"TOK"));
+    let suppressed_hits = scan_chunk_findings(&engine_with_suppressor, encoded_utf16.as_bytes());
+    assert!(
+        !suppressed_hits
+            .iter()
+            .any(|h| h.rule == "value-suppressor-b64-utf16"),
+        "expected suppressor to filter UTF-16 decoded match"
+    );
+
+    let unsuppressed_hits =
+        scan_chunk_findings(&engine_without_suppressor, encoded_utf16.as_bytes());
+    assert!(
+        unsuppressed_hits
+            .iter()
+            .any(|h| h.rule == "value-suppressor-b64-utf16"),
+        "expected UTF-16 decoded match when suppressors are not configured"
+    );
+}
+
+#[test]
 fn entropy_gate_filters_low_entropy_matches() {
     const ANCHORS: &[&[u8]] = &[b"TOK_"];
     let rule = RuleSpec {
