@@ -165,21 +165,214 @@ pub trait StoreProducer: Send + Sync + 'static {
 
 ### Append-Log Backend (Phase C)
 
-When `--persist-findings` is enabled for FS scans, the orchestrator now wires
-`AppendLogStoreProducer` by default. Behavior:
+When `--persist-findings` is enabled for FS scans, the orchestrator wires
+`AppendLogStoreProducer` by default.
 
-- Writer runtime:
-  - Bounded MPSC ingestion with both batch-count and byte-budget limits.
-  - Explicit error on over-budget single frames (no silent drop).
-  - Single writer thread is the only mutator of segment files.
-- On-disk records:
-  - `RunStart`, `RuleDef`, `FindingBatch`, `RunEnd`.
-  - Frame header: `u32_le len`, `u32_le crc32`, `u8 frame_type`, payload.
-  - Rule definitions are emitted in fingerprint-sorted order for deterministic metadata ordering.
-- Segment lifecycle:
-  - Active segment is `segment-<seq>.open`.
-  - Rotation/finalize performs durable close (`sync_data`) and atomic rename to `.bin`.
-  - Reader/query paths consume finalized `.bin` segments only in MVP.
+#### Store Root Resolution
+
+The append-log root directory is resolved in this order:
+
+1. **`SCANNER_FS_LOG_DIR` env var** — used verbatim if set.
+2. **Sibling of scan root** — `<parent>/.<name>.scanner-rs-store` where
+   `<name>` is the scan root's directory name (sanitized for safe path chars).
+
+Example: scanning `/data/repos/myproject` creates
+`/data/repos/.myproject.scanner-rs-store/`.
+
+#### On-Disk Directory Layout
+
+```text
+<store_root>/
+  └── run-<hex_id>/
+        └── segments/
+              ├── segment-00000000000000000000.bin   ← finalized
+              ├── segment-00000000000000000001.bin   ← finalized
+              └── segment-00000000000000000002.open  ← active (only during scan)
+```
+
+- Each scan run gets its own `run-<hex_id>/` directory.
+- Segments use a 20-digit zero-padded sequence number.
+- Active segments have the `.open` extension; finalized segments have `.bin`.
+- After a clean shutdown, no `.open` files remain.
+- `list_finalized_segment_files()` walks `run-*/segments/segment-*.bin` in
+  lexical order and ignores `.open` files.
+
+#### Binary Frame Format
+
+Every record is wrapped in a self-describing frame with an 8-byte header:
+
+```text
+ byte:  0       4       8    9                     N
+        ┌───────┬───────┬────┬──────────────────────┐
+        │ len   │ CRC32 │type│      payload          │
+        │ u32le │ u32le │ u8 │   [len − 1] bytes     │
+        └───────┴───────┴────┴──────────────────────┘
+         header (8 B)         body (len bytes)
+```
+
+| Field | Bytes | Encoding | Description |
+|-------|-------|----------|-------------|
+| `frame_len` | 0–3 | `u32_le` | Byte count of type + payload (body excluding header). Always ≥ 1. |
+| `crc32` | 4–7 | `u32_le` | CRC-32/ISO-HDLC (polynomial `0x04C11DB7`, zlib-compatible) over the type byte + payload. Verified before any parsing. |
+| `type` | 8 | `u8` | `FrameType` discriminant: `1`=RunStart, `2`=RuleDef, `3`=FindingBatch, `4`=RunEnd. |
+| `payload` | 9+ | variable | Record-specific bytes. Variable-length fields are length-prefixed with `u32_le`. |
+
+Invariants:
+- All multi-byte integers are little-endian.
+- No inter-frame padding — segments are contiguous frame sequences.
+- Payload size hard cap: `DEFAULT_MAX_FRAME_PAYLOAD_BYTES` = **16 MB**.
+
+#### Record Type Layouts
+
+**RunStart** (frame type `1`) — emitted once at the start of each segment.
+
+```text
+offset  size   field
+  0     u16    version               (LOG_FORMAT_VERSION = 1)
+  2     u64    run_id
+ 10     u64    started_unix_ms
+ 18     u8     durability            (0 = SegmentClose, 1 = Batch)
+ 19     u8     correlation_mode      (0 = Persistent, 1 = Ephemeral)
+ 20     u8     key_source            (0 = EnvVar, 1 = Ephemeral)
+ 21     u32    max_inflight_batches
+ 25     u64    max_inflight_bytes
+ 33     u32    max_frame_payload_bytes
+                                     total: 37 bytes payload
+```
+
+**RuleDef** (frame type `2`) — one per loaded rule, emitted in ascending
+BLAKE3 fingerprint order for deterministic metadata.
+
+```text
+offset  size   field
+  0     u32    rule_id               (engine rule index, 0-based)
+  4     [32]   rule_fingerprint      (BLAKE3-keyed)
+ 36     u32    rule_name_len
+ 40     [N]    rule_name             (UTF-8, N = rule_name_len)
+                                     total: 40 + N bytes payload
+```
+
+**FindingBatch** (frame type `3`) — one per scanned object that produced
+findings.
+
+```text
+offset  size   field
+  0     u32    object_path_len
+  4     [P]    object_path           (raw bytes, P = object_path_len)
+4+P     u32    findings_count
+8+P     ...    findings[]            (findings_count × 132 bytes each)
+```
+
+Each finding record within the batch is fixed-size:
+
+```text
+offset  size   field
+  0     u32    rule_id
+  4     [32]   rule_fingerprint
+ 36     [32]   secret_hash           (BLAKE3 of normalized secret)
+ 68     [32]   finding_id            (deterministic occurrence ID)
+100     u64    root_hint_start       (dedup region start)
+108     u64    root_hint_end         (dedup region end, exclusive)
+116     u64    span_start            (matched secret start)
+124     u64    span_end              (matched secret end, exclusive)
+                                     total: 132 bytes per finding
+```
+
+**RunEnd** (frame type `4`) — final frame sealing the run.
+
+```text
+offset  size   field
+  0     u64    ended_unix_ms
+  8     u64    dropped_findings      (engine cap drops)
+ 16     u64    persistence_emit_failures
+ 24     u8     incomplete            (1 if any loss, 0 otherwise)
+                                     total: 25 bytes payload
+```
+
+#### Segment Content Ordering
+
+A well-formed segment follows a strict frame sequence:
+
+```text
+┌──────────────────────────────────────────────────────────────┐
+│  RunStart       (1 frame)                                    │
+├──────────────────────────────────────────────────────────────┤
+│  RuleDef        (N frames, sorted by fingerprint ascending)  │
+├──────────────────────────────────────────────────────────────┤
+│  FindingBatch   (M frames, one per scanned object)           │
+├──────────────────────────────────────────────────────────────┤
+│  RunEnd         (1 frame)                                    │
+└──────────────────────────────────────────────────────────────┘
+```
+
+The writer enforces this order. The reader decodes frames in whatever order
+they appear (no ordering validation).
+
+#### Segment Rotation
+
+Segments rotate when writing a frame would exceed `max_segment_bytes`
+(default **64 MB**):
+
+```text
+write_frame(data):
+    if bytes_written > 0 AND bytes_written + len(data) > max_segment_bytes:
+        sync_data()              ← flush to disk
+        rename .open → .bin      ← atomic finalization
+        sync_dir()               ← directory entry durable
+        open new .open (seq++)
+        bytes_written = 0
+    write data to current .open
+    bytes_written += len(data)
+```
+
+A single frame is never split across segments. Frames larger than
+`max_segment_bytes` are rejected outright.
+
+#### Durability Modes
+
+The `LogDurabilityMode` controls how often `sync_data()` (fdatasync) is
+called:
+
+| Mode | Discriminant | Behavior | Trade-off |
+|------|-------------|----------|-----------|
+| `SegmentClose` | `0` | `sync_data` only at segment rotation/finalize | Higher throughput; up to one segment of findings at risk on crash |
+| `Batch` | `1` | `sync_data` after every `FindingBatch` frame write | Lower throughput; at most one batch at risk on crash |
+
+Default: `SegmentClose`.
+
+#### Writer Configuration Defaults
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `max_inflight_batches` | 256 | Max queued finding-batch frames before backpressure blocks producers |
+| `max_inflight_bytes` | 64 MB | Max queued encoded bytes before backpressure blocks producers |
+| `max_segment_bytes` | 64 MB | Segment rotation threshold |
+| `max_frame_payload_bytes` | 16 MB | Hard cap on any single frame's payload |
+| `durability` | `SegmentClose` | fsync strategy |
+
+Validation rejects: any zero-valued budget, `max_inflight_batches` > `u32::MAX`
+(wire format limit), and `max_frame_payload_bytes` + 8 (header) >
+`max_segment_bytes` (a frame must fit in a segment).
+
+#### Backpressure
+
+Two budgets are enforced atomically on the producer side:
+
+```text
+Producer thread                       Writer thread
+───────────────                      ─────────────
+reserve_inflight(frame_bytes)
+  ├─ batches < 256 AND               write frame to disk
+  │  bytes < 64 MB?                  release_inflight()
+  │     YES → proceed                     │
+  │     NO  → block on Condvar  ◄─────────┘ notify_all()
+  ▼
+send frame on channel ──────────►  recv → write → release
+```
+
+- A single frame exceeding `max_inflight_bytes` is rejected immediately
+  (not silently dropped).
+- Blocked producers wait on a `Condvar`, not spin.
 
 ## Loss Accounting
 
@@ -242,6 +435,13 @@ The `--persist-findings` flag sets `FsScanConfig.persist_findings = true`,
 which causes the orchestrator to wire a `StoreProducer` into the
 `ParallelScanConfig`. The default producer is `AppendLogStoreProducer`, which
 writes run directories under the append-log root.
+
+#### Environment Variables
+
+| Variable | Purpose |
+|----------|---------|
+| `SCANNER_FS_LOG_DIR` | Override the append-log store root directory (takes precedence over the default sibling-of-scan-root path) |
+| `SCANNER_SECRET_KEY` | Stable secret key for BLAKE3-keyed identity hashes; if unset, an ephemeral key is generated (cross-run dedup disabled) |
 
 ### Wiring Path
 
