@@ -10,15 +10,15 @@
 //!  Scanner worker threads            Writer thread
 //!  ────────────────────             ──────────────
 //!  emit_fs_batch()                  ┌──────────────────────┐
-//!    ├─ encode finding frame        │ writer_thread_main()  │
-//!    ├─ reserve_inflight()  ──►     │  ├─ write RunStart    │
-//!    └─ send on channel    ──►      │  ├─ write RuleDefs    │
-//!                                   │  ├─ recv loop:        │
+//!    ├─ plan + reserve inflight ─►  │ writer_thread_main()  │
+//!    ├─ acquire pooled frame        │  ├─ write RunStart    │
+//!    ├─ encode finding frame        │  ├─ write RuleDefs    │
+//!    └─ send on channel    ──►      │  ├─ recv loop:        │
 //!  record_fs_run_loss()             │  │  write FindingFrame │
-//!    ├─ encode run-end frame        │  │  release_inflight() │
-//!    ├─ mark_closed()               │  └─ write RunEnd      │
-//!    ├─ send Finish cmd    ──►      │  └─ finalize segment  │
-//!    └─ join writer thread          └──────────────────────┘
+//!    ├─ encode run-end frame        │  │  recycle frame      │
+//!    ├─ send Finish cmd    ──►      │  │  release_inflight() │
+//!    └─ join writer thread          │  └─ write RunEnd + finalize
+//!                                   └──────────────────────┘
 //! ```
 //!
 //! # Backpressure
@@ -28,8 +28,8 @@
 //! - **Batch count** — caps the number of in-flight finding frames.
 //! - **Byte budget** — caps the total encoded bytes queued in the channel.
 //!
-//! The writer thread releases budget after each frame is written to disk,
-//! waking blocked producers via a [`Condvar`].
+//! The writer thread recycles each finding-frame buffer and releases budget
+//! after each frame write, waking blocked producers via a [`Condvar`].
 //!
 //! # Segment lifecycle
 //!
@@ -42,11 +42,13 @@ use super::format::{
     encode_record, FrameType, LogDurabilityMode, LogRecord, LogRuleDef, LogRunEnd, LogRunStart,
     DEFAULT_MAX_FRAME_PAYLOAD_BYTES, FRAME_HEADER_BYTES, LOG_FORMAT_VERSION,
 };
+use super::secret_cache::SecretHashCache;
 use crate::api::RuleSpec;
-use crate::store::identity::{rule_fingerprint, secret_hash};
+use crate::store::identity::rule_fingerprint;
 use crate::store::keys::StoreKeys;
 use crate::store::{FsFindingBatch, FsFindingRecord, FsRunLoss, FsStoreError, StoreProducer};
 use crossbeam_channel::{Receiver, Sender};
+use crossbeam_queue::ArrayQueue;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -63,11 +65,18 @@ const SEGMENT_BIN_EXT: &str = "bin";
 const FINDING_ID_DOMAIN: &[u8] = b"scanner.store.log.v1.finding_id";
 const FINDING_BATCH_BASE_PAYLOAD_BYTES: usize = 8; // object_path_len + findings_count
 const FINDING_RECORD_WIRE_BYTES: usize = 132;
+const FINDING_FRAME_POOL_MIN_CAPACITY: usize = 256;
+const FINDING_FRAME_POOL_DEFAULT_CAPACITY: usize = 4 * 1024;
 
 /// Environment override for FS append-log root directory.
 pub const SCANNER_FS_LOG_DIR_ENV: &str = "SCANNER_FS_LOG_DIR";
 
 /// Runtime configuration for [`AppendLogStoreProducer`].
+///
+/// All budget and size fields are validated at construction time by
+/// [`validate_config`]. The cross-field invariant
+/// `max_frame_payload_bytes + FRAME_HEADER_BYTES <= max_segment_bytes`
+/// is enforced so that no single frame can exceed a segment.
 #[derive(Clone, Debug)]
 pub struct LogWriterConfig {
     /// Store root directory that will contain `run-<id>/segments/*.bin`.
@@ -153,8 +162,13 @@ impl AppendLogStoreProducer {
         let run_start = build_run_start(&cfg, &keys, run_id);
 
         let shared = Arc::new(SharedState::default());
+        let finding_frame_pool = Arc::new(FindingFramePool::new(
+            cfg.max_inflight_batches,
+            finding_frame_pool_capacity_hint(&cfg),
+        ));
         let (tx, rx) = crossbeam_channel::bounded(cfg.max_inflight_batches.max(1));
         let thread_shared = Arc::clone(&shared);
+        let thread_pool = Arc::clone(&finding_frame_pool);
         let thread_cfg = cfg.clone();
         let writer_handle = std::thread::Builder::new()
             .name("scanner-rs-log-writer".to_string())
@@ -165,6 +179,7 @@ impl AppendLogStoreProducer {
                     run_id,
                     run_start,
                     rule_defs_sorted,
+                    &thread_pool,
                     &thread_shared,
                 ) {
                     set_terminal_error(&thread_shared, err);
@@ -185,6 +200,7 @@ impl AppendLogStoreProducer {
                 shared,
                 writer_handle: Mutex::new(Some(writer_handle)),
                 rule_fingerprints_by_id: rule_fingerprints_by_id.into_boxed_slice(),
+                finding_frame_pool,
             }),
         })
     }
@@ -201,24 +217,11 @@ impl AppendLogStoreProducer {
         &self.inner.cfg.root_dir
     }
 
-    /// Encode a [`FsFindingBatch`] directly into a framed wire buffer.
-    ///
-    /// Unlike `RunStart`/`RuleDef`/`RunEnd` frames (which go through
-    /// [`encode_record`]), finding frames are built inline here to avoid an
-    /// intermediate `LogFindingBatch` allocation. The hot path is:
-    ///
-    /// 1. Reserve a `Vec` with exact capacity (`FRAME_HEADER_BYTES + body`).
-    /// 2. Write a placeholder 8-byte header (filled in step 5).
-    /// 3. Stream the type byte, path, and per-finding fields while keeping a
-    ///    running CRC-32 in lockstep via [`frame_extend_crc`].
-    /// 4. Derive a deterministic `finding_id` per finding using a cloned
-    ///    BLAKE3 prefix hasher (amortises the object-path hash across the
-    ///    batch).
-    /// 5. Back-patch the header with `body_len` and `crc32`.
-    ///
-    /// The resulting buffer is ready for `SegmentWriter::write_frame` with no
-    /// further copies.
-    fn build_finding_frame(&self, batch: FsFindingBatch<'_>) -> Result<Vec<u8>, FsStoreError> {
+    /// Compute all finding-frame size checks before reserving inflight budget.
+    fn plan_finding_frame(
+        &self,
+        batch: FsFindingBatch<'_>,
+    ) -> Result<FindingFramePlan, FsStoreError> {
         let object_path_len = u32::try_from(batch.object_path.len()).map_err(|_| {
             FsStoreError::backend(format!(
                 "object_path too large: {} bytes",
@@ -250,10 +253,35 @@ impl AppendLogStoreProducer {
             .ok_or_else(|| FsStoreError::backend("finding frame body length overflow"))?;
         let body_len_u32 = u32::try_from(body_len)
             .map_err(|_| FsStoreError::backend("finding frame body exceeds u32::MAX"))?;
+        let frame_len = FRAME_HEADER_BYTES
+            .checked_add(body_len)
+            .ok_or_else(|| FsStoreError::backend("finding frame length overflow"))?;
 
-        // Encode directly into the framed buffer to avoid building an
-        // intermediate `LogFindingBatch` payload and re-copying it.
-        let mut frame = Vec::with_capacity(FRAME_HEADER_BYTES + body_len);
+        Ok(FindingFramePlan {
+            object_path_len,
+            findings_count_u32,
+            body_len,
+            body_len_u32,
+            frame_len,
+        })
+    }
+
+    /// Encode a [`FsFindingBatch`] directly into a pooled frame buffer.
+    ///
+    /// Unlike `RunStart`/`RuleDef`/`RunEnd` frames (which go through
+    /// [`encode_record`]), finding frames are built inline here to avoid an
+    /// intermediate `LogFindingBatch` allocation. The resulting buffer is
+    /// ready for `SegmentWriter::write_frame` with no further copies.
+    fn build_finding_frame(
+        &self,
+        batch: FsFindingBatch<'_>,
+        plan: FindingFramePlan,
+        frame: &mut Vec<u8>,
+    ) -> Result<(), FsStoreError> {
+        frame.clear();
+        if frame.capacity() < plan.frame_len {
+            frame.reserve(plan.frame_len - frame.capacity());
+        }
         frame.resize(FRAME_HEADER_BYTES, 0);
         let frame_type = FrameType::FindingBatch as u8;
         frame.push(frame_type);
@@ -261,16 +289,17 @@ impl AppendLogStoreProducer {
         let mut crc = crc32fast::Hasher::new();
         crc.update(&[frame_type]);
 
-        let path_len_bytes = object_path_len.to_le_bytes();
-        frame_extend_crc(&mut frame, &mut crc, &path_len_bytes);
-        frame_extend_crc(&mut frame, &mut crc, batch.object_path);
-        frame_extend_crc(&mut frame, &mut crc, &findings_count_u32.to_le_bytes());
+        let path_len_bytes = plan.object_path_len.to_le_bytes();
+        frame_extend_crc(frame, &mut crc, &path_len_bytes);
+        frame_extend_crc(frame, &mut crc, batch.object_path);
+        frame_extend_crc(frame, &mut crc, &plan.findings_count_u32.to_le_bytes());
 
         let finding_id_prefix = finding_id_prefix_hasher(
             self.inner.keys.metadata_key(),
-            object_path_len,
+            plan.object_path_len,
             batch.object_path,
         );
+        let mut secret_cache = SecretHashCache::new();
         for finding in batch.findings {
             let rule_idx = finding.rule_id as usize;
             let Some(rule_fp) = self.inner.rule_fingerprints_by_id.get(rule_idx) else {
@@ -279,25 +308,25 @@ impl AppendLogStoreProducer {
                     finding.rule_id
                 )));
             };
-            let secret = secret_hash(&finding.norm_hash, &self.inner.keys);
+            let secret = secret_cache.get_or_compute(&finding.norm_hash, &self.inner.keys);
             let finding_id = derive_finding_id(&finding_id_prefix, finding, rule_fp, &secret);
 
-            frame_extend_crc(&mut frame, &mut crc, &finding.rule_id.to_le_bytes());
-            frame_extend_crc(&mut frame, &mut crc, rule_fp);
-            frame_extend_crc(&mut frame, &mut crc, &secret);
-            frame_extend_crc(&mut frame, &mut crc, &finding_id);
-            frame_extend_crc(&mut frame, &mut crc, &finding.root_hint_start.to_le_bytes());
-            frame_extend_crc(&mut frame, &mut crc, &finding.root_hint_end.to_le_bytes());
-            frame_extend_crc(&mut frame, &mut crc, &finding.span_start.to_le_bytes());
-            frame_extend_crc(&mut frame, &mut crc, &finding.span_end.to_le_bytes());
+            frame_extend_crc(frame, &mut crc, &finding.rule_id.to_le_bytes());
+            frame_extend_crc(frame, &mut crc, rule_fp);
+            frame_extend_crc(frame, &mut crc, &secret);
+            frame_extend_crc(frame, &mut crc, &finding_id);
+            frame_extend_crc(frame, &mut crc, &finding.root_hint_start.to_le_bytes());
+            frame_extend_crc(frame, &mut crc, &finding.root_hint_end.to_le_bytes());
+            frame_extend_crc(frame, &mut crc, &finding.span_start.to_le_bytes());
+            frame_extend_crc(frame, &mut crc, &finding.span_end.to_le_bytes());
         }
 
         let crc32 = crc.finalize();
-        frame[..4].copy_from_slice(&body_len_u32.to_le_bytes());
+        frame[..4].copy_from_slice(&plan.body_len_u32.to_le_bytes());
         frame[4..FRAME_HEADER_BYTES].copy_from_slice(&crc32.to_le_bytes());
 
-        debug_assert_eq!(frame.len(), FRAME_HEADER_BYTES + body_len);
-        Ok(frame)
+        debug_assert_eq!(frame.len(), FRAME_HEADER_BYTES + plan.body_len);
+        Ok(())
     }
 
     /// Encode a `RunEnd` frame via the generic [`encode_record`] path.
@@ -363,14 +392,29 @@ impl AppendLogStoreProducer {
 }
 
 impl StoreProducer for AppendLogStoreProducer {
+    /// Encode and queue a finding batch for disk write.
+    ///
+    /// Steps: plan (compute sizes) → reserve inflight budget (may block) →
+    /// acquire pooled frame → encode inline → send to writer thread.
+    /// On any failure after reservation, the budget and buffer are released
+    /// before returning the error.
     fn emit_fs_batch(&self, batch: FsFindingBatch<'_>) -> Result<(), FsStoreError> {
         if batch.findings.is_empty() {
             return Ok(());
         }
 
-        let frame = self.build_finding_frame(batch)?;
-        let charge = frame.len();
+        let plan = self.plan_finding_frame(batch)?;
+        let charge = plan.frame_len;
+        // Reserve first so the number of concurrently held frame buffers
+        // remains bounded by inflight budgets.
         self.reserve_inflight(charge)?;
+
+        let mut frame = self.inner.finding_frame_pool.acquire(charge);
+        if let Err(err) = self.build_finding_frame(batch, plan, &mut frame) {
+            self.inner.finding_frame_pool.recycle(frame);
+            self.release_inflight(charge);
+            return Err(err);
+        }
 
         let flush_after = self.inner.cfg.durability == LogDurabilityMode::Batch;
         let msg = WriterCommand::FindingFrame {
@@ -378,8 +422,17 @@ impl StoreProducer for AppendLogStoreProducer {
             charge_bytes: charge,
             flush_after,
         };
-        if self.inner.tx.send(msg).is_err() {
-            self.release_inflight(charge);
+        if let Err(err) = self.inner.tx.send(msg) {
+            let WriterCommand::FindingFrame {
+                frame,
+                charge_bytes,
+                ..
+            } = err.0
+            else {
+                unreachable!("emit_fs_batch only sends FindingFrame")
+            };
+            self.inner.finding_frame_pool.recycle(frame);
+            self.release_inflight(charge_bytes);
             // The writer thread has exited — check for a terminal error
             // that explains why.
             return Err(terminal_result(&self.inner.shared)
@@ -391,6 +444,10 @@ impl StoreProducer for AppendLogStoreProducer {
         Ok(())
     }
 
+    /// Encode a `RunEnd` frame, send `Finish` to the writer, and join the
+    /// writer thread. The close signal is intentionally deferred to the
+    /// writer thread's exit so that blocked emitters can drain naturally
+    /// via `release_inflight` rather than receiving spurious "closed" errors.
     fn record_fs_run_loss(&self, loss: FsRunLoss) -> Result<(), FsStoreError> {
         let frame = self.build_run_end_frame(loss)?;
 
@@ -452,6 +509,7 @@ struct Inner {
     writer_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Index `[rule_id]` → 32-byte BLAKE3 fingerprint.
     rule_fingerprints_by_id: Box<[[u8; 32]]>,
+    finding_frame_pool: Arc<FindingFramePool>,
 }
 
 /// Producer ↔ writer synchronisation.
@@ -495,6 +553,103 @@ struct InflightState {
     terminal_error: Option<String>,
 }
 
+/// Precomputed finding-frame sizing metadata used by the hot path.
+///
+/// Built by `plan_finding_frame` so we can reserve inflight budget before
+/// encoding and avoid redundant length arithmetic.
+#[derive(Clone, Copy, Debug)]
+struct FindingFramePlan {
+    object_path_len: u32,
+    findings_count_u32: u32,
+    body_len: usize,
+    body_len_u32: u32,
+    frame_len: usize,
+}
+
+/// Bounded, reusable storage for encoded finding frames.
+///
+/// Producers acquire a `Vec<u8>`, encode directly into it, then transfer
+/// ownership to the writer thread through `WriterCommand::FindingFrame`.
+/// The writer recycles buffers after each write.
+struct FindingFramePool {
+    free: ArrayQueue<Vec<u8>>,
+    #[cfg(test)]
+    acquire_misses: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    grow_count: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    dropped_recycles: std::sync::atomic::AtomicU64,
+}
+
+impl FindingFramePool {
+    /// Create a pool with `slots` reusable buffers, each pre-allocated to
+    /// `prealloc_capacity` bytes. `slots` is clamped to at least 1.
+    fn new(slots: usize, prealloc_capacity: usize) -> Self {
+        let slots = slots.max(1);
+        let free = ArrayQueue::new(slots);
+        for _ in 0..slots {
+            // Startup seeding amortizes steady-state frame allocation churn.
+            let _ = free.push(Vec::with_capacity(prealloc_capacity));
+        }
+        Self {
+            free,
+            #[cfg(test)]
+            acquire_misses: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            grow_count: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            dropped_recycles: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Pop a buffer from the pool (or allocate a fresh one on miss), ensuring
+    /// at least `min_capacity` bytes of capacity. The returned `Vec` is empty.
+    #[inline]
+    #[allow(clippy::manual_unwrap_or_default)] // keep explicit fallback to bump test-only miss counter
+    fn acquire(&self, min_capacity: usize) -> Vec<u8> {
+        let mut frame = match self.free.pop() {
+            Some(frame) => frame,
+            None => {
+                #[cfg(test)]
+                self.acquire_misses
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Vec::new()
+            }
+        };
+        frame.clear();
+        if frame.capacity() < min_capacity {
+            #[cfg(test)]
+            self.grow_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            frame.reserve(min_capacity - frame.capacity());
+        }
+        frame
+    }
+
+    /// Return a buffer to the pool for reuse. If the pool is full the buffer
+    /// is silently dropped (capacity is bounded by the channel size).
+    #[inline]
+    fn recycle(&self, mut frame: Vec<u8>) {
+        frame.clear();
+        if self.free.push(frame).is_err() {
+            #[cfg(test)]
+            self.dropped_recycles
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    fn debug_counters(&self) -> (u64, u64, u64) {
+        (
+            self.acquire_misses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.grow_count.load(std::sync::atomic::Ordering::Relaxed),
+            self.dropped_recycles
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+}
+
 /// Messages sent from producer threads to the single writer thread.
 enum WriterCommand {
     /// A pre-encoded finding-batch frame ready for disk write.
@@ -515,8 +670,8 @@ enum WriterCommand {
 ///
 /// Writes frames in strict order: `RunStart` → `RuleDef`s (sorted by
 /// fingerprint) → finding frames from the channel → `RunEnd` on `Finish`.
-/// Each finding frame write releases its inflight budget, unblocking any
-/// producers waiting in `reserve_inflight`.
+/// Each finding frame write recycles its buffer and releases inflight budget,
+/// unblocking producers waiting in `reserve_inflight`.
 ///
 /// If the channel disconnects (producer dropped without `Finish`), the
 /// current segment is finalized best-effort without a `RunEnd` frame.
@@ -526,6 +681,7 @@ fn writer_thread_main(
     run_id: u64,
     run_start: LogRunStart,
     rule_defs_sorted: Vec<LogRuleDef>,
+    finding_frame_pool: &FindingFramePool,
     shared: &SharedState,
 ) -> Result<(), String> {
     let run_dir = cfg.root_dir.join(format!("{RUN_PREFIX}{run_id:016x}"));
@@ -568,6 +724,9 @@ fn writer_thread_main(
                 if let Some(delay) = cfg.write_delay {
                     std::thread::sleep(delay);
                 }
+                // Recycle before waking producers so newly-unblocked emitters
+                // can immediately reuse this buffer.
+                finding_frame_pool.recycle(frame);
                 release_inflight(shared, charge_bytes);
                 if let Err(err) = write_result {
                     return Err(format!("failed to write finding frame: {err}"));
@@ -612,6 +771,7 @@ struct SegmentWriter {
 }
 
 impl SegmentWriter {
+    /// Create the segments directory and open the first `.open` segment file.
     fn new(segments_dir: PathBuf, max_segment_bytes: u64) -> std::io::Result<Self> {
         fs::create_dir_all(&segments_dir)?;
         let (file, open_path) = open_segment_file(&segments_dir, 0)?;
@@ -625,6 +785,10 @@ impl SegmentWriter {
         })
     }
 
+    /// Append `frame` to the current segment, rotating first if the frame
+    /// would exceed `max_segment_bytes`. A single frame is never split
+    /// across segments. If `flush_after` is true, `sync_data` is called
+    /// after the write (used for per-batch durability).
     fn write_frame(&mut self, frame: &[u8], flush_after: bool) -> std::io::Result<()> {
         let frame_len = frame.len() as u64;
         if frame_len > self.max_segment_bytes {
@@ -656,10 +820,14 @@ impl SegmentWriter {
         Ok(())
     }
 
+    /// Finalize the current segment (sync + rename `.open` → `.bin`) and
+    /// consume the writer. Called once at the end of a run.
     fn finish(mut self) -> std::io::Result<()> {
         self.finalize_current()
     }
 
+    /// Sync the current segment's data, rename `.open` → `.bin`, and fsync
+    /// the directory. After this call the segment is durable on disk.
     fn finalize_current(&mut self) -> std::io::Result<()> {
         self.file.sync_data()?;
         let mut bin_path = self.open_path.clone();
@@ -787,6 +955,23 @@ fn validate_config(cfg: &LogWriterConfig) -> Result<(), FsStoreError> {
         ));
     }
     Ok(())
+}
+
+/// Startup hint for per-frame pooled `Vec<u8>` capacity.
+///
+/// Uses per-frame byte budget as a signal, then clamps to a conservative range
+/// to avoid large eager allocations while still covering common small frames.
+#[inline]
+fn finding_frame_pool_capacity_hint(cfg: &LogWriterConfig) -> usize {
+    let per_frame_budget = cfg
+        .max_inflight_bytes
+        .checked_div(cfg.max_inflight_batches.max(1))
+        .unwrap_or(0);
+    let max_frame_len = cfg.max_frame_payload_bytes as usize + FRAME_HEADER_BYTES;
+    per_frame_budget.min(max_frame_len).clamp(
+        FINDING_FRAME_POOL_MIN_CAPACITY,
+        FINDING_FRAME_POOL_DEFAULT_CAPACITY,
+    )
 }
 
 /// Append bytes to the frame payload while keeping CRC in lockstep.
@@ -1553,6 +1738,51 @@ mod tests {
     // ================================================================
 
     #[test]
+    fn finding_frame_pool_reuses_grown_buffers_after_warmup() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = LogWriterConfig::for_root(tmp.path().to_path_buf());
+        cfg.max_inflight_batches = 1;
+        cfg.max_inflight_bytes = 16 * 1024 * 1024;
+
+        let producer = AppendLogStoreProducer::new(&[simple_rule()], cfg).unwrap();
+        let findings: Vec<_> = (0..48u64).map(|i| sample_finding(0, i * 100)).collect();
+
+        // Warm up once so the pooled buffer can grow to this frame shape.
+        producer
+            .emit_fs_batch(FsFindingBatch {
+                object_path: b"warmup.txt",
+                findings: &findings,
+            })
+            .unwrap();
+
+        let before = producer.inner.finding_frame_pool.debug_counters();
+        for _ in 0..20 {
+            producer
+                .emit_fs_batch(FsFindingBatch {
+                    object_path: b"steady-state.txt",
+                    findings: &findings,
+                })
+                .unwrap();
+        }
+        let after = producer.inner.finding_frame_pool.debug_counters();
+
+        assert_eq!(
+            after.0, before.0,
+            "steady-state should not allocate new frame buffers (pool miss)"
+        );
+        assert_eq!(
+            after.1, before.1,
+            "steady-state should not grow pooled frame capacity"
+        );
+        assert_eq!(
+            after.2, before.2,
+            "steady-state should not drop recycled frame buffers"
+        );
+
+        producer.record_fs_run_loss(FsRunLoss::default()).unwrap();
+    }
+
+    #[test]
     fn byte_budget_backpressure_blocks_and_unblocks() {
         // Set max_inflight_bytes to allow exactly 1 frame with write delay.
         let tmp = TempDir::new().unwrap();
@@ -1565,13 +1795,13 @@ mod tests {
         // First, measure frame size.
         let producer_probe = AppendLogStoreProducer::new(&[simple_rule()], cfg.clone()).unwrap();
         let findings = vec![sample_finding(0, 0)];
-        let frame = producer_probe
-            .build_finding_frame(FsFindingBatch {
+        let frame_size = producer_probe
+            .plan_finding_frame(FsFindingBatch {
                 object_path: b"probe.txt",
                 findings: &findings,
             })
-            .unwrap();
-        let frame_size = frame.len();
+            .unwrap()
+            .frame_len;
         producer_probe
             .record_fs_run_loss(FsRunLoss::default())
             .unwrap();

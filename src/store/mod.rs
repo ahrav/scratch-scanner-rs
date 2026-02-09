@@ -34,6 +34,8 @@ pub use keys::{
     CorrelationMode, KeySource, RunModeMetadata, StoreKeys, SCANNER_SECRET_KEY_ENV,
     STORE_KEYS_VERSION,
 };
+#[cfg(feature = "bench")]
+pub use log::SecretHashCache;
 pub use log::{
     default_fs_log_root, list_finalized_segment_files, AppendLogStoreProducer, LogWriterConfig,
     SCANNER_FS_LOG_DIR_ENV,
