@@ -4,10 +4,12 @@
 
 The `scheduler::engine_trait` module defines a trait-based abstraction layer that decouples the scheduler from specific detection engine implementations. This abstraction enables the scheduler to work seamlessly with both **mock engines** (for testing) and **real production engines** (for actual secret scanning).
 
-The module exports three core traits:
+The module exports four core traits and one carrier type:
 - **`ScanEngine`** - The primary scanning interface
 - **`EngineScratch`** - Per-worker scratch state management
 - **`FindingRecord`** - Finding representation abstraction
+- **`FindingWithHashRecord`** - Extension of `FindingRecord` that carries normalized secret hash bytes
+- **`FindingWithHash<F>`** - Generic carrier type that bundles a finding with its `NormHash`
 
 This design allows the scheduler logic to remain engine-agnostic while supporting different underlying implementations with varying data types and behaviors.
 
@@ -81,9 +83,9 @@ collisions with real filesystem file IDs.
 
 ### Associated Type
 
-#### `type Finding: FindingRecord`
+#### `type Finding: FindingWithHashRecord`
 
-Specifies the finding type produced by this scratch. This associated type allows different engines to use their own finding representations while maintaining a common trait interface.
+Specifies the finding type produced by this scratch. The bound was elevated from `FindingRecord` to `FindingWithHashRecord` to ensure every finding carries a normalized secret hash for persistence plumbing. This associated type allows different engines to use their own finding representations while maintaining a common trait interface that includes hash access.
 
 ### Core Methods
 
@@ -115,9 +117,15 @@ Specifies the finding type produced by this scratch. This associated type allows
 
 **Purpose**: Transfers all remaining findings from the scratch to an output vector.
 
-**Contract**: This operation should avoid reallocation when possible (e.g., by swapping internal buffers). After draining, the scratch is logically empty but may retain allocated capacity.
+**Contract**: Findings are **appended** to `out`; the caller is responsible for clearing `out` beforehand if a fresh batch is desired. The scratch's internal finding buffer is empty after this call. Implementations should transfer ownership without extra allocation when possible (e.g., `Vec::append` or `drain(..)` into `out`).
 
 **Usage**: Called after processing each chunk to extract findings for output or further processing.
+
+#### `dropped_findings(&self) -> u64`
+
+**Purpose**: Returns the count of findings dropped by the engine due to per-scan capacity limits (e.g., `max_findings_per_chunk` tuning).
+
+**Contract**: Default implementation returns 0. Used for run-level loss accounting in persistence backends via `FsRunLoss`.
 
 ---
 
@@ -175,9 +183,62 @@ Findings use a two-level deduplication strategy:
    - Findings with `root_hint_end < new_bytes_start` are dropped
    - Prevents reporting the same finding multiple times across overlapping chunks
 
-2. **Within-Chunk Uniqueness** (`span` fields):
+2. **Within-Chunk Uniqueness** (`span` + `norm_hash` fields):
    - Two findings with the same `root_hint` but different spans are distinct
+   - Two findings at the same span but with different `norm_hash` values are preserved (different secrets at the same location)
    - Allows multiple matches or transformed variants of the same secret
+
+---
+
+## FindingWithHashRecord Trait
+
+### Purpose
+
+`FindingWithHashRecord` extends `FindingRecord` to carry normalized secret hash bytes alongside finding metadata. This trait enables persistence backends to deduplicate findings across runs without storing raw secret bytes.
+
+### Type Constraints
+
+Inherits all constraints from `FindingRecord` (`Clone`, `Send`, `'static`).
+
+### Required Method
+
+#### `norm_hash(&self) -> &NormHash`
+
+**Purpose**: Returns the BLAKE3 digest of the normalized (whitespace-collapsed, case-folded) secret value.
+
+**Semantics**: Two findings with the same `norm_hash` matched the same logical secret, even if their byte spans differ due to surrounding context or transform chains.
+
+**Usage**: Used by within-chunk dedup (as an additional dedup key), persistence batch construction, and cross-run deduplication in the store backend.
+
+---
+
+## FindingWithHash Carrier Type
+
+### Purpose
+
+`FindingWithHash<F: FindingRecord>` is a generic wrapper that bundles a finding record with its normalized secret hash. It implements both `FindingRecord` (delegating to the inner finding) and `FindingWithHashRecord` (returning the hash).
+
+### Structure
+
+```rust
+pub struct FindingWithHash<F: FindingRecord> {
+    pub finding: F,
+    pub norm_hash: NormHash,  // [u8; 32]
+}
+```
+
+### Why Bundle the Hash with the Finding?
+
+The engine computes a normalized hash of the matched secret at scan time (inside `scan_chunk_into`). This hash must travel with the finding through overlap dedup, within-chunk dedup, and final emission. Storing them in separate parallel vectors is fragile — any sort, filter, or drain would require coordinating two collections. Bundling into a single value type makes the 1:1 alignment structural and impossible to violate.
+
+### Implementations
+
+Both the real engine adapter and mock engine produce `FindingWithHash<F>` values:
+
+| Engine | `F` type | Hash source |
+|--------|----------|-------------|
+| Real (`engine_impl`) | `api::FindingRec` | Engine-computed BLAKE3 of normalized secret |
+| Mock (`engine_stub`) | `FindingRec` | Deterministic placeholder hash |
 
 ---
 
@@ -208,7 +269,8 @@ The traits bridge type differences between implementations:
 | Rule ID | `RuleId(u16)` | `u32` |
 | Span Offsets | `u64` | `u32` (exposed as `u64` via trait) |
 | Root Hint Offsets | `u64` | `u64` |
-| Finding Type | `FindingRec` | `api::FindingRec` |
+| Finding Type | `FindingWithHash<FindingRec>` | `FindingWithHash<api::FindingRec>` |
+| Norm Hash | Deterministic placeholder | Engine-computed BLAKE3 |
 | File ID in finding record | Not stored | `FileId` |
 | Decode step/provenance | Not stored | `StepId` |
 
