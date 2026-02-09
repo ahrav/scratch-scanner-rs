@@ -39,7 +39,7 @@ pub const LOG_FORMAT_VERSION: u16 = 1;
 /// Default hard cap for frame payload bytes.
 pub const DEFAULT_MAX_FRAME_PAYLOAD_BYTES: u32 = 16 * 1024 * 1024;
 
-const FRAME_HEADER_BYTES: usize = 8;
+pub(crate) const FRAME_HEADER_BYTES: usize = 8;
 
 /// Frame discriminants written on disk.
 ///
@@ -52,7 +52,7 @@ const FRAME_HEADER_BYTES: usize = 8;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum FrameType {
-    /// Run metadata emitted once at the start of every segment chain.
+    /// Run metadata emitted once at the start of every segment sequence.
     RunStart = 1,
     /// Declares one detection rule active during this run. Emitted in
     /// ascending `rule_fingerprint` order immediately after `RunStart`.
@@ -103,7 +103,7 @@ impl LogDurabilityMode {
 
 /// Run-start metadata frame.
 ///
-/// Written once at the beginning of a segment chain. Captures the writer
+/// Written once at the beginning of a segment sequence. Captures the writer
 /// configuration snapshot so that a reader can validate compatibility and
 /// reconstruct the backpressure parameters that were active during the run.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -637,7 +637,11 @@ fn decode_finding_batch(payload: &[u8]) -> Result<LogFindingBatch, FormatError> 
         .take_bytes(FrameType::FindingBatch, "object_path")?
         .to_vec();
     let count = c.take_u32(FrameType::FindingBatch, "findings_count")? as usize;
-    let mut findings = Vec::with_capacity(count);
+    // Each finding is at least 132 bytes on disk (see finding_record_on_disk_size_is_132_bytes).
+    // Cap pre-allocation to avoid OOM from malformed count fields.
+    const MIN_FINDING_BYTES: usize = 132;
+    let max_possible = c.remaining() / MIN_FINDING_BYTES;
+    let mut findings = Vec::with_capacity(count.min(max_possible));
     for _ in 0..count {
         let rule_id = c.take_u32(FrameType::FindingBatch, "rule_id")?;
         let rule_fingerprint = c.take_array_32(FrameType::FindingBatch, "rule_fingerprint")?;
@@ -869,12 +873,11 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::keys::STORE_KEYS_VERSION;
     use std::io::Cursor as IoCursor;
 
     fn sample_run_start() -> LogRunStart {
         LogRunStart {
-            version: STORE_KEYS_VERSION as u16,
+            version: LOG_FORMAT_VERSION,
             run_id: 42,
             started_unix_ms: 1234,
             durability: LogDurabilityMode::SegmentClose,
@@ -980,5 +983,399 @@ mod tests {
 
         let err = decode_record(&bytes, DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap_err();
         assert!(matches!(err, FormatError::CrcMismatch { .. }));
+    }
+
+    // ================================================================
+    // Codec edge cases
+    // ================================================================
+
+    #[test]
+    fn decode_truncated_header_various_lengths() {
+        // Byte slices of length 0..=8 should all fail with TruncatedHeader.
+        for len in 0..=8 {
+            let buf = vec![0u8; len];
+            let err = decode_record(&buf, DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap_err();
+            assert!(
+                matches!(err, FormatError::TruncatedHeader { .. }),
+                "len={len}: expected TruncatedHeader, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_frame_with_zero_frame_len() {
+        // Construct 9+ bytes with frame_len=0.
+        let mut buf = vec![0u8; 16];
+        // frame_len = 0 (first 4 bytes, already zero)
+        // crc = 0 (bytes 4-7, already zero)
+        // type + payload (bytes 8+)
+        buf[8] = 1; // RunStart type byte
+
+        let err = decode_record(&buf, DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap_err();
+        // frame_len=0 means body len < 9 (need at least 9 total), so TruncatedHeader
+        // Actually with our buffer size 16, the header check passes but
+        // decode_frame_body checks frame_len == 0 → InvalidFrameLength.
+        assert!(
+            matches!(err, FormatError::TruncatedHeader { .. } | FormatError::InvalidFrameLength { .. }),
+            "expected TruncatedHeader or InvalidFrameLength, got: {err}"
+        );
+    }
+
+    #[test]
+    fn decode_unknown_frame_type() {
+        // Craft valid-CRC frames with unknown type bytes.
+        for type_byte in [0u8, 5, 255] {
+            // Build a frame with the unknown type byte.
+            let payload = []; // empty payload
+            let frame_len: u32 = 1; // just the type byte
+
+            let mut crc = crc32fast::Hasher::new();
+            crc.update(&[type_byte]);
+            crc.update(&payload);
+            let crc32 = crc.finalize();
+
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&frame_len.to_le_bytes());
+            buf.extend_from_slice(&crc32.to_le_bytes());
+            buf.push(type_byte);
+
+            let err = decode_record(&buf, DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap_err();
+            assert!(
+                matches!(err, FormatError::UnknownFrameType { raw } if raw == type_byte),
+                "type_byte={type_byte}: expected UnknownFrameType, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_run_end_invalid_bool() {
+        // Craft a RunEnd frame where the `incomplete` byte = 2 (invalid bool).
+        let mut payload = Vec::new();
+        // ended_unix_ms
+        payload.extend_from_slice(&9999u64.to_le_bytes());
+        // dropped_findings
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        // persistence_emit_failures
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        // incomplete = 2 (invalid)
+        payload.push(2);
+
+        let type_byte = FrameType::RunEnd as u8;
+        let frame_len = (payload.len() + 1) as u32; // +1 for type byte
+
+        let mut body = vec![type_byte];
+        body.extend_from_slice(&payload);
+
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(&body);
+        let crc32 = crc.finalize();
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&frame_len.to_le_bytes());
+        buf.extend_from_slice(&crc32.to_le_bytes());
+        buf.extend_from_slice(&body);
+
+        let err = decode_record(&buf, DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap_err();
+        assert!(
+            matches!(err, FormatError::InvalidBool { field: "incomplete", value: 2 }),
+            "expected InvalidBool for incomplete=2, got: {err}"
+        );
+    }
+
+    #[test]
+    fn decode_run_start_invalid_durability() {
+        // Craft a RunStart frame where durability byte = 3 (invalid).
+        let mut payload = Vec::new();
+        // version
+        payload.extend_from_slice(&1u16.to_le_bytes());
+        // run_id
+        payload.extend_from_slice(&42u64.to_le_bytes());
+        // started_unix_ms
+        payload.extend_from_slice(&1234u64.to_le_bytes());
+        // durability = 3 (invalid)
+        payload.push(3);
+        // correlation_mode = 0 (valid)
+        payload.push(0);
+        // key_source = 0 (valid)
+        payload.push(0);
+        // max_inflight_batches
+        payload.extend_from_slice(&16u32.to_le_bytes());
+        // max_inflight_bytes
+        payload.extend_from_slice(&(1u64 << 20).to_le_bytes());
+        // max_frame_payload_bytes
+        payload.extend_from_slice(&DEFAULT_MAX_FRAME_PAYLOAD_BYTES.to_le_bytes());
+
+        let type_byte = FrameType::RunStart as u8;
+        let frame_len = (payload.len() + 1) as u32;
+
+        let mut body = vec![type_byte];
+        body.extend_from_slice(&payload);
+
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(&body);
+        let crc32 = crc.finalize();
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&frame_len.to_le_bytes());
+        buf.extend_from_slice(&crc32.to_le_bytes());
+        buf.extend_from_slice(&body);
+
+        let err = decode_record(&buf, DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap_err();
+        assert!(
+            matches!(err, FormatError::InvalidEnum { field: "durability", value: 3 }),
+            "expected InvalidEnum for durability=3, got: {err}"
+        );
+    }
+
+    #[test]
+    fn decode_finding_batch_trailing_bytes_rejected() {
+        // Encode a valid finding batch, then append extra bytes.
+        let rec = LogRecord::FindingBatch(sample_finding_batch());
+        let mut bytes = Vec::new();
+        encode_record(&rec, DEFAULT_MAX_FRAME_PAYLOAD_BYTES, &mut bytes).unwrap();
+
+        // Append extra bytes inside the frame (modify frame_len and recompute CRC).
+        // Read original frame_len.
+        let orig_frame_len =
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let new_frame_len = orig_frame_len + 2;
+
+        // Rebuild: take body, append 2 bytes, recompute CRC.
+        let mut body = bytes[FRAME_HEADER_BYTES..].to_vec();
+        body.push(0xDE);
+        body.push(0xAD);
+
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(&body);
+        let crc32 = crc.finalize();
+
+        let mut new_bytes = Vec::new();
+        new_bytes.extend_from_slice(&new_frame_len.to_le_bytes());
+        new_bytes.extend_from_slice(&crc32.to_le_bytes());
+        new_bytes.extend_from_slice(&body);
+
+        let err = decode_record(&new_bytes, DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FormatError::InvalidRecord {
+                    detail: "trailing bytes",
+                    ..
+                }
+            ),
+            "expected InvalidRecord with 'trailing bytes', got: {err}"
+        );
+    }
+
+    #[test]
+    fn finding_batch_with_zero_findings_roundtrips() {
+        let batch = LogFindingBatch {
+            object_path: b"empty-findings.txt".to_vec(),
+            findings: vec![],
+        };
+        let rec = LogRecord::FindingBatch(batch.clone());
+        let mut bytes = Vec::new();
+        encode_record(&rec, DEFAULT_MAX_FRAME_PAYLOAD_BYTES, &mut bytes).unwrap();
+
+        let decoded = decode_record(&bytes, DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap();
+        assert_eq!(decoded, LogRecord::FindingBatch(batch));
+    }
+
+    /// A reader that returns exactly 1 byte per `read()` call.
+    struct OneByteReader<R: Read> {
+        inner: R,
+    }
+
+    impl<R: Read> Read for OneByteReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            self.inner.read(&mut buf[..1])
+        }
+    }
+
+    #[test]
+    fn streaming_reader_one_byte_at_a_time() {
+        let records = vec![
+            LogRecord::RunStart(sample_run_start()),
+            LogRecord::RuleDef(sample_rule_def()),
+            LogRecord::FindingBatch(sample_finding_batch()),
+            LogRecord::RunEnd(sample_run_end()),
+        ];
+
+        let mut bytes = Vec::new();
+        for rec in &records {
+            encode_record(rec, DEFAULT_MAX_FRAME_PAYLOAD_BYTES, &mut bytes).unwrap();
+        }
+
+        let reader = OneByteReader {
+            inner: IoCursor::new(bytes),
+        };
+        let mut lr = LogRecordReader::new(reader, DEFAULT_MAX_FRAME_PAYLOAD_BYTES);
+        let mut decoded = Vec::new();
+        while let Some(rec) = lr.next_record().unwrap() {
+            decoded.push(rec);
+        }
+        assert_eq!(decoded, records);
+    }
+
+    #[test]
+    fn streaming_reader_eof_mid_header() {
+        // Provide exactly 4 bytes (partial header).
+        let buf = [0x01, 0x00, 0x00, 0x00];
+        let mut reader =
+            LogRecordReader::new(IoCursor::new(buf.to_vec()), DEFAULT_MAX_FRAME_PAYLOAD_BYTES);
+        let err = reader.next_record().unwrap_err();
+        assert!(
+            matches!(err, FormatError::TruncatedHeader { got: 4 }),
+            "expected TruncatedHeader with got=4, got: {err}"
+        );
+    }
+
+    #[test]
+    fn streaming_reader_eof_mid_body() {
+        // Encode a valid frame, then truncate by 2 bytes.
+        let rec = LogRecord::RunEnd(sample_run_end());
+        let mut bytes = Vec::new();
+        encode_record(&rec, DEFAULT_MAX_FRAME_PAYLOAD_BYTES, &mut bytes).unwrap();
+
+        // Remove last 2 bytes.
+        bytes.truncate(bytes.len() - 2);
+
+        let mut reader =
+            LogRecordReader::new(IoCursor::new(bytes), DEFAULT_MAX_FRAME_PAYLOAD_BYTES);
+        let err = reader.next_record().unwrap_err();
+        assert!(
+            matches!(err, FormatError::TruncatedFrame { .. }),
+            "expected TruncatedFrame, got: {err}"
+        );
+    }
+
+    #[test]
+    fn encode_appends_to_existing_buffer() {
+        let prefix = vec![0xDE, 0xAD];
+        let mut buf = prefix.clone();
+
+        let rec1 = LogRecord::RunEnd(sample_run_end());
+        let rec2 = LogRecord::RuleDef(sample_rule_def());
+        encode_record(&rec1, DEFAULT_MAX_FRAME_PAYLOAD_BYTES, &mut buf).unwrap();
+        encode_record(&rec2, DEFAULT_MAX_FRAME_PAYLOAD_BYTES, &mut buf).unwrap();
+
+        // Prefix preserved.
+        assert_eq!(&buf[..2], &prefix[..]);
+
+        // Both frames decodable from offset 2.
+        let mut reader =
+            LogRecordReader::new(IoCursor::new(buf[2..].to_vec()), DEFAULT_MAX_FRAME_PAYLOAD_BYTES);
+        let d1 = reader.next_record().unwrap().unwrap();
+        let d2 = reader.next_record().unwrap().unwrap();
+        assert_eq!(d1, rec1);
+        assert_eq!(d2, rec2);
+        assert!(reader.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn decode_finding_batch_huge_count_does_not_oom() {
+        // Craft a FindingBatch frame with count = u32::MAX but only a few
+        // bytes of actual payload. Without a cap on pre-allocation, this
+        // would attempt a ~500 GiB allocation.
+        let mut payload = Vec::new();
+        // object_path: length-prefixed empty
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        // findings_count = u32::MAX
+        payload.extend_from_slice(&u32::MAX.to_le_bytes());
+        // No actual finding data follows — the loop should error
+        // on the first take_u32 for "rule_id".
+
+        let type_byte = FrameType::FindingBatch as u8;
+        let frame_len = (payload.len() + 1) as u32;
+
+        let mut body = vec![type_byte];
+        body.extend_from_slice(&payload);
+
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(&body);
+        let crc32 = crc.finalize();
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&frame_len.to_le_bytes());
+        buf.extend_from_slice(&crc32.to_le_bytes());
+        buf.extend_from_slice(&body);
+
+        // Should return a decode error (truncated/invalid), NOT OOM.
+        let err = decode_record(&buf, u32::MAX).unwrap_err();
+        assert!(
+            matches!(err, FormatError::InvalidRecord { .. }),
+            "expected InvalidRecord from truncated finding data, got: {err}"
+        );
+    }
+
+    #[test]
+    fn finding_record_on_disk_size_is_132_bytes() {
+        // Per-finding payload: rule_id(4) + rule_fingerprint(32) + secret_hash(32)
+        //   + finding_id(32) + root_hint_start(8) + root_hint_end(8)
+        //   + span_start(8) + span_end(8) = 132 bytes.
+        let batch_1 = LogFindingBatch {
+            object_path: b"x".to_vec(),
+            findings: vec![LogFindingRecord {
+                rule_id: 0,
+                rule_fingerprint: [0; 32],
+                secret_hash: [0; 32],
+                finding_id: [0; 32],
+                root_hint_start: 0,
+                root_hint_end: 0,
+                span_start: 0,
+                span_end: 0,
+            }],
+        };
+        let batch_2 = LogFindingBatch {
+            object_path: b"x".to_vec(),
+            findings: vec![
+                LogFindingRecord {
+                    rule_id: 0,
+                    rule_fingerprint: [0; 32],
+                    secret_hash: [0; 32],
+                    finding_id: [0; 32],
+                    root_hint_start: 0,
+                    root_hint_end: 0,
+                    span_start: 0,
+                    span_end: 0,
+                },
+                LogFindingRecord {
+                    rule_id: 1,
+                    rule_fingerprint: [1; 32],
+                    secret_hash: [1; 32],
+                    finding_id: [1; 32],
+                    root_hint_start: 1,
+                    root_hint_end: 1,
+                    span_start: 1,
+                    span_end: 1,
+                },
+            ],
+        };
+
+        let mut buf1 = Vec::new();
+        let mut buf2 = Vec::new();
+        encode_record(
+            &LogRecord::FindingBatch(batch_1),
+            DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+            &mut buf1,
+        )
+        .unwrap();
+        encode_record(
+            &LogRecord::FindingBatch(batch_2),
+            DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+            &mut buf2,
+        )
+        .unwrap();
+
+        // The difference in encoded size between 1 finding and 2 findings
+        // is exactly the per-finding record size.
+        let per_finding_bytes = buf2.len() - buf1.len();
+        assert_eq!(
+            per_finding_bytes, 132,
+            "per-finding on-disk size should be 132 bytes, got {per_finding_bytes}"
+        );
     }
 }

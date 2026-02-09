@@ -148,6 +148,7 @@ fn run_scan(scan_root: &Path, workers: usize) -> PersistedSummary {
 
     let mut writer_cfg = LogWriterConfig::for_root(store_root.clone());
     writer_cfg.max_segment_bytes = 512 * 1024;
+    writer_cfg.max_frame_payload_bytes = 256 * 1024;
     let producer = Arc::new(AppendLogStoreProducer::new(&rules, writer_cfg.clone()).unwrap());
 
     let mut cfg = ParallelScanConfig {
