@@ -1040,6 +1040,7 @@ pub(super) fn execute_pack_plans_with_scheduler(
     adapter_cfg: EngineAdapterConfig,
     pack_cache_bytes: u32,
     workers: usize,
+    pin_threads: bool,
 ) -> Result<Vec<SchedulerPackExecOutput>, GitScanError> {
     if plans.is_empty() {
         return Ok(Vec::new());
@@ -1081,6 +1082,7 @@ pub(super) fn execute_pack_plans_with_scheduler(
                 ExecutorConfig {
                     workers: exec_workers,
                     seed: 0x853c49e6748fea9b,
+                    pin_threads,
                     ..ExecutorConfig::default()
                 },
                 move |_wid| SchedulerPackScratch {
@@ -1227,6 +1229,7 @@ pub(super) fn execute_pack_plans_with_scheduler(
                 ExecutorConfig {
                     workers: exec_workers,
                     seed: 0x853c49e6748fea9b,
+                    pin_threads,
                     ..ExecutorConfig::default()
                 },
                 move |_wid| SchedulerPackScratch {

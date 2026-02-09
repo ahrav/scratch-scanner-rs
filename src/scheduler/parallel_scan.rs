@@ -280,6 +280,9 @@ pub struct ParallelScanConfig {
     /// Archive scanning configuration.
     pub archive: ArchiveConfig,
 
+    /// Pin worker threads to CPU cores (Linux only, no-op elsewhere).
+    pub pin_threads: bool,
+
     /// When `true`, skip files that appear to be binary (NUL byte heuristic).
     /// Defaults to `true`. Set to `false` via `--scan-binary` to scan everything.
     pub skip_binary: bool,
@@ -314,6 +317,7 @@ impl Default for ParallelScanConfig {
             respect_gitignore: true,
             max_file_size: 100 * 1024 * 1024, // 100 MiB
             archive: ArchiveConfig::default(),
+            pin_threads: super::affinity::default_pin_threads(),
             skip_binary: true,
             event_sink: Arc::new(crate::unified::events::NullEventSink),
             store_producer: None,
@@ -335,6 +339,7 @@ impl std::fmt::Debug for ParallelScanConfig {
             .field("respect_gitignore", &self.respect_gitignore)
             .field("max_file_size", &self.max_file_size)
             .field("archive", &self.archive)
+            .field("pin_threads", &self.pin_threads)
             .field("skip_binary", &self.skip_binary)
             .field("event_sink", &"<dyn EventSink>")
             .field(
@@ -361,6 +366,7 @@ impl ParallelScanConfig {
             max_in_flight_objects: self.max_in_flight_objects,
             max_file_size: self.max_file_size,
             seed: self.seed,
+            pin_threads: self.pin_threads,
             dedupe_within_chunk: true,
             archive: self.archive.clone(),
             skip_binary: self.skip_binary,
@@ -655,6 +661,7 @@ mod tests {
             respect_gitignore: false,
             max_file_size: 10 * 1024 * 1024,
             archive: ArchiveConfig::default(),
+            pin_threads: false,
             skip_binary: true,
             event_sink: Arc::new(crate::unified::events::NullEventSink),
             store_producer: None,

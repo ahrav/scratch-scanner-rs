@@ -1165,6 +1165,13 @@ pub(super) fn introduce_parallel<'a>(
 
     let auto_cache_fn = super::runner_exec::auto_tree_delta_cache_bytes;
 
+    // Create core assigner for thread pinning (Linux only; None elsewhere).
+    let core_assigner = if config.pin_threads {
+        crate::scheduler::affinity::CoreAssigner::new()
+    } else {
+        None
+    };
+
     // Spawn workers with std::thread::scope.
     let results: Vec<Result<WorkerResult, TreeDiffError>> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..worker_count)
@@ -1174,8 +1181,12 @@ pub(super) fn introduce_parallel<'a>(
                 let abort = &abort;
                 let seen = &seen;
                 let per_worker_limits = &per_worker_limits;
+                let core_assigner = &core_assigner;
 
                 s.spawn(move || {
+                    if let Some(ref a) = core_assigner {
+                        a.pin_current_thread();
+                    }
                     // Per-worker ObjectStore.
                     let auto_cache_bytes =
                         auto_cache_fn(object_count, per_worker_limits.max_tree_delta_cache_bytes);

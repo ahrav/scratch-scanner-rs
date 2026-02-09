@@ -34,9 +34,7 @@
 //!
 //! # Platform
 //!
-//! Linux-only. Feature-gated behind `io-uring` feature.
-
-#![cfg(all(target_os = "linux", feature = "io-uring"))]
+//! Linux-only. Compiled unconditionally on `target_os = "linux"`.
 
 use super::count_budget::{CountBudget, CountPermit};
 use super::engine_stub::BUFFER_LEN_MAX;
@@ -44,6 +42,13 @@ use super::engine_trait::{EngineScratch, FindingRecord, ScanEngine};
 use super::executor::{Executor, ExecutorConfig, ExecutorHandle, WorkerCtx};
 use super::metrics::MetricsSnapshot;
 use crate::api::FileId;
+use crate::archive::detect::detect_kind_from_path;
+use crate::archive::scan::{
+    scan_gzip_stream, scan_tar_stream, scan_targz_stream, scan_zip_source, ArchiveEntrySink,
+    ArchiveScratch, EntryChunk, EntryMeta,
+};
+use crate::archive::{ArchiveConfig, ArchiveKind, ArchiveStats};
+use crate::content_policy::{self, ContentVerdict};
 use crate::perf_stats;
 use crate::unified::events::{EventSink, FindingEvent, ScanEvent};
 use crate::unified::SourceKind;
@@ -147,6 +152,15 @@ pub struct LocalFsUringConfig {
 
     /// Deduplicate findings within each chunk.
     pub dedupe_within_chunk: bool,
+
+    /// Pin worker and I/O threads to CPU cores (Linux only, no-op elsewhere).
+    pub pin_threads: bool,
+
+    /// When `true`, skip files that appear to be binary (NUL byte heuristic).
+    pub skip_binary: bool,
+
+    /// Archive scanning configuration (gzip, tar, zip expansion).
+    pub archive: ArchiveConfig,
 }
 
 impl Default for LocalFsUringConfig {
@@ -167,6 +181,9 @@ impl Default for LocalFsUringConfig {
             max_file_size: None,
             seed: 1,
             dedupe_within_chunk: true,
+            pin_threads: super::affinity::default_pin_threads(),
+            skip_binary: true,
+            archive: ArchiveConfig::default(),
         }
     }
 }
@@ -240,6 +257,8 @@ pub struct LocalFsSummary {
     pub open_errors: u64,
     pub read_errors: u64,
     pub files_skipped_size: u64,
+    pub archives_routed: u64,
+    pub binary_skipped: u64,
 }
 
 /// Per-I/O-thread counters.
@@ -258,6 +277,8 @@ pub struct UringIoStats {
     pub reads_completed: u64,
     pub read_errors: u64,
     pub short_reads: u64,
+    pub binary_skipped: u64,
+    pub archives_sniffed: u64,
 }
 
 // ============================================================================
@@ -379,6 +400,8 @@ impl UringIoStats {
         self.reads_completed += other.reads_completed;
         self.read_errors += other.read_errors;
         self.short_reads += other.short_reads;
+        self.binary_skipped += other.binary_skipped;
+        self.archives_sniffed += other.archives_sniffed;
     }
 }
 
@@ -438,6 +461,13 @@ struct FileToken {
 /// Work item for I/O threads.
 struct FileWork {
     path: PathBuf,
+    token: Arc<FileToken>,
+}
+
+/// Work item for archive worker threads.
+struct ArchiveWork {
+    path: PathBuf,
+    kind: ArchiveKind,
     token: Arc<FileToken>,
 }
 
@@ -569,6 +599,171 @@ fn cpu_runner<E: ScanEngine>(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScra
 }
 
 // ============================================================================
+// Archive Sink + Worker
+// ============================================================================
+
+/// Sink that forwards archive entry chunks to the scan engine.
+///
+/// Implements `ArchiveEntrySink` following the same pattern as `cpu_runner`:
+/// scan_chunk_into → drop_prefix_findings → drain → dedupe → emit.
+struct UringArchiveSink<'a, E: ScanEngine> {
+    engine: &'a E,
+    scratch: &'a mut E::Scratch,
+    pending: &'a mut Vec<<E::Scratch as EngineScratch>::Finding>,
+    event_sink: &'a dyn EventSink,
+    display: Vec<u8>,
+    file_id: FileId,
+    dedupe: bool,
+    bytes_scanned: u64,
+    chunks_scanned: u64,
+    findings_emitted: u64,
+}
+
+impl<E: ScanEngine> ArchiveEntrySink for UringArchiveSink<'_, E> {
+    type Error = ();
+
+    fn on_entry_start(&mut self, meta: &EntryMeta<'_>) -> Result<(), Self::Error> {
+        self.display.clear();
+        self.display.extend_from_slice(meta.display_path);
+        // Use a deterministic file_id for each entry within the archive.
+        self.file_id = FileId(self.file_id.0.wrapping_add(1));
+        Ok(())
+    }
+
+    fn on_entry_chunk(&mut self, chunk: EntryChunk<'_>) -> Result<(), Self::Error> {
+        self.engine
+            .scan_chunk_into(chunk.data, self.file_id, chunk.base_offset, self.scratch);
+        self.scratch.drop_prefix_findings(chunk.new_bytes_start);
+
+        self.pending.clear();
+        self.scratch.drain_findings_into(self.pending);
+
+        if self.dedupe {
+            dedupe_pending_in_place(self.pending);
+        }
+
+        self.findings_emitted += self.pending.len() as u64;
+        emit_findings(self.engine, self.event_sink, &self.display, self.pending);
+
+        self.bytes_scanned += chunk.new_bytes_len as u64;
+        self.chunks_scanned += 1;
+        Ok(())
+    }
+
+    fn on_entry_end(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+/// Archive worker stats returned after all work items are processed.
+#[allow(dead_code)]
+struct ArchiveWorkerStats {
+    bytes_scanned: u64,
+    chunks_scanned: u64,
+    findings_emitted: u64,
+    archives_processed: u64,
+    archive_stats: ArchiveStats,
+}
+
+/// Per-archive-worker loop: receives `ArchiveWork` items from a channel and
+/// dispatches to the appropriate archive scanner (gzip, tar, tar.gz, zip).
+fn archive_worker_loop<E: ScanEngine>(
+    rx: chan::Receiver<ArchiveWork>,
+    engine: Arc<E>,
+    event_sink: Arc<dyn EventSink>,
+    cfg: ArchiveConfig,
+    dedupe: bool,
+) -> ArchiveWorkerStats {
+    let overlap = engine.required_overlap();
+    let chunk_size = 256 * 1024; // Match ARCHIVE_STREAM_READ_MAX ceiling.
+
+    let mut scratch = engine.new_scratch();
+    let mut pending = Vec::with_capacity(4096);
+    let mut archive_scratch: ArchiveScratch<File> = ArchiveScratch::new(&cfg, chunk_size, overlap);
+    let mut archive_stats = ArchiveStats::default();
+    let mut total_bytes = 0u64;
+    let mut total_chunks = 0u64;
+    let mut total_findings = 0u64;
+    let mut archives_processed = 0u64;
+
+    for work in rx {
+        let display = &*work.token.display;
+        let file = match File::open(&work.path) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+
+        let mut sink = UringArchiveSink {
+            engine: engine.as_ref(),
+            scratch: &mut scratch,
+            pending: &mut pending,
+            event_sink: &*event_sink,
+            display: Vec::new(),
+            file_id: work.token.file_id,
+            dedupe,
+            bytes_scanned: 0,
+            chunks_scanned: 0,
+            findings_emitted: 0,
+        };
+
+        let _end = match work.kind {
+            ArchiveKind::Gzip => scan_gzip_stream(
+                file,
+                display,
+                &cfg,
+                &mut archive_scratch,
+                &mut sink,
+                &mut archive_stats,
+            ),
+            ArchiveKind::Tar => {
+                let mut file = file;
+                scan_tar_stream(
+                    &mut file,
+                    display,
+                    &cfg,
+                    &mut archive_scratch,
+                    &mut sink,
+                    &mut archive_stats,
+                    false,
+                )
+            }
+            ArchiveKind::TarGz => scan_targz_stream(
+                file,
+                display,
+                &cfg,
+                &mut archive_scratch,
+                &mut sink,
+                &mut archive_stats,
+            ),
+            ArchiveKind::Zip => scan_zip_source(
+                file,
+                display,
+                &cfg,
+                &mut archive_scratch,
+                &mut sink,
+                &mut archive_stats,
+            ),
+        };
+
+        total_bytes += sink.bytes_scanned;
+        total_chunks += sink.chunks_scanned;
+        total_findings += sink.findings_emitted;
+        archives_processed += 1;
+
+        // Token drop releases the CountPermit, unblocking discovery.
+        drop(work.token);
+    }
+
+    ArchiveWorkerStats {
+        bytes_scanned: total_bytes,
+        chunks_scanned: total_chunks,
+        findings_emitted: total_findings,
+        archives_processed,
+        archive_stats,
+    }
+}
+
+// ============================================================================
 // I/O Worker State
 // ============================================================================
 
@@ -677,7 +872,7 @@ fn drain_in_flight(
                         drop(op.buf);
                         perf_stats::sat_add_u64(&mut stats.reads_completed, 1);
                         if res < 0 {
-                            perf_stats::sat_add_u64(&mut stats.read_errors, 1);
+                            stats.read_errors = stats.read_errors.saturating_add(1);
                         }
                     }
                     Op::Open(_op) => {
@@ -740,6 +935,7 @@ fn open_file_safe(path: &Path, follow_symlinks: bool) -> io::Result<File> {
 ///
 /// On `stop` signal or channel close, we stop accepting new work but drain
 /// all in-flight operations to completion.
+#[allow(clippy::too_many_arguments)]
 fn io_worker_loop<E: ScanEngine>(
     _wid: usize,
     rx: chan::Receiver<FileWork>,
@@ -748,6 +944,7 @@ fn io_worker_loop<E: ScanEngine>(
     engine: Arc<E>,
     cfg: LocalFsUringConfig,
     stop: Arc<AtomicBool>,
+    archive_tx: Option<chan::Sender<ArchiveWork>>,
 ) -> io::Result<UringIoStats> {
     let overlap = engine.required_overlap();
     let chunk_size = cfg.chunk_size;
@@ -845,7 +1042,7 @@ fn io_worker_loop<E: ScanEngine>(
         let file = match open_file_safe(path, cfg.follow_symlinks) {
             Ok(f) => f,
             Err(_) => {
-                perf_stats::sat_add_u64(&mut stats.files_open_failed, 1);
+                stats.files_open_failed = stats.files_open_failed.saturating_add(1);
                 return BlockingOutcome::Failed;
             }
         };
@@ -855,7 +1052,7 @@ fn io_worker_loop<E: ScanEngine>(
         let size = match file.metadata() {
             Ok(m) => m.len(),
             Err(_) => {
-                perf_stats::sat_add_u64(&mut stats.files_open_failed, 1);
+                stats.files_open_failed = stats.files_open_failed.saturating_add(1);
                 return BlockingOutcome::Failed;
             }
         };
@@ -1208,7 +1405,7 @@ fn io_worker_loop<E: ScanEngine>(
                 let path_cstr = match CString::new(path.as_os_str().as_bytes()) {
                     Ok(s) => s,
                     Err(_) => {
-                        perf_stats::sat_add_u64(&mut stats.files_open_failed, 1);
+                        stats.files_open_failed = stats.files_open_failed.saturating_add(1);
                         perf_stats::sat_add_u64(&mut stats.open_failures, 1);
                         st.failed = true;
                         st.done = true;
@@ -1377,7 +1574,7 @@ fn io_worker_loop<E: ScanEngine>(
 
                     if res < 0 {
                         // Read syscall failed.
-                        perf_stats::sat_add_u64(&mut stats.read_errors, 1);
+                        stats.read_errors = stats.read_errors.saturating_add(1);
                         st.failed = true;
                         st.done = true;
                         drop(op.buf);
@@ -1385,7 +1582,7 @@ fn io_worker_loop<E: ScanEngine>(
                         let n = res as usize;
                         if n == 0 {
                             // Unexpected EOF (empty read).
-                            perf_stats::sat_add_u64(&mut stats.read_errors, 1);
+                            stats.read_errors = stats.read_errors.saturating_add(1);
                             st.failed = true;
                             st.done = true;
                             drop(op.buf);
@@ -1399,6 +1596,76 @@ fn io_worker_loop<E: ScanEngine>(
                             }
 
                             let total_len = op.prefix_len.saturating_add(n);
+
+                            // First-chunk classification: sniff archive magic and
+                            // classify binary vs text. Only on first read (no
+                            // overlap prefix) to avoid re-classifying later chunks.
+                            if op.base_offset == 0 && op.prefix_len == 0 {
+                                let sniff_len = total_len.min(512);
+                                let sniff_data = &op.buf.as_slice()[..sniff_len];
+
+                                // Archive magic sniffing: route to archive workers
+                                // if file content looks like an archive despite not
+                                // having a recognized extension.
+                                if let Some(ref atx) = archive_tx {
+                                    if let Some(kind) =
+                                        crate::archive::detect::sniff_kind_from_header(sniff_data)
+                                    {
+                                        stats.archives_sniffed =
+                                            stats.archives_sniffed.saturating_add(1);
+                                        // SAFETY: display bytes originate from
+                                        // `Path::as_os_str().as_bytes()` on Unix,
+                                        // so they are valid OS string bytes.
+                                        let path = PathBuf::from(unsafe {
+                                            std::ffi::OsStr::from_encoded_bytes_unchecked(
+                                                &st.token.display,
+                                            )
+                                        });
+                                        let aw = ArchiveWork {
+                                            path,
+                                            kind,
+                                            token: Arc::clone(&st.token),
+                                        };
+                                        let _ = atx.send(aw);
+                                        st.done = true;
+                                        drop(op.buf);
+
+                                        if st.in_flight == 0 {
+                                            files[op.file_slot] = None;
+                                            free_file_slots.push(op.file_slot);
+                                        }
+                                        continue;
+                                    }
+                                }
+
+                                // Binary classification: skip files with NUL bytes
+                                // in the first CHECK_LEN bytes.
+                                if cfg.skip_binary {
+                                    let check_len = total_len.min(content_policy::CHECK_LEN);
+                                    let verdict = content_policy::classify_content(
+                                        &op.buf.as_slice()[..check_len],
+                                        &st.token.display,
+                                        content_policy::CHECK_LEN,
+                                    );
+                                    match verdict {
+                                        ContentVerdict::Binary
+                                        | ContentVerdict::BinaryExtractable(_) => {
+                                            stats.binary_skipped =
+                                                stats.binary_skipped.saturating_add(1);
+                                            st.done = true;
+                                            drop(op.buf);
+
+                                            if st.in_flight == 0 {
+                                                files[op.file_slot] = None;
+                                                free_file_slots.push(op.file_slot);
+                                            }
+                                            continue;
+                                        }
+                                        ContentVerdict::Text => { /* fall through to scan */ }
+                                    }
+                                }
+                            }
+
                             let len = total_len as u32;
 
                             if overlap > 0 {
@@ -1482,7 +1749,7 @@ fn io_worker_loop<E: ScanEngine>(
                                 }
                             }
                         } else {
-                            perf_stats::sat_add_u64(&mut stats.files_open_failed, 1);
+                            stats.files_open_failed = stats.files_open_failed.saturating_add(1);
                             st.failed = true;
                             st.done = true;
                         }
@@ -1653,94 +1920,137 @@ fn walk_and_send_files(
     cfg: &LocalFsUringConfig,
     budget: &Arc<CountBudget>,
     tx: &chan::Sender<FileWork>,
+    archive_tx: &Option<chan::Sender<ArchiveWork>>,
     next_file_id: &mut u32,
     summary: &mut LocalFsSummary,
 ) -> io::Result<()> {
-    let mut stack: Vec<PathBuf> = Vec::with_capacity(1024);
-    stack.push(root.to_path_buf());
+    // Use a directory-entry stack instead of a path stack. DirEntry::file_type()
+    // uses `d_type` from getdents64 on Linux (no syscall), avoiding the per-file
+    // symlink_metadata/statx that was the #1 bottleneck in cold-cache discovery.
+    // Size filtering is deferred to the I/O thread's statx, which runs async
+    // via io_uring and is already required for correctness (TOCTOU).
+    let mut dir_stack: Vec<PathBuf> = Vec::with_capacity(1024);
+    dir_stack.push(root.to_path_buf());
 
-    while let Some(path) = stack.pop() {
-        let meta = if cfg.follow_symlinks {
-            match fs::metadata(&path) {
-                Ok(m) => m,
-                Err(_) => {
-                    summary.walk_errors = summary.walk_errors.saturating_add(1);
-                    continue;
-                }
-            }
-        } else {
-            match fs::symlink_metadata(&path) {
-                Ok(m) => {
-                    if m.file_type().is_symlink() {
-                        continue;
-                    }
-                    m
-                }
-                Err(_) => {
-                    summary.walk_errors = summary.walk_errors.saturating_add(1);
-                    continue;
-                }
+    while let Some(dir_path) = dir_stack.pop() {
+        let rd = match fs::read_dir(&dir_path) {
+            Ok(rd) => rd,
+            Err(_) => {
+                summary.walk_errors = summary.walk_errors.saturating_add(1);
+                continue;
             }
         };
 
-        if meta.is_dir() {
-            let rd = match fs::read_dir(&path) {
-                Ok(rd) => rd,
+        for entry in rd {
+            let entry = match entry {
+                Ok(e) => e,
                 Err(_) => {
                     summary.walk_errors = summary.walk_errors.saturating_add(1);
                     continue;
                 }
             };
 
-            for ent in rd {
-                match ent {
-                    Ok(ent) => stack.push(ent.path()),
-                    Err(_) => summary.walk_errors = summary.walk_errors.saturating_add(1),
+            // DirEntry::file_type() uses d_type from getdents64 (no syscall on
+            // ext4/xfs/btrfs). Falls back to symlink_metadata only if d_type is
+            // DT_UNKNOWN (rare: some network filesystems).
+            let ft = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => {
+                    summary.walk_errors = summary.walk_errors.saturating_add(1);
+                    continue;
                 }
-            }
-            continue;
-        }
+            };
 
-        if !meta.is_file() {
-            continue;
-        }
-
-        summary.files_seen = summary.files_seen.saturating_add(1);
-
-        let size = meta.len();
-
-        if let Some(max_sz) = cfg.max_file_size {
-            if size > max_sz {
-                summary.files_skipped_size = summary.files_skipped_size.saturating_add(1);
+            if ft.is_dir() {
+                dir_stack.push(entry.path());
                 continue;
             }
+
+            if !cfg.follow_symlinks && ft.is_symlink() {
+                continue;
+            }
+
+            if !ft.is_file() {
+                // Symlinks when following: resolve via metadata to check target type.
+                if cfg.follow_symlinks && ft.is_symlink() {
+                    match fs::metadata(entry.path()) {
+                        Ok(m) if m.is_file() => { /* fall through to enqueue */ }
+                        Ok(m) if m.is_dir() => {
+                            dir_stack.push(entry.path());
+                            continue;
+                        }
+                        _ => continue,
+                    }
+                } else {
+                    continue;
+                }
+            }
+
+            summary.files_seen = summary.files_seen.saturating_add(1);
+
+            let path = entry.path();
+
+            // Extension-based archive routing: if the path has a recognized
+            // archive extension, route directly to archive workers (no io_uring
+            // read needed — archive scanning opens the file itself).
+            if let Some(archive_tx) = archive_tx.as_ref() {
+                if let Some(kind) = detect_kind_from_path(&path) {
+                    let permit = budget.acquire(1);
+                    let id = *next_file_id;
+                    *next_file_id = next_file_id.checked_add(1).expect("FileId overflow");
+                    let file_id = FileId(id);
+                    let display: Arc<[u8]> = path
+                        .as_os_str()
+                        .as_bytes()
+                        .to_vec()
+                        .into_boxed_slice()
+                        .into();
+                    let token = Arc::new(FileToken {
+                        _permit: permit,
+                        file_id,
+                        display,
+                    });
+                    if archive_tx.send(ArchiveWork { path, kind, token }).is_err() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "archive workers stopped",
+                        ));
+                    }
+                    summary.archives_routed = summary.archives_routed.saturating_add(1);
+                    summary.files_enqueued = summary.files_enqueued.saturating_add(1);
+                    continue;
+                }
+            }
+
+            // Skip discovery-time size filtering: the I/O thread's statx (via
+            // io_uring) provides the authoritative size and handles max_file_size.
+
+            // Backpressure: blocks until permit available.
+            let permit = budget.acquire(1);
+
+            let id = *next_file_id;
+            *next_file_id = next_file_id.checked_add(1).expect("FileId overflow");
+            let file_id = FileId(id);
+
+            let display: Arc<[u8]> = path
+                .as_os_str()
+                .as_bytes()
+                .to_vec()
+                .into_boxed_slice()
+                .into();
+
+            let token = Arc::new(FileToken {
+                _permit: permit,
+                file_id,
+                display,
+            });
+
+            // Backpressure: bounded channel send blocks here.
+            tx.send(FileWork { path, token })
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "io threads stopped"))?;
+
+            summary.files_enqueued = summary.files_enqueued.saturating_add(1);
         }
-
-        // Backpressure: blocks until permit available.
-        let permit = budget.acquire(1);
-
-        let id = *next_file_id;
-        *next_file_id = next_file_id.checked_add(1).expect("FileId overflow");
-        let file_id = FileId(id);
-
-        let display = path
-            .as_os_str()
-            .as_bytes()
-            .to_vec()
-            .into_boxed_slice()
-            .into();
-
-        let token = Arc::new(FileToken {
-            _permit: permit,
-            file_id,
-            display,
-        });
-
-        // Backpressure: bounded channel send blocks here.
-        tx.send(FileWork { path, token })
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "io threads stopped"))?;
-
-        summary.files_enqueued = summary.files_enqueued.saturating_add(1);
     }
 
     Ok(())
@@ -1788,6 +2098,7 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
         ExecutorConfig {
             workers: cfg.cpu_workers,
             seed: cfg.seed,
+            pin_threads: cfg.pin_threads,
             ..ExecutorConfig::default()
         },
         {
@@ -1813,7 +2124,46 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
 
     let stop = Arc::new(AtomicBool::new(false));
 
+    // Archive channel + workers (if archives enabled).
+    let archive_enabled = cfg.archive.enabled;
+    let (archive_tx, archive_rx) = if archive_enabled {
+        let (tx, rx) = chan::bounded::<ArchiveWork>(cfg.file_queue_cap);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
+    let archive_worker_count = if archive_enabled {
+        (cfg.cpu_workers / 4).max(1)
+    } else {
+        0
+    };
+    let mut archive_threads = Vec::with_capacity(archive_worker_count);
+    if let Some(ref arx) = archive_rx {
+        for wid in 0..archive_worker_count {
+            let rx = arx.clone();
+            let engine = Arc::clone(&engine);
+            let event_sink = Arc::clone(&event_sink);
+            let archive_cfg = cfg.archive.clone();
+            let dedupe = cfg.dedupe_within_chunk;
+
+            archive_threads.push(
+                thread::Builder::new()
+                    .name(format!("uring-archive-{wid}"))
+                    .spawn(move || archive_worker_loop(rx, engine, event_sink, archive_cfg, dedupe))
+                    .expect("failed to spawn archive worker thread"),
+            );
+        }
+    }
+    // Drop the extra rx clone so only worker threads hold receivers.
+    drop(archive_rx);
+
     // Spawn I/O threads.
+    let io_assigner = if cfg.pin_threads {
+        super::affinity::CoreAssigner::with_offset(cfg.cpu_workers).map(Arc::new)
+    } else {
+        None
+    };
     let mut io_threads = Vec::with_capacity(cfg.io_threads);
     for wid in 0..cfg.io_threads {
         let rx = rx.clone();
@@ -1822,10 +2172,20 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
         let engine = Arc::clone(&engine);
         let cfg2 = cfg.clone();
         let stop2 = Arc::clone(&stop);
+        let io_assigner_clone = io_assigner.clone();
+        let atx = archive_tx.clone();
 
-        io_threads.push(thread::spawn(move || {
-            io_worker_loop(wid, rx, pool, cpu, engine, cfg2, stop2)
-        }));
+        io_threads.push(
+            thread::Builder::new()
+                .name(format!("uring-io-{wid}"))
+                .spawn(move || {
+                    if let Some(ref a) = io_assigner_clone {
+                        a.pin_current_thread();
+                    }
+                    io_worker_loop(wid, rx, pool, cpu, engine, cfg2, stop2, atx)
+                })
+                .expect("failed to spawn uring I/O thread"),
+        );
     }
     drop(rx);
 
@@ -1839,6 +2199,7 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
             &cfg,
             &file_budget,
             &tx,
+            &archive_tx,
             &mut next_file_id,
             &mut summary,
         )?;
@@ -1847,7 +2208,10 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
         }
     }
 
+    // Close discovery → I/O channel, then close archive channel so workers
+    // drain remaining work and exit.
     drop(tx);
+    drop(archive_tx);
 
     // Join I/O threads and merge stats.
     let mut io_stats = UringIoStats::default();
@@ -1859,11 +2223,39 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
         }
     }
 
+    // Join archive workers and merge stats into MetricsSnapshot.
+    let mut archive_bytes = 0u64;
+    let mut archive_chunks = 0u64;
+    let mut archive_findings = 0u64;
+    let mut total_archive_stats = ArchiveStats::default();
+    for t in archive_threads {
+        match t.join() {
+            Ok(ws) => {
+                archive_bytes += ws.bytes_scanned;
+                archive_chunks += ws.chunks_scanned;
+                archive_findings += ws.findings_emitted;
+                total_archive_stats.merge_from(&ws.archive_stats);
+            }
+            Err(_) => return Err(io::Error::other("archive worker panicked")),
+        }
+    }
+
     summary.open_errors = io_stats.files_open_failed;
     summary.read_errors = io_stats.read_errors;
+    summary.binary_skipped = io_stats.binary_skipped;
 
     // Join CPU executor.
-    let cpu_metrics = ex.join();
+    let mut cpu_metrics = ex.join();
+
+    // Merge archive worker stats into the CPU metrics snapshot so the
+    // orchestrator sees a single unified view of bytes/chunks/findings.
+    cpu_metrics.bytes_scanned = cpu_metrics.bytes_scanned.wrapping_add(archive_bytes);
+    cpu_metrics.chunks_scanned = cpu_metrics.chunks_scanned.wrapping_add(archive_chunks);
+    cpu_metrics.findings_emitted = cpu_metrics.findings_emitted.wrapping_add(archive_findings);
+    cpu_metrics.binary_skipped = cpu_metrics
+        .binary_skipped
+        .wrapping_add(io_stats.binary_skipped);
+    cpu_metrics.archive.merge_from(&total_archive_stats);
 
     event_sink.flush();
 
@@ -1925,6 +2317,9 @@ mod tests {
             max_file_size: None,
             seed: 123,
             dedupe_within_chunk: true,
+            pin_threads: false,
+            skip_binary: false,
+            archive: ArchiveConfig::default(),
         };
 
         let (_summary, _io_stats, _cpu_metrics) =
@@ -1943,12 +2338,12 @@ mod tests {
 
     #[test]
     fn global_only_pool_works() {
-        // Verify global-only pool (workers=0, local_queue_cap=0) doesn't panic
+        // Verify minimal pool (single worker, minimal local queue) works.
         let pool = TsBufferPool::new(TsBufferPoolConfig {
             buffer_len: 1024,
             total_buffers: 8,
-            workers: 0,
-            local_queue_cap: 0,
+            workers: 1,
+            local_queue_cap: 1,
         });
 
         // Acquire and release a buffer to verify basic functionality
@@ -1996,6 +2391,9 @@ mod tests {
             max_file_size: None,
             seed: 123,
             dedupe_within_chunk: true,
+            pin_threads: false,
+            skip_binary: false,
+            archive: ArchiveConfig::default(),
         };
 
         let sink_blocking = Arc::new(VecEventSink::new());
@@ -2060,6 +2458,9 @@ mod tests {
             max_file_size: None,
             seed: 123,
             dedupe_within_chunk: true,
+            pin_threads: false,
+            skip_binary: false,
+            archive: ArchiveConfig::default(),
         };
 
         let sink = Arc::new(VecEventSink::new());
@@ -2069,6 +2470,122 @@ mod tests {
         assert_eq!(io_stats.open_ops_submitted, 0);
         assert_eq!(io_stats.stat_ops_submitted, 0);
         assert_eq!(io_stats.open_stat_fallbacks, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn uring_binary_skipped_counted() -> io::Result<()> {
+        let engine = Arc::new(MockEngine::with_tuning(
+            vec![MockRule {
+                name: "secret".into(),
+                pattern: b"SECRET".to_vec(),
+            }],
+            6,
+            EngineTuning {
+                max_findings_per_chunk: 128,
+                max_rules: 16,
+            },
+        ));
+
+        let dir = tempdir()?;
+        // File contains NUL bytes so it looks binary.
+        let file_path = dir.path().join("binary.dat");
+        std::fs::write(&file_path, b"\x00\x01\x02SECRET")?;
+
+        let cfg = LocalFsUringConfig {
+            cpu_workers: 2,
+            io_threads: 1,
+            ring_entries: 64,
+            io_depth: 16,
+            chunk_size: 64,
+            max_in_flight_files: 8,
+            file_queue_cap: 8,
+            pool_buffers: 32,
+            use_registered_buffers: false,
+            open_stat_mode: OpenStatMode::BlockingOnly,
+            resolve_policy: ResolvePolicy::Default,
+            follow_symlinks: false,
+            max_file_size: None,
+            seed: 123,
+            dedupe_within_chunk: true,
+            pin_threads: false,
+            skip_binary: true,
+            archive: ArchiveConfig {
+                enabled: false,
+                ..ArchiveConfig::default()
+            },
+        };
+
+        let sink = Arc::new(VecEventSink::new());
+        let (_summary, io_stats, cpu_metrics) =
+            scan_local_fs_uring(engine, &[dir.path().to_path_buf()], cfg, sink.clone())?;
+
+        assert_eq!(
+            io_stats.binary_skipped, 1,
+            "io_stats should count the binary file as skipped"
+        );
+        assert_eq!(
+            cpu_metrics.binary_skipped, 1,
+            "cpu_metrics should count the binary file as skipped"
+        );
+        // The file should NOT have been scanned (no findings for "SECRET").
+        let events = sink.take();
+        assert!(events.is_empty(), "binary file should not produce findings");
+
+        Ok(())
+    }
+
+    #[test]
+    fn uring_archive_sniffed_counted() -> io::Result<()> {
+        let engine = Arc::new(MockEngine::with_tuning(
+            vec![MockRule {
+                name: "secret".into(),
+                pattern: b"SECRET".to_vec(),
+            }],
+            6,
+            EngineTuning {
+                max_findings_per_chunk: 128,
+                max_rules: 16,
+            },
+        ));
+
+        let dir = tempdir()?;
+        // File with no archive extension but gzip magic bytes in content.
+        let file_path = dir.path().join("data.bin");
+        let mut content = vec![0x1f, 0x8b, 0x08, 0x00];
+        content.extend_from_slice(&[0u8; 60]); // padding to make a valid-ish file
+        std::fs::write(&file_path, &content)?;
+
+        let cfg = LocalFsUringConfig {
+            cpu_workers: 2,
+            io_threads: 1,
+            ring_entries: 64,
+            io_depth: 16,
+            chunk_size: 64,
+            max_in_flight_files: 8,
+            file_queue_cap: 8,
+            pool_buffers: 32,
+            use_registered_buffers: false,
+            open_stat_mode: OpenStatMode::BlockingOnly,
+            resolve_policy: ResolvePolicy::Default,
+            follow_symlinks: false,
+            max_file_size: None,
+            seed: 123,
+            dedupe_within_chunk: true,
+            pin_threads: false,
+            skip_binary: false,
+            archive: ArchiveConfig::default(), // enabled=true by default
+        };
+
+        let sink = Arc::new(VecEventSink::new());
+        let (_summary, io_stats, _cpu_metrics) =
+            scan_local_fs_uring(engine, &[dir.path().to_path_buf()], cfg, sink)?;
+
+        assert_eq!(
+            io_stats.archives_sniffed, 1,
+            "io_stats should count the file as archive-sniffed"
+        );
 
         Ok(())
     }

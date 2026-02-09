@@ -226,7 +226,7 @@ OPTIONS:\n\
     --repo <path>              Repository path (positional also supported)\n\
     --iters=<N>                Measured iterations (default: 10)\n\
     --warmup=<N>               Warmup iterations (default: 1)\n\
-    --pin-core=<N>             Pin to core id (requires scheduler-affinity)\n\
+    --pin-core=<N>             Pin to core id (Linux only)\n\
     --merge=all|first-parent   Merge diff mode (default: all)\n\
     --anchors=manual|derived   Anchor mode (default: manual)\n\
     --max-transform-depth=<N>  Override transform depth\n\
@@ -292,17 +292,10 @@ fn pin_to_core(core: Option<usize>) -> PinStatus {
         return PinStatus::None;
     };
 
-    #[cfg(feature = "scheduler-affinity")]
-    {
-        if let Some(cores) = core_affinity::get_core_ids() {
-            if let Some(core_id) = cores.into_iter().find(|c| c.id == core) {
-                core_affinity::set_for_current(core_id);
-                return PinStatus::Applied(core);
-            }
-        }
+    match scanner_rs::scheduler::affinity::try_pin_to_core(core) {
+        Some(_) => PinStatus::Applied(core),
+        None => PinStatus::Unavailable(core),
     }
-
-    PinStatus::Unavailable(core)
 }
 
 fn main() {

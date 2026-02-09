@@ -3,7 +3,7 @@
 //! Dispatches to the appropriate source driver based on the parsed
 //! CLI configuration:
 //!
-//! - **FS** → [`parallel_scan_dir`] (work-stealing executor, streaming directory walk)
+//! - **FS** → `scan_local_fs_uring` on Linux (io_uring), `parallel_scan_dir` elsewhere
 //! - **Git** → [`run_git_scan`] (pack execution, tree diffs, loose scan)
 //!
 //! Both paths share a common [`EventSink`](super::events::EventSink) for
@@ -31,7 +31,9 @@ use crate::git_scan::{
     self, run_git_scan, GitScanConfig, GitScanResult, InMemoryPersistenceStore, NeverSeenStore,
     StartSetConfig,
 };
-use crate::scheduler::{parallel_scan_dir, ParallelScanConfig};
+#[cfg(not(target_os = "linux"))]
+use crate::scheduler::parallel_scan_dir;
+use crate::scheduler::ParallelScanConfig;
 use crate::store::{NullStoreProducer, StoreProducer};
 use crate::{demo_rules, demo_transforms, demo_tuning, AnchorMode, AnchorPolicy, Engine};
 
@@ -62,7 +64,10 @@ pub fn run(config: ScanConfig) -> io::Result<()> {
     }
 }
 
-/// Filesystem scan path — delegates to `parallel_scan_dir`.
+/// Filesystem scan path.
+///
+/// On Linux, dispatches to `scan_local_fs_uring` (io_uring-based async I/O).
+/// On other platforms, delegates to `parallel_scan_dir` (blocking I/O).
 ///
 /// Findings are emitted as structured JSONL events to stdout via the
 /// [`EventSink`]. Summary stats are written to stderr.
@@ -118,6 +123,64 @@ fn run_fs(
     if cfg.scan_binary {
         ps_config.skip_binary = false;
     }
+    #[cfg(target_os = "linux")]
+    let report = {
+        use crate::scheduler::local_fs_owner::{LocalReport, LocalStats};
+        use crate::scheduler::{scan_local_fs_uring, LocalFsUringConfig};
+
+        let defaults = LocalFsUringConfig::default();
+        let io_threads = (cfg.workers / 4).max(2);
+        let io_depth = defaults.io_depth;
+        // pool_buffers must be >= io_threads * io_depth (assertion floor), but
+        // the real requirement is headroom ABOVE that so completed I/O can sit
+        // in the CPU executor queue while I/O threads keep submitting.  Without
+        // headroom every buffer is in-flight and try_acquire() fails, stalling
+        // both I/O submission and the CPU pipeline.
+        let io_pool = io_threads * io_depth;
+        let cpu_headroom = cfg.workers * 4;
+        let pool_buffers = io_pool + cpu_headroom;
+
+        let uring_cfg = LocalFsUringConfig {
+            cpu_workers: cfg.workers,
+            io_threads,
+            io_depth,
+            chunk_size: ps_config.chunk_size,
+            pool_buffers,
+            max_in_flight_files: ps_config.max_in_flight_objects,
+            max_file_size: Some(ps_config.max_file_size),
+            dedupe_within_chunk: true,
+            seed: ps_config.seed,
+            skip_binary: ps_config.skip_binary,
+            archive: ps_config.archive.clone(),
+            ..defaults
+        };
+
+        let (summary, _io_stats, cpu_metrics) = scan_local_fs_uring(
+            engine,
+            std::slice::from_ref(&cfg.root),
+            uring_cfg,
+            Arc::clone(&event_sink),
+        )?;
+
+        let io_errors = summary
+            .walk_errors
+            .saturating_add(summary.open_errors)
+            .saturating_add(summary.read_errors);
+
+        LocalReport {
+            stats: LocalStats {
+                files_enqueued: summary.files_enqueued,
+                bytes_enqueued: 0,
+                io_errors,
+                dropped_findings: cpu_metrics.findings_dropped,
+                persistence_emit_failures: cpu_metrics.persistence_emit_failures,
+                persistence_incomplete: false,
+            },
+            metrics: cpu_metrics,
+        }
+    };
+
+    #[cfg(not(target_os = "linux"))]
     let report = parallel_scan_dir(&cfg.root, engine, ps_config)?;
 
     let scan_elapsed = scan_start.elapsed();

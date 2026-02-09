@@ -184,6 +184,8 @@ pub struct GitScanConfig {
     ///
     /// Default: min(available_parallelism, 8), clamped to at least 1.
     pub blob_intro_workers: usize,
+    /// Pin worker threads to CPU cores (Linux only, no-op elsewhere).
+    pub pin_threads: bool,
     /// Optional spill directory override. When `None`, a unique temp directory is used.
     pub spill_dir: Option<PathBuf>,
     /// Limits for in-memory artifact construction.
@@ -217,6 +219,7 @@ impl Default for GitScanConfig {
             pack_cache_bytes: 64 * 1024 * 1024,
             pack_exec_workers: default_pack_exec_workers(),
             blob_intro_workers: default_blob_intro_workers(),
+            pin_threads: crate::scheduler::affinity::default_pin_threads(),
             spill_dir: None,
             artifact_build: ArtifactBuildLimits::default(),
         }

@@ -334,6 +334,7 @@ mod tests {
             max_in_flight_objects: 8,
             max_file_size: u64::MAX,
             seed: 12345,
+            pin_threads: false,
             dedupe_within_chunk: true,
             archive: ArchiveConfig::default(),
             skip_binary: true,

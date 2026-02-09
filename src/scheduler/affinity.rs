@@ -244,6 +244,91 @@ pub fn try_pin_to_first_allowed() -> Option<usize> {
 }
 
 // ============================================================================
+// Defaults
+// ============================================================================
+
+/// Default for `pin_threads`: enabled on Linux, no-op elsewhere.
+pub const fn default_pin_threads() -> bool {
+    cfg!(target_os = "linux")
+}
+
+// ============================================================================
+// CoreAssigner
+// ============================================================================
+
+/// Thread-safe round-robin core assigner.
+///
+/// Distributes threads across available CPU cores using atomic round-robin
+/// assignment. Container/cgroup-aware: only assigns cores the process is
+/// actually allowed to use.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// let assigner = CoreAssigner::new().expect("not on Linux or no allowed CPUs");
+/// // In each thread's startup:
+/// assigner.pin_current_thread();
+/// ```
+pub struct CoreAssigner {
+    /// Sorted list of allowed core indices (cached at construction).
+    cores: Vec<usize>,
+    /// Round-robin index (wraps via modulo).
+    next: std::sync::atomic::AtomicUsize,
+}
+
+// SAFETY: `AtomicUsize` is `Send + Sync`, and `Vec<usize>` is `Send + Sync`.
+// The struct is safe to share across threads via `Arc` or borrowed references.
+unsafe impl Sync for CoreAssigner {}
+
+impl CoreAssigner {
+    /// Create a new assigner using all allowed CPUs.
+    ///
+    /// Returns `None` on non-Linux platforms or if no allowed CPUs can be
+    /// determined.
+    pub fn new() -> Option<Self> {
+        Self::with_offset(0)
+    }
+
+    /// Create a new assigner starting round-robin from `offset`.
+    ///
+    /// Useful for offsetting I/O threads past CPU worker cores:
+    /// ```rust,ignore
+    /// let io_assigner = CoreAssigner::with_offset(cpu_worker_count);
+    /// ```
+    pub fn with_offset(offset: usize) -> Option<Self> {
+        let allowed = allowed_cpus().ok()?;
+        let cores: Vec<usize> = allowed.iter().collect();
+        if cores.is_empty() {
+            return None;
+        }
+        Some(Self {
+            cores,
+            next: std::sync::atomic::AtomicUsize::new(offset),
+        })
+    }
+
+    /// Return the next core in round-robin order.
+    #[inline]
+    pub fn next_core(&self) -> usize {
+        let idx = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.cores[idx % self.cores.len()]
+    }
+
+    /// Pin the current thread to the next core in round-robin order.
+    ///
+    /// Returns `Some(core)` on success, `None` on failure (logged to stderr).
+    pub fn pin_current_thread(&self) -> Option<usize> {
+        try_pin_to_core(self.next_core())
+    }
+
+    /// Number of allowed cores.
+    #[inline]
+    pub fn available(&self) -> usize {
+        self.cores.len()
+    }
+}
+
+// ============================================================================
 // CpuSet
 // ============================================================================
 
@@ -552,5 +637,58 @@ mod tests {
         // On Linux with invalid core, same behavior
         let result = try_pin_to_core(CPU_SET_CAPACITY);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn default_pin_threads_matches_platform() {
+        let expected = cfg!(target_os = "linux");
+        assert_eq!(default_pin_threads(), expected);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn core_assigner_round_robin() {
+        let assigner = CoreAssigner::new().expect("should succeed on Linux");
+        assert!(assigner.available() > 0);
+
+        // Collect cores across multiple calls - should cycle
+        let n = assigner.available() * 2;
+        let mut assigned: Vec<usize> = Vec::with_capacity(n);
+        for _ in 0..n {
+            assigned.push(assigner.next_core());
+        }
+
+        // Second half should repeat first half (round-robin wrap)
+        let half = assigner.available();
+        assert_eq!(&assigned[..half], &assigned[half..]);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn core_assigner_with_offset() {
+        let a0 = CoreAssigner::with_offset(0).expect("should succeed on Linux");
+        let a1 = CoreAssigner::with_offset(1).expect("should succeed on Linux");
+
+        let first_from_0 = a0.next_core();
+        let first_from_1 = a1.next_core();
+
+        // With offset=1, the first core should be the second in the list
+        if a0.available() > 1 {
+            assert_ne!(first_from_0, first_from_1);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn core_assigner_pin_succeeds() {
+        let assigner = CoreAssigner::new().expect("should succeed on Linux");
+        let pinned = assigner.pin_current_thread();
+        assert!(pinned.is_some(), "pin should succeed on allowed core");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn core_assigner_returns_none_on_non_linux() {
+        assert!(CoreAssigner::new().is_none());
     }
 }
