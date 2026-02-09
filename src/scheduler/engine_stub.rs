@@ -72,13 +72,16 @@ pub struct RuleId(pub u16);
 ///   where the match "root" (anchor) was found. Used for deduplication.
 /// - `span_start/end`: Full match span (may extend beyond root hint)
 ///
-/// # Deduplication Key
+/// # Deduplication
 ///
-/// For overlap-based dedupe, the key is:
-/// `(rule_id, root_hint_start, root_hint_end, span_start, span_end)`
+/// **Cross-chunk** dedupe uses `root_hint_end`: findings with
+/// `root_hint_end < new_bytes_start` are dropped because the previous chunk
+/// owns them (see [`ScanScratch::drop_prefix_findings`]).
 ///
-/// `StepId` (transform chain) is intentionally excluded from the dedup key
-/// because the same match found via different transform paths is still one finding.
+/// **Within-chunk** dedupe (in [`local_fs_owner::dedupe_findings`]) uses the
+/// full 5-tuple `(rule_id, root_hint_start, root_hint_end, span_start, span_end)`.
+/// `StepId` (transform chain) is intentionally excluded because the same match
+/// found via different transform paths is still one finding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FindingRec {
     pub rule_id: RuleId,
@@ -174,14 +177,21 @@ impl ScanScratch {
         self.findings.retain(|f| f.root_hint_end >= new_bytes_start);
     }
 
-    /// Drain all findings into the provided vector.
+    /// Drain all findings into the provided vector (append semantics).
     ///
-    /// This transfers ownership without allocation (just pointer swap).
+    /// Unlike the real engine's `drain_findings` (which clears `out` first),
+    /// this **appends** to `out` via `Vec::append`. The internal findings
+    /// buffer is empty after this call. This uses pointer swap — no element
+    /// copying when `out` is empty.
     pub fn drain_findings_into(&mut self, out: &mut Vec<FindingRec>) {
         out.append(&mut self.findings);
     }
 
-    /// Add a finding (used by engine during scan).
+    /// Append a finding to the scratch buffer.
+    ///
+    /// No capacity check — the caller (mock engine) is expected to produce
+    /// a bounded number of findings per scan. In the real engine, the
+    /// analogous path is bounded by `max_findings_per_chunk`.
     pub(crate) fn push_finding(&mut self, rec: FindingRec) {
         self.findings.push(rec);
     }
@@ -376,11 +386,16 @@ impl EngineScratch for ScanScratch {
 
     fn drain_findings_into(&mut self, out: &mut Vec<Self::Finding>) {
         out.reserve(self.findings.len());
-        // Stub engine doesn't compute normalized secret hashes.
-        // Keep a deterministic placeholder to exercise carrier plumbing.
+        // The mock engine doesn't compute normalized secret hashes.
+        // A zero hash exercises the `FindingWithHash` carrier plumbing
+        // without introducing non-determinism into scheduler tests.
         for finding in self.findings.drain(..) {
             out.push(FindingWithHash::new(finding, [0; 32]));
         }
+    }
+
+    fn pending_findings_len(&self) -> usize {
+        self.findings.len()
     }
 }
 
@@ -408,6 +423,10 @@ impl ScanEngine for MockEngine {
 
     fn rule_name(&self, rule_id: u32) -> &str {
         self.rule_name(RuleId(rule_id as u16))
+    }
+
+    fn max_findings_per_chunk(&self) -> usize {
+        self.tuning.max_findings_per_chunk
     }
 }
 

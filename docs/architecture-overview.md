@@ -23,6 +23,7 @@ graph TB
         Walker["IterWalker<br/>File Discovery"]
         Scanner["scan_local()<br/>Owner-Compute Scan"]
         Events["EventSink<br/>JSONL/Text/JSON/SARIF"]
+        StoreProd["StoreProducer<br/>FS Persistence"]
     end
 
     subgraph GitPath["Git Scan Path"]
@@ -59,6 +60,7 @@ graph TB
     PScan --> Scanner
     Walker --> Scanner
     Scanner --> Events
+    Scanner --> StoreProd
 
     Scanner --> Engine
     Scanner --> TsBufferPool
@@ -162,6 +164,12 @@ graph TB
 | **Policy Hash**     | `src/git_scan/policy_hash.rs`  | Canonical BLAKE3 identity over rules, transforms, and tuning         |
 | **Store Keys**      | `src/store/keys.rs`            | `SCANNER_SECRET_KEY` bootstrap, subkey derivation, and run correlation mode metadata |
 | **Store Identity**  | `src/store/identity.rs`        | Versioned `rule_fingerprint` / `secret_hash` / `occurrence_id` contracts for FS persistence |
+| **StoreProducer**   | `src/store/fs.rs`              | Write-side trait for FS finding persistence; scheduler calls `emit_fs_batch` per object |
+| **FsFindingRecord** | `src/store/fs.rs`              | Backend-agnostic post-dedupe finding record with `norm_hash` |
+| **FsFindingBatch**  | `src/store/fs.rs`              | Borrowed batch grouping findings for a single scanned object |
+| **FsRunLoss**       | `src/store/fs.rs`              | Run-level drop/failure accounting for persistence completeness |
+| **NullStoreProducer** | `src/store/fs.rs`            | No-op producer for CLI default and feature-off paths |
+| **InMemoryStoreProducer** | `src/store/fs.rs`        | In-memory collector for tests and diagnostics |
 
 
 ## Archive Scanning Notes
@@ -361,7 +369,9 @@ Scheduler harness code lives in `src/scheduler/sim_executor_harness.rs`.
 3. **FS Discovery**: `IterWalker` discovers files and `scan_local` assigns work to workers
 4. **Scanning**: Workers read overlap-aware chunks, run `Engine`, and dedupe overlap findings
 5. **Output**: Findings stream through `EventSink` implementations to stdout
-6. **Memory**: Scheduler/runtime buffer pools and engine scratch structures are reused per run
+6. **Persistence**: When enabled (`--persist-findings`), post-dedupe findings are also emitted
+   to a `StoreProducer` backend; run-level loss accounting is recorded at scan end
+7. **Memory**: Scheduler/runtime buffer pools and engine scratch structures are reused per run
 
 ## Design Principles
 

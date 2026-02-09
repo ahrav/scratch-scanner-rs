@@ -19,11 +19,13 @@ flowchart LR
     Detect -->|regular file| ChunkLoop["Sequential read + overlap carry"]
     ChunkLoop --> Engine["Engine::scan_chunk_into()"]
     Engine --> Emit["ScanEvent::Finding via EventSink"]
+    Engine --> Persist["emit_persistence_batch()<br/>via StoreProducer"]
 
     Pool["TsBufferPool"] -.->|"acquire()"| ChunkLoop
     ChunkLoop -.->|"TsBufferHandle::drop()"| Pool
 
     Emit --> Summary["Summary event + sink.flush()"]
+    Persist -.->|"run end"| RunLoss["record_fs_run_loss()"]
 ```
 
 ## Stage Details
@@ -46,11 +48,22 @@ flowchart LR
   - Binary skip/extract gate (content-policy based)
   - Sequential read with overlap carry (`copy_within` tail -> head)
   - `Engine::scan_chunk_into(...)` + `drop_prefix_findings(...)`
-  - Optional within-chunk dedupe + `ScanEvent::Finding` emission
+  - Optional within-chunk dedupe (includes `norm_hash` in dedup key) + `ScanEvent::Finding` emission
+  - `build_persistence_batch()` + `emit_persistence_batch()` via `StoreProducer` (when configured)
 
 ### Output
 - Findings are emitted directly through `EventSink` (JSONL/Text/JSON/SARIF)
 - No filesystem-path `OutputStage` queue in the scheduler flow
+
+### Persistence (Optional)
+- When `--persist-findings` is set, post-dedupe findings are also emitted to a
+  `StoreProducer` via `emit_persistence_batch()` at every scan site
+- Each batch carries the scanned object's path and its `FsFindingRecord` values
+- At run end, `record_fs_run_loss()` emits loss accounting (`FsRunLoss`) so the
+  backend can decide whether the run is complete or partial
+- Errors from the producer are counted (`persistence_emit_failures`) but do not
+  abort the scan — fail-soft semantics
+- See [fs-persistence-pipeline.md](fs-persistence-pipeline.md) for full details
 
 `PipelineStats` in `src/pipeline.rs` includes `archive: ArchiveStats`, while
 the active scheduler report type is `LocalReport`/`MetricsSnapshot`.
@@ -64,6 +77,7 @@ sequenceDiagram
     participant File as std::fs::File
     participant Engine as Engine
     participant Sink as EventSink
+    participant Store as StoreProducer
 
     Worker->>Pool: acquire()
     Pool-->>Worker: TsBufferHandle
@@ -71,6 +85,7 @@ sequenceDiagram
         Worker->>File: read(payload after overlap carry)
         Worker->>Engine: scan_chunk_into(data, file_id, base_offset, scratch)
         Worker->>Worker: drop_prefix_findings + optional dedupe
+        Worker->>Store: emit_persistence_batch(path, findings)
         Worker->>Sink: emit ScanEvent::Finding
     end
     Worker->>Pool: TsBufferHandle::drop()

@@ -25,7 +25,12 @@ use regex::bytes::CaptureLocations;
 
 use super::Engine;
 
-/// Normalized secret hash bytes (BLAKE3 output).
+/// BLAKE3 digest of the normalized (whitespace-collapsed, case-folded) secret
+/// value. 32 bytes = 256 bits, matching BLAKE3's default output length.
+///
+/// Used for cross-chunk and cross-run deduplication: two findings with the
+/// same `NormHash` are considered the same secret regardless of surrounding
+/// context or encoding transform.
 pub type NormHash = [u8; 32];
 
 /// Scratch histogram for entropy gating.
@@ -1123,6 +1128,36 @@ impl ScanScratch {
         self.drop_hint_end.clear();
     }
 
+    /// Moves all findings and aligned normalized hashes without allocating.
+    ///
+    /// # Panics
+    /// Panics if either output vector capacity is smaller than the number of
+    /// pending findings.
+    pub fn drain_findings_with_hashes(
+        &mut self,
+        findings_out: &mut Vec<FindingRec>,
+        norm_hash_out: &mut Vec<NormHash>,
+    ) {
+        findings_out.clear();
+        norm_hash_out.clear();
+        assert_eq!(
+            self.out.len(),
+            self.norm_hash.len(),
+            "norm hash length mismatch"
+        );
+        assert!(
+            findings_out.capacity() >= self.out.len(),
+            "findings output capacity too small"
+        );
+        assert!(
+            norm_hash_out.capacity() >= self.norm_hash.len(),
+            "norm-hash output capacity too small"
+        );
+        findings_out.extend(self.out.drain());
+        norm_hash_out.extend(self.norm_hash.drain());
+        self.drop_hint_end.clear();
+    }
+
     /// Returns the number of pending compact findings.
     pub fn pending_findings_len(&self) -> usize {
         self.out.len()
@@ -1430,7 +1465,11 @@ impl ScanScratch {
 #[cfg(test)]
 mod tests {
     use super::{normalize_root_hint_end_for_dedup, CachelineBoundary, ScanScratch};
-    use crate::api::{FileId, FindingRec, StepId, TransformId, STEP_ROOT};
+    use crate::api::{
+        FileId, FindingRec, RuleSpec, StepId, TransformConfig, TransformId, Tuning, STEP_ROOT,
+    };
+    use crate::engine::Engine;
+    use regex::bytes::Regex;
 
     #[test]
     fn scanscratch_cold_region_is_cacheline_aligned() {
@@ -1482,6 +1521,47 @@ mod tests {
         }
     }
 
+    fn test_tuning() -> Tuning {
+        Tuning {
+            merge_gap: 64,
+            max_windows_per_rule_variant: 64,
+            pressure_gap_start: 128,
+            max_anchor_hits_per_rule_variant: 256,
+            max_utf16_decoded_bytes_per_window: 4096,
+            max_transform_depth: 2,
+            max_total_decode_output_bytes: 1024 * 1024,
+            max_work_items: 64,
+            max_findings_per_chunk: 4096,
+            scan_utf16_variants: true,
+        }
+    }
+
+    fn simple_rule() -> RuleSpec {
+        RuleSpec {
+            name: "test-secret",
+            anchors: &[b"SECRET"],
+            radius: 32,
+            validator: crate::api::ValidatorKind::None,
+            two_phase: None,
+            must_contain: None,
+            keywords_any: None,
+            value_suppressors_any: None,
+            entropy: None,
+            local_context: None,
+            secret_group: None,
+            re: Regex::new(r"SECRET[A-Z0-9]{8}").unwrap(),
+        }
+    }
+
+    fn new_test_scratch() -> ScanScratch {
+        let engine = Engine::new(
+            vec![simple_rule()],
+            Vec::<TransformConfig>::new(),
+            test_tuning(),
+        );
+        engine.new_scratch()
+    }
+
     #[test]
     fn engine_normalize_url_percent_not_snapped() {
         // decoded_len=13, min_encoded(base64)=18
@@ -1512,5 +1592,51 @@ mod tests {
         let rec = make_rec(StepId(1), 200, 213, 1000, 1019);
         let result = normalize_root_hint_end_for_dedup(&rec, None);
         assert_eq!(result, 1019);
+    }
+
+    #[test]
+    fn drain_findings_with_hashes_preserves_alignment_and_order() {
+        let mut scratch = new_test_scratch();
+        let rec_a = make_rec(STEP_ROOT, 10, 16, 100, 106);
+        let rec_b = make_rec(STEP_ROOT, 20, 26, 200, 206);
+        let hash_a = [0xA1; 32];
+        let hash_b = [0xB2; 32];
+
+        scratch.push_finding(rec_a, hash_a);
+        scratch.push_finding(rec_b, hash_b);
+
+        let mut findings_out = Vec::with_capacity(2);
+        let mut hash_out = Vec::with_capacity(2);
+        scratch.drain_findings_with_hashes(&mut findings_out, &mut hash_out);
+
+        assert_eq!(findings_out, vec![rec_a, rec_b]);
+        assert_eq!(hash_out, vec![hash_a, hash_b]);
+        assert_eq!(scratch.pending_findings_len(), 0);
+        assert!(scratch.norm_hashes().is_empty());
+        assert!(scratch.drop_hint_end().is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "findings output capacity too small")]
+    fn drain_findings_with_hashes_panics_when_findings_capacity_too_small() {
+        let mut scratch = new_test_scratch();
+        scratch.push_finding(make_rec(STEP_ROOT, 10, 16, 100, 106), [0x11; 32]);
+        scratch.push_finding(make_rec(STEP_ROOT, 20, 26, 200, 206), [0x22; 32]);
+
+        let mut findings_out = Vec::with_capacity(1);
+        let mut hash_out = Vec::with_capacity(2);
+        scratch.drain_findings_with_hashes(&mut findings_out, &mut hash_out);
+    }
+
+    #[test]
+    #[should_panic(expected = "norm-hash output capacity too small")]
+    fn drain_findings_with_hashes_panics_when_hash_capacity_too_small() {
+        let mut scratch = new_test_scratch();
+        scratch.push_finding(make_rec(STEP_ROOT, 10, 16, 100, 106), [0x11; 32]);
+        scratch.push_finding(make_rec(STEP_ROOT, 20, 26, 200, 206), [0x22; 32]);
+
+        let mut findings_out = Vec::with_capacity(2);
+        let mut hash_out = Vec::with_capacity(1);
+        scratch.drain_findings_with_hashes(&mut findings_out, &mut hash_out);
     }
 }

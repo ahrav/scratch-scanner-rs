@@ -19,10 +19,13 @@ use scanner_rs::archive::{
     ArchiveSkipReason, EncryptedPolicy, EntrySkipReason, PartialReason, UnsupportedPolicy,
 };
 use scanner_rs::scheduler::engine_stub::{MockEngine, MockRule};
-use scanner_rs::scheduler::engine_trait::{EngineScratch, FindingRecord, ScanEngine};
+use scanner_rs::scheduler::engine_trait::{
+    EngineScratch, FindingRecord, FindingWithHashRecord, ScanEngine,
+};
 use scanner_rs::scheduler::local_fs_owner::{
     scan_local, LocalConfig, LocalFile, LocalReport, VecFileSource,
 };
+use scanner_rs::store::InMemoryStoreProducer;
 use scanner_rs::unified::events::VecEventSink;
 use scanner_rs::FileId;
 use std::fs::{self, File};
@@ -586,6 +589,13 @@ impl FindingRecord for DummyFinding {
     }
 }
 
+impl FindingWithHashRecord for DummyFinding {
+    fn norm_hash(&self) -> &scanner_rs::NormHash {
+        const ZERO: scanner_rs::NormHash = [0; 32];
+        &ZERO
+    }
+}
+
 struct IdScratch {
     findings: Vec<DummyFinding>,
 }
@@ -635,6 +645,10 @@ impl ScanEngine for IdEngine {
 
     fn rule_name(&self, _rule_id: u32) -> &str {
         "rule"
+    }
+
+    fn max_findings_per_chunk(&self) -> usize {
+        4096
     }
 }
 
@@ -1847,4 +1861,106 @@ fn nested_depth_limit_is_recorded() {
         "expected depth_exceeded to be counted: {:?}",
         report.metrics.archive
     );
+}
+
+// ============================================================================
+// Archive + persistence integration tests
+// ============================================================================
+
+/// Helper: run a scan with an InMemoryStoreProducer and return (output, report, producer).
+fn run_scan_with_persistence(
+    files: Vec<LocalFile>,
+    mut cfg: LocalConfig,
+) -> (String, LocalReport, Arc<InMemoryStoreProducer>) {
+    let engine = Arc::new(MockEngine::new(
+        vec![MockRule {
+            name: "secret".into(),
+            pattern: b"SECRET".to_vec(),
+        }],
+        16,
+    ));
+    let sink = Arc::new(VecEventSink::new());
+    let producer = Arc::new(InMemoryStoreProducer::default());
+    cfg.event_sink = Arc::clone(&sink) as Arc<dyn scanner_rs::unified::events::EventSink>;
+    cfg.store_producer = Some(Arc::clone(&producer) as Arc<dyn scanner_rs::store::StoreProducer>);
+    let report = scan_local(engine, VecFileSource::new(files), cfg);
+    let out = String::from_utf8_lossy(&sink.take()).to_string();
+    (out, report, producer)
+}
+
+#[test]
+fn persistence_batches_emitted_for_gzip_scan() {
+    let dir = TempDir::new().unwrap();
+    let gz = dir.path().join("payload.gz");
+    let payload = payload_with_secret_at(5);
+    write_gz(&gz, &payload).unwrap();
+
+    let cfg = cfg_archives_enabled();
+    let (_out, report, producer) = run_scan_with_persistence(vec![file_from_path(&gz)], cfg);
+
+    let batches = producer.batches();
+    let persisted: usize = batches.iter().map(|b| b.findings.len()).sum();
+    assert!(
+        !batches.is_empty(),
+        "expected persistence batches for gzip scan"
+    );
+    assert_eq!(
+        persisted as u64, report.metrics.findings_emitted,
+        "persisted count should match findings_emitted"
+    );
+
+    // Run-loss should be recorded.
+    let losses = producer.losses();
+    assert_eq!(losses.len(), 1, "expected exactly one run-loss record");
+}
+
+#[test]
+fn persistence_batches_emitted_for_tar_scan() {
+    let dir = TempDir::new().unwrap();
+    let tar_path = dir.path().join("payload.tar");
+    let payload = payload_with_secret_at(3);
+    let tar_bytes = build_simple_tar("entry.txt", &payload);
+    fs::write(&tar_path, tar_bytes).unwrap();
+
+    let cfg = cfg_archives_enabled();
+    let (_out, report, producer) = run_scan_with_persistence(vec![file_from_path(&tar_path)], cfg);
+
+    let batches = producer.batches();
+    let persisted: usize = batches.iter().map(|b| b.findings.len()).sum();
+    assert!(
+        !batches.is_empty(),
+        "expected persistence batches for tar scan"
+    );
+    assert_eq!(
+        persisted as u64, report.metrics.findings_emitted,
+        "persisted count should match findings_emitted"
+    );
+
+    let losses = producer.losses();
+    assert_eq!(losses.len(), 1, "expected exactly one run-loss record");
+}
+
+#[test]
+fn persistence_batches_emitted_for_zip_scan() {
+    let dir = TempDir::new().unwrap();
+    let zip_path = dir.path().join("payload.zip");
+    let payload = payload_with_secret_at(2);
+    write_zip(&zip_path, &[("secret.txt", &payload)]).unwrap();
+
+    let cfg = cfg_archives_enabled();
+    let (_out, report, producer) = run_scan_with_persistence(vec![file_from_path(&zip_path)], cfg);
+
+    let batches = producer.batches();
+    let persisted: usize = batches.iter().map(|b| b.findings.len()).sum();
+    assert!(
+        !batches.is_empty(),
+        "expected persistence batches for zip scan"
+    );
+    assert_eq!(
+        persisted as u64, report.metrics.findings_emitted,
+        "persisted count should match findings_emitted"
+    );
+
+    let losses = producer.losses();
+    assert_eq!(losses.len(), 1, "expected exactly one run-loss record");
 }

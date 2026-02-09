@@ -5,7 +5,7 @@ Verified against:
 `src/api.rs`, `src/engine/core.rs`, `src/engine/rule_repr.rs`,
 `src/engine/scratch.rs`, `src/runtime.rs`, `src/pipeline.rs`,
 `src/pool/node_pool.rs`, `src/stdx/{bitset,ring_buffer}.rs`,
-`src/store/keys.rs`, and `src/store/identity.rs`.
+`src/store/keys.rs`, `src/store/identity.rs`, and `src/store/fs.rs`.
 
 ```mermaid
 classDiagram
@@ -113,8 +113,14 @@ classDiagram
         +bool scan_utf16_variants
     }
 
+    class NormHash {
+        [u8; 32]
+        BLAKE3 normalized secret digest
+    }
+
     class ScanScratch {
         -ScratchVec~FindingRec~ out
+        -ScratchVec~NormHash~ norm_hash
         -ScratchVec~WorkItem~ work_q
         -usize work_head
         -DecodeSlab slab
@@ -127,7 +133,10 @@ classDiagram
         -StepArena step_arena
         +drain_findings(out)
         +drain_findings_into(out)
+        +drain_findings_with_hashes(findings, hashes)
         +findings() &[FindingRec]
+        +norm_hashes() &[NormHash]
+        +dropped_findings() usize
     }
 
     class Finding {
@@ -173,6 +182,7 @@ classDiagram
     TwoPhaseCompiled --> PackedPatterns : uses
 
     ScanScratch --> FindingRec : produces
+    ScanScratch --> NormHash : produces aligned hashes
     ScanScratch --> StepId : tracks
 
     Finding --> DecodeStep : contains
@@ -373,6 +383,74 @@ classDiagram
     }
 ```
 
+## FS Persistence Producer Types
+
+```mermaid
+classDiagram
+    direction TB
+
+    class FsFindingRecord {
+        +u32 rule_id
+        +u64 root_hint_start
+        +u64 root_hint_end
+        +u64 span_start
+        +u64 span_end
+        +NormHash norm_hash
+    }
+
+    class FsFindingBatch {
+        +&[u8] object_path
+        +&[FsFindingRecord] findings
+    }
+
+    class FsRunLoss {
+        +u64 dropped_findings
+        +u64 persistence_emit_failures
+        +bool incomplete
+    }
+
+    class StoreProducer {
+        <<trait>>
+        +emit_fs_batch(batch) Result
+        +record_fs_run_loss(loss) Result
+    }
+
+    class NullStoreProducer {
+        no-op default
+    }
+
+    class InMemoryStoreProducer {
+        -Mutex~Vec~ batches
+        -Mutex~Vec~ losses
+        +batches() Vec
+        +losses() Vec
+    }
+
+    FsFindingBatch --> FsFindingRecord : contains
+    FsFindingRecord --> NormHash : carries
+    StoreProducer <|.. NullStoreProducer : implements
+    StoreProducer <|.. InMemoryStoreProducer : implements
+    StoreProducer ..> FsFindingBatch : receives
+    StoreProducer ..> FsRunLoss : receives
+```
+
+Verified against: `src/store/fs.rs`.
+
+**Data flow**: After within-chunk dedup, the scheduler's `build_persistence_batch()`
+converts `FindingWithHash<F>` carriers into `FsFindingRecord` values. These are
+grouped per scanned object in `FsFindingBatch` and handed to the configured
+`StoreProducer`. At run end, `record_fs_run_loss()` captures drop/failure counters
+so the backend can mark the run as incomplete when warranted.
+
+| Type | Purpose |
+|------|---------|
+| `FsFindingRecord` | Post-dedupe, backend-agnostic finding with absolute byte offsets and `norm_hash` |
+| `FsFindingBatch` | Borrowed batch of findings for one scanned object (file or archive entry) |
+| `FsRunLoss` | Run-level loss accounting (dropped findings, emit failures, incomplete flag) |
+| `StoreProducer` | `Send + Sync` trait for FS finding persistence (`Arc<dyn StoreProducer>`) |
+| `NullStoreProducer` | Default no-op for CLI / feature-off paths |
+| `InMemoryStoreProducer` | Collects batches in memory for tests and diagnostics |
+
 ## Persistence Identity Types
 
 ```mermaid
@@ -474,3 +552,7 @@ See [persistence-identity.md](persistence-identity.md) for contract details and 
 | `StoreKeys` | contains | `RunModeMetadata` | Run correlation semantics |
 | `OccurrenceInput` | references | `FindingRec` | Finding to hash |
 | `OccurrenceInput` | contains | `VariantDiscriminant` | UTF-16 variant discrimination |
+| `FsFindingBatch` | contains | `FsFindingRecord` | Post-dedupe findings per object |
+| `FsFindingRecord` | carries | `NormHash` | BLAKE3 digest for cross-run dedup |
+| `StoreProducer` | receives | `FsFindingBatch` | Per-object finding persistence |
+| `StoreProducer` | receives | `FsRunLoss` | Run-level loss accounting |

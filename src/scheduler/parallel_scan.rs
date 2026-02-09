@@ -89,6 +89,7 @@
 use super::local_fs_owner::{scan_local, FileSource, LocalConfig, LocalFile, LocalReport};
 use crate::archive::ArchiveConfig;
 use crate::engine::Engine;
+use crate::store::StoreProducer;
 
 use std::io;
 use std::path::Path;
@@ -288,6 +289,14 @@ pub struct ParallelScanConfig {
     /// All findings are emitted as structured events through this sink.
     /// Defaults to [`NullEventSink`](crate::unified::events::NullEventSink).
     pub event_sink: Arc<dyn crate::unified::events::EventSink>,
+
+    /// Optional persistence producer for post-dedupe FS findings.
+    ///
+    /// When `Some`, the scheduler calls [`StoreProducer::emit_fs_batch`] for
+    /// each scanned object that produces findings, and
+    /// [`StoreProducer::record_fs_run_loss`] once at run end.
+    /// When `None` (the default), no persistence callbacks are made.
+    pub store_producer: Option<Arc<dyn StoreProducer>>,
 }
 
 impl Default for ParallelScanConfig {
@@ -307,6 +316,7 @@ impl Default for ParallelScanConfig {
             archive: ArchiveConfig::default(),
             skip_binary: true,
             event_sink: Arc::new(crate::unified::events::NullEventSink),
+            store_producer: None,
         }
     }
 }
@@ -327,6 +337,10 @@ impl std::fmt::Debug for ParallelScanConfig {
             .field("archive", &self.archive)
             .field("skip_binary", &self.skip_binary)
             .field("event_sink", &"<dyn EventSink>")
+            .field(
+                "store_producer",
+                &self.store_producer.as_ref().map(|_| "<dyn StoreProducer>"),
+            )
             .finish()
     }
 }
@@ -351,6 +365,7 @@ impl ParallelScanConfig {
             archive: self.archive.clone(),
             skip_binary: self.skip_binary,
             event_sink: self.event_sink.clone(),
+            store_producer: self.store_producer.clone(),
         }
     }
 }
@@ -642,6 +657,7 @@ mod tests {
             archive: ArchiveConfig::default(),
             skip_binary: true,
             event_sink: Arc::new(crate::unified::events::NullEventSink),
+            store_producer: None,
         }
     }
 

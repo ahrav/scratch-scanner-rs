@@ -30,14 +30,15 @@ and maintains zero allocations during the hot path. Memory scales with worker co
 These figures are from the diagnostic sizing model (`223` builtin rules,
 `max_anchor_hits_per_rule_variant = 2048`, and a `64 KiB` overlap estimate).
 
-### Per-Worker Allocation (~18.8 MiB each)
+### Per-Worker Allocation (~19.1 MiB each)
 
 | Component                           | Size      | % of Total |
 | ----------------------------------- | --------- | ---------- |
-| **HitAccPool.windows**              | 15.68 MiB | 83.3%      |
-| FixedSet128 (seen_findings)         | 768 KiB   | 4.0%       |
+| **HitAccPool.windows**              | 15.68 MiB | 82.1%      |
+| FixedSet128 (seen_findings)         | 768 KiB   | 3.9%       |
 | FindingRec buffers (out + tmp)      | 640 KiB   | 3.3%       |
 | DecodeSlab                          | 512 KiB   | 2.6%       |
+| norm_hash_buf (RealEngineScratch)   | ~256 KiB  | 1.3%       |
 | Other (ByteRing, TimingWheel, etc.) | ~1.2 MiB  | 6.8%       |
 
 **Key insight**: HitAccPool dominates at 83.3% of per-worker memory. This is
@@ -75,6 +76,14 @@ After startup allocation, the scan phase is allocation-free:
 Startup may perform best-effort Vectorscan DB cache I/O (deserialize on hit,
 serialize on miss) for raw prefilter and decoded-stream prefilter databases.
 This affects startup latency only; hot-path scan memory behavior is unchanged.
+
+**FS persistence allocation**: When a `StoreProducer` is configured,
+`build_persistence_batch()` fills a per-worker `Vec<FsFindingRecord>` buffer
+sized to the post-dedupe finding count. This buffer is reused across files
+to avoid per-object allocation. The `emit_fs_batch()` call borrows the batch,
+so backends must copy or serialize before returning. This is off the hot
+chunk-scanning path (occurs once per scanned object, after all chunks are
+processed).
 
 Path storage is also bounded: `FileTable` maintains a fixed-capacity byte arena
 for Unix paths. Archive expansion uses fallible `try_*` insertion APIs plus

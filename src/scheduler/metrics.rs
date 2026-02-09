@@ -312,6 +312,10 @@ pub struct WorkerMetricsLocal {
     pub io_errors: u64,
     /// Total findings emitted by this worker.
     pub findings_emitted: u64,
+    /// Findings dropped by engine per-chunk caps.
+    pub findings_dropped: u64,
+    /// Persistence batch emission failures.
+    pub persistence_emit_failures: u64,
     /// Cumulative nanoseconds spent in open + stat syscalls (perf-stats only).
     pub open_stat_ns: u64,
     /// Cumulative nanoseconds spent in read syscalls (perf-stats only).
@@ -357,6 +361,8 @@ impl WorkerMetricsLocal {
             park_count: 0,
             io_errors: 0,
             findings_emitted: 0,
+            findings_dropped: 0,
+            persistence_emit_failures: 0,
             open_stat_ns: 0,
             read_ns: 0,
             scan_ns: 0,
@@ -459,6 +465,10 @@ pub struct MetricsSnapshot {
     pub io_errors: u64,
     /// Total findings emitted across all workers.
     pub findings_emitted: u64,
+    /// Total findings dropped by engine per-chunk caps.
+    pub findings_dropped: u64,
+    /// Total persistence batch emission failures.
+    pub persistence_emit_failures: u64,
     /// Total files skipped because they appear to be binary.
     pub binary_skipped: u64,
     /// Total files where text was extracted from a known binary format.
@@ -504,6 +514,8 @@ impl MetricsSnapshot {
             yield_count: 0,
             io_errors: 0,
             findings_emitted: 0,
+            findings_dropped: 0,
+            persistence_emit_failures: 0,
             binary_skipped: 0,
             binary_extracted: 0,
             archive: ArchiveStats::default(),
@@ -531,6 +543,10 @@ impl MetricsSnapshot {
         self.chunks_scanned = self.chunks_scanned.wrapping_add(w.chunks_scanned);
         self.io_errors = self.io_errors.wrapping_add(w.io_errors);
         self.findings_emitted = self.findings_emitted.wrapping_add(w.findings_emitted);
+        self.findings_dropped = self.findings_dropped.wrapping_add(w.findings_dropped);
+        self.persistence_emit_failures = self
+            .persistence_emit_failures
+            .wrapping_add(w.persistence_emit_failures);
         self.binary_skipped = self.binary_skipped.wrapping_add(w.binary_skipped);
         self.binary_extracted = self.binary_extracted.wrapping_add(w.binary_extracted);
         self.worker_count = self.worker_count.wrapping_add(1);

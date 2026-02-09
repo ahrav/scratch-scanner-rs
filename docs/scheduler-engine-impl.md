@@ -10,8 +10,8 @@ This module implements the adapter layer connecting the scheduler's abstract eng
 
 The `engine_impl` module provides **trait implementations** that bridge the gap between two different worlds:
 
-- **Scheduler side**: Expects generic traits (`ScanEngine`, `EngineScratch`, `FindingRecord`)
-- **Engine side**: Has concrete types (`crate::engine::Engine`, `ScanScratch`, `FindingRec`)
+- **Scheduler side**: Expects generic traits (`ScanEngine`, `EngineScratch`, `FindingRecord`, `FindingWithHashRecord`)
+- **Engine side**: Has concrete types (`crate::engine::Engine`, `ScanScratch`, `FindingRec`, `NormHash`)
 
 This decoupling allows:
 - The scheduler to remain engine-agnostic (can work with mock or real engine)
@@ -30,6 +30,7 @@ This decoupling allows:
 | Concept | Scheduler Trait | Real Engine Type | Wrapper |
 |---------|-----------------|------------------|---------|
 | Finding | `FindingRecord` | `crate::api::FindingRec` | Direct impl (no wrapper) |
+| Finding+Hash | `FindingWithHashRecord` | `FindingWithHash<ApiFindingRec>` | `FindingWithHash` carrier |
 | Scratch | `EngineScratch` | `crate::engine::ScanScratch` | `RealEngineScratch` |
 | Engine | `ScanEngine` | `crate::engine::Engine` | Direct impl |
 
@@ -111,20 +112,22 @@ Instead of fighting the design, the module implements a **lazy reset** approach 
 Worker Thread Creation:
   ├─ Engine::new_scratch() → RealScanScratch
   ├─ RealEngineScratch::new(scratch, max_findings)
-  │  └─ Creates findings_buf with capacity
+  │  ├─ Creates findings_buf with capacity
+  │  └─ Creates norm_hash_buf with capacity
   └─ Stored in WorkerCtx (thread-local)
 
 For Each File:
-  ├─ Optional: scratch.clear() → clears findings_buf only
+  ├─ Optional: scratch.clear() → clears findings_buf + norm_hash_buf only
   └─ For Each Chunk:
      ├─ scan_chunk_into()
      │  ├─ Engine handles internal scratch reset/validation as part of scan
-     │  ├─ Scans chunk, appends to real ScanScratch
-     │  └─ Findings now in scratch.scratch
+     │  ├─ Scans chunk, appends findings + norm_hashes to real ScanScratch
+     │  └─ Findings and hashes now in scratch.scratch
      ├─ drop_prefix_findings() → delegates to real scratch
      └─ drain_findings_into()
-        ├─ Real scratch.drain_findings() → findings_buf
-        └─ findings_buf.append() → out vector
+        ├─ Real scratch.drain_findings_with_hashes() → findings_buf + norm_hash_buf
+        ├─ Zip findings with aligned hashes → FindingWithHash carriers
+        └─ Append FindingWithHash values → out vector
 ```
 
 ### Why This Works
@@ -173,6 +176,7 @@ This module is a classic **Adapter** pattern (also called **Wrapper**):
 | Finding types differ slightly (u32 vs u16 for rule_id) | Type conversion in trait impl |
 | Engine returns `ScanScratch`, trait expects `RealEngineScratch` | `RealEngineScratch::new()` wrapper |
 | Findings need extraction from engine scratch | `drain_findings_into()` buffer pattern |
+| Findings and hashes stored in parallel vectors in engine scratch | `drain_findings_with_hashes()` + zip into `FindingWithHash` carriers |
 
 ### Benefits of This Approach
 
@@ -185,12 +189,13 @@ This module is a classic **Adapter** pattern (also called **Wrapper**):
 
 ## 5. Key Structures
 
-### `RealEngineScratch` (lines 94-142)
+### `RealEngineScratch` (lines 94-149)
 
 ```rust
 pub struct RealEngineScratch {
     scratch: RealScanScratch,           // The real engine's native scratch
-    findings_buf: Vec<ApiFindingRec>,   // Temporary drain buffer
+    findings_buf: Vec<ApiFindingRec>,   // Temporary drain buffer (findings)
+    norm_hash_buf: Vec<NormHash>,       // Temporary drain buffer (hashes)
 }
 ```
 
@@ -201,9 +206,12 @@ pub struct RealEngineScratch {
 - `findings_buf`: A pre-allocated buffer used to extract findings from the real scratch
   - Reused across chunk drains to minimize allocations
   - Sized to `max_findings_per_chunk` at creation
+- `norm_hash_buf`: A pre-allocated buffer for extracting `NormHash` values aligned with `findings_buf`
+  - Sized identically to `findings_buf` at creation
+  - Drained in lockstep with findings to construct `FindingWithHash` carriers
 
 **Methods**:
-- `new(scratch, max_findings)`: Wraps a real scratch with a findings buffer
+- `new(scratch, max_findings)`: Wraps a real scratch with findings and hash buffers
 - `inner_mut()`: Provides mutable access for the engine's `scan_chunk_into()`
 
 ### `RealScanScratch` (from `crate::engine`)
@@ -237,27 +245,41 @@ Maps directly to the `FindingRecord` trait methods.
 
 ### Buffered Findings Extraction
 
-**The Pattern** (lines 160-174):
+**The Pattern** (lines 168-197):
 
 ```rust
 fn drain_findings_into(&mut self, out: &mut Vec<Self::Finding>) {
-    // Ensure capacity
-    if self.findings_buf.capacity() >= self.scratch.pending_findings_len() {
-        self.scratch.drain_findings(&mut self.findings_buf);
-        out.append(&mut self.findings_buf);
-    } else {
-        self.findings_buf.reserve(...);
-        // ...
+    self.findings_buf.clear();
+    self.norm_hash_buf.clear();
+    let pending = self.scratch.pending_findings_len();
+    // Ensure capacity for both buffers
+    if self.findings_buf.capacity() < pending {
+        self.findings_buf.reserve(pending);
+    }
+    if self.norm_hash_buf.capacity() < pending {
+        self.norm_hash_buf.reserve(pending);
+    }
+    // Drain findings and hashes into separate buffers
+    self.scratch.drain_findings_with_hashes(
+        &mut self.findings_buf, &mut self.norm_hash_buf,
+    );
+    // Zip and append as FindingWithHash carriers
+    out.reserve(self.findings_buf.len());
+    for (finding, norm_hash) in self.findings_buf.drain(..)
+        .zip(self.norm_hash_buf.drain(..))
+    {
+        out.push(FindingWithHash::new(finding, norm_hash));
     }
 }
 ```
 
 **How it works**:
-1. `self.scratch.drain_findings()` moves findings into `findings_buf`
-2. `out.append()` moves `findings_buf` into `out` without per-record cloning
-3. `findings_buf` is then empty but retains its capacity for reuse
+1. `drain_findings_with_hashes()` moves findings and hashes into separate buffers
+2. Zip iterator pairs each finding with its aligned hash
+3. Each pair is wrapped in a `FindingWithHash` carrier and appended to `out`
+4. Both buffers retain capacity for reuse across chunks
 
-**Cost**: O(n) moves for `drain_findings()` + `append()`, typically without extra allocations once buffers are sized
+**Cost**: O(n) moves for `drain_findings_with_hashes()` + O(n) `FindingWithHash` construction, typically without extra allocations once buffers are sized
 
 ### Thread-Local Scratch Benefits
 
@@ -312,12 +334,18 @@ Both modules implement the same traits:
 // engine_impl.rs
 impl FindingRecord for crate::api::FindingRec { ... }
 impl ScanEngine for crate::engine::Engine { ... }
-impl EngineScratch for RealEngineScratch { ... }
+impl EngineScratch for RealEngineScratch {
+    type Finding = FindingWithHash<ApiFindingRec>;
+    ...
+}
 
 // engine_stub.rs
 impl FindingRecord for FindingRec { ... }
 impl ScanEngine for MockEngine { ... }
-impl EngineScratch for ScanScratch { ... }
+impl EngineScratch for ScanScratch {
+    type Finding = FindingWithHash<FindingRec>;
+    ...
+}
 ```
 
 ### Key Differences
@@ -382,5 +410,6 @@ These tests confirm that the real engine works correctly through the trait inter
 3. **Solves impedance mismatches** through lazy reset and buffer patterns
 4. **Preserves performance** with buffer reuse and thread-local scratch
 5. **Provides parallel testability** by coexisting with the mock engine
+6. **Bridges hash plumbing** by zipping findings and norm_hashes into `FindingWithHash` carriers for persistence
 
 The adapter pattern keeps concerns separated: the engine focuses on pattern matching, the scheduler focuses on chunking and deduplication, and this module keeps them talking.

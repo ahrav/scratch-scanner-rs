@@ -26,6 +26,10 @@
 //! | step_id | — | `StepId` |
 //!
 //! The traits abstract these differences by exposing a common interface.
+//! `file_id` and `step_id` are intentionally **not** part of the trait surface:
+//! `file_id` is passed as a parameter to `scan_chunk_into` (the scheduler
+//! already knows which file is being scanned), and `step_id` is an internal
+//! engine concept (transform chain position) excluded from the dedup key.
 //!
 //! # Implementations
 //!
@@ -107,15 +111,35 @@ pub trait FindingRecord: Clone + Send + 'static {
     fn span_end(&self) -> u64;
 }
 
-/// Finding record bundled with normalized hash bytes.
+/// A finding record that carries normalized secret hash bytes.
+pub trait FindingWithHashRecord: FindingRecord {
+    /// Normalized hash aligned with this finding.
+    fn norm_hash(&self) -> &NormHash;
+}
+
+/// Finding record bundled with its normalized-secret hash.
 ///
-/// This carrier preserves strict 1:1 alignment between finding metadata and the
-/// normalized secret hash emitted by the engine scratch.
+/// # Why bundle the hash with the finding?
+///
+/// The engine computes a normalized hash of the matched secret at scan time
+/// (inside `scan_chunk_into`). This hash must travel with the finding through
+/// overlap dedup, within-chunk dedup, and final emission. Storing them in
+/// separate parallel vectors is fragile — any sort, filter, or drain would
+/// require coordinating two collections. Bundling into a single value type
+/// makes the 1:1 alignment structural and impossible to violate.
+///
+/// # Hash Semantics
+///
+/// `norm_hash` is a BLAKE3 digest of the *normalized* secret text (whitespace-
+/// collapsed, case-folded). Two findings with the same `norm_hash` matched
+/// the same logical secret, even if their byte spans differ due to surrounding
+/// context or transform chains. Real engine adapters carry the engine-computed
+/// hash; mock adapters may use a deterministic placeholder hash.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FindingWithHash<F: FindingRecord> {
     /// Underlying engine finding record.
     pub finding: F,
-    /// Normalized secret hash aligned with `finding`.
+    /// BLAKE3 digest of the normalized secret.
     pub norm_hash: NormHash,
 }
 
@@ -150,6 +174,13 @@ impl<F: FindingRecord> FindingRecord for FindingWithHash<F> {
     #[inline]
     fn span_end(&self) -> u64 {
         self.finding.span_end()
+    }
+}
+
+impl<F: FindingRecord> FindingWithHashRecord for FindingWithHash<F> {
+    #[inline]
+    fn norm_hash(&self) -> &NormHash {
+        &self.norm_hash
     }
 }
 
@@ -191,7 +222,7 @@ impl<F: FindingRecord> FindingRecord for FindingWithHash<F> {
 /// - [`engine_impl::RealEngineScratch`](super::engine_impl::RealEngineScratch) (real)
 pub trait EngineScratch: Send + 'static {
     /// The finding type produced by this scratch.
-    type Finding: FindingRecord;
+    type Finding: FindingWithHashRecord;
 
     /// Clear all accumulated findings, preparing for a new scan.
     fn clear(&mut self);
@@ -205,8 +236,28 @@ pub trait EngineScratch: Send + 'static {
 
     /// Drain all findings into the provided vector.
     ///
-    /// This transfers ownership without allocation (when possible).
+    /// Findings are **appended** to `out`; the caller is responsible for
+    /// clearing `out` beforehand if a fresh batch is desired. The scratch's
+    /// internal finding buffer is empty after this call.
+    ///
+    /// Implementations should transfer ownership without extra allocation
+    /// when possible (e.g., `Vec::append` or `drain(..)` into `out`).
     fn drain_findings_into(&mut self, out: &mut Vec<Self::Finding>);
+
+    /// Current number of pending findings held by scratch.
+    ///
+    /// Used by the scheduler to account for overlap/prefix pruning before
+    /// drain. Implementations without efficient access can use the default.
+    fn pending_findings_len(&self) -> usize {
+        0
+    }
+
+    /// Count of findings dropped by engine per-scan caps.
+    ///
+    /// Default implementation returns 0 for engines without drop accounting.
+    fn dropped_findings(&self) -> u64 {
+        0
+    }
 }
 
 // ============================================================================
@@ -270,6 +321,13 @@ pub trait ScanEngine: Send + Sync + 'static {
     ///
     /// Used for output formatting. Returns `"<unknown-rule>"` for invalid IDs.
     fn rule_name(&self, rule_id: u32) -> &str;
+
+    /// Hard cap on findings per chunk scan.
+    ///
+    /// Used by the scheduler to pre-size per-worker buffers so that no
+    /// allocations occur after startup. The engine enforces this cap
+    /// internally; the scheduler trusts the value for capacity planning.
+    fn max_findings_per_chunk(&self) -> usize;
 }
 
 #[cfg(test)]

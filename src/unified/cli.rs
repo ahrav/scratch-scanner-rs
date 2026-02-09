@@ -144,6 +144,7 @@ fn parse_fs_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<S
     let mut no_archives = false;
     let mut null_sink = false;
     let mut scan_binary = false;
+    let mut persist_findings = false;
     let mut verbose = false;
     let mut anchor_mode = AnchorMode::Manual;
     let mut event_format = EventFormat::Jsonl;
@@ -211,6 +212,10 @@ fn parse_fs_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<S
                     scan_binary = true;
                     continue;
                 }
+                "--persist-findings" => {
+                    persist_findings = true;
+                    continue;
+                }
                 "--verbose" => {
                     verbose = true;
                     continue;
@@ -251,6 +256,7 @@ fn parse_fs_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<S
             anchor_mode,
             null_sink,
             scan_binary,
+            persist_findings,
         }),
         event_format,
         verbose,
@@ -537,7 +543,7 @@ fn parse_transforms(s: &str) -> TransformFilter {
 }
 
 // ---------------------------------------------------------------------------
-// Usage text
+// OsStr flag helpers
 // ---------------------------------------------------------------------------
 
 /// Extract the value from a `--flag=value` OsString without requiring UTF-8.
@@ -553,6 +559,10 @@ fn strip_os_prefix<'a>(arg: &'a std::ffi::OsStr, prefix: &str) -> Option<&'a std
         None
     }
 }
+
+// ---------------------------------------------------------------------------
+// Usage text
+// ---------------------------------------------------------------------------
 
 fn print_top_usage(exe: &std::ffi::OsStr) {
     eprintln!(
@@ -589,6 +599,7 @@ OPTIONS:
     --no-archives           Disable archive scanning
     --null-sink             Drop all findings (measure scan overhead only)
     --scan-binary           Scan binary files instead of skipping them
+    --persist-findings      Enable FS persistence producer plumbing
     --anchors=manual|derived  Anchor mode (default: manual)
     --event-format=jsonl    Output format (default: jsonl)
     --help, -h              Show this help"
@@ -674,6 +685,19 @@ mod tests {
         let args = vec![OsString::from("--path=/some/dir")];
         let config = parse_fs_args(args.into_iter()).unwrap();
         assert_eq!(config.transform_filter, TransformFilter::All);
+    }
+
+    #[test]
+    fn fs_persist_findings_flag_enables_persistence() {
+        let args = vec![
+            OsString::from("--path=/some/dir"),
+            OsString::from("--persist-findings"),
+        ];
+        let config = parse_fs_args(args.into_iter()).unwrap();
+        let SourceConfig::Fs(fs) = config.source else {
+            panic!("expected fs source config");
+        };
+        assert!(fs.persist_findings);
     }
 
     #[test]

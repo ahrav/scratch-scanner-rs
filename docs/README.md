@@ -37,6 +37,7 @@ Documentation index for the scanner-rs secret scanning engine. This guide helps 
 #### Persistence
 | Document | Focus | Key Concepts |
 |----------|-------|--------------|
+| [fs-persistence-pipeline.md](fs-persistence-pipeline.md) | FS persistence write-side plumbing | StoreProducer trait, FsFindingRecord, loss accounting, scan site coverage |
 | [persistence-identity.md](persistence-identity.md) | FS persistence identity contracts | Key bootstrap, rule fingerprint, secret hash, occurrence ID, normalization |
 | [git-scanning.md](git-scanning.md) | Git persistence pipeline | Two-phase persist, ref watermarks, seen-blob store |
 
@@ -116,6 +117,7 @@ Documentation index for the scanner-rs secret scanning engine. This guide helps 
 | Debug memory issues | [memory-management.md](memory-management.md) |
 | Add transform support | [engine-transforms.md](engine-transforms.md) → [transform-chain.md](transform-chain.md) |
 | Understand window validation | [engine-window-validation.md](engine-window-validation.md) |
+| Understand FS persistence plumbing | [fs-persistence-pipeline.md](fs-persistence-pipeline.md) |
 | Understand persistence identity | [persistence-identity.md](persistence-identity.md) |
 | Configure `SCANNER_SECRET_KEY` | [persistence-identity.md](persistence-identity.md#key-bootstrap) |
 
