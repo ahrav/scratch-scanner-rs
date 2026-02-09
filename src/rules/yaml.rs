@@ -792,6 +792,116 @@ rules:
     }
 
     #[test]
+    fn hashicorp_tf_password_random_high_entropy_values_are_not_suppressed() {
+        let rule_name = "hashicorp-tf-password";
+        let rule = builtin_rule_by_name(rule_name);
+        let suppressors = rule
+            .value_suppressors_any
+            .expect("hashicorp-tf-password should have value suppressors");
+        let suppressors: Vec<&str> = suppressors
+            .iter()
+            .map(|s| std::str::from_utf8(s).expect("suppressor should be valid UTF-8"))
+            .collect();
+
+        let mut seed = 0xA5A5A5A5A5A5A5A5_u64;
+        let mut checked = 0usize;
+        for _ in 0..192 {
+            let secret = deterministic_secret(&mut seed, 12);
+            if suppressors
+                .iter()
+                .any(|sup| secret.to_lowercase().contains(&sup.to_lowercase()))
+            {
+                continue;
+            }
+
+            let distinct = secret
+                .as_bytes()
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<u8>>()
+                .len();
+            if distinct < 6 {
+                continue;
+            }
+
+            let hay = format!("password = \"{secret}\"");
+            let hits = scan_single_builtin_rule(rule_name, hay.as_bytes());
+            assert!(
+                has_rule_hit(&hits, rule_name),
+                "expected randomized terraform password '{secret}' to be reported"
+            );
+            checked += 1;
+        }
+
+        assert!(
+            checked >= 96,
+            "expected to validate at least 96 randomized secrets, got {checked}"
+        );
+    }
+
+    #[test]
+    fn atlassian_api_token_random_high_entropy_values_are_not_suppressed() {
+        let rule_name = "atlassian-api-token";
+        let rule = builtin_rule_by_name(rule_name);
+        let suppressors = rule
+            .value_suppressors_any
+            .expect("atlassian-api-token should have value suppressors");
+        let suppressors: Vec<&str> = suppressors
+            .iter()
+            .map(|s| std::str::from_utf8(s).expect("suppressor should be valid UTF-8"))
+            .collect();
+
+        // The atlassian rule's group 1 expects [a-z0-9]{20}[a-f0-9]{4} — 24 lowercase hex-ish chars.
+        let hex_alphabet: &[u8] = b"0123456789abcdef";
+        let alnum_alphabet: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+
+        let mut seed = 0xCAFEBABEDEAD5678_u64;
+        let mut checked = 0usize;
+        for _ in 0..192 {
+            // Build a valid secret: 20 [a-z0-9] chars + 4 [a-f0-9] chars.
+            let mut secret = String::with_capacity(24);
+            for _ in 0..20 {
+                let next = lcg_next(&mut seed);
+                secret.push(alnum_alphabet[(next % alnum_alphabet.len() as u64) as usize] as char);
+            }
+            for _ in 0..4 {
+                let next = lcg_next(&mut seed);
+                secret.push(hex_alphabet[(next % hex_alphabet.len() as u64) as usize] as char);
+            }
+
+            if suppressors
+                .iter()
+                .any(|sup| secret.to_lowercase().contains(&sup.to_lowercase()))
+            {
+                continue;
+            }
+
+            let distinct = secret
+                .as_bytes()
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<u8>>()
+                .len();
+            if distinct < 6 {
+                continue;
+            }
+
+            let hay = format!("JIRA_TOKEN={secret}");
+            let hits = scan_single_builtin_rule(rule_name, hay.as_bytes());
+            assert!(
+                has_rule_hit(&hits, rule_name),
+                "expected randomized atlassian token '{secret}' to be reported"
+            );
+            checked += 1;
+        }
+
+        assert!(
+            checked >= 96,
+            "expected to validate at least 96 randomized secrets, got {checked}"
+        );
+    }
+
+    #[test]
     fn hashicorp_tf_password_suppresses_placeholder_value() {
         let rule_name = "hashicorp-tf-password";
         let hay = br#"password = "changeme123""#;
