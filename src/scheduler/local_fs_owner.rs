@@ -4242,8 +4242,7 @@ mod tests {
         let output = sink.take();
         let output_str = String::from_utf8_lossy(&output);
         assert!(
-            output_str.contains("run-loss recording failed")
-                || output_str.contains("injected"),
+            output_str.contains("run-loss recording failed") || output_str.contains("injected"),
             "expected diagnostic event about run-loss failure; output: {output_str}"
         );
     }
