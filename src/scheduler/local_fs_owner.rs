@@ -954,6 +954,13 @@ fn apply_entry_budget_clamp(
 }
 
 /// Drain remaining tar entry payload bytes to realign the stream.
+///
+/// After a nested archive scan or a budget clamp, the tar entry may have
+/// unread payload bytes. These must be consumed so the tar cursor stays
+/// aligned to the next entry header. Discarded bytes are charged against
+/// the decompressed-output budgets via [`charge_discarded_bytes`].
+///
+/// Returns `Err(MalformedTar)` on EOF or I/O error mid-drain.
 fn discard_remaining_payload(
     input: &mut dyn TarRead,
     budgets: &mut ArchiveBudgets,
@@ -1962,7 +1969,14 @@ fn scan_tar_stream_nested<E: ScanEngine>(
     outcome
 }
 
-/// Scan a `.tar` or `.tar.gz` root by wiring budgets + tar stream scanning.
+/// Shared entry point for `.tar` and `.tar.gz` root files.
+///
+/// Wires up the [`ArchiveScanCtx`] from [`LocalScratch`], resets budgets,
+/// enters the archive scope, then delegates to [`scan_tar_stream_nested`]
+/// at depth 1. This avoids duplicating budget setup between the two formats.
+///
+/// The caller (`process_tar_file` / `process_targz_file`) is responsible for
+/// opening the file and wrapping it in the appropriate [`TarInput`] variant.
 fn process_tar_like<E: ScanEngine>(
     task: &FileTask,
     ctx: &mut WorkerCtx<FileTask, LocalScratch<E>>,
@@ -4185,7 +4199,7 @@ mod tests {
     }
 
     #[test]
-    fn run_loss_record_failure_increments_counters() {
+    fn run_loss_record_failure_increments_counters_and_emits_diagnostic() {
         let engine = Arc::new(test_engine());
         let sink = Arc::new(VecEventSink::new());
         let producer = Arc::new(EmitOnlyStoreProducer::new());
@@ -4197,7 +4211,7 @@ mod tests {
         let size = tmp.as_file().metadata().unwrap().len();
 
         let source = VecFileSource::new(vec![LocalFile { path, size }]);
-        let mut cfg = small_config_with_sink(sink);
+        let mut cfg = small_config_with_sink(sink.clone());
         cfg.store_producer = Some(producer.clone());
 
         let report = scan_local(engine, source, cfg);
@@ -4218,6 +4232,15 @@ mod tests {
             report.stats.persistence_emit_failures >= 1,
             "expected persistence_emit_failures >= 1 from run-loss failure, got {}",
             report.stats.persistence_emit_failures
+        );
+
+        // Verify a diagnostic event was emitted for the run-loss failure.
+        let output = sink.take();
+        let output_str = String::from_utf8_lossy(&output);
+        assert!(
+            output_str.contains("run-loss recording failed")
+                || output_str.contains("injected"),
+            "expected diagnostic event about run-loss failure; output: {output_str}"
         );
     }
 
