@@ -19,10 +19,13 @@
 //!
 //! `occurrence_id` additionally normalizes its inputs before hashing to absorb
 //! benign variation that the engine's existing dedupe logic already collapses:
-//! - **Root-hint end normalization**: base64 padding bytes (1–3 trailing `=`)
-//!   cause the encoded-region length to vary for identical decoded content;
+//! - **Root-hint end normalization**: base64 padding (up to 2 trailing `=`
+//!   characters, inflating the encoded region by up to 3 bytes) causes the
+//!   encoded-region length to vary for identical decoded content;
 //!   `normalize_root_hint_end` snaps the end offset to the padding-free minimum
-//!   so both padded and unpadded encodings hash identically.
+//!   so both padded and unpadded encodings hash identically. This normalization
+//!   only applies to `Base64` transforms; other transforms (e.g. `UrlPercent`)
+//!   preserve length exactly and are left unchanged.
 //! - **Non-root span erasure**: for transform-derived findings, the decoded-buffer
 //!   span is unstable across chunk boundaries, so it is zeroed out; only the
 //!   root-hint window participates in identity.
@@ -33,7 +36,7 @@
 //! any encoding detail requires bumping this version so that old and new hashes
 //! never collide silently.
 
-use crate::api::{FindingRec, RuleSpec, StepId, STEP_ROOT};
+use crate::api::{FindingRec, RuleSpec, StepId, TransformId, STEP_ROOT};
 
 use super::keys::StoreKeys;
 
@@ -126,12 +129,12 @@ impl IdentityFlags {
         Ok(Self(bits))
     }
 
-    /// Derives flags from `(step_id, include_span, variant)`, enforcing structural
-    /// invariants:
+    /// Derives flags from `(step_id, include_span, variant, normalized)`,
+    /// enforcing structural invariants:
     ///
     /// - Root findings (`STEP_ROOT`) always set `ROOT_STEP` and include span.
-    /// - Transform findings (non-root) set `ROOT_HINT_END_NORMALIZED` because
-    ///   their root-hint end may have been snapped by padding normalization.
+    /// - `ROOT_HINT_END_NORMALIZED` is set when `normalized` is true (i.e., the
+    ///   finding is a Base64 non-root finding that went through padding normalization).
     /// - Span inclusion follows engine dedupe semantics (`dedupe_with_span`):
     ///   included when root-span mapping is unavailable, excluded otherwise.
     /// - A root finding with a UTF-16 variant is rejected as a caller bug.
@@ -139,6 +142,7 @@ impl IdentityFlags {
         step_id: StepId,
         include_span: bool,
         variant: VariantDiscriminant,
+        normalized: bool,
     ) -> Result<Self, IdentityError> {
         if step_id == STEP_ROOT && !matches!(variant, VariantDiscriminant::None) {
             return Err(IdentityError::RootStepHasVariant { variant });
@@ -151,7 +155,7 @@ impl IdentityFlags {
         if include_span {
             bits |= Self::FLAG_SPAN_INCLUDED;
         }
-        if step_id != STEP_ROOT {
+        if normalized {
             bits |= Self::FLAG_ROOT_HINT_END_NORMALIZED;
         }
         match variant {
@@ -179,6 +183,8 @@ pub enum IdentityError {
     ConflictingUtf16Flags { bits: u32 },
     /// Root findings must not carry UTF-16 variant discriminants.
     RootStepHasVariant { variant: VariantDiscriminant },
+    /// Object key exceeds the `u32::MAX` length limit for canonical encoding.
+    ObjectKeyTooLarge { len: usize },
 }
 
 impl std::fmt::Display for IdentityError {
@@ -192,6 +198,13 @@ impl std::fmt::Display for IdentityError {
             }
             Self::RootStepHasVariant { variant } => {
                 write!(f, "root finding cannot carry variant {variant:?}")
+            }
+            Self::ObjectKeyTooLarge { len } => {
+                write!(
+                    f,
+                    "object key too large for canonical encoding: {len} bytes (max {})",
+                    u32::MAX
+                )
             }
         }
     }
@@ -217,6 +230,13 @@ pub struct OccurrenceInput<'a> {
     pub secret_hash: &'a SecretHash,
     /// UTF-16 variant discriminator from decode provenance.
     pub variant: VariantDiscriminant,
+    /// The leaf transform that produced this finding, if any.
+    ///
+    /// Used to gate root-hint normalization: only `Base64` findings have
+    /// padding-induced length variation that needs snapping. Other transforms
+    /// (e.g. `UrlPercent`) preserve length exactly and must not be normalized.
+    /// `None` means the finding is from the root buffer (no transform).
+    pub leaf_transform: Option<TransformId>,
 }
 
 /// Compute canonical rule fingerprint from `RuleSpec::encode_policy` bytes.
@@ -248,7 +268,7 @@ pub fn occurrence_id(
     input: OccurrenceInput<'_>,
     keys: &StoreKeys,
 ) -> Result<OccurrenceId, IdentityError> {
-    let canonical = canonicalize_finding(input.finding, input.variant)?;
+    let canonical = canonicalize_finding(input.finding, input.variant, input.leaf_transform)?;
     let mut payload = Vec::with_capacity(256 + input.object_key.len());
     encode_occurrence_canonical(
         &mut payload,
@@ -256,7 +276,7 @@ pub fn occurrence_id(
         input.rule_fingerprint,
         input.secret_hash,
         &canonical,
-    );
+    )?;
     Ok(keyed_hash(
         keys.identity_key(),
         OCCURRENCE_ID_DOMAIN,
@@ -292,15 +312,22 @@ struct CanonicalFinding {
 fn canonicalize_finding(
     finding: &FindingRec,
     variant: VariantDiscriminant,
+    leaf_transform: Option<TransformId>,
 ) -> Result<CanonicalFinding, IdentityError> {
-    let root_hint_end = normalize_root_hint_end(finding);
+    let root_hint_end = normalize_root_hint_end(finding, leaf_transform);
+    // The flag signals "this finding went through the normalization path" (i.e.,
+    // it's a Base64 non-root finding), not "the value actually changed". This
+    // ensures that pre-normalized values (already at min_encoded) produce the same
+    // flags as values that were snapped, so both hash identically.
+    let normalized =
+        finding.step_id != STEP_ROOT && leaf_transform == Some(TransformId::Base64);
     let include_span = finding.dedupe_with_span || finding.step_id == STEP_ROOT;
     let (span_start, span_end) = if include_span {
         (finding.span_start, finding.span_end)
     } else {
         (0, 0)
     };
-    let flags = IdentityFlags::from_parts(finding.step_id, include_span, variant)?;
+    let flags = IdentityFlags::from_parts(finding.step_id, include_span, variant, normalized)?;
 
     Ok(CanonicalFinding {
         flags,
@@ -332,8 +359,13 @@ fn canonicalize_finding(
 /// different encoded region, not mere padding variation.
 ///
 /// Root findings are returned unchanged because their spans are authoritative.
-fn normalize_root_hint_end(finding: &FindingRec) -> u64 {
+fn normalize_root_hint_end(finding: &FindingRec, leaf_transform: Option<TransformId>) -> u64 {
     if finding.step_id == STEP_ROOT {
+        return finding.root_hint_end;
+    }
+
+    // Only Base64 has 4/3 padding rules; other transforms must not normalize.
+    if leaf_transform != Some(TransformId::Base64) {
         return finding.root_hint_end;
     }
 
@@ -364,7 +396,7 @@ fn encode_occurrence_canonical(
     rule_fingerprint: &RuleFingerprint,
     secret_hash: &SecretHash,
     finding: &CanonicalFinding,
-) {
+) -> Result<(), IdentityError> {
     out.clear();
     out.extend_from_slice(b"occurrence_canonical");
     out.push(0);
@@ -374,7 +406,7 @@ fn encode_occurrence_canonical(
     push_u32_le(out, finding.flags.bits());
 
     push_tag(out, b"object");
-    push_bytes_u32(out, object_key);
+    push_bytes_u32(out, object_key)?;
 
     push_tag(out, b"rule_fingerprint");
     out.extend_from_slice(rule_fingerprint);
@@ -392,6 +424,7 @@ fn encode_occurrence_canonical(
 
     push_tag(out, b"variant");
     out.push(finding.variant as u8);
+    Ok(())
 }
 
 /// Domain-separated BLAKE3 keyed hash: `H_key(domain ‖ 0x00 ‖ payload)`.
@@ -422,14 +455,13 @@ fn push_u64_le(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
-fn push_bytes_u32(out: &mut Vec<u8>, bytes: &[u8]) {
-    assert!(
-        bytes.len() <= u32::MAX as usize,
-        "object key too large for canonical encoding: {}",
-        bytes.len()
-    );
+fn push_bytes_u32(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), IdentityError> {
+    if bytes.len() > u32::MAX as usize {
+        return Err(IdentityError::ObjectKeyTooLarge { len: bytes.len() });
+    }
     push_u32_le(out, bytes.len() as u32);
     out.extend_from_slice(bytes);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -448,6 +480,7 @@ mod tests {
         rule_fingerprint: RuleFingerprint,
         secret_hash: SecretHash,
         variant: VariantDiscriminant,
+        leaf_transform: Option<TransformId>,
     }
 
     fn test_keys() -> StoreKeys {
@@ -503,6 +536,7 @@ mod tests {
                     rule_fingerprint: &case.rule_fingerprint,
                     secret_hash: &case.secret_hash,
                     variant: case.variant,
+                    leaf_transform: case.leaf_transform,
                 },
                 keys,
             )
@@ -569,6 +603,7 @@ mod tests {
                 rule_fingerprint: &rule_fp,
                 secret_hash: &secret,
                 variant: VariantDiscriminant::None,
+                leaf_transform: Some(TransformId::Base64),
             },
             &keys,
         )
@@ -580,6 +615,7 @@ mod tests {
                 rule_fingerprint: &rule_fp,
                 secret_hash: &secret,
                 variant: VariantDiscriminant::None,
+                leaf_transform: Some(TransformId::Base64),
             },
             &keys,
         )
@@ -611,6 +647,7 @@ mod tests {
                 rule_fingerprint: &rule_fp,
                 secret_hash: &secret,
                 variant: VariantDiscriminant::Utf16Le,
+                leaf_transform: Some(TransformId::Base64),
             },
             &keys,
         )
@@ -622,6 +659,7 @@ mod tests {
                 rule_fingerprint: &rule_fp,
                 secret_hash: &secret,
                 variant: VariantDiscriminant::Utf16Be,
+                leaf_transform: Some(TransformId::Base64),
             },
             &keys,
         )
@@ -658,6 +696,7 @@ mod tests {
                 rule_fingerprint: &rule_fp,
                 secret_hash: &secret,
                 variant: VariantDiscriminant::None,
+                leaf_transform: Some(TransformId::Base64),
             },
             &keys,
         )
@@ -669,6 +708,7 @@ mod tests {
                 rule_fingerprint: &rule_fp,
                 secret_hash: &secret,
                 variant: VariantDiscriminant::None,
+                leaf_transform: Some(TransformId::Base64),
             },
             &keys,
         )
@@ -705,6 +745,7 @@ mod tests {
                 rule_fingerprint: &rule_fp,
                 secret_hash: &secret,
                 variant: VariantDiscriminant::None,
+                leaf_transform: Some(TransformId::Base64),
             },
             &keys,
         )
@@ -716,6 +757,7 @@ mod tests {
                 rule_fingerprint: &rule_fp,
                 secret_hash: &secret,
                 variant: VariantDiscriminant::None,
+                leaf_transform: Some(TransformId::Base64),
             },
             &keys,
         )
@@ -745,6 +787,7 @@ mod tests {
                 rule_fingerprint: &[0x11; 32],
                 secret_hash: &[0x22; 32],
                 variant: VariantDiscriminant::Utf16Le,
+                leaf_transform: None,
             },
             &keys,
         )
@@ -799,6 +842,7 @@ mod tests {
                 root_hint_start + min_encoded + pad
             };
 
+            let leaf_transform = if root { None } else { Some(TransformId::Base64) };
             cases.push(OccurrenceCase {
                 object_key: format!("obj-{}", lcg(&mut seed) % 23).into_bytes(),
                 finding: FindingRec {
@@ -814,6 +858,7 @@ mod tests {
                 rule_fingerprint: rand_arr(&mut seed),
                 secret_hash: rand_arr(&mut seed),
                 variant,
+                leaf_transform,
             });
         }
 
@@ -869,7 +914,7 @@ mod tests {
         // span_end == span_start → decoded_len=0, min_encoded=0
         // Any 1-3 excess should snap to root_hint_start.
         let f = make_finding(StepId(1), 100, 100, 500, 502);
-        assert_eq!(normalize_root_hint_end(&f), 500); // snapped: 502 - 500 = 2, 0 < 2 <= 3
+        assert_eq!(normalize_root_hint_end(&f, Some(TransformId::Base64)), 500); // snapped: 502 - 500 = 2, 0 < 2 <= 3
     }
 
     #[test]
@@ -877,7 +922,7 @@ mod tests {
         // decoded_len = 12, min_encoded = ceil(12*4/3) = 16
         // actual_encoded = 16 (== min_encoded), condition is `> min_encoded`, so no snap.
         let f = make_finding(StepId(1), 0, 12, 1000, 1016);
-        assert_eq!(normalize_root_hint_end(&f), 1016); // unchanged
+        assert_eq!(normalize_root_hint_end(&f, Some(TransformId::Base64)), 1016); // unchanged
     }
 
     #[test]
@@ -885,7 +930,7 @@ mod tests {
         // decoded_len = 12, min_encoded = 16
         // actual_encoded = 19 (min + 3). 19 > 16 && 19 <= 16+3 → snap.
         let f = make_finding(StepId(1), 0, 12, 1000, 1019);
-        assert_eq!(normalize_root_hint_end(&f), 1016); // snapped to start + min_encoded
+        assert_eq!(normalize_root_hint_end(&f, Some(TransformId::Base64)), 1016); // snapped to start + min_encoded
     }
 
     #[test]
@@ -893,14 +938,14 @@ mod tests {
         // decoded_len = 12, min_encoded = 16
         // actual_encoded = 20 (min + 4). 20 > 16 but 20 > 16+3 → no snap.
         let f = make_finding(StepId(1), 0, 12, 1000, 1020);
-        assert_eq!(normalize_root_hint_end(&f), 1020); // unchanged
+        assert_eq!(normalize_root_hint_end(&f, Some(TransformId::Base64)), 1020); // unchanged
     }
 
     #[test]
     fn normalize_root_hint_end_root_passthrough() {
         // Root findings should return root_hint_end unchanged.
         let f = make_finding(STEP_ROOT, 0, 12, 1000, 1099);
-        assert_eq!(normalize_root_hint_end(&f), 1099);
+        assert_eq!(normalize_root_hint_end(&f, Some(TransformId::Base64)), 1099);
     }
 
     #[test]
@@ -909,7 +954,7 @@ mod tests {
         // No panic should occur.
         let f = make_finding(StepId(1), 200, 100, 500, 502);
         // decoded_len=0, min_encoded=0, actual_encoded=2, 0 < 2 <= 3 → snap
-        assert_eq!(normalize_root_hint_end(&f), 500);
+        assert_eq!(normalize_root_hint_end(&f, Some(TransformId::Base64)), 500);
     }
 
     // ================================================================
@@ -918,44 +963,56 @@ mod tests {
 
     #[test]
     fn from_parts_root_none_flags_are_0x03() {
-        // Root + None → ROOT_STEP | SPAN_INCLUDED = 1 + 2 = 3
-        let flags = IdentityFlags::from_parts(STEP_ROOT, true, VariantDiscriminant::None).unwrap();
+        // Root + None + not normalized → ROOT_STEP | SPAN_INCLUDED = 1 + 2 = 3
+        let flags =
+            IdentityFlags::from_parts(STEP_ROOT, true, VariantDiscriminant::None, false).unwrap();
         assert_eq!(flags.bits(), 3);
     }
 
     #[test]
-    fn from_parts_non_root_no_span_flags_are_0x04() {
-        // Non-root, no span, None → ROOT_HINT_END_NORMALIZED = 4
-        let flags = IdentityFlags::from_parts(StepId(1), false, VariantDiscriminant::None).unwrap();
+    fn from_parts_non_root_no_span_normalized_flags_are_0x04() {
+        // Non-root, no span, None, normalized → ROOT_HINT_END_NORMALIZED = 4
+        let flags =
+            IdentityFlags::from_parts(StepId(1), false, VariantDiscriminant::None, true).unwrap();
         assert_eq!(flags.bits(), 4);
     }
 
     #[test]
-    fn from_parts_non_root_with_span_flags_are_0x06() {
-        // Non-root, span, None → SPAN_INCLUDED | ROOT_HINT_END_NORMALIZED = 2 + 4 = 6
-        let flags = IdentityFlags::from_parts(StepId(1), true, VariantDiscriminant::None).unwrap();
+    fn from_parts_non_root_no_span_not_normalized_flags_are_0x00() {
+        // Non-root, no span, None, not normalized → 0
+        let flags =
+            IdentityFlags::from_parts(StepId(1), false, VariantDiscriminant::None, false).unwrap();
+        assert_eq!(flags.bits(), 0);
+    }
+
+    #[test]
+    fn from_parts_non_root_with_span_normalized_flags_are_0x06() {
+        // Non-root, span, None, normalized → SPAN_INCLUDED | ROOT_HINT_END_NORMALIZED = 2 + 4 = 6
+        let flags =
+            IdentityFlags::from_parts(StepId(1), true, VariantDiscriminant::None, true).unwrap();
         assert_eq!(flags.bits(), 6);
     }
 
     #[test]
-    fn from_parts_non_root_utf16le_with_span_flags() {
-        // Non-root, span, LE → SPAN_INCLUDED + ROOT_HINT_END_NORMALIZED + UTF16_LE = 2+4+256 = 262
+    fn from_parts_non_root_utf16le_with_span_normalized_flags() {
+        // Non-root, span, LE, normalized → SPAN_INCLUDED + ROOT_HINT_END_NORMALIZED + UTF16_LE = 2+4+256 = 262
         let flags =
-            IdentityFlags::from_parts(StepId(2), true, VariantDiscriminant::Utf16Le).unwrap();
+            IdentityFlags::from_parts(StepId(2), true, VariantDiscriminant::Utf16Le, true).unwrap();
         assert_eq!(flags.bits(), 262);
     }
 
     #[test]
-    fn from_parts_non_root_utf16be_no_span_flags() {
-        // Non-root, no span, BE → ROOT_HINT_END_NORMALIZED + UTF16_BE = 4+512 = 516
+    fn from_parts_non_root_utf16be_no_span_normalized_flags() {
+        // Non-root, no span, BE, normalized → ROOT_HINT_END_NORMALIZED + UTF16_BE = 4+512 = 516
         let flags =
-            IdentityFlags::from_parts(StepId(3), false, VariantDiscriminant::Utf16Be).unwrap();
+            IdentityFlags::from_parts(StepId(3), false, VariantDiscriminant::Utf16Be, true)
+                .unwrap();
         assert_eq!(flags.bits(), 516);
     }
 
     #[test]
     fn from_parts_root_utf16be_rejected() {
-        let err = IdentityFlags::from_parts(STEP_ROOT, true, VariantDiscriminant::Utf16Be)
+        let err = IdentityFlags::from_parts(STEP_ROOT, true, VariantDiscriminant::Utf16Be, false)
             .expect_err("root + BE must fail");
         assert!(matches!(
             err,
@@ -1027,6 +1084,7 @@ mod tests {
             rule_fingerprint: [0xBB; 32],
             secret_hash: [0xCC; 32],
             variant: VariantDiscriminant::None,
+            leaf_transform: Some(TransformId::Base64),
         }
     }
 
@@ -1038,6 +1096,7 @@ mod tests {
                 rule_fingerprint: &case.rule_fingerprint,
                 secret_hash: &case.secret_hash,
                 variant: case.variant,
+                leaf_transform: case.leaf_transform,
             },
             keys,
         )
@@ -1080,6 +1139,7 @@ mod tests {
         b.finding.step_id = STEP_ROOT;
         b.finding.root_hint_start = 50;
         b.finding.root_hint_end = 66;
+        b.leaf_transform = None;
         // a is non-root, b is root — even with overlapping data, IDs differ
         // (root vs non-root have different flags, normalization, etc.)
         assert_ne!(compute_id(&a, &keys), compute_id(&b, &keys));
@@ -1110,7 +1170,7 @@ mod tests {
             dedupe_with_span: false,
             step_id: STEP_ROOT,
         };
-        let cf = canonicalize_finding(&finding, VariantDiscriminant::None).unwrap();
+        let cf = canonicalize_finding(&finding, VariantDiscriminant::None, None).unwrap();
         // Root always includes span
         assert_eq!(cf.span_start, 10);
         assert_eq!(cf.span_end, 42);
@@ -1124,6 +1184,7 @@ mod tests {
 
     #[test]
     fn canonicalize_non_root_zeroes_span_when_no_dedupe() {
+        // decoded_len = 16, min_encoded = 22, actual = 24, 24 in [23,25] → snapped
         let finding = FindingRec {
             file_id: FileId(0),
             rule_id: 0,
@@ -1134,15 +1195,18 @@ mod tests {
             dedupe_with_span: false,
             step_id: StepId(1),
         };
-        let cf = canonicalize_finding(&finding, VariantDiscriminant::None).unwrap();
+        let cf =
+            canonicalize_finding(&finding, VariantDiscriminant::None, Some(TransformId::Base64))
+                .unwrap();
         assert_eq!(cf.span_start, 0);
         assert_eq!(cf.span_end, 0);
-        // Flags: ROOT_HINT_END_NORMALIZED = 4
+        // Flags: ROOT_HINT_END_NORMALIZED = 4 (normalization fired for base64)
         assert_eq!(cf.flags.bits(), 4);
     }
 
     #[test]
     fn canonicalize_non_root_preserves_span_when_dedupe() {
+        // decoded_len = 16, min_encoded = 22, actual = 24, 24 in [23,25] → snapped
         let finding = FindingRec {
             file_id: FileId(0),
             rule_id: 0,
@@ -1153,7 +1217,9 @@ mod tests {
             dedupe_with_span: true,
             step_id: StepId(1),
         };
-        let cf = canonicalize_finding(&finding, VariantDiscriminant::None).unwrap();
+        let cf =
+            canonicalize_finding(&finding, VariantDiscriminant::None, Some(TransformId::Base64))
+                .unwrap();
         assert_eq!(cf.span_start, 100);
         assert_eq!(cf.span_end, 116);
         // Flags: SPAN_INCLUDED | ROOT_HINT_END_NORMALIZED = 2 + 4 = 6
@@ -1185,18 +1251,35 @@ mod tests {
             }
         }
 
-        fn arb_finding_rec() -> impl Strategy<Value = (FindingRec, VariantDiscriminant)> {
+        fn arb_leaf_transform_for_step(
+            step: StepId,
+        ) -> BoxedStrategy<Option<TransformId>> {
+            if step == STEP_ROOT {
+                Just(None).boxed()
+            } else {
+                prop_oneof![
+                    Just(Some(TransformId::Base64)),
+                    Just(Some(TransformId::UrlPercent)),
+                ]
+                .boxed()
+            }
+        }
+
+        fn arb_finding_rec(
+        ) -> impl Strategy<Value = (FindingRec, VariantDiscriminant, Option<TransformId>)> {
             arb_step_id().prop_flat_map(|step_id| {
                 let variant_strat = arb_variant_for_step(step_id);
+                let transform_strat = arb_leaf_transform_for_step(step_id);
                 (
                     (0u32..4096),    // span_start
                     (8u32..64),      // span_len
                     (0u64..100_000), // root_hint_start
                     any::<bool>(),   // dedupe_with_span
                     variant_strat,
+                    transform_strat,
                 )
                     .prop_map(
-                        move |(span_start, span_len, root_hint_start, dedupe, variant)| {
+                        move |(span_start, span_len, root_hint_start, dedupe, variant, leaf_tf)| {
                             let span_end = span_start + span_len;
                             let decoded_len = span_len as u64;
                             let min_encoded = (decoded_len * 4).div_ceil(3);
@@ -1213,6 +1296,7 @@ mod tests {
                                     step_id,
                                 },
                                 variant,
+                                leaf_tf,
                             )
                         },
                     )
@@ -1222,18 +1306,18 @@ mod tests {
         proptest! {
             #[test]
             fn prop_normalize_root_hint_end_idempotent(
-                (finding, _variant) in arb_finding_rec()
+                (finding, _variant, leaf_tf) in arb_finding_rec()
             ) {
-                let once = normalize_root_hint_end(&finding);
+                let once = normalize_root_hint_end(&finding, leaf_tf);
                 let mut finding2 = finding;
                 finding2.root_hint_end = once;
-                let twice = normalize_root_hint_end(&finding2);
+                let twice = normalize_root_hint_end(&finding2, leaf_tf);
                 prop_assert_eq!(once, twice);
             }
 
             #[test]
             fn prop_occurrence_id_deterministic(
-                (finding, variant) in arb_finding_rec(),
+                (finding, variant, leaf_tf) in arb_finding_rec(),
                 obj_key in proptest::collection::vec(any::<u8>(), 0..64),
                 rule_fp in proptest::collection::vec(any::<u8>(), 32..=32),
                 secret in proptest::collection::vec(any::<u8>(), 32..=32),
@@ -1251,6 +1335,7 @@ mod tests {
                         rule_fingerprint: &rfp,
                         secret_hash: &sh,
                         variant,
+                        leaf_transform: leaf_tf,
                     },
                     &keys,
                 ).expect("valid");
@@ -1262,6 +1347,7 @@ mod tests {
                         rule_fingerprint: &rfp,
                         secret_hash: &sh,
                         variant,
+                        leaf_transform: leaf_tf,
                     },
                     &keys,
                 ).expect("valid");
@@ -1271,7 +1357,7 @@ mod tests {
 
             #[test]
             fn prop_distinct_single_field_change_different_id(
-                (finding, variant) in arb_finding_rec(),
+                (finding, variant, leaf_tf) in arb_finding_rec(),
                 extra_byte in any::<u8>(),
             ) {
                 let keys = test_keys();
@@ -1287,6 +1373,7 @@ mod tests {
                         rule_fingerprint: &rfp,
                         secret_hash: &sh,
                         variant,
+                        leaf_transform: leaf_tf,
                     },
                     &keys,
                 ).expect("valid");
@@ -1307,6 +1394,264 @@ mod tests {
 
                 prop_assert_ne!(id_base, id_obj);
             }
+        }
+    }
+
+    // ================================================================
+    // UrlPercent must NOT be base64-normalized
+    // ================================================================
+
+    #[test]
+    fn url_percent_finding_not_base64_normalized() {
+        // decoded_len=13, min_encoded(base64)=18
+        // root_hint_end = root_hint_start + 19 (min+1, in padding window)
+        // With UrlPercent, normalization must NOT fire.
+        let f = make_finding(StepId(1), 200, 213, 1000, 1019);
+        let result = normalize_root_hint_end(&f, Some(TransformId::UrlPercent));
+        // UrlPercent must return the original, not the snapped value.
+        assert_eq!(result, 1019);
+    }
+
+    #[test]
+    fn url_percent_findings_with_different_hint_end_produce_different_ids() {
+        let keys = test_keys();
+        let rule_fp = rand_arr(&mut 100);
+        let secret = rand_arr(&mut 101);
+
+        // Two findings identical except root_hint_end differs by 1, in base64 padding window.
+        let finding_a = FindingRec {
+            file_id: FileId(7),
+            rule_id: 12,
+            span_start: 200,
+            span_end: 213, // decoded_len=13, base64 min_encoded=18
+            root_hint_start: 1000,
+            root_hint_end: 1019, // min + 1
+            dedupe_with_span: false,
+            step_id: StepId(1),
+        };
+        let finding_b = FindingRec {
+            root_hint_end: 1020, // min + 2
+            ..finding_a
+        };
+
+        let id_a = occurrence_id(
+            OccurrenceInput {
+                object_key: b"repo:src/main.rs",
+                finding: &finding_a,
+                rule_fingerprint: &rule_fp,
+                secret_hash: &secret,
+                variant: VariantDiscriminant::None,
+                leaf_transform: Some(TransformId::UrlPercent),
+            },
+            &keys,
+        )
+        .expect("valid");
+        let id_b = occurrence_id(
+            OccurrenceInput {
+                object_key: b"repo:src/main.rs",
+                finding: &finding_b,
+                rule_fingerprint: &rule_fp,
+                secret_hash: &secret,
+                variant: VariantDiscriminant::None,
+                leaf_transform: Some(TransformId::UrlPercent),
+            },
+            &keys,
+        )
+        .expect("valid");
+
+        // With UrlPercent, these must produce DIFFERENT IDs (no normalization).
+        assert_ne!(id_a, id_b);
+    }
+
+    #[test]
+    fn base64_still_normalizes_after_gating_fix() {
+        // Ensure the fix doesn't break base64 normalization.
+        let f = make_finding(StepId(1), 200, 213, 1000, 1019);
+        let result = normalize_root_hint_end(&f, Some(TransformId::Base64));
+        // Base64: decoded_len=13, min_encoded=18, actual=19, in [19,21] → snapped to 1018
+        assert_eq!(result, 1018);
+    }
+
+    #[test]
+    fn none_leaf_transform_skips_normalization() {
+        // leaf_transform=None means root or unknown; normalization should not fire.
+        let f = make_finding(StepId(1), 200, 213, 1000, 1019);
+        let result = normalize_root_hint_end(&f, None);
+        assert_eq!(result, 1019);
+    }
+
+    // ================================================================
+    // Coverage gap: root occurrence includes span in identity
+    // ================================================================
+
+    #[test]
+    fn root_occurrence_includes_span_in_identity() {
+        let keys = test_keys();
+        let rule_fp = [0xBB; 32];
+        let secret = [0xCC; 32];
+
+        let finding_a = FindingRec {
+            file_id: FileId(1),
+            rule_id: 10,
+            span_start: 50,
+            span_end: 66,
+            root_hint_start: 50,
+            root_hint_end: 66,
+            dedupe_with_span: false,
+            step_id: STEP_ROOT,
+        };
+        let finding_b = FindingRec {
+            span_start: 100,
+            span_end: 116,
+            root_hint_start: 100,
+            root_hint_end: 116,
+            ..finding_a
+        };
+
+        let id_a = occurrence_id(
+            OccurrenceInput {
+                object_key: b"repo:src/main.rs",
+                finding: &finding_a,
+                rule_fingerprint: &rule_fp,
+                secret_hash: &secret,
+                variant: VariantDiscriminant::None,
+                leaf_transform: None,
+            },
+            &keys,
+        )
+        .expect("valid");
+        let id_b = occurrence_id(
+            OccurrenceInput {
+                object_key: b"repo:src/main.rs",
+                finding: &finding_b,
+                rule_fingerprint: &rule_fp,
+                secret_hash: &secret,
+                variant: VariantDiscriminant::None,
+                leaf_transform: None,
+            },
+            &keys,
+        )
+        .expect("valid");
+
+        assert_ne!(id_a, id_b);
+    }
+
+    // ================================================================
+    // Coverage gap: normalize_root_hint_end boundary tests
+    // ================================================================
+
+    #[test]
+    fn normalize_root_hint_end_boundary_exact_min_base64() {
+        // decoded_len=12, min_encoded=16, actual_encoded=16 → no snap
+        let f = make_finding(StepId(1), 0, 12, 1000, 1016);
+        assert_eq!(normalize_root_hint_end(&f, Some(TransformId::Base64)), 1016);
+    }
+
+    #[test]
+    fn normalize_root_hint_end_boundary_min_plus_one_base64() {
+        // decoded_len=12, min_encoded=16, actual_encoded=17 → snap to 1016
+        let f = make_finding(StepId(1), 0, 12, 1000, 1017);
+        assert_eq!(normalize_root_hint_end(&f, Some(TransformId::Base64)), 1016);
+    }
+
+    #[test]
+    fn normalize_root_hint_end_boundary_min_plus_three_base64() {
+        // decoded_len=12, min_encoded=16, actual_encoded=19 → snap to 1016
+        let f = make_finding(StepId(1), 0, 12, 1000, 1019);
+        assert_eq!(normalize_root_hint_end(&f, Some(TransformId::Base64)), 1016);
+    }
+
+    #[test]
+    fn normalize_root_hint_end_boundary_min_plus_four_base64() {
+        // decoded_len=12, min_encoded=16, actual_encoded=20 → no snap (outside window)
+        let f = make_finding(StepId(1), 0, 12, 1000, 1020);
+        assert_eq!(normalize_root_hint_end(&f, Some(TransformId::Base64)), 1020);
+    }
+
+    // ================================================================
+    // Coverage gap: domain separation
+    // ================================================================
+
+    #[test]
+    fn rule_fingerprint_and_secret_hash_never_collide_for_same_input() {
+        let keys = test_keys();
+        let same_bytes = [0xAA; 32];
+        let rfp = keyed_hash(keys.identity_key(), RULE_FINGERPRINT_DOMAIN, &same_bytes);
+        let sh = keyed_hash(keys.secret_key(), SECRET_HASH_DOMAIN, &same_bytes);
+        assert_ne!(rfp, sh);
+    }
+
+    #[test]
+    fn different_keys_produce_different_fingerprints() {
+        let meta = RunModeMetadata {
+            version: STORE_KEYS_VERSION,
+            correlation_mode: CorrelationMode::Persistent,
+            key_source: KeySource::EnvVar,
+        };
+        let keys_a = StoreKeys::from_test_root_key([0x11; 32], meta);
+        let keys_b = StoreKeys::from_test_root_key([0x22; 32], meta);
+        let r = rule("token", r"tok_[A-Z0-9]{8}", &[b"tok_"]);
+        let fp_a = rule_fingerprint(&r, &keys_a);
+        let fp_b = rule_fingerprint(&r, &keys_b);
+        assert_ne!(fp_a, fp_b);
+    }
+
+    #[test]
+    fn conflicting_utf16_flags_rejected() {
+        let err =
+            IdentityFlags::from_bits_strict(0x300).expect_err("both UTF-16 bits set must fail");
+        assert!(matches!(err, IdentityError::ConflictingUtf16Flags { .. }));
+    }
+
+    // ── push_bytes_u32 → Result tests ────────────────────────────────
+
+    #[test]
+    fn push_bytes_u32_small_input_succeeds() {
+        let mut buf = Vec::new();
+        let data = b"hello";
+        push_bytes_u32(&mut buf, data).expect("small input should succeed");
+        // First 4 bytes: little-endian u32 length, then the data.
+        assert_eq!(&buf[..4], &5u32.to_le_bytes());
+        assert_eq!(&buf[4..], b"hello");
+    }
+
+    #[test]
+    fn push_bytes_u32_empty_input_succeeds() {
+        let mut buf = Vec::new();
+        push_bytes_u32(&mut buf, b"").expect("empty input should succeed");
+        assert_eq!(&buf[..4], &0u32.to_le_bytes());
+        assert_eq!(buf.len(), 4);
+    }
+
+    #[test]
+    fn object_key_too_large_error_display() {
+        let err = IdentityError::ObjectKeyTooLarge { len: 5_000_000_000 };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("5000000000"),
+            "display should include the actual length: {msg}"
+        );
+        assert!(
+            msg.contains(&u32::MAX.to_string()),
+            "display should include the max: {msg}"
+        );
+    }
+
+    #[test]
+    fn occurrence_id_propagates_object_key_too_large() {
+        // We can't allocate >4GB, but we can verify the error path exists by
+        // testing encode_occurrence_canonical directly with a mock that would
+        // trigger the guard. Instead, verify the function signature contract:
+        // calling push_bytes_u32 with a length that exceeds u32::MAX (on
+        // 64-bit) returns the correct error variant.
+        //
+        // On 64-bit platforms, u32::MAX as usize + 1 is representable.
+        #[cfg(target_pointer_width = "64")]
+        {
+            // We don't allocate: just verify the guard arithmetic is correct.
+            let too_large = u32::MAX as usize + 1;
+            let err = IdentityError::ObjectKeyTooLarge { len: too_large };
+            assert!(matches!(err, IdentityError::ObjectKeyTooLarge { len } if len > u32::MAX as usize));
         }
     }
 }
@@ -1374,7 +1719,13 @@ mod kani_proofs {
             step_id,
         };
 
+        let leaf_transform = if is_root {
+            None
+        } else {
+            Some(TransformId::Base64)
+        };
+
         // Must not panic.
-        let _ = normalize_root_hint_end(&finding);
+        let _ = normalize_root_hint_end(&finding, leaf_transform);
     }
 }

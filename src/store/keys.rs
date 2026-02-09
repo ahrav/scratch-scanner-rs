@@ -145,14 +145,23 @@ impl StoreKeys {
 
     fn bootstrap_from_os_value(value: Option<&OsStr>) -> Self {
         if let Some(raw) = value {
-            if let Some(root_key) = parse_root_key(raw) {
-                return Self::from_root_key(root_key, RunModeMetadata::persistent());
+            match parse_root_key(raw) {
+                Ok(root_key) => {
+                    return Self::from_root_key(root_key, RunModeMetadata::persistent());
+                }
+                Err(e) => {
+                    eprintln!(
+                        "WARNING: {} is set but invalid ({}). \
+                         Falling back to ephemeral key \u{2014} cross-run correlation is disabled.",
+                        SCANNER_SECRET_KEY_ENV, e
+                    );
+                    let root_key = generate_ephemeral_root_key();
+                    return Self::from_root_key(
+                        root_key,
+                        RunModeMetadata::ephemeral(KeySource::InvalidEnvVar),
+                    );
+                }
             }
-            let root_key = generate_ephemeral_root_key();
-            return Self::from_root_key(
-                root_key,
-                RunModeMetadata::ephemeral(KeySource::InvalidEnvVar),
-            );
         }
 
         let root_key = generate_ephemeral_root_key();
@@ -209,18 +218,42 @@ impl StoreKeys {
     }
 }
 
-fn parse_root_key(raw: &OsStr) -> Option<[u8; 32]> {
-    let encoded = raw.to_str()?;
+/// Specific failure modes for `parse_root_key`.
+///
+/// Structured errors enable callers to emit targeted diagnostics rather than a
+/// generic "invalid key" message.
+#[derive(Debug)]
+enum ParseKeyError {
+    /// The env var value is not valid UTF-8.
+    NonUtf8,
+    /// The UTF-8 string is not valid standard base64.
+    InvalidBase64(base64::DecodeError),
+    /// The base64 decoded to a valid byte string, but not 32 bytes.
+    WrongLength { got: usize },
+}
+
+impl fmt::Display for ParseKeyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NonUtf8 => write!(f, "value is not valid UTF-8"),
+            Self::InvalidBase64(e) => write!(f, "not valid base64: {e}"),
+            Self::WrongLength { got } => write!(f, "decoded to {got} bytes, expected 32"),
+        }
+    }
+}
+
+fn parse_root_key(raw: &OsStr) -> Result<[u8; 32], ParseKeyError> {
+    let encoded = raw.to_str().ok_or(ParseKeyError::NonUtf8)?;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(encoded)
-        .ok()?;
+        .map_err(ParseKeyError::InvalidBase64)?;
     if bytes.len() != 32 {
-        return None;
+        return Err(ParseKeyError::WrongLength { got: bytes.len() });
     }
 
     let mut out = [0u8; 32];
     out.copy_from_slice(&bytes);
-    Some(out)
+    Ok(out)
 }
 
 /// Generate a one-time ephemeral root key.
@@ -478,5 +511,65 @@ mod tests {
                 assert_eq!(keys.run_mode().key_source, KeySource::InvalidEnvVar);
             });
         }
+    }
+
+    // ================================================================
+    // Structured ParseKeyError tests
+    // ================================================================
+
+    #[test]
+    fn parse_key_invalid_base64_returns_specific_error() {
+        let raw = OsString::from("not-valid-base64!!!");
+        let err = parse_root_key(&raw).expect_err("should fail");
+        assert!(
+            matches!(err, ParseKeyError::InvalidBase64(_)),
+            "expected InvalidBase64, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_key_wrong_length_returns_specific_error() {
+        let encoded = base64::engine::general_purpose::STANDARD.encode([0x22; 31]);
+        let raw = OsString::from(encoded);
+        let err = parse_root_key(&raw).expect_err("should fail");
+        assert!(
+            matches!(err, ParseKeyError::WrongLength { got: 31 }),
+            "expected WrongLength {{ got: 31 }}, got: {err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_key_non_utf8_returns_specific_error() {
+        let raw = OsString::from_vec(vec![0xFF, 0xFE]);
+        let err = parse_root_key(&raw).expect_err("should fail");
+        assert!(
+            matches!(err, ParseKeyError::NonUtf8),
+            "expected NonUtf8, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_key_error_display_messages() {
+        let non_utf8 = ParseKeyError::NonUtf8;
+        assert_eq!(non_utf8.to_string(), "value is not valid UTF-8");
+
+        let wrong_len = ParseKeyError::WrongLength { got: 16 };
+        assert_eq!(wrong_len.to_string(), "decoded to 16 bytes, expected 32");
+
+        // InvalidBase64 display includes the inner error
+        let raw = OsString::from("not-valid-base64!!!");
+        if let Err(ParseKeyError::InvalidBase64(inner)) = parse_root_key(&raw) {
+            let msg = format!("not valid base64: {inner}");
+            assert_eq!(ParseKeyError::InvalidBase64(inner).to_string(), msg);
+        }
+    }
+
+    #[test]
+    fn parse_key_valid_input_returns_ok() {
+        let encoded = base64::engine::general_purpose::STANDARD.encode([0x42; 32]);
+        let raw = OsString::from(encoded);
+        let result = parse_root_key(&raw).expect("should succeed");
+        assert_eq!(result, [0x42; 32]);
     }
 }
