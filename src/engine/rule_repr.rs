@@ -319,9 +319,10 @@ pub(super) struct EntropyCompiled {
 /// 1. **Every candidate**: `re`, `must_contain`, `needs_assignment_shape_check`
 ///    — touched for every merged window to decide if the regex runs.
 /// 2. **Post-match only**: `secret_group` — read only when the regex matches.
-/// 3. **Gate indices**: `confirm_all`, `keywords`, `entropy`, `local_context`,
-///    `two_phase` — dereferenced through `Engine` pool accessors only when
-///    the corresponding gate is present (`Some`). Most rules have 0–2 gates,
+/// 3. **Gate indices**: `confirm_all`, `keywords`, `value_suppressors`,
+///    `entropy`, `local_context`, `two_phase` — dereferenced through `Engine`
+///    pool accessors only when the corresponding gate is present (`Some`).
+///    Most rules have 0–2 gates,
 ///    so these are cold for the majority of candidates.
 ///
 /// # Gate pool access
@@ -332,6 +333,7 @@ pub(super) struct EntropyCompiled {
 /// |----------------|---------------------------|
 /// | `confirm_all`  | `confirm_all_gates`       |
 /// | `keywords`     | `keyword_gates`           |
+/// | `value_suppressors` | `value_suppressor_gates` |
 /// | `entropy`      | `entropy_gates`           |
 /// | `local_context`| `local_context_gates`     |
 /// | `two_phase`    | `two_phase_gates`         |
@@ -350,6 +352,7 @@ pub(super) struct RuleCompiled {
     // Gate pool indices — dereference through Engine pool vectors.
     pub(super) confirm_all: Option<u32>,
     pub(super) keywords: Option<u32>,
+    pub(super) value_suppressors: Option<u32>,
     pub(super) entropy: Option<u32>,
     pub(super) local_context: Option<u32>,
     pub(super) two_phase: Option<u32>,
@@ -379,6 +382,7 @@ const _: () = assert!(std::mem::size_of::<Option<u32>>() == 8);
 pub(super) struct CompiledGates {
     pub(super) two_phase: Option<TwoPhaseCompiled>,
     pub(super) keywords: Option<KeywordsCompiled>,
+    pub(super) value_suppressors: Option<PackedPatterns>,
     pub(super) entropy: Option<EntropyCompiled>,
     pub(super) local_context: Option<LocalContextSpec>,
 }
@@ -433,6 +437,19 @@ pub(super) fn compile_rule(spec: &RuleSpec) -> (RuleCompiled, CompiledGates) {
         }
     });
 
+    // Value suppressors only need raw patterns: they are checked against
+    // extracted secret bytes (post-regex), which are always in decoded byte
+    // space, never raw UTF-16 window bytes.
+    let value_suppressors = spec.value_suppressors_any.map(|suppressors| {
+        let count = suppressors.len();
+        let raw_bytes = suppressors.iter().map(|p| p.len()).sum::<usize>();
+        let mut raw = PackedPatternsBuilder::with_capacity(count, raw_bytes);
+        for &p in suppressors {
+            raw.push_raw(p);
+        }
+        raw.build()
+    });
+
     let entropy = spec.entropy.as_ref().map(|e| EntropyCompiled {
         min_bits_per_byte: e.min_bits_per_byte,
         min_len: e.min_len,
@@ -450,6 +467,7 @@ pub(super) fn compile_rule(spec: &RuleSpec) -> (RuleCompiled, CompiledGates) {
         secret_group: spec.secret_group,
         confirm_all: None,
         keywords: None,
+        value_suppressors: None,
         entropy: None,
         local_context: None,
         two_phase: None,
@@ -458,6 +476,7 @@ pub(super) fn compile_rule(spec: &RuleSpec) -> (RuleCompiled, CompiledGates) {
     let gates = CompiledGates {
         two_phase,
         keywords,
+        value_suppressors,
         entropy,
         local_context: spec.local_context,
     };
@@ -588,6 +607,36 @@ pub(super) fn utf16be_bytes(ascii: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::{RuleSpec, ValidatorKind};
+    use regex::bytes::Regex;
+
+    fn unpack_patterns(pats: &PackedPatterns) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let count = pats.offsets.len().saturating_sub(1);
+        for i in 0..count {
+            let start = pats.offsets[i] as usize;
+            let end = pats.offsets[i + 1] as usize;
+            out.push(pats.bytes[start..end].to_vec());
+        }
+        out
+    }
+
+    fn test_rule_spec(value_suppressors_any: Option<&'static [&'static [u8]]>) -> RuleSpec {
+        RuleSpec {
+            name: "compile-rule-test",
+            anchors: &[b"TOK_"],
+            radius: 32,
+            validator: ValidatorKind::None,
+            two_phase: None,
+            must_contain: None,
+            keywords_any: None,
+            value_suppressors_any,
+            entropy: None,
+            local_context: None,
+            secret_group: Some(1),
+            re: Regex::new(r"TOK_([A-Z0-9]{4})").unwrap(),
+        }
+    }
 
     #[test]
     fn map_to_patterns_sorts_patterns_and_targets() {
@@ -612,5 +661,31 @@ mod tests {
                 Target::new(2, Variant::Raw),
             ]
         );
+    }
+
+    #[test]
+    fn compile_rule_builds_value_suppressor_patterns() {
+        static SUPPRESSORS: &[&[u8]] = &[b"EXAMPLE", b"DUMMY_TOKEN"];
+        let spec = test_rule_spec(Some(SUPPRESSORS));
+
+        let (rule, gates) = compile_rule(&spec);
+        assert!(rule.value_suppressors.is_none());
+        let packed = gates
+            .value_suppressors
+            .as_ref()
+            .expect("value suppressors should be compiled");
+        assert_eq!(
+            unpack_patterns(packed),
+            vec![b"EXAMPLE".to_vec(), b"DUMMY_TOKEN".to_vec()]
+        );
+    }
+
+    #[test]
+    fn compile_rule_without_value_suppressors_has_no_gate() {
+        let spec = test_rule_spec(None);
+        let (rule, gates) = compile_rule(&spec);
+
+        assert!(rule.value_suppressors.is_none());
+        assert!(gates.value_suppressors.is_none());
     }
 }

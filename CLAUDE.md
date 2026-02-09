@@ -168,4 +168,21 @@ bd sync                 # Commit beads changes
 
 <!-- end-bv-agent-instructions -->
 
+## Documentation Consistency
+
+When changes touch any of these source files, verify the corresponding docs
+are updated in the same PR:
+
+| Source file | Doc files to check |
+|---|---|
+| `src/api.rs` (RuleSpec fields) | `docs/detection-rules.md` (Rule Anatomy diagram, YAML template), `docs/data-types.md` (RuleSpec class) |
+| `src/engine/rule_repr.rs` (RuleCompiled gate fields) | `docs/data-types.md` (RuleCompiled class), `docs/engine-window-validation.md` (gate pool table) |
+| `src/engine/window_validate.rs` (gate sequence in module doc) | `docs/engine-window-validation.md` (Gate sequence, gate ordering) |
+| `src/engine/core.rs` (Engine gate pool vectors) | `docs/data-types.md` (Engine class), `docs/detection-engine.md` (flow diagram) |
+| `default_rules.yaml` (rule additions/removals) | `docs/detection-rules.md` (Current Snapshot counts) |
+
+The `cargo test --test integration doc_consistency` suite enforces structural
+invariants automatically. Semantic accuracy of explanations must be reviewed
+manually or by code review.
+
 See AGENTS.md for full project details.

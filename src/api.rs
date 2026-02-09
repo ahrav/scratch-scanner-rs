@@ -582,7 +582,8 @@ impl LocalContextSpec {
 ///
 /// # Invariants
 /// - `name` must be non-empty.
-/// - `two_phase`, `must_contain`, `keywords_any`, and `entropy` must be valid when present.
+/// - `two_phase`, `must_contain`, `keywords_any`, `value_suppressors_any`,
+///   `entropy`, and `local_context` must be valid when present.
 ///
 /// # Design Notes
 /// - Anchors should be ASCII-ish; UTF-16 variants are derived automatically.
@@ -591,7 +592,11 @@ impl LocalContextSpec {
 ///
 /// # Performance
 /// - Smaller `radius` values reduce regex work but can miss matches if too small.
-/// - `must_contain`, `keywords_any`, and `entropy` act as progressively cheaper filters.
+/// - `must_contain`, `keywords_any`, and `entropy` act as progressively cheaper
+///   pre-/post-regex filters evaluated on the match window.
+/// - `value_suppressors_any` is a post-extraction filter that runs after regex
+///   matching and entropy gating; it adds minimal cost per confirmed match but
+///   does not reduce regex work.
 #[derive(Clone, Debug)]
 pub struct RuleSpec {
     /// Rule name used for reporting.
@@ -632,6 +637,19 @@ pub struct RuleSpec {
     /// Like anchors, keywords are compiled into raw + UTF-16LE/BE variants so the
     /// gate works consistently whether scanning raw buffers or decoded UTF-16 content.
     pub keywords_any: Option<&'static [&'static [u8]]>,
+
+    /// Optional value suppressor gate (any-of) checked on extracted secret bytes.
+    ///
+    /// This is a *post-match* filter: when any configured literal appears in the
+    /// extracted secret value, the finding is suppressed. Useful for suppressing
+    /// known placeholder or example values (e.g., `EXAMPLE`, `DUMMY_TOKEN`) that
+    /// regex and entropy gates cannot distinguish from real secrets.
+    ///
+    /// Patterns are matched on raw bytes and are case-sensitive. Unlike
+    /// `keywords_any`, which operates on the full window before regex execution,
+    /// value suppressors operate on the extracted secret span after regex
+    /// matching and entropy gating.
+    pub value_suppressors_any: Option<&'static [&'static [u8]]>,
 
     /// Optional entropy gate evaluated on each regex match.
     ///
@@ -689,6 +707,18 @@ impl RuleSpec {
         }
         if let Some(kws) = self.keywords_any {
             assert!(!kws.is_empty(), "keywords_any must not be empty");
+        }
+        if let Some(suppressors) = self.value_suppressors_any {
+            assert!(
+                !suppressors.is_empty(),
+                "value_suppressors_any must not be empty"
+            );
+            for suppressor in suppressors {
+                assert!(
+                    !suppressor.is_empty(),
+                    "value_suppressors_any contains empty value"
+                );
+            }
         }
         if let Some(ent) = &self.entropy {
             ent.assert_valid();
@@ -763,6 +793,7 @@ mod tests {
             two_phase: None,
             must_contain: None,
             keywords_any: None,
+            value_suppressors_any: None,
             entropy: None,
             local_context,
             secret_group: None,
@@ -795,6 +826,40 @@ mod tests {
             key_names_any: Some(&[]),
         };
         let rule = dummy_rule(Some(ctx));
+        rule.assert_valid();
+    }
+
+    #[test]
+    fn value_suppressors_none_is_valid() {
+        dummy_rule(None).assert_valid();
+    }
+
+    #[test]
+    fn value_suppressors_non_empty_is_valid() {
+        static VALUE_SUPPRESSORS: &[&[u8]] = &[b"EXAMPLE", b"DUMMY_TOKEN"];
+
+        let mut rule = dummy_rule(None);
+        rule.value_suppressors_any = Some(VALUE_SUPPRESSORS);
+        rule.assert_valid();
+    }
+
+    #[test]
+    #[should_panic(expected = "value_suppressors_any must not be empty")]
+    fn value_suppressors_empty_list_panics() {
+        static EMPTY_SUPPRESSORS: &[&[u8]] = &[];
+
+        let mut rule = dummy_rule(None);
+        rule.value_suppressors_any = Some(EMPTY_SUPPRESSORS);
+        rule.assert_valid();
+    }
+
+    #[test]
+    #[should_panic(expected = "value_suppressors_any contains empty value")]
+    fn value_suppressors_empty_entry_panics() {
+        static SUPPRESSORS_WITH_EMPTY_ENTRY: &[&[u8]] = &[b""];
+
+        let mut rule = dummy_rule(None);
+        rule.value_suppressors_any = Some(SUPPRESSORS_WITH_EMPTY_ENTRY);
         rule.assert_valid();
     }
 }
@@ -913,6 +978,7 @@ impl RuleSpec {
 
         encode_opt_bytes(out, self.must_contain);
         encode_opt_bytes_list(out, self.keywords_any);
+        encode_opt_bytes_list(out, self.value_suppressors_any);
 
         match &self.entropy {
             None => out.push(0),

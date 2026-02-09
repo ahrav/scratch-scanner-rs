@@ -159,6 +159,7 @@ mod tests {
             two_phase: None,
             must_contain: None,
             keywords_any: None,
+            value_suppressors_any: None,
             entropy: None,
             local_context: None,
             secret_group: None,
@@ -187,6 +188,22 @@ mod tests {
         let h1 = policy_hash(&rules, &transforms(), &tuning, MergeDiffMode::AllParents, 1);
         let h2 = policy_hash(&rules, &transforms(), &tuning, MergeDiffMode::AllParents, 1);
         assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn policy_hash_is_sensitive_to_value_suppressors_any() {
+        let mut r1 = rule("a", "a", &[b"a"]);
+        let mut r2 = rule("a", "a", &[b"a"]);
+        r1.value_suppressors_any = None;
+        r2.value_suppressors_any = Some(&[b"EXAMPLE"]);
+        let tuning = demo_tuning();
+
+        let h1 = policy_hash(&[r1], &transforms(), &tuning, MergeDiffMode::AllParents, 1);
+        let h2 = policy_hash(&[r2], &transforms(), &tuning, MergeDiffMode::AllParents, 1);
+        assert_ne!(
+            h1, h2,
+            "changing value_suppressors_any must change the policy hash"
+        );
     }
 
     #[test]

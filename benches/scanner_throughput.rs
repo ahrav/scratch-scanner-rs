@@ -608,6 +608,7 @@ fn minimal_engine() -> Engine {
         two_phase: None,
         must_contain: None,
         keywords_any: None,
+        value_suppressors_any: None,
         entropy: None,
         local_context: None,
         secret_group: None,

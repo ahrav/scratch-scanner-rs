@@ -18,6 +18,7 @@ The values below are from the current repository snapshot:
 - `two_phase` enabled: `2` rules (`private-key`, `vault-service-token-legacy`)
 - `entropy` enabled: `131` rules
 - `local_context` enabled: `1` rule (`generic-api-key`)
+- `value_suppressors_any` enabled: `0` rules
 - `secret_group` enabled: `2` rules (`microsoft-teams-webhook`, `sonar-api-token`)
 - `must_contain` enabled: `0` rules
 - `keywords_any` enabled: `223` rules
@@ -116,6 +117,7 @@ graph TB
         TwoPhase["two_phase: Option<TwoPhaseSpec>"]
         MustContain["must_contain: Option<&'static [u8]>"]
         KeywordsAny["keywords_any: Option<&'static [&'static [u8]]>"]
+        ValueSuppressorsAny["value_suppressors_any: Option<&'static [&'static [u8]]>"]
         Entropy["entropy: Option<EntropySpec>"]
         LocalContext["local_context: Option<LocalContextSpec>"]
         SecretGroup["secret_group: Option<u16>"]
@@ -241,6 +243,7 @@ rules:
   must_contain: null
   keywords_any:
   - mytok_
+  value_suppressors_any: null
   entropy: null
   two_phase: null
   local_context: null
@@ -253,6 +256,9 @@ Guidelines:
 2. Set radius to cover expected anchor-to-secret distance.
 3. Use `two_phase` only when anchors are noisy.
 4. Keep `keywords_any` aligned with reliable context tokens.
-5. Set `secret_group` when the secret is not the full match.
+5. Use `value_suppressors_any` to suppress known placeholder or example values
+   (e.g., `EXAMPLE`, `DUMMY_TOKEN`) that regex and entropy cannot distinguish
+   from real secrets. Patterns are case-sensitive and matched on extracted secret bytes.
+6. Set `secret_group` when the secret is not the full match.
 6. Derived anchors are enabled by default (`AnchorPolicy::PreferDerived`) and
    may produce a compiled `confirm_all` gate from regex literal islands.

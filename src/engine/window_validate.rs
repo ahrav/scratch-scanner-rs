@@ -16,8 +16,9 @@
 //! 3. Run regex with reusable capture locations to access capture groups.
 //! 4. Apply entropy gates on the *full match* (group 0).
 //! 5. Extract the secret span using capture group priority (see [`extract_secret_span`]).
-//! 6. Apply local context checks (when configured) on the secret span.
-//! 7. Record the finding with the extracted secret span.
+//! 6. Apply value suppressors (when configured) on the extracted secret bytes.
+//! 7. Apply local context checks (when configured) on the secret span.
+//! 8. Record the finding with the extracted secret span.
 //!
 //! # Secret Extraction
 //! The finding's `span_start`/`span_end` reflect the *secret* portion of the match,
@@ -381,6 +382,7 @@ impl Engine {
                 let search_window = &window[search_start..];
 
                 let entropy = self.entropy_gate(rule.entropy);
+                let value_suppressors = self.value_suppressor_gate(rule.value_suppressors);
                 // Take the pre-allocated CaptureLocations out of scratch so the
                 // closure can borrow `locs` mutably without also borrowing `scratch`.
                 // Restored after the loop to keep the slot populated for the next call.
@@ -412,6 +414,15 @@ impl Engine {
                             extract_secret_span_locs(locs, rule.secret_group);
                         let secret_start = search_start + secret_start;
                         let secret_end = search_start + secret_end;
+                        let secret_bytes = &window[secret_start..secret_end];
+
+                        // Value suppressor gate: discard findings whose extracted
+                        // secret contains a known placeholder/example pattern.
+                        if let Some(vs) = value_suppressors {
+                            if contains_any_memmem(secret_bytes, vs) {
+                                return;
+                            }
+                        }
 
                         let context_ok =
                             if let Some(ctx) = self.local_context_gate(rule.local_context) {
@@ -452,7 +463,6 @@ impl Engine {
                             let include_span =
                                 step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
 
-                            let secret_bytes = &window[secret_start..secret_end];
                             let norm_hash = *blake3::hash(secret_bytes).as_bytes();
                             scratch.push_finding_with_drop_hint(
                                 FindingRec {
@@ -629,6 +639,7 @@ impl Engine {
         );
 
         let entropy = self.entropy_gate(rule.entropy);
+        let value_suppressors = self.value_suppressor_gate(rule.value_suppressors);
         let mut locs = scratch.capture_locs[rule_id as usize]
             .take()
             .expect("capture locations missing for rule");
@@ -652,6 +663,14 @@ impl Engine {
             if entropy_ok {
                 // Extract secret span using capture group logic.
                 let (secret_start, secret_end) = extract_secret_span_locs(locs, rule.secret_group);
+                let secret_bytes = &decoded[secret_start..secret_end];
+
+                // Value suppressor gate (see raw-path comment for rationale).
+                if let Some(vs) = value_suppressors {
+                    if contains_any_memmem(secret_bytes, vs) {
+                        return;
+                    }
+                }
 
                 let context_ok = if let Some(ctx) = self.local_context_gate(rule.local_context) {
                     local_context_passes(decoded, secret_start, secret_end, ctx)
@@ -692,7 +711,6 @@ impl Engine {
                     // is unavailable for nested transforms.
                     let include_span =
                         utf16_step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
-                    let secret_bytes = &decoded[secret_start..secret_end];
                     let norm_hash = *blake3::hash(secret_bytes).as_bytes();
                     scratch.push_finding_with_drop_hint(
                         FindingRec {
@@ -781,6 +799,7 @@ impl Engine {
 
         let max_findings = scratch.max_findings;
         let entropy = self.entropy_gate(rule.entropy);
+        let value_suppressors = self.value_suppressor_gate(rule.value_suppressors);
         let mut locs = scratch.capture_locs[rule_id as usize]
             .take()
             .expect("capture locations missing for rule");
@@ -806,6 +825,14 @@ impl Engine {
                 let (secret_start, secret_end) = extract_secret_span_locs(locs, rule.secret_group);
                 let secret_start = search_start + secret_start;
                 let secret_end = search_start + secret_end;
+                let secret_bytes = &window[secret_start..secret_end];
+
+                // Value suppressor gate (see raw-path comment for rationale).
+                if let Some(vs) = value_suppressors {
+                    if contains_any_memmem(secret_bytes, vs) {
+                        return;
+                    }
+                }
 
                 let context_ok = if let Some(ctx) = self.local_context_gate(rule.local_context) {
                     local_context_passes(window, secret_start, secret_end, ctx)
@@ -848,7 +875,6 @@ impl Engine {
                         let dedupe_with_span =
                             step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
 
-                        let secret_bytes = &window[secret_start..secret_end];
                         let norm_hash = *blake3::hash(secret_bytes).as_bytes();
                         scratch.tmp_findings.push(FindingRec {
                             file_id,
@@ -993,6 +1019,7 @@ impl Engine {
 
         let max_findings = scratch.max_findings;
         let entropy = self.entropy_gate(rule.entropy);
+        let value_suppressors = self.value_suppressor_gate(rule.value_suppressors);
         let mut locs = scratch.capture_locs[rule_id as usize]
             .take()
             .expect("capture locations missing for rule");
@@ -1014,6 +1041,14 @@ impl Engine {
             if entropy_ok {
                 // Extract secret span using capture group logic.
                 let (secret_start, secret_end) = extract_secret_span_locs(locs, rule.secret_group);
+                let secret_bytes = &decoded[secret_start..secret_end];
+
+                // Value suppressor gate (see raw-path comment for rationale).
+                if let Some(vs) = value_suppressors {
+                    if contains_any_memmem(secret_bytes, vs) {
+                        return;
+                    }
+                }
 
                 let context_ok = if let Some(ctx) = self.local_context_gate(rule.local_context) {
                     local_context_passes(decoded, secret_start, secret_end, ctx)
@@ -1058,7 +1093,6 @@ impl Engine {
                         // is unavailable. See run_rule_on_raw_window_into for full rationale.
                         let dedupe_with_span =
                             utf16_step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
-                        let secret_bytes = &decoded[secret_start..secret_end];
                         let norm_hash = *blake3::hash(secret_bytes).as_bytes();
                         scratch.tmp_findings.push(FindingRec {
                             file_id,
