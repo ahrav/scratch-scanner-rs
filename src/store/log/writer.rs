@@ -246,7 +246,14 @@ impl AppendLogStoreProducer {
         &self.inner.cfg.root_dir
     }
 
-    /// Compute all finding-frame size checks before reserving inflight budget.
+    /// Pre-compute finding-frame sizes and validate limits before reserving
+    /// inflight budget.
+    ///
+    /// Returns a [`FindingFramePlan`] containing the wire-level lengths
+    /// (`body_len`, `body_len_word`, `frame_len`) and already-cast count
+    /// fields so that [`build_finding_frame`](Self::build_finding_frame)
+    /// can serialize without redundant checks. Runs entirely on the
+    /// producer thread with no locks held.
     fn plan_finding_frame(
         &self,
         batch: FsFindingBatch<'_>,
@@ -376,7 +383,11 @@ impl AppendLogStoreProducer {
         Ok(())
     }
 
-    /// Build the run-end payload written during `Finish`.
+    /// Build the [`LogRunEnd`] payload written during `Finish`.
+    ///
+    /// Captures the current wall-clock timestamp and propagates the loss
+    /// counters (`dropped_findings`, `persistence_emit_failures`) and
+    /// the `incomplete` flag from the accumulated [`FsRunLoss`].
     fn build_run_end_record(&self, loss: FsRunLoss) -> LogRunEnd {
         LogRunEnd {
             ended_unix_ms: now_unix_ms(),
