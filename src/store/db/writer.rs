@@ -101,7 +101,6 @@ struct WriterState {
     /// Monotonically increasing sequence number within this run, bumped once
     /// per finding and recorded in `observations.batch_seqno`.
     batch_seqno: i64,
-    root_pk: i64,
     /// `rule_fingerprint → rule_pk` — populated lazily on first encounter.
     rule_cache: HashMap<[u8; 32], i64>,
     counters: RunCounters,
@@ -166,7 +165,6 @@ impl SqliteStoreProducer {
                 conn,
                 run_pk,
                 batch_seqno: 0,
-                root_pk,
                 rule_cache: HashMap::new(),
                 counters: RunCounters::default(),
             }),

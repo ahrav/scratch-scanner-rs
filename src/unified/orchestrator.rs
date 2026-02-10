@@ -500,8 +500,8 @@ fn run_store_command(cmd: StoreCommand) -> io::Result<()> {
                         println!("No runs found.");
                     } else {
                         println!(
-                            "{:<36} {:<8} {:<15} {:<10} {}",
-                            "RUN ID", "STATUS", "STARTED", "FINDINGS", "ROOT"
+                            "{:<36} {:<8} {:<15} {:<10} ROOT",
+                            "RUN ID", "STATUS", "STARTED", "FINDINGS"
                         );
                         for run in &runs {
                             let status_str = status_label(run.status);
@@ -650,8 +650,8 @@ fn run_store_command(cmd: StoreCommand) -> io::Result<()> {
                         println!("No secrets found.");
                     } else {
                         println!(
-                            "{:<36} {:<12} {:<8} {}",
-                            "SECRET HASH", "OCCURRENCES", "STATUS", "FIRST SEEN"
+                            "{:<36} {:<12} {:<8} FIRST SEEN",
+                            "SECRET HASH", "OCCURRENCES", "STATUS"
                         );
                         for s in &secrets {
                             println!(

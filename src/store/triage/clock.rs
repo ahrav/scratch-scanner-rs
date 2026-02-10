@@ -49,7 +49,7 @@ impl TriageClock {
         }
 
         let node_id = generate_node_id();
-        let mut c = Self {
+        let c = Self {
             node_id,
             clock: 0,
             meta_path,

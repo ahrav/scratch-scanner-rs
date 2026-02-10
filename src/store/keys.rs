@@ -225,6 +225,7 @@ impl StoreKeys {
     }
 
     /// Key for rule fingerprint and occurrence-id derivation.
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn identity_key(&self) -> &[u8; 32] {
         &self.identity_key

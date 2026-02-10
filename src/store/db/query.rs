@@ -327,7 +327,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 fn hex_decode(hex: &str) -> Vec<u8> {
     let hex = hex.trim();
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Vec::new();
     }
     let mut bytes = Vec::with_capacity(hex.len() / 2);
