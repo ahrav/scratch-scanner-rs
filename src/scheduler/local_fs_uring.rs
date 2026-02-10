@@ -521,11 +521,13 @@ struct ArchiveWork {
 /// Work item sent to binary-extraction worker threads.
 ///
 /// Routed from I/O threads when `skip_binary` is true and the first chunk
-/// is classified as `BinaryExtractable` (e.g., PDF, Office documents).
-/// The extraction worker reads the file, extracts scannable text, and scans
-/// it as a single chunk.
+/// is classified as `BinaryExtractable` (e.g., `.ipynb`, `.class`, `.jar`,
+/// `.war`, `.pyc`). The already-open file descriptor is transferred so
+/// extraction avoids an extra open syscall and preserves open-time snapshot
+/// semantics.
 struct ExtractWork {
-    path: PathBuf,
+    file: File,
+    file_size: u64,
     fmt: crate::content_policy::ExtractableFormat,
     token: Arc<FileToken>,
 }
@@ -906,13 +908,15 @@ struct ExtractWorkerStats {
     bytes_scanned: u64,
     chunks_scanned: u64,
     findings_emitted: u64,
+    findings_dropped: u64,
     files_extracted: u64,
-    files_open_failed: u64,
+    io_errors: u64,
     extract_failures: u64,
 }
 
 /// Per-extraction-worker loop: drains [`ExtractWork`] from the channel,
-/// opens each file, extracts scannable text (capped at 64 MiB input), and
+/// reads each already-open file descriptor, extracts scannable text (capped at
+/// 64 MiB input), and
 /// scans the extracted content as a single chunk.
 ///
 /// Runs on a dedicated thread. Returns aggregate stats when the channel
@@ -938,33 +942,25 @@ fn extract_worker_loop<E: ScanEngine>(
     let mut total_bytes = 0u64;
     let mut total_chunks = 0u64;
     let mut total_findings = 0u64;
+    let mut total_dropped = 0u64;
     let mut files_extracted = 0u64;
-    let mut files_open_failed = 0u64;
+    let mut io_errors = 0u64;
     let mut extract_failures = 0u64;
 
-    for work in rx {
+    for mut work in rx {
         let display = &*work.token.display;
 
-        let file = match File::open(&work.path) {
-            Ok(f) => f,
-            Err(_e) => {
-                files_open_failed += 1;
-                #[cfg(debug_assertions)]
-                eprintln!("[uring-extract] Failed to open {:?}: {}", work.path, _e);
-                continue;
-            }
-        };
-
         // Read entire file (capped at 64 MiB).
-        let read_limit = 64 * 1024 * 1024usize;
+        let read_limit = work.file_size.min(64 * 1024 * 1024u64) as usize;
         input_buf.clear();
         input_buf.reserve(read_limit.min(4096));
-        if file
+        if work
+            .file
             .take(read_limit as u64)
             .read_to_end(&mut input_buf)
             .is_err()
         {
-            extract_failures += 1;
+            io_errors = io_errors.saturating_add(1);
             continue;
         }
 
@@ -979,14 +975,22 @@ fn extract_worker_loop<E: ScanEngine>(
 
         // Scan extracted text as a single chunk.
         engine.scan_chunk_into(&output_buf, work.token.file_id, 0, &mut scratch);
+        let engine_dropped = scratch.dropped_findings();
+        let before_prefix = scratch.pending_findings_len();
         scratch.drop_prefix_findings(0);
 
         pending.clear();
         scratch.drain_findings_into(&mut pending);
 
+        let before_dedupe = pending.len();
         if dedupe {
             dedupe_pending_in_place(&mut pending);
         }
+        let scheduler_pruned = before_prefix
+            .saturating_sub(before_dedupe)
+            .saturating_add(before_dedupe.saturating_sub(pending.len()));
+        let effective_dropped = engine_dropped.saturating_add(scheduler_pruned as u64);
+        total_dropped = total_dropped.saturating_add(effective_dropped);
 
         total_findings += pending.len() as u64;
         emit_findings(engine.as_ref(), &*event_sink, display, &pending);
@@ -1002,8 +1006,9 @@ fn extract_worker_loop<E: ScanEngine>(
         bytes_scanned: total_bytes,
         chunks_scanned: total_chunks,
         findings_emitted: total_findings,
+        findings_dropped: total_dropped,
         files_extracted,
-        files_open_failed,
+        io_errors,
         extract_failures,
     }
 }
@@ -1049,7 +1054,9 @@ enum FilePhase {
 /// submission. `overlap_buf` carries the tail bytes of the previous chunk so
 /// the next read's buffer can be prefixed without re-reading from disk.
 struct ReadState {
-    file: File,
+    /// Open file descriptor for this slot. `None` only after ownership is
+    /// transferred to extraction workers for `BinaryExtractable` files.
+    file: Option<File>,
     /// Authoritative file size from fstat/statx at open time.
     size: u64,
     /// Byte offset of the next payload read (not counting overlap prefix).
@@ -1351,7 +1358,7 @@ fn io_worker_loop<E: ScanEngine>(
         }
 
         BlockingOutcome::Ready(ReadState {
-            file,
+            file: Some(file),
             size,
             next_offset: 0,
             overlap_buf: vec![0u8; overlap].into_boxed_slice(),
@@ -1501,8 +1508,17 @@ fn io_worker_loop<E: ScanEngine>(
                                     .copy_from_slice(&rs.overlap_buf[..prefix_len]);
                             }
 
+                            let Some(file) = rs.file.as_ref() else {
+                                st.failed = true;
+                                st.done = true;
+                                drop(buf);
+                                files[file_slot] = None;
+                                free_file_slots.push(file_slot);
+                                continue;
+                            };
+
                             let op_slot = free_ops.pop().unwrap();
-                            let fd = rs.file.as_raw_fd();
+                            let fd = file.as_raw_fd();
                             // SAFETY: `prefix_len < buffer_len` (clamped above), so
                             // `add(prefix_len)` stays within the buffer allocation.
                             let ptr = unsafe { buf.as_mut_slice().as_mut_ptr().add(prefix_len) };
@@ -1969,24 +1985,24 @@ fn io_worker_loop<E: ScanEngine>(
                                         }
                                         ContentVerdict::BinaryExtractable(fmt) => {
                                             if let Some(ref etx) = extract_tx {
-                                                // SAFETY: display bytes originate from
-                                                // `Path::as_os_str().as_bytes()` on Unix,
-                                                // so they are valid OS string bytes.
-                                                let path = PathBuf::from(unsafe {
-                                                    std::ffi::OsStr::from_encoded_bytes_unchecked(
-                                                        &st.token.display,
-                                                    )
-                                                });
-                                                let ew = ExtractWork {
-                                                    path,
-                                                    fmt,
-                                                    token: Arc::clone(&st.token),
-                                                };
-                                                if etx.send(ew).is_ok() {
-                                                    stats.extractions_routed =
-                                                        stats.extractions_routed.saturating_add(1);
+                                                if let Some(file) = rs.file.take() {
+                                                    let ew = ExtractWork {
+                                                        file,
+                                                        file_size: rs.size,
+                                                        fmt,
+                                                        token: Arc::clone(&st.token),
+                                                    };
+                                                    if etx.send(ew).is_ok() {
+                                                        stats.extractions_routed = stats
+                                                            .extractions_routed
+                                                            .saturating_add(1);
+                                                    } else {
+                                                        // Channel closed; fall back to skip.
+                                                        stats.binary_skipped =
+                                                            stats.binary_skipped.saturating_add(1);
+                                                    }
                                                 } else {
-                                                    // Channel closed; fall back to skip.
+                                                    // File handle missing unexpectedly.
                                                     stats.binary_skipped =
                                                         stats.binary_skipped.saturating_add(1);
                                                 }
@@ -2195,7 +2211,7 @@ fn io_worker_loop<E: ScanEngine>(
                                         };
 
                                         st.phase = FilePhase::Ready(ReadState {
-                                            file,
+                                            file: Some(file),
                                             size,
                                             next_offset: 0,
                                             overlap_buf: vec![0u8; overlap].into_boxed_slice(),
@@ -2253,7 +2269,7 @@ fn io_worker_loop<E: ScanEngine>(
 
                                 perf_stats::sat_add_u64(&mut stats.bytes_enqueued, size);
                                 st.phase = FilePhase::Ready(ReadState {
-                                    file,
+                                    file: Some(file),
                                     size,
                                     next_offset: 0,
                                     overlap_buf: vec![0u8; overlap].into_boxed_slice(),
@@ -2671,6 +2687,8 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
     let mut extract_bytes = 0u64;
     let mut extract_chunks = 0u64;
     let mut extract_findings = 0u64;
+    let mut extract_dropped_findings = 0u64;
+    let mut extract_io_errors = 0u64;
     let mut total_extracted = 0u64;
     for t in extract_threads {
         match t.join() {
@@ -2678,6 +2696,8 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
                 extract_bytes += ws.bytes_scanned;
                 extract_chunks += ws.chunks_scanned;
                 extract_findings += ws.findings_emitted;
+                extract_dropped_findings += ws.findings_dropped;
+                extract_io_errors += ws.io_errors;
                 total_extracted += ws.files_extracted;
             }
             Err(_) => return Err(io::Error::other("extraction worker panicked")),
@@ -2685,7 +2705,7 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
     }
 
     summary.open_errors = io_stats.files_open_failed + archive_open_errors;
-    summary.read_errors = io_stats.read_errors + archive_scan_errors;
+    summary.read_errors = io_stats.read_errors + archive_scan_errors + extract_io_errors;
     summary.binary_skipped = io_stats.binary_skipped;
 
     // Join CPU executor.
@@ -2706,6 +2726,10 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
     cpu_metrics.bytes_scanned = cpu_metrics.bytes_scanned.wrapping_add(extract_bytes);
     cpu_metrics.chunks_scanned = cpu_metrics.chunks_scanned.wrapping_add(extract_chunks);
     cpu_metrics.findings_emitted = cpu_metrics.findings_emitted.wrapping_add(extract_findings);
+    cpu_metrics.findings_dropped = cpu_metrics
+        .findings_dropped
+        .wrapping_add(extract_dropped_findings);
+    cpu_metrics.io_errors = cpu_metrics.io_errors.wrapping_add(extract_io_errors);
 
     event_sink.flush();
 
@@ -2718,11 +2742,93 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
 
 #[cfg(test)]
 mod tests {
-    use super::super::engine_stub::{EngineTuning, MockEngine, MockRule};
+    use super::super::engine_stub::{EngineTuning, FindingRec, MockEngine, MockRule, RuleId};
+    use super::super::engine_trait::{EngineScratch, FindingRecord, FindingWithHash, ScanEngine};
     use super::super::{TsBufferPool, TsBufferPoolConfig};
     use super::*;
+    use crate::api::FileId;
     use crate::unified::events::VecEventSink;
     use tempfile::tempdir;
+
+    struct DuplicateDropEngine;
+
+    struct DuplicateDropScratch {
+        findings: Vec<FindingWithHash<FindingRec>>,
+        dropped_findings: u64,
+    }
+
+    impl EngineScratch for DuplicateDropScratch {
+        type Finding = FindingWithHash<FindingRec>;
+
+        fn clear(&mut self) {
+            self.findings.clear();
+            self.dropped_findings = 0;
+        }
+
+        fn drop_prefix_findings(&mut self, new_bytes_start: u64) {
+            self.findings
+                .retain(|f| f.root_hint_end() >= new_bytes_start);
+        }
+
+        fn drain_findings_into(&mut self, out: &mut Vec<Self::Finding>) {
+            out.append(&mut self.findings);
+        }
+
+        fn pending_findings_len(&self) -> usize {
+            self.findings.len()
+        }
+
+        fn dropped_findings(&self) -> u64 {
+            self.dropped_findings
+        }
+    }
+
+    impl ScanEngine for DuplicateDropEngine {
+        type Scratch = DuplicateDropScratch;
+
+        fn required_overlap(&self) -> usize {
+            0
+        }
+
+        fn new_scratch(&self) -> Self::Scratch {
+            DuplicateDropScratch {
+                findings: Vec::with_capacity(8),
+                dropped_findings: 0,
+            }
+        }
+
+        fn scan_chunk_into(
+            &self,
+            data: &[u8],
+            _file_id: FileId,
+            _base_offset: u64,
+            scratch: &mut Self::Scratch,
+        ) {
+            if data.is_empty() {
+                return;
+            }
+            let rec = FindingRec {
+                rule_id: RuleId(0),
+                root_hint_start: 0,
+                root_hint_end: 6,
+                span_start: 0,
+                span_end: 6,
+            };
+            // Emit duplicates so scheduler dedupe prunes one finding.
+            scratch.findings.push(FindingWithHash::new(rec, [0; 32]));
+            scratch.findings.push(FindingWithHash::new(rec, [0; 32]));
+            // Simulate engine-side cap drops for parity accounting checks.
+            scratch.dropped_findings = scratch.dropped_findings.saturating_add(2);
+        }
+
+        fn rule_name(&self, _rule_id: u32) -> &str {
+            "dup"
+        }
+
+        fn max_findings_per_chunk(&self) -> usize {
+            8
+        }
+    }
 
     #[test]
     fn uring_finds_boundary_spanning_match() -> io::Result<()> {
@@ -2982,6 +3088,111 @@ mod tests {
         // The file should NOT have been scanned (no findings for "SECRET").
         let events = sink.take();
         assert!(events.is_empty(), "binary file should not produce findings");
+
+        Ok(())
+    }
+
+    #[test]
+    fn uring_extract_path_counts_dropped_findings() -> io::Result<()> {
+        let engine = Arc::new(DuplicateDropEngine);
+        let dir = tempdir()?;
+        let file_path = dir.path().join("notebook.ipynb");
+        std::fs::write(
+            &file_path,
+            br#"{"cells":[{"cell_type":"code","source":["SECRET\n"]}],"metadata":{},"nbformat":4,"nbformat_minor":5}"#,
+        )?;
+
+        let cfg = LocalFsUringConfig {
+            cpu_workers: 2,
+            io_threads: 1,
+            ring_entries: 64,
+            io_depth: 16,
+            chunk_size: 64,
+            max_in_flight_files: 8,
+            file_queue_cap: 8,
+            pool_buffers: 32,
+            use_registered_buffers: false,
+            open_stat_mode: OpenStatMode::BlockingOnly,
+            resolve_policy: ResolvePolicy::Default,
+            follow_symlinks: false,
+            max_file_size: None,
+            seed: 123,
+            dedupe_within_chunk: true,
+            pin_threads: false,
+            skip_binary: true,
+            archive: ArchiveConfig {
+                enabled: false,
+                ..ArchiveConfig::default()
+            },
+        };
+
+        let sink = Arc::new(VecEventSink::new());
+        let (_summary, _io_stats, cpu_metrics) =
+            scan_local_fs_uring(engine, &[dir.path().to_path_buf()], cfg, sink)?;
+
+        assert_eq!(cpu_metrics.binary_extracted, 1);
+        assert_eq!(
+            cpu_metrics.findings_dropped, 3,
+            "extraction path should count engine + scheduler dropped findings"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn extract_worker_uses_existing_fd_after_unlink() -> io::Result<()> {
+        let engine = Arc::new(MockEngine::with_tuning(
+            vec![MockRule {
+                name: "secret".into(),
+                pattern: b"SECRET".to_vec(),
+            }],
+            6,
+            EngineTuning {
+                max_findings_per_chunk: 128,
+                max_rules: 16,
+            },
+        ));
+
+        let dir = tempdir()?;
+        let file_path = dir.path().join("gone.ipynb");
+        std::fs::write(
+            &file_path,
+            br#"{"cells":[{"cell_type":"code","source":["SECRET\n"]}],"metadata":{},"nbformat":4,"nbformat_minor":5}"#,
+        )?;
+
+        let file = File::open(&file_path)?;
+        let file_size = file.metadata()?.len();
+        std::fs::remove_file(&file_path)?;
+
+        let budget = Arc::new(CountBudget::new(1));
+        let token = Arc::new(FileToken {
+            _permit: budget.acquire(1),
+            file_id: FileId(1),
+            display: b"gone.ipynb".to_vec().into_boxed_slice().into(),
+        });
+
+        let (tx, rx) = chan::bounded::<ExtractWork>(1);
+        tx.send(ExtractWork {
+            file,
+            file_size,
+            fmt: crate::content_policy::ExtractableFormat::Ipynb,
+            token,
+        })
+        .map_err(|_| io::Error::other("failed to enqueue extraction work"))?;
+        drop(tx);
+
+        let sink = Arc::new(VecEventSink::new());
+        let stats = extract_worker_loop(rx, engine, sink.clone(), true);
+
+        assert_eq!(stats.files_extracted, 1, "expected extraction from open fd");
+        assert_eq!(stats.io_errors, 0);
+        assert_eq!(stats.extract_failures, 0);
+        let out = sink.take();
+        let out_str = String::from_utf8_lossy(&out);
+        assert!(
+            out_str.contains("secret"),
+            "expected finding after unlink; output: {out_str}"
+        );
 
         Ok(())
     }
