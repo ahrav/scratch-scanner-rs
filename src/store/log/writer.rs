@@ -915,7 +915,7 @@ impl SegmentWriter {
         self.file.get_ref().sync_data()?;
         let mut bin_path = self.open_path.clone();
         bin_path.set_extension(SEGMENT_BIN_EXT);
-        fs::rename(&self.open_path, &bin_path)?;
+        rename_noreplace(&self.open_path, &bin_path)?;
         sync_dir(&self.segments_dir)?;
         Ok(())
     }
@@ -952,6 +952,71 @@ fn sync_dir(path: &Path) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn sync_dir(_path: &Path) -> std::io::Result<()> {
     Ok(())
+}
+
+/// Rename `from` to `to`, failing if `to` already exists.
+///
+/// Uses platform-specific atomic rename where available to close the
+/// TOCTOU gap between `exists()` and `rename()`.
+#[cfg(target_os = "linux")]
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_from =
+        CString::new(from.as_os_str().as_bytes()).map_err(|e| std::io::Error::other(e))?;
+    let c_to = CString::new(to.as_os_str().as_bytes()).map_err(|e| std::io::Error::other(e))?;
+
+    // RENAME_NOREPLACE = 1
+    let ret = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            c_from.as_ptr(),
+            libc::AT_FDCWD,
+            c_to.as_ptr(),
+            1, // RENAME_NOREPLACE
+        )
+    };
+    if ret == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    // Fall back to plain rename on old kernels that don't support renameat2.
+    if err.raw_os_error() == Some(libc::ENOSYS) {
+        return fs::rename(from, to);
+    }
+    Err(err)
+}
+
+/// Rename `from` to `to`, failing if `to` already exists.
+#[cfg(target_os = "macos")]
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    extern "C" {
+        fn renamex_np(from: *const libc::c_char, to: *const libc::c_char, flags: u32) -> i32;
+    }
+
+    let c_from =
+        CString::new(from.as_os_str().as_bytes()).map_err(|e| std::io::Error::other(e))?;
+    let c_to = CString::new(to.as_os_str().as_bytes()).map_err(|e| std::io::Error::other(e))?;
+
+    // RENAME_EXCL = 0x00000004
+    let ret = unsafe { renamex_np(c_from.as_ptr(), c_to.as_ptr(), 0x00000004) };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Rename `from` to `to`. Falls back to plain `fs::rename` on platforms
+/// without atomic no-overwrite rename support — a TOCTOU gap remains on
+/// these targets.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::rename(from, to)
 }
 
 /// Compute fingerprints and build the sorted `RuleDef` frame list.
@@ -1432,7 +1497,22 @@ pub fn recover_open_segments(
                     .map_err(|e| io_to_store_err_at(e, &open_path))?;
             }
 
-            fs::rename(&open_path, &bin_path).map_err(|e| io_to_store_err_at(e, &bin_path))?;
+            match rename_noreplace(&open_path, &bin_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Another process created .bin between our exists()
+                    // check and rename. Treat as concurrent duplicate.
+                    fs::remove_file(&open_path)
+                        .map_err(|e| io_to_store_err_at(e, &open_path))?;
+                    report.entries.push(OpenSegmentRecoveryEntry {
+                        open_path,
+                        bin_path,
+                        outcome: OpenSegmentRecoveryOutcome::DiscardedDuplicateBin,
+                    });
+                    continue;
+                }
+                Err(e) => return Err(io_to_store_err_at(e, &bin_path)),
+            }
             sync_dir(&seg_dir).map_err(|e| io_to_store_err_at(e, &seg_dir))?;
 
             report.entries.push(OpenSegmentRecoveryEntry {
@@ -3608,5 +3688,170 @@ mod tests {
         assert!(report.entries.is_empty());
         assert_eq!(report.recovered_count(), 0);
         assert_eq!(report.discarded_count(), 0);
+    }
+
+    #[test]
+    fn rename_noreplace_fails_when_target_exists() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source.tmp");
+        let target = tmp.path().join("target.tmp");
+
+        fs::write(&source, b"src").unwrap();
+        fs::write(&target, b"tgt").unwrap();
+
+        let err = rename_noreplace(&source, &target).unwrap_err();
+        // On macOS/Linux this is EEXIST → AlreadyExists.
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "expected AlreadyExists, got: {err:?}"
+        );
+        // Source should still exist (rename was not performed).
+        assert!(source.exists());
+        // Target should be unchanged.
+        assert_eq!(fs::read(&target).unwrap(), b"tgt");
+    }
+
+    #[test]
+    fn rename_noreplace_succeeds_when_target_absent() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source.tmp");
+        let target = tmp.path().join("target.tmp");
+
+        fs::write(&source, b"data").unwrap();
+
+        rename_noreplace(&source, &target).unwrap();
+        assert!(!source.exists());
+        assert_eq!(fs::read(&target).unwrap(), b"data");
+    }
+
+    // ================================================================
+    // Recovery: Tier 3 — Coverage gaps
+    // ================================================================
+
+    #[test]
+    fn recover_multiple_run_dirs_with_mixed_open_files() {
+        let tmp = TempDir::new().unwrap();
+
+        // Run 1: one .open (valid), one .open + matching .bin (duplicate).
+        let run1_seg = tmp.path().join("run-0000000000000001").join("segments");
+        fs::create_dir_all(&run1_seg).unwrap();
+        let mut bytes = Vec::new();
+        encode_record(
+            &LogRecord::RunStart(recovery_run_start()),
+            DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+            &mut bytes,
+        )
+        .unwrap();
+        fs::write(
+            run1_seg.join("segment-00000000000000000000.open"),
+            &bytes,
+        )
+        .unwrap();
+        fs::write(
+            run1_seg.join("segment-00000000000000000001.open"),
+            b"stale",
+        )
+        .unwrap();
+        fs::write(
+            run1_seg.join("segment-00000000000000000001.bin"),
+            b"final",
+        )
+        .unwrap();
+
+        // Run 2: one empty .open.
+        let run2_seg = tmp.path().join("run-0000000000000002").join("segments");
+        fs::create_dir_all(&run2_seg).unwrap();
+        fs::write(
+            run2_seg.join("segment-00000000000000000000.open"),
+            b"",
+        )
+        .unwrap();
+
+        // Run 3: one .open with corrupt frame 0.
+        let run3_seg = tmp.path().join("run-0000000000000003").join("segments");
+        fs::create_dir_all(&run3_seg).unwrap();
+        let mut corrupt = bytes.clone();
+        corrupt[FRAME_HEADER_BYTES] ^= 0x01;
+        fs::write(
+            run3_seg.join("segment-00000000000000000000.open"),
+            &corrupt,
+        )
+        .unwrap();
+
+        let report = recover_open_segments(tmp.path(), DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap();
+
+        assert_eq!(report.recovered_count(), 1, "one valid .open → .bin");
+        assert_eq!(report.discarded_count(), 1, "one duplicate discard");
+        assert_eq!(
+            report.discarded_empty_count(),
+            2,
+            "one 0-byte + one corrupt-frame-0"
+        );
+        assert_eq!(report.entries.len(), 4);
+    }
+
+    #[test]
+    fn recover_header_only_truncation_less_than_8_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run-0000000000000001");
+        let seg_dir = run_dir.join("segments");
+        fs::create_dir_all(&seg_dir).unwrap();
+
+        let open_path = seg_dir.join("segment-00000000000000000000.open");
+        let bin_path = seg_dir.join("segment-00000000000000000000.bin");
+
+        // 3 bytes: not enough for even a frame header.
+        fs::write(&open_path, &[0xAA, 0xBB, 0xCC]).unwrap();
+
+        let report = recover_open_segments(tmp.path(), DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap();
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.discarded_empty_count(), 1);
+
+        let entry = &report.entries[0];
+        match entry.outcome {
+            OpenSegmentRecoveryOutcome::DiscardedEmpty {
+                original_len,
+                stop_reason,
+            } => {
+                assert_eq!(original_len, 3);
+                assert_eq!(stop_reason, Some(LogReadErrorReason::Truncated));
+            }
+            _ => panic!("expected DiscardedEmpty outcome"),
+        }
+
+        assert!(!open_path.exists());
+        assert!(!bin_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_recovery_boundary_io_error_returns_err() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run-0000000000000001");
+        let seg_dir = run_dir.join("segments");
+        fs::create_dir_all(&seg_dir).unwrap();
+
+        let open_path = seg_dir.join("segment-00000000000000000000.open");
+        let mut bytes = Vec::new();
+        encode_record(
+            &LogRecord::RunStart(recovery_run_start()),
+            DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+            &mut bytes,
+        )
+        .unwrap();
+        fs::write(&open_path, &bytes).unwrap();
+
+        // Remove read permission.
+        fs::set_permissions(&open_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = recover_open_segments(tmp.path(), DEFAULT_MAX_FRAME_PAYLOAD_BYTES);
+
+        // Restore permissions for cleanup.
+        fs::set_permissions(&open_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(result.is_err(), "expected error when file is unreadable");
     }
 }
