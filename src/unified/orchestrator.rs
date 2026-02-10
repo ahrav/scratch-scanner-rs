@@ -318,7 +318,7 @@ fn run_fs(
 
     // Also write machine-readable stats to stderr for compatibility.
     eprintln!(
-        "files={} chunks={} bytes={} findings={} errors={} dropped_findings={} persist_emit_failures={} persist_incomplete={} binary_skipped={} binary_extracted={} init_ms={} scan_ms={} persist_ms={} elapsed_ms={} throughput_mib_s={:.2} workers={}",
+        "files={} chunks={} bytes={} findings={} errors={} dropped_findings={} persist_emit_failures={} persist_incomplete={} binary_skipped={} binary_extracted={} init_ms={} scan_ms={} elapsed_ms={} throughput_mib_s={:.2} workers={}",
         report.stats.files_enqueued,
         report.metrics.chunks_scanned,
         report.metrics.bytes_scanned,
@@ -331,7 +331,6 @@ fn run_fs(
         report.metrics.binary_extracted,
         init_elapsed.as_millis(),
         scan_elapsed.as_millis(),
-        report.metrics.persist_ns / 1_000_000,
         total_elapsed.as_millis(),
         throughput_mib,
         cfg.workers,
