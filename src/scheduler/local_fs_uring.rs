@@ -1985,6 +1985,10 @@ fn io_worker_loop<E: ScanEngine>(
                                         }
                                         ContentVerdict::BinaryExtractable(fmt) => {
                                             if let Some(ref etx) = extract_tx {
+                                                // Transfer the already-open fd to extraction
+                                                // workers. This avoids a second open syscall and
+                                                // keeps extraction consistent with the snapshot
+                                                // captured by open/stat in this I/O worker.
                                                 if let Some(file) = rs.file.take() {
                                                     let ew = ExtractWork {
                                                         file,
@@ -2565,7 +2569,8 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
     drop(archive_rx);
 
     // Extraction channel + workers (when skip_binary is true, extractable
-    // binary files are routed here instead of being silently skipped).
+    // binary files are routed here with already-open file descriptors instead
+    // of being silently skipped or re-opened by path).
     let (extract_tx, extract_rx) = if cfg.skip_binary {
         let (tx, rx) = chan::bounded::<ExtractWork>(cfg.file_queue_cap);
         (Some(tx), Some(rx))
