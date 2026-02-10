@@ -41,8 +41,16 @@ use crate::api::{FindingRec, RuleSpec, StepId, TransformId, STEP_ROOT};
 use super::keys::StoreKeys;
 
 /// Identity contract version shared by all encodings in this module.
+///
+/// Embedded as the first metadata byte in every canonical payload. Any change
+/// to field ordering, normalization logic, or domain strings requires bumping
+/// this version so that hashes produced under different contracts never collide.
 pub const IDENTITY_CONTRACT_VERSION: u8 = 1;
 
+// Domain-separation strings for BLAKE3 keyed/unkeyed hashes.
+// Each domain is prepended (with a NUL terminator) to the payload before
+// hashing, ensuring that identical byte payloads used in different contexts
+// produce distinct digests. Changing any string is a contract-breaking change.
 const RULE_FINGERPRINT_DOMAIN: &[u8] = b"scanner.store.identity.v1.rule_fingerprint";
 const SECRET_HASH_DOMAIN: &[u8] = b"scanner.store.identity.v1.secret_hash";
 const OCCURRENCE_ID_DOMAIN: &[u8] = b"scanner.store.identity.v1.occurrence_id";
@@ -235,22 +243,98 @@ pub struct OccurrenceInput<'a> {
     /// Used to gate root-hint normalization: only `Base64` findings have
     /// padding-induced length variation that needs snapping. Other transforms
     /// (e.g. `UrlPercent`) preserve length exactly and must not be normalized.
-    /// `None` means the finding is from the root buffer (no transform).
+    ///
+    /// `None` means the finding is from the root buffer (no transform) **or**
+    /// the caller does not know the transform. In either case normalization
+    /// is skipped, which is safe: root findings bypass normalization by
+    /// design, and unknown-transform findings produce a conservative
+    /// (non-snapped) identity.
     pub leaf_transform: Option<TransformId>,
 }
 
+/// Maximum bytes of secret content fed to the hash function.
+///
+/// Secrets larger than this are truncated to a prefix/suffix hash to bound
+/// memory and CPU. 64 KiB is generous for any realistic secret value.
+pub const MAX_SECRET_HASH_BYTES: usize = 64 * 1024;
+
+/// Secret length bucket thresholds (in bytes).
+const SECRET_LEN_SHORT_MAX: usize = 64;
+const SECRET_LEN_MEDIUM_MAX: usize = 512;
+
+/// Coarse length bucket for the secret value.
+///
+/// Used in the `secrets` table to enable approximate length filtering without
+/// storing the actual secret content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SecretLenBucket {
+    /// Length unknown or not applicable.
+    Unknown = 0,
+    /// Short secret (≤ 64 bytes).
+    Short = 1,
+    /// Medium secret (65–512 bytes).
+    Medium = 2,
+    /// Long secret (> 512 bytes).
+    Long = 3,
+}
+
+impl SecretLenBucket {
+    /// Classify a secret by its byte length.
+    #[must_use]
+    pub const fn from_len(len: usize) -> Self {
+        if len <= SECRET_LEN_SHORT_MAX {
+            Self::Short
+        } else if len <= SECRET_LEN_MEDIUM_MAX {
+            Self::Medium
+        } else {
+            Self::Long
+        }
+    }
+}
+
 /// Compute canonical rule fingerprint from `RuleSpec::encode_policy` bytes.
+///
+/// **Always unkeyed** regardless of [`IdHashMode`] — rules are stable policy
+/// definitions that must be comparable across operators.
 #[must_use]
-pub fn rule_fingerprint(rule: &RuleSpec, keys: &StoreKeys) -> RuleFingerprint {
+pub fn rule_fingerprint(rule: &RuleSpec, _keys: &StoreKeys) -> RuleFingerprint {
     let mut policy_bytes = Vec::with_capacity(256);
     rule.encode_policy(&mut policy_bytes);
-    keyed_hash(keys.identity_key(), RULE_FINGERPRINT_DOMAIN, &policy_bytes)
+    unkeyed_hash(RULE_FINGERPRINT_DOMAIN, &policy_bytes)
 }
 
 /// Compute keyed secret hash over existing engine `norm_hash` bytes.
+///
+/// **Always keyed** regardless of [`IdHashMode`] — prevents rainbow-table
+/// attacks against secret hashes stored on disk.
 #[must_use]
 pub fn secret_hash(norm_hash: &[u8; 32], keys: &StoreKeys) -> SecretHash {
     keyed_hash(keys.secret_key(), SECRET_HASH_DOMAIN, norm_hash)
+}
+
+/// Compute keyed secret hash with optional truncation for oversized secrets.
+///
+/// For secrets ≤ [`MAX_SECRET_HASH_BYTES`], hashes all bytes.
+/// For oversized secrets, hashes a `prefix(32 KiB) ‖ length ‖ suffix(32 KiB)`
+/// window. Using both prefix and suffix (rather than prefix alone) ensures
+/// that changes near either end of the secret are reflected in the hash,
+/// while the interleaved length prevents collisions between secrets whose
+/// prefix+suffix bytes happen to match but whose total lengths differ.
+#[must_use]
+pub fn secret_hash_with_truncation(secret_bytes: &[u8], keys: &StoreKeys) -> SecretHash {
+    if secret_bytes.len() <= MAX_SECRET_HASH_BYTES {
+        let norm = blake3::hash(secret_bytes);
+        return keyed_hash(keys.secret_key(), SECRET_HASH_DOMAIN, norm.as_bytes());
+    }
+    // For oversized: hash(prefix(32K) ‖ length ‖ suffix(32K))
+    let half = MAX_SECRET_HASH_BYTES / 2;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&secret_bytes[..half]);
+    hasher.update(&(secret_bytes.len() as u64).to_le_bytes());
+    hasher.update(&secret_bytes[secret_bytes.len() - half..]);
+    let norm = hasher.finalize();
+    keyed_hash(keys.secret_key(), SECRET_HASH_DOMAIN, norm.as_bytes())
 }
 
 /// Compute canonical occurrence ID for a finding.
@@ -264,6 +348,8 @@ pub fn secret_hash(norm_hash: &[u8; 32], keys: &StoreKeys) -> SecretHash {
 /// - root-hint start/end (with transform normalization)
 /// - root-only span contribution
 /// - variant discriminator
+///
+/// The hash is keyed or unkeyed based on [`IdHashMode`].
 pub fn occurrence_id(
     input: OccurrenceInput<'_>,
     keys: &StoreKeys,
@@ -278,7 +364,7 @@ pub fn occurrence_id(
         &canonical,
     )?;
     Ok(keyed_hash(
-        keys.identity_key(),
+        keys.effective_identity_key(),
         OCCURRENCE_ID_DOMAIN,
         &payload,
     ))
@@ -304,11 +390,15 @@ struct CanonicalFinding {
 
 /// Normalize a [`FindingRec`] into identity-canonical form.
 ///
-/// Two normalizations are applied:
-/// 1. Non-root spans are zeroed (they shift with chunk alignment and must not
-///    affect identity).
-/// 2. `root_hint_end` is snapped to the padding-free minimum for non-root
-///    findings whose encoded length falls in the base64 padding window.
+/// Three normalizations are applied:
+/// 1. **Span inclusion policy**: root findings always include span; non-root
+///    findings include span only when `dedupe_with_span` is set (meaning
+///    root-span mapping is unavailable and the decoded-buffer span is the
+///    only distinguishing coordinate).
+/// 2. **Non-root span erasure**: when span is excluded, `span_start`/`span_end`
+///    are zeroed so that chunk-alignment-induced offsets do not affect identity.
+/// 3. **Root-hint-end snapping**: for non-root Base64 findings, `root_hint_end`
+///    is snapped to the padding-free minimum encoded length.
 fn canonicalize_finding(
     finding: &FindingRec,
     variant: VariantDiscriminant,
@@ -435,6 +525,17 @@ fn encode_occurrence_canonical(
 /// under the same key.
 fn keyed_hash(key: &[u8; 32], domain: &[u8], payload: &[u8]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_keyed(key);
+    hasher.update(domain);
+    hasher.update(&[0]);
+    hasher.update(payload);
+    *hasher.finalize().as_bytes()
+}
+
+/// Domain-separated BLAKE3 **unkeyed** hash: `H(domain ‖ 0x00 ‖ payload)`.
+///
+/// Used for rule fingerprints where operator-independence is required.
+fn unkeyed_hash(domain: &[u8], payload: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
     hasher.update(domain);
     hasher.update(&[0]);
     hasher.update(payload);
@@ -1587,13 +1688,15 @@ mod tests {
     fn rule_fingerprint_and_secret_hash_never_collide_for_same_input() {
         let keys = test_keys();
         let same_bytes = [0xAA; 32];
-        let rfp = keyed_hash(keys.identity_key(), RULE_FINGERPRINT_DOMAIN, &same_bytes);
+        // rule_fingerprint uses unkeyed hash, secret_hash uses keyed — always different.
+        let rfp = unkeyed_hash(RULE_FINGERPRINT_DOMAIN, &same_bytes);
         let sh = keyed_hash(keys.secret_key(), SECRET_HASH_DOMAIN, &same_bytes);
         assert_ne!(rfp, sh);
     }
 
     #[test]
-    fn different_keys_produce_different_fingerprints() {
+    fn rule_fingerprint_is_unkeyed_and_key_independent() {
+        // Rule fingerprint is always unkeyed — different keys produce the same fingerprint.
         let meta = RunModeMetadata {
             version: STORE_KEYS_VERSION,
             correlation_mode: CorrelationMode::Persistent,
@@ -1604,7 +1707,10 @@ mod tests {
         let r = rule("token", r"tok_[A-Z0-9]{8}", &[b"tok_"]);
         let fp_a = rule_fingerprint(&r, &keys_a);
         let fp_b = rule_fingerprint(&r, &keys_b);
-        assert_ne!(fp_a, fp_b);
+        assert_eq!(
+            fp_a, fp_b,
+            "rule_fingerprint must be key-independent (unkeyed)"
+        );
     }
 
     #[test]

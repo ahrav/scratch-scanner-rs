@@ -18,7 +18,7 @@ use crate::api::TransformId;
 use crate::git_scan::{GitScanMode, MergeDiffMode};
 use crate::AnchorMode;
 
-use super::{EventFormat, FsScanConfig, GitSourceConfig, SourceConfig};
+use super::{EventFormat, FsScanConfig, GitSourceConfig, OutputFormat, SourceConfig, StoreCommand};
 
 /// Controls which transform decoders are active during a scan.
 ///
@@ -56,9 +56,16 @@ pub enum TransformFilter {
     Only(Vec<TransformId>),
 }
 
-/// Top-level scan configuration produced by CLI parsing.
+/// Top-level configuration produced by CLI parsing.
+///
+/// Combines the scan source (filesystem, git, or store query) with
+/// cross-cutting options that apply regardless of source type. The
+/// orchestrator consumes this directly — no further validation is needed
+/// beyond what `parse_args` already enforces.
 pub struct ScanConfig {
+    /// What to scan (or query, in store mode).
     pub source: SourceConfig,
+    /// Wire format for streaming scan events to stdout.
     pub event_format: EventFormat,
     /// Enable verbose output (used by text event format).
     pub verbose: bool,
@@ -96,8 +103,21 @@ pub fn parse_args() -> io::Result<ScanConfig> {
             std::process::exit(0);
         }
         "scan" => {}
+        "store" => {
+            let store_cmd = parse_store_subcommand(args);
+            return Ok(ScanConfig {
+                source: SourceConfig::Store(store_cmd),
+                event_format: EventFormat::default(),
+                verbose: false,
+                rules_file: None,
+                transform_filter: TransformFilter::default(),
+            });
+        }
         _ => {
-            eprintln!("error: expected 'scan' subcommand, got '{}'", first_str);
+            eprintln!(
+                "error: expected 'scan' or 'store' subcommand, got '{}'",
+                first_str
+            );
             eprintln!();
             print_top_usage(&exe);
             std::process::exit(2);
@@ -448,7 +468,8 @@ fn parse_git_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Parse a string value into `T`, or exit with code 2 on parse failure.
+/// Parse a string value into `T`, printing `"invalid {flag} value: {s}"` and
+/// exiting with code 2 on parse failure. Used for numeric CLI flag values.
 fn parse_or_exit<T: std::str::FromStr>(s: &str, flag: &str) -> T {
     s.parse().unwrap_or_else(|_| {
         eprintln!("invalid {} value: {}", flag, s);
@@ -456,6 +477,8 @@ fn parse_or_exit<T: std::str::FromStr>(s: &str, flag: &str) -> T {
     })
 }
 
+/// Map a CLI string (`"manual"` | `"derived"`) to [`AnchorMode`].
+/// Exits with code 2 on unrecognised values.
 fn parse_anchor_mode(s: &str) -> AnchorMode {
     match s {
         "manual" => AnchorMode::Manual,
@@ -467,6 +490,7 @@ fn parse_anchor_mode(s: &str) -> AnchorMode {
     }
 }
 
+/// Map a CLI string to [`EventFormat`]. Exits with code 2 on unrecognised values.
 fn parse_event_format(s: &str) -> EventFormat {
     match s {
         "jsonl" => EventFormat::Jsonl,
@@ -565,23 +589,31 @@ fn strip_os_prefix<'a>(arg: &'a std::ffi::OsStr, prefix: &str) -> Option<&'a std
 // ---------------------------------------------------------------------------
 
 fn print_top_usage(exe: &std::ffi::OsStr) {
+    let name = exe.to_string_lossy();
     eprintln!(
-        "usage: {} scan <source> [OPTIONS]
+        "usage: {name} scan <source> [OPTIONS]
+       {name} store <command> [OPTIONS]
 
-SOURCES:
+COMMANDS:
+    scan   Run a scan
+    store  Query the findings database
+
+SCAN SOURCES:
     fs    Scan filesystem path(s)
     git   Scan git repository history
 
-EXAMPLES:
-    {} scan fs --path /src
-    {} scan git --repo /repos/myproject
+STORE COMMANDS:
+    list-runs       List completed scan runs
+    list-findings   List findings for a specific run
+    diff            Compare two runs
+    list-secrets    List unique secrets
 
-Run '{} scan fs --help' or '{} scan git --help' for source-specific options.",
-        exe.to_string_lossy(),
-        exe.to_string_lossy(),
-        exe.to_string_lossy(),
-        exe.to_string_lossy(),
-        exe.to_string_lossy(),
+EXAMPLES:
+    {name} scan fs --path /src
+    {name} scan git --repo /repos/myproject
+    {name} store list-runs --store-dir .scanner-store
+    {name} store list-findings --store-dir .scanner-store --run <hex-id>
+    {name} store diff --store-dir .scanner-store --run-a <hex-id> --run-b <hex-id>"
     );
 }
 
@@ -628,6 +660,215 @@ OPTIONS:
     --scan-binary             Scan binary blobs instead of skipping them
     --event-format=jsonl      Output format (default: jsonl)
     --help, -h                Show this help"
+    );
+}
+
+/// Dispatch `store <command>` to the appropriate flag parser.
+///
+/// The store subcommands are read-only queries against the findings database
+/// and do not start a scan. Each variant collects its own `--store-dir`,
+/// `--format`, and command-specific filters.
+fn parse_store_subcommand(mut args: impl Iterator<Item = std::ffi::OsString>) -> StoreCommand {
+    let sub = match args.next() {
+        Some(a) => a,
+        None => {
+            eprintln!(
+                "error: 'store' requires a command: list-runs, list-findings, diff, list-secrets"
+            );
+            std::process::exit(2);
+        }
+    };
+
+    let sub_str = sub.to_string_lossy();
+    match sub_str.as_ref() {
+        "list-runs" => parse_store_list_runs(args),
+        "list-findings" => parse_store_list_findings(args),
+        "diff" => parse_store_diff(args),
+        "list-secrets" => parse_store_list_secrets(args),
+        "--help" | "-h" => {
+            print_store_usage();
+            std::process::exit(0);
+        }
+        _ => {
+            eprintln!("error: unknown store command '{}'; expected list-runs, list-findings, diff, list-secrets", sub_str);
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Parse flags for `store list-runs` (`--store-dir`, `--status`, `--limit`, `--format`).
+fn parse_store_list_runs(args: impl Iterator<Item = std::ffi::OsString>) -> StoreCommand {
+    let mut store_dir = PathBuf::from(".scanner-store");
+    let mut status: Option<i32> = None;
+    let mut limit: usize = 50;
+    let mut format = OutputFormat::Text;
+
+    for arg in args {
+        let s = arg.to_string_lossy();
+        if let Some(v) = s.strip_prefix("--store-dir=") {
+            store_dir = PathBuf::from(v);
+        } else if let Some(v) = s.strip_prefix("--status=") {
+            status = Some(parse_or_exit(v, "--status"));
+        } else if let Some(v) = s.strip_prefix("--limit=") {
+            limit = parse_or_exit(v, "--limit");
+        } else if s == "--format=json" {
+            format = OutputFormat::Json;
+        } else if s == "--format=text" {
+            format = OutputFormat::Text;
+        } else if s == "--help" || s == "-h" {
+            print_store_usage();
+            std::process::exit(0);
+        } else {
+            eprintln!("error: unrecognized flag: {s}");
+            std::process::exit(2);
+        }
+    }
+
+    StoreCommand::ListRuns {
+        store_dir,
+        status,
+        limit,
+        format,
+    }
+}
+
+/// Parse flags for `store list-findings`. Requires `--run=<hex-id>`.
+fn parse_store_list_findings(args: impl Iterator<Item = std::ffi::OsString>) -> StoreCommand {
+    let mut store_dir = PathBuf::from(".scanner-store");
+    let mut run = String::new();
+    let mut rule: Option<String> = None;
+    let mut path: Option<String> = None;
+    let mut limit: usize = 100;
+    let mut format = OutputFormat::Text;
+
+    for arg in args {
+        let s = arg.to_string_lossy();
+        if let Some(v) = s.strip_prefix("--store-dir=") {
+            store_dir = PathBuf::from(v);
+        } else if let Some(v) = s.strip_prefix("--run=") {
+            run = v.to_string();
+        } else if let Some(v) = s.strip_prefix("--rule=") {
+            rule = Some(v.to_string());
+        } else if let Some(v) = s.strip_prefix("--path=") {
+            path = Some(v.to_string());
+        } else if let Some(v) = s.strip_prefix("--limit=") {
+            limit = parse_or_exit(v, "--limit");
+        } else if s == "--format=json" {
+            format = OutputFormat::Json;
+        } else if s == "--format=text" {
+            format = OutputFormat::Text;
+        } else {
+            eprintln!("error: unrecognized flag: {s}");
+            std::process::exit(2);
+        }
+    }
+
+    if run.is_empty() {
+        eprintln!("error: --run=<hex-id> is required for list-findings");
+        std::process::exit(2);
+    }
+
+    StoreCommand::ListFindings {
+        store_dir,
+        run,
+        rule,
+        path,
+        limit,
+        format,
+    }
+}
+
+/// Parse flags for `store diff`. Requires `--run-a` and `--run-b`.
+fn parse_store_diff(args: impl Iterator<Item = std::ffi::OsString>) -> StoreCommand {
+    let mut store_dir = PathBuf::from(".scanner-store");
+    let mut run_a = String::new();
+    let mut run_b = String::new();
+    let mut format = OutputFormat::Text;
+
+    for arg in args {
+        let s = arg.to_string_lossy();
+        if let Some(v) = s.strip_prefix("--store-dir=") {
+            store_dir = PathBuf::from(v);
+        } else if let Some(v) = s.strip_prefix("--run-a=") {
+            run_a = v.to_string();
+        } else if let Some(v) = s.strip_prefix("--run-b=") {
+            run_b = v.to_string();
+        } else if s == "--format=json" {
+            format = OutputFormat::Json;
+        } else if s == "--format=text" {
+            format = OutputFormat::Text;
+        } else {
+            eprintln!("error: unrecognized flag: {s}");
+            std::process::exit(2);
+        }
+    }
+
+    if run_a.is_empty() || run_b.is_empty() {
+        eprintln!("error: --run-a=<hex-id> and --run-b=<hex-id> are required for diff");
+        std::process::exit(2);
+    }
+
+    StoreCommand::Diff {
+        store_dir,
+        run_a,
+        run_b,
+        format,
+    }
+}
+
+/// Parse flags for `store list-secrets` (`--store-dir`, `--status`, `--limit`, `--format`).
+fn parse_store_list_secrets(args: impl Iterator<Item = std::ffi::OsString>) -> StoreCommand {
+    let mut store_dir = PathBuf::from(".scanner-store");
+    let mut status: Option<i32> = None;
+    let mut limit: usize = 50;
+    let mut format = OutputFormat::Text;
+
+    for arg in args {
+        let s = arg.to_string_lossy();
+        if let Some(v) = s.strip_prefix("--store-dir=") {
+            store_dir = PathBuf::from(v);
+        } else if let Some(v) = s.strip_prefix("--status=") {
+            status = Some(parse_or_exit(v, "--status"));
+        } else if let Some(v) = s.strip_prefix("--limit=") {
+            limit = parse_or_exit(v, "--limit");
+        } else if s == "--format=json" {
+            format = OutputFormat::Json;
+        } else if s == "--format=text" {
+            format = OutputFormat::Text;
+        } else {
+            eprintln!("error: unrecognized flag: {s}");
+            std::process::exit(2);
+        }
+    }
+
+    StoreCommand::ListSecrets {
+        store_dir,
+        status,
+        limit,
+        format,
+    }
+}
+
+fn print_store_usage() {
+    eprintln!(
+        "usage: scanner-rs store <command> [OPTIONS]
+
+COMMANDS:
+    list-runs       List completed scan runs
+    list-findings   List findings for a specific run
+    diff            Compare two runs
+    list-secrets    List unique secrets
+
+COMMON OPTIONS:
+    --store-dir=<path>   Path to store directory (default: .scanner-store)
+    --format=text|json   Output format (default: text)
+    --limit=<N>          Max results (default: 50)
+
+EXAMPLES:
+    scanner-rs store list-runs --store-dir .scanner-store
+    scanner-rs store list-findings --store-dir .scanner-store --run <hex-id>
+    scanner-rs store diff --store-dir .scanner-store --run-a <id1> --run-b <id2>
+    scanner-rs store list-secrets --store-dir .scanner-store"
     );
 }
 
