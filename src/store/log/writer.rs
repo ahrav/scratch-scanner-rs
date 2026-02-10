@@ -853,9 +853,10 @@ impl SegmentWriter {
             && self.bytes_written.saturating_add(frame_len) > self.max_segment_bytes
         {
             self.finalize_current()?;
-            self.seq = self.seq.checked_add(1).ok_or_else(|| {
-                std::io::Error::other("segment sequence number overflow")
-            })?;
+            self.seq = self
+                .seq
+                .checked_add(1)
+                .ok_or_else(|| std::io::Error::other("segment sequence number overflow"))?;
             let (file, open_path) = open_segment_file(&self.segments_dir, self.seq)?;
             self.file = file;
             self.open_path = open_path;
