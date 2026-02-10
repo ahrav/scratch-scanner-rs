@@ -276,8 +276,11 @@ pub struct CoreAssigner {
     next: std::sync::atomic::AtomicUsize,
 }
 
-// SAFETY: `AtomicUsize` is `Send + Sync`, and `Vec<usize>` is `Send + Sync`.
-// The struct is safe to share across threads via `Arc` or borrowed references.
+// SAFETY: Both fields (`Vec<usize>` and `AtomicUsize`) are independently
+// `Send + Sync`. This explicit impl exists because `CoreAssigner` is shared
+// via `Arc` across thread-spawning closures where the compiler sometimes
+// cannot infer `Sync` through complex generic bounds. The `AtomicUsize`
+// provides the interior-mutability synchronization for `next`.
 unsafe impl Sync for CoreAssigner {}
 
 impl CoreAssigner {

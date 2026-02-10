@@ -463,9 +463,10 @@ impl<const N: usize> StackMsg<N> {
 
     #[inline]
     fn as_str(&self) -> &str {
-        // SAFETY: `fmt::Write::write_str` only accepts valid UTF-8, and we
-        // only copy full byte sequences from those slices, so the buffer
-        // contents are always valid UTF-8.
+        // SAFETY: `write_str` only copies bytes from valid `&str` slices,
+        // and truncation is rounded down to a UTF-8 character boundary
+        // (see `is_char_boundary` check in `write_str`). The buffer
+        // therefore always contains a valid UTF-8 prefix.
         unsafe { std::str::from_utf8_unchecked(&self.buf[..self.len]) }
     }
 }
@@ -475,7 +476,12 @@ impl<const N: usize> std::fmt::Write for StackMsg<N> {
     fn write_str(&mut self, s: &str) -> std::fmt::Result {
         let bytes = s.as_bytes();
         let remaining = N - self.len;
-        let n = bytes.len().min(remaining);
+        let mut n = bytes.len().min(remaining);
+        // Truncate at a UTF-8 character boundary so `as_str()` never
+        // observes a partial multi-byte sequence.
+        while n > 0 && !s.is_char_boundary(n) {
+            n -= 1;
+        }
         self.buf[self.len..self.len + n].copy_from_slice(&bytes[..n]);
         self.len += n;
         Ok(())

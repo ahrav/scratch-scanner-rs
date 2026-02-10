@@ -49,6 +49,11 @@ impl WorkerId {
 /// Minimal task metadata tracked by the executor.
 #[derive(Clone, Debug)]
 pub struct SimTask {
+    /// Opaque task-type tag set by the simulation harness.
+    ///
+    /// The executor does not interpret this value — it exists so the runner
+    /// callback can dispatch based on task type (e.g., `0 = Enumerate`,
+    /// `1 = Fetch`, `2 = Scan`).
     pub kind: u16,
 }
 
@@ -74,11 +79,34 @@ pub enum StepResult {
 /// Deterministic choice metadata for trace logging.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StepDecision {
+    /// Total number of workers considered (always `== executor.worker_count()`).
     pub choices: u32,
+    /// Index of the worker selected by the RNG (0-based).
     pub chosen: u32,
 }
 
 /// Deterministic single-thread executor with work-stealing queues.
+///
+/// Models a multi-worker work-stealing scheduler within a single OS thread
+/// for property testing and simulation. Each [`step()`](Self::step) call
+/// selects a worker uniformly at random (via seeded RNG), then that worker
+/// pops from its local queue (LIFO), falls back to the global queue (FIFO),
+/// or steals from a random victim (FIFO).
+///
+/// # What This Models
+///
+/// - Worker-local queue semantics (LIFO pop, FIFO steal)
+/// - Global injection queue (FIFO)
+/// - Random worker selection and victim selection
+///
+/// # What This Does NOT Model
+///
+/// - Real-time scheduling or timing
+/// - Cache effects or memory locality
+/// - Contention or CAS failures
+/// - Thread wake/sleep transitions
+///
+/// Given the same seed and input sequence, execution is fully deterministic.
 pub struct SimExecutor {
     workers: u32,
     next_task_id: u32,

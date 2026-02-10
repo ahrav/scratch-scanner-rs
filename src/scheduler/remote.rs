@@ -412,6 +412,11 @@ struct CpuScratch {
 // ============================================================================
 
 /// In-place dedupe of findings by `(rule_id, root_hint, span)`.
+///
+/// `FindingRec` (mock engine stub) does not carry `norm_hash`, so this
+/// dedup key is a strict subset of the production path in `local_fs_owner`.
+/// See the note on `dedupe_pending_in_place` in `local_fs_uring.rs` for
+/// implications when porting to real engine findings.
 fn dedupe_pending_in_place(p: &mut Vec<FindingRec>) {
     if p.len() <= 1 {
         return;
@@ -444,6 +449,10 @@ fn dedupe_pending_in_place(p: &mut Vec<FindingRec>) {
 }
 
 /// Emit findings as structured events.
+///
+/// NOTE: Uses `SourceKind::Fs` because this module currently uses `MockEngine`
+/// for testing. When wired to a real remote backend, the source kind should
+/// be updated to reflect the actual origin (e.g., `SourceKind::Remote`).
 fn emit_findings(
     engine: &MockEngine,
     event_sink: &dyn EventSink,

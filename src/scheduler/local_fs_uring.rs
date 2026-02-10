@@ -288,8 +288,12 @@ pub struct UringIoStats {
 /// Fixed buffer pool backed by a stable buffer table.
 ///
 /// Buffers are allocated once and never moved, allowing safe registration with
-/// io_uring via `register_buffers`. Handles return buffers to a global free
-/// queue on drop.
+/// io_uring via `register_buffers`. Address stability is critical: the kernel
+/// retains pointers to these buffers for DMA and will write directly into them
+/// on completion. Moving or reallocating the backing storage while operations
+/// are in-flight would corrupt memory.
+///
+/// Handles return buffers to a global free queue on drop.
 struct FixedBufferPool {
     buffers: Vec<Box<[u8]>>,
     free: ArrayQueue<usize>,
@@ -496,6 +500,17 @@ struct CpuScratch<E: ScanEngine> {
 // ============================================================================
 
 /// In-place dedupe of findings by (rule_id, root_hint, span).
+///
+/// # Note on `norm_hash` omission
+///
+/// The local_fs_owner path uses [`FindingWithHashRecord`] which includes
+/// `norm_hash` in the dedup key to avoid collapsing distinct secrets at the
+/// same location. This function uses the base [`FindingRecord`] trait which
+/// does not expose `norm_hash`. If the engine's `Finding` type carries a
+/// hash, two findings with identical `(rule_id, root_hint, span)` but
+/// different normalized secrets will be collapsed here. This is acceptable
+/// for within-chunk dedupe (same bytes produce same secrets), but callers
+/// should be aware of this limitation for engines with transform chains.
 fn dedupe_pending_in_place<F: FindingRecord>(p: &mut Vec<F>) {
     if p.len() <= 1 {
         return;
@@ -881,6 +896,9 @@ fn drain_in_flight(
                             perf_stats::sat_add_u64(&mut stats.open_failures, 1);
                         } else {
                             // Prevent fd leak on shutdown path.
+                            // SAFETY: `res` is a valid fd returned by the kernel
+                            // via io_uring openat/openat2. We own it exclusively
+                            // (no File wrapper created on this drain path).
                             unsafe {
                                 libc::close(res);
                             }
@@ -1713,6 +1731,9 @@ fn io_worker_loop<E: ScanEngine>(
                     perf_stats::sat_add_u64(&mut stats.open_ops_completed, 1);
                     let Some(st) = files.get_mut(op.file_slot).and_then(|s| s.as_mut()) else {
                         if res >= 0 {
+                            // SAFETY: `res` is a valid fd from io_uring openat.
+                            // The FileState was cleaned up, so we must close the
+                            // fd to prevent a leak. No other code path owns it.
                             unsafe {
                                 libc::close(res);
                             }
@@ -1915,6 +1936,16 @@ fn io_worker_loop<E: ScanEngine>(
 // Discovery Walker
 // ============================================================================
 
+/// Depth-first recursive directory walk that feeds files to I/O threads.
+///
+/// Uses a stack-based DFS (not `WalkDir`) to avoid per-entry `stat` calls.
+/// `DirEntry::file_type()` uses `d_type` from `getdents64` on Linux (no
+/// extra syscall on ext4/xfs/btrfs). Size filtering is deferred to the
+/// I/O thread's async `statx`, which is already required for TOCTOU safety.
+///
+/// Files with recognized archive extensions are routed directly to archive
+/// workers (bypassing I/O threads), since archive scanning opens files itself.
+/// Symlinks are followed or skipped based on `cfg.follow_symlinks`.
 fn walk_and_send_files(
     root: &Path,
     cfg: &LocalFsUringConfig,
