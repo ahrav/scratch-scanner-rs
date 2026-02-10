@@ -338,7 +338,7 @@ impl<R: Read> LogReader<R> {
     /// Byte offset where the next frame header is expected.
     ///
     /// After successfully decoding a frame, this advances by the exact frame
-    /// byte length (`8 + frame_len`).
+    /// byte length (`8 + body_len`).
     #[inline]
     pub const fn next_frame_offset(&self) -> u64 {
         self.next_frame_offset
@@ -654,7 +654,9 @@ impl<R: Read> LogReader<R> {
             None => return Ok(None),
         };
 
-        // CRC check over the body (type byte + payload).
+        // CRC check over the full body:
+        // - V1: type + payload
+        // - V2: frame_seq + segment_id + type + payload
         self.check_crc()?;
 
         // Version gate for RunStart frames.

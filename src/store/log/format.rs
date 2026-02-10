@@ -522,7 +522,10 @@ impl fmt::Display for FormatError {
                 write!(f, "frame payload too large: {len} > {max}")
             }
             Self::InvalidFrameLength { len } => {
-                write!(f, "invalid frame length: {len} (must include type byte)")
+                write!(
+                    f,
+                    "invalid frame length: {len} (must include frame type and any required v2 prefix)"
+                )
             }
             Self::TruncatedHeader { got } => write!(f, "truncated frame header: got {got} bytes"),
             Self::TruncatedFrame { expected, got } => {
@@ -569,7 +572,7 @@ impl From<io::Error> for FormatError {
     }
 }
 
-/// Encode one log record as a framed blob and append to `out`.
+/// Encode one log record as a **legacy V1** framed blob and append to `out`.
 ///
 /// Writes the 8-byte header (`frame_len` + `crc32`) followed by the type
 /// byte and encoded payload. Returns [`FormatError::FrameTooLarge`] if the
@@ -577,6 +580,8 @@ impl From<io::Error> for FormatError {
 ///
 /// `out` is **not** cleared before writing; the frame is appended so that
 /// callers can build multi-frame buffers incrementally.
+///
+/// New on-disk segments should use [`encode_record_with_position`].
 pub fn encode_record(
     record: &LogRecord,
     max_payload_bytes: u32,
@@ -704,7 +709,8 @@ pub fn finalize_v2_frame_in_place(
 /// Decode one framed record from `frame_bytes`.
 ///
 /// `frame_bytes` must contain exactly one complete frame (header + body).
-/// The CRC is verified before any payload parsing.
+/// The CRC is verified before any payload parsing. Supports both legacy V1
+/// and current V2 frame layouts.
 ///
 /// Returns [`FormatError::FrameTooLarge`] if the declared payload exceeds
 /// `max_payload_bytes`, and [`FormatError::CrcMismatch`] on data corruption.
@@ -743,6 +749,8 @@ pub fn decode_record(frame_bytes: &[u8], max_payload_bytes: u32) -> Result<LogRe
 ///
 /// EOF handling: a clean EOF (zero bytes read at the start of a new header)
 /// returns `Ok(None)`. A partial header or truncated body is an error.
+/// When a V2 segment trailer is encountered, it is validated against the
+/// accumulated frame counters and CRC-chain state before returning EOF.
 pub struct LogRecordReader<R: Read> {
     reader: R,
     frame_buf: Vec<u8>,
@@ -1355,13 +1363,11 @@ mod tests {
         let mut buf = vec![0u8; 16];
         // frame_len = 0 (first 4 bytes, already zero)
         // crc = 0 (bytes 4-7, already zero)
-        // type + payload (bytes 8+)
+        // body bytes (bytes 8+) - interpreted as V1 because the V2 flag is not set.
         buf[8] = 1; // RunStart type byte
 
         let err = decode_record(&buf, DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap_err();
-        // frame_len=0 means body len < 9 (need at least 9 total), so TruncatedHeader
-        // Actually with our buffer size 16, the header check passes but
-        // decode_frame_body checks frame_len == 0 → InvalidFrameLength.
+        // Header bytes are present, so this should fail at frame-length validation.
         assert!(
             matches!(
                 err,

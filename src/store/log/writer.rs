@@ -2152,7 +2152,7 @@ mod tests {
 
     #[test]
     fn config_frame_payload_larger_than_segment_rejected_at_construction() {
-        // max_frame_payload_bytes + header + type byte must not exceed
+        // max_frame_payload_bytes + V2 overhead + trailer must not exceed
         // max_segment_bytes; validate_config rejects this at construction time.
         let tmp = TempDir::new().unwrap();
         let mut cfg = LogWriterConfig::for_root(tmp.path().to_path_buf());
@@ -2171,7 +2171,7 @@ mod tests {
     }
 
     #[test]
-    fn config_rejects_segment_that_cannot_fit_frame_type_byte() {
+    fn config_rejects_segment_that_cannot_fit_min_v2_frame() {
         let tmp = TempDir::new().unwrap();
         let mut cfg = LogWriterConfig::for_root(tmp.path().to_path_buf());
         cfg.max_frame_payload_bytes = 1_024;
