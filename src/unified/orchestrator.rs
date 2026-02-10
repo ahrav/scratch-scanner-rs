@@ -128,7 +128,10 @@ fn run_fs(
 
     let t0 = Instant::now();
     let rules = load_rules_for_scan(rules_file.as_deref());
-    let store_producer: Option<Arc<dyn StoreProducer>> = if cfg.persist_findings {
+    let (store_producer, sqlite_store): (
+        Option<Arc<dyn StoreProducer>>,
+        Option<Arc<SqliteStoreProducer>>,
+    ) = if cfg.persist_findings {
         let store_dir = cfg.root.join(".scanner-store");
         let keys = StoreKeys::bootstrap_from_env();
         let root_id = crate::store::root_id::root_id(
@@ -149,19 +152,22 @@ fn run_fs(
             id_hash_mode: keys.id_hash_mode(),
             scanner_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         };
-        let producer = SqliteStoreProducer::open(sqlite_config).map_err(|err| {
+        let producer = Arc::new(SqliteStoreProducer::open(sqlite_config).map_err(|err| {
             io::Error::other(format!(
                 "failed to initialize SQLite persistence backend: {}",
                 err.detail()
             ))
-        })?;
+        })?);
         eprintln!(
             "info: --persist-findings enabled; store: {}",
             store_dir.join("findings.db").display()
         );
-        Some(Arc::new(producer) as Arc<dyn StoreProducer>)
+        (
+            Some(Arc::clone(&producer) as Arc<dyn StoreProducer>),
+            Some(producer),
+        )
     } else {
-        None
+        (None, None)
     };
     let transforms = apply_transform_filter(demo_transforms(), transform_filter);
     let mut tuning = demo_tuning();
@@ -283,6 +289,12 @@ fn run_fs(
 
     #[cfg(not(target_os = "linux"))]
     let report = parallel_scan_dir(&cfg.root, Arc::clone(&engine), ps_config)?;
+
+    if let Some(store) = sqlite_store {
+        store
+            .end_run(false)
+            .map_err(|err| io::Error::other(format!("failed to finalize run: {}", err.detail())))?;
+    }
 
     let scan_elapsed = scan_start.elapsed();
     let total_elapsed = t0.elapsed();
@@ -451,7 +463,7 @@ fn run_git(
 /// appropriate query function from [`crate::store::db::query`].
 fn run_store_command(cmd: StoreCommand) -> io::Result<()> {
     use crate::store::db::query;
-    use crate::store::db::schema::configure_connection;
+    use crate::store::db::schema::configure_readonly_connection;
     use rusqlite::{Connection, OpenFlags};
 
     let open_db = |path: &std::path::Path| -> io::Result<Connection> {
@@ -460,7 +472,7 @@ fn run_store_command(cmd: StoreCommand) -> io::Result<()> {
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(|e| io::Error::other(format!("failed to open store: {e}")))?;
-        configure_connection(&conn)
+        configure_readonly_connection(&conn)
             .map_err(|e| io::Error::other(format!("failed to configure connection: {e}")))?;
         Ok(conn)
     };
@@ -478,22 +490,21 @@ fn run_store_command(cmd: StoreCommand) -> io::Result<()> {
 
             match format {
                 OutputFormat::Json => {
-                    println!("[");
-                    for (i, run) in runs.iter().enumerate() {
-                        let comma = if i + 1 < runs.len() { "," } else { "" };
-                        println!(
-                            "  {{\"run_id\":\"{}\",\"root\":{},\"started_at\":{},\"ended_at\":{},\"status\":{},\"findings\":{},\"objects\":{}}}{}",
-                            run.run_id_hex,
-                            run.root_display.as_deref().map_or("null".to_string(), |s| format!("\"{}\"", s)),
-                            run.started_at,
-                            run.ended_at.map_or("null".to_string(), |v| v.to_string()),
-                            run.status,
-                            run.findings_emitted,
-                            run.objects_scanned,
-                            comma,
-                        );
-                    }
-                    println!("]");
+                    let rows: Vec<_> = runs
+                        .iter()
+                        .map(|run| {
+                            serde_json::json!({
+                                "run_id": run.run_id_hex,
+                                "root": run.root_display,
+                                "started_at": run.started_at,
+                                "ended_at": run.ended_at,
+                                "status": run.status,
+                                "findings": run.findings_emitted,
+                                "objects": run.objects_scanned,
+                            })
+                        })
+                        .collect();
+                    print_json(&rows)?;
                 }
                 OutputFormat::Text => {
                     if runs.is_empty() {
@@ -539,15 +550,20 @@ fn run_store_command(cmd: StoreCommand) -> io::Result<()> {
 
             match format {
                 OutputFormat::Json => {
-                    println!("[");
-                    for (i, f) in findings.iter().enumerate() {
-                        let comma = if i + 1 < findings.len() { "," } else { "" };
-                        println!(
-                            "  {{\"occurrence_id\":\"{}\",\"path\":\"{}\",\"rule\":\"{}\",\"start\":{},\"end\":{},\"secret_hash\":\"{}\"}}{}",
-                            f.occurrence_id_hex, f.object_path, f.rule_name, f.start_byte, f.end_byte, f.secret_hash_hex, comma,
-                        );
-                    }
-                    println!("]");
+                    let rows: Vec<_> = findings
+                        .iter()
+                        .map(|f| {
+                            serde_json::json!({
+                                "occurrence_id": f.occurrence_id_hex,
+                                "path": f.object_path,
+                                "rule": f.rule_name,
+                                "start": f.start_byte,
+                                "end": f.end_byte,
+                                "secret_hash": f.secret_hash_hex,
+                            })
+                        })
+                        .collect();
+                    print_json(&rows)?;
                 }
                 OutputFormat::Text => {
                     if findings.is_empty() {
@@ -588,11 +604,12 @@ fn run_store_command(cmd: StoreCommand) -> io::Result<()> {
 
             match format {
                 OutputFormat::Json => {
-                    println!("{{");
-                    println!("  \"new_count\":{},", diff.new_findings.len());
-                    println!("  \"resolved_count\":{},", diff.resolved_findings.len());
-                    println!("  \"unchanged_count\":{}", diff.unchanged_count);
-                    println!("}}");
+                    let payload = serde_json::json!({
+                        "new_count": diff.new_findings.len(),
+                        "resolved_count": diff.resolved_findings.len(),
+                        "unchanged_count": diff.unchanged_count,
+                    });
+                    print_json(&payload)?;
                 }
                 OutputFormat::Text => {
                     println!(
@@ -635,15 +652,19 @@ fn run_store_command(cmd: StoreCommand) -> io::Result<()> {
 
             match format {
                 OutputFormat::Json => {
-                    println!("[");
-                    for (i, s) in secrets.iter().enumerate() {
-                        let comma = if i + 1 < secrets.len() { "," } else { "" };
-                        println!(
-                            "  {{\"secret_hash\":\"{}\",\"occurrences\":{},\"first_seen\":{},\"last_seen\":{},\"status\":{}}}{}",
-                            s.secret_hash_hex, s.occurrence_count, s.first_seen_run, s.last_seen_run, s.status, comma,
-                        );
-                    }
-                    println!("]");
+                    let rows: Vec<_> = secrets
+                        .iter()
+                        .map(|s| {
+                            serde_json::json!({
+                                "secret_hash": s.secret_hash_hex,
+                                "occurrences": s.occurrence_count,
+                                "first_seen": s.first_seen_run,
+                                "last_seen": s.last_seen_run,
+                                "status": s.status,
+                            })
+                        })
+                        .collect();
+                    print_json(&rows)?;
                 }
                 OutputFormat::Text => {
                     if secrets.is_empty() {
@@ -681,6 +702,13 @@ fn status_label(status: i32) -> &'static str {
         4 => "failed",
         _ => "unknown",
     }
+}
+
+fn print_json<T: serde::Serialize>(value: &T) -> io::Result<()> {
+    let encoded = serde_json::to_string(value)
+        .map_err(|e| io::Error::other(format!("json encode failed: {e}")))?;
+    println!("{encoded}");
+    Ok(())
 }
 
 /// Print git scan results to stderr (debug stats and/or perf breakdown).

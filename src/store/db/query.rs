@@ -456,6 +456,119 @@ mod tests {
         assert!(hex_decode("abc").is_empty()); // Odd length.
     }
 
+    /// Insert a complete finding across all tables using direct SQL.
+    ///
+    /// The writer's `emit_fs_batch` only resolves rules today, so query tests
+    /// must populate occurrences/secrets/paths/observations manually.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_test_finding(
+        conn: &Connection,
+        run_pk: i64,
+        root_pk: i64,
+        occurrence_id: &[u8; 32],
+        rule_fingerprint: &[u8; 32],
+        rule_name: &str,
+        secret_hash: &[u8; 32],
+        path_id: &[u8; 32],
+        object_path: &str,
+        start_byte: i64,
+        end_byte: i64,
+    ) -> i64 {
+        conn.execute(
+            "INSERT OR IGNORE INTO rules (rule_fingerprint, rule_id, rule_name) VALUES (?1, ?2, ?3)",
+            params![rule_fingerprint.as_slice(), 1i64, rule_name],
+        )
+        .unwrap();
+        let rule_pk: i64 = conn
+            .query_row(
+                "SELECT rule_pk FROM rules WHERE rule_fingerprint = ?1",
+                params![rule_fingerprint.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        conn.execute(
+            "INSERT OR IGNORE INTO secrets (secret_hash, secret_len_bucket, first_seen_run, last_seen_run, occurrence_count, status)
+             VALUES (?1, 0, ?2, ?2, 1, 0)",
+            params![secret_hash.as_slice(), run_pk],
+        )
+        .unwrap();
+        let secret_pk: i64 = conn
+            .query_row(
+                "SELECT secret_pk FROM secrets WHERE secret_hash = ?1",
+                params![secret_hash.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        conn.execute(
+            "INSERT OR IGNORE INTO paths (path_id, root_pk, canonical_path) VALUES (?1, ?2, ?3)",
+            params![path_id.as_slice(), root_pk, object_path],
+        )
+        .unwrap();
+        let path_pk: i64 = conn
+            .query_row(
+                "SELECT path_pk FROM paths WHERE path_id = ?1",
+                params![path_id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        conn.execute(
+            "INSERT OR IGNORE INTO occurrences (occurrence_id, root_pk, path_pk, rule_pk, secret_pk, start_byte, end_byte, object_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                occurrence_id.as_slice(),
+                root_pk,
+                path_pk,
+                rule_pk,
+                secret_pk,
+                start_byte,
+                end_byte,
+                object_path
+            ],
+        )
+        .unwrap();
+        let occ_pk: i64 = conn
+            .query_row(
+                "SELECT occ_pk FROM occurrences WHERE occurrence_id = ?1",
+                params![occurrence_id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        conn.execute(
+            "INSERT OR IGNORE INTO observations (run_pk, occ_pk, batch_seqno) VALUES (?1, ?2, 1)",
+            params![run_pk, occ_pk],
+        )
+        .unwrap();
+
+        occ_pk
+    }
+
+    /// Convenience wrapper: derives all byte arrays from a single `idx` byte.
+    fn insert_finding_simple(conn: &Connection, run_pk: i64, root_pk: i64, idx: u8) -> i64 {
+        let occurrence_id = [idx; 32];
+        let rule_fingerprint = [idx; 32];
+        let rule_name = format!("test_rule_{idx}");
+        let secret_hash = [idx.wrapping_add(0x80); 32];
+        let path_id = [idx.wrapping_add(0x40); 32];
+        let object_path = format!("src/file_{idx}.rs");
+        insert_test_finding(
+            conn,
+            run_pk,
+            root_pk,
+            &occurrence_id,
+            &rule_fingerprint,
+            &rule_name,
+            &secret_hash,
+            &path_id,
+            &object_path,
+            i64::from(idx) * 100,
+            i64::from(idx) * 100 + 50,
+        )
+    }
+
     #[test]
     fn list_secrets_empty_db() {
         let conn = setup_db();
@@ -474,5 +587,238 @@ mod tests {
         assert!(diff.new_findings.is_empty());
         assert!(diff.resolved_findings.is_empty());
         assert_eq!(diff.unchanged_count, 0);
+    }
+
+    // ======================================================================
+    // Step 2: Critical query tests with populated data
+    // ======================================================================
+
+    #[test]
+    fn list_findings_returns_populated_findings() {
+        let conn = setup_db();
+        let root_pk = insert_test_root(&conn);
+        let run_pk = insert_test_run(&conn, root_pk, &[1; 16]);
+        insert_finding_simple(&conn, run_pk, root_pk, 1);
+
+        let findings = list_findings(&conn, run_pk, None, None, 100).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_name, "test_rule_1");
+        assert_eq!(findings[0].object_path, "src/file_1.rs");
+        assert_eq!(findings[0].start_byte, 100);
+        assert_eq!(findings[0].end_byte, 150);
+        // Verify hex encoding of occurrence_id and secret_hash.
+        assert_eq!(findings[0].occurrence_id_hex, hex_encode(&[1u8; 32]));
+        assert_eq!(
+            findings[0].secret_hash_hex,
+            hex_encode(&[1u8.wrapping_add(0x80); 32])
+        );
+    }
+
+    #[test]
+    fn list_findings_with_rule_filter() {
+        let conn = setup_db();
+        let root_pk = insert_test_root(&conn);
+        let run_pk = insert_test_run(&conn, root_pk, &[1; 16]);
+        insert_finding_simple(&conn, run_pk, root_pk, 1);
+        insert_finding_simple(&conn, run_pk, root_pk, 2);
+
+        let filtered = list_findings(&conn, run_pk, Some("rule_1"), None, 100).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].rule_name, "test_rule_1");
+    }
+
+    #[test]
+    fn list_findings_with_path_filter() {
+        let conn = setup_db();
+        let root_pk = insert_test_root(&conn);
+        let run_pk = insert_test_run(&conn, root_pk, &[1; 16]);
+        insert_finding_simple(&conn, run_pk, root_pk, 1);
+        insert_finding_simple(&conn, run_pk, root_pk, 2);
+
+        let filtered = list_findings(&conn, run_pk, None, Some("file_2"), 100).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].object_path, "src/file_2.rs");
+    }
+
+    #[test]
+    fn list_findings_with_both_filters() {
+        let conn = setup_db();
+        let root_pk = insert_test_root(&conn);
+        let run_pk = insert_test_run(&conn, root_pk, &[1; 16]);
+        insert_finding_simple(&conn, run_pk, root_pk, 1);
+        insert_finding_simple(&conn, run_pk, root_pk, 2);
+        insert_finding_simple(&conn, run_pk, root_pk, 3);
+
+        // Match both rule and path for idx=2.
+        let filtered = list_findings(&conn, run_pk, Some("rule_2"), Some("file_2"), 100).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].rule_name, "test_rule_2");
+        assert_eq!(filtered[0].object_path, "src/file_2.rs");
+
+        // Rule matches idx=1 but path matches idx=2 — no overlap.
+        let empty = list_findings(&conn, run_pk, Some("rule_1"), Some("file_2"), 100).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn diff_runs_with_new_and_resolved_findings() {
+        let conn = setup_db();
+        let root_pk = insert_test_root(&conn);
+        let run_a = insert_test_run(&conn, root_pk, &[1; 16]);
+        let run_b = insert_test_run(&conn, root_pk, &[2; 16]);
+
+        // Finding 1: only in run A (resolved).
+        insert_finding_simple(&conn, run_a, root_pk, 1);
+        // Finding 2: only in run B (new).
+        insert_finding_simple(&conn, run_b, root_pk, 2);
+        // Finding 3: in both runs (unchanged).
+        let occ_pk_3 = insert_finding_simple(&conn, run_a, root_pk, 3);
+        conn.execute(
+            "INSERT OR IGNORE INTO observations (run_pk, occ_pk, batch_seqno) VALUES (?1, ?2, 1)",
+            params![run_b, occ_pk_3],
+        )
+        .unwrap();
+
+        let diff = diff_runs(&conn, run_a, run_b).unwrap();
+        assert_eq!(diff.new_findings.len(), 1, "one new finding in run B");
+        assert_eq!(diff.resolved_findings.len(), 1, "one resolved from run A");
+        assert_eq!(diff.unchanged_count, 1, "one unchanged across both");
+        assert_eq!(diff.new_findings[0].rule_name, "test_rule_2");
+        assert_eq!(diff.resolved_findings[0].rule_name, "test_rule_1");
+    }
+
+    #[test]
+    fn list_secrets_with_populated_data() {
+        let conn = setup_db();
+        let root_pk = insert_test_root(&conn);
+        let run_pk = insert_test_run(&conn, root_pk, &[1; 16]);
+        insert_finding_simple(&conn, run_pk, root_pk, 1);
+        insert_finding_simple(&conn, run_pk, root_pk, 2);
+
+        // Bump occurrence_count on the first secret so we can verify ordering.
+        conn.execute(
+            "UPDATE secrets SET occurrence_count = 5 WHERE secret_hash = ?1",
+            params![[1u8.wrapping_add(0x80); 32].as_slice()],
+        )
+        .unwrap();
+
+        let secrets = list_secrets(&conn, None, 100).unwrap();
+        assert_eq!(secrets.len(), 2);
+        // ORDER BY occurrence_count DESC — secret with count=5 comes first.
+        assert_eq!(secrets[0].occurrence_count, 5);
+        assert_eq!(secrets[1].occurrence_count, 1);
+    }
+
+    #[test]
+    fn resolve_run_pk_ambiguous_prefix() {
+        let conn = setup_db();
+        let root_pk = insert_test_root(&conn);
+        // Two runs whose hex starts with "AA".
+        let run_a = insert_test_run(&conn, root_pk, &[0xAA; 16]);
+        let run_b = insert_test_run(
+            &conn,
+            root_pk,
+            &[0xAA, 0xBB, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        );
+
+        // Prefix "AA" matches both — query_row returns the first match.
+        let found = resolve_run_pk(&conn, "AA").unwrap();
+        assert!(found.is_some(), "ambiguous prefix should still return a pk");
+        let pk = found.unwrap();
+        assert!(pk == run_a || pk == run_b);
+    }
+
+    // ======================================================================
+    // Step 4: Additional query tests
+    // ======================================================================
+
+    #[test]
+    fn list_findings_ordered_by_path_and_offset() {
+        let conn = setup_db();
+        let root_pk = insert_test_root(&conn);
+        let run_pk = insert_test_run(&conn, root_pk, &[1; 16]);
+
+        // Insert findings with different paths/offsets to verify ordering.
+        // idx=3: path "src/file_3.rs", start_byte=300
+        insert_finding_simple(&conn, run_pk, root_pk, 3);
+        // idx=1: path "src/file_1.rs", start_byte=100
+        insert_finding_simple(&conn, run_pk, root_pk, 1);
+        // idx=2: path "src/file_2.rs", start_byte=200
+        insert_finding_simple(&conn, run_pk, root_pk, 2);
+
+        let findings = list_findings(&conn, run_pk, None, None, 100).unwrap();
+        assert_eq!(findings.len(), 3);
+        // ORDER BY (object_path, start_byte) → file_1, file_2, file_3.
+        assert_eq!(findings[0].object_path, "src/file_1.rs");
+        assert_eq!(findings[1].object_path, "src/file_2.rs");
+        assert_eq!(findings[2].object_path, "src/file_3.rs");
+    }
+
+    #[test]
+    fn resolve_run_pk_case_insensitive() {
+        let conn = setup_db();
+        let root_pk = insert_test_root(&conn);
+        let run_id: [u8; 16] = [0xAB, 0xCD, 0xEF, 0x12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let run_pk = insert_test_run(&conn, root_pk, &run_id);
+
+        // Mixed-case prefix — code does `.to_uppercase()` before LIKE.
+        let found = resolve_run_pk(&conn, "AbCdEf12").unwrap();
+        assert_eq!(found, Some(run_pk));
+    }
+
+    #[test]
+    fn hex_decode_edge_cases() {
+        // Empty string → empty vec.
+        assert!(hex_decode("").is_empty());
+        // Whitespace-only → trimmed to empty → empty vec.
+        assert!(hex_decode("   ").is_empty());
+        // Leading/trailing whitespace trimmed before decoding.
+        assert_eq!(hex_decode(" 01ab "), vec![0x01, 0xAB]);
+    }
+
+    #[test]
+    fn list_findings_respects_limit() {
+        let conn = setup_db();
+        let root_pk = insert_test_root(&conn);
+        let run_pk = insert_test_run(&conn, root_pk, &[1; 16]);
+        for idx in 1..=5u8 {
+            insert_finding_simple(&conn, run_pk, root_pk, idx);
+        }
+
+        let limited = list_findings(&conn, run_pk, None, None, 2).unwrap();
+        assert_eq!(limited.len(), 2);
+    }
+
+    #[test]
+    fn diff_runs_with_only_unchanged() {
+        let conn = setup_db();
+        let root_pk = insert_test_root(&conn);
+        let run_a = insert_test_run(&conn, root_pk, &[1; 16]);
+        let run_b = insert_test_run(&conn, root_pk, &[2; 16]);
+
+        // Same finding observed in both runs.
+        let occ_pk = insert_finding_simple(&conn, run_a, root_pk, 1);
+        conn.execute(
+            "INSERT OR IGNORE INTO observations (run_pk, occ_pk, batch_seqno) VALUES (?1, ?2, 1)",
+            params![run_b, occ_pk],
+        )
+        .unwrap();
+
+        let diff = diff_runs(&conn, run_a, run_b).unwrap();
+        assert!(diff.new_findings.is_empty());
+        assert!(diff.resolved_findings.is_empty());
+        assert_eq!(diff.unchanged_count, 1);
+    }
+
+    #[test]
+    fn list_runs_limit_respected() {
+        let conn = setup_db();
+        let root_pk = insert_test_root(&conn);
+        for i in 1..=5u8 {
+            insert_test_run(&conn, root_pk, &[i; 16]);
+        }
+
+        let limited = list_runs(&conn, None, 2).unwrap();
+        assert_eq!(limited.len(), 2);
     }
 }

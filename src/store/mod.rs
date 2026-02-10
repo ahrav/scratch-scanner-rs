@@ -35,9 +35,9 @@ pub mod root_id;
 pub mod triage;
 
 pub use db::{
-    configure_connection, diff_runs, ensure_schema, list_findings, list_runs, list_secrets,
-    resolve_run_pk, DiffResult, FindingRow, RunCounters, RunStatus, RunSummary, SecretSummary,
-    SqliteStoreConfig, SqliteStoreProducer, SCHEMA_VERSION,
+    configure_connection, configure_readonly_connection, diff_runs, ensure_schema, list_findings,
+    list_runs, list_secrets, resolve_run_pk, DiffResult, FindingRow, RunCounters, RunStatus,
+    RunSummary, SecretSummary, SqliteStoreConfig, SqliteStoreProducer, SCHEMA_VERSION,
 };
 #[cfg(test)]
 pub(crate) use fs::{EmitOnlyStoreProducer, FailingStoreProducer};

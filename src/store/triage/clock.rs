@@ -207,4 +207,68 @@ mod tests {
         // Should reinitialize to 0.
         assert_eq!(clock.value(), 0);
     }
+
+    // ======================================================================
+    // Step 7: Specific corruption patterns
+    // ======================================================================
+
+    #[test]
+    fn clock_corrupt_meta_specific_patterns() {
+        // Pattern 1: correct magic but bad CRC.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let meta_path = dir.path().join("triage.meta");
+            let mut buf = [0u8; META_SIZE];
+            buf[0..4].copy_from_slice(META_MAGIC);
+            buf[4..12].copy_from_slice(&42u64.to_le_bytes());
+            buf[12..20].copy_from_slice(&99u64.to_le_bytes());
+            // Write wrong CRC (all zeros).
+            buf[20..24].copy_from_slice(&0u32.to_le_bytes());
+            std::fs::write(&meta_path, buf).unwrap();
+
+            let clock = TriageClock::open(dir.path()).unwrap();
+            assert_eq!(clock.value(), 0, "bad CRC should reinitialize");
+        }
+
+        // Pattern 2: truncated file (only magic bytes).
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let meta_path = dir.path().join("triage.meta");
+            std::fs::write(&meta_path, META_MAGIC).unwrap();
+
+            let clock = TriageClock::open(dir.path()).unwrap();
+            assert_eq!(clock.value(), 0, "truncated file should reinitialize");
+        }
+
+        // Pattern 3: zero-length file.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let meta_path = dir.path().join("triage.meta");
+            std::fs::write(&meta_path, b"").unwrap();
+
+            let clock = TriageClock::open(dir.path()).unwrap();
+            assert_eq!(clock.value(), 0, "empty file should reinitialize");
+        }
+    }
+
+    // ======================================================================
+    // Step 8: Rapid-tick monotonicity
+    // ======================================================================
+
+    #[test]
+    fn clock_rapid_tick_monotonicity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut clock = TriageClock::open(dir.path()).unwrap();
+
+        let mut prev = 0u64;
+        for _ in 0..1000 {
+            let val = clock.tick().unwrap();
+            assert!(
+                val > prev,
+                "clock must be strictly monotonic: prev={prev}, val={val}"
+            );
+            prev = val;
+        }
+        assert_eq!(clock.value(), 1000);
+    }
 }

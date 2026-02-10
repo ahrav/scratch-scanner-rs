@@ -486,4 +486,114 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].reason.as_deref(), Some("updated"));
     }
+
+    // ======================================================================
+    // Step 6: Triage persistence and isolation tests
+    // ======================================================================
+
+    #[test]
+    fn triage_store_reopen_preserves_state() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Write a decision, then drop the store.
+        {
+            let mut store = TriageStore::open(dir.path()).unwrap();
+            store
+                .set_occurrence_status(
+                    &test_root(),
+                    &test_occ(),
+                    TriageStatus::FalsePositive,
+                    Some("test key"),
+                    Some("alice"),
+                )
+                .unwrap();
+        }
+
+        // Reopen and verify the decision persisted.
+        let store = TriageStore::open(dir.path()).unwrap();
+        let status = store
+            .effective_status(&test_root(), &test_occ(), &test_secret())
+            .unwrap();
+        assert_eq!(status, Some(TriageStatus::FalsePositive));
+
+        let rows = store.list_occurrence_triage(&test_root(), 100).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].reason.as_deref(), Some("test key"));
+        assert_eq!(rows[0].updated_by.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn triage_multiple_roots_isolated() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = TriageStore::open(dir.path()).unwrap();
+
+        let root_a = [0x01; 32];
+        let root_b = [0x02; 32];
+        let occ = [0xBB; 32];
+        let secret = [0xCC; 32];
+
+        // Same occurrence_id under different root_ids.
+        store
+            .set_occurrence_status(&root_a, &occ, TriageStatus::Suppressed, None, None)
+            .unwrap();
+        store
+            .set_occurrence_status(&root_b, &occ, TriageStatus::AcceptedRisk, None, None)
+            .unwrap();
+
+        let status_a = store.effective_status(&root_a, &occ, &secret).unwrap();
+        let status_b = store.effective_status(&root_b, &occ, &secret).unwrap();
+
+        assert_eq!(status_a, Some(TriageStatus::Suppressed));
+        assert_eq!(status_b, Some(TriageStatus::AcceptedRisk));
+    }
+
+    #[test]
+    fn triage_status_from_i32_out_of_range() {
+        assert_eq!(TriageStatus::from_i32(-1), None);
+        assert_eq!(TriageStatus::from_i32(4), None);
+        assert_eq!(TriageStatus::from_i32(i32::MAX), None);
+        assert_eq!(TriageStatus::from_i32(i32::MIN), None);
+
+        // Valid range.
+        assert_eq!(TriageStatus::from_i32(0), Some(TriageStatus::Active));
+        assert_eq!(TriageStatus::from_i32(3), Some(TriageStatus::AcceptedRisk));
+    }
+
+    // ======================================================================
+    // Step 8: Clock monotonicity across operations
+    // ======================================================================
+
+    #[test]
+    fn triage_clock_monotonic_across_operations() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = TriageStore::open(dir.path()).unwrap();
+
+        let root = test_root();
+        let occ1 = [0x01; 32];
+        let occ2 = [0x02; 32];
+        let occ3 = [0x03; 32];
+
+        store
+            .set_occurrence_status(&root, &occ1, TriageStatus::Suppressed, None, None)
+            .unwrap();
+        store
+            .set_occurrence_status(&root, &occ2, TriageStatus::FalsePositive, None, None)
+            .unwrap();
+        store
+            .set_occurrence_status(&root, &occ3, TriageStatus::AcceptedRisk, None, None)
+            .unwrap();
+
+        let rows = store.list_occurrence_triage(&root, 100).unwrap();
+        assert_eq!(rows.len(), 3);
+
+        // Clock values should be strictly increasing (1, 2, 3).
+        let clocks: Vec<i64> = rows.iter().map(|r| r.clock).collect();
+        // Rows are ordered by updated_at DESC, so clocks should be descending.
+        for window in clocks.windows(2) {
+            assert!(
+                window[0] > window[1],
+                "clocks must be strictly decreasing in list order: {clocks:?}"
+            );
+        }
+    }
 }

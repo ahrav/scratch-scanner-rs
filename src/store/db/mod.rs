@@ -23,5 +23,7 @@ pub use query::{
     diff_runs, list_findings, list_runs, list_secrets, resolve_run_pk, DiffResult, FindingRow,
     RunSummary, SecretSummary,
 };
-pub use schema::{configure_connection, ensure_schema, SCHEMA_VERSION};
+pub use schema::{
+    configure_connection, configure_readonly_connection, ensure_schema, SCHEMA_VERSION,
+};
 pub use writer::{RunCounters, RunStatus, SqliteStoreConfig, SqliteStoreProducer};

@@ -61,6 +61,18 @@ pub fn configure_connection(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+/// Set connection PRAGMAs for read-only query access.
+///
+/// Unlike [`configure_connection`], this intentionally avoids `journal_mode`
+/// and `synchronous` writes so it can run on read-only handles.
+pub fn configure_readonly_connection(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         PRAGMA busy_timeout = 5000;
+         PRAGMA cache_size = -64000;",
+    )
+}
+
 /// Ensure the schema is at the current version, applying migrations as needed.
 ///
 /// Idempotent: calling it on an already-up-to-date database is a no-op.
@@ -261,5 +273,22 @@ mod tests {
             .unwrap();
         // In-memory db returns "memory" for journal_mode, but the pragma was accepted
         assert!(mode == "wal" || mode == "memory");
+    }
+
+    #[test]
+    fn foreign_key_violation_rejected() {
+        let conn = open_memory_db();
+        ensure_schema(&conn).expect("schema");
+
+        // Insert occurrence referencing non-existent rule_pk — must fail.
+        let result = conn.execute(
+            "INSERT INTO occurrences (occurrence_id, root_pk, path_pk, rule_pk, secret_pk, start_byte, end_byte, object_path)
+             VALUES (X'AA', 999, 999, 999, 999, 0, 10, 'test.rs')",
+            [],
+        );
+        assert!(
+            result.is_err(),
+            "FK violation should be rejected: {result:?}"
+        );
     }
 }

@@ -8,8 +8,8 @@
 //!
 //! - Single writer connection (SQLite serializes writes anyway via WAL).
 //! - Batched transactions: each `emit_fs_batch` call runs inside a transaction.
-//! - `INSERT OR IGNORE` for occurrence_id idempotency.
-//! - Upsert for secrets: `ON CONFLICT DO UPDATE last_seen_run, count`.
+//! - `INSERT OR IGNORE` for idempotent dimensions and observation edges.
+//! - Observation-driven secret counters (`occurrence_count`, first/last seen run).
 //! - Rust-side `HashMap<[u8;32], i64>` caches for surrogate key resolution.
 
 use std::collections::HashMap;
@@ -21,7 +21,9 @@ use rusqlite::{params, Connection};
 
 use super::schema::{configure_connection, ensure_schema};
 use crate::store::fs::{FsFindingBatch, FsRunLoss, FsStoreError, StoreProducer};
+use crate::store::identity::SecretLenBucket;
 use crate::store::keys::IdHashMode;
+use crate::store::path_id::canonicalize_path;
 use crate::store::root_id::RootKind;
 
 /// Run status codes stored in the `runs.status` column.
@@ -98,6 +100,8 @@ pub struct SqliteStoreConfig {
 struct WriterState {
     conn: Connection,
     run_pk: i64,
+    root_pk: i64,
+    root_id: [u8; 32],
     /// Monotonically increasing sequence number within this run, bumped once
     /// per finding and recorded in `observations.batch_seqno`.
     batch_seqno: i64,
@@ -164,38 +168,13 @@ impl SqliteStoreProducer {
             state: Mutex::new(WriterState {
                 conn,
                 run_pk,
+                root_pk,
+                root_id: config.root_id,
                 batch_seqno: 0,
                 rule_cache: HashMap::new(),
                 counters: RunCounters::default(),
             }),
         })
-    }
-
-    /// Finalize the run: set end time, status, and counters.
-    pub fn end_run(&self, had_coverage_limits: bool) -> Result<(), FsStoreError> {
-        let state = self.state.lock().expect("writer lock poisoned");
-        let status = state.counters.derive_status(had_coverage_limits);
-        let ended_at = now_epoch_ms();
-        state
-            .conn
-            .execute(
-                "UPDATE runs SET ended_at = ?1, status = ?2,
-                 objects_scanned = ?3, bytes_scanned = ?4, findings_emitted = ?5,
-                 dropped_findings = ?6, emit_failures = ?7
-                 WHERE run_pk = ?8",
-                params![
-                    ended_at,
-                    status as i32,
-                    state.counters.objects_scanned as i64,
-                    state.counters.bytes_scanned as i64,
-                    state.counters.findings_emitted as i64,
-                    state.counters.dropped_findings as i64,
-                    state.counters.emit_failures as i64,
-                    state.run_pk,
-                ],
-            )
-            .map_err(|e| FsStoreError::backend(format!("run finalize failed: {e}")))?;
-        Ok(())
     }
 
     /// Returns the run_pk for this run (useful for queries after scan).
@@ -223,32 +202,84 @@ impl StoreProducer for SqliteStoreProducer {
         let mut state = self.state.lock().expect("writer lock poisoned");
         let state = &mut *state;
 
-        let _object_path = batch.object_path;
-
         state
             .conn
             .execute_batch("BEGIN IMMEDIATE;")
             .map_err(|e| FsStoreError::backend(format!("begin txn failed: {e}")))?;
 
-        for finding in batch.findings {
-            state.batch_seqno += 1;
+        let write_result: rusqlite::Result<()> = (|| {
+            let object_path = String::from_utf8_lossy(batch.object_path).into_owned();
+            let canonical_path = canonicalize_path(&object_path);
+            let path_id = derive_path_id(&state.root_id, &canonical_path);
+            let path_pk =
+                resolve_or_insert_path(&state.conn, &path_id, state.root_pk, &canonical_path)?;
 
-            // Resolve rule surrogate (cached).
-            let rule_pk = resolve_or_insert_rule(
-                &state.conn,
-                &finding.norm_hash, // Using norm_hash as placeholder for rule_fingerprint
-                finding.rule_id,
-                &state.rule_cache,
-            )
-            .map_err(|e| {
-                let _ = state.conn.execute_batch("ROLLBACK;");
-                FsStoreError::backend(format!("rule resolve failed: {e}"))
-            })?;
+            for finding in batch.findings {
+                state.batch_seqno += 1;
 
-            // Cache the rule mapping.
-            state.rule_cache.entry(finding.norm_hash).or_insert(rule_pk);
+                let rule_fingerprint = derive_rule_fingerprint(finding.rule_id);
+                let rule_pk = resolve_or_insert_rule(
+                    &state.conn,
+                    &rule_fingerprint,
+                    finding.rule_id,
+                    &state.rule_cache,
+                )?;
+                state.rule_cache.entry(rule_fingerprint).or_insert(rule_pk);
 
-            state.counters.findings_emitted += 1;
+                state.conn.execute(
+                    "INSERT OR IGNORE INTO run_rules (run_pk, rule_pk) VALUES (?1, ?2)",
+                    params![state.run_pk, rule_pk],
+                )?;
+
+                let secret_hash = finding.norm_hash;
+                let secret_pk = resolve_or_insert_secret(&state.conn, &secret_hash, state.run_pk)?;
+
+                let occurrence_id =
+                    derive_occurrence_id(&path_id, &rule_fingerprint, &secret_hash, finding);
+
+                state.conn.execute(
+                    "INSERT OR IGNORE INTO occurrences (
+                         occurrence_id, root_pk, path_pk, rule_pk, secret_pk,
+                         start_byte, end_byte, identity_flags, object_path
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        occurrence_id.as_slice(),
+                        state.root_pk,
+                        path_pk,
+                        rule_pk,
+                        secret_pk,
+                        finding.root_hint_start as i64,
+                        finding.root_hint_end as i64,
+                        0i64,
+                        object_path.as_str(),
+                    ],
+                )?;
+
+                let occ_pk: i64 = state.conn.query_row(
+                    "SELECT occ_pk FROM occurrences WHERE occurrence_id = ?1",
+                    params![occurrence_id.as_slice()],
+                    |row| row.get(0),
+                )?;
+
+                let inserted_observation = state.conn.execute(
+                    "INSERT OR IGNORE INTO observations (run_pk, occ_pk, batch_seqno)
+                     VALUES (?1, ?2, ?3)",
+                    params![state.run_pk, occ_pk, state.batch_seqno],
+                )?;
+
+                if inserted_observation > 0 {
+                    touch_secret_observation(&state.conn, secret_pk, state.run_pk)?;
+                }
+
+                state.counters.findings_emitted += 1;
+            }
+
+            Ok(())
+        })();
+
+        if let Err(e) = write_result {
+            let _ = state.conn.execute_batch("ROLLBACK;");
+            return Err(FsStoreError::backend(format!("emit txn failed: {e}")));
         }
 
         state
@@ -264,6 +295,32 @@ impl StoreProducer for SqliteStoreProducer {
         let mut state = self.state.lock().expect("writer lock poisoned");
         state.counters.dropped_findings += loss.dropped_findings;
         state.counters.emit_failures += loss.persistence_emit_failures;
+        Ok(())
+    }
+
+    fn end_run(&self, had_coverage_limits: bool) -> Result<(), FsStoreError> {
+        let state = self.state.lock().expect("writer lock poisoned");
+        let status = state.counters.derive_status(had_coverage_limits);
+        let ended_at = now_epoch_ms();
+        state
+            .conn
+            .execute(
+                "UPDATE runs SET ended_at = ?1, status = ?2,
+                 objects_scanned = ?3, bytes_scanned = ?4, findings_emitted = ?5,
+                 dropped_findings = ?6, emit_failures = ?7
+                 WHERE run_pk = ?8",
+                params![
+                    ended_at,
+                    status as i32,
+                    state.counters.objects_scanned as i64,
+                    state.counters.bytes_scanned as i64,
+                    state.counters.findings_emitted as i64,
+                    state.counters.dropped_findings as i64,
+                    state.counters.emit_failures as i64,
+                    state.run_pk,
+                ],
+            )
+            .map_err(|e| FsStoreError::backend(format!("run finalize failed: {e}")))?;
         Ok(())
     }
 }
@@ -332,6 +389,110 @@ fn resolve_or_insert_rule(
         params![rule_fingerprint.as_slice()],
         |row| row.get(0),
     )
+}
+
+/// Resolve or create a path dimension row, returning its surrogate PK.
+fn resolve_or_insert_path(
+    conn: &Connection,
+    path_id: &[u8; 32],
+    root_pk: i64,
+    canonical_path: &str,
+) -> rusqlite::Result<i64> {
+    conn.execute(
+        "INSERT OR IGNORE INTO paths (path_id, root_pk, canonical_path)
+         VALUES (?1, ?2, ?3)",
+        params![path_id.as_slice(), root_pk, canonical_path],
+    )?;
+    conn.query_row(
+        "SELECT path_pk FROM paths WHERE path_id = ?1",
+        params![path_id.as_slice()],
+        |row| row.get(0),
+    )
+}
+
+/// Resolve or create a secret dimension row, returning its surrogate PK.
+fn resolve_or_insert_secret(
+    conn: &Connection,
+    secret_hash: &[u8; 32],
+    run_pk: i64,
+) -> rusqlite::Result<i64> {
+    conn.execute(
+        "INSERT OR IGNORE INTO secrets (
+             secret_hash, secret_len_bucket, first_seen_run, last_seen_run, occurrence_count, status
+         ) VALUES (?1, ?2, ?3, ?3, 0, 0)",
+        params![
+            secret_hash.as_slice(),
+            SecretLenBucket::Unknown as i32,
+            run_pk
+        ],
+    )?;
+    conn.query_row(
+        "SELECT secret_pk FROM secrets WHERE secret_hash = ?1",
+        params![secret_hash.as_slice()],
+        |row| row.get(0),
+    )
+}
+
+/// Update aggregate counters for a secret when a new observation is recorded.
+fn touch_secret_observation(
+    conn: &Connection,
+    secret_pk: i64,
+    run_pk: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE secrets
+         SET first_seen_run = MIN(first_seen_run, ?2),
+             last_seen_run = MAX(last_seen_run, ?2),
+             occurrence_count = occurrence_count + 1
+         WHERE secret_pk = ?1",
+        params![secret_pk, run_pk],
+    )?;
+    Ok(())
+}
+
+/// Derive a deterministic rule fingerprint from the rule id.
+///
+/// This keeps rule identity independent from secret bytes and guarantees that
+/// different `rule_id` values map to different rule keys.
+fn derive_rule_fingerprint(rule_id: u32) -> [u8; 32] {
+    const DOMAIN: &[u8] = b"scanner.store.db.v1.rule_fingerprint";
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(DOMAIN);
+    hasher.update(&[0]);
+    hasher.update(&rule_id.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+/// Derive a deterministic path identifier from `(root_id, canonical_path)`.
+fn derive_path_id(root_id: &[u8; 32], canonical_path: &str) -> [u8; 32] {
+    const DOMAIN: &[u8] = b"scanner.store.db.v1.path_id";
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(DOMAIN);
+    hasher.update(&[0]);
+    hasher.update(root_id);
+    hasher.update(canonical_path.as_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+/// Derive a deterministic occurrence identifier.
+fn derive_occurrence_id(
+    path_id: &[u8; 32],
+    rule_fingerprint: &[u8; 32],
+    secret_hash: &[u8; 32],
+    finding: &crate::store::fs::FsFindingRecord,
+) -> [u8; 32] {
+    const DOMAIN: &[u8] = b"scanner.store.db.v1.occurrence_id";
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(DOMAIN);
+    hasher.update(&[0]);
+    hasher.update(path_id);
+    hasher.update(rule_fingerprint);
+    hasher.update(secret_hash);
+    hasher.update(&finding.root_hint_start.to_le_bytes());
+    hasher.update(&finding.root_hint_end.to_le_bytes());
+    hasher.update(&finding.span_start.to_le_bytes());
+    hasher.update(&finding.span_end.to_le_bytes());
+    *hasher.finalize().as_bytes()
 }
 
 /// Generate a 16-byte random run identifier.
@@ -531,5 +692,214 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
             .unwrap();
         assert_eq!(run_count, 2);
+    }
+
+    // ======================================================================
+    // Step 3: Empty batch test
+    // ======================================================================
+
+    #[test]
+    fn emit_empty_batch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let producer = SqliteStoreProducer::open(config).expect("open");
+
+        let batch = FsFindingBatch {
+            object_path: b"empty.rs",
+            findings: &[],
+        };
+        producer
+            .emit_fs_batch(batch)
+            .expect("empty batch should succeed");
+        producer.end_run(false).expect("end_run");
+
+        let conn = Connection::open(tmp.path().join("findings.db")).unwrap();
+        let run: (i64, i64) = conn
+            .query_row(
+                "SELECT objects_scanned, findings_emitted FROM runs ORDER BY run_pk DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(run.0, 1, "objects_scanned should increment");
+        assert_eq!(run.1, 0, "findings_emitted should stay 0");
+    }
+
+    // ======================================================================
+    // Step 5: Additional writer tests
+    // ======================================================================
+
+    #[test]
+    fn rule_cache_hit_avoids_db_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let producer = SqliteStoreProducer::open(config).expect("open");
+
+        let rec = FsFindingRecord {
+            rule_id: 42,
+            root_hint_start: 0,
+            root_hint_end: 10,
+            span_start: 0,
+            span_end: 10,
+            norm_hash: [0xDD; 32],
+        };
+        // Two batches with the same rule_id — fingerprint derived from rule_id
+        // should be cached after the first batch.
+        for path in &[b"a.rs" as &[u8], b"b.rs"] {
+            let batch = FsFindingBatch {
+                object_path: path,
+                findings: &[rec],
+            };
+            producer.emit_fs_batch(batch).expect("emit");
+        }
+        producer.end_run(false).expect("end_run");
+
+        let conn = Connection::open(tmp.path().join("findings.db")).unwrap();
+        let fp = derive_rule_fingerprint(42);
+        let rule_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM rules WHERE rule_fingerprint = ?1",
+                params![fp.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rule_count, 1, "cache should prevent duplicate rule rows");
+    }
+
+    #[test]
+    fn multiple_findings_per_batch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let producer = SqliteStoreProducer::open(config).expect("open");
+
+        let findings: Vec<FsFindingRecord> = (0..5u8)
+            .map(|i| FsFindingRecord {
+                rule_id: u32::from(i),
+                root_hint_start: 0,
+                root_hint_end: 10,
+                span_start: 0,
+                span_end: 10,
+                norm_hash: [i; 32],
+            })
+            .collect();
+        let batch = FsFindingBatch {
+            object_path: b"multi.rs",
+            findings: &findings,
+        };
+        producer.emit_fs_batch(batch).expect("emit");
+        producer.end_run(false).expect("end_run");
+
+        let conn = Connection::open(tmp.path().join("findings.db")).unwrap();
+        let (scanned, emitted): (i64, i64) = conn
+            .query_row(
+                "SELECT objects_scanned, findings_emitted FROM runs ORDER BY run_pk DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(scanned, 1);
+        assert_eq!(emitted, 5);
+
+        let rule_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM rules", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rule_count, 5, "all 5 distinct rules should be created");
+    }
+
+    // ======================================================================
+    // Step 8: Stress and edge-case tests
+    // ======================================================================
+
+    #[test]
+    fn writer_large_batch_stress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let producer = SqliteStoreProducer::open(config).expect("open");
+
+        let findings: Vec<FsFindingRecord> = (0..200u16)
+            .map(|i| {
+                let mut hash = [0u8; 32];
+                hash[0..2].copy_from_slice(&i.to_le_bytes());
+                FsFindingRecord {
+                    rule_id: i as u32,
+                    root_hint_start: 0,
+                    root_hint_end: 10,
+                    span_start: 0,
+                    span_end: 10,
+                    norm_hash: hash,
+                }
+            })
+            .collect();
+        let batch = FsFindingBatch {
+            object_path: b"stress.rs",
+            findings: &findings,
+        };
+        producer
+            .emit_fs_batch(batch)
+            .expect("large batch should succeed");
+        producer.end_run(false).expect("end_run");
+
+        let conn = Connection::open(tmp.path().join("findings.db")).unwrap();
+        let emitted: i64 = conn
+            .query_row(
+                "SELECT findings_emitted FROM runs ORDER BY run_pk DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(emitted, 200);
+    }
+
+    #[test]
+    fn writer_concurrent_emit_from_threads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let producer = std::sync::Arc::new(SqliteStoreProducer::open(config).expect("open"));
+
+        let handles: Vec<_> = (0..8u8)
+            .map(|t| {
+                let p = std::sync::Arc::clone(&producer);
+                std::thread::spawn(move || {
+                    let rec = FsFindingRecord {
+                        rule_id: u32::from(t),
+                        root_hint_start: 0,
+                        root_hint_end: 10,
+                        span_start: 0,
+                        span_end: 10,
+                        norm_hash: [t; 32],
+                    };
+                    let path = format!("thread_{t}.rs");
+                    let batch = FsFindingBatch {
+                        object_path: path.as_bytes(),
+                        findings: &[rec],
+                    };
+                    p.emit_fs_batch(batch).expect("concurrent emit");
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+        producer.end_run(false).expect("end_run");
+
+        let conn = Connection::open(tmp.path().join("findings.db")).unwrap();
+        let emitted: i64 = conn
+            .query_row(
+                "SELECT findings_emitted FROM runs ORDER BY run_pk DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(emitted, 8, "all 8 thread batches should be recorded");
+    }
+
+    #[test]
+    fn generate_run_id_uniqueness() {
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let id = generate_run_id();
+            assert!(ids.insert(id), "duplicate run_id generated");
+        }
     }
 }

@@ -8,7 +8,7 @@
 use scanner_rs::store::{
     db::{
         query::{self, resolve_run_pk},
-        schema::configure_connection,
+        schema::{configure_connection, ensure_schema},
         writer::{RunCounters, RunStatus, SqliteStoreConfig, SqliteStoreProducer},
     },
     identity::{
@@ -20,6 +20,8 @@ use scanner_rs::store::{
     root_id::{self, RootIdInput, RootKind},
     FsFindingBatch, FsFindingRecord, FsRunLoss, StoreProducer,
 };
+use std::fs;
+use std::process::Command;
 
 // ---------------------------------------------------------------------------
 // 5.1 Identity conformance
@@ -302,11 +304,11 @@ fn idempotent_reinsert_same_finding() {
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     configure_connection(&conn).unwrap();
 
-    // Rule should be deduplicated (same norm_hash used as fingerprint placeholder).
+    // Rule should be deduplicated by rule identity.
     let rule_count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM rules WHERE rule_fingerprint = ?1",
-            rusqlite::params![[0xAAu8; 32].as_slice()],
+            "SELECT COUNT(*) FROM rules WHERE rule_id = ?1",
+            rusqlite::params![1_i64],
             |r| r.get(0),
         )
         .unwrap();
@@ -447,4 +449,331 @@ fn list_runs_filters_by_status() {
 
     let incomplete = query::list_runs(&conn, Some(RunStatus::Incomplete as i32), 100).unwrap();
     assert_eq!(incomplete.len(), 1);
+}
+
+#[test]
+fn emit_batch_persists_queryable_findings_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("findings.db");
+    let keys = StoreKeys::bootstrap_from_env();
+    let root_id = root_id::root_id(
+        &RootIdInput {
+            kind: RootKind::Fs,
+            identity_scheme: "fs_path_v1",
+            canonical_identity: b"/tmp/persist-findings",
+        },
+        &keys,
+    );
+
+    let config = make_config(db_path.clone(), root_id, keys.id_hash_mode());
+    let producer = SqliteStoreProducer::open(config).unwrap();
+    let run_pk = producer.run_pk();
+
+    let rec = FsFindingRecord {
+        rule_id: 7,
+        root_hint_start: 10,
+        root_hint_end: 20,
+        span_start: 10,
+        span_end: 20,
+        norm_hash: [0x33; 32],
+    };
+    producer
+        .emit_fs_batch(FsFindingBatch {
+            object_path: b"src/main.rs",
+            findings: &[rec],
+        })
+        .unwrap();
+    producer.end_run(false).unwrap();
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    configure_connection(&conn).unwrap();
+    let findings = query::list_findings(&conn, run_pk, None, None, 100).unwrap();
+    assert_eq!(findings.len(), 1, "expected persisted finding row");
+}
+
+#[test]
+fn rules_do_not_collapse_when_norm_hash_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("findings.db");
+    let keys = StoreKeys::bootstrap_from_env();
+    let root_id = root_id::root_id(
+        &RootIdInput {
+            kind: RootKind::Fs,
+            identity_scheme: "fs_path_v1",
+            canonical_identity: b"/tmp/rule-separation",
+        },
+        &keys,
+    );
+
+    let config = make_config(db_path.clone(), root_id, keys.id_hash_mode());
+    let producer = SqliteStoreProducer::open(config).unwrap();
+    let shared_norm_hash = [0x99; 32];
+    let batch = FsFindingBatch {
+        object_path: b"src/lib.rs",
+        findings: &[
+            FsFindingRecord {
+                rule_id: 1,
+                root_hint_start: 0,
+                root_hint_end: 5,
+                span_start: 0,
+                span_end: 5,
+                norm_hash: shared_norm_hash,
+            },
+            FsFindingRecord {
+                rule_id: 2,
+                root_hint_start: 10,
+                root_hint_end: 15,
+                span_start: 10,
+                span_end: 15,
+                norm_hash: shared_norm_hash,
+            },
+        ],
+    };
+    producer.emit_fs_batch(batch).unwrap();
+    producer.end_run(false).unwrap();
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    configure_connection(&conn).unwrap();
+    let distinct_rule_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM rules", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        distinct_rule_count, 2,
+        "different rule ids must persist as distinct rules even with same norm hash"
+    );
+}
+
+#[test]
+fn fs_scan_with_persist_findings_finalizes_run() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(
+        root.path().join("secret.txt"),
+        b"token=xoxa-1234567890abcdef\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_scanner-rs"))
+        .args(["scan", "fs"])
+        .arg(root.path())
+        .arg("--persist-findings")
+        .output()
+        .expect("run scanner-rs scan fs");
+    assert!(
+        output.status.success(),
+        "scan command failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let db_path = root.path().join(".scanner-store").join("findings.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    configure_connection(&conn).unwrap();
+
+    let (status, ended_at): (i32, Option<i64>) = conn
+        .query_row(
+            "SELECT status, ended_at FROM runs ORDER BY run_pk DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_ne!(
+        status,
+        RunStatus::InProgress as i32,
+        "run must be finalized"
+    );
+    assert!(ended_at.is_some(), "run must have ended_at");
+}
+
+#[test]
+fn store_list_runs_command_succeeds_against_existing_db() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("findings.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    ensure_schema(&conn).unwrap();
+    let root_id = [0xABu8; 32];
+    conn.execute(
+        "INSERT INTO roots (root_id, root_kind, identity_scheme, canonical_identity, display_name)
+         VALUES (?1, 2, 'fs_path_v1', X'01', 'manual-root')",
+        rusqlite::params![root_id.as_slice()],
+    )
+    .unwrap();
+    let root_pk = conn.last_insert_rowid();
+    let run_id: [u8; 16] = [0x11; 16];
+    conn.execute(
+        "INSERT INTO runs (run_id, root_pk, id_hash_mode, started_at, ended_at, status, findings_emitted, objects_scanned)
+         VALUES (?1, ?2, 1, 1, 2, 1, 0, 0)",
+        rusqlite::params![run_id.as_slice(), root_pk],
+    )
+    .unwrap();
+    drop(conn);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_scanner-rs"))
+        .args(["store", "list-runs"])
+        .arg(format!("--store-dir={}", dir.path().display()))
+        .arg("--format=json")
+        .output()
+        .expect("run scanner-rs store list-runs");
+    assert!(
+        output.status.success(),
+        "store list-runs failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn store_list_findings_json_output_is_valid_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("findings.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    configure_connection(&conn).unwrap();
+    ensure_schema(&conn).unwrap();
+
+    let root_id = [0xAAu8; 32];
+    conn.execute(
+        "INSERT INTO roots (root_id, root_kind, identity_scheme, canonical_identity, display_name)
+         VALUES (?1, 2, 'fs_path_v1', X'01', 'root')",
+        rusqlite::params![root_id.as_slice()],
+    )
+    .unwrap();
+    let root_pk = conn.last_insert_rowid();
+
+    let run_id: [u8; 16] = [0x22; 16];
+    conn.execute(
+        "INSERT INTO runs (run_id, root_pk, id_hash_mode, started_at, ended_at, status, findings_emitted, objects_scanned)
+         VALUES (?1, ?2, 1, 1, 2, 1, 1, 1)",
+        rusqlite::params![run_id.as_slice(), root_pk],
+    )
+    .unwrap();
+    let run_pk = conn.last_insert_rowid();
+
+    let path_id = [0x33u8; 32];
+    conn.execute(
+        "INSERT INTO paths (path_id, root_pk, canonical_path) VALUES (?1, ?2, ?3)",
+        rusqlite::params![path_id.as_slice(), root_pk, "bad\"name\\x.txt"],
+    )
+    .unwrap();
+    let path_pk = conn.last_insert_rowid();
+
+    let rule_fp = [0x44u8; 32];
+    conn.execute(
+        "INSERT INTO rules (rule_fingerprint, rule_id, rule_name) VALUES (?1, 7, ?2)",
+        rusqlite::params![rule_fp.as_slice(), "rule\"quoted"],
+    )
+    .unwrap();
+    let rule_pk = conn.last_insert_rowid();
+
+    let secret_hash = [0x55u8; 32];
+    conn.execute(
+        "INSERT INTO secrets (secret_hash, secret_len_bucket, first_seen_run, last_seen_run, occurrence_count, status)
+         VALUES (?1, 1, ?2, ?2, 1, 0)",
+        rusqlite::params![secret_hash.as_slice(), run_pk],
+    )
+    .unwrap();
+    let secret_pk = conn.last_insert_rowid();
+
+    let occ_id = [0x66u8; 32];
+    conn.execute(
+        "INSERT INTO occurrences (occurrence_id, root_pk, path_pk, rule_pk, secret_pk, start_byte, end_byte, identity_flags, object_path)
+         VALUES (?1, ?2, ?3, ?4, ?5, 10, 20, 0, ?6)",
+        rusqlite::params![
+            occ_id.as_slice(),
+            root_pk,
+            path_pk,
+            rule_pk,
+            secret_pk,
+            "bad\"name\\x.txt"
+        ],
+    )
+    .unwrap();
+    let occ_pk = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO observations (run_pk, occ_pk, batch_seqno) VALUES (?1, ?2, 1)",
+        rusqlite::params![run_pk, occ_pk],
+    )
+    .unwrap();
+    drop(conn);
+
+    let run_id_hex = run_id
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_scanner-rs"))
+        .args(["store", "list-findings"])
+        .arg(format!("--store-dir={}", dir.path().display()))
+        .arg(format!("--run={run_id_hex}"))
+        .arg("--format=json")
+        .output()
+        .expect("run scanner-rs store list-findings");
+    assert!(
+        output.status.success(),
+        "store list-findings failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(parsed.is_array(), "list-findings JSON must be an array");
+}
+
+#[test]
+fn db_reopen_across_lifetimes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("findings.db");
+    let keys = StoreKeys::bootstrap_from_env();
+    let root_id = root_id::root_id(
+        &RootIdInput {
+            kind: RootKind::Fs,
+            identity_scheme: "fs_path_v1",
+            canonical_identity: b"/tmp/reopen",
+        },
+        &keys,
+    );
+
+    // First lifetime: write a finding.
+    let run_pk_1;
+    {
+        let config = make_config(db_path.clone(), root_id, keys.id_hash_mode());
+        let producer = SqliteStoreProducer::open(config).unwrap();
+        run_pk_1 = producer.run_pk();
+
+        let rec = FsFindingRecord {
+            rule_id: 1,
+            root_hint_start: 0,
+            root_hint_end: 10,
+            span_start: 0,
+            span_end: 10,
+            norm_hash: [0xEE; 32],
+        };
+        producer
+            .emit_fs_batch(FsFindingBatch {
+                object_path: b"reopen.rs",
+                findings: &[rec],
+            })
+            .unwrap();
+        producer.end_run(false).unwrap();
+        // Producer dropped here — connection closed.
+    }
+
+    // Second lifetime: reopen and verify data survives.
+    {
+        let config = make_config(db_path.clone(), root_id, keys.id_hash_mode());
+        let producer = SqliteStoreProducer::open(config).unwrap();
+        let run_pk_2 = producer.run_pk();
+        assert_ne!(run_pk_1, run_pk_2, "second open creates a new run");
+        producer.end_run(false).unwrap();
+    }
+
+    // Verify both runs are queryable.
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    configure_connection(&conn).unwrap();
+
+    let runs = query::list_runs(&conn, None, 100).unwrap();
+    assert_eq!(runs.len(), 2, "both runs should survive reopen");
+
+    // First run's finding should be queryable.
+    let findings = query::list_findings(&conn, run_pk_1, None, None, 100).unwrap();
+    assert_eq!(
+        findings.len(),
+        1,
+        "finding from first lifetime should persist"
+    );
 }
