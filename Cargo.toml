@@ -15,6 +15,7 @@ crossbeam-channel = "0.5"
 crossbeam-deque = "0.8"
 crossbeam-queue = "0.3"
 crossbeam-utils = "0.8"
+crc32fast = "1.4"
 flate2 = { version = "1.0", default-features = false, features = ["zlib-ng"] }
 libc = "0.2"
 memchr = "2.6"
@@ -61,7 +62,6 @@ real-rules-harness = []  # Real-ruleset regression harness (simulation test)
 binary-extract = ["serde_json", "dep:zip"]  # Binary format text extraction (.ipynb, .class, .jar, .pyc)
 
 [dev-dependencies]
-crc32fast = "1.4"
 loom = "0.7"
 proptest = "1.4"
 criterion = "0.5"

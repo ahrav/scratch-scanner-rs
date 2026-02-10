@@ -216,6 +216,29 @@ Filesystem persistence now has a separate identity contract in `src/store/`:
   (`step_id == STEP_ROOT` or `dedupe_with_span`), and UTF-16 LE/BE variant
   discrimination.
 
+## FS Append-Log Writer (Phase C)
+
+Filesystem scans now have a concrete persistence backend in
+`src/store/log/`:
+
+- `store::log::format` defines deterministic frames with explicit size caps and
+  CRC32 integrity (`len + crc32 + frame_type + payload`).
+- `store::log::writer` runs a bounded single-writer thread with backpressure on
+  both in-flight batch count (default 256) and in-flight bytes (default 64 MB).
+- Segments rotate at `max_segment_bytes` (default 64 MB). Active segments are
+  written as `.open` and finalized to `.bin` via `sync_data()` + atomic rename,
+  preserving crash-safe visibility boundaries.
+- `RuleDef` records are emitted in fingerprint-sorted order, so metadata order
+  is deterministic even if findings arrive from workers in non-deterministic
+  order.
+- Two durability modes: `SegmentClose` (fsync at rotation only, default) and
+  `Batch` (fsync after every finding frame).
+- Store root is resolved from `SCANNER_FS_LOG_DIR` env var, or defaults to a
+  sibling directory of the scan root.
+
+For the full binary wire format specification, directory layout, and
+configuration defaults, see [fs-persistence-pipeline.md § Append-Log Backend](fs-persistence-pipeline.md#append-log-backend-phase-c).
+
 **Pressure Coalescing**: If windows exceed `max_windows_per_rule_variant` (16), the gap doubles until windows fit, or everything merges into one.
 
 ### Seed Confirmation + Expansion

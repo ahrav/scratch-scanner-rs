@@ -34,7 +34,7 @@ use crate::git_scan::{
 #[cfg(not(target_os = "linux"))]
 use crate::scheduler::parallel_scan_dir;
 use crate::scheduler::ParallelScanConfig;
-use crate::store::{NullStoreProducer, StoreProducer};
+use crate::store::{AppendLogStoreProducer, StoreProducer};
 use crate::{demo_rules, demo_transforms, demo_tuning, AnchorMode, AnchorPolicy, Engine};
 
 use super::cli::TransformFilter;
@@ -83,6 +83,21 @@ fn run_fs(
 
     let t0 = Instant::now();
     let rules = load_rules_for_scan(rules_file.as_deref());
+    let store_producer: Option<Arc<dyn StoreProducer>> = if cfg.persist_findings {
+        let producer = AppendLogStoreProducer::for_fs_scan(&cfg.root, &rules).map_err(|err| {
+            io::Error::other(format!(
+                "failed to initialize append-log persistence backend: {}",
+                err.detail()
+            ))
+        })?;
+        eprintln!(
+            "info: --persist-findings enabled; append-log root: {}",
+            producer.store_root().display()
+        );
+        Some(Arc::new(producer) as Arc<dyn StoreProducer>)
+    } else {
+        None
+    };
     let transforms = apply_transform_filter(demo_transforms(), transform_filter);
     let mut tuning = demo_tuning();
     if let Some(depth) = cfg.decode_depth {
@@ -113,9 +128,8 @@ fn run_fs(
         event_sink: Arc::clone(&event_sink),
         ..Default::default()
     };
-    if cfg.persist_findings {
-        eprintln!("WARNING: --persist-findings enabled but no persistence backend configured; findings will not be persisted");
-        ps_config.store_producer = Some(Arc::new(NullStoreProducer) as Arc<dyn StoreProducer>);
+    if let Some(producer) = store_producer {
+        ps_config.store_producer = Some(producer);
     }
     if cfg.no_archives {
         ps_config.archive.enabled = false;
