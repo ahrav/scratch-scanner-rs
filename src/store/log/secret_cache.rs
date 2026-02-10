@@ -43,6 +43,13 @@ const SECRET_HASH_CACHE_WAYS: usize = 2;
 /// Total slot count: sets × ways.
 const SECRET_HASH_CACHE_ENTRIES: usize = SECRET_HASH_CACHE_SETS * SECRET_HASH_CACHE_WAYS;
 
+/// Compile-time guarantee that `SETS` is a power of two (required for
+/// the bitmask `& (SETS - 1)` in `set_index`).
+const _: () = assert!(
+    SECRET_HASH_CACHE_SETS.is_power_of_two(),
+    "SECRET_HASH_CACHE_SETS must be a power of two"
+);
+
 /// A single cache entry pairing a 32-byte key with its 32-byte hashed value.
 ///
 /// `#[repr(C)]` guarantees `key` is at offset 0 and `value` at offset 32,
@@ -155,7 +162,7 @@ impl SecretHashCache {
     /// before masking to the set count.
     #[inline(always)]
     fn set_index(norm_hash: &[u8; 32]) -> usize {
-        debug_assert!(SECRET_HASH_CACHE_SETS.is_power_of_two());
+        // Power-of-two invariant checked at compile time (see const assertion above).
         let (a, rest) = norm_hash.split_first_chunk::<8>().unwrap();
         let (b, rest) = rest.split_first_chunk::<8>().unwrap();
         let (c, rest) = rest.split_first_chunk::<8>().unwrap();

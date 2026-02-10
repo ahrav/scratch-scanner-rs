@@ -132,12 +132,13 @@ Run-level loss accounting emitted once at scan end.
 ├──────────────────────────────────────┤
 │  dropped_findings: u64               │  ◄── engine cap drops
 │  persistence_emit_failures: u64      │  ◄── batch emit errors
-│  incomplete: bool                    │  ◄── should mark run partial?
+├──────────────────────────────────────┤
+│  fn incomplete(&self) -> bool        │  ◄── derived: any loss?
 └──────────────────────────────────────┘
 ```
 
-The backend uses `incomplete` to decide whether to mark the run as a
-complete scan or flag data loss.
+`incomplete()` is a derived method (not a stored field) that returns `true`
+when `dropped_findings > 0 || persistence_emit_failures > 0`.
 
 ### StoreProducer Trait
 
@@ -224,7 +225,7 @@ Invariants:
 
 #### Record Type Layouts
 
-**RunStart** (frame type `1`) — emitted once at the start of each segment.
+**RunStart** (frame type `1`) — emitted once at the start of the run (first segment).
 
 ```text
 offset  size   field
@@ -233,7 +234,7 @@ offset  size   field
  10     u64    started_unix_ms
  18     u8     durability            (0 = SegmentClose, 1 = Batch)
  19     u8     correlation_mode      (0 = Persistent, 1 = Ephemeral)
- 20     u8     key_source            (0 = EnvVar, 1 = Ephemeral)
+ 20     u8     key_source            (0 = EnvVar, 1 = MissingEnvVar, 2 = InvalidEnvVar)
  21     u32    max_inflight_batches
  25     u64    max_inflight_bytes
  33     u32    max_frame_payload_bytes
@@ -289,24 +290,26 @@ offset  size   field
                                      total: 25 bytes payload
 ```
 
-#### Segment Content Ordering
+#### Run Content Ordering
 
-A well-formed segment follows a strict frame sequence:
+A well-formed run (which may span multiple segments due to rotation) follows
+this frame sequence:
 
 ```text
 ┌──────────────────────────────────────────────────────────────┐
-│  RunStart       (1 frame)                                    │
+│  RunStart       (1 frame, first segment only)                │
 ├──────────────────────────────────────────────────────────────┤
 │  RuleDef        (N frames, sorted by fingerprint ascending)  │
 ├──────────────────────────────────────────────────────────────┤
 │  FindingBatch   (M frames, one per scanned object)           │
+│                 ← segment rotation may occur here →          │
 ├──────────────────────────────────────────────────────────────┤
-│  RunEnd         (1 frame)                                    │
+│  RunEnd         (1 frame, final segment only)                │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-The writer enforces this order. The reader decodes frames in whatever order
-they appear (no ordering validation).
+The writer enforces this order across segment boundaries. The reader decodes
+frames in whatever order they appear (no ordering validation).
 
 #### Segment Rotation
 

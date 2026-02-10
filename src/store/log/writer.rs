@@ -33,7 +33,7 @@
 //!
 //! # Segment lifecycle
 //!
-//! Files are created as `segment-NNNNN.open` and renamed to `.bin` on
+//! Files are created as `segment-<20-digit-seq>.open` and renamed to `.bin` on
 //! segment close (`sync_data` + rename + `sync_dir`). The writer rotates
 //! to a new segment when `bytes_written + frame_len > max_segment_bytes`.
 //! After a clean shutdown, no `.open` files remain.
@@ -133,9 +133,12 @@ impl Default for LogWriterConfig {
 ///
 /// [`record_fs_run_loss`](StoreProducer::record_fs_run_loss) must be called
 /// exactly once to close the run. It sends the `RunEnd` frame, joins the
-/// writer thread, and finalizes the last segment. Dropping the producer
-/// without calling `record_fs_run_loss` causes a best-effort finalization
-/// of the current segment (no `RunEnd` frame is written).
+/// writer thread, and finalizes the last segment.
+///
+/// If the producer is dropped without calling `record_fs_run_loss`, the
+/// `Drop` impl closes the channel and joins the writer thread, ensuring
+/// the current segment is finalized (no `RunEnd` frame is written in
+/// this case).
 pub struct AppendLogStoreProducer {
     inner: Arc<Inner>,
 }
@@ -193,7 +196,7 @@ impl AppendLogStoreProducer {
 
         Ok(Self {
             inner: Arc::new(Inner {
-                tx,
+                tx: Some(tx),
                 cfg,
                 run_id,
                 keys,
@@ -422,19 +425,44 @@ impl StoreProducer for AppendLogStoreProducer {
             charge_bytes: charge,
             flush_after,
         };
-        if let Err(err) = self.inner.tx.send(msg) {
-            let WriterCommand::FindingFrame {
-                frame,
-                charge_bytes,
-                ..
-            } = err.0
-            else {
-                unreachable!("emit_fs_batch only sends FindingFrame")
-            };
-            self.inner.finding_frame_pool.recycle(frame);
-            self.release_inflight(charge_bytes);
-            // The writer thread has exited — check for a terminal error
-            // that explains why.
+        let send_err = match self.inner.tx.as_ref() {
+            Some(tx) => {
+                match tx.send(msg) {
+                    Ok(()) => None,
+                    Err(err) => {
+                        // Recover the frame from the SendError.
+                        let WriterCommand::FindingFrame {
+                            frame,
+                            charge_bytes,
+                            ..
+                        } = err.0
+                        else {
+                            unreachable!("emit_fs_batch only sends FindingFrame")
+                        };
+                        self.inner.finding_frame_pool.recycle(frame);
+                        self.release_inflight(charge_bytes);
+                        Some(())
+                    }
+                }
+            }
+            None => {
+                // Channel already closed (Drop or record_fs_run_loss).
+                // `frame` is still in `msg` which we own, but it was moved
+                // into `msg` above. Recover it.
+                let WriterCommand::FindingFrame {
+                    frame,
+                    charge_bytes,
+                    ..
+                } = msg
+                else {
+                    unreachable!("emit_fs_batch only sends FindingFrame")
+                };
+                self.inner.finding_frame_pool.recycle(frame);
+                self.release_inflight(charge_bytes);
+                Some(())
+            }
+        };
+        if send_err.is_some() {
             return Err(terminal_result(&self.inner.shared)
                 .err()
                 .unwrap_or_else(|| {
@@ -474,7 +502,12 @@ impl StoreProducer for AppendLogStoreProducer {
             return terminal_result(&self.inner.shared);
         }
 
-        if self.inner.tx.send(WriterCommand::Finish { frame }).is_err() {
+        let send_ok = self
+            .inner
+            .tx
+            .as_ref()
+            .map_or(false, |tx| tx.send(WriterCommand::Finish { frame }).is_ok());
+        if !send_ok {
             set_terminal_error(
                 &self.inner.shared,
                 "failed to send run-end frame: writer channel disconnected".to_string(),
@@ -494,13 +527,31 @@ impl StoreProducer for AppendLogStoreProducer {
     }
 }
 
+/// Best-effort cleanup: close the channel so the writer thread sees a
+/// disconnect, then join it to ensure the segment is fully finalized
+/// before the process continues. If `record_fs_run_loss` was already
+/// called, both the sender and handle are `None` and this is a no-op.
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // Close the channel first so the writer thread's recv() returns Err.
+        self.tx.take();
+        // Now join the writer thread (it will finalize the segment).
+        if let Ok(mut guard) = self.writer_handle.lock() {
+            if let Some(handle) = guard.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
 /// Shared-ownership core behind [`AppendLogStoreProducer`].
 ///
 /// Split from the public struct so an `Arc<Inner>` can be handed to
 /// concurrent emitter threads and the writer-thread closure without
 /// exposing internals.
 struct Inner {
-    tx: Sender<WriterCommand>,
+    /// `None` after `Drop` or `record_fs_run_loss` closes the channel.
+    tx: Option<Sender<WriterCommand>>,
     cfg: LogWriterConfig,
     run_id: u64,
     keys: StoreKeys,
@@ -802,10 +853,12 @@ impl SegmentWriter {
             && self.bytes_written.saturating_add(frame_len) > self.max_segment_bytes
         {
             self.finalize_current()?;
-            self.seq = self
-                .seq
-                .checked_add(1)
-                .expect("segment sequence number overflow");
+            self.seq = self.seq.checked_add(1).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "segment sequence number overflow",
+                )
+            })?;
             let (file, open_path) = open_segment_file(&self.segments_dir, self.seq)?;
             self.file = file;
             self.open_path = open_path;
@@ -1030,10 +1083,9 @@ fn map_format_err(err: super::format::FormatError) -> FsStoreError {
 /// run directory.
 fn next_run_id() -> u64 {
     static RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
-    let t = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
+    let duration = SystemTime::now().duration_since(UNIX_EPOCH);
+    debug_assert!(duration.is_ok(), "system clock is before Unix epoch");
+    let t = duration.unwrap_or(Duration::ZERO).as_nanos() as u64;
     let c = RUN_COUNTER.fetch_add(1, Ordering::Relaxed);
     // Use wrapping_add instead of XOR: since time is monotonically
     // non-decreasing and the counter is strictly increasing, the sum
@@ -1043,10 +1095,9 @@ fn next_run_id() -> u64 {
 }
 
 fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    let duration = SystemTime::now().duration_since(UNIX_EPOCH);
+    debug_assert!(duration.is_ok(), "system clock is before Unix epoch");
+    duration.unwrap_or(Duration::ZERO).as_millis() as u64
 }
 
 /// Acquire the inflight-state lock, mapping poison to [`FsStoreError`].
@@ -2255,8 +2306,8 @@ mod tests {
     }
 
     /// PR Comment 3: next_run_id() uniqueness within a single process.
-    /// The XOR of truncated nanos with a monotonic counter should produce
-    /// unique IDs for sequential calls within the same process.
+    /// The wrapping_add of truncated nanos with a monotonic counter should
+    /// produce unique IDs for sequential calls within the same process.
     #[test]
     fn next_run_id_is_unique_within_process() {
         let mut ids = std::collections::HashSet::new();
@@ -2264,6 +2315,55 @@ mod tests {
             let id = next_run_id();
             assert!(ids.insert(id), "duplicate run_id detected: {id:#018x}");
         }
+    }
+
+    /// Drop must join the writer thread and finalize the segment without
+    /// requiring an explicit `record_fs_run_loss` call. Before the Drop
+    /// impl, the writer thread was detached and the test had to sleep.
+    #[test]
+    fn drop_joins_writer_thread_and_finalizes_segment() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = LogWriterConfig::for_root(tmp.path().to_path_buf());
+
+        let producer = AppendLogStoreProducer::new(&[simple_rule()], cfg.clone()).unwrap();
+        let findings = vec![sample_finding(0, 0)];
+        producer
+            .emit_fs_batch(FsFindingBatch {
+                object_path: b"drop-test.txt",
+                findings: &findings,
+            })
+            .unwrap();
+
+        // Drop the producer — this should join the writer thread synchronously.
+        drop(producer);
+
+        // No sleep needed: if Drop joins the thread, the segment is already
+        // finalized by the time we reach here.
+        let bins = list_finalized_segment_files(&cfg.root_dir).unwrap();
+        assert!(
+            !bins.is_empty(),
+            "expected finalized .bin segment after Drop (no sleep)"
+        );
+    }
+
+    #[test]
+    fn segment_sequence_overflow_returns_error_instead_of_panic() {
+        let tmp = TempDir::new().unwrap();
+        let segments_dir = tmp.path().join("segments");
+        let mut sw = SegmentWriter::new(segments_dir, 64).unwrap();
+
+        // Force the sequence counter to u64::MAX so the next rotation overflows.
+        sw.seq = u64::MAX;
+        // Write enough to fill the current segment, then write again to trigger rotation.
+        sw.file.write_all(&[0u8; 32]).unwrap();
+        sw.bytes_written = 32;
+
+        // This second write should trigger rotation (32 + 64 > 64),
+        // which increments seq from u64::MAX → overflow.
+        let result = sw.write_frame(&[0u8; 64], false);
+        assert!(result.is_err(), "expected error on sequence overflow, not panic");
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
     }
 
     /// Field-level round-trip: emit a batch with known values via the inline
@@ -2379,6 +2479,87 @@ mod tests {
         assert_eq!(fb.root_hint_end, 400);
         assert_eq!(fb.span_start, 310);
         assert_eq!(fb.span_end, 390);
+    }
+
+    /// Invalid rule_id in a finding should surface an error from
+    /// build_finding_frame, not panic or produce corrupt data.
+    #[test]
+    fn invalid_rule_id_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = LogWriterConfig::for_root(tmp.path().to_path_buf());
+
+        let producer = AppendLogStoreProducer::new(&[simple_rule()], cfg).unwrap();
+        // rule_id 99 doesn't exist — only rule 0 was registered.
+        let findings = vec![FsFindingRecord {
+            rule_id: 99,
+            root_hint_start: 0,
+            root_hint_end: 16,
+            span_start: 1,
+            span_end: 15,
+            norm_hash: [0xCC; 32],
+        }];
+        let err = producer
+            .emit_fs_batch(FsFindingBatch {
+                object_path: b"bad-rule.txt",
+                findings: &findings,
+            })
+            .unwrap_err();
+        assert!(
+            err.detail().contains("unknown rule_id"),
+            "expected 'unknown rule_id' error, got: {}",
+            err.detail()
+        );
+        producer.record_fs_run_loss(FsRunLoss::default()).unwrap();
+    }
+
+    /// plan_finding_frame checks: object_path too large to fit in u32.
+    #[test]
+    fn plan_finding_frame_rejects_oversized_object_path() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = LogWriterConfig::for_root(tmp.path().to_path_buf());
+        let producer = AppendLogStoreProducer::new(&[simple_rule()], cfg).unwrap();
+
+        // Use a payload that exceeds max_frame_payload_bytes.
+        let long_path = vec![b'x'; producer.inner.cfg.max_frame_payload_bytes as usize + 1];
+        let findings = vec![sample_finding(0, 0)];
+        let err = producer
+            .emit_fs_batch(FsFindingBatch {
+                object_path: &long_path,
+                findings: &findings,
+            })
+            .unwrap_err();
+        assert!(
+            err.detail().contains("too large") || err.detail().contains("FrameTooLarge"),
+            "expected size error, got: {}",
+            err.detail()
+        );
+        producer.record_fs_run_loss(FsRunLoss::default()).unwrap();
+    }
+
+    /// plan_finding_frame: findings count × record size overflows.
+    #[test]
+    fn plan_finding_frame_rejects_too_many_findings() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = LogWriterConfig::for_root(tmp.path().to_path_buf());
+        cfg.max_frame_payload_bytes = 512;
+        cfg.max_segment_bytes = 1024;
+        cfg.max_inflight_bytes = 16 * 1024 * 1024;
+
+        let producer = AppendLogStoreProducer::new(&[simple_rule()], cfg).unwrap();
+        // 4 findings × 132 bytes = 528 > 512 max_frame_payload_bytes
+        let findings: Vec<_> = (0..4).map(|i| sample_finding(0, i * 100)).collect();
+        let err = producer
+            .emit_fs_batch(FsFindingBatch {
+                object_path: b"many.txt",
+                findings: &findings,
+            })
+            .unwrap_err();
+        assert!(
+            err.detail().contains("FrameTooLarge") || err.detail().contains("too large"),
+            "expected frame too large error, got: {}",
+            err.detail()
+        );
+        producer.record_fs_run_loss(FsRunLoss::default()).unwrap();
     }
 
     #[test]

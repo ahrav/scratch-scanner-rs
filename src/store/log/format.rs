@@ -43,16 +43,18 @@ pub(crate) const FRAME_HEADER_BYTES: usize = 8;
 
 /// Frame discriminants written on disk.
 ///
-/// A well-formed segment always begins with [`RunStart`](Self::RunStart),
-/// followed by zero or more [`RuleDef`](Self::RuleDef) frames in sorted
-/// fingerprint order, then zero or more interleaved
-/// [`FindingBatch`](Self::FindingBatch) frames, and is sealed by a single
-/// [`RunEnd`](Self::RunEnd). The writer enforces this ordering; the reader
-/// does **not** — it decodes frames in whatever order they appear.
+/// A well-formed run begins with [`RunStart`](Self::RunStart) in the first
+/// segment, followed by zero or more [`RuleDef`](Self::RuleDef) frames in
+/// sorted fingerprint order, then zero or more interleaved
+/// [`FindingBatch`](Self::FindingBatch) frames (which may span multiple
+/// segments due to rotation), and is sealed by a single
+/// [`RunEnd`](Self::RunEnd) in the final segment. The writer enforces this
+/// ordering; the reader does **not** — it decodes frames in whatever order
+/// they appear.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum FrameType {
-    /// Run metadata emitted once at the start of every segment sequence.
+    /// Run metadata emitted once at the start of the run (first segment).
     RunStart = 1,
     /// Declares one detection rule active during this run. Emitted in
     /// ascending `rule_fingerprint` order immediately after `RunStart`.
@@ -103,16 +105,17 @@ impl LogDurabilityMode {
 
 /// Run-start metadata frame.
 ///
-/// Written once at the beginning of a segment sequence. Captures the writer
-/// configuration snapshot so that a reader can validate compatibility and
-/// reconstruct the backpressure parameters that were active during the run.
+/// Written once at the beginning of a run (first segment). Captures the
+/// writer configuration snapshot so that a reader can validate compatibility
+/// and reconstruct the backpressure parameters that were active during the
+/// run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogRunStart {
     /// Log format version ([`LOG_FORMAT_VERSION`]). Readers should reject
     /// segments whose version they do not support.
     pub version: u16,
     /// Unique identifier for this scan run, derived from wall-clock time
-    /// XOR'd with a monotonic counter.
+    /// combined with a monotonic counter via `wrapping_add`.
     pub run_id: u64,
     /// Wall-clock milliseconds since Unix epoch when the run began.
     pub started_unix_ms: u64,
@@ -203,8 +206,8 @@ pub struct LogFindingBatch {
 pub struct LogRunEnd {
     /// Wall-clock milliseconds since Unix epoch when the run ended.
     pub ended_unix_ms: u64,
-    /// Number of findings that the scanner produced but the persistence
-    /// layer was unable to emit (e.g. backpressure overflow).
+    /// Number of findings that the engine produced but were not persisted
+    /// (e.g. engine max-findings cap or scheduler-side filtering).
     pub dropped_findings: u64,
     /// Number of `emit_fs_batch` calls that returned an error from the
     /// persistence backend.
@@ -1392,6 +1395,54 @@ mod tests {
         assert_eq!(
             per_finding_bytes, 132,
             "per-finding on-disk size should be 132 bytes, got {per_finding_bytes}"
+        );
+    }
+
+    // ── decode_correlation_mode / decode_key_source invalid-value paths ──
+
+    #[test]
+    fn decode_correlation_mode_invalid_value_returns_error() {
+        for invalid in [2, 128, 255] {
+            let result = decode_correlation_mode(invalid, FrameType::RunStart);
+            assert!(
+                matches!(result, Err(FormatError::InvalidRecord { .. })),
+                "expected InvalidRecord for correlation_mode={invalid}, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_key_source_invalid_value_returns_error() {
+        for invalid in [3, 128, 255] {
+            let result = decode_key_source(invalid, FrameType::RunStart);
+            assert!(
+                matches!(result, Err(FormatError::InvalidRecord { .. })),
+                "expected InvalidRecord for key_source={invalid}, got {result:?}"
+            );
+        }
+    }
+
+    // ── LogRecordReader FrameTooLarge streaming path ────────────────────
+
+    #[test]
+    fn log_record_reader_frame_too_large_returns_error() {
+        // Craft a raw frame whose declared payload exceeds max_payload_bytes.
+        let max_payload: u32 = 256;
+        // frame_len = payload_len + 1 (type byte). Set payload_len > max_payload.
+        let frame_len: u32 = max_payload + 100 + 1;
+        let crc: u32 = 0; // doesn't matter, check happens before CRC
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&frame_len.to_le_bytes());
+        data.extend_from_slice(&crc.to_le_bytes());
+        // We don't need to write the body — the reader should reject before reading it.
+
+        let cursor = IoCursor::new(data);
+        let mut reader = LogRecordReader::new(cursor, max_payload);
+        let result = reader.next_record();
+        assert!(
+            matches!(result, Err(FormatError::FrameTooLarge { .. })),
+            "expected FrameTooLarge, got {result:?}"
         );
     }
 }
