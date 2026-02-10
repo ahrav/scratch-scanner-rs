@@ -13,7 +13,7 @@
 //!
 //! # Submodules
 //!
-//! - [`format`] — deterministic framed codec (legacy V1 + position-bound V2)
+//! - [`mod@format`] — deterministic framed codec (legacy V1 + position-bound V2)
 //!   for `RunStart`, `RuleDef`, `FindingBatch`, and `RunEnd` records, plus
 //!   V2 segment integrity trailers.
 //! - [`reader`] — streaming, position-tracking iterator over framed records
