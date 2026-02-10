@@ -94,7 +94,7 @@ fn writer_thread_io_error_surfaces_as_terminal_error() {
     // away while the writer is sleeping, then confirm the error surfaces.
     let tmp = TempDir::new().unwrap();
     let mut cfg = LogWriterConfig::for_root(tmp.path().to_path_buf());
-    cfg.max_segment_bytes = 300;
+    cfg.max_segment_bytes = 512;
     cfg.max_frame_payload_bytes = 250;
     cfg.max_inflight_batches = 4;
     cfg.max_inflight_bytes = 16 * 1024 * 1024;
