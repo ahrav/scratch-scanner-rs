@@ -322,6 +322,8 @@ pub struct WorkerMetricsLocal {
     pub read_ns: u64,
     /// Cumulative nanoseconds spent in scan_chunk_into (perf-stats only).
     pub scan_ns: u64,
+    /// Cumulative nanoseconds spent in persistence batch emission.
+    pub persist_ns: u64,
     /// Times worker yielded to OS scheduler (TieredIdle yield path).
     pub yield_count: u64,
     /// Files skipped because they appear to be binary.
@@ -366,6 +368,7 @@ impl WorkerMetricsLocal {
             open_stat_ns: 0,
             read_ns: 0,
             scan_ns: 0,
+            persist_ns: 0,
             yield_count: 0,
             binary_skipped: 0,
             binary_extracted: 0,
@@ -482,6 +485,8 @@ pub struct MetricsSnapshot {
     pub read_ns: u64,
     /// Cumulative nanoseconds spent in scan_chunk_into (always merged for diagnostics).
     pub scan_ns: u64,
+    /// Cumulative nanoseconds spent in persistence batch emission (always merged).
+    pub persist_ns: u64,
 
     /// Number of workers merged.
     pub worker_count: u32,
@@ -522,6 +527,7 @@ impl MetricsSnapshot {
             open_stat_ns: 0,
             read_ns: 0,
             scan_ns: 0,
+            persist_ns: 0,
             worker_count: 0,
             duration_ns: 0,
         }
@@ -555,6 +561,7 @@ impl MetricsSnapshot {
         self.open_stat_ns = self.open_stat_ns.wrapping_add(w.open_stat_ns);
         self.read_ns = self.read_ns.wrapping_add(w.read_ns);
         self.scan_ns = self.scan_ns.wrapping_add(w.scan_ns);
+        self.persist_ns = self.persist_ns.wrapping_add(w.persist_ns);
         self.idle_spins = self.idle_spins.wrapping_add(w.idle_spins);
         self.park_count = self.park_count.wrapping_add(w.park_count);
         self.yield_count = self.yield_count.wrapping_add(w.yield_count);
