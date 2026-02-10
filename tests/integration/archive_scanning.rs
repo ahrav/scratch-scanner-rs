@@ -1964,3 +1964,105 @@ fn persistence_batches_emitted_for_zip_scan() {
     let losses = producer.losses();
     assert_eq!(losses.len(), 1, "expected exactly one run-loss record");
 }
+
+// ============================================================================
+// Sniff-based archive detection tests (no archive extension)
+// ============================================================================
+
+/// File with no archive extension but valid gzip magic should be detected via
+/// header sniffing and produce findings from archive expansion.
+#[test]
+fn sniff_detected_gzip_archive_emits_findings() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("data.bin"); // no .gz extension
+
+    let payload = payload_with_secret_at(5);
+    let gz_bytes = build_gz_bytes(&payload);
+    fs::write(&path, gz_bytes).unwrap();
+
+    let (out, report) = run_scan(vec![file_from_path(&path)], cfg_archives_enabled());
+    let findings = parse_findings(&out);
+
+    assert!(
+        !findings.is_empty(),
+        "expected finding from sniff-detected gzip; output: {out}"
+    );
+    assert!(
+        findings[0].path.contains("data.bin"),
+        "finding path should reference the original file: {}",
+        findings[0].path
+    );
+    assert_perf!(
+        report.metrics.archive.archives_seen > 0,
+        report.metrics.archive.archives_seen == 0,
+        "expected archives_seen > 0 for sniff-detected gzip; metrics={:?}",
+        report.metrics.archive
+    );
+}
+
+/// File with no archive extension but valid tar ustar header (>= 512 bytes)
+/// should be detected via header sniffing and produce findings.
+#[test]
+fn sniff_detected_tar_archive_emits_findings() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("payload.dat"); // no .tar extension
+
+    let tar_bytes = build_simple_tar("inner.txt", b"prefix SECRET suffix");
+    // Tar archive is always >= 512 bytes due to the header block.
+    assert!(
+        tar_bytes.len() >= TAR_BLOCK_LEN,
+        "tar must be >= 512 bytes for ustar detection"
+    );
+    fs::write(&path, tar_bytes).unwrap();
+
+    let (out, report) = run_scan(vec![file_from_path(&path)], cfg_archives_enabled());
+    let findings = parse_findings(&out);
+
+    assert!(
+        !findings.is_empty(),
+        "expected finding from sniff-detected tar; output: {out}"
+    );
+    assert!(
+        findings[0].path.contains("inner.txt"),
+        "finding path should reference the tar entry: {}",
+        findings[0].path
+    );
+    assert_perf!(
+        report.metrics.archive.archives_seen > 0,
+        report.metrics.archive.archives_seen == 0,
+        "expected archives_seen > 0 for sniff-detected tar; metrics={:?}",
+        report.metrics.archive
+    );
+}
+
+/// File with no archive extension but valid ZIP magic (PK\x03\x04) should be
+/// detected via header sniffing and produce findings.
+#[test]
+fn sniff_detected_zip_archive_emits_findings() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("bundle.dat"); // no .zip extension
+
+    let payload = payload_with_secret_at(2);
+    let zip_bytes = build_zip_single_stored_entry("secret.txt", &payload, false);
+    fs::write(&path, zip_bytes).unwrap();
+
+    let (out, report) = run_scan(vec![file_from_path(&path)], cfg_archives_enabled());
+    let findings = parse_findings(&out);
+
+    assert!(
+        !findings.is_empty(),
+        "expected finding from sniff-detected zip; output: {out}"
+    );
+    assert!(
+        findings[0].path.contains("secret.txt"),
+        "finding path should reference the zip entry: {}",
+        findings[0].path
+    );
+    assert_locator(&findings[0].path, 'z');
+    assert_perf!(
+        report.metrics.archive.archives_seen > 0,
+        report.metrics.archive.archives_seen == 0,
+        "expected archives_seen > 0 for sniff-detected zip; metrics={:?}",
+        report.metrics.archive
+    );
+}

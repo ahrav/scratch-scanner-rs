@@ -2722,4 +2722,151 @@ mod tests {
 
         Ok(())
     }
+
+    /// Sniff-detected gzip archive should emit actual findings, not just
+    /// increment a counter. This tests the full chain: I/O thread sniff ->
+    /// archive channel send -> archive_worker_loop -> scan_gzip_stream ->
+    /// finding emission.
+    #[test]
+    fn uring_sniff_detected_gzip_emits_findings() -> io::Result<()> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let engine = Arc::new(MockEngine::with_tuning(
+            vec![MockRule {
+                name: "secret".into(),
+                pattern: b"SECRET".to_vec(),
+            }],
+            6,
+            EngineTuning {
+                max_findings_per_chunk: 128,
+                max_rules: 16,
+            },
+        ));
+
+        let dir = tempdir()?;
+        // No archive extension — must be discovered via magic byte sniffing.
+        let file_path = dir.path().join("mystery.dat");
+        let payload = b"prefix SECRET suffix";
+        let mut gz_bytes = Vec::new();
+        {
+            let mut enc = GzEncoder::new(&mut gz_bytes, Compression::default());
+            std::io::Write::write_all(&mut enc, payload).unwrap();
+            enc.finish().unwrap();
+        }
+        std::fs::write(&file_path, &gz_bytes)?;
+
+        let sink = Arc::new(VecEventSink::new());
+        let cfg = LocalFsUringConfig {
+            cpu_workers: 2,
+            io_threads: 1,
+            ring_entries: 64,
+            io_depth: 16,
+            chunk_size: 64,
+            max_in_flight_files: 8,
+            file_queue_cap: 8,
+            pool_buffers: 32,
+            use_registered_buffers: false,
+            open_stat_mode: OpenStatMode::BlockingOnly,
+            resolve_policy: ResolvePolicy::Default,
+            follow_symlinks: false,
+            max_file_size: None,
+            seed: 123,
+            dedupe_within_chunk: true,
+            pin_threads: false,
+            skip_binary: false,
+            archive: ArchiveConfig::default(), // enabled=true
+        };
+
+        let (_summary, io_stats, _cpu_metrics) =
+            scan_local_fs_uring(engine, &[dir.path().to_path_buf()], cfg, sink.clone())?;
+
+        assert!(
+            io_stats.archives_sniffed >= 1,
+            "expected archives_sniffed >= 1, got {}",
+            io_stats.archives_sniffed
+        );
+
+        let out = sink.take();
+        let out_str = String::from_utf8_lossy(&out);
+        assert!(
+            out_str.contains("secret"),
+            "expected finding from sniff-detected gzip archive; output: {out_str}"
+        );
+
+        Ok(())
+    }
+
+    /// Extension-routed archive from discovery should emit actual findings.
+    /// Files with recognized archive extensions bypass I/O threads entirely
+    /// and go directly to archive workers.
+    #[test]
+    fn uring_extension_routed_archive_emits_findings() -> io::Result<()> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let engine = Arc::new(MockEngine::with_tuning(
+            vec![MockRule {
+                name: "secret".into(),
+                pattern: b"SECRET".to_vec(),
+            }],
+            6,
+            EngineTuning {
+                max_findings_per_chunk: 128,
+                max_rules: 16,
+            },
+        ));
+
+        let dir = tempdir()?;
+        // Recognized archive extension — routed at discovery time.
+        let file_path = dir.path().join("secret.gz");
+        let payload = b"padding SECRET padding";
+        let mut gz_bytes = Vec::new();
+        {
+            let mut enc = GzEncoder::new(&mut gz_bytes, Compression::default());
+            std::io::Write::write_all(&mut enc, payload).unwrap();
+            enc.finish().unwrap();
+        }
+        std::fs::write(&file_path, &gz_bytes)?;
+
+        let sink = Arc::new(VecEventSink::new());
+        let cfg = LocalFsUringConfig {
+            cpu_workers: 2,
+            io_threads: 1,
+            ring_entries: 64,
+            io_depth: 16,
+            chunk_size: 64,
+            max_in_flight_files: 8,
+            file_queue_cap: 8,
+            pool_buffers: 32,
+            use_registered_buffers: false,
+            open_stat_mode: OpenStatMode::BlockingOnly,
+            resolve_policy: ResolvePolicy::Default,
+            follow_symlinks: false,
+            max_file_size: None,
+            seed: 123,
+            dedupe_within_chunk: true,
+            pin_threads: false,
+            skip_binary: false,
+            archive: ArchiveConfig::default(), // enabled=true
+        };
+
+        let (summary, _io_stats, _cpu_metrics) =
+            scan_local_fs_uring(engine, &[dir.path().to_path_buf()], cfg, sink.clone())?;
+
+        assert!(
+            summary.archives_routed >= 1,
+            "expected archives_routed >= 1, got {}",
+            summary.archives_routed
+        );
+
+        let out = sink.take();
+        let out_str = String::from_utf8_lossy(&out);
+        assert!(
+            out_str.contains("secret"),
+            "expected finding from extension-routed archive; output: {out_str}"
+        );
+
+        Ok(())
+    }
 }

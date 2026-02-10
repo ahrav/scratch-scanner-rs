@@ -4274,4 +4274,158 @@ mod tests {
         assert_eq!(rec.span_end, 190);
         assert_eq!(rec.norm_hash, [0xDE; 32]);
     }
+
+    // ------------------------------------------------------------------
+    // StackMsg UTF-8 boundary truncation
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn stack_msg_truncates_at_utf8_boundary_3byte() {
+        use std::fmt::Write;
+        // ☃ is U+2603, encoded as 3 bytes (E2 98 83).
+        // A StackMsg<5> has room for 5 bytes. "ab" = 2 bytes, then 3 bytes
+        // remaining — exactly enough for ☃. Verify it fits.
+        let mut msg = StackMsg::<5>::new();
+        write!(msg, "ab☃").unwrap();
+        assert_eq!(msg.as_str(), "ab☃");
+
+        // A StackMsg<4> has room for 4 bytes. "ab" = 2 bytes, then only 2
+        // bytes remaining — not enough for a 3-byte character. The snowman
+        // must be dropped entirely to preserve UTF-8 validity.
+        let mut msg = StackMsg::<4>::new();
+        write!(msg, "ab☃").unwrap();
+        assert_eq!(msg.as_str(), "ab");
+    }
+
+    #[test]
+    fn stack_msg_truncates_at_utf8_boundary_2byte() {
+        use std::fmt::Write;
+        // é is U+00E9, encoded as 2 bytes (C3 A9).
+        // StackMsg<4>: "abc" = 3 bytes, 1 remaining — can't fit 2-byte char.
+        let mut msg = StackMsg::<4>::new();
+        write!(msg, "abcé").unwrap();
+        assert_eq!(msg.as_str(), "abc");
+    }
+
+    #[test]
+    fn stack_msg_truncates_at_utf8_boundary_4byte() {
+        use std::fmt::Write;
+        // 𝄞 is U+1D11E (musical symbol), encoded as 4 bytes (F0 9D 84 9E).
+        // StackMsg<5>: "a" = 1 byte, 4 remaining — exactly fits.
+        let mut msg = StackMsg::<5>::new();
+        write!(msg, "a𝄞").unwrap();
+        assert_eq!(msg.as_str(), "a𝄞");
+
+        // StackMsg<4>: "a" = 1 byte, 3 remaining — can't fit 4-byte char.
+        let mut msg = StackMsg::<4>::new();
+        write!(msg, "a𝄞").unwrap();
+        assert_eq!(msg.as_str(), "a");
+    }
+
+    #[test]
+    fn stack_msg_exact_fill_multibyte() {
+        use std::fmt::Write;
+        // Two 3-byte chars = 6 bytes, exactly fills StackMsg<6>.
+        let mut msg = StackMsg::<6>::new();
+        write!(msg, "☃☃").unwrap();
+        assert_eq!(msg.as_str(), "☃☃");
+    }
+
+    #[test]
+    fn stack_msg_sequential_writes_respect_boundary() {
+        use std::fmt::Write;
+        // First write fills 3 bytes, second write has only 1 byte remaining
+        // and must drop the 2-byte é.
+        let mut msg = StackMsg::<4>::new();
+        write!(msg, "abc").unwrap();
+        write!(msg, "é").unwrap();
+        assert_eq!(msg.as_str(), "abc");
+    }
+
+    // ---------------------------------------------------------------
+    // First-read dual-use: preloaded + overlap carry interaction
+    // ---------------------------------------------------------------
+
+    /// The preloaded first chunk must interact correctly with the overlap
+    /// carry loop. A secret straddling the boundary between the preloaded
+    /// chunk and the second read must be found exactly once.
+    #[test]
+    fn preloaded_first_chunk_overlap_carry_finds_boundary_secret() {
+        let engine = Arc::new(test_engine());
+        let sink = Arc::new(VecEventSink::new());
+
+        // chunk_size=100, overlap=16.  Place SECRET at position 97 so it
+        // spans the boundary between the preloaded first chunk ([0..100))
+        // and the second chunk.  The preloaded path sets carry=16 from
+        // bytes [84..100) of the first read.  The overlap must correctly
+        // deliver bytes [84..100)+[100..200) so SECRET at [97..103) is
+        // found.
+        let mut data = vec![b'A'; 97];
+        data.extend_from_slice(b"SECRET");
+        data.extend_from_slice(&vec![b'B'; 100]); // ensure second chunk read
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&data).unwrap();
+        tmp.flush().unwrap();
+
+        let path = tmp.path().to_path_buf();
+        let size = tmp.as_file().metadata().unwrap().len();
+
+        let source = VecFileSource::new(vec![LocalFile { path, size }]);
+        let mut cfg = small_config_with_sink(sink.clone());
+        cfg.workers = 1;
+        cfg.chunk_size = 100;
+        // overlap remains 16 (from test_engine)
+
+        let report = scan_local(engine, source, cfg);
+
+        assert!(
+            report.metrics.chunks_scanned >= 2,
+            "expected >= 2 chunks, got {}",
+            report.metrics.chunks_scanned
+        );
+        let output = sink.take();
+        let output_str = String::from_utf8_lossy(&output);
+        let count = output_str.matches("secret").count();
+        assert_eq!(
+            count, 1,
+            "SECRET spanning preloaded boundary should be found exactly once, got {count}: {output_str}"
+        );
+    }
+
+    /// A file smaller than TAR_BLOCK_LEN (512 bytes) must scan normally
+    /// and not be misidentified as an archive when archive sniffing is
+    /// enabled.
+    #[test]
+    fn small_file_below_tar_block_len_scans_normally() {
+        let engine = Arc::new(test_engine());
+        let sink = Arc::new(VecEventSink::new());
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("tiny.txt");
+        // 100-byte text file containing SECRET (well below 512 TAR_BLOCK_LEN)
+        let mut data = vec![b'A'; 50];
+        data.extend_from_slice(b"SECRET");
+        data.resize(100, b'z');
+        fs::write(&path, &data).unwrap();
+        let size = fs::metadata(&path).unwrap().len();
+
+        let source = VecFileSource::new(vec![LocalFile {
+            path,
+            size,
+        }]);
+        let mut cfg = small_config_with_sink(sink.clone());
+        cfg.archive.enabled = true;
+
+        let report = scan_local(engine, source, cfg);
+
+        // File should be scanned as text, not routed as archive.
+        let output = sink.take();
+        let output_str = String::from_utf8_lossy(&output);
+        assert!(
+            output_str.contains("secret"),
+            "small file should be scanned and find SECRET; output: {output_str}"
+        );
+        assert_perf_u64(report.metrics.archive.archives_seen, 0);
+    }
 }

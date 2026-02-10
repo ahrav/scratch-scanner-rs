@@ -111,7 +111,7 @@ pub struct ExecutorConfig {
     /// Longer = less OS scheduling overhead.
     pub park_timeout: Duration,
 
-    /// Try to pin each worker to a core (requires `affinity` feature).
+    /// Try to pin each worker to a core (Linux only).
     pub pin_threads: bool,
 }
 
