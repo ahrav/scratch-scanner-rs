@@ -75,7 +75,7 @@ pub const SCANNER_FS_LOG_DIR_ENV: &str = "SCANNER_FS_LOG_DIR";
 ///
 /// All budget and size fields are validated at construction time by
 /// [`validate_config`]. The cross-field invariant
-/// `max_frame_payload_bytes + FRAME_HEADER_BYTES <= max_segment_bytes`
+/// `max_frame_payload_bytes + FRAME_HEADER_BYTES + 1 <= max_segment_bytes`
 /// is enforced so that no single frame can exceed a segment.
 #[derive(Clone, Debug)]
 pub struct LogWriterConfig {
@@ -917,9 +917,9 @@ fn build_run_start(cfg: &LogWriterConfig, keys: &StoreKeys, run_id: u64) -> LogR
 /// Reject obviously invalid configurations at construction time.
 ///
 /// Beyond per-field zero checks, enforces the cross-field invariant that
-/// the largest possible frame (`max_frame_payload_bytes + FRAME_HEADER_BYTES`)
-/// must fit inside a single segment. Without this check, the writer would
-/// fail on the very first frame write.
+/// the largest possible frame (`max_frame_payload_bytes + FRAME_HEADER_BYTES + 1`)
+/// must fit inside a single segment (`+1` is the required frame type byte).
+/// Without this check, the writer would fail on the first max-sized frame.
 fn validate_config(cfg: &LogWriterConfig) -> Result<(), FsStoreError> {
     if cfg.max_inflight_batches == 0 {
         return Err(FsStoreError::backend(
@@ -946,11 +946,11 @@ fn validate_config(cfg: &LogWriterConfig) -> Result<(), FsStoreError> {
             "max_inflight_batches exceeds u32::MAX (wire format limit)",
         ));
     }
-    if (cfg.max_frame_payload_bytes as u64 + super::format::FRAME_HEADER_BYTES as u64)
+    if (cfg.max_frame_payload_bytes as u64 + super::format::FRAME_HEADER_BYTES as u64 + 1)
         > cfg.max_segment_bytes
     {
         return Err(FsStoreError::backend(
-            "max_frame_payload_bytes + frame header exceeds max_segment_bytes; \
+            "max_frame_payload_bytes + frame header + frame type exceeds max_segment_bytes; \
              no frame could ever be written",
         ));
     }
@@ -1511,8 +1511,8 @@ mod tests {
 
     #[test]
     fn config_frame_payload_larger_than_segment_rejected_at_construction() {
-        // max_frame_payload_bytes + header must not exceed max_segment_bytes;
-        // validate_config rejects this at construction time.
+        // max_frame_payload_bytes + header + type byte must not exceed
+        // max_segment_bytes; validate_config rejects this at construction time.
         let tmp = TempDir::new().unwrap();
         let mut cfg = LogWriterConfig::for_root(tmp.path().to_path_buf());
         cfg.max_frame_payload_bytes = 10_000;
@@ -1525,6 +1525,25 @@ mod tests {
             err.detail().contains("max_frame_payload_bytes")
                 || err.detail().contains("max_segment_bytes"),
             "expected config validation error about frame/segment size, got: {}",
+            err.detail()
+        );
+    }
+
+    #[test]
+    fn config_rejects_segment_that_cannot_fit_frame_type_byte() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = LogWriterConfig::for_root(tmp.path().to_path_buf());
+        cfg.max_frame_payload_bytes = 1_024;
+        cfg.max_segment_bytes = cfg.max_frame_payload_bytes as u64 + FRAME_HEADER_BYTES as u64;
+
+        let err = AppendLogStoreProducer::new(&[simple_rule()], cfg)
+            .err()
+            .expect("expected config validation error");
+        assert!(
+            err.detail().contains("max_frame_payload_bytes")
+                || err.detail().contains("max_segment_bytes")
+                || err.detail().contains("frame header"),
+            "expected frame/segment validation error, got: {}",
             err.detail()
         );
     }
@@ -2245,6 +2264,121 @@ mod tests {
             let id = next_run_id();
             assert!(ids.insert(id), "duplicate run_id detected: {id:#018x}");
         }
+    }
+
+    /// Field-level round-trip: emit a batch with known values via the inline
+    /// encoder (`build_finding_frame`), read back from disk, and verify every
+    /// decoded `LogFindingRecord` field matches the independently-computed
+    /// expected value. This closes the coverage gap between the inline encoder
+    /// and `encode_finding_batch` (format.rs) paths.
+    #[test]
+    fn finding_frame_field_level_round_trip() {
+        use crate::store::identity::{rule_fingerprint as compute_rule_fp, secret_hash};
+        use crate::store::log::format::{LogFindingBatch as DecodedBatch, LogRecord};
+
+        let tmp = TempDir::new().unwrap();
+        let cfg = LogWriterConfig::for_root(tmp.path().to_path_buf());
+        let max_payload = cfg.max_frame_payload_bytes;
+        let rules = [simple_rule()];
+
+        let producer = AppendLogStoreProducer::new(&rules, cfg.clone()).unwrap();
+        let keys = &producer.inner.keys;
+
+        // Compute expected derived values independently.
+        let expected_rule_fp = compute_rule_fp(&rules[0], keys);
+        let norm_hash_a: [u8; 32] = [0xAA; 32];
+        let norm_hash_b: [u8; 32] = [0xBB; 32];
+        let expected_secret_a = secret_hash(&norm_hash_a, keys);
+        let expected_secret_b = secret_hash(&norm_hash_b, keys);
+
+        // Use non-trivial, distinct field values to catch transposition bugs.
+        let findings = vec![
+            FsFindingRecord {
+                rule_id: 0,
+                root_hint_start: 100,
+                root_hint_end: 200,
+                span_start: 110,
+                span_end: 190,
+                norm_hash: norm_hash_a,
+            },
+            FsFindingRecord {
+                rule_id: 0,
+                root_hint_start: 300,
+                root_hint_end: 400,
+                span_start: 310,
+                span_end: 390,
+                norm_hash: norm_hash_b,
+            },
+        ];
+
+        let object_path = b"test/round-trip.txt";
+
+        // Compute expected finding_ids independently using the same derivation.
+        let prefix_hasher = finding_id_prefix_hasher(
+            keys.metadata_key(),
+            object_path.len() as u32,
+            object_path,
+        );
+        let expected_finding_id_a = derive_finding_id(
+            &prefix_hasher,
+            &findings[0],
+            &expected_rule_fp,
+            &expected_secret_a,
+        );
+        let expected_finding_id_b = derive_finding_id(
+            &prefix_hasher,
+            &findings[1],
+            &expected_rule_fp,
+            &expected_secret_b,
+        );
+
+        producer
+            .emit_fs_batch(FsFindingBatch {
+                object_path,
+                findings: &findings,
+            })
+            .unwrap();
+        producer.record_fs_run_loss(FsRunLoss::default()).unwrap();
+
+        // Read back and decode.
+        let bins = list_finalized_segment_files(&cfg.root_dir).unwrap();
+        let mut decoded_batches: Vec<DecodedBatch> = Vec::new();
+        for bin in &bins {
+            let f = File::open(bin).unwrap();
+            let mut reader = LogRecordReader::new(f, max_payload);
+            while let Some(rec) = reader.next_record().unwrap() {
+                if let LogRecord::FindingBatch(batch) = rec {
+                    decoded_batches.push(batch);
+                }
+            }
+        }
+
+        assert_eq!(decoded_batches.len(), 1, "expected exactly one finding batch");
+        let batch = &decoded_batches[0];
+        assert_eq!(batch.object_path, object_path);
+        assert_eq!(batch.findings.len(), 2);
+
+        // Finding A: verify every field.
+        let fa = &batch.findings[0];
+        assert_eq!(fa.rule_id, 0);
+        assert_eq!(fa.rule_fingerprint, expected_rule_fp, "rule_fingerprint mismatch (finding A)");
+        assert_eq!(fa.secret_hash, expected_secret_a, "secret_hash mismatch (finding A)");
+        assert_eq!(fa.finding_id, expected_finding_id_a, "finding_id mismatch (finding A)");
+        assert_eq!(fa.root_hint_start, 100);
+        assert_eq!(fa.root_hint_end, 200);
+        assert_eq!(fa.span_start, 110);
+        assert_eq!(fa.span_end, 190);
+
+        // Finding B: verify every field.
+        let fb = &batch.findings[1];
+        assert_eq!(fb.rule_id, 0);
+        assert_eq!(fb.rule_fingerprint, expected_rule_fp, "rule_fingerprint mismatch (finding B)");
+        assert_eq!(fb.secret_hash, expected_secret_b, "secret_hash mismatch (finding B)");
+        assert_eq!(fb.finding_id, expected_finding_id_b, "finding_id mismatch (finding B)");
+        assert_eq!(fb.root_hint_start, 300);
+        assert_eq!(fb.root_hint_end, 400);
+        assert_eq!(fb.span_start, 310);
+        assert_eq!(fb.span_end, 390);
     }
 
     #[test]
