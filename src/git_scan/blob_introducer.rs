@@ -150,9 +150,15 @@ impl SeenSets {
     }
 }
 
+/// Single slot in the [`LooseOidSet`] open-addressing hash table.
+///
+/// The `occupied` flag distinguishes empty slots from populated ones because
+/// a zeroed `OidBytes` is a valid (if unlikely) key — the tag alone cannot
+/// distinguish "never written" from "written with tag 0".
 #[derive(Clone, Copy, Debug)]
 struct LooseEntry {
     key: OidBytes,
+    /// High byte of the hash; used for early rejection before full OID compare.
     tag: u8,
     occupied: bool,
 }
@@ -367,7 +373,12 @@ impl PathBuilder {
     }
 }
 
-/// Buffered tree cursor with cached parsing, used for small trees.
+/// Buffered tree cursor that holds the entire tree payload in memory.
+///
+/// Used for small trees (below `stream_threshold`) where the full payload
+/// fits comfortably in the in-flight byte budget. Supports peek/advance
+/// iteration with a one-entry lookahead cache: `peek_entry` parses and
+/// caches the next entry; `advance` consumes it by bumping `pos`.
 struct BufferedCursor {
     bytes: TreeBytes,
     pos: usize,
@@ -469,8 +480,14 @@ impl TreeCursor {
     }
 }
 
+/// One level of the depth-first tree walk stack.
+///
+/// Each frame owns a [`TreeCursor`] for the tree at that depth and records
+/// the tree's in-flight byte contribution so it can be subtracted from the
+/// budget when the frame is popped.
 struct TreeFrame {
     cursor: TreeCursor,
+    /// Bytes charged to the in-flight budget for this tree.
     in_flight_len: u64,
 }
 
@@ -1062,6 +1079,10 @@ impl<'a> BlobIntroWorker<'a> {
 }
 
 /// Merged results from parallel blob introduction.
+///
+/// All per-worker candidate lists are concatenated and (for loose) deduplicated.
+/// The `path_arena` owns every path byte referenced by `ByteRef` handles in
+/// `packed` and `loose` — it must outlive any downstream consumer.
 pub(super) struct ParallelIntroResult {
     pub packed: Vec<PackCandidate>,
     pub loose: Vec<LooseCandidate>,
@@ -1165,6 +1186,13 @@ pub(super) fn introduce_parallel<'a>(
 
     let auto_cache_fn = super::runner_exec::auto_tree_delta_cache_bytes;
 
+    // Create core assigner for thread pinning (Linux only; None elsewhere).
+    let core_assigner = if config.pin_threads {
+        crate::scheduler::affinity::CoreAssigner::new()
+    } else {
+        None
+    };
+
     // Spawn workers with std::thread::scope.
     let results: Vec<Result<WorkerResult, TreeDiffError>> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..worker_count)
@@ -1174,8 +1202,12 @@ pub(super) fn introduce_parallel<'a>(
                 let abort = &abort;
                 let seen = &seen;
                 let per_worker_limits = &per_worker_limits;
+                let core_assigner = &core_assigner;
 
                 s.spawn(move || {
+                    if let Some(ref a) = core_assigner {
+                        a.pin_current_thread();
+                    }
                     // Per-worker ObjectStore.
                     let auto_cache_bytes =
                         auto_cache_fn(object_count, per_worker_limits.max_tree_delta_cache_bytes);
@@ -1273,8 +1305,15 @@ pub(super) fn introduce_parallel<'a>(
 
 /// Merge per-worker introduction outputs and enforce global candidate/arena caps.
 ///
-/// The merged path arena is created with `path_arena_capacity` so parallel
-/// mode honors the same global arena budget as the serial collector path.
+/// Worker results are concatenated in order. Each worker's path arena is
+/// appended to a single merged arena, and every candidate's `path_ref.off`
+/// is rebased by the arena offset at the time of append. If the combined
+/// arena exceeds `path_arena_capacity`, returns [`TreeDiffError::PathArenaFull`].
+///
+/// Loose candidates are deduplicated by OID with deterministic context
+/// tie-breakers (see [`dedup_loose_by_oid`]). After dedup, the merged totals
+/// are re-validated against `max_packed` and `max_loose` because per-worker
+/// limits are approximate divisions of the global budget.
 fn merge_worker_results(
     worker_results: Vec<WorkerResult>,
     path_arena_capacity: u32,
@@ -1369,7 +1408,11 @@ fn merge_worker_results(
 
 /// Returns the loose-candidate budget used by each parallel worker.
 ///
-/// The returned value is always in `0..=max_loose`.
+/// Divides `max_loose` by `worker_count` with ceiling division so no
+/// candidates are lost to rounding. The result is clamped to `[1, max_loose]`
+/// (with a special-case `0` when `max_loose` is zero). Post-merge validation
+/// in [`merge_worker_results`] catches cases where the per-worker budgets
+/// sum to more than the global cap.
 fn per_worker_loose_limit(max_loose: u32, worker_count: usize) -> u32 {
     if max_loose == 0 {
         return 0;

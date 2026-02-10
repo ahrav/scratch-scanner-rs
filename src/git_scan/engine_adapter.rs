@@ -175,10 +175,8 @@ pub struct EngineAdapter<'a> {
     /// When `true`, skip the binary content check and scan everything.
     scan_binary: bool,
     /// Reusable buffer for binary format text extraction.
-    #[cfg(feature = "binary-extract")]
     extract_buf: Vec<u8>,
     /// Temporary workspace for extractors (e.g. per-entry reads in JARs).
-    #[cfg(feature = "binary-extract")]
     extract_scratch: Vec<u8>,
 }
 
@@ -217,9 +215,7 @@ impl<'a> EngineAdapter<'a> {
             next_file_id: 0,
             event_sink,
             scan_binary: config.scan_binary,
-            #[cfg(feature = "binary-extract")]
             extract_buf: Vec::with_capacity(crate::content_policy::extract::EXTRACT_OUTPUT_CAP),
-            #[cfg(feature = "binary-extract")]
             extract_scratch: Vec::with_capacity(crate::content_policy::extract::JAR_ENTRY_CAP),
         }
     }
@@ -323,8 +319,7 @@ impl<'a> EngineAdapter<'a> {
     /// When `scan_binary` is false the blob is classified via
     /// [`content_policy::classify_content`]. Text blobs are scanned directly;
     /// extractable binary formats (`.class`, `.pyc`, etc.) have their text
-    /// extracted first (feature-gated on `binary-extract`); opaque binaries
-    /// are skipped entirely.
+    /// extracted first; opaque binaries are skipped entirely.
     ///
     /// On return, `self.findings_buf` contains the sorted+deduped findings
     /// for this blob. The caller is responsible for streaming them to the
@@ -342,28 +337,21 @@ impl<'a> EngineAdapter<'a> {
                     perf::record_scan_binary_skip();
                     return Ok(());
                 }
-                ContentVerdict::BinaryExtractable(_fmt) => {
-                    #[cfg(feature = "binary-extract")]
+                ContentVerdict::BinaryExtractable(fmt) => {
+                    use crate::content_policy::extract::{extract_content, ExtractResult};
+                    if extract_content(fmt, bytes, &mut self.extract_buf, &mut self.extract_scratch)
+                        == ExtractResult::Ok
                     {
-                        use crate::content_policy::extract::{extract_content, ExtractResult};
-                        if extract_content(
-                            _fmt,
-                            bytes,
-                            &mut self.extract_buf,
-                            &mut self.extract_scratch,
-                        ) == ExtractResult::Ok
-                        {
-                            perf::record_scan_binary_extract();
-                            return scan_blob_chunked_with_chunker(
-                                self.engine,
-                                &mut self.scratch,
-                                file_id,
-                                &self.extract_buf,
-                                self.overlap,
-                                &mut self.chunker,
-                                &mut self.findings_buf,
-                            );
-                        }
+                        perf::record_scan_binary_extract();
+                        return scan_blob_chunked_with_chunker(
+                            self.engine,
+                            &mut self.scratch,
+                            file_id,
+                            &self.extract_buf,
+                            self.overlap,
+                            &mut self.chunker,
+                            &mut self.findings_buf,
+                        );
                     }
                     perf::record_scan_binary_skip();
                     return Ok(());

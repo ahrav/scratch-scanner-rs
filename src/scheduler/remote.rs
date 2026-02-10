@@ -143,6 +143,9 @@ pub struct RemoteConfig {
 
     /// If true, deduplicate findings within each chunk.
     pub dedupe_within_chunk: bool,
+
+    /// Pin worker and I/O threads to CPU cores (Linux only, no-op elsewhere).
+    pub pin_threads: bool,
 }
 
 impl Default for RemoteConfig {
@@ -159,6 +162,7 @@ impl Default for RemoteConfig {
             max_object_time: Some(Duration::from_secs(30)),
             seed: 1,
             dedupe_within_chunk: true,
+            pin_threads: super::affinity::default_pin_threads(),
         }
     }
 }
@@ -408,6 +412,11 @@ struct CpuScratch {
 // ============================================================================
 
 /// In-place dedupe of findings by `(rule_id, root_hint, span)`.
+///
+/// `FindingRec` (mock engine stub) does not carry `norm_hash`, so this
+/// dedup key is a strict subset of the production path in `local_fs_owner`.
+/// See the note on `dedupe_pending_in_place` in `local_fs_uring.rs` for
+/// implications when porting to real engine findings.
 fn dedupe_pending_in_place(p: &mut Vec<FindingRec>) {
     if p.len() <= 1 {
         return;
@@ -440,6 +449,10 @@ fn dedupe_pending_in_place(p: &mut Vec<FindingRec>) {
 }
 
 /// Emit findings as structured events.
+///
+/// NOTE: Uses `SourceKind::Fs` because this module currently uses `MockEngine`
+/// for testing. When wired to a real remote backend, the source kind should
+/// be updated to reflect the actual origin (e.g., `SourceKind::Remote`).
 fn emit_findings(
     engine: &MockEngine,
     event_sink: &dyn EventSink,
@@ -845,6 +858,7 @@ pub fn scan_remote<B: RemoteBackend>(
         ExecutorConfig {
             workers: cfg.cpu_workers,
             seed: cfg.seed,
+            pin_threads: cfg.pin_threads,
             ..ExecutorConfig::default()
         },
         {
@@ -869,6 +883,11 @@ pub fn scan_remote<B: RemoteBackend>(
     let stop = Arc::new(AtomicBool::new(false));
 
     // Spawn I/O threads
+    let io_assigner = if cfg.pin_threads {
+        super::affinity::CoreAssigner::with_offset(cfg.cpu_workers).map(Arc::new)
+    } else {
+        None
+    };
     let mut io_threads = Vec::with_capacity(cfg.io_threads);
     for wid in 0..cfg.io_threads {
         let backend = Arc::clone(&backend);
@@ -877,10 +896,19 @@ pub fn scan_remote<B: RemoteBackend>(
         let cpu = cpu_handle.clone();
         let cfg2 = cfg.clone();
         let stop2 = Arc::clone(&stop);
+        let io_assigner_clone = io_assigner.clone();
 
-        io_threads.push(thread::spawn(move || {
-            io_worker_loop(wid, backend, rx, pool, cpu, cfg2, overlap, stop2)
-        }));
+        io_threads.push(
+            thread::Builder::new()
+                .name(format!("remote-io-{wid}"))
+                .spawn(move || {
+                    if let Some(ref a) = io_assigner_clone {
+                        a.pin_current_thread();
+                    }
+                    io_worker_loop(wid, backend, rx, pool, cpu, cfg2, overlap, stop2)
+                })
+                .expect("failed to spawn remote I/O thread"),
+        );
     }
     drop(rx); // Close our receiver; only I/O threads hold receivers now
 
@@ -1143,6 +1171,7 @@ mod tests {
             max_object_time: Some(Duration::from_secs(5)),
             seed: 42,
             dedupe_within_chunk: true,
+            pin_threads: false,
         }
     }
 

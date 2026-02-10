@@ -97,7 +97,8 @@ struct VsDb {
 impl VsDb {
     fn compile(patterns: &[&str], flags: &[u32]) -> Result<Self, String> {
         let c_patterns: Vec<CString> = patterns.iter().map(|p| CString::new(*p).unwrap()).collect();
-        let pattern_ptrs: Vec<*const i8> = c_patterns.iter().map(|p| p.as_ptr()).collect();
+        let pattern_ptrs: Vec<*const std::ffi::c_char> =
+            c_patterns.iter().map(|p| p.as_ptr()).collect();
         let ids: Vec<u32> = (0..patterns.len() as u32).collect();
 
         let mut db: *mut vs::hs_database_t = std::ptr::null_mut();
@@ -146,7 +147,7 @@ impl VsDb {
         let rc = unsafe {
             vs::hs_scan(
                 self.db,
-                data.as_ptr() as *const i8,
+                data.as_ptr() as *const std::ffi::c_char,
                 data.len() as u32,
                 0,
                 self.scratch,

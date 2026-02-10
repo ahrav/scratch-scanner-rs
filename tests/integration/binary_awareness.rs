@@ -5,7 +5,7 @@
 //! These tests exercise the FS scanning path's binary file skipping,
 //! binary text extraction, and the `--scan-binary` override behavior.
 //!
-//! Run with: `cargo test --test integration --features binary-extract`
+//! Run with: `cargo test --test integration`
 
 use scanner_rs::scheduler::engine_stub::{MockEngine, MockRule};
 use scanner_rs::scheduler::local_fs_owner::{scan_local, LocalConfig, LocalFile, VecFileSource};
@@ -160,7 +160,6 @@ fn fs_scan_text_files_not_skipped() {
 }
 
 /// .ipynb files should be detected as extractable and have their code cells scanned.
-#[cfg(feature = "binary-extract")]
 #[test]
 fn fs_scan_ipynb_extraction() {
     let dir = TempDir::new().unwrap();
@@ -193,7 +192,6 @@ fn fs_scan_ipynb_extraction() {
 }
 
 /// .class files should be detected as extractable and have their constant pool strings scanned.
-#[cfg(feature = "binary-extract")]
 #[test]
 fn fs_scan_java_class_extraction() {
     let dir = TempDir::new().unwrap();
@@ -230,8 +228,7 @@ fn fs_scan_java_class_extraction() {
 }
 
 /// .jar files should be detected as extractable and have embedded .class strings scanned.
-/// Archive scanning is disabled so the JAR goes through the binary-extract path.
-#[cfg(feature = "binary-extract")]
+/// Archive scanning is disabled so the JAR goes through the extraction path.
 #[test]
 fn fs_scan_jar_extraction() {
     let dir = TempDir::new().unwrap();
@@ -259,7 +256,7 @@ fn fs_scan_jar_extraction() {
     let size = std::fs::metadata(&jar_path).unwrap().len();
 
     let files = vec![lf(jar_path, size)];
-    // Disable archive scanning so the JAR hits the binary-extract path
+    // Disable archive scanning so the JAR hits the extraction path
     // (otherwise ZIP magic routes it through archive scanning instead).
     let mut cfg = default_cfg();
     cfg.archive.enabled = false;
@@ -278,7 +275,6 @@ fn fs_scan_jar_extraction() {
 }
 
 /// .pyc files should be detected as extractable and have their marshal strings scanned.
-#[cfg(feature = "binary-extract")]
 #[test]
 fn fs_scan_pyc_extraction() {
     let dir = TempDir::new().unwrap();
@@ -350,6 +346,39 @@ fn binary_skip_stats_correct() {
     assert_eq!(
         report.metrics.binary_skipped, 3,
         "expected 3 binary files skipped, got {}",
+        report.metrics.binary_skipped
+    );
+}
+
+/// Binary file with no archive magic should be classified as binary (not
+/// archive) when both archive sniffing and binary skipping are enabled.
+/// Validates the sequential logic: sniff first, binary check second.
+#[test]
+fn binary_file_classified_after_sniff_fails() {
+    let dir = TempDir::new().unwrap();
+
+    // Binary content: NUL bytes but no archive magic.
+    let bin_path = dir.path().join("data.bin");
+    std::fs::write(&bin_path, b"\x00\x01SECRET\x00\x02").unwrap();
+    let size = std::fs::metadata(&bin_path).unwrap().len();
+
+    let files = vec![lf(bin_path, size)];
+
+    let mut cfg = default_cfg();
+    cfg.archive.enabled = true;
+    cfg.skip_binary = true;
+
+    let (output, report) = run_scan_with_config(files, cfg);
+    let paths = finding_paths(&output);
+
+    // File should be skipped as binary, not routed as archive.
+    assert!(
+        paths.is_empty(),
+        "binary file with no archive magic should produce no findings: {output}"
+    );
+    assert!(
+        report.metrics.binary_skipped > 0,
+        "expected binary_skipped > 0, got {}",
         report.metrics.binary_skipped
     );
 }

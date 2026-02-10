@@ -59,6 +59,7 @@
 //! | Module | Purpose |
 //! |--------|---------|
 //! | [`count_budget`] | Integer-based permits (e.g., max concurrent fetches) |
+//! | `file_id_alloc` | Run-scoped `FileId` allocator for unique logical file boundaries |
 //! | [`findings`] | Per-worker finding buffers with dedup via [`SecretHash`] |
 //! | [`ts_buffer_pool`] | Thread-safe buffer recycling to avoid allocation churn |
 //! | [`ts_chunk`] | Thread-safe chunk wrapper for cross-thread handoff |
@@ -70,7 +71,7 @@
 //! |--------|---------|
 //! | [`local_fs_owner`] | Canonical local filesystem scanning path (chunked I/O + archive expansion) |
 //! | [`parallel_scan`] | High-level directory scanning with gitignore support |
-//! | [`local_fs_uring`] | Linux-only io_uring backend (feature `io-uring`) |
+//! | [`local_fs_uring`] | Linux-only io_uring backend (default on Linux) |
 //! | [`remote`] | HTTP/object-store backend with retry policies |
 //!
 //! ## Observability
@@ -192,12 +193,6 @@
 //!
 //! All unsafe blocks have documented invariants and are tested.
 //!
-//! # Feature Flags
-//!
-//! | Feature | Effect |
-//! |---------|--------|
-//! | `io-uring` | Enables [`local_fs_uring`] for async filesystem I/O on Linux |
-//!
 //! # Re-exports
 //!
 //! The crate root re-exports commonly used types so users can write
@@ -224,6 +219,8 @@ pub mod count_budget;
 pub mod engine_impl;
 pub mod engine_stub;
 pub mod engine_trait;
+#[cfg(any(target_os = "linux", test))]
+pub(crate) mod file_id_alloc;
 pub mod findings;
 pub mod ts_buffer_pool;
 pub mod ts_chunk;
@@ -232,7 +229,7 @@ pub mod worker_id;
 // I/O backends
 pub mod local_fs_owner;
 pub use local_fs_owner as local;
-#[cfg(all(target_os = "linux", feature = "io-uring"))]
+#[cfg(target_os = "linux")]
 pub mod local_fs_uring;
 pub mod parallel_scan;
 pub mod remote;
@@ -291,7 +288,7 @@ pub use worker_id::{current_worker_id, set_current_worker_id};
 pub use local_fs_owner::{
     scan_local, FileSource, LocalConfig, LocalFile, LocalReport, LocalStats, VecFileSource,
 };
-#[cfg(all(target_os = "linux", feature = "io-uring"))]
+#[cfg(target_os = "linux")]
 pub use local_fs_uring::{scan_local_fs_uring, LocalFsUringConfig, UringIoStats};
 pub use parallel_scan::{parallel_scan_dir, ParallelScanConfig, ParallelScanReport};
 pub use remote::{ErrorClass, RemoteBackend, RemoteConfig, RetryPolicy};
@@ -299,7 +296,7 @@ pub use remote::{ErrorClass, RemoteBackend, RemoteConfig, RetryPolicy};
 // Observability
 pub use affinity::{
     allowed_cpus, first_allowed_cpu, num_cpus, pin_current_thread_to_core, try_pin_to_core,
-    try_pin_to_first_allowed, CpuSet, CPU_SET_CAPACITY,
+    try_pin_to_first_allowed, CoreAssigner, CpuSet, CPU_SET_CAPACITY,
 };
 pub use alloc::{alloc_stats, AllocGuard, AllocStats, AllocStatsDelta, CountingAllocator};
 pub use bench::{

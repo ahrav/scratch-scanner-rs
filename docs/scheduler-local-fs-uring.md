@@ -4,16 +4,18 @@ The io_uring backend provides Linux-native asynchronous I/O for high-concurrency
 
 ## Module Purpose
 
-`src/scheduler/local_fs_uring.rs` implements Linux io_uring-based file scanning with work-stealing CPU executors. The module separates I/O and CPU work across dedicated thread pools:
+`src/scheduler/local_fs_uring.rs` implements Linux io_uring-based file scanning with work-stealing CPU executors. The module separates I/O, CPU, and archive work across dedicated thread pools:
 
 - **I/O threads** use io_uring to manage asynchronous reads with batched syscalls
 - **CPU threads** run the work-stealing executor to scan chunks and emit findings
+- **Archive worker threads** handle blocking decompression (gzip, tar, zip) off the I/O loop
 - **Buffer pool** transfers ownership: I/O threads acquire, CPU threads release
 
 The architecture emphasizes:
 - **High concurrency**: Hundreds of in-flight operations via efficient batch submission
 - **Work conservation**: Never drops discovered files; uses backpressure instead
 - **Correctness guarantees**: Chunk overlap, deduplication, exactly-once scanning semantics
+- **Minimal syscalls**: First-chunk classification folds archive/binary probing into the initial read
 - **Platform parity**: Single unified interface with blocking `local_fs_owner.rs` backend (`scan_local`)
 
 ## Why io_uring?
@@ -70,17 +72,25 @@ Traditional Blocking Reads:       io_uring Approach:
 flowchart TB
     subgraph Discovery["Discovery Phase (main thread)"]
         Source["roots: &[PathBuf]"]
-        Walk["DFS file walk<br/>symlink-safe"]
+        Walk["DFS file walk<br/>d_type from getdents64"]
         Budget["CountBudget<br/>max_in_flight_files"]
         Queue["Bounded channel<br/>file_queue_cap"]
+        ExtRoute["Extension-based<br/>archive routing"]
     end
 
     subgraph IoPool["I/O Worker Threads (io_threads)"]
         IOW1["I/O Worker 0<br/>io_uring ring"]
         IOW2["I/O Worker 1<br/>io_uring ring"]
         IOwN["I/O Worker N<br/>io_uring ring"]
+        Classify["First-chunk classification<br/>archive sniff + binary skip"]
         FileState["Per-file state:<br/>phase, size, overlap"]
         OpSlots["SQ/CQ slots<br/>io_depth entries"]
+    end
+
+    subgraph ArchivePool["Archive Worker Threads (cpu_workers/4)"]
+        AW1["Archive Worker 0<br/>decompress + scan"]
+        AWN["Archive Worker N<br/>decompress + scan"]
+        ArchiveChan["Bounded channel<br/>ArchiveWork items"]
     end
 
     subgraph BufferPool["Shared Buffer Pool<br/>(FixedBufferPool)"]
@@ -106,12 +116,20 @@ flowchart TB
 
     Source --> Walk
     Walk --> Budget
-    Budget --> Queue
+    Budget --> ExtRoute
+    ExtRoute -->|"known archive ext"| ArchiveChan
+    ExtRoute -->|"regular file"| Queue
     Queue --> IOW1 & IOW2 & IOwN
 
     IOW1 & IOW2 & IOwN --> BufAcq
     BufAcq --> OpSlots
-    OpSlots --> |"CQE completion"| Processing
+    OpSlots -->|"CQE completion"| Classify
+    Classify -->|"archive magic"| ArchiveChan
+    Classify -->|"binary"| BufRel
+    Classify -->|"text"| Processing
+
+    ArchiveChan --> AW1 & AWN
+    AW1 & AWN --> Emit
 
     Processing --> Scan
     Scan --> DropPrefix
@@ -123,6 +141,7 @@ flowchart TB
 
     style Discovery fill:#e3f2fd
     style IoPool fill:#fff3e0
+    style ArchivePool fill:#ffe0b2
     style BufferPool fill:#f3e5f5
     style CpuPool fill:#c8e6c9
     style Processing fill:#e8f5e9
@@ -221,11 +240,11 @@ Unlike `scan_local` in `local_fs_owner.rs`, this backend does not take a `FileSo
 `walk_and_send_files()`.
 
 **Discovery flow**:
-1. Main thread DFS-walks each root (`fs::symlink_metadata` or `fs::metadata` per `follow_symlinks`)
-2. For each regular file, increment `files_seen` and apply `max_file_size` filter
-3. Acquire a `CountBudget` permit (blocks when `max_in_flight_files` is reached)
-4. Wrap path + permit in `FileToken`, then send `FileWork` over bounded channel
-5. I/O workers keep the token alive until all chunk tasks for that file finish
+1. Main thread DFS-walks each root using `fs::read_dir` + `DirEntry::file_type()`. On Linux (ext4/xfs/btrfs), `file_type()` uses the `d_type` field from `getdents64` — **no per-file `statx` syscall** during discovery. This eliminated ~98K redundant `statx` calls observed in profiling.
+2. Files with known archive extensions (`.tar`, `.gz`, `.tar.gz`, `.zip`) are routed directly to archive workers via the archive channel, bypassing I/O threads entirely.
+3. Remaining regular files: acquire a `CountBudget` permit (blocks when `max_in_flight_files` is reached), wrap path + permit in `FileToken`, send `FileWork` over bounded channel.
+4. I/O workers keep the token alive until all chunk tasks for that file finish.
+5. Size filtering is deferred to the I/O thread's `statx` (which runs async via io_uring), avoiding TOCTOU races between discovery and scanning.
 
 This still enforces work conservation: discovery blocks under backpressure instead of dropping files.
 
@@ -301,6 +320,115 @@ fn dedupe_pending_in_place(p: &mut Vec<FindingRec>) {
 
 **Purpose**: Overlap regions can generate duplicate findings across chunks. Sorting + dedup ensures each finding is reported once per chunk.
 
+## First-Chunk Classification
+
+When the first CQE completes for a file (`base_offset == 0`, `prefix_len == 0`), the I/O thread classifies the file content before spawning a CPU task. This folds what was previously a separate probe read + seek into the initial read that was going to happen anyway — eliminating 2 syscalls per file.
+
+### Classification Steps
+
+```
+First CQE (base_offset=0, prefix_len=0):
+┌─────────────────────────────────────────────┐
+│  1. Archive magic sniff (first 512 bytes)   │
+│     └─ match → route ArchiveWork to channel │
+│                 mark file done, continue     │
+│                                              │
+│  2. Binary classification (first CHECK_LEN) │
+│     └─ NUL bytes → increment binary_skipped │
+│                     mark file done, continue │
+│                                              │
+│  3. Text → fall through to scan_chunk spawn  │
+└─────────────────────────────────────────────┘
+```
+
+**Archive sniffing**: Uses `sniff_kind_from_header()` to detect gzip, tar, and zip magic bytes regardless of file extension. If detected, the I/O thread constructs an `ArchiveWork` item and sends it to the archive channel. The buffer is dropped immediately (archive workers re-open the file) and the file is marked done — no further reads are submitted.
+
+**Binary detection**: When `skip_binary` is enabled, checks the first `CHECK_LEN` bytes for NUL bytes. Binary files are skipped entirely, saving all subsequent read + scan work.
+
+**Why this is done in the I/O thread**: The first CQE is the earliest point where file content is available. Classifying here avoids spawning CPU tasks for files that will be skipped or rerouted, and avoids a separate probe read + seek that would waste 2 syscalls per file.
+
+### Comparison with Blocking Path
+
+The blocking path (`local_fs_owner.rs`) applies the same optimization: the first `read()` doubles as both archive/binary probe and the first scan chunk. The old code performed a separate 512-byte probe read into a dedicated buffer, then `seek(0)` to rewind before the real read. The new code acquires the pool buffer up-front, reads directly into it, classifies from those bytes, and reuses the buffer for scanning on the first loop iteration (tracked via `preloaded: usize`).
+
+Both paths now have the same per-file syscall profile:
+
+```
+open → fstat → read (first chunk, doubles as probe) → [more reads...] → close
+```
+
+## Archive Worker Architecture
+
+Archive decompression (gzip inflate, tar entry parsing, zip extraction) is blocking synchronous I/O. The io_uring I/O threads cannot perform this work inline because doing so would stall the entire io_uring completion loop, starving all other in-flight file reads.
+
+### Why Separate Threads?
+
+```
+io_uring I/O thread event loop (MUST NOT BLOCK):
+┌──────────────────────────────────────────┐
+│  submit SQEs → flush → reap CQEs → loop │
+│  (drives 128+ concurrent reads)          │
+└──────────────────────────────────────────┘
+         │
+         │ [archive detected]
+         ▼
+  ArchiveWork ──channel──▶ Archive Worker Thread
+                           (blocking decompress is fine here)
+```
+
+If an I/O thread blocked on `gzip::read()`, all other in-flight reads on that ring would stall until decompression finished. With 128 concurrent ops per thread, one slow archive could stall 127 other file reads.
+
+### Contrast with Blocking Path
+
+The blocking path (`local_fs_owner.rs`) handles archives **inline on the same worker thread** via `dispatch_archive_scan()`. This is safe because blocking-path workers already call `read()` synchronously — there is no completion loop to protect. Each worker processes one file at a time, so blocking on decompression only delays that worker's next file.
+
+```
+Blocking path:                     io_uring path:
+┌──────────────────┐              ┌──────────────────┐
+│ Worker thread    │              │ I/O thread       │
+│  open → read →   │              │  submit → reap → │
+│  [archive?]      │              │  [archive?]      │
+│   └─ decompress  │              │   └─ send to     │
+│      inline      │              │      archive     │
+│  scan → close    │              │      channel     │
+└──────────────────┘              └──────────────────┘
+                                         │
+                                         ▼
+                                  ┌──────────────────┐
+                                  │ Archive worker   │
+                                  │  open → decomp → │
+                                  │  scan → close    │
+                                  └──────────────────┘
+```
+
+The key invariant: **never block a thread that drives an async I/O completion loop**. The blocking path doesn't have one, so the distinction doesn't apply there.
+
+### Thread Pool Sizing
+
+Archive worker count defaults to `max(cpu_workers / 4, 1)` when archives are enabled. This is a fraction of the CPU pool because:
+- Archive decompression is CPU-bound (inflate) mixed with blocking I/O (re-read from disk).
+- Most files in a typical scan are not archives; a small pool avoids idle threads.
+- The bounded channel (`file_queue_cap`) provides backpressure if archives arrive faster than workers can process.
+
+### Archive Routing
+
+Archives are detected at two points:
+
+1. **Discovery time** (extension-based): Files with known extensions (`.tar`, `.gz`, `.tar.gz`, `.zip`) are routed directly to archive workers during directory traversal via `detect_kind_from_path()`, bypassing I/O threads entirely.
+
+2. **First-chunk classification** (content-based): Files without archive extensions but with archive magic bytes in their content are detected by I/O threads after the first read completes and routed to archive workers via `ArchiveWork`.
+
+### Archive Scan Flow
+
+Each archive worker runs `archive_worker_loop`, which:
+1. Receives `ArchiveWork` from the bounded channel.
+2. Re-opens the file (the I/O thread dropped its fd after routing).
+3. Dispatches to the appropriate scanner: `scan_gzip_stream`, `scan_tar_stream`, `scan_targz_stream`, or `scan_zip_source`.
+4. Uses `UringArchiveSink` to forward decompressed entry chunks to the scan engine, following the same `scan_chunk_into → drop_prefix_findings → drain → dedupe → emit` pattern as regular CPU tasks.
+5. Drops the `FileToken` when done, releasing the `CountPermit` and unblocking discovery.
+
+Archive worker stats (bytes, chunks, findings, archives processed) are merged into the `MetricsSnapshot` after all workers finish, giving the orchestrator a unified view.
+
 ## Setup and Configuration
 
 ### LocalFsUringConfig Structure
@@ -331,6 +459,13 @@ pub struct LocalFsUringConfig {
 
     // Deduplication
     pub dedupe_within_chunk: bool,       // Dedupe findings per chunk
+
+    // Thread affinity
+    pub pin_threads: bool,               // Pin worker/IO threads to CPU cores
+
+    // Content classification
+    pub skip_binary: bool,               // Skip files with NUL bytes in first CHECK_LEN
+    pub archive: ArchiveConfig,          // Archive scanning (gzip, tar, zip expansion)
 }
 ```
 
@@ -358,6 +493,9 @@ pub fn default() -> Self {
         max_file_size: None,             // No size filter
         seed: 1,                         // Deterministic executor
         dedupe_within_chunk: true,       // Dedupe by default
+        pin_threads: default_pin_threads(), // CPU affinity (Linux)
+        skip_binary: true,               // Skip binary files by default
+        archive: ArchiveConfig::default(), // Archive expansion enabled
     }
 }
 ```
@@ -468,7 +606,12 @@ Each I/O worker thread runs an event loop:
 │       - Match to Op via user_data                 │
 │       - Open success → queue Stat                 │
 │       - Stat success → queue Read                 │
-│       - Read success → spawn ScanChunk            │
+│       - Read success (first chunk):               │
+│         a. Sniff archive magic → route to         │
+│            archive workers, mark done             │
+│         b. Check binary → skip, mark done         │
+│         c. Text → spawn ScanChunk                 │
+│       - Read success (subsequent) → ScanChunk     │
 │       - Errors/short reads → mark file done       │
 │       - Release buffer to pool (RAII)             │
 │                                                     │
@@ -741,21 +884,15 @@ This module does not hardcode a kernel version check. Runtime behavior is:
 - Open/stat capability is probed per ring (`OPENAT`/`OPENAT2`/`STATX`)
 - `open_stat_mode` controls fallback vs hard failure when capabilities are missing
 
-### Feature Gate
+### Compilation
 
-The module is **feature-gated** behind `io-uring`:
-
-```toml
-# Cargo.toml
-[features]
-io-uring = []  # Enable io_uring scanner on Linux
-```
+The module compiles **unconditionally on Linux** (no feature gate):
 
 ```rust
-#![cfg(all(target_os = "linux", feature = "io-uring"))]
+#![cfg(target_os = "linux")]
 ```
 
-**Effect**: Code only compiles on Linux with feature enabled. On other platforms or without feature, `io_uring` backend is unavailable (blocking `scan_local` in `local_fs_owner.rs` remains available).
+**Effect**: On Linux, both io_uring and blocking backends are always available. On other platforms, only the blocking `scan_local` in `local_fs_owner.rs` is compiled. The previous `io-uring` feature gate was removed to simplify build configuration.
 
 ### Kernel Capabilities
 
@@ -815,6 +952,8 @@ pub struct LocalFsSummary {
     pub open_errors: u64,          // Files that couldn't be opened
     pub read_errors: u64,          // Read syscall errors
     pub files_skipped_size: u64,   // Files exceeding max_file_size
+    pub archives_routed: u64,      // Files routed to archive workers
+    pub binary_skipped: u64,       // Files skipped as binary
 }
 
 pub struct UringIoStats {
@@ -831,6 +970,8 @@ pub struct UringIoStats {
     pub reads_completed: u64,      // CQEs reaped
     pub read_errors: u64,          // Syscall errors or short reads
     pub short_reads: u64,          // File truncation between reads
+    pub binary_skipped: u64,       // Files skipped as binary (first-chunk)
+    pub archives_sniffed: u64,     // Files routed to archive workers (content-based)
 }
 ```
 
@@ -923,6 +1064,26 @@ enum CpuTask {
         buf: FixedBufferHandle,
     },
 }
+
+// Archive worker types
+struct ArchiveWork {
+    path: PathBuf,                  // Path to archive file
+    kind: ArchiveKind,              // Detected archive format
+    token: Arc<FileToken>,          // Keeps permit alive during decompression
+}
+
+struct UringArchiveSink<'a, E: ScanEngine> {
+    engine: &'a E,
+    scratch: &'a mut E::Scratch,
+    pending: &'a mut Vec<Finding>,
+    event_sink: &'a dyn EventSink,
+    display: Vec<u8>,               // Current entry display path
+    file_id: FileId,                // Deterministic per-entry ID
+    dedupe: bool,
+    bytes_scanned: u64,
+    chunks_scanned: u64,
+    findings_emitted: u64,
+}
 ```
 
 ### Core Functions
@@ -937,7 +1098,17 @@ fn io_worker_loop<E: ScanEngine>(
     engine: Arc<E>,
     cfg: LocalFsUringConfig,
     stop: Arc<AtomicBool>,              // Graceful shutdown flag
+    archive_tx: Option<chan::Sender<ArchiveWork>>, // Archive routing channel
 ) -> io::Result<UringIoStats>;
+
+// Archive worker loop (blocking decompression + scan)
+fn archive_worker_loop<E: ScanEngine>(
+    rx: chan::Receiver<ArchiveWork>,
+    engine: Arc<E>,
+    event_sink: Arc<dyn EventSink>,
+    cfg: ArchiveConfig,
+    dedupe: bool,
+) -> ArchiveWorkerStats;
 
 // Discovery DFS walk
 fn walk_and_send_files(
@@ -945,6 +1116,7 @@ fn walk_and_send_files(
     cfg: &LocalFsUringConfig,
     budget: &Arc<CountBudget>,         // In-flight file limit
     tx: &chan::Sender<FileWork>,
+    archive_tx: &Option<chan::Sender<ArchiveWork>>, // Direct archive routing
     next_file_id: &mut u32,
     summary: &mut LocalFsSummary,
 ) -> io::Result<()>;
@@ -1124,8 +1296,21 @@ fn uring_finds_boundary_spanning_match() {
 
 #[test]
 fn global_only_pool_works() {
-    // Verify buffer pool in global-only mode doesn't panic
+    // Verify minimal pool (single worker, minimal local queue) works
     // and correctly acquires/releases buffers
+}
+
+#[test]
+fn uring_binary_skipped_counted() {
+    // File with NUL bytes triggers binary skip
+    // Verifies both io_stats.binary_skipped and cpu_metrics.binary_skipped
+    // are incremented, and no findings are emitted for the binary file
+}
+
+#[test]
+fn uring_archive_sniffed_counted() {
+    // File with gzip magic bytes (0x1f 0x8b) but no archive extension
+    // Verifies io_stats.archives_sniffed is incremented (content-based routing)
 }
 ```
 

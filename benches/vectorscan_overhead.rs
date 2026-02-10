@@ -232,7 +232,7 @@ fn bench_raw_vectorscan(c: &mut Criterion) {
             let rc = unsafe {
                 vs::hs_scan(
                     db,
-                    ascii.as_ptr() as *const i8,
+                    ascii.as_ptr() as *const std::ffi::c_char,
                     ascii.len() as u32,
                     0,
                     scratch,
@@ -252,7 +252,7 @@ fn bench_raw_vectorscan(c: &mut Criterion) {
             let rc = unsafe {
                 vs::hs_scan(
                     db,
-                    random.as_ptr() as *const i8,
+                    random.as_ptr() as *const std::ffi::c_char,
                     random.len() as u32,
                     0,
                     scratch,
@@ -269,7 +269,8 @@ fn bench_raw_vectorscan(c: &mut Criterion) {
     let patterns_multi: Vec<CString> = (0..10)
         .map(|i| CString::new(format!(r"\xFF\xFE\xFD{:02x}", i)).unwrap())
         .collect();
-    let pattern_ptrs: Vec<*const i8> = patterns_multi.iter().map(|p| p.as_ptr()).collect();
+    let pattern_ptrs: Vec<*const std::ffi::c_char> =
+        patterns_multi.iter().map(|p| p.as_ptr()).collect();
     let flags_multi: Vec<u32> = vec![vs::HS_FLAG_SINGLEMATCH; 10];
     let ids_multi: Vec<u32> = (0..10).collect();
 
@@ -299,7 +300,7 @@ fn bench_raw_vectorscan(c: &mut Criterion) {
             let rc = unsafe {
                 vs::hs_scan(
                     db_multi,
-                    ascii.as_ptr() as *const i8,
+                    ascii.as_ptr() as *const std::ffi::c_char,
                     ascii.len() as u32,
                     0,
                     scratch_multi,

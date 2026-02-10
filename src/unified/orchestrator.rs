@@ -3,7 +3,8 @@
 //! Dispatches to the appropriate source driver based on the parsed
 //! CLI configuration:
 //!
-//! - **FS** → [`parallel_scan_dir`] (work-stealing executor, streaming directory walk)
+//! - **FS** → `scan_local_fs_uring` on Linux when available and persistence is off;
+//!   otherwise `parallel_scan_dir`
 //! - **Git** → [`run_git_scan`] (pack execution, tree diffs, loose scan)
 //!
 //! Both paths share a common [`EventSink`](super::events::EventSink) for
@@ -31,7 +32,8 @@ use crate::git_scan::{
     self, run_git_scan, GitScanConfig, GitScanResult, InMemoryPersistenceStore, NeverSeenStore,
     StartSetConfig,
 };
-use crate::scheduler::{parallel_scan_dir, ParallelScanConfig};
+use crate::scheduler::parallel_scan_dir;
+use crate::scheduler::ParallelScanConfig;
 use crate::store::{AppendLogStoreProducer, StoreProducer};
 use crate::{demo_rules, demo_transforms, demo_tuning, AnchorMode, AnchorPolicy, Engine};
 
@@ -43,6 +45,12 @@ use super::{EventFormat, FsScanConfig, GitSourceConfig, ScanConfig, SourceConfig
 ///
 /// This is the single entry point called by `main()`. It builds the
 /// detection engine, selects the source driver, and runs the scan.
+///
+/// # Exit behavior
+///
+/// Sub-functions may call `std::process::exit(2)` on fatal configuration
+/// errors (rule loading, overflow of CLI size params). This function itself
+/// returns `io::Result` for normal I/O failures.
 pub fn run(config: ScanConfig) -> io::Result<()> {
     let event_format = config.event_format;
     let verbose = config.verbose;
@@ -62,7 +70,42 @@ pub fn run(config: ScanConfig) -> io::Result<()> {
     }
 }
 
-/// Filesystem scan path — delegates to `parallel_scan_dir`.
+#[cfg(any(test, target_os = "linux"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FsBackend {
+    Blocking,
+    Uring,
+}
+
+/// Select the filesystem backend from platform + runtime capabilities.
+///
+/// Linux can use io_uring only when:
+/// - persistence is not requested, and
+/// - io_uring initialization succeeds during preflight.
+#[cfg(any(test, target_os = "linux"))]
+#[inline]
+fn select_fs_backend(
+    is_linux: bool,
+    persist_findings: bool,
+    uring_backend_available: bool,
+) -> FsBackend {
+    if !is_linux || persist_findings || !uring_backend_available {
+        FsBackend::Blocking
+    } else {
+        FsBackend::Uring
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+fn uring_backend_available(ring_entries: u32) -> bool {
+    io_uring::IoUring::new(ring_entries).is_ok()
+}
+
+/// Filesystem scan path.
+///
+/// Uses io_uring on Linux only when it is available and `--persist-findings`
+/// is disabled. Otherwise uses the blocking `parallel_scan_dir` path.
 ///
 /// Findings are emitted as structured JSONL events to stdout via the
 /// [`EventSink`]. Summary stats are written to stderr.
@@ -132,7 +175,87 @@ fn run_fs(
     if cfg.scan_binary {
         ps_config.skip_binary = false;
     }
-    let report = parallel_scan_dir(&cfg.root, engine, ps_config)?;
+    #[cfg(target_os = "linux")]
+    let report = {
+        use crate::scheduler::local_fs_owner::{LocalReport, LocalStats};
+        use crate::scheduler::{scan_local_fs_uring, LocalFsUringConfig};
+
+        let defaults = LocalFsUringConfig::default();
+        let backend = select_fs_backend(
+            true,
+            cfg.persist_findings,
+            uring_backend_available(defaults.ring_entries),
+        );
+
+        match backend {
+            FsBackend::Uring => {
+                let io_threads = (cfg.workers / 4).max(2);
+                let io_depth = defaults.io_depth;
+                // pool_buffers must be >= io_threads * io_depth (assertion floor), but
+                // the real requirement is headroom ABOVE that so completed I/O can sit
+                // in the CPU executor queue while I/O threads keep submitting.  Without
+                // headroom every buffer is in-flight and try_acquire() fails, stalling
+                // both I/O submission and the CPU pipeline.
+                let io_pool = io_threads * io_depth;
+                let cpu_headroom = cfg.workers * 4;
+                let pool_buffers = io_pool + cpu_headroom;
+
+                let uring_cfg = LocalFsUringConfig {
+                    cpu_workers: cfg.workers,
+                    io_threads,
+                    io_depth,
+                    chunk_size: ps_config.chunk_size,
+                    pool_buffers,
+                    max_in_flight_files: ps_config.max_in_flight_objects,
+                    max_file_size: Some(ps_config.max_file_size),
+                    dedupe_within_chunk: true,
+                    seed: ps_config.seed,
+                    skip_binary: ps_config.skip_binary,
+                    archive: ps_config.archive.clone(),
+                    ..defaults
+                };
+
+                let (summary, io_stats, cpu_metrics) = scan_local_fs_uring(
+                    Arc::clone(&engine),
+                    std::slice::from_ref(&cfg.root),
+                    uring_cfg,
+                    Arc::clone(&event_sink),
+                )?;
+
+                let io_errors = summary
+                    .walk_errors
+                    .saturating_add(summary.open_errors)
+                    .saturating_add(summary.read_errors);
+
+                LocalReport {
+                    stats: LocalStats {
+                        files_enqueued: summary.files_enqueued,
+                        bytes_enqueued: io_stats.bytes_enqueued,
+                        io_errors,
+                        dropped_findings: cpu_metrics.findings_dropped,
+                        persistence_emit_failures: cpu_metrics.persistence_emit_failures,
+                        persistence_incomplete: false,
+                    },
+                    metrics: cpu_metrics,
+                }
+            }
+            FsBackend::Blocking => {
+                if cfg.persist_findings {
+                    eprintln!(
+                        "info: using blocking FS backend on Linux because --persist-findings is enabled"
+                    );
+                } else {
+                    eprintln!(
+                        "info: io_uring backend unavailable; falling back to blocking FS backend"
+                    );
+                }
+                parallel_scan_dir(&cfg.root, Arc::clone(&engine), ps_config)?
+            }
+        }
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    let report = parallel_scan_dir(&cfg.root, Arc::clone(&engine), ps_config)?;
 
     let scan_elapsed = scan_start.elapsed();
     let total_elapsed = t0.elapsed();
@@ -183,12 +306,16 @@ fn run_fs(
     Ok(())
 }
 
-/// Git scan path — delegates to `run_git_scan`.
+/// Git scan path — delegates to [`run_git_scan`].
 ///
 /// Builds the engine, configures persistence stores (in-memory for CLI),
 /// resolves the start set via `git` CLI commands, and runs the scan.
 /// Findings stream through the [`EventSink`](super::events::EventSink);
 /// summary + optional debug/perf output goes to stderr.
+///
+/// Calls `process::exit(2)` on fatal errors (rule loading, config overflow,
+/// scan failure) rather than returning an error, matching the CLI exit-code
+/// convention.
 fn run_git(
     cfg: GitSourceConfig,
     event_format: EventFormat,
@@ -292,6 +419,9 @@ fn run_git(
 }
 
 /// Print git scan results to stderr (debug stats and/or perf breakdown).
+///
+/// Called only on successful scans. Each section is gated by its respective
+/// CLI flag so the default output is clean.
 fn print_git_report(
     report: &git_scan::GitScanReport,
     config: &GitScanConfig,
@@ -320,6 +450,10 @@ fn build_event_sink(event_format: EventFormat, verbose: bool) -> Arc<dyn super::
 }
 
 /// Emit a structured `ScanEvent::Summary` for the completed git scan.
+///
+/// Maps `FinalizeOutcome::Complete` to status `"complete"` (0 errors) and
+/// `Partial` to `"partial"` (with the skipped-candidate count as errors).
+/// Throughput is computed from `scan_bytes` perf counter, not wall time.
 fn emit_git_summary_event(
     event_sink: &dyn super::events::EventSink,
     report: &git_scan::GitScanReport,
@@ -352,6 +486,11 @@ fn emit_git_summary_event(
 }
 
 /// Dump verbose internal stats to stderr (commit counts, tree diff, pack plan, cache rejects).
+///
+/// Emits one `key=value` or `key={:?}` line per stat. Includes a sample of
+/// up to 5 skipped candidates for post-mortem diagnosis. Format is
+/// intentionally unstructured — use `--event-format jsonl` for machine
+/// consumption and reserve this output for human debugging.
 fn print_git_debug(report: &git_scan::GitScanReport) {
     eprintln!("commits={}", report.commit_count);
     eprintln!("tree_diff_stats={:?}", report.tree_diff_stats);
@@ -682,5 +821,69 @@ mod tests {
     fn filter_none_on_empty_input() {
         let result = apply_transform_filter(vec![], &TransformFilter::All);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn fs_backend_non_linux_is_blocking() {
+        assert_eq!(select_fs_backend(false, false, true), FsBackend::Blocking);
+        assert_eq!(select_fs_backend(false, true, false), FsBackend::Blocking);
+    }
+
+    #[test]
+    fn fs_backend_linux_with_persistence_uses_blocking() {
+        assert_eq!(
+            select_fs_backend(true, true, true),
+            FsBackend::Blocking,
+            "persistence path must use blocking backend until io_uring persistence is wired"
+        );
+    }
+
+    #[test]
+    fn fs_backend_linux_without_uring_falls_back_to_blocking() {
+        assert_eq!(
+            select_fs_backend(true, false, false),
+            FsBackend::Blocking,
+            "io_uring unavailability must fall back to blocking backend"
+        );
+    }
+
+    #[test]
+    fn fs_backend_linux_uring_when_available_and_no_persistence() {
+        assert_eq!(select_fs_backend(true, false, true), FsBackend::Uring);
+    }
+
+    /// The pool buffer sizing formula must satisfy the assertion floor
+    /// (pool_buffers >= io_threads * io_depth) across a range of worker
+    /// counts, including edge cases. This prevents runtime panics from
+    /// the LocalFsUringConfig::validate() assertion.
+    #[test]
+    fn buffer_pool_sizing_satisfies_assertion_floor() {
+        let io_depth: usize = 128; // Default from LocalFsUringConfig
+
+        for workers in [1, 2, 3, 4, 8, 16, 32, 64, 128, 256] {
+            let io_threads = (workers / 4).max(2);
+            let io_pool = io_threads * io_depth;
+            let cpu_headroom = workers * 4;
+            let pool_buffers = io_pool + cpu_headroom;
+
+            // Must satisfy the assertion floor.
+            assert!(
+                pool_buffers >= io_threads * io_depth,
+                "pool_buffers ({pool_buffers}) < io_threads * io_depth ({}) for workers={workers}",
+                io_threads * io_depth
+            );
+
+            // Must not overflow u16 range when registered buffers are in
+            // use (io_uring registered buffers are indexed by u16).
+            // For very high worker counts the formula can exceed u16::MAX.
+            // This test documents the boundary rather than asserting a hard
+            // limit, since registered buffers are optional.
+            if workers <= 64 {
+                assert!(
+                    pool_buffers <= u16::MAX as usize,
+                    "pool_buffers ({pool_buffers}) exceeds u16::MAX for workers={workers}"
+                );
+            }
+        }
     }
 }

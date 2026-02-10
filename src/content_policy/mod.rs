@@ -14,15 +14,10 @@
 //! - The NUL-byte heuristic mirrors Git's `buffer_is_binary` and uses
 //!   `memchr` for SIMD-accelerated scanning.
 
-#[cfg(feature = "binary-extract")]
 pub mod extract;
-#[cfg(feature = "binary-extract")]
 pub mod ipynb;
-#[cfg(feature = "binary-extract")]
 pub mod jar_war;
-#[cfg(feature = "binary-extract")]
 pub mod java_class;
-#[cfg(feature = "binary-extract")]
 pub mod pyc;
 
 /// Number of leading bytes to inspect for the NUL-byte heuristic.
@@ -70,8 +65,8 @@ pub fn is_likely_binary(data: &[u8], check_len: usize) -> bool {
 ///
 /// 1. Check for NUL bytes in the first `check_len` bytes.
 /// 2. If no NUL bytes:
-///    - `.ipynb` is [`ContentVerdict::BinaryExtractable`] when
-///      `binary-extract` is enabled, so code/markdown cells can be extracted.
+///    - `.ipynb` is [`ContentVerdict::BinaryExtractable`] so code/markdown
+///      cells can be extracted.
 ///    - otherwise classify as [`ContentVerdict::Text`].
 /// 3. If NUL bytes are present: check extension for extractable formats →
 ///    [`ContentVerdict::BinaryExtractable`]; otherwise → [`ContentVerdict::Binary`].
@@ -86,7 +81,6 @@ pub fn classify_content(data: &[u8], path: &[u8], check_len: usize) -> ContentVe
         // .pyc) should only trigger extraction when the data actually
         // contains NUL bytes — otherwise a misnamed text file would be
         // silently skipped instead of scanned.
-        #[cfg(feature = "binary-extract")]
         if let Some(ExtractableFormat::Ipynb) = match_extractable_extension(path) {
             return ContentVerdict::BinaryExtractable(ExtractableFormat::Ipynb);
         }
@@ -220,23 +214,12 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "binary-extract")]
     #[test]
     fn ipynb_text_content_classified_as_extractable() {
         let data = b"{\"cells\": []}";
         assert_eq!(
             classify_content(data, b"notebook.ipynb", CHECK_LEN),
             ContentVerdict::BinaryExtractable(ExtractableFormat::Ipynb)
-        );
-    }
-
-    #[cfg(not(feature = "binary-extract"))]
-    #[test]
-    fn ipynb_text_content_classified_as_text() {
-        let data = b"{\"cells\": []}";
-        assert_eq!(
-            classify_content(data, b"notebook.ipynb", CHECK_LEN),
-            ContentVerdict::Text
         );
     }
 

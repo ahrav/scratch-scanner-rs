@@ -346,6 +346,7 @@ pub(super) fn run_diff_history(
             config.engine_adapter,
             pack_cache_bytes,
             scheduler_workers,
+            config.pin_threads,
         )?;
         for output in outputs {
             pack_exec_reports.push(output.report);

@@ -17,7 +17,7 @@ tempfile = "3"
 
 [dependencies.scanner-rs]
 path = ".."
-features = ["tiger-harness", "binary-extract"]
+features = ["tiger-harness"]
 
 # Prevent this from interfering with workspaces
 [workspace]

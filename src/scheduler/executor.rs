@@ -111,7 +111,7 @@ pub struct ExecutorConfig {
     /// Longer = less OS scheduling overhead.
     pub park_timeout: Duration,
 
-    /// Try to pin each worker to a core (requires `affinity` feature).
+    /// Try to pin each worker to a core (Linux only).
     pub pin_threads: bool,
 }
 
@@ -136,7 +136,7 @@ impl Default for ExecutorConfig {
             steal_tries: 4,
             spin_iters: 200,
             park_timeout: Duration::from_micros(200),
-            pin_threads: false,
+            pin_threads: super::affinity::default_pin_threads(),
         }
     }
 }
@@ -790,6 +790,13 @@ impl<T: Send + 'static> Executor<T> {
         let runner = Arc::new(runner);
         let scratch_init = Arc::new(scratch_init);
 
+        // Create core assigner for thread pinning (Linux only; None elsewhere).
+        let core_assigner = if cfg.pin_threads {
+            super::affinity::CoreAssigner::new().map(Arc::new)
+        } else {
+            None
+        };
+
         let mut threads = Vec::with_capacity(cfg.workers);
 
         // Spawn workers in reverse so pop() gives correct worker_id
@@ -800,13 +807,13 @@ impl<T: Send + 'static> Executor<T> {
             let local = locals.pop().expect("locals length mismatch");
             let parker = parkers.pop().expect("parkers length mismatch");
             let thread_cfg = cfg;
+            let core_assigner_clone = core_assigner.clone();
 
             let th = thread::Builder::new()
                 .name(format!("scanner-worker-{worker_id}"))
                 .spawn(move || {
-                    #[cfg(feature = "scheduler-affinity")]
-                    if thread_cfg.pin_threads {
-                        pin_current_thread(worker_id);
+                    if let Some(ref assigner) = core_assigner_clone {
+                        assigner.pin_current_thread();
                     }
 
                     let scratch = (scratch_init)(worker_id);
@@ -1040,27 +1047,6 @@ impl IdleHooks for TieredIdle {
         IdleAction::Park {
             timeout: cfg.park_timeout,
         }
-    }
-}
-
-#[cfg(feature = "scheduler-affinity")]
-fn pin_current_thread(worker_id: usize) {
-    let cores = match core_affinity::get_core_ids() {
-        Some(v) if !v.is_empty() => v,
-        _ => {
-            eprintln!(
-                "WARN: Failed to get core IDs for worker {}, skipping affinity",
-                worker_id
-            );
-            return;
-        }
-    };
-    let core = cores[worker_id % cores.len()];
-    if !core_affinity::set_for_current(core) {
-        eprintln!(
-            "WARN: Failed to pin worker {} to core {:?}",
-            worker_id, core.id
-        );
     }
 }
 

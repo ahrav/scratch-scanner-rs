@@ -422,7 +422,9 @@ pub(super) fn resolve_pack_paths(
 
 /// Strip a `.pack` or `.idx` suffix from a pack-related file name.
 ///
-/// Returns the input unchanged (as a new `Vec`) if neither suffix matches.
+/// Both suffixes are handled because the MIDX stores pack basenames with
+/// `.idx` suffixes, while we need `.pack` paths for mmap. Returns the
+/// input unchanged (as a new `Vec`) if neither suffix matches.
 pub(super) fn strip_pack_suffix(name: &[u8]) -> Vec<u8> {
     if name.ends_with(b".pack") {
         name[..name.len() - 5].to_vec()
@@ -500,11 +502,16 @@ pub(super) fn mmap_pack_files(
 /// Issues `POSIX_FADV_SEQUENTIAL` (Linux only) on the file descriptor and
 /// `MADV_SEQUENTIAL` on the mapped region. Both are advisory; failures are
 /// silently ignored since they only affect readahead heuristics.
+///
+/// # Safety (internal)
+///
+/// The `unsafe` block calls `libc::posix_fadvise` and `libc::madvise` with
+/// valid file descriptors and mmap pointers that remain live for the
+/// duration of the call. Both functions are idempotent advisory hints —
+/// return codes are intentionally discarded.
 #[cfg(unix)]
 pub(super) fn advise_sequential(file: &File, reader: &Mmap) {
     unsafe {
-        // SAFETY: The file descriptor and mmap are valid for the duration of
-        // these advisory calls; failures are ignored because they are hints.
         #[cfg(target_os = "linux")]
         let _ = libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
         #[cfg(not(target_os = "linux"))]
@@ -829,32 +836,53 @@ pub(super) fn append_scanned_blobs(dst: &mut ScannedBlobs, mut src: ScannedBlobs
 }
 
 /// Output produced by one scheduler-dispatched pack-plan task.
+///
+/// All three fields correspond to the same plan (or shard of a plan).
+/// The caller reassembles outputs in deterministic sequence order
+/// regardless of worker completion order.
 pub(super) struct SchedulerPackExecOutput {
-    /// Pack execution report for this plan.
+    /// Pack execution report for this plan (decode stats, timing).
     pub report: PackExecReport,
-    /// Scanned blobs produced by this plan.
+    /// Scanned blobs with findings. Finding arena offsets are local to this
+    /// output and must be rebased when merged with other outputs.
     pub scanned: ScannedBlobs,
     /// Candidate-level skip records mapped from pack skip offsets.
     pub skipped: Vec<SkippedCandidate>,
 }
 
+/// Task dispatched to a scheduler worker thread.
 enum SchedulerPackTask {
+    /// Execute a full pack plan (used by Serial and PackParallel strategies).
     ExecPlan { seq: usize },
+    /// Execute one shard of a pack plan (used by IntraPackSharded strategy).
     ExecShard { plan_idx: usize, shard_idx: usize },
 }
 
+/// Per-worker scratch space reused across tasks to avoid re-allocation.
 struct SchedulerPackScratch {
     cache: PackCache,
     exec_scratch: PackExecScratch,
 }
 
+/// Pre-computed sharding metadata for one pack plan.
+///
+/// Built once before task dispatch and shared (read-only) across all shard
+/// tasks for the same plan. `exec_indices` defines the decode order;
+/// `shard_ranges` partitions that order into contiguous slices, one per shard.
 #[derive(Clone)]
 struct SchedulerShardMeta {
+    /// Decode order indices into `plan.need_offsets`.
     exec_indices: Vec<usize>,
+    /// Per-offset candidate range: `Some((start, end))` into `plan.candidates`.
     candidate_ranges: Vec<Option<(usize, usize)>>,
+    /// `(start, end)` slices into `exec_indices`, one per shard.
     shard_ranges: Vec<(usize, usize)>,
 }
 
+/// Immutable state shared across all scheduler worker threads.
+///
+/// Wrapped in `Arc` so each worker can borrow without lifetime issues.
+/// Mutable per-worker state lives in [`SchedulerPackScratch`] instead.
 struct SchedulerPackShared {
     engine: Arc<Engine>,
     event_sink: Arc<dyn EventSink>,
@@ -1019,10 +1047,18 @@ fn run_scheduler_pack_task(
     }
 }
 
-/// Execute full pack plans as scheduler tasks.
+/// Execute pack plans via the scheduler `Executor` work-queue.
 ///
-/// This is used by git runners to route parallel pack execution through
-/// `scheduler::Executor` instead of ad-hoc thread pools.
+/// Selects a [`PackExecStrategy`] based on worker count and plan structure:
+/// - **Serial / PackParallel**: each plan is one task; outputs are collected
+///   into sequence-indexed slots for deterministic reassembly.
+/// - **IntraPackSharded**: large plans are split into shards; per-shard
+///   outputs are merged (reports summed, scanned blobs rebased) before
+///   returning one output per plan.
+///
+/// On the first worker error, an abort flag prevents new tasks from starting.
+/// The function joins all workers, then returns the first error encountered.
+/// Outputs from successful plans are discarded on error.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn execute_pack_plans_with_scheduler(
     engine: Arc<Engine>,
@@ -1040,6 +1076,7 @@ pub(super) fn execute_pack_plans_with_scheduler(
     adapter_cfg: EngineAdapterConfig,
     pack_cache_bytes: u32,
     workers: usize,
+    pin_threads: bool,
 ) -> Result<Vec<SchedulerPackExecOutput>, GitScanError> {
     if plans.is_empty() {
         return Ok(Vec::new());
@@ -1081,6 +1118,7 @@ pub(super) fn execute_pack_plans_with_scheduler(
                 ExecutorConfig {
                     workers: exec_workers,
                     seed: 0x853c49e6748fea9b,
+                    pin_threads,
                     ..ExecutorConfig::default()
                 },
                 move |_wid| SchedulerPackScratch {
@@ -1227,6 +1265,7 @@ pub(super) fn execute_pack_plans_with_scheduler(
                 ExecutorConfig {
                     workers: exec_workers,
                     seed: 0x853c49e6748fea9b,
+                    pin_threads,
                     ..ExecutorConfig::default()
                 },
                 move |_wid| SchedulerPackScratch {
