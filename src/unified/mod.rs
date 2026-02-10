@@ -64,6 +64,52 @@ pub enum SourceConfig {
     Fs(FsScanConfig),
     /// Git repository history scan.
     Git(GitSourceConfig),
+    /// Store query command (not a scan).
+    Store(StoreCommand),
+}
+
+/// Store subcommand for querying the findings database.
+pub enum StoreCommand {
+    /// List completed runs.
+    ListRuns {
+        store_dir: PathBuf,
+        status: Option<i32>,
+        limit: usize,
+        format: OutputFormat,
+    },
+    /// List findings for a specific run.
+    ListFindings {
+        store_dir: PathBuf,
+        run: String,
+        rule: Option<String>,
+        path: Option<String>,
+        limit: usize,
+        format: OutputFormat,
+    },
+    /// Diff two runs.
+    Diff {
+        store_dir: PathBuf,
+        run_a: String,
+        run_b: String,
+        format: OutputFormat,
+    },
+    /// List unique secrets.
+    ListSecrets {
+        store_dir: PathBuf,
+        status: Option<i32>,
+        limit: usize,
+        format: OutputFormat,
+    },
+}
+
+/// Output format for store queries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OutputFormat {
+    /// Human-readable text output.
+    #[default]
+    Text,
+    /// JSON output.
+    Json,
 }
 
 /// Filesystem scan configuration.

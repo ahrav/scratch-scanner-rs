@@ -426,27 +426,28 @@ classDiagram
         +losses() Vec
     }
 
-    class AppendLogStoreProducer {
-        bounded writer thread
-        append-only .open/.bin segments
+    class SqliteStoreProducer {
+        -Mutex~WriterState~ state
+        +open(config) Result
+        +run_pk() Result~i64~
     }
 
     FsFindingBatch --> FsFindingRecord : contains
     FsFindingRecord --> NormHash : carries
     StoreProducer <|.. NullStoreProducer : implements
     StoreProducer <|.. InMemoryStoreProducer : implements
-    StoreProducer <|.. AppendLogStoreProducer : implements
+    StoreProducer <|.. SqliteStoreProducer : implements
     StoreProducer ..> FsFindingBatch : receives
     StoreProducer ..> FsRunLoss : receives
 ```
 
-Verified against: `src/store/fs.rs`, `src/store/log/writer.rs`.
+Verified against: `src/store/fs.rs`, `src/store/db/writer.rs`.
 
 **Data flow**: After within-chunk dedup, the scheduler's `build_persistence_batch()`
 converts `FindingWithHash<F>` carriers into `FsFindingRecord` values. These are
 grouped per scanned object in `FsFindingBatch` and handed to the configured
 `StoreProducer`. At run end, `record_fs_run_loss()` captures drop/failure counters
-so the backend can mark the run as incomplete when warranted.
+and `end_run()` derives the final run status and persists it to the database.
 
 | Type | Purpose |
 |------|---------|
@@ -456,7 +457,7 @@ so the backend can mark the run as incomplete when warranted.
 | `StoreProducer` | `Send + Sync` trait for FS finding persistence (`Arc<dyn StoreProducer>`) |
 | `NullStoreProducer` | Default no-op for CLI / feature-off paths |
 | `InMemoryStoreProducer` | Collects batches in memory for tests and diagnostics |
-| `AppendLogStoreProducer` | Default FS backend writing CRC-framed append-only segment logs |
+| `SqliteStoreProducer` | Default FS backend: SQLite star-schema with WAL mode, per-batch transactions, and in-memory rule cache |
 
 ## Persistence Identity Types
 

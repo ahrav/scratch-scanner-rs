@@ -50,6 +50,26 @@ pub const KEY_DERIVE_CONTEXT_SECRET_V1: &str = "scanner.store.keys.v1.secret";
 /// Versioned key derivation contexts (BLAKE3 KDF).
 pub const KEY_DERIVE_CONTEXT_METADATA_V1: &str = "scanner.store.keys.v1.metadata";
 
+/// Identity hashing mode controlling keyed vs unkeyed derivation.
+///
+/// - `Keyed`: All identity hashes (root_id, path_id, occurrence_id, secret_hash)
+///   are keyed with operator-specific material. Cross-operator hashes never collide,
+///   preventing hash-based correlation attacks between operators.
+/// - `Unkeyed`: Identity hashes use a fixed zero key. Useful for debugging and
+///   reproducibility when operator isolation is not required.
+///
+/// Note: `rule_fingerprint` is **always unkeyed** regardless of this mode (rules
+/// are stable policy definitions, not operator-specific). `secret_hash` is
+/// **always keyed** regardless of this mode (to prevent rainbow-table attacks).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum IdHashMode {
+    /// Keyed identity derivation using operator secret material.
+    Keyed = 1,
+    /// Unkeyed identity derivation using a fixed zero key.
+    Unkeyed = 2,
+}
+
 /// Correlation mode for this run's persistence identity outputs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CorrelationMode {
@@ -112,6 +132,7 @@ pub struct StoreKeys {
     secret_key: [u8; 32],
     metadata_key: [u8; 32],
     run_mode: RunModeMetadata,
+    id_hash_mode: IdHashMode,
 }
 
 impl fmt::Debug for StoreKeys {
@@ -180,11 +201,20 @@ impl StoreKeys {
         let secret_key = blake3::derive_key(KEY_DERIVE_CONTEXT_SECRET_V1, &root_key);
         let metadata_key = blake3::derive_key(KEY_DERIVE_CONTEXT_METADATA_V1, &root_key);
 
+        // Default to Keyed mode when persistent key material is available,
+        // Unkeyed when ephemeral (since there is no stable operator secret).
+        let id_hash_mode = if run_mode.is_persistent() {
+            IdHashMode::Keyed
+        } else {
+            IdHashMode::Unkeyed
+        };
+
         Self {
             identity_key,
             secret_key,
             metadata_key,
             run_mode,
+            id_hash_mode,
         }
     }
 
@@ -195,6 +225,7 @@ impl StoreKeys {
     }
 
     /// Key for rule fingerprint and occurrence-id derivation.
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn identity_key(&self) -> &[u8; 32] {
         &self.identity_key
@@ -212,11 +243,38 @@ impl StoreKeys {
         &self.metadata_key
     }
 
+    /// Identity hashing mode (keyed vs unkeyed).
+    #[must_use]
+    pub const fn id_hash_mode(&self) -> IdHashMode {
+        self.id_hash_mode
+    }
+
+    /// Returns the effective identity key based on [`IdHashMode`].
+    ///
+    /// - `Keyed`: returns the operator-derived identity key.
+    /// - `Unkeyed`: returns a fixed all-zero key (deterministic, operator-independent).
+    #[must_use]
+    pub const fn effective_identity_key(&self) -> &[u8; 32] {
+        match self.id_hash_mode {
+            IdHashMode::Keyed => &self.identity_key,
+            IdHashMode::Unkeyed => &ZERO_KEY,
+        }
+    }
+
+    /// Override the identity hashing mode for this key set.
+    pub fn with_id_hash_mode(mut self, mode: IdHashMode) -> Self {
+        self.id_hash_mode = mode;
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn from_test_root_key(root_key: [u8; 32], run_mode: RunModeMetadata) -> Self {
         Self::from_root_key(root_key, run_mode)
     }
 }
+
+/// Fixed all-zero key used in [`IdHashMode::Unkeyed`] mode.
+const ZERO_KEY: [u8; 32] = [0u8; 32];
 
 /// Specific failure modes for `parse_root_key`.
 ///

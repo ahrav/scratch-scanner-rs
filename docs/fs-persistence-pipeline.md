@@ -3,8 +3,8 @@
 Write-side plumbing that carries post-dedupe findings from the scheduler's
 FS scan loops into a persistence backend.
 
-**Source**: `src/store/fs.rs`, `src/store/log/format.rs`,
-`src/store/log/reader.rs`, `src/store/log/writer.rs`,
+**Source**: `src/store/fs.rs`, `src/store/db/schema.rs`,
+`src/store/db/writer.rs`, `src/store/db/query.rs`,
 `src/scheduler/local_fs_owner.rs`, `src/scheduler/parallel_scan.rs`,
 `src/unified/orchestrator.rs`
 
@@ -13,7 +13,7 @@ FS scan loops into a persistence backend.
 The detection engine emits findings during scanning, but those findings are
 transient — they flow through the `EventSink` to stdout and are gone. The
 FS persistence pipeline adds a **durable write path** so post-dedupe findings
-are persisted to append-only segment logs for cross-run deduplication,
+are persisted to a SQLite database for cross-run deduplication, diff analysis,
 tracking, and reporting.
 
 This module defines the **producer-side contracts** (what the scheduler
@@ -25,18 +25,19 @@ emits). The consumer side (actual backend storage) is plugged in via the
 | Module | Scope | Purpose |
 |--------|-------|---------|
 | `src/store/fs.rs` | FS persistence producer | Write-side trait + data types for FS scan findings |
-| `src/store/log/format.rs` | FS log codec | Framed on-disk record format (V1 + V2, position-bound CRC, segment header/trailer, cross-segment hash chaining) |
-| `src/store/log/reader.rs` | FS log reader | Streaming frame decoder with reason-coded errors and `.open` recovery |
-| `src/store/log/writer.rs` | FS append-log backend | Bounded single-writer runtime with `.open` -> `.bin` finalize |
+| `src/store/db/schema.rs` | SQLite schema | Star-schema DDL with dimension tables (roots, paths, rules, secrets) and fact tables (runs, occurrences, observations) |
+| `src/store/db/writer.rs` | SQLite writer | Single-writer producer with WAL mode, per-batch transactions, and in-memory rule cache |
+| `src/store/db/query.rs` | SQLite queries | Read-path queries for list-runs, list-findings, diff, and list-secrets CLI commands |
 | `src/store/identity.rs` | Identity contracts | Stable `RuleFingerprint`, `SecretHash`, `OccurrenceId` derivation |
 | `src/store/keys.rs` | Key bootstrap | `SCANNER_SECRET_KEY` KDF for keyed identity hashes |
 | `src/git_scan/persist.rs` | Git persistence | Two-phase persist contract for Git blob scan results |
 
 The identity contracts (`identity.rs`) define *how to compute stable IDs*
 for findings. The FS persistence pipeline (`fs.rs`) defines *how findings
-flow from scan workers into a backend*. A production backend would use both:
-the pipeline delivers `FsFindingRecord` batches, and the backend computes
-`OccurrenceId` from each record before storing.
+flow from scan workers into a backend*. The SQLite backend (`db/writer.rs`)
+uses the pipeline to receive `FsFindingRecord` batches and computes
+deterministic identifiers (occurrence IDs, rule fingerprints, path IDs) via
+BLAKE3 domain-separated hashes before storing them.
 
 ## Data Flow
 
@@ -71,16 +72,17 @@ the pipeline delivers `FsFindingRecord` batches, and the backend computes
                      │                         │                                   │
                      │           ┌─────────────┼──────────────┬─────────────┐      │
                      │           ▼             ▼              ▼             ▼      │
-                     │   AppendLogProducer  InMemoryProd  NullProducer   (custom)   │
-                     │    (.open/.bin)       (test/diag)    (discard)               │
+                     │   SqliteStoreProd  InMemoryProd  NullProducer   (custom)    │
+                     │    (findings.db)    (test/diag)    (discard)                │
                      └─────────────────────────────────────────────────────────────┘
 
                      At run end:
-                     ┌─────────────────────────────────────────┐
-                     │  Aggregate worker metrics                │
-                     │  ──► FsRunLoss { dropped, failures }    │
-                     │  ──► StoreProducer::record_fs_run_loss() │
-                     └─────────────────────────────────────────┘
+                     ┌─────────────────────────────────────────────────┐
+                     │  Aggregate worker metrics                        │
+                     │  ──► FsRunLoss { dropped, failures }            │
+                     │  ──► StoreProducer::record_fs_run_loss()        │
+                     │  ──► StoreProducer::end_run(had_coverage_limits)│
+                     └─────────────────────────────────────────────────┘
 ```
 
 ## Key Types
@@ -148,6 +150,7 @@ when `dropped_findings > 0 || persistence_emit_failures > 0`.
 pub trait StoreProducer: Send + Sync + 'static {
     fn emit_fs_batch(&self, batch: FsFindingBatch<'_>) -> Result<(), FsStoreError>;
     fn record_fs_run_loss(&self, loss: FsRunLoss) -> Result<(), FsStoreError>;
+    fn end_run(&self, had_coverage_limits: bool) -> Result<(), FsStoreError>;
 }
 ```
 
@@ -156,340 +159,199 @@ pub trait StoreProducer: Send + Sync + 'static {
   scanned object that produced findings. Batches may arrive out of file
   order when workers run in parallel.
 - `record_fs_run_loss` is called exactly once at the end of a scan run.
+- `end_run` is called once after `record_fs_run_loss` to finalize the run
+  (set end time and derive final status). The default implementation is a
+  no-op, suitable for backends that don't need run finalization.
 - Errors from either method are counted but do **not** abort the scan.
 
 ### Implementations
 
 | Type | Purpose |
 |------|---------|
-| `AppendLogStoreProducer` | Default FS backend: bounded single-writer append-log with framed records and segment finalize |
+| `SqliteStoreProducer` | Default FS backend: SQLite star-schema with WAL mode, per-batch transactions, and in-memory rule cache |
 | `NullStoreProducer` | Default no-op — CLI default, feature-off, benchmarks |
 | `InMemoryStoreProducer` | Collects batches in memory for tests and diagnostics |
 
-### Append-Log Backend
+### SQLite Backend
 
 When `--persist-findings` is enabled for FS scans, the orchestrator wires
-`AppendLogStoreProducer` by default.
+`SqliteStoreProducer` as the persistence backend.
 
 #### Store Root Resolution
 
-The append-log root directory is resolved in this order:
+The store root directory is resolved in this order:
 
 1. **`SCANNER_FS_LOG_DIR` env var** — used verbatim if set.
-2. **Sibling of scan root** — `<parent>/.<name>.scanner-rs-store` where
-   `<name>` is the scan root's directory name (sanitized for safe path chars).
+2. **Sibling of scan root** — `<scan_root>/.scanner-store/` under the
+   scan target directory.
 
 Example: scanning `/data/repos/myproject` creates
-`/data/repos/.myproject.scanner-rs-store/`.
+`/data/repos/myproject/.scanner-store/findings.db`.
 
-#### On-Disk Directory Layout
+#### On-Disk Layout
 
 ```text
 <store_root>/
-  └── run-<hex_id>/
-        └── segments/
-              ├── segment-00000000000000000000.bin   ← finalized
-              ├── segment-00000000000000000001.bin   ← finalized
-              └── segment-00000000000000000002.open  ← active (only during scan)
+  ├── findings.db       ← SQLite database (WAL mode)
+  ├── findings.db-wal   ← WAL journal (transient, auto-managed by SQLite)
+  └── findings.db-shm   ← shared-memory index (transient, auto-managed by SQLite)
 ```
 
-- Each scan run gets its own `run-<hex_id>/` directory.
-- Segments use a 20-digit zero-padded sequence number.
-- Active segments have the `.open` extension; finalized segments have `.bin`.
-- After a clean shutdown, no `.open` files remain.
-- `list_finalized_segment_files()` walks `run-*/segments/segment-*.bin` in
-  lexical order, ignores `.open` files, and verifies V2 `prev_segment_hash`
-  continuity before returning paths.
+A single `findings.db` file contains all runs, findings, and metadata.
+Multiple runs accumulate in the same database; dimension rows (roots, rules,
+paths, secrets) are deduplicated via `INSERT OR IGNORE` on their natural keys.
 
-#### Binary Frame Format
+#### Star Schema
 
-Every record is wrapped in a self-describing frame with an 8-byte header.
-Readers accept both legacy V1 and current V2 frames:
+The schema follows a star-schema layout with two fact tables and four
+dimension tables, defined in `src/store/db/schema.rs`:
 
 ```text
-V1 body:
- byte:  0       4       8    9                     N
-        ┌───────┬───────┬────┬──────────────────────┐
-        │ len   │ CRC32 │type│      payload          │
-        │ u32le │ u32le │ u8 │   [len − 1] bytes     │
-        └───────┴───────┴────┴──────────────────────┘
-
-V2 body (position-bound CRC):
- byte:  0       4       8          16         24   25                 N
-        ┌───────┬───────┬──────────┬──────────┬────┬──────────────────┐
-        │len|F2 │ CRC32 │frame_seq │segment_id│type│payload            │
-        │ u32le │ u32le │  u64le   │  u64le   │ u8 │ [len − 17] bytes  │
-        └───────┴───────┴──────────┴──────────┴────┴──────────────────┘
+                  ┌──────────┐
+                  │  roots   │  ← dimension: scan target identity
+                  └────┬─────┘
+       ┌───────────────┼───────────────┐
+       ▼               ▼               ▼
+  ┌─────────┐    ┌──────────┐    ┌──────────┐
+  │  paths  │    │   runs   │    │occurrences│ ← fact: per-object findings
+  └────┬────┘    └────┬─────┘    └──┬──┬──┬──┘
+       │              │             │  │  │
+       │              ▼             │  │  ▼
+       │         ┌────────────┐    │  │ ┌─────────┐
+       │         │observations│    │  │ │ secrets │  ← dimension: normalised
+       │         └────────────┘    │  │ └─────────┘    secret identity
+       │              ▲            │  │
+       │         ┌────────┐       │  ▼
+       │         │run_rules│◄─────┤ ┌─────────┐
+       │         └────────┘       └►│  rules  │  ← dimension: detection rule
+       │                            └─────────┘
+       │                                ▲
+       └────────────────────────────────┘
+                 (paths ← occurrences → rules)
 ```
 
-| Field | Bytes | Encoding | Description |
-|-------|-------|----------|-------------|
-| `frame_len` | 0–3 | `u32_le` | Body length excluding header. In V2 the high bit (`F2`) is set; the lower 31 bits hold body length. |
-| `crc32` | 4–7 | `u32_le` | CRC-32/ISO-HDLC over the entire body. In V2 this includes `frame_seq` + `segment_id` + `type` + payload. |
-| `frame_seq` (V2) | 8–15 | `u64_le` | Monotonic per-run frame counter. |
-| `segment_id` (V2) | 16–23 | `u64_le` | Segment sequence number where the frame is committed. |
-| `type` | 8 (V1), 24 (V2) | `u8` | `FrameType`: `1`=RunStart, `2`=RuleDef, `3`=FindingBatch, `4`=RunEnd. |
-| `payload` | 9+ (V1), 25+ (V2) | variable | Record-specific bytes. Variable fields are length-prefixed with `u32_le`. |
+**Dimension tables:**
 
-Invariants:
-- All multi-byte integers are little-endian.
-- No inter-frame padding — segments are contiguous frame sequences.
-- Payload size hard cap: `DEFAULT_MAX_FRAME_PAYLOAD_BYTES` = **16 MB**.
+| Table | Natural key | Purpose |
+|-------|-------------|---------|
+| `roots` | `root_id` (32-byte BLAKE3) | Scan target identity (FS path, git remote, etc.) |
+| `paths` | `path_id` (32-byte BLAKE3) | Canonical file path within a root |
+| `rules` | `rule_fingerprint` (32-byte BLAKE3) | Detection rule identity |
+| `secrets` | `secret_hash` (32-byte BLAKE3) | Normalized secret identity with aggregate counters |
 
-#### Record Type Layouts
+**Fact tables:**
 
-**RunStart** (frame type `1`) — emitted once at the start of the run (first segment).
+| Table | Keys | Purpose |
+|-------|------|---------|
+| `runs` | `run_pk` (auto-increment) | One row per scan execution, with timestamps, status, and counters |
+| `occurrences` | `occ_pk` (auto-increment) | One row per unique finding (path + rule + secret + offsets) |
 
-```text
-offset  size   field
-  0     u16    version               (LOG_FORMAT_VERSION = 2, readers accept 1..=2)
-  2     u64    run_id
- 10     u64    started_unix_ms
- 18     u8     durability            (0 = SegmentClose, 1 = Batch)
- 19     u8     correlation_mode      (0 = Persistent, 1 = Ephemeral)
- 20     u8     key_source            (0 = EnvVar, 1 = MissingEnvVar, 2 = InvalidEnvVar)
- 21     u32    max_inflight_batches
- 25     u64    max_inflight_bytes
- 33     u32    max_frame_payload_bytes
-                                     total: 37 bytes payload
-```
+**Junction tables (WITHOUT ROWID):**
 
-**RuleDef** (frame type `2`) — one per loaded rule, emitted in ascending
-BLAKE3 fingerprint order for deterministic metadata.
+| Table | Composite PK | Purpose |
+|-------|-------------|---------|
+| `observations` | `(run_pk, occ_pk)` | Links runs to their observed occurrences (M:N) |
+| `run_rules` | `(run_pk, rule_pk)` | Tracks which rules were active in each run |
 
-```text
-offset  size   field
-  0     u32    rule_id               (engine rule index, 0-based)
-  4     [32]   rule_fingerprint      (BLAKE3-keyed)
- 36     u32    rule_name_len
- 40     [N]    rule_name             (UTF-8, N = rule_name_len)
-                                     total: 40 + N bytes payload
-```
+**Indexes:**
 
-**FindingBatch** (frame type `3`) — one per scanned object that produced
-findings.
+| Index | Column(s) | Purpose |
+|-------|-----------|---------|
+| `idx_runs_root` | `runs(root_pk)` | Filter runs by root |
+| `idx_runs_status_started` | `runs(status, started_at DESC)` | Status-filtered run listing without temp sort |
+| `idx_secrets_occ_count` | `secrets(occurrence_count DESC)` | Ordered secret listing without temp sort |
+| `idx_occ_secret` | `occurrences(secret_pk)` | Secret-based occurrence lookup |
+| `idx_occ_rule` | `occurrences(rule_pk)` | Rule-based occurrence lookup |
+| `idx_obs_occ` | `observations(occ_pk)` | Occurrence → observation lookup |
+| `idx_paths_root` | `paths(root_pk)` | Path → root lookup |
 
-```text
-offset  size   field
-  0     u32    object_path_len
-  4     [P]    object_path           (raw bytes, P = object_path_len)
-4+P     u32    findings_count
-8+P     ...    findings[]            (findings_count × 132 bytes each)
-```
+#### Connection Configuration
 
-Each finding record within the batch is fixed-size:
+| PRAGMA | Value | Rationale |
+|--------|-------|-----------|
+| `journal_mode` | WAL | Concurrent readers + single writer without blocking |
+| `synchronous` | NORMAL | Durability with WAL (fsync on checkpoint, not every commit) |
+| `foreign_keys` | ON | Enforce referential integrity at runtime |
+| `busy_timeout` | 5000ms | Retry on `SQLITE_BUSY` instead of failing immediately |
+| `cache_size` | -64000 | ~64 MB page cache (negative = KiB) |
 
-```text
-offset  size   field
-  0     u32    rule_id
-  4     [32]   rule_fingerprint
- 36     [32]   secret_hash           (BLAKE3 of normalized secret)
- 68     [32]   finding_id            (deterministic occurrence ID)
-100     u64    root_hint_start       (dedup region start)
-108     u64    root_hint_end         (dedup region end, exclusive)
-116     u64    span_start            (matched secret start)
-124     u64    span_end              (matched secret end, exclusive)
-                                     total: 132 bytes per finding
-```
+Read-only connections (for CLI query commands) skip `journal_mode` and
+`synchronous` pragmas to avoid requiring write access.
 
-**RunEnd** (frame type `4`) — final frame sealing the run.
+#### Write Path
 
-```text
-offset  size   field
-  0     u64    ended_unix_ms
-  8     u64    dropped_findings      (engine cap drops)
- 16     u64    persistence_emit_failures
-  24     u8     incomplete            (1 if any loss, 0 otherwise)
-                                     total: 25 bytes payload
-```
+`SqliteStoreProducer` implements the `StoreProducer` trait:
 
-#### Segment Integrity Trailer (V2)
+1. **`open(config)`** — Opens (or creates) the database, applies schema
+   migrations via `PRAGMA user_version`, resolves or inserts the root
+   dimension row, and creates a new `runs` record with `status = InProgress`.
 
-Finalized V2 segments use both a fixed header and a fixed trailer:
+2. **`emit_fs_batch(batch)`** — Runs inside a `BEGIN IMMEDIATE … COMMIT`
+   transaction:
+   - Resolves or inserts the `paths` dimension row.
+   - For each finding: resolves or inserts `rules` (with in-memory cache),
+     `secrets`, and `occurrences` dimension rows.
+   - Inserts `observations` junction rows linking the run to occurrences.
+   - Updates secret aggregate counters (`occurrence_count`, `first_seen_run`,
+     `last_seen_run`) via `touch_secret_observation`.
+   - On any DML failure, the entire transaction is rolled back.
 
-**Segment header (written at segment start):**
+3. **`record_fs_run_loss(loss)`** — Accumulates drop/failure counters in
+   the writer's in-memory `RunCounters`.
 
-```text
-offset  size   field
-  0     [8]    magic                ("SCRHDRv2")
-  8     u64    segment_id
- 16     [32]   prev_segment_hash     (hash of previous finalized segment, or zero for first)
-                                     total: 48 bytes
-```
+4. **`end_run(had_coverage_limits)`** — Derives final run status from
+   counters and updates the `runs` row with `ended_at`, `status`, and
+   all counter columns.
 
-Finalized `.bin` segments append a fixed trailer after the last frame:
+#### Run Status Derivation
 
-```text
-offset  size   field
-  0     [8]    magic                ("SCRSEGv2")
-  8     u64    segment_id
- 16     u64    frame_count           (# of frames in this segment)
- 24     u64    total_frame_bytes     (sum of frame byte lengths, excludes trailer)
- 32     [32]   frame_crc_chain       (BLAKE3 chain over per-frame crc32 values)
-                                     total: 64 bytes
-```
+Run status is derived from `RunCounters` at `end_run` time:
 
-Readers validate trailer fields against observed frame stream state when
-present and derive a deterministic per-segment hash from:
-`segment_id`, `prev_segment_hash`, `frame_count`, `total_frame_bytes`, and
-`frame_crc_chain`.
+| Status code | Name | Condition |
+|-------------|------|-----------|
+| 0 | `InProgress` | Set at `open()`, before `end_run()` is called |
+| 1 | `Complete` | No drops, no emit failures, no coverage limits |
+| 2 | `CompleteWithCoverageLimits` | No drops/failures, but coverage caps applied |
+| 3 | `Incomplete` | Any dropped findings or emit failures |
+| 4 | `Failed` | Reserved for scan-level errors |
 
-`.open` files may not contain a trailer; recovery scans treat clean EOF at a
-frame boundary as valid for `.open`.
+Precedence: Incomplete > CompleteWithCoverageLimits > Complete.
 
-#### Cross-Segment Chain Verification (V2)
+#### Query Path
 
-For V2 runs, segment ordering/integrity is validated by hash chaining:
+Read-path queries in `src/store/db/query.rs`:
 
-- First segment must have `prev_segment_hash = [0; 32]`.
-- Each subsequent segment header must point to the previous segment's derived hash.
-- Recovery (`recover_open_segments`) and replay segment discovery
-  (`list_finalized_segment_files`) both validate this chain and fail on
-  insertion/deletion/reordering/tampering patterns that break continuity.
+| Function | CLI command | Description |
+|----------|------------|-------------|
+| `list_runs()` | `store list-runs` | List runs ordered by `started_at DESC`, optional status filter |
+| `list_findings()` | `store list-findings` | Findings for a run, with optional rule/path LIKE filters |
+| `diff_runs()` | `store diff` | Set-difference between two runs (new, resolved, unchanged count) |
+| `list_secrets()` | `store list-secrets` | Unique secrets ordered by occurrence count |
+| `resolve_run_pk()` | (internal) | Resolve hex prefix to `run_pk` (exact or LIKE match) |
 
-#### Run Content Ordering
+#### Schema Migration
 
-A well-formed run (which may span multiple segments due to rotation) follows
-this frame sequence:
+`PRAGMA user_version` tracks the current schema version. Each migration
+function (`apply_v1`, `apply_v2`, …) is idempotent (`CREATE IF NOT EXISTS`)
+and runs inside a single `BEGIN IMMEDIATE` transaction. Concurrent callers
+are serialized via the busy timeout.
 
-```text
-┌──────────────────────────────────────────────────────────────┐
-│  RunStart       (1 frame, first segment only)                │
-├──────────────────────────────────────────────────────────────┤
-│  RuleDef        (N frames, sorted by fingerprint ascending)  │
-├──────────────────────────────────────────────────────────────┤
-│  FindingBatch   (M frames, one per scanned object)           │
-│                 ← segment rotation may occur here →          │
-├──────────────────────────────────────────────────────────────┤
-│  RunEnd         (1 frame, final segment only)                │
-└──────────────────────────────────────────────────────────────┘
-```
+#### Identity Derivation
 
-The writer enforces this order across segment boundaries. The reader decodes
-frames in whatever order they appear (no ordering validation).
+The writer derives all 32-byte identifiers using BLAKE3 domain-separated hashes:
 
-#### Reader API
+| Identity | Domain prefix | Inputs |
+|----------|---------------|--------|
+| `rule_fingerprint` | `scanner.store.db.v1.rule_fingerprint` | `rule_id` |
+| `path_id` | `scanner.store.db.v1.path_id` | `root_id`, `canonical_path` |
+| `occurrence_id` | `scanner.store.db.v1.occurrence_id` | `path_id`, `rule_fingerprint`, `secret_hash`, byte offsets |
 
-Use `store::log::reader::LogReader` when replaying persisted runs or scanning
-segments for recovery:
+#### Thread Safety
 
-```rust
-use scanner_rs::store::log::LogReader;
-
-let file = std::fs::File::open("segment-00000000000000000000.bin")?;
-let mut reader = LogReader::with_default_limit(file);
-while let Some(record) = reader.next_record()? {
-    // process record
-}
-```
-
-`LogReader` keeps a reusable frame buffer and reports deterministic,
-reason-coded failures via `LogReadError`:
-
-| Reason | Meaning |
-|--------|---------|
-| `CrcMismatch` | Frame CRC does not match payload bytes |
-| `Truncated` | EOF before full header/body completion |
-| `UnsupportedFrame` | Unknown frame discriminant |
-| `UnsupportedVersion` | `RunStart.version` is outside supported range (`1..=LOG_FORMAT_VERSION`) |
-| `MalformedFrame` | Invalid frame shape or payload fields |
-| `Io` | Underlying read error from the transport |
-
-On any failure, callers also get:
-- `frame_index` (0-based frame number),
-- `frame_offset` (byte offset where that frame started).
-
-These fields make startup recovery deterministic: truncate `.open` at the last
-known-good offset and stop at first bad frame.
-
-#### Startup `.open` Recovery
-
-Use `recover_open_segments(store_root, max_frame_payload_bytes)` before
-query/replay startup to convert stale `.open` files into finalized `.bin`
-segments.
-
-Policy:
-- Scan each `.open` frame-by-frame in lexical order.
-- On first recoverable decode error, treat that frame boundary as EOF.
-- Surface `Io` and `UnsupportedVersion` as hard recovery errors (do not
-  truncate/rename the source `.open`).
-- Truncate tail bytes beyond the last valid frame.
-- Rename `.open` → `.bin`.
-- If matching `.bin` already exists, discard `.open` and record
-  `DiscardedDuplicateBin` in the recovery report.
-
-The returned `OpenSegmentRecoveryReport` captures per-file outcomes and
-truncation metadata for audit/telemetry.
-
-#### Segment Rotation
-
-Segments rotate when writing a frame would exceed `max_segment_bytes`
-*after reserving trailer space* (default **64 MB**):
-
-```text
-write_frame(data):
-    trailer_bytes = 64
-    if frame_count > 0 AND bytes_written + len(data) + trailer_bytes > max_segment_bytes:
-        append trailer(frame_count, total_frame_bytes, frame_crc_chain)
-        sync_data()              ← flush to disk
-        rename .open → .bin      ← atomic finalization
-        sync_dir()               ← directory entry durable
-        derive segment_hash      ← used as next segment's prev_segment_hash
-        open new .open (seq++)
-        write segment header(segment_id, prev_segment_hash)
-        bytes_written = header_bytes
-    write data to current .open
-    bytes_written += len(data)
-```
-
-A single frame is never split across segments. Frames larger than
-`max_segment_bytes - trailer_bytes` are rejected outright.
-
-#### Durability Modes
-
-The `LogDurabilityMode` controls how often `sync_data()` (fdatasync) is
-called:
-
-| Mode | Discriminant | Behavior | Trade-off |
-|------|-------------|----------|-----------|
-| `SegmentClose` | `0` | `sync_data` only at segment rotation/finalize | Higher throughput; up to one segment of findings at risk on crash |
-| `Batch` | `1` | `sync_data` after every `FindingBatch` frame write | Lower throughput; at most one batch at risk on crash |
-
-Default: `SegmentClose`.
-
-#### Writer Configuration Defaults
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `max_inflight_batches` | 256 | Max queued finding-batch frames before backpressure blocks producers |
-| `max_inflight_bytes` | 64 MB | Max queued encoded bytes before backpressure blocks producers |
-| `max_segment_bytes` | 64 MB | Segment rotation threshold |
-| `max_frame_payload_bytes` | 16 MB | Hard cap on any single frame's payload |
-| `durability` | `SegmentClose` | fsync strategy |
-
-Validation rejects: any zero-valued budget, `max_inflight_batches` > `u32::MAX`
-(wire format limit), and segment sizes that cannot fit at least one maximal
-configured V2 frame plus the fixed 48-byte header and 64-byte trailer.
-
-#### Backpressure
-
-Two budgets are enforced atomically on the producer side:
-
-```text
-Producer thread                       Writer thread
-───────────────                      ─────────────
-reserve_inflight(frame_bytes)
-  ├─ batches < 256 AND               write frame to disk
-  │  bytes < 64 MB?                  release_inflight()
-  │     YES → proceed                     │
-  │     NO  → block on Condvar  ◄─────────┘ notify_all()
-  ▼
-send frame on channel ──────────►  recv → write → release
-```
-
-- A single frame exceeding `max_inflight_bytes` is rejected immediately
-  (not silently dropped).
-- Blocked producers wait on a `Condvar`, not spin.
+All mutable state is behind a `Mutex<WriterState>`. The scheduler calls
+`emit_fs_batch` from multiple worker threads; the mutex serializes writes.
+Lock acquisition uses `map_err` to return `FsStoreError` instead of
+panicking on poisoned locks.
 
 ## Loss Accounting
 
@@ -511,8 +373,9 @@ Findings can be lost at two points, and both are tracked:
                                                        │
                                                        ▼
                                               record_fs_run_loss()
-                                              Backend decides: complete
-                                              vs partial run
+                                              ──► end_run()
+                                              Status: Complete / Incomplete
+                                              / CompleteWithCoverageLimits
 ```
 
 ### Metrics Rollup
@@ -550,14 +413,14 @@ scanner scan fs --path=/some/dir --persist-findings
 
 The `--persist-findings` flag sets `FsScanConfig.persist_findings = true`,
 which causes the orchestrator to wire a `StoreProducer` into the
-`ParallelScanConfig`. The default producer is `AppendLogStoreProducer`, which
-writes run directories under the append-log root.
+`ParallelScanConfig`. The default producer is `SqliteStoreProducer`, which
+writes to `findings.db` under the store root.
 
 #### Environment Variables
 
 | Variable | Purpose |
 |----------|---------|
-| `SCANNER_FS_LOG_DIR` | Override the append-log store root directory (takes precedence over the default sibling-of-scan-root path) |
+| `SCANNER_FS_LOG_DIR` | Override the store root directory (takes precedence over the default sibling-of-scan-root path) |
 | `SCANNER_SECRET_KEY` | Stable secret key for BLAKE3-keyed identity hashes; if unset, an ephemeral key is generated (cross-run dedup disabled) |
 
 ### Wiring Path
@@ -570,7 +433,7 @@ FsScanConfig { persist_findings: true }
   │
   ▼
 run_fs() in orchestrator.rs
-  │  creates Arc<AppendLogStoreProducer>
+  │  creates Arc<SqliteStoreProducer>
   ▼
 ParallelScanConfig { store_producer: Some(Arc<dyn StoreProducer>) }
   │
@@ -615,11 +478,6 @@ files=N chunks=N bytes=N findings=N errors=N dropped_findings=N persist_emit_fai
 
 The `SummaryEvent.status` field is set to `"partial"` when
 `persistence_incomplete` is true, instead of the default `"complete"`.
-
-## What's NOT Included (Future Work)
-
-- **No derived index yet** — logs are the source of truth; SQLite/indexed query
-  acceleration is post-MVP.
 
 ## Related Documentation
 

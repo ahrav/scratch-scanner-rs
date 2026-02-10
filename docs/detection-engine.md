@@ -216,30 +216,27 @@ Filesystem persistence now has a separate identity contract in `src/store/`:
   (`step_id == STEP_ROOT` or `dedupe_with_span`), and UTF-16 LE/BE variant
   discrimination.
 
-## FS Append-Log Writer
+## SQLite Persistence Backend
 
-Filesystem scans now have a concrete persistence backend in
-`src/store/log/`:
+Filesystem scans have a concrete persistence backend in
+`src/store/db/`:
 
-- `store::log::format` defines deterministic frames with explicit size caps and
-  CRC32 integrity over the full body (legacy V1 `type + payload`; current V2
-  `frame_seq + segment_id + frame_type + payload`), plus finalized-segment
-  integrity headers/trailers and cross-segment hash chaining.
-- `store::log::writer` runs a bounded single-writer thread with backpressure on
-  both in-flight batch count (default 256) and in-flight bytes (default 64 MB).
-- Segments rotate at `max_segment_bytes` (default 64 MB). Active segments are
-  written as `.open` and finalized to `.bin` via `sync_data()` + atomic rename,
-  preserving crash-safe visibility boundaries.
-- `RuleDef` records are emitted in fingerprint-sorted order, so metadata order
-  is deterministic even if findings arrive from workers in non-deterministic
-  order.
-- Two durability modes: `SegmentClose` (fsync at rotation only, default) and
-  `Batch` (fsync after every finding frame).
-- Store root is resolved from `SCANNER_FS_LOG_DIR` env var, or defaults to a
-  sibling directory of the scan root.
+- `store::db::schema` defines a star-schema with dimension tables (`roots`,
+  `paths`, `rules`, `secrets`) and fact tables (`runs`, `occurrences`,
+  `observations`). Schema migrations are tracked via `PRAGMA user_version`.
+- `store::db::writer` runs per-batch `BEGIN IMMEDIATE … COMMIT` transactions
+  within a `Mutex`-guarded SQLite connection. WAL mode enables concurrent
+  readers without blocking the single writer.
+- Dimension rows (`roots`, `rules`, `paths`, `secrets`) are deduplicated via
+  `INSERT OR IGNORE` on their natural keys. An in-memory rule cache avoids
+  redundant lookups for frequently seen rules.
+- Run status (`Complete`, `CompleteWithCoverageLimits`, `Incomplete`) is
+  derived from `RunCounters` at `end_run()` time.
+- Store root is resolved from `SCANNER_FS_LOG_DIR` env var, or defaults to
+  `<scan_root>/.scanner-store/`.
 
-For the full binary wire format specification, directory layout, and
-configuration defaults, see [fs-persistence-pipeline.md § Append-Log Backend](fs-persistence-pipeline.md#append-log-backend).
+For the full schema documentation, query APIs, and configuration,
+see [fs-persistence-pipeline.md § SQLite Backend](fs-persistence-pipeline.md#sqlite-backend).
 
 **Pressure Coalescing**: If windows exceed `max_windows_per_rule_variant` (16), the gap doubles until windows fit, or everything merges into one.
 

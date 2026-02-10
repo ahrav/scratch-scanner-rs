@@ -4,8 +4,9 @@
 
 mod archive_path_canonicalization;
 mod binary_classification;
-mod fs_log_codec;
-mod fs_log_reader;
+// Log-based persistence removed in favor of SQLite. See src/store/db/.
+// mod fs_log_codec;
+// mod fs_log_reader;
 mod git_commit_walk;
 mod git_engine_adapter;
 mod git_spill_dedupe;

@@ -34,12 +34,15 @@ use crate::git_scan::{
 };
 use crate::scheduler::parallel_scan_dir;
 use crate::scheduler::ParallelScanConfig;
-use crate::store::{AppendLogStoreProducer, StoreProducer};
+use crate::store::{RootKind, SqliteStoreConfig, SqliteStoreProducer, StoreKeys, StoreProducer};
 use crate::{demo_rules, demo_transforms, demo_tuning, AnchorMode, AnchorPolicy, Engine};
 
 use super::cli::TransformFilter;
 use super::source::git::{EmptyWatermarkStore, GitCliResolver};
-use super::{EventFormat, FsScanConfig, GitSourceConfig, ScanConfig, SourceConfig};
+use super::{
+    EventFormat, FsScanConfig, GitSourceConfig, OutputFormat, ScanConfig, SourceConfig,
+    StoreCommand,
+};
 
 /// Run a scan using the unified configuration.
 ///
@@ -67,6 +70,7 @@ pub fn run(config: ScanConfig) -> io::Result<()> {
             rules_file,
             &transform_filter,
         ),
+        SourceConfig::Store(cmd) => run_store_command(cmd),
     }
 }
 
@@ -96,6 +100,9 @@ fn select_fs_backend(
     }
 }
 
+/// Probe whether io_uring is usable on this kernel by attempting to
+/// create a ring with the given entry count. Returns `false` on older
+/// kernels or when seccomp blocks `io_uring_setup`.
 #[cfg(target_os = "linux")]
 #[inline]
 fn uring_backend_available(ring_entries: u32) -> bool {
@@ -122,17 +129,37 @@ fn run_fs(
     let t0 = Instant::now();
     let rules = load_rules_for_scan(rules_file.as_deref());
     let store_producer: Option<Arc<dyn StoreProducer>> = if cfg.persist_findings {
-        let producer = AppendLogStoreProducer::for_fs_scan(&cfg.root, &rules).map_err(|err| {
+        let store_dir = cfg.root.join(".scanner-store");
+        let keys = StoreKeys::bootstrap_from_env();
+        let root_id = crate::store::root_id::root_id(
+            &crate::store::RootIdInput {
+                kind: RootKind::Fs,
+                identity_scheme: "fs_path_v1",
+                canonical_identity: cfg.root.to_string_lossy().as_bytes(),
+            },
+            &keys,
+        );
+        let sqlite_config = SqliteStoreConfig {
+            db_path: store_dir.join("findings.db"),
+            root_id,
+            root_kind: RootKind::Fs,
+            identity_scheme: "fs_path_v1".to_string(),
+            canonical_identity: cfg.root.to_string_lossy().as_bytes().to_vec(),
+            display_name: Some(cfg.root.display().to_string()),
+            id_hash_mode: keys.id_hash_mode(),
+            scanner_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        };
+        let producer = Arc::new(SqliteStoreProducer::open(sqlite_config).map_err(|err| {
             io::Error::other(format!(
-                "failed to initialize append-log persistence backend: {}",
+                "failed to initialize SQLite persistence backend: {}",
                 err.detail()
             ))
-        })?;
+        })?);
         eprintln!(
-            "info: --persist-findings enabled; append-log root: {}",
-            producer.store_root().display()
+            "info: --persist-findings enabled; store: {}",
+            store_dir.join("findings.db").display()
         );
-        Some(Arc::new(producer) as Arc<dyn StoreProducer>)
+        Some(producer)
     } else {
         None
     };
@@ -166,8 +193,8 @@ fn run_fs(
         event_sink: Arc::clone(&event_sink),
         ..Default::default()
     };
-    if let Some(producer) = store_producer {
-        ps_config.store_producer = Some(producer);
+    if let Some(ref producer) = store_producer {
+        ps_config.store_producer = Some(Arc::clone(producer));
     }
     if cfg.no_archives {
         ps_config.archive.enabled = false;
@@ -256,6 +283,12 @@ fn run_fs(
 
     #[cfg(not(target_os = "linux"))]
     let report = parallel_scan_dir(&cfg.root, Arc::clone(&engine), ps_config)?;
+
+    if let Some(ref store) = store_producer {
+        store
+            .end_run(false)
+            .map_err(|err| io::Error::other(format!("failed to finalize run: {}", err.detail())))?;
+    }
 
     let scan_elapsed = scan_start.elapsed();
     let total_elapsed = t0.elapsed();
@@ -416,6 +449,260 @@ fn run_git(
             std::process::exit(2);
         }
     }
+}
+
+/// Execute a store query command (list-runs, list-findings, diff, list-secrets).
+///
+/// Opens the SQLite database in read-only mode and dispatches to the
+/// appropriate query function from [`crate::store::db::query`].
+fn run_store_command(cmd: StoreCommand) -> io::Result<()> {
+    use crate::store::db::query;
+    use crate::store::db::schema::configure_readonly_connection;
+    use rusqlite::{Connection, OpenFlags};
+
+    let open_db = |path: &std::path::Path| -> io::Result<Connection> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| io::Error::other(format!("failed to open store: {e}")))?;
+        configure_readonly_connection(&conn)
+            .map_err(|e| io::Error::other(format!("failed to configure connection: {e}")))?;
+        Ok(conn)
+    };
+
+    match cmd {
+        StoreCommand::ListRuns {
+            store_dir,
+            status,
+            limit,
+            format,
+        } => {
+            let conn = open_db(&store_dir.join("findings.db"))?;
+            let runs = query::list_runs(&conn, status, limit)
+                .map_err(|e| io::Error::other(format!("query failed: {e}")))?;
+
+            match format {
+                OutputFormat::Json => {
+                    let rows: Vec<_> = runs
+                        .iter()
+                        .map(|run| {
+                            serde_json::json!({
+                                "run_id": run.run_id_hex,
+                                "root": run.root_display,
+                                "started_at": run.started_at,
+                                "ended_at": run.ended_at,
+                                "status": run.status,
+                                "findings": run.findings_emitted,
+                                "objects": run.objects_scanned,
+                            })
+                        })
+                        .collect();
+                    print_json(&rows)?;
+                }
+                OutputFormat::Text => {
+                    if runs.is_empty() {
+                        println!("No runs found.");
+                    } else {
+                        println!(
+                            "{:<36} {:<8} {:<15} {:<10} ROOT",
+                            "RUN ID", "STATUS", "STARTED", "FINDINGS"
+                        );
+                        for run in &runs {
+                            let status_str = status_label(run.status);
+                            let root = run.root_display.as_deref().unwrap_or("-");
+                            println!(
+                                "{:<36} {:<8} {:<15} {:<10} {}",
+                                &run.run_id_hex[..run.run_id_hex.len().min(36)],
+                                status_str,
+                                run.started_at,
+                                run.findings_emitted,
+                                root,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        StoreCommand::ListFindings {
+            store_dir,
+            run,
+            rule,
+            path,
+            limit,
+            format,
+        } => {
+            let conn = open_db(&store_dir.join("findings.db"))?;
+            let run_pk = query::resolve_run_pk(&conn, &run)
+                .map_err(|e| io::Error::other(format!("query failed: {e}")))?
+                .ok_or_else(|| io::Error::other(format!("run not found: {run}")))?;
+
+            let findings =
+                query::list_findings(&conn, run_pk, rule.as_deref(), path.as_deref(), limit)
+                    .map_err(|e| io::Error::other(format!("query failed: {e}")))?;
+
+            match format {
+                OutputFormat::Json => {
+                    let rows: Vec<_> = findings
+                        .iter()
+                        .map(|f| {
+                            serde_json::json!({
+                                "occurrence_id": f.occurrence_id_hex,
+                                "path": f.object_path,
+                                "rule": f.rule_name,
+                                "start": f.start_byte,
+                                "end": f.end_byte,
+                                "secret_hash": f.secret_hash_hex,
+                            })
+                        })
+                        .collect();
+                    print_json(&rows)?;
+                }
+                OutputFormat::Text => {
+                    if findings.is_empty() {
+                        println!("No findings for run {run}.");
+                    } else {
+                        println!("{} findings for run {}:", findings.len(), &run);
+                        for f in &findings {
+                            println!(
+                                "  {} {}:{}-{} [{}]",
+                                f.rule_name,
+                                f.object_path,
+                                f.start_byte,
+                                f.end_byte,
+                                &f.secret_hash_hex[..16],
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        StoreCommand::Diff {
+            store_dir,
+            run_a,
+            run_b,
+            format,
+        } => {
+            let conn = open_db(&store_dir.join("findings.db"))?;
+            let pk_a = query::resolve_run_pk(&conn, &run_a)
+                .map_err(|e| io::Error::other(format!("query failed: {e}")))?
+                .ok_or_else(|| io::Error::other(format!("run A not found: {run_a}")))?;
+            let pk_b = query::resolve_run_pk(&conn, &run_b)
+                .map_err(|e| io::Error::other(format!("query failed: {e}")))?
+                .ok_or_else(|| io::Error::other(format!("run B not found: {run_b}")))?;
+
+            let diff = query::diff_runs(&conn, pk_a, pk_b, None)
+                .map_err(|e| io::Error::other(format!("query failed: {e}")))?;
+
+            match format {
+                OutputFormat::Json => {
+                    let payload = serde_json::json!({
+                        "new_count": diff.new_findings.len(),
+                        "resolved_count": diff.resolved_findings.len(),
+                        "unchanged_count": diff.unchanged_count,
+                    });
+                    print_json(&payload)?;
+                }
+                OutputFormat::Text => {
+                    println!(
+                        "Diff: {} new, {} resolved, {} unchanged",
+                        diff.new_findings.len(),
+                        diff.resolved_findings.len(),
+                        diff.unchanged_count,
+                    );
+                    if !diff.new_findings.is_empty() {
+                        println!("\nNew findings:");
+                        for f in &diff.new_findings {
+                            println!(
+                                "  + {} {}:{}-{}",
+                                f.rule_name, f.object_path, f.start_byte, f.end_byte
+                            );
+                        }
+                    }
+                    if !diff.resolved_findings.is_empty() {
+                        println!("\nResolved findings:");
+                        for f in &diff.resolved_findings {
+                            println!(
+                                "  - {} {}:{}-{}",
+                                f.rule_name, f.object_path, f.start_byte, f.end_byte
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        StoreCommand::ListSecrets {
+            store_dir,
+            status,
+            limit,
+            format,
+        } => {
+            let conn = open_db(&store_dir.join("findings.db"))?;
+            let secrets = query::list_secrets(&conn, status, limit)
+                .map_err(|e| io::Error::other(format!("query failed: {e}")))?;
+
+            match format {
+                OutputFormat::Json => {
+                    let rows: Vec<_> = secrets
+                        .iter()
+                        .map(|s| {
+                            serde_json::json!({
+                                "secret_hash": s.secret_hash_hex,
+                                "occurrences": s.occurrence_count,
+                                "first_seen": s.first_seen_run,
+                                "last_seen": s.last_seen_run,
+                                "status": s.status,
+                            })
+                        })
+                        .collect();
+                    print_json(&rows)?;
+                }
+                OutputFormat::Text => {
+                    if secrets.is_empty() {
+                        println!("No secrets found.");
+                    } else {
+                        println!(
+                            "{:<36} {:<12} {:<8} FIRST SEEN",
+                            "SECRET HASH", "OCCURRENCES", "STATUS"
+                        );
+                        for s in &secrets {
+                            println!(
+                                "{:<36} {:<12} {:<8} {}",
+                                &s.secret_hash_hex[..s.secret_hash_hex.len().min(36)],
+                                s.occurrence_count,
+                                status_label(s.status),
+                                s.first_seen_run,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Map a numeric status code to a human-readable label.
+fn status_label(status: i32) -> &'static str {
+    match status {
+        0 => "active",
+        1 => "complete",
+        2 => "limited",
+        3 => "incomplete",
+        4 => "failed",
+        _ => "unknown",
+    }
+}
+
+fn print_json<T: serde::Serialize>(value: &T) -> io::Result<()> {
+    let encoded = serde_json::to_string(value)
+        .map_err(|e| io::Error::other(format!("json encode failed: {e}")))?;
+    println!("{encoded}");
+    Ok(())
 }
 
 /// Print git scan results to stderr (debug stats and/or perf breakdown).
