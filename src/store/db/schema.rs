@@ -12,16 +12,20 @@
 //!        ▼               ▼               ▼
 //!   ┌─────────┐    ┌──────────┐    ┌──────────┐
 //!   │  paths  │    │   runs   │    │occurrences│ ← fact: per-object findings
-//!   └─────────┘    └────┬─────┘    └─────┬─────┘
-//!                       │                │
-//!                       ▼                ▼
-//!                  ┌────────────┐   ┌─────────┐
-//!                  │observations│   │ secrets │  ← dimension: normalised secret
-//!                  └────────────┘   └─────────┘
-//!                       ▲
-//!                  ┌────────┐
-//!                  │run_rules│  ← junction: rules active in a run
-//!                  └────────┘
+//!   └────┬────┘    └────┬─────┘    └──┬──┬──┬──┘
+//!        │              │             │  │  │
+//!        │              ▼             │  │  ▼
+//!        │         ┌────────────┐    │  │ ┌─────────┐
+//!        │         │observations│    │  │ │ secrets │  ← dimension: normalised
+//!        │         └────────────┘    │  │ └─────────┘    secret identity
+//!        │              ▲            │  │
+//!        │         ┌────────┐       │  ▼
+//!        │         │run_rules│◄─────┤ ┌─────────┐
+//!        │         └────────┘       └►│  rules  │  ← dimension: detection rule
+//!        │                            └─────────┘
+//!        │                                ▲
+//!        └────────────────────────────────┘
+//!                  (paths ← occurrences → rules)
 //! ```
 //!
 //! `observations` and `run_rules` are `WITHOUT ROWID` junction tables keyed by

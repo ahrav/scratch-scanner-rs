@@ -214,16 +214,20 @@ dimension tables, defined in `src/store/db/schema.rs`:
        ▼               ▼               ▼
   ┌─────────┐    ┌──────────┐    ┌──────────┐
   │  paths  │    │   runs   │    │occurrences│ ← fact: per-object findings
-  └─────────┘    └────┬─────┘    └─────┬─────┘
-                      │                │
-                      ▼                ▼
-                 ┌────────────┐   ┌─────────┐
-                 │observations│   │ secrets │  ← dimension: normalised secret
-                 └────────────┘   └─────────┘
-                      ▲
-                 ┌────────┐
-                 │run_rules│  ← junction: rules active in a run
-                 └────────┘
+  └────┬────┘    └────┬─────┘    └──┬──┬──┬──┘
+       │              │             │  │  │
+       │              ▼             │  │  ▼
+       │         ┌────────────┐    │  │ ┌─────────┐
+       │         │observations│    │  │ │ secrets │  ← dimension: normalised
+       │         └────────────┘    │  │ └─────────┘    secret identity
+       │              ▲            │  │
+       │         ┌────────┐       │  ▼
+       │         │run_rules│◄─────┤ ┌─────────┐
+       │         └────────┘       └►│  rules  │  ← dimension: detection rule
+       │                            └─────────┘
+       │                                ▲
+       └────────────────────────────────┘
+                 (paths ← occurrences → rules)
 ```
 
 **Dimension tables:**
@@ -257,9 +261,7 @@ dimension tables, defined in `src/store/db/schema.rs`:
 | `idx_runs_status_started` | `runs(status, started_at DESC)` | Status-filtered run listing without temp sort |
 | `idx_secrets_occ_count` | `secrets(occurrence_count DESC)` | Ordered secret listing without temp sort |
 | `idx_occ_secret` | `occurrences(secret_pk)` | Secret-based occurrence lookup |
-| `idx_occ_path` | `occurrences(path_pk)` | Path-based occurrence lookup |
 | `idx_occ_rule` | `occurrences(rule_pk)` | Rule-based occurrence lookup |
-| `idx_occ_root` | `occurrences(root_pk)` | Root-based occurrence lookup |
 | `idx_obs_occ` | `observations(occ_pk)` | Occurrence → observation lookup |
 | `idx_paths_root` | `paths(root_pk)` | Path → root lookup |
 
