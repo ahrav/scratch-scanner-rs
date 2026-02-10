@@ -947,7 +947,7 @@ fn extract_worker_loop<E: ScanEngine>(
     let mut io_errors = 0u64;
     let mut extract_failures = 0u64;
 
-    for mut work in rx {
+    for work in rx {
         let display = &*work.token.display;
 
         // Read entire file (capped at 64 MiB).
