@@ -246,7 +246,7 @@ impl TriageStore {
             .prepare(
                 "SELECT root_id, occurrence_id, status, reason, updated_by, clock, updated_at
                  FROM occurrence_triage WHERE root_id = ?1
-                 ORDER BY updated_at DESC LIMIT ?2",
+                 ORDER BY updated_at DESC, clock DESC LIMIT ?2",
             )
             .map_err(|e| io::Error::other(format!("triage query failed: {e}")))?;
 
