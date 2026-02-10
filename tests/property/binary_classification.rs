@@ -72,7 +72,6 @@ proptest! {
     }
 }
 
-#[cfg(feature = "binary-extract")]
 mod with_extraction {
     use proptest::prelude::*;
     use scanner_rs::content_policy::extract::{extract_content, ExtractResult};

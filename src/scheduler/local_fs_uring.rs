@@ -281,6 +281,7 @@ pub struct UringIoStats {
     pub binary_skipped: u64,
     pub archives_sniffed: u64,
     pub archives_send_failed: u64,
+    pub extractions_routed: u64,
     pub bytes_enqueued: u64,
 }
 
@@ -410,6 +411,7 @@ impl UringIoStats {
         self.binary_skipped += other.binary_skipped;
         self.archives_sniffed += other.archives_sniffed;
         self.archives_send_failed += other.archives_send_failed;
+        self.extractions_routed += other.extractions_routed;
         self.bytes_enqueued += other.bytes_enqueued;
     }
 }
@@ -477,6 +479,13 @@ struct FileWork {
 struct ArchiveWork {
     path: PathBuf,
     kind: ArchiveKind,
+    token: Arc<FileToken>,
+}
+
+/// Work item for binary-extraction worker threads.
+struct ExtractWork {
+    path: PathBuf,
+    fmt: crate::content_policy::ExtractableFormat,
     token: Arc<FileToken>,
 }
 
@@ -816,6 +825,113 @@ fn archive_worker_loop<E: ScanEngine>(
 }
 
 // ============================================================================
+// Extraction Workers
+// ============================================================================
+
+/// Extraction worker stats returned after all work items are processed.
+#[allow(dead_code)]
+struct ExtractWorkerStats {
+    bytes_scanned: u64,
+    chunks_scanned: u64,
+    findings_emitted: u64,
+    files_extracted: u64,
+    files_open_failed: u64,
+    extract_failures: u64,
+}
+
+/// Per-extraction-worker loop: receives `ExtractWork` items from a channel,
+/// opens the file, extracts scannable text, and scans it as a single chunk.
+fn extract_worker_loop<E: ScanEngine>(
+    rx: chan::Receiver<ExtractWork>,
+    engine: Arc<E>,
+    event_sink: Arc<dyn EventSink>,
+    dedupe: bool,
+) -> ExtractWorkerStats {
+    use crate::content_policy::extract::{
+        extract_content, ExtractResult, EXTRACT_INPUT_CAP, EXTRACT_OUTPUT_CAP, JAR_ENTRY_CAP,
+    };
+    use std::io::Read as _;
+
+    let mut scratch = engine.new_scratch();
+    let mut pending = Vec::with_capacity(4096);
+    let mut input_buf = Vec::with_capacity(EXTRACT_INPUT_CAP);
+    let mut output_buf = Vec::with_capacity(EXTRACT_OUTPUT_CAP);
+    let mut extract_scratch = Vec::with_capacity(JAR_ENTRY_CAP);
+
+    let mut total_bytes = 0u64;
+    let mut total_chunks = 0u64;
+    let mut total_findings = 0u64;
+    let mut files_extracted = 0u64;
+    let mut files_open_failed = 0u64;
+    let mut extract_failures = 0u64;
+
+    for work in rx {
+        let display = &*work.token.display;
+
+        let mut file = match File::open(&work.path) {
+            Ok(f) => f,
+            Err(_e) => {
+                files_open_failed += 1;
+                #[cfg(debug_assertions)]
+                eprintln!("[uring-extract] Failed to open {:?}: {}", work.path, _e);
+                continue;
+            }
+        };
+
+        // Read entire file (capped at 64 MiB).
+        let read_limit = 64 * 1024 * 1024usize;
+        input_buf.clear();
+        input_buf.reserve(read_limit.min(4096));
+        if file
+            .take(read_limit as u64)
+            .read_to_end(&mut input_buf)
+            .is_err()
+        {
+            extract_failures += 1;
+            continue;
+        }
+
+        let result = extract_content(work.fmt, &input_buf, &mut output_buf, &mut extract_scratch);
+
+        if result != ExtractResult::Ok || output_buf.is_empty() {
+            extract_failures += 1;
+            continue;
+        }
+
+        files_extracted += 1;
+
+        // Scan extracted text as a single chunk.
+        engine.scan_chunk_into(&output_buf, work.token.file_id, 0, &mut scratch);
+        scratch.drop_prefix_findings(0);
+
+        pending.clear();
+        scratch.drain_findings_into(&mut pending);
+
+        if dedupe {
+            dedupe_pending_in_place(&mut pending);
+        }
+
+        total_findings += pending.len() as u64;
+        emit_findings(engine.as_ref(), &*event_sink, display, &pending);
+
+        total_bytes += output_buf.len() as u64;
+        total_chunks += 1;
+
+        // Token drop releases the CountPermit, unblocking discovery.
+        drop(work.token);
+    }
+
+    ExtractWorkerStats {
+        bytes_scanned: total_bytes,
+        chunks_scanned: total_chunks,
+        findings_emitted: total_findings,
+        files_extracted,
+        files_open_failed,
+        extract_failures,
+    }
+}
+
+// ============================================================================
 // I/O Worker State
 // ============================================================================
 
@@ -1000,6 +1116,7 @@ fn io_worker_loop<E: ScanEngine>(
     cfg: LocalFsUringConfig,
     stop: Arc<AtomicBool>,
     archive_tx: Option<chan::Sender<ArchiveWork>>,
+    extract_tx: Option<chan::Sender<ExtractWork>>,
 ) -> io::Result<UringIoStats> {
     let overlap = engine.required_overlap();
     let chunk_size = cfg.chunk_size;
@@ -1727,13 +1844,45 @@ fn io_worker_loop<E: ScanEngine>(
                                         content_policy::CHECK_LEN,
                                     );
                                     match verdict {
-                                        ContentVerdict::Binary
-                                        | ContentVerdict::BinaryExtractable(_) => {
-                                            // TODO: when binary-extract is enabled,
-                                            // route BinaryExtractable to extraction
-                                            // workers (like local_fs_owner does).
+                                        ContentVerdict::Binary => {
                                             stats.binary_skipped =
                                                 stats.binary_skipped.saturating_add(1);
+                                            st.done = true;
+                                            drop(op.buf);
+
+                                            if st.in_flight == 0 {
+                                                files[op.file_slot] = None;
+                                                free_file_slots.push(op.file_slot);
+                                            }
+                                            continue;
+                                        }
+                                        ContentVerdict::BinaryExtractable(fmt) => {
+                                            if let Some(ref etx) = extract_tx {
+                                                // SAFETY: display bytes originate from
+                                                // `Path::as_os_str().as_bytes()` on Unix,
+                                                // so they are valid OS string bytes.
+                                                let path = PathBuf::from(unsafe {
+                                                    std::ffi::OsStr::from_encoded_bytes_unchecked(
+                                                        &st.token.display,
+                                                    )
+                                                });
+                                                let ew = ExtractWork {
+                                                    path,
+                                                    fmt,
+                                                    token: Arc::clone(&st.token),
+                                                };
+                                                if etx.send(ew).is_ok() {
+                                                    stats.extractions_routed =
+                                                        stats.extractions_routed.saturating_add(1);
+                                                } else {
+                                                    // Channel closed; fall back to skip.
+                                                    stats.binary_skipped =
+                                                        stats.binary_skipped.saturating_add(1);
+                                                }
+                                            } else {
+                                                stats.binary_skipped =
+                                                    stats.binary_skipped.saturating_add(1);
+                                            }
                                             st.done = true;
                                             drop(op.buf);
 
@@ -2288,6 +2437,38 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
     // Drop the extra rx clone so only worker threads hold receivers.
     drop(archive_rx);
 
+    // Extraction channel + workers (when skip_binary is true, extractable
+    // binary files are routed here instead of being silently skipped).
+    let (extract_tx, extract_rx) = if cfg.skip_binary {
+        let (tx, rx) = chan::bounded::<ExtractWork>(cfg.file_queue_cap);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
+    let extract_worker_count = if cfg.skip_binary {
+        (cfg.cpu_workers / 4).max(1)
+    } else {
+        0
+    };
+    let mut extract_threads = Vec::with_capacity(extract_worker_count);
+    if let Some(ref erx) = extract_rx {
+        for wid in 0..extract_worker_count {
+            let rx = erx.clone();
+            let engine = Arc::clone(&engine);
+            let event_sink = Arc::clone(&event_sink);
+            let dedupe = cfg.dedupe_within_chunk;
+
+            extract_threads.push(
+                thread::Builder::new()
+                    .name(format!("uring-extract-{wid}"))
+                    .spawn(move || extract_worker_loop(rx, engine, event_sink, dedupe))
+                    .expect("failed to spawn extraction worker thread"),
+            );
+        }
+    }
+    drop(extract_rx);
+
     // Spawn I/O threads.
     let io_assigner = if cfg.pin_threads {
         super::affinity::CoreAssigner::with_offset(cfg.cpu_workers).map(Arc::new)
@@ -2304,6 +2485,7 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
         let stop2 = Arc::clone(&stop);
         let io_assigner_clone = io_assigner.clone();
         let atx = archive_tx.clone();
+        let etx = extract_tx.clone();
 
         io_threads.push(
             thread::Builder::new()
@@ -2312,7 +2494,7 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
                     if let Some(ref a) = io_assigner_clone {
                         a.pin_current_thread();
                     }
-                    io_worker_loop(wid, rx, pool, cpu, engine, cfg2, stop2, atx)
+                    io_worker_loop(wid, rx, pool, cpu, engine, cfg2, stop2, atx, etx)
                 })
                 .expect("failed to spawn uring I/O thread"),
         );
@@ -2337,10 +2519,11 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
         }
     }
 
-    // Close discovery → I/O channel, then close archive channel so workers
-    // drain remaining work and exit.
+    // Close discovery → I/O channel, then close archive and extraction
+    // channels so workers drain remaining work and exit.
     drop(tx);
     drop(archive_tx);
+    drop(extract_tx);
 
     // Join I/O threads and merge stats.
     let mut io_stats = UringIoStats::default();
@@ -2373,6 +2556,23 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
         }
     }
 
+    // Join extraction workers and merge stats.
+    let mut extract_bytes = 0u64;
+    let mut extract_chunks = 0u64;
+    let mut extract_findings = 0u64;
+    let mut total_extracted = 0u64;
+    for t in extract_threads {
+        match t.join() {
+            Ok(ws) => {
+                extract_bytes += ws.bytes_scanned;
+                extract_chunks += ws.chunks_scanned;
+                extract_findings += ws.findings_emitted;
+                total_extracted += ws.files_extracted;
+            }
+            Err(_) => return Err(io::Error::other("extraction worker panicked")),
+        }
+    }
+
     summary.open_errors = io_stats.files_open_failed + archive_open_errors;
     summary.read_errors = io_stats.read_errors + archive_scan_errors;
     summary.binary_skipped = io_stats.binary_skipped;
@@ -2389,6 +2589,12 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
         .binary_skipped
         .wrapping_add(io_stats.binary_skipped);
     cpu_metrics.archive.merge_from(&total_archive_stats);
+
+    // Merge extraction worker stats.
+    cpu_metrics.binary_extracted = cpu_metrics.binary_extracted.wrapping_add(total_extracted);
+    cpu_metrics.bytes_scanned = cpu_metrics.bytes_scanned.wrapping_add(extract_bytes);
+    cpu_metrics.chunks_scanned = cpu_metrics.chunks_scanned.wrapping_add(extract_chunks);
+    cpu_metrics.findings_emitted = cpu_metrics.findings_emitted.wrapping_add(extract_findings);
 
     event_sink.flush();
 
