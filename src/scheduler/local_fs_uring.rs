@@ -872,7 +872,7 @@ fn archive_worker_loop<E: ScanEngine>(
         if let Err(_e) = scan_result {
             archives_scan_errors += 1;
             #[cfg(debug_assertions)]
-            eprintln!("[uring-archive] Scan failed for {:?}: {}", work.path, _e);
+            eprintln!("[uring-archive] Scan failed for {:?}: {:?}", work.path, _e);
         }
 
         total_bytes += sink.bytes_scanned;
@@ -945,7 +945,7 @@ fn extract_worker_loop<E: ScanEngine>(
     for work in rx {
         let display = &*work.token.display;
 
-        let mut file = match File::open(&work.path) {
+        let file = match File::open(&work.path) {
             Ok(f) => f,
             Err(_e) => {
                 files_open_failed += 1;
