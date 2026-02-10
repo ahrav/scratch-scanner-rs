@@ -178,9 +178,11 @@ impl SqliteStoreProducer {
     }
 
     /// Returns the run_pk for this run (useful for queries after scan).
-    #[must_use]
-    pub fn run_pk(&self) -> i64 {
-        self.state.lock().expect("writer lock poisoned").run_pk
+    pub fn run_pk(&self) -> Result<i64, FsStoreError> {
+        self.state
+            .lock()
+            .map(|s| s.run_pk)
+            .map_err(|_| FsStoreError::backend("writer lock poisoned"))
     }
 
     /// Returns the path to the database file.
@@ -199,7 +201,10 @@ impl StoreProducer for SqliteStoreProducer {
     /// does **not** abort the scan — subsequent batches will still be
     /// attempted.
     fn emit_fs_batch(&self, batch: FsFindingBatch<'_>) -> Result<(), FsStoreError> {
-        let mut state = self.state.lock().expect("writer lock poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| FsStoreError::backend("writer lock poisoned"))?;
         let state = &mut *state;
 
         state
@@ -207,6 +212,7 @@ impl StoreProducer for SqliteStoreProducer {
             .execute_batch("BEGIN IMMEDIATE;")
             .map_err(|e| FsStoreError::backend(format!("begin txn failed: {e}")))?;
 
+        let mut batch_count: u64 = 0;
         let write_result: rusqlite::Result<()> = (|| {
             let object_path = String::from_utf8_lossy(batch.object_path).into_owned();
             let canonical_path = canonicalize_path(&object_path);
@@ -271,14 +277,16 @@ impl StoreProducer for SqliteStoreProducer {
                     touch_secret_observation(&state.conn, secret_pk, state.run_pk)?;
                 }
 
-                state.counters.findings_emitted += 1;
+                batch_count += 1;
             }
 
             Ok(())
         })();
 
         if let Err(e) = write_result {
-            let _ = state.conn.execute_batch("ROLLBACK;");
+            if let Err(rb_err) = state.conn.execute_batch("ROLLBACK;") {
+                eprintln!("warn: ROLLBACK failed after emit error: {rb_err}");
+            }
             return Err(FsStoreError::backend(format!("emit txn failed: {e}")));
         }
 
@@ -287,19 +295,26 @@ impl StoreProducer for SqliteStoreProducer {
             .execute_batch("COMMIT;")
             .map_err(|e| FsStoreError::backend(format!("commit failed: {e}")))?;
 
+        state.counters.findings_emitted += batch_count;
         state.counters.objects_scanned += 1;
         Ok(())
     }
 
     fn record_fs_run_loss(&self, loss: FsRunLoss) -> Result<(), FsStoreError> {
-        let mut state = self.state.lock().expect("writer lock poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| FsStoreError::backend("writer lock poisoned"))?;
         state.counters.dropped_findings += loss.dropped_findings;
         state.counters.emit_failures += loss.persistence_emit_failures;
         Ok(())
     }
 
     fn end_run(&self, had_coverage_limits: bool) -> Result<(), FsStoreError> {
-        let state = self.state.lock().expect("writer lock poisoned");
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| FsStoreError::backend("writer lock poisoned"))?;
         let status = state.counters.derive_status(had_coverage_limits);
         let ended_at = now_epoch_ms();
         state
@@ -507,8 +522,9 @@ fn generate_run_id() -> [u8; 16] {
     {
         use std::io::Read;
         if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-            let _ = f.read_exact(&mut id);
-            return id;
+            if f.read_exact(&mut id).is_ok() {
+                return id;
+            }
         }
     }
     // Fallback: hash of PID + timestamp.
@@ -529,8 +545,10 @@ fn now_epoch_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
-    use crate::store::fs::{FsFindingBatch, FsFindingRecord, FsRunLoss};
+    use crate::store::fs::{FsFindingBatch, FsFindingRecord, FsRunLoss, StoreProducer};
 
     fn test_config(dir: &std::path::Path) -> SqliteStoreConfig {
         SqliteStoreConfig {
@@ -550,7 +568,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let config = test_config(tmp.path());
         let producer = SqliteStoreProducer::open(config).expect("open");
-        let run_pk = producer.run_pk();
+        let run_pk = producer.run_pk().expect("run_pk");
         assert!(run_pk > 0);
     }
 
@@ -581,7 +599,7 @@ mod tests {
         let config = test_config(tmp.path());
         let db_path = config.db_path.clone();
         let producer = SqliteStoreProducer::open(config).expect("open");
-        let run_pk = producer.run_pk();
+        let run_pk = producer.run_pk().expect("run_pk");
 
         producer.end_run(false).expect("end_run");
 
@@ -603,7 +621,7 @@ mod tests {
         let config = test_config(tmp.path());
         let db_path = config.db_path.clone();
         let producer = SqliteStoreProducer::open(config).expect("open");
-        let run_pk = producer.run_pk();
+        let run_pk = producer.run_pk().expect("run_pk");
 
         producer
             .record_fs_run_loss(FsRunLoss {
@@ -630,7 +648,7 @@ mod tests {
         let config = test_config(tmp.path());
         let db_path = config.db_path.clone();
         let producer = SqliteStoreProducer::open(config).expect("open");
-        let run_pk = producer.run_pk();
+        let run_pk = producer.run_pk().expect("run_pk");
 
         producer.end_run(true).expect("end_run");
 
@@ -900,6 +918,68 @@ mod tests {
         for _ in 0..1000 {
             let id = generate_run_id();
             assert!(ids.insert(id), "duplicate run_id generated");
+        }
+    }
+
+    /// Proves Bug 3 fix: `end_run` is callable through `dyn StoreProducer`.
+    ///
+    /// Before the fix, `end_run` was only an inherent method on the concrete
+    /// `SqliteStoreProducer` type. Callers had to keep a separate
+    /// `Arc<SqliteStoreProducer>` alongside `Arc<dyn StoreProducer>` to
+    /// finalize a run. Now `end_run` is part of the trait, so any holder
+    /// of `Arc<dyn StoreProducer>` can finalize the run.
+    #[test]
+    fn end_run_callable_through_dyn_store_producer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let db_path = config.db_path.clone();
+        let producer = SqliteStoreProducer::open(config).expect("open");
+        let run_pk = producer.run_pk().expect("run_pk");
+
+        // Erase the concrete type — only trait methods are available.
+        let dyn_producer: Arc<dyn StoreProducer> = Arc::new(producer);
+
+        let rec = FsFindingRecord {
+            rule_id: 99,
+            root_hint_start: 0,
+            root_hint_end: 10,
+            span_start: 0,
+            span_end: 10,
+            norm_hash: [0xFF; 32],
+        };
+        dyn_producer
+            .emit_fs_batch(FsFindingBatch {
+                object_path: b"trait_test.rs",
+                findings: &[rec],
+            })
+            .expect("emit via trait");
+
+        // Before the fix, this line would not compile because `end_run`
+        // was not part of `StoreProducer`.
+        dyn_producer.end_run(false).expect("end_run via trait");
+
+        // Verify the run was actually finalized in the DB.
+        let conn = Connection::open(&db_path).unwrap();
+        let (status, ended_at): (i32, Option<i64>) = conn
+            .query_row(
+                "SELECT status, ended_at FROM runs WHERE run_pk = ?1",
+                params![run_pk],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            status,
+            RunStatus::Complete as i32,
+            "run finalized via dyn StoreProducer must be Complete"
+        );
+        assert!(ended_at.is_some(), "ended_at must be set after end_run");
+    }
+
+    #[test]
+    fn generate_run_id_never_all_zeros() {
+        for _ in 0..100 {
+            let id = generate_run_id();
+            assert_ne!(id, [0u8; 16], "run_id must never be all zeros");
         }
     }
 }

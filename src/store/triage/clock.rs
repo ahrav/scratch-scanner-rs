@@ -60,14 +60,21 @@ impl TriageClock {
 
     /// Increment the clock and return the new value.
     pub fn tick(&mut self) -> io::Result<u64> {
-        self.clock += 1;
+        self.clock = self
+            .clock
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("lamport clock overflow"))?;
         self.persist()?;
         Ok(self.clock)
     }
 
     /// Merge with a remote clock: `max(local, remote) + 1`.
     pub fn merge(&mut self, remote_clock: u64) -> io::Result<u64> {
-        self.clock = self.clock.max(remote_clock) + 1;
+        self.clock = self
+            .clock
+            .max(remote_clock)
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("lamport clock overflow"))?;
         self.persist()?;
         Ok(self.clock)
     }
@@ -123,27 +130,25 @@ impl TriageClock {
 /// Generate a random node_id using available entropy.
 fn generate_node_id() -> u64 {
     // Use the same approach as SqliteStoreProducer::generate_run_id —
-    // /dev/urandom on unix, BCryptGenRandom on Windows.
-    let mut buf = [0u8; 8];
+    // /dev/urandom on unix, fallback to time+PID hash otherwise.
     #[cfg(unix)]
     {
         use std::io::Read;
+        let mut buf = [0u8; 8];
         if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-            let _ = f.read_exact(&mut buf);
+            if f.read_exact(&mut buf).is_ok() {
+                return u64::from_le_bytes(buf);
+            }
         }
     }
-    #[cfg(not(unix))]
-    {
-        // Fallback: hash of current time + PID.
-        use std::time::SystemTime;
-        let t = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-        let pid = std::process::id() as u64;
-        buf = (t ^ (pid << 32)).to_le_bytes();
-    }
-    u64::from_le_bytes(buf)
+    // Fallback: hash of current time + PID (used on non-unix or if /dev/urandom fails).
+    use std::time::SystemTime;
+    let t = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let pid = std::process::id() as u64;
+    t ^ (pid << 32)
 }
 
 #[cfg(test)]
@@ -270,5 +275,22 @@ mod tests {
             prev = val;
         }
         assert_eq!(clock.value(), 1000);
+    }
+
+    #[test]
+    fn generate_node_id_never_zero() {
+        for _ in 0..100 {
+            let id = generate_node_id();
+            assert_ne!(id, 0, "node_id must never be zero");
+        }
+    }
+
+    #[test]
+    fn generate_node_id_uniqueness() {
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let id = generate_node_id();
+            assert!(ids.insert(id), "duplicate node_id generated");
+        }
     }
 }

@@ -467,7 +467,7 @@ fn emit_batch_persists_queryable_findings_rows() {
 
     let config = make_config(db_path.clone(), root_id, keys.id_hash_mode());
     let producer = SqliteStoreProducer::open(config).unwrap();
-    let run_pk = producer.run_pk();
+    let run_pk = producer.run_pk().expect("run_pk");
 
     let rec = FsFindingRecord {
         rule_id: 7,
@@ -733,7 +733,7 @@ fn db_reopen_across_lifetimes() {
     {
         let config = make_config(db_path.clone(), root_id, keys.id_hash_mode());
         let producer = SqliteStoreProducer::open(config).unwrap();
-        run_pk_1 = producer.run_pk();
+        run_pk_1 = producer.run_pk().expect("run_pk");
 
         let rec = FsFindingRecord {
             rule_id: 1,
@@ -757,7 +757,7 @@ fn db_reopen_across_lifetimes() {
     {
         let config = make_config(db_path.clone(), root_id, keys.id_hash_mode());
         let producer = SqliteStoreProducer::open(config).unwrap();
-        let run_pk_2 = producer.run_pk();
+        let run_pk_2 = producer.run_pk().expect("run_pk");
         assert_ne!(run_pk_1, run_pk_2, "second open creates a new run");
         producer.end_run(false).unwrap();
     }

@@ -134,6 +134,9 @@ impl std::error::Error for FsStoreError {}
 ///   order when workers run in parallel.
 /// - `record_fs_run_loss` is called exactly once at the end of a scan run.
 ///   Implementations should persist or log the loss data before returning.
+/// - `end_run` is called once after `record_fs_run_loss` to finalize the run
+///   (e.g. set end time and status in the database). The default implementation
+///   is a no-op, suitable for backends that don't need run finalization.
 /// - Errors from either method are counted in [`FsRunLoss::persistence_emit_failures`]
 ///   but do **not** abort the scan; the scheduler continues scanning.
 pub trait StoreProducer: Send + Sync + 'static {
@@ -147,6 +150,15 @@ pub trait StoreProducer: Send + Sync + 'static {
     ///
     /// Called after all files have been scanned and all workers have joined.
     fn record_fs_run_loss(&self, loss: FsRunLoss) -> Result<(), FsStoreError>;
+
+    /// Finalize the run after all findings and loss records have been emitted.
+    ///
+    /// Called once after `record_fs_run_loss`. Implementations that track run
+    /// state (e.g. SQLite) should set end time, final status, and counters.
+    /// The default is a no-op for backends that don't need finalization.
+    fn end_run(&self, _had_coverage_limits: bool) -> Result<(), FsStoreError> {
+        Ok(())
+    }
 }
 
 /// No-op producer that discards all batches and loss records.

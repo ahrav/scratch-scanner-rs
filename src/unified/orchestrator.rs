@@ -128,10 +128,7 @@ fn run_fs(
 
     let t0 = Instant::now();
     let rules = load_rules_for_scan(rules_file.as_deref());
-    let (store_producer, sqlite_store): (
-        Option<Arc<dyn StoreProducer>>,
-        Option<Arc<SqliteStoreProducer>>,
-    ) = if cfg.persist_findings {
+    let store_producer: Option<Arc<dyn StoreProducer>> = if cfg.persist_findings {
         let store_dir = cfg.root.join(".scanner-store");
         let keys = StoreKeys::bootstrap_from_env();
         let root_id = crate::store::root_id::root_id(
@@ -162,12 +159,9 @@ fn run_fs(
             "info: --persist-findings enabled; store: {}",
             store_dir.join("findings.db").display()
         );
-        (
-            Some(Arc::clone(&producer) as Arc<dyn StoreProducer>),
-            Some(producer),
-        )
+        Some(producer)
     } else {
-        (None, None)
+        None
     };
     let transforms = apply_transform_filter(demo_transforms(), transform_filter);
     let mut tuning = demo_tuning();
@@ -199,8 +193,8 @@ fn run_fs(
         event_sink: Arc::clone(&event_sink),
         ..Default::default()
     };
-    if let Some(producer) = store_producer {
-        ps_config.store_producer = Some(producer);
+    if let Some(ref producer) = store_producer {
+        ps_config.store_producer = Some(Arc::clone(producer));
     }
     if cfg.no_archives {
         ps_config.archive.enabled = false;
@@ -290,7 +284,7 @@ fn run_fs(
     #[cfg(not(target_os = "linux"))]
     let report = parallel_scan_dir(&cfg.root, Arc::clone(&engine), ps_config)?;
 
-    if let Some(store) = sqlite_store {
+    if let Some(ref store) = store_producer {
         store
             .end_run(false)
             .map_err(|err| io::Error::other(format!("failed to finalize run: {}", err.detail())))?;
@@ -599,7 +593,7 @@ fn run_store_command(cmd: StoreCommand) -> io::Result<()> {
                 .map_err(|e| io::Error::other(format!("query failed: {e}")))?
                 .ok_or_else(|| io::Error::other(format!("run B not found: {run_b}")))?;
 
-            let diff = query::diff_runs(&conn, pk_a, pk_b)
+            let diff = query::diff_runs(&conn, pk_a, pk_b, None)
                 .map_err(|e| io::Error::other(format!("query failed: {e}")))?;
 
             match format {

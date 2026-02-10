@@ -53,15 +53,33 @@ pub fn configure_triage_connection(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 /// Ensure the triage schema is created. Idempotent.
+///
+/// Uses `BEGIN IMMEDIATE … COMMIT` to prevent interleaving with concurrent
+/// callers and to guarantee atomicity: if DDL succeeds but the version
+/// pragma fails, the entire migration is rolled back.
 pub fn ensure_triage_schema(conn: &Connection) -> rusqlite::Result<()> {
     let current_version: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
 
-    if current_version < TRIAGE_SCHEMA_VERSION {
-        conn.execute_batch(TRIAGE_DDL)?;
-        conn.pragma_update(None, "user_version", TRIAGE_SCHEMA_VERSION)?;
+    if current_version >= TRIAGE_SCHEMA_VERSION {
+        return Ok(());
     }
 
-    Ok(())
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let result = (|| {
+        conn.execute_batch(TRIAGE_DDL)?;
+        conn.pragma_update(None, "user_version", TRIAGE_SCHEMA_VERSION)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            conn.execute_batch("COMMIT;")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(e)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -96,5 +114,52 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn schema_recovers_after_rolled_back_transaction() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure_triage_connection(&conn).unwrap();
+
+        // Simulate a rolled-back migration attempt.
+        conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        conn.execute_batch("ROLLBACK;").unwrap();
+
+        // ensure_triage_schema should succeed after the rollback.
+        ensure_triage_schema(&conn).unwrap();
+
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, TRIAGE_SCHEMA_VERSION);
+
+        // Verify tables were actually created.
+        let count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('occurrence_triage', 'secret_triage')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn version_set_correctly_after_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure_triage_connection(&conn).unwrap();
+        ensure_triage_schema(&conn).unwrap();
+
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, TRIAGE_SCHEMA_VERSION);
+
+        // Second call is a no-op — version should remain the same.
+        ensure_triage_schema(&conn).unwrap();
+        let version2: i32 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version2, TRIAGE_SCHEMA_VERSION);
     }
 }

@@ -88,12 +88,23 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     }
 
     conn.execute_batch("BEGIN IMMEDIATE;")?;
-    if version < 1 {
-        apply_v1(conn)?;
+    let result = (|| {
+        if version < 1 {
+            apply_v1(conn)?;
+        }
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            conn.execute_batch("COMMIT;")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(e)
+        }
     }
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-    conn.execute_batch("COMMIT;")?;
-    Ok(())
 }
 
 /// V1 schema: initial star-schema creation.
@@ -180,6 +191,7 @@ fn apply_v1(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_occ_secret ON occurrences(secret_pk);
         CREATE INDEX IF NOT EXISTS idx_occ_path   ON occurrences(path_pk);
         CREATE INDEX IF NOT EXISTS idx_occ_rule   ON occurrences(rule_pk);
+        CREATE INDEX IF NOT EXISTS idx_occ_root   ON occurrences(root_pk);
 
         CREATE TABLE IF NOT EXISTS observations (
             run_pk        INTEGER NOT NULL REFERENCES runs(run_pk),
@@ -290,5 +302,28 @@ mod tests {
             result.is_err(),
             "FK violation should be rejected: {result:?}"
         );
+    }
+
+    #[test]
+    fn ensure_schema_recovers_after_simulated_failure() {
+        // Simulate a migration failure by manually beginning a transaction,
+        // then verify ensure_schema still works on a subsequent call.
+        let conn = open_memory_db();
+
+        // Manually set version to 0 and begin a transaction, then roll it back
+        // to simulate what ensure_schema does on failure.
+        conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        conn.execute_batch("ROLLBACK;").unwrap();
+
+        // ensure_schema should succeed after the rolled-back transaction.
+        ensure_schema(&conn).expect("schema should succeed after rollback");
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // A second call should be a no-op.
+        ensure_schema(&conn).expect("idempotent call should succeed");
     }
 }

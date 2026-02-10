@@ -21,7 +21,7 @@ use rusqlite::{params, Connection};
 /// One row from the `runs` table, joined with `roots` for display name.
 ///
 /// Fields are pre-formatted for CLI output: `run_id` is hex-encoded,
-/// timestamps are raw epoch seconds (formatted by the caller).
+/// timestamps are raw epoch milliseconds (formatted by the caller).
 /// `status` uses the integer codes from [`super::schema`]:
 /// 0 = active, 1 = complete, 2 = limited, 3 = incomplete, 4 = failed.
 #[derive(Clone, Debug)]
@@ -154,25 +154,35 @@ pub fn list_findings(
         sql.push_str(&format!(" AND o.object_path LIKE {param_idx}"));
     }
     sql.push_str(" ORDER BY o.object_path, o.start_byte");
-    sql.push_str(&format!(" LIMIT {limit}"));
+
+    // Determine the next parameter index for LIMIT.
+    let mut next_param = 2;
+    if rule_filter.is_some() {
+        next_param += 1;
+    }
+    if path_filter.is_some() {
+        next_param += 1;
+    }
+    sql.push_str(&format!(" LIMIT ?{next_param}"));
 
     let mut stmt = conn.prepare(&sql)?;
+    let limit_val = limit as i64;
 
     let rows = match (rule_filter, path_filter) {
         (Some(rule), Some(path)) => {
             let rule_pat = format!("%{rule}%");
             let path_pat = format!("%{path}%");
-            stmt.query_map(params![run_pk, rule_pat, path_pat], map_finding_row)?
+            stmt.query_map(params![run_pk, rule_pat, path_pat, limit_val], map_finding_row)?
         }
         (Some(rule), None) => {
             let rule_pat = format!("%{rule}%");
-            stmt.query_map(params![run_pk, rule_pat], map_finding_row)?
+            stmt.query_map(params![run_pk, rule_pat, limit_val], map_finding_row)?
         }
         (None, Some(path)) => {
             let path_pat = format!("%{path}%");
-            stmt.query_map(params![run_pk, path_pat], map_finding_row)?
+            stmt.query_map(params![run_pk, path_pat, limit_val], map_finding_row)?
         }
-        (None, None) => stmt.query_map(params![run_pk], map_finding_row)?,
+        (None, None) => stmt.query_map(params![run_pk, limit_val], map_finding_row)?,
     };
 
     rows.collect()
@@ -199,9 +209,21 @@ fn map_finding_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FindingRow> {
 ///
 /// The comparison uses `observations` (the run-to-occurrence join table),
 /// so only findings actually observed in each run participate.
-pub fn diff_runs(conn: &Connection, run_a_pk: i64, run_b_pk: i64) -> rusqlite::Result<DiffResult> {
-    // New in B: present in B but not in A.
-    let new_sql =
+///
+/// When `limit` is `Some(n)`, at most `n` rows are returned for each of the
+/// "new" and "resolved" sets. Pass `None` for an unbounded result.
+pub fn diff_runs(
+    conn: &Connection,
+    run_a_pk: i64,
+    run_b_pk: i64,
+    limit: Option<usize>,
+) -> rusqlite::Result<DiffResult> {
+    let limit_clause = match limit {
+        Some(_) => " LIMIT ?3",
+        None => "",
+    };
+
+    let new_sql = format!(
         "SELECT o.occurrence_id, o.object_path, ru.rule_name, o.start_byte, o.end_byte, s.secret_hash
          FROM observations ob
          JOIN occurrences o  ON o.occ_pk = ob.occ_pk
@@ -210,18 +232,28 @@ pub fn diff_runs(conn: &Connection, run_a_pk: i64, run_b_pk: i64) -> rusqlite::R
          WHERE ob.run_pk = ?1
            AND NOT EXISTS (
              SELECT 1 FROM observations oa WHERE oa.run_pk = ?2 AND oa.occ_pk = ob.occ_pk
-           )";
+           ){limit_clause}"
+    );
 
-    let new_findings: Vec<FindingRow> = conn
-        .prepare(new_sql)?
-        .query_map(params![run_b_pk, run_a_pk], map_finding_row)?
-        .collect::<rusqlite::Result<_>>()?;
+    let new_findings: Vec<FindingRow> = if let Some(n) = limit {
+        conn.prepare(&new_sql)?
+            .query_map(params![run_b_pk, run_a_pk, n as i64], map_finding_row)?
+            .collect::<rusqlite::Result<_>>()?
+    } else {
+        conn.prepare(&new_sql)?
+            .query_map(params![run_b_pk, run_a_pk], map_finding_row)?
+            .collect::<rusqlite::Result<_>>()?
+    };
 
-    // Resolved: present in A but not in B.
-    let resolved_findings: Vec<FindingRow> = conn
-        .prepare(new_sql)?
-        .query_map(params![run_a_pk, run_b_pk], map_finding_row)?
-        .collect::<rusqlite::Result<_>>()?;
+    let resolved_findings: Vec<FindingRow> = if let Some(n) = limit {
+        conn.prepare(&new_sql)?
+            .query_map(params![run_a_pk, run_b_pk, n as i64], map_finding_row)?
+            .collect::<rusqlite::Result<_>>()?
+    } else {
+        conn.prepare(&new_sql)?
+            .query_map(params![run_a_pk, run_b_pk], map_finding_row)?
+            .collect::<rusqlite::Result<_>>()?
+    };
 
     // Unchanged count.
     let unchanged_count: i64 = conn.query_row(
@@ -583,7 +615,7 @@ mod tests {
         let run_a = insert_test_run(&conn, root_pk, &[1; 16]);
         let run_b = insert_test_run(&conn, root_pk, &[2; 16]);
 
-        let diff = diff_runs(&conn, run_a, run_b).unwrap();
+        let diff = diff_runs(&conn, run_a, run_b, None).unwrap();
         assert!(diff.new_findings.is_empty());
         assert!(diff.resolved_findings.is_empty());
         assert_eq!(diff.unchanged_count, 0);
@@ -679,7 +711,7 @@ mod tests {
         )
         .unwrap();
 
-        let diff = diff_runs(&conn, run_a, run_b).unwrap();
+        let diff = diff_runs(&conn, run_a, run_b, None).unwrap();
         assert_eq!(diff.new_findings.len(), 1, "one new finding in run B");
         assert_eq!(diff.resolved_findings.len(), 1, "one resolved from run A");
         assert_eq!(diff.unchanged_count, 1, "one unchanged across both");
@@ -804,7 +836,7 @@ mod tests {
         )
         .unwrap();
 
-        let diff = diff_runs(&conn, run_a, run_b).unwrap();
+        let diff = diff_runs(&conn, run_a, run_b, None).unwrap();
         assert!(diff.new_findings.is_empty());
         assert!(diff.resolved_findings.is_empty());
         assert_eq!(diff.unchanged_count, 1);

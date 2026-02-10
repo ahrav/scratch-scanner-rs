@@ -165,8 +165,8 @@ graph TB
 | **Store Keys**      | `src/store/keys.rs`            | `SCANNER_SECRET_KEY` bootstrap, subkey derivation, and run correlation mode metadata |
 | **Store Identity**  | `src/store/identity.rs`        | Versioned `rule_fingerprint` / `secret_hash` / `occurrence_id` contracts for FS persistence |
 | **StoreProducer**   | `src/store/fs.rs`              | Write-side trait for FS finding persistence; scheduler calls `emit_fs_batch` per object |
-| **FS Log Format**   | `src/store/log/format.rs`      | Framed FS persistence codec (legacy V1 + position-bound V2 with segment header/trailer and chained segment integrity) for run metadata + finding batches |
-| **FS Log Writer**   | `src/store/log/writer.rs`      | Bounded single-writer append-log backend with deterministic `RuleDef` ordering, chained segment finalize, and replay/recovery chain verification |
+| **SQLite Schema**   | `src/store/db/schema.rs`       | SQLite star-schema with findings, runs, occurrences, and dimension tables (roots, paths, rules, secrets) |
+| **SQLite Writer**   | `src/store/db/writer.rs`       | Single-writer SQLite producer with WAL mode, per-batch transactions, and in-memory rule cache |
 | **FsFindingRecord** | `src/store/fs.rs`              | Backend-agnostic post-dedupe finding record with `norm_hash` |
 | **FsFindingBatch**  | `src/store/fs.rs`              | Borrowed batch grouping findings for a single scanned object |
 | **FsRunLoss**       | `src/store/fs.rs`              | Run-level drop/failure accounting for persistence completeness |
