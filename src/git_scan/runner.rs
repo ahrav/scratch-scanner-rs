@@ -244,7 +244,9 @@ fn default_pack_exec_workers() -> usize {
 
 /// Blob-intro worker count.
 ///
-/// Uses available parallelism capped at 8. Falls back to 1 on error.
+/// Capped at 8 because inflate is memory-bandwidth-bound and shows
+/// diminishing returns beyond that on typical hardware. Falls back to
+/// 1 when `available_parallelism` is unavailable.
 fn default_blob_intro_workers() -> usize {
     let parallelism = std::thread::available_parallelism()
         .map(|count| count.get())
@@ -701,6 +703,11 @@ impl GitScanMetricsSnapshot {
 }
 
 /// Summary report for a completed scan.
+///
+/// Contains per-stage statistics, pack execution reports, skipped candidates,
+/// and finalize output. Callers typically use [`metrics_snapshot`](Self::metrics_snapshot)
+/// for a condensed view or [`format_metrics`](Self::format_metrics) for
+/// machine-parseable output.
 #[derive(Debug)]
 pub struct GitScanReport {
     /// Number of commits processed in the plan.
@@ -802,35 +809,44 @@ pub(super) struct ScanModeOutput {
 }
 
 /// Git scan error taxonomy.
+///
+/// Errors are organized by pipeline stage. Early stages (repo open, commit
+/// plan) fail fast; later stages (pack exec, persist) may produce partial
+/// output before failing. `ConcurrentMaintenance` is a special sentinel
+/// that triggers retry logic in callers.
+///
+/// All variants implement `Display` and `Error`. The `source()` chain
+/// preserves the inner error for diagnostic logging.
 #[derive(Debug)]
 pub enum GitScanError {
     /// Repo open phase failed (bad metadata, missing refs, etc.).
     RepoOpen(RepoOpenError),
-    /// Commit plan construction failed.
+    /// Commit plan construction failed (e.g. missing commit-graph entries).
     CommitPlan(CommitPlanError),
-    /// Tree diff walker encountered an error.
+    /// Tree diff walker encountered an error (corrupt trees, depth exceeded).
     TreeDiff(TreeDiffError),
-    /// Spill/dedupe pipeline error.
+    /// Spill/dedupe pipeline error (I/O failure on spill files).
     Spill(SpillError),
-    /// MIDX parsing or validation error.
+    /// MIDX parsing or validation error (corrupt header, missing packs).
     Midx(MidxError),
-    /// Pack plan construction error.
+    /// Pack plan construction error (out-of-range pack IDs, corrupt headers).
     PackPlan(PackPlanError),
-    /// Fatal pack execution error.
+    /// Fatal pack execution error (decode failure that aborted a plan).
     PackExec(PackExecError),
-    /// Pack I/O (loose object or cross-pack base resolution) error.
+    /// Pack I/O error during loose object or cross-pack base resolution.
     PackIo(PackIoError),
     /// Persistence store write failed.
     Persist(PersistError),
-    /// Underlying I/O error.
+    /// Underlying I/O error not covered by a more specific variant.
     Io(io::Error),
-    /// Resource limit exceeded (pack mmap counts or bytes).
+    /// Resource limit exceeded (pack mmap counts or cumulative bytes).
     ResourceLimit(String),
     /// Scan mode not yet implemented.
     UnsupportedMode(GitScanMode),
-    /// In-memory artifact construction failed.
+    /// In-memory artifact construction failed (MIDX or commit-graph build).
     ArtifactAcquire(ArtifactAcquireError),
-    /// Artifacts changed during the scan (concurrent git maintenance detected).
+    /// Pack files or indices changed during the scan — a concurrent `git gc`
+    /// or `git repack` invalidated the planned offsets. Callers should retry.
     ConcurrentMaintenance,
 }
 

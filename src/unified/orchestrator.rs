@@ -45,6 +45,12 @@ use super::{EventFormat, FsScanConfig, GitSourceConfig, ScanConfig, SourceConfig
 ///
 /// This is the single entry point called by `main()`. It builds the
 /// detection engine, selects the source driver, and runs the scan.
+///
+/// # Exit behavior
+///
+/// Sub-functions may call `std::process::exit(2)` on fatal configuration
+/// errors (rule loading, overflow of CLI size params). This function itself
+/// returns `io::Result` for normal I/O failures.
 pub fn run(config: ScanConfig) -> io::Result<()> {
     let event_format = config.event_format;
     let verbose = config.verbose;
@@ -246,12 +252,16 @@ fn run_fs(
     Ok(())
 }
 
-/// Git scan path — delegates to `run_git_scan`.
+/// Git scan path — delegates to [`run_git_scan`].
 ///
 /// Builds the engine, configures persistence stores (in-memory for CLI),
 /// resolves the start set via `git` CLI commands, and runs the scan.
 /// Findings stream through the [`EventSink`](super::events::EventSink);
 /// summary + optional debug/perf output goes to stderr.
+///
+/// Calls `process::exit(2)` on fatal errors (rule loading, config overflow,
+/// scan failure) rather than returning an error, matching the CLI exit-code
+/// convention.
 fn run_git(
     cfg: GitSourceConfig,
     event_format: EventFormat,
@@ -355,6 +365,9 @@ fn run_git(
 }
 
 /// Print git scan results to stderr (debug stats and/or perf breakdown).
+///
+/// Called only on successful scans. Each section is gated by its respective
+/// CLI flag so the default output is clean.
 fn print_git_report(
     report: &git_scan::GitScanReport,
     config: &GitScanConfig,
@@ -383,6 +396,10 @@ fn build_event_sink(event_format: EventFormat, verbose: bool) -> Arc<dyn super::
 }
 
 /// Emit a structured `ScanEvent::Summary` for the completed git scan.
+///
+/// Maps `FinalizeOutcome::Complete` to status `"complete"` (0 errors) and
+/// `Partial` to `"partial"` (with the skipped-candidate count as errors).
+/// Throughput is computed from `scan_bytes` perf counter, not wall time.
 fn emit_git_summary_event(
     event_sink: &dyn super::events::EventSink,
     report: &git_scan::GitScanReport,
@@ -415,6 +432,11 @@ fn emit_git_summary_event(
 }
 
 /// Dump verbose internal stats to stderr (commit counts, tree diff, pack plan, cache rejects).
+///
+/// Emits one `key=value` or `key={:?}` line per stat. Includes a sample of
+/// up to 5 skipped candidates for post-mortem diagnosis. Format is
+/// intentionally unstructured — use `--event-format jsonl` for machine
+/// consumption and reserve this output for human debugging.
 fn print_git_debug(report: &git_scan::GitScanReport) {
     eprintln!("commits={}", report.commit_count);
     eprintln!("tree_diff_stats={:?}", report.tree_diff_stats);
