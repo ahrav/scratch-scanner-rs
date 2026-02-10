@@ -172,7 +172,10 @@ pub fn list_findings(
         (Some(rule), Some(path)) => {
             let rule_pat = format!("%{rule}%");
             let path_pat = format!("%{path}%");
-            stmt.query_map(params![run_pk, rule_pat, path_pat, limit_val], map_finding_row)?
+            stmt.query_map(
+                params![run_pk, rule_pat, path_pat, limit_val],
+                map_finding_row,
+            )?
         }
         (Some(rule), None) => {
             let rule_pat = format!("%{rule}%");

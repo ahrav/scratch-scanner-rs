@@ -777,3 +777,223 @@ fn db_reopen_across_lifetimes() {
         "finding from first lifetime should persist"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 5.5 Edge-case coverage
+// ---------------------------------------------------------------------------
+
+/// diff_runs with both runs empty should return empty sets and zero unchanged.
+#[test]
+fn diff_runs_with_empty_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("findings.db");
+    let keys = StoreKeys::bootstrap_from_env();
+    let root_id = root_id::root_id(
+        &RootIdInput {
+            kind: RootKind::Fs,
+            identity_scheme: "fs_path_v1",
+            canonical_identity: b"/tmp/diff-empty",
+        },
+        &keys,
+    );
+
+    // Two runs, neither has findings.
+    let run_pk_a;
+    let run_pk_b;
+    {
+        let config = make_config(db_path.clone(), root_id, keys.id_hash_mode());
+        let p = SqliteStoreProducer::open(config).unwrap();
+        run_pk_a = p.run_pk().expect("run_pk");
+        p.end_run(false).unwrap();
+    }
+    {
+        let config = make_config(db_path.clone(), root_id, keys.id_hash_mode());
+        let p = SqliteStoreProducer::open(config).unwrap();
+        run_pk_b = p.run_pk().expect("run_pk");
+        p.end_run(false).unwrap();
+    }
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    configure_connection(&conn).unwrap();
+
+    let diff = query::diff_runs(&conn, run_pk_a, run_pk_b, None).unwrap();
+    assert!(diff.new_findings.is_empty(), "no new findings expected");
+    assert!(
+        diff.resolved_findings.is_empty(),
+        "no resolved findings expected"
+    );
+    assert_eq!(diff.unchanged_count, 0, "zero unchanged expected");
+}
+
+/// diff_runs with a limit caps the new and resolved result sets.
+#[test]
+fn diff_runs_respects_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("findings.db");
+    let keys = StoreKeys::bootstrap_from_env();
+    let root_id = root_id::root_id(
+        &RootIdInput {
+            kind: RootKind::Fs,
+            identity_scheme: "fs_path_v1",
+            canonical_identity: b"/tmp/diff-limit",
+        },
+        &keys,
+    );
+
+    // Run A: emit 3 findings.
+    let run_pk_a;
+    {
+        let config = make_config(db_path.clone(), root_id, keys.id_hash_mode());
+        let p = SqliteStoreProducer::open(config).unwrap();
+        run_pk_a = p.run_pk().expect("run_pk");
+        for i in 0..3u8 {
+            let rec = FsFindingRecord {
+                rule_id: u32::from(i),
+                root_hint_start: u64::from(i) * 100,
+                root_hint_end: u64::from(i) * 100 + 50,
+                span_start: u64::from(i) * 100,
+                span_end: u64::from(i) * 100 + 50,
+                norm_hash: [i.wrapping_add(0x10); 32],
+            };
+            p.emit_fs_batch(FsFindingBatch {
+                object_path: format!("file_{i}.rs").as_bytes(),
+                findings: &[rec],
+            })
+            .unwrap();
+        }
+        p.end_run(false).unwrap();
+    }
+
+    // Run B: empty (all 3 findings are "resolved" relative to B).
+    let run_pk_b;
+    {
+        let config = make_config(db_path.clone(), root_id, keys.id_hash_mode());
+        let p = SqliteStoreProducer::open(config).unwrap();
+        run_pk_b = p.run_pk().expect("run_pk");
+        p.end_run(false).unwrap();
+    }
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    configure_connection(&conn).unwrap();
+
+    // Without limit: all 3 resolved.
+    let diff_all = query::diff_runs(&conn, run_pk_a, run_pk_b, None).unwrap();
+    assert_eq!(diff_all.resolved_findings.len(), 3);
+
+    // With limit=1: only 1 resolved returned.
+    let diff_limited = query::diff_runs(&conn, run_pk_a, run_pk_b, Some(1)).unwrap();
+    assert_eq!(
+        diff_limited.resolved_findings.len(),
+        1,
+        "limit should cap resolved findings"
+    );
+}
+
+/// Schema re-open on an existing database with the current version should be a
+/// no-op (no migration errors).
+#[test]
+fn schema_reopen_on_existing_db() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("findings.db");
+
+    // First open creates the schema.
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        configure_connection(&conn).unwrap();
+        ensure_schema(&conn).unwrap();
+    }
+
+    // Second open should succeed without errors (idempotent migration).
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        configure_connection(&conn).unwrap();
+        ensure_schema(&conn).unwrap();
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert!(version > 0, "user_version must be set after migration");
+    }
+}
+
+/// touch_secret_observation updates first_seen_run, last_seen_run, and
+/// occurrence_count correctly across multiple runs.
+#[test]
+fn secret_observation_counters_track_across_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("findings.db");
+    let keys = StoreKeys::bootstrap_from_env();
+    let root_id = root_id::root_id(
+        &RootIdInput {
+            kind: RootKind::Fs,
+            identity_scheme: "fs_path_v1",
+            canonical_identity: b"/tmp/secret-obs",
+        },
+        &keys,
+    );
+
+    let shared_hash = [0xDD; 32];
+
+    // Run 1: emit a finding with shared_hash.
+    {
+        let config = make_config(db_path.clone(), root_id, keys.id_hash_mode());
+        let p = SqliteStoreProducer::open(config).unwrap();
+        p.emit_fs_batch(FsFindingBatch {
+            object_path: b"a.rs",
+            findings: &[FsFindingRecord {
+                rule_id: 0,
+                root_hint_start: 0,
+                root_hint_end: 10,
+                span_start: 0,
+                span_end: 10,
+                norm_hash: shared_hash,
+            }],
+        })
+        .unwrap();
+        p.end_run(false).unwrap();
+    }
+
+    // Run 2: emit the same finding again — occurrence_count should increase.
+    {
+        let config = make_config(db_path.clone(), root_id, keys.id_hash_mode());
+        let p = SqliteStoreProducer::open(config).unwrap();
+        p.emit_fs_batch(FsFindingBatch {
+            object_path: b"a.rs",
+            findings: &[FsFindingRecord {
+                rule_id: 0,
+                root_hint_start: 0,
+                root_hint_end: 10,
+                span_start: 0,
+                span_end: 10,
+                norm_hash: shared_hash,
+            }],
+        })
+        .unwrap();
+        p.end_run(false).unwrap();
+    }
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    configure_connection(&conn).unwrap();
+
+    // Verify the secret's aggregate counters.
+    let (occ_count, first_run, last_run): (i64, i64, i64) = conn
+        .query_row(
+            "SELECT occurrence_count, first_seen_run, last_seen_run FROM secrets LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+
+    assert!(
+        occ_count >= 2,
+        "occurrence_count should be >= 2 after two runs, got {occ_count}"
+    );
+    assert!(
+        first_run <= last_run,
+        "first_seen_run ({first_run}) should be <= last_seen_run ({last_run})"
+    );
+    assert_ne!(
+        first_run, last_run,
+        "first and last seen runs should differ across two runs"
+    );
+}
