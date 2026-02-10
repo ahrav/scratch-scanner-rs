@@ -3332,30 +3332,65 @@ mod tests {
 
         let report = recover_open_segments(tmp.path(), DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap();
         assert_eq!(report.entries.len(), 1);
-        assert_eq!(report.recovered_count(), 1);
+        assert_eq!(report.recovered_count(), 0);
+        assert_eq!(report.discarded_empty_count(), 1);
 
         let entry = &report.entries[0];
         match entry.outcome {
-            OpenSegmentRecoveryOutcome::Recovered {
+            OpenSegmentRecoveryOutcome::DiscardedEmpty {
                 original_len,
-                recovered_len,
-                truncated_bytes,
                 stop_reason,
             } => {
                 assert_eq!(original_len, 0);
-                assert_eq!(recovered_len, 0);
-                assert_eq!(truncated_bytes, 0);
                 assert_eq!(stop_reason, None);
             }
-            OpenSegmentRecoveryOutcome::DiscardedDuplicateBin
-            | OpenSegmentRecoveryOutcome::DiscardedEmpty { .. } => {
-                panic!("expected recovered outcome")
-            }
+            _ => panic!("expected DiscardedEmpty outcome"),
         }
 
         assert!(!open_path.exists());
-        assert!(bin_path.exists());
-        assert_eq!(fs::metadata(&bin_path).unwrap().len(), 0);
+        assert!(!bin_path.exists(), "0-byte .bin should not be created");
+    }
+
+    #[test]
+    fn recover_open_segments_frame_0_corrupt_discards_file() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run-0000000000000001");
+        let seg_dir = run_dir.join("segments");
+        fs::create_dir_all(&seg_dir).unwrap();
+
+        let open_path = seg_dir.join("segment-00000000000000000000.open");
+        let bin_path = seg_dir.join("segment-00000000000000000000.bin");
+
+        // Create .open with a CRC-corrupted first frame.
+        let mut bytes = Vec::new();
+        encode_record(
+            &LogRecord::RunStart(recovery_run_start()),
+            DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+            &mut bytes,
+        )
+        .unwrap();
+        bytes[FRAME_HEADER_BYTES] ^= 0x01; // flip body byte to break CRC
+        fs::write(&open_path, &bytes).unwrap();
+
+        let report = recover_open_segments(tmp.path(), DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap();
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.recovered_count(), 0);
+        assert_eq!(report.discarded_empty_count(), 1);
+
+        let entry = &report.entries[0];
+        match entry.outcome {
+            OpenSegmentRecoveryOutcome::DiscardedEmpty {
+                original_len,
+                stop_reason,
+            } => {
+                assert!(original_len > 0);
+                assert_eq!(stop_reason, Some(LogReadErrorReason::CrcMismatch));
+            }
+            _ => panic!("expected DiscardedEmpty outcome"),
+        }
+
+        assert!(!open_path.exists());
+        assert!(!bin_path.exists(), "0-byte .bin should not be created");
     }
 
     #[test]
