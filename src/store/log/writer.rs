@@ -63,8 +63,28 @@ const SEGMENTS_DIR: &str = "segments";
 const SEGMENT_PREFIX: &str = "segment-";
 const SEGMENT_OPEN_EXT: &str = "open";
 const SEGMENT_BIN_EXT: &str = "bin";
+/// Domain separation tag for the keyed BLAKE3 finding-id derivation.
+///
+/// Prevents collisions with other keyed hashes that share the same
+/// `metadata_key` (e.g. secret hashes, rule fingerprints). Changing this
+/// string invalidates all previously-emitted finding IDs.
 const FINDING_ID_DOMAIN: &[u8] = b"scanner.store.log.v1.finding_id";
-const FINDING_BATCH_BASE_PAYLOAD_BYTES: usize = 8; // object_path_len + findings_count
+const FINDING_BATCH_BASE_PAYLOAD_BYTES: usize = 8; // object_path_len (4) + findings_count (4)
+
+/// Per-finding wire size in a `FindingBatch` frame body.
+///
+/// ```text
+///   rule_id            4 bytes   u32-LE
+///   rule_fingerprint  32 bytes   BLAKE3
+///   secret_hash       32 bytes   BLAKE3
+///   finding_id        32 bytes   BLAKE3
+///   root_hint_start    8 bytes   u64-LE
+///   root_hint_end      8 bytes   u64-LE
+///   span_start         8 bytes   u64-LE
+///   span_end           8 bytes   u64-LE
+///                    ─────────
+///   total            132 bytes
+/// ```
 const FINDING_RECORD_WIRE_BYTES: usize = 132;
 const FINDING_FRAME_POOL_MIN_CAPACITY: usize = 256;
 const FINDING_FRAME_POOL_DEFAULT_CAPACITY: usize = 4 * 1024;
@@ -276,6 +296,23 @@ impl AppendLogStoreProducer {
     /// [`encode_record`]), finding frames are built inline here to avoid an
     /// intermediate `LogFindingBatch` allocation. The resulting buffer is
     /// ready for `SegmentWriter::write_frame` with no further copies.
+    ///
+    /// # Wire layout
+    ///
+    /// ```text
+    /// ┌──────────────┬──────────┬───────────────┬────────────────────┬─────────────┐
+    /// │ frame_len(4) │ crc32(4) │ type_byte(1)  │ object_path_len(4) │ object_path │
+    /// ├──────────────┴──────────┴───────────────┴────────────────────┴─────────────┤
+    /// │ findings_count(4)                                                          │
+    /// ├───────────────────────────────────────────────────────────────────────────--┤
+    /// │ per finding × N:                                                           │
+    /// │   rule_id(4) | rule_fp(32) | secret(32) | finding_id(32)                   │
+    /// │   | root_hint_start(8) | root_hint_end(8) | span_start(8) | span_end(8)   │
+    /// └───────────────────────────────────────────────────────────────────────────--┘
+    /// ```
+    ///
+    /// CRC-32 covers `type_byte .. end` (the entire body). The `frame_len`
+    /// field stores `body_len` (= 1 + payload), not `total_len`.
     fn build_finding_frame(
         &self,
         batch: FsFindingBatch<'_>,
@@ -1052,6 +1089,12 @@ fn finding_id_prefix_hasher(
 }
 
 /// Derive a deterministic finding ID by extending a cloned batch prefix.
+///
+/// The resulting 32-byte BLAKE3 hash is keyed by the store metadata key and
+/// absorbs every field that distinguishes one finding from another within the
+/// same object path: rule fingerprint, secret hash, and byte offsets. Two
+/// findings are considered identical iff their IDs match — this drives
+/// cross-run deduplication in downstream consumers.
 #[inline(always)]
 fn derive_finding_id(
     prefix_hasher: &blake3::Hasher,
@@ -1397,6 +1440,15 @@ pub fn list_finalized_segment_files(store_root: &Path) -> Result<Vec<PathBuf>, F
     Ok(out)
 }
 
+/// Drive a [`LogReader`] forward through `file` until clean EOF or first bad
+/// frame, returning `(last_valid_byte_offset, stop_reason)`.
+///
+/// The caller truncates the file at the returned offset, discarding any
+/// partial trailing frame. A `None` stop reason means the reader reached
+/// clean EOF with no corruption — the entire file is valid. An `Io` reason
+/// is promoted to a hard error (the caller cannot safely truncate on I/O
+/// failure), while all other reasons (CRC, truncated, malformed, etc.) are
+/// treated as a recoverable boundary.
 fn scan_recovery_boundary(
     file: &mut File,
     max_frame_payload_bytes: u32,
@@ -1420,6 +1472,11 @@ fn scan_recovery_boundary(
     }
 }
 
+/// Collect `run-*` directories under `store_root` in lexical order.
+///
+/// Lexical ordering over the hex run-id suffix gives chronological order
+/// within a single process (run IDs are time+counter). Cross-process ordering
+/// is best-effort because run-id generation is per-process.
 fn list_run_dirs(store_root: &Path) -> Result<Vec<PathBuf>, FsStoreError> {
     let mut run_dirs = Vec::new();
     for entry in fs::read_dir(store_root).map_err(io_to_store_err)? {
@@ -1470,7 +1527,7 @@ mod tests {
     use crate::store::keys::{CorrelationMode, KeySource};
     use crate::store::log::format::{
         encode_record, LogDurabilityMode, LogRecord, LogRecordReader, LogRunEnd, LogRunStart,
-        DEFAULT_MAX_FRAME_PAYLOAD_BYTES, LOG_FORMAT_VERSION,
+        DEFAULT_MAX_FRAME_PAYLOAD_BYTES, FRAME_HEADER_BYTES, LOG_FORMAT_VERSION,
     };
     use regex::bytes::Regex;
     use tempfile::TempDir;
@@ -1524,6 +1581,38 @@ mod tests {
             persistence_emit_failures: 0,
             incomplete: false,
         }
+    }
+
+    fn rewrite_frame_body_byte_and_recompute_crc(frame: &mut [u8], body_offset: usize, value: u8) {
+        let body_idx = FRAME_HEADER_BYTES + body_offset;
+        frame[body_idx] = value;
+
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(&frame[FRAME_HEADER_BYTES..]);
+        let crc32 = crc.finalize();
+        frame[4..FRAME_HEADER_BYTES].copy_from_slice(&crc32.to_le_bytes());
+    }
+
+    fn decode_recovered_records(bin_path: &std::path::Path) -> Vec<LogRecord> {
+        let f = File::open(bin_path).unwrap();
+        let mut reader = LogRecordReader::new(f, DEFAULT_MAX_FRAME_PAYLOAD_BYTES);
+        let mut records = Vec::new();
+        while let Some(rec) = reader.next_record().unwrap() {
+            records.push(rec);
+        }
+        records
+    }
+
+    fn run_marked_incomplete(
+        records: &[LogRecord],
+        stop_reason: Option<LogReadErrorReason>,
+    ) -> bool {
+        if stop_reason.is_some() {
+            return true;
+        }
+        !records
+            .iter()
+            .any(|record| matches!(record, LogRecord::RunEnd(run_end) if !run_end.incomplete))
     }
 
     #[test]
@@ -2468,6 +2557,158 @@ mod tests {
             Some(LogRecord::RunStart(_))
         ));
         assert!(reader.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn recover_open_segments_crc_failure_stops_at_first_bad_frame_and_marks_incomplete() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run-0000000000000001");
+        let seg_dir = run_dir.join("segments");
+        fs::create_dir_all(&seg_dir).unwrap();
+
+        let open_path = seg_dir.join("segment-00000000000000000000.open");
+        let bin_path = seg_dir.join("segment-00000000000000000000.bin");
+
+        let mut bytes = Vec::new();
+        encode_record(
+            &LogRecord::RunStart(recovery_run_start()),
+            DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+            &mut bytes,
+        )
+        .unwrap();
+        let expected_recovered_len = bytes.len() as u64;
+
+        let mut corrupt_run_end = Vec::new();
+        encode_record(
+            &LogRecord::RunEnd(recovery_run_end()),
+            DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+            &mut corrupt_run_end,
+        )
+        .unwrap();
+        corrupt_run_end[FRAME_HEADER_BYTES] ^= 0x01;
+        bytes.extend_from_slice(&corrupt_run_end);
+        // Valid trailing frame should be ignored: recovery stops at the first bad frame.
+        encode_record(
+            &LogRecord::RunEnd(recovery_run_end()),
+            DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+            &mut bytes,
+        )
+        .unwrap();
+
+        fs::write(&open_path, &bytes).unwrap();
+
+        let report = recover_open_segments(tmp.path(), DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap();
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.recovered_count(), 1);
+
+        let entry = &report.entries[0];
+        assert_eq!(entry.open_path, open_path);
+        assert_eq!(entry.bin_path, bin_path);
+        let stop_reason = match entry.outcome {
+            OpenSegmentRecoveryOutcome::Recovered {
+                recovered_len,
+                truncated_bytes,
+                stop_reason,
+                ..
+            } => {
+                assert_eq!(recovered_len, expected_recovered_len);
+                assert!(truncated_bytes > 0);
+                assert_eq!(stop_reason, Some(LogReadErrorReason::CrcMismatch));
+                stop_reason
+            }
+            OpenSegmentRecoveryOutcome::DiscardedDuplicateBin => {
+                panic!("expected recovered outcome")
+            }
+        };
+
+        let records = decode_recovered_records(&bin_path);
+        assert_eq!(records.len(), 1);
+        assert!(matches!(records[0], LogRecord::RunStart(_)));
+        assert!(
+            run_marked_incomplete(&records, stop_reason),
+            "CRC stop reason should mark recovered run incomplete"
+        );
+    }
+
+    #[test]
+    fn recover_open_segments_reserved_identity_metadata_violation_is_covered() {
+        // RunStart payload layout:
+        // version(2) + run_id(8) + started(8) + durability(1) + correlation_mode(1)
+        // + key_source(1) + max_inflight_batches(4) + max_inflight_bytes(8)
+        // + max_frame_payload_bytes(4)
+        const RUN_START_KEY_SOURCE_BODY_OFFSET: usize = 1 + 2 + 8 + 8 + 1 + 1;
+
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run-0000000000000001");
+        let seg_dir = run_dir.join("segments");
+        fs::create_dir_all(&seg_dir).unwrap();
+
+        let open_path = seg_dir.join("segment-00000000000000000000.open");
+        let bin_path = seg_dir.join("segment-00000000000000000000.bin");
+
+        let mut bytes = Vec::new();
+        encode_record(
+            &LogRecord::RunStart(recovery_run_start()),
+            DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+            &mut bytes,
+        )
+        .unwrap();
+        let expected_recovered_len = bytes.len() as u64;
+
+        let mut invalid_identity_run_start = Vec::new();
+        encode_record(
+            &LogRecord::RunStart(recovery_run_start()),
+            DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+            &mut invalid_identity_run_start,
+        )
+        .unwrap();
+        // key_source uses a small fixed domain; 0xFF exercises reserved/unknown value handling.
+        rewrite_frame_body_byte_and_recompute_crc(
+            &mut invalid_identity_run_start,
+            RUN_START_KEY_SOURCE_BODY_OFFSET,
+            0xFF,
+        );
+        bytes.extend_from_slice(&invalid_identity_run_start);
+        encode_record(
+            &LogRecord::RunEnd(recovery_run_end()),
+            DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+            &mut bytes,
+        )
+        .unwrap();
+
+        fs::write(&open_path, &bytes).unwrap();
+
+        let report = recover_open_segments(tmp.path(), DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap();
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.recovered_count(), 1);
+
+        let entry = &report.entries[0];
+        assert_eq!(entry.open_path, open_path);
+        assert_eq!(entry.bin_path, bin_path);
+        let stop_reason = match entry.outcome {
+            OpenSegmentRecoveryOutcome::Recovered {
+                recovered_len,
+                truncated_bytes,
+                stop_reason,
+                ..
+            } => {
+                assert_eq!(recovered_len, expected_recovered_len);
+                assert!(truncated_bytes > 0);
+                assert_eq!(stop_reason, Some(LogReadErrorReason::MalformedFrame));
+                stop_reason
+            }
+            OpenSegmentRecoveryOutcome::DiscardedDuplicateBin => {
+                panic!("expected recovered outcome")
+            }
+        };
+
+        let records = decode_recovered_records(&bin_path);
+        assert_eq!(records.len(), 1);
+        assert!(matches!(records[0], LogRecord::RunStart(_)));
+        assert!(
+            run_marked_incomplete(&records, stop_reason),
+            "reserved identity metadata violation should mark recovered run incomplete"
+        );
     }
 
     #[test]

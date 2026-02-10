@@ -462,6 +462,41 @@ mod tests {
         out
     }
 
+    fn rewrite_body_byte_and_recompute_crc(frame: &mut [u8], body_offset: usize, value: u8) {
+        let body_idx = FRAME_HEADER_BYTES + body_offset;
+        frame[body_idx] = value;
+
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(&frame[FRAME_HEADER_BYTES..]);
+        let crc32 = crc.finalize();
+        frame[4..FRAME_HEADER_BYTES].copy_from_slice(&crc32.to_le_bytes());
+    }
+
+    fn decode_with_incomplete_policy(
+        bytes: Vec<u8>,
+    ) -> (Vec<LogRecord>, bool, Option<LogReadErrorReason>) {
+        let mut reader = LogReader::with_default_limit(IoCursor::new(bytes));
+        let mut records = Vec::new();
+        let mut stop_reason = None;
+
+        loop {
+            match reader.next_record() {
+                Ok(Some(record)) => records.push(record),
+                Ok(None) => break,
+                Err(err) => {
+                    stop_reason = Some(err.reason());
+                    break;
+                }
+            }
+        }
+
+        let has_clean_run_end = records
+            .iter()
+            .any(|record| matches!(record, LogRecord::RunEnd(run_end) if !run_end.incomplete));
+        let incomplete = stop_reason.is_some() || !has_clean_run_end;
+        (records, incomplete, stop_reason)
+    }
+
     fn unknown_type_frame(type_byte: u8) -> Vec<u8> {
         let frame_len: u32 = 1;
         let mut crc = crc32fast::Hasher::new();
@@ -588,5 +623,82 @@ mod tests {
         let mut reader = LogReader::with_default_limit(IoCursor::new(bytes));
         let err = reader.next_record().unwrap_err();
         assert_eq!(err.reason(), LogReadErrorReason::MalformedFrame);
+    }
+
+    #[test]
+    fn truncated_tail_policy_treats_terminal_error_as_incomplete_eof() {
+        let mut bytes = encode_records(&[
+            LogRecord::RunStart(sample_run_start()),
+            LogRecord::RuleDef(sample_rule_def()),
+            LogRecord::RunEnd(sample_run_end()),
+        ]);
+        bytes.truncate(bytes.len() - 4);
+
+        let (records, incomplete, stop_reason) = decode_with_incomplete_policy(bytes);
+        assert_eq!(records.len(), 2);
+        assert!(matches!(records[0], LogRecord::RunStart(_)));
+        assert!(matches!(records[1], LogRecord::RuleDef(_)));
+        assert!(incomplete);
+        assert_eq!(stop_reason, Some(LogReadErrorReason::Truncated));
+    }
+
+    #[test]
+    fn crc_failure_stops_at_first_bad_frame_and_marks_incomplete() {
+        let mut bad_run_end = encode_records(&[LogRecord::RunEnd(sample_run_end())]);
+        bad_run_end[FRAME_HEADER_BYTES] ^= 0x01;
+
+        let mut bytes = encode_records(&[
+            LogRecord::RunStart(sample_run_start()),
+            LogRecord::RuleDef(sample_rule_def()),
+        ]);
+        bytes.extend_from_slice(&bad_run_end);
+        bytes.extend_from_slice(&encode_records(&[LogRecord::RunEnd(sample_run_end())]));
+
+        let mut reader = LogReader::with_default_limit(IoCursor::new(bytes.clone()));
+        assert!(matches!(
+            reader.next_record().unwrap(),
+            Some(LogRecord::RunStart(_))
+        ));
+        assert!(matches!(
+            reader.next_record().unwrap(),
+            Some(LogRecord::RuleDef(_))
+        ));
+        let err = reader.next_record().unwrap_err();
+        assert_eq!(err.reason(), LogReadErrorReason::CrcMismatch);
+        assert!(reader.next_record().unwrap().is_none());
+
+        let (records, incomplete, stop_reason) = decode_with_incomplete_policy(bytes);
+        assert_eq!(records.len(), 2);
+        assert!(incomplete);
+        assert_eq!(stop_reason, Some(LogReadErrorReason::CrcMismatch));
+    }
+
+    #[test]
+    fn reserved_identity_metadata_violation_is_reason_coded_malformed() {
+        // RunStart payload layout:
+        // version(2) + run_id(8) + started(8) + durability(1) + correlation_mode(1)
+        // + key_source(1) + max_inflight_batches(4) + max_inflight_bytes(8)
+        // + max_frame_payload_bytes(4)
+        const RUN_START_KEY_SOURCE_BODY_OFFSET: usize = 1 + 2 + 8 + 8 + 1 + 1;
+
+        let mut invalid_run_start = encode_records(&[LogRecord::RunStart(sample_run_start())]);
+        // key_source uses a small fixed domain; 0xFF exercises reserved/unknown value handling.
+        rewrite_body_byte_and_recompute_crc(
+            &mut invalid_run_start,
+            RUN_START_KEY_SOURCE_BODY_OFFSET,
+            0xFF,
+        );
+
+        let mut bytes = encode_records(&[
+            LogRecord::RunStart(sample_run_start()),
+            LogRecord::RuleDef(sample_rule_def()),
+        ]);
+        bytes.extend_from_slice(&invalid_run_start);
+        bytes.extend_from_slice(&encode_records(&[LogRecord::RunEnd(sample_run_end())]));
+
+        let (records, incomplete, stop_reason) = decode_with_incomplete_policy(bytes);
+        assert_eq!(records.len(), 2);
+        assert!(incomplete);
+        assert_eq!(stop_reason, Some(LogReadErrorReason::MalformedFrame));
     }
 }
