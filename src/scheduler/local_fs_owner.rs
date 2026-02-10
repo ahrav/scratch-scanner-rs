@@ -4410,10 +4410,7 @@ mod tests {
         fs::write(&path, &data).unwrap();
         let size = fs::metadata(&path).unwrap().len();
 
-        let source = VecFileSource::new(vec![LocalFile {
-            path,
-            size,
-        }]);
+        let source = VecFileSource::new(vec![LocalFile { path, size }]);
         let mut cfg = small_config_with_sink(sink.clone());
         cfg.archive.enabled = true;
 
