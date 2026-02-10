@@ -353,3 +353,36 @@ fn binary_skip_stats_correct() {
         report.metrics.binary_skipped
     );
 }
+
+/// Binary file with no archive magic should be classified as binary (not
+/// archive) when both archive sniffing and binary skipping are enabled.
+/// Validates the sequential logic: sniff first, binary check second.
+#[test]
+fn binary_file_classified_after_sniff_fails() {
+    let dir = TempDir::new().unwrap();
+
+    // Binary content: NUL bytes but no archive magic.
+    let bin_path = dir.path().join("data.bin");
+    std::fs::write(&bin_path, b"\x00\x01SECRET\x00\x02").unwrap();
+    let size = std::fs::metadata(&bin_path).unwrap().len();
+
+    let files = vec![lf(bin_path, size)];
+
+    let mut cfg = default_cfg();
+    cfg.archive.enabled = true;
+    cfg.skip_binary = true;
+
+    let (output, report) = run_scan_with_config(files, cfg);
+    let paths = finding_paths(&output);
+
+    // File should be skipped as binary, not routed as archive.
+    assert!(
+        paths.is_empty(),
+        "binary file with no archive magic should produce no findings: {output}"
+    );
+    assert!(
+        report.metrics.binary_skipped > 0,
+        "expected binary_skipped > 0, got {}",
+        report.metrics.binary_skipped
+    );
+}
