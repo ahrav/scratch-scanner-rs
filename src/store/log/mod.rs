@@ -20,6 +20,7 @@
 //!   segment rotation, and durable `.open` → `.bin` finalization.
 
 pub mod format;
+mod secret_cache;
 pub mod writer;
 
 pub use format::{
@@ -27,6 +28,8 @@ pub use format::{
     LogFindingRecord, LogRecord, LogRecordReader, LogRuleDef, LogRunEnd, LogRunStart,
     DEFAULT_MAX_FRAME_PAYLOAD_BYTES, LOG_FORMAT_VERSION,
 };
+#[cfg(feature = "bench")]
+pub use secret_cache::SecretHashCache;
 pub use writer::{
     default_fs_log_root, list_finalized_segment_files, AppendLogStoreProducer, LogWriterConfig,
     SCANNER_FS_LOG_DIR_ENV,

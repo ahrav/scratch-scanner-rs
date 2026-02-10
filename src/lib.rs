@@ -112,6 +112,8 @@ pub use engine::{
 #[cfg(feature = "stats")]
 pub use engine::{AnchorPlanStats, VectorscanStats};
 pub use engine::{Engine, NormHash, ScanScratch};
+#[cfg(feature = "bench")]
+pub use store::SecretHashCache;
 
 pub use runtime::{
     read_file_chunks, BufferHandle, BufferPool, Chunk, FileTable, ScannerConfig, ScannerRuntime,

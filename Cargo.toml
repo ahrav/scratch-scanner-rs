@@ -161,6 +161,11 @@ harness = false
 name = "rule_isolation"
 harness = false
 
+[[bench]]
+name = "secret_hash_cache"
+harness = false
+required-features = ["bench"]
+
 [profile.dev]
 opt-level = 1
 
