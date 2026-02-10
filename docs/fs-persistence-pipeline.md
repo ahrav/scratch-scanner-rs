@@ -25,7 +25,7 @@ emits). The consumer side (actual backend storage) is plugged in via the
 | Module | Scope | Purpose |
 |--------|-------|---------|
 | `src/store/fs.rs` | FS persistence producer | Write-side trait + data types for FS scan findings |
-| `src/store/log/format.rs` | FS log codec | Framed on-disk record format (V1 + V2, position-bound CRC, segment trailer) |
+| `src/store/log/format.rs` | FS log codec | Framed on-disk record format (V1 + V2, position-bound CRC, segment header/trailer, cross-segment hash chaining) |
 | `src/store/log/reader.rs` | FS log reader | Streaming frame decoder with reason-coded errors and `.open` recovery |
 | `src/store/log/writer.rs` | FS append-log backend | Bounded single-writer runtime with `.open` -> `.bin` finalize |
 | `src/store/identity.rs` | Identity contracts | Stable `RuleFingerprint`, `SecretHash`, `OccurrenceId` derivation |
@@ -198,7 +198,8 @@ Example: scanning `/data/repos/myproject` creates
 - Active segments have the `.open` extension; finalized segments have `.bin`.
 - After a clean shutdown, no `.open` files remain.
 - `list_finalized_segment_files()` walks `run-*/segments/segment-*.bin` in
-  lexical order and ignores `.open` files.
+  lexical order, ignores `.open` files, and verifies V2 `prev_segment_hash`
+  continuity before returning paths.
 
 #### Binary Frame Format
 
@@ -304,6 +305,18 @@ offset  size   field
 
 #### Segment Integrity Trailer (V2)
 
+Finalized V2 segments use both a fixed header and a fixed trailer:
+
+**Segment header (written at segment start):**
+
+```text
+offset  size   field
+  0     [8]    magic                ("SCRHDRv2")
+  8     u64    segment_id
+ 16     [32]   prev_segment_hash     (hash of previous finalized segment, or zero for first)
+                                     total: 48 bytes
+```
+
 Finalized `.bin` segments append a fixed trailer after the last frame:
 
 ```text
@@ -317,8 +330,22 @@ offset  size   field
 ```
 
 Readers validate trailer fields against observed frame stream state when
-present. `.open` files may not contain a trailer; recovery scans treat clean
-EOF at a frame boundary as valid for `.open`.
+present and derive a deterministic per-segment hash from:
+`segment_id`, `prev_segment_hash`, `frame_count`, `total_frame_bytes`, and
+`frame_crc_chain`.
+
+`.open` files may not contain a trailer; recovery scans treat clean EOF at a
+frame boundary as valid for `.open`.
+
+#### Cross-Segment Chain Verification (V2)
+
+For V2 runs, segment ordering/integrity is validated by hash chaining:
+
+- First segment must have `prev_segment_hash = [0; 32]`.
+- Each subsequent segment header must point to the previous segment's derived hash.
+- Recovery (`recover_open_segments`) and replay segment discovery
+  (`list_finalized_segment_files`) both validate this chain and fail on
+  insertion/deletion/reordering/tampering patterns that break continuity.
 
 #### Run Content Ordering
 
@@ -402,13 +429,15 @@ Segments rotate when writing a frame would exceed `max_segment_bytes`
 ```text
 write_frame(data):
     trailer_bytes = 64
-    if bytes_written > 0 AND bytes_written + len(data) + trailer_bytes > max_segment_bytes:
+    if frame_count > 0 AND bytes_written + len(data) + trailer_bytes > max_segment_bytes:
         append trailer(frame_count, total_frame_bytes, frame_crc_chain)
         sync_data()              ← flush to disk
         rename .open → .bin      ← atomic finalization
         sync_dir()               ← directory entry durable
+        derive segment_hash      ← used as next segment's prev_segment_hash
         open new .open (seq++)
-        bytes_written = 0
+        write segment header(segment_id, prev_segment_hash)
+        bytes_written = header_bytes
     write data to current .open
     bytes_written += len(data)
 ```
@@ -439,8 +468,8 @@ Default: `SegmentClose`.
 | `durability` | `SegmentClose` | fsync strategy |
 
 Validation rejects: any zero-valued budget, `max_inflight_batches` > `u32::MAX`
-(wire format limit), and segment sizes that cannot fit at least one minimal
-V2 frame plus the 64-byte segment trailer.
+(wire format limit), and segment sizes that cannot fit at least one maximal
+configured V2 frame plus the fixed 48-byte header and 64-byte trailer.
 
 #### Backpressure
 

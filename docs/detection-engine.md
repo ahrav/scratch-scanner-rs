@@ -224,7 +224,7 @@ Filesystem scans now have a concrete persistence backend in
 - `store::log::format` defines deterministic frames with explicit size caps and
   CRC32 integrity over the full body (legacy V1 `type + payload`; current V2
   `frame_seq + segment_id + frame_type + payload`), plus finalized-segment
-  integrity trailers.
+  integrity headers/trailers and cross-segment hash chaining.
 - `store::log::writer` runs a bounded single-writer thread with backpressure on
   both in-flight batch count (default 256) and in-flight bytes (default 64 MB).
 - Segments rotate at `max_segment_bytes` (default 64 MB). Active segments are

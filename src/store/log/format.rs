@@ -2,7 +2,7 @@
 //!
 //! # Wire format
 //!
-//! Every record is wrapped in a fixed 8-byte header followed by the body.
+//! Each segment starts with a fixed header and then stores framed records.
 //! Two frame layouts are supported on read:
 //!
 //! - **V1 (legacy)** body = `type || payload`
@@ -11,6 +11,12 @@
 //! V2 is encoded by setting the high bit of `frame_len`.
 //!
 //! ```text
+//! V2 segment envelope:
+//! ┌──────────────┬────────────────────┬──────────────┐
+//! │ seg header   │ framed records...  │ seg trailer  │
+//! │ SCRHDRv2     │ V1/V2 frame layout │ SCRSEGv2     │
+//! └──────────────┴────────────────────┴──────────────┘
+//!
 //! V1 body:
 //! ┌──────────────┬──────────────┬──────────┬─────────────────────┐
 //! │ frame_len    │ crc32        │ type     │ payload             │
@@ -40,6 +46,8 @@
 //!   length-prefixed with a `u32_le` count.
 //! - Finalized V2 segments end with a fixed-size trailer carrying
 //!   `frame_count`, `total_frame_bytes`, and a BLAKE3 chain over per-frame CRCs.
+//! - V2 segments also carry a fixed header with `segment_id` and
+//!   `prev_segment_hash` for cross-segment chain verification.
 //! - Frame payloads must not exceed [`DEFAULT_MAX_FRAME_PAYLOAD_BYTES`]
 //!   (configurable at the writer level) to bound memory allocation on read.
 
@@ -62,6 +70,8 @@ pub(crate) const FRAME_V2_SEQ_OFFSET: usize = FRAME_HEADER_BYTES;
 pub(crate) const FRAME_V2_SEGMENT_ID_OFFSET: usize = FRAME_V2_SEQ_OFFSET + 8;
 pub(crate) const FRAME_V2_TYPE_OFFSET: usize = FRAME_V2_SEGMENT_ID_OFFSET + 8;
 
+pub(crate) const SEGMENT_HEADER_MAGIC: [u8; 8] = *b"SCRHDRv2";
+pub(crate) const SEGMENT_HEADER_BYTES: usize = 8 + 8 + 32;
 pub(crate) const SEGMENT_TRAILER_MAGIC: [u8; 8] = *b"SCRSEGv2";
 pub(crate) const SEGMENT_TRAILER_BYTES: usize = 8 + 8 + 8 + 8 + 32;
 
@@ -70,6 +80,13 @@ pub(crate) const SEGMENT_TRAILER_BYTES: usize = 8 + 8 + 8 + 8 + 32;
 pub struct FramePosition {
     pub frame_seq: u64,
     pub segment_id: u64,
+}
+
+/// Header written at the beginning of each V2 segment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SegmentHeader {
+    pub segment_id: u64,
+    pub prev_segment_hash: [u8; 32],
 }
 
 /// Integrity trailer written at the end of finalized V2 segments.
@@ -187,6 +204,37 @@ pub(crate) fn extend_frame_crc_chain(prev: &[u8; 32], frame_crc: u32) -> [u8; 32
     *hasher.finalize().as_bytes()
 }
 
+/// Serialize a [`SegmentHeader`] and append it to `out`.
+pub(crate) fn append_segment_header(out: &mut Vec<u8>, header: &SegmentHeader) {
+    out.extend_from_slice(&SEGMENT_HEADER_MAGIC);
+    out.extend_from_slice(&header.segment_id.to_le_bytes());
+    out.extend_from_slice(&header.prev_segment_hash);
+}
+
+/// Decode a [`SegmentHeader`] from an exact [`SEGMENT_HEADER_BYTES`]-length
+/// slice.
+pub(crate) fn decode_segment_header(buf: &[u8]) -> Result<SegmentHeader, FormatError> {
+    if buf.len() != SEGMENT_HEADER_BYTES {
+        return Err(FormatError::InvalidSegmentHeader {
+            detail: "segment header length mismatch",
+        });
+    }
+    if buf[..8] != SEGMENT_HEADER_MAGIC {
+        return Err(FormatError::InvalidSegmentHeader {
+            detail: "segment header magic mismatch",
+        });
+    }
+    let segment_id = u64::from_le_bytes([
+        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+    ]);
+    let mut prev_segment_hash = [0u8; 32];
+    prev_segment_hash.copy_from_slice(&buf[16..48]);
+    Ok(SegmentHeader {
+        segment_id,
+        prev_segment_hash,
+    })
+}
+
 /// Serialize a [`SegmentTrailer`] and append it to `out`.
 ///
 /// Writes the fixed 64-byte trailer: 8-byte magic (`SCRSEGv2`), then
@@ -246,6 +294,21 @@ pub(crate) fn decode_segment_trailer(buf: &[u8]) -> Result<SegmentTrailer, Forma
         total_frame_bytes,
         frame_crc_chain,
     })
+}
+
+/// Derive a deterministic digest for one finalized segment.
+///
+/// The digest is chained across segments via
+/// [`SegmentHeader::prev_segment_hash`].
+pub(crate) fn derive_segment_hash(header: &SegmentHeader, trailer: &SegmentTrailer) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"scanner.store.log.v2.segment_hash");
+    hasher.update(&header.segment_id.to_le_bytes());
+    hasher.update(&header.prev_segment_hash);
+    hasher.update(&trailer.frame_count.to_le_bytes());
+    hasher.update(&trailer.total_frame_bytes.to_le_bytes());
+    hasher.update(&trailer.frame_crc_chain);
+    *hasher.finalize().as_bytes()
 }
 
 /// Frame discriminants written on disk.
@@ -504,6 +567,9 @@ pub enum FormatError {
         frame_type: FrameType,
         detail: &'static str,
     },
+    InvalidSegmentHeader {
+        detail: &'static str,
+    },
     InvalidSegmentTrailer {
         detail: &'static str,
     },
@@ -546,6 +612,9 @@ impl fmt::Display for FormatError {
             }
             Self::InvalidRecord { frame_type, detail } => {
                 write!(f, "invalid {frame_type:?} payload: {detail}")
+            }
+            Self::InvalidSegmentHeader { detail } => {
+                write!(f, "invalid segment header: {detail}")
             }
             Self::InvalidSegmentTrailer { detail } => {
                 write!(f, "invalid segment trailer: {detail}")
@@ -755,6 +824,8 @@ pub struct LogRecordReader<R: Read> {
     reader: R,
     frame_buf: Vec<u8>,
     max_payload_bytes: u32,
+    segment_preamble_checked: bool,
+    segment_header: Option<SegmentHeader>,
     frame_count: u64,
     total_frame_bytes: u64,
     frame_crc_chain: [u8; 32],
@@ -766,6 +837,8 @@ impl<R: Read> LogRecordReader<R> {
             reader,
             frame_buf: Vec::new(),
             max_payload_bytes,
+            segment_preamble_checked: false,
+            segment_header: None,
             frame_count: 0,
             total_frame_bytes: 0,
             frame_crc_chain: [0u8; 32],
@@ -792,6 +865,13 @@ impl<R: Read> LogRecordReader<R> {
         trailer_buf[..8].copy_from_slice(&magic);
         self.read_exact_into(&mut trailer_buf[8..])?;
         let trailer = decode_segment_trailer(&trailer_buf)?;
+        if let Some(header) = self.segment_header {
+            if trailer.segment_id != header.segment_id {
+                return Err(FormatError::InvalidSegmentTrailer {
+                    detail: "segment_id mismatch",
+                });
+            }
+        }
         if trailer.frame_count != self.frame_count {
             return Err(FormatError::InvalidSegmentTrailer {
                 detail: "frame_count mismatch",
@@ -810,22 +890,10 @@ impl<R: Read> LogRecordReader<R> {
         Ok(())
     }
 
-    /// Decode the next record.
-    ///
-    /// Returns `Ok(None)` on clean EOF before a new frame header starts.
-    pub fn next_record(&mut self) -> Result<Option<LogRecord>, FormatError> {
-        let mut header = [0u8; FRAME_HEADER_BYTES];
-        let mut got = 0usize;
-        while got < FRAME_HEADER_BYTES {
-            let n = self.reader.read(&mut header[got..])?;
-            if n == 0 {
-                if got == 0 {
-                    return Ok(None);
-                }
-                return Err(FormatError::TruncatedHeader { got });
-            }
-            got += n;
-        }
+    fn next_record_from_header(
+        &mut self,
+        header: [u8; FRAME_HEADER_BYTES],
+    ) -> Result<Option<LogRecord>, FormatError> {
         if header == SEGMENT_TRAILER_MAGIC {
             self.read_segment_trailer_after_magic(header)?;
             return Ok(None);
@@ -863,6 +931,50 @@ impl<R: Read> LogRecordReader<R> {
             self.frame_crc_chain = extend_frame_crc_chain(&self.frame_crc_chain, crc_expected);
             Some(record)
         })
+    }
+
+    /// Decode the next record.
+    ///
+    /// Returns `Ok(None)` on clean EOF before a new frame header starts.
+    pub fn next_record(&mut self) -> Result<Option<LogRecord>, FormatError> {
+        if !self.segment_preamble_checked {
+            let mut prelude = [0u8; FRAME_HEADER_BYTES];
+            let mut got = 0usize;
+            while got < FRAME_HEADER_BYTES {
+                let n = self.reader.read(&mut prelude[got..])?;
+                if n == 0 {
+                    if got == 0 {
+                        return Ok(None);
+                    }
+                    return Err(FormatError::TruncatedHeader { got });
+                }
+                got += n;
+            }
+            if prelude == SEGMENT_HEADER_MAGIC {
+                let mut header_buf = [0u8; SEGMENT_HEADER_BYTES];
+                header_buf[..FRAME_HEADER_BYTES].copy_from_slice(&prelude);
+                self.read_exact_into(&mut header_buf[FRAME_HEADER_BYTES..])?;
+                self.segment_header = Some(decode_segment_header(&header_buf)?);
+                self.segment_preamble_checked = true;
+                return self.next_record();
+            }
+            self.segment_preamble_checked = true;
+            return self.next_record_from_header(prelude);
+        }
+
+        let mut header = [0u8; FRAME_HEADER_BYTES];
+        let mut got = 0usize;
+        while got < FRAME_HEADER_BYTES {
+            let n = self.reader.read(&mut header[got..])?;
+            if n == 0 {
+                if got == 0 {
+                    return Ok(None);
+                }
+                return Err(FormatError::TruncatedHeader { got });
+            }
+            got += n;
+        }
+        self.next_record_from_header(header)
     }
 }
 

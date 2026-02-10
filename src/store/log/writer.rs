@@ -37,15 +37,17 @@
 //! segment close (`sync_data` + rename + `sync_dir`). The writer rotates
 //! to a new segment when `bytes_written + frame_len + trailer_bytes >
 //! max_segment_bytes`, so every finalized segment can append its integrity
-//! trailer (`frame_count`, `total_frame_bytes`, BLAKE3 CRC chain).
+//! trailer (`frame_count`, `total_frame_bytes`, BLAKE3 CRC chain) and feed its
+//! derived hash into the next segment header (`prev_segment_hash`).
 //! After a clean shutdown, no `.open` files remain.
 
 use super::format::{
-    append_segment_trailer, encode_record_with_position, extend_frame_crc_chain,
-    finalize_v2_frame_in_place, frame_crc_from_header, FramePosition, FrameType, LogDurabilityMode,
-    LogRecord, LogRuleDef, LogRunEnd, LogRunStart, SegmentTrailer, DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+    append_segment_header, append_segment_trailer, derive_segment_hash,
+    encode_record_with_position, extend_frame_crc_chain, finalize_v2_frame_in_place,
+    frame_crc_from_header, FramePosition, FrameType, LogDurabilityMode, LogRecord, LogRuleDef,
+    LogRunEnd, LogRunStart, SegmentHeader, SegmentTrailer, DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
     FRAME_HEADER_BYTES, FRAME_V2_LEN_FLAG, FRAME_V2_POSITION_BYTES, LOG_FORMAT_VERSION,
-    SEGMENT_TRAILER_BYTES,
+    SEGMENT_HEADER_BYTES, SEGMENT_TRAILER_BYTES,
 };
 use super::reader::{LogReadErrorReason, LogReader};
 use super::secret_cache::SecretHashCache;
@@ -101,7 +103,8 @@ pub const SCANNER_FS_LOG_DIR_ENV: &str = "SCANNER_FS_LOG_DIR";
 ///
 /// All budget and size fields are validated at construction time by
 /// [`validate_config`]. The cross-field invariant
-/// `max_frame_payload_bytes + V2 frame overhead + trailer <= max_segment_bytes`
+/// `max_frame_payload_bytes + V2 frame overhead + segment header + trailer
+/// <= max_segment_bytes`
 /// is enforced so that no single frame can exceed a segment.
 #[derive(Clone, Debug)]
 pub struct LogWriterConfig {
@@ -945,9 +948,14 @@ struct SegmentWriter {
     max_segment_bytes: u64,
     /// Monotonically increasing segment sequence number (zero-based).
     seq: u64,
+    current_header: SegmentHeader,
+    next_prev_segment_hash: [u8; 32],
     file: BufWriter<File>,
     open_path: PathBuf,
+    /// Raw bytes written to the current segment file (header + frames).
     bytes_written: u64,
+    /// Sum of frame byte lengths in the current segment (excludes header/trailer).
+    frame_bytes_written: u64,
     frame_count: u64,
     frame_crc_chain: [u8; 32],
 }
@@ -957,16 +965,32 @@ impl SegmentWriter {
     fn new(segments_dir: PathBuf, max_segment_bytes: u64) -> std::io::Result<Self> {
         fs::create_dir_all(&segments_dir)?;
         let (file, open_path) = open_segment_file(&segments_dir, 0)?;
-        Ok(Self {
+        let mut this = Self {
             segments_dir,
             max_segment_bytes,
             seq: 0,
+            current_header: SegmentHeader {
+                segment_id: 0,
+                prev_segment_hash: [0u8; 32],
+            },
+            next_prev_segment_hash: [0u8; 32],
             file: BufWriter::new(file),
             open_path,
             bytes_written: 0,
+            frame_bytes_written: 0,
             frame_count: 0,
             frame_crc_chain: [0u8; 32],
-        })
+        };
+        this.write_segment_header()?;
+        Ok(this)
+    }
+
+    fn write_segment_header(&mut self) -> std::io::Result<()> {
+        let mut header = Vec::with_capacity(SEGMENT_HEADER_BYTES);
+        append_segment_header(&mut header, &self.current_header);
+        self.file.write_all(&header)?;
+        self.bytes_written = SEGMENT_HEADER_BYTES as u64;
+        Ok(())
     }
 
     /// Ensure the current segment has room for one additional frame.
@@ -974,15 +998,20 @@ impl SegmentWriter {
     /// Segments reserve trailer space so every finalized `.bin` ends with a
     /// deterministic integrity footer.
     fn prepare_for_frame(&mut self, frame_len: u64) -> std::io::Result<u64> {
+        let header_bytes = SEGMENT_HEADER_BYTES as u64;
         let trailer_bytes = SEGMENT_TRAILER_BYTES as u64;
-        if frame_len.saturating_add(trailer_bytes) > self.max_segment_bytes {
+        if frame_len
+            .saturating_add(header_bytes)
+            .saturating_add(trailer_bytes)
+            > self.max_segment_bytes
+        {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "frame exceeds max_segment_bytes",
             ));
         }
 
-        if self.bytes_written > 0
+        if self.frame_count > 0
             && self
                 .bytes_written
                 .saturating_add(frame_len)
@@ -997,9 +1026,15 @@ impl SegmentWriter {
             let (file, open_path) = open_segment_file(&self.segments_dir, self.seq)?;
             self.file = BufWriter::new(file);
             self.open_path = open_path;
+            self.current_header = SegmentHeader {
+                segment_id: self.seq,
+                prev_segment_hash: self.next_prev_segment_hash,
+            };
             self.bytes_written = 0;
+            self.frame_bytes_written = 0;
             self.frame_count = 0;
             self.frame_crc_chain = [0u8; 32];
+            self.write_segment_header()?;
         }
         Ok(self.seq)
     }
@@ -1016,6 +1051,7 @@ impl SegmentWriter {
             .map_err(|e| std::io::Error::other(format!("invalid frame header: {e}")))?;
         self.file.write_all(frame)?;
         self.bytes_written = self.bytes_written.saturating_add(frame.len() as u64);
+        self.frame_bytes_written = self.frame_bytes_written.saturating_add(frame.len() as u64);
         self.frame_count = self.frame_count.saturating_add(1);
         self.frame_crc_chain = extend_frame_crc_chain(&self.frame_crc_chain, frame_crc);
         if flush_after {
@@ -1042,16 +1078,15 @@ impl SegmentWriter {
     /// `.open` → `.bin`, and fsync the directory. After this call
     /// the segment is durable on disk.
     fn finalize_current(&mut self) -> std::io::Result<()> {
+        let trailer_data = SegmentTrailer {
+            segment_id: self.seq,
+            frame_count: self.frame_count,
+            total_frame_bytes: self.frame_bytes_written,
+            frame_crc_chain: self.frame_crc_chain,
+        };
+        let segment_hash = derive_segment_hash(&self.current_header, &trailer_data);
         let mut trailer = Vec::with_capacity(SEGMENT_TRAILER_BYTES);
-        append_segment_trailer(
-            &mut trailer,
-            &SegmentTrailer {
-                segment_id: self.seq,
-                frame_count: self.frame_count,
-                total_frame_bytes: self.bytes_written,
-                frame_crc_chain: self.frame_crc_chain,
-            },
-        );
+        append_segment_trailer(&mut trailer, &trailer_data);
         self.file.write_all(&trailer)?;
         self.file.flush()?;
         self.file.get_ref().sync_data()?;
@@ -1059,6 +1094,7 @@ impl SegmentWriter {
         bin_path.set_extension(SEGMENT_BIN_EXT);
         rename_noreplace(&self.open_path, &bin_path)?;
         sync_dir(&self.segments_dir)?;
+        self.next_prev_segment_hash = segment_hash;
         Ok(())
     }
 }
@@ -1205,8 +1241,8 @@ fn build_run_start(cfg: &LogWriterConfig, keys: &StoreKeys, run_id: u64) -> LogR
 /// Reject obviously invalid configurations at construction time.
 ///
 /// Beyond per-field zero checks, enforces the cross-field invariant that
-/// the largest possible V2 frame plus the segment trailer must fit inside
-/// a single segment.
+/// the largest possible V2 frame plus segment header and trailer must fit
+/// inside a single segment.
 fn validate_config(cfg: &LogWriterConfig) -> Result<(), FsStoreError> {
     if cfg.max_inflight_batches == 0 {
         return Err(FsStoreError::backend(
@@ -1237,10 +1273,11 @@ fn validate_config(cfg: &LogWriterConfig) -> Result<(), FsStoreError> {
         + super::format::FRAME_HEADER_BYTES as u64
         + super::format::FRAME_V2_POSITION_BYTES as u64
         + 1;
-    if max_frame_len + SEGMENT_TRAILER_BYTES as u64 > cfg.max_segment_bytes {
+    let min_v2_segment_overhead = SEGMENT_HEADER_BYTES as u64 + SEGMENT_TRAILER_BYTES as u64;
+    if max_frame_len + min_v2_segment_overhead > cfg.max_segment_bytes {
         return Err(FsStoreError::backend(
-            "max_frame_payload_bytes + v2 frame overhead + trailer exceeds max_segment_bytes; \
-             no frame could ever be written",
+            "max_frame_payload_bytes + v2 frame overhead + segment header + trailer exceeds \
+             max_segment_bytes; no frame could ever be written",
         ));
     }
     Ok(())
@@ -1567,6 +1604,7 @@ impl OpenSegmentRecoveryReport {
 /// - Surface `Io` and `UnsupportedVersion` as hard errors (no byte mutation).
 /// - Rename `.open` → `.bin` after truncate.
 /// - If matching `.bin` already exists, remove `.open` and record discard.
+/// - Verify V2 `prev_segment_hash` continuity across finalized `.bin` segments.
 ///
 /// This is intended for startup recovery before query/replay workflows.
 pub fn recover_open_segments(
@@ -1684,6 +1722,23 @@ pub fn recover_open_segments(
                 },
             });
         }
+
+        let mut finalized = Vec::new();
+        for entry in fs::read_dir(&seg_dir).map_err(io_to_store_err)? {
+            let entry = entry.map_err(io_to_store_err)?;
+            let ft = entry.file_type().map_err(io_to_store_err)?;
+            if !ft.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let name = path.file_name().and_then(OsStr::to_str).unwrap_or("");
+            let is_bin = path.extension().and_then(OsStr::to_str) == Some(SEGMENT_BIN_EXT);
+            if is_bin && name.starts_with(SEGMENT_PREFIX) {
+                finalized.push(path);
+            }
+        }
+        finalized.sort();
+        verify_v2_segment_chain_for_paths(&finalized, max_frame_payload_bytes)?;
     }
     Ok(report)
 }
@@ -1693,7 +1748,9 @@ pub fn recover_open_segments(
 /// Walks `store_root/run-*/segments/segment-*.bin`, returning paths sorted
 /// first by run directory then by segment sequence number. Only `.bin`
 /// (finalized) segments are included; in-progress `.open` files are
-/// excluded. Returns an empty vec if `store_root` does not exist.
+/// excluded. For V2 segments, this also verifies `prev_segment_hash`
+/// continuity per run before returning paths. Returns an empty vec if
+/// `store_root` does not exist.
 pub fn list_finalized_segment_files(store_root: &Path) -> Result<Vec<PathBuf>, FsStoreError> {
     if !store_root.exists() {
         return Ok(Vec::new());
@@ -1721,9 +1778,81 @@ pub fn list_finalized_segment_files(store_root: &Path) -> Result<Vec<PathBuf>, F
             }
         }
         segs.sort();
+        // Replay callers use this listing as their segment source-of-truth.
+        // Validate V2 prev-hash continuity per run before returning paths.
+        verify_v2_segment_chain_for_paths(&segs, DEFAULT_MAX_FRAME_PAYLOAD_BYTES)?;
         out.extend(segs);
     }
     Ok(out)
+}
+
+/// Verify V2 prev-segment hash continuity for one run's finalized segments.
+///
+/// Legacy segments (no V2 header/trailer) are accepted as-is. Once a V2 chain
+/// starts, every subsequent segment in lexical order must also be V2 and must
+/// carry the expected `prev_segment_hash` link.
+fn verify_v2_segment_chain_for_paths(
+    segment_paths: &[PathBuf],
+    max_frame_payload_bytes: u32,
+) -> Result<(), FsStoreError> {
+    let mut saw_v2_chain = false;
+    let mut expected_prev_hash = [0u8; 32];
+
+    for path in segment_paths {
+        let file = File::open(path).map_err(|e| io_to_store_err_at(e, path))?;
+        let mut reader = LogReader::buffered(file, max_frame_payload_bytes);
+        loop {
+            match reader.next_frame_validated() {
+                Ok(Some(())) => {}
+                Ok(None) => break,
+                Err(err) => {
+                    return Err(FsStoreError::backend(format!(
+                        "segment chain verification failed at '{}': {}",
+                        path.display(),
+                        err
+                    )))
+                }
+            }
+        }
+
+        let header = reader.segment_header();
+        let hash = reader.segment_hash();
+        match (header, hash) {
+            (Some(header), Some(hash)) => {
+                if !saw_v2_chain {
+                    if header.prev_segment_hash != [0u8; 32] {
+                        return Err(FsStoreError::backend(format!(
+                            "segment chain verification failed at '{}': first v2 segment has non-zero prev_segment_hash",
+                            path.display()
+                        )));
+                    }
+                } else if header.prev_segment_hash != expected_prev_hash {
+                    return Err(FsStoreError::backend(format!(
+                        "segment chain verification failed at '{}': prev_segment_hash mismatch",
+                        path.display()
+                    )));
+                }
+                expected_prev_hash = hash;
+                saw_v2_chain = true;
+            }
+            (None, None) => {
+                if saw_v2_chain {
+                    return Err(FsStoreError::backend(format!(
+                        "segment chain verification failed at '{}': missing v2 header/trailer after v2 chain started",
+                        path.display()
+                    )));
+                }
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(FsStoreError::backend(format!(
+                    "segment chain verification failed at '{}': incomplete v2 segment metadata",
+                    path.display()
+                )));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Drive a [`LogReader`] forward through `file` until clean EOF or first bad
@@ -1978,7 +2107,7 @@ mod tests {
     fn rotation_finalizes_open_segments_to_bin() {
         let tmp = TempDir::new().unwrap();
         let mut cfg = LogWriterConfig::for_root(tmp.path().to_path_buf());
-        cfg.max_segment_bytes = 700;
+        cfg.max_segment_bytes = 900;
         cfg.max_frame_payload_bytes = 600;
         cfg.max_inflight_bytes = 8 * 1024 * 1024;
 
@@ -2353,7 +2482,7 @@ mod tests {
         // Trigger 50+ rotations. Assert filenames are monotonically ordered.
         let tmp = TempDir::new().unwrap();
         let mut cfg = LogWriterConfig::for_root(tmp.path().to_path_buf());
-        cfg.max_segment_bytes = 380; // Very small to force many rotations.
+        cfg.max_segment_bytes = 420; // Very small to force many rotations.
         cfg.max_frame_payload_bytes = 250;
         cfg.max_inflight_bytes = 16 * 1024 * 1024;
 
@@ -2591,7 +2720,7 @@ mod tests {
         let mut cfg = LogWriterConfig::for_root(tmp.path().to_path_buf());
         // Small segment so rotation happens after RunStart + RuleDef + 1 finding;
         // valid per cross-field check.
-        cfg.max_segment_bytes = 400;
+        cfg.max_segment_bytes = 480;
         cfg.max_frame_payload_bytes = 300;
         cfg.max_inflight_batches = 4;
         cfg.max_inflight_bytes = 16 * 1024 * 1024;
@@ -2795,6 +2924,43 @@ mod tests {
             assert!(name.starts_with(SEGMENT_PREFIX));
             assert!(name.ends_with(".bin"));
         }
+    }
+
+    #[test]
+    fn list_finalized_segment_files_detects_prev_segment_hash_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = LogWriterConfig::for_root(tmp.path().to_path_buf());
+        cfg.max_segment_bytes = 420;
+        cfg.max_frame_payload_bytes = 250;
+        cfg.max_inflight_bytes = 16 * 1024 * 1024;
+
+        let producer = AppendLogStoreProducer::new(&[simple_rule()], cfg.clone()).unwrap();
+        for i in 0..64u64 {
+            let findings = vec![sample_finding(0, i * 100)];
+            producer
+                .emit_fs_batch(FsFindingBatch {
+                    object_path: format!("f-{i:04}.txt").as_bytes(),
+                    findings: &findings,
+                })
+                .unwrap();
+        }
+        producer.record_fs_run_loss(FsRunLoss::default()).unwrap();
+
+        let bins = list_finalized_segment_files(&cfg.root_dir).unwrap();
+        assert!(bins.len() >= 2, "need at least two segments for chain test");
+
+        let mut second = fs::read(&bins[1]).unwrap();
+        assert!(second.len() >= SEGMENT_HEADER_BYTES);
+        second[16] ^= 0x01;
+        fs::write(&bins[1], &second).unwrap();
+
+        let err = list_finalized_segment_files(&cfg.root_dir).unwrap_err();
+        assert!(
+            err.detail().contains("segment chain verification failed")
+                && err.detail().contains("prev_segment_hash mismatch"),
+            "expected prev-segment-hash chain error, got: {}",
+            err.detail()
+        );
     }
 
     #[test]
@@ -3075,7 +3241,14 @@ mod tests {
         let open_path = seg_dir.join("segment-00000000000000000000.open");
         let bin_path = seg_dir.join("segment-00000000000000000000.bin");
 
-        fs::write(&bin_path, b"already-finalized").unwrap();
+        let mut finalized_bytes = Vec::new();
+        encode_record(
+            &LogRecord::RunStart(recovery_run_start()),
+            DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+            &mut finalized_bytes,
+        )
+        .unwrap();
+        fs::write(&bin_path, &finalized_bytes).unwrap();
         fs::write(&open_path, b"stale-open").unwrap();
 
         let report = recover_open_segments(tmp.path(), DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap();
@@ -3091,7 +3264,7 @@ mod tests {
         );
         assert!(!open_path.exists(), "stale .open should be removed");
         assert!(bin_path.exists(), "existing .bin should remain");
-        assert_eq!(fs::read(&bin_path).unwrap(), b"already-finalized");
+        assert_eq!(fs::read(&bin_path).unwrap(), finalized_bytes);
     }
 
     /// PR Comment 2 regression: blocked emitters should NOT get spurious
@@ -3243,7 +3416,9 @@ mod tests {
         sw.seq = u64::MAX;
         // Write enough to fill the current segment, then write again to trigger rotation.
         sw.file.write_all(&[0u8; 128]).unwrap();
-        sw.bytes_written = 128;
+        sw.bytes_written = SEGMENT_HEADER_BYTES as u64 + 128;
+        sw.frame_bytes_written = 128;
+        sw.frame_count = 1;
 
         // This second write should trigger rotation once trailer reservation
         // is considered: 128 + 128 + trailer > 256.
@@ -3745,6 +3920,43 @@ mod tests {
     }
 
     #[test]
+    fn recover_open_segments_detects_prev_segment_hash_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = LogWriterConfig::for_root(tmp.path().to_path_buf());
+        cfg.max_segment_bytes = 420;
+        cfg.max_frame_payload_bytes = 250;
+        cfg.max_inflight_bytes = 16 * 1024 * 1024;
+
+        let producer = AppendLogStoreProducer::new(&[simple_rule()], cfg.clone()).unwrap();
+        for i in 0..64u64 {
+            let findings = vec![sample_finding(0, i * 100)];
+            producer
+                .emit_fs_batch(FsFindingBatch {
+                    object_path: format!("f-{i:04}.txt").as_bytes(),
+                    findings: &findings,
+                })
+                .unwrap();
+        }
+        producer.record_fs_run_loss(FsRunLoss::default()).unwrap();
+
+        let bins = list_finalized_segment_files(&cfg.root_dir).unwrap();
+        assert!(bins.len() >= 2, "need at least two segments for chain test");
+        let mut second = fs::read(&bins[1]).unwrap();
+        assert!(second.len() >= SEGMENT_HEADER_BYTES);
+        second[16] ^= 0x01;
+        fs::write(&bins[1], &second).unwrap();
+
+        let err =
+            recover_open_segments(&cfg.root_dir, DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap_err();
+        assert!(
+            err.detail().contains("segment chain verification failed")
+                && err.detail().contains("prev_segment_hash mismatch"),
+            "expected prev-segment-hash chain error, got: {}",
+            err.detail()
+        );
+    }
+
+    #[test]
     fn recover_idempotency() {
         let tmp = TempDir::new().unwrap();
         let run_dir = tmp.path().join("run-0000000000000001");
@@ -3798,9 +4010,16 @@ mod tests {
         )
         .unwrap();
 
+        let mut finalized_dup = Vec::new();
+        encode_record(
+            &LogRecord::RunStart(recovery_run_start()),
+            DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+            &mut finalized_dup,
+        )
+        .unwrap();
         fs::write(
             seg1_dir.join("segment-00000000000000000001.bin"),
-            b"already-finalized",
+            &finalized_dup,
         )
         .unwrap();
         fs::write(seg1_dir.join("segment-00000000000000000001.open"), b"stale").unwrap();
@@ -3904,7 +4123,7 @@ mod tests {
         .unwrap();
         fs::write(run1_seg.join("segment-00000000000000000000.open"), &bytes).unwrap();
         fs::write(run1_seg.join("segment-00000000000000000001.open"), b"stale").unwrap();
-        fs::write(run1_seg.join("segment-00000000000000000001.bin"), b"final").unwrap();
+        fs::write(run1_seg.join("segment-00000000000000000001.bin"), &bytes).unwrap();
 
         // Run 2: one empty .open.
         let run2_seg = tmp.path().join("run-0000000000000002").join("segments");

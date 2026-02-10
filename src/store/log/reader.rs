@@ -12,6 +12,8 @@
 //!   can truncate a corrupt `.open` file at the last valid byte boundary.
 //! - **V2 segment-trailer verification** of `frame_count`, `total_frame_bytes`,
 //!   and the BLAKE3 frame-CRC chain when reading finalized `.bin` segments.
+//! - **V2 segment-header/trailer chaining** via `prev_segment_hash` plus
+//!   derived per-segment hash material for cross-segment continuity checks.
 //! - **Reason-coded errors** ([`LogReadErrorReason`]) enabling deterministic
 //!   policy (e.g. stop-at-first-bad-frame, skip-and-continue, truncate).
 //!
@@ -36,9 +38,11 @@
 //! [`LogReadErrorReason::UnsupportedVersion`] and terminate the reader.
 
 use super::format::{
-    decode_record, decode_segment_trailer, extend_frame_crc_chain, parse_frame_layout, FormatError,
-    FrameType, LogRecord, DEFAULT_MAX_FRAME_PAYLOAD_BYTES, FRAME_HEADER_BYTES,
-    LEGACY_LOG_FORMAT_VERSION, LOG_FORMAT_VERSION, SEGMENT_TRAILER_BYTES, SEGMENT_TRAILER_MAGIC,
+    decode_record, decode_segment_header, decode_segment_trailer, derive_segment_hash,
+    extend_frame_crc_chain, parse_frame_layout, FormatError, FrameType, LogRecord, SegmentHeader,
+    DEFAULT_MAX_FRAME_PAYLOAD_BYTES, FRAME_HEADER_BYTES, LEGACY_LOG_FORMAT_VERSION,
+    LOG_FORMAT_VERSION, SEGMENT_HEADER_BYTES, SEGMENT_HEADER_MAGIC, SEGMENT_TRAILER_BYTES,
+    SEGMENT_TRAILER_MAGIC,
 };
 use std::fmt;
 use std::io::Read;
@@ -213,6 +217,7 @@ fn classify_reason(err: &FormatError) -> LogReadErrorReason {
         | FormatError::InvalidEnum { .. }
         | FormatError::InvalidBool { .. }
         | FormatError::InvalidRecord { .. }
+        | FormatError::InvalidSegmentHeader { .. }
         | FormatError::InvalidSegmentTrailer { .. }
         | FormatError::LengthTooLarge { .. } => LogReadErrorReason::MalformedFrame,
     }
@@ -246,6 +251,9 @@ pub struct LogReader<R: Read> {
     max_payload_bytes: u32,
     next_frame_index: u64,
     next_frame_offset: u64,
+    segment_preamble_checked: bool,
+    segment_header: Option<SegmentHeader>,
+    segment_hash: Option<[u8; 32]>,
     segment_frame_count: u64,
     segment_total_frame_bytes: u64,
     segment_frame_crc_chain: [u8; 32],
@@ -277,6 +285,9 @@ impl<R: Read> LogReader<R> {
             max_payload_bytes,
             next_frame_index: 0,
             next_frame_offset: 0,
+            segment_preamble_checked: false,
+            segment_header: None,
+            segment_hash: None,
             segment_frame_count: 0,
             segment_total_frame_bytes: 0,
             segment_frame_crc_chain: [0u8; 32],
@@ -344,20 +355,56 @@ impl<R: Read> LogReader<R> {
         self.next_frame_offset
     }
 
-    /// Read the next frame's header and body into `self.frame_buf`.
-    ///
-    /// Returns `Ok(Some(total_len))` on success (header + body bytes in
-    /// `frame_buf[..total_len]`), `Ok(None)` on clean EOF at a frame
-    /// boundary, or `Err` on any I/O or structural failure.
-    ///
-    /// On error the terminal latch is set; callers must not retry.
-    fn read_next_frame(&mut self) -> Result<Option<usize>, LogReadError> {
-        let frame_index = self.next_frame_index;
-        let frame_offset = self.next_frame_offset;
+    /// Parsed V2 segment header, if one was present at stream start.
+    #[inline]
+    pub const fn segment_header(&self) -> Option<SegmentHeader> {
+        self.segment_header
+    }
 
-        // Read the 8-byte header, looping because `Read::read` may return
-        // fewer bytes than requested (pipes, TLS streams, partial OS buffers).
-        let mut header = [0u8; FRAME_HEADER_BYTES];
+    /// Deterministic V2 segment hash derived after a valid trailer is read.
+    #[inline]
+    pub const fn segment_hash(&self) -> Option<[u8; 32]> {
+        self.segment_hash
+    }
+
+    fn read_exact_or_err(
+        &mut self,
+        dst: &mut [u8],
+        frame_index: u64,
+        frame_offset: u64,
+    ) -> Result<(), LogReadError> {
+        let mut got = 0usize;
+        while got < dst.len() {
+            let n = self
+                .reader
+                .read(&mut dst[got..])
+                .map_err(FormatError::Io)
+                .map_err(|err| {
+                    self.terminated = true;
+                    LogReadError::from_format(frame_index, frame_offset, err)
+                })?;
+            if n == 0 {
+                self.terminated = true;
+                return Err(LogReadError::from_format(
+                    frame_index,
+                    frame_offset,
+                    FormatError::TruncatedFrame {
+                        expected: dst.len(),
+                        got,
+                    },
+                ));
+            }
+            got += n;
+        }
+        Ok(())
+    }
+
+    fn read_header_or_eof(
+        &mut self,
+        header: &mut [u8; FRAME_HEADER_BYTES],
+        frame_index: u64,
+        frame_offset: u64,
+    ) -> Result<Option<()>, LogReadError> {
         let mut got = 0usize;
         while got < FRAME_HEADER_BYTES {
             let n = self
@@ -381,7 +428,70 @@ impl<R: Read> LogReader<R> {
             }
             got += n;
         }
+        Ok(Some(()))
+    }
 
+    /// Read the next frame's header and body into `self.frame_buf`.
+    ///
+    /// Returns `Ok(Some(total_len))` on success (header + body bytes in
+    /// `frame_buf[..total_len]`), `Ok(None)` on clean EOF at a frame
+    /// boundary, or `Err` on any I/O or structural failure.
+    ///
+    /// On error the terminal latch is set; callers must not retry.
+    fn read_next_frame(&mut self) -> Result<Option<usize>, LogReadError> {
+        let frame_index = self.next_frame_index;
+        let frame_offset = self.next_frame_offset;
+
+        // Parse optional V2 segment header once at stream start.
+        if !self.segment_preamble_checked {
+            let mut prelude = [0u8; FRAME_HEADER_BYTES];
+            if self
+                .read_header_or_eof(&mut prelude, frame_index, frame_offset)?
+                .is_none()
+            {
+                return Ok(None);
+            }
+            if prelude == SEGMENT_HEADER_MAGIC {
+                let mut header_buf = [0u8; SEGMENT_HEADER_BYTES];
+                header_buf[..FRAME_HEADER_BYTES].copy_from_slice(&prelude);
+                self.read_exact_or_err(
+                    &mut header_buf[FRAME_HEADER_BYTES..],
+                    frame_index,
+                    frame_offset,
+                )?;
+                let header = decode_segment_header(&header_buf).map_err(|err| {
+                    self.terminated = true;
+                    LogReadError::from_format(frame_index, frame_offset, err)
+                })?;
+                self.segment_header = Some(header);
+                self.segment_preamble_checked = true;
+                self.next_frame_offset = SEGMENT_HEADER_BYTES as u64;
+                return self.read_next_frame();
+            } else {
+                self.segment_preamble_checked = true;
+                // No segment header: treat the prelude as the first frame header.
+                let mut header = [0u8; FRAME_HEADER_BYTES];
+                header.copy_from_slice(&prelude);
+                return self.read_next_frame_from_header(header, frame_index, frame_offset);
+            }
+        }
+
+        let mut header = [0u8; FRAME_HEADER_BYTES];
+        if self
+            .read_header_or_eof(&mut header, frame_index, frame_offset)?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        self.read_next_frame_from_header(header, frame_index, frame_offset)
+    }
+
+    fn read_next_frame_from_header(
+        &mut self,
+        header: [u8; FRAME_HEADER_BYTES],
+        frame_index: u64,
+        frame_offset: u64,
+    ) -> Result<Option<usize>, LogReadError> {
         if header == SEGMENT_TRAILER_MAGIC {
             let mut trailer_buf = [0u8; SEGMENT_TRAILER_BYTES];
             trailer_buf[..FRAME_HEADER_BYTES].copy_from_slice(&header);
@@ -412,6 +522,18 @@ impl<R: Read> LogReader<R> {
                 self.terminated = true;
                 LogReadError::from_format(frame_index, frame_offset, err)
             })?;
+            if let Some(header) = self.segment_header {
+                if trailer.segment_id != header.segment_id {
+                    self.terminated = true;
+                    return Err(LogReadError::from_format(
+                        frame_index,
+                        frame_offset,
+                        FormatError::InvalidSegmentTrailer {
+                            detail: "segment_id mismatch",
+                        },
+                    ));
+                }
+            }
             if trailer.frame_count != self.segment_frame_count {
                 self.terminated = true;
                 return Err(LogReadError::from_format(
@@ -441,6 +563,9 @@ impl<R: Read> LogReader<R> {
                         detail: "frame_crc_chain mismatch",
                     },
                 ));
+            }
+            if let Some(header) = self.segment_header {
+                self.segment_hash = Some(derive_segment_hash(&header, &trailer));
             }
             self.terminated = true;
             return Ok(None);
