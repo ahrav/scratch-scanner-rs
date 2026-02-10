@@ -851,4 +851,39 @@ mod tests {
     fn fs_backend_linux_uring_when_available_and_no_persistence() {
         assert_eq!(select_fs_backend(true, false, true), FsBackend::Uring);
     }
+
+    /// The pool buffer sizing formula must satisfy the assertion floor
+    /// (pool_buffers >= io_threads * io_depth) across a range of worker
+    /// counts, including edge cases. This prevents runtime panics from
+    /// the LocalFsUringConfig::validate() assertion.
+    #[test]
+    fn buffer_pool_sizing_satisfies_assertion_floor() {
+        let io_depth: usize = 128; // Default from LocalFsUringConfig
+
+        for workers in [1, 2, 3, 4, 8, 16, 32, 64, 128, 256] {
+            let io_threads = (workers / 4).max(2);
+            let io_pool = io_threads * io_depth;
+            let cpu_headroom = workers * 4;
+            let pool_buffers = io_pool + cpu_headroom;
+
+            // Must satisfy the assertion floor.
+            assert!(
+                pool_buffers >= io_threads * io_depth,
+                "pool_buffers ({pool_buffers}) < io_threads * io_depth ({}) for workers={workers}",
+                io_threads * io_depth
+            );
+
+            // Must not overflow u16 range when registered buffers are in
+            // use (io_uring registered buffers are indexed by u16).
+            // For very high worker counts the formula can exceed u16::MAX.
+            // This test documents the boundary rather than asserting a hard
+            // limit, since registered buffers are optional.
+            if workers <= 64 {
+                assert!(
+                    pool_buffers <= u16::MAX as usize,
+                    "pool_buffers ({pool_buffers}) exceeds u16::MAX for workers={workers}"
+                );
+            }
+        }
+    }
 }

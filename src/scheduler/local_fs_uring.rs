@@ -2869,4 +2869,137 @@ mod tests {
 
         Ok(())
     }
+
+    /// Sniff-detected ZIP archive (no .zip extension) should produce findings
+    /// through the archive worker chain via I/O thread sniffing.
+    #[test]
+    fn uring_sniff_detected_zip_emits_findings() -> io::Result<()> {
+        let engine = Arc::new(MockEngine::with_tuning(
+            vec![MockRule {
+                name: "secret".into(),
+                pattern: b"SECRET".to_vec(),
+            }],
+            6,
+            EngineTuning {
+                max_findings_per_chunk: 128,
+                max_rules: 16,
+            },
+        ));
+
+        let dir = tempdir()?;
+        // No .zip extension — must be detected by PK\x03\x04 magic.
+        let file_path = dir.path().join("bundle.dat");
+
+        // Build a minimal stored ZIP with SECRET in one entry.
+        let payload = b"SECRET";
+        let zip_bytes = build_minimal_zip("secret.txt", payload);
+        std::fs::write(&file_path, &zip_bytes)?;
+
+        let sink = Arc::new(VecEventSink::new());
+        let cfg = LocalFsUringConfig {
+            cpu_workers: 2,
+            io_threads: 1,
+            ring_entries: 64,
+            io_depth: 16,
+            chunk_size: 64,
+            max_in_flight_files: 8,
+            file_queue_cap: 8,
+            pool_buffers: 32,
+            use_registered_buffers: false,
+            open_stat_mode: OpenStatMode::BlockingOnly,
+            resolve_policy: ResolvePolicy::Default,
+            follow_symlinks: false,
+            max_file_size: None,
+            seed: 123,
+            dedupe_within_chunk: true,
+            pin_threads: false,
+            skip_binary: false,
+            archive: ArchiveConfig::default(), // enabled=true
+        };
+
+        let (_summary, io_stats, _cpu_metrics) =
+            scan_local_fs_uring(engine, &[dir.path().to_path_buf()], cfg, sink.clone())?;
+
+        assert!(
+            io_stats.archives_sniffed >= 1,
+            "expected archives_sniffed >= 1, got {}",
+            io_stats.archives_sniffed
+        );
+
+        let out = sink.take();
+        let out_str = String::from_utf8_lossy(&out);
+        assert!(
+            out_str.contains("secret"),
+            "expected finding from sniff-detected ZIP archive; output: {out_str}"
+        );
+
+        Ok(())
+    }
+
+    /// Build a minimal stored ZIP archive with a single entry.
+    fn build_minimal_zip(name: &str, data: &[u8]) -> Vec<u8> {
+        fn u16le(v: u16) -> [u8; 2] {
+            v.to_le_bytes()
+        }
+        fn u32le(v: u32) -> [u8; 4] {
+            v.to_le_bytes()
+        }
+
+        let name_bytes = name.as_bytes();
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(data);
+        let crc32 = crc.finalize();
+
+        let mut out = Vec::new();
+
+        // Local file header
+        out.extend_from_slice(&u32le(0x04034b50));
+        out.extend_from_slice(&u16le(20));
+        out.extend_from_slice(&u16le(0)); // flags
+        out.extend_from_slice(&u16le(0)); // stored
+        out.extend_from_slice(&u16le(0));
+        out.extend_from_slice(&u16le(0));
+        out.extend_from_slice(&u32le(crc32));
+        out.extend_from_slice(&u32le(data.len() as u32));
+        out.extend_from_slice(&u32le(data.len() as u32));
+        out.extend_from_slice(&u16le(name_bytes.len() as u16));
+        out.extend_from_slice(&u16le(0)); // extra len
+        out.extend_from_slice(name_bytes);
+        out.extend_from_slice(data);
+
+        // Central directory header
+        let cd_start = out.len() as u32;
+        out.extend_from_slice(&u32le(0x02014b50));
+        out.extend_from_slice(&u16le(0));
+        out.extend_from_slice(&u16le(20));
+        out.extend_from_slice(&u16le(0)); // flags
+        out.extend_from_slice(&u16le(0)); // stored
+        out.extend_from_slice(&u16le(0));
+        out.extend_from_slice(&u16le(0));
+        out.extend_from_slice(&u32le(crc32));
+        out.extend_from_slice(&u32le(data.len() as u32));
+        out.extend_from_slice(&u32le(data.len() as u32));
+        out.extend_from_slice(&u16le(name_bytes.len() as u16));
+        out.extend_from_slice(&u16le(0)); // extra len
+        out.extend_from_slice(&u16le(0)); // comment len
+        out.extend_from_slice(&u16le(0)); // disk number
+        out.extend_from_slice(&u16le(0)); // internal attrs
+        out.extend_from_slice(&u32le(0)); // external attrs
+        out.extend_from_slice(&u32le(0)); // local header offset
+
+        out.extend_from_slice(name_bytes);
+        let cd_size = (out.len() as u32) - cd_start;
+
+        // EOCD
+        out.extend_from_slice(&u32le(0x06054b50));
+        out.extend_from_slice(&u16le(0));
+        out.extend_from_slice(&u16le(0));
+        out.extend_from_slice(&u16le(1));
+        out.extend_from_slice(&u16le(1));
+        out.extend_from_slice(&u32le(cd_size));
+        out.extend_from_slice(&u32le(cd_start));
+        out.extend_from_slice(&u16le(0)); // comment len
+
+        out
+    }
 }
