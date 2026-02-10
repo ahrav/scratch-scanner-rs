@@ -52,7 +52,7 @@ use crossbeam_channel::{Receiver, Sender};
 use crossbeam_queue::ArrayQueue;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -65,9 +65,9 @@ const SEGMENT_OPEN_EXT: &str = "open";
 const SEGMENT_BIN_EXT: &str = "bin";
 /// Domain separation tag for the keyed BLAKE3 finding-id derivation.
 ///
-/// Prevents collisions with other keyed hashes that share the same
-/// `metadata_key` (e.g. secret hashes, rule fingerprints). Changing this
-/// string invalidates all previously-emitted finding IDs.
+/// Prevents collisions with any other keyed hashes derived from
+/// `metadata_key`. Changing this string invalidates all previously-emitted
+/// finding IDs.
 const FINDING_ID_DOMAIN: &[u8] = b"scanner.store.log.v1.finding_id";
 const FINDING_BATCH_BASE_PAYLOAD_BYTES: usize = 8; // object_path_len (4) + findings_count (4)
 
@@ -323,17 +323,17 @@ impl AppendLogStoreProducer {
         if frame.capacity() < plan.frame_len {
             frame.reserve(plan.frame_len - frame.capacity());
         }
+
+        // Reserve space for frame header (body_len + crc32), filled in at the end.
         frame.resize(FRAME_HEADER_BYTES, 0);
-        let frame_type = FrameType::FindingBatch as u8;
-        frame.push(frame_type);
 
-        let mut crc = crc32fast::Hasher::new();
-        crc.update(&[frame_type]);
-
-        let path_len_bytes = plan.object_path_len.to_le_bytes();
-        frame_extend_crc(frame, &mut crc, &path_len_bytes);
-        frame_extend_crc(frame, &mut crc, batch.object_path);
-        frame_extend_crc(frame, &mut crc, &plan.findings_count_u32.to_le_bytes());
+        // Build the entire body without CRC tracking — we compute CRC in a
+        // single pass over the contiguous buffer at the end, which lets
+        // crc32fast use full hardware acceleration (SSE4.2/ARM CRC).
+        frame.push(FrameType::FindingBatch as u8);
+        frame.extend_from_slice(&plan.object_path_len.to_le_bytes());
+        frame.extend_from_slice(batch.object_path);
+        frame.extend_from_slice(&plan.findings_count_u32.to_le_bytes());
 
         let finding_id_prefix = finding_id_prefix_hasher(
             self.inner.keys.metadata_key(),
@@ -352,17 +352,18 @@ impl AppendLogStoreProducer {
             let secret = secret_cache.get_or_compute(&finding.norm_hash, &self.inner.keys);
             let finding_id = derive_finding_id(&finding_id_prefix, finding, rule_fp, &secret);
 
-            frame_extend_crc(frame, &mut crc, &finding.rule_id.to_le_bytes());
-            frame_extend_crc(frame, &mut crc, rule_fp);
-            frame_extend_crc(frame, &mut crc, &secret);
-            frame_extend_crc(frame, &mut crc, &finding_id);
-            frame_extend_crc(frame, &mut crc, &finding.root_hint_start.to_le_bytes());
-            frame_extend_crc(frame, &mut crc, &finding.root_hint_end.to_le_bytes());
-            frame_extend_crc(frame, &mut crc, &finding.span_start.to_le_bytes());
-            frame_extend_crc(frame, &mut crc, &finding.span_end.to_le_bytes());
+            frame.extend_from_slice(&finding.rule_id.to_le_bytes());
+            frame.extend_from_slice(rule_fp);
+            frame.extend_from_slice(&secret);
+            frame.extend_from_slice(&finding_id);
+            frame.extend_from_slice(&finding.root_hint_start.to_le_bytes());
+            frame.extend_from_slice(&finding.root_hint_end.to_le_bytes());
+            frame.extend_from_slice(&finding.span_start.to_le_bytes());
+            frame.extend_from_slice(&finding.span_end.to_le_bytes());
         }
 
-        let crc32 = crc.finalize();
+        // Single-pass CRC over the entire body (type byte + payload).
+        let crc32 = crc32fast::hash(&frame[FRAME_HEADER_BYTES..]);
         frame[..4].copy_from_slice(&plan.body_len_u32.to_le_bytes());
         frame[4..FRAME_HEADER_BYTES].copy_from_slice(&crc32.to_le_bytes());
 
@@ -662,12 +663,9 @@ struct FindingFramePlan {
 /// The writer recycles buffers after each write.
 struct FindingFramePool {
     free: ArrayQueue<Vec<u8>>,
-    #[cfg(test)]
-    acquire_misses: std::sync::atomic::AtomicU64,
-    #[cfg(test)]
-    grow_count: std::sync::atomic::AtomicU64,
-    #[cfg(test)]
-    dropped_recycles: std::sync::atomic::AtomicU64,
+    acquire_misses: AtomicU64,
+    grow_count: AtomicU64,
+    dropped_recycles: AtomicU64,
 }
 
 impl FindingFramePool {
@@ -682,34 +680,27 @@ impl FindingFramePool {
         }
         Self {
             free,
-            #[cfg(test)]
-            acquire_misses: std::sync::atomic::AtomicU64::new(0),
-            #[cfg(test)]
-            grow_count: std::sync::atomic::AtomicU64::new(0),
-            #[cfg(test)]
-            dropped_recycles: std::sync::atomic::AtomicU64::new(0),
+            acquire_misses: AtomicU64::new(0),
+            grow_count: AtomicU64::new(0),
+            dropped_recycles: AtomicU64::new(0),
         }
     }
 
     /// Pop a buffer from the pool (or allocate a fresh one on miss), ensuring
     /// at least `min_capacity` bytes of capacity. The returned `Vec` is empty.
     #[inline]
-    #[allow(clippy::manual_unwrap_or_default)] // keep explicit fallback to bump test-only miss counter
+    #[allow(clippy::manual_unwrap_or_default)] // keep explicit fallback to bump miss counter
     fn acquire(&self, min_capacity: usize) -> Vec<u8> {
         let mut frame = match self.free.pop() {
             Some(frame) => frame,
             None => {
-                #[cfg(test)]
-                self.acquire_misses
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.acquire_misses.fetch_add(1, Ordering::Relaxed);
                 Vec::new()
             }
         };
         frame.clear();
         if frame.capacity() < min_capacity {
-            #[cfg(test)]
-            self.grow_count
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.grow_count.fetch_add(1, Ordering::Relaxed);
             frame.reserve(min_capacity - frame.capacity());
         }
         frame
@@ -721,20 +712,20 @@ impl FindingFramePool {
     fn recycle(&self, mut frame: Vec<u8>) {
         frame.clear();
         if self.free.push(frame).is_err() {
-            #[cfg(test)]
-            self.dropped_recycles
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.dropped_recycles.fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    #[cfg(test)]
+    /// Snapshot of pool health counters: `(acquire_misses, grow_count, dropped_recycles)`.
+    ///
+    /// All counters use `Relaxed` ordering — suitable for metrics collection
+    /// and diagnostics, not for synchronisation.
+    #[allow(dead_code)] // Retained for production metrics; currently called only in tests.
     fn debug_counters(&self) -> (u64, u64, u64) {
         (
-            self.acquire_misses
-                .load(std::sync::atomic::Ordering::Relaxed),
-            self.grow_count.load(std::sync::atomic::Ordering::Relaxed),
-            self.dropped_recycles
-                .load(std::sync::atomic::Ordering::Relaxed),
+            self.acquire_misses.load(Ordering::Relaxed),
+            self.grow_count.load(Ordering::Relaxed),
+            self.dropped_recycles.load(Ordering::Relaxed),
         )
     }
 }
@@ -854,7 +845,7 @@ struct SegmentWriter {
     max_segment_bytes: u64,
     /// Monotonically increasing segment sequence number (zero-based).
     seq: u64,
-    file: File,
+    file: BufWriter<File>,
     open_path: PathBuf,
     bytes_written: u64,
 }
@@ -868,7 +859,7 @@ impl SegmentWriter {
             segments_dir,
             max_segment_bytes,
             seq: 0,
-            file,
+            file: BufWriter::new(file),
             open_path,
             bytes_written: 0,
         })
@@ -896,7 +887,7 @@ impl SegmentWriter {
                 .checked_add(1)
                 .ok_or_else(|| std::io::Error::other("segment sequence number overflow"))?;
             let (file, open_path) = open_segment_file(&self.segments_dir, self.seq)?;
-            self.file = file;
+            self.file = BufWriter::new(file);
             self.open_path = open_path;
             self.bytes_written = 0;
         }
@@ -904,7 +895,8 @@ impl SegmentWriter {
         self.file.write_all(frame)?;
         self.bytes_written = self.bytes_written.saturating_add(frame_len);
         if flush_after {
-            self.file.sync_data()?;
+            self.file.flush()?;
+            self.file.get_ref().sync_data()?;
         }
         Ok(())
     }
@@ -915,10 +907,12 @@ impl SegmentWriter {
         self.finalize_current()
     }
 
-    /// Sync the current segment's data, rename `.open` → `.bin`, and fsync
-    /// the directory. After this call the segment is durable on disk.
+    /// Flush the BufWriter, sync the underlying file's data, rename
+    /// `.open` → `.bin`, and fsync the directory. After this call
+    /// the segment is durable on disk.
     fn finalize_current(&mut self) -> std::io::Result<()> {
-        self.file.sync_data()?;
+        self.file.flush()?;
+        self.file.get_ref().sync_data()?;
         let mut bin_path = self.open_path.clone();
         bin_path.set_extension(SEGMENT_BIN_EXT);
         fs::rename(&self.open_path, &bin_path)?;
@@ -1063,13 +1057,6 @@ fn finding_frame_pool_capacity_hint(cfg: &LogWriterConfig) -> usize {
     )
 }
 
-/// Append bytes to the frame payload while keeping CRC in lockstep.
-#[inline(always)]
-fn frame_extend_crc(frame: &mut Vec<u8>, crc: &mut crc32fast::Hasher, bytes: &[u8]) {
-    frame.extend_from_slice(bytes);
-    crc.update(bytes);
-}
-
 /// Build the batch-invariant finding-id hash prefix.
 ///
 /// All per-batch fields are absorbed once (`domain`, `path_len`, `path`) and
@@ -1095,6 +1082,10 @@ fn finding_id_prefix_hasher(
 /// same object path: rule fingerprint, secret hash, and byte offsets. Two
 /// findings are considered identical iff their IDs match — this drives
 /// cross-run deduplication in downstream consumers.
+///
+/// All per-finding fields are packed into a single contiguous 96-byte buffer
+/// (rule_fp:32 + secret:32 + 4×u64:32) and fed to BLAKE3 in one `update`
+/// call, reducing function-call overhead and improving internal buffering.
 #[inline(always)]
 fn derive_finding_id(
     prefix_hasher: &blake3::Hasher,
@@ -1102,13 +1093,17 @@ fn derive_finding_id(
     rule_fingerprint: &[u8; 32],
     secret_hash: &[u8; 32],
 ) -> [u8; 32] {
+    // 32 (rule_fp) + 32 (secret) + 4×8 (u64 offsets) = 96 bytes.
+    let mut buf = [0u8; 96];
+    buf[..32].copy_from_slice(rule_fingerprint);
+    buf[32..64].copy_from_slice(secret_hash);
+    buf[64..72].copy_from_slice(&finding.root_hint_start.to_le_bytes());
+    buf[72..80].copy_from_slice(&finding.root_hint_end.to_le_bytes());
+    buf[80..88].copy_from_slice(&finding.span_start.to_le_bytes());
+    buf[88..96].copy_from_slice(&finding.span_end.to_le_bytes());
+
     let mut hasher = prefix_hasher.clone();
-    hasher.update(rule_fingerprint);
-    hasher.update(secret_hash);
-    hasher.update(&finding.root_hint_start.to_le_bytes());
-    hasher.update(&finding.root_hint_end.to_le_bytes());
-    hasher.update(&finding.span_start.to_le_bytes());
-    hasher.update(&finding.span_end.to_le_bytes());
+    hasher.update(&buf);
     *hasher.finalize().as_bytes()
 }
 
@@ -1165,13 +1160,18 @@ fn closed_error(state: &InflightState) -> FsStoreError {
     }
 }
 
-/// Decrement inflight budgets and wake all blocked producers.
+/// Decrement inflight budgets and wake one blocked producer.
 ///
 /// Called by the writer thread after each finding frame is persisted.
 /// Uses `unwrap_or_else(PoisonError::into_inner)` rather than
 /// propagating poison because budget release is critical-path: if it
 /// fails, every producer blocks forever. Accepting a potentially
 /// inconsistent inner state is preferable to a deadlock.
+///
+/// Uses `notify_one` rather than `notify_all`: each release frees
+/// exactly one batch slot, so only one waiter can make progress.
+/// Shutdown paths (`set_terminal_error`, `mark_closed`) still use
+/// `notify_all` so every blocked producer observes the shutdown.
 fn release_inflight(shared: &SharedState, bytes: usize) {
     let mut guard = shared.state.lock().unwrap_or_else(|e| e.into_inner());
     debug_assert!(
@@ -1181,7 +1181,7 @@ fn release_inflight(shared: &SharedState, bytes: usize) {
     guard.inflight_batches = guard.inflight_batches.saturating_sub(1);
     guard.inflight_bytes = guard.inflight_bytes.saturating_sub(bytes);
     drop(guard);
-    shared.cv.notify_all();
+    shared.cv.notify_one();
 }
 
 /// Record a fatal writer-thread error and wake all producers.
@@ -1267,11 +1267,18 @@ pub enum OpenSegmentRecoveryOutcome {
         recovered_len: u64,
         /// Number of bytes removed from the tail.
         truncated_bytes: u64,
-        /// First non-I/O failure reason that terminated scanning, if any.
+        /// First recoverable decode failure reason that terminated scanning, if any.
         stop_reason: Option<LogReadErrorReason>,
     },
     /// `.open` was removed because matching `.bin` already existed.
     DiscardedDuplicateBin,
+    /// `.open` contained no valid frames and was removed.
+    DiscardedEmpty {
+        /// File length before removal.
+        original_len: u64,
+        /// First decode failure reason, if any (`None` for 0-byte files).
+        stop_reason: Option<LogReadErrorReason>,
+    },
 }
 
 /// Recovery metadata for one `.open` file.
@@ -1311,6 +1318,20 @@ impl OpenSegmentRecoveryReport {
             })
             .count()
     }
+
+    /// Number of `.open` files discarded because they contained no valid frames.
+    #[inline]
+    pub fn discarded_empty_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.outcome,
+                    OpenSegmentRecoveryOutcome::DiscardedEmpty { .. }
+                )
+            })
+            .count()
+    }
 }
 
 /// Recover stale `.open` segments and finalize them as `.bin`.
@@ -1318,7 +1339,8 @@ impl OpenSegmentRecoveryReport {
 /// Deterministic policy:
 /// - Iterate `run-*` directories and `.open` files in lexical order.
 /// - Scan each `.open` with [`LogReader`] until clean EOF or first bad frame.
-/// - Treat first non-I/O error as EOF boundary (`truncate` to last good byte).
+/// - Treat first recoverable decode error as EOF boundary (`truncate` to last good byte).
+/// - Surface `Io` and `UnsupportedVersion` as hard errors (no byte mutation).
 /// - Rename `.open` → `.bin` after truncate.
 /// - If matching `.bin` already exists, remove `.open` and record discard.
 ///
@@ -1359,7 +1381,8 @@ pub fn recover_open_segments(
             let mut bin_path = open_path.clone();
             bin_path.set_extension(SEGMENT_BIN_EXT);
             if bin_path.exists() {
-                fs::remove_file(&open_path).map_err(io_to_store_err)?;
+                fs::remove_file(&open_path)
+                    .map_err(|e| io_to_store_err_at(e, &open_path))?;
                 report.entries.push(OpenSegmentRecoveryEntry {
                     open_path,
                     bin_path,
@@ -1372,20 +1395,26 @@ pub fn recover_open_segments(
                 .read(true)
                 .write(true)
                 .open(&open_path)
-                .map_err(io_to_store_err)?;
-            let original_len = file.metadata().map_err(io_to_store_err)?.len();
+                .map_err(|e| io_to_store_err_at(e, &open_path))?;
+            let original_len = file
+                .metadata()
+                .map_err(|e| io_to_store_err_at(e, &open_path))?
+                .len();
 
             let (recovered_len, stop_reason) =
                 scan_recovery_boundary(&mut file, max_frame_payload_bytes)?;
             let recovered_len = recovered_len.min(original_len);
             if recovered_len < original_len {
-                file.set_len(recovered_len).map_err(io_to_store_err)?;
+                let file = OpenOptions::new()
+                    .write(true)
+                    .open(&open_path)
+                    .map_err(|e| io_to_store_err_at(e, &open_path))?;
+                file.set_len(recovered_len)
+                    .map_err(|e| io_to_store_err_at(e, &open_path))?;
             }
-            file.sync_data().map_err(io_to_store_err)?;
-            drop(file);
-
-            fs::rename(&open_path, &bin_path).map_err(io_to_store_err)?;
-            sync_dir(&seg_dir).map_err(io_to_store_err)?;
+             fs::rename(&open_path, &bin_path)
+                .map_err(|e| io_to_store_err_at(e, &bin_path))?;
+            sync_dir(&seg_dir).map_err(|e| io_to_store_err_at(e, &seg_dir))?;
 
             report.entries.push(OpenSegmentRecoveryEntry {
                 open_path,
@@ -1445,23 +1474,31 @@ pub fn list_finalized_segment_files(store_root: &Path) -> Result<Vec<PathBuf>, F
 ///
 /// The caller truncates the file at the returned offset, discarding any
 /// partial trailing frame. A `None` stop reason means the reader reached
-/// clean EOF with no corruption — the entire file is valid. An `Io` reason
-/// is promoted to a hard error (the caller cannot safely truncate on I/O
-/// failure), while all other reasons (CRC, truncated, malformed, etc.) are
-/// treated as a recoverable boundary.
+/// clean EOF with no corruption — the entire file is valid. `Io` and
+/// `UnsupportedVersion` reasons are promoted to hard errors (callers cannot
+/// safely mutate bytes for transport failures, and must preserve forward-
+/// version segments), while all other reasons (CRC, truncated, malformed,
+/// etc.) are treated as a recoverable boundary.
 fn scan_recovery_boundary(
     file: &mut File,
     max_frame_payload_bytes: u32,
 ) -> Result<(u64, Option<LogReadErrorReason>), FsStoreError> {
-    let mut reader = LogReader::new(file, max_frame_payload_bytes);
+    let mut reader = LogReader::buffered(file, max_frame_payload_bytes);
     loop {
-        match reader.next_record() {
-            Ok(Some(_)) => {}
+        match reader.next_frame_validated() {
+            Ok(Some(())) => {}
             Ok(None) => return Ok((reader.next_frame_offset(), None)),
             Err(err) => {
                 if err.reason() == LogReadErrorReason::Io {
                     return Err(FsStoreError::backend(format!(
                         "failed to recover open segment at offset {}: {}",
+                        err.frame_offset(),
+                        err
+                    )));
+                }
+                if err.reason() == LogReadErrorReason::UnsupportedVersion {
+                    return Err(FsStoreError::backend(format!(
+                        "failed to recover open segment at offset {}: unsupported version: {}",
                         err.frame_offset(),
                         err
                     )));
@@ -1498,7 +1535,15 @@ fn list_run_dirs(store_root: &Path) -> Result<Vec<PathBuf>, FsStoreError> {
 }
 
 fn io_to_store_err(err: std::io::Error) -> FsStoreError {
-    FsStoreError::backend(format!("append-log io error: {err}"))
+    FsStoreError::backend(format!("append-log io error ({:?}): {err}", err.kind()))
+}
+
+fn io_to_store_err_at(err: std::io::Error, path: &Path) -> FsStoreError {
+    FsStoreError::backend(format!(
+        "append-log io error ({:?}) at '{}': {err}",
+        err.kind(),
+        path.display()
+    ))
 }
 
 /// Replace non-portable characters with `_` for use in directory names.
@@ -2630,8 +2675,13 @@ mod tests {
         );
     }
 
+    /// Recovery uses skip-decode (`next_frame_validated`) which checks CRC
+    /// and version gate but skips full payload decode. A frame with valid CRC
+    /// but an invalid enum value (e.g. reserved key_source) passes the
+    /// recovery scan because the frame boundary is trustworthy. The semantic
+    /// error is surfaced later at query time, not at recovery time.
     #[test]
-    fn recover_open_segments_reserved_identity_metadata_violation_is_covered() {
+    fn recover_open_segments_reserved_identity_metadata_violation_passes_skip_decode() {
         // RunStart payload layout:
         // version(2) + run_id(8) + started(8) + durability(1) + correlation_mode(1)
         // + key_source(1) + max_inflight_batches(4) + max_inflight_bytes(8)
@@ -2653,7 +2703,6 @@ mod tests {
             &mut bytes,
         )
         .unwrap();
-        let expected_recovered_len = bytes.len() as u64;
 
         let mut invalid_identity_run_start = Vec::new();
         encode_record(
@@ -2663,6 +2712,7 @@ mod tests {
         )
         .unwrap();
         // key_source uses a small fixed domain; 0xFF exercises reserved/unknown value handling.
+        // CRC is recomputed, so the frame is structurally valid.
         rewrite_frame_body_byte_and_recompute_crc(
             &mut invalid_identity_run_start,
             RUN_START_KEY_SOURCE_BODY_OFFSET,
@@ -2676,6 +2726,7 @@ mod tests {
         )
         .unwrap();
 
+        let expected_total_len = bytes.len() as u64;
         fs::write(&open_path, &bytes).unwrap();
 
         let report = recover_open_segments(tmp.path(), DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap();
@@ -2685,29 +2736,72 @@ mod tests {
         let entry = &report.entries[0];
         assert_eq!(entry.open_path, open_path);
         assert_eq!(entry.bin_path, bin_path);
-        let stop_reason = match entry.outcome {
+        // Skip-decode accepts all CRC-valid frames, so the entire file is
+        // recovered with clean EOF (no truncation, no stop reason).
+        match entry.outcome {
             OpenSegmentRecoveryOutcome::Recovered {
                 recovered_len,
                 truncated_bytes,
                 stop_reason,
                 ..
             } => {
-                assert_eq!(recovered_len, expected_recovered_len);
-                assert!(truncated_bytes > 0);
-                assert_eq!(stop_reason, Some(LogReadErrorReason::MalformedFrame));
-                stop_reason
+                assert_eq!(recovered_len, expected_total_len);
+                assert_eq!(truncated_bytes, 0);
+                assert_eq!(stop_reason, None);
             }
             OpenSegmentRecoveryOutcome::DiscardedDuplicateBin => {
                 panic!("expected recovered outcome")
             }
-        };
+        }
 
-        let records = decode_recovered_records(&bin_path);
-        assert_eq!(records.len(), 1);
-        assert!(matches!(records[0], LogRecord::RunStart(_)));
+        // The .bin file contains all bytes. Full decode will hit the invalid
+        // enum in the second RunStart — that error is surfaced at query time.
+        let bin_len = fs::metadata(&bin_path).unwrap().len();
+        assert_eq!(bin_len, expected_total_len);
+    }
+
+    #[test]
+    fn recover_open_segments_unsupported_version_is_hard_error() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run-0000000000000001");
+        let seg_dir = run_dir.join("segments");
+        fs::create_dir_all(&seg_dir).unwrap();
+
+        let open_path = seg_dir.join("segment-00000000000000000000.open");
+        let bin_path = seg_dir.join("segment-00000000000000000000.bin");
+
+        let mut run_start = recovery_run_start();
+        run_start.version = LOG_FORMAT_VERSION.wrapping_add(1);
+
+        let mut bytes = Vec::new();
+        encode_record(
+            &LogRecord::RunStart(run_start),
+            DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+            &mut bytes,
+        )
+        .unwrap();
+        let original_len = bytes.len() as u64;
+        fs::write(&open_path, &bytes).unwrap();
+
+        let err = recover_open_segments(tmp.path(), DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap_err();
         assert!(
-            run_marked_incomplete(&records, stop_reason),
-            "reserved identity metadata violation should mark recovered run incomplete"
+            err.detail().contains("unsupported version"),
+            "expected unsupported version error, got: {}",
+            err.detail()
+        );
+
+        assert!(
+            open_path.exists(),
+            ".open should remain for unsupported versions"
+        );
+        assert!(
+            !bin_path.exists(),
+            ".bin should not be created on hard error"
+        );
+        let current_len = fs::metadata(&open_path).unwrap().len();
+        assert_eq!(
+            current_len, original_len,
+            "unsupported-version recovery must not truncate source bytes"
         );
     }
 
@@ -3141,5 +3235,319 @@ mod tests {
                 || result_str.contains("scanner-rs-store"),
             "expected store path containing scan-root marker, got: {result_str}"
         );
+    }
+
+    #[test]
+    fn recover_completely_valid_open_no_truncation() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run-0000000000000001");
+        let seg_dir = run_dir.join("segments");
+        fs::create_dir_all(&seg_dir).unwrap();
+
+        let open_path = seg_dir.join("segment-00000000000000000000.open");
+        let bin_path = seg_dir.join("segment-00000000000000000000.bin");
+
+        let mut bytes = Vec::new();
+        encode_record(
+            &LogRecord::RunStart(recovery_run_start()),
+            DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+            &mut bytes,
+        )
+        .unwrap();
+        encode_record(
+            &LogRecord::RunEnd(recovery_run_end()),
+            DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+            &mut bytes,
+        )
+        .unwrap();
+        let original_len = bytes.len() as u64;
+        fs::write(&open_path, &bytes).unwrap();
+
+        let report = recover_open_segments(tmp.path(), DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap();
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.recovered_count(), 1);
+        assert_eq!(report.discarded_count(), 0);
+
+        let entry = &report.entries[0];
+        match entry.outcome {
+            OpenSegmentRecoveryOutcome::Recovered {
+                original_len: orig,
+                recovered_len,
+                truncated_bytes,
+                stop_reason,
+            } => {
+                assert_eq!(orig, original_len);
+                assert_eq!(recovered_len, original_len);
+                assert_eq!(truncated_bytes, 0);
+                assert_eq!(stop_reason, None);
+            }
+            OpenSegmentRecoveryOutcome::DiscardedDuplicateBin => {
+                panic!("expected recovered outcome")
+            }
+        }
+
+        assert!(!open_path.exists());
+        assert!(bin_path.exists());
+
+        let records = decode_recovered_records(&bin_path);
+        assert_eq!(records.len(), 2);
+        assert!(matches!(records[0], LogRecord::RunStart(_)));
+        assert!(matches!(records[1], LogRecord::RunEnd(_)));
+    }
+
+    #[test]
+    fn recover_empty_open_file() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run-0000000000000001");
+        let seg_dir = run_dir.join("segments");
+        fs::create_dir_all(&seg_dir).unwrap();
+
+        let open_path = seg_dir.join("segment-00000000000000000000.open");
+        let bin_path = seg_dir.join("segment-00000000000000000000.bin");
+
+        fs::write(&open_path, b"").unwrap();
+
+        let report = recover_open_segments(tmp.path(), DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap();
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.recovered_count(), 1);
+
+        let entry = &report.entries[0];
+        match entry.outcome {
+            OpenSegmentRecoveryOutcome::Recovered {
+                original_len,
+                recovered_len,
+                truncated_bytes,
+                stop_reason,
+            } => {
+                assert_eq!(original_len, 0);
+                assert_eq!(recovered_len, 0);
+                assert_eq!(truncated_bytes, 0);
+                assert_eq!(stop_reason, None);
+            }
+            OpenSegmentRecoveryOutcome::DiscardedDuplicateBin => {
+                panic!("expected recovered outcome")
+            }
+        }
+
+        assert!(!open_path.exists());
+        assert!(bin_path.exists());
+        assert_eq!(fs::metadata(&bin_path).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn recover_multiple_open_in_one_run() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run-0000000000000001");
+        let seg_dir = run_dir.join("segments");
+        fs::create_dir_all(&seg_dir).unwrap();
+
+        let open1 = seg_dir.join("segment-00000000000000000000.open");
+        let open2 = seg_dir.join("segment-00000000000000000001.open");
+
+        let mut bytes1 = Vec::new();
+        encode_record(
+            &LogRecord::RunStart(recovery_run_start()),
+            DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+            &mut bytes1,
+        )
+        .unwrap();
+        fs::write(&open1, &bytes1).unwrap();
+
+        let mut bytes2 = Vec::new();
+        encode_record(
+            &LogRecord::RunEnd(recovery_run_end()),
+            DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+            &mut bytes2,
+        )
+        .unwrap();
+        fs::write(&open2, &bytes2).unwrap();
+
+        let report = recover_open_segments(tmp.path(), DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap();
+        assert_eq!(report.entries.len(), 2);
+        assert_eq!(report.recovered_count(), 2);
+
+        let names: Vec<&str> = report
+            .entries
+            .iter()
+            .map(|e| e.open_path.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert!(names[0] < names[1], "expected lexical order: {names:?}");
+
+        let bin1 = seg_dir.join("segment-00000000000000000000.bin");
+        let bin2 = seg_dir.join("segment-00000000000000000001.bin");
+        assert!(bin1.exists());
+        assert!(bin2.exists());
+    }
+
+    #[test]
+    fn recover_multiple_run_dirs() {
+        let tmp = TempDir::new().unwrap();
+
+        for run_name in &["run-0000000000000001", "run-0000000000000002"] {
+            let seg_dir = tmp.path().join(run_name).join("segments");
+            fs::create_dir_all(&seg_dir).unwrap();
+
+            let open_path = seg_dir.join("segment-00000000000000000000.open");
+            let mut bytes = Vec::new();
+            encode_record(
+                &LogRecord::RunStart(recovery_run_start()),
+                DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+                &mut bytes,
+            )
+            .unwrap();
+            fs::write(&open_path, &bytes).unwrap();
+        }
+
+        let report = recover_open_segments(tmp.path(), DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap();
+        assert_eq!(report.entries.len(), 2);
+        assert_eq!(report.recovered_count(), 2);
+
+        let run_dirs: Vec<String> = report
+            .entries
+            .iter()
+            .map(|e| {
+                e.open_path
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert!(
+            run_dirs[0] < run_dirs[1],
+            "expected run order preserved: {run_dirs:?}"
+        );
+    }
+
+    #[test]
+    fn recover_no_open_files_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run-0000000000000001");
+        let seg_dir = run_dir.join("segments");
+        fs::create_dir_all(&seg_dir).unwrap();
+
+        let mut bytes = Vec::new();
+        encode_record(
+            &LogRecord::RunStart(recovery_run_start()),
+            DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+            &mut bytes,
+        )
+        .unwrap();
+        fs::write(seg_dir.join("segment-00000000000000000000.bin"), &bytes).unwrap();
+
+        let report = recover_open_segments(tmp.path(), DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap();
+        assert!(report.entries.is_empty());
+        assert_eq!(report.recovered_count(), 0);
+        assert_eq!(report.discarded_count(), 0);
+    }
+
+    #[test]
+    fn recover_idempotency() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run-0000000000000001");
+        let seg_dir = run_dir.join("segments");
+        fs::create_dir_all(&seg_dir).unwrap();
+
+        let open_path = seg_dir.join("segment-00000000000000000000.open");
+        let bin_path = seg_dir.join("segment-00000000000000000000.bin");
+
+        let mut bytes = Vec::new();
+        encode_record(
+            &LogRecord::RunStart(recovery_run_start()),
+            DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+            &mut bytes,
+        )
+        .unwrap();
+        bytes.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        fs::write(&open_path, &bytes).unwrap();
+
+        let report1 = recover_open_segments(tmp.path(), DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap();
+        assert_eq!(report1.recovered_count(), 1);
+        assert!(bin_path.exists());
+
+        let report2 = recover_open_segments(tmp.path(), DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap();
+        assert!(report2.entries.is_empty());
+
+        let records = decode_recovered_records(&bin_path);
+        assert_eq!(records.len(), 1);
+        assert!(matches!(records[0], LogRecord::RunStart(_)));
+    }
+
+    #[test]
+    fn recover_mixed_scenario() {
+        let tmp = TempDir::new().unwrap();
+
+        // Run 1: one valid .open + one duplicate (.bin already exists).
+        let run1_dir = tmp.path().join("run-0000000000000001");
+        let seg1_dir = run1_dir.join("segments");
+        fs::create_dir_all(&seg1_dir).unwrap();
+
+        let mut valid_bytes = Vec::new();
+        encode_record(
+            &LogRecord::RunStart(recovery_run_start()),
+            DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+            &mut valid_bytes,
+        )
+        .unwrap();
+        fs::write(
+            seg1_dir.join("segment-00000000000000000000.open"),
+            &valid_bytes,
+        )
+        .unwrap();
+
+        fs::write(
+            seg1_dir.join("segment-00000000000000000001.bin"),
+            b"already-finalized",
+        )
+        .unwrap();
+        fs::write(seg1_dir.join("segment-00000000000000000001.open"), b"stale").unwrap();
+
+        // Run 2: one truncated .open.
+        let run2_dir = tmp.path().join("run-0000000000000002");
+        let seg2_dir = run2_dir.join("segments");
+        fs::create_dir_all(&seg2_dir).unwrap();
+
+        let mut trunc_bytes = Vec::new();
+        encode_record(
+            &LogRecord::RunStart(recovery_run_start()),
+            DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+            &mut trunc_bytes,
+        )
+        .unwrap();
+        let good_len = trunc_bytes.len();
+        encode_record(
+            &LogRecord::RunEnd(recovery_run_end()),
+            DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+            &mut trunc_bytes,
+        )
+        .unwrap();
+        trunc_bytes.truncate(good_len + 3);
+        fs::write(
+            seg2_dir.join("segment-00000000000000000000.open"),
+            &trunc_bytes,
+        )
+        .unwrap();
+
+        let report = recover_open_segments(tmp.path(), DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap();
+        assert_eq!(report.recovered_count(), 2, "expected 2 recovered");
+        assert_eq!(report.discarded_count(), 1, "expected 1 discarded");
+        assert_eq!(report.entries.len(), 3);
+    }
+
+    #[test]
+    fn recover_nonexistent_root_is_noop() {
+        let report = recover_open_segments(
+            Path::new("/nonexistent/path/that/should/not/exist"),
+            DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+        )
+        .unwrap();
+        assert!(report.entries.is_empty());
+        assert_eq!(report.recovered_count(), 0);
+        assert_eq!(report.discarded_count(), 0);
     }
 }

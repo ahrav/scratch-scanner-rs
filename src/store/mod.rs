@@ -1,8 +1,8 @@
 //! Persistence store contracts and backends for filesystem finding persistence.
 //!
-//! # Submodules by phase
+//! # Submodules
 //!
-//! **Phase A** — shared contracts and cryptographic identity:
+//! **Shared contracts and cryptographic identity:**
 //! - [`keys`] — key bootstrap from `SCANNER_SECRET_KEY` (or ephemeral fallback)
 //!   and [`RunModeMetadata`] describing the correlation semantics of this run.
 //! - [`identity`] — versioned, deterministic derivation of [`RuleFingerprint`],
@@ -10,11 +10,12 @@
 //! - [`fs`] — write-side API ([`StoreProducer`]) used by the scheduler FS scan
 //!   paths to hand off post-dedupe findings to a persistence backend.
 //!
-//! **Phase C** — append-only log persistence backend:
+//! **Append-only log persistence and recovery:**
 //! - [`log`] — framed binary codec ([`log::format`]), streaming reader with
-//!   reason-coded errors ([`log::reader`]), and bounded single-writer runtime
-//!   ([`log::writer`]) that implements [`StoreProducer`] with segment
-//!   rotation, CRC integrity, and backpressure.
+//!   reason-coded errors and position tracking ([`log::reader`]), bounded
+//!   single-writer runtime ([`log::writer`]) that implements [`StoreProducer`]
+//!   with segment rotation, CRC integrity, and backpressure, and startup
+//!   recovery of `.open` segments via [`log::writer::recover_open_segments`].
 
 pub mod fs;
 pub mod identity;

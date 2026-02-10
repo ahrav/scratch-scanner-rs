@@ -200,7 +200,7 @@ The hash is stored in a scratch sidecar aligned with `FindingRec` indices and
 is used by Git persistence as part of the deterministic finding key
 `(start, end, rule_id, norm_hash)`. No raw secret bytes are stored.
 
-## FS Persistence Identity Contracts (Phase A)
+## FS Persistence Identity Contracts
 
 Filesystem persistence now has a separate identity contract in `src/store/`:
 
@@ -216,7 +216,7 @@ Filesystem persistence now has a separate identity contract in `src/store/`:
   (`step_id == STEP_ROOT` or `dedupe_with_span`), and UTF-16 LE/BE variant
   discrimination.
 
-## FS Append-Log Writer (Phase C)
+## FS Append-Log Writer
 
 Filesystem scans now have a concrete persistence backend in
 `src/store/log/`:
@@ -237,7 +237,7 @@ Filesystem scans now have a concrete persistence backend in
   sibling directory of the scan root.
 
 For the full binary wire format specification, directory layout, and
-configuration defaults, see [fs-persistence-pipeline.md § Append-Log Backend](fs-persistence-pipeline.md#append-log-backend-phase-c).
+configuration defaults, see [fs-persistence-pipeline.md § Append-Log Backend](fs-persistence-pipeline.md#append-log-backend).
 
 **Pressure Coalescing**: If windows exceed `max_windows_per_rule_variant` (16), the gap doubles until windows fit, or everything merges into one.
 

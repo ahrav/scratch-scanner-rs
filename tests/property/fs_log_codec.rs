@@ -8,8 +8,9 @@
 
 use proptest::prelude::*;
 use scanner_rs::store::log::{
-    decode_record, encode_record, LogDurabilityMode, LogFindingBatch, LogFindingRecord, LogRecord,
-    LogRecordReader, LogRuleDef, LogRunEnd, LogRunStart, DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+    decode_record, encode_record, LogDurabilityMode, LogFindingBatch, LogFindingRecord, LogReader,
+    LogRecord, LogRecordReader, LogRuleDef, LogRunEnd, LogRunStart,
+    DEFAULT_MAX_FRAME_PAYLOAD_BYTES, LOG_FORMAT_VERSION,
 };
 use scanner_rs::store::{CorrelationMode, KeySource};
 use std::io::Cursor;
@@ -159,6 +160,25 @@ fn arb_log_record() -> impl Strategy<Value = LogRecord> {
     ]
 }
 
+/// RunStart with version pinned to LOG_FORMAT_VERSION — passes LogReader's
+/// version gate so it can be used in recovery/boundary property tests.
+fn arb_valid_run_start() -> impl Strategy<Value = LogRunStart> {
+    arb_run_start().prop_map(|mut rs| {
+        rs.version = LOG_FORMAT_VERSION;
+        rs
+    })
+}
+
+/// Record generator that LogReader will accept (version-gated RunStart).
+fn arb_reader_valid_record() -> impl Strategy<Value = LogRecord> {
+    prop_oneof![
+        arb_valid_run_start().prop_map(LogRecord::RunStart),
+        arb_rule_def().prop_map(LogRecord::RuleDef),
+        arb_finding_batch().prop_map(LogRecord::FindingBatch),
+        arb_run_end().prop_map(LogRecord::RunEnd),
+    ]
+}
+
 // ========================================================================
 // Property tests
 // ========================================================================
@@ -251,5 +271,58 @@ proptest! {
         // total frame = header(8) + frame_len
         let expected_total = FRAME_HEADER_BYTES + frame_len as usize;
         prop_assert_eq!(buf.len(), expected_total);
+    }
+
+    /// T1.8: Recovery boundary sits exactly at the end of valid frames when
+    /// garbage bytes are appended. This is THE critical correctness property
+    /// for crash recovery — off by 1 byte = data loss or retained corruption.
+    #[test]
+    fn recovery_boundary_after_garbage_tail(
+        records in proptest::collection::vec(arb_reader_valid_record(), 1..20),
+        garbage in proptest::collection::vec(any::<u8>(), 1..128),
+    ) {
+        let mut buf = Vec::new();
+        for rec in &records {
+            encode_record(rec, DEFAULT_MAX_FRAME_PAYLOAD_BYTES, &mut buf).unwrap();
+        }
+        let valid_len = buf.len() as u64;
+        buf.extend_from_slice(&garbage);
+
+        let mut reader = LogReader::with_default_limit(Cursor::new(buf));
+        loop {
+            match reader.next_record() {
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+        // The boundary offset must equal the sum of all valid frame sizes.
+        prop_assert_eq!(reader.next_frame_offset(), valid_len);
+    }
+
+    /// T2.8: Random single-byte corruption never causes a panic.
+    /// Deterministic CI-friendly complement to the fuzz target.
+    #[test]
+    fn corruption_never_causes_panic(
+        records in proptest::collection::vec(arb_reader_valid_record(), 1..20),
+        flip_idx in any::<proptest::sample::Index>(),
+    ) {
+        let mut buf = Vec::new();
+        for rec in &records {
+            encode_record(rec, DEFAULT_MAX_FRAME_PAYLOAD_BYTES, &mut buf).unwrap();
+        }
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let idx = flip_idx.index(buf.len());
+        buf[idx] ^= 0xFF;
+
+        let mut reader = LogReader::with_default_limit(Cursor::new(buf));
+        // Drain until terminal — must not panic.
+        loop {
+            match reader.next_record() {
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
     }
 }

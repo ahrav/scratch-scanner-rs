@@ -4,8 +4,9 @@ Write-side plumbing that carries post-dedupe findings from the scheduler's
 FS scan loops into a persistence backend.
 
 **Source**: `src/store/fs.rs`, `src/store/log/format.rs`,
-`src/store/log/writer.rs`, `src/scheduler/local_fs_owner.rs`,
-`src/scheduler/parallel_scan.rs`, `src/unified/orchestrator.rs`
+`src/store/log/reader.rs`, `src/store/log/writer.rs`,
+`src/scheduler/local_fs_owner.rs`, `src/scheduler/parallel_scan.rs`,
+`src/unified/orchestrator.rs`
 
 ## Purpose
 
@@ -25,6 +26,7 @@ emits). The consumer side (actual backend storage) is plugged in via the
 |--------|-------|---------|
 | `src/store/fs.rs` | FS persistence producer | Write-side trait + data types for FS scan findings |
 | `src/store/log/format.rs` | FS log codec | Framed on-disk record format (`len + crc32 + type + payload`) |
+| `src/store/log/reader.rs` | FS log reader | Streaming frame decoder with reason-coded errors and `.open` recovery |
 | `src/store/log/writer.rs` | FS append-log backend | Bounded single-writer runtime with `.open` -> `.bin` finalize |
 | `src/store/identity.rs` | Identity contracts | Stable `RuleFingerprint`, `SecretHash`, `OccurrenceId` derivation |
 | `src/store/keys.rs` | Key bootstrap | `SCANNER_SECRET_KEY` KDF for keyed identity hashes |
@@ -164,7 +166,7 @@ pub trait StoreProducer: Send + Sync + 'static {
 | `NullStoreProducer` | Default no-op — CLI default, feature-off, benchmarks |
 | `InMemoryStoreProducer` | Collects batches in memory for tests and diagnostics |
 
-### Append-Log Backend (Phase C)
+### Append-Log Backend
 
 When `--persist-findings` is enabled for FS scans, the orchestrator wires
 `AppendLogStoreProducer` by default.
@@ -311,7 +313,7 @@ this frame sequence:
 The writer enforces this order across segment boundaries. The reader decodes
 frames in whatever order they appear (no ordering validation).
 
-#### Reader API (Phase D)
+#### Reader API
 
 Use `store::log::reader::LogReader` when replaying persisted runs or scanning
 segments for recovery:
@@ -353,7 +355,9 @@ segments.
 
 Policy:
 - Scan each `.open` frame-by-frame in lexical order.
-- On first non-I/O decode error, treat that frame boundary as EOF.
+- On first recoverable decode error, treat that frame boundary as EOF.
+- Surface `Io` and `UnsupportedVersion` as hard recovery errors (do not
+  truncate/rename the source `.open`).
 - Truncate tail bytes beyond the last valid frame.
 - Rename `.open` → `.bin`.
 - If matching `.bin` already exists, discard `.open` and record
@@ -405,7 +409,7 @@ Default: `SegmentClose`.
 | `durability` | `SegmentClose` | fsync strategy |
 
 Validation rejects: any zero-valued budget, `max_inflight_batches` > `u32::MAX`
-(wire format limit), and `max_frame_payload_bytes` + 8 (header) >
+(wire format limit), and `max_frame_payload_bytes` + 8 (header) + 1 (type byte) >
 `max_segment_bytes` (a frame must fit in a segment).
 
 #### Backpressure
@@ -555,10 +559,6 @@ The `SummaryEvent.status` field is set to `"partial"` when
 
 ## What's NOT Included (Future Work)
 
-- **No live `.open` readers in MVP** — query/replay is over finalized `.bin`
-  segments only.
-- **No mid-segment salvage** — malformed frame handling is stop-at-first-bad-frame;
-  advanced resync/recovery policy is handled in Phase D.
 - **No derived index yet** — logs are the source of truth; SQLite/indexed query
   acceleration is post-MVP.
 
