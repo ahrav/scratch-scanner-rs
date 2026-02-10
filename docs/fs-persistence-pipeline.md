@@ -254,7 +254,8 @@ dimension tables, defined in `src/store/db/schema.rs`:
 | Index | Column(s) | Purpose |
 |-------|-----------|---------|
 | `idx_runs_root` | `runs(root_pk)` | Filter runs by root |
-| `idx_runs_status` | `runs(status) WHERE status = 0` | Find active (in-progress) runs |
+| `idx_runs_status_started` | `runs(status, started_at DESC)` | Status-filtered run listing without temp sort |
+| `idx_secrets_occ_count` | `secrets(occurrence_count DESC)` | Ordered secret listing without temp sort |
 | `idx_occ_secret` | `occurrences(secret_pk)` | Secret-based occurrence lookup |
 | `idx_occ_path` | `occurrences(path_pk)` | Path-based occurrence lookup |
 | `idx_occ_rule` | `occurrences(rule_pk)` | Rule-based occurrence lookup |

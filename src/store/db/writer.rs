@@ -8,7 +8,7 @@
 //!
 //! - Single writer connection (SQLite serializes writes anyway via WAL).
 //! - Batched transactions: each `emit_fs_batch` call runs inside a transaction.
-//! - `INSERT OR IGNORE` for idempotent dimensions and observation edges.
+//! - `INSERT … ON CONFLICT DO NOTHING` for idempotent dimensions and observation edges.
 //! - Observation-driven secret counters (`occurrence_count`, first/last seen run).
 //! - Rust-side `HashMap<[u8;32], i64>` caches for surrogate key resolution.
 
@@ -232,10 +232,13 @@ impl StoreProducer for SqliteStoreProducer {
                 )?;
                 state.rule_cache.entry(rule_fingerprint).or_insert(rule_pk);
 
-                state.conn.execute(
-                    "INSERT OR IGNORE INTO run_rules (run_pk, rule_pk) VALUES (?1, ?2)",
-                    params![state.run_pk, rule_pk],
-                )?;
+                state
+                    .conn
+                    .prepare_cached(
+                        "INSERT INTO run_rules (run_pk, rule_pk) VALUES (?1, ?2)
+                         ON CONFLICT(run_pk, rule_pk) DO NOTHING",
+                    )?
+                    .execute(params![state.run_pk, rule_pk])?;
 
                 let secret_hash = finding.norm_hash;
                 let secret_pk = resolve_or_insert_secret(&state.conn, &secret_hash, state.run_pk)?;
@@ -243,12 +246,16 @@ impl StoreProducer for SqliteStoreProducer {
                 let occurrence_id =
                     derive_occurrence_id(&path_id, &rule_fingerprint, &secret_hash, finding);
 
-                state.conn.execute(
-                    "INSERT OR IGNORE INTO occurrences (
+                state
+                    .conn
+                    .prepare_cached(
+                        "INSERT INTO occurrences (
                          occurrence_id, root_pk, path_pk, rule_pk, secret_pk,
                          start_byte, end_byte, identity_flags, object_path
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    params![
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                     ON CONFLICT(occurrence_id) DO NOTHING",
+                    )?
+                    .execute(params![
                         occurrence_id.as_slice(),
                         state.root_pk,
                         path_pk,
@@ -258,20 +265,21 @@ impl StoreProducer for SqliteStoreProducer {
                         finding.root_hint_end as i64,
                         0i64,
                         object_path.as_str(),
-                    ],
-                )?;
+                    ])?;
 
-                let occ_pk: i64 = state.conn.query_row(
-                    "SELECT occ_pk FROM occurrences WHERE occurrence_id = ?1",
-                    params![occurrence_id.as_slice()],
-                    |row| row.get(0),
-                )?;
+                let occ_pk: i64 = state
+                    .conn
+                    .prepare_cached("SELECT occ_pk FROM occurrences WHERE occurrence_id = ?1")?
+                    .query_row(params![occurrence_id.as_slice()], |row| row.get(0))?;
 
-                let inserted_observation = state.conn.execute(
-                    "INSERT OR IGNORE INTO observations (run_pk, occ_pk, batch_seqno)
-                     VALUES (?1, ?2, ?3)",
-                    params![state.run_pk, occ_pk, state.batch_seqno],
-                )?;
+                let inserted_observation = state
+                    .conn
+                    .prepare_cached(
+                        "INSERT INTO observations (run_pk, occ_pk, batch_seqno)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(run_pk, occ_pk) DO NOTHING",
+                    )?
+                    .execute(params![state.run_pk, occ_pk, state.batch_seqno])?;
 
                 if inserted_observation > 0 {
                     touch_secret_observation(&state.conn, secret_pk, state.run_pk)?;
@@ -346,10 +354,13 @@ impl StoreProducer for SqliteStoreProducer {
 
 /// Resolve or create a root dimension row, returning its surrogate PK.
 ///
-/// Uses `INSERT OR IGNORE` + `SELECT` rather than `INSERT … RETURNING`
-/// because `RETURNING` requires SQLite ≥ 3.35 and rusqlite's `execute`
-/// doesn't expose returned rows. The two-step approach is safe under
-/// `BEGIN IMMEDIATE` and on a single-writer connection.
+/// Uses `INSERT … ON CONFLICT DO NOTHING` + `SELECT` rather than
+/// `INSERT … RETURNING` because `RETURNING` requires SQLite ≥ 3.35 and
+/// rusqlite's `execute` doesn't expose returned rows. The two-step approach
+/// is safe under `BEGIN IMMEDIATE` and on a single-writer connection.
+///
+/// `ON CONFLICT(root_id) DO NOTHING` scopes duplicate suppression to the
+/// exact UNIQUE constraint, so FK/NOT-NULL/CHECK violations still surface.
 fn resolve_or_insert_root(
     conn: &Connection,
     root_id: &[u8; 32],
@@ -358,29 +369,27 @@ fn resolve_or_insert_root(
     canonical_identity: &[u8],
     display_name: Option<&str>,
 ) -> rusqlite::Result<i64> {
-    conn.execute(
-        "INSERT OR IGNORE INTO roots (root_id, root_kind, identity_scheme, canonical_identity, display_name)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![
-            root_id.as_slice(),
-            kind as u8,
-            scheme,
-            canonical_identity,
-            display_name,
-        ],
-    )?;
-    conn.query_row(
-        "SELECT root_pk FROM roots WHERE root_id = ?1",
-        params![root_id.as_slice()],
-        |row| row.get(0),
-    )
+    conn.prepare_cached(
+        "INSERT INTO roots (root_id, root_kind, identity_scheme, canonical_identity, display_name)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(root_id) DO NOTHING",
+    )?
+    .execute(params![
+        root_id.as_slice(),
+        kind as u8,
+        scheme,
+        canonical_identity,
+        display_name,
+    ])?;
+    conn.prepare_cached("SELECT root_pk FROM roots WHERE root_id = ?1")?
+        .query_row(params![root_id.as_slice()], |row| row.get(0))
 }
 
 /// Resolve or create a rule dimension row, returning its surrogate PK.
 ///
 /// Checks the in-memory `cache` first (O(1) lookup); on miss falls back to
-/// `INSERT OR IGNORE` + `SELECT` against the `rules` table. The caller is
-/// responsible for inserting the returned PK into the cache.
+/// `INSERT … ON CONFLICT DO NOTHING` + `SELECT` against the `rules` table.
+/// The caller is responsible for inserting the returned PK into the cache.
 fn resolve_or_insert_rule(
     conn: &Connection,
     rule_fingerprint: &[u8; 32],
@@ -390,20 +399,18 @@ fn resolve_or_insert_rule(
     if let Some(&pk) = cache.get(rule_fingerprint) {
         return Ok(pk);
     }
-    conn.execute(
-        "INSERT OR IGNORE INTO rules (rule_fingerprint, rule_id, rule_name)
-         VALUES (?1, ?2, ?3)",
-        params![
-            rule_fingerprint.as_slice(),
-            rule_id as i64,
-            format!("rule_{rule_id}"),
-        ],
-    )?;
-    conn.query_row(
-        "SELECT rule_pk FROM rules WHERE rule_fingerprint = ?1",
-        params![rule_fingerprint.as_slice()],
-        |row| row.get(0),
-    )
+    conn.prepare_cached(
+        "INSERT INTO rules (rule_fingerprint, rule_id, rule_name)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(rule_fingerprint) DO NOTHING",
+    )?
+    .execute(params![
+        rule_fingerprint.as_slice(),
+        rule_id as i64,
+        format!("rule_{rule_id}"),
+    ])?;
+    conn.prepare_cached("SELECT rule_pk FROM rules WHERE rule_fingerprint = ?1")?
+        .query_row(params![rule_fingerprint.as_slice()], |row| row.get(0))
 }
 
 /// Resolve or create a path dimension row, returning its surrogate PK.
@@ -413,16 +420,14 @@ fn resolve_or_insert_path(
     root_pk: i64,
     canonical_path: &str,
 ) -> rusqlite::Result<i64> {
-    conn.execute(
-        "INSERT OR IGNORE INTO paths (path_id, root_pk, canonical_path)
-         VALUES (?1, ?2, ?3)",
-        params![path_id.as_slice(), root_pk, canonical_path],
-    )?;
-    conn.query_row(
-        "SELECT path_pk FROM paths WHERE path_id = ?1",
-        params![path_id.as_slice()],
-        |row| row.get(0),
-    )
+    conn.prepare_cached(
+        "INSERT INTO paths (path_id, root_pk, canonical_path)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(path_id) DO NOTHING",
+    )?
+    .execute(params![path_id.as_slice(), root_pk, canonical_path])?;
+    conn.prepare_cached("SELECT path_pk FROM paths WHERE path_id = ?1")?
+        .query_row(params![path_id.as_slice()], |row| row.get(0))
 }
 
 /// Resolve or create a secret dimension row, returning its surrogate PK.
@@ -431,21 +436,19 @@ fn resolve_or_insert_secret(
     secret_hash: &[u8; 32],
     run_pk: i64,
 ) -> rusqlite::Result<i64> {
-    conn.execute(
-        "INSERT OR IGNORE INTO secrets (
+    conn.prepare_cached(
+        "INSERT INTO secrets (
              secret_hash, secret_len_bucket, first_seen_run, last_seen_run, occurrence_count, status
-         ) VALUES (?1, ?2, ?3, ?3, 0, 0)",
-        params![
-            secret_hash.as_slice(),
-            SecretLenBucket::Unknown as i32,
-            run_pk
-        ],
-    )?;
-    conn.query_row(
-        "SELECT secret_pk FROM secrets WHERE secret_hash = ?1",
-        params![secret_hash.as_slice()],
-        |row| row.get(0),
-    )
+         ) VALUES (?1, ?2, ?3, ?3, 0, 0)
+         ON CONFLICT(secret_hash) DO NOTHING",
+    )?
+    .execute(params![
+        secret_hash.as_slice(),
+        SecretLenBucket::Unknown as i32,
+        run_pk
+    ])?;
+    conn.prepare_cached("SELECT secret_pk FROM secrets WHERE secret_hash = ?1")?
+        .query_row(params![secret_hash.as_slice()], |row| row.get(0))
 }
 
 /// Update aggregate counters for a secret when a new observation is recorded.
@@ -454,14 +457,14 @@ fn touch_secret_observation(
     secret_pk: i64,
     run_pk: i64,
 ) -> rusqlite::Result<()> {
-    conn.execute(
+    conn.prepare_cached(
         "UPDATE secrets
          SET first_seen_run = MIN(first_seen_run, ?2),
              last_seen_run = MAX(last_seen_run, ?2),
              occurrence_count = occurrence_count + 1
          WHERE secret_pk = ?1",
-        params![secret_pk, run_pk],
-    )?;
+    )?
+    .execute(params![secret_pk, run_pk])?;
     Ok(())
 }
 

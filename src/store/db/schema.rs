@@ -174,7 +174,9 @@ fn apply_v1(conn: &Connection) -> rusqlite::Result<()> {
             scanner_version     TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_runs_root ON runs(root_pk);
-        CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status) WHERE status = 0;
+        CREATE INDEX IF NOT EXISTS idx_runs_status_started ON runs(status, started_at DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_secrets_occ_count ON secrets(occurrence_count DESC);
 
         CREATE TABLE IF NOT EXISTS occurrences (
             occ_pk           INTEGER PRIMARY KEY,
@@ -183,15 +185,13 @@ fn apply_v1(conn: &Connection) -> rusqlite::Result<()> {
             path_pk          INTEGER NOT NULL REFERENCES paths(path_pk),
             rule_pk          INTEGER NOT NULL REFERENCES rules(rule_pk),
             secret_pk        INTEGER NOT NULL REFERENCES secrets(secret_pk),
-            start_byte       INTEGER NOT NULL,
-            end_byte         INTEGER NOT NULL,
+            start_byte       INTEGER NOT NULL CHECK(start_byte >= 0),
+            end_byte         INTEGER NOT NULL CHECK(end_byte > start_byte),
             identity_flags   INTEGER NOT NULL DEFAULT 0,
             object_path      TEXT    NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_occ_secret ON occurrences(secret_pk);
-        CREATE INDEX IF NOT EXISTS idx_occ_path   ON occurrences(path_pk);
         CREATE INDEX IF NOT EXISTS idx_occ_rule   ON occurrences(rule_pk);
-        CREATE INDEX IF NOT EXISTS idx_occ_root   ON occurrences(root_pk);
 
         CREATE TABLE IF NOT EXISTS observations (
             run_pk        INTEGER NOT NULL REFERENCES runs(run_pk),

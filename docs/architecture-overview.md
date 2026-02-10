@@ -372,7 +372,7 @@ Scheduler harness code lives in `src/scheduler/sim_executor_harness.rs`.
 4. **Scanning**: Workers read overlap-aware chunks, run `Engine`, and dedupe overlap findings
 5. **Output**: Findings stream through `EventSink` implementations to stdout
 6. **Persistence**: When enabled (`--persist-findings`), post-dedupe findings are emitted
-   to a `StoreProducer` backend (default: append-log segments with CRC-framed records);
+   to a `StoreProducer` backend (default: SQLite star-schema with WAL mode);
    run-level loss accounting is recorded at scan end
 7. **Memory**: Scheduler/runtime buffer pools and engine scratch structures are reused per run
 

@@ -85,13 +85,10 @@ so backends must copy or serialize before returning. This is off the hot
 chunk-scanning path (occurs once per scanned object, after all chunks are
 processed).
 
-With the append-log backend (`src/store/log/writer.rs`), each worker then
-encodes owned finding frames and hands them to a single writer thread via a
-bounded queue:
-
-- `max_inflight_batches` caps queued frame count.
-- `max_inflight_bytes` caps queued encoded bytes.
-- Over-budget single frames fail explicitly instead of being dropped.
+With the SQLite backend (`src/store/db/writer.rs`), each worker calls
+`emit_fs_batch` on the shared `SqliteStoreProducer`. A `Mutex` serializes
+writes; each batch runs inside a `BEGIN IMMEDIATE … COMMIT` transaction.
+WAL mode enables concurrent readers without blocking the writer.
 
 These caps bound persistence-side memory independently of engine scanning
 budgets.
