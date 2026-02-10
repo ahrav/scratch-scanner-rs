@@ -4,8 +4,9 @@ Write-side plumbing that carries post-dedupe findings from the scheduler's
 FS scan loops into a persistence backend.
 
 **Source**: `src/store/fs.rs`, `src/store/log/format.rs`,
-`src/store/log/writer.rs`, `src/scheduler/local_fs_owner.rs`,
-`src/scheduler/parallel_scan.rs`, `src/unified/orchestrator.rs`
+`src/store/log/reader.rs`, `src/store/log/writer.rs`,
+`src/scheduler/local_fs_owner.rs`, `src/scheduler/parallel_scan.rs`,
+`src/unified/orchestrator.rs`
 
 ## Purpose
 
@@ -24,7 +25,8 @@ emits). The consumer side (actual backend storage) is plugged in via the
 | Module | Scope | Purpose |
 |--------|-------|---------|
 | `src/store/fs.rs` | FS persistence producer | Write-side trait + data types for FS scan findings |
-| `src/store/log/format.rs` | FS log codec | Framed on-disk record format (`len + crc32 + type + payload`) |
+| `src/store/log/format.rs` | FS log codec | Framed on-disk record format (V1 + V2, position-bound CRC, segment header/trailer, cross-segment hash chaining) |
+| `src/store/log/reader.rs` | FS log reader | Streaming frame decoder with reason-coded errors and `.open` recovery |
 | `src/store/log/writer.rs` | FS append-log backend | Bounded single-writer runtime with `.open` -> `.bin` finalize |
 | `src/store/identity.rs` | Identity contracts | Stable `RuleFingerprint`, `SecretHash`, `OccurrenceId` derivation |
 | `src/store/keys.rs` | Key bootstrap | `SCANNER_SECRET_KEY` KDF for keyed identity hashes |
@@ -164,7 +166,7 @@ pub trait StoreProducer: Send + Sync + 'static {
 | `NullStoreProducer` | Default no-op — CLI default, feature-off, benchmarks |
 | `InMemoryStoreProducer` | Collects batches in memory for tests and diagnostics |
 
-### Append-Log Backend (Phase C)
+### Append-Log Backend
 
 When `--persist-findings` is enabled for FS scans, the orchestrator wires
 `AppendLogStoreProducer` by default.
@@ -196,27 +198,38 @@ Example: scanning `/data/repos/myproject` creates
 - Active segments have the `.open` extension; finalized segments have `.bin`.
 - After a clean shutdown, no `.open` files remain.
 - `list_finalized_segment_files()` walks `run-*/segments/segment-*.bin` in
-  lexical order and ignores `.open` files.
+  lexical order, ignores `.open` files, and verifies V2 `prev_segment_hash`
+  continuity before returning paths.
 
 #### Binary Frame Format
 
-Every record is wrapped in a self-describing frame with an 8-byte header:
+Every record is wrapped in a self-describing frame with an 8-byte header.
+Readers accept both legacy V1 and current V2 frames:
 
 ```text
+V1 body:
  byte:  0       4       8    9                     N
         ┌───────┬───────┬────┬──────────────────────┐
         │ len   │ CRC32 │type│      payload          │
         │ u32le │ u32le │ u8 │   [len − 1] bytes     │
         └───────┴───────┴────┴──────────────────────┘
-         header (8 B)         body (len bytes)
+
+V2 body (position-bound CRC):
+ byte:  0       4       8          16         24   25                 N
+        ┌───────┬───────┬──────────┬──────────┬────┬──────────────────┐
+        │len|F2 │ CRC32 │frame_seq │segment_id│type│payload            │
+        │ u32le │ u32le │  u64le   │  u64le   │ u8 │ [len − 17] bytes  │
+        └───────┴───────┴──────────┴──────────┴────┴──────────────────┘
 ```
 
 | Field | Bytes | Encoding | Description |
 |-------|-------|----------|-------------|
-| `frame_len` | 0–3 | `u32_le` | Byte count of type + payload (body excluding header). Always ≥ 1. |
-| `crc32` | 4–7 | `u32_le` | CRC-32/ISO-HDLC (polynomial `0x04C11DB7`, zlib-compatible) over the type byte + payload. Verified before any parsing. |
-| `type` | 8 | `u8` | `FrameType` discriminant: `1`=RunStart, `2`=RuleDef, `3`=FindingBatch, `4`=RunEnd. |
-| `payload` | 9+ | variable | Record-specific bytes. Variable-length fields are length-prefixed with `u32_le`. |
+| `frame_len` | 0–3 | `u32_le` | Body length excluding header. In V2 the high bit (`F2`) is set; the lower 31 bits hold body length. |
+| `crc32` | 4–7 | `u32_le` | CRC-32/ISO-HDLC over the entire body. In V2 this includes `frame_seq` + `segment_id` + `type` + payload. |
+| `frame_seq` (V2) | 8–15 | `u64_le` | Monotonic per-run frame counter. |
+| `segment_id` (V2) | 16–23 | `u64_le` | Segment sequence number where the frame is committed. |
+| `type` | 8 (V1), 24 (V2) | `u8` | `FrameType`: `1`=RunStart, `2`=RuleDef, `3`=FindingBatch, `4`=RunEnd. |
+| `payload` | 9+ (V1), 25+ (V2) | variable | Record-specific bytes. Variable fields are length-prefixed with `u32_le`. |
 
 Invariants:
 - All multi-byte integers are little-endian.
@@ -229,7 +242,7 @@ Invariants:
 
 ```text
 offset  size   field
-  0     u16    version               (LOG_FORMAT_VERSION = 1)
+  0     u16    version               (LOG_FORMAT_VERSION = 2, readers accept 1..=2)
   2     u64    run_id
  10     u64    started_unix_ms
  18     u8     durability            (0 = SegmentClose, 1 = Batch)
@@ -286,9 +299,53 @@ offset  size   field
   0     u64    ended_unix_ms
   8     u64    dropped_findings      (engine cap drops)
  16     u64    persistence_emit_failures
- 24     u8     incomplete            (1 if any loss, 0 otherwise)
+  24     u8     incomplete            (1 if any loss, 0 otherwise)
                                      total: 25 bytes payload
 ```
+
+#### Segment Integrity Trailer (V2)
+
+Finalized V2 segments use both a fixed header and a fixed trailer:
+
+**Segment header (written at segment start):**
+
+```text
+offset  size   field
+  0     [8]    magic                ("SCRHDRv2")
+  8     u64    segment_id
+ 16     [32]   prev_segment_hash     (hash of previous finalized segment, or zero for first)
+                                     total: 48 bytes
+```
+
+Finalized `.bin` segments append a fixed trailer after the last frame:
+
+```text
+offset  size   field
+  0     [8]    magic                ("SCRSEGv2")
+  8     u64    segment_id
+ 16     u64    frame_count           (# of frames in this segment)
+ 24     u64    total_frame_bytes     (sum of frame byte lengths, excludes trailer)
+ 32     [32]   frame_crc_chain       (BLAKE3 chain over per-frame crc32 values)
+                                     total: 64 bytes
+```
+
+Readers validate trailer fields against observed frame stream state when
+present and derive a deterministic per-segment hash from:
+`segment_id`, `prev_segment_hash`, `frame_count`, `total_frame_bytes`, and
+`frame_crc_chain`.
+
+`.open` files may not contain a trailer; recovery scans treat clean EOF at a
+frame boundary as valid for `.open`.
+
+#### Cross-Segment Chain Verification (V2)
+
+For V2 runs, segment ordering/integrity is validated by hash chaining:
+
+- First segment must have `prev_segment_hash = [0; 32]`.
+- Each subsequent segment header must point to the previous segment's derived hash.
+- Recovery (`recover_open_segments`) and replay segment discovery
+  (`list_finalized_segment_files`) both validate this chain and fail on
+  insertion/deletion/reordering/tampering patterns that break continuity.
 
 #### Run Content Ordering
 
@@ -311,25 +368,82 @@ this frame sequence:
 The writer enforces this order across segment boundaries. The reader decodes
 frames in whatever order they appear (no ordering validation).
 
+#### Reader API
+
+Use `store::log::reader::LogReader` when replaying persisted runs or scanning
+segments for recovery:
+
+```rust
+use scanner_rs::store::log::LogReader;
+
+let file = std::fs::File::open("segment-00000000000000000000.bin")?;
+let mut reader = LogReader::with_default_limit(file);
+while let Some(record) = reader.next_record()? {
+    // process record
+}
+```
+
+`LogReader` keeps a reusable frame buffer and reports deterministic,
+reason-coded failures via `LogReadError`:
+
+| Reason | Meaning |
+|--------|---------|
+| `CrcMismatch` | Frame CRC does not match payload bytes |
+| `Truncated` | EOF before full header/body completion |
+| `UnsupportedFrame` | Unknown frame discriminant |
+| `UnsupportedVersion` | `RunStart.version` is outside supported range (`1..=LOG_FORMAT_VERSION`) |
+| `MalformedFrame` | Invalid frame shape or payload fields |
+| `Io` | Underlying read error from the transport |
+
+On any failure, callers also get:
+- `frame_index` (0-based frame number),
+- `frame_offset` (byte offset where that frame started).
+
+These fields make startup recovery deterministic: truncate `.open` at the last
+known-good offset and stop at first bad frame.
+
+#### Startup `.open` Recovery
+
+Use `recover_open_segments(store_root, max_frame_payload_bytes)` before
+query/replay startup to convert stale `.open` files into finalized `.bin`
+segments.
+
+Policy:
+- Scan each `.open` frame-by-frame in lexical order.
+- On first recoverable decode error, treat that frame boundary as EOF.
+- Surface `Io` and `UnsupportedVersion` as hard recovery errors (do not
+  truncate/rename the source `.open`).
+- Truncate tail bytes beyond the last valid frame.
+- Rename `.open` → `.bin`.
+- If matching `.bin` already exists, discard `.open` and record
+  `DiscardedDuplicateBin` in the recovery report.
+
+The returned `OpenSegmentRecoveryReport` captures per-file outcomes and
+truncation metadata for audit/telemetry.
+
 #### Segment Rotation
 
 Segments rotate when writing a frame would exceed `max_segment_bytes`
-(default **64 MB**):
+*after reserving trailer space* (default **64 MB**):
 
 ```text
 write_frame(data):
-    if bytes_written > 0 AND bytes_written + len(data) > max_segment_bytes:
+    trailer_bytes = 64
+    if frame_count > 0 AND bytes_written + len(data) + trailer_bytes > max_segment_bytes:
+        append trailer(frame_count, total_frame_bytes, frame_crc_chain)
         sync_data()              ← flush to disk
         rename .open → .bin      ← atomic finalization
         sync_dir()               ← directory entry durable
+        derive segment_hash      ← used as next segment's prev_segment_hash
         open new .open (seq++)
-        bytes_written = 0
+        write segment header(segment_id, prev_segment_hash)
+        bytes_written = header_bytes
     write data to current .open
     bytes_written += len(data)
 ```
 
 A single frame is never split across segments. Frames larger than
-`max_segment_bytes` are rejected outright.
+`max_segment_bytes - trailer_bytes` are rejected outright.
 
 #### Durability Modes
 
@@ -354,8 +468,8 @@ Default: `SegmentClose`.
 | `durability` | `SegmentClose` | fsync strategy |
 
 Validation rejects: any zero-valued budget, `max_inflight_batches` > `u32::MAX`
-(wire format limit), and `max_frame_payload_bytes` + 8 (header) >
-`max_segment_bytes` (a frame must fit in a segment).
+(wire format limit), and segment sizes that cannot fit at least one maximal
+configured V2 frame plus the fixed 48-byte header and 64-byte trailer.
 
 #### Backpressure
 
@@ -504,10 +618,6 @@ The `SummaryEvent.status` field is set to `"partial"` when
 
 ## What's NOT Included (Future Work)
 
-- **No live `.open` readers in MVP** — query/replay is over finalized `.bin`
-  segments only.
-- **No mid-segment salvage** — malformed frame handling is stop-at-first-bad-frame;
-  advanced resync/recovery policy is handled in Phase D.
 - **No derived index yet** — logs are the source of truth; SQLite/indexed query
   acceleration is post-MVP.
 

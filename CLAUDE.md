@@ -90,10 +90,10 @@ bv --robot-triage --robot-triage-by-label # Group by domain
 - `status` — Per-metric state: `computed|approx|timeout|skipped` + elapsed ms
 - `as_of` / `as_of_commit` — Present when using `--as-of`; contains ref and resolved SHA
 
-**Two-phase analysis:**
+**Two-step analysis:**
 
-- **Phase 1 (instant):** degree, topo sort, density — always available immediately
-- **Phase 2 (async, 500ms timeout):** PageRank, betweenness, HITS, eigenvector, cycles — check `status` flags
+- **Immediate pass (instant):** degree, topo sort, density — always available immediately
+- **Deferred pass (async, 500ms timeout):** PageRank, betweenness, HITS, eigenvector, cycles — check `status` flags
 
 **For large graphs (>500 nodes):** Some metrics may be approximated or skipped. Always check `status`.
 
@@ -106,7 +106,7 @@ bv --robot-insights | jq '.status' # Check metric readiness
 bv --robot-insights | jq '.Cycles' # Circular deps (must fix!)
 bv --robot-label-health | jq '.results.labels[] | select(.health_level == "critical")'
 
-**Performance:** Phase 1 instant, Phase 2 async (500ms timeout). Prefer `--robot-plan` over `--robot-insights` when speed matters. Results cached by data hash.
+**Performance:** Immediate pass is instant; deferred pass is async (500ms timeout). Prefer `--robot-plan` over `--robot-insights` when speed matters. Results cached by data hash.
 
 Use bv instead of parsing beads.jsonl—it computes PageRank, critical paths, cycles, and parallel tracks deterministically.
 

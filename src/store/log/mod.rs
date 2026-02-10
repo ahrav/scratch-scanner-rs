@@ -13,24 +13,34 @@
 //!
 //! # Submodules
 //!
-//! - [`format`] — deterministic framed codec (`len + crc32 + type + payload`)
-//!   for `RunStart`, `RuleDef`, `FindingBatch`, and `RunEnd` records.
+//! - [`mod@format`] — deterministic framed codec (legacy V1 + position-bound V2)
+//!   for `RunStart`, `RuleDef`, `FindingBatch`, and `RunEnd` records, plus
+//!   V2 segment integrity headers/trailers and cross-segment hash chaining.
+//! - [`reader`] — streaming, position-tracking iterator over framed records
+//!   with reason-coded errors. This is the primary entry point for offline
+//!   query and segment recovery (e.g. truncating a corrupt `.open` file at
+//!   the last valid frame boundary via [`LogReader::next_frame_offset`]).
 //! - [`writer`] — bounded single-writer runtime that implements
 //!   [`StoreProducer`](crate::store::StoreProducer) with backpressure,
-//!   segment rotation, and durable `.open` → `.bin` finalization.
+//!   segment rotation, durable `.open` → `.bin` finalization, and V2 segment
+//!   chain verification during replay/recovery listing paths.
 
 pub mod format;
+pub mod reader;
 mod secret_cache;
 pub mod writer;
 
 pub use format::{
-    decode_record, encode_record, FormatError, FrameType, LogDurabilityMode, LogFindingBatch,
-    LogFindingRecord, LogRecord, LogRecordReader, LogRuleDef, LogRunEnd, LogRunStart,
-    DEFAULT_MAX_FRAME_PAYLOAD_BYTES, LOG_FORMAT_VERSION,
+    decode_record, encode_record, encode_record_with_position, finalize_v2_frame_in_place,
+    FormatError, FramePosition, FrameType, LogDurabilityMode, LogFindingBatch, LogFindingRecord,
+    LogRecord, LogRecordReader, LogRuleDef, LogRunEnd, LogRunStart, SegmentHeader, SegmentTrailer,
+    DEFAULT_MAX_FRAME_PAYLOAD_BYTES, LEGACY_LOG_FORMAT_VERSION, LOG_FORMAT_VERSION,
 };
+pub use reader::{LogReadError, LogReadErrorReason, LogReader};
 #[cfg(feature = "bench")]
 pub use secret_cache::SecretHashCache;
 pub use writer::{
-    default_fs_log_root, list_finalized_segment_files, AppendLogStoreProducer, LogWriterConfig,
-    SCANNER_FS_LOG_DIR_ENV,
+    default_fs_log_root, list_finalized_segment_files, recover_open_segments,
+    AppendLogStoreProducer, LogWriterConfig, OpenSegmentRecoveryEntry, OpenSegmentRecoveryOutcome,
+    OpenSegmentRecoveryReport, SCANNER_FS_LOG_DIR_ENV,
 };

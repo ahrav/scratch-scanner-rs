@@ -2,20 +2,39 @@
 //!
 //! # Wire format
 //!
-//! Every record is wrapped in a fixed 8-byte header followed by the body:
+//! Each segment starts with a fixed header and then stores framed records.
+//! Two frame layouts are supported on read:
+//!
+//! - **V1 (legacy)** body = `type || payload`
+//! - **V2 (current)** body = `frame_seq || segment_id || type || payload`
+//!
+//! V2 is encoded by setting the high bit of `frame_len`.
 //!
 //! ```text
+//! V2 segment envelope:
+//! ┌──────────────┬────────────────────┬──────────────┐
+//! │ seg header   │ framed records...  │ seg trailer  │
+//! │ SCRHDRv2     │ V1/V2 frame layout │ SCRSEGv2     │
+//! └──────────────┴────────────────────┴──────────────┘
+//!
+//! V1 body:
 //! ┌──────────────┬──────────────┬──────────┬─────────────────────┐
 //! │ frame_len    │ crc32        │ type     │ payload             │
-//! │ u32_le (4B)  │ u32_le (4B)  │ u8 (1B)  │ [frame_len - 1] B  │
+//! │ u32_le (4B)  │ u32_le (4B)  │ u8 (1B)  │ [frame_len - 1] B   │
 //! └──────────────┴──────────────┴──────────┴─────────────────────┘
+//!
+//! V2 body:
+//! ┌──────────────┬──────────────┬───────────┬────────────┬──────────┬──────────┐
+//! │ frame_len|F2 │ crc32        │ frame_seq │ segment_id │ type     │ payload  │
+//! │ u32_le (4B)  │ u32_le (4B)  │ u64_le    │ u64_le     │ u8       │ ...      │
+//! └──────────────┴──────────────┴───────────┴────────────┴──────────┴──────────┘
 //! ```
 //!
-//! - **`frame_len`** — byte count of `type + payload` (i.e. body excluding the
-//!   8-byte header). Always ≥ 1 because the type byte is mandatory.
+//! - **`frame_len`** — byte count of body bytes (excluding the 8-byte header).
+//!   For V2, the high bit is set and the remaining bits store the body length.
 //! - **`crc32`** — CRC-32/ISO-HDLC (polynomial 0x04C11DB7, same as zlib)
-//!   computed over the concatenation of the type byte and payload bytes.
-//!   Verified on read before any payload parsing.
+//!   over the full body bytes. In V2 this binds `frame_seq` + `segment_id`
+//!   into the checksum region.
 //! - **`type`** — [`FrameType`] discriminant identifying the payload schema.
 //! - **`payload`** — record-specific bytes; see the per-variant encode/decode
 //!   functions below.
@@ -25,8 +44,10 @@
 //! - All multi-byte integers are **little-endian**.
 //! - Variable-length byte fields (e.g. `object_path`, `rule_name`) are
 //!   length-prefixed with a `u32_le` count.
-//! - A valid segment is a contiguous sequence of frames with no inter-frame
-//!   padding. The reader stops cleanly at EOF after consuming the last frame.
+//! - Finalized V2 segments end with a fixed-size trailer carrying
+//!   `frame_count`, `total_frame_bytes`, and a BLAKE3 chain over per-frame CRCs.
+//! - V2 segments also carry a fixed header with `segment_id` and
+//!   `prev_segment_hash` for cross-segment chain verification.
 //! - Frame payloads must not exceed [`DEFAULT_MAX_FRAME_PAYLOAD_BYTES`]
 //!   (configurable at the writer level) to bound memory allocation on read.
 
@@ -34,12 +55,261 @@ use crate::store::keys::{CorrelationMode, KeySource};
 use std::fmt;
 use std::io::{self, Read};
 
-/// Log format version for run metadata payloads.
-pub const LOG_FORMAT_VERSION: u16 = 1;
+/// Latest log format version for run metadata payloads.
+pub const LOG_FORMAT_VERSION: u16 = 2;
+/// Legacy log format version still accepted by readers.
+pub const LEGACY_LOG_FORMAT_VERSION: u16 = 1;
 /// Default hard cap for frame payload bytes.
 pub const DEFAULT_MAX_FRAME_PAYLOAD_BYTES: u32 = 16 * 1024 * 1024;
 
 pub(crate) const FRAME_HEADER_BYTES: usize = 8;
+pub(crate) const FRAME_V2_LEN_FLAG: u32 = 1 << 31;
+pub(crate) const FRAME_V2_POSITION_BYTES: usize = 16;
+pub(crate) const FRAME_V2_MIN_BODY_BYTES: u32 = (FRAME_V2_POSITION_BYTES as u32) + 1;
+pub(crate) const FRAME_V2_SEQ_OFFSET: usize = FRAME_HEADER_BYTES;
+pub(crate) const FRAME_V2_SEGMENT_ID_OFFSET: usize = FRAME_V2_SEQ_OFFSET + 8;
+pub(crate) const FRAME_V2_TYPE_OFFSET: usize = FRAME_V2_SEGMENT_ID_OFFSET + 8;
+
+pub(crate) const SEGMENT_HEADER_MAGIC: [u8; 8] = *b"SCRHDRv2";
+pub(crate) const SEGMENT_HEADER_BYTES: usize = 8 + 8 + 32;
+pub(crate) const SEGMENT_TRAILER_MAGIC: [u8; 8] = *b"SCRSEGv2";
+pub(crate) const SEGMENT_TRAILER_BYTES: usize = 8 + 8 + 8 + 8 + 32;
+
+/// Position metadata bound into V2 frame CRCs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FramePosition {
+    pub frame_seq: u64,
+    pub segment_id: u64,
+}
+
+/// Header written at the beginning of each V2 segment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SegmentHeader {
+    pub segment_id: u64,
+    pub prev_segment_hash: [u8; 32],
+}
+
+/// Integrity trailer written at the end of finalized V2 segments.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SegmentTrailer {
+    pub segment_id: u64,
+    pub frame_count: u64,
+    pub total_frame_bytes: u64,
+    pub frame_crc_chain: [u8; 32],
+}
+
+/// Parsed layout metadata for a single frame header.
+///
+/// Produced by [`parse_frame_layout`] from the raw `frame_len` word. Captures
+/// whether the frame is V1 or V2, the body and payload lengths, and the byte
+/// offsets within the body where the type byte and payload begin. This lets
+/// callers navigate the body without re-deriving version-dependent offsets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FrameLayout {
+    pub(crate) is_v2: bool,
+    /// Body length as stored in the header (low 31 bits of `frame_len`).
+    pub(crate) body_len_u32: u32,
+    /// Body length as `usize` for indexing.
+    pub(crate) body_len: usize,
+    /// Payload length excluding the type byte and V2 position prefix.
+    pub(crate) payload_len: u32,
+    /// Byte offset of the type byte within the body (0 for V1, 16 for V2).
+    pub(crate) type_offset: usize,
+    /// Byte offset of the first payload byte within the body.
+    pub(crate) payload_offset: usize,
+}
+
+/// Derive a [`FrameLayout`] from the raw `frame_len` word in a frame header.
+///
+/// The high bit of `frame_len_word` selects V1 vs V2 (see [`FRAME_V2_LEN_FLAG`]).
+/// The low 31 bits give the body length, from which this function computes
+/// the payload size and byte offsets for the type tag and payload within the
+/// body. Returns [`FormatError::InvalidFrameLength`] for zero-length or
+/// undersized bodies, and [`FormatError::FrameTooLarge`] if the payload
+/// exceeds `max_payload_bytes`.
+#[inline]
+pub(crate) fn parse_frame_layout(
+    frame_len_word: u32,
+    max_payload_bytes: u32,
+) -> Result<FrameLayout, FormatError> {
+    let is_v2 = (frame_len_word & FRAME_V2_LEN_FLAG) != 0;
+    let body_len_u32 = frame_len_word & !FRAME_V2_LEN_FLAG;
+    if body_len_u32 == 0 {
+        return Err(FormatError::InvalidFrameLength {
+            len: frame_len_word,
+        });
+    }
+
+    let min_body = if is_v2 { FRAME_V2_MIN_BODY_BYTES } else { 1 };
+    if body_len_u32 < min_body {
+        return Err(FormatError::InvalidFrameLength {
+            len: frame_len_word,
+        });
+    }
+    let payload_len = body_len_u32 - min_body;
+    if payload_len > max_payload_bytes {
+        return Err(FormatError::FrameTooLarge {
+            len: payload_len,
+            max: max_payload_bytes,
+        });
+    }
+
+    let body_len = usize::try_from(body_len_u32).map_err(|_| FormatError::InvalidFrameLength {
+        len: frame_len_word,
+    })?;
+    let type_offset = if is_v2 { FRAME_V2_POSITION_BYTES } else { 0 };
+    let payload_offset = type_offset + 1;
+    Ok(FrameLayout {
+        is_v2,
+        body_len_u32,
+        body_len,
+        payload_len,
+        type_offset,
+        payload_offset,
+    })
+}
+
+/// Extract the CRC-32 stored in bytes 4..8 of a frame header.
+///
+/// The frame header layout is `[frame_len: u32-LE, crc: u32-LE]`; this
+/// function reads the second word. Returns [`FormatError::TruncatedHeader`]
+/// if `frame_bytes` is shorter than [`FRAME_HEADER_BYTES`] (8).
+#[inline]
+pub(crate) fn frame_crc_from_header(frame_bytes: &[u8]) -> Result<u32, FormatError> {
+    if frame_bytes.len() < FRAME_HEADER_BYTES {
+        return Err(FormatError::TruncatedHeader {
+            got: frame_bytes.len(),
+        });
+    }
+    Ok(u32::from_le_bytes([
+        frame_bytes[4],
+        frame_bytes[5],
+        frame_bytes[6],
+        frame_bytes[7],
+    ]))
+}
+
+/// Advance the rolling BLAKE3 CRC chain by one frame.
+///
+/// Computes `BLAKE3(prev || frame_crc_le)` where `frame_crc_le` is the
+/// per-frame CRC-32 in little-endian. The chain starts from 32 zero bytes
+/// and is extended once per frame; the final value is stored in the
+/// [`SegmentTrailer::frame_crc_chain`] field to authenticate the segment's
+/// frame sequence.
+#[inline]
+pub(crate) fn extend_frame_crc_chain(prev: &[u8; 32], frame_crc: u32) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(prev);
+    hasher.update(&frame_crc.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+/// Serialize a [`SegmentHeader`] and append it to `out`.
+pub(crate) fn append_segment_header(out: &mut Vec<u8>, header: &SegmentHeader) {
+    out.extend_from_slice(&SEGMENT_HEADER_MAGIC);
+    out.extend_from_slice(&header.segment_id.to_le_bytes());
+    out.extend_from_slice(&header.prev_segment_hash);
+}
+
+/// Decode a [`SegmentHeader`] from an exact [`SEGMENT_HEADER_BYTES`]-length
+/// slice.
+pub(crate) fn decode_segment_header(buf: &[u8]) -> Result<SegmentHeader, FormatError> {
+    if buf.len() != SEGMENT_HEADER_BYTES {
+        return Err(FormatError::InvalidSegmentHeader {
+            detail: "segment header length mismatch",
+        });
+    }
+    if buf[..8] != SEGMENT_HEADER_MAGIC {
+        return Err(FormatError::InvalidSegmentHeader {
+            detail: "segment header magic mismatch",
+        });
+    }
+    let segment_id = u64::from_le_bytes([
+        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+    ]);
+    let mut prev_segment_hash = [0u8; 32];
+    prev_segment_hash.copy_from_slice(&buf[16..48]);
+    Ok(SegmentHeader {
+        segment_id,
+        prev_segment_hash,
+    })
+}
+
+/// Serialize a [`SegmentTrailer`] and append it to `out`.
+///
+/// Writes the fixed 64-byte trailer: 8-byte magic (`SCRSEGv2`), then
+/// `segment_id`, `frame_count`, and `total_frame_bytes` as little-endian
+/// u64s, followed by the 32-byte `frame_crc_chain` digest. The writer calls
+/// this just before finalizing (`.open` → `.bin` rename) so readers can
+/// verify segment integrity without re-scanning every frame.
+pub(crate) fn append_segment_trailer(out: &mut Vec<u8>, trailer: &SegmentTrailer) {
+    out.extend_from_slice(&SEGMENT_TRAILER_MAGIC);
+    out.extend_from_slice(&trailer.segment_id.to_le_bytes());
+    out.extend_from_slice(&trailer.frame_count.to_le_bytes());
+    out.extend_from_slice(&trailer.total_frame_bytes.to_le_bytes());
+    out.extend_from_slice(&trailer.frame_crc_chain);
+}
+
+/// Decode a [`SegmentTrailer`] from an exact [`SEGMENT_TRAILER_BYTES`]-length
+/// slice.
+///
+/// Validates the 8-byte magic prefix and deserializes the remaining fields.
+/// Returns [`FormatError::InvalidSegmentTrailer`] on length mismatch or
+/// magic mismatch. This is the inverse of [`append_segment_trailer`].
+pub(crate) fn decode_segment_trailer(buf: &[u8]) -> Result<SegmentTrailer, FormatError> {
+    if buf.len() != SEGMENT_TRAILER_BYTES {
+        return Err(FormatError::InvalidSegmentTrailer {
+            detail: "segment trailer length mismatch",
+        });
+    }
+    if buf[..8] != SEGMENT_TRAILER_MAGIC {
+        return Err(FormatError::InvalidSegmentTrailer {
+            detail: "segment trailer magic mismatch",
+        });
+    }
+
+    let mut cursor = 8usize;
+    let take_u64 = |s: &[u8], idx: &mut usize| -> u64 {
+        let start = *idx;
+        *idx += 8;
+        u64::from_le_bytes([
+            s[start],
+            s[start + 1],
+            s[start + 2],
+            s[start + 3],
+            s[start + 4],
+            s[start + 5],
+            s[start + 6],
+            s[start + 7],
+        ])
+    };
+    let segment_id = take_u64(buf, &mut cursor);
+    let frame_count = take_u64(buf, &mut cursor);
+    let total_frame_bytes = take_u64(buf, &mut cursor);
+    let mut frame_crc_chain = [0u8; 32];
+    frame_crc_chain.copy_from_slice(&buf[cursor..cursor + 32]);
+    Ok(SegmentTrailer {
+        segment_id,
+        frame_count,
+        total_frame_bytes,
+        frame_crc_chain,
+    })
+}
+
+/// Derive a deterministic digest for one finalized segment.
+///
+/// The digest is chained across segments via
+/// [`SegmentHeader::prev_segment_hash`].
+pub(crate) fn derive_segment_hash(header: &SegmentHeader, trailer: &SegmentTrailer) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"scanner.store.log.v2.segment_hash");
+    hasher.update(&header.segment_id.to_le_bytes());
+    hasher.update(&header.prev_segment_hash);
+    hasher.update(&trailer.frame_count.to_le_bytes());
+    hasher.update(&trailer.total_frame_bytes.to_le_bytes());
+    hasher.update(&trailer.frame_crc_chain);
+    *hasher.finalize().as_bytes()
+}
 
 /// Frame discriminants written on disk.
 ///
@@ -297,6 +567,12 @@ pub enum FormatError {
         frame_type: FrameType,
         detail: &'static str,
     },
+    InvalidSegmentHeader {
+        detail: &'static str,
+    },
+    InvalidSegmentTrailer {
+        detail: &'static str,
+    },
     LengthTooLarge {
         field: &'static str,
         len: usize,
@@ -312,7 +588,10 @@ impl fmt::Display for FormatError {
                 write!(f, "frame payload too large: {len} > {max}")
             }
             Self::InvalidFrameLength { len } => {
-                write!(f, "invalid frame length: {len} (must include type byte)")
+                write!(
+                    f,
+                    "invalid frame length: {len} (must include frame type and any required v2 prefix)"
+                )
             }
             Self::TruncatedHeader { got } => write!(f, "truncated frame header: got {got} bytes"),
             Self::TruncatedFrame { expected, got } => {
@@ -333,6 +612,12 @@ impl fmt::Display for FormatError {
             }
             Self::InvalidRecord { frame_type, detail } => {
                 write!(f, "invalid {frame_type:?} payload: {detail}")
+            }
+            Self::InvalidSegmentHeader { detail } => {
+                write!(f, "invalid segment header: {detail}")
+            }
+            Self::InvalidSegmentTrailer { detail } => {
+                write!(f, "invalid segment trailer: {detail}")
             }
             Self::LengthTooLarge { field, len, max } => {
                 write!(f, "{field} length too large: {len} > {max}")
@@ -356,7 +641,7 @@ impl From<io::Error> for FormatError {
     }
 }
 
-/// Encode one log record as a framed blob and append to `out`.
+/// Encode one log record as a **legacy V1** framed blob and append to `out`.
 ///
 /// Writes the 8-byte header (`frame_len` + `crc32`) followed by the type
 /// byte and encoded payload. Returns [`FormatError::FrameTooLarge`] if the
@@ -364,6 +649,8 @@ impl From<io::Error> for FormatError {
 ///
 /// `out` is **not** cleared before writing; the frame is appended so that
 /// callers can build multi-frame buffers incrementally.
+///
+/// New on-disk segments should use [`encode_record_with_position`].
 pub fn encode_record(
     record: &LogRecord,
     max_payload_bytes: u32,
@@ -400,10 +687,99 @@ pub fn encode_record(
     Ok(())
 }
 
+/// Encode one log record using the V2 wire layout and append to `out`.
+///
+/// V2 frames add a 16-byte position prefix (`frame_seq`, `segment_id`)
+/// ahead of the type byte and payload, then bind those bytes into the CRC.
+pub fn encode_record_with_position(
+    record: &LogRecord,
+    max_payload_bytes: u32,
+    position: FramePosition,
+    out: &mut Vec<u8>,
+) -> Result<(), FormatError> {
+    let mut payload = Vec::with_capacity(256);
+    record.encode_payload(&mut payload)?;
+
+    if payload.len() > max_payload_bytes as usize {
+        return Err(FormatError::FrameTooLarge {
+            len: payload.len() as u32,
+            max: max_payload_bytes,
+        });
+    }
+
+    let body_len = payload
+        .len()
+        .checked_add(1 + FRAME_V2_POSITION_BYTES)
+        .ok_or(FormatError::InvalidFrameLength { len: u32::MAX })?;
+    let body_len_u32 =
+        u32::try_from(body_len).map_err(|_| FormatError::InvalidFrameLength { len: u32::MAX })?;
+    let frame_len_word = FRAME_V2_LEN_FLAG | body_len_u32;
+
+    let frame_type = record.frame_type() as u8;
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(&position.frame_seq.to_le_bytes());
+    crc.update(&position.segment_id.to_le_bytes());
+    crc.update(&[frame_type]);
+    crc.update(&payload);
+    let crc32 = crc.finalize();
+
+    out.reserve(FRAME_HEADER_BYTES + body_len);
+    out.extend_from_slice(&frame_len_word.to_le_bytes());
+    out.extend_from_slice(&crc32.to_le_bytes());
+    out.extend_from_slice(&position.frame_seq.to_le_bytes());
+    out.extend_from_slice(&position.segment_id.to_le_bytes());
+    out.push(frame_type);
+    out.extend_from_slice(&payload);
+    Ok(())
+}
+
+/// Patch a pre-built V2 frame in place with final position metadata and CRC.
+///
+/// `frame` must already contain the full body and use a V2 `frame_len` word.
+pub fn finalize_v2_frame_in_place(
+    frame: &mut [u8],
+    position: FramePosition,
+) -> Result<u32, FormatError> {
+    if frame.len() < FRAME_HEADER_BYTES + FRAME_V2_POSITION_BYTES + 1 {
+        return Err(FormatError::TruncatedFrame {
+            expected: FRAME_HEADER_BYTES + FRAME_V2_POSITION_BYTES + 1,
+            got: frame.len(),
+        });
+    }
+    let frame_len_word = u32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]);
+    let layout = parse_frame_layout(frame_len_word, u32::MAX)?;
+    if !layout.is_v2 {
+        return Err(FormatError::InvalidFrameLength {
+            len: frame_len_word,
+        });
+    }
+    let expected_total_len =
+        FRAME_HEADER_BYTES
+            .checked_add(layout.body_len)
+            .ok_or(FormatError::InvalidFrameLength {
+                len: frame_len_word,
+            })?;
+    if frame.len() != expected_total_len {
+        return Err(FormatError::TruncatedFrame {
+            expected: expected_total_len,
+            got: frame.len(),
+        });
+    }
+
+    frame[FRAME_V2_SEQ_OFFSET..FRAME_V2_SEGMENT_ID_OFFSET]
+        .copy_from_slice(&position.frame_seq.to_le_bytes());
+    frame[FRAME_V2_SEGMENT_ID_OFFSET..FRAME_V2_TYPE_OFFSET]
+        .copy_from_slice(&position.segment_id.to_le_bytes());
+    let crc32 = crc32fast::hash(&frame[FRAME_HEADER_BYTES..]);
+    frame[4..FRAME_HEADER_BYTES].copy_from_slice(&crc32.to_le_bytes());
+    Ok(crc32)
+}
+
 /// Decode one framed record from `frame_bytes`.
 ///
 /// `frame_bytes` must contain exactly one complete frame (header + body).
-/// The CRC is verified before any payload parsing.
+/// The CRC is verified before any payload parsing. Supports both legacy V1
+/// and current V2 frame layouts.
 ///
 /// Returns [`FormatError::FrameTooLarge`] if the declared payload exceeds
 /// `max_payload_bytes`, and [`FormatError::CrcMismatch`] on data corruption.
@@ -414,7 +790,7 @@ pub fn decode_record(frame_bytes: &[u8], max_payload_bytes: u32) -> Result<LogRe
         });
     }
 
-    let frame_len = u32::from_le_bytes([
+    let frame_len_word = u32::from_le_bytes([
         frame_bytes[0],
         frame_bytes[1],
         frame_bytes[2],
@@ -427,7 +803,7 @@ pub fn decode_record(frame_bytes: &[u8], max_payload_bytes: u32) -> Result<LogRe
         frame_bytes[7],
     ]);
     decode_frame_body(
-        frame_len,
+        frame_len_word,
         crc_expected,
         &frame_bytes[FRAME_HEADER_BYTES..],
         max_payload_bytes,
@@ -442,10 +818,17 @@ pub fn decode_record(frame_bytes: &[u8], max_payload_bytes: u32) -> Result<LogRe
 ///
 /// EOF handling: a clean EOF (zero bytes read at the start of a new header)
 /// returns `Ok(None)`. A partial header or truncated body is an error.
+/// When a V2 segment trailer is encountered, it is validated against the
+/// accumulated frame counters and CRC-chain state before returning EOF.
 pub struct LogRecordReader<R: Read> {
     reader: R,
     frame_buf: Vec<u8>,
     max_payload_bytes: u32,
+    segment_preamble_checked: bool,
+    segment_header: Option<SegmentHeader>,
+    frame_count: u64,
+    total_frame_bytes: u64,
+    frame_crc_chain: [u8; 32],
 }
 
 impl<R: Read> LogRecordReader<R> {
@@ -454,40 +837,73 @@ impl<R: Read> LogRecordReader<R> {
             reader,
             frame_buf: Vec::new(),
             max_payload_bytes,
+            segment_preamble_checked: false,
+            segment_header: None,
+            frame_count: 0,
+            total_frame_bytes: 0,
+            frame_crc_chain: [0u8; 32],
         }
     }
 
-    /// Decode the next record.
-    ///
-    /// Returns `Ok(None)` on clean EOF before a new frame header starts.
-    pub fn next_record(&mut self) -> Result<Option<LogRecord>, FormatError> {
-        let mut header = [0u8; FRAME_HEADER_BYTES];
+    fn read_exact_into(&mut self, dst: &mut [u8]) -> Result<(), FormatError> {
         let mut got = 0usize;
-        while got < FRAME_HEADER_BYTES {
-            let n = self.reader.read(&mut header[got..])?;
+        while got < dst.len() {
+            let n = self.reader.read(&mut dst[got..])?;
             if n == 0 {
-                if got == 0 {
-                    return Ok(None);
-                }
-                return Err(FormatError::TruncatedHeader { got });
+                return Err(FormatError::TruncatedFrame {
+                    expected: dst.len(),
+                    got,
+                });
             }
             got += n;
         }
+        Ok(())
+    }
 
-        let frame_len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-        let crc_expected = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-        if frame_len == 0 {
-            return Err(FormatError::InvalidFrameLength { len: frame_len });
+    fn read_segment_trailer_after_magic(&mut self, magic: [u8; 8]) -> Result<(), FormatError> {
+        let mut trailer_buf = [0u8; SEGMENT_TRAILER_BYTES];
+        trailer_buf[..8].copy_from_slice(&magic);
+        self.read_exact_into(&mut trailer_buf[8..])?;
+        let trailer = decode_segment_trailer(&trailer_buf)?;
+        if let Some(header) = self.segment_header {
+            if trailer.segment_id != header.segment_id {
+                return Err(FormatError::InvalidSegmentTrailer {
+                    detail: "segment_id mismatch",
+                });
+            }
         }
-        let payload_len = frame_len - 1;
-        if payload_len > self.max_payload_bytes {
-            return Err(FormatError::FrameTooLarge {
-                len: payload_len,
-                max: self.max_payload_bytes,
+        if trailer.frame_count != self.frame_count {
+            return Err(FormatError::InvalidSegmentTrailer {
+                detail: "frame_count mismatch",
             });
         }
+        if trailer.total_frame_bytes != self.total_frame_bytes {
+            return Err(FormatError::InvalidSegmentTrailer {
+                detail: "total_frame_bytes mismatch",
+            });
+        }
+        if trailer.frame_crc_chain != self.frame_crc_chain {
+            return Err(FormatError::InvalidSegmentTrailer {
+                detail: "frame_crc_chain mismatch",
+            });
+        }
+        Ok(())
+    }
 
-        let want = frame_len as usize;
+    fn next_record_from_header(
+        &mut self,
+        header: [u8; FRAME_HEADER_BYTES],
+    ) -> Result<Option<LogRecord>, FormatError> {
+        if header == SEGMENT_TRAILER_MAGIC {
+            self.read_segment_trailer_after_magic(header)?;
+            return Ok(None);
+        }
+
+        let frame_len_word = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let crc_expected = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+        let layout = parse_frame_layout(frame_len_word, self.max_payload_bytes)?;
+
+        let want = layout.body_len;
         self.frame_buf.resize(want, 0);
         let mut read = 0usize;
         while read < want {
@@ -502,34 +918,76 @@ impl<R: Read> LogRecordReader<R> {
         }
 
         decode_frame_body(
-            frame_len,
+            frame_len_word,
             crc_expected,
             &self.frame_buf,
             self.max_payload_bytes,
         )
-        .map(Some)
+        .map(|record| {
+            self.frame_count = self.frame_count.saturating_add(1);
+            self.total_frame_bytes = self
+                .total_frame_bytes
+                .saturating_add((FRAME_HEADER_BYTES + layout.body_len) as u64);
+            self.frame_crc_chain = extend_frame_crc_chain(&self.frame_crc_chain, crc_expected);
+            Some(record)
+        })
+    }
+
+    /// Decode the next record.
+    ///
+    /// Returns `Ok(None)` on clean EOF before a new frame header starts.
+    pub fn next_record(&mut self) -> Result<Option<LogRecord>, FormatError> {
+        if !self.segment_preamble_checked {
+            let mut prelude = [0u8; FRAME_HEADER_BYTES];
+            let mut got = 0usize;
+            while got < FRAME_HEADER_BYTES {
+                let n = self.reader.read(&mut prelude[got..])?;
+                if n == 0 {
+                    if got == 0 {
+                        return Ok(None);
+                    }
+                    return Err(FormatError::TruncatedHeader { got });
+                }
+                got += n;
+            }
+            if prelude == SEGMENT_HEADER_MAGIC {
+                let mut header_buf = [0u8; SEGMENT_HEADER_BYTES];
+                header_buf[..FRAME_HEADER_BYTES].copy_from_slice(&prelude);
+                self.read_exact_into(&mut header_buf[FRAME_HEADER_BYTES..])?;
+                self.segment_header = Some(decode_segment_header(&header_buf)?);
+                self.segment_preamble_checked = true;
+                return self.next_record();
+            }
+            self.segment_preamble_checked = true;
+            return self.next_record_from_header(prelude);
+        }
+
+        let mut header = [0u8; FRAME_HEADER_BYTES];
+        let mut got = 0usize;
+        while got < FRAME_HEADER_BYTES {
+            let n = self.reader.read(&mut header[got..])?;
+            if n == 0 {
+                if got == 0 {
+                    return Ok(None);
+                }
+                return Err(FormatError::TruncatedHeader { got });
+            }
+            got += n;
+        }
+        self.next_record_from_header(header)
     }
 }
 
 fn decode_frame_body(
-    frame_len: u32,
+    frame_len_word: u32,
     crc_expected: u32,
     body: &[u8],
     max_payload_bytes: u32,
 ) -> Result<LogRecord, FormatError> {
-    if frame_len == 0 {
-        return Err(FormatError::InvalidFrameLength { len: frame_len });
-    }
-    let payload_len = frame_len - 1;
-    if payload_len > max_payload_bytes {
-        return Err(FormatError::FrameTooLarge {
-            len: payload_len,
-            max: max_payload_bytes,
-        });
-    }
-    if body.len() != frame_len as usize {
+    let layout = parse_frame_layout(frame_len_word, max_payload_bytes)?;
+    if body.len() != layout.body_len {
         return Err(FormatError::TruncatedFrame {
-            expected: frame_len as usize,
+            expected: layout.body_len,
             got: body.len(),
         });
     }
@@ -544,8 +1002,14 @@ fn decode_frame_body(
         });
     }
 
-    let frame_type = FrameType::from_u8(body[0])?;
-    LogRecord::decode_payload(frame_type, &body[1..])
+    let payload = &body[layout.payload_offset..];
+    if payload.len() != layout.payload_len as usize {
+        return Err(FormatError::InvalidFrameLength {
+            len: frame_len_word,
+        });
+    }
+    let frame_type = FrameType::from_u8(body[layout.type_offset])?;
+    LogRecord::decode_payload(frame_type, payload)
 }
 
 fn encode_run_start(rec: &LogRunStart, out: &mut Vec<u8>) -> Result<(), FormatError> {
@@ -1011,13 +1475,11 @@ mod tests {
         let mut buf = vec![0u8; 16];
         // frame_len = 0 (first 4 bytes, already zero)
         // crc = 0 (bytes 4-7, already zero)
-        // type + payload (bytes 8+)
+        // body bytes (bytes 8+) - interpreted as V1 because the V2 flag is not set.
         buf[8] = 1; // RunStart type byte
 
         let err = decode_record(&buf, DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap_err();
-        // frame_len=0 means body len < 9 (need at least 9 total), so TruncatedHeader
-        // Actually with our buffer size 16, the header check passes but
-        // decode_frame_body checks frame_len == 0 → InvalidFrameLength.
+        // Header bytes are present, so this should fail at frame-length validation.
         assert!(
             matches!(
                 err,

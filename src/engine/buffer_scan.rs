@@ -215,10 +215,10 @@ impl Engine {
             // Two-phase confirmation: a cost-saving optimization for rules whose
             // prefilter fires frequently but whose regex is expensive.
             //
-            // Phase 1 (seed): memmem-check each seed window for the confirm
-            //   pattern. Windows without a match are dropped immediately.
-            // Phase 2 (expand): surviving windows are widened from seed_radius
-            //   to full_radius (the actual regex validation radius). The extra
+            // Seed pass: memmem-check each seed window for the confirm pattern.
+            //   Windows without a match are dropped immediately.
+            // Expand pass: surviving windows are widened from seed_radius to
+            //   full_radius (the actual regex validation radius). The extra
             //   padding is `(full_radius - seed_radius) * variant.scale()`.
             //
             // Soundness argument: confirm patterns are mandatory literal

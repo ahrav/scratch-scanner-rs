@@ -1,10 +1,10 @@
-# Phase 1 Data Layout Benchmarks (2026-02-08)
+# Baseline Data Layout Benchmarks (2026-02-08)
 
 Issue: `scratch-scanner-rs-y2o`  
 Epic: `scratch-scanner-rs-22c`
 
 ## Scope
-Executed the Phase 1 benchmark suite after all Phase 1 implementation tasks were closed:
+Executed the baseline benchmark suite after implementation tasks were closed:
 - `scanner_throughput` (includes tier2 + tier3)
 - `rule_scaling`
 - `vectorscan_overhead`
@@ -17,13 +17,13 @@ Executed the Phase 1 benchmark suite after all Phase 1 implementation tasks were
 
 ## Commands
 ```bash
-mkdir -p .bench/phase1-2026-02-08
+mkdir -p .bench/baseline-2026-02-08
 RUSTFLAGS="-C target-cpu=native" cargo bench --bench scanner_throughput \
-  2>&1 | tee .bench/phase1-2026-02-08/scanner_throughput.log
+  2>&1 | tee .bench/baseline-2026-02-08/scanner_throughput.log
 RUSTFLAGS="-C target-cpu=native" cargo bench --bench rule_scaling \
-  2>&1 | tee .bench/phase1-2026-02-08/rule_scaling.log
+  2>&1 | tee .bench/baseline-2026-02-08/rule_scaling.log
 RUSTFLAGS="-C target-cpu=native" cargo bench --bench vectorscan_overhead \
-  2>&1 | tee .bench/phase1-2026-02-08/vectorscan_overhead.log
+  2>&1 | tee .bench/baseline-2026-02-08/vectorscan_overhead.log
 ```
 
 ## Key Results
@@ -67,11 +67,11 @@ Aggregate medians:
 | `layer4_full_engine/full_gitleaks_random` | `163.69 MiB/s` |
 
 ## Notes and Constraints
-- The explicit pre-optimization baseline task (`scratch-scanner-rs-pp0`) was previously closed as skipped, so this run has no stored "before" baseline to compute Phase 1 deltas.
+- The explicit pre-optimization baseline task (`scratch-scanner-rs-pp0`) was previously closed as skipped, so this run has no stored "before" baseline deltas.
 - Linux `perf stat` counters requested by `y2o` were not collected because this run was executed on macOS (`Darwin`), not Linux.
-- This run can serve as a Phase 1 reference point for Phase 2 comparisons.
+- This run serves as the baseline reference point for follow-up comparisons.
 
 ## Artifacts
-- `.bench/phase1-2026-02-08/scanner_throughput.log`
-- `.bench/phase1-2026-02-08/rule_scaling.log`
-- `.bench/phase1-2026-02-08/vectorscan_overhead.log`
+- `.bench/baseline-2026-02-08/scanner_throughput.log`
+- `.bench/baseline-2026-02-08/rule_scaling.log`
+- `.bench/baseline-2026-02-08/vectorscan_overhead.log`
