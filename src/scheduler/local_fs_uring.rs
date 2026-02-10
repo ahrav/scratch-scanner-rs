@@ -40,6 +40,7 @@ use super::count_budget::{CountBudget, CountPermit};
 use super::engine_stub::BUFFER_LEN_MAX;
 use super::engine_trait::{EngineScratch, FindingRecord, ScanEngine};
 use super::executor::{Executor, ExecutorConfig, ExecutorHandle, WorkerCtx};
+use super::file_id_alloc::FileIdAllocator;
 use super::metrics::MetricsSnapshot;
 use crate::api::FileId;
 use crate::archive::detect::detect_kind_from_path;
@@ -279,6 +280,8 @@ pub struct UringIoStats {
     pub short_reads: u64,
     pub binary_skipped: u64,
     pub archives_sniffed: u64,
+    pub archives_send_failed: u64,
+    pub bytes_enqueued: u64,
 }
 
 // ============================================================================
@@ -406,6 +409,8 @@ impl UringIoStats {
         self.short_reads += other.short_reads;
         self.binary_skipped += other.binary_skipped;
         self.archives_sniffed += other.archives_sniffed;
+        self.archives_send_failed += other.archives_send_failed;
+        self.bytes_enqueued += other.bytes_enqueued;
     }
 }
 
@@ -627,6 +632,9 @@ struct UringArchiveSink<'a, E: ScanEngine> {
     pending: &'a mut Vec<<E::Scratch as EngineScratch>::Finding>,
     event_sink: &'a dyn EventSink,
     display: Vec<u8>,
+    container_file_id: FileId,
+    next_entry_index: u32,
+    file_ids: Arc<FileIdAllocator>,
     file_id: FileId,
     dedupe: bool,
     bytes_scanned: u64,
@@ -640,8 +648,12 @@ impl<E: ScanEngine> ArchiveEntrySink for UringArchiveSink<'_, E> {
     fn on_entry_start(&mut self, meta: &EntryMeta<'_>) -> Result<(), Self::Error> {
         self.display.clear();
         self.display.extend_from_slice(meta.display_path);
-        // Use a deterministic file_id for each entry within the archive.
-        self.file_id = FileId(self.file_id.0.wrapping_add(1));
+        // Use a run-global allocator so archive entries never reuse ids from
+        // neighboring archives or regular files.
+        self.file_id = self
+            .file_ids
+            .next_archive_entry_file_id(self.container_file_id, &mut self.next_entry_index)
+            .ok_or(())?;
         Ok(())
     }
 
@@ -677,6 +689,8 @@ struct ArchiveWorkerStats {
     chunks_scanned: u64,
     findings_emitted: u64,
     archives_processed: u64,
+    archives_open_failed: u64,
+    archives_scan_errors: u64,
     archive_stats: ArchiveStats,
 }
 
@@ -686,6 +700,7 @@ fn archive_worker_loop<E: ScanEngine>(
     rx: chan::Receiver<ArchiveWork>,
     engine: Arc<E>,
     event_sink: Arc<dyn EventSink>,
+    file_ids: Arc<FileIdAllocator>,
     cfg: ArchiveConfig,
     dedupe: bool,
 ) -> ArchiveWorkerStats {
@@ -701,11 +716,22 @@ fn archive_worker_loop<E: ScanEngine>(
     let mut total_findings = 0u64;
     let mut archives_processed = 0u64;
 
+    let mut archives_open_failed = 0u64;
+    let mut archives_scan_errors = 0u64;
+
     for work in rx {
         let display = &*work.token.display;
         let file = match File::open(&work.path) {
             Ok(f) => f,
-            Err(_) => continue,
+            Err(_e) => {
+                archives_open_failed += 1;
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "[uring-archive] Failed to open archive {:?}: {}",
+                    work.path, _e
+                );
+                continue;
+            }
         };
 
         let mut sink = UringArchiveSink {
@@ -714,6 +740,9 @@ fn archive_worker_loop<E: ScanEngine>(
             pending: &mut pending,
             event_sink: &*event_sink,
             display: Vec::new(),
+            container_file_id: work.token.file_id,
+            next_entry_index: 0,
+            file_ids: Arc::clone(&file_ids),
             file_id: work.token.file_id,
             dedupe,
             bytes_scanned: 0,
@@ -721,7 +750,7 @@ fn archive_worker_loop<E: ScanEngine>(
             findings_emitted: 0,
         };
 
-        let _end = match work.kind {
+        let scan_result = match work.kind {
             ArchiveKind::Gzip => scan_gzip_stream(
                 file,
                 display,
@@ -760,6 +789,12 @@ fn archive_worker_loop<E: ScanEngine>(
             ),
         };
 
+        if let Err(_e) = scan_result {
+            archives_scan_errors += 1;
+            #[cfg(debug_assertions)]
+            eprintln!("[uring-archive] Scan failed for {:?}: {}", work.path, _e);
+        }
+
         total_bytes += sink.bytes_scanned;
         total_chunks += sink.chunks_scanned;
         total_findings += sink.findings_emitted;
@@ -774,6 +809,8 @@ fn archive_worker_loop<E: ScanEngine>(
         chunks_scanned: total_chunks,
         findings_emitted: total_findings,
         archives_processed,
+        archives_open_failed,
+        archives_scan_errors,
         archive_stats,
     }
 }
@@ -1133,6 +1170,8 @@ fn io_worker_loop<E: ScanEngine>(
                 return;
             }
         };
+
+        perf_stats::sat_add_u64(&mut stats.bytes_enqueued, read_state.size);
 
         let slot = free_file_slots.pop().unwrap_or_else(|| {
             files.push(None);
@@ -1593,6 +1632,12 @@ fn io_worker_loop<E: ScanEngine>(
                     if res < 0 {
                         // Read syscall failed.
                         stats.read_errors = stats.read_errors.saturating_add(1);
+                        #[cfg(debug_assertions)]
+                        eprintln!(
+                            "[uring-io] read failed errno={} file={:?}",
+                            -res,
+                            std::str::from_utf8(&st.token.display).unwrap_or("<non-utf8>"),
+                        );
                         st.failed = true;
                         st.done = true;
                         drop(op.buf);
@@ -1601,6 +1646,11 @@ fn io_worker_loop<E: ScanEngine>(
                         if n == 0 {
                             // Unexpected EOF (empty read).
                             stats.read_errors = stats.read_errors.saturating_add(1);
+                            #[cfg(debug_assertions)]
+                            eprintln!(
+                                "[uring-io] unexpected EOF file={:?}",
+                                std::str::from_utf8(&st.token.display).unwrap_or("<non-utf8>"),
+                            );
                             st.failed = true;
                             st.done = true;
                             drop(op.buf);
@@ -1644,7 +1694,18 @@ fn io_worker_loop<E: ScanEngine>(
                                             kind,
                                             token: Arc::clone(&st.token),
                                         };
-                                        let _ = atx.send(aw);
+                                        if atx.send(aw).is_err() {
+                                            perf_stats::sat_add_u64(
+                                                &mut stats.archives_send_failed,
+                                                1,
+                                            );
+                                            #[cfg(debug_assertions)]
+                                            eprintln!(
+                                                "[uring-io] archive channel closed, \
+                                                 dropping sniffed archive {:?}",
+                                                &st.token.display,
+                                            );
+                                        }
                                         st.done = true;
                                         drop(op.buf);
 
@@ -1668,6 +1729,9 @@ fn io_worker_loop<E: ScanEngine>(
                                     match verdict {
                                         ContentVerdict::Binary
                                         | ContentVerdict::BinaryExtractable(_) => {
+                                            // TODO: when binary-extract is enabled,
+                                            // route BinaryExtractable to extraction
+                                            // workers (like local_fs_owner does).
                                             stats.binary_skipped =
                                                 stats.binary_skipped.saturating_add(1);
                                             st.done = true;
@@ -1707,6 +1771,8 @@ fn io_worker_loop<E: ScanEngine>(
 
                             if cpu.spawn(task).is_err() {
                                 // CPU executor shut down. Start stopping.
+                                #[cfg(debug_assertions)]
+                                eprintln!("[uring-io] CPU executor closed, stopping I/O worker");
                                 stopping = true;
                                 st.failed = true;
                                 st.done = true;
@@ -1753,11 +1819,27 @@ fn io_worker_loop<E: ScanEngine>(
                             perf_stats::sat_add_u64(&mut stats.open_stat_fallbacks, 1);
                             let path = match &mut st.phase {
                                 FilePhase::PendingOpen { path } => std::mem::take(path),
-                                _ => PathBuf::new(),
+                                _ => {
+                                    debug_assert!(
+                                        false,
+                                        "Op::Open completion with non-PendingOpen phase"
+                                    );
+                                    st.failed = true;
+                                    st.done = true;
+                                    if st.in_flight == 0 {
+                                        files[op.file_slot] = None;
+                                        free_file_slots.push(op.file_slot);
+                                    }
+                                    continue;
+                                }
                             };
 
                             match blocking_open(&path, &mut stats) {
                                 BlockingOutcome::Ready(read_state) => {
+                                    perf_stats::sat_add_u64(
+                                        &mut stats.bytes_enqueued,
+                                        read_state.size,
+                                    );
                                     st.phase = FilePhase::Ready(read_state);
                                     read_ready.push_back(op.file_slot);
                                 }
@@ -1771,6 +1853,12 @@ fn io_worker_loop<E: ScanEngine>(
                             }
                         } else {
                             stats.files_open_failed = stats.files_open_failed.saturating_add(1);
+                            #[cfg(debug_assertions)]
+                            eprintln!(
+                                "[uring-io] open failed errno={} file={:?}",
+                                -res,
+                                std::str::from_utf8(&st.token.display).unwrap_or("<non-utf8>"),
+                            );
                             st.failed = true;
                             st.done = true;
                         }
@@ -1865,6 +1953,12 @@ fn io_worker_loop<E: ScanEngine>(
                                 st.done = true;
                             }
                         } else {
+                            #[cfg(debug_assertions)]
+                            eprintln!(
+                                "[uring-io] stat failed errno={} file={:?}",
+                                -res,
+                                std::str::from_utf8(&st.token.display).unwrap_or("<non-utf8>"),
+                            );
                             st.failed = true;
                             st.done = true;
                         }
@@ -1897,6 +1991,7 @@ fn io_worker_loop<E: ScanEngine>(
                                     }
                                 };
 
+                                perf_stats::sat_add_u64(&mut stats.bytes_enqueued, size);
                                 st.phase = FilePhase::Ready(ReadState {
                                     file,
                                     size,
@@ -1952,7 +2047,7 @@ fn walk_and_send_files(
     budget: &Arc<CountBudget>,
     tx: &chan::Sender<FileWork>,
     archive_tx: &Option<chan::Sender<ArchiveWork>>,
-    next_file_id: &mut u32,
+    file_ids: &FileIdAllocator,
     summary: &mut LocalFsSummary,
 ) -> io::Result<()> {
     // Use a directory-entry stack instead of a path stack. DirEntry::file_type()
@@ -2027,9 +2122,9 @@ fn walk_and_send_files(
             if let Some(archive_tx) = archive_tx.as_ref() {
                 if let Some(kind) = detect_kind_from_path(&path) {
                     let permit = budget.acquire(1);
-                    let id = *next_file_id;
-                    *next_file_id = next_file_id.checked_add(1).expect("FileId overflow");
-                    let file_id = FileId(id);
+                    let file_id = file_ids
+                        .next_root_file_id()
+                        .ok_or_else(|| io::Error::other("FileId overflow"))?;
                     let display: Arc<[u8]> = path
                         .as_os_str()
                         .as_bytes()
@@ -2059,9 +2154,9 @@ fn walk_and_send_files(
             // Backpressure: blocks until permit available.
             let permit = budget.acquire(1);
 
-            let id = *next_file_id;
-            *next_file_id = next_file_id.checked_add(1).expect("FileId overflow");
-            let file_id = FileId(id);
+            let file_id = file_ids
+                .next_root_file_id()
+                .ok_or_else(|| io::Error::other("FileId overflow"))?;
 
             let display: Arc<[u8]> = path
                 .as_os_str()
@@ -2123,6 +2218,7 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
     let pool = FixedBufferPool::new(buf_len, cfg.pool_buffers);
 
     let file_budget = Arc::new(CountBudget::new(cfg.max_in_flight_files));
+    let file_ids = Arc::new(FileIdAllocator::new(0));
 
     // CPU executor for scanning.
     let ex = Executor::<CpuTask>::new(
@@ -2175,13 +2271,16 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
             let rx = arx.clone();
             let engine = Arc::clone(&engine);
             let event_sink = Arc::clone(&event_sink);
+            let file_ids = Arc::clone(&file_ids);
             let archive_cfg = cfg.archive.clone();
             let dedupe = cfg.dedupe_within_chunk;
 
             archive_threads.push(
                 thread::Builder::new()
                     .name(format!("uring-archive-{wid}"))
-                    .spawn(move || archive_worker_loop(rx, engine, event_sink, archive_cfg, dedupe))
+                    .spawn(move || {
+                        archive_worker_loop(rx, engine, event_sink, file_ids, archive_cfg, dedupe)
+                    })
                     .expect("failed to spawn archive worker thread"),
             );
         }
@@ -2222,7 +2321,6 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
 
     // Discovery walk: DFS, bounded by file_budget + bounded channel.
     let mut summary = LocalFsSummary::default();
-    let mut next_file_id: u32 = 0;
 
     for root in roots {
         walk_and_send_files(
@@ -2231,7 +2329,7 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
             &file_budget,
             &tx,
             &archive_tx,
-            &mut next_file_id,
+            &file_ids,
             &mut summary,
         )?;
         if stop.load(Ordering::Relaxed) {
@@ -2258,6 +2356,8 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
     let mut archive_bytes = 0u64;
     let mut archive_chunks = 0u64;
     let mut archive_findings = 0u64;
+    let mut archive_open_errors = 0u64;
+    let mut archive_scan_errors = 0u64;
     let mut total_archive_stats = ArchiveStats::default();
     for t in archive_threads {
         match t.join() {
@@ -2265,14 +2365,16 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
                 archive_bytes += ws.bytes_scanned;
                 archive_chunks += ws.chunks_scanned;
                 archive_findings += ws.findings_emitted;
+                archive_open_errors += ws.archives_open_failed;
+                archive_scan_errors += ws.archives_scan_errors;
                 total_archive_stats.merge_from(&ws.archive_stats);
             }
             Err(_) => return Err(io::Error::other("archive worker panicked")),
         }
     }
 
-    summary.open_errors = io_stats.files_open_failed;
-    summary.read_errors = io_stats.read_errors;
+    summary.open_errors = io_stats.files_open_failed + archive_open_errors;
+    summary.read_errors = io_stats.read_errors + archive_scan_errors;
     summary.binary_skipped = io_stats.binary_skipped;
 
     // Join CPU executor.

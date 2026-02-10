@@ -3,7 +3,8 @@
 //! Dispatches to the appropriate source driver based on the parsed
 //! CLI configuration:
 //!
-//! - **FS** → `scan_local_fs_uring` on Linux (io_uring), `parallel_scan_dir` elsewhere
+//! - **FS** → `scan_local_fs_uring` on Linux when available and persistence is off;
+//!   otherwise `parallel_scan_dir`
 //! - **Git** → [`run_git_scan`] (pack execution, tree diffs, loose scan)
 //!
 //! Both paths share a common [`EventSink`](super::events::EventSink) for
@@ -31,7 +32,6 @@ use crate::git_scan::{
     self, run_git_scan, GitScanConfig, GitScanResult, InMemoryPersistenceStore, NeverSeenStore,
     StartSetConfig,
 };
-#[cfg(not(target_os = "linux"))]
 use crate::scheduler::parallel_scan_dir;
 use crate::scheduler::ParallelScanConfig;
 use crate::store::{AppendLogStoreProducer, StoreProducer};
@@ -70,10 +70,42 @@ pub fn run(config: ScanConfig) -> io::Result<()> {
     }
 }
 
+#[cfg(any(test, target_os = "linux"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FsBackend {
+    Blocking,
+    Uring,
+}
+
+/// Select the filesystem backend from platform + runtime capabilities.
+///
+/// Linux can use io_uring only when:
+/// - persistence is not requested, and
+/// - io_uring initialization succeeds during preflight.
+#[cfg(any(test, target_os = "linux"))]
+#[inline]
+fn select_fs_backend(
+    is_linux: bool,
+    persist_findings: bool,
+    uring_backend_available: bool,
+) -> FsBackend {
+    if !is_linux || persist_findings || !uring_backend_available {
+        FsBackend::Blocking
+    } else {
+        FsBackend::Uring
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+fn uring_backend_available(ring_entries: u32) -> bool {
+    io_uring::IoUring::new(ring_entries).is_ok()
+}
+
 /// Filesystem scan path.
 ///
-/// On Linux, dispatches to `scan_local_fs_uring` (io_uring-based async I/O).
-/// On other platforms, delegates to `parallel_scan_dir` (blocking I/O).
+/// Uses io_uring on Linux only when it is available and `--persist-findings`
+/// is disabled. Otherwise uses the blocking `parallel_scan_dir` path.
 ///
 /// Findings are emitted as structured JSONL events to stdout via the
 /// [`EventSink`]. Summary stats are written to stderr.
@@ -149,59 +181,81 @@ fn run_fs(
         use crate::scheduler::{scan_local_fs_uring, LocalFsUringConfig};
 
         let defaults = LocalFsUringConfig::default();
-        let io_threads = (cfg.workers / 4).max(2);
-        let io_depth = defaults.io_depth;
-        // pool_buffers must be >= io_threads * io_depth (assertion floor), but
-        // the real requirement is headroom ABOVE that so completed I/O can sit
-        // in the CPU executor queue while I/O threads keep submitting.  Without
-        // headroom every buffer is in-flight and try_acquire() fails, stalling
-        // both I/O submission and the CPU pipeline.
-        let io_pool = io_threads * io_depth;
-        let cpu_headroom = cfg.workers * 4;
-        let pool_buffers = io_pool + cpu_headroom;
+        let backend = select_fs_backend(
+            true,
+            cfg.persist_findings,
+            uring_backend_available(defaults.ring_entries),
+        );
 
-        let uring_cfg = LocalFsUringConfig {
-            cpu_workers: cfg.workers,
-            io_threads,
-            io_depth,
-            chunk_size: ps_config.chunk_size,
-            pool_buffers,
-            max_in_flight_files: ps_config.max_in_flight_objects,
-            max_file_size: Some(ps_config.max_file_size),
-            dedupe_within_chunk: true,
-            seed: ps_config.seed,
-            skip_binary: ps_config.skip_binary,
-            archive: ps_config.archive.clone(),
-            ..defaults
-        };
+        match backend {
+            FsBackend::Uring => {
+                let io_threads = (cfg.workers / 4).max(2);
+                let io_depth = defaults.io_depth;
+                // pool_buffers must be >= io_threads * io_depth (assertion floor), but
+                // the real requirement is headroom ABOVE that so completed I/O can sit
+                // in the CPU executor queue while I/O threads keep submitting.  Without
+                // headroom every buffer is in-flight and try_acquire() fails, stalling
+                // both I/O submission and the CPU pipeline.
+                let io_pool = io_threads * io_depth;
+                let cpu_headroom = cfg.workers * 4;
+                let pool_buffers = io_pool + cpu_headroom;
 
-        let (summary, _io_stats, cpu_metrics) = scan_local_fs_uring(
-            engine,
-            std::slice::from_ref(&cfg.root),
-            uring_cfg,
-            Arc::clone(&event_sink),
-        )?;
+                let uring_cfg = LocalFsUringConfig {
+                    cpu_workers: cfg.workers,
+                    io_threads,
+                    io_depth,
+                    chunk_size: ps_config.chunk_size,
+                    pool_buffers,
+                    max_in_flight_files: ps_config.max_in_flight_objects,
+                    max_file_size: Some(ps_config.max_file_size),
+                    dedupe_within_chunk: true,
+                    seed: ps_config.seed,
+                    skip_binary: ps_config.skip_binary,
+                    archive: ps_config.archive.clone(),
+                    ..defaults
+                };
 
-        let io_errors = summary
-            .walk_errors
-            .saturating_add(summary.open_errors)
-            .saturating_add(summary.read_errors);
+                let (summary, io_stats, cpu_metrics) = scan_local_fs_uring(
+                    Arc::clone(&engine),
+                    std::slice::from_ref(&cfg.root),
+                    uring_cfg,
+                    Arc::clone(&event_sink),
+                )?;
 
-        LocalReport {
-            stats: LocalStats {
-                files_enqueued: summary.files_enqueued,
-                bytes_enqueued: 0,
-                io_errors,
-                dropped_findings: cpu_metrics.findings_dropped,
-                persistence_emit_failures: cpu_metrics.persistence_emit_failures,
-                persistence_incomplete: false,
-            },
-            metrics: cpu_metrics,
+                let io_errors = summary
+                    .walk_errors
+                    .saturating_add(summary.open_errors)
+                    .saturating_add(summary.read_errors);
+
+                LocalReport {
+                    stats: LocalStats {
+                        files_enqueued: summary.files_enqueued,
+                        bytes_enqueued: io_stats.bytes_enqueued,
+                        io_errors,
+                        dropped_findings: cpu_metrics.findings_dropped,
+                        persistence_emit_failures: cpu_metrics.persistence_emit_failures,
+                        persistence_incomplete: false,
+                    },
+                    metrics: cpu_metrics,
+                }
+            }
+            FsBackend::Blocking => {
+                if cfg.persist_findings {
+                    eprintln!(
+                        "info: using blocking FS backend on Linux because --persist-findings is enabled"
+                    );
+                } else {
+                    eprintln!(
+                        "info: io_uring backend unavailable; falling back to blocking FS backend"
+                    );
+                }
+                parallel_scan_dir(&cfg.root, Arc::clone(&engine), ps_config)?
+            }
         }
     };
 
     #[cfg(not(target_os = "linux"))]
-    let report = parallel_scan_dir(&cfg.root, engine, ps_config)?;
+    let report = parallel_scan_dir(&cfg.root, Arc::clone(&engine), ps_config)?;
 
     let scan_elapsed = scan_start.elapsed();
     let total_elapsed = t0.elapsed();
@@ -767,5 +821,34 @@ mod tests {
     fn filter_none_on_empty_input() {
         let result = apply_transform_filter(vec![], &TransformFilter::All);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn fs_backend_non_linux_is_blocking() {
+        assert_eq!(select_fs_backend(false, false, true), FsBackend::Blocking);
+        assert_eq!(select_fs_backend(false, true, false), FsBackend::Blocking);
+    }
+
+    #[test]
+    fn fs_backend_linux_with_persistence_uses_blocking() {
+        assert_eq!(
+            select_fs_backend(true, true, true),
+            FsBackend::Blocking,
+            "persistence path must use blocking backend until io_uring persistence is wired"
+        );
+    }
+
+    #[test]
+    fn fs_backend_linux_without_uring_falls_back_to_blocking() {
+        assert_eq!(
+            select_fs_backend(true, false, false),
+            FsBackend::Blocking,
+            "io_uring unavailability must fall back to blocking backend"
+        );
+    }
+
+    #[test]
+    fn fs_backend_linux_uring_when_available_and_no_persistence() {
+        assert_eq!(select_fs_backend(true, false, true), FsBackend::Uring);
     }
 }

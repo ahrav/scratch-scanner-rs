@@ -59,6 +59,7 @@
 //! | Module | Purpose |
 //! |--------|---------|
 //! | [`count_budget`] | Integer-based permits (e.g., max concurrent fetches) |
+//! | `file_id_alloc` | Run-scoped `FileId` allocator for unique logical file boundaries |
 //! | [`findings`] | Per-worker finding buffers with dedup via [`SecretHash`] |
 //! | [`ts_buffer_pool`] | Thread-safe buffer recycling to avoid allocation churn |
 //! | [`ts_chunk`] | Thread-safe chunk wrapper for cross-thread handoff |
@@ -218,6 +219,8 @@ pub mod count_budget;
 pub mod engine_impl;
 pub mod engine_stub;
 pub mod engine_trait;
+#[cfg(any(target_os = "linux", test))]
+pub(crate) mod file_id_alloc;
 pub mod findings;
 pub mod ts_buffer_pool;
 pub mod ts_chunk;
