@@ -650,10 +650,23 @@ fn emit_persistence_batch<F: FindingWithHashRecord>(
     }
 
     build_persistence_batch(findings, persist_batch);
-    if let Err(err) = producer.emit_fs_batch(FsFindingBatch {
+
+    #[cfg(all(feature = "perf-stats", debug_assertions))]
+    let persist_t0 = std::time::Instant::now();
+
+    let emit_result = producer.emit_fs_batch(FsFindingBatch {
         object_path: path,
         findings: persist_batch.as_slice(),
-    }) {
+    });
+
+    #[cfg(all(feature = "perf-stats", debug_assertions))]
+    {
+        metrics.persist_ns = metrics
+            .persist_ns
+            .saturating_add(persist_t0.elapsed().as_nanos() as u64);
+    }
+
+    if let Err(err) = emit_result {
         metrics.persistence_emit_failures = metrics.persistence_emit_failures.saturating_add(1);
         let mut msg = StackMsg::<256>::new();
         let _ = std::fmt::Write::write_fmt(
