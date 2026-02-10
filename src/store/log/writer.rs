@@ -1404,6 +1404,25 @@ pub fn recover_open_segments(
             let (recovered_len, stop_reason) =
                 scan_recovery_boundary(&mut file, max_frame_payload_bytes)?;
             let recovered_len = recovered_len.min(original_len);
+            drop(file);
+
+            // No valid frames: discard the file instead of creating a
+            // confusing 0-byte `.bin`.
+            if recovered_len == 0 {
+                fs::remove_file(&open_path)
+                    .map_err(|e| io_to_store_err_at(e, &open_path))?;
+                report.entries.push(OpenSegmentRecoveryEntry {
+                    open_path,
+                    bin_path,
+                    outcome: OpenSegmentRecoveryOutcome::DiscardedEmpty {
+                        original_len,
+                        stop_reason,
+                    },
+                });
+                continue;
+            }
+
+            // Re-open for truncation and sync if needed.
             if recovered_len < original_len {
                 let file = OpenOptions::new()
                     .write(true)
@@ -1411,8 +1430,11 @@ pub fn recover_open_segments(
                     .map_err(|e| io_to_store_err_at(e, &open_path))?;
                 file.set_len(recovered_len)
                     .map_err(|e| io_to_store_err_at(e, &open_path))?;
+                file.sync_data()
+                    .map_err(|e| io_to_store_err_at(e, &open_path))?;
             }
-             fs::rename(&open_path, &bin_path)
+
+            fs::rename(&open_path, &bin_path)
                 .map_err(|e| io_to_store_err_at(e, &bin_path))?;
             sync_dir(&seg_dir).map_err(|e| io_to_store_err_at(e, &seg_dir))?;
 
@@ -2587,7 +2609,8 @@ mod tests {
                 assert!(truncated_bytes > 0);
                 assert_eq!(stop_reason, Some(LogReadErrorReason::Truncated));
             }
-            OpenSegmentRecoveryOutcome::DiscardedDuplicateBin => {
+            OpenSegmentRecoveryOutcome::DiscardedDuplicateBin
+            | OpenSegmentRecoveryOutcome::DiscardedEmpty { .. } => {
                 panic!("expected recovered outcome")
             }
         }
@@ -2661,7 +2684,8 @@ mod tests {
                 assert_eq!(stop_reason, Some(LogReadErrorReason::CrcMismatch));
                 stop_reason
             }
-            OpenSegmentRecoveryOutcome::DiscardedDuplicateBin => {
+            OpenSegmentRecoveryOutcome::DiscardedDuplicateBin
+            | OpenSegmentRecoveryOutcome::DiscardedEmpty { .. } => {
                 panic!("expected recovered outcome")
             }
         };
@@ -2749,7 +2773,8 @@ mod tests {
                 assert_eq!(truncated_bytes, 0);
                 assert_eq!(stop_reason, None);
             }
-            OpenSegmentRecoveryOutcome::DiscardedDuplicateBin => {
+            OpenSegmentRecoveryOutcome::DiscardedDuplicateBin
+            | OpenSegmentRecoveryOutcome::DiscardedEmpty { .. } => {
                 panic!("expected recovered outcome")
             }
         }
@@ -3281,7 +3306,8 @@ mod tests {
                 assert_eq!(truncated_bytes, 0);
                 assert_eq!(stop_reason, None);
             }
-            OpenSegmentRecoveryOutcome::DiscardedDuplicateBin => {
+            OpenSegmentRecoveryOutcome::DiscardedDuplicateBin
+            | OpenSegmentRecoveryOutcome::DiscardedEmpty { .. } => {
                 panic!("expected recovered outcome")
             }
         }
@@ -3324,7 +3350,8 @@ mod tests {
                 assert_eq!(truncated_bytes, 0);
                 assert_eq!(stop_reason, None);
             }
-            OpenSegmentRecoveryOutcome::DiscardedDuplicateBin => {
+            OpenSegmentRecoveryOutcome::DiscardedDuplicateBin
+            | OpenSegmentRecoveryOutcome::DiscardedEmpty { .. } => {
                 panic!("expected recovered outcome")
             }
         }
