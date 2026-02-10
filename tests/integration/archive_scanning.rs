@@ -2002,6 +2002,9 @@ fn sniff_detected_gzip_archive_emits_findings() {
 
 /// File with no archive extension but valid tar ustar header (>= 512 bytes)
 /// should be detected via header sniffing and produce findings.
+///
+/// Tar ustar detection requires 512 bytes in the first read so
+/// `chunk_size` must be >= `TAR_BLOCK_LEN`.
 #[test]
 fn sniff_detected_tar_archive_emits_findings() {
     let tmp = TempDir::new().unwrap();
@@ -2015,7 +2018,12 @@ fn sniff_detected_tar_archive_emits_findings() {
     );
     fs::write(&path, tar_bytes).unwrap();
 
-    let (out, report) = run_scan(vec![file_from_path(&path)], cfg_archives_enabled());
+    // Tar ustar magic lives at offset 257, so the first read must be
+    // >= 512 bytes for sniff_kind_from_header to detect it.
+    let mut cfg = cfg_archives_enabled();
+    cfg.chunk_size = 1024; // ensure first read covers the full tar header
+
+    let (out, report) = run_scan(vec![file_from_path(&path)], cfg);
     let findings = parse_findings(&out);
 
     assert!(
