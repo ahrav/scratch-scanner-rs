@@ -506,7 +506,7 @@ impl StoreProducer for AppendLogStoreProducer {
             .inner
             .tx
             .as_ref()
-            .map_or(false, |tx| tx.send(WriterCommand::Finish { frame }).is_ok());
+            .is_some_and(|tx| tx.send(WriterCommand::Finish { frame }).is_ok());
         if !send_ok {
             set_terminal_error(
                 &self.inner.shared,
@@ -854,10 +854,7 @@ impl SegmentWriter {
         {
             self.finalize_current()?;
             self.seq = self.seq.checked_add(1).ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "segment sequence number overflow",
-                )
+                std::io::Error::other("segment sequence number overflow")
             })?;
             let (file, open_path) = open_segment_file(&self.segments_dir, self.seq)?;
             self.file = file;
@@ -2361,7 +2358,10 @@ mod tests {
         // This second write should trigger rotation (32 + 64 > 64),
         // which increments seq from u64::MAX → overflow.
         let result = sw.write_frame(&[0u8; 64], false);
-        assert!(result.is_err(), "expected error on sequence overflow, not panic");
+        assert!(
+            result.is_err(),
+            "expected error on sequence overflow, not panic"
+        );
         let err = result.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::Other);
     }
@@ -2414,11 +2414,8 @@ mod tests {
         let object_path = b"test/round-trip.txt";
 
         // Compute expected finding_ids independently using the same derivation.
-        let prefix_hasher = finding_id_prefix_hasher(
-            keys.metadata_key(),
-            object_path.len() as u32,
-            object_path,
-        );
+        let prefix_hasher =
+            finding_id_prefix_hasher(keys.metadata_key(), object_path.len() as u32, object_path);
         let expected_finding_id_a = derive_finding_id(
             &prefix_hasher,
             &findings[0],
@@ -2453,7 +2450,11 @@ mod tests {
             }
         }
 
-        assert_eq!(decoded_batches.len(), 1, "expected exactly one finding batch");
+        assert_eq!(
+            decoded_batches.len(),
+            1,
+            "expected exactly one finding batch"
+        );
         let batch = &decoded_batches[0];
         assert_eq!(batch.object_path, object_path);
         assert_eq!(batch.findings.len(), 2);
@@ -2461,9 +2462,18 @@ mod tests {
         // Finding A: verify every field.
         let fa = &batch.findings[0];
         assert_eq!(fa.rule_id, 0);
-        assert_eq!(fa.rule_fingerprint, expected_rule_fp, "rule_fingerprint mismatch (finding A)");
-        assert_eq!(fa.secret_hash, expected_secret_a, "secret_hash mismatch (finding A)");
-        assert_eq!(fa.finding_id, expected_finding_id_a, "finding_id mismatch (finding A)");
+        assert_eq!(
+            fa.rule_fingerprint, expected_rule_fp,
+            "rule_fingerprint mismatch (finding A)"
+        );
+        assert_eq!(
+            fa.secret_hash, expected_secret_a,
+            "secret_hash mismatch (finding A)"
+        );
+        assert_eq!(
+            fa.finding_id, expected_finding_id_a,
+            "finding_id mismatch (finding A)"
+        );
         assert_eq!(fa.root_hint_start, 100);
         assert_eq!(fa.root_hint_end, 200);
         assert_eq!(fa.span_start, 110);
@@ -2472,9 +2482,18 @@ mod tests {
         // Finding B: verify every field.
         let fb = &batch.findings[1];
         assert_eq!(fb.rule_id, 0);
-        assert_eq!(fb.rule_fingerprint, expected_rule_fp, "rule_fingerprint mismatch (finding B)");
-        assert_eq!(fb.secret_hash, expected_secret_b, "secret_hash mismatch (finding B)");
-        assert_eq!(fb.finding_id, expected_finding_id_b, "finding_id mismatch (finding B)");
+        assert_eq!(
+            fb.rule_fingerprint, expected_rule_fp,
+            "rule_fingerprint mismatch (finding B)"
+        );
+        assert_eq!(
+            fb.secret_hash, expected_secret_b,
+            "secret_hash mismatch (finding B)"
+        );
+        assert_eq!(
+            fb.finding_id, expected_finding_id_b,
+            "finding_id mismatch (finding B)"
+        );
         assert_eq!(fb.root_hint_start, 300);
         assert_eq!(fb.root_hint_end, 400);
         assert_eq!(fb.span_start, 310);
