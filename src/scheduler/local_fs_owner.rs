@@ -386,13 +386,10 @@ struct LocalScratch<E: ScanEngine> {
     /// When `true`, skip files that appear to be binary.
     skip_binary: bool,
     /// Reusable buffer for reading extractable binary files (input).
-    #[cfg(feature = "binary-extract")]
     extract_buf: Vec<u8>,
     /// Reusable buffer for extraction output.
-    #[cfg(feature = "binary-extract")]
     extract_out_buf: Vec<u8>,
     /// Temporary workspace for extractors (e.g. per-entry reads in JARs).
-    #[cfg(feature = "binary-extract")]
     extract_scratch: Vec<u8>,
 }
 
@@ -4362,7 +4359,7 @@ mod tests {
         // found.
         let mut data = vec![b'A'; 97];
         data.extend_from_slice(b"SECRET");
-        data.extend_from_slice(&vec![b'B'; 100]); // ensure second chunk read
+        data.extend_from_slice(&[b'B'; 100]); // ensure second chunk read
 
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(&data).unwrap();
