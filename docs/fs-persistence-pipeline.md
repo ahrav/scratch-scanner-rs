@@ -25,7 +25,7 @@ emits). The consumer side (actual backend storage) is plugged in via the
 | Module | Scope | Purpose |
 |--------|-------|---------|
 | `src/store/fs.rs` | FS persistence producer | Write-side trait + data types for FS scan findings |
-| `src/store/log/format.rs` | FS log codec | Framed on-disk record format (`len + crc32 + type + payload`) |
+| `src/store/log/format.rs` | FS log codec | Framed on-disk record format (V1 + V2, position-bound CRC, segment trailer) |
 | `src/store/log/reader.rs` | FS log reader | Streaming frame decoder with reason-coded errors and `.open` recovery |
 | `src/store/log/writer.rs` | FS append-log backend | Bounded single-writer runtime with `.open` -> `.bin` finalize |
 | `src/store/identity.rs` | Identity contracts | Stable `RuleFingerprint`, `SecretHash`, `OccurrenceId` derivation |
@@ -202,23 +202,33 @@ Example: scanning `/data/repos/myproject` creates
 
 #### Binary Frame Format
 
-Every record is wrapped in a self-describing frame with an 8-byte header:
+Every record is wrapped in a self-describing frame with an 8-byte header.
+Readers accept both legacy V1 and current V2 frames:
 
 ```text
+V1 body:
  byte:  0       4       8    9                     N
         ┌───────┬───────┬────┬──────────────────────┐
         │ len   │ CRC32 │type│      payload          │
         │ u32le │ u32le │ u8 │   [len − 1] bytes     │
         └───────┴───────┴────┴──────────────────────┘
-         header (8 B)         body (len bytes)
+
+V2 body (position-bound CRC):
+ byte:  0       4       8          16         24   25                 N
+        ┌───────┬───────┬──────────┬──────────┬────┬──────────────────┐
+        │len|F2 │ CRC32 │frame_seq │segment_id│type│payload            │
+        │ u32le │ u32le │  u64le   │  u64le   │ u8 │ [len − 17] bytes  │
+        └───────┴───────┴──────────┴──────────┴────┴──────────────────┘
 ```
 
 | Field | Bytes | Encoding | Description |
 |-------|-------|----------|-------------|
-| `frame_len` | 0–3 | `u32_le` | Byte count of type + payload (body excluding header). Always ≥ 1. |
-| `crc32` | 4–7 | `u32_le` | CRC-32/ISO-HDLC (polynomial `0x04C11DB7`, zlib-compatible) over the type byte + payload. Verified before any parsing. |
-| `type` | 8 | `u8` | `FrameType` discriminant: `1`=RunStart, `2`=RuleDef, `3`=FindingBatch, `4`=RunEnd. |
-| `payload` | 9+ | variable | Record-specific bytes. Variable-length fields are length-prefixed with `u32_le`. |
+| `frame_len` | 0–3 | `u32_le` | Body length excluding header. In V2 the high bit (`F2`) is set; the lower 31 bits hold body length. |
+| `crc32` | 4–7 | `u32_le` | CRC-32/ISO-HDLC over the entire body. In V2 this includes `frame_seq` + `segment_id` + `type` + payload. |
+| `frame_seq` (V2) | 8–15 | `u64_le` | Monotonic per-run frame counter. |
+| `segment_id` (V2) | 16–23 | `u64_le` | Segment sequence number where the frame is committed. |
+| `type` | 8 (V1), 24 (V2) | `u8` | `FrameType`: `1`=RunStart, `2`=RuleDef, `3`=FindingBatch, `4`=RunEnd. |
+| `payload` | 9+ (V1), 25+ (V2) | variable | Record-specific bytes. Variable fields are length-prefixed with `u32_le`. |
 
 Invariants:
 - All multi-byte integers are little-endian.
@@ -231,7 +241,7 @@ Invariants:
 
 ```text
 offset  size   field
-  0     u16    version               (LOG_FORMAT_VERSION = 1)
+  0     u16    version               (LOG_FORMAT_VERSION = 2, readers accept 1..=2)
   2     u64    run_id
  10     u64    started_unix_ms
  18     u8     durability            (0 = SegmentClose, 1 = Batch)
@@ -288,9 +298,27 @@ offset  size   field
   0     u64    ended_unix_ms
   8     u64    dropped_findings      (engine cap drops)
  16     u64    persistence_emit_failures
- 24     u8     incomplete            (1 if any loss, 0 otherwise)
+  24     u8     incomplete            (1 if any loss, 0 otherwise)
                                      total: 25 bytes payload
 ```
+
+#### Segment Integrity Trailer (V2)
+
+Finalized `.bin` segments append a fixed trailer after the last frame:
+
+```text
+offset  size   field
+  0     [8]    magic                ("SCRSEGv2")
+  8     u64    segment_id
+ 16     u64    frame_count           (# of frames in this segment)
+ 24     u64    total_frame_bytes     (sum of frame byte lengths, excludes trailer)
+ 32     [32]   frame_crc_chain       (BLAKE3 chain over per-frame crc32 values)
+                                     total: 64 bytes
+```
+
+Readers validate trailer fields against observed frame stream state when
+present. `.open` files may not contain a trailer; recovery scans treat clean
+EOF at a frame boundary as valid for `.open`.
 
 #### Run Content Ordering
 
@@ -336,7 +364,7 @@ reason-coded failures via `LogReadError`:
 | `CrcMismatch` | Frame CRC does not match payload bytes |
 | `Truncated` | EOF before full header/body completion |
 | `UnsupportedFrame` | Unknown frame discriminant |
-| `UnsupportedVersion` | `RunStart.version` is not `LOG_FORMAT_VERSION` |
+| `UnsupportedVersion` | `RunStart.version` is outside supported range (`1..=LOG_FORMAT_VERSION`) |
 | `MalformedFrame` | Invalid frame shape or payload fields |
 | `Io` | Underlying read error from the transport |
 
@@ -369,11 +397,13 @@ truncation metadata for audit/telemetry.
 #### Segment Rotation
 
 Segments rotate when writing a frame would exceed `max_segment_bytes`
-(default **64 MB**):
+*after reserving trailer space* (default **64 MB**):
 
 ```text
 write_frame(data):
-    if bytes_written > 0 AND bytes_written + len(data) > max_segment_bytes:
+    trailer_bytes = 64
+    if bytes_written > 0 AND bytes_written + len(data) + trailer_bytes > max_segment_bytes:
+        append trailer(frame_count, total_frame_bytes, frame_crc_chain)
         sync_data()              ← flush to disk
         rename .open → .bin      ← atomic finalization
         sync_dir()               ← directory entry durable
@@ -384,7 +414,7 @@ write_frame(data):
 ```
 
 A single frame is never split across segments. Frames larger than
-`max_segment_bytes` are rejected outright.
+`max_segment_bytes - trailer_bytes` are rejected outright.
 
 #### Durability Modes
 
@@ -409,8 +439,8 @@ Default: `SegmentClose`.
 | `durability` | `SegmentClose` | fsync strategy |
 
 Validation rejects: any zero-valued budget, `max_inflight_batches` > `u32::MAX`
-(wire format limit), and `max_frame_payload_bytes` + 8 (header) + 1 (type byte) >
-`max_segment_bytes` (a frame must fit in a segment).
+(wire format limit), and segment sizes that cannot fit at least one minimal
+V2 frame plus the 64-byte segment trailer.
 
 #### Backpressure
 

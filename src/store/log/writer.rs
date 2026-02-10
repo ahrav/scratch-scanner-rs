@@ -12,10 +12,10 @@
 //!  emit_fs_batch()                  ┌──────────────────────┐
 //!    ├─ plan + reserve inflight ─►  │ writer_thread_main()  │
 //!    ├─ acquire pooled frame        │  ├─ write RunStart    │
-//!    ├─ encode finding frame        │  ├─ write RuleDefs    │
+//!    ├─ encode finding payload      │  ├─ write RuleDefs    │
 //!    └─ send on channel    ──►      │  ├─ recv loop:        │
 //!  record_fs_run_loss()             │  │  write FindingFrame │
-//!    ├─ encode run-end frame        │  │  recycle frame      │
+//!    ├─ build run-end record        │  │  bind seq+segment   │
 //!    ├─ send Finish cmd    ──►      │  │  release_inflight() │
 //!    └─ join writer thread          │  └─ write RunEnd + finalize
 //!                                   └──────────────────────┘
@@ -35,12 +35,17 @@
 //!
 //! Files are created as `segment-<20-digit-seq>.open` and renamed to `.bin` on
 //! segment close (`sync_data` + rename + `sync_dir`). The writer rotates
-//! to a new segment when `bytes_written + frame_len > max_segment_bytes`.
+//! to a new segment when `bytes_written + frame_len + trailer_bytes >
+//! max_segment_bytes`, so every finalized segment can append its integrity
+//! trailer (`frame_count`, `total_frame_bytes`, BLAKE3 CRC chain).
 //! After a clean shutdown, no `.open` files remain.
 
 use super::format::{
-    encode_record, FrameType, LogDurabilityMode, LogRecord, LogRuleDef, LogRunEnd, LogRunStart,
-    DEFAULT_MAX_FRAME_PAYLOAD_BYTES, FRAME_HEADER_BYTES, LOG_FORMAT_VERSION,
+    append_segment_trailer, encode_record_with_position, extend_frame_crc_chain,
+    finalize_v2_frame_in_place, frame_crc_from_header, FramePosition, FrameType, LogDurabilityMode,
+    LogRecord, LogRuleDef, LogRunEnd, LogRunStart, SegmentTrailer, DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+    FRAME_HEADER_BYTES, FRAME_V2_LEN_FLAG, FRAME_V2_POSITION_BYTES, LOG_FORMAT_VERSION,
+    SEGMENT_TRAILER_BYTES,
 };
 use super::reader::{LogReadErrorReason, LogReader};
 use super::secret_cache::SecretHashCache;
@@ -96,7 +101,7 @@ pub const SCANNER_FS_LOG_DIR_ENV: &str = "SCANNER_FS_LOG_DIR";
 ///
 /// All budget and size fields are validated at construction time by
 /// [`validate_config`]. The cross-field invariant
-/// `max_frame_payload_bytes + FRAME_HEADER_BYTES + 1 <= max_segment_bytes`
+/// `max_frame_payload_bytes + V2 frame overhead + trailer <= max_segment_bytes`
 /// is enforced so that no single frame can exceed a segment.
 #[derive(Clone, Debug)]
 pub struct LogWriterConfig {
@@ -273,10 +278,11 @@ impl AppendLogStoreProducer {
         }
 
         let body_len = payload_len
-            .checked_add(1)
+            .checked_add(1 + FRAME_V2_POSITION_BYTES)
             .ok_or_else(|| FsStoreError::backend("finding frame body length overflow"))?;
         let body_len_u32 = u32::try_from(body_len)
             .map_err(|_| FsStoreError::backend("finding frame body exceeds u32::MAX"))?;
+        let body_len_word = FRAME_V2_LEN_FLAG | body_len_u32;
         let frame_len = FRAME_HEADER_BYTES
             .checked_add(body_len)
             .ok_or_else(|| FsStoreError::backend("finding frame length overflow"))?;
@@ -285,7 +291,7 @@ impl AppendLogStoreProducer {
             object_path_len,
             findings_count_u32,
             body_len,
-            body_len_u32,
+            body_len_word,
             frame_len,
         })
     }
@@ -295,24 +301,25 @@ impl AppendLogStoreProducer {
     /// Unlike `RunStart`/`RuleDef`/`RunEnd` frames (which go through
     /// [`encode_record`]), finding frames are built inline here to avoid an
     /// intermediate `LogFindingBatch` allocation. The resulting buffer is
-    /// ready for `SegmentWriter::write_frame` with no further copies.
+    /// ready for writer-thread position binding and disk write with no
+    /// additional payload re-encoding.
     ///
     /// # Wire layout
     ///
     /// ```text
-    /// ┌──────────────┬──────────┬───────────────┬────────────────────┬─────────────┐
-    /// │ frame_len(4) │ crc32(4) │ type_byte(1)  │ object_path_len(4) │ object_path │
-    /// ├──────────────┴──────────┴───────────────┴────────────────────┴─────────────┤
-    /// │ findings_count(4)                                                          │
-    /// ├───────────────────────────────────────────────────────────────────────────--┤
+    /// ┌──────────────┬──────────┬──────────────┬──────────────────────┬───────────────┐
+    /// │ frame_len(4) │ crc32(4) │ frame_seq(8) │ segment_id(8)        │ type_byte(1)  │
+    /// ├──────────────┴──────────┴──────────────┴──────────────────────┴───────────────┤
+    /// │ object_path_len(4) │ object_path │ findings_count(4)                         │
+    /// ├──────────────────────────────────────────────────────────────────────────────┤
     /// │ per finding × N:                                                           │
     /// │   rule_id(4) | rule_fp(32) | secret(32) | finding_id(32)                   │
     /// │   | root_hint_start(8) | root_hint_end(8) | span_start(8) | span_end(8)   │
-    /// └───────────────────────────────────────────────────────────────────────────--┘
+    /// └──────────────────────────────────────────────────────────────────────────────┘
     /// ```
     ///
-    /// CRC-32 covers `type_byte .. end` (the entire body). The `frame_len`
-    /// field stores `body_len` (= 1 + payload), not `total_len`.
+    /// The writer thread patches `frame_seq`/`segment_id`, then computes CRC-32
+    /// over the entire body (`frame_seq .. end`) immediately before disk write.
     fn build_finding_frame(
         &self,
         batch: FsFindingBatch<'_>,
@@ -324,12 +331,12 @@ impl AppendLogStoreProducer {
             frame.reserve(plan.frame_len - frame.capacity());
         }
 
-        // Reserve space for frame header (body_len + crc32), filled in at the end.
-        frame.resize(FRAME_HEADER_BYTES, 0);
+        // Reserve space for frame header (frame_len + crc32) and position fields.
+        // `crc32`, `frame_seq`, and `segment_id` are patched by the writer thread.
+        frame.resize(FRAME_HEADER_BYTES + FRAME_V2_POSITION_BYTES, 0);
 
-        // Build the entire body without CRC tracking — we compute CRC in a
-        // single pass over the contiguous buffer at the end, which lets
-        // crc32fast use full hardware acceleration (SSE4.2/ARM CRC).
+        // Build the entire body without CRC tracking. The writer thread later
+        // patches position fields and computes CRC over the full body.
         frame.push(FrameType::FindingBatch as u8);
         frame.extend_from_slice(&plan.object_path_len.to_le_bytes());
         frame.extend_from_slice(batch.object_path);
@@ -362,27 +369,21 @@ impl AppendLogStoreProducer {
             frame.extend_from_slice(&finding.span_end.to_le_bytes());
         }
 
-        // Single-pass CRC over the entire body (type byte + payload).
-        let crc32 = crc32fast::hash(&frame[FRAME_HEADER_BYTES..]);
-        frame[..4].copy_from_slice(&plan.body_len_u32.to_le_bytes());
-        frame[4..FRAME_HEADER_BYTES].copy_from_slice(&crc32.to_le_bytes());
+        frame[..4].copy_from_slice(&plan.body_len_word.to_le_bytes());
+        frame[4..FRAME_HEADER_BYTES].copy_from_slice(&0u32.to_le_bytes());
 
         debug_assert_eq!(frame.len(), FRAME_HEADER_BYTES + plan.body_len);
         Ok(())
     }
 
-    /// Encode a `RunEnd` frame via the generic [`encode_record`] path.
-    fn build_run_end_frame(&self, loss: FsRunLoss) -> Result<Vec<u8>, FsStoreError> {
-        let record = LogRecord::RunEnd(LogRunEnd {
+    /// Build the run-end payload written during `Finish`.
+    fn build_run_end_record(&self, loss: FsRunLoss) -> LogRunEnd {
+        LogRunEnd {
             ended_unix_ms: now_unix_ms(),
             dropped_findings: loss.dropped_findings,
             persistence_emit_failures: loss.persistence_emit_failures,
             incomplete: loss.incomplete(),
-        });
-        let mut frame = Vec::with_capacity(128);
-        encode_record(&record, self.inner.cfg.max_frame_payload_bytes, &mut frame)
-            .map_err(map_format_err)?;
-        Ok(frame)
+        }
     }
 
     /// Block until both inflight budgets (batch count and byte count) have
@@ -516,7 +517,7 @@ impl StoreProducer for AppendLogStoreProducer {
     /// writer thread's exit so that blocked emitters can drain naturally
     /// via `release_inflight` rather than receiving spurious "closed" errors.
     fn record_fs_run_loss(&self, loss: FsRunLoss) -> Result<(), FsStoreError> {
-        let frame = self.build_run_end_frame(loss)?;
+        let run_end = self.build_run_end_record(loss);
 
         // NOTE: we intentionally do NOT call mark_closed() here. The writer
         // thread already calls mark_closed() (or set_terminal_error()) when
@@ -545,7 +546,7 @@ impl StoreProducer for AppendLogStoreProducer {
             .inner
             .tx
             .as_ref()
-            .is_some_and(|tx| tx.send(WriterCommand::Finish { frame }).is_ok());
+            .is_some_and(|tx| tx.send(WriterCommand::Finish { run_end }).is_ok());
         if !send_ok {
             set_terminal_error(
                 &self.inner.shared,
@@ -652,7 +653,7 @@ struct FindingFramePlan {
     object_path_len: u32,
     findings_count_u32: u32,
     body_len: usize,
-    body_len_u32: u32,
+    body_len_word: u32,
     frame_len: usize,
 }
 
@@ -742,8 +743,8 @@ enum WriterCommand {
         /// frame (used when `durability == Batch`).
         flush_after: bool,
     },
-    /// Shutdown: write the pre-encoded `RunEnd` frame and finalize.
-    Finish { frame: Vec<u8> },
+    /// Shutdown: write `RunEnd` and finalize.
+    Finish { run_end: LogRunEnd },
 }
 
 /// Writer thread entry point.
@@ -769,38 +770,41 @@ fn writer_thread_main(
     let mut segment_writer =
         SegmentWriter::new(segments_dir, cfg.max_segment_bytes).map_err(|e| e.to_string())?;
 
+    let mut next_frame_seq = 0u64;
     let mut frame = Vec::with_capacity(512);
-    encode_record(
+    write_record_v2(
+        &mut segment_writer,
+        &mut next_frame_seq,
         &LogRecord::RunStart(run_start),
         cfg.max_frame_payload_bytes,
+        false,
         &mut frame,
-    )
-    .map_err(|e| e.to_string())?;
-    segment_writer
-        .write_frame(&frame, false)
-        .map_err(|e| e.to_string())?;
+    )?;
 
     for rule_def in rule_defs_sorted {
-        frame.clear();
-        encode_record(
+        write_record_v2(
+            &mut segment_writer,
+            &mut next_frame_seq,
             &LogRecord::RuleDef(rule_def),
             cfg.max_frame_payload_bytes,
+            false,
             &mut frame,
-        )
-        .map_err(|e| e.to_string())?;
-        segment_writer
-            .write_frame(&frame, false)
-            .map_err(|e| e.to_string())?;
+        )?;
     }
 
     loop {
         match rx.recv() {
             Ok(WriterCommand::FindingFrame {
-                frame,
+                mut frame,
                 charge_bytes,
                 flush_after,
             }) => {
-                let write_result = segment_writer.write_frame(&frame, flush_after);
+                let write_result = write_prebuilt_v2_frame(
+                    &mut segment_writer,
+                    &mut next_frame_seq,
+                    &mut frame,
+                    flush_after,
+                );
                 if let Some(delay) = cfg.write_delay {
                     std::thread::sleep(delay);
                 }
@@ -812,10 +816,16 @@ fn writer_thread_main(
                     return Err(format!("failed to write finding frame: {err}"));
                 }
             }
-            Ok(WriterCommand::Finish { frame }) => {
-                segment_writer
-                    .write_frame(&frame, false)
-                    .map_err(|e| format!("failed to write run-end frame: {e}"))?;
+            Ok(WriterCommand::Finish { run_end }) => {
+                write_record_v2(
+                    &mut segment_writer,
+                    &mut next_frame_seq,
+                    &LogRecord::RunEnd(run_end),
+                    cfg.max_frame_payload_bytes,
+                    false,
+                    &mut frame,
+                )
+                .map_err(|e| format!("failed to write run-end frame: {e}"))?;
                 segment_writer
                     .finish()
                     .map_err(|e| format!("failed to finalize segment: {e}"))?;
@@ -830,6 +840,85 @@ fn writer_thread_main(
             }
         }
     }
+}
+
+/// Encode a [`LogRecord`] into a V2 frame and write it to disk.
+///
+/// Handles the full encode → position-bind → CRC → write pipeline for
+/// non-finding records (`RunStart`, `RuleDef`, `RunEnd`). The record is
+/// first encoded with a placeholder position, then the writer obtains the
+/// real `segment_id` from [`SegmentWriter::prepare_for_frame`] (which may
+/// trigger rotation), assigns a monotonic `frame_seq`, patches the position
+/// prefix and CRC via [`finalize_v2_frame_in_place`], and finally writes
+/// the completed frame.
+fn write_record_v2(
+    segment_writer: &mut SegmentWriter,
+    next_frame_seq: &mut u64,
+    record: &LogRecord,
+    max_frame_payload_bytes: u32,
+    flush_after: bool,
+    frame_buf: &mut Vec<u8>,
+) -> Result<(), String> {
+    frame_buf.clear();
+    encode_record_with_position(
+        record,
+        max_frame_payload_bytes,
+        FramePosition::default(),
+        frame_buf,
+    )
+    .map_err(|e| format!("failed to encode frame payload: {e}"))?;
+    let segment_id = segment_writer
+        .prepare_for_frame(frame_buf.len() as u64)
+        .map_err(|e| format!("failed to prepare segment: {e}"))?;
+    let frame_seq = *next_frame_seq;
+    *next_frame_seq = next_frame_seq
+        .checked_add(1)
+        .ok_or_else(|| "frame sequence overflow".to_string())?;
+    finalize_v2_frame_in_place(
+        frame_buf,
+        FramePosition {
+            frame_seq,
+            segment_id,
+        },
+    )
+    .map_err(|e| format!("failed to patch v2 frame: {e}"))?;
+    segment_writer
+        .write_prepared_frame(frame_buf, flush_after)
+        .map_err(|e| format!("failed to write v2 frame: {e}"))?;
+    Ok(())
+}
+
+/// Write a pre-encoded V2 frame (finding batch) to disk.
+///
+/// Unlike [`write_record_v2`], the frame body is already fully serialized
+/// by [`AppendLogStoreProducer::build_finding_frame`] on the producer
+/// thread. This function only binds the position (`frame_seq` +
+/// `segment_id`), recomputes the CRC, and writes. Keeping serialization on
+/// the producer side avoids holding the segment writer during encoding.
+fn write_prebuilt_v2_frame(
+    segment_writer: &mut SegmentWriter,
+    next_frame_seq: &mut u64,
+    frame: &mut [u8],
+    flush_after: bool,
+) -> Result<(), String> {
+    let segment_id = segment_writer
+        .prepare_for_frame(frame.len() as u64)
+        .map_err(|e| format!("failed to prepare segment: {e}"))?;
+    let frame_seq = *next_frame_seq;
+    *next_frame_seq = next_frame_seq
+        .checked_add(1)
+        .ok_or_else(|| "frame sequence overflow".to_string())?;
+    finalize_v2_frame_in_place(
+        frame,
+        FramePosition {
+            frame_seq,
+            segment_id,
+        },
+    )
+    .map_err(|e| format!("failed to patch v2 frame: {e}"))?;
+    segment_writer
+        .write_prepared_frame(frame, flush_after)
+        .map_err(|e| format!("failed to write v2 frame: {e}"))
 }
 
 /// Manages the current `.open` segment file and handles rotation.
@@ -848,6 +937,8 @@ struct SegmentWriter {
     file: BufWriter<File>,
     open_path: PathBuf,
     bytes_written: u64,
+    frame_count: u64,
+    frame_crc_chain: [u8; 32],
 }
 
 impl SegmentWriter {
@@ -862,16 +953,18 @@ impl SegmentWriter {
             file: BufWriter::new(file),
             open_path,
             bytes_written: 0,
+            frame_count: 0,
+            frame_crc_chain: [0u8; 32],
         })
     }
 
-    /// Append `frame` to the current segment, rotating first if the frame
-    /// would exceed `max_segment_bytes`. A single frame is never split
-    /// across segments. If `flush_after` is true, `sync_data` is called
-    /// after the write (used for per-batch durability).
-    fn write_frame(&mut self, frame: &[u8], flush_after: bool) -> std::io::Result<()> {
-        let frame_len = frame.len() as u64;
-        if frame_len > self.max_segment_bytes {
+    /// Ensure the current segment has room for one additional frame.
+    ///
+    /// Segments reserve trailer space so every finalized `.bin` ends with a
+    /// deterministic integrity footer.
+    fn prepare_for_frame(&mut self, frame_len: u64) -> std::io::Result<u64> {
+        let trailer_bytes = SEGMENT_TRAILER_BYTES as u64;
+        if frame_len.saturating_add(trailer_bytes) > self.max_segment_bytes {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "frame exceeds max_segment_bytes",
@@ -879,7 +972,11 @@ impl SegmentWriter {
         }
 
         if self.bytes_written > 0
-            && self.bytes_written.saturating_add(frame_len) > self.max_segment_bytes
+            && self
+                .bytes_written
+                .saturating_add(frame_len)
+                .saturating_add(trailer_bytes)
+                > self.max_segment_bytes
         {
             self.finalize_current()?;
             self.seq = self
@@ -890,15 +987,38 @@ impl SegmentWriter {
             self.file = BufWriter::new(file);
             self.open_path = open_path;
             self.bytes_written = 0;
+            self.frame_count = 0;
+            self.frame_crc_chain = [0u8; 32];
         }
+        Ok(self.seq)
+    }
 
+    /// Append a frame after [`prepare_for_frame`](Self::prepare_for_frame).
+    fn write_prepared_frame(&mut self, frame: &[u8], flush_after: bool) -> std::io::Result<()> {
+        if frame.len() < FRAME_HEADER_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "frame is shorter than header",
+            ));
+        }
+        let frame_crc = frame_crc_from_header(frame)
+            .map_err(|e| std::io::Error::other(format!("invalid frame header: {e}")))?;
         self.file.write_all(frame)?;
-        self.bytes_written = self.bytes_written.saturating_add(frame_len);
+        self.bytes_written = self.bytes_written.saturating_add(frame.len() as u64);
+        self.frame_count = self.frame_count.saturating_add(1);
+        self.frame_crc_chain = extend_frame_crc_chain(&self.frame_crc_chain, frame_crc);
         if flush_after {
             self.file.flush()?;
             self.file.get_ref().sync_data()?;
         }
         Ok(())
+    }
+
+    /// Compatibility helper for tests that write already-finalized frames.
+    #[cfg(test)]
+    fn write_frame(&mut self, frame: &[u8], flush_after: bool) -> std::io::Result<()> {
+        self.prepare_for_frame(frame.len() as u64)?;
+        self.write_prepared_frame(frame, flush_after)
     }
 
     /// Finalize the current segment (sync + rename `.open` → `.bin`) and
@@ -911,6 +1031,17 @@ impl SegmentWriter {
     /// `.open` → `.bin`, and fsync the directory. After this call
     /// the segment is durable on disk.
     fn finalize_current(&mut self) -> std::io::Result<()> {
+        let mut trailer = Vec::with_capacity(SEGMENT_TRAILER_BYTES);
+        append_segment_trailer(
+            &mut trailer,
+            &SegmentTrailer {
+                segment_id: self.seq,
+                frame_count: self.frame_count,
+                total_frame_bytes: self.bytes_written,
+                frame_crc_chain: self.frame_crc_chain,
+            },
+        );
+        self.file.write_all(&trailer)?;
         self.file.flush()?;
         self.file.get_ref().sync_data()?;
         let mut bin_path = self.open_path.clone();
@@ -963,9 +1094,8 @@ fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    let c_from =
-        CString::new(from.as_os_str().as_bytes()).map_err(|e| std::io::Error::other(e))?;
-    let c_to = CString::new(to.as_os_str().as_bytes()).map_err(|e| std::io::Error::other(e))?;
+    let c_from = CString::new(from.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
+    let c_to = CString::new(to.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
 
     // RENAME_NOREPLACE = 1
     let ret = unsafe {
@@ -998,9 +1128,8 @@ fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
         fn renamex_np(from: *const libc::c_char, to: *const libc::c_char, flags: u32) -> i32;
     }
 
-    let c_from =
-        CString::new(from.as_os_str().as_bytes()).map_err(|e| std::io::Error::other(e))?;
-    let c_to = CString::new(to.as_os_str().as_bytes()).map_err(|e| std::io::Error::other(e))?;
+    let c_from = CString::new(from.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
+    let c_to = CString::new(to.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
 
     // RENAME_EXCL = 0x00000004
     let ret = unsafe { renamex_np(c_from.as_ptr(), c_to.as_ptr(), 0x00000004) };
@@ -1065,9 +1194,8 @@ fn build_run_start(cfg: &LogWriterConfig, keys: &StoreKeys, run_id: u64) -> LogR
 /// Reject obviously invalid configurations at construction time.
 ///
 /// Beyond per-field zero checks, enforces the cross-field invariant that
-/// the largest possible frame (`max_frame_payload_bytes + FRAME_HEADER_BYTES + 1`)
-/// must fit inside a single segment (`+1` is the required frame type byte).
-/// Without this check, the writer would fail on the first max-sized frame.
+/// the largest possible V2 frame plus the segment trailer must fit inside
+/// a single segment.
 fn validate_config(cfg: &LogWriterConfig) -> Result<(), FsStoreError> {
     if cfg.max_inflight_batches == 0 {
         return Err(FsStoreError::backend(
@@ -1094,11 +1222,13 @@ fn validate_config(cfg: &LogWriterConfig) -> Result<(), FsStoreError> {
             "max_inflight_batches exceeds u32::MAX (wire format limit)",
         ));
     }
-    if (cfg.max_frame_payload_bytes as u64 + super::format::FRAME_HEADER_BYTES as u64 + 1)
-        > cfg.max_segment_bytes
-    {
+    let max_frame_len = cfg.max_frame_payload_bytes as u64
+        + super::format::FRAME_HEADER_BYTES as u64
+        + super::format::FRAME_V2_POSITION_BYTES as u64
+        + 1;
+    if max_frame_len + SEGMENT_TRAILER_BYTES as u64 > cfg.max_segment_bytes {
         return Err(FsStoreError::backend(
-            "max_frame_payload_bytes + frame header + frame type exceeds max_segment_bytes; \
+            "max_frame_payload_bytes + v2 frame overhead + trailer exceeds max_segment_bytes; \
              no frame could ever be written",
         ));
     }
@@ -1115,7 +1245,8 @@ fn finding_frame_pool_capacity_hint(cfg: &LogWriterConfig) -> usize {
         .max_inflight_bytes
         .checked_div(cfg.max_inflight_batches.max(1))
         .unwrap_or(0);
-    let max_frame_len = cfg.max_frame_payload_bytes as usize + FRAME_HEADER_BYTES;
+    let max_frame_len =
+        cfg.max_frame_payload_bytes as usize + FRAME_HEADER_BYTES + FRAME_V2_POSITION_BYTES + 1;
     per_frame_budget.min(max_frame_len).clamp(
         FINDING_FRAME_POOL_MIN_CAPACITY,
         FINDING_FRAME_POOL_DEFAULT_CAPACITY,
@@ -1321,7 +1452,14 @@ pub fn default_fs_log_root(scan_root: &Path) -> PathBuf {
     parent.join(format!(".{sanitized}.scanner-rs-store"))
 }
 
-/// Outcome for one recovered `.open` segment.
+/// Outcome for one `.open` segment processed by [`recover_open_segments`].
+///
+/// Each `.open` file lands in exactly one of three buckets: successfully
+/// truncated-and-finalized (`Recovered`), redundant because a `.bin` peer
+/// already exists (`DiscardedDuplicateBin`), or empty / entirely corrupt
+/// (`DiscardedEmpty`). The variant payloads carry enough detail for
+/// diagnostics and metrics without requiring callers to re-inspect the
+/// filesystem.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OpenSegmentRecoveryOutcome {
     /// `.open` was scanned to a deterministic boundary and finalized as `.bin`.
@@ -1346,17 +1484,27 @@ pub enum OpenSegmentRecoveryOutcome {
     },
 }
 
-/// Recovery metadata for one `.open` file.
+/// Recovery metadata for one `.open` file processed during startup.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenSegmentRecoveryEntry {
+    /// Absolute path to the `.open` segment that was processed.
     pub open_path: PathBuf,
+    /// Corresponding `.bin` path (the finalization target, or the existing
+    /// peer that caused a duplicate discard).
     pub bin_path: PathBuf,
+    /// What happened to this `.open` file.
     pub outcome: OpenSegmentRecoveryOutcome,
 }
 
 /// Deterministic report from [`recover_open_segments`].
+///
+/// Collects one [`OpenSegmentRecoveryEntry`] per `.open` file found in the
+/// segments directory, sorted by filename. Callers can use the convenience
+/// methods ([`recovered_count`](Self::recovered_count),
+/// [`discarded_count`](Self::discarded_count), etc.) for summary metrics.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OpenSegmentRecoveryReport {
+    /// Per-file outcomes, ordered by ascending segment filename.
     pub entries: Vec<OpenSegmentRecoveryEntry>,
 }
 
@@ -1502,8 +1650,7 @@ pub fn recover_open_segments(
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     // Another process created .bin between our exists()
                     // check and rename. Treat as concurrent duplicate.
-                    fs::remove_file(&open_path)
-                        .map_err(|e| io_to_store_err_at(e, &open_path))?;
+                    fs::remove_file(&open_path).map_err(|e| io_to_store_err_at(e, &open_path))?;
                     report.entries.push(OpenSegmentRecoveryEntry {
                         open_path,
                         bin_path,
@@ -2121,7 +2268,7 @@ mod tests {
         // across multiple segments.
         let tmp = TempDir::new().unwrap();
         let mut cfg = LogWriterConfig::for_root(tmp.path().to_path_buf());
-        cfg.max_segment_bytes = 200; // Very small.
+        cfg.max_segment_bytes = 320; // Very small after reserving trailer space.
         cfg.max_frame_payload_bytes = 180;
         cfg.max_inflight_bytes = 16 * 1024 * 1024;
 
@@ -2195,7 +2342,7 @@ mod tests {
         // Trigger 50+ rotations. Assert filenames are monotonically ordered.
         let tmp = TempDir::new().unwrap();
         let mut cfg = LogWriterConfig::for_root(tmp.path().to_path_buf());
-        cfg.max_segment_bytes = 300; // Very small to force many rotations.
+        cfg.max_segment_bytes = 380; // Very small to force many rotations.
         cfg.max_frame_payload_bytes = 250;
         cfg.max_inflight_bytes = 16 * 1024 * 1024;
 
@@ -2434,7 +2581,7 @@ mod tests {
         // Small segment so rotation happens after RunStart + RuleDef + 1 finding;
         // valid per cross-field check.
         cfg.max_segment_bytes = 400;
-        cfg.max_frame_payload_bytes = 350;
+        cfg.max_frame_payload_bytes = 300;
         cfg.max_inflight_batches = 4;
         cfg.max_inflight_bytes = 16 * 1024 * 1024;
         // Slow writer so we have a window to sabotage the directory.
@@ -3079,17 +3226,18 @@ mod tests {
     fn segment_sequence_overflow_returns_error_instead_of_panic() {
         let tmp = TempDir::new().unwrap();
         let segments_dir = tmp.path().join("segments");
-        let mut sw = SegmentWriter::new(segments_dir, 64).unwrap();
+        let mut sw = SegmentWriter::new(segments_dir, 256).unwrap();
 
         // Force the sequence counter to u64::MAX so the next rotation overflows.
         sw.seq = u64::MAX;
         // Write enough to fill the current segment, then write again to trigger rotation.
-        sw.file.write_all(&[0u8; 32]).unwrap();
-        sw.bytes_written = 32;
+        sw.file.write_all(&[0u8; 128]).unwrap();
+        sw.bytes_written = 128;
 
-        // This second write should trigger rotation (32 + 64 > 64),
+        // This second write should trigger rotation once trailer reservation
+        // is considered: 128 + 128 + trailer > 256.
         // which increments seq from u64::MAX → overflow.
-        let result = sw.write_frame(&[0u8; 64], false);
+        let result = sw.write_frame(&[0u8; 128], false);
         assert!(
             result.is_err(),
             "expected error on sequence overflow, not panic"
@@ -3743,41 +3891,21 @@ mod tests {
             &mut bytes,
         )
         .unwrap();
-        fs::write(
-            run1_seg.join("segment-00000000000000000000.open"),
-            &bytes,
-        )
-        .unwrap();
-        fs::write(
-            run1_seg.join("segment-00000000000000000001.open"),
-            b"stale",
-        )
-        .unwrap();
-        fs::write(
-            run1_seg.join("segment-00000000000000000001.bin"),
-            b"final",
-        )
-        .unwrap();
+        fs::write(run1_seg.join("segment-00000000000000000000.open"), &bytes).unwrap();
+        fs::write(run1_seg.join("segment-00000000000000000001.open"), b"stale").unwrap();
+        fs::write(run1_seg.join("segment-00000000000000000001.bin"), b"final").unwrap();
 
         // Run 2: one empty .open.
         let run2_seg = tmp.path().join("run-0000000000000002").join("segments");
         fs::create_dir_all(&run2_seg).unwrap();
-        fs::write(
-            run2_seg.join("segment-00000000000000000000.open"),
-            b"",
-        )
-        .unwrap();
+        fs::write(run2_seg.join("segment-00000000000000000000.open"), b"").unwrap();
 
         // Run 3: one .open with corrupt frame 0.
         let run3_seg = tmp.path().join("run-0000000000000003").join("segments");
         fs::create_dir_all(&run3_seg).unwrap();
         let mut corrupt = bytes.clone();
         corrupt[FRAME_HEADER_BYTES] ^= 0x01;
-        fs::write(
-            run3_seg.join("segment-00000000000000000000.open"),
-            &corrupt,
-        )
-        .unwrap();
+        fs::write(run3_seg.join("segment-00000000000000000000.open"), &corrupt).unwrap();
 
         let report = recover_open_segments(tmp.path(), DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap();
 
@@ -3802,7 +3930,7 @@ mod tests {
         let bin_path = seg_dir.join("segment-00000000000000000000.bin");
 
         // 3 bytes: not enough for even a frame header.
-        fs::write(&open_path, &[0xAA, 0xBB, 0xCC]).unwrap();
+        fs::write(&open_path, [0xAA, 0xBB, 0xCC]).unwrap();
 
         let report = recover_open_segments(tmp.path(), DEFAULT_MAX_FRAME_PAYLOAD_BYTES).unwrap();
         assert_eq!(report.entries.len(), 1);

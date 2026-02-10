@@ -10,6 +10,8 @@
 //! - **Bounded allocation** via a reusable internal frame buffer (`frame_buf`).
 //! - **Position tracking** (`frame_index`, `frame_offset`) so recovery callers
 //!   can truncate a corrupt `.open` file at the last valid byte boundary.
+//! - **V2 segment-trailer verification** of `frame_count`, `total_frame_bytes`,
+//!   and the BLAKE3 frame-CRC chain when reading finalized `.bin` segments.
 //! - **Reason-coded errors** ([`LogReadErrorReason`]) enabling deterministic
 //!   policy (e.g. stop-at-first-bad-frame, skip-and-continue, truncate).
 //!
@@ -29,12 +31,14 @@
 //!
 //! # Version policy
 //!
-//! `RunStart.version` must equal [`LOG_FORMAT_VERSION`]. Mismatches surface as
+//! `RunStart.version` must be in the supported range
+//! `[LEGACY_LOG_FORMAT_VERSION, LOG_FORMAT_VERSION]`. Mismatches surface as
 //! [`LogReadErrorReason::UnsupportedVersion`] and terminate the reader.
 
 use super::format::{
-    decode_record, FormatError, FrameType, LogRecord, DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
-    FRAME_HEADER_BYTES, LOG_FORMAT_VERSION,
+    decode_record, decode_segment_trailer, extend_frame_crc_chain, parse_frame_layout, FormatError,
+    FrameType, LogRecord, DEFAULT_MAX_FRAME_PAYLOAD_BYTES, FRAME_HEADER_BYTES,
+    LEGACY_LOG_FORMAT_VERSION, LOG_FORMAT_VERSION, SEGMENT_TRAILER_BYTES, SEGMENT_TRAILER_MAGIC,
 };
 use std::fmt;
 use std::io::Read;
@@ -209,8 +213,14 @@ fn classify_reason(err: &FormatError) -> LogReadErrorReason {
         | FormatError::InvalidEnum { .. }
         | FormatError::InvalidBool { .. }
         | FormatError::InvalidRecord { .. }
+        | FormatError::InvalidSegmentTrailer { .. }
         | FormatError::LengthTooLarge { .. } => LogReadErrorReason::MalformedFrame,
     }
+}
+
+#[inline]
+fn is_supported_log_version(version: u16) -> bool {
+    (LEGACY_LOG_FORMAT_VERSION..=LOG_FORMAT_VERSION).contains(&version)
 }
 
 /// Stream decoder for framed FS log records.
@@ -236,6 +246,9 @@ pub struct LogReader<R: Read> {
     max_payload_bytes: u32,
     next_frame_index: u64,
     next_frame_offset: u64,
+    segment_frame_count: u64,
+    segment_total_frame_bytes: u64,
+    segment_frame_crc_chain: [u8; 32],
     /// Latched on clean EOF or any decode/IO error; see "Terminal latch" above.
     terminated: bool,
 }
@@ -264,6 +277,9 @@ impl<R: Read> LogReader<R> {
             max_payload_bytes,
             next_frame_index: 0,
             next_frame_offset: 0,
+            segment_frame_count: 0,
+            segment_total_frame_bytes: 0,
+            segment_frame_crc_chain: [0u8; 32],
             terminated: false,
         }
     }
@@ -366,43 +382,84 @@ impl<R: Read> LogReader<R> {
             got += n;
         }
 
-        // frame_len covers `type + payload`; zero is invalid because at least
-        // the 1-byte type discriminant must be present.
-        let frame_len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-        if frame_len == 0 {
+        if header == SEGMENT_TRAILER_MAGIC {
+            let mut trailer_buf = [0u8; SEGMENT_TRAILER_BYTES];
+            trailer_buf[..FRAME_HEADER_BYTES].copy_from_slice(&header);
+            let mut trailer_got = FRAME_HEADER_BYTES;
+            while trailer_got < SEGMENT_TRAILER_BYTES {
+                let n = self
+                    .reader
+                    .read(&mut trailer_buf[trailer_got..])
+                    .map_err(FormatError::Io)
+                    .map_err(|err| {
+                        self.terminated = true;
+                        LogReadError::from_format(frame_index, frame_offset, err)
+                    })?;
+                if n == 0 {
+                    self.terminated = true;
+                    return Err(LogReadError::from_format(
+                        frame_index,
+                        frame_offset,
+                        FormatError::TruncatedFrame {
+                            expected: SEGMENT_TRAILER_BYTES,
+                            got: trailer_got,
+                        },
+                    ));
+                }
+                trailer_got += n;
+            }
+            let trailer = decode_segment_trailer(&trailer_buf).map_err(|err| {
+                self.terminated = true;
+                LogReadError::from_format(frame_index, frame_offset, err)
+            })?;
+            if trailer.frame_count != self.segment_frame_count {
+                self.terminated = true;
+                return Err(LogReadError::from_format(
+                    frame_index,
+                    frame_offset,
+                    FormatError::InvalidSegmentTrailer {
+                        detail: "frame_count mismatch",
+                    },
+                ));
+            }
+            if trailer.total_frame_bytes != self.segment_total_frame_bytes {
+                self.terminated = true;
+                return Err(LogReadError::from_format(
+                    frame_index,
+                    frame_offset,
+                    FormatError::InvalidSegmentTrailer {
+                        detail: "total_frame_bytes mismatch",
+                    },
+                ));
+            }
+            if trailer.frame_crc_chain != self.segment_frame_crc_chain {
+                self.terminated = true;
+                return Err(LogReadError::from_format(
+                    frame_index,
+                    frame_offset,
+                    FormatError::InvalidSegmentTrailer {
+                        detail: "frame_crc_chain mismatch",
+                    },
+                ));
+            }
             self.terminated = true;
-            return Err(LogReadError::from_format(
-                frame_index,
-                frame_offset,
-                FormatError::InvalidFrameLength { len: frame_len },
-            ));
+            return Ok(None);
         }
-        let payload_len = frame_len - 1;
-        if payload_len > self.max_payload_bytes {
+
+        let frame_len_word = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let layout = parse_frame_layout(frame_len_word, self.max_payload_bytes).map_err(|err| {
             self.terminated = true;
-            return Err(LogReadError::from_format(
-                frame_index,
-                frame_offset,
-                FormatError::FrameTooLarge {
-                    len: payload_len,
-                    max: self.max_payload_bytes,
-                },
-            ));
-        }
-        let body_len = usize::try_from(frame_len).map_err(|_| {
-            self.terminated = true;
-            LogReadError::from_format(
-                frame_index,
-                frame_offset,
-                FormatError::InvalidFrameLength { len: frame_len },
-            )
+            LogReadError::from_format(frame_index, frame_offset, err)
         })?;
+        let body_len = layout.body_len;
         let total_len = body_len.checked_add(FRAME_HEADER_BYTES).ok_or_else(|| {
             self.terminated = true;
             LogReadError::from_format(
                 frame_index,
                 frame_offset,
-                FormatError::InvalidFrameLength { len: frame_len },
+                FormatError::InvalidFrameLength {
+                    len: frame_len_word,
+                },
             )
         })?;
 
@@ -442,15 +499,23 @@ impl<R: Read> LogReader<R> {
     fn check_version_gate(&mut self) -> Result<(), LogReadError> {
         let frame_index = self.next_frame_index;
         let frame_offset = self.next_frame_offset;
+        let frame_len_word = u32::from_le_bytes([
+            self.frame_buf[0],
+            self.frame_buf[1],
+            self.frame_buf[2],
+            self.frame_buf[3],
+        ]);
+        let layout = parse_frame_layout(frame_len_word, self.max_payload_bytes).map_err(|err| {
+            self.terminated = true;
+            LogReadError::from_format(frame_index, frame_offset, err)
+        })?;
         let body = &self.frame_buf[FRAME_HEADER_BYTES..];
 
-        // body[0] is the type discriminant; RunStart payload starts at body[1].
-        if body[0] == FrameType::RunStart as u8 {
-            // version is the first u16_le of the RunStart payload.
-            // Minimum RunStart body: type(1) + version(2) = 3 bytes.
-            if body.len() >= 3 {
-                let found = u16::from_le_bytes([body[1], body[2]]);
-                if found != LOG_FORMAT_VERSION {
+        if body[layout.type_offset] == FrameType::RunStart as u8 {
+            let version_offset = layout.payload_offset;
+            if body.len() >= version_offset + 2 {
+                let found = u16::from_le_bytes([body[version_offset], body[version_offset + 1]]);
+                if !is_supported_log_version(found) {
                     self.terminated = true;
                     return Err(LogReadError::unsupported_version(
                         frame_index,
@@ -530,7 +595,7 @@ impl<R: Read> LogReader<R> {
         // check fires once per RunStart frame, which appears at most once
         // in a well-formed segment.
         if let LogRecord::RunStart(run_start) = &record {
-            if run_start.version != LOG_FORMAT_VERSION {
+            if !is_supported_log_version(run_start.version) {
                 self.terminated = true;
                 return Err(LogReadError::unsupported_version(
                     frame_index,
@@ -549,6 +614,18 @@ impl<R: Read> LogReader<R> {
             Some(v) => self.next_frame_offset = v,
             None => self.terminated = true,
         }
+        let frame_crc = u32::from_le_bytes([
+            self.frame_buf[4],
+            self.frame_buf[5],
+            self.frame_buf[6],
+            self.frame_buf[7],
+        ]);
+        self.segment_frame_count = self.segment_frame_count.saturating_add(1);
+        self.segment_total_frame_bytes = self
+            .segment_total_frame_bytes
+            .saturating_add(total_len as u64);
+        self.segment_frame_crc_chain =
+            extend_frame_crc_chain(&self.segment_frame_crc_chain, frame_crc);
         Ok(Some(record))
     }
 
@@ -591,6 +668,18 @@ impl<R: Read> LogReader<R> {
             Some(v) => self.next_frame_offset = v,
             None => self.terminated = true,
         }
+        let frame_crc = u32::from_le_bytes([
+            self.frame_buf[4],
+            self.frame_buf[5],
+            self.frame_buf[6],
+            self.frame_buf[7],
+        ]);
+        self.segment_frame_count = self.segment_frame_count.saturating_add(1);
+        self.segment_total_frame_bytes = self
+            .segment_total_frame_bytes
+            .saturating_add(total_len as u64);
+        self.segment_frame_crc_chain =
+            extend_frame_crc_chain(&self.segment_frame_crc_chain, frame_crc);
         Ok(Some(()))
     }
 }
