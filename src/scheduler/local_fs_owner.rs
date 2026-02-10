@@ -2499,7 +2499,6 @@ fn process_zip_file<E: ScanEngine>(
 ///   No error is recorded because the file was already classified as
 ///   extractable by extension; a parse failure simply means the content
 ///   didn't match (e.g. a `.class` file with corrupt magic).
-#[cfg(feature = "binary-extract")]
 fn extract_and_scan_file<E: ScanEngine>(
     task: &FileTask,
     ctx: &mut WorkerCtx<FileTask, LocalScratch<E>>,
@@ -2793,16 +2792,9 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
                 ctx.metrics.binary_skipped = ctx.metrics.binary_skipped.wrapping_add(1);
                 return;
             }
-            crate::content_policy::ContentVerdict::BinaryExtractable(_fmt) => {
-                #[cfg(feature = "binary-extract")]
-                {
-                    drop(buf); // release buffer before extraction
-                    extract_and_scan_file(&task, ctx, &mut file, file_size, path_bytes, _fmt);
-                }
-                #[cfg(not(feature = "binary-extract"))]
-                {
-                    ctx.metrics.binary_skipped = ctx.metrics.binary_skipped.wrapping_add(1);
-                }
+            crate::content_policy::ContentVerdict::BinaryExtractable(fmt) => {
+                drop(buf); // release buffer before extraction
+                extract_and_scan_file(&task, ctx, &mut file, file_size, path_bytes, fmt);
                 return;
             }
             crate::content_policy::ContentVerdict::Text => {}
@@ -3169,15 +3161,12 @@ where
                     max_file_size: cfg.max_file_size,
                     archive: archive_cfg.clone(),
                     skip_binary: cfg.skip_binary,
-                    #[cfg(feature = "binary-extract")]
                     extract_buf: Vec::with_capacity(
                         crate::content_policy::extract::EXTRACT_INPUT_CAP,
                     ),
-                    #[cfg(feature = "binary-extract")]
                     extract_out_buf: Vec::with_capacity(
                         crate::content_policy::extract::EXTRACT_OUTPUT_CAP,
                     ),
-                    #[cfg(feature = "binary-extract")]
                     extract_scratch: Vec::with_capacity(
                         crate::content_policy::extract::JAR_ENTRY_CAP,
                     ),

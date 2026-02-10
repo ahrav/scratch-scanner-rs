@@ -26,9 +26,9 @@ vectorscan-rs-sys = "0.0.5"
 sha2 = "0.10"
 blake3 = "1.5"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = { version = "1.0", optional = true }
+serde_json = "1.0"
 serde_yml = "0.0.12"
-zip = { version = "0.6", optional = true, default-features = false, features = ["deflate"] }
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
 gix-commitgraph = "0.29"
 rocksdb = { version = "0.22", optional = true }
 
@@ -53,21 +53,18 @@ stats = ["perf-stats"]  # Alias: enables perf-stats
 b64-stats = ["stats"]  # Base64 decode/gate instrumentation (implies stats)
 bench = []
 tiger-harness = []
-sim-harness = ["serde_json"]
+sim-harness = []
 kani = []  # Gate Kani model-checking proofs
 scheduler-sim = []  # Enable longer-running scheduler simulation tests
 rocksdb = ["dep:rocksdb"]
 git-perf = ["perf-stats"]  # Git pack-exec timing probes (implies perf-stats)
 real-rules-harness = []  # Real-ruleset regression harness (simulation test)
-binary-extract = ["serde_json", "dep:zip"]  # Binary format text extraction (.ipynb, .class, .jar, .pyc)
 
 [dev-dependencies]
 loom = "0.7"
 proptest = "1.4"
 criterion = "0.5"
-serde_json = "1.0"
 tempfile = "3.10"
-zip = { version = "0.6", default-features = false, features = ["deflate"] }
 
 [[bench]]
 name = "scan"

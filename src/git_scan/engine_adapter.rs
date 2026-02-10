@@ -175,10 +175,8 @@ pub struct EngineAdapter<'a> {
     /// When `true`, skip the binary content check and scan everything.
     scan_binary: bool,
     /// Reusable buffer for binary format text extraction.
-    #[cfg(feature = "binary-extract")]
     extract_buf: Vec<u8>,
     /// Temporary workspace for extractors (e.g. per-entry reads in JARs).
-    #[cfg(feature = "binary-extract")]
     extract_scratch: Vec<u8>,
 }
 
@@ -217,9 +215,7 @@ impl<'a> EngineAdapter<'a> {
             next_file_id: 0,
             event_sink,
             scan_binary: config.scan_binary,
-            #[cfg(feature = "binary-extract")]
             extract_buf: Vec::with_capacity(crate::content_policy::extract::EXTRACT_OUTPUT_CAP),
-            #[cfg(feature = "binary-extract")]
             extract_scratch: Vec::with_capacity(crate::content_policy::extract::JAR_ENTRY_CAP),
         }
     }
