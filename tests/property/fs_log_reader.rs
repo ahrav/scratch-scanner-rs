@@ -8,8 +8,7 @@
 
 use proptest::prelude::*;
 use scanner_rs::store::log::{
-    encode_record, LogReader, LogRecord, LogRecordReader, DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
-    LOG_FORMAT_VERSION,
+    encode_record, LogReader, LogRecordReader, DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
 };
 use std::io::Cursor;
 

@@ -289,12 +289,7 @@ proptest! {
         buf.extend_from_slice(&garbage);
 
         let mut reader = LogReader::with_default_limit(Cursor::new(buf));
-        loop {
-            match reader.next_record() {
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => break,
-            }
-        }
+        while let Ok(Some(_)) = reader.next_record() {}
         // The boundary offset must equal the sum of all valid frame sizes.
         prop_assert_eq!(reader.next_frame_offset(), valid_len);
     }
@@ -318,11 +313,6 @@ proptest! {
 
         let mut reader = LogReader::with_default_limit(Cursor::new(buf));
         // Drain until terminal — must not panic.
-        loop {
-            match reader.next_record() {
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => break,
-            }
-        }
+        while let Ok(Some(_)) = reader.next_record() {}
     }
 }
