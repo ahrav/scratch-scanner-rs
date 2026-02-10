@@ -352,6 +352,18 @@ impl FixedBufferPool {
     }
 }
 
+/// RAII handle to a single buffer in a [`FixedBufferPool`].
+///
+/// Ownership is exclusive: the free queue guarantees at most one handle exists
+/// per buffer index at any time. Dropping the handle returns the buffer to the
+/// pool's free queue, making it available for the next `try_acquire`.
+///
+/// # Lifetime coupling with io_uring
+///
+/// When a read op is in flight, the handle must live in the `ops[]` slab until
+/// the CQE is reaped. The kernel writes directly into the buffer's memory, so
+/// dropping the handle (and freeing the index) before completion would allow
+/// another thread to acquire the same buffer and observe torn data.
 struct FixedBufferHandle {
     pool: Arc<FixedBufferPool>,
     index: usize,
@@ -420,15 +432,19 @@ impl UringIoStats {
 // Internal Types
 // ============================================================================
 
+/// Probed io_uring opcode capabilities for the current kernel.
+///
+/// Queried once per ring via `register_probe`. The result determines whether
+/// the I/O thread uses io_uring open/stat or falls back to blocking syscalls.
 #[derive(Clone, Copy, Debug)]
 struct OpenStatCaps {
     /// IORING_OP_OPENAT supported.
     openat: bool,
-    /// IORING_OP_OPENAT2 supported.
+    /// IORING_OP_OPENAT2 supported (needed for resolve policy flags).
     openat2: bool,
     /// IORING_OP_STATX supported.
     statx: bool,
-    /// Kernel guarantees submit-time parameter stability.
+    /// Kernel guarantees submit-time parameter stability (`IORING_FEAT_SUBMIT_STABLE`).
     submit_stable: bool,
 }
 
@@ -439,7 +455,10 @@ impl OpenStatCaps {
     }
 }
 
-/// Map resolve policy to openat2 resolve bits (ignored when openat2 unsupported).
+/// Map [`ResolvePolicy`] to `openat2(2)` resolve flags.
+///
+/// These flags restrict path traversal at the kernel level. Ignored when
+/// the kernel doesn't support `IORING_OP_OPENAT2`.
 fn resolve_bits(policy: ResolvePolicy) -> u64 {
     match policy {
         ResolvePolicy::Default => 0,
@@ -448,8 +467,11 @@ fn resolve_bits(policy: ResolvePolicy) -> u64 {
     }
 }
 
+/// Probe the io_uring instance for supported opcodes and features.
+///
+/// Called once per I/O thread during ring setup. The result is used to decide
+/// between io_uring-based open/stat and blocking fallback paths.
 fn probe_uring_caps(ring: &IoUring) -> io::Result<OpenStatCaps> {
-    // Probe opcode availability and submit-stable behavior once per ring.
     let mut probe = Probe::new();
     ring.submitter().register_probe(&mut probe)?;
 
@@ -461,7 +483,13 @@ fn probe_uring_caps(ring: &IoUring) -> io::Result<OpenStatCaps> {
     })
 }
 
-/// Token that holds the in-flight file permit until all chunk tasks complete.
+/// Per-file lifecycle token that ties a [`CountPermit`] to scan completion.
+///
+/// Shared via `Arc` among the I/O thread and all CPU tasks spawned for this
+/// file's chunks. The permit is released when the last `Arc<FileToken>` drops,
+/// which signals `CountBudget` that one in-flight file slot is free for
+/// discovery to fill. This is the backpressure mechanism that bounds
+/// `max_in_flight_files`.
 struct FileToken {
     _permit: CountPermit,
     file_id: FileId,
@@ -469,28 +497,51 @@ struct FileToken {
     display: Arc<[u8]>,
 }
 
-/// Work item for I/O threads.
+/// Work item sent from discovery to I/O threads via the bounded file channel.
+///
+/// The token's permit keeps backpressure: discovery blocks when
+/// `max_in_flight_files` is reached, and the permit releases when all chunks
+/// of this file have been scanned (or the file is skipped/failed).
 struct FileWork {
     path: PathBuf,
     token: Arc<FileToken>,
 }
 
-/// Work item for archive worker threads.
+/// Work item sent to archive worker threads.
+///
+/// Routed in two ways: extension-based (from discovery walker) or
+/// magic-byte sniffing (from I/O thread first-chunk classification).
+/// Archive workers open the file themselves, so no fd is carried here.
 struct ArchiveWork {
     path: PathBuf,
     kind: ArchiveKind,
     token: Arc<FileToken>,
 }
 
-/// Work item for binary-extraction worker threads.
+/// Work item sent to binary-extraction worker threads.
+///
+/// Routed from I/O threads when `skip_binary` is true and the first chunk
+/// is classified as `BinaryExtractable` (e.g., PDF, Office documents).
+/// The extraction worker reads the file, extracts scannable text, and scans
+/// it as a single chunk.
 struct ExtractWork {
     path: PathBuf,
     fmt: crate::content_policy::ExtractableFormat,
     token: Arc<FileToken>,
 }
 
-/// CPU task type for the executor.
+/// Task dispatched from I/O threads to the work-stealing CPU executor.
+///
+/// Each variant carries all data needed for scanning with no shared mutable
+/// state — the executor can run tasks on any worker thread without locking.
 enum CpuTask {
+    /// Scan a single chunk of a file.
+    ///
+    /// The buffer contains `prefix_len` bytes of overlap from the previous
+    /// chunk (copied in-memory, not re-read from disk) followed by fresh
+    /// payload bytes. `base_offset` is the file offset of byte 0 in the
+    /// buffer (i.e., `file_offset - prefix_len`). `len` is the total number
+    /// of valid bytes (`prefix_len + payload`).
     ScanChunk {
         token: Arc<FileToken>,
         base_offset: u64,
@@ -500,7 +551,11 @@ enum CpuTask {
     },
 }
 
-/// Per-CPU-worker scratch space.
+/// Per-CPU-worker scratch space, owned by exactly one executor thread.
+///
+/// Holds the engine scratch buffer, a reusable findings vec, and references
+/// to shared state. The `pending` vec is cleared before each chunk to avoid
+/// cross-chunk finding accumulation (see `drain_findings_into` append semantics).
 struct CpuScratch<E: ScanEngine> {
     engine: Arc<E>,
     event_sink: Arc<dyn EventSink>,
@@ -549,7 +604,10 @@ fn dedupe_pending_in_place<F: FindingRecord>(p: &mut Vec<F>) {
     });
 }
 
-/// Emit findings as structured events.
+/// Emit findings as [`FindingEvent`]s through the event sink.
+///
+/// Each finding becomes a `ScanEvent::Finding` with `SourceKind::Fs` and the
+/// display path from the file token. No-op when `recs` is empty.
 fn emit_findings<E: ScanEngine, F: FindingRecord>(
     engine: &E,
     event_sink: &dyn EventSink,
@@ -578,6 +636,13 @@ fn emit_findings<E: ScanEngine, F: FindingRecord>(
 // CPU Task Runner
 // ============================================================================
 
+/// Executor callback: scans one chunk and emits findings.
+///
+/// Pipeline: `scan_chunk_into` → `drop_prefix_findings` → `drain` → dedupe → emit.
+///
+/// Prefix findings (those fully contained within the overlap region) are
+/// dropped to avoid double-counting across consecutive chunks. Metrics track
+/// only new-payload bytes to give an accurate throughput measure.
 fn cpu_runner<E: ScanEngine>(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScratch<E>>) {
     match task {
         CpuTask::ScanChunk {
@@ -691,7 +756,8 @@ impl<E: ScanEngine> ArchiveEntrySink for UringArchiveSink<'_, E> {
     }
 }
 
-/// Archive worker stats returned after all work items are processed.
+/// Aggregate stats from a single archive worker thread, merged into
+/// [`MetricsSnapshot`] after the worker joins.
 #[allow(dead_code)]
 struct ArchiveWorkerStats {
     bytes_scanned: u64,
@@ -703,8 +769,13 @@ struct ArchiveWorkerStats {
     archive_stats: ArchiveStats,
 }
 
-/// Per-archive-worker loop: receives `ArchiveWork` items from a channel and
-/// dispatches to the appropriate archive scanner (gzip, tar, tar.gz, zip).
+/// Per-archive-worker loop: drains [`ArchiveWork`] from the channel and
+/// dispatches each item to the appropriate archive scanner.
+///
+/// Runs on a dedicated thread. Returns aggregate stats when the channel
+/// closes (all senders dropped). Each archive is opened, decompressed/parsed,
+/// and its entries scanned via [`UringArchiveSink`] using the same
+/// scan → dedupe → emit pipeline as regular chunks.
 fn archive_worker_loop<E: ScanEngine>(
     rx: chan::Receiver<ArchiveWork>,
     engine: Arc<E>,
@@ -828,7 +899,8 @@ fn archive_worker_loop<E: ScanEngine>(
 // Extraction Workers
 // ============================================================================
 
-/// Extraction worker stats returned after all work items are processed.
+/// Aggregate stats from a single extraction worker thread, merged into
+/// [`MetricsSnapshot`] after the worker joins.
 #[allow(dead_code)]
 struct ExtractWorkerStats {
     bytes_scanned: u64,
@@ -839,8 +911,13 @@ struct ExtractWorkerStats {
     extract_failures: u64,
 }
 
-/// Per-extraction-worker loop: receives `ExtractWork` items from a channel,
-/// opens the file, extracts scannable text, and scans it as a single chunk.
+/// Per-extraction-worker loop: drains [`ExtractWork`] from the channel,
+/// opens each file, extracts scannable text (capped at 64 MiB input), and
+/// scans the extracted content as a single chunk.
+///
+/// Runs on a dedicated thread. Returns aggregate stats when the channel
+/// closes. Unlike the archive worker, extraction produces at most one
+/// chunk per file (no streaming), so there is no overlap handling.
 fn extract_worker_loop<E: ScanEngine>(
     rx: chan::Receiver<ExtractWork>,
     engine: Arc<E>,
@@ -951,21 +1028,35 @@ struct FileState {
     token: Arc<FileToken>,
 }
 
-/// Phase-specific data for a file slot.
+/// State machine phase for a file being processed by an I/O thread.
+///
+/// Transitions are forward-only: `PendingOpen → PendingStat → Ready`.
+/// Each transition is driven by a CQE completion (or blocking fallback).
+/// The I/O thread enforces at most one in-flight op per file at any phase.
 enum FilePhase {
     /// Path queued for open via io_uring (or fallback).
     PendingOpen { path: PathBuf },
     /// File opened; waiting on statx for size snapshot.
+    /// `file` is `Some` until consumed by the transition to `Ready`.
     PendingStat { file: Option<File> },
-    /// Ready for read submissions with size + overlap tracking.
+    /// File sized and ready for chunked reads. Holds mutable read progress.
     Ready(ReadState),
 }
 
+/// Mutable progress for chunked reads of a single file.
+///
+/// `next_offset` advances by `chunk_size` (payload only) after each read
+/// submission. `overlap_buf` carries the tail bytes of the previous chunk so
+/// the next read's buffer can be prefixed without re-reading from disk.
 struct ReadState {
     file: File,
+    /// Authoritative file size from fstat/statx at open time.
     size: u64,
+    /// Byte offset of the next payload read (not counting overlap prefix).
     next_offset: u64,
+    /// Tail bytes from the previous chunk, copied into the next buffer's prefix.
     overlap_buf: Box<[u8]>,
+    /// Number of valid bytes in `overlap_buf` (0 for the first chunk).
     overlap_len: usize,
 }
 
@@ -982,6 +1073,11 @@ enum Op {
     Read(ReadOp),
 }
 
+/// State for an in-flight openat/openat2 op.
+///
+/// `path` and `open_how` are kept alive here because the kernel may read them
+/// asynchronously between SQE submission and CQE completion. Dropping them
+/// early would be use-after-free.
 struct OpenOp {
     file_slot: usize,
     #[allow(dead_code)]
@@ -990,13 +1086,23 @@ struct OpenOp {
     open_how: Option<Box<types::OpenHow>>,
 }
 
+/// State for an in-flight statx op.
+///
+/// `statx_buf` is written to by the kernel on completion; it must not be
+/// moved or dropped until the CQE is reaped.
 struct StatOp {
     file_slot: usize,
     statx_buf: Box<libc::statx>,
 }
 
+/// State for an in-flight read op.
+///
+/// `buf` holds the target memory for the kernel read. `prefix_len` bytes at
+/// the front are overlap copied from the previous chunk (already filled before
+/// submission). `payload_len` is the number of new bytes requested from disk.
 struct ReadOp {
     file_slot: usize,
+    /// File offset corresponding to byte 0 of `buf` (i.e., start of overlap).
     base_offset: u64,
     prefix_len: usize,
     payload_len: usize,
@@ -1070,7 +1176,12 @@ fn drain_in_flight(
     Ok(())
 }
 
-/// Open file with optional O_NOFOLLOW for symlink safety.
+/// Open a file read-only with optional `O_NOFOLLOW` for symlink safety.
+///
+/// When `follow_symlinks` is false, `O_NOFOLLOW` causes the open to fail with
+/// `ELOOP` if the final path component is a symlink. This prevents TOCTOU
+/// attacks where a regular file is replaced with a symlink between discovery
+/// and open.
 #[cfg(unix)]
 fn open_file_safe(path: &Path, follow_symlinks: bool) -> io::Result<File> {
     use std::fs::OpenOptions;
