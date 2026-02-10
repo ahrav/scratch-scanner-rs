@@ -1381,8 +1381,7 @@ pub fn recover_open_segments(
             let mut bin_path = open_path.clone();
             bin_path.set_extension(SEGMENT_BIN_EXT);
             if bin_path.exists() {
-                fs::remove_file(&open_path)
-                    .map_err(|e| io_to_store_err_at(e, &open_path))?;
+                fs::remove_file(&open_path).map_err(|e| io_to_store_err_at(e, &open_path))?;
                 report.entries.push(OpenSegmentRecoveryEntry {
                     open_path,
                     bin_path,
@@ -1409,8 +1408,7 @@ pub fn recover_open_segments(
             // No valid frames: discard the file instead of creating a
             // confusing 0-byte `.bin`.
             if recovered_len == 0 {
-                fs::remove_file(&open_path)
-                    .map_err(|e| io_to_store_err_at(e, &open_path))?;
+                fs::remove_file(&open_path).map_err(|e| io_to_store_err_at(e, &open_path))?;
                 report.entries.push(OpenSegmentRecoveryEntry {
                     open_path,
                     bin_path,
@@ -1434,8 +1432,7 @@ pub fn recover_open_segments(
                     .map_err(|e| io_to_store_err_at(e, &open_path))?;
             }
 
-            fs::rename(&open_path, &bin_path)
-                .map_err(|e| io_to_store_err_at(e, &bin_path))?;
+            fs::rename(&open_path, &bin_path).map_err(|e| io_to_store_err_at(e, &bin_path))?;
             sync_dir(&seg_dir).map_err(|e| io_to_store_err_at(e, &seg_dir))?;
 
             report.entries.push(OpenSegmentRecoveryEntry {
