@@ -311,6 +311,57 @@ this frame sequence:
 The writer enforces this order across segment boundaries. The reader decodes
 frames in whatever order they appear (no ordering validation).
 
+#### Reader API (Phase D)
+
+Use `store::log::reader::LogReader` when replaying persisted runs or scanning
+segments for recovery:
+
+```rust
+use scanner_rs::store::log::LogReader;
+
+let file = std::fs::File::open("segment-00000000000000000000.bin")?;
+let mut reader = LogReader::with_default_limit(file);
+while let Some(record) = reader.next_record()? {
+    // process record
+}
+```
+
+`LogReader` keeps a reusable frame buffer and reports deterministic,
+reason-coded failures via `LogReadError`:
+
+| Reason | Meaning |
+|--------|---------|
+| `CrcMismatch` | Frame CRC does not match payload bytes |
+| `Truncated` | EOF before full header/body completion |
+| `UnsupportedFrame` | Unknown frame discriminant |
+| `UnsupportedVersion` | `RunStart.version` is not `LOG_FORMAT_VERSION` |
+| `MalformedFrame` | Invalid frame shape or payload fields |
+| `Io` | Underlying read error from the transport |
+
+On any failure, callers also get:
+- `frame_index` (0-based frame number),
+- `frame_offset` (byte offset where that frame started).
+
+These fields make startup recovery deterministic: truncate `.open` at the last
+known-good offset and stop at first bad frame.
+
+#### Startup `.open` Recovery
+
+Use `recover_open_segments(store_root, max_frame_payload_bytes)` before
+query/replay startup to convert stale `.open` files into finalized `.bin`
+segments.
+
+Policy:
+- Scan each `.open` frame-by-frame in lexical order.
+- On first non-I/O decode error, treat that frame boundary as EOF.
+- Truncate tail bytes beyond the last valid frame.
+- Rename `.open` → `.bin`.
+- If matching `.bin` already exists, discard `.open` and record
+  `DiscardedDuplicateBin` in the recovery report.
+
+The returned `OpenSegmentRecoveryReport` captures per-file outcomes and
+truncation metadata for audit/telemetry.
+
 #### Segment Rotation
 
 Segments rotate when writing a frame would exceed `max_segment_bytes`

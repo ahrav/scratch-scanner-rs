@@ -15,11 +15,16 @@
 //!
 //! - [`format`] — deterministic framed codec (`len + crc32 + type + payload`)
 //!   for `RunStart`, `RuleDef`, `FindingBatch`, and `RunEnd` records.
+//! - [`reader`] — streaming, position-tracking iterator over framed records
+//!   with reason-coded errors. This is the primary entry point for offline
+//!   query and segment recovery (e.g. truncating a corrupt `.open` file at
+//!   the last valid frame boundary via [`LogReader::next_frame_offset`]).
 //! - [`writer`] — bounded single-writer runtime that implements
 //!   [`StoreProducer`](crate::store::StoreProducer) with backpressure,
 //!   segment rotation, and durable `.open` → `.bin` finalization.
 
 pub mod format;
+pub mod reader;
 mod secret_cache;
 pub mod writer;
 
@@ -28,9 +33,11 @@ pub use format::{
     LogFindingRecord, LogRecord, LogRecordReader, LogRuleDef, LogRunEnd, LogRunStart,
     DEFAULT_MAX_FRAME_PAYLOAD_BYTES, LOG_FORMAT_VERSION,
 };
+pub use reader::{LogReadError, LogReadErrorReason, LogReader};
 #[cfg(feature = "bench")]
 pub use secret_cache::SecretHashCache;
 pub use writer::{
-    default_fs_log_root, list_finalized_segment_files, AppendLogStoreProducer, LogWriterConfig,
-    SCANNER_FS_LOG_DIR_ENV,
+    default_fs_log_root, list_finalized_segment_files, recover_open_segments,
+    AppendLogStoreProducer, LogWriterConfig, OpenSegmentRecoveryEntry, OpenSegmentRecoveryOutcome,
+    OpenSegmentRecoveryReport, SCANNER_FS_LOG_DIR_ENV,
 };

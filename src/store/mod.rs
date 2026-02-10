@@ -11,8 +11,9 @@
 //!   paths to hand off post-dedupe findings to a persistence backend.
 //!
 //! **Phase C** — append-only log persistence backend:
-//! - [`log`] — framed binary codec ([`log::format`]) and bounded single-writer
-//!   runtime ([`log::writer`]) that implements [`StoreProducer`] with segment
+//! - [`log`] — framed binary codec ([`log::format`]), streaming reader with
+//!   reason-coded errors ([`log::reader`]), and bounded single-writer runtime
+//!   ([`log::writer`]) that implements [`StoreProducer`] with segment
 //!   rotation, CRC integrity, and backpressure.
 
 pub mod fs;
@@ -37,6 +38,8 @@ pub use keys::{
 #[cfg(feature = "bench")]
 pub use log::SecretHashCache;
 pub use log::{
-    default_fs_log_root, list_finalized_segment_files, AppendLogStoreProducer, LogWriterConfig,
+    default_fs_log_root, list_finalized_segment_files, recover_open_segments,
+    AppendLogStoreProducer, LogReadError, LogReadErrorReason, LogReader, LogWriterConfig,
+    OpenSegmentRecoveryEntry, OpenSegmentRecoveryOutcome, OpenSegmentRecoveryReport,
     SCANNER_FS_LOG_DIR_ENV,
 };
