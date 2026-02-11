@@ -2,7 +2,7 @@
 //!
 //! Usage:
 //!   cargo bench --bench git_scan_perf -- --repo <path> [--iters N] [--warmup N]
-//!       [--pin-core N] [--merge all|first-parent] [--anchors manual|derived]
+//!       [--pin-core N] [--x-merge all|first-parent] [--anchors manual|derived]
 //!
 //! Warmup iterations are discarded; the summary reports median and MAD.
 
@@ -151,12 +151,12 @@ fn parse_args() -> BenchConfig {
                 }));
                 continue;
             }
-            if let Some(value) = flag.strip_prefix("--merge=") {
+            if let Some(value) = flag.strip_prefix("--x-merge=") {
                 merge_mode = match value {
                     "all" => MergeDiffMode::AllParents,
                     "first-parent" => MergeDiffMode::FirstParentOnly,
                     _ => {
-                        eprintln!("invalid --merge value: {}", value);
+                        eprintln!("invalid --x-merge value: {}", value);
                         std::process::exit(2);
                     }
                 };
@@ -227,7 +227,7 @@ OPTIONS:\n\
     --iters=<N>                Measured iterations (default: 10)\n\
     --warmup=<N>               Warmup iterations (default: 1)\n\
     --pin-core=<N>             Pin to core id (Linux only)\n\
-    --merge=all|first-parent   Merge diff mode (default: all)\n\
+    --x-merge=all|first-parent Merge diff mode (default: all)\n\
     --anchors=manual|derived   Anchor mode (default: manual)\n\
     --max-transform-depth=<N>  Override transform depth\n\
     --help, -h                 Show this help message",

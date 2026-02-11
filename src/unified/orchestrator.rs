@@ -187,8 +187,10 @@ fn run_fs(
 
     let scan_start = Instant::now();
 
-    // Structured event sink: JSONL findings to stdout, or null sink for diagnostics.
+    // Structured event sink: findings to stdout (format per --event-format),
+    // or null sink for overhead measurement.
     let event_sink: Arc<dyn super::events::EventSink> = if null_sink {
+        eprintln!("info: --null-sink enabled; findings will not be written to stdout");
         Arc::new(super::events::NullEventSink)
     } else {
         build_event_sink(event_format, verbose)
@@ -410,6 +412,7 @@ fn run_git(
     });
 
     let event_sink: Arc<dyn super::events::EventSink> = if null_sink {
+        eprintln!("info: --null-sink enabled; findings will not be written to stdout");
         Arc::new(super::events::NullEventSink)
     } else {
         build_event_sink(event_format, verbose)

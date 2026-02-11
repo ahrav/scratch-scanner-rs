@@ -292,9 +292,9 @@ fn parse_fs_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<S
     })
 }
 
-/// Parse `--repo`, `--mode`, and other git-specific flags from the
-/// remaining argument iterator. Accepts `--repo=<path>` or a bare positional
-/// path. Exits with code 2 on unrecognised flags or missing `--repo`.
+/// Parse git-specific flags from the remaining argument iterator.
+/// Accepts `--repo=<path>` or a bare positional path. Exits with code 2
+/// on unrecognised flags or missing `--repo`.
 fn parse_git_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<ScanConfig> {
     let mut repo: Option<PathBuf> = None;
     let mut repo_id: u64 = 1;
@@ -410,18 +410,26 @@ fn parse_git_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<
                 engine_chunk_mb = Some(n);
                 continue;
             }
+            if let Some(rest) = flag.strip_prefix("--debug=") {
+                match rest {
+                    "perf" => debug_level = DebugLevel::Perf,
+                    _ => {
+                        eprintln!(
+                            "invalid --debug value: {} (expected: perf, or bare --debug for stats)",
+                            rest
+                        );
+                        std::process::exit(2);
+                    }
+                }
+                continue;
+            }
             match flag {
-                // --debug / --debug=perf
                 "--debug" => {
                     // Bare --debug: stage stats only (don't downgrade if
                     // --debug=perf was already seen).
                     if debug_level == DebugLevel::Off {
                         debug_level = DebugLevel::Stats;
                     }
-                    continue;
-                }
-                "--debug=perf" => {
-                    debug_level = DebugLevel::Perf;
                     continue;
                 }
                 "--scan-binary" => {
@@ -1128,6 +1136,16 @@ mod tests {
     fn git_null_sink_flag_parsed() {
         let args = vec![OsString::from("--repo=/r"), OsString::from("--null-sink")];
         let config = parse_git_args(args.into_iter()).unwrap();
+        assert!(config.null_sink);
+    }
+
+    #[test]
+    fn fs_null_sink_flag_parsed() {
+        let args = vec![
+            OsString::from("--path=/some/dir"),
+            OsString::from("--null-sink"),
+        ];
+        let config = parse_fs_args(args.into_iter()).unwrap();
         assert!(config.null_sink);
     }
 
