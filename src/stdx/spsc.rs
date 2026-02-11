@@ -597,6 +597,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // 10k iterations too slow under Miri; see miri variant below.
     fn cross_thread_fifo() {
         let (mut tx, mut rx) = spsc_channel::<u64, 8>();
         let count = 10_000u64;
@@ -631,6 +632,101 @@ mod tests {
         for (i, &v) in received.iter().enumerate() {
             assert_eq!(v, i as u64, "FIFO violation at index {}", i);
         }
+    }
+
+    /// Miri-friendly variant of `cross_thread_fifo` with a small iteration
+    /// count. Exercises the same Acquire/Release ordering and UnsafeCell
+    /// access pattern under Miri's thread interleaving.
+    #[test]
+    fn cross_thread_fifo_miri() {
+        let (mut tx, mut rx) = spsc_channel::<u64, 4>();
+        // Small count for Miri — enough to wrap the ring and exercise ordering.
+        let count = if cfg!(miri) { 16u64 } else { 200u64 };
+
+        let producer = std::thread::spawn(move || {
+            for i in 0..count {
+                loop {
+                    match tx.try_push(i) {
+                        Ok(()) => break,
+                        Err(_) => std::thread::yield_now(),
+                    }
+                }
+            }
+        });
+
+        let consumer = std::thread::spawn(move || {
+            let mut received = Vec::with_capacity(count as usize);
+            while received.len() < count as usize {
+                if let Some(v) = rx.try_pop() {
+                    received.push(v);
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+            received
+        });
+
+        producer.join().unwrap();
+        let received = consumer.join().unwrap();
+
+        assert_eq!(received.len(), count as usize);
+        for (i, &v) in received.iter().enumerate() {
+            assert_eq!(v, i as u64, "FIFO violation at index {i}");
+        }
+    }
+
+    /// Drop semantics under cross-thread ownership transfer.
+    /// The producer pushes DropTrackers, consumer pops some, then both handles
+    /// are dropped — verifying no leak or double-drop.
+    #[test]
+    fn cross_thread_drop_tracking() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct Dt(Arc<AtomicUsize>);
+        impl Drop for Dt {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let count = if cfg!(miri) { 8usize } else { 100usize };
+        let (mut tx, mut rx) = spsc_channel::<Dt, 4>();
+
+        let drops_p = drops.clone();
+        let producer = std::thread::spawn(move || {
+            for _ in 0..count {
+                // Create the tracker once per item; retry pushes the same instance.
+                let mut item = Some(Dt(drops_p.clone()));
+                loop {
+                    match tx.try_push(item.take().unwrap()) {
+                        Ok(()) => break,
+                        Err(returned) => {
+                            item = Some(returned);
+                            std::thread::yield_now();
+                        }
+                    }
+                }
+            }
+        });
+
+        let consumer = std::thread::spawn(move || {
+            let mut popped = 0;
+            while popped < count {
+                if let Some(_v) = rx.try_pop() {
+                    popped += 1;
+                    // _v dropped here.
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+        });
+
+        producer.join().unwrap();
+        consumer.join().unwrap();
+
+        assert_eq!(drops.load(Ordering::Relaxed), count);
     }
 }
 

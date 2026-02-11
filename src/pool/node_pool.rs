@@ -202,6 +202,221 @@ impl<const NODE_SIZE: usize, const NODE_ALIGNMENT: usize> Drop
     }
 }
 
+// ---------------------------------------------------------------------------
+// Miri-friendly unit tests (no feature gates, no proptest).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod miri_tests {
+    use super::*;
+    use std::ptr::NonNull;
+
+    #[test]
+    fn acquire_single_and_release() {
+        let mut pool = NodePoolType::<8, 8>::init(1);
+        let node = pool.acquire();
+        // Write to prove the memory is accessible.
+        unsafe { node.as_ptr().write(0xAB) };
+        pool.release(node);
+    }
+
+    #[test]
+    fn acquire_all_then_release_all() {
+        let cap = 4u32;
+        let mut pool = NodePoolType::<16, 8>::init(cap);
+        let mut nodes: Vec<NonNull<u8>> = Vec::new();
+        for _ in 0..cap {
+            nodes.push(pool.acquire());
+        }
+        // All nodes should be distinct.
+        for i in 0..nodes.len() {
+            for j in (i + 1)..nodes.len() {
+                assert_ne!(nodes[i], nodes[j]);
+            }
+        }
+        for node in nodes {
+            pool.release(node);
+        }
+    }
+
+    #[test]
+    fn interleaved_acquire_release() {
+        let mut pool = NodePoolType::<8, 8>::init(2);
+        let a = pool.acquire();
+        let b = pool.acquire();
+
+        // Write unique values.
+        unsafe {
+            a.as_ptr().write(1);
+            b.as_ptr().write(2);
+        }
+
+        pool.release(a);
+        let c = pool.acquire(); // should reuse a's slot
+
+        unsafe {
+            assert_eq!(b.as_ptr().read(), 2); // b untouched
+            c.as_ptr().write(3);
+        }
+
+        pool.release(b);
+        pool.release(c);
+    }
+
+    #[test]
+    fn alignment_is_respected() {
+        let mut pool = NodePoolType::<64, 16>::init(4);
+        for _ in 0..4 {
+            let node = pool.acquire();
+            assert_eq!(
+                node.as_ptr() as usize % 16,
+                0,
+                "node pointer not aligned to 16"
+            );
+            pool.release(node);
+        }
+    }
+
+    #[test]
+    fn acquire_release_cycle_reuses_slots() {
+        let mut pool = NodePoolType::<8, 8>::init(1);
+        for _ in 0..10 {
+            let node = pool.acquire();
+            unsafe { node.as_ptr().write(0xFF) };
+            pool.release(node);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "node pool exhausted")]
+    fn exhaustion_panics() {
+        // ManuallyDrop avoids the pool's Drop asserting "all nodes must be
+        // released" during panic unwinding, which would double-panic and abort.
+        let mut pool = std::mem::ManuallyDrop::new(NodePoolType::<8, 8>::init(1));
+        let _a = pool.acquire();
+        let _b = pool.acquire(); // should panic
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    // Small pool capacity — keeps Kani state space tractable while exercising
+    // multi-slot logic (at least 2 nodes for overlap checks).
+    const MAX_NODES: u32 = 3;
+
+    /// Acquire always returns a pointer within the allocated buffer.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn verify_acquire_in_bounds() {
+        let cap: u32 = kani::any();
+        kani::assume(cap >= 1 && cap <= MAX_NODES);
+
+        let mut pool = NodePoolType::<8, 8>::init(cap);
+        let node = pool.acquire();
+
+        let base = pool.buffer.as_ptr() as usize;
+        let ptr = node.as_ptr() as usize;
+
+        kani::assert(ptr >= base, "acquired pointer must be >= buffer base");
+        kani::assert(
+            ptr + 8 <= base + pool.len,
+            "acquired pointer + NODE_SIZE must be within buffer",
+        );
+
+        pool.release(node);
+    }
+
+    /// Two concurrently-held nodes never overlap.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn verify_no_overlap() {
+        let mut pool = NodePoolType::<8, 8>::init(2);
+
+        let a = pool.acquire();
+        let b = pool.acquire();
+
+        let a_start = a.as_ptr() as usize;
+        let b_start = b.as_ptr() as usize;
+
+        // Non-overlapping: [a, a+8) and [b, b+8) must not intersect.
+        kani::assert(
+            a_start + 8 <= b_start || b_start + 8 <= a_start,
+            "two acquired nodes must not overlap",
+        );
+
+        pool.release(a);
+        pool.release(b);
+    }
+
+    /// Release returns the slot to the free set; re-acquire succeeds.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn verify_release_reacquire() {
+        let mut pool = NodePoolType::<8, 8>::init(1);
+
+        let a = pool.acquire();
+        pool.release(a);
+
+        // After release, the slot must be reusable.
+        let b = pool.acquire();
+        kani::assert(!b.as_ptr().is_null(), "re-acquired pointer must be valid");
+
+        pool.release(b);
+    }
+
+    /// Free-count is node_count after init, decreases on acquire, increases on
+    /// release — the bitset accurately tracks outstanding nodes.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn verify_free_count_tracking() {
+        let cap: u32 = kani::any();
+        kani::assume(cap >= 1 && cap <= MAX_NODES);
+
+        let mut pool = NodePoolType::<8, 8>::init(cap);
+
+        // All slots free after init.
+        kani::assert(
+            pool.free.count() == cap as usize,
+            "all slots must be free after init",
+        );
+
+        let node = pool.acquire();
+
+        // One fewer free slot after acquire.
+        kani::assert(
+            pool.free.count() == (cap as usize) - 1,
+            "free count must decrease by 1 after acquire",
+        );
+
+        pool.release(node);
+
+        // Restored after release.
+        kani::assert(
+            pool.free.count() == cap as usize,
+            "free count must be restored after release",
+        );
+    }
+
+    /// Acquired pointer is aligned to NODE_ALIGNMENT.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn verify_alignment() {
+        let cap: u32 = kani::any();
+        kani::assume(cap >= 1 && cap <= MAX_NODES);
+
+        let mut pool = NodePoolType::<16, 16>::init(cap);
+        let node = pool.acquire();
+
+        kani::assert(
+            node.as_ptr() as usize % 16 == 0,
+            "acquired pointer must be aligned to NODE_ALIGNMENT",
+        );
+
+        pool.release(node);
+    }
+}
+
 #[cfg(all(test, feature = "stdx-proptest"))]
 mod tests {
     use super::NodePoolType;

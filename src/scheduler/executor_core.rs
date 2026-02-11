@@ -5,8 +5,12 @@
 
 use std::any::Any;
 use std::panic;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+
+#[cfg(loom)]
+use loom::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(not(loom))]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::executor::ExecutorConfig;
 
@@ -401,5 +405,193 @@ where
     match idle.on_idle(cfg) {
         IdleAction::Continue => WorkerStepResult::NoWork,
         IdleAction::Park { timeout } => WorkerStepResult::ShouldPark { timeout },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Loom concurrency tests for the combined state machine.
+// ---------------------------------------------------------------------------
+
+#[cfg(loom)]
+mod loom_tests {
+    use super::*;
+    use loom::sync::atomic::AtomicUsize;
+    use loom::sync::Arc;
+    use loom::thread;
+
+    /// Helper: CAS-loop spawn (mirrors `ExecutorHandle::spawn`).
+    /// Returns `true` if the spawn was accepted, `false` if gate was closed.
+    fn try_spawn(state: &AtomicUsize) -> bool {
+        let mut s = state.load(Ordering::Acquire);
+        loop {
+            if !is_accepting(s) {
+                return false;
+            }
+            match state.compare_exchange_weak(
+                s,
+                s.wrapping_add(COUNT_UNIT),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => s = actual,
+            }
+        }
+    }
+
+    /// Helper: completion decrement (mirrors worker completion path).
+    /// Returns `true` if this decrement should trigger `initiate_done`.
+    fn complete(state: &AtomicUsize) -> bool {
+        let prev = state.fetch_sub(COUNT_UNIT, Ordering::AcqRel);
+        in_flight(prev) == 1 && !is_accepting(prev)
+    }
+
+    /// Concurrent spawn vs join: either spawn succeeds (before close) or
+    /// fails (after close). The combined state must never go inconsistent.
+    #[test]
+    fn spawn_vs_join_gate_atomicity() {
+        loom::model(|| {
+            // State: accepting=1, count=0
+            let state = Arc::new(AtomicUsize::new(ACCEPTING_BIT));
+            let s2 = Arc::clone(&state);
+
+            // Thread 1: try to spawn
+            let h = thread::spawn(move || try_spawn(&s2));
+
+            // Main: close gate (join)
+            let prev = close_gate(&state);
+            let main_saw_count = in_flight(prev);
+
+            let spawn_ok = h.join().unwrap();
+
+            let final_state = state.load(Ordering::Acquire);
+            let final_count = in_flight(final_state);
+
+            if spawn_ok {
+                // Spawn won the race: count was incremented before or after
+                // gate close, but CAS saw accepting=1.
+                assert_eq!(final_count, 1, "spawn succeeded → count must be 1");
+                assert!(
+                    !is_accepting(final_state),
+                    "gate must be closed after join",
+                );
+            } else {
+                // Join won: gate was closed before spawn's CAS observed it.
+                assert_eq!(
+                    final_count, main_saw_count,
+                    "spawn failed → count unchanged",
+                );
+            }
+        });
+    }
+
+    /// Completion vs join: last one to see count==0 && !accepting triggers done.
+    /// Exactly one of the two threads should see the termination condition.
+    #[test]
+    fn completion_vs_join_termination() {
+        loom::model(|| {
+            // State: accepting=1, count=1 (one in-flight task)
+            let state = Arc::new(AtomicUsize::new(ACCEPTING_BIT | COUNT_UNIT));
+            let s2 = Arc::clone(&state);
+
+            // Thread 1: complete the task (decrement count)
+            let h = thread::spawn(move || complete(&s2));
+
+            // Main: close gate
+            let prev = close_gate(&state);
+            let main_triggers_done = in_flight(prev) == 0 && is_accepting(prev);
+            // Note: main_triggers_done can only be true if count was already 0
+            // when we closed the gate. But we started with count=1, so the
+            // completion thread must have decremented first.
+
+            let thread_triggers_done = h.join().unwrap();
+
+            // Exactly one must trigger done.
+            let final_state = state.load(Ordering::Acquire);
+            if in_flight(final_state) == 0 && !is_accepting(final_state) {
+                // Terminal state reached.
+                // At least one path must have triggered done.
+                assert!(
+                    main_triggers_done || thread_triggers_done,
+                    "terminal state reached but no one triggered done",
+                );
+            }
+
+            // Both cannot be true simultaneously unless count was 0 when
+            // main closed the gate AND also the thread saw count==1 and
+            // !accepting — which is impossible because main closing
+            // the gate doesn't change the count.
+            assert!(
+                !(main_triggers_done && thread_triggers_done),
+                "both threads cannot trigger done simultaneously",
+            );
+        });
+    }
+
+    /// Two concurrent spawns: both succeed, total count is 2.
+    #[test]
+    fn concurrent_spawns_no_lost_count() {
+        loom::model(|| {
+            let state = Arc::new(AtomicUsize::new(ACCEPTING_BIT));
+            let s2 = Arc::clone(&state);
+
+            let h = thread::spawn(move || try_spawn(&s2));
+
+            let r1 = try_spawn(&state);
+            let r2 = h.join().unwrap();
+
+            // Gate never closed, so both must succeed.
+            assert!(r1, "spawn 1 must succeed (gate open)");
+            assert!(r2, "spawn 2 must succeed (gate open)");
+
+            let final_count = in_flight(state.load(Ordering::Acquire));
+            assert_eq!(final_count, 2, "two successful spawns → count must be 2");
+        });
+    }
+
+    /// Spawn + complete + join race: three-way interleaving.
+    /// The spawn thread tries to enqueue, the worker thread completes a
+    /// pre-existing task, and the main thread closes the gate.
+    #[test]
+    fn three_way_spawn_complete_join() {
+        loom::model(|| {
+            // Start: accepting=1, count=1 (one pre-existing in-flight task)
+            let state = Arc::new(AtomicUsize::new(ACCEPTING_BIT | COUNT_UNIT));
+            let s_spawn = Arc::clone(&state);
+            let s_complete = Arc::clone(&state);
+
+            // Thread A: try to spawn a new task
+            let h_spawn = thread::spawn(move || try_spawn(&s_spawn));
+
+            // Thread B: complete the existing task
+            let h_complete = thread::spawn(move || complete(&s_complete));
+
+            // Main: close gate (join)
+            close_gate(&state);
+
+            let spawn_ok = h_spawn.join().unwrap();
+            let complete_triggered_done = h_complete.join().unwrap();
+
+            let final_state = state.load(Ordering::Acquire);
+            let final_count = in_flight(final_state);
+
+            // Gate must be closed.
+            assert!(
+                !is_accepting(final_state),
+                "gate must be closed after join",
+            );
+
+            // Count must be consistent with operations.
+            if spawn_ok {
+                // Started with 1, +1 spawn, -1 completion = 1.
+                assert_eq!(final_count, 1, "spawn ok + completion → count 1");
+                // Completion can't trigger done if spawn succeeded (count was ≥1 after sub).
+                // Actually it depends on ordering — completion may have run after gate close
+                // but before spawn. Let's just check the count is correct.
+            } else {
+                // Started with 1, -1 completion = 0.
+                assert_eq!(final_count, 0, "spawn failed + completion → count 0");
+            }
+        });
     }
 }

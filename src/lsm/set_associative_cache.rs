@@ -942,7 +942,22 @@ where
     }
 
     /// Bitmask of ways whose tag matches `tag` (bit i corresponds to way i).
-    #[cfg(target_arch = "aarch64")]
+    /// Under Miri, we always use the scalar fallback since SIMD intrinsics
+    /// are not supported by the Miri interpreter.
+    #[cfg(miri)]
+    #[inline]
+    fn search_tags(tags: &[TagT; WAYS], tag: TagT) -> u16 {
+        let mut bits = 0u16;
+        for (i, &t) in tags.iter().enumerate() {
+            if t == tag {
+                bits |= 1u16 << i;
+            }
+        }
+        bits
+    }
+
+    /// Bitmask of ways whose tag matches `tag` (bit i corresponds to way i).
+    #[cfg(all(not(miri), target_arch = "aarch64"))]
     #[inline]
     fn search_tags(tags: &[TagT; WAYS], tag: TagT) -> u16 {
         // SAFETY: NEON intrinsics are available on all aarch64 targets.
@@ -950,7 +965,7 @@ where
     }
 
     /// Bitmask of ways whose tag matches `tag` (bit i corresponds to way i).
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(not(miri), target_arch = "x86_64"))]
     #[inline]
     fn search_tags(tags: &[TagT; WAYS], tag: TagT) -> u16 {
         // SAFETY: SSE2 is baseline on x86_64.
@@ -958,7 +973,7 @@ where
     }
 
     /// Bitmask of ways whose tag matches `tag` (bit i corresponds to way i).
-    #[cfg(target_arch = "x86")]
+    #[cfg(all(not(miri), target_arch = "x86"))]
     #[inline]
     fn search_tags(tags: &[TagT; WAYS], tag: TagT) -> u16 {
         if std::is_x86_feature_detected!("sse2") {
@@ -976,7 +991,12 @@ where
     }
 
     /// Bitmask of ways whose tag matches `tag` (bit i corresponds to way i).
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "x86")))]
+    #[cfg(not(any(
+        miri,
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "x86"
+    )))]
     #[inline]
     fn search_tags(tags: &[TagT; WAYS], tag: TagT) -> u16 {
         let mut bits = 0u16;

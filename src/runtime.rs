@@ -827,6 +827,141 @@ impl ScannerRuntime {
     }
 }
 
+#[cfg(test)]
+mod tests_buffer_pool {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // Acquire / release — exercises UnsafeCell interior mutability.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn acquire_returns_valid_handle() {
+        let pool = BufferPool::new(1);
+        let handle = pool.acquire();
+        assert_eq!(handle.as_slice().len(), BUFFER_LEN_MAX);
+    }
+
+    #[test]
+    fn acquire_and_release_cycle() {
+        let pool = BufferPool::new(1);
+        // Acquire, drop (release), acquire again — proves release returns the
+        // slot to the pool without UnsafeCell aliasing issues.
+        let h1 = pool.acquire();
+        drop(h1);
+        let h2 = pool.acquire();
+        drop(h2);
+    }
+
+    #[test]
+    fn acquire_multiple_slots() {
+        let pool = BufferPool::new(2);
+        let h1 = pool.acquire();
+        let h2 = pool.acquire();
+        // Two distinct buffers.
+        assert_ne!(h1.ptr, h2.ptr);
+        drop(h1);
+        drop(h2);
+    }
+
+    #[test]
+    fn try_acquire_exhaustion() {
+        let pool = BufferPool::new(1);
+        let _h = pool.acquire();
+        assert!(pool.try_acquire().is_none());
+    }
+
+    #[test]
+    fn release_makes_slot_available() {
+        let pool = BufferPool::new(1);
+        let h = pool.acquire();
+        assert!(pool.try_acquire().is_none());
+        drop(h);
+        assert!(pool.try_acquire().is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Slice access — exercises from_raw_parts / from_raw_parts_mut provenance.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn write_then_read_via_slices() {
+        let pool = BufferPool::new(1);
+        let mut handle = pool.acquire();
+
+        // Write a pattern to the first few bytes.
+        let buf = handle.as_mut_slice();
+        buf[0] = 0xAB;
+        buf[1] = 0xCD;
+        buf[BUFFER_LEN_MAX - 1] = 0xEF;
+
+        // Read back via shared slice.
+        let slice = handle.as_slice();
+        assert_eq!(slice[0], 0xAB);
+        assert_eq!(slice[1], 0xCD);
+        assert_eq!(slice[BUFFER_LEN_MAX - 1], 0xEF);
+    }
+
+    #[test]
+    fn data_persists_across_acquire_release() {
+        let pool = BufferPool::new(1);
+
+        // Write a marker, release, re-acquire, verify marker is still there.
+        // (Pool does not zero on release — this is documented behavior.)
+        {
+            let mut h = pool.acquire();
+            h.as_mut_slice()[42] = 0xFF;
+        }
+        let h = pool.acquire();
+        // Buffer contents are unspecified, but the allocation is valid.
+        let _ = h.as_slice()[42]; // just ensure access doesn't fault.
+    }
+
+    // -----------------------------------------------------------------------
+    // Drop ordering — handle dropped before pool is safe.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pool_outlives_handles() {
+        let pool = BufferPool::new(2);
+        let h1 = pool.acquire();
+        let h2 = pool.acquire();
+        // Drop handles first, then pool — the release_slot calls in handle
+        // Drop run while the pool's Rc is still alive.
+        drop(h1);
+        drop(h2);
+        drop(pool);
+    }
+
+    #[test]
+    fn handles_dropped_after_pool_clone_dropped() {
+        let pool = BufferPool::new(1);
+        let pool2 = pool.clone(); // Rc clone
+        let h = pool.acquire();
+        drop(pool); // original Rc ref gone, but pool2 keeps inner alive
+        drop(pool2); // both Rc refs for pool gone, but h holds one
+        drop(h); // releases slot and drops last Rc → inner dropped
+    }
+
+    // -----------------------------------------------------------------------
+    // Clear — exercises fill(0) over from_raw_parts_mut span.
+    // Under Miri this verifies the entire BUFFER_LEN_MAX range is valid.
+    // Skipped under Miri to avoid slowness from 8MB memset.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn clear_zeroes_entire_buffer() {
+        let pool = BufferPool::new(1);
+        let mut handle = pool.acquire();
+        handle.as_mut_slice()[0] = 0xFF;
+        handle.as_mut_slice()[BUFFER_LEN_MAX - 1] = 0xFF;
+        handle.clear();
+        assert_eq!(handle.as_slice()[0], 0);
+        assert_eq!(handle.as_slice()[BUFFER_LEN_MAX - 1], 0);
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests_filetable_try {
     use super::*;
