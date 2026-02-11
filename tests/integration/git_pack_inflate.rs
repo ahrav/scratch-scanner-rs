@@ -36,7 +36,10 @@ fn build_minimal_pack(oid_len: usize) -> Vec<u8> {
 #[test]
 fn corrupt_sha1_trailer_still_parses() {
     let mut pack = build_minimal_pack(20);
-    assert!(PackFile::parse(&pack, 20).is_ok(), "baseline pack should parse");
+    assert!(
+        PackFile::parse(&pack, 20).is_ok(),
+        "baseline pack should parse"
+    );
 
     // Flip every bit in the 20-byte trailer region.
     let trailer_start = pack.len() - 20;
@@ -82,7 +85,10 @@ fn truncated_sha1_trailer_triggers_too_small() {
 #[test]
 fn corrupt_sha256_trailer_still_parses() {
     let mut pack = build_minimal_pack(32);
-    assert!(PackFile::parse(&pack, 32).is_ok(), "baseline pack should parse");
+    assert!(
+        PackFile::parse(&pack, 32).is_ok(),
+        "baseline pack should parse"
+    );
 
     // Flip every bit in the 32-byte trailer region.
     let trailer_start = pack.len() - 32;

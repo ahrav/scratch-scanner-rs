@@ -47,8 +47,8 @@ fn tiny_zlib_block_inflates_single_byte() {
 
     let zlib_input = pack.slice_from(header.data_start);
     let mut out = Vec::with_capacity(header.size as usize);
-    let consumed =
-        inflate_limited(zlib_input, &mut out, header.size as usize).expect("inflate should succeed");
+    let consumed = inflate_limited(zlib_input, &mut out, header.size as usize)
+        .expect("inflate should succeed");
 
     assert_eq!(out, b"X", "decompressed payload should be a single 'X'");
     assert!(consumed > 0, "should consume at least some input bytes");
@@ -67,12 +67,15 @@ fn concat_zlib_streams_stops_at_first_stream_end() {
     let header = pack
         .entry_header_at(FIRST_ENTRY_OFFSET, MAX_HEADER_BYTES)
         .expect("entry header");
-    assert_eq!(header.size, 4, "declared size should match first block (ABCD)");
+    assert_eq!(
+        header.size, 4,
+        "declared size should match first block (ABCD)"
+    );
 
     let zlib_input = pack.slice_from(header.data_start);
     let mut out = Vec::with_capacity(header.size as usize);
-    let consumed =
-        inflate_limited(zlib_input, &mut out, header.size as usize).expect("inflate should succeed");
+    let consumed = inflate_limited(zlib_input, &mut out, header.size as usize)
+        .expect("inflate should succeed");
 
     assert_eq!(out, b"ABCD", "should decompress only the first stream");
     // The consumed bytes should be less than the full zlib region because the
@@ -103,10 +106,7 @@ fn zlib_output_cap_1024_inflates_exact_boundary() {
     inflate_limited(zlib_input, &mut out, header.size as usize).expect("inflate should succeed");
 
     assert_eq!(out.len(), 1024, "output should be exactly 1024 bytes");
-    assert!(
-        out.iter().all(|&b| b == b'A'),
-        "all bytes should be 'A'"
-    );
+    assert!(out.iter().all(|&b| b == b'A'), "all bytes should be 'A'");
 }
 
 // ---------------------------------------------------------------------------
@@ -171,7 +171,10 @@ fn zero_length_zlib_header_only() {
 
     match result {
         Ok(_) => {
-            assert!(out.is_empty(), "successful inflate of zero-length should produce empty output");
+            assert!(
+                out.is_empty(),
+                "successful inflate of zero-length should produce empty output"
+            );
         }
         Err(InflateError::TruncatedInput | InflateError::Backend) => {
             // Acceptable: the bare header without a final deflate block is

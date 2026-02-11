@@ -464,9 +464,8 @@ fn mixed_ofs_ref_delta_chain_resolution() {
         ..Default::default()
     };
 
-    let plan = unpack_plan(
-        build_pack_plans(vec![cand], &[Some(pack_view)], &resolver, &config).unwrap(),
-    );
+    let plan =
+        unpack_plan(build_pack_plans(vec![cand], &[Some(pack_view)], &resolver, &config).unwrap());
 
     // All 3 offsets must be present.
     assert_eq!(
@@ -543,9 +542,8 @@ fn mixed_ref_ofs_ref_chain_resolution() {
         ..Default::default()
     };
 
-    let plan = unpack_plan(
-        build_pack_plans(vec![cand], &[Some(pack_view)], &resolver, &config).unwrap(),
-    );
+    let plan =
+        unpack_plan(build_pack_plans(vec![cand], &[Some(pack_view)], &resolver, &config).unwrap());
 
     // All 4 offsets must be present.
     assert_eq!(
@@ -595,10 +593,7 @@ fn mixed_chain_with_external_ref() {
     let mut ofs_header = encode_obj_header(6, 1); // OFS_DELTA
     ofs_header.extend_from_slice(&encode_ofs_distance(ofs_offset - ref_offset));
 
-    let pack_bytes = build_pack(
-        20,
-        &[(ref_offset, ref_header), (ofs_offset, ofs_header)],
-    );
+    let pack_bytes = build_pack(20, &[(ref_offset, ref_header), (ofs_offset, ofs_header)]);
     let pack_view = PackView::parse(&pack_bytes, 20).unwrap();
 
     // External base resolves to a different pack (pack_id=1).
@@ -618,9 +613,8 @@ fn mixed_chain_with_external_ref() {
         ..Default::default()
     };
 
-    let plan = unpack_plan(
-        build_pack_plans(vec![cand], &[Some(pack_view)], &resolver, &config).unwrap(),
-    );
+    let plan =
+        unpack_plan(build_pack_plans(vec![cand], &[Some(pack_view)], &resolver, &config).unwrap());
 
     // Both local offsets must be in need_offsets.
     assert_eq!(plan.need_offsets, vec![ref_offset, ofs_offset]);
@@ -678,11 +672,7 @@ fn deep_ofs_chain_at_depth_32() {
         build_pack_plans(vec![cand], &[Some(pack_view)], &NoopResolver, &config).unwrap(),
     );
 
-    assert_eq!(
-        plan.need_offsets.len(),
-        33,
-        "base + 32 deltas = 33 offsets"
-    );
+    assert_eq!(plan.need_offsets.len(), 33, "base + 32 deltas = 33 offsets");
     // Verify all offsets are present in sorted order.
     for &off in &offsets {
         assert!(

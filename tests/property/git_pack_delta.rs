@@ -107,11 +107,7 @@ fn build_mixed_delta(base_len: usize, result_len: usize, ops: &[DeltaOp<'_>]) ->
 }
 
 /// Apply delta via the streaming API and collect output.
-fn apply_delta_into_vec(
-    base: &[u8],
-    delta: &[u8],
-    max_out: usize,
-) -> Result<Vec<u8>, DeltaError> {
+fn apply_delta_into_vec(base: &[u8], delta: &[u8], max_out: usize) -> Result<Vec<u8>, DeltaError> {
     let mut collected = Vec::new();
     apply_delta_into(base, delta, max_out, |chunk| {
         collected.extend_from_slice(chunk);
