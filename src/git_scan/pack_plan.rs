@@ -632,13 +632,14 @@ fn build_delta_dep_index(need_offsets: &[u64], delta_deps: &[DeltaDep]) -> Vec<u
 }
 
 /// Result from `build_exec_order` including diagnostic stats.
-struct ExecOrderResult {
+#[doc(hidden)]
+pub struct ExecOrderResult {
     /// DFS execution order, or `None` when natural order suffices.
-    order: Option<Vec<u32>>,
+    pub order: Option<Vec<u32>>,
     /// Number of indegree-0 nodes with dependents (delta tree roots).
-    tree_roots: u32,
+    pub tree_roots: u32,
     /// Maximum depth of the dependency DAG.
-    max_depth: u32,
+    pub max_depth: u32,
 }
 
 /// Build a cache-aware DFS execution order for pack delta chains.
@@ -661,7 +662,8 @@ struct ExecOrderResult {
 ///    pushed in reverse so thinnest lands on top. DAG nodes wait until all
 ///    parents are emitted (`dag_remaining` counter).
 /// 4. **Identity check**: If the result is `[0..n]`, return `None`.
-fn build_exec_order(
+#[doc(hidden)]
+pub fn build_exec_order(
     need_offsets: &[u64],
     delta_deps: &[DeltaDep],
     pack_id: u16,
@@ -839,67 +841,23 @@ fn is_sorted_unique(offsets: &[u64]) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn exec_order_backward_deps_groups_subtrees() {
-        // Even with all backward deps, DFS groups subtrees contiguously.
-        // Offsets: 10(idx0)→50(idx1), 70(idx2) independent.
-        // DFS processes thin subtrees first (idx2 alone), then subtree
-        // rooted at idx0 (idx0, idx1).
-        let need_offsets = vec![10, 50, 70];
-        let deps = vec![DeltaDep {
-            offset: 50,
+    /// Shorthand for an OFS_DELTA dependency: `offset` depends on `base`.
+    fn ofs_dep(offset: u64, base: u64) -> DeltaDep {
+        DeltaDep {
+            offset,
             kind: DeltaKind::Ofs,
-            base: BaseLoc::Offset(10),
-        }];
-        let result = build_exec_order(&need_offsets, &deps, 0).unwrap();
-        let order = result.order.expect("DFS reorders even backward deps");
-        // Base (idx0) must come before its dependent (idx1).
-        let pos_base = order.iter().position(|&v| v == 0).unwrap();
-        let pos_dep = order.iter().position(|&v| v == 1).unwrap();
-        assert!(pos_base < pos_dep, "base must precede dependent");
-        // idx0 and idx1 must be adjacent (subtree contiguous).
-        assert_eq!(pos_dep - pos_base, 1, "subtree must be contiguous");
+            base: BaseLoc::Offset(base),
+        }
     }
 
-    #[test]
-    fn exec_order_respects_forward_dep() {
-        let need_offsets = vec![10, 50, 70];
-        let deps = vec![DeltaDep {
-            offset: 10,
+    /// Shorthand for a REF_DELTA dependency: `offset` depends on `base`.
+    fn ref_dep(offset: u64, base: u64) -> DeltaDep {
+        DeltaDep {
+            offset,
             kind: DeltaKind::Ref,
-            base: BaseLoc::Offset(50),
-        }];
-        let result = build_exec_order(&need_offsets, &deps, 0).unwrap();
-        let order = result.order.expect("exec order");
-        let pos = |offset| {
-            let idx = need_offsets.iter().position(|&o| o == offset).unwrap();
-            order.iter().position(|&o| o == idx as u32).unwrap()
-        };
-        assert!(pos(50) < pos(10));
+            base: BaseLoc::Offset(base),
+        }
     }
-
-    #[test]
-    fn delta_dep_index_maps_need_offsets() {
-        let need_offsets = vec![10, 20, 30, 40];
-        let deps = vec![
-            DeltaDep {
-                offset: 20,
-                kind: DeltaKind::Ofs,
-                base: BaseLoc::Offset(10),
-            },
-            DeltaDep {
-                offset: 40,
-                kind: DeltaKind::Ref,
-                base: BaseLoc::External {
-                    oid: OidBytes::sha1([0x11; 20]),
-                },
-            },
-        ];
-        let index = build_delta_dep_index(&need_offsets, &deps);
-        assert_eq!(index, vec![NONE_U32, 0, NONE_U32, 1]);
-    }
-
-    // --- DFS execution order tests ---
 
     /// Helper: verify topological ordering (base before all dependents).
     fn assert_topo_valid(order: &[u32], edges: &[(u32, u32)]) {
@@ -930,84 +888,78 @@ mod tests {
     }
 
     #[test]
+    fn exec_order_backward_deps_groups_subtrees() {
+        // Even with all backward deps, DFS groups subtrees contiguously.
+        // Offsets: 10(idx0)→50(idx1), 70(idx2) independent.
+        let need_offsets = vec![10, 50, 70];
+        let deps = vec![ofs_dep(50, 10)];
+        let result = build_exec_order(&need_offsets, &deps, 0).unwrap();
+        let order = result.order.expect("DFS reorders even backward deps");
+        let pos_base = order.iter().position(|&v| v == 0).unwrap();
+        let pos_dep = order.iter().position(|&v| v == 1).unwrap();
+        assert!(pos_base < pos_dep, "base must precede dependent");
+        assert_eq!(pos_dep - pos_base, 1, "subtree must be contiguous");
+    }
+
+    #[test]
+    fn exec_order_respects_forward_dep() {
+        let need_offsets = vec![10, 50, 70];
+        let deps = vec![ref_dep(10, 50)];
+        let result = build_exec_order(&need_offsets, &deps, 0).unwrap();
+        let order = result.order.expect("exec order");
+        let pos = |offset| {
+            let idx = need_offsets.iter().position(|&o| o == offset).unwrap();
+            order.iter().position(|&o| o == idx as u32).unwrap()
+        };
+        assert!(pos(50) < pos(10));
+    }
+
+    #[test]
+    fn delta_dep_index_maps_need_offsets() {
+        let need_offsets = vec![10, 20, 30, 40];
+        let deps = vec![
+            ofs_dep(20, 10),
+            DeltaDep {
+                offset: 40,
+                kind: DeltaKind::Ref,
+                base: BaseLoc::External {
+                    oid: OidBytes::sha1([0x11; 20]),
+                },
+            },
+        ];
+        let index = build_delta_dep_index(&need_offsets, &deps);
+        assert_eq!(index, vec![NONE_U32, 0, NONE_U32, 1]);
+    }
+
+    // --- DFS execution order tests ---
+
+    #[test]
     fn dfs_groups_subtrees_contiguously() {
         // base(0)→A(1), base(0)→B(2), base2(3)→C(4)
         let need_offsets = vec![10, 20, 30, 40, 50];
-        let deps = vec![
-            DeltaDep {
-                offset: 20,
-                kind: DeltaKind::Ofs,
-                base: BaseLoc::Offset(10),
-            },
-            DeltaDep {
-                offset: 30,
-                kind: DeltaKind::Ofs,
-                base: BaseLoc::Offset(10),
-            },
-            DeltaDep {
-                offset: 50,
-                kind: DeltaKind::Ofs,
-                base: BaseLoc::Offset(40),
-            },
-        ];
+        let deps = vec![ofs_dep(20, 10), ofs_dep(30, 10), ofs_dep(50, 40)];
         let result = build_exec_order(&need_offsets, &deps, 0).unwrap();
         let order = result.order.expect("should produce non-identity order");
         assert_eq!(order.len(), 5);
         assert_topo_valid(&order, &[(0, 1), (0, 2), (3, 4)]);
-        // Subtree rooted at idx0: {0, 1, 2} must be contiguous.
         assert_contiguous(&order, &[0, 1, 2]);
-        // Subtree rooted at idx3: {3, 4} must be contiguous.
         assert_contiguous(&order, &[3, 4]);
     }
 
     #[test]
     fn dfs_thin_subtree_first() {
         // root(0)→big_child(1), root(0)→thin_child(2)
-        // big_child(1)→g1(3), big_child(1)→g2(4), big_child(1)→g3(5),
-        // big_child(1)→g4(6), big_child(1)→g5(7)
-        // thin_child(2)→leaf(8)
+        // big_child(1)→{g1..g5}(3..7), thin_child(2)→leaf(8)
         let need_offsets: Vec<u64> = (0..9).map(|i| (i + 1) * 100).collect();
         let deps = vec![
-            DeltaDep {
-                offset: 200,
-                kind: DeltaKind::Ofs,
-                base: BaseLoc::Offset(100),
-            },
-            DeltaDep {
-                offset: 300,
-                kind: DeltaKind::Ofs,
-                base: BaseLoc::Offset(100),
-            },
-            DeltaDep {
-                offset: 400,
-                kind: DeltaKind::Ofs,
-                base: BaseLoc::Offset(200),
-            },
-            DeltaDep {
-                offset: 500,
-                kind: DeltaKind::Ofs,
-                base: BaseLoc::Offset(200),
-            },
-            DeltaDep {
-                offset: 600,
-                kind: DeltaKind::Ofs,
-                base: BaseLoc::Offset(200),
-            },
-            DeltaDep {
-                offset: 700,
-                kind: DeltaKind::Ofs,
-                base: BaseLoc::Offset(200),
-            },
-            DeltaDep {
-                offset: 800,
-                kind: DeltaKind::Ofs,
-                base: BaseLoc::Offset(200),
-            },
-            DeltaDep {
-                offset: 900,
-                kind: DeltaKind::Ofs,
-                base: BaseLoc::Offset(300),
-            },
+            ofs_dep(200, 100),
+            ofs_dep(300, 100),
+            ofs_dep(400, 200),
+            ofs_dep(500, 200),
+            ofs_dep(600, 200),
+            ofs_dep(700, 200),
+            ofs_dep(800, 200),
+            ofs_dep(900, 300),
         ];
         let result = build_exec_order(&need_offsets, &deps, 0).unwrap();
         let order = result.order.expect("non-identity DFS order");
@@ -1024,7 +976,6 @@ mod tests {
                 (2, 8),
             ],
         );
-        // Thin subtree {2, 8} should appear before big subtree {1,3,4,5,6,7}.
         let pos = |idx: u32| order.iter().position(|&v| v == idx).unwrap();
         assert!(
             pos(2) < pos(1),
@@ -1034,27 +985,9 @@ mod tests {
 
     #[test]
     fn dfs_linear_chain() {
-        // 10→20→30→40 (linear chain).
         let need_offsets = vec![10, 20, 30, 40];
-        let deps = vec![
-            DeltaDep {
-                offset: 20,
-                kind: DeltaKind::Ofs,
-                base: BaseLoc::Offset(10),
-            },
-            DeltaDep {
-                offset: 30,
-                kind: DeltaKind::Ofs,
-                base: BaseLoc::Offset(20),
-            },
-            DeltaDep {
-                offset: 40,
-                kind: DeltaKind::Ofs,
-                base: BaseLoc::Offset(30),
-            },
-        ];
+        let deps = vec![ofs_dep(20, 10), ofs_dep(30, 20), ofs_dep(40, 30)];
         let result = build_exec_order(&need_offsets, &deps, 0).unwrap();
-        // Linear chain in natural offset order: DFS produces [0,1,2,3] = identity.
         assert!(
             result.order.is_none(),
             "linear natural chain should be identity"
@@ -1065,25 +998,12 @@ mod tests {
 
     #[test]
     fn dfs_dag_shared_base() {
-        // Two bases both needed by one dependent (DAG, not tree).
-        // base1(0), base2(1), shared_dep(2) depends on both.
+        // Node at offset 30 depends on both bases at 10 and 20.
         let need_offsets = vec![10, 20, 30];
-        let deps = vec![
-            DeltaDep {
-                offset: 30,
-                kind: DeltaKind::Ofs,
-                base: BaseLoc::Offset(10),
-            },
-            DeltaDep {
-                offset: 30,
-                kind: DeltaKind::Ref,
-                base: BaseLoc::Offset(20),
-            },
-        ];
+        let deps = vec![ofs_dep(30, 10), ref_dep(30, 20)];
         let result = build_exec_order(&need_offsets, &deps, 0).unwrap();
         let order = result.order.expect("DAG reorders");
         assert_eq!(order.len(), 3);
-        // Both bases must precede the shared dependent.
         assert_topo_valid(&order, &[(0, 2), (1, 2)]);
     }
 
@@ -1099,40 +1019,16 @@ mod tests {
 
     #[test]
     fn dfs_returns_none_natural_order() {
-        // Single linear chain in natural offset order → identity permutation.
         let need_offsets = vec![10, 20, 30];
-        let deps = vec![
-            DeltaDep {
-                offset: 20,
-                kind: DeltaKind::Ofs,
-                base: BaseLoc::Offset(10),
-            },
-            DeltaDep {
-                offset: 30,
-                kind: DeltaKind::Ofs,
-                base: BaseLoc::Offset(20),
-            },
-        ];
+        let deps = vec![ofs_dep(20, 10), ofs_dep(30, 20)];
         let result = build_exec_order(&need_offsets, &deps, 0).unwrap();
         assert!(result.order.is_none(), "natural chain → identity → None");
     }
 
     #[test]
     fn dfs_cycle_detected() {
-        // Cycle: 10→20, 20→10.
         let need_offsets = vec![10, 20];
-        let deps = vec![
-            DeltaDep {
-                offset: 20,
-                kind: DeltaKind::Ofs,
-                base: BaseLoc::Offset(10),
-            },
-            DeltaDep {
-                offset: 10,
-                kind: DeltaKind::Ofs,
-                base: BaseLoc::Offset(20),
-            },
-        ];
+        let deps = vec![ofs_dep(20, 10), ofs_dep(10, 20)];
         let result = build_exec_order(&need_offsets, &deps, 0);
         assert!(
             matches!(result, Err(PackPlanError::DeltaCycleDetected { .. })),

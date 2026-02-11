@@ -12,6 +12,9 @@ use super::error::SimGitError;
 use super::scenario::{GitArtifactBundle, GitPackBytes, GitRepoModel};
 
 /// In-memory pack bytes for simulation.
+///
+/// `packs` is indexed by pack id (`pack_id as usize`), so construction enforces
+/// a dense `0..N` id space.
 #[derive(Debug, Clone)]
 pub struct SimPackBytes {
     object_format: ObjectFormat,
@@ -20,6 +23,9 @@ pub struct SimPackBytes {
 
 impl SimPackBytes {
     /// Build pack bytes from the repo model and artifact bundle.
+    ///
+    /// The repo model only contributes object format; pack bytes come from the
+    /// artifact bundle and are validated for dense pack-id indexing.
     pub fn from_repo(
         repo: &GitRepoModel,
         artifacts: &GitArtifactBundle,
@@ -33,6 +39,9 @@ impl SimPackBytes {
     }
 
     /// Returns pack views for planning.
+    ///
+    /// Parsing happens per call so planners always see fresh `PackView`s derived
+    /// from the stored bytes and selected object-id width.
     pub fn pack_views(&self) -> Result<Vec<PackView<'_>>, PackPlanError> {
         let mut out = Vec::with_capacity(self.packs.len());
         for pack in &self.packs {
@@ -62,6 +71,13 @@ impl SimPackBytes {
     }
 }
 
+/// Convert scenario pack artifacts into a dense, pack-id-indexed vector.
+///
+/// # Invariants
+///
+/// - Pack ids must be contiguous from `0` to `max_id`.
+/// - Duplicate ids are rejected.
+/// - On success every slot in the output vector is populated.
 fn collect_packs(packs: &[GitPackBytes]) -> Result<Vec<BytesView>, SimGitError> {
     if packs.is_empty() {
         return Ok(Vec::new());
@@ -91,7 +107,10 @@ fn collect_packs(packs: &[GitPackBytes]) -> Result<Vec<BytesView>, SimGitError> 
         out[idx] = Some(BytesView::from_vec(pack.bytes.clone()));
     }
 
-    Ok(out.into_iter().map(|b| b.expect("pack bytes")).collect())
+    Ok(out
+        .into_iter()
+        .map(|b| b.expect("all pack ids populated after dense validation"))
+        .collect())
 }
 
 #[cfg(test)]
@@ -220,6 +239,7 @@ mod tests {
                 external_bases: 0,
                 forward_deps: 0,
                 candidate_span: 0,
+                ..PackPlanStats::empty()
             },
         };
 
