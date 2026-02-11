@@ -152,6 +152,38 @@ pub struct ScannedBlobs {
     pub finding_arena: Vec<FindingKey>,
 }
 
+/// Always-on Git scan counters for user-facing summaries.
+///
+/// Unlike `git-perf` counters, these values are recorded in all builds and
+/// track the same core dimensions as FS summaries.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GitScanCommonMetrics {
+    /// Number of blob payloads sent through the scanner.
+    pub objects_scanned: u64,
+    /// Number of chunk windows scanned across all objects.
+    pub chunks_scanned: u64,
+    /// Total payload bytes scanned.
+    pub bytes_scanned: u64,
+    /// Findings emitted to the event stream.
+    pub findings_emitted: u64,
+    /// Blobs skipped because they were classified as binary.
+    pub binary_skipped: u64,
+    /// Blobs scanned via extracted text from binary formats.
+    pub binary_extracted: u64,
+}
+
+impl GitScanCommonMetrics {
+    #[inline(always)]
+    pub fn merge_from(&mut self, other: &Self) {
+        self.objects_scanned = self.objects_scanned.saturating_add(other.objects_scanned);
+        self.chunks_scanned = self.chunks_scanned.saturating_add(other.chunks_scanned);
+        self.bytes_scanned = self.bytes_scanned.saturating_add(other.bytes_scanned);
+        self.findings_emitted = self.findings_emitted.saturating_add(other.findings_emitted);
+        self.binary_skipped = self.binary_skipped.saturating_add(other.binary_skipped);
+        self.binary_extracted = self.binary_extracted.saturating_add(other.binary_extracted);
+    }
+}
+
 /// Engine adapter error taxonomy.
 #[derive(Debug)]
 pub enum EngineAdapterError {
@@ -223,6 +255,8 @@ pub struct EngineAdapter<'a> {
     /// all adapter instances sharing the same `Arc`, ensuring at most one
     /// `CommitMeta` event per commit even under concurrent pack-exec workers.
     commit_meta_seen: Arc<AtomicBitSet>,
+    /// Always-on counters for machine-readable scan summaries.
+    metrics: GitScanCommonMetrics,
 }
 
 impl<'a> EngineAdapter<'a> {
@@ -265,6 +299,7 @@ impl<'a> EngineAdapter<'a> {
             extract_scratch: Vec::with_capacity(crate::content_policy::extract::JAR_ENTRY_CAP),
             commit_graph: ctx.commit_graph_index,
             commit_meta_seen: ctx.commit_meta_seen,
+            metrics: GitScanCommonMetrics::default(),
         }
     }
 
@@ -298,6 +333,7 @@ impl<'a> EngineAdapter<'a> {
         self.results.clear();
         self.findings_arena.clear();
         self.findings_buf.clear();
+        self.metrics = GitScanCommonMetrics::default();
     }
 
     /// Reserves capacity for upcoming blob results.
@@ -317,6 +353,17 @@ impl<'a> EngineAdapter<'a> {
     /// (not the cumulative total).
     pub fn reserve_findings_buf(&mut self, additional: usize) {
         self.findings_buf.reserve(additional);
+    }
+
+    /// Returns the always-on scan summary counters accumulated by this adapter.
+    #[must_use]
+    pub const fn metrics(&self) -> GitScanCommonMetrics {
+        self.metrics
+    }
+
+    /// Takes the current metrics snapshot and resets counters to zero.
+    pub fn take_metrics(&mut self) -> GitScanCommonMetrics {
+        std::mem::take(&mut self.metrics)
     }
 
     /// Emits a loose candidate blob for scanning.
@@ -430,6 +477,7 @@ impl<'a> EngineAdapter<'a> {
             match content_policy::classify_content(bytes, path, content_policy::CHECK_LEN) {
                 ContentVerdict::Binary => {
                     perf::record_scan_binary_skip();
+                    self.metrics.binary_skipped = self.metrics.binary_skipped.saturating_add(1);
                     return Ok(());
                 }
                 ContentVerdict::BinaryExtractable(fmt) => {
@@ -438,7 +486,9 @@ impl<'a> EngineAdapter<'a> {
                         == ExtractResult::Ok
                     {
                         perf::record_scan_binary_extract();
-                        return scan_blob_chunked_with_chunker(
+                        self.metrics.binary_extracted =
+                            self.metrics.binary_extracted.saturating_add(1);
+                        scan_blob_chunked_with_chunker(
                             self.engine,
                             &mut self.scratch,
                             file_id,
@@ -446,14 +496,25 @@ impl<'a> EngineAdapter<'a> {
                             self.overlap,
                             &mut self.chunker,
                             &mut self.findings_buf,
-                        );
+                        )?;
+                        self.record_scanned_payload(self.extract_buf.len());
+                        return Ok(());
                     }
                     perf::record_scan_binary_skip();
+                    self.metrics.binary_skipped = self.metrics.binary_skipped.saturating_add(1);
                     return Ok(());
                 }
                 ContentVerdict::Text => {}
             }
         }
+        self.scan_blob_payload(file_id, bytes)
+    }
+
+    fn scan_blob_payload(
+        &mut self,
+        file_id: FileId,
+        bytes: &[u8],
+    ) -> Result<(), EngineAdapterError> {
         scan_blob_chunked_with_chunker(
             self.engine,
             &mut self.scratch,
@@ -462,7 +523,26 @@ impl<'a> EngineAdapter<'a> {
             self.overlap,
             &mut self.chunker,
             &mut self.findings_buf,
-        )
+        )?;
+        self.record_scanned_payload(bytes.len());
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn record_scanned_payload(&mut self, scanned_len: usize) {
+        self.metrics.objects_scanned = self.metrics.objects_scanned.saturating_add(1);
+        self.metrics.bytes_scanned = self
+            .metrics
+            .bytes_scanned
+            .saturating_add(scanned_len as u64);
+        self.metrics.chunks_scanned =
+            self.metrics
+                .chunks_scanned
+                .saturating_add(chunk_count_for_blob_len(
+                    scanned_len,
+                    self.chunker.chunk_bytes(),
+                    self.overlap,
+                ));
     }
 
     /// Transfer `findings_buf` into the shared arena and return the span.
@@ -480,6 +560,7 @@ impl<'a> EngineAdapter<'a> {
 
         // Extend the shared arena; the returned span is used by `ScannedBlob`.
         self.findings_arena.extend_from_slice(&self.findings_buf);
+        self.metrics.findings_emitted = self.metrics.findings_emitted.saturating_add(len as u64);
         Ok(FindingSpan {
             start: start as u32,
             len: len as u32,
@@ -584,6 +665,19 @@ fn effective_chunk_bytes(requested: usize, overlap: usize) -> usize {
         requested
     };
     base.max(min).min(u32::MAX as usize)
+}
+
+#[inline(always)]
+fn chunk_count_for_blob_len(blob_len: usize, chunk_bytes: usize, overlap: usize) -> u64 {
+    if blob_len <= chunk_bytes {
+        return 1;
+    }
+    // RingChunker emits one full chunk, then advances by (chunk-overlap) bytes
+    // per subsequent window, with a final partial chunk when remainder exists.
+    let step = chunk_bytes.saturating_sub(overlap).max(1);
+    let remaining = blob_len.saturating_sub(chunk_bytes);
+    let extra = remaining.saturating_add(step - 1) / step;
+    1u64.saturating_add(extra as u64)
 }
 
 fn scan_blob_chunked_into(

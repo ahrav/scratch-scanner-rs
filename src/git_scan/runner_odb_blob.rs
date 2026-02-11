@@ -40,7 +40,7 @@ use super::blob_introducer::{introduce_parallel, BlobIntroStats, BlobIntroducer}
 use super::byte_arena::ByteArena;
 use super::commit_graph::CommitGraphIndex;
 use super::commit_walk::PlannedCommit;
-use super::engine_adapter::{CommitMetaContext, EngineAdapter, ScannedBlobs};
+use super::engine_adapter::{CommitMetaContext, EngineAdapter, GitScanCommonMetrics, ScannedBlobs};
 use super::errors::TreeDiffError;
 use super::mapping_bridge::{MappingBridge, MappingBridgeConfig, MappingStats};
 use super::midx::MidxView;
@@ -356,6 +356,7 @@ pub(super) fn run_odb_blob(
         .map_err(|_| io::Error::other("pack cache size exceeds u32::MAX"))?;
     let mut pack_exec_reports = Vec::with_capacity(used_pack_ids.len());
     let mut skipped_candidates = Vec::new();
+    let mut common_metrics = GitScanCommonMetrics::default();
     let mut scanned = ScannedBlobs {
         blobs: Vec::with_capacity(packed_len.saturating_add(loose_len)),
         finding_arena: Vec::new(),
@@ -441,6 +442,7 @@ pub(super) fn run_odb_blob(
             for output in outputs {
                 pack_exec_reports.push(output.report);
                 skipped_candidates.extend(output.skipped);
+                common_metrics.merge_from(&output.common_metrics);
                 append_scanned_blobs(&mut scanned, output.scanned);
             }
         }
@@ -474,6 +476,8 @@ pub(super) fn run_odb_blob(
                 &mut skipped_candidates,
             )?;
             stage_nanos.loose_scan = loose_start.elapsed().as_nanos() as u64;
+            let loose_metrics = adapter.take_metrics();
+            common_metrics.merge_from(&loose_metrics);
             append_scanned_blobs(&mut scanned, adapter.take_results());
         }
     } else {
@@ -507,6 +511,8 @@ pub(super) fn run_odb_blob(
                 &mut skipped_candidates,
             )?;
             stage_nanos.loose_scan = loose_start.elapsed().as_nanos() as u64;
+            let loose_metrics = adapter.take_metrics();
+            common_metrics.merge_from(&loose_metrics);
             append_scanned_blobs(&mut scanned, adapter.take_results());
         }
     }
@@ -530,6 +536,7 @@ pub(super) fn run_odb_blob(
         tree_diff_stats: TreeDiffStats::from(intro_stats),
         spill_stats,
         mapping_stats,
+        common_metrics,
         stage_nanos,
         alloc_stats: alloc_deltas,
         pack_cache_per_worker_bytes: pack_cache_target,

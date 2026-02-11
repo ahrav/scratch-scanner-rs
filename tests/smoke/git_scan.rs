@@ -4,10 +4,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn perf_stats_enabled() -> bool {
-    cfg!(all(feature = "perf-stats", debug_assertions))
-}
-
 fn git_available() -> bool {
     Command::new("git").arg("--version").output().is_ok()
 }
@@ -60,15 +56,36 @@ fn find_release_binary(name: &str) -> PathBuf {
 }
 
 fn extract_summary_findings(stdout: &str) -> Option<u64> {
+    extract_summary_metric(stdout, "findings")
+}
+
+fn extract_summary_metric(stdout: &str, key: &str) -> Option<u64> {
     for line in stdout.lines() {
         if !line.contains("\"type\":\"summary\"") || !line.contains("\"source\":\"git\"") {
             continue;
         }
-        if let Some(idx) = line.find("\"findings\":") {
-            let tail = &line[idx + "\"findings\":".len()..];
+        let pattern = format!("\"{key}\":");
+        if let Some(idx) = line.find(&pattern) {
+            let tail = &line[idx + pattern.len()..];
             let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
             if !digits.is_empty() {
                 return digits.parse().ok();
+            }
+        }
+    }
+    None
+}
+
+fn extract_stderr_metric(stderr: &str, key: &str) -> Option<u64> {
+    for line in stderr.lines().rev() {
+        if !line.contains('=') {
+            continue;
+        }
+        for field in line.split_whitespace() {
+            if let Some((k, v)) = field.split_once('=') {
+                if k == key {
+                    return v.parse().ok();
+                }
             }
         }
     }
@@ -127,16 +144,36 @@ fn git_scan_binary_finds_secrets() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stdout.contains("\"type\":\"summary\"") && stdout.contains("\"source\":\"git\""),
         "missing git summary JSONL event in stdout: {stdout}"
     );
     let findings = extract_summary_findings(&stdout).unwrap_or(0);
-    if perf_stats_enabled() {
-        assert!(findings > 0, "expected findings > 0, got {findings}");
-    } else {
-        assert_eq!(findings, 0, "expected findings=0 when perf stats disabled");
-    }
+    assert!(findings > 0, "expected findings > 0, got {findings}");
+    let bytes = extract_summary_metric(&stdout, "bytes").unwrap_or(0);
+    assert!(bytes > 0, "expected summary bytes > 0, got {bytes}");
+
+    let objects = extract_stderr_metric(&stderr, "objects").unwrap_or(0);
+    let chunks = extract_stderr_metric(&stderr, "chunks").unwrap_or(0);
+    let stderr_bytes = extract_stderr_metric(&stderr, "bytes").unwrap_or(0);
+    let stderr_findings = extract_stderr_metric(&stderr, "findings").unwrap_or(0);
+    assert!(
+        objects > 0,
+        "expected objects > 0 in stderr summary: {stderr}"
+    );
+    assert!(
+        chunks > 0,
+        "expected chunks > 0 in stderr summary: {stderr}"
+    );
+    assert!(
+        stderr_bytes > 0,
+        "expected bytes > 0 in stderr summary: {stderr}"
+    );
+    assert!(
+        stderr_findings > 0,
+        "expected findings > 0 in stderr summary: {stderr}"
+    );
 
     fs::remove_dir_all(&repo).unwrap();
 }

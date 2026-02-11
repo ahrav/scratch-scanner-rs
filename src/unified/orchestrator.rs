@@ -771,7 +771,7 @@ fn build_event_sink(event_format: EventFormat, verbose: bool) -> Arc<dyn super::
 ///
 /// Maps `FinalizeOutcome::Complete` to status `"complete"` (0 errors) and
 /// `Partial` to `"partial"` (with the skipped-candidate count as errors).
-/// Throughput is computed from `scan_bytes` perf counter, not wall time.
+/// Throughput is computed from always-on `common_metrics.bytes_scanned`.
 fn emit_git_summary_event(
     event_sink: &dyn super::events::EventSink,
     report: &git_scan::GitScanReport,
@@ -785,7 +785,7 @@ fn emit_git_summary_event(
         git_scan::FinalizeOutcome::Partial { skipped_count } => ("partial", skipped_count),
     };
     let elapsed_secs = elapsed.as_secs_f64();
-    let bytes_scanned = report.perf_stats.scan_bytes;
+    let bytes_scanned = report.common_metrics.bytes_scanned;
     let throughput_mib_s = if elapsed_secs > 0.0 {
         (bytes_scanned as f64 / (1024.0 * 1024.0)) / elapsed_secs
     } else {
@@ -797,7 +797,7 @@ fn emit_git_summary_event(
         status,
         elapsed_ms: elapsed.as_millis() as u64,
         bytes_scanned,
-        findings_emitted: report.finalize.stats.total_findings,
+        findings_emitted: report.common_metrics.findings_emitted,
         errors: errors as u64,
         throughput_mib_s,
     }));
@@ -815,27 +815,27 @@ fn print_git_stderr_summary(
     scan_elapsed: std::time::Duration,
     total_elapsed: std::time::Duration,
 ) {
-    let perf = &report.perf_stats;
+    let common = &report.common_metrics;
     let errors = match report.finalize.outcome {
         git_scan::FinalizeOutcome::Complete => 0u64,
         git_scan::FinalizeOutcome::Partial { skipped_count } => skipped_count as u64,
     };
     let scan_secs = scan_elapsed.as_secs_f64();
     let throughput_mib = if scan_secs > 0.0 {
-        (perf.scan_bytes as f64 / (1024.0 * 1024.0)) / scan_secs
+        (common.bytes_scanned as f64 / (1024.0 * 1024.0)) / scan_secs
     } else {
         0.0
     };
     let init_ms = total_elapsed.saturating_sub(scan_elapsed).as_millis();
     eprintln!(
         "objects={} chunks={} bytes={} findings={} errors={} binary_skipped={} binary_extracted={} init_ms={} scan_ms={} elapsed_ms={} throughput_mib_s={:.2} workers={}",
-        perf.scan_blob_count,
-        perf.scan_chunk_count,
-        perf.scan_bytes,
-        report.finalize.stats.total_findings,
+        common.objects_scanned,
+        common.chunks_scanned,
+        common.bytes_scanned,
+        common.findings_emitted,
         errors,
-        perf.scan_binary_skip_count,
-        perf.scan_binary_extract_count,
+        common.binary_skipped,
+        common.binary_extracted,
         init_ms,
         scan_elapsed.as_millis(),
         total_elapsed.as_millis(),

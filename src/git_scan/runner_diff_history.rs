@@ -54,7 +54,7 @@ use crate::scheduler::{alloc_stats, AllocStats};
 use crate::Engine;
 
 use super::commit_walk::{CommitGraph, ParentScratch, PlannedCommit};
-use super::engine_adapter::{CommitMetaContext, EngineAdapter, ScannedBlobs};
+use super::engine_adapter::{CommitMetaContext, EngineAdapter, GitScanCommonMetrics, ScannedBlobs};
 use super::mapping_bridge::{MappingBridge, MappingBridgeConfig};
 use super::object_store::{ObjectStore, ObjectStoreLayout};
 use super::pack_candidates::CappedPackCandidateSink;
@@ -333,6 +333,7 @@ pub(super) fn run_diff_history(
     let spill_dir = Arc::new(spill_dir);
     let mut pack_exec_reports = Vec::with_capacity(plan_count);
     let mut skipped_candidates = Vec::new();
+    let mut common_metrics = GitScanCommonMetrics::default();
     let mut scanned = ScannedBlobs {
         blobs: Vec::with_capacity(packed_len.saturating_add(loose_len)),
         finding_arena: Vec::new(),
@@ -375,6 +376,7 @@ pub(super) fn run_diff_history(
         for output in outputs {
             pack_exec_reports.push(output.report);
             skipped_candidates.extend(output.skipped);
+            common_metrics.merge_from(&output.common_metrics);
             append_scanned_blobs(&mut scanned, output.scanned);
         }
     }
@@ -404,6 +406,8 @@ pub(super) fn run_diff_history(
             &mut external,
             &mut skipped_candidates,
         )?;
+        let loose_metrics = adapter.take_metrics();
+        common_metrics.merge_from(&loose_metrics);
         append_scanned_blobs(&mut scanned, adapter.take_results());
     }
     stage_nanos.pack_exec = pack_exec_start.elapsed().as_nanos() as u64;
@@ -423,6 +427,7 @@ pub(super) fn run_diff_history(
         tree_diff_stats: walker.stats().clone(),
         spill_stats,
         mapping_stats,
+        common_metrics,
         stage_nanos,
         alloc_stats: alloc_deltas,
         pack_cache_per_worker_bytes: pack_cache_target,

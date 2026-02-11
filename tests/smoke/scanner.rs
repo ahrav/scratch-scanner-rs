@@ -6,6 +6,22 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+fn extract_stderr_metric(stderr: &str, key: &str) -> Option<u64> {
+    for line in stderr.lines().rev() {
+        if !line.contains('=') {
+            continue;
+        }
+        for field in line.split_whitespace() {
+            if let Some((k, v)) = field.split_once('=') {
+                if k == key {
+                    return v.parse().ok();
+                }
+            }
+        }
+    }
+    None
+}
+
 fn make_temp_dir() -> PathBuf {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -85,6 +101,20 @@ fn scanner_binary_finds_secrets() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("findings="), "No stats output in stderr");
+    let files = extract_stderr_metric(&stderr, "files").unwrap_or(0);
+    let chunks = extract_stderr_metric(&stderr, "chunks").unwrap_or(0);
+    let bytes = extract_stderr_metric(&stderr, "bytes").unwrap_or(0);
+    let findings = extract_stderr_metric(&stderr, "findings").unwrap_or(0);
+    assert!(files > 0, "expected files > 0 in stderr summary: {stderr}");
+    assert!(
+        chunks > 0,
+        "expected chunks > 0 in stderr summary: {stderr}"
+    );
+    assert!(bytes > 0, "expected bytes > 0 in stderr summary: {stderr}");
+    assert!(
+        findings > 0,
+        "expected findings > 0 in stderr summary: {stderr}"
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(

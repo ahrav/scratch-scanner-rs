@@ -35,7 +35,9 @@ use memmap2::Mmap;
 
 use super::byte_arena::ByteArena;
 use super::bytes::BytesView;
-use super::engine_adapter::{CommitMetaContext, EngineAdapter, EngineAdapterConfig, ScannedBlobs};
+use super::engine_adapter::{
+    CommitMetaContext, EngineAdapter, EngineAdapterConfig, GitScanCommonMetrics, ScannedBlobs,
+};
 use super::errors::TreeDiffError;
 use super::finalize::RefEntry;
 use super::midx::MidxView;
@@ -848,6 +850,8 @@ pub(super) struct SchedulerPackExecOutput {
     pub scanned: ScannedBlobs,
     /// Candidate-level skip records mapped from pack skip offsets.
     pub skipped: Vec<SkippedCandidate>,
+    /// Always-on summary counters for this output shard/plan.
+    pub common_metrics: GitScanCommonMetrics,
 }
 
 /// Task dispatched to a scheduler worker thread.
@@ -961,6 +965,7 @@ fn empty_scheduler_output() -> SchedulerPackExecOutput {
             finding_arena: Vec::new(),
         },
         skipped: Vec::new(),
+        common_metrics: GitScanCommonMetrics::default(),
     }
 }
 
@@ -1033,10 +1038,12 @@ fn run_scheduler_pack_task(
 
             let mut skipped = Vec::new();
             collect_skipped_candidates(plan, &report.skips, &mut skipped);
+            let common_metrics = adapter.take_metrics();
             Ok(SchedulerPackExecOutput {
                 report,
                 scanned: adapter.take_results(),
                 skipped,
+                common_metrics,
             })
         }
         SchedulerPackTask::ExecShard {
@@ -1092,10 +1099,12 @@ fn run_scheduler_pack_task(
 
             let mut skipped = Vec::new();
             collect_skipped_candidates(plan, &report.skips, &mut skipped);
+            let common_metrics = adapter.take_metrics();
             Ok(SchedulerPackExecOutput {
                 report,
                 scanned: adapter.take_results(),
                 skipped,
+                common_metrics,
             })
         }
     }
@@ -1406,6 +1415,7 @@ pub(super) fn execute_pack_plans_with_scheduler(
                 let mut reports = Vec::with_capacity(per_plan[plan_idx].len());
                 let mut scanned_shards = Vec::with_capacity(per_plan[plan_idx].len());
                 let mut skipped = Vec::new();
+                let mut common_metrics = GitScanCommonMetrics::default();
                 for slot in per_plan[plan_idx].iter_mut() {
                     let shard_output = slot.take().ok_or_else(|| {
                         GitScanError::PackExec(PackExecError::PackRead(
@@ -1415,6 +1425,7 @@ pub(super) fn execute_pack_plans_with_scheduler(
                     reports.push(shard_output.report);
                     scanned_shards.push(shard_output.scanned);
                     skipped.extend(shard_output.skipped);
+                    common_metrics.merge_from(&shard_output.common_metrics);
                 }
 
                 let report = if reports.len() == 1 {
@@ -1427,6 +1438,7 @@ pub(super) fn execute_pack_plans_with_scheduler(
                     report,
                     scanned,
                     skipped,
+                    common_metrics,
                 });
             }
             Ok(merged)

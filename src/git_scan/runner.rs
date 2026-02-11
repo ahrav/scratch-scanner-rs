@@ -50,7 +50,9 @@ use super::byte_arena::ByteArena;
 use super::commit_graph::CommitGraphIndex;
 use super::commit_walk::introduced_by_plan;
 use super::commit_walk_limits::CommitWalkLimits;
-use super::engine_adapter::{CommitMetaContext, EngineAdapterConfig, ScannedBlobs};
+use super::engine_adapter::{
+    CommitMetaContext, EngineAdapterConfig, GitScanCommonMetrics, ScannedBlobs,
+};
 use super::errors::{CommitPlanError, PersistError, RepoOpenError, SpillError, TreeDiffError};
 use super::finalize::{build_finalize_ops, FinalizeInput, FinalizeOutput};
 use super::identity_intern::IdentityInterner;
@@ -753,6 +755,8 @@ pub struct GitScanReport {
     pub skipped_candidates: Vec<SkippedCandidate>,
     /// Finalize output and persistence stats.
     pub finalize: FinalizeOutput,
+    /// Always-on counters used by CLI summary output.
+    pub common_metrics: GitScanCommonMetrics,
     /// Stage timing data (nanoseconds).
     pub stage_nanos: GitScanStageNanos,
     /// Git perf counter snapshot (pack decode, scan, mapping).
@@ -821,6 +825,8 @@ pub(super) struct ScanModeOutput {
     pub spill_stats: SpillStats,
     /// Pack mapping statistics.
     pub mapping_stats: MappingStats,
+    /// Always-on counters used by CLI summary output.
+    pub common_metrics: GitScanCommonMetrics,
     /// Stage timing data (nanoseconds).
     pub stage_nanos: GitScanStageNanos,
     /// Allocation deltas for hot stages.
@@ -1159,6 +1165,7 @@ pub fn run_git_scan(
         pack_exec_reports: output.pack_exec_reports,
         skipped_candidates: output.skipped_candidates,
         finalize,
+        common_metrics: output.common_metrics,
         stage_nanos: output.stage_nanos,
         perf_stats,
         alloc_stats: output.alloc_stats,
