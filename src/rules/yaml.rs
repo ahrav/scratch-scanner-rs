@@ -539,6 +539,12 @@ mod tests {
 
     /// Build an engine for a single rule, returning a closure that scans a
     /// haystack without rebuilding the Vectorscan database each time.
+    ///
+    /// NOTE: Scratch is allocated per-call intentionally. `ScanScratch`
+    /// carries inter-chunk state (dedup sets, stream counters) that causes
+    /// incorrect results when reused across independent inputs. Production
+    /// code reuses scratch across *chunks of the same file*, not across
+    /// unrelated scans.
     fn make_rule_scanner(rule_name: &str) -> impl FnMut(&[u8]) -> Vec<Finding> {
         let rule = builtin_rule_by_name(rule_name);
         let engine = Engine::new_with_anchor_policy(
@@ -553,6 +559,31 @@ mod tests {
             engine.scan_chunk_materialized(hay, &mut scratch, &mut findings);
             findings
         }
+    }
+
+    /// Regression: scratch must be fresh per scan. Reusing a single scratch
+    /// across independent inputs causes dedup state to suppress findings.
+    #[test]
+    fn fresh_scratch_per_scan_avoids_stale_dedup() {
+        let rule_name = "generic-api-key";
+        let mut scan = make_rule_scanner(rule_name);
+
+        // Two identical haystacks must both produce findings — a shared scratch
+        // would dedup the second call against the first.
+        let hay = b"API_KEY=a8f2k9x7m4p1q6w3";
+        let first = scan(hay);
+        let second = scan(hay);
+
+        assert!(
+            !first.is_empty(),
+            "first scan should find the generic-api-key"
+        );
+        assert_eq!(
+            first.len(),
+            second.len(),
+            "repeated scan of the same input must produce the same findings; \
+             stale scratch would suppress the second"
+        );
     }
 
     fn has_rule_hit(hits: &[Finding], rule_name: &str) -> bool {
