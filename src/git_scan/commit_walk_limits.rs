@@ -143,18 +143,3 @@ impl Default for CommitWalkLimits {
 const _: () = CommitWalkLimits::DEFAULT.validate();
 const _: () = CommitWalkLimits::RESTRICTIVE.validate();
 const _: () = assert!(std::mem::size_of::<CommitWalkLimits>() == 16);
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_limits_valid() {
-        CommitWalkLimits::DEFAULT.validate();
-    }
-
-    #[test]
-    fn restrictive_limits_valid() {
-        CommitWalkLimits::RESTRICTIVE.validate();
-    }
-}

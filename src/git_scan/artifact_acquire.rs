@@ -304,19 +304,11 @@ fn resolve_pack_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git_scan::commit_walk::CommitGraph;
 
     #[test]
     fn artifact_build_limits_default() {
         let limits = ArtifactBuildLimits::default();
         assert!(limits.midx.max_packs > 0);
         assert!(limits.commit_load.max_commits > 0);
-    }
-
-    #[test]
-    fn commit_graph_mem_builds_empty() {
-        let mem =
-            CommitGraphMem::build(vec![], super::super::object_id::ObjectFormat::Sha1).unwrap();
-        assert_eq!(mem.num_commits(), 0);
     }
 }

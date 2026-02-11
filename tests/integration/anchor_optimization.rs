@@ -20,32 +20,25 @@ fn has_rule_match(engine: &scanner_rs::Engine, input: &[u8], rule_name: &str) ->
 #[test]
 fn test_jwt_standard_hs256_detected() {
     let engine = demo_engine();
+
     // Standard JWT with HS256 algorithm
-    let jwt = b"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+    let jwt_hs256 = b"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
     assert!(
-        has_rule_match(&engine, jwt, "jwt"),
+        has_rule_match(&engine, jwt_hs256, "jwt"),
         "JWT with HS256 should be detected"
     );
-}
 
-#[test]
-fn test_jwt_rs256_detected() {
-    let engine = demo_engine();
     // JWT with RS256 algorithm
-    let jwt = b"eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiYWRtaW4iOnRydWUsImlhdCI6MTUxNjIzOTAyMn0.signature_placeholder_xxxxx";
+    let jwt_rs256 = b"eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiYWRtaW4iOnRydWUsImlhdCI6MTUxNjIzOTAyMn0.signature_placeholder_xxxxx";
     assert!(
-        has_rule_match(&engine, jwt, "jwt"),
+        has_rule_match(&engine, jwt_rs256, "jwt"),
         "JWT with RS256 should be detected"
     );
-}
 
-#[test]
-fn test_jwt_es256_detected() {
-    let engine = demo_engine();
     // JWT with ES256 algorithm
-    let jwt = b"eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiYWRtaW4iOnRydWUsImlhdCI6MTUxNjIzOTAyMn0.signature_placeholder_xxxxx";
+    let jwt_es256 = b"eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiYWRtaW4iOnRydWUsImlhdCI6MTUxNjIzOTAyMn0.signature_placeholder_xxxxx";
     assert!(
-        has_rule_match(&engine, jwt, "jwt"),
+        has_rule_match(&engine, jwt_es256, "jwt"),
         "JWT with ES256 should be detected"
     );
 }

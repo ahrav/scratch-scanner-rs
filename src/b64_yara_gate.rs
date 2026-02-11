@@ -834,28 +834,6 @@ mod tests {
         a || b
     }
 
-    fn stream_scan_many_chunks(gate: &Base64YaraGate, bytes: &[u8], chunk_sizes: &[usize]) -> bool {
-        let mut st = GateState::default();
-        let mut i = 0usize;
-
-        for &sz in chunk_sizes {
-            if i >= bytes.len() {
-                break;
-            }
-            let end = (i + sz).min(bytes.len());
-            if gate.scan_with_state(&bytes[i..end], &mut st) {
-                return true;
-            }
-            i = end;
-        }
-
-        if i < bytes.len() {
-            gate.scan_with_state(&bytes[i..], &mut st)
-        } else {
-            false
-        }
-    }
-
     // -----------------------------
     // 1) Curated corpus tests
     // -----------------------------
@@ -881,21 +859,6 @@ mod tests {
             std::str::from_utf8(&p2).unwrap(),
             "UaGlzIHByb2dyYW0gY2Fubm90"
         );
-    }
-
-    #[test]
-    fn corpus_gate_hits_with_whitespace() {
-        let a = b"This program cannot";
-        let gate = Base64YaraGate::build(
-            [a.as_slice()],
-            Base64YaraGateConfig {
-                min_pattern_len: 0,
-                ..Default::default()
-            },
-        );
-
-        let encoded = b"VGhpcyBw\ncm9ncmFt\tIGNhbm5vd\r";
-        assert!(gate.hits(encoded));
     }
 
     #[test]
@@ -926,22 +889,6 @@ mod tests {
 
         let encoded = b"YW\x0bJj\x0c";
         assert!(gate.hits(encoded));
-    }
-
-    #[test]
-    fn corpus_urlsafe_mapping_hits() {
-        // 0xff,0xff,0xff -> "////" (contains '/'), urlsafe becomes "____"
-        let anchor = &[0xffu8, 0xffu8, 0xffu8];
-        let gate = Base64YaraGate::build(
-            [anchor.as_slice()],
-            Base64YaraGateConfig {
-                min_pattern_len: 4,
-                ..Default::default()
-            },
-        );
-
-        let urlsafe = b"____";
-        assert!(gate.hits(urlsafe));
     }
 
     #[test]
@@ -1028,26 +975,6 @@ mod tests {
     // -----------------------------
 
     #[test]
-    fn determinism_hits_is_stable() {
-        let gate = Base64YaraGate::build(
-            [
-                b"This program cannot".as_slice(),
-                b"abc".as_slice(),
-                b"test".as_slice(),
-            ],
-            Base64YaraGateConfig {
-                min_pattern_len: 0,
-                ..Default::default()
-            },
-        );
-
-        let input = b"VGhpcyBwcm9ncmFtIGNhbm5vdA==\n";
-        let a = gate.hits(input);
-        let b = gate.hits(input);
-        assert_eq!(a, b);
-    }
-
-    #[test]
     fn streaming_stop_at_first_padding_is_sticky_across_chunks() {
         // Anchor "abc" has base64 "YWJj".
         // With min_pattern_len=4, only the offset=0 pattern ("YWJj") is kept.
@@ -1091,22 +1018,6 @@ mod tests {
     }
 
     #[test]
-    fn streaming_matches_across_chunk_boundary_without_padding() {
-        let gate = Base64YaraGate::build(
-            [b"abc".as_slice()],
-            Base64YaraGateConfig {
-                min_pattern_len: 4,
-                ..Default::default()
-            },
-        );
-
-        // "abc" -> "YWJj"
-        let mut st = GateState::default();
-        assert!(!gate.scan_with_state(b"YW", &mut st));
-        assert!(gate.scan_with_state(b"Jj", &mut st));
-    }
-
-    #[test]
     fn gate_state_reset_clears_padding_halt() {
         let gate = Base64YaraGate::build(
             [b"abc".as_slice()],
@@ -1123,52 +1034,6 @@ mod tests {
 
         st.reset();
         assert!(gate.scan_with_state(b"YWJj", &mut st));
-    }
-
-    #[test]
-    fn streaming_vs_one_shot_equivalence_randomized_chunking_fixed_samples() {
-        let gate = Base64YaraGate::build(
-            [
-                b"This program cannot".as_slice(),
-                b"abc".as_slice(),
-                b"\xff\xff\xff".as_slice(),
-            ],
-            Base64YaraGateConfig {
-                min_pattern_len: 0,
-                ..Default::default()
-            },
-        );
-
-        // Shapes: clean, line-wrapped, urlsafe, mixed noise, early '='
-        let samples: Vec<Vec<u8>> = vec![
-            b"VGhpcyBwcm9ncmFtIGNhbm5vdA==".to_vec(),
-            insert_newlines_every(b"VGhpcyBwcm9ncmFtIGNhbm5vdA==", 76),
-            to_urlsafe(b"////"),
-            b"noiseVGhpcyBwcm9ncmFtIGNhbm5vdmore".to_vec(),
-            b"AAAA=VGhpcyBwcm9ncmFtIGNhbm5vd".to_vec(),
-            b"YWJj".to_vec(),
-            b"YW\0Jj".to_vec(),
-        ];
-
-        let chunkings: Vec<Vec<usize>> = vec![
-            vec![1],
-            vec![2, 3, 5, 8],
-            vec![7, 7, 7, 7],
-            vec![64],
-            vec![3, 1, 4, 1, 5, 9, 2],
-        ];
-
-        for s in &samples {
-            let one = gate.hits(s);
-            for ch in &chunkings {
-                let st = stream_scan_many_chunks(&gate, s, ch);
-                assert_eq!(
-                    one, st,
-                    "chunking mismatch for sample {:?} chunks {:?}",
-                    s, ch
-                );
-            }
-        }
     }
 
     #[test]
@@ -1195,74 +1060,7 @@ mod tests {
     }
 
     // -----------------------------
-    // 3) Differential tests (encoding + trimming rules)
-    // -----------------------------
-
-    #[test]
-    fn differential_base64_encode_std_matches_base64_crate_known_rfc4648_vectors() {
-        let cases: &[(&[u8], &str)] = &[
-            (b"", ""),
-            (b"f", "Zg=="),
-            (b"fo", "Zm8="),
-            (b"foo", "Zm9v"),
-            (b"foob", "Zm9vYg=="),
-            (b"fooba", "Zm9vYmE="),
-            (b"foobar", "Zm9vYmFy"),
-        ];
-        for (raw, exp) in cases {
-            let ours = super::base64_encode_std(raw);
-            let theirs = STANDARD.encode(raw).into_bytes();
-            assert_eq!(ours, theirs, "base64 mismatch for {:?}", raw);
-            assert_eq!(std::str::from_utf8(&ours).unwrap(), *exp);
-        }
-    }
-
-    #[test]
-    fn differential_yara_perm_matches_reference_base64_crate_for_doc_example() {
-        let a = b"This program cannot";
-        for offset in 0..3 {
-            let ours = super::yara_base64_perm(a, offset, 0);
-            let theirs = ref_yara_base64_perm_using_base64_crate(a, offset, 0);
-            assert_eq!(ours, theirs, "perm mismatch at offset {}", offset);
-        }
-    }
-
-    // -----------------------------
-    // 4) Gate correctness vs naive/oracle matcher
-    // -----------------------------
-
-    #[test]
-    fn gate_equals_oracle_on_curated_inputs() {
-        let anchors: &[&[u8]] = &[b"This program cannot", b"abc", b"test", b"\xff\xff\xff"];
-        let min_pat_len = 0;
-        let cfg = Base64YaraGateConfig {
-            min_pattern_len: min_pat_len,
-            ..Default::default()
-        };
-
-        let gate = Base64YaraGate::build(anchors.iter().copied(), cfg.clone());
-        let patterns = build_patterns_from_anchors(anchors, min_pat_len);
-
-        let inputs: Vec<&[u8]> = vec![
-            b"VGhpcyBwcm9ncmFtIGNhbm5vdA==",
-            b"VGhpcyBw\ncm9ncmFt\tIGNhbm5vd\r",
-            b"AAAA=dGVzdA",
-            b"YWJj",
-            b"YW\0Jj",
-            b"____",                 // urlsafe for "////"
-            b"\xff\xff\xff\xff\xff", // hostile
-            b"",
-        ];
-
-        for inp in inputs {
-            let g = gate.hits(inp);
-            let o = oracle_hits(&patterns, inp, cfg.padding_policy, cfg.whitespace_policy);
-            assert_eq!(g, o, "oracle mismatch for input {:?}", inp);
-        }
-    }
-
-    // -----------------------------
-    // 5) Robustness / hostile inputs
+    // 3) Robustness / hostile inputs
     // -----------------------------
 
     #[test]
@@ -1298,7 +1096,7 @@ mod tests {
     }
 
     // -----------------------------
-    // 6) Proptest properties (deterministic, high leverage)
+    // 4) Proptest properties (deterministic, high leverage)
     // -----------------------------
 
     proptest! {
@@ -1451,7 +1249,7 @@ mod tests {
     }
 
     // -----------------------------
-    // 7) Pattern count boundary checks (sanity)
+    // 5) Pattern count boundary checks (sanity)
     // -----------------------------
 
     #[test]

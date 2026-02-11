@@ -1,22 +1,18 @@
 //! Integration tests for the SQLite persistence layer.
 //!
 //! Covers:
-//! - 5.1 Identity conformance (keyed vs unkeyed, rule_fp always unkeyed, secret_hash keyed)
-//! - 5.2 Run status semantics
+//! - 5.1 Identity edge-cases (bucket classification, truncation)
 //! - 5.4 SQLite roundtrip (write → query → verify)
+//! - 5.5 Edge-case coverage (diff_runs, schema reopen, secret observation)
 
 use scanner_rs::store::{
     db::{
         query::{self, resolve_run_pk},
         schema::{configure_connection, ensure_schema},
-        writer::{RunCounters, RunStatus, SqliteStoreConfig, SqliteStoreProducer},
+        writer::{RunStatus, SqliteStoreConfig, SqliteStoreProducer},
     },
-    identity::{
-        rule_fingerprint, secret_hash, secret_hash_with_truncation, SecretLenBucket,
-        MAX_SECRET_HASH_BYTES,
-    },
+    identity::{secret_hash_with_truncation, SecretLenBucket, MAX_SECRET_HASH_BYTES},
     keys::{IdHashMode, StoreKeys},
-    path_id::canonicalize_path,
     root_id::{self, RootIdInput, RootKind},
     FsFindingBatch, FsFindingRecord, FsRunLoss, StoreProducer,
 };
@@ -24,101 +20,9 @@ use std::fs;
 use std::process::Command;
 
 // ---------------------------------------------------------------------------
-// 5.1 Identity conformance
+// 5.1 Identity conformance (edge-case coverage; keyed/unkeyed/root_id/path
+//     basics are covered by unit tests in identity.rs, root_id.rs, path_id.rs)
 // ---------------------------------------------------------------------------
-
-#[test]
-fn rule_fingerprint_is_always_unkeyed() {
-    // Two different ephemeral keys produce the same rule fingerprint.
-    let keys_a = StoreKeys::bootstrap_from_env();
-    let keys_b = StoreKeys::bootstrap_from_env();
-
-    let rule = scanner_rs::demo_rules().into_iter().next().unwrap();
-    let fp_a = rule_fingerprint(&rule, &keys_a);
-    let fp_b = rule_fingerprint(&rule, &keys_b);
-    assert_eq!(fp_a, fp_b, "rule_fingerprint must be key-independent");
-}
-
-#[test]
-fn secret_hash_is_always_keyed() {
-    let keys_a = StoreKeys::bootstrap_from_env();
-    let keys_b = StoreKeys::bootstrap_from_env();
-
-    let norm = [0x42u8; 32];
-    let sh_a = secret_hash(&norm, &keys_a);
-    let sh_b = secret_hash(&norm, &keys_b);
-    assert_ne!(
-        sh_a, sh_b,
-        "secret_hash must use key material (different ephemeral keys → different hashes)"
-    );
-}
-
-#[test]
-fn keyed_vs_unkeyed_root_id_differs() {
-    let keys = StoreKeys::bootstrap_from_env();
-    let keys_keyed = keys.with_id_hash_mode(IdHashMode::Keyed);
-    let keys_unkeyed = keys.with_id_hash_mode(IdHashMode::Unkeyed);
-
-    let input = RootIdInput {
-        kind: RootKind::Fs,
-        identity_scheme: "fs_path_v1",
-        canonical_identity: b"/tmp/test",
-    };
-
-    let root_keyed = root_id::root_id(&input, &keys_keyed);
-    let root_unkeyed = root_id::root_id(&input, &keys_unkeyed);
-
-    assert_ne!(
-        root_keyed, root_unkeyed,
-        "keyed and unkeyed root_ids must differ"
-    );
-}
-
-#[test]
-fn root_id_deterministic_for_same_mode() {
-    let keys = StoreKeys::bootstrap_from_env();
-    let input = RootIdInput {
-        kind: RootKind::Fs,
-        identity_scheme: "fs_path_v1",
-        canonical_identity: b"/tmp/test",
-    };
-
-    let r1 = root_id::root_id(&input, &keys);
-    let r2 = root_id::root_id(&input, &keys);
-    assert_eq!(r1, r2, "same input + same keys must produce same root_id");
-}
-
-#[test]
-fn different_root_kinds_produce_different_ids() {
-    let keys = StoreKeys::bootstrap_from_env();
-
-    let fs_root = root_id::root_id(
-        &RootIdInput {
-            kind: RootKind::Fs,
-            identity_scheme: "fs_path_v1",
-            canonical_identity: b"/tmp/test",
-        },
-        &keys,
-    );
-    let git_root = root_id::root_id(
-        &RootIdInput {
-            kind: RootKind::Git,
-            identity_scheme: "git_remote_url_v1",
-            canonical_identity: b"/tmp/test",
-        },
-        &keys,
-    );
-    assert_ne!(fs_root, git_root, "different root kinds must differ");
-}
-
-#[test]
-fn path_canonicalization_is_deterministic() {
-    assert_eq!(canonicalize_path("a/b/../c"), "a/c");
-    assert_eq!(canonicalize_path("a/./b/./c"), "a/b/c");
-    assert_eq!(canonicalize_path("/foo/bar"), "foo/bar");
-    assert_eq!(canonicalize_path("a\\b\\c"), "a/b/c");
-    assert_eq!(canonicalize_path("./a/b"), "a/b");
-}
 
 #[test]
 fn secret_len_bucket_classification() {
@@ -150,53 +54,6 @@ fn max_secret_hash_bytes_truncation() {
         "different lengths should produce different hashes"
     );
     assert_ne!(sh2, sh3, "truncated hash should differ from non-truncated");
-}
-
-// ---------------------------------------------------------------------------
-// 5.2 Run status semantics
-// ---------------------------------------------------------------------------
-
-#[test]
-fn run_status_complete() {
-    assert_eq!(
-        RunCounters::default().derive_status(false),
-        RunStatus::Complete
-    );
-}
-
-#[test]
-fn run_status_complete_with_coverage_limits() {
-    assert_eq!(
-        RunCounters::default().derive_status(true),
-        RunStatus::CompleteWithCoverageLimits
-    );
-}
-
-#[test]
-fn run_status_incomplete_on_dropped() {
-    let c = RunCounters {
-        dropped_findings: 3,
-        ..Default::default()
-    };
-    assert_eq!(c.derive_status(false), RunStatus::Incomplete);
-}
-
-#[test]
-fn run_status_incomplete_on_emit_failures() {
-    let c = RunCounters {
-        emit_failures: 2,
-        ..Default::default()
-    };
-    assert_eq!(c.derive_status(false), RunStatus::Incomplete);
-}
-
-#[test]
-fn run_status_incomplete_overrides_coverage_limits() {
-    let c = RunCounters {
-        dropped_findings: 1,
-        ..Default::default()
-    };
-    assert_eq!(c.derive_status(true), RunStatus::Incomplete);
 }
 
 // ---------------------------------------------------------------------------
@@ -378,32 +235,6 @@ fn run_loss_marks_status_incomplete() {
     let runs = query::list_runs(&conn, None, 100).unwrap();
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].status, RunStatus::Incomplete as i32);
-}
-
-#[test]
-fn coverage_limits_run_status() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("findings.db");
-    let keys = StoreKeys::bootstrap_from_env();
-    let root_id = root_id::root_id(
-        &RootIdInput {
-            kind: RootKind::Fs,
-            identity_scheme: "fs_path_v1",
-            canonical_identity: b"/tmp/coverage",
-        },
-        &keys,
-    );
-
-    let config = make_config(db_path.clone(), root_id, keys.id_hash_mode());
-    let producer = SqliteStoreProducer::open(config).unwrap();
-    producer.end_run(true).unwrap(); // had_coverage_limits = true
-
-    let conn = rusqlite::Connection::open(&db_path).unwrap();
-    configure_connection(&conn).unwrap();
-
-    let runs = query::list_runs(&conn, None, 100).unwrap();
-    assert_eq!(runs.len(), 1);
-    assert_eq!(runs[0].status, RunStatus::CompleteWithCoverageLimits as i32);
 }
 
 #[test]

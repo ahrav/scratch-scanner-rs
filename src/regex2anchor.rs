@@ -1641,29 +1641,6 @@ mod tests {
         }
 
         #[test]
-        fn test_alternation_with_short_branch() {
-            // This is the critical bug test
-            // (a|abc) should fail because "a" is too short with min_anchor_len=3
-            assert!(matches!(
-                derive("a|abc"),
-                Err(AnchorDeriveError::OnlyWeakAnchors) | Err(AnchorDeriveError::Unanchorable)
-            ));
-
-            // With min_anchor_len=1, both should work
-            let mut result = derive_min("a|abc", 1).unwrap();
-            result.sort();
-            assert_eq!(result, vec!["a", "abc"]);
-        }
-
-        #[test]
-        fn test_alternation_overlapping() {
-            // Both branches are long enough
-            let mut result = derive("abc|abcdef").unwrap();
-            result.sort();
-            assert_eq!(result, vec!["abc", "abcdef"]);
-        }
-
-        #[test]
         fn test_optional_prefix() {
             // a?bc - the "a" is optional, so "bc" might not have it
             // But "bc" is too short with min=3
@@ -1753,12 +1730,6 @@ mod tests {
         }
 
         #[test]
-        fn test_dot_star() {
-            // .* matches anything - completely unanchorable
-            assert!(matches!(derive(".*"), Err(AnchorDeriveError::Unanchorable)));
-        }
-
-        #[test]
         fn test_anchors_caret_dollar() {
             // ^foo$ - the anchors don't add characters
             assert_eq!(derive("^foo$").unwrap(), vec!["foo"]);
@@ -1826,6 +1797,12 @@ mod tests {
                 result.is_err(),
                 "Pattern (a|abc) with min=3 should fail, not return only 'abc'"
             );
+
+            // With min_anchor_len=1, both branches are long enough and should succeed.
+            // (Merged from test_alternation_with_short_branch)
+            let mut result = derive_min("a|abc", 1).unwrap();
+            result.sort();
+            assert_eq!(result, vec!["a", "abc"]);
         }
 
         #[test]
@@ -1871,23 +1848,6 @@ mod tests {
                 }
             }
             // If Err, that's fine - conservative is safe
-        }
-
-        #[test]
-        fn test_bug_empty_string_in_exact_set() {
-            // BUG CLASS 3: Empty string in exact set
-            // Pattern: (|foo) - matches empty OR "foo"
-            // Empty string should not become an anchor
-
-            let result = derive_min("|foo", 1);
-            // This should either fail (because empty matches anything)
-            // or return ["foo"] only (not ["", "foo"])
-            if let Ok(anchors) = result {
-                assert!(
-                    !anchors.contains(&String::new()),
-                    "Empty string should not be an anchor"
-                );
-            }
         }
 
         #[test]
@@ -1969,6 +1929,12 @@ mod tests {
                     "Must include 'foobar'"
                 );
             }
+
+            // Both branches long enough — both must be preserved.
+            // (Merged from test_alternation_overlapping)
+            let mut result = derive("abc|abcdef").unwrap();
+            result.sort();
+            assert_eq!(result, vec!["abc", "abcdef"]);
         }
 
         #[test]
@@ -2044,6 +2010,18 @@ mod tests {
                 result.is_err(),
                 "Pattern 'foo|' matches empty string, should be unanchorable"
             );
+
+            // Leading empty branch: (|foo) — same invariant, opposite order.
+            // If the pattern happens to succeed, the empty string must not appear
+            // in the anchor set.
+            // (Merged from test_bug_empty_string_in_exact_set)
+            let result = derive_min("|foo", 1);
+            if let Ok(anchors) = result {
+                assert!(
+                    !anchors.contains(&String::new()),
+                    "Empty string should not be an anchor"
+                );
+            }
         }
 
         #[test]

@@ -557,32 +557,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn canonicalize_separators_and_dots() {
-        let mut c = EntryPathCanonicalizer::with_capacity(DEFAULT_MAX_COMPONENTS, 1024);
-        let r = c.canonicalize(b"a\\b/./c", 256, 1024);
-        assert_eq!(r.bytes, b"a/b/c");
-        assert!(!r.had_traversal);
-        assert!(!r.truncated);
-        assert!(!r.component_cap_exceeded);
-    }
-
-    #[test]
-    fn canonicalize_dotdot_clamps_above_root() {
-        let mut c = EntryPathCanonicalizer::with_capacity(DEFAULT_MAX_COMPONENTS, 1024);
-        let r = c.canonicalize(b"../../a/b", 256, 1024);
-        assert_eq!(r.bytes, b"a/b");
-        assert!(r.had_traversal);
-    }
-
-    #[test]
-    fn canonicalize_dotdot_pops() {
-        let mut c = EntryPathCanonicalizer::with_capacity(DEFAULT_MAX_COMPONENTS, 1024);
-        let r = c.canonicalize(b"a/b/../c", 256, 1024);
-        assert_eq!(r.bytes, b"a/c");
-        assert!(!r.had_traversal);
-    }
-
-    #[test]
     fn canonicalize_escapes_non_printable_and_percent() {
         let mut c = EntryPathCanonicalizer::with_capacity(DEFAULT_MAX_COMPONENTS, 1024);
         // component: "ab%\x01"

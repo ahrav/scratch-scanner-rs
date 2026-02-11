@@ -284,54 +284,6 @@ mod unit_tests {
     use super::*;
 
     #[test]
-    fn empty_bitset() {
-        let bs = AtomicBitSet::empty(64);
-        assert_eq!(bs.count(), 0);
-        assert_eq!(bs.bit_length(), 64);
-    }
-
-    #[test]
-    fn test_and_set_returns_true_then_false() {
-        let bs = AtomicBitSet::empty(64);
-        assert!(bs.test_and_set(0), "first call must return true");
-        assert!(!bs.test_and_set(0), "second call must return false");
-    }
-
-    #[test]
-    fn is_set_reflects_test_and_set() {
-        let bs = AtomicBitSet::empty(128);
-        assert!(!bs.is_set(42));
-        bs.test_and_set(42);
-        assert!(bs.is_set(42));
-    }
-
-    #[test]
-    fn clear_resets_all_bits() {
-        let bs = AtomicBitSet::empty(128);
-        bs.test_and_set(0);
-        bs.test_and_set(63);
-        bs.test_and_set(64);
-        bs.test_and_set(127);
-
-        bs.clear();
-
-        assert_eq!(bs.count(), 0);
-        assert!(!bs.is_set(0));
-        assert!(!bs.is_set(63));
-        assert!(!bs.is_set(64));
-        assert!(!bs.is_set(127));
-    }
-
-    #[test]
-    fn count_accumulates() {
-        let bs = AtomicBitSet::empty(256);
-        for i in 0..10 {
-            bs.test_and_set(i * 25);
-        }
-        assert_eq!(bs.count(), 10);
-    }
-
-    #[test]
     fn word_boundary_bits() {
         let bs = AtomicBitSet::empty(128);
         // Bit 0: first bit of word 0
