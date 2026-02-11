@@ -537,6 +537,30 @@ mod tests {
         findings
     }
 
+    /// Build an engine for a single rule, returning a closure that scans a
+    /// haystack without rebuilding the Vectorscan database each time.
+    ///
+    /// NOTE: Scratch is allocated per-call intentionally. `ScanScratch`
+    /// carries inter-chunk state (dedup sets, stream counters) that causes
+    /// incorrect results when reused across independent inputs. Production
+    /// code reuses scratch across *chunks of the same file*, not across
+    /// unrelated scans.
+    fn make_rule_scanner(rule_name: &str) -> impl FnMut(&[u8]) -> Vec<Finding> {
+        let rule = builtin_rule_by_name(rule_name);
+        let engine = Engine::new_with_anchor_policy(
+            vec![rule],
+            Vec::new(),
+            demo_tuning(),
+            AnchorPolicy::ManualOnly,
+        );
+        move |hay: &[u8]| {
+            let mut scratch = engine.new_scratch();
+            let mut findings = Vec::with_capacity(16);
+            engine.scan_chunk_materialized(hay, &mut scratch, &mut findings);
+            findings
+        }
+    }
+
     fn has_rule_hit(hits: &[Finding], rule_name: &str) -> bool {
         hits.iter().any(|hit| hit.rule == rule_name)
     }
@@ -757,6 +781,7 @@ rules:
             .map(|s| std::str::from_utf8(s).expect("suppressor should be valid UTF-8"))
             .collect();
 
+        let mut scan = make_rule_scanner(rule_name);
         let mut seed = 0x9E3779B97F4A7C15_u64;
         let mut checked = 0usize;
         for _ in 0..192 {
@@ -777,7 +802,7 @@ rules:
             }
 
             let hay = format!("API_KEY={secret}");
-            let hits = scan_single_builtin_rule(rule_name, hay.as_bytes());
+            let hits = scan(hay.as_bytes());
             assert!(
                 has_rule_hit(&hits, rule_name),
                 "expected randomized secret '{secret}' to be reported"
@@ -803,6 +828,7 @@ rules:
             .map(|s| std::str::from_utf8(s).expect("suppressor should be valid UTF-8"))
             .collect();
 
+        let mut scan = make_rule_scanner(rule_name);
         let mut seed = 0xA5A5A5A5A5A5A5A5_u64;
         let mut checked = 0usize;
         for _ in 0..192 {
@@ -825,7 +851,7 @@ rules:
             }
 
             let hay = format!("password = \"{secret}\"");
-            let hits = scan_single_builtin_rule(rule_name, hay.as_bytes());
+            let hits = scan(hay.as_bytes());
             assert!(
                 has_rule_hit(&hits, rule_name),
                 "expected randomized terraform password '{secret}' to be reported"
@@ -855,6 +881,7 @@ rules:
         let hex_alphabet: &[u8] = b"0123456789abcdef";
         let alnum_alphabet: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
 
+        let mut scan = make_rule_scanner(rule_name);
         let mut seed = 0xCAFEBABEDEAD5678_u64;
         let mut checked = 0usize;
         for _ in 0..192 {
@@ -887,7 +914,7 @@ rules:
             }
 
             let hay = format!("JIRA_TOKEN={secret}");
-            let hits = scan_single_builtin_rule(rule_name, hay.as_bytes());
+            let hits = scan(hay.as_bytes());
             assert!(
                 has_rule_hit(&hits, rule_name),
                 "expected randomized atlassian token '{secret}' to be reported"
@@ -1080,6 +1107,7 @@ rules:
             .map(|s| std::str::from_utf8(s).expect("suppressor should be valid UTF-8"))
             .collect();
 
+        let mut scan = make_rule_scanner(rule_name);
         let mut seed = 0xDEADBEEFCAFEBABE_u64;
         let mut checked = 0usize;
         for _ in 0..192 {
@@ -1104,7 +1132,7 @@ rules:
             }
 
             let hay = format!("curl -H \"Authorization: Bearer {secret}\" https://api.internal");
-            let hits = scan_single_builtin_rule(rule_name, hay.as_bytes());
+            let hits = scan(hay.as_bytes());
             assert!(
                 has_rule_hit(&hits, rule_name),
                 "expected randomized bearer token '{secret}' to be reported"
@@ -1130,6 +1158,7 @@ rules:
             .map(|s| std::str::from_utf8(s).expect("suppressor should be valid UTF-8"))
             .collect();
 
+        let mut scan = make_rule_scanner(rule_name);
         let mut seed = 0xA5A5A5A5B4B4B4B4_u64;
         let mut checked = 0usize;
         for _ in 0..192 {
@@ -1154,7 +1183,7 @@ rules:
             }
 
             let hay = format!("curl -u deploy_svc:{secret} https://registry.internal");
-            let hits = scan_single_builtin_rule(rule_name, hay.as_bytes());
+            let hits = scan(hay.as_bytes());
             assert!(
                 has_rule_hit(&hits, rule_name),
                 "expected randomized curl -u password '{secret}' to be reported"

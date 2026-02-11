@@ -4,7 +4,7 @@ This project uses `bd` (Beads) for issue tracking. Issues live in `.beads/`.
 
 At session start: run `bd ready` to find work.
 Track status with `bd update <id> --status in_progress`.
-At session end: close finished work, file new issues, run `bd sync`, then `git push`.
+At session end: close finished work, file new issues, run `bd sync`.
 
 For graph-aware triage: `bv --robot-triage` (never bare `bv`).
 
