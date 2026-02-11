@@ -73,8 +73,10 @@ pub enum ScanEvent<'a> {
     Diagnostic(DiagnosticEvent<'a>),
     /// Commit metadata emitted exactly once per referenced commit.
     ///
-    /// Sent before the first `Finding` that references a given `commit_id`.
-    /// Ordering across different commits is non-deterministic (parallel workers).
+    /// Emitted at most once per `commit_id` (only for commits with findings).
+    /// In parallel scan modes, stream ordering is intentionally non-deterministic:
+    /// a `Finding` may appear before the matching `CommitMeta`.
+    /// Consumers should join by `commit_id`, not event position.
     ///
     /// Wire format type: `"commit_meta"`.
     CommitMeta(CommitMetaEvent),
@@ -149,6 +151,8 @@ pub struct DiagnosticEvent<'a> {
 /// Provides the mapping from opaque `commit_id` (graph position) to the
 /// full commit hash and timestamp so JSONL output is self-contained.
 /// Only emitted for commits that have at least one finding.
+/// Ordering is best-effort under parallel workers; consumers must treat
+/// `commit_id` as the join key rather than assuming `CommitMeta` appears first.
 ///
 /// The exactly-once guarantee is enforced by an `AtomicBitSet` shared
 /// across all `EngineAdapter` instances. See

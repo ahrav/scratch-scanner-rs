@@ -571,6 +571,9 @@ fn run_scan_with_events(
 
 /// Verify that every finding's `commit_id` has a matching `commit_meta` event
 /// and that `commit_meta` is emitted exactly once per commit_id.
+///
+/// Event ordering is intentionally not asserted: pack/loose workers emit in
+/// parallel, so commit metadata and findings may interleave non-deterministically.
 #[test]
 fn commit_meta_output_matches_findings() {
     if !git_available() {
@@ -613,21 +616,14 @@ fn commit_meta_output_matches_findings() {
         // Collect commit_meta and finding events.
         let mut meta_ids: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
         let mut finding_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        let mut meta_positions: std::collections::HashMap<u64, usize> =
-            std::collections::HashMap::new();
-        let mut finding_first_pos: std::collections::HashMap<u64, usize> =
-            std::collections::HashMap::new();
-
-        for (idx, line) in lines.iter().enumerate() {
+        for line in &lines {
             if line.contains("\"type\":\"commit_meta\"") {
                 if let Some(cid) = extract_commit_id(line) {
                     *meta_ids.entry(cid).or_insert(0) += 1;
-                    meta_positions.entry(cid).or_insert(idx);
                 }
             } else if line.contains("\"type\":\"finding\"") {
                 if let Some(cid) = extract_commit_id(line) {
                     finding_ids.insert(cid);
-                    finding_first_pos.entry(cid).or_insert(idx);
                 }
             }
         }
@@ -646,18 +642,6 @@ fn commit_meta_output_matches_findings() {
             assert!(
                 finding_ids.contains(&mid),
                 "mode={mode:?}: commit_meta for id={mid} has no matching finding"
-            );
-        }
-
-        // 3. Each commit_meta appears before the first finding that references it.
-        for &cid in &finding_ids {
-            let meta_pos = meta_positions
-                .get(&cid)
-                .expect("commit_meta must exist (checked above)");
-            let find_pos = finding_first_pos.get(&cid).unwrap();
-            assert!(
-                meta_pos < find_pos,
-                "mode={mode:?}: commit_meta for id={cid} at line {meta_pos} must appear before first finding at line {find_pos}"
             );
         }
     }

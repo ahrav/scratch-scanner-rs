@@ -336,8 +336,12 @@ impl<'a> EngineAdapter<'a> {
     /// (across all adapter instances sharing the same `Arc<AtomicBitSet>`),
     /// so the resulting `CommitMeta` event is emitted at most once per
     /// `commit_id` — even when multiple workers or blobs reference the
-    /// same commit. The `CommitMeta` event always precedes the finding
-    /// events that reference it within the same `emit` / `emit_loose` call.
+    /// same commit.
+    ///
+    /// Within the adapter call that wins `test_and_set`, `CommitMeta` is
+    /// emitted before that adapter's finding events. Across parallel adapters,
+    /// global stream order is intentionally non-deterministic: a `Finding`
+    /// for a commit may appear before that commit's `CommitMeta`.
     ///
     /// Commits with zero findings never trigger `CommitMeta` emission.
     fn stream_findings(&self, path: &[u8], commit_id: u32, change_kind: &str) {
@@ -1004,7 +1008,9 @@ mod tests {
 
     use crate::git_scan::commit_graph::CommitGraphIndex;
     use crate::stdx::AtomicBitSet;
-    use crate::unified::events::VecEventSink;
+    use crate::unified::events::{EventSink, ScanEvent, VecEventSink};
+    use std::sync::{Condvar, Mutex};
+    use std::time::{Duration, Instant};
 
     /// Build a test adapter with event sink and dummy commit-graph / bitset.
     ///
@@ -1324,7 +1330,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_meta_emitted_before_finding() {
+    fn single_adapter_commit_meta_precedes_its_findings() {
         let entries = vec![(test_oid(0xab), 1_700_000_000)];
         let engine = test_engine_with_tok_rule();
         let sink = Arc::new(VecEventSink::new());
@@ -1360,6 +1366,185 @@ mod tests {
         assert!(
             output.contains("\"timestamp\":1700000000"),
             "commit_meta must contain timestamp: {output}"
+        );
+    }
+
+    #[derive(Default)]
+    struct ReorderGateState {
+        meta_waiting: bool,
+        allow_meta_emit: bool,
+    }
+
+    /// Event sink that blocks the first `CommitMeta` until another worker emits
+    /// a `Finding`. This makes cross-worker ordering inversions deterministic.
+    struct BlockingCommitMetaSink {
+        events: Mutex<Vec<&'static str>>,
+        state: Mutex<ReorderGateState>,
+        cv: Condvar,
+    }
+
+    impl BlockingCommitMetaSink {
+        fn new() -> Self {
+            Self {
+                events: Mutex::new(Vec::new()),
+                state: Mutex::new(ReorderGateState::default()),
+                cv: Condvar::new(),
+            }
+        }
+
+        fn wait_until_meta_waiting(&self, timeout: Duration) -> bool {
+            let start = Instant::now();
+            let mut state = self
+                .state
+                .lock()
+                .expect("blocking sink state mutex poisoned");
+            while !state.meta_waiting {
+                let elapsed = start.elapsed();
+                if elapsed >= timeout {
+                    return false;
+                }
+                let wait_for = timeout.saturating_sub(elapsed);
+                let (next_state, timed_out) = self
+                    .cv
+                    .wait_timeout(state, wait_for)
+                    .expect("blocking sink condvar wait poisoned");
+                state = next_state;
+                if timed_out.timed_out() && !state.meta_waiting {
+                    return false;
+                }
+            }
+            true
+        }
+
+        fn events(&self) -> Vec<&'static str> {
+            self.events
+                .lock()
+                .expect("blocking sink events mutex poisoned")
+                .clone()
+        }
+    }
+
+    impl EventSink for BlockingCommitMetaSink {
+        fn emit(&self, event: ScanEvent<'_>) {
+            match event {
+                ScanEvent::CommitMeta(_) => {
+                    let mut state = self
+                        .state
+                        .lock()
+                        .expect("blocking sink state mutex poisoned");
+                    state.meta_waiting = true;
+                    self.cv.notify_all();
+                    while !state.allow_meta_emit {
+                        state = self
+                            .cv
+                            .wait(state)
+                            .expect("blocking sink condvar wait poisoned");
+                    }
+                    drop(state);
+
+                    self.events
+                        .lock()
+                        .expect("blocking sink events mutex poisoned")
+                        .push("commit_meta");
+                }
+                ScanEvent::Finding(_) => {
+                    self.events
+                        .lock()
+                        .expect("blocking sink events mutex poisoned")
+                        .push("finding");
+                    let mut state = self
+                        .state
+                        .lock()
+                        .expect("blocking sink state mutex poisoned");
+                    if state.meta_waiting {
+                        state.allow_meta_emit = true;
+                        self.cv.notify_all();
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    #[test]
+    fn parallel_adapters_can_emit_finding_before_commit_meta_for_same_commit() {
+        let entries = vec![(test_oid(0xdd), 4_000)];
+        let engine = Arc::new(test_engine_with_tok_rule());
+        let sink = Arc::new(BlockingCommitMetaSink::new());
+
+        let graph = SmallTestGraph::new(&entries);
+        let commit_graph_index = Arc::new(CommitGraphIndex::build(&graph).expect("build graph"));
+        let commit_meta_seen = Arc::new(AtomicBitSet::empty(commit_graph_index.len().max(1)));
+        let blob = b"prefix TOK_ABCDEFGH suffix";
+
+        let worker_a = {
+            let engine = Arc::clone(&engine);
+            let sink = Arc::clone(&sink);
+            let commit_graph_index = Arc::clone(&commit_graph_index);
+            let commit_meta_seen = Arc::clone(&commit_meta_seen);
+            std::thread::spawn(move || {
+                let event_sink: Arc<dyn EventSink> = sink;
+                let mut adapter = EngineAdapter::new_with_event_sink(
+                    engine.as_ref(),
+                    EngineAdapterConfig::default(),
+                    CommitMetaContext {
+                        event_sink,
+                        commit_graph_index,
+                        commit_meta_seen,
+                    },
+                );
+                let candidate = make_candidate_with_ctx(0, ChangeKind::Add);
+                adapter
+                    .emit_loose(&candidate, b"a.txt", blob)
+                    .expect("worker A scan");
+            })
+        };
+
+        assert!(
+            sink.wait_until_meta_waiting(Duration::from_secs(2)),
+            "timed out waiting for worker A to block in commit_meta emit"
+        );
+
+        let worker_b = {
+            let engine = Arc::clone(&engine);
+            let sink = Arc::clone(&sink);
+            let commit_graph_index = Arc::clone(&commit_graph_index);
+            let commit_meta_seen = Arc::clone(&commit_meta_seen);
+            std::thread::spawn(move || {
+                let event_sink: Arc<dyn EventSink> = sink;
+                let mut adapter = EngineAdapter::new_with_event_sink(
+                    engine.as_ref(),
+                    EngineAdapterConfig::default(),
+                    CommitMetaContext {
+                        event_sink,
+                        commit_graph_index,
+                        commit_meta_seen,
+                    },
+                );
+                let candidate = make_candidate_with_ctx(0, ChangeKind::Add);
+                adapter
+                    .emit_loose(&candidate, b"b.txt", blob)
+                    .expect("worker B scan");
+            })
+        };
+
+        worker_b.join().expect("worker B join");
+        worker_a.join().expect("worker A join");
+
+        let events = sink.events();
+        let first_finding = events
+            .iter()
+            .position(|ty| *ty == "finding")
+            .expect("expected at least one finding event");
+        let first_meta = events
+            .iter()
+            .position(|ty| *ty == "commit_meta")
+            .expect("expected commit_meta event");
+        assert!(
+            first_finding < first_meta,
+            "expected a finding before commit_meta for the same commit: {events:?}"
         );
     }
 
@@ -1417,6 +1602,38 @@ mod tests {
         assert!(
             output.is_empty(),
             "no events should be emitted for blobs without findings"
+        );
+    }
+
+    #[test]
+    fn out_of_range_commit_id_emits_diagnostic() {
+        // Graph has 1 entry (positions 0..1); commit_id=5 is out of range.
+        let entries = vec![(test_oid(0xaa), 1000)];
+        let engine = test_engine_with_tok_rule();
+        let sink = Arc::new(VecEventSink::new());
+        let mut adapter = test_adapter_with_graph(&engine, sink.clone(), &entries);
+
+        let candidate = make_candidate_with_ctx(5, ChangeKind::Add);
+        let blob = b"prefix TOK_ABCDEFGH suffix";
+        adapter
+            .emit_loose(&candidate, b"secret.txt", blob)
+            .expect("scan with out-of-range commit_id");
+
+        let output = String::from_utf8(sink.take()).expect("valid UTF-8");
+        // Findings should still be emitted.
+        assert!(
+            output.contains("\"type\":\"finding\""),
+            "findings must still be emitted for out-of-range commit_id: {output}"
+        );
+        // No commit_meta should be emitted (commit_id is out of range).
+        assert!(
+            !output.contains("\"type\":\"commit_meta\""),
+            "commit_meta must not be emitted for out-of-range commit_id: {output}"
+        );
+        // A diagnostic warning should be emitted so the skip is visible.
+        assert!(
+            output.contains("\"type\":\"diagnostic\""),
+            "expected a diagnostic event for out-of-range commit_id, got: {output}"
         );
     }
 

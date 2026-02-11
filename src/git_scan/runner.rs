@@ -988,8 +988,12 @@ impl From<ArtifactAcquireError> for GitScanError {
 ///
 /// # Determinism
 /// Pack plans are built in pack order, and parallel execution reassembles
-/// results by pack (and shard) order before finalize. This keeps scan output
-/// stable even when multiple workers are used.
+/// results by pack (and shard) order before finalize. This keeps persisted
+/// scan output stable even when multiple workers are used.
+///
+/// Structured event ordering is intentionally non-deterministic under parallel
+/// workers: `commit_meta` and `finding` events may interleave across commits,
+/// and a finding may appear before its matching commit metadata.
 ///
 /// # Caveats
 /// - Loose object decode failures are recorded as skipped candidates and may

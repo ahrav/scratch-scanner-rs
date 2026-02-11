@@ -108,7 +108,9 @@ use super::runner_exec::{
 /// referenced commit. The index maps commit-graph positions to OIDs and
 /// timestamps; the bitset gates emission so each `commit_id` produces at
 /// most one `CommitMeta` event even when multiple adapters (or multiple
-/// blobs within a single adapter) reference the same commit.
+/// blobs within a single adapter) reference the same commit. Event ordering
+/// is intentionally non-deterministic under parallel workers; findings may
+/// precede matching commit metadata.
 ///
 /// # Errors
 ///

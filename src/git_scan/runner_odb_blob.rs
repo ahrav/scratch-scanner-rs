@@ -98,7 +98,9 @@ use super::repo_open::RepoJobState;
 /// referenced commit across all pack-exec workers and loose-scan adapters
 /// spawned by this function. See
 /// [`EngineAdapter::stream_findings`](super::engine_adapter::EngineAdapter)
-/// for the gating protocol.
+/// for the gating protocol. Event stream ordering is intentionally
+/// non-deterministic under parallel workers; findings may appear before
+/// matching commit metadata.
 ///
 /// # Parameters
 /// - `repo`: opened repository job state (paths, object format, artifacts).
