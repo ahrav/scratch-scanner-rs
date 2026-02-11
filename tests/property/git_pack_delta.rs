@@ -57,10 +57,10 @@ fn build_copy_cmd(offset: usize, size: usize) -> Vec<u8> {
 
     let actual_size = if size == 0x10000 { 0u32 } else { size as u32 };
     let sz_bytes = actual_size.to_le_bytes();
-    for i in 0..3 {
-        if sz_bytes[i] != 0 {
+    for (i, &b) in sz_bytes.iter().enumerate().take(3) {
+        if b != 0 {
             cmd |= 1 << (4 + i);
-            params.push(sz_bytes[i]);
+            params.push(b);
         }
     }
 
@@ -173,23 +173,21 @@ proptest! {
         let copy_size = ((copy_size_frac * max_copy as f64) as usize).max(1).min(max_copy);
 
         let mut expected = Vec::new();
-        let ops: Vec<DeltaOp<'_>>;
-
-        if insert_first {
+        let ops: Vec<DeltaOp<'_>> = if insert_first {
             expected.extend_from_slice(&insert_data);
             expected.extend_from_slice(&base[copy_offset..copy_offset + copy_size]);
-            ops = vec![
+            vec![
                 DeltaOp::Insert(&insert_data),
                 DeltaOp::Copy { offset: copy_offset, size: copy_size },
-            ];
+            ]
         } else {
             expected.extend_from_slice(&base[copy_offset..copy_offset + copy_size]);
             expected.extend_from_slice(&insert_data);
-            ops = vec![
+            vec![
                 DeltaOp::Copy { offset: copy_offset, size: copy_size },
                 DeltaOp::Insert(&insert_data),
-            ];
-        }
+            ]
+        };
 
         let delta = build_mixed_delta(base.len(), expected.len(), &ops);
         let mut out = Vec::new();
