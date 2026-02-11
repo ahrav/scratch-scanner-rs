@@ -1,8 +1,21 @@
 //! Streaming JSON array event sink.
 //!
-//! Writes a single valid JSON array document (`[{...},{...},...]`).
-//! Results are streamed as they arrive; the closing `]\n` is written
-//! on [`flush()`](EventSink::flush).
+//! Writes a single valid JSON array document — one top-level `[…]` whose
+//! elements are the same JSON objects as the JSONL sink but separated by
+//! commas instead of newlines. Use this when the consumer expects a single
+//! parseable JSON value (e.g. `jq '.[0]'`); prefer [`JsonlEventSink`] for
+//! streaming / line-oriented consumers.
+//!
+//! [`JsonlEventSink`]: super::events::JsonlEventSink
+//!
+//! # Example output
+//!
+//! ```text
+//! [
+//! {"type":"finding","source":"fs","path":"src/main.rs", …},
+//! {"type":"summary","source":"fs","status":"complete", …}
+//! ]
+//! ```
 //!
 //! # Thread safety
 //!
@@ -15,7 +28,9 @@
 //!
 //! - The opening `[` is written eagerly in [`JsonEventSink::new`].
 //! - Each element is preceded by `\n` (first) or `,\n` (subsequent).
-//! - `flush()` writes `\n]\n` and flushes the underlying `BufWriter`.
+//! - [`flush()`](EventSink::flush) writes `\n]\n` and flushes the
+//!   underlying `BufWriter`. It must be called **exactly once** at
+//!   end-of-scan; a second call would emit a stray `]\n`.
 //! - Broken-pipe errors are silently swallowed (for piped consumers like
 //!   `head`); all other I/O errors panic.
 
@@ -24,26 +39,39 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use super::events::{
-    encode_commit_meta, encode_diagnostic, encode_finding, encode_progress, encode_summary,
-    with_format_buf, EventSink, ScanEvent,
+    encode_commit_meta, encode_diagnostic, encode_finding, encode_identity_dictionary,
+    encode_progress, encode_summary, with_format_buf, EventSink, ScanEvent,
 };
 
-/// Default buffer size (64 KiB).
+/// Default `BufWriter` capacity (64 KiB).
+///
+/// Matches the JSONL sink and the typical OS pipe buffer, keeping
+/// syscall frequency low without over-allocating for small scans.
 const DEFAULT_BUF_CAPACITY: usize = 64 * 1024;
 
-/// JSON array event sink: streams `[{...},{...},...]`.
+/// JSON array event sink: streams `[{…},{…},…]`.
 ///
-/// The opening `[` is written on construction. Each `emit()` appends one
-/// JSON object (comma-separated). `flush()` writes `]\n` and flushes the
-/// underlying writer.
+/// The opening `[` is written on construction. Each [`emit()`](EventSink::emit)
+/// appends one comma-separated JSON object. [`flush()`](EventSink::flush)
+/// closes the array with `]\n` and flushes the underlying writer.
+///
+/// See the [module docs](self) for wire format, threading model, and error
+/// contract.
 pub struct JsonEventSink<W: Write + Send> {
+    /// Buffered writer, mutex-guarded for concurrent `emit()` calls.
     writer: Mutex<BufWriter<W>>,
+    /// `true` until the first element is written; controls whether
+    /// the separator is `\n` (first) or `,\n` (subsequent).
     first: AtomicBool,
 }
 
 impl<W: Write + Send> JsonEventSink<W> {
+    /// Create a new JSON array sink over `writer`.
+    ///
+    /// Eagerly writes the opening `[`. If this write fails (e.g. the
+    /// writer is already broken-pipe) it is silently ignored — the
+    /// subsequent `emit()` will surface the error on its payload write.
     pub fn new(mut writer: W) -> Self {
-        // Write the opening bracket immediately.
         let _ = writer.write_all(b"[");
         Self {
             writer: Mutex::new(BufWriter::with_capacity(DEFAULT_BUF_CAPACITY, writer)),
@@ -61,10 +89,15 @@ impl<W: Write + Send + 'static> EventSink for JsonEventSink<W> {
                 ScanEvent::Summary(s) => encode_summary(s, buf),
                 ScanEvent::Diagnostic(d) => encode_diagnostic(d, buf),
                 ScanEvent::CommitMeta(m) => encode_commit_meta(m, buf),
+                ScanEvent::IdentityDictionary(d) => encode_identity_dictionary(d, buf),
             },
             |bytes| {
                 let mut writer = self.writer.lock().expect("json sink mutex poisoned");
-                // Write comma separator between elements.
+                // Comma state machine: the first element gets a bare newline,
+                // all subsequent elements get ",\n". `Relaxed` is sufficient
+                // because the mutex already provides happens-before ordering.
+                // Separator write errors are intentionally discarded (`let _ =`);
+                // if the writer is broken, the payload write below will surface it.
                 if self.first.swap(false, Ordering::Relaxed) {
                     let _ = writer.write_all(b"\n");
                 } else {

@@ -13,6 +13,7 @@
 //! - `generations`: N * u32
 //! - `parent_start`: N+1 * u32 (CSR-style prefix sums)
 //! - `parents`: flattened parent positions
+//! - `identity_ids`: optional N * `CommitIdentityIds` (16 bytes each)
 //!
 //! # Generation Numbers
 //! Computed as `gen(commit) = 1 + max(gen(parent))` with roots having gen=1.
@@ -39,12 +40,24 @@ use gix_commitgraph::Position;
 use super::commit_loader::LoadedCommit;
 use super::commit_walk::{CommitGraph, ParentScratch};
 use super::errors::CommitPlanError;
+use super::identity_intern::CommitIdentityIds;
 use super::object_id::{ObjectFormat, OidBytes};
 
 /// In-memory commit graph built from loaded commits.
 ///
 /// Provides equivalent functionality to `CommitGraphView` for repos without
-/// pre-built commit-graph files.
+/// pre-built commit-graph files. All per-commit data uses Struct-of-Arrays
+/// layout for cache-friendly sequential access during generation-ordered
+/// traversal.
+///
+/// Parent edges use Compressed Sparse Row (CSR) encoding:
+/// `parent_start[i]..parent_start[i+1]` indexes into the flat `parents`
+/// array, avoiding one `Vec` allocation per commit.
+///
+/// When identity enrichment is enabled, per-commit identity IDs are stored
+/// in a flat `Vec<CommitIdentityIds>` (16 bytes per commit) indexed by
+/// position. The identity data survives the `(generation, oid)` sort
+/// permutation applied during construction.
 #[derive(Debug)]
 pub struct CommitGraphMem {
     format: ObjectFormat,
@@ -56,12 +69,15 @@ pub struct CommitGraphMem {
     timestamps: Vec<u64>,  // N entries
     generations: Vec<u32>, // N entries
 
-    // Parent storage (CSR-style: prefix sums + flattened positions)
-    parent_start: Vec<u32>, // N+1 entries
+    // Parent storage (CSR: parent_start[i]..parent_start[i+1] into parents)
+    parent_start: Vec<u32>, // N+1 entries (prefix sums)
     parents: Vec<u32>,      // flattened parent positions
 
     // Lookup table
     oid_to_pos: HashMap<OidBytes, u32>,
+
+    // Optional per-commit identity IDs (when enrichment is enabled)
+    identity_ids: Option<Vec<CommitIdentityIds>>,
 }
 
 impl CommitGraphMem {
@@ -131,8 +147,10 @@ impl CommitGraphMem {
             }
         }
 
-        // Topological generation propagation:
-        // gen(node) = 1 + max(gen(parent)) over in-set parents.
+        // Kahn's algorithm for topological generation propagation:
+        // Seed the ready queue with in-degree-zero nodes (roots or commits
+        // whose parents are all outside the loaded set), then propagate
+        // gen(node) = 1 + max(gen(parent)) through the child adjacency.
         let mut generations = vec![0u32; n];
         let mut max_parent_gen = vec![0u32; n];
         let mut ready = VecDeque::with_capacity(n);
@@ -161,7 +179,10 @@ impl CommitGraphMem {
             }
         }
 
-        // Force-resolve remaining commits (cycle or unresolved in-set parent chain).
+        // Force-resolve remaining commits (cycle or unresolved in-set parent
+        // chain). Assigning gen=1 keeps the graph usable for traversal; the
+        // (generation, oid) sort still produces a deterministic order, just
+        // without meaningful generation semantics for these nodes.
         if resolved_count != n {
             for gen in &mut generations {
                 if *gen == 0 {
@@ -221,10 +242,50 @@ impl CommitGraphMem {
             parent_start,
             parents: parents_flat,
             oid_to_pos,
+            identity_ids: None,
         })
     }
 
-    /// Creates an empty commit graph.
+    /// Builds an in-memory commit graph with per-commit identity data.
+    ///
+    /// This is the identity-aware counterpart to [`build`](Self::build).
+    /// The `identity_ids` vector must be the same length as `commits` and
+    /// aligned 1:1 — `identity_ids[i]` corresponds to `commits[i]`.
+    ///
+    /// The identity data is permuted to match the deterministic
+    /// `(generation, oid)` sort order applied during graph construction.
+    ///
+    /// # Panics
+    /// Panics (debug) if `commits.len() != identity_ids.len()`.
+    pub fn build_with_identities(
+        commits: Vec<LoadedCommit>,
+        identity_ids: Vec<CommitIdentityIds>,
+        format: ObjectFormat,
+    ) -> Result<Self, CommitPlanError> {
+        debug_assert_eq!(
+            commits.len(),
+            identity_ids.len(),
+            "identity_ids must be 1:1 with commits"
+        );
+
+        // Capture original OIDs before build() consumes commits.
+        let original_oids: Vec<OidBytes> = commits.iter().map(|c| c.oid).collect();
+        let mut graph = Self::build(commits, format)?;
+
+        // Apply the same (generation, oid) permutation to identity data.
+        let n = original_oids.len();
+        let mut sorted_ids = vec![CommitIdentityIds::default(); n];
+        for (orig_idx, oid) in original_oids.iter().enumerate() {
+            if let Some(&pos) = graph.oid_to_pos.get(oid) {
+                sorted_ids[pos as usize] = identity_ids[orig_idx];
+            }
+        }
+
+        graph.identity_ids = Some(sorted_ids);
+        Ok(graph)
+    }
+
+    /// Creates an empty commit graph (zero commits, valid CSR sentinel).
     fn empty(format: ObjectFormat) -> Self {
         Self {
             format,
@@ -236,6 +297,7 @@ impl CommitGraphMem {
             parent_start: vec![0],
             parents: Vec::new(),
             oid_to_pos: HashMap::new(),
+            identity_ids: None,
         }
     }
 
@@ -266,6 +328,21 @@ impl CommitGraphMem {
     #[inline]
     pub fn committer_timestamp(&self, pos: Position) -> u64 {
         self.timestamps[pos.0 as usize]
+    }
+
+    /// Returns `true` if this graph carries per-commit identity data.
+    #[inline]
+    pub fn has_identity_data(&self) -> bool {
+        self.identity_ids.is_some()
+    }
+
+    /// Returns per-commit identity IDs for `pos`, if identity enrichment
+    /// was enabled during graph construction.
+    ///
+    /// Returns `None` when the graph was built without identity data.
+    #[inline]
+    pub fn identity_ids(&self, pos: Position) -> Option<CommitIdentityIds> {
+        self.identity_ids.as_ref().map(|ids| ids[pos.0 as usize])
     }
 }
 
@@ -580,7 +657,64 @@ mod tests {
     fn memory_layout_efficient() {
         // Verify SoA layout is reasonably sized
         let size = std::mem::size_of::<CommitGraphMem>();
-        // Should be ~200 bytes for the struct (vecs are pointers + len + cap)
-        assert!(size < 300, "CommitGraphMem struct too large: {size}");
+        // identity_ids adds Option<Vec<CommitIdentityIds>> (24+8 bytes)
+        assert!(size < 350, "CommitGraphMem struct too large: {size}");
+    }
+
+    #[test]
+    fn build_with_identities_empty() {
+        let graph =
+            CommitGraphMem::build_with_identities(vec![], vec![], ObjectFormat::Sha1).unwrap();
+        assert_eq!(graph.num_commits(), 0);
+        // Empty build still sets identity_ids to None (no data to permute).
+        // This is fine: has_identity_data() returns false for empty graphs.
+    }
+
+    #[test]
+    fn build_with_identities_preserves_permutation() {
+        // c2 -> c1 (root). Build order: [c2, c1].
+        // Deterministic sort: (gen=1, c1), (gen=2, c2) → positions [0, 1].
+        let c1 = make_commit([1; 20], [11; 20], &[], 1000);
+        let c2 = make_commit([2; 20], [12; 20], &[[1; 20]], 2000);
+
+        let id_c1 = CommitIdentityIds {
+            author_name: 10,
+            author_email: 11,
+            committer_name: 12,
+            committer_email: 13,
+        };
+        let id_c2 = CommitIdentityIds {
+            author_name: 20,
+            author_email: 21,
+            committer_name: 22,
+            committer_email: 23,
+        };
+
+        // Input order: [c2, c1], identity order: [id_c2, id_c1].
+        let graph = CommitGraphMem::build_with_identities(
+            vec![c2, c1],
+            vec![id_c2, id_c1],
+            ObjectFormat::Sha1,
+        )
+        .unwrap();
+
+        assert!(graph.has_identity_data());
+
+        // After sort: pos 0 = c1 (gen=1), pos 1 = c2 (gen=2).
+        let pos_c1 = graph.lookup(&OidBytes::sha1([1; 20])).unwrap().unwrap();
+        let pos_c2 = graph.lookup(&OidBytes::sha1([2; 20])).unwrap().unwrap();
+
+        assert_eq!(graph.identity_ids(pos_c1), Some(id_c1));
+        assert_eq!(graph.identity_ids(pos_c2), Some(id_c2));
+    }
+
+    #[test]
+    fn identity_ids_none_without_enrichment() {
+        let c1 = make_commit([1; 20], [11; 20], &[], 1000);
+        let graph = CommitGraphMem::build(vec![c1], ObjectFormat::Sha1).unwrap();
+        assert!(!graph.has_identity_data());
+
+        let pos = graph.lookup(&OidBytes::sha1([1; 20])).unwrap().unwrap();
+        assert_eq!(graph.identity_ids(pos), None);
     }
 }

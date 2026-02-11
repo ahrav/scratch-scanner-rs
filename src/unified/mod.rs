@@ -162,6 +162,8 @@ pub struct GitSourceConfig {
     pub perf_breakdown: bool,
     /// When `true`, scan binary blobs instead of skipping them.
     pub scan_binary: bool,
+    /// When `true`, extract and emit author/committer identity data.
+    pub enrich_identities: bool,
 }
 
 /// Output event format selection.

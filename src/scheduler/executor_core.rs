@@ -516,15 +516,8 @@ mod loom_tests {
             let final_state = state.load(Ordering::Acquire);
 
             // Terminal state MUST always be reached: count=0, !accepting.
-            assert_eq!(
-                in_flight(final_state),
-                0,
-                "count must reach 0",
-            );
-            assert!(
-                !is_accepting(final_state),
-                "gate must be closed",
-            );
+            assert_eq!(in_flight(final_state), 0, "count must reach 0",);
+            assert!(!is_accepting(final_state), "gate must be closed",);
 
             // Exactly one observer must trigger done.
             //

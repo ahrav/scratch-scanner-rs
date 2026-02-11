@@ -45,6 +45,8 @@ use std::path::PathBuf;
 use memmap2::Mmap;
 
 use super::commit_parse::{parse_commit, CommitParseLimits};
+use super::identity_intern::{CommitIdentityIds, IdentityInterner, SENTINEL_ID};
+use super::identity_parse::{parse_author_identity, parse_committer_identity};
 use super::midx::MidxView;
 use super::midx_error::MidxError;
 use super::object_id::{ObjectFormat, OidBytes};
@@ -168,13 +170,16 @@ impl From<MidxError> for CommitLoadError {
 }
 
 /// Loaded commit with all fields needed for graph construction.
+///
+/// Parent OIDs preserve the order from the commit object, which matters
+/// for first-parent semantics and deterministic traversal.
 #[derive(Debug, Clone)]
 pub struct LoadedCommit {
     /// Commit OID.
     pub oid: OidBytes,
     /// Tree OID this commit points to.
     pub tree_oid: OidBytes,
-    /// Parent commit OIDs.
+    /// Parent commit OIDs (in commit-object order).
     pub parents: Vec<OidBytes>,
     /// Committer timestamp (Unix epoch seconds).
     pub timestamp: u64,
@@ -284,6 +289,30 @@ pub fn load_commits_from_tips_with_loose_dirs(
     loader.load_from_tips(tips, progress)
 }
 
+/// Loads commits with identity enrichment from tip OIDs using BFS.
+///
+/// Same BFS traversal as [`load_commits_from_tips_with_loose_dirs`], but also
+/// extracts author/committer identity from each commit's raw bytes and interns
+/// the strings into `interner`. Returns both the loaded commits and a parallel
+/// `Vec<CommitIdentityIds>` aligned 1:1 with the commit list.
+///
+/// When identity parsing fails for a commit (malformed header), the identity
+/// IDs are set to [`SENTINEL_ID`].
+#[allow(clippy::too_many_arguments)]
+pub fn load_commits_with_identities(
+    tips: &[OidBytes],
+    midx: &MidxView<'_>,
+    pack_paths: &[PathBuf],
+    loose_dirs: &[PathBuf],
+    format: ObjectFormat,
+    limits: &CommitLoadLimits,
+    interner: &mut IdentityInterner,
+    progress: Option<&ProgressFn>,
+) -> Result<(Vec<LoadedCommit>, Vec<CommitIdentityIds>), CommitLoadError> {
+    let mut loader = CommitLoader::new(midx, pack_paths, loose_dirs, format, limits)?;
+    loader.load_from_tips_with_identities(tips, interner, progress)
+}
+
 /// Resolves pack paths from MIDX pack names.
 ///
 /// Returns paths in MIDX pack order (by pack_id).
@@ -379,6 +408,12 @@ fn derive_loose_dirs_from_pack_paths(pack_paths: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 /// Internal commit loader state.
+///
+/// Owns a lazy mmap cache for pack files: each pack is mapped on first
+/// access and reused for all subsequent lookups within the same load call.
+/// Delta resolution is recursive (bounded by `max_delta_depth`); each
+/// recursive call releases the pack borrow before recursing so the mmap
+/// cache can be extended if the base lives in a different pack.
 struct CommitLoader<'m, 'p, 'l> {
     /// MIDX used for OID → (pack_id, offset) resolution.
     midx: &'m MidxView<'m>,
@@ -471,6 +506,55 @@ impl<'m, 'p, 'l> CommitLoader<'m, 'p, 'l> {
         Ok(commits)
     }
 
+    fn load_from_tips_with_identities(
+        &mut self,
+        tips: &[OidBytes],
+        interner: &mut IdentityInterner,
+        progress: Option<&ProgressFn>,
+    ) -> Result<(Vec<LoadedCommit>, Vec<CommitIdentityIds>), CommitLoadError> {
+        let mut commits = Vec::new();
+        let mut identity_ids = Vec::new();
+        let mut visited = HashSet::new();
+        let mut queued = HashSet::with_capacity(tips.len());
+        let mut frontier = VecDeque::with_capacity(tips.len());
+
+        for tip in tips {
+            let _ = enqueue_frontier_oid(*tip, &visited, &mut queued, &mut frontier);
+        }
+
+        while let Some(oid) = frontier.pop_front() {
+            queued.remove(&oid);
+
+            if !visited.insert(oid) {
+                continue;
+            }
+
+            if commits.len() >= self.limits.max_commits as usize {
+                return Err(CommitLoadError::TooManyCommits {
+                    count: commits.len() as u32,
+                    limit: self.limits.max_commits,
+                });
+            }
+
+            let (commit, ids) = self.load_commit_with_identity(&oid, interner)?;
+
+            for parent in &commit.parents {
+                let _ = enqueue_frontier_oid(*parent, &visited, &mut queued, &mut frontier);
+            }
+
+            commits.push(commit);
+            identity_ids.push(ids);
+
+            if let Some(cb) = progress {
+                if commits.len() % 1000 == 0 {
+                    cb(commits.len() as u32);
+                }
+            }
+        }
+
+        Ok((commits, identity_ids))
+    }
+
     fn load_commit(&mut self, oid: &OidBytes) -> Result<LoadedCommit, CommitLoadError> {
         // Prefer MIDX-backed packs. Fall back to loose object lookup on miss.
         let (kind, data) = match self.midx.find_oid(oid)? {
@@ -501,6 +585,52 @@ impl<'m, 'p, 'l> CommitLoader<'m, 'p, 'l> {
             parents: parsed.parents,
             timestamp: parsed.committer_timestamp,
         })
+    }
+
+    /// Loads a commit and extracts identity data from the raw bytes.
+    ///
+    /// Performs the same object loading and parsing as [`load_commit`](Self::load_commit),
+    /// then makes a second pass over the raw header bytes (~200 B) to extract
+    /// author/committer identity via [`parse_author_identity`] and
+    /// [`parse_committer_identity`]. The identity strings are interned into
+    /// `interner`; on parse failure, fields default to [`SENTINEL_ID`].
+    fn load_commit_with_identity(
+        &mut self,
+        oid: &OidBytes,
+        interner: &mut IdentityInterner,
+    ) -> Result<(LoadedCommit, CommitIdentityIds), CommitLoadError> {
+        let (kind, data) = match self.midx.find_oid(oid)? {
+            Some(idx) => {
+                let (pack_id, offset) = self.midx.offset_at(idx)?;
+                self.load_object(pack_id, offset)?
+            }
+            None => self
+                .load_loose_object(oid)?
+                .ok_or(CommitLoadError::CommitNotFound { oid: *oid })?,
+        };
+
+        if kind != ObjectKind::Commit {
+            return Err(CommitLoadError::NotACommit { oid: *oid, kind });
+        }
+
+        // Extract identity from raw commit bytes before parsing consumes structure.
+        let ids = intern_commit_identities(&data, interner);
+
+        let parsed = parse_commit(&data, self.format, &self.parse_limits).map_err(|e| {
+            CommitLoadError::ParseError {
+                oid: *oid,
+                detail: e.to_string(),
+            }
+        })?;
+
+        let commit = LoadedCommit {
+            oid: *oid,
+            tree_oid: parsed.tree_oid,
+            parents: parsed.parents,
+            timestamp: parsed.committer_timestamp,
+        };
+
+        Ok((commit, ids))
     }
 
     fn load_loose_object(
@@ -561,6 +691,13 @@ impl<'m, 'p, 'l> CommitLoader<'m, 'p, 'l> {
         self.load_object_with_depth(pack_id, offset, max_depth)
     }
 
+    /// Resolves a pack entry, recursing through delta chains up to `depth`.
+    ///
+    /// For delta entries (OFS_DELTA / REF_DELTA), the method extracts the
+    /// entry header, drops the pack borrow, recurses to resolve the base,
+    /// then re-borrows the pack to inflate the delta payload. This
+    /// borrow-release-reborrow pattern is necessary because `ensure_pack_loaded`
+    /// may mutate `pack_cache` when the base lives in a different pack.
     fn load_object_with_depth(
         &mut self,
         pack_id: u16,
@@ -708,6 +845,11 @@ impl<'m, 'p, 'l> CommitLoader<'m, 'p, 'l> {
     }
 }
 
+/// Parses a decompressed loose object.
+///
+/// Git loose objects have the wire format `<type> <decimal-size>\0<payload>`
+/// after zlib decompression. The caller is responsible for decompression
+/// before calling this function.
 fn parse_loose_object(bytes: &[u8], max_payload: usize) -> Result<(ObjectKind, Vec<u8>), String> {
     let nul = bytes
         .iter()
@@ -764,6 +906,37 @@ fn parse_decimal(bytes: &[u8]) -> Option<u64> {
         out = out.checked_mul(10)?.checked_add((b - b'0') as u64)?;
     }
     Some(out)
+}
+
+/// Extracts and interns author/committer identity from raw commit bytes.
+///
+/// Makes a single pass over the commit header (~200 bytes) to locate the
+/// `author` and `committer` lines, then interns the name/email strings.
+/// On parse failure (malformed header), the corresponding fields are set
+/// to [`SENTINEL_ID`].
+fn intern_commit_identities(data: &[u8], interner: &mut IdentityInterner) -> CommitIdentityIds {
+    let (author_name, author_email) = match parse_author_identity(data) {
+        Some(raw) => (
+            interner.intern_or_sentinel(raw.name),
+            interner.intern_or_sentinel(raw.email),
+        ),
+        None => (SENTINEL_ID, SENTINEL_ID),
+    };
+
+    let (committer_name, committer_email) = match parse_committer_identity(data) {
+        Some(raw) => (
+            interner.intern_or_sentinel(raw.name),
+            interner.intern_or_sentinel(raw.email),
+        ),
+        None => (SENTINEL_ID, SENTINEL_ID),
+    };
+
+    CommitIdentityIds {
+        author_name,
+        author_email,
+        committer_name,
+        committer_email,
+    }
 }
 
 fn oid_to_hex(oid: &OidBytes) -> String {

@@ -301,6 +301,7 @@ fn parse_git_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<
     let mut debug = false;
     let mut perf_breakdown = false;
     let mut scan_binary = false;
+    let mut enrich_identities = false;
     let mut verbose = false;
     let mut event_format = EventFormat::Jsonl;
     let mut rules_file: Option<PathBuf> = None;
@@ -411,6 +412,10 @@ fn parse_git_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<
                     scan_binary = true;
                     continue;
                 }
+                "--enrich-identities" => {
+                    enrich_identities = true;
+                    continue;
+                }
                 "--verbose" => {
                     verbose = true;
                     continue;
@@ -456,6 +461,7 @@ fn parse_git_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<
             debug,
             perf_breakdown,
             scan_binary,
+            enrich_identities,
         }),
         event_format,
         verbose,
@@ -658,6 +664,7 @@ OPTIONS:
     --debug                   Verbose stage stats to stderr
     --perf-breakdown          Pack execution timing breakdown
     --scan-binary             Scan binary blobs instead of skipping them
+    --enrich-identities       Emit author/committer identity data
     --event-format=jsonl      Output format (default: jsonl)
     --help, -h                Show this help"
     );

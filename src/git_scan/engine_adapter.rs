@@ -42,6 +42,7 @@ use crate::unified::SourceKind;
 use crate::{Engine, FileId, NormHash, ScanScratch};
 
 use super::commit_graph::CommitGraphIndex;
+use super::identity_intern::IdentityInterner;
 
 use super::alloc_guard;
 use super::object_id::OidBytes;
@@ -62,6 +63,14 @@ pub struct CommitMetaContext {
     pub commit_graph_index: Arc<CommitGraphIndex>,
     /// Emit-once bitset — one bit per commit-graph position.
     pub commit_meta_seen: Arc<AtomicBitSet>,
+    /// Identity interner for resolving intern IDs to raw name/email bytes.
+    ///
+    /// Present when identity enrichment is enabled (`--author-attribution`).
+    /// Used by the runner for upfront dictionary emission; carried here so
+    /// `EngineAdapter` instances in the scheduler can forward it to their
+    /// `CommitMetaContext` without a separate plumbing path. Currently only
+    /// read by the runner, not by the adapter itself.
+    pub identity_interner: Option<Arc<IdentityInterner>>,
 }
 
 /// Default chunk window size for adapter scanning (1 MiB).
@@ -297,6 +306,10 @@ impl<'a> EngineAdapter<'a> {
     }
 
     /// Reserves capacity for the per-blob findings buffer.
+    ///
+    /// The per-blob buffer is drained into the shared arena after each blob,
+    /// so this only needs to cover the expected peak per-blob finding count
+    /// (not the cumulative total).
     pub fn reserve_findings_buf(&mut self, additional: usize) {
         self.findings_buf.reserve(additional);
     }
@@ -362,10 +375,12 @@ impl<'a> EngineAdapter<'a> {
                 if self.commit_meta_seen.test_and_set(commit_id as usize) {
                     let oid = self.commit_graph.commit_oid(Position(commit_id));
                     let ts = self.commit_graph.committer_timestamp(Position(commit_id));
+                    let identity = self.commit_graph.identity_ids(Position(commit_id));
                     self.event_sink.emit(ScanEvent::CommitMeta(CommitMetaEvent {
                         commit_id,
                         commit_oid: oid,
                         timestamp: ts,
+                        identity,
                     }));
                 }
             } else {
@@ -510,6 +525,7 @@ impl<'a> EngineAdapter<'a> {
                 event_sink: Arc::new(NullEventSink),
                 commit_graph_index: Arc::new(CommitGraphIndex::empty()),
                 commit_meta_seen: Arc::new(AtomicBitSet::empty(1)),
+                identity_interner: None,
             },
         )
     }
@@ -544,8 +560,9 @@ pub fn scan_blob_chunked(
 
 /// Clamp requested chunk sizes for overlap and offset safety.
 ///
-/// Ensures `chunk_bytes > overlap` and caps the result at `u32::MAX` so
-/// finding offsets can safely downcast to `u32`.
+/// Ensures `chunk_bytes > overlap` (so each chunk makes forward progress)
+/// and caps the result at `u32::MAX` so finding offsets can safely downcast
+/// to `u32`. A `requested` value of `0` selects [`DEFAULT_CHUNK_BYTES`].
 fn effective_chunk_bytes(requested: usize, overlap: usize) -> usize {
     // Enforce progress and clamp to u32::MAX for offset conversion safety.
     // Finding offsets are stored as `u32`, so chunking must preserve bounds.
@@ -1046,6 +1063,7 @@ mod tests {
                 event_sink: sink,
                 commit_graph_index: Arc::new(CommitGraphIndex::empty()),
                 commit_meta_seen: Arc::new(AtomicBitSet::empty(1)),
+                identity_interner: None,
             },
         )
     }
@@ -1312,6 +1330,7 @@ mod tests {
                 event_sink: sink,
                 commit_graph_index: cg,
                 commit_meta_seen: seen,
+                identity_interner: None,
             },
         )
     }
@@ -1511,6 +1530,7 @@ mod tests {
                         event_sink,
                         commit_graph_index,
                         commit_meta_seen,
+                        identity_interner: None,
                     },
                 );
                 let candidate = make_candidate_with_ctx(0, ChangeKind::Add);
@@ -1539,6 +1559,7 @@ mod tests {
                         event_sink,
                         commit_graph_index,
                         commit_meta_seen,
+                        identity_interner: None,
                     },
                 );
                 let candidate = make_candidate_with_ctx(0, ChangeKind::Add);
@@ -1705,6 +1726,7 @@ mod tests {
                 event_sink: sink,
                 commit_graph_index: cg,
                 commit_meta_seen: seen,
+                identity_interner: None,
             },
         );
     }

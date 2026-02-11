@@ -851,16 +851,32 @@ pub(super) struct SchedulerPackExecOutput {
 }
 
 /// Task dispatched to a scheduler worker thread.
+///
+/// Variant determines which execution function is called in
+/// [`run_scheduler_pack_task`]. The `seq` / index fields are positions
+/// into the shared `plans` vector, not pack IDs.
 enum SchedulerPackTask {
     /// Execute a full pack plan (used by Serial and PackParallel strategies).
+    ///
+    /// `seq` is the index into `shared.plans` and doubles as the output
+    /// slot index for deterministic reassembly.
     ExecPlan { seq: usize },
     /// Execute one shard of a pack plan (used by IntraPackSharded strategy).
+    ///
+    /// `plan_idx` indexes `shared.plans`; `shard_idx` indexes the
+    /// `shard_ranges` within that plan's [`SchedulerShardMeta`].
     ExecShard { plan_idx: usize, shard_idx: usize },
 }
 
 /// Per-worker scratch space reused across tasks to avoid re-allocation.
+///
+/// Created once per worker thread by the `Executor` init closure.
+/// Both fields grow to steady-state capacity after the first few tasks
+/// and remain stable for the rest of the scan.
 struct SchedulerPackScratch {
+    /// LRU-style delta base cache sized by [`per_worker_cache_bytes`].
     cache: PackCache,
+    /// Decode workspace: inflate buffer, delta apply buffer, object staging.
     exec_scratch: PackExecScratch,
 }
 
@@ -883,6 +899,11 @@ struct SchedulerShardMeta {
 ///
 /// Wrapped in `Arc` so each worker can borrow without lifetime issues.
 /// Mutable per-worker state lives in [`SchedulerPackScratch`] instead.
+///
+/// Fields fall into three categories:
+/// - **I/O context** — mmaps, paths, MIDX bytes for pack/loose decode.
+/// - **Scan context** — engine, adapter config, decode limits.
+/// - **Event context** — sink, commit-graph, bitset for `CommitMeta` gating.
 struct SchedulerPackShared {
     engine: Arc<Engine>,
     event_sink: Arc<dyn EventSink>,
@@ -906,6 +927,11 @@ struct SchedulerPackShared {
     commit_meta_seen: Arc<crate::stdx::AtomicBitSet>,
 }
 
+/// Pre-allocate adapter result capacity for a shard's execution slice.
+///
+/// Sums the candidate counts across all offsets in `exec_slice` so the
+/// adapter can reserve a single contiguous allocation before the decode
+/// loop, avoiding incremental growth on the hot path.
 fn reserve_results_for_exec_slice(
     adapter: &mut EngineAdapter<'_>,
     exec_slice: &[usize],
@@ -922,6 +948,11 @@ fn reserve_results_for_exec_slice(
     }
 }
 
+/// Construct a zero-work output for plans with no executable offsets.
+///
+/// Used by the `IntraPackSharded` path when a plan has empty `exec_indices`
+/// (no offsets to decode), so every plan slot has a value for deterministic
+/// reassembly without special-casing `None`.
 fn empty_scheduler_output() -> SchedulerPackExecOutput {
     SchedulerPackExecOutput {
         report: PackExecReport::default(),
@@ -933,6 +964,18 @@ fn empty_scheduler_output() -> SchedulerPackExecOutput {
     }
 }
 
+/// Execute a single scheduler-dispatched pack task (plan or shard).
+///
+/// Each invocation creates a fresh `EngineAdapter` and `PackIo` from the
+/// shared state, then delegates to the appropriate pack-exec function.
+/// The per-worker `scratch` (cache + decode workspace) is reused across
+/// tasks on the same thread to amortize allocation.
+///
+/// # Error propagation
+///
+/// Errors bubble up to the scheduler closure, which stores the first
+/// error in `first_error` and sets the abort flag to quiesce remaining
+/// tasks.
 fn run_scheduler_pack_task(
     task: SchedulerPackTask,
     scratch: &mut SchedulerPackScratch,
@@ -953,6 +996,7 @@ fn run_scheduler_pack_task(
             event_sink: Arc::clone(&shared.event_sink),
             commit_graph_index: Arc::clone(&shared.commit_graph),
             commit_meta_seen: Arc::clone(&shared.commit_meta_seen),
+            identity_interner: None,
         },
     );
 

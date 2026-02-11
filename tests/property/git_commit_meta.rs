@@ -38,6 +38,7 @@ proptest! {
             commit_id,
             commit_oid: oid,
             timestamp,
+            identity: None,
         };
 
         let encoder = JsonlEncoder::new();

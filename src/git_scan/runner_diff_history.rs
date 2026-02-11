@@ -133,6 +133,7 @@ pub(super) fn run_diff_history(
         event_sink,
         commit_graph_index,
         commit_meta_seen,
+        identity_interner,
     } = commit_meta;
 
     let mut stage_nanos = GitScanStageNanos::default();
@@ -309,7 +310,11 @@ pub(super) fn run_diff_history(
         return Err(GitScanError::ConcurrentMaintenance);
     }
 
-    // ── Stage 5: Pack execution + scan ───────────────────────────────────
+    // ── Stage 5: Pack execution + loose scan ──────────────────────────────
+    // Packed candidates are dispatched via the scheduler (serial, pack-
+    // parallel, or intra-pack-sharded). Loose candidates are decoded and
+    // scanned sequentially after all pack work completes. Both paths feed
+    // the same `scanned` accumulator for deterministic output order.
     let pack_cache_target = per_worker_cache_bytes(
         config.pack_cache_bytes,
         &pack_mmaps,
@@ -381,6 +386,7 @@ pub(super) fn run_diff_history(
                 event_sink: event_sink.clone(),
                 commit_graph_index: Arc::clone(&commit_graph_index),
                 commit_meta_seen: Arc::clone(&commit_meta_seen),
+                identity_interner: identity_interner.clone(),
             },
         );
         adapter.reserve_results(sink.loose.len());

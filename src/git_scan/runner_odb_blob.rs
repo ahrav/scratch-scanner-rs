@@ -128,6 +128,7 @@ pub(super) fn run_odb_blob(
         event_sink,
         commit_graph_index,
         commit_meta_seen,
+        identity_interner,
     } = commit_meta;
 
     let mut stage_nanos = GitScanStageNanos::default();
@@ -453,6 +454,7 @@ pub(super) fn run_odb_blob(
                     event_sink: event_sink.clone(),
                     commit_graph_index: Arc::clone(&commit_graph_index),
                     commit_meta_seen: Arc::clone(&commit_meta_seen),
+                    identity_interner: identity_interner.clone(),
                 },
             );
             adapter.reserve_results(loose.len());
@@ -485,6 +487,7 @@ pub(super) fn run_odb_blob(
                     event_sink: event_sink.clone(),
                     commit_graph_index: Arc::clone(&commit_graph_index),
                     commit_meta_seen: Arc::clone(&commit_meta_seen),
+                    identity_interner: identity_interner.clone(),
                 },
             );
             adapter.reserve_results(loose.len());
