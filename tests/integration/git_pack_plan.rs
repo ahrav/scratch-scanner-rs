@@ -672,7 +672,11 @@ fn deep_ofs_chain_at_depth_32() {
         build_pack_plans(vec![cand], &[Some(pack_view)], &NoopResolver, &config).unwrap(),
     );
 
-    assert_eq!(plan.need_offsets().len(), 33, "base + 32 deltas = 33 offsets");
+    assert_eq!(
+        plan.need_offsets().len(),
+        33,
+        "base + 32 deltas = 33 offsets"
+    );
     // Verify all offsets are present in sorted order.
     for &off in &offsets {
         assert!(
