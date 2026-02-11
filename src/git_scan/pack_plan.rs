@@ -718,6 +718,57 @@ pub struct ExecOrderResult {
 ///    pushed in reverse so thinnest lands on top. DAG nodes wait until all
 ///    parents are emitted (`dag_remaining` counter).
 /// 5. **Identity check**: If the result is `[0..n]`, return `None`.
+///
+/// # Worked example
+///
+/// ```text
+/// need_offsets = [100, 200, 300, 400, 500]   (indices 0..4)
+///
+/// delta_deps:
+///   300 (idx 2) ─base→ 100 (idx 0)     // backward dep
+///   400 (idx 3) ─base→ 100 (idx 0)     // backward dep
+///   500 (idx 4) ─base→ 400 (idx 3)     // backward dep
+///
+/// DAG (base → dependent):
+///
+///        0 (100)         1 (200, independent)
+///       / \
+///      2   3 (400)
+///          |
+///          4
+///
+/// Phase 1 – CSR adjacency:
+///   forward[0] = [2, 3]   forward[3] = [4]
+///   indegree:  [0, 0, 1, 1, 1]
+///   outdegree: [2, 0, 0, 1, 0]
+///
+/// Phase 2 – Descendant counts (leaf BFS upward):
+///   leaves = {1, 2, 4}
+///   desc_count[3] += desc_count[4]+1 = 1   (from leaf 4)
+///   desc_count[0] += desc_count[2]+1 = 1   (from leaf 2)
+///   desc_count[0] += desc_count[3]+1 = 3   (from node 3, now a leaf)
+///   result: desc_count = [3, 0, 0, 1, 0]
+///
+/// Phase 3 – DFS (thin subtrees first):
+///   Sort children of 0 by desc_count: [2(0), 3(1)] → thin first
+///   Roots by descending desc_count: [0(3), 1(0)]
+///   Stack starts: [0, 1]
+///
+///   pop 0 → emit 0, push children rev [3, 2] → stack [1, 3, 2]
+///   pop 2 → emit 2, no children          → stack [1, 3]
+///   pop 3 → emit 3, push child [4]       → stack [1, 4]
+///   pop 4 → emit 4, no children          → stack [1]
+///   pop 1 → emit 1, no children          → stack []
+///
+///   order = [0, 2, 3, 4, 1]
+///
+/// Phase 4 – Identity check:
+///   [0, 2, 3, 4, 1] ≠ [0, 1, 2, 3, 4] → return Some(order)
+///
+/// Result: bases decoded before dependents, thin subtree {0,2}
+/// completes before deep subtree {0,3,4}, minimising live cache
+/// entries at any point.
+/// ```
 #[doc(hidden)]
 pub fn build_exec_order(
     need_offsets: &[u64],
