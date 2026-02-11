@@ -867,6 +867,109 @@ pub fn execute_pack_plan<S: PackObjectSink, B: ExternalBaseProvider>(
     )
 }
 
+/// Shared per-offset execution path for pack plan executors.
+///
+/// Decodes one `need_offsets[idx]`, then emits all candidates in `range`.
+/// Non-fatal decode failures are recorded as skip records in `report`.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn execute_offset_range_with_scratch<S: PackObjectSink, B: ExternalBaseProvider>(
+    plan: &PackPlan,
+    pack: &PackFile<'_>,
+    paths: &ByteArena,
+    limits: &PackDecodeLimits,
+    cache: &mut PackCache,
+    external: &mut B,
+    sink: &mut S,
+    spill_dir: &Path,
+    scratch: &mut PackExecScratch,
+    report: &mut PackExecReport,
+    hot_stats: &mut PackExecHotStats,
+    alloc_guard_enabled: bool,
+    idx: usize,
+    range: CandidateRange,
+) -> Result<(), PackExecError> {
+    let guard = if alloc_guard_enabled {
+        Some(AllocGuard::new())
+    } else {
+        None
+    };
+    let offset = plan.need_offsets[idx];
+
+    let (cache_result, lookup_nanos) = perf::time(|| cache_get(cache, offset));
+    record_timing(&mut report.stats.cache_lookup_nanos, lookup_nanos);
+    let (obj_kind, storage, cache_hit_bytes) = if let Some(hit) = cache_result {
+        perf::record_cache_hit();
+        (hit.kind, DecodedStorage::Cache, Some(hit.bytes))
+    } else {
+        perf::record_cache_miss();
+        let decoded = decode_offset(
+            pack,
+            offset,
+            idx,
+            &plan.need_offsets,
+            limits,
+            plan.max_delta_depth,
+            cache,
+            external,
+            &scratch.delta_deps_hot,
+            &scratch.external_base_oids,
+            &plan.delta_dep_index,
+            hot_stats,
+            report,
+            &mut scratch.inflate_buf,
+            &mut scratch.result_buf,
+            &mut scratch.base_buf,
+            &mut scratch.delta_stack,
+            spill_dir,
+        )?;
+
+        let Some(obj) = decoded else {
+            return Ok(());
+        };
+
+        (obj.kind, obj.storage, None)
+    };
+
+    // Reuse the first probe's bytes on hit to avoid a redundant cache re-probe.
+    let bytes: &[u8] = if let Some(bytes) = cache_hit_bytes {
+        bytes
+    } else {
+        match &storage {
+            DecodedStorage::Cache => cache_get(cache, offset)
+                .map(|hit| hit.bytes)
+                .unwrap_or(scratch.result_buf.as_slice()),
+            DecodedStorage::Scratch => scratch.result_buf.as_slice(),
+            DecodedStorage::Spill(spill) => spill.as_slice(),
+        }
+    };
+
+    if let Some((start, end)) = range.bounds() {
+        for cand_idx in start..end {
+            let candidate = &plan.candidates[plan.candidate_offsets[cand_idx].cand_idx as usize];
+            if obj_kind != ObjectKind::Blob {
+                report.skips.push(SkipRecord {
+                    offset,
+                    reason: SkipReason::NotBlob,
+                });
+                hot_stats.inc_skipped();
+                continue;
+            }
+            let path = paths.get(candidate.ctx.path_ref);
+            let (emit_result, emit_nanos) = perf::time(|| sink.emit(candidate, path, bytes));
+            emit_result?;
+            record_timing(&mut report.stats.sink_emit_nanos, emit_nanos);
+            hot_stats.inc_emitted();
+        }
+    }
+
+    if let Some(guard) = guard {
+        guard.assert_no_alloc();
+    }
+
+    Ok(())
+}
+
 /// Executes a pack plan using caller-provided scratch buffers.
 ///
 /// Identical to [`execute_pack_plan`] but allows the caller to amortize
@@ -894,100 +997,30 @@ pub fn execute_pack_plan_with_scratch<S: PackObjectSink, B: ExternalBaseProvider
     let alloc_guard_enabled = alloc_guard::enabled();
 
     scratch.prepare(plan, limits);
-    let inflate_buf = &mut scratch.inflate_buf;
-    let result_buf = &mut scratch.result_buf;
     let mut hot_stats = PackExecHotStats::default();
-
-    let mut handle_idx = |idx: usize, range: CandidateRange| -> Result<(), PackExecError> {
-        let guard = if alloc_guard_enabled {
-            Some(AllocGuard::new())
-        } else {
-            None
-        };
-        let offset = plan.need_offsets[idx];
-
-        let (cache_result, lookup_nanos) = perf::time(|| cache_get(cache, offset));
-        record_timing(&mut report.stats.cache_lookup_nanos, lookup_nanos);
-        let (obj_kind, storage, cache_hit_bytes) = if let Some(hit) = cache_result {
-            perf::record_cache_hit();
-            (hit.kind, DecodedStorage::Cache, Some(hit.bytes))
-        } else {
-            perf::record_cache_miss();
-            let decoded = decode_offset(
-                &pack,
-                offset,
-                idx,
-                &plan.need_offsets,
-                limits,
-                plan.max_delta_depth,
-                cache,
-                external,
-                &scratch.delta_deps_hot,
-                &scratch.external_base_oids,
-                &plan.delta_dep_index,
-                &mut hot_stats,
-                &mut report,
-                inflate_buf,
-                result_buf,
-                &mut scratch.base_buf,
-                &mut scratch.delta_stack,
-                spill_dir,
-            )?;
-
-            let Some(obj) = decoded else {
-                return Ok(());
-            };
-
-            (obj.kind, obj.storage, None)
-        };
-
-        // Reuse the first probe's bytes on hit to avoid a redundant cache re-probe.
-        let bytes = if let Some(bytes) = cache_hit_bytes {
-            bytes
-        } else {
-            match &storage {
-                DecodedStorage::Cache => cache_get(cache, offset)
-                    .map(|hit| hit.bytes)
-                    .unwrap_or(result_buf.as_slice()),
-                DecodedStorage::Scratch => result_buf.as_slice(),
-                DecodedStorage::Spill(spill) => spill.as_slice(),
-            }
-        };
-
-        if let Some((start, end)) = range.bounds() {
-            // Candidate range is precomputed (out-of-order) or merged (monotone).
-            for cand_idx in start..end {
-                let candidate =
-                    &plan.candidates[plan.candidate_offsets[cand_idx].cand_idx as usize];
-                if obj_kind != ObjectKind::Blob {
-                    report.skips.push(SkipRecord {
-                        offset,
-                        reason: SkipReason::NotBlob,
-                    });
-                    hot_stats.inc_skipped();
-                    continue;
-                }
-                let path = paths.get(candidate.ctx.path_ref);
-                let (emit_result, emit_nanos) = perf::time(|| sink.emit(candidate, path, bytes));
-                emit_result?;
-                record_timing(&mut report.stats.sink_emit_nanos, emit_nanos);
-                hot_stats.inc_emitted();
-            }
-        }
-
-        if let Some(guard) = guard {
-            guard.assert_no_alloc();
-        }
-
-        Ok(())
-    };
 
     if let Some(order) = plan.exec_order.as_ref() {
         // Out-of-order execution: precompute exact candidate ranges by need index.
         build_candidate_ranges(plan, &mut scratch.candidate_ranges);
         for &idx in order {
             let idx = idx as usize;
-            handle_idx(idx, scratch.candidate_ranges[idx])?;
+            let range = scratch.candidate_ranges[idx];
+            execute_offset_range_with_scratch(
+                plan,
+                &pack,
+                paths,
+                limits,
+                cache,
+                external,
+                sink,
+                spill_dir,
+                scratch,
+                &mut report,
+                &mut hot_stats,
+                alloc_guard_enabled,
+                idx,
+                range,
+            )?;
         }
     } else {
         // Monotone execution: merge candidate offsets with need offsets.
@@ -1006,7 +1039,22 @@ pub fn execute_pack_plan_with_scratch<S: PackObjectSink, B: ExternalBaseProvider
             } else {
                 CandidateRange::missing()
             };
-            handle_idx(idx, range)?;
+            execute_offset_range_with_scratch(
+                plan,
+                &pack,
+                paths,
+                limits,
+                cache,
+                external,
+                sink,
+                spill_dir,
+                scratch,
+                &mut report,
+                &mut hot_stats,
+                alloc_guard_enabled,
+                idx,
+                range,
+            )?;
         }
     }
 
@@ -1068,96 +1116,25 @@ pub fn execute_pack_plan_with_scratch_indices<S: PackObjectSink, B: ExternalBase
     let alloc_guard_enabled = alloc_guard::enabled();
 
     scratch.prepare(plan, limits);
-    let inflate_buf = &mut scratch.inflate_buf;
-    let result_buf = &mut scratch.result_buf;
     let mut hot_stats = PackExecHotStats::default();
 
-    let mut handle_idx = |idx: usize| -> Result<(), PackExecError> {
-        let guard = if alloc_guard_enabled {
-            Some(AllocGuard::new())
-        } else {
-            None
-        };
-        let offset = plan.need_offsets[idx];
-        let range = candidate_ranges[idx];
-
-        let (cache_result, lookup_nanos) = perf::time(|| cache_get(cache, offset));
-        record_timing(&mut report.stats.cache_lookup_nanos, lookup_nanos);
-        let (obj_kind, storage, cache_hit_bytes) = if let Some(hit) = cache_result {
-            perf::record_cache_hit();
-            (hit.kind, DecodedStorage::Cache, Some(hit.bytes))
-        } else {
-            perf::record_cache_miss();
-            let decoded = decode_offset(
-                &pack,
-                offset,
-                idx,
-                &plan.need_offsets,
-                limits,
-                plan.max_delta_depth,
-                cache,
-                external,
-                &scratch.delta_deps_hot,
-                &scratch.external_base_oids,
-                &plan.delta_dep_index,
-                &mut hot_stats,
-                &mut report,
-                inflate_buf,
-                result_buf,
-                &mut scratch.base_buf,
-                &mut scratch.delta_stack,
-                spill_dir,
-            )?;
-
-            let Some(obj) = decoded else {
-                return Ok(());
-            };
-
-            (obj.kind, obj.storage, None)
-        };
-
-        // Reuse the first probe's bytes on hit to avoid a redundant cache re-probe.
-        let bytes: &[u8] = if let Some(bytes) = cache_hit_bytes {
-            bytes
-        } else {
-            match &storage {
-                DecodedStorage::Cache => cache_get(cache, offset)
-                    .map(|hit| hit.bytes)
-                    .unwrap_or(result_buf.as_slice()),
-                DecodedStorage::Scratch => result_buf.as_slice(),
-                DecodedStorage::Spill(spill) => spill.as_slice(),
-            }
-        };
-
-        if let Some((start, end)) = range.bounds() {
-            for cand_idx in start..end {
-                let candidate =
-                    &plan.candidates[plan.candidate_offsets[cand_idx].cand_idx as usize];
-                if obj_kind != ObjectKind::Blob {
-                    report.skips.push(SkipRecord {
-                        offset,
-                        reason: SkipReason::NotBlob,
-                    });
-                    hot_stats.inc_skipped();
-                    continue;
-                }
-                let path = paths.get(candidate.ctx.path_ref);
-                let (emit_result, emit_nanos) = perf::time(|| sink.emit(candidate, path, bytes));
-                emit_result?;
-                record_timing(&mut report.stats.sink_emit_nanos, emit_nanos);
-                hot_stats.inc_emitted();
-            }
-        }
-
-        if let Some(guard) = guard {
-            guard.assert_no_alloc();
-        }
-
-        Ok(())
-    };
-
     for &idx in exec_indices {
-        handle_idx(idx)?;
+        execute_offset_range_with_scratch(
+            plan,
+            &pack,
+            paths,
+            limits,
+            cache,
+            external,
+            sink,
+            spill_dir,
+            scratch,
+            &mut report,
+            &mut hot_stats,
+            alloc_guard_enabled,
+            idx,
+            candidate_ranges[idx],
+        )?;
     }
 
     sink.finish()?;
@@ -1211,92 +1188,7 @@ pub fn execute_pack_plan_with_scratch_range<S: PackObjectSink, B: ExternalBasePr
     let alloc_guard_enabled = alloc_guard::enabled();
 
     scratch.prepare(plan, limits);
-    let inflate_buf = &mut scratch.inflate_buf;
-    let result_buf = &mut scratch.result_buf;
     let mut hot_stats = PackExecHotStats::default();
-
-    let mut handle_idx = |idx: usize, range: CandidateRange| -> Result<(), PackExecError> {
-        let guard = if alloc_guard_enabled {
-            Some(AllocGuard::new())
-        } else {
-            None
-        };
-        let offset = plan.need_offsets[idx];
-
-        let (cache_result, lookup_nanos) = perf::time(|| cache_get(cache, offset));
-        record_timing(&mut report.stats.cache_lookup_nanos, lookup_nanos);
-        let (obj_kind, storage, cache_hit_bytes) = if let Some(hit) = cache_result {
-            perf::record_cache_hit();
-            (hit.kind, DecodedStorage::Cache, Some(hit.bytes))
-        } else {
-            perf::record_cache_miss();
-            let decoded = decode_offset(
-                &pack,
-                offset,
-                idx,
-                &plan.need_offsets,
-                limits,
-                plan.max_delta_depth,
-                cache,
-                external,
-                &scratch.delta_deps_hot,
-                &scratch.external_base_oids,
-                &plan.delta_dep_index,
-                &mut hot_stats,
-                &mut report,
-                inflate_buf,
-                result_buf,
-                &mut scratch.base_buf,
-                &mut scratch.delta_stack,
-                spill_dir,
-            )?;
-
-            let Some(obj) = decoded else {
-                return Ok(());
-            };
-
-            (obj.kind, obj.storage, None)
-        };
-
-        // Reuse the first probe's bytes on hit to avoid a redundant cache re-probe.
-        let bytes: &[u8] = if let Some(bytes) = cache_hit_bytes {
-            bytes
-        } else {
-            match &storage {
-                DecodedStorage::Cache => cache_get(cache, offset)
-                    .map(|hit| hit.bytes)
-                    .unwrap_or(result_buf.as_slice()),
-                DecodedStorage::Scratch => result_buf.as_slice(),
-                DecodedStorage::Spill(spill) => spill.as_slice(),
-            }
-        };
-
-        if let Some((start, end)) = range.bounds() {
-            for cand_idx in start..end {
-                let candidate =
-                    &plan.candidates[plan.candidate_offsets[cand_idx].cand_idx as usize];
-                if obj_kind != ObjectKind::Blob {
-                    report.skips.push(SkipRecord {
-                        offset,
-                        reason: SkipReason::NotBlob,
-                    });
-                    hot_stats.inc_skipped();
-                    continue;
-                }
-                let path = paths.get(candidate.ctx.path_ref);
-                let (emit_result, emit_nanos) = perf::time(|| sink.emit(candidate, path, bytes));
-                emit_result?;
-                record_timing(&mut report.stats.sink_emit_nanos, emit_nanos);
-                hot_stats.inc_emitted();
-            }
-        }
-
-        if let Some(guard) = guard {
-            guard.assert_no_alloc();
-        }
-
-        Ok(())
-    };
 
     if start_idx < end_idx {
         let cand = &plan.candidate_offsets;
@@ -1316,7 +1208,22 @@ pub fn execute_pack_plan_with_scratch_range<S: PackObjectSink, B: ExternalBasePr
             } else {
                 CandidateRange::missing()
             };
-            handle_idx(idx, range)?;
+            execute_offset_range_with_scratch(
+                plan,
+                &pack,
+                paths,
+                limits,
+                cache,
+                external,
+                sink,
+                spill_dir,
+                scratch,
+                &mut report,
+                &mut hot_stats,
+                alloc_guard_enabled,
+                idx,
+                range,
+            )?;
         }
     }
 

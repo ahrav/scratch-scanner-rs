@@ -19,6 +19,8 @@
 use super::pack_inflate::ObjectKind;
 use std::sync::OnceLock;
 
+/// Environment variable controlling optional pack-cache eviction policy.
+const EVICTION_POLICY_ENV_VAR: &str = "SCANNER_RS_PACK_CACHE_EVICTION";
 /// Default slot size for small cached pack objects (64 KiB).
 const DEFAULT_SMALL_SLOT_SIZE: u32 = 64 * 1024;
 /// Default slot size for large cached pack objects (2 MiB).
@@ -39,8 +41,9 @@ const MIN_SLOT_SIZE: u32 = 1024;
 const WAYS: usize = 4;
 /// Max distance between a likely base hit and dependent insert.
 ///
-/// This keeps dependency protection conservative: we only protect recently hit
-/// entries when the dependent offset is nearby (typical for Git delta chains).
+/// Tuning constant for dependency-clock behavior. Keeping this conservative
+/// avoids over-protecting unrelated entries, while still helping common
+/// nearby Git delta chains.
 const DEPENDENCY_HINT_MAX_DISTANCE: u64 = 16 * 1024 * 1024;
 /// Number of dependency-protection passes before a slot is fully eligible.
 const DEPENDENCY_GUARD_MAX: u8 = 2;
@@ -61,14 +64,32 @@ impl EvictionPolicy {
     }
 }
 
+/// Returns the process-wide eviction policy selection.
+///
+/// The environment variable is read once and cached for the process lifetime
+/// to avoid repeated env lookups on `PackCache::new`.
 fn selected_eviction_policy() -> EvictionPolicy {
     static POLICY: OnceLock<EvictionPolicy> = OnceLock::new();
-    *POLICY.get_or_init(|| match std::env::var("SCANNER_RS_PACK_CACHE_EVICTION") {
-        Ok(raw) if raw.eq_ignore_ascii_case("dependency_clock") => EvictionPolicy::DependencyClock,
-        Ok(raw) if raw.eq_ignore_ascii_case("dep_clock") => EvictionPolicy::DependencyClock,
-        Ok(raw) if raw.eq_ignore_ascii_case("depclock") => EvictionPolicy::DependencyClock,
-        _ => EvictionPolicy::Clock,
+    *POLICY.get_or_init(|| {
+        let raw = std::env::var(EVICTION_POLICY_ENV_VAR).ok();
+        parse_eviction_policy(raw.as_deref())
     })
+}
+
+/// Parses a configured eviction-policy string.
+///
+/// Unknown values intentionally fall back to `clock` to preserve default
+/// behavior.
+#[inline]
+fn parse_eviction_policy(raw: Option<&str>) -> EvictionPolicy {
+    match raw {
+        Some(raw) if raw.eq_ignore_ascii_case("dependency_clock") => {
+            EvictionPolicy::DependencyClock
+        }
+        Some(raw) if raw.eq_ignore_ascii_case("dep_clock") => EvictionPolicy::DependencyClock,
+        Some(raw) if raw.eq_ignore_ascii_case("depclock") => EvictionPolicy::DependencyClock,
+        _ => EvictionPolicy::Clock,
+    }
 }
 
 /// Eviction instrumentation intended for benchmarks and profiling.
@@ -722,6 +743,91 @@ fn round_down_power_of_two_u32(mut value: u32) -> u32 {
 mod tests {
     use super::super::pack_inflate::ObjectKind;
     use super::*;
+    use std::process::Command;
+
+    const ENV_POLICY_WORKER_CASE: &str = "SCANNER_RS_PACK_CACHE_POLICY_WORKER_CASE";
+
+    fn run_env_policy_worker(case: &str, env_policy: Option<&str>) {
+        let mut cmd = Command::new(std::env::current_exe().expect("test binary path"));
+        cmd.arg("--test-threads=1")
+            .arg("pack_cache_env_policy_worker");
+        cmd.env(ENV_POLICY_WORKER_CASE, case);
+        match env_policy {
+            Some(value) => {
+                cmd.env(EVICTION_POLICY_ENV_VAR, value);
+            }
+            None => {
+                cmd.env_remove(EVICTION_POLICY_ENV_VAR);
+            }
+        }
+
+        let output = cmd.output().expect("spawn worker test");
+        assert!(
+            output.status.success(),
+            "worker case `{case}` failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
+    fn selected_eviction_policy_env_isolation_via_subprocess() {
+        if std::env::var_os(ENV_POLICY_WORKER_CASE).is_some() {
+            return;
+        }
+        run_env_policy_worker("unset", None);
+        run_env_policy_worker("dependency_clock", Some("dependency_clock"));
+        run_env_policy_worker("dep_clock", Some("dep_clock"));
+        run_env_policy_worker("depclock", Some("depclock"));
+        run_env_policy_worker("invalid", Some("clockwise"));
+    }
+
+    #[test]
+    fn pack_cache_env_policy_worker() {
+        let Some(case) = std::env::var(ENV_POLICY_WORKER_CASE).ok() else {
+            return;
+        };
+        let expected = match case.as_str() {
+            "unset" => EvictionPolicy::Clock,
+            "dependency_clock" => EvictionPolicy::DependencyClock,
+            "dep_clock" => EvictionPolicy::DependencyClock,
+            "depclock" => EvictionPolicy::DependencyClock,
+            "invalid" => EvictionPolicy::Clock,
+            other => panic!("unexpected worker case `{other}`"),
+        };
+
+        assert_eq!(selected_eviction_policy(), expected);
+
+        // `selected_eviction_policy()` uses `OnceLock`, so changing the env var
+        // after the first read should not change the selected policy.
+        std::env::set_var(
+            EVICTION_POLICY_ENV_VAR,
+            if expected == EvictionPolicy::Clock {
+                "dependency_clock"
+            } else {
+                "clock"
+            },
+        );
+        assert_eq!(selected_eviction_policy(), expected);
+    }
+
+    #[test]
+    fn parse_eviction_policy_aliases() {
+        assert_eq!(parse_eviction_policy(None), EvictionPolicy::Clock);
+        assert_eq!(parse_eviction_policy(Some("clock")), EvictionPolicy::Clock);
+        assert_eq!(
+            parse_eviction_policy(Some("dependency_clock")),
+            EvictionPolicy::DependencyClock
+        );
+        assert_eq!(
+            parse_eviction_policy(Some("dep_clock")),
+            EvictionPolicy::DependencyClock
+        );
+        assert_eq!(
+            parse_eviction_policy(Some("depclock")),
+            EvictionPolicy::DependencyClock
+        );
+    }
 
     #[test]
     fn cache_insert_and_get() {
@@ -803,5 +909,35 @@ mod tests {
             cache.get(100).is_none(),
             "CLOCK fallback should evict first-hand slot after a full sweep"
         );
+    }
+
+    #[test]
+    fn dependency_hint_distance_tuning_constant_boundary_marks_base() {
+        let mut cache =
+            PackCache::new_with_policy_for_test(4 * 1024, EvictionPolicy::DependencyClock);
+        let payload = [0x66u8; 32];
+        let base = 1_000_u64;
+        let child = base + DEPENDENCY_HINT_MAX_DISTANCE;
+
+        assert!(cache.insert(base, ObjectKind::Blob, &payload));
+        let _ = cache.get(base).expect("base must exist");
+        assert!(cache.insert(child, ObjectKind::Blob, &payload));
+
+        assert_eq!(cache.eviction_stats().dependency_marks, 1);
+    }
+
+    #[test]
+    fn dependency_hint_distance_tuning_constant_rejects_far_child() {
+        let mut cache =
+            PackCache::new_with_policy_for_test(4 * 1024, EvictionPolicy::DependencyClock);
+        let payload = [0x77u8; 32];
+        let base = 1_000_u64;
+        let child = base + DEPENDENCY_HINT_MAX_DISTANCE + 1;
+
+        assert!(cache.insert(base, ObjectKind::Blob, &payload));
+        let _ = cache.get(base).expect("base must exist");
+        assert!(cache.insert(child, ObjectKind::Blob, &payload));
+
+        assert_eq!(cache.eviction_stats().dependency_marks, 0);
     }
 }
