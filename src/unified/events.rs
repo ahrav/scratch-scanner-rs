@@ -481,6 +481,29 @@ mod tests {
     }
 
     #[test]
+    fn fs_finding_jsonl_omits_git_fields() {
+        let line = collect_jsonl(ScanEvent::Finding(FindingEvent {
+            source: SourceKind::Fs,
+            object_path: b"src/config.yaml",
+            start: 10,
+            end: 50,
+            rule_id: 2,
+            rule_name: "generic-api-key",
+            commit_id: None,
+            change_kind: None,
+        }));
+        assert!(line.contains("\"source\":\"fs\""));
+        assert!(
+            !line.contains("commit_id"),
+            "FS findings must not include commit_id: {line}"
+        );
+        assert!(
+            !line.contains("change_kind"),
+            "FS findings must not include change_kind: {line}"
+        );
+    }
+
+    #[test]
     fn jsonl_sink_writes_to_vec() {
         let buf = Vec::new();
         let sink = JsonlEventSink::new(buf);

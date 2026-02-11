@@ -12,6 +12,8 @@
 //! 4. Convert findings into `FindingKey` values (no raw secret bytes).
 //! 5. Sort + dedup per blob to guarantee deterministic ordering.
 //!
+//! Blobs that fit in a single chunk skip the ring buffer entirely (fast path).
+//!
 //! # Design
 //! - Chunk overlap uses `Engine::required_overlap()` and
 //!   `ScanScratch::drop_prefix_findings`.
@@ -165,7 +167,11 @@ pub struct EngineAdapter<'a> {
     scratch: ScanScratch,
     overlap: usize,
     results: Vec<ScannedBlob>,
+    /// Accumulated findings across all blobs; each `ScannedBlob.findings`
+    /// indexes a contiguous span here.
     findings_arena: Vec<FindingKey>,
+    /// Per-blob scratch: populated by `scan_blob_into_buf`, consumed by
+    /// `stream_findings` + `record_findings`, then cleared for the next blob.
     findings_buf: Vec<FindingKey>,
     chunker: RingChunker,
     // Monotone ID for this adapter instance; wraps on overflow.
@@ -284,7 +290,11 @@ impl<'a> EngineAdapter<'a> {
         self.next_file_id = self.next_file_id.wrapping_add(1);
 
         self.scan_blob_into_buf(file_id, path, bytes)?;
-        self.stream_findings(path);
+        self.stream_findings(
+            path,
+            candidate.ctx.commit_id,
+            candidate.ctx.change_kind.as_str(),
+        );
         let span = self.record_findings()?;
         self.results.push(ScannedBlob {
             oid: candidate.oid,
@@ -299,7 +309,7 @@ impl<'a> EngineAdapter<'a> {
     /// Called after `scan_blob_into_buf` and before `record_findings`.
     /// Findings are emitted as structured events without allocation;
     /// the event sink handles its own serialization buffers.
-    fn stream_findings(&self, path: &[u8]) {
+    fn stream_findings(&self, path: &[u8], commit_id: u32, change_kind: &str) {
         for f in &self.findings_buf {
             self.event_sink.emit(ScanEvent::Finding(FindingEvent {
                 source: SourceKind::Git,
@@ -308,8 +318,8 @@ impl<'a> EngineAdapter<'a> {
                 end: u64::from(f.end),
                 rule_id: f.rule_id,
                 rule_name: self.engine.rule_name(f.rule_id),
-                commit_id: None,
-                change_kind: None,
+                commit_id: Some(commit_id),
+                change_kind: Some(change_kind),
             }));
         }
     }
@@ -370,6 +380,11 @@ impl<'a> EngineAdapter<'a> {
         )
     }
 
+    /// Transfer `findings_buf` into the shared arena and return the span.
+    ///
+    /// Must be called after `scan_blob_into_buf` (which populates
+    /// `findings_buf`) and `stream_findings` (which reads it). The span
+    /// indexes into `findings_arena` for the just-scanned blob.
     fn record_findings(&mut self) -> Result<FindingSpan, EngineAdapterError> {
         let start = self.findings_arena.len();
         let len = self.findings_buf.len();
@@ -398,7 +413,11 @@ impl PackObjectSink for EngineAdapter<'_> {
         self.next_file_id = self.next_file_id.wrapping_add(1);
 
         self.scan_blob_into_buf(file_id, path, bytes)?;
-        self.stream_findings(path);
+        self.stream_findings(
+            path,
+            candidate.ctx.commit_id,
+            candidate.ctx.change_kind.as_str(),
+        );
         let span = self.record_findings()?;
         self.results.push(ScannedBlob {
             oid: candidate.oid,
@@ -591,6 +610,10 @@ fn scan_blob_chunked_with_chunker(
 /// to avoid cross-chunk duplication. Remaining findings are converted to
 /// `FindingKey` values and appended to `out`. If any finding offset
 /// exceeds `u32` bounds, `err` is set and the function returns early.
+///
+/// The `err` out-parameter (instead of a `Result` return) allows this
+/// function to be called inside the `RingChunker::feed` / `flush`
+/// closures, which use `FnMut(ChunkView)` with no `Result` return.
 fn scan_chunk(
     engine: &Engine,
     scratch: &mut ScanScratch,
@@ -921,5 +944,139 @@ mod tests {
         let mut data2 = vec![b'a'; 99];
         data2.push(0);
         assert!(is_likely_binary(&data2, 100));
+    }
+
+    // -- Attribution event tests ------------------------------------------------
+
+    use crate::unified::events::VecEventSink;
+    use crate::{
+        demo_tuning, AnchorPolicy, Gate, RuleSpec, TransformConfig, TransformId, TransformMode,
+        ValidatorKind,
+    };
+    use regex::bytes::Regex;
+
+    fn test_engine_with_tok_rule() -> Engine {
+        let rule = RuleSpec {
+            name: "tok",
+            anchors: &[b"TOK_"],
+            radius: 16,
+            validator: ValidatorKind::None,
+            two_phase: None,
+            must_contain: None,
+            keywords_any: None,
+            value_suppressors_any: None,
+            entropy: None,
+            local_context: None,
+            secret_group: Some(1),
+            re: Regex::new(r"TOK_([A-Z0-9]{8})").unwrap(),
+        };
+
+        let transforms = vec![TransformConfig {
+            id: TransformId::Base64,
+            mode: TransformMode::Always,
+            gate: Gate::AnchorsInDecoded,
+            min_len: 16,
+            max_spans_per_buffer: 4,
+            max_encoded_len: 1024,
+            max_decoded_bytes: 1024,
+            plus_to_space: false,
+            base64_allow_space_ws: false,
+        }];
+
+        Engine::new_with_anchor_policy(
+            vec![rule],
+            transforms,
+            demo_tuning(),
+            AnchorPolicy::ManualOnly,
+        )
+    }
+
+    fn make_candidate_with_ctx(commit_id: u32, change_kind: ChangeKind) -> LooseCandidate {
+        let ctx = CandidateContext {
+            commit_id,
+            parent_idx: 0,
+            change_kind,
+            ctx_flags: 0,
+            cand_flags: 0,
+            path_ref: ByteRef::new(0, 0),
+        };
+        LooseCandidate {
+            oid: OidBytes::from_slice(&[0u8; 20]),
+            ctx,
+        }
+    }
+
+    #[test]
+    fn git_finding_event_carries_add_attribution() {
+        let engine = test_engine_with_tok_rule();
+        let sink = Arc::new(VecEventSink::new());
+        let mut adapter = EngineAdapter::new_with_event_sink(
+            &engine,
+            EngineAdapterConfig::default(),
+            sink.clone(),
+        );
+
+        let candidate = make_candidate_with_ctx(42, ChangeKind::Add);
+        let blob = b"prefix TOK_ABCDEFGH suffix";
+        adapter
+            .emit_loose(&candidate, b"secret.txt", blob)
+            .expect("scan with Add attribution");
+
+        let output = String::from_utf8(sink.take()).expect("valid UTF-8");
+        assert!(
+            output.contains("\"commit_id\":42"),
+            "expected commit_id:42 in: {output}"
+        );
+        assert!(
+            output.contains("\"change_kind\":\"add\""),
+            "expected change_kind:add in: {output}"
+        );
+    }
+
+    #[test]
+    fn git_finding_event_carries_modify_attribution() {
+        let engine = test_engine_with_tok_rule();
+        let sink = Arc::new(VecEventSink::new());
+        let mut adapter = EngineAdapter::new_with_event_sink(
+            &engine,
+            EngineAdapterConfig::default(),
+            sink.clone(),
+        );
+
+        let candidate = make_candidate_with_ctx(99, ChangeKind::Modify);
+        let blob = b"prefix TOK_ABCDEFGH suffix";
+        adapter
+            .emit_loose(&candidate, b"secret.txt", blob)
+            .expect("scan with Modify attribution");
+
+        let output = String::from_utf8(sink.take()).expect("valid UTF-8");
+        assert!(
+            output.contains("\"commit_id\":99"),
+            "expected commit_id:99 in: {output}"
+        );
+        assert!(
+            output.contains("\"change_kind\":\"modify\""),
+            "expected change_kind:modify in: {output}"
+        );
+    }
+
+    #[test]
+    fn no_finding_blob_emits_no_events() {
+        let engine = test_engine_with_tok_rule();
+        let sink = Arc::new(VecEventSink::new());
+        let mut adapter = EngineAdapter::new_with_event_sink(
+            &engine,
+            EngineAdapterConfig::default(),
+            sink.clone(),
+        );
+
+        let candidate = make_candidate_with_ctx(1, ChangeKind::Add);
+        let blob = b"nothing suspicious here";
+        adapter
+            .emit_loose(&candidate, b"clean.txt", blob)
+            .expect("scan clean blob");
+
+        let output = sink.take();
+        assert!(output.is_empty(), "expected no events for clean blob");
     }
 }

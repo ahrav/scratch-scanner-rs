@@ -30,6 +30,16 @@ impl ChangeKind {
     pub const fn as_u8(self) -> u8 {
         self as u8
     }
+
+    /// Returns a human-readable string label for event emission.
+    #[inline]
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Modify => "modify",
+        }
+    }
 }
 
 /// Canonical context for a blob candidate.
@@ -49,9 +59,11 @@ pub struct CandidateContext {
     pub parent_idx: u8,
     /// Type of change: Add or Modify.
     pub change_kind: ChangeKind,
-    /// Context flags (file mode in low bits).
+    /// Context flags. Low 4 bits encode the Git file mode category
+    /// (blob, executable, symlink); upper bits are reserved.
     pub ctx_flags: u16,
-    /// Candidate flags (path classification, etc.).
+    /// Candidate flags. Bit 0 = path-looks-interesting heuristic;
+    /// remaining bits are reserved for future classification signals.
     pub cand_flags: u16,
     /// Path reference into the shared `ByteArena`.
     pub path_ref: ByteRef,
@@ -66,7 +78,10 @@ pub struct TreeCandidate {
     pub ctx: CandidateContext,
 }
 
-/// Resolved candidate with its path bytes.
+/// Dereferenced form of [`TreeCandidate`] with path bytes resolved from
+/// the [`CandidateBuffer`] arena.
+///
+/// Produced by [`CandidateBuffer::iter_resolved`]; borrows from the buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResolvedCandidate<'a> {
     /// Blob object ID.
@@ -266,5 +281,22 @@ impl<'a> Iterator for ResolvedIter<'a> {
             ctx_flags: cand.ctx.ctx_flags,
             cand_flags: cand.ctx.cand_flags,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn change_kind_as_str_values() {
+        assert_eq!(ChangeKind::Add.as_str(), "add");
+        assert_eq!(ChangeKind::Modify.as_str(), "modify");
+    }
+
+    #[test]
+    fn change_kind_as_u8_roundtrip() {
+        assert_eq!(ChangeKind::Add.as_u8(), 1);
+        assert_eq!(ChangeKind::Modify.as_u8(), 2);
     }
 }
