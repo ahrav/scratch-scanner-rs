@@ -72,8 +72,9 @@ pub enum ScanEvent<'a> {
 
 /// A single secret finding.
 ///
-/// All fields borrow from the scan scratch / adapter to avoid allocation
-/// on the hot path. The sink is responsible for copying what it needs.
+/// Borrowed fields (`object_path`, `rule_name`, `change_kind`) reference
+/// adapter scratch or engine-owned data to avoid allocation on the hot path.
+/// The sink is responsible for copying what it needs.
 pub struct FindingEvent<'a> {
     /// Whether this finding came from a Git blob or filesystem file.
     pub source: SourceKind,
@@ -95,6 +96,7 @@ pub struct FindingEvent<'a> {
 
 /// Progress checkpoint emitted periodically during scanning.
 pub struct ProgressEvent {
+    /// Whether this progress update is for a Git or filesystem scan.
     pub source: SourceKind,
     /// Current scan phase (e.g. `"scanning"`, `"finalizing"`).
     pub stage: &'static str,
@@ -108,6 +110,7 @@ pub struct ProgressEvent {
 
 /// Final summary emitted once when scanning completes.
 pub struct SummaryEvent {
+    /// Whether this summary is for a Git or filesystem scan.
     pub source: SourceKind,
     /// Terminal status (e.g. `"complete"`, `"error"`).
     pub status: &'static str,
@@ -119,7 +122,7 @@ pub struct SummaryEvent {
     pub findings_emitted: u64,
     /// Number of non-fatal errors encountered.
     pub errors: u64,
-    /// Throughput in MiB/s (bytes_scanned / elapsed).
+    /// Throughput in MiB/s: `(bytes_scanned / 1_048_576) / elapsed_secs`.
     pub throughput_mib_s: f64,
 }
 

@@ -170,8 +170,9 @@ pub struct EngineAdapter<'a> {
     /// Accumulated findings across all blobs; each `ScannedBlob.findings`
     /// indexes a contiguous span here.
     findings_arena: Vec<FindingKey>,
-    /// Per-blob scratch: populated by `scan_blob_into_buf`, consumed by
-    /// `stream_findings` + `record_findings`, then cleared for the next blob.
+    /// Per-blob scratch: populated by `scan_blob_into_buf`, read by
+    /// `stream_findings`, drained into the arena by `record_findings`,
+    /// then cleared at the start of the next `scan_blob_into_buf` call.
     findings_buf: Vec<FindingKey>,
     chunker: RingChunker,
     // Monotone ID for this adapter instance; wraps on overflow.
@@ -849,18 +850,7 @@ mod tests {
     }
 
     fn make_candidate() -> LooseCandidate {
-        let ctx = CandidateContext {
-            commit_id: 0,
-            parent_idx: 0,
-            change_kind: ChangeKind::Add,
-            ctx_flags: 0,
-            cand_flags: 0,
-            path_ref: ByteRef::new(0, 0),
-        };
-        LooseCandidate {
-            oid: OidBytes::from_slice(&[0u8; 20]),
-            ctx,
-        }
+        make_candidate_with_ctx(0, ChangeKind::Add)
     }
 
     /// Blob of exactly chunk_bytes takes the bypass path (single chunk).
@@ -1078,5 +1068,96 @@ mod tests {
 
         let output = sink.take();
         assert!(output.is_empty(), "expected no events for clean blob");
+    }
+
+    #[test]
+    fn pack_object_sink_carries_attribution() {
+        let engine = test_engine_with_tok_rule();
+        let sink = Arc::new(VecEventSink::new());
+        let mut adapter = EngineAdapter::new_with_event_sink(
+            &engine,
+            EngineAdapterConfig::default(),
+            sink.clone(),
+        );
+
+        let ctx = CandidateContext {
+            commit_id: 77,
+            parent_idx: 0,
+            change_kind: ChangeKind::Modify,
+            ctx_flags: 0,
+            cand_flags: 0,
+            path_ref: ByteRef::new(0, 0),
+        };
+        let candidate = PackCandidate {
+            oid: OidBytes::from_slice(&[0u8; 20]),
+            ctx,
+            pack_id: 0,
+            offset: 0,
+        };
+        let blob = b"prefix TOK_ABCDEFGH suffix";
+
+        PackObjectSink::emit(&mut adapter, &candidate, b"packed.txt", blob)
+            .expect("pack path scan");
+
+        let output = String::from_utf8(sink.take()).expect("valid UTF-8");
+        assert!(
+            output.contains("\"commit_id\":77"),
+            "pack path must carry commit_id: {output}"
+        );
+        assert!(
+            output.contains("\"change_kind\":\"modify\""),
+            "pack path must carry change_kind: {output}"
+        );
+    }
+
+    #[test]
+    fn git_finding_events_carry_source_git() {
+        let engine = test_engine_with_tok_rule();
+        let sink = Arc::new(VecEventSink::new());
+        let mut adapter = EngineAdapter::new_with_event_sink(
+            &engine,
+            EngineAdapterConfig::default(),
+            sink.clone(),
+        );
+
+        let candidate = make_candidate_with_ctx(1, ChangeKind::Add);
+        let blob = b"prefix TOK_ABCDEFGH suffix";
+        adapter
+            .emit_loose(&candidate, b"secret.txt", blob)
+            .expect("scan");
+
+        let output = String::from_utf8(sink.take()).expect("valid UTF-8");
+        assert!(
+            output.contains("\"source\":\"git\""),
+            "git findings must have source:git: {output}"
+        );
+    }
+
+    #[test]
+    fn commit_id_zero_roundtrips_as_some() {
+        let engine = test_engine_with_tok_rule();
+        let sink = Arc::new(VecEventSink::new());
+        let mut adapter = EngineAdapter::new_with_event_sink(
+            &engine,
+            EngineAdapterConfig::default(),
+            sink.clone(),
+        );
+
+        // commit_id 0 is a valid graph position (root commit).
+        let candidate = make_candidate_with_ctx(0, ChangeKind::Add);
+        let blob = b"prefix TOK_ABCDEFGH suffix";
+        adapter
+            .emit_loose(&candidate, b"root.txt", blob)
+            .expect("scan with commit_id 0");
+
+        let output = String::from_utf8(sink.take()).expect("valid UTF-8");
+        assert!(
+            output.contains("\"commit_id\":0"),
+            "commit_id:0 must appear in JSONL (not be treated as None): {output}"
+        );
+        assert!(
+            output.contains("\"change_kind\":\"add\""),
+            "change_kind must still appear with commit_id 0: {output}"
+        );
     }
 }

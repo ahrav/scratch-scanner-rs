@@ -59,10 +59,11 @@ pub struct CandidateContext {
     pub parent_idx: u8,
     /// Type of change: Add or Modify.
     pub change_kind: ChangeKind,
-    /// Context flags (reserved; currently always 0).
+    /// Git tree entry file mode, truncated to `u16`.
     ///
-    /// Intended for future file-mode or tree-context encoding.
-    /// Included in sort keys and spill records for forward compatibility.
+    /// Populated by the tree diff walker as `mode as u16` (e.g. regular
+    /// file `0o100644` → `0o644`). Used in sort keys and spill records
+    /// for deduplication and ordering.
     pub ctx_flags: u16,
     /// Candidate flags — [`PathClass`](super::path_policy::PathClass) bitflags
     /// produced by [`classify_path`](super::path_policy::classify_path).
@@ -83,9 +84,10 @@ pub struct TreeCandidate {
 }
 
 /// Dereferenced form of [`TreeCandidate`] with path bytes resolved from
-/// the [`CandidateBuffer`] arena.
+/// the owning arena.
 ///
-/// Produced by [`CandidateBuffer::iter_resolved`]; borrows from the buffer.
+/// Produced by both [`CandidateBuffer::iter_resolved`] and
+/// `CandidateChunk::iter_resolved`; borrows from the respective buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResolvedCandidate<'a> {
     /// Blob object ID.
@@ -302,5 +304,33 @@ mod tests {
     fn change_kind_as_u8_roundtrip() {
         assert_eq!(ChangeKind::Add.as_u8(), 1);
         assert_eq!(ChangeKind::Modify.as_u8(), 2);
+    }
+
+    #[test]
+    fn ctx_flags_carries_file_mode() {
+        // tree_diff.rs passes `mode as u16` (Git tree entry mode) as ctx_flags.
+        // Regular file = 0o100644, truncated to u16 = 0o644 = 420.
+        let mode_regular: u16 = 0o100644u32 as u16; // 420
+        assert_ne!(mode_regular, 0, "regular file mode must be non-zero");
+
+        let limits = TreeDiffLimits::RESTRICTIVE;
+        let mut buf = CandidateBuffer::new(&limits, 20);
+        buf.push(
+            OidBytes::from_slice(&[0xAA; 20]),
+            b"src/main.rs",
+            1,
+            0,
+            ChangeKind::Add,
+            mode_regular,
+            0,
+        )
+        .expect("push with non-zero ctx_flags");
+
+        let resolved: Vec<_> = buf.iter_resolved().collect();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            resolved[0].ctx_flags, mode_regular,
+            "ctx_flags must round-trip the file mode, not be reserved/zero"
+        );
     }
 }
