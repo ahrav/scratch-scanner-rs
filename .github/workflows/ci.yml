@@ -150,6 +150,7 @@ jobs:
         -Zmiri-strict-provenance
         -Zmiri-symbolic-alignment-check
         -Zmiri-preemption-rate=0.1
+        -Zmiri-disable-isolation
     steps:
       - uses: actions/checkout@v4
       - name: Install system deps
@@ -173,7 +174,8 @@ jobs:
             --skip scheduler::local_fs_uring \
             --skip scheduler::engine_impl \
             --skip scheduler::parallel_scan \
-            --skip rules::yaml
+            --skip rules::yaml \
+            --skip archive::
 
   kani:
     name: Kani Verification (Scheduled)

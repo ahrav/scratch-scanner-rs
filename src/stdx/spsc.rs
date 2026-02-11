@@ -156,15 +156,23 @@ impl<T, const N: usize> Drop for SpscRing<T, N> {
 /// Holds a reference to the shared ring and a cached copy of the consumer's
 /// `head` index. The cached head is only refreshed when the ring appears full,
 /// reducing cross-core cache-coherence traffic.
-pub struct SpscProducer<'a, T, const N: usize> {
-    ring: &'a SpscRing<T, N>,
+pub struct SpscProducer<T, const N: usize> {
+    /// Raw pointer to the shared ring. Using a raw pointer instead of a reference
+    /// avoids Stacked Borrows conflicts when producer and consumer access
+    /// disjoint slots concurrently from different threads.
+    ring: *const SpscRing<T, N>,
     /// Cached snapshot of consumer's `head`. Only refreshed when the ring
     /// appears full (tail - cached_head >= capacity). This avoids loading
     /// the consumer's cache line on every push.
     cached_head: u32,
 }
 
-impl<'a, T, const N: usize> SpscProducer<'a, T, N> {
+// SAFETY: SpscProducer accesses the ring via raw pointer and the SPSC protocol
+// ensures exclusive write access to producer-side indices. The ring is valid
+// for the lifetime of the producer (enforced by the owning Arc in OwnedSpscProducer).
+unsafe impl<T: Send, const N: usize> Send for SpscProducer<T, N> {}
+
+impl<T, const N: usize> SpscProducer<T, N> {
     /// Attempt to push `value` into the ring.
     ///
     /// Returns `Ok(())` if successful, `Err(value)` if the ring is full.
@@ -178,32 +186,32 @@ impl<'a, T, const N: usize> SpscProducer<'a, T, N> {
     /// 4. Release-store `tail + 1` to publish the slot to the consumer.
     #[inline(always)]
     pub fn try_push(&mut self, value: T) -> Result<(), T> {
-        let tail = self.ring.tail.load(Ordering::Relaxed);
-
-        // Check if ring appears full using cached head.
-        if tail.wrapping_sub(self.cached_head) >= SpscRing::<T, N>::CAPACITY {
-            // Refresh cached head from consumer's actual head.
-            self.cached_head = self.ring.head.load(Ordering::Acquire);
-            if tail.wrapping_sub(self.cached_head) >= SpscRing::<T, N>::CAPACITY {
-                return Err(value);
-            }
-        }
-
-        let slot = (tail & SpscRing::<T, N>::MASK) as usize;
-        // SAFETY: We have confirmed the slot is empty (not in [head, tail) range
-        // of the consumer). The consumer will not read this slot until we advance
-        // tail below.
+        // SAFETY: `self.ring` is valid for the producer's lifetime (guaranteed
+        // by the owning Arc in OwnedSpscProducer). All field accesses go through
+        // raw pointer deref to avoid creating a shared reference to the ring,
+        // which would conflict under Stacked Borrows with the consumer.
         unsafe {
-            let buf = &mut *self.ring.buf.get();
-            buf[slot] = MaybeUninit::new(value);
+            let ring = self.ring;
+            let tail = (*ring).tail.load(Ordering::Relaxed);
+
+            // Check if ring appears full using cached head.
+            if tail.wrapping_sub(self.cached_head) >= SpscRing::<T, N>::CAPACITY {
+                // Refresh cached head from consumer's actual head.
+                self.cached_head = (*ring).head.load(Ordering::Acquire);
+                if tail.wrapping_sub(self.cached_head) >= SpscRing::<T, N>::CAPACITY {
+                    return Err(value);
+                }
+            }
+
+            let slot = (tail & SpscRing::<T, N>::MASK) as usize;
+            let slot_ptr = (*ring).buf.get().cast::<MaybeUninit<T>>().add(slot);
+            slot_ptr.write(MaybeUninit::new(value));
+
+            // Release-store tail to make the written slot visible to consumer.
+            (*ring).tail.store(tail.wrapping_add(1), Ordering::Release);
+
+            Ok(())
         }
-
-        // Release-store tail to make the written slot visible to consumer.
-        self.ring
-            .tail
-            .store(tail.wrapping_add(1), Ordering::Release);
-
-        Ok(())
     }
 }
 
@@ -216,15 +224,21 @@ impl<'a, T, const N: usize> SpscProducer<'a, T, N> {
 /// Holds a reference to the shared ring and a cached copy of the producer's
 /// `tail` index. The cached tail is only refreshed when the ring appears empty,
 /// reducing cross-core cache-coherence traffic.
-pub struct SpscConsumer<'a, T, const N: usize> {
-    ring: &'a SpscRing<T, N>,
+pub struct SpscConsumer<T, const N: usize> {
+    /// Raw pointer to the shared ring. See `SpscProducer::ring` for rationale.
+    ring: *const SpscRing<T, N>,
     /// Cached snapshot of producer's `tail`. Only refreshed when the ring
     /// appears empty (head == cached_tail). This avoids loading the producer's
     /// cache line on every pop.
     cached_tail: u32,
 }
 
-impl<'a, T, const N: usize> SpscConsumer<'a, T, N> {
+// SAFETY: SpscConsumer accesses the ring via raw pointer and the SPSC protocol
+// ensures exclusive write access to consumer-side indices. The ring is valid
+// for the lifetime of the consumer (enforced by the owning Arc in OwnedSpscConsumer).
+unsafe impl<T: Send, const N: usize> Send for SpscConsumer<T, N> {}
+
+impl<T, const N: usize> SpscConsumer<T, N> {
     /// Attempt to pop a value from the ring.
     ///
     /// Returns `Some(value)` if successful, `None` if the ring is empty.
@@ -238,31 +252,30 @@ impl<'a, T, const N: usize> SpscConsumer<'a, T, N> {
     /// 4. Release-store `head + 1` to free the slot for the producer.
     #[inline(always)]
     pub fn try_pop(&mut self) -> Option<T> {
-        let head = self.ring.head.load(Ordering::Relaxed);
+        // SAFETY: `self.ring` is valid for the consumer's lifetime. All field
+        // accesses go through raw pointer deref (see SpscProducer for rationale).
+        unsafe {
+            let ring = self.ring;
+            let head = (*ring).head.load(Ordering::Relaxed);
 
-        // Check if ring appears empty using cached tail.
-        if head == self.cached_tail {
-            // Refresh cached tail from producer's actual tail.
-            self.cached_tail = self.ring.tail.load(Ordering::Acquire);
+            // Check if ring appears empty using cached tail.
             if head == self.cached_tail {
-                return None;
+                // Refresh cached tail from producer's actual tail.
+                self.cached_tail = (*ring).tail.load(Ordering::Acquire);
+                if head == self.cached_tail {
+                    return None;
+                }
             }
+
+            let slot = (head & SpscRing::<T, N>::MASK) as usize;
+            let slot_ptr = (*ring).buf.get().cast::<MaybeUninit<T>>().add(slot);
+            let value = (*slot_ptr).as_ptr().read();
+
+            // Release-store head to free the slot for the producer.
+            (*ring).head.store(head.wrapping_add(1), Ordering::Release);
+
+            Some(value)
         }
-
-        let slot = (head & SpscRing::<T, N>::MASK) as usize;
-        // SAFETY: We have confirmed the slot is initialized (in [head, tail) range).
-        // The producer will not overwrite this slot until we advance head below.
-        let value = unsafe {
-            let buf = &*self.ring.buf.get();
-            buf[slot].as_ptr().read()
-        };
-
-        // Release-store head to free the slot for the producer.
-        self.ring
-            .head
-            .store(head.wrapping_add(1), Ordering::Release);
-
-        Some(value)
     }
 
     /// Attempt to pop up to `out.len()` values from the ring in batch.
@@ -282,33 +295,34 @@ impl<'a, T, const N: usize> SpscConsumer<'a, T, N> {
             return 0;
         }
 
-        let head = self.ring.head.load(Ordering::Relaxed);
-
-        // Always refresh tail for batch — we want to drain as much as possible.
-        self.cached_tail = self.ring.tail.load(Ordering::Acquire);
-
-        let available = self.cached_tail.wrapping_sub(head) as usize;
-        if available == 0 {
-            return 0;
-        }
-
-        let count = available.min(out.len());
-
-        // SAFETY: All slots in [head, head+count) are initialized.
+        // SAFETY: `self.ring` is valid for the consumer's lifetime.
         unsafe {
-            let buf = &*self.ring.buf.get();
+            let ring = self.ring;
+            let head = (*ring).head.load(Ordering::Relaxed);
+
+            // Always refresh tail for batch — we want to drain as much as possible.
+            self.cached_tail = (*ring).tail.load(Ordering::Acquire);
+
+            let available = self.cached_tail.wrapping_sub(head) as usize;
+            if available == 0 {
+                return 0;
+            }
+
+            let count = available.min(out.len());
+
+            let base = (*ring).buf.get().cast::<MaybeUninit<T>>();
             for (i, slot_out) in out[..count].iter_mut().enumerate() {
                 let slot = (head.wrapping_add(i as u32) & SpscRing::<T, N>::MASK) as usize;
-                *slot_out = MaybeUninit::new(buf[slot].as_ptr().read());
+                *slot_out = MaybeUninit::new((*base.add(slot)).as_ptr().read());
             }
+
+            // Advance head past all consumed slots.
+            (*ring)
+                .head
+                .store(head.wrapping_add(count as u32), Ordering::Release);
+
+            count
         }
-
-        // Advance head past all consumed slots.
-        self.ring
-            .head
-            .store(head.wrapping_add(count as u32), Ordering::Release);
-
-        count
     }
 }
 
@@ -349,7 +363,7 @@ pub fn spsc_channel<T: Send + 'static, const N: usize>(
 
     let producer = OwnedSpscProducer {
         inner: SpscProducer {
-            ring: unsafe { &*ring },
+            ring,
             cached_head: 0,
         },
         _owner: inner.clone(),
@@ -357,7 +371,7 @@ pub fn spsc_channel<T: Send + 'static, const N: usize>(
 
     let consumer = OwnedSpscConsumer {
         inner: SpscConsumer {
-            ring: unsafe { &*ring },
+            ring,
             cached_tail: 0,
         },
         _owner: inner,
@@ -391,7 +405,7 @@ impl<T, const N: usize> Drop for OwnedSpscInner<T, N> {
 /// at a time (enforced by `&mut self` on `try_push`). It can be *moved* to
 /// another thread but must not be shared via `&OwnedSpscProducer`.
 pub struct OwnedSpscProducer<T: Send + 'static, const N: usize> {
-    inner: SpscProducer<'static, T, N>,
+    inner: SpscProducer<T, N>,
     _owner: std::sync::Arc<OwnedSpscInner<T, N>>,
 }
 
@@ -414,7 +428,7 @@ unsafe impl<T: Send, const N: usize> Send for OwnedSpscProducer<T, N> {}
 /// at a time (enforced by `&mut self` on `try_pop`). It can be *moved* to
 /// another thread but must not be shared via `&OwnedSpscConsumer`.
 pub struct OwnedSpscConsumer<T: Send + 'static, const N: usize> {
-    inner: SpscConsumer<'static, T, N>,
+    inner: SpscConsumer<T, N>,
     _owner: std::sync::Arc<OwnedSpscInner<T, N>>,
 }
 

@@ -27,9 +27,10 @@ use super::bytes::BytesView;
 use super::commit_graph_mem::CommitGraphMem;
 use super::commit_loader::{
     collect_loose_dirs, collect_pack_dirs, load_commits_from_tips_with_loose_dirs,
-    resolve_pack_paths_from_midx, CommitLoadError, CommitLoadLimits,
+    load_commits_with_identities, resolve_pack_paths_from_midx, CommitLoadError, CommitLoadLimits,
 };
 use super::errors::{CommitPlanError, RepoOpenError};
+use super::identity_intern::IdentityInterner;
 use super::midx::MidxView;
 use super::midx_build::{build_midx_bytes, MidxBuildError, MidxBuildLimits};
 use super::midx_error::MidxError;
@@ -240,6 +241,54 @@ pub fn acquire_commit_graph(
 
     CommitGraphMem::build(commits, repo.object_format)
         .map_err(ArtifactAcquireError::CommitGraphBuild)
+}
+
+/// Builds the commit-graph with identity enrichment.
+///
+/// Same tip resolution and BFS traversal as [`acquire_commit_graph`], but also
+/// extracts and interns author/committer identity strings from each commit's
+/// raw bytes. Returns both the identity-enriched `CommitGraphMem` and the
+/// `IdentityInterner` that holds the deduped string data.
+///
+/// The interner is allocated with a 4 MiB arena and an initial estimate of
+/// 16,384 unique identity strings.
+pub fn acquire_commit_graph_with_identities(
+    repo: &RepoJobState,
+    midx: &MidxView<'_>,
+    pack_paths: &[PathBuf],
+    limits: &ArtifactBuildLimits,
+) -> Result<(CommitGraphMem, IdentityInterner), ArtifactAcquireError> {
+    let tips: Vec<OidBytes> = repo.start_set.iter().map(|r| r.tip).collect();
+
+    if tips.is_empty() {
+        if repo_has_reachable_refs(&repo.paths)? {
+            return Err(ArtifactAcquireError::EmptyStartSetWithRefs);
+        }
+
+        let graph = CommitGraphMem::build(vec![], repo.object_format)
+            .map_err(ArtifactAcquireError::CommitGraphBuild)?;
+        let interner = IdentityInterner::with_capacity(0, 0);
+        return Ok((graph, interner));
+    }
+
+    let loose_dirs = collect_loose_dirs(&repo.paths);
+    let mut interner = IdentityInterner::with_capacity(4 * 1024 * 1024, 16_384);
+
+    let (commits, identity_ids) = load_commits_with_identities(
+        &tips,
+        midx,
+        pack_paths,
+        &loose_dirs,
+        repo.object_format,
+        &limits.commit_load,
+        &mut interner,
+        None, // No progress callback for now
+    )?;
+
+    let graph = CommitGraphMem::build_with_identities(commits, identity_ids, repo.object_format)
+        .map_err(ArtifactAcquireError::CommitGraphBuild)?;
+
+    Ok((graph, interner))
 }
 
 /// Resolves pack paths from MIDX data.

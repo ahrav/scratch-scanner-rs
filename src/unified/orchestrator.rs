@@ -427,6 +427,7 @@ fn run_git(
     if cfg.scan_binary {
         config.engine_adapter.scan_binary = true;
     }
+    config.enrich_identities = cfg.enrich_identities;
 
     let scan_start = Instant::now();
     match run_git_scan(

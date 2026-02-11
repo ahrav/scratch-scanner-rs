@@ -515,23 +515,21 @@ mod loom_tests {
 
             let final_state = state.load(Ordering::Acquire);
 
-            // Terminal state: count=0, !accepting
-            if in_flight(final_state) == 0 && !is_accepting(final_state) {
-                assert!(
-                    main_triggers_done || thread_triggers_done,
-                    "terminal state reached but no one triggered done",
-                );
-            }
+            // Terminal state MUST always be reached: count=0, !accepting.
+            assert_eq!(in_flight(final_state), 0, "count must reach 0",);
+            assert!(!is_accepting(final_state), "gate must be closed",);
 
-            // Both cannot trigger done: that would mean main saw count=0
-            // (completion already ran) AND completion saw !accepting + count going to 0.
-            // If completion ran first (count→0), main sees count=0 → triggers done.
-            // But completion saw accepting=1 (main hadn't closed yet) → thread does NOT trigger.
-            // If main closes first, then completion sees !accepting + count 1→0 → triggers.
-            // But main saw count=1 → does NOT trigger. QED: at most one.
+            // Exactly one observer must trigger done.
+            //
+            // Proof sketch (two orderings):
+            // - Completion first (count→0): main sees count=0 → triggers done.
+            //   But completion saw accepting=1 (main hadn't closed) → does NOT trigger.
+            // - Main closes first: completion sees !accepting + count 1→0 → triggers.
+            //   But main saw count=1 → does NOT trigger.
+            // QED: exactly one.
             assert!(
-                !(main_triggers_done && thread_triggers_done),
-                "both threads cannot trigger done simultaneously",
+                main_triggers_done ^ thread_triggers_done,
+                "exactly one thread must trigger done, got main={main_triggers_done} thread={thread_triggers_done}",
             );
         });
     }
@@ -568,10 +566,12 @@ mod loom_tests {
             let h_spawn = thread::spawn(move || try_spawn(&s_spawn));
             let h_complete = thread::spawn(move || complete(&s_complete));
 
-            close_gate(&state);
+            // Capture return value to determine if main triggers done.
+            let prev = close_gate(&state);
+            let close_triggers_done = in_flight(prev) == 0;
 
             let spawn_ok = h_spawn.join().unwrap();
-            let _complete_triggered = h_complete.join().unwrap();
+            let complete_triggered = h_complete.join().unwrap();
 
             let final_state = state.load(Ordering::Acquire);
             let final_count = in_flight(final_state);
@@ -581,9 +581,19 @@ mod loom_tests {
             if spawn_ok {
                 // +1 spawn, −1 completion = net 0 change from initial 1 → count 1
                 assert_eq!(final_count, 1, "spawn ok + completion → count 1");
+                // count is 1, not terminal — nobody should trigger done yet.
+                assert!(
+                    !close_triggers_done && !complete_triggered,
+                    "not terminal (count=1), nobody should trigger done",
+                );
             } else {
                 // −1 completion from initial 1 → count 0
                 assert_eq!(final_count, 0, "spawn failed + completion → count 0");
+                // Terminal state: exactly one must trigger done.
+                assert!(
+                    close_triggers_done ^ complete_triggered,
+                    "exactly one must trigger done in terminal state, got close={close_triggers_done} complete={complete_triggered}",
+                );
             }
         });
     }

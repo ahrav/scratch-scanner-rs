@@ -29,6 +29,18 @@ use super::SourceKind;
 const DEFAULT_BUF_CAPACITY: usize = 64 * 1024;
 
 /// Human-readable text sink with compact and verbose modes.
+///
+/// Thread-safe: the internal `BufWriter` is guarded by a [`Mutex`], so
+/// multiple worker threads may call [`EventSink::emit`] concurrently.
+/// The mutex is held for the full `write_all` (formatting + write), unlike
+/// [`JsonlEventSink`](super::events::JsonlEventSink) which formats outside
+/// the lock. This is acceptable because text output is a low-throughput
+/// debug path — the JSONL sink is the production-grade choice.
+///
+/// # Error contract
+///
+/// `BrokenPipe` is silently swallowed (downstream consumer hung up).
+/// Any other I/O error panics — a scan must not silently lose findings.
 pub struct TextEventSink<W: Write + Send> {
     writer: Mutex<BufWriter<W>>,
     verbose: bool,
@@ -75,6 +87,10 @@ impl<W: Write + Send + 'static> EventSink for TextEventSink<W> {
                     write_line(&self.writer, &line);
                 }
                 // Compact mode: suppress commit_meta events.
+            }
+            ScanEvent::IdentityDictionary(_) => {
+                // Identity dictionary entries are consumed by JSONL sinks;
+                // the human-readable text sink silently drops them.
             }
         }
     }
@@ -301,6 +317,7 @@ mod tests {
                 commit_id: 42,
                 commit_oid: oid,
                 timestamp: 1_700_000_000,
+                identity: None,
             }),
             true,
         );
@@ -318,6 +335,7 @@ mod tests {
                 commit_id: 0,
                 commit_oid: OidBytes::sha1([0u8; 20]),
                 timestamp: 0,
+                identity: None,
             }),
             false,
         );

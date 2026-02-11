@@ -906,15 +906,19 @@ mod tests_buffer_pool {
     fn data_persists_across_acquire_release() {
         let pool = BufferPool::new(1);
 
-        // Write a marker, release, re-acquire, verify marker is still there.
-        // (Pool does not zero on release — this is documented behavior.)
+        // Write a marker, release, re-acquire, and read from the same offset.
+        // This proves the allocation is valid across acquire/release cycles;
+        // the actual contents are unspecified after release.
         {
             let mut h = pool.acquire();
             h.as_mut_slice()[42] = 0xFF;
         }
         let h = pool.acquire();
-        // Buffer contents are unspecified, but the allocation is valid.
-        let _ = h.as_slice()[42]; // just ensure access doesn't fault.
+        // Verify the slice has the correct length.
+        assert_eq!(h.as_slice().len(), BUFFER_LEN_MAX);
+        // Access the slot to verify the pointer is valid under Miri.
+        // The value is unspecified (pool does not zero), but the access must not fault.
+        let _val = h.as_slice()[42];
     }
 
     // -----------------------------------------------------------------------

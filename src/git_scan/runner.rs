@@ -43,7 +43,8 @@ use crate::scheduler::AllocStatsDelta;
 use crate::Engine;
 
 use super::artifact_acquire::{
-    acquire_commit_graph, acquire_midx, ArtifactAcquireError, ArtifactBuildLimits,
+    acquire_commit_graph, acquire_commit_graph_with_identities, acquire_midx, ArtifactAcquireError,
+    ArtifactBuildLimits,
 };
 use super::byte_arena::ByteArena;
 use super::commit_graph::CommitGraphIndex;
@@ -52,6 +53,7 @@ use super::commit_walk_limits::CommitWalkLimits;
 use super::engine_adapter::{CommitMetaContext, EngineAdapterConfig, ScannedBlobs};
 use super::errors::{CommitPlanError, PersistError, RepoOpenError, SpillError, TreeDiffError};
 use super::finalize::{build_finalize_ops, FinalizeInput, FinalizeOutput};
+use super::identity_intern::IdentityInterner;
 use super::limits::RepoOpenLimits;
 use super::mapping_bridge::{MappingBridgeConfig, MappingStats};
 use super::midx::MidxView;
@@ -193,6 +195,10 @@ pub struct GitScanConfig {
     /// Applied when disk artifacts are missing and `run_git_scan` builds
     /// MIDX and commit-graph in memory.
     pub artifact_build: ArtifactBuildLimits,
+    /// When true, extract author/committer identity data and emit
+    /// identity_dictionary + enriched commit_meta events.
+    /// Default: false. Zero overhead when disabled.
+    pub enrich_identities: bool,
 }
 
 impl Default for GitScanConfig {
@@ -222,6 +228,7 @@ impl Default for GitScanConfig {
             pin_threads: crate::scheduler::affinity::default_pin_threads(),
             spill_dir: None,
             artifact_build: ArtifactBuildLimits::default(),
+            enrich_identities: false,
         }
     }
 }
@@ -252,6 +259,20 @@ fn default_blob_intro_workers() -> usize {
         .map(|count| count.get())
         .unwrap_or(1);
     parallelism.clamp(1, 8)
+}
+
+/// Emits all identity dictionary entries before any `CommitMeta` events.
+fn emit_identity_dictionary(
+    sink: &dyn crate::unified::events::EventSink,
+    interner: &IdentityInterner,
+) {
+    use crate::unified::events::{IdentityDictionaryEvent, ScanEvent};
+    for (id, value) in interner.iter() {
+        sink.emit(ScanEvent::IdentityDictionary(IdentityDictionaryEvent {
+            id,
+            value,
+        }));
+    }
 }
 
 /// Git scan execution mode.
@@ -1028,12 +1049,24 @@ pub fn run_git_scan(
         return Err(GitScanError::ConcurrentMaintenance);
     }
     let midx_view = MidxView::parse(midx_result.bytes.as_slice(), repo.object_format)?;
-    let cg = acquire_commit_graph(
-        &repo,
-        &midx_view,
-        &midx_result.pack_paths,
-        &config.artifact_build,
-    )?;
+    // Conditional identity enrichment.
+    let (cg, identity_interner) = if config.enrich_identities {
+        let (cg_enriched, interner) = acquire_commit_graph_with_identities(
+            &repo,
+            &midx_view,
+            &midx_result.pack_paths,
+            &config.artifact_build,
+        )?;
+        (cg_enriched, Some(std::sync::Arc::new(interner)))
+    } else {
+        let cg = acquire_commit_graph(
+            &repo,
+            &midx_view,
+            &midx_result.pack_paths,
+            &config.artifact_build,
+        )?;
+        (cg, None)
+    };
 
     // Commit plan (shared across both modes).
     let plan_start = Instant::now();
@@ -1041,15 +1074,21 @@ pub fn run_git_scan(
     let commit_plan_nanos = plan_start.elapsed().as_nanos() as u64;
 
     // Build commit-graph index and emit-once bitset (shared by both modes).
-    let cg_index = std::sync::Arc::new(CommitGraphIndex::build(&cg)?);
+    let cg_index = std::sync::Arc::new(CommitGraphIndex::build_from_mem(&cg)?);
     let commit_meta_seen =
         std::sync::Arc::new(crate::stdx::AtomicBitSet::empty(cg_index.len().max(1)));
+
+    // Emit identity dictionary before any CommitMeta events.
+    if let Some(ref interner) = identity_interner {
+        emit_identity_dictionary(&*event_sink, interner);
+    }
 
     // Dispatch to mode-specific pipeline.
     let mk_commit_meta = || CommitMetaContext {
         event_sink: std::sync::Arc::clone(&event_sink),
         commit_graph_index: std::sync::Arc::clone(&cg_index),
         commit_meta_seen: std::sync::Arc::clone(&commit_meta_seen),
+        identity_interner: identity_interner.clone(),
     };
     let mut output = match config.scan_mode {
         GitScanMode::OdbBlobFast => super::runner_odb_blob::run_odb_blob(

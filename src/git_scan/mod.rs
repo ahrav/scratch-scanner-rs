@@ -49,6 +49,8 @@ pub mod commit_walk_limits;
 pub mod engine_adapter;
 pub mod errors;
 pub mod finalize;
+pub mod identity_intern;
+pub mod identity_parse;
 pub mod limits;
 pub mod mapping_bridge;
 pub mod midx;
@@ -106,18 +108,33 @@ pub mod watermark_keys;
 pub mod work_items;
 
 pub use alloc_guard::{enabled as alloc_guard_enabled, set_enabled as set_alloc_guard_enabled};
+// ── Stage 1: Repo open & artifact acquisition ──────────────────────────
 pub use artifact_acquire::{
-    acquire_commit_graph, acquire_midx, ArtifactAcquireError, ArtifactBuildLimits,
-    MidxAcquireResult,
+    acquire_commit_graph, acquire_commit_graph_with_identities, acquire_midx, ArtifactAcquireError,
+    ArtifactBuildLimits, MidxAcquireResult,
 };
-pub use blob_introducer::{BlobIntroStats, BlobIntroducer, SeenSets};
-pub use byte_arena::{ByteArena, ByteRef};
-pub use bytes::BytesView;
+pub use limits::RepoOpenLimits;
+pub use midx::MidxView;
+pub use midx_build::{build_midx_bytes, MidxBuildError, MidxBuildLimits};
+pub use object_id::{ObjectFormat, OidBytes};
+pub use preflight::{
+    preflight, ArtifactPaths, ArtifactStatus, PreflightMaintenance, PreflightReport,
+};
+pub use preflight_error::PreflightError;
+pub use preflight_limits::PreflightLimits;
+pub use repo::{GitRepoPaths, RepoKind};
+pub use repo_open::{
+    repo_open, RefWatermarkStore, RepoArtifactFingerprint, RepoArtifactMmaps, RepoArtifactPaths,
+    RepoJobState, StartSetRef, StartSetResolver,
+};
+pub use start_set::{StartSetConfig, StartSetId};
+
+// ── Stage 2: Commit loading & graph construction ────────────────────────
 pub use commit_graph::CommitGraphIndex;
 pub use commit_graph_mem::CommitGraphMem;
 pub use commit_loader::{
-    collect_pack_dirs, load_commits_from_tips, resolve_pack_paths_from_midx, CommitLoadError,
-    CommitLoadLimits, LoadedCommit,
+    collect_pack_dirs, load_commits_from_tips, load_commits_with_identities,
+    resolve_pack_paths_from_midx, CommitLoadError, CommitLoadLimits, LoadedCommit,
 };
 pub use commit_parse::{parse_commit, CommitParseError, CommitParseLimits, ParsedCommit};
 pub use commit_walk::{
@@ -125,23 +142,31 @@ pub use commit_walk::{
     PlannedCommit,
 };
 pub use commit_walk_limits::CommitWalkLimits;
-pub use engine_adapter::{
-    scan_blob_chunked, EngineAdapter, EngineAdapterConfig, EngineAdapterError, FindingKey,
-    FindingSpan, ScannedBlob, ScannedBlobs, DEFAULT_CHUNK_BYTES,
-};
-pub use errors::PersistError;
-pub use errors::{CommitPlanError, MappingCandidateKind, RepoOpenError, SpillError, TreeDiffError};
-pub use finalize::{
-    build_finalize_ops, FinalizeInput, FinalizeOutcome, FinalizeOutput, FinalizeStats, RefEntry,
-    WriteOp,
-};
-pub use limits::RepoOpenLimits;
-pub use mapping_bridge::{MappingBridge, MappingBridgeConfig, MappingStats};
-pub use midx::MidxView;
-pub use midx_build::{build_midx_bytes, MidxBuildError, MidxBuildLimits};
-pub use object_id::{ObjectFormat, OidBytes};
+pub use identity_intern::{CommitIdentityIds, IdentityInterner, SENTINEL_ID};
+
+// ── Stage 3: Tree diff & candidate extraction ───────────────────────────
+pub use blob_introducer::{BlobIntroStats, BlobIntroducer, SeenSets};
 pub use object_store::{ObjectStore, TreeBytes, TreeSource};
+pub use path_policy::PathClass;
+pub use tree_candidate::{
+    CandidateBuffer, CandidateContext, CandidateSink, ChangeKind, ResolvedCandidate, TreeCandidate,
+};
+pub use tree_diff::{TreeDiffStats, TreeDiffWalker};
+pub use tree_diff_limits::TreeDiffLimits;
+pub use tree_entry::{EntryKind, TreeEntry, TreeEntryIter};
+pub use tree_order::{git_tree_file_name_cmp, git_tree_name_cmp};
+pub use unique_blob::{CollectedUniqueBlob, CollectingUniqueBlobSink, UniqueBlob, UniqueBlobSink};
+
+// ── Stage 4: Spill, dedup & mapping ─────────────────────────────────────
+pub use mapping_bridge::{MappingBridge, MappingBridgeConfig, MappingStats};
 pub use oid_index::OidIndex;
+pub use seen_store::{AlwaysSeenStore, InMemorySeenStore, NeverSeenStore, SeenBlobStore};
+pub use spill_chunk::CandidateChunk;
+pub use spill_limits::SpillLimits;
+pub use spill_merge::{merge_all, RunMerger};
+pub use spiller::{SpillStats, Spiller};
+
+// ── Stage 5: Pack planning & execution ──────────────────────────────────
 pub use pack_cache::{CachedObject, PackCache};
 pub use pack_candidates::{
     CappedPackCandidateSink, CollectingPackCandidateSink, LooseCandidate, PackCandidate,
@@ -162,20 +187,31 @@ pub use pack_plan_model::{
     BaseLoc, CandidateAtOffset, DeltaDep, DeltaKind, PackPlan, PackPlanStats,
 };
 pub use pack_reader::{PackReadError, PackReader, SlicePackReader};
-pub use path_policy::PathClass;
-pub use perf::{reset as reset_git_perf, snapshot as git_perf_snapshot, GitPerfStats};
+
+// ── Stage 6: Engine scanning ────────────────────────────────────────────
+pub use engine_adapter::{
+    scan_blob_chunked, EngineAdapter, EngineAdapterConfig, EngineAdapterError, FindingKey,
+    FindingSpan, ScannedBlob, ScannedBlobs, DEFAULT_CHUNK_BYTES,
+};
+
+// ── Stage 7: Finalize & persist ─────────────────────────────────────────
+pub use finalize::{
+    build_finalize_ops, FinalizeInput, FinalizeOutcome, FinalizeOutput, FinalizeStats, RefEntry,
+    WriteOp,
+};
 pub use persist::{persist_finalize_output, InMemoryPersistenceStore, PersistenceStore};
+pub use snapshot_plan::snapshot_plan;
+pub use watermark_keys::{
+    decode_ref_watermark_value, encode_ref_watermark_value, KeyArena, KeyRef, NS_REF_WATERMARK,
+};
+
+// ── Cross-cutting: errors, config, runner, I/O ──────────────────────────
+pub use byte_arena::{ByteArena, ByteRef};
+pub use bytes::BytesView;
+pub use errors::PersistError;
+pub use errors::{CommitPlanError, MappingCandidateKind, RepoOpenError, SpillError, TreeDiffError};
+pub use perf::{reset as reset_git_perf, snapshot as git_perf_snapshot, GitPerfStats};
 pub use policy_hash::{policy_hash, MergeDiffMode, PolicyHash};
-pub use preflight::{
-    preflight, ArtifactPaths, ArtifactStatus, PreflightMaintenance, PreflightReport,
-};
-pub use preflight_error::PreflightError;
-pub use preflight_limits::PreflightLimits;
-pub use repo::{GitRepoPaths, RepoKind};
-pub use repo_open::{
-    repo_open, RefWatermarkStore, RepoArtifactFingerprint, RepoArtifactMmaps, RepoArtifactPaths,
-    RepoJobState, StartSetRef, StartSetResolver,
-};
 pub use run_format::{RunContext, RunHeader, RunRecord};
 pub use run_reader::RunReader;
 pub use run_writer::RunWriter;
@@ -183,23 +219,5 @@ pub use runner::{
     run_git_scan, CandidateSkipReason, GitScanAllocStats, GitScanConfig, GitScanError,
     GitScanMetricsSnapshot, GitScanMode, GitScanReport, GitScanResult, GitScanStageNanos,
     PackMmapLimits, SkippedCandidate,
-};
-pub use seen_store::{AlwaysSeenStore, InMemorySeenStore, NeverSeenStore, SeenBlobStore};
-pub use snapshot_plan::snapshot_plan;
-pub use spill_chunk::CandidateChunk;
-pub use spill_limits::SpillLimits;
-pub use spill_merge::{merge_all, RunMerger};
-pub use spiller::{SpillStats, Spiller};
-pub use start_set::{StartSetConfig, StartSetId};
-pub use tree_candidate::{
-    CandidateBuffer, CandidateContext, CandidateSink, ChangeKind, ResolvedCandidate, TreeCandidate,
-};
-pub use tree_diff::{TreeDiffStats, TreeDiffWalker};
-pub use tree_diff_limits::TreeDiffLimits;
-pub use tree_entry::{EntryKind, TreeEntry, TreeEntryIter};
-pub use tree_order::{git_tree_file_name_cmp, git_tree_name_cmp};
-pub use unique_blob::{CollectedUniqueBlob, CollectingUniqueBlobSink, UniqueBlob, UniqueBlobSink};
-pub use watermark_keys::{
-    decode_ref_watermark_value, encode_ref_watermark_value, KeyArena, KeyRef, NS_REF_WATERMARK,
 };
 pub use work_items::WorkItems;

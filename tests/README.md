@@ -80,6 +80,25 @@ Regression test corpus organized by simulation type:
 - `corpus/scheduler/` - Scheduler simulation artifacts (`.case.json`)
 - `corpus/git_scan/` - Git simulation artifacts (`.case.json`)
 
+### Miri (runtime safety)
+
+Miri interprets Rust MIR to detect undefined behavior at runtime: pointer provenance
+violations, misaligned access, use-after-free, and data races.
+
+```bash
+# Run Miri on library tests (requires nightly)
+cargo +nightly miri test --lib
+
+# Skip FFI-dependent modules (engine, git_scan, scheduler, rules)
+cargo +nightly miri test --lib -- \
+  --skip engine --skip git_scan --skip scheduler --skip rules
+```
+
+Miri-specific test variants live alongside regular tests behind `#[cfg(miri)]` or
+`#[cfg_attr(miri, ignore)]` (for tests too slow under interpretation). SIMD code
+paths have scalar fallbacks gated on `cfg(miri)`. CI runs Miri on a nightly
+schedule with `-Zmiri-strict-provenance` and `-Zmiri-symbolic-alignment-check`.
+
 ### `diagnostic/`
 Analysis and audit tools that are `#[ignore]` by default because they have special requirements (e.g., custom allocators) or produce verbose output. Run manually when investigating specific issues.
 
