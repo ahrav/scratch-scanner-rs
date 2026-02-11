@@ -52,11 +52,11 @@ proptest! {
         let (need_offsets, deps) = random_acyclic_dag(n, &edges_raw);
         let result = build_exec_order(&need_offsets, &deps, 0).unwrap();
 
-        if let Some(ref order) = result.order {
+        if let Some(order) = result.order() {
             {
                 // Completeness: output is a permutation of 0..n.
                 assert_eq!(order.len(), n);
-                let mut sorted = order.clone();
+                let mut sorted = order.to_vec();
                 sorted.sort_unstable();
                 let expected: Vec<u32> = (0..n as u32).collect();
                 prop_assert_eq!(sorted, expected, "order must be a permutation");
@@ -124,7 +124,7 @@ proptest! {
         match result {
             Ok(res) => {
                 // Valid — the back-edge didn't form a cycle.
-                if let Some(ref order) = res.order {
+                if let Some(order) = res.order() {
                     assert_eq!(order.len(), n);
                 }
             }

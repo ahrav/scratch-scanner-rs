@@ -689,19 +689,43 @@ fn build_delta_dep_index(need_offsets: &[u64], delta_deps: &[DeltaDep]) -> Vec<u
 #[doc(hidden)]
 pub struct ExecOrderResult {
     /// DFS execution order, or `None` when natural order suffices.
-    pub order: Option<Vec<u32>>,
+    pub(crate) order: Option<Vec<u32>>,
     /// Number of indegree-0 nodes with dependents (delta tree roots).
-    pub tree_roots: u32,
+    pub(crate) tree_roots: u32,
     /// Maximum depth of the dependency DAG.
-    pub max_depth: u32,
+    pub(crate) max_depth: u32,
+}
+
+impl ExecOrderResult {
+    /// Returns the DFS execution order, or `None` when natural order suffices.
+    #[inline]
+    #[must_use]
+    pub fn order(&self) -> Option<&[u32]> {
+        self.order.as_deref()
+    }
+
+    /// Returns the number of indegree-0 nodes with dependents (delta tree roots).
+    #[inline]
+    #[must_use]
+    pub fn tree_roots(&self) -> u32 {
+        self.tree_roots
+    }
+
+    /// Returns the maximum depth of the dependency DAG.
+    #[inline]
+    #[must_use]
+    pub fn max_depth(&self) -> u32 {
+        self.max_depth
+    }
 }
 
 /// Build a cache-aware DFS execution order for pack delta chains.
 ///
 /// Produces subtree-contiguous ordering: each base is immediately followed by
 /// all of its dependents before moving to the next base. This minimizes the
-/// number of bases that must survive in cache simultaneously (working set =
-/// depth, not breadth).
+/// number of bases that must survive in cache simultaneously (working set is
+/// bounded by tree depth for tree-structured chains; may be slightly higher
+/// for DAGs with shared dependents).
 ///
 /// Returns `None` when there are no pack-local delta dependencies, or when
 /// the DFS order matches the natural `[0, 1, ..., n-1]` sequence (preserving
@@ -709,15 +733,16 @@ pub struct ExecOrderResult {
 ///
 /// # Algorithm
 ///
-/// 1. **Early fast path**: If no pack-local deps exist, return `None` before
-///    graph allocation.
-/// 2. **CSR adjacency**: Build compact forward/reverse CSR edge lists from
+/// Returns `None` immediately if no pack-local deps exist (fast path).
+/// Otherwise:
+///
+/// 1. **CSR adjacency**: Build compact forward/reverse CSR edge lists from
 ///    sorted offsets.
-/// 3. **Descendant counts**: BFS from leaves upward to compute subtree sizes.
-/// 4. **DFS with LIFO stack**: Thin subtrees first (ascending `desc_count`),
+/// 2. **Descendant counts**: BFS from leaves upward to compute subtree sizes.
+/// 3. **DFS with LIFO stack**: Thin subtrees first (ascending `desc_count`),
 ///    pushed in reverse so thinnest lands on top. DAG nodes wait until all
 ///    parents are emitted (`dag_remaining` counter).
-/// 5. **Identity check**: If the result is `[0..n]`, return `None`.
+/// 4. **Identity check**: If the result is `[0..n]`, return `None`.
 ///
 /// # Worked example
 ///
@@ -752,18 +777,18 @@ pub struct ExecOrderResult {
 /// Phase 3 – DFS (thin subtrees first):
 ///   Sort children of 0 by desc_count: [2(0), 3(1)] → thin first
 ///   Roots by descending desc_count: [0(3), 1(0)]
-///   Stack starts: [0, 1]
+///   Push roots in order → stack [0, 1] (LIFO: 1 on top)
 ///
-///   pop 0 → emit 0, push children rev [3, 2] → stack [1, 3, 2]
-///   pop 2 → emit 2, no children          → stack [1, 3]
-///   pop 3 → emit 3, push child [4]       → stack [1, 4]
-///   pop 4 → emit 4, no children          → stack [1]
-///   pop 1 → emit 1, no children          → stack []
+///   pop 1 → emit 1, no children          → stack [0]
+///   pop 0 → emit 0, push children rev [3, 2] → stack [3, 2]
+///   pop 2 → emit 2, no children          → stack [3]
+///   pop 3 → emit 3, push child [4]       → stack [4]
+///   pop 4 → emit 4, no children          → stack []
 ///
-///   order = [0, 2, 3, 4, 1]
+///   order = [1, 0, 2, 3, 4]
 ///
 /// Phase 4 – Identity check:
-///   [0, 2, 3, 4, 1] ≠ [0, 1, 2, 3, 4] → return Some(order)
+///   [1, 0, 2, 3, 4] ≠ [0, 1, 2, 3, 4] → return Some(order)
 ///
 /// Result: bases decoded before dependents, thin subtree {0,2}
 /// completes before deep subtree {0,3,4}, minimising live cache
@@ -868,7 +893,11 @@ pub fn build_exec_order(
             let parent = parent_u32 as usize;
             // Propagate: parent gains this node + all its descendants.
             desc_count[parent] = desc_count[parent].saturating_add(desc_count[idx] + 1);
-            remaining_out[parent] -= 1;
+            debug_assert!(
+                remaining_out[parent] > 0,
+                "remaining_out underflow at parent {parent}"
+            );
+            remaining_out[parent] = remaining_out[parent].saturating_sub(1);
             if remaining_out[parent] == 0 {
                 leaf_queue.push_back(parent);
             }
@@ -913,7 +942,11 @@ pub fn build_exec_order(
         let bounds = csr_row_bounds(&forward_starts, idx);
         for i in (bounds.start..bounds.end).rev() {
             let child = forward_edges[i] as usize;
-            dag_remaining[child] -= 1;
+            debug_assert!(
+                dag_remaining[child] > 0,
+                "dag_remaining underflow at child {child}"
+            );
+            dag_remaining[child] = dag_remaining[child].saturating_sub(1);
             if dag_remaining[child] == 0 {
                 stack.push(child as u32);
             }
@@ -1297,6 +1330,49 @@ mod tests {
         assert!(
             matches!(result, Err(PackPlanError::DeltaCycleDetected { .. })),
             "cycle must be detected"
+        );
+    }
+
+    #[test]
+    fn dfs_worked_example_matches_doc() {
+        // Exact graph from the module-level worked example.
+        let need_offsets = vec![100, 200, 300, 400, 500];
+        let deps = vec![
+            ofs_dep(300, 100), // idx 2 depends on idx 0
+            ofs_dep(400, 100), // idx 3 depends on idx 0
+            ofs_dep(500, 400), // idx 4 depends on idx 3
+        ];
+        let result = build_exec_order(&need_offsets, &deps, 0).unwrap();
+        let order = result.order.expect("non-identity DFS order");
+
+        // Roots sorted by descending desc_count: [0(3), 1(0)]
+        // Push order: 0 first, then 1. Stack = [0, 1], LIFO.
+        // Pop 1 -> emit 1 (no children)
+        // Pop 0 -> emit 0, children [2, 3] sorted asc desc_count: [2(0), 3(1)]
+        //   push reversed: [3, 2]. Stack [3, 2].
+        // Pop 2 -> emit 2 (no children)
+        // Pop 3 -> emit 3, push child [4]. Stack [4].
+        // Pop 4 -> emit 4.
+        // Order: [1, 0, 2, 3, 4]
+        assert_eq!(order, vec![1, 0, 2, 3, 4]);
+        assert_topo_valid(&order, &[(0, 2), (0, 3), (3, 4)]);
+        assert_contiguous(&order, &[0, 2, 3, 4]);
+    }
+
+    #[test]
+    fn dfs_duplicate_edges_no_underflow() {
+        // Same dependency expressed twice (OFS + REF both point to same base).
+        let need_offsets = vec![100, 200, 300];
+        let deps = vec![
+            ofs_dep(200, 100),
+            ref_dep(200, 100), // duplicate edge: same base, different kind
+        ];
+        // Should succeed without panic; the duplicate edge bumps indegree to 2
+        // but both decrements are handled safely.
+        let result = build_exec_order(&need_offsets, &deps, 0);
+        assert!(
+            result.is_ok(),
+            "duplicate edges must not cause panic or error"
         );
     }
 }

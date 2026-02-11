@@ -82,7 +82,7 @@ pub struct ExternalBase {
 pub trait ExternalBaseProvider {
     /// Returns the base object for a given OID, or `None` if missing.
     ///
-    /// Any error is recorded as `SkipReason::ExternalBaseError` for the
+    /// Any error is recorded as `SkipReason::ExternalBaseError { detail }` for the
     /// affected offset; execution continues.
     fn load_base(&mut self, oid: &OidBytes) -> Result<Option<ExternalBase>, PackExecError>;
 }
@@ -174,7 +174,7 @@ pub enum SkipReason {
     /// External base provider returned `None` for a REF delta.
     ExternalBaseMissing { oid: OidBytes },
     /// External base provider returned an error.
-    ExternalBaseError,
+    ExternalBaseError { detail: String },
     /// Entry decoded successfully but is not a blob.
     NotBlob,
 }
@@ -576,6 +576,12 @@ impl Default for CandidateRange {
 /// (base not in cache). The stack is unwound in reverse to apply deltas
 /// from the root base outward.
 ///
+/// `delta_deps_hot` is a compact view of delta dependencies rewritten for
+/// the hot decode path. External base OIDs are interned separately.
+///
+/// `external_base_oids` stores interned OIDs for REF deltas whose bases
+/// are outside the current pack. Indexed by `DeltaDepHot::external_oid_idx`.
+///
 /// `candidate_ranges` is populated once per plan for out-of-order
 /// execution; it maps each `need_offsets` index to its contiguous range
 /// in `candidate_offsets` via packed [`CandidateRange`] values.
@@ -738,6 +744,11 @@ impl BaseBytes<'_> {
 /// pack-local case stays dense.
 #[derive(Clone, Copy, Debug)]
 struct DeltaDepHot {
+    /// Pack offset of the base entry for OFS deltas.
+    ///
+    /// Only valid when `!self.is_external()`. Sentinel `0` is safe because
+    /// the pack header occupies bytes `0..12`, so no valid base starts at
+    /// offset 0.
     base_offset: u64,
     external_oid_idx: u32,
     data_start: u64,
@@ -1539,8 +1550,15 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                     );
                     return Ok(None);
                 }
-                Err(_) => {
-                    record_skip(report, hot_stats, offset, SkipReason::ExternalBaseError);
+                Err(err) => {
+                    record_skip(
+                        report,
+                        hot_stats,
+                        offset,
+                        SkipReason::ExternalBaseError {
+                            detail: err.to_string(),
+                        },
+                    );
                     return Ok(None);
                 }
             }
@@ -1905,8 +1923,15 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                     );
                     Ok(None)
                 }
-                Err(_) => {
-                    record_skip(report, hot_stats, offset, SkipReason::ExternalBaseError);
+                Err(err) => {
+                    record_skip(
+                        report,
+                        hot_stats,
+                        offset,
+                        SkipReason::ExternalBaseError {
+                            detail: err.to_string(),
+                        },
+                    );
                     Ok(None)
                 }
             }
@@ -2061,21 +2086,19 @@ fn load_external_root_base<B: ExternalBaseProvider>(
                 hot_stats.inc_decoded();
                 Ok((base.kind, None))
             } else {
-                let mut spill = BlobSpill::new(spill_dir, base_len).map_err(|_| {
-                    SkipReason::Decode(PackDecodeError::Inflate(
-                        super::pack_inflate::InflateError::Backend,
-                    ))
+                let mut spill = BlobSpill::new(spill_dir, base_len).map_err(|e| {
+                    SkipReason::ExternalBaseError {
+                        detail: format!("spill create: {e}"),
+                    }
                 })?;
                 let mut writer = spill.writer();
-                writer.write(&base.bytes).map_err(|_| {
-                    SkipReason::Decode(PackDecodeError::Inflate(
-                        super::pack_inflate::InflateError::Backend,
-                    ))
-                })?;
-                writer.finish().map_err(|_| {
-                    SkipReason::Decode(PackDecodeError::Inflate(
-                        super::pack_inflate::InflateError::Backend,
-                    ))
+                writer
+                    .write(&base.bytes)
+                    .map_err(|e| SkipReason::ExternalBaseError {
+                        detail: format!("spill write: {e}"),
+                    })?;
+                writer.finish().map_err(|e| SkipReason::ExternalBaseError {
+                    detail: format!("spill finish: {e}"),
                 })?;
                 hot_stats.inc_decoded();
                 stats.record_cache_reject(base_len);
@@ -2083,7 +2106,9 @@ fn load_external_root_base<B: ExternalBaseProvider>(
             }
         }
         Ok(None) => Err(SkipReason::ExternalBaseMissing { oid }),
-        Err(_) => Err(SkipReason::ExternalBaseError),
+        Err(err) => Err(SkipReason::ExternalBaseError {
+            detail: err.to_string(),
+        }),
     }
 }
 

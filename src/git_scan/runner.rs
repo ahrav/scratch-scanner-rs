@@ -341,7 +341,7 @@ impl CandidateSkipReason {
             SkipReason::Delta(_) => Self::PackDelta,
             SkipReason::BaseMissing { .. } => Self::PackBaseMissing,
             SkipReason::ExternalBaseMissing { .. } => Self::PackExternalBaseMissing,
-            SkipReason::ExternalBaseError => Self::PackExternalBaseError,
+            SkipReason::ExternalBaseError { .. } => Self::PackExternalBaseError,
             SkipReason::NotBlob => Self::PackNotBlob,
         }
     }

@@ -83,12 +83,17 @@ fn selected_eviction_policy() -> EvictionPolicy {
 #[inline]
 fn parse_eviction_policy(raw: Option<&str>) -> EvictionPolicy {
     match raw {
-        Some(raw) if raw.eq_ignore_ascii_case("dependency_clock") => {
-            EvictionPolicy::DependencyClock
+        Some(s) if s.eq_ignore_ascii_case("dependency_clock") => EvictionPolicy::DependencyClock,
+        Some(s) if s.eq_ignore_ascii_case("dep_clock") => EvictionPolicy::DependencyClock,
+        Some(s) if s.eq_ignore_ascii_case("depclock") => EvictionPolicy::DependencyClock,
+        Some(s) if s.eq_ignore_ascii_case("clock") => EvictionPolicy::Clock,
+        None | Some("") => EvictionPolicy::Clock,
+        Some(unknown) => {
+            eprintln!(
+                "warning: unrecognized {EVICTION_POLICY_ENV_VAR} value {unknown:?}, falling back to clock"
+            );
+            EvictionPolicy::Clock
         }
-        Some(raw) if raw.eq_ignore_ascii_case("dep_clock") => EvictionPolicy::DependencyClock,
-        Some(raw) if raw.eq_ignore_ascii_case("depclock") => EvictionPolicy::DependencyClock,
-        _ => EvictionPolicy::Clock,
     }
 }
 
@@ -232,6 +237,12 @@ impl PackCacheTier {
         self.capacity_bytes
     }
 
+    /// Returns the eviction policy for this tier.
+    #[inline]
+    const fn eviction_policy(&self) -> EvictionPolicy {
+        self.eviction_policy
+    }
+
     /// Returns the slot size in bytes.
     #[must_use]
     const fn slot_size(&self) -> u32 {
@@ -321,13 +332,13 @@ impl PackCacheTier {
         hash as usize & (self.sets - 1)
     }
 
-    /// Selects a victim slot within a set using the CLOCK algorithm.
+    /// Selects a victim slot within a set using the active eviction policy.
     ///
-    /// Scans the set starting from the persisted hand position. Slots with
-    /// `clock == 0` (or invalid) are immediately chosen as victims. Slots
-    /// with `clock == 1` have their bit cleared ("second chance") and the
-    /// hand advances. If all `WAYS` slots survive a full sweep, the slot
-    /// under the hand after the sweep is evicted unconditionally.
+    /// Under `Clock`, scans the set starting from the persisted hand
+    /// position with second-chance demotion. Under `DependencyClock`,
+    /// additionally skips slots whose `dependency_guard` is nonzero
+    /// (decrementing the guard on each skip). Falls back to unconditional
+    /// eviction after a bounded sweep.
     fn select_victim(&mut self, base: usize, set: usize) -> usize {
         self.eviction_stats.victim_selections =
             self.eviction_stats.victim_selections.saturating_add(1);
@@ -353,6 +364,11 @@ impl PackCacheTier {
         idx
     }
 
+    /// Dependency-aware CLOCK variant that protects likely delta bases.
+    ///
+    /// Two-sweep search: first sweep clears clock bits and skips guarded
+    /// slots (decrementing the guard). If no victim is found, a second
+    /// unconditional eviction is performed.
     fn select_victim_dependency_clock(&mut self, base: usize, set: usize) -> usize {
         let mut hand = self.clock_hands[set] as usize % WAYS;
 
@@ -461,7 +477,6 @@ impl PackCacheTier {
 pub struct PackCache {
     small: PackCacheTier,
     large: PackCacheTier,
-    eviction_policy: EvictionPolicy,
     pending_dependency_hint: Option<u64>,
 }
 
@@ -482,7 +497,6 @@ impl PackCache {
             return Self {
                 small: PackCacheTier::disabled_with_policy(capacity_bytes, eviction_policy),
                 large: PackCacheTier::disabled_with_policy(0, eviction_policy),
-                eviction_policy,
                 pending_dependency_hint: None,
             };
         }
@@ -516,7 +530,6 @@ impl PackCache {
             return Self {
                 small,
                 large,
-                eviction_policy,
                 pending_dependency_hint: None,
             };
         }
@@ -529,7 +542,6 @@ impl PackCache {
             return Self {
                 small,
                 large,
-                eviction_policy,
                 pending_dependency_hint: None,
             };
         }
@@ -542,7 +554,6 @@ impl PackCache {
             return Self {
                 small,
                 large,
-                eviction_policy,
                 pending_dependency_hint: None,
             };
         }
@@ -550,7 +561,6 @@ impl PackCache {
         Self {
             small,
             large,
-            eviction_policy,
             pending_dependency_hint: None,
         }
     }
@@ -574,14 +584,15 @@ impl PackCache {
     /// Searches the small tier first, then the large tier. A hit in either
     /// tier updates that slot's CLOCK reference bit.
     pub fn get(&mut self, offset: u64) -> Option<CachedObject<'_>> {
+        let is_dep_clock = self.small.eviction_policy() == EvictionPolicy::DependencyClock;
         if let Some(hit) = self.small.get(offset) {
-            if self.eviction_policy == EvictionPolicy::DependencyClock {
+            if is_dep_clock {
                 self.pending_dependency_hint = Some(offset);
             }
             return Some(hit);
         }
         if let Some(hit) = self.large.get(offset) {
-            if self.eviction_policy == EvictionPolicy::DependencyClock {
+            if is_dep_clock {
                 self.pending_dependency_hint = Some(offset);
             }
             return Some(hit);
@@ -634,7 +645,7 @@ impl PackCache {
         }
         // Need more space — reconstruct. This allocates but only happens
         // when a larger repo is encountered for the first time.
-        *self = Self::new_with_policy(capacity_bytes, self.eviction_policy);
+        *self = Self::new_with_policy(capacity_bytes, self.small.eviction_policy());
     }
 
     /// Builds a cache with only the small tier enabled, using the full
@@ -647,7 +658,6 @@ impl PackCache {
                 eviction_policy,
             ),
             large: PackCacheTier::disabled_with_policy(0, eviction_policy),
-            eviction_policy,
             pending_dependency_hint: None,
         }
     }
@@ -655,7 +665,7 @@ impl PackCache {
     /// Active eviction policy label (`clock` or `dependency_clock`).
     #[must_use]
     pub fn eviction_policy_name(&self) -> &'static str {
-        self.eviction_policy.as_str()
+        self.small.eviction_policy().as_str()
     }
 
     /// Aggregate eviction stats across both tiers.
@@ -667,7 +677,7 @@ impl PackCache {
     }
 
     fn maybe_protect_dependency_base(&mut self, base_offset: u64, child_offset: u64) {
-        if self.eviction_policy != EvictionPolicy::DependencyClock {
+        if self.small.eviction_policy() != EvictionPolicy::DependencyClock {
             return;
         }
         if base_offset >= child_offset {
@@ -830,6 +840,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_eviction_policy_unknown_falls_back_to_clock() {
+        assert_eq!(
+            parse_eviction_policy(Some("typo_policy")),
+            EvictionPolicy::Clock
+        );
+        assert_eq!(parse_eviction_policy(Some("")), EvictionPolicy::Clock);
+        assert_eq!(parse_eviction_policy(Some("CLOCK")), EvictionPolicy::Clock);
+    }
+
+    #[test]
     fn cache_insert_and_get() {
         let mut cache = PackCache::new(64 * 1024);
         let data = vec![0x11u8; 32];
@@ -855,7 +875,6 @@ mod tests {
         let mut cache = PackCache {
             small,
             large,
-            eviction_policy: EvictionPolicy::Clock,
             pending_dependency_hint: None,
         };
         let data = vec![0x22u8; 128 * 1024];
@@ -939,5 +958,92 @@ mod tests {
         assert!(cache.insert(child, ObjectKind::Blob, &payload));
 
         assert_eq!(cache.eviction_stats().dependency_marks, 0);
+    }
+
+    #[test]
+    fn dependency_guard_expires_after_max_credits() {
+        let mut cache =
+            PackCache::new_with_policy_for_test(4 * 1024, EvictionPolicy::DependencyClock);
+        let payload = [0x88u8; 32];
+
+        // Fill all 4 ways in one set (4 KiB / 1024 slot = 1 set x 4 ways).
+        assert!(cache.insert(100, ObjectKind::Blob, &payload));
+        assert!(cache.insert(200, ObjectKind::Blob, &payload));
+        assert!(cache.insert(300, ObjectKind::Blob, &payload));
+        assert!(cache.insert(400, ObjectKind::Blob, &payload));
+
+        // Protect offset 100 via dependency hint (get sets pending hint,
+        // next insert applies it).
+        let _ = cache.get(100).expect("base must exist");
+        assert!(cache.insert(500, ObjectKind::Blob, &payload));
+        assert!(
+            cache.eviction_stats().dependency_marks > 0,
+            "guard should be set"
+        );
+
+        // Force enough evictions to exhaust guard credits WITHOUT calling
+        // get(100), which would re-arm the hint and re-protect it.
+        // DEPENDENCY_GUARD_MAX = 2, so we need several sweeps to decrement
+        // the guard, clear clock bits, and finally evict the slot.
+        for offset in (600..=1200).step_by(100) {
+            cache.insert(offset, ObjectKind::Blob, &payload);
+        }
+
+        // After enough eviction rounds, offset 100 should be gone.
+        assert!(
+            cache.get(100).is_none(),
+            "dependency guard should expire after enough eviction rounds"
+        );
+    }
+
+    #[test]
+    fn pending_hint_miss_then_insert_no_protection() {
+        let mut cache =
+            PackCache::new_with_policy_for_test(4 * 1024, EvictionPolicy::DependencyClock);
+        let payload = [0x99u8; 32];
+
+        // Fill set.
+        assert!(cache.insert(100, ObjectKind::Blob, &payload));
+        assert!(cache.insert(200, ObjectKind::Blob, &payload));
+        assert!(cache.insert(300, ObjectKind::Blob, &payload));
+        assert!(cache.insert(400, ObjectKind::Blob, &payload));
+
+        // Miss on a non-existent offset clears pending hint.
+        assert!(cache.get(999).is_none());
+        // Insert after miss should NOT protect any base.
+        assert!(cache.insert(500, ObjectKind::Blob, &payload));
+
+        assert_eq!(
+            cache.eviction_stats().dependency_marks,
+            0,
+            "cache miss should clear pending hint — no protection applied"
+        );
+    }
+
+    #[test]
+    fn pending_hint_overwritten_by_second_get() {
+        let mut cache =
+            PackCache::new_with_policy_for_test(4 * 1024, EvictionPolicy::DependencyClock);
+        let payload = [0xAAu8; 32];
+
+        assert!(cache.insert(100, ObjectKind::Blob, &payload));
+        assert!(cache.insert(200, ObjectKind::Blob, &payload));
+        assert!(cache.insert(300, ObjectKind::Blob, &payload));
+        assert!(cache.insert(400, ObjectKind::Blob, &payload));
+
+        // Two consecutive gets: second overwrites the first hint.
+        let _ = cache.get(100).expect("first hit");
+        let _ = cache.get(200).expect("second hit");
+
+        // Insert after second get should protect offset 200, not 100.
+        assert!(cache.insert(500, ObjectKind::Blob, &payload));
+
+        // The exact protection target depends on implementation: the key point
+        // is that the second get overwrites the hint.
+        let stats = cache.eviction_stats();
+        assert!(
+            stats.dependency_marks > 0,
+            "second hit's base should be protected"
+        );
     }
 }

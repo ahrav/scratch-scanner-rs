@@ -1027,6 +1027,9 @@ struct SchedulerPackScratch {
 /// - `adapter` drops before `engine`
 /// - `external` drops before `midx_bytes`
 struct SchedulerPackWorkerRuntime {
+    // SAFETY-INVARIANT: Do not reorder fields. `adapter` must drop before
+    // `_engine`, and `external` must drop before `_midx_bytes`, because
+    // they hold references widened to 'static from the latter's storage.
     adapter: EngineAdapter<'static>,
     _engine: Arc<Engine>,
     external: PackIo<'static>,
@@ -2417,5 +2420,78 @@ mod tests {
         assert_eq!(skipped[0].reason, CandidateSkipReason::LooseMissing);
         let scanned = adapter.take_results();
         assert!(scanned.blobs.is_empty());
+    }
+
+    #[test]
+    fn shard_id_for_exec_position_10_by_3() {
+        // 10 items, 3 shards: extra=1, sizes [4,3,3]
+        let assignments: Vec<usize> = (0..10)
+            .map(|p| shard_id_for_exec_position(p, 10, 3))
+            .collect();
+        assert_eq!(assignments, vec![0, 0, 0, 0, 1, 1, 1, 2, 2, 2]);
+    }
+
+    #[test]
+    fn shard_id_for_exec_position_9_by_3() {
+        // 9 items, 3 shards: extra=0, sizes [3,3,3]
+        let assignments: Vec<usize> = (0..9)
+            .map(|p| shard_id_for_exec_position(p, 9, 3))
+            .collect();
+        assert_eq!(assignments, vec![0, 0, 0, 1, 1, 1, 2, 2, 2]);
+    }
+
+    #[test]
+    fn shard_id_for_exec_position_5_by_1() {
+        // 5 items, 1 shard: all in shard 0
+        let assignments: Vec<usize> = (0..5)
+            .map(|p| shard_id_for_exec_position(p, 5, 1))
+            .collect();
+        assert_eq!(assignments, vec![0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn shard_id_for_exec_position_4_by_4() {
+        // 4 items, 4 shards: one per shard
+        let assignments: Vec<usize> = (0..4)
+            .map(|p| shard_id_for_exec_position(p, 4, 4))
+            .collect();
+        assert_eq!(assignments, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn shard_id_for_exec_position_7_by_4() {
+        // 7 items, 4 shards: extra=3, sizes [2,2,2,1]
+        let assignments: Vec<usize> = (0..7)
+            .map(|p| shard_id_for_exec_position(p, 7, 4))
+            .collect();
+        assert_eq!(assignments, vec![0, 0, 1, 1, 2, 2, 3]);
+    }
+
+    #[test]
+    fn estimate_locality_pressure_known_deps() {
+        // 8 need_offsets with backward offset deps every 4 positions.
+        // dep_gap=4: deps at indices 4,5,6,7 depending on 0,1,2,3.
+        let plan = synthetic_locality_plan(0, 8, 700, 4);
+        assert_eq!(plan.delta_deps.len(), 4, "should have 4 offset deps");
+
+        let p2 = estimate_locality_pressure(&plan, 2);
+        assert_eq!(p2.offset_deps, 4, "all 4 deps are offset-based");
+        assert_eq!(p2.unresolved_offset_bases, 0, "all bases in need_offsets");
+        // With 2 shards: positions 0..4 → shard 0, positions 4..8 → shard 1.
+        // All 4 deps cross the shard boundary.
+        assert_eq!(
+            p2.cross_shard_offset_deps, 4,
+            "all deps cross shard boundary"
+        );
+
+        let p4 = estimate_locality_pressure(&plan, 4);
+        assert_eq!(p4.offset_deps, 4);
+        assert_eq!(p4.unresolved_offset_bases, 0);
+        // With 4 shards: [0,1], [2,3], [4,5], [6,7].
+        // dep 4→0 crosses, dep 5→1 crosses, dep 6→2 crosses, dep 7→3 crosses.
+        assert_eq!(
+            p4.cross_shard_offset_deps, 4,
+            "all deps cross shard boundaries"
+        );
     }
 }
