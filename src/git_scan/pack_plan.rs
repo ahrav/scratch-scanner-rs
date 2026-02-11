@@ -1376,3 +1376,57 @@ mod tests {
         );
     }
 }
+
+// ============================================================================
+// Kani Bounded Model Checking Proofs
+// ============================================================================
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// Maximum graph size for Kani proofs. Small to keep state space manageable.
+    const MAX_N: usize = 6;
+    /// Maximum edges for Kani proofs.
+    const MAX_EDGES: usize = 12;
+
+    /// Proves that `remaining_out` and `dag_remaining` counters in
+    /// `build_exec_order` never underflow below 0.
+    ///
+    /// Constructs symbolic acyclic DAGs (edges only from lower to higher
+    /// index) with bounded size, runs `build_exec_order`, and asserts it
+    /// completes without panic (the `debug_assert!` guards inside the
+    /// function would fire on underflow in debug builds; `saturating_sub`
+    /// prevents wrap in release).
+    #[kani::proof]
+    #[kani::unwind(20)]
+    fn dag_remaining_no_underflow() {
+        let n: usize = kani::any();
+        kani::assume(n >= 1 && n <= MAX_N);
+
+        let need_offsets: Vec<u64> = (0..n as u64).map(|i| (i + 1) * 100).collect();
+
+        let num_edges: usize = kani::any();
+        kani::assume(num_edges <= MAX_EDGES);
+
+        let mut deps = Vec::new();
+        for _ in 0..num_edges {
+            let from: usize = kani::any();
+            let to: usize = kani::any();
+            kani::assume(from < n && to < n && from != to);
+            // Acyclicity: edges only go from lower to higher index.
+            let (base_idx, dep_idx) = if from < to { (from, to) } else { (to, from) };
+            deps.push(DeltaDep {
+                offset: need_offsets[dep_idx],
+                kind: DeltaKind::Ofs,
+                base: BaseLoc::Offset(need_offsets[base_idx]),
+                data_start: 0,
+                delta_size: 0,
+            });
+        }
+
+        // Must not panic — the debug_assert! guards inside build_exec_order
+        // catch any underflow.
+        let _ = build_exec_order(&need_offsets, &deps, 0);
+    }
+}

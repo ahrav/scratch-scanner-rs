@@ -2495,3 +2495,56 @@ mod tests {
         );
     }
 }
+
+// ============================================================================
+// Kani Bounded Model Checking Proofs
+// ============================================================================
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// Proves that `shard_id_for_exec_position` produces a valid,
+    /// complete, and balanced partitioning for all bounded inputs.
+    ///
+    /// For symbolic `len ∈ [1..16]` and `shards ∈ [1..len]`:
+    /// 1. All positions `0..len` map to a valid shard id `< shards`.
+    /// 2. Every shard id `0..shards` is assigned to at least one position.
+    /// 3. Shard sizes differ by at most 1 (balanced partitioning invariant).
+    #[kani::proof]
+    #[kani::unwind(18)]
+    fn shard_id_partitions_cover_all_positions() {
+        let len: usize = kani::any();
+        let shards: usize = kani::any();
+        kani::assume(len >= 1 && len <= 16);
+        kani::assume(shards >= 1 && shards <= len);
+
+        let mut counts = vec![0usize; shards];
+        for pos in 0..len {
+            let shard = shard_id_for_exec_position(pos, len, shards);
+            kani::assert(shard < shards, "shard id must be < shards");
+            counts[shard] += 1;
+        }
+
+        // Every shard must be assigned at least one position.
+        for s in 0..shards {
+            kani::assert(counts[s] > 0, "every shard must have at least one position");
+        }
+
+        // Balanced: max shard size - min shard size <= 1.
+        let mut min_count = len;
+        let mut max_count = 0;
+        for s in 0..shards {
+            if counts[s] < min_count {
+                min_count = counts[s];
+            }
+            if counts[s] > max_count {
+                max_count = counts[s];
+            }
+        }
+        kani::assert(
+            max_count - min_count <= 1,
+            "shard sizes must differ by at most 1",
+        );
+    }
+}

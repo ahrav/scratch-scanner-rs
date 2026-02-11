@@ -7,6 +7,7 @@
 //! 3. **Cycle detection**: graphs with cycles are rejected.
 
 use proptest::prelude::*;
+use proptest::strategy::Just;
 
 use scanner_rs::git_scan::{build_exec_order, BaseLoc, DeltaDep, DeltaKind, PackPlanError};
 
@@ -36,67 +37,82 @@ fn random_acyclic_dag(n: usize, edges_raw: &[(usize, usize)]) -> (Vec<u64>, Vec<
     (need_offsets, deps)
 }
 
-/// Strategy for generating (from, to) edge pairs within a graph of size n.
-fn edge_pairs(n: usize) -> impl Strategy<Value = Vec<(usize, usize)>> {
-    // Generate up to n*2 candidate edges; duplicates/self-loops are filtered.
-    let max_edges = n.saturating_mul(2).max(1);
-    prop::collection::vec((0..n, 0..n), 0..max_edges)
-}
-
 proptest! {
     #[test]
     fn exec_order_is_topologically_valid(
-        n in 2..40usize,
-        edges_raw in edge_pairs(40),
+        (n, edges_raw) in (2..40usize).prop_flat_map(|n| {
+            let max_edges = n.saturating_mul(2).max(1);
+            (Just(n), prop::collection::vec((0..n, 0..n), 0..max_edges))
+        }),
     ) {
         let (need_offsets, deps) = random_acyclic_dag(n, &edges_raw);
         let result = build_exec_order(&need_offsets, &deps, 0).unwrap();
 
         if let Some(order) = result.order() {
-            {
-                // Completeness: output is a permutation of 0..n.
-                assert_eq!(order.len(), n);
-                let mut sorted = order.to_vec();
-                sorted.sort_unstable();
-                let expected: Vec<u32> = (0..n as u32).collect();
-                prop_assert_eq!(sorted, expected, "order must be a permutation");
+            // Completeness: output is a permutation of 0..n.
+            assert_eq!(order.len(), n);
+            let mut sorted = order.to_vec();
+            sorted.sort_unstable();
+            let expected: Vec<u32> = (0..n as u32).collect();
+            prop_assert_eq!(sorted, expected, "order must be a permutation");
 
-                // Topological validity: every base precedes its dependent.
-                let mut pos = vec![0usize; n];
-                for (i, &idx) in order.iter().enumerate() {
-                    pos[idx as usize] = i;
-                }
-                for dep in &deps {
-                    let BaseLoc::Offset(base_offset) = dep.base else {
-                        continue;
-                    };
-                    let base_idx = need_offsets
-                        .iter()
-                        .position(|&o| o == base_offset)
-                        .unwrap();
-                    let dep_idx = need_offsets
-                        .iter()
-                        .position(|&o| o == dep.offset)
-                        .unwrap();
-                    prop_assert!(
-                        pos[base_idx] < pos[dep_idx],
-                        "base idx {} (pos {}) must precede dep idx {} (pos {})",
-                        base_idx,
-                        pos[base_idx],
-                        dep_idx,
-                        pos[dep_idx],
-                    );
-                }
+            // Topological validity: every base precedes its dependent.
+            let mut pos = vec![0usize; n];
+            for (i, &idx) in order.iter().enumerate() {
+                pos[idx as usize] = i;
+            }
+            for dep in &deps {
+                let BaseLoc::Offset(base_offset) = dep.base else {
+                    continue;
+                };
+                let base_idx = need_offsets
+                    .iter()
+                    .position(|&o| o == base_offset)
+                    .unwrap();
+                let dep_idx = need_offsets
+                    .iter()
+                    .position(|&o| o == dep.offset)
+                    .unwrap();
+                prop_assert!(
+                    pos[base_idx] < pos[dep_idx],
+                    "base idx {} (pos {}) must precede dep idx {} (pos {})",
+                    base_idx,
+                    pos[base_idx],
+                    dep_idx,
+                    pos[dep_idx],
+                );
+            }
+        } else {
+            // When order is None, natural order [0..n] must satisfy all
+            // dependencies: every base offset precedes its dependent offset.
+            for dep in &deps {
+                let BaseLoc::Offset(base_offset) = dep.base else {
+                    continue;
+                };
+                let base_idx = need_offsets
+                    .iter()
+                    .position(|&o| o == base_offset)
+                    .unwrap();
+                let dep_idx = need_offsets
+                    .iter()
+                    .position(|&o| o == dep.offset)
+                    .unwrap();
+                prop_assert!(
+                    base_idx < dep_idx,
+                    "None order implies natural order works, but base idx {} >= dep idx {}",
+                    base_idx,
+                    dep_idx,
+                );
             }
         }
     }
 
     #[test]
     fn exec_order_detects_cycles(
-        n in 2..20usize,
-        cycle_a in 0..20usize,
-        cycle_b in 0..20usize,
-        edges_raw in edge_pairs(20),
+        (n, cycle_a, cycle_b, edges_raw) in (2..20usize).prop_flat_map(|n| {
+            let max_edges = n.saturating_mul(2).max(1);
+            (Just(n), 0..n, 0..n, prop::collection::vec((0..n, 0..n), 0..max_edges))
+        }),
     ) {
         // Start with an acyclic DAG, then inject one back-edge to create a cycle.
         let a = cycle_a % n;
@@ -142,8 +158,8 @@ proptest! {
         let need_offsets: Vec<u64> = (0..n as u64).map(|i| (i + 1) * 100).collect();
         let deps = vec![];
         let result = build_exec_order(&need_offsets, &deps, 0).unwrap();
-        prop_assert!(result.order.is_none(), "no deps should always yield None");
-        prop_assert_eq!(result.tree_roots, 0);
-        prop_assert_eq!(result.max_depth, 0);
+        prop_assert!(result.order().is_none(), "no deps should always yield None");
+        prop_assert_eq!(result.tree_roots(), 0);
+        prop_assert_eq!(result.max_depth(), 0);
     }
 }
