@@ -481,10 +481,7 @@ mod loom_tests {
             let final_state = state.load(Ordering::Acquire);
             let final_count = in_flight(final_state);
 
-            assert!(
-                !is_accepting(final_state),
-                "gate must be closed after join",
-            );
+            assert!(!is_accepting(final_state), "gate must be closed after join",);
 
             if spawn_ok {
                 assert_eq!(final_count, 1, "spawn succeeded → count must be 1");
