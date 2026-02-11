@@ -107,6 +107,10 @@ impl<W: Write + Send + 'static> EventSink for SarifEventSink<W> {
 ///
 /// Produces: `{"ruleId":"…","message":{…},"locations":[{…}]}`
 /// See module-level table for the full field mapping.
+///
+/// Note: `commit_id` and `change_kind` are intentionally omitted — SARIF
+/// 2.1.0 has no standard property for VCS attribution. These fields are
+/// available in the JSONL output for consumers that need them.
 fn encode_sarif_result(f: &FindingEvent<'_>, buf: &mut Vec<u8>) {
     buf.extend_from_slice(b"{\"ruleId\":\"");
     write_json_str(f.rule_name, buf);

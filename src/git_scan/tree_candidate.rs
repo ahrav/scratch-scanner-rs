@@ -30,6 +30,16 @@ impl ChangeKind {
     pub const fn as_u8(self) -> u8 {
         self as u8
     }
+
+    /// Returns a human-readable string label for event emission.
+    #[inline]
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Modify => "modify",
+        }
+    }
 }
 
 /// Canonical context for a blob candidate.
@@ -49,9 +59,16 @@ pub struct CandidateContext {
     pub parent_idx: u8,
     /// Type of change: Add or Modify.
     pub change_kind: ChangeKind,
-    /// Context flags (file mode in low bits).
+    /// Git tree entry file mode, truncated to `u16`.
+    ///
+    /// Populated by the tree diff walker as `mode as u16` (e.g. regular
+    /// file `0o100644` → `0o644`). Used in sort keys and spill records
+    /// for deduplication and ordering.
     pub ctx_flags: u16,
-    /// Candidate flags (path classification, etc.).
+    /// Candidate flags — [`PathClass`](super::path_policy::PathClass) bitflags
+    /// produced by [`classify_path`](super::path_policy::classify_path).
+    ///
+    /// Bits: test, vendor, generated, binary, source, unknown.
     pub cand_flags: u16,
     /// Path reference into the shared `ByteArena`.
     pub path_ref: ByteRef,
@@ -66,7 +83,11 @@ pub struct TreeCandidate {
     pub ctx: CandidateContext,
 }
 
-/// Resolved candidate with its path bytes.
+/// Dereferenced form of [`TreeCandidate`] with path bytes resolved from
+/// the owning arena.
+///
+/// Produced by both [`CandidateBuffer::iter_resolved`] and
+/// `CandidateChunk::iter_resolved`; borrows from the respective buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResolvedCandidate<'a> {
     /// Blob object ID.
@@ -266,5 +287,50 @@ impl<'a> Iterator for ResolvedIter<'a> {
             ctx_flags: cand.ctx.ctx_flags,
             cand_flags: cand.ctx.cand_flags,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn change_kind_as_str_values() {
+        assert_eq!(ChangeKind::Add.as_str(), "add");
+        assert_eq!(ChangeKind::Modify.as_str(), "modify");
+    }
+
+    #[test]
+    fn change_kind_as_u8_roundtrip() {
+        assert_eq!(ChangeKind::Add.as_u8(), 1);
+        assert_eq!(ChangeKind::Modify.as_u8(), 2);
+    }
+
+    #[test]
+    fn ctx_flags_carries_file_mode() {
+        // tree_diff.rs passes `mode as u16` (Git tree entry mode) as ctx_flags.
+        // Regular file = 0o100644, truncated to u16 = 0o644 = 420.
+        let mode_regular: u16 = 0o100644u32 as u16; // 420
+        assert_ne!(mode_regular, 0, "regular file mode must be non-zero");
+
+        let limits = TreeDiffLimits::RESTRICTIVE;
+        let mut buf = CandidateBuffer::new(&limits, 20);
+        buf.push(
+            OidBytes::from_slice(&[0xAA; 20]),
+            b"src/main.rs",
+            1,
+            0,
+            ChangeKind::Add,
+            mode_regular,
+            0,
+        )
+        .expect("push with non-zero ctx_flags");
+
+        let resolved: Vec<_> = buf.iter_resolved().collect();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            resolved[0].ctx_flags, mode_regular,
+            "ctx_flags must round-trip the file mode, not be reserved/zero"
+        );
     }
 }
