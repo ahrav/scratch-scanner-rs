@@ -121,7 +121,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: fuzz/corpus
-          key: fuzz-corpus-pack-${{ hashFiles('fuzz/corpus/fuzz_pack_parse_delta/**') }}
+          key: fuzz-corpus-pack-${{ hashFiles('fuzz/corpus/fuzz_pack_*/**') }}
           restore-keys: |
             fuzz-corpus-pack-
       - name: Run pack fuzz targets
@@ -158,7 +158,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: fuzz/corpus
-          key: fuzz-corpus-nightly-linux-${{ hashFiles('fuzz/corpus/fuzz_pack_parse_delta/**') }}
+          key: fuzz-corpus-nightly-linux-${{ hashFiles('fuzz/corpus/fuzz_pack_*/**') }}
           restore-keys: |
             fuzz-corpus-nightly-linux-
       - name: Run fuzz targets
@@ -193,7 +193,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: fuzz/corpus
-          key: fuzz-corpus-nightly-macos-${{ hashFiles('fuzz/corpus/fuzz_pack_parse_delta/**') }}
+          key: fuzz-corpus-nightly-macos-${{ hashFiles('fuzz/corpus/fuzz_pack_*/**') }}
           restore-keys: |
             fuzz-corpus-nightly-macos-
       - name: Run fuzz targets

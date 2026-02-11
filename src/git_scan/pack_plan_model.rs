@@ -103,9 +103,11 @@ impl PackPlanStats {
 ///
 /// The plan contains both the candidate list and the expanded set of
 /// offsets required to decode them (including pack-local delta bases).
-/// `exec_order` is present only when the DFS scheduler detects forward
-/// delta dependencies (a base at a higher offset than its dependent);
-/// without it the executor uses ascending offset order with a merge cursor.
+/// `exec_order` is present when the DFS scheduler produces a non-identity
+/// permutation of `need_offsets` indices. This happens when delta
+/// dependencies exist and DFS subtree grouping differs from natural
+/// ascending offset order. When absent, the executor uses ascending offset
+/// order with a forward-only merge cursor.
 ///
 /// # Lookup indirection
 ///

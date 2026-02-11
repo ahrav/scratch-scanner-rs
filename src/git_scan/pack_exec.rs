@@ -16,11 +16,12 @@
 //! - Oversized blobs and delta outputs may be spilled to mmap-backed files
 //!   under a caller-provided spill directory.
 //!
-//! Execution order is driven by `PackPlan.exec_order`: when absent, offsets
-//! are processed in ascending order and candidate gating uses a single
-//! forward-only merge cursor over `candidate_offsets`. When present, the
-//! executor precomputes exact per-offset candidate ranges to preserve
-//! gating under out-of-order execution.
+//! Execution order is driven by `PackPlan.exec_order`: when absent (no
+//! delta dependencies, or the DFS order matches the natural ascending
+//! sequence), offsets are processed in ascending order and candidate gating
+//! uses a single forward-only merge cursor over `candidate_offsets`. When
+//! present, the executor precomputes exact per-offset candidate ranges to
+//! preserve gating under out-of-order execution.
 //!
 //! # Invariants
 //! - `plan.need_offsets` and `plan.candidate_offsets` are sorted by pack offset.
