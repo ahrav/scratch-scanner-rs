@@ -16,11 +16,12 @@
 //! - Oversized blobs and delta outputs may be spilled to mmap-backed files
 //!   under a caller-provided spill directory.
 //!
-//! Execution order is driven by `PackPlan.exec_order`: when absent, offsets
-//! are processed in ascending order and candidate gating uses a single
-//! forward-only merge cursor over `candidate_offsets`. When present, the
-//! executor precomputes exact per-offset candidate ranges to preserve
-//! gating under out-of-order execution.
+//! Execution order is driven by `PackPlan.exec_order`: when absent (no
+//! delta dependencies, or the DFS order matches the natural ascending
+//! sequence), offsets are processed in ascending order and candidate gating
+//! uses a single forward-only merge cursor over `candidate_offsets`. When
+//! present, the executor precomputes exact per-offset candidate ranges to
+//! preserve gating under out-of-order execution.
 //!
 //! # Invariants
 //! - `plan.need_offsets` and `plan.candidate_offsets` are sorted by pack offset.
@@ -390,6 +391,10 @@ fn cache_reject_bucket_range(idx: usize) -> (u32, u32) {
     (start, end)
 }
 
+/// Record the length of a completed fallback delta-chain walk into stats.
+///
+/// Called once per `decode_base_from_pack` invocation, whether the walk
+/// succeeded or failed, to track the distribution of chain depths.
 #[inline]
 fn record_fallback_chain(stats: &mut PackExecStats, chain_len: usize) {
     let chain_len = chain_len.min(u32::MAX as usize) as u32;
@@ -433,6 +438,26 @@ pub fn merge_pack_exec_reports(mut reports: Vec<PackExecReport>) -> PackExecRepo
 }
 
 /// Reusable scratch buffers for pack execution.
+///
+/// The executor uses a three-buffer rotation scheme to avoid per-offset
+/// heap allocations on the hot path:
+///
+/// - `inflate_buf` — receives raw zlib-inflated bytes (delta payloads or
+///   non-delta object data). Sized to `max_delta_bytes`.
+/// - `result_buf` — holds the final decoded object bytes after delta
+///   application. This is the buffer handed to `cache.insert()` or read
+///   by the sink. Sized to `max_object_bytes`.
+/// - `base_buf` — holds the base object bytes during fallback delta chain
+///   resolution. Swapped with `result_buf` as each delta frame is applied
+///   so the previous output becomes the next base.
+///
+/// `delta_stack` collects `DeltaFrame`s during fallback chain walks
+/// (base not in cache). The stack is unwound in reverse to apply deltas
+/// from the root base outward.
+///
+/// `candidate_ranges` is populated once per plan for out-of-order
+/// execution; it maps each `need_offsets` index to its contiguous range
+/// in `candidate_offsets`.
 #[derive(Debug, Default)]
 pub struct PackExecScratch {
     inflate_buf: Vec<u8>,
@@ -499,7 +524,11 @@ struct DecodedObject {
     storage: DecodedStorage,
 }
 
-/// Base byte storage for delta application.
+/// Where resolved base bytes live during delta application.
+///
+/// Small bases are borrowed from the cache or `base_buf` (`Slice`).
+/// Bases that exceed `max_object_bytes` are backed by a spill mmap; the
+/// `BlobSpill` owns the mapping and must outlive any slice borrows.
 enum BaseStorage<'a> {
     Slice(&'a [u8]),
     /// Spill-backed bytes; the spill must remain alive while referenced.
@@ -515,7 +544,11 @@ impl BaseStorage<'_> {
     }
 }
 
-/// Resolved base bytes for delta application.
+/// Resolved base object: its git object kind plus the raw bytes.
+///
+/// Used as the input to `decode_delta_output`. The kind propagates
+/// through the delta chain (the final reconstructed object inherits the
+/// kind of the root non-delta base).
 struct BaseBytes<'a> {
     kind: ObjectKind,
     storage: BaseStorage<'a>,
@@ -527,9 +560,18 @@ impl BaseBytes<'_> {
     }
 }
 
+/// One frame in the delta chain stack during fallback base resolution.
+///
+/// When the executor encounters a delta whose base is not cached, it
+/// pushes a frame for each intermediate delta while walking toward the
+/// root non-delta object. The stack is then unwound in reverse to apply
+/// deltas from the root outward.
 #[derive(Clone, Copy, Debug)]
 struct DeltaFrame {
+    /// Pack offset of this delta entry (used for cache insertion after
+    /// applying the delta).
     offset: u64,
+    /// Parsed entry header (contains kind, data_start, and declared size).
     header: EntryHeader,
 }
 
@@ -613,7 +655,12 @@ pub fn execute_pack_plan<S: PackObjectSink, B: ExternalBaseProvider>(
     )
 }
 
-/// Executes a pack plan using reusable scratch buffers.
+/// Executes a pack plan using caller-provided scratch buffers.
+///
+/// Identical to [`execute_pack_plan`] but allows the caller to amortize
+/// buffer allocations across multiple pack plans by reusing a single
+/// [`PackExecScratch`]. The scratch is `prepare()`d at the start of
+/// each call and may grow but never shrinks.
 #[allow(clippy::too_many_arguments)]
 pub fn execute_pack_plan_with_scratch<S: PackObjectSink, B: ExternalBaseProvider>(
     plan: &PackPlan,
@@ -750,8 +797,31 @@ pub fn execute_pack_plan_with_scratch<S: PackObjectSink, B: ExternalBaseProvider
 
 /// Executes a pack plan for a subset of offsets in `exec_indices`.
 ///
-/// The `candidate_ranges` slice must be indexed by `need_offsets` index and
-/// is used to map offsets to candidate ranges deterministically.
+/// This is the shard-parallel entry point: callers split `exec_order`
+/// (or `0..need_offsets.len()`) into disjoint index slices and dispatch
+/// each slice to a separate shard with its own scratch buffers and cache.
+/// Results are merged afterward with [`merge_pack_exec_reports`].
+///
+/// # Arguments
+///
+/// - `exec_indices` — which `need_offsets` indices this shard decodes.
+///   May be non-contiguous; order determines decode sequence.
+/// - `candidate_ranges` — precomputed by [`build_candidate_ranges`],
+///   indexed by `need_offsets` position. Must have length
+///   `plan.need_offsets.len()`.
+///
+/// # Delta base resolution
+///
+/// Because each shard has an independent cache, delta bases decoded by a
+/// different shard will not be present. The executor falls back to
+/// `decode_base_from_pack` which re-inflates the chain from pack bytes.
+/// For plans with deep delta chains, ensure related base/dependent pairs
+/// land in the same shard to avoid redundant work.
+///
+/// # Errors
+///
+/// Same as [`execute_pack_plan_with_scratch`]: `PackParse` and `Sink`
+/// errors are fatal; decode failures are recorded as skips.
 #[allow(clippy::too_many_arguments)]
 pub fn execute_pack_plan_with_scratch_indices<S: PackObjectSink, B: ExternalBaseProvider>(
     plan: &PackPlan,
@@ -935,6 +1005,10 @@ fn size_to_usize(size: u64, kind: EntryKind) -> Result<usize, PackDecodeError> {
     })
 }
 
+/// Inflated delta payload bytes, either in-memory or spill-backed.
+///
+/// Small payloads live in a borrowed scratch buffer; oversized payloads
+/// are written to a spill file and accessed through an mmap.
 enum DeltaPayload<'a> {
     Slice(&'a [u8]),
     Spill(BlobSpill),
@@ -949,6 +1023,12 @@ impl DeltaPayload<'_> {
     }
 }
 
+/// Inflate a delta entry's compressed payload into memory or a spill file.
+///
+/// If the declared delta size fits within `limits.max_delta_bytes`, the
+/// payload is inflated into `inflate_buf` and returned as a borrowed
+/// slice. Otherwise the payload is streamed into a spill-backed mmap to
+/// keep resident memory bounded.
 fn inflate_delta_payload<'a>(
     pack: &PackFile<'_>,
     header: &EntryHeader,
@@ -1414,6 +1494,16 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
     }
 }
 
+/// Inflate a delta payload, apply it against `base_bytes`, and produce
+/// the reconstructed object.
+///
+/// Returns the storage location of the output and its byte length. When
+/// the output fits within `limits.max_object_bytes`, it is written into
+/// `result_buf` (returned as `DecodedStorage::Scratch`). Otherwise it is
+/// streamed into a spill-backed mmap (`DecodedStorage::Spill`).
+///
+/// `inflate_buf` is used as scratch for the raw delta payload; it may be
+/// overwritten regardless of the outcome.
 fn decode_delta_output(
     pack: &PackFile<'_>,
     header: &EntryHeader,
@@ -1492,10 +1582,31 @@ fn delta_dep_at_index(
     delta_deps.get(idx as usize).copied()
 }
 
-/// Decode a base object on demand into `base_buf`, following delta chains as needed.
+/// Decode a base object on demand by walking the delta chain from `offset`.
 ///
-/// Returns `SkipReason` for non-fatal failures; callers should record skips
-/// on the original offset.
+/// Called when a delta's base is not in the cache (fallback path). The
+/// algorithm has two phases:
+///
+/// 1. **Walk forward** — starting at `offset`, read each entry header. If
+///    the entry is itself a delta, push a [`DeltaFrame`] onto the stack
+///    and follow the base pointer. Stop when a non-delta entry or an
+///    external REF base is reached, or `max_delta_depth` is exceeded.
+///
+/// 2. **Unwind backward** — inflate the root base into `base_buf`, then
+///    iterate the delta stack in reverse. For each frame, inflate the
+///    delta payload and apply it against the current base bytes, writing
+///    the output into `result_buf`. After each application, swap
+///    `base_buf` and `result_buf` so the latest output becomes the base
+///    for the next frame. Results are also offered to the cache at each
+///    step.
+///
+/// Oversized bases or delta outputs are spilled to mmap-backed files
+/// under `spill_dir` rather than held in RAM.
+///
+/// Returns the fully resolved base bytes (in `base_buf` or a spill) on
+/// success, or a `SkipReason` for non-fatal failures. Callers record the
+/// skip on the *original* dependent offset, not on intermediate chain
+/// entries.
 #[allow(clippy::too_many_arguments)]
 fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
     pack: &'a PackFile<'a>,
@@ -1793,9 +1904,16 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
     }
 }
 
+/// Non-fatal delta decode failure.
+///
+/// Callers convert this into the appropriate [`SkipReason`] variant and
+/// record it in the execution report. This is separate from
+/// [`PackExecError`] because delta failures do not abort the plan.
 #[derive(Debug)]
 enum DeltaDecodeError {
+    /// Inflation or header parsing failed.
     Decode(PackDecodeError),
+    /// Delta application itself failed (e.g., output overrun, bad opcodes).
     Delta(DeltaError),
 }
 
@@ -2085,6 +2203,7 @@ mod tests {
             external_bases: 0,
             forward_deps: exec_order.as_ref().map_or(0, |_| 1),
             candidate_span: candidate_span(&candidate_offsets),
+            ..PackPlanStats::empty()
         };
 
         PackPlan {
@@ -2265,6 +2384,7 @@ mod tests {
                 external_bases: 0,
                 forward_deps: 0,
                 candidate_span: delta_offset - base_offset,
+                ..PackPlanStats::empty()
             },
         };
 
@@ -2595,6 +2715,7 @@ mod tests {
                 external_bases: 0,
                 forward_deps: 0,
                 candidate_span: delta_offset - base_offset,
+                ..PackPlanStats::empty()
             },
         };
 
@@ -2678,6 +2799,7 @@ mod tests {
                 external_bases: 0,
                 forward_deps: 0,
                 candidate_span: delta_offset - base_offset,
+                ..PackPlanStats::empty()
             },
         };
 
@@ -2759,6 +2881,7 @@ mod tests {
                 external_bases: 0,
                 forward_deps: 0,
                 candidate_span: delta_offset - base_offset,
+                ..PackPlanStats::empty()
             },
         };
 
@@ -2840,6 +2963,7 @@ mod tests {
                 external_bases: 0,
                 forward_deps: 0,
                 candidate_span: delta_offset - base_offset,
+                ..PackPlanStats::empty()
             },
         };
 
@@ -2919,6 +3043,7 @@ mod tests {
                 external_bases: 1,
                 forward_deps: 0,
                 candidate_span: 0,
+                ..PackPlanStats::empty()
             },
         };
 

@@ -5,6 +5,13 @@
 //! shape (sorted/disjoint sets), watermark gating, and stability across
 //! schedule seeds.
 //!
+//! Stage pipeline:
+//! `RepoOpen -> CommitWalk -> TreeDiff -> PackExec -> Finalize`
+//!
+//! Each stage is executed exactly once per run. Stage outputs are carried in
+//! `RunState` and validated at the end of the run before a `RunReport` is
+//! emitted.
+//!
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use blake3::Hasher;
@@ -77,6 +84,10 @@ pub struct RunReport {
     pub trace_hash: [u8; 32],
 }
 
+/// Semantic subset of `RunReport` used for cross-seed stability checks.
+///
+/// `steps` and `trace_hash` are intentionally excluded so schedule variations
+/// can be tolerated as long as externally visible scan results are identical.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RunOutput {
     commit_count: u32,
@@ -304,6 +315,10 @@ impl GitSimRunner {
     }
 }
 
+/// Stable stage identifiers used by trace events and task dispatch.
+///
+/// Numeric discriminants are explicit to keep event encoding stable if enum
+/// declaration order changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StageKind {
     RepoOpen = 1,
@@ -313,6 +328,10 @@ enum StageKind {
     Finalize = 5,
 }
 
+/// Mutable per-run state threaded through stage execution.
+///
+/// Most fields are populated monotonically as the stage pipeline advances.
+/// `Option` fields represent stage prerequisites and are validated on access.
 struct RunState<'a> {
     scenario: &'a GitScenario,
     trace: GitTraceRing,
@@ -347,6 +366,11 @@ impl<'a> RunState<'a> {
     }
 }
 
+/// Spawn one stage task and remember the stage kind at the assigned task index.
+///
+/// The `tasks` vector is a side table keyed by `SimTaskId::index()`, letting the
+/// scheduler return compact task ids while the runner retains semantic stage
+/// identity for dispatch and tracing.
 fn spawn_stage(
     executor: &mut SimExecutor,
     tasks: &mut Vec<StageKind>,
@@ -361,6 +385,11 @@ fn spawn_stage(
     id
 }
 
+/// Resolve the step budget for a run.
+///
+/// A non-zero configured value wins. Otherwise we derive a conservative
+/// heuristic from repo shape to keep runaway schedules bounded while still
+/// allowing small scenarios to complete.
 fn derive_max_steps(max_steps: u64, scenario: &GitScenario) -> u64 {
     if max_steps != 0 {
         return max_steps;
@@ -372,6 +401,11 @@ fn derive_max_steps(max_steps: u64, scenario: &GitScenario) -> u64 {
     1000 + commits.saturating_mul(8) + refs.saturating_mul(4) + trees.saturating_mul(2)
 }
 
+/// Stage 1: validate and materialize static repo structures.
+///
+/// Ref names are sorted for deterministic start-set construction before being
+/// interned into `ByteArena`, so downstream hashing is independent of input
+/// order in the scenario.
 fn stage_repo_open(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
     let repo = &state.scenario.repo;
     if let Some(artifacts) = &state.scenario.artifacts {
@@ -422,6 +456,7 @@ fn stage_repo_open(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
     Ok(state.refs.len() as u32)
 }
 
+/// Stage 2: produce the commit execution plan from start refs.
 fn stage_commit_walk(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
     let commit_graph = state
         .commit_graph
@@ -444,6 +479,10 @@ fn stage_commit_walk(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
     Ok(state.plan.len() as u32)
 }
 
+/// Stage 3: expand planned commits into blob candidates via tree diffs.
+///
+/// Root/snapshot commits diff against an empty tree; other commits diff against
+/// each parent to preserve parent-specific context.
 fn stage_tree_diff(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
     let commit_graph = state
         .commit_graph
@@ -501,6 +540,12 @@ fn stage_tree_diff(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
     Ok(count)
 }
 
+/// Stage 4: execute pack plans and partition candidates into scanned/skipped.
+///
+/// Fallback behavior is intentionally deterministic:
+/// - no artifacts => treat semantic candidates as scanned
+/// - incomplete artifacts => treat candidates as skipped
+/// - full artifacts => execute pack decode path and collect per-object outcomes
 fn stage_pack_exec(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
     let Some(candidates) = state.candidates.as_ref() else {
         return Err(failure_inv(30, "candidates missing"));
@@ -646,6 +691,7 @@ fn stage_pack_exec(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
     Ok(state.scanned.len() as u32)
 }
 
+/// Stage 5: derive finalize outcome from collected scanned/skipped sets.
 fn stage_finalize(state: &mut RunState<'_>) -> Result<u32, FailureReport> {
     let skipped_count = state.skipped.len();
     let outcome = if skipped_count == 0 {
@@ -679,6 +725,10 @@ impl crate::git_scan::PackObjectSink for CollectingSink {
     }
 }
 
+/// Map pack-exec skip offsets back to candidate OIDs.
+///
+/// `candidate_offsets` is sorted by offset, so we can recover all candidates at
+/// a skipped offset with two `partition_point` calls and no extra indexing map.
 fn collect_skipped_from_report(
     plan: &crate::git_scan::PackPlan,
     report: &PackExecReport,
@@ -700,24 +750,36 @@ fn collect_skipped_from_report(
     }
 }
 
+/// Record every semantic candidate as scanned.
+///
+/// Used when byte-level artifacts are unavailable and we intentionally bypass
+/// pack decode.
 fn collect_semantic_scan(candidates: &CandidateBuffer, out: &mut Vec<OidBytes>) {
     for cand in candidates.iter_resolved() {
         out.push(cand.oid);
     }
 }
 
+/// Record every semantic candidate as skipped.
+///
+/// Used when byte-level artifacts are present but incomplete, so decode is not
+/// attempted.
 fn collect_semantic_skip(candidates: &CandidateBuffer, out: &mut Vec<OidBytes>) {
     for cand in candidates.iter_resolved() {
         out.push(cand.oid);
     }
 }
 
+/// Sort and deduplicate OIDs to normalize set-like outputs.
+///
+/// Downstream invariants and hashes assume canonical ordering.
 fn dedupe_sorted(mut oids: Vec<OidBytes>) -> Vec<OidBytes> {
     oids.sort();
     oids.dedup();
     oids
 }
 
+/// Build the final run report after validating end-of-run invariants.
 fn build_report(state: &RunState<'_>, steps: u64) -> Result<RunReport, FailureReport> {
     let commit_count = state.plan.len() as u32;
     let candidate_count = state
@@ -744,6 +806,7 @@ fn build_report(state: &RunState<'_>, steps: u64) -> Result<RunReport, FailureRe
     })
 }
 
+/// Hash a canonical OID set (already sorted + deduped).
 fn hash_oids(oids: &[OidBytes]) -> [u8; 32] {
     let mut hasher = Hasher::new();
     for oid in oids {
@@ -752,6 +815,7 @@ fn hash_oids(oids: &[OidBytes]) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
+/// Hash trace events in emitted order.
 fn hash_trace(events: &[GitTraceEvent]) -> [u8; 32] {
     let mut hasher = Hasher::new();
     for ev in events {
@@ -760,6 +824,10 @@ fn hash_trace(events: &[GitTraceEvent]) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
+/// Encode one trace event into the trace hash stream.
+///
+/// Event tag bytes are stable and explicit to keep hash compatibility across
+/// refactors.
 fn hash_event(hasher: &mut Hasher, ev: &GitTraceEvent) {
     match ev {
         GitTraceEvent::StageEnter { stage_id } => {
@@ -788,6 +856,11 @@ fn hash_event(hasher: &mut Hasher, ev: &GitTraceEvent) {
     }
 }
 
+/// Apply a single configured read fault/corruption sequence to an in-memory
+/// resource snapshot.
+///
+/// This path is used for whole-buffer artifacts (for example MIDX bytes) where
+/// fault injection occurs before parser construction.
 fn apply_fault_to_bytes(
     faults: &mut GitFaultInjector,
     trace: &mut GitTraceRing,
@@ -820,6 +893,7 @@ fn apply_fault_to_bytes(
     Ok(out)
 }
 
+/// Emit deterministic fault events into the trace for replay/oracle checks.
 fn record_fault_events(
     trace: &mut GitTraceRing,
     resource: &GitResourceId,
@@ -842,6 +916,7 @@ fn record_fault_events(
     }
 }
 
+/// Apply corruption semantics to an owned byte buffer.
 fn apply_corruption_vec(buf: &mut Vec<u8>, corruption: &super::fault::GitCorruption) {
     match corruption {
         super::fault::GitCorruption::TruncateTo { new_len } => {
@@ -865,6 +940,7 @@ fn apply_corruption_vec(buf: &mut Vec<u8>, corruption: &super::fault::GitCorrupt
     }
 }
 
+/// `PackReader` wrapper that injects deterministic per-read faults/corruption.
 struct FaultyPackReader<'a> {
     resource: GitResourceId,
     bytes: BytesView,
@@ -893,6 +969,10 @@ impl PackReader for FaultyPackReader<'_> {
         self.bytes.len() as u64
     }
 
+    /// Read at `offset`, then apply configured I/O fault and corruption rules.
+    ///
+    /// Corruption is applied after copy into `dst` to mirror real-world on-wire
+    /// corruption behavior.
     fn read_at(&mut self, offset: u64, dst: &mut [u8]) -> Result<usize, PackReadError> {
         let offset_usize = offset as usize;
         let bytes = self.bytes.as_slice();
@@ -935,6 +1015,10 @@ impl PackReader for FaultyPackReader<'_> {
     }
 }
 
+/// Apply corruption semantics to a borrowed read buffer and returned length.
+///
+/// Length-changing corruption (`TruncateTo`) updates the logical byte count
+/// while in-place corruption mutates only the visible prefix.
 fn apply_corruption_read(
     buf: &mut [u8],
     mut len: usize,
@@ -1003,10 +1087,14 @@ fn validate_outputs(state: &RunState<'_>) -> Result<FinalizeOutcome, FailureRepo
     Ok(outcome)
 }
 
+/// Return true when `oids` is strictly increasing (sorted + unique).
 fn is_sorted_unique(oids: &[OidBytes]) -> bool {
     oids.windows(2).all(|pair| pair[0] < pair[1])
 }
 
+/// Detect whether two sorted OID slices intersect.
+///
+/// This two-pointer walk runs in `O(left.len() + right.len())`.
 fn has_overlap(left: &[OidBytes], right: &[OidBytes]) -> bool {
     let mut i = 0usize;
     let mut j = 0usize;
@@ -1020,6 +1108,7 @@ fn has_overlap(left: &[OidBytes], right: &[OidBytes]) -> bool {
     false
 }
 
+/// Build an invariant-violation failure with a stable numeric code.
 fn failure_inv<T: std::fmt::Display>(code: u32, err: T) -> FailureReport {
     FailureReport {
         kind: FailureKind::InvariantViolation { code },
@@ -1028,6 +1117,7 @@ fn failure_inv<T: std::fmt::Display>(code: u32, err: T) -> FailureReport {
     }
 }
 
+/// Build an oracle-mismatch failure.
 fn failure_oracle<T: std::fmt::Display>(err: T) -> FailureReport {
     FailureReport {
         kind: FailureKind::OracleMismatch,
@@ -1319,6 +1409,7 @@ mod tests {
                 external_bases: 0,
                 forward_deps: 0,
                 candidate_span: 0,
+                ..PackPlanStats::empty()
             },
         };
 

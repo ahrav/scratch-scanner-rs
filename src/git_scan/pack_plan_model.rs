@@ -4,8 +4,10 @@
 //! decoded (candidates plus pack-local bases), along with delta dependency
 //! metadata for later execution strategies.
 //!
-//! Execution order is optional: it is only required when forward delta
-//! dependencies exist (a base offset greater than its dependent offset).
+//! Execution order is optional: it is present when the DFS scheduler
+//! produces a non-identity permutation of `need_offsets` indices, which
+//! happens whenever delta dependencies exist and DFS subtree grouping
+//! differs from the natural ascending offset order.
 //!
 //! # Invariants
 //! - `need_offsets` is sorted and unique.
@@ -75,6 +77,12 @@ pub struct PackPlanStats {
     pub forward_deps: u32,
     /// Span between first and last candidate offsets.
     pub candidate_span: u64,
+    /// Number of indegree-0 nodes with dependents (delta tree roots).
+    /// Only populated when `perf-stats` is enabled.
+    pub delta_tree_roots: u32,
+    /// Maximum depth of the dependency DAG.
+    /// Only populated when `perf-stats` is enabled.
+    pub delta_tree_max_depth: u32,
 }
 
 impl PackPlanStats {
@@ -87,6 +95,8 @@ impl PackPlanStats {
             external_bases: 0,
             forward_deps: 0,
             candidate_span: 0,
+            delta_tree_roots: 0,
+            delta_tree_max_depth: 0,
         }
     }
 }
@@ -95,7 +105,21 @@ impl PackPlanStats {
 ///
 /// The plan contains both the candidate list and the expanded set of
 /// offsets required to decode them (including pack-local delta bases).
-/// `exec_order` is present only when forward dependencies exist.
+/// `exec_order` is present when the DFS scheduler produces a non-identity
+/// permutation of `need_offsets` indices. This happens when delta
+/// dependencies exist and DFS subtree grouping differs from natural
+/// ascending offset order. When absent, the executor uses ascending offset
+/// order with a forward-only merge cursor.
+///
+/// # Lookup indirection
+///
+/// `delta_deps` is a compact, sorted-by-offset array of dependency
+/// descriptors. To look up the dependency for a given `need_offsets[i]`
+/// in O(1), use `delta_dep_index[i]`: it yields the index into
+/// `delta_deps`, or [`NONE_U32`] if the offset is not a delta.
+///
+/// This two-table design avoids a `HashMap` on the hot decode path while
+/// keeping `delta_deps` dense for iteration during planning.
 #[derive(Clone, Debug)]
 pub struct PackPlan {
     /// Pack id (PNAM order).
@@ -110,11 +134,16 @@ pub struct PackPlan {
     pub candidate_offsets: Vec<CandidateAtOffset>,
     /// Offsets to decode (candidates + pack-local bases), sorted unique.
     pub need_offsets: Vec<u64>,
-    /// Delta dependencies for offsets in `need_offsets`.
+    /// Delta dependencies for offsets in `need_offsets`, sorted by offset.
     pub delta_deps: Vec<DeltaDep>,
-    /// Dense index mapping `need_offsets` index to `delta_deps` index.
+    /// Dense index: `delta_dep_index[i]` is the `delta_deps` index for
+    /// `need_offsets[i]`, or [`NONE_U32`] if the offset has no dependency.
     pub delta_dep_index: Vec<u32>,
     /// Optional execution order (indices into `need_offsets`).
+    ///
+    /// Present only when the DFS scheduler produces an order different
+    /// from the natural `[0, 1, ..., n-1]` sequence. `None` means
+    /// ascending offset order is correct.
     pub exec_order: Option<Vec<u32>>,
     /// Summary statistics for strategy selection.
     pub stats: PackPlanStats,

@@ -152,6 +152,51 @@ def gen_external_base() -> None:
     write_pack("external_base_delta.pack", build_pack([delta_obj]))
 
 
+def gen_tiny_zlib_blocks() -> None:
+    """Pack with blob containing tiny zlib blocks (short literal runs)."""
+    data = b"X"  # minimal payload
+    compressed = compress(data)
+    obj = encode_header(3, len(data)) + compressed
+    write_pack("tiny_zlib_block.pack", build_pack([obj]))
+
+
+def gen_many_small_zlib_concat() -> None:
+    """Pack with a blob containing concatenated small zlib streams."""
+    # After the first valid zlib stream ends, the rest is garbage.
+    # inflate should stop at StreamEnd from the first stream.
+    data1 = b"ABCD"
+    z1 = compress(data1)
+    z2 = compress(b"EFGH")
+    # Blob size matches first decompressed block only
+    obj = encode_header(3, len(data1)) + z1 + z2
+    write_pack("concat_zlib_streams.pack", build_pack([obj]))
+
+
+def gen_zero_length_zlib() -> None:
+    """Pack with a blob containing a valid zlib header but empty stream."""
+    # zlib header (78 01) followed by empty deflate - just the header bytes
+    obj = encode_header(3, 0) + b"\x78\x01"
+    write_pack("zero_length_zlib.pack", build_pack([obj]))
+
+
+def gen_zlib_at_output_cap() -> None:
+    """Pack with blob whose decompressed size is exactly 1024 bytes (boundary test)."""
+    data = b"A" * 1024
+    obj = encode_header(3, len(data)) + compress(data)
+    write_pack("zlib_output_cap_1024.pack", build_pack([obj]))
+
+
+def gen_truncated_zlib_mid_block() -> None:
+    """Pack with blob where zlib stream is cut mid-block (not at stream end)."""
+    data = b"Hello World! " * 100  # enough to make a multi-byte deflate
+    compressed = compress(data)
+    # Cut at roughly 60% of compressed data
+    cut_point = len(compressed) * 6 // 10
+    truncated = compressed[:cut_point]
+    obj = encode_header(3, len(data)) + truncated
+    write_pack("truncated_zlib_mid_block.pack", build_pack([obj]))
+
+
 def main() -> None:
     """Generate all regression pack fixtures."""
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -159,6 +204,11 @@ def main() -> None:
     gen_corrupt_header()
     gen_deep_delta()
     gen_external_base()
+    gen_tiny_zlib_blocks()
+    gen_many_small_zlib_concat()
+    gen_zero_length_zlib()
+    gen_zlib_at_output_cap()
+    gen_truncated_zlib_mid_block()
 
 
 if __name__ == "__main__":

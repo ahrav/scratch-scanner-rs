@@ -19,7 +19,7 @@
 //! - `candidate_offsets` is sorted by offset (ties by candidate index).
 //! - `exec_order` indices refer to `need_offsets`.
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 
 use super::midx::MidxView;
@@ -437,7 +437,8 @@ pub(crate) fn build_pack_plan_for_pack<'a, R: OidResolver>(
 
     let delta_deps = build_delta_deps(&need_offsets, &entry_cache, pack_id);
     let delta_dep_index = build_delta_dep_index(&need_offsets, &delta_deps);
-    let exec_order = build_exec_order(&need_offsets, &delta_deps, pack_id)?;
+    let exec_result = build_exec_order(&need_offsets, &delta_deps, pack_id)?;
+    let exec_order = exec_result.order;
 
     let external_bases = delta_deps
         .iter()
@@ -448,13 +449,16 @@ pub(crate) fn build_pack_plan_for_pack<'a, R: OidResolver>(
         .filter(|dep| matches!(dep.base, BaseLoc::Offset(base) if base > dep.offset))
         .count() as u32;
 
-    let stats = PackPlanStats {
+    let mut stats = PackPlanStats {
         candidate_count: candidates.len() as u32,
         need_count: need_offsets.len() as u32,
         external_bases,
         forward_deps,
         candidate_span,
+        ..PackPlanStats::empty()
     };
+    crate::perf_stats::set_u32(&mut stats.delta_tree_roots, exec_result.tree_roots);
+    crate::perf_stats::set_u32(&mut stats.delta_tree_max_depth, exec_result.max_depth);
 
     Ok(PackPlan {
         pack_id,
@@ -557,7 +561,12 @@ fn parse_entry<R: OidResolver>(
 
 /// Build delta dependency descriptors for the current pack.
 ///
-/// External bases are recorded as `BaseLoc::External`.
+/// Iterates `need_offsets` in ascending order and emits one [`DeltaDep`]
+/// per delta entry. The output is therefore sorted by offset, matching
+/// the `delta_deps` invariant on [`PackPlan`].
+///
+/// REF deltas whose base resolves to a different pack (or is unresolved)
+/// are recorded as `BaseLoc::External`.
 fn build_delta_deps(
     need_offsets: &[u64],
     cache: &HashMap<u64, ParsedEntry>,
@@ -593,6 +602,11 @@ fn build_delta_deps(
     deps
 }
 
+/// Build a dense index from `need_offsets` position to `delta_deps` position.
+///
+/// Both inputs are sorted by offset, so a single forward-only merge cursor
+/// produces the mapping in O(n + m) without hashing. Entries with no
+/// matching dependency get [`NONE_U32`].
 fn build_delta_dep_index(need_offsets: &[u64], delta_deps: &[DeltaDep]) -> Vec<u32> {
     let mut index = vec![NONE_U32; need_offsets.len()];
     if delta_deps.is_empty() {
@@ -617,29 +631,61 @@ fn build_delta_dep_index(need_offsets: &[u64], delta_deps: &[DeltaDep]) -> Vec<u
     index
 }
 
-/// Build an execution order that respects forward delta dependencies.
+/// Result from `build_exec_order` including diagnostic stats.
+#[doc(hidden)]
+pub struct ExecOrderResult {
+    /// DFS execution order, or `None` when natural order suffices.
+    pub order: Option<Vec<u32>>,
+    /// Number of indegree-0 nodes with dependents (delta tree roots).
+    pub tree_roots: u32,
+    /// Maximum depth of the dependency DAG.
+    pub max_depth: u32,
+}
+
+/// Build a cache-aware DFS execution order for pack delta chains.
 ///
-/// Returns `None` when natural `need_offsets` order already satisfies all
-/// dependencies.
-fn build_exec_order(
+/// Produces subtree-contiguous ordering: each base is immediately followed by
+/// all of its dependents before moving to the next base. This minimizes the
+/// number of bases that must survive in cache simultaneously (working set =
+/// depth, not breadth).
+///
+/// Returns `None` when there are no pack-local delta dependencies, or when
+/// the DFS order matches the natural `[0, 1, ..., n-1]` sequence (preserving
+/// the fast monotone merge cursor path in the executor).
+///
+/// # Algorithm
+///
+/// 1. **Adjacency**: Build forward edges (base→dependents) and indegree from
+///    all pack-local delta deps (both forward and backward).
+/// 2. **Descendant counts**: BFS from leaves upward to compute subtree sizes.
+/// 3. **DFS with LIFO stack**: Thin subtrees first (ascending `desc_count`),
+///    pushed in reverse so thinnest lands on top. DAG nodes wait until all
+///    parents are emitted (`dag_remaining` counter).
+/// 4. **Identity check**: If the result is `[0..n]`, return `None`.
+#[doc(hidden)]
+pub fn build_exec_order(
     need_offsets: &[u64],
     delta_deps: &[DeltaDep],
     pack_id: u16,
-) -> Result<Option<Vec<u32>>, PackPlanError> {
-    // If all delta bases are at offsets <= their dependents, natural
-    // `need_offsets` order already respects dependencies.
-    if need_offsets.is_empty() {
-        return Ok(None);
+) -> Result<ExecOrderResult, PackPlanError> {
+    let n = need_offsets.len();
+    if n == 0 {
+        return Ok(ExecOrderResult {
+            order: None,
+            tree_roots: 0,
+            max_depth: 0,
+        });
     }
 
-    let mut offset_to_idx: HashMap<u64, usize> = HashMap::with_capacity(need_offsets.len());
+    // Phase 1 — Adjacency: offset_to_idx, edges (base→dependents), indegree.
+    let mut offset_to_idx: HashMap<u64, usize> = HashMap::with_capacity(n);
     for (idx, &offset) in need_offsets.iter().enumerate() {
         offset_to_idx.insert(offset, idx);
     }
 
-    let mut indegree = vec![0u32; need_offsets.len()];
-    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); need_offsets.len()];
-    let mut has_forward = false;
+    let mut indegree = vec![0u32; n];
+    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut has_deps = false;
 
     for dep in delta_deps {
         let BaseLoc::Offset(base_offset) = dep.base else {
@@ -651,41 +697,98 @@ fn build_exec_order(
         let Some(&dep_idx) = offset_to_idx.get(&dep.offset) else {
             continue;
         };
-        if base_offset > dep.offset {
-            has_forward = true;
-        }
+        has_deps = true;
         edges[base_idx].push(dep_idx);
         indegree[dep_idx] = indegree[dep_idx].saturating_add(1);
     }
 
-    if !has_forward {
-        return Ok(None);
+    if !has_deps {
+        return Ok(ExecOrderResult {
+            order: None,
+            tree_roots: 0,
+            max_depth: 0,
+        });
     }
 
-    let mut ready: BTreeSet<usize> = BTreeSet::new();
-    for (idx, &deg) in indegree.iter().enumerate() {
-        if deg == 0 {
-            ready.insert(idx);
+    // Phase 2 — Descendant counts: BFS from leaves upward.
+    // Build reverse edges (child→parents) and outdegree for leaf detection.
+    let mut reverse_edges: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut outdegree = vec![0u32; n];
+    for (base_idx, children) in edges.iter().enumerate() {
+        outdegree[base_idx] = children.len() as u32;
+        for &child_idx in children {
+            reverse_edges[child_idx].push(base_idx);
         }
     }
 
-    let mut order = Vec::with_capacity(need_offsets.len());
-    while let Some(&idx) = ready.iter().next() {
-        ready.remove(&idx);
-        order.push(idx as u32);
-        for &next in &edges[idx] {
-            let next_deg = indegree[next].saturating_sub(1);
-            indegree[next] = next_deg;
-            if next_deg == 0 {
-                ready.insert(next);
+    let mut desc_count = vec![0u32; n];
+    let mut leaf_queue: VecDeque<usize> = VecDeque::new();
+    let mut remaining_out = outdegree.clone();
+
+    for (idx, &out_degree) in outdegree.iter().enumerate() {
+        if out_degree == 0 {
+            leaf_queue.push_back(idx);
+        }
+    }
+
+    while let Some(idx) = leaf_queue.pop_front() {
+        for &parent in &reverse_edges[idx] {
+            // Propagate: parent gains this node + all its descendants.
+            desc_count[parent] = desc_count[parent].saturating_add(desc_count[idx] + 1);
+            remaining_out[parent] -= 1;
+            if remaining_out[parent] == 0 {
+                leaf_queue.push_back(parent);
             }
         }
     }
 
-    if order.len() != need_offsets.len() {
+    // Compute tree_roots (indegree-0 nodes that have dependents) and max_depth.
+    let mut tree_roots = 0u32;
+    for idx in 0..n {
+        if indegree[idx] == 0 && !edges[idx].is_empty() {
+            tree_roots += 1;
+        }
+    }
+
+    // Phase 3 — DFS with explicit LIFO stack.
+    // Sort children by ascending desc_count (thin subtrees first).
+    for children in &mut edges {
+        children.sort_unstable_by_key(|&child| desc_count[child]);
+    }
+
+    // Collect roots sorted by descending desc_count (largest subtree pushed
+    // first, so it ends up at the bottom of the stack — processed last).
+    let mut roots: Vec<usize> = (0..n).filter(|&idx| indegree[idx] == 0).collect();
+    roots.sort_unstable_by(|&a, &b| desc_count[b].cmp(&desc_count[a]));
+
+    // dag_remaining tracks how many unresolved parents each node has.
+    // A node is only pushed to the stack when dag_remaining hits zero.
+    let mut dag_remaining = indegree.clone();
+
+    let mut stack: Vec<usize> = Vec::with_capacity(n);
+    for &root in &roots {
+        stack.push(root);
+    }
+
+    let mut order: Vec<u32> = Vec::with_capacity(n);
+    while let Some(idx) = stack.pop() {
+        order.push(idx as u32);
+        // Push children in reverse order so the thinnest (first after sort)
+        // ends up on top of the stack.
+        for i in (0..edges[idx].len()).rev() {
+            let child = edges[idx][i];
+            dag_remaining[child] -= 1;
+            if dag_remaining[child] == 0 {
+                stack.push(child);
+            }
+        }
+    }
+
+    // Cycle check.
+    if order.len() != n {
         let mut offset = 0u64;
-        for (idx, &deg) in indegree.iter().enumerate() {
-            if deg != 0 {
+        for (idx, &rem) in dag_remaining.iter().enumerate() {
+            if rem != 0 {
                 offset = need_offsets[idx];
                 break;
             }
@@ -693,7 +796,31 @@ fn build_exec_order(
         return Err(PackPlanError::DeltaCycleDetected { pack_id, offset });
     }
 
-    Ok(Some(order))
+    // Compute max_depth precisely from the DFS topological order.
+    let mut topo_depth = vec![0u32; n];
+    let mut max_depth = 0u32;
+    for &idx_u32 in &order {
+        let idx = idx_u32 as usize;
+        for &child in &edges[idx] {
+            let child_depth = topo_depth[idx] + 1;
+            if child_depth > topo_depth[child] {
+                topo_depth[child] = child_depth;
+            }
+        }
+        if topo_depth[idx] > max_depth {
+            max_depth = topo_depth[idx];
+        }
+    }
+
+    // Phase 4 — Identity check: if DFS order is [0, 1, ..., n-1], return None.
+    let is_identity = order.iter().enumerate().all(|(i, &v)| v == i as u32);
+    let order = if is_identity { None } else { Some(order) };
+
+    Ok(ExecOrderResult {
+        order,
+        tree_roots,
+        max_depth,
+    })
 }
 
 /// Span (last - first) for a sorted offset list.
@@ -714,29 +841,72 @@ fn is_sorted_unique(offsets: &[u64]) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn exec_order_emits_only_with_forward_deps() {
-        let need_offsets = vec![10, 50, 70];
-        let deps = vec![DeltaDep {
-            offset: 50,
+    /// Shorthand for an OFS_DELTA dependency: `offset` depends on `base`.
+    fn ofs_dep(offset: u64, base: u64) -> DeltaDep {
+        DeltaDep {
+            offset,
             kind: DeltaKind::Ofs,
-            base: BaseLoc::Offset(10),
-        }];
-        let order = build_exec_order(&need_offsets, &deps, 0).unwrap();
-        assert!(order.is_none());
+            base: BaseLoc::Offset(base),
+        }
+    }
+
+    /// Shorthand for a REF_DELTA dependency: `offset` depends on `base`.
+    fn ref_dep(offset: u64, base: u64) -> DeltaDep {
+        DeltaDep {
+            offset,
+            kind: DeltaKind::Ref,
+            base: BaseLoc::Offset(base),
+        }
+    }
+
+    /// Helper: verify topological ordering (base before all dependents).
+    fn assert_topo_valid(order: &[u32], edges: &[(u32, u32)]) {
+        let pos: HashMap<u32, usize> = order.iter().enumerate().map(|(i, &v)| (v, i)).collect();
+        for &(base, dep) in edges {
+            assert!(
+                pos[&base] < pos[&dep],
+                "base {base} (pos {}) must precede dep {dep} (pos {})",
+                pos[&base],
+                pos[&dep],
+            );
+        }
+    }
+
+    /// Helper: check that a set of indices appear contiguously in the order.
+    fn assert_contiguous(order: &[u32], group: &[u32]) {
+        let pos: Vec<usize> = group
+            .iter()
+            .map(|v| order.iter().position(|&o| o == *v).unwrap())
+            .collect();
+        let lo = *pos.iter().min().unwrap();
+        let hi = *pos.iter().max().unwrap();
+        assert_eq!(
+            hi - lo + 1,
+            group.len(),
+            "group {group:?} not contiguous in order {order:?}"
+        );
+    }
+
+    #[test]
+    fn exec_order_backward_deps_groups_subtrees() {
+        // Even with all backward deps, DFS groups subtrees contiguously.
+        // Offsets: 10(idx0)→50(idx1), 70(idx2) independent.
+        let need_offsets = vec![10, 50, 70];
+        let deps = vec![ofs_dep(50, 10)];
+        let result = build_exec_order(&need_offsets, &deps, 0).unwrap();
+        let order = result.order.expect("DFS reorders even backward deps");
+        let pos_base = order.iter().position(|&v| v == 0).unwrap();
+        let pos_dep = order.iter().position(|&v| v == 1).unwrap();
+        assert!(pos_base < pos_dep, "base must precede dependent");
+        assert_eq!(pos_dep - pos_base, 1, "subtree must be contiguous");
     }
 
     #[test]
     fn exec_order_respects_forward_dep() {
         let need_offsets = vec![10, 50, 70];
-        let deps = vec![DeltaDep {
-            offset: 10,
-            kind: DeltaKind::Ref,
-            base: BaseLoc::Offset(50),
-        }];
-        let order = build_exec_order(&need_offsets, &deps, 0)
-            .unwrap()
-            .expect("exec order");
+        let deps = vec![ref_dep(10, 50)];
+        let result = build_exec_order(&need_offsets, &deps, 0).unwrap();
+        let order = result.order.expect("exec order");
         let pos = |offset| {
             let idx = need_offsets.iter().position(|&o| o == offset).unwrap();
             order.iter().position(|&o| o == idx as u32).unwrap()
@@ -748,11 +918,7 @@ mod tests {
     fn delta_dep_index_maps_need_offsets() {
         let need_offsets = vec![10, 20, 30, 40];
         let deps = vec![
-            DeltaDep {
-                offset: 20,
-                kind: DeltaKind::Ofs,
-                base: BaseLoc::Offset(10),
-            },
+            ofs_dep(20, 10),
             DeltaDep {
                 offset: 40,
                 kind: DeltaKind::Ref,
@@ -763,5 +929,147 @@ mod tests {
         ];
         let index = build_delta_dep_index(&need_offsets, &deps);
         assert_eq!(index, vec![NONE_U32, 0, NONE_U32, 1]);
+    }
+
+    // --- DFS execution order tests ---
+
+    #[test]
+    fn dfs_groups_subtrees_contiguously() {
+        // base(0)→A(1), base(0)→B(2), base2(3)→C(4)
+        let need_offsets = vec![10, 20, 30, 40, 50];
+        let deps = vec![ofs_dep(20, 10), ofs_dep(30, 10), ofs_dep(50, 40)];
+        let result = build_exec_order(&need_offsets, &deps, 0).unwrap();
+        let order = result.order.expect("should produce non-identity order");
+        assert_eq!(order.len(), 5);
+        assert_topo_valid(&order, &[(0, 1), (0, 2), (3, 4)]);
+        assert_contiguous(&order, &[0, 1, 2]);
+        assert_contiguous(&order, &[3, 4]);
+    }
+
+    #[test]
+    fn dfs_thin_subtree_first() {
+        // root(0)→big_child(1), root(0)→thin_child(2)
+        // big_child(1)→{g1..g5}(3..7), thin_child(2)→leaf(8)
+        let need_offsets: Vec<u64> = (0..9).map(|i| (i + 1) * 100).collect();
+        let deps = vec![
+            ofs_dep(200, 100),
+            ofs_dep(300, 100),
+            ofs_dep(400, 200),
+            ofs_dep(500, 200),
+            ofs_dep(600, 200),
+            ofs_dep(700, 200),
+            ofs_dep(800, 200),
+            ofs_dep(900, 300),
+        ];
+        let result = build_exec_order(&need_offsets, &deps, 0).unwrap();
+        let order = result.order.expect("non-identity DFS order");
+        assert_topo_valid(
+            &order,
+            &[
+                (0, 1),
+                (0, 2),
+                (1, 3),
+                (1, 4),
+                (1, 5),
+                (1, 6),
+                (1, 7),
+                (2, 8),
+            ],
+        );
+        let pos = |idx: u32| order.iter().position(|&v| v == idx).unwrap();
+        assert!(
+            pos(2) < pos(1),
+            "thin child (idx2) should be processed before big child (idx1)"
+        );
+    }
+
+    #[test]
+    fn dfs_linear_chain() {
+        let need_offsets = vec![10, 20, 30, 40];
+        let deps = vec![ofs_dep(20, 10), ofs_dep(30, 20), ofs_dep(40, 30)];
+        let result = build_exec_order(&need_offsets, &deps, 0).unwrap();
+        assert!(
+            result.order.is_none(),
+            "linear natural chain should be identity"
+        );
+        assert_eq!(result.tree_roots, 1);
+        assert_eq!(result.max_depth, 3);
+    }
+
+    #[test]
+    fn dfs_dag_shared_base() {
+        // Node at offset 30 depends on both bases at 10 and 20.
+        let need_offsets = vec![10, 20, 30];
+        let deps = vec![ofs_dep(30, 10), ref_dep(30, 20)];
+        let result = build_exec_order(&need_offsets, &deps, 0).unwrap();
+        let order = result.order.expect("DAG reorders");
+        assert_eq!(order.len(), 3);
+        assert_topo_valid(&order, &[(0, 2), (1, 2)]);
+    }
+
+    #[test]
+    fn dfs_returns_none_no_deps() {
+        let need_offsets = vec![10, 20, 30];
+        let deps = vec![];
+        let result = build_exec_order(&need_offsets, &deps, 0).unwrap();
+        assert!(result.order.is_none());
+        assert_eq!(result.tree_roots, 0);
+        assert_eq!(result.max_depth, 0);
+    }
+
+    #[test]
+    fn dfs_returns_none_natural_order() {
+        let need_offsets = vec![10, 20, 30];
+        let deps = vec![ofs_dep(20, 10), ofs_dep(30, 20)];
+        let result = build_exec_order(&need_offsets, &deps, 0).unwrap();
+        assert!(result.order.is_none(), "natural chain → identity → None");
+    }
+
+    #[test]
+    fn dfs_cycle_detected() {
+        let need_offsets = vec![10, 20];
+        let deps = vec![ofs_dep(20, 10), ofs_dep(10, 20)];
+        let result = build_exec_order(&need_offsets, &deps, 0);
+        assert!(
+            matches!(result, Err(PackPlanError::DeltaCycleDetected { .. })),
+            "cycle must be detected"
+        );
+    }
+
+    #[test]
+    fn dfs_multiple_independent_trees() {
+        // Three independent delta trees plus two isolated nodes.
+        //   Tree A: 10→20, 10→30
+        //   Tree B: 40→50→60
+        //   Tree C: 70→80
+        //   Isolated: 90, 100
+        let need_offsets = vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
+        let deps = vec![
+            ofs_dep(20, 10),
+            ofs_dep(30, 10),
+            ofs_dep(50, 40),
+            ofs_dep(60, 50),
+            ofs_dep(80, 70),
+        ];
+        let result = build_exec_order(&need_offsets, &deps, 0).unwrap();
+
+        assert_eq!(
+            result.tree_roots, 3,
+            "should have 3 independent delta tree roots"
+        );
+        assert_eq!(result.max_depth, 2, "longest chain is 40→50→60 (depth 2)");
+
+        let order = result
+            .order
+            .expect("non-trivial graph should produce exec_order");
+        assert_eq!(order.len(), 10);
+
+        // Each tree's nodes must be contiguous.
+        assert_contiguous(&order, &[0, 1, 2]); // Tree A
+        assert_contiguous(&order, &[3, 4, 5]); // Tree B
+        assert_contiguous(&order, &[6, 7]); // Tree C
+
+        // Topological validity.
+        assert_topo_valid(&order, &[(0, 1), (0, 2), (3, 4), (4, 5), (6, 7)]);
     }
 }

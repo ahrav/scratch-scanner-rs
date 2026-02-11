@@ -182,6 +182,8 @@ pub use pack_exec::{
 };
 pub use pack_idx::{IdxError, IdxOidIter, IdxView};
 pub use pack_io::{PackIo, PackIoError, PackIoLimits};
+#[doc(hidden)]
+pub use pack_plan::{build_exec_order, ExecOrderResult};
 pub use pack_plan::{build_pack_plans, OidResolver, PackPlanConfig, PackPlanError, PackView};
 pub use pack_plan_model::{
     BaseLoc, CandidateAtOffset, DeltaDep, DeltaKind, PackPlan, PackPlanStats,

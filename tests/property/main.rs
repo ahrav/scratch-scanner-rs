@@ -10,6 +10,8 @@ mod binary_classification;
 mod git_commit_meta;
 mod git_commit_walk;
 mod git_engine_adapter;
+mod git_pack_delta;
+mod git_pack_plan;
 mod git_spill_dedupe;
 mod git_tree_diff;
 mod regex2anchor_soundness;
