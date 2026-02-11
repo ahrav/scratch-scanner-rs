@@ -42,6 +42,8 @@
 //! - Otherwise, bytes live in a scratch buffer that is overwritten per offset.
 //! - Sinks must consume `bytes` within the `emit` call.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::fmt;
 use std::path::Path;
 
@@ -52,7 +54,7 @@ use super::alloc_guard;
 use super::blob_spill::BlobSpill;
 use super::byte_arena::ByteArena;
 use super::object_id::OidBytes;
-use super::pack_cache::PackCache;
+use super::pack_cache::{CachedObject, PackCache};
 use super::pack_candidates::PackCandidate;
 use super::pack_decode::{inflate_entry_payload, PackDecodeError, PackDecodeLimits};
 use super::pack_delta::apply_delta;
@@ -523,6 +525,28 @@ struct DecodedObject {
     storage: DecodedStorage,
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_CACHE_GET_CALLS: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_test_cache_get_calls() {
+    TEST_CACHE_GET_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+fn test_cache_get_calls() -> u64 {
+    TEST_CACHE_GET_CALLS.with(Cell::get)
+}
+
+#[inline(always)]
+fn cache_get(cache: &mut PackCache, offset: u64) -> Option<CachedObject<'_>> {
+    #[cfg(test)]
+    TEST_CACHE_GET_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+    cache.get(offset)
+}
+
 /// Where resolved base bytes live during delta application.
 ///
 /// Small bases are borrowed from the cache or `base_buf` (`Slice`).
@@ -692,11 +716,11 @@ pub fn execute_pack_plan_with_scratch<S: PackObjectSink, B: ExternalBaseProvider
         };
         let offset = plan.need_offsets[idx];
 
-        let (cache_result, lookup_nanos) = perf::time(|| cache.get(offset));
+        let (cache_result, lookup_nanos) = perf::time(|| cache_get(cache, offset));
         record_timing(&mut report.stats.cache_lookup_nanos, lookup_nanos);
-        let (obj_kind, storage) = if let Some(hit) = cache_result {
+        let (obj_kind, storage, cache_hit_bytes) = if let Some(hit) = cache_result {
             perf::record_cache_hit();
-            (hit.kind, DecodedStorage::Cache)
+            (hit.kind, DecodedStorage::Cache, Some(hit.bytes))
         } else {
             perf::record_cache_miss();
             let decoded = decode_offset(
@@ -722,16 +746,20 @@ pub fn execute_pack_plan_with_scratch<S: PackObjectSink, B: ExternalBaseProvider
                 return Ok(());
             };
 
-            (obj.kind, obj.storage)
+            (obj.kind, obj.storage, None)
         };
 
-        let bytes = match &storage {
-            DecodedStorage::Cache => cache
-                .get(offset)
-                .map(|hit| hit.bytes)
-                .unwrap_or(result_buf.as_slice()),
-            DecodedStorage::Scratch => result_buf.as_slice(),
-            DecodedStorage::Spill(spill) => spill.as_slice(),
+        // Reuse the first probe's bytes on hit to avoid a redundant cache re-probe.
+        let bytes = if let Some(bytes) = cache_hit_bytes {
+            bytes
+        } else {
+            match &storage {
+                DecodedStorage::Cache => cache_get(cache, offset)
+                    .map(|hit| hit.bytes)
+                    .unwrap_or(result_buf.as_slice()),
+                DecodedStorage::Scratch => result_buf.as_slice(),
+                DecodedStorage::Spill(spill) => spill.as_slice(),
+            }
         };
 
         if let Some((start, end)) = range {
@@ -861,11 +889,11 @@ pub fn execute_pack_plan_with_scratch_indices<S: PackObjectSink, B: ExternalBase
         let offset = plan.need_offsets[idx];
         let range = candidate_ranges[idx];
 
-        let (cache_result, lookup_nanos) = perf::time(|| cache.get(offset));
+        let (cache_result, lookup_nanos) = perf::time(|| cache_get(cache, offset));
         record_timing(&mut report.stats.cache_lookup_nanos, lookup_nanos);
-        let (obj_kind, storage) = if let Some(hit) = cache_result {
+        let (obj_kind, storage, cache_hit_bytes) = if let Some(hit) = cache_result {
             perf::record_cache_hit();
-            (hit.kind, DecodedStorage::Cache)
+            (hit.kind, DecodedStorage::Cache, Some(hit.bytes))
         } else {
             perf::record_cache_miss();
             let decoded = decode_offset(
@@ -891,16 +919,20 @@ pub fn execute_pack_plan_with_scratch_indices<S: PackObjectSink, B: ExternalBase
                 return Ok(());
             };
 
-            (obj.kind, obj.storage)
+            (obj.kind, obj.storage, None)
         };
 
-        let bytes: &[u8] = match &storage {
-            DecodedStorage::Cache => cache
-                .get(offset)
-                .map(|hit| hit.bytes)
-                .unwrap_or(result_buf.as_slice()),
-            DecodedStorage::Scratch => result_buf.as_slice(),
-            DecodedStorage::Spill(spill) => spill.as_slice(),
+        // Reuse the first probe's bytes on hit to avoid a redundant cache re-probe.
+        let bytes: &[u8] = if let Some(bytes) = cache_hit_bytes {
+            bytes
+        } else {
+            match &storage {
+                DecodedStorage::Cache => cache_get(cache, offset)
+                    .map(|hit| hit.bytes)
+                    .unwrap_or(result_buf.as_slice()),
+                DecodedStorage::Scratch => result_buf.as_slice(),
+                DecodedStorage::Spill(spill) => spill.as_slice(),
+            }
         };
 
         if let Some((start, end)) = range {
@@ -2275,6 +2307,112 @@ mod tests {
 
         assert_perf_u32(report.stats.emitted_candidates, 1);
         assert_eq!(sink.emitted.len(), 1);
+    }
+
+    #[test]
+    fn merge_fast_path_cache_hit_probes_once() {
+        let object_bytes = b"cached";
+        let (pack, offsets) = build_pack(&[(ObjectKind::Blob, object_bytes)]);
+        let offset = offsets[0];
+
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"file.txt").unwrap();
+        let candidate = PackCandidate {
+            oid: OidBytes::sha1([0x71; 20]),
+            ctx: ctx(path_ref),
+            pack_id: 0,
+            offset,
+        };
+
+        let plan = build_plan(
+            vec![offset],
+            vec![candidate],
+            vec![CandidateAtOffset {
+                offset,
+                cand_idx: 0,
+            }],
+            None,
+        );
+
+        let mut cache = PackCache::new(64 * 1024);
+        assert!(cache.insert(offset, ObjectKind::Blob, object_bytes));
+        let mut external = NoExternal;
+        let mut sink = CollectingSink::default();
+
+        reset_test_cache_get_calls();
+        let report = exec_plan(
+            &plan,
+            &pack,
+            &arena,
+            &PackDecodeLimits::new(64, 1024, 1024),
+            &mut cache,
+            &mut external,
+            &mut sink,
+        );
+
+        assert_perf_u32(report.stats.emitted_candidates, 1);
+        assert_eq!(
+            sink.blobs.get(&candidate.oid).map(|b| b.as_slice()),
+            Some(object_bytes.as_slice())
+        );
+        assert_eq!(test_cache_get_calls(), 1);
+    }
+
+    #[test]
+    fn shard_fast_path_cache_hit_probes_once() {
+        let object_bytes = b"cached";
+        let (pack, offsets) = build_pack(&[(ObjectKind::Blob, object_bytes)]);
+        let offset = offsets[0];
+
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"file.txt").unwrap();
+        let candidate = PackCandidate {
+            oid: OidBytes::sha1([0x72; 20]),
+            ctx: ctx(path_ref),
+            pack_id: 0,
+            offset,
+        };
+
+        let plan = build_plan(
+            vec![offset],
+            vec![candidate],
+            vec![CandidateAtOffset {
+                offset,
+                cand_idx: 0,
+            }],
+            None,
+        );
+
+        let mut candidate_ranges = Vec::new();
+        build_candidate_ranges(&plan, &mut candidate_ranges);
+        let exec_indices = [0usize];
+
+        let mut cache = PackCache::new(64 * 1024);
+        assert!(cache.insert(offset, ObjectKind::Blob, object_bytes));
+        let mut external = NoExternal;
+        let mut sink = CollectingSink::default();
+        let mut scratch = PackExecScratch::default();
+
+        reset_test_cache_get_calls();
+        let report = exec_plan_indices(
+            &plan,
+            &pack,
+            &arena,
+            &PackDecodeLimits::new(64, 1024, 1024),
+            &mut cache,
+            &mut external,
+            &mut sink,
+            &mut scratch,
+            &exec_indices,
+            &candidate_ranges,
+        );
+
+        assert_perf_u32(report.stats.emitted_candidates, 1);
+        assert_eq!(
+            sink.blobs.get(&candidate.oid).map(|b| b.as_slice()),
+            Some(object_bytes.as_slice())
+        );
+        assert_eq!(test_cache_get_calls(), 1);
     }
 
     #[test]

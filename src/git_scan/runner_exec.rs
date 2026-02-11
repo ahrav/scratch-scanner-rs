@@ -882,6 +882,23 @@ struct SchedulerPackScratch {
     cache: PackCache,
     /// Decode workspace: inflate buffer, delta apply buffer, object staging.
     exec_scratch: PackExecScratch,
+    /// Lazily initialized heavy worker-local runtime (I/O + adapter state).
+    runtime: Option<SchedulerPackWorkerRuntime>,
+}
+
+/// Heavy scheduler worker state reused across all tasks on one thread.
+///
+/// This caches the expensive one-time setup that used to be rebuilt per task:
+/// parsed MIDX + `PackIo` and `EngineAdapter` wiring.
+///
+/// Field order matters for drop safety with widened lifetimes:
+/// - `adapter` drops before `engine`
+/// - `external` drops before `midx_bytes`
+struct SchedulerPackWorkerRuntime {
+    adapter: EngineAdapter<'static>,
+    _engine: Arc<Engine>,
+    external: PackIo<'static>,
+    _midx_bytes: BytesView,
 }
 
 /// Pre-computed sharding metadata for one pack plan.
@@ -969,12 +986,76 @@ fn empty_scheduler_output() -> SchedulerPackExecOutput {
     }
 }
 
+/// Build reusable worker runtime for scheduler pack tasks.
+///
+/// This performs the fallible setup that historically happened per task. The
+/// caller stores the returned runtime in worker scratch and reuses it.
+///
+/// # Safety
+///
+/// This function widens lifetimes for:
+/// - `MidxView` (to keep a parsed view inside reusable `PackIo`)
+/// - `&Engine` (to keep a reusable `EngineAdapter`)
+///
+/// Soundness relies on ownership stored in [`SchedulerPackWorkerRuntime`]:
+/// `external` cannot outlive `_midx_bytes`, and `adapter` cannot outlive
+/// `_engine` (enforced by field drop order and struct ownership).
+fn build_scheduler_worker_runtime(
+    shared: &SchedulerPackShared,
+) -> Result<SchedulerPackWorkerRuntime, GitScanError> {
+    let midx_bytes = shared.midx_bytes.clone();
+    let midx = MidxView::parse(midx_bytes.as_slice(), shared.object_format)?;
+    // SAFETY: `midx` borrows from `midx_bytes`, which is stored in the same
+    // runtime struct and outlives `external` (field drop order).
+    let midx: MidxView<'static> = unsafe { std::mem::transmute(midx) };
+    let external = PackIo::from_parts(
+        midx,
+        (*shared.pack_paths).clone(),
+        (*shared.loose_dirs).clone(),
+        shared.pack_io,
+    )
+    .map_err(GitScanError::PackIo)?;
+
+    let engine = Arc::clone(&shared.engine);
+    // SAFETY: the adapter only borrows `engine` and the same runtime stores
+    // `engine` so it remains alive for the adapter's full lifetime.
+    let engine_ref: &'static Engine = unsafe { std::mem::transmute(engine.as_ref()) };
+    let adapter = EngineAdapter::new_with_event_sink(
+        engine_ref,
+        shared.adapter_cfg,
+        CommitMetaContext {
+            event_sink: Arc::clone(&shared.event_sink),
+            commit_graph_index: Arc::clone(&shared.commit_graph),
+            commit_meta_seen: Arc::clone(&shared.commit_meta_seen),
+            identity_interner: None,
+        },
+    );
+
+    Ok(SchedulerPackWorkerRuntime {
+        adapter,
+        _engine: engine,
+        external,
+        _midx_bytes: midx_bytes,
+    })
+}
+
+/// Ensure reusable worker runtime is initialized in scratch.
+fn ensure_scheduler_worker_runtime(
+    runtime: &mut Option<SchedulerPackWorkerRuntime>,
+    shared: &SchedulerPackShared,
+) -> Result<(), GitScanError> {
+    if runtime.is_none() {
+        *runtime = Some(build_scheduler_worker_runtime(shared)?);
+    }
+    Ok(())
+}
+
 /// Execute a single scheduler-dispatched pack task (plan or shard).
 ///
-/// Each invocation creates a fresh `EngineAdapter` and `PackIo` from the
-/// shared state, then delegates to the appropriate pack-exec function.
-/// The per-worker `scratch` (cache + decode workspace) is reused across
-/// tasks on the same thread to amortize allocation.
+/// Uses reusable per-worker runtime (`PackIo` + `EngineAdapter`) from
+/// `scratch`, creating it lazily on first use, then delegates to the
+/// appropriate pack-exec function. The per-worker decode/cache scratch
+/// is also reused across tasks on the same thread.
 ///
 /// # Error propagation
 ///
@@ -986,24 +1067,18 @@ fn run_scheduler_pack_task(
     scratch: &mut SchedulerPackScratch,
     shared: &SchedulerPackShared,
 ) -> Result<SchedulerPackExecOutput, GitScanError> {
-    let midx = MidxView::parse(shared.midx_bytes.as_slice(), shared.object_format)?;
-    let mut external = PackIo::from_parts(
-        midx,
-        (*shared.pack_paths).clone(),
-        (*shared.loose_dirs).clone(),
-        shared.pack_io,
-    )
-    .map_err(GitScanError::PackIo)?;
-    let mut adapter = EngineAdapter::new_with_event_sink(
-        shared.engine.as_ref(),
-        shared.adapter_cfg,
-        CommitMetaContext {
-            event_sink: Arc::clone(&shared.event_sink),
-            commit_graph_index: Arc::clone(&shared.commit_graph),
-            commit_meta_seen: Arc::clone(&shared.commit_meta_seen),
-            identity_interner: None,
-        },
+    ensure_scheduler_worker_runtime(&mut scratch.runtime, shared)?;
+    let (cache, exec_scratch, runtime) = (
+        &mut scratch.cache,
+        &mut scratch.exec_scratch,
+        scratch
+            .runtime
+            .as_mut()
+            .expect("scheduler worker runtime initialized"),
     );
+    runtime.adapter.clear_results();
+    let adapter = &mut runtime.adapter;
+    let external = &mut runtime.external;
 
     match task {
         SchedulerPackTask::ExecPlan { seq } => {
@@ -1029,11 +1104,11 @@ fn run_scheduler_pack_task(
                 pack_bytes,
                 shared.path_arena.as_ref(),
                 &shared.pack_decode,
-                &mut scratch.cache,
-                &mut external,
-                &mut adapter,
+                cache,
+                external,
+                adapter,
                 shared.spill_dir.as_ref(),
-                &mut scratch.exec_scratch,
+                exec_scratch,
             )?;
 
             let mut skipped = Vec::new();
@@ -1082,17 +1157,17 @@ fn run_scheduler_pack_task(
                 }))?
                 .as_ref();
 
-            reserve_results_for_exec_slice(&mut adapter, exec_slice, &shard_meta.candidate_ranges);
+            reserve_results_for_exec_slice(adapter, exec_slice, &shard_meta.candidate_ranges);
             let report = execute_pack_plan_with_scratch_indices(
                 plan,
                 pack_bytes,
                 shared.path_arena.as_ref(),
                 &shared.pack_decode,
-                &mut scratch.cache,
-                &mut external,
-                &mut adapter,
+                cache,
+                external,
+                adapter,
                 shared.spill_dir.as_ref(),
-                &mut scratch.exec_scratch,
+                exec_scratch,
                 exec_slice,
                 &shard_meta.candidate_ranges,
             )?;
@@ -1191,6 +1266,7 @@ pub(super) fn execute_pack_plans_with_scheduler(
                 move |_wid| SchedulerPackScratch {
                     cache: PackCache::new(pack_cache_bytes),
                     exec_scratch: PackExecScratch::default(),
+                    runtime: None,
                 },
                 {
                     let shared = Arc::clone(&shared);
@@ -1340,6 +1416,7 @@ pub(super) fn execute_pack_plans_with_scheduler(
                 move |_wid| SchedulerPackScratch {
                     cache: PackCache::new(pack_cache_bytes),
                     exec_scratch: PackExecScratch::default(),
+                    runtime: None,
                 },
                 {
                     let shared = Arc::clone(&shared);
@@ -1567,7 +1644,7 @@ mod tests {
     use crate::git_scan::midx::MidxView;
     use crate::git_scan::object_id::ObjectFormat;
     use crate::git_scan::pack_candidates::PackCandidate;
-    use crate::git_scan::pack_io::{PackIo, PackIoLimits};
+    use crate::git_scan::pack_io::{PackIo, PackIoError, PackIoLimits};
 
     fn synthetic_plan(
         pack_id: u16,
@@ -1885,6 +1962,32 @@ mod tests {
         PackIo::from_parts(midx, pack_paths, vec![objects_dir.to_path_buf()], limits).unwrap()
     }
 
+    fn scheduler_pack_shared_for_runtime(pack_paths: Vec<PathBuf>) -> SchedulerPackShared {
+        let mut midx_builder = MidxBuilder::default();
+        midx_builder.add_pack(b"pack-test");
+        let midx_bytes = BytesView::from_vec(midx_builder.build());
+
+        let decode = PackDecodeLimits::new(64, 1024 * 1024, 1024 * 1024);
+        SchedulerPackShared {
+            engine: Arc::new(test_engine()),
+            event_sink: Arc::new(crate::unified::events::NullEventSink),
+            midx_bytes,
+            object_format: ObjectFormat::Sha1,
+            pack_paths: Arc::new(pack_paths),
+            loose_dirs: Arc::new(Vec::new()),
+            pack_mmaps: Arc::new(Vec::new()),
+            path_arena: Arc::new(ByteArena::with_capacity(16)),
+            spill_dir: Arc::new(PathBuf::from(".")),
+            pack_decode: decode,
+            pack_io: PackIoLimits::new(decode, 2),
+            adapter_cfg: EngineAdapterConfig::default(),
+            plans: Arc::new(Vec::new()),
+            shard_meta: None,
+            commit_graph: Arc::new(crate::git_scan::commit_graph::CommitGraphIndex::empty()),
+            commit_meta_seen: Arc::new(crate::stdx::AtomicBitSet::empty(1)),
+        }
+    }
+
     fn loose_candidate(path_ref: ByteRef, oid: OidBytes) -> LooseCandidate {
         LooseCandidate {
             oid,
@@ -1897,6 +2000,50 @@ mod tests {
                 path_ref,
             },
         }
+    }
+
+    #[test]
+    fn scheduler_worker_runtime_is_initialized_once() {
+        let shared = scheduler_pack_shared_for_runtime(vec![PathBuf::from("pack-test.pack")]);
+        let mut runtime = None;
+
+        ensure_scheduler_worker_runtime(&mut runtime, &shared).expect("first init should succeed");
+        let first = runtime.as_ref().expect("runtime initialized");
+        let first_external = &first.external as *const PackIo<'static>;
+        let first_adapter = &first.adapter as *const EngineAdapter<'static>;
+
+        ensure_scheduler_worker_runtime(&mut runtime, &shared)
+            .expect("second init should reuse existing runtime");
+        let second = runtime.as_ref().expect("runtime still present");
+        let second_external = &second.external as *const PackIo<'static>;
+        let second_adapter = &second.adapter as *const EngineAdapter<'static>;
+
+        assert_eq!(
+            first_external, second_external,
+            "PackIo instance should be reused per worker"
+        );
+        assert_eq!(
+            first_adapter, second_adapter,
+            "EngineAdapter instance should be reused per worker"
+        );
+    }
+
+    #[test]
+    fn scheduler_worker_runtime_init_preserves_pack_io_error_mapping() {
+        let shared = scheduler_pack_shared_for_runtime(Vec::new());
+        let mut runtime = None;
+
+        let err = ensure_scheduler_worker_runtime(&mut runtime, &shared).expect_err("must fail");
+        assert!(
+            matches!(
+                err,
+                GitScanError::PackIo(PackIoError::PackCountMismatch {
+                    expected: 1,
+                    actual: 0,
+                })
+            ),
+            "expected pack count mismatch from PackIo::from_parts"
+        );
     }
 
     #[test]
