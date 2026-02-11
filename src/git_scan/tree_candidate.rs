@@ -59,11 +59,15 @@ pub struct CandidateContext {
     pub parent_idx: u8,
     /// Type of change: Add or Modify.
     pub change_kind: ChangeKind,
-    /// Context flags. Low 4 bits encode the Git file mode category
-    /// (blob, executable, symlink); upper bits are reserved.
+    /// Context flags (reserved; currently always 0).
+    ///
+    /// Intended for future file-mode or tree-context encoding.
+    /// Included in sort keys and spill records for forward compatibility.
     pub ctx_flags: u16,
-    /// Candidate flags. Bit 0 = path-looks-interesting heuristic;
-    /// remaining bits are reserved for future classification signals.
+    /// Candidate flags — [`PathClass`](super::path_policy::PathClass) bitflags
+    /// produced by [`classify_path`](super::path_policy::classify_path).
+    ///
+    /// Bits: test, vendor, generated, binary, source, unknown.
     pub cand_flags: u16,
     /// Path reference into the shared `ByteArena`.
     pub path_ref: ByteRef,
