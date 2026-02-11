@@ -73,6 +73,10 @@ impl CommitGraphIndex {
     /// [`CommitGraphMem::build_with_identities`]), the resulting index also
     /// carries per-commit identity IDs accessible via
     /// [`identity_ids`](Self::identity_ids).
+    ///
+    /// Unlike [`build`](Self::build), OID lookups here use `CommitGraphMem`'s
+    /// inherent methods which index directly into the SoA arrays and cannot
+    /// fail, so the `Result` is only retained for API symmetry.
     pub fn build_from_mem(cg: &CommitGraphMem) -> Result<Self, CommitPlanError> {
         let count = cg.num_commits() as usize;
         let mut commit_oids = Vec::with_capacity(count);

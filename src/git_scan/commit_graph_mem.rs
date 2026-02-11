@@ -255,22 +255,29 @@ impl CommitGraphMem {
     /// The identity data is permuted to match the deterministic
     /// `(generation, oid)` sort order applied during graph construction.
     ///
-    /// # Panics
-    /// Panics (debug) if `commits.len() != identity_ids.len()`.
+    /// # Errors
+    /// Returns [`CommitPlanError::IdentityLengthMismatch`] if
+    /// `commits.len() != identity_ids.len()`.
     pub fn build_with_identities(
         commits: Vec<LoadedCommit>,
         identity_ids: Vec<CommitIdentityIds>,
         format: ObjectFormat,
     ) -> Result<Self, CommitPlanError> {
-        debug_assert_eq!(
-            commits.len(),
-            identity_ids.len(),
-            "identity_ids must be 1:1 with commits"
-        );
+        if commits.len() != identity_ids.len() {
+            return Err(CommitPlanError::IdentityLengthMismatch {
+                commits: commits.len(),
+                identity_ids: identity_ids.len(),
+            });
+        }
 
         // Capture original OIDs before build() consumes commits.
         let original_oids: Vec<OidBytes> = commits.iter().map(|c| c.oid).collect();
         let mut graph = Self::build(commits, format)?;
+
+        // Empty graphs have no identity data to permute.
+        if original_oids.is_empty() {
+            return Ok(graph);
+        }
 
         // Apply the same (generation, oid) permutation to identity data.
         let n = original_oids.len();
@@ -662,12 +669,28 @@ mod tests {
     }
 
     #[test]
-    fn build_with_identities_empty() {
+    fn build_with_identities_empty_has_no_identity_data() {
         let graph =
             CommitGraphMem::build_with_identities(vec![], vec![], ObjectFormat::Sha1).unwrap();
         assert_eq!(graph.num_commits(), 0);
-        // Empty build still sets identity_ids to None (no data to permute).
-        // This is fine: has_identity_data() returns false for empty graphs.
+        assert!(
+            !graph.has_identity_data(),
+            "empty graph should not claim to have identity data"
+        );
+    }
+
+    #[test]
+    fn build_with_identities_mismatched_lengths_returns_error() {
+        let c1 = make_commit([1; 20], [11; 20], &[], 1000);
+        let result = CommitGraphMem::build_with_identities(
+            vec![c1],
+            vec![], // 1 commit but 0 identity IDs
+            ObjectFormat::Sha1,
+        );
+        assert!(
+            result.is_err(),
+            "mismatched commits/identity_ids lengths should return Err"
+        );
     }
 
     #[test]

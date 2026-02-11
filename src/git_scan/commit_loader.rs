@@ -44,6 +44,7 @@ use std::path::PathBuf;
 
 use memmap2::Mmap;
 
+use super::byte_arena::ByteRef;
 use super::commit_parse::{parse_commit, CommitParseLimits};
 use super::identity_intern::{CommitIdentityIds, IdentityInterner, SENTINEL_ID};
 use super::identity_parse::{parse_author_identity, parse_committer_identity};
@@ -96,6 +97,12 @@ pub enum CommitLoadError {
         offset: u64,
         depth: u8,
     },
+    /// Identity parsed successfully but could not be interned.
+    IdentityInternError {
+        oid: OidBytes,
+        field: &'static str,
+        reason: &'static str,
+    },
 }
 
 impl std::fmt::Display for CommitLoadError {
@@ -139,6 +146,12 @@ impl std::fmt::Display for CommitLoadError {
                 write!(
                     f,
                     "pack {pack_id} offset {offset}: delta chain depth {depth} exceeded"
+                )
+            }
+            Self::IdentityInternError { oid, field, reason } => {
+                write!(
+                    f,
+                    "commit {oid} identity interning failed for {field}: {reason}"
                 )
             }
         }
@@ -297,7 +310,8 @@ pub fn load_commits_from_tips_with_loose_dirs(
 /// `Vec<CommitIdentityIds>` aligned 1:1 with the commit list.
 ///
 /// When identity parsing fails for a commit (malformed header), the identity
-/// IDs are set to [`SENTINEL_ID`].
+/// IDs are set to [`SENTINEL_ID`]. If parsing succeeds but interning fails,
+/// loading returns `CommitLoadError`.
 #[allow(clippy::too_many_arguments)]
 pub fn load_commits_with_identities(
     tips: &[OidBytes],
@@ -390,6 +404,12 @@ fn find_pack_file(name: &[u8], pack_dirs: &[PathBuf]) -> Result<PathBuf, CommitL
     )))
 }
 
+/// Derives loose object directories from pack file paths.
+///
+/// Walks each pack path up two levels (`…/objects/pack/foo.pack` →
+/// `…/objects/`) to locate the parent objects directory, deduplicating
+/// along the way. This is a best-effort heuristic for when explicit
+/// loose dirs are not available.
 fn derive_loose_dirs_from_pack_paths(pack_paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     for pack_path in pack_paths {
@@ -459,6 +479,8 @@ impl<'m, 'p, 'l> CommitLoader<'m, 'p, 'l> {
         })
     }
 
+    /// Runs the BFS traversal from `tips`, returning loaded commits in
+    /// discovery order. See module docs for the full algorithm.
     fn load_from_tips(
         &mut self,
         tips: &[OidBytes],
@@ -506,6 +528,8 @@ impl<'m, 'p, 'l> CommitLoader<'m, 'p, 'l> {
         Ok(commits)
     }
 
+    /// BFS traversal with identity enrichment. Returns commits and a
+    /// parallel `Vec<CommitIdentityIds>` aligned 1:1 with the commit list.
     fn load_from_tips_with_identities(
         &mut self,
         tips: &[OidBytes],
@@ -594,6 +618,7 @@ impl<'m, 'p, 'l> CommitLoader<'m, 'p, 'l> {
     /// author/committer identity via [`parse_author_identity`] and
     /// [`parse_committer_identity`]. The identity strings are interned into
     /// `interner`; on parse failure, fields default to [`SENTINEL_ID`].
+    /// Interner failures return `CommitLoadError::IdentityInternError`.
     fn load_commit_with_identity(
         &mut self,
         oid: &OidBytes,
@@ -614,7 +639,7 @@ impl<'m, 'p, 'l> CommitLoader<'m, 'p, 'l> {
         }
 
         // Extract identity from raw commit bytes before parsing consumes structure.
-        let ids = intern_commit_identities(&data, interner);
+        let ids = intern_commit_identities(&data, interner, *oid)?;
 
         let parsed = parse_commit(&data, self.format, &self.parse_limits).map_err(|e| {
             CommitLoadError::ParseError {
@@ -819,6 +844,8 @@ impl<'m, 'p, 'l> CommitLoader<'m, 'p, 'l> {
         }
     }
 
+    /// Memory-maps and caches the pack file for `pack_id` if not already
+    /// loaded. Subsequent calls for the same `pack_id` are no-ops.
     fn ensure_pack_loaded(&mut self, pack_id: u16) -> Result<(), CommitLoadError> {
         let idx = pack_id as usize;
         if idx >= self.pack_cache.len() {
@@ -913,32 +940,62 @@ fn parse_decimal(bytes: &[u8]) -> Option<u64> {
 /// Makes a single pass over the commit header (~200 bytes) to locate the
 /// `author` and `committer` lines, then interns the name/email strings.
 /// On parse failure (malformed header), the corresponding fields are set
-/// to [`SENTINEL_ID`].
-fn intern_commit_identities(data: &[u8], interner: &mut IdentityInterner) -> CommitIdentityIds {
+/// to [`SENTINEL_ID`]. If parsing succeeds but interning fails, returns
+/// `CommitLoadError::IdentityInternError`.
+fn intern_commit_identities(
+    data: &[u8],
+    interner: &mut IdentityInterner,
+    oid: OidBytes,
+) -> Result<CommitIdentityIds, CommitLoadError> {
+    #[inline]
+    fn intern_field(
+        interner: &mut IdentityInterner,
+        bytes: &[u8],
+        oid: OidBytes,
+        field: &'static str,
+    ) -> Result<u32, CommitLoadError> {
+        if let Some(id) = interner.intern(bytes) {
+            return Ok(id);
+        }
+
+        // `IdentityInterner::intern` only fails for oversized fields or arena
+        // exhaustion. Treat both as hard errors so parse-failure sentinel use
+        // remains unambiguous.
+        let reason = if bytes.len() > ByteRef::MAX_LEN as usize {
+            "too_long"
+        } else {
+            "arena_full"
+        };
+
+        Err(CommitLoadError::IdentityInternError { oid, field, reason })
+    }
+
     let (author_name, author_email) = match parse_author_identity(data) {
         Some(raw) => (
-            interner.intern_or_sentinel(raw.name),
-            interner.intern_or_sentinel(raw.email),
+            intern_field(interner, raw.name, oid, "author_name")?,
+            intern_field(interner, raw.email, oid, "author_email")?,
         ),
         None => (SENTINEL_ID, SENTINEL_ID),
     };
 
     let (committer_name, committer_email) = match parse_committer_identity(data) {
         Some(raw) => (
-            interner.intern_or_sentinel(raw.name),
-            interner.intern_or_sentinel(raw.email),
+            intern_field(interner, raw.name, oid, "committer_name")?,
+            intern_field(interner, raw.email, oid, "committer_email")?,
         ),
         None => (SENTINEL_ID, SENTINEL_ID),
     };
 
-    CommitIdentityIds {
+    Ok(CommitIdentityIds {
         author_name,
         author_email,
         committer_name,
         committer_email,
-    }
+    })
 }
 
+/// Converts an OID to its lowercase hex representation for loose-object
+/// path construction (`ab/cdef…`).
 fn oid_to_hex(oid: &OidBytes) -> String {
     let mut out = String::with_capacity(oid.len() as usize * 2);
     for &byte in oid.as_slice() {
@@ -1137,6 +1194,66 @@ mod tests {
         oid[0] = byte;
         oid[19] = byte ^ 0x5a;
         OidBytes::sha1(oid)
+    }
+
+    fn make_commit_bytes(
+        author_name: &[u8],
+        author_email: &[u8],
+        committer_name: &[u8],
+        committer_email: &[u8],
+    ) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(256);
+        buf.extend_from_slice(b"tree ");
+        buf.extend_from_slice(&[b'a'; 40]);
+        buf.push(b'\n');
+        buf.extend_from_slice(b"author ");
+        buf.extend_from_slice(author_name);
+        buf.extend_from_slice(b" <");
+        buf.extend_from_slice(author_email);
+        buf.extend_from_slice(b"> 1700000000 +0000\n");
+        buf.extend_from_slice(b"committer ");
+        buf.extend_from_slice(committer_name);
+        buf.extend_from_slice(b" <");
+        buf.extend_from_slice(committer_email);
+        buf.extend_from_slice(b"> 1700000000 +0000\n");
+        buf.push(b'\n');
+        buf.extend_from_slice(b"commit message\n");
+        buf
+    }
+
+    #[test]
+    fn intern_commit_identities_interner_failure_is_error_parse_failure_is_sentinel() {
+        let valid = make_commit_bytes(b"Alice", b"alice@example.com", b"Bob", b"bob@example.com");
+        assert!(parse_author_identity(&valid).is_some());
+        assert!(parse_committer_identity(&valid).is_some());
+
+        // With no interner capacity, this must be an error (never sentinel).
+        let oid = test_oid(0xA1);
+        let mut exhausted = IdentityInterner::with_capacity(0, 0);
+        let err = intern_commit_identities(&valid, &mut exhausted, oid)
+            .expect_err("interner failure must be a hard error");
+        match err {
+            CommitLoadError::IdentityInternError {
+                oid: err_oid,
+                field,
+                reason,
+            } => {
+                assert_eq!(err_oid, oid);
+                assert_eq!(field, "author_name");
+                assert_eq!(reason, "arena_full");
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+
+        // Parse failures still map to sentinel IDs even with zero interner
+        // capacity, so ambiguity is impossible.
+        let malformed = b"tree aaaa\n\ncommit body\n";
+        let mut tiny = IdentityInterner::with_capacity(0, 0);
+        let ids = intern_commit_identities(malformed, &mut tiny, test_oid(0xA2)).unwrap();
+        assert_eq!(ids.author_name, SENTINEL_ID);
+        assert_eq!(ids.author_email, SENTINEL_ID);
+        assert_eq!(ids.committer_name, SENTINEL_ID);
+        assert_eq!(ids.committer_email, SENTINEL_ID);
     }
 
     #[test]

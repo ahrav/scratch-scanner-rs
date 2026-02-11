@@ -29,12 +29,26 @@ pub const SENTINEL_ID: u32 = u32::MAX;
 /// committer email. Each ID indexes into an [`IdentityInterner`].
 /// [`SENTINEL_ID`] indicates a parse failure for that field.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommitIdentityIds {
     pub author_name: u32,
     pub author_email: u32,
     pub committer_name: u32,
     pub committer_email: u32,
+}
+
+impl Default for CommitIdentityIds {
+    /// All fields default to [`SENTINEL_ID`] (unset/parse-failure).
+    ///
+    /// This prevents confusion with intern ID 0, which is a valid entry.
+    fn default() -> Self {
+        Self {
+            author_name: SENTINEL_ID,
+            author_email: SENTINEL_ID,
+            committer_name: SENTINEL_ID,
+            committer_email: SENTINEL_ID,
+        }
+    }
 }
 
 // Compile-time layout assertions.
@@ -86,7 +100,9 @@ impl IdentityInterner {
     /// Interns a byte slice, returning its ID.
     ///
     /// Returns the existing ID on dedup hit. Returns `None` if the arena
-    /// is full or the slice exceeds `ByteRef::MAX_LEN`.
+    /// is full, the slice exceeds `ByteRef::MAX_LEN`, or the intern table
+    /// has reached `u32::MAX` entries (which would collide with
+    /// [`SENTINEL_ID`]).
     pub fn intern(&mut self, bytes: &[u8]) -> Option<u32> {
         let hash = self.hash_bytes(bytes);
 
@@ -139,7 +155,8 @@ impl IdentityInterner {
         self.refs.is_empty()
     }
 
-    /// Iterates over all interned entries as `(id, bytes)` pairs.
+    /// Iterates over all interned entries as `(id, bytes)` pairs in
+    /// insertion order (monotonically increasing IDs, `0..len()`).
     pub fn iter(&self) -> impl Iterator<Item = (u32, &[u8])> {
         self.refs
             .iter()
@@ -267,12 +284,12 @@ mod tests {
     }
 
     #[test]
-    fn commit_identity_ids_default() {
+    fn commit_identity_ids_default_uses_sentinel() {
         let ids = CommitIdentityIds::default();
-        assert_eq!(ids.author_name, 0);
-        assert_eq!(ids.author_email, 0);
-        assert_eq!(ids.committer_name, 0);
-        assert_eq!(ids.committer_email, 0);
+        assert_eq!(ids.author_name, SENTINEL_ID);
+        assert_eq!(ids.author_email, SENTINEL_ID);
+        assert_eq!(ids.committer_name, SENTINEL_ID);
+        assert_eq!(ids.committer_email, SENTINEL_ID);
     }
 
     #[test]

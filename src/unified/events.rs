@@ -26,7 +26,7 @@ use super::json_write::{
     write_f64, write_json_bytes, write_json_str, write_oid_hex, write_source, write_u64,
 };
 use super::SourceKind;
-use crate::git_scan::identity_intern::CommitIdentityIds;
+use crate::git_scan::identity_intern::{CommitIdentityIds, SENTINEL_ID};
 use crate::git_scan::object_id::OidBytes;
 
 thread_local! {
@@ -327,6 +327,20 @@ pub(crate) fn encode_diagnostic(d: &DiagnosticEvent<'_>, buf: &mut Vec<u8>) {
     buf.extend_from_slice(b"\"}");
 }
 
+/// Writes a single identity field, emitting `null` for [`SENTINEL_ID`].
+#[inline]
+fn write_identity_field(name: &[u8], id: u32, buf: &mut Vec<u8>) {
+    buf.push(b',');
+    buf.push(b'"');
+    buf.extend_from_slice(name);
+    buf.extend_from_slice(b"\":");
+    if id == SENTINEL_ID {
+        buf.extend_from_slice(b"null");
+    } else {
+        write_u64(id as u64, buf);
+    }
+}
+
 /// Append a JSONL `commit_meta` object to `buf` (no trailing newline).
 pub(crate) fn encode_commit_meta(m: &CommitMetaEvent, buf: &mut Vec<u8>) {
     buf.extend_from_slice(b"{\"type\":\"commit_meta\",\"commit_id\":");
@@ -336,14 +350,10 @@ pub(crate) fn encode_commit_meta(m: &CommitMetaEvent, buf: &mut Vec<u8>) {
     buf.extend_from_slice(b"\",\"timestamp\":");
     write_u64(m.timestamp, buf);
     if let Some(ref ids) = m.identity {
-        buf.extend_from_slice(b",\"author_name_id\":");
-        write_u64(ids.author_name as u64, buf);
-        buf.extend_from_slice(b",\"author_email_id\":");
-        write_u64(ids.author_email as u64, buf);
-        buf.extend_from_slice(b",\"committer_name_id\":");
-        write_u64(ids.committer_name as u64, buf);
-        buf.extend_from_slice(b",\"committer_email_id\":");
-        write_u64(ids.committer_email as u64, buf);
+        write_identity_field(b"author_name_id", ids.author_name, buf);
+        write_identity_field(b"author_email_id", ids.author_email, buf);
+        write_identity_field(b"committer_name_id", ids.committer_name, buf);
+        write_identity_field(b"committer_email_id", ids.committer_email, buf);
     }
     buf.push(b'}');
 }
@@ -703,6 +713,33 @@ mod tests {
         assert!(line.contains("\"author_email_id\":1"));
         assert!(line.contains("\"committer_name_id\":2"));
         assert!(line.contains("\"committer_email_id\":3"));
+    }
+
+    #[test]
+    fn commit_meta_jsonl_sentinel_id_omitted() {
+        let oid = OidBytes::sha1([0xcc; 20]);
+        let ids = CommitIdentityIds {
+            author_name: 5,
+            author_email: SENTINEL_ID,
+            committer_name: 6,
+            committer_email: SENTINEL_ID,
+        };
+        let line = collect_jsonl(ScanEvent::CommitMeta(CommitMetaEvent {
+            commit_id: 99,
+            commit_oid: oid,
+            timestamp: 3_000,
+            identity: Some(ids),
+        }));
+        // Valid IDs should appear normally.
+        assert!(line.contains("\"author_name_id\":5"));
+        assert!(line.contains("\"committer_name_id\":6"));
+        // SENTINEL_ID fields must be emitted as null, not raw u32::MAX.
+        assert!(
+            !line.contains("4294967295"),
+            "SENTINEL_ID must not be emitted as raw u32::MAX in JSONL; got: {line}"
+        );
+        assert!(line.contains("\"author_email_id\":null"));
+        assert!(line.contains("\"committer_email_id\":null"));
     }
 
     #[test]

@@ -66,10 +66,9 @@ pub struct CommitMetaContext {
     /// Identity interner for resolving intern IDs to raw name/email bytes.
     ///
     /// Present when identity enrichment is enabled (`--author-attribution`).
-    /// Used by the runner for upfront dictionary emission; carried here so
-    /// `EngineAdapter` instances in the scheduler can forward it to their
-    /// `CommitMetaContext` without a separate plumbing path. Currently only
-    /// read by the runner, not by the adapter itself.
+    /// The runner reads this for upfront `IdentityDictionary` emission;
+    /// it is carried here to avoid a separate plumbing path through the
+    /// scheduler into per-worker adapter construction.
     pub identity_interner: Option<Arc<IdentityInterner>>,
 }
 
@@ -231,6 +230,12 @@ impl<'a> EngineAdapter<'a> {
     ///
     /// Findings are streamed as JSONL events during scanning (in addition to
     /// being accumulated in `ScannedBlobs` for persistence).
+    ///
+    /// # Panics (debug only)
+    ///
+    /// Debug-asserts that `ctx.commit_meta_seen.bit_length()` is at least
+    /// `ctx.commit_graph_index.len()`. A mismatched bitset would silently
+    /// skip `CommitMeta` emission for high-position commits.
     #[must_use]
     pub fn new_with_event_sink(
         engine: &'a Engine,
@@ -483,6 +488,12 @@ impl<'a> EngineAdapter<'a> {
 }
 
 impl PackObjectSink for EngineAdapter<'_> {
+    /// Scans a pack-sourced blob, streams findings to the event sink, and
+    /// records results in the adapter arena.
+    ///
+    /// Follows the same scan → stream → record pipeline as
+    /// [`emit_loose`](Self::emit_loose); the only difference is the candidate
+    /// type (`PackCandidate` carries a pack offset).
     fn emit(
         &mut self,
         candidate: &PackCandidate,

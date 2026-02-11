@@ -139,6 +139,8 @@ pub enum CommitPlanError {
     TooManyParents { count: usize, max: usize },
     /// Topological ordering could not process all commits (cycle or corruption).
     TopoSortCycle { remaining: u32 },
+    /// Identity-ID vector length does not match commit count.
+    IdentityLengthMismatch { commits: usize, identity_ids: usize },
 }
 
 impl fmt::Display for CommitPlanError {
@@ -165,6 +167,15 @@ impl fmt::Display for CommitPlanError {
                 write!(
                     f,
                     "topological ordering failed: {remaining} commits unresolved"
+                )
+            }
+            Self::IdentityLengthMismatch {
+                commits,
+                identity_ids,
+            } => {
+                write!(
+                    f,
+                    "identity_ids length ({identity_ids}) does not match commits ({commits})"
                 )
             }
         }
