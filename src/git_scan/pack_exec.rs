@@ -1481,7 +1481,7 @@ fn finalize_decoded_delta(
     storage: DecodedStorage,
     out_len: usize,
     cache: &mut PackCache,
-    result_buf: &mut Vec<u8>,
+    result_buf: &mut [u8],
     stats: &mut PackExecStats,
 ) -> DecodedObject {
     if matches!(&storage, DecodedStorage::Spill(_)) {
@@ -1513,6 +1513,7 @@ fn finalize_decoded_delta(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_delta_against_base(
     pack: &PackFile<'_>,
     data_start: u64,
@@ -2010,6 +2011,7 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
 ///
 /// `inflate_buf` is used as scratch for the raw delta payload; it may be
 /// overwritten regardless of the outcome.
+#[allow(clippy::too_many_arguments)]
 fn decode_delta_output(
     pack: &PackFile<'_>,
     data_start: u64,
@@ -2124,12 +2126,12 @@ fn unwind_delta_stack(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn load_external_root_base<'b, B: ExternalBaseProvider>(
+fn load_external_root_base<B: ExternalBaseProvider>(
     oid: OidBytes,
     external: &mut B,
     limits: &PackDecodeLimits,
     spill_dir: &Path,
-    base_buf: &'b mut Vec<u8>,
+    base_buf: &mut Vec<u8>,
     hot_stats: &mut PackExecHotStats,
     stats: &mut PackExecStats,
 ) -> Result<(ObjectKind, Option<BlobSpill>), SkipReason> {

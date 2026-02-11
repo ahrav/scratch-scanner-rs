@@ -505,11 +505,15 @@ where
     Ok((buckets, pack_ids))
 }
 
+/// Per-pack sparse bucket: each index corresponds to a pack id and contains
+/// `Some(candidates)` only for packs that have at least one candidate.
+type SparseBuckets = Vec<Option<Vec<PackCandidate>>>;
+
 /// Sparse variant of [`bucket_pack_candidates`] that only allocates touched buckets.
 fn bucket_pack_candidates_sparse<I>(
     candidates: I,
     pack_count: usize,
-) -> Result<(Vec<Option<Vec<PackCandidate>>>, Vec<u16>), PackPlanError>
+) -> Result<(SparseBuckets, Vec<u16>), PackPlanError>
 where
     I: IntoIterator<Item = PackCandidate>,
 {
