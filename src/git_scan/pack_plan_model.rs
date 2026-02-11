@@ -49,6 +49,26 @@ pub struct DeltaDep {
     pub kind: DeltaKind,
     /// Base location (internal offset or external OID).
     pub base: BaseLoc,
+    /// Byte offset where this delta entry's zlib payload starts.
+    ///
+    /// Populated by `pack_plan` from parsed entry headers. Synthetic plans
+    /// may leave this as `0`, in which case executors should fall back to
+    /// parsing the header at execution time.
+    pub data_start: u64,
+    /// Declared uncompressed delta payload size from the pack entry header.
+    ///
+    /// Populated by `pack_plan` from parsed entry headers. Synthetic plans
+    /// may leave this as `0`.
+    pub delta_size: u64,
+}
+
+impl DeltaDep {
+    /// Returns true when plan-time header metadata is available.
+    #[inline]
+    #[must_use]
+    pub const fn has_header_meta(self) -> bool {
+        self.data_start != 0
+    }
 }
 
 /// Candidate index paired with its pack offset.

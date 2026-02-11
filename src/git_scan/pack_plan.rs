@@ -19,8 +19,10 @@
 //! - `candidate_offsets` is sorted by offset (ties by candidate index).
 //! - `exec_order` indices refer to `need_offsets`.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::fmt;
+
+use ahash::{AHashMap, AHashSet};
 
 use super::midx::MidxView;
 use super::midx_error::MidxError;
@@ -230,10 +232,14 @@ enum ParsedEntry {
     NonDelta,
     Ofs {
         base_offset: u64,
+        data_start: u64,
+        delta_size: u64,
     },
     Ref {
         base_oid: OidBytes,
         base: Option<(u16, u64)>,
+        data_start: u64,
+        delta_size: u64,
     },
 }
 
@@ -268,7 +274,7 @@ pub fn build_pack_plans<'a, R: OidResolver>(
         return Ok(Vec::new());
     }
 
-    let (mut buckets, pack_ids) = bucket_pack_candidates(candidates.drain(..), packs.len())?;
+    let (mut buckets, pack_ids) = bucket_pack_candidates_sparse(candidates.drain(..), packs.len())?;
 
     let mut plans = Vec::with_capacity(pack_ids.len());
     for pack_id in pack_ids {
@@ -279,7 +285,7 @@ pub fn build_pack_plans<'a, R: OidResolver>(
                 pack_count: packs.len(),
             },
         )?;
-        let pack_candidates = std::mem::take(&mut buckets[pack_idx]);
+        let pack_candidates = buckets[pack_idx].take().unwrap_or_default();
 
         let plan = build_pack_plan_for_pack(pack_id, pack, pack_candidates, resolver, config)?;
         plans.push(plan);
@@ -303,7 +309,8 @@ pub fn build_pack_plans<'a, R: OidResolver>(
 /// - Pack corruption or resolver failures return `PackPlanError`.
 ///
 /// # Complexity
-/// - `O(N log N)` for `N` candidates due to sorting and hash lookups.
+/// - `O(N log N + E log N)` where `N` is unique candidate offsets and `E`
+///   is newly discovered pack-local base offsets.
 pub(crate) fn build_pack_plan_for_pack<'a, R: OidResolver>(
     pack_id: u16,
     pack: &PackView<'a>,
@@ -335,8 +342,8 @@ pub(crate) fn build_pack_plan_for_pack<'a, R: OidResolver>(
 
     let candidate_span = span_from_sorted(&unique_candidate_offsets);
 
-    let mut entry_cache: HashMap<u64, ParsedEntry> =
-        HashMap::with_capacity(unique_candidate_offsets.len());
+    let mut entry_cache: AHashMap<u64, ParsedEntry> =
+        AHashMap::with_capacity(unique_candidate_offsets.len());
 
     let mut base_lookup_count = 0usize;
     for &offset in &unique_candidate_offsets {
@@ -353,16 +360,15 @@ pub(crate) fn build_pack_plan_for_pack<'a, R: OidResolver>(
         )?;
     }
 
-    let mut need_set: HashSet<u64> = HashSet::with_capacity(unique_candidate_offsets.len());
-    for &offset in &unique_candidate_offsets {
-        need_set.insert(offset);
-    }
-    if need_set.len() > config.max_worklist_entries {
+    let mut need_count = unique_candidate_offsets.len();
+    if need_count > config.max_worklist_entries {
         return Err(PackPlanError::WorklistLimitExceeded {
             limit: config.max_worklist_entries,
-            observed: need_set.len(),
+            observed: need_count,
         });
     }
+    let mut discovered_base_offsets: AHashSet<u64> =
+        AHashSet::with_capacity(unique_candidate_offsets.len());
 
     let mut worklist: VecDeque<WorkItem> = unique_candidate_offsets
         .iter()
@@ -386,47 +392,48 @@ pub(crate) fn build_pack_plan_for_pack<'a, R: OidResolver>(
 
         match entry {
             ParsedEntry::NonDelta => {}
-            ParsedEntry::Ofs { base_offset } => {
+            ParsedEntry::Ofs { base_offset, .. } => {
                 if base_offset == item.offset {
                     return Err(PackPlanError::DeltaCycleDetected {
                         pack_id,
                         offset: base_offset,
                     });
                 }
-                if can_expand && need_set.insert(base_offset) {
-                    if need_set.len() > config.max_worklist_entries {
-                        return Err(PackPlanError::WorklistLimitExceeded {
-                            limit: config.max_worklist_entries,
-                            observed: need_set.len(),
-                        });
-                    }
-                    worklist.push_back(WorkItem {
-                        offset: base_offset,
-                        depth: next_depth,
-                    });
+                if can_expand {
+                    enqueue_pack_local_base(
+                        base_offset,
+                        next_depth,
+                        &unique_candidate_offsets,
+                        &mut discovered_base_offsets,
+                        &mut worklist,
+                        &mut need_count,
+                        config.max_worklist_entries,
+                    )?;
                 }
             }
             ParsedEntry::Ref { base, .. } => {
                 if let Some((base_pack, base_offset)) = base {
-                    if base_pack == pack_id && can_expand && need_set.insert(base_offset) {
-                        if need_set.len() > config.max_worklist_entries {
-                            return Err(PackPlanError::WorklistLimitExceeded {
-                                limit: config.max_worklist_entries,
-                                observed: need_set.len(),
-                            });
-                        }
-                        worklist.push_back(WorkItem {
-                            offset: base_offset,
-                            depth: next_depth,
-                        });
+                    if base_pack == pack_id && can_expand {
+                        enqueue_pack_local_base(
+                            base_offset,
+                            next_depth,
+                            &unique_candidate_offsets,
+                            &mut discovered_base_offsets,
+                            &mut worklist,
+                            &mut need_count,
+                            config.max_worklist_entries,
+                        )?;
                     }
                 }
             }
         }
     }
 
-    let mut need_offsets: Vec<u64> = need_set.into_iter().collect();
-    need_offsets.sort_unstable();
+    let mut need_offsets = unique_candidate_offsets;
+    if !discovered_base_offsets.is_empty() {
+        need_offsets.extend(discovered_base_offsets);
+        need_offsets.sort_unstable();
+    }
     debug_assert!(is_sorted_unique(&need_offsets));
     debug_assert!(
         candidate_offsets
@@ -490,7 +497,23 @@ pub(crate) fn bucket_pack_candidates<I>(
 where
     I: IntoIterator<Item = PackCandidate>,
 {
-    let mut buckets: Vec<Vec<PackCandidate>> = vec![Vec::new(); pack_count];
+    let (buckets_sparse, pack_ids) = bucket_pack_candidates_sparse(candidates, pack_count)?;
+    let buckets = buckets_sparse
+        .into_iter()
+        .map(|bucket| bucket.unwrap_or_default())
+        .collect();
+    Ok((buckets, pack_ids))
+}
+
+/// Sparse variant of [`bucket_pack_candidates`] that only allocates touched buckets.
+fn bucket_pack_candidates_sparse<I>(
+    candidates: I,
+    pack_count: usize,
+) -> Result<(Vec<Option<Vec<PackCandidate>>>, Vec<u16>), PackPlanError>
+where
+    I: IntoIterator<Item = PackCandidate>,
+{
+    let mut buckets: Vec<Option<Vec<PackCandidate>>> = vec![None; pack_count];
     let mut pack_ids: Vec<u16> = Vec::new();
 
     for cand in candidates {
@@ -501,10 +524,15 @@ where
                 pack_count,
             });
         }
-        if buckets[pack_idx].is_empty() {
-            pack_ids.push(cand.pack_id);
+        let pack_id = cand.pack_id;
+        let bucket_opt = &mut buckets[pack_idx];
+        if bucket_opt.is_none() {
+            pack_ids.push(pack_id);
+            *bucket_opt = Some(Vec::new());
         }
-        buckets[pack_idx].push(cand);
+        if let Some(bucket) = bucket_opt.as_mut() {
+            bucket.push(cand);
+        }
     }
 
     pack_ids.sort_unstable();
@@ -520,7 +548,7 @@ fn parse_entry<R: OidResolver>(
     offset: u64,
     pack: &PackView<'_>,
     resolver: &R,
-    cache: &mut HashMap<u64, ParsedEntry>,
+    cache: &mut AHashMap<u64, ParsedEntry>,
     config: &PackPlanConfig,
     pack_id: u16,
     is_candidate: bool,
@@ -541,7 +569,11 @@ fn parse_entry<R: OidResolver>(
 
     let parsed = match header.kind {
         EntryKind::NonDelta { .. } => ParsedEntry::NonDelta,
-        EntryKind::OfsDelta { base_offset } => ParsedEntry::Ofs { base_offset },
+        EntryKind::OfsDelta { base_offset } => ParsedEntry::Ofs {
+            base_offset,
+            data_start: header.data_start as u64,
+            delta_size: header.size,
+        },
         EntryKind::RefDelta { base_oid } => {
             if *base_lookup_count >= config.max_base_lookups {
                 return Err(PackPlanError::BaseLookupLimitExceeded {
@@ -551,7 +583,12 @@ fn parse_entry<R: OidResolver>(
             }
             *base_lookup_count += 1;
             let base = resolver.resolve(&base_oid)?;
-            ParsedEntry::Ref { base_oid, base }
+            ParsedEntry::Ref {
+                base_oid,
+                base,
+                data_start: header.data_start as u64,
+                delta_size: header.size,
+            }
         }
     };
 
@@ -569,7 +606,7 @@ fn parse_entry<R: OidResolver>(
 /// are recorded as `BaseLoc::External`.
 fn build_delta_deps(
     need_offsets: &[u64],
-    cache: &HashMap<u64, ParsedEntry>,
+    cache: &AHashMap<u64, ParsedEntry>,
     pack_id: u16,
 ) -> Vec<DeltaDep> {
     let mut deps = Vec::new();
@@ -579,12 +616,23 @@ fn build_delta_deps(
         };
         match *entry {
             ParsedEntry::NonDelta => {}
-            ParsedEntry::Ofs { base_offset } => deps.push(DeltaDep {
+            ParsedEntry::Ofs {
+                base_offset,
+                data_start,
+                delta_size,
+            } => deps.push(DeltaDep {
                 offset,
                 kind: DeltaKind::Ofs,
                 base: BaseLoc::Offset(base_offset),
+                data_start,
+                delta_size,
             }),
-            ParsedEntry::Ref { base_oid, base } => {
+            ParsedEntry::Ref {
+                base_oid,
+                base,
+                data_start,
+                delta_size,
+            } => {
                 let base_loc = match base {
                     Some((base_pack, base_offset)) if base_pack == pack_id => {
                         BaseLoc::Offset(base_offset)
@@ -595,6 +643,8 @@ fn build_delta_deps(
                     offset,
                     kind: DeltaKind::Ref,
                     base: base_loc,
+                    data_start,
+                    delta_size,
                 });
             }
         }
@@ -655,13 +705,15 @@ pub struct ExecOrderResult {
 ///
 /// # Algorithm
 ///
-/// 1. **Adjacency**: Build forward edges (base→dependents) and indegree from
-///    all pack-local delta deps (both forward and backward).
-/// 2. **Descendant counts**: BFS from leaves upward to compute subtree sizes.
-/// 3. **DFS with LIFO stack**: Thin subtrees first (ascending `desc_count`),
+/// 1. **Early fast path**: If no pack-local deps exist, return `None` before
+///    graph allocation.
+/// 2. **CSR adjacency**: Build compact forward/reverse CSR edge lists from
+///    sorted offsets.
+/// 3. **Descendant counts**: BFS from leaves upward to compute subtree sizes.
+/// 4. **DFS with LIFO stack**: Thin subtrees first (ascending `desc_count`),
 ///    pushed in reverse so thinnest lands on top. DAG nodes wait until all
 ///    parents are emitted (`dag_remaining` counter).
-/// 4. **Identity check**: If the result is `[0..n]`, return `None`.
+/// 5. **Identity check**: If the result is `[0..n]`, return `None`.
 #[doc(hidden)]
 pub fn build_exec_order(
     need_offsets: &[u64],
@@ -677,32 +729,12 @@ pub fn build_exec_order(
         });
     }
 
-    // Phase 1 — Adjacency: offset_to_idx, edges (base→dependents), indegree.
-    let mut offset_to_idx: HashMap<u64, usize> = HashMap::with_capacity(n);
-    for (idx, &offset) in need_offsets.iter().enumerate() {
-        offset_to_idx.insert(offset, idx);
-    }
-
-    let mut indegree = vec![0u32; n];
-    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); n];
-    let mut has_deps = false;
-
-    for dep in delta_deps {
-        let BaseLoc::Offset(base_offset) = dep.base else {
-            continue;
-        };
-        let Some(&base_idx) = offset_to_idx.get(&base_offset) else {
-            continue;
-        };
-        let Some(&dep_idx) = offset_to_idx.get(&dep.offset) else {
-            continue;
-        };
-        has_deps = true;
-        edges[base_idx].push(dep_idx);
-        indegree[dep_idx] = indegree[dep_idx].saturating_add(1);
-    }
-
-    if !has_deps {
+    // Fast path: skip graph setup when there are no pack-local deps.
+    let local_dep_count = delta_deps
+        .iter()
+        .filter(|dep| matches!(dep.base, BaseLoc::Offset(_)))
+        .count();
+    if local_dep_count == 0 {
         return Ok(ExecOrderResult {
             order: None,
             tree_roots: 0,
@@ -710,17 +742,61 @@ pub fn build_exec_order(
         });
     }
 
-    // Phase 2 — Descendant counts: BFS from leaves upward.
-    // Build reverse edges (child→parents) and outdegree for leaf detection.
-    let mut reverse_edges: Vec<Vec<usize>> = vec![Vec::new(); n];
-    let mut outdegree = vec![0u32; n];
-    for (base_idx, children) in edges.iter().enumerate() {
-        outdegree[base_idx] = children.len() as u32;
-        for &child_idx in children {
-            reverse_edges[child_idx].push(base_idx);
-        }
+    // Phase 1 — Local edge extraction and CSR adjacency build.
+    //
+    // We map both dep and base offsets with binary search against
+    // `need_offsets`. This keeps the routine robust even if callers pass
+    // `delta_deps` that are not pre-sorted by offset.
+    let mut local_edges: Vec<(u32, u32)> = Vec::with_capacity(local_dep_count);
+    for dep in delta_deps {
+        let BaseLoc::Offset(base_offset) = dep.base else {
+            continue;
+        };
+        let Ok(dep_idx) = need_offsets.binary_search(&dep.offset) else {
+            continue;
+        };
+        let Ok(base_idx) = need_offsets.binary_search(&base_offset) else {
+            continue;
+        };
+        local_edges.push((base_idx as u32, dep_idx as u32));
     }
 
+    if local_edges.is_empty() {
+        return Ok(ExecOrderResult {
+            order: None,
+            tree_roots: 0,
+            max_depth: 0,
+        });
+    }
+
+    let mut indegree = vec![0u32; n];
+    let mut outdegree = vec![0u32; n];
+    for &(base_idx, dep_idx) in &local_edges {
+        outdegree[base_idx as usize] = outdegree[base_idx as usize].saturating_add(1);
+        indegree[dep_idx as usize] = indegree[dep_idx as usize].saturating_add(1);
+    }
+
+    let forward_starts = build_csr_starts(&outdegree);
+    let reverse_starts = build_csr_starts(&indegree);
+
+    let mut forward_edges = vec![0u32; local_edges.len()];
+    let mut reverse_edges = vec![0u32; local_edges.len()];
+    let mut forward_cursor = forward_starts[..n].to_vec();
+    let mut reverse_cursor = reverse_starts[..n].to_vec();
+    for &(base_idx, dep_idx) in &local_edges {
+        let base = base_idx as usize;
+        let dep = dep_idx as usize;
+
+        let f_slot = forward_cursor[base];
+        forward_edges[f_slot] = dep_idx;
+        forward_cursor[base] += 1;
+
+        let r_slot = reverse_cursor[dep];
+        reverse_edges[r_slot] = base_idx;
+        reverse_cursor[dep] += 1;
+    }
+
+    // Phase 2 — Descendant counts: BFS from leaves upward.
     let mut desc_count = vec![0u32; n];
     let mut leaf_queue: VecDeque<usize> = VecDeque::new();
     let mut remaining_out = outdegree.clone();
@@ -732,7 +808,9 @@ pub fn build_exec_order(
     }
 
     while let Some(idx) = leaf_queue.pop_front() {
-        for &parent in &reverse_edges[idx] {
+        let rev_bounds = csr_row_bounds(&reverse_starts, idx);
+        for &parent_u32 in &reverse_edges[rev_bounds] {
+            let parent = parent_u32 as usize;
             // Propagate: parent gains this node + all its descendants.
             desc_count[parent] = desc_count[parent].saturating_add(desc_count[idx] + 1);
             remaining_out[parent] -= 1;
@@ -745,15 +823,16 @@ pub fn build_exec_order(
     // Compute tree_roots (indegree-0 nodes that have dependents) and max_depth.
     let mut tree_roots = 0u32;
     for idx in 0..n {
-        if indegree[idx] == 0 && !edges[idx].is_empty() {
+        if indegree[idx] == 0 && outdegree[idx] != 0 {
             tree_roots += 1;
         }
     }
 
     // Phase 3 — DFS with explicit LIFO stack.
     // Sort children by ascending desc_count (thin subtrees first).
-    for children in &mut edges {
-        children.sort_unstable_by_key(|&child| desc_count[child]);
+    for idx in 0..n {
+        let bounds = csr_row_bounds(&forward_starts, idx);
+        sort_children_by_desc_count(&mut forward_edges[bounds], &desc_count);
     }
 
     // Collect roots sorted by descending desc_count (largest subtree pushed
@@ -765,21 +844,23 @@ pub fn build_exec_order(
     // A node is only pushed to the stack when dag_remaining hits zero.
     let mut dag_remaining = indegree.clone();
 
-    let mut stack: Vec<usize> = Vec::with_capacity(n);
+    let mut stack: Vec<u32> = Vec::with_capacity(n);
     for &root in &roots {
-        stack.push(root);
+        stack.push(root as u32);
     }
 
     let mut order: Vec<u32> = Vec::with_capacity(n);
-    while let Some(idx) = stack.pop() {
-        order.push(idx as u32);
+    while let Some(idx_u32) = stack.pop() {
+        let idx = idx_u32 as usize;
+        order.push(idx_u32);
         // Push children in reverse order so the thinnest (first after sort)
         // ends up on top of the stack.
-        for i in (0..edges[idx].len()).rev() {
-            let child = edges[idx][i];
+        let bounds = csr_row_bounds(&forward_starts, idx);
+        for i in (bounds.start..bounds.end).rev() {
+            let child = forward_edges[i] as usize;
             dag_remaining[child] -= 1;
             if dag_remaining[child] == 0 {
-                stack.push(child);
+                stack.push(child as u32);
             }
         }
     }
@@ -801,7 +882,9 @@ pub fn build_exec_order(
     let mut max_depth = 0u32;
     for &idx_u32 in &order {
         let idx = idx_u32 as usize;
-        for &child in &edges[idx] {
+        let bounds = csr_row_bounds(&forward_starts, idx);
+        for &child_u32 in &forward_edges[bounds] {
+            let child = child_u32 as usize;
             let child_depth = topo_depth[idx] + 1;
             if child_depth > topo_depth[child] {
                 topo_depth[child] = child_depth;
@@ -823,6 +906,79 @@ pub fn build_exec_order(
     })
 }
 
+#[inline(always)]
+fn enqueue_pack_local_base(
+    base_offset: u64,
+    depth: u8,
+    unique_candidate_offsets: &[u64],
+    discovered_base_offsets: &mut AHashSet<u64>,
+    worklist: &mut VecDeque<WorkItem>,
+    need_count: &mut usize,
+    max_worklist_entries: usize,
+) -> Result<(), PackPlanError> {
+    // Candidate offsets are already in the initial worklist and need set.
+    if unique_candidate_offsets.binary_search(&base_offset).is_ok() {
+        return Ok(());
+    }
+    if discovered_base_offsets.insert(base_offset) {
+        *need_count += 1;
+        if *need_count > max_worklist_entries {
+            return Err(PackPlanError::WorklistLimitExceeded {
+                limit: max_worklist_entries,
+                observed: *need_count,
+            });
+        }
+        worklist.push_back(WorkItem {
+            offset: base_offset,
+            depth,
+        });
+    }
+    Ok(())
+}
+
+#[inline(always)]
+fn build_csr_starts(degree: &[u32]) -> Vec<usize> {
+    let mut starts = Vec::with_capacity(degree.len() + 1);
+    starts.push(0usize);
+    let mut acc = 0usize;
+    for &d in degree {
+        acc += d as usize;
+        starts.push(acc);
+    }
+    starts
+}
+
+#[inline(always)]
+fn csr_row_bounds(starts: &[usize], row: usize) -> std::ops::Range<usize> {
+    starts[row]..starts[row + 1]
+}
+
+#[inline(always)]
+fn sort_children_by_desc_count(children: &mut [u32], desc_count: &[u32]) {
+    match children.len() {
+        0 | 1 => {}
+        2 => {
+            if desc_count[children[0] as usize] > desc_count[children[1] as usize] {
+                children.swap(0, 1);
+            }
+        }
+        3 => {
+            if desc_count[children[0] as usize] > desc_count[children[1] as usize] {
+                children.swap(0, 1);
+            }
+            if desc_count[children[1] as usize] > desc_count[children[2] as usize] {
+                children.swap(1, 2);
+            }
+            if desc_count[children[0] as usize] > desc_count[children[1] as usize] {
+                children.swap(0, 1);
+            }
+        }
+        _ => {
+            children.sort_unstable_by_key(|&child| desc_count[child as usize]);
+        }
+    }
+}
+
 /// Span (last - first) for a sorted offset list.
 fn span_from_sorted(offsets: &[u64]) -> u64 {
     if offsets.is_empty() {
@@ -840,6 +996,7 @@ fn is_sorted_unique(offsets: &[u64]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     /// Shorthand for an OFS_DELTA dependency: `offset` depends on `base`.
     fn ofs_dep(offset: u64, base: u64) -> DeltaDep {
@@ -847,6 +1004,8 @@ mod tests {
             offset,
             kind: DeltaKind::Ofs,
             base: BaseLoc::Offset(base),
+            data_start: 0,
+            delta_size: 0,
         }
     }
 
@@ -856,6 +1015,8 @@ mod tests {
             offset,
             kind: DeltaKind::Ref,
             base: BaseLoc::Offset(base),
+            data_start: 0,
+            delta_size: 0,
         }
     }
 
@@ -925,6 +1086,8 @@ mod tests {
                 base: BaseLoc::External {
                     oid: OidBytes::sha1([0x11; 20]),
                 },
+                data_start: 0,
+                delta_size: 0,
             },
         ];
         let index = build_delta_dep_index(&need_offsets, &deps);
@@ -1015,6 +1178,52 @@ mod tests {
         assert!(result.order.is_none());
         assert_eq!(result.tree_roots, 0);
         assert_eq!(result.max_depth, 0);
+    }
+
+    #[test]
+    fn dfs_returns_none_external_only_deps() {
+        let need_offsets = vec![10, 20, 30];
+        let deps = vec![DeltaDep {
+            offset: 20,
+            kind: DeltaKind::Ref,
+            base: BaseLoc::External {
+                oid: OidBytes::sha1([0xAB; 20]),
+            },
+            data_start: 0,
+            delta_size: 0,
+        }];
+        let result = build_exec_order(&need_offsets, &deps, 0).unwrap();
+        assert!(result.order.is_none());
+        assert_eq!(result.tree_roots, 0);
+        assert_eq!(result.max_depth, 0);
+    }
+
+    #[test]
+    fn dfs_returns_none_when_local_base_missing_from_need_offsets() {
+        let need_offsets = vec![10, 20];
+        let deps = vec![ofs_dep(20, 30)];
+        let result = build_exec_order(&need_offsets, &deps, 0).unwrap();
+        assert!(result.order.is_none());
+        assert_eq!(result.tree_roots, 0);
+        assert_eq!(result.max_depth, 0);
+    }
+
+    #[test]
+    fn dfs_three_children_keeps_largest_subtree_last() {
+        // root(0) -> {1,2,3}; child(1) has two descendants.
+        let need_offsets = vec![10, 20, 30, 40, 50, 60];
+        let deps = vec![
+            ofs_dep(20, 10),
+            ofs_dep(30, 10),
+            ofs_dep(40, 10),
+            ofs_dep(50, 20),
+            ofs_dep(60, 20),
+        ];
+        let result = build_exec_order(&need_offsets, &deps, 0).unwrap();
+        let order = result.order.expect("non-identity order expected");
+        let pos = |idx: u32| order.iter().position(|&v| v == idx).unwrap();
+        assert!(pos(2) < pos(1), "thin child idx2 should precede idx1");
+        assert!(pos(3) < pos(1), "thin child idx3 should precede idx1");
     }
 
     #[test]

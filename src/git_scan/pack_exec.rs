@@ -243,6 +243,62 @@ pub struct PackExecReport {
     pub skips: Vec<SkipRecord>,
 }
 
+/// Hot-path counters buffered outside `PackExecStats`.
+///
+/// This keeps frequently bumped fields in a tiny struct during execution and
+/// applies them to `PackExecStats` once per report.
+#[derive(Clone, Copy, Debug, Default)]
+struct PackExecHotStats {
+    decoded_offsets: u32,
+    emitted_candidates: u32,
+    skipped_offsets: u32,
+    base_cache_hits: u32,
+    base_cache_misses: u32,
+    external_base_calls: u32,
+}
+
+impl PackExecHotStats {
+    #[inline(always)]
+    fn inc_decoded(&mut self) {
+        self.decoded_offsets = self.decoded_offsets.saturating_add(1);
+    }
+
+    #[inline(always)]
+    fn inc_emitted(&mut self) {
+        self.emitted_candidates = self.emitted_candidates.saturating_add(1);
+    }
+
+    #[inline(always)]
+    fn inc_skipped(&mut self) {
+        self.skipped_offsets = self.skipped_offsets.saturating_add(1);
+    }
+
+    #[inline(always)]
+    fn inc_base_cache_hit(&mut self) {
+        self.base_cache_hits = self.base_cache_hits.saturating_add(1);
+    }
+
+    #[inline(always)]
+    fn inc_base_cache_miss(&mut self) {
+        self.base_cache_misses = self.base_cache_misses.saturating_add(1);
+    }
+
+    #[inline(always)]
+    fn inc_external_base_call(&mut self) {
+        self.external_base_calls = self.external_base_calls.saturating_add(1);
+    }
+
+    #[inline]
+    fn merge_into(self, stats: &mut PackExecStats) {
+        perf_stats::sat_add_u32(&mut stats.decoded_offsets, self.decoded_offsets);
+        perf_stats::sat_add_u32(&mut stats.emitted_candidates, self.emitted_candidates);
+        perf_stats::sat_add_u32(&mut stats.skipped_offsets, self.skipped_offsets);
+        perf_stats::sat_add_u32(&mut stats.base_cache_hits, self.base_cache_hits);
+        perf_stats::sat_add_u32(&mut stats.base_cache_misses, self.base_cache_misses);
+        perf_stats::sat_add_u32(&mut stats.external_base_calls, self.external_base_calls);
+    }
+}
+
 /// Number of cache reject size buckets (log2 of byte size).
 pub const CACHE_REJECT_BUCKETS: usize = 32;
 
@@ -438,6 +494,70 @@ pub fn merge_pack_exec_reports(mut reports: Vec<PackExecReport>) -> PackExecRepo
     merged
 }
 
+/// Packed candidate range indexed by `need_offsets`.
+///
+/// `missing()` is encoded as `(NONE_U32, NONE_U32)` to avoid `Option` tagging
+/// overhead in hot-path range tables.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CandidateRange {
+    start: u32,
+    end: u32,
+}
+
+impl CandidateRange {
+    #[inline(always)]
+    pub const fn missing() -> Self {
+        Self {
+            start: NONE_U32,
+            end: NONE_U32,
+        }
+    }
+
+    #[inline(always)]
+    pub fn from_bounds(start: usize, end: usize) -> Self {
+        debug_assert!(start <= end);
+        debug_assert!(start <= u32::MAX as usize);
+        debug_assert!(end <= u32::MAX as usize);
+        Self {
+            start: start as u32,
+            end: end as u32,
+        }
+    }
+
+    #[inline(always)]
+    pub fn from_option(range: Option<(usize, usize)>) -> Self {
+        if let Some((start, end)) = range {
+            Self::from_bounds(start, end)
+        } else {
+            Self::missing()
+        }
+    }
+
+    #[inline(always)]
+    pub fn bounds(self) -> Option<(usize, usize)> {
+        if self.start == NONE_U32 {
+            return None;
+        }
+        debug_assert!(self.end != NONE_U32);
+        Some((self.start as usize, self.end as usize))
+    }
+
+    #[inline(always)]
+    pub fn candidate_count(self) -> usize {
+        if let Some((start, end)) = self.bounds() {
+            end.saturating_sub(start)
+        } else {
+            0
+        }
+    }
+}
+
+impl Default for CandidateRange {
+    fn default() -> Self {
+        Self::missing()
+    }
+}
+
 /// Reusable scratch buffers for pack execution.
 ///
 /// The executor uses a three-buffer rotation scheme to avoid per-offset
@@ -458,14 +578,16 @@ pub fn merge_pack_exec_reports(mut reports: Vec<PackExecReport>) -> PackExecRepo
 ///
 /// `candidate_ranges` is populated once per plan for out-of-order
 /// execution; it maps each `need_offsets` index to its contiguous range
-/// in `candidate_offsets`.
+/// in `candidate_offsets` via packed [`CandidateRange`] values.
 #[derive(Debug, Default)]
 pub struct PackExecScratch {
     inflate_buf: Vec<u8>,
     result_buf: Vec<u8>,
     base_buf: Vec<u8>,
     delta_stack: Vec<DeltaFrame>,
-    candidate_ranges: Vec<Option<(usize, usize)>>,
+    delta_deps_hot: Vec<DeltaDepHot>,
+    external_base_oids: Vec<OidBytes>,
+    candidate_ranges: Vec<CandidateRange>,
 }
 
 impl PackExecScratch {
@@ -501,6 +623,24 @@ impl PackExecScratch {
                 .reserve(depth_target - self.delta_stack.capacity());
         }
         self.delta_stack.clear();
+        if self.delta_deps_hot.capacity() < plan.delta_deps.len() {
+            self.delta_deps_hot
+                .reserve(plan.delta_deps.len() - self.delta_deps_hot.capacity());
+        }
+        self.delta_deps_hot.clear();
+        self.external_base_oids.clear();
+        for dep in &plan.delta_deps {
+            let external_oid_idx = match dep.base {
+                BaseLoc::Offset(_) => NONE_U32,
+                BaseLoc::External { oid } => {
+                    let idx = self.external_base_oids.len();
+                    self.external_base_oids.push(oid);
+                    idx as u32
+                }
+            };
+            self.delta_deps_hot
+                .push(DeltaDepHot::from_plan(dep, external_oid_idx));
+        }
         self.candidate_ranges.clear();
     }
 }
@@ -583,6 +723,44 @@ impl BaseBytes<'_> {
     }
 }
 
+/// Compact delta-dependency view used on the hot decode path.
+///
+/// External base OIDs are interned into a separate table so the common
+/// pack-local case stays dense.
+#[derive(Clone, Copy, Debug)]
+struct DeltaDepHot {
+    base_offset: u64,
+    external_oid_idx: u32,
+    data_start: u64,
+    delta_size: u64,
+}
+
+impl DeltaDepHot {
+    #[inline]
+    fn from_plan(dep: &DeltaDep, external_oid_idx: u32) -> Self {
+        let base_offset = match dep.base {
+            BaseLoc::Offset(base_offset) => base_offset,
+            BaseLoc::External { .. } => 0,
+        };
+        Self {
+            base_offset,
+            external_oid_idx,
+            data_start: dep.data_start,
+            delta_size: dep.delta_size,
+        }
+    }
+
+    #[inline(always)]
+    fn has_header_meta(self) -> bool {
+        self.data_start != 0
+    }
+
+    #[inline(always)]
+    fn is_external(self) -> bool {
+        self.external_oid_idx != NONE_U32
+    }
+}
+
 /// One frame in the delta chain stack during fallback base resolution.
 ///
 /// When the executor encounters a delta whose base is not cached, it
@@ -594,8 +772,10 @@ struct DeltaFrame {
     /// Pack offset of this delta entry (used for cache insertion after
     /// applying the delta).
     offset: u64,
-    /// Parsed entry header (contains kind, data_start, and declared size).
-    header: EntryHeader,
+    /// Byte offset where the delta payload zlib stream starts.
+    data_start: u64,
+    /// Declared uncompressed delta payload size.
+    delta_size: u64,
 }
 
 /// Executes a pack plan against a `PackReader`.
@@ -707,8 +887,9 @@ pub fn execute_pack_plan_with_scratch<S: PackObjectSink, B: ExternalBaseProvider
     scratch.prepare(plan, limits);
     let inflate_buf = &mut scratch.inflate_buf;
     let result_buf = &mut scratch.result_buf;
+    let mut hot_stats = PackExecHotStats::default();
 
-    let mut handle_idx = |idx: usize, range: Option<(usize, usize)>| -> Result<(), PackExecError> {
+    let mut handle_idx = |idx: usize, range: CandidateRange| -> Result<(), PackExecError> {
         let guard = if alloc_guard_enabled {
             Some(AllocGuard::new())
         } else {
@@ -732,8 +913,10 @@ pub fn execute_pack_plan_with_scratch<S: PackObjectSink, B: ExternalBaseProvider
                 plan.max_delta_depth,
                 cache,
                 external,
-                &plan.delta_deps,
+                &scratch.delta_deps_hot,
+                &scratch.external_base_oids,
                 &plan.delta_dep_index,
+                &mut hot_stats,
                 &mut report,
                 inflate_buf,
                 result_buf,
@@ -762,7 +945,7 @@ pub fn execute_pack_plan_with_scratch<S: PackObjectSink, B: ExternalBaseProvider
             }
         };
 
-        if let Some((start, end)) = range {
+        if let Some((start, end)) = range.bounds() {
             // Candidate range is precomputed (out-of-order) or merged (monotone).
             for cand_idx in start..end {
                 let candidate =
@@ -772,14 +955,14 @@ pub fn execute_pack_plan_with_scratch<S: PackObjectSink, B: ExternalBaseProvider
                         offset,
                         reason: SkipReason::NotBlob,
                     });
-                    perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
+                    hot_stats.inc_skipped();
                     continue;
                 }
                 let path = paths.get(candidate.ctx.path_ref);
                 let (emit_result, emit_nanos) = perf::time(|| sink.emit(candidate, path, bytes));
                 emit_result?;
                 record_timing(&mut report.stats.sink_emit_nanos, emit_nanos);
-                perf_stats::sat_add_u32(&mut report.stats.emitted_candidates, 1);
+                hot_stats.inc_emitted();
             }
         }
 
@@ -810,15 +993,16 @@ pub fn execute_pack_plan_with_scratch<S: PackObjectSink, B: ExternalBaseProvider
                 while cand_idx < cand.len() && cand[cand_idx].offset == offset {
                     cand_idx += 1;
                 }
-                Some((start, cand_idx))
+                CandidateRange::from_bounds(start, cand_idx)
             } else {
-                None
+                CandidateRange::missing()
             };
             handle_idx(idx, range)?;
         }
     }
 
     sink.finish()?;
+    hot_stats.merge_into(&mut report.stats);
     Ok(report)
 }
 
@@ -861,16 +1045,14 @@ pub fn execute_pack_plan_with_scratch_indices<S: PackObjectSink, B: ExternalBase
     spill_dir: &Path,
     scratch: &mut PackExecScratch,
     exec_indices: &[usize],
-    candidate_ranges: &[Option<(usize, usize)>],
+    candidate_ranges: &[CandidateRange],
 ) -> Result<PackExecReport, PackExecError> {
     debug_assert_eq!(candidate_ranges.len(), plan.need_offsets.len());
     let pack = PackFile::parse(pack_bytes, plan.oid_len as usize)?;
     let mut report = PackExecReport::default();
     let mut expected = exec_indices.len();
     for &idx in exec_indices {
-        if let Some((start, end)) = candidate_ranges[idx] {
-            expected = expected.saturating_add(end - start);
-        }
+        expected = expected.saturating_add(candidate_ranges[idx].candidate_count());
     }
     report.skips.reserve(expected.min(u32::MAX as usize));
 
@@ -879,6 +1061,7 @@ pub fn execute_pack_plan_with_scratch_indices<S: PackObjectSink, B: ExternalBase
     scratch.prepare(plan, limits);
     let inflate_buf = &mut scratch.inflate_buf;
     let result_buf = &mut scratch.result_buf;
+    let mut hot_stats = PackExecHotStats::default();
 
     let mut handle_idx = |idx: usize| -> Result<(), PackExecError> {
         let guard = if alloc_guard_enabled {
@@ -905,8 +1088,10 @@ pub fn execute_pack_plan_with_scratch_indices<S: PackObjectSink, B: ExternalBase
                 plan.max_delta_depth,
                 cache,
                 external,
-                &plan.delta_deps,
+                &scratch.delta_deps_hot,
+                &scratch.external_base_oids,
                 &plan.delta_dep_index,
+                &mut hot_stats,
                 &mut report,
                 inflate_buf,
                 result_buf,
@@ -935,7 +1120,7 @@ pub fn execute_pack_plan_with_scratch_indices<S: PackObjectSink, B: ExternalBase
             }
         };
 
-        if let Some((start, end)) = range {
+        if let Some((start, end)) = range.bounds() {
             for cand_idx in start..end {
                 let candidate =
                     &plan.candidates[plan.candidate_offsets[cand_idx].cand_idx as usize];
@@ -944,14 +1129,14 @@ pub fn execute_pack_plan_with_scratch_indices<S: PackObjectSink, B: ExternalBase
                         offset,
                         reason: SkipReason::NotBlob,
                     });
-                    perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
+                    hot_stats.inc_skipped();
                     continue;
                 }
                 let path = paths.get(candidate.ctx.path_ref);
                 let (emit_result, emit_nanos) = perf::time(|| sink.emit(candidate, path, bytes));
                 emit_result?;
                 record_timing(&mut report.stats.sink_emit_nanos, emit_nanos);
-                perf_stats::sat_add_u32(&mut report.stats.emitted_candidates, 1);
+                hot_stats.inc_emitted();
             }
         }
 
@@ -967,6 +1152,167 @@ pub fn execute_pack_plan_with_scratch_indices<S: PackObjectSink, B: ExternalBase
     }
 
     sink.finish()?;
+    hot_stats.merge_into(&mut report.stats);
+    Ok(report)
+}
+
+/// Executes a natural-order shard over `[start_idx, end_idx)` of `need_offsets`.
+///
+/// This variant avoids materializing `exec_indices` when a plan has no
+/// `exec_order` permutation. Candidate ranges are discovered with a single
+/// forward merge cursor over `candidate_offsets`.
+///
+/// # Errors
+///
+/// Same as [`execute_pack_plan_with_scratch`]: `PackParse` and `Sink`
+/// errors are fatal; decode failures are recorded as skips.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_pack_plan_with_scratch_range<S: PackObjectSink, B: ExternalBaseProvider>(
+    plan: &PackPlan,
+    pack_bytes: &[u8],
+    paths: &ByteArena,
+    limits: &PackDecodeLimits,
+    cache: &mut PackCache,
+    external: &mut B,
+    sink: &mut S,
+    spill_dir: &Path,
+    scratch: &mut PackExecScratch,
+    start_idx: usize,
+    end_idx: usize,
+) -> Result<PackExecReport, PackExecError> {
+    debug_assert!(start_idx <= end_idx);
+    debug_assert!(end_idx <= plan.need_offsets.len());
+
+    let pack = PackFile::parse(pack_bytes, plan.oid_len as usize)?;
+    let mut report = PackExecReport::default();
+    let mut expected = end_idx.saturating_sub(start_idx);
+    if start_idx < end_idx {
+        let first_offset = plan.need_offsets[start_idx];
+        let last_offset = plan.need_offsets[end_idx - 1];
+        let cand_start = plan
+            .candidate_offsets
+            .partition_point(|cand| cand.offset < first_offset);
+        let cand_end = plan
+            .candidate_offsets
+            .partition_point(|cand| cand.offset <= last_offset);
+        expected = expected.saturating_add(cand_end.saturating_sub(cand_start));
+    }
+    report.skips.reserve(expected.min(u32::MAX as usize));
+
+    let alloc_guard_enabled = alloc_guard::enabled();
+
+    scratch.prepare(plan, limits);
+    let inflate_buf = &mut scratch.inflate_buf;
+    let result_buf = &mut scratch.result_buf;
+    let mut hot_stats = PackExecHotStats::default();
+
+    let mut handle_idx = |idx: usize, range: CandidateRange| -> Result<(), PackExecError> {
+        let guard = if alloc_guard_enabled {
+            Some(AllocGuard::new())
+        } else {
+            None
+        };
+        let offset = plan.need_offsets[idx];
+
+        let (cache_result, lookup_nanos) = perf::time(|| cache_get(cache, offset));
+        record_timing(&mut report.stats.cache_lookup_nanos, lookup_nanos);
+        let (obj_kind, storage, cache_hit_bytes) = if let Some(hit) = cache_result {
+            perf::record_cache_hit();
+            (hit.kind, DecodedStorage::Cache, Some(hit.bytes))
+        } else {
+            perf::record_cache_miss();
+            let decoded = decode_offset(
+                &pack,
+                offset,
+                idx,
+                &plan.need_offsets,
+                limits,
+                plan.max_delta_depth,
+                cache,
+                external,
+                &scratch.delta_deps_hot,
+                &scratch.external_base_oids,
+                &plan.delta_dep_index,
+                &mut hot_stats,
+                &mut report,
+                inflate_buf,
+                result_buf,
+                &mut scratch.base_buf,
+                &mut scratch.delta_stack,
+                spill_dir,
+            )?;
+
+            let Some(obj) = decoded else {
+                return Ok(());
+            };
+
+            (obj.kind, obj.storage, None)
+        };
+
+        // Reuse the first probe's bytes on hit to avoid a redundant cache re-probe.
+        let bytes: &[u8] = if let Some(bytes) = cache_hit_bytes {
+            bytes
+        } else {
+            match &storage {
+                DecodedStorage::Cache => cache_get(cache, offset)
+                    .map(|hit| hit.bytes)
+                    .unwrap_or(result_buf.as_slice()),
+                DecodedStorage::Scratch => result_buf.as_slice(),
+                DecodedStorage::Spill(spill) => spill.as_slice(),
+            }
+        };
+
+        if let Some((start, end)) = range.bounds() {
+            for cand_idx in start..end {
+                let candidate =
+                    &plan.candidates[plan.candidate_offsets[cand_idx].cand_idx as usize];
+                if obj_kind != ObjectKind::Blob {
+                    report.skips.push(SkipRecord {
+                        offset,
+                        reason: SkipReason::NotBlob,
+                    });
+                    hot_stats.inc_skipped();
+                    continue;
+                }
+                let path = paths.get(candidate.ctx.path_ref);
+                let (emit_result, emit_nanos) = perf::time(|| sink.emit(candidate, path, bytes));
+                emit_result?;
+                record_timing(&mut report.stats.sink_emit_nanos, emit_nanos);
+                hot_stats.inc_emitted();
+            }
+        }
+
+        if let Some(guard) = guard {
+            guard.assert_no_alloc();
+        }
+
+        Ok(())
+    };
+
+    if start_idx < end_idx {
+        let cand = &plan.candidate_offsets;
+        let first_offset = plan.need_offsets[start_idx];
+        let mut cand_idx = cand.partition_point(|entry| entry.offset < first_offset);
+        for idx in start_idx..end_idx {
+            let offset = plan.need_offsets[idx];
+            while cand_idx < cand.len() && cand[cand_idx].offset < offset {
+                cand_idx += 1;
+            }
+            let range = if cand_idx < cand.len() && cand[cand_idx].offset == offset {
+                let start = cand_idx;
+                while cand_idx < cand.len() && cand[cand_idx].offset == offset {
+                    cand_idx += 1;
+                }
+                CandidateRange::from_bounds(start, cand_idx)
+            } else {
+                CandidateRange::missing()
+            };
+            handle_idx(idx, range)?;
+        }
+    }
+
+    sink.finish()?;
+    hot_stats.merge_into(&mut report.stats);
     Ok(report)
 }
 
@@ -992,12 +1338,12 @@ fn read_pack_bytes<R: PackReader>(reader: &mut R, out: &mut Vec<u8>) -> Result<(
 /// scans of the candidate list by leveraging sorted candidate offsets.
 ///
 /// Assumes `candidate_offsets` is sorted ascending by offset.
-pub fn build_candidate_ranges(plan: &PackPlan, ranges: &mut Vec<Option<(usize, usize)>>) {
+pub fn build_candidate_ranges(plan: &PackPlan, ranges: &mut Vec<CandidateRange>) {
     // Single pass over sorted offsets; each need offset maps to a contiguous
     // range in `candidate_offsets` (if any). Requires plan invariants:
     // `need_offsets` sorted unique and `candidate_offsets` sorted by offset.
     ranges.clear();
-    ranges.resize(plan.need_offsets.len(), None);
+    ranges.resize(plan.need_offsets.len(), CandidateRange::missing());
     let mut cand_idx = 0usize;
     for (need_idx, &offset) in plan.need_offsets.iter().enumerate() {
         let start = cand_idx;
@@ -1007,7 +1353,7 @@ pub fn build_candidate_ranges(plan: &PackPlan, ranges: &mut Vec<Option<(usize, u
             cand_idx += 1;
         }
         if cand_idx > start {
-            ranges[need_idx] = Some((start, cand_idx));
+            ranges[need_idx] = CandidateRange::from_bounds(start, cand_idx);
         }
     }
 }
@@ -1036,6 +1382,20 @@ fn size_to_usize(size: u64, kind: EntryKind) -> Result<usize, PackDecodeError> {
     })
 }
 
+#[inline]
+fn delta_size_to_usize(size: u64) -> Result<usize, PackDecodeError> {
+    usize::try_from(size).map_err(|_| PackDecodeError::DeltaTooLarge {
+        size,
+        max: usize::MAX,
+    })
+}
+
+#[inline]
+fn data_start_to_usize(data_start: u64) -> Result<usize, PackDecodeError> {
+    usize::try_from(data_start)
+        .map_err(|_| PackDecodeError::PackParse(PackParseError::OffsetOutOfRange(data_start)))
+}
+
 /// Inflated delta payload bytes, either in-memory or spill-backed.
 ///
 /// Small payloads live in a borrowed scratch buffer; oversized payloads
@@ -1062,15 +1422,17 @@ impl DeltaPayload<'_> {
 /// keep resident memory bounded.
 fn inflate_delta_payload<'a>(
     pack: &PackFile<'_>,
-    header: &EntryHeader,
+    data_start: u64,
+    delta_size: u64,
     limits: &PackDecodeLimits,
     spill_dir: &Path,
     inflate_buf: &'a mut Vec<u8>,
 ) -> Result<DeltaPayload<'a>, PackDecodeError> {
-    let delta_size = size_to_usize(header.size, header.kind)?;
+    let delta_size = delta_size_to_usize(delta_size)?;
+    let data_start = data_start_to_usize(data_start)?;
     if delta_size <= limits.max_delta_bytes {
         let consumed = inflate_limited(
-            pack.slice_from(header.data_start),
+            pack.slice_from(data_start),
             inflate_buf,
             limits.max_delta_bytes,
         )
@@ -1081,7 +1443,7 @@ fn inflate_delta_payload<'a>(
         let mut spill = BlobSpill::new(spill_dir, delta_size)
             .map_err(|_| PackDecodeError::Inflate(super::pack_inflate::InflateError::Backend))?;
         let mut writer = spill.writer();
-        inflate_stream(pack.slice_from(header.data_start), delta_size, |chunk| {
+        inflate_stream(pack.slice_from(data_start), delta_size, |chunk| {
             writer
                 .write(chunk)
                 .map_err(|_| super::pack_inflate::InflateError::Backend)
@@ -1092,6 +1454,89 @@ fn inflate_delta_payload<'a>(
             .map_err(|_| PackDecodeError::Inflate(super::pack_inflate::InflateError::Backend))?;
         Ok(DeltaPayload::Spill(spill))
     }
+}
+
+#[inline]
+fn record_skip(
+    report: &mut PackExecReport,
+    hot_stats: &mut PackExecHotStats,
+    offset: u64,
+    reason: SkipReason,
+) {
+    report.skips.push(SkipRecord { offset, reason });
+    hot_stats.inc_skipped();
+}
+
+#[inline]
+fn skip_reason_from_delta_error(err: DeltaDecodeError) -> SkipReason {
+    match err {
+        DeltaDecodeError::Decode(err) => SkipReason::Decode(err),
+        DeltaDecodeError::Delta(err) => SkipReason::Delta(err),
+    }
+}
+
+fn finalize_decoded_delta(
+    offset: u64,
+    kind: ObjectKind,
+    storage: DecodedStorage,
+    out_len: usize,
+    cache: &mut PackCache,
+    result_buf: &mut Vec<u8>,
+    stats: &mut PackExecStats,
+) -> DecodedObject {
+    if matches!(&storage, DecodedStorage::Spill(_)) {
+        perf_stats::sat_add_u32(&mut stats.large_blob_spilled_count, 1);
+        perf_stats::sat_add_u64(&mut stats.large_blob_bytes, out_len as u64);
+    }
+    match storage {
+        DecodedStorage::Cache | DecodedStorage::Scratch => {
+            if cache.insert(offset, kind, result_buf) {
+                DecodedObject {
+                    kind,
+                    storage: DecodedStorage::Cache,
+                }
+            } else {
+                stats.record_cache_reject(out_len);
+                DecodedObject {
+                    kind,
+                    storage: DecodedStorage::Scratch,
+                }
+            }
+        }
+        DecodedStorage::Spill(spill) => {
+            stats.record_cache_reject(out_len);
+            DecodedObject {
+                kind,
+                storage: DecodedStorage::Spill(spill),
+            }
+        }
+    }
+}
+
+fn decode_delta_against_base(
+    pack: &PackFile<'_>,
+    data_start: u64,
+    delta_size: u64,
+    base_bytes: &[u8],
+    limits: &PackDecodeLimits,
+    inflate_buf: &mut Vec<u8>,
+    result_buf: &mut Vec<u8>,
+    spill_dir: &Path,
+    hot_stats: &mut PackExecHotStats,
+) -> Result<(DecodedStorage, usize), SkipReason> {
+    let (storage, out_len) = decode_delta_output(
+        pack,
+        data_start,
+        delta_size,
+        base_bytes,
+        limits,
+        inflate_buf,
+        result_buf,
+        spill_dir,
+    )
+    .map_err(skip_reason_from_delta_error)?;
+    hot_stats.inc_decoded();
+    Ok((storage, out_len))
 }
 
 /// Decodes a single offset, using the cache for bases and for storing results.
@@ -1110,8 +1555,10 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
     max_delta_depth: u8,
     cache: &'a mut PackCache,
     external: &'a mut B,
-    delta_deps: &'a [DeltaDep],
+    delta_deps: &'a [DeltaDepHot],
+    external_base_oids: &'a [OidBytes],
     delta_dep_index: &'a [u32],
+    hot_stats: &'a mut PackExecHotStats,
     report: &'a mut PackExecReport,
     inflate_buf: &'a mut Vec<u8>,
     result_buf: &'a mut Vec<u8>,
@@ -1119,14 +1566,149 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
     delta_stack: &'a mut Vec<DeltaFrame>,
     spill_dir: &'a Path,
 ) -> Result<Option<DecodedObject>, PackExecError> {
+    let planned_dep = delta_dep_at_index(delta_deps, delta_dep_index, need_idx);
+
+    // Fast path: use plan-time persisted delta metadata when available.
+    if let Some(dep) = planned_dep.filter(|dep| dep.has_header_meta()) {
+        if dep.is_external() {
+            let Some(base_oid) = external_base_oids
+                .get(dep.external_oid_idx as usize)
+                .copied()
+            else {
+                record_skip(
+                    report,
+                    hot_stats,
+                    offset,
+                    SkipReason::Decode(PackDecodeError::PackParse(PackParseError::Truncated)),
+                );
+                return Ok(None);
+            };
+            hot_stats.inc_external_base_call();
+            match external.load_base(&base_oid) {
+                Ok(Some(base)) => match decode_delta_against_base(
+                    pack,
+                    dep.data_start,
+                    dep.delta_size,
+                    &base.bytes,
+                    limits,
+                    inflate_buf,
+                    result_buf,
+                    spill_dir,
+                    hot_stats,
+                ) {
+                    Ok((storage, out_len)) => {
+                        let obj = finalize_decoded_delta(
+                            offset,
+                            base.kind,
+                            storage,
+                            out_len,
+                            cache,
+                            result_buf,
+                            &mut report.stats,
+                        );
+                        return Ok(Some(obj));
+                    }
+                    Err(reason) => {
+                        record_skip(report, hot_stats, offset, reason);
+                        return Ok(None);
+                    }
+                },
+                Ok(None) => {
+                    record_skip(
+                        report,
+                        hot_stats,
+                        offset,
+                        SkipReason::ExternalBaseMissing { oid: base_oid },
+                    );
+                    return Ok(None);
+                }
+                Err(_) => {
+                    record_skip(report, hot_stats, offset, SkipReason::ExternalBaseError);
+                    return Ok(None);
+                }
+            }
+        }
+
+        let (base_kind, storage, out_len) = {
+            let base = match cache.get(dep.base_offset) {
+                Some(base) => {
+                    hot_stats.inc_base_cache_hit();
+                    BaseBytes {
+                        kind: base.kind,
+                        storage: BaseStorage::Slice(base.bytes),
+                    }
+                }
+                None => {
+                    hot_stats.inc_base_cache_miss();
+                    let (result, resolve_nanos) = perf::time(|| {
+                        decode_base_from_pack(
+                            pack,
+                            dep.base_offset,
+                            need_offsets,
+                            limits,
+                            max_delta_depth,
+                            cache,
+                            external,
+                            delta_deps,
+                            external_base_oids,
+                            delta_dep_index,
+                            hot_stats,
+                            report,
+                            inflate_buf,
+                            result_buf,
+                            base_buf,
+                            delta_stack,
+                            spill_dir,
+                        )
+                    });
+                    record_timing(&mut report.stats.fallback_resolve_nanos, resolve_nanos);
+                    match result {
+                        Ok(base) => base,
+                        Err(reason) => {
+                            record_skip(report, hot_stats, offset, reason);
+                            return Ok(None);
+                        }
+                    }
+                }
+            };
+
+            let (storage, out_len) = match decode_delta_against_base(
+                pack,
+                dep.data_start,
+                dep.delta_size,
+                base.bytes(),
+                limits,
+                inflate_buf,
+                result_buf,
+                spill_dir,
+                hot_stats,
+            ) {
+                Ok(decoded) => decoded,
+                Err(reason) => {
+                    record_skip(report, hot_stats, offset, reason);
+                    return Ok(None);
+                }
+            };
+            (base.kind, storage, out_len)
+        };
+
+        let obj = finalize_decoded_delta(
+            offset,
+            base_kind,
+            storage,
+            out_len,
+            cache,
+            result_buf,
+            &mut report.stats,
+        );
+        return Ok(Some(obj));
+    }
+
+    // Fallback path for synthetic/manual plans without persisted metadata.
     let header = match read_entry_header(pack, offset, limits.max_header_bytes) {
         Ok(header) => header,
         Err(err) => {
-            report.skips.push(SkipRecord {
-                offset,
-                reason: SkipReason::Decode(err),
-            });
-            perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
+            record_skip(report, hot_stats, offset, SkipReason::Decode(err));
             return Ok(None);
         }
     };
@@ -1136,11 +1718,7 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
             let size = match size_to_usize(header.size, header.kind) {
                 Ok(size) => size,
                 Err(err) => {
-                    report.skips.push(SkipRecord {
-                        offset,
-                        reason: SkipReason::Decode(err),
-                    });
-                    perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
+                    record_skip(report, hot_stats, offset, SkipReason::Decode(err));
                     return Ok(None);
                 }
             };
@@ -1153,15 +1731,11 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                 let (inflate_res, nanos) =
                     perf::time(|| inflate_entry_payload(pack, &header, result_buf, limits));
                 if let Err(err) = inflate_res {
-                    report.skips.push(SkipRecord {
-                        offset,
-                        reason: SkipReason::Decode(err),
-                    });
-                    perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
+                    record_skip(report, hot_stats, offset, SkipReason::Decode(err));
                     return Ok(None);
                 }
                 perf::record_pack_inflate(result_buf.len(), nanos);
-                perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
+                hot_stats.inc_decoded();
 
                 if cache.insert(offset, kind, result_buf) {
                     Ok(Some(DecodedObject {
@@ -1187,18 +1761,19 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                     })
                 });
                 if let Err(err) = inflate_res {
-                    report.skips.push(SkipRecord {
+                    record_skip(
+                        report,
+                        hot_stats,
                         offset,
-                        reason: SkipReason::Decode(PackDecodeError::Inflate(err)),
-                    });
-                    perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
+                        SkipReason::Decode(PackDecodeError::Inflate(err)),
+                    );
                     return Ok(None);
                 }
                 writer
                     .finish()
                     .map_err(|err| PackExecError::Spill(err.to_string()))?;
                 perf::record_pack_inflate(size, nanos);
-                perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
+                hot_stats.inc_decoded();
                 report.stats.record_cache_reject(size);
                 perf_stats::sat_add_u32(&mut report.stats.large_blob_spilled_count, 1);
                 perf_stats::sat_add_u64(&mut report.stats.large_blob_bytes, size as u64);
@@ -1213,14 +1788,14 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
             let (base_kind, storage, out_len) = {
                 let base = match cache.get(base_offset) {
                     Some(base) => {
-                        perf_stats::sat_add_u32(&mut report.stats.base_cache_hits, 1);
+                        hot_stats.inc_base_cache_hit();
                         BaseBytes {
                             kind: base.kind,
                             storage: BaseStorage::Slice(base.bytes),
                         }
                     }
                     None => {
-                        perf_stats::sat_add_u32(&mut report.stats.base_cache_misses, 1);
+                        hot_stats.inc_base_cache_miss();
                         let (result, resolve_nanos) = perf::time(|| {
                             decode_base_from_pack(
                                 pack,
@@ -1231,7 +1806,9 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                                 cache,
                                 external,
                                 delta_deps,
+                                external_base_oids,
                                 delta_dep_index,
+                                hot_stats,
                                 report,
                                 inflate_buf,
                                 result_buf,
@@ -1244,102 +1821,71 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                         match result {
                             Ok(base) => base,
                             Err(reason) => {
-                                report.skips.push(SkipRecord { offset, reason });
-                                perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
+                                record_skip(report, hot_stats, offset, reason);
                                 return Ok(None);
                             }
                         }
                     }
                 };
 
-                let (storage, out_len) = match decode_delta_output(
+                let (storage, out_len) = match decode_delta_against_base(
                     pack,
-                    &header,
+                    header.data_start as u64,
+                    header.size,
                     base.bytes(),
                     limits,
                     inflate_buf,
                     result_buf,
                     spill_dir,
+                    hot_stats,
                 ) {
-                    Ok(out) => out,
-                    Err(err) => {
-                        match err {
-                            DeltaDecodeError::Decode(err) => {
-                                report.skips.push(SkipRecord {
-                                    offset,
-                                    reason: SkipReason::Decode(err),
-                                });
-                            }
-                            DeltaDecodeError::Delta(err) => {
-                                report.skips.push(SkipRecord {
-                                    offset,
-                                    reason: SkipReason::Delta(err),
-                                });
-                            }
-                        }
-                        perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
+                    Ok(decoded) => decoded,
+                    Err(reason) => {
+                        record_skip(report, hot_stats, offset, reason);
                         return Ok(None);
                     }
                 };
-
                 (base.kind, storage, out_len)
             };
 
-            perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
-            if matches!(&storage, DecodedStorage::Spill(_)) {
-                perf_stats::sat_add_u32(&mut report.stats.large_blob_spilled_count, 1);
-                perf_stats::sat_add_u64(&mut report.stats.large_blob_bytes, out_len as u64);
-            }
-            match storage {
-                DecodedStorage::Cache | DecodedStorage::Scratch => {
-                    if cache.insert(offset, base_kind, result_buf) {
-                        Ok(Some(DecodedObject {
-                            kind: base_kind,
-                            storage: DecodedStorage::Cache,
-                        }))
-                    } else {
-                        report.stats.record_cache_reject(out_len);
-                        Ok(Some(DecodedObject {
-                            kind: base_kind,
-                            storage: DecodedStorage::Scratch,
-                        }))
-                    }
-                }
-                DecodedStorage::Spill(spill) => {
-                    report.stats.record_cache_reject(out_len);
-                    Ok(Some(DecodedObject {
-                        kind: base_kind,
-                        storage: DecodedStorage::Spill(spill),
-                    }))
-                }
-            }
+            let obj = finalize_decoded_delta(
+                offset,
+                base_kind,
+                storage,
+                out_len,
+                cache,
+                result_buf,
+                &mut report.stats,
+            );
+            Ok(Some(obj))
         }
         EntryKind::RefDelta { base_oid } => {
-            let dep = delta_dep_at_index(delta_deps, delta_dep_index, need_idx);
-            match dep.map(|d| d.base) {
-                Some(BaseLoc::Offset(base_offset)) => {
+            if let Some(dep) = planned_dep {
+                if !dep.is_external() {
                     let (base_kind, storage, out_len) = {
-                        let base = match cache.get(base_offset) {
+                        let base = match cache.get(dep.base_offset) {
                             Some(base) => {
-                                perf_stats::sat_add_u32(&mut report.stats.base_cache_hits, 1);
+                                hot_stats.inc_base_cache_hit();
                                 BaseBytes {
                                     kind: base.kind,
                                     storage: BaseStorage::Slice(base.bytes),
                                 }
                             }
                             None => {
-                                perf_stats::sat_add_u32(&mut report.stats.base_cache_misses, 1);
+                                hot_stats.inc_base_cache_miss();
                                 let (result, resolve_nanos) = perf::time(|| {
                                     decode_base_from_pack(
                                         pack,
-                                        base_offset,
+                                        dep.base_offset,
                                         need_offsets,
                                         limits,
                                         max_delta_depth,
                                         cache,
                                         external,
                                         delta_deps,
+                                        external_base_oids,
                                         delta_dep_index,
+                                        hot_stats,
                                         report,
                                         inflate_buf,
                                         result_buf,
@@ -1355,170 +1901,99 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                                 match result {
                                     Ok(base) => base,
                                     Err(reason) => {
-                                        report.skips.push(SkipRecord { offset, reason });
-                                        perf_stats::sat_add_u32(
-                                            &mut report.stats.skipped_offsets,
-                                            1,
-                                        );
+                                        record_skip(report, hot_stats, offset, reason);
                                         return Ok(None);
                                     }
                                 }
                             }
                         };
 
-                        let (storage, out_len) = match decode_delta_output(
+                        let (storage, out_len) = match decode_delta_against_base(
                             pack,
-                            &header,
+                            header.data_start as u64,
+                            header.size,
                             base.bytes(),
                             limits,
                             inflate_buf,
                             result_buf,
                             spill_dir,
+                            hot_stats,
                         ) {
-                            Ok(out) => out,
-                            Err(err) => {
-                                match err {
-                                    DeltaDecodeError::Decode(err) => {
-                                        report.skips.push(SkipRecord {
-                                            offset,
-                                            reason: SkipReason::Decode(err),
-                                        });
-                                    }
-                                    DeltaDecodeError::Delta(err) => {
-                                        report.skips.push(SkipRecord {
-                                            offset,
-                                            reason: SkipReason::Delta(err),
-                                        });
-                                    }
-                                }
-                                perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
+                            Ok(decoded) => decoded,
+                            Err(reason) => {
+                                record_skip(report, hot_stats, offset, reason);
                                 return Ok(None);
                             }
                         };
-
                         (base.kind, storage, out_len)
                     };
 
-                    perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
-                    if matches!(&storage, DecodedStorage::Spill(_)) {
-                        perf_stats::sat_add_u32(&mut report.stats.large_blob_spilled_count, 1);
-                        perf_stats::sat_add_u64(&mut report.stats.large_blob_bytes, out_len as u64);
-                    }
-                    match storage {
-                        DecodedStorage::Cache | DecodedStorage::Scratch => {
-                            if cache.insert(offset, base_kind, result_buf) {
-                                Ok(Some(DecodedObject {
-                                    kind: base_kind,
-                                    storage: DecodedStorage::Cache,
-                                }))
-                            } else {
-                                report.stats.record_cache_reject(out_len);
-                                Ok(Some(DecodedObject {
-                                    kind: base_kind,
-                                    storage: DecodedStorage::Scratch,
-                                }))
-                            }
-                        }
-                        DecodedStorage::Spill(spill) => {
-                            report.stats.record_cache_reject(out_len);
-                            Ok(Some(DecodedObject {
-                                kind: base_kind,
-                                storage: DecodedStorage::Spill(spill),
-                            }))
-                        }
-                    }
+                    let obj = finalize_decoded_delta(
+                        offset,
+                        base_kind,
+                        storage,
+                        out_len,
+                        cache,
+                        result_buf,
+                        &mut report.stats,
+                    );
+                    return Ok(Some(obj));
                 }
-                Some(BaseLoc::External { .. }) | None => {
-                    let base_oid = oid_or_base(base_oid, dep.as_ref());
-                    perf_stats::sat_add_u32(&mut report.stats.external_base_calls, 1);
-                    match external.load_base(&base_oid) {
-                        Ok(Some(base)) => {
-                            let base_bytes = BaseBytes {
-                                kind: base.kind,
-                                storage: BaseStorage::Slice(&base.bytes),
-                            };
-                            let (storage, out_len) = match decode_delta_output(
-                                pack,
-                                &header,
-                                base_bytes.bytes(),
-                                limits,
-                                inflate_buf,
-                                result_buf,
-                                spill_dir,
-                            ) {
-                                Ok(out) => out,
-                                Err(err) => {
-                                    match err {
-                                        DeltaDecodeError::Decode(err) => {
-                                            report.skips.push(SkipRecord {
-                                                offset,
-                                                reason: SkipReason::Decode(err),
-                                            });
-                                        }
-                                        DeltaDecodeError::Delta(err) => {
-                                            report.skips.push(SkipRecord {
-                                                offset,
-                                                reason: SkipReason::Delta(err),
-                                            });
-                                        }
-                                    }
-                                    perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
-                                    return Ok(None);
-                                }
-                            };
+            }
 
-                            perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
-                            if matches!(&storage, DecodedStorage::Spill(_)) {
-                                perf_stats::sat_add_u32(
-                                    &mut report.stats.large_blob_spilled_count,
-                                    1,
-                                );
-                                perf_stats::sat_add_u64(
-                                    &mut report.stats.large_blob_bytes,
-                                    out_len as u64,
-                                );
-                            }
-                            match storage {
-                                DecodedStorage::Cache | DecodedStorage::Scratch => {
-                                    if cache.insert(offset, base.kind, result_buf) {
-                                        Ok(Some(DecodedObject {
-                                            kind: base.kind,
-                                            storage: DecodedStorage::Cache,
-                                        }))
-                                    } else {
-                                        report.stats.record_cache_reject(out_len);
-                                        Ok(Some(DecodedObject {
-                                            kind: base.kind,
-                                            storage: DecodedStorage::Scratch,
-                                        }))
-                                    }
-                                }
-                                DecodedStorage::Spill(spill) => {
-                                    report.stats.record_cache_reject(out_len);
-                                    Ok(Some(DecodedObject {
-                                        kind: base.kind,
-                                        storage: DecodedStorage::Spill(spill),
-                                    }))
-                                }
-                            }
-                        }
-                        Ok(None) => {
-                            report.skips.push(SkipRecord {
-                                offset,
-                                reason: SkipReason::ExternalBaseMissing { oid: base_oid },
-                            });
-                            perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
-                            Ok(None)
-                        }
-                        Err(_) => {
-                            report.skips.push(SkipRecord {
-                                offset,
-                                reason: SkipReason::ExternalBaseError,
-                            });
-                            perf_stats::sat_add_u32(&mut report.stats.skipped_offsets, 1);
-                            Ok(None)
-                        }
+            let resolved_oid = planned_dep
+                .and_then(|dep| {
+                    dep.is_external()
+                        .then(|| {
+                            external_base_oids
+                                .get(dep.external_oid_idx as usize)
+                                .copied()
+                        })
+                        .flatten()
+                })
+                .unwrap_or(base_oid);
+            hot_stats.inc_external_base_call();
+            match external.load_base(&resolved_oid) {
+                Ok(Some(base)) => match decode_delta_against_base(
+                    pack,
+                    header.data_start as u64,
+                    header.size,
+                    &base.bytes,
+                    limits,
+                    inflate_buf,
+                    result_buf,
+                    spill_dir,
+                    hot_stats,
+                ) {
+                    Ok((storage, out_len)) => {
+                        let obj = finalize_decoded_delta(
+                            offset,
+                            base.kind,
+                            storage,
+                            out_len,
+                            cache,
+                            result_buf,
+                            &mut report.stats,
+                        );
+                        Ok(Some(obj))
                     }
+                    Err(reason) => {
+                        record_skip(report, hot_stats, offset, reason);
+                        Ok(None)
+                    }
+                },
+                Ok(None) => {
+                    record_skip(
+                        report,
+                        hot_stats,
+                        offset,
+                        SkipReason::ExternalBaseMissing { oid: resolved_oid },
+                    );
+                    Ok(None)
+                }
+                Err(_) => {
+                    record_skip(report, hot_stats, offset, SkipReason::ExternalBaseError);
+                    Ok(None)
                 }
             }
         }
@@ -1537,15 +2012,17 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
 /// overwritten regardless of the outcome.
 fn decode_delta_output(
     pack: &PackFile<'_>,
-    header: &EntryHeader,
+    data_start: u64,
+    delta_size: u64,
     base_bytes: &[u8],
     limits: &PackDecodeLimits,
     inflate_buf: &mut Vec<u8>,
     result_buf: &mut Vec<u8>,
     spill_dir: &Path,
 ) -> Result<(DecodedStorage, usize), DeltaDecodeError> {
-    let (payload_res, inflate_nanos) =
-        perf::time(|| inflate_delta_payload(pack, header, limits, spill_dir, inflate_buf));
+    let (payload_res, inflate_nanos) = perf::time(|| {
+        inflate_delta_payload(pack, data_start, delta_size, limits, spill_dir, inflate_buf)
+    });
     let payload = payload_res.map_err(DeltaDecodeError::Decode)?;
     let delta_bytes = payload.as_slice();
     perf::record_pack_inflate(delta_bytes.len(), inflate_nanos);
@@ -1580,29 +2057,13 @@ fn decode_delta_output(
     }
 }
 
-/// Resolve the base location for a REF delta at the given offset.
-fn resolve_ref_base(
-    offset: u64,
-    base_oid: OidBytes,
-    need_offsets: &[u64],
-    delta_deps: &[DeltaDep],
-    delta_dep_index: &[u32],
-) -> BaseLoc {
-    if let Ok(need_idx) = need_offsets.binary_search(&offset) {
-        if let Some(dep) = delta_dep_at_index(delta_deps, delta_dep_index, need_idx) {
-            return dep.base;
-        }
-    }
-    BaseLoc::External { oid: base_oid }
-}
-
 /// Lookup the delta dependency by `need_offsets` index using the dense index.
 #[inline]
 fn delta_dep_at_index(
-    delta_deps: &[DeltaDep],
+    delta_deps: &[DeltaDepHot],
     delta_dep_index: &[u32],
     need_idx: usize,
-) -> Option<DeltaDep> {
+) -> Option<DeltaDepHot> {
     if delta_dep_index.is_empty() {
         return None;
     }
@@ -1611,6 +2072,104 @@ fn delta_dep_at_index(
         return None;
     }
     delta_deps.get(idx as usize).copied()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn unwind_delta_stack(
+    pack: &PackFile<'_>,
+    delta_stack: &[DeltaFrame],
+    base_kind: ObjectKind,
+    base_spill: &mut Option<BlobSpill>,
+    limits: &PackDecodeLimits,
+    cache: &mut PackCache,
+    inflate_buf: &mut Vec<u8>,
+    result_buf: &mut Vec<u8>,
+    base_buf: &mut Vec<u8>,
+    spill_dir: &Path,
+    hot_stats: &mut PackExecHotStats,
+    stats: &mut PackExecStats,
+) -> Result<(), DeltaDecodeError> {
+    for frame in delta_stack.iter().rev() {
+        let base_bytes = base_spill
+            .as_ref()
+            .map(|spill| spill.as_slice())
+            .unwrap_or_else(|| base_buf.as_slice());
+        let (storage, out_len) = decode_delta_output(
+            pack,
+            frame.data_start,
+            frame.delta_size,
+            base_bytes,
+            limits,
+            inflate_buf,
+            result_buf,
+            spill_dir,
+        )?;
+
+        hot_stats.inc_decoded();
+        match storage {
+            DecodedStorage::Cache | DecodedStorage::Scratch => {
+                std::mem::swap(base_buf, result_buf);
+                *base_spill = None;
+                if !cache.insert(frame.offset, base_kind, base_buf) {
+                    stats.record_cache_reject(base_buf.len());
+                }
+            }
+            DecodedStorage::Spill(spill) => {
+                stats.record_cache_reject(out_len);
+                *base_spill = Some(spill);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_external_root_base<'b, B: ExternalBaseProvider>(
+    oid: OidBytes,
+    external: &mut B,
+    limits: &PackDecodeLimits,
+    spill_dir: &Path,
+    base_buf: &'b mut Vec<u8>,
+    hot_stats: &mut PackExecHotStats,
+    stats: &mut PackExecStats,
+) -> Result<(ObjectKind, Option<BlobSpill>), SkipReason> {
+    hot_stats.inc_external_base_call();
+    match external.load_base(&oid) {
+        Ok(Some(base)) => {
+            let base_len = base.bytes.len();
+            if base_len <= limits.max_object_bytes {
+                base_buf.clear();
+                if base_buf.capacity() < base_len {
+                    base_buf.reserve(base_len - base_buf.capacity());
+                }
+                base_buf.extend_from_slice(&base.bytes);
+                hot_stats.inc_decoded();
+                Ok((base.kind, None))
+            } else {
+                let mut spill = BlobSpill::new(spill_dir, base_len).map_err(|_| {
+                    SkipReason::Decode(PackDecodeError::Inflate(
+                        super::pack_inflate::InflateError::Backend,
+                    ))
+                })?;
+                let mut writer = spill.writer();
+                writer.write(&base.bytes).map_err(|_| {
+                    SkipReason::Decode(PackDecodeError::Inflate(
+                        super::pack_inflate::InflateError::Backend,
+                    ))
+                })?;
+                writer.finish().map_err(|_| {
+                    SkipReason::Decode(PackDecodeError::Inflate(
+                        super::pack_inflate::InflateError::Backend,
+                    ))
+                })?;
+                hot_stats.inc_decoded();
+                stats.record_cache_reject(base_len);
+                Ok((base.kind, Some(spill)))
+            }
+        }
+        Ok(None) => Err(SkipReason::ExternalBaseMissing { oid }),
+        Err(_) => Err(SkipReason::ExternalBaseError),
+    }
 }
 
 /// Decode a base object on demand by walking the delta chain from `offset`.
@@ -1647,8 +2206,10 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
     max_delta_depth: u8,
     cache: &'a mut PackCache,
     external: &'a mut B,
-    delta_deps: &'a [DeltaDep],
+    delta_deps: &'a [DeltaDepHot],
+    external_base_oids: &'a [OidBytes],
     delta_dep_index: &'a [u32],
+    hot_stats: &'a mut PackExecHotStats,
     report: &'a mut PackExecReport,
     inflate_buf: &mut Vec<u8>,
     result_buf: &mut Vec<u8>,
@@ -1672,6 +2233,87 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
             return Err(SkipReason::BaseMissing {
                 base_offset: current_offset,
             });
+        }
+
+        // Fast path: follow persisted delta metadata when available.
+        if let Ok(need_idx) = need_offsets.binary_search(&current_offset) {
+            if let Some(dep) = delta_dep_at_index(delta_deps, delta_dep_index, need_idx)
+                .filter(|dep| dep.has_header_meta())
+            {
+                if dep.is_external() {
+                    let Some(base_oid) = external_base_oids
+                        .get(dep.external_oid_idx as usize)
+                        .copied()
+                    else {
+                        record_fallback_chain(&mut report.stats, delta_stack.len());
+                        return Err(SkipReason::Decode(PackDecodeError::PackParse(
+                            PackParseError::Truncated,
+                        )));
+                    };
+                    delta_stack.push(DeltaFrame {
+                        offset: current_offset,
+                        data_start: dep.data_start,
+                        delta_size: dep.delta_size,
+                    });
+
+                    let (base_kind, mut base_spill) = match load_external_root_base(
+                        base_oid,
+                        external,
+                        limits,
+                        spill_dir,
+                        base_buf,
+                        hot_stats,
+                        &mut report.stats,
+                    ) {
+                        Ok(root) => root,
+                        Err(reason) => {
+                            record_fallback_chain(&mut report.stats, delta_stack.len());
+                            return Err(reason);
+                        }
+                    };
+
+                    if let Err(err) = unwind_delta_stack(
+                        pack,
+                        delta_stack,
+                        base_kind,
+                        &mut base_spill,
+                        limits,
+                        cache,
+                        inflate_buf,
+                        result_buf,
+                        base_buf,
+                        spill_dir,
+                        hot_stats,
+                        &mut report.stats,
+                    ) {
+                        record_fallback_chain(&mut report.stats, delta_stack.len());
+                        return Err(skip_reason_from_delta_error(err));
+                    }
+
+                    record_fallback_chain(&mut report.stats, delta_stack.len());
+                    let storage = match base_spill {
+                        Some(spill) => BaseStorage::Spill(spill),
+                        None => BaseStorage::Slice(base_buf.as_slice()),
+                    };
+                    return Ok(BaseBytes {
+                        kind: base_kind,
+                        storage,
+                    });
+                }
+
+                if dep.base_offset == current_offset {
+                    return Err(SkipReason::BaseMissing {
+                        base_offset: dep.base_offset,
+                    });
+                }
+                delta_stack.push(DeltaFrame {
+                    offset: current_offset,
+                    data_start: dep.data_start,
+                    delta_size: dep.delta_size,
+                });
+                current_offset = dep.base_offset;
+                continue;
+            }
         }
 
         let header = match read_entry_header(pack, current_offset, limits.max_header_bytes) {
@@ -1706,7 +2348,7 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
                         return Err(SkipReason::Decode(err));
                     }
                     perf::record_pack_inflate(base_buf.len(), nanos);
-                    perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
+                    hot_stats.inc_decoded();
                     if !cache.insert(current_offset, kind, base_buf) {
                         report.stats.record_cache_reject(base_buf.len());
                     }
@@ -1739,48 +2381,28 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
                         )));
                     }
                     perf::record_pack_inflate(size, nanos);
-                    perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
+                    hot_stats.inc_decoded();
                     report.stats.record_cache_reject(size);
                     base_spill = Some(spill);
                 }
 
                 let base_kind = kind;
-                for frame in delta_stack.iter().rev() {
-                    let base_bytes = base_spill
-                        .as_ref()
-                        .map(|spill| spill.as_slice())
-                        .unwrap_or_else(|| base_buf.as_slice());
-                    let (storage, out_len) = decode_delta_output(
-                        pack,
-                        &frame.header,
-                        base_bytes,
-                        limits,
-                        inflate_buf,
-                        result_buf,
-                        spill_dir,
-                    )
-                    .map_err(|err| {
-                        record_fallback_chain(&mut report.stats, delta_stack.len());
-                        match err {
-                            DeltaDecodeError::Decode(err) => SkipReason::Decode(err),
-                            DeltaDecodeError::Delta(err) => SkipReason::Delta(err),
-                        }
-                    })?;
-
-                    perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
-                    match storage {
-                        DecodedStorage::Cache | DecodedStorage::Scratch => {
-                            std::mem::swap(base_buf, result_buf);
-                            base_spill = None;
-                            if !cache.insert(frame.offset, base_kind, base_buf) {
-                                report.stats.record_cache_reject(base_buf.len());
-                            }
-                        }
-                        DecodedStorage::Spill(spill) => {
-                            report.stats.record_cache_reject(out_len);
-                            base_spill = Some(spill);
-                        }
-                    }
+                if let Err(err) = unwind_delta_stack(
+                    pack,
+                    delta_stack,
+                    base_kind,
+                    &mut base_spill,
+                    limits,
+                    cache,
+                    inflate_buf,
+                    result_buf,
+                    base_buf,
+                    spill_dir,
+                    hot_stats,
+                    &mut report.stats,
+                ) {
+                    record_fallback_chain(&mut report.stats, delta_stack.len());
+                    return Err(skip_reason_from_delta_error(err));
                 }
 
                 record_fallback_chain(&mut report.stats, delta_stack.len());
@@ -1799,135 +2421,94 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
                 }
                 delta_stack.push(DeltaFrame {
                     offset: current_offset,
-                    header,
+                    data_start: header.data_start as u64,
+                    delta_size: header.size,
                 });
                 current_offset = base_offset;
             }
             EntryKind::RefDelta { base_oid } => {
-                match resolve_ref_base(
-                    current_offset,
-                    base_oid,
-                    need_offsets,
-                    delta_deps,
-                    delta_dep_index,
-                ) {
-                    BaseLoc::Offset(base_offset) => {
+                let dep = need_offsets
+                    .binary_search(&current_offset)
+                    .ok()
+                    .and_then(|idx| delta_dep_at_index(delta_deps, delta_dep_index, idx));
+                match dep {
+                    Some(dep) if !dep.is_external() => {
                         delta_stack.push(DeltaFrame {
                             offset: current_offset,
-                            header,
+                            data_start: if dep.has_header_meta() {
+                                dep.data_start
+                            } else {
+                                header.data_start as u64
+                            },
+                            delta_size: if dep.has_header_meta() {
+                                dep.delta_size
+                            } else {
+                                header.size
+                            },
                         });
-                        current_offset = base_offset;
+                        current_offset = dep.base_offset;
                     }
-                    BaseLoc::External { oid } => {
+                    _ => {
                         delta_stack.push(DeltaFrame {
                             offset: current_offset,
-                            header,
+                            data_start: header.data_start as u64,
+                            delta_size: header.size,
                         });
-                        perf_stats::sat_add_u32(&mut report.stats.external_base_calls, 1);
-                        match external.load_base(&oid) {
-                            Ok(Some(base)) => {
-                                let base_len = base.bytes.len();
-                                let mut base_spill: Option<BlobSpill> = None;
-                                if base_len <= limits.max_object_bytes {
-                                    base_buf.clear();
-                                    if base_buf.capacity() < base_len {
-                                        base_buf.reserve(base_len - base_buf.capacity());
-                                    }
-                                    base_buf.extend_from_slice(&base.bytes);
-                                    perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
-                                } else {
-                                    let mut spill = match BlobSpill::new(spill_dir, base_len) {
-                                        Ok(spill) => spill,
-                                        Err(_) => {
-                                            record_fallback_chain(
-                                                &mut report.stats,
-                                                delta_stack.len(),
-                                            );
-                                            return Err(SkipReason::Decode(
-                                                PackDecodeError::Inflate(
-                                                    super::pack_inflate::InflateError::Backend,
-                                                ),
-                                            ));
-                                        }
-                                    };
-                                    let mut writer = spill.writer();
-                                    if writer.write(&base.bytes).is_err() {
-                                        record_fallback_chain(&mut report.stats, delta_stack.len());
-                                        return Err(SkipReason::Decode(PackDecodeError::Inflate(
-                                            super::pack_inflate::InflateError::Backend,
-                                        )));
-                                    }
-                                    if writer.finish().is_err() {
-                                        record_fallback_chain(&mut report.stats, delta_stack.len());
-                                        return Err(SkipReason::Decode(PackDecodeError::Inflate(
-                                            super::pack_inflate::InflateError::Backend,
-                                        )));
-                                    }
-                                    perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
-                                    report.stats.record_cache_reject(base_len);
-                                    base_spill = Some(spill);
-                                };
+                        let base_oid = dep
+                            .and_then(|dep| {
+                                dep.is_external()
+                                    .then(|| {
+                                        external_base_oids
+                                            .get(dep.external_oid_idx as usize)
+                                            .copied()
+                                    })
+                                    .flatten()
+                            })
+                            .unwrap_or(base_oid);
 
-                                let base_kind = base.kind;
-                                for frame in delta_stack.iter().rev() {
-                                    let base_bytes = base_spill
-                                        .as_ref()
-                                        .map(|spill| spill.as_slice())
-                                        .unwrap_or_else(|| base_buf.as_slice());
-                                    let (storage, out_len) = decode_delta_output(
-                                        pack,
-                                        &frame.header,
-                                        base_bytes,
-                                        limits,
-                                        inflate_buf,
-                                        result_buf,
-                                        spill_dir,
-                                    )
-                                    .map_err(|err| {
-                                        record_fallback_chain(&mut report.stats, delta_stack.len());
-                                        match err {
-                                            DeltaDecodeError::Decode(err) => {
-                                                SkipReason::Decode(err)
-                                            }
-                                            DeltaDecodeError::Delta(err) => SkipReason::Delta(err),
-                                        }
-                                    })?;
+                        let (base_kind, mut base_spill) = match load_external_root_base(
+                            base_oid,
+                            external,
+                            limits,
+                            spill_dir,
+                            base_buf,
+                            hot_stats,
+                            &mut report.stats,
+                        ) {
+                            Ok(root) => root,
+                            Err(reason) => {
+                                record_fallback_chain(&mut report.stats, delta_stack.len());
+                                return Err(reason);
+                            }
+                        };
 
-                                    perf_stats::sat_add_u32(&mut report.stats.decoded_offsets, 1);
-                                    match storage {
-                                        DecodedStorage::Cache | DecodedStorage::Scratch => {
-                                            std::mem::swap(base_buf, result_buf);
-                                            base_spill = None;
-                                            if !cache.insert(frame.offset, base_kind, base_buf) {
-                                                report.stats.record_cache_reject(base_buf.len());
-                                            }
-                                        }
-                                        DecodedStorage::Spill(spill) => {
-                                            report.stats.record_cache_reject(out_len);
-                                            base_spill = Some(spill);
-                                        }
-                                    }
-                                }
-
-                                record_fallback_chain(&mut report.stats, delta_stack.len());
-                                let storage = match base_spill {
-                                    Some(spill) => BaseStorage::Spill(spill),
-                                    None => BaseStorage::Slice(base_buf.as_slice()),
-                                };
-                                return Ok(BaseBytes {
-                                    kind: base_kind,
-                                    storage,
-                                });
-                            }
-                            Ok(None) => {
-                                record_fallback_chain(&mut report.stats, delta_stack.len());
-                                return Err(SkipReason::ExternalBaseMissing { oid });
-                            }
-                            Err(_) => {
-                                record_fallback_chain(&mut report.stats, delta_stack.len());
-                                return Err(SkipReason::ExternalBaseError);
-                            }
+                        if let Err(err) = unwind_delta_stack(
+                            pack,
+                            delta_stack,
+                            base_kind,
+                            &mut base_spill,
+                            limits,
+                            cache,
+                            inflate_buf,
+                            result_buf,
+                            base_buf,
+                            spill_dir,
+                            hot_stats,
+                            &mut report.stats,
+                        ) {
+                            record_fallback_chain(&mut report.stats, delta_stack.len());
+                            return Err(skip_reason_from_delta_error(err));
                         }
+
+                        record_fallback_chain(&mut report.stats, delta_stack.len());
+                        let storage = match base_spill {
+                            Some(spill) => BaseStorage::Spill(spill),
+                            None => BaseStorage::Slice(base_buf.as_slice()),
+                        };
+                        return Ok(BaseBytes {
+                            kind: base_kind,
+                            storage,
+                        });
                     }
                 }
             }
@@ -1946,20 +2527,6 @@ enum DeltaDecodeError {
     Decode(PackDecodeError),
     /// Delta application itself failed (e.g., output overrun, bad opcodes).
     Delta(DeltaError),
-}
-
-/// Returns the best OID to query for external bases.
-///
-/// If the planner resolved a specific external base OID, prefer it over the
-/// base OID encoded in the REF delta header.
-fn oid_or_base(base_oid: OidBytes, dep: Option<&DeltaDep>) -> OidBytes {
-    match dep {
-        Some(DeltaDep {
-            base: BaseLoc::External { oid },
-            ..
-        }) => *oid,
-        _ => base_oid,
-    }
 }
 
 #[cfg(test)]
@@ -2158,7 +2725,7 @@ mod tests {
         sink: &mut S,
         scratch: &mut PackExecScratch,
         exec_indices: &[usize],
-        candidate_ranges: &[Option<(usize, usize)>],
+        candidate_ranges: &[CandidateRange],
     ) -> PackExecReport {
         let spill_dir = tempfile::tempdir().expect("spill dir");
         execute_pack_plan_with_scratch_indices(
@@ -2173,6 +2740,36 @@ mod tests {
             scratch,
             exec_indices,
             candidate_ranges,
+        )
+        .unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn exec_plan_range<S: PackObjectSink, B: ExternalBaseProvider>(
+        plan: &PackPlan,
+        pack: &[u8],
+        arena: &ByteArena,
+        limits: &PackDecodeLimits,
+        cache: &mut PackCache,
+        external: &mut B,
+        sink: &mut S,
+        scratch: &mut PackExecScratch,
+        start_idx: usize,
+        end_idx: usize,
+    ) -> PackExecReport {
+        let spill_dir = tempfile::tempdir().expect("spill dir");
+        execute_pack_plan_with_scratch_range(
+            plan,
+            pack,
+            arena,
+            limits,
+            cache,
+            external,
+            sink,
+            spill_dir.path(),
+            scratch,
+            start_idx,
+            end_idx,
         )
         .unwrap()
     }
@@ -2220,6 +2817,12 @@ mod tests {
             }
         }
         index
+    }
+
+    fn delta_header_meta(pack: &[u8], offset: u64) -> (u64, u64) {
+        let parsed = PackFile::parse(pack, 20).expect("pack parse");
+        let header = parsed.entry_header_at(offset, 64).expect("entry header");
+        (header.data_start as u64, header.size)
     }
 
     fn build_plan(
@@ -2496,10 +3099,13 @@ mod tests {
         };
 
         let need_offsets = vec![base_offset, delta_offset];
+        let (data_start, delta_size) = delta_header_meta(&pack, delta_offset);
         let delta_deps = vec![DeltaDep {
             offset: delta_offset,
             kind: DeltaKind::Ofs,
             base: BaseLoc::Offset(base_offset),
+            data_start,
+            delta_size,
         }];
         let delta_dep_index = build_delta_dep_index(&need_offsets, &delta_deps);
         let plan = PackPlan {
@@ -2796,6 +3402,103 @@ mod tests {
     }
 
     #[test]
+    fn shard_range_exec_matches_index_exec_for_natural_order() {
+        let (pack, offsets) = build_pack(&[
+            (ObjectKind::Blob, b"first"),
+            (ObjectKind::Blob, b"second"),
+            (ObjectKind::Blob, b"third"),
+        ]);
+
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"file.txt").unwrap();
+        let candidates = vec![
+            PackCandidate {
+                oid: OidBytes::sha1([0x11; 20]),
+                ctx: ctx(path_ref),
+                pack_id: 0,
+                offset: offsets[0],
+            },
+            PackCandidate {
+                oid: OidBytes::sha1([0x22; 20]),
+                ctx: ctx(path_ref),
+                pack_id: 0,
+                offset: offsets[1],
+            },
+            PackCandidate {
+                oid: OidBytes::sha1([0x33; 20]),
+                ctx: ctx(path_ref),
+                pack_id: 0,
+                offset: offsets[2],
+            },
+        ];
+
+        let plan = build_plan(
+            vec![offsets[0], offsets[1], offsets[2]],
+            candidates,
+            vec![
+                CandidateAtOffset {
+                    offset: offsets[0],
+                    cand_idx: 0,
+                },
+                CandidateAtOffset {
+                    offset: offsets[1],
+                    cand_idx: 1,
+                },
+                CandidateAtOffset {
+                    offset: offsets[2],
+                    cand_idx: 2,
+                },
+            ],
+            None,
+        );
+
+        let mut candidate_ranges = Vec::new();
+        build_candidate_ranges(&plan, &mut candidate_ranges);
+        let exec_indices = [1usize, 2usize];
+
+        let mut cache_idx = PackCache::new(0);
+        let mut external_idx = NoExternal;
+        let mut sink_idx = TestSink::default();
+        let mut scratch_idx = PackExecScratch::default();
+        let report_idx = exec_plan_indices(
+            &plan,
+            &pack,
+            &arena,
+            &PackDecodeLimits::new(64, 1024, 1024),
+            &mut cache_idx,
+            &mut external_idx,
+            &mut sink_idx,
+            &mut scratch_idx,
+            &exec_indices,
+            &candidate_ranges,
+        );
+
+        let mut cache_range = PackCache::new(0);
+        let mut external_range = NoExternal;
+        let mut sink_range = TestSink::default();
+        let mut scratch_range = PackExecScratch::default();
+        let report_range = exec_plan_range(
+            &plan,
+            &pack,
+            &arena,
+            &PackDecodeLimits::new(64, 1024, 1024),
+            &mut cache_range,
+            &mut external_range,
+            &mut sink_range,
+            &mut scratch_range,
+            1,
+            3,
+        );
+
+        assert_eq!(
+            report_range.stats.emitted_candidates,
+            report_idx.stats.emitted_candidates
+        );
+        assert_eq!(report_range.skips.len(), report_idx.skips.len());
+        assert_eq!(sink_range.emitted, sink_idx.emitted);
+    }
+
+    #[test]
     fn shard_exec_decodes_delta_without_base_cached() {
         let base_bytes = b"";
         let result_bytes = b"TOK_ABCDEFGH";
@@ -2827,10 +3530,13 @@ mod tests {
         };
 
         let need_offsets = vec![base_offset, delta_offset];
+        let (data_start, delta_size) = delta_header_meta(&pack, delta_offset);
         let delta_deps = vec![DeltaDep {
             offset: delta_offset,
             kind: DeltaKind::Ofs,
             base: BaseLoc::Offset(base_offset),
+            data_start,
+            delta_size,
         }];
         let delta_dep_index = build_delta_dep_index(&need_offsets, &delta_deps);
         let plan = PackPlan {
@@ -2911,10 +3617,13 @@ mod tests {
         };
 
         let need_offsets = vec![base_offset, delta_offset];
+        let (data_start, delta_size) = delta_header_meta(&pack, delta_offset);
         let delta_deps = vec![DeltaDep {
             offset: delta_offset,
             kind: DeltaKind::Ofs,
             base: BaseLoc::Offset(base_offset),
+            data_start,
+            delta_size,
         }];
         let delta_dep_index = build_delta_dep_index(&need_offsets, &delta_deps);
         let plan = PackPlan {
@@ -2993,10 +3702,13 @@ mod tests {
         };
 
         let need_offsets = vec![base_offset, delta_offset];
+        let (data_start, delta_size) = delta_header_meta(&pack, delta_offset);
         let delta_deps = vec![DeltaDep {
             offset: delta_offset,
             kind: DeltaKind::Ofs,
             base: BaseLoc::Offset(base_offset),
+            data_start,
+            delta_size,
         }];
         let delta_dep_index = build_delta_dep_index(&need_offsets, &delta_deps);
         let plan = PackPlan {
@@ -3075,10 +3787,13 @@ mod tests {
         };
 
         let need_offsets = vec![base_offset, delta_offset];
+        let (data_start, delta_size) = delta_header_meta(&pack, delta_offset);
         let delta_deps = vec![DeltaDep {
             offset: delta_offset,
             kind: DeltaKind::Ofs,
             base: BaseLoc::Offset(base_offset),
+            data_start,
+            delta_size,
         }];
         let delta_dep_index = build_delta_dep_index(&need_offsets, &delta_deps);
         let plan = PackPlan {
@@ -3155,10 +3870,13 @@ mod tests {
         };
 
         let need_offsets = vec![delta_offset];
+        let (data_start, delta_size) = delta_header_meta(&pack, delta_offset);
         let delta_deps = vec![DeltaDep {
             offset: delta_offset,
             kind: DeltaKind::Ref,
             base: BaseLoc::External { oid: base_oid },
+            data_start,
+            delta_size,
         }];
         let delta_dep_index = build_delta_dep_index(&need_offsets, &delta_deps);
         let plan = PackPlan {

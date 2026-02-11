@@ -28,6 +28,8 @@ fn random_acyclic_dag(n: usize, edges_raw: &[(usize, usize)]) -> (Vec<u64>, Vec<
             offset: need_offsets[dep_idx],
             kind: DeltaKind::Ofs,
             base: BaseLoc::Offset(need_offsets[base_idx]),
+            data_start: 0,
+            delta_size: 0,
         });
     }
 
@@ -110,6 +112,8 @@ proptest! {
             offset: need_offsets[low],
             kind: DeltaKind::Ofs,
             base: BaseLoc::Offset(need_offsets[high]),
+            data_start: 0,
+            delta_size: 0,
         });
 
         // There must exist a forward path from low→high (via the acyclic edges)

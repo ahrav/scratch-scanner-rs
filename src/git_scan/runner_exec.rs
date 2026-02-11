@@ -48,12 +48,13 @@ use super::pack_candidates::LooseCandidate;
 use super::pack_decode::PackDecodeLimits;
 use super::pack_exec::{
     build_candidate_ranges, execute_pack_plan_with_scratch, execute_pack_plan_with_scratch_indices,
-    merge_pack_exec_reports, PackExecError, PackExecReport, PackExecScratch, SkipRecord,
+    execute_pack_plan_with_scratch_range, merge_pack_exec_reports, CandidateRange, PackExecError,
+    PackExecReport, PackExecScratch, SkipRecord,
 };
 use super::pack_inflate::ObjectKind;
 use super::pack_io::{PackIo, PackIoError, PackIoLimits};
 use super::pack_plan::{PackPlanError, PackView};
-use super::pack_plan_model::{BaseLoc, PackPlan};
+use super::pack_plan_model::{BaseLoc, PackPlan, NONE_U32};
 use super::repo::GitRepoPaths;
 use super::repo_open::RepoJobState;
 use super::runner::{CandidateSkipReason, GitScanError, PackMmapLimits, SkippedCandidate};
@@ -585,6 +586,10 @@ const MIN_NEED_PER_SHARD: usize = 1_024;
 const MIN_SPAN_PER_SHARD: u64 = 4 * 1024 * 1024;
 /// Cap shard fan-out when dependency pressure is high.
 const MAX_SHARDS_WITH_DEP_PRESSURE: usize = 2;
+/// Locality cap target: allow at most this percent of offset deps to cross shard boundaries.
+const MAX_LOCALITY_CROSS_PERCENT: usize = 55;
+/// Minimum offset-dependency sample size before locality pressure can reduce shards.
+const MIN_LOCALITY_DEP_SAMPLES: usize = 128;
 
 /// Stats-free cost hint derived from core `PackPlan` structure.
 ///
@@ -606,6 +611,17 @@ struct PlanCostHint {
     forward_deps: usize,
     /// Delta deps resolved via external OID lookup (not by offset).
     external_deps: usize,
+}
+
+/// Cross-shard locality pressure estimate for one plan at a candidate shard count.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LocalityPressure {
+    /// Count of offset-based delta deps examined (`BaseLoc::Offset`).
+    offset_deps: usize,
+    /// Offset deps where base/dependent would land in different shards.
+    cross_shard_offset_deps: usize,
+    /// Offset deps whose base offset was not found in `need_offsets`.
+    unresolved_offset_bases: usize,
 }
 
 /// Diff-history pack execution strategy for a planned pack set.
@@ -663,6 +679,118 @@ fn build_plan_cost_hint(plan: &PackPlan) -> PlanCostHint {
     }
 }
 
+/// Maps execution position to shard id using the same partitioning as [`shard_ranges`].
+#[inline(always)]
+fn shard_id_for_exec_position(pos: usize, len: usize, shards: usize) -> usize {
+    debug_assert!(len > 0);
+    debug_assert!(shards > 0);
+    debug_assert!(shards <= len);
+    debug_assert!(pos < len);
+    let base = len / shards;
+    let extra = len % shards;
+    let large_prefix_len = (base + 1) * extra;
+    if pos < large_prefix_len {
+        pos / (base + 1)
+    } else {
+        extra + (pos - large_prefix_len) / base
+    }
+}
+
+/// Estimate cross-shard dependency pressure for a proposed shard count.
+///
+/// Uses execution positions (natural order or `exec_order`) and counts how
+/// many offset-based deps would cross shard boundaries under contiguous shard
+/// partitioning.
+fn estimate_locality_pressure(plan: &PackPlan, shards: usize) -> LocalityPressure {
+    let need_count = plan.need_offsets.len();
+    if need_count <= 1 || shards <= 1 {
+        return LocalityPressure::default();
+    }
+    let shards = shards.max(1).min(need_count);
+
+    let exec_pos_by_need = plan.exec_order.as_ref().map(|order| {
+        let mut pos = vec![usize::MAX; need_count];
+        for (exec_pos, &need_idx_u32) in order.iter().enumerate() {
+            let need_idx = need_idx_u32 as usize;
+            if need_idx < need_count {
+                pos[need_idx] = exec_pos;
+            }
+        }
+        pos
+    });
+
+    let position_for_need_idx = |need_idx: usize| -> Option<usize> {
+        if let Some(pos) = exec_pos_by_need.as_ref() {
+            let exec_pos = *pos.get(need_idx)?;
+            (exec_pos != usize::MAX).then_some(exec_pos)
+        } else {
+            Some(need_idx)
+        }
+    };
+
+    let mut pressure = LocalityPressure::default();
+    for (need_idx, &dep_idx_u32) in plan.delta_dep_index.iter().enumerate() {
+        if dep_idx_u32 == NONE_U32 {
+            continue;
+        }
+        let Some(dep) = plan.delta_deps.get(dep_idx_u32 as usize) else {
+            continue;
+        };
+        let base_offset = match &dep.base {
+            BaseLoc::Offset(base_offset) => *base_offset,
+            BaseLoc::External { .. } => continue,
+        };
+        pressure.offset_deps = pressure.offset_deps.saturating_add(1);
+        let Ok(base_need_idx) = plan.need_offsets.binary_search(&base_offset) else {
+            pressure.unresolved_offset_bases = pressure.unresolved_offset_bases.saturating_add(1);
+            continue;
+        };
+        let Some(dep_pos) = position_for_need_idx(need_idx) else {
+            pressure.unresolved_offset_bases = pressure.unresolved_offset_bases.saturating_add(1);
+            continue;
+        };
+        let Some(base_pos) = position_for_need_idx(base_need_idx) else {
+            pressure.unresolved_offset_bases = pressure.unresolved_offset_bases.saturating_add(1);
+            continue;
+        };
+        if shard_id_for_exec_position(dep_pos, need_count, shards)
+            != shard_id_for_exec_position(base_pos, need_count, shards)
+        {
+            pressure.cross_shard_offset_deps = pressure.cross_shard_offset_deps.saturating_add(1);
+        }
+    }
+
+    pressure
+}
+
+/// Reduce shard fan-out when contiguous shards would fragment many delta edges.
+///
+/// The cap is lowered deterministically until weighted cross-shard pressure
+/// (crossings + 2× unresolved bases) falls below
+/// [`MAX_LOCALITY_CROSS_PERCENT`], or until
+/// [`MAX_SHARDS_WITH_DEP_PRESSURE`] is reached.
+fn apply_locality_shard_cap(plan: &PackPlan, shard_cap: usize) -> usize {
+    let mut cap = shard_cap.max(1).min(plan.need_offsets.len());
+    while cap > MAX_SHARDS_WITH_DEP_PRESSURE {
+        let pressure = estimate_locality_pressure(plan, cap);
+        if pressure.offset_deps < MIN_LOCALITY_DEP_SAMPLES {
+            break;
+        }
+        let weighted_cross = pressure
+            .cross_shard_offset_deps
+            .saturating_add(pressure.unresolved_offset_bases.saturating_mul(2));
+        if weighted_cross.saturating_mul(100)
+            <= pressure
+                .offset_deps
+                .saturating_mul(MAX_LOCALITY_CROSS_PERCENT)
+        {
+            break;
+        }
+        cap -= 1;
+    }
+    cap
+}
+
 /// Select the shard count for one pack plan based on structural heuristics.
 ///
 /// The shard count is the minimum of several independent caps:
@@ -672,6 +800,8 @@ fn build_plan_cost_hint(plan: &PackPlan) -> PlanCostHint {
 /// 4. **Dependency pressure** — if more than half the need offsets have forward
 ///    or external deps, the shard count is capped to [`MAX_SHARDS_WITH_DEP_PRESSURE`]
 ///    to reduce cross-shard ordering hazards.
+/// 5. **Locality pressure** — if projected shard boundaries split too many
+///    offset-based deps in execution order, reduce fan-out to improve cache locality.
 ///
 /// Returns 1 for single-worker execution or degenerate plans (≤ 1 offset).
 #[inline(always)]
@@ -707,6 +837,8 @@ pub(super) fn select_plan_shard_count(workers: usize, plan: &PackPlan) -> usize 
     if dep_pressure > (hint.need_count / 2) {
         shard_cap = shard_cap.min(MAX_SHARDS_WITH_DEP_PRESSURE);
     }
+
+    shard_cap = apply_locality_shard_cap(plan, shard_cap);
 
     shard_cap.max(1).min(hint.need_count)
 }
@@ -901,18 +1033,48 @@ struct SchedulerPackWorkerRuntime {
     _midx_bytes: BytesView,
 }
 
+/// Scheduler execution representation for one plan's shardable decode order.
+#[derive(Clone)]
+enum SchedulerShardExecPlan {
+    /// Natural order `need_offsets[start..end)`.
+    Natural { len: usize },
+    /// Explicit execution permutation (`exec_order`) by need index.
+    Explicit(Vec<usize>),
+}
+
+impl SchedulerShardExecPlan {
+    #[inline(always)]
+    fn len(&self) -> usize {
+        match self {
+            Self::Natural { len } => *len,
+            Self::Explicit(indices) => indices.len(),
+        }
+    }
+}
+
+/// Build shard execution representation for one plan.
+#[inline(always)]
+fn build_scheduler_shard_exec_plan(plan: &PackPlan) -> SchedulerShardExecPlan {
+    if plan.exec_order.is_some() {
+        SchedulerShardExecPlan::Explicit(build_exec_indices(plan))
+    } else {
+        SchedulerShardExecPlan::Natural {
+            len: plan.need_offsets.len(),
+        }
+    }
+}
+
 /// Pre-computed sharding metadata for one pack plan.
 ///
 /// Built once before task dispatch and shared (read-only) across all shard
-/// tasks for the same plan. `exec_indices` defines the decode order;
+/// tasks for the same plan. `exec_plan` defines decode ordering and
 /// `shard_ranges` partitions that order into contiguous slices, one per shard.
 #[derive(Clone)]
 struct SchedulerShardMeta {
-    /// Decode order indices into `plan.need_offsets`.
-    exec_indices: Vec<usize>,
-    /// Per-offset candidate range: `Some((start, end))` into `plan.candidates`.
-    candidate_ranges: Vec<Option<(usize, usize)>>,
-    /// `(start, end)` slices into `exec_indices`, one per shard.
+    exec_plan: SchedulerShardExecPlan,
+    /// Per-offset candidate ranges for explicit exec-order sharding.
+    candidate_ranges: Vec<CandidateRange>,
+    /// `(start, end)` slices into `exec_plan`.
     shard_ranges: Vec<(usize, usize)>,
 }
 
@@ -956,11 +1118,15 @@ struct SchedulerPackShared {
 fn reserve_results_for_exec_slice(
     adapter: &mut EngineAdapter<'_>,
     exec_slice: &[usize],
-    candidate_ranges: &[Option<(usize, usize)>],
+    candidate_ranges: &[CandidateRange],
 ) {
     let mut total = 0usize;
     for idx in exec_slice {
-        if let Some((start, end)) = candidate_ranges.get(*idx).copied().flatten() {
+        if let Some((start, end)) = candidate_ranges
+            .get(*idx)
+            .copied()
+            .and_then(CandidateRange::bounds)
+        {
             total = total.saturating_add(end.saturating_sub(start));
         }
     }
@@ -969,10 +1135,37 @@ fn reserve_results_for_exec_slice(
     }
 }
 
+/// Pre-allocate adapter result capacity for natural-order shard range.
+///
+/// Uses offset bounds to count candidates in `need_offsets[start..end)` without
+/// materializing per-index candidate range tables.
+fn reserve_results_for_need_range(
+    adapter: &mut EngineAdapter<'_>,
+    plan: &PackPlan,
+    start: usize,
+    end: usize,
+) {
+    if start >= end {
+        return;
+    }
+    let first_offset = plan.need_offsets[start];
+    let last_offset = plan.need_offsets[end - 1];
+    let cand_start = plan
+        .candidate_offsets
+        .partition_point(|cand| cand.offset < first_offset);
+    let cand_end = plan
+        .candidate_offsets
+        .partition_point(|cand| cand.offset <= last_offset);
+    let total = cand_end.saturating_sub(cand_start);
+    if total > 0 {
+        adapter.reserve_results(total);
+    }
+}
+
 /// Construct a zero-work output for plans with no executable offsets.
 ///
-/// Used by the `IntraPackSharded` path when a plan has empty `exec_indices`
-/// (no offsets to decode), so every plan slot has a value for deterministic
+/// Used by the `IntraPackSharded` path when a plan has no decode work (empty
+/// execution order), so every plan slot has a value for deterministic
 /// reassembly without special-casing `None`.
 fn empty_scheduler_output() -> SchedulerPackExecOutput {
     SchedulerPackExecOutput {
@@ -1144,7 +1337,6 @@ fn run_scheduler_pack_task(
                     "scheduler shard index out of range".to_string(),
                 ))
             })?;
-            let exec_slice = &shard_meta.exec_indices[start..end];
 
             let pack_id = plan.pack_id as usize;
             let pack_bytes = shared
@@ -1157,20 +1349,45 @@ fn run_scheduler_pack_task(
                 }))?
                 .as_ref();
 
-            reserve_results_for_exec_slice(adapter, exec_slice, &shard_meta.candidate_ranges);
-            let report = execute_pack_plan_with_scratch_indices(
-                plan,
-                pack_bytes,
-                shared.path_arena.as_ref(),
-                &shared.pack_decode,
-                cache,
-                external,
-                adapter,
-                shared.spill_dir.as_ref(),
-                exec_scratch,
-                exec_slice,
-                &shard_meta.candidate_ranges,
-            )?;
+            let report = match &shard_meta.exec_plan {
+                SchedulerShardExecPlan::Explicit(exec_indices) => {
+                    let exec_slice = &exec_indices[start..end];
+                    reserve_results_for_exec_slice(
+                        adapter,
+                        exec_slice,
+                        &shard_meta.candidate_ranges,
+                    );
+                    execute_pack_plan_with_scratch_indices(
+                        plan,
+                        pack_bytes,
+                        shared.path_arena.as_ref(),
+                        &shared.pack_decode,
+                        cache,
+                        external,
+                        adapter,
+                        shared.spill_dir.as_ref(),
+                        exec_scratch,
+                        exec_slice,
+                        &shard_meta.candidate_ranges,
+                    )?
+                }
+                SchedulerShardExecPlan::Natural { .. } => {
+                    reserve_results_for_need_range(adapter, plan, start, end);
+                    execute_pack_plan_with_scratch_range(
+                        plan,
+                        pack_bytes,
+                        shared.path_arena.as_ref(),
+                        &shared.pack_decode,
+                        cache,
+                        external,
+                        adapter,
+                        shared.spill_dir.as_ref(),
+                        exec_scratch,
+                        start,
+                        end,
+                    )?
+                }
+            };
 
             let mut skipped = Vec::new();
             collect_skipped_candidates(plan, &report.skips, &mut skipped);
@@ -1341,25 +1558,31 @@ pub(super) fn execute_pack_plans_with_scheduler(
             Ok(merged)
         }
         PackExecStrategy::IntraPackSharded { shard_counts } => {
-            let mut candidate_ranges_buf = Vec::new();
             let mut shard_meta = Vec::with_capacity(plan_count);
             let mut tasks = Vec::new();
 
             for (plan_idx, plan) in plans.iter().enumerate() {
-                let exec_indices = build_exec_indices(plan);
-                if exec_indices.is_empty() {
+                let exec_plan = build_scheduler_shard_exec_plan(plan);
+                let exec_len = exec_plan.len();
+                if exec_len == 0 {
                     shard_meta.push(SchedulerShardMeta {
-                        exec_indices,
+                        exec_plan,
                         candidate_ranges: Vec::new(),
                         shard_ranges: Vec::new(),
                     });
                     continue;
                 }
 
-                build_candidate_ranges(plan, &mut candidate_ranges_buf);
-                let candidate_ranges = candidate_ranges_buf.clone();
+                let candidate_ranges = if matches!(&exec_plan, SchedulerShardExecPlan::Explicit(_))
+                {
+                    let mut ranges = Vec::new();
+                    build_candidate_ranges(plan, &mut ranges);
+                    ranges
+                } else {
+                    Vec::new()
+                };
                 let shard_count = shard_count_for_pack(&shard_counts, plan.pack_id);
-                let shard_ranges = shard_ranges(exec_indices.len(), shard_count);
+                let shard_ranges = shard_ranges(exec_len, shard_count);
                 for shard_idx in 0..shard_ranges.len() {
                     tasks.push(SchedulerPackTask::ExecShard {
                         plan_idx,
@@ -1368,7 +1591,7 @@ pub(super) fn execute_pack_plans_with_scheduler(
                 }
 
                 shard_meta.push(SchedulerShardMeta {
-                    exec_indices,
+                    exec_plan,
                     candidate_ranges,
                     shard_ranges,
                 });
@@ -1670,6 +1893,8 @@ mod tests {
                 offset,
                 kind: DeltaKind::Ofs,
                 base: BaseLoc::Offset(offset.saturating_add(1)),
+                data_start: 0,
+                delta_size: 0,
             });
         }
         for idx in 0..external_deps {
@@ -1680,9 +1905,17 @@ mod tests {
                 base: BaseLoc::External {
                     oid: OidBytes::default(),
                 },
+                data_start: 0,
+                delta_size: 0,
             });
         }
         delta_deps.sort_by_key(|dep| dep.offset);
+        let mut delta_dep_index = vec![NONE_U32; need_count];
+        for (dep_idx, dep) in delta_deps.iter().enumerate() {
+            if let Ok(need_idx) = need_offsets.binary_search(&dep.offset) {
+                delta_dep_index[need_idx] = dep_idx as u32;
+            }
+        }
 
         PackPlan {
             pack_id,
@@ -1692,10 +1925,43 @@ mod tests {
             candidate_offsets: Vec::new(),
             need_offsets,
             delta_deps,
-            delta_dep_index: vec![NONE_U32; need_count],
+            delta_dep_index,
             exec_order: None,
             stats: PackPlanStats::empty(),
         }
+    }
+
+    fn synthetic_locality_plan(
+        pack_id: u16,
+        need_count: usize,
+        span_bytes: u64,
+        dep_gap: usize,
+    ) -> PackPlan {
+        let mut plan = synthetic_plan(pack_id, need_count, span_bytes, 0, 0);
+        if dep_gap == 0 || dep_gap >= need_count {
+            return plan;
+        }
+
+        let mut delta_deps = Vec::with_capacity(need_count.saturating_sub(dep_gap));
+        for dep_need_idx in dep_gap..need_count {
+            delta_deps.push(DeltaDep {
+                offset: plan.need_offsets[dep_need_idx],
+                kind: DeltaKind::Ofs,
+                base: BaseLoc::Offset(plan.need_offsets[dep_need_idx - dep_gap]),
+                data_start: 0,
+                delta_size: 0,
+            });
+        }
+        let mut delta_dep_index = vec![NONE_U32; need_count];
+        for (dep_idx, dep) in delta_deps.iter().enumerate() {
+            if let Ok(need_idx) = plan.need_offsets.binary_search(&dep.offset) {
+                delta_dep_index[need_idx] = dep_idx as u32;
+            }
+        }
+
+        plan.delta_deps = delta_deps;
+        plan.delta_dep_index = delta_dep_index;
+        plan
     }
 
     #[test]
@@ -1757,6 +2023,45 @@ mod tests {
             2,
             "dependency pressure should cap shard fan-out",
         );
+    }
+
+    #[test]
+    fn select_plan_shard_count_caps_locality_pressure_without_forward_or_external_deps() {
+        let locality_heavy = synthetic_locality_plan(0, 8_192, 512 * 1024 * 1024, 2_048);
+        let hint = build_plan_cost_hint(&locality_heavy);
+        assert_eq!(hint.forward_deps, 0);
+        assert_eq!(hint.external_deps, 0);
+        assert_eq!(
+            select_plan_shard_count(8, &locality_heavy),
+            2,
+            "wide backward deps should reduce shard fan-out for locality",
+        );
+    }
+
+    #[test]
+    fn build_scheduler_shard_exec_plan_uses_natural_range_for_monotone_plans() {
+        let plan = synthetic_plan(0, 2_048, 64 * 1024 * 1024, 0, 0);
+        match build_scheduler_shard_exec_plan(&plan) {
+            SchedulerShardExecPlan::Natural { len } => assert_eq!(len, plan.need_offsets.len()),
+            SchedulerShardExecPlan::Explicit(indices) => {
+                panic!(
+                    "expected natural shard plan, got explicit len={}",
+                    indices.len()
+                )
+            }
+        }
+    }
+
+    #[test]
+    fn build_scheduler_shard_exec_plan_uses_indices_for_exec_ordered_plans() {
+        let mut plan = synthetic_plan(0, 4, 16 * 1024 * 1024, 0, 0);
+        plan.exec_order = Some(vec![2, 0, 3, 1]);
+        match build_scheduler_shard_exec_plan(&plan) {
+            SchedulerShardExecPlan::Natural { .. } => panic!("expected explicit shard plan"),
+            SchedulerShardExecPlan::Explicit(indices) => {
+                assert_eq!(indices, vec![2, 0, 3, 1]);
+            }
+        }
     }
 
     #[test]
