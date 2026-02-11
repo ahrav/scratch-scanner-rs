@@ -513,15 +513,16 @@ impl CandidateRange {
         }
     }
 
+    /// Packs a half-open candidate index range `[start, end)` into `u32` bounds.
+    ///
+    /// # Panics
+    /// Panics when `start > end` or when either bound exceeds `u32::MAX`.
     #[inline(always)]
     pub fn from_bounds(start: usize, end: usize) -> Self {
-        debug_assert!(start <= end);
-        debug_assert!(start <= u32::MAX as usize);
-        debug_assert!(end <= u32::MAX as usize);
-        Self {
-            start: start as u32,
-            end: end as u32,
-        }
+        assert!(start <= end, "candidate range start must be <= end");
+        let start = u32::try_from(start).expect("candidate range start exceeds u32::MAX");
+        let end = u32::try_from(end).expect("candidate range end exceeds u32::MAX");
+        Self { start, end }
     }
 
     #[inline(always)]
@@ -661,6 +662,16 @@ impl PackExecScratch {
 }
 
 /// Where the decoded bytes live after `decode_offset`.
+///
+/// Each variant has different ownership semantics:
+/// - `Cache` — bytes are owned by the `PackCache`; valid until the cache
+///   evicts the entry or is dropped. A second `cache_get` call is needed
+///   to obtain a slice.
+/// - `Scratch` — bytes live in `result_buf`, which is overwritten on the
+///   next offset decode. The sink must consume them before returning from
+///   `emit`.
+/// - `Spill` — bytes live in an mmap-backed temp file. The `BlobSpill`
+///   handle must outlive any slice borrows.
 #[derive(Debug)]
 enum DecodedStorage {
     /// Bytes are stored in the `PackCache`.
@@ -707,6 +718,11 @@ fn cache_get(cache: &mut PackCache, offset: u64) -> Option<CachedObject<'_>> {
 /// Small bases are borrowed from the cache or `base_buf` (`Slice`).
 /// Bases that exceed `max_object_bytes` are backed by a spill mmap; the
 /// `BlobSpill` owns the mapping and must outlive any slice borrows.
+///
+/// The lifetime `'a` ties `Slice` borrows to either the `PackCache`
+/// (when the base was a cache hit) or `base_buf` (after fallback
+/// decode). `Spill` is `'static`-equivalent because the mmap owns its
+/// backing file.
 enum BaseStorage<'a> {
     Slice(&'a [u8]),
     /// Spill-backed bytes; the spill must remain alive while referenced.
@@ -725,8 +741,12 @@ impl BaseStorage<'_> {
 /// Resolved base object: its git object kind plus the raw bytes.
 ///
 /// Used as the input to `decode_delta_output`. The kind propagates
-/// through the delta chain (the final reconstructed object inherits the
-/// kind of the root non-delta base).
+/// through the delta chain — the final reconstructed object inherits
+/// the kind of the root non-delta base, even when multiple intermediate
+/// OFS/REF deltas are applied.
+///
+/// Returned by [`decode_base_from_pack`] on the fallback path and by
+/// inline cache hits in [`resolve_and_apply_delta`].
 struct BaseBytes<'a> {
     kind: ObjectKind,
     storage: BaseStorage<'a>,
@@ -882,6 +902,16 @@ pub fn execute_pack_plan<S: PackObjectSink, B: ExternalBaseProvider>(
 ///
 /// Decodes one `need_offsets[idx]`, then emits all candidates in `range`.
 /// Non-fatal decode failures are recorded as skip records in `report`.
+///
+/// The function brackets the entire offset in an optional [`AllocGuard`]
+/// (when `alloc_guard_enabled` is true) to enforce the zero-allocation
+/// invariant on the hot path.
+///
+/// Cache-hit fast path: when the offset is already in `cache`, the bytes
+/// from the initial probe are reused directly — no redundant re-probe.
+/// On a cache miss, `decode_offset` is invoked and may store bytes in
+/// `Cache`, `Scratch`, or `Spill`; a second `cache_get` is only needed
+/// when `decode_offset` returns `DecodedStorage::Cache`.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn execute_offset_range_with_scratch<S: PackObjectSink, B: ExternalBaseProvider>(
@@ -1325,8 +1355,12 @@ fn data_start_to_usize(data_start: u64) -> Result<usize, PackDecodeError> {
 
 /// Inflated delta payload bytes, either in-memory or spill-backed.
 ///
-/// Small payloads live in a borrowed scratch buffer; oversized payloads
-/// are written to a spill file and accessed through an mmap.
+/// Small payloads (≤ `limits.max_delta_bytes`) are inflated into
+/// `inflate_buf` and borrowed as a `Slice`. Oversized payloads are
+/// streamed into a spill-backed mmap to avoid holding the full delta
+/// in resident memory. The choice is made once in
+/// [`inflate_delta_payload`] and is transparent to callers via
+/// `as_slice()`.
 enum DeltaPayload<'a> {
     Slice(&'a [u8]),
     Spill(BlobSpill),
@@ -1402,6 +1436,15 @@ fn skip_reason_from_delta_error(err: DeltaDecodeError) -> SkipReason {
     }
 }
 
+/// Offer decoded delta output to the cache and determine final storage.
+///
+/// If the output is in `result_buf` (Scratch or Cache-tagged), attempts
+/// a cache insert. On success the object is promoted to `Cache` storage;
+/// on failure (oversize or cache disabled) it remains in `Scratch` and
+/// the reject is recorded in `stats`.
+///
+/// Spill-backed outputs skip the cache entirely — they are already
+/// too large to benefit from caching — and record a reject directly.
 fn finalize_decoded_delta(
     offset: u64,
     kind: ObjectKind,
@@ -1440,6 +1483,13 @@ fn finalize_decoded_delta(
     }
 }
 
+/// Inflate a delta payload, apply it against known base bytes, and
+/// return the output storage and length.
+///
+/// This is the "inflate + apply + inc_decoded" combo used by all code
+/// paths that already have resolved base bytes in hand (cache hit,
+/// external base, or fallback unwind). Converts any
+/// [`DeltaDecodeError`] into the appropriate [`SkipReason`].
 #[allow(clippy::too_many_arguments)]
 fn decode_delta_against_base(
     pack: &PackFile<'_>,
@@ -1467,12 +1517,142 @@ fn decode_delta_against_base(
     Ok((storage, out_len))
 }
 
+/// Resolve the base for an in-pack OFS delta, apply the delta, and
+/// finalize the decoded object. Returns `None` when the decode is
+/// skipped (non-fatal).
+///
+/// This encapsulates the common "cache-or-decode base → apply delta →
+/// finalize" pipeline used by all three in-pack delta code paths in
+/// [`decode_offset`]:
+///
+/// 1. **Cache hit** — base bytes are borrowed directly from `PackCache`.
+/// 2. **Cache miss** — falls back to [`decode_base_from_pack`], which
+///    walks the chain from `base_offset`, inflating and unwinding into
+///    `base_buf` (or a spill mmap). Fallback timing is recorded into
+///    `report.stats.fallback_resolve_nanos`.
+///
+/// After base resolution, [`decode_delta_against_base`] inflates the
+/// delta payload and applies it; [`finalize_decoded_delta`] decides
+/// whether the result goes into the cache, stays in scratch, or is
+/// spill-backed.
+#[allow(clippy::too_many_arguments)]
+fn resolve_and_apply_delta<B: ExternalBaseProvider>(
+    pack: &PackFile<'_>,
+    offset: u64,
+    base_offset: u64,
+    data_start: u64,
+    delta_size: u64,
+    need_offsets: &[u64],
+    limits: &PackDecodeLimits,
+    max_delta_depth: u8,
+    cache: &mut PackCache,
+    external: &mut B,
+    delta_deps: &[DeltaDepHot],
+    external_base_oids: &[OidBytes],
+    delta_dep_index: &[u32],
+    hot_stats: &mut PackExecHotStats,
+    report: &mut PackExecReport,
+    inflate_buf: &mut Vec<u8>,
+    result_buf: &mut Vec<u8>,
+    base_buf: &mut Vec<u8>,
+    delta_stack: &mut Vec<DeltaFrame>,
+    spill_dir: &Path,
+) -> Result<Option<DecodedObject>, PackExecError> {
+    let base = match cache_get(cache, base_offset) {
+        Some(base) => {
+            hot_stats.inc_base_cache_hit();
+            BaseBytes {
+                kind: base.kind,
+                storage: BaseStorage::Slice(base.bytes),
+            }
+        }
+        None => {
+            hot_stats.inc_base_cache_miss();
+            let (result, resolve_nanos) = perf::time(|| {
+                decode_base_from_pack(
+                    pack,
+                    base_offset,
+                    need_offsets,
+                    limits,
+                    max_delta_depth,
+                    cache,
+                    external,
+                    delta_deps,
+                    external_base_oids,
+                    delta_dep_index,
+                    hot_stats,
+                    report,
+                    inflate_buf,
+                    result_buf,
+                    base_buf,
+                    delta_stack,
+                    spill_dir,
+                )
+            });
+            record_timing(&mut report.stats.fallback_resolve_nanos, resolve_nanos);
+            match result {
+                Ok(base) => base,
+                Err(reason) => {
+                    record_skip(report, hot_stats, offset, reason);
+                    return Ok(None);
+                }
+            }
+        }
+    };
+
+    let (storage, out_len) = match decode_delta_against_base(
+        pack,
+        data_start,
+        delta_size,
+        base.bytes(),
+        limits,
+        inflate_buf,
+        result_buf,
+        spill_dir,
+        hot_stats,
+    ) {
+        Ok(decoded) => decoded,
+        Err(reason) => {
+            record_skip(report, hot_stats, offset, reason);
+            return Ok(None);
+        }
+    };
+
+    let obj = finalize_decoded_delta(
+        offset,
+        base.kind,
+        storage,
+        out_len,
+        cache,
+        result_buf,
+        &mut report.stats,
+    );
+    Ok(Some(obj))
+}
+
 /// Decodes a single offset, using the cache for bases and for storing results.
 ///
 /// Returns `Ok(None)` for non-fatal issues (decode errors, missing bases, or
 /// external base provider errors), with the skip recorded in the report.
 /// Successful decodes return metadata describing where the bytes reside
-/// (cache vs scratch).
+/// (cache, scratch, or spill).
+///
+/// Three dispatch paths, tried in order:
+///
+/// 1. **Planned-dep fast path** — when `delta_dep_index` maps this offset
+///    to a [`DeltaDepHot`] with persisted header metadata (`has_header_meta`),
+///    the entry header parse is skipped entirely. External REF deltas go
+///    straight to the external base provider; in-pack OFS deltas go to
+///    [`resolve_and_apply_delta`].
+///
+/// 2. **Fallback header parse** — for synthetic plans or offsets without
+///    a delta-dep entry, the raw entry header is read from pack bytes.
+///    Non-delta entries are inflated directly (small → `result_buf`,
+///    large → spill). OFS deltas delegate to [`resolve_and_apply_delta`].
+///
+/// 3. **REF delta header parse** — REF deltas check the planned-dep for
+///    an in-pack base offset first; otherwise the external provider is
+///    queried using the OID from either the plan or the entry header.
 #[allow(clippy::too_many_arguments)]
 fn decode_offset<'a, B: ExternalBaseProvider>(
     pack: &'a PackFile<'a>,
@@ -1564,79 +1744,28 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
             }
         }
 
-        let (base_kind, storage, out_len) = {
-            let base = match cache_get(cache, dep.base_offset) {
-                Some(base) => {
-                    hot_stats.inc_base_cache_hit();
-                    BaseBytes {
-                        kind: base.kind,
-                        storage: BaseStorage::Slice(base.bytes),
-                    }
-                }
-                None => {
-                    hot_stats.inc_base_cache_miss();
-                    let (result, resolve_nanos) = perf::time(|| {
-                        decode_base_from_pack(
-                            pack,
-                            dep.base_offset,
-                            need_offsets,
-                            limits,
-                            max_delta_depth,
-                            cache,
-                            external,
-                            delta_deps,
-                            external_base_oids,
-                            delta_dep_index,
-                            hot_stats,
-                            report,
-                            inflate_buf,
-                            result_buf,
-                            base_buf,
-                            delta_stack,
-                            spill_dir,
-                        )
-                    });
-                    record_timing(&mut report.stats.fallback_resolve_nanos, resolve_nanos);
-                    match result {
-                        Ok(base) => base,
-                        Err(reason) => {
-                            record_skip(report, hot_stats, offset, reason);
-                            return Ok(None);
-                        }
-                    }
-                }
-            };
-
-            let (storage, out_len) = match decode_delta_against_base(
-                pack,
-                dep.data_start,
-                dep.delta_size,
-                base.bytes(),
-                limits,
-                inflate_buf,
-                result_buf,
-                spill_dir,
-                hot_stats,
-            ) {
-                Ok(decoded) => decoded,
-                Err(reason) => {
-                    record_skip(report, hot_stats, offset, reason);
-                    return Ok(None);
-                }
-            };
-            (base.kind, storage, out_len)
-        };
-
-        let obj = finalize_decoded_delta(
+        return resolve_and_apply_delta(
+            pack,
             offset,
-            base_kind,
-            storage,
-            out_len,
+            dep.base_offset,
+            dep.data_start,
+            dep.delta_size,
+            need_offsets,
+            limits,
+            max_delta_depth,
             cache,
+            external,
+            delta_deps,
+            external_base_oids,
+            delta_dep_index,
+            hot_stats,
+            report,
+            inflate_buf,
             result_buf,
-            &mut report.stats,
+            base_buf,
+            delta_stack,
+            spill_dir,
         );
-        return Ok(Some(obj));
     }
 
     // Fallback path for synthetic/manual plans without persisted metadata.
@@ -1716,160 +1845,53 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                 }))
             }
         }
-        EntryKind::OfsDelta { base_offset } => {
-            let (base_kind, storage, out_len) = {
-                let base = match cache_get(cache, base_offset) {
-                    Some(base) => {
-                        hot_stats.inc_base_cache_hit();
-                        BaseBytes {
-                            kind: base.kind,
-                            storage: BaseStorage::Slice(base.bytes),
-                        }
-                    }
-                    None => {
-                        hot_stats.inc_base_cache_miss();
-                        let (result, resolve_nanos) = perf::time(|| {
-                            decode_base_from_pack(
-                                pack,
-                                base_offset,
-                                need_offsets,
-                                limits,
-                                max_delta_depth,
-                                cache,
-                                external,
-                                delta_deps,
-                                external_base_oids,
-                                delta_dep_index,
-                                hot_stats,
-                                report,
-                                inflate_buf,
-                                result_buf,
-                                base_buf,
-                                delta_stack,
-                                spill_dir,
-                            )
-                        });
-                        record_timing(&mut report.stats.fallback_resolve_nanos, resolve_nanos);
-                        match result {
-                            Ok(base) => base,
-                            Err(reason) => {
-                                record_skip(report, hot_stats, offset, reason);
-                                return Ok(None);
-                            }
-                        }
-                    }
-                };
-
-                let (storage, out_len) = match decode_delta_against_base(
-                    pack,
-                    header.data_start as u64,
-                    header.size,
-                    base.bytes(),
-                    limits,
-                    inflate_buf,
-                    result_buf,
-                    spill_dir,
-                    hot_stats,
-                ) {
-                    Ok(decoded) => decoded,
-                    Err(reason) => {
-                        record_skip(report, hot_stats, offset, reason);
-                        return Ok(None);
-                    }
-                };
-                (base.kind, storage, out_len)
-            };
-
-            let obj = finalize_decoded_delta(
-                offset,
-                base_kind,
-                storage,
-                out_len,
-                cache,
-                result_buf,
-                &mut report.stats,
-            );
-            Ok(Some(obj))
-        }
+        EntryKind::OfsDelta { base_offset } => resolve_and_apply_delta(
+            pack,
+            offset,
+            base_offset,
+            header.data_start as u64,
+            header.size,
+            need_offsets,
+            limits,
+            max_delta_depth,
+            cache,
+            external,
+            delta_deps,
+            external_base_oids,
+            delta_dep_index,
+            hot_stats,
+            report,
+            inflate_buf,
+            result_buf,
+            base_buf,
+            delta_stack,
+            spill_dir,
+        ),
         EntryKind::RefDelta { base_oid } => {
             if let Some(dep) = planned_dep {
                 if !dep.is_external() {
-                    let (base_kind, storage, out_len) = {
-                        let base = match cache_get(cache, dep.base_offset) {
-                            Some(base) => {
-                                hot_stats.inc_base_cache_hit();
-                                BaseBytes {
-                                    kind: base.kind,
-                                    storage: BaseStorage::Slice(base.bytes),
-                                }
-                            }
-                            None => {
-                                hot_stats.inc_base_cache_miss();
-                                let (result, resolve_nanos) = perf::time(|| {
-                                    decode_base_from_pack(
-                                        pack,
-                                        dep.base_offset,
-                                        need_offsets,
-                                        limits,
-                                        max_delta_depth,
-                                        cache,
-                                        external,
-                                        delta_deps,
-                                        external_base_oids,
-                                        delta_dep_index,
-                                        hot_stats,
-                                        report,
-                                        inflate_buf,
-                                        result_buf,
-                                        base_buf,
-                                        delta_stack,
-                                        spill_dir,
-                                    )
-                                });
-                                record_timing(
-                                    &mut report.stats.fallback_resolve_nanos,
-                                    resolve_nanos,
-                                );
-                                match result {
-                                    Ok(base) => base,
-                                    Err(reason) => {
-                                        record_skip(report, hot_stats, offset, reason);
-                                        return Ok(None);
-                                    }
-                                }
-                            }
-                        };
-
-                        let (storage, out_len) = match decode_delta_against_base(
-                            pack,
-                            header.data_start as u64,
-                            header.size,
-                            base.bytes(),
-                            limits,
-                            inflate_buf,
-                            result_buf,
-                            spill_dir,
-                            hot_stats,
-                        ) {
-                            Ok(decoded) => decoded,
-                            Err(reason) => {
-                                record_skip(report, hot_stats, offset, reason);
-                                return Ok(None);
-                            }
-                        };
-                        (base.kind, storage, out_len)
-                    };
-
-                    let obj = finalize_decoded_delta(
+                    return resolve_and_apply_delta(
+                        pack,
                         offset,
-                        base_kind,
-                        storage,
-                        out_len,
+                        dep.base_offset,
+                        header.data_start as u64,
+                        header.size,
+                        need_offsets,
+                        limits,
+                        max_delta_depth,
                         cache,
+                        external,
+                        delta_deps,
+                        external_base_oids,
+                        delta_dep_index,
+                        hot_stats,
+                        report,
+                        inflate_buf,
                         result_buf,
-                        &mut report.stats,
+                        base_buf,
+                        delta_stack,
+                        spill_dir,
                     );
-                    return Ok(Some(obj));
                 }
             }
 
@@ -2014,6 +2036,20 @@ fn delta_dep_at_index(
     delta_deps.get(idx as usize).copied()
 }
 
+/// Apply stacked delta frames in reverse (root-outward) order.
+///
+/// After [`decode_base_from_pack`] resolves the root non-delta base,
+/// this function iterates the delta stack from the deepest (closest to
+/// root) to the shallowest (closest to the originally requested offset).
+/// For each frame it inflates the delta payload and applies it against
+/// the current base, producing the next-level reconstructed object.
+///
+/// Buffer rotation: after each application, `base_buf` and `result_buf`
+/// are swapped so the output of one frame becomes the input base for the
+/// next. Intermediate results are also offered to the cache (with
+/// `base_kind` as the object kind, since kind is inherited from the
+/// root). Oversized intermediates move through `base_spill` instead of
+/// `base_buf`.
 #[allow(clippy::too_many_arguments)]
 fn unwind_delta_stack(
     pack: &PackFile<'_>,
@@ -2063,6 +2099,15 @@ fn unwind_delta_stack(
     Ok(())
 }
 
+/// Load a REF-delta root base from the external provider.
+///
+/// Returns the base's object kind and an optional spill handle. Small
+/// bases (≤ `max_object_bytes`) are copied into `base_buf`; oversized
+/// bases are written to a spill-backed mmap. Either way, the returned
+/// `Option<BlobSpill>` tells the caller where the bytes live.
+///
+/// Errors from the provider or spill I/O are converted to `SkipReason`
+/// so the caller can record a non-fatal skip for the affected offset.
 #[allow(clippy::too_many_arguments)]
 fn load_external_root_base<B: ExternalBaseProvider>(
     oid: OidBytes,
@@ -2110,6 +2155,56 @@ fn load_external_root_base<B: ExternalBaseProvider>(
             detail: err.to_string(),
         }),
     }
+}
+
+/// Unwind the accumulated delta stack against a resolved root base and
+/// build the final [`BaseBytes`].
+///
+/// This is the shared tail of every "found root base" exit in
+/// [`decode_base_from_pack`]: it applies deltas in reverse, records the
+/// fallback chain metric, and constructs the return value.
+#[allow(clippy::too_many_arguments)]
+fn unwind_and_build_base<'b>(
+    pack: &PackFile<'_>,
+    delta_stack: &[DeltaFrame],
+    base_kind: ObjectKind,
+    mut base_spill: Option<BlobSpill>,
+    limits: &PackDecodeLimits,
+    cache: &mut PackCache,
+    inflate_buf: &mut Vec<u8>,
+    result_buf: &mut Vec<u8>,
+    base_buf: &'b mut Vec<u8>,
+    spill_dir: &Path,
+    hot_stats: &mut PackExecHotStats,
+    stats: &mut PackExecStats,
+) -> Result<BaseBytes<'b>, SkipReason> {
+    if let Err(err) = unwind_delta_stack(
+        pack,
+        delta_stack,
+        base_kind,
+        &mut base_spill,
+        limits,
+        cache,
+        inflate_buf,
+        result_buf,
+        base_buf,
+        spill_dir,
+        hot_stats,
+        stats,
+    ) {
+        record_fallback_chain(stats, delta_stack.len());
+        return Err(skip_reason_from_delta_error(err));
+    }
+
+    record_fallback_chain(stats, delta_stack.len());
+    let storage = match base_spill {
+        Some(spill) => BaseStorage::Spill(spill),
+        None => BaseStorage::Slice(base_buf.as_slice()),
+    };
+    Ok(BaseBytes {
+        kind: base_kind,
+        storage,
+    })
 }
 
 /// Decode a base object on demand by walking the delta chain from `offset`.
@@ -2196,7 +2291,7 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
                         delta_size: dep.delta_size,
                     });
 
-                    let (base_kind, mut base_spill) = match load_external_root_base(
+                    let (base_kind, base_spill) = match load_external_root_base(
                         base_oid,
                         external,
                         limits,
@@ -2212,11 +2307,11 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
                         }
                     };
 
-                    if let Err(err) = unwind_delta_stack(
+                    return unwind_and_build_base(
                         pack,
                         delta_stack,
                         base_kind,
-                        &mut base_spill,
+                        base_spill,
                         limits,
                         cache,
                         inflate_buf,
@@ -2225,20 +2320,7 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
                         spill_dir,
                         hot_stats,
                         &mut report.stats,
-                    ) {
-                        record_fallback_chain(&mut report.stats, delta_stack.len());
-                        return Err(skip_reason_from_delta_error(err));
-                    }
-
-                    record_fallback_chain(&mut report.stats, delta_stack.len());
-                    let storage = match base_spill {
-                        Some(spill) => BaseStorage::Spill(spill),
-                        None => BaseStorage::Slice(base_buf.as_slice()),
-                    };
-                    return Ok(BaseBytes {
-                        kind: base_kind,
-                        storage,
-                    });
+                    );
                 }
 
                 if dep.base_offset == current_offset {
@@ -2326,12 +2408,11 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
                     base_spill = Some(spill);
                 }
 
-                let base_kind = kind;
-                if let Err(err) = unwind_delta_stack(
+                return unwind_and_build_base(
                     pack,
                     delta_stack,
-                    base_kind,
-                    &mut base_spill,
+                    kind,
+                    base_spill,
                     limits,
                     cache,
                     inflate_buf,
@@ -2340,20 +2421,7 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
                     spill_dir,
                     hot_stats,
                     &mut report.stats,
-                ) {
-                    record_fallback_chain(&mut report.stats, delta_stack.len());
-                    return Err(skip_reason_from_delta_error(err));
-                }
-
-                record_fallback_chain(&mut report.stats, delta_stack.len());
-                let storage = match base_spill {
-                    Some(spill) => BaseStorage::Spill(spill),
-                    None => BaseStorage::Slice(base_buf.as_slice()),
-                };
-                return Ok(BaseBytes {
-                    kind: base_kind,
-                    storage,
-                });
+                );
             }
             EntryKind::OfsDelta { base_offset } => {
                 if base_offset == current_offset {
@@ -2406,7 +2474,7 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
                             })
                             .unwrap_or(base_oid);
 
-                        let (base_kind, mut base_spill) = match load_external_root_base(
+                        let (base_kind, base_spill) = match load_external_root_base(
                             base_oid,
                             external,
                             limits,
@@ -2422,11 +2490,11 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
                             }
                         };
 
-                        if let Err(err) = unwind_delta_stack(
+                        return unwind_and_build_base(
                             pack,
                             delta_stack,
                             base_kind,
-                            &mut base_spill,
+                            base_spill,
                             limits,
                             cache,
                             inflate_buf,
@@ -2435,20 +2503,7 @@ fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
                             spill_dir,
                             hot_stats,
                             &mut report.stats,
-                        ) {
-                            record_fallback_chain(&mut report.stats, delta_stack.len());
-                            return Err(skip_reason_from_delta_error(err));
-                        }
-
-                        record_fallback_chain(&mut report.stats, delta_stack.len());
-                        let storage = match base_spill {
-                            Some(spill) => BaseStorage::Spill(spill),
-                            None => BaseStorage::Slice(base_buf.as_slice()),
-                        };
-                        return Ok(BaseBytes {
-                            kind: base_kind,
-                            storage,
-                        });
+                        );
                     }
                 }
             }
@@ -2808,6 +2863,39 @@ mod tests {
         } else {
             assert_eq!(actual, 0);
         }
+    }
+
+    #[test]
+    fn candidate_range_from_bounds_preserves_values() {
+        let range = CandidateRange::from_bounds(7, 11);
+        assert_eq!(range.bounds(), Some((7, 11)));
+        assert_eq!(range.candidate_count(), 4);
+    }
+
+    #[test]
+    fn candidate_range_from_bounds_panics_when_start_after_end() {
+        let result = std::panic::catch_unwind(|| CandidateRange::from_bounds(4, 3));
+        assert!(result.is_err());
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn candidate_range_from_bounds_panics_on_start_overflow() {
+        let overflow = (u32::MAX as usize)
+            .checked_add(1)
+            .expect("64-bit usize should represent u32::MAX + 1");
+        let result = std::panic::catch_unwind(|| CandidateRange::from_bounds(overflow, overflow));
+        assert!(result.is_err());
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn candidate_range_from_bounds_panics_on_end_overflow() {
+        let overflow = (u32::MAX as usize)
+            .checked_add(1)
+            .expect("64-bit usize should represent u32::MAX + 1");
+        let result = std::panic::catch_unwind(|| CandidateRange::from_bounds(0, overflow));
+        assert!(result.is_err());
     }
 
     #[test]

@@ -25,6 +25,7 @@
 use std::fs;
 use std::fs::File;
 use std::io;
+use std::mem::ManuallyDrop;
 #[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -680,6 +681,17 @@ fn build_plan_cost_hint(plan: &PackPlan) -> PlanCostHint {
 }
 
 /// Maps execution position to shard id using the same partitioning as [`shard_ranges`].
+///
+/// The partitioning distributes `len` items across `shards` with sizes differing
+/// by at most 1. The first `extra = len % shards` shards get `base + 1` items;
+/// the remaining shards get `base = len / shards` items. This creates two
+/// contiguous regions:
+///
+/// - **Large prefix** (positions `0..extra*(base+1)`): shards of size `base+1`.
+/// - **Small suffix** (positions after that): shards of size `base`.
+///
+/// The branch selects the correct region and divides to find the shard index.
+/// Verified by Kani proof [`shard_id_partitions_cover_all_positions`].
 #[inline(always)]
 fn shard_id_for_exec_position(pos: usize, len: usize, shards: usize) -> usize {
     debug_assert!(len > 0);
@@ -688,6 +700,7 @@ fn shard_id_for_exec_position(pos: usize, len: usize, shards: usize) -> usize {
     debug_assert!(pos < len);
     let base = len / shards;
     let extra = len % shards;
+    // Boundary between the large-prefix region and the small-suffix region.
     let large_prefix_len = (base + 1) * extra;
     if pos < large_prefix_len {
         pos / (base + 1)
@@ -701,6 +714,14 @@ fn shard_id_for_exec_position(pos: usize, len: usize, shards: usize) -> usize {
 /// Uses execution positions (natural order or `exec_order`) and counts how
 /// many offset-based deps would cross shard boundaries under contiguous shard
 /// partitioning.
+///
+/// The algorithm:
+/// 1. Build an inverse map from need-index → execution position (identity when
+///    no explicit `exec_order` exists).
+/// 2. For each offset-based delta dep, resolve both the dependent and its base
+///    to execution positions, then check whether they fall in different shards.
+/// 3. Count crossings and unresolved bases (where the base offset isn't in
+///    `need_offsets`, meaning it's decoded on-demand rather than planned).
 fn estimate_locality_pressure(plan: &PackPlan, shards: usize) -> LocalityPressure {
     let need_count = plan.need_offsets.len();
     if need_count <= 1 || shards <= 1 {
@@ -708,6 +729,10 @@ fn estimate_locality_pressure(plan: &PackPlan, shards: usize) -> LocalityPressur
     }
     let shards = shards.max(1).min(need_count);
 
+    // Inverse map: need_index → execution position.  When `exec_order` is
+    // present, the execution order differs from need-offset order (e.g. to
+    // decode bases before their dependents).  Without it, need-index *is*
+    // the execution position.
     let exec_pos_by_need = plan.exec_order.as_ref().map(|order| {
         let mut pos = vec![usize::MAX; need_count];
         for (exec_pos, &need_idx_u32) in order.iter().enumerate() {
@@ -776,6 +801,9 @@ fn apply_locality_shard_cap(plan: &PackPlan, shard_cap: usize) -> usize {
         if pressure.offset_deps < MIN_LOCALITY_DEP_SAMPLES {
             break;
         }
+        // Unresolved bases are weighted 2× because they force expensive
+        // cross-pack or loose-object fallback I/O, whereas a resolved
+        // cross-shard dep only causes a cache miss within the same pack.
         let weighted_cross = pressure
             .cross_shard_offset_deps
             .saturating_add(pressure.unresolved_offset_bases.saturating_mul(2));
@@ -929,10 +957,11 @@ pub(super) fn shard_ranges(len: usize, shards: usize) -> Vec<(usize, usize)> {
 
 /// Merge per-shard scan results into a single [`ScannedBlobs`].
 ///
-/// Each blob stores its findings as a `Range<u32>` into a flat
-/// `finding_arena`. When arenas are concatenated the range start indices
-/// become stale, so every blob's `findings.start` is shifted ("rebased")
-/// by the arena length at the time its shard is appended.
+/// Each blob stores its findings as a [`FindingSpan`] (`start` + `len`)
+/// into the flat `finding_arena`. When arenas are concatenated the `start`
+/// indices become stale, so every blob's `findings.start` is shifted
+/// ("rebased") by the arena length at the time its shard is appended.
+/// The `len` field is unaffected because it is relative to `start`.
 ///
 /// Shards must be in deterministic order (e.g. by pack id) to produce
 /// reproducible output.
@@ -957,7 +986,7 @@ pub(super) fn merge_scanned_blobs(mut shards: Vec<ScannedBlobs>) -> ScannedBlobs
     merged
 }
 
-/// Append `src` blobs into `dst`, rebasing finding spans into `dst`'s arena.
+/// Append `src` blobs into `dst`, rebasing [`FindingSpan::start`] into `dst`'s arena.
 ///
 /// Same rebasing logic as [`merge_scanned_blobs`] but operates in-place.
 pub(super) fn append_scanned_blobs(dst: &mut ScannedBlobs, mut src: ScannedBlobs) {
@@ -971,7 +1000,7 @@ pub(super) fn append_scanned_blobs(dst: &mut ScannedBlobs, mut src: ScannedBlobs
 
 /// Output produced by one scheduler-dispatched pack-plan task.
 ///
-/// All three fields correspond to the same plan (or shard of a plan).
+/// All fields correspond to the same plan (or shard of a plan).
 /// The caller reassembles outputs in deterministic sequence order
 /// regardless of worker completion order.
 pub(super) struct SchedulerPackExecOutput {
@@ -1023,17 +1052,36 @@ struct SchedulerPackScratch {
 /// This caches the expensive one-time setup that used to be rebuilt per task:
 /// parsed MIDX + `PackIo` and `EngineAdapter` wiring.
 ///
-/// Field order matters for drop safety with widened lifetimes:
-/// - `adapter` drops before `engine`
-/// - `external` drops before `midx_bytes`
+/// # Safety
+///
+/// `adapter` and `external` hold transmuted `'static` references that actually
+/// borrow from `_engine` and `_midx_bytes` respectively. They are wrapped in
+/// [`ManuallyDrop`] so they are NOT dropped by the compiler's automatic field
+/// drop order. Instead, our custom [`Drop`] impl explicitly drops borrowers
+/// before their backing storage.
 struct SchedulerPackWorkerRuntime {
-    // SAFETY-INVARIANT: Do not reorder fields. `adapter` must drop before
-    // `_engine`, and `external` must drop before `_midx_bytes`, because
-    // they hold references widened to 'static from the latter's storage.
-    adapter: EngineAdapter<'static>,
+    // Borrowing fields — dropped explicitly in our `Drop` impl before
+    // the owning storage they reference.
+    adapter: ManuallyDrop<EngineAdapter<'static>>,
+    external: ManuallyDrop<PackIo<'static>>,
+    // Owning storage — dropped automatically after our `Drop` impl runs.
     _engine: Arc<Engine>,
-    external: PackIo<'static>,
     _midx_bytes: BytesView,
+}
+
+impl Drop for SchedulerPackWorkerRuntime {
+    fn drop(&mut self) {
+        // SAFETY: `adapter` holds a transmuted `&'static Engine` that actually
+        // borrows from `_engine`, and `external` holds a transmuted
+        // `MidxView<'static>` that actually borrows from `_midx_bytes`.
+        // We must drop the borrowers before the backing storage is freed.
+        // After this function returns, the remaining fields (`_engine`,
+        // `_midx_bytes`) are dropped automatically in declaration order.
+        unsafe {
+            ManuallyDrop::drop(&mut self.adapter);
+            ManuallyDrop::drop(&mut self.external);
+        }
+    }
 }
 
 /// Scheduler execution representation for one plan's shardable decode order.
@@ -1195,14 +1243,16 @@ fn empty_scheduler_output() -> SchedulerPackExecOutput {
 ///
 /// Soundness relies on ownership stored in [`SchedulerPackWorkerRuntime`]:
 /// `external` cannot outlive `_midx_bytes`, and `adapter` cannot outlive
-/// `_engine` (enforced by field drop order and struct ownership).
+/// `_engine`. Drop ordering is enforced by a custom `Drop` impl on the
+/// runtime struct (borrowers are dropped before their backing storage).
 fn build_scheduler_worker_runtime(
     shared: &SchedulerPackShared,
 ) -> Result<SchedulerPackWorkerRuntime, GitScanError> {
     let midx_bytes = shared.midx_bytes.clone();
     let midx = MidxView::parse(midx_bytes.as_slice(), shared.object_format)?;
     // SAFETY: `midx` borrows from `midx_bytes`, which is stored in the same
-    // runtime struct and outlives `external` (field drop order).
+    // runtime struct. The custom `Drop` impl on the runtime ensures `external`
+    // (which contains this midx) is dropped before `_midx_bytes`.
     let midx: MidxView<'static> = unsafe { std::mem::transmute(midx) };
     let external = PackIo::from_parts(
         midx,
@@ -1214,7 +1264,8 @@ fn build_scheduler_worker_runtime(
 
     let engine = Arc::clone(&shared.engine);
     // SAFETY: the adapter only borrows `engine` and the same runtime stores
-    // `engine` so it remains alive for the adapter's full lifetime.
+    // `_engine`. The custom `Drop` impl ensures `adapter` is dropped before
+    // `_engine`.
     let engine_ref: &'static Engine = unsafe { std::mem::transmute(engine.as_ref()) };
     let adapter = EngineAdapter::new_with_event_sink(
         engine_ref,
@@ -1228,9 +1279,9 @@ fn build_scheduler_worker_runtime(
     );
 
     Ok(SchedulerPackWorkerRuntime {
-        adapter,
+        adapter: ManuallyDrop::new(adapter),
+        external: ManuallyDrop::new(external),
         _engine: engine,
-        external,
         _midx_bytes: midx_bytes,
     })
 }
@@ -1273,8 +1324,8 @@ fn run_scheduler_pack_task(
             .expect("scheduler worker runtime initialized"),
     );
     runtime.adapter.clear_results();
-    let adapter = &mut runtime.adapter;
-    let external = &mut runtime.external;
+    let adapter: &mut EngineAdapter<'static> = &mut runtime.adapter;
+    let external: &mut PackIo<'static> = &mut runtime.external;
 
     match task {
         SchedulerPackTask::ExecPlan { seq } => {
@@ -2320,14 +2371,14 @@ mod tests {
 
         ensure_scheduler_worker_runtime(&mut runtime, &shared).expect("first init should succeed");
         let first = runtime.as_ref().expect("runtime initialized");
-        let first_external = &first.external as *const PackIo<'static>;
-        let first_adapter = &first.adapter as *const EngineAdapter<'static>;
+        let first_external = &*first.external as *const PackIo<'static>;
+        let first_adapter = &*first.adapter as *const EngineAdapter<'static>;
 
         ensure_scheduler_worker_runtime(&mut runtime, &shared)
             .expect("second init should reuse existing runtime");
         let second = runtime.as_ref().expect("runtime still present");
-        let second_external = &second.external as *const PackIo<'static>;
-        let second_adapter = &second.adapter as *const EngineAdapter<'static>;
+        let second_external = &*second.external as *const PackIo<'static>;
+        let second_adapter = &*second.adapter as *const EngineAdapter<'static>;
 
         assert_eq!(
             first_external, second_external,
