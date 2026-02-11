@@ -124,9 +124,6 @@ pub struct FsScanConfig {
     pub no_archives: bool,
     /// Anchor extraction mode for rule matching.
     pub anchor_mode: AnchorMode,
-    /// Use a no-op event sink (drops all findings). For measuring scan overhead
-    /// without JSON encoding + stdout I/O.
-    pub null_sink: bool,
     /// When `true`, scan binary files instead of skipping them.
     pub scan_binary: bool,
     /// When `true`, wire a [`StoreProducer`](crate::store::StoreProducer) into
@@ -134,6 +131,21 @@ pub struct FsScanConfig {
     /// backend. The default backend writes append-only framed segment logs
     /// under the configured store root.
     pub persist_findings: bool,
+}
+
+/// Controls which debug output is emitted to stderr after a git scan.
+///
+/// Variants form a hierarchy: `Perf` is a strict superset of `Stats`
+/// (stage stats are always included when perf breakdown is requested).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DebugLevel {
+    /// No debug output (default).
+    #[default]
+    Off,
+    /// Emit verbose stage stats (`--debug`).
+    Stats,
+    /// Emit stage stats **and** pack execution timing breakdown (`--debug=perf`).
+    Perf,
 }
 
 /// Git repository scan configuration.
@@ -156,10 +168,8 @@ pub struct GitSourceConfig {
     pub tree_delta_cache_mb: Option<u32>,
     /// Engine chunk size in MiB (`None` → config default of 1).
     pub engine_chunk_mb: Option<u32>,
-    /// Emit verbose stage stats to stderr.
-    pub debug: bool,
-    /// Emit pack execution timing breakdown to stderr.
-    pub perf_breakdown: bool,
+    /// Debug output level for stderr diagnostics.
+    pub debug: DebugLevel,
     /// When `true`, scan binary blobs instead of skipping them.
     pub scan_binary: bool,
     /// When `true`, extract and emit author/committer identity data.
