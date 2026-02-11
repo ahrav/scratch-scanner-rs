@@ -268,6 +268,28 @@ mod tests {
         assert_eq!(file_extension(b"archive.tar.gz"), Some(b"gz".as_slice()));
     }
 
+    // ---- case-insensitive extension matching ----
+
+    #[test]
+    fn mixed_case_extensions_classify_correctly() {
+        // Binary data (contains NUL) with various case extensions.
+        let bin = b"\xCA\xFE\xBA\xBE\x00";
+        for (path, expected_fmt) in [
+            (&b"app.JAR"[..], ExtractableFormat::JarWar),
+            (b"Foo.ClAsS", ExtractableFormat::JavaClass),
+            (b"app.WAR", ExtractableFormat::JarWar),
+            (b"mod.PYC", ExtractableFormat::Pyc),
+            (b"nb.IPYNB", ExtractableFormat::Ipynb),
+        ] {
+            assert_eq!(
+                classify_content(bin, path, CHECK_LEN),
+                ContentVerdict::BinaryExtractable(expected_fmt),
+                "case-insensitive match failed for {:?}",
+                String::from_utf8_lossy(path),
+            );
+        }
+    }
+
     // ---- empty / edge cases ----
 
     #[test]
