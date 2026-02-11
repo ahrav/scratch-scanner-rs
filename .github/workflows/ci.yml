@@ -84,6 +84,58 @@ jobs:
           key: ubuntu-22.04
       - run: cargo test --lib --bins --tests --examples --features stdx-proptest,tiger-harness,scheduler-sim
 
+  fuzz-pack-smoke:
+    name: Fuzz Pack Smoke (PR)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-22.04
+    env:
+      # ~20s per target × 4 targets ≈ 80s total (within 60-120s budget).
+      FUZZ_SECONDS: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            pack:
+              - 'src/git_scan/pack_*'
+              - 'fuzz/fuzz_targets/fuzz_pack_*'
+              - 'fuzz/corpus/**'
+      - uses: dtolnay/rust-toolchain@nightly
+        if: steps.filter.outputs.pack == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.filter.outputs.pack == 'true'
+        with:
+          key: ubuntu-22.04-fuzz
+          workspaces: fuzz -> target
+      - name: Install LLVM
+        if: steps.filter.outputs.pack == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libboost-dev
+      - name: Install cargo-fuzz
+        if: steps.filter.outputs.pack == 'true'
+        run: cargo install cargo-fuzz
+      - name: Restore fuzz corpus cache
+        if: steps.filter.outputs.pack == 'true'
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-pack-${{ hashFiles('fuzz/corpus/fuzz_pack_*/**') }}
+          restore-keys: |
+            fuzz-corpus-pack-
+      - name: Run pack fuzz targets
+        if: steps.filter.outputs.pack == 'true'
+        working-directory: fuzz
+        run: |
+          cargo +nightly fuzz run fuzz_pack_parse_delta    -- -max_total_time=${FUZZ_SECONDS}
+          cargo +nightly fuzz run fuzz_pack_inflate_stream  -- -max_total_time=${FUZZ_SECONDS}
+          cargo +nightly fuzz run fuzz_pack_delta_into      -- -max_total_time=${FUZZ_SECONDS}
+          cargo +nightly fuzz run fuzz_pack_exec            -- -max_total_time=${FUZZ_SECONDS}
+      - name: Skip — no pack files changed
+        if: steps.filter.outputs.pack != 'true'
+        run: echo "No pack-related files changed; skipping fuzz smoke."
+
   fuzz-linux:
     name: Fuzz (Scheduled, Nightly Only, Linux)
     if: github.event_name == 'schedule'
@@ -102,6 +154,13 @@ jobs:
           sudo apt-get install -y clang llvm libboost-dev
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz
+      - name: Restore fuzz corpus cache
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-nightly-linux-${{ hashFiles('fuzz/corpus/fuzz_pack_*/**') }}
+          restore-keys: |
+            fuzz-corpus-nightly-linux-
       - name: Run fuzz targets
         working-directory: fuzz
         run: |
@@ -109,6 +168,10 @@ jobs:
           cargo +nightly fuzz run fuzz_b64_gate_build_and_scan -- -runs=${FUZZ_RUNS}
           cargo +nightly fuzz run fuzz_b64_gate_determinism -- -runs=${FUZZ_RUNS}
           cargo +nightly fuzz run fuzz_b64_gate_differential -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_pack_parse_delta -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_pack_inflate_stream -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_pack_delta_into -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_pack_exec -- -runs=${FUZZ_RUNS}
 
   fuzz-macos:
     name: Fuzz (Scheduled, Nightly Only, macOS)
@@ -126,6 +189,13 @@ jobs:
         run: brew install boost
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz
+      - name: Restore fuzz corpus cache
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-nightly-macos-${{ hashFiles('fuzz/corpus/fuzz_pack_*/**') }}
+          restore-keys: |
+            fuzz-corpus-nightly-macos-
       - name: Run fuzz targets
         working-directory: fuzz
         run: |
@@ -135,6 +205,10 @@ jobs:
           cargo +nightly fuzz run fuzz_b64_gate_build_and_scan -- -runs=${FUZZ_RUNS}
           cargo +nightly fuzz run fuzz_b64_gate_determinism -- -runs=${FUZZ_RUNS}
           cargo +nightly fuzz run fuzz_b64_gate_differential -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_pack_parse_delta -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_pack_inflate_stream -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_pack_delta_into -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_pack_exec -- -runs=${FUZZ_RUNS}
 
   miri:
     name: Miri (Scheduled, Nightly)

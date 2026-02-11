@@ -61,7 +61,7 @@ fuzz_target!(|data: &[u8]| {
     }
 
     // Fuzz generic inflate with a fixed output cap.
-    let mut inflate_out = Vec::with_capacity(256);
+    let mut inflate_out = Vec::with_capacity(MAX_OUT);
     let _ = inflate_limited(data, &mut inflate_out, MAX_OUT);
 
     // Fuzz delta apply with independent base/delta slices and size guards.
@@ -81,5 +81,5 @@ fuzz_target!(|data: &[u8]| {
     }
     let base = &base[..base_len as usize];
     let mut delta_out = Vec::with_capacity(result_len as usize);
-    let _ = apply_delta(base, delta, &mut delta_out, result_len as usize, MAX_OUT);
+    let _ = apply_delta(base, delta, &mut delta_out, MAX_OUT);
 });
