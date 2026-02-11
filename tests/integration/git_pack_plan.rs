@@ -141,7 +141,7 @@ fn ofs_delta_chain_includes_base_closure() {
         build_pack_plans(vec![cand], &[Some(pack_view)], &NoopResolver, &config).unwrap(),
     );
     assert_eq!(
-        plan.need_offsets,
+        plan.need_offsets(),
         vec![base_offset, delta1_offset, delta2_offset]
     );
 }
@@ -183,7 +183,7 @@ fn ofs_delta_chain_respects_depth_limit() {
     let plan = unpack_plan(
         build_pack_plans(vec![cand], &[Some(pack_view)], &NoopResolver, &config).unwrap(),
     );
-    assert_eq!(plan.need_offsets, vec![delta1_offset, delta2_offset]);
+    assert_eq!(plan.need_offsets(), vec![delta1_offset, delta2_offset]);
 }
 
 #[test]
@@ -257,10 +257,10 @@ fn ref_delta_inside_pack_is_resolved() {
         )
         .unwrap(),
     );
-    assert_eq!(plan.need_offsets, vec![base_offset, ref_offset]);
+    assert_eq!(plan.need_offsets(), vec![base_offset, ref_offset]);
 
     let dep = plan
-        .delta_deps
+        .delta_deps()
         .iter()
         .find(|dep| dep.offset == ref_offset)
         .expect("ref dep");
@@ -301,11 +301,11 @@ fn ref_delta_outside_pack_is_external() {
         )
         .unwrap(),
     );
-    assert_eq!(plan.need_offsets, vec![ref_offset]);
-    assert_eq!(plan.stats.external_bases, 1);
+    assert_eq!(plan.need_offsets(), vec![ref_offset]);
+    assert_eq!(plan.stats().external_bases(), 1);
 
     let dep = plan
-        .delta_deps
+        .delta_deps()
         .iter()
         .find(|dep| dep.offset == ref_offset)
         .expect("ref dep");
@@ -342,11 +342,11 @@ fn ref_delta_missing_base_is_external() {
         )
         .unwrap(),
     );
-    assert_eq!(plan.need_offsets, vec![ref_offset]);
-    assert_eq!(plan.stats.external_bases, 1);
+    assert_eq!(plan.need_offsets(), vec![ref_offset]);
+    assert_eq!(plan.stats().external_bases(), 1);
 
     let dep = plan
-        .delta_deps
+        .delta_deps()
         .iter()
         .find(|dep| dep.offset == ref_offset)
         .expect("ref dep");
@@ -469,13 +469,13 @@ fn mixed_ofs_ref_delta_chain_resolution() {
 
     // All 3 offsets must be present.
     assert_eq!(
-        plan.need_offsets,
+        plan.need_offsets(),
         vec![obj0_offset, obj1_offset, obj2_offset]
     );
 
     // Object 1 is an OFS_DELTA with base at Object 0.
     let dep1 = plan
-        .delta_deps
+        .delta_deps()
         .iter()
         .find(|dep| dep.offset == obj1_offset)
         .expect("obj1 dep");
@@ -484,7 +484,7 @@ fn mixed_ofs_ref_delta_chain_resolution() {
 
     // Object 2 is a REF_DELTA resolved to Object 1 (same pack).
     let dep2 = plan
-        .delta_deps
+        .delta_deps()
         .iter()
         .find(|dep| dep.offset == obj2_offset)
         .expect("obj2 dep");
@@ -547,13 +547,13 @@ fn mixed_ref_ofs_ref_chain_resolution() {
 
     // All 4 offsets must be present.
     assert_eq!(
-        plan.need_offsets,
+        plan.need_offsets(),
         vec![base_offset, ref1_offset, ofs_offset, ref2_offset]
     );
 
     // ref2 is REF_DELTA resolved to ofs_offset (same pack).
     let dep_ref2 = plan
-        .delta_deps
+        .delta_deps()
         .iter()
         .find(|dep| dep.offset == ref2_offset)
         .expect("ref2 dep");
@@ -562,7 +562,7 @@ fn mixed_ref_ofs_ref_chain_resolution() {
 
     // ofs is OFS_DELTA referencing ref1_offset.
     let dep_ofs = plan
-        .delta_deps
+        .delta_deps()
         .iter()
         .find(|dep| dep.offset == ofs_offset)
         .expect("ofs dep");
@@ -571,7 +571,7 @@ fn mixed_ref_ofs_ref_chain_resolution() {
 
     // ref1 is REF_DELTA resolved to base_offset (same pack).
     let dep_ref1 = plan
-        .delta_deps
+        .delta_deps()
         .iter()
         .find(|dep| dep.offset == ref1_offset)
         .expect("ref1 dep");
@@ -617,11 +617,11 @@ fn mixed_chain_with_external_ref() {
         unpack_plan(build_pack_plans(vec![cand], &[Some(pack_view)], &resolver, &config).unwrap());
 
     // Both local offsets must be in need_offsets.
-    assert_eq!(plan.need_offsets, vec![ref_offset, ofs_offset]);
+    assert_eq!(plan.need_offsets(), vec![ref_offset, ofs_offset]);
 
     // The OFS_DELTA references the REF_DELTA in the same pack.
     let dep_ofs = plan
-        .delta_deps
+        .delta_deps()
         .iter()
         .find(|dep| dep.offset == ofs_offset)
         .expect("ofs dep");
@@ -630,7 +630,7 @@ fn mixed_chain_with_external_ref() {
 
     // The REF_DELTA's base is external (different pack).
     let dep_ref = plan
-        .delta_deps
+        .delta_deps()
         .iter()
         .find(|dep| dep.offset == ref_offset)
         .expect("ref dep");
@@ -640,7 +640,7 @@ fn mixed_chain_with_external_ref() {
         "REF_DELTA base should be external"
     );
 
-    assert_eq!(plan.stats.external_bases, 1);
+    assert_eq!(plan.stats().external_bases(), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -672,11 +672,15 @@ fn deep_ofs_chain_at_depth_32() {
         build_pack_plans(vec![cand], &[Some(pack_view)], &NoopResolver, &config).unwrap(),
     );
 
-    assert_eq!(plan.need_offsets.len(), 33, "base + 32 deltas = 33 offsets");
+    assert_eq!(
+        plan.need_offsets().len(),
+        33,
+        "base + 32 deltas = 33 offsets"
+    );
     // Verify all offsets are present in sorted order.
     for &off in &offsets {
         assert!(
-            plan.need_offsets.contains(&off),
+            plan.need_offsets().contains(&off),
             "offset {off} missing from need_offsets"
         );
     }
@@ -713,13 +717,13 @@ fn deep_ofs_chain_at_exact_depth_limit() {
     );
 
     assert_eq!(
-        plan.need_offsets.len(),
+        plan.need_offsets().len(),
         65,
         "base + 64 deltas = 65 offsets at exact depth limit"
     );
     // The root base must be present.
     assert!(
-        plan.need_offsets.contains(&offsets[0]),
+        plan.need_offsets().contains(&offsets[0]),
         "root base must be included at exact depth limit"
     );
 }
@@ -758,12 +762,12 @@ fn deep_ofs_chain_exceeds_depth_limit() {
 
     // The root base (offsets[0]) should NOT be in need_offsets.
     assert!(
-        !plan.need_offsets.contains(&offsets[0]),
+        !plan.need_offsets().contains(&offsets[0]),
         "root base must be excluded when chain exceeds depth limit"
     );
     // We should have 65 offsets: the candidate + 64 ancestors (deltas 1..65).
     assert_eq!(
-        plan.need_offsets.len(),
+        plan.need_offsets().len(),
         65,
         "should include candidate + 64 levels of expansion, not the root base"
     );
@@ -799,13 +803,13 @@ fn deep_ofs_chain_depth_128_rejected() {
 
     // The root base must NOT be in need_offsets.
     assert!(
-        !plan.need_offsets.contains(&offsets[0]),
+        !plan.need_offsets().contains(&offsets[0]),
         "root base must not be included for 128-deep chain with limit 64"
     );
 
     // Expansion stops at depth 64: candidate (depth 0) + 64 levels = 65 offsets.
     assert_eq!(
-        plan.need_offsets.len(),
+        plan.need_offsets().len(),
         65,
         "expansion must stop at depth 64, yielding candidate + 64 ancestors"
     );
@@ -814,7 +818,7 @@ fn deep_ofs_chain_depth_128_rejected() {
     // offsets[0..64] (the base and first 63 deltas) should NOT be present.
     for &off in &offsets[..64] {
         assert!(
-            !plan.need_offsets.contains(&off),
+            !plan.need_offsets().contains(&off),
             "offset {off} should be outside the depth window"
         );
     }
@@ -822,7 +826,7 @@ fn deep_ofs_chain_depth_128_rejected() {
     // offsets[64..129] (the last 65 entries) SHOULD all be present.
     for &off in &offsets[64..] {
         assert!(
-            plan.need_offsets.contains(&off),
+            plan.need_offsets().contains(&off),
             "offset {off} should be within the depth window"
         );
     }

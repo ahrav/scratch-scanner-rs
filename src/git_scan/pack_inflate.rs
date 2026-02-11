@@ -700,68 +700,137 @@ pub fn apply_delta_into(
 /// Bit layout follows the Git delta specification:
 /// - Low bits select which offset bytes are present (little-endian).
 /// - High bits select which size bytes are present.
+///
+/// This path is on the delta-copy hot loop. We pre-compute the total number of
+/// parameter bytes and perform one bounds check up front, then decode with
+/// tight predictable branches.
+#[inline(always)]
 fn decode_copy_params(
     delta: &[u8],
     pos: &mut usize,
     cmd: u8,
 ) -> Result<(usize, usize), DeltaError> {
+    let off_mask = cmd & 0x0f;
+    let size_mask = (cmd >> 4) & 0x07;
+    let needed = (off_mask.count_ones() + size_mask.count_ones()) as usize;
+    let start = *pos;
+    let end = start.checked_add(needed).ok_or(DeltaError::Truncated)?;
+    if end > delta.len() {
+        *pos = delta.len();
+        return Err(DeltaError::Truncated);
+    }
+
+    let mut cursor = start;
     let mut off: usize = 0;
+    if (off_mask & 0x01) != 0 {
+        off |= delta[cursor] as usize;
+        cursor += 1;
+    }
+    if (off_mask & 0x02) != 0 {
+        off |= (delta[cursor] as usize) << 8;
+        cursor += 1;
+    }
+    if (off_mask & 0x04) != 0 {
+        off |= (delta[cursor] as usize) << 16;
+        cursor += 1;
+    }
+    if (off_mask & 0x08) != 0 {
+        off |= (delta[cursor] as usize) << 24;
+        cursor += 1;
+    }
+
     let mut size: usize = 0;
-
-    if (cmd & 0x01) != 0 {
-        if *pos >= delta.len() {
-            return Err(DeltaError::Truncated);
-        }
-        off |= delta[*pos] as usize;
-        *pos += 1;
+    if (size_mask & 0x01) != 0 {
+        size |= delta[cursor] as usize;
+        cursor += 1;
     }
-    if (cmd & 0x02) != 0 {
-        if *pos >= delta.len() {
-            return Err(DeltaError::Truncated);
-        }
-        off |= (delta[*pos] as usize) << 8;
-        *pos += 1;
+    if (size_mask & 0x02) != 0 {
+        size |= (delta[cursor] as usize) << 8;
+        cursor += 1;
     }
-    if (cmd & 0x04) != 0 {
-        if *pos >= delta.len() {
-            return Err(DeltaError::Truncated);
-        }
-        off |= (delta[*pos] as usize) << 16;
-        *pos += 1;
+    if (size_mask & 0x04) != 0 {
+        size |= (delta[cursor] as usize) << 16;
+        cursor += 1;
     }
-    if (cmd & 0x08) != 0 {
-        if *pos >= delta.len() {
-            return Err(DeltaError::Truncated);
-        }
-        off |= (delta[*pos] as usize) << 24;
-        *pos += 1;
-    }
-
-    if (cmd & 0x10) != 0 {
-        if *pos >= delta.len() {
-            return Err(DeltaError::Truncated);
-        }
-        size |= delta[*pos] as usize;
-        *pos += 1;
-    }
-    if (cmd & 0x20) != 0 {
-        if *pos >= delta.len() {
-            return Err(DeltaError::Truncated);
-        }
-        size |= (delta[*pos] as usize) << 8;
-        *pos += 1;
-    }
-    if (cmd & 0x40) != 0 {
-        if *pos >= delta.len() {
-            return Err(DeltaError::Truncated);
-        }
-        size |= (delta[*pos] as usize) << 16;
-        *pos += 1;
-    }
+    *pos = cursor;
 
     if size == 0 {
         size = 0x10000;
     }
 
     Ok((off, size))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn push_varint(mut value: usize, out: &mut Vec<u8>) {
+        loop {
+            let mut b = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                b |= 0x80;
+            }
+            out.push(b);
+            if value == 0 {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn decode_copy_params_reads_all_selected_fields() {
+        let delta = [0x11_u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77];
+        let cmd = 0x80 | 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40;
+        let mut pos = 0_usize;
+        let (off, size) = decode_copy_params(&delta, &mut pos, cmd).expect("decode copy params");
+        assert_eq!(off, 0x4433_2211);
+        assert_eq!(size, 0x0077_6655);
+        assert_eq!(pos, delta.len());
+    }
+
+    #[test]
+    fn decode_copy_params_zero_size_expands_to_64k() {
+        let delta = [0x2a_u8];
+        let cmd = 0x80 | 0x01; // copy with 1-byte offset, implicit 64 KiB size
+        let mut pos = 0_usize;
+        let (off, size) = decode_copy_params(&delta, &mut pos, cmd).expect("decode copy params");
+        assert_eq!(off, 0x2a);
+        assert_eq!(size, 0x1_0000);
+        assert_eq!(pos, 1);
+    }
+
+    #[test]
+    fn decode_copy_params_truncated_when_flagged_bytes_missing() {
+        let delta = [0xaa_u8, 0xbb];
+        let cmd = 0x80 | 0x01 | 0x02 | 0x10;
+        let mut pos = 0_usize;
+        let err = decode_copy_params(&delta, &mut pos, cmd).expect_err("expected truncation");
+        assert_eq!(err, DeltaError::Truncated);
+        assert_eq!(
+            pos,
+            delta.len(),
+            "position should match legacy truncation behavior"
+        );
+    }
+
+    #[test]
+    fn apply_delta_into_copy_zero_size_round_trip() {
+        let base = vec![0xa5_u8; 0x1_0000];
+        let mut delta = Vec::new();
+        push_varint(base.len(), &mut delta);
+        push_varint(base.len(), &mut delta);
+        delta.push(0x80); // copy from offset 0, implicit 64 KiB
+
+        let mut out = Vec::new();
+        let written = apply_delta_into(&base, &delta, base.len(), |chunk| {
+            out.extend_from_slice(chunk);
+            Ok(())
+        })
+        .expect("apply delta");
+
+        assert_eq!(written, base.len());
+        assert_eq!(out, base);
+    }
 }

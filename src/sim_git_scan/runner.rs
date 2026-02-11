@@ -755,9 +755,7 @@ fn collect_skipped_from_report(
 /// Used when byte-level artifacts are unavailable and we intentionally bypass
 /// pack decode.
 fn collect_semantic_scan(candidates: &CandidateBuffer, out: &mut Vec<OidBytes>) {
-    for cand in candidates.iter_resolved() {
-        out.push(cand.oid);
-    }
+    collect_semantic_candidates(candidates, out);
 }
 
 /// Record every semantic candidate as skipped.
@@ -765,6 +763,13 @@ fn collect_semantic_scan(candidates: &CandidateBuffer, out: &mut Vec<OidBytes>) 
 /// Used when byte-level artifacts are present but incomplete, so decode is not
 /// attempted.
 fn collect_semantic_skip(candidates: &CandidateBuffer, out: &mut Vec<OidBytes>) {
+    collect_semantic_candidates(candidates, out);
+}
+
+/// Append all resolved semantic candidate OIDs to `out` in iteration order.
+///
+/// Shared by the semantic scan/skip fallback paths to keep behavior aligned.
+fn collect_semantic_candidates(candidates: &CandidateBuffer, out: &mut Vec<OidBytes>) {
     for cand in candidates.iter_resolved() {
         out.push(cand.oid);
     }
