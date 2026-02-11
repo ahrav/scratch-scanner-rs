@@ -327,13 +327,13 @@ fn run_fs(
     event_sink.flush();
 
     // Also write machine-readable stats to stderr for compatibility.
-    let scanned_mib = report.metrics.bytes_scanned as f64 / (1024.0 * 1024.0);
+    let scanned_mb = report.metrics.bytes_scanned as f64 / 1_000_000.0;
     eprintln!(
-        "files={}\nchunks={}\nbytes={} ({:.2} MiB)\nfindings={}\nerrors={}\ndropped_findings={}\npersist_emit_failures={}\npersist_incomplete={}\nbinary_skipped={}\nbinary_extracted={}\ninit_ms={}\nscan_ms={}\npersist_ms={}\nelapsed_ms={}\nthroughput_mib_s={:.2}\nworkers={}",
+        "files={}\nchunks={}\nbytes={} ({:.2}MB)\nfindings={}\nerrors={}\ndropped_findings={}\npersist_emit_failures={}\npersist_incomplete={}\nbinary_skipped={}\nbinary_extracted={}\ninit_ms={}\nscan_ms={}\npersist_ms={}\nelapsed_ms={}\nthroughput_mib_s={:.2}\nworkers={}",
         report.stats.files_enqueued,
         report.metrics.chunks_scanned,
         report.metrics.bytes_scanned,
-        scanned_mib,
+        scanned_mb,
         report.metrics.findings_emitted,
         report.stats.io_errors,
         report.stats.dropped_findings,
@@ -829,13 +829,13 @@ fn print_git_stderr_summary(
         0.0
     };
     let init_ms = total_elapsed.saturating_sub(scan_elapsed).as_millis();
-    let scanned_mib = common.bytes_scanned as f64 / (1024.0 * 1024.0);
+    let scanned_mb = common.bytes_scanned as f64 / 1_000_000.0;
     eprintln!(
-        "objects={}\nchunks={}\nbytes={} ({:.2} MiB)\nfindings={}\nerrors={}\nbinary_skipped={}\nbinary_extracted={}\ninit_ms={}\nscan_ms={}\nelapsed_ms={}\nthroughput_mib_s={:.2}\nworkers={}",
+        "objects={}\nchunks={}\nbytes={} ({:.2}MB)\nfindings={}\nerrors={}\nbinary_skipped={}\nbinary_extracted={}\ninit_ms={}\nscan_ms={}\nelapsed_ms={}\nthroughput_mib_s={:.2}\nworkers={}",
         common.objects_scanned,
         common.chunks_scanned,
         common.bytes_scanned,
-        scanned_mib,
+        scanned_mb,
         common.findings_emitted,
         errors,
         common.binary_skipped,
