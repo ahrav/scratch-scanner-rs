@@ -1007,7 +1007,7 @@ enum SchedulerPackTask {
 /// Per-worker scratch space reused across tasks to avoid re-allocation.
 ///
 /// Created once per worker thread by the `Executor` init closure.
-/// Both fields grow to steady-state capacity after the first few tasks
+/// Fields grow to steady-state capacity after the first few tasks
 /// and remain stable for the rest of the scan.
 struct SchedulerPackScratch {
     /// LRU-style delta base cache sized by [`per_worker_cache_bytes`].
@@ -1304,13 +1304,11 @@ fn run_scheduler_pack_task(
                 exec_scratch,
             )?;
 
-            let mut skipped = Vec::new();
-            collect_skipped_candidates(plan, &report.skips, &mut skipped);
             let common_metrics = adapter.take_metrics();
             Ok(SchedulerPackExecOutput {
                 report,
                 scanned: adapter.take_results(),
-                skipped,
+                skipped: Vec::new(),
                 common_metrics,
             })
         }
@@ -1389,13 +1387,11 @@ fn run_scheduler_pack_task(
                 }
             };
 
-            let mut skipped = Vec::new();
-            collect_skipped_candidates(plan, &report.skips, &mut skipped);
             let common_metrics = adapter.take_metrics();
             Ok(SchedulerPackExecOutput {
                 report,
                 scanned: adapter.take_results(),
-                skipped,
+                skipped: Vec::new(),
                 common_metrics,
             })
         }
@@ -1547,12 +1543,19 @@ pub(super) fn execute_pack_plans_with_scheduler(
                 .lock()
                 .expect("scheduler pack output mutex poisoned");
             let mut merged = Vec::with_capacity(plan_count);
-            for slot in slots.iter_mut() {
-                let output = slot.take().ok_or_else(|| {
+            for (plan_idx, slot) in slots.iter_mut().enumerate() {
+                let mut output = slot.take().ok_or_else(|| {
                     GitScanError::PackExec(PackExecError::PackRead(
                         "missing scheduler pack output".to_string(),
                     ))
                 })?;
+                // Defer skip mapping to merge time so worker tasks avoid building
+                // per-task skipped vectors in the hot path.
+                collect_skipped_candidates(
+                    &plans[plan_idx],
+                    &output.report.skips,
+                    &mut output.skipped,
+                );
                 merged.push(output);
             }
             Ok(merged)
@@ -1724,7 +1727,6 @@ pub(super) fn execute_pack_plans_with_scheduler(
                     })?;
                     reports.push(shard_output.report);
                     scanned_shards.push(shard_output.scanned);
-                    skipped.extend(shard_output.skipped);
                     common_metrics.merge_from(&shard_output.common_metrics);
                 }
 
@@ -1733,6 +1735,7 @@ pub(super) fn execute_pack_plans_with_scheduler(
                 } else {
                     merge_pack_exec_reports(reports)
                 };
+                collect_skipped_candidates(&plans[plan_idx], &report.skips, &mut skipped);
                 let scanned = merge_scanned_blobs(scanned_shards);
                 merged.push(SchedulerPackExecOutput {
                     report,

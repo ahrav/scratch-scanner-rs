@@ -128,7 +128,7 @@ pub enum PackExecError {
     /// External base provider returned a fatal error.
     ExternalBase(String),
     /// Spill file creation or write failed.
-    Spill(String),
+    Spill(std::io::Error),
 }
 
 impl fmt::Display for PackExecError {
@@ -138,7 +138,7 @@ impl fmt::Display for PackExecError {
             Self::PackRead(msg) => write!(f, "pack read error: {msg}"),
             Self::Sink(msg) => write!(f, "sink error: {msg}"),
             Self::ExternalBase(msg) => write!(f, "external base error: {msg}"),
-            Self::Spill(msg) => write!(f, "spill error: {msg}"),
+            Self::Spill(err) => write!(f, "spill error: {err}"),
         }
     }
 }
@@ -626,6 +626,15 @@ impl PackExecScratch {
         if self.delta_deps_hot.capacity() < plan.delta_deps.len() {
             self.delta_deps_hot
                 .reserve(plan.delta_deps.len() - self.delta_deps_hot.capacity());
+        }
+        let external_base_oids_target = plan
+            .delta_deps
+            .iter()
+            .filter(|dep| matches!(dep.base, BaseLoc::External { .. }))
+            .count();
+        if self.external_base_oids.capacity() < external_base_oids_target {
+            self.external_base_oids
+                .reserve(external_base_oids_target - self.external_base_oids.capacity());
         }
         self.delta_deps_hot.clear();
         self.external_base_oids.clear();
@@ -1751,8 +1760,7 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                     }))
                 }
             } else {
-                let mut spill = BlobSpill::new(spill_dir, size)
-                    .map_err(|err| PackExecError::Spill(err.to_string()))?;
+                let mut spill = BlobSpill::new(spill_dir, size).map_err(PackExecError::Spill)?;
                 let mut writer = spill.writer();
                 let (inflate_res, nanos) = perf::time(|| {
                     inflate_stream(pack.slice_from(header.data_start), size, |chunk| {
@@ -1770,9 +1778,7 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                     );
                     return Ok(None);
                 }
-                writer
-                    .finish()
-                    .map_err(|err| PackExecError::Spill(err.to_string()))?;
+                writer.finish().map_err(PackExecError::Spill)?;
                 perf::record_pack_inflate(size, nanos);
                 hot_stats.inc_decoded();
                 report.stats.record_cache_reject(size);
