@@ -5,7 +5,7 @@ edition = "2021"
 
 # Allow Kani's cfg flag (set automatically by cargo kani)
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)', 'cfg(miri)'] }
 
 [dependencies]
 aegis = "0.9"

@@ -136,12 +136,55 @@ jobs:
           cargo +nightly fuzz run fuzz_b64_gate_determinism -- -runs=${FUZZ_RUNS}
           cargo +nightly fuzz run fuzz_b64_gate_differential -- -runs=${FUZZ_RUNS}
 
+  miri:
+    name: Miri (Scheduled, Nightly)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-22.04
+    env:
+      # strict-provenance: catches pointer provenance violations in node_pool,
+      #   scratch_memory, set_associative_cache raw-pointer arithmetic.
+      # symbolic-alignment-check: catches misaligned access in from_raw_parts.
+      # preemption-rate: enables thread interleaving for spsc, atomic_bitset
+      #   concurrent tests — higher than default to exercise more schedules.
+      MIRIFLAGS: >-
+        -Zmiri-strict-provenance
+        -Zmiri-symbolic-alignment-check
+        -Zmiri-preemption-rate=0.1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libboost-dev
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ubuntu-22.04-miri
+      - name: Run Miri on lib tests (skip FFI-dependent modules)
+        run: |
+          cargo +nightly miri test --lib -- \
+            --skip engine:: \
+            --skip git_scan:: \
+            --skip scheduler::affinity \
+            --skip scheduler::device_slots \
+            --skip scheduler::rusage \
+            --skip scheduler::local_fs_uring \
+            --skip scheduler::engine_impl \
+            --skip scheduler::parallel_scan \
+            --skip rules::yaml
+
   kani:
     name: Kani Verification (Scheduled)
     if: github.event_name == 'schedule'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libboost-dev
       - name: Install Kani
         uses: model-checking/kani-github-action@v1.1
         with:

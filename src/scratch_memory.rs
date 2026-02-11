@@ -546,6 +546,275 @@ mod tests {
         let result = ScratchVec::<u8>::with_capacity(u32::MAX as usize + 1);
         assert!(result.is_err());
     }
+
+    // -----------------------------------------------------------------------
+    // Miri-targeted: drop tracking for unsafe paths.
+    // -----------------------------------------------------------------------
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[derive(Clone)]
+    struct DropTracker(Arc<AtomicUsize>);
+
+    impl Drop for DropTracker {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn dt(c: &Arc<AtomicUsize>) -> DropTracker {
+        DropTracker(c.clone())
+    }
+
+    #[test]
+    fn truncate_drops_correct_count() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut vec = ScratchVec::<DropTracker>::with_capacity(8).unwrap();
+        for _ in 0..5 {
+            vec.push(dt(&drops));
+        }
+        vec.truncate(2);
+        // 3 elements should be dropped by truncate.
+        assert_eq!(drops.load(Ordering::Relaxed), 3);
+        assert_eq!(vec.len(), 2);
+        drop(vec);
+        // Remaining 2 dropped.
+        assert_eq!(drops.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn drain_full_drops_all() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut vec = ScratchVec::<DropTracker>::with_capacity(4).unwrap();
+        for _ in 0..4 {
+            vec.push(dt(&drops));
+        }
+        let collected: Vec<DropTracker> = vec.drain().collect();
+        // Drain transferred ownership; no drops yet from drain itself.
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        drop(collected);
+        assert_eq!(drops.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn drain_partial_drops_remainder() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut vec = ScratchVec::<DropTracker>::with_capacity(4).unwrap();
+        for _ in 0..4 {
+            vec.push(dt(&drops));
+        }
+        {
+            let mut drain = vec.drain();
+            let _first = drain.next(); // takes ownership of 1
+                                       // Drain::drop should drop the remaining 3.
+        }
+        // 1 still alive in _first? No, _first is dropped at end of block too.
+        assert_eq!(drops.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn drain_zero_consumed_drops_all() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut vec = ScratchVec::<DropTracker>::with_capacity(4).unwrap();
+        for _ in 0..3 {
+            vec.push(dt(&drops));
+        }
+        {
+            let _drain = vec.drain(); // consume none, drop all 3
+        }
+        assert_eq!(drops.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn extend_from_self_range_non_overlapping() {
+        let mut vec = ScratchVec::<u8>::with_capacity(16).unwrap();
+        vec.extend_from_slice(&[10, 20, 30, 40]);
+        vec.extend_from_self_range(1, 2); // copy [20, 30] to end
+        assert_eq!(vec.as_slice(), &[10, 20, 30, 40, 20, 30]);
+    }
+
+    #[test]
+    fn extend_from_self_range_adjacent() {
+        let mut vec = ScratchVec::<u8>::with_capacity(16).unwrap();
+        vec.extend_from_slice(&[1, 2, 3, 4]);
+        // Source range ends exactly at current len — destination starts at len.
+        vec.extend_from_self_range(2, 2); // copy [3, 4]
+        assert_eq!(vec.as_slice(), &[1, 2, 3, 4, 3, 4]);
+    }
+
+    #[test]
+    fn push_pop_reuse_slots() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut vec = ScratchVec::<DropTracker>::with_capacity(4).unwrap();
+        // Push 4, pop 4, push 4 again — reuse the same allocation.
+        for _ in 0..4 {
+            vec.push(dt(&drops));
+        }
+        for _ in 0..4 {
+            vec.pop();
+        }
+        assert_eq!(drops.load(Ordering::Relaxed), 4);
+
+        for _ in 0..4 {
+            vec.push(dt(&drops));
+        }
+        drop(vec);
+        assert_eq!(drops.load(Ordering::Relaxed), 8);
+    }
+
+    #[test]
+    fn zero_capacity_is_safe() {
+        let vec = ScratchVec::<u32>::with_capacity(0).unwrap();
+        assert_eq!(vec.len(), 0);
+        assert_eq!(vec.capacity(), 0);
+        assert!(vec.is_empty());
+        // Drop should be safe on zero-capacity.
+    }
+
+    #[test]
+    fn index_and_index_mut() {
+        let mut vec = ScratchVec::<u32>::with_capacity(4).unwrap();
+        vec.push(10);
+        vec.push(20);
+        assert_eq!(vec[0], 10);
+        assert_eq!(vec[1], 20);
+        vec[0] = 100;
+        assert_eq!(vec[0], 100);
+    }
+}
+
+// ============================================================================
+// Kani Bounded Model Checking Proofs
+// ============================================================================
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// Bounded capacity for Kani proofs. Small to keep state space manageable.
+    const MAX_CAP: usize = 4;
+
+    /// Proves push never writes beyond capacity.
+    /// For any valid capacity and sequence of pushes up to that capacity,
+    /// `len` never exceeds `cap` and `as_slice` returns the correct values.
+    #[kani::proof]
+    #[kani::unwind(6)] // MAX_CAP + 2 for loop unrolling
+    fn verify_push_never_exceeds_capacity() {
+        let cap: usize = kani::any();
+        kani::assume(cap > 0 && cap <= MAX_CAP);
+
+        let mut vec = ScratchVec::<u8>::with_capacity(cap).unwrap();
+
+        let n: usize = kani::any();
+        kani::assume(n <= cap);
+
+        for i in 0..n {
+            let val: u8 = kani::any();
+            vec.push(val);
+            kani::assert(vec.len() == i + 1, "len must match push count");
+            kani::assert(vec.len() <= vec.capacity(), "len must not exceed cap");
+        }
+    }
+
+    /// Proves truncate leaves exactly `new_len` elements.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn verify_truncate_bounds() {
+        let cap: usize = kani::any();
+        kani::assume(cap > 0 && cap <= MAX_CAP);
+
+        let mut vec = ScratchVec::<u8>::with_capacity(cap).unwrap();
+
+        let fill: usize = kani::any();
+        kani::assume(fill <= cap);
+        for _ in 0..fill {
+            vec.push(kani::any());
+        }
+
+        let new_len: usize = kani::any();
+        kani::assume(new_len <= fill);
+        vec.truncate(new_len);
+
+        kani::assert(vec.len() == new_len, "truncate must set len to new_len");
+    }
+
+    /// Proves pop returns the last pushed value and decrements len.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn verify_pop_returns_last() {
+        let cap: usize = kani::any();
+        kani::assume(cap > 0 && cap <= MAX_CAP);
+
+        let mut vec = ScratchVec::<u8>::with_capacity(cap).unwrap();
+
+        let fill: usize = kani::any();
+        kani::assume(fill > 0 && fill <= cap);
+
+        let mut last = 0u8;
+        for _ in 0..fill {
+            last = kani::any();
+            vec.push(last);
+        }
+
+        let popped = vec.pop();
+        kani::assert(popped == Some(last), "pop must return last pushed value");
+        kani::assert(vec.len() == fill - 1, "pop must decrement len");
+    }
+
+    /// Proves extend_from_slice bounds: new_len == old_len + slice.len() <= cap.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn verify_extend_from_slice_bounds() {
+        let cap: usize = kani::any();
+        kani::assume(cap > 0 && cap <= MAX_CAP);
+
+        let mut vec = ScratchVec::<u8>::with_capacity(cap).unwrap();
+
+        let fill: usize = kani::any();
+        kani::assume(fill <= cap);
+        for _ in 0..fill {
+            vec.push(kani::any());
+        }
+
+        let ext_len: usize = kani::any();
+        kani::assume(ext_len <= cap - fill);
+        // Build a small stack buffer to extend from.
+        let mut buf = [0u8; MAX_CAP];
+        for i in 0..ext_len {
+            buf[i] = kani::any();
+        }
+
+        vec.extend_from_slice(&buf[..ext_len]);
+        kani::assert(
+            vec.len() == fill + ext_len,
+            "extend must add exactly ext_len elements",
+        );
+        kani::assert(vec.len() <= vec.capacity(), "len must not exceed cap");
+    }
+
+    /// Proves drain yields exactly `len` elements and leaves vec empty.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn verify_drain_yields_all() {
+        let cap: usize = kani::any();
+        kani::assume(cap > 0 && cap <= MAX_CAP);
+
+        let mut vec = ScratchVec::<u8>::with_capacity(cap).unwrap();
+
+        let fill: usize = kani::any();
+        kani::assume(fill <= cap);
+        for _ in 0..fill {
+            vec.push(kani::any());
+        }
+
+        let mut count = 0usize;
+        for _ in vec.drain() {
+            count += 1;
+        }
+
+        kani::assert(count == fill, "drain must yield exactly len elements");
+        kani::assert(vec.is_empty(), "vec must be empty after full drain");
+    }
 }
 
 #[cfg(all(test, feature = "stdx-proptest"))]
