@@ -57,16 +57,23 @@ use super::{
 pub fn run(config: ScanConfig) -> io::Result<()> {
     let event_format = config.event_format;
     let verbose = config.verbose;
+    let null_sink = config.null_sink;
     let rules_file = config.rules_file;
     let transform_filter = config.transform_filter;
     match config.source {
-        SourceConfig::Fs(fs_cfg) => {
-            run_fs(fs_cfg, event_format, verbose, rules_file, &transform_filter)
-        }
+        SourceConfig::Fs(fs_cfg) => run_fs(
+            fs_cfg,
+            event_format,
+            verbose,
+            null_sink,
+            rules_file,
+            &transform_filter,
+        ),
         SourceConfig::Git(git_cfg) => run_git(
             git_cfg,
             event_format,
             verbose,
+            null_sink,
             rules_file,
             &transform_filter,
         ),
@@ -120,6 +127,7 @@ fn run_fs(
     cfg: FsScanConfig,
     event_format: EventFormat,
     verbose: bool,
+    null_sink: bool,
     rules_file: Option<PathBuf>,
     transform_filter: &TransformFilter,
 ) -> io::Result<()> {
@@ -179,8 +187,10 @@ fn run_fs(
 
     let scan_start = Instant::now();
 
-    // Structured event sink: JSONL findings to stdout, or null sink for diagnostics.
-    let event_sink: Arc<dyn super::events::EventSink> = if cfg.null_sink {
+    // Structured event sink: findings to stdout (format per --event-format),
+    // or null sink for overhead measurement.
+    let event_sink: Arc<dyn super::events::EventSink> = if null_sink {
+        eprintln!("info: --null-sink enabled; findings will not be written to stdout");
         Arc::new(super::events::NullEventSink)
     } else {
         build_event_sink(event_format, verbose)
@@ -317,11 +327,13 @@ fn run_fs(
     event_sink.flush();
 
     // Also write machine-readable stats to stderr for compatibility.
+    let scanned_mb = report.metrics.bytes_scanned as f64 / 1_000_000.0;
     eprintln!(
-        "files={} chunks={} bytes={} findings={} errors={} dropped_findings={} persist_emit_failures={} persist_incomplete={} binary_skipped={} binary_extracted={} init_ms={} scan_ms={} persist_ms={} elapsed_ms={} throughput_mib_s={:.2} workers={}",
+        "files={}\nchunks={}\nbytes={} ({:.2}MB)\nfindings={}\nerrors={}\ndropped_findings={}\npersist_emit_failures={}\npersist_incomplete={}\nbinary_skipped={}\nbinary_extracted={}\ninit_ms={}\nscan_ms={}\npersist_ms={}\nelapsed_ms={}\nthroughput_mib_s={:.2}\nworkers={}",
         report.stats.files_enqueued,
         report.metrics.chunks_scanned,
         report.metrics.bytes_scanned,
+        scanned_mb,
         report.metrics.findings_emitted,
         report.stats.io_errors,
         report.stats.dropped_findings,
@@ -354,9 +366,11 @@ fn run_git(
     cfg: GitSourceConfig,
     event_format: EventFormat,
     verbose: bool,
+    null_sink: bool,
     rules_file: Option<PathBuf>,
     transform_filter: &TransformFilter,
 ) -> io::Result<()> {
+    let t0 = Instant::now();
     let rules = load_rules_for_scan(rules_file.as_deref());
     let transforms = apply_transform_filter(demo_transforms(), transform_filter);
     let mut tuning = demo_tuning();
@@ -368,7 +382,7 @@ fn run_git(
     let tree_delta_cache_bytes = cfg.tree_delta_cache_mb.map(|mb| {
         let bytes = mb as u64 * 1024 * 1024;
         if bytes > u64::from(u32::MAX) {
-            eprintln!("--tree-delta-cache-mb exceeds max bytes for this build");
+            eprintln!("--x-tree-delta-cache-mb exceeds max bytes for this build");
             std::process::exit(2);
         }
         bytes as u32
@@ -376,7 +390,7 @@ fn run_git(
     let engine_chunk_bytes = cfg.engine_chunk_mb.map(|mb| {
         let bytes = mb as u64 * 1024 * 1024;
         if bytes > u64::from(u32::MAX) {
-            eprintln!("--engine-chunk-mb exceeds max chunk size");
+            eprintln!("--x-engine-chunk-mb exceeds max chunk size");
             std::process::exit(2);
         }
         bytes as usize
@@ -399,7 +413,12 @@ fn run_git(
         }
     });
 
-    let event_sink = build_event_sink(event_format, verbose);
+    let event_sink: Arc<dyn super::events::EventSink> = if null_sink {
+        eprintln!("info: --null-sink enabled; findings will not be written to stdout");
+        Arc::new(super::events::NullEventSink)
+    } else {
+        build_event_sink(event_format, verbose)
+    };
 
     let start_set = StartSetConfig::DefaultBranchOnly;
     let resolver = GitCliResolver::new(cfg.repo_root.clone(), start_set.clone());
@@ -441,9 +460,12 @@ fn run_git(
         Arc::clone(&event_sink),
     ) {
         Ok(GitScanResult(report)) => {
-            emit_git_summary_event(&*event_sink, &report, scan_start.elapsed());
+            let scan_elapsed = scan_start.elapsed();
+            let total_elapsed = t0.elapsed();
+            emit_git_summary_event(&*event_sink, &report, scan_elapsed);
             event_sink.flush();
-            print_git_report(&report, &config, cfg.debug, cfg.perf_breakdown);
+            print_git_stderr_summary(&report, &config, scan_elapsed, total_elapsed);
+            print_git_report(&report, &config, cfg.debug);
             Ok(())
         }
         Err(err) => {
@@ -707,21 +729,30 @@ fn print_json<T: serde::Serialize>(value: &T) -> io::Result<()> {
     Ok(())
 }
 
-/// Print git scan results to stderr (debug stats and/or perf breakdown).
+/// Print git scan results to stderr based on the selected [`DebugLevel`].
 ///
-/// Called only on successful scans. Each section is gated by its respective
-/// CLI flag so the default output is clean.
+/// Called only on successful scans. Output is gated by `debug_level` so the
+/// default output is clean.
+///
+/// - [`DebugLevel::Off`]: no debug output.
+/// - [`DebugLevel::Stats`]: verbose stage stats (`--debug`).
+/// - [`DebugLevel::Perf`]: stage stats **and** pack execution timing
+///   breakdown (`--debug=perf`).
 fn print_git_report(
     report: &git_scan::GitScanReport,
     config: &GitScanConfig,
-    debug: bool,
-    perf_breakdown: bool,
+    debug_level: super::DebugLevel,
 ) {
-    if debug {
-        print_git_debug(report);
-    }
-    if perf_breakdown {
-        print_git_perf_breakdown(report, config);
+    use super::DebugLevel;
+    match debug_level {
+        DebugLevel::Off => {}
+        DebugLevel::Stats => {
+            print_git_debug(report);
+        }
+        DebugLevel::Perf => {
+            print_git_debug(report);
+            print_git_perf_breakdown(report, config);
+        }
     }
 }
 
@@ -742,7 +773,7 @@ fn build_event_sink(event_format: EventFormat, verbose: bool) -> Arc<dyn super::
 ///
 /// Maps `FinalizeOutcome::Complete` to status `"complete"` (0 errors) and
 /// `Partial` to `"partial"` (with the skipped-candidate count as errors).
-/// Throughput is computed from `scan_bytes` perf counter, not wall time.
+/// Throughput is computed from always-on `common_metrics.bytes_scanned`.
 fn emit_git_summary_event(
     event_sink: &dyn super::events::EventSink,
     report: &git_scan::GitScanReport,
@@ -756,7 +787,7 @@ fn emit_git_summary_event(
         git_scan::FinalizeOutcome::Partial { skipped_count } => ("partial", skipped_count),
     };
     let elapsed_secs = elapsed.as_secs_f64();
-    let bytes_scanned = report.perf_stats.scan_bytes;
+    let bytes_scanned = report.common_metrics.bytes_scanned;
     let throughput_mib_s = if elapsed_secs > 0.0 {
         (bytes_scanned as f64 / (1024.0 * 1024.0)) / elapsed_secs
     } else {
@@ -768,10 +799,53 @@ fn emit_git_summary_event(
         status,
         elapsed_ms: elapsed.as_millis() as u64,
         bytes_scanned,
-        findings_emitted: report.finalize.stats.total_findings,
+        findings_emitted: report.common_metrics.findings_emitted,
         errors: errors as u64,
         throughput_mib_s,
     }));
+}
+
+/// Print a machine-readable `key=value` summary block to stderr for git scans.
+///
+/// Always called on successful scans (not gated by `--debug`), matching the
+/// FS scan path which always emits a comparable line. Field order is stable
+/// for scripted parsing. Fields use git-specific names where the FS equivalent
+/// doesn't apply (e.g. `objects` instead of `files`).
+fn print_git_stderr_summary(
+    report: &git_scan::GitScanReport,
+    config: &GitScanConfig,
+    scan_elapsed: std::time::Duration,
+    total_elapsed: std::time::Duration,
+) {
+    let common = &report.common_metrics;
+    let errors = match report.finalize.outcome {
+        git_scan::FinalizeOutcome::Complete => 0u64,
+        git_scan::FinalizeOutcome::Partial { skipped_count } => skipped_count as u64,
+    };
+    let scan_secs = scan_elapsed.as_secs_f64();
+    let throughput_mib = if scan_secs > 0.0 {
+        (common.bytes_scanned as f64 / (1024.0 * 1024.0)) / scan_secs
+    } else {
+        0.0
+    };
+    let init_ms = total_elapsed.saturating_sub(scan_elapsed).as_millis();
+    let scanned_mb = common.bytes_scanned as f64 / 1_000_000.0;
+    eprintln!(
+        "objects={}\nchunks={}\nbytes={} ({:.2}MB)\nfindings={}\nerrors={}\nbinary_skipped={}\nbinary_extracted={}\ninit_ms={}\nscan_ms={}\nelapsed_ms={}\nthroughput_mib_s={:.2}\nworkers={}",
+        common.objects_scanned,
+        common.chunks_scanned,
+        common.bytes_scanned,
+        scanned_mb,
+        common.findings_emitted,
+        errors,
+        common.binary_skipped,
+        common.binary_extracted,
+        init_ms,
+        scan_elapsed.as_millis(),
+        total_elapsed.as_millis(),
+        throughput_mib,
+        config.pack_exec_workers,
+    );
 }
 
 /// Dump verbose internal stats to stderr (commit counts, tree diff, pack plan, cache rejects).

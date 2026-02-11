@@ -18,7 +18,10 @@ use crate::api::TransformId;
 use crate::git_scan::{GitScanMode, MergeDiffMode};
 use crate::AnchorMode;
 
-use super::{EventFormat, FsScanConfig, GitSourceConfig, OutputFormat, SourceConfig, StoreCommand};
+use super::{
+    DebugLevel, EventFormat, FsScanConfig, GitSourceConfig, OutputFormat, SourceConfig,
+    StoreCommand,
+};
 
 /// Controls which transform decoders are active during a scan.
 ///
@@ -78,6 +81,9 @@ pub struct ScanConfig {
     /// scans, the filtered list also feeds into the policy hash, so
     /// disabling a transform correctly invalidates cached scan results.
     pub transform_filter: TransformFilter,
+    /// Use a no-op event sink (drops all findings). For measuring scan
+    /// overhead without JSON encoding + stdout I/O.
+    pub null_sink: bool,
 }
 
 /// Parse `std::env::args_os()` into a [`ScanConfig`].
@@ -111,6 +117,7 @@ pub fn parse_args() -> io::Result<ScanConfig> {
                 verbose: false,
                 rules_file: None,
                 transform_filter: TransformFilter::default(),
+                null_sink: false,
             });
         }
         _ => {
@@ -274,7 +281,6 @@ fn parse_fs_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<S
             decode_depth,
             no_archives,
             anchor_mode,
-            null_sink,
             scan_binary,
             persist_findings,
         }),
@@ -282,12 +288,13 @@ fn parse_fs_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<S
         verbose,
         rules_file,
         transform_filter,
+        null_sink,
     })
 }
 
-/// Parse `--repo`, `--mode`, and other git-specific flags from the
-/// remaining argument iterator. Accepts `--repo=<path>` or a bare positional
-/// path. Exits with code 2 on unrecognised flags or missing `--repo`.
+/// Parse git-specific flags from the remaining argument iterator.
+/// Accepts `--repo=<path>` or a bare positional path. Exits with code 2
+/// on unrecognised flags or missing `--repo`.
 fn parse_git_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<ScanConfig> {
     let mut repo: Option<PathBuf> = None;
     let mut repo_id: u64 = 1;
@@ -298,10 +305,10 @@ fn parse_git_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<
     let mut pack_exec_workers: Option<usize> = None;
     let mut tree_delta_cache_mb: Option<u32> = None;
     let mut engine_chunk_mb: Option<u32> = None;
-    let mut debug = false;
-    let mut perf_breakdown = false;
+    let mut debug_level = DebugLevel::Off;
     let mut scan_binary = false;
     let mut enrich_identities = false;
+    let mut null_sink = false;
     let mut verbose = false;
     let mut event_format = EventFormat::Jsonl;
     let mut rules_file: Option<PathBuf> = None;
@@ -334,32 +341,6 @@ fn parse_git_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<
                 repo = Some(PathBuf::from(rest));
                 continue;
             }
-            if let Some(rest) = flag.strip_prefix("--repo-id=") {
-                repo_id = parse_or_exit(rest, "--repo-id");
-                continue;
-            }
-            if let Some(rest) = flag.strip_prefix("--mode=") {
-                scan_mode = match rest {
-                    "diff" | "diff-history" => GitScanMode::DiffHistory,
-                    "odb-blob" | "odb-blob-fast" => GitScanMode::OdbBlobFast,
-                    _ => {
-                        eprintln!("invalid --mode value: {}", rest);
-                        std::process::exit(2);
-                    }
-                };
-                continue;
-            }
-            if let Some(rest) = flag.strip_prefix("--merge=") {
-                merge_mode = match rest {
-                    "all" => MergeDiffMode::AllParents,
-                    "first-parent" => MergeDiffMode::FirstParentOnly,
-                    _ => {
-                        eprintln!("invalid --merge value: {}", rest);
-                        std::process::exit(2);
-                    }
-                };
-                continue;
-            }
             if let Some(rest) = flag.strip_prefix("--anchors=") {
                 anchor_mode = parse_anchor_mode(rest);
                 continue;
@@ -368,44 +349,87 @@ fn parse_git_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<
                 decode_depth = Some(parse_or_exit(rest, "--decode-depth"));
                 continue;
             }
-            if let Some(rest) = flag.strip_prefix("--pack-exec-workers=") {
-                let n: usize = parse_or_exit(rest, "--pack-exec-workers");
+            if let Some(rest) = flag.strip_prefix("--event-format=") {
+                event_format = parse_event_format(rest);
+                continue;
+            }
+            // --- Hidden flags (--x-* prefix) -----------------------------------
+            // These are unstable internal tuning knobs. They work but are
+            // deliberately omitted from --help output so they don't become
+            // part of the public API / semver surface.
+            if let Some(rest) = flag.strip_prefix("--x-repo-id=") {
+                repo_id = parse_or_exit(rest, "--x-repo-id");
+                continue;
+            }
+            if let Some(rest) = flag.strip_prefix("--x-mode=") {
+                scan_mode = match rest {
+                    "diff" | "diff-history" => GitScanMode::DiffHistory,
+                    "odb-blob" | "odb-blob-fast" => GitScanMode::OdbBlobFast,
+                    _ => {
+                        eprintln!("invalid --x-mode value: {}", rest);
+                        std::process::exit(2);
+                    }
+                };
+                continue;
+            }
+            if let Some(rest) = flag.strip_prefix("--x-merge=") {
+                merge_mode = match rest {
+                    "all" => MergeDiffMode::AllParents,
+                    "first-parent" => MergeDiffMode::FirstParentOnly,
+                    _ => {
+                        eprintln!("invalid --x-merge value: {}", rest);
+                        std::process::exit(2);
+                    }
+                };
+                continue;
+            }
+            if let Some(rest) = flag.strip_prefix("--x-pack-exec-workers=") {
+                let n: usize = parse_or_exit(rest, "--x-pack-exec-workers");
                 if n == 0 {
-                    eprintln!("--pack-exec-workers must be >= 1");
+                    eprintln!("--x-pack-exec-workers must be >= 1");
                     std::process::exit(2);
                 }
                 pack_exec_workers = Some(n);
                 continue;
             }
-            if let Some(rest) = flag.strip_prefix("--tree-delta-cache-mb=") {
-                let n: u32 = parse_or_exit(rest, "--tree-delta-cache-mb");
+            if let Some(rest) = flag.strip_prefix("--x-tree-delta-cache-mb=") {
+                let n: u32 = parse_or_exit(rest, "--x-tree-delta-cache-mb");
                 if n == 0 {
-                    eprintln!("--tree-delta-cache-mb must be >= 1");
+                    eprintln!("--x-tree-delta-cache-mb must be >= 1");
                     std::process::exit(2);
                 }
                 tree_delta_cache_mb = Some(n);
                 continue;
             }
-            if let Some(rest) = flag.strip_prefix("--engine-chunk-mb=") {
-                let n: u32 = parse_or_exit(rest, "--engine-chunk-mb");
+            if let Some(rest) = flag.strip_prefix("--x-engine-chunk-mb=") {
+                let n: u32 = parse_or_exit(rest, "--x-engine-chunk-mb");
                 if n == 0 {
-                    eprintln!("--engine-chunk-mb must be >= 1");
+                    eprintln!("--x-engine-chunk-mb must be >= 1");
                     std::process::exit(2);
                 }
                 engine_chunk_mb = Some(n);
                 continue;
             }
-            if let Some(rest) = flag.strip_prefix("--event-format=") {
-                event_format = parse_event_format(rest);
+            if let Some(rest) = flag.strip_prefix("--debug=") {
+                match rest {
+                    "perf" => debug_level = DebugLevel::Perf,
+                    _ => {
+                        eprintln!(
+                            "invalid --debug value: {} (expected: perf, or bare --debug for stats)",
+                            rest
+                        );
+                        std::process::exit(2);
+                    }
+                }
                 continue;
             }
             match flag {
                 "--debug" => {
-                    debug = true;
-                    continue;
-                }
-                "--perf-breakdown" => {
-                    perf_breakdown = true;
+                    // Bare --debug: stage stats only (don't downgrade if
+                    // --debug=perf was already seen).
+                    if debug_level == DebugLevel::Off {
+                        debug_level = DebugLevel::Stats;
+                    }
                     continue;
                 }
                 "--scan-binary" => {
@@ -414,6 +438,10 @@ fn parse_git_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<
                 }
                 "--enrich-identities" => {
                     enrich_identities = true;
+                    continue;
+                }
+                "--null-sink" => {
+                    null_sink = true;
                     continue;
                 }
                 "--verbose" => {
@@ -458,8 +486,7 @@ fn parse_git_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<
             pack_exec_workers,
             tree_delta_cache_mb,
             engine_chunk_mb,
-            debug,
-            perf_breakdown,
+            debug: debug_level,
             scan_binary,
             enrich_identities,
         }),
@@ -467,6 +494,7 @@ fn parse_git_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<
         verbose,
         rules_file,
         transform_filter,
+        null_sink,
     })
 }
 
@@ -639,7 +667,8 @@ OPTIONS:
     --scan-binary           Scan binary files instead of skipping them
     --persist-findings      Persist FS findings to append-log segment files
     --anchors=manual|derived  Anchor mode (default: manual)
-    --event-format=jsonl    Output format (default: jsonl)
+    --event-format=jsonl|text|json|sarif  Output format (default: jsonl)
+    --verbose               Verbose output (text format only)
     --help, -h              Show this help"
     );
 }
@@ -650,22 +679,18 @@ fn print_git_usage() {
 
 OPTIONS:
     --repo=<path>             Repository path (also accepted as positional arg)
-    --repo-id=<N>             Repository id (default: 1)
     --rules=<path>            YAML rules file (default: default_rules.yaml next to binary)
-    --mode=diff|odb-blob      Scan mode (default: odb-blob)
-    --merge=all|first-parent  Merge diff mode (default: all)
-    --pack-exec-workers=<N>   Pack exec workers
-    --tree-delta-cache-mb=<N> Tree delta cache (default: 128)
-    --engine-chunk-mb=<N>     Engine chunk size (default: 1)
     --decode-depth=<N>        Max decode depth (default: 2)
     --transforms=all|none|<list>  Transforms to enable (default: all)
                               Comma-separated: base64, url (case-insensitive)
     --anchors=manual|derived  Anchor mode (default: manual)
     --debug                   Verbose stage stats to stderr
-    --perf-breakdown          Pack execution timing breakdown
+    --debug=perf              Stage stats + pack execution timing breakdown
+    --null-sink               Drop all findings (measure scan overhead only)
     --scan-binary             Scan binary blobs instead of skipping them
     --enrich-identities       Emit author/committer identity data
-    --event-format=jsonl      Output format (default: jsonl)
+    --event-format=jsonl|text|json|sarif  Output format (default: jsonl)
+    --verbose                 Verbose output (text format only)
     --help, -h                Show this help"
     );
 }
@@ -1105,5 +1130,139 @@ mod tests {
         let val = strip_os_prefix(&arg, "--rules=").unwrap();
         let expected = OsString::from_vec(b"/tmp/\xff/r.yaml".to_vec());
         assert_eq!(val, &*expected);
+    }
+
+    #[test]
+    fn git_null_sink_flag_parsed() {
+        let args = vec![OsString::from("--repo=/r"), OsString::from("--null-sink")];
+        let config = parse_git_args(args.into_iter()).unwrap();
+        assert!(config.null_sink);
+    }
+
+    #[test]
+    fn fs_null_sink_flag_parsed() {
+        let args = vec![
+            OsString::from("--path=/some/dir"),
+            OsString::from("--null-sink"),
+        ];
+        let config = parse_fs_args(args.into_iter()).unwrap();
+        assert!(config.null_sink);
+    }
+
+    #[test]
+    fn null_sink_defaults_false() {
+        let fs_args = vec![OsString::from("--path=/some/dir")];
+        let fs_config = parse_fs_args(fs_args.into_iter()).unwrap();
+        assert!(!fs_config.null_sink);
+
+        let git_args = vec![OsString::from("--repo=/r")];
+        let git_config = parse_git_args(git_args.into_iter()).unwrap();
+        assert!(!git_config.null_sink);
+    }
+
+    // -- DebugLevel / --debug / --debug=perf --------------------------------
+
+    fn git_debug_level(args: &[&str]) -> super::super::DebugLevel {
+        let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
+        let config = parse_git_args(os_args.into_iter()).unwrap();
+        let SourceConfig::Git(git) = config.source else {
+            panic!("expected git source config");
+        };
+        git.debug
+    }
+
+    #[test]
+    fn git_debug_defaults_off() {
+        assert_eq!(
+            git_debug_level(&["--repo=/r"]),
+            super::super::DebugLevel::Off
+        );
+    }
+
+    #[test]
+    fn git_debug_bare_sets_stats() {
+        assert_eq!(
+            git_debug_level(&["--repo=/r", "--debug"]),
+            super::super::DebugLevel::Stats
+        );
+    }
+
+    #[test]
+    fn git_debug_perf_sets_perf() {
+        assert_eq!(
+            git_debug_level(&["--repo=/r", "--debug=perf"]),
+            super::super::DebugLevel::Perf
+        );
+    }
+
+    #[test]
+    fn git_debug_perf_overrides_bare_debug() {
+        // --debug then --debug=perf → Perf wins
+        assert_eq!(
+            git_debug_level(&["--repo=/r", "--debug", "--debug=perf"]),
+            super::super::DebugLevel::Perf
+        );
+    }
+
+    #[test]
+    fn git_debug_bare_does_not_downgrade_perf() {
+        // --debug=perf then --debug → Perf is preserved (bare doesn't downgrade)
+        assert_eq!(
+            git_debug_level(&["--repo=/r", "--debug=perf", "--debug"]),
+            super::super::DebugLevel::Perf
+        );
+    }
+
+    // -- Hidden --x-* flags -------------------------------------------------
+
+    fn git_config(args: &[&str]) -> super::super::GitSourceConfig {
+        let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
+        let config = parse_git_args(os_args.into_iter()).unwrap();
+        let SourceConfig::Git(git) = config.source else {
+            panic!("expected git source config");
+        };
+        git
+    }
+
+    #[test]
+    fn git_hidden_repo_id_parsed() {
+        let cfg = git_config(&["--repo=/r", "--x-repo-id=42"]);
+        assert_eq!(cfg.repo_id, 42);
+    }
+
+    #[test]
+    fn git_hidden_mode_diff_parsed() {
+        let cfg = git_config(&["--repo=/r", "--x-mode=diff"]);
+        assert_eq!(cfg.scan_mode, GitScanMode::DiffHistory);
+    }
+
+    #[test]
+    fn git_hidden_mode_odb_blob_parsed() {
+        let cfg = git_config(&["--repo=/r", "--x-mode=odb-blob"]);
+        assert_eq!(cfg.scan_mode, GitScanMode::OdbBlobFast);
+    }
+
+    #[test]
+    fn git_hidden_merge_first_parent_parsed() {
+        let cfg = git_config(&["--repo=/r", "--x-merge=first-parent"]);
+        assert_eq!(cfg.merge_mode, MergeDiffMode::FirstParentOnly);
+    }
+
+    #[test]
+    fn git_hidden_pack_exec_workers_parsed() {
+        let cfg = git_config(&["--repo=/r", "--x-pack-exec-workers=4"]);
+        assert_eq!(cfg.pack_exec_workers, Some(4));
+    }
+
+    #[test]
+    fn git_hidden_tree_delta_cache_parsed() {
+        let cfg = git_config(&["--repo=/r", "--x-tree-delta-cache-mb=256"]);
+        assert_eq!(cfg.tree_delta_cache_mb, Some(256));
+    }
+
+    #[test]
+    fn git_hidden_engine_chunk_parsed() {
+        let cfg = git_config(&["--repo=/r", "--x-engine-chunk-mb=4"]);
+        assert_eq!(cfg.engine_chunk_mb, Some(4));
     }
 }

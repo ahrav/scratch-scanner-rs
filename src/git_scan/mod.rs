@@ -191,7 +191,7 @@ pub use pack_reader::{PackReadError, PackReader, SlicePackReader};
 // ── Stage 6: Engine scanning ────────────────────────────────────────────
 pub use engine_adapter::{
     scan_blob_chunked, EngineAdapter, EngineAdapterConfig, EngineAdapterError, FindingKey,
-    FindingSpan, ScannedBlob, ScannedBlobs, DEFAULT_CHUNK_BYTES,
+    FindingSpan, GitScanCommonMetrics, ScannedBlob, ScannedBlobs, DEFAULT_CHUNK_BYTES,
 };
 
 // ── Stage 7: Finalize & persist ─────────────────────────────────────────
