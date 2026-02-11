@@ -287,13 +287,29 @@ mod miri_tests {
     }
 
     #[test]
-    #[should_panic(expected = "node pool exhausted")]
     fn exhaustion_panics() {
-        // ManuallyDrop avoids the pool's Drop asserting "all nodes must be
-        // released" during panic unwinding, which would double-panic and abort.
-        let mut pool = std::mem::ManuallyDrop::new(NodePoolType::<8, 8>::init(1));
-        let _a = pool.acquire();
-        let _b = pool.acquire(); // should panic
+        let mut pool = NodePoolType::<8, 8>::init(1);
+        let a = pool.acquire();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _b = pool.acquire(); // should panic
+        }));
+
+        let payload = result.expect_err("acquiring past capacity must panic");
+        let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            String::new()
+        };
+        assert!(
+            msg.contains("node pool exhausted"),
+            "unexpected panic message: {msg}"
+        );
+
+        // Ensure clean teardown: outstanding node is released and pool can drop.
+        pool.release(a);
     }
 }
 
@@ -349,18 +365,31 @@ mod kani_proofs {
         pool.release(b);
     }
 
-    /// Release returns the slot to the free set; re-acquire succeeds.
+    /// Release returns the slot to the free set; re-acquire yields the same slot.
     #[kani::proof]
     #[kani::unwind(5)]
     fn verify_release_reacquire() {
         let mut pool = NodePoolType::<8, 8>::init(1);
 
         let a = pool.acquire();
+        let a_addr = a.as_ptr() as usize;
         pool.release(a);
 
-        // After release, the slot must be reusable.
+        // After release, the single slot must be reusable.
         let b = pool.acquire();
-        kani::assert(!b.as_ptr().is_null(), "re-acquired pointer must be valid");
+        let b_addr = b.as_ptr() as usize;
+
+        // With a single-slot pool, re-acquire must return the same slot.
+        kani::assert(
+            a_addr == b_addr,
+            "re-acquired pointer must be the same slot in a 1-slot pool",
+        );
+
+        // Free count must be 0 (one slot outstanding).
+        kani::assert(
+            pool.free.count() == 0,
+            "free count must be 0 with the slot acquired",
+        );
 
         pool.release(b);
     }

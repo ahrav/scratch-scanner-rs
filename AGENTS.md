@@ -83,6 +83,7 @@ manually or by code review.
 - `cargo test --test diagnostic -- --ignored --nocapture` - Diagnostic/audit tools
 - `cargo test --features stdx-proptest` - Unit + stdx property tests (~3-5 min)
 - `cargo kani --features kani` - Kani model checking
+- `cargo +nightly miri test --lib` - Miri undefined behavior detection (skips FFI-dependent modules)
 - `cargo +nightly fuzz run <target>` - Fuzz testing (targets in `/fuzz/`)
 - Benchmarks in `benches/` directory, run with `cargo bench`
 - See `tests/README.md` for full test organization details
