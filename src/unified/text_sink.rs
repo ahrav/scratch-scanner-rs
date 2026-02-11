@@ -176,8 +176,7 @@ fn format_summary(s: &SummaryEvent) -> String {
 fn format_commit_meta(m: &CommitMetaEvent) -> String {
     let mut hex_buf = Vec::with_capacity(m.commit_oid.len() as usize * 2);
     write_oid_hex(&m.commit_oid, &mut hex_buf);
-    // SAFETY: write_oid_hex only pushes ASCII hex digits.
-    let hex = unsafe { String::from_utf8_unchecked(hex_buf) };
+    let hex = String::from_utf8(hex_buf).expect("write_oid_hex produces only ASCII hex");
     format!(
         "[commit_meta] id={} oid={} ts={}\n",
         m.commit_id, hex, m.timestamp,
@@ -288,6 +287,41 @@ mod tests {
         assert!(out.contains("[summary]"));
         assert!(out.contains("elapsed=1234ms"));
         assert!(out.contains("81.23 MiB/s"));
+    }
+
+    #[test]
+    fn verbose_commit_meta() {
+        use crate::git_scan::object_id::OidBytes;
+        let oid = OidBytes::sha1([
+            0xde, 0xad, 0xbe, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc,
+            0xba, 0x98, 0x76, 0x54, 0x32, 0x10,
+        ]);
+        let out = collect_text(
+            ScanEvent::CommitMeta(CommitMetaEvent {
+                commit_id: 42,
+                commit_oid: oid,
+                timestamp: 1_700_000_000,
+            }),
+            true,
+        );
+        assert_eq!(
+            out,
+            "[commit_meta] id=42 oid=deadbeef0123456789abcdeffedcba9876543210 ts=1700000000\n"
+        );
+    }
+
+    #[test]
+    fn compact_suppresses_commit_meta() {
+        use crate::git_scan::object_id::OidBytes;
+        let out = collect_text(
+            ScanEvent::CommitMeta(CommitMetaEvent {
+                commit_id: 0,
+                commit_oid: OidBytes::sha1([0u8; 20]),
+                timestamp: 0,
+            }),
+            false,
+        );
+        assert!(out.is_empty(), "compact mode must suppress commit_meta");
     }
 
     #[test]

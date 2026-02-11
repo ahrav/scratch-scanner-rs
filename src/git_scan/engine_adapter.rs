@@ -35,7 +35,9 @@ use gix_commitgraph::Position;
 use crate::content_policy::{self, ContentVerdict};
 use crate::scheduler::AllocGuard;
 use crate::stdx::AtomicBitSet;
-use crate::unified::events::{CommitMetaEvent, EventSink, FindingEvent, ScanEvent};
+use crate::unified::events::{
+    CommitMetaEvent, DiagnosticEvent, EventSink, FindingEvent, ScanEvent,
+};
 use crate::unified::SourceKind;
 use crate::{Engine, FileId, NormHash, ScanScratch};
 
@@ -226,6 +228,12 @@ impl<'a> EngineAdapter<'a> {
         config: EngineAdapterConfig,
         ctx: CommitMetaContext,
     ) -> Self {
+        debug_assert!(
+            ctx.commit_meta_seen.bit_length() >= ctx.commit_graph_index.len(),
+            "AtomicBitSet bit_length ({}) must be >= CommitGraphIndex len ({})",
+            ctx.commit_meta_seen.bit_length(),
+            ctx.commit_graph_index.len(),
+        );
         let overlap = engine.required_overlap();
         let chunk_bytes = effective_chunk_bytes(config.chunk_bytes, overlap);
         Self {
@@ -344,18 +352,28 @@ impl<'a> EngineAdapter<'a> {
     /// for a commit may appear before that commit's `CommitMeta`.
     ///
     /// Commits with zero findings never trigger `CommitMeta` emission.
+    ///
+    /// When `commit_id` is out of range (>= `commit_graph.len()`), a
+    /// `Diagnostic` event at warn level is emitted instead of `CommitMeta`.
+    /// Findings are still emitted regardless.
     fn stream_findings(&self, path: &[u8], commit_id: u32, change_kind: &str) {
-        if !self.findings_buf.is_empty()
-            && (commit_id as usize) < self.commit_graph.len()
-            && self.commit_meta_seen.test_and_set(commit_id as usize)
-        {
-            let oid = self.commit_graph.commit_oid(Position(commit_id));
-            let ts = self.commit_graph.committer_timestamp(Position(commit_id));
-            self.event_sink.emit(ScanEvent::CommitMeta(CommitMetaEvent {
-                commit_id,
-                commit_oid: oid,
-                timestamp: ts,
-            }));
+        if !self.findings_buf.is_empty() {
+            if (commit_id as usize) < self.commit_graph.len() {
+                if self.commit_meta_seen.test_and_set(commit_id as usize) {
+                    let oid = self.commit_graph.commit_oid(Position(commit_id));
+                    let ts = self.commit_graph.committer_timestamp(Position(commit_id));
+                    self.event_sink.emit(ScanEvent::CommitMeta(CommitMetaEvent {
+                        commit_id,
+                        commit_oid: oid,
+                        timestamp: ts,
+                    }));
+                }
+            } else {
+                self.event_sink.emit(ScanEvent::Diagnostic(DiagnosticEvent {
+                    level: "warn",
+                    message: "commit_id out of commit-graph range; CommitMeta skipped",
+                }));
+            }
         }
         for f in &self.findings_buf {
             self.event_sink.emit(ScanEvent::Finding(FindingEvent {
@@ -1662,6 +1680,32 @@ mod tests {
         assert!(
             output.contains("\"timestamp\":1234567890"),
             "timestamp must match: {output}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "AtomicBitSet bit_length")]
+    fn mismatched_bitset_and_graph_panics_in_debug() {
+        // Graph has 3 entries but bitset only has 1 bit — mismatch.
+        let entries = vec![
+            (test_oid(0xaa), 1000),
+            (test_oid(0xbb), 2000),
+            (test_oid(0xcc), 3000),
+        ];
+        let engine = test_engine_with_tok_rule();
+        let sink = Arc::new(VecEventSink::new());
+        let graph = SmallTestGraph::new(&entries);
+        let cg = Arc::new(CommitGraphIndex::build(&graph).expect("build test graph"));
+        // Deliberately create a bitset smaller than the graph.
+        let seen = Arc::new(AtomicBitSet::empty(1));
+        let _adapter = EngineAdapter::new_with_event_sink(
+            &engine,
+            EngineAdapterConfig::default(),
+            CommitMetaContext {
+                event_sink: sink,
+                commit_graph_index: cg,
+                commit_meta_seen: seen,
+            },
         );
     }
 }
