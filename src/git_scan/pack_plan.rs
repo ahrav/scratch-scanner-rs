@@ -1035,4 +1035,41 @@ mod tests {
             "cycle must be detected"
         );
     }
+
+    #[test]
+    fn dfs_multiple_independent_trees() {
+        // Three independent delta trees plus two isolated nodes.
+        //   Tree A: 10→20, 10→30
+        //   Tree B: 40→50→60
+        //   Tree C: 70→80
+        //   Isolated: 90, 100
+        let need_offsets = vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
+        let deps = vec![
+            ofs_dep(20, 10),
+            ofs_dep(30, 10),
+            ofs_dep(50, 40),
+            ofs_dep(60, 50),
+            ofs_dep(80, 70),
+        ];
+        let result = build_exec_order(&need_offsets, &deps, 0).unwrap();
+
+        assert_eq!(
+            result.tree_roots, 3,
+            "should have 3 independent delta tree roots"
+        );
+        assert_eq!(result.max_depth, 2, "longest chain is 40→50→60 (depth 2)");
+
+        let order = result
+            .order
+            .expect("non-trivial graph should produce exec_order");
+        assert_eq!(order.len(), 10);
+
+        // Each tree's nodes must be contiguous.
+        assert_contiguous(&order, &[0, 1, 2]); // Tree A
+        assert_contiguous(&order, &[3, 4, 5]); // Tree B
+        assert_contiguous(&order, &[6, 7]); // Tree C
+
+        // Topological validity.
+        assert_topo_valid(&order, &[(0, 1), (0, 2), (3, 4), (4, 5), (6, 7)]);
+    }
 }

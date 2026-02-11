@@ -48,10 +48,17 @@ fuzz_target!(|data: &[u8]| {
     // --- 2. Exercise with expected = 0 (empty output) ---
 
     let mut zero_out = Vec::new();
-    let _ = inflate_stream(zlib_data, 0, |chunk| {
+    let zero_result = inflate_stream(zlib_data, 0, |chunk| {
         zero_out.extend_from_slice(chunk);
         Ok(())
     });
+    if zero_result.is_ok() {
+        assert!(
+            zero_out.is_empty(),
+            "inflate_stream with expected=0 succeeded but produced {} bytes",
+            zero_out.len(),
+        );
+    }
 
     // --- 3. Cross-check against inflate_limited ---
 
@@ -67,15 +74,23 @@ fuzz_target!(|data: &[u8]| {
             exact_out.extend_from_slice(chunk);
             Ok(())
         });
-        if let Ok(stream_consumed) = exact_result {
-            assert_eq!(
-                exact_out, limited_out,
-                "inflate_stream and inflate_limited disagree on output"
-            );
-            assert_eq!(
-                stream_consumed, limited_consumed,
-                "inflate_stream and inflate_limited disagree on bytes consumed"
-            );
+        match exact_result {
+            Ok(stream_consumed) => {
+                assert_eq!(
+                    exact_out, limited_out,
+                    "inflate_stream and inflate_limited disagree on output"
+                );
+                assert_eq!(
+                    stream_consumed, limited_consumed,
+                    "inflate_stream and inflate_limited disagree on bytes consumed"
+                );
+            }
+            Err(e) => {
+                panic!(
+                    "inflate_limited succeeded ({exact} bytes, {limited_consumed} consumed) \
+                     but inflate_stream failed with {e:?}"
+                );
+            }
         }
 
         // 3b. Expected = exact - 1: should get LimitExceeded if exact > 0 and
@@ -88,7 +103,7 @@ fuzz_target!(|data: &[u8]| {
             });
             // Must not succeed -- the stream produces `exact` bytes but we only
             // allowed `exact - 1`.
-            if let Ok(_) = under_result {
+            if under_result.is_ok() {
                 // This can only happen if the stream actually produced fewer
                 // bytes than `exact - 1`, which contradicts the inflate_limited
                 // result. That would be a bug.
@@ -100,13 +115,19 @@ fuzz_target!(|data: &[u8]| {
         }
 
         // 3c. Expected = exact + 1: the stream produces exactly `exact` bytes,
-        //     so inflate_stream should return TruncatedInput (output != expected).
+        //     so inflate_stream should fail (output size != expected).
         if exact < MAX_OUT {
             let mut over_out = Vec::new();
-            let _ = inflate_stream(zlib_data, exact + 1, |chunk| {
+            let over_result = inflate_stream(zlib_data, exact + 1, |chunk| {
                 over_out.extend_from_slice(chunk);
                 Ok(())
             });
+            assert!(
+                over_result.is_err(),
+                "inflate_stream should fail when expected ({}) exceeds actual output ({})",
+                exact + 1,
+                exact,
+            );
         }
     }
 

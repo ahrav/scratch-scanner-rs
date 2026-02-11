@@ -4,8 +4,10 @@
 //! decoded (candidates plus pack-local bases), along with delta dependency
 //! metadata for later execution strategies.
 //!
-//! Execution order is optional: it is only required when forward delta
-//! dependencies exist (a base offset greater than its dependent offset).
+//! Execution order is optional: it is present when the DFS scheduler
+//! produces a non-identity permutation of `need_offsets` indices, which
+//! happens whenever delta dependencies exist and DFS subtree grouping
+//! differs from the natural ascending offset order.
 //!
 //! # Invariants
 //! - `need_offsets` is sorted and unique.
