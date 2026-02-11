@@ -1547,7 +1547,7 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
         }
 
         let (base_kind, storage, out_len) = {
-            let base = match cache.get(dep.base_offset) {
+            let base = match cache_get(cache, dep.base_offset) {
                 Some(base) => {
                     hot_stats.inc_base_cache_hit();
                     BaseBytes {
@@ -1700,7 +1700,7 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
         }
         EntryKind::OfsDelta { base_offset } => {
             let (base_kind, storage, out_len) = {
-                let base = match cache.get(base_offset) {
+                let base = match cache_get(cache, base_offset) {
                     Some(base) => {
                         hot_stats.inc_base_cache_hit();
                         BaseBytes {
@@ -1777,7 +1777,7 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
             if let Some(dep) = planned_dep {
                 if !dep.is_external() {
                     let (base_kind, storage, out_len) = {
-                        let base = match cache.get(dep.base_offset) {
+                        let base = match cache_get(cache, dep.base_offset) {
                             Some(base) => {
                                 hot_stats.inc_base_cache_hit();
                                 BaseBytes {
@@ -4080,5 +4080,111 @@ run with --test-threads=1 to enable"
         let scanned = adapter.take_results();
         assert_eq!(scanned.blobs.len(), 1);
         assert!(!scanned.finding_arena.is_empty());
+    }
+
+    /// Regression: delta base lookups inside `decode_offset` must go through
+    /// the `cache_get()` wrapper so test instrumentation counts them.
+    /// Three call-sites (planned-dep fast-path, OfsDelta fallback, RefDelta
+    /// planned-dep) were using `cache.get()` directly, bypassing the counter.
+    #[test]
+    fn delta_base_cache_lookup_counted_by_cache_get_wrapper() {
+        let base_bytes = b"HELLO";
+        let result_bytes = b"GOODBYE_WORLD";
+        let delta_payload = build_insert_delta(result_bytes, base_bytes.len());
+
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&2u32.to_be_bytes());
+
+        let base_offset = pack.len() as u64;
+        pack.extend_from_slice(&encode_entry_header(ObjectKind::Blob, base_bytes.len()));
+        pack.extend_from_slice(&compress(base_bytes));
+
+        let delta_offset = pack.len() as u64;
+        let mut delta_entry = encode_delta_header(6, delta_payload.len());
+        delta_entry.extend_from_slice(&encode_ofs_distance(delta_offset - base_offset));
+        delta_entry.extend_from_slice(&compress(&delta_payload));
+        pack.extend_from_slice(&delta_entry);
+        pack.extend_from_slice(&[0u8; 20]);
+
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"file.txt").unwrap();
+        let candidate = PackCandidate {
+            oid: OidBytes::sha1([0xAA; 20]),
+            ctx: ctx(path_ref),
+            pack_id: 0,
+            offset: delta_offset,
+        };
+
+        let need_offsets = vec![base_offset, delta_offset];
+        let (data_start, delta_size) = delta_header_meta(&pack, delta_offset);
+        let delta_deps = vec![DeltaDep {
+            offset: delta_offset,
+            kind: DeltaKind::Ofs,
+            base: BaseLoc::Offset(base_offset),
+            data_start,
+            delta_size,
+        }];
+        let delta_dep_index = build_delta_dep_index(&need_offsets, &delta_deps);
+        let plan = PackPlan {
+            pack_id: 0,
+            oid_len: 20,
+            max_delta_depth: 16,
+            candidates: vec![candidate],
+            candidate_offsets: vec![CandidateAtOffset {
+                offset: delta_offset,
+                cand_idx: 0,
+            }],
+            need_offsets,
+            delta_deps,
+            delta_dep_index,
+            exec_order: Some(vec![0, 1]),
+            stats: PackPlanStats {
+                candidate_count: 1,
+                need_count: 2,
+                external_bases: 0,
+                forward_deps: 1,
+                candidate_span: delta_offset - base_offset,
+                ..PackPlanStats::empty()
+            },
+        };
+
+        // Pre-cache the base so the delta fast-path hits cache.get (line 1550).
+        let mut cache = PackCache::new(64 * 1024);
+        assert!(cache.insert(base_offset, ObjectKind::Blob, base_bytes));
+
+        let mut external = NoExternal;
+        let mut sink = CollectingSink::default();
+
+        reset_test_cache_get_calls();
+        let report = exec_plan(
+            &plan,
+            &pack,
+            &arena,
+            &PackDecodeLimits::new(64, 1024, 1024),
+            &mut cache,
+            &mut external,
+            &mut sink,
+        );
+
+        assert_perf_u32(report.stats.emitted_candidates, 1);
+        assert_eq!(
+            sink.blobs.get(&candidate.oid).map(|b| b.as_slice()),
+            Some(result_bytes.as_slice()),
+        );
+
+        // Expected cache_get wrapper calls when all lookups go through it:
+        //   1. emit_one_offset(base): cache_get(cache, base_offset) → hit
+        //   2. emit_one_offset(delta): cache_get(cache, delta_offset) → miss
+        //   3. decode_offset: cache_get(cache, dep.base_offset) → hit (base lookup)
+        //   4. emit_one_offset(delta) re-probe: cache_get(cache, delta_offset)
+        //
+        // If call #3 uses cache.get() directly, only 3 calls are counted.
+        let calls = test_cache_get_calls();
+        assert_eq!(
+            calls, 4,
+            "delta base lookup must go through cache_get wrapper; expected 4 calls, got {calls}",
+        );
     }
 }
