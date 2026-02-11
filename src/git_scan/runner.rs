@@ -49,7 +49,7 @@ use super::byte_arena::ByteArena;
 use super::commit_graph::CommitGraphIndex;
 use super::commit_walk::introduced_by_plan;
 use super::commit_walk_limits::CommitWalkLimits;
-use super::engine_adapter::{EngineAdapterConfig, ScannedBlobs};
+use super::engine_adapter::{CommitMetaContext, EngineAdapterConfig, ScannedBlobs};
 use super::errors::{CommitPlanError, PersistError, RepoOpenError, SpillError, TreeDiffError};
 use super::finalize::{build_finalize_ops, FinalizeInput, FinalizeOutput};
 use super::limits::RepoOpenLimits;
@@ -978,10 +978,22 @@ impl From<ArtifactAcquireError> for GitScanError {
 /// Missing or corrupt maintenance artifacts (commit-graph, MIDX) surface as
 /// `GitScanError::CommitPlan` or `GitScanError::Midx`.
 ///
+/// # Commit-meta emission
+///
+/// A [`CommitGraphIndex`] and shared [`AtomicBitSet`] are constructed from
+/// the commit graph before mode dispatch. Both are passed (via `Arc`) to
+/// every `EngineAdapter` created during pack execution and loose scanning,
+/// enabling exactly-once `CommitMeta` event emission per referenced commit
+/// across all worker threads.
+///
 /// # Determinism
 /// Pack plans are built in pack order, and parallel execution reassembles
-/// results by pack (and shard) order before finalize. This keeps scan output
-/// stable even when multiple workers are used.
+/// results by pack (and shard) order before finalize. This keeps persisted
+/// scan output stable even when multiple workers are used.
+///
+/// Structured event ordering is intentionally non-deterministic under parallel
+/// workers: `commit_meta` and `finding` events may interleave across commits,
+/// and a finding may appear before its matching commit metadata.
 ///
 /// # Caveats
 /// - Loose object decode failures are recorded as skipped candidates and may
@@ -1028,20 +1040,27 @@ pub fn run_git_scan(
     let plan = introduced_by_plan(&repo, &cg, config.commit_walk)?;
     let commit_plan_nanos = plan_start.elapsed().as_nanos() as u64;
 
+    // Build commit-graph index and emit-once bitset (shared by both modes).
+    let cg_index = std::sync::Arc::new(CommitGraphIndex::build(&cg)?);
+    let commit_meta_seen =
+        std::sync::Arc::new(crate::stdx::AtomicBitSet::empty(cg_index.len().max(1)));
+
     // Dispatch to mode-specific pipeline.
+    let mk_commit_meta = || CommitMetaContext {
+        event_sink: std::sync::Arc::clone(&event_sink),
+        commit_graph_index: std::sync::Arc::clone(&cg_index),
+        commit_meta_seen: std::sync::Arc::clone(&commit_meta_seen),
+    };
     let mut output = match config.scan_mode {
-        GitScanMode::OdbBlobFast => {
-            let cg_index = CommitGraphIndex::build(&cg)?;
-            super::runner_odb_blob::run_odb_blob(
-                &repo,
-                std::sync::Arc::clone(&engine),
-                seen_store,
-                &cg_index,
-                &plan,
-                config,
-                std::sync::Arc::clone(&event_sink),
-            )?
-        }
+        GitScanMode::OdbBlobFast => super::runner_odb_blob::run_odb_blob(
+            &repo,
+            std::sync::Arc::clone(&engine),
+            seen_store,
+            &cg_index,
+            &plan,
+            config,
+            mk_commit_meta(),
+        )?,
         GitScanMode::DiffHistory => super::runner_diff_history::run_diff_history(
             &repo,
             std::sync::Arc::clone(&engine),
@@ -1049,7 +1068,7 @@ pub fn run_git_scan(
             &cg,
             &plan,
             config,
-            std::sync::Arc::clone(&event_sink),
+            mk_commit_meta(),
         )?,
     };
     output.stage_nanos.commit_plan = commit_plan_nanos;

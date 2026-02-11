@@ -54,7 +54,7 @@ use crate::scheduler::{alloc_stats, AllocStats};
 use crate::Engine;
 
 use super::commit_walk::{CommitGraph, ParentScratch, PlannedCommit};
-use super::engine_adapter::{EngineAdapter, ScannedBlobs};
+use super::engine_adapter::{CommitMetaContext, EngineAdapter, ScannedBlobs};
 use super::mapping_bridge::{MappingBridge, MappingBridgeConfig};
 use super::object_store::{ObjectStore, ObjectStoreLayout};
 use super::pack_candidates::CappedPackCandidateSink;
@@ -101,6 +101,17 @@ use super::runner_exec::{
 /// candidates. It must outlive any downstream consumer that dereferences
 /// those handles.
 ///
+/// # Commit-meta emission
+///
+/// The [`CommitMetaContext`] bundles the event sink, commit-graph index,
+/// and emit-once bitset for exactly-once `CommitMeta` event emission per
+/// referenced commit. The index maps commit-graph positions to OIDs and
+/// timestamps; the bitset gates emission so each `commit_id` produces at
+/// most one `CommitMeta` event even when multiple adapters (or multiple
+/// blobs within a single adapter) reference the same commit. Event ordering
+/// is intentionally non-deterministic under parallel workers; findings may
+/// precede matching commit metadata.
+///
 /// # Errors
 ///
 /// - MIDX load, completeness, or OID resolution failures.
@@ -116,8 +127,14 @@ pub(super) fn run_diff_history(
     cg: &dyn CommitGraph,
     plan: &[PlannedCommit],
     config: &GitScanConfig,
-    event_sink: std::sync::Arc<dyn crate::unified::events::EventSink>,
+    commit_meta: CommitMetaContext,
 ) -> Result<ScanModeOutput, GitScanError> {
+    let CommitMetaContext {
+        event_sink,
+        commit_graph_index,
+        commit_meta_seen,
+    } = commit_meta;
+
     let mut stage_nanos = GitScanStageNanos::default();
     let mut alloc_deltas = GitScanAllocStats::default();
 
@@ -347,6 +364,8 @@ pub(super) fn run_diff_history(
             pack_cache_bytes,
             scheduler_workers,
             config.pin_threads,
+            Arc::clone(&commit_graph_index),
+            Arc::clone(&commit_meta_seen),
         )?;
         for output in outputs {
             pack_exec_reports.push(output.report);
@@ -358,7 +377,11 @@ pub(super) fn run_diff_history(
         let mut adapter = EngineAdapter::new_with_event_sink(
             engine.as_ref(),
             config.engine_adapter,
-            event_sink.clone(),
+            CommitMetaContext {
+                event_sink: event_sink.clone(),
+                commit_graph_index: Arc::clone(&commit_graph_index),
+                commit_meta_seen: Arc::clone(&commit_meta_seen),
+            },
         );
         adapter.reserve_results(sink.loose.len());
         let mut external = PackIo::from_parts(

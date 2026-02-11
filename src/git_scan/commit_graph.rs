@@ -97,4 +97,17 @@ impl CommitGraphIndex {
     }
 }
 
+#[cfg(test)]
+impl CommitGraphIndex {
+    /// Creates an empty index with no commits (test-only).
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            commit_oids: Vec::new(),
+            root_trees: Vec::new(),
+            committer_timestamps: Vec::new(),
+        }
+    }
+}
+
 // Tests live in `tests/integration/git_commit_walk.rs` to reuse git helpers.

@@ -9,6 +9,8 @@
 //! to emit quotes themselves as part of the larger JSON structure. This
 //! avoids double-quoting when composing nested objects by hand.
 
+use crate::git_scan::object_id::OidBytes;
+
 use super::SourceKind;
 
 const HEX_DIGITS: [u8; 16] = *b"0123456789abcdef";
@@ -19,6 +21,18 @@ pub(crate) fn write_source(kind: SourceKind, buf: &mut Vec<u8>) {
     match kind {
         SourceKind::Fs => buf.extend_from_slice(b"fs"),
         SourceKind::Git => buf.extend_from_slice(b"git"),
+    }
+}
+
+/// Write an [`OidBytes`] as lowercase hex (without surrounding quotes).
+///
+/// Produces 40 hex characters for SHA-1 (20 bytes) and 64 for SHA-256
+/// (32 bytes), matching `git log --format=%H` output.
+#[inline(always)]
+pub(crate) fn write_oid_hex(oid: &OidBytes, buf: &mut Vec<u8>) {
+    for &b in oid.as_slice() {
+        buf.push(HEX_DIGITS[(b >> 4) as usize]);
+        buf.push(HEX_DIGITS[(b & 0xf) as usize]);
     }
 }
 
@@ -263,5 +277,36 @@ mod tests {
         write_json_bytes(b"src/\xff/bad.rs", &mut buf);
         let s = std::str::from_utf8(&buf).unwrap();
         assert_eq!(s, "src/\\u00ff/bad.rs");
+    }
+
+    #[test]
+    fn write_oid_hex_sha1() {
+        let oid = OidBytes::sha1([
+            0xde, 0xad, 0xbe, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc,
+            0xba, 0x98, 0x76, 0x54, 0x32, 0x10,
+        ]);
+        let mut buf = Vec::new();
+        write_oid_hex(&oid, &mut buf);
+        assert_eq!(
+            std::str::from_utf8(&buf).unwrap(),
+            "deadbeef0123456789abcdeffedcba9876543210"
+        );
+        assert_eq!(buf.len(), 40);
+    }
+
+    #[test]
+    fn write_oid_hex_sha256() {
+        let mut bytes = [0u8; 32];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let oid = OidBytes::sha256(bytes);
+        let mut buf = Vec::new();
+        write_oid_hex(&oid, &mut buf);
+        assert_eq!(
+            std::str::from_utf8(&buf).unwrap(),
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+        );
+        assert_eq!(buf.len(), 64);
     }
 }
