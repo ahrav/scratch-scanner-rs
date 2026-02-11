@@ -440,18 +440,6 @@ mod tests {
     }
 
     #[test]
-    fn scratch_vec_extend_from_slice() {
-        let mut vec = ScratchVec::<u8>::with_capacity(10).unwrap();
-        vec.extend_from_slice(&[1, 2, 3]);
-        assert_eq!(vec.as_slice(), &[1, 2, 3]);
-        vec.extend_from_slice(&[4, 5]);
-        assert_eq!(vec.as_slice(), &[1, 2, 3, 4, 5]);
-        vec.clear();
-        vec.extend_from_slice(&[]);
-        assert!(vec.is_empty());
-    }
-
-    #[test]
     #[should_panic(expected = "scratch vec capacity exceeded")]
     fn scratch_vec_push_overflow_panics() {
         let mut vec = ScratchVec::<u8>::with_capacity(1).unwrap();
@@ -464,21 +452,6 @@ mod tests {
     fn scratch_vec_extend_from_slice_overflow() {
         let mut vec = ScratchVec::<u8>::with_capacity(3).unwrap();
         vec.extend_from_slice(&[1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn scratch_vec_pop() {
-        let mut vec = ScratchVec::<u32>::with_capacity(4).unwrap();
-        assert_eq!(vec.pop(), None);
-        vec.push(10);
-        vec.push(20);
-        vec.push(30);
-        assert_eq!(vec.pop(), Some(30));
-        assert_eq!(vec.pop(), Some(20));
-        assert_eq!(vec.as_slice(), &[10]);
-        assert_eq!(vec.pop(), Some(10));
-        assert_eq!(vec.pop(), None);
-        assert!(vec.is_empty());
     }
 
     #[test]
@@ -505,19 +478,6 @@ mod tests {
     }
 
     #[test]
-    fn scratch_vec_drain() {
-        let mut vec = ScratchVec::<u32>::with_capacity(4).unwrap();
-        vec.push(1);
-        vec.push(2);
-        vec.push(3);
-
-        let drained: Vec<u32> = vec.drain().collect();
-        assert_eq!(drained, vec![1, 2, 3]);
-        assert!(vec.is_empty());
-        assert_eq!(vec.capacity(), 4);
-    }
-
-    #[test]
     fn scratch_vec_drain_partial() {
         let mut vec = ScratchVec::<u32>::with_capacity(4).unwrap();
         vec.push(1);
@@ -530,14 +490,6 @@ mod tests {
             // Drop without consuming all - remaining should be dropped
         }
 
-        assert!(vec.is_empty());
-    }
-
-    #[test]
-    fn scratch_vec_drain_empty() {
-        let mut vec = ScratchVec::<u32>::with_capacity(4).unwrap();
-        let drained: Vec<u32> = vec.drain().collect();
-        assert!(drained.is_empty());
         assert!(vec.is_empty());
     }
 

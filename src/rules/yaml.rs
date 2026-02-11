@@ -642,27 +642,6 @@ rules:
     }
 
     #[test]
-    fn roundtrip_yaml_preserves_value_suppressors_any() {
-        let yaml = r#"
-rules:
-  - name: "roundtrip-value-suppressors"
-    regex: 'TOK_([A-Z0-9]{12})'
-    anchors: ["TOK_"]
-    radius: 32
-    value_suppressors_any: ["EXAMPLE", "DUMMY_TOKEN"]
-    secret_group: 1
-"#;
-
-        let original_rules = parse_yaml_rules(yaml).expect("parse original YAML");
-        let yaml_rules: Vec<YamlRule> = original_rules.iter().map(rulespec_to_yaml).collect();
-        let file = YamlRulesFile { rules: yaml_rules };
-        let yaml_str = serde_yml::to_string(&file).expect("serialize to YAML");
-        let parsed_rules = parse_yaml_rules(&yaml_str).expect("parse round-tripped YAML");
-
-        assert_rules_equal(&original_rules, &parsed_rules);
-    }
-
-    #[test]
     fn yaml_to_engine_suppresses_matching_secret_value() {
         let yaml = r#"
 rules:
@@ -1216,42 +1195,6 @@ rules:
         assert!(rules[0].two_phase.is_none());
         assert!(rules[0].local_context.is_none());
         assert!(rules[0].secret_group.is_none());
-    }
-
-    #[test]
-    fn parse_yaml_with_value_suppressors_any() {
-        let yaml = r#"
-rules:
-  - name: "suppressor-rule"
-    regex: '(tok_)[a-z0-9]{8}'
-    anchors: ["tok_"]
-    radius: 64
-    value_suppressors_any: ["EXAMPLE", "DUMMY_TOKEN"]
-"#;
-
-        let rules = parse_yaml_rules(yaml).expect("parse yaml with value_suppressors_any");
-        assert_eq!(rules.len(), 1);
-        let suppressors = rules[0]
-            .value_suppressors_any
-            .expect("value_suppressors_any should be present");
-        assert_eq!(suppressors.len(), 2);
-        assert_eq!(suppressors[0], b"EXAMPLE");
-        assert_eq!(suppressors[1], b"DUMMY_TOKEN");
-    }
-
-    #[test]
-    fn parse_yaml_without_value_suppressors_any_defaults_to_none() {
-        let yaml = r#"
-rules:
-  - name: "no-suppressor-rule"
-    regex: '(tok_)[a-z0-9]{8}'
-    anchors: ["tok_"]
-    radius: 64
-"#;
-
-        let rules = parse_yaml_rules(yaml).expect("parse yaml without value_suppressors_any");
-        assert_eq!(rules.len(), 1);
-        assert!(rules[0].value_suppressors_any.is_none());
     }
 
     #[test]

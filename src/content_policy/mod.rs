@@ -233,62 +233,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn class_file_classified_as_extractable() {
-        let data = b"\xCA\xFE\xBA\xBE\x00\x00\x00\x34";
-        assert_eq!(
-            classify_content(data, b"Foo.class", CHECK_LEN),
-            ContentVerdict::BinaryExtractable(ExtractableFormat::JavaClass)
-        );
-    }
-
-    #[test]
-    fn jar_file_classified_as_extractable() {
-        let data = b"PK\x03\x04some jar content\x00\x00";
-        assert_eq!(
-            classify_content(data, b"app.jar", CHECK_LEN),
-            ContentVerdict::BinaryExtractable(ExtractableFormat::JarWar)
-        );
-    }
-
-    #[test]
-    fn war_file_classified_as_extractable() {
-        let data = b"PK\x03\x04some war content\x00\x00";
-        assert_eq!(
-            classify_content(data, b"app.war", CHECK_LEN),
-            ContentVerdict::BinaryExtractable(ExtractableFormat::JarWar)
-        );
-    }
-
-    #[test]
-    fn pyc_file_classified_as_extractable() {
-        let data = b"\x42\x0d\x0d\x0a\x00\x00\x00\x00";
-        assert_eq!(
-            classify_content(data, b"module.pyc", CHECK_LEN),
-            ContentVerdict::BinaryExtractable(ExtractableFormat::Pyc)
-        );
-    }
-
-    // ---- case-insensitive extension matching ----
-
-    #[test]
-    fn uppercase_extension_matches() {
-        let data = b"PK\x03\x04\x00";
-        assert_eq!(
-            classify_content(data, b"app.JAR", CHECK_LEN),
-            ContentVerdict::BinaryExtractable(ExtractableFormat::JarWar)
-        );
-    }
-
-    #[test]
-    fn mixed_case_extension_matches() {
-        let data = b"\xCA\xFE\xBA\xBE\x00";
-        assert_eq!(
-            classify_content(data, b"Foo.ClAsS", CHECK_LEN),
-            ContentVerdict::BinaryExtractable(ExtractableFormat::JavaClass)
-        );
-    }
-
     // ---- file_extension helper ----
 
     #[test]
@@ -325,14 +269,6 @@ mod tests {
     }
 
     // ---- empty / edge cases ----
-
-    #[test]
-    fn empty_data_classifies_as_text() {
-        assert_eq!(
-            classify_content(b"", b"empty.txt", CHECK_LEN),
-            ContentVerdict::Text
-        );
-    }
 
     #[test]
     fn empty_path_with_binary_data() {

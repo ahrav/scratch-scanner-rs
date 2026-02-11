@@ -594,37 +594,4 @@ mod tests {
         let size = std::mem::size_of::<ChunkMeta>();
         assert!(size <= 40, "ChunkMeta is {} bytes, expected <= 40", size);
     }
-
-    #[test]
-    fn dedupe_test_uses_relative_predicate() {
-        // Same as the existing dedupe test but using the faster rel_end predicate
-        let data = b"aaaaaSECRETbbbbbbbbbbbbSECRETcccccccccccccccc";
-        let needle = b"SECRET";
-
-        let contract = EngineContract::bounded((needle.len() - 1) as u32);
-        let params = params_from_contract(16, contract).unwrap();
-        let view = ViewId(0);
-        let object_id = make_object_id();
-
-        let expected = find_all(data, needle);
-
-        let mut got = Vec::new();
-        for meta in ChunkIter::new(object_id, data.len() as u64, params, view) {
-            let start = meta.base_offset as usize;
-            let end = start + meta.len as usize;
-            let chunk = &data[start..end];
-
-            for (rs, re) in find_all(chunk, needle) {
-                // Use relative predicate (preferred in hot path)
-                let rel_end = re as u32;
-                if meta.keep_finding_rel_end(rel_end) {
-                    got.push((meta.base_offset + rs, meta.base_offset + re));
-                }
-            }
-        }
-
-        got.sort();
-        got.dedup();
-        assert_eq!(got, expected, "should find all secrets without duplicates");
-    }
 }

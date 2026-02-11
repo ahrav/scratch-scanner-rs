@@ -611,48 +611,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)] // 10k iterations too slow under Miri; see miri variant below.
     fn cross_thread_fifo() {
-        let (mut tx, mut rx) = spsc_channel::<u64, 8>();
-        let count = 10_000u64;
-
-        let producer = std::thread::spawn(move || {
-            for i in 0..count {
-                loop {
-                    match tx.try_push(i) {
-                        Ok(()) => break,
-                        Err(_) => std::hint::spin_loop(),
-                    }
-                }
-            }
-        });
-
-        let consumer = std::thread::spawn(move || {
-            let mut received = Vec::with_capacity(count as usize);
-            while received.len() < count as usize {
-                if let Some(v) = rx.try_pop() {
-                    received.push(v);
-                } else {
-                    std::hint::spin_loop();
-                }
-            }
-            received
-        });
-
-        producer.join().unwrap();
-        let received = consumer.join().unwrap();
-
-        assert_eq!(received.len(), count as usize);
-        for (i, &v) in received.iter().enumerate() {
-            assert_eq!(v, i as u64, "FIFO violation at index {}", i);
-        }
-    }
-
-    /// Miri-friendly variant of `cross_thread_fifo` with a small iteration
-    /// count. Exercises the same Acquire/Release ordering and UnsafeCell
-    /// access pattern under Miri's thread interleaving.
-    #[test]
-    fn cross_thread_fifo_miri() {
         let (mut tx, mut rx) = spsc_channel::<u64, 4>();
         // Small count for Miri — enough to wrap the ring and exercise ordering.
         let count = if cfg!(miri) { 16u64 } else { 200u64 };

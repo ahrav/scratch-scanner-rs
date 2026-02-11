@@ -1169,25 +1169,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_has_assignment_value_shape_with_equals() {
-        // Basic assignment with long token
+    fn test_has_assignment_value_shape_separators() {
+        // Equals
         assert!(has_assignment_value_shape(b"api_key=AKIAIOSFODNN7EXAMPLE"));
         assert!(has_assignment_value_shape(b"token = abcdefghij1234567890"));
         assert!(has_assignment_value_shape(b"secret=\"longtoken1234\""));
-    }
-
-    #[test]
-    fn test_has_assignment_value_shape_with_colon() {
-        // JSON-style assignment
+        // Colon (JSON-style)
         assert!(has_assignment_value_shape(
             b"\"api_key\": \"AKIAIOSFODNN7EXAMPLE\""
         ));
         assert!(has_assignment_value_shape(b"token: abcdefghij1234567890"));
-    }
-
-    #[test]
-    fn test_has_assignment_value_shape_with_arrow() {
-        // Arrow assignment (=> becomes > after =)
+        // Arrow (=> becomes > after =)
         assert!(has_assignment_value_shape(b"key => longtoken1234567890"));
         assert!(has_assignment_value_shape(b"secret => AKIAIOSFODNN7EX"));
     }

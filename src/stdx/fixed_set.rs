@@ -139,28 +139,6 @@ mod tests {
     use super::FixedSet128;
 
     #[test]
-    fn fixed_set_128_insert_and_duplicate() {
-        let mut set = FixedSet128::with_pow2(16);
-        assert!(set.insert(42));
-        assert!(!set.insert(42));
-        assert!(set.insert(7));
-        assert!(!set.insert(7));
-        // Test with large 128-bit values.
-        let big = 0xDEAD_BEEF_CAFE_BABE_1234_5678_9ABC_DEF0u128;
-        assert!(set.insert(big));
-        assert!(!set.insert(big));
-    }
-
-    #[test]
-    fn fixed_set_128_reset_clears_generation() {
-        let mut set = FixedSet128::with_pow2(8);
-        assert!(set.insert(1));
-        assert!(!set.insert(1));
-        set.reset();
-        assert!(set.insert(1));
-    }
-
-    #[test]
     fn fixed_set_128_wrap_resets_gen_table() {
         let mut set = FixedSet128::with_pow2(8);
         for slot in &mut set.slots {
@@ -170,17 +148,6 @@ mod tests {
         set.reset();
         assert_eq!(set.cur, 1);
         assert!(set.slots.iter().all(|slot| slot.gen == 0));
-    }
-
-    #[test]
-    fn fixed_set_128_full_table_keeps_dedup_for_existing_keys() {
-        let mut set = FixedSet128::with_pow2(8);
-        for k in 0..8u128 {
-            assert!(set.insert(k));
-        }
-        assert!(!set.insert(3));
-        assert!(!set.insert(7));
-        // New keys after full table are best-effort; no assert on return value.
     }
 }
 

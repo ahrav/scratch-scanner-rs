@@ -186,18 +186,3 @@ const _: () = SpillLimits::DEFAULT.validate();
 const _: () = SpillLimits::RESTRICTIVE.validate();
 // Keep the struct layout fixed for predictable serialization/caching costs.
 const _: () = assert!(std::mem::size_of::<SpillLimits>() == 32);
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_limits_valid() {
-        SpillLimits::DEFAULT.validate();
-    }
-
-    #[test]
-    fn restrictive_limits_valid() {
-        SpillLimits::RESTRICTIVE.validate();
-    }
-}

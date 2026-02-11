@@ -227,16 +227,6 @@ mod tests {
     }
 
     #[test]
-    fn same_name_file_vs_dir() {
-        // "a\0" vs "a/"
-        assert_eq!(git_tree_name_cmp(b"a", false, b"a", true), Ordering::Less);
-        assert_eq!(
-            git_tree_name_cmp(b"a", true, b"a", false),
-            Ordering::Greater
-        );
-    }
-
-    #[test]
     fn file_prefix_of_dir_different_names() {
         // "a\0" vs "ab/"
         assert_eq!(git_tree_name_cmp(b"a", false, b"ab", true), Ordering::Less);

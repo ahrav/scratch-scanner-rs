@@ -248,18 +248,3 @@ impl Default for TreeDiffLimits {
 const _: () = TreeDiffLimits::DEFAULT.validate();
 const _: () = TreeDiffLimits::RESTRICTIVE.validate();
 const _: () = assert!(std::mem::size_of::<TreeDiffLimits>() == 40);
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_limits_valid() {
-        TreeDiffLimits::DEFAULT.validate();
-    }
-
-    #[test]
-    fn restrictive_limits_valid() {
-        TreeDiffLimits::RESTRICTIVE.validate();
-    }
-}

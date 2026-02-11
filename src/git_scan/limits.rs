@@ -149,18 +149,3 @@ impl Default for RepoOpenLimits {
 const _: () = RepoOpenLimits::DEFAULT.validate();
 const _: () = RepoOpenLimits::RESTRICTIVE.validate();
 const _: () = assert!(std::mem::size_of::<RepoOpenLimits>() == 28);
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_limits_valid() {
-        RepoOpenLimits::DEFAULT.validate();
-    }
-
-    #[test]
-    fn restrictive_limits_valid() {
-        RepoOpenLimits::RESTRICTIVE.validate();
-    }
-}

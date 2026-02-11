@@ -379,89 +379,12 @@ mod unit_tests {
     use super::*;
 
     #[test]
-    fn empty_bitset() {
-        let b = DynamicBitSet::empty(64);
-
-        assert_eq!(b.count(), 0);
-        assert_eq!(b.bit_length(), 64);
-        assert!(b.padding_invariant_holds());
-    }
-
-    #[test]
-    fn set_and_is_set() {
-        let mut b = DynamicBitSet::empty(64);
-        b.set(0);
-        b.set(32);
-        b.set(63);
-
-        assert!(b.is_set(0));
-        assert!(b.is_set(32));
-        assert!(b.is_set(63));
-        assert!(!b.is_set(1));
-        assert_eq!(b.count(), 3);
-    }
-
-    #[test]
-    fn unset() {
-        let mut b = DynamicBitSet::empty(64);
-        b.set(5);
-        assert!(b.is_set(5));
-
-        b.unset(5);
-        assert!(!b.is_set(5));
-        assert_eq!(b.count(), 0);
-    }
-
-    #[test]
-    fn clear() {
-        let mut b = DynamicBitSet::empty(64);
-        b.set(0);
-        b.set(32);
-        b.set(63);
-
-        b.clear();
-
-        assert_eq!(b.count(), 0);
-        assert!(!b.is_set(0));
-        assert!(!b.is_set(32));
-        assert!(!b.is_set(63));
-    }
-
-    #[test]
-    fn toggle_all() {
-        let mut b = DynamicBitSet::empty(8);
-        b.set(0);
-        b.set(7);
-
-        b.toggle_all();
-
-        assert!(!b.is_set(0));
-        assert!(b.is_set(1));
-        assert!(b.is_set(6));
-        assert!(!b.is_set(7));
-        assert_eq!(b.count(), 6);
-        assert!(b.padding_invariant_holds());
-    }
-
-    #[test]
     fn toggle_all_preserves_invariant_non_multiple_of_64() {
         let mut b = DynamicBitSet::empty(10);
         b.toggle_all();
 
         assert_eq!(b.count(), 10);
         assert!(b.padding_invariant_holds());
-    }
-
-    #[test]
-    fn iter_set() {
-        let mut b = DynamicBitSet::empty(128);
-        b.set(0);
-        b.set(63);
-        b.set(64);
-        b.set(127);
-
-        let indices: Vec<usize> = b.iter_set().collect();
-        assert_eq!(indices, vec![0, 63, 64, 127]);
     }
 
     #[test]

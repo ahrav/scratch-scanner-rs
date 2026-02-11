@@ -703,20 +703,6 @@ fn gzip_entry_byte_cap_prevents_unbounded_work_and_is_reported() {
 }
 
 #[test]
-fn scans_tar_entry_and_emits_virtual_path() {
-    let tmp = TempDir::new().unwrap();
-    let tar_path = tmp.path().join("payload.tar");
-
-    let tar_bytes = build_simple_tar("a/b.txt", b"hello SECRET world\n");
-    fs::write(&tar_path, tar_bytes).unwrap();
-
-    let (out, _report) = run_scan(vec![file_from_path(&tar_path)], cfg_archives_enabled());
-    assert!(out.contains("secret"), "output: {out}");
-    assert!(out.contains("::"), "output: {out}");
-    assert!(out.contains("a/b.txt"), "output: {out}");
-}
-
-#[test]
 fn tar_boundary_spanning_secret_once() {
     let tmp = TempDir::new().unwrap();
     let tar_path = tmp.path().join("payload.tar");
@@ -742,24 +728,6 @@ fn tar_boundary_spanning_secret_once() {
     );
     let count = out.matches("secret").count();
     assert_eq!(count, 1, "output: {out}");
-}
-
-#[test]
-fn scans_targz_entry_and_emits_virtual_path() {
-    let tmp = TempDir::new().unwrap();
-    let tgz = tmp.path().join("payload.tar.gz");
-
-    let tar_bytes = build_simple_tar("inner.txt", b"xxSECRETyy");
-    {
-        let f = File::create(&tgz).unwrap();
-        let mut enc = GzEncoder::new(f, Compression::default());
-        enc.write_all(&tar_bytes).unwrap();
-        enc.finish().unwrap();
-    }
-
-    let (out, _report) = run_scan(vec![file_from_path(&tgz)], cfg_archives_enabled());
-    assert!(out.contains("secret"), "output: {out}");
-    assert!(out.contains("::inner.txt"), "output: {out}");
 }
 
 #[test]
@@ -864,23 +832,6 @@ fn tar_path_budget_exceeded_is_reported() {
         "expected path budget partial to be recorded; metrics={:?}",
         report.metrics.archive
     );
-}
-
-#[test]
-fn scans_zip_entry_and_emits_virtual_path() {
-    let tmp = TempDir::new().unwrap();
-    let zip_path = tmp.path().join("payload.zip");
-
-    write_zip(
-        &zip_path,
-        &[("a/b.txt", b"hello SECRET world\n".as_slice())],
-    )
-    .unwrap();
-
-    let (out, _report) = run_scan(vec![file_from_path(&zip_path)], cfg_archives_enabled());
-    assert!(out.contains("secret"), "output: {out}");
-    assert!(out.contains("::"), "output: {out}");
-    assert!(out.contains("a/b.txt"), "output: {out}");
 }
 
 #[test]

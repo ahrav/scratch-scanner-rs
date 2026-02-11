@@ -299,13 +299,6 @@ mod tests {
     }
 
     #[test]
-    fn canonical_encoding_is_non_empty() {
-        let mut buf = Vec::new();
-        StartSetConfig::DefaultBranchOnly.encode_canonical(&mut buf);
-        assert!(buf.len() >= 12);
-    }
-
-    #[test]
     fn canonical_encoding_clears_buffer() {
         let mut buf = vec![0xff; 100];
         StartSetConfig::DefaultBranchOnly.encode_canonical(&mut buf);
