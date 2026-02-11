@@ -892,7 +892,10 @@ pub fn build_exec_order(
         for &parent_u32 in &reverse_edges[rev_bounds] {
             let parent = parent_u32 as usize;
             // Propagate: parent gains this node + all its descendants.
-            desc_count[parent] = desc_count[parent].saturating_add(desc_count[idx] + 1);
+            // Keep the inner increment saturating so we never overflow
+            // before applying the outer accumulation saturation.
+            let child_plus_self = desc_count[idx].saturating_add(1);
+            desc_count[parent] = desc_count[parent].saturating_add(child_plus_self);
             debug_assert!(
                 remaining_out[parent] > 0,
                 "remaining_out underflow at parent {parent}"
@@ -1374,6 +1377,33 @@ mod tests {
             result.is_ok(),
             "duplicate edges must not cause panic or error"
         );
+    }
+
+    #[test]
+    fn dfs_desc_count_inner_increment_saturates() {
+        // Complete DAG over 34 nodes (edge i -> j for all i < j).
+        // This yields desc_count[1] == u32::MAX, so propagating that child
+        // into node 0 requires saturating the inner `+ 1`.
+        let n = 34u64;
+        let need_offsets: Vec<u64> = (0..n).map(|i| (i + 1) * 100).collect();
+        let mut deps = Vec::new();
+        for base in 0..n {
+            for dep in (base + 1)..n {
+                deps.push(ofs_dep(
+                    need_offsets[dep as usize],
+                    need_offsets[base as usize],
+                ));
+            }
+        }
+
+        let result = build_exec_order(&need_offsets, &deps, 0)
+            .expect("desc_count propagation should saturate without overflow panic");
+        assert!(
+            result.order.is_none(),
+            "complete DAG follows natural topological order"
+        );
+        assert_eq!(result.tree_roots, 1);
+        assert_eq!(result.max_depth, 33);
     }
 }
 
