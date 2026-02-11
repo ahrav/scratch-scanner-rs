@@ -7,6 +7,7 @@ mod binary_classification;
 // Log-based persistence removed in favor of SQLite. See src/store/db/.
 // mod fs_log_codec;
 // mod fs_log_reader;
+mod git_commit_meta;
 mod git_commit_walk;
 mod git_engine_adapter;
 mod git_spill_dedupe;

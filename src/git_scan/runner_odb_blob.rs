@@ -40,7 +40,7 @@ use super::blob_introducer::{introduce_parallel, BlobIntroStats, BlobIntroducer}
 use super::byte_arena::ByteArena;
 use super::commit_graph::CommitGraphIndex;
 use super::commit_walk::PlannedCommit;
-use super::engine_adapter::{EngineAdapter, ScannedBlobs};
+use super::engine_adapter::{CommitMetaContext, EngineAdapter, ScannedBlobs};
 use super::errors::TreeDiffError;
 use super::mapping_bridge::{MappingBridge, MappingBridgeConfig, MappingStats};
 use super::midx::MidxView;
@@ -91,6 +91,15 @@ use super::repo_open::RepoJobState;
 /// scheduling. Consumers must not treat `commit_id`/`path` attribution in this
 /// mode as deterministic across worker counts.
 ///
+/// # Commit-meta emission
+///
+/// The [`CommitMetaContext`] bundles the event sink, commit-graph index,
+/// and emit-once bitset for exactly-once `CommitMeta` event emission per
+/// referenced commit across all pack-exec workers and loose-scan adapters
+/// spawned by this function. See
+/// [`EngineAdapter::stream_findings`](super::engine_adapter::EngineAdapter)
+/// for the gating protocol.
+///
 /// # Parameters
 /// - `repo`: opened repository job state (paths, object format, artifacts).
 /// - `engine`: detection engine instance for scanning blob contents.
@@ -98,7 +107,7 @@ use super::repo_open::RepoJobState;
 /// - `cg_index`: commit graph index built from the commit graph.
 /// - `plan`: commit plan (planned commits from `introduced_by_plan`).
 /// - `config`: scan configuration (limits, worker counts, etc.).
-/// - `event_sink`: event sink for streaming scan progress and diagnostics.
+/// - `commit_meta`: event sink + commit-graph index + emit-once bitset.
 ///
 /// # Errors
 /// Returns `GitScanError` on MIDX, pack plan, pack exec, or I/O failures.
@@ -111,8 +120,14 @@ pub(super) fn run_odb_blob(
     cg_index: &CommitGraphIndex,
     plan: &[PlannedCommit],
     config: &GitScanConfig,
-    event_sink: std::sync::Arc<dyn crate::unified::events::EventSink>,
+    commit_meta: CommitMetaContext,
 ) -> Result<ScanModeOutput, GitScanError> {
+    let CommitMetaContext {
+        event_sink,
+        commit_graph_index,
+        commit_meta_seen,
+    } = commit_meta;
+
     let mut stage_nanos = GitScanStageNanos::default();
     let mut alloc_deltas = GitScanAllocStats::default();
 
@@ -417,6 +432,8 @@ pub(super) fn run_odb_blob(
                 pack_cache_bytes,
                 scheduler_workers,
                 config.pin_threads,
+                Arc::clone(&commit_graph_index),
+                Arc::clone(&commit_meta_seen),
             )?;
             for output in outputs {
                 pack_exec_reports.push(output.report);
@@ -430,7 +447,11 @@ pub(super) fn run_odb_blob(
             let mut adapter = EngineAdapter::new_with_event_sink(
                 engine.as_ref(),
                 config.engine_adapter,
-                event_sink.clone(),
+                CommitMetaContext {
+                    event_sink: event_sink.clone(),
+                    commit_graph_index: Arc::clone(&commit_graph_index),
+                    commit_meta_seen: Arc::clone(&commit_meta_seen),
+                },
             );
             adapter.reserve_results(loose.len());
             let mut external = PackIo::from_parts(
@@ -458,7 +479,11 @@ pub(super) fn run_odb_blob(
             let mut adapter = EngineAdapter::new_with_event_sink(
                 engine.as_ref(),
                 config.engine_adapter,
-                event_sink.clone(),
+                CommitMetaContext {
+                    event_sink: event_sink.clone(),
+                    commit_graph_index: Arc::clone(&commit_graph_index),
+                    commit_meta_seen: Arc::clone(&commit_meta_seen),
+                },
             );
             adapter.reserve_results(loose.len());
             let mut external = PackIo::from_parts(

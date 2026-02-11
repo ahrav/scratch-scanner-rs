@@ -16,7 +16,7 @@ use scanner_rs::git_scan::{
     GitScanResult, InMemoryPersistenceStore, MappingCandidateKind, NeverSeenStore, OidBytes,
     RefWatermarkStore, RepoOpenError, SpillError, StartSetConfig, StartSetResolver, WriteOp,
 };
-use scanner_rs::unified::events::NullEventSink;
+use scanner_rs::unified::events::{NullEventSink, VecEventSink};
 use scanner_rs::{demo_tuning, AnchorPolicy, Engine, Gate, RuleSpec, TransformConfig, TransformId};
 use scanner_rs::{TransformMode, ValidatorKind};
 
@@ -529,3 +529,146 @@ fn odb_blob_parallel_intro_keeps_persistence_contract_without_blob_ctx_determini
 // loose-only blob whose commit is still in a pack using normal Git
 // operations. The `LooseMissing` code path is covered by the unit test in
 // `runner.rs` (see `scan_loose_candidates_missing_object_skipped`).
+
+// ============================================================================
+// commit_meta event output tests
+// ============================================================================
+
+/// Run a scan using a `VecEventSink` and return the JSONL output as lines.
+fn run_scan_with_events(
+    repo: &Path,
+    watermark: Option<OidBytes>,
+    config: GitScanConfig,
+) -> (GitScanResult, Vec<String>) {
+    let engine = test_engine();
+    let tip = oid_from_hex(&git_output(repo, &["rev-parse", "HEAD"]));
+    let resolver = TestResolver { tip };
+    let watermark_store = TestWatermarkStore { watermark };
+    let persist_store = InMemoryPersistenceStore::default();
+    let sink = std::sync::Arc::new(VecEventSink::new());
+
+    let result = run_git_scan(
+        repo,
+        std::sync::Arc::new(engine),
+        &resolver,
+        &NeverSeenStore,
+        &watermark_store,
+        Some(&persist_store),
+        &config,
+        sink.clone(),
+    )
+    .expect("scan should succeed");
+
+    let bytes = sink.take();
+    let output = String::from_utf8(bytes).expect("valid UTF-8");
+    let lines: Vec<String> = output
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect();
+    (result, lines)
+}
+
+/// Verify that every finding's `commit_id` has a matching `commit_meta` event
+/// and that `commit_meta` is emitted exactly once per commit_id.
+#[test]
+fn commit_meta_output_matches_findings() {
+    if !git_available() {
+        eprintln!("git not available, skipping");
+        return;
+    }
+
+    let tmp = init_repo();
+    let repo = tmp.path();
+
+    // Commit a file with a detectable secret.
+    commit_file(
+        repo,
+        "secret.txt",
+        "prefix TOK_ABCDEFGH suffix",
+        "add secret",
+    );
+    // Second commit modifying the same file (different content but same secret).
+    commit_file(
+        repo,
+        "secret.txt",
+        "changed prefix TOK_ABCDEFGH changed suffix",
+        "modify secret",
+    );
+    // A clean file with no secrets.
+    commit_file(repo, "clean.txt", "nothing here", "add clean file");
+    ensure_artifacts(repo);
+
+    for &mode in &[GitScanMode::OdbBlobFast, GitScanMode::DiffHistory] {
+        let config = GitScanConfig {
+            repo_id: 42,
+            policy_hash: [0x11; 32],
+            start_set: StartSetConfig::DefaultBranchOnly,
+            scan_mode: mode,
+            ..Default::default()
+        };
+
+        let (_result, lines) = run_scan_with_events(repo, None, config);
+
+        // Collect commit_meta and finding events.
+        let mut meta_ids: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+        let mut finding_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut meta_positions: std::collections::HashMap<u64, usize> =
+            std::collections::HashMap::new();
+        let mut finding_first_pos: std::collections::HashMap<u64, usize> =
+            std::collections::HashMap::new();
+
+        for (idx, line) in lines.iter().enumerate() {
+            if line.contains("\"type\":\"commit_meta\"") {
+                if let Some(cid) = extract_commit_id(line) {
+                    *meta_ids.entry(cid).or_insert(0) += 1;
+                    meta_positions.entry(cid).or_insert(idx);
+                }
+            } else if line.contains("\"type\":\"finding\"") {
+                if let Some(cid) = extract_commit_id(line) {
+                    finding_ids.insert(cid);
+                    finding_first_pos.entry(cid).or_insert(idx);
+                }
+            }
+        }
+
+        // 1. Every commit_id in a finding has exactly one commit_meta.
+        for &fid in &finding_ids {
+            assert_eq!(
+                meta_ids.get(&fid).copied().unwrap_or(0),
+                1,
+                "mode={mode:?}: commit_id {fid} should have exactly 1 commit_meta"
+            );
+        }
+
+        // 2. No commit_meta exists without a matching finding.
+        for &mid in meta_ids.keys() {
+            assert!(
+                finding_ids.contains(&mid),
+                "mode={mode:?}: commit_meta for id={mid} has no matching finding"
+            );
+        }
+
+        // 3. Each commit_meta appears before the first finding that references it.
+        for &cid in &finding_ids {
+            let meta_pos = meta_positions
+                .get(&cid)
+                .expect("commit_meta must exist (checked above)");
+            let find_pos = finding_first_pos.get(&cid).unwrap();
+            assert!(
+                meta_pos < find_pos,
+                "mode={mode:?}: commit_meta for id={cid} at line {meta_pos} must appear before first finding at line {find_pos}"
+            );
+        }
+    }
+}
+
+fn extract_commit_id(line: &str) -> Option<u64> {
+    let marker = "\"commit_id\":";
+    let start = line.find(marker)? + marker.len();
+    let rest = &line[start..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse::<u64>().ok()
+}

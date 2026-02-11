@@ -24,8 +24,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use super::events::{
-    encode_diagnostic, encode_finding, encode_progress, encode_summary, with_format_buf, EventSink,
-    ScanEvent,
+    encode_commit_meta, encode_diagnostic, encode_finding, encode_progress, encode_summary,
+    with_format_buf, EventSink, ScanEvent,
 };
 
 /// Default buffer size (64 KiB).
@@ -60,6 +60,7 @@ impl<W: Write + Send + 'static> EventSink for JsonEventSink<W> {
                 ScanEvent::Progress(p) => encode_progress(p, buf),
                 ScanEvent::Summary(s) => encode_summary(s, buf),
                 ScanEvent::Diagnostic(d) => encode_diagnostic(d, buf),
+                ScanEvent::CommitMeta(m) => encode_commit_meta(m, buf),
             },
             |bytes| {
                 let mut writer = self.writer.lock().expect("json sink mutex poisoned");

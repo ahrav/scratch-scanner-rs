@@ -22,8 +22,11 @@ use std::cell::RefCell;
 use std::io::{BufWriter, ErrorKind, Write};
 use std::sync::Mutex;
 
-use super::json_write::{write_f64, write_json_bytes, write_json_str, write_source, write_u64};
+use super::json_write::{
+    write_f64, write_json_bytes, write_json_str, write_oid_hex, write_source, write_u64,
+};
 use super::SourceKind;
+use crate::git_scan::object_id::OidBytes;
 
 thread_local! {
     static EMIT_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(256));
@@ -68,6 +71,13 @@ pub enum ScanEvent<'a> {
     Progress(ProgressEvent),
     Summary(SummaryEvent),
     Diagnostic(DiagnosticEvent<'a>),
+    /// Commit metadata emitted exactly once per referenced commit.
+    ///
+    /// Sent before the first `Finding` that references a given `commit_id`.
+    /// Ordering across different commits is non-deterministic (parallel workers).
+    ///
+    /// Wire format type: `"commit_meta"`.
+    CommitMeta(CommitMetaEvent),
 }
 
 /// A single secret finding.
@@ -134,6 +144,26 @@ pub struct DiagnosticEvent<'a> {
     pub message: &'a str,
 }
 
+/// Commit metadata emitted once per referenced commit.
+///
+/// Provides the mapping from opaque `commit_id` (graph position) to the
+/// full commit hash and timestamp so JSONL output is self-contained.
+/// Only emitted for commits that have at least one finding.
+///
+/// The exactly-once guarantee is enforced by an `AtomicBitSet` shared
+/// across all `EngineAdapter` instances. See
+/// [`EngineAdapter::stream_findings`](crate::git_scan::engine_adapter::EngineAdapter)
+/// for the gating protocol.
+pub struct CommitMetaEvent {
+    /// Commit-graph position (same value as `FindingEvent::commit_id`).
+    pub commit_id: u32,
+    /// Raw commit object ID (SHA-1 or SHA-256). Hex formatting happens
+    /// at the serialization boundary.
+    pub commit_oid: OidBytes,
+    /// Committer timestamp (seconds since epoch).
+    pub timestamp: u64,
+}
+
 // ============================================================================
 // Traits
 // ============================================================================
@@ -193,6 +223,7 @@ impl EventEncoder for JsonlEncoder {
             ScanEvent::Progress(p) => encode_progress(p, buf),
             ScanEvent::Summary(s) => encode_summary(s, buf),
             ScanEvent::Diagnostic(d) => encode_diagnostic(d, buf),
+            ScanEvent::CommitMeta(m) => encode_commit_meta(m, buf),
         }
         buf.push(b'\n');
     }
@@ -268,6 +299,17 @@ pub(crate) fn encode_diagnostic(d: &DiagnosticEvent<'_>, buf: &mut Vec<u8>) {
     buf.extend_from_slice(b"\"}");
 }
 
+/// Append a JSONL `commit_meta` object to `buf` (no trailing newline).
+pub(crate) fn encode_commit_meta(m: &CommitMetaEvent, buf: &mut Vec<u8>) {
+    buf.extend_from_slice(b"{\"type\":\"commit_meta\",\"commit_id\":");
+    write_u64(m.commit_id as u64, buf);
+    buf.extend_from_slice(b",\"oid\":\"");
+    write_oid_hex(&m.commit_oid, buf);
+    buf.extend_from_slice(b"\",\"timestamp\":");
+    write_u64(m.timestamp, buf);
+    buf.push(b'}');
+}
+
 // ============================================================================
 // JSONL event sink
 // ============================================================================
@@ -321,7 +363,9 @@ impl<W: Write + Send + 'static> EventSink for JsonlEventSink<W> {
     }
 }
 
-/// Null event sink that discards all events (for benchmarking).
+/// Null event sink that discards all events.
+///
+/// Used as the default when no structured output is configured.
 pub struct NullEventSink;
 
 impl EventSink for NullEventSink {
@@ -549,5 +593,45 @@ mod tests {
         // After flush the BufWriter's internal buffer is flushed to the Vec.
         // Verify the sink didn't panic and the data is well-formed.
         let _inner = sink.writer.lock().unwrap();
+    }
+
+    #[test]
+    fn commit_meta_jsonl_encoding() {
+        let oid = OidBytes::sha1([
+            0xde, 0xad, 0xbe, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc,
+            0xba, 0x98, 0x76, 0x54, 0x32, 0x10,
+        ]);
+        let line = collect_jsonl(ScanEvent::CommitMeta(CommitMetaEvent {
+            commit_id: 42,
+            commit_oid: oid,
+            timestamp: 1_700_000_000,
+        }));
+        assert!(line.starts_with('{'));
+        assert!(line.ends_with("}\n"));
+        assert!(line.contains("\"type\":\"commit_meta\""));
+        assert!(line.contains("\"commit_id\":42"));
+        assert!(line.contains("\"oid\":\"deadbeef0123456789abcdeffedcba9876543210\""));
+        assert!(line.contains("\"timestamp\":1700000000"));
+    }
+
+    #[test]
+    fn commit_meta_jsonl_sha256() {
+        let mut bytes = [0u8; 32];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (0xff - i) as u8;
+        }
+        let oid = OidBytes::sha256(bytes);
+        let line = collect_jsonl(ScanEvent::CommitMeta(CommitMetaEvent {
+            commit_id: 0,
+            commit_oid: oid,
+            timestamp: u64::MAX,
+        }));
+        assert!(line.contains("\"type\":\"commit_meta\""));
+        assert!(line.contains("\"commit_id\":0"));
+        // 64-char hex for SHA-256.
+        assert!(line.contains(
+            "\"oid\":\"fffefdfcfbfaf9f8f7f6f5f4f3f2f1f0efeeedecebeae9e8e7e6e5e4e3e2e1e0\""
+        ));
+        assert!(line.contains(&format!("\"timestamp\":{}", u64::MAX)));
     }
 }

@@ -35,7 +35,7 @@ use memmap2::Mmap;
 
 use super::byte_arena::ByteArena;
 use super::bytes::BytesView;
-use super::engine_adapter::{EngineAdapter, EngineAdapterConfig, ScannedBlobs};
+use super::engine_adapter::{CommitMetaContext, EngineAdapter, EngineAdapterConfig, ScannedBlobs};
 use super::errors::TreeDiffError;
 use super::finalize::RefEntry;
 use super::midx::MidxView;
@@ -898,6 +898,12 @@ struct SchedulerPackShared {
     adapter_cfg: EngineAdapterConfig,
     plans: Arc<Vec<PackPlan>>,
     shard_meta: Option<Arc<Vec<SchedulerShardMeta>>>,
+    /// Commit-graph index for resolving `commit_id` → OID + timestamp.
+    /// Cloned into each worker's `EngineAdapter` for `CommitMeta` emission.
+    commit_graph: Arc<super::commit_graph::CommitGraphIndex>,
+    /// Emit-once bitset shared across all worker `EngineAdapter` instances
+    /// so each `commit_id` produces at most one `CommitMeta` event.
+    commit_meta_seen: Arc<crate::stdx::AtomicBitSet>,
 }
 
 fn reserve_results_for_exec_slice(
@@ -943,7 +949,11 @@ fn run_scheduler_pack_task(
     let mut adapter = EngineAdapter::new_with_event_sink(
         shared.engine.as_ref(),
         shared.adapter_cfg,
-        Arc::clone(&shared.event_sink),
+        CommitMetaContext {
+            event_sink: Arc::clone(&shared.event_sink),
+            commit_graph_index: Arc::clone(&shared.commit_graph),
+            commit_meta_seen: Arc::clone(&shared.commit_meta_seen),
+        },
     );
 
     match task {
@@ -1077,6 +1087,8 @@ pub(super) fn execute_pack_plans_with_scheduler(
     pack_cache_bytes: u32,
     workers: usize,
     pin_threads: bool,
+    commit_graph: Arc<super::commit_graph::CommitGraphIndex>,
+    commit_meta_seen: Arc<crate::stdx::AtomicBitSet>,
 ) -> Result<Vec<SchedulerPackExecOutput>, GitScanError> {
     if plans.is_empty() {
         return Ok(Vec::new());
@@ -1112,6 +1124,8 @@ pub(super) fn execute_pack_plans_with_scheduler(
                 adapter_cfg,
                 plans: Arc::clone(&plans),
                 shard_meta: None,
+                commit_graph: Arc::clone(&commit_graph),
+                commit_meta_seen: Arc::clone(&commit_meta_seen),
             });
 
             let ex = Executor::<SchedulerPackTask>::new(
@@ -1259,6 +1273,8 @@ pub(super) fn execute_pack_plans_with_scheduler(
                 adapter_cfg,
                 plans: Arc::clone(&plans),
                 shard_meta: Some(Arc::clone(&shard_meta)),
+                commit_graph,
+                commit_meta_seen,
             });
 
             let ex = Executor::<SchedulerPackTask>::new(

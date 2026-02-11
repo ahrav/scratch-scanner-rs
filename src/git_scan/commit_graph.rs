@@ -28,6 +28,19 @@ pub struct CommitGraphIndex {
 }
 
 impl CommitGraphIndex {
+    /// Creates an empty index with no commits.
+    ///
+    /// Used as a dummy placeholder in test helpers and callers that don't
+    /// need commit-meta emission.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            commit_oids: Vec::new(),
+            root_trees: Vec::new(),
+            committer_timestamps: Vec::new(),
+        }
+    }
+
     /// Builds a commit-graph index from any `CommitGraph` implementation.
     ///
     /// # Costs
@@ -94,6 +107,19 @@ impl CommitGraphIndex {
     #[inline]
     pub fn committer_timestamp(&self, pos: Position) -> u64 {
         self.committer_timestamps[pos.0 as usize]
+    }
+}
+
+#[cfg(test)]
+impl CommitGraphIndex {
+    /// Creates an empty index with no commits (test-only).
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            commit_oids: Vec::new(),
+            root_trees: Vec::new(),
+            committer_timestamps: Vec::new(),
+        }
     }
 }
 

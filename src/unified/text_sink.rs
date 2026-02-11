@@ -13,13 +13,16 @@
 //! | Progress | suppressed | `[progress] …` |
 //! | Summary | `[summary] …` | `[summary] …` |
 //! | Diagnostic | stderr (always) | stderr (always) |
+//! | CommitMeta | suppressed | `[commit_meta] id={} oid={} ts={}` |
 
 use std::io::{BufWriter, ErrorKind, Write};
 use std::sync::Mutex;
 
 use super::events::{
-    DiagnosticEvent, EventSink, FindingEvent, ProgressEvent, ScanEvent, SummaryEvent,
+    CommitMetaEvent, DiagnosticEvent, EventSink, FindingEvent, ProgressEvent, ScanEvent,
+    SummaryEvent,
 };
+use super::json_write::write_oid_hex;
 use super::SourceKind;
 
 /// Default buffer size (64 KiB) for buffered text emission.
@@ -65,6 +68,13 @@ impl<W: Write + Send + 'static> EventSink for TextEventSink<W> {
             ScanEvent::Diagnostic(ref d) => {
                 // Diagnostics always go to stderr, not the main writer.
                 write_diagnostic(d);
+            }
+            ScanEvent::CommitMeta(ref m) => {
+                if self.verbose {
+                    let line = format_commit_meta(m);
+                    write_line(&self.writer, &line);
+                }
+                // Compact mode: suppress commit_meta events.
             }
         }
     }
@@ -159,6 +169,18 @@ fn format_summary(s: &SummaryEvent) -> String {
         s.findings_emitted,
         s.errors,
         s.throughput_mib_s,
+    )
+}
+
+/// Verbose: `[commit_meta] id={commit_id} oid={hex} ts={timestamp}`
+fn format_commit_meta(m: &CommitMetaEvent) -> String {
+    let mut hex_buf = Vec::with_capacity(m.commit_oid.len() as usize * 2);
+    write_oid_hex(&m.commit_oid, &mut hex_buf);
+    // SAFETY: write_oid_hex only pushes ASCII hex digits.
+    let hex = unsafe { String::from_utf8_unchecked(hex_buf) };
+    format!(
+        "[commit_meta] id={} oid={} ts={}\n",
+        m.commit_id, hex, m.timestamp,
     )
 }
 
