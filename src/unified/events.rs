@@ -71,43 +71,63 @@ pub enum ScanEvent<'a> {
 }
 
 /// A single secret finding.
+///
+/// All fields borrow from the scan scratch / adapter to avoid allocation
+/// on the hot path. The sink is responsible for copying what it needs.
 pub struct FindingEvent<'a> {
+    /// Whether this finding came from a Git blob or filesystem file.
     pub source: SourceKind,
-    /// Raw bytes — git paths are not guaranteed UTF-8.
+    /// Raw path bytes — Git paths are not guaranteed UTF-8.
     pub object_path: &'a [u8],
+    /// Inclusive byte offset of the match start within the source object.
     pub start: u64,
+    /// Exclusive byte offset of the match end within the source object.
     pub end: u64,
+    /// Stable numeric rule identifier (index into the engine rule table).
     pub rule_id: u32,
+    /// Human-readable rule name (e.g. `"aws-access-key"`).
     pub rule_name: &'a str,
-    /// Git-specific: commit ID (None for FS).
+    /// Commit-graph position for Git findings; `None` for filesystem scans.
     pub commit_id: Option<u32>,
-    /// Git-specific: change kind (None for FS).
+    /// Change kind (`"add"` / `"modify"`) for Git findings; `None` for FS.
     pub change_kind: Option<&'a str>,
 }
 
-/// Progress checkpoint emitted periodically.
+/// Progress checkpoint emitted periodically during scanning.
 pub struct ProgressEvent {
     pub source: SourceKind,
+    /// Current scan phase (e.g. `"scanning"`, `"finalizing"`).
     pub stage: &'static str,
+    /// Cumulative objects processed so far.
     pub objects_scanned: u64,
+    /// Cumulative raw bytes fed to the engine.
     pub bytes_scanned: u64,
+    /// Cumulative findings emitted so far.
     pub findings_emitted: u64,
 }
 
-/// Final summary emitted when scanning completes.
+/// Final summary emitted once when scanning completes.
 pub struct SummaryEvent {
     pub source: SourceKind,
+    /// Terminal status (e.g. `"complete"`, `"error"`).
     pub status: &'static str,
+    /// Wall-clock elapsed time in milliseconds.
     pub elapsed_ms: u64,
+    /// Total raw bytes fed to the engine.
     pub bytes_scanned: u64,
+    /// Total findings emitted during the scan.
     pub findings_emitted: u64,
+    /// Number of non-fatal errors encountered.
     pub errors: u64,
+    /// Throughput in MiB/s (bytes_scanned / elapsed).
     pub throughput_mib_s: f64,
 }
 
-/// Debug / perf diagnostic line.
+/// Debug / performance diagnostic line.
 pub struct DiagnosticEvent<'a> {
+    /// Severity level (e.g. `"debug"`, `"warn"`).
     pub level: &'static str,
+    /// Free-form diagnostic message.
     pub message: &'a str,
 }
 
@@ -175,6 +195,7 @@ impl EventEncoder for JsonlEncoder {
     }
 }
 
+/// Append a JSONL `finding` object to `buf` (no trailing newline).
 pub(crate) fn encode_finding(f: &FindingEvent<'_>, buf: &mut Vec<u8>) {
     buf.extend_from_slice(b"{\"type\":\"finding\",\"source\":\"");
     write_source(f.source, buf);
@@ -201,6 +222,7 @@ pub(crate) fn encode_finding(f: &FindingEvent<'_>, buf: &mut Vec<u8>) {
     buf.push(b'}');
 }
 
+/// Append a JSONL `progress` object to `buf` (no trailing newline).
 pub(crate) fn encode_progress(p: &ProgressEvent, buf: &mut Vec<u8>) {
     buf.extend_from_slice(b"{\"type\":\"progress\",\"source\":\"");
     write_source(p.source, buf);
@@ -215,6 +237,7 @@ pub(crate) fn encode_progress(p: &ProgressEvent, buf: &mut Vec<u8>) {
     buf.push(b'}');
 }
 
+/// Append a JSONL `summary` object to `buf` (no trailing newline).
 pub(crate) fn encode_summary(s: &SummaryEvent, buf: &mut Vec<u8>) {
     buf.extend_from_slice(b"{\"type\":\"summary\",\"source\":\"");
     write_source(s.source, buf);
@@ -233,6 +256,7 @@ pub(crate) fn encode_summary(s: &SummaryEvent, buf: &mut Vec<u8>) {
     buf.push(b'}');
 }
 
+/// Append a JSONL `diagnostic` object to `buf` (no trailing newline).
 pub(crate) fn encode_diagnostic(d: &DiagnosticEvent<'_>, buf: &mut Vec<u8>) {
     buf.extend_from_slice(b"{\"type\":\"diagnostic\",\"level\":\"");
     write_json_str(d.level, buf);
