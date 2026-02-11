@@ -660,10 +660,13 @@ fn cpu_runner<E: ScanEngine>(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScra
             let data = &buf.as_slice()[..len_usize];
 
             engine.scan_chunk_into(data, token.file_id, base_offset, &mut ctx.scratch.scratch);
+            let engine_dropped = ctx.scratch.scratch.dropped_findings();
 
             // Drop findings fully contained in prefix (overlap region).
             let new_bytes_start = base_offset + prefix_len as u64;
+            let before_prefix = ctx.scratch.scratch.pending_findings_len();
             ctx.scratch.scratch.drop_prefix_findings(new_bytes_start);
+            let after_prefix = ctx.scratch.scratch.pending_findings_len();
 
             // CRITICAL: Clear pending before drain to avoid accumulating findings
             // across chunks. drain_findings_into uses append(), not replace.
@@ -672,9 +675,20 @@ fn cpu_runner<E: ScanEngine>(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScra
                 .scratch
                 .drain_findings_into(&mut ctx.scratch.pending);
 
+            let before_dedupe = ctx.scratch.pending.len();
             if ctx.scratch.dedupe_within_chunk {
                 dedupe_pending_in_place(&mut ctx.scratch.pending);
             }
+
+            // Account for dropped findings: engine drops minus scheduler pruning.
+            let scheduler_pruned = before_prefix
+                .saturating_sub(after_prefix)
+                .saturating_add(before_dedupe.saturating_sub(ctx.scratch.pending.len()));
+            let effective_dropped = engine_dropped.saturating_sub(scheduler_pruned as u64);
+            ctx.metrics.findings_dropped = ctx
+                .metrics
+                .findings_dropped
+                .saturating_add(effective_dropped);
 
             emit_findings(
                 engine,
@@ -687,6 +701,10 @@ fn cpu_runner<E: ScanEngine>(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScra
             let payload = (len as u64).saturating_sub(prefix_len as u64);
             ctx.metrics.chunks_scanned = ctx.metrics.chunks_scanned.saturating_add(1);
             ctx.metrics.bytes_scanned = ctx.metrics.bytes_scanned.saturating_add(payload);
+            ctx.metrics.findings_emitted = ctx
+                .metrics
+                .findings_emitted
+                .saturating_add(ctx.scratch.pending.len() as u64);
 
             // Buffer returns to pool on drop (RAII).
             drop(buf);
