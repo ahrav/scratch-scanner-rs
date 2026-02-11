@@ -98,13 +98,6 @@ doc = false
 bench = false
 
 [[bin]]
-name = "fuzz_log_reader"
-path = "fuzz_targets/fuzz_log_reader.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "fuzz_pack_delta_into"
 path = "fuzz_targets/fuzz_pack_delta_into.rs"
 test = false
