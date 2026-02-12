@@ -59,7 +59,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ubuntu-22.04
-      - run: cargo test --features stdx-proptest
+      - run: cargo test --features stdx-proptest,integration-tests,property-tests,diagnostic-tests,smoke-tests
 
   test-full-harness:
     name: Test (Scheduled, Full Harness)
@@ -82,7 +82,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ubuntu-22.04
-      - run: cargo test --lib --bins --tests --examples --features stdx-proptest,tiger-harness,scheduler-sim
+      - run: cargo test --lib --bins --tests --examples --features stdx-proptest,tiger-harness,scheduler-sim,integration-tests,property-tests,diagnostic-tests,smoke-tests
 
   fuzz-pack-smoke:
     name: Fuzz Pack Smoke (PR)

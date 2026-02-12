@@ -30,8 +30,8 @@ use super::vectorscan_prefilter::{
 use crate::api::Tuning;
 use crate::api::{
     AnchorPolicy, DecodeStep, EntropySpec, FileId, Finding, FindingRec, Gate, LocalContextSpec,
-    RuleSpec, TransformConfig, TransformId, TransformMode, Utf16Endianness, ValidatorKind,
-    STEP_ROOT,
+    OfflineValidationSpec, RuleSpec, TransformConfig, TransformId, TransformMode, Utf16Endianness,
+    ValidatorKind, STEP_ROOT,
 };
 use crate::demo::{demo_engine, demo_rules, demo_tuning};
 use crate::regex2anchor::{compile_trigger_plan, AnchorDeriveConfig, TriggerPlan};
@@ -167,6 +167,7 @@ fn norm_hash_deterministic_for_raw_matches() {
         entropy: None,
         local_context: None,
         secret_group: Some(1),
+        offline_validation: None,
         re: Regex::new(r"TOK_([A-Z0-9]{4})").unwrap(),
     };
 
@@ -214,6 +215,7 @@ fn norm_hash_uses_decoded_bytes_for_base64_transform() {
         entropy: None,
         local_context: None,
         secret_group: Some(1),
+        offline_validation: None,
         re: Regex::new(r"SECRET_([A-Z]{4})").unwrap(),
     };
     let transforms = vec![TransformConfig {
@@ -265,6 +267,7 @@ fn local_context_gate_applies_in_base64_stream_decode() {
             key_names_any: None,
         }),
         secret_group: Some(0),
+        offline_validation: None,
         re: Regex::new(r"SECRET_[A-Z]{4}").unwrap(),
     };
     let transforms = vec![TransformConfig {
@@ -325,6 +328,7 @@ fn local_context_gate_filters_without_assignment_when_bounds_present() {
             key_names_any: None,
         }),
         secret_group: None,
+        offline_validation: None,
         re: Regex::new(r"TOK_[A-Z]{4}").unwrap(),
     };
 
@@ -370,6 +374,7 @@ fn local_context_key_names_required_and_fail_open_when_out_of_range() {
             key_names_any: Some(&[b"key"]),
         }),
         secret_group: None,
+        offline_validation: None,
         re: Regex::new(r"TOK_[A-Z]{4}").unwrap(),
     };
 
@@ -639,6 +644,7 @@ fn zero_hit_url_plus_to_space_still_scans_transforms() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new(r"TOK [A-Z]{4}").unwrap(),
     };
     let transforms = vec![TransformConfig {
@@ -698,6 +704,7 @@ fn base64_padding_in_root_hint() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new(r"SIM0_[A-Z0-9]{12}").unwrap(),
     };
     let transforms = vec![TransformConfig {
@@ -793,6 +800,7 @@ fn keyword_gate_filters_without_keyword() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new("secret").unwrap(),
     };
     let eng = Engine::new_with_anchor_policy(
@@ -825,6 +833,7 @@ fn derived_confirm_all_is_compiled() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new(r"foo\d+bar").unwrap(),
     };
 
@@ -889,6 +898,7 @@ fn value_suppressor_gate_is_compiled_and_indexed() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new(r"TOK_[A-Za-z0-9]{8}").unwrap(),
     };
 
@@ -931,6 +941,7 @@ fn value_suppressor_filters_matching_secret_in_raw_path() {
         entropy: None,
         local_context: None,
         secret_group: Some(1),
+        offline_validation: None,
         re: Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
     };
 
@@ -963,6 +974,7 @@ fn value_suppressor_passes_non_matching_secret_in_raw_path() {
         entropy: None,
         local_context: None,
         secret_group: Some(1),
+        offline_validation: None,
         re: Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
     };
 
@@ -995,6 +1007,7 @@ fn value_suppressor_any_match_filters_with_multiple_patterns() {
         entropy: None,
         local_context: None,
         secret_group: Some(1),
+        offline_validation: None,
         re: Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
     };
 
@@ -1031,6 +1044,7 @@ fn value_suppressor_absent_does_not_change_behavior() {
         entropy: None,
         local_context: None,
         secret_group: Some(1),
+        offline_validation: None,
         re: Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
     };
 
@@ -1063,6 +1077,7 @@ fn safelist_emit_time_filter_suppresses_root_finding() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new(r"(?:placeholder_token|prod_token_[A-Z0-9]{6})").unwrap(),
     };
 
@@ -1098,6 +1113,7 @@ fn safelist_emit_time_filter_suppresses_root_finding() {
     assert_eq!(rec.step_id, STEP_ROOT, "remaining finding should be root");
     let span = rec.span_start as usize..rec.span_end as usize;
     assert_eq!(&hay[span], b"prod_token_A1B2C3");
+    #[cfg(feature = "perf-stats")]
     assert_eq!(
         scratch.safelist_suppressed(),
         1,
@@ -1119,6 +1135,7 @@ fn safelist_emit_time_filter_keeps_non_root_findings() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new(r"placeholder_token").unwrap(),
     };
     let transforms = vec![TransformConfig {
@@ -1180,6 +1197,7 @@ fn safelist_emit_time_filter_does_not_suppress_utf16_root_emission() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new(r"placeholder_token").unwrap(),
     };
 
@@ -1202,6 +1220,7 @@ fn safelist_emit_time_filter_does_not_suppress_utf16_root_emission() {
         recs[0].step_id, STEP_ROOT,
         "utf16 finding from root input should have a utf16 decode step id"
     );
+    #[cfg(feature = "perf-stats")]
     assert_eq!(
         scratch.safelist_suppressed(),
         0,
@@ -1223,6 +1242,7 @@ fn safelist_suppression_does_not_consume_findings_cap() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new(r"(?:placeholder_token|prod_token_[A-Z0-9]{6})").unwrap(),
     };
 
@@ -1265,6 +1285,7 @@ fn max_findings_cap_applies_after_safelist_suppression() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new(r"(?:placeholder_token|prod_token_[A-Z0-9]{6})").unwrap(),
     };
 
@@ -1296,6 +1317,7 @@ fn max_findings_cap_applies_after_safelist_suppression() {
         ],
         "cap should trim only after placeholder suppression"
     );
+    #[cfg(feature = "perf-stats")]
     assert_eq!(
         scratch.safelist_suppressed(),
         1,
@@ -1322,6 +1344,7 @@ fn safelist_emit_time_filter_noop_keeps_all_non_safelisted_roots() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new(r"prod_token_[A-Z0-9]{6}").unwrap(),
     };
 
@@ -1355,6 +1378,7 @@ fn safelist_emit_time_filter_noop_keeps_all_non_safelisted_roots() {
     for rec in recs {
         assert_eq!(rec.step_id, STEP_ROOT);
     }
+    #[cfg(feature = "perf-stats")]
     assert_eq!(
         scratch.safelist_suppressed(),
         0,
@@ -1376,6 +1400,7 @@ fn safelist_emit_time_filter_drops_tail_root_finding() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new(r"(?:prod_token_[A-Z0-9]{6}|placeholder_token)").unwrap(),
     };
 
@@ -1400,6 +1425,7 @@ fn safelist_emit_time_filter_drops_tail_root_finding() {
     assert_eq!(&hay[span], b"prod_token_A1B2C3");
     assert_eq!(recs.len(), scratch.norm_hashes().len());
     assert_eq!(recs.len(), scratch.drop_hint_end().len());
+    #[cfg(feature = "perf-stats")]
     assert_eq!(
         scratch.safelist_suppressed(),
         1,
@@ -1422,6 +1448,7 @@ fn safelist_emit_time_filter_suppresses_duplicate_root_spans_across_rules() {
             entropy: None,
             local_context: None,
             secret_group: None,
+            offline_validation: None,
             re: Regex::new(r"placeholder_token").unwrap(),
         },
         RuleSpec {
@@ -1436,6 +1463,7 @@ fn safelist_emit_time_filter_suppresses_duplicate_root_spans_across_rules() {
             entropy: None,
             local_context: None,
             secret_group: None,
+            offline_validation: None,
             re: Regex::new(r"placeholder_token").unwrap(),
         },
         RuleSpec {
@@ -1450,6 +1478,7 @@ fn safelist_emit_time_filter_suppresses_duplicate_root_spans_across_rules() {
             entropy: None,
             local_context: None,
             secret_group: None,
+            offline_validation: None,
             re: Regex::new(r"prod_token_[A-Z0-9]{6}").unwrap(),
         },
     ];
@@ -1485,6 +1514,7 @@ fn safelist_emit_time_filter_all_findings_suppressed() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new(r"placeholder_token").unwrap(),
     };
 
@@ -1507,12 +1537,14 @@ fn safelist_emit_time_filter_all_findings_suppressed() {
     );
     assert_eq!(recs.len(), scratch.norm_hashes().len());
     assert_eq!(recs.len(), scratch.drop_hint_end().len());
+    #[cfg(feature = "perf-stats")]
     assert!(
         scratch.safelist_suppressed() > 0,
         "safelist_suppressed counter must be non-zero when findings are suppressed"
     );
 }
 
+#[cfg(feature = "perf-stats")]
 #[test]
 fn safelist_suppressed_counter_resets_between_scans() {
     let rule = RuleSpec {
@@ -1527,6 +1559,7 @@ fn safelist_suppressed_counter_resets_between_scans() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new(r"(?:placeholder_token|prod_token_[A-Z0-9]{6})").unwrap(),
     };
 
@@ -1568,6 +1601,7 @@ fn value_suppressor_applies_in_base64_stream_decode_raw_path() {
         entropy: None,
         local_context: None,
         secret_group: Some(1),
+        offline_validation: None,
         re: Regex::new(r"SECRET_([A-Z]{4})").unwrap(),
     };
     let transforms = vec![TransformConfig {
@@ -1622,6 +1656,7 @@ fn value_suppressor_applies_in_base64_stream_decode_utf16_path() {
         entropy: None,
         local_context: None,
         secret_group: Some(0),
+        offline_validation: None,
         re: Regex::new("TOK").unwrap(),
     };
     let without_suppressor = RuleSpec {
@@ -1690,6 +1725,7 @@ fn value_suppressor_filters_in_chunked_scan_path() {
         entropy: None,
         local_context: None,
         secret_group: Some(1),
+        offline_validation: None,
         re: Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
     };
 
@@ -1729,6 +1765,7 @@ fn value_suppressor_is_case_sensitive() {
         entropy: None,
         local_context: None,
         secret_group: Some(1),
+        offline_validation: None,
         re: Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
     };
 
@@ -1764,6 +1801,7 @@ fn value_suppressor_works_with_full_match_fallback() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new(r"TOK_[A-Z]{8}").unwrap(),
     };
 
@@ -1805,6 +1843,7 @@ fn value_suppressor_single_byte_pattern() {
         entropy: None,
         local_context: None,
         secret_group: Some(1),
+        offline_validation: None,
         re: Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
     };
 
@@ -1852,6 +1891,7 @@ fn value_suppressor_targets_secret_group_not_full_match() {
         entropy: None,
         local_context: None,
         secret_group: Some(1),
+        offline_validation: None,
         re: Regex::new(r"KEY_([A-Za-z0-9]{8,16})").unwrap(),
     };
 
@@ -1895,6 +1935,7 @@ fn value_suppressor_is_substring_match_not_exact() {
         entropy: None,
         local_context: None,
         secret_group: Some(1),
+        offline_validation: None,
         re: Regex::new(r"TOK_([A-Za-z0-9]{8})").unwrap(),
     };
 
@@ -1960,6 +2001,7 @@ fn value_suppressor_with_entropy_and_local_context_combined() {
             key_names_any: None,
         }),
         secret_group: Some(1),
+        offline_validation: None,
         re: Regex::new(r"KEY=([A-Za-z0-9]{8,16})").unwrap(),
     };
 
@@ -2015,6 +2057,7 @@ fn value_suppressor_direct_utf16_window() {
         entropy: None,
         local_context: None,
         secret_group: Some(0),
+        offline_validation: None,
         re: Regex::new("TOK").unwrap(),
     };
 
@@ -2068,6 +2111,7 @@ fn multiple_rules_different_suppressors_are_independent() {
         entropy: None,
         local_context: None,
         secret_group: Some(1),
+        offline_validation: None,
         re: Regex::new(r"AA_([A-Za-z0-9]{8})").unwrap(),
     };
     let rule_b = RuleSpec {
@@ -2082,6 +2126,7 @@ fn multiple_rules_different_suppressors_are_independent() {
         entropy: None,
         local_context: None,
         secret_group: Some(1),
+        offline_validation: None,
         re: Regex::new(r"BB_([A-Za-z0-9]{8})").unwrap(),
     };
 
@@ -2135,6 +2180,7 @@ fn value_suppressor_with_explicit_secret_group_0() {
         entropy: None,
         local_context: None,
         secret_group: Some(0), // Explicit group 0 instead of None
+        offline_validation: None,
         re: Regex::new(r"TOK_[A-Z]{8}").unwrap(),
     };
 
@@ -2181,6 +2227,7 @@ fn entropy_gate_filters_low_entropy_matches() {
         }),
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new(r"TOK_[A-Za-z0-9]{8}").unwrap(),
     };
     let eng = Engine::new_with_anchor_policy(
@@ -2197,6 +2244,222 @@ fn entropy_gate_filters_low_entropy_matches() {
     let high = b"TOK_A1b2C3d4";
     let hits = scan_chunk_findings(&eng, high);
     assert!(hits.iter().any(|h| h.rule == "entropy-gate"));
+}
+
+#[test]
+fn offline_validation_gate_pooled_round_trip() {
+    const ANCHORS: &[&[u8]] = &[b"TOK_"];
+    let rule_with = RuleSpec {
+        name: "with-ov",
+        anchors: ANCHORS,
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        local_context: None,
+        secret_group: None,
+        offline_validation: Some(OfflineValidationSpec::GithubFinegrainedPat),
+        re: Regex::new(r"TOK_[A-Z0-9]{4}").unwrap(),
+    };
+    let rule_without = RuleSpec {
+        name: "without-ov",
+        anchors: ANCHORS,
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        local_context: None,
+        secret_group: None,
+        offline_validation: None,
+        re: Regex::new(r"TOK_[A-Z0-9]{4}").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule_with, rule_without],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Rule 0 should have offline_validation index 0.
+    assert_eq!(engine.rules_hot[0].offline_validation, Some(0));
+    assert_eq!(
+        engine.offline_validation_gates[0],
+        OfflineValidationSpec::GithubFinegrainedPat,
+    );
+
+    // Rule 1 should have no offline_validation gate.
+    assert_eq!(engine.rules_hot[1].offline_validation, None);
+}
+
+// --------------------------
+// Offline validation end-to-end tests
+// --------------------------
+//
+// These tests verify the full `post_scan_filter` path: engine scan → offline
+// validation → finding suppression / retention.
+
+/// Build a `pfx_<payload><base62(crc32(payload))>` token.
+fn build_crc32_base62_token(payload: &[u8]) -> Vec<u8> {
+    let crc = crc32fast::hash(payload);
+    let mut checksum = [0u8; 6];
+    // Inline base62 encode matching offline_validate's format.
+    {
+        let chars: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+        let mut v = crc;
+        for slot in checksum.iter_mut().rev() {
+            *slot = chars[(v % 62) as usize];
+            v /= 62;
+        }
+    }
+    let mut tok = Vec::with_capacity(4 + payload.len() + 6);
+    tok.extend_from_slice(b"pfx_");
+    tok.extend_from_slice(payload);
+    tok.extend_from_slice(&checksum);
+    tok
+}
+
+/// Helper: build a `RuleSpec` that matches `pfx_<alnum>{16}` with optional offline
+/// validation using `Crc32Base62 { prefix_skip: 4, payload_len: 10, checksum_len: 6 }`.
+fn crc32_rule(name: &'static str, with_ov: bool) -> RuleSpec {
+    const ANCHORS: &[&[u8]] = &[b"pfx_"];
+    RuleSpec {
+        name,
+        anchors: ANCHORS,
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        local_context: None,
+        secret_group: None,
+        offline_validation: if with_ov {
+            Some(OfflineValidationSpec::Crc32Base62 {
+                prefix_skip: 4,
+                payload_len: 10,
+                checksum_len: 6,
+            })
+        } else {
+            None
+        },
+        re: Regex::new(r"pfx_[A-Za-z0-9]{16}").unwrap(),
+    }
+}
+
+#[test]
+fn offline_validation_suppresses_invalid_crc_token() {
+    let rule = crc32_rule("ov-crc", true);
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Token with a WRONG checksum — should be suppressed.
+    let bad_token = b"pfx_ABCDEFGHIJ000000";
+    let hay = [b"prefix " as &[u8], bad_token, b" suffix"].concat();
+    let hits = scan_chunk_findings(&engine, &hay);
+    assert!(
+        !hits.iter().any(|h| h.rule == "ov-crc"),
+        "finding with invalid CRC should be suppressed by offline validation"
+    );
+}
+
+#[test]
+fn offline_validation_keeps_valid_crc_token() {
+    let rule = crc32_rule("ov-crc", true);
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Token with a CORRECT checksum — should survive.
+    let good_token = build_crc32_base62_token(b"ABCDEFGHIJ");
+    let hay = [b"prefix " as &[u8], &good_token, b" suffix"].concat();
+    let hits = scan_chunk_findings(&engine, &hay);
+    assert!(
+        hits.iter().any(|h| h.rule == "ov-crc"),
+        "finding with valid CRC should pass offline validation"
+    );
+}
+
+#[test]
+fn offline_validation_does_not_affect_rules_without_gate() {
+    let rule = crc32_rule("no-ov", false);
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Bad checksum, but the rule has no offline_validation — finding kept.
+    let bad_token = b"pfx_ABCDEFGHIJ000000";
+    let hay = [b"prefix " as &[u8], bad_token, b" suffix"].concat();
+    let hits = scan_chunk_findings(&engine, &hay);
+    assert!(
+        hits.iter().any(|h| h.rule == "no-ov"),
+        "rule without offline_validation should emit finding regardless of CRC"
+    );
+}
+
+#[test]
+fn offline_validation_indeterminate_keeps_finding() {
+    let rule = crc32_rule("ov-short", true);
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Token where the 6-char base-62 checksum decodes to a value > u32::MAX.
+    // "zzzzzz" in base-62 = 56_800_235_583 which overflows u32, so
+    // base62_decode_u32 returns None → validate_crc32_base62 returns
+    // Indeterminate → finding is kept.
+    let overflow_token = b"pfx_ABCDEFGHIJzzzzzz";
+    let hay = [b"prefix " as &[u8], overflow_token as &[u8], b" suffix"].concat();
+    let hits = scan_chunk_findings(&engine, &hay);
+    assert!(
+        hits.iter().any(|h| h.rule == "ov-short"),
+        "Indeterminate verdict should keep the finding"
+    );
+}
+
+#[test]
+fn offline_validation_mixed_rules_selective_suppression() {
+    let rule_with = crc32_rule("with-ov", true);
+    let rule_without = crc32_rule("without-ov", false);
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule_with, rule_without],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Bad CRC token — should be suppressed by with-ov, kept by without-ov.
+    let bad_token = b"pfx_ABCDEFGHIJ000000";
+    let hay = [b"prefix " as &[u8], bad_token, b" suffix"].concat();
+    let hits = scan_chunk_findings(&engine, &hay);
+    assert!(
+        !hits.iter().any(|h| h.rule == "with-ov"),
+        "rule with offline_validation should suppress invalid CRC"
+    );
+    assert!(
+        hits.iter().any(|h| h.rule == "without-ov"),
+        "rule without offline_validation should keep finding"
+    );
 }
 
 // --------------------------
@@ -2234,6 +2497,7 @@ fn secret_extraction_prefers_group1_over_full_match() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         // Pattern: KEY_<secret> where <secret> is captured in group 1
         re: Regex::new(r"KEY_([A-Za-z0-9]{8,16})").unwrap(),
     };
@@ -2276,6 +2540,7 @@ fn secret_extraction_uses_configured_secret_group() {
         entropy: None,
         local_context: None,
         secret_group: Some(2), // Use group 2 instead of group 1
+        offline_validation: None,
         // Pattern: TOK<prefix>:<secret> where prefix is group 1, secret is group 2
         re: Regex::new(r"TOK([A-Z]+):([a-z0-9]{8,16})").unwrap(),
     };
@@ -2320,6 +2585,7 @@ fn secret_extraction_falls_back_to_full_match_without_groups() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         // Pattern with no capture groups
         re: Regex::new(r"AKIA[A-Z0-9]{16}").unwrap(),
     };
@@ -2365,6 +2631,7 @@ fn secret_extraction_skips_empty_group1() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         // Group 1 can be empty (optional prefix), group 0 is the full match
         re: Regex::new(r"OPT([A-Z]*)_[a-z0-9]{8}").unwrap(),
     };
@@ -2411,6 +2678,7 @@ fn secret_extraction_hash_consistency() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new(r"SEC_([A-Za-z0-9]{12})").unwrap(),
     };
     let eng = Engine::new_with_anchor_policy(
@@ -2464,6 +2732,7 @@ fn secret_extraction_utf16le_path() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new(r"UTF_([A-Za-z0-9]{8})").unwrap(),
     };
 
@@ -2531,6 +2800,7 @@ fn local_context_gate_applies_in_utf16_path() {
             key_names_any: None,
         }),
         secret_group: Some(0),
+        offline_validation: None,
         re: Regex::new(r"UTF_[A-Za-z0-9]{8}").unwrap(),
     };
 
@@ -2676,6 +2946,7 @@ fn root_span_hint_uses_full_window_for_partial_secret() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         // Pattern: PREFIX_<secret>_SUFFIX - group 1 is just the middle part.
         re: Regex::new(r"PREFIX_([A-Za-z0-9]{8})_SUFFIX").unwrap(),
     };
@@ -2732,6 +3003,7 @@ fn secret_extraction_explicit_group0_overrides_group1() {
         entropy: None,
         local_context: None,
         secret_group: Some(0), // Explicitly use full match
+        offline_validation: None,
         // Pattern: TOK_<secret>_END where <secret> would normally be group 1
         re: Regex::new(r"TOK_([A-Za-z0-9]{8})_END").unwrap(),
     };
@@ -2775,6 +3047,7 @@ fn secret_extraction_empty_configured_group_falls_back() {
         entropy: None,
         local_context: None,
         secret_group: Some(2), // Points to group 2 which can be empty
+        offline_validation: None,
         // Pattern: CFG_<prefix>_<optional> - group 1 is prefix, group 2 is optional suffix
         re: Regex::new(r"CFG_([a-z0-9]{8})([A-Z]*)").unwrap(),
     };
@@ -2820,6 +3093,7 @@ fn anchor_policy_prefers_derived_over_manual() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new("foo").unwrap(),
     };
 
@@ -2850,6 +3124,7 @@ fn anchor_policy_falls_back_to_manual_on_unfilterable() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new("[A-Za-z]{1,}").unwrap(),
     };
 
@@ -3963,6 +4238,7 @@ fn scan_file_sync_drops_prefix_duplicates() -> std::io::Result<()> {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new("X").unwrap(),
     }];
     let engine = Arc::new(Engine::new(rules, Vec::new(), demo_tuning()));
@@ -4003,6 +4279,7 @@ fn utf16_overlap_accounts_for_scaled_radius() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new(r"aaatok_[0-9]{8}bbbb").unwrap(),
     };
     let engine = Engine::new_with_anchor_policy(
@@ -4064,6 +4341,7 @@ fn utf16le_anchor_odd_offset_near_start_is_detected() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new(r"SIM2_[A-Z0-9]{12}").unwrap(),
     };
     let engine = Engine::new_with_anchor_policy(
@@ -4111,6 +4389,7 @@ fn utf16be_mixed_parity_anchors_find_both() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new(r"SIM2_[A-Z0-9]{12}").unwrap(),
     };
     let mut tuning = demo_tuning();
@@ -4181,6 +4460,7 @@ fn test_chunked_scan_dedup_secret_in_overlap_with_wide_window() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new(r"KEY_([A-Za-z0-9]{16})").unwrap(),
     };
 
@@ -4262,6 +4542,7 @@ fn test_chunked_scan_trailing_context_not_dropped() {
         entropy: None,
         local_context: None,
         secret_group: Some(1), // Capture group 1 is the secret
+        offline_validation: None,
         re: Regex::new(r"KEY_([A-Z0-9]{8})(?:;|$)").unwrap(),
     };
 
@@ -4574,6 +4855,7 @@ fn chunked_transform_root_hint_matches_reference() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new("TOK0_[A-Z0-9]{8}").unwrap(),
     };
 
@@ -4704,6 +4986,7 @@ fn chunked_url_percent_prefix_trigger_kept() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new("TOK0_[A-Z0-9]{8}").unwrap(),
     };
 
@@ -4760,6 +5043,7 @@ fn chunked_url_percent_no_duplicate_when_trigger_before_and_after() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new("TOK0_[A-Z0-9]{8}").unwrap(),
     };
 
@@ -4844,6 +5128,7 @@ fn chunked_overlap_gt_chunk_dedupes_transform_findings() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new("TOK0_[A-Z0-9]{8}").unwrap(),
     };
 
@@ -4924,6 +5209,7 @@ fn nested_transform_dedupe_keeps_multiple_matches() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new("TOK0_[A-Z0-9]{8}").unwrap(),
     };
 
@@ -5046,6 +5332,7 @@ fn base64_gate_utf16be_anchor_straddles_stream_boundary() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new("TOK").unwrap(),
     };
 
@@ -5099,6 +5386,7 @@ fn stream_window_recovers_after_ring_eviction() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new("TOK").unwrap(),
     };
 
@@ -5150,6 +5438,7 @@ fn stream_hit_cap_forces_full_fallback() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new("TOK").unwrap(),
     };
 
@@ -5203,6 +5492,7 @@ fn stream_nested_span_fallback_recovers() {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: Regex::new("TOK").unwrap(),
     };
 
@@ -5506,4 +5796,282 @@ mod url_percent_gate_check_tests {
         // %41='A' (not in set), %42='B' (in set)
         assert!(url_percent_gate_check(&set, false, b"%41%42"));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Offline validation post-scan filter tests
+// ---------------------------------------------------------------------------
+
+/// Encode a `u32` into a 6-char base-62 string, matching the production encoder.
+fn base62_encode_u32_test(mut val: u32, buf: &mut [u8; 6]) {
+    const CHARS: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    for slot in buf.iter_mut().rev() {
+        *slot = CHARS[(val % 62) as usize];
+        val /= 62;
+    }
+}
+
+/// Build a `tok_<8-char payload><6-char CRC>` token with a correct CRC.
+fn build_valid_crc_token() -> Vec<u8> {
+    let prefix = b"tok_";
+    let payload = b"ABcd1234"; // 8 bytes
+    let crc = crc32fast::hash(payload);
+    let mut checksum = [0u8; 6];
+    base62_encode_u32_test(crc, &mut checksum);
+    let mut token = Vec::with_capacity(18);
+    token.extend_from_slice(prefix);
+    token.extend_from_slice(payload);
+    token.extend_from_slice(&checksum);
+    token
+}
+
+/// Build a `tok_<8-char payload><6-char CRC>` token with an INVALID CRC.
+fn build_invalid_crc_token() -> Vec<u8> {
+    let prefix = b"tok_";
+    let payload = b"XYzw5678"; // 8 bytes
+                               // Use a deliberately wrong CRC (correct CRC + 1).
+    let wrong_crc = crc32fast::hash(payload).wrapping_add(1);
+    let mut checksum = [0u8; 6];
+    base62_encode_u32_test(wrong_crc, &mut checksum);
+    let mut token = Vec::with_capacity(18);
+    token.extend_from_slice(prefix);
+    token.extend_from_slice(payload);
+    token.extend_from_slice(&checksum);
+    token
+}
+
+/// Create a rule spec with offline CRC-32 base-62 validation.
+///
+/// The regex captures `tok_` + 14 alphanumeric chars (8 payload + 6 checksum).
+/// `secret_group` is `None` so the full match is the secret span.
+fn offline_crc_rule() -> RuleSpec {
+    RuleSpec {
+        name: "offline-crc-test",
+        anchors: &[b"tok_"],
+        radius: 64,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        local_context: None,
+        secret_group: None,
+        offline_validation: Some(OfflineValidationSpec::Crc32Base62 {
+            prefix_skip: 4,
+            payload_len: 8,
+            checksum_len: 6,
+        }),
+        re: Regex::new(r"tok_[A-Za-z0-9]{14}").unwrap(),
+    }
+}
+
+#[test]
+fn offline_validation_suppresses_invalid_root_finding() {
+    let rule = offline_crc_rule();
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let invalid_tok = build_invalid_crc_token();
+    let mut hay = Vec::new();
+    hay.extend_from_slice(b"prefix ");
+    hay.extend_from_slice(&invalid_tok);
+    hay.extend_from_slice(b" suffix");
+
+    let mut scratch = engine.new_scratch();
+    engine.scan_chunk_into(&hay, FileId(0), 0, &mut scratch);
+
+    let recs = scratch.findings();
+    assert_eq!(
+        recs.len(),
+        0,
+        "offline validation should suppress root finding with invalid CRC"
+    );
+    #[cfg(feature = "perf-stats")]
+    assert_eq!(
+        scratch.offline_suppressed(),
+        1,
+        "offline_suppressed counter should track suppressed findings"
+    );
+    // Sidecar alignment must hold even after compaction.
+    assert_eq!(recs.len(), scratch.norm_hashes().len());
+    assert_eq!(recs.len(), scratch.drop_hint_end().len());
+}
+
+#[test]
+fn offline_validation_keeps_valid_root_finding() {
+    let rule = offline_crc_rule();
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let valid_tok = build_valid_crc_token();
+    let mut hay = Vec::new();
+    hay.extend_from_slice(b"prefix ");
+    hay.extend_from_slice(&valid_tok);
+    hay.extend_from_slice(b" suffix");
+
+    let mut scratch = engine.new_scratch();
+    engine.scan_chunk_into(&hay, FileId(0), 0, &mut scratch);
+
+    let recs = scratch.findings();
+    assert_eq!(
+        recs.len(),
+        1,
+        "offline validation should keep root finding with valid CRC"
+    );
+    assert_eq!(recs[0].step_id, STEP_ROOT);
+    #[cfg(feature = "perf-stats")]
+    assert_eq!(scratch.offline_suppressed(), 0);
+    assert_eq!(recs.len(), scratch.norm_hashes().len());
+    assert_eq!(recs.len(), scratch.drop_hint_end().len());
+}
+
+#[test]
+fn offline_validation_mixed_valid_invalid_and_no_gate() {
+    // Three rules: one with valid CRC, one with invalid CRC, one without offline gate.
+    let crc_rule = offline_crc_rule();
+
+    // A rule without offline validation.
+    let plain_rule = RuleSpec {
+        name: "plain-no-gate",
+        anchors: &[b"api_"],
+        radius: 64,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        local_context: None,
+        secret_group: None,
+        offline_validation: None,
+        re: Regex::new(r"api_[A-Za-z0-9]{8}").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![crc_rule, plain_rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let valid_tok = build_valid_crc_token();
+    let invalid_tok = build_invalid_crc_token();
+
+    let mut hay = Vec::new();
+    hay.extend_from_slice(b"prefix ");
+    hay.extend_from_slice(&valid_tok);
+    hay.extend_from_slice(b" middle ");
+    hay.extend_from_slice(&invalid_tok);
+    hay.extend_from_slice(b" api_Zz9aQq1R end");
+
+    let mut scratch = engine.new_scratch();
+    engine.scan_chunk_into(&hay, FileId(0), 0, &mut scratch);
+
+    let recs = scratch.findings();
+    // Expected: valid CRC token + plain rule token survive; invalid CRC token is removed.
+    assert_eq!(
+        recs.len(),
+        2,
+        "expected 2 findings: valid CRC kept + plain rule kept, invalid CRC suppressed"
+    );
+    #[cfg(feature = "perf-stats")]
+    assert_eq!(scratch.offline_suppressed(), 1);
+    assert_eq!(recs.len(), scratch.norm_hashes().len());
+    assert_eq!(recs.len(), scratch.drop_hint_end().len());
+
+    let rule_names: Vec<&str> = recs.iter().map(|r| engine.rule_name(r.rule_id)).collect();
+    assert!(
+        rule_names.contains(&"offline-crc-test"),
+        "valid CRC finding should survive"
+    );
+    assert!(
+        rule_names.contains(&"plain-no-gate"),
+        "finding without offline gate should survive"
+    );
+}
+
+#[test]
+fn offline_validation_does_not_suppress_non_root_findings() {
+    // A rule with offline validation that also matches via base64 transform.
+    // The base64-decoded finding (non-root step) should bypass offline validation.
+    let rule = offline_crc_rule();
+
+    let transforms = vec![TransformConfig {
+        id: TransformId::Base64,
+        mode: TransformMode::Always,
+        gate: Gate::AnchorsInDecoded,
+        min_len: 8,
+        max_spans_per_buffer: 8,
+        max_encoded_len: 1024,
+        max_decoded_bytes: 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    }];
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        transforms,
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Build an invalid-CRC token and base64-encode it so the transform
+    // decodes it into the scan buffer. The decoded finding is non-root
+    // (step_id != STEP_ROOT) and should survive offline validation.
+    let invalid_tok = build_invalid_crc_token();
+    let b64_encoded = base64_encode_bytes(&invalid_tok);
+
+    let mut hay = Vec::new();
+    hay.extend_from_slice(b"data ");
+    hay.extend_from_slice(&b64_encoded);
+    hay.extend_from_slice(b" end");
+
+    let mut scratch = engine.new_scratch();
+    engine.scan_chunk_into(&hay, FileId(0), 0, &mut scratch);
+
+    let recs = scratch.findings();
+    // The base64-decoded finding is non-root and should survive.
+    assert!(
+        recs.iter().any(|r| r.step_id != STEP_ROOT),
+        "non-root (transform-derived) finding should bypass offline validation"
+    );
+}
+
+/// Minimal base64 encoder for test helpers.
+fn base64_encode_bytes(input: &[u8]) -> Vec<u8> {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 2 < input.len() {
+        let n = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8) | (input[i + 2] as u32);
+        out.push(ALPHABET[((n >> 18) & 63) as usize]);
+        out.push(ALPHABET[((n >> 12) & 63) as usize]);
+        out.push(ALPHABET[((n >> 6) & 63) as usize]);
+        out.push(ALPHABET[(n & 63) as usize]);
+        i += 3;
+    }
+    let remaining = input.len() - i;
+    if remaining == 2 {
+        let n = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8);
+        out.push(ALPHABET[((n >> 18) & 63) as usize]);
+        out.push(ALPHABET[((n >> 12) & 63) as usize]);
+        out.push(ALPHABET[((n >> 6) & 63) as usize]);
+        out.push(b'=');
+    } else if remaining == 1 {
+        let n = (input[i] as u32) << 16;
+        out.push(ALPHABET[((n >> 18) & 63) as usize]);
+        out.push(ALPHABET[((n >> 12) & 63) as usize]);
+        out.push(b'=');
+        out.push(b'=');
+    }
+    out
 }

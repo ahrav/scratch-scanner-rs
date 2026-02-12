@@ -20,27 +20,29 @@
 //!
 //! ### Build phase (`new` / `new_with_anchor_policy`)
 //!
-//! 1. Compile each [`RuleSpec`](crate::api::RuleSpec) into a [`RuleCompiled`]
-//!    with precompiled regexes and optional gates.
-//! 2. Derive anchor patterns from regex analysis (or use manual anchors per
-//!    policy). Build deduped pattern maps for raw + UTF-16 variants.
-//! 3. Construct Vectorscan prefilter DBs (raw, UTF-16, stream, gate) and
-//!    the Base64 YARA pre-gate.
+//! Compile each [`RuleSpec`](crate::api::RuleSpec) into a [`RuleCompiled`]
+//! with precompiled regexes and optional gates.
+//! Derive anchor patterns from regex analysis (or use manual anchors per
+//! policy). Build deduped pattern maps for raw + UTF-16 variants.
+//! Construct Vectorscan prefilter DBs (raw, UTF-16, stream, gate) and
+//! the Base64 YARA pre-gate.
 //!
 //! ### Scan phase (`scan_chunk_into`)
 //!
-//! 1. Run Vectorscan prefilter on root buffer to populate touched pairs.
-//! 2. Enqueue `ScanBuf(root)` into the work queue.
-//! 3. Process work items in FIFO order:
-//!    - `ScanBuf`: validate regexes in prefilter windows (see
-//!      [`buffer_scan`](super::buffer_scan)), then discover transform spans
-//!      and enqueue `DecodeSpan` items.
-//!    - `DecodeSpan`: decode the span, then enqueue a `ScanBuf` for the
-//!      decoded output.
-//! 4. Budgets (decode bytes, work items, depth) are enforced per-item so no
-//!    single input forces unbounded work.
-//! 5. Apply suppression/cap policies at finding emission time so no post-scan
-//!    compaction pass is required.
+//! Run Vectorscan prefilter on root buffer to populate touched pairs.
+//! Enqueue `ScanBuf(root)` into the work queue.
+//! Process work items in FIFO order:
+//!   - `ScanBuf`: validate regexes in prefilter windows (see
+//!     [`buffer_scan`](super::buffer_scan)), then discover transform spans
+//!     and enqueue `DecodeSpan` items.
+//!   - `DecodeSpan`: decode the span, then enqueue a `ScanBuf` for the
+//!     decoded output.
+//! - Budgets (decode bytes, work items, depth) are enforced per-item so no
+//!   single input forces unbounded work.
+//! - Apply suppression/cap policies at finding emission time so most
+//!   findings are handled inline. A final post-scan compaction pass
+//!   (`post_scan_filter`) removes root findings that fail offline
+//!   structural validation.
 //!
 //! ## Design choices
 //!
@@ -223,7 +225,12 @@ pub struct Engine {
     pub(super) rules_hot: Vec<RuleCompiled>,
     /// Cold per-rule metadata indexed in parallel with `rules_hot`.
     pub(super) rules_cold: Vec<RuleCold>,
+    /// Ordered transform configurations; indices into this vector are used as
+    /// `transform_idx` throughout work items, decode steps, and finding provenance.
+    /// Frozen after construction.
     pub(super) transforms: Vec<TransformConfig>,
+    /// Scan-time budgets and capacity knobs. Frozen after construction; all
+    /// per-scan scratch sizing derives from these values.
     pub(crate) tuning: Tuning,
 
     /// Gate pools — indexed by `Option<u32>` gate IDs stored in [`RuleCompiled`].
@@ -238,6 +245,8 @@ pub struct Engine {
     pub(super) entropy_gates: Vec<EntropyCompiled>,
     pub(super) two_phase_gates: Vec<TwoPhaseCompiled>,
     pub(super) local_context_gates: Vec<crate::api::LocalContextSpec>,
+    /// Offline structural validation specs (e.g. CRC-32, format checks).
+    pub(super) offline_validation_gates: Vec<crate::api::OfflineValidationSpec>,
     /// Global context safelist evaluated at finding emission time.
     pub(super) safelist: SafelistFilter,
 
@@ -285,6 +294,7 @@ pub struct Engine {
     /// Build-time summary of anchor selection decisions.
     anchor_plan_stats: AnchorPlanStats,
     #[cfg(feature = "stats")]
+    /// Per-scan Vectorscan counters snapshotted via [`VectorscanCounters::snapshot`].
     pub(super) vs_stats: VectorscanCounters,
 
     /// True if any rule has UTF-16 anchor variants compiled.
@@ -392,6 +402,7 @@ impl Engine {
         let mut entropy_gates: Vec<EntropyCompiled> = Vec::new();
         let mut two_phase_gates: Vec<TwoPhaseCompiled> = Vec::new();
         let mut local_context_gates: Vec<crate::api::LocalContextSpec> = Vec::new();
+        let mut offline_validation_gates: Vec<crate::api::OfflineValidationSpec> = Vec::new();
 
         let mut rules_compiled: Vec<RuleCompiled> = Vec::with_capacity(rules.len());
         let mut rules_cold: Vec<RuleCold> = Vec::with_capacity(rules.len());
@@ -421,6 +432,11 @@ impl Engine {
                 debug_assert!(local_context_gates.len() <= u32::MAX as usize);
                 rule.local_context = Some(local_context_gates.len() as u32);
                 local_context_gates.push(ctx);
+            }
+            if let Some(ov) = gates.offline_validation {
+                debug_assert!(offline_validation_gates.len() <= u32::MAX as usize);
+                rule.offline_validation = Some(offline_validation_gates.len() as u32);
+                offline_validation_gates.push(ov);
             }
             rules_compiled.push(rule);
             rules_cold.push(RuleCold { name: spec.name });
@@ -623,6 +639,7 @@ impl Engine {
         let (anchor_patterns_utf16, pat_targets_utf16, pat_offsets_utf16) =
             map_to_patterns(pat_map_utf16);
         let has_utf16_anchors = !anchor_patterns_utf16.is_empty();
+        // Retained for diagnostic / debugging use; not referenced in production paths.
         let _has_any_anchors = !anchor_patterns_all.is_empty();
         let max_anchor_pat_len = anchor_patterns_all
             .iter()
@@ -651,8 +668,12 @@ impl Engine {
         };
 
         // Warm regex caches at startup to avoid lazy allocations later.
-        // `find_iter` always constructs the per-regex cache, so a tiny buffer
-        // is sufficient here.
+        //
+        // `regex::bytes::Regex` lazily builds its internal DFA cache on first
+        // use. Calling `find_iter(..).next()` forces that lazy allocation here,
+        // during engine construction, so that the first real scan does not pay
+        // an allocation penalty on the hot path. A 1-byte buffer suffices
+        // because the DFA cache is created regardless of whether a match occurs.
         let warm = [0u8; 1];
         for rule in &rules_compiled {
             let mut it = rule.re.find_iter(&warm);
@@ -678,6 +699,8 @@ impl Engine {
             .map(|tc| tc.max_decoded_bytes)
             .max()
             .unwrap_or(0);
+        // Env: SCANNER_INIT_DIAG — when set, prints Vectorscan DB build timings
+        // to stderr during engine construction (diagnostic / integration-test use).
         let init_diag = std::env::var_os("SCANNER_INIT_DIAG").is_some();
         let max_encoded_len = transforms
             .iter()
@@ -695,13 +718,13 @@ impl Engine {
         //                     to avoid false negatives.
         //
         // A rule can safely omit its raw regex from the prefilter when ALL of:
-        //   1. It has at least one anchor pattern (otherwise nothing triggers).
-        //   2. Every anchor is >= 5 bytes. Below this, Vectorscan's Aho-Corasick
-        //      automaton produces high false-positive rates, and short byte-exact
-        //      anchors risk case-sensitivity mismatches with the regex.
-        //   3. The regex is NOT case-insensitive. Byte-exact anchors cannot
-        //      match the alternate casings that `(?i)` would accept, so relying
-        //      on anchors alone would cause false negatives.
+        //   - It has at least one anchor pattern (otherwise nothing triggers).
+        //   - Every anchor is >= 5 bytes. Below this, Vectorscan's Aho-Corasick
+        //     automaton produces high false-positive rates, and short byte-exact
+        //     anchors risk case-sensitivity mismatches with the regex.
+        //   - The regex is NOT case-insensitive. Byte-exact anchors cannot
+        //     match the alternate casings that `(?i)` would accept, so relying
+        //     on anchors alone would cause false negatives.
         //
         // Rules that fail any check keep their regex in the prefilter DB.
         // The 5-byte threshold is empirically chosen; it may need revisiting if
@@ -710,16 +733,16 @@ impl Engine {
             .iter()
             .map(|r| {
                 // Rule needs raw prefilter if:
-                // 1. No anchors at all
+                // No anchors at all
                 if r.anchors.is_empty() {
                     return true;
                 }
-                // 2. Regex is case-insensitive (anchors are byte-exact, won't match)
+                // Regex is case-insensitive (anchors are byte-exact, won't match)
                 let re_str = r.re.as_str();
                 if re_str.starts_with("(?i)") || re_str.contains("(?i:") {
                     return true;
                 }
-                // 3. Any anchor is shorter than 5 bytes (weak anchor)
+                // Any anchor is shorter than 5 bytes (weak anchor)
                 !r.anchors.iter().all(|a| a.len() >= 5)
             })
             .collect();
@@ -834,6 +857,8 @@ impl Engine {
             ) {
                 Ok(db) => Some(db),
                 Err(err) => {
+                    // Env: SCANNER_VS_UTF16_DEBUG — prints UTF-16 Vectorscan
+                    // build errors to stderr (non-fatal; block-mode fallback).
                     if std::env::var_os("SCANNER_VS_UTF16_DEBUG").is_some() {
                         eprintln!("vectorscan utf16 db build failed: {err}");
                     }
@@ -869,6 +894,8 @@ impl Engine {
                 vs_ms, vs_stream_ms, vs_gate_ms, vs_utf16_ms, vs_utf16_stream_ms,
             );
         }
+        // Pre-bucket transform indices by (mode, id) so the scan-loop work-item
+        // path avoids per-transform branches. See `scanbuf_transform_buckets`.
         let mut scanbuf_transform_idxs_active_non_base64 =
             Vec::with_capacity(transforms.len().min(8));
         let mut scanbuf_transform_idxs_active_base64 = Vec::with_capacity(transforms.len().min(8));
@@ -928,6 +955,7 @@ impl Engine {
             entropy_gates,
             two_phase_gates,
             local_context_gates,
+            offline_validation_gates,
             safelist: SafelistFilter::new(),
             entropy_log2,
             vs,
@@ -980,26 +1008,47 @@ impl Engine {
     // references using direct indexing; out-of-bounds indices panic, which signals
     // inconsistent compiled rule data.
 
+    /// Resolves the confirm-all (multi-literal AND) gate for a rule.
+    ///
+    /// # Panics
+    /// Panics on out-of-bounds index, indicating corrupted compiled rule data.
     #[inline(always)]
     pub(super) fn confirm_all_gate(&self, idx: Option<u32>) -> Option<&ConfirmAllCompiled> {
         idx.map(|i| &self.confirm_all_gates[i as usize])
     }
 
+    /// Resolves the keyword-any (literal OR) gate for a rule.
+    ///
+    /// # Panics
+    /// Panics on out-of-bounds index, indicating corrupted compiled rule data.
     #[inline(always)]
     pub(super) fn keyword_gate(&self, idx: Option<u32>) -> Option<&KeywordsCompiled> {
         idx.map(|i| &self.keyword_gates[i as usize])
     }
 
+    /// Resolves the value-suppressor gate (packed literal patterns checked
+    /// against extracted secret bytes to suppress known false positives).
+    ///
+    /// # Panics
+    /// Panics on out-of-bounds index, indicating corrupted compiled rule data.
     #[inline(always)]
     pub(super) fn value_suppressor_gate(&self, idx: Option<u32>) -> Option<&PackedPatterns> {
         idx.map(|i| &self.value_suppressor_gates[i as usize])
     }
 
+    /// Resolves the Shannon entropy gate for a rule.
+    ///
+    /// # Panics
+    /// Panics on out-of-bounds index, indicating corrupted compiled rule data.
     #[inline(always)]
     pub(super) fn entropy_gate(&self, idx: Option<u32>) -> Option<EntropyCompiled> {
         idx.map(|i| self.entropy_gates[i as usize])
     }
 
+    /// Resolves the local-context gate (surrounding-line pattern match).
+    ///
+    /// # Panics
+    /// Panics on out-of-bounds index, indicating corrupted compiled rule data.
     #[inline(always)]
     pub(super) fn local_context_gate(
         &self,
@@ -1148,14 +1197,14 @@ impl Engine {
     /// - `scratch` is exclusively owned for the duration of the call.
     ///
     /// # High-level flow
-    /// 1. Run Vectorscan prefilter on the root buffer.
-    /// 2. On zero hits: check if transform discovery is needed; if not, return
-    ///    immediately. This is the common fast path.
-    /// 3. On hits: reset per-scan state, enqueue root `ScanBuf`.
-    /// 4. Process the work queue in FIFO order (BFS over decode layers):
-    ///    - `ScanBuf`: validate regexes in windows, discover transform spans,
-    ///      enqueue `DecodeSpan` items.
-    ///    - `DecodeSpan`: decode the span, enqueue a `ScanBuf` for output.
+    /// Run Vectorscan prefilter on the root buffer.
+    /// On zero hits: check if transform discovery is needed; if not, return
+    /// immediately. This is the common fast path.
+    /// On hits: reset per-scan state, enqueue root `ScanBuf`.
+    /// Process the work queue in FIFO order (BFS over decode layers):
+    ///   - `ScanBuf`: validate regexes in windows, discover transform spans,
+    ///     enqueue `DecodeSpan` items.
+    ///   - `DecodeSpan`: decode the span, enqueue a `ScanBuf` for output.
     ///
     /// Budget gates (decode bytes, work items, depth) are enforced per iteration
     /// so no single input can force unbounded work.
@@ -1292,6 +1341,7 @@ impl Engine {
                 break;
             }
 
+            // Dequeue via `take` + cursor advance (avoids shifting the Vec).
             let item = std::mem::take(&mut scratch.work_q[scratch.work_head]);
             scratch.work_head += 1;
 
@@ -1312,12 +1362,12 @@ impl Engine {
                 // holding a borrow on `scratch.slab` while we pass `scratch` mutably
                 // into `scan_rules_on_buffer`. This is sound because:
                 //
-                //   1. The slab is pre-allocated and never reallocated during a scan,
-                //      so the pointer remains valid.
-                //   2. `scan_rules_on_buffer` writes only to scratch output buffers
-                //      (findings, hit accumulators), never to the slab region backing
-                //      `cur_buf`. No aliasing violation occurs.
-                //   3. `root_buf` is caller-owned and immutable for the scan duration.
+                //   - The slab is pre-allocated and never reallocated during a scan,
+                //     so the pointer remains valid.
+                //   - `scan_rules_on_buffer` writes only to scratch output buffers
+                //     (findings, hit accumulators), never to the slab region backing
+                //     `cur_buf`. No aliasing violation occurs.
+                //   - `root_buf` is caller-owned and immutable for the scan duration.
                 let (buf_ptr, buf_len, buf_offset) = if let Some(slab_range) = item.buf_slab_range()
                 {
                     let start = slab_range.start as usize;
@@ -1551,16 +1601,18 @@ impl Engine {
 
                         // Base64 alignment shifts.
                         //
-                        // A Base64-encoded span may not start on a 4-character boundary
-                        // relative to the original encoding. Shifting by 0..3 characters
-                        // tries each possible alignment and produces up to 4 decode sub-spans.
+                        // Base64 encodes in 4-character quanta. A span extracted from
+                        // raw bytes may not start on a quantum boundary relative to
+                        // the original encoding, so we try all four possible offsets
+                        // (shift 0..3) to cover every alignment.
                         //
-                        // For each shift, `base64_skip_chars` returns the byte offset to
-                        // skip leading non-alphabet chars (whitespace, padding) plus
-                        // `shift` alignment chars. If the remaining encoded characters
-                        // are fewer than `min_len`, the shift is skipped. Duplicate start
-                        // offsets (which can occur when whitespace collapses shifts) are
-                        // also deduplicated.
+                        // For each shift, `base64_skip_chars` returns the byte offset
+                        // to skip leading non-alphabet chars (whitespace, padding) plus
+                        // `shift` alignment chars. Returns `None` when the span is too
+                        // short to accommodate the shift — at that point larger shifts
+                        // would also fail, so we `break` rather than `continue`.
+                        // Duplicate start offsets (which can occur when whitespace
+                        // collapses shifts) are deduplicated.
                         let mut span_starts = [0usize; 4];
                         let mut span_ends = [0usize; 4];
                         let mut span_count = 0usize;
@@ -1664,23 +1716,33 @@ impl Engine {
                 }
 
                 // Resolve the encoded span to a raw pointer + length.
+                //
                 // Same aliasing argument as the ScanBuf arm: root_buf is
-                // immutable; the slab is pre-allocated and not reallocated.
-                // Bounds are checked before pointer arithmetic.
+                // caller-owned and immutable; the slab is pre-allocated and
+                // never reallocated during a scan (DecodeSlab invariant).
+                // `r.end` is bounds-checked against the backing buffer before
+                // any pointer arithmetic; `r.start <= r.end` is guaranteed by
+                // `EncRef::range_usize()`.
                 let r = enc_ref.range_usize();
                 let (enc_ptr, enc_len) = if !enc_ref.is_slab {
                     if r.end <= root_buf.len() {
+                        // SAFETY: `r.start <= r.end <= root_buf.len()` checked
+                        // above; root_buf is immutable for the scan duration.
                         let ptr = unsafe { root_buf.as_ptr().add(r.start) };
                         (ptr, r.end - r.start)
                     } else {
                         continue;
                     }
                 } else if r.end <= scratch.slab.buf.len() {
+                    // SAFETY: `r.start <= r.end <= slab.buf.len()` checked
+                    // above; slab never reallocates during a scan.
                     let ptr = unsafe { scratch.slab.buf.as_ptr().add(r.start) };
                     (ptr, r.end - r.start)
                 } else {
                     continue;
                 };
+                // SAFETY: pointer + length were validated by the bounds checks
+                // above; the backing buffer is not mutated while this slice exists.
                 let enc = unsafe { std::slice::from_raw_parts(enc_ptr, enc_len) };
                 // True only when root_hint exactly names the encoded bytes being
                 // decoded. This allows decoded matches to map back to precise
@@ -1730,6 +1792,77 @@ impl Engine {
                 );
             }
         }
+
+        // ── Post-scan filter: offline validation ─────────────────────────
+        //
+        // Suppress root findings that fail structural validation (bad CRC,
+        // invalid charset, etc.). Runs after all scan work is complete so
+        // it sees the full finding set, including transform-derived results.
+        //
+        // TODO: offline-invalid findings currently consume max_findings_per_chunk
+        // slots during emission. In pathological inputs this could crowd out
+        // valid findings that are then permanently dropped. Consider running
+        // offline validation inline during emission or reserving cap headroom,
+        // though this would require restructuring the scan loop since offline
+        // validation needs complete extracted spans from the BFS work queue.
+        self.post_scan_filter(root_buf, scratch);
+    }
+
+    /// Post-scan offline-validation filter: suppress root findings that fail
+    /// structural checks.
+    ///
+    /// Runs after the work-queue loop in [`scan_chunk_into`], once all findings
+    /// have been emitted. For each root finding whose rule has an
+    /// `offline_validation` gate, the matched secret bytes are sliced from
+    /// `root_buf` and passed to [`super::offline_validate::validate`].
+    /// Findings with an [`Invalid`](crate::api::OfflineVerdict::Invalid)
+    /// verdict are removed in a single compaction pass over the three parallel
+    /// scratch vectors (`out`, `norm_hash`, `drop_hint_end`).
+    ///
+    /// Non-root findings (transform-derived) are always kept because their
+    /// span coordinates reference decoded buffers, not `root_buf`.
+    ///
+    /// `Valid` and `Indeterminate` verdicts are both kept — only positive proof
+    /// of structural failure triggers suppression.
+    #[inline]
+    fn post_scan_filter(&self, root_buf: &[u8], scratch: &mut ScanScratch) {
+        if self.offline_validation_gates.is_empty() {
+            return;
+        }
+
+        let rules_hot = &self.rules_hot;
+        let gates = &self.offline_validation_gates;
+        let buf_len = root_buf.len();
+
+        let removed = scratch.retain_findings_aligned(|rec, _drop_end| {
+            // Only root findings are eligible for offline validation.
+            if rec.step_id != STEP_ROOT {
+                return true;
+            }
+
+            let rule = &rules_hot[rec.rule_id as usize];
+            let gate_idx = match rule.offline_validation {
+                Some(idx) => idx,
+                None => return true,
+            };
+
+            let spec = gates[gate_idx as usize];
+            let start = rec.span_start as usize;
+            let end = rec.span_end as usize;
+
+            // Defensive: skip validation if the span is out of bounds.
+            if end > buf_len {
+                return true;
+            }
+
+            let secret = &root_buf[start..end];
+            let verdict = super::offline_validate::validate(spec, secret);
+
+            !(matches!(verdict, crate::api::OfflineVerdict::Invalid)
+                && spec.suppresses_on_invalid())
+        });
+
+        crate::perf_stats::sat_add_usize(&mut scratch.offline_suppressed, removed);
     }
 
     /// Scans a buffer and returns a shared view of finding records.
@@ -1782,6 +1915,8 @@ impl Engine {
     }
 
     /// Returns the rule name for a rule id used in [`FindingRec`].
+    ///
+    /// Returns `"<unknown-rule>"` if `rule_id` is out of bounds.
     pub fn rule_name(&self, rule_id: u32) -> &str {
         self.rules_cold
             .get(rule_id as usize)
@@ -1790,6 +1925,11 @@ impl Engine {
     }
 
     /// Allocates a fresh scratch state sized for this engine.
+    ///
+    /// The returned scratch must be used exclusively with `self`. Using it with
+    /// a different `Engine` may panic or produce incorrect results because
+    /// internal buffer sizes, gate pool indices, and Vectorscan scratch
+    /// bindings are engine-specific.
     pub fn new_scratch(&self) -> ScanScratch {
         ScanScratch::new(self)
     }

@@ -707,6 +707,12 @@ fn test_cache_get_calls() -> u64 {
     TEST_CACHE_GET_CALLS.with(Cell::get)
 }
 
+/// Thin wrapper around `cache.get()` that instruments call counts in tests.
+///
+/// All cache lookups in the executor **must** go through this function so
+/// that the `delta_base_cache_lookup_counted_by_cache_get_wrapper` test can
+/// verify that no code path bypasses the counter. In release builds this
+/// compiles to a direct `cache.get()` call.
 #[inline(always)]
 fn cache_get(cache: &mut PackCache, offset: u64) -> Option<CachedObject<'_>> {
     #[cfg(test)]
@@ -4114,6 +4120,7 @@ run with --test-threads=1 to enable"
             entropy: None,
             local_context: None,
             secret_group: Some(1),
+            offline_validation: None,
             re: Regex::new(r"TOK_([A-Z0-9]{8})").unwrap(),
         };
 

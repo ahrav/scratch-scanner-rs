@@ -253,6 +253,7 @@ fn make_rule(name: &'static str, anchor: &'static [u8], pattern: &str) -> RuleSp
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: regex::bytes::Regex::new(pattern).unwrap(),
     }
 }
@@ -278,6 +279,7 @@ fn make_rule_multi(
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: regex::bytes::Regex::new(pattern).unwrap(),
     }
 }
@@ -931,6 +933,7 @@ fn bench_anchor_diversity(c: &mut Criterion) {
                 entropy: None,
                 local_context: None,
                 secret_group: None,
+                offline_validation: None,
                 re: regex::bytes::Regex::new(&format!(r"{anchor_str}[A-Za-z0-9]{{20}}")).unwrap(),
             }
         })
@@ -960,6 +963,7 @@ fn bench_anchor_diversity(c: &mut Criterion) {
                 entropy: None,
                 local_context: None,
                 secret_group: None,
+                offline_validation: None,
                 re: regex::bytes::Regex::new(&format!(r"{anchor_str}[A-Za-z0-9]{{20}}")).unwrap(),
             }
         })

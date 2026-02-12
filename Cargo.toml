@@ -57,6 +57,10 @@ tiger-harness = []
 sim-harness = []
 kani = []  # Gate Kani model-checking proofs
 scheduler-sim = []  # Enable longer-running scheduler simulation tests
+integration-tests = []  # Gate integration tests behind explicit opt-in
+property-tests = []  # Gate property-based tests behind explicit opt-in
+smoke-tests = []  # Gate smoke (binary end-to-end) tests behind explicit opt-in
+diagnostic-tests = []  # Gate diagnostic tests behind explicit opt-in
 rocksdb = ["dep:rocksdb"]
 git-perf = ["perf-stats"]  # Git pack-exec timing probes (implies perf-stats)
 real-rules-harness = []  # Real-ruleset regression harness (simulation test)
@@ -98,6 +102,11 @@ harness = false
 
 [[bench]]
 name = "validator"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "offline_validation"
 harness = false
 required-features = ["bench"]
 
@@ -178,14 +187,17 @@ inherits = "release"
 [[test]]
 name = "integration"
 path = "tests/integration/main.rs"
+required-features = ["integration-tests"]
 
 [[test]]
 name = "smoke"
 path = "tests/smoke/main.rs"
+required-features = ["smoke-tests"]
 
 [[test]]
 name = "property"
 path = "tests/property/main.rs"
+required-features = ["property-tests"]
 
 [[test]]
 name = "simulation"
@@ -195,6 +207,7 @@ path = "tests/simulation/main.rs"
 [[test]]
 name = "diagnostic"
 path = "tests/diagnostic/main.rs"
+required-features = ["diagnostic-tests"]
 
 # ============================================================================
 # Examples

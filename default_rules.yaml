@@ -1,3 +1,40 @@
+# ==========================================================================
+# Default detection rules for scanner-rs.
+#
+# Each entry defines a secret-detection rule compiled into the scan engine.
+# See docs/detection-rules.md for the full schema reference and authoring
+# guidelines, and src/rules/yaml.rs for the parser.
+#
+# Required fields:
+#   name      — Unique rule identifier (e.g. "github-pat").
+#   regex     — Pattern compiled into a regex::bytes::Regex.
+#   anchors   — Literal byte strings for Vectorscan pre-filter.
+#   radius    — Byte radius around an anchor match fed to the regex.
+#
+# Optional fields:
+#   must_contain           — Literal that must appear in the scan window.
+#   keywords_any           — At least one keyword must appear near the match.
+#   value_suppressors_any  — Substrings in extracted secret that suppress
+#                            the finding (e.g. "EXAMPLE", "PLACEHOLDER").
+#   entropy                — Shannon-entropy gate on extracted secret bytes.
+#     min_bits_per_byte    — Minimum bits of entropy per byte.
+#     min_len / max_len    — Length bounds for entropy measurement.
+#   two_phase              — Two-pass scan: seed_radius → confirm_any → full_radius.
+#   local_context          — Structural context checks (assignment, quoting, key names).
+#   offline_validation     — Offline structural check (checksum, format) on extracted
+#                            secret. See src/engine/offline_validate.rs for validators.
+#     type                 — Algorithm: crc32_base62, github_fine_grained_pat,
+#                            grafana_service_account, aws_access_key, sentry_org_token.
+#     prefix_skip          — (crc32_base62 only) Bytes to skip before payload.
+#     payload_len          — (crc32_base62 only) Payload length in base-62 digits.
+#     checksum_len         — (crc32_base62 only) Checksum length in base-62 digits.
+#   secret_group           — Capture group index when the secret is not the full match.
+#
+# Notes:
+# - Unknown fields are silently ignored by the parser.
+# - ValidatorKind is not expressible in YAML; it is set programmatically.
+# - Rules are tested by `cargo test` (yaml.rs round-trip + integration tests).
+# ==========================================================================
 rules:
 - name: '1password-secret-key'
   regex: \bA3-[A-Z0-9]{6}-(?:(?:[A-Z0-9]{11})|(?:[A-Z0-9]{6}-[A-Z0-9]{5}))-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}\b
@@ -449,6 +486,8 @@ rules:
     max_len: 256
   two_phase: null
   local_context: null
+  offline_validation:
+    type: aws_access_key
   secret_group: null
 - name: aws-amazon-bedrock-api-key-long-lived
   regex: \b(ABSK[A-Za-z0-9+/]{109,269}={0,2})(?:[\x60'"\s;]|\\[nr]|$)
@@ -1657,6 +1696,11 @@ rules:
     max_len: 256
   two_phase: null
   local_context: null
+  offline_validation:
+    type: crc32_base62
+    prefix_skip: 4
+    payload_len: 30
+    checksum_len: 6
   secret_group: null
 - name: github-fine-grained-pat
   regex: github_pat_\w{82}
@@ -1672,6 +1716,8 @@ rules:
     max_len: 256
   two_phase: null
   local_context: null
+  offline_validation:
+    type: github_fine_grained_pat
   secret_group: null
 - name: github-oauth
   regex: gho_[0-9a-zA-Z]{36}
@@ -1687,6 +1733,11 @@ rules:
     max_len: 256
   two_phase: null
   local_context: null
+  offline_validation:
+    type: crc32_base62
+    prefix_skip: 4
+    payload_len: 30
+    checksum_len: 6
   secret_group: null
 - name: github-pat
   regex: ghp_[0-9a-zA-Z]{36}
@@ -1702,6 +1753,11 @@ rules:
     max_len: 256
   two_phase: null
   local_context: null
+  offline_validation:
+    type: crc32_base62
+    prefix_skip: 4
+    payload_len: 30
+    checksum_len: 6
   secret_group: null
 - name: github-refresh-token
   regex: ghr_[0-9a-zA-Z]{36}
@@ -1717,6 +1773,11 @@ rules:
     max_len: 256
   two_phase: null
   local_context: null
+  offline_validation:
+    type: crc32_base62
+    prefix_skip: 4
+    payload_len: 30
+    checksum_len: 6
   secret_group: null
 - name: gitlab-cicd-job-token
   regex: glcbt-[0-9a-zA-Z]{1,5}_[0-9a-zA-Z_-]{20}
@@ -2027,6 +2088,8 @@ rules:
     max_len: 256
   two_phase: null
   local_context: null
+  offline_validation:
+    type: grafana_service_account
   secret_group: null
 - name: harness-api-key
   regex: (?:pat|sat)\.[a-zA-Z0-9_-]{22}\.[a-zA-Z0-9]{24}\.[a-zA-Z0-9]{20}
@@ -2876,6 +2939,11 @@ rules:
     max_len: 256
   two_phase: null
   local_context: null
+  offline_validation:
+    type: crc32_base62
+    prefix_skip: 4
+    payload_len: 30
+    checksum_len: 6
   secret_group: null
 - name: nuget-config-password
   regex: (?i)<add key=\"(?:(?:ClearText)?Password)\"\s*value=\"(.{8,})\"\s*/>
@@ -3359,6 +3427,8 @@ rules:
     max_len: 256
   two_phase: null
   local_context: null
+  offline_validation:
+    type: sentry_org_token
   secret_group: null
 - name: sentry-user-token
   regex: \b(sntryu_[a-f0-9]{64})(?:[\x60'"\s;]|\\[nr]|$)

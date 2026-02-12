@@ -27,7 +27,7 @@
 //!   unit) used for literal gating. They are not general-purpose UTF-16 encoders.
 //! - Variant ordering is stable and reused for packed arrays and bit layouts.
 
-use crate::api::{LocalContextSpec, RuleSpec};
+use crate::api::{LocalContextSpec, OfflineValidationSpec, RuleSpec};
 use ahash::AHashMap;
 use regex::bytes::Regex;
 
@@ -171,6 +171,11 @@ const _: () = assert!(std::mem::size_of::<PackedPatterns>() == 32);
 
 /// Builder for [`PackedPatterns`] that accumulates patterns using `Vec`
 /// internally, then freezes into boxed slices.
+///
+/// # Invariants maintained during building
+/// - `offsets[0] == 0` (established at construction).
+/// - Each `push_*` call appends bytes and records a new offset.
+/// - `bytes.len() <= u32::MAX` (asserted on each push).
 pub(super) struct PackedPatternsBuilder {
     bytes: Vec<u8>,
     offsets: Vec<u32>,
@@ -255,7 +260,10 @@ pub(super) struct TwoPhaseCompiled {
     pub(super) seed_radius: usize,
     pub(super) full_radius: usize,
 
-    // confirm patterns per variant (raw bytes for Raw, utf16-bytes for Utf16Le/Be)
+    /// Confirm patterns per variant, indexed by [`Variant::idx()`].
+    ///
+    /// Raw byte patterns for `Variant::Raw`, UTF-16-expanded patterns for
+    /// `Variant::Utf16Le` and `Variant::Utf16Be`.
     pub(super) confirm: [PackedPatterns; 3],
 }
 
@@ -265,9 +273,10 @@ pub(super) struct TwoPhaseCompiled {
 /// - `any` is encoded per variant and indexed by `Variant::idx()`.
 #[derive(Clone, Debug)]
 pub(super) struct KeywordsCompiled {
-    // Raw / Utf16Le / Utf16Be variants packed for fast memmem gating.
-    // This mirrors anchor variant handling so keyword gating behaves consistently
-    // across encodings and avoids per-window UTF-16 conversions.
+    /// Keyword patterns per variant, indexed by [`Variant::idx()`].
+    ///
+    /// Mirrors anchor variant handling so keyword gating behaves consistently
+    /// across encodings and avoids per-window UTF-16 conversions.
     pub(super) any: [PackedPatterns; 3],
 }
 
@@ -290,14 +299,25 @@ pub(super) struct ConfirmAllCompiled {
 
 /// Entropy gate parameters compiled into a rule.
 ///
+/// Copied from the validated [`crate::api::EntropySpec`] at compile time to
+/// avoid repeated lookups through the rule spec during scanning. See
+/// `EntropySpec` for the entropy algorithm description.
+///
 /// # Invariants
 /// - Values are validated by `RuleSpec::assert_valid`.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct EntropyCompiled {
-    // Prevalidated config stored in compiled rules to avoid repeated lookups.
-    // Lengths are measured in bytes of the candidate match.
+    /// Minimum Shannon entropy threshold in bits per byte.
+    ///
+    /// Candidates below this threshold are rejected as low-entropy
+    /// (e.g., repeated characters, sequential digits).
     pub(super) min_bits_per_byte: f32,
+    /// Minimum candidate length in bytes for the entropy check to apply.
     pub(super) min_len: usize,
+    /// Maximum candidate length in bytes for the entropy check to apply.
+    ///
+    /// Also determines the size of the pre-computed `ln(i)/ln(2)` table
+    /// in [`Engine::entropy_log2`](super::core::Engine).
     pub(super) max_len: usize,
 }
 
@@ -320,9 +340,9 @@ pub(super) struct EntropyCompiled {
 ///    — touched for every merged window to decide if the regex runs.
 /// 2. **Post-match only**: `secret_group` — read only when the regex matches.
 /// 3. **Gate indices**: `confirm_all`, `keywords`, `value_suppressors`,
-///    `entropy`, `local_context`, `two_phase` — dereferenced through `Engine`
-///    pool accessors only when the corresponding gate is present (`Some`).
-///    Most rules have 0–2 gates,
+///    `entropy`, `local_context`, `two_phase`, `offline_validation` —
+///    dereferenced through `Engine` pool accessors only when the
+///    corresponding gate is present (`Some`). Most rules have 0–2 gates,
 ///    so these are cold for the majority of candidates.
 ///
 /// # Gate pool access
@@ -337,6 +357,7 @@ pub(super) struct EntropyCompiled {
 /// | `entropy`      | `entropy_gates`           |
 /// | `local_context`| `local_context_gates`     |
 /// | `two_phase`    | `two_phase_gates`         |
+/// | `offline_validation` | `offline_validation_gates` |
 ///
 /// # Invariants
 /// - All fields are derived from a validated `RuleSpec`.
@@ -350,12 +371,14 @@ pub(super) struct RuleCompiled {
     pub(super) needs_assignment_shape_check: bool,
     pub(super) secret_group: Option<u16>,
     // Gate pool indices — dereference through Engine pool vectors.
+    // See the "Gate pool access" table in the struct-level doc.
     pub(super) confirm_all: Option<u32>,
     pub(super) keywords: Option<u32>,
     pub(super) value_suppressors: Option<u32>,
     pub(super) entropy: Option<u32>,
     pub(super) local_context: Option<u32>,
     pub(super) two_phase: Option<u32>,
+    pub(super) offline_validation: Option<u32>,
 }
 
 /// Cold rule metadata used outside the validation hot path.
@@ -385,6 +408,7 @@ pub(super) struct CompiledGates {
     pub(super) value_suppressors: Option<PackedPatterns>,
     pub(super) entropy: Option<EntropyCompiled>,
     pub(super) local_context: Option<LocalContextSpec>,
+    pub(super) offline_validation: Option<OfflineValidationSpec>,
 }
 
 /// Compile a validated rule spec into the runtime representation.
@@ -471,6 +495,7 @@ pub(super) fn compile_rule(spec: &RuleSpec) -> (RuleCompiled, CompiledGates) {
         entropy: None,
         local_context: None,
         two_phase: None,
+        offline_validation: None,
     };
 
     let gates = CompiledGates {
@@ -479,6 +504,7 @@ pub(super) fn compile_rule(spec: &RuleSpec) -> (RuleCompiled, CompiledGates) {
         value_suppressors,
         entropy,
         local_context: spec.local_context,
+        offline_validation: spec.offline_validation,
     };
 
     (rule, gates)
@@ -486,8 +512,11 @@ pub(super) fn compile_rule(spec: &RuleSpec) -> (RuleCompiled, CompiledGates) {
 
 /// Compile the derived "confirm all" gate from mandatory literal islands.
 ///
-/// The longest literal becomes the `primary` selector; the remaining literals
-/// are packed into AND-gated tables for the fast memmem pass.
+/// Returns `None` if `confirm_all` is empty (no mandatory literals derived).
+///
+/// The longest literal becomes the `primary` selector — checked first via a
+/// single memmem search for early rejection. The remaining literals are packed
+/// into AND-gated tables (all must match) for the fast memmem pass.
 pub(super) fn compile_confirm_all(mut confirm_all: Vec<Vec<u8>>) -> Option<ConfirmAllCompiled> {
     if confirm_all.is_empty() {
         return None;
@@ -584,7 +613,10 @@ pub(super) fn map_to_patterns(
     (patterns, flat, offsets)
 }
 
-/// Convert ASCII bytes to UTF-16LE encoding (byte -> code unit).
+/// Convert ASCII bytes to UTF-16LE encoding (one byte → one code unit).
+///
+/// Input is assumed to be ASCII (bytes 0x00–0x7F). Non-ASCII input produces
+/// technically invalid UTF-16 but is still useful for byte-level literal matching.
 pub(super) fn utf16le_bytes(ascii: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(ascii.len() * 2);
     for &b in ascii {
@@ -594,7 +626,10 @@ pub(super) fn utf16le_bytes(ascii: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Convert ASCII bytes to UTF-16BE encoding (byte -> code unit).
+/// Convert ASCII bytes to UTF-16BE encoding (one byte → one code unit).
+///
+/// Input is assumed to be ASCII (bytes 0x00–0x7F). Non-ASCII input produces
+/// technically invalid UTF-16 but is still useful for byte-level literal matching.
 pub(super) fn utf16be_bytes(ascii: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(ascii.len() * 2);
     for &b in ascii {
@@ -634,6 +669,7 @@ mod tests {
             entropy: None,
             local_context: None,
             secret_group: Some(1),
+            offline_validation: None,
             re: Regex::new(r"TOK_([A-Z0-9]{4})").unwrap(),
         }
     }

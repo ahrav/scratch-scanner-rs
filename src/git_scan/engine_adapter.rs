@@ -20,6 +20,9 @@
 //! - A fixed-size ring buffer streams blob bytes into the scanner, avoiding
 //!   per-blob allocations beyond the chunk window.
 //! - Findings are stored in a shared arena with per-blob spans.
+//! - `CommitMeta` events are emitted at most once per commit using an
+//!   `AtomicBitSet` shared across all adapter instances. See
+//!   [`EngineAdapter::stream_findings`] for the exactly-once protocol.
 //!
 //! # Invariants
 //! - Results are returned in candidate order.
@@ -510,6 +513,9 @@ impl<'a> EngineAdapter<'a> {
         self.scan_blob_payload(file_id, bytes)
     }
 
+    /// Scans raw blob bytes (bypassing content classification) and updates
+    /// metrics. Called by `scan_blob_into_buf` for text blobs and extracted
+    /// binary content.
     fn scan_blob_payload(
         &mut self,
         file_id: FileId,
@@ -528,6 +534,7 @@ impl<'a> EngineAdapter<'a> {
         Ok(())
     }
 
+    /// Increments scan metrics for a successfully scanned payload.
     #[inline(always)]
     fn record_scanned_payload(&mut self, scanned_len: usize) {
         self.metrics.objects_scanned = self.metrics.objects_scanned.saturating_add(1);
@@ -667,6 +674,10 @@ fn effective_chunk_bytes(requested: usize, overlap: usize) -> usize {
     base.max(min).min(u32::MAX as usize)
 }
 
+/// Computes the number of chunk windows emitted for a blob of the given length,
+/// accounting for overlap between adjacent windows.
+///
+/// Returns at least 1 (single-chunk fast path), matching `RingChunker` behavior.
 #[inline(always)]
 fn chunk_count_for_blob_len(blob_len: usize, chunk_bytes: usize, overlap: usize) -> u64 {
     if blob_len <= chunk_bytes {
@@ -680,6 +691,9 @@ fn chunk_count_for_blob_len(blob_len: usize, chunk_bytes: usize, overlap: usize)
     1u64.saturating_add(extra as u64)
 }
 
+/// Internal scan entry point that creates a fresh `RingChunker` and delegates
+/// to [`scan_blob_chunked_with_chunker`]. Used by the public
+/// [`scan_blob_chunked`] API when no reusable chunker is available.
 fn scan_blob_chunked_into(
     engine: &Engine,
     scratch: &mut ScanScratch,
@@ -932,6 +946,10 @@ impl RingChunker {
         self.overlap
     }
 
+    /// Resets the chunker for reuse with a new blob.
+    ///
+    /// Clears the fill cursor and base offset; the next `feed` call will
+    /// treat the first emitted window as `is_first = true`.
     fn reset(&mut self) {
         self.filled = 0;
         self.base = 0;
@@ -1191,6 +1209,7 @@ mod tests {
             entropy: None,
             local_context: None,
             secret_group: Some(1),
+            offline_validation: None,
             re: Regex::new(r"TOK_([A-Z0-9]{8})").unwrap(),
         };
 

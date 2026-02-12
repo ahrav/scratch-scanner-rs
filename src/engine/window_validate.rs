@@ -21,6 +21,8 @@
 //! 8. Apply root-context safelist suppression for root emit paths.
 //! 9. Record the finding with the extracted secret span.
 //!
+//! Offline structural validation runs post-scan in `core.rs`, not per-window.
+//!
 //! # Secret Extraction
 //! The finding's `span_start`/`span_end` reflect the *secret* portion of the match,
 //! not necessarily the full regex match. The `root_hint_*` fields use the *full match*
@@ -461,8 +463,10 @@ impl Engine {
                                 root_hint_end,
                                 &mut last_safelist_decision,
                             ) {
-                                scratch.safelist_suppressed =
-                                    scratch.safelist_suppressed.saturating_add(1);
+                                crate::perf_stats::sat_add_usize(
+                                    &mut scratch.safelist_suppressed,
+                                    1,
+                                );
                                 return;
                             }
                             let mut drop_hint_end = root_span_hint.end;
@@ -739,7 +743,7 @@ impl Engine {
                         root_hint_end,
                         &mut last_safelist_decision,
                     ) {
-                        scratch.safelist_suppressed = scratch.safelist_suppressed.saturating_add(1);
+                        crate::perf_stats::sat_add_usize(&mut scratch.safelist_suppressed, 1);
                         return;
                     }
 
@@ -906,7 +910,7 @@ impl Engine {
                         root_hint_end,
                         &mut last_safelist_decision,
                     ) {
-                        scratch.safelist_suppressed = scratch.safelist_suppressed.saturating_add(1);
+                        crate::perf_stats::sat_add_usize(&mut scratch.safelist_suppressed, 1);
                         return;
                     }
 
@@ -1141,7 +1145,7 @@ impl Engine {
                         root_hint_end,
                         &mut last_safelist_decision,
                     ) {
-                        scratch.safelist_suppressed = scratch.safelist_suppressed.saturating_add(1);
+                        crate::perf_stats::sat_add_usize(&mut scratch.safelist_suppressed, 1);
                         return;
                     }
 

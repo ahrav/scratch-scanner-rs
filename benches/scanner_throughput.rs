@@ -612,6 +612,7 @@ fn minimal_engine() -> Engine {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: regex::bytes::Regex::new(r"\xFF\xFE\xFD\xFC[a-z]{10}").unwrap(),
     }];
 

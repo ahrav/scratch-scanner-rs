@@ -87,8 +87,10 @@ pub enum TransformMode {
     /// Always apply this transform, subject to span and budget caps.
     Always,
 
-    /// Correctness trade (explicit).
-    /// Skips this transform if the *current buffer* already produced any findings.
+    /// Skip this transform when the current buffer has already produced findings.
+    ///
+    /// This is an explicit correctness trade-off: reducing redundant transform
+    /// work at the cost of potentially missing findings in nested encodings.
     ///
     /// Scope: This only considers findings from the current buffer being scanned;
     /// findings from parent buffers (that produced this one) or child buffers
@@ -583,7 +585,7 @@ impl LocalContextSpec {
 /// # Invariants
 /// - `name` must be non-empty.
 /// - `two_phase`, `must_contain`, `keywords_any`, `value_suppressors_any`,
-///   `entropy`, and `local_context` must be valid when present.
+///   `entropy`, `local_context`, and `offline_validation` must be valid when present.
 ///
 /// # Design Notes
 /// - Anchors should be ASCII-ish; UTF-16 variants are derived automatically.
@@ -662,6 +664,12 @@ pub struct RuleSpec {
     /// Optional local context gate evaluated after secret extraction.
     pub local_context: Option<LocalContextSpec>,
 
+    /// Optional offline structural validation applied post-extraction.
+    ///
+    /// When present, the engine runs this check on the extracted secret bytes
+    /// after all other gates pass. See [`OfflineValidationSpec`] for variants.
+    pub offline_validation: Option<OfflineValidationSpec>,
+
     /// Optional capture group index for secret extraction.
     ///
     /// When set, the engine extracts the secret value from the specified capture
@@ -726,6 +734,9 @@ impl RuleSpec {
         if let Some(ctx) = &self.local_context {
             ctx.assert_valid();
         }
+        if let Some(ov) = &self.offline_validation {
+            ov.assert_valid();
+        }
         if let Some(gi) = self.secret_group {
             let group_count = self.re.captures_len();
             assert!(
@@ -780,6 +791,89 @@ impl EntropySpec {
     }
 }
 
+/// Offline structural validation applied post-extraction, before emitting a finding.
+///
+/// Each variant encodes a self-contained check that can confirm or reject a
+/// candidate secret without network access. Parameterised variants carry the
+/// per-rule geometry needed to locate the checksum/payload fields.
+///
+/// # Invariants (enforced by [`assert_valid`](OfflineValidationSpec::assert_valid))
+/// - `Crc32Base62`: `payload_len > 0`, `checksum_len > 0`, `checksum_len <= 6`.
+/// - Unit variants: always valid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OfflineValidationSpec {
+    /// CRC-32 encoded as base-62 and appended to the token.
+    ///
+    /// `prefix_skip` bytes are skipped before the payload/checksum region.
+    /// The next `payload_len` bytes are the payload and the following
+    /// `checksum_len` bytes are the base-62-encoded CRC-32 of the payload.
+    Crc32Base62 {
+        prefix_skip: u8,
+        payload_len: u8,
+        checksum_len: u8,
+    },
+    /// GitHub fine-grained PAT built-in checksum.
+    GithubFinegrainedPat,
+    /// Grafana service-account token checksum.
+    GrafanaServiceAccount,
+    /// AWS access key ID check-digit validation.
+    AwsAccessKey,
+    /// Sentry org-auth-token base64 format and JSON payload prefix check.
+    SentryOrgToken,
+}
+
+impl OfflineValidationSpec {
+    /// Internal invariant checks used at engine build time.
+    pub(crate) fn assert_valid(&self) {
+        match self {
+            Self::Crc32Base62 {
+                payload_len,
+                checksum_len,
+                ..
+            } => {
+                assert!(*payload_len > 0, "Crc32Base62 payload_len must be > 0");
+                assert!(*checksum_len > 0, "Crc32Base62 checksum_len must be > 0");
+                assert!(
+                    *checksum_len <= 6,
+                    "Crc32Base62 checksum_len must be <= 6 (base-62 encodes u32 in at most 6 chars)"
+                );
+            }
+            Self::GithubFinegrainedPat
+            | Self::GrafanaServiceAccount
+            | Self::AwsAccessKey
+            | Self::SentryOrgToken => {}
+        }
+    }
+
+    /// Whether an `Invalid` verdict from this check should suppress the finding.
+    ///
+    /// Currently all variants suppress on invalid — the match arm is kept
+    /// explicit so adding a new variant forces a compile-time decision.
+    pub fn suppresses_on_invalid(&self) -> bool {
+        match self {
+            Self::Crc32Base62 { .. }
+            | Self::GithubFinegrainedPat
+            | Self::GrafanaServiceAccount
+            | Self::AwsAccessKey
+            | Self::SentryOrgToken => true,
+        }
+    }
+}
+
+/// Result of an offline structural validation check.
+///
+/// `Valid` and `Indeterminate` allow the finding to be emitted;
+/// `Invalid` suppresses it (see `Engine::post_scan_filter` in `core.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OfflineVerdict {
+    /// The token passed the structural check.
+    Valid,
+    /// The token failed the structural check (likely false positive).
+    Invalid,
+    /// The check could not be applied (e.g., token too short).
+    Indeterminate,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,6 +890,7 @@ mod tests {
             value_suppressors_any: None,
             entropy: None,
             local_context,
+            offline_validation: None,
             secret_group: None,
             re: Regex::new(r"tok_[a-z0-9]{8}").unwrap(),
         }
@@ -861,6 +956,81 @@ mod tests {
         let mut rule = dummy_rule(None);
         rule.value_suppressors_any = Some(SUPPRESSORS_WITH_EMPTY_ENTRY);
         rule.assert_valid();
+    }
+
+    // ---- OfflineValidationSpec tests ----
+
+    #[test]
+    fn offline_validation_none_is_valid() {
+        let rule = dummy_rule(None);
+        assert!(rule.offline_validation.is_none());
+        rule.assert_valid();
+    }
+
+    #[test]
+    fn offline_crc32_valid() {
+        let mut rule = dummy_rule(None);
+        rule.offline_validation = Some(OfflineValidationSpec::Crc32Base62 {
+            prefix_skip: 4,
+            payload_len: 30,
+            checksum_len: 6,
+        });
+        rule.assert_valid();
+    }
+
+    #[test]
+    #[should_panic(expected = "Crc32Base62 payload_len must be > 0")]
+    fn offline_crc32_zero_payload_panics() {
+        let spec = OfflineValidationSpec::Crc32Base62 {
+            prefix_skip: 0,
+            payload_len: 0,
+            checksum_len: 4,
+        };
+        spec.assert_valid();
+    }
+
+    #[test]
+    #[should_panic(expected = "Crc32Base62 checksum_len must be > 0")]
+    fn offline_crc32_zero_checksum_panics() {
+        let spec = OfflineValidationSpec::Crc32Base62 {
+            prefix_skip: 0,
+            payload_len: 10,
+            checksum_len: 0,
+        };
+        spec.assert_valid();
+    }
+
+    #[test]
+    #[should_panic(expected = "Crc32Base62 checksum_len must be <= 6")]
+    fn offline_crc32_checksum_too_large_panics() {
+        let spec = OfflineValidationSpec::Crc32Base62 {
+            prefix_skip: 0,
+            payload_len: 10,
+            checksum_len: 7,
+        };
+        spec.assert_valid();
+    }
+
+    #[test]
+    fn offline_suppresses_on_invalid() {
+        let variants: &[OfflineValidationSpec] = &[
+            OfflineValidationSpec::Crc32Base62 {
+                prefix_skip: 0,
+                payload_len: 10,
+                checksum_len: 4,
+            },
+            OfflineValidationSpec::GithubFinegrainedPat,
+            OfflineValidationSpec::GrafanaServiceAccount,
+            OfflineValidationSpec::AwsAccessKey,
+            OfflineValidationSpec::SentryOrgToken,
+        ];
+        for v in variants {
+            assert!(
+                v.suppresses_on_invalid(),
+                "{:?} should suppress on invalid",
+                v
+            );
+        }
     }
 }
 
@@ -996,6 +1166,14 @@ impl RuleSpec {
             }
         }
 
+        match &self.offline_validation {
+            None => out.push(0),
+            Some(ov) => {
+                out.push(1);
+                ov.encode_policy(out);
+            }
+        }
+
         push_bytes_u32(out, self.re.as_str().as_bytes());
     }
 }
@@ -1015,6 +1193,28 @@ impl EntropySpec {
         push_u32_le(out, self.min_bits_per_byte.to_bits());
         push_u64_le(out, self.min_len as u64);
         push_u64_le(out, self.max_len as u64);
+    }
+}
+
+impl OfflineValidationSpec {
+    /// Encodes this offline validation spec into canonical bytes.
+    pub(crate) fn encode_policy(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::Crc32Base62 {
+                prefix_skip,
+                payload_len,
+                checksum_len,
+            } => {
+                out.push(0);
+                out.push(*prefix_skip);
+                out.push(*payload_len);
+                out.push(*checksum_len);
+            }
+            Self::GithubFinegrainedPat => out.push(1),
+            Self::GrafanaServiceAccount => out.push(2),
+            Self::AwsAccessKey => out.push(3),
+            Self::SentryOrgToken => out.push(4),
+        }
     }
 }
 
@@ -1166,6 +1366,10 @@ impl Tuning {
     }
 }
 
+/// Encodes an optional byte slice.
+///
+/// `None` encodes as a single 0x00 byte; `Some` encodes as 0x01 followed
+/// by the length-prefixed byte slice.
 fn encode_opt_bytes(out: &mut Vec<u8>, value: Option<&[u8]>) {
     match value {
         None => out.push(0),

@@ -129,6 +129,7 @@ fn generic_api_key_rule() -> RuleSpec {
         }),
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: build_regex(
             r#"(?i)[\w.-]{0,50}?(?:access|auth|(?-i:[Aa]pi|API)|credential|creds|key|passw(?:or)?d|secret|token)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([\w.=-]{10,150}|[a-z0-9][a-z0-9+/]{11,}={0,3})(?:[\x60'"\s;]|\\[nr]|$)"#,
         ),
@@ -149,6 +150,7 @@ fn impossible_rule(name: &'static str) -> RuleSpec {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: build_regex(r"\xFF\xFE\xFD\xFC[a-z]{10}"),
     }
 }
@@ -171,6 +173,7 @@ fn github_pat_rule() -> RuleSpec {
         }),
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: build_regex(r"ghp_[0-9a-zA-Z]{36}"),
     }
 }
@@ -189,6 +192,7 @@ fn aws_rule() -> RuleSpec {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: build_regex(r"(?:AKIA|AGPA|AIDA|AROA|AIPA)[A-Z0-9]{16}"),
     }
 }
@@ -406,6 +410,7 @@ fn bench_anchor_density(c: &mut Criterion) {
             }),
             local_context: None,
             secret_group: None,
+            offline_validation: None,
             re: build_regex(
                 r#"(?i)[\w.-]{0,50}?(?:access|auth|api|key|passw(?:or)?d|secret|token)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([\w.=-]{10,150})(?:[\x60'"\s;]|\\[nr]|$)"#,
             ),

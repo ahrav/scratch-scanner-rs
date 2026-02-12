@@ -72,6 +72,7 @@ mod work_items;
 
 // Core engine and scratch modules
 mod core;
+pub(crate) mod offline_validate;
 mod scratch;
 
 // Scanning implementation modules (Engine impl extensions)
@@ -100,6 +101,10 @@ pub use core::{AnchorPlanStats, VectorscanStats};
 pub use core::{
     bench_contains_any_memmem, bench_find_spans_into, bench_pack_patterns_raw,
     bench_stream_decode_base64, bench_stream_decode_url, BenchPackedPatterns,
+};
+#[cfg(feature = "bench")]
+pub use offline_validate::{
+    bench_offline_validate_aws_access_key, bench_offline_validate_sentry_org_token,
 };
 
 #[cfg(feature = "tiger-harness")]
