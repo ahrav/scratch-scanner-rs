@@ -58,6 +58,8 @@ pub(crate) enum RulesError {
     },
     /// Rule validation failure (e.g., invalid invariants).
     Validation { rule_name: String, message: String },
+    /// Offline validation configuration error (unknown type, missing params).
+    OfflineValidation { rule_name: String, message: String },
     /// The rules file contained no rules.
     NoRules,
 }
@@ -77,6 +79,12 @@ impl fmt::Display for RulesError {
             ),
             RulesError::Validation { rule_name, message } => {
                 write!(f, "validation error in rule '{rule_name}': {message}")
+            }
+            RulesError::OfflineValidation { rule_name, message } => {
+                write!(
+                    f,
+                    "offline_validation error in rule '{rule_name}': {message}"
+                )
             }
             RulesError::NoRules => write!(f, "rules file contains no rules"),
         }

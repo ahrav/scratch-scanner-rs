@@ -34,7 +34,9 @@ use std::sync::{LazyLock, Mutex};
 
 use serde::Deserialize;
 
-use crate::api::{EntropySpec, LocalContextSpec, RuleSpec, TwoPhaseSpec, ValidatorKind};
+use crate::api::{
+    EntropySpec, LocalContextSpec, OfflineValidationSpec, RuleSpec, TwoPhaseSpec, ValidatorKind,
+};
 
 use super::RulesError;
 
@@ -90,6 +92,8 @@ pub(crate) struct YamlRule {
     #[serde(default)]
     pub local_context: Option<YamlLocalContext>,
     #[serde(default)]
+    pub offline_validation: Option<YamlOfflineValidation>,
+    #[serde(default)]
     pub secret_group: Option<u16>,
 }
 
@@ -136,6 +140,34 @@ pub(crate) struct YamlLocalContext {
     pub require_quoted: bool,
     #[serde(default)]
     pub key_names_any: Option<Vec<String>>,
+}
+
+/// Offline structural validation configuration.
+///
+/// The `type` field selects the validation algorithm. Parameterised variants
+/// (currently only `crc32_base62`) require additional numeric fields; unit
+/// variants need only the type selector.
+///
+/// # Supported types
+///
+/// | YAML `type` value          | Maps to                                |
+/// |----------------------------|----------------------------------------|
+/// | `crc32_base62`             | [`OfflineValidationSpec::Crc32Base62`] |
+/// | `github_fine_grained_pat`  | [`OfflineValidationSpec::GithubFinegrainedPat`] |
+/// | `grafana_service_account`  | [`OfflineValidationSpec::GrafanaServiceAccount`] |
+/// | `aws_access_key`           | [`OfflineValidationSpec::AwsAccessKey`] |
+/// | `sentry_org_token`         | [`OfflineValidationSpec::SentryOrgToken`] |
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub(crate) struct YamlOfflineValidation {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub prefix_skip: Option<u8>,
+    #[serde(default)]
+    pub payload_len: Option<u8>,
+    #[serde(default)]
+    pub checksum_len: Option<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -228,6 +260,50 @@ fn with_rule_atoms<T>(f: impl FnOnce(&mut RuleAtomPool) -> T) -> T {
 // Core conversion
 // ---------------------------------------------------------------------------
 
+/// Convert a [`YamlOfflineValidation`] into an [`OfflineValidationSpec`].
+///
+/// Returns an error for unknown type strings or missing required parameters.
+fn yaml_offline_to_spec(
+    rule_name: &str,
+    ov: YamlOfflineValidation,
+) -> Result<OfflineValidationSpec, RulesError> {
+    match ov.kind.as_str() {
+        "crc32_base62" => {
+            let prefix_skip = ov
+                .prefix_skip
+                .ok_or_else(|| RulesError::OfflineValidation {
+                    rule_name: rule_name.to_string(),
+                    message: "crc32_base62 requires 'prefix_skip'".into(),
+                })?;
+            let payload_len = ov
+                .payload_len
+                .ok_or_else(|| RulesError::OfflineValidation {
+                    rule_name: rule_name.to_string(),
+                    message: "crc32_base62 requires 'payload_len'".into(),
+                })?;
+            let checksum_len = ov
+                .checksum_len
+                .ok_or_else(|| RulesError::OfflineValidation {
+                    rule_name: rule_name.to_string(),
+                    message: "crc32_base62 requires 'checksum_len'".into(),
+                })?;
+            Ok(OfflineValidationSpec::Crc32Base62 {
+                prefix_skip,
+                payload_len,
+                checksum_len,
+            })
+        }
+        "github_fine_grained_pat" => Ok(OfflineValidationSpec::GithubFinegrainedPat),
+        "grafana_service_account" => Ok(OfflineValidationSpec::GrafanaServiceAccount),
+        "aws_access_key" => Ok(OfflineValidationSpec::AwsAccessKey),
+        "sentry_org_token" => Ok(OfflineValidationSpec::SentryOrgToken),
+        unknown => Err(RulesError::OfflineValidation {
+            rule_name: rule_name.to_string(),
+            message: format!("unknown offline_validation type '{unknown}'"),
+        }),
+    }
+}
+
 /// Parse YAML content into a `Vec<RuleSpec>`.
 ///
 /// Deserializes the YAML, then converts each [`YamlRule`] into a [`RuleSpec`]
@@ -256,6 +332,7 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
             entropy,
             two_phase,
             local_context,
+            offline_validation,
             secret_group,
         } = yr;
 
@@ -308,6 +385,10 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
             max_len: e.max_len,
         });
 
+        let offline_validation = offline_validation
+            .map(|ov| yaml_offline_to_spec(&name, ov))
+            .transpose()?;
+
         rules.push(RuleSpec {
             name,
             anchors,
@@ -322,7 +403,7 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
             value_suppressors_any,
             entropy,
             local_context,
-            offline_validation: None,
+            offline_validation,
             secret_group,
             re,
         });
@@ -400,6 +481,43 @@ mod tests {
             }),
         });
 
+        let offline_validation = rule.offline_validation.map(|ov| match ov {
+            OfflineValidationSpec::Crc32Base62 {
+                prefix_skip,
+                payload_len,
+                checksum_len,
+            } => YamlOfflineValidation {
+                kind: "crc32_base62".into(),
+                prefix_skip: Some(prefix_skip),
+                payload_len: Some(payload_len),
+                checksum_len: Some(checksum_len),
+            },
+            OfflineValidationSpec::GithubFinegrainedPat => YamlOfflineValidation {
+                kind: "github_fine_grained_pat".into(),
+                prefix_skip: None,
+                payload_len: None,
+                checksum_len: None,
+            },
+            OfflineValidationSpec::GrafanaServiceAccount => YamlOfflineValidation {
+                kind: "grafana_service_account".into(),
+                prefix_skip: None,
+                payload_len: None,
+                checksum_len: None,
+            },
+            OfflineValidationSpec::AwsAccessKey => YamlOfflineValidation {
+                kind: "aws_access_key".into(),
+                prefix_skip: None,
+                payload_len: None,
+                checksum_len: None,
+            },
+            OfflineValidationSpec::SentryOrgToken => YamlOfflineValidation {
+                kind: "sentry_org_token".into(),
+                prefix_skip: None,
+                payload_len: None,
+                checksum_len: None,
+            },
+        });
+
         YamlRule {
             name: rule.name.to_string(),
             regex: rule.re.as_str().to_string(),
@@ -411,6 +529,7 @@ mod tests {
             entropy,
             two_phase,
             local_context,
+            offline_validation,
             secret_group: rule.secret_group,
         }
     }
@@ -580,6 +699,13 @@ mod tests {
                 (None, None) => {}
                 _ => panic!("local_context presence mismatch for {}", orig.name),
             }
+
+            // Offline validation.
+            assert_eq!(
+                orig.offline_validation, parsed.offline_validation,
+                "offline_validation mismatch for {}",
+                orig.name
+            );
 
             // Secret group.
             assert_eq!(
@@ -952,8 +1078,11 @@ rules:
             "entropy",
             "two_phase",
             "local_context",
+            "offline_validation",
             "secret_group",
         ];
+        let offline_validation_fields: &[&str] =
+            &["type", "prefix_skip", "payload_len", "checksum_len"];
         let entropy_fields: &[&str] = &["min_bits_per_byte", "min_len", "max_len"];
         let two_phase_fields: &[&str] = &["seed_radius", "full_radius", "confirm_any"];
         let local_ctx_fields: &[&str] = &[
@@ -1013,6 +1142,18 @@ rules:
                         assert!(
                             local_ctx_fields.contains(&k),
                             "rule {i} ({name}) local_context has unknown field '{k}'"
+                        );
+                    }
+                }
+            }
+            // Check nested offline_validation fields.
+            if let Some(ov) = map.get(serde_yml::Value::String("offline_validation".into())) {
+                if let Some(om) = ov.as_mapping() {
+                    for key in om.keys() {
+                        let k = key.as_str().unwrap_or("");
+                        assert!(
+                            offline_validation_fields.contains(&k),
+                            "rule {i} ({name}) offline_validation has unknown field '{k}'"
                         );
                     }
                 }
@@ -1705,6 +1846,282 @@ rules:
         match parse_yaml_rules(yaml) {
             Err(RulesError::Yaml(_)) => {}
             other => panic!("expected Yaml error, got: {other:?}"),
+        }
+    }
+
+    // ---- offline_validation YAML parsing tests ----
+
+    #[test]
+    fn parse_offline_validation_crc32_base62() {
+        let yaml = r#"
+rules:
+  - name: "ov-crc32"
+    regex: 'tok_[a-z0-9]{40}'
+    anchors: ["tok_"]
+    radius: 64
+    offline_validation:
+      type: crc32_base62
+      prefix_skip: 4
+      payload_len: 30
+      checksum_len: 6
+"#;
+        let rules = parse_yaml_rules(yaml).expect("parse crc32_base62");
+        assert_eq!(
+            rules[0].offline_validation,
+            Some(OfflineValidationSpec::Crc32Base62 {
+                prefix_skip: 4,
+                payload_len: 30,
+                checksum_len: 6,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_offline_validation_github_fine_grained_pat() {
+        let yaml = r#"
+rules:
+  - name: "ov-ghpat"
+    regex: 'github_pat_[A-Za-z0-9_]{82}'
+    anchors: ["github_pat_"]
+    radius: 128
+    offline_validation:
+      type: github_fine_grained_pat
+"#;
+        let rules = parse_yaml_rules(yaml).expect("parse github_fine_grained_pat");
+        assert_eq!(
+            rules[0].offline_validation,
+            Some(OfflineValidationSpec::GithubFinegrainedPat)
+        );
+    }
+
+    #[test]
+    fn parse_offline_validation_grafana_service_account() {
+        let yaml = r#"
+rules:
+  - name: "ov-grafana"
+    regex: 'glsa_[A-Za-z0-9]{32}_[a-f0-9]{8}'
+    anchors: ["glsa_"]
+    radius: 64
+    offline_validation:
+      type: grafana_service_account
+"#;
+        let rules = parse_yaml_rules(yaml).expect("parse grafana_service_account");
+        assert_eq!(
+            rules[0].offline_validation,
+            Some(OfflineValidationSpec::GrafanaServiceAccount)
+        );
+    }
+
+    #[test]
+    fn parse_offline_validation_aws_access_key() {
+        let yaml = r#"
+rules:
+  - name: "ov-aws"
+    regex: 'AKIA[0-9A-Z]{16}'
+    anchors: ["AKIA"]
+    radius: 32
+    offline_validation:
+      type: aws_access_key
+"#;
+        let rules = parse_yaml_rules(yaml).expect("parse aws_access_key");
+        assert_eq!(
+            rules[0].offline_validation,
+            Some(OfflineValidationSpec::AwsAccessKey)
+        );
+    }
+
+    #[test]
+    fn parse_offline_validation_sentry_org_token() {
+        let yaml = r#"
+rules:
+  - name: "ov-sentry"
+    regex: 'sntrys_[A-Za-z0-9+/=]{64,}'
+    anchors: ["sntrys_"]
+    radius: 128
+    offline_validation:
+      type: sentry_org_token
+"#;
+        let rules = parse_yaml_rules(yaml).expect("parse sentry_org_token");
+        assert_eq!(
+            rules[0].offline_validation,
+            Some(OfflineValidationSpec::SentryOrgToken)
+        );
+    }
+
+    #[test]
+    fn parse_offline_validation_absent_yields_none() {
+        let yaml = r#"
+rules:
+  - name: "no-ov"
+    regex: 'tok_[a-z0-9]{8}'
+    anchors: ["tok_"]
+    radius: 64
+"#;
+        let rules = parse_yaml_rules(yaml).expect("parse rule without offline_validation");
+        assert!(rules[0].offline_validation.is_none());
+    }
+
+    #[test]
+    fn parse_offline_validation_unknown_type_fails() {
+        let yaml = r#"
+rules:
+  - name: "ov-bad"
+    regex: 'tok_[a-z0-9]{8}'
+    anchors: ["tok_"]
+    radius: 64
+    offline_validation:
+      type: nonexistent_algo
+"#;
+        match parse_yaml_rules(yaml) {
+            Err(RulesError::OfflineValidation { rule_name, message }) => {
+                assert_eq!(rule_name, "ov-bad");
+                assert!(
+                    message.contains("nonexistent_algo"),
+                    "error should mention the unknown type: {message}"
+                );
+            }
+            other => panic!("expected OfflineValidation error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_offline_validation_crc32_missing_payload_len_fails() {
+        let yaml = r#"
+rules:
+  - name: "ov-incomplete"
+    regex: 'tok_[a-z0-9]{40}'
+    anchors: ["tok_"]
+    radius: 64
+    offline_validation:
+      type: crc32_base62
+      prefix_skip: 4
+      checksum_len: 6
+"#;
+        match parse_yaml_rules(yaml) {
+            Err(RulesError::OfflineValidation { rule_name, message }) => {
+                assert_eq!(rule_name, "ov-incomplete");
+                assert!(
+                    message.contains("payload_len"),
+                    "error should mention missing field: {message}"
+                );
+            }
+            other => panic!("expected OfflineValidation error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_offline_validation_crc32_missing_prefix_skip_fails() {
+        let yaml = r#"
+rules:
+  - name: "ov-no-prefix"
+    regex: 'tok_[a-z0-9]{40}'
+    anchors: ["tok_"]
+    radius: 64
+    offline_validation:
+      type: crc32_base62
+      payload_len: 30
+      checksum_len: 6
+"#;
+        match parse_yaml_rules(yaml) {
+            Err(RulesError::OfflineValidation { rule_name, message }) => {
+                assert_eq!(rule_name, "ov-no-prefix");
+                assert!(
+                    message.contains("prefix_skip"),
+                    "error should mention missing field: {message}"
+                );
+            }
+            other => panic!("expected OfflineValidation error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_offline_validation_crc32_missing_checksum_len_fails() {
+        let yaml = r#"
+rules:
+  - name: "ov-no-crc"
+    regex: 'tok_[a-z0-9]{40}'
+    anchors: ["tok_"]
+    radius: 64
+    offline_validation:
+      type: crc32_base62
+      prefix_skip: 4
+      payload_len: 30
+"#;
+        match parse_yaml_rules(yaml) {
+            Err(RulesError::OfflineValidation { rule_name, message }) => {
+                assert_eq!(rule_name, "ov-no-crc");
+                assert!(
+                    message.contains("checksum_len"),
+                    "error should mention missing field: {message}"
+                );
+            }
+            other => panic!("expected OfflineValidation error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_offline_validation_crc32_base62() {
+        let yaml = r#"
+rules:
+  - name: "rt-crc32"
+    regex: 'tok_[a-z0-9]{40}'
+    anchors: ["tok_"]
+    radius: 64
+    offline_validation:
+      type: crc32_base62
+      prefix_skip: 4
+      payload_len: 30
+      checksum_len: 6
+"#;
+        let original = parse_yaml_rules(yaml).expect("parse");
+        let yaml_rules: Vec<YamlRule> = original.iter().map(rulespec_to_yaml).collect();
+        let file = YamlRulesFile { rules: yaml_rules };
+        let yaml_str = serde_yml::to_string(&file).expect("serialize");
+        let parsed = parse_yaml_rules(&yaml_str).expect("re-parse");
+        assert_eq!(original[0].offline_validation, parsed[0].offline_validation);
+    }
+
+    #[test]
+    fn roundtrip_offline_validation_unit_variants() {
+        let yaml = r#"
+rules:
+  - name: "rt-ghpat"
+    regex: 'github_pat_[A-Za-z0-9_]{82}'
+    anchors: ["github_pat_"]
+    radius: 128
+    offline_validation:
+      type: github_fine_grained_pat
+  - name: "rt-grafana"
+    regex: 'glsa_[A-Za-z0-9]{32}_[a-f0-9]{8}'
+    anchors: ["glsa_"]
+    radius: 64
+    offline_validation:
+      type: grafana_service_account
+  - name: "rt-aws"
+    regex: 'AKIA[0-9A-Z]{16}'
+    anchors: ["AKIA"]
+    radius: 32
+    offline_validation:
+      type: aws_access_key
+  - name: "rt-sentry"
+    regex: 'sntrys_[A-Za-z0-9+/=]{64,}'
+    anchors: ["sntrys_"]
+    radius: 128
+    offline_validation:
+      type: sentry_org_token
+"#;
+        let original = parse_yaml_rules(yaml).expect("parse");
+        let yaml_rules: Vec<YamlRule> = original.iter().map(rulespec_to_yaml).collect();
+        let file = YamlRulesFile { rules: yaml_rules };
+        let yaml_str = serde_yml::to_string(&file).expect("serialize");
+        let parsed = parse_yaml_rules(&yaml_str).expect("re-parse");
+
+        for (orig, reparsed) in original.iter().zip(parsed.iter()) {
+            assert_eq!(
+                orig.offline_validation, reparsed.offline_validation,
+                "round-trip mismatch for {}",
+                orig.name
+            );
         }
     }
 }
