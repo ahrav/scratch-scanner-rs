@@ -559,8 +559,10 @@ impl Engine {
     ///
     /// # Behavior
     /// Applies the same gate order as the raw path (confirm/keyword/must-contain,
-    /// assignment-shape, regex, entropy, value suppressor, local context) while
-    /// enforcing UTF-16 decode budgets.
+    /// assignment-shape, regex, entropy, value suppressor, local context,
+    /// offline validation) while enforcing UTF-16 decode budgets. Offline
+    /// validation uses the parent `step_id` (not `utf16_step_id`) so that
+    /// root-level UTF-16 findings are correctly identified as root-semantic.
     ///
     #[allow(clippy::too_many_arguments)]
     fn run_rule_on_utf16_window_aligned(
@@ -1254,8 +1256,25 @@ impl Engine {
 
     /// Returns `true` if offline structural validation suppresses this finding.
     ///
-    /// Only root-semantic findings (`parent_step_id == STEP_ROOT`) are checked.
-    /// For UTF-16 paths, pass the parent step_id (not `utf16_step_id`).
+    /// Only root-semantic findings (`parent_step_id == STEP_ROOT`) are checked;
+    /// transform-derived findings (parent != `STEP_ROOT`) are unconditionally
+    /// kept because their secret bytes reference decoded buffers, not the
+    /// original input.
+    ///
+    /// For UTF-16 paths, callers must pass the **parent** `step_id` (not
+    /// `utf16_step_id`), because root-level UTF-16 findings carry a
+    /// `Utf16Window` decode step as their own `step_id` while their parent
+    /// is `STEP_ROOT`.
+    ///
+    /// Suppression requires two conditions:
+    /// 1. The validator returns [`OfflineVerdict::Invalid`] (positive proof of
+    ///    structural failure — bad CRC, invalid charset, etc.).
+    /// 2. The spec's [`suppresses_on_invalid`](OfflineValidationSpec::suppresses_on_invalid)
+    ///    flag is set.
+    ///
+    /// [`Valid`](OfflineVerdict::Valid) and [`Indeterminate`](OfflineVerdict::Indeterminate)
+    /// verdicts always pass through — only definitive structural failure triggers
+    /// suppression.
     #[inline(always)]
     fn offline_validation_suppresses(
         &self,
