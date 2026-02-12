@@ -1011,8 +1011,10 @@ impl Engine {
     /// Returns whether a root finding should be suppressed by the global safelist.
     ///
     /// `root_hint_start`/`root_hint_end` are absolute file offsets in the same
-    /// coordinate space as `context_base_offset`.
-    #[inline(always)]
+    /// coordinate space as `context_base_offset`. `last_decision` is a single-entry
+    /// cache scoped to one `for_each_capture_match` invocation; consecutive matches
+    /// that rebase to the same `(start, end)` slice reuse the previous result.
+    #[inline]
     pub(super) fn suppress_root_finding_by_safelist(
         &self,
         context_buf: &[u8],
@@ -1022,6 +1024,11 @@ impl Engine {
         root_hint_end: u64,
         last_decision: &mut Option<(u64, u64, bool)>,
     ) -> bool {
+        debug_assert!(
+            root_hint_start <= root_hint_end,
+            "root_hint range is backwards: {root_hint_start}..{root_hint_end}",
+        );
+
         if step_id != STEP_ROOT {
             return false;
         }

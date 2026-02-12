@@ -49,6 +49,8 @@ Input: Window [w.start..w.end) in buffer
   ↓
 [Gate 8] Apply local context checks (bounded, fail-open)
   ↓
+[Gate 9] Apply root-context safelist suppression (emit-time, root findings only)
+  ↓
 Output: FindingRec with spans in appropriate coordinate space
 ```
 

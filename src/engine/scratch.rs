@@ -1494,6 +1494,16 @@ impl ScanScratch {
         }
 
         if self.out.len() < self.max_findings {
+            debug_assert!(
+                self.norm_hash.len() < self.norm_hash.capacity()
+                    && self.drop_hint_end.len() < self.drop_hint_end.capacity(),
+                "sidecar vector capacity desynced from max_findings ({}) -- \
+                 out cap={}, norm_hash cap={}, drop_hint_end cap={}",
+                self.max_findings,
+                self.out.capacity(),
+                self.norm_hash.capacity(),
+                self.drop_hint_end.capacity(),
+            );
             self.out.push(rec);
             self.norm_hash.push(norm_hash);
             self.drop_hint_end.push(drop_hint_end);

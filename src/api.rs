@@ -869,7 +869,7 @@ mod tests {
 /// # Trade-offs
 /// - Window coalescing limits bound CPU cost but may widen validation windows.
 /// - Decode/work-item caps can skip derived buffers when exceeded.
-/// - `max_findings_per_chunk` is enforced after post-scan suppression.
+/// - `max_findings_per_chunk` is enforced at finding insertion time.
 #[derive(Clone, Debug)]
 pub struct Tuning {
     /// Window merge gap in bytes when coalescing adjacent anchor hits.

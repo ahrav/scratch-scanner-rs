@@ -1219,7 +1219,7 @@ rules:
 
     /// Regression test for PR #43 review comment:
     /// Reviewer claimed URL text could trigger the "example" suppressor and
-    /// hide a real bearer token. With post-scan safelist enabled, `example`
+    /// hide a real bearer token. With emit-time safelist enabled, `example`
     /// hosts are intentionally suppressed; this test uses a non-safelisted
     /// host to keep value suppressor behavior isolated.
     #[test]
