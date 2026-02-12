@@ -20,6 +20,13 @@
 //! 4. Run the source driver (FS or Git), which emits `Finding` /
 //!    `Progress` events through the sink.
 //! 5. Emit a final `Summary` event and call `sink.flush()`.
+//!
+//! # Output Contract
+//!
+//! - Structured events are written to stdout via [`EventSink`].
+//! - Human-readable and machine-parseable `key=value` summaries are written
+//!   to stderr on successful FS/Git scans for backward-compatible tooling.
+//! - Fatal configuration failures exit with status code `2`.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -353,6 +360,9 @@ fn run_fs(
 }
 
 /// Parse `in-pack` object count from `git count-objects -v` output.
+///
+/// Accepts surrounding whitespace and returns the first `in-pack:` entry.
+/// Returns `None` when the field is missing or not a valid `u64`.
 fn parse_in_pack_object_count(text: &str) -> Option<u64> {
     text.lines().find_map(|line| {
         let rest = line.trim().strip_prefix("in-pack:")?;
@@ -362,7 +372,13 @@ fn parse_in_pack_object_count(text: &str) -> Option<u64> {
 
 /// Return `in-pack` object count for the repository.
 ///
-/// Falls back to caller-chosen defaults if this probe fails.
+/// This probe is advisory and used only for worker auto-sizing. Callers
+/// should fall back to deterministic defaults when it fails.
+///
+/// # Errors
+///
+/// Returns an error when `git` invocation fails, exits non-zero, or the
+/// expected `in-pack:` field is absent.
 fn probe_in_pack_object_count(repo_root: &Path) -> io::Result<u64> {
     let output = std::process::Command::new("git")
         .arg("-C")
@@ -387,6 +403,10 @@ fn probe_in_pack_object_count(repo_root: &Path) -> io::Result<u64> {
 /// resolves the start set via `git` CLI commands, and runs the scan.
 /// Findings stream through the [`EventSink`](super::events::EventSink);
 /// summary + optional debug/perf output goes to stderr.
+///
+/// `pack_exec_workers` is auto-sized from `git count-objects -v` when the
+/// CLI does not provide an explicit value; probe failures fall back to the
+/// static defaults from [`GitScanConfig::default`].
 ///
 /// Calls `process::exit(2)` on fatal errors (rule loading, config overflow,
 /// scan failure) rather than returning an error, matching the CLI exit-code
@@ -743,7 +763,10 @@ fn run_store_command(cmd: StoreCommand) -> io::Result<()> {
     Ok(())
 }
 
-/// Map a numeric status code to a human-readable label.
+/// Map a persisted run/secret status code to a human-readable label.
+///
+/// Values mirror store schema query outputs. Unknown values map to
+/// `"unknown"` for forward compatibility with newer schema versions.
 fn status_label(status: i32) -> &'static str {
     match status {
         0 => "active",
@@ -755,6 +778,11 @@ fn status_label(status: i32) -> &'static str {
     }
 }
 
+/// Serialize a value as a single-line JSON document to stdout.
+///
+/// # Errors
+///
+/// Returns an error if serialization fails.
 fn print_json<T: serde::Serialize>(value: &T) -> io::Result<()> {
     let encoded = serde_json::to_string(value)
         .map_err(|e| io::Error::other(format!("json encode failed: {e}")))?;

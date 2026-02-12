@@ -254,12 +254,24 @@ fn detected_parallelism() -> usize {
 
 /// Repositories below this `in-pack` object count use the baseline 1× core
 /// multiplier for pack execution.
+///
+/// Boundary is exclusive (`< SMALL`).
 pub(crate) const PACK_EXEC_SMALL_REPO_MAX_IN_PACK_OBJECTS: u64 = 100_000;
 /// Repositories below this `in-pack` object count (and above small) use the
 /// medium 3× core multiplier for pack execution.
+///
+/// Boundary is exclusive (`< MEDIUM`), so values `>= MEDIUM` use the large tier.
 pub(crate) const PACK_EXEC_MEDIUM_REPO_MAX_IN_PACK_OBJECTS: u64 = 2_000_000;
 
 /// Compute the pack-exec worker multiplier from repository `in-pack` size.
+///
+/// Tier ranges:
+/// - `[0, SMALL)` -> `1`
+/// - `[SMALL, MEDIUM)` -> `3`
+/// - `[MEDIUM, +inf)` -> `4`
+///
+/// Larger repositories intentionally over-subscribe cores to better hide
+/// pack I/O and page-fault latency during decode + scan.
 #[inline(always)]
 pub(crate) fn pack_exec_worker_multiplier_for_in_pack(in_pack_objects: u64) -> usize {
     if in_pack_objects < PACK_EXEC_SMALL_REPO_MAX_IN_PACK_OBJECTS {
@@ -278,6 +290,9 @@ pub(crate) fn auto_pack_exec_workers_for_in_pack(in_pack_objects: u64) -> usize 
 }
 
 /// Auto-size pack-exec workers from repository `in-pack` size and caller-provided cores.
+///
+/// `cores` is clamped to at least `1`, and multiplication is saturating to
+/// prevent overflow if a caller passes an extreme core count in tests.
 #[inline(always)]
 pub(crate) fn auto_pack_exec_workers_for_in_pack_with_cores(
     in_pack_objects: u64,
@@ -300,6 +315,10 @@ fn default_blob_intro_workers() -> usize {
 }
 
 /// Emits all identity dictionary entries before any `CommitMeta` events.
+///
+/// Ordering is significant: consumers can resolve identity IDs in subsequent
+/// commit metadata only if this dictionary is emitted first. Entries are
+/// emitted in intern ID order (`0..N`) as provided by [`IdentityInterner::iter`].
 fn emit_identity_dictionary(
     sink: &dyn crate::unified::events::EventSink,
     interner: &IdentityInterner,
@@ -1041,6 +1060,15 @@ impl From<ArtifactAcquireError> for GitScanError {
 /// Missing or corrupt maintenance artifacts (commit-graph, MIDX) surface as
 /// `GitScanError::CommitPlan` or `GitScanError::Midx`.
 ///
+/// # Artifact stability checks
+///
+/// Artifact stability is validated twice:
+/// 1. Immediately after MIDX acquisition (before expensive traversal).
+/// 2. After mode execution, before finalize/persist.
+///
+/// This avoids persisting results derived from pack offsets that changed
+/// while the scan was in flight (for example due to concurrent `git gc`).
+///
 /// # Commit-meta emission
 ///
 /// A [`CommitGraphIndex`] and shared [`AtomicBitSet`] are constructed from
@@ -1161,6 +1189,8 @@ pub fn run_git_scan(
 
     // Finalize + persist.
     let refs = build_ref_entries(&repo);
+    // Finalize uses only candidate OIDs for watermark/progress semantics;
+    // reason taxonomy remains in the report payload.
     let skipped_candidate_oids = output
         .skipped_candidates
         .iter()
