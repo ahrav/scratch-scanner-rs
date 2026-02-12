@@ -72,7 +72,7 @@ mod work_items;
 
 // Core engine and scratch modules
 mod core;
-mod offline_validate;
+pub(crate) mod offline_validate;
 mod scratch;
 
 // Scanning implementation modules (Engine impl extensions)

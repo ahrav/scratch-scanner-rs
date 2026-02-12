@@ -262,7 +262,10 @@ fn with_rule_atoms<T>(f: impl FnOnce(&mut RuleAtomPool) -> T) -> T {
 
 /// Convert a [`YamlOfflineValidation`] into an [`OfflineValidationSpec`].
 ///
-/// Returns an error for unknown type strings or missing required parameters.
+/// The `crc32_base62` type requires all three numeric parameters (`prefix_skip`,
+/// `payload_len`, `checksum_len`); all other types are unit variants that need
+/// only the `type` selector. Returns an error for unknown type strings or
+/// missing required parameters.
 fn yaml_offline_to_spec(
     rule_name: &str,
     ov: YamlOfflineValidation,
@@ -419,7 +422,7 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::ValidatorKind;
+    use crate::api::{OfflineVerdict, ValidatorKind};
     use crate::rules::builtin_rules;
     use crate::{demo_tuning, AnchorPolicy, Engine, Finding};
     use std::path::Path;
@@ -2123,6 +2126,148 @@ rules:
                 orig.name
             );
         }
+    }
+
+    // ---- default_rules.yaml offline validation spec assertions ----
+
+    #[test]
+    fn default_rules_offline_validation_specs() {
+        let rules = builtin_rules();
+        let find = |name: &str| -> &RuleSpec {
+            rules
+                .iter()
+                .find(|r| r.name == name)
+                .unwrap_or_else(|| panic!("missing rule: {name}"))
+        };
+
+        let crc32_spec = OfflineValidationSpec::Crc32Base62 {
+            prefix_skip: 4,
+            payload_len: 30,
+            checksum_len: 6,
+        };
+
+        // CRC32/Base62 rules (5 rules sharing the same token format).
+        for rule_name in [
+            "github-pat",
+            "github-oauth",
+            "github-app-token",
+            "github-refresh-token",
+            "npm-access-token",
+        ] {
+            assert_eq!(
+                find(rule_name).offline_validation,
+                Some(crc32_spec),
+                "{rule_name} should have crc32_base62 offline validation"
+            );
+        }
+
+        // Unit-variant rules.
+        assert_eq!(
+            find("github-fine-grained-pat").offline_validation,
+            Some(OfflineValidationSpec::GithubFinegrainedPat),
+        );
+        assert_eq!(
+            find("grafana-service-account-token").offline_validation,
+            Some(OfflineValidationSpec::GrafanaServiceAccount),
+        );
+        assert_eq!(
+            find("aws-access-token").offline_validation,
+            Some(OfflineValidationSpec::AwsAccessKey),
+        );
+        assert_eq!(
+            find("sentry-org-token").offline_validation,
+            Some(OfflineValidationSpec::SentryOrgToken),
+        );
+
+        // Unrelated rules should have no offline validation.
+        assert_eq!(
+            find("generic-api-key").offline_validation,
+            None,
+            "generic-api-key should not have offline validation"
+        );
+    }
+
+    // ---- offline validation rejection with default_rules.yaml specs ----
+
+    #[test]
+    fn default_rules_offline_validators_reject_bad_tokens() {
+        use crate::engine::offline_validate;
+
+        let rules = builtin_rules();
+        let find = |name: &str| -> &RuleSpec {
+            rules
+                .iter()
+                .find(|r| r.name == name)
+                .unwrap_or_else(|| panic!("missing rule: {name}"))
+        };
+
+        // CRC32/Base62 rules: token matches regex format but checksum is wrong.
+        // 4-char prefix + 30 alphanumeric payload + 6 wrong checksum = 40 chars.
+        let bad_crc32_token = b"ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcd000000";
+        for rule_name in [
+            "github-pat",
+            "github-oauth",
+            "github-app-token",
+            "github-refresh-token",
+            "npm-access-token",
+        ] {
+            let spec = find(rule_name)
+                .offline_validation
+                .expect("should have offline_validation");
+            let verdict = offline_validate::validate(spec, bad_crc32_token);
+            assert_eq!(
+                verdict,
+                OfflineVerdict::Invalid,
+                "{rule_name}: bad CRC32 token should be rejected"
+            );
+        }
+
+        // GitHub fine-grained PAT: valid prefix but wrong checksum.
+        let mut bad_ghpat = Vec::with_capacity(93);
+        bad_ghpat.extend_from_slice(b"github_pat_");
+        bad_ghpat.extend_from_slice(&[b'A'; 76]);
+        bad_ghpat.extend_from_slice(b"000000"); // wrong checksum
+        assert_eq!(bad_ghpat.len(), 93);
+        let spec = find("github-fine-grained-pat").offline_validation.unwrap();
+        assert_eq!(
+            offline_validate::validate(spec, &bad_ghpat),
+            OfflineVerdict::Invalid,
+        );
+
+        // Grafana: valid prefix but wrong hex checksum.
+        let mut bad_grafana = Vec::new();
+        bad_grafana.extend_from_slice(b"glsa_");
+        bad_grafana.extend_from_slice(&[b'a'; 32]);
+        bad_grafana.push(b'_');
+        bad_grafana.extend_from_slice(b"deadbeef"); // wrong CRC
+        let spec = find("grafana-service-account-token")
+            .offline_validation
+            .unwrap();
+        assert_eq!(
+            offline_validate::validate(spec, &bad_grafana),
+            OfflineVerdict::Invalid,
+        );
+
+        // AWS: lowercase chars in suffix → invalid.
+        let bad_aws = b"AKIAiosfodnn7example";
+        let spec = find("aws-access-token").offline_validation.unwrap();
+        assert_eq!(
+            offline_validate::validate(spec, bad_aws),
+            OfflineVerdict::Invalid,
+        );
+
+        // Sentry: payload decodes to non-JSON → invalid.
+        let mut bad_sentry = Vec::new();
+        bad_sentry.extend_from_slice(b"sntrys_");
+        // Base64 of "not_json_at_all_here" = "bm90X2pzb25fYXRfYWxsX2hlcmU="
+        bad_sentry.extend_from_slice(b"bm90X2pzb25fYXRfYWxsX2hlcmU=");
+        bad_sentry.push(b'_');
+        bad_sentry.extend_from_slice(&[b'A'; 43]);
+        let spec = find("sentry-org-token").offline_validation.unwrap();
+        assert_eq!(
+            offline_validate::validate(spec, &bad_sentry),
+            OfflineVerdict::Invalid,
+        );
     }
 }
 

@@ -1,3 +1,6 @@
+// Engine wiring (.6) will call `validate` from the post-scan filter path.
+// Until then, all non-bench public items are only exercised by tests.
+#![allow(dead_code)]
 //! Offline structural validation for extracted secrets.
 //!
 //! Each validator runs a deterministic, network-free check on secret bytes
@@ -30,7 +33,7 @@ use crate::api::{OfflineValidationSpec, OfflineVerdict};
 /// Called by the post-scan filter when a rule has an `offline_validation` gate.
 /// Returns [`OfflineVerdict::Valid`], [`Invalid`](OfflineVerdict::Invalid),
 /// or [`Indeterminate`](OfflineVerdict::Indeterminate).
-pub(super) fn validate(spec: OfflineValidationSpec, secret: &[u8]) -> OfflineVerdict {
+pub(crate) fn validate(spec: OfflineValidationSpec, secret: &[u8]) -> OfflineVerdict {
     match spec {
         OfflineValidationSpec::Crc32Base62 {
             prefix_skip,
