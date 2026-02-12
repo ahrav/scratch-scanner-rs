@@ -352,6 +352,35 @@ fn run_fs(
     Ok(())
 }
 
+/// Parse `in-pack` object count from `git count-objects -v` output.
+fn parse_in_pack_object_count(text: &str) -> Option<u64> {
+    text.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("in-pack:")?;
+        rest.trim().parse::<u64>().ok()
+    })
+}
+
+/// Return `in-pack` object count for the repository.
+///
+/// Falls back to caller-chosen defaults if this probe fails.
+fn probe_in_pack_object_count(repo_root: &Path) -> io::Result<u64> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["count-objects", "-v"])
+        .output()
+        .map_err(|e| io::Error::other(format!("failed to run git count-objects: {e}")))?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "git count-objects failed with status {}",
+            output.status
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_in_pack_object_count(&stdout)
+        .ok_or_else(|| io::Error::other("missing in-pack entry in git count-objects output"))
+}
+
 /// Git scan path — delegates to [`run_git_scan`].
 ///
 /// Builds the engine, configures persistence stores (in-memory for CLI),
@@ -425,6 +454,12 @@ fn run_git(
     let seen_store = NeverSeenStore;
     let watermark_store = EmptyWatermarkStore;
     let persist_store = InMemoryPersistenceStore::default();
+    let pack_exec_workers = cfg.pack_exec_workers.unwrap_or_else(|| {
+        probe_in_pack_object_count(&cfg.repo_root)
+            .ok()
+            .map(git_scan::auto_pack_exec_workers_for_in_pack)
+            .unwrap_or(base_config.pack_exec_workers)
+    });
 
     let mut config = GitScanConfig {
         scan_mode: cfg.scan_mode,
@@ -432,9 +467,7 @@ fn run_git(
         merge_diff_mode: cfg.merge_mode,
         start_set: start_set.clone(),
         policy_hash: policy,
-        pack_exec_workers: cfg
-            .pack_exec_workers
-            .unwrap_or(base_config.pack_exec_workers),
+        pack_exec_workers,
         ..base_config
     };
     if let Some(bytes) = tree_delta_cache_bytes {
@@ -1242,6 +1275,18 @@ mod tests {
         assert_eq!(format_human_bytes(1536), "1.50KiB");
         assert_eq!(format_human_bytes(1024 * 1024), "1.00MiB");
         assert_eq!(format_human_bytes(1024 * 1024 * 1024), "1.00GiB");
+    }
+
+    #[test]
+    fn parse_in_pack_object_count_extracts_value() {
+        let text = "count: 0\nsize: 0\nin-pack: 11278814\npacks: 241\n";
+        assert_eq!(parse_in_pack_object_count(text), Some(11_278_814));
+    }
+
+    #[test]
+    fn parse_in_pack_object_count_handles_missing_or_invalid_value() {
+        assert_eq!(parse_in_pack_object_count("count: 0\npacks: 1\n"), None);
+        assert_eq!(parse_in_pack_object_count("in-pack: not-a-number\n"), None);
     }
 
     /// The pool buffer sizing formula must satisfy the assertion floor

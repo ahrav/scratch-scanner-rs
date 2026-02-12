@@ -235,20 +235,56 @@ impl Default for GitScanConfig {
     }
 }
 
-/// Per-worker pack exec thread budget.
+/// Baseline pack-exec worker budget.
 ///
-/// Oversubscribes 2× cores to mask IO latency (page faults from mmap'd
-/// packs interleave with inflate + scan compute). Capped at 24 to avoid
-/// memory-bandwidth collapse on large machines where inflate throughput
-/// saturates. Floor of 12 ensures sufficient parallelism even on
-/// low-core-count machines (e.g., CI runners).
+/// Uses detected hardware parallelism (1× cores). CLI orchestration may
+/// scale this baseline using repository-size heuristics.
 fn default_pack_exec_workers() -> usize {
-    let parallelism = std::thread::available_parallelism()
+    detected_parallelism()
+}
+
+/// Returns detected hardware parallelism, falling back to 1.
+#[inline(always)]
+fn detected_parallelism() -> usize {
+    std::thread::available_parallelism()
         .map(|count| count.get())
-        .unwrap_or(1);
-    let doubled = parallelism.saturating_mul(2);
-    let capped = if doubled > 24 { 24 } else { doubled };
-    capped.max(12)
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// Repositories below this `in-pack` object count use the baseline 1× core
+/// multiplier for pack execution.
+pub(crate) const PACK_EXEC_SMALL_REPO_MAX_IN_PACK_OBJECTS: u64 = 100_000;
+/// Repositories below this `in-pack` object count (and above small) use the
+/// medium 3× core multiplier for pack execution.
+pub(crate) const PACK_EXEC_MEDIUM_REPO_MAX_IN_PACK_OBJECTS: u64 = 2_000_000;
+
+/// Compute the pack-exec worker multiplier from repository `in-pack` size.
+#[inline(always)]
+pub(crate) fn pack_exec_worker_multiplier_for_in_pack(in_pack_objects: u64) -> usize {
+    if in_pack_objects < PACK_EXEC_SMALL_REPO_MAX_IN_PACK_OBJECTS {
+        1
+    } else if in_pack_objects < PACK_EXEC_MEDIUM_REPO_MAX_IN_PACK_OBJECTS {
+        3
+    } else {
+        4
+    }
+}
+
+/// Auto-size pack-exec workers from repository `in-pack` size and detected cores.
+#[inline(always)]
+pub(crate) fn auto_pack_exec_workers_for_in_pack(in_pack_objects: u64) -> usize {
+    auto_pack_exec_workers_for_in_pack_with_cores(in_pack_objects, detected_parallelism())
+}
+
+/// Auto-size pack-exec workers from repository `in-pack` size and caller-provided cores.
+#[inline(always)]
+pub(crate) fn auto_pack_exec_workers_for_in_pack_with_cores(
+    in_pack_objects: u64,
+    cores: usize,
+) -> usize {
+    let multiplier = pack_exec_worker_multiplier_for_in_pack(in_pack_objects);
+    cores.max(1).saturating_mul(multiplier)
 }
 
 /// Blob-intro worker count.
@@ -1180,6 +1216,51 @@ mod tests {
     #[test]
     fn default_scan_mode_matches_config_default() {
         assert_eq!(GitScanConfig::default().scan_mode, GitScanMode::default());
+    }
+
+    #[test]
+    fn auto_pack_exec_workers_uses_in_pack_tiers() {
+        assert_eq!(auto_pack_exec_workers_for_in_pack_with_cores(0, 12), 12);
+        assert_eq!(
+            auto_pack_exec_workers_for_in_pack_with_cores(
+                PACK_EXEC_SMALL_REPO_MAX_IN_PACK_OBJECTS - 1,
+                12
+            ),
+            12
+        );
+        assert_eq!(
+            auto_pack_exec_workers_for_in_pack_with_cores(
+                PACK_EXEC_SMALL_REPO_MAX_IN_PACK_OBJECTS,
+                12
+            ),
+            36
+        );
+        assert_eq!(
+            auto_pack_exec_workers_for_in_pack_with_cores(
+                PACK_EXEC_MEDIUM_REPO_MAX_IN_PACK_OBJECTS - 1,
+                12
+            ),
+            36
+        );
+        assert_eq!(
+            auto_pack_exec_workers_for_in_pack_with_cores(
+                PACK_EXEC_MEDIUM_REPO_MAX_IN_PACK_OBJECTS,
+                12
+            ),
+            48
+        );
+    }
+
+    #[test]
+    fn auto_pack_exec_workers_clamps_cores_to_one() {
+        assert_eq!(auto_pack_exec_workers_for_in_pack_with_cores(0, 0), 1);
+        assert_eq!(
+            auto_pack_exec_workers_for_in_pack_with_cores(
+                PACK_EXEC_SMALL_REPO_MAX_IN_PACK_OBJECTS,
+                0
+            ),
+            3
+        );
     }
 
     #[test]
