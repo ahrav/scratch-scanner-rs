@@ -1050,6 +1050,411 @@ fn value_suppressor_absent_does_not_change_behavior() {
 }
 
 #[test]
+fn safelist_post_scan_filter_suppresses_root_finding() {
+    let rule = RuleSpec {
+        name: "safelist-root-filter",
+        anchors: &[b"token"],
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        local_context: None,
+        secret_group: None,
+        re: Regex::new(r"(?:placeholder_token|prod_token_[A-Z0-9]{6})").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let mut scratch = engine.new_scratch();
+    let hay = b"placeholder_token prod_token_A1B2C3";
+    engine.scan_chunk_into(hay, FileId(0), 0, &mut scratch);
+
+    let recs = scratch.findings();
+    assert_eq!(
+        recs.len(),
+        1,
+        "expected safelist post-filter to suppress placeholder root finding"
+    );
+    assert_eq!(
+        recs.len(),
+        scratch.norm_hashes().len(),
+        "norm_hash sidecar must stay aligned after post-filter compaction"
+    );
+    assert_eq!(
+        recs.len(),
+        scratch.drop_hint_end().len(),
+        "drop_hint_end sidecar must stay aligned after post-filter compaction"
+    );
+
+    let rec = recs[0];
+    assert_eq!(rec.step_id, STEP_ROOT, "remaining finding should be root");
+    let span = rec.span_start as usize..rec.span_end as usize;
+    assert_eq!(&hay[span], b"prod_token_A1B2C3");
+    assert_eq!(
+        scratch.safelist_suppressed(),
+        1,
+        "safelist_suppressed counter should track suppressed root findings"
+    );
+}
+
+#[test]
+fn safelist_post_scan_filter_keeps_non_root_findings() {
+    let rule = RuleSpec {
+        name: "safelist-mixed-root-non-root",
+        anchors: &[b"placeholder_token"],
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        local_context: None,
+        secret_group: None,
+        re: Regex::new(r"placeholder_token").unwrap(),
+    };
+    let transforms = vec![TransformConfig {
+        id: TransformId::Base64,
+        mode: TransformMode::Always,
+        gate: Gate::AnchorsInDecoded,
+        min_len: 8,
+        max_spans_per_buffer: 8,
+        max_encoded_len: 1024,
+        max_decoded_bytes: 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    }];
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        transforms,
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let mut scratch = engine.new_scratch();
+    let hay = b"placeholder_token cGxhY2Vob2xkZXJfdG9rZW4=";
+    engine.scan_chunk_into(hay, FileId(0), 0, &mut scratch);
+
+    let recs = scratch.findings();
+    assert_eq!(
+        recs.len(),
+        1,
+        "expected root finding suppression while preserving decoded non-root finding"
+    );
+    assert_ne!(
+        recs[0].step_id, STEP_ROOT,
+        "non-root findings must bypass safelist suppression in post-filter"
+    );
+    assert_eq!(
+        recs.len(),
+        scratch.norm_hashes().len(),
+        "norm_hash sidecar must stay aligned after mixed compaction"
+    );
+    assert_eq!(
+        recs.len(),
+        scratch.drop_hint_end().len(),
+        "drop_hint_end sidecar must stay aligned after mixed compaction"
+    );
+}
+
+#[test]
+fn safelist_suppression_does_not_consume_findings_cap() {
+    let rule = RuleSpec {
+        name: "safelist-cap-ordering",
+        anchors: &[b"token"],
+        radius: 128,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        local_context: None,
+        secret_group: None,
+        re: Regex::new(r"(?:placeholder_token|prod_token_[A-Z0-9]{6})").unwrap(),
+    };
+
+    let mut tuning = demo_tuning();
+    tuning.max_findings_per_chunk = 2;
+
+    let engine =
+        Engine::new_with_anchor_policy(vec![rule], Vec::new(), tuning, AnchorPolicy::ManualOnly);
+
+    let mut scratch = engine.new_scratch();
+    let hay = b"placeholder_token placeholder_token placeholder_token prod_token_A1B2C3";
+    engine.scan_chunk_into(hay, FileId(0), 0, &mut scratch);
+
+    let recs = scratch.findings();
+    assert_eq!(
+        recs.len(),
+        1,
+        "safelisted roots should not consume finding capacity ahead of real findings"
+    );
+    let span = recs[0].span_start as usize..recs[0].span_end as usize;
+    assert_eq!(&hay[span], b"prod_token_A1B2C3");
+    assert_eq!(
+        scratch.dropped_findings(),
+        0,
+        "suppressed safelist findings should not be counted as dropped findings"
+    );
+}
+
+#[test]
+fn safelist_post_scan_filter_noop_keeps_all_non_safelisted_roots() {
+    let rule = RuleSpec {
+        name: "safelist-noop-root",
+        anchors: &[b"prod_token_"],
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        local_context: None,
+        secret_group: None,
+        re: Regex::new(r"prod_token_[A-Z0-9]{6}").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let mut scratch = engine.new_scratch();
+    let hay = b"prod_token_A1B2C3 prod_token_D4E5F6";
+    engine.scan_chunk_into(hay, FileId(0), 0, &mut scratch);
+
+    let recs = scratch.findings();
+    assert_eq!(
+        recs.len(),
+        2,
+        "non-safelisted roots should not be suppressed"
+    );
+    assert_eq!(
+        recs.len(),
+        scratch.norm_hashes().len(),
+        "norm_hash sidecar must stay aligned on no-op post-filter path"
+    );
+    assert_eq!(
+        recs.len(),
+        scratch.drop_hint_end().len(),
+        "drop_hint_end sidecar must stay aligned on no-op post-filter path"
+    );
+    for rec in recs {
+        assert_eq!(rec.step_id, STEP_ROOT);
+    }
+    assert_eq!(
+        scratch.safelist_suppressed(),
+        0,
+        "no-op path should not increment safelist_suppressed counter"
+    );
+}
+
+#[test]
+fn safelist_post_scan_filter_drops_tail_root_finding() {
+    let rule = RuleSpec {
+        name: "safelist-tail-drop",
+        anchors: &[b"token"],
+        radius: 64,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        local_context: None,
+        secret_group: None,
+        re: Regex::new(r"(?:prod_token_[A-Z0-9]{6}|placeholder_token)").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let mut scratch = engine.new_scratch();
+    let hay = b"prod_token_A1B2C3 placeholder_token";
+    engine.scan_chunk_into(hay, FileId(0), 0, &mut scratch);
+
+    let recs = scratch.findings();
+    assert_eq!(
+        recs.len(),
+        1,
+        "tail safelisted finding should be removed while preserving earlier root finding"
+    );
+    let span = recs[0].span_start as usize..recs[0].span_end as usize;
+    assert_eq!(&hay[span], b"prod_token_A1B2C3");
+    assert_eq!(recs.len(), scratch.norm_hashes().len());
+    assert_eq!(recs.len(), scratch.drop_hint_end().len());
+    assert_eq!(
+        scratch.safelist_suppressed(),
+        1,
+        "tail drop should increment safelist_suppressed counter"
+    );
+}
+
+#[test]
+fn safelist_post_scan_filter_suppresses_duplicate_root_spans_across_rules() {
+    let rules = vec![
+        RuleSpec {
+            name: "safelist-dup-a",
+            anchors: &[b"placeholder_token"],
+            radius: 32,
+            validator: ValidatorKind::None,
+            two_phase: None,
+            must_contain: None,
+            keywords_any: None,
+            value_suppressors_any: None,
+            entropy: None,
+            local_context: None,
+            secret_group: None,
+            re: Regex::new(r"placeholder_token").unwrap(),
+        },
+        RuleSpec {
+            name: "safelist-dup-b",
+            anchors: &[b"placeholder_token"],
+            radius: 32,
+            validator: ValidatorKind::None,
+            two_phase: None,
+            must_contain: None,
+            keywords_any: None,
+            value_suppressors_any: None,
+            entropy: None,
+            local_context: None,
+            secret_group: None,
+            re: Regex::new(r"placeholder_token").unwrap(),
+        },
+        RuleSpec {
+            name: "safelist-dup-keep",
+            anchors: &[b"prod_token_"],
+            radius: 32,
+            validator: ValidatorKind::None,
+            two_phase: None,
+            must_contain: None,
+            keywords_any: None,
+            value_suppressors_any: None,
+            entropy: None,
+            local_context: None,
+            secret_group: None,
+            re: Regex::new(r"prod_token_[A-Z0-9]{6}").unwrap(),
+        },
+    ];
+
+    let engine =
+        Engine::new_with_anchor_policy(rules, Vec::new(), demo_tuning(), AnchorPolicy::ManualOnly);
+
+    let mut scratch = engine.new_scratch();
+    let hay = b"placeholder_token prod_token_A1B2C3";
+    engine.scan_chunk_into(hay, FileId(0), 0, &mut scratch);
+
+    let recs = scratch.findings();
+    assert_eq!(
+        recs.len(),
+        1,
+        "duplicate safelisted root spans across rules should all be suppressed"
+    );
+    let span = recs[0].span_start as usize..recs[0].span_end as usize;
+    assert_eq!(&hay[span], b"prod_token_A1B2C3");
+}
+
+#[test]
+fn safelist_post_scan_filter_all_findings_suppressed() {
+    let rule = RuleSpec {
+        name: "safelist-all-suppressed",
+        anchors: &[b"placeholder_token"],
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        local_context: None,
+        secret_group: None,
+        re: Regex::new(r"placeholder_token").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let mut scratch = engine.new_scratch();
+    let hay = b"placeholder_token";
+    engine.scan_chunk_into(hay, FileId(0), 0, &mut scratch);
+
+    let recs = scratch.findings();
+    assert_eq!(
+        recs.len(),
+        0,
+        "all root findings matching safelist should be suppressed"
+    );
+    assert_eq!(recs.len(), scratch.norm_hashes().len());
+    assert_eq!(recs.len(), scratch.drop_hint_end().len());
+    assert!(
+        scratch.safelist_suppressed() > 0,
+        "safelist_suppressed counter must be non-zero when findings are suppressed"
+    );
+}
+
+#[test]
+fn safelist_suppressed_counter_resets_between_scans() {
+    let rule = RuleSpec {
+        name: "safelist-counter-reset",
+        anchors: &[b"token"],
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        local_context: None,
+        secret_group: None,
+        re: Regex::new(r"(?:placeholder_token|prod_token_[A-Z0-9]{6})").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let mut scratch = engine.new_scratch();
+
+    // First scan: one finding suppressed.
+    let hay1 = b"placeholder_token prod_token_A1B2C3";
+    engine.scan_chunk_into(hay1, FileId(0), 0, &mut scratch);
+    assert_eq!(scratch.safelist_suppressed(), 1);
+
+    // Second scan: no findings suppressed.
+    let hay2 = b"prod_token_D4E5F6";
+    engine.scan_chunk_into(hay2, FileId(1), 0, &mut scratch);
+    assert_eq!(
+        scratch.safelist_suppressed(),
+        0,
+        "safelist_suppressed counter should reset between scans"
+    );
+}
+
+#[test]
 fn value_suppressor_applies_in_base64_stream_decode_raw_path() {
     let rule = RuleSpec {
         name: "value-suppressor-b64-raw",
@@ -1825,7 +2230,7 @@ fn secret_extraction_falls_back_to_full_match_without_groups() {
         AnchorPolicy::ManualOnly,
     );
 
-    let hay = b"prefix AKIAIOSFODNN7EXAMPLE suffix";
+    let hay = b"prefix AKIAIOSFODNN7REAL123 suffix";
     let hits = scan_chunk_findings(&eng, hay);
     assert!(
         hits.iter().any(|h| h.rule == "no-groups-fallback"),
@@ -1839,7 +2244,7 @@ fn secret_extraction_falls_back_to_full_match_without_groups() {
     // Without capture groups, span should be full match
     let matched = &hay[hit.span.clone()];
     assert_eq!(
-        matched, b"AKIAIOSFODNN7EXAMPLE",
+        matched, b"AKIAIOSFODNN7REAL123",
         "without capture groups, span should be full match"
     );
 }
@@ -2119,7 +2524,7 @@ fn secret_extraction_teams_webhook_extracts_full_url() {
     );
 
     // Construct a valid Teams webhook URL matching the rule regex.
-    let webhook_url = b"https://example.webhook.office.com/webhookb2/12345678-abcd-1234-abcd-123456789012@12345678-abcd-1234-abcd-123456789012/IncomingWebhook/abcdef01234567890123456789abcdef/12345678-abcd-1234-abcd-123456789012";
+    let webhook_url = b"https://contoso.webhook.office.com/webhookb2/12345678-abcd-1234-abcd-123456789012@12345678-abcd-1234-abcd-123456789012/IncomingWebhook/abcdef01234567890123456789abcdef/12345678-abcd-1234-abcd-123456789012";
     let hay = format!(
         "webhook_url='{}'",
         std::str::from_utf8(webhook_url).unwrap()

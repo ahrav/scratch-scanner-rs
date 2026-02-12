@@ -336,6 +336,7 @@ pub struct ScanScratch {
     pub(super) drop_hint_end: ScratchVec<u64>,
     pub(super) max_findings: usize,     // Per-chunk cap from tuning.
     pub(super) findings_dropped: usize, // Overflow counter when cap is exceeded.
+    pub(super) safelist_suppressed: usize, // Findings removed by post-scan safelist.
     /// Work queue for breadth-first buffer traversal.
     ///
     /// Contains the root buffer plus any decoded buffers from transforms.
@@ -558,6 +559,7 @@ impl ScanScratch {
                 .expect("scratch drop_hint_end allocation failed"),
             max_findings,
             findings_dropped: 0,
+            safelist_suppressed: 0,
             work_q: ScratchVec::with_capacity(engine.tuning.max_work_items.saturating_add(1))
                 .expect("scratch work_q allocation failed"),
             work_head: 0,
@@ -711,6 +713,7 @@ impl ScanScratch {
         self.norm_hash.clear();
         self.drop_hint_end.clear();
         self.findings_dropped = 0;
+        self.safelist_suppressed = 0;
         self.work_q.clear();
         self.work_head = 0;
         self.slab.reset();
@@ -770,6 +773,7 @@ impl ScanScratch {
         self.norm_hash.clear();
         self.drop_hint_end.clear();
         self.findings_dropped = 0;
+        self.safelist_suppressed = 0;
         self.work_q.clear();
         self.work_head = 0;
         self.slab.reset();
@@ -815,6 +819,14 @@ impl ScanScratch {
     /// On the first call, validates and potentially reallocates all scratch
     /// buffers to match the engine's current tuning and rule set. Subsequent
     /// calls are no-ops because `Engine` is immutable after construction.
+    ///
+    /// Capacity policy is monotonic: buffers only grow (never shrink) so long
+    /// scans do not thrash allocations. `reset_for_scan*` handles per-scan
+    /// clears; this method handles structural compatibility with the engine:
+    /// - Vectorscan scratch bindings still match the current DB pointers
+    /// - per-rule/variant accumulators are large enough for current limits
+    /// - bounded sidecar vectors (`out`, `norm_hash`, `drop_hint_end`) remain
+    ///   aligned and large enough for `max_findings`
     pub(super) fn ensure_capacity(&mut self, engine: &Engine) {
         if self.capacity_validated {
             return;
@@ -1202,6 +1214,23 @@ impl ScanScratch {
         if new_bytes_start == 0 {
             return;
         }
+        self.retain_findings_aligned(|_rec, drop_end| drop_end > new_bytes_start);
+    }
+
+    /// Retains findings in place while keeping all aligned sidecars compacted.
+    ///
+    /// `keep` receives the finding record plus its aligned drop boundary and must
+    /// return `true` to keep the row. Returns the number of rows removed.
+    ///
+    /// # Contract for `keep`
+    /// `keep` may be called more than once for the same row when at least one
+    /// row is dropped (first-pass detection + second-pass compaction). It must
+    /// therefore be side-effect free and deterministic for a given input pair.
+    #[inline(always)]
+    pub(super) fn retain_findings_aligned<F>(&mut self, mut keep: F) -> usize
+    where
+        F: FnMut(FindingRec, u64) -> bool,
+    {
         debug_assert_eq!(
             self.out.len(),
             self.drop_hint_end.len(),
@@ -1212,42 +1241,46 @@ impl ScanScratch {
             self.norm_hash.len(),
             "norm hash length mismatch"
         );
-        // Compact in place: keep only findings whose dedupe boundary extends
-        // past `new_bytes_start`. This is a standard partition-retain loop
-        // over three parallel arrays (out, drop_hint_end, norm_hash).
-        //
-        // Why raw pointer copy instead of swap/clone: `ScratchVec` doesn't
-        // expose `swap()`, and `FindingRec` is a plain data struct (no Drop).
-        // The pointer copy avoids a temporary and is a single `memcpy(size)`.
-        let mut write_idx = 0;
+
         let len = self.out.len();
+        // Fast path: if all rows are retained, avoid touching any sidecars.
+        let mut first_drop_idx = len;
         for read_idx in 0..len {
-            let drop_end = {
-                let slice = self.drop_hint_end.as_slice();
-                slice[read_idx]
-            };
-            if drop_end > new_bytes_start {
-                if write_idx != read_idx {
-                    // SAFETY: The compaction invariant `write_idx < read_idx`
-                    // holds because write_idx only advances when we keep an
-                    // element, and read_idx always advances. Since both point
-                    // into the same ScratchVec and index distinct elements,
-                    // there is no aliasing.
-                    let src = &self.out[read_idx] as *const FindingRec;
-                    let dst = &mut self.out[write_idx] as *mut FindingRec;
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(src, dst, 1);
-                    }
-                }
-                self.drop_hint_end.as_mut_slice()[write_idx] = drop_end;
-                let hash = self.norm_hash.as_slice()[read_idx];
-                self.norm_hash.as_mut_slice()[write_idx] = hash;
-                write_idx += 1;
+            let rec = self.out[read_idx];
+            let drop_end = self.drop_hint_end.as_slice()[read_idx];
+            if !keep(rec, drop_end) {
+                first_drop_idx = read_idx;
+                break;
             }
         }
+
+        if first_drop_idx == len {
+            return 0;
+        }
+
+        // Compact in place over three parallel arrays
+        // (out, drop_hint_end, norm_hash).
+        let mut write_idx = first_drop_idx;
+        for read_idx in (first_drop_idx + 1)..len {
+            let rec = self.out[read_idx];
+            let drop_end = self.drop_hint_end.as_slice()[read_idx];
+            if !keep(rec, drop_end) {
+                continue;
+            }
+
+            // `rec` is already a `Copy` of `self.out[read_idx]`, so this
+            // assignment doesn't alias into the same ScratchVec.
+            self.out[write_idx] = rec;
+            self.drop_hint_end.as_mut_slice()[write_idx] = drop_end;
+            let hash = self.norm_hash.as_slice()[read_idx];
+            self.norm_hash.as_mut_slice()[write_idx] = hash;
+            write_idx += 1;
+        }
+
         self.out.truncate(write_idx);
         self.drop_hint_end.truncate(write_idx);
         self.norm_hash.truncate(write_idx);
+        len - write_idx
     }
 
     /// Returns the drop-boundary offsets aligned 1:1 with [`findings()`].
@@ -1279,6 +1312,11 @@ impl ScanScratch {
     /// Returns the number of findings dropped due to the per-chunk cap.
     pub fn dropped_findings(&self) -> usize {
         self.findings_dropped
+    }
+
+    /// Returns the number of findings removed by the post-scan safelist.
+    pub fn safelist_suppressed(&self) -> usize {
+        self.safelist_suppressed
     }
 
     /// Records a finding using `root_hint_end` as the default drop boundary.
@@ -1327,6 +1365,9 @@ impl ScanScratch {
     /// - A per-file set (`seen_findings`) that suppresses cross-chunk repeats.
     /// - A per-scan set (`seen_findings_scan`) that enables within-scan replacement
     ///   (e.g., prefer transform findings) without re-emitting earlier chunks.
+    ///
+    /// Replacement lookup is `O(n)` in pending findings (linear scan of `out`)
+    /// but bounded by `max_findings_per_chunk`, so it stays predictable.
     #[inline(always)]
     pub(super) fn push_finding_with_drop_hint(
         &mut self,

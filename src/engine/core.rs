@@ -12,6 +12,9 @@
 //! - [`ScanScratch`] is single-threaded and must not be shared across threads.
 //! - The decode slab does not reallocate during a scan; all `unsafe` slice
 //!   construction relies on this property.
+//! - `scratch.out`, `scratch.drop_hint_end`, and `scratch.norm_hash` stay
+//!   length-aligned throughout a scan; post-filter compaction preserves this
+//!   lock-step invariant.
 //!
 //! ## Algorithm
 //!
@@ -36,6 +39,8 @@
 //!      decoded output.
 //! 4. Budgets (decode bytes, work items, depth) are enforced per-item so no
 //!    single input forces unbounded work.
+//! 5. Run post-scan suppression and in-place compaction to drop safelisted
+//!    root-context findings while keeping auxiliary arrays aligned.
 //!
 //! ## Design choices
 //!
@@ -45,6 +50,8 @@
 //! - Raw regex patterns are included in the Vectorscan prefilter DB only for
 //!   rules with weak or missing literal anchors (< 5 bytes). Rules with strong
 //!   anchors rely on anchor-pattern matching alone, reducing DB size.
+//! - Suppression gates are monotonic: they may remove findings after validation
+//!   but never mutate span or decode provenance for findings that remain.
 
 use crate::api::*;
 use crate::b64_yara_gate::{Base64YaraGate, Base64YaraGateConfig, PaddingPolicy, WhitespacePolicy};
@@ -61,6 +68,7 @@ use super::rule_repr::{
     utf16le_bytes, ConfirmAllCompiled, EntropyCompiled, KeywordsCompiled, PackedPatterns, RuleCold,
     RuleCompiled, Target, TwoPhaseCompiled, Variant,
 };
+use super::safelist::SafelistFilter;
 use super::scratch::{RootSpanMapCtx, ScanScratch};
 use super::transform::STREAM_DECODE_CHUNK_BYTES;
 use super::vectorscan_prefilter::{
@@ -230,6 +238,8 @@ pub struct Engine {
     pub(super) entropy_gates: Vec<EntropyCompiled>,
     pub(super) two_phase_gates: Vec<TwoPhaseCompiled>,
     pub(super) local_context_gates: Vec<crate::api::LocalContextSpec>,
+    /// Global context safelist evaluated in the post-scan suppression pass.
+    pub(super) safelist: SafelistFilter,
 
     /// Pre-computed `ln(i)/ln(2)` table for Shannon entropy calculation.
     ///
@@ -918,6 +928,7 @@ impl Engine {
             entropy_gates,
             two_phase_gates,
             local_context_gates,
+            safelist: SafelistFilter::new(),
             entropy_log2,
             vs,
             vs_utf16,
@@ -966,7 +977,8 @@ impl Engine {
     // ── Gate pool accessors ────────────────────────────────────────────
     //
     // Centralised helpers that resolve `Option<u32>` gate indices into pool
-    // references with a descriptive panic on out-of-bounds access.
+    // references using direct indexing; out-of-bounds indices panic, which signals
+    // inconsistent compiled rule data.
 
     #[inline(always)]
     pub(super) fn confirm_all_gate(&self, idx: Option<u32>) -> Option<&ConfirmAllCompiled> {
@@ -1619,6 +1631,10 @@ impl Engine {
                     continue;
                 };
                 let enc = unsafe { std::slice::from_raw_parts(enc_ptr, enc_len) };
+                // True only when root_hint exactly names the encoded bytes being
+                // decoded. This allows decoded matches to map back to precise
+                // root spans; otherwise we keep coarse root_hint windows to avoid
+                // fabricating exact offsets from partial context.
                 let root_hint_maps_encoded = if !enc_ref.is_slab {
                     if let Some(hint) = root_hint.as_ref() {
                         hint.start == r.start && hint.end == r.end
@@ -1663,6 +1679,73 @@ impl Engine {
                 );
             }
         }
+
+        self.post_scan_filter(root_buf, base_offset, scratch);
+    }
+
+    /// Applies post-scan suppression policies and compacts findings in place.
+    ///
+    /// Current policy is intentionally narrow: only root findings
+    /// (`step_id == STEP_ROOT`) are eligible, and only when their root-context
+    /// slice matches the global safelist. Findings from decoded buffers are not
+    /// suppressed here.
+    ///
+    /// Retention stays linear-time (`O(n)`) and keeps the three parallel vectors
+    /// (`out`, `drop_hint_end`, `norm_hash`) in strict index alignment. The helper
+    /// performs a no-drop detection pass and only compacts when suppression occurs.
+    /// This invariant is required by later materialization and dedup bookkeeping
+    /// paths. The aligned retain/compaction mechanics live in
+    /// [`ScanScratch::retain_findings_aligned`].
+    ///
+    /// `base_offset` rebases absolute `root_hint_*` offsets into the current
+    /// `root_buf` slice; spans outside the slice are clamped and treated as
+    /// non-matching.
+    fn post_scan_filter(&self, root_buf: &[u8], base_offset: u64, scratch: &mut ScanScratch) {
+        if scratch.out.is_empty() {
+            return;
+        }
+        let safelist_matcher = self.safelist.matcher();
+
+        let root_len_u64 = root_buf.len() as u64;
+        let mut last_root_decision: Option<(u64, u64, bool)> = None;
+        let removed = scratch.retain_findings_aligned(|rec, _drop_end| {
+            if rec.step_id != STEP_ROOT {
+                return true;
+            }
+
+            debug_assert!(
+                rec.root_hint_start <= rec.root_hint_end,
+                "root_hint range is backwards: {}..{} for rule {}",
+                rec.root_hint_start,
+                rec.root_hint_end,
+                rec.rule_id,
+            );
+
+            // Rebase absolute root hints into this chunk and clamp to avoid
+            // panics when overlap hints extend outside `root_buf`.
+            let start = rec
+                .root_hint_start
+                .saturating_sub(base_offset)
+                .min(root_len_u64);
+            let end = rec
+                .root_hint_end
+                .saturating_sub(base_offset)
+                .min(root_len_u64);
+            if start >= end {
+                return true;
+            }
+
+            if let Some((last_start, last_end, last_keep)) = last_root_decision {
+                if last_start == start && last_end == end {
+                    return last_keep;
+                }
+            }
+
+            let keep = !safelist_matcher.is_match(&root_buf[start as usize..end as usize]);
+            last_root_decision = Some((start, end, keep));
+            keep
+        });
+        scratch.safelist_suppressed = scratch.safelist_suppressed.saturating_add(removed);
     }
 
     /// Scans a buffer and returns a shared view of finding records.
