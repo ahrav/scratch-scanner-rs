@@ -375,6 +375,7 @@ pub struct ScanScratch {
     pub(super) max_findings: usize,     // Per-chunk cap from tuning.
     pub(super) findings_dropped: usize, // Overflow counter when cap is exceeded.
     pub(super) safelist_suppressed: usize, // Findings removed by emit-time safelist.
+    pub(super) offline_suppressed: usize, // Findings removed by offline validation.
     /// Work queue for breadth-first buffer traversal.
     ///
     /// Contains the root buffer plus any decoded buffers from transforms.
@@ -610,6 +611,7 @@ impl ScanScratch {
             max_findings,
             findings_dropped: 0,
             safelist_suppressed: 0,
+            offline_suppressed: 0,
             work_q: ScratchVec::with_capacity(engine.tuning.max_work_items.saturating_add(1))
                 .expect("scratch work_q allocation failed"),
             work_head: 0,
@@ -764,6 +766,7 @@ impl ScanScratch {
         self.drop_hint_end.clear();
         self.findings_dropped = 0;
         self.safelist_suppressed = 0;
+        self.offline_suppressed = 0;
         self.work_q.clear();
         self.work_head = 0;
         self.slab.reset();
@@ -824,6 +827,7 @@ impl ScanScratch {
         self.drop_hint_end.clear();
         self.findings_dropped = 0;
         self.safelist_suppressed = 0;
+        self.offline_suppressed = 0;
         self.work_q.clear();
         self.work_head = 0;
         self.slab.reset();
@@ -1367,6 +1371,11 @@ impl ScanScratch {
     /// Returns the number of findings removed by emit-time safelist checks.
     pub fn safelist_suppressed(&self) -> usize {
         self.safelist_suppressed
+    }
+
+    /// Returns the number of root findings removed by offline validation.
+    pub fn offline_suppressed(&self) -> usize {
+        self.offline_suppressed
     }
 
     /// Records a finding using `root_hint_end` as the default drop boundary.

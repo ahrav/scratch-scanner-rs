@@ -1,5 +1,3 @@
-// TODO(scratch-n3y.6): Remove once `validate` is called from post_scan_filter.
-#![allow(dead_code)]
 //! Offline structural validation for extracted secrets.
 //!
 //! Each validator runs a deterministic, network-free check on secret bytes

@@ -5627,3 +5627,278 @@ mod url_percent_gate_check_tests {
         assert!(url_percent_gate_check(&set, false, b"%41%42"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Offline validation post-scan filter tests
+// ---------------------------------------------------------------------------
+
+/// Encode a `u32` into a 6-char base-62 string, matching the production encoder.
+fn base62_encode_u32_test(mut val: u32, buf: &mut [u8; 6]) {
+    const CHARS: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    for slot in buf.iter_mut().rev() {
+        *slot = CHARS[(val % 62) as usize];
+        val /= 62;
+    }
+}
+
+/// Build a `tok_<8-char payload><6-char CRC>` token with a correct CRC.
+fn build_valid_crc_token() -> Vec<u8> {
+    let prefix = b"tok_";
+    let payload = b"ABcd1234"; // 8 bytes
+    let crc = crc32fast::hash(payload);
+    let mut checksum = [0u8; 6];
+    base62_encode_u32_test(crc, &mut checksum);
+    let mut token = Vec::with_capacity(18);
+    token.extend_from_slice(prefix);
+    token.extend_from_slice(payload);
+    token.extend_from_slice(&checksum);
+    token
+}
+
+/// Build a `tok_<8-char payload><6-char CRC>` token with an INVALID CRC.
+fn build_invalid_crc_token() -> Vec<u8> {
+    let prefix = b"tok_";
+    let payload = b"XYzw5678"; // 8 bytes
+                               // Use a deliberately wrong CRC (correct CRC + 1).
+    let wrong_crc = crc32fast::hash(payload).wrapping_add(1);
+    let mut checksum = [0u8; 6];
+    base62_encode_u32_test(wrong_crc, &mut checksum);
+    let mut token = Vec::with_capacity(18);
+    token.extend_from_slice(prefix);
+    token.extend_from_slice(payload);
+    token.extend_from_slice(&checksum);
+    token
+}
+
+/// Create a rule spec with offline CRC-32 base-62 validation.
+///
+/// The regex captures `tok_` + 14 alphanumeric chars (8 payload + 6 checksum).
+/// `secret_group` is `None` so the full match is the secret span.
+fn offline_crc_rule() -> RuleSpec {
+    RuleSpec {
+        name: "offline-crc-test",
+        anchors: &[b"tok_"],
+        radius: 64,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        local_context: None,
+        secret_group: None,
+        offline_validation: Some(OfflineValidationSpec::Crc32Base62 {
+            prefix_skip: 4,
+            payload_len: 8,
+            checksum_len: 6,
+        }),
+        re: Regex::new(r"tok_[A-Za-z0-9]{14}").unwrap(),
+    }
+}
+
+#[test]
+fn offline_validation_suppresses_invalid_root_finding() {
+    let rule = offline_crc_rule();
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let invalid_tok = build_invalid_crc_token();
+    let mut hay = Vec::new();
+    hay.extend_from_slice(b"prefix ");
+    hay.extend_from_slice(&invalid_tok);
+    hay.extend_from_slice(b" suffix");
+
+    let mut scratch = engine.new_scratch();
+    engine.scan_chunk_into(&hay, FileId(0), 0, &mut scratch);
+
+    let recs = scratch.findings();
+    assert_eq!(
+        recs.len(),
+        0,
+        "offline validation should suppress root finding with invalid CRC"
+    );
+    assert_eq!(
+        scratch.offline_suppressed(),
+        1,
+        "offline_suppressed counter should track suppressed findings"
+    );
+    // Sidecar alignment must hold even after compaction.
+    assert_eq!(recs.len(), scratch.norm_hashes().len());
+    assert_eq!(recs.len(), scratch.drop_hint_end().len());
+}
+
+#[test]
+fn offline_validation_keeps_valid_root_finding() {
+    let rule = offline_crc_rule();
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let valid_tok = build_valid_crc_token();
+    let mut hay = Vec::new();
+    hay.extend_from_slice(b"prefix ");
+    hay.extend_from_slice(&valid_tok);
+    hay.extend_from_slice(b" suffix");
+
+    let mut scratch = engine.new_scratch();
+    engine.scan_chunk_into(&hay, FileId(0), 0, &mut scratch);
+
+    let recs = scratch.findings();
+    assert_eq!(
+        recs.len(),
+        1,
+        "offline validation should keep root finding with valid CRC"
+    );
+    assert_eq!(recs[0].step_id, STEP_ROOT);
+    assert_eq!(scratch.offline_suppressed(), 0);
+    assert_eq!(recs.len(), scratch.norm_hashes().len());
+    assert_eq!(recs.len(), scratch.drop_hint_end().len());
+}
+
+#[test]
+fn offline_validation_mixed_valid_invalid_and_no_gate() {
+    // Three rules: one with valid CRC, one with invalid CRC, one without offline gate.
+    let crc_rule = offline_crc_rule();
+
+    // A rule without offline validation.
+    let plain_rule = RuleSpec {
+        name: "plain-no-gate",
+        anchors: &[b"api_"],
+        radius: 64,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        local_context: None,
+        secret_group: None,
+        offline_validation: None,
+        re: Regex::new(r"api_[A-Za-z0-9]{8}").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![crc_rule, plain_rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let valid_tok = build_valid_crc_token();
+    let invalid_tok = build_invalid_crc_token();
+
+    let mut hay = Vec::new();
+    hay.extend_from_slice(b"prefix ");
+    hay.extend_from_slice(&valid_tok);
+    hay.extend_from_slice(b" middle ");
+    hay.extend_from_slice(&invalid_tok);
+    hay.extend_from_slice(b" api_Zz9aQq1R end");
+
+    let mut scratch = engine.new_scratch();
+    engine.scan_chunk_into(&hay, FileId(0), 0, &mut scratch);
+
+    let recs = scratch.findings();
+    // Expected: valid CRC token + plain rule token survive; invalid CRC token is removed.
+    assert_eq!(
+        recs.len(),
+        2,
+        "expected 2 findings: valid CRC kept + plain rule kept, invalid CRC suppressed"
+    );
+    assert_eq!(scratch.offline_suppressed(), 1);
+    assert_eq!(recs.len(), scratch.norm_hashes().len());
+    assert_eq!(recs.len(), scratch.drop_hint_end().len());
+
+    let rule_names: Vec<&str> = recs.iter().map(|r| engine.rule_name(r.rule_id)).collect();
+    assert!(
+        rule_names.contains(&"offline-crc-test"),
+        "valid CRC finding should survive"
+    );
+    assert!(
+        rule_names.contains(&"plain-no-gate"),
+        "finding without offline gate should survive"
+    );
+}
+
+#[test]
+fn offline_validation_does_not_suppress_non_root_findings() {
+    // A rule with offline validation that also matches via base64 transform.
+    // The base64-decoded finding (non-root step) should bypass offline validation.
+    let rule = offline_crc_rule();
+
+    let transforms = vec![TransformConfig {
+        id: TransformId::Base64,
+        mode: TransformMode::Always,
+        gate: Gate::AnchorsInDecoded,
+        min_len: 8,
+        max_spans_per_buffer: 8,
+        max_encoded_len: 1024,
+        max_decoded_bytes: 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    }];
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        transforms,
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Build an invalid-CRC token and base64-encode it so the transform
+    // decodes it into the scan buffer. The decoded finding is non-root
+    // (step_id != STEP_ROOT) and should survive offline validation.
+    let invalid_tok = build_invalid_crc_token();
+    let b64_encoded = base64_encode_bytes(&invalid_tok);
+
+    let mut hay = Vec::new();
+    hay.extend_from_slice(b"data ");
+    hay.extend_from_slice(&b64_encoded);
+    hay.extend_from_slice(b" end");
+
+    let mut scratch = engine.new_scratch();
+    engine.scan_chunk_into(&hay, FileId(0), 0, &mut scratch);
+
+    let recs = scratch.findings();
+    // The base64-decoded finding is non-root and should survive.
+    assert!(
+        recs.iter().any(|r| r.step_id != STEP_ROOT),
+        "non-root (transform-derived) finding should bypass offline validation"
+    );
+}
+
+/// Minimal base64 encoder for test helpers.
+fn base64_encode_bytes(input: &[u8]) -> Vec<u8> {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 2 < input.len() {
+        let n = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8) | (input[i + 2] as u32);
+        out.push(ALPHABET[((n >> 18) & 63) as usize]);
+        out.push(ALPHABET[((n >> 12) & 63) as usize]);
+        out.push(ALPHABET[((n >> 6) & 63) as usize]);
+        out.push(ALPHABET[(n & 63) as usize]);
+        i += 3;
+    }
+    let remaining = input.len() - i;
+    if remaining == 2 {
+        let n = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8);
+        out.push(ALPHABET[((n >> 18) & 63) as usize]);
+        out.push(ALPHABET[((n >> 12) & 63) as usize]);
+        out.push(ALPHABET[((n >> 6) & 63) as usize]);
+        out.push(b'=');
+    } else if remaining == 1 {
+        let n = (input[i] as u32) << 16;
+        out.push(ALPHABET[((n >> 18) & 63) as usize]);
+        out.push(ALPHABET[((n >> 12) & 63) as usize]);
+        out.push(b'=');
+        out.push(b'=');
+    }
+    out
+}
