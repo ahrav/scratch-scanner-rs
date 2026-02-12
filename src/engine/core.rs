@@ -12,6 +12,9 @@
 //! - [`ScanScratch`] is single-threaded and must not be shared across threads.
 //! - The decode slab does not reallocate during a scan; all `unsafe` slice
 //!   construction relies on this property.
+//! - `scratch.out`, `scratch.drop_hint_end`, and `scratch.norm_hash` stay
+//!   length-aligned throughout a scan; post-filter compaction preserves this
+//!   lock-step invariant.
 //!
 //! ## Algorithm
 //!
@@ -36,6 +39,8 @@
 //!      decoded output.
 //! 4. Budgets (decode bytes, work items, depth) are enforced per-item so no
 //!    single input forces unbounded work.
+//! 5. Run post-scan suppression and in-place compaction to drop safelisted
+//!    root-context findings while keeping auxiliary arrays aligned.
 //!
 //! ## Design choices
 //!
@@ -45,6 +50,8 @@
 //! - Raw regex patterns are included in the Vectorscan prefilter DB only for
 //!   rules with weak or missing literal anchors (< 5 bytes). Rules with strong
 //!   anchors rely on anchor-pattern matching alone, reducing DB size.
+//! - Suppression gates are monotonic: they may remove findings after validation
+//!   but never mutate span or decode provenance for findings that remain.
 
 use crate::api::*;
 use crate::b64_yara_gate::{Base64YaraGate, Base64YaraGateConfig, PaddingPolicy, WhitespacePolicy};
@@ -61,6 +68,7 @@ use super::rule_repr::{
     utf16le_bytes, ConfirmAllCompiled, EntropyCompiled, KeywordsCompiled, PackedPatterns, RuleCold,
     RuleCompiled, Target, TwoPhaseCompiled, Variant,
 };
+use super::safelist::SafelistFilter;
 use super::scratch::{RootSpanMapCtx, ScanScratch};
 use super::transform::STREAM_DECODE_CHUNK_BYTES;
 use super::vectorscan_prefilter::{
@@ -230,6 +238,8 @@ pub struct Engine {
     pub(super) entropy_gates: Vec<EntropyCompiled>,
     pub(super) two_phase_gates: Vec<TwoPhaseCompiled>,
     pub(super) local_context_gates: Vec<crate::api::LocalContextSpec>,
+    /// Global context safelist evaluated in the post-scan suppression pass.
+    pub(super) safelist: SafelistFilter,
 
     /// Pre-computed `ln(i)/ln(2)` table for Shannon entropy calculation.
     ///
@@ -918,6 +928,7 @@ impl Engine {
             entropy_gates,
             two_phase_gates,
             local_context_gates,
+            safelist: SafelistFilter::new(),
             entropy_log2,
             vs,
             vs_utf16,
@@ -966,7 +977,8 @@ impl Engine {
     // ── Gate pool accessors ────────────────────────────────────────────
     //
     // Centralised helpers that resolve `Option<u32>` gate indices into pool
-    // references with a descriptive panic on out-of-bounds access.
+    // references using direct indexing; out-of-bounds indices panic, which signals
+    // inconsistent compiled rule data.
 
     #[inline(always)]
     pub(super) fn confirm_all_gate(&self, idx: Option<u32>) -> Option<&ConfirmAllCompiled> {
@@ -1663,6 +1675,94 @@ impl Engine {
                 );
             }
         }
+
+        self.post_scan_filter(root_buf, base_offset, scratch);
+    }
+
+    /// Applies post-scan suppression policies and compacts findings in place.
+    ///
+    /// Current policy is intentionally narrow: only root findings
+    /// (`step_id == STEP_ROOT`) are eligible, and only when their root-context
+    /// slice matches the global safelist. Findings from decoded buffers are not
+    /// suppressed here.
+    ///
+    /// Compaction runs in one forward pass (`O(n)`) and keeps the three parallel
+    /// vectors (`out`, `drop_hint_end`, `norm_hash`) in strict index alignment.
+    /// This invariant is required by later materialization and dedup bookkeeping
+    /// paths.
+    ///
+    /// `base_offset` rebases absolute `root_hint_*` offsets into the current
+    /// `root_buf` slice; spans outside the slice are clamped and treated as
+    /// non-matching.
+    fn post_scan_filter(&self, root_buf: &[u8], base_offset: u64, scratch: &mut ScanScratch) {
+        debug_assert_eq!(
+            scratch.out.len(),
+            scratch.drop_hint_end.len(),
+            "drop hint length mismatch"
+        );
+        debug_assert_eq!(
+            scratch.out.len(),
+            scratch.norm_hash.len(),
+            "norm hash length mismatch"
+        );
+
+        if self.safelist.is_empty() || scratch.out.is_empty() {
+            return;
+        }
+
+        let root_len_u64 = root_buf.len() as u64;
+        let mut write_idx = 0usize;
+        let len = scratch.out.len();
+
+        for read_idx in 0..len {
+            let rec = scratch.out[read_idx];
+            let suppress = if rec.step_id == STEP_ROOT {
+                // Rebase absolute root hints into this chunk and clamp to avoid
+                // panics when overlap hints extend outside `root_buf`.
+                let start = rec
+                    .root_hint_start
+                    .saturating_sub(base_offset)
+                    .min(root_len_u64);
+                let end = rec
+                    .root_hint_end
+                    .saturating_sub(base_offset)
+                    .min(root_len_u64);
+                if start < end {
+                    self.safelist
+                        .matches(&root_buf[start as usize..end as usize])
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if suppress {
+                continue;
+            }
+
+            if write_idx != read_idx {
+                // SAFETY: During in-place compaction `write_idx < read_idx` always
+                // holds for moved elements, so source and destination never overlap.
+                let src = &scratch.out[read_idx] as *const FindingRec;
+                let dst = &mut scratch.out[write_idx] as *mut FindingRec;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src, dst, 1);
+                }
+            }
+
+            let drop_end = scratch.drop_hint_end.as_slice()[read_idx];
+            scratch.drop_hint_end.as_mut_slice()[write_idx] = drop_end;
+
+            let norm_hash = scratch.norm_hash.as_slice()[read_idx];
+            scratch.norm_hash.as_mut_slice()[write_idx] = norm_hash;
+
+            write_idx += 1;
+        }
+
+        scratch.out.truncate(write_idx);
+        scratch.drop_hint_end.truncate(write_idx);
+        scratch.norm_hash.truncate(write_idx);
     }
 
     /// Scans a buffer and returns a shared view of finding records.

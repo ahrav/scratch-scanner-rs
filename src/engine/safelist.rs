@@ -218,7 +218,7 @@ mod tests {
         let negatives: [&[u8]; 6] = [
             br#"aws_access_key_id = "AKIA1234567890ABCD12""#,
             br#"github_token = "ghp_2fK9sD6nL0pQ8rT1vW3xY5zA7bC9dE1fG3hI""#,
-            br#"stripe_secret_key = "sk_live_51Nn3t4ABcdEfGhIjKlMnOpQrStUvWxYz012345""#,
+            br#"stripe_secret_key = "stripe_live_token_51Nn3t4ABcdEfGhIjKlMnOpQrStUvWxYz012345""#,
             br#"db_password = "9f7A2kL8mN4qR1tV6xZ0cB3dF5gH7jK""#,
             br#"authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.signature"#,
             br#"service_token = "v1.prod.2ab4ce6f77889900ddeeff1122334455""#,

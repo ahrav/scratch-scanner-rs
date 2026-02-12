@@ -1019,20 +1019,20 @@ rules:
     }
 
     /// Regression test for PR #43 review comment:
-    /// Reviewer claimed URL text like "example.com" in a curl command could
-    /// trigger the "example" suppressor and hide a real bearer token.
-    /// The regex only captures the token inside the header value, so the URL
-    /// is never part of the extracted secret.
+    /// Reviewer claimed URL text could trigger the "example" suppressor and
+    /// hide a real bearer token. With post-scan safelist enabled, `example`
+    /// hosts are intentionally suppressed; this test uses a non-safelisted
+    /// host to keep value suppressor behavior isolated.
     #[test]
-    fn curl_auth_header_url_with_example_does_not_suppress_real_token() {
+    fn curl_auth_header_non_safelisted_url_does_not_suppress_real_token() {
         let rule_name = "curl-auth-header";
-        // Real token + URL containing "example" — should still be reported.
+        // Real token + non-safelisted URL should still be reported.
         let hay =
-            br#"curl https://api.example.com -H "Authorization: Bearer a8f2k9x7m4p1q6w3b5n0j4c9""#;
+            br#"curl https://api.internal -H "Authorization: Bearer a8f2k9x7m4p1q6w3b5n0j4c9""#;
         let hits = scan_single_builtin_rule(rule_name, hay);
         assert!(
             has_rule_hit(&hits, rule_name),
-            "URL containing 'example' must not suppress a real bearer token"
+            "non-safelisted URL must not suppress a real bearer token"
         );
     }
 
