@@ -876,7 +876,7 @@ rules:
         for (i, rule) in rules.iter().enumerate() {
             let map = rule.as_mapping().unwrap();
             let name = map
-                .get(&serde_yml::Value::String("name".into()))
+                .get(serde_yml::Value::String("name".into()))
                 .and_then(|v| v.as_str())
                 .unwrap_or("<unnamed>");
             for key in map.keys() {
@@ -887,7 +887,7 @@ rules:
                 );
             }
             // Check nested entropy fields.
-            if let Some(ent) = map.get(&serde_yml::Value::String("entropy".into())) {
+            if let Some(ent) = map.get(serde_yml::Value::String("entropy".into())) {
                 if let Some(em) = ent.as_mapping() {
                     for key in em.keys() {
                         let k = key.as_str().unwrap_or("");
@@ -899,7 +899,7 @@ rules:
                 }
             }
             // Check nested two_phase fields.
-            if let Some(tp) = map.get(&serde_yml::Value::String("two_phase".into())) {
+            if let Some(tp) = map.get(serde_yml::Value::String("two_phase".into())) {
                 if let Some(tm) = tp.as_mapping() {
                     for key in tm.keys() {
                         let k = key.as_str().unwrap_or("");
@@ -911,7 +911,7 @@ rules:
                 }
             }
             // Check nested local_context fields.
-            if let Some(lc) = map.get(&serde_yml::Value::String("local_context".into())) {
+            if let Some(lc) = map.get(serde_yml::Value::String("local_context".into())) {
                 if let Some(lm) = lc.as_mapping() {
                     for key in lm.keys() {
                         let k = key.as_str().unwrap_or("");
