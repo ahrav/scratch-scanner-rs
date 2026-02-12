@@ -386,7 +386,7 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
         });
 
         let offline_validation = offline_validation
-            .map(|ov| yaml_offline_to_spec(&name, ov))
+            .map(|ov| yaml_offline_to_spec(name, ov))
             .transpose()?;
 
         rules.push(RuleSpec {
