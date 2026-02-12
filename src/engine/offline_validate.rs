@@ -4,6 +4,14 @@
 //! already extracted by the regex engine. The goal is to reject structurally
 //! invalid tokens (likely false positives) before they reach the output sink.
 //!
+//! ## Supported token types
+//!
+//! - **CRC-32 + base-62** — generic parameterised validator (used by npm, PyPI, etc.)
+//! - **GitHub fine-grained PAT** — `github_pat_` prefix with CRC-32/base-62 checksum
+//! - **Grafana service-account** — `glsa_` prefix with CRC-32/hex checksum
+//! - **AWS access key ID** — base-32-encoded account ID with range check
+//! - **Sentry org-auth-token** — `sntrys_` prefix with base64 JSON payload check
+//!
 //! ## Design constraints
 //!
 //! - **No allocation in validator logic.** Decode buffers are stack-local
@@ -86,6 +94,10 @@ fn base62_decode_u32(bytes: &[u8]) -> Option<u32> {
 
 /// Encode a `u32` into a fixed-width base-62 string, zero-padded on the left.
 /// Writes exactly `buf.len()` bytes into `buf`; the caller sizes the buffer.
+///
+/// If `val` requires more base-62 digits than `buf.len()`, the high-order
+/// digits are silently truncated. Callers must ensure the buffer is wide
+/// enough (6 chars suffice for any `u32`).
 fn base62_encode_u32(mut val: u32, buf: &mut [u8]) {
     for slot in buf.iter_mut().rev() {
         *slot = BASE62_CHARS[(val % 62) as usize];
@@ -137,6 +149,7 @@ fn validate_crc32_base62(
 // GitHub fine-grained PAT
 // ---------------------------------------------------------------------------
 
+/// Literal prefix of a GitHub fine-grained personal access token.
 const GH_PAT_PREFIX: &[u8] = b"github_pat_";
 /// Total length of a GitHub fine-grained PAT: `github_pat_` (11) + 76 body + 6 checksum = 93.
 const GH_PAT_TOTAL_LEN: usize = 93;
@@ -146,7 +159,9 @@ const GH_PAT_CHECKSUM_LEN: usize = 6;
 /// Validate a GitHub fine-grained personal access token.
 ///
 /// Format: `github_pat_<76 body chars><6 char CRC-32 base-62>` (93 bytes total).
-/// The CRC-32 is computed over the first 87 bytes (everything before the checksum).
+/// The CRC-32 is computed over the first 87 bytes (everything before the checksum),
+/// which **includes the `github_pat_` prefix** — unlike [`validate_crc32_base62`]
+/// where the prefix is skipped before hashing.
 fn validate_github_fine_grained_pat(secret: &[u8]) -> OfflineVerdict {
     if secret.len() < GH_PAT_TOTAL_LEN {
         return OfflineVerdict::Indeterminate;
@@ -176,6 +191,7 @@ fn validate_github_fine_grained_pat(secret: &[u8]) -> OfflineVerdict {
 // Grafana service-account token
 // ---------------------------------------------------------------------------
 
+/// Literal prefix of a Grafana service-account token.
 const GLSA_PREFIX: &[u8] = b"glsa_";
 /// Minimum length: `glsa_` (5) + 32 random + `_` (1) + 8 hex = 46.
 const GLSA_MIN_LEN: usize = 46;
@@ -361,6 +377,7 @@ fn decode_aws_account_id(suffix: &[u8]) -> Option<u64> {
 // Sentry org-auth-token
 // ---------------------------------------------------------------------------
 
+/// Literal prefix of a Sentry org-auth-token.
 const SENTRY_PREFIX: &[u8] = b"sntrys_";
 
 /// Validate a Sentry org-auth-token.
@@ -443,9 +460,16 @@ fn is_base64_char(b: u8) -> bool {
     BASE64_LUT[b as usize] < 64
 }
 
+/// Reasons a base64-prefix check can fail.
+///
+/// The Sentry validator maps these to different verdicts:
+/// `InvalidChar` → [`OfflineVerdict::Invalid`] (structurally broken),
+/// `OutputTooSmall` → [`OfflineVerdict::Indeterminate`] (can't tell).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Base64DecodeError {
+    /// Input contains a byte outside the base64 alphabet (not `[A-Za-z0-9+/=]`).
     InvalidChar,
+    /// Estimated decoded size exceeds the caller-supplied cap.
     OutputTooSmall,
 }
 
@@ -492,8 +516,11 @@ fn base64_decode(input: &[u8], output: &mut [u8]) -> Option<usize> {
 
 /// Validate base64 input and check whether decoded bytes start with `prefix`.
 ///
-/// This decodes and validates the entire input but only compares emitted bytes
-/// against `prefix` instead of writing the full decoded payload to memory.
+/// Every input byte is checked against the base64 alphabet (invalid chars
+/// return [`Base64DecodeError::InvalidChar`]), but actual decode work stops
+/// once the prefix comparison concludes — either a mismatch or full match.
+/// This avoids decoding the entire payload while still rejecting malformed
+/// input.
 #[inline]
 fn base64_decoded_starts_with(
     input: &[u8],
