@@ -2299,6 +2299,170 @@ fn offline_validation_gate_pooled_round_trip() {
 }
 
 // --------------------------
+// Offline validation end-to-end tests
+// --------------------------
+//
+// These tests verify the full `post_scan_filter` path: engine scan → offline
+// validation → finding suppression / retention.
+
+/// Build a `pfx_<payload><base62(crc32(payload))>` token.
+fn build_crc32_base62_token(payload: &[u8]) -> Vec<u8> {
+    let crc = crc32fast::hash(payload);
+    let mut checksum = [0u8; 6];
+    // Inline base62 encode matching offline_validate's format.
+    {
+        let chars: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+        let mut v = crc;
+        for slot in checksum.iter_mut().rev() {
+            *slot = chars[(v % 62) as usize];
+            v /= 62;
+        }
+    }
+    let mut tok = Vec::with_capacity(4 + payload.len() + 6);
+    tok.extend_from_slice(b"pfx_");
+    tok.extend_from_slice(payload);
+    tok.extend_from_slice(&checksum);
+    tok
+}
+
+/// Helper: build a `RuleSpec` that matches `pfx_<alnum>{16}` with optional offline
+/// validation using `Crc32Base62 { prefix_skip: 4, payload_len: 10, checksum_len: 6 }`.
+fn crc32_rule(name: &'static str, with_ov: bool) -> RuleSpec {
+    const ANCHORS: &[&[u8]] = &[b"pfx_"];
+    RuleSpec {
+        name,
+        anchors: ANCHORS,
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        local_context: None,
+        secret_group: None,
+        offline_validation: if with_ov {
+            Some(OfflineValidationSpec::Crc32Base62 {
+                prefix_skip: 4,
+                payload_len: 10,
+                checksum_len: 6,
+            })
+        } else {
+            None
+        },
+        re: Regex::new(r"pfx_[A-Za-z0-9]{16}").unwrap(),
+    }
+}
+
+#[test]
+fn offline_validation_suppresses_invalid_crc_token() {
+    let rule = crc32_rule("ov-crc", true);
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Token with a WRONG checksum — should be suppressed.
+    let bad_token = b"pfx_ABCDEFGHIJ000000";
+    let hay = [b"prefix " as &[u8], bad_token, b" suffix"].concat();
+    let hits = scan_chunk_findings(&engine, &hay);
+    assert!(
+        !hits.iter().any(|h| h.rule == "ov-crc"),
+        "finding with invalid CRC should be suppressed by offline validation"
+    );
+}
+
+#[test]
+fn offline_validation_keeps_valid_crc_token() {
+    let rule = crc32_rule("ov-crc", true);
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Token with a CORRECT checksum — should survive.
+    let good_token = build_crc32_base62_token(b"ABCDEFGHIJ");
+    let hay = [b"prefix " as &[u8], &good_token, b" suffix"].concat();
+    let hits = scan_chunk_findings(&engine, &hay);
+    assert!(
+        hits.iter().any(|h| h.rule == "ov-crc"),
+        "finding with valid CRC should pass offline validation"
+    );
+}
+
+#[test]
+fn offline_validation_does_not_affect_rules_without_gate() {
+    let rule = crc32_rule("no-ov", false);
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Bad checksum, but the rule has no offline_validation — finding kept.
+    let bad_token = b"pfx_ABCDEFGHIJ000000";
+    let hay = [b"prefix " as &[u8], bad_token, b" suffix"].concat();
+    let hits = scan_chunk_findings(&engine, &hay);
+    assert!(
+        hits.iter().any(|h| h.rule == "no-ov"),
+        "rule without offline_validation should emit finding regardless of CRC"
+    );
+}
+
+#[test]
+fn offline_validation_indeterminate_keeps_finding() {
+    let rule = crc32_rule("ov-short", true);
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Token where the 6-char base-62 checksum decodes to a value > u32::MAX.
+    // "zzzzzz" in base-62 = 56_800_235_583 which overflows u32, so
+    // base62_decode_u32 returns None → validate_crc32_base62 returns
+    // Indeterminate → finding is kept.
+    let overflow_token = b"pfx_ABCDEFGHIJzzzzzz";
+    let hay = [b"prefix " as &[u8], overflow_token as &[u8], b" suffix"].concat();
+    let hits = scan_chunk_findings(&engine, &hay);
+    assert!(
+        hits.iter().any(|h| h.rule == "ov-short"),
+        "Indeterminate verdict should keep the finding"
+    );
+}
+
+#[test]
+fn offline_validation_mixed_rules_selective_suppression() {
+    let rule_with = crc32_rule("with-ov", true);
+    let rule_without = crc32_rule("without-ov", false);
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule_with, rule_without],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Bad CRC token — should be suppressed by with-ov, kept by without-ov.
+    let bad_token = b"pfx_ABCDEFGHIJ000000";
+    let hay = [b"prefix " as &[u8], bad_token, b" suffix"].concat();
+    let hits = scan_chunk_findings(&engine, &hay);
+    assert!(
+        !hits.iter().any(|h| h.rule == "with-ov"),
+        "rule with offline_validation should suppress invalid CRC"
+    );
+    assert!(
+        hits.iter().any(|h| h.rule == "without-ov"),
+        "rule without offline_validation should keep finding"
+    );
+}
+
+// --------------------------
 // Secret extraction tests
 // --------------------------
 //

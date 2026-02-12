@@ -818,7 +818,7 @@ pub enum OfflineValidationSpec {
     GrafanaServiceAccount,
     /// AWS access key ID check-digit validation.
     AwsAccessKey,
-    /// Sentry org-auth-token CRC validation.
+    /// Sentry org-auth-token base64 format and JSON payload prefix check.
     SentryOrgToken,
 }
 
@@ -863,9 +863,8 @@ impl OfflineValidationSpec {
 /// Result of an offline structural validation check.
 ///
 /// `Valid` and `Indeterminate` allow the finding to be emitted;
-/// `Invalid` suppresses it (see [`OfflineValidationSpec::suppresses_on_invalid`]).
+/// `Invalid` suppresses it (see `Engine::post_scan_filter` in `core.rs`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // Used once offline validation pipeline is wired up.
 pub enum OfflineVerdict {
     /// The token passed the structural check.
     Valid,

@@ -28,6 +28,15 @@
 //! The asymmetry is intentional: `Invalid` requires positive proof of
 //! structural failure; anything uncertain stays `Indeterminate`.
 //!
+//! ## Scope
+//!
+//! Offline validation runs as a **post-scan filter** on root-buffer findings
+//! only. Transform-derived findings (e.g. secrets discovered inside a
+//! base64-decoded span) are not validated because their span coordinates
+//! reference decoded buffers, not the root input buffer from which secret
+//! bytes would need to be sliced. This means a rule with both transform
+//! decoding and `offline_validation` will only validate direct (root) matches.
+//!
 //! ## Design constraints
 //!
 //! - **No heap allocation.** Decode buffers are stack-local (`[u8; N]`) so
@@ -51,7 +60,7 @@
 //! Decode loops exploit this by OR-accumulating lookup results into a
 //! single `invalid` flag and deferring the validity branch until after
 //! the loop. This eliminates per-character branches, giving the CPU a
-//! straight-line `ldrb + orr + madd` (or `lsl + orr`) body that the
+//! straight-line body (on AArch64: `ldrb + orr + madd` / `lsl + orr`) that the
 //! out-of-order engine can pipeline without misprediction stalls.
 
 use crate::api::{OfflineValidationSpec, OfflineVerdict};
@@ -104,8 +113,8 @@ const BASE62_LUT: [u8; 256] = {
 /// or invalid characters.
 ///
 /// Uses a `u64` accumulator with deferred validity to eliminate all
-/// per-character branches. The loop body compiles to `ldrb + orr + madd`
-/// (3 instructions, 0 branches per character).
+/// per-character branches. On AArch64, the loop body compiles to
+/// `ldrb + orr + madd` (3 instructions, 0 branches per character).
 ///
 /// **Correctness argument:**
 /// - Valid LUT values (0–61) never set bit 7; the sentinel `0xFF` does.
@@ -113,8 +122,9 @@ const BASE62_LUT: [u8; 256] = {
 ///   short-circuiting the loop.
 /// - Garbage accumulated from invalid digits is discarded by the final
 ///   `invalid` check — the accumulator is never read on the error path.
-/// - `u64` cannot overflow: the widest input we process is 6 chars
-///   (CRC-32 checksums), and `62^6 = 56_800_235_584 < u64::MAX`.
+/// - For the inputs in this module (at most 6 chars), `u64` cannot overflow:
+///   `62^6 = 56_800_235_584 < u64::MAX`. Callers passing more than ~10
+///   characters should be aware of potential `u64` wrapping.
 ///   The `u32::try_from` at the end rejects values above `u32::MAX`.
 #[inline]
 fn base62_decode_u32(bytes: &[u8]) -> Option<u32> {
@@ -563,7 +573,8 @@ fn base64_decoded_starts_with(
     }
 
     // Phase 1: branchless validity scan over ALL input bytes.
-    // Loop body: ldrb + ldrb + lsr + and + orr — 0 branches per byte.
+    // On AArch64 the loop body compiles to ldrb + ldrb + lsr + and + orr
+    // — 0 branches per byte.
     let mut any_invalid: u8 = 0;
     for &b in input {
         let v = BASE64_LUT[b as usize];
@@ -1115,6 +1126,79 @@ mod tests {
         // 7 base-62 chars that overflow u32 (62^6 = 56_800_235_584 > u32::MAX).
         // "1000000" in base-62 = 62^6 = 56_800_235_584.
         assert_eq!(base62_decode_u32(b"1000000"), None);
+    }
+
+    // ---- PR review comment regression tests ----
+
+    /// PR Comment #1 (greptile): AWS charset check at line 366 only validates
+    /// suffix[0]. Verify that an invalid char at suffix[5] (position 9 in key)
+    /// still produces Invalid, not a different verdict via a different path.
+    #[test]
+    fn aws_invalid_char_at_suffix_position_5() {
+        // AKIA + 16 valid chars, then corrupt position 9 (suffix[5]) with 'a'
+        // which is not in [A-Z2-7].
+        let mut key = *b"AKIAABCDEFGHIJKLMNOP";
+        assert_eq!(key.len(), 20);
+        key[9] = b'a'; // suffix[5] = lowercase, invalid for AWS base-32
+        let verdict = validate(OfflineValidationSpec::AwsAccessKey, &key);
+        assert_eq!(
+            verdict,
+            OfflineVerdict::Invalid,
+            "invalid char at suffix[5] should still yield Invalid"
+        );
+    }
+
+    /// PR Comment #1 (greptile): verify that an invalid char at the LAST suffix
+    /// position (suffix[15], key[19]) also yields Invalid.
+    #[test]
+    fn aws_invalid_char_at_last_suffix_position() {
+        let mut key = *b"AKIAABCDEFGHIJKLMNOP";
+        key[19] = b'1'; // '1' is not in [A-Z2-7]
+        let verdict = validate(OfflineValidationSpec::AwsAccessKey, &key);
+        assert_eq!(
+            verdict,
+            OfflineVerdict::Invalid,
+            "invalid char at suffix[15] should yield Invalid"
+        );
+    }
+
+    /// PR Comment #3 (codex-connector): Sentry rposition('_') could pick a
+    /// trailing underscore if the regex match includes extra characters.
+    /// Construct: sntrys_<valid_b64_payload>_<43 valid sig>_extra
+    #[test]
+    fn sentry_trailing_underscore_after_signature() {
+        let payload_json = b"{\"iat\":1234567890,\"region_url\":\"https://sentry.io\"}";
+        let mut b64_payload = Vec::new();
+        base64_encode_for_test(payload_json, &mut b64_payload);
+
+        let mut token = Vec::new();
+        token.extend_from_slice(b"sntrys_");
+        token.extend_from_slice(&b64_payload);
+        token.push(b'_');
+        let sig: Vec<u8> = std::iter::repeat_n(b'A', 43).collect();
+        token.extend_from_slice(&sig);
+
+        // This is what the validator sees if regex match is exact — should be Valid.
+        assert_eq!(
+            validate(OfflineValidationSpec::SentryOrgToken, &token),
+            OfflineVerdict::Valid,
+            "exact match should be Valid"
+        );
+
+        // Now append _extra to simulate over-matching regex.
+        let mut over_matched = token.clone();
+        over_matched.extend_from_slice(b"_extradata");
+
+        // With rposition, the split finds the wrong `_`. The sig_part will be
+        // "extradata" (9 chars < 43), so the validator returns Indeterminate.
+        // The reviewer claims this should suppress the finding but now it won't.
+        let verdict = validate(OfflineValidationSpec::SentryOrgToken, &over_matched);
+        // Document what actually happens:
+        assert_eq!(
+            verdict,
+            OfflineVerdict::Indeterminate,
+            "over-matched token with trailing _ returns Indeterminate (not suppressed)"
+        );
     }
 
     // ---- Test-only helper ----

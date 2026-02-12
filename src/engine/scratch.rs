@@ -384,10 +384,12 @@ pub struct ScanScratch {
     /// Number of findings that could not be emitted because the cap was reached.
     pub(super) findings_dropped: usize,
     /// Findings removed by the global context safelist at emission time.
-    /// Incremented only when `perf-stats` is enabled; accessor returns 0 otherwise.
+    /// Incremented only when both `perf-stats` and `debug_assertions` are
+    /// enabled; accessor returns 0 otherwise.
     pub(super) safelist_suppressed: usize,
     /// Findings removed by post-scan offline structural validation.
-    /// Incremented only when `perf-stats` is enabled; accessor returns 0 otherwise.
+    /// Incremented only when both `perf-stats` and `debug_assertions` are
+    /// enabled; accessor returns 0 otherwise.
     pub(super) offline_suppressed: usize,
     /// Work queue for breadth-first buffer traversal.
     ///

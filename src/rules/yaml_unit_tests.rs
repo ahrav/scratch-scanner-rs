@@ -114,6 +114,46 @@ fn rulespec_to_yaml(rule: &RuleSpec) -> YamlRule {
     }
 }
 
+/// Assert that a YAML mapping section contains only known field names.
+fn assert_no_unknown_nested_fields(
+    map: &serde_yml::Mapping,
+    section: &str,
+    allowed: &[&str],
+    rule_idx: usize,
+    rule_name: &str,
+) {
+    if let Some(val) = map.get(serde_yml::Value::String(section.into())) {
+        if let Some(sm) = val.as_mapping() {
+            for key in sm.keys() {
+                let k = key.as_str().unwrap_or("");
+                assert!(
+                    allowed.contains(&k),
+                    "rule {rule_idx} ({rule_name}) {section} has unknown field '{k}'"
+                );
+            }
+        }
+    }
+}
+
+/// Assert two `Option<&[&[u8]]>` values are element-wise equal.
+fn assert_opt_slices_eq(
+    orig: Option<&[&[u8]]>,
+    parsed: Option<&[&[u8]]>,
+    field: &str,
+    rule_name: &str,
+) {
+    match (orig, parsed) {
+        (Some(o), Some(p)) => {
+            assert_eq!(o.len(), p.len(), "{field} count mismatch for {rule_name}");
+            for (a, b) in o.iter().zip(p.iter()) {
+                assert_eq!(*a, *b, "{field} mismatch for {rule_name}");
+            }
+        }
+        (None, None) => {}
+        _ => panic!("{field} presence mismatch for {rule_name}"),
+    }
+}
+
 fn assert_rules_equal(original_rules: &[RuleSpec], parsed_rules: &[RuleSpec]) {
     assert_eq!(
         original_rules.len(),
@@ -136,49 +176,28 @@ fn assert_rules_equal(original_rules: &[RuleSpec], parsed_rules: &[RuleSpec]) {
         );
 
         // Anchors.
-        assert_eq!(
-            orig.anchors.len(),
-            parsed.anchors.len(),
-            "anchor count mismatch for {}",
-            orig.name
+        assert_opt_slices_eq(
+            Some(orig.anchors),
+            Some(parsed.anchors),
+            "anchors",
+            orig.name,
         );
-        for (oa, pa) in orig.anchors.iter().zip(parsed.anchors.iter()) {
-            assert_eq!(*oa, *pa, "anchor mismatch for {}", orig.name);
-        }
 
         // Keywords.
-        match (orig.keywords_any, parsed.keywords_any) {
-            (Some(ok), Some(pk)) => {
-                assert_eq!(
-                    ok.len(),
-                    pk.len(),
-                    "keywords count mismatch for {}",
-                    orig.name
-                );
-                for (okw, pkw) in ok.iter().zip(pk.iter()) {
-                    assert_eq!(*okw, *pkw, "keyword mismatch for {}", orig.name);
-                }
-            }
-            (None, None) => {}
-            _ => panic!("keywords_any presence mismatch for {}", orig.name),
-        }
+        assert_opt_slices_eq(
+            orig.keywords_any,
+            parsed.keywords_any,
+            "keywords_any",
+            orig.name,
+        );
 
         // Value suppressors.
-        match (orig.value_suppressors_any, parsed.value_suppressors_any) {
-            (Some(os), Some(ps)) => {
-                assert_eq!(
-                    os.len(),
-                    ps.len(),
-                    "value_suppressors_any count mismatch for {}",
-                    orig.name
-                );
-                for (ovs, pvs) in os.iter().zip(ps.iter()) {
-                    assert_eq!(*ovs, *pvs, "value_suppressor mismatch for {}", orig.name);
-                }
-            }
-            (None, None) => {}
-            _ => panic!("value_suppressors_any presence mismatch for {}", orig.name),
-        }
+        assert_opt_slices_eq(
+            orig.value_suppressors_any,
+            parsed.value_suppressors_any,
+            "value_suppressors_any",
+            orig.name,
+        );
 
         // Entropy.
         match (&orig.entropy, &parsed.entropy) {
@@ -216,15 +235,12 @@ fn assert_rules_equal(original_rules: &[RuleSpec], parsed_rules: &[RuleSpec]) {
                     "two_phase full_radius mismatch for {}",
                     orig.name
                 );
-                assert_eq!(
-                    otp.confirm_any.len(),
-                    ptp.confirm_any.len(),
-                    "two_phase confirm_any count mismatch for {}",
-                    orig.name
+                assert_opt_slices_eq(
+                    Some(otp.confirm_any),
+                    Some(ptp.confirm_any),
+                    "two_phase confirm_any",
+                    orig.name,
                 );
-                for (oc, pc) in otp.confirm_any.iter().zip(ptp.confirm_any.iter()) {
-                    assert_eq!(*oc, *pc, "two_phase confirm_any mismatch for {}", orig.name);
-                }
             }
             (None, None) => {}
             _ => panic!("two_phase presence mismatch for {}", orig.name),
@@ -253,28 +269,12 @@ fn assert_rules_equal(original_rules: &[RuleSpec], parsed_rules: &[RuleSpec]) {
                     "local_context require_quoted mismatch for {}",
                     orig.name
                 );
-                match (olc.key_names_any, plc.key_names_any) {
-                    (Some(ok), Some(pk)) => {
-                        assert_eq!(
-                            ok.len(),
-                            pk.len(),
-                            "local_context key_names count mismatch for {}",
-                            orig.name
-                        );
-                        for (okn, pkn) in ok.iter().zip(pk.iter()) {
-                            assert_eq!(
-                                *okn, *pkn,
-                                "local_context key_name mismatch for {}",
-                                orig.name
-                            );
-                        }
-                    }
-                    (None, None) => {}
-                    _ => panic!(
-                        "local_context key_names_any presence mismatch for {}",
-                        orig.name
-                    ),
-                }
+                assert_opt_slices_eq(
+                    olc.key_names_any,
+                    plc.key_names_any,
+                    "local_context key_names_any",
+                    orig.name,
+                );
             }
             (None, None) => {}
             _ => panic!("local_context presence mismatch for {}", orig.name),
@@ -685,53 +685,15 @@ fn default_rules_yaml_has_no_unknown_fields() {
                 "rule {i} ({name}) has unknown field '{k}'"
             );
         }
-        // Check nested entropy fields.
-        if let Some(ent) = map.get(serde_yml::Value::String("entropy".into())) {
-            if let Some(em) = ent.as_mapping() {
-                for key in em.keys() {
-                    let k = key.as_str().unwrap_or("");
-                    assert!(
-                        entropy_fields.contains(&k),
-                        "rule {i} ({name}) entropy has unknown field '{k}'"
-                    );
-                }
-            }
-        }
-        // Check nested two_phase fields.
-        if let Some(tp) = map.get(serde_yml::Value::String("two_phase".into())) {
-            if let Some(tm) = tp.as_mapping() {
-                for key in tm.keys() {
-                    let k = key.as_str().unwrap_or("");
-                    assert!(
-                        two_phase_fields.contains(&k),
-                        "rule {i} ({name}) two_phase has unknown field '{k}'"
-                    );
-                }
-            }
-        }
-        // Check nested local_context fields.
-        if let Some(lc) = map.get(serde_yml::Value::String("local_context".into())) {
-            if let Some(lm) = lc.as_mapping() {
-                for key in lm.keys() {
-                    let k = key.as_str().unwrap_or("");
-                    assert!(
-                        local_ctx_fields.contains(&k),
-                        "rule {i} ({name}) local_context has unknown field '{k}'"
-                    );
-                }
-            }
-        }
-        // Check nested offline_validation fields.
-        if let Some(ov) = map.get(serde_yml::Value::String("offline_validation".into())) {
-            if let Some(om) = ov.as_mapping() {
-                for key in om.keys() {
-                    let k = key.as_str().unwrap_or("");
-                    assert!(
-                        offline_validation_fields.contains(&k),
-                        "rule {i} ({name}) offline_validation has unknown field '{k}'"
-                    );
-                }
-            }
+        // Check nested section fields.
+        let nested_sections: &[(&str, &[&str])] = &[
+            ("entropy", entropy_fields),
+            ("two_phase", two_phase_fields),
+            ("local_context", local_ctx_fields),
+            ("offline_validation", offline_validation_fields),
+        ];
+        for &(section, allowed) in nested_sections {
+            assert_no_unknown_nested_fields(map, section, allowed, i, name);
         }
     }
 }

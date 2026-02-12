@@ -21,6 +21,8 @@
 //! 8. Apply root-context safelist suppression for root emit paths.
 //! 9. Record the finding with the extracted secret span.
 //!
+//! Offline structural validation runs post-scan in `core.rs`, not per-window.
+//!
 //! # Secret Extraction
 //! The finding's `span_start`/`span_end` reflect the *secret* portion of the match,
 //! not necessarily the full regex match. The `root_hint_*` fields use the *full match*

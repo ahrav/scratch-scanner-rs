@@ -39,8 +39,10 @@
 //!     decoded output.
 //! - Budgets (decode bytes, work items, depth) are enforced per-item so no
 //!   single input forces unbounded work.
-//! - Apply suppression/cap policies at finding emission time so no post-scan
-//!   compaction pass is required.
+//! - Apply suppression/cap policies at finding emission time so most
+//!   findings are handled inline. A final post-scan compaction pass
+//!   (`post_scan_filter`) removes root findings that fail offline
+//!   structural validation.
 //!
 //! ## Design choices
 //!
@@ -1599,8 +1601,6 @@ impl Engine {
 
                         // Base64 alignment shifts.
                         //
-                        // Base64 alignment shifts.
-                        //
                         // Base64 encodes in 4-character quanta. A span extracted from
                         // raw bytes may not start on a quantum boundary relative to
                         // the original encoding, so we try all four possible offsets
@@ -1851,7 +1851,8 @@ impl Engine {
             let secret = &root_buf[start..end];
             let verdict = super::offline_validate::validate(spec, secret);
 
-            !matches!(verdict, crate::api::OfflineVerdict::Invalid)
+            !(matches!(verdict, crate::api::OfflineVerdict::Invalid)
+                && spec.suppresses_on_invalid())
         });
 
         crate::perf_stats::sat_add_usize(&mut scratch.offline_suppressed, removed);
