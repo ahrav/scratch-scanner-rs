@@ -94,7 +94,10 @@ impl SafelistFilter {
     /// compile time by the `const _` assertion above.
     pub(crate) fn new() -> Self {
         let regex_set = RegexSet::new(SAFELIST_PATTERNS).unwrap_or_else(|e| {
-            panic!("safelist pattern compilation failed ({} patterns): {e}", SAFELIST_PATTERNS.len())
+            panic!(
+                "safelist pattern compilation failed ({} patterns): {e}",
+                SAFELIST_PATTERNS.len()
+            )
         });
         Self { regex_set }
     }
