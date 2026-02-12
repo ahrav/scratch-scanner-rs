@@ -10,6 +10,12 @@
 //! - `schema_version` governs this artifact wrapper.
 //! - `scenario.schema_version` governs the embedded scenario payload.
 //! - Callers should validate both before replaying across versions.
+//!
+//! # Replay Contract
+//! For deterministic replay, callers should treat `scenario_seed`,
+//! `schedule_seed`, `run_config`, `scenario`, and `fault_plan` as immutable
+//! once captured. Fields such as `scanner_pkg_version`, `git_commit`, and
+//! `target` are diagnostic metadata only.
 
 use serde::{Deserialize, Serialize};
 
@@ -18,7 +24,11 @@ use super::runner::FailureReport;
 use super::scenario::{GitRunConfig, GitScenario};
 use super::trace::GitTraceEvent;
 
-/// Trace data captured for a failure.
+/// Trace data captured when a simulation run fails.
+///
+/// The ring snapshot is always present and cheap to store. The optional full
+/// trace is larger but can provide exact event-by-event reconstruction during
+/// debugging.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GitTraceDump {
     /// Ring-buffer snapshot of recent events.
@@ -30,6 +40,10 @@ pub struct GitTraceDump {
 }
 
 /// Self-contained reproduction artifact for a failed Git simulation run.
+///
+/// # Guarantees
+/// - Contains all determinism-critical inputs required to re-run the scenario.
+/// - Separates replay inputs from diagnostic-only metadata.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GitReproArtifact {
     /// Artifact schema version (independent of the scenario schema).
@@ -44,11 +58,14 @@ pub struct GitReproArtifact {
     /// This is informational only and must not affect replay.
     pub target: String,
 
-    /// Determinism keys.
+    /// Scenario generation seed used to materialize repository state.
     pub scenario_seed: u64,
+    /// Fault scheduler seed used to drive fault-injection ordering.
     pub schedule_seed: u64,
 
     /// Test case data.
+    ///
+    /// Together with the seeds above, these fields define the replay input.
     pub run_config: GitRunConfig,
     pub scenario: GitScenario,
     pub fault_plan: GitFaultPlan,

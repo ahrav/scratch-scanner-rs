@@ -37,6 +37,12 @@
 //! # Pack Access
 //! Pack files are memory-mapped lazily on first access and cached per pack id.
 //! The `pack_paths` slice must align with MIDX pack ids.
+//!
+//! # Shallow Boundaries
+//! Commits listed in `.git/shallow` are loaded as normal commit nodes, but BFS
+//! intentionally does not enqueue their parents. This preserves first-class
+//! graph nodes for local history while preventing traversal into known-missing
+//! remote ancestry.
 
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File};
@@ -200,6 +206,9 @@ pub struct LoadedCommit {
 }
 
 /// Limits for commit loading.
+///
+/// These bounds are guardrails against malicious or pathological object graphs
+/// (oversized commit payloads, extreme merge fan-in, and deep delta chains).
 #[derive(Debug, Clone, Copy)]
 pub struct CommitLoadLimits {
     /// Maximum number of commits to load.
@@ -252,6 +261,7 @@ fn enqueue_frontier_oid(
 ///
 /// Returns all reachable commits in discovery order (BFS). The order is
 /// deterministic given the same tip OIDs (including order) and pack contents.
+/// Loose-object lookup directories are derived heuristically from `pack_paths`.
 ///
 /// # Arguments
 /// * `tips` - Starting commit OIDs (branch tips, tags, etc.)
@@ -294,6 +304,11 @@ pub fn load_commits_from_tips(
 /// absent from MIDX, it attempts the same OID in `loose_dirs`. Commits listed
 /// in `.git/shallow` are treated as traversal roots: their parent links are
 /// retained in the loaded commit but not enqueued for loading.
+///
+/// # Preconditions
+/// - `pack_paths` must be indexed by MIDX `pack_id`.
+/// - `shallow_boundary_roots` should come from the same repository graph as
+///   `tips`/`midx` to avoid unintentionally truncating traversal.
 #[allow(clippy::too_many_arguments)]
 pub fn load_commits_from_tips_with_loose_dirs(
     tips: &[OidBytes],
@@ -368,6 +383,9 @@ pub fn resolve_pack_paths_from_midx(
 }
 
 /// Collects pack directories from repo paths.
+///
+/// Includes the primary objects pack dir and alternate object pack dirs,
+/// skipping alternates that resolve to the primary objects directory.
 pub fn collect_pack_dirs(repo: &GitRepoPaths) -> Vec<PathBuf> {
     let mut dirs = Vec::with_capacity(1 + repo.alternate_object_dirs.len());
     dirs.push(repo.pack_dir.clone());
@@ -382,6 +400,9 @@ pub fn collect_pack_dirs(repo: &GitRepoPaths) -> Vec<PathBuf> {
 }
 
 /// Collects loose object directories from repo paths.
+///
+/// Returns directories in precedence order: primary objects dir first, then
+/// unique alternates.
 pub fn collect_loose_dirs(repo: &GitRepoPaths) -> Vec<PathBuf> {
     let mut dirs = Vec::with_capacity(1 + repo.alternate_object_dirs.len());
     dirs.push(repo.objects_dir.clone());
@@ -613,6 +634,9 @@ impl<'m, 'p, 'l, 's> CommitLoader<'m, 'p, 'l, 's> {
 
     /// BFS traversal with identity enrichment. Returns commits and a
     /// parallel `Vec<CommitIdentityIds>` aligned 1:1 with the commit list.
+    ///
+    /// Alignment invariant: `identity_ids[i]` always corresponds to
+    /// `commits[i]` for every loaded commit.
     fn load_from_tips_with_identities(
         &mut self,
         tips: &[OidBytes],
@@ -743,6 +767,11 @@ impl<'m, 'p, 'l, 's> CommitLoader<'m, 'p, 'l, 's> {
         Ok((commit, ids))
     }
 
+    /// Attempts to load `oid` from loose-object directories.
+    ///
+    /// Returns `Ok(None)` when the object is not present in any loose dir. Any
+    /// read/inflate/header-parse failure for a discovered loose object returns
+    /// `CommitLoadError::LooseObjectError`.
     fn load_loose_object(
         &self,
         oid: &OidBytes,
@@ -792,6 +821,9 @@ impl<'m, 'p, 'l, 's> CommitLoader<'m, 'p, 'l, 's> {
         Ok(None)
     }
 
+    /// Loads one object from pack storage, resolving deltas recursively.
+    ///
+    /// Starts recursion at the configured maximum delta depth.
     fn load_object(
         &mut self,
         pack_id: u16,
@@ -1005,6 +1037,9 @@ fn parse_loose_object(bytes: &[u8], max_payload: usize) -> Result<(ObjectKind, V
     Ok((kind, payload.to_vec()))
 }
 
+/// Parses ASCII decimal digits into `u64` with overflow checks.
+///
+/// Returns `None` for empty, non-digit, or overflowing inputs.
 fn parse_decimal(bytes: &[u8]) -> Option<u64> {
     if bytes.is_empty() {
         return None;
@@ -1020,6 +1055,9 @@ fn parse_decimal(bytes: &[u8]) -> Option<u64> {
     Some(out)
 }
 
+/// Parses a full-length hex OID string for the repository object format.
+///
+/// Returns `None` on length mismatch or invalid hex characters.
 fn parse_hex_oid_for_format(hex: &[u8], format: ObjectFormat) -> Option<OidBytes> {
     let expected_hex_len = format.hex_len() as usize;
     if hex.len() != expected_hex_len {
