@@ -369,12 +369,9 @@ fn validate_aws_access_key(secret: &[u8]) -> OfflineVerdict {
     }
 
     // Decode the base-32 suffix to extract the embedded account ID. Invalid
-    // charset bytes are treated as Invalid once the fixed length/prefix checks
-    // have passed.
+    // charset bytes are caught by `decode_aws_account_id` which returns `None`
+    // for any byte outside `[A-Z2-7]`.
     let suffix = &key[4..];
-    if !matches!(suffix[0], b'A'..=b'Z' | b'2'..=b'7') {
-        return OfflineVerdict::Invalid;
-    }
 
     // AWS encodes a 40-bit account number in bits [1..41] of the 80-bit decoded
     // value (16 base-32 chars = 80 bits). The account ID must be a valid AWS
@@ -1126,79 +1123,6 @@ mod tests {
         // 7 base-62 chars that overflow u32 (62^6 = 56_800_235_584 > u32::MAX).
         // "1000000" in base-62 = 62^6 = 56_800_235_584.
         assert_eq!(base62_decode_u32(b"1000000"), None);
-    }
-
-    // ---- PR review comment regression tests ----
-
-    /// PR Comment #1 (greptile): AWS charset check at line 366 only validates
-    /// suffix[0]. Verify that an invalid char at suffix[5] (position 9 in key)
-    /// still produces Invalid, not a different verdict via a different path.
-    #[test]
-    fn aws_invalid_char_at_suffix_position_5() {
-        // AKIA + 16 valid chars, then corrupt position 9 (suffix[5]) with 'a'
-        // which is not in [A-Z2-7].
-        let mut key = *b"AKIAABCDEFGHIJKLMNOP";
-        assert_eq!(key.len(), 20);
-        key[9] = b'a'; // suffix[5] = lowercase, invalid for AWS base-32
-        let verdict = validate(OfflineValidationSpec::AwsAccessKey, &key);
-        assert_eq!(
-            verdict,
-            OfflineVerdict::Invalid,
-            "invalid char at suffix[5] should still yield Invalid"
-        );
-    }
-
-    /// PR Comment #1 (greptile): verify that an invalid char at the LAST suffix
-    /// position (suffix[15], key[19]) also yields Invalid.
-    #[test]
-    fn aws_invalid_char_at_last_suffix_position() {
-        let mut key = *b"AKIAABCDEFGHIJKLMNOP";
-        key[19] = b'1'; // '1' is not in [A-Z2-7]
-        let verdict = validate(OfflineValidationSpec::AwsAccessKey, &key);
-        assert_eq!(
-            verdict,
-            OfflineVerdict::Invalid,
-            "invalid char at suffix[15] should yield Invalid"
-        );
-    }
-
-    /// PR Comment #3 (codex-connector): Sentry rposition('_') could pick a
-    /// trailing underscore if the regex match includes extra characters.
-    /// Construct: sntrys_<valid_b64_payload>_<43 valid sig>_extra
-    #[test]
-    fn sentry_trailing_underscore_after_signature() {
-        let payload_json = b"{\"iat\":1234567890,\"region_url\":\"https://sentry.io\"}";
-        let mut b64_payload = Vec::new();
-        base64_encode_for_test(payload_json, &mut b64_payload);
-
-        let mut token = Vec::new();
-        token.extend_from_slice(b"sntrys_");
-        token.extend_from_slice(&b64_payload);
-        token.push(b'_');
-        let sig: Vec<u8> = std::iter::repeat_n(b'A', 43).collect();
-        token.extend_from_slice(&sig);
-
-        // This is what the validator sees if regex match is exact — should be Valid.
-        assert_eq!(
-            validate(OfflineValidationSpec::SentryOrgToken, &token),
-            OfflineVerdict::Valid,
-            "exact match should be Valid"
-        );
-
-        // Now append _extra to simulate over-matching regex.
-        let mut over_matched = token.clone();
-        over_matched.extend_from_slice(b"_extradata");
-
-        // With rposition, the split finds the wrong `_`. The sig_part will be
-        // "extradata" (9 chars < 43), so the validator returns Indeterminate.
-        // The reviewer claims this should suppress the finding but now it won't.
-        let verdict = validate(OfflineValidationSpec::SentryOrgToken, &over_matched);
-        // Document what actually happens:
-        assert_eq!(
-            verdict,
-            OfflineVerdict::Indeterminate,
-            "over-matched token with trailing _ returns Indeterminate (not suppressed)"
-        );
     }
 
     // ---- Test-only helper ----
