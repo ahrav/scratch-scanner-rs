@@ -327,13 +327,13 @@ fn run_fs(
     event_sink.flush();
 
     // Also write machine-readable stats to stderr for compatibility.
-    let scanned_mb = report.metrics.bytes_scanned as f64 / 1_000_000.0;
+    let scanned_human = format_human_bytes(report.metrics.bytes_scanned);
     eprintln!(
-        "files={}\nchunks={}\nbytes={} ({:.2}MB)\nfindings={}\nerrors={}\ndropped_findings={}\npersist_emit_failures={}\npersist_incomplete={}\nbinary_skipped={}\nbinary_extracted={}\ninit_ms={}\nscan_ms={}\npersist_ms={}\nelapsed_ms={}\nthroughput_mib_s={:.2}\nworkers={}",
+        "files={}\nchunks={}\nbytes={} ({})\nfindings={}\nerrors={}\ndropped_findings={}\npersist_emit_failures={}\npersist_incomplete={}\nbinary_skipped={}\nbinary_extracted={}\ninit_ms={}\nscan_ms={}\npersist_ms={}\nelapsed_ms={}\nthroughput_mib_s={:.2}\nworkers={}",
         report.stats.files_enqueued,
         report.metrics.chunks_scanned,
         report.metrics.bytes_scanned,
-        scanned_mb,
+        scanned_human,
         report.metrics.findings_emitted,
         report.stats.io_errors,
         report.stats.dropped_findings,
@@ -829,13 +829,13 @@ fn print_git_stderr_summary(
         0.0
     };
     let init_ms = total_elapsed.saturating_sub(scan_elapsed).as_millis();
-    let scanned_mb = common.bytes_scanned as f64 / 1_000_000.0;
+    let scanned_human = format_human_bytes(common.bytes_scanned);
     eprintln!(
-        "objects={}\nchunks={}\nbytes={} ({:.2}MB)\nfindings={}\nerrors={}\nbinary_skipped={}\nbinary_extracted={}\ninit_ms={}\nscan_ms={}\nelapsed_ms={}\nthroughput_mib_s={:.2}\nworkers={}",
+        "objects={}\nchunks={}\nbytes={} ({})\nfindings={}\nerrors={}\nbinary_skipped={}\nbinary_extracted={}\ninit_ms={}\nscan_ms={}\nelapsed_ms={}\nthroughput_mib_s={:.2}\nworkers={}",
         common.objects_scanned,
         common.chunks_scanned,
         common.bytes_scanned,
-        scanned_mb,
+        scanned_human,
         common.findings_emitted,
         errors,
         common.binary_skipped,
@@ -846,6 +846,25 @@ fn print_git_stderr_summary(
         throughput_mib,
         config.pack_exec_workers,
     );
+}
+
+/// Format byte counts using binary IEC units (KiB, MiB, GiB, ...).
+///
+/// This keeps stderr summaries human-readable without losing the raw byte
+/// count emitted in the adjacent `bytes=<raw>` field.
+fn format_human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    if bytes < 1024 {
+        return format!("{bytes}B");
+    }
+
+    let mut value = bytes as f64;
+    let mut unit_idx = 0usize;
+    while value >= 1024.0 && unit_idx < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit_idx += 1;
+    }
+    format!("{value:.2}{}", UNITS[unit_idx])
 }
 
 /// Dump verbose internal stats to stderr (commit counts, tree diff, pack plan, cache rejects).
@@ -1213,6 +1232,16 @@ mod tests {
     #[test]
     fn fs_backend_linux_uring_when_available_and_no_persistence() {
         assert_eq!(select_fs_backend(true, false, true), FsBackend::Uring);
+    }
+
+    #[test]
+    fn format_human_bytes_binary_units() {
+        assert_eq!(format_human_bytes(0), "0B");
+        assert_eq!(format_human_bytes(1023), "1023B");
+        assert_eq!(format_human_bytes(1024), "1.00KiB");
+        assert_eq!(format_human_bytes(1536), "1.50KiB");
+        assert_eq!(format_human_bytes(1024 * 1024), "1.00MiB");
+        assert_eq!(format_human_bytes(1024 * 1024 * 1024), "1.00GiB");
     }
 
     /// The pool buffer sizing formula must satisfy the assertion floor
