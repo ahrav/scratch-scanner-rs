@@ -41,6 +41,35 @@ rules:
   keywords_any:
   - adafruit
   - ADAFRUIT
+  value_suppressors_any:
+  - "example"
+  - "EXAMPLE"
+  - "sample"
+  - "SAMPLE"
+  - "placeholder"
+  - "PLACEHOLDER"
+  - "changeme"
+  - "CHANGE_ME"
+  - "change_me"
+  - "xxxxxx"
+  - "XXXXXX"
+  - "000000"
+  - "abcdef"
+  - "123456"
+  - "dummy"
+  - "DUMMY"
+  - "redacted"
+  - "REDACTED"
+  - "YOUR_"
+  - "your_"
+  - "INSERT_"
+  - "insert_"
+  - "REPLACE_"
+  - "replace_"
+  - "fake_"
+  - "FAKE_"
+  - "test_"
+  - "TEST_"
   entropy: null
   two_phase: null
   local_context: null
@@ -55,6 +84,35 @@ rules:
   keywords_any:
   - adobe
   - ADOBE
+  value_suppressors_any:
+  - "example"
+  - "EXAMPLE"
+  - "sample"
+  - "SAMPLE"
+  - "placeholder"
+  - "PLACEHOLDER"
+  - "changeme"
+  - "CHANGE_ME"
+  - "change_me"
+  - "xxxxxx"
+  - "XXXXXX"
+  - "000000"
+  - "abcdef"
+  - "123456"
+  - "dummy"
+  - "DUMMY"
+  - "redacted"
+  - "REDACTED"
+  - "YOUR_"
+  - "your_"
+  - "INSERT_"
+  - "insert_"
+  - "REPLACE_"
+  - "replace_"
+  - "fake_"
+  - "FAKE_"
+  - "test_"
+  - "TEST_"
   entropy:
     min_bits_per_byte: 2.0
     min_len: 16
@@ -129,6 +187,35 @@ rules:
   keywords_any:
   - algolia
   - ALGOLIA
+  value_suppressors_any:
+  - "example"
+  - "EXAMPLE"
+  - "sample"
+  - "SAMPLE"
+  - "placeholder"
+  - "PLACEHOLDER"
+  - "changeme"
+  - "CHANGE_ME"
+  - "change_me"
+  - "xxxxxx"
+  - "XXXXXX"
+  - "000000"
+  - "abcdef"
+  - "123456"
+  - "dummy"
+  - "DUMMY"
+  - "redacted"
+  - "REDACTED"
+  - "YOUR_"
+  - "your_"
+  - "INSERT_"
+  - "insert_"
+  - "REPLACE_"
+  - "replace_"
+  - "fake_"
+  - "FAKE_"
+  - "test_"
+  - "TEST_"
   entropy: null
   two_phase: null
   local_context: null
@@ -646,6 +733,35 @@ rules:
   keywords_any:
   - confluent
   - CONFLUENT
+  value_suppressors_any:
+  - "example"
+  - "EXAMPLE"
+  - "sample"
+  - "SAMPLE"
+  - "placeholder"
+  - "PLACEHOLDER"
+  - "changeme"
+  - "CHANGE_ME"
+  - "change_me"
+  - "xxxxxx"
+  - "XXXXXX"
+  - "000000"
+  - "abcdef"
+  - "123456"
+  - "dummy"
+  - "DUMMY"
+  - "redacted"
+  - "REDACTED"
+  - "YOUR_"
+  - "your_"
+  - "INSERT_"
+  - "insert_"
+  - "REPLACE_"
+  - "replace_"
+  - "fake_"
+  - "FAKE_"
+  - "test_"
+  - "TEST_"
   entropy: null
   two_phase: null
   local_context: null
@@ -660,6 +776,35 @@ rules:
   keywords_any:
   - confluent
   - CONFLUENT
+  value_suppressors_any:
+  - "example"
+  - "EXAMPLE"
+  - "sample"
+  - "SAMPLE"
+  - "placeholder"
+  - "PLACEHOLDER"
+  - "changeme"
+  - "CHANGE_ME"
+  - "change_me"
+  - "xxxxxx"
+  - "XXXXXX"
+  - "000000"
+  - "abcdef"
+  - "123456"
+  - "dummy"
+  - "DUMMY"
+  - "redacted"
+  - "REDACTED"
+  - "YOUR_"
+  - "your_"
+  - "INSERT_"
+  - "insert_"
+  - "REPLACE_"
+  - "replace_"
+  - "fake_"
+  - "FAKE_"
+  - "test_"
+  - "TEST_"
   entropy: null
   two_phase: null
   local_context: null
@@ -883,6 +1028,35 @@ rules:
   keywords_any:
   - discord
   - DISCORD
+  value_suppressors_any:
+  - "example"
+  - "EXAMPLE"
+  - "sample"
+  - "SAMPLE"
+  - "placeholder"
+  - "PLACEHOLDER"
+  - "changeme"
+  - "CHANGE_ME"
+  - "change_me"
+  - "xxxxxx"
+  - "XXXXXX"
+  - "000000"
+  - "abcdef"
+  - "123456"
+  - "dummy"
+  - "DUMMY"
+  - "redacted"
+  - "REDACTED"
+  - "YOUR_"
+  - "your_"
+  - "INSERT_"
+  - "insert_"
+  - "REPLACE_"
+  - "replace_"
+  - "fake_"
+  - "FAKE_"
+  - "test_"
+  - "TEST_"
   entropy: null
   two_phase: null
   local_context: null
@@ -914,6 +1088,35 @@ rules:
   keywords_any:
   - discord
   - DISCORD
+  value_suppressors_any:
+  - "example"
+  - "EXAMPLE"
+  - "sample"
+  - "SAMPLE"
+  - "placeholder"
+  - "PLACEHOLDER"
+  - "changeme"
+  - "CHANGE_ME"
+  - "change_me"
+  - "xxxxxx"
+  - "XXXXXX"
+  - "000000"
+  - "abcdef"
+  - "123456"
+  - "dummy"
+  - "DUMMY"
+  - "redacted"
+  - "REDACTED"
+  - "YOUR_"
+  - "your_"
+  - "INSERT_"
+  - "insert_"
+  - "REPLACE_"
+  - "replace_"
+  - "fake_"
+  - "FAKE_"
+  - "test_"
+  - "TEST_"
   entropy:
     min_bits_per_byte: 2.0
     min_len: 16
@@ -1922,6 +2125,35 @@ rules:
   keywords_any:
   - heroku
   - HEROKU
+  value_suppressors_any:
+  - "example"
+  - "EXAMPLE"
+  - "sample"
+  - "SAMPLE"
+  - "placeholder"
+  - "PLACEHOLDER"
+  - "changeme"
+  - "CHANGE_ME"
+  - "change_me"
+  - "xxxxxx"
+  - "XXXXXX"
+  - "000000"
+  - "abcdef"
+  - "123456"
+  - "dummy"
+  - "DUMMY"
+  - "redacted"
+  - "REDACTED"
+  - "YOUR_"
+  - "your_"
+  - "INSERT_"
+  - "insert_"
+  - "REPLACE_"
+  - "replace_"
+  - "fake_"
+  - "FAKE_"
+  - "test_"
+  - "TEST_"
   entropy: null
   two_phase: null
   local_context: null
@@ -1936,6 +2168,7 @@ rules:
   keywords_any:
   - hrku-aa
   - HRKU-AA
+  # Prefix-structured token; skip placeholder suppressors for this strict format.
   entropy:
     min_bits_per_byte: 4.0
     min_len: 16
@@ -2203,6 +2436,7 @@ rules:
   keywords_any:
   - lin_api_
   - LIN_API_
+  # Prefix-structured token; skip placeholder suppressors for this strict format.
   entropy:
     min_bits_per_byte: 2.0
     min_len: 16
@@ -2220,6 +2454,35 @@ rules:
   keywords_any:
   - linear
   - LINEAR
+  value_suppressors_any:
+  - "example"
+  - "EXAMPLE"
+  - "sample"
+  - "SAMPLE"
+  - "placeholder"
+  - "PLACEHOLDER"
+  - "changeme"
+  - "CHANGE_ME"
+  - "change_me"
+  - "xxxxxx"
+  - "XXXXXX"
+  - "000000"
+  - "abcdef"
+  - "123456"
+  - "dummy"
+  - "DUMMY"
+  - "redacted"
+  - "REDACTED"
+  - "YOUR_"
+  - "your_"
+  - "INSERT_"
+  - "insert_"
+  - "REPLACE_"
+  - "replace_"
+  - "fake_"
+  - "FAKE_"
+  - "test_"
+  - "TEST_"
   entropy:
     min_bits_per_byte: 2.0
     min_len: 16
@@ -3820,6 +4083,35 @@ rules:
   keywords_any:
   - zendesk
   - ZENDESK
+  value_suppressors_any:
+  - "example"
+  - "EXAMPLE"
+  - "sample"
+  - "SAMPLE"
+  - "placeholder"
+  - "PLACEHOLDER"
+  - "changeme"
+  - "CHANGE_ME"
+  - "change_me"
+  - "xxxxxx"
+  - "XXXXXX"
+  - "000000"
+  - "abcdef"
+  - "123456"
+  - "dummy"
+  - "DUMMY"
+  - "redacted"
+  - "REDACTED"
+  - "YOUR_"
+  - "your_"
+  - "INSERT_"
+  - "insert_"
+  - "REPLACE_"
+  - "replace_"
+  - "fake_"
+  - "FAKE_"
+  - "test_"
+  - "TEST_"
   entropy: null
   two_phase: null
   local_context: null

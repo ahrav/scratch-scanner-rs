@@ -39,8 +39,8 @@
 //!      decoded output.
 //! 4. Budgets (decode bytes, work items, depth) are enforced per-item so no
 //!    single input forces unbounded work.
-//! 5. Run post-scan suppression and in-place compaction to drop safelisted
-//!    root-context findings while keeping auxiliary arrays aligned.
+//! 5. Run post-scan suppression and in-place compaction, then enforce the
+//!    final findings cap while keeping auxiliary arrays aligned.
 //!
 //! ## Design choices
 //!
@@ -1683,19 +1683,21 @@ impl Engine {
         self.post_scan_filter(root_buf, base_offset, scratch);
     }
 
-    /// Applies post-scan suppression policies and compacts findings in place.
+    /// Applies post-scan suppression policies and finalizes finding limits.
     ///
-    /// Current policy is intentionally narrow: only root findings
+    /// Current suppression policy is intentionally narrow: only root findings
     /// (`step_id == STEP_ROOT`) are eligible, and only when their root-context
     /// slice matches the global safelist. Findings from decoded buffers are not
-    /// suppressed here.
+    /// safelist-suppressed here.
     ///
-    /// Retention stays linear-time (`O(n)`) and keeps the three parallel vectors
-    /// (`out`, `drop_hint_end`, `norm_hash`) in strict index alignment. The helper
-    /// performs a no-drop detection pass and only compacts when suppression occurs.
-    /// This invariant is required by later materialization and dedup bookkeeping
-    /// paths. The aligned retain/compaction mechanics live in
-    /// [`ScanScratch::retain_findings_aligned`].
+    /// Finalization is two-step:
+    /// 1. Safelist retain/compaction (linear-time, aligned sidecars).
+    /// 2. Post-suppression truncation to `max_findings_per_chunk`.
+    ///
+    /// Both steps preserve strict index alignment across parallel vectors
+    /// (`out`, `drop_hint_end`, `norm_hash`), which is required by materialization
+    /// and dedupe bookkeeping paths. The aligned retain/compaction mechanics live
+    /// in [`ScanScratch::retain_findings_aligned`].
     ///
     /// `base_offset` rebases absolute `root_hint_*` offsets into the current
     /// `root_buf` slice; spans outside the slice are clamped and treated as
@@ -1746,6 +1748,15 @@ impl Engine {
             keep
         });
         scratch.safelist_suppressed = scratch.safelist_suppressed.saturating_add(removed);
+
+        let final_cap = scratch.max_findings;
+        if scratch.out.len() > final_cap {
+            let dropped = scratch.out.len().saturating_sub(final_cap);
+            scratch.out.truncate(final_cap);
+            scratch.norm_hash.truncate(final_cap);
+            scratch.drop_hint_end.truncate(final_cap);
+            scratch.findings_dropped = scratch.findings_dropped.saturating_add(dropped);
+        }
     }
 
     /// Scans a buffer and returns a shared view of finding records.

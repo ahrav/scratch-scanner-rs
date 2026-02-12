@@ -107,15 +107,6 @@ impl SafelistFilter {
     pub(crate) fn matcher(&self) -> &RegexSet {
         &self.regex_set
     }
-
-    /// Returns `true` when any safelist pattern matches the supplied context.
-    ///
-    /// Callers should treat `true` as "eligible for suppression review", not as a
-    /// proof that the candidate is non-secret.
-    #[inline]
-    pub(crate) fn matches(&self, context: &[u8]) -> bool {
-        self.regex_set.is_match(context)
-    }
 }
 
 #[cfg(test)]
@@ -180,7 +171,7 @@ mod tests {
 
         for (label, context) in cases {
             assert!(
-                filter.matches(context),
+                filter.matcher().is_match(context),
                 "expected safelist match for category: {label}"
             );
         }
@@ -200,7 +191,7 @@ mod tests {
 
         for context in negatives {
             assert!(
-                !filter.matches(context),
+                !filter.matcher().is_match(context),
                 "unexpected safelist match for realistic secret context: {}",
                 String::from_utf8_lossy(context)
             );

@@ -18,8 +18,7 @@
 //! 5. Extract the secret span using capture group priority (see [`extract_secret_span`]).
 //! 6. Apply value suppressors (when configured) on the extracted secret bytes.
 //! 7. Apply local context checks (when configured) on the secret span.
-//! 8. For root-buffer findings in the engine hot path, apply safelist suppression.
-//! 9. Record the finding with the extracted secret span.
+//! 8. Record the finding with the extracted secret span.
 //!
 //! # Secret Extraction
 //! The finding's `span_start`/`span_end` reflect the *secret* portion of the match,
@@ -44,11 +43,10 @@
 //!
 //! # Entry Points
 //! - `run_rule_on_window`: engine hot path that writes findings directly into
-//!   `ScanScratch`, applies root safelist suppression (for `STEP_ROOT`), and
-//!   performs dedupe/drop-hint bookkeeping immediately.
+//!   `ScanScratch` and performs dedupe/drop-hint bookkeeping immediately.
 //! - `run_rule_on_raw_window_into` / `run_rule_on_utf16_window_into`: scheduler
 //!   adapters that accumulate findings in `scratch.tmp_findings` for the caller
-//!   to commit and account for dropped findings.
+//!   to batch-commit.
 //!
 //! [`extract_secret_span`]: super::helpers::extract_secret_span
 
@@ -312,26 +310,6 @@ fn local_context_passes(
 }
 
 impl Engine {
-    /// Returns whether a root-buffer finding should be suppressed by safelist.
-    ///
-    /// This runs before finding-cap accounting so safelisted root findings do
-    /// not consume `max_findings_per_chunk` capacity and starve later
-    /// non-safelisted findings.
-    #[inline(always)]
-    fn suppress_root_finding_by_safelist(
-        &self,
-        buf: &[u8],
-        step_id: StepId,
-        root_span_hint: &Range<usize>,
-    ) -> bool {
-        if step_id != STEP_ROOT {
-            return false;
-        }
-        let start = root_span_hint.start.min(buf.len());
-        let end = root_span_hint.end.min(buf.len());
-        start < end && self.safelist.matches(&buf[start..end])
-    }
-
     /// Runs a compiled rule against one window and appends findings into `scratch`.
     ///
     /// Guarantees / invariants:
@@ -348,7 +326,8 @@ impl Engine {
     /// Errors / edge cases:
     /// - Returns early when gates fail, decode budgets are exhausted, or decoding
     ///   fails.
-    /// - May drop findings when the scratch capacity cap is reached.
+    /// - Candidate findings are emitted; suppression/cap policies are applied
+    ///   in post-scan filtering.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn run_rule_on_window(
         &self,
@@ -471,13 +450,6 @@ impl Engine {
                                 } else {
                                     root_hint.clone().unwrap_or(match_span_in_buf)
                                 };
-                            if self.suppress_root_finding_by_safelist(buf, step_id, &root_span_hint)
-                            {
-                                scratch.safelist_suppressed =
-                                    scratch.safelist_suppressed.saturating_add(1);
-                                return;
-                            }
-
                             let mut drop_hint_end = root_span_hint.end;
                             if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
                                 if let Some(end) =
@@ -566,8 +538,6 @@ impl Engine {
     /// assignment-shape, regex, entropy, value suppressor, local context) while
     /// enforcing UTF-16 decode budgets.
     ///
-    /// Note: root safelist suppression is currently applied in the raw hot path
-    /// (`run_rule_on_window` Raw variant), not in this helper.
     #[allow(clippy::too_many_arguments)]
     fn run_rule_on_utf16_window_aligned(
         &self,
@@ -788,7 +758,6 @@ impl Engine {
     ///
     /// # Effects
     /// - Sets `found_any` when any match passes gates.
-    /// - Increments `dropped` when the per-chunk findings cap is exceeded.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn run_rule_on_raw_window_into(
         &self,
@@ -801,7 +770,6 @@ impl Engine {
         base_offset: u64,
         file_id: FileId,
         scratch: &mut ScanScratch,
-        dropped: &mut usize,
         found_any: &mut bool,
         anchor_hint: u64,
     ) {
@@ -840,7 +808,6 @@ impl Engine {
         let search_start = hint_in_window.saturating_sub(BACK_SCAN_MARGIN);
         let search_window = &window[search_start..];
 
-        let max_findings = scratch.max_findings;
         let entropy = self.entropy_gate(rule.entropy);
         let value_suppressors = self.value_suppressor_gate(rule.value_suppressors);
         let mut locs = scratch.capture_locs[rule_id as usize]
@@ -899,41 +866,37 @@ impl Engine {
                         root_hint.clone().unwrap_or(match_span_in_buf)
                     };
 
-                    if scratch.tmp_findings.len() < max_findings {
-                        let mut drop_hint_end = root_span_hint.end;
-                        if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
-                            if let Some(end) = ctx.drop_hint_end_for_match(root_span_hint.clone()) {
-                                drop_hint_end = drop_hint_end.max(end);
-                            }
+                    let mut drop_hint_end = root_span_hint.end;
+                    if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
+                        if let Some(end) = ctx.drop_hint_end_for_match(root_span_hint.clone()) {
+                            drop_hint_end = drop_hint_end.max(end);
                         }
-                        let drop_hint_end = base_offset + drop_hint_end as u64;
-                        // Dedupe key includes the decoded span only when offsets are
-                        // stable across chunks:
-                        // - Root findings (STEP_ROOT): offsets are absolute file positions.
-                        // - No root-span mapping: nested transforms with length-changing
-                        //   parents produce different decoded offsets per chunk alignment,
-                        //   but without mapping we have no better key.
-                        // When mapping IS available, decoded spans can shift with chunk
-                        // boundaries, so dedupe relies solely on the root hint window.
-                        let dedupe_with_span =
-                            step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
-
-                        let norm_hash = *blake3::hash(secret_bytes).as_bytes();
-                        scratch.tmp_findings.push(FindingRec {
-                            file_id,
-                            rule_id,
-                            span_start: span_in_buf.start as u32,
-                            span_end: span_in_buf.end as u32,
-                            root_hint_start: base_offset + root_span_hint.start as u64,
-                            root_hint_end: base_offset + root_span_hint.end as u64,
-                            dedupe_with_span,
-                            step_id,
-                        });
-                        scratch.tmp_drop_hint_end.push(drop_hint_end);
-                        scratch.tmp_norm_hash.push(norm_hash);
-                    } else {
-                        *dropped = dropped.saturating_add(1);
                     }
+                    let drop_hint_end = base_offset + drop_hint_end as u64;
+                    // Dedupe key includes the decoded span only when offsets are
+                    // stable across chunks:
+                    // - Root findings (STEP_ROOT): offsets are absolute file positions.
+                    // - No root-span mapping: nested transforms with length-changing
+                    //   parents produce different decoded offsets per chunk alignment,
+                    //   but without mapping we have no better key.
+                    // When mapping IS available, decoded spans can shift with chunk
+                    // boundaries, so dedupe relies solely on the root hint window.
+                    let dedupe_with_span =
+                        step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
+
+                    let norm_hash = *blake3::hash(secret_bytes).as_bytes();
+                    scratch.tmp_findings.push(FindingRec {
+                        file_id,
+                        rule_id,
+                        span_start: span_in_buf.start as u32,
+                        span_end: span_in_buf.end as u32,
+                        root_hint_start: base_offset + root_span_hint.start as u64,
+                        root_hint_end: base_offset + root_span_hint.end as u64,
+                        dedupe_with_span,
+                        step_id,
+                    });
+                    scratch.tmp_drop_hint_end.push(drop_hint_end);
+                    scratch.tmp_norm_hash.push(norm_hash);
                 }
             }
         });
@@ -955,7 +918,6 @@ impl Engine {
     ///
     /// # Effects
     /// - Sets `found_any` when any match passes gates.
-    /// - Increments `dropped` when the per-chunk findings cap is exceeded.
     ///
     /// # Edge cases
     /// - Returns early when decode budgets are exhausted or decoding fails.
@@ -972,7 +934,6 @@ impl Engine {
         base_offset: u64,
         file_id: FileId,
         scratch: &mut ScanScratch,
-        dropped: &mut usize,
         found_any: &mut bool,
     ) {
         // Contract mirrors `run_rule_on_utf16_window_aligned` but writes into
@@ -1063,7 +1024,6 @@ impl Engine {
             },
         );
 
-        let max_findings = scratch.max_findings;
         let entropy = self.entropy_gate(rule.entropy);
         let value_suppressors = self.value_suppressor_gate(rule.value_suppressors);
         let mut locs = scratch.capture_locs[rule_id as usize]
@@ -1127,34 +1087,30 @@ impl Engine {
                         root_hint.clone().unwrap_or(mapped_span)
                     };
 
-                    if scratch.tmp_findings.len() < max_findings {
-                        let mut drop_hint_end = root_span_hint.end;
-                        if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
-                            if let Some(end) = ctx.drop_hint_end_for_match(root_span_hint.clone()) {
-                                drop_hint_end = drop_hint_end.max(end);
-                            }
+                    let mut drop_hint_end = root_span_hint.end;
+                    if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
+                        if let Some(end) = ctx.drop_hint_end_for_match(root_span_hint.clone()) {
+                            drop_hint_end = drop_hint_end.max(end);
                         }
-                        let drop_hint_end = base_offset + drop_hint_end as u64;
-                        // Include span in dedupe key for root findings or when root-span mapping
-                        // is unavailable. See run_rule_on_raw_window_into for full rationale.
-                        let dedupe_with_span =
-                            utf16_step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
-                        let norm_hash = *blake3::hash(secret_bytes).as_bytes();
-                        scratch.tmp_findings.push(FindingRec {
-                            file_id,
-                            rule_id,
-                            span_start: secret_start as u32,
-                            span_end: secret_end as u32,
-                            root_hint_start: base_offset + root_span_hint.start as u64,
-                            root_hint_end: base_offset + root_span_hint.end as u64,
-                            dedupe_with_span,
-                            step_id: utf16_step_id,
-                        });
-                        scratch.tmp_drop_hint_end.push(drop_hint_end);
-                        scratch.tmp_norm_hash.push(norm_hash);
-                    } else {
-                        *dropped = dropped.saturating_add(1);
                     }
+                    let drop_hint_end = base_offset + drop_hint_end as u64;
+                    // Include span in dedupe key for root findings or when root-span mapping
+                    // is unavailable. See run_rule_on_raw_window_into for full rationale.
+                    let dedupe_with_span =
+                        utf16_step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
+                    let norm_hash = *blake3::hash(secret_bytes).as_bytes();
+                    scratch.tmp_findings.push(FindingRec {
+                        file_id,
+                        rule_id,
+                        span_start: secret_start as u32,
+                        span_end: secret_end as u32,
+                        root_hint_start: base_offset + root_span_hint.start as u64,
+                        root_hint_end: base_offset + root_span_hint.end as u64,
+                        dedupe_with_span,
+                        step_id: utf16_step_id,
+                    });
+                    scratch.tmp_drop_hint_end.push(drop_hint_end);
+                    scratch.tmp_norm_hash.push(norm_hash);
                 }
             }
         });
@@ -1179,7 +1135,6 @@ impl Engine {
         base_offset: u64,
         file_id: FileId,
         scratch: &mut ScanScratch,
-        dropped: &mut usize,
         found_any: &mut bool,
         anchor_hint: u64,
     ) {
@@ -1201,7 +1156,6 @@ impl Engine {
                 base_offset,
                 file_id,
                 scratch,
-                dropped,
                 found_any,
             );
             if scratch.total_decode_output_bytes >= self.tuning.max_total_decode_output_bytes {
