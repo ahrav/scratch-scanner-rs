@@ -137,8 +137,17 @@ graph TB
         ValueSuppressorsAny["value_suppressors_any: Option<&'static [&'static [u8]]>"]
         Entropy["entropy: Option<EntropySpec>"]
         LocalContext["local_context: Option<LocalContextSpec>"]
+        OfflineValidation["offline_validation: Option<OfflineValidationSpec>"]
         SecretGroup["secret_group: Option<u16>"]
         Regex["re: Regex"]
+    end
+
+    subgraph OfflineValidationSpec["OfflineValidationSpec (optional)"]
+        OvCrc32["Crc32Base62 { prefix_skip, payload_len, checksum_len }"]
+        OvGhPat["GithubFinegrainedPat"]
+        OvGrafana["GrafanaServiceAccount"]
+        OvAws["AwsAccessKey"]
+        OvSentry["SentryOrgToken"]
     end
 
     subgraph TwoPhaseSpec["TwoPhaseSpec (optional)"]
@@ -264,6 +273,7 @@ rules:
   entropy: null
   two_phase: null
   local_context: null
+  offline_validation: null
   secret_group: null
 ```
 

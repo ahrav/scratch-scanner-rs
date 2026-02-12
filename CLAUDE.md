@@ -181,8 +181,5 @@ are updated in the same PR:
 | `src/engine/core.rs` (Engine gate pool vectors) | `docs/data-types.md` (Engine class), `docs/detection-engine.md` (flow diagram) |
 | `default_rules.yaml` (rule additions/removals) | `docs/detection-rules.md` (Current Snapshot counts) |
 
-The `cargo test --test integration doc_consistency` suite enforces structural
-invariants automatically. Semantic accuracy of explanations must be reviewed
-manually or by code review.
 
 See AGENTS.md for full project details.
