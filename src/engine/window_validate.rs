@@ -733,7 +733,7 @@ impl Engine {
                     if self.suppress_root_finding_by_safelist(
                         buf,
                         base_offset,
-                        step_id,
+                        utf16_step_id,
                         root_hint_start,
                         root_hint_end,
                         &mut last_safelist_decision,
@@ -1135,7 +1135,7 @@ impl Engine {
                     if self.suppress_root_finding_by_safelist(
                         raw_win,
                         base_offset.saturating_add(window_start),
-                        step_id,
+                        utf16_step_id,
                         root_hint_start,
                         root_hint_end,
                         &mut last_safelist_decision,

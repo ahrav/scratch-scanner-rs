@@ -1167,6 +1167,49 @@ fn safelist_emit_time_filter_keeps_non_root_findings() {
 }
 
 #[test]
+fn safelist_emit_time_filter_does_not_suppress_utf16_root_emission() {
+    let rule = RuleSpec {
+        name: "safelist-utf16-root-emission",
+        anchors: &[b"placeholder_token"],
+        radius: 64,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        local_context: None,
+        secret_group: None,
+        re: Regex::new(r"placeholder_token").unwrap(),
+    };
+
+    let mut tuning = demo_tuning();
+    tuning.scan_utf16_variants = true;
+    let engine =
+        Engine::new_with_anchor_policy(vec![rule], Vec::new(), tuning, AnchorPolicy::ManualOnly);
+
+    let mut scratch = engine.new_scratch();
+    let hay = utf16le_bytes(b"placeholder_token");
+    engine.scan_chunk_into(&hay, FileId(0), 0, &mut scratch);
+
+    let recs = scratch.findings();
+    assert_eq!(
+        recs.len(),
+        1,
+        "utf16 root emissions are tagged with decode steps and must bypass root-only safelist suppression"
+    );
+    assert_ne!(
+        recs[0].step_id, STEP_ROOT,
+        "utf16 finding from root input should have a utf16 decode step id"
+    );
+    assert_eq!(
+        scratch.safelist_suppressed(),
+        0,
+        "root-only safelist suppression must not drop utf16 root emissions"
+    );
+}
+
+#[test]
 fn safelist_suppression_does_not_consume_findings_cap() {
     let rule = RuleSpec {
         name: "safelist-cap-ordering",
