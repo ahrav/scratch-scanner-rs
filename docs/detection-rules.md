@@ -37,7 +37,6 @@ Suppression is split between rule-level secret filtering and engine-level post-s
 |-----------|---------------------|---------|--------|
 | `value_suppressors_any` | Per-rule YAML (`RuleSpec.value_suppressors_any`) | Extracted secret bytes | Window validation post-match gate |
 | Global safelist | Engine policy (`SafelistFilter`) | Root-match context slice | Post-scan filtering/compaction |
-| Offline validation verdicts | Offline policy layer (when enabled) | Finding-level structural/context evidence | Post-scan filtering/compaction |
 
 Examples:
 
@@ -45,7 +44,7 @@ Examples:
 2. **Safelist**: a real-looking bearer token in documentation-style context (for example hosts/placeholders) can be filtered by post-scan safelist even when the secret bytes do not match `value_suppressors_any`.
 3. **Non-safelisted context**: the same token in production-like context (for example `api.internal`) remains reportable if other gates pass.
 
-`value_suppressors_any` is the only suppression control encoded directly in rule YAML today; safelist and offline-policy suppression are deliberately outside rule-gate sequencing and run in post-scan filtering.
+`value_suppressors_any` is the only suppression control encoded directly in rule YAML today; safelist suppression is deliberately outside rule-gate sequencing and runs in post-scan filtering.
 
 ## Rule Families (Representative Only)
 

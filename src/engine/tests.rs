@@ -1209,6 +1209,63 @@ fn safelist_suppression_does_not_consume_findings_cap() {
 }
 
 #[test]
+fn max_findings_cap_applies_after_safelist_suppression() {
+    let rule = RuleSpec {
+        name: "safelist-cap-post-suppression",
+        anchors: &[b"token"],
+        radius: 128,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        local_context: None,
+        secret_group: None,
+        re: Regex::new(r"(?:placeholder_token|prod_token_[A-Z0-9]{6})").unwrap(),
+    };
+
+    let mut tuning = demo_tuning();
+    tuning.max_findings_per_chunk = 2;
+
+    let engine =
+        Engine::new_with_anchor_policy(vec![rule], Vec::new(), tuning, AnchorPolicy::ManualOnly);
+
+    let mut scratch = engine.new_scratch();
+    let hay = b"placeholder_token prod_token_A1B2C3 prod_token_D4E5F6 prod_token_G7H8I9";
+    engine.scan_chunk_into(hay, FileId(0), 0, &mut scratch);
+
+    let recs = scratch.findings();
+    assert_eq!(
+        recs.len(),
+        2,
+        "post-scan cap should be enforced after safelist suppression"
+    );
+    let spans: Vec<&[u8]> = recs
+        .iter()
+        .map(|rec| &hay[rec.span_start as usize..rec.span_end as usize])
+        .collect();
+    assert_eq!(
+        spans,
+        vec![
+            b"prod_token_A1B2C3".as_slice(),
+            b"prod_token_D4E5F6".as_slice()
+        ],
+        "cap should trim only after placeholder suppression"
+    );
+    assert_eq!(
+        scratch.safelist_suppressed(),
+        1,
+        "placeholder should be suppressed by safelist before cap truncation"
+    );
+    assert_eq!(
+        scratch.dropped_findings(),
+        1,
+        "only findings above post-suppression cap should count as dropped"
+    );
+}
+
+#[test]
 fn safelist_post_scan_filter_noop_keeps_all_non_safelisted_roots() {
     let rule = RuleSpec {
         name: "safelist-noop-root",

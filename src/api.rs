@@ -869,7 +869,7 @@ mod tests {
 /// # Trade-offs
 /// - Window coalescing limits bound CPU cost but may widen validation windows.
 /// - Decode/work-item caps can skip derived buffers when exceeded.
-/// - `max_findings_per_chunk` is a hard cap; excess findings are dropped.
+/// - `max_findings_per_chunk` is enforced after post-scan suppression.
 #[derive(Clone, Debug)]
 pub struct Tuning {
     /// Window merge gap in bytes when coalescing adjacent anchor hits.
@@ -901,7 +901,7 @@ pub struct Tuning {
     /// Hard cap on number of enqueued decoded buffers (DoS control).
     pub max_work_items: usize,
 
-    /// Hard cap on findings per buffer/chunk.
+    /// Final hard cap on findings emitted per buffer/chunk after suppression.
     pub max_findings_per_chunk: usize,
 
     /// Whether to scan UTF-16 anchor variants at all.

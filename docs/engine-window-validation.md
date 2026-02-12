@@ -22,7 +22,7 @@ Two entry styles are supported:
 - **Finding extraction**: Record matches with proper span information and secret data extraction
 - **Entropy validation**: Gate findings on Shannon entropy of matched tokens
 - **Value suppression**: Discard findings whose extracted secret contains known placeholder/example patterns
-- **Post-scan handoff**: Emit candidate findings for policy filters that run after window validation
+- **Post-scan handoff**: Emit candidate findings for policy filtering and final cap enforcement
 
 ---
 
@@ -122,7 +122,6 @@ Early returns occur when:
 
 Late returns occur when:
 - Entropy gates reject a match (continues to next match, not full return)
-- Finding buffer capacity is reached (finding is dropped but processing continues)
 
 ---
 
@@ -244,6 +243,7 @@ filtering applies policy suppression such as:
 
 - Global safelist checks on root-span context
 - Offline validation verdict filtering (when enabled)
+- Final findings-cap enforcement (`max_findings_per_chunk`) after suppression
 
 These controls are intentionally kept out of window-gate ordering so rule
 validation semantics stay focused on pattern correctness, while policy
@@ -444,17 +444,10 @@ scratch.push_finding_with_drop_hint(
 
 ### Capacity Management
 
-Findings are stored in scratch buffers with configurable limits:
-
-```rust
-if out.len() < max_findings {
-    out.push(FindingRec { ... });
-} else {
-    *dropped = dropped.saturating_add(1);
-}
-```
-
-Excess findings are counted in `dropped` for metrics but not stored.
+This module emits candidate findings into scratch. Final cap enforcement
+(`max_findings_per_chunk`) is applied in post-scan filtering after suppression.
+Scratch keeps a bounded pre-cap candidate budget for safety; overflow increments
+drop counters.
 
 ### Coordinate Spaces
 
@@ -632,7 +625,7 @@ Two limits prevent DoS via massive UTF-16 expansion:
 
 Findings written to scratch buffers (not directly to results) because:
 - Allows findings to be filtered/deduplicated in parent modules
-- Supports per-window finding caps without allocating separate buffers
+- Keeps hot-path validation focused on matching while post-scan applies policy/cap decisions
 - Enables post-processing (e.g., sorting, merging)
 
 ---
@@ -647,4 +640,4 @@ Findings written to scratch buffers (not directly to results) because:
 6. All early returns occur before findings are recorded
 7. Findings are appended to scratch (never removed or reordered during function execution)
 8. Entropy gates continue to next match (not early return)
-9. Finding capacity overflow increments drop counter but doesn't invalidate other findings
+9. Suppression and final cap truncation are post-scan concerns, outside this module

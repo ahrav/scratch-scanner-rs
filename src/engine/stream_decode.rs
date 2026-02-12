@@ -412,7 +412,6 @@ impl Engine {
         let mut truncated = false;
         let mut prefilter_gate_hit = false;
         let mut found_any = false;
-        let mut local_dropped = 0usize;
 
         if gate_enabled {
             if let Some(db) = self.vs_gate.as_ref() {
@@ -463,7 +462,6 @@ impl Engine {
                               hi: u64,
                               scratch: &mut ScanScratch,
                               found_any: &mut bool,
-                              local_dropped: &mut usize,
                               force_full: &mut bool| {
             if *force_full {
                 return;
@@ -511,7 +509,6 @@ impl Engine {
                         base_offset,
                         file_id,
                         scratch,
-                        local_dropped,
                         found_any,
                         win.anchor_hint,
                     );
@@ -528,7 +525,6 @@ impl Engine {
                         base_offset,
                         file_id,
                         scratch,
-                        local_dropped,
                         found_any,
                         win.anchor_hint,
                     );
@@ -547,7 +543,6 @@ impl Engine {
         // derive from stack locals in this function and do not escape it.
         let scratch_ptr = scratch as *mut ScanScratch;
         let found_any_ptr = &mut found_any as *mut bool;
-        let local_dropped_ptr = &mut local_dropped as *mut usize;
         let force_full_ptr = &mut force_full as *mut bool;
 
         if depth < self.tuning.max_transform_depth {
@@ -829,14 +824,7 @@ impl Engine {
                         Ok(PushOutcome::Scheduled) => {}
                         Ok(PushOutcome::Ready(win)) => {
                             let hi = win.hi.min(decoded_offset);
-                            process_window(
-                                win,
-                                hi,
-                                scratch,
-                                &mut found_any,
-                                &mut local_dropped,
-                                &mut force_full,
-                            );
+                            process_window(win, hi, scratch, &mut found_any, &mut force_full);
                             if force_full {
                                 break;
                             }
@@ -864,13 +852,12 @@ impl Engine {
                     // SAFETY: pending_windows is mutably borrowed; we only touch other fields.
                     let scratch = unsafe { &mut *scratch_ptr };
                     let found_any = unsafe { &mut *found_any_ptr };
-                    let local_dropped = unsafe { &mut *local_dropped_ptr };
                     let force_full = unsafe { &mut *force_full_ptr };
                     if *force_full {
                         return;
                     }
                     let hi = win.hi.min(decoded_offset);
-                    process_window(win, hi, scratch, found_any, local_dropped, force_full);
+                    process_window(win, hi, scratch, found_any, force_full);
                 });
 
             if force_full {
@@ -1137,14 +1124,7 @@ impl Engine {
                         Ok(PushOutcome::Scheduled) => {}
                         Ok(PushOutcome::Ready(win)) => {
                             let hi = win.hi.min(decoded_offset);
-                            process_window(
-                                win,
-                                hi,
-                                scratch,
-                                &mut found_any,
-                                &mut local_dropped,
-                                &mut force_full,
-                            );
+                            process_window(win, hi, scratch, &mut found_any, &mut force_full);
                             if force_full {
                                 break;
                             }
@@ -1302,13 +1282,12 @@ impl Engine {
                 // SAFETY: pending_windows is mutably borrowed; we only touch other fields.
                 let scratch = unsafe { &mut *scratch_ptr };
                 let found_any = unsafe { &mut *found_any_ptr };
-                let local_dropped = unsafe { &mut *local_dropped_ptr };
                 let force_full = unsafe { &mut *force_full_ptr };
                 if *force_full {
                     return;
                 }
                 let hi = win.hi.min(final_offset);
-                process_window(win, hi, scratch, found_any, local_dropped, force_full);
+                process_window(win, hi, scratch, found_any, force_full);
             });
         }
 
@@ -1502,7 +1481,6 @@ impl Engine {
                                         base_offset,
                                         file_id,
                                         scratch,
-                                        &mut local_dropped,
                                         &mut found_any,
                                         span.anchor_hint as u64,
                                     );
@@ -1524,7 +1502,6 @@ impl Engine {
                                         base_offset,
                                         file_id,
                                         scratch,
-                                        &mut local_dropped,
                                         &mut found_any,
                                         span.anchor_hint as u64,
                                     );
@@ -1609,9 +1586,6 @@ impl Engine {
             return;
         }
 
-        if local_dropped > 0 {
-            scratch.findings_dropped = scratch.findings_dropped.saturating_add(local_dropped);
-        }
         // Commit staged findings now that streaming succeeded and dedupe passed.
         // `mem::take` + put-back avoids double-borrowing `scratch` while draining.
         let mut tmp_findings = std::mem::take(&mut scratch.tmp_findings);

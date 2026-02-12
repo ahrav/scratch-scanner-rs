@@ -41,9 +41,10 @@ flowchart TB
         LocalCtx["Local context gate<br/>(optional, fail-open)"]
     end
 
-    subgraph PostScan["Post-Scan Compaction"]
+    subgraph PostScan["Post-Scan Finalization"]
         Safelist["Root-context safelist check<br/>(step_id == STEP_ROOT)"]
         Compact["In-place compaction<br/>(out + sidecars aligned)"]
+        Cap["Final findings cap<br/>(max_findings_per_chunk)"]
     end
 
     subgraph Output["Output"]
@@ -83,7 +84,8 @@ flowchart TB
     LocalCtx --> FindingRec
     FindingRec --> Safelist
     Safelist --> Compact
-    Compact --> FinalRec
+    Compact --> Cap
+    Cap --> FinalRec
 
     style Input fill:#e3f2fd
     style AnchorScan fill:#fff3e0
@@ -250,9 +252,9 @@ see [fs-persistence-pipeline.md § SQLite Backend](fs-persistence-pipeline.md#sq
 
 **Pressure Coalescing**: If windows exceed `max_windows_per_rule_variant` (16), the gap doubles until windows fit, or everything merges into one.
 
-### Post-Scan Compaction
+### Post-Scan Finalization
 
-After work-queue processing, the engine runs a post-scan compaction pass:
+After work-queue processing, the engine runs a post-scan finalization pass:
 
 - Evaluate the global safelist only for root findings (`step_id == STEP_ROOT`).
 - Derive the safelist context from `root_hint_start..root_hint_end` (clamped to
@@ -260,6 +262,8 @@ After work-queue processing, the engine runs a post-scan compaction pass:
 - Suppress safelisted root findings and compact `out`, `norm_hash`, and
   `drop_hint_end` in-place with a single write cursor.
 - Preserve non-root (transform-derived) findings for downstream phases.
+- Apply `max_findings_per_chunk` **after** suppression by truncating aligned
+  finding sidecars; excess findings increment `dropped_findings`.
 
 ### Seed Confirmation + Expansion
 
@@ -381,7 +385,7 @@ These gates are designed to be **local and bounded**:
 | `max_transform_depth` | 3 | Max nested decode steps (root + transforms) |
 | `max_total_decode_output_bytes` | 512 KiB | Global decoded output budget per scan |
 | `max_work_items` | 256 | Cap on queued decode work items per scan |
-| `max_findings_per_chunk` | 8192 | Hard cap on findings per chunk |
+| `max_findings_per_chunk` | 8192 | Final cap on findings per chunk after suppression |
 | `scan_utf16_variants` | true | Enable UTF-16 anchor variants |
 
 Derived (non-config) limits used by streaming decode:
