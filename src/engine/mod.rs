@@ -6,7 +6,7 @@
 //! 2. Prefilter input buffers (Vectorscan / gates) to build candidate windows.
 //! 3. Validate windows with regexes/validators and record compact findings.
 //! 4. Optionally decode transform spans into derived buffers and repeat via BFS.
-//! 5. Optionally apply post-validation suppression policies before final emission.
+//! 5. Apply suppression policies at finding emission sites before final output.
 //!
 //! # Module Layout
 //! - `core`: immutable engine configuration and compiled rule state.
