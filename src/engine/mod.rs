@@ -102,6 +102,10 @@ pub use core::{
     bench_contains_any_memmem, bench_find_spans_into, bench_pack_patterns_raw,
     bench_stream_decode_base64, bench_stream_decode_url, BenchPackedPatterns,
 };
+#[cfg(feature = "bench")]
+pub use offline_validate::{
+    bench_offline_validate_aws_access_key, bench_offline_validate_sentry_org_token,
+};
 
 #[cfg(feature = "tiger-harness")]
 pub use vs_cache::fuzz_try_load;

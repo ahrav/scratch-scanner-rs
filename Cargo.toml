@@ -102,6 +102,11 @@ harness = false
 required-features = ["bench"]
 
 [[bench]]
+name = "offline_validation"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
 name = "timing_wheel"
 harness = false
 
@@ -178,14 +183,17 @@ inherits = "release"
 [[test]]
 name = "integration"
 path = "tests/integration/main.rs"
+required-features = ["integration-tests"]
 
 [[test]]
 name = "smoke"
 path = "tests/smoke/main.rs"
+required-features = ["smoke-tests"]
 
 [[test]]
 name = "property"
 path = "tests/property/main.rs"
+required-features = ["property-tests"]
 
 [[test]]
 name = "simulation"
@@ -195,6 +203,7 @@ path = "tests/simulation/main.rs"
 [[test]]
 name = "diagnostic"
 path = "tests/diagnostic/main.rs"
+required-features = ["diagnostic-tests"]
 
 # ============================================================================
 # Examples

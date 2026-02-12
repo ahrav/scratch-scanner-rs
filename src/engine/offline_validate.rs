@@ -249,32 +249,27 @@ fn validate_aws_access_key(secret: &[u8]) -> OfflineVerdict {
         || key.starts_with(b"ASIA")
         || key.starts_with(b"ABIA")
         || key.starts_with(b"ACCA")
-        || (key.starts_with(b"A3T")
-            && key
-                .get(3)
-                .map_or(false, |b| b.is_ascii_uppercase() || b.is_ascii_digit()));
+        || (key.starts_with(b"A3T") && (key[3].is_ascii_uppercase() || key[3].is_ascii_digit()));
 
     if !valid_prefix {
         return OfflineVerdict::Indeterminate;
     }
 
-    // Validate character set for positions 4..20: must be [A-Z2-7].
+    // Decode the base-32 suffix to extract the embedded account ID. Invalid
+    // charset bytes are treated as Invalid once the fixed length/prefix checks
+    // have passed.
     let suffix = &key[4..];
-    for &b in suffix {
-        match b {
-            b'A'..=b'Z' | b'2'..=b'7' => {}
-            _ => return OfflineVerdict::Invalid,
-        }
+    if !matches!(suffix[0], b'A'..=b'Z' | b'2'..=b'7') {
+        return OfflineVerdict::Invalid;
     }
 
-    // Decode the base-32 suffix to extract the embedded account ID.
-    // AWS encodes a 40-bit account number in bits [1..41] of the 80-bit
-    // decoded value (16 base-32 chars = 80 bits). The account ID must be
-    // a valid AWS account number (≤ 999_999_999_999).
+    // AWS encodes a 40-bit account number in bits [1..41] of the 80-bit decoded
+    // value (16 base-32 chars = 80 bits). The account ID must be a valid AWS
+    // account number (≤ 999_999_999_999).
     match decode_aws_account_id(suffix) {
         Some(id) if id <= 999_999_999_999 => OfflineVerdict::Valid,
         Some(_) => OfflineVerdict::Invalid,
-        None => OfflineVerdict::Indeterminate,
+        None => OfflineVerdict::Invalid,
     }
 }
 
@@ -303,13 +298,14 @@ fn decode_aws_account_id(suffix: &[u8]) -> Option<u64> {
         bit_buf = (bit_buf << 5) | val;
         bits_in_buf += 5;
 
-        while bits_in_buf >= 8 && out_idx < 10 {
+        while bits_in_buf >= 8 {
             bits_in_buf -= 8;
             decoded[out_idx] = (bit_buf >> bits_in_buf) as u8;
             bit_buf &= (1u64 << bits_in_buf) - 1;
             out_idx += 1;
         }
     }
+    debug_assert_eq!(out_idx, decoded.len());
 
     // Account ID is in bits [1..41] from the MSB of the 80-bit value.
     // In byte terms: skip bit 0 of decoded[0], then take 40 bits.
@@ -368,27 +364,14 @@ fn validate_sentry_org_token(secret: &[u8]) -> OfflineVerdict {
         return OfflineVerdict::Indeterminate;
     }
 
-    // Validate payload chars are base64 (with optional `=` padding at end).
-    if !payload_b64.iter().all(|&b| is_base64_char(b) || b == b'=') {
-        return OfflineVerdict::Invalid;
-    }
-
-    // Decode the base64 payload into a stack buffer. 512 bytes covers the
-    // typical Sentry JSON payload (~100-200 bytes decoded); oversized tokens
-    // fall through to Indeterminate via the None path.
-    let mut decode_buf = [0u8; 512];
-    let decoded_len = match base64_decode(payload_b64, &mut decode_buf) {
-        Some(n) => n,
-        None => return OfflineVerdict::Indeterminate,
-    };
-
-    let decoded = &decode_buf[..decoded_len];
-
-    // The decoded payload should be JSON starting with `{"iat":`.
-    if decoded.starts_with(b"{\"iat\":") {
-        OfflineVerdict::Valid
-    } else {
-        OfflineVerdict::Invalid
+    // Validate and decode in one pass while only checking the decoded prefix.
+    // A 512-byte decoded cap preserves existing conservative behavior on
+    // oversized payloads.
+    match base64_decoded_starts_with(payload_b64, b"{\"iat\":", 512) {
+        Ok(true) => OfflineVerdict::Valid,
+        Ok(false) => OfflineVerdict::Invalid,
+        Err(Base64DecodeError::InvalidChar) => OfflineVerdict::Invalid,
+        Err(Base64DecodeError::OutputTooSmall) => OfflineVerdict::Indeterminate,
     }
 }
 
@@ -396,6 +379,12 @@ fn validate_sentry_org_token(secret: &[u8]) -> OfflineVerdict {
 #[inline]
 fn is_base64_char(b: u8) -> bool {
     matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/')
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Base64DecodeError {
+    InvalidChar,
+    OutputTooSmall,
 }
 
 /// Minimal base64 decoder into a caller-provided buffer (no heap allocation).
@@ -437,6 +426,86 @@ fn base64_decode(input: &[u8], output: &mut [u8]) -> Option<usize> {
     }
 
     Some(out_idx)
+}
+
+/// Validate base64 input and check whether decoded bytes start with `prefix`.
+///
+/// This decodes and validates the entire input but only compares emitted bytes
+/// against `prefix` instead of writing the full decoded payload to memory.
+fn base64_decoded_starts_with(
+    input: &[u8],
+    prefix: &[u8],
+    max_decoded_bytes: usize,
+) -> Result<bool, Base64DecodeError> {
+    let max_decoded = input.len() * 3 / 4;
+    if max_decoded > max_decoded_bytes {
+        return Err(Base64DecodeError::OutputTooSmall);
+    }
+
+    let mut buf: u32 = 0;
+    let mut buf_bits: u32 = 0;
+    let mut prefix_idx = 0usize;
+    let mut matches_prefix = true;
+    let mut decode_prefix = !prefix.is_empty();
+
+    for &b in input {
+        let val = match b {
+            b'A'..=b'Z' => (b - b'A') as u32,
+            b'a'..=b'z' => (b - b'a') as u32 + 26,
+            b'0'..=b'9' => (b - b'0') as u32 + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => continue,
+            _ => return Err(Base64DecodeError::InvalidChar),
+        };
+
+        if !decode_prefix {
+            continue;
+        }
+
+        buf = (buf << 6) | val;
+        buf_bits += 6;
+
+        while buf_bits >= 8 && decode_prefix {
+            buf_bits -= 8;
+            let decoded = (buf >> buf_bits) as u8;
+            buf &= (1u32 << buf_bits) - 1;
+
+            if decoded != prefix[prefix_idx] {
+                matches_prefix = false;
+                decode_prefix = false;
+                break;
+            }
+
+            prefix_idx += 1;
+            if prefix_idx == prefix.len() {
+                decode_prefix = false;
+            }
+        }
+    }
+
+    if prefix_idx < prefix.len() {
+        return Ok(false);
+    }
+    Ok(matches_prefix)
+}
+
+// ---------------------------------------------------------------------------
+// Bench-only exports
+// ---------------------------------------------------------------------------
+
+/// Bench hook for AWS access-key offline validation.
+#[cfg(feature = "bench")]
+#[inline(always)]
+pub fn bench_offline_validate_aws_access_key(secret: &[u8]) -> bool {
+    matches!(validate_aws_access_key(secret), OfflineVerdict::Valid)
+}
+
+/// Bench hook for Sentry org-token offline validation.
+#[cfg(feature = "bench")]
+#[inline(always)]
+pub fn bench_offline_validate_sentry_org_token(secret: &[u8]) -> bool {
+    matches!(validate_sentry_org_token(secret), OfflineVerdict::Valid)
 }
 
 // ---------------------------------------------------------------------------
@@ -758,6 +827,18 @@ mod tests {
         token.push(b'_');
         let sig: Vec<u8> = std::iter::repeat(b'A').take(43).collect();
         token.extend_from_slice(&sig);
+
+        assert_eq!(
+            validate(OfflineValidationSpec::SentryOrgToken, &token),
+            OfflineVerdict::Invalid,
+        );
+    }
+
+    #[test]
+    fn sentry_invalid_payload_char() {
+        let mut token = Vec::new();
+        token.extend_from_slice(b"sntrys_eyJpYXQiO@==_");
+        token.extend_from_slice(&[b'A'; 43]);
 
         assert_eq!(
             validate(OfflineValidationSpec::SentryOrgToken, &token),
