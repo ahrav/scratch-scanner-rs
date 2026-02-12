@@ -277,10 +277,19 @@ pub struct ParallelScanConfig {
     /// to contain secrets but would consume significant scan time.
     pub max_file_size: u64,
 
-    /// Archive scanning configuration.
+    /// Archive scanning configuration (zip, tar, gzip, etc.).
+    ///
+    /// When enabled, the scanner decompresses recognized archive formats
+    /// inline and scans their contents. Tuning parameters control max
+    /// nesting depth, per-entry size limits, and total extracted bytes to
+    /// bound memory and CPU during decompression.
     pub archive: ArchiveConfig,
 
     /// Pin worker threads to CPU cores (Linux only, no-op elsewhere).
+    ///
+    /// Pinning improves cache locality and reduces cross-NUMA memory traffic
+    /// on multi-socket machines. On single-socket systems the benefit is
+    /// marginal and the OS scheduler may make better placement decisions.
     pub pin_threads: bool,
 
     /// When `true`, skip files that appear to be binary (NUL byte heuristic).
@@ -357,6 +366,11 @@ impl ParallelScanConfig {
     /// options (`follow_symlinks`, `skip_hidden`, `respect_gitignore`) are handled
     /// during file collection. `max_file_size` is enforced both at discovery and
     /// open time.
+    ///
+    /// `dedupe_within_chunk` is hardcoded to `true` because directory scans
+    /// always process overlapping chunks and must suppress duplicate findings
+    /// at chunk boundaries. Callers that need to disable dedup should use
+    /// `scan_local` directly.
     fn to_local_config(&self) -> LocalConfig {
         LocalConfig {
             workers: self.workers,
@@ -382,7 +396,14 @@ impl ParallelScanConfig {
 
 /// Report from a parallel directory scan.
 ///
-/// This is currently identical to `LocalReport` (stats + metrics snapshot).
+/// Contains [`LocalReport::stats`](super::local_fs_owner::LocalReport::stats)
+/// (files enqueued, I/O errors) and
+/// [`LocalReport::metrics`](super::local_fs_owner::LocalReport::metrics)
+/// (bytes scanned, chunks processed, findings emitted).
+///
+/// This is a type alias today; it exists as a separate name so that
+/// directory-scan callers are insulated if the report grows fields that
+/// don't apply to raw `scan_local` usage.
 pub type ParallelScanReport = LocalReport;
 
 // ============================================================================

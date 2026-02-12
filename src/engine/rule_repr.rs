@@ -171,6 +171,11 @@ const _: () = assert!(std::mem::size_of::<PackedPatterns>() == 32);
 
 /// Builder for [`PackedPatterns`] that accumulates patterns using `Vec`
 /// internally, then freezes into boxed slices.
+///
+/// # Invariants maintained during building
+/// - `offsets[0] == 0` (established at construction).
+/// - Each `push_*` call appends bytes and records a new offset.
+/// - `bytes.len() <= u32::MAX` (asserted on each push).
 pub(super) struct PackedPatternsBuilder {
     bytes: Vec<u8>,
     offsets: Vec<u32>,
@@ -289,6 +294,10 @@ pub(super) struct ConfirmAllCompiled {
 }
 
 /// Entropy gate parameters compiled into a rule.
+///
+/// Copied from the validated [`crate::api::EntropySpec`] at compile time to
+/// avoid repeated lookups through the rule spec during scanning. See
+/// `EntropySpec` for the entropy algorithm description.
 ///
 /// # Invariants
 /// - Values are validated by `RuleSpec::assert_valid`.
@@ -584,7 +593,10 @@ pub(super) fn map_to_patterns(
     (patterns, flat, offsets)
 }
 
-/// Convert ASCII bytes to UTF-16LE encoding (byte -> code unit).
+/// Convert ASCII bytes to UTF-16LE encoding (one byte → one code unit).
+///
+/// Input is assumed to be ASCII (bytes 0x00–0x7F). Non-ASCII input produces
+/// technically invalid UTF-16 but is still useful for byte-level literal matching.
 pub(super) fn utf16le_bytes(ascii: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(ascii.len() * 2);
     for &b in ascii {
@@ -594,7 +606,10 @@ pub(super) fn utf16le_bytes(ascii: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Convert ASCII bytes to UTF-16BE encoding (byte -> code unit).
+/// Convert ASCII bytes to UTF-16BE encoding (one byte → one code unit).
+///
+/// Input is assumed to be ASCII (bytes 0x00–0x7F). Non-ASCII input produces
+/// technically invalid UTF-16 but is still useful for byte-level literal matching.
 pub(super) fn utf16be_bytes(ascii: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(ascii.len() * 2);
     for &b in ascii {

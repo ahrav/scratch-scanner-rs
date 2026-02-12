@@ -5,6 +5,24 @@
 //! [`RootSpanMapCtx`] for translating decoded-byte offsets back to root-buffer
 //! coordinates during transform scans. Scratch state is single-threaded and
 //! reused across chunks to keep the hot path allocation-free.
+//!
+//! # Layout
+//!
+//! `ScanScratch` uses a `#[repr(C)]` layout with an explicit 64-byte cache-line
+//! boundary separating hot-path fields (findings, work queue, hit accumulators)
+//! from cold fields (decode slab, ring buffer, Vectorscan scratch). See the
+//! struct-level docs for the full field map.
+//!
+//! # Lifecycle
+//!
+//! 1. Allocate via [`ScanScratch::new`] — pre-sizes all buffers to the engine's
+//!    tuning parameters.
+//! 2. Per-chunk: call [`ScanScratch::reset_for_scan`] (or
+//!    [`ScanScratch::reset_for_scan_after_prefilter`]) to clear per-scan state
+//!    while preserving allocations.
+//! 3. Scan: the engine populates findings, work items, and decode steps.
+//! 4. Drain: [`ScanScratch::drain_findings`] or
+//!    [`ScanScratch::drain_findings_with_hashes`] extracts results.
 
 use crate::api::{
     DecodeStep, FileId, FindingRec, StepId, TransformConfig, TransformId, TransformMode, STEP_ROOT,
@@ -70,9 +88,18 @@ pub(super) struct EntropyScratch {
 /// This context captures the encoded span being decoded so that decoded offsets
 /// can be translated back to root-buffer offsets for deduplication and output.
 ///
-/// # Safety
+/// # Raw pointers
+///
+/// This type stores `*const TransformConfig` and `*const u8` (encoded bytes)
+/// to avoid lifetime entanglement with the engine and buffer references.
+/// Both pointers reference data owned by the `Engine` (immutable after
+/// construction) and the current scan buffer, which outlive the context.
+///
+/// # Safety contract
 /// - `tc` and `encoded_ptr`/`encoded_len` must remain valid while this
-///   context is set (cleared after each buffer scan completes).
+///   context is set. The scan loop in `core.rs` clears `root_span_map_ctx`
+///   to `None` after each buffer scan completes.
+/// - See the `unsafe impl Send` block below for cross-thread reasoning.
 #[derive(Clone, Copy)]
 pub(super) struct RootSpanMapCtx {
     tc: *const TransformConfig,
@@ -263,7 +290,10 @@ impl EntropyScratch {
         }
     }
 
-    /// Reset only the touched counters listed in `used`.
+    /// Resets only the histogram bins that were incremented since the last reset.
+    ///
+    /// This is O(distinct byte values seen) rather than O(256), which matters
+    /// when entropy checks are frequent but candidate matches are short.
     #[inline]
     pub(super) fn reset(&mut self) {
         let used_len = self.used_len as usize;
@@ -415,8 +445,12 @@ pub struct ScanScratch {
     _cold_boundary: CachelineBoundary,
 
     // ---------------- Cold / conditional region ----------------
-    pub(super) slab: DecodeSlab,  // Decoded output storage.
-    pub(super) seen: FixedSet128, // Dedupe for decoded buffers.
+    pub(super) slab: DecodeSlab, // Decoded output storage.
+    /// Bloom-style dedupe set for decoded buffer identity.
+    ///
+    /// Avoids re-scanning identical decoded output across different transform
+    /// spans within a single chunk. Keyed on decoded content hash.
+    pub(super) seen: FixedSet128,
     /// Bloom-style deduplication for output findings within a file.
     ///
     /// Prevents emitting the same finding multiple times when overlapping chunks
@@ -461,9 +495,12 @@ pub struct ScanScratch {
     /// each buffer scan completes. When `Some`, findings from decoded buffers
     /// use this context to map spans back to root-buffer offsets.
     pub(super) root_span_map_ctx: Option<RootSpanMapCtx>,
-    /// Last scanned chunk metadata (used to infer overlap).
+    /// Absolute byte offset of the most recent chunk within the current file.
     pub(super) last_chunk_start: u64,
+    /// Length in bytes of the most recent chunk.
     pub(super) last_chunk_len: usize,
+    /// File ID of the most recent chunk (used to detect file transitions
+    /// and reset cross-chunk dedup state).
     pub(super) last_file_id: Option<FileId>,
 
     /// Per-thread Vectorscan scratch space for the unified prefilter DB.

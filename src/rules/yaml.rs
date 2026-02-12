@@ -1,9 +1,33 @@
-//! YAML rule deserialization and conversion to `RuleSpec`.
+//! YAML rule deserialization and conversion to [`RuleSpec`].
 //!
-//! Defines serde intermediate types that mirror the YAML schema, then converts
-//! them into `RuleSpec` values with interned `'static` references. Rule literals
-//! are process-lifetime data by design, but interning avoids repeated growth
-//! when the same YAML is parsed multiple times.
+//! # Schema overview
+//!
+//! A YAML rules file is a mapping with a single `rules` key whose value is a
+//! sequence of rule objects. Each rule must specify `name`, `regex`, `anchors`,
+//! and `radius`; all other fields are optional. See [`YamlRule`] for the full
+//! field set.
+//!
+//! Unknown fields are silently ignored (serde's default behavior) so that newer
+//! YAML files can be read by older parser versions. The companion test
+//! `default_rules_yaml_has_no_unknown_fields` catches accidental typos in the
+//! canonical `default_rules.yaml`.
+//!
+//! # Interning
+//!
+//! Parsed rule data — names, anchors, keywords, etc. — are interned into a
+//! process-global [`RuleAtomPool`] and returned as `&'static` references.
+//! This is intentional: rule literals live for the entire process, and
+//! interning avoids repeated heap growth when the same YAML is parsed
+//! multiple times (e.g. across configuration reloads).
+//!
+//! The pool is protected by a [`Mutex`] with poison recovery, so a panic
+//! during interning does not permanently lock out subsequent callers.
+//!
+//! # Thread safety
+//!
+//! [`parse_yaml_rules`] is safe to call from multiple threads. The global
+//! atom pool serializes interning but the critical section is short (hash
+//! lookups and pointer copies for already-interned atoms).
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
@@ -18,12 +42,34 @@ use super::RulesError;
 // YAML serde types
 // ---------------------------------------------------------------------------
 
+/// Top-level YAML structure: `{ rules: [...] }`.
+///
+/// This is the serde target for the entire rules file. The `rules` key
+/// maps to a heterogeneous list of [`YamlRule`] objects.
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct YamlRulesFile {
     pub rules: Vec<YamlRule>,
 }
 
+/// One detection rule as expressed in YAML.
+///
+/// # Required fields
+///
+/// - `name` — unique rule identifier (e.g. `"generic-api-key"`).
+/// - `regex` — pattern compiled into a [`regex::bytes::Regex`].
+/// - `anchors` — literal byte strings used by the Vectorscan pre-filter
+///   to narrow scan windows before the regex is applied.
+/// - `radius` — byte radius around an anchor match to feed to the regex.
+///
+/// # Optional fields
+///
+/// All other fields default to `None` / absent. See the corresponding
+/// `*Spec` types in [`crate::api`] for semantics.
+///
+/// `ValidatorKind` is intentionally absent from the YAML schema — fast
+/// validators are tightly coupled to specific regex patterns and are only
+/// set programmatically.
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct YamlRule {
@@ -47,6 +93,11 @@ pub(crate) struct YamlRule {
     pub secret_group: Option<u16>,
 }
 
+/// Entropy gate parameters for a rule.
+///
+/// When present, the secret value (captured group) must have at least
+/// `min_bits_per_byte` bits of Shannon entropy per byte, and its length
+/// must fall within `[min_len, max_len]`, or the match is discarded.
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct YamlEntropy {
@@ -55,6 +106,11 @@ pub(crate) struct YamlEntropy {
     pub max_len: usize,
 }
 
+/// Two-phase scanning configuration.
+///
+/// Phase 1 uses `seed_radius` to cheaply locate potential matches.
+/// Phase 2 expands to `full_radius` and requires at least one
+/// `confirm_any` literal in the wider window before emitting a finding.
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct YamlTwoPhase {
@@ -63,6 +119,12 @@ pub(crate) struct YamlTwoPhase {
     pub confirm_any: Vec<String>,
 }
 
+/// Local-context validation for reducing false positives.
+///
+/// Examines the bytes immediately surrounding a regex match
+/// (`lookbehind` bytes before, `lookahead` bytes after) for structural
+/// cues such as assignment operators, quoting, or specific key names.
+/// Gates that fail suppress the finding.
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct YamlLocalContext {
@@ -81,6 +143,17 @@ pub(crate) struct YamlLocalContext {
 // allocations in a global pool and reuse them across parse calls.
 // ---------------------------------------------------------------------------
 
+/// Content-addressed interning pool for rule atoms.
+///
+/// Each `intern_*` method returns a `&'static` reference. If the value
+/// was already interned, the existing pointer is returned (dedup by
+/// content equality). Otherwise, the value is `Box::leak`-ed into
+/// process-lifetime storage and inserted into the lookup table.
+///
+/// Three maps cover the three shapes needed by [`RuleSpec`]:
+/// - `strings` — rule names (`&'static str`).
+/// - `bytes` — individual byte slices (anchors, keywords, etc.).
+/// - `bytes_slices` — slices-of-slices (e.g. the full anchors array).
 #[derive(Default)]
 struct RuleAtomPool {
     strings: HashMap<String, &'static str>,
@@ -89,6 +162,8 @@ struct RuleAtomPool {
 }
 
 impl RuleAtomPool {
+    /// Intern a string, returning a `&'static str` pointer-equal across calls
+    /// with the same content.
     fn intern_str(&mut self, s: String) -> &'static str {
         if let Some(existing) = self.strings.get(&s) {
             return existing;
@@ -98,10 +173,12 @@ impl RuleAtomPool {
         leaked
     }
 
+    /// Intern a string's UTF-8 bytes.
     fn intern_bytes(&mut self, s: String) -> &'static [u8] {
         self.intern_bytes_vec(s.into_bytes())
     }
 
+    /// Intern a raw byte vector, deduplicating by content.
     fn intern_bytes_vec(&mut self, bytes: Vec<u8>) -> &'static [u8] {
         if let Some(existing) = self.bytes.get(&bytes) {
             return existing;
@@ -111,6 +188,10 @@ impl RuleAtomPool {
         leaked
     }
 
+    /// Intern a list of strings as a `&'static [&'static [u8]]`.
+    ///
+    /// Both the outer slice and each inner byte slice are interned
+    /// independently, so element-level sharing works across rules.
     fn intern_bytes_slice(&mut self, values: Vec<String>) -> &'static [&'static [u8]] {
         let keys: Vec<Vec<u8>> = values.into_iter().map(String::into_bytes).collect();
         if let Some(existing) = self.bytes_slices.get(&keys) {
@@ -130,6 +211,12 @@ impl RuleAtomPool {
 static RULE_ATOMS: LazyLock<Mutex<RuleAtomPool>> =
     LazyLock::new(|| Mutex::new(RuleAtomPool::default()));
 
+/// Acquire the global atom pool and run `f` under the lock.
+///
+/// Poison recovery (`into_inner`) is deliberate: a prior panic during
+/// interning leaves the pool in a consistent state (partial inserts are
+/// harmless because `Box::leak` is idempotent for the leaked value) so
+/// subsequent callers should not be blocked.
 fn with_rule_atoms<T>(f: impl FnOnce(&mut RuleAtomPool) -> T) -> T {
     let mut guard = RULE_ATOMS
         .lock()
@@ -143,9 +230,16 @@ fn with_rule_atoms<T>(f: impl FnOnce(&mut RuleAtomPool) -> T) -> T {
 
 /// Parse YAML content into a `Vec<RuleSpec>`.
 ///
-/// Deserializes the YAML, then converts each `YamlRule` into a `RuleSpec`
+/// Deserializes the YAML, then converts each [`YamlRule`] into a [`RuleSpec`]
 /// by compiling regexes and interning textual fields into reusable `'static`
-/// references.
+/// references via the global [`RuleAtomPool`].
+///
+/// # Errors
+///
+/// - [`RulesError::Yaml`] — the input is not valid YAML or does not match
+///   the expected schema (missing required fields).
+/// - [`RulesError::Regex`] — a rule's `regex` field fails to compile.
+///   The error includes the rule name and pattern for diagnostics.
 pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesError> {
     let file: YamlRulesFile = serde_yml::from_str(content).map_err(RulesError::Yaml)?;
 

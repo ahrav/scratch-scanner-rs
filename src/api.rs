@@ -87,8 +87,10 @@ pub enum TransformMode {
     /// Always apply this transform, subject to span and budget caps.
     Always,
 
-    /// Correctness trade (explicit).
-    /// Skips this transform if the *current buffer* already produced any findings.
+    /// Skip this transform when the current buffer has already produced findings.
+    ///
+    /// This is an explicit correctness trade-off: reducing redundant transform
+    /// work at the cost of potentially missing findings in nested encodings.
     ///
     /// Scope: This only considers findings from the current buffer being scanned;
     /// findings from parent buffers (that produced this one) or child buffers
@@ -859,7 +861,11 @@ impl OfflineValidationSpec {
 }
 
 /// Result of an offline structural validation check.
+///
+/// `Valid` and `Indeterminate` allow the finding to be emitted;
+/// `Invalid` suppresses it (see [`OfflineValidationSpec::suppresses_on_invalid`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Used once offline validation pipeline is wired up.
 pub enum OfflineVerdict {
     /// The token passed the structural check.
     Valid,
@@ -1361,6 +1367,10 @@ impl Tuning {
     }
 }
 
+/// Encodes an optional byte slice.
+///
+/// `None` encodes as a single 0x00 byte; `Some` encodes as 0x01 followed
+/// by the length-prefixed byte slice.
 fn encode_opt_bytes(out: &mut Vec<u8>, value: Option<&[u8]>) {
     match value {
         None => out.push(0),

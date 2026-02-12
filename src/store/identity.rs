@@ -295,8 +295,8 @@ impl SecretLenBucket {
 
 /// Compute canonical rule fingerprint from `RuleSpec::encode_policy` bytes.
 ///
-/// **Always unkeyed** regardless of [`IdHashMode`] — rules are stable policy
-/// definitions that must be comparable across operators.
+/// **Always unkeyed** regardless of [`IdHashMode`](super::keys::IdHashMode) —
+/// rules are stable policy definitions that must be comparable across operators.
 #[must_use]
 pub fn rule_fingerprint(rule: &RuleSpec, _keys: &StoreKeys) -> RuleFingerprint {
     let mut policy_bytes = Vec::with_capacity(256);
@@ -306,8 +306,8 @@ pub fn rule_fingerprint(rule: &RuleSpec, _keys: &StoreKeys) -> RuleFingerprint {
 
 /// Compute keyed secret hash over existing engine `norm_hash` bytes.
 ///
-/// **Always keyed** regardless of [`IdHashMode`] — prevents rainbow-table
-/// attacks against secret hashes stored on disk.
+/// **Always keyed** regardless of [`IdHashMode`](super::keys::IdHashMode) —
+/// prevents rainbow-table attacks against secret hashes stored on disk.
 #[must_use]
 pub fn secret_hash(norm_hash: &[u8; 32], keys: &StoreKeys) -> SecretHash {
     keyed_hash(keys.secret_key(), SECRET_HASH_DOMAIN, norm_hash)
@@ -349,7 +349,7 @@ pub fn secret_hash_with_truncation(secret_bytes: &[u8], keys: &StoreKeys) -> Sec
 /// - root-only span contribution
 /// - variant discriminator
 ///
-/// The hash is keyed or unkeyed based on [`IdHashMode`].
+/// The hash is keyed or unkeyed based on [`IdHashMode`](super::keys::IdHashMode).
 pub fn occurrence_id(
     input: OccurrenceInput<'_>,
     keys: &StoreKeys,
@@ -555,6 +555,10 @@ fn push_u64_le(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
+/// Append a length-prefixed byte slice: `LE32(len) ‖ bytes`.
+///
+/// Fails if `bytes.len()` exceeds `u32::MAX`, which would corrupt the
+/// canonical payload's fixed-width length field.
 fn push_bytes_u32(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), IdentityError> {
     if bytes.len() > u32::MAX as usize {
         return Err(IdentityError::ObjectKeyTooLarge { len: bytes.len() });
