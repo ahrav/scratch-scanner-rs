@@ -66,7 +66,7 @@ fn base62_decode_u32(bytes: &[u8]) -> Option<u32> {
 }
 
 /// Encode a `u32` into a fixed-width base-62 string, zero-padded on the left.
-/// Writes exactly `width` bytes into `buf` and returns the slice.
+/// Writes exactly `buf.len()` bytes into `buf`; the caller sizes the buffer.
 fn base62_encode_u32(mut val: u32, buf: &mut [u8]) {
     for slot in buf.iter_mut().rev() {
         *slot = BASE62_CHARS[(val % 62) as usize];
@@ -118,15 +118,16 @@ fn validate_crc32_base62(
 // GitHub fine-grained PAT
 // ---------------------------------------------------------------------------
 
-/// Expected total length of a GitHub fine-grained PAT: `github_pat_` (11) + 82 = 93.
 const GH_PAT_PREFIX: &[u8] = b"github_pat_";
+/// Total length of a GitHub fine-grained PAT: `github_pat_` (11) + 76 body + 6 checksum = 93.
 const GH_PAT_TOTAL_LEN: usize = 93;
+/// Trailing CRC-32 checksum encoded as 6 base-62 characters.
 const GH_PAT_CHECKSUM_LEN: usize = 6;
 
 /// Validate a GitHub fine-grained personal access token.
 ///
-/// Format: `github_pat_<11 type chars>_<payload><6 char CRC-32 base-62>`.
-/// The CRC-32 is computed over all bytes before the last 6 characters.
+/// Format: `github_pat_<76 body chars><6 char CRC-32 base-62>` (93 bytes total).
+/// The CRC-32 is computed over the first 87 bytes (everything before the checksum).
 fn validate_github_fine_grained_pat(secret: &[u8]) -> OfflineVerdict {
     if secret.len() < GH_PAT_TOTAL_LEN {
         return OfflineVerdict::Indeterminate;
@@ -157,9 +158,11 @@ fn validate_github_fine_grained_pat(secret: &[u8]) -> OfflineVerdict {
 // ---------------------------------------------------------------------------
 
 const GLSA_PREFIX: &[u8] = b"glsa_";
-/// Minimum length: `glsa_` (5) + 32 + `_` (1) + 8 = 46.
+/// Minimum length: `glsa_` (5) + 32 random + `_` (1) + 8 hex = 46.
 const GLSA_MIN_LEN: usize = 46;
+/// Length of the alphanumeric random segment between the prefix and separator.
 const GLSA_RANDOM_LEN: usize = 32;
+/// CRC-32 encoded as 8 lowercase hex characters.
 const GLSA_CHECKSUM_HEX_LEN: usize = 8;
 
 /// Validate a Grafana service-account token.
@@ -220,6 +223,7 @@ fn hex_decode_u32(bytes: &[u8]) -> Option<u32> {
 // AWS access key ID
 // ---------------------------------------------------------------------------
 
+/// Fixed length of an AWS access key ID (4-byte prefix + 16-byte base-32 suffix).
 const AWS_KEY_LEN: usize = 20;
 
 /// Validate an AWS access key ID.
@@ -276,9 +280,9 @@ fn validate_aws_access_key(secret: &[u8]) -> OfflineVerdict {
 
 /// Decode a 16-char AWS base-32 suffix into the embedded account ID.
 ///
-/// The 16 base-32 characters encode 80 bits. The account ID occupies bits
-/// 1 through 40 (0-indexed from the MSB, skipping the top flag bit) of
-/// the first 5 bytes after masking.
+/// The 16 base-32 characters encode 80 bits (10 bytes). The account ID
+/// occupies bits 1–40 (0-indexed from MSB, skipping the top flag bit),
+/// which spans decoded bytes 0–5 (bit 1 of byte 0 through bit 0 of byte 5).
 fn decode_aws_account_id(suffix: &[u8]) -> Option<u64> {
     if suffix.len() != 16 {
         return None;
@@ -369,7 +373,9 @@ fn validate_sentry_org_token(secret: &[u8]) -> OfflineVerdict {
         return OfflineVerdict::Invalid;
     }
 
-    // Decode the base64 payload into a stack buffer.
+    // Decode the base64 payload into a stack buffer. 512 bytes covers the
+    // typical Sentry JSON payload (~100-200 bytes decoded); oversized tokens
+    // fall through to Indeterminate via the None path.
     let mut decode_buf = [0u8; 512];
     let decoded_len = match base64_decode(payload_b64, &mut decode_buf) {
         Some(n) => n,
@@ -392,8 +398,10 @@ fn is_base64_char(b: u8) -> bool {
     matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/')
 }
 
-/// Minimal base64 decoder into a fixed-size buffer. Returns decoded length
-/// or `None` if the output buffer is too small or input is malformed.
+/// Minimal base64 decoder into a caller-provided buffer (no heap allocation).
+///
+/// Returns the number of decoded bytes, or `None` if the output buffer is
+/// too small or the input contains characters outside the base64 alphabet.
 fn base64_decode(input: &[u8], output: &mut [u8]) -> Option<usize> {
     let max_decoded = input.len() * 3 / 4;
     if max_decoded > output.len() {
@@ -489,8 +497,7 @@ mod tests {
     #[test]
     fn base64_decode_basic() {
         let mut buf = [0u8; 64];
-        // "eyJpYXQiOg==" decodes to `{"iat":`  -- wait, let me verify.
-        // "eyJpYXQiOg==" = {"iat":   (7 bytes)
+        // "eyJpYXQiOg==" decodes to `{"iat":` (7 bytes).
         let input = b"eyJpYXQiOg==";
         let len = base64_decode(input, &mut buf).unwrap();
         assert_eq!(&buf[..len], b"{\"iat\":");
