@@ -41,5 +41,8 @@ mod git_scan_corpus;
 #[cfg(feature = "sim-harness")]
 mod git_scan_random;
 
+#[cfg(feature = "sim-harness")]
+mod git_scan_shallow_limits;
+
 #[cfg(feature = "real-rules-harness")]
 mod scanner_real_rules;

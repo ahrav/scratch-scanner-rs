@@ -26,9 +26,8 @@ use std::path::PathBuf;
 use super::bytes::BytesView;
 use super::commit_graph_mem::CommitGraphMem;
 use super::commit_loader::{
-    collect_loose_dirs, collect_pack_dirs, load_commits_from_tips_with_loose_dirs,
-    load_commits_with_identities, load_shallow_boundary_roots, resolve_pack_paths_from_midx,
-    CommitLoadError, CommitLoadLimits,
+    collect_loose_dirs, collect_pack_dirs, load_commits_from_tips, load_commits_with_identities,
+    load_shallow_boundary_roots, resolve_pack_paths_from_midx, CommitLoadError, CommitLoadLimits,
 };
 use super::errors::{CommitPlanError, RepoOpenError};
 use super::identity_intern::IdentityInterner;
@@ -230,8 +229,9 @@ pub fn acquire_commit_graph(
     }
 
     let loose_dirs = collect_loose_dirs(&repo.paths);
-    let shallow_boundary_roots = load_shallow_boundary_roots(&repo.paths, repo.object_format)?;
-    let commits = load_commits_from_tips_with_loose_dirs(
+    let shallow_boundary_roots =
+        load_shallow_boundary_roots(&repo.paths, repo.object_format, &limits.commit_load)?;
+    let commits = load_commits_from_tips(
         &tips,
         midx,
         pack_paths,
@@ -275,7 +275,8 @@ pub fn acquire_commit_graph_with_identities(
     }
 
     let loose_dirs = collect_loose_dirs(&repo.paths);
-    let shallow_boundary_roots = load_shallow_boundary_roots(&repo.paths, repo.object_format)?;
+    let shallow_boundary_roots =
+        load_shallow_boundary_roots(&repo.paths, repo.object_format, &limits.commit_load)?;
     let mut interner = IdentityInterner::with_capacity(4 * 1024 * 1024, 16_384);
 
     let (commits, identity_ids) = load_commits_with_identities(
@@ -315,5 +316,7 @@ mod tests {
         let limits = ArtifactBuildLimits::default();
         assert!(limits.midx.max_packs > 0);
         assert!(limits.commit_load.max_commits > 0);
+        assert!(limits.commit_load.max_shallow_file_bytes > 0);
+        assert!(limits.commit_load.max_shallow_roots > 0);
     }
 }

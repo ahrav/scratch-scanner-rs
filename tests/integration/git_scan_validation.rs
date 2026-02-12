@@ -12,9 +12,10 @@ use regex::bytes::Regex;
 use tempfile::TempDir;
 
 use scanner_rs::git_scan::{
-    run_git_scan, FinalizeOutcome, GitScanConfig, GitScanError, GitScanMode, GitScanReport,
-    GitScanResult, InMemoryPersistenceStore, MappingCandidateKind, NeverSeenStore, OidBytes,
-    RefWatermarkStore, RepoOpenError, SpillError, StartSetConfig, StartSetResolver, WriteOp,
+    run_git_scan, ArtifactAcquireError, CommitLoadError, FinalizeOutcome, GitScanConfig,
+    GitScanError, GitScanMode, GitScanReport, GitScanResult, InMemoryPersistenceStore,
+    MappingCandidateKind, NeverSeenStore, OidBytes, RefWatermarkStore, RepoOpenError, SpillError,
+    StartSetConfig, StartSetResolver, WriteOp,
 };
 use scanner_rs::unified::events::{NullEventSink, VecEventSink};
 use scanner_rs::{demo_tuning, AnchorPolicy, Engine, Gate, RuleSpec, TransformConfig, TransformId};
@@ -585,6 +586,44 @@ fn shallow_clone_boundary_treats_missing_parent_as_external_root() {
         .expect("shallow-boundary missing parent should not fail artifact acquisition");
     assert_eq!(report.finalize.outcome, FinalizeOutcome::Complete);
     assert!(report.skipped_candidates.is_empty());
+}
+
+#[test]
+fn shallow_clone_fails_fast_when_shallow_root_limit_is_exceeded() {
+    if !git_available() {
+        eprintln!("git not available; skipping shallow limit regression test");
+        return;
+    }
+
+    let source = init_repo();
+    commit_file(source.path(), "base.txt", "base\n", "c1");
+    commit_file(source.path(), "base.txt", "TOK_ABCDEFGH\n", "c2");
+
+    let shallow_tmp = TempDir::new().unwrap();
+    let shallow_repo = shallow_tmp.path().join("repo");
+    let source_url = format!("file://{}", source.path().display());
+    let clone_status = Command::new("git")
+        .arg("clone")
+        .arg("--depth")
+        .arg("1")
+        .arg(source_url)
+        .arg(&shallow_repo)
+        .status()
+        .expect("failed to run git clone");
+    assert!(clone_status.success(), "git clone --depth 1 must succeed");
+
+    let mut config = base_config();
+    config.artifact_build.commit_load.max_shallow_roots = 0;
+
+    let err = run_scan_with_config(&shallow_repo, None, config).unwrap_err();
+    match err {
+        GitScanError::ArtifactAcquire(ArtifactAcquireError::CommitLoad(
+            CommitLoadError::TooManyShallowRoots { limit, .. },
+        )) => {
+            assert_eq!(limit, 0);
+        }
+        other => panic!("unexpected error variant: {other:?}"),
+    }
 }
 
 // ============================================================================

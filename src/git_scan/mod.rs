@@ -133,8 +133,9 @@ pub use start_set::{StartSetConfig, StartSetId};
 pub use commit_graph::CommitGraphIndex;
 pub use commit_graph_mem::CommitGraphMem;
 pub use commit_loader::{
-    collect_pack_dirs, load_commits_from_tips, load_commits_with_identities,
-    resolve_pack_paths_from_midx, CommitLoadError, CommitLoadLimits, LoadedCommit,
+    collect_loose_dirs, collect_pack_dirs, load_commits_from_tips, load_commits_with_identities,
+    load_shallow_boundary_roots, resolve_pack_paths_from_midx, CommitLoadError, CommitLoadLimits,
+    LoadedCommit,
 };
 pub use commit_parse::{parse_commit, CommitParseError, CommitParseLimits, ParsedCommit};
 pub use commit_walk::{

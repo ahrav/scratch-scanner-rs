@@ -18,12 +18,12 @@ use std::path::Path;
 use std::process::Command;
 
 use scanner_rs::git_scan::{
-    acquire_commit_graph, acquire_midx, build_midx_bytes, collect_pack_dirs,
-    load_commits_from_tips, resolve_pack_paths_from_midx, ArtifactAcquireError,
-    ArtifactBuildLimits, CommitGraph, CommitGraphMem, CommitLoadLimits, CommitPlanIter,
-    CommitWalkLimits, GitRepoPaths, MidxBuildLimits, MidxView, ObjectFormat, OidBytes,
-    ParentScratch, RefWatermarkStore, RepoOpenError, RepoOpenLimits, StartSetConfig,
-    StartSetResolver,
+    acquire_commit_graph, acquire_midx, build_midx_bytes, collect_loose_dirs, collect_pack_dirs,
+    load_commits_from_tips, load_shallow_boundary_roots, resolve_pack_paths_from_midx,
+    ArtifactAcquireError, ArtifactBuildLimits, CommitGraph, CommitGraphMem, CommitLoadLimits,
+    CommitPlanIter, CommitWalkLimits, GitRepoPaths, LoadedCommit, MidxBuildLimits, MidxView,
+    ObjectFormat, OidBytes, ParentScratch, RefWatermarkStore, RepoOpenError, RepoOpenLimits,
+    StartSetConfig, StartSetResolver,
 };
 use tempfile::TempDir;
 
@@ -70,6 +70,29 @@ fn decode_hex(hex: &str) -> Vec<u8> {
 fn oid_from_hex(hex: &str) -> OidBytes {
     let bytes = decode_hex(hex.trim());
     OidBytes::from_slice(&bytes)
+}
+
+fn load_commits_for_repo(
+    paths: &GitRepoPaths,
+    midx: &MidxView<'_>,
+    pack_paths: &[std::path::PathBuf],
+    tips: &[OidBytes],
+    format: ObjectFormat,
+) -> Vec<LoadedCommit> {
+    let limits = CommitLoadLimits::default();
+    let loose_dirs = collect_loose_dirs(paths);
+    let shallow_boundary_roots = load_shallow_boundary_roots(paths, format, &limits).unwrap();
+    load_commits_from_tips(
+        tips,
+        midx,
+        pack_paths,
+        &loose_dirs,
+        &shallow_boundary_roots,
+        format,
+        &limits,
+        None,
+    )
+    .unwrap()
 }
 
 /// Get all commit OIDs reachable from HEAD using `git rev-list`.
@@ -275,15 +298,8 @@ fn commit_graph_mem_matches_git_commit_count() {
     let pack_dirs = collect_pack_dirs(&paths);
     let pack_paths = resolve_pack_paths_from_midx(&midx, &pack_dirs).unwrap();
 
-    let commits = load_commits_from_tips(
-        &[*tip_oid],
-        &midx,
-        &pack_paths,
-        ObjectFormat::Sha1,
-        &CommitLoadLimits::default(),
-        None,
-    )
-    .unwrap();
+    let commits =
+        load_commits_for_repo(&paths, &midx, &pack_paths, &[*tip_oid], ObjectFormat::Sha1);
 
     let mem_cg = CommitGraphMem::build(commits, ObjectFormat::Sha1).unwrap();
 
@@ -318,15 +334,8 @@ fn commit_graph_mem_all_commits_lookupable() {
     let pack_paths = resolve_pack_paths_from_midx(&midx, &pack_dirs).unwrap();
 
     let tip_oid = all_commits.first().unwrap();
-    let commits = load_commits_from_tips(
-        &[*tip_oid],
-        &midx,
-        &pack_paths,
-        ObjectFormat::Sha1,
-        &CommitLoadLimits::default(),
-        None,
-    )
-    .unwrap();
+    let commits =
+        load_commits_for_repo(&paths, &midx, &pack_paths, &[*tip_oid], ObjectFormat::Sha1);
 
     let mem_cg = CommitGraphMem::build(commits, ObjectFormat::Sha1).unwrap();
 
@@ -360,15 +369,8 @@ fn commit_graph_mem_generation_numbers_valid() {
     let pack_dirs = collect_pack_dirs(&paths);
     let pack_paths = resolve_pack_paths_from_midx(&midx, &pack_dirs).unwrap();
 
-    let commits = load_commits_from_tips(
-        &[*tip_oid],
-        &midx,
-        &pack_paths,
-        ObjectFormat::Sha1,
-        &CommitLoadLimits::default(),
-        None,
-    )
-    .unwrap();
+    let commits =
+        load_commits_for_repo(&paths, &midx, &pack_paths, &[*tip_oid], ObjectFormat::Sha1);
 
     let mem_cg = CommitGraphMem::build(commits, ObjectFormat::Sha1).unwrap();
 
@@ -419,15 +421,7 @@ fn commit_graph_mem_parent_relationships_match_git() {
     let pack_dirs = collect_pack_dirs(&paths);
     let pack_paths = resolve_pack_paths_from_midx(&midx, &pack_dirs).unwrap();
 
-    let commits = load_commits_from_tips(
-        &[tip_oid],
-        &midx,
-        &pack_paths,
-        ObjectFormat::Sha1,
-        &CommitLoadLimits::default(),
-        None,
-    )
-    .unwrap();
+    let commits = load_commits_for_repo(&paths, &midx, &pack_paths, &[tip_oid], ObjectFormat::Sha1);
 
     let mem_cg = CommitGraphMem::build(commits, ObjectFormat::Sha1).unwrap();
 
@@ -781,15 +775,7 @@ fn commit_loader_loads_all_reachable_commits() {
     let head = git_output(tmp.path(), &["rev-parse", "HEAD"]);
     let tip_oid = oid_from_hex(&head);
 
-    let commits = load_commits_from_tips(
-        &[tip_oid],
-        &midx,
-        &pack_paths,
-        ObjectFormat::Sha1,
-        &CommitLoadLimits::default(),
-        None,
-    )
-    .unwrap();
+    let commits = load_commits_for_repo(&paths, &midx, &pack_paths, &[tip_oid], ObjectFormat::Sha1);
 
     let loaded_oids: HashSet<OidBytes> = commits.iter().map(|c| c.oid).collect();
 
@@ -820,15 +806,7 @@ fn commit_loader_tree_oids_match_git() {
     let head = git_output(tmp.path(), &["rev-parse", "HEAD"]);
     let tip_oid = oid_from_hex(&head);
 
-    let commits = load_commits_from_tips(
-        &[tip_oid],
-        &midx,
-        &pack_paths,
-        ObjectFormat::Sha1,
-        &CommitLoadLimits::default(),
-        None,
-    )
-    .unwrap();
+    let commits = load_commits_for_repo(&paths, &midx, &pack_paths, &[tip_oid], ObjectFormat::Sha1);
 
     // Verify each commit's tree OID matches what git reports
     for commit in &commits {
