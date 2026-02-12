@@ -296,8 +296,10 @@ classDiagram
   is built from the same anchor patterns as `vs` and is only used to
   skip wasteful decodes; the decoded-space gate still enforces correctness.
 - `Engine.safelist` is applied in a post-scan compaction pass on root findings
-  only (`step_id == STEP_ROOT`), and compaction keeps `findings`,
-  `norm_hashes`, and `drop_hint_end` aligned 1:1.
+  only (`step_id == STEP_ROOT`), followed by final findings-cap enforcement;
+  both passes keep `findings`, `norm_hashes`, and `drop_hint_end` aligned 1:1.
+- Offline validation suppression (when enabled) is part of the same post-scan
+  policy layer, not part of `window_validate` gate ordering.
 - `Engine.required_overlap()` is computed as:
   `max_window_diameter_bytes + (max_prefilter_width - 1)`.
 - `StepId` and `FindingRec.step_id` are only valid while the originating

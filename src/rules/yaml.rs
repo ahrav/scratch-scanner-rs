@@ -708,6 +708,16 @@ rules:
             "curl-auth-header",
             "curl-auth-user",
             "atlassian-api-token",
+            "adafruit-api-key",
+            "adobe-client-id",
+            "algolia-api-key",
+            "confluent-access-token",
+            "confluent-secret-key",
+            "discord-api-token",
+            "discord-client-secret",
+            "heroku-api-key",
+            "linear-client-secret",
+            "zendesk-secret-key",
         ];
 
         for rule_name in target_rules {
@@ -723,6 +733,195 @@ rules:
                 suppressors.iter().any(|v| *v == b"example"),
                 "expected shared suppressor 'example' for {rule_name}"
             );
+        }
+    }
+
+    #[test]
+    /// Guardrail: strongly prefix-structured tokens intentionally stay off the
+    /// generic placeholder suppressor baseline to avoid format-specific false negatives.
+    fn structured_prefix_rules_keep_value_suppressors_unset() {
+        let structured_prefix_rules = [
+            "aws-access-token",
+            "github-pat",
+            "npm-access-token",
+            "grafana-service-account-token",
+            "sentry-org-token",
+            // Explicitly commented in YAML as prefix-structured.
+            "heroku-api-key-v2",
+            "linear-api-key",
+            // Shopify family (shpat_, shpca_, shppa_, shpss_).
+            "shopify-access-token",
+            "shopify-custom-access-token",
+            "shopify-private-app-access-token",
+            "shopify-shared-secret",
+            // GitLab family (glpat-).
+            "gitlab-pat",
+        ];
+
+        for rule_name in structured_prefix_rules {
+            let rule = builtin_rule_by_name(rule_name);
+            assert!(
+                rule.value_suppressors_any.is_none(),
+                "expected value_suppressors_any to remain unset for {rule_name}"
+            );
+        }
+    }
+
+    #[test]
+    /// Regression: adafruit now carries the shared placeholder suppressor baseline.
+    fn adafruit_api_key_suppresses_placeholder_value() {
+        let rule_name = "adafruit-api-key";
+        let hay = b"adafruit_token=exampleexampleexampleexampleabcd";
+        let hits = scan_single_builtin_rule(rule_name, hay);
+        assert!(
+            !has_rule_hit(&hits, rule_name),
+            "expected placeholder adafruit API key to be suppressed"
+        );
+    }
+
+    #[test]
+    fn adafruit_api_key_allows_real_value() {
+        let rule_name = "adafruit-api-key";
+        let hay = b"adafruit_token=a8f2k9x7m4p1q6w3b5n0j4c9d2e7h6m1";
+        let hits = scan_single_builtin_rule(rule_name, hay);
+        assert!(
+            has_rule_hit(&hits, rule_name),
+            "expected real-looking adafruit API key to be reported"
+        );
+    }
+
+    #[test]
+    fn heroku_api_key_suppresses_placeholder_uuid() {
+        let rule_name = "heroku-api-key";
+        let hay = b"heroku_key=00000000-0000-0000-0000-000000000000";
+        let hits = scan_single_builtin_rule(rule_name, hay);
+        assert!(
+            !has_rule_hit(&hits, rule_name),
+            "expected all-zeros placeholder UUID to be suppressed"
+        );
+    }
+
+    #[test]
+    fn heroku_api_key_allows_real_uuid() {
+        let rule_name = "heroku-api-key";
+        let hay = b"heroku_key=7e2f19c4-83d1-4a56-b7e9-1f3c8d2a5b60";
+        let hits = scan_single_builtin_rule(rule_name, hay);
+        assert!(
+            has_rule_hit(&hits, rule_name),
+            "expected real-looking Heroku UUID to be reported"
+        );
+    }
+
+    #[test]
+    fn discord_client_secret_suppresses_placeholder_value() {
+        let rule_name = "discord-client-secret";
+        // 32-char value containing "example" (suppressor substring).
+        // Uses "discord_app_key" to avoid triggering the global safelist on `secret[:=]`.
+        let hay = b"discord_app_key=exampleexampleexampleexampleabcd";
+        let hits = scan_single_builtin_rule(rule_name, hay);
+        assert!(
+            !has_rule_hit(&hits, rule_name),
+            "expected placeholder discord client secret to be suppressed"
+        );
+    }
+
+    #[test]
+    fn discord_client_secret_allows_real_value() {
+        let rule_name = "discord-client-secret";
+        // Use "discord_app_key" instead of "discord_secret" to avoid
+        // triggering the global safelist pattern `secret[:=]`.
+        let hay = b"discord_app_key=\"a8f2c9d7e4b1063895fa2d7c4e0b1a39\"";
+        let hits = scan_single_builtin_rule(rule_name, hay);
+        assert!(
+            has_rule_hit(&hits, rule_name),
+            "expected real-looking discord client secret to be reported"
+        );
+    }
+
+    #[test]
+    /// Validate that default_rules.yaml uses only known field names, catching
+    /// typos that serde would silently ignore.
+    fn default_rules_yaml_has_no_unknown_fields() {
+        let yaml_str = include_str!("../../default_rules.yaml");
+        let raw: serde_yml::Value =
+            serde_yml::from_str(yaml_str).expect("parse default_rules.yaml");
+
+        let rule_fields: &[&str] = &[
+            "name",
+            "regex",
+            "anchors",
+            "radius",
+            "must_contain",
+            "keywords_any",
+            "value_suppressors_any",
+            "entropy",
+            "two_phase",
+            "local_context",
+            "secret_group",
+        ];
+        let entropy_fields: &[&str] = &["min_bits_per_byte", "min_len", "max_len"];
+        let two_phase_fields: &[&str] = &["seed_radius", "full_radius", "confirm_any"];
+        let local_ctx_fields: &[&str] = &[
+            "lookbehind",
+            "lookahead",
+            "require_same_line_assignment",
+            "require_quoted",
+            "key_names_any",
+        ];
+
+        let rules = raw
+            .get("rules")
+            .and_then(|v| v.as_sequence())
+            .expect("rules key");
+        for (i, rule) in rules.iter().enumerate() {
+            let map = rule.as_mapping().unwrap();
+            let name = map
+                .get(serde_yml::Value::String("name".into()))
+                .and_then(|v| v.as_str())
+                .unwrap_or("<unnamed>");
+            for key in map.keys() {
+                let k = key.as_str().unwrap_or("");
+                assert!(
+                    rule_fields.contains(&k),
+                    "rule {i} ({name}) has unknown field '{k}'"
+                );
+            }
+            // Check nested entropy fields.
+            if let Some(ent) = map.get(serde_yml::Value::String("entropy".into())) {
+                if let Some(em) = ent.as_mapping() {
+                    for key in em.keys() {
+                        let k = key.as_str().unwrap_or("");
+                        assert!(
+                            entropy_fields.contains(&k),
+                            "rule {i} ({name}) entropy has unknown field '{k}'"
+                        );
+                    }
+                }
+            }
+            // Check nested two_phase fields.
+            if let Some(tp) = map.get(serde_yml::Value::String("two_phase".into())) {
+                if let Some(tm) = tp.as_mapping() {
+                    for key in tm.keys() {
+                        let k = key.as_str().unwrap_or("");
+                        assert!(
+                            two_phase_fields.contains(&k),
+                            "rule {i} ({name}) two_phase has unknown field '{k}'"
+                        );
+                    }
+                }
+            }
+            // Check nested local_context fields.
+            if let Some(lc) = map.get(serde_yml::Value::String("local_context".into())) {
+                if let Some(lm) = lc.as_mapping() {
+                    for key in lm.keys() {
+                        let k = key.as_str().unwrap_or("");
+                        assert!(
+                            local_ctx_fields.contains(&k),
+                            "rule {i} ({name}) local_context has unknown field '{k}'"
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -1414,3 +1613,9 @@ rules:
         }
     }
 }
+
+// Property-based parser/interning invariants live in a sibling module to keep
+// this file's unit tests focused and to preserve fast default `cargo test`.
+#[cfg(all(test, feature = "stdx-proptest"))]
+#[path = "yaml_tests.rs"]
+mod yaml_tests;
