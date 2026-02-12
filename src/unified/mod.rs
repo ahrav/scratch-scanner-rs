@@ -120,7 +120,7 @@ pub struct FsScanConfig {
     pub workers: usize,
     /// Max transform decode depth (`None` → engine default of 2).
     pub decode_depth: Option<usize>,
-    /// Skip archive (zip/tar/gz) expansion.
+    /// When `true`, skip archive (zip/tar/gz) expansion (default: `false`, archives are expanded).
     pub skip_archives: bool,
     /// Anchor extraction mode for rule matching.
     pub anchor_mode: AnchorMode,
