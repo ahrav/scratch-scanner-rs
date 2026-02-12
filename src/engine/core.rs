@@ -1798,6 +1798,13 @@ impl Engine {
         // Suppress root findings that fail structural validation (bad CRC,
         // invalid charset, etc.). Runs after all scan work is complete so
         // it sees the full finding set, including transform-derived results.
+        //
+        // TODO: offline-invalid findings currently consume max_findings_per_chunk
+        // slots during emission. In pathological inputs this could crowd out
+        // valid findings that are then permanently dropped. Consider running
+        // offline validation inline during emission or reserving cap headroom,
+        // though this would require restructuring the scan loop since offline
+        // validation needs complete extracted spans from the BFS work queue.
         self.post_scan_filter(root_buf, scratch);
     }
 
