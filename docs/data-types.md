@@ -18,6 +18,7 @@ classDiagram
         -Tuning tuning
         -Option~VsPrefilterDb~ vs
         -Option~Base64YaraGate~ b64_gate
+        -SafelistFilter safelist
         -usize max_window_diameter_bytes
         -usize max_prefilter_width
         +new(rules, transforms, tuning) Engine
@@ -69,6 +70,12 @@ classDiagram
     class PackedPatterns {
         -Box~[u8]~ bytes
         -Box~[u32]~ offsets
+    }
+
+    class SafelistFilter {
+        +new() SafelistFilter
+        +matcher() RegexSet
+        +matches(context) bool
     }
 
     class Target {
@@ -175,6 +182,7 @@ classDiagram
     Engine --> RuleCold : contains
     Engine --> TransformConfig : contains
     Engine --> Tuning : contains
+    Engine --> SafelistFilter : contains
     Engine --> ScanScratch : creates
 
     RuleSpec --> TwoPhaseSpec : optional
@@ -287,6 +295,9 @@ classDiagram
 - `Engine.b64_gate` is an optional encoded-space pre-gate for Base64 spans. It
   is built from the same anchor patterns as `vs` and is only used to
   skip wasteful decodes; the decoded-space gate still enforces correctness.
+- `Engine.safelist` is applied in a post-scan compaction pass on root findings
+  only (`step_id == STEP_ROOT`), and compaction keeps `findings`,
+  `norm_hashes`, and `drop_hint_end` aligned 1:1.
 - `Engine.required_overlap()` is computed as:
   `max_window_diameter_bytes + (max_prefilter_width - 1)`.
 - `StepId` and `FindingRec.step_id` are only valid while the originating

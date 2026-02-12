@@ -180,6 +180,7 @@ Calculate average throughput delta per repository:
 3. **Update issue status** - Close finished work, update in-progress items
 4. **PUSH TO REMOTE** - This is MANDATORY:
    ```bash
+   git branch --show-current  # MUST be a user-created feature branch (never main)
    git pull --rebase
    bd sync
    git push
@@ -192,6 +193,9 @@ Calculate average throughput delta per repository:
 **CRITICAL RULES:**
 
 - Work is NOT complete until `git push` succeeds
+- NEVER push to `main`
+- ALWAYS work from a user-created feature branch in a user-created git worktree
+- If current branch is `main` (or not a user-created feature branch), stop and ask the user before continuing
 - NEVER stop before pushing - that leaves work stranded locally
 - NEVER say "ready to push when you are" - YOU must push
 - If push fails, resolve and retry until it succeeds

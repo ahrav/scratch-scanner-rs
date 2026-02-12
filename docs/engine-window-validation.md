@@ -44,6 +44,8 @@ Input: Window [w.start..w.end) in buffer
   ↓
 [Gate 8] Apply local context checks (bounded, fail-open)
   ↓
+[Gate 9] For root findings (`step_id == STEP_ROOT`), apply safelist suppression before insertion
+  ↓
 Output: FindingRec with spans in appropriate coordinate space
 ```
 
@@ -228,6 +230,16 @@ assignment separators, quoting, or key-name hints. These checks are:
 
 Local context gates are rule-selective and opt-in via rule config.
 They apply uniformly in raw, UTF-16, and stream-decoded validation paths.
+
+### 7. Root Safelist Suppression
+
+For root-buffer findings only (`step_id == STEP_ROOT`), validation applies the
+global safelist to the full-match root span **before** insertion into
+`ScanScratch`. This ordering prevents safelisted placeholders from consuming
+`max_findings_per_chunk` capacity and starving later non-safelisted findings.
+
+Transform-derived findings (`step_id != STEP_ROOT`) bypass this gate in window
+validation; any broader suppression policy remains a post-scan concern.
 
 ---
 

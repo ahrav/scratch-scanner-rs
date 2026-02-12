@@ -41,8 +41,14 @@ flowchart TB
         LocalCtx["Local context gate<br/>(optional, fail-open)"]
     end
 
+    subgraph PostScan["Post-Scan Compaction"]
+        Safelist["Root-context safelist check<br/>(step_id == STEP_ROOT)"]
+        Compact["In-place compaction<br/>(out + sidecars aligned)"]
+    end
+
     subgraph Output["Output"]
-        FindingRec["FindingRec<br/>{ file_id, rule_id, span, step_id }"]
+        FindingRec["Candidate FindingRec<br/>{ file_id, rule_id, span, step_id }"]
+        FinalRec["Compacted FindingRec<br/>(emission-ready)"]
     end
 
     Chunk --> VS
@@ -75,6 +81,9 @@ flowchart TB
     SecretExtract --> ValueSuppressors
     ValueSuppressors --> LocalCtx
     LocalCtx --> FindingRec
+    FindingRec --> Safelist
+    Safelist --> Compact
+    Compact --> FinalRec
 
     style Input fill:#e3f2fd
     style AnchorScan fill:#fff3e0
@@ -82,6 +91,7 @@ flowchart TB
     style SeedConfirm fill:#f3e5f5
     style RegexConfirm fill:#ffebee
     style PostMatch fill:#fff8e1
+    style PostScan fill:#ede7f6
     style Output fill:#e8eaf6
 ```
 
@@ -239,6 +249,17 @@ For the full schema documentation, query APIs, and configuration,
 see [fs-persistence-pipeline.md § SQLite Backend](fs-persistence-pipeline.md#sqlite-backend).
 
 **Pressure Coalescing**: If windows exceed `max_windows_per_rule_variant` (16), the gap doubles until windows fit, or everything merges into one.
+
+### Post-Scan Compaction
+
+After work-queue processing, the engine runs a post-scan compaction pass:
+
+- Evaluate the global safelist only for root findings (`step_id == STEP_ROOT`).
+- Derive the safelist context from `root_hint_start..root_hint_end` (clamped to
+  the current `root_buf` bounds).
+- Suppress safelisted root findings and compact `out`, `norm_hash`, and
+  `drop_hint_end` in-place with a single write cursor.
+- Preserve non-root (transform-derived) findings for downstream phases.
 
 ### Seed Confirmation + Expansion
 
