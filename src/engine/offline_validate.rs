@@ -43,19 +43,38 @@ pub(super) fn validate(spec: OfflineValidationSpec, secret: &[u8]) -> OfflineVer
 /// Base-62 alphabet: `0-9 A-Z a-z`.
 const BASE62_CHARS: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
+/// Branchless base-62 decode table. `0xFF` marks invalid characters.
+const BASE62_LUT: [u8; 256] = {
+    let mut lut = [0xFFu8; 256];
+    let mut i: u16 = 0;
+    while i < 256 {
+        let b = i as u8;
+        if b >= b'0' && b <= b'9' {
+            lut[i as usize] = b - b'0';
+        } else if b >= b'A' && b <= b'Z' {
+            lut[i as usize] = b - b'A' + 10;
+        } else if b >= b'a' && b <= b'z' {
+            lut[i as usize] = b - b'a' + 36;
+        }
+        i += 1;
+    }
+    lut
+};
+
 /// Decode a single base-62 digit, returning `None` for invalid characters.
 #[inline]
 fn base62_digit(b: u8) -> Option<u32> {
-    match b {
-        b'0'..=b'9' => Some((b - b'0') as u32),
-        b'A'..=b'Z' => Some((b - b'A') as u32 + 10),
-        b'a'..=b'z' => Some((b - b'a') as u32 + 36),
-        _ => None,
+    let v = BASE62_LUT[b as usize];
+    if v == 0xFF {
+        None
+    } else {
+        Some(v as u32)
     }
 }
 
 /// Decode a base-62 byte string into a `u32`, returning `None` on overflow
 /// or invalid characters.
+#[inline]
 fn base62_decode_u32(bytes: &[u8]) -> Option<u32> {
     let mut acc: u32 = 0;
     for &b in bytes {
@@ -201,20 +220,38 @@ fn validate_grafana_service_account(secret: &[u8]) -> OfflineVerdict {
     }
 }
 
+/// Branchless hex decode table. `0xFF` marks invalid characters.
+const HEX_LUT: [u8; 256] = {
+    let mut lut = [0xFFu8; 256];
+    let mut i: u16 = 0;
+    while i < 256 {
+        let b = i as u8;
+        if b >= b'0' && b <= b'9' {
+            lut[i as usize] = b - b'0';
+        } else if b >= b'a' && b <= b'f' {
+            lut[i as usize] = b - b'a' + 10;
+        } else if b >= b'A' && b <= b'F' {
+            lut[i as usize] = b - b'A' + 10;
+        }
+        i += 1;
+    }
+    lut
+};
+
 /// Decode an 8-byte hex string (case-insensitive) into a `u32`.
+#[inline]
 fn hex_decode_u32(bytes: &[u8]) -> Option<u32> {
     if bytes.len() != 8 {
         return None;
     }
     let mut acc: u32 = 0;
     for &b in bytes {
-        let nibble = match b {
-            b'0'..=b'9' => (b - b'0') as u32,
-            b'a'..=b'f' => (b - b'a') as u32 + 10,
-            b'A'..=b'F' => (b - b'A') as u32 + 10,
-            _ => return None,
-        };
-        acc = acc.checked_shl(4)?.checked_add(nibble)?;
+        let nibble = HEX_LUT[b as usize];
+        if nibble == 0xFF {
+            return None;
+        }
+        // 8 hex digits cannot overflow u32 (max = 0xFFFF_FFFF = u32::MAX).
+        acc = (acc << 4) | nibble as u32;
     }
     Some(acc)
 }
@@ -278,6 +315,7 @@ fn validate_aws_access_key(secret: &[u8]) -> OfflineVerdict {
 /// The 16 base-32 characters encode 80 bits (10 bytes). The account ID
 /// occupies bits 1–40 (0-indexed from MSB, skipping the top flag bit),
 /// which spans decoded bytes 0–5 (bit 1 of byte 0 through bit 0 of byte 5).
+#[inline]
 fn decode_aws_account_id(suffix: &[u8]) -> Option<u64> {
     if suffix.len() != 16 {
         return None;
@@ -375,10 +413,34 @@ fn validate_sentry_org_token(secret: &[u8]) -> OfflineVerdict {
     }
 }
 
+/// Branchless base64 decode table. `0xFF` = invalid, `0xFE` = padding (`=`).
+const BASE64_LUT: [u8; 256] = {
+    let mut lut = [0xFFu8; 256];
+    let mut i: u16 = 0;
+    while i < 256 {
+        let b = i as u8;
+        if b >= b'A' && b <= b'Z' {
+            lut[i as usize] = b - b'A';
+        } else if b >= b'a' && b <= b'z' {
+            lut[i as usize] = b - b'a' + 26;
+        } else if b >= b'0' && b <= b'9' {
+            lut[i as usize] = b - b'0' + 52;
+        } else if b == b'+' {
+            lut[i as usize] = 62;
+        } else if b == b'/' {
+            lut[i as usize] = 63;
+        } else if b == b'=' {
+            lut[i as usize] = 0xFE; // padding sentinel
+        }
+        i += 1;
+    }
+    lut
+};
+
 /// Check if a byte is a valid base64 character (not padding).
 #[inline]
 fn is_base64_char(b: u8) -> bool {
-    matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/')
+    BASE64_LUT[b as usize] < 64
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -391,6 +453,7 @@ enum Base64DecodeError {
 ///
 /// Returns the number of decoded bytes, or `None` if the output buffer is
 /// too small or the input contains characters outside the base64 alphabet.
+#[inline]
 fn base64_decode(input: &[u8], output: &mut [u8]) -> Option<usize> {
     let max_decoded = input.len() * 3 / 4;
     if max_decoded > output.len() {
@@ -402,15 +465,14 @@ fn base64_decode(input: &[u8], output: &mut [u8]) -> Option<usize> {
     let mut buf_bits: u32 = 0;
 
     for &b in input {
-        let val = match b {
-            b'A'..=b'Z' => (b - b'A') as u32,
-            b'a'..=b'z' => (b - b'a') as u32 + 26,
-            b'0'..=b'9' => (b - b'0') as u32 + 52,
-            b'+' => 62,
-            b'/' => 63,
-            b'=' => continue, // skip padding
-            _ => return None,
-        };
+        let v = BASE64_LUT[b as usize];
+        if v == 0xFE {
+            continue; // padding
+        }
+        if v == 0xFF {
+            return None;
+        }
+        let val = v as u32;
         buf = (buf << 6) | val;
         buf_bits += 6;
 
@@ -432,6 +494,7 @@ fn base64_decode(input: &[u8], output: &mut [u8]) -> Option<usize> {
 ///
 /// This decodes and validates the entire input but only compares emitted bytes
 /// against `prefix` instead of writing the full decoded payload to memory.
+#[inline]
 fn base64_decoded_starts_with(
     input: &[u8],
     prefix: &[u8],
@@ -449,15 +512,14 @@ fn base64_decoded_starts_with(
     let mut decode_prefix = !prefix.is_empty();
 
     for &b in input {
-        let val = match b {
-            b'A'..=b'Z' => (b - b'A') as u32,
-            b'a'..=b'z' => (b - b'a') as u32 + 26,
-            b'0'..=b'9' => (b - b'0') as u32 + 52,
-            b'+' => 62,
-            b'/' => 63,
-            b'=' => continue,
-            _ => return Err(Base64DecodeError::InvalidChar),
-        };
+        let v = BASE64_LUT[b as usize];
+        if v == 0xFE {
+            continue; // padding
+        }
+        if v == 0xFF {
+            return Err(Base64DecodeError::InvalidChar);
+        }
+        let val = v as u32;
 
         if !decode_prefix {
             continue;
