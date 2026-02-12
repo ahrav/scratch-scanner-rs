@@ -33,6 +33,12 @@
 //!   state and configuration.
 //! - In ODB-blob mode with parallel introduction, blob attribution context
 //!   (`commit_id`, path, flags) is not guaranteed deterministic.
+//!
+//! # Facade Contract
+//! This module is the public stage-oriented facade for git scanning. Re-exports
+//! are grouped by pipeline stage so callers can depend on stable boundaries
+//! (`repo_open`/artifact acquisition, commit traversal, candidate extraction,
+//! decode+scan, and finalize+persist) instead of individual internal modules.
 
 pub mod alloc_guard;
 pub mod artifact_acquire;
@@ -133,8 +139,9 @@ pub use start_set::{StartSetConfig, StartSetId};
 pub use commit_graph::CommitGraphIndex;
 pub use commit_graph_mem::CommitGraphMem;
 pub use commit_loader::{
-    collect_pack_dirs, load_commits_from_tips, load_commits_with_identities,
-    resolve_pack_paths_from_midx, CommitLoadError, CommitLoadLimits, LoadedCommit,
+    collect_loose_dirs, collect_pack_dirs, load_commits_from_tips, load_commits_with_identities,
+    load_shallow_boundary_roots, resolve_pack_paths_from_midx, CommitLoadError, CommitLoadLimits,
+    LoadedCommit,
 };
 pub use commit_parse::{parse_commit, CommitParseError, CommitParseLimits, ParsedCommit};
 pub use commit_walk::{
@@ -217,6 +224,7 @@ pub use policy_hash::{policy_hash, MergeDiffMode, PolicyHash};
 pub use run_format::{RunContext, RunHeader, RunRecord};
 pub use run_reader::RunReader;
 pub use run_writer::RunWriter;
+pub(crate) use runner::auto_pack_exec_workers_for_in_pack;
 pub use runner::{
     run_git_scan, CandidateSkipReason, GitScanAllocStats, GitScanConfig, GitScanError,
     GitScanMetricsSnapshot, GitScanMode, GitScanReport, GitScanResult, GitScanStageNanos,

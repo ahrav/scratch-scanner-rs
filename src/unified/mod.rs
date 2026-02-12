@@ -120,11 +120,15 @@ pub struct FsScanConfig {
     pub workers: usize,
     /// Max transform decode depth (`None` → engine default of 2).
     pub decode_depth: Option<usize>,
-    /// Skip archive (zip/tar/gz) expansion.
+    /// When `true`, skip archive (zip/tar/gz) expansion (default: `false`, archives are expanded).
     pub skip_archives: bool,
     /// Anchor extraction mode for rule matching.
     pub anchor_mode: AnchorMode,
-    /// When `true`, scan binary files instead of skipping them.
+    /// When `true`, scan binary files instead of skipping them
+    /// (default: `false`, binary files are skipped). A file is classified as
+    /// binary by [`content_policy::classify_content`](crate::content_policy::classify_content),
+    /// which checks for NUL bytes in the first 8 KiB — matching Git's own
+    /// `buffer_is_binary` heuristic.
     pub scan_binary: bool,
     /// When `true`, wire a [`StoreProducer`](crate::store::StoreProducer) into
     /// the parallel scan so post-dedupe findings are emitted to the persistence
@@ -170,7 +174,10 @@ pub struct GitSourceConfig {
     pub engine_chunk_mb: Option<u32>,
     /// Debug output level for stderr diagnostics.
     pub debug: DebugLevel,
-    /// When `true`, scan binary blobs instead of skipping them.
+    /// When `true`, scan binary blobs instead of skipping them
+    /// (default: `false`, binary blobs are skipped). Classification uses
+    /// NUL-byte detection in the first 8 KiB via
+    /// [`content_policy::classify_content`](crate::content_policy::classify_content).
     pub scan_binary: bool,
     /// When `true`, extract and emit author/committer identity data.
     pub enrich_identities: bool,

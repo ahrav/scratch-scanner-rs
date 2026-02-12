@@ -20,6 +20,13 @@
 //! 4. Run the source driver (FS or Git), which emits `Finding` /
 //!    `Progress` events through the sink.
 //! 5. Emit a final `Summary` event and call `sink.flush()`.
+//!
+//! # Output Contract
+//!
+//! - Structured events are written to stdout via [`EventSink`].
+//! - Human-readable and machine-parseable `key=value` summaries are written
+//!   to stderr on successful FS/Git scans for backward-compatible tooling.
+//! - Fatal configuration failures exit with status code `2`.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -352,12 +359,54 @@ fn run_fs(
     Ok(())
 }
 
+/// Parse `in-pack` object count from `git count-objects -v` output.
+///
+/// Accepts surrounding whitespace and returns the first `in-pack:` entry.
+/// Returns `None` when the field is missing or not a valid `u64`.
+fn parse_in_pack_object_count(text: &str) -> Option<u64> {
+    text.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("in-pack:")?;
+        rest.trim().parse::<u64>().ok()
+    })
+}
+
+/// Return `in-pack` object count for the repository.
+///
+/// This probe is advisory and used only for worker auto-sizing. Callers
+/// should fall back to deterministic defaults when it fails.
+///
+/// # Errors
+///
+/// Returns an error when `git` invocation fails, exits non-zero, or the
+/// expected `in-pack:` field is absent.
+fn probe_in_pack_object_count(repo_root: &Path) -> io::Result<u64> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["count-objects", "-v"])
+        .output()
+        .map_err(|e| io::Error::other(format!("failed to run git count-objects: {e}")))?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "git count-objects failed with status {}",
+            output.status
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_in_pack_object_count(&stdout)
+        .ok_or_else(|| io::Error::other("missing in-pack entry in git count-objects output"))
+}
+
 /// Git scan path — delegates to [`run_git_scan`].
 ///
 /// Builds the engine, configures persistence stores (in-memory for CLI),
 /// resolves the start set via `git` CLI commands, and runs the scan.
 /// Findings stream through the [`EventSink`](super::events::EventSink);
 /// summary + optional debug/perf output goes to stderr.
+///
+/// `pack_exec_workers` is auto-sized from `git count-objects -v` when the
+/// CLI does not provide an explicit value; probe failures fall back to the
+/// static defaults from [`GitScanConfig::default`].
 ///
 /// Calls `process::exit(2)` on fatal errors (rule loading, config overflow,
 /// scan failure) rather than returning an error, matching the CLI exit-code
@@ -425,6 +474,12 @@ fn run_git(
     let seen_store = NeverSeenStore;
     let watermark_store = EmptyWatermarkStore;
     let persist_store = InMemoryPersistenceStore::default();
+    let pack_exec_workers = cfg.pack_exec_workers.unwrap_or_else(|| {
+        probe_in_pack_object_count(&cfg.repo_root)
+            .ok()
+            .map(git_scan::auto_pack_exec_workers_for_in_pack)
+            .unwrap_or(base_config.pack_exec_workers)
+    });
 
     let mut config = GitScanConfig {
         scan_mode: cfg.scan_mode,
@@ -432,9 +487,7 @@ fn run_git(
         merge_diff_mode: cfg.merge_mode,
         start_set: start_set.clone(),
         policy_hash: policy,
-        pack_exec_workers: cfg
-            .pack_exec_workers
-            .unwrap_or(base_config.pack_exec_workers),
+        pack_exec_workers,
         ..base_config
     };
     if let Some(bytes) = tree_delta_cache_bytes {
@@ -710,7 +763,10 @@ fn run_store_command(cmd: StoreCommand) -> io::Result<()> {
     Ok(())
 }
 
-/// Map a numeric status code to a human-readable label.
+/// Map a persisted run/secret status code to a human-readable label.
+///
+/// Values mirror store schema query outputs. Unknown values map to
+/// `"unknown"` for forward compatibility with newer schema versions.
 fn status_label(status: i32) -> &'static str {
     match status {
         0 => "active",
@@ -722,6 +778,11 @@ fn status_label(status: i32) -> &'static str {
     }
 }
 
+/// Serialize a value as a single-line JSON document to stdout.
+///
+/// # Errors
+///
+/// Returns an error if serialization fails.
 fn print_json<T: serde::Serialize>(value: &T) -> io::Result<()> {
     let encoded = serde_json::to_string(value)
         .map_err(|e| io::Error::other(format!("json encode failed: {e}")))?;
@@ -1242,6 +1303,18 @@ mod tests {
         assert_eq!(format_human_bytes(1536), "1.50KiB");
         assert_eq!(format_human_bytes(1024 * 1024), "1.00MiB");
         assert_eq!(format_human_bytes(1024 * 1024 * 1024), "1.00GiB");
+    }
+
+    #[test]
+    fn parse_in_pack_object_count_extracts_value() {
+        let text = "count: 0\nsize: 0\nin-pack: 11278814\npacks: 241\n";
+        assert_eq!(parse_in_pack_object_count(text), Some(11_278_814));
+    }
+
+    #[test]
+    fn parse_in_pack_object_count_handles_missing_or_invalid_value() {
+        assert_eq!(parse_in_pack_object_count("count: 0\npacks: 1\n"), None);
+        assert_eq!(parse_in_pack_object_count("in-pack: not-a-number\n"), None);
     }
 
     /// The pool buffer sizing formula must satisfy the assertion floor

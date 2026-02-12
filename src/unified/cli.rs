@@ -303,6 +303,10 @@ fn parse_fs_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<S
 /// Parse git-specific flags from the remaining argument iterator.
 /// Accepts `--repo=<path>` or a bare positional path. Exits with code 2
 /// on unrecognised flags or missing `--repo`.
+///
+/// Public `--workers=<N>` is normalised to the git runner's
+/// `pack_exec_workers` setting so caller-facing concurrency controls stay
+/// aligned with `scan fs`.
 fn parse_git_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<ScanConfig> {
     let mut repo: Option<PathBuf> = None;
     let mut repo_id: u64 = 1;
@@ -347,6 +351,17 @@ fn parse_git_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<
         if let Some(flag) = arg.to_str() {
             if let Some(rest) = flag.strip_prefix("--repo=") {
                 repo = Some(PathBuf::from(rest));
+                continue;
+            }
+            if let Some(rest) = flag.strip_prefix("--workers=") {
+                // Keep source-agnostic worker semantics in the public CLI while
+                // preserving the internal git runner field name.
+                let n: usize = parse_or_exit(rest, "--workers");
+                if n == 0 {
+                    eprintln!("--workers must be >= 1");
+                    std::process::exit(2);
+                }
+                pack_exec_workers = Some(n);
                 continue;
             }
             if let Some(rest) = flag.strip_prefix("--anchors=") {
@@ -678,8 +693,12 @@ OPTIONS:
     --persist-findings      Persist FS findings to append-log segment files
 
 FILE TYPE OPTIONS:
-    --skip-archives       Skip archive (zip/tar/gz) expansion  [default: scan]
-    --scan-binary         Scan binary files instead of skipping [default: skip]
+    --skip-archives         Skip archive (zip/tar/gz) expansion  [default: scan]
+    --scan-archives         Scan archives (undo --skip-archives) [default: scan]
+    --scan-binary           Scan binary files instead of skipping [default: skip]
+    --skip-binary           Skip binary files (undo --scan-binary) [default: skip]
+
+OUTPUT OPTIONS:
     --anchors=manual|derived  Anchor mode (default: manual)
     --event-format=jsonl|text|json|sarif  Output format (default: jsonl)
     --verbose               Verbose output (text format only)
@@ -694,6 +713,7 @@ fn print_git_usage() {
 OPTIONS:
     --repo=<path>             Repository path (also accepted as positional arg)
     --rules=<path>            YAML rules file (default: default_rules.yaml next to binary)
+    --workers=<N>             Worker threads (default: auto)
     --decode-depth=<N>        Max decode depth (default: 2)
     --transforms=all|none|<list>  Transforms to enable (default: all)
                               Comma-separated: base64, url (case-insensitive)
@@ -705,6 +725,9 @@ OPTIONS:
 
 FILE TYPE OPTIONS:
     --scan-binary             Scan binary blobs instead of skipping [default: skip]
+    --skip-binary             Skip binary blobs (undo --scan-binary) [default: skip]
+
+OUTPUT OPTIONS:
     --event-format=jsonl|text|json|sarif  Output format (default: jsonl)
     --verbose                 Verbose output (text format only)
     --help, -h                Show this help"
@@ -1259,6 +1282,12 @@ mod tests {
     }
 
     #[test]
+    fn git_workers_flag_parsed() {
+        let cfg = git_config(&["--repo=/r", "--workers=4"]);
+        assert_eq!(cfg.pack_exec_workers, Some(4));
+    }
+
+    #[test]
     fn git_hidden_merge_first_parent_parsed() {
         let cfg = git_config(&["--repo=/r", "--x-merge=first-parent"]);
         assert_eq!(cfg.merge_mode, MergeDiffMode::FirstParentOnly);
@@ -1319,5 +1348,43 @@ mod tests {
     fn fs_scan_binary_flag_parsed() {
         let cfg = fs_config(&["--path=/d", "--scan-binary"]);
         assert!(cfg.scan_binary);
+    }
+
+    #[test]
+    fn git_scan_binary_flag_parsed() {
+        let cfg = git_config(&["--repo=/r", "--scan-binary"]);
+        assert!(cfg.scan_binary);
+    }
+
+    #[test]
+    fn git_skip_binary_accepted() {
+        let cfg = git_config(&["--repo=/r", "--skip-binary"]);
+        assert!(!cfg.scan_binary);
+    }
+
+    // -- Last-wins semantics: contradictory flags resolve to the last one -----
+
+    #[test]
+    fn fs_last_flag_wins_archives() {
+        let cfg = fs_config(&["--path=/d", "--skip-archives", "--scan-archives"]);
+        assert!(!cfg.skip_archives);
+    }
+
+    #[test]
+    fn fs_last_flag_wins_binary() {
+        let cfg = fs_config(&["--path=/d", "--scan-binary", "--skip-binary"]);
+        assert!(!cfg.scan_binary);
+    }
+
+    // -- Defaults: file-type flags start at standard behavior -----------------
+
+    #[test]
+    fn file_type_flags_default_to_standard_behavior() {
+        let fs = fs_config(&["--path=/d"]);
+        assert!(!fs.skip_archives, "archives should be scanned by default");
+        assert!(!fs.scan_binary, "binary should be skipped by default");
+
+        let git = git_config(&["--repo=/r"]);
+        assert!(!git.scan_binary, "binary should be skipped by default");
     }
 }

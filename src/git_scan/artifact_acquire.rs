@@ -26,8 +26,8 @@ use std::path::PathBuf;
 use super::bytes::BytesView;
 use super::commit_graph_mem::CommitGraphMem;
 use super::commit_loader::{
-    collect_loose_dirs, collect_pack_dirs, load_commits_from_tips_with_loose_dirs,
-    load_commits_with_identities, resolve_pack_paths_from_midx, CommitLoadError, CommitLoadLimits,
+    collect_loose_dirs, collect_pack_dirs, load_commits_from_tips, load_commits_with_identities,
+    load_shallow_boundary_roots, resolve_pack_paths_from_midx, CommitLoadError, CommitLoadLimits,
 };
 use super::errors::{CommitPlanError, RepoOpenError};
 use super::identity_intern::IdentityInterner;
@@ -167,6 +167,15 @@ pub struct MidxAcquireResult {
 /// # Side Effects
 /// This function updates `repo.mmaps.midx` with the built bytes and sets
 /// the fingerprint to `PackSet` variant.
+///
+/// # Errors
+/// Returns:
+/// - `ArtifactAcquireError::MidxBuild` when in-memory MIDX construction fails.
+/// - `ArtifactAcquireError::MidxParse` when the freshly built bytes do not
+///   parse for `repo.object_format`.
+/// - `ArtifactAcquireError::CommitLoad` when MIDX pack names cannot be resolved
+///   to `.pack` paths.
+/// - `ArtifactAcquireError::RepoOpen` if fingerprint refresh fails.
 pub fn acquire_midx(
     repo: &mut RepoJobState,
     limits: &ArtifactBuildLimits,
@@ -210,6 +219,10 @@ pub fn acquire_midx(
 /// an empty graph.
 ///
 /// Bounded by `limits.commit_load`.
+///
+/// # Errors
+/// Returns `ArtifactAcquireError` when shallow-boundary loading or commit
+/// loading fails, or when `CommitGraphMem` rejects the loaded commit set.
 pub fn acquire_commit_graph(
     repo: &RepoJobState,
     midx: &MidxView<'_>,
@@ -229,11 +242,14 @@ pub fn acquire_commit_graph(
     }
 
     let loose_dirs = collect_loose_dirs(&repo.paths);
-    let commits = load_commits_from_tips_with_loose_dirs(
+    let shallow_boundary_roots =
+        load_shallow_boundary_roots(&repo.paths, repo.object_format, &limits.commit_load)?;
+    let commits = load_commits_from_tips(
         &tips,
         midx,
         pack_paths,
         &loose_dirs,
+        &shallow_boundary_roots,
         repo.object_format,
         &limits.commit_load,
         None, // No progress callback for now
@@ -252,6 +268,13 @@ pub fn acquire_commit_graph(
 ///
 /// The interner is allocated with a 4 MiB arena and an initial estimate of
 /// 16,384 unique identity strings.
+///
+/// If `repo.start_set` is empty and the repository has no reachable refs, this
+/// returns an empty graph and an empty interner.
+///
+/// # Errors
+/// Same error surface as [`acquire_commit_graph`], plus interning failures
+/// surfaced by `load_commits_with_identities`.
 pub fn acquire_commit_graph_with_identities(
     repo: &RepoJobState,
     midx: &MidxView<'_>,
@@ -272,6 +295,8 @@ pub fn acquire_commit_graph_with_identities(
     }
 
     let loose_dirs = collect_loose_dirs(&repo.paths);
+    let shallow_boundary_roots =
+        load_shallow_boundary_roots(&repo.paths, repo.object_format, &limits.commit_load)?;
     let mut interner = IdentityInterner::with_capacity(4 * 1024 * 1024, 16_384);
 
     let (commits, identity_ids) = load_commits_with_identities(
@@ -279,6 +304,7 @@ pub fn acquire_commit_graph_with_identities(
         midx,
         pack_paths,
         &loose_dirs,
+        &shallow_boundary_roots,
         repo.object_format,
         &limits.commit_load,
         &mut interner,
@@ -291,7 +317,10 @@ pub fn acquire_commit_graph_with_identities(
     Ok((graph, interner))
 }
 
-/// Resolves pack paths from MIDX data.
+/// Resolves `.pack` paths from freshly built MIDX bytes.
+///
+/// Re-parses the MIDX bytes for the repository object format, then resolves
+/// pack names using directory precedence from [`collect_pack_dirs`].
 fn resolve_pack_paths(
     repo: &RepoJobState,
     midx_bytes: &BytesView,
@@ -310,5 +339,7 @@ mod tests {
         let limits = ArtifactBuildLimits::default();
         assert!(limits.midx.max_packs > 0);
         assert!(limits.commit_load.max_commits > 0);
+        assert!(limits.commit_load.max_shallow_file_bytes > 0);
+        assert!(limits.commit_load.max_shallow_roots > 0);
     }
 }

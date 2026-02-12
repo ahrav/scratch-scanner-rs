@@ -11,6 +11,7 @@
 //! 4. Decode commit object (pack mmap + inflate or loose inflate)
 //! 5. Parse commit, collect parents
 //! 6. Add parents to frontier only if neither visited nor already queued
+//!    (except commits listed in `shallow`, which are treated as traversal roots)
 //! 7. Repeat until frontier empty or limits exceeded
 //!
 //! # Limits
@@ -18,6 +19,9 @@
 //! - `max_commit_object_bytes`: Reject commits exceeding this size
 //! - `max_parents`: Reject commits with too many parents
 //! - `max_delta_depth`: Abort overly deep delta chains
+//! - `max_shallow_file_bytes`: Reject oversized `.git/shallow` files
+//! - `max_shallow_roots`: Reject excessive unique shallow roots (also clamped
+//!   by the preallocated shallow-root capacity)
 //!
 //! # Determinism
 //! BFS order is deterministic given:
@@ -36,10 +40,25 @@
 //! # Pack Access
 //! Pack files are memory-mapped lazily on first access and cached per pack id.
 //! The `pack_paths` slice must align with MIDX pack ids.
+//!
+//! # Shallow Boundaries
+//! Commits listed in `.git/shallow` are loaded as normal commit nodes, but BFS
+//! intentionally does not enqueue their parents. This preserves first-class
+//! graph nodes for local history while preventing traversal into known-missing
+//! remote ancestry.
+//!
+//! # Complexity
+//! Traversal is `O(V + E)` in reachable commits/parent edges, plus object decode
+//! cost for each loaded node. Peak queue/set memory is bounded by frontier size.
+//!
+//! # Error Model
+//! Loader failures are fail-closed: malformed commit objects, missing packs for
+//! referenced MIDX entries, oversized shallow metadata, and delta-depth overruns
+//! all return `CommitLoadError` instead of silently skipping commits.
 
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, BufRead, BufReader};
 use std::path::PathBuf;
 
 use memmap2::Mmap;
@@ -91,6 +110,19 @@ pub enum CommitLoadError {
     CommitNotFound { oid: OidBytes },
     /// Too many commits.
     TooManyCommits { count: u32, limit: u32 },
+    /// Shallow file exceeds configured byte cap.
+    ShallowFileTooLarge {
+        path: PathBuf,
+        size: u64,
+        limit: u32,
+    },
+    /// Too many unique shallow roots were ingested.
+    TooManyShallowRoots {
+        path: PathBuf,
+        line: u32,
+        count: u32,
+        limit: u32,
+    },
     /// Delta chain too deep.
     DeltaChainTooDeep {
         pack_id: u16,
@@ -137,6 +169,25 @@ impl std::fmt::Display for CommitLoadError {
             }
             Self::TooManyCommits { count, limit } => {
                 write!(f, "too many commits: {count} (limit: {limit})")
+            }
+            Self::ShallowFileTooLarge { path, size, limit } => {
+                write!(
+                    f,
+                    "shallow file too large: {} (size: {size}, limit: {limit})",
+                    path.display()
+                )
+            }
+            Self::TooManyShallowRoots {
+                path,
+                line,
+                count,
+                limit,
+            } => {
+                write!(
+                    f,
+                    "too many shallow roots in {} at line {line}: {count} (limit: {limit})",
+                    path.display()
+                )
             }
             Self::DeltaChainTooDeep {
                 pack_id,
@@ -199,6 +250,9 @@ pub struct LoadedCommit {
 }
 
 /// Limits for commit loading.
+///
+/// These bounds are guardrails against malicious or pathological object graphs
+/// (oversized commit payloads, extreme merge fan-in, and deep delta chains).
 #[derive(Debug, Clone, Copy)]
 pub struct CommitLoadLimits {
     /// Maximum number of commits to load.
@@ -209,6 +263,13 @@ pub struct CommitLoadLimits {
     pub max_parents: usize,
     /// Maximum delta chain depth.
     pub max_delta_depth: u8,
+    /// Maximum bytes accepted from a single shallow file.
+    pub max_shallow_file_bytes: u32,
+    /// Maximum unique shallow roots accepted across all shallow files.
+    ///
+    /// Effective limit is additionally capped by
+    /// [`ShallowBoundaryRoots::PREALLOC_CAPACITY`].
+    pub max_shallow_roots: u32,
 }
 
 impl Default for CommitLoadLimits {
@@ -218,11 +279,73 @@ impl Default for CommitLoadLimits {
             max_commit_object_bytes: 1024 * 1024, // 1 MiB
             max_parents: 256,
             max_delta_depth: 64,
+            max_shallow_file_bytes: 8 * 1024 * 1024, // 8 MiB
+            max_shallow_roots: ShallowBoundaryRoots::PREALLOC_CAPACITY as u32,
+        }
+    }
+}
+
+/// Compact shallow-boundary root set used by commit traversal.
+///
+/// Layout is optimized for expected shallow-root cardinalities:
+/// - `Empty`: no lookup work in the BFS hot path
+/// - `One`: single equality check
+/// - `ManySorted`: sorted contiguous OID storage + binary search
+///
+/// `ManySorted` is populated from a preallocated vector to avoid additional
+/// heap growth in common cases.
+#[derive(Debug, Clone)]
+pub enum ShallowBoundaryRoots {
+    Empty,
+    One(OidBytes),
+    ManySorted(Vec<OidBytes>),
+}
+
+impl ShallowBoundaryRoots {
+    /// Preallocated shallow-root capacity (OID count).
+    pub const PREALLOC_CAPACITY: usize = 256;
+
+    #[inline(always)]
+    fn contains(&self, oid: &OidBytes) -> bool {
+        match self {
+            Self::Empty => false,
+            Self::One(root) => root == oid,
+            Self::ManySorted(roots) => roots.binary_search(oid).is_ok(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::Empty)
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::One(_) => 1,
+            Self::ManySorted(roots) => roots.len(),
+        }
+    }
+
+    fn from_deduped(mut roots: Vec<OidBytes>) -> Self {
+        if roots.is_empty() {
+            return Self::Empty;
+        }
+        roots.sort_unstable();
+        roots.dedup();
+        match roots.len() {
+            0 => Self::Empty,
+            1 => Self::One(roots[0]),
+            _ => Self::ManySorted(roots),
         }
     }
 }
 
 /// Progress callback for commit loading.
+///
+/// Called with the number of successfully loaded commits so far. Invocation is
+/// best-effort and currently throttled to every 1,000 loaded commits.
 pub type ProgressFn = dyn Fn(u32);
 
 /// Enqueues `oid` for BFS if it is neither visited nor already queued.
@@ -249,62 +372,51 @@ fn enqueue_frontier_oid(
 
 /// Loads commits starting from tip OIDs using BFS.
 ///
-/// Returns all reachable commits in discovery order (BFS). The order is
-/// deterministic given the same tip OIDs (including order) and pack contents.
+/// The loader first resolves commits from MIDX-backed packs. If an OID is
+/// absent from MIDX, it attempts the same OID in `loose_dirs`. Commits listed
+/// in `.git/shallow` are treated as traversal roots: their parent links are
+/// retained in the loaded commit but not enqueued for loading.
 ///
-/// # Arguments
-/// * `tips` - Starting commit OIDs (branch tips, tags, etc.)
-/// * `midx` - MIDX view for pack lookups
-/// * `pack_paths` - Resolved pack file paths (in MIDX order)
-/// * `format` - Object format (SHA-1 or SHA-256)
-/// * `limits` - Loading limits
-/// * `progress` - Optional progress callback (called every 1000 commits)
+/// This is the canonical commit-loading entrypoint: callers must explicitly
+/// provide loose-object lookup directories and shallow-boundary roots from the
+/// same repository snapshot used to build `midx` and `pack_paths`.
+///
+/// # Preconditions
+/// - `pack_paths` must be indexed by MIDX `pack_id`.
+/// - `shallow_boundary_roots` should come from the same repository graph as
+///   `tips`/`midx` to avoid unintentionally truncating traversal.
+///
+/// # Complexity
+/// `O(V + E)` over commits reachable from `tips`, excluding object decode cost.
 ///
 /// # Errors
-/// Returns `CommitLoadError` if:
-/// - A commit cannot be found or decoded
-/// - Limits are exceeded
-/// - Pack files cannot be read
+/// Propagates `CommitLoadError` on lookup, decode, parse, or configured-limit
+/// violations.
+#[allow(clippy::too_many_arguments)]
 pub fn load_commits_from_tips(
     tips: &[OidBytes],
     midx: &MidxView<'_>,
     pack_paths: &[PathBuf],
+    loose_dirs: &[PathBuf],
+    shallow_boundary_roots: &ShallowBoundaryRoots,
     format: ObjectFormat,
     limits: &CommitLoadLimits,
     progress: Option<&ProgressFn>,
 ) -> Result<Vec<LoadedCommit>, CommitLoadError> {
-    let loose_dirs = derive_loose_dirs_from_pack_paths(pack_paths);
-    load_commits_from_tips_with_loose_dirs(
-        tips,
+    let mut loader = CommitLoader::new(
         midx,
         pack_paths,
-        &loose_dirs,
+        loose_dirs,
+        shallow_boundary_roots,
         format,
         limits,
-        progress,
-    )
-}
-
-/// Loads commits starting from tip OIDs using BFS with explicit loose lookup dirs.
-///
-/// The loader first resolves commits from MIDX-backed packs. If an OID is
-/// absent from MIDX, it attempts the same OID in `loose_dirs`.
-pub fn load_commits_from_tips_with_loose_dirs(
-    tips: &[OidBytes],
-    midx: &MidxView<'_>,
-    pack_paths: &[PathBuf],
-    loose_dirs: &[PathBuf],
-    format: ObjectFormat,
-    limits: &CommitLoadLimits,
-    progress: Option<&ProgressFn>,
-) -> Result<Vec<LoadedCommit>, CommitLoadError> {
-    let mut loader = CommitLoader::new(midx, pack_paths, loose_dirs, format, limits)?;
+    )?;
     loader.load_from_tips(tips, progress)
 }
 
 /// Loads commits with identity enrichment from tip OIDs using BFS.
 ///
-/// Same BFS traversal as [`load_commits_from_tips_with_loose_dirs`], but also
+/// Same BFS traversal as [`load_commits_from_tips`], but also
 /// extracts author/committer identity from each commit's raw bytes and interns
 /// the strings into `interner`. Returns both the loaded commits and a parallel
 /// `Vec<CommitIdentityIds>` aligned 1:1 with the commit list.
@@ -312,18 +424,35 @@ pub fn load_commits_from_tips_with_loose_dirs(
 /// When identity parsing fails for a commit (malformed header), the identity
 /// IDs are set to [`SENTINEL_ID`]. If parsing succeeds but interning fails,
 /// loading returns `CommitLoadError`.
+///
+/// # Complexity
+/// Same asymptotic traversal cost as [`load_commits_from_tips`], with an extra
+/// constant-time header scan per loaded commit for identity extraction.
+///
+/// # Errors
+/// Same error surface as [`load_commits_from_tips`], plus
+/// `CommitLoadError::IdentityInternError` when parsed identity fields cannot be
+/// interned.
 #[allow(clippy::too_many_arguments)]
 pub fn load_commits_with_identities(
     tips: &[OidBytes],
     midx: &MidxView<'_>,
     pack_paths: &[PathBuf],
     loose_dirs: &[PathBuf],
+    shallow_boundary_roots: &ShallowBoundaryRoots,
     format: ObjectFormat,
     limits: &CommitLoadLimits,
     interner: &mut IdentityInterner,
     progress: Option<&ProgressFn>,
 ) -> Result<(Vec<LoadedCommit>, Vec<CommitIdentityIds>), CommitLoadError> {
-    let mut loader = CommitLoader::new(midx, pack_paths, loose_dirs, format, limits)?;
+    let mut loader = CommitLoader::new(
+        midx,
+        pack_paths,
+        loose_dirs,
+        shallow_boundary_roots,
+        format,
+        limits,
+    )?;
     loader.load_from_tips_with_identities(tips, interner, progress)
 }
 
@@ -331,6 +460,10 @@ pub fn load_commits_with_identities(
 ///
 /// Returns paths in MIDX pack order (by pack_id).
 /// The first matching directory in `pack_dirs` wins.
+///
+/// # Errors
+/// Returns `CommitLoadError::Io(NotFound)` when any MIDX-referenced pack is not
+/// present in the supplied directory list.
 pub fn resolve_pack_paths_from_midx(
     midx: &MidxView<'_>,
     pack_dirs: &[PathBuf],
@@ -346,6 +479,10 @@ pub fn resolve_pack_paths_from_midx(
 }
 
 /// Collects pack directories from repo paths.
+///
+/// Includes the primary objects pack dir and alternate object pack dirs,
+/// skipping alternates that resolve to the primary objects directory.
+/// Returned order is significant and defines pack-name lookup precedence.
 pub fn collect_pack_dirs(repo: &GitRepoPaths) -> Vec<PathBuf> {
     let mut dirs = Vec::with_capacity(1 + repo.alternate_object_dirs.len());
     dirs.push(repo.pack_dir.clone());
@@ -360,6 +497,11 @@ pub fn collect_pack_dirs(repo: &GitRepoPaths) -> Vec<PathBuf> {
 }
 
 /// Collects loose object directories from repo paths.
+///
+/// Returns directories in precedence order: primary objects dir first, then
+/// unique alternates.
+/// Returned paths are not canonicalized; callers should supply a coherent
+/// `GitRepoPaths` snapshot from `repo_open`.
 pub fn collect_loose_dirs(repo: &GitRepoPaths) -> Vec<PathBuf> {
     let mut dirs = Vec::with_capacity(1 + repo.alternate_object_dirs.len());
     dirs.push(repo.objects_dir.clone());
@@ -371,6 +513,98 @@ pub fn collect_loose_dirs(repo: &GitRepoPaths) -> Vec<PathBuf> {
     }
 
     dirs
+}
+
+/// Loads shallow-boundary commit OIDs from `shallow` files.
+///
+/// Git stores shallow-cut commits in `<gitdir>/shallow` (and, for linked
+/// worktrees, potentially `<commondir>/shallow`). These commits are real local
+/// objects whose parent links may reference non-local history. The commit
+/// loader uses this set to stop BFS traversal at those boundaries.
+///
+/// Missing `shallow` files are treated as an empty set.
+///
+/// # Errors
+/// Returns `CommitLoadError::Io(InvalidData)` when a `shallow` entry is not a
+/// valid full-length OID for the repository object format. Returns dedicated
+/// limit errors when shallow file size or root count bounds are exceeded. The
+/// root-count bound is clamped by [`ShallowBoundaryRoots::PREALLOC_CAPACITY`].
+pub fn load_shallow_boundary_roots(
+    repo: &GitRepoPaths,
+    format: ObjectFormat,
+    limits: &CommitLoadLimits,
+) -> Result<ShallowBoundaryRoots, CommitLoadError> {
+    let mut shallow_files = Vec::with_capacity(2);
+    shallow_files.push(repo.git_dir.join("shallow"));
+    if repo.common_dir != repo.git_dir {
+        shallow_files.push(repo.common_dir.join("shallow"));
+    }
+
+    let mut out = Vec::with_capacity(ShallowBoundaryRoots::PREALLOC_CAPACITY);
+    let max_unique_roots = limits
+        .max_shallow_roots
+        .min(limits.max_commits)
+        .min(ShallowBoundaryRoots::PREALLOC_CAPACITY as u32);
+    let mut line_buf = String::new();
+
+    for shallow_path in shallow_files {
+        let file = match File::open(&shallow_path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(CommitLoadError::Io(err)),
+        };
+        let file_size = file.metadata().map_err(CommitLoadError::Io)?.len();
+        if file_size > limits.max_shallow_file_bytes as u64 {
+            return Err(CommitLoadError::ShallowFileTooLarge {
+                path: shallow_path,
+                size: file_size,
+                limit: limits.max_shallow_file_bytes,
+            });
+        }
+
+        let mut reader = BufReader::new(file);
+        let mut line_idx = 0u32;
+        loop {
+            line_buf.clear();
+            if reader
+                .read_line(&mut line_buf)
+                .map_err(CommitLoadError::Io)?
+                == 0
+            {
+                break;
+            }
+            line_idx = line_idx.saturating_add(1);
+            let trimmed = line_buf.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Some(oid) = parse_hex_oid_for_format(trimmed.as_bytes(), format) else {
+                return Err(CommitLoadError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid shallow OID in {} at line {}",
+                        shallow_path.display(),
+                        line_idx
+                    ),
+                )));
+            };
+
+            if out.contains(&oid) {
+                continue;
+            }
+            if out.len() >= max_unique_roots as usize {
+                return Err(CommitLoadError::TooManyShallowRoots {
+                    path: shallow_path.clone(),
+                    line: line_idx,
+                    count: u32::try_from(out.len().saturating_add(1)).unwrap_or(u32::MAX),
+                    limit: max_unique_roots,
+                });
+            }
+            out.push(oid);
+        }
+    }
+
+    Ok(ShallowBoundaryRoots::from_deduped(out))
 }
 
 /// Finds a pack file by name across pack directories.
@@ -404,29 +638,6 @@ fn find_pack_file(name: &[u8], pack_dirs: &[PathBuf]) -> Result<PathBuf, CommitL
     )))
 }
 
-/// Derives loose object directories from pack file paths.
-///
-/// Walks each pack path up two levels (`…/objects/pack/foo.pack` →
-/// `…/objects/`) to locate the parent objects directory, deduplicating
-/// along the way. This is a best-effort heuristic for when explicit
-/// loose dirs are not available.
-fn derive_loose_dirs_from_pack_paths(pack_paths: &[PathBuf]) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    for pack_path in pack_paths {
-        let Some(pack_dir) = pack_path.parent() else {
-            continue;
-        };
-        let Some(objects_dir) = pack_dir.parent() else {
-            continue;
-        };
-        let objects_dir = objects_dir.to_path_buf();
-        if !dirs.iter().any(|existing| existing == &objects_dir) {
-            dirs.push(objects_dir);
-        }
-    }
-    dirs
-}
-
 /// Internal commit loader state.
 ///
 /// Owns a lazy mmap cache for pack files: each pack is mapped on first
@@ -434,13 +645,15 @@ fn derive_loose_dirs_from_pack_paths(pack_paths: &[PathBuf]) -> Vec<PathBuf> {
 /// Delta resolution is recursive (bounded by `max_delta_depth`); each
 /// recursive call releases the pack borrow before recursing so the mmap
 /// cache can be extended if the base lives in a different pack.
-struct CommitLoader<'m, 'p, 'l> {
+struct CommitLoader<'m, 'p, 'l, 's> {
     /// MIDX used for OID → (pack_id, offset) resolution.
     midx: &'m MidxView<'m>,
     /// Pack paths aligned to MIDX pack ids.
     pack_paths: &'p [PathBuf],
     /// Loose object directories (primary objects dir + alternates).
     loose_dirs: &'l [PathBuf],
+    /// Commit OIDs at shallow boundaries (`.git/shallow`).
+    shallow_boundary_roots: &'s ShallowBoundaryRoots,
     format: ObjectFormat,
     limits: CommitLoadLimits,
     parse_limits: CommitParseLimits,
@@ -450,11 +663,12 @@ struct CommitLoader<'m, 'p, 'l> {
     pack_parse_cache: Vec<Option<PackHeader>>,
 }
 
-impl<'m, 'p, 'l> CommitLoader<'m, 'p, 'l> {
+impl<'m, 'p, 'l, 's> CommitLoader<'m, 'p, 'l, 's> {
     fn new(
         midx: &'m MidxView<'m>,
         pack_paths: &'p [PathBuf],
         loose_dirs: &'l [PathBuf],
+        shallow_boundary_roots: &'s ShallowBoundaryRoots,
         format: ObjectFormat,
         limits: &CommitLoadLimits,
     ) -> Result<Self, CommitLoadError> {
@@ -471,6 +685,7 @@ impl<'m, 'p, 'l> CommitLoader<'m, 'p, 'l> {
             midx,
             pack_paths,
             loose_dirs,
+            shallow_boundary_roots,
             format,
             limits: *limits,
             parse_limits,
@@ -511,9 +726,12 @@ impl<'m, 'p, 'l> CommitLoader<'m, 'p, 'l> {
 
             let commit = self.load_commit(&oid)?;
 
-            // Add unseen parents to frontier.
-            for parent in &commit.parents {
-                let _ = enqueue_frontier_oid(*parent, &visited, &mut queued, &mut frontier);
+            // Shallow-boundary commits intentionally reference unavailable
+            // ancestors. Keep parent links for graph semantics, but stop BFS.
+            if !self.shallow_boundary_roots.contains(&oid) {
+                for parent in &commit.parents {
+                    let _ = enqueue_frontier_oid(*parent, &visited, &mut queued, &mut frontier);
+                }
             }
 
             commits.push(commit);
@@ -530,6 +748,9 @@ impl<'m, 'p, 'l> CommitLoader<'m, 'p, 'l> {
 
     /// BFS traversal with identity enrichment. Returns commits and a
     /// parallel `Vec<CommitIdentityIds>` aligned 1:1 with the commit list.
+    ///
+    /// Alignment invariant: `identity_ids[i]` always corresponds to
+    /// `commits[i]` for every loaded commit.
     fn load_from_tips_with_identities(
         &mut self,
         tips: &[OidBytes],
@@ -562,8 +783,10 @@ impl<'m, 'p, 'l> CommitLoader<'m, 'p, 'l> {
 
             let (commit, ids) = self.load_commit_with_identity(&oid, interner)?;
 
-            for parent in &commit.parents {
-                let _ = enqueue_frontier_oid(*parent, &visited, &mut queued, &mut frontier);
+            if !self.shallow_boundary_roots.contains(&oid) {
+                for parent in &commit.parents {
+                    let _ = enqueue_frontier_oid(*parent, &visited, &mut queued, &mut frontier);
+                }
             }
 
             commits.push(commit);
@@ -658,6 +881,11 @@ impl<'m, 'p, 'l> CommitLoader<'m, 'p, 'l> {
         Ok((commit, ids))
     }
 
+    /// Attempts to load `oid` from loose-object directories.
+    ///
+    /// Returns `Ok(None)` when the object is not present in any loose dir. Any
+    /// read/inflate/header-parse failure for a discovered loose object returns
+    /// `CommitLoadError::LooseObjectError`.
     fn load_loose_object(
         &self,
         oid: &OidBytes,
@@ -707,6 +935,9 @@ impl<'m, 'p, 'l> CommitLoader<'m, 'p, 'l> {
         Ok(None)
     }
 
+    /// Loads one object from pack storage, resolving deltas recursively.
+    ///
+    /// Starts recursion at the configured maximum delta depth.
     fn load_object(
         &mut self,
         pack_id: u16,
@@ -920,6 +1151,9 @@ fn parse_loose_object(bytes: &[u8], max_payload: usize) -> Result<(ObjectKind, V
     Ok((kind, payload.to_vec()))
 }
 
+/// Parses ASCII decimal digits into `u64` with overflow checks.
+///
+/// Returns `None` for empty, non-digit, or overflowing inputs.
 fn parse_decimal(bytes: &[u8]) -> Option<u64> {
     if bytes.is_empty() {
         return None;
@@ -933,6 +1167,42 @@ fn parse_decimal(bytes: &[u8]) -> Option<u64> {
         out = out.checked_mul(10)?.checked_add((b - b'0') as u64)?;
     }
     Some(out)
+}
+
+/// Parses a full-length hex OID string for the repository object format.
+///
+/// Returns `None` on length mismatch or invalid hex characters.
+fn parse_hex_oid_for_format(hex: &[u8], format: ObjectFormat) -> Option<OidBytes> {
+    let expected_hex_len = format.hex_len() as usize;
+    if hex.len() != expected_hex_len {
+        return None;
+    }
+
+    let mut out = [0u8; 32];
+    for (idx, pair) in hex.chunks_exact(2).enumerate() {
+        let hi = hex_nibble(pair[0])?;
+        let lo = hex_nibble(pair[1])?;
+        out[idx] = (hi << 4) | lo;
+    }
+
+    match format {
+        ObjectFormat::Sha1 => {
+            let mut sha1 = [0u8; 20];
+            sha1.copy_from_slice(&out[..20]);
+            Some(OidBytes::sha1(sha1))
+        }
+        ObjectFormat::Sha256 => Some(OidBytes::sha256(out)),
+    }
+}
+
+#[inline(always)]
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Extracts and interns author/committer identity from raw commit bytes.
@@ -1008,6 +1278,7 @@ fn oid_to_hex(oid: &OidBytes) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git_scan::RepoKind;
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
     use std::io::Write;
@@ -1196,6 +1467,32 @@ mod tests {
         OidBytes::sha1(oid)
     }
 
+    fn test_repo_paths(base: &std::path::Path) -> GitRepoPaths {
+        let git_dir = base.join(".git");
+        let objects_dir = git_dir.join("objects");
+        let pack_dir = objects_dir.join("pack");
+        fs::create_dir_all(&pack_dir).unwrap();
+        GitRepoPaths {
+            kind: RepoKind::Worktree,
+            worktree_root: Some(base.to_path_buf()),
+            git_dir: git_dir.clone(),
+            common_dir: git_dir,
+            objects_dir,
+            pack_dir,
+            alternate_object_dirs: Vec::new(),
+        }
+    }
+
+    fn sha1_hex(seed: u8) -> String {
+        use std::fmt::Write as _;
+
+        let mut out = String::with_capacity(40);
+        for idx in 0..20u8 {
+            let _ = write!(&mut out, "{:02x}", seed.wrapping_add(idx));
+        }
+        out
+    }
+
     fn make_commit_bytes(
         author_name: &[u8],
         author_email: &[u8],
@@ -1263,6 +1560,187 @@ mod tests {
         assert!(limits.max_commit_object_bytes >= 64 * 1024);
         assert!(limits.max_parents >= 16);
         assert!(limits.max_delta_depth >= 32);
+        assert!(limits.max_shallow_file_bytes >= 1024 * 1024);
+        assert_eq!(
+            limits.max_shallow_roots as usize,
+            ShallowBoundaryRoots::PREALLOC_CAPACITY
+        );
+    }
+
+    #[test]
+    fn load_shallow_boundary_roots_missing_files_returns_empty() {
+        let temp = tempdir().unwrap();
+        let repo = test_repo_paths(temp.path());
+        let roots =
+            load_shallow_boundary_roots(&repo, ObjectFormat::Sha1, &CommitLoadLimits::default())
+                .unwrap();
+        assert!(roots.is_empty());
+    }
+
+    #[test]
+    fn load_shallow_boundary_roots_invalid_oid_is_invalid_data() {
+        let temp = tempdir().unwrap();
+        let repo = test_repo_paths(temp.path());
+        fs::write(repo.git_dir.join("shallow"), "not-an-oid\n").unwrap();
+
+        let err =
+            load_shallow_boundary_roots(&repo, ObjectFormat::Sha1, &CommitLoadLimits::default())
+                .unwrap_err();
+        match err {
+            CommitLoadError::Io(err) => {
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_shallow_boundary_roots_rejects_oversized_file() {
+        let temp = tempdir().unwrap();
+        let repo = test_repo_paths(temp.path());
+        let payload = format!("{}\n", sha1_hex(0x11));
+        fs::write(repo.git_dir.join("shallow"), payload).unwrap();
+
+        let limits = CommitLoadLimits {
+            max_shallow_file_bytes: 8,
+            ..CommitLoadLimits::default()
+        };
+        let err = load_shallow_boundary_roots(&repo, ObjectFormat::Sha1, &limits).unwrap_err();
+        match err {
+            CommitLoadError::ShallowFileTooLarge { path, size, limit } => {
+                assert_eq!(path, repo.git_dir.join("shallow"));
+                assert!(size > u64::from(limit));
+                assert_eq!(limit, 8);
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_shallow_boundary_roots_rejects_too_many_unique_roots() {
+        let temp = tempdir().unwrap();
+        let repo = test_repo_paths(temp.path());
+        let shallow = format!("{}\n{}\n", sha1_hex(0x22), sha1_hex(0x33));
+        fs::write(repo.git_dir.join("shallow"), shallow).unwrap();
+
+        let limits = CommitLoadLimits {
+            max_shallow_roots: 1,
+            max_commits: 10,
+            ..CommitLoadLimits::default()
+        };
+        let err = load_shallow_boundary_roots(&repo, ObjectFormat::Sha1, &limits).unwrap_err();
+        match err {
+            CommitLoadError::TooManyShallowRoots {
+                path,
+                line,
+                count,
+                limit,
+            } => {
+                assert_eq!(path, repo.git_dir.join("shallow"));
+                assert_eq!(line, 2);
+                assert_eq!(count, 2);
+                assert_eq!(limit, 1);
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_shallow_boundary_roots_duplicates_do_not_trip_unique_limit() {
+        let temp = tempdir().unwrap();
+        let repo = test_repo_paths(temp.path());
+        let oid = sha1_hex(0x44);
+        let shallow = format!("{oid}\n{oid}\n{oid}\n");
+        fs::write(repo.git_dir.join("shallow"), shallow).unwrap();
+
+        let limits = CommitLoadLimits {
+            max_shallow_roots: 1,
+            max_commits: 10,
+            ..CommitLoadLimits::default()
+        };
+        let roots = load_shallow_boundary_roots(&repo, ObjectFormat::Sha1, &limits).unwrap();
+        assert_eq!(roots.len(), 1);
+    }
+
+    #[test]
+    fn load_shallow_boundary_roots_clamps_limit_to_max_commits() {
+        let temp = tempdir().unwrap();
+        let repo = test_repo_paths(temp.path());
+        let shallow = format!("{}\n{}\n", sha1_hex(0x55), sha1_hex(0x66));
+        fs::write(repo.git_dir.join("shallow"), shallow).unwrap();
+
+        let limits = CommitLoadLimits {
+            max_shallow_roots: 10,
+            max_commits: 1,
+            ..CommitLoadLimits::default()
+        };
+        let err = load_shallow_boundary_roots(&repo, ObjectFormat::Sha1, &limits).unwrap_err();
+        match err {
+            CommitLoadError::TooManyShallowRoots { limit, .. } => {
+                assert_eq!(limit, 1);
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_shallow_boundary_roots_clamps_limit_to_preallocated_capacity() {
+        let temp = tempdir().unwrap();
+        let repo = test_repo_paths(temp.path());
+
+        let mut shallow = String::new();
+        for idx in 0..=ShallowBoundaryRoots::PREALLOC_CAPACITY {
+            // 40-hex-digit SHA-1 OIDs; all unique across this range.
+            shallow.push_str(&format!("{:040x}\n", idx + 1));
+        }
+        fs::write(repo.git_dir.join("shallow"), shallow).unwrap();
+
+        let limits = CommitLoadLimits {
+            max_shallow_roots: 10_000,
+            max_commits: 10_000,
+            ..CommitLoadLimits::default()
+        };
+        let err = load_shallow_boundary_roots(&repo, ObjectFormat::Sha1, &limits).unwrap_err();
+        match err {
+            CommitLoadError::TooManyShallowRoots {
+                line, count, limit, ..
+            } => {
+                assert_eq!(line as usize, ShallowBoundaryRoots::PREALLOC_CAPACITY + 1);
+                assert_eq!(count as usize, ShallowBoundaryRoots::PREALLOC_CAPACITY + 1);
+                assert_eq!(limit as usize, ShallowBoundaryRoots::PREALLOC_CAPACITY);
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_shallow_boundary_roots_reads_common_dir_for_linked_worktree() {
+        let temp = tempdir().unwrap();
+        let worktree_root = temp.path().join("worktree");
+        let git_dir = worktree_root.join(".git");
+        let common_dir = temp.path().join("common.git");
+        fs::create_dir_all(git_dir.join("objects/pack")).unwrap();
+        fs::create_dir_all(common_dir.join("objects/pack")).unwrap();
+
+        fs::write(git_dir.join("shallow"), format!("{}\n", sha1_hex(0x77))).unwrap();
+        fs::write(common_dir.join("shallow"), format!("{}\n", sha1_hex(0x88))).unwrap();
+
+        let repo = GitRepoPaths {
+            kind: RepoKind::Worktree,
+            worktree_root: Some(worktree_root),
+            git_dir: git_dir.clone(),
+            common_dir: common_dir.clone(),
+            objects_dir: common_dir.join("objects"),
+            pack_dir: common_dir.join("objects/pack"),
+            alternate_object_dirs: Vec::new(),
+        };
+        let limits = CommitLoadLimits {
+            max_shallow_roots: 2,
+            ..CommitLoadLimits::default()
+        };
+
+        let roots = load_shallow_boundary_roots(&repo, ObjectFormat::Sha1, &limits).unwrap();
+        assert_eq!(roots.len(), 2);
     }
 
     #[test]
@@ -1365,9 +1843,16 @@ mod tests {
 
         let pack_paths = vec![pack_path];
         let loose_dirs = Vec::new();
-        let mut loader =
-            CommitLoader::new(&midx, &pack_paths, &loose_dirs, ObjectFormat::Sha1, &limits)
-                .unwrap();
+        let shallow_boundary_roots = ShallowBoundaryRoots::Empty;
+        let mut loader = CommitLoader::new(
+            &midx,
+            &pack_paths,
+            &loose_dirs,
+            &shallow_boundary_roots,
+            ObjectFormat::Sha1,
+            &limits,
+        )
+        .unwrap();
 
         let loaded = loader
             .load_object_with_depth(0, delta_offset, limits.max_delta_depth)
