@@ -30,12 +30,14 @@
 //!
 //! ## Scope
 //!
-//! Offline validation runs as a **post-scan filter** on root-buffer findings
-//! only. Transform-derived findings (e.g. secrets discovered inside a
-//! base64-decoded span) are not validated because their span coordinates
-//! reference decoded buffers, not the root input buffer from which secret
-//! bytes would need to be sliced. This means a rule with both transform
-//! decoding and `offline_validation` will only validate direct (root) matches.
+//! Offline validation runs **inline at emission time** in `window_validate.rs`
+//! for root-semantic findings only (parent `step_id == STEP_ROOT`). This
+//! includes UTF-16 root findings whose parent is `STEP_ROOT` even though
+//! their own `step_id` is a `Utf16Window` decode step. Transform-derived
+//! findings (e.g. secrets discovered inside a base64-decoded span) are not
+//! validated because their parent step_id is not `STEP_ROOT`. This means a
+//! rule with both transform decoding and `offline_validation` will only
+//! validate direct (root) matches.
 //!
 //! ## Design constraints
 //!
@@ -67,7 +69,7 @@ use crate::api::{OfflineValidationSpec, OfflineVerdict};
 
 /// Dispatch an offline validation check for the given spec and secret bytes.
 ///
-/// Called by the post-scan filter when a rule has an `offline_validation` gate.
+/// Called by the inline emission-time gate when a rule has an `offline_validation` gate.
 /// Returns [`OfflineVerdict::Valid`], [`Invalid`](OfflineVerdict::Invalid),
 /// or [`Indeterminate`](OfflineVerdict::Indeterminate).
 pub(crate) fn validate(spec: OfflineValidationSpec, secret: &[u8]) -> OfflineVerdict {

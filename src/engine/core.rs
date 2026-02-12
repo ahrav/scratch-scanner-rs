@@ -40,9 +40,8 @@
 //! - Budgets (decode bytes, work items, depth) are enforced per-item so no
 //!   single input forces unbounded work.
 //! - Apply suppression/cap policies at finding emission time so most
-//!   findings are handled inline. A final post-scan compaction pass
-//!   (`post_scan_filter`) removes root findings that fail offline
-//!   structural validation.
+//!   findings are handled inline, including offline structural validation
+//!   which runs at each emission site in `window_validate.rs`.
 //!
 //! ## Design choices
 //!
@@ -1803,76 +1802,9 @@ impl Engine {
             }
         }
 
-        // ── Post-scan filter: offline validation ─────────────────────────
-        //
-        // Suppress root findings that fail structural validation (bad CRC,
-        // invalid charset, etc.). Runs after all scan work is complete so
-        // it sees the full finding set, including transform-derived results.
-        //
-        // TODO: offline-invalid findings currently consume max_findings_per_chunk
-        // slots during emission. In pathological inputs this could crowd out
-        // valid findings that are then permanently dropped. Consider running
-        // offline validation inline during emission or reserving cap headroom,
-        // though this would require restructuring the scan loop since offline
-        // validation needs complete extracted spans from the BFS work queue.
-        self.post_scan_filter(root_buf, scratch);
-    }
-
-    /// Post-scan offline-validation filter: suppress root findings that fail
-    /// structural checks.
-    ///
-    /// Runs after the work-queue loop in [`scan_chunk_into`], once all findings
-    /// have been emitted. For each root finding whose rule has an
-    /// `offline_validation` gate, the matched secret bytes are sliced from
-    /// `root_buf` and passed to [`super::offline_validate::validate`].
-    /// Findings with an [`Invalid`](crate::api::OfflineVerdict::Invalid)
-    /// verdict are removed in a single compaction pass over the three parallel
-    /// scratch vectors (`out`, `norm_hash`, `drop_hint_end`).
-    ///
-    /// Non-root findings (transform-derived) are always kept because their
-    /// span coordinates reference decoded buffers, not `root_buf`.
-    ///
-    /// `Valid` and `Indeterminate` verdicts are both kept — only positive proof
-    /// of structural failure triggers suppression.
-    #[inline]
-    fn post_scan_filter(&self, root_buf: &[u8], scratch: &mut ScanScratch) {
-        if self.offline_validation_gates.is_empty() {
-            return;
-        }
-
-        let rules_hot = &self.rules_hot;
-        let gates = &self.offline_validation_gates;
-        let buf_len = root_buf.len();
-
-        let removed = scratch.retain_findings_aligned(|rec, _drop_end| {
-            // Only root findings are eligible for offline validation.
-            if rec.step_id != STEP_ROOT {
-                return true;
-            }
-
-            let rule = &rules_hot[rec.rule_id as usize];
-            let gate_idx = match rule.offline_validation {
-                Some(idx) => idx,
-                None => return true,
-            };
-
-            let spec = gates[gate_idx as usize];
-            let start = rec.span_start as usize;
-            let end = rec.span_end as usize;
-
-            // Defensive: skip validation if the span is out of bounds.
-            if end > buf_len {
-                return true;
-            }
-
-            let secret = &root_buf[start..end];
-            let verdict = super::offline_validate::validate(spec, secret);
-
-            !(matches!(verdict, crate::api::OfflineVerdict::Invalid)
-                && spec.suppresses_on_invalid())
-        });
-
-        crate::perf_stats::sat_add_usize(&mut scratch.offline_suppressed, removed);
+        // Offline validation runs inline at each emission site in
+        // window_validate.rs, using the parent step_id to correctly
+        // identify root-semantic findings (including UTF-16 variants).
     }
 
     /// Scans a buffer and returns a shared view of finding records.

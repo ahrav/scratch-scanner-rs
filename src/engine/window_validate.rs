@@ -19,9 +19,8 @@
 //! 6. Apply value suppressors (when configured) on the extracted secret bytes.
 //! 7. Apply local context checks (when configured) on the secret span.
 //! 8. Apply root-context safelist suppression for root emit paths.
-//! 9. Record the finding with the extracted secret span.
-//!
-//! Offline structural validation runs post-scan in `core.rs`, not per-window.
+//! 9. Apply offline structural validation (CRC, charset, etc.) for root-semantic findings.
+//! 10. Record the finding with the extracted secret span.
 //!
 //! # Secret Extraction
 //! The finding's `span_start`/`span_end` reflect the *secret* portion of the match,
@@ -482,6 +481,14 @@ impl Engine {
                             let include_span =
                                 step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
 
+                            if self.offline_validation_suppresses(rule, secret_bytes, step_id) {
+                                crate::perf_stats::sat_add_usize(
+                                    &mut scratch.offline_suppressed,
+                                    1,
+                                );
+                                return;
+                            }
+
                             let norm_hash = *blake3::hash(secret_bytes).as_bytes();
                             scratch.push_finding_with_drop_hint(
                                 FindingRec {
@@ -756,6 +763,14 @@ impl Engine {
                     // is unavailable for nested transforms.
                     let include_span =
                         utf16_step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
+
+                    // Use the parent step_id (not utf16_step_id) for offline validation:
+                    // root UTF-16 findings have parent == STEP_ROOT.
+                    if self.offline_validation_suppresses(rule, secret_bytes, step_id) {
+                        crate::perf_stats::sat_add_usize(&mut scratch.offline_suppressed, 1);
+                        return;
+                    }
+
                     let norm_hash = *blake3::hash(secret_bytes).as_bytes();
                     scratch.push_finding_with_drop_hint(
                         FindingRec {
@@ -929,6 +944,11 @@ impl Engine {
                     // boundaries, so dedupe relies solely on the root hint window.
                     let dedupe_with_span =
                         step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
+
+                    if self.offline_validation_suppresses(rule, secret_bytes, step_id) {
+                        crate::perf_stats::sat_add_usize(&mut scratch.offline_suppressed, 1);
+                        return;
+                    }
 
                     let norm_hash = *blake3::hash(secret_bytes).as_bytes();
                     scratch.tmp_findings.push(FindingRec {
@@ -1158,6 +1178,14 @@ impl Engine {
                     // is unavailable. See run_rule_on_raw_window_into for full rationale.
                     let dedupe_with_span =
                         utf16_step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
+
+                    // Use the parent step_id (not utf16_step_id) for offline validation:
+                    // root UTF-16 findings have parent == STEP_ROOT.
+                    if self.offline_validation_suppresses(rule, secret_bytes, step_id) {
+                        crate::perf_stats::sat_add_usize(&mut scratch.offline_suppressed, 1);
+                        return;
+                    }
+
                     let norm_hash = *blake3::hash(secret_bytes).as_bytes();
                     scratch.tmp_findings.push(FindingRec {
                         file_id,
@@ -1222,6 +1250,29 @@ impl Engine {
                 break;
             }
         }
+    }
+
+    /// Returns `true` if offline structural validation suppresses this finding.
+    ///
+    /// Only root-semantic findings (`parent_step_id == STEP_ROOT`) are checked.
+    /// For UTF-16 paths, pass the parent step_id (not `utf16_step_id`).
+    #[inline(always)]
+    fn offline_validation_suppresses(
+        &self,
+        rule: &RuleCompiled,
+        secret_bytes: &[u8],
+        parent_step_id: StepId,
+    ) -> bool {
+        if parent_step_id != STEP_ROOT {
+            return false;
+        }
+        let gate_idx = match rule.offline_validation {
+            Some(idx) => idx,
+            None => return false,
+        };
+        let spec = self.offline_validation_gates[gate_idx as usize];
+        let verdict = super::offline_validate::validate(spec, secret_bytes);
+        matches!(verdict, crate::api::OfflineVerdict::Invalid) && spec.suppresses_on_invalid()
     }
 }
 
