@@ -708,6 +708,16 @@ rules:
             "curl-auth-header",
             "curl-auth-user",
             "atlassian-api-token",
+            "adafruit-api-key",
+            "adobe-client-id",
+            "algolia-api-key",
+            "confluent-access-token",
+            "confluent-secret-key",
+            "discord-api-token",
+            "discord-client-secret",
+            "heroku-api-key",
+            "linear-client-secret",
+            "zendesk-secret-key",
         ];
 
         for rule_name in target_rules {
@@ -724,6 +734,50 @@ rules:
                 "expected shared suppressor 'example' for {rule_name}"
             );
         }
+    }
+
+    #[test]
+    /// Guardrail: strongly prefix-structured tokens intentionally stay off the
+    /// generic placeholder suppressor baseline to avoid format-specific false negatives.
+    fn structured_prefix_rules_keep_value_suppressors_unset() {
+        let structured_prefix_rules = [
+            "aws-access-token",
+            "github-pat",
+            "npm-access-token",
+            "grafana-service-account-token",
+            "sentry-org-token",
+        ];
+
+        for rule_name in structured_prefix_rules {
+            let rule = builtin_rule_by_name(rule_name);
+            assert!(
+                rule.value_suppressors_any.is_none(),
+                "expected value_suppressors_any to remain unset for {rule_name}"
+            );
+        }
+    }
+
+    #[test]
+    /// Regression: adafruit now carries the shared placeholder suppressor baseline.
+    fn adafruit_api_key_suppresses_placeholder_value() {
+        let rule_name = "adafruit-api-key";
+        let hay = b"adafruit_token=exampleexampleexampleexampleabcd";
+        let hits = scan_single_builtin_rule(rule_name, hay);
+        assert!(
+            !has_rule_hit(&hits, rule_name),
+            "expected placeholder adafruit API key to be suppressed"
+        );
+    }
+
+    #[test]
+    fn adafruit_api_key_allows_real_value() {
+        let rule_name = "adafruit-api-key";
+        let hay = b"adafruit_token=a8f2k9x7m4p1q6w3b5n0j4c9d2e7h6m1";
+        let hits = scan_single_builtin_rule(rule_name, hay);
+        assert!(
+            has_rule_hit(&hits, rule_name),
+            "expected real-looking adafruit API key to be reported"
+        );
     }
 
     #[test]
