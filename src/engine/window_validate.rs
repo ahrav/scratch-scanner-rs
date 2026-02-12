@@ -18,7 +18,8 @@
 //! 5. Extract the secret span using capture group priority (see [`extract_secret_span`]).
 //! 6. Apply value suppressors (when configured) on the extracted secret bytes.
 //! 7. Apply local context checks (when configured) on the secret span.
-//! 8. Record the finding with the extracted secret span.
+//! 8. For root-buffer findings in the engine hot path, apply safelist suppression.
+//! 9. Record the finding with the extracted secret span.
 //!
 //! # Secret Extraction
 //! The finding's `span_start`/`span_end` reflect the *secret* portion of the match,
@@ -43,7 +44,8 @@
 //!
 //! # Entry Points
 //! - `run_rule_on_window`: engine hot path that writes findings directly into
-//!   `ScanScratch` and applies dedupe/drop-hint bookkeeping immediately.
+//!   `ScanScratch`, applies root safelist suppression (for `STEP_ROOT`), and
+//!   performs dedupe/drop-hint bookkeeping immediately.
 //! - `run_rule_on_raw_window_into` / `run_rule_on_utf16_window_into`: scheduler
 //!   adapters that accumulate findings in `scratch.tmp_findings` for the caller
 //!   to commit and account for dropped findings.
@@ -550,6 +552,22 @@ impl Engine {
         }
     }
 
+    /// Validates one UTF-16-aligned decode range and writes findings directly.
+    ///
+    /// Guarantees / invariants:
+    /// - `decode_range` must start on a UTF-16 code-unit boundary.
+    /// - Findings are emitted in decoded UTF-8 byte space and annotated with
+    ///   `DecodeStep::Utf16Window` so callers can recover parent raw spans.
+    /// - Root span hints are derived from full-match extents after mapping
+    ///   decoded offsets back into raw UTF-16 bytes.
+    ///
+    /// # Behavior
+    /// Applies the same gate order as the raw path (confirm/keyword/must-contain,
+    /// assignment-shape, regex, entropy, value suppressor, local context) while
+    /// enforcing UTF-16 decode budgets.
+    ///
+    /// Note: root safelist suppression is currently applied in the raw hot path
+    /// (`run_rule_on_window` Raw variant), not in this helper.
     #[allow(clippy::too_many_arguments)]
     fn run_rule_on_utf16_window_aligned(
         &self,
@@ -564,6 +582,16 @@ impl Engine {
         file_id: FileId,
         scratch: &mut ScanScratch,
     ) {
+        // Contract:
+        // - `decode_range` is expected to be UTF-16 aligned by the caller.
+        // - Finding spans are emitted in decoded UTF-8 byte space under a
+        //   `DecodeStep::Utf16Window` child step for parent-span reconstruction.
+        // - Root span hints are based on FULL MATCH extents mapped back through
+        //   raw UTF-16 offsets and optional root-span mapping context.
+        //
+        // Note: unlike the raw hot path, this helper does not perform direct
+        // root safelist suppression; that policy is currently scoped to the raw
+        // root-buffer insertion path.
         // Caller is responsible for UTF-16 alignment; `decode_range.start`
         // should be on a code-unit boundary (parity handled upstream).
         // Decode this window as UTF-16 and run the same validators on UTF-8 output.
@@ -960,6 +988,9 @@ impl Engine {
         dropped: &mut usize,
         found_any: &mut bool,
     ) {
+        // Contract mirrors `run_rule_on_utf16_window_aligned` but writes into
+        // staging vectors (`tmp_findings` and friends) instead of committing
+        // directly into dedupe state.
         // Decode this window as UTF-16 and run the same validators on UTF-8 output.
         let remaining = self
             .tuning
@@ -1143,6 +1174,11 @@ impl Engine {
         scratch.capture_locs[rule_id as usize] = Some(locs);
     }
 
+    /// UTF-16 scheduler adapter: scans both byte parities for the anchor-aligned
+    /// window and stages findings in `scratch.tmp_*`.
+    ///
+    /// Ordering matters: hinted parity is attempted first, then the opposite
+    /// parity, so decode budget is spent on the most likely alignment first.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn run_rule_on_utf16_window_into(
         &self,
@@ -1160,6 +1196,11 @@ impl Engine {
         found_any: &mut bool,
         anchor_hint: u64,
     ) {
+        // UTF-16 anchors can land on either byte parity within a merged window;
+        // scan both alignments so mixed-parity anchors are not missed.
+        //
+        // Ordering matters for decode-budget efficiency: hinted parity first,
+        // opposite parity second.
         // UTF-16 anchors can land on either byte parity within a merged window;
         // scan both alignments so mixed-parity anchors are not missed.
         let parity = (anchor_hint.saturating_sub(window_start) & 1) as usize;
