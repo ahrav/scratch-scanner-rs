@@ -125,6 +125,7 @@ fn bench_throughput_comparison(c: &mut Criterion) {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: regex::bytes::Regex::new(r"ZZZZZZZZ[A-Z]{32}").unwrap(),
     };
 
@@ -223,6 +224,7 @@ fn bench_bottleneck_analysis(c: &mut Criterion) {
                 entropy: None,
                 local_context: None,
                 secret_group: None,
+                offline_validation: None,
                 re: regex::bytes::Regex::new(&format!(r"{prefix}[A-Za-z0-9]{{20}}")).unwrap(),
             }
         })

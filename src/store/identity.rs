@@ -607,6 +607,7 @@ mod tests {
             entropy: None,
             local_context: None,
             secret_group: None,
+            offline_validation: None,
             re: Regex::new(pattern).expect("regex must compile"),
         }
     }

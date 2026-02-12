@@ -386,6 +386,7 @@ pub fn materialize_rules(suite: &RuleSuiteSpec) -> Result<Vec<RuleSpec>, String>
             entropy: None,
             local_context: None,
             secret_group: None,
+            offline_validation: None,
             re,
         });
     }

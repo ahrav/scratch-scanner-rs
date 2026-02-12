@@ -366,6 +366,7 @@ fn bench_minimal_engine(c: &mut Criterion) {
         entropy: None,
         local_context: None,
         secret_group: None,
+        offline_validation: None,
         re: regex::bytes::Regex::new(r"\xFF\xFE\xFD\xFC[a-z]{10}").unwrap(),
     }];
 
@@ -406,6 +407,7 @@ fn bench_minimal_engine(c: &mut Criterion) {
             entropy: None,
             local_context: None,
             secret_group: None,
+            offline_validation: None,
             re: regex::bytes::Regex::new(&format!(r"\xFF\xFE\xFD\xFC{i:02}[a-z]{{10}}")).unwrap(),
         })
         .collect();

@@ -228,6 +228,7 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
             value_suppressors_any,
             entropy,
             local_context,
+            offline_validation: None,
             secret_group,
             re,
         });

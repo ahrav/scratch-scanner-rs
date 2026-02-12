@@ -78,6 +78,7 @@ proptest! {
             entropy: None,
             local_context: None,
             secret_group: Some(1),
+            offline_validation: None,
             re: Regex::new(r"TOK_([A-Za-z0-9]{10,30})").unwrap(),
         };
 
@@ -147,6 +148,7 @@ proptest! {
             entropy: None,
             local_context: None,
             secret_group: Some(1),
+            offline_validation: None,
             re: Regex::new(r"TOK_([A-Z0-9]{10,30})").unwrap(),
         };
 
