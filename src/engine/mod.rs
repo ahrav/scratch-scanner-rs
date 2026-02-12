@@ -66,6 +66,7 @@ mod window_validate;
 
 // Supporting modules
 mod helpers;
+mod safelist;
 mod transform;
 mod vectorscan_prefilter; // Vectorscan/Hyperscan prefilter DBs and FFI callbacks
 mod vs_cache; // On-disk cache for serialized Vectorscan databases
