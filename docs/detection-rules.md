@@ -18,7 +18,7 @@ The values below are from the current repository snapshot:
 - `two_phase` enabled: `2` rules (`private-key`, `vault-service-token-legacy`)
 - `entropy` enabled: `131` rules
 - `local_context` enabled: `1` rule (`generic-api-key`)
-- `value_suppressors_any` enabled: `5` rules (`generic-api-key`, `hashicorp-tf-password`, `curl-auth-header`, `curl-auth-user`, `atlassian-api-token`)
+- `value_suppressors_any` enabled: `15` rules (`adafruit-api-key`, `adobe-client-id`, `algolia-api-key`, `atlassian-api-token`, `confluent-access-token`, `confluent-secret-key`, `curl-auth-header`, `curl-auth-user`, `discord-api-token`, `discord-client-secret`, `generic-api-key`, `hashicorp-tf-password`, `heroku-api-key`, `linear-client-secret`, `zendesk-secret-key`)
 - `secret_group` enabled: `2` rules (`microsoft-teams-webhook`, `sonar-api-token`)
 - `must_contain` enabled: `0` rules
 - `keywords_any` enabled: `223` rules
@@ -28,6 +28,24 @@ Rule loading order:
 1. Explicit `--rules=<path>`
 2. `default_rules.yaml` next to the scanner binary
 3. Compiled-in fallback (`include_str!("../../default_rules.yaml")`)
+
+## Suppression Controls
+
+Suppression is split between rule-level secret filtering and engine-level post-scan policies.
+
+| Control | Config Surface | Match Input | Stage |
+|-----------|---------------------|---------|--------|
+| `value_suppressors_any` | Per-rule YAML (`RuleSpec.value_suppressors_any`) | Extracted secret bytes | Window validation post-match gate |
+| Global safelist | Engine policy (`SafelistFilter`) | Root-match context slice | Post-scan filtering/compaction |
+| Offline validation verdicts | Offline policy layer (when enabled) | Finding-level structural/context evidence | Post-scan filtering/compaction |
+
+Examples:
+
+1. **Value suppressor**: `API_KEY=YOUR_EXAMPLE_1` matches `generic-api-key` shape but is filtered because the extracted secret contains a configured suppressor substring.
+2. **Safelist**: a real-looking bearer token in documentation-style context (for example hosts/placeholders) can be filtered by post-scan safelist even when the secret bytes do not match `value_suppressors_any`.
+3. **Non-safelisted context**: the same token in production-like context (for example `api.internal`) remains reportable if other gates pass.
+
+`value_suppressors_any` is the only suppression control encoded directly in rule YAML today; safelist and offline-policy suppression are deliberately outside rule-gate sequencing and run in post-scan filtering.
 
 ## Rule Families (Representative Only)
 
