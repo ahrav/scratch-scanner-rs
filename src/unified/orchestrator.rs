@@ -206,7 +206,7 @@ fn run_fs(
     if let Some(ref producer) = store_producer {
         ps_config.store_producer = Some(Arc::clone(producer));
     }
-    if cfg.no_archives {
+    if cfg.skip_archives {
         ps_config.archive.enabled = false;
     }
     if cfg.scan_binary {

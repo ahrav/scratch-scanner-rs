@@ -168,7 +168,7 @@ fn parse_fs_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<S
     let mut path: Option<PathBuf> = None;
     let mut workers: Option<usize> = None;
     let mut decode_depth: Option<usize> = None;
-    let mut no_archives = false;
+    let mut skip_archives = false;
     let mut null_sink = false;
     let mut scan_binary = false;
     let mut persist_findings = false;
@@ -227,8 +227,12 @@ fn parse_fs_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<S
                 continue;
             }
             match flag {
-                "--no-archives" => {
-                    no_archives = true;
+                "--skip-archives" => {
+                    skip_archives = true;
+                    continue;
+                }
+                "--scan-archives" => {
+                    skip_archives = false;
                     continue;
                 }
                 "--null-sink" => {
@@ -237,6 +241,10 @@ fn parse_fs_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<S
                 }
                 "--scan-binary" => {
                     scan_binary = true;
+                    continue;
+                }
+                "--skip-binary" => {
+                    scan_binary = false;
                     continue;
                 }
                 "--persist-findings" => {
@@ -279,7 +287,7 @@ fn parse_fs_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<S
             root,
             workers: workers.unwrap_or_else(|| num_cpus::get().max(1)),
             decode_depth,
-            no_archives,
+            skip_archives,
             anchor_mode,
             scan_binary,
             persist_findings,
@@ -434,6 +442,10 @@ fn parse_git_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<
                 }
                 "--scan-binary" => {
                     scan_binary = true;
+                    continue;
+                }
+                "--skip-binary" => {
+                    scan_binary = false;
                     continue;
                 }
                 "--enrich-identities" => {
@@ -662,10 +674,12 @@ OPTIONS:
     --decode-depth=<N>      Max decode depth (default: 2)
     --transforms=all|none|<list>  Transforms to enable (default: all)
                             Comma-separated: base64, url (case-insensitive)
-    --no-archives           Disable archive scanning
     --null-sink             Drop all findings (measure scan overhead only)
-    --scan-binary           Scan binary files instead of skipping them
     --persist-findings      Persist FS findings to append-log segment files
+
+FILE TYPE OPTIONS:
+    --skip-archives       Skip archive (zip/tar/gz) expansion  [default: scan]
+    --scan-binary         Scan binary files instead of skipping [default: skip]
     --anchors=manual|derived  Anchor mode (default: manual)
     --event-format=jsonl|text|json|sarif  Output format (default: jsonl)
     --verbose               Verbose output (text format only)
@@ -687,8 +701,10 @@ OPTIONS:
     --debug                   Verbose stage stats to stderr
     --debug=perf              Stage stats + pack execution timing breakdown
     --null-sink               Drop all findings (measure scan overhead only)
-    --scan-binary             Scan binary blobs instead of skipping them
     --enrich-identities       Emit author/committer identity data
+
+FILE TYPE OPTIONS:
+    --scan-binary             Scan binary blobs instead of skipping [default: skip]
     --event-format=jsonl|text|json|sarif  Output format (default: jsonl)
     --verbose                 Verbose output (text format only)
     --help, -h                Show this help"
@@ -1264,5 +1280,44 @@ mod tests {
     fn git_hidden_engine_chunk_parsed() {
         let cfg = git_config(&["--repo=/r", "--x-engine-chunk-mb=4"]);
         assert_eq!(cfg.engine_chunk_mb, Some(4));
+    }
+
+    // -- File-type flag convention (--skip-X / --scan-X) ----------------------
+
+    fn fs_config(args: &[&str]) -> super::super::FsScanConfig {
+        let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
+        let config = parse_fs_args(os_args.into_iter()).unwrap();
+        let SourceConfig::Fs(fs) = config.source else {
+            panic!("expected fs source config");
+        };
+        fs
+    }
+
+    #[test]
+    fn fs_skip_archives_flag_parsed() {
+        let cfg = fs_config(&["--path=/d", "--skip-archives"]);
+        assert!(cfg.skip_archives);
+    }
+
+    #[test]
+    fn fs_scan_archives_accepted() {
+        // --scan-archives is the default (no-op); verify it's accepted and
+        // skip_archives stays false.
+        let cfg = fs_config(&["--path=/d", "--scan-archives"]);
+        assert!(!cfg.skip_archives);
+    }
+
+    #[test]
+    fn fs_skip_binary_accepted() {
+        // --skip-binary is the default (no-op); verify it's accepted and
+        // scan_binary stays false.
+        let cfg = fs_config(&["--path=/d", "--skip-binary"]);
+        assert!(!cfg.scan_binary);
+    }
+
+    #[test]
+    fn fs_scan_binary_flag_parsed() {
+        let cfg = fs_config(&["--path=/d", "--scan-binary"]);
+        assert!(cfg.scan_binary);
     }
 }
