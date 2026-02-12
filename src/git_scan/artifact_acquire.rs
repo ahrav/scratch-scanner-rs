@@ -167,6 +167,15 @@ pub struct MidxAcquireResult {
 /// # Side Effects
 /// This function updates `repo.mmaps.midx` with the built bytes and sets
 /// the fingerprint to `PackSet` variant.
+///
+/// # Errors
+/// Returns:
+/// - `ArtifactAcquireError::MidxBuild` when in-memory MIDX construction fails.
+/// - `ArtifactAcquireError::MidxParse` when the freshly built bytes do not
+///   parse for `repo.object_format`.
+/// - `ArtifactAcquireError::CommitLoad` when MIDX pack names cannot be resolved
+///   to `.pack` paths.
+/// - `ArtifactAcquireError::RepoOpen` if fingerprint refresh fails.
 pub fn acquire_midx(
     repo: &mut RepoJobState,
     limits: &ArtifactBuildLimits,
@@ -210,6 +219,10 @@ pub fn acquire_midx(
 /// an empty graph.
 ///
 /// Bounded by `limits.commit_load`.
+///
+/// # Errors
+/// Returns `ArtifactAcquireError` when shallow-boundary loading or commit
+/// loading fails, or when `CommitGraphMem` rejects the loaded commit set.
 pub fn acquire_commit_graph(
     repo: &RepoJobState,
     midx: &MidxView<'_>,
@@ -255,6 +268,13 @@ pub fn acquire_commit_graph(
 ///
 /// The interner is allocated with a 4 MiB arena and an initial estimate of
 /// 16,384 unique identity strings.
+///
+/// If `repo.start_set` is empty and the repository has no reachable refs, this
+/// returns an empty graph and an empty interner.
+///
+/// # Errors
+/// Same error surface as [`acquire_commit_graph`], plus interning failures
+/// surfaced by `load_commits_with_identities`.
 pub fn acquire_commit_graph_with_identities(
     repo: &RepoJobState,
     midx: &MidxView<'_>,
@@ -297,7 +317,10 @@ pub fn acquire_commit_graph_with_identities(
     Ok((graph, interner))
 }
 
-/// Resolves pack paths from MIDX data.
+/// Resolves `.pack` paths from freshly built MIDX bytes.
+///
+/// Re-parses the MIDX bytes for the repository object format, then resolves
+/// pack names using directory precedence from [`collect_pack_dirs`].
 fn resolve_pack_paths(
     repo: &RepoJobState,
     midx_bytes: &BytesView,

@@ -46,6 +46,15 @@
 //! intentionally does not enqueue their parents. This preserves first-class
 //! graph nodes for local history while preventing traversal into known-missing
 //! remote ancestry.
+//!
+//! # Complexity
+//! Traversal is `O(V + E)` in reachable commits/parent edges, plus object decode
+//! cost for each loaded node. Peak queue/set memory is bounded by frontier size.
+//!
+//! # Error Model
+//! Loader failures are fail-closed: malformed commit objects, missing packs for
+//! referenced MIDX entries, oversized shallow metadata, and delta-depth overruns
+//! all return `CommitLoadError` instead of silently skipping commits.
 
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File};
@@ -334,6 +343,9 @@ impl ShallowBoundaryRoots {
 }
 
 /// Progress callback for commit loading.
+///
+/// Called with the number of successfully loaded commits so far. Invocation is
+/// best-effort and currently throttled to every 1,000 loaded commits.
 pub type ProgressFn = dyn Fn(u32);
 
 /// Enqueues `oid` for BFS if it is neither visited nor already queued.
@@ -373,6 +385,13 @@ fn enqueue_frontier_oid(
 /// - `pack_paths` must be indexed by MIDX `pack_id`.
 /// - `shallow_boundary_roots` should come from the same repository graph as
 ///   `tips`/`midx` to avoid unintentionally truncating traversal.
+///
+/// # Complexity
+/// `O(V + E)` over commits reachable from `tips`, excluding object decode cost.
+///
+/// # Errors
+/// Propagates `CommitLoadError` on lookup, decode, parse, or configured-limit
+/// violations.
 #[allow(clippy::too_many_arguments)]
 pub fn load_commits_from_tips(
     tips: &[OidBytes],
@@ -405,6 +424,15 @@ pub fn load_commits_from_tips(
 /// When identity parsing fails for a commit (malformed header), the identity
 /// IDs are set to [`SENTINEL_ID`]. If parsing succeeds but interning fails,
 /// loading returns `CommitLoadError`.
+///
+/// # Complexity
+/// Same asymptotic traversal cost as [`load_commits_from_tips`], with an extra
+/// constant-time header scan per loaded commit for identity extraction.
+///
+/// # Errors
+/// Same error surface as [`load_commits_from_tips`], plus
+/// `CommitLoadError::IdentityInternError` when parsed identity fields cannot be
+/// interned.
 #[allow(clippy::too_many_arguments)]
 pub fn load_commits_with_identities(
     tips: &[OidBytes],
@@ -432,6 +460,10 @@ pub fn load_commits_with_identities(
 ///
 /// Returns paths in MIDX pack order (by pack_id).
 /// The first matching directory in `pack_dirs` wins.
+///
+/// # Errors
+/// Returns `CommitLoadError::Io(NotFound)` when any MIDX-referenced pack is not
+/// present in the supplied directory list.
 pub fn resolve_pack_paths_from_midx(
     midx: &MidxView<'_>,
     pack_dirs: &[PathBuf],
@@ -450,6 +482,7 @@ pub fn resolve_pack_paths_from_midx(
 ///
 /// Includes the primary objects pack dir and alternate object pack dirs,
 /// skipping alternates that resolve to the primary objects directory.
+/// Returned order is significant and defines pack-name lookup precedence.
 pub fn collect_pack_dirs(repo: &GitRepoPaths) -> Vec<PathBuf> {
     let mut dirs = Vec::with_capacity(1 + repo.alternate_object_dirs.len());
     dirs.push(repo.pack_dir.clone());
@@ -467,6 +500,8 @@ pub fn collect_pack_dirs(repo: &GitRepoPaths) -> Vec<PathBuf> {
 ///
 /// Returns directories in precedence order: primary objects dir first, then
 /// unique alternates.
+/// Returned paths are not canonicalized; callers should supply a coherent
+/// `GitRepoPaths` snapshot from `repo_open`.
 pub fn collect_loose_dirs(repo: &GitRepoPaths) -> Vec<PathBuf> {
     let mut dirs = Vec::with_capacity(1 + repo.alternate_object_dirs.len());
     dirs.push(repo.objects_dir.clone());

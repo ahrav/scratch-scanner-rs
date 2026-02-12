@@ -33,6 +33,12 @@
 //!   state and configuration.
 //! - In ODB-blob mode with parallel introduction, blob attribution context
 //!   (`commit_id`, path, flags) is not guaranteed deterministic.
+//!
+//! # Facade Contract
+//! This module is the public stage-oriented facade for git scanning. Re-exports
+//! are grouped by pipeline stage so callers can depend on stable boundaries
+//! (`repo_open`/artifact acquisition, commit traversal, candidate extraction,
+//! decode+scan, and finalize+persist) instead of individual internal modules.
 
 pub mod alloc_guard;
 pub mod artifact_acquire;
