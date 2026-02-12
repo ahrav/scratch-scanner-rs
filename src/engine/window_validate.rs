@@ -582,9 +582,6 @@ impl Engine {
         file_id: FileId,
         scratch: &mut ScanScratch,
     ) {
-        // Caller is responsible for UTF-16 alignment; `decode_range.start`
-        // should be on a code-unit boundary (parity handled upstream).
-        // Decode this window as UTF-16 and run the same validators on UTF-8 output.
         let remaining = self
             .tuning
             .max_total_decode_output_bytes
@@ -1186,8 +1183,6 @@ impl Engine {
         found_any: &mut bool,
         anchor_hint: u64,
     ) {
-        // UTF-16 anchors can land on either byte parity within a merged window;
-        // scan both alignments so mixed-parity anchors are not missed.
         let parity = (anchor_hint.saturating_sub(window_start) & 1) as usize;
         let offsets = [parity, parity ^ 1];
 
