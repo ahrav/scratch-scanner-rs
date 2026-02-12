@@ -75,10 +75,11 @@ const FINDING_DEDUPE_MULTIPLIER: usize = 32;
 ///   inflate the histogram.
 #[derive(Clone, Copy)]
 pub(super) struct EntropyScratch {
-    // Histogram for byte frequencies (256 bins).
+    /// Byte-frequency histogram (256 bins, one per byte value).
     pub(super) counts: [u32; 256],
-    // List of "touched" byte values so we can reset in O(distinct) instead of O(256).
+    /// Indices of non-zero bins, enabling O(distinct) reset instead of O(256).
     pub(super) used: [u8; 256],
+    /// Number of valid entries in `used[0..used_len]`.
     pub(super) used_len: u16,
 }
 
@@ -102,12 +103,16 @@ pub(super) struct EntropyScratch {
 /// - See the `unsafe impl Send` block below for cross-thread reasoning.
 #[derive(Clone, Copy)]
 pub(super) struct RootSpanMapCtx {
+    /// Pointer to the Engine-owned `TransformConfig` for this decode layer.
     tc: *const TransformConfig,
+    /// Start of the encoded byte span (in `root_buf` or slab).
     encoded_ptr: *const u8,
+    /// Length of the encoded byte span in bytes.
     encoded_len: usize,
+    /// Absolute offset of the encoded span's start within the root buffer.
     root_start: usize,
-    // Minimum overlap (in bytes) guaranteed by chunked scans; used to decide
-    // whether a trigger before the match would have appeared in the prior chunk.
+    /// Minimum overlap (in bytes) guaranteed by chunked scans; used to decide
+    /// whether a trigger before the match would have appeared in the prior chunk.
     overlap_backscan: usize,
 }
 
@@ -141,7 +146,6 @@ impl RootSpanMapCtx {
 
     /// Maps a decoded-byte span back to absolute root-buffer coordinates.
     pub(super) fn map_span(&self, span: std::ops::Range<usize>) -> std::ops::Range<usize> {
-        // Map decoded offsets back to absolute root-buffer offsets.
         // SAFETY: The engine-owned transform config lives for the duration
         // of the scan, and encoded bytes are valid while the map context is set.
         let tc = unsafe { &*self.tc };
@@ -160,7 +164,6 @@ impl RootSpanMapCtx {
         &self,
         root_span: std::ops::Range<usize>,
     ) -> Option<bool> {
-        // Only applicable for URL-percent transforms.
         // SAFETY: The engine-owned transform config lives for the duration
         // of the scan, and encoded bytes are valid while the map context is set.
         let tc = unsafe { &*self.tc };
@@ -334,6 +337,10 @@ impl CachelineBoundary {
 /// - Not thread-safe; use by a single worker at a time.
 /// - Contents (including slices from [`ScanScratch::findings`]) are invalidated
 ///   by `reset_for_scan` and any draining/mutation method.
+/// - **Parallel-array invariant**: `out`, `norm_hash`, and `drop_hint_end`
+///   are kept length-aligned at all times. Every push, truncation, or drain
+///   must maintain this lock-step relationship. Violating it corrupts finding
+///   deduplication and materialization.
 ///
 /// # Performance
 /// - Fixed-capacity buffers cap per-scan work; overflow increments
@@ -372,24 +379,35 @@ pub struct ScanScratch {
     pub(super) norm_hash: ScratchVec<NormHash>,
     /// Drop boundary used by `drop_prefix_findings` (absolute offset in file).
     pub(super) drop_hint_end: ScratchVec<u64>,
-    pub(super) max_findings: usize,     // Per-chunk cap from tuning.
-    pub(super) findings_dropped: usize, // Overflow counter when cap is exceeded.
-    pub(super) safelist_suppressed: usize, // Findings removed by emit-time safelist.
-    pub(super) offline_suppressed: usize, // Findings removed by offline validation.
+    /// Per-chunk finding emission cap, derived from `tuning.max_findings_per_chunk`.
+    pub(super) max_findings: usize,
+    /// Number of findings that could not be emitted because the cap was reached.
+    pub(super) findings_dropped: usize,
+    /// Findings removed by the global context safelist at emission time.
+    pub(super) safelist_suppressed: usize,
+    /// Findings removed by post-scan offline structural validation.
+    pub(super) offline_suppressed: usize,
     /// Work queue for breadth-first buffer traversal.
     ///
     /// Contains the root buffer plus any decoded buffers from transforms.
-    /// Fixed capacity ensures no allocations during the scan loop; the tuning
-    /// parameter `max_work_items` determines the upper bound.
+    /// Append-only during a scan; `work_head` advances monotonically as items
+    /// are consumed. Fixed capacity ensures no allocations during the scan
+    /// loop; the tuning parameter `max_work_items` determines the upper bound.
     pub(super) work_q: ScratchVec<WorkItem>,
-    pub(super) work_head: usize, // Cursor into work_q.
+    /// Monotonically advancing cursor into `work_q`; items at indices
+    /// `[0..work_head)` have been processed.
+    pub(super) work_head: usize,
     /// Per-scan dedupe set used to detect duplicates within a single chunk scan.
     ///
     /// This resets every `scan_chunk_into` and lets us prefer more informative
     /// findings within a scan while suppressing repeats across chunks.
     pub(super) seen_findings_scan: FixedSet128,
-    pub(super) total_decode_output_bytes: usize, // Global decode budget tracker.
-    pub(super) work_items_enqueued: usize,       // Work queue budget tracker.
+    /// Cumulative decoded bytes produced so far in this scan (budget tracker
+    /// against `tuning.max_total_decode_output_bytes`).
+    pub(super) total_decode_output_bytes: usize,
+    /// Number of work items enqueued so far (budget tracker against
+    /// `tuning.max_work_items`).
+    pub(super) work_items_enqueued: usize,
     /// Per-rule regex capture locations (reused to avoid per-scan allocations).
     pub(super) capture_locs: Vec<Option<CaptureLocations>>,
     /// Per-rule stream hit counts for decoded-window seeding.
@@ -446,7 +464,10 @@ pub struct ScanScratch {
     _cold_boundary: CachelineBoundary,
 
     // ---------------- Cold / conditional region ----------------
-    pub(super) slab: DecodeSlab, // Decoded output storage.
+    /// Pre-allocated decoded-output slab. Never reallocated during a scan;
+    /// all `unsafe` slice construction in the work-queue loop relies on this
+    /// stability invariant.
+    pub(super) slab: DecodeSlab,
     /// Bloom-style dedupe set for decoded buffer identity.
     ///
     /// Avoids re-scanning identical decoded output across different transform
@@ -489,7 +510,9 @@ pub struct ScanScratch {
     pub(super) tmp_drop_hint_end: Vec<u64>,
     /// Normalized hashes aligned with `tmp_findings`.
     pub(super) tmp_norm_hash: Vec<NormHash>,
-    pub(super) entropy_scratch: Option<Box<EntropyScratch>>, // Entropy histogram scratch.
+    /// Entropy histogram scratch. `None` when no rules have entropy gates,
+    /// avoiding a 1 KiB heap allocation for engines that don't need it.
+    pub(super) entropy_scratch: Option<Box<EntropyScratch>>,
     /// Active decoded→root coordinate mapping context (set during transform scans).
     ///
     /// Set by the scan loop before scanning a decoded buffer and cleared after
@@ -521,8 +544,9 @@ pub struct ScanScratch {
     /// Per-thread Vectorscan scratch space for decoded gate scanning.
     /// Used for anchor gating in decoded transform output (e.g., base64 decoded bytes).
     pub(super) vs_gate_scratch: Option<VsScratch>,
+    /// Per-scan Base64 decode/gate instrumentation counters (feature: `b64-stats`).
     #[cfg(feature = "b64-stats")]
-    pub(super) base64_stats: Base64DecodeStats, // Base64 decode/gate instrumentation.
+    pub(super) base64_stats: Base64DecodeStats,
 }
 
 /// Normalize `root_hint_end` for dedup key construction.
@@ -543,6 +567,7 @@ fn normalize_root_hint_end_for_dedup(rec: &FindingRec, leaf_transform: Option<Tr
         return rec.root_hint_end;
     }
     let decoded_len = rec.span_end.saturating_sub(rec.span_start) as u64;
+    // Base64 encodes 3 bytes → 4 chars; inverse: min_encoded = ⌈decoded × 4/3⌉.
     let min_encoded = (decoded_len * 4).div_ceil(3);
     let actual_encoded = rec.root_hint_end.saturating_sub(rec.root_hint_start);
     if actual_encoded > min_encoded && actual_encoded <= min_encoded.saturating_add(3) {
@@ -574,6 +599,10 @@ impl ScanScratch {
         let max_steps = engine.tuning.max_work_items.saturating_add(
             rules_len.saturating_mul(2 * engine.tuning.max_windows_per_rule_variant),
         );
+        // Decoded-buffer identity dedupe set: sized to ~2× the max work items
+        // (each work item can produce a decoded buffer). Power-of-two for
+        // efficient modular hashing. Floor of 1024 keeps the set effective
+        // even when work-item limits are small.
         let seen_cap = pow2_at_least(
             engine
                 .tuning
@@ -589,6 +618,7 @@ impl ScanScratch {
                 .max(64),
         );
         let stream_match_cap = engine.tuning.max_windows_per_rule_variant.max(16);
+        // rules × 3 variants (Raw/Utf16Le/Utf16Be) × max windows per variant.
         let pending_window_cap = rules_len
             .saturating_mul(3)
             .saturating_mul(engine.tuning.max_windows_per_rule_variant)
@@ -783,6 +813,8 @@ impl ScanScratch {
         self.tmp_findings.clear();
         self.tmp_drop_hint_end.clear();
         self.tmp_norm_hash.clear();
+        // Sparse reset: zero only the stream-hit counters that were
+        // incremented (O(touched) instead of O(rules × 3)).
         for idx in self.stream_hit_touched.drain() {
             let slot = idx as usize;
             if let Some(hit) = self.stream_hit_counts.get_mut(slot) {
@@ -886,6 +918,11 @@ impl ScanScratch {
             return;
         }
 
+        // ── 1. Vectorscan scratch rebinding ───────────────────────────────
+        //
+        // Five stanzas (vs, vs_utf16, vs_utf16_stream, vs_stream, vs_gate)
+        // each check whether the scratch is still bound to the current DB
+        // pointer and reallocate if not.
         match engine.vs.as_ref() {
             Some(db) => {
                 let need_alloc = match self.vs_scratch.as_ref() {
@@ -972,6 +1009,9 @@ impl ScanScratch {
             }
         }
 
+        // ── 2. Hit accumulator pool + per-rule/variant vectors ──────────
+        //
+        // `expected_pairs` = rules × 3 variants (Raw, Utf16Le, Utf16Be).
         let expected_pairs = engine.rules_hot.len().saturating_mul(3);
         let max_hits_u32 =
             u32::try_from(engine.tuning.max_anchor_hits_per_rule_variant).unwrap_or(u32::MAX);
@@ -1016,6 +1056,7 @@ impl ScanScratch {
             self.stream_hit_touched =
                 ScratchVec::with_capacity(stream_hits_len).expect("scratch stream hits");
         }
+        // ── 3. Finding output buffers (parallel-array invariant) ─────────
         if self.max_findings != engine.tuning.max_findings_per_chunk {
             self.max_findings = engine.tuning.max_findings_per_chunk;
         }
@@ -1031,6 +1072,7 @@ impl ScanScratch {
             self.drop_hint_end = ScratchVec::with_capacity(self.max_findings)
                 .expect("scratch drop_hint_end allocation failed");
         }
+        // ── 4. Work queue / decode step arena ───────────────────────────
         if self.work_q.capacity() < engine.tuning.max_work_items.saturating_add(1) {
             self.work_q = ScratchVec::with_capacity(engine.tuning.max_work_items.saturating_add(1))
                 .expect("scratch work_q allocation failed");
@@ -1055,6 +1097,11 @@ impl ScanScratch {
             self.steps_buf = ScratchVec::with_capacity(steps_buf_cap)
                 .expect("scratch steps_buf allocation failed");
         }
+        // ── 5. Transform-conditional buffers ──────────────────────────
+        //
+        // Zero-cost when all transforms are disabled: ring buffer, pending
+        // windows, stream matches, and temporary findings are sized to
+        // their minimum.
         let has_active_transforms = engine
             .transforms
             .iter()
@@ -1109,6 +1156,7 @@ impl ScanScratch {
                     .reserve(self.max_findings - self.tmp_norm_hash.capacity());
             }
         }
+        // ── 6. Entropy scratch + capture locations ──────────────────────
         if engine.entropy_gates.is_empty() {
             self.entropy_scratch = None;
         } else if self.entropy_scratch.is_none() {
@@ -1482,20 +1530,30 @@ impl ScanScratch {
         key_bytes[32] = variant_disc;
 
         let hash = hash128(&key_bytes);
+        // `insert` returns `true` if the key was newly added.
+        // `seen_in_scan`: true if this key was already present in *this scan*.
+        // `is_new`:       true if this key was newly added to the *cross-chunk* set.
+        //
+        //   is_new │ seen_in_scan │ Action
+        //   ───────┼──────────────┼────────────────────────────────────────────
+        //    true  │    false     │ Brand-new finding → emit normally (below)
+        //    true  │    true      │ Impossible (new in file set can't be old in scan set)
+        //    false │    false     │ Prior-chunk duplicate → suppress
+        //    false │    true      │ Same-scan duplicate → attempt in-place replacement
         let seen_in_scan = !self.seen_findings_scan.insert(hash);
         let is_new = self.seen_findings.insert(hash);
 
         if !is_new && !seen_in_scan {
-            // Seen in a prior scan/chunk; suppress to avoid cross-chunk duplicates.
+            // Prior-chunk duplicate — suppress to avoid cross-chunk repeats.
             return;
         }
 
         if !is_new {
-            // Duplicate key detected. Prefer findings with more information:
+            // Same-scan duplicate. Prefer findings with more information:
             // 1. Transform findings over RAW (transforms provide decoded content)
-            // 2. For transform findings with base64 padding tolerance, prefer larger root_hint_end
+            // 2. For same-type duplicates, prefer larger root_hint_end
             //
-            // Search for the existing finding that matches this dedup key and potentially replace it.
+            // Linear scan over pending findings to find the matching entry.
             for (i, existing) in self.out.as_mut_slice().iter_mut().enumerate() {
                 if existing.file_id != rec.file_id || existing.rule_id != rec.rule_id {
                     continue;

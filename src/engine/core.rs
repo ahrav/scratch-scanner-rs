@@ -223,7 +223,12 @@ pub struct Engine {
     pub(super) rules_hot: Vec<RuleCompiled>,
     /// Cold per-rule metadata indexed in parallel with `rules_hot`.
     pub(super) rules_cold: Vec<RuleCold>,
+    /// Ordered transform configurations; indices into this vector are used as
+    /// `transform_idx` throughout work items, decode steps, and finding provenance.
+    /// Frozen after construction.
     pub(super) transforms: Vec<TransformConfig>,
+    /// Scan-time budgets and capacity knobs. Frozen after construction; all
+    /// per-scan scratch sizing derives from these values.
     pub(crate) tuning: Tuning,
 
     /// Gate pools — indexed by `Option<u32>` gate IDs stored in [`RuleCompiled`].
@@ -632,6 +637,7 @@ impl Engine {
         let (anchor_patterns_utf16, pat_targets_utf16, pat_offsets_utf16) =
             map_to_patterns(pat_map_utf16);
         let has_utf16_anchors = !anchor_patterns_utf16.is_empty();
+        // Retained for diagnostic / debugging use; not referenced in production paths.
         let _has_any_anchors = !anchor_patterns_all.is_empty();
         let max_anchor_pat_len = anchor_patterns_all
             .iter()
@@ -660,8 +666,12 @@ impl Engine {
         };
 
         // Warm regex caches at startup to avoid lazy allocations later.
-        // `find_iter` always constructs the per-regex cache, so a tiny buffer
-        // is sufficient here.
+        //
+        // `regex::bytes::Regex` lazily builds its internal DFA cache on first
+        // use. Calling `find_iter(..).next()` forces that lazy allocation here,
+        // during engine construction, so that the first real scan does not pay
+        // an allocation penalty on the hot path. A 1-byte buffer suffices
+        // because the DFA cache is created regardless of whether a match occurs.
         let warm = [0u8; 1];
         for rule in &rules_compiled {
             let mut it = rule.re.find_iter(&warm);
@@ -687,6 +697,8 @@ impl Engine {
             .map(|tc| tc.max_decoded_bytes)
             .max()
             .unwrap_or(0);
+        // Env: SCANNER_INIT_DIAG — when set, prints Vectorscan DB build timings
+        // to stderr during engine construction (diagnostic / integration-test use).
         let init_diag = std::env::var_os("SCANNER_INIT_DIAG").is_some();
         let max_encoded_len = transforms
             .iter()
@@ -843,6 +855,8 @@ impl Engine {
             ) {
                 Ok(db) => Some(db),
                 Err(err) => {
+                    // Env: SCANNER_VS_UTF16_DEBUG — prints UTF-16 Vectorscan
+                    // build errors to stderr (non-fatal; block-mode fallback).
                     if std::env::var_os("SCANNER_VS_UTF16_DEBUG").is_some() {
                         eprintln!("vectorscan utf16 db build failed: {err}");
                     }
@@ -992,26 +1006,47 @@ impl Engine {
     // references using direct indexing; out-of-bounds indices panic, which signals
     // inconsistent compiled rule data.
 
+    /// Resolves the confirm-all (multi-literal AND) gate for a rule.
+    ///
+    /// # Panics
+    /// Panics on out-of-bounds index, indicating corrupted compiled rule data.
     #[inline(always)]
     pub(super) fn confirm_all_gate(&self, idx: Option<u32>) -> Option<&ConfirmAllCompiled> {
         idx.map(|i| &self.confirm_all_gates[i as usize])
     }
 
+    /// Resolves the keyword-any (literal OR) gate for a rule.
+    ///
+    /// # Panics
+    /// Panics on out-of-bounds index, indicating corrupted compiled rule data.
     #[inline(always)]
     pub(super) fn keyword_gate(&self, idx: Option<u32>) -> Option<&KeywordsCompiled> {
         idx.map(|i| &self.keyword_gates[i as usize])
     }
 
+    /// Resolves the value-suppressor gate (packed literal patterns checked
+    /// against extracted secret bytes to suppress known false positives).
+    ///
+    /// # Panics
+    /// Panics on out-of-bounds index, indicating corrupted compiled rule data.
     #[inline(always)]
     pub(super) fn value_suppressor_gate(&self, idx: Option<u32>) -> Option<&PackedPatterns> {
         idx.map(|i| &self.value_suppressor_gates[i as usize])
     }
 
+    /// Resolves the Shannon entropy gate for a rule.
+    ///
+    /// # Panics
+    /// Panics on out-of-bounds index, indicating corrupted compiled rule data.
     #[inline(always)]
     pub(super) fn entropy_gate(&self, idx: Option<u32>) -> Option<EntropyCompiled> {
         idx.map(|i| self.entropy_gates[i as usize])
     }
 
+    /// Resolves the local-context gate (surrounding-line pattern match).
+    ///
+    /// # Panics
+    /// Panics on out-of-bounds index, indicating corrupted compiled rule data.
     #[inline(always)]
     pub(super) fn local_context_gate(
         &self,
@@ -1020,6 +1055,10 @@ impl Engine {
         idx.map(|i| self.local_context_gates[i as usize])
     }
 
+    /// Resolves the offline structural-validation gate (CRC, format checks).
+    ///
+    /// # Panics
+    /// Panics on out-of-bounds index, indicating corrupted compiled rule data.
     #[inline(always)]
     pub(super) fn offline_validation_gate(
         &self,
@@ -1312,6 +1351,7 @@ impl Engine {
                 break;
             }
 
+            // Dequeue via `take` + cursor advance (avoids shifting the Vec).
             let item = std::mem::take(&mut scratch.work_q[scratch.work_head]);
             scratch.work_head += 1;
 
@@ -1571,16 +1611,20 @@ impl Engine {
 
                         // Base64 alignment shifts.
                         //
-                        // A Base64-encoded span may not start on a 4-character boundary
-                        // relative to the original encoding. Shifting by 0..3 characters
-                        // tries each possible alignment and produces up to 4 decode sub-spans.
+                        // Base64 alignment shifts.
                         //
-                        // For each shift, `base64_skip_chars` returns the byte offset to
-                        // skip leading non-alphabet chars (whitespace, padding) plus
-                        // `shift` alignment chars. If the remaining encoded characters
-                        // are fewer than `min_len`, the shift is skipped. Duplicate start
-                        // offsets (which can occur when whitespace collapses shifts) are
-                        // also deduplicated.
+                        // Base64 encodes in 4-character quanta. A span extracted from
+                        // raw bytes may not start on a quantum boundary relative to
+                        // the original encoding, so we try all four possible offsets
+                        // (shift 0..3) to cover every alignment.
+                        //
+                        // For each shift, `base64_skip_chars` returns the byte offset
+                        // to skip leading non-alphabet chars (whitespace, padding) plus
+                        // `shift` alignment chars. Returns `None` when the span is too
+                        // short to accommodate the shift — at that point larger shifts
+                        // would also fail, so we `break` rather than `continue`.
+                        // Duplicate start offsets (which can occur when whitespace
+                        // collapses shifts) are deduplicated.
                         let mut span_starts = [0usize; 4];
                         let mut span_ends = [0usize; 4];
                         let mut span_count = 0usize;
@@ -1684,23 +1728,33 @@ impl Engine {
                 }
 
                 // Resolve the encoded span to a raw pointer + length.
+                //
                 // Same aliasing argument as the ScanBuf arm: root_buf is
-                // immutable; the slab is pre-allocated and not reallocated.
-                // Bounds are checked before pointer arithmetic.
+                // caller-owned and immutable; the slab is pre-allocated and
+                // never reallocated during a scan (DecodeSlab invariant).
+                // `r.end` is bounds-checked against the backing buffer before
+                // any pointer arithmetic; `r.start <= r.end` is guaranteed by
+                // `EncRef::range_usize()`.
                 let r = enc_ref.range_usize();
                 let (enc_ptr, enc_len) = if !enc_ref.is_slab {
                     if r.end <= root_buf.len() {
+                        // SAFETY: `r.start <= r.end <= root_buf.len()` checked
+                        // above; root_buf is immutable for the scan duration.
                         let ptr = unsafe { root_buf.as_ptr().add(r.start) };
                         (ptr, r.end - r.start)
                     } else {
                         continue;
                     }
                 } else if r.end <= scratch.slab.buf.len() {
+                    // SAFETY: `r.start <= r.end <= slab.buf.len()` checked
+                    // above; slab never reallocates during a scan.
                     let ptr = unsafe { scratch.slab.buf.as_ptr().add(r.start) };
                     (ptr, r.end - r.start)
                 } else {
                     continue;
                 };
+                // SAFETY: pointer + length were validated by the bounds checks
+                // above; the backing buffer is not mutated while this slice exists.
                 let enc = unsafe { std::slice::from_raw_parts(enc_ptr, enc_len) };
                 // True only when root_hint exactly names the encoded bytes being
                 // decoded. This allows decoded matches to map back to precise
@@ -1865,6 +1919,8 @@ impl Engine {
     }
 
     /// Returns the rule name for a rule id used in [`FindingRec`].
+    ///
+    /// Returns `"<unknown-rule>"` if `rule_id` is out of bounds.
     pub fn rule_name(&self, rule_id: u32) -> &str {
         self.rules_cold
             .get(rule_id as usize)
@@ -1873,6 +1929,11 @@ impl Engine {
     }
 
     /// Allocates a fresh scratch state sized for this engine.
+    ///
+    /// The returned scratch must be used exclusively with `self`. Using it with
+    /// a different `Engine` may panic or produce incorrect results because
+    /// internal buffer sizes, gate pool indices, and Vectorscan scratch
+    /// bindings are engine-specific.
     pub fn new_scratch(&self) -> ScanScratch {
         ScanScratch::new(self)
     }
