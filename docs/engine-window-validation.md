@@ -6,9 +6,9 @@
 
 The window validation module executes compiled detection rules against bounded byte windows extracted from scanned data. It performs the critical "hot path" validation where patterns are matched, gates are enforced, and findings are recorded. The module handles both raw binary data and UTF-16 encoded content, applying progressive filtering through cheap gates before expensive regex matching.
 
-Policy-driven suppression (global safelist and offline validation verdicts) is
-owned by post-scan filtering and is intentionally documented outside this
-module's gate sequence.
+Global safelist suppression for root emit paths is enforced during finding
+recording in this module. Offline validation suppression (when enabled) remains
+outside this module's gate sequence.
 
 Two entry styles are supported:
 - **Engine hot path**: `run_rule_on_window` writes findings directly into `ScanScratch` and performs dedupe bookkeeping immediately.
@@ -22,7 +22,7 @@ Two entry styles are supported:
 - **Finding extraction**: Record matches with proper span information and secret data extraction
 - **Entropy validation**: Gate findings on Shannon entropy of matched tokens
 - **Value suppression**: Discard findings whose extracted secret contains known placeholder/example patterns
-- **Post-scan handoff**: Emit candidate findings for policy filtering and final cap enforcement
+- **Emit-time policy checks**: Apply root safelist suppression before recording findings
 
 ---
 
@@ -52,8 +52,8 @@ Input: Window [w.start..w.end) in buffer
 Output: FindingRec with spans in appropriate coordinate space
 ```
 
-Post-scan policy filters (global safelist and offline validation verdicts)
-execute after this module completes and are not part of the gate ordering above.
+Offline validation suppression (when enabled) executes after this module
+completes and is not part of the gate ordering above.
 
 ### Anchor Hint Processing
 
@@ -236,18 +236,16 @@ assignment separators, quoting, or key-name hints. These checks are:
 Local context gates are rule-selective and opt-in via rule config.
 They apply uniformly in raw, UTF-16, and stream-decoded validation paths.
 
-### 7. Post-Scan Policy Suppression (Outside This Module)
+### 7. Emit-Time Safelist Suppression
 
-After window validation emits candidate findings, engine-level post-scan
-filtering applies policy suppression such as:
+Before recording a finding, root emit paths run a safelist check on the
+root-context slice derived from `root_hint_start..root_hint_end`.
 
-- Global safelist checks on root-span context
-- Offline validation verdict filtering (when enabled)
-- Final findings-cap enforcement (`max_findings_per_chunk`) after suppression
-
-These controls are intentionally kept out of window-gate ordering so rule
-validation semantics stay focused on pattern correctness, while policy
-suppression remains centralized in post-scan compaction/filtering.
+- Root findings matching safelist patterns are suppressed immediately.
+- Suppressed findings increment `ScanScratch::safelist_suppressed`.
+- Non-root findings bypass this check.
+- Offline validation verdict filtering (when enabled) is still outside this
+  module.
 
 ---
 
@@ -444,10 +442,8 @@ scratch.push_finding_with_drop_hint(
 
 ### Capacity Management
 
-This module emits candidate findings into scratch. Final cap enforcement
-(`max_findings_per_chunk`) is applied in post-scan filtering after suppression.
-Scratch keeps a bounded pre-cap candidate budget for safety; overflow increments
-drop counters.
+This module records findings directly into scratch. `max_findings_per_chunk` is
+enforced at insert time, and overflow increments drop counters.
 
 ### Coordinate Spaces
 
@@ -605,8 +601,8 @@ variant-specific ordering:
 
 Early failures save expensive regex execution. Post-match gates run only on
 confirmed regex matches, so their cost scales with finding count, not window count.
-Safelist/offline policy suppression is deliberately excluded from this sequence
-and handled in post-scan filtering.
+Root safelist suppression runs at finding emission; offline policy suppression
+remains outside this module.
 
 ### Entropy on Full Match
 
@@ -623,10 +619,10 @@ Two limits prevent DoS via massive UTF-16 expansion:
 
 ### Scratch-Based Recording
 
-Findings written to scratch buffers (not directly to results) because:
-- Allows findings to be filtered/deduplicated in parent modules
-- Keeps hot-path validation focused on matching while post-scan applies policy/cap decisions
-- Enables post-processing (e.g., sorting, merging)
+Findings are written to scratch buffers (not directly to materialized results) because:
+- Keeps dedupe/drop-hint bookkeeping localized and allocation-free
+- Enables downstream processing (materialization, transforms, reporting)
+- Preserves consistent sidecar alignment for `norm_hash` and `drop_hint_end`
 
 ---
 
@@ -640,4 +636,4 @@ Findings written to scratch buffers (not directly to results) because:
 6. All early returns occur before findings are recorded
 7. Findings are appended to scratch (never removed or reordered during function execution)
 8. Entropy gates continue to next match (not early return)
-9. Suppression and final cap truncation are post-scan concerns, outside this module
+9. Root safelist suppression and cap checks are applied before finding insertion

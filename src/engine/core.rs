@@ -13,7 +13,7 @@
 //! - The decode slab does not reallocate during a scan; all `unsafe` slice
 //!   construction relies on this property.
 //! - `scratch.out`, `scratch.drop_hint_end`, and `scratch.norm_hash` stay
-//!   length-aligned throughout a scan; post-filter compaction preserves this
+//!   length-aligned throughout a scan; all finding writes preserve this
 //!   lock-step invariant.
 //!
 //! ## Algorithm
@@ -39,8 +39,8 @@
 //!      decoded output.
 //! 4. Budgets (decode bytes, work items, depth) are enforced per-item so no
 //!    single input forces unbounded work.
-//! 5. Run post-scan suppression and in-place compaction, then enforce the
-//!    final findings cap while keeping auxiliary arrays aligned.
+//! 5. Apply suppression/cap policies at finding emission time so no post-scan
+//!    compaction pass is required.
 //!
 //! ## Design choices
 //!
@@ -238,7 +238,7 @@ pub struct Engine {
     pub(super) entropy_gates: Vec<EntropyCompiled>,
     pub(super) two_phase_gates: Vec<TwoPhaseCompiled>,
     pub(super) local_context_gates: Vec<crate::api::LocalContextSpec>,
-    /// Global context safelist evaluated in the post-scan suppression pass.
+    /// Global context safelist evaluated at finding emission time.
     pub(super) safelist: SafelistFilter,
 
     /// Pre-computed `ln(i)/ln(2)` table for Shannon entropy calculation.
@@ -1008,6 +1008,50 @@ impl Engine {
         idx.map(|i| self.local_context_gates[i as usize])
     }
 
+    /// Returns whether a root finding should be suppressed by the global safelist.
+    ///
+    /// `root_hint_start`/`root_hint_end` are absolute file offsets in the same
+    /// coordinate space as `context_base_offset`.
+    #[inline(always)]
+    pub(super) fn suppress_root_finding_by_safelist(
+        &self,
+        context_buf: &[u8],
+        context_base_offset: u64,
+        step_id: StepId,
+        root_hint_start: u64,
+        root_hint_end: u64,
+        last_decision: &mut Option<(u64, u64, bool)>,
+    ) -> bool {
+        if step_id != STEP_ROOT {
+            return false;
+        }
+
+        let context_len_u64 = context_buf.len() as u64;
+        let start = root_hint_start
+            .saturating_sub(context_base_offset)
+            .min(context_len_u64);
+        let end = root_hint_end
+            .saturating_sub(context_base_offset)
+            .min(context_len_u64);
+
+        if start >= end {
+            return false;
+        }
+
+        if let Some((last_start, last_end, last_suppressed)) = last_decision.as_ref().copied() {
+            if last_start == start && last_end == end {
+                return last_suppressed;
+            }
+        }
+
+        let suppressed = self
+            .safelist
+            .matcher()
+            .is_match(&context_buf[start as usize..end as usize]);
+        *last_decision = Some((start, end, suppressed));
+        suppressed
+    }
+
     #[inline(always)]
     pub(super) fn two_phase_gate(&self, idx: Option<u32>) -> Option<&TwoPhaseCompiled> {
         idx.map(|i| &self.two_phase_gates[i as usize])
@@ -1678,84 +1722,6 @@ impl Engine {
                     _transform_start.elapsed().as_nanos() as u64
                 );
             }
-        }
-
-        self.post_scan_filter(root_buf, base_offset, scratch);
-    }
-
-    /// Applies post-scan suppression policies and finalizes finding limits.
-    ///
-    /// Current suppression policy is intentionally narrow: only root findings
-    /// (`step_id == STEP_ROOT`) are eligible, and only when their root-context
-    /// slice matches the global safelist. Findings from decoded buffers are not
-    /// safelist-suppressed here.
-    ///
-    /// Finalization is two-step:
-    /// 1. Safelist retain/compaction (linear-time, aligned sidecars).
-    /// 2. Post-suppression truncation to `max_findings_per_chunk`.
-    ///
-    /// Both steps preserve strict index alignment across parallel vectors
-    /// (`out`, `drop_hint_end`, `norm_hash`), which is required by materialization
-    /// and dedupe bookkeeping paths. The aligned retain/compaction mechanics live
-    /// in [`ScanScratch::retain_findings_aligned`].
-    ///
-    /// `base_offset` rebases absolute `root_hint_*` offsets into the current
-    /// `root_buf` slice; spans outside the slice are clamped and treated as
-    /// non-matching.
-    fn post_scan_filter(&self, root_buf: &[u8], base_offset: u64, scratch: &mut ScanScratch) {
-        if scratch.out.is_empty() {
-            return;
-        }
-        let safelist_matcher = self.safelist.matcher();
-
-        let root_len_u64 = root_buf.len() as u64;
-        let mut last_root_decision: Option<(u64, u64, bool)> = None;
-        let removed = scratch.retain_findings_aligned(|rec, _drop_end| {
-            if rec.step_id != STEP_ROOT {
-                return true;
-            }
-
-            debug_assert!(
-                rec.root_hint_start <= rec.root_hint_end,
-                "root_hint range is backwards: {}..{} for rule {}",
-                rec.root_hint_start,
-                rec.root_hint_end,
-                rec.rule_id,
-            );
-
-            // Rebase absolute root hints into this chunk and clamp to avoid
-            // panics when overlap hints extend outside `root_buf`.
-            let start = rec
-                .root_hint_start
-                .saturating_sub(base_offset)
-                .min(root_len_u64);
-            let end = rec
-                .root_hint_end
-                .saturating_sub(base_offset)
-                .min(root_len_u64);
-            if start >= end {
-                return true;
-            }
-
-            if let Some((last_start, last_end, last_keep)) = last_root_decision {
-                if last_start == start && last_end == end {
-                    return last_keep;
-                }
-            }
-
-            let keep = !safelist_matcher.is_match(&root_buf[start as usize..end as usize]);
-            last_root_decision = Some((start, end, keep));
-            keep
-        });
-        scratch.safelist_suppressed = scratch.safelist_suppressed.saturating_add(removed);
-
-        let final_cap = scratch.max_findings;
-        if scratch.out.len() > final_cap {
-            let dropped = scratch.out.len().saturating_sub(final_cap);
-            scratch.out.truncate(final_cap);
-            scratch.norm_hash.truncate(final_cap);
-            scratch.drop_hint_end.truncate(final_cap);
-            scratch.findings_dropped = scratch.findings_dropped.saturating_add(dropped);
         }
     }
 

@@ -18,7 +18,8 @@
 //! 5. Extract the secret span using capture group priority (see [`extract_secret_span`]).
 //! 6. Apply value suppressors (when configured) on the extracted secret bytes.
 //! 7. Apply local context checks (when configured) on the secret span.
-//! 8. Record the finding with the extracted secret span.
+//! 8. Apply root-context safelist suppression for root emit paths.
+//! 9. Record the finding with the extracted secret span.
 //!
 //! # Secret Extraction
 //! The finding's `span_start`/`span_end` reflect the *secret* portion of the match,
@@ -43,7 +44,7 @@
 //!
 //! # Entry Points
 //! - `run_rule_on_window`: engine hot path that writes findings directly into
-//!   `ScanScratch` and performs dedupe/drop-hint bookkeeping immediately.
+//!   `ScanScratch`, applying safelist suppression + dedupe/drop-hint bookkeeping.
 //! - `run_rule_on_raw_window_into` / `run_rule_on_utf16_window_into`: scheduler
 //!   adapters that accumulate findings in `scratch.tmp_findings` for the caller
 //!   to batch-commit.
@@ -326,8 +327,7 @@ impl Engine {
     /// Errors / edge cases:
     /// - Returns early when gates fail, decode budgets are exhausted, or decoding
     ///   fails.
-    /// - Candidate findings are emitted; suppression/cap policies are applied
-    ///   in post-scan filtering.
+    /// - Findings may be suppressed at emit-time by safelist policy.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn run_rule_on_window(
         &self,
@@ -386,6 +386,7 @@ impl Engine {
 
                 let entropy = self.entropy_gate(rule.entropy);
                 let value_suppressors = self.value_suppressor_gate(rule.value_suppressors);
+                let mut last_safelist_decision: Option<(u64, u64, bool)> = None;
                 // Take the pre-allocated CaptureLocations out of scratch so the
                 // closure can borrow `locs` mutably without also borrowing `scratch`.
                 // Restored after the loop to keep the slot populated for the next call.
@@ -450,6 +451,20 @@ impl Engine {
                                 } else {
                                     root_hint.clone().unwrap_or(match_span_in_buf)
                                 };
+                            let root_hint_start = base_offset + root_span_hint.start as u64;
+                            let root_hint_end = base_offset + root_span_hint.end as u64;
+                            if self.suppress_root_finding_by_safelist(
+                                buf,
+                                base_offset,
+                                step_id,
+                                root_hint_start,
+                                root_hint_end,
+                                &mut last_safelist_decision,
+                            ) {
+                                scratch.safelist_suppressed =
+                                    scratch.safelist_suppressed.saturating_add(1);
+                                return;
+                            }
                             let mut drop_hint_end = root_span_hint.end;
                             if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
                                 if let Some(end) =
@@ -472,8 +487,8 @@ impl Engine {
                                     rule_id,
                                     span_start: span_in_buf.start as u32,
                                     span_end: span_in_buf.end as u32,
-                                    root_hint_start: base_offset + root_span_hint.start as u64,
-                                    root_hint_end: base_offset + root_span_hint.end as u64,
+                                    root_hint_start,
+                                    root_hint_end,
                                     dedupe_with_span: include_span,
                                     step_id,
                                 },
@@ -653,6 +668,7 @@ impl Engine {
 
         let entropy = self.entropy_gate(rule.entropy);
         let value_suppressors = self.value_suppressor_gate(rule.value_suppressors);
+        let mut last_safelist_decision: Option<(u64, u64, bool)> = None;
         let mut locs = scratch.capture_locs[rule_id as usize]
             .take()
             .expect("capture locations missing for rule");
@@ -712,6 +728,19 @@ impl Engine {
                     } else {
                         root_hint.clone().unwrap_or(mapped_span)
                     };
+                    let root_hint_start = base_offset + root_span_hint.start as u64;
+                    let root_hint_end = base_offset + root_span_hint.end as u64;
+                    if self.suppress_root_finding_by_safelist(
+                        buf,
+                        base_offset,
+                        step_id,
+                        root_hint_start,
+                        root_hint_end,
+                        &mut last_safelist_decision,
+                    ) {
+                        scratch.safelist_suppressed = scratch.safelist_suppressed.saturating_add(1);
+                        return;
+                    }
 
                     let mut drop_hint_end = root_span_hint.end;
                     if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
@@ -731,8 +760,8 @@ impl Engine {
                             rule_id,
                             span_start: secret_start as u32,
                             span_end: secret_end as u32,
-                            root_hint_start: base_offset + root_span_hint.start as u64,
-                            root_hint_end: base_offset + root_span_hint.end as u64,
+                            root_hint_start,
+                            root_hint_end,
                             dedupe_with_span: include_span,
                             step_id: utf16_step_id,
                         },
@@ -810,6 +839,7 @@ impl Engine {
 
         let entropy = self.entropy_gate(rule.entropy);
         let value_suppressors = self.value_suppressor_gate(rule.value_suppressors);
+        let mut last_safelist_decision: Option<(u64, u64, bool)> = None;
         let mut locs = scratch.capture_locs[rule_id as usize]
             .take()
             .expect("capture locations missing for rule");
@@ -865,6 +895,19 @@ impl Engine {
                     } else {
                         root_hint.clone().unwrap_or(match_span_in_buf)
                     };
+                    let root_hint_start = base_offset + root_span_hint.start as u64;
+                    let root_hint_end = base_offset + root_span_hint.end as u64;
+                    if self.suppress_root_finding_by_safelist(
+                        window,
+                        base_offset.saturating_add(window_start),
+                        step_id,
+                        root_hint_start,
+                        root_hint_end,
+                        &mut last_safelist_decision,
+                    ) {
+                        scratch.safelist_suppressed = scratch.safelist_suppressed.saturating_add(1);
+                        return;
+                    }
 
                     let mut drop_hint_end = root_span_hint.end;
                     if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
@@ -890,8 +933,8 @@ impl Engine {
                         rule_id,
                         span_start: span_in_buf.start as u32,
                         span_end: span_in_buf.end as u32,
-                        root_hint_start: base_offset + root_span_hint.start as u64,
-                        root_hint_end: base_offset + root_span_hint.end as u64,
+                        root_hint_start,
+                        root_hint_end,
                         dedupe_with_span,
                         step_id,
                     });
@@ -1026,6 +1069,7 @@ impl Engine {
 
         let entropy = self.entropy_gate(rule.entropy);
         let value_suppressors = self.value_suppressor_gate(rule.value_suppressors);
+        let mut last_safelist_decision: Option<(u64, u64, bool)> = None;
         let mut locs = scratch.capture_locs[rule_id as usize]
             .take()
             .expect("capture locations missing for rule");
@@ -1086,6 +1130,19 @@ impl Engine {
                     } else {
                         root_hint.clone().unwrap_or(mapped_span)
                     };
+                    let root_hint_start = base_offset + root_span_hint.start as u64;
+                    let root_hint_end = base_offset + root_span_hint.end as u64;
+                    if self.suppress_root_finding_by_safelist(
+                        raw_win,
+                        base_offset.saturating_add(window_start),
+                        step_id,
+                        root_hint_start,
+                        root_hint_end,
+                        &mut last_safelist_decision,
+                    ) {
+                        scratch.safelist_suppressed = scratch.safelist_suppressed.saturating_add(1);
+                        return;
+                    }
 
                     let mut drop_hint_end = root_span_hint.end;
                     if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
@@ -1104,8 +1161,8 @@ impl Engine {
                         rule_id,
                         span_start: secret_start as u32,
                         span_end: secret_end as u32,
-                        root_hint_start: base_offset + root_span_hint.start as u64,
-                        root_hint_end: base_offset + root_span_hint.end as u64,
+                        root_hint_start,
+                        root_hint_end,
                         dedupe_with_span,
                         step_id: utf16_step_id,
                     });

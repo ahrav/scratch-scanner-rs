@@ -1050,7 +1050,7 @@ fn value_suppressor_absent_does_not_change_behavior() {
 }
 
 #[test]
-fn safelist_post_scan_filter_suppresses_root_finding() {
+fn safelist_emit_time_filter_suppresses_root_finding() {
     let rule = RuleSpec {
         name: "safelist-root-filter",
         anchors: &[b"token"],
@@ -1081,17 +1081,17 @@ fn safelist_post_scan_filter_suppresses_root_finding() {
     assert_eq!(
         recs.len(),
         1,
-        "expected safelist post-filter to suppress placeholder root finding"
+        "expected emit-time safelist to suppress placeholder root finding"
     );
     assert_eq!(
         recs.len(),
         scratch.norm_hashes().len(),
-        "norm_hash sidecar must stay aligned after post-filter compaction"
+        "norm_hash sidecar must stay aligned after emit-time suppression"
     );
     assert_eq!(
         recs.len(),
         scratch.drop_hint_end().len(),
-        "drop_hint_end sidecar must stay aligned after post-filter compaction"
+        "drop_hint_end sidecar must stay aligned after emit-time suppression"
     );
 
     let rec = recs[0];
@@ -1106,7 +1106,7 @@ fn safelist_post_scan_filter_suppresses_root_finding() {
 }
 
 #[test]
-fn safelist_post_scan_filter_keeps_non_root_findings() {
+fn safelist_emit_time_filter_keeps_non_root_findings() {
     let rule = RuleSpec {
         name: "safelist-mixed-root-non-root",
         anchors: &[b"placeholder_token"],
@@ -1152,7 +1152,7 @@ fn safelist_post_scan_filter_keeps_non_root_findings() {
     );
     assert_ne!(
         recs[0].step_id, STEP_ROOT,
-        "non-root findings must bypass safelist suppression in post-filter"
+        "non-root findings must bypass emit-time safelist suppression"
     );
     assert_eq!(
         recs.len(),
@@ -1211,7 +1211,7 @@ fn safelist_suppression_does_not_consume_findings_cap() {
 #[test]
 fn max_findings_cap_applies_after_safelist_suppression() {
     let rule = RuleSpec {
-        name: "safelist-cap-post-suppression",
+        name: "safelist-cap-emit-time-suppression",
         anchors: &[b"token"],
         radius: 128,
         validator: ValidatorKind::None,
@@ -1239,7 +1239,7 @@ fn max_findings_cap_applies_after_safelist_suppression() {
     assert_eq!(
         recs.len(),
         2,
-        "post-scan cap should be enforced after safelist suppression"
+        "cap should be enforced after emit-time safelist suppression"
     );
     let spans: Vec<&[u8]> = recs
         .iter()
@@ -1261,12 +1261,12 @@ fn max_findings_cap_applies_after_safelist_suppression() {
     assert_eq!(
         scratch.dropped_findings(),
         1,
-        "only findings above post-suppression cap should count as dropped"
+        "only findings above the cap should count as dropped"
     );
 }
 
 #[test]
-fn safelist_post_scan_filter_noop_keeps_all_non_safelisted_roots() {
+fn safelist_emit_time_filter_noop_keeps_all_non_safelisted_roots() {
     let rule = RuleSpec {
         name: "safelist-noop-root",
         anchors: &[b"prod_token_"],
@@ -1302,12 +1302,12 @@ fn safelist_post_scan_filter_noop_keeps_all_non_safelisted_roots() {
     assert_eq!(
         recs.len(),
         scratch.norm_hashes().len(),
-        "norm_hash sidecar must stay aligned on no-op post-filter path"
+        "norm_hash sidecar must stay aligned on no-op emit-time path"
     );
     assert_eq!(
         recs.len(),
         scratch.drop_hint_end().len(),
-        "drop_hint_end sidecar must stay aligned on no-op post-filter path"
+        "drop_hint_end sidecar must stay aligned on no-op emit-time path"
     );
     for rec in recs {
         assert_eq!(rec.step_id, STEP_ROOT);
@@ -1320,7 +1320,7 @@ fn safelist_post_scan_filter_noop_keeps_all_non_safelisted_roots() {
 }
 
 #[test]
-fn safelist_post_scan_filter_drops_tail_root_finding() {
+fn safelist_emit_time_filter_drops_tail_root_finding() {
     let rule = RuleSpec {
         name: "safelist-tail-drop",
         anchors: &[b"token"],
@@ -1365,7 +1365,7 @@ fn safelist_post_scan_filter_drops_tail_root_finding() {
 }
 
 #[test]
-fn safelist_post_scan_filter_suppresses_duplicate_root_spans_across_rules() {
+fn safelist_emit_time_filter_suppresses_duplicate_root_spans_across_rules() {
     let rules = vec![
         RuleSpec {
             name: "safelist-dup-a",
@@ -1429,7 +1429,7 @@ fn safelist_post_scan_filter_suppresses_duplicate_root_spans_across_rules() {
 }
 
 #[test]
-fn safelist_post_scan_filter_all_findings_suppressed() {
+fn safelist_emit_time_filter_all_findings_suppressed() {
     let rule = RuleSpec {
         name: "safelist-all-suppressed",
         anchors: &[b"placeholder_token"],

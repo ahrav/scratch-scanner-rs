@@ -33,21 +33,6 @@ use super::Engine;
 /// context or encoding transform.
 pub type NormHash = [u8; 32];
 
-/// Internal candidate-buffer multiplier used before post-scan cap enforcement.
-///
-/// Findings are accumulated and policy-filtered first; the public
-/// `max_findings_per_chunk` cap is applied afterward. This multiplier provides a
-/// bounded staging margin so placeholder-heavy inputs do not overflow the final
-/// cap before suppression runs.
-const FINDING_CANDIDATE_MULTIPLIER: usize = 8;
-
-#[inline(always)]
-fn candidate_findings_capacity(max_findings: usize) -> usize {
-    max_findings
-        .max(1)
-        .saturating_mul(FINDING_CANDIDATE_MULTIPLIER)
-}
-
 /// Scratch histogram for entropy gating.
 ///
 /// Entropy gates reject candidate matches whose byte distribution is too
@@ -313,8 +298,7 @@ impl CachelineBoundary {
 ///   by `reset_for_scan` and any draining/mutation method.
 ///
 /// # Performance
-/// - Findings accumulate in a bounded candidate buffer and are finalized
-///   (suppression + cap) post-scan; overflow increments
+/// - Fixed-capacity buffers cap per-scan work; overflow increments
 ///   [`ScanScratch::dropped_findings`].
 ///
 /// # Layout — hot / cold split
@@ -342,18 +326,17 @@ pub struct ScanScratch {
     /// Per-chunk finding records awaiting materialization.
     ///
     /// Compact records are stored here during scanning; they are expanded into
-    /// full `Finding` structs with provenance during materialization.
-    /// Capacity is provisioned to a bounded candidate budget so policy
-    /// suppression can run before the final reporting cap is enforced.
+    /// full `Finding` structs with provenance during materialization. Fixed
+    /// capacity prevents allocation in the hot path; overflow increments
+    /// `findings_dropped` instead of reallocating.
     pub(super) out: ScratchVec<FindingRec>,
     /// Normalized hash for each finding (aligned with `out`).
     pub(super) norm_hash: ScratchVec<NormHash>,
     /// Drop boundary used by `drop_prefix_findings` (absolute offset in file).
     pub(super) drop_hint_end: ScratchVec<u64>,
-    pub(super) max_findings: usize, // Final post-scan cap from tuning.
-    pub(super) max_candidate_findings: usize, // Bounded pre-cap candidate budget.
-    pub(super) findings_dropped: usize, // Overflow + post-cap drop counter.
-    pub(super) safelist_suppressed: usize, // Findings removed by post-scan safelist.
+    pub(super) max_findings: usize,     // Per-chunk cap from tuning.
+    pub(super) findings_dropped: usize, // Overflow counter when cap is exceeded.
+    pub(super) safelist_suppressed: usize, // Findings removed by emit-time safelist.
     /// Work queue for breadth-first buffer traversal.
     ///
     /// Contains the root buffer plus any decoded buffers from transforms.
@@ -537,7 +520,6 @@ impl ScanScratch {
             .max()
             .unwrap_or(0);
         let max_findings = engine.tuning.max_findings_per_chunk;
-        let max_candidate_findings = candidate_findings_capacity(max_findings);
         let pair_count = rules_len.checked_mul(3).expect("rule pair count overflow");
         let hit_acc_pool =
             HitAccPool::new(pair_count, engine.tuning.max_anchor_hits_per_rule_variant)
@@ -554,7 +536,7 @@ impl ScanScratch {
                 .saturating_mul(2)
                 .max(1024),
         );
-        let findings_cap = pow2_at_least(max_candidate_findings.saturating_mul(4).max(64));
+        let findings_cap = pow2_at_least(max_findings.saturating_mul(4).max(64));
         let stream_match_cap = engine.tuning.max_windows_per_rule_variant.max(16);
         let pending_window_cap = rules_len
             .saturating_mul(3)
@@ -570,14 +552,12 @@ impl ScanScratch {
         let has_entropy_gates = !engine.entropy_gates.is_empty();
 
         Self {
-            out: ScratchVec::with_capacity(max_candidate_findings)
-                .expect("scratch out allocation failed"),
-            norm_hash: ScratchVec::with_capacity(max_candidate_findings)
+            out: ScratchVec::with_capacity(max_findings).expect("scratch out allocation failed"),
+            norm_hash: ScratchVec::with_capacity(max_findings)
                 .expect("scratch norm_hash allocation failed"),
-            drop_hint_end: ScratchVec::with_capacity(max_candidate_findings)
+            drop_hint_end: ScratchVec::with_capacity(max_findings)
                 .expect("scratch drop_hint_end allocation failed"),
             max_findings,
-            max_candidate_findings,
             findings_dropped: 0,
             safelist_suppressed: 0,
             work_q: ScratchVec::with_capacity(engine.tuning.max_work_items.saturating_add(1))
@@ -625,17 +605,17 @@ impl ScanScratch {
                 Vec::new()
             },
             tmp_findings: if has_active_transforms {
-                Vec::with_capacity(max_candidate_findings)
+                Vec::with_capacity(max_findings)
             } else {
                 Vec::new()
             },
             tmp_drop_hint_end: if has_active_transforms {
-                Vec::with_capacity(max_candidate_findings)
+                Vec::with_capacity(max_findings)
             } else {
                 Vec::new()
             },
             tmp_norm_hash: if has_active_transforms {
-                Vec::with_capacity(max_candidate_findings)
+                Vec::with_capacity(max_findings)
             } else {
                 Vec::new()
             },
@@ -846,7 +826,7 @@ impl ScanScratch {
     /// - Vectorscan scratch bindings still match the current DB pointers
     /// - per-rule/variant accumulators are large enough for current limits
     /// - bounded sidecar vectors (`out`, `norm_hash`, `drop_hint_end`) remain
-    ///   aligned and large enough for candidate buffering
+    ///   aligned and large enough for `max_findings`
     pub(super) fn ensure_capacity(&mut self, engine: &Engine) {
         if self.capacity_validated {
             return;
@@ -985,20 +965,16 @@ impl ScanScratch {
         if self.max_findings != engine.tuning.max_findings_per_chunk {
             self.max_findings = engine.tuning.max_findings_per_chunk;
         }
-        let required_candidates = candidate_findings_capacity(self.max_findings);
-        if self.max_candidate_findings < required_candidates {
-            self.max_candidate_findings = required_candidates;
-        }
-        if self.out.capacity() < self.max_candidate_findings {
-            self.out = ScratchVec::with_capacity(self.max_candidate_findings)
+        if self.out.capacity() < self.max_findings {
+            self.out = ScratchVec::with_capacity(self.max_findings)
                 .expect("scratch out allocation failed");
         }
-        if self.norm_hash.capacity() < self.max_candidate_findings {
-            self.norm_hash = ScratchVec::with_capacity(self.max_candidate_findings)
+        if self.norm_hash.capacity() < self.max_findings {
+            self.norm_hash = ScratchVec::with_capacity(self.max_findings)
                 .expect("scratch norm_hash allocation failed");
         }
-        if self.drop_hint_end.capacity() < self.max_candidate_findings {
-            self.drop_hint_end = ScratchVec::with_capacity(self.max_candidate_findings)
+        if self.drop_hint_end.capacity() < self.max_findings {
+            self.drop_hint_end = ScratchVec::with_capacity(self.max_findings)
                 .expect("scratch drop_hint_end allocation failed");
         }
         if self.work_q.capacity() < engine.tuning.max_work_items.saturating_add(1) {
@@ -1066,17 +1042,17 @@ impl ScanScratch {
                 self.span_streams
                     .reserve(engine.transforms.len() - self.span_streams.capacity());
             }
-            if self.tmp_findings.capacity() < self.max_candidate_findings {
+            if self.tmp_findings.capacity() < self.max_findings {
                 self.tmp_findings
-                    .reserve(self.max_candidate_findings - self.tmp_findings.capacity());
+                    .reserve(self.max_findings - self.tmp_findings.capacity());
             }
-            if self.tmp_drop_hint_end.capacity() < self.max_candidate_findings {
+            if self.tmp_drop_hint_end.capacity() < self.max_findings {
                 self.tmp_drop_hint_end
-                    .reserve(self.max_candidate_findings - self.tmp_drop_hint_end.capacity());
+                    .reserve(self.max_findings - self.tmp_drop_hint_end.capacity());
             }
-            if self.tmp_norm_hash.capacity() < self.max_candidate_findings {
+            if self.tmp_norm_hash.capacity() < self.max_findings {
                 self.tmp_norm_hash
-                    .reserve(self.max_candidate_findings - self.tmp_norm_hash.capacity());
+                    .reserve(self.max_findings - self.tmp_norm_hash.capacity());
             }
         }
         if engine.entropy_gates.is_empty() {
@@ -1338,7 +1314,7 @@ impl ScanScratch {
         self.findings_dropped
     }
 
-    /// Returns the number of findings removed by the post-scan safelist.
+    /// Returns the number of findings removed by emit-time safelist checks.
     pub fn safelist_suppressed(&self) -> usize {
         self.safelist_suppressed
     }
@@ -1380,7 +1356,7 @@ impl ScanScratch {
     ///
     /// The underlying `FixedSet128` is a probabilistic structure (Bloom-like).
     /// Collisions may suppress distinct findings, but the capacity is sized to
-    /// `4×` the candidate-finding budget to keep collision probability low.
+    /// `4× max_findings` to keep collision probability low for typical scans.
     ///
     /// `include_span` controls whether `span_start`/`span_end` participate in
     /// the dedupe key (used when root-span mapping is unavailable).
@@ -1391,7 +1367,7 @@ impl ScanScratch {
     ///   (e.g., prefer transform findings) without re-emitting earlier chunks.
     ///
     /// Replacement lookup is `O(n)` in pending findings (linear scan of `out`)
-    /// but bounded by the candidate-finding budget, so it stays predictable.
+    /// but bounded by `max_findings_per_chunk`, so it stays predictable.
     #[inline(always)]
     pub(super) fn push_finding_with_drop_hint(
         &mut self,
@@ -1517,10 +1493,7 @@ impl ScanScratch {
             return; // Already seen (or hash collision) and no update needed.
         }
 
-        let can_push = self.out.len() < self.out.capacity()
-            && self.norm_hash.len() < self.norm_hash.capacity()
-            && self.drop_hint_end.len() < self.drop_hint_end.capacity();
-        if can_push {
+        if self.out.len() < self.max_findings {
             self.out.push(rec);
             self.norm_hash.push(norm_hash);
             self.drop_hint_end.push(drop_hint_end);

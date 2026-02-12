@@ -41,15 +41,13 @@ flowchart TB
         LocalCtx["Local context gate<br/>(optional, fail-open)"]
     end
 
-    subgraph PostScan["Post-Scan Finalization"]
-        Safelist["Root-context safelist check<br/>(step_id == STEP_ROOT)"]
-        Compact["In-place compaction<br/>(out + sidecars aligned)"]
-        Cap["Final findings cap<br/>(max_findings_per_chunk)"]
+    subgraph EmitPolicy["Emit-Time Policies"]
+        Safelist["Root-context safelist check<br/>(root emit paths only)"]
+        Cap["Findings cap check<br/>(max_findings_per_chunk)"]
     end
 
     subgraph Output["Output"]
-        FindingRec["Candidate FindingRec<br/>{ file_id, rule_id, span, step_id }"]
-        FinalRec["Compacted FindingRec<br/>(emission-ready)"]
+        FindingRec["FindingRec<br/>{ file_id, rule_id, span, step_id }"]
     end
 
     Chunk --> VS
@@ -81,11 +79,9 @@ flowchart TB
     Entropy --> SecretExtract
     SecretExtract --> ValueSuppressors
     ValueSuppressors --> LocalCtx
-    LocalCtx --> FindingRec
-    FindingRec --> Safelist
-    Safelist --> Compact
-    Compact --> Cap
-    Cap --> FinalRec
+    LocalCtx --> Safelist
+    Safelist --> Cap
+    Cap --> FindingRec
 
     style Input fill:#e3f2fd
     style AnchorScan fill:#fff3e0
@@ -93,7 +89,7 @@ flowchart TB
     style SeedConfirm fill:#f3e5f5
     style RegexConfirm fill:#ffebee
     style PostMatch fill:#fff8e1
-    style PostScan fill:#ede7f6
+    style EmitPolicy fill:#ede7f6
     style Output fill:#e8eaf6
 ```
 
@@ -252,18 +248,16 @@ see [fs-persistence-pipeline.md § SQLite Backend](fs-persistence-pipeline.md#sq
 
 **Pressure Coalescing**: If windows exceed `max_windows_per_rule_variant` (16), the gap doubles until windows fit, or everything merges into one.
 
-### Post-Scan Finalization
+### Emit-Time Policies
 
-After work-queue processing, the engine runs a post-scan finalization pass:
+Finding policies are enforced when each finding is about to be recorded:
 
-- Evaluate the global safelist only for root findings (`step_id == STEP_ROOT`).
-- Derive the safelist context from `root_hint_start..root_hint_end` (clamped to
-  the current `root_buf` bounds).
-- Suppress safelisted root findings and compact `out`, `norm_hash`, and
-  `drop_hint_end` in-place with a single write cursor.
-- Preserve non-root (transform-derived) findings for downstream phases.
-- Apply `max_findings_per_chunk` **after** suppression by truncating aligned
-  finding sidecars; excess findings increment `dropped_findings`.
+- Evaluate the global safelist for root emit paths using
+  `root_hint_start..root_hint_end` rebased to the active context slice.
+- Suppressed findings increment `safelist_suppressed` and are not inserted.
+- Non-root findings bypass safelist suppression.
+- `max_findings_per_chunk` is enforced in `push_finding_with_drop_hint`; excess
+  findings increment `dropped_findings`.
 
 ### Seed Confirmation + Expansion
 
