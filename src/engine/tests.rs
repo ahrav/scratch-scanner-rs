@@ -2302,8 +2302,9 @@ fn offline_validation_gate_pooled_round_trip() {
 // Offline validation end-to-end tests
 // --------------------------
 //
-// These tests verify the full `post_scan_filter` path: engine scan → offline
-// validation → finding suppression / retention.
+// These tests verify emit-time offline validation ordering:
+// engine scan → safelist (step-root only) → offline validation (root-semantic)
+// → finding suppression / retention.
 
 /// Build a `pfx_<payload><base62(crc32(payload))>` token.
 fn build_crc32_base62_token(payload: &[u8]) -> Vec<u8> {
@@ -5799,7 +5800,7 @@ mod url_percent_gate_check_tests {
 }
 
 // ---------------------------------------------------------------------------
-// Offline validation post-scan filter tests
+// Offline validation emission-time gate tests
 // ---------------------------------------------------------------------------
 
 /// Encode a `u32` into a 6-char base-62 string, matching the production encoder.
@@ -6133,6 +6134,44 @@ fn offline_validation_suppresses_invalid_utf16be_root_finding() {
         recs.len(),
         0,
         "invalid token should be suppressed for UTF-16 BE root input"
+    );
+}
+
+#[test]
+fn offline_invalid_does_not_consume_finding_cap_slot() {
+    // With the old post-scan filter, invalid findings consumed cap slots during
+    // emission and were only removed afterwards — crowding out valid findings in
+    // pathological inputs. Inline suppression must prevent this: an invalid
+    // token followed by a valid token should still allow the valid token to
+    // occupy the single cap slot when cap = 1.
+    let rule = offline_crc_rule();
+    let mut tuning = demo_tuning();
+    tuning.max_findings_per_chunk = 1;
+    let engine =
+        Engine::new_with_anchor_policy(vec![rule], Vec::new(), tuning, AnchorPolicy::ManualOnly);
+
+    let invalid_tok = build_invalid_crc_token();
+    let valid_tok = build_valid_crc_token();
+    let mut hay = Vec::new();
+    hay.extend_from_slice(b"prefix ");
+    hay.extend_from_slice(&invalid_tok);
+    hay.extend_from_slice(b" middle ");
+    hay.extend_from_slice(&valid_tok);
+    hay.extend_from_slice(b" suffix");
+
+    let mut scratch = engine.new_scratch();
+    engine.scan_chunk_into(&hay, FileId(0), 0, &mut scratch);
+
+    let recs = scratch.findings();
+    assert_eq!(
+        recs.len(),
+        1,
+        "valid token should survive even with cap=1 because invalid token is suppressed inline"
+    );
+    assert_eq!(
+        &hay[recs[0].span_start as usize..recs[0].span_end as usize],
+        valid_tok.as_slice(),
+        "the surviving finding should be the valid token, not the invalid one"
     );
 }
 

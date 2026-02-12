@@ -22,7 +22,7 @@ Two entry styles are supported:
 - **Finding extraction**: Record matches with proper span information and secret data extraction
 - **Entropy validation**: Gate findings on Shannon entropy of matched tokens
 - **Value suppression**: Discard findings whose extracted secret contains known placeholder/example patterns
-- **Emit-time policy checks**: Apply root safelist suppression before recording findings
+- **Emit-time policy checks**: Apply root safelist suppression and offline structural validation before recording findings
 
 ---
 
@@ -49,7 +49,7 @@ Input: Window [w.start..w.end) in buffer
   ↓
 [Gate 8] Apply local context checks (bounded, fail-open)
   ↓
-[Gate 9] Apply root-context safelist suppression (emit-time, root findings only)
+[Gate 9] Apply root-context safelist suppression (emit-time, `step_id == STEP_ROOT` findings only)
   ↓
 [Gate 10] Apply offline structural validation (CRC, charset, etc.) for root-semantic findings
   ↓
@@ -239,12 +239,16 @@ They apply uniformly in raw, UTF-16, and stream-decoded validation paths.
 
 ### 7. Emit-Time Safelist Suppression
 
-Before recording a finding, root emit paths run a safelist check on the
-root-context slice derived from `root_hint_start..root_hint_end`.
+Before recording a finding, emit paths run a safelist check only when the
+finding's `step_id == STEP_ROOT`, using the root-context slice derived from
+`root_hint_start..root_hint_end`.
 
-- Root findings matching safelist patterns are suppressed immediately.
+- Step-root findings matching safelist patterns are suppressed immediately.
 - Suppressed findings increment `ScanScratch::safelist_suppressed`.
-- Non-root findings bypass this check.
+- Findings with `step_id != STEP_ROOT` bypass this check.
+- Root-semantic UTF-16 findings carry a `Utf16Window` step as their own
+  `step_id`, so they bypass safelist but still participate in offline
+  validation via their parent step.
 
 ### 8. Offline Structural Validation
 
@@ -650,4 +654,4 @@ Findings are written to scratch buffers (not directly to materialized results) b
 6. All early returns occur before findings are recorded
 7. Findings are appended or replaced in-place for dedupe preference (never removed or reordered during function execution)
 8. Entropy gates continue to next match (not early return)
-9. Root safelist suppression and cap checks are applied before finding insertion
+9. Root safelist suppression, offline structural validation, and cap checks are applied before finding insertion

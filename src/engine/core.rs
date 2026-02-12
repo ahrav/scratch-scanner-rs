@@ -1802,9 +1802,10 @@ impl Engine {
             }
         }
 
-        // Offline validation runs inline at each emission site in
-        // window_validate.rs, using the parent step_id to correctly
-        // identify root-semantic findings (including UTF-16 variants).
+        // Offline validation runs inline via `offline_validation_suppresses()`
+        // at each emission site in window_validate.rs, using the parent
+        // step_id to correctly identify root-semantic findings (including
+        // UTF-16 variants).
     }
 
     /// Scans a buffer and returns a shared view of finding records.

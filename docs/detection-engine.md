@@ -43,11 +43,8 @@ flowchart TB
 
     subgraph EmitPolicy["Emit-Time Policies"]
         Safelist["Root-context safelist check<br/>(root emit paths only)"]
+        OfflineVal["Offline validation<br/>(structural checks on root-semantic findings)"]
         Cap["Findings cap check<br/>(max_findings_per_chunk)"]
-    end
-
-    subgraph PostScan["Post-Scan Filtering"]
-        OfflineVal["Offline validation<br/>(structural checks on root findings)"]
     end
 
     subgraph Output["Output"]
@@ -84,9 +81,9 @@ flowchart TB
     SecretExtract --> ValueSuppressors
     ValueSuppressors --> LocalCtx
     LocalCtx --> Safelist
-    Safelist --> Cap
-    Cap --> OfflineVal
-    OfflineVal --> FindingRec
+    Safelist --> OfflineVal
+    OfflineVal --> Cap
+    Cap --> FindingRec
 
     style Input fill:#e3f2fd
     style AnchorScan fill:#fff3e0
@@ -95,7 +92,6 @@ flowchart TB
     style RegexConfirm fill:#ffebee
     style PostMatch fill:#fff8e1
     style EmitPolicy fill:#ede7f6
-    style PostScan fill:#fce4ec
     style Output fill:#e8eaf6
 ```
 
@@ -265,17 +261,21 @@ Finding policies are enforced when each finding is about to be recorded:
 - `max_findings_per_chunk` is enforced in `push_finding_with_drop_hint`; excess
   findings increment `dropped_findings`.
 
-### Post-Scan Filtering
+### Inline Offline Validation
 
-After the work-queue loop completes, `post_scan_filter` runs a batch pass over
-the accumulated findings. For each root finding whose rule has an
-`OfflineValidationSpec` gate, the matched secret bytes are sliced from the
-original root buffer and validated structurally (CRC-32, check-digit, or
-format-specific checks). Findings that receive an `Invalid` verdict are removed
-in a single compaction pass; `Valid` and `Indeterminate` verdicts keep the
-finding. Non-root (transform-derived) findings are always kept because their
-span coordinates reference decoded buffers, not the root buffer. Suppressed
-findings increment `ScanScratch.offline_suppressed`.
+Offline structural validation (CRC-32, check-digit, charset, etc.) runs inline
+at each finding emission site in `window_validate.rs`, **before** the finding
+occupies a `max_findings_per_chunk` cap slot or triggers dedup computation.
+For each root-semantic finding whose rule has an `OfflineValidationSpec` gate,
+the extracted secret bytes are validated via
+`Engine::offline_validation_suppresses`. Root-semantic detection uses the
+**parent** `step_id` (`STEP_ROOT`), so root-level UTF-16 findings are correctly
+identified even though their own `step_id` is a `Utf16Window` decode step.
+
+`Valid` and `Indeterminate` verdicts keep the finding; `Invalid` (with the
+spec's `suppresses_on_invalid` flag set) suppresses it. Non-root
+(transform-derived) findings are always kept. Suppressed findings increment
+`ScanScratch.offline_suppressed`.
 
 ### Seed Confirmation + Expansion
 
