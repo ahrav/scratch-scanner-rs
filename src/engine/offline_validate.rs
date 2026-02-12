@@ -79,9 +79,6 @@ pub(crate) fn validate(spec: OfflineValidationSpec, secret: &[u8]) -> OfflineVer
 // Base-62 helpers
 // ---------------------------------------------------------------------------
 
-/// Base-62 alphabet: `0-9 A-Z a-z`.
-const BASE62_CHARS: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-
 /// Base-62 decode table (256 entries, one per byte value).
 ///
 /// Valid entries: `'0'–'9'` → 0–9, `'A'–'Z'` → 10–35, `'a'–'z'` → 36–61.
@@ -132,19 +129,6 @@ fn base62_decode_u32(bytes: &[u8]) -> Option<u32> {
         return None;
     }
     u32::try_from(acc).ok()
-}
-
-/// Encode a `u32` into a fixed-width base-62 string, zero-padded on the left.
-/// Writes exactly `buf.len()` bytes into `buf`; the caller sizes the buffer.
-///
-/// If `val` requires more base-62 digits than `buf.len()`, the high-order
-/// digits are silently truncated. Callers must ensure the buffer is wide
-/// enough (6 chars suffice for any `u32`).
-fn base62_encode_u32(mut val: u32, buf: &mut [u8]) {
-    for slot in buf.iter_mut().rev() {
-        *slot = BASE62_CHARS[(val % 62) as usize];
-        val /= 62;
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -558,51 +542,6 @@ enum Base64DecodeError {
     OutputTooSmall,
 }
 
-/// Full base64 decoder into a caller-provided buffer (no heap allocation).
-///
-/// Decodes the entire input into `output`. Returns the number of decoded
-/// bytes written, or `None` if `output` is too small or the input contains
-/// bytes outside the base64 alphabet.
-///
-/// For cases where only a prefix of the decoded output matters, prefer
-/// [`base64_decoded_starts_with`] which avoids decoding the full payload.
-#[inline]
-fn base64_decode(input: &[u8], output: &mut [u8]) -> Option<usize> {
-    let max_decoded = input.len() * 3 / 4;
-    if max_decoded > output.len() {
-        return None;
-    }
-
-    let mut out_idx = 0;
-    let mut buf: u32 = 0;
-    let mut buf_bits: u32 = 0;
-
-    for &b in input {
-        let v = BASE64_LUT[b as usize];
-        if v == 0xFE {
-            continue; // padding
-        }
-        if v == 0xFF {
-            return None;
-        }
-        let val = v as u32;
-        buf = (buf << 6) | val;
-        buf_bits += 6;
-
-        if buf_bits >= 8 {
-            buf_bits -= 8;
-            if out_idx >= output.len() {
-                return None;
-            }
-            output[out_idx] = (buf >> buf_bits) as u8;
-            buf &= (1u32 << buf_bits) - 1;
-            out_idx += 1;
-        }
-    }
-
-    Some(out_idx)
-}
-
 /// Validate base64 input and check whether decoded bytes start with `prefix`.
 ///
 /// Two-phase design for better ILP:
@@ -707,6 +646,47 @@ pub fn bench_offline_validate_sentry_org_token(secret: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const BASE62_CHARS: &[u8; 62] =
+        b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+    fn base62_encode_u32(mut val: u32, buf: &mut [u8]) {
+        for slot in buf.iter_mut().rev() {
+            *slot = BASE62_CHARS[(val % 62) as usize];
+            val /= 62;
+        }
+    }
+
+    fn base64_decode(input: &[u8], output: &mut [u8]) -> Option<usize> {
+        let max_decoded = input.len() * 3 / 4;
+        if max_decoded > output.len() {
+            return None;
+        }
+        let mut out_idx = 0;
+        let mut buf: u32 = 0;
+        let mut buf_bits: u32 = 0;
+        for &b in input {
+            let v = BASE64_LUT[b as usize];
+            if v == 0xFE {
+                continue;
+            }
+            if v == 0xFF {
+                return None;
+            }
+            buf = (buf << 6) | v as u32;
+            buf_bits += 6;
+            if buf_bits >= 8 {
+                buf_bits -= 8;
+                if out_idx >= output.len() {
+                    return None;
+                }
+                output[out_idx] = (buf >> buf_bits) as u8;
+                buf &= (1u32 << buf_bits) - 1;
+                out_idx += 1;
+            }
+        }
+        Some(out_idx)
+    }
 
     // ---- Base-62 round-trip ----
 

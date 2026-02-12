@@ -2290,13 +2290,12 @@ fn offline_validation_gate_pooled_round_trip() {
     // Rule 0 should have offline_validation index 0.
     assert_eq!(engine.rules_hot[0].offline_validation, Some(0));
     assert_eq!(
-        engine.offline_validation_gate(Some(0)),
-        Some(OfflineValidationSpec::GithubFinegrainedPat),
+        engine.offline_validation_gates[0],
+        OfflineValidationSpec::GithubFinegrainedPat,
     );
 
     // Rule 1 should have no offline_validation gate.
     assert_eq!(engine.rules_hot[1].offline_validation, None);
-    assert_eq!(engine.offline_validation_gate(None), None);
 }
 
 // --------------------------

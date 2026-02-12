@@ -37,10 +37,10 @@
 //!     and enqueue `DecodeSpan` items.
 //!   - `DecodeSpan`: decode the span, then enqueue a `ScanBuf` for the
 //!     decoded output.
-//! Budgets (decode bytes, work items, depth) are enforced per-item so no
-//! single input forces unbounded work.
-//! Apply suppression/cap policies at finding emission time so no post-scan
-//! compaction pass is required.
+//! - Budgets (decode bytes, work items, depth) are enforced per-item so no
+//!   single input forces unbounded work.
+//! - Apply suppression/cap policies at finding emission time so no post-scan
+//!   compaction pass is required.
 //!
 //! ## Design choices
 //!
@@ -1053,18 +1053,6 @@ impl Engine {
         idx: Option<u32>,
     ) -> Option<crate::api::LocalContextSpec> {
         idx.map(|i| self.local_context_gates[i as usize])
-    }
-
-    /// Resolves the offline structural-validation gate (CRC, format checks).
-    ///
-    /// # Panics
-    /// Panics on out-of-bounds index, indicating corrupted compiled rule data.
-    #[inline(always)]
-    pub(super) fn offline_validation_gate(
-        &self,
-        idx: Option<u32>,
-    ) -> Option<crate::api::OfflineValidationSpec> {
-        idx.map(|i| self.offline_validation_gates[i as usize])
     }
 
     /// Returns whether a root finding should be suppressed by the global safelist.
