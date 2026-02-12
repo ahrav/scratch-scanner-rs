@@ -6,6 +6,18 @@
 //! 2. Prefilter input buffers (Vectorscan / gates) to build candidate windows.
 //! 3. Validate windows with regexes/validators and record compact findings.
 //! 4. Optionally decode transform spans into derived buffers and repeat via BFS.
+//! 5. Optionally apply post-validation suppression policies before final emission.
+//!
+//! # Module Layout
+//! - `core`: immutable engine configuration and compiled rule state.
+//! - `scratch`: per-scan mutable buffers, counters, and decode provenance.
+//! - `buffer_scan`, `window_validate`, `stream_decode`: runtime scan pipeline
+//!   stages that populate and consume scratch state.
+//! - `decode_state`, `work_items`, `hit_pool`: bounded scheduling/storage helpers
+//!   for decoded work.
+//! - `transform`, `safelist`, `helpers`: supporting logic reused by scan stages.
+//! - `vectorscan_prefilter`, `vs_cache`: Vectorscan database build/load/runtime
+//!   integration.
 //!
 //! # Invariants
 //! - The engine is immutable after construction; all mutable scan state lives in
@@ -38,6 +50,9 @@
 //!   selection is permissive, while validation and gates enforce correctness.
 //! - Prefilters (Vectorscan, base64 pre-gate) are conservative: they may admit
 //!   false positives but must not drop true matches.
+//! - Suppression policies (for example, safelist/value suppressor checks) are
+//!   intended to be monotonic: they may remove candidate findings, but must not
+//!   alter span/provenance for findings that remain.
 //!
 //! # Failure Modes and Limits
 //! - Raw Vectorscan prefilter DB build failures are fatal (fallback disabled).
