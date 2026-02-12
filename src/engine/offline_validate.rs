@@ -710,7 +710,7 @@ mod tests {
         let mut token = Vec::new();
         token.extend_from_slice(b"github_pat_");
         // 76 payload chars (type + underscore + random).
-        let payload_filler: Vec<u8> = std::iter::repeat(b'A').take(76).collect();
+        let payload_filler: Vec<u8> = std::iter::repeat_n(b'A', 76).collect();
         token.extend_from_slice(&payload_filler);
 
         // CRC of everything so far (87 bytes).
@@ -730,7 +730,7 @@ mod tests {
     fn github_pat_invalid_checksum() {
         let mut token = Vec::new();
         token.extend_from_slice(b"github_pat_");
-        let payload_filler: Vec<u8> = std::iter::repeat(b'A').take(76).collect();
+        let payload_filler: Vec<u8> = std::iter::repeat_n(b'A', 76).collect();
         token.extend_from_slice(&payload_filler);
         token.extend_from_slice(b"000000"); // wrong checksum
 
@@ -766,7 +766,7 @@ mod tests {
     fn grafana_valid() {
         let mut token = Vec::new();
         token.extend_from_slice(b"glsa_");
-        let random: Vec<u8> = std::iter::repeat(b'a').take(32).collect();
+        let random: Vec<u8> = std::iter::repeat_n(b'a', 32).collect();
         token.extend_from_slice(&random);
 
         // CRC over `glsa_<32 chars>` (37 bytes).
@@ -867,7 +867,7 @@ mod tests {
         token.extend_from_slice(&b64_payload);
         token.push(b'_');
         // 43-char base64 signature.
-        let sig: Vec<u8> = std::iter::repeat(b'A').take(43).collect();
+        let sig: Vec<u8> = std::iter::repeat_n(b'A', 43).collect();
         token.extend_from_slice(&sig);
 
         assert_eq!(
@@ -887,7 +887,7 @@ mod tests {
         token.extend_from_slice(b"sntrys_");
         token.extend_from_slice(&b64_payload);
         token.push(b'_');
-        let sig: Vec<u8> = std::iter::repeat(b'A').take(43).collect();
+        let sig: Vec<u8> = std::iter::repeat_n(b'A', 43).collect();
         token.extend_from_slice(&sig);
 
         assert_eq!(
