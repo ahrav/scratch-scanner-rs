@@ -12,10 +12,9 @@ use regex::bytes::Regex;
 use tempfile::TempDir;
 
 use scanner_rs::git_scan::{
-    run_git_scan, ArtifactAcquireError, CommitLoadError, FinalizeOutcome, GitScanConfig,
-    GitScanError, GitScanMode, GitScanReport, GitScanResult, InMemoryPersistenceStore,
-    MappingCandidateKind, NeverSeenStore, OidBytes, RefWatermarkStore, RepoOpenError, SpillError,
-    StartSetConfig, StartSetResolver, WriteOp,
+    run_git_scan, FinalizeOutcome, GitScanConfig, GitScanError, GitScanMode, GitScanReport,
+    GitScanResult, InMemoryPersistenceStore, MappingCandidateKind, NeverSeenStore, OidBytes,
+    RefWatermarkStore, RepoOpenError, SpillError, StartSetConfig, StartSetResolver, WriteOp,
 };
 use scanner_rs::unified::events::{NullEventSink, VecEventSink};
 use scanner_rs::{demo_tuning, AnchorPolicy, Engine, Gate, RuleSpec, TransformConfig, TransformId};
@@ -532,7 +531,7 @@ fn odb_blob_parallel_intro_keeps_persistence_contract_without_blob_ctx_determini
 // `runner.rs` (see `scan_loose_candidates_missing_object_skipped`).
 
 #[test]
-fn shallow_clone_boundary_reproduces_commit_not_found_during_artifact_acquire() {
+fn shallow_clone_boundary_treats_missing_parent_as_external_root() {
     if !git_available() {
         eprintln!("git not available; skipping shallow clone regression test");
         return;
@@ -569,8 +568,6 @@ fn shallow_clone_boundary_reproduces_commit_not_found_during_artifact_acquire() 
         .lines()
         .find_map(|line| line.strip_prefix("parent "))
         .expect("fixture expects HEAD raw commit to include a parent");
-    let missing_parent = oid_from_hex(missing_parent_hex);
-
     let parent_present = Command::new("git")
         .arg("cat-file")
         .arg("-e")
@@ -584,19 +581,10 @@ fn shallow_clone_boundary_reproduces_commit_not_found_during_artifact_acquire() 
         "fixture requires missing parent {missing_parent_hex}"
     );
 
-    let err = run_scan_with_config(&shallow_repo, None, base_config())
-        .expect_err("current shallow-boundary behavior should fail with CommitNotFound");
-    match err {
-        GitScanError::ArtifactAcquire(ArtifactAcquireError::CommitLoad(
-            CommitLoadError::CommitNotFound { oid },
-        )) => {
-            assert_eq!(
-                oid, missing_parent,
-                "error should report the missing shallow-boundary parent"
-            );
-        }
-        other => panic!("expected shallow-boundary CommitNotFound, got {other:?}"),
-    }
+    let GitScanResult(report) = run_scan_with_config(&shallow_repo, None, base_config())
+        .expect("shallow-boundary missing parent should not fail artifact acquisition");
+    assert_eq!(report.finalize.outcome, FinalizeOutcome::Complete);
+    assert!(report.skipped_candidates.is_empty());
 }
 
 // ============================================================================

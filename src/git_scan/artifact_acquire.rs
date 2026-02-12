@@ -27,7 +27,8 @@ use super::bytes::BytesView;
 use super::commit_graph_mem::CommitGraphMem;
 use super::commit_loader::{
     collect_loose_dirs, collect_pack_dirs, load_commits_from_tips_with_loose_dirs,
-    load_commits_with_identities, resolve_pack_paths_from_midx, CommitLoadError, CommitLoadLimits,
+    load_commits_with_identities, load_shallow_boundary_roots, resolve_pack_paths_from_midx,
+    CommitLoadError, CommitLoadLimits,
 };
 use super::errors::{CommitPlanError, RepoOpenError};
 use super::identity_intern::IdentityInterner;
@@ -229,11 +230,13 @@ pub fn acquire_commit_graph(
     }
 
     let loose_dirs = collect_loose_dirs(&repo.paths);
+    let shallow_boundary_roots = load_shallow_boundary_roots(&repo.paths, repo.object_format)?;
     let commits = load_commits_from_tips_with_loose_dirs(
         &tips,
         midx,
         pack_paths,
         &loose_dirs,
+        &shallow_boundary_roots,
         repo.object_format,
         &limits.commit_load,
         None, // No progress callback for now
@@ -272,6 +275,7 @@ pub fn acquire_commit_graph_with_identities(
     }
 
     let loose_dirs = collect_loose_dirs(&repo.paths);
+    let shallow_boundary_roots = load_shallow_boundary_roots(&repo.paths, repo.object_format)?;
     let mut interner = IdentityInterner::with_capacity(4 * 1024 * 1024, 16_384);
 
     let (commits, identity_ids) = load_commits_with_identities(
@@ -279,6 +283,7 @@ pub fn acquire_commit_graph_with_identities(
         midx,
         pack_paths,
         &loose_dirs,
+        &shallow_boundary_roots,
         repo.object_format,
         &limits.commit_load,
         &mut interner,

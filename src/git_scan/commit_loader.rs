@@ -11,6 +11,7 @@
 //! 4. Decode commit object (pack mmap + inflate or loose inflate)
 //! 5. Parse commit, collect parents
 //! 6. Add parents to frontier only if neither visited nor already queued
+//!    (except commits listed in `shallow`, which are treated as traversal roots)
 //! 7. Repeat until frontier empty or limits exceeded
 //!
 //! # Limits
@@ -39,7 +40,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, BufRead, BufReader};
 use std::path::PathBuf;
 
 use memmap2::Mmap;
@@ -274,11 +275,13 @@ pub fn load_commits_from_tips(
     progress: Option<&ProgressFn>,
 ) -> Result<Vec<LoadedCommit>, CommitLoadError> {
     let loose_dirs = derive_loose_dirs_from_pack_paths(pack_paths);
+    let shallow_boundary_roots = HashSet::new();
     load_commits_from_tips_with_loose_dirs(
         tips,
         midx,
         pack_paths,
         &loose_dirs,
+        &shallow_boundary_roots,
         format,
         limits,
         progress,
@@ -288,17 +291,28 @@ pub fn load_commits_from_tips(
 /// Loads commits starting from tip OIDs using BFS with explicit loose lookup dirs.
 ///
 /// The loader first resolves commits from MIDX-backed packs. If an OID is
-/// absent from MIDX, it attempts the same OID in `loose_dirs`.
+/// absent from MIDX, it attempts the same OID in `loose_dirs`. Commits listed
+/// in `.git/shallow` are treated as traversal roots: their parent links are
+/// retained in the loaded commit but not enqueued for loading.
+#[allow(clippy::too_many_arguments)]
 pub fn load_commits_from_tips_with_loose_dirs(
     tips: &[OidBytes],
     midx: &MidxView<'_>,
     pack_paths: &[PathBuf],
     loose_dirs: &[PathBuf],
+    shallow_boundary_roots: &HashSet<OidBytes>,
     format: ObjectFormat,
     limits: &CommitLoadLimits,
     progress: Option<&ProgressFn>,
 ) -> Result<Vec<LoadedCommit>, CommitLoadError> {
-    let mut loader = CommitLoader::new(midx, pack_paths, loose_dirs, format, limits)?;
+    let mut loader = CommitLoader::new(
+        midx,
+        pack_paths,
+        loose_dirs,
+        shallow_boundary_roots,
+        format,
+        limits,
+    )?;
     loader.load_from_tips(tips, progress)
 }
 
@@ -318,12 +332,20 @@ pub fn load_commits_with_identities(
     midx: &MidxView<'_>,
     pack_paths: &[PathBuf],
     loose_dirs: &[PathBuf],
+    shallow_boundary_roots: &HashSet<OidBytes>,
     format: ObjectFormat,
     limits: &CommitLoadLimits,
     interner: &mut IdentityInterner,
     progress: Option<&ProgressFn>,
 ) -> Result<(Vec<LoadedCommit>, Vec<CommitIdentityIds>), CommitLoadError> {
-    let mut loader = CommitLoader::new(midx, pack_paths, loose_dirs, format, limits)?;
+    let mut loader = CommitLoader::new(
+        midx,
+        pack_paths,
+        loose_dirs,
+        shallow_boundary_roots,
+        format,
+        limits,
+    )?;
     loader.load_from_tips_with_identities(tips, interner, progress)
 }
 
@@ -371,6 +393,60 @@ pub fn collect_loose_dirs(repo: &GitRepoPaths) -> Vec<PathBuf> {
     }
 
     dirs
+}
+
+/// Loads shallow-boundary commit OIDs from `shallow` files.
+///
+/// Git stores shallow-cut commits in `<gitdir>/shallow` (and, for linked
+/// worktrees, potentially `<commondir>/shallow`). These commits are real local
+/// objects whose parent links may reference non-local history. The commit
+/// loader uses this set to stop BFS traversal at those boundaries.
+///
+/// Missing `shallow` files are treated as an empty set.
+///
+/// # Errors
+/// Returns `CommitLoadError::Io(InvalidData)` when a `shallow` entry is not a
+/// valid full-length OID for the repository object format.
+pub fn load_shallow_boundary_roots(
+    repo: &GitRepoPaths,
+    format: ObjectFormat,
+) -> Result<HashSet<OidBytes>, CommitLoadError> {
+    let mut shallow_files = Vec::with_capacity(2);
+    shallow_files.push(repo.git_dir.join("shallow"));
+    if repo.common_dir != repo.git_dir {
+        shallow_files.push(repo.common_dir.join("shallow"));
+    }
+
+    let mut out = HashSet::new();
+    for shallow_path in shallow_files {
+        let file = match File::open(&shallow_path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(CommitLoadError::Io(err)),
+        };
+
+        let reader = BufReader::new(file);
+        for (line_idx, line_result) in reader.lines().enumerate() {
+            let line = line_result.map_err(CommitLoadError::Io)?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Some(oid) = parse_hex_oid_for_format(trimmed.as_bytes(), format) else {
+                return Err(CommitLoadError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid shallow OID in {} at line {}",
+                        shallow_path.display(),
+                        line_idx + 1
+                    ),
+                )));
+            };
+            out.insert(oid);
+        }
+    }
+
+    Ok(out)
 }
 
 /// Finds a pack file by name across pack directories.
@@ -434,13 +510,15 @@ fn derive_loose_dirs_from_pack_paths(pack_paths: &[PathBuf]) -> Vec<PathBuf> {
 /// Delta resolution is recursive (bounded by `max_delta_depth`); each
 /// recursive call releases the pack borrow before recursing so the mmap
 /// cache can be extended if the base lives in a different pack.
-struct CommitLoader<'m, 'p, 'l> {
+struct CommitLoader<'m, 'p, 'l, 's> {
     /// MIDX used for OID → (pack_id, offset) resolution.
     midx: &'m MidxView<'m>,
     /// Pack paths aligned to MIDX pack ids.
     pack_paths: &'p [PathBuf],
     /// Loose object directories (primary objects dir + alternates).
     loose_dirs: &'l [PathBuf],
+    /// Commit OIDs at shallow boundaries (`.git/shallow`).
+    shallow_boundary_roots: &'s HashSet<OidBytes>,
     format: ObjectFormat,
     limits: CommitLoadLimits,
     parse_limits: CommitParseLimits,
@@ -450,11 +528,12 @@ struct CommitLoader<'m, 'p, 'l> {
     pack_parse_cache: Vec<Option<PackHeader>>,
 }
 
-impl<'m, 'p, 'l> CommitLoader<'m, 'p, 'l> {
+impl<'m, 'p, 'l, 's> CommitLoader<'m, 'p, 'l, 's> {
     fn new(
         midx: &'m MidxView<'m>,
         pack_paths: &'p [PathBuf],
         loose_dirs: &'l [PathBuf],
+        shallow_boundary_roots: &'s HashSet<OidBytes>,
         format: ObjectFormat,
         limits: &CommitLoadLimits,
     ) -> Result<Self, CommitLoadError> {
@@ -471,6 +550,7 @@ impl<'m, 'p, 'l> CommitLoader<'m, 'p, 'l> {
             midx,
             pack_paths,
             loose_dirs,
+            shallow_boundary_roots,
             format,
             limits: *limits,
             parse_limits,
@@ -511,9 +591,12 @@ impl<'m, 'p, 'l> CommitLoader<'m, 'p, 'l> {
 
             let commit = self.load_commit(&oid)?;
 
-            // Add unseen parents to frontier.
-            for parent in &commit.parents {
-                let _ = enqueue_frontier_oid(*parent, &visited, &mut queued, &mut frontier);
+            // Shallow-boundary commits intentionally reference unavailable
+            // ancestors. Keep parent links for graph semantics, but stop BFS.
+            if !self.shallow_boundary_roots.contains(&oid) {
+                for parent in &commit.parents {
+                    let _ = enqueue_frontier_oid(*parent, &visited, &mut queued, &mut frontier);
+                }
             }
 
             commits.push(commit);
@@ -562,8 +645,10 @@ impl<'m, 'p, 'l> CommitLoader<'m, 'p, 'l> {
 
             let (commit, ids) = self.load_commit_with_identity(&oid, interner)?;
 
-            for parent in &commit.parents {
-                let _ = enqueue_frontier_oid(*parent, &visited, &mut queued, &mut frontier);
+            if !self.shallow_boundary_roots.contains(&oid) {
+                for parent in &commit.parents {
+                    let _ = enqueue_frontier_oid(*parent, &visited, &mut queued, &mut frontier);
+                }
             }
 
             commits.push(commit);
@@ -933,6 +1018,39 @@ fn parse_decimal(bytes: &[u8]) -> Option<u64> {
         out = out.checked_mul(10)?.checked_add((b - b'0') as u64)?;
     }
     Some(out)
+}
+
+fn parse_hex_oid_for_format(hex: &[u8], format: ObjectFormat) -> Option<OidBytes> {
+    let expected_hex_len = format.hex_len() as usize;
+    if hex.len() != expected_hex_len {
+        return None;
+    }
+
+    let mut out = [0u8; 32];
+    for (idx, pair) in hex.chunks_exact(2).enumerate() {
+        let hi = hex_nibble(pair[0])?;
+        let lo = hex_nibble(pair[1])?;
+        out[idx] = (hi << 4) | lo;
+    }
+
+    match format {
+        ObjectFormat::Sha1 => {
+            let mut sha1 = [0u8; 20];
+            sha1.copy_from_slice(&out[..20]);
+            Some(OidBytes::sha1(sha1))
+        }
+        ObjectFormat::Sha256 => Some(OidBytes::sha256(out)),
+    }
+}
+
+#[inline(always)]
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Extracts and interns author/committer identity from raw commit bytes.
@@ -1365,9 +1483,16 @@ mod tests {
 
         let pack_paths = vec![pack_path];
         let loose_dirs = Vec::new();
-        let mut loader =
-            CommitLoader::new(&midx, &pack_paths, &loose_dirs, ObjectFormat::Sha1, &limits)
-                .unwrap();
+        let shallow_boundary_roots = HashSet::new();
+        let mut loader = CommitLoader::new(
+            &midx,
+            &pack_paths,
+            &loose_dirs,
+            &shallow_boundary_roots,
+            ObjectFormat::Sha1,
+            &limits,
+        )
+        .unwrap();
 
         let loaded = loader
             .load_object_with_depth(0, delta_offset, limits.max_delta_depth)

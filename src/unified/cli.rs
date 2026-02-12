@@ -303,6 +303,10 @@ fn parse_fs_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<S
 /// Parse git-specific flags from the remaining argument iterator.
 /// Accepts `--repo=<path>` or a bare positional path. Exits with code 2
 /// on unrecognised flags or missing `--repo`.
+///
+/// Public `--workers=<N>` is normalised to the git runner's
+/// `pack_exec_workers` setting so caller-facing concurrency controls stay
+/// aligned with `scan fs`.
 fn parse_git_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<ScanConfig> {
     let mut repo: Option<PathBuf> = None;
     let mut repo_id: u64 = 1;
@@ -347,6 +351,17 @@ fn parse_git_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<
         if let Some(flag) = arg.to_str() {
             if let Some(rest) = flag.strip_prefix("--repo=") {
                 repo = Some(PathBuf::from(rest));
+                continue;
+            }
+            if let Some(rest) = flag.strip_prefix("--workers=") {
+                // Keep source-agnostic worker semantics in the public CLI while
+                // preserving the internal git runner field name.
+                let n: usize = parse_or_exit(rest, "--workers");
+                if n == 0 {
+                    eprintln!("--workers must be >= 1");
+                    std::process::exit(2);
+                }
+                pack_exec_workers = Some(n);
                 continue;
             }
             if let Some(rest) = flag.strip_prefix("--anchors=") {
@@ -694,6 +709,7 @@ fn print_git_usage() {
 OPTIONS:
     --repo=<path>             Repository path (also accepted as positional arg)
     --rules=<path>            YAML rules file (default: default_rules.yaml next to binary)
+    --workers=<N>             Worker threads (default: auto)
     --decode-depth=<N>        Max decode depth (default: 2)
     --transforms=all|none|<list>  Transforms to enable (default: all)
                               Comma-separated: base64, url (case-insensitive)
@@ -1256,6 +1272,12 @@ mod tests {
     fn git_hidden_mode_odb_blob_parsed() {
         let cfg = git_config(&["--repo=/r", "--x-mode=odb-blob"]);
         assert_eq!(cfg.scan_mode, GitScanMode::OdbBlobFast);
+    }
+
+    #[test]
+    fn git_workers_flag_parsed() {
+        let cfg = git_config(&["--repo=/r", "--workers=4"]);
+        assert_eq!(cfg.pack_exec_workers, Some(4));
     }
 
     #[test]
