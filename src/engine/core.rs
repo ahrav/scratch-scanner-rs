@@ -1336,13 +1336,26 @@ impl Engine {
         //   • `total_decode_output_bytes` vs `max_total_decode_output_bytes`
         //   • `work_items_enqueued` vs `max_work_items` (inside ScanBuf arm)
         //   • `depth` vs `max_transform_depth` (inside ScanBuf arm)
+        //
+        // Tuning values are hoisted into locals before the loop. Although
+        // `self` is `&Engine` (immutable), LLVM cannot prove that `&mut
+        // ScanScratch` does not alias `self.tuning` fields, so it must
+        // conservatively reload them on every iteration. Locals let the
+        // register allocator keep these values in registers.
+        let max_decode_bytes = self.tuning.max_total_decode_output_bytes;
+        let max_work = self.tuning.max_work_items;
+        let max_depth = self.tuning.max_transform_depth;
         while scratch.work_head < scratch.work_q.len() {
-            if scratch.total_decode_output_bytes >= self.tuning.max_total_decode_output_bytes {
+            if scratch.total_decode_output_bytes >= max_decode_bytes {
                 break;
             }
 
-            // Dequeue via `take` + cursor advance (avoids shifting the Vec).
-            let item = std::mem::take(&mut scratch.work_q[scratch.work_head]);
+            // Dequeue via copy + cursor advance (avoids shifting the Vec).
+            // WorkItem is Copy (40 bytes of plain integers), so this reads
+            // the slot without writing a default back — saving a 40-byte
+            // store per iteration. The slot is never re-read because
+            // work_head advances monotonically.
+            let item = scratch.work_q[scratch.work_head];
             scratch.work_head += 1;
 
             if !item.is_decode_span() {
@@ -1439,23 +1452,20 @@ impl Engine {
                 scratch.root_span_map_ctx = None;
                 let found_any_in_this_buf = scratch.out.len() > before;
 
-                if depth >= self.tuning.max_transform_depth {
+                if depth >= max_depth {
                     continue;
                 }
-                if scratch.work_items_enqueued >= self.tuning.max_work_items {
+                if scratch.work_items_enqueued >= max_work {
                     continue;
                 }
                 // Decode bytes are only produced in the DecodeSpan arm, so this
                 // budget is invariant while processing a ScanBuf item.
-                if scratch.total_decode_output_bytes >= self.tuning.max_total_decode_output_bytes {
+                if scratch.total_decode_output_bytes >= max_decode_bytes {
                     continue;
                 }
                 // Keep a local decrementing budget to avoid repeated loads of
-                // `work_items_enqueued` and `max_work_items` in span inner loops.
-                let mut remaining_work_items = self
-                    .tuning
-                    .max_work_items
-                    .saturating_sub(scratch.work_items_enqueued);
+                // `work_items_enqueued` and `max_work` in span inner loops.
+                let mut remaining_work_items = max_work.saturating_sub(scratch.work_items_enqueued);
                 if remaining_work_items == 0 {
                     continue;
                 }
@@ -1707,7 +1717,7 @@ impl Engine {
                 #[cfg(feature = "git-perf")]
                 let _transform_start = std::time::Instant::now();
 
-                if scratch.total_decode_output_bytes >= self.tuning.max_total_decode_output_bytes {
+                if scratch.total_decode_output_bytes >= max_decode_bytes {
                     continue;
                 }
                 let tc = &self.transforms[transform_idx];

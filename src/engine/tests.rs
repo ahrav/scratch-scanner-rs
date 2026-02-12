@@ -6046,6 +6046,31 @@ fn offline_validation_does_not_suppress_non_root_findings() {
     );
 }
 
+#[test]
+#[ignore = "Known bug: root UTF-16 findings bypass offline validation"]
+fn offline_validation_suppresses_invalid_utf16_root_finding() {
+    // Root UTF-16 findings currently carry a Utf16Window step id, so they are
+    // treated as non-root in post_scan_filter and skip offline validation.
+    let rule = offline_crc_rule();
+    let mut tuning = demo_tuning();
+    tuning.scan_utf16_variants = true;
+    let engine =
+        Engine::new_with_anchor_policy(vec![rule], Vec::new(), tuning, AnchorPolicy::ManualOnly);
+
+    let invalid_tok = build_invalid_crc_token();
+    let hay = utf16le_bytes(&invalid_tok);
+
+    let mut scratch = engine.new_scratch();
+    engine.scan_chunk_into(&hay, FileId(0), 0, &mut scratch);
+
+    let recs = scratch.findings();
+    assert_eq!(
+        recs.len(),
+        0,
+        "invalid token should be suppressed for UTF-16 root input, same as ASCII root input"
+    );
+}
+
 /// Minimal base64 encoder for test helpers.
 fn base64_encode_bytes(input: &[u8]) -> Vec<u8> {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

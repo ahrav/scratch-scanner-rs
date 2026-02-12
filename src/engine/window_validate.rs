@@ -140,10 +140,8 @@ fn for_each_capture_match(
 fn has_assignment_value_shape(window: &[u8]) -> bool {
     // Find any assignment separator. We check for `=`, `:`, and `>` (for `=>`).
     // The position we find may be part of `=>`, but that's fine for our purpose.
-    let sep_pos = match window
-        .iter()
-        .position(|&b| b == b'=' || b == b':' || b == b'>')
-    {
+    // Uses vectorized memchr3 (SIMD on x86/ARM) instead of byte-at-a-time scan.
+    let sep_pos = match memchr::memchr3(b'=', b':', b'>', window) {
         Some(pos) => pos,
         None => return false,
     };
