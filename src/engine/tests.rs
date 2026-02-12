@@ -30,8 +30,8 @@ use super::vectorscan_prefilter::{
 use crate::api::Tuning;
 use crate::api::{
     AnchorPolicy, DecodeStep, EntropySpec, FileId, Finding, FindingRec, Gate, LocalContextSpec,
-    RuleSpec, TransformConfig, TransformId, TransformMode, Utf16Endianness, ValidatorKind,
-    STEP_ROOT,
+    OfflineValidationSpec, RuleSpec, TransformConfig, TransformId, TransformMode, Utf16Endianness,
+    ValidatorKind, STEP_ROOT,
 };
 use crate::demo::{demo_engine, demo_rules, demo_tuning};
 use crate::regex2anchor::{compile_trigger_plan, AnchorDeriveConfig, TriggerPlan};
@@ -2237,6 +2237,59 @@ fn entropy_gate_filters_low_entropy_matches() {
     let high = b"TOK_A1b2C3d4";
     let hits = scan_chunk_findings(&eng, high);
     assert!(hits.iter().any(|h| h.rule == "entropy-gate"));
+}
+
+#[test]
+fn offline_validation_gate_pooled_round_trip() {
+    const ANCHORS: &[&[u8]] = &[b"TOK_"];
+    let rule_with = RuleSpec {
+        name: "with-ov",
+        anchors: ANCHORS,
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        local_context: None,
+        secret_group: None,
+        offline_validation: Some(OfflineValidationSpec::GithubFinegrainedPat),
+        re: Regex::new(r"TOK_[A-Z0-9]{4}").unwrap(),
+    };
+    let rule_without = RuleSpec {
+        name: "without-ov",
+        anchors: ANCHORS,
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        local_context: None,
+        secret_group: None,
+        offline_validation: None,
+        re: Regex::new(r"TOK_[A-Z0-9]{4}").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule_with, rule_without],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Rule 0 should have offline_validation index 0.
+    assert_eq!(engine.rules_hot[0].offline_validation, Some(0));
+    assert_eq!(
+        engine.offline_validation_gate(Some(0)),
+        Some(OfflineValidationSpec::GithubFinegrainedPat),
+    );
+
+    // Rule 1 should have no offline_validation gate.
+    assert_eq!(engine.rules_hot[1].offline_validation, None);
+    assert_eq!(engine.offline_validation_gate(None), None);
 }
 
 // --------------------------

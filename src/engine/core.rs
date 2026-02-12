@@ -238,6 +238,8 @@ pub struct Engine {
     pub(super) entropy_gates: Vec<EntropyCompiled>,
     pub(super) two_phase_gates: Vec<TwoPhaseCompiled>,
     pub(super) local_context_gates: Vec<crate::api::LocalContextSpec>,
+    /// Offline structural validation specs (e.g. CRC-32, format checks).
+    pub(super) offline_validation_gates: Vec<crate::api::OfflineValidationSpec>,
     /// Global context safelist evaluated at finding emission time.
     pub(super) safelist: SafelistFilter,
 
@@ -392,6 +394,7 @@ impl Engine {
         let mut entropy_gates: Vec<EntropyCompiled> = Vec::new();
         let mut two_phase_gates: Vec<TwoPhaseCompiled> = Vec::new();
         let mut local_context_gates: Vec<crate::api::LocalContextSpec> = Vec::new();
+        let mut offline_validation_gates: Vec<crate::api::OfflineValidationSpec> = Vec::new();
 
         let mut rules_compiled: Vec<RuleCompiled> = Vec::with_capacity(rules.len());
         let mut rules_cold: Vec<RuleCold> = Vec::with_capacity(rules.len());
@@ -421,6 +424,11 @@ impl Engine {
                 debug_assert!(local_context_gates.len() <= u32::MAX as usize);
                 rule.local_context = Some(local_context_gates.len() as u32);
                 local_context_gates.push(ctx);
+            }
+            if let Some(ov) = gates.offline_validation {
+                debug_assert!(offline_validation_gates.len() <= u32::MAX as usize);
+                rule.offline_validation = Some(offline_validation_gates.len() as u32);
+                offline_validation_gates.push(ov);
             }
             rules_compiled.push(rule);
             rules_cold.push(RuleCold { name: spec.name });
@@ -928,6 +936,7 @@ impl Engine {
             entropy_gates,
             two_phase_gates,
             local_context_gates,
+            offline_validation_gates,
             safelist: SafelistFilter::new(),
             entropy_log2,
             vs,
@@ -1006,6 +1015,14 @@ impl Engine {
         idx: Option<u32>,
     ) -> Option<crate::api::LocalContextSpec> {
         idx.map(|i| self.local_context_gates[i as usize])
+    }
+
+    #[inline(always)]
+    pub(super) fn offline_validation_gate(
+        &self,
+        idx: Option<u32>,
+    ) -> Option<crate::api::OfflineValidationSpec> {
+        idx.map(|i| self.offline_validation_gates[i as usize])
     }
 
     /// Returns whether a root finding should be suppressed by the global safelist.
