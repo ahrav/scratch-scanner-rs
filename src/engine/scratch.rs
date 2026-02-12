@@ -384,8 +384,10 @@ pub struct ScanScratch {
     /// Number of findings that could not be emitted because the cap was reached.
     pub(super) findings_dropped: usize,
     /// Findings removed by the global context safelist at emission time.
+    /// Incremented only when `perf-stats` is enabled; accessor returns 0 otherwise.
     pub(super) safelist_suppressed: usize,
     /// Findings removed by post-scan offline structural validation.
+    /// Incremented only when `perf-stats` is enabled; accessor returns 0 otherwise.
     pub(super) offline_suppressed: usize,
     /// Work queue for breadth-first buffer traversal.
     ///
@@ -1417,13 +1419,33 @@ impl ScanScratch {
     }
 
     /// Returns the number of findings removed by emit-time safelist checks.
+    ///
+    /// Always returns 0 when the `perf-stats` feature is disabled.
     pub fn safelist_suppressed(&self) -> usize {
-        self.safelist_suppressed
+        #[cfg(all(feature = "perf-stats", debug_assertions))]
+        {
+            self.safelist_suppressed
+        }
+        #[cfg(not(all(feature = "perf-stats", debug_assertions)))]
+        {
+            let _ = &self.safelist_suppressed;
+            0
+        }
     }
 
     /// Returns the number of root findings removed by offline validation.
+    ///
+    /// Always returns 0 when the `perf-stats` feature is disabled.
     pub fn offline_suppressed(&self) -> usize {
-        self.offline_suppressed
+        #[cfg(all(feature = "perf-stats", debug_assertions))]
+        {
+            self.offline_suppressed
+        }
+        #[cfg(not(all(feature = "perf-stats", debug_assertions)))]
+        {
+            let _ = &self.offline_suppressed;
+            0
+        }
     }
 
     /// Records a finding using `root_hint_end` as the default drop boundary.

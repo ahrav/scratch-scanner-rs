@@ -461,8 +461,10 @@ impl Engine {
                                 root_hint_end,
                                 &mut last_safelist_decision,
                             ) {
-                                scratch.safelist_suppressed =
-                                    scratch.safelist_suppressed.saturating_add(1);
+                                crate::perf_stats::sat_add_usize(
+                                    &mut scratch.safelist_suppressed,
+                                    1,
+                                );
                                 return;
                             }
                             let mut drop_hint_end = root_span_hint.end;
@@ -739,7 +741,7 @@ impl Engine {
                         root_hint_end,
                         &mut last_safelist_decision,
                     ) {
-                        scratch.safelist_suppressed = scratch.safelist_suppressed.saturating_add(1);
+                        crate::perf_stats::sat_add_usize(&mut scratch.safelist_suppressed, 1);
                         return;
                     }
 
@@ -906,7 +908,7 @@ impl Engine {
                         root_hint_end,
                         &mut last_safelist_decision,
                     ) {
-                        scratch.safelist_suppressed = scratch.safelist_suppressed.saturating_add(1);
+                        crate::perf_stats::sat_add_usize(&mut scratch.safelist_suppressed, 1);
                         return;
                     }
 
@@ -1141,7 +1143,7 @@ impl Engine {
                         root_hint_end,
                         &mut last_safelist_decision,
                     ) {
-                        scratch.safelist_suppressed = scratch.safelist_suppressed.saturating_add(1);
+                        crate::perf_stats::sat_add_usize(&mut scratch.safelist_suppressed, 1);
                         return;
                     }
 

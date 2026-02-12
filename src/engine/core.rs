@@ -20,27 +20,27 @@
 //!
 //! ### Build phase (`new` / `new_with_anchor_policy`)
 //!
-//! 1. Compile each [`RuleSpec`](crate::api::RuleSpec) into a [`RuleCompiled`]
-//!    with precompiled regexes and optional gates.
-//! 2. Derive anchor patterns from regex analysis (or use manual anchors per
-//!    policy). Build deduped pattern maps for raw + UTF-16 variants.
-//! 3. Construct Vectorscan prefilter DBs (raw, UTF-16, stream, gate) and
-//!    the Base64 YARA pre-gate.
+//! Compile each [`RuleSpec`](crate::api::RuleSpec) into a [`RuleCompiled`]
+//! with precompiled regexes and optional gates.
+//! Derive anchor patterns from regex analysis (or use manual anchors per
+//! policy). Build deduped pattern maps for raw + UTF-16 variants.
+//! Construct Vectorscan prefilter DBs (raw, UTF-16, stream, gate) and
+//! the Base64 YARA pre-gate.
 //!
 //! ### Scan phase (`scan_chunk_into`)
 //!
-//! 1. Run Vectorscan prefilter on root buffer to populate touched pairs.
-//! 2. Enqueue `ScanBuf(root)` into the work queue.
-//! 3. Process work items in FIFO order:
-//!    - `ScanBuf`: validate regexes in prefilter windows (see
-//!      [`buffer_scan`](super::buffer_scan)), then discover transform spans
-//!      and enqueue `DecodeSpan` items.
-//!    - `DecodeSpan`: decode the span, then enqueue a `ScanBuf` for the
-//!      decoded output.
-//! 4. Budgets (decode bytes, work items, depth) are enforced per-item so no
-//!    single input forces unbounded work.
-//! 5. Apply suppression/cap policies at finding emission time so no post-scan
-//!    compaction pass is required.
+//! Run Vectorscan prefilter on root buffer to populate touched pairs.
+//! Enqueue `ScanBuf(root)` into the work queue.
+//! Process work items in FIFO order:
+//!   - `ScanBuf`: validate regexes in prefilter windows (see
+//!     [`buffer_scan`](super::buffer_scan)), then discover transform spans
+//!     and enqueue `DecodeSpan` items.
+//!   - `DecodeSpan`: decode the span, then enqueue a `ScanBuf` for the
+//!     decoded output.
+//! Budgets (decode bytes, work items, depth) are enforced per-item so no
+//! single input forces unbounded work.
+//! Apply suppression/cap policies at finding emission time so no post-scan
+//! compaction pass is required.
 //!
 //! ## Design choices
 //!
@@ -716,13 +716,13 @@ impl Engine {
         //                     to avoid false negatives.
         //
         // A rule can safely omit its raw regex from the prefilter when ALL of:
-        //   1. It has at least one anchor pattern (otherwise nothing triggers).
-        //   2. Every anchor is >= 5 bytes. Below this, Vectorscan's Aho-Corasick
-        //      automaton produces high false-positive rates, and short byte-exact
-        //      anchors risk case-sensitivity mismatches with the regex.
-        //   3. The regex is NOT case-insensitive. Byte-exact anchors cannot
-        //      match the alternate casings that `(?i)` would accept, so relying
-        //      on anchors alone would cause false negatives.
+        //   - It has at least one anchor pattern (otherwise nothing triggers).
+        //   - Every anchor is >= 5 bytes. Below this, Vectorscan's Aho-Corasick
+        //     automaton produces high false-positive rates, and short byte-exact
+        //     anchors risk case-sensitivity mismatches with the regex.
+        //   - The regex is NOT case-insensitive. Byte-exact anchors cannot
+        //     match the alternate casings that `(?i)` would accept, so relying
+        //     on anchors alone would cause false negatives.
         //
         // Rules that fail any check keep their regex in the prefilter DB.
         // The 5-byte threshold is empirically chosen; it may need revisiting if
@@ -731,16 +731,16 @@ impl Engine {
             .iter()
             .map(|r| {
                 // Rule needs raw prefilter if:
-                // 1. No anchors at all
+                // No anchors at all
                 if r.anchors.is_empty() {
                     return true;
                 }
-                // 2. Regex is case-insensitive (anchors are byte-exact, won't match)
+                // Regex is case-insensitive (anchors are byte-exact, won't match)
                 let re_str = r.re.as_str();
                 if re_str.starts_with("(?i)") || re_str.contains("(?i:") {
                     return true;
                 }
-                // 3. Any anchor is shorter than 5 bytes (weak anchor)
+                // Any anchor is shorter than 5 bytes (weak anchor)
                 !r.anchors.iter().all(|a| a.len() >= 5)
             })
             .collect();
@@ -1207,14 +1207,14 @@ impl Engine {
     /// - `scratch` is exclusively owned for the duration of the call.
     ///
     /// # High-level flow
-    /// 1. Run Vectorscan prefilter on the root buffer.
-    /// 2. On zero hits: check if transform discovery is needed; if not, return
-    ///    immediately. This is the common fast path.
-    /// 3. On hits: reset per-scan state, enqueue root `ScanBuf`.
-    /// 4. Process the work queue in FIFO order (BFS over decode layers):
-    ///    - `ScanBuf`: validate regexes in windows, discover transform spans,
-    ///      enqueue `DecodeSpan` items.
-    ///    - `DecodeSpan`: decode the span, enqueue a `ScanBuf` for output.
+    /// Run Vectorscan prefilter on the root buffer.
+    /// On zero hits: check if transform discovery is needed; if not, return
+    /// immediately. This is the common fast path.
+    /// On hits: reset per-scan state, enqueue root `ScanBuf`.
+    /// Process the work queue in FIFO order (BFS over decode layers):
+    ///   - `ScanBuf`: validate regexes in windows, discover transform spans,
+    ///     enqueue `DecodeSpan` items.
+    ///   - `DecodeSpan`: decode the span, enqueue a `ScanBuf` for output.
     ///
     /// Budget gates (decode bytes, work items, depth) are enforced per iteration
     /// so no single input can force unbounded work.
@@ -1372,12 +1372,12 @@ impl Engine {
                 // holding a borrow on `scratch.slab` while we pass `scratch` mutably
                 // into `scan_rules_on_buffer`. This is sound because:
                 //
-                //   1. The slab is pre-allocated and never reallocated during a scan,
-                //      so the pointer remains valid.
-                //   2. `scan_rules_on_buffer` writes only to scratch output buffers
-                //      (findings, hit accumulators), never to the slab region backing
-                //      `cur_buf`. No aliasing violation occurs.
-                //   3. `root_buf` is caller-owned and immutable for the scan duration.
+                //   - The slab is pre-allocated and never reallocated during a scan,
+                //     so the pointer remains valid.
+                //   - `scan_rules_on_buffer` writes only to scratch output buffers
+                //     (findings, hit accumulators), never to the slab region backing
+                //     `cur_buf`. No aliasing violation occurs.
+                //   - `root_buf` is caller-owned and immutable for the scan duration.
                 let (buf_ptr, buf_len, buf_offset) = if let Some(slab_range) = item.buf_slab_range()
                 {
                     let start = slab_range.start as usize;
@@ -1866,7 +1866,7 @@ impl Engine {
             !matches!(verdict, crate::api::OfflineVerdict::Invalid)
         });
 
-        scratch.offline_suppressed = scratch.offline_suppressed.saturating_add(removed);
+        crate::perf_stats::sat_add_usize(&mut scratch.offline_suppressed, removed);
     }
 
     /// Scans a buffer and returns a shared view of finding records.

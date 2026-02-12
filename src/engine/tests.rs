@@ -1113,6 +1113,7 @@ fn safelist_emit_time_filter_suppresses_root_finding() {
     assert_eq!(rec.step_id, STEP_ROOT, "remaining finding should be root");
     let span = rec.span_start as usize..rec.span_end as usize;
     assert_eq!(&hay[span], b"prod_token_A1B2C3");
+    #[cfg(feature = "perf-stats")]
     assert_eq!(
         scratch.safelist_suppressed(),
         1,
@@ -1219,6 +1220,7 @@ fn safelist_emit_time_filter_does_not_suppress_utf16_root_emission() {
         recs[0].step_id, STEP_ROOT,
         "utf16 finding from root input should have a utf16 decode step id"
     );
+    #[cfg(feature = "perf-stats")]
     assert_eq!(
         scratch.safelist_suppressed(),
         0,
@@ -1315,6 +1317,7 @@ fn max_findings_cap_applies_after_safelist_suppression() {
         ],
         "cap should trim only after placeholder suppression"
     );
+    #[cfg(feature = "perf-stats")]
     assert_eq!(
         scratch.safelist_suppressed(),
         1,
@@ -1375,6 +1378,7 @@ fn safelist_emit_time_filter_noop_keeps_all_non_safelisted_roots() {
     for rec in recs {
         assert_eq!(rec.step_id, STEP_ROOT);
     }
+    #[cfg(feature = "perf-stats")]
     assert_eq!(
         scratch.safelist_suppressed(),
         0,
@@ -1421,6 +1425,7 @@ fn safelist_emit_time_filter_drops_tail_root_finding() {
     assert_eq!(&hay[span], b"prod_token_A1B2C3");
     assert_eq!(recs.len(), scratch.norm_hashes().len());
     assert_eq!(recs.len(), scratch.drop_hint_end().len());
+    #[cfg(feature = "perf-stats")]
     assert_eq!(
         scratch.safelist_suppressed(),
         1,
@@ -1532,12 +1537,14 @@ fn safelist_emit_time_filter_all_findings_suppressed() {
     );
     assert_eq!(recs.len(), scratch.norm_hashes().len());
     assert_eq!(recs.len(), scratch.drop_hint_end().len());
+    #[cfg(feature = "perf-stats")]
     assert!(
         scratch.safelist_suppressed() > 0,
         "safelist_suppressed counter must be non-zero when findings are suppressed"
     );
 }
 
+#[cfg(feature = "perf-stats")]
 #[test]
 fn safelist_suppressed_counter_resets_between_scans() {
     let rule = RuleSpec {
@@ -5721,6 +5728,7 @@ fn offline_validation_suppresses_invalid_root_finding() {
         0,
         "offline validation should suppress root finding with invalid CRC"
     );
+    #[cfg(feature = "perf-stats")]
     assert_eq!(
         scratch.offline_suppressed(),
         1,
@@ -5757,6 +5765,7 @@ fn offline_validation_keeps_valid_root_finding() {
         "offline validation should keep root finding with valid CRC"
     );
     assert_eq!(recs[0].step_id, STEP_ROOT);
+    #[cfg(feature = "perf-stats")]
     assert_eq!(scratch.offline_suppressed(), 0);
     assert_eq!(recs.len(), scratch.norm_hashes().len());
     assert_eq!(recs.len(), scratch.drop_hint_end().len());
@@ -5811,6 +5820,7 @@ fn offline_validation_mixed_valid_invalid_and_no_gate() {
         2,
         "expected 2 findings: valid CRC kept + plain rule kept, invalid CRC suppressed"
     );
+    #[cfg(feature = "perf-stats")]
     assert_eq!(scratch.offline_suppressed(), 1);
     assert_eq!(recs.len(), scratch.norm_hashes().len());
     assert_eq!(recs.len(), scratch.drop_hint_end().len());
