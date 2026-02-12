@@ -19,6 +19,7 @@ classDiagram
         -Option~VsPrefilterDb~ vs
         -Option~Base64YaraGate~ b64_gate
         -SafelistFilter safelist
+        -Vec~OfflineValidationSpec~ offline_validation_gates
         -usize max_window_diameter_bytes
         -usize max_prefilter_width
         +new(rules, transforms, tuning) Engine
@@ -40,6 +41,7 @@ classDiagram
         +Option~&'static [&'static [u8]]~ value_suppressors_any
         +Option~EntropySpec~ entropy
         +Option~LocalContextSpec~ local_context
+        +Option~OfflineValidationSpec~ offline_validation
         +Option~u16~ secret_group
         +Regex re
     }
@@ -55,6 +57,7 @@ classDiagram
         -Option~u32~ entropy
         -Option~u32~ local_context
         -Option~u32~ two_phase
+        -Option~u32~ offline_validation
     }
 
     class RuleCold {
@@ -131,6 +134,7 @@ classDiagram
         -ScratchVec~WorkItem~ work_q
         -usize work_head
         -DecodeSlab slab
+        -usize offline_suppressed
         -FixedSet128 seen_findings_scan
         -HitAccPool hit_acc_pool
         -ScratchVec~u32~ touched_pairs
@@ -184,8 +188,10 @@ classDiagram
     Engine --> Tuning : contains
     Engine --> SafelistFilter : contains
     Engine --> ScanScratch : creates
+    Engine --> OfflineValidationSpec : offline gate pool
 
     RuleSpec --> TwoPhaseSpec : optional
+    RuleSpec --> OfflineValidationSpec : optional
     RuleCompiled --> TwoPhaseCompiled : optional gate index
     TwoPhaseCompiled --> PackedPatterns : uses
 
@@ -298,8 +304,12 @@ classDiagram
 - `Engine.safelist` is applied at finding emission for root emit paths. A
   suppressed finding is never inserted, so `findings`, `norm_hashes`, and
   `drop_hint_end` stay aligned 1:1 without a post-scan compaction pass.
-- Offline validation suppression (when enabled) remains outside
-  `window_validate` gate ordering.
+- Offline validation runs as a post-scan filter after the work-queue loop,
+  outside `window_validate` gate ordering. Each root finding whose rule has
+  an `OfflineValidationSpec` gate is checked against the matched secret bytes.
+  `Valid` and `Indeterminate` verdicts keep the finding; `Invalid` suppresses
+  it. Non-root (transform-derived) findings are always kept. Suppressed
+  findings increment `ScanScratch.offline_suppressed`.
 - `Engine.required_overlap()` is computed as:
   `max_window_diameter_bytes + (max_prefilter_width - 1)`.
 - `StepId` and `FindingRec.step_id` are only valid while the originating
@@ -393,6 +403,22 @@ classDiagram
         <<enumeration>>
         Le
         Be
+    }
+
+    class OfflineValidationSpec {
+        <<enumeration>>
+        Crc32Base62
+        GithubFinegrainedPat
+        GrafanaServiceAccount
+        AwsAccessKey
+        SentryOrgToken
+    }
+
+    class OfflineVerdict {
+        <<enumeration>>
+        Valid
+        Invalid
+        Indeterminate
     }
 ```
 
@@ -564,6 +590,8 @@ See [persistence-identity.md](persistence-identity.md) for contract details and 
 | `Engine` | contains | `RuleCold` | Cold rule metadata (`name`) |
 | `Engine` | contains | `TransformConfig` | Transform configurations |
 | `Engine` | creates | `ScanScratch` | Per-scan scratch state |
+| `Engine` | contains | `OfflineValidationSpec` | Offline validation gate pool |
+| `RuleSpec` | optional | `OfflineValidationSpec` | Per-rule offline validation spec |
 | `ScannerRuntime` | owns | `BufferPool` | Buffer memory pool |
 | `FileTable` | produces | `FileId` | File metadata IDs |
 | `Chunk` | owns | `BufferHandle` | Buffer with RAII release |

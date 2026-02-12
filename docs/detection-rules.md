@@ -20,6 +20,7 @@ The values below are from the current repository snapshot:
 - `local_context` enabled: `1` rule (`generic-api-key`)
 - `value_suppressors_any` enabled: `15` rules (`adafruit-api-key`, `adobe-client-id`, `algolia-api-key`, `atlassian-api-token`, `confluent-access-token`, `confluent-secret-key`, `curl-auth-header`, `curl-auth-user`, `discord-api-token`, `discord-client-secret`, `generic-api-key`, `hashicorp-tf-password`, `heroku-api-key`, `linear-client-secret`, `zendesk-secret-key`)
 - `secret_group` enabled: `2` rules (`microsoft-teams-webhook`, `sonar-api-token`)
+- `offline_validation` enabled: `9` rules (`aws-access-token`, `github-app-token`, `github-fine-grained-pat`, `github-oauth`, `github-pat`, `github-refresh-token`, `grafana-service-account-token`, `npm-access-token`, `sentry-org-token`)
 - `must_contain` enabled: `0` rules
 - `keywords_any` enabled: `223` rules
 
@@ -36,6 +37,7 @@ Suppression is split between rule-level secret filtering and engine-level safeli
 | Control | Config Surface | Match Input | Stage |
 |-----------|---------------------|---------|--------|
 | `value_suppressors_any` | Per-rule YAML (`RuleSpec.value_suppressors_any`) | Extracted secret bytes | Window validation post-match gate |
+| `offline_validation` | Per-rule YAML (`RuleSpec.offline_validation`) | Extracted secret bytes (root findings) | Post-scan batch filter |
 | Global safelist | Engine policy (`SafelistFilter`) | Root-match context slice | Emit-time suppression on root emit paths |
 
 Examples:
