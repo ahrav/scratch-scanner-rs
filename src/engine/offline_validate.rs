@@ -1,5 +1,4 @@
-// Engine wiring (.6) will call `validate` from the post-scan filter path.
-// Until then, all non-bench public items are only exercised by tests.
+// TODO(scratch-n3y.6): Remove once `validate` is called from post_scan_filter.
 #![allow(dead_code)]
 //! Offline structural validation for extracted secrets.
 //!
@@ -9,22 +8,53 @@
 //!
 //! ## Supported token types
 //!
-//! - **CRC-32 + base-62** — generic parameterised validator (used by npm, PyPI, etc.)
-//! - **GitHub fine-grained PAT** — `github_pat_` prefix with CRC-32/base-62 checksum
-//! - **Grafana service-account** — `glsa_` prefix with CRC-32/hex checksum
-//! - **AWS access key ID** — base-32-encoded account ID with range check
-//! - **Sentry org-auth-token** — `sntrys_` prefix with base64 JSON payload check
+//! | Variant                  | Format sketch                         | Validation strategy                    |
+//! |--------------------------|---------------------------------------|----------------------------------------|
+//! | CRC-32 + base-62         | `<prefix><payload><base62(crc32)>`    | Recompute CRC, compare                 |
+//! | GitHub fine-grained PAT  | `github_pat_<76 body><6 base62 CRC>`  | CRC over first 87 bytes                |
+//! | Grafana service-account  | `glsa_<32 alnum>_<8 hex CRC>`         | CRC over `glsa_<32>`                   |
+//! | AWS access key ID        | `(AKIA\|ASIA\|...)[A-Z2-7]{16}`      | Base-32 decode, account-ID range check |
+//! | Sentry org-auth-token    | `sntrys_<b64 payload>_<43 b64 sig>`   | Base64 decode, `{"iat":` prefix check  |
+//!
+//! ## Verdict hierarchy
+//!
+//! Every validator returns one of three outcomes:
+//!
+//! - [`Valid`](OfflineVerdict::Valid) — structural check passed; finding is
+//!   likely real.
+//! - [`Invalid`](OfflineVerdict::Invalid) — token is structurally broken (bad
+//!   CRC, invalid charset after prefix match, etc.); safe to suppress.
+//! - [`Indeterminate`](OfflineVerdict::Indeterminate) — cannot tell (too
+//!   short, wrong prefix, ambiguous); **do not suppress**.
+//!
+//! The asymmetry is intentional: `Invalid` requires positive proof of
+//! structural failure; anything uncertain stays `Indeterminate`.
 //!
 //! ## Design constraints
 //!
-//! - **No allocation in validator logic.** Decode buffers are stack-local
-//!   (`[u8; N]`) so the hot path stays allocation-free.
+//! - **No heap allocation.** Decode buffers are stack-local (`[u8; N]`) so
+//!   the hot path stays allocation-free.
 //! - **Conservative verdicts.** When a token is too short or structurally
-//!   ambiguous, return [`Indeterminate`](OfflineVerdict::Indeterminate)
-//!   rather than [`Invalid`](OfflineVerdict::Invalid) to avoid suppressing
-//!   legitimate findings.
+//!   ambiguous, return `Indeterminate` rather than `Invalid` to avoid
+//!   suppressing legitimate findings.
 //! - **No regex or I/O.** Validators work on the already-extracted `&[u8]`
 //!   slice; they must not compile regexes, open files, or make network calls.
+//!
+//! ## Branchless decode strategy
+//!
+//! All three lookup tables ([`BASE62_LUT`], [`HEX_LUT`], [`BASE64_LUT`])
+//! share a common sentinel convention:
+//!
+//! - Valid values occupy the low bits (0–61 for base-62, 0–15 for hex,
+//!   0–63 for base64) and **never** set bit 7.
+//! - Invalid bytes map to `0xFF` (bit 7 set).
+//! - Base64 padding (`=`) maps to `0xFE` (bit 7 set, bit 0 clear).
+//!
+//! Decode loops exploit this by OR-accumulating lookup results into a
+//! single `invalid` flag and deferring the validity branch until after
+//! the loop. This eliminates per-character branches, giving the CPU a
+//! straight-line `ldrb + orr + madd` (or `lsl + orr`) body that the
+//! out-of-order engine can pipeline without misprediction stalls.
 
 use crate::api::{OfflineValidationSpec, OfflineVerdict};
 
@@ -54,7 +84,10 @@ pub(crate) fn validate(spec: OfflineValidationSpec, secret: &[u8]) -> OfflineVer
 /// Base-62 alphabet: `0-9 A-Z a-z`.
 const BASE62_CHARS: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
-/// Branchless base-62 decode table. `0xFF` marks invalid characters.
+/// Base-62 decode table (256 entries, one per byte value).
+///
+/// Valid entries: `'0'–'9'` → 0–9, `'A'–'Z'` → 10–35, `'a'–'z'` → 36–61.
+/// All other entries are `0xFF` (bit 7 set), the invalid sentinel.
 const BASE62_LUT: [u8; 256] = {
     let mut lut = [0xFFu8; 256];
     let mut i: u16 = 0;
@@ -72,27 +105,35 @@ const BASE62_LUT: [u8; 256] = {
     lut
 };
 
-/// Decode a single base-62 digit, returning `None` for invalid characters.
-#[inline]
-fn base62_digit(b: u8) -> Option<u32> {
-    let v = BASE62_LUT[b as usize];
-    if v == 0xFF {
-        None
-    } else {
-        Some(v as u32)
-    }
-}
-
 /// Decode a base-62 byte string into a `u32`, returning `None` on overflow
 /// or invalid characters.
+///
+/// Uses a `u64` accumulator with deferred validity to eliminate all
+/// per-character branches. The loop body compiles to `ldrb + orr + madd`
+/// (3 instructions, 0 branches per character).
+///
+/// **Correctness argument:**
+/// - Valid LUT values (0–61) never set bit 7; the sentinel `0xFF` does.
+///   OR-accumulating into `invalid` captures any bad byte without
+///   short-circuiting the loop.
+/// - Garbage accumulated from invalid digits is discarded by the final
+///   `invalid` check — the accumulator is never read on the error path.
+/// - `u64` cannot overflow: the widest input we process is 6 chars
+///   (CRC-32 checksums), and `62^6 = 56_800_235_584 < u64::MAX`.
+///   The `u32::try_from` at the end rejects values above `u32::MAX`.
 #[inline]
 fn base62_decode_u32(bytes: &[u8]) -> Option<u32> {
-    let mut acc: u32 = 0;
+    let mut acc: u64 = 0;
+    let mut invalid: u8 = 0;
     for &b in bytes {
-        let digit = base62_digit(b)?;
-        acc = acc.checked_mul(62)?.checked_add(digit)?;
+        let v = BASE62_LUT[b as usize];
+        invalid |= v;
+        acc = acc * 62 + v as u64;
     }
-    Some(acc)
+    if invalid & 0x80 != 0 {
+        return None;
+    }
+    u32::try_from(acc).ok()
 }
 
 /// Encode a `u32` into a fixed-width base-62 string, zero-padded on the left.
@@ -116,6 +157,10 @@ fn base62_encode_u32(mut val: u32, buf: &mut [u8]) {
 ///
 /// Layout: `[prefix_skip bytes][payload_len bytes][checksum_len bytes]`.
 /// The checksum is the base-62 encoding of `crc32(payload)`.
+///
+/// Returns `Indeterminate` (not `Invalid`) when the checksum contains
+/// non-base-62 characters, because the regex match may have grabbed a
+/// wider span than the actual token.
 fn validate_crc32_base62(
     secret: &[u8],
     prefix_skip: u8,
@@ -239,7 +284,10 @@ fn validate_grafana_service_account(secret: &[u8]) -> OfflineVerdict {
     }
 }
 
-/// Branchless hex decode table. `0xFF` marks invalid characters.
+/// Hex decode table (256 entries, one per byte value).
+///
+/// Valid entries: `'0'–'9'` → 0–9, `'a'–'f'` / `'A'–'F'` → 10–15.
+/// All other entries are `0xFF` (bit 7 set), the invalid sentinel.
 const HEX_LUT: [u8; 256] = {
     let mut lut = [0xFFu8; 256];
     let mut i: u16 = 0;
@@ -257,20 +305,28 @@ const HEX_LUT: [u8; 256] = {
     lut
 };
 
-/// Decode an 8-byte hex string (case-insensitive) into a `u32`.
+/// Decode an **exactly 8-byte** hex string (case-insensitive) into a `u32`.
+///
+/// Same deferred-validity pattern as [`base62_decode_u32`]: valid nibbles
+/// (0–15) never set bit 7, the sentinel `0xFF` does. 8 hex digits map
+/// 1:1 to 32 bits, so overflow is impossible (`0xFFFF_FFFF = u32::MAX`).
+///
+/// Returns `None` if the input is not exactly 8 bytes or contains
+/// non-hex characters.
 #[inline]
 fn hex_decode_u32(bytes: &[u8]) -> Option<u32> {
     if bytes.len() != 8 {
         return None;
     }
     let mut acc: u32 = 0;
+    let mut invalid: u8 = 0;
     for &b in bytes {
         let nibble = HEX_LUT[b as usize];
-        if nibble == 0xFF {
-            return None;
-        }
-        // 8 hex digits cannot overflow u32 (max = 0xFFFF_FFFF = u32::MAX).
+        invalid |= nibble;
         acc = (acc << 4) | nibble as u32;
+    }
+    if invalid & 0x80 != 0 {
+        return None;
     }
     Some(acc)
 }
@@ -300,12 +356,21 @@ fn validate_aws_access_key(secret: &[u8]) -> OfflineVerdict {
 
     let key = &secret[..AWS_KEY_LEN];
 
-    // Validate known prefix.
-    let valid_prefix = key.starts_with(b"AKIA")
-        || key.starts_with(b"ASIA")
-        || key.starts_with(b"ABIA")
-        || key.starts_with(b"ACCA")
-        || (key.starts_with(b"A3T") && (key[3].is_ascii_uppercase() || key[3].is_ascii_digit()));
+    // Validate known prefix with a single u32 load + comparison tree.
+    // This avoids 4 separate `starts_with` calls that each reload key[0..4].
+    let prefix_word = u32::from_le_bytes([key[0], key[1], key[2], key[3]]);
+    const PREFIX_AKIA: u32 = u32::from_le_bytes(*b"AKIA");
+    const PREFIX_ASIA: u32 = u32::from_le_bytes(*b"ASIA");
+    const PREFIX_ABIA: u32 = u32::from_le_bytes(*b"ABIA");
+    const PREFIX_ACCA: u32 = u32::from_le_bytes(*b"ACCA");
+
+    let valid_prefix = matches!(
+        prefix_word,
+        PREFIX_AKIA | PREFIX_ASIA | PREFIX_ABIA | PREFIX_ACCA
+    ) || (key[0] == b'A'
+        && key[1] == b'3'
+        && key[2] == b'T'
+        && (key[3].is_ascii_uppercase() || key[3].is_ascii_digit()));
 
     if !valid_prefix {
         return OfflineVerdict::Indeterminate;
@@ -329,11 +394,21 @@ fn validate_aws_access_key(secret: &[u8]) -> OfflineVerdict {
     }
 }
 
-/// Decode a 16-char AWS base-32 suffix into the embedded account ID.
+/// Decode a 16-char AWS base-32 suffix into the embedded 40-bit account ID.
 ///
 /// The 16 base-32 characters encode 80 bits (10 bytes). The account ID
 /// occupies bits 1–40 (0-indexed from MSB, skipping the top flag bit),
-/// which spans decoded bytes 0–5 (bit 1 of byte 0 through bit 0 of byte 5).
+/// spanning decoded bytes 0–5.
+///
+/// ```text
+/// Byte:   [  0  ] [  1  ] [  2  ] [  3  ] [  4  ] [  5  ] ...
+/// Bits:   F AAAAAAA AAAAAAAA AAAAAAAA AAAAAAAA AAAAAAAA A-------
+///         ^                                              ^
+///         bit 0 (flag, skipped)                          bit 41+
+/// ```
+///
+/// The extraction `(decoded[0] & 0x7F) << 33 | ... | decoded[5] >> 7`
+/// masks off the flag bit and packs 40 contiguous bits into a `u64`.
 #[inline]
 fn decode_aws_account_id(suffix: &[u8]) -> Option<u64> {
     if suffix.len() != 16 {
@@ -410,9 +485,16 @@ fn validate_sentry_org_token(secret: &[u8]) -> OfflineVerdict {
         return OfflineVerdict::Indeterminate;
     }
 
-    // Validate signature characters are base64.
+    // Branchless signature validation: OR-accumulate `LUT[b] & 0xC0` over
+    // 43 bytes. Valid base64 values (0–63) have bits 6–7 clear; both 0xFF
+    // (invalid) and 0xFE (padding) have at least one of those bits set.
+    // A non-zero result means at least one byte was not a data character.
     let sig_bytes = &sig_part[..43];
-    if !sig_bytes.iter().all(|&b| is_base64_char(b)) {
+    let mut sig_invalid: u8 = 0;
+    for &b in sig_bytes {
+        sig_invalid |= BASE64_LUT[b as usize] & 0xC0;
+    }
+    if sig_invalid != 0 {
         return OfflineVerdict::Invalid;
     }
 
@@ -422,9 +504,9 @@ fn validate_sentry_org_token(secret: &[u8]) -> OfflineVerdict {
         return OfflineVerdict::Indeterminate;
     }
 
-    // Validate and decode in one pass while only checking the decoded prefix.
-    // A 512-byte decoded cap preserves existing conservative behavior on
-    // oversized payloads.
+    // Two-phase payload check: branchless validity scan over all bytes,
+    // then decode only the first ~12 base64 chars to match `{"iat":`.
+    // The 512-byte decoded cap returns Indeterminate for oversized payloads.
     match base64_decoded_starts_with(payload_b64, b"{\"iat\":", 512) {
         Ok(true) => OfflineVerdict::Valid,
         Ok(false) => OfflineVerdict::Invalid,
@@ -433,7 +515,15 @@ fn validate_sentry_org_token(secret: &[u8]) -> OfflineVerdict {
     }
 }
 
-/// Branchless base64 decode table. `0xFF` = invalid, `0xFE` = padding (`=`).
+/// Base64 decode table (256 entries, one per byte value).
+///
+/// Valid entries: `'A'–'Z'` → 0–25, `'a'–'z'` → 26–51, `'0'–'9'` → 52–61,
+/// `'+'` → 62, `'/'` → 63. Padding `'='` maps to `0xFE` (bit 7 set,
+/// bit 0 clear). All other entries are `0xFF` (bits 7 and 0 both set).
+///
+/// The `0xFE`/`0xFF` distinction enables the `v & (v >> 7)` trick in
+/// [`base64_decoded_starts_with`]: `0xFF & 1 = 1` (invalid), `0xFE & 1 = 0`
+/// (padding, acceptable), `0–63 & 0 = 0` (valid).
 const BASE64_LUT: [u8; 256] = {
     let mut lut = [0xFFu8; 256];
     let mut i: u16 = 0;
@@ -457,12 +547,6 @@ const BASE64_LUT: [u8; 256] = {
     lut
 };
 
-/// Check if a byte is a valid base64 character (not padding).
-#[inline]
-fn is_base64_char(b: u8) -> bool {
-    BASE64_LUT[b as usize] < 64
-}
-
 /// Reasons a base64-prefix check can fail.
 ///
 /// The Sentry validator maps these to different verdicts:
@@ -476,10 +560,14 @@ enum Base64DecodeError {
     OutputTooSmall,
 }
 
-/// Minimal base64 decoder into a caller-provided buffer (no heap allocation).
+/// Full base64 decoder into a caller-provided buffer (no heap allocation).
 ///
-/// Returns the number of decoded bytes, or `None` if the output buffer is
-/// too small or the input contains characters outside the base64 alphabet.
+/// Decodes the entire input into `output`. Returns the number of decoded
+/// bytes written, or `None` if `output` is too small or the input contains
+/// bytes outside the base64 alphabet.
+///
+/// For cases where only a prefix of the decoded output matters, prefer
+/// [`base64_decoded_starts_with`] which avoids decoding the full payload.
 #[inline]
 fn base64_decode(input: &[u8], output: &mut [u8]) -> Option<usize> {
     let max_decoded = input.len() * 3 / 4;
@@ -519,11 +607,13 @@ fn base64_decode(input: &[u8], output: &mut [u8]) -> Option<usize> {
 
 /// Validate base64 input and check whether decoded bytes start with `prefix`.
 ///
-/// Every input byte is checked against the base64 alphabet (invalid chars
-/// return [`Base64DecodeError::InvalidChar`]), but actual decode work stops
-/// once the prefix comparison concludes — either a mismatch or full match.
-/// This avoids decoding the entire payload while still rejecting malformed
-/// input.
+/// Two-phase design for better ILP:
+/// - **Phase 1:** Branchless scan of ALL input bytes for validity. Each byte
+///   is looked up in `BASE64_LUT`; the `v & (v >> 7)` trick detects 0xFF
+///   (invalid) without flagging 0xFE (padding): `0xFF & 1 = 1`, `0xFE & 1 = 0`,
+///   valid 0–63: `v >> 7 = 0`.
+/// - **Phase 2:** Decode only the first `ceil(prefix.len() / 3) * 4` base64
+///   chars and compare decoded bytes against `prefix`.
 #[inline]
 fn base64_decoded_starts_with(
     input: &[u8],
@@ -535,51 +625,63 @@ fn base64_decoded_starts_with(
         return Err(Base64DecodeError::OutputTooSmall);
     }
 
-    let mut buf: u32 = 0;
-    let mut buf_bits: u32 = 0;
-    let mut prefix_idx = 0usize;
-    let mut matches_prefix = true;
-    let mut decode_prefix = !prefix.is_empty();
-
+    // Phase 1: branchless validity scan over ALL input bytes.
+    // Loop body: ldrb + ldrb + lsr + and + orr — 0 branches per byte.
+    let mut any_invalid: u8 = 0;
     for &b in input {
         let v = BASE64_LUT[b as usize];
-        if v == 0xFE {
-            continue; // padding
-        }
-        if v == 0xFF {
-            return Err(Base64DecodeError::InvalidChar);
-        }
-        let val = v as u32;
+        // 0xFF → 0xFF & (0xFF >> 7) = 0xFF & 1 = 1 (invalid)
+        // 0xFE → 0xFE & (0xFE >> 7) = 0xFE & 1 = 0 (padding, ok)
+        // 0–63 → v & 0 = 0 (valid)
+        any_invalid |= v & (v >> 7);
+    }
+    if any_invalid != 0 {
+        return Err(Base64DecodeError::InvalidChar);
+    }
 
-        if !decode_prefix {
-            continue;
-        }
+    // Phase 2: decode only enough base64 chars to cover the prefix.
+    // Each group of 4 base64 chars produces 3 decoded bytes, so we need
+    // ceil(prefix_len / 3) * 4 input chars. For `{"iat":` (7 bytes):
+    // ceil(7/3) * 4 = 12 chars — decoding 12 chars yields 9 bytes ≥ 7.
+    if prefix.is_empty() {
+        return Ok(true);
+    }
 
-        buf = (buf << 6) | val;
+    let decode_input_len = prefix.len().div_ceil(3) * 4;
+    let decode_slice = if decode_input_len < input.len() {
+        &input[..decode_input_len]
+    } else {
+        input
+    };
+
+    let mut buf: u32 = 0;
+    let mut buf_bits: u32 = 0;
+    let mut prefix_idx: usize = 0;
+
+    for &b in decode_slice {
+        let v = BASE64_LUT[b as usize];
+        if v >= 0xFE {
+            continue; // padding — already validated in phase 1
+        }
+        buf = (buf << 6) | v as u32;
         buf_bits += 6;
 
-        while buf_bits >= 8 && decode_prefix {
+        while buf_bits >= 8 {
             buf_bits -= 8;
             let decoded = (buf >> buf_bits) as u8;
             buf &= (1u32 << buf_bits) - 1;
 
-            if decoded != prefix[prefix_idx] {
-                matches_prefix = false;
-                decode_prefix = false;
+            if prefix_idx >= prefix.len() {
                 break;
             }
-
-            prefix_idx += 1;
-            if prefix_idx == prefix.len() {
-                decode_prefix = false;
+            if decoded != prefix[prefix_idx] {
+                return Ok(false);
             }
+            prefix_idx += 1;
         }
     }
 
-    if prefix_idx < prefix.len() {
-        return Ok(false);
-    }
-    Ok(matches_prefix)
+    Ok(prefix_idx >= prefix.len())
 }
 
 // ---------------------------------------------------------------------------
@@ -983,6 +1085,58 @@ mod tests {
         token.extend_from_slice(&checksum);
 
         assert_eq!(validate(spec, &token), OfflineVerdict::Valid);
+    }
+
+    // ---- Step 6: edge-case tests for branchless optimizations ----
+
+    #[test]
+    fn sentry_invalid_sig_char() {
+        // Invalid `@` at position 21 in the 43-char signature.
+        let payload_json = b"{\"iat\":1234567890}";
+        let mut b64_payload = Vec::new();
+        base64_encode_for_test(payload_json, &mut b64_payload);
+
+        let mut token = Vec::new();
+        token.extend_from_slice(b"sntrys_");
+        token.extend_from_slice(&b64_payload);
+        token.push(b'_');
+        // 43-char sig with an invalid char at position 21.
+        let mut sig = vec![b'A'; 43];
+        sig[21] = b'@';
+        token.extend_from_slice(&sig);
+
+        assert_eq!(
+            validate(OfflineValidationSpec::SentryOrgToken, &token),
+            OfflineVerdict::Invalid,
+        );
+    }
+
+    #[test]
+    fn sentry_sig_with_padding_char() {
+        // Padding `=` in signature must reject (not valid base64 data char).
+        let payload_json = b"{\"iat\":1234567890}";
+        let mut b64_payload = Vec::new();
+        base64_encode_for_test(payload_json, &mut b64_payload);
+
+        let mut token = Vec::new();
+        token.extend_from_slice(b"sntrys_");
+        token.extend_from_slice(&b64_payload);
+        token.push(b'_');
+        let mut sig = vec![b'A'; 43];
+        sig[42] = b'=';
+        token.extend_from_slice(&sig);
+
+        assert_eq!(
+            validate(OfflineValidationSpec::SentryOrgToken, &token),
+            OfflineVerdict::Invalid,
+        );
+    }
+
+    #[test]
+    fn base62_decode_just_over_u32_max() {
+        // 7 base-62 chars that overflow u32 (62^6 = 56_800_235_584 > u32::MAX).
+        // "1000000" in base-62 = 62^6 = 56_800_235_584.
+        assert_eq!(base62_decode_u32(b"1000000"), None);
     }
 
     // ---- Test-only helper ----
