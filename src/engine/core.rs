@@ -287,6 +287,7 @@ pub struct Engine {
     /// Build-time summary of anchor selection decisions.
     anchor_plan_stats: AnchorPlanStats,
     #[cfg(feature = "stats")]
+    /// Per-scan Vectorscan counters snapshotted via [`VectorscanCounters::snapshot`].
     pub(super) vs_stats: VectorscanCounters,
 
     /// True if any rule has UTF-16 anchor variants compiled.
@@ -877,6 +878,8 @@ impl Engine {
                 vs_ms, vs_stream_ms, vs_gate_ms, vs_utf16_ms, vs_utf16_stream_ms,
             );
         }
+        // Pre-bucket transform indices by (mode, id) so the scan-loop work-item
+        // path avoids per-transform branches. See `scanbuf_transform_buckets`.
         let mut scanbuf_transform_idxs_active_non_base64 =
             Vec::with_capacity(transforms.len().min(8));
         let mut scanbuf_transform_idxs_active_base64 = Vec::with_capacity(transforms.len().min(8));
