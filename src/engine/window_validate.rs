@@ -582,16 +582,6 @@ impl Engine {
         file_id: FileId,
         scratch: &mut ScanScratch,
     ) {
-        // Contract:
-        // - `decode_range` is expected to be UTF-16 aligned by the caller.
-        // - Finding spans are emitted in decoded UTF-8 byte space under a
-        //   `DecodeStep::Utf16Window` child step for parent-span reconstruction.
-        // - Root span hints are based on FULL MATCH extents mapped back through
-        //   raw UTF-16 offsets and optional root-span mapping context.
-        //
-        // Note: unlike the raw hot path, this helper does not perform direct
-        // root safelist suppression; that policy is currently scoped to the raw
-        // root-buffer insertion path.
         // Caller is responsible for UTF-16 alignment; `decode_range.start`
         // should be on a code-unit boundary (parity handled upstream).
         // Decode this window as UTF-16 and run the same validators on UTF-8 output.
@@ -1196,11 +1186,6 @@ impl Engine {
         found_any: &mut bool,
         anchor_hint: u64,
     ) {
-        // UTF-16 anchors can land on either byte parity within a merged window;
-        // scan both alignments so mixed-parity anchors are not missed.
-        //
-        // Ordering matters for decode-budget efficiency: hinted parity first,
-        // opposite parity second.
         // UTF-16 anchors can land on either byte parity within a merged window;
         // scan both alignments so mixed-parity anchors are not missed.
         let parity = (anchor_hint.saturating_sub(window_start) & 1) as usize;

@@ -1631,6 +1631,10 @@ impl Engine {
                     continue;
                 };
                 let enc = unsafe { std::slice::from_raw_parts(enc_ptr, enc_len) };
+                // True only when root_hint exactly names the encoded bytes being
+                // decoded. This allows decoded matches to map back to precise
+                // root spans; otherwise we keep coarse root_hint windows to avoid
+                // fabricating exact offsets from partial context.
                 let root_hint_maps_encoded = if !enc_ref.is_slab {
                     if let Some(hint) = root_hint.as_ref() {
                         hint.start == r.start && hint.end == r.end

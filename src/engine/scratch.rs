@@ -819,6 +819,14 @@ impl ScanScratch {
     /// On the first call, validates and potentially reallocates all scratch
     /// buffers to match the engine's current tuning and rule set. Subsequent
     /// calls are no-ops because `Engine` is immutable after construction.
+    ///
+    /// Capacity policy is monotonic: buffers only grow (never shrink) so long
+    /// scans do not thrash allocations. `reset_for_scan*` handles per-scan
+    /// clears; this method handles structural compatibility with the engine:
+    /// - Vectorscan scratch bindings still match the current DB pointers
+    /// - per-rule/variant accumulators are large enough for current limits
+    /// - bounded sidecar vectors (`out`, `norm_hash`, `drop_hint_end`) remain
+    ///   aligned and large enough for `max_findings`
     pub(super) fn ensure_capacity(&mut self, engine: &Engine) {
         if self.capacity_validated {
             return;
@@ -1213,6 +1221,11 @@ impl ScanScratch {
     ///
     /// `keep` receives the finding record plus its aligned drop boundary and must
     /// return `true` to keep the row. Returns the number of rows removed.
+    ///
+    /// # Contract for `keep`
+    /// `keep` may be called more than once for the same row when at least one
+    /// row is dropped (first-pass detection + second-pass compaction). It must
+    /// therefore be side-effect free and deterministic for a given input pair.
     #[inline(always)]
     pub(super) fn retain_findings_aligned<F>(&mut self, mut keep: F) -> usize
     where
@@ -1352,6 +1365,9 @@ impl ScanScratch {
     /// - A per-file set (`seen_findings`) that suppresses cross-chunk repeats.
     /// - A per-scan set (`seen_findings_scan`) that enables within-scan replacement
     ///   (e.g., prefer transform findings) without re-emitting earlier chunks.
+    ///
+    /// Replacement lookup is `O(n)` in pending findings (linear scan of `out`)
+    /// but bounded by `max_findings_per_chunk`, so it stays predictable.
     #[inline(always)]
     pub(super) fn push_finding_with_drop_hint(
         &mut self,
