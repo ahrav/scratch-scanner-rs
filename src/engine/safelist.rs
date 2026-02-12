@@ -1,8 +1,8 @@
 //! Global context safelist for emit-time suppression.
 //!
 //! The safelist is intentionally broad and conservative: if any pattern matches
-//! nearby context for a finding, later pipeline stages can drop likely
-//! placeholder/test artifacts before reporting.
+//! nearby context for a finding, the finding is suppressed before it is
+//! recorded.
 //!
 //! # Scope and Matching Model
 //! - Matching runs on caller-provided context windows around already-detected
@@ -26,7 +26,8 @@
 //!
 //! # Complexity
 //! - Construction cost is paid once per filter instance.
-//! - `matches` is effectively linear in context length for a fixed pattern set.
+//! - `matcher().is_match(...)` is effectively linear in context length for a
+//!   fixed pattern set.
 //!
 //! # Failure Modes
 //! - A compile-time assertion guards the pattern count; adding or removing

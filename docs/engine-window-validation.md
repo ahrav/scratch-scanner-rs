@@ -636,6 +636,6 @@ Findings are written to scratch buffers (not directly to materialized results) b
 4. root_hint (when present) is in the same coordinate space as base_offset
 5. anchor_hint is in window/buffer coordinates (Raw back-scan and UTF-16 parity selection)
 6. All early returns occur before findings are recorded
-7. Findings are appended to scratch (never removed or reordered during function execution)
+7. Findings are appended or replaced in-place for dedupe preference (never removed or reordered during function execution)
 8. Entropy gates continue to next match (not early return)
 9. Root safelist suppression and cap checks are applied before finding insertion

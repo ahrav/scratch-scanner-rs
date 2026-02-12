@@ -33,6 +33,14 @@ use super::Engine;
 /// context or encoding transform.
 pub type NormHash = [u8; 32];
 
+/// Internal multiplier for cross-chunk dedupe set sizing.
+///
+/// Dedupe sets must track more keys than the emit cap because many candidates
+/// can be observed (and intentionally dropped) before the chunk cap is reached.
+/// Keeping this budget separate from `max_findings` preserves cross-chunk
+/// duplicate suppression under high candidate pressure.
+const FINDING_DEDUPE_MULTIPLIER: usize = 32;
+
 /// Scratch histogram for entropy gating.
 ///
 /// Entropy gates reject candidate matches whose byte distribution is too
@@ -536,7 +544,12 @@ impl ScanScratch {
                 .saturating_mul(2)
                 .max(1024),
         );
-        let findings_cap = pow2_at_least(max_findings.saturating_mul(4).max(64));
+        let findings_cap = pow2_at_least(
+            max_findings
+                .max(1)
+                .saturating_mul(FINDING_DEDUPE_MULTIPLIER)
+                .max(64),
+        );
         let stream_match_cap = engine.tuning.max_windows_per_rule_variant.max(16);
         let pending_window_cap = rules_len
             .saturating_mul(3)
@@ -1355,8 +1368,9 @@ impl ScanScratch {
     /// # False Positives
     ///
     /// The underlying `FixedSet128` is a probabilistic structure (Bloom-like).
-    /// Collisions may suppress distinct findings, but the capacity is sized to
-    /// `4× max_findings` to keep collision probability low for typical scans.
+    /// Collisions may suppress distinct findings, but the dedupe table is sized
+    /// to `FINDING_DEDUPE_MULTIPLIER × max_findings` to keep load low under
+    /// high-candidate scans.
     ///
     /// `include_span` controls whether `span_start`/`span_end` participate in
     /// the dedupe key (used when root-span mapping is unavailable).
@@ -1689,5 +1703,58 @@ mod tests {
         let mut findings_out = Vec::with_capacity(2);
         let mut hash_out = Vec::with_capacity(1);
         scratch.drain_findings_with_hashes(&mut findings_out, &mut hash_out);
+    }
+
+    #[test]
+    fn cross_chunk_dedupe_tracks_candidates_beyond_emit_cap() {
+        let mut tuning = test_tuning();
+        tuning.max_findings_per_chunk = 8;
+        let engine = Engine::new(vec![simple_rule()], Vec::<TransformConfig>::new(), tuning);
+        let mut scratch = engine.new_scratch();
+
+        let make_candidate = |idx: u32| {
+            make_rec(
+                STEP_ROOT,
+                idx.saturating_mul(2),
+                idx.saturating_mul(2).saturating_add(1),
+                1_000u64.saturating_add(u64::from(idx).saturating_mul(10)),
+                1_004u64.saturating_add(u64::from(idx).saturating_mul(10)),
+            )
+        };
+
+        scratch.update_chunk_overlap(FileId(0), 0, 1024);
+        for idx in 0..80u32 {
+            let rec = make_candidate(idx);
+            let mut norm_hash = [0u8; 32];
+            norm_hash[0] = idx as u8;
+            scratch.push_finding_with_drop_hint(
+                rec,
+                norm_hash,
+                rec.root_hint_end,
+                rec.dedupe_with_span,
+            );
+        }
+        assert_eq!(
+            scratch.pending_findings_len(),
+            8,
+            "emit cap should keep only the first eight pending findings"
+        );
+
+        scratch.reset_for_scan_after_prefilter(&engine);
+        scratch.update_chunk_overlap(FileId(0), 768, 1024);
+
+        let duplicate = make_candidate(79);
+        scratch.push_finding_with_drop_hint(
+            duplicate,
+            [79u8; 32],
+            duplicate.root_hint_end,
+            duplicate.dedupe_with_span,
+        );
+
+        assert_eq!(
+            scratch.pending_findings_len(),
+            0,
+            "cross-chunk duplicate should be suppressed even when first sighting exceeded emit cap"
+        );
     }
 }

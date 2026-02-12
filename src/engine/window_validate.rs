@@ -624,9 +624,10 @@ impl Engine {
         // 1. `utf16_buf` was just populated; its length and backing allocation
         //    are stable for the remainder of this function.
         // 2. No code path between here and the last use of `decoded` writes to,
-        //    resizes, or reallocates `utf16_buf`. The mutable methods invoked
-        //    below touch only `out`, `drop_hint_end`, `seen_findings`,
-        //    `total_decode_output_bytes`, and `capture_locs`.
+        //    resizes, or reallocates `utf16_buf`. Mutations below touch other
+        //    scratch fields (`out`, `drop_hint_end`, `seen_findings`,
+        //    `safelist_suppressed`, `total_decode_output_bytes`, `capture_locs`)
+        //    but never `utf16_buf`.
         // 3. Pointer and length are captured before any subsequent mutation.
         let decoded_len = scratch.utf16_buf.len();
         let decoded_ptr = scratch.utf16_buf.as_slice().as_ptr();
