@@ -74,7 +74,7 @@ classDiagram
 
     class SafelistFilter {
         +new() SafelistFilter
-        +is_empty() bool
+        +matcher() RegexSet
         +matches(context) bool
     }
 

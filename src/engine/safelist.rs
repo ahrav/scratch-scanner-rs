@@ -14,14 +14,13 @@
 //!   detection, not a standalone detector.
 //!
 //! # Invariants
-//! - Pattern inventory is fixed at 18 categories for this epic phase.
+//! - Pattern inventory is fixed at 18 categories; changes require updating
+//!   `SAFELIST_PATTERN_COUNT` and the compile-time assertion.
 //! - Matching is byte-oriented and uses `regex::bytes::RegexSet` (ANY semantics).
 //! - Case-insensitive handling is encoded inline in patterns via `(?i)` where needed.
 //!
 //! # Edge Cases
 //! - Context may be non-UTF-8; byte regexes keep matching behavior stable.
-//! - Empty inventories are treated as a strict no-op (`matches` always returns
-//!   `false`) so call sites do not need special handling.
 //! - Extremely narrow caller-provided context windows can miss safelist markers,
 //!   which is a deliberate trade-off controlled by the caller.
 //!
@@ -30,6 +29,8 @@
 //! - `matches` is effectively linear in context length for a fixed pattern set.
 //!
 //! # Failure Modes
+//! - A compile-time assertion guards the pattern count; adding or removing
+//!   patterns without updating `SAFELIST_PATTERN_COUNT` is a compile error.
 //! - Construction panics if any pattern is invalid; this is treated as a build-time
 //!   configuration bug, not a recoverable runtime condition.
 
@@ -67,7 +68,7 @@ const SAFELIST_PATTERNS: &[&str] = &[
     // INSERT_YOUR / REPLACE_WITH style markers.
     r"(?i)\b(?:INSERT[_\s-]?YOUR|REPLACE[_\s-]?WITH)[A-Z0-9_\s-]*\b",
     // Base64 for example/test/sample literals.
-    r"(?i)(?:ZXhhbXBsZQ==|c2FtcGxl={0,2}|dGVzdA==)",
+    r"(?:ZXhhbXBsZQ==|c2FtcGxl={0,2}|dGVzdA==)",
     // Git conflict markers.
     r"(?m)^(?:<{7}|={7}|>{7})(?: .*)?$",
     // Test fixture path markers (__test__, fixture, mock).
@@ -82,59 +83,35 @@ const _: () = assert!(SAFELIST_PATTERNS.len() == SAFELIST_PATTERN_COUNT);
 ///
 /// A `SafelistFilter` is immutable after construction and safe to share across scans.
 #[derive(Debug)]
-#[allow(dead_code)] // Added ahead of call-site integration in scratch-65g.2.
 pub(crate) struct SafelistFilter {
-    regex_set: Option<RegexSet>,
+    regex_set: RegexSet,
 }
 
-#[allow(dead_code)] // Added ahead of call-site integration in scratch-65g.2.
 impl SafelistFilter {
     /// Compile the static safelist pattern inventory into a `RegexSet`.
     ///
-    /// Panics when the inventory count drifts from the expected value or when any
-    /// regex fails to compile. This is a fail-fast invariant check for checked-in
-    /// rule configuration.
+    /// Panics if any regex fails to compile. Pattern count is enforced at
+    /// compile time by the `const _` assertion above.
     pub(crate) fn new() -> Self {
-        assert_eq!(
-            SAFELIST_PATTERNS.len(),
-            SAFELIST_PATTERN_COUNT,
-            "safelist inventory count changed"
-        );
-
-        let regex_set = if SAFELIST_PATTERNS.is_empty() {
-            None
-        } else {
-            Some(
-                RegexSet::new(SAFELIST_PATTERNS)
-                    .expect("safelist inventory must contain valid regexes"),
-            )
-        };
-
+        let regex_set = RegexSet::new(SAFELIST_PATTERNS).unwrap_or_else(|e| {
+            panic!("safelist pattern compilation failed ({} patterns): {e}", SAFELIST_PATTERNS.len())
+        });
         Self { regex_set }
     }
 
-    /// Fast no-op check for empty inventories.
-    ///
-    /// The default inventory is non-empty, but this remains as a cheap guard for
-    /// future feature-flagged or generated inventories.
-    #[inline(always)]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.regex_set.is_none()
+    /// Returns a reference to the compiled matcher for use in hot loops.
+    #[inline]
+    pub(crate) fn matcher(&self) -> &RegexSet {
+        &self.regex_set
     }
 
     /// Returns `true` when any safelist pattern matches the supplied context.
     ///
-    /// Empty inventories always return `false` to preserve a predictable no-op path.
     /// Callers should treat `true` as "eligible for suppression review", not as a
     /// proof that the candidate is non-secret.
-    #[inline(always)]
+    #[inline]
     pub(crate) fn matches(&self, context: &[u8]) -> bool {
-        if self.is_empty() {
-            return false;
-        }
-        self.regex_set
-            .as_ref()
-            .is_some_and(|regex_set| regex_set.is_match(context))
+        self.regex_set.is_match(context)
     }
 }
 
@@ -145,12 +122,6 @@ mod tests {
     #[test]
     fn safelist_inventory_has_expected_count() {
         assert_eq!(SAFELIST_PATTERNS.len(), SAFELIST_PATTERN_COUNT);
-    }
-
-    #[test]
-    fn safelist_is_not_empty_with_default_inventory() {
-        let filter = SafelistFilter::new();
-        assert!(!filter.is_empty());
     }
 
     #[test]

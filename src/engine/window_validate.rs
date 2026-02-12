@@ -310,6 +310,26 @@ fn local_context_passes(
 }
 
 impl Engine {
+    /// Returns whether a root-buffer finding should be suppressed by safelist.
+    ///
+    /// This runs before finding-cap accounting so safelisted root findings do
+    /// not consume `max_findings_per_chunk` capacity and starve later
+    /// non-safelisted findings.
+    #[inline(always)]
+    fn suppress_root_finding_by_safelist(
+        &self,
+        buf: &[u8],
+        step_id: StepId,
+        root_span_hint: &Range<usize>,
+    ) -> bool {
+        if step_id != STEP_ROOT {
+            return false;
+        }
+        let start = root_span_hint.start.min(buf.len());
+        let end = root_span_hint.end.min(buf.len());
+        start < end && self.safelist.matches(&buf[start..end])
+    }
+
     /// Runs a compiled rule against one window and appends findings into `scratch`.
     ///
     /// Guarantees / invariants:
@@ -449,6 +469,12 @@ impl Engine {
                                 } else {
                                     root_hint.clone().unwrap_or(match_span_in_buf)
                                 };
+                            if self.suppress_root_finding_by_safelist(buf, step_id, &root_span_hint)
+                            {
+                                scratch.safelist_suppressed =
+                                    scratch.safelist_suppressed.saturating_add(1);
+                                return;
+                            }
 
                             let mut drop_hint_end = root_span_hint.end;
                             if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {

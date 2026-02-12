@@ -1686,83 +1686,62 @@ impl Engine {
     /// slice matches the global safelist. Findings from decoded buffers are not
     /// suppressed here.
     ///
-    /// Compaction runs in one forward pass (`O(n)`) and keeps the three parallel
-    /// vectors (`out`, `drop_hint_end`, `norm_hash`) in strict index alignment.
+    /// Retention stays linear-time (`O(n)`) and keeps the three parallel vectors
+    /// (`out`, `drop_hint_end`, `norm_hash`) in strict index alignment. The helper
+    /// performs a no-drop detection pass and only compacts when suppression occurs.
     /// This invariant is required by later materialization and dedup bookkeeping
-    /// paths.
+    /// paths. The aligned retain/compaction mechanics live in
+    /// [`ScanScratch::retain_findings_aligned`].
     ///
     /// `base_offset` rebases absolute `root_hint_*` offsets into the current
     /// `root_buf` slice; spans outside the slice are clamped and treated as
     /// non-matching.
     fn post_scan_filter(&self, root_buf: &[u8], base_offset: u64, scratch: &mut ScanScratch) {
-        debug_assert_eq!(
-            scratch.out.len(),
-            scratch.drop_hint_end.len(),
-            "drop hint length mismatch"
-        );
-        debug_assert_eq!(
-            scratch.out.len(),
-            scratch.norm_hash.len(),
-            "norm hash length mismatch"
-        );
-
-        if self.safelist.is_empty() || scratch.out.is_empty() {
+        if scratch.out.is_empty() {
             return;
         }
+        let safelist_matcher = self.safelist.matcher();
 
         let root_len_u64 = root_buf.len() as u64;
-        let mut write_idx = 0usize;
-        let len = scratch.out.len();
-
-        for read_idx in 0..len {
-            let rec = scratch.out[read_idx];
-            let suppress = if rec.step_id == STEP_ROOT {
-                // Rebase absolute root hints into this chunk and clamp to avoid
-                // panics when overlap hints extend outside `root_buf`.
-                let start = rec
-                    .root_hint_start
-                    .saturating_sub(base_offset)
-                    .min(root_len_u64);
-                let end = rec
-                    .root_hint_end
-                    .saturating_sub(base_offset)
-                    .min(root_len_u64);
-                if start < end {
-                    self.safelist
-                        .matches(&root_buf[start as usize..end as usize])
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-
-            if suppress {
-                continue;
+        let mut last_root_decision: Option<(u64, u64, bool)> = None;
+        let removed = scratch.retain_findings_aligned(|rec, _drop_end| {
+            if rec.step_id != STEP_ROOT {
+                return true;
             }
 
-            if write_idx != read_idx {
-                // SAFETY: During in-place compaction `write_idx < read_idx` always
-                // holds for moved elements, so source and destination never overlap.
-                let src = &scratch.out[read_idx] as *const FindingRec;
-                let dst = &mut scratch.out[write_idx] as *mut FindingRec;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(src, dst, 1);
+            debug_assert!(
+                rec.root_hint_start <= rec.root_hint_end,
+                "root_hint range is backwards: {}..{} for rule {}",
+                rec.root_hint_start,
+                rec.root_hint_end,
+                rec.rule_id,
+            );
+
+            // Rebase absolute root hints into this chunk and clamp to avoid
+            // panics when overlap hints extend outside `root_buf`.
+            let start = rec
+                .root_hint_start
+                .saturating_sub(base_offset)
+                .min(root_len_u64);
+            let end = rec
+                .root_hint_end
+                .saturating_sub(base_offset)
+                .min(root_len_u64);
+            if start >= end {
+                return true;
+            }
+
+            if let Some((last_start, last_end, last_keep)) = last_root_decision {
+                if last_start == start && last_end == end {
+                    return last_keep;
                 }
             }
 
-            let drop_end = scratch.drop_hint_end.as_slice()[read_idx];
-            scratch.drop_hint_end.as_mut_slice()[write_idx] = drop_end;
-
-            let norm_hash = scratch.norm_hash.as_slice()[read_idx];
-            scratch.norm_hash.as_mut_slice()[write_idx] = norm_hash;
-
-            write_idx += 1;
-        }
-
-        scratch.out.truncate(write_idx);
-        scratch.drop_hint_end.truncate(write_idx);
-        scratch.norm_hash.truncate(write_idx);
+            let keep = !safelist_matcher.is_match(&root_buf[start as usize..end as usize]);
+            last_root_decision = Some((start, end, keep));
+            keep
+        });
+        scratch.safelist_suppressed = scratch.safelist_suppressed.saturating_add(removed);
     }
 
     /// Scans a buffer and returns a shared view of finding records.
