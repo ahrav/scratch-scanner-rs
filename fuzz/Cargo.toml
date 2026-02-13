@@ -117,3 +117,10 @@ path = "fuzz_targets/fuzz_pack_exec.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_hit_pool_callback"
+path = "fuzz_targets/fuzz_hit_pool_callback.rs"
+test = false
+doc = false
+bench = false

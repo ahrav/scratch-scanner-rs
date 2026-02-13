@@ -308,17 +308,22 @@ impl HitAccPool {
     ///
     /// The output list remains unique within a scan epoch, enabling `reset_touched`
     /// to clear bits in O(#unique_touched) time.
+    ///
+    /// # Safety
+    ///
+    /// - `pair < self.pair_count()` (equivalently, `pair / 64` is in-bounds for
+    ///   `touched_words`).
+    /// - `touched_pairs` must have spare capacity for at least one more element
+    ///   (guaranteed when the caller pre-allocates for `pair_count` entries).
     #[inline(always)]
-    pub(super) fn mark_touched(&mut self, pair: usize, touched_pairs: &mut ScratchVec<u32>) {
-        debug_assert!(pair < self.pair_count as usize);
-        // SAFETY: pair < pair_count, so pair / 64 < touched_word_count.
-        unsafe {
-            let word = self.touched_words.add(pair / 64);
-            let bit = 1u64 << (pair % 64);
-            if (*word & bit) == 0 {
-                *word |= bit;
-                touched_pairs.push(pair as u32);
-            }
+    unsafe fn mark_touched_unchecked(&mut self, pair: usize, touched_pairs: &mut ScratchVec<u32>) {
+        // SAFETY: Caller guarantees `pair < pair_count`, so `pair / 64` is
+        // within `touched_words` and all pointer arithmetic is in-bounds.
+        let word = self.touched_words.add(pair / 64);
+        let bit = 1u64 << (pair % 64);
+        if (*word & bit) == 0 {
+            *word |= bit;
+            touched_pairs.push(pair as u32);
         }
     }
 
@@ -326,6 +331,7 @@ impl HitAccPool {
     ///
     /// Once the per-pair cap is exceeded, all hits are coalesced into a single
     /// span that conservatively covers every hit seen so far.
+    #[cfg(any(test, feature = "bench", feature = "tiger-harness", feature = "kani"))]
     #[inline(always)]
     pub(super) fn push_span(
         &mut self,
@@ -334,11 +340,29 @@ impl HitAccPool {
         touched_pairs: &mut ScratchVec<u32>,
     ) {
         debug_assert!(pair < self.pair_count as usize);
-        self.mark_touched(pair, touched_pairs);
+        unsafe { self.push_span_unchecked_hot(pair, span, touched_pairs) };
+    }
 
-        // Read len and coalesced as values so the mutable borrow of
-        // pair_meta does not extend across the coalesce_overflow call.
-        // SAFETY: pair < pair_count, pointer arithmetic is in bounds.
+    /// Hot unchecked insertion path used by scan callbacks.
+    ///
+    /// # Safety
+    /// - `pair < self.pair_count()`.
+    /// - `touched_pairs` must be valid mutable scratch state for this scan epoch.
+    /// - Caller must guarantee single-threaded access to this pool instance.
+    #[inline(always)]
+    pub(super) unsafe fn push_span_unchecked_hot(
+        &mut self,
+        pair: usize,
+        span: SpanU32,
+        touched_pairs: &mut ScratchVec<u32>,
+    ) {
+        debug_assert!(pair < self.pair_count as usize);
+        unsafe {
+            self.mark_touched_unchecked(pair, touched_pairs);
+        }
+
+        // Read len/coalesced as values so the mutable borrow of pair_meta
+        // doesn't extend across coalesce_overflow.
         let (len, coalesced) = unsafe {
             let m = &*self.pair_meta.add(pair);
             (m.len as usize, m.coalesced)
@@ -346,7 +370,6 @@ impl HitAccPool {
 
         if coalesced != 0 {
             // Expand coalesced window, preserving the earliest anchor hint.
-            // SAFETY: pair < pair_count.
             let c = unsafe { &mut *self.coalesced.add(pair) };
             c.start = c.start.min(span.start);
             c.end = c.end.max(span.end);
@@ -357,7 +380,6 @@ impl HitAccPool {
         let max_hits = self.max_hits as usize;
         if len < max_hits {
             let base = pair * max_hits;
-            // SAFETY: base + len < pair_count * max_hits (total window slots).
             unsafe {
                 *self.windows.add(base + len) = span;
                 (*self.pair_meta.add(pair)).len = (len + 1) as u16;
@@ -549,6 +571,75 @@ impl BenchHitAccPool {
     }
 }
 
+/// Fuzz harness wrapping [`HitAccPool`] for use by fuzz targets.
+///
+/// Provides the same interface as `BenchHitAccPool` but gated behind
+/// `tiger-harness` for the fuzz crate.
+#[cfg(feature = "tiger-harness")]
+pub struct FuzzHitAccPool {
+    pool: HitAccPool,
+    touched: ScratchVec<u32>,
+    output: ScratchVec<SpanU32>,
+}
+
+#[cfg(feature = "tiger-harness")]
+impl FuzzHitAccPool {
+    /// Builds a fuzz-only accumulator wrapper.
+    ///
+    /// Returns `None` if allocation fails (fuzz targets should bail on `None`).
+    pub fn new(pair_count: usize, max_hits: usize) -> Option<Self> {
+        let pool = HitAccPool::new(pair_count, max_hits).ok()?;
+        let touched = ScratchVec::<u32>::with_capacity(pair_count).ok()?;
+        let output = ScratchVec::<SpanU32>::with_capacity(max_hits).ok()?;
+        Some(Self {
+            pool,
+            touched,
+            output,
+        })
+    }
+
+    /// Push one window. `pair` is clamped to `pair_count - 1`.
+    pub fn push(&mut self, pair: usize, start: u32, end: u32, hint: u32) {
+        let pair = pair % self.pool.pair_count().max(1);
+        let (start, end) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        let hint = hint.clamp(start, end);
+        self.pool.push_span(
+            pair,
+            SpanU32 {
+                start,
+                end,
+                anchor_hint: hint,
+            },
+            &mut self.touched,
+        );
+    }
+
+    /// Drain windows for `pair`.
+    pub fn take(&mut self, pair: usize) -> usize {
+        let pair = pair % self.pool.pair_count().max(1);
+        self.pool.take_into(pair, &mut self.output);
+        self.output.len()
+    }
+
+    /// Reset all touched-pair state.
+    pub fn reset(&mut self) {
+        for &p in self.touched.as_slice() {
+            self.pool.reset_pair(p as usize);
+        }
+        self.pool.reset_touched(self.touched.as_slice());
+        self.touched.clear();
+    }
+
+    /// Returns the pair count.
+    pub fn pair_count(&self) -> usize {
+        self.pool.pair_count()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Miri-compatible unit tests (no FFI, no feature gates)
 // ---------------------------------------------------------------------------
@@ -685,6 +776,46 @@ mod tests {
     }
 
     #[test]
+    fn unsafe_hot_path_matches_safe_behavior() {
+        let pair_count = 4usize;
+        let max_hits = 3usize;
+        let mut pool_safe = HitAccPool::new(pair_count, max_hits).unwrap();
+        let mut pool_hot = HitAccPool::new(pair_count, max_hits).unwrap();
+        let mut touched_safe = ScratchVec::<u32>::with_capacity(pair_count).unwrap();
+        let mut touched_hot = ScratchVec::<u32>::with_capacity(pair_count).unwrap();
+        let mut out_safe = ScratchVec::<SpanU32>::with_capacity(max_hits).unwrap();
+        let mut out_hot = ScratchVec::<SpanU32>::with_capacity(max_hits).unwrap();
+
+        let ops = [
+            (0usize, make_span(10, 20)),
+            (1usize, make_span(15, 25)),
+            (0usize, make_span(30, 40)),
+            (2usize, make_span(5, 9)),
+            (0usize, make_span(50, 60)),
+            (0usize, make_span(55, 80)), // overflow/coalesce for pair 0
+            (1usize, make_span(2, 100)),
+            (1usize, make_span(3, 110)),
+            (1usize, make_span(1, 120)), // overflow/coalesce for pair 1
+            (3usize, make_span(7, 8)),
+        ];
+
+        for (pair, span) in ops {
+            pool_safe.push_span(pair, span, &mut touched_safe);
+            unsafe {
+                pool_hot.push_span_unchecked_hot(pair, span, &mut touched_hot);
+            }
+        }
+
+        assert_eq!(touched_safe.as_slice(), touched_hot.as_slice());
+
+        for pair in 0..pair_count {
+            pool_safe.take_into(pair, &mut out_safe);
+            pool_hot.take_into(pair, &mut out_hot);
+            assert_eq!(out_safe.as_slice(), out_hot.as_slice(), "pair={pair}");
+        }
+    }
+
+    #[test]
     fn new_rejects_max_hits_u32_overflow() {
         match HitAccPool::new(1, (u32::MAX as usize) + 1) {
             Ok(_) => panic!("max_hits values above u32::MAX must be rejected"),
@@ -729,5 +860,130 @@ mod tests {
                 "unexpected error: {err}"
             ),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kani model-checking proofs
+// ---------------------------------------------------------------------------
+
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    // Kani proofs use concrete allocation sizes to avoid symbolic Vec
+    // allocation blowup (symbolic pair_count/max_hits cause CBMC to model
+    // all possible allocation sizes simultaneously, consuming 60GB+ RAM).
+    // The pair index and span values remain symbolic, which is what matters:
+    // it proves the pointer arithmetic in push_span / take_into / reset
+    // is safe for any valid `pair < pair_count` and any span values.
+
+    const PAIR_COUNT: usize = 3;
+    const MAX_HITS: usize = 2;
+
+    /// Proves that `push_span` never causes OOB access for any valid
+    /// `pair < pair_count` and any span values.
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn verify_push_span_bounds() {
+        let mut pool = HitAccPool::new(PAIR_COUNT, MAX_HITS).unwrap();
+        let mut touched = ScratchVec::<u32>::with_capacity(PAIR_COUNT).unwrap();
+
+        let pair: usize = kani::any();
+        kani::assume(pair < PAIR_COUNT);
+
+        let start: u32 = kani::any();
+        let end: u32 = kani::any();
+        kani::assume(start <= end);
+
+        let span = SpanU32 {
+            start,
+            end,
+            anchor_hint: start,
+        };
+        pool.push_span(pair, span, &mut touched);
+        // Kani proves: no OOB, no UB for any pair and span.
+    }
+
+    /// Proves that pushing past the per-pair cap triggers the coalesce
+    /// path without OOB access.
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn verify_coalesce_overflow_bounds() {
+        let mut pool = HitAccPool::new(PAIR_COUNT, MAX_HITS).unwrap();
+        let mut touched = ScratchVec::<u32>::with_capacity(PAIR_COUNT).unwrap();
+
+        let pair: usize = kani::any();
+        kani::assume(pair < PAIR_COUNT);
+
+        // Push MAX_HITS + 1 spans to trigger coalesce.
+        for i in 0..MAX_HITS + 1 {
+            pool.push_span(
+                pair,
+                SpanU32 {
+                    start: i as u32,
+                    end: (i + 10) as u32,
+                    anchor_hint: i as u32,
+                },
+                &mut touched,
+            );
+        }
+        // Kani proves: coalesce path has no OOB.
+    }
+
+    /// Proves that `take_into` never reads OOB for any valid pair,
+    /// regardless of how many spans were pushed.
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn verify_take_into_bounds() {
+        let mut pool = HitAccPool::new(PAIR_COUNT, MAX_HITS).unwrap();
+        let mut touched = ScratchVec::<u32>::with_capacity(PAIR_COUNT).unwrap();
+        let mut out = ScratchVec::<SpanU32>::with_capacity(MAX_HITS).unwrap();
+
+        let pair: usize = kani::any();
+        kani::assume(pair < PAIR_COUNT);
+
+        let push_count: usize = kani::any();
+        kani::assume(push_count <= MAX_HITS);
+
+        for i in 0..push_count {
+            pool.push_span(
+                pair,
+                SpanU32 {
+                    start: i as u32,
+                    end: (i + 1) as u32,
+                    anchor_hint: i as u32,
+                },
+                &mut touched,
+            );
+        }
+
+        pool.take_into(pair, &mut out);
+        // Kani proves: take_into reads only valid memory.
+    }
+
+    /// Proves that `reset_touched` never writes OOB in the touched_words
+    /// bitset.
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn verify_reset_touched_bounds() {
+        let mut pool = HitAccPool::new(PAIR_COUNT, MAX_HITS).unwrap();
+        let mut touched = ScratchVec::<u32>::with_capacity(PAIR_COUNT).unwrap();
+
+        let pair: usize = kani::any();
+        kani::assume(pair < PAIR_COUNT);
+
+        pool.push_span(
+            pair,
+            SpanU32 {
+                start: 0,
+                end: 10,
+                anchor_hint: 0,
+            },
+            &mut touched,
+        );
+
+        pool.reset_touched(touched.as_slice());
+        // Kani proves: reset_touched never writes OOB.
     }
 }

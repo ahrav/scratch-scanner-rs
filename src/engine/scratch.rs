@@ -691,12 +691,15 @@ impl ScanScratch {
                 .saturating_mul(FINDING_DEDUPE_MULTIPLIER)
                 .max(64),
         );
-        let stream_match_cap = engine.tuning.max_windows_per_rule_variant.max(16);
         // rules × 3 variants (Raw/Utf16Le/Utf16Be) × max windows per variant.
         let pending_window_cap = rules_len
             .saturating_mul(3)
             .saturating_mul(engine.tuning.max_windows_per_rule_variant)
             .max(16);
+        // Keep callback staging capacity aligned with pending-window capacity:
+        // stream callbacks can emit at most one staging entry per eventual
+        // pending window, and overflow flips decode-stream fallback to full scan.
+        let stream_match_cap = pending_window_cap;
         let max_radius_bytes = (engine.max_window_diameter_bytes / 2) as u64;
         let pending_window_horizon_bytes =
             max_radius_bytes.saturating_add(STREAM_DECODE_CHUNK_BYTES as u64);
@@ -1190,13 +1193,15 @@ impl ScanScratch {
                 self.window_bytes
                     .reserve(engine.stream_ring_bytes - self.window_bytes.capacity());
             }
-            let stream_match_cap = engine.tuning.max_windows_per_rule_variant.max(16);
             let pending_window_cap = engine
                 .rules_hot
                 .len()
                 .saturating_mul(3)
                 .saturating_mul(engine.tuning.max_windows_per_rule_variant)
                 .max(16);
+            // Keep callback staging capacity aligned with pending-window capacity
+            // (same invariant as in `new` above).
+            let stream_match_cap = pending_window_cap;
             let max_radius_bytes = (engine.max_window_diameter_bytes / 2) as u64;
             let pending_window_horizon_bytes =
                 max_radius_bytes.saturating_add(STREAM_DECODE_CHUNK_BYTES as u64);

@@ -117,4 +117,6 @@ pub use offline_validate::{
 };
 
 #[cfg(feature = "tiger-harness")]
+pub use hit_pool::FuzzHitAccPool;
+#[cfg(feature = "tiger-harness")]
 pub use vs_cache::fuzz_try_load;
