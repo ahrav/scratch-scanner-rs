@@ -2475,6 +2475,8 @@ unsafe extern "C" fn vs_anchor_on_match(
     ctx: *mut c_void,
 ) -> c_int {
     // Absolutely no panics across FFI.
+    // SAFETY: `ctx` is a valid, non-null pointer to `VsAnchorMatchCtx` passed by
+    // the caller of `hs_scan`. It is exclusively borrowed for the scan duration.
     let c = unsafe { &mut *(ctx as *mut VsAnchorMatchCtx) };
 
     let pid = id as usize;
@@ -2524,9 +2526,13 @@ fn expression_info_max_width(pattern: &str, flags: c_uint) -> Result<(u32, CStri
 
     let mut info_ptr: *mut vs::hs_expr_info_t = ptr::null_mut();
     let mut compile_err: *mut vs::hs_compile_error_t = ptr::null_mut();
+    // SAFETY: `c_pat` is a valid NUL-terminated C string; `info_ptr` and
+    // `compile_err` are valid out-pointers.
     let rc =
         unsafe { vs::hs_expression_info(c_pat.as_ptr(), flags, &mut info_ptr, &mut compile_err) };
     if rc != vs::HS_SUCCESS as c_int {
+        // SAFETY: `compile_err` was populated by `hs_expression_info`; if non-null
+        // it points to a valid `hs_compile_error_t` that we read and then free.
         let msg = unsafe {
             if compile_err.is_null() {
                 format!("hs_expression_info failed: rc={rc}")
@@ -2551,9 +2557,12 @@ fn expression_info_max_width(pattern: &str, flags: c_uint) -> Result<(u32, CStri
         return Err("hs_expression_info returned null info".to_string());
     }
 
+    // SAFETY: `info_ptr` is non-null (checked above) and was allocated by
+    // `hs_expression_info` with a valid `hs_expr_info_t` layout.
     let maxw = unsafe { (*info_ptr).max_width };
+    // SAFETY: `info_ptr` was allocated by Vectorscan's misc allocator (which
+    // uses the default malloc); freeing it with `libc::free` is correct.
     unsafe {
-        // Allocated by the misc allocator; we assume default malloc/free.
         libc::free(info_ptr.cast());
     }
 
@@ -2606,12 +2615,16 @@ mod tests {
 
         let win = make_window(0, 0, 100);
 
+        // SAFETY: `ptr` points to a 4-element MaybeUninit buffer; `len` and
+        // `overflow` are valid mutable references. cap=4, max_pending=4.
         let ok = unsafe { push_stream_window_bounded(ptr, &mut len, 4, 4, &mut overflow, win) };
         assert!(ok);
         assert_eq!(len, 1);
         assert_eq!(overflow, 0);
 
         // Verify the written value.
+        // SAFETY: One element was successfully written above (len == 1), so
+        // `ptr` points to an initialized `VsStreamWindow`.
         let stored = unsafe { ptr.read() };
         assert_eq!(stored.lo, 0);
         assert_eq!(stored.hi, 100);
@@ -2626,6 +2639,8 @@ mod tests {
         let mut overflow: u8 = 0;
 
         for i in 0..3u32 {
+            // SAFETY: `ptr` points to a 3-element buffer; `len < cap` on each
+            // iteration. All mutable references are valid.
             let ok = unsafe {
                 push_stream_window_bounded(
                     ptr,
@@ -2642,6 +2657,8 @@ mod tests {
         assert_eq!(overflow, 0);
 
         // Next push should fail — buffer is full.
+        // SAFETY: `ptr` points to a 3-element buffer; `len == cap` so no write
+        // occurs. All mutable references are valid.
         let ok = unsafe {
             push_stream_window_bounded(ptr, &mut len, 3, 3, &mut overflow, make_window(99, 0, 1))
         };
@@ -2660,6 +2677,8 @@ mod tests {
 
         // Cap is 8 but max_pending is 2.
         for i in 0..2u32 {
+            // SAFETY: `ptr` points to an 8-element buffer; `len < max_pending`
+            // on each iteration. All mutable references are valid.
             let ok = unsafe {
                 push_stream_window_bounded(
                     ptr,
@@ -2675,6 +2694,8 @@ mod tests {
         assert_eq!(len, 2);
 
         // Third push hits max_pending.
+        // SAFETY: `ptr` points to an 8-element buffer; `len == max_pending` so
+        // no write occurs. All mutable references are valid.
         let ok = unsafe {
             push_stream_window_bounded(ptr, &mut len, 8, 2, &mut overflow, make_window(3, 0, 10))
         };
@@ -2691,6 +2712,8 @@ mod tests {
         let mut len: u32 = 1; // Already full.
 
         // Null overflow pointer — should not crash.
+        // SAFETY: `ptr` points to a 1-element buffer; `len == cap` so no write
+        // occurs. The null overflow pointer is handled internally by the function.
         let ok = unsafe {
             push_stream_window_bounded(
                 ptr,
@@ -2722,9 +2745,13 @@ mod tests {
             force_full: true,
         };
 
+        // SAFETY: `ptr` points to a 2-element buffer; `len == 0 < cap`. All
+        // mutable references are valid.
         let ok = unsafe { push_stream_window_bounded(ptr, &mut len, 2, 2, &mut overflow, win) };
         assert!(ok);
 
+        // SAFETY: One element was successfully written above (len == 1), so
+        // `ptr` points to an initialized `VsStreamWindow`.
         let stored = unsafe { ptr.read() };
         assert_eq!(stored.lo, 42);
         assert_eq!(stored.hi, 999);
@@ -2747,6 +2774,9 @@ mod tests {
         let mut ctx =
             build_stream_match_ctx(&mut pending, &mut pending_len, &meta, 0, &mut overflowed);
 
+        // SAFETY: `ctx` is a valid, stack-allocated `VsStreamMatchCtx` with all
+        // fields pointing to live locals. The cast to `*mut c_void` matches the
+        // FFI callback signature.
         let rc =
             unsafe { vs_on_stream_match(0, 10, 20, 0, (&mut ctx as *mut VsStreamMatchCtx).cast()) };
         assert_eq!(rc, 1);
@@ -2779,6 +2809,9 @@ mod tests {
             &mut overflowed,
         );
 
+        // SAFETY: `ctx` is a valid, stack-allocated `VsUtf16StreamMatchCtx` with
+        // all fields pointing to live locals. The cast to `*mut c_void` matches
+        // the FFI callback signature.
         let rc = unsafe {
             vs_utf16_stream_on_match(0, 0, 2, 0, (&mut ctx as *mut VsUtf16StreamMatchCtx).cast())
         };
