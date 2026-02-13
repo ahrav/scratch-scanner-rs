@@ -41,7 +41,8 @@
 //! The `*SpanStream` scanners accept chunked input via `feed(chunk, base_offset, ...)`,
 //! where `base_offset` is the absolute byte offset of `chunk[0]` in the original
 //! buffer. Call `finish(end_offset, ...)` once at end-of-stream to flush a trailing
-//! run; after `on_span` returns `false`, the stream becomes inert until `reset()`.
+//! run; after `on_span` returns `false`, the stream becomes inert (construct a
+//! new instance to scan again).
 //! Chunks are expected to arrive in-order with monotonic `base_offset` (typically
 //! contiguous). Gaps or overlaps split runs across chunk boundaries and may
 //! suppress or fragment spans.
@@ -63,12 +64,20 @@ fn is_hex(b: u8) -> bool {
     b.is_ascii_hexdigit()
 }
 
+/// Returns `true` if `b` is a URL-percent trigger byte (`%`, or `+` when
+/// `plus_to_space` is enabled).
+///
+/// A trigger is the minimum evidence that a URL-ish run might contain encoded
+/// content worth decoding. Runs without at least one trigger are discarded.
 #[inline(always)]
 pub(super) fn is_url_trigger(b: u8, plus_to_space: bool) -> bool {
     b == b'%' || (plus_to_space && b == b'+')
 }
 
-// Caller must check `is_hex` first; non-hex bytes map to 0.
+/// Convert an ASCII hex digit to its 4-bit numeric value.
+///
+/// Caller must verify `b.is_ascii_hexdigit()` first; non-hex bytes
+/// silently map to 0.
 fn hex_val(b: u8) -> u8 {
     match b {
         b'0'..=b'9' => b - b'0',
@@ -78,7 +87,9 @@ fn hex_val(b: u8) -> u8 {
     }
 }
 
-// Byte-class table used by both URL and Base64 scanners.
+// Byte-class bitmask flags for the shared 256-byte lookup table (`BYTE_CLASS`).
+// Each byte gets a bitwise-OR of these flags so both URL and base64 scanners
+// can classify a byte with a single table lookup and mask test.
 const URLISH: u8 = 1 << 0;
 const B64_CHAR: u8 = 1 << 1;
 const B64_WS: u8 = 1 << 2;
@@ -145,6 +156,10 @@ const fn build_byte_class() -> [u8; 256] {
     table
 }
 
+/// Precomputed byte-class table mapping each byte value to its bitmask flags.
+///
+/// Indexed by `byte as usize`; the result is a bitwise-OR of `URLISH`,
+/// `B64_CHAR`, `B64_WS`, and `B64_WS_SPACE` flags.
 static BYTE_CLASS: [u8; 256] = build_byte_class();
 
 /// Sentinel value indicating an invalid base64 byte in B64_DECODE table.
@@ -176,6 +191,8 @@ const fn build_b64_decode_table() -> [u8; 256] {
     table
 }
 
+/// Precomputed base64 decode table mapping each byte to its 6-bit value,
+/// `B64_PAD` (64) for `=`, or `B64_INVALID` (0xFF) for non-base64 bytes.
 static B64_DECODE: [u8; 256] = build_b64_decode_table();
 
 /// Target for span collection, allowing reuse of `Vec` or `ScratchVec`.
@@ -206,7 +223,7 @@ pub(super) trait SpanSink {
 ///
 /// # Invariants
 /// - Once `done` is set (via `on_span` returning `false`), no further spans
-///   will be emitted until `reset()` is called.
+///   will be emitted; construct a new instance to scan again.
 /// - `in_run` is `true` iff we are currently inside an eligible URL-ish run.
 /// - Between chunks, run state (`start`, `run_len`, `triggers`) is preserved
 ///   so that runs can span chunk boundaries.
@@ -241,7 +258,7 @@ impl UrlSpanStream {
     /// buffer. Chunks should be provided in order with a monotonic
     /// `base_offset` (typically contiguous) so runs can span chunk boundaries.
     /// Spans are reported as half-open absolute ranges. Returning `false` from
-    /// `on_span` stops the scan early; the stream must be `reset()` before reuse.
+    /// `on_span` stops the scan early; the stream becomes inert afterward.
     pub(super) fn feed<F>(&mut self, chunk: &[u8], base_offset: u64, mut on_span: F)
     where
         F: FnMut(u64, u64) -> bool,
@@ -329,7 +346,7 @@ impl UrlSpanStream {
 ///
 /// # Invariants
 /// - Once `done` is set (via `on_span` returning `false`), no further spans
-///   will be emitted until `reset()` is called.
+///   will be emitted; construct a new instance to scan again.
 /// - `in_run` is `true` iff we are currently inside an eligible base64 run.
 /// - `have_b64` tracks whether at least one alphabet character (not whitespace)
 ///   has been seen in the current run; runs with only whitespace are discarded.
@@ -788,11 +805,16 @@ fn decode_url_percent_to_vec(
 // Transform: Base64 (urlsafe + std alph, ignores whitespace)
 // --------------------------
 
-/// Internal error used to signal decode failures in tests.
+/// Decode errors returned by [`stream_decode_base64`].
 #[derive(Debug)]
 enum Base64DecodeError {
+    /// A byte that is not in the base64 alphabet and not whitespace.
     InvalidByte,
+    /// Padding (`=`) appeared in a position that violates the base64 spec
+    /// (e.g., `=` as the first or second char of a quantum, or data after padding).
     InvalidPadding,
+    /// The input ended with exactly one leftover base64 char, which cannot
+    /// produce any output byte (a minimum of two chars per quantum is required).
     TruncatedQuantum,
 }
 
@@ -920,6 +942,12 @@ pub(super) fn find_base64_spans_into(
     }
 }
 
+/// Returns the byte offset past the first `skip` base64-alphabet characters
+/// in `encoded`, skipping over whitespace.
+///
+/// Returns `None` if `encoded` contains fewer than `skip` alphabet chars
+/// or a non-base64 byte is encountered before the count is reached.
+/// Padding (`=`) is counted as a base64 char by the `B64_CHAR` flag.
 pub(super) fn base64_skip_chars(
     encoded: &[u8],
     skip: usize,
@@ -944,6 +972,11 @@ pub(super) fn base64_skip_chars(
     None
 }
 
+/// Counts the number of base64 data characters (A-Z, a-z, 0-9, +, /, -, _)
+/// in `encoded`, ignoring whitespace and stopping at the first non-base64 byte.
+///
+/// Padding (`=`) is excluded from the count. This is used to check whether a
+/// span meets the `min_chars` threshold before attempting decode.
 pub(super) fn base64_char_count(encoded: &[u8], allow_space_ws: bool) -> usize {
     let mut count = 0usize;
     for &b in encoded {
@@ -1210,6 +1243,10 @@ pub(super) fn map_decoded_offset(
     }
 }
 
+/// Walk `encoded` byte-by-byte, counting decoded output chars, and return the
+/// encoded byte position at which the `decoded_offset`-th output byte has been
+/// produced. A `%HH` escape consumes 3 encoded bytes for 1 decoded byte;
+/// all other bytes are 1:1.
 fn map_decoded_offset_url(encoded: &[u8], decoded_offset: usize) -> usize {
     if decoded_offset == 0 {
         return 0;
@@ -1231,6 +1268,13 @@ fn map_decoded_offset_url(encoded: &[u8], decoded_offset: usize) -> usize {
     i.min(encoded.len())
 }
 
+/// Walk `encoded` quantum-by-quantum, tracking cumulative decoded byte count,
+/// and return the encoded byte position at which `decoded_offset` output bytes
+/// have been produced.
+///
+/// Base64 output bytes arrive at quantum positions 2, 3, and 4 (when not
+/// padding). The function returns as soon as the running total reaches
+/// `decoded_offset`, so it never decodes more than necessary.
 fn map_decoded_offset_base64(encoded: &[u8], decoded_offset: usize, allow_space_ws: bool) -> usize {
     if decoded_offset == 0 {
         return 0;
@@ -1287,6 +1331,10 @@ fn map_decoded_offset_base64(encoded: &[u8], decoded_offset: usize, allow_space_
     i.min(encoded.len())
 }
 
+/// Compute the total decoded byte count for `encoded` without materializing
+/// the output. Used by [`map_decoded_offset_base64`] to detect whether the
+/// requested offset exceeds the payload, allowing an early `encoded.len()`
+/// return.
 fn base64_decoded_len(encoded: &[u8], allow_space_ws: bool) -> usize {
     let mut decoded = 0usize;
     let mut quad: [u8; 4] = [0; 4];
