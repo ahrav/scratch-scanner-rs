@@ -46,13 +46,13 @@ fi
 
 # List matching functions
 echo "--- Matching functions ---"
-RAW_MATCHES=$(cargo asm --lib -p "$PACKAGE" 2>&1 | grep -i "$PATTERN" || true)
+RAW_MATCHES=$(cargo asm --lib -p "$PACKAGE" 2>&1 | grep -i -- "$PATTERN" || true)
 
 if [ -z "$RAW_MATCHES" ]; then
     echo "No functions matching '$PATTERN' found."
     echo ""
     echo "Try a broader search:"
-    echo "  cargo asm --lib -p $PACKAGE 2>&1 | grep -i '<keyword>'"
+    echo "  cargo asm --lib -p $PACKAGE 2>&1 | grep -i -- '<keyword>'"
     exit 1
 fi
 

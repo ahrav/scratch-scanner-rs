@@ -392,13 +392,14 @@ Entropy gating kept separate from gate checks because:
 
 ## Secret Span Extraction
 
-The `extract_secret_span_locs()` helper extracts the sensitive portion of the match using a priority hierarchy:
+The `extract_secret_span_locs_raw()` helper extracts the sensitive portion of the
+match using a priority hierarchy:
 
 ### Extraction Priority
 
 1. **Configured secret_group**: If rule specifies `secret_group` and that capture group is non-empty
-2. **Capture group 1**: Gitleaks convention; if non-empty (e.g., regex like `secret\s*=\s*([\w\-]+)` captures the token in group 1)
-3. **Full match (group 0)**: Fallback when no capture groups are configured or group 1 is empty
+2. **First non-empty capture group (1..N)**: Group 1 is checked first as a fast path (Gitleaks convention), then groups 2..N are scanned for the first non-empty match
+3. **Full match (group 0)**: Fallback when no capture groups are non-empty
 
 ### Example
 

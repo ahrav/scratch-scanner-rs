@@ -15,7 +15,7 @@
 //! 2. For UTF-16 variants, decode with per-window and total-output budgets.
 //! 3. Run regex with reusable capture locations to access capture groups.
 //! 4. Apply entropy gates on the *full match* (group 0).
-//! 5. Extract the secret span using capture group priority (see [`extract_secret_span`]).
+//! 5. Extract the secret span using capture group priority (see [`extract_secret_span_locs_raw`]).
 //! 6. Apply value suppressors (when configured) on the extracted secret bytes.
 //! 7. Apply local context checks (when configured) on the secret span.
 //! 8. Apply root-context safelist suppression for root emit paths.
@@ -50,7 +50,7 @@
 //!   adapters that accumulate findings in `scratch.tmp_findings` for the caller
 //!   to batch-commit.
 //!
-//! [`extract_secret_span`]: super::helpers::extract_secret_span
+//! [`extract_secret_span_locs_raw`]: super::helpers::extract_secret_span_locs_raw
 
 use crate::api::{
     DecodeStep, FileId, FindingRec, LocalContextSpec, StepId, Utf16Endianness, STEP_ROOT,
