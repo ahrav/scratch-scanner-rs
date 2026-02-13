@@ -383,7 +383,7 @@ mod neon {
         let bytes = s.as_bytes();
         let mut i = 0;
 
-        // Process aligned 16-byte chunks.
+        // Process 16-byte chunks (vld1q_u8 handles unaligned loads).
         while i + 16 <= bytes.len() {
             let chunk = vld1q_u8(bytes.as_ptr().add(i));
             if is_all_safe_neon(chunk) {
