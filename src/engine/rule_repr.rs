@@ -10,10 +10,11 @@
 //! Compilation is split into two tiers to keep `RuleCompiled` compact:
 //!
 //! 1. [`compile_rule`] produces a `RuleCompiled` with all gate indices set to
-//!    `None`, plus a [`CompiledGates`] bag holding the heavyweight gate objects.
+//!    [`NO_GATE`] (sentinel for "absent"), plus a [`CompiledGates`] bag holding
+//!    the heavyweight gate objects.
 //! 2. The caller (`Engine::new`) pools each gate into a type-specific `Vec` on
-//!    `Engine` and patches the corresponding `Option<u32>` index back onto the
-//!    rule. This indirection means `RuleCompiled` stays small enough for
+//!    `Engine` and patches the corresponding `u32` index back onto the rule.
+//!    This indirection means `RuleCompiled` stays small enough for
 //!    cache-friendly iteration while the (rarely accessed) gate data lives in
 //!    separate, densely packed pools.
 //!
@@ -321,12 +322,20 @@ pub(super) struct EntropyCompiled {
     pub(super) max_len: usize,
 }
 
+/// Sentinel value indicating no gate is assigned for a given slot.
+///
+/// Using `u32::MAX` as a sentinel instead of `Option<u32>` saves 4 bytes per
+/// gate field (no discriminant padding), shrinking `RuleCompiled` by 28 bytes
+/// total. Valid pool indices never reach `u32::MAX` because pool sizes are
+/// bounded by the number of rules.
+pub(super) const NO_GATE: u32 = u32::MAX;
+
 /// Hot compiled rule representation used during scanning.
 ///
 /// This keeps precompiled regexes and optional gate pool indices to minimize
 /// work in the hot path. Large gate structures are stored in pool vectors on
-/// `Engine` and accessed via `Option<u32>` indices here, keeping this struct
-/// compact for cache-friendly iteration.
+/// `Engine` and accessed via `u32` indices here (with [`NO_GATE`] as the
+/// "absent" sentinel), keeping this struct compact for cache-friendly iteration.
 ///
 /// Cold per-rule metadata (e.g., rule name) is stored in the parallel
 /// [`RuleCold`] array at `Engine::rules_cold`, indexed identically so that
@@ -342,8 +351,8 @@ pub(super) struct EntropyCompiled {
 /// 3. **Gate indices**: `confirm_all`, `keywords`, `value_suppressors`,
 ///    `entropy`, `local_context`, `two_phase`, `offline_validation` —
 ///    dereferenced through `Engine` pool accessors only when the
-///    corresponding gate is present (`Some`). Most rules have 0–2 gates,
-///    so these are cold for the majority of candidates.
+///    corresponding gate is present (`!= NO_GATE`). Most rules have 0–2
+///    gates, so these are cold for the majority of candidates.
 ///
 /// # Gate pool access
 ///
@@ -361,9 +370,8 @@ pub(super) struct EntropyCompiled {
 ///
 /// # Invariants
 /// - All fields are derived from a validated `RuleSpec`.
-/// - Gate indices, when `Some`, are valid into the corresponding pool vectors.
-/// - `Option<u32>` is 8 bytes (niche optimization does not apply here because
-///   `u32` has no niche — all bit patterns are valid values).
+/// - Gate indices, when `!= NO_GATE`, are valid into the corresponding pool
+///   vectors.
 #[derive(Clone, Debug)]
 pub(super) struct RuleCompiled {
     pub(super) re: Regex,
@@ -371,14 +379,14 @@ pub(super) struct RuleCompiled {
     pub(super) needs_assignment_shape_check: bool,
     pub(super) secret_group: Option<u16>,
     // Gate pool indices — dereference through Engine pool vectors.
-    // See the "Gate pool access" table in the struct-level doc.
-    pub(super) confirm_all: Option<u32>,
-    pub(super) keywords: Option<u32>,
-    pub(super) value_suppressors: Option<u32>,
-    pub(super) entropy: Option<u32>,
-    pub(super) local_context: Option<u32>,
-    pub(super) two_phase: Option<u32>,
-    pub(super) offline_validation: Option<u32>,
+    // NO_GATE (u32::MAX) means the gate is absent for this rule.
+    pub(super) confirm_all: u32,
+    pub(super) keywords: u32,
+    pub(super) value_suppressors: u32,
+    pub(super) entropy: u32,
+    pub(super) local_context: u32,
+    pub(super) two_phase: u32,
+    pub(super) offline_validation: u32,
 }
 
 /// Cold rule metadata used outside the validation hot path.
@@ -390,8 +398,9 @@ pub(super) struct RuleCold {
     pub(super) name: &'static str,
 }
 
-// Compile-time size guard: gate index is 8 bytes (Option<u32> without niche).
-const _: () = assert!(std::mem::size_of::<Option<u32>>() == 8);
+// Compile-time size guard: gate index is now a plain u32 (4 bytes) with
+// NO_GATE sentinel, down from 8-byte Option<u32> (no niche optimization).
+const _: () = assert!(std::mem::size_of::<u32>() == 4);
 
 // --------------------------
 // Compile helpers
@@ -413,12 +422,12 @@ pub(super) struct CompiledGates {
 
 /// Compile a validated rule spec into the runtime representation.
 ///
-/// Returns the compact `RuleCompiled` (with `None` gate indices) and the
-/// compiled gate objects. The caller is responsible for pooling gates into
+/// Returns the compact `RuleCompiled` (with [`NO_GATE`] sentinel indices) and
+/// the compiled gate objects. The caller is responsible for pooling gates into
 /// `Engine` vectors and patching the indices on `RuleCompiled`.
 ///
-/// `confirm_all` is intentionally left `None` and should be filled by the
-/// caller after confirm-all literals are derived.
+/// `confirm_all` is intentionally left as `NO_GATE` and should be filled by
+/// the caller after confirm-all literals are derived.
 pub(super) fn compile_rule(spec: &RuleSpec) -> (RuleCompiled, CompiledGates) {
     let two_phase = spec.two_phase.as_ref().map(|tp| {
         let count = tp.confirm_any.len();
@@ -489,13 +498,13 @@ pub(super) fn compile_rule(spec: &RuleSpec) -> (RuleCompiled, CompiledGates) {
         must_contain: spec.must_contain,
         needs_assignment_shape_check,
         secret_group: spec.secret_group,
-        confirm_all: None,
-        keywords: None,
-        value_suppressors: None,
-        entropy: None,
-        local_context: None,
-        two_phase: None,
-        offline_validation: None,
+        confirm_all: NO_GATE,
+        keywords: NO_GATE,
+        value_suppressors: NO_GATE,
+        entropy: NO_GATE,
+        local_context: NO_GATE,
+        two_phase: NO_GATE,
+        offline_validation: NO_GATE,
     };
 
     let gates = CompiledGates {
@@ -705,7 +714,7 @@ mod tests {
         let spec = test_rule_spec(Some(SUPPRESSORS));
 
         let (rule, gates) = compile_rule(&spec);
-        assert!(rule.value_suppressors.is_none());
+        assert_eq!(rule.value_suppressors, NO_GATE);
         let packed = gates
             .value_suppressors
             .as_ref()
@@ -721,7 +730,7 @@ mod tests {
         let spec = test_rule_spec(None);
         let (rule, gates) = compile_rule(&spec);
 
-        assert!(rule.value_suppressors.is_none());
+        assert_eq!(rule.value_suppressors, NO_GATE);
         assert!(gates.value_suppressors.is_none());
     }
 }

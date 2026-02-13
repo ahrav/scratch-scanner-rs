@@ -136,10 +136,16 @@ pub(super) fn coalesce_under_pressure_sorted(
 ///
 /// # Behavior
 /// - Returns false when `needles` contains no patterns.
+/// - Fast-paths the common single-needle case to avoid loop overhead.
 pub(super) fn contains_any_memmem(hay: &[u8], needles: &PackedPatterns) -> bool {
-    for pair in needles.offsets.windows(2) {
-        let start = pair[0] as usize;
-        let end = pair[1] as usize;
+    let count = needles.offsets.len().saturating_sub(1);
+    if count == 1 {
+        let end = needles.offsets[1] as usize;
+        return memmem::find(hay, &needles.bytes[..end]).is_some();
+    }
+    for i in 0..count {
+        let start = needles.offsets[i] as usize;
+        let end = needles.offsets[i + 1] as usize;
         debug_assert!(end <= needles.bytes.len());
         // SAFETY: PackedPatterns invariant guarantees offsets index into bytes.
         let needle = unsafe { needles.bytes.get_unchecked(start..end) };
@@ -159,10 +165,16 @@ pub(super) fn contains_any_memmem(hay: &[u8], needles: &PackedPatterns) -> bool 
 ///
 /// # Behavior
 /// - Returns true when `needles` contains no patterns.
+/// - Fast-paths the common single-needle case to avoid loop overhead.
 pub(super) fn contains_all_memmem(hay: &[u8], needles: &PackedPatterns) -> bool {
-    for pair in needles.offsets.windows(2) {
-        let start = pair[0] as usize;
-        let end = pair[1] as usize;
+    let count = needles.offsets.len().saturating_sub(1);
+    if count == 1 {
+        let end = needles.offsets[1] as usize;
+        return memmem::find(hay, &needles.bytes[..end]).is_some();
+    }
+    for i in 0..count {
+        let start = needles.offsets[i] as usize;
+        let end = needles.offsets[i + 1] as usize;
         debug_assert!(end <= needles.bytes.len());
         // SAFETY: PackedPatterns invariant guarantees offsets index into bytes.
         let needle = unsafe { needles.bytes.get_unchecked(start..end) };
@@ -662,7 +674,81 @@ pub(super) fn extract_secret_span_locs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::rule_repr::PackedPatternsBuilder;
     use crate::scratch_memory::ScratchVec;
+
+    fn build_packed(patterns: &[&[u8]]) -> PackedPatterns {
+        let byte_len: usize = patterns.iter().map(|p| p.len()).sum();
+        let mut b = PackedPatternsBuilder::with_capacity(patterns.len(), byte_len);
+        for &p in patterns {
+            b.push_raw(p);
+        }
+        b.build()
+    }
+
+    // ---- contains_any_memmem ----
+
+    #[test]
+    fn contains_any_memmem_zero_needles() {
+        let packed = build_packed(&[]);
+        assert!(!contains_any_memmem(b"hello world", &packed));
+    }
+
+    #[test]
+    fn contains_any_memmem_single_needle_present() {
+        let packed = build_packed(&[b"world"]);
+        assert!(contains_any_memmem(b"hello world", &packed));
+    }
+
+    #[test]
+    fn contains_any_memmem_single_needle_absent() {
+        let packed = build_packed(&[b"xyz"]);
+        assert!(!contains_any_memmem(b"hello world", &packed));
+    }
+
+    #[test]
+    fn contains_any_memmem_multiple_needles_one_present() {
+        let packed = build_packed(&[b"xyz", b"world"]);
+        assert!(contains_any_memmem(b"hello world", &packed));
+    }
+
+    #[test]
+    fn contains_any_memmem_multiple_needles_none_present() {
+        let packed = build_packed(&[b"xyz", b"abc"]);
+        assert!(!contains_any_memmem(b"hello world", &packed));
+    }
+
+    // ---- contains_all_memmem ----
+
+    #[test]
+    fn contains_all_memmem_zero_needles() {
+        let packed = build_packed(&[]);
+        assert!(contains_all_memmem(b"hello world", &packed));
+    }
+
+    #[test]
+    fn contains_all_memmem_single_needle_present() {
+        let packed = build_packed(&[b"hello"]);
+        assert!(contains_all_memmem(b"hello world", &packed));
+    }
+
+    #[test]
+    fn contains_all_memmem_single_needle_absent() {
+        let packed = build_packed(&[b"xyz"]);
+        assert!(!contains_all_memmem(b"hello world", &packed));
+    }
+
+    #[test]
+    fn contains_all_memmem_multiple_needles_all_present() {
+        let packed = build_packed(&[b"hello", b"world"]);
+        assert!(contains_all_memmem(b"hello world", &packed));
+    }
+
+    #[test]
+    fn contains_all_memmem_multiple_needles_one_missing() {
+        let packed = build_packed(&[b"hello", b"xyz"]);
+        assert!(!contains_all_memmem(b"hello world", &packed));
+    }
 
     fn expected_map_utf16_offset(input: &[u8], decoded_offset: usize, le: bool) -> usize {
         if decoded_offset == 0 {

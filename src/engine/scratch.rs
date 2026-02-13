@@ -43,8 +43,46 @@ use regex::bytes::CaptureLocations;
 
 use super::Engine;
 
-/// BLAKE3 digest of the normalized (whitespace-collapsed, case-folded) secret
-/// value. 32 bytes = 256 bits, matching BLAKE3's default output length.
+/// Packed dedup key for finding deduplication.
+///
+/// Uses `#[repr(C)]` with `bytemuck::Pod` to guarantee a fixed 32-byte layout
+/// aligned to the AEGIS-128L absorption rate (32 bytes = 2 × 128-bit AES
+/// blocks) with no padding. This lets `hash128` process the key in a single
+/// absorption step with no trailing partial-block handling, which is measurably
+/// faster than the previous 33-byte packed layout.
+///
+/// The variant discriminator is packed into the high byte of
+/// `rule_id_with_variant`. This requires `rule_id <= DEDUP_RULE_ID_MAX`.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct DedupKey {
+    file_id: u32,
+    /// Lower 24 bits: `rule_id`. Upper 8 bits: `variant_disc`.
+    rule_id_with_variant: u32,
+    span_start: u32,
+    span_end: u32,
+    root_hint_start: u64,
+    root_hint_end: u64,
+}
+
+const _: () = assert!(std::mem::size_of::<DedupKey>() == 32);
+
+/// Number of low bits reserved for rule IDs in `DedupKey::rule_id_with_variant`.
+const DEDUP_RULE_ID_BITS: u32 = 24;
+/// Maximum rule id that can be packed with an 8-bit variant discriminator.
+pub(super) const DEDUP_RULE_ID_MAX: u32 = (1u32 << DEDUP_RULE_ID_BITS) - 1;
+
+#[inline(always)]
+fn pack_rule_id_with_variant(rule_id: u32, variant_disc: u8) -> u32 {
+    assert!(
+        rule_id <= DEDUP_RULE_ID_MAX,
+        "rule_id exceeds 24-bit dedup budget"
+    );
+    rule_id | (u32::from(variant_disc) << DEDUP_RULE_ID_BITS)
+}
+
+/// BLAKE3 digest of the raw secret bytes extracted after gate validation.
+/// 32 bytes = 256 bits, matching BLAKE3's default output length.
 ///
 /// Used for cross-chunk and cross-run deduplication: two findings with the
 /// same `NormHash` are considered the same secret regardless of surrounding
@@ -354,6 +392,13 @@ impl CachelineBoundary {
 /// hot cache lines when transforms are inactive (the common case for
 /// many file types).
 ///
+/// **Per-chunk region** (after VS scratch fields): fields written once
+/// per chunk or only under `perf-stats` / `debug_assertions`. Includes
+/// safelist/offline suppression counters, the one-shot prefilter flags,
+/// overlap metadata, and the capacity-validated sentinel. Placing these
+/// after the cold region keeps them off cache lines touched by the inner
+/// scan loop and the transform decode path.
+///
 /// The `_cold_boundary` marker forces the first cold field (`slab`) to
 /// begin at a cache-line boundary, reducing false sharing between regions.
 #[repr(C)]
@@ -374,14 +419,6 @@ pub struct ScanScratch {
     pub(super) max_findings: usize,
     /// Number of findings that could not be emitted because the cap was reached.
     pub(super) findings_dropped: usize,
-    /// Findings removed by the global context safelist at emission time.
-    /// Incremented only when both `perf-stats` and `debug_assertions` are
-    /// enabled; accessor returns 0 otherwise.
-    pub(super) safelist_suppressed: usize,
-    /// Findings removed by post-scan offline structural validation.
-    /// Incremented only when both `perf-stats` and `debug_assertions` are
-    /// enabled; accessor returns 0 otherwise.
-    pub(super) offline_suppressed: usize,
     /// Work queue for breadth-first buffer traversal.
     ///
     /// Contains the root buffer plus any decoded buffers from transforms.
@@ -434,27 +471,6 @@ pub struct ScanScratch {
     /// reconstruct the full decode path. This buffer holds the reversed chain
     /// during materialization. Capacity is bounded by `max_transform_depth`.
     pub(super) steps_buf: ScratchVec<DecodeStep>,
-    /// Set by `scan_chunk_into` after running the Vectorscan prefilter on the
-    /// root buffer. Consumed (one-shot) by the first `scan_rules_on_buffer`
-    /// call so that the root buffer skips redundant prefiltering. Transform
-    /// buffer calls see `false` and run the full prefilter as normal.
-    pub(super) root_prefilter_done: bool,
-    /// Whether the root prefilter detected UTF-16 anchor hits. Paired with
-    /// `root_prefilter_done`; only meaningful when that flag is `true`.
-    pub(super) root_prefilter_saw_utf16: bool,
-    /// Overlap size inferred from the previous chunk in the same file.
-    ///
-    /// Used to determine whether a transform trigger before a match would have
-    /// appeared in the prior chunk, so dedupe boundaries can be widened only
-    /// when needed.
-    pub(super) chunk_overlap_backscan: usize,
-    /// Set after the first `reset_for_scan` validates capacities.
-    ///
-    /// Since the `Engine` is immutable after construction, capacity checks
-    /// are idempotent — they only matter on the first call. Subsequent calls
-    /// skip the validation block for reduced per-chunk overhead.
-    capacity_validated: bool,
-
     // --------------- Cache-line boundary ----------------
     _cold_boundary: CachelineBoundary,
 
@@ -474,9 +490,9 @@ pub struct ScanScratch {
     /// or transform re-scans produce identical matches. The set is reset on file
     /// boundary transitions (new file or `base_offset == 0`).
     ///
-    /// Key composition (32 bytes → 128-bit hash):
+    /// Key composition (32 bytes = one AEGIS-128L absorption block → 128-bit hash):
     /// - `file_id` (4 bytes) — scoped to current file
-    /// - `rule_id` (4 bytes) — distinguishes rule matches
+    /// - `rule_id | variant_disc << 24` (4 bytes) — rule + UTF-16 endianness discriminator
     /// - `span_start`, `span_end` (8 bytes) — root-level span (zeroed for mapped transforms)
     /// - `root_hint_start`, `root_hint_end` (16 bytes) — dedupe boundary in root coordinates
     ///
@@ -539,6 +555,37 @@ pub struct ScanScratch {
     /// Per-thread Vectorscan scratch space for decoded gate scanning.
     /// Used for anchor gating in decoded transform output (e.g., base64 decoded bytes).
     pub(super) vs_gate_scratch: Option<VsScratch>,
+
+    // --- Per-chunk / debug-only fields (set once per chunk or rarer) ---
+    /// Findings removed by the global context safelist at emission time.
+    /// Incremented only when both `perf-stats` and `debug_assertions` are
+    /// enabled; accessor returns 0 otherwise.
+    pub(super) safelist_suppressed: usize,
+    /// Findings removed by post-scan offline structural validation.
+    /// Incremented only when both `perf-stats` and `debug_assertions` are
+    /// enabled; accessor returns 0 otherwise.
+    pub(super) offline_suppressed: usize,
+    /// Set by `scan_chunk_into` after running the Vectorscan prefilter on the
+    /// root buffer. Consumed (one-shot) by the first `scan_rules_on_buffer`
+    /// call so that the root buffer skips redundant prefiltering. Transform
+    /// buffer calls see `false` and run the full prefilter as normal.
+    pub(super) root_prefilter_done: bool,
+    /// Whether the root prefilter detected UTF-16 anchor hits. Paired with
+    /// `root_prefilter_done`; only meaningful when that flag is `true`.
+    pub(super) root_prefilter_saw_utf16: bool,
+    /// Overlap size inferred from the previous chunk in the same file.
+    ///
+    /// Used to determine whether a transform trigger before a match would have
+    /// appeared in the prior chunk, so dedupe boundaries can be widened only
+    /// when needed.
+    pub(super) chunk_overlap_backscan: usize,
+    /// Set after the first `reset_for_scan` validates capacities.
+    ///
+    /// Since the `Engine` is immutable after construction, capacity checks
+    /// are idempotent — they only matter on the first call. Subsequent calls
+    /// skip the validation block for reduced per-chunk overhead.
+    capacity_validated: bool,
+
     /// Per-scan Base64 decode/gate instrumentation counters (feature: `b64-stats`).
     #[cfg(feature = "b64-stats")]
     pub(super) base64_stats: Base64DecodeStats,
@@ -635,8 +682,6 @@ impl ScanScratch {
                 .expect("scratch drop_hint_end allocation failed"),
             max_findings,
             findings_dropped: 0,
-            safelist_suppressed: 0,
-            offline_suppressed: 0,
             work_q: ScratchVec::with_capacity(engine.tuning.max_work_items.saturating_add(1))
                 .expect("scratch work_q allocation failed"),
             work_head: 0,
@@ -753,6 +798,8 @@ impl ScanScratch {
             chunk_overlap_backscan: 0,
             capacity_validated: false,
             _cold_boundary: CachelineBoundary::new(),
+            safelist_suppressed: 0,
+            offline_suppressed: 0,
             last_chunk_start: 0,
             last_chunk_len: 0,
             last_file_id: None,
@@ -1452,14 +1499,17 @@ impl ScanScratch {
     ///
     /// # Deduplication Strategy
     ///
-    /// Findings are keyed by a 33-byte composite:
+    /// Findings are keyed by a 32-byte composite (`DedupKey`):
     ///
     /// ```text
-    /// ┌────────┬────────┬────────────┬──────────┬─────────────────┬───────────────┬─────────┐
-    /// │file_id │rule_id │ span_start │ span_end │ root_hint_start │ root_hint_end │ variant │
-    /// │ 4B     │ 4B     │ 4B         │ 4B       │ 8B              │ 8B            │ 1B      │
-    /// └────────┴────────┴────────────┴──────────┴─────────────────┴───────────────┴─────────┘
+    /// ┌────────┬──────────────────────┬────────────┬──────────┬─────────────────┬───────────────┐
+    /// │file_id │ rule_id_with_variant │ span_start │ span_end │ root_hint_start │ root_hint_end │
+    /// │ 4B     │ 4B                   │ 4B         │ 4B       │ 8B              │ 8B            │
+    /// └────────┴──────────────────────┴────────────┴──────────┴─────────────────┴───────────────┘
     /// ```
+    ///
+    /// `rule_id_with_variant` packs a 24-bit rule id plus an 8-bit variant
+    /// discriminator. Rule ids above `DEDUP_RULE_ID_MAX` are rejected.
     ///
     /// For transform-derived findings (`step_id != STEP_ROOT`), span coordinates
     /// are zeroed only when a precise root-span mapping is available. When
@@ -1491,7 +1541,7 @@ impl ScanScratch {
     ///
     /// Replacement lookup is `O(n)` in pending findings (linear scan of `out`)
     /// but bounded by `max_findings_per_chunk`, so it stays predictable.
-    #[inline(always)]
+    #[inline]
     pub(super) fn push_finding_with_drop_hint(
         &mut self,
         rec: FindingRec,
@@ -1534,17 +1584,16 @@ impl ScanScratch {
             0
         };
 
-        // Build a 33-byte dedup key and hash to 128 bits.
-        let mut key_bytes = [0u8; 33];
-        key_bytes[0..4].copy_from_slice(&rec.file_id.0.to_le_bytes());
-        key_bytes[4..8].copy_from_slice(&rec.rule_id.to_le_bytes());
-        key_bytes[8..12].copy_from_slice(&span_start.to_le_bytes());
-        key_bytes[12..16].copy_from_slice(&span_end.to_le_bytes());
-        key_bytes[16..24].copy_from_slice(&rec.root_hint_start.to_le_bytes());
-        key_bytes[24..32].copy_from_slice(&normalized_root_hint_end.to_le_bytes());
-        key_bytes[32] = variant_disc;
-
-        let hash = hash128(&key_bytes);
+        // Build a 32-byte dedup key (one AEGIS-128L absorption block) and hash to 128 bits.
+        let key = DedupKey {
+            file_id: rec.file_id.0,
+            rule_id_with_variant: pack_rule_id_with_variant(rec.rule_id, variant_disc),
+            span_start,
+            span_end,
+            root_hint_start: rec.root_hint_start,
+            root_hint_end: normalized_root_hint_end,
+        };
+        let hash = hash128(bytemuck::bytes_of(&key));
         // `insert` returns `true` if the key was newly added.
         // `seen_in_scan`: true if this key was already present in *this scan*.
         // `is_new`:       true if this key was newly added to the *cross-chunk* set.
@@ -1564,66 +1613,14 @@ impl ScanScratch {
         }
 
         if !is_new {
-            // Same-scan duplicate. Prefer findings with more information:
-            // 1. Transform findings over RAW (transforms provide decoded content)
-            // 2. For same-type duplicates, prefer larger root_hint_end
-            //
-            // Linear scan over pending findings to find the matching entry.
-            for (i, existing) in self.out.as_mut_slice().iter_mut().enumerate() {
-                if existing.file_id != rec.file_id || existing.rule_id != rec.rule_id {
-                    continue;
-                }
-
-                // Check if this existing finding matches the dedup key criteria.
-                let existing_matches = if rec.step_id == STEP_ROOT {
-                    // Incoming is RAW: match on span and root_hint
-                    existing.span_start == rec.span_start
-                        && existing.span_end == rec.span_end
-                        && existing.root_hint_start == rec.root_hint_start
-                        && existing.root_hint_end == rec.root_hint_end
-                } else {
-                    // Incoming is transform: match on root_hint_start and normalized_root_hint_end
-                    if existing.step_id == STEP_ROOT {
-                        // Existing is RAW, incoming is transform. They match if the RAW's
-                        // root_hint overlaps with the transform's normalized root_hint.
-                        existing.root_hint_start == rec.root_hint_start
-                            && existing.root_hint_end <= normalized_root_hint_end.saturating_add(3)
-                            && existing.root_hint_end >= normalized_root_hint_end
-                    } else {
-                        // Both are transforms: match on normalized root_hint
-                        if existing.root_hint_start != rec.root_hint_start {
-                            false
-                        } else {
-                            let existing_normalized_end =
-                                normalize_root_hint_end_for_dedup(existing, leaf_transform);
-                            existing_normalized_end == normalized_root_hint_end
-                        }
-                    }
-                };
-
-                if existing_matches {
-                    // Found the matching existing finding. Decide whether to replace it.
-                    let should_replace =
-                        if rec.step_id != STEP_ROOT && existing.step_id == STEP_ROOT {
-                            // Incoming is transform, existing is RAW: prefer transform
-                            true
-                        } else if rec.step_id == STEP_ROOT && existing.step_id != STEP_ROOT {
-                            // Incoming is RAW, existing is transform: keep transform
-                            false
-                        } else {
-                            // Both same type: prefer larger root_hint_end
-                            rec.root_hint_end > existing.root_hint_end
-                        };
-
-                    if should_replace {
-                        *existing = rec;
-                        self.drop_hint_end.as_mut_slice()[i] = drop_hint_end;
-                        self.norm_hash.as_mut_slice()[i] = norm_hash;
-                    }
-                    return;
-                }
-            }
-            return; // Already seen (or hash collision) and no update needed.
+            self.replace_same_scan_duplicate(
+                rec,
+                norm_hash,
+                drop_hint_end,
+                normalized_root_hint_end,
+                leaf_transform,
+            );
+            return;
         }
 
         if self.out.len() < self.max_findings {
@@ -1644,237 +1641,75 @@ impl ScanScratch {
             self.findings_dropped = self.findings_dropped.saturating_add(1);
         }
     }
+
+    /// Same-scan duplicate replacement (cold path).
+    ///
+    /// Extracted from `push_finding_with_drop_hint` to keep the hot fast path
+    /// compact for better register allocation and i-cache utilization.
+    ///
+    /// Replacement policy (most-informative-wins):
+    /// 1. Transform findings replace RAW findings (transforms provide decoded
+    ///    content that aids triage).
+    /// 2. RAW findings never replace an existing transform finding.
+    /// 3. Among same-type duplicates, the finding with the larger
+    ///    `root_hint_end` wins (wider context window).
+    #[cold]
+    fn replace_same_scan_duplicate(
+        &mut self,
+        rec: FindingRec,
+        norm_hash: NormHash,
+        drop_hint_end: u64,
+        normalized_root_hint_end: u64,
+        leaf_transform: Option<TransformId>,
+    ) {
+        for (i, existing) in self.out.as_mut_slice().iter_mut().enumerate() {
+            if existing.file_id != rec.file_id || existing.rule_id != rec.rule_id {
+                continue;
+            }
+
+            // Match criteria vary by finding type:
+            //   RAW vs RAW:       exact span + root_hint match
+            //   transform vs RAW: root_hint_start match + ≤3-byte padding tolerance
+            //   transform vs transform: normalized root_hint match
+            let existing_matches = if rec.step_id == STEP_ROOT {
+                existing.span_start == rec.span_start
+                    && existing.span_end == rec.span_end
+                    && existing.root_hint_start == rec.root_hint_start
+                    && existing.root_hint_end == rec.root_hint_end
+            } else if existing.step_id == STEP_ROOT {
+                existing.root_hint_start == rec.root_hint_start
+                    && existing.root_hint_end <= normalized_root_hint_end.saturating_add(3)
+                    && existing.root_hint_end >= normalized_root_hint_end
+            } else {
+                existing.root_hint_start == rec.root_hint_start && {
+                    let existing_normalized_end =
+                        normalize_root_hint_end_for_dedup(existing, leaf_transform);
+                    existing_normalized_end == normalized_root_hint_end
+                }
+            };
+
+            if existing_matches {
+                // Transform > RAW (decoded content aids triage);
+                // among same type, prefer wider context (larger root_hint_end).
+                let should_replace = if rec.step_id != STEP_ROOT && existing.step_id == STEP_ROOT {
+                    true
+                } else if rec.step_id == STEP_ROOT && existing.step_id != STEP_ROOT {
+                    false
+                } else {
+                    rec.root_hint_end > existing.root_hint_end
+                };
+
+                if should_replace {
+                    *existing = rec;
+                    self.drop_hint_end.as_mut_slice()[i] = drop_hint_end;
+                    self.norm_hash.as_mut_slice()[i] = norm_hash;
+                }
+                return;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{normalize_root_hint_end_for_dedup, CachelineBoundary, ScanScratch};
-    use crate::api::{
-        FileId, FindingRec, RuleSpec, StepId, TransformConfig, TransformId, Tuning, STEP_ROOT,
-    };
-    use crate::engine::Engine;
-    use regex::bytes::Regex;
-
-    #[test]
-    fn scanscratch_cold_region_is_cacheline_aligned() {
-        assert_eq!(std::mem::align_of::<CachelineBoundary>(), 64);
-        assert_eq!(std::mem::align_of::<ScanScratch>() % 64, 0);
-
-        let cold_boundary_offset = std::mem::offset_of!(ScanScratch, _cold_boundary);
-        let slab_offset = std::mem::offset_of!(ScanScratch, slab);
-
-        assert_eq!(cold_boundary_offset % 64, 0);
-        assert_eq!(slab_offset % 64, 0);
-        assert!(slab_offset >= cold_boundary_offset);
-
-        // Key hot fields must live before the cold boundary.
-        let out_offset = std::mem::offset_of!(ScanScratch, out);
-        let work_q_offset = std::mem::offset_of!(ScanScratch, work_q);
-        let steps_buf_offset = std::mem::offset_of!(ScanScratch, steps_buf);
-
-        assert!(
-            out_offset < cold_boundary_offset,
-            "out (findings) must be in the hot region"
-        );
-        assert!(
-            work_q_offset < cold_boundary_offset,
-            "work_q must be in the hot region"
-        );
-        assert!(
-            steps_buf_offset < cold_boundary_offset,
-            "steps_buf must be in the hot region"
-        );
-    }
-
-    fn make_rec(
-        step_id: StepId,
-        span_start: u32,
-        span_end: u32,
-        root_hint_start: u64,
-        root_hint_end: u64,
-    ) -> FindingRec {
-        FindingRec {
-            file_id: FileId(0),
-            rule_id: 0,
-            span_start,
-            span_end,
-            root_hint_start,
-            root_hint_end,
-            dedupe_with_span: false,
-            step_id,
-        }
-    }
-
-    fn test_tuning() -> Tuning {
-        Tuning {
-            merge_gap: 64,
-            max_windows_per_rule_variant: 64,
-            pressure_gap_start: 128,
-            max_anchor_hits_per_rule_variant: 256,
-            max_utf16_decoded_bytes_per_window: 4096,
-            max_transform_depth: 2,
-            max_total_decode_output_bytes: 1024 * 1024,
-            max_work_items: 64,
-            max_findings_per_chunk: 4096,
-            scan_utf16_variants: true,
-        }
-    }
-
-    fn simple_rule() -> RuleSpec {
-        RuleSpec {
-            name: "test-secret",
-            anchors: &[b"SECRET"],
-            radius: 32,
-            validator: crate::api::ValidatorKind::None,
-            two_phase: None,
-            must_contain: None,
-            keywords_any: None,
-            value_suppressors_any: None,
-            entropy: None,
-            local_context: None,
-            secret_group: None,
-            offline_validation: None,
-            re: Regex::new(r"SECRET[A-Z0-9]{8}").unwrap(),
-        }
-    }
-
-    fn new_test_scratch() -> ScanScratch {
-        let engine = Engine::new(
-            vec![simple_rule()],
-            Vec::<TransformConfig>::new(),
-            test_tuning(),
-        );
-        engine.new_scratch()
-    }
-
-    #[test]
-    fn engine_normalize_url_percent_not_snapped() {
-        // decoded_len=13, min_encoded(base64)=18
-        // root_hint_end = root_hint_start + 19 (min+1, in padding window)
-        let rec = make_rec(StepId(1), 200, 213, 1000, 1019);
-        let result = normalize_root_hint_end_for_dedup(&rec, Some(TransformId::UrlPercent));
-        // UrlPercent must NOT snap — returns original root_hint_end
-        assert_eq!(result, 1019);
-    }
-
-    #[test]
-    fn engine_normalize_base64_snaps() {
-        let rec = make_rec(StepId(1), 200, 213, 1000, 1019);
-        let result = normalize_root_hint_end_for_dedup(&rec, Some(TransformId::Base64));
-        // Base64: decoded_len=13, min_encoded=18, actual=19, snap to 1018
-        assert_eq!(result, 1018);
-    }
-
-    #[test]
-    fn engine_normalize_root_unchanged() {
-        let rec = make_rec(STEP_ROOT, 200, 213, 1000, 1019);
-        let result = normalize_root_hint_end_for_dedup(&rec, Some(TransformId::Base64));
-        assert_eq!(result, 1019);
-    }
-
-    #[test]
-    fn engine_normalize_none_transform_not_snapped() {
-        let rec = make_rec(StepId(1), 200, 213, 1000, 1019);
-        let result = normalize_root_hint_end_for_dedup(&rec, None);
-        assert_eq!(result, 1019);
-    }
-
-    #[test]
-    fn drain_findings_with_hashes_preserves_alignment_and_order() {
-        let mut scratch = new_test_scratch();
-        let rec_a = make_rec(STEP_ROOT, 10, 16, 100, 106);
-        let rec_b = make_rec(STEP_ROOT, 20, 26, 200, 206);
-        let hash_a = [0xA1; 32];
-        let hash_b = [0xB2; 32];
-
-        scratch.push_finding(rec_a, hash_a);
-        scratch.push_finding(rec_b, hash_b);
-
-        let mut findings_out = Vec::with_capacity(2);
-        let mut hash_out = Vec::with_capacity(2);
-        scratch.drain_findings_with_hashes(&mut findings_out, &mut hash_out);
-
-        assert_eq!(findings_out, vec![rec_a, rec_b]);
-        assert_eq!(hash_out, vec![hash_a, hash_b]);
-        assert_eq!(scratch.pending_findings_len(), 0);
-        assert!(scratch.norm_hashes().is_empty());
-        assert!(scratch.drop_hint_end().is_empty());
-    }
-
-    #[test]
-    #[should_panic(expected = "findings output capacity too small")]
-    fn drain_findings_with_hashes_panics_when_findings_capacity_too_small() {
-        let mut scratch = new_test_scratch();
-        scratch.push_finding(make_rec(STEP_ROOT, 10, 16, 100, 106), [0x11; 32]);
-        scratch.push_finding(make_rec(STEP_ROOT, 20, 26, 200, 206), [0x22; 32]);
-
-        let mut findings_out = Vec::with_capacity(1);
-        let mut hash_out = Vec::with_capacity(2);
-        scratch.drain_findings_with_hashes(&mut findings_out, &mut hash_out);
-    }
-
-    #[test]
-    #[should_panic(expected = "norm-hash output capacity too small")]
-    fn drain_findings_with_hashes_panics_when_hash_capacity_too_small() {
-        let mut scratch = new_test_scratch();
-        scratch.push_finding(make_rec(STEP_ROOT, 10, 16, 100, 106), [0x11; 32]);
-        scratch.push_finding(make_rec(STEP_ROOT, 20, 26, 200, 206), [0x22; 32]);
-
-        let mut findings_out = Vec::with_capacity(2);
-        let mut hash_out = Vec::with_capacity(1);
-        scratch.drain_findings_with_hashes(&mut findings_out, &mut hash_out);
-    }
-
-    #[test]
-    fn cross_chunk_dedupe_tracks_candidates_beyond_emit_cap() {
-        let mut tuning = test_tuning();
-        tuning.max_findings_per_chunk = 8;
-        let engine = Engine::new(vec![simple_rule()], Vec::<TransformConfig>::new(), tuning);
-        let mut scratch = engine.new_scratch();
-
-        let make_candidate = |idx: u32| {
-            make_rec(
-                STEP_ROOT,
-                idx.saturating_mul(2),
-                idx.saturating_mul(2).saturating_add(1),
-                1_000u64.saturating_add(u64::from(idx).saturating_mul(10)),
-                1_004u64.saturating_add(u64::from(idx).saturating_mul(10)),
-            )
-        };
-
-        scratch.update_chunk_overlap(FileId(0), 0, 1024);
-        for idx in 0..80u32 {
-            let rec = make_candidate(idx);
-            let mut norm_hash = [0u8; 32];
-            norm_hash[0] = idx as u8;
-            scratch.push_finding_with_drop_hint(
-                rec,
-                norm_hash,
-                rec.root_hint_end,
-                rec.dedupe_with_span,
-            );
-        }
-        assert_eq!(
-            scratch.pending_findings_len(),
-            8,
-            "emit cap should keep only the first eight pending findings"
-        );
-
-        scratch.reset_for_scan_after_prefilter(&engine);
-        scratch.update_chunk_overlap(FileId(0), 768, 1024);
-
-        let duplicate = make_candidate(79);
-        scratch.push_finding_with_drop_hint(
-            duplicate,
-            [79u8; 32],
-            duplicate.root_hint_end,
-            duplicate.dedupe_with_span,
-        );
-
-        assert_eq!(
-            scratch.pending_findings_len(),
-            0,
-            "cross-chunk duplicate should be suppressed even when first sighting exceeded emit cap"
-        );
-    }
-}
+#[path = "scratch_tests.rs"]
+mod tests;
