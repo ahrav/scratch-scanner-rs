@@ -22,15 +22,13 @@ use std::cell::RefCell;
 use std::io::{BufWriter, ErrorKind, Write};
 use std::sync::Mutex;
 
-use super::json_write::{
-    write_f64, write_json_bytes, write_json_str, write_oid_hex, write_source, write_u64,
-};
+use super::json_write::{write_f64, write_json_bytes, write_json_str, write_oid_hex, write_u64};
 use super::SourceKind;
 use crate::git_scan::identity_intern::{CommitIdentityIds, SENTINEL_ID};
 use crate::git_scan::object_id::OidBytes;
 
 thread_local! {
-    static EMIT_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(256));
+    static EMIT_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(512));
 }
 
 /// Format into a thread-local scratch buffer, then pass the filled bytes to `f`.
@@ -258,10 +256,19 @@ impl EventEncoder for JsonlEncoder {
 }
 
 /// Append a JSONL `finding` object to `buf` (no trailing newline).
-pub(crate) fn encode_finding(f: &FindingEvent<'_>, buf: &mut Vec<u8>) {
-    buf.extend_from_slice(b"{\"type\":\"finding\",\"source\":\"");
-    write_source(f.source, buf);
-    buf.extend_from_slice(b"\",\"path\":\"");
+pub fn encode_finding(f: &FindingEvent<'_>, buf: &mut Vec<u8>) {
+    // Pre-reserve: typical finding is ~128 bytes + path + rule name.
+    buf.reserve(128 + f.object_path.len() + f.rule_name.len());
+    // Merge the opening static segments with source kind to eliminate
+    // the separate `write_source` call and two `extend_from_slice` calls.
+    match f.source {
+        SourceKind::Fs => {
+            buf.extend_from_slice(b"{\"type\":\"finding\",\"source\":\"fs\",\"path\":\"")
+        }
+        SourceKind::Git => {
+            buf.extend_from_slice(b"{\"type\":\"finding\",\"source\":\"git\",\"path\":\"")
+        }
+    }
     write_json_bytes(f.object_path, buf);
     buf.extend_from_slice(b"\",\"start\":");
     write_u64(f.start, buf);
@@ -285,10 +292,15 @@ pub(crate) fn encode_finding(f: &FindingEvent<'_>, buf: &mut Vec<u8>) {
 }
 
 /// Append a JSONL `progress` object to `buf` (no trailing newline).
-pub(crate) fn encode_progress(p: &ProgressEvent, buf: &mut Vec<u8>) {
-    buf.extend_from_slice(b"{\"type\":\"progress\",\"source\":\"");
-    write_source(p.source, buf);
-    buf.extend_from_slice(b"\",\"stage\":\"");
+pub fn encode_progress(p: &ProgressEvent, buf: &mut Vec<u8>) {
+    match p.source {
+        SourceKind::Fs => {
+            buf.extend_from_slice(b"{\"type\":\"progress\",\"source\":\"fs\",\"stage\":\"")
+        }
+        SourceKind::Git => {
+            buf.extend_from_slice(b"{\"type\":\"progress\",\"source\":\"git\",\"stage\":\"")
+        }
+    }
     write_json_str(p.stage, buf);
     buf.extend_from_slice(b"\",\"objects\":");
     write_u64(p.objects_scanned, buf);
@@ -300,10 +312,15 @@ pub(crate) fn encode_progress(p: &ProgressEvent, buf: &mut Vec<u8>) {
 }
 
 /// Append a JSONL `summary` object to `buf` (no trailing newline).
-pub(crate) fn encode_summary(s: &SummaryEvent, buf: &mut Vec<u8>) {
-    buf.extend_from_slice(b"{\"type\":\"summary\",\"source\":\"");
-    write_source(s.source, buf);
-    buf.extend_from_slice(b"\",\"status\":\"");
+pub fn encode_summary(s: &SummaryEvent, buf: &mut Vec<u8>) {
+    match s.source {
+        SourceKind::Fs => {
+            buf.extend_from_slice(b"{\"type\":\"summary\",\"source\":\"fs\",\"status\":\"")
+        }
+        SourceKind::Git => {
+            buf.extend_from_slice(b"{\"type\":\"summary\",\"source\":\"git\",\"status\":\"")
+        }
+    }
     write_json_str(s.status, buf);
     buf.extend_from_slice(b"\",\"elapsed_ms\":");
     write_u64(s.elapsed_ms, buf);
@@ -319,7 +336,7 @@ pub(crate) fn encode_summary(s: &SummaryEvent, buf: &mut Vec<u8>) {
 }
 
 /// Append a JSONL `diagnostic` object to `buf` (no trailing newline).
-pub(crate) fn encode_diagnostic(d: &DiagnosticEvent<'_>, buf: &mut Vec<u8>) {
+pub fn encode_diagnostic(d: &DiagnosticEvent<'_>, buf: &mut Vec<u8>) {
     buf.extend_from_slice(b"{\"type\":\"diagnostic\",\"level\":\"");
     write_json_str(d.level, buf);
     buf.extend_from_slice(b"\",\"message\":\"");
@@ -330,8 +347,7 @@ pub(crate) fn encode_diagnostic(d: &DiagnosticEvent<'_>, buf: &mut Vec<u8>) {
 /// Writes a single identity field, emitting `null` for [`SENTINEL_ID`].
 #[inline]
 fn write_identity_field(name: &[u8], id: u32, buf: &mut Vec<u8>) {
-    buf.push(b',');
-    buf.push(b'"');
+    buf.extend_from_slice(b",\"");
     buf.extend_from_slice(name);
     buf.extend_from_slice(b"\":");
     if id == SENTINEL_ID {
@@ -342,7 +358,7 @@ fn write_identity_field(name: &[u8], id: u32, buf: &mut Vec<u8>) {
 }
 
 /// Append a JSONL `commit_meta` object to `buf` (no trailing newline).
-pub(crate) fn encode_commit_meta(m: &CommitMetaEvent, buf: &mut Vec<u8>) {
+pub fn encode_commit_meta(m: &CommitMetaEvent, buf: &mut Vec<u8>) {
     buf.extend_from_slice(b"{\"type\":\"commit_meta\",\"commit_id\":");
     write_u64(m.commit_id as u64, buf);
     buf.extend_from_slice(b",\"oid\":\"");
@@ -359,7 +375,7 @@ pub(crate) fn encode_commit_meta(m: &CommitMetaEvent, buf: &mut Vec<u8>) {
 }
 
 /// Append a JSONL `identity_dictionary` object to `buf` (no trailing newline).
-pub(crate) fn encode_identity_dictionary(d: &IdentityDictionaryEvent<'_>, buf: &mut Vec<u8>) {
+pub fn encode_identity_dictionary(d: &IdentityDictionaryEvent<'_>, buf: &mut Vec<u8>) {
     buf.extend_from_slice(b"{\"type\":\"identity_dictionary\",\"id\":");
     write_u64(d.id as u64, buf);
     buf.extend_from_slice(b",\"value\":\"");
