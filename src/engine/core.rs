@@ -2346,7 +2346,8 @@ pub fn bench_extract_secret_span_locs(
     locs: &regex::bytes::CaptureLocations,
     secret_group: Option<u16>,
 ) -> (usize, usize) {
-    super::helpers::extract_secret_span_locs(locs, secret_group)
+    let secret_group_raw = secret_group.unwrap_or(super::rule_repr::NO_SECRET_GROUP);
+    super::helpers::extract_secret_span_locs_raw(locs, secret_group_raw)
 }
 
 /// Benchmark wrapper for `hash128`.
