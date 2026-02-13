@@ -1065,6 +1065,320 @@ pub(super) fn base64_char_count(encoded: &[u8], allow_space_ws: bool) -> usize {
     count
 }
 
+// ---------------------------------------------------------------------------
+// SIMD base64 decode helpers (16 input bytes → 12 output bytes per chunk)
+// ---------------------------------------------------------------------------
+//
+// Each arch module exposes:
+//   unsafe fn decode_simd_chunks(src: &[u8], dst: &mut [u8]) -> (usize, usize)
+//     Decodes as many aligned 16-byte chunks as possible.
+//     Returns (bytes_consumed_from_src, bytes_written_to_dst).
+//     Stops at the first chunk containing a non-base64 byte (whitespace,
+//     padding, or invalid).
+
+#[cfg(target_arch = "aarch64")]
+mod simd_b64 {
+    use std::arch::aarch64::*;
+
+    /// Classify 16 bytes: returns a vector of 6-bit decoded values and a bool
+    /// indicating all bytes were valid base64 (standard + URL-safe alphabet).
+    #[inline(always)]
+    unsafe fn classify_and_decode(input: uint8x16_t) -> (uint8x16_t, bool) {
+        // Range checks for each alphabet segment.
+        let upper_lo = vdupq_n_u8(b'A');
+        let upper_hi = vdupq_n_u8(b'Z');
+        let lower_lo = vdupq_n_u8(b'a');
+        let lower_hi = vdupq_n_u8(b'z');
+        let digit_lo = vdupq_n_u8(b'0');
+        let digit_hi = vdupq_n_u8(b'9');
+
+        let is_upper = vandq_u8(vcgeq_u8(input, upper_lo), vcleq_u8(input, upper_hi));
+        let is_lower = vandq_u8(vcgeq_u8(input, lower_lo), vcleq_u8(input, lower_hi));
+        let is_digit = vandq_u8(vcgeq_u8(input, digit_lo), vcleq_u8(input, digit_hi));
+
+        // Special characters: + (0x2B), - (0x2D) → 62; / (0x2F), _ (0x5F) → 63
+        let is_plus = vceqq_u8(input, vdupq_n_u8(b'+'));
+        let is_dash = vceqq_u8(input, vdupq_n_u8(b'-'));
+        let is_slash = vceqq_u8(input, vdupq_n_u8(b'/'));
+        let is_under = vceqq_u8(input, vdupq_n_u8(b'_'));
+
+        let is_62 = vorrq_u8(is_plus, is_dash);
+        let is_63 = vorrq_u8(is_slash, is_under);
+
+        // Validate: every byte must belong to one of the groups.
+        let valid = vorrq_u8(
+            vorrq_u8(vorrq_u8(is_upper, is_lower), is_digit),
+            vorrq_u8(is_62, is_63),
+        );
+        // Check all lanes are 0xFF (all valid).
+        let all_valid = vminvq_u8(valid) == 0xFF;
+
+        // Compute 6-bit values per range using wrapping arithmetic offsets:
+        //   A-Z: value = byte - 65
+        //   a-z: value = byte - 71  (= byte - 'a' + 26)
+        //   0-9: value = byte + 4   (= byte - '0' + 52, wrapping u8)
+        //   +/-: value = 62
+        //   //_: value = 63
+        let val_upper = vsubq_u8(input, vdupq_n_u8(65)); // A→0, Z→25
+        let val_lower = vsubq_u8(input, vdupq_n_u8(71)); // a→26, z→51
+        let val_digit = vaddq_u8(input, vdupq_n_u8(4)); // '0'→52, '9'→61
+        let val_62 = vdupq_n_u8(62);
+        let val_63 = vdupq_n_u8(63);
+
+        // Select the correct value per byte using bitwise select (bsl).
+        // Start with 0, overlay each range.
+        let mut result = vandq_u8(is_upper, val_upper);
+        result = vorrq_u8(result, vandq_u8(is_lower, val_lower));
+        result = vorrq_u8(result, vandq_u8(is_digit, val_digit));
+        result = vorrq_u8(result, vandq_u8(is_62, val_62));
+        result = vorrq_u8(result, vandq_u8(is_63, val_63));
+
+        (result, all_valid)
+    }
+
+    /// Pack 16 x 6-bit values into 12 output bytes (4 groups of 4→3).
+    ///
+    /// Input layout:  [a0,b0,c0,d0, a1,b1,c1,d1, a2,b2,c2,d2, a3,b3,c3,d3]
+    /// Output layout: [o0,o1,o2,     o3,o4,o5,     o6,o7,o8,     o9,o10,o11]
+    ///
+    /// Where: o0 = (a<<2)|(b>>4), o1 = ((b&0xF)<<4)|(c>>2), o2 = ((c&3)<<6)|d
+    #[inline(always)]
+    unsafe fn pack_16_to_12(vals: uint8x16_t) -> [u8; 12] {
+        // Shuffle to create aligned inputs for the three output-byte formulas.
+        // Type A positions (o0,o3,o6,o9): need a-values from indices 0,4,8,12
+        //                                  and b-values from indices 1,5,9,13
+        // Type B positions (o1,o4,o7,o10): need b-values and c-values
+        // Type C positions (o2,o5,o8,o11): need c-values and d-values
+
+        // Shuffle indices to create:
+        // v_ab = [a0, b0, a1, b1, a2, b2, a3, b3, ?, ?, ?, ?, ?, ?, ?, ?]
+        // v_cd = [c0, d0, c1, d1, c2, d2, c3, d3, ?, ?, ?, ?, ?, ?, ?, ?]
+        let idx_ab = vcreate_u8(u64::from_le_bytes([0, 1, 4, 5, 8, 9, 12, 13]));
+        let idx_cd = vcreate_u8(u64::from_le_bytes([2, 3, 6, 7, 10, 11, 14, 15]));
+
+        let v_ab = vqtbl1_u8(vals, idx_ab); // 8 bytes: [a0,b0,a1,b1,a2,b2,a3,b3]
+        let v_cd = vqtbl1_u8(vals, idx_cd); // 8 bytes: [c0,d0,c1,d1,c2,d2,c3,d3]
+
+        // Widen pairs to u16 and merge: a*64+b and c*64+d
+        // vmull with constant 64 on even positions, then add odd positions.
+        // Even indices [a0,a1,a2,a3], odd indices [b0,b1,b2,b3]:
+        let ab_even = vuzp1_u8(v_ab, v_ab); // [a0,a1,a2,a3,a0,a1,a2,a3]
+        let ab_odd = vuzp2_u8(v_ab, v_ab); // [b0,b1,b2,b3,b0,b1,b2,b3]
+        let cd_even = vuzp1_u8(v_cd, v_cd); // [c0,c1,c2,c3,...]
+        let cd_odd = vuzp2_u8(v_cd, v_cd); // [d0,d1,d2,d3,...]
+
+        // Widen to u16 and compute: even*64 + odd → 12-bit merged value
+        let ab_merged: uint16x4_t = vget_low_u16(vmlal_u8(
+            vmovl_u8(vget_low_u8(vcombine_u8(ab_odd, ab_odd))),
+            vget_low_u8(vcombine_u8(ab_even, ab_even)),
+            vdup_n_u8(64),
+        ));
+        let cd_merged: uint16x4_t = vget_low_u16(vmlal_u8(
+            vmovl_u8(vget_low_u8(vcombine_u8(cd_odd, cd_odd))),
+            vget_low_u8(vcombine_u8(cd_even, cd_even)),
+            vdup_n_u8(64),
+        ));
+
+        // Now merge u16 pairs: ab*4096 + cd → 24-bit value in u32
+        let ab32 = vmovl_u16(ab_merged); // u32x4
+        let cd32 = vmovl_u16(cd_merged); // u32x4
+        let packed = vmlaq_n_u32(cd32, ab32, 4096); // ab*4096 + cd → 24-bit in u32
+
+        // Extract 3 bytes from each u32 lane (big-endian byte order within 24 bits).
+        // packed[i] contains 24 bits of output: bits[23:16] = o0, [15:8] = o1, [7:0] = o2
+        let mut out = [0u8; 12];
+        let p = vreinterpretq_u8_u32(packed);
+        // On little-endian: u32 bytes are [o2, o1, o0, 0] per lane.
+        // Shuffle to extract [o0, o1, o2] per group, 12 bytes total.
+        let extract_idx: uint8x16_t = vld1q_u8(
+            [
+                2u8, 1, 0, 6, 5, 4, 10, 9, 8, 14, 13, 12, 0xFF, 0xFF, 0xFF, 0xFF,
+            ]
+            .as_ptr(),
+        );
+        let shuffled = vqtbl1q_u8(p, extract_idx);
+        vst1q_u8(out.as_mut_ptr(), shuffled);
+        // Note: bytes 12-15 are garbage (0 from out-of-range tbl), but we only use 0..12.
+        out
+    }
+
+    /// Decode as many 16-byte base64 chunks as possible from `src` into `dst`.
+    /// Returns (bytes_consumed, bytes_written).
+    /// Stops on first chunk containing any non-base64 byte.
+    ///
+    /// # Safety
+    /// Caller must ensure `dst` has room for `(src.len() / 16) * 12` bytes.
+    #[inline]
+    pub(super) unsafe fn decode_simd_chunks(src: &[u8], dst: &mut [u8]) -> (usize, usize) {
+        let mut si = 0usize;
+        let mut di = 0usize;
+        let end = src.len() & !15; // round down to 16-byte boundary
+
+        while si < end && di + 12 <= dst.len() {
+            let input = vld1q_u8(src.as_ptr().add(si));
+            let (vals, valid) = classify_and_decode(input);
+            if !valid {
+                break;
+            }
+            let packed = pack_16_to_12(vals);
+            std::ptr::copy_nonoverlapping(packed.as_ptr(), dst.as_mut_ptr().add(di), 12);
+            si += 16;
+            di += 12;
+        }
+
+        (si, di)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+mod simd_b64 {
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    /// Classify 16 bytes and produce 6-bit decoded values.
+    /// Uses SSSE3 pshufb for nibble-indexed lookup tables.
+    /// Returns (decoded_values, all_valid).
+    #[inline(always)]
+    #[target_feature(enable = "ssse3")]
+    unsafe fn classify_and_decode(input: __m128i) -> (__m128i, bool) {
+        // High nibble of each byte → index into 16-entry LUTs.
+        let hi_nib = _mm_and_si128(_mm_srli_epi32(input, 4), _mm_set1_epi8(0x0F));
+
+        // LUT for the shift to apply per high-nibble range.
+        // High nibble → offset such that byte + offset = 6-bit value.
+        // Nibble 2: '+' (0x2B) → 62, offset = 62-0x2B = 0x25 (37)
+        // Nibble 3: '0' (0x30) → 52, offset = 52-0x30 = 0xFC (-4 as u8, = +4 wrapping add)
+        // Nibble 4: 'A' (0x41) → 0,  offset = 0-0x41 = 0xBF (-65 as u8)
+        // Nibble 5: 'P' (0x50) → 15, offset = 15-0x50 = 0xBF (-65 as u8)
+        // Nibble 6: 'a' (0x61) → 26, offset = 26-0x61 = 0xB9 (-71 as u8)
+        // Nibble 7: 'p' (0x70) → 41, offset = 41-0x70 = 0xB9 (-71 as u8)
+        // Others: 0 (invalid, caught by validation)
+        #[rustfmt::skip]
+        let shift_lut = _mm_setr_epi8(
+            0, 0, 0x25, 0x04u8 as i8,              // nibbles 0-3
+            0xBFu8 as i8, 0xBFu8 as i8, 0xB9u8 as i8, 0xB9u8 as i8, // nibbles 4-7
+            0, 0, 0, 0, 0, 0, 0, 0,                // nibbles 8-15
+        );
+        let shift = _mm_shuffle_epi8(shift_lut, hi_nib);
+        let decoded = _mm_add_epi8(input, shift);
+
+        // Handle special chars that share a high nibble but need different values.
+        // '-' (0x2D) should be 62 but shift_lut[2] is tuned for '+' (0x2B).
+        // With shift=37: '-'(0x2D)+37 = 0x52 = 82 (wrong, want 62). Diff = -20.
+        // '/' (0x2F) should be 63. With shift=37: 0x2F+37 = 0x54 = 84. Diff = -21.
+        // '_' (0x5F) should be 63. With shift[5]=-65: 0x5F-65 = -6 = 250. Diff = 63-250 = -187 = 69 mod 256.
+        let eq_dash = _mm_cmpeq_epi8(input, _mm_set1_epi8(b'-' as i8));
+        let eq_slash = _mm_cmpeq_epi8(input, _mm_set1_epi8(b'/' as i8));
+        let eq_under = _mm_cmpeq_epi8(input, _mm_set1_epi8(b'_' as i8));
+
+        // Compute corrections: decoded already has some wrong value; we need
+        // to adjust to the correct 6-bit output.
+        // For '-': current = 0x2D + 0x25 = 0x52 = 82, want 62, correction = -20 = 0xEC
+        let corr_dash = _mm_and_si128(eq_dash, _mm_set1_epi8(0xECu8 as i8));
+        // For '/': current = 0x2F + 0x25 = 0x54 = 84, want 63, correction = -21 = 0xEB
+        let corr_slash = _mm_and_si128(eq_slash, _mm_set1_epi8(0xEBu8 as i8));
+        // For '_': current = 0x5F + 0xBF = 0x1E = 30, want 63, correction = 33 = 0x21
+        let corr_under = _mm_and_si128(eq_under, _mm_set1_epi8(0x21));
+
+        let correction = _mm_or_si128(_mm_or_si128(corr_dash, corr_slash), corr_under);
+        let decoded = _mm_add_epi8(decoded, correction);
+
+        // Validation: valid 6-bit values are 0-63 (bits 6 and 7 clear).
+        // Invalid/whitespace bytes produce values with bit 6 or 7 set after
+        // the shift+correction. Check with AND 0xC0 then movemask (SSE2).
+        let invalid_bits = _mm_and_si128(decoded, _mm_set1_epi8(0xC0u8 as i8));
+        let is_zero = _mm_cmpeq_epi8(invalid_bits, _mm_setzero_si128());
+        let all_valid = _mm_movemask_epi8(is_zero) == 0xFFFF;
+
+        (decoded, all_valid)
+    }
+
+    /// Pack 16 x 6-bit values into 12 output bytes.
+    #[inline(always)]
+    #[target_feature(enable = "ssse3")]
+    unsafe fn pack_16_to_12(vals: __m128i) -> [u8; 12] {
+        // Merge pairs of 6-bit values into 12-bit values using u16 multiply.
+        // Treat vals as u16 lanes (little-endian: low byte is even index, high is odd).
+        // Even positions (a,c) need to be multiplied by 64 and added to odd (b,d).
+        //
+        // u16 lane = [lo, hi] = hi*256 + lo. We want lo*64 + hi.
+        // So: lo*64 + hi = lo*64 + hi*1
+        // Use _mm_maddubs_epi16 which does: pairs[i] = a[2i]*b[2i] + a[2i+1]*b[2i+1]
+        // where a is treated as unsigned, b as signed, result is i16.
+        // Set b = [64, 1, 64, 1, ...]: each pair → even*64 + odd*1 = 12-bit merged.
+        let merge_const = _mm_set1_epi16(0x0140); // [64, 1] repeated as bytes
+        let merged = _mm_maddubs_epi16(vals, merge_const);
+        // merged is i16x8: [a0*64+b0, c0*64+d0, a1*64+b1, c1*64+d1, ...]
+
+        // Now merge u16 pairs into u32: (a*64+b)*4096 + (c*64+d) = 24-bit packed.
+        // Use _mm_madd_epi16: u32[i] = i16[2i]*i16_const[2i] + i16[2i+1]*i16_const[2i+1]
+        let merge32_const = _mm_set1_epi32(0x0001_1000); // [4096, 1] as i16 pair
+        let packed = _mm_madd_epi16(merged, merge32_const);
+        // packed is i32x4: each contains 24 bits of decoded data.
+
+        // Extract 3 bytes from each u32 (little-endian: bytes [o2, o1, o0, 0]).
+        // Shuffle to [o0, o1, o2, o3, o4, o5, o6, o7, o8, o9, o10, o11, ?, ?, ?, ?]
+        #[rustfmt::skip]
+        let shuffle = _mm_setr_epi8(
+            2, 1, 0, 6, 5, 4, 10, 9, 8, 14, 13, 12,
+            -1, -1, -1, -1, // don't care
+        );
+        let result = _mm_shuffle_epi8(packed, shuffle);
+
+        let mut out = [0u8; 12];
+        // Store lower 12 bytes. _mm_storeu_si128 writes 16 but we only read 12.
+        _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, result);
+        out
+    }
+
+    /// Decode as many 16-byte base64 chunks as possible from `src` into `dst`.
+    /// Returns (bytes_consumed, bytes_written).
+    ///
+    /// # Safety
+    /// Caller must ensure `dst` has room for `(src.len() / 16) * 12` bytes.
+    /// Requires SSSE3 support.
+    #[inline]
+    #[target_feature(enable = "ssse3")]
+    pub(super) unsafe fn decode_simd_chunks(src: &[u8], dst: &mut [u8]) -> (usize, usize) {
+        let mut si = 0usize;
+        let mut di = 0usize;
+        let end = src.len() & !15;
+
+        while si < end && di + 12 <= dst.len() {
+            let input = _mm_loadu_si128(src.as_ptr().add(si) as *const __m128i);
+            let (vals, valid) = classify_and_decode(input);
+            if !valid {
+                break;
+            }
+            let packed = pack_16_to_12(vals);
+            std::ptr::copy_nonoverlapping(packed.as_ptr(), dst.as_mut_ptr().add(di), 12);
+            si += 16;
+            di += 12;
+        }
+
+        (si, di)
+    }
+}
+
+// On architectures without SIMD support, decode_simd_chunks is not available;
+// the fast-path in stream_decode_base64 uses the scalar 4-byte batch instead.
+
+/// Returns true if SIMD base64 decode is available at runtime.
+#[cfg(target_arch = "aarch64")]
+fn has_simd_b64() -> bool {
+    true // NEON is always available on aarch64
+}
+
+#[cfg(target_arch = "x86_64")]
+fn has_simd_b64() -> bool {
+    is_x86_feature_detected!("ssse3")
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+fn has_simd_b64() -> bool {
+    false
+}
+
 /// Streaming base64 decoder that accepts std + URL-safe alphabets.
 ///
 /// Whitespace is ignored. Padding is validated, but an unpadded tail
@@ -1111,11 +1425,26 @@ fn stream_decode_base64(
 
     let mut i = 0usize;
     while i < input.len() {
-        // Fast path: when no partial quad is pending, batch-decode 4 bytes at a
-        // time using direct table lookups. The combined OR detects whitespace,
-        // padding, and invalid bytes in a single comparison — all map to values
-        // > 63 in B64_DECODE (B64_PAD=64, B64_INVALID=0xFF).
+        // Fast path: when no partial quad is pending, use SIMD to decode 16
+        // input bytes → 12 output bytes per iteration, then fall back to the
+        // 4-byte scalar batch for the tail.
         if qn == 0 && !seen_pad {
+            // SIMD path: decode 16-byte chunks directly into the output buffer.
+            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+            if has_simd_b64() {
+                let remaining_input = input.len() - i;
+                let remaining_output = max_fill.saturating_sub(out_len);
+                if remaining_input >= 16 && remaining_output >= 12 {
+                    // SAFETY: we checked has_simd_b64() and bounds above.
+                    let (consumed, written) =
+                        unsafe { simd_b64::decode_simd_chunks(&input[i..], &mut out[out_len..]) };
+                    i += consumed;
+                    out_len += written;
+                }
+            }
+
+            // Scalar 4-byte batch: handle remaining aligned input after SIMD
+            // and on architectures without SIMD support.
             while i + 4 <= input.len() && out_len + 3 <= max_fill {
                 let a = B64_DECODE[input[i] as usize];
                 let b = B64_DECODE[input[i + 1] as usize];
