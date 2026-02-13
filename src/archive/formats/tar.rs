@@ -1030,4 +1030,23 @@ mod tests {
         assert_eq!(cursor.pax_path.capacity(), cap);
         cursor.debug_assert_no_growth();
     }
+
+    #[test]
+    fn parse_octal_rejects_overflow() {
+        // 21 octal sevens = 8^21 − 1 = 2^63 − 1: max safe digit count.
+        let max_safe = b"777777777777777777777";
+        assert_eq!(
+            parse_tar_size_octal(max_safe),
+            Some((1u64 << 63) - 1),
+            "21 octal digits must be accepted",
+        );
+
+        // 22 octal digits can overflow u64 → must be rejected.
+        let overflow_input = b"7777777777777777777777";
+        assert_eq!(
+            parse_tar_size_octal(overflow_input),
+            None,
+            "22+ octal digits must be rejected",
+        );
+    }
 }

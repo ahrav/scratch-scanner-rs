@@ -12,6 +12,13 @@
 //! workers is non-deterministic, but individual events are never interleaved
 //! at the byte level.
 //!
+//! # Visibility
+//!
+//! Several items in this module and in [`super::json_write`] are `pub` rather
+//! than `pub(crate)` so that Criterion benchmarks in `benches/event_encoding.rs`
+//! can import them directly. They are **not** part of a stable public API —
+//! treat them as crate-internal.
+//!
 //! # Performance
 //!
 //! Each [`EventSink::emit`] call formats into a thread-local scratch
@@ -55,6 +62,10 @@ where
             f(&buf);
         } else {
             // Reentrant call — allocate a one-off buffer.
+            debug_assert!(
+                false,
+                "with_format_buf: reentrant borrow detected; allocating fallback buffer"
+            );
             let mut buf = Vec::with_capacity(256);
             encode(&mut buf);
             f(&buf);
@@ -273,7 +284,7 @@ impl EventEncoder for JsonlEncoder {
 /// Wire fields `commit_id` and `change_kind` are only emitted for
 /// [`SourceKind::Git`] findings (when the corresponding `Option` is `Some`).
 /// Filesystem findings omit them entirely to keep output compact.
-pub fn encode_finding(f: &FindingEvent<'_>, buf: &mut Vec<u8>) {
+pub(crate) fn encode_finding(f: &FindingEvent<'_>, buf: &mut Vec<u8>) {
     // Pre-reserve: typical finding is ~128 bytes + path + rule name.
     buf.reserve(128 + f.object_path.len() + f.rule_name.len());
     // Merge the opening static segments with source kind to eliminate
@@ -309,7 +320,7 @@ pub fn encode_finding(f: &FindingEvent<'_>, buf: &mut Vec<u8>) {
 }
 
 /// Append a JSONL `progress` object to `buf` (no trailing newline).
-pub fn encode_progress(p: &ProgressEvent, buf: &mut Vec<u8>) {
+pub(crate) fn encode_progress(p: &ProgressEvent, buf: &mut Vec<u8>) {
     match p.source {
         SourceKind::Fs => {
             buf.extend_from_slice(b"{\"type\":\"progress\",\"source\":\"fs\",\"stage\":\"")
@@ -329,7 +340,7 @@ pub fn encode_progress(p: &ProgressEvent, buf: &mut Vec<u8>) {
 }
 
 /// Append a JSONL `summary` object to `buf` (no trailing newline).
-pub fn encode_summary(s: &SummaryEvent, buf: &mut Vec<u8>) {
+pub(crate) fn encode_summary(s: &SummaryEvent, buf: &mut Vec<u8>) {
     match s.source {
         SourceKind::Fs => {
             buf.extend_from_slice(b"{\"type\":\"summary\",\"source\":\"fs\",\"status\":\"")
@@ -353,7 +364,7 @@ pub fn encode_summary(s: &SummaryEvent, buf: &mut Vec<u8>) {
 }
 
 /// Append a JSONL `diagnostic` object to `buf` (no trailing newline).
-pub fn encode_diagnostic(d: &DiagnosticEvent<'_>, buf: &mut Vec<u8>) {
+pub(crate) fn encode_diagnostic(d: &DiagnosticEvent<'_>, buf: &mut Vec<u8>) {
     buf.extend_from_slice(b"{\"type\":\"diagnostic\",\"level\":\"");
     write_json_str(d.level, buf);
     buf.extend_from_slice(b"\",\"message\":\"");
@@ -380,7 +391,7 @@ fn write_identity_field(name: &[u8], id: u32, buf: &mut Vec<u8>) {
 /// `identity` is `None`. When present, individual fields with value
 /// [`SENTINEL_ID`] are emitted as JSON `null` (not as the raw `u32::MAX`
 /// integer) to signal a parse failure to downstream consumers.
-pub fn encode_commit_meta(m: &CommitMetaEvent, buf: &mut Vec<u8>) {
+pub(crate) fn encode_commit_meta(m: &CommitMetaEvent, buf: &mut Vec<u8>) {
     buf.extend_from_slice(b"{\"type\":\"commit_meta\",\"commit_id\":");
     write_u64(m.commit_id as u64, buf);
     buf.extend_from_slice(b",\"oid\":\"");
@@ -397,7 +408,7 @@ pub fn encode_commit_meta(m: &CommitMetaEvent, buf: &mut Vec<u8>) {
 }
 
 /// Append a JSONL `identity_dictionary` object to `buf` (no trailing newline).
-pub fn encode_identity_dictionary(d: &IdentityDictionaryEvent<'_>, buf: &mut Vec<u8>) {
+pub(crate) fn encode_identity_dictionary(d: &IdentityDictionaryEvent<'_>, buf: &mut Vec<u8>) {
     buf.extend_from_slice(b"{\"type\":\"identity_dictionary\",\"id\":");
     write_u64(d.id as u64, buf);
     buf.extend_from_slice(b",\"value\":\"");
@@ -532,7 +543,16 @@ mod tests {
         let encoder = JsonlEncoder::new();
         let mut buf = Vec::new();
         encoder.encode(&event, &mut buf);
-        String::from_utf8(buf).unwrap()
+        let s = String::from_utf8(buf).unwrap();
+
+        // Every JSONL line (minus trailing newline) must parse as valid JSON.
+        let line = s.trim_end_matches('\n');
+        assert!(
+            serde_json::from_str::<serde_json::Value>(line).is_ok(),
+            "encoder produced invalid JSON: {line}"
+        );
+
+        s
     }
 
     #[test]

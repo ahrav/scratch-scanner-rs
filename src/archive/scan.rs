@@ -1414,3 +1414,7 @@ pub fn scan_zip_source<S: ArchiveEntrySink, Z: ZipSource>(
     scratch.budgets.exit_archive();
     Ok(outcome)
 }
+
+#[cfg(test)]
+#[path = "scan_tests.rs"]
+mod scan_tests;

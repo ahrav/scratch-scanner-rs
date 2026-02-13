@@ -132,6 +132,34 @@ fn make_ascii_with_escapes(n: usize) -> String {
     s
 }
 
+/// Generate a string of length `n` with escapes placed sparsely (not every chunk).
+///
+/// Places `"` characters at positions 50, 150, and 350 (if within range).
+/// This models realistic file paths where most of the string is clean ASCII
+/// but occasional characters need escaping. Unlike [`make_ascii_with_escapes`]
+/// which bails SIMD on every chunk, this exercises the SIMD resume-after-escape
+/// path where most chunks pass through the fast path.
+fn make_sparse_escapes(n: usize) -> String {
+    let mut rng = XorShift64::new(0xFACE_CAFE_0000 + n as u64);
+    let mut s = String::with_capacity(n);
+    let escape_positions = [50, 150, 350];
+    for i in 0..n {
+        if escape_positions.contains(&i) {
+            s.push('"');
+        } else {
+            let mut b = (rng.next_u64() % 93 + 0x21) as u8;
+            if b == b'"' {
+                b = b'a';
+            }
+            if b == b'\\' {
+                b = b'b';
+            }
+            s.push(b as char);
+        }
+    }
+    s
+}
+
 /// Generate clean ASCII bytes of length `n`.
 fn make_clean_bytes(n: usize) -> Vec<u8> {
     make_clean_ascii(n).into_bytes()
@@ -308,6 +336,21 @@ fn bench_write_json_str(c: &mut Criterion) {
     use scanner_rs::unified::json_write::write_json_str;
     let mut group = c.benchmark_group("write_json_str");
 
+    // Sub-16-byte strings: always take the scalar path (below SIMD threshold).
+    // Rule names like "aws-access-key" (14 chars) fall in this range.
+    for &size in &[4, 8, 14] {
+        let clean = make_clean_ascii(size);
+        group.throughput(Throughput::Bytes(size as u64));
+        group.bench_with_input(BenchmarkId::new("scalar_short", size), &clean, |b, s| {
+            let mut buf = Vec::with_capacity(size + 16);
+            b.iter(|| {
+                buf.clear();
+                write_json_str(black_box(s), &mut buf);
+                black_box(&buf);
+            });
+        });
+    }
+
     for &size in &[32, 128, 512] {
         let clean = make_clean_ascii(size);
         group.throughput(Throughput::Bytes(size as u64));
@@ -334,13 +377,26 @@ fn bench_write_json_str(c: &mut Criterion) {
         });
     }
 
+    // Sparse escapes: only a few escapes in a long string — exercises SIMD
+    // resume-after-escape (most chunks pass all-safe check).
+    let sparse = make_sparse_escapes(512);
+    group.throughput(Throughput::Bytes(512));
+    group.bench_with_input(BenchmarkId::new("sparse_escapes", 512), &sparse, |b, s| {
+        let mut buf = Vec::with_capacity(512 + 64);
+        b.iter(|| {
+            buf.clear();
+            write_json_str(black_box(s), &mut buf);
+            black_box(&buf);
+        });
+    });
+
     group.finish();
 }
 
 /// Measure `write_json_bytes` for clean ASCII vs. a buffer containing `0xFF`.
 ///
 /// Git object paths are raw bytes (not guaranteed UTF-8), so `write_json_bytes`
-/// must handle high bytes via hex-escape (`\\xHH`). The `with_0xff` variant
+/// must handle high bytes via Unicode escape (`\\u00XX`). The `with_0xff` variant
 /// confirms the scalar fallback cost is bounded.
 fn bench_write_json_bytes(c: &mut Criterion) {
     use scanner_rs::unified::json_write::write_json_bytes;
@@ -373,7 +429,8 @@ fn bench_write_json_bytes(c: &mut Criterion) {
 
 /// Measure `write_f64` with a representative two-decimal-place value.
 ///
-/// `write_f64` uses `ryu` under the hood for fast float→string conversion.
+/// `write_f64` uses a hand-rolled fixed-precision formatter (integer part via
+/// `write_u64`, fractional part via two-digit lookup) — no `ryu` dependency.
 /// This benchmark exists mainly as a regression guard — f64 fields are rare
 /// in scan events today but the primitive is shared infrastructure.
 fn bench_write_f64(c: &mut Criterion) {
@@ -512,7 +569,7 @@ fn bench_encode_batch(c: &mut Criterion) {
 /// buffer acquisition, encoding, mutex lock, and `write_all`. The `io::sink()`
 /// writer discards bytes instantly, so the measured cost is pure serialization
 /// + synchronization overhead without I/O latency. Comparing against the batch
-/// benchmark isolates the cost of the thread-local + mutex machinery.
+///   benchmark isolates the cost of the thread-local + mutex machinery.
 fn bench_sink_emit(c: &mut Criterion) {
     let mut group = c.benchmark_group("sink_emit");
     group.throughput(Throughput::Elements(1000));
@@ -547,6 +604,56 @@ fn bench_sink_emit(c: &mut Criterion) {
     group.finish();
 }
 
+/// Emit findings from multiple threads through a shared `JsonlEventSink`.
+///
+/// Unlike `bench_sink_emit` (single-threaded), this exercises the mutex
+/// contention path that production workers encounter. The `io::sink()` writer
+/// removes I/O variance, isolating pure formatting + synchronization cost.
+fn bench_sink_contention(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sink_contention");
+
+    for &threads in &[2, 4, 8] {
+        group.throughput(Throughput::Elements(1000));
+        group.bench_function(BenchmarkId::new("threads", threads), |b| {
+            let sink = std::sync::Arc::new(JsonlEventSink::new(io::sink()));
+            let findings: Vec<FindingEvent<'static>> = (0..1000)
+                .map(|i| {
+                    if i % 2 == 0 {
+                        make_fs_finding()
+                    } else {
+                        make_git_finding()
+                    }
+                })
+                .collect();
+            b.iter(|| {
+                std::thread::scope(|s| {
+                    let per_thread = 1000 / threads;
+                    for t in 0..threads {
+                        let sink = &sink;
+                        let chunk = &findings[t * per_thread..(t + 1) * per_thread];
+                        s.spawn(move || {
+                            for f in chunk {
+                                sink.emit(ScanEvent::Finding(FindingEvent {
+                                    source: f.source,
+                                    object_path: f.object_path,
+                                    start: f.start,
+                                    end: f.end,
+                                    rule_id: f.rule_id,
+                                    rule_name: f.rule_name,
+                                    commit_id: f.commit_id,
+                                    change_kind: f.change_kind,
+                                }));
+                            }
+                        });
+                    }
+                });
+            });
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     primitives,
     bench_write_u64,
@@ -561,5 +668,6 @@ criterion_group!(
     bench_encode_commit_meta,
     bench_encode_batch,
     bench_sink_emit,
+    bench_sink_contention,
 );
 criterion_main!(primitives, encoding);

@@ -742,4 +742,99 @@ mod tests {
         let rem = b.remaining_decompressed_allowance_with_ratio_probe(true);
         assert_eq!(rem, 2);
     }
+
+    /// When entry and archive caps are tied, the entry cap should win (SkipEntry,
+    /// not PartialArchive). This locks in the priority ordering.
+    #[test]
+    fn tied_entry_and_archive_caps_prefer_skip_entry() {
+        let mut c = cfg();
+        // Set entry cap == archive cap so they exhaust simultaneously.
+        c.max_uncompressed_bytes_per_entry = 10;
+        c.max_total_uncompressed_bytes_per_archive = 10;
+        c.max_total_uncompressed_bytes_per_root = 1000;
+
+        let mut b = ArchiveBudgets::new(&c);
+        b.enter_archive().unwrap();
+        b.begin_entry().unwrap();
+
+        // Charge exactly up to the shared cap.
+        assert_eq!(b.charge_decompressed_out(10), ChargeResult::Ok);
+
+        // Next byte hits both caps; entry should win.
+        let r = b.charge_decompressed_out(1);
+        assert_eq!(
+            r,
+            ChargeResult::Clamp {
+                allowed: 0,
+                hit: BudgetHit::SkipEntry(EntrySkipReason::EntryOutputBudgetExceeded)
+            }
+        );
+    }
+
+    /// `charge_discarded_out` intentionally bypasses the per-entry cap.
+    /// After the entry cap is exhausted via `charge_decompressed_out`, discarded
+    /// bytes should still be accepted up to the archive/root caps.
+    #[test]
+    fn discarded_out_bypasses_entry_cap() {
+        let mut c = cfg();
+        c.max_uncompressed_bytes_per_entry = 5;
+        c.max_total_uncompressed_bytes_per_archive = 100;
+        c.max_total_uncompressed_bytes_per_root = 1000;
+
+        let mut b = ArchiveBudgets::new(&c);
+        b.enter_archive().unwrap();
+        b.begin_entry().unwrap();
+
+        // Exhaust the per-entry cap.
+        assert_eq!(b.charge_decompressed_out(5), ChargeResult::Ok);
+        assert_eq!(
+            b.charge_decompressed_out(1),
+            ChargeResult::Clamp {
+                allowed: 0,
+                hit: BudgetHit::SkipEntry(EntrySkipReason::EntryOutputBudgetExceeded)
+            }
+        );
+
+        // Discarded bytes should still succeed (entry cap does not apply).
+        assert_eq!(b.charge_discarded_out(10), ChargeResult::Ok);
+    }
+
+    /// Entry counters reset correctly across open/close/reopen cycles.
+    /// The second entry gets its full per-entry budget regardless of what
+    /// the first entry consumed.
+    #[test]
+    fn entry_lifecycle_reopen_resets_counter() {
+        let mut c = cfg();
+        c.max_uncompressed_bytes_per_entry = 10;
+        c.max_total_uncompressed_bytes_per_archive = 100;
+        c.max_total_uncompressed_bytes_per_root = 1000;
+        c.max_entries_per_archive = 10;
+
+        let mut b = ArchiveBudgets::new(&c);
+        b.enter_archive().unwrap();
+
+        // First entry: consume full per-entry budget.
+        b.begin_entry().unwrap();
+        assert_eq!(b.charge_decompressed_out(10), ChargeResult::Ok);
+        assert_eq!(
+            b.charge_decompressed_out(1),
+            ChargeResult::Clamp {
+                allowed: 0,
+                hit: BudgetHit::SkipEntry(EntrySkipReason::EntryOutputBudgetExceeded)
+            }
+        );
+        b.end_entry(true);
+
+        // Second entry: should get a fresh per-entry budget of 10.
+        b.begin_entry().unwrap();
+        assert_eq!(b.charge_decompressed_out(10), ChargeResult::Ok);
+        assert_eq!(
+            b.charge_decompressed_out(1),
+            ChargeResult::Clamp {
+                allowed: 0,
+                hit: BudgetHit::SkipEntry(EntrySkipReason::EntryOutputBudgetExceeded)
+            }
+        );
+        b.end_entry(true);
+    }
 }

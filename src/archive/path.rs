@@ -634,4 +634,79 @@ mod tests {
         assert!(r.bytes.len() <= 8);
         assert!(r.truncated);
     }
+
+    // ── Restored hash-suffix truncation boundary tests ──────────────────
+
+    #[test]
+    fn hash_suffix_trunc_cut_on_percent_removes_lone_percent() {
+        // Build output where cut falls exactly on '%'.
+        // TRUNC_SUFFIX_LEN = 18. With max_len=20, prefix_len=2.
+        // If prefix is "X%", the '%' at the boundary should be removed.
+        let mut out = b"X%".to_vec();
+        let hash = 0x1234_5678_ABCD_EF00u64;
+        apply_hash_suffix_truncation(&mut out, hash, 20);
+        // The '%' should be removed: output = "X" + suffix (18 bytes) = 19 bytes.
+        assert!(out.len() <= 20);
+        assert!(!out[..out.len().saturating_sub(18)].ends_with(b"%"));
+        assert!(out.windows(2).any(|w| w == b"~#"));
+    }
+
+    #[test]
+    fn hash_suffix_trunc_cut_on_first_hex_removes_partial_escape() {
+        // Prefix is "X%2" → "%2" should be removed (split escape).
+        let mut out = b"X%2".to_vec();
+        let hash = 0x1234_5678_ABCD_EF01u64;
+        // max_len = 21 → prefix_len = 3. Out has 3 bytes, cut is at 3.
+        // But out ends with "%2" (2-byte partial), which the backup should remove.
+        apply_hash_suffix_truncation(&mut out, hash, 21);
+        assert!(out.len() <= 21);
+        // The "%2" should be removed from the prefix.
+        let prefix_end = out.len().saturating_sub(18);
+        let prefix = &out[..prefix_end];
+        assert!(
+            !prefix.ends_with(b"%2"),
+            "partial escape '%2' should have been removed"
+        );
+    }
+
+    #[test]
+    fn hash_suffix_trunc_complete_escape_preserved() {
+        // Prefix is "X%25" → complete escape, no backup needed.
+        let mut out = b"X%25".to_vec();
+        let hash = 0x1234_5678_ABCD_EF02u64;
+        // max_len = 22 → prefix_len = 4. Out has 4 bytes, all good.
+        apply_hash_suffix_truncation(&mut out, hash, 22);
+        assert!(out.len() <= 22);
+        let prefix_end = out.len().saturating_sub(18);
+        let prefix = &out[..prefix_end];
+        // Complete escape "%25" should be preserved (not backed up).
+        assert_eq!(prefix, b"X%25");
+    }
+
+    #[test]
+    fn hash_suffix_trunc_max_len_equals_suffix_len() {
+        // max_len == TRUNC_SUFFIX_LEN (18) → output is just the suffix.
+        let mut out = b"some long prefix data".to_vec();
+        let hash = 0xAAAA_BBBB_CCCC_DDDDu64;
+        apply_hash_suffix_truncation(&mut out, hash, TRUNC_SUFFIX_LEN);
+        assert_eq!(out.len(), TRUNC_SUFFIX_LEN);
+        assert!(out.starts_with(b"~#"));
+    }
+
+    #[test]
+    fn hash_suffix_trunc_max_len_zero() {
+        let mut out = b"some data".to_vec();
+        apply_hash_suffix_truncation(&mut out, 0, 0);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn hash_suffix_trunc_max_len_less_than_suffix() {
+        // max_len < TRUNC_SUFFIX_LEN → output is truncated suffix.
+        let mut out = b"data".to_vec();
+        let hash = 0x1111_2222_3333_4444u64;
+        apply_hash_suffix_truncation(&mut out, hash, 5);
+        assert_eq!(out.len(), 5);
+        assert!(out.starts_with(b"~#"));
+    }
 }
