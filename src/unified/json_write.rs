@@ -8,16 +8,64 @@
 //! **None of the functions write surrounding `"`** — callers are expected
 //! to emit quotes themselves as part of the larger JSON structure. This
 //! avoids double-quoting when composing nested objects by hand.
+//!
+//! # Optimizations
+//!
+//! - **`write_u64`**: Two-digits-at-a-time lookup table (like `itoa` crate).
+//!   Halves division count and eliminates the reverse pass.
+//! - **`write_oid_hex`**: 256-entry byte-to-hex-pair lookup table with a
+//!   single `reserve` + bulk write (unsafe `ptr::write` + `set_len`).
+//! - **`write_json_str`** / **`write_json_bytes`**: SIMD fast path on
+//!   aarch64 (NEON) and x86_64 (SSE2) — loads 16 bytes at a time, checks
+//!   all-safe in parallel, and bulk-copies safe runs. Falls back to scalar
+//!   for chunks containing characters that need escaping.
 
 use crate::git_scan::object_id::OidBytes;
 
 use super::SourceKind;
 
+// ============================================================================
+// Lookup tables
+// ============================================================================
+
 const HEX_DIGITS: [u8; 16] = *b"0123456789abcdef";
+
+/// Two-character decimal digit pairs for 00..99.
+///
+/// Used by `write_u64` to emit two digits per division, halving the number
+/// of `udiv` instructions compared to one-digit-at-a-time.
+const DIGIT_PAIRS: [[u8; 2]; 100] = {
+    let mut table = [[0u8; 2]; 100];
+    let mut i = 0u8;
+    while i < 100 {
+        table[i as usize] = [b'0' + i / 10, b'0' + i % 10];
+        i += 1;
+    }
+    table
+};
+
+/// Byte-to-hex-pair lookup table: maps each byte 0x00..0xff to its
+/// two-character lowercase hex representation.
+///
+/// Used by `write_oid_hex` to avoid per-nibble indexing into `HEX_DIGITS`.
+const HEX_PAIRS: [[u8; 2]; 256] = {
+    let mut table = [[0u8; 2]; 256];
+    let digits = b"0123456789abcdef";
+    let mut i = 0u16;
+    while i < 256 {
+        table[i as usize] = [digits[(i >> 4) as usize], digits[(i & 0xf) as usize]];
+        i += 1;
+    }
+    table
+};
+
+// ============================================================================
+// Primitives
+// ============================================================================
 
 /// Write a [`SourceKind`] as its JSON string value (`fs` or `git`), without quotes.
 #[inline(always)]
-pub(crate) fn write_source(kind: SourceKind, buf: &mut Vec<u8>) {
+pub fn write_source(kind: SourceKind, buf: &mut Vec<u8>) {
     match kind {
         SourceKind::Fs => buf.extend_from_slice(b"fs"),
         SourceKind::Git => buf.extend_from_slice(b"git"),
@@ -28,35 +76,117 @@ pub(crate) fn write_source(kind: SourceKind, buf: &mut Vec<u8>) {
 ///
 /// Produces 40 hex characters for SHA-1 (20 bytes) and 64 for SHA-256
 /// (32 bytes), matching `git log --format=%H` output.
+///
+/// Uses a 256-entry byte-to-hex-pair lookup table with a single `reserve`
+/// and bulk pointer writes to eliminate per-byte bounds checks.
 #[inline(always)]
-pub(crate) fn write_oid_hex(oid: &OidBytes, buf: &mut Vec<u8>) {
-    for &b in oid.as_slice() {
-        buf.push(HEX_DIGITS[(b >> 4) as usize]);
-        buf.push(HEX_DIGITS[(b & 0xf) as usize]);
+pub fn write_oid_hex(oid: &OidBytes, buf: &mut Vec<u8>) {
+    let src = oid.as_slice();
+    let out_len = src.len() * 2;
+    buf.reserve(out_len);
+    let base = buf.len();
+    // SAFETY: We just reserved exactly `out_len` bytes beyond `buf.len()`.
+    // The loop writes exactly `out_len` bytes (2 per input byte) via
+    // pointer arithmetic within the reserved region. `HEX_PAIRS` always
+    // produces valid ASCII bytes. After the loop, `set_len` advances the
+    // length to cover exactly what was written.
+    unsafe {
+        let dst = buf.as_mut_ptr().add(base);
+        for (i, &b) in src.iter().enumerate() {
+            let pair = HEX_PAIRS[b as usize];
+            std::ptr::write(dst.add(i * 2), pair[0]);
+            std::ptr::write(dst.add(i * 2 + 1), pair[1]);
+        }
+        buf.set_len(base + out_len);
+    }
+}
+
+/// Count the number of decimal digits in a u64.
+///
+/// Uses cascading comparisons against powers of 10, which compiles to a
+/// branch-free sequence on most architectures.
+#[inline(always)]
+fn digit_count(n: u64) -> usize {
+    // Powers of 10 for each digit count threshold.
+    const P: [u64; 19] = [
+        10,
+        100,
+        1_000,
+        10_000,
+        100_000,
+        1_000_000,
+        10_000_000,
+        100_000_000,
+        1_000_000_000,
+        10_000_000_000,
+        100_000_000_000,
+        1_000_000_000_000,
+        10_000_000_000_000,
+        100_000_000_000_000,
+        1_000_000_000_000_000,
+        10_000_000_000_000_000,
+        100_000_000_000_000_000,
+        1_000_000_000_000_000_000,
+        10_000_000_000_000_000_000,
+    ];
+    // Count leading zeros to estimate digit count, then correct with a
+    // comparison against the exact power-of-10 boundary.
+    if n == 0 {
+        return 1;
+    }
+    // log10(n) ≈ (63 - clz(n)) * 77 / 256  (integer approximation)
+    let approx = ((63 - n.leading_zeros() as usize) * 77) >> 8;
+    // The approximation can be off by 1, so compare against the boundary.
+    if approx < 19 && n >= P[approx] {
+        approx + 2
+    } else {
+        approx + 1
     }
 }
 
 /// Write a u64 as decimal ASCII.
+///
+/// Uses a two-digits-at-a-time lookup table to halve the number of divisions.
+/// Writes into a stack buffer in reverse, then copies to `buf` with a single
+/// `extend_from_slice` (memcpy).
 #[inline(always)]
-pub(crate) fn write_u64(n: u64, buf: &mut Vec<u8>) {
+pub fn write_u64(n: u64, buf: &mut Vec<u8>) {
     if n == 0 {
         buf.push(b'0');
         return;
     }
-    let start = buf.len();
+
+    let digits = digit_count(n);
+    let mut tmp = [0u8; 20]; // u64::MAX is 20 digits
+    let mut pos = digits;
     let mut v = n;
-    while v > 0 {
-        buf.push(b'0' + (v % 10) as u8);
-        v /= 10;
+
+    // Process two digits at a time from the least-significant end.
+    while v >= 100 {
+        let rem = (v % 100) as usize;
+        v /= 100;
+        pos -= 2;
+        tmp[pos] = DIGIT_PAIRS[rem][0];
+        tmp[pos + 1] = DIGIT_PAIRS[rem][1];
     }
-    buf[start..].reverse();
+
+    // Handle remaining 1 or 2 digits.
+    if v >= 10 {
+        let rem = v as usize;
+        tmp[0] = DIGIT_PAIRS[rem][0];
+        tmp[1] = DIGIT_PAIRS[rem][1];
+    } else {
+        tmp[0] = b'0' + v as u8;
+    }
+
+    buf.extend_from_slice(&tmp[..digits]);
 }
 
 /// Write an f64 with 2 decimal places.
 ///
 /// Handles NaN/Inf as `0.00` to avoid invalid JSON.
 #[inline(always)]
-pub(crate) fn write_f64(n: f64, buf: &mut Vec<u8>) {
+pub fn write_f64(n: f64, buf: &mut Vec<u8>) {
     if n.is_nan() || n.is_infinite() {
         buf.extend_from_slice(b"0.00");
         return;
@@ -92,9 +222,16 @@ pub(crate) fn write_bool(v: bool, buf: &mut Vec<u8>) {
     }
 }
 
-/// Write a JSON-escaped UTF-8 string (without surrounding quotes).
+// ============================================================================
+// JSON string escaping — scalar path
+// ============================================================================
+
+/// Scalar JSON string escaping (per-byte match).
+///
+/// This is the fallback for all platforms and for strings shorter than 16 bytes
+/// on aarch64.
 #[inline(always)]
-pub(crate) fn write_json_str(s: &str, buf: &mut Vec<u8>) {
+fn write_json_str_scalar(s: &str, buf: &mut Vec<u8>) {
     for byte in s.bytes() {
         match byte {
             b'"' => buf.extend_from_slice(b"\\\""),
@@ -112,24 +249,11 @@ pub(crate) fn write_json_str(s: &str, buf: &mut Vec<u8>) {
     }
 }
 
-/// Write raw bytes as a JSON string value (without surrounding quotes).
+/// Scalar JSON byte-slice escaping.
 ///
-/// The algorithm walks `bytes` left-to-right:
-///
-/// 1. **ASCII control / special** (`0x00..=0x1f`, `"`, `\`) — JSON-escape.
-/// 2. **ASCII printable** (`0x20..=0x7e`) — pass through verbatim.
-/// 3. **High byte** (`0x80..=0xff`) — attempt UTF-8 validation on the
-///    *remainder* of the slice:
-///    - If the entire remainder is valid UTF-8, delegate to [`write_json_str`]
-///      (which handles escaping of control chars within valid UTF-8) and return.
-///    - Otherwise, copy the valid prefix via `write_json_str`, advance `i`
-///      past it, and escape the first invalid byte as `\u00XX`. The loop then
-///      continues from the next byte.
-///
-/// This avoids a full `from_utf8` over the entire input upfront while still
-/// emitting valid multi-byte codepoints (e.g. emoji, CJK) as-is rather than
-/// escaping each byte individually.
-pub(crate) fn write_json_bytes(bytes: &[u8], buf: &mut Vec<u8>) {
+/// Walks bytes left-to-right, escaping control/special characters and
+/// attempting UTF-8 validation for high bytes.
+fn write_json_bytes_scalar(bytes: &[u8], buf: &mut Vec<u8>) {
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
@@ -151,14 +275,12 @@ pub(crate) fn write_json_bytes(bytes: &[u8], buf: &mut Vec<u8>) {
                 let remaining = &bytes[i..];
                 match std::str::from_utf8(remaining) {
                     Ok(s) => {
-                        // Rest is valid UTF-8 — write it and done.
                         write_json_str(s, buf);
                         return;
                     }
                     Err(e) => {
                         let valid_up_to = e.valid_up_to();
                         if valid_up_to > 0 {
-                            // Write the valid prefix.
                             // SAFETY: `from_utf8` proved `remaining[..valid_up_to]`
                             // is valid UTF-8.
                             let valid =
@@ -179,9 +301,314 @@ pub(crate) fn write_json_bytes(bytes: &[u8], buf: &mut Vec<u8>) {
     }
 }
 
+// ============================================================================
+// NEON SIMD fast path (aarch64 only)
+// ============================================================================
+
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use std::arch::aarch64::*;
+
+    /// Check whether all 16 bytes in `chunk` are "safe" for JSON output:
+    /// printable ASCII (0x20..=0x7e) excluding `"` (0x22) and `\` (0x5c),
+    /// and no control characters.
+    ///
+    /// Returns `true` if every byte can be copied verbatim into a JSON string.
+    ///
+    /// # Safety
+    ///
+    /// Requires aarch64 NEON support (guaranteed on all AArch64 targets).
+    #[inline(always)]
+    pub(super) unsafe fn is_all_safe_neon(chunk: uint8x16_t) -> bool {
+        // Range check: byte >= 0x20 && byte <= 0x7e
+        let lo = vdupq_n_u8(0x20);
+        let hi = vdupq_n_u8(0x7e);
+        let ge_lo = vcgeq_u8(chunk, lo);
+        let le_hi = vcleq_u8(chunk, hi);
+        let in_range = vandq_u8(ge_lo, le_hi);
+
+        // Exclude quote and backslash
+        let quote = vdupq_n_u8(b'"');
+        let backslash = vdupq_n_u8(b'\\');
+        let not_quote = vmvnq_u8(vceqq_u8(chunk, quote));
+        let not_backslash = vmvnq_u8(vceqq_u8(chunk, backslash));
+
+        // All conditions must hold for every lane
+        let safe = vandq_u8(in_range, vandq_u8(not_quote, not_backslash));
+
+        // Horizontal minimum: if the minimum lane is 0xff, all lanes are safe.
+        vminvq_u8(safe) == 0xff
+    }
+
+    /// NEON-accelerated JSON string escaping for `&str`.
+    ///
+    /// Processes 16 bytes at a time. If all 16 are safe, bulk-copies the chunk.
+    /// Otherwise falls back to scalar for the remainder of the string (the
+    /// scalar path handles the partial chunk correctly because `&str` is valid
+    /// UTF-8 — no risk of splitting a codepoint).
+    ///
+    /// # Safety
+    ///
+    /// - `s` must be a valid `&str` (guaranteed by type system).
+    /// - Requires aarch64 NEON support (guaranteed on all AArch64 targets).
+    #[inline]
+    pub(super) unsafe fn write_json_str_neon(s: &str, buf: &mut Vec<u8>) {
+        let bytes = s.as_bytes();
+        let mut i = 0;
+
+        // Process aligned 16-byte chunks.
+        while i + 16 <= bytes.len() {
+            let chunk = vld1q_u8(bytes.as_ptr().add(i));
+            if is_all_safe_neon(chunk) {
+                buf.extend_from_slice(&bytes[i..i + 16]);
+                i += 16;
+            } else {
+                // Escape-worthy byte found: fall back to scalar for the rest.
+                super::write_json_str_scalar(&s[i..], buf);
+                return;
+            }
+        }
+
+        // Scalar tail for remaining < 16 bytes.
+        if i < bytes.len() {
+            super::write_json_str_scalar(&s[i..], buf);
+        }
+    }
+
+    /// NEON-accelerated JSON byte-slice escaping.
+    ///
+    /// Like `write_json_str_neon` but for arbitrary `&[u8]`. When a non-safe
+    /// chunk is encountered, the *entire remainder* is delegated to the scalar
+    /// path (not just 16 bytes), because the scalar path's UTF-8 validation
+    /// for high bytes needs to see the full remaining slice to avoid splitting
+    /// mid-codepoint.
+    ///
+    /// # Safety
+    ///
+    /// - `bytes` is a valid byte slice (trivially true).
+    /// - Requires aarch64 NEON support (guaranteed on all AArch64 targets).
+    #[inline]
+    pub(super) unsafe fn write_json_bytes_neon(bytes: &[u8], buf: &mut Vec<u8>) {
+        let mut i = 0;
+
+        while i + 16 <= bytes.len() {
+            let chunk = vld1q_u8(bytes.as_ptr().add(i));
+            if is_all_safe_neon(chunk) {
+                buf.extend_from_slice(&bytes[i..i + 16]);
+                i += 16;
+            } else {
+                // Non-safe byte found: delegate entire remainder to scalar.
+                super::write_json_bytes_scalar(&bytes[i..], buf);
+                return;
+            }
+        }
+
+        // Scalar tail for remaining < 16 bytes.
+        if i < bytes.len() {
+            super::write_json_bytes_scalar(&bytes[i..], buf);
+        }
+    }
+}
+
+// ============================================================================
+// SSE2 SIMD fast path (x86_64 only)
+// ============================================================================
+
+#[cfg(target_arch = "x86_64")]
+mod sse2 {
+    use std::arch::x86_64::*;
+
+    /// Check whether all 16 bytes in `chunk` are "safe" for JSON output:
+    /// printable ASCII (0x20..=0x7e) excluding `"` (0x22) and `\` (0x5c),
+    /// and no control characters.
+    ///
+    /// Returns `true` if every byte can be copied verbatim into a JSON string.
+    ///
+    /// # Safety
+    ///
+    /// Requires SSE2 support (guaranteed on all x86_64 targets).
+    ///
+    /// # SSE2 signed-comparison trick
+    ///
+    /// SSE2 only provides signed byte comparisons (`_mm_cmpgt_epi8`,
+    /// `_mm_cmplt_epi8`). For the range we care about (0x20..=0x7e),
+    /// all bytes are positive in two's complement (0x00..0x7f), so signed
+    /// comparisons produce correct results:
+    /// - `byte > 0x1f` is true for 0x20..0x7f (correct: includes our range)
+    /// - `byte < 0x7f` is true for 0x00..0x7e (correct: excludes DEL)
+    /// - High bytes (0x80..0xff) are negative, so `> 0x1f` is false (correct)
+    #[inline(always)]
+    pub(super) unsafe fn is_all_safe_sse2(chunk: __m128i) -> bool {
+        // Range check: byte > 0x1f && byte < 0x7f  →  0x20..=0x7e
+        let lo = _mm_set1_epi8(0x1f);
+        let hi = _mm_set1_epi8(0x7f_u8 as i8);
+        let gt_lo = _mm_cmpgt_epi8(chunk, lo); // byte > 0x1f
+        let lt_hi = _mm_cmplt_epi8(chunk, hi); // byte < 0x7f
+        let in_range = _mm_and_si128(gt_lo, lt_hi);
+
+        // Exclude quote (0x22) and backslash (0x5c)
+        let quote = _mm_set1_epi8(b'"' as i8);
+        let backslash = _mm_set1_epi8(b'\\' as i8);
+        let is_quote = _mm_cmpeq_epi8(chunk, quote);
+        let is_backslash = _mm_cmpeq_epi8(chunk, backslash);
+        let is_special = _mm_or_si128(is_quote, is_backslash);
+
+        // safe = in_range AND NOT is_special
+        let safe = _mm_andnot_si128(is_special, in_range);
+
+        // Extract high bit of each byte. If all lanes are 0xff, movemask = 0xffff.
+        _mm_movemask_epi8(safe) == 0xffff_i32
+    }
+
+    /// SSE2-accelerated JSON string escaping for `&str`.
+    ///
+    /// Processes 16 bytes at a time. If all 16 are safe, bulk-copies the chunk.
+    /// Otherwise falls back to scalar for the remainder of the string.
+    ///
+    /// # Safety
+    ///
+    /// - `s` must be a valid `&str` (guaranteed by type system).
+    /// - Requires SSE2 support (guaranteed on all x86_64 targets).
+    #[inline]
+    pub(super) unsafe fn write_json_str_sse2(s: &str, buf: &mut Vec<u8>) {
+        let bytes = s.as_bytes();
+        let mut i = 0;
+
+        while i + 16 <= bytes.len() {
+            let chunk = _mm_loadu_si128(bytes.as_ptr().add(i) as *const __m128i);
+            if is_all_safe_sse2(chunk) {
+                buf.extend_from_slice(&bytes[i..i + 16]);
+                i += 16;
+            } else {
+                // Escape-worthy byte found: fall back to scalar for the rest.
+                // All bytes consumed so far were ASCII, so `i` is on a char boundary.
+                super::write_json_str_scalar(&s[i..], buf);
+                return;
+            }
+        }
+
+        if i < bytes.len() {
+            super::write_json_str_scalar(&s[i..], buf);
+        }
+    }
+
+    /// SSE2-accelerated JSON byte-slice escaping.
+    ///
+    /// Like `write_json_str_sse2` but for arbitrary `&[u8]`. When a non-safe
+    /// chunk is encountered, the *entire remainder* is delegated to the scalar
+    /// path to avoid splitting mid-codepoint in UTF-8 validation.
+    ///
+    /// # Safety
+    ///
+    /// - `bytes` is a valid byte slice (trivially true).
+    /// - Requires SSE2 support (guaranteed on all x86_64 targets).
+    #[inline]
+    pub(super) unsafe fn write_json_bytes_sse2(bytes: &[u8], buf: &mut Vec<u8>) {
+        let mut i = 0;
+
+        while i + 16 <= bytes.len() {
+            let chunk = _mm_loadu_si128(bytes.as_ptr().add(i) as *const __m128i);
+            if is_all_safe_sse2(chunk) {
+                buf.extend_from_slice(&bytes[i..i + 16]);
+                i += 16;
+            } else {
+                super::write_json_bytes_scalar(&bytes[i..], buf);
+                return;
+            }
+        }
+
+        if i < bytes.len() {
+            super::write_json_bytes_scalar(&bytes[i..], buf);
+        }
+    }
+}
+
+// ============================================================================
+// Public dispatch functions
+// ============================================================================
+
+/// Write a JSON-escaped UTF-8 string (without surrounding quotes).
+///
+/// On aarch64, uses NEON SIMD to bulk-copy runs of safe ASCII characters.
+/// On x86_64, uses SSE2 for the same 16-byte vectorized scan.
+/// Falls back to scalar per-byte escaping for short strings or when
+/// escape-worthy characters are encountered.
+#[inline(always)]
+pub fn write_json_str(s: &str, buf: &mut Vec<u8>) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if s.len() >= 16 {
+            // SAFETY: NEON is guaranteed on aarch64. The function operates on
+            // a valid &str and writes only to the caller-owned Vec<u8>.
+            unsafe {
+                neon::write_json_str_neon(s, buf);
+            }
+            return;
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if s.len() >= 16 {
+            // SAFETY: SSE2 is guaranteed on x86_64. The function operates on
+            // a valid &str and writes only to the caller-owned Vec<u8>.
+            unsafe {
+                sse2::write_json_str_sse2(s, buf);
+            }
+            return;
+        }
+    }
+    write_json_str_scalar(s, buf);
+}
+
+/// Write raw bytes as a JSON string value (without surrounding quotes).
+///
+/// The algorithm walks `bytes` left-to-right:
+///
+/// 1. **ASCII control / special** (`0x00..=0x1f`, `"`, `\`) — JSON-escape.
+/// 2. **ASCII printable** (`0x20..=0x7e`) — pass through verbatim.
+/// 3. **High byte** (`0x80..=0xff`) — attempt UTF-8 validation on the
+///    *remainder* of the slice:
+///    - If the entire remainder is valid UTF-8, delegate to [`write_json_str`]
+///      (which handles escaping of control chars within valid UTF-8) and return.
+///    - Otherwise, copy the valid prefix via `write_json_str`, advance `i`
+///      past it, and escape the first invalid byte as `\u00XX`. The loop then
+///      continues from the next byte.
+///
+/// On aarch64 (NEON) and x86_64 (SSE2), a SIMD fast path scans 16 bytes at a
+/// time for safe ASCII runs.
+pub fn write_json_bytes(bytes: &[u8], buf: &mut Vec<u8>) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if bytes.len() >= 16 {
+            // SAFETY: NEON is guaranteed on aarch64. The function reads from a
+            // valid byte slice and writes only to the caller-owned Vec<u8>.
+            unsafe {
+                neon::write_json_bytes_neon(bytes, buf);
+            }
+            return;
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if bytes.len() >= 16 {
+            // SAFETY: SSE2 is guaranteed on x86_64. The function reads from a
+            // valid byte slice and writes only to the caller-owned Vec<u8>.
+            unsafe {
+                sse2::write_json_bytes_sse2(bytes, buf);
+            }
+            return;
+        }
+    }
+    write_json_bytes_scalar(bytes, buf);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // write_u64 tests
+    // ========================================================================
 
     #[test]
     fn u64_values() {
@@ -197,6 +624,120 @@ mod tests {
         write_u64(u64::MAX, &mut buf);
         assert_eq!(std::str::from_utf8(&buf).unwrap(), u64::MAX.to_string());
     }
+
+    #[test]
+    fn u64_boundary_values() {
+        let cases: &[(u64, &str)] = &[
+            (0, "0"),
+            (1, "1"),
+            (9, "9"),
+            (10, "10"),
+            (99, "99"),
+            (100, "100"),
+            (999, "999"),
+            (10000, "10000"),
+            (u32::MAX as u64, "4294967295"),
+            (u64::MAX, "18446744073709551615"),
+        ];
+        let mut buf = Vec::new();
+        for &(val, expected) in cases {
+            buf.clear();
+            write_u64(val, &mut buf);
+            assert_eq!(
+                std::str::from_utf8(&buf).unwrap(),
+                expected,
+                "write_u64({val}) mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn u64_matches_to_string() {
+        let mut buf = Vec::new();
+        // Test a spread of values across the entire u64 range.
+        let values = [
+            0,
+            1,
+            9,
+            10,
+            11,
+            99,
+            100,
+            101,
+            999,
+            1000,
+            9999,
+            10000,
+            99999,
+            100000,
+            999999,
+            1000000,
+            9999999,
+            10000000,
+            123456789,
+            1000000000,
+            1700000000,
+            u32::MAX as u64,
+            u32::MAX as u64 + 1,
+            10_000_000_000,
+            100_000_000_000,
+            1_000_000_000_000,
+            999_999_999_999_999,
+            10_000_000_000_000_000,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        for &n in &values {
+            buf.clear();
+            write_u64(n, &mut buf);
+            assert_eq!(
+                std::str::from_utf8(&buf).unwrap(),
+                n.to_string(),
+                "write_u64({n}) mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn digit_count_correctness() {
+        assert_eq!(digit_count(0), 1);
+        assert_eq!(digit_count(1), 1);
+        assert_eq!(digit_count(9), 1);
+        assert_eq!(digit_count(10), 2);
+        assert_eq!(digit_count(99), 2);
+        assert_eq!(digit_count(100), 3);
+        assert_eq!(digit_count(999), 3);
+        assert_eq!(digit_count(9999), 4);
+        assert_eq!(digit_count(10000), 5);
+        assert_eq!(digit_count(u32::MAX as u64), 10);
+        assert_eq!(digit_count(u64::MAX), 20);
+
+        // Verify every power-of-10 boundary.
+        let mut p: u64 = 1;
+        for expected_digits in 1..=19 {
+            assert_eq!(
+                digit_count(p - 1),
+                if p == 1 { 1 } else { expected_digits - 1 },
+                "digit_count({}) should be {}",
+                p - 1,
+                if p == 1 { 1 } else { expected_digits - 1 }
+            );
+            assert_eq!(
+                digit_count(p),
+                expected_digits,
+                "digit_count({p}) should be {expected_digits}"
+            );
+            if let Some(next) = p.checked_mul(10) {
+                p = next;
+            } else {
+                break;
+            }
+        }
+    }
+
+    // ========================================================================
+    // write_f64 tests
+    // ========================================================================
 
     #[test]
     fn f64_values() {
@@ -236,6 +777,10 @@ mod tests {
         assert_eq!(&buf, b"-1.00");
     }
 
+    // ========================================================================
+    // write_bool tests
+    // ========================================================================
+
     #[test]
     fn bool_values() {
         let mut buf = Vec::new();
@@ -247,37 +792,9 @@ mod tests {
         assert_eq!(&buf, b"false");
     }
 
-    #[test]
-    fn json_str_escaping() {
-        let mut buf = Vec::new();
-        write_json_str("path=\"foo\\bar\"\nnewline", &mut buf);
-        let s = std::str::from_utf8(&buf).unwrap();
-        assert!(s.contains("\\\""));
-        assert!(s.contains("\\\\"));
-        assert!(s.contains("\\n"));
-    }
-
-    #[test]
-    fn json_str_control_chars() {
-        let mut buf = Vec::new();
-        write_json_str("\x00\x1f", &mut buf);
-        assert_eq!(&buf, b"\\u0000\\u001f");
-    }
-
-    #[test]
-    fn json_bytes_valid_utf8() {
-        let mut buf = Vec::new();
-        write_json_bytes(b"hello world", &mut buf);
-        assert_eq!(&buf, b"hello world");
-    }
-
-    #[test]
-    fn json_bytes_invalid_utf8() {
-        let mut buf = Vec::new();
-        write_json_bytes(b"src/\xff/bad.rs", &mut buf);
-        let s = std::str::from_utf8(&buf).unwrap();
-        assert_eq!(s, "src/\\u00ff/bad.rs");
-    }
+    // ========================================================================
+    // write_oid_hex tests
+    // ========================================================================
 
     #[test]
     fn write_oid_hex_sha1() {
@@ -308,5 +825,354 @@ mod tests {
             "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
         );
         assert_eq!(buf.len(), 64);
+    }
+
+    #[test]
+    fn write_oid_hex_all_zero() {
+        let oid = OidBytes::sha1([0x00; 20]);
+        let mut buf = Vec::new();
+        write_oid_hex(&oid, &mut buf);
+        assert_eq!(
+            std::str::from_utf8(&buf).unwrap(),
+            "0000000000000000000000000000000000000000"
+        );
+    }
+
+    #[test]
+    fn write_oid_hex_all_ff() {
+        let oid = OidBytes::sha1([0xff; 20]);
+        let mut buf = Vec::new();
+        write_oid_hex(&oid, &mut buf);
+        assert_eq!(
+            std::str::from_utf8(&buf).unwrap(),
+            "ffffffffffffffffffffffffffffffffffffffff"
+        );
+    }
+
+    // ========================================================================
+    // write_json_str tests
+    // ========================================================================
+
+    #[test]
+    fn json_str_escaping() {
+        let mut buf = Vec::new();
+        write_json_str("path=\"foo\\bar\"\nnewline", &mut buf);
+        let s = std::str::from_utf8(&buf).unwrap();
+        assert!(s.contains("\\\""));
+        assert!(s.contains("\\\\"));
+        assert!(s.contains("\\n"));
+    }
+
+    #[test]
+    fn json_str_control_chars() {
+        let mut buf = Vec::new();
+        write_json_str("\x00\x1f", &mut buf);
+        assert_eq!(&buf, b"\\u0000\\u001f");
+    }
+
+    #[test]
+    fn json_str_simd_boundary_lengths() {
+        // Verify correctness at lengths around SIMD boundaries (0, 1, 15, 16, 17, 31, 32, 33, 48, 64).
+        let mut buf_new = Vec::new();
+        let mut buf_scalar = Vec::new();
+        for &len in &[0, 1, 15, 16, 17, 31, 32, 33, 48, 64] {
+            let s: String = (0..len).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+            buf_new.clear();
+            buf_scalar.clear();
+            write_json_str(&s, &mut buf_new);
+            write_json_str_scalar(&s, &mut buf_scalar);
+            assert_eq!(buf_new, buf_scalar, "write_json_str mismatch at len={len}");
+        }
+    }
+
+    #[test]
+    fn json_str_escape_at_every_position() {
+        // Place escape chars at positions 0..31 in a 32-byte string.
+        let escape_chars = [b'"', b'\\', b'\n', 0x01];
+        let mut buf_new = Vec::new();
+        let mut buf_scalar = Vec::new();
+        for &esc in &escape_chars {
+            for pos in 0..32 {
+                let mut bytes = vec![b'a'; 32];
+                bytes[pos] = esc;
+                // For control chars, make sure we build a valid str.
+                let s = String::from_utf8(bytes).unwrap_or_else(|_| {
+                    let mut bytes = vec![b'a'; 32];
+                    bytes[pos] = esc;
+                    // Control chars are valid UTF-8, quote/backslash are ASCII.
+                    unsafe { String::from_utf8_unchecked(bytes) }
+                });
+                buf_new.clear();
+                buf_scalar.clear();
+                write_json_str(&s, &mut buf_new);
+                write_json_str_scalar(&s, &mut buf_scalar);
+                assert_eq!(
+                    buf_new, buf_scalar,
+                    "mismatch for esc=0x{esc:02x} at pos={pos}"
+                );
+            }
+        }
+    }
+
+    // ========================================================================
+    // write_json_bytes tests
+    // ========================================================================
+
+    #[test]
+    fn json_bytes_valid_utf8() {
+        let mut buf = Vec::new();
+        write_json_bytes(b"hello world", &mut buf);
+        assert_eq!(&buf, b"hello world");
+    }
+
+    #[test]
+    fn json_bytes_invalid_utf8() {
+        let mut buf = Vec::new();
+        write_json_bytes(b"src/\xff/bad.rs", &mut buf);
+        let s = std::str::from_utf8(&buf).unwrap();
+        assert_eq!(s, "src/\\u00ff/bad.rs");
+    }
+
+    #[test]
+    fn json_bytes_simd_then_scalar() {
+        // 16 clean ASCII bytes + 0xff + rest — SIMD handles first chunk, scalar handles rest.
+        let mut input = vec![b'a'; 16];
+        input.push(0xff);
+        input.extend_from_slice(b"/rest.rs");
+
+        let mut buf_new = Vec::new();
+        let mut buf_scalar = Vec::new();
+        write_json_bytes(&input, &mut buf_new);
+        write_json_bytes_scalar(&input, &mut buf_scalar);
+        assert_eq!(buf_new, buf_scalar);
+    }
+
+    #[test]
+    fn json_bytes_simd_boundary_lengths() {
+        let mut buf_new = Vec::new();
+        let mut buf_scalar = Vec::new();
+        for &len in &[0, 1, 15, 16, 17, 31, 32, 33, 48, 64] {
+            let input: Vec<u8> = (0..len).map(|i| b'a' + (i % 26) as u8).collect();
+            buf_new.clear();
+            buf_scalar.clear();
+            write_json_bytes(&input, &mut buf_new);
+            write_json_bytes_scalar(&input, &mut buf_scalar);
+            assert_eq!(
+                buf_new, buf_scalar,
+                "write_json_bytes mismatch at len={len}"
+            );
+        }
+    }
+
+    // ========================================================================
+    // Miri-targeted edge-case tests for unsafe paths
+    // ========================================================================
+
+    /// Exercise the `from_utf8_unchecked` path in `write_json_bytes_scalar`
+    /// with invalid UTF-8 bytes at various positions. Miri validates the
+    /// `from_utf8_unchecked` precondition (the prefix up to `valid_up_to`
+    /// is genuinely valid UTF-8).
+    #[test]
+    fn miri_write_json_bytes_invalid_utf8_boundary() {
+        let mut buf = Vec::new();
+
+        // Invalid byte at position 0: no valid UTF-8 prefix.
+        buf.clear();
+        write_json_bytes(b"\xff hello", &mut buf);
+        let s = std::str::from_utf8(&buf).unwrap();
+        assert!(s.starts_with("\\u00ff"));
+
+        // Invalid byte after a valid multi-byte sequence:
+        // "é" = [0xc3, 0xa9], then 0xff forces scalar fallback with a
+        // valid_up_to of 2.
+        buf.clear();
+        write_json_bytes(b"\xc3\xa9\xff rest", &mut buf);
+        let s = std::str::from_utf8(&buf).unwrap();
+        assert!(s.contains("\\u00ff"), "output was: {s}");
+
+        // Invalid byte splitting a multi-byte sequence: 0xc3 without
+        // its continuation byte. `from_utf8` returns valid_up_to = 0,
+        // so we skip the `from_utf8_unchecked` path entirely.
+        buf.clear();
+        write_json_bytes(b"\xc3\xff rest", &mut buf);
+        let s = std::str::from_utf8(&buf).unwrap();
+        assert!(s.starts_with("\\u00c3\\u00ff"), "output was: {s}");
+
+        // Invalid byte at the end of a long run. The high byte (0x80+)
+        // triggers the UTF-8 validation branch after ASCII processing.
+        buf.clear();
+        let mut input = b"abcdef1234567890".to_vec(); // 16 bytes (SIMD chunk)
+        input.extend_from_slice(b"\xc3\xa9"); // valid 2-byte UTF-8
+        input.push(0xff); // invalid
+        input.extend_from_slice(b"tail");
+        write_json_bytes(&input, &mut buf);
+        let s = std::str::from_utf8(&buf).unwrap();
+        assert!(s.contains("\\u00ff"), "output was: {s}");
+        assert!(s.ends_with("tail"), "output was: {s}");
+
+        // Multiple consecutive invalid bytes.
+        buf.clear();
+        write_json_bytes(b"\xfe\xff\x80\x81", &mut buf);
+        let s = std::str::from_utf8(&buf).unwrap();
+        assert_eq!(s, "\\u00fe\\u00ff\\u0080\\u0081");
+    }
+
+    /// Exercise `write_oid_hex` under Miri with SHA-256 all-0xff (maximum
+    /// byte values) to stress the ptr::write path with the highest table
+    /// indices.
+    #[test]
+    fn miri_write_oid_hex_sha256_all_ff() {
+        let oid = OidBytes::sha256([0xff; 32]);
+        let mut buf = Vec::new();
+        write_oid_hex(&oid, &mut buf);
+        assert_eq!(buf.len(), 64);
+        assert!(buf.iter().all(|&b| b == b'f'));
+    }
+
+    /// Verify `write_oid_hex` into a non-empty buffer (offset != 0).
+    /// This exercises the `base = buf.len()` path with a nonzero base
+    /// pointer offset.
+    #[test]
+    fn miri_write_oid_hex_appends_to_nonempty() {
+        let oid = OidBytes::sha1([0xab; 20]);
+        let mut buf = Vec::from(b"prefix:" as &[u8]);
+        write_oid_hex(&oid, &mut buf);
+        assert_eq!(buf.len(), 7 + 40);
+        assert_eq!(&buf[..7], b"prefix:");
+        assert_eq!(
+            std::str::from_utf8(&buf[7..]).unwrap(),
+            "abababababababababababababababababababab"
+        );
+    }
+}
+
+// ============================================================================
+// Property-based tests (proptest)
+// ============================================================================
+
+#[cfg(all(test, feature = "stdx-proptest"))]
+mod prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 1024,
+            .. ProptestConfig::default()
+        })]
+
+        /// For any u64, `write_u64(n)` produces the same bytes as `n.to_string()`.
+        #[test]
+        fn prop_write_u64_matches_std(n: u64) {
+            let mut buf = Vec::new();
+            write_u64(n, &mut buf);
+            let got = std::str::from_utf8(&buf).unwrap();
+            prop_assert_eq!(got, &n.to_string());
+        }
+
+        /// For any valid UTF-8 string, `write_json_str` (which dispatches to
+        /// the SIMD path on supported architectures) produces identical output
+        /// to the scalar-only path.
+        #[test]
+        fn prop_write_json_str_simd_matches_scalar(s in "\\PC{0,256}") {
+            let mut buf_dispatch = Vec::new();
+            let mut buf_scalar = Vec::new();
+            write_json_str(&s, &mut buf_dispatch);
+            write_json_str_scalar(&s, &mut buf_scalar);
+            prop_assert_eq!(buf_dispatch, buf_scalar);
+        }
+
+        /// For any byte slice, `write_json_bytes` (SIMD dispatch) produces
+        /// identical output to `write_json_bytes_scalar`.
+        #[test]
+        fn prop_write_json_bytes_simd_matches_scalar(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
+            let mut buf_dispatch = Vec::new();
+            let mut buf_scalar = Vec::new();
+            write_json_bytes(&bytes, &mut buf_dispatch);
+            write_json_bytes_scalar(&bytes, &mut buf_scalar);
+            prop_assert_eq!(buf_dispatch, buf_scalar);
+        }
+
+        /// For any 20-byte array, `write_oid_hex` produces the same hex
+        /// string as per-byte `format!("{:02x}")`.
+        #[test]
+        fn prop_write_oid_hex_matches_format(raw in proptest::collection::vec(any::<u8>(), 20..=20)) {
+            let mut arr = [0u8; 20];
+            arr.copy_from_slice(&raw);
+            let oid = OidBytes::sha1(arr);
+            let mut buf = Vec::new();
+            write_oid_hex(&oid, &mut buf);
+            let expected: String = arr.iter().map(|b| format!("{b:02x}")).collect();
+            prop_assert_eq!(std::str::from_utf8(&buf).unwrap(), &expected);
+        }
+    }
+}
+
+// ============================================================================
+// Kani model-checking proofs
+// ============================================================================
+
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    // Kani proofs use concrete OID sizes (20 or 32) to avoid symbolic Vec
+    // allocation blowup. The byte *values* remain symbolic, which is what
+    // matters: Kani proves the pointer arithmetic in `write_oid_hex` is
+    // safe for any byte content at both SHA-1 and SHA-256 lengths.
+
+    /// Proves `write_oid_hex` pointer arithmetic stays within the
+    /// allocated region for SHA-1 (20-byte) OIDs.
+    ///
+    /// Kani verifies:
+    /// - `buf.as_mut_ptr().add(base + i*2)` is within allocation for all `i`
+    /// - `buf.as_mut_ptr().add(base + i*2 + 1)` is within allocation for all `i`
+    /// - `set_len(base + out_len)` does not exceed capacity
+    #[kani::proof]
+    #[kani::unwind(22)] // 20 iterations + 1
+    fn verify_write_oid_hex_sha1_bounds() {
+        let mut raw = [0u8; 20];
+        for b in raw.iter_mut() {
+            *b = kani::any();
+        }
+        let oid = OidBytes::sha1(raw);
+        let mut buf = Vec::with_capacity(64);
+        write_oid_hex(&oid, &mut buf);
+        assert_eq!(buf.len(), 40);
+    }
+
+    /// Proves `write_oid_hex` pointer arithmetic stays within the
+    /// allocated region for SHA-256 (32-byte) OIDs.
+    #[kani::proof]
+    #[kani::unwind(34)] // 32 iterations + 1
+    fn verify_write_oid_hex_sha256_bounds() {
+        let mut raw = [0u8; 32];
+        for b in raw.iter_mut() {
+            *b = kani::any();
+        }
+        let oid = OidBytes::sha256(raw);
+        let mut buf = Vec::with_capacity(64);
+        write_oid_hex(&oid, &mut buf);
+        assert_eq!(buf.len(), 64);
+    }
+
+    /// Proves `write_oid_hex` appended to a non-empty buffer does not
+    /// corrupt prior content or write out of bounds.
+    #[kani::proof]
+    #[kani::unwind(22)]
+    fn verify_write_oid_hex_nonempty_buf() {
+        let mut raw = [0u8; 20];
+        for b in raw.iter_mut() {
+            *b = kani::any();
+        }
+        let oid = OidBytes::sha1(raw);
+        // Start with some existing content in the buffer.
+        let mut buf = Vec::with_capacity(128);
+        buf.extend_from_slice(b"prefix");
+        let prefix_len = buf.len();
+        write_oid_hex(&oid, &mut buf);
+        assert_eq!(buf.len(), prefix_len + 40);
+        // Verify prefix was not overwritten.
+        assert_eq!(&buf[..prefix_len], b"prefix");
     }
 }
