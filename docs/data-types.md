@@ -51,13 +51,13 @@ classDiagram
         -Option~&'static [u8]~ must_contain
         -bool needs_assignment_shape_check
         -Option~u16~ secret_group
-        -Option~u32~ confirm_all
-        -Option~u32~ keywords
-        -Option~u32~ value_suppressors
-        -Option~u32~ entropy
-        -Option~u32~ local_context
-        -Option~u32~ two_phase
-        -Option~u32~ offline_validation
+        -u32 confirm_all
+        -u32 keywords
+        -u32 value_suppressors
+        -u32 entropy
+        -u32 local_context
+        -u32 two_phase
+        -u32 offline_validation
     }
 
     class RuleCold {
@@ -192,7 +192,7 @@ classDiagram
 
     RuleSpec --> TwoPhaseSpec : optional
     RuleSpec --> OfflineValidationSpec : optional
-    RuleCompiled --> TwoPhaseCompiled : optional gate index
+    RuleCompiled --> TwoPhaseCompiled : optional gate index (`u32`; `NO_GATE` sentinel)
     TwoPhaseCompiled --> PackedPatterns : uses
 
     ScanScratch --> FindingRec : produces
