@@ -738,11 +738,41 @@ fn stream_decode_url_percent(
 
     let mut out = [0u8; STREAM_DECODE_CHUNK_BYTES];
     let mut n = 0usize;
+    let max_fill = out.len() - 4; // headroom for escape decode
 
     let mut i = 0usize;
     while i < input.len() {
-        let b = input[i];
+        // Fast-path: use SIMD memchr to skip non-escape bytes in bulk.
+        let rest = &input[i..];
+        let skip = if plus_to_space {
+            memchr2(b'%', b'+', rest)
+        } else {
+            memchr(b'%', rest)
+        }
+        .unwrap_or(rest.len());
 
+        if skip > 0 {
+            let mut copied = 0;
+            while copied < skip {
+                let avail = max_fill.saturating_sub(n);
+                if avail == 0 {
+                    match flush_buf(&mut out, &mut n, &mut on_bytes) {
+                        ControlFlow::Continue(()) => {}
+                        ControlFlow::Break(()) => return,
+                    }
+                    continue;
+                }
+                let chunk = (skip - copied).min(avail);
+                out[n..n + chunk].copy_from_slice(&input[i + copied..i + copied + chunk]);
+                n += chunk;
+                copied += chunk;
+            }
+            i += skip;
+            continue;
+        }
+
+        // Slow path: decode the escape at input[i].
+        let b = input[i];
         let decoded =
             if b == b'%' && i + 2 < input.len() && is_hex(input[i + 1]) && is_hex(input[i + 2]) {
                 let hi = hex_val(input[i + 1]);
@@ -760,10 +790,7 @@ fn stream_decode_url_percent(
         out[n] = decoded;
         n += 1;
 
-        // Leave 4 bytes of headroom to safely write the next decoded output.
-        // URL decoding produces 1 byte per decode; base64 can produce up to 3.
-        // Using 4 covers both cases with a small margin.
-        if n >= out.len() - 4 {
+        if n >= max_fill {
             match flush_buf(&mut out, &mut n, &mut on_bytes) {
                 ControlFlow::Continue(()) => {}
                 ControlFlow::Break(()) => return,

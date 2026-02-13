@@ -24,22 +24,32 @@
 //!   advances `start_offset` past all earlier data.
 
 /// Fixed-capacity ring buffer for the tail of a byte stream.
+///
+/// Capacity is rounded up to the next power of two so that all index
+/// wrapping uses bitwise AND (`& mask`) instead of modulo division,
+/// eliminating `divq` instructions from the hot push path.
 pub(crate) struct ByteRing {
     buf: Vec<u8>,
+    mask: usize, // capacity - 1; capacity is always a power of two
     head: usize,
     len: usize,
     start_offset: u64,
 }
 
 impl ByteRing {
-    /// Creates an empty ring with a fixed `capacity`.
+    /// Creates an empty ring that can retain at least `capacity` bytes.
+    ///
+    /// The actual allocation is rounded up to the next power of two so that
+    /// index wrapping uses `& mask` instead of `% cap`.
     ///
     /// # Panics
     /// Panics if `capacity == 0`.
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         assert!(capacity > 0, "ByteRing capacity must be > 0");
+        let actual = capacity.next_power_of_two();
         Self {
-            buf: vec![0u8; capacity],
+            buf: vec![0u8; actual],
+            mask: actual - 1,
             head: 0,
             len: 0,
             start_offset: 0,
@@ -68,7 +78,7 @@ impl ByteRing {
         if self.len == 0 {
             return (&[], &[]);
         }
-        let cap = self.buf.len();
+        let cap = self.mask + 1;
         let start = self.head;
         if self.len <= cap - start {
             (&self.buf[start..start + self.len], &[])
@@ -96,7 +106,8 @@ impl ByteRing {
             return;
         }
 
-        let cap = self.buf.len();
+        let mask = self.mask;
+        let cap = mask + 1;
         let n = data.len();
         let old_len = self.len;
         let old_end = self.start_offset.saturating_add(old_len as u64);
@@ -117,12 +128,12 @@ impl ByteRing {
             drop = 0;
         }
         if drop > 0 {
-            self.head = (self.head + drop) % cap;
+            self.head = (self.head + drop) & mask;
             self.len = self.len.saturating_sub(drop);
             self.start_offset = self.start_offset.saturating_add(drop as u64);
         }
 
-        let tail = (self.head + self.len) % cap;
+        let tail = (self.head + self.len) & mask;
         let first = (cap - tail).min(n);
         self.buf[tail..tail + first].copy_from_slice(&data[..first]);
         if n > first {
@@ -188,8 +199,9 @@ impl ByteRing {
             return true;
         }
 
-        let cap = self.buf.len();
-        let start = (self.head + offset) % cap;
+        let mask = self.mask;
+        let cap = mask + 1;
+        let start = (self.head + offset) & mask;
         let first = (cap - start).min(len);
         out.extend_from_slice(&self.buf[start..start + first]);
         if len > first {
