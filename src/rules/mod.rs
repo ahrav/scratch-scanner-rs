@@ -3,6 +3,15 @@
 //! Rules can be loaded from an external YAML file at runtime, or from the
 //! built-in set embedded via `include_str!`. The YAML schema mirrors `RuleSpec`
 //! fields and uses the same `build_regex()` + `assert_valid()` validation.
+//!
+//! # Invariants
+//!
+//! - Runtime file loading always returns structured `RulesError` values for
+//!   parse/validation failures.
+//! - Built-in rules are validated once at process startup and then cloned from
+//!   cache; invalid embedded YAML is treated as a programming error and panics.
+//! - Regex compilation uses progressive size tiers so one complex rule does not
+//!   require raising memory limits globally.
 
 pub(crate) mod yaml;
 
@@ -21,7 +30,11 @@ const REGEX_SIZE_LIMITS: &[usize] = &[32 * 1024 * 1024, 128 * 1024 * 1024, 512 *
 
 /// Build a bytes regex with increasing size limits.
 ///
-/// Returns an error if the pattern is invalid or exceeds the maximum configured limits.
+/// This retries only `CompiledTooBig` failures at higher limits; all other
+/// regex errors return immediately.
+///
+/// Returns an error if the pattern is invalid or still exceeds the largest
+/// configured limit.
 pub(crate) fn build_regex(pattern: &str) -> Result<Regex, String> {
     for &limit in REGEX_SIZE_LIMITS {
         let mut builder = regex::bytes::RegexBuilder::new(pattern);
@@ -105,6 +118,10 @@ impl std::error::Error for RulesError {
 ///
 /// Reads the file, parses it via [`yaml::parse_yaml_rules`], then runs
 /// `assert_valid()` on each rule (catching panics as `Validation` errors).
+///
+/// Panics from `assert_valid()` that are not string payloads are re-raised:
+/// they are treated as non-validation failures (for example, abort-like
+/// runtime failures) rather than user-facing rule errors.
 pub(crate) fn load_rules(path: &Path) -> Result<Vec<RuleSpec>, RulesError> {
     let content = std::fs::read_to_string(path).map_err(RulesError::Io)?;
     let rules = yaml::parse_yaml_rules(&content)?;
@@ -148,6 +165,7 @@ pub(crate) fn load_rules(path: &Path) -> Result<Vec<RuleSpec>, RulesError> {
 ///
 /// Returns `None` if the executable path cannot be determined (e.g., `/proc`
 /// not mounted in containers, or the binary has no parent directory).
+/// The returned path is a candidate location and may not exist.
 pub(crate) fn default_rules_path() -> Option<PathBuf> {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -162,11 +180,22 @@ pub(crate) fn default_rules_path() -> Option<PathBuf> {
 /// The built-in rule set, embedded from `default_rules.yaml` at compile time.
 const BUILTIN_RULES_YAML: &str = include_str!("../../default_rules.yaml");
 
+/// Returns the built-in `default_rules.yaml` contents embedded at compile time.
+///
+/// Used for provenance hashing/logging in startup paths that fall back to
+/// built-in rules.
+pub(crate) fn builtin_rules_yaml() -> &'static str {
+    BUILTIN_RULES_YAML
+}
+
 /// Parse and return the built-in rule set.
 ///
 /// This replaces the old `gitleaks_rules()` function. Rules are parsed and
 /// compiled once (via `OnceLock`) then cloned on subsequent calls, avoiding
 /// repeated memory leaks from `Box::leak` in the YAML parser.
+///
+/// Panics if embedded YAML is invalid or empty, because that indicates a
+/// build-time packaging/programming error, not runtime user input.
 pub(crate) fn builtin_rules() -> Vec<RuleSpec> {
     static BUILTIN: OnceLock<Vec<RuleSpec>> = OnceLock::new();
     BUILTIN

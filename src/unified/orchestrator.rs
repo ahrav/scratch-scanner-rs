@@ -14,7 +14,8 @@
 //!
 //! # Lifecycle
 //!
-//! 1. Load rules (YAML file → fallback to compiled-in set).
+//! 1. Load rules (`--rules` override → workspace/default YAML → executable-dir YAML
+//!    → compiled-in fallback).
 //! 2. Apply `--transforms` filter and build the detection [`Engine`].
 //! 3. Construct the [`EventSink`] for the selected output format.
 //! 4. Run the source driver (FS or Git), which emits `Finding` /
@@ -27,6 +28,13 @@
 //! - Human-readable and machine-parseable `key=value` summaries are written
 //!   to stderr on successful FS/Git scans for backward-compatible tooling.
 //! - Fatal configuration failures exit with status code `2`.
+//!
+//! # Rule Source Invariants
+//!
+//! - At most one rule source is chosen per run, using a strict precedence order.
+//! - Default file candidates are only selected when they exist on disk.
+//! - Built-in fallback remains available even when path discovery fails, so startup
+//!   never depends on host filesystem layout.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -1180,30 +1188,157 @@ fn apply_transform_filter(
 
 /// Load rules from a YAML file, falling back to the compiled-in set.
 ///
-/// Fallback chain: explicit path > `default_rules.yaml` next to binary > `demo_rules()`.
-fn load_rules_for_scan(rules_file: Option<&Path>) -> Vec<RuleSpec> {
-    let path = match rules_file {
-        Some(p) => p.to_path_buf(),
-        None => match crate::rules::default_rules_path() {
-            Some(p) if p.exists() => {
-                eprintln!("info: loading rules from {}", p.display());
-                p
-            }
-            _ => {
-                let rules = demo_rules();
-                eprintln!("info: using compiled-in rule set ({} rules)", rules.len());
-                return rules;
-            }
-        },
+/// Fallback chain:
+/// `--rules` override > `./default_rules.yaml` in current working directory
+/// > `default_rules.yaml` next to binary > compiled-in fallback.
+///
+/// This helper exits the process with code `2` on read/parse failures because
+/// rule configuration errors are treated as fatal startup misconfiguration.
+/// Provenance and a BLAKE3 content hash are emitted for diagnostics.
+///
+/// Resolved provenance for the rule set selected for a scan.
+///
+/// # Invariants
+/// - `Explicit`, `WorkspaceDefault`, and `ExecutableDefault` variants always
+///   reference existing files.
+/// - `BuiltInFallback` stores probed candidate paths for diagnostics even when
+///   those files are absent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RuleSource {
+    Explicit(PathBuf),
+    WorkspaceDefault(PathBuf),
+    ExecutableDefault(PathBuf),
+    BuiltInFallback {
+        workspace_default_path: Option<PathBuf>,
+        executable_default_path: Option<PathBuf>,
+    },
+}
+
+/// Hash raw YAML bytes for startup provenance logs.
+///
+/// Using raw bytes (not parsed structures) keeps the digest stable even if the
+/// parser implementation changes.
+#[inline]
+fn rules_hash(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
+/// Resolve which rule source to use according to precedence.
+///
+/// Explicit `--rules` paths are accepted without existence checks so downstream
+/// loader diagnostics can report precise read/parse failures. Default candidates
+/// are accepted only if they currently exist.
+fn resolve_rule_source(
+    rules_file: Option<&Path>,
+    workspace_default_path: Option<&Path>,
+    executable_default_path: Option<&Path>,
+) -> RuleSource {
+    if let Some(path) = rules_file {
+        return RuleSource::Explicit(path.to_path_buf());
+    }
+    if let Some(path) = workspace_default_path.filter(|p| p.exists()) {
+        return RuleSource::WorkspaceDefault(path.to_path_buf());
+    }
+    if let Some(path) = executable_default_path.filter(|p| p.exists()) {
+        return RuleSource::ExecutableDefault(path.to_path_buf());
+    }
+    RuleSource::BuiltInFallback {
+        workspace_default_path: workspace_default_path.map(Path::to_path_buf),
+        executable_default_path: executable_default_path.map(Path::to_path_buf),
+    }
+}
+
+/// Load and parse rules from `path`, returning `(rules, hash)`.
+///
+/// The file is read once up front to compute a provenance hash. Parsing then
+/// delegates to [`crate::rules::load_rules`], which performs schema and per-rule
+/// validation. Any failure exits the process with code `2`.
+fn load_rules_from_path(path: &Path, source_label: &str) -> (Vec<RuleSpec>, String) {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("error: failed to read rules from {}: {e}", path.display());
+            std::process::exit(2);
+        }
     };
-    match crate::rules::load_rules(&path) {
+    let hash = rules_hash(&bytes);
+    match crate::rules::load_rules(path) {
         Ok(rules) => {
-            eprintln!("info: loaded {} rules from {}", rules.len(), path.display());
-            rules
+            eprintln!(
+                "info: loaded {} rules from {} (source: {}, rule_hash: {})",
+                rules.len(),
+                path.display(),
+                source_label,
+                hash
+            );
+            (rules, hash)
         }
         Err(e) => {
             eprintln!("error: failed to load rules from {}: {e}", path.display());
             std::process::exit(2);
+        }
+    }
+}
+
+/// Load the rule set for a scan run with deterministic fallback precedence.
+///
+/// # Selection order
+/// 1. `--rules` explicit path
+/// 2. `./default_rules.yaml` in current working directory
+/// 3. `default_rules.yaml` next to the executable
+/// 4. Compile-time embedded fallback (`default_rules.yaml`)
+///
+/// # Effects
+/// - Emits provenance logs (source label and BLAKE3 hash).
+/// - Exits with status `2` if an explicitly selected file cannot be read/parsed.
+fn load_rules_for_scan(rules_file: Option<&Path>) -> Vec<RuleSpec> {
+    let workspace_default_path = std::env::current_dir()
+        .ok()
+        .map(|cwd| cwd.join("default_rules.yaml"));
+    let executable_default_path = crate::rules::default_rules_path();
+    let source = resolve_rule_source(
+        rules_file,
+        workspace_default_path.as_deref(),
+        executable_default_path.as_deref(),
+    );
+    match source {
+        RuleSource::Explicit(path) => {
+            let (rules, _) = load_rules_from_path(&path, "explicit");
+            rules
+        }
+        RuleSource::WorkspaceDefault(path) => {
+            let (rules, _) = load_rules_from_path(&path, "workspace-default");
+            rules
+        }
+        RuleSource::ExecutableDefault(path) => {
+            let (rules, _) = load_rules_from_path(&path, "executable-default");
+            rules
+        }
+        RuleSource::BuiltInFallback {
+            workspace_default_path,
+            executable_default_path,
+        } => {
+            let rules = demo_rules();
+            let built_in_hash = rules_hash(crate::rules::builtin_rules_yaml().as_bytes());
+            let workspace_display = workspace_default_path
+                .as_deref()
+                .map(Path::display)
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "<cwd unavailable>".to_string());
+            let executable_display = executable_default_path
+                .as_deref()
+                .map(Path::display)
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "<executable path unavailable>".to_string());
+            eprintln!(
+                "warning: default_rules.yaml not found in workspace ({workspace_display}) or executable dir ({executable_display}); using compiled-in fallback"
+            );
+            eprintln!(
+                "info: using compiled-in rule set ({} rules, source: built-in, rule_hash: {})",
+                rules.len(),
+                built_in_hash
+            );
+            rules
         }
     }
 }
@@ -1213,12 +1348,85 @@ mod tests {
     use super::*;
     use crate::api::{TransformConfig, TransformId};
 
+    fn touch_default_rules_file(path: &Path) {
+        std::fs::write(path, "rules: []\n").expect("write default_rules.yaml");
+    }
+
     fn test_transforms() -> Vec<TransformConfig> {
         crate::demo_transforms()
     }
 
     fn ids(ts: &[TransformConfig]) -> Vec<TransformId> {
         ts.iter().map(|t| t.id).collect()
+    }
+
+    #[test]
+    fn resolve_rule_source_prefers_explicit_path_over_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let explicit = dir.path().join("custom_rules.yaml");
+        let workspace_default = dir.path().join("default_rules.yaml");
+        let executable_default = dir.path().join("exe_default_rules.yaml");
+        touch_default_rules_file(&explicit);
+        touch_default_rules_file(&workspace_default);
+        touch_default_rules_file(&executable_default);
+
+        let source = resolve_rule_source(
+            Some(&explicit),
+            Some(workspace_default.as_path()),
+            Some(executable_default.as_path()),
+        );
+        assert_eq!(source, RuleSource::Explicit(explicit));
+    }
+
+    #[test]
+    fn resolve_rule_source_prefers_workspace_default_over_executable_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_default = dir.path().join("default_rules.yaml");
+        let executable_default = dir.path().join("exe_default_rules.yaml");
+        touch_default_rules_file(&workspace_default);
+        touch_default_rules_file(&executable_default);
+
+        let source = resolve_rule_source(
+            None,
+            Some(workspace_default.as_path()),
+            Some(executable_default.as_path()),
+        );
+        assert_eq!(source, RuleSource::WorkspaceDefault(workspace_default));
+    }
+
+    #[test]
+    fn resolve_rule_source_uses_executable_default_when_workspace_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_default = dir.path().join("missing_default_rules.yaml");
+        let executable_default = dir.path().join("default_rules.yaml");
+        touch_default_rules_file(&executable_default);
+
+        let source = resolve_rule_source(
+            None,
+            Some(workspace_default.as_path()),
+            Some(executable_default.as_path()),
+        );
+        assert_eq!(source, RuleSource::ExecutableDefault(executable_default));
+    }
+
+    #[test]
+    fn resolve_rule_source_falls_back_to_builtin_when_no_defaults_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_default = dir.path().join("workspace_default_rules.yaml");
+        let executable_default = dir.path().join("exe_default_rules.yaml");
+
+        let source = resolve_rule_source(
+            None,
+            Some(workspace_default.as_path()),
+            Some(executable_default.as_path()),
+        );
+        assert_eq!(
+            source,
+            RuleSource::BuiltInFallback {
+                workspace_default_path: Some(workspace_default),
+                executable_default_path: Some(executable_default),
+            }
+        );
     }
 
     #[test]
