@@ -1188,8 +1188,7 @@ fn apply_transform_filter(
 /// Load rules from a YAML file, falling back to the compiled-in set.
 ///
 /// Fallback chain:
-/// `--rules` override > `./default_rules.yaml` in current working directory
-/// > `default_rules.yaml` next to binary > compiled-in fallback.
+/// `--rules` override > `default_rules.yaml` next to binary > compiled-in fallback.
 ///
 /// This helper exits the process with code `2` on read/parse failures because
 /// rule configuration errors are treated as fatal startup misconfiguration.
@@ -1198,17 +1197,14 @@ fn apply_transform_filter(
 /// Resolved provenance for the rule set selected for a scan.
 ///
 /// # Invariants
-/// - `Explicit`, `WorkspaceDefault`, and `ExecutableDefault` variants always
-///   reference existing files.
-/// - `BuiltInFallback` stores probed candidate paths for diagnostics even when
-///   those files are absent.
+/// - `Explicit` and `ExecutableDefault` variants always reference existing files.
+/// - `BuiltInFallback` stores the probed executable-dir candidate path for
+///   diagnostics even when absent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RuleSource {
     Explicit(PathBuf),
-    WorkspaceDefault(PathBuf),
     ExecutableDefault(PathBuf),
     BuiltInFallback {
-        workspace_default_path: Option<PathBuf>,
         executable_default_path: Option<PathBuf>,
     },
 }
@@ -1237,20 +1233,15 @@ fn rules_hash(bytes: &[u8]) -> String {
 /// are accepted only if they currently exist.
 fn resolve_rule_source(
     rules_file: Option<&Path>,
-    workspace_default_path: Option<&Path>,
     executable_default_path: Option<&Path>,
 ) -> RuleSource {
     if let Some(path) = rules_file {
         return RuleSource::Explicit(path.to_path_buf());
     }
-    if let Some(path) = workspace_default_path.filter(|p| p.exists()) {
-        return RuleSource::WorkspaceDefault(path.to_path_buf());
-    }
     if let Some(path) = executable_default_path.filter(|p| p.exists()) {
         return RuleSource::ExecutableDefault(path.to_path_buf());
     }
     RuleSource::BuiltInFallback {
-        workspace_default_path: workspace_default_path.map(Path::to_path_buf),
         executable_default_path: executable_default_path.map(Path::to_path_buf),
     }
 }
@@ -1291,30 +1282,18 @@ fn load_rules_from_path(path: &Path, source_label: &str) -> (Vec<RuleSpec>, Stri
 ///
 /// # Selection order
 /// 1. `--rules` explicit path
-/// 2. `./default_rules.yaml` in current working directory
-/// 3. `default_rules.yaml` next to the executable
-/// 4. Compile-time embedded fallback (`default_rules.yaml`)
+/// 2. `default_rules.yaml` next to the executable
+/// 3. Compile-time embedded fallback (`default_rules.yaml`)
 ///
 /// # Effects
 /// - Emits provenance logs (source label and deterministic fast hash fingerprint).
 /// - Exits with status `2` if an explicitly selected file cannot be read/parsed.
 fn load_rules_for_scan(rules_file: Option<&Path>) -> Vec<RuleSpec> {
-    let workspace_default_path = std::env::current_dir()
-        .ok()
-        .map(|cwd| cwd.join("default_rules.yaml"));
     let executable_default_path = crate::rules::default_rules_path();
-    let source = resolve_rule_source(
-        rules_file,
-        workspace_default_path.as_deref(),
-        executable_default_path.as_deref(),
-    );
+    let source = resolve_rule_source(rules_file, executable_default_path.as_deref());
     match source {
         RuleSource::Explicit(path) => {
             let (rules, _) = load_rules_from_path(&path, "explicit");
-            rules
-        }
-        RuleSource::WorkspaceDefault(path) => {
-            let (rules, _) = load_rules_from_path(&path, "workspace-default");
             rules
         }
         RuleSource::ExecutableDefault(path) => {
@@ -1322,23 +1301,17 @@ fn load_rules_for_scan(rules_file: Option<&Path>) -> Vec<RuleSpec> {
             rules
         }
         RuleSource::BuiltInFallback {
-            workspace_default_path,
             executable_default_path,
         } => {
             let rules = demo_rules();
             let built_in_hash = rules_hash(crate::rules::builtin_rules_yaml().as_bytes());
-            let workspace_display = workspace_default_path
-                .as_deref()
-                .map(Path::display)
-                .map(|p| p.to_string())
-                .unwrap_or_else(|| "<cwd unavailable>".to_string());
             let executable_display = executable_default_path
                 .as_deref()
                 .map(Path::display)
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "<executable path unavailable>".to_string());
             eprintln!(
-                "warning: default_rules.yaml not found in workspace ({workspace_display}) or executable dir ({executable_display}); using compiled-in fallback"
+                "warning: default_rules.yaml not found next to executable ({executable_display}); using compiled-in fallback"
             );
             eprintln!(
                 "info: using compiled-in rule set ({} rules, source: built-in, rule_hash: {})",
@@ -1386,66 +1359,33 @@ mod tests {
     fn resolve_rule_source_prefers_explicit_path_over_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let explicit = dir.path().join("custom_rules.yaml");
-        let workspace_default = dir.path().join("default_rules.yaml");
         let executable_default = dir.path().join("exe_default_rules.yaml");
         touch_default_rules_file(&explicit);
-        touch_default_rules_file(&workspace_default);
         touch_default_rules_file(&executable_default);
 
-        let source = resolve_rule_source(
-            Some(&explicit),
-            Some(workspace_default.as_path()),
-            Some(executable_default.as_path()),
-        );
+        let source = resolve_rule_source(Some(&explicit), Some(executable_default.as_path()));
         assert_eq!(source, RuleSource::Explicit(explicit));
     }
 
     #[test]
-    fn resolve_rule_source_prefers_workspace_default_over_executable_default() {
+    fn resolve_rule_source_uses_executable_default_when_present() {
         let dir = tempfile::tempdir().unwrap();
-        let workspace_default = dir.path().join("default_rules.yaml");
         let executable_default = dir.path().join("exe_default_rules.yaml");
-        touch_default_rules_file(&workspace_default);
         touch_default_rules_file(&executable_default);
 
-        let source = resolve_rule_source(
-            None,
-            Some(workspace_default.as_path()),
-            Some(executable_default.as_path()),
-        );
-        assert_eq!(source, RuleSource::WorkspaceDefault(workspace_default));
-    }
-
-    #[test]
-    fn resolve_rule_source_uses_executable_default_when_workspace_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        let workspace_default = dir.path().join("missing_default_rules.yaml");
-        let executable_default = dir.path().join("default_rules.yaml");
-        touch_default_rules_file(&executable_default);
-
-        let source = resolve_rule_source(
-            None,
-            Some(workspace_default.as_path()),
-            Some(executable_default.as_path()),
-        );
+        let source = resolve_rule_source(None, Some(executable_default.as_path()));
         assert_eq!(source, RuleSource::ExecutableDefault(executable_default));
     }
 
     #[test]
-    fn resolve_rule_source_falls_back_to_builtin_when_no_defaults_exist() {
+    fn resolve_rule_source_falls_back_to_builtin_when_default_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let workspace_default = dir.path().join("workspace_default_rules.yaml");
         let executable_default = dir.path().join("exe_default_rules.yaml");
 
-        let source = resolve_rule_source(
-            None,
-            Some(workspace_default.as_path()),
-            Some(executable_default.as_path()),
-        );
+        let source = resolve_rule_source(None, Some(executable_default.as_path()));
         assert_eq!(
             source,
             RuleSource::BuiltInFallback {
-                workspace_default_path: Some(workspace_default),
                 executable_default_path: Some(executable_default),
             }
         );
