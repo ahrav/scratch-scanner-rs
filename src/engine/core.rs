@@ -63,20 +63,27 @@ use ahash::AHashMap;
 #[cfg(feature = "stats")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::helpers::u64_to_usize;
+#[cfg(feature = "bench")]
+use super::helpers::contains_any_memmem;
+use super::helpers::{build_log2_table, u64_to_usize};
+#[cfg(feature = "bench")]
+use super::rule_repr::PackedPatternsBuilder;
 use super::rule_repr::{
     add_pat_owned, add_pat_raw, compile_confirm_all, compile_rule, map_to_patterns, utf16be_bytes,
     utf16le_bytes, ConfirmAllCompiled, EntropyCompiled, KeywordsCompiled, PackedPatterns, RuleCold,
-    RuleCompiled, Target, TwoPhaseCompiled, Variant,
+    RuleCompiled, Target, TwoPhaseCompiled, Variant, NO_GATE,
 };
 use super::safelist::SafelistFilter;
 use super::scratch::{RootSpanMapCtx, ScanScratch};
-use super::transform::STREAM_DECODE_CHUNK_BYTES;
+use super::transform::{
+    base64_char_count, base64_skip_chars, find_spans_into, transform_quick_trigger,
+    STREAM_DECODE_CHUNK_BYTES,
+};
 use super::vectorscan_prefilter::{
     AnchorInput, VsAnchorDb, VsGateDb, VsPrefilterDb, VsStreamDb, VsUtf16StreamDb,
 };
 use super::work_items::{EncRef, WorkItem};
-use crate::api::{Gate, TransformConfig, TransformId, TransformMode};
+use crate::git_scan::perf;
 use std::ops::Range;
 use std::time::Instant;
 
@@ -243,9 +250,9 @@ pub struct Engine {
     pub(super) value_suppressor_gates: Vec<PackedPatterns>,
     pub(super) entropy_gates: Vec<EntropyCompiled>,
     pub(super) two_phase_gates: Vec<TwoPhaseCompiled>,
-    pub(super) local_context_gates: Vec<crate::api::LocalContextSpec>,
+    pub(super) local_context_gates: Vec<LocalContextSpec>,
     /// Offline structural validation specs (e.g. CRC-32, format checks).
-    pub(super) offline_validation_gates: Vec<crate::api::OfflineValidationSpec>,
+    pub(super) offline_validation_gates: Vec<OfflineValidationSpec>,
     /// Global context safelist evaluated at finding emission time.
     pub(super) safelist: SafelistFilter,
 
@@ -400,40 +407,40 @@ impl Engine {
         let mut value_suppressor_gates: Vec<PackedPatterns> = Vec::new();
         let mut entropy_gates: Vec<EntropyCompiled> = Vec::new();
         let mut two_phase_gates: Vec<TwoPhaseCompiled> = Vec::new();
-        let mut local_context_gates: Vec<crate::api::LocalContextSpec> = Vec::new();
-        let mut offline_validation_gates: Vec<crate::api::OfflineValidationSpec> = Vec::new();
+        let mut local_context_gates: Vec<LocalContextSpec> = Vec::new();
+        let mut offline_validation_gates: Vec<OfflineValidationSpec> = Vec::new();
 
         let mut rules_compiled: Vec<RuleCompiled> = Vec::with_capacity(rules.len());
         let mut rules_cold: Vec<RuleCold> = Vec::with_capacity(rules.len());
         for spec in rules.iter() {
             let (mut rule, gates) = compile_rule(spec);
             if let Some(tp) = gates.two_phase {
-                debug_assert!(two_phase_gates.len() < super::rule_repr::NO_GATE as usize);
+                debug_assert!(two_phase_gates.len() < NO_GATE as usize);
                 rule.two_phase = two_phase_gates.len() as u32;
                 two_phase_gates.push(tp);
             }
             if let Some(kw) = gates.keywords {
-                debug_assert!(keyword_gates.len() < super::rule_repr::NO_GATE as usize);
+                debug_assert!(keyword_gates.len() < NO_GATE as usize);
                 rule.keywords = keyword_gates.len() as u32;
                 keyword_gates.push(kw);
             }
             if let Some(suppressors) = gates.value_suppressors {
-                debug_assert!(value_suppressor_gates.len() < super::rule_repr::NO_GATE as usize);
+                debug_assert!(value_suppressor_gates.len() < NO_GATE as usize);
                 rule.value_suppressors = value_suppressor_gates.len() as u32;
                 value_suppressor_gates.push(suppressors);
             }
             if let Some(ent) = gates.entropy {
-                debug_assert!(entropy_gates.len() < super::rule_repr::NO_GATE as usize);
+                debug_assert!(entropy_gates.len() < NO_GATE as usize);
                 rule.entropy = entropy_gates.len() as u32;
                 entropy_gates.push(ent);
             }
             if let Some(ctx) = gates.local_context {
-                debug_assert!(local_context_gates.len() < super::rule_repr::NO_GATE as usize);
+                debug_assert!(local_context_gates.len() < NO_GATE as usize);
                 rule.local_context = local_context_gates.len() as u32;
                 local_context_gates.push(ctx);
             }
             if let Some(ov) = gates.offline_validation {
-                debug_assert!(offline_validation_gates.len() < super::rule_repr::NO_GATE as usize);
+                debug_assert!(offline_validation_gates.len() < NO_GATE as usize);
                 rule.offline_validation = offline_validation_gates.len() as u32;
                 offline_validation_gates.push(ov);
             }
@@ -443,7 +450,7 @@ impl Engine {
         debug_assert_eq!(rules_compiled.len(), rules_cold.len());
 
         let max_entropy_len = entropy_gates.iter().map(|e| e.max_len).max().unwrap_or(0);
-        let entropy_log2 = super::helpers::build_log2_table(max_entropy_len);
+        let entropy_log2 = build_log2_table(max_entropy_len);
 
         let raw_seed_radius_bytes = rules
             .iter()
@@ -577,7 +584,7 @@ impl Engine {
                         confirm_all.retain(|c| c.as_slice() != needle);
                     }
                     if let Some(compiled) = compile_confirm_all(confirm_all) {
-                        debug_assert!(confirm_all_gates.len() < super::rule_repr::NO_GATE as usize);
+                        debug_assert!(confirm_all_gates.len() < NO_GATE as usize);
                         rules_compiled[rid].confirm_all = confirm_all_gates.len() as u32;
                         confirm_all_gates.push(compiled);
                     }
@@ -1013,7 +1020,7 @@ impl Engine {
     /// Panics on out-of-bounds index, indicating corrupted compiled rule data.
     #[inline(always)]
     pub(super) fn confirm_all_gate(&self, idx: u32) -> Option<&ConfirmAllCompiled> {
-        if idx == super::rule_repr::NO_GATE {
+        if idx == NO_GATE {
             None
         } else {
             Some(&self.confirm_all_gates[idx as usize])
@@ -1026,7 +1033,7 @@ impl Engine {
     /// Panics on out-of-bounds index, indicating corrupted compiled rule data.
     #[inline(always)]
     pub(super) fn keyword_gate(&self, idx: u32) -> Option<&KeywordsCompiled> {
-        if idx == super::rule_repr::NO_GATE {
+        if idx == NO_GATE {
             None
         } else {
             Some(&self.keyword_gates[idx as usize])
@@ -1040,7 +1047,7 @@ impl Engine {
     /// Panics on out-of-bounds index, indicating corrupted compiled rule data.
     #[inline(always)]
     pub(super) fn value_suppressor_gate(&self, idx: u32) -> Option<&PackedPatterns> {
-        if idx == super::rule_repr::NO_GATE {
+        if idx == NO_GATE {
             None
         } else {
             Some(&self.value_suppressor_gates[idx as usize])
@@ -1053,7 +1060,7 @@ impl Engine {
     /// Panics on out-of-bounds index, indicating corrupted compiled rule data.
     #[inline(always)]
     pub(super) fn entropy_gate(&self, idx: u32) -> Option<EntropyCompiled> {
-        if idx == super::rule_repr::NO_GATE {
+        if idx == NO_GATE {
             None
         } else {
             Some(self.entropy_gates[idx as usize])
@@ -1065,8 +1072,8 @@ impl Engine {
     /// # Panics
     /// Panics on out-of-bounds index, indicating corrupted compiled rule data.
     #[inline(always)]
-    pub(super) fn local_context_gate(&self, idx: u32) -> Option<crate::api::LocalContextSpec> {
-        if idx == super::rule_repr::NO_GATE {
+    pub(super) fn local_context_gate(&self, idx: u32) -> Option<LocalContextSpec> {
+        if idx == NO_GATE {
             None
         } else {
             Some(self.local_context_gates[idx as usize])
@@ -1126,7 +1133,7 @@ impl Engine {
 
     #[inline(always)]
     pub(super) fn two_phase_gate(&self, idx: u32) -> Option<&TwoPhaseCompiled> {
-        if idx == super::rule_repr::NO_GATE {
+        if idx == NO_GATE {
             None
         } else {
             Some(&self.two_phase_gates[idx as usize])
@@ -1271,8 +1278,8 @@ impl Engine {
             .scans_attempted
             .fetch_add(1, Ordering::Relaxed);
         let (result, _vs_nanos) =
-            crate::git_scan::perf::time(|| vs.scan_raw(root_buf, scratch, &mut vs_scratch_owned));
-        crate::git_scan::perf::record_scan_vs_prefilter(_vs_nanos);
+            perf::time(|| vs.scan_raw(root_buf, scratch, &mut vs_scratch_owned));
+        perf::record_scan_vs_prefilter(_vs_nanos);
         scratch.vs_scratch = Some(vs_scratch_owned);
         let saw_utf16 = match result {
             Ok(saw) => {
@@ -1299,7 +1306,7 @@ impl Engine {
         //   (b) every active transform's buffer-level gate rejects this buffer
         //       (meaning no anchor could appear in decoded form).
         if scratch.touched_pairs.is_empty() {
-            crate::git_scan::perf::record_scan_zero_hit_chunk();
+            perf::record_scan_zero_hit_chunk();
 
             let needs_transform_scan = self.has_active_transforms
                 && (self
@@ -1308,7 +1315,7 @@ impl Engine {
                     .any(|&tidx| {
                         let tc = &self.transforms[tidx];
                         root_buf.len() >= tc.min_len
-                            && super::transform::transform_quick_trigger(tc, root_buf)
+                            && transform_quick_trigger(tc, root_buf)
                             && self.base64_buffer_gate(tc, root_buf)
                             && (tc.id != TransformId::UrlPercent
                                 || self.url_percent_buffer_gate(tc, root_buf))
@@ -1319,12 +1326,12 @@ impl Engine {
                         .any(|&tidx| {
                             let tc = &self.transforms[tidx];
                             root_buf.len() >= tc.min_len
-                                && super::transform::transform_quick_trigger(tc, root_buf)
+                                && transform_quick_trigger(tc, root_buf)
                                 && self.base64_buffer_gate(tc, root_buf)
                         }));
 
             if !needs_transform_scan {
-                crate::git_scan::perf::record_scan_prefilter_bypass();
+                perf::record_scan_prefilter_bypass();
                 scratch.out.clear();
                 scratch.norm_hash.clear();
                 scratch.drop_hint_end.clear();
@@ -1338,10 +1345,10 @@ impl Engine {
         // ── Step F: HIT PATH — selective reset, set one-shot flag ───────
         scratch.root_prefilter_saw_utf16 = saw_utf16;
         scratch.root_prefilter_done = true;
-        let ((), _reset_nanos) = crate::git_scan::perf::time(|| {
+        let ((), _reset_nanos) = perf::time(|| {
             scratch.reset_for_scan_after_prefilter(self);
         });
-        crate::git_scan::perf::record_scan_reset(_reset_nanos);
+        perf::record_scan_reset(_reset_nanos);
 
         scratch.work_q.push(WorkItem::scan_root());
 
@@ -1500,11 +1507,11 @@ impl Engine {
                     if cur_buf.len() < tc.min_len {
                         continue;
                     }
-                    if !super::transform::transform_quick_trigger(tc, cur_buf) {
+                    if !transform_quick_trigger(tc, cur_buf) {
                         continue;
                     }
 
-                    super::transform::find_spans_into(tc, cur_buf, &mut scratch.spans);
+                    find_spans_into(tc, cur_buf, &mut scratch.spans);
                     if scratch.spans.is_empty() {
                         continue;
                     }
@@ -1569,14 +1576,14 @@ impl Engine {
                     if cur_buf.len() < tc.min_len {
                         continue;
                     }
-                    if !super::transform::transform_quick_trigger(tc, cur_buf) {
+                    if !transform_quick_trigger(tc, cur_buf) {
                         continue;
                     }
                     if !self.base64_buffer_gate(tc, cur_buf) {
                         continue;
                     }
 
-                    super::transform::find_spans_into(tc, cur_buf, &mut scratch.spans);
+                    find_spans_into(tc, cur_buf, &mut scratch.spans);
                     if scratch.spans.is_empty() {
                         continue;
                     }
@@ -1648,9 +1655,7 @@ impl Engine {
                         let mut span_count = 0usize;
                         let allow_space_ws = tc.base64_allow_space_ws;
                         for shift in 0..4usize {
-                            let Some(rel) =
-                                super::transform::base64_skip_chars(enc, shift, allow_space_ws)
-                            else {
+                            let Some(rel) = base64_skip_chars(enc, shift, allow_space_ws) else {
                                 break;
                             };
                             let start = enc_span.start.saturating_add(rel);
@@ -1661,8 +1666,7 @@ impl Engine {
                                 continue;
                             }
                             let enc_aligned = &cur_buf[start..enc_span.end];
-                            let remaining_chars =
-                                super::transform::base64_char_count(enc_aligned, allow_space_ws);
+                            let remaining_chars = base64_char_count(enc_aligned, allow_space_ws);
                             if remaining_chars < tc.min_len {
                                 continue;
                             }
@@ -1817,9 +1821,7 @@ impl Engine {
                 }
 
                 #[cfg(feature = "git-perf")]
-                crate::git_scan::perf::record_scan_transform(
-                    _transform_start.elapsed().as_nanos() as u64
-                );
+                perf::record_scan_transform(_transform_start.elapsed().as_nanos() as u64);
             }
         }
 
@@ -2036,7 +2038,7 @@ pub fn bench_find_spans_into(
     buf: &[u8],
     out: &mut Vec<std::ops::Range<usize>>,
 ) {
-    super::transform::find_spans_into(tc, buf, out);
+    find_spans_into(tc, buf, out);
 }
 
 /// Benchmark helper that stores pre-packed literal patterns for memmem gates.
@@ -2046,15 +2048,14 @@ pub fn bench_find_spans_into(
 #[cfg(feature = "bench")]
 #[derive(Clone, Debug)]
 pub struct BenchPackedPatterns {
-    patterns: super::rule_repr::PackedPatterns,
+    patterns: PackedPatterns,
 }
 
 /// Build packed raw literal patterns for benchmark-only memmem checks.
 #[cfg(feature = "bench")]
 pub fn bench_pack_patterns_raw(patterns: &[&[u8]]) -> BenchPackedPatterns {
     let total_bytes = patterns.iter().map(|p| p.len()).sum();
-    let mut builder =
-        super::rule_repr::PackedPatternsBuilder::with_capacity(patterns.len(), total_bytes);
+    let mut builder = PackedPatternsBuilder::with_capacity(patterns.len(), total_bytes);
     for pat in patterns {
         builder.push_raw(pat);
     }
@@ -2067,7 +2068,7 @@ pub fn bench_pack_patterns_raw(patterns: &[&[u8]]) -> BenchPackedPatterns {
 #[cfg(feature = "bench")]
 #[inline(always)]
 pub fn bench_contains_any_memmem(hay: &[u8], needles: &BenchPackedPatterns) -> bool {
-    super::helpers::contains_any_memmem(hay, &needles.patterns)
+    contains_any_memmem(hay, &needles.patterns)
 }
 
 #[cfg(feature = "bench")]
