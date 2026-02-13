@@ -716,15 +716,15 @@ mod tests {
         let mut p: u64 = 1;
         for expected_digits in 1..=19 {
             assert_eq!(
-                digit_count(p - 1).max(1),
-                if p == 1 { 1 } else { expected_digits },
+                digit_count(p - 1),
+                if p == 1 { 1 } else { expected_digits - 1 },
                 "digit_count({}) should be {}",
                 p - 1,
-                if p == 1 { 1 } else { expected_digits }
+                if p == 1 { 1 } else { expected_digits - 1 }
             );
             assert_eq!(
                 digit_count(p),
-                expected_digits + if expected_digits == 0 { 1 } else { 0 },
+                expected_digits,
                 "digit_count({p}) should be {expected_digits}"
             );
             if let Some(next) = p.checked_mul(10) {
@@ -1041,7 +1041,7 @@ mod tests {
         assert_eq!(&buf[..7], b"prefix:");
         assert_eq!(
             std::str::from_utf8(&buf[7..]).unwrap(),
-            "abababababababababababababababababababababab"
+            "abababababababababababababababababababab"
         );
     }
 }
