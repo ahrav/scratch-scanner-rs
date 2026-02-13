@@ -2145,41 +2145,154 @@ pub fn bench_shannon_entropy(bytes: &[u8], max_len: usize) -> f32 {
     })
 }
 
+/// Reusable benchmark state for `merge_ranges_with_gap_sorted`.
+#[cfg(feature = "bench")]
+pub struct BenchMergeRangesState {
+    ranges: crate::scratch_memory::ScratchVec<super::hit_pool::SpanU32>,
+}
+
+#[cfg(feature = "bench")]
+impl BenchMergeRangesState {
+    #[inline]
+    fn new(capacity: usize) -> Self {
+        Self {
+            ranges: crate::scratch_memory::ScratchVec::with_capacity(capacity)
+                .expect("bench merge_ranges alloc"),
+        }
+    }
+
+    #[inline]
+    fn ensure_capacity(&mut self, capacity: usize) {
+        if self.ranges.capacity() < capacity {
+            self.ranges = crate::scratch_memory::ScratchVec::with_capacity(capacity)
+                .expect("bench merge_ranges alloc");
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+thread_local! {
+    static BENCH_MERGE_STATE: std::cell::RefCell<BenchMergeRangesState> =
+        std::cell::RefCell::new(BenchMergeRangesState::new(0));
+}
+
+/// Build reusable merge-range benchmark state.
+#[cfg(feature = "bench")]
+pub fn bench_build_merge_ranges_state(capacity: usize) -> BenchMergeRangesState {
+    BenchMergeRangesState::new(capacity)
+}
+
+/// Load source ranges into reusable merge benchmark state.
+#[cfg(feature = "bench")]
+pub fn bench_merge_ranges_load(state: &mut BenchMergeRangesState, ranges: &[(u32, u32)]) {
+    state.ensure_capacity(ranges.len());
+    state.ranges.clear();
+    for &(s, e) in ranges {
+        state.ranges.push(super::hit_pool::SpanU32 {
+            start: s,
+            end: e,
+            anchor_hint: s,
+        });
+    }
+}
+
+/// Run `merge_ranges_with_gap_sorted` on already-loaded benchmark state.
+#[cfg(feature = "bench")]
+#[inline(always)]
+pub fn bench_merge_ranges_run(state: &mut BenchMergeRangesState, gap: u32) -> usize {
+    super::helpers::merge_ranges_with_gap_sorted(&mut state.ranges, gap);
+    state.ranges.len()
+}
+
 /// Benchmark wrapper for `merge_ranges_with_gap_sorted`.
 ///
 /// Accepts a slice of `(start, end)` tuples and a gap, returns the number
 /// of merged ranges.
 #[cfg(feature = "bench")]
 pub fn bench_merge_ranges(ranges: &[(u32, u32)], gap: u32) -> usize {
-    use crate::scratch_memory::ScratchVec;
-    let mut sv = ScratchVec::with_capacity(ranges.len()).expect("bench merge_ranges alloc");
-    for &(s, e) in ranges {
-        sv.push(super::hit_pool::SpanU32 {
-            start: s,
-            end: e,
-            anchor_hint: s,
-        });
+    BENCH_MERGE_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        bench_merge_ranges_load(&mut state, ranges);
+        bench_merge_ranges_run(&mut state, gap)
+    })
+}
+
+/// Reusable benchmark state for UTF-16 decode helpers.
+#[cfg(feature = "bench")]
+pub struct BenchUtf16DecodeState {
+    max_out: usize,
+    out: crate::scratch_memory::ScratchVec<u8>,
+}
+
+#[cfg(feature = "bench")]
+impl BenchUtf16DecodeState {
+    #[inline]
+    fn new(max_out: usize) -> Self {
+        Self {
+            max_out,
+            out: crate::scratch_memory::ScratchVec::with_capacity(max_out)
+                .expect("bench utf16 alloc"),
+        }
     }
-    super::helpers::merge_ranges_with_gap_sorted(&mut sv, gap);
-    sv.len()
+
+    #[inline]
+    fn ensure_max_out(&mut self, max_out: usize) {
+        if self.max_out != max_out {
+            self.max_out = max_out;
+            if self.out.capacity() < max_out {
+                self.out = crate::scratch_memory::ScratchVec::with_capacity(max_out)
+                    .expect("bench utf16 alloc");
+            }
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+thread_local! {
+    static BENCH_UTF16_STATE: std::cell::RefCell<BenchUtf16DecodeState> =
+        std::cell::RefCell::new(BenchUtf16DecodeState::new(0));
+}
+
+/// Build reusable UTF-16 decode benchmark state.
+#[cfg(feature = "bench")]
+pub fn bench_build_utf16_decode_state(max_out: usize) -> BenchUtf16DecodeState {
+    BenchUtf16DecodeState::new(max_out)
+}
+
+/// Benchmark helper for `decode_utf16le_to_buf` using reusable state.
+#[cfg(feature = "bench")]
+#[inline(always)]
+pub fn bench_decode_utf16le_with_state(input: &[u8], state: &mut BenchUtf16DecodeState) -> usize {
+    let _ = super::helpers::decode_utf16le_to_buf(input, state.max_out, &mut state.out);
+    state.out.len()
+}
+
+/// Benchmark helper for `decode_utf16be_to_buf` using reusable state.
+#[cfg(feature = "bench")]
+#[inline(always)]
+pub fn bench_decode_utf16be_with_state(input: &[u8], state: &mut BenchUtf16DecodeState) -> usize {
+    let _ = super::helpers::decode_utf16be_to_buf(input, state.max_out, &mut state.out);
+    state.out.len()
 }
 
 /// Benchmark wrapper for `decode_utf16le_to_buf`.
 #[cfg(feature = "bench")]
 pub fn bench_decode_utf16le(input: &[u8], max_out: usize) -> usize {
-    let mut out =
-        crate::scratch_memory::ScratchVec::with_capacity(max_out).expect("bench utf16 alloc");
-    let _ = super::helpers::decode_utf16le_to_buf(input, max_out, &mut out);
-    out.len()
+    BENCH_UTF16_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.ensure_max_out(max_out);
+        bench_decode_utf16le_with_state(input, &mut state)
+    })
 }
 
 /// Benchmark wrapper for `decode_utf16be_to_buf`.
 #[cfg(feature = "bench")]
 pub fn bench_decode_utf16be(input: &[u8], max_out: usize) -> usize {
-    let mut out =
-        crate::scratch_memory::ScratchVec::with_capacity(max_out).expect("bench utf16 alloc");
-    let _ = super::helpers::decode_utf16be_to_buf(input, max_out, &mut out);
-    out.len()
+    BENCH_UTF16_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.ensure_max_out(max_out);
+        bench_decode_utf16be_with_state(input, &mut state)
+    })
 }
 
 /// Benchmark wrapper for `map_utf16_decoded_offset`.

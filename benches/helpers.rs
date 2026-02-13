@@ -1,9 +1,12 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{
+    black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
+};
 use scanner_rs::{
-    bench_build_entropy_state, bench_contains_all_memmem, bench_contains_any_memmem,
-    bench_decode_utf16le, bench_entropy_gate_passes_with_state, bench_extract_secret_span_locs,
-    bench_hash128, bench_map_utf16_decoded_offset, bench_merge_ranges, bench_pack_patterns_raw,
-    bench_shannon_entropy_with_state,
+    bench_build_entropy_state, bench_build_merge_ranges_state, bench_build_utf16_decode_state,
+    bench_contains_all_memmem, bench_contains_any_memmem, bench_decode_utf16le_with_state,
+    bench_entropy_gate_passes_with_state, bench_extract_secret_span_locs, bench_hash128,
+    bench_map_utf16_decoded_offset, bench_merge_ranges_load, bench_merge_ranges_run,
+    bench_pack_patterns_raw, bench_shannon_entropy_with_state,
 };
 
 // ---------------------------------------------------------------------------
@@ -68,7 +71,7 @@ fn make_mixed_utf16le(len: usize) -> Vec<u8> {
     let mut rng = XorShift64::new(0xdead_cafe);
     while out.len() + 4 <= len {
         let v = rng.next_u64();
-        if v % 8 == 0 && out.len() + 4 <= len {
+        if v.is_multiple_of(8) && out.len() + 4 <= len {
             // Surrogate pair: U+10000
             out.extend_from_slice(&[0x00, 0xD8, 0x00, 0xDC]);
         } else {
@@ -178,12 +181,30 @@ fn bench_merge_ranges_group(c: &mut Criterion) {
 
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::new("no_merge", count), &no_merge, |b, data| {
-            b.iter(|| bench_merge_ranges(black_box(data), 32))
+            b.iter_batched(
+                || {
+                    let mut state = bench_build_merge_ranges_state(data.len());
+                    bench_merge_ranges_load(&mut state, data);
+                    state
+                },
+                |mut state| bench_merge_ranges_run(black_box(&mut state), 32),
+                BatchSize::SmallInput,
+            )
         });
         group.bench_with_input(
             BenchmarkId::new("all_merge", count),
             &all_merge,
-            |b, data| b.iter(|| bench_merge_ranges(black_box(data), 32)),
+            |b, data| {
+                b.iter_batched(
+                    || {
+                        let mut state = bench_build_merge_ranges_state(data.len());
+                        bench_merge_ranges_load(&mut state, data);
+                        state
+                    },
+                    |mut state| bench_merge_ranges_run(black_box(&mut state), 32),
+                    BatchSize::SmallInput,
+                )
+            },
         );
     }
     group.finish();
@@ -204,15 +225,17 @@ fn bench_utf16_decode(c: &mut Criterion) {
         let max_out = byte_len * 2; // generous cap
 
         group.throughput(Throughput::Bytes(byte_len as u64));
+        let mut ascii_state = bench_build_utf16_decode_state(max_out);
         group.bench_with_input(
             BenchmarkId::new("ascii", byte_len),
             &ascii_u16,
-            |b, data| b.iter(|| bench_decode_utf16le(black_box(data), max_out)),
+            |b, data| b.iter(|| bench_decode_utf16le_with_state(black_box(data), &mut ascii_state)),
         );
+        let mut mixed_state = bench_build_utf16_decode_state(max_out);
         group.bench_with_input(
             BenchmarkId::new("mixed", byte_len),
             &mixed_u16,
-            |b, data| b.iter(|| bench_decode_utf16le(black_box(data), max_out)),
+            |b, data| b.iter(|| bench_decode_utf16le_with_state(black_box(data), &mut mixed_state)),
         );
     }
     group.finish();
