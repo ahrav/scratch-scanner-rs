@@ -176,6 +176,9 @@ impl Engine {
             let vidx = pair % 3;
             let variant = VARIANTS[vidx];
             let rule = &self.rules_hot[rid];
+            // Resolve gate pool references once per (rule, variant) pair rather
+            // than inside the per-window loop. See ResolvedGates for rationale.
+            let gates = self.resolve_gates(rule);
 
             scratch.hit_acc_pool.take_into(pair, &mut scratch.windows);
             if scratch.windows.is_empty() {
@@ -283,6 +286,7 @@ impl Engine {
                         file_id,
                         scratch,
                         anchor_hint,
+                        &gates,
                     );
                 }
                 continue;
@@ -305,6 +309,7 @@ impl Engine {
                     file_id,
                     scratch,
                     anchor_hint,
+                    &gates,
                 );
             }
         }

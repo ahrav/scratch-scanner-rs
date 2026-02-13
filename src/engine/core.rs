@@ -408,33 +408,33 @@ impl Engine {
         for spec in rules.iter() {
             let (mut rule, gates) = compile_rule(spec);
             if let Some(tp) = gates.two_phase {
-                debug_assert!(two_phase_gates.len() <= u32::MAX as usize);
-                rule.two_phase = Some(two_phase_gates.len() as u32);
+                debug_assert!(two_phase_gates.len() < super::rule_repr::NO_GATE as usize);
+                rule.two_phase = two_phase_gates.len() as u32;
                 two_phase_gates.push(tp);
             }
             if let Some(kw) = gates.keywords {
-                debug_assert!(keyword_gates.len() <= u32::MAX as usize);
-                rule.keywords = Some(keyword_gates.len() as u32);
+                debug_assert!(keyword_gates.len() < super::rule_repr::NO_GATE as usize);
+                rule.keywords = keyword_gates.len() as u32;
                 keyword_gates.push(kw);
             }
             if let Some(suppressors) = gates.value_suppressors {
-                debug_assert!(value_suppressor_gates.len() <= u32::MAX as usize);
-                rule.value_suppressors = Some(value_suppressor_gates.len() as u32);
+                debug_assert!(value_suppressor_gates.len() < super::rule_repr::NO_GATE as usize);
+                rule.value_suppressors = value_suppressor_gates.len() as u32;
                 value_suppressor_gates.push(suppressors);
             }
             if let Some(ent) = gates.entropy {
-                debug_assert!(entropy_gates.len() <= u32::MAX as usize);
-                rule.entropy = Some(entropy_gates.len() as u32);
+                debug_assert!(entropy_gates.len() < super::rule_repr::NO_GATE as usize);
+                rule.entropy = entropy_gates.len() as u32;
                 entropy_gates.push(ent);
             }
             if let Some(ctx) = gates.local_context {
-                debug_assert!(local_context_gates.len() <= u32::MAX as usize);
-                rule.local_context = Some(local_context_gates.len() as u32);
+                debug_assert!(local_context_gates.len() < super::rule_repr::NO_GATE as usize);
+                rule.local_context = local_context_gates.len() as u32;
                 local_context_gates.push(ctx);
             }
             if let Some(ov) = gates.offline_validation {
-                debug_assert!(offline_validation_gates.len() <= u32::MAX as usize);
-                rule.offline_validation = Some(offline_validation_gates.len() as u32);
+                debug_assert!(offline_validation_gates.len() < super::rule_repr::NO_GATE as usize);
+                rule.offline_validation = offline_validation_gates.len() as u32;
                 offline_validation_gates.push(ov);
             }
             rules_compiled.push(rule);
@@ -577,8 +577,8 @@ impl Engine {
                         confirm_all.retain(|c| c.as_slice() != needle);
                     }
                     if let Some(compiled) = compile_confirm_all(confirm_all) {
-                        debug_assert!(confirm_all_gates.len() <= u32::MAX as usize);
-                        rules_compiled[rid].confirm_all = Some(confirm_all_gates.len() as u32);
+                        debug_assert!(confirm_all_gates.len() < super::rule_repr::NO_GATE as usize);
+                        rules_compiled[rid].confirm_all = confirm_all_gates.len() as u32;
                         confirm_all_gates.push(compiled);
                     }
                     #[cfg(feature = "stats")]
@@ -1003,17 +1003,21 @@ impl Engine {
 
     // ── Gate pool accessors ────────────────────────────────────────────
     //
-    // Centralised helpers that resolve `Option<u32>` gate indices into pool
-    // references using direct indexing; out-of-bounds indices panic, which signals
-    // inconsistent compiled rule data.
+    // Centralised helpers that resolve `u32` gate indices (with `NO_GATE`
+    // sentinel) into pool references using direct indexing; out-of-bounds
+    // indices panic, which signals inconsistent compiled rule data.
 
     /// Resolves the confirm-all (multi-literal AND) gate for a rule.
     ///
     /// # Panics
     /// Panics on out-of-bounds index, indicating corrupted compiled rule data.
     #[inline(always)]
-    pub(super) fn confirm_all_gate(&self, idx: Option<u32>) -> Option<&ConfirmAllCompiled> {
-        idx.map(|i| &self.confirm_all_gates[i as usize])
+    pub(super) fn confirm_all_gate(&self, idx: u32) -> Option<&ConfirmAllCompiled> {
+        if idx == super::rule_repr::NO_GATE {
+            None
+        } else {
+            Some(&self.confirm_all_gates[idx as usize])
+        }
     }
 
     /// Resolves the keyword-any (literal OR) gate for a rule.
@@ -1021,8 +1025,12 @@ impl Engine {
     /// # Panics
     /// Panics on out-of-bounds index, indicating corrupted compiled rule data.
     #[inline(always)]
-    pub(super) fn keyword_gate(&self, idx: Option<u32>) -> Option<&KeywordsCompiled> {
-        idx.map(|i| &self.keyword_gates[i as usize])
+    pub(super) fn keyword_gate(&self, idx: u32) -> Option<&KeywordsCompiled> {
+        if idx == super::rule_repr::NO_GATE {
+            None
+        } else {
+            Some(&self.keyword_gates[idx as usize])
+        }
     }
 
     /// Resolves the value-suppressor gate (packed literal patterns checked
@@ -1031,8 +1039,12 @@ impl Engine {
     /// # Panics
     /// Panics on out-of-bounds index, indicating corrupted compiled rule data.
     #[inline(always)]
-    pub(super) fn value_suppressor_gate(&self, idx: Option<u32>) -> Option<&PackedPatterns> {
-        idx.map(|i| &self.value_suppressor_gates[i as usize])
+    pub(super) fn value_suppressor_gate(&self, idx: u32) -> Option<&PackedPatterns> {
+        if idx == super::rule_repr::NO_GATE {
+            None
+        } else {
+            Some(&self.value_suppressor_gates[idx as usize])
+        }
     }
 
     /// Resolves the Shannon entropy gate for a rule.
@@ -1040,8 +1052,12 @@ impl Engine {
     /// # Panics
     /// Panics on out-of-bounds index, indicating corrupted compiled rule data.
     #[inline(always)]
-    pub(super) fn entropy_gate(&self, idx: Option<u32>) -> Option<EntropyCompiled> {
-        idx.map(|i| self.entropy_gates[i as usize])
+    pub(super) fn entropy_gate(&self, idx: u32) -> Option<EntropyCompiled> {
+        if idx == super::rule_repr::NO_GATE {
+            None
+        } else {
+            Some(self.entropy_gates[idx as usize])
+        }
     }
 
     /// Resolves the local-context gate (surrounding-line pattern match).
@@ -1049,11 +1065,12 @@ impl Engine {
     /// # Panics
     /// Panics on out-of-bounds index, indicating corrupted compiled rule data.
     #[inline(always)]
-    pub(super) fn local_context_gate(
-        &self,
-        idx: Option<u32>,
-    ) -> Option<crate::api::LocalContextSpec> {
-        idx.map(|i| self.local_context_gates[i as usize])
+    pub(super) fn local_context_gate(&self, idx: u32) -> Option<crate::api::LocalContextSpec> {
+        if idx == super::rule_repr::NO_GATE {
+            None
+        } else {
+            Some(self.local_context_gates[idx as usize])
+        }
     }
 
     /// Returns whether a root finding should be suppressed by the global safelist.
@@ -1108,8 +1125,12 @@ impl Engine {
     }
 
     #[inline(always)]
-    pub(super) fn two_phase_gate(&self, idx: Option<u32>) -> Option<&TwoPhaseCompiled> {
-        idx.map(|i| &self.two_phase_gates[i as usize])
+    pub(super) fn two_phase_gate(&self, idx: u32) -> Option<&TwoPhaseCompiled> {
+        if idx == super::rule_repr::NO_GATE {
+            None
+        } else {
+            Some(&self.two_phase_gates[idx as usize])
+        }
     }
 
     /// Select which transform index buckets to iterate for a `ScanBuf` work item.

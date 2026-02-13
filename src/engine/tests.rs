@@ -856,12 +856,18 @@ fn derived_confirm_all_is_compiled() {
     let compiled = &eng.rules_hot[0];
     let compiled_confirm_idx = compiled.confirm_all;
     if expected.is_empty() {
-        assert!(
-            compiled_confirm_idx.is_none(),
+        assert_eq!(
+            compiled_confirm_idx,
+            super::rule_repr::NO_GATE,
             "confirm_all should be omitted when no extra literals are required"
         );
     } else {
-        let idx = compiled_confirm_idx.expect("confirm_all should be compiled");
+        assert_ne!(
+            compiled_confirm_idx,
+            super::rule_repr::NO_GATE,
+            "confirm_all should be compiled"
+        );
+        let idx = compiled_confirm_idx;
         let confirm = &eng.confirm_all_gates[idx as usize];
         let primary = confirm.primary[Variant::Raw.idx()]
             .as_ref()
@@ -910,11 +916,14 @@ fn value_suppressor_gate_is_compiled_and_indexed() {
     );
 
     let compiled = &eng.rules_hot[0];
-    let idx = compiled
-        .value_suppressors
-        .expect("value suppressor gate index should be populated");
+    let idx = compiled.value_suppressors;
+    assert_ne!(
+        idx,
+        super::rule_repr::NO_GATE,
+        "value suppressor gate index should be populated"
+    );
     let suppressor_gate = eng
-        .value_suppressor_gate(Some(idx))
+        .value_suppressor_gate(idx)
         .expect("value suppressor gate should be accessible");
     assert!(
         std::ptr::eq(suppressor_gate, &eng.value_suppressor_gates[idx as usize]),
@@ -924,7 +933,9 @@ fn value_suppressor_gate_is_compiled_and_indexed() {
         unpack_patterns(suppressor_gate),
         vec![b"EXAMPLE".to_vec(), b"DUMMY_TOKEN".to_vec()]
     );
-    assert!(eng.value_suppressor_gate(None).is_none());
+    assert!(eng
+        .value_suppressor_gate(super::rule_repr::NO_GATE)
+        .is_none());
 }
 
 #[test]
@@ -2288,14 +2299,17 @@ fn offline_validation_gate_pooled_round_trip() {
     );
 
     // Rule 0 should have offline_validation index 0.
-    assert_eq!(engine.rules_hot[0].offline_validation, Some(0));
+    assert_eq!(engine.rules_hot[0].offline_validation, 0);
     assert_eq!(
         engine.offline_validation_gates[0],
         OfflineValidationSpec::GithubFinegrainedPat,
     );
 
     // Rule 1 should have no offline_validation gate.
-    assert_eq!(engine.rules_hot[1].offline_validation, None);
+    assert_eq!(
+        engine.rules_hot[1].offline_validation,
+        super::rule_repr::NO_GATE
+    );
 }
 
 // --------------------------

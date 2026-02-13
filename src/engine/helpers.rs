@@ -132,8 +132,13 @@ pub(super) fn coalesce_under_pressure_sorted(
 ///
 /// # Behavior
 /// - Returns false when `needles` contains no patterns.
+/// - Fast-paths the common single-needle case to avoid loop overhead.
 pub(super) fn contains_any_memmem(hay: &[u8], needles: &PackedPatterns) -> bool {
     let count = needles.offsets.len().saturating_sub(1);
+    if count == 1 {
+        let end = needles.offsets[1] as usize;
+        return memmem::find(hay, &needles.bytes[..end]).is_some();
+    }
     for i in 0..count {
         let start = needles.offsets[i] as usize;
         let end = needles.offsets[i + 1] as usize;
@@ -154,8 +159,13 @@ pub(super) fn contains_any_memmem(hay: &[u8], needles: &PackedPatterns) -> bool 
 ///
 /// # Behavior
 /// - Returns true when `needles` contains no patterns.
+/// - Fast-paths the common single-needle case to avoid loop overhead.
 pub(super) fn contains_all_memmem(hay: &[u8], needles: &PackedPatterns) -> bool {
     let count = needles.offsets.len().saturating_sub(1);
+    if count == 1 {
+        let end = needles.offsets[1] as usize;
+        return memmem::find(hay, &needles.bytes[..end]).is_some();
+    }
     for i in 0..count {
         let start = needles.offsets[i] as usize;
         let end = needles.offsets[i + 1] as usize;

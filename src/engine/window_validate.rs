@@ -64,8 +64,45 @@ use super::helpers::{
     contains_all_memmem, contains_any_memmem, decode_utf16be_to_buf, decode_utf16le_to_buf,
     entropy_gate_passes, extract_secret_span_locs, map_utf16_decoded_offset,
 };
-use super::rule_repr::{RuleCompiled, Variant};
+use super::rule_repr::{
+    ConfirmAllCompiled, EntropyCompiled, KeywordsCompiled, PackedPatterns, RuleCompiled, Variant,
+};
 use super::scratch::ScanScratch;
+
+/// Gate references resolved once per (rule, variant) pair, then passed into
+/// every `run_rule_on_window` / `run_rule_on_utf16_window_aligned` call for
+/// the same rule.
+///
+/// Without this struct, LLVM re-loads gate pool references after every
+/// `&mut ScanScratch` mutation because it cannot prove `&self` (Engine)
+/// fields are unaliased by the mutable scratch borrow. Hoisting the lookups
+/// here eliminates those redundant loads from the per-window inner loop.
+pub(super) struct ResolvedGates<'e> {
+    pub(super) confirm_all: Option<&'e ConfirmAllCompiled>,
+    pub(super) keywords: Option<&'e KeywordsCompiled>,
+    pub(super) entropy: Option<EntropyCompiled>,
+    pub(super) value_suppressors: Option<&'e PackedPatterns>,
+    pub(super) local_context: Option<LocalContextSpec>,
+}
+
+impl Engine {
+    /// Resolves the five per-window gates for a rule into stack-local references.
+    ///
+    /// Called once per (rule, variant) pair in `scan_rules_on_buffer`, then the
+    /// result is passed into every `run_rule_on_window` call for that pair.
+    /// This avoids redundant gate-pool loads inside the per-window inner loop
+    /// (see [`ResolvedGates`] for the LLVM aliasing rationale).
+    #[inline(always)]
+    pub(super) fn resolve_gates(&self, rule: &RuleCompiled) -> ResolvedGates<'_> {
+        ResolvedGates {
+            confirm_all: self.confirm_all_gate(rule.confirm_all),
+            keywords: self.keyword_gate(rule.keywords),
+            entropy: self.entropy_gate(rule.entropy),
+            value_suppressors: self.value_suppressor_gate(rule.value_suppressors),
+            local_context: self.local_context_gate(rule.local_context),
+        }
+    }
+}
 
 /// Bytes scanned backward from the anchor hint to find the regex match start.
 ///
@@ -79,11 +116,23 @@ use super::scratch::ScanScratch;
 /// this showed no additional matches in benchmarks.
 const BACK_SCAN_MARGIN: usize = 64;
 
-/// Sidecar data computed after emit-time policy checks pass.
+/// Sidecar data computed by [`Engine::apply_emit_time_policy`] when a finding
+/// survives safelist suppression and offline validation.
+///
+/// Callers pass these values to `push_finding_with_drop_hint` alongside the
+/// `FindingRec` so that dedup and drop-prefix bookkeeping stay consistent.
 #[derive(Clone, Copy)]
 struct EmitPolicyOutcome {
+    /// Absolute byte offset (in root-buffer coordinates) past which
+    /// `drop_prefix_findings` should keep this finding. May be extended
+    /// beyond the match span for URL-percent transforms with late triggers.
     drop_hint_end: u64,
+    /// Whether the decoded span should participate in the dedup key.
+    /// `true` for root findings and when no root-span mapping is available;
+    /// `false` when mapping shifts decoded offsets across chunk boundaries.
     dedupe_with_span: bool,
+    /// BLAKE3 digest of the raw secret bytes, used for cross-chunk and
+    /// cross-run deduplication.
     norm_hash: [u8; 32],
 }
 
@@ -350,6 +399,7 @@ impl Engine {
         file_id: FileId,
         scratch: &mut ScanScratch,
         anchor_hint: usize,
+        gates: &ResolvedGates<'_>,
     ) {
         match variant {
             Variant::Raw => {
@@ -361,7 +411,7 @@ impl Engine {
                     }
                 }
 
-                if let Some(confirm) = self.confirm_all_gate(rule.confirm_all) {
+                if let Some(confirm) = gates.confirm_all {
                     let vidx = Variant::Raw.idx();
                     if let Some(primary) = &confirm.primary[vidx] {
                         if memmem::find(window, primary).is_none() {
@@ -373,7 +423,7 @@ impl Engine {
                     }
                 }
 
-                if let Some(kws) = self.keyword_gate(rule.keywords) {
+                if let Some(kws) = gates.keywords {
                     // Keyword gate is a cheap pre-regex filter: if none of the
                     // keywords appear in this window, the regex cannot be relevant.
                     if !contains_any_memmem(window, &kws.any[Variant::Raw.idx()]) {
@@ -392,8 +442,8 @@ impl Engine {
                 let search_start = hint_in_window.saturating_sub(BACK_SCAN_MARGIN);
                 let search_window = &window[search_start..];
 
-                let entropy = self.entropy_gate(rule.entropy);
-                let value_suppressors = self.value_suppressor_gate(rule.value_suppressors);
+                let entropy = gates.entropy;
+                let value_suppressors = gates.value_suppressors;
                 let mut last_safelist_decision: Option<(u64, u64, bool)> = None;
                 // Take the pre-allocated CaptureLocations out of scratch so the
                 // closure can borrow `locs` mutably without also borrowing `scratch`.
@@ -436,12 +486,11 @@ impl Engine {
                             }
                         }
 
-                        let context_ok =
-                            if let Some(ctx) = self.local_context_gate(rule.local_context) {
-                                local_context_passes(window, secret_start, secret_end, ctx)
-                            } else {
-                                true
-                            };
+                        let context_ok = if let Some(ctx) = gates.local_context {
+                            local_context_passes(window, secret_start, secret_end, ctx)
+                        } else {
+                            true
+                        };
 
                         if context_ok {
                             let span_in_buf = (w.start + secret_start)..(w.start + secret_end);
@@ -524,6 +573,7 @@ impl Engine {
                         base_offset,
                         file_id,
                         scratch,
+                        gates,
                     );
                     if scratch.total_decode_output_bytes
                         >= self.tuning.max_total_decode_output_bytes
@@ -566,6 +616,7 @@ impl Engine {
         base_offset: u64,
         file_id: FileId,
         scratch: &mut ScanScratch,
+        gates: &ResolvedGates<'_>,
     ) {
         let remaining = self
             .tuning
@@ -577,7 +628,7 @@ impl Engine {
 
         let raw_win = &buf[decode_range.clone()];
 
-        if let Some(confirm) = self.confirm_all_gate(rule.confirm_all) {
+        if let Some(confirm) = gates.confirm_all {
             // Confirm-all literals are encoded like anchors/keywords so we can
             // cheaply reject UTF-16 windows before decoding.
             let vidx = variant.idx();
@@ -591,7 +642,7 @@ impl Engine {
             }
         }
 
-        if let Some(kws) = self.keyword_gate(rule.keywords) {
+        if let Some(kws) = gates.keywords {
             // For UTF-16 variants, apply the keyword gate on the raw UTF-16 bytes
             // *before* decoding to avoid spending decode budget on windows that
             // could never pass the keyword check.
@@ -667,8 +718,8 @@ impl Engine {
             },
         );
 
-        let entropy = self.entropy_gate(rule.entropy);
-        let value_suppressors = self.value_suppressor_gate(rule.value_suppressors);
+        let entropy = gates.entropy;
+        let value_suppressors = gates.value_suppressors;
         let mut last_safelist_decision: Option<(u64, u64, bool)> = None;
         let mut locs = scratch.capture_locs[rule_id as usize]
             .take()
@@ -702,7 +753,7 @@ impl Engine {
                     }
                 }
 
-                let context_ok = if let Some(ctx) = self.local_context_gate(rule.local_context) {
+                let context_ok = if let Some(ctx) = gates.local_context {
                     local_context_passes(decoded, secret_start, secret_end, ctx)
                 } else {
                     true
@@ -1302,10 +1353,10 @@ impl Engine {
         if parent_step_id != STEP_ROOT {
             return false;
         }
-        let gate_idx = match rule.offline_validation {
-            Some(idx) => idx,
-            None => return false,
-        };
+        let gate_idx = rule.offline_validation;
+        if gate_idx == super::rule_repr::NO_GATE {
+            return false;
+        }
         let spec = self.offline_validation_gates[gate_idx as usize];
         let verdict = super::offline_validate::validate(spec, secret_bytes);
         matches!(verdict, crate::api::OfflineVerdict::Invalid) && spec.suppresses_on_invalid()
