@@ -1194,7 +1194,7 @@ fn apply_transform_filter(
 ///
 /// This helper exits the process with code `2` on read/parse failures because
 /// rule configuration errors are treated as fatal startup misconfiguration.
-/// Provenance and a BLAKE3 content hash are emitted for diagnostics.
+/// Provenance and a deterministic fast content fingerprint are emitted for diagnostics.
 ///
 /// Resolved provenance for the rule set selected for a scan.
 ///
@@ -1220,7 +1220,15 @@ enum RuleSource {
 /// parser implementation changes.
 #[inline]
 fn rules_hash(bytes: &[u8]) -> String {
-    blake3::hash(bytes).to_hex().to_string()
+    // Deterministic non-cryptographic fingerprint for startup diagnostics.
+    // AHash uses hardware acceleration on supported platforms (AES/AVX).
+    const RULE_HASHER: ahash::RandomState = ahash::RandomState::with_seeds(
+        0x524C_5348_3031,
+        0xA341_6F5D_19B2_CC93,
+        0x9E37_79B9_7F4A_7C15,
+        0xD1B5_4A32_D192_ED03,
+    );
+    format!("{:016x}", RULE_HASHER.hash_one(bytes))
 }
 
 /// Resolve which rule source to use according to precedence.
@@ -1289,7 +1297,7 @@ fn load_rules_from_path(path: &Path, source_label: &str) -> (Vec<RuleSpec>, Stri
 /// 4. Compile-time embedded fallback (`default_rules.yaml`)
 ///
 /// # Effects
-/// - Emits provenance logs (source label and BLAKE3 hash).
+/// - Emits provenance logs (source label and deterministic fast hash fingerprint).
 /// - Exits with status `2` if an explicitly selected file cannot be read/parsed.
 fn load_rules_for_scan(rules_file: Option<&Path>) -> Vec<RuleSpec> {
     let workspace_default_path = std::env::current_dir()
@@ -1358,6 +1366,21 @@ mod tests {
 
     fn ids(ts: &[TransformConfig]) -> Vec<TransformId> {
         ts.iter().map(|t| t.id).collect()
+    }
+
+    #[test]
+    fn rules_hash_is_stable_and_hex_sized() {
+        let h1 = rules_hash(b"rules: []\n");
+        let h2 = rules_hash(b"rules: []\n");
+        let h3 = rules_hash(b"rules:\n- name: x\n");
+        assert_eq!(h1, h2, "same bytes should hash identically");
+        assert_ne!(h1, h3, "different bytes should generally hash differently");
+        assert_eq!(
+            h1.len(),
+            16,
+            "u64 fingerprint should format as 16 hex chars"
+        );
+        assert!(h1.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]

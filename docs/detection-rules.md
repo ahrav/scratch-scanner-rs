@@ -31,8 +31,9 @@ Rule loading order:
 3. `default_rules.yaml` next to the scanner binary
 4. Compiled-in fallback (`include_str!("../../default_rules.yaml")`)
 
-Startup logs include the resolved rule source and a stable BLAKE3 `rule_hash`
-of the loaded rule bytes to make cache and rule-source behavior auditable.
+Startup logs include the resolved rule source and a stable fast non-cryptographic
+`rule_hash` fingerprint of the loaded rule bytes to make cache and rule-source
+behavior auditable.
 
 ## Suppression Controls
 
