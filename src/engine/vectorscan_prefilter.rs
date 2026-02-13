@@ -456,6 +456,9 @@ impl VsStreamDb {
             .len()
             .try_into()
             .map_err(|_| format!("buffer too large for hs_scan_stream: {} bytes", data.len()))?;
+        // SAFETY: `stream.stream` is a valid open stream; `data` is a valid byte
+        // slice with length fitting in `u32`; `scratch` is allocated for this db;
+        // `ctx` is caller-guaranteed valid for the callback duration.
         let rc = unsafe {
             vs::hs_scan_stream(
                 stream.stream,
@@ -485,6 +488,8 @@ impl VsStreamDb {
         on_event: vs::match_event_handler,
         ctx: *mut c_void,
     ) -> Result<(), String> {
+        // SAFETY: `stream.stream` is a valid open stream being consumed (moved in);
+        // `scratch` is allocated for this db; `ctx` is valid for the callback duration.
         let rc = unsafe { vs::hs_close_stream(stream.stream, scratch.scratch, on_event, ctx) };
         if rc == vs::HS_SUCCESS as c_int {
             Ok(())
@@ -1114,6 +1119,8 @@ unsafe impl Sync for VsUtf16StreamDb {}
 
 impl Drop for VsUtf16StreamDb {
     fn drop(&mut self) {
+        // SAFETY: `self.db` was allocated by `hs_compile_multi` (or deserialized)
+        // and is only freed once here; the null check guards against double-free.
         unsafe {
             if !self.db.is_null() {
                 vs::hs_free_database(self.db);
@@ -1128,6 +1135,8 @@ unsafe impl Sync for VsAnchorDb {}
 
 impl Drop for VsAnchorDb {
     fn drop(&mut self) {
+        // SAFETY: `self.db` was allocated by `hs_compile_multi` (or deserialized)
+        // and is only freed once here; the null check guards against double-free.
         unsafe {
             if !self.db.is_null() {
                 vs::hs_free_database(self.db);
@@ -1173,9 +1182,13 @@ impl VsAnchorDb {
 
         // SAFETY: see `VsStreamDb::try_new_stream` for the zeroed-platform rationale.
         let mut platform = MaybeUninit::<vs::hs_platform_info_t>::zeroed();
+        // SAFETY: `platform` is a valid `MaybeUninit` pointer; `hs_populate_platform`
+        // writes through it and does not retain the pointer after returning.
         unsafe {
             let _ = vs::hs_populate_platform(platform.as_mut_ptr());
         }
+        // SAFETY: zeroed `hs_platform_info_t` is valid, and `hs_populate_platform`
+        // (or the zeroed fallback) fully initializes it.
         let platform = unsafe { platform.assume_init() };
 
         let cache = VsDbCache::new();
@@ -1976,6 +1989,8 @@ impl VsPrefilterDb {
             let ids = [0u32];
             let mut db: *mut vs::hs_database_t = ptr::null_mut();
             let mut compile_err: *mut vs::hs_compile_error_t = ptr::null_mut();
+            // SAFETY: Single-element arrays are valid pointers with count 1.
+            // `db` and `compile_err` are valid out-pointers. Platform is initialized.
             let rc = unsafe {
                 vs::hs_compile_multi(
                     expr_ptrs.as_ptr(),
@@ -1989,6 +2004,8 @@ impl VsPrefilterDb {
                 )
             };
             if rc != vs::HS_SUCCESS as c_int {
+                // SAFETY: `compile_err` was populated by `hs_compile_multi`; if non-null
+                // it points to a valid `hs_compile_error_t` that we read and then free.
                 let msg = unsafe {
                     if compile_err.is_null() {
                         "hs_compile_multi failed (no error message)".to_string()
@@ -2009,6 +2026,9 @@ impl VsPrefilterDb {
                 };
                 return Err(msg);
             }
+            // SAFETY: `db` was successfully allocated by `hs_compile_multi` above
+            // (rc == HS_SUCCESS). We free it immediately since we only needed to
+            // validate the pattern.
             unsafe {
                 if !db.is_null() {
                     vs::hs_free_database(db);
@@ -2130,6 +2150,8 @@ impl VsPrefilterDb {
     /// thread to avoid allocation overhead.
     pub(crate) fn alloc_scratch(&self) -> Result<VsScratch, String> {
         let mut scratch: *mut vs::hs_scratch_t = ptr::null_mut();
+        // SAFETY: `self.db` is a valid compiled Vectorscan database; `scratch` is
+        // a valid out-pointer. Vectorscan allocates scratch internally.
         let rc =
             unsafe { vs::hs_alloc_scratch(self.db, &mut scratch as *mut *mut vs::hs_scratch_t) };
         if rc != vs::HS_SUCCESS as c_int {
@@ -2187,6 +2209,10 @@ impl VsPrefilterDb {
             saw_utf16: false,
         };
 
+        // SAFETY: `self.db` is a valid compiled database; `hay` is a live slice with
+        // length `len_u32`; `vs_scratch` is allocated for this database; `ctx` is a
+        // valid `VsMatchCtx` that outlives the scan. The callback `vs_on_match`
+        // upholds the FFI contract (no panics, no unwind).
         let rc = unsafe {
             vs::hs_scan(
                 self.db,

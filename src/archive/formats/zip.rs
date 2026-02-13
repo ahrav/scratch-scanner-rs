@@ -967,6 +967,8 @@ mod tests {
 
         buf.clear();
         let store_len = 32usize.min(cap);
+        // SAFETY: `store_len <= cap`; the test simulates an error path where
+        // uninit bytes are never read (the buffer is cleared before reuse).
         unsafe {
             buf.set_len(store_len);
         }
@@ -980,6 +982,7 @@ mod tests {
         assert_eq!(buf.capacity(), cap);
 
         // After clear, the buffer is safe to reuse with a new set_len+fill.
+        // SAFETY: 16 <= cap (64); we immediately fill all 16 bytes below.
         unsafe {
             buf.set_len(16);
         }
@@ -998,6 +1001,7 @@ mod tests {
         // The code guards: `if store_len > 0 { unsafe { set_len(...) } }`
         // so store_len == 0 never enters the unsafe block.
         if store_len > 0 {
+            // SAFETY: `store_len <= cap`; dead code here since `store_len == 0`.
             unsafe {
                 buf.set_len(store_len);
             }
@@ -1012,6 +1016,7 @@ mod tests {
 
         buf.clear();
         let store_len = cap; // store_len == capacity
+                             // SAFETY: `store_len == cap`; we immediately fill all bytes below.
         unsafe {
             buf.set_len(store_len);
         }
