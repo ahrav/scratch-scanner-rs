@@ -184,8 +184,8 @@ fn main() {
         let _ = engine.scan_chunk_records(buf, scanner_rs::FileId(0), 0, &mut scratch);
         let stats = engine.vectorscan_stats();
         eprintln!(
-            "{label}: stream_force_full={} stream_window_cap_exceeded={}",
-            stats.stream_force_full, stats.stream_window_cap_exceeded
+            "{label}: stream_force_full={} stream_window_cap_exceeded={} stream_callback_overflow={}",
+            stats.stream_force_full, stats.stream_window_cap_exceeded, stats.stream_callback_overflow
         );
     }
 

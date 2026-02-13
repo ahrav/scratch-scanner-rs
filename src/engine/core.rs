@@ -135,6 +135,8 @@ pub struct VectorscanStats {
     pub stream_force_full: u64,
     /// Stream decode spans that exceeded the per-rule window cap.
     pub stream_window_cap_exceeded: u64,
+    /// Stream decode spans where the callback sink overflowed.
+    pub stream_callback_overflow: u64,
 }
 
 /// Cache-line padded atomic counter to reduce false sharing between workers.
@@ -179,6 +181,9 @@ pub(super) struct VectorscanCounters {
     pub(super) anchor_skipped: CachePaddedAtomicU64,
     pub(super) stream_force_full: CachePaddedAtomicU64,
     pub(super) stream_window_cap_exceeded: CachePaddedAtomicU64,
+    /// Stream decode spans where the callback sink overflowed
+    /// (`vs_match_overflowed`), forcing a whole-buffer fallback.
+    pub(super) stream_callback_overflow: CachePaddedAtomicU64,
 }
 
 #[cfg(feature = "stats")]
@@ -199,6 +204,7 @@ impl VectorscanCounters {
             anchor_skipped: self.anchor_skipped.load(Ordering::Relaxed),
             stream_force_full: self.stream_force_full.load(Ordering::Relaxed),
             stream_window_cap_exceeded: self.stream_window_cap_exceeded.load(Ordering::Relaxed),
+            stream_callback_overflow: self.stream_callback_overflow.load(Ordering::Relaxed),
         }
     }
 }

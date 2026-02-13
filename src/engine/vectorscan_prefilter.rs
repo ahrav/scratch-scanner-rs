@@ -78,6 +78,27 @@ use super::hit_pool::SpanU32;
 use super::rule_repr::{Target, Variant};
 use super::scratch::ScanScratch;
 
+/// Per-pattern metadata for the raw-byte match callback (AoS layout).
+///
+/// Indexed by Vectorscan expression id in the compiled database. The match
+/// callback loads one `RawPatternMeta` per hit to determine the originating
+/// rule, the estimated match width (for window start derivation), and the
+/// seed radius (for window expansion). The `#[repr(C)]` layout guarantees
+/// 12 bytes with no internal padding, verified by the compile-time assertion
+/// below.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct RawPatternMeta {
+    rule_id: u32,
+    match_width: u32,
+    seed_radius: u32,
+}
+
+// Compile-time size guard: 3 × u32 = 12 bytes, no padding under #[repr(C)].
+// Exact size matters because the match callback indexes this via raw pointer
+// arithmetic (`raw_meta.add(id)`) in the hot path.
+const _: () = assert!(std::mem::size_of::<RawPatternMeta>() == 12);
+
 /// Compiled Vectorscan database plus per-rule window metadata for raw-byte scanning.
 ///
 /// The database is immutable after compilation and can be shared across
@@ -88,17 +109,6 @@ use super::scratch::ScanScratch;
 /// we fall back to per-rule compilation, `raw_missing_rules` records rejected
 /// rules (and the build fails). Optional UTF-16 anchor patterns are appended
 /// after raw patterns and resolved via the `anchor_*` mapping tables.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-struct RawPatternMeta {
-    rule_id: u32,
-    match_width: u32,
-    seed_radius: u32,
-}
-
-// Compile-time size guard: 3 × u32 = 12 bytes, no padding under #[repr(C)].
-const _: () = assert!(std::mem::size_of::<RawPatternMeta>() == 12);
-
 pub(crate) struct VsPrefilterDb {
     /// Compiled Vectorscan block-mode database.
     db: *mut vs::hs_database_t,
@@ -234,7 +244,15 @@ unsafe impl Send for VsScratch {}
 
 /// Opaque stream handle for stream-mode scanning.
 ///
-/// Must be closed with `close_stream` to flush end-of-stream matches.
+/// Must be closed via one of the `close_stream` methods on [`VsStreamDb`],
+/// [`VsUtf16StreamDb`], or [`VsGateDb`] to flush end-of-stream matches and
+/// free the underlying `hs_stream_t`.
+///
+/// **There is intentionally no `Drop` impl**: `hs_close_stream` requires a
+/// scratch handle and a match callback, so cleanup cannot be done
+/// automatically. Callers must ensure `close_stream` is called on every
+/// opened stream, even on error paths, to avoid leaking the Vectorscan
+/// stream allocation.
 pub(crate) struct VsStream {
     /// Opaque Vectorscan stream handle.
     stream: *mut vs::hs_stream_t,
@@ -247,6 +265,10 @@ impl VsStreamDb {
     /// treated as unbounded and capped by `max_decoded_cap` when nonzero.
     /// Patterns are compiled with `HS_FLAG_PREFILTER`; hits are conservative
     /// and used only for window seeding.
+    ///
+    /// # Errors
+    /// Returns an error if any rule pattern contains NUL bytes,
+    /// `hs_expression_info` rejects a pattern, or `hs_compile_multi` fails.
     pub(crate) fn try_new_stream(
         rules: &[RuleSpec],
         max_decoded_cap: usize,
@@ -290,6 +312,11 @@ impl VsStreamDb {
             ids.push(rid as c_uint);
         }
 
+        // SAFETY: `hs_platform_info_t` is a plain-data struct (all integer fields)
+        // and `MaybeUninit::zeroed()` produces a valid all-zeros representation.
+        // `hs_populate_platform` fills it on success; on failure the zeroed value
+        // is still a valid `hs_platform_info_t` (Vectorscan treats zero fields as
+        // "use defaults"), so `assume_init` is sound in both cases.
         let mut platform = MaybeUninit::<vs::hs_platform_info_t>::zeroed();
         unsafe {
             let _ = vs::hs_populate_platform(platform.as_mut_ptr());
@@ -380,6 +407,10 @@ impl VsStreamDb {
     }
 
     /// Opens a new stream handle bound to this database.
+    ///
+    /// The caller **must** call [`Self::close_stream`] on the returned handle
+    /// to flush end-of-stream matches and free the underlying allocation.
+    /// See [`VsStream`] for lifecycle details.
     pub(crate) fn open_stream(&self) -> Result<VsStream, String> {
         let mut stream: *mut vs::hs_stream_t = ptr::null_mut();
         let rc = unsafe { vs::hs_open_stream(self.db, 0, &mut stream) };
@@ -488,15 +519,21 @@ const _: () = assert!(std::mem::size_of::<VsStreamWindow>() == 32);
 /// single stream, so match offsets are already absolute within that buffer.
 ///
 /// Safety invariants:
-/// - `pending` points to a live `Vec<VsStreamWindow>` for the duration of the scan.
-/// - `pending` is not accessed concurrently while the scan runs.
+/// - `pending_ptr` points to a writable buffer of `pending_cap` windows.
+/// - `pending_len` points to the current initialized length in `pending_ptr`.
 /// - `meta` points to an array of `meta_len` entries indexed by rule id.
-/// - `meta_len` matches the number of compiled rules; ids are expected to be `< meta_len`.
+/// - `meta_len` matches the number of compiled rules; ids are expected `< meta_len`.
+/// - `max_pending <= pending_cap`.
+/// - `overflowed` points to a live byte flag for the duration of the scan (`0`/`1`).
 #[repr(C)]
 pub(crate) struct VsStreamMatchCtx {
-    pub(crate) pending: *mut Vec<VsStreamWindow>,
+    pub(crate) pending_ptr: *mut VsStreamWindow,
+    pub(crate) pending_len: *mut u32,
+    pub(crate) pending_cap: u32,
     pub(crate) meta: *const VsStreamMeta,
     pub(crate) meta_len: u32,
+    pub(crate) max_pending: u32,
+    pub(crate) overflowed: *mut u8,
 }
 
 /// Callback context for UTF-16 anchor stream scans.
@@ -507,28 +544,139 @@ pub(crate) struct VsStreamMatchCtx {
 /// stream-local offsets into absolute positions within the full decoded output.
 ///
 /// Safety invariants:
-/// - `pending` points to a live `Vec<VsStreamWindow>` for the duration of the scan.
-/// - `pending` is not accessed concurrently while the scan runs.
 /// - `targets`/`pat_offsets`/`pat_lens` describe the UTF-16 anchor mapping tables.
 /// - `pat_offsets` has length `pat_count + 1` and is monotonically increasing.
 /// - `pat_offsets[pat_count]` equals the number of `targets` entries.
 /// - `pat_lens` has length `pat_count`.
 /// - `base_offset` converts stream-local match offsets into absolute decoded offsets.
+/// - `pending_ptr` points to a writable buffer of `pending_cap` windows.
+/// - `pending_len` points to the current initialized length in `pending_ptr`.
+/// - `max_pending <= pending_cap`.
+/// - `overflowed` points to a live byte flag for the duration of the scan (`0`/`1`).
 #[repr(C)]
 pub(crate) struct VsUtf16StreamMatchCtx {
-    pub(crate) pending: *mut Vec<VsStreamWindow>,
+    pub(crate) pending_ptr: *mut VsStreamWindow,
+    pub(crate) pending_len: *mut u32,
+    pub(crate) pending_cap: u32,
     pub(crate) targets: *const VsAnchorTarget,
     pub(crate) pat_offsets: *const u32,
     pub(crate) pat_lens: *const u32,
     pub(crate) pat_count: u32,
     pub(crate) base_offset: u64,
+    pub(crate) max_pending: u32,
+    pub(crate) overflowed: *mut u8,
+}
+
+/// Borrowed UTF-16 anchor mapping tables used by stream callbacks.
+pub(crate) struct VsUtf16MatchTables<'a> {
+    pub(crate) targets: &'a [VsAnchorTarget],
+    pub(crate) pat_offsets: &'a [u32],
+    pub(crate) pat_lens: &'a [u32],
+}
+
+/// Constructs the stream callback context from a pending-window staging buffer.
+///
+/// `pending` is treated as fixed-capacity storage during callbacks: appends write
+/// directly into its allocation via `pending_ptr` and increment `pending_len`.
+#[inline(always)]
+pub(crate) fn build_stream_match_ctx(
+    pending: &mut Vec<VsStreamWindow>,
+    pending_len: &mut u32,
+    meta: &[VsStreamMeta],
+    max_pending: u32,
+    overflowed: &mut u8,
+) -> VsStreamMatchCtx {
+    let pending_cap = u32::try_from(pending.capacity()).unwrap_or(u32::MAX);
+    debug_assert!(max_pending <= pending_cap);
+    VsStreamMatchCtx {
+        pending_ptr: pending.as_mut_ptr(),
+        pending_len: (pending_len as *mut u32),
+        pending_cap,
+        meta: meta.as_ptr(),
+        meta_len: meta.len() as u32,
+        max_pending,
+        overflowed: (overflowed as *mut u8),
+    }
+}
+
+/// Constructs the UTF-16 stream callback context from the shared pending-window
+/// staging buffer and UTF-16 mapping tables.
+///
+/// Like [`build_stream_match_ctx`], `pending` is treated as fixed-capacity
+/// storage during callbacks: appends write directly into its allocation via
+/// `pending_ptr` and increment `pending_len`. The caller must not reallocate
+/// `pending` while the returned context is in use.
+#[inline(always)]
+pub(crate) fn build_utf16_stream_match_ctx(
+    pending: &mut Vec<VsStreamWindow>,
+    pending_len: &mut u32,
+    tables: VsUtf16MatchTables<'_>,
+    base_offset: u64,
+    max_pending: u32,
+    overflowed: &mut u8,
+) -> VsUtf16StreamMatchCtx {
+    let pending_cap = u32::try_from(pending.capacity()).unwrap_or(u32::MAX);
+    debug_assert!(max_pending <= pending_cap);
+    VsUtf16StreamMatchCtx {
+        pending_ptr: pending.as_mut_ptr(),
+        pending_len: (pending_len as *mut u32),
+        pending_cap,
+        targets: tables.targets.as_ptr(),
+        pat_offsets: tables.pat_offsets.as_ptr(),
+        pat_lens: tables.pat_lens.as_ptr(),
+        pat_count: tables.pat_lens.len() as u32,
+        base_offset,
+        max_pending,
+        overflowed: (overflowed as *mut u8),
+    }
+}
+
+/// Appends a callback-produced window without triggering `Vec` growth.
+///
+/// Returns `true` if the window was appended, `false` if the buffer is full
+/// (at `max_pending` or `pending_cap`). On `false`, sets `*overflowed = 1`
+/// when the pointer is non-null, signalling callers to fall back to a
+/// whole-buffer scan.
+///
+/// # Safety
+/// - `pending_ptr` must point to a writable allocation of `pending_cap` windows.
+/// - `pending_len` must be a valid pointer to the initialized count for `pending_ptr`.
+/// - `overflowed` must be null or point to a writable `u8` flag.
+/// - No concurrent access to `pending_ptr`/`pending_len` may occur.
+#[inline(always)]
+unsafe fn push_stream_window_bounded(
+    pending_ptr: *mut VsStreamWindow,
+    pending_len: *mut u32,
+    pending_cap: u32,
+    max_pending: u32,
+    overflowed: *mut u8,
+    win: VsStreamWindow,
+) -> bool {
+    debug_assert!(!pending_ptr.is_null());
+    debug_assert!(!pending_len.is_null());
+    let len = unsafe { *pending_len };
+    if len >= max_pending || len >= pending_cap {
+        if !overflowed.is_null() {
+            unsafe { *overflowed = 1 };
+        }
+        return false;
+    }
+    // `len < max_pending` and `len < pending_cap` from the guard above,
+    // so `len + 1 <= pending_cap <= u32::MAX` — no overflow.
+    debug_assert!(len < u32::MAX, "pending_len would overflow u32");
+    unsafe {
+        pending_ptr.add(len as usize).write(win);
+        *pending_len = len + 1;
+    }
+    true
 }
 
 /// Stream-mode match callback. Pushes window seeds into `pending`.
 ///
 /// # Safety
 /// - `ctx` must be non-null and point to a valid `VsStreamMatchCtx`.
-/// - `pending` and `meta` must outlive the call and not be accessed concurrently.
+/// - `pending_ptr`/`pending_len`/`meta` must outlive the call and not be
+///   accessed concurrently.
 /// - This callback must never panic or unwind across the FFI boundary.
 unsafe extern "C" fn vs_on_stream_match(
     id: c_uint,
@@ -541,20 +689,31 @@ unsafe extern "C" fn vs_on_stream_match(
         return 0;
     }
     let c = &mut *(ctx as *mut VsStreamMatchCtx);
+    if !c.overflowed.is_null() && unsafe { *c.overflowed } != 0 {
+        return 1;
+    }
     if id >= c.meta_len {
         return 0;
     }
     let meta = *c.meta.add(id as usize);
     if meta.whole_buffer_on_hit != 0 {
-        let pending = &mut *c.pending;
-        pending.push(VsStreamWindow {
-            rule_id: id,
-            lo: 0,
-            hi: 0,
-            variant_idx: 0,
-            force_full: true,
-            anchor_hint: from,
-        });
+        if !push_stream_window_bounded(
+            c.pending_ptr,
+            c.pending_len,
+            c.pending_cap,
+            c.max_pending,
+            c.overflowed,
+            VsStreamWindow {
+                rule_id: id,
+                lo: 0,
+                hi: 0,
+                variant_idx: 0,
+                force_full: true,
+                anchor_hint: from,
+            },
+        ) {
+            return 1;
+        }
         return 0;
     }
     let max_width = meta.max_width as u64;
@@ -563,17 +722,25 @@ unsafe extern "C" fn vs_on_stream_match(
     let hi = to.saturating_add(radius);
 
     // Clamp anchor hint to window bounds.
-    let anchor_hint = from.clamp(lo, to);
+    let anchor_hint = clamp_u64_ordered(from, lo, to);
 
-    let pending = &mut *c.pending;
-    pending.push(VsStreamWindow {
-        rule_id: id,
-        lo,
-        hi,
-        variant_idx: 0,
-        force_full: false,
-        anchor_hint,
-    });
+    if !push_stream_window_bounded(
+        c.pending_ptr,
+        c.pending_len,
+        c.pending_cap,
+        c.max_pending,
+        c.overflowed,
+        VsStreamWindow {
+            rule_id: id,
+            lo,
+            hi,
+            variant_idx: 0,
+            force_full: false,
+            anchor_hint,
+        },
+    ) {
+        return 1;
+    }
     0
 }
 
@@ -619,8 +786,8 @@ pub(crate) fn gate_match_callback() -> vs::match_event_handler {
 ///
 /// # Safety
 /// - `ctx` must point to a valid `VsUtf16StreamMatchCtx`.
-/// - `pending` and UTF-16 mapping tables must outlive the call and not be
-///   accessed concurrently.
+/// - `pending_ptr`/`pending_len` and UTF-16 mapping tables must outlive the call
+///   and not be accessed concurrently.
 /// - This callback must never panic or unwind across the FFI boundary.
 unsafe extern "C" fn vs_utf16_stream_on_match(
     id: c_uint,
@@ -633,6 +800,9 @@ unsafe extern "C" fn vs_utf16_stream_on_match(
         return 0;
     }
     let c = &mut *(ctx as *mut VsUtf16StreamMatchCtx);
+    if !c.overflowed.is_null() && unsafe { *c.overflowed } != 0 {
+        return 1;
+    }
     if id >= c.pat_count {
         return 0;
     }
@@ -648,24 +818,66 @@ unsafe extern "C" fn vs_utf16_stream_on_match(
     let off_start = *c.pat_offsets.add(pid) as usize;
     let off_end = *c.pat_offsets.add(pid + 1) as usize;
 
-    let pending = &mut *c.pending;
     for i in off_start..off_end {
         let target = *c.targets.add(i);
         let seed = target.seed_radius_bytes as u64;
         let lo = start.saturating_sub(seed);
         let hi = end.saturating_add(seed);
         // Clamp anchor hint to window bounds.
-        let anchor_hint = abs_from.clamp(lo, end);
-        pending.push(VsStreamWindow {
-            rule_id: target.rule_id,
-            lo,
-            hi,
-            variant_idx: target.variant_idx,
-            force_full: false,
-            anchor_hint,
-        });
+        let anchor_hint = clamp_u64_ordered(abs_from, lo, end);
+        if !push_stream_window_bounded(
+            c.pending_ptr,
+            c.pending_len,
+            c.pending_cap,
+            c.max_pending,
+            c.overflowed,
+            VsStreamWindow {
+                rule_id: target.rule_id,
+                lo,
+                hi,
+                variant_idx: target.variant_idx,
+                force_full: false,
+                anchor_hint,
+            },
+        ) {
+            return 1;
+        }
     }
     0
+}
+
+/// Clamps `v` into `[lo, hi]`. Requires `lo <= hi` (debug-asserted).
+///
+/// Used in FFI callbacks where panicking is undefined behavior. Unlike
+/// `Ord::clamp()`, which uses `assert!(min <= max)` and can unwind across
+/// the FFI boundary, this uses `debug_assert!` — the panic path is elided
+/// in release builds, making the function safe for `extern "C"` callbacks.
+#[inline(always)]
+fn clamp_u32_ordered(v: u32, lo: u32, hi: u32) -> u32 {
+    debug_assert!(lo <= hi);
+    if v < lo {
+        lo
+    } else if v > hi {
+        hi
+    } else {
+        v
+    }
+}
+
+/// Clamps `v` into `[lo, hi]`. Requires `lo <= hi` (debug-asserted).
+///
+/// 64-bit variant for stream-mode callbacks where offsets are `u64`.
+/// See [`clamp_u32_ordered`] for the FFI safety rationale.
+#[inline(always)]
+fn clamp_u64_ordered(v: u64, lo: u64, hi: u64) -> u64 {
+    debug_assert!(lo <= hi);
+    if v < lo {
+        lo
+    } else if v > hi {
+        hi
+    } else {
+        v
+    }
 }
 
 /// Returns the UTF-16 stream-mode match callback for anchor scanning.
@@ -940,6 +1152,7 @@ impl VsAnchorDb {
             ids.push(id as c_uint);
         }
 
+        // SAFETY: see `VsStreamDb::try_new_stream` for the zeroed-platform rationale.
         let mut platform = MaybeUninit::<vs::hs_platform_info_t>::zeroed();
         unsafe {
             let _ = vs::hs_populate_platform(platform.as_mut_ptr());
@@ -1121,6 +1334,7 @@ impl VsUtf16StreamDb {
             ids.push(id as c_uint);
         }
 
+        // SAFETY: see `VsStreamDb::try_new_stream` for the zeroed-platform rationale.
         let mut platform = MaybeUninit::<vs::hs_platform_info_t>::zeroed();
         unsafe {
             let _ = vs::hs_populate_platform(platform.as_mut_ptr());
@@ -1231,6 +1445,10 @@ impl VsUtf16StreamDb {
     }
 
     /// Opens a new stream handle bound to this database.
+    ///
+    /// The caller **must** call [`Self::close_stream`] on the returned handle
+    /// to flush end-of-stream matches and free the underlying allocation.
+    /// See [`VsStream`] for lifecycle details.
     pub(crate) fn open_stream(&self) -> Result<VsStream, String> {
         let mut stream: *mut vs::hs_stream_t = ptr::null_mut();
         let rc = unsafe { vs::hs_open_stream(self.db, 0, &mut stream) };
@@ -1340,6 +1558,7 @@ impl VsGateDb {
             ids.push(id as c_uint);
         }
 
+        // SAFETY: see `VsStreamDb::try_new_stream` for the zeroed-platform rationale.
         let mut platform = MaybeUninit::<vs::hs_platform_info_t>::zeroed();
         unsafe {
             let _ = vs::hs_populate_platform(platform.as_mut_ptr());
@@ -1421,6 +1640,10 @@ impl VsGateDb {
     }
 
     /// Opens a new stream handle bound to this database.
+    ///
+    /// The caller **must** call [`Self::close_stream`] on the returned handle
+    /// to flush end-of-stream matches and free the underlying allocation.
+    /// See [`VsStream`] for lifecycle details.
     pub(crate) fn open_stream(&self) -> Result<VsStream, String> {
         let mut stream: *mut vs::hs_stream_t = ptr::null_mut();
         let rc = unsafe { vs::hs_open_stream(self.db, 0, &mut stream) };
@@ -1503,9 +1726,14 @@ impl VsPrefilterDb {
     ///   with `use_raw_prefilter[rid] == true` have their regex compiled. Rules with
     ///   `false` rely on anchor patterns for window seeding.
     ///
-    /// Returns an error if the database cannot be compiled or if any rule
-    /// pattern is rejected by `hs_expression_info`. If multi-compile fails, we
-    /// recompile patterns individually to surface the specific rule errors.
+    /// # Errors
+    /// Returns an error if:
+    /// - Any rule pattern contains NUL bytes or is rejected by
+    ///   `hs_expression_info`.
+    /// - `hs_compile_multi` fails for the combined database. In this case
+    ///   patterns are recompiled individually; the error lists every rejected
+    ///   rule with its name, pattern, and compiler message.
+    /// - All raw patterns are rejected and no anchor data is available.
     pub(crate) fn try_new(
         rules: &[RuleSpec],
         anchor: Option<AnchorInput<'_>>,
@@ -1576,9 +1804,9 @@ impl VsPrefilterDb {
             None
         };
 
+        // SAFETY: see `VsStreamDb::try_new_stream` for the zeroed-platform rationale.
         let mut platform = MaybeUninit::<vs::hs_platform_info_t>::zeroed();
         unsafe {
-            // Best-effort: if this fails, Hyperscan/Vectorscan will fall back to defaults.
             let _ = vs::hs_populate_platform(platform.as_mut_ptr());
         }
         let platform = unsafe { platform.assume_init() };
@@ -1668,6 +1896,10 @@ impl VsPrefilterDb {
             Ok(db)
         };
 
+        // Compiles a single pattern in isolation to test whether Vectorscan
+        // accepts it. The compiled database is immediately freed — the only
+        // purpose is to identify which patterns caused the multi-compile failure
+        // so we can exclude them and retry with the valid subset.
         let compile_single = |pat: &RawPattern<'_>| -> Result<(), String> {
             let expr_ptrs = [pat.c_pat.as_ptr()];
             let flags = [RAW_FLAGS];
@@ -1759,6 +1991,16 @@ impl VsPrefilterDb {
                 seed_radius: p.seed_radius,
             })
             .collect();
+        // Construction invariant: every rule_id must be a valid index into the
+        // engine's rules array. This is guaranteed by the enumerate() loop above
+        // but checked here defensively since the FFI callbacks rely on it for
+        // safe push_span_unchecked_hot indexing (pair = rule_id * 3 + variant).
+        debug_assert!(
+            raw_meta.iter().all(|m| (m.rule_id as usize) < rules.len()),
+            "raw_meta rule_id out of bounds: max rule_id={}, rules.len()={}",
+            raw_meta.iter().map(|m| m.rule_id).max().unwrap_or(0),
+            rules.len(),
+        );
         let raw_rule_count = raw_kept.len() as u32;
 
         let (anchor_id_base, anchor_pat_count, anchor_targets, anchor_pat_offsets, anchor_pat_lens) =
@@ -1778,6 +2020,15 @@ impl VsPrefilterDb {
             } else {
                 (raw_rule_count, 0, Vec::new(), Vec::new(), Vec::new())
             };
+
+        // Same invariant for anchor targets: rule_id must be in-bounds and
+        // variant_idx must be 0..3 so pair = rule_id * 3 + variant_idx < rules.len() * 3.
+        debug_assert!(
+            anchor_targets
+                .iter()
+                .all(|t| (t.rule_id as usize) < rules.len() && t.variant_idx < 3),
+            "anchor target rule_id or variant_idx out of bounds",
+        );
 
         Ok(Self {
             db,
@@ -1927,18 +2178,80 @@ struct VsAnchorMatchCtx {
     saw_utf16: bool,
 }
 
+/// Expands one matched anchor pattern into per-target hit spans.
+///
+/// # Safety
+/// - `targets` must point to at least `off_end` entries.
+/// - `off_start <= off_end`.
+/// - `scratch` must be valid and exclusively borrowed for the call.
+#[inline(always)]
+unsafe fn enqueue_anchor_target_spans(
+    scratch: &mut ScanScratch,
+    targets: *const VsAnchorTarget,
+    offsets: std::ops::Range<usize>,
+    start: u32,
+    end: u32,
+    hay_len: u32,
+    saw_utf16: &mut bool,
+) {
+    for i in offsets {
+        // SAFETY: caller guarantees `targets` covers `[off_start, off_end)`.
+        let target = unsafe { *targets.add(i) };
+        let seed = target.seed_radius_bytes;
+        let lo = start.saturating_sub(seed);
+        let hi = end.saturating_add(seed).min(hay_len);
+
+        // Anchor patterns are fixed-width; use the computed start as the hint to
+        // avoid relying on `from` for prefilter-style callbacks.
+        let anchor_hint = clamp_u32_ordered(start, lo, end);
+
+        let rid = target.rule_id as usize;
+        let vidx = target.variant_idx as usize;
+        let pair = rid * 3 + vidx;
+        debug_assert!(
+            pair < scratch.hit_acc_pool.pair_count(),
+            "pair {pair} exceeds pool pair_count {}",
+            scratch.hit_acc_pool.pair_count()
+        );
+        unsafe {
+            scratch.hit_acc_pool.push_span_unchecked_hot(
+                pair,
+                SpanU32 {
+                    start: lo,
+                    end: hi,
+                    anchor_hint,
+                },
+                &mut scratch.touched_pairs,
+            );
+        }
+        if matches!(target.variant_idx, 1 | 2) {
+            *saw_utf16 = true;
+        }
+    }
+}
+
 /// Prefilter match callback for raw-byte scanning.
 ///
 /// Seeds per-rule raw windows in `ScanScratch` based on the match end offset.
 /// `id` values below `raw_rule_count` denote raw rules; ids at or above
-/// `anchor_id_base` denote anchor literal patterns.
+/// `anchor_id_base` denote anchor literal patterns. Out-of-range ids or
+/// match ends beyond `hay_len` are silently dropped (defensive against
+/// Vectorscan reporting spurious matches under `HS_FLAG_PREFILTER`).
+///
+/// # Id dispatch
+/// - `id < raw_rule_count`: raw regex hit — seeds one window using
+///   `raw_meta[id]` for width and radius.
+/// - `anchor_id_base <= id < anchor_id_base + anchor_pat_count`: anchor
+///   literal hit — fans out to all `(rule, variant)` targets for that
+///   pattern.
+/// - Everything else: ignored.
 ///
 /// # Safety
 /// - `ctx` must be non-null and point to a valid `VsMatchCtx`.
-/// - `scratch` and mapping tables referenced by `ctx` must remain valid and not
-///   be accessed concurrently for the duration of the scan.
+/// - `scratch` and mapping tables referenced by `ctx` must remain valid and
+///   not be accessed concurrently for the duration of the scan.
 /// - This callback must never panic or unwind across the FFI boundary.
-extern "C" fn vs_on_match(
+unsafe extern "C" fn vs_on_match(
     id: c_uint,
     from: u64,
     to: u64,
@@ -1972,18 +2285,27 @@ extern "C" fn vs_on_match(
         let hi = end.saturating_add(seed).min(c.hay_len);
 
         // Clamp anchor hint to window bounds.
-        let anchor_hint = (from as u32).clamp(lo, end);
+        let anchor_hint = clamp_u32_ordered(from as u32, lo, end);
 
+        // Pair encoding: `rid * 3 + variant_idx` maps (rule, variant) to a
+        // unique hit-accumulator slot. Variant indices: 0=Raw, 1=UTF-16LE, 2=UTF-16BE.
         let pair = rid * 3 + RAW_IDX;
-        scratch.hit_acc_pool.push_span(
-            pair,
-            SpanU32 {
-                start: lo,
-                end: hi,
-                anchor_hint,
-            },
-            &mut scratch.touched_pairs,
+        debug_assert!(
+            pair < scratch.hit_acc_pool.pair_count(),
+            "pair {pair} exceeds pool pair_count {}",
+            scratch.hit_acc_pool.pair_count()
         );
+        unsafe {
+            scratch.hit_acc_pool.push_span_unchecked_hot(
+                pair,
+                SpanU32 {
+                    start: lo,
+                    end: hi,
+                    anchor_hint,
+                },
+                &mut scratch.touched_pairs,
+            );
+        }
         return 0;
     }
 
@@ -1996,6 +2318,7 @@ extern "C" fn vs_on_match(
         return 0;
     }
 
+    // SAFETY: pid < anchor_pat_count (checked at line above).
     let len = unsafe { *c.anchor_pat_lens.add(pid) };
     let end = to as u32;
     if end > c.hay_len {
@@ -2003,38 +2326,25 @@ extern "C" fn vs_on_match(
     }
     let start = end.saturating_sub(len);
 
+    // SAFETY: pat_offsets has length anchor_pat_count + 1 (ctx invariant),
+    // and pid < anchor_pat_count, so pid and pid + 1 are in bounds.
     let off_start = unsafe { *c.anchor_pat_offsets.add(pid) } as usize;
     let off_end = unsafe { *c.anchor_pat_offsets.add(pid + 1) } as usize;
 
     // SAFETY: `scratch` is valid for the duration of the scan and not used concurrently.
     let scratch = unsafe { &mut *c.scratch };
 
-    for i in off_start..off_end {
-        let target = unsafe { *c.anchor_targets.add(i) };
-        let seed = target.seed_radius_bytes;
-        let lo = start.saturating_sub(seed);
-        let hi = end.saturating_add(seed).min(c.hay_len);
-
-        // Anchor patterns are fixed-width; use the computed start as the hint to
-        // avoid relying on `from` for prefilter-style callbacks.
-        let anchor_hint = start.clamp(lo, end);
-
-        let rid = target.rule_id as usize;
-        let vidx = target.variant_idx as usize;
-
-        let pair = rid * 3 + vidx;
-        scratch.hit_acc_pool.push_span(
-            pair,
-            SpanU32 {
-                start: lo,
-                end: hi,
-                anchor_hint,
-            },
-            &mut scratch.touched_pairs,
+    // SAFETY: offsets are derived from `anchor_pat_offsets` bounds checked above.
+    unsafe {
+        enqueue_anchor_target_spans(
+            scratch,
+            c.anchor_targets,
+            off_start..off_end,
+            start,
+            end,
+            c.hay_len,
+            &mut c.saw_utf16,
         );
-        if matches!(target.variant_idx, 1 | 2) {
-            c.saw_utf16 = true;
-        }
     }
 
     0
@@ -2043,14 +2353,14 @@ extern "C" fn vs_on_match(
 /// Anchor literal match callback.
 ///
 /// Expands each anchor match into windows for all rule/variant targets tied to
-/// the matched pattern.
+/// the matched pattern. Window ends are clamped to `hay_len`.
 ///
 /// # Safety
 /// - `ctx` must be non-null and point to a valid `VsAnchorMatchCtx`.
-/// - `scratch` and mapping tables referenced by `ctx` must remain valid and not
-///   be accessed concurrently for the duration of the scan.
+/// - `scratch` and mapping tables referenced by `ctx` must remain valid and
+///   not be accessed concurrently for the duration of the scan.
 /// - This callback must never panic or unwind across the FFI boundary.
-extern "C" fn vs_anchor_on_match(
+unsafe extern "C" fn vs_anchor_on_match(
     id: c_uint,
     _from: u64,
     to: u64,
@@ -2063,43 +2373,31 @@ extern "C" fn vs_anchor_on_match(
     let pid = id as usize;
     debug_assert!(pid < c.pat_count as usize);
 
+    // SAFETY: pid < pat_count (debug-asserted above).
     let len = unsafe { *c.pat_lens.add(pid) };
     let end = to as u32;
     debug_assert!(end <= c.hay_len);
     let start = end.saturating_sub(len);
 
+    // SAFETY: pat_offsets has length pat_count + 1 (ctx invariant),
+    // and pid < pat_count, so pid and pid + 1 are in bounds.
     let off_start = unsafe { *c.pat_offsets.add(pid) } as usize;
     let off_end = unsafe { *c.pat_offsets.add(pid + 1) } as usize;
 
     // SAFETY: scratch is valid for the duration of the scan and not used concurrently.
     let scratch = unsafe { &mut *c.scratch };
 
-    for i in off_start..off_end {
-        let target = unsafe { *c.targets.add(i) };
-        let seed = target.seed_radius_bytes;
-        let lo = start.saturating_sub(seed);
-        let hi = end.saturating_add(seed).min(c.hay_len);
-
-        // Anchor patterns are fixed-width; use the computed start as the hint to
-        // avoid relying on `from` for prefilter-style callbacks.
-        let anchor_hint = start.clamp(lo, end);
-
-        let rid = target.rule_id as usize;
-        let vidx = target.variant_idx as usize;
-
-        let pair = rid * 3 + vidx;
-        scratch.hit_acc_pool.push_span(
-            pair,
-            SpanU32 {
-                start: lo,
-                end: hi,
-                anchor_hint,
-            },
-            &mut scratch.touched_pairs,
+    // SAFETY: offsets are derived from `pat_offsets` bounds checked above.
+    unsafe {
+        enqueue_anchor_target_spans(
+            scratch,
+            c.targets,
+            off_start..off_end,
+            start,
+            end,
+            c.hay_len,
+            &mut c.saw_utf16,
         );
-        if matches!(target.variant_idx, 1 | 2) {
-            c.saw_utf16 = true;
-        }
     }
 
     0
@@ -2107,8 +2405,13 @@ extern "C" fn vs_anchor_on_match(
 
 /// Returns `(max_width, c_pattern)` for use in compilation.
 ///
-/// Errors if the pattern contains NUL bytes or if `hs_expression_info` fails.
-/// A reported `max_width` of zero is treated as "unbounded" by callers.
+/// Vectorscan reports `max_width = 0` when a pattern can match an unbounded
+/// number of bytes (e.g. `.*`). Callers must map zero to `u32::MAX` or
+/// fall back to whole-buffer scanning.
+///
+/// # Errors
+/// Returns an error if the pattern contains NUL bytes or if
+/// `hs_expression_info` fails (e.g. unsupported regex syntax).
 fn expression_info_max_width(pattern: &str, flags: c_uint) -> Result<(u32, CString), String> {
     let c_pat = CString::new(pattern).map_err(|_| "pattern contains NUL byte".to_string())?;
 
@@ -2164,5 +2467,238 @@ fn usize_to_u32_saturating(v: usize) -> u32 {
         u32::MAX
     } else {
         v as u32
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Miri-compatible unit tests (no FFI dependencies)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_window(rule_id: u32, lo: u64, hi: u64) -> VsStreamWindow {
+        VsStreamWindow {
+            lo,
+            hi,
+            anchor_hint: lo,
+            rule_id,
+            variant_idx: 0,
+            force_full: false,
+        }
+    }
+
+    #[test]
+    fn miri_push_stream_window_bounded_within_cap() {
+        let mut buf =
+            std::array::from_fn::<_, 4, _>(|_| std::mem::MaybeUninit::<VsStreamWindow>::uninit());
+        let ptr = buf.as_mut_ptr() as *mut VsStreamWindow;
+        let mut len: u32 = 0;
+        let mut overflow: u8 = 0;
+
+        let win = make_window(0, 0, 100);
+
+        let ok = unsafe { push_stream_window_bounded(ptr, &mut len, 4, 4, &mut overflow, win) };
+        assert!(ok);
+        assert_eq!(len, 1);
+        assert_eq!(overflow, 0);
+
+        // Verify the written value.
+        let stored = unsafe { ptr.read() };
+        assert_eq!(stored.lo, 0);
+        assert_eq!(stored.hi, 100);
+    }
+
+    #[test]
+    fn miri_push_stream_window_bounded_fills_to_cap() {
+        let mut buf =
+            std::array::from_fn::<_, 3, _>(|_| std::mem::MaybeUninit::<VsStreamWindow>::uninit());
+        let ptr = buf.as_mut_ptr() as *mut VsStreamWindow;
+        let mut len: u32 = 0;
+        let mut overflow: u8 = 0;
+
+        for i in 0..3u32 {
+            let ok = unsafe {
+                push_stream_window_bounded(
+                    ptr,
+                    &mut len,
+                    3,
+                    3,
+                    &mut overflow,
+                    make_window(i, i as u64 * 10, i as u64 * 10 + 5),
+                )
+            };
+            assert!(ok, "push {i} should succeed");
+        }
+        assert_eq!(len, 3);
+        assert_eq!(overflow, 0);
+
+        // Next push should fail — buffer is full.
+        let ok = unsafe {
+            push_stream_window_bounded(ptr, &mut len, 3, 3, &mut overflow, make_window(99, 0, 1))
+        };
+        assert!(!ok);
+        assert_eq!(overflow, 1);
+        assert_eq!(len, 3); // Unchanged.
+    }
+
+    #[test]
+    fn miri_push_stream_window_bounded_max_pending_lower_than_cap() {
+        let mut buf =
+            std::array::from_fn::<_, 8, _>(|_| std::mem::MaybeUninit::<VsStreamWindow>::uninit());
+        let ptr = buf.as_mut_ptr() as *mut VsStreamWindow;
+        let mut len: u32 = 0;
+        let mut overflow: u8 = 0;
+
+        // Cap is 8 but max_pending is 2.
+        for i in 0..2u32 {
+            let ok = unsafe {
+                push_stream_window_bounded(
+                    ptr,
+                    &mut len,
+                    8,
+                    2,
+                    &mut overflow,
+                    make_window(i, 0, 10),
+                )
+            };
+            assert!(ok);
+        }
+        assert_eq!(len, 2);
+
+        // Third push hits max_pending.
+        let ok = unsafe {
+            push_stream_window_bounded(ptr, &mut len, 8, 2, &mut overflow, make_window(3, 0, 10))
+        };
+        assert!(!ok);
+        assert_eq!(overflow, 1);
+        assert_eq!(len, 2);
+    }
+
+    #[test]
+    fn miri_push_stream_window_bounded_null_overflow_ptr() {
+        let mut buf =
+            std::array::from_fn::<_, 1, _>(|_| std::mem::MaybeUninit::<VsStreamWindow>::uninit());
+        let ptr = buf.as_mut_ptr() as *mut VsStreamWindow;
+        let mut len: u32 = 1; // Already full.
+
+        // Null overflow pointer — should not crash.
+        let ok = unsafe {
+            push_stream_window_bounded(
+                ptr,
+                &mut len,
+                1,
+                1,
+                std::ptr::null_mut(),
+                make_window(0, 0, 10),
+            )
+        };
+        assert!(!ok);
+        assert_eq!(len, 1);
+    }
+
+    #[test]
+    fn miri_push_stream_window_bounded_preserves_field_values() {
+        let mut buf =
+            std::array::from_fn::<_, 2, _>(|_| std::mem::MaybeUninit::<VsStreamWindow>::uninit());
+        let ptr = buf.as_mut_ptr() as *mut VsStreamWindow;
+        let mut len: u32 = 0;
+        let mut overflow: u8 = 0;
+
+        let win = VsStreamWindow {
+            lo: 42,
+            hi: 999,
+            anchor_hint: 50,
+            rule_id: 7,
+            variant_idx: 2,
+            force_full: true,
+        };
+
+        let ok = unsafe { push_stream_window_bounded(ptr, &mut len, 2, 2, &mut overflow, win) };
+        assert!(ok);
+
+        let stored = unsafe { ptr.read() };
+        assert_eq!(stored.lo, 42);
+        assert_eq!(stored.hi, 999);
+        assert_eq!(stored.anchor_hint, 50);
+        assert_eq!(stored.rule_id, 7);
+        assert_eq!(stored.variant_idx, 2);
+        assert!(stored.force_full);
+    }
+
+    #[test]
+    fn stream_match_callback_terminates_on_overflow() {
+        let mut pending: Vec<VsStreamWindow> = Vec::new();
+        let mut pending_len = 0u32;
+        let mut overflowed = 0u8;
+        let meta = [VsStreamMeta {
+            max_width: 8,
+            radius: 4,
+            whole_buffer_on_hit: 0,
+        }];
+        let mut ctx =
+            build_stream_match_ctx(&mut pending, &mut pending_len, &meta, 0, &mut overflowed);
+
+        let rc =
+            unsafe { vs_on_stream_match(0, 10, 20, 0, (&mut ctx as *mut VsStreamMatchCtx).cast()) };
+        assert_eq!(rc, 1);
+        assert_eq!(overflowed, 1);
+        assert_eq!(pending_len, 0);
+    }
+
+    #[test]
+    fn utf16_stream_callback_terminates_on_overflow() {
+        let mut pending: Vec<VsStreamWindow> = Vec::new();
+        let mut pending_len = 0u32;
+        let mut overflowed = 0u8;
+        let targets = [VsAnchorTarget {
+            rule_id: 7,
+            variant_idx: 1,
+            seed_radius_bytes: 3,
+        }];
+        let pat_offsets = [0u32, 1u32];
+        let pat_lens = [2u32];
+        let mut ctx = build_utf16_stream_match_ctx(
+            &mut pending,
+            &mut pending_len,
+            VsUtf16MatchTables {
+                targets: &targets,
+                pat_offsets: &pat_offsets,
+                pat_lens: &pat_lens,
+            },
+            0,
+            0,
+            &mut overflowed,
+        );
+
+        let rc = unsafe {
+            vs_utf16_stream_on_match(0, 0, 2, 0, (&mut ctx as *mut VsUtf16StreamMatchCtx).cast())
+        };
+        assert_eq!(rc, 1);
+        assert_eq!(overflowed, 1);
+        assert_eq!(pending_len, 0);
+    }
+
+    #[test]
+    fn clamp_u32_ordered_within_range() {
+        assert_eq!(clamp_u32_ordered(5, 0, 10), 5);
+    }
+
+    #[test]
+    fn clamp_u32_ordered_below_range() {
+        assert_eq!(clamp_u32_ordered(0, 5, 10), 5);
+    }
+
+    #[test]
+    fn clamp_u32_ordered_above_range() {
+        assert_eq!(clamp_u32_ordered(15, 5, 10), 10);
+    }
+
+    #[test]
+    fn clamp_u32_ordered_equal_bounds() {
+        assert_eq!(clamp_u32_ordered(3, 5, 5), 5);
+        assert_eq!(clamp_u32_ordered(5, 5, 5), 5);
+        assert_eq!(clamp_u32_ordered(7, 5, 5), 5);
     }
 }

@@ -177,6 +177,10 @@ required-features = ["bench"]
 name = "archive_throughput"
 harness = false
 
+[[bench]]
+name = "runtime_hotpath"
+harness = false
+
 [profile.dev]
 opt-level = 1
 
