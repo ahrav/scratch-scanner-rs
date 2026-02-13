@@ -78,16 +78,14 @@ use super::hit_pool::SpanU32;
 use super::rule_repr::{Target, Variant};
 use super::scratch::ScanScratch;
 
-/// Compiled Vectorscan database plus per-rule window metadata for raw-byte scanning.
+/// Per-pattern metadata for the raw-byte match callback (AoS layout).
 ///
-/// The database is immutable after compilation and can be shared across
-/// threads, but each thread must allocate its own `VsScratch`.
-///
-/// Raw pattern ids follow compile order; `raw_meta` maps expression index to
-/// scan metadata (`rule_id`, `max_width`, `seed_radius`) in one AoS load. If
-/// we fall back to per-rule compilation, `raw_missing_rules` records rejected
-/// rules (and the build fails). Optional UTF-16 anchor patterns are appended
-/// after raw patterns and resolved via the `anchor_*` mapping tables.
+/// Indexed by Vectorscan expression id in the compiled database. The match
+/// callback loads one `RawPatternMeta` per hit to determine the originating
+/// rule, the estimated match width (for window start derivation), and the
+/// seed radius (for window expansion). The `#[repr(C)]` layout guarantees
+/// 12 bytes with no internal padding, verified by the compile-time assertion
+/// below.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct RawPatternMeta {
@@ -101,6 +99,16 @@ struct RawPatternMeta {
 // arithmetic (`raw_meta.add(id)`) in the hot path.
 const _: () = assert!(std::mem::size_of::<RawPatternMeta>() == 12);
 
+/// Compiled Vectorscan database plus per-rule window metadata for raw-byte scanning.
+///
+/// The database is immutable after compilation and can be shared across
+/// threads, but each thread must allocate its own `VsScratch`.
+///
+/// Raw pattern ids follow compile order; `raw_meta` maps expression index to
+/// scan metadata (`rule_id`, `max_width`, `seed_radius`) in one AoS load. If
+/// we fall back to per-rule compilation, `raw_missing_rules` records rejected
+/// rules (and the build fails). Optional UTF-16 anchor patterns are appended
+/// after raw patterns and resolved via the `anchor_*` mapping tables.
 pub(crate) struct VsPrefilterDb {
     /// Compiled Vectorscan block-mode database.
     db: *mut vs::hs_database_t,
@@ -236,7 +244,15 @@ unsafe impl Send for VsScratch {}
 
 /// Opaque stream handle for stream-mode scanning.
 ///
-/// Must be closed with `close_stream` to flush end-of-stream matches.
+/// Must be closed via one of the `close_stream` methods on [`VsStreamDb`],
+/// [`VsUtf16StreamDb`], or [`VsGateDb`] to flush end-of-stream matches and
+/// free the underlying `hs_stream_t`.
+///
+/// **There is intentionally no `Drop` impl**: `hs_close_stream` requires a
+/// scratch handle and a match callback, so cleanup cannot be done
+/// automatically. Callers must ensure `close_stream` is called on every
+/// opened stream, even on error paths, to avoid leaking the Vectorscan
+/// stream allocation.
 pub(crate) struct VsStream {
     /// Opaque Vectorscan stream handle.
     stream: *mut vs::hs_stream_t,
@@ -296,6 +312,11 @@ impl VsStreamDb {
             ids.push(rid as c_uint);
         }
 
+        // SAFETY: `hs_platform_info_t` is a plain-data struct (all integer fields)
+        // and `MaybeUninit::zeroed()` produces a valid all-zeros representation.
+        // `hs_populate_platform` fills it on success; on failure the zeroed value
+        // is still a valid `hs_platform_info_t` (Vectorscan treats zero fields as
+        // "use defaults"), so `assume_init` is sound in both cases.
         let mut platform = MaybeUninit::<vs::hs_platform_info_t>::zeroed();
         unsafe {
             let _ = vs::hs_populate_platform(platform.as_mut_ptr());
@@ -386,6 +407,10 @@ impl VsStreamDb {
     }
 
     /// Opens a new stream handle bound to this database.
+    ///
+    /// The caller **must** call [`Self::close_stream`] on the returned handle
+    /// to flush end-of-stream matches and free the underlying allocation.
+    /// See [`VsStream`] for lifecycle details.
     pub(crate) fn open_stream(&self) -> Result<VsStream, String> {
         let mut stream: *mut vs::hs_stream_t = ptr::null_mut();
         let rc = unsafe { vs::hs_open_stream(self.db, 0, &mut stream) };
@@ -576,6 +601,11 @@ pub(crate) fn build_stream_match_ctx(
 
 /// Constructs the UTF-16 stream callback context from the shared pending-window
 /// staging buffer and UTF-16 mapping tables.
+///
+/// Like [`build_stream_match_ctx`], `pending` is treated as fixed-capacity
+/// storage during callbacks: appends write directly into its allocation via
+/// `pending_ptr` and increment `pending_len`. The caller must not reallocate
+/// `pending` while the returned context is in use.
 #[inline(always)]
 pub(crate) fn build_utf16_stream_match_ctx(
     pending: &mut Vec<VsStreamWindow>,
@@ -1122,6 +1152,7 @@ impl VsAnchorDb {
             ids.push(id as c_uint);
         }
 
+        // SAFETY: see `VsStreamDb::try_new_stream` for the zeroed-platform rationale.
         let mut platform = MaybeUninit::<vs::hs_platform_info_t>::zeroed();
         unsafe {
             let _ = vs::hs_populate_platform(platform.as_mut_ptr());
@@ -1303,6 +1334,7 @@ impl VsUtf16StreamDb {
             ids.push(id as c_uint);
         }
 
+        // SAFETY: see `VsStreamDb::try_new_stream` for the zeroed-platform rationale.
         let mut platform = MaybeUninit::<vs::hs_platform_info_t>::zeroed();
         unsafe {
             let _ = vs::hs_populate_platform(platform.as_mut_ptr());
@@ -1413,6 +1445,10 @@ impl VsUtf16StreamDb {
     }
 
     /// Opens a new stream handle bound to this database.
+    ///
+    /// The caller **must** call [`Self::close_stream`] on the returned handle
+    /// to flush end-of-stream matches and free the underlying allocation.
+    /// See [`VsStream`] for lifecycle details.
     pub(crate) fn open_stream(&self) -> Result<VsStream, String> {
         let mut stream: *mut vs::hs_stream_t = ptr::null_mut();
         let rc = unsafe { vs::hs_open_stream(self.db, 0, &mut stream) };
@@ -1522,6 +1558,7 @@ impl VsGateDb {
             ids.push(id as c_uint);
         }
 
+        // SAFETY: see `VsStreamDb::try_new_stream` for the zeroed-platform rationale.
         let mut platform = MaybeUninit::<vs::hs_platform_info_t>::zeroed();
         unsafe {
             let _ = vs::hs_populate_platform(platform.as_mut_ptr());
@@ -1603,6 +1640,10 @@ impl VsGateDb {
     }
 
     /// Opens a new stream handle bound to this database.
+    ///
+    /// The caller **must** call [`Self::close_stream`] on the returned handle
+    /// to flush end-of-stream matches and free the underlying allocation.
+    /// See [`VsStream`] for lifecycle details.
     pub(crate) fn open_stream(&self) -> Result<VsStream, String> {
         let mut stream: *mut vs::hs_stream_t = ptr::null_mut();
         let rc = unsafe { vs::hs_open_stream(self.db, 0, &mut stream) };
@@ -1763,9 +1804,9 @@ impl VsPrefilterDb {
             None
         };
 
+        // SAFETY: see `VsStreamDb::try_new_stream` for the zeroed-platform rationale.
         let mut platform = MaybeUninit::<vs::hs_platform_info_t>::zeroed();
         unsafe {
-            // Best-effort: if this fails, Hyperscan/Vectorscan will fall back to defaults.
             let _ = vs::hs_populate_platform(platform.as_mut_ptr());
         }
         let platform = unsafe { platform.assume_init() };
@@ -1855,6 +1896,10 @@ impl VsPrefilterDb {
             Ok(db)
         };
 
+        // Compiles a single pattern in isolation to test whether Vectorscan
+        // accepts it. The compiled database is immediately freed — the only
+        // purpose is to identify which patterns caused the multi-compile failure
+        // so we can exclude them and retry with the valid subset.
         let compile_single = |pat: &RawPattern<'_>| -> Result<(), String> {
             let expr_ptrs = [pat.c_pat.as_ptr()];
             let flags = [RAW_FLAGS];
