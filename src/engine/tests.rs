@@ -106,11 +106,18 @@ fn decoded_prefilter_hit(engine: &Engine, decoded: &[u8]) -> bool {
         Err(_) => return false,
     };
 
-    let mut pending: Vec<VsStreamWindow> = Vec::new();
+    let mut pending: Vec<VsStreamWindow> = Vec::with_capacity(32);
+    let pending_cap = u32::try_from(pending.capacity()).unwrap_or(u32::MAX);
+    let mut pending_len: u32 = 0;
+    let mut overflowed: u8 = 0;
     let mut ctx = VsStreamMatchCtx {
-        pending: &mut pending as *mut Vec<VsStreamWindow>,
+        pending_ptr: pending.as_mut_ptr(),
+        pending_len: (&mut pending_len as *mut u32),
+        pending_cap,
         meta: vs_stream.meta().as_ptr(),
         meta_len: vs_stream.meta().len() as u32,
+        max_pending: pending_cap,
+        overflowed: (&mut overflowed as *mut u8),
     };
     let cb = stream_match_callback();
 
@@ -132,8 +139,10 @@ fn decoded_prefilter_hit(engine: &Engine, decoded: &[u8]) -> bool {
         );
         return false;
     }
+    unsafe { pending.set_len(pending_len as usize) };
     let mut hit = !pending.is_empty();
     pending.clear();
+    pending_len = 0;
 
     if vs_stream
         .close_stream(
@@ -146,6 +155,7 @@ fn decoded_prefilter_hit(engine: &Engine, decoded: &[u8]) -> bool {
     {
         return false;
     }
+    unsafe { pending.set_len(pending_len as usize) };
     if !pending.is_empty() {
         hit = true;
     }

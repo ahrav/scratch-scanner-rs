@@ -488,15 +488,21 @@ const _: () = assert!(std::mem::size_of::<VsStreamWindow>() == 32);
 /// single stream, so match offsets are already absolute within that buffer.
 ///
 /// Safety invariants:
-/// - `pending` points to a live `Vec<VsStreamWindow>` for the duration of the scan.
-/// - `pending` is not accessed concurrently while the scan runs.
+/// - `pending_ptr` points to a writable buffer of `pending_cap` windows.
+/// - `pending_len` points to the current initialized length in `pending_ptr`.
 /// - `meta` points to an array of `meta_len` entries indexed by rule id.
-/// - `meta_len` matches the number of compiled rules; ids are expected to be `< meta_len`.
+/// - `meta_len` matches the number of compiled rules; ids are expected `< meta_len`.
+/// - `max_pending <= pending_cap`.
+/// - `overflowed` points to a live byte flag for the duration of the scan (`0`/`1`).
 #[repr(C)]
 pub(crate) struct VsStreamMatchCtx {
-    pub(crate) pending: *mut Vec<VsStreamWindow>,
+    pub(crate) pending_ptr: *mut VsStreamWindow,
+    pub(crate) pending_len: *mut u32,
+    pub(crate) pending_cap: u32,
     pub(crate) meta: *const VsStreamMeta,
     pub(crate) meta_len: u32,
+    pub(crate) max_pending: u32,
+    pub(crate) overflowed: *mut u8,
 }
 
 /// Callback context for UTF-16 anchor stream scans.
@@ -514,14 +520,54 @@ pub(crate) struct VsStreamMatchCtx {
 /// - `pat_offsets[pat_count]` equals the number of `targets` entries.
 /// - `pat_lens` has length `pat_count`.
 /// - `base_offset` converts stream-local match offsets into absolute decoded offsets.
+/// - `pending_ptr` points to a writable buffer of `pending_cap` windows.
+/// - `pending_len` points to the current initialized length in `pending_ptr`.
+/// - `max_pending <= pending_cap`.
+/// - `overflowed` points to a live byte flag for the duration of the scan (`0`/`1`).
 #[repr(C)]
 pub(crate) struct VsUtf16StreamMatchCtx {
-    pub(crate) pending: *mut Vec<VsStreamWindow>,
+    pub(crate) pending_ptr: *mut VsStreamWindow,
+    pub(crate) pending_len: *mut u32,
+    pub(crate) pending_cap: u32,
     pub(crate) targets: *const VsAnchorTarget,
     pub(crate) pat_offsets: *const u32,
     pub(crate) pat_lens: *const u32,
     pub(crate) pat_count: u32,
     pub(crate) base_offset: u64,
+    pub(crate) max_pending: u32,
+    pub(crate) overflowed: *mut u8,
+}
+
+/// Appends a callback-produced window without triggering `Vec` growth.
+///
+/// # Safety
+/// - `pending_ptr` must point to a writable allocation of `pending_cap` windows.
+/// - `pending_len` must be a valid pointer to the initialized count for `pending_ptr`.
+/// - `overflowed` must be null or point to a writable `u8` flag.
+/// - No concurrent access to `pending_ptr`/`pending_len` may occur.
+#[inline(always)]
+unsafe fn push_stream_window_bounded(
+    pending_ptr: *mut VsStreamWindow,
+    pending_len: *mut u32,
+    pending_cap: u32,
+    max_pending: u32,
+    overflowed: *mut u8,
+    win: VsStreamWindow,
+) -> bool {
+    debug_assert!(!pending_ptr.is_null());
+    debug_assert!(!pending_len.is_null());
+    let len = unsafe { *pending_len };
+    if len >= max_pending || len >= pending_cap {
+        if !overflowed.is_null() {
+            unsafe { *overflowed = 1 };
+        }
+        return false;
+    }
+    unsafe {
+        pending_ptr.add(len as usize).write(win);
+        *pending_len = len + 1;
+    }
+    true
 }
 
 /// Stream-mode match callback. Pushes window seeds into `pending`.
@@ -546,15 +592,21 @@ unsafe extern "C" fn vs_on_stream_match(
     }
     let meta = *c.meta.add(id as usize);
     if meta.whole_buffer_on_hit != 0 {
-        let pending = &mut *c.pending;
-        pending.push(VsStreamWindow {
-            rule_id: id,
-            lo: 0,
-            hi: 0,
-            variant_idx: 0,
-            force_full: true,
-            anchor_hint: from,
-        });
+        let _ = push_stream_window_bounded(
+            c.pending_ptr,
+            c.pending_len,
+            c.pending_cap,
+            c.max_pending,
+            c.overflowed,
+            VsStreamWindow {
+                rule_id: id,
+                lo: 0,
+                hi: 0,
+                variant_idx: 0,
+                force_full: true,
+                anchor_hint: from,
+            },
+        );
         return 0;
     }
     let max_width = meta.max_width as u64;
@@ -563,17 +615,23 @@ unsafe extern "C" fn vs_on_stream_match(
     let hi = to.saturating_add(radius);
 
     // Clamp anchor hint to window bounds.
-    let anchor_hint = from.clamp(lo, to);
+    let anchor_hint = clamp_u64_ordered(from, lo, to);
 
-    let pending = &mut *c.pending;
-    pending.push(VsStreamWindow {
-        rule_id: id,
-        lo,
-        hi,
-        variant_idx: 0,
-        force_full: false,
-        anchor_hint,
-    });
+    let _ = push_stream_window_bounded(
+        c.pending_ptr,
+        c.pending_len,
+        c.pending_cap,
+        c.max_pending,
+        c.overflowed,
+        VsStreamWindow {
+            rule_id: id,
+            lo,
+            hi,
+            variant_idx: 0,
+            force_full: false,
+            anchor_hint,
+        },
+    );
     0
 }
 
@@ -648,24 +706,56 @@ unsafe extern "C" fn vs_utf16_stream_on_match(
     let off_start = *c.pat_offsets.add(pid) as usize;
     let off_end = *c.pat_offsets.add(pid + 1) as usize;
 
-    let pending = &mut *c.pending;
     for i in off_start..off_end {
         let target = *c.targets.add(i);
         let seed = target.seed_radius_bytes as u64;
         let lo = start.saturating_sub(seed);
         let hi = end.saturating_add(seed);
         // Clamp anchor hint to window bounds.
-        let anchor_hint = abs_from.clamp(lo, end);
-        pending.push(VsStreamWindow {
-            rule_id: target.rule_id,
-            lo,
-            hi,
-            variant_idx: target.variant_idx,
-            force_full: false,
-            anchor_hint,
-        });
+        let anchor_hint = clamp_u64_ordered(abs_from, lo, end);
+        if !push_stream_window_bounded(
+            c.pending_ptr,
+            c.pending_len,
+            c.pending_cap,
+            c.max_pending,
+            c.overflowed,
+            VsStreamWindow {
+                rule_id: target.rule_id,
+                lo,
+                hi,
+                variant_idx: target.variant_idx,
+                force_full: false,
+                anchor_hint,
+            },
+        ) {
+            return 0;
+        }
     }
     0
+}
+
+#[inline(always)]
+fn clamp_u32_ordered(v: u32, lo: u32, hi: u32) -> u32 {
+    debug_assert!(lo <= hi);
+    if v < lo {
+        lo
+    } else if v > hi {
+        hi
+    } else {
+        v
+    }
+}
+
+#[inline(always)]
+fn clamp_u64_ordered(v: u64, lo: u64, hi: u64) -> u64 {
+    debug_assert!(lo <= hi);
+    if v < lo {
+        lo
+    } else if v > hi {
+        hi
+    } else {
+        v
+    }
 }
 
 /// Returns the UTF-16 stream-mode match callback for anchor scanning.
@@ -1972,18 +2062,20 @@ extern "C" fn vs_on_match(
         let hi = end.saturating_add(seed).min(c.hay_len);
 
         // Clamp anchor hint to window bounds.
-        let anchor_hint = (from as u32).clamp(lo, end);
+        let anchor_hint = clamp_u32_ordered(from as u32, lo, end);
 
         let pair = rid * 3 + RAW_IDX;
-        scratch.hit_acc_pool.push_span(
-            pair,
-            SpanU32 {
-                start: lo,
-                end: hi,
-                anchor_hint,
-            },
-            &mut scratch.touched_pairs,
-        );
+        unsafe {
+            scratch.hit_acc_pool.push_span_unchecked_hot(
+                pair,
+                SpanU32 {
+                    start: lo,
+                    end: hi,
+                    anchor_hint,
+                },
+                &mut scratch.touched_pairs,
+            );
+        }
         return 0;
     }
 
@@ -2017,21 +2109,23 @@ extern "C" fn vs_on_match(
 
         // Anchor patterns are fixed-width; use the computed start as the hint to
         // avoid relying on `from` for prefilter-style callbacks.
-        let anchor_hint = start.clamp(lo, end);
+        let anchor_hint = clamp_u32_ordered(start, lo, end);
 
         let rid = target.rule_id as usize;
         let vidx = target.variant_idx as usize;
 
         let pair = rid * 3 + vidx;
-        scratch.hit_acc_pool.push_span(
-            pair,
-            SpanU32 {
-                start: lo,
-                end: hi,
-                anchor_hint,
-            },
-            &mut scratch.touched_pairs,
-        );
+        unsafe {
+            scratch.hit_acc_pool.push_span_unchecked_hot(
+                pair,
+                SpanU32 {
+                    start: lo,
+                    end: hi,
+                    anchor_hint,
+                },
+                &mut scratch.touched_pairs,
+            );
+        }
         if matches!(target.variant_idx, 1 | 2) {
             c.saw_utf16 = true;
         }
@@ -2082,21 +2176,23 @@ extern "C" fn vs_anchor_on_match(
 
         // Anchor patterns are fixed-width; use the computed start as the hint to
         // avoid relying on `from` for prefilter-style callbacks.
-        let anchor_hint = start.clamp(lo, end);
+        let anchor_hint = clamp_u32_ordered(start, lo, end);
 
         let rid = target.rule_id as usize;
         let vidx = target.variant_idx as usize;
 
         let pair = rid * 3 + vidx;
-        scratch.hit_acc_pool.push_span(
-            pair,
-            SpanU32 {
-                start: lo,
-                end: hi,
-                anchor_hint,
-            },
-            &mut scratch.touched_pairs,
-        );
+        unsafe {
+            scratch.hit_acc_pool.push_span_unchecked_hot(
+                pair,
+                SpanU32 {
+                    start: lo,
+                    end: hi,
+                    anchor_hint,
+                },
+                &mut scratch.touched_pairs,
+            );
+        }
         if matches!(target.variant_idx, 1 | 2) {
             c.saw_utf16 = true;
         }

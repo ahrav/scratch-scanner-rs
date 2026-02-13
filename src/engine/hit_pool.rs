@@ -309,16 +309,12 @@ impl HitAccPool {
     /// The output list remains unique within a scan epoch, enabling `reset_touched`
     /// to clear bits in O(#unique_touched) time.
     #[inline(always)]
-    pub(super) fn mark_touched(&mut self, pair: usize, touched_pairs: &mut ScratchVec<u32>) {
-        debug_assert!(pair < self.pair_count as usize);
-        // SAFETY: pair < pair_count, so pair / 64 < touched_word_count.
-        unsafe {
-            let word = self.touched_words.add(pair / 64);
-            let bit = 1u64 << (pair % 64);
-            if (*word & bit) == 0 {
-                *word |= bit;
-                touched_pairs.push(pair as u32);
-            }
+    unsafe fn mark_touched_unchecked(&mut self, pair: usize, touched_pairs: &mut ScratchVec<u32>) {
+        let word = unsafe { self.touched_words.add(pair / 64) };
+        let bit = 1u64 << (pair % 64);
+        if unsafe { (*word & bit) == 0 } {
+            unsafe { *word |= bit };
+            touched_pairs.push(pair as u32);
         }
     }
 
@@ -326,6 +322,7 @@ impl HitAccPool {
     ///
     /// Once the per-pair cap is exceeded, all hits are coalesced into a single
     /// span that conservatively covers every hit seen so far.
+    #[cfg(any(test, feature = "bench"))]
     #[inline(always)]
     pub(super) fn push_span(
         &mut self,
@@ -334,11 +331,29 @@ impl HitAccPool {
         touched_pairs: &mut ScratchVec<u32>,
     ) {
         debug_assert!(pair < self.pair_count as usize);
-        self.mark_touched(pair, touched_pairs);
+        unsafe { self.push_span_unchecked_hot(pair, span, touched_pairs) };
+    }
 
-        // Read len and coalesced as values so the mutable borrow of
-        // pair_meta does not extend across the coalesce_overflow call.
-        // SAFETY: pair < pair_count, pointer arithmetic is in bounds.
+    /// Hot unchecked insertion path used by scan callbacks.
+    ///
+    /// # Safety
+    /// - `pair < self.pair_count()`.
+    /// - `touched_pairs` must be valid mutable scratch state for this scan epoch.
+    /// - Caller must guarantee single-threaded access to this pool instance.
+    #[inline(always)]
+    pub(super) unsafe fn push_span_unchecked_hot(
+        &mut self,
+        pair: usize,
+        span: SpanU32,
+        touched_pairs: &mut ScratchVec<u32>,
+    ) {
+        debug_assert!(pair < self.pair_count as usize);
+        unsafe {
+            self.mark_touched_unchecked(pair, touched_pairs);
+        }
+
+        // Read len/coalesced as values so the mutable borrow of pair_meta
+        // doesn't extend across coalesce_overflow.
         let (len, coalesced) = unsafe {
             let m = &*self.pair_meta.add(pair);
             (m.len as usize, m.coalesced)
@@ -346,7 +361,6 @@ impl HitAccPool {
 
         if coalesced != 0 {
             // Expand coalesced window, preserving the earliest anchor hint.
-            // SAFETY: pair < pair_count.
             let c = unsafe { &mut *self.coalesced.add(pair) };
             c.start = c.start.min(span.start);
             c.end = c.end.max(span.end);
@@ -357,7 +371,6 @@ impl HitAccPool {
         let max_hits = self.max_hits as usize;
         if len < max_hits {
             let base = pair * max_hits;
-            // SAFETY: base + len < pair_count * max_hits (total window slots).
             unsafe {
                 *self.windows.add(base + len) = span;
                 (*self.pair_meta.add(pair)).len = (len + 1) as u16;
@@ -682,6 +695,46 @@ mod tests {
     #[test]
     fn rejects_max_hits_exceeding_u16() {
         assert!(HitAccPool::new(1, u16::MAX as usize + 1).is_err());
+    }
+
+    #[test]
+    fn unsafe_hot_path_matches_safe_behavior() {
+        let pair_count = 4usize;
+        let max_hits = 3usize;
+        let mut pool_safe = HitAccPool::new(pair_count, max_hits).unwrap();
+        let mut pool_hot = HitAccPool::new(pair_count, max_hits).unwrap();
+        let mut touched_safe = ScratchVec::<u32>::with_capacity(pair_count).unwrap();
+        let mut touched_hot = ScratchVec::<u32>::with_capacity(pair_count).unwrap();
+        let mut out_safe = ScratchVec::<SpanU32>::with_capacity(max_hits).unwrap();
+        let mut out_hot = ScratchVec::<SpanU32>::with_capacity(max_hits).unwrap();
+
+        let ops = [
+            (0usize, make_span(10, 20)),
+            (1usize, make_span(15, 25)),
+            (0usize, make_span(30, 40)),
+            (2usize, make_span(5, 9)),
+            (0usize, make_span(50, 60)),
+            (0usize, make_span(55, 80)), // overflow/coalesce for pair 0
+            (1usize, make_span(2, 100)),
+            (1usize, make_span(3, 110)),
+            (1usize, make_span(1, 120)), // overflow/coalesce for pair 1
+            (3usize, make_span(7, 8)),
+        ];
+
+        for (pair, span) in ops {
+            pool_safe.push_span(pair, span, &mut touched_safe);
+            unsafe {
+                pool_hot.push_span_unchecked_hot(pair, span, &mut touched_hot);
+            }
+        }
+
+        assert_eq!(touched_safe.as_slice(), touched_hot.as_slice());
+
+        for pair in 0..pair_count {
+            pool_safe.take_into(pair, &mut out_safe);
+            pool_hot.take_into(pair, &mut out_hot);
+            assert_eq!(out_safe.as_slice(), out_hot.as_slice(), "pair={pair}");
+        }
     }
 
     #[test]

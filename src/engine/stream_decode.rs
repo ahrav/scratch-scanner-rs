@@ -639,10 +639,23 @@ impl Engine {
             }
         };
 
+        // Callback sink is fixed-capacity: callbacks append via raw ptr/len/cap
+        // and set an overflow flag instead of triggering Vec growth in FFI.
+        let stream_pending_cap =
+            u32::try_from(scratch.vs_stream_matches.capacity()).unwrap_or(u32::MAX);
+        let max_stream_pending = u32::try_from(scratch.pending_windows.capacity())
+            .unwrap_or(u32::MAX)
+            .min(stream_pending_cap);
+        let mut vs_pending_len: u32 = 0;
+        let mut vs_match_overflowed: u8 = 0;
         let mut ctx = VsStreamMatchCtx {
-            pending: &mut scratch.vs_stream_matches as *mut Vec<_>,
+            pending_ptr: scratch.vs_stream_matches.as_mut_ptr(),
+            pending_len: (&mut vs_pending_len as *mut u32),
+            pending_cap: stream_pending_cap,
             meta: vs_stream.meta().as_ptr(),
             meta_len: vs_stream.meta().len() as u32,
+            max_pending: max_stream_pending,
+            overflowed: (&mut vs_match_overflowed as *mut u8),
         };
 
         let mut decoded_offset: u64 = 0;
@@ -730,6 +743,10 @@ impl Engine {
                 truncated = true;
                 return ControlFlow::Break(());
             }
+            if vs_match_overflowed != 0 {
+                force_full = true;
+                return ControlFlow::Break(());
+            }
 
             // ── Phase 5: Gate DB scan ─────────────────────────────────────
             if gate_db_active && gate_hit == 0 {
@@ -789,12 +806,16 @@ impl Engine {
                         };
                         let base_offset = scratch.decode_ring.start_offset();
                         let mut uctx = VsUtf16StreamMatchCtx {
-                            pending: &mut scratch.vs_stream_matches as *mut Vec<_>,
+                            pending_ptr: ctx.pending_ptr,
+                            pending_len: ctx.pending_len,
+                            pending_cap: ctx.pending_cap,
                             targets: db.targets().as_ptr(),
                             pat_offsets: db.pat_offsets().as_ptr(),
                             pat_lens: db.pat_lens().as_ptr(),
                             pat_count: db.pat_lens().len() as u32,
                             base_offset,
+                            max_pending: max_stream_pending,
+                            overflowed: (&mut vs_match_overflowed as *mut u8),
                         };
                         let (seg1, seg2) = scratch.decode_ring.segments();
                         if !seg1.is_empty()
@@ -811,6 +832,10 @@ impl Engine {
                             truncated = true;
                             return ControlFlow::Break(());
                         }
+                        if vs_match_overflowed != 0 {
+                            force_full = true;
+                            return ControlFlow::Break(());
+                        }
                         if !seg2.is_empty()
                             && db
                                 .scan_stream(
@@ -823,6 +848,10 @@ impl Engine {
                                 .is_err()
                         {
                             truncated = true;
+                            return ControlFlow::Break(());
+                        }
+                        if vs_match_overflowed != 0 {
+                            force_full = true;
                             return ControlFlow::Break(());
                         }
                         utf16_stream = Some(ustream);
@@ -850,13 +879,21 @@ impl Engine {
                                 truncated = true;
                                 return ControlFlow::Break(());
                             }
+                            if vs_match_overflowed != 0 {
+                                force_full = true;
+                                return ControlFlow::Break(());
+                            }
                         }
                     }
                 }
             }
 
             // ── Phase 7: Vectorscan match → PendingWindow enqueue ────────
-            if !scratch.vs_stream_matches.is_empty() {
+            if vs_pending_len != 0 {
+                // SAFETY: callbacks cap vs_pending_len to stream_pending_cap.
+                unsafe {
+                    scratch.vs_stream_matches.set_len(vs_pending_len as usize);
+                }
                 let max_hits = self.tuning.max_windows_per_rule_variant as u32;
                 let mut vs_matches = std::mem::take(&mut scratch.vs_stream_matches);
                 for win in vs_matches.drain(..) {
@@ -919,6 +956,7 @@ impl Engine {
                 }
                 vs_matches.clear();
                 scratch.vs_stream_matches = vs_matches;
+                vs_pending_len = 0;
                 if force_full {
                     return ControlFlow::Break(());
                 }
@@ -1140,6 +1178,15 @@ impl Engine {
         }
         if let Some(vs_utf16_scratch) = utf16_stream_scratch.take() {
             scratch.vs_utf16_stream_scratch = Some(vs_utf16_scratch);
+        }
+        if vs_pending_len != 0 {
+            // SAFETY: callbacks cap vs_pending_len to stream_pending_cap.
+            unsafe {
+                scratch.vs_stream_matches.set_len(vs_pending_len as usize);
+            }
+        }
+        if vs_match_overflowed != 0 {
+            force_full = true;
         }
 
         // ── Post-stream: force_full checkpoint 1 ─────────────────────────
