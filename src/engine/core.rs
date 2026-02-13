@@ -74,7 +74,7 @@ use super::rule_repr::{
     RuleCompiled, Target, TwoPhaseCompiled, Variant, NO_GATE,
 };
 use super::safelist::SafelistFilter;
-use super::scratch::{RootSpanMapCtx, ScanScratch};
+use super::scratch::{RootSpanMapCtx, ScanScratch, DEDUP_RULE_ID_MAX};
 use super::transform::{
     base64_char_count, base64_skip_chars, find_spans_into, transform_quick_trigger,
     STREAM_DECODE_CHUNK_BYTES,
@@ -239,11 +239,11 @@ pub struct Engine {
     /// per-scan scratch sizing derives from these values.
     pub(crate) tuning: Tuning,
 
-    /// Gate pools — indexed by `Option<u32>` gate IDs stored in [`RuleCompiled`].
+    /// Gate pools — indexed by `u32` IDs stored in [`RuleCompiled`], with
+    /// [`NO_GATE`] (`u32::MAX`) as the absent sentinel.
     ///
-    /// Each rule holds an `Option<u32>` index into the relevant pool. This
-    /// indirection keeps `RuleCompiled` small (no inline allocations) while
-    /// allowing gate data to be shared or deduplicated in the future.
+    /// This indirection keeps `RuleCompiled` small (no inline allocations)
+    /// while allowing gate data to be shared or deduplicated in the future.
     pub(super) confirm_all_gates: Vec<ConfirmAllCompiled>,
     pub(super) keyword_gates: Vec<KeywordsCompiled>,
     /// Value-level suppression patterns checked against extracted secret bytes.
@@ -513,7 +513,11 @@ impl Engine {
         );
 
         for (rid, r) in rules.iter().enumerate() {
-            assert!(rid <= u32::MAX as usize);
+            assert!(
+                rid <= DEDUP_RULE_ID_MAX as usize,
+                "rule index exceeds dedup key capacity ({})",
+                DEDUP_RULE_ID_MAX
+            );
             let rid_u32 = rid as u32;
             let mut manual_used = false;
             let mut add_manual =
