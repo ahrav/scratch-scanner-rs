@@ -110,6 +110,8 @@ pub use core::{
     BenchEntropyState, BenchMergeRangesState, BenchPackedPatterns, BenchUtf16DecodeState,
 };
 #[cfg(feature = "bench")]
+pub use hit_pool::BenchHitAccPool;
+#[cfg(feature = "bench")]
 pub use offline_validate::{
     bench_offline_validate_aws_access_key, bench_offline_validate_sentry_org_token,
 };
