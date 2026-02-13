@@ -1,9 +1,9 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use scanner_rs::{
-    bench_contains_all_memmem, bench_contains_any_memmem, bench_decode_utf16le,
-    bench_entropy_gate_passes, bench_extract_secret_span_locs, bench_hash128,
-    bench_map_utf16_decoded_offset, bench_merge_ranges, bench_pack_patterns_raw,
-    bench_shannon_entropy,
+    bench_build_entropy_state, bench_contains_all_memmem, bench_contains_any_memmem,
+    bench_decode_utf16le, bench_entropy_gate_passes_with_state, bench_extract_secret_span_locs,
+    bench_hash128, bench_map_utf16_decoded_offset, bench_merge_ranges, bench_pack_patterns_raw,
+    bench_shannon_entropy_with_state,
 };
 
 // ---------------------------------------------------------------------------
@@ -129,11 +129,13 @@ fn bench_entropy(c: &mut Criterion) {
         let low = make_low_entropy(sz);
 
         group.throughput(Throughput::Bytes(sz as u64));
+        let mut random_state = bench_build_entropy_state(max_len);
         group.bench_with_input(BenchmarkId::new("random", sz), &random, |b, data| {
-            b.iter(|| bench_shannon_entropy(black_box(data), max_len))
+            b.iter(|| bench_shannon_entropy_with_state(black_box(data), &mut random_state))
         });
+        let mut low_state = bench_build_entropy_state(max_len);
         group.bench_with_input(BenchmarkId::new("low_entropy", sz), &low, |b, data| {
-            b.iter(|| bench_shannon_entropy(black_box(data), max_len))
+            b.iter(|| bench_shannon_entropy_with_state(black_box(data), &mut low_state))
         });
     }
     group.finish();
@@ -144,11 +146,17 @@ fn bench_entropy(c: &mut Criterion) {
         let low = make_low_entropy(sz);
 
         group.throughput(Throughput::Bytes(sz as u64));
+        let mut random_state = bench_build_entropy_state(max_len);
         group.bench_with_input(BenchmarkId::new("random", sz), &random, |b, data| {
-            b.iter(|| bench_entropy_gate_passes(3.0, 16, max_len, black_box(data)))
+            b.iter(|| {
+                bench_entropy_gate_passes_with_state(3.0, 16, black_box(data), &mut random_state)
+            })
         });
+        let mut low_state = bench_build_entropy_state(max_len);
         group.bench_with_input(BenchmarkId::new("low_entropy", sz), &low, |b, data| {
-            b.iter(|| bench_entropy_gate_passes(3.0, 16, max_len, black_box(data)))
+            b.iter(|| {
+                bench_entropy_gate_passes_with_state(3.0, 16, black_box(data), &mut low_state)
+            })
         });
     }
     group.finish();
