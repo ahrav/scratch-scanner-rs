@@ -1,6 +1,6 @@
 # Kani Bounded Model Checking
 
-This document describes how scanner-rs uses [Kani](https://model-checking.github.io/kani/) for formal verification of `stdx` data structure invariants.
+This document describes how scanner-rs uses [Kani](https://model-checking.github.io/kani/) for formal verification of `stdx` data structures and selected core pipeline invariants.
 
 ## What is Kani?
 
@@ -47,7 +47,7 @@ CI note:
 
 ## Verified Properties
 
-Current source inventory (`#[kani::proof]`): **35 harnesses**.
+Current source inventory (`#[kani::proof]`): **49 harnesses**.
 
 | Suite | Source file | Harnesses |
 |-------|-------------|-----------|
@@ -55,6 +55,11 @@ Current source inventory (`#[kani::proof]`): **35 harnesses**.
 | DynamicBitSet | `src/stdx/bitset_tests.rs` | 12 |
 | AtomicBitSet | `src/stdx/atomic_bitset_tests.rs` | 6 |
 | AtomicSeenSets | `src/stdx/atomic_seen_sets_tests.rs` | 5 |
+| Identity Flags + Root Hint Normalization | `src/store/identity.rs` | 2 |
+| NodePoolType | `src/pool/node_pool.rs` | 5 |
+| ScratchVec | `src/scratch_memory.rs` | 5 |
+| PackPlan Shard Partitioning | `src/git_scan/pack_plan.rs` | 1 |
+| RunnerExec DAG Remaining Counters | `src/git_scan/runner_exec.rs` | 1 |
 
 ### TimingWheel Proofs
 
@@ -84,13 +89,18 @@ Located in `src/stdx/timing_wheel_tests.rs` under `#[cfg(kani)] mod kani_proofs`
 
 ### Additional Proof Suites
 
-All of the following live under `#[cfg(kani)] mod kani_proofs`:
+All of the following live under `#[cfg(kani)]` proof modules:
 
 | Suite | Source file | Harnesses | Coverage focus |
 |-------|-------------|-----------|----------------|
 | DynamicBitSet | `src/stdx/bitset_tests.rs` | 12 | set/unset roundtrips, padding invariant preservation, count/clear correctness, iterator consistency |
 | AtomicBitSet | `src/stdx/atomic_bitset_tests.rs` | 6 | test_and_set idempotency, bit independence, count bounds, clear correctness |
 | AtomicSeenSets | `src/stdx/atomic_seen_sets_tests.rs` | 5 | mark/is_seen roundtrips, cross-bitset independence, clear correctness |
+| Identity Flags + Root Hint Normalization | `src/store/identity.rs` | 2 | strict flag decoding acceptance/rejection and bounded normalization no-panic checks |
+| NodePoolType | `src/pool/node_pool.rs` | 5 | in-bounds acquire, non-overlap, release/reacquire slot reuse, free-count tracking, alignment |
+| ScratchVec | `src/scratch_memory.rs` | 5 | push/truncate/pop/extend/drain bounds and length invariants |
+| PackPlan Shard Partitioning | `src/git_scan/pack_plan.rs` | 1 | shard mapping is valid, complete, and balanced across bounded symbolic inputs |
+| RunnerExec DAG Remaining Counters | `src/git_scan/runner_exec.rs` | 1 | bounded acyclic dependency graphs do not underflow remaining counters |
 
 ## Bounded Sizes Rationale
 

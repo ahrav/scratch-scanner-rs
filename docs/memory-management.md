@@ -8,7 +8,8 @@ The unified filesystem entrypoint (`scanner-rs scan fs`) now uses
 `src/scheduler/local_fs_owner.rs`:
 
 - One thread per worker.
-- Round-robin dispatch assigns discovered files to workers.
+- Discovery pushes file batches into a shared injector; workers pull tasks via
+  work-stealing.
 - Each worker owns and reuses its own chunk buffer, overlap state, pending
   findings vector, and scan scratch.
 - There is no cross-thread chunk handoff between I/O and scan stages.

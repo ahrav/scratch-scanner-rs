@@ -279,7 +279,7 @@ avoid re-interning in the engine adapter.
 
 Pack execution inflates and applies deltas for packed objects, emitting blob
 payloads to the engine adapter. A tiered pack cache keeps decoded bases hot:
-Tier A stores <=64 KiB objects, Tier B stores <=512 KiB objects. Both tiers
+Tier A stores <=64 KiB objects, Tier B stores <=2 MiB objects. Both tiers
 use fixed-size slots with CLOCK eviction and preallocated storage, so hot-path
 lookups and inserts stay allocation-free and deterministic.
 

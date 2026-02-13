@@ -3,6 +3,16 @@
 //! Rules can be loaded from an external YAML file at runtime, or from the
 //! built-in set embedded via `include_str!`. The YAML schema mirrors `RuleSpec`
 //! fields and uses the same `build_regex()` + `assert_valid()` validation.
+//!
+//! # Invariants
+//!
+//! - Runtime file loading always returns structured `RulesError` values for
+//!   parse/validation failures.
+//! - Built-in rules are parsed/validated lazily on first use via `OnceLock`,
+//!   then cloned from cache; invalid embedded YAML is treated as a programming
+//!   error and panics.
+//! - Regex compilation uses progressive size tiers so one complex rule does not
+//!   require raising memory limits globally.
 
 pub(crate) mod yaml;
 
@@ -21,7 +31,11 @@ const REGEX_SIZE_LIMITS: &[usize] = &[32 * 1024 * 1024, 128 * 1024 * 1024, 512 *
 
 /// Build a bytes regex with increasing size limits.
 ///
-/// Returns an error if the pattern is invalid or exceeds the maximum configured limits.
+/// This retries only `CompiledTooBig` failures at higher limits; all other
+/// regex errors return immediately.
+///
+/// Returns an error if the pattern is invalid or still exceeds the largest
+/// configured limit.
 pub(crate) fn build_regex(pattern: &str) -> Result<Regex, String> {
     for &limit in REGEX_SIZE_LIMITS {
         let mut builder = regex::bytes::RegexBuilder::new(pattern);
@@ -101,13 +115,31 @@ impl std::error::Error for RulesError {
     }
 }
 
+/// Read rule YAML text from `path`.
+///
+/// This is separated from parsing so callers can compute provenance metadata
+/// (for example, content hashes) and then parse exactly the same bytes.
+pub(crate) fn read_rules_text(path: &Path) -> Result<String, RulesError> {
+    let content = std::fs::read_to_string(path).map_err(RulesError::Io)?;
+    Ok(content)
+}
+
 /// Load and validate rules from a YAML file.
 ///
-/// Reads the file, parses it via [`yaml::parse_yaml_rules`], then runs
-/// `assert_valid()` on each rule (catching panics as `Validation` errors).
+/// Test-only convenience wrapper around [`read_rules_text`] plus
+/// [`load_rules_from_content`].
+#[cfg(test)]
 pub(crate) fn load_rules(path: &Path) -> Result<Vec<RuleSpec>, RulesError> {
-    let content = std::fs::read_to_string(path).map_err(RulesError::Io)?;
-    let rules = yaml::parse_yaml_rules(&content)?;
+    let content = read_rules_text(path)?;
+    load_rules_from_content(&content)
+}
+
+/// Parse and validate rules from YAML content already in memory.
+///
+/// This is used by callers that need to hash/log the exact bytes first, then
+/// parse and validate those same bytes without re-reading from disk.
+pub(crate) fn load_rules_from_content(content: &str) -> Result<Vec<RuleSpec>, RulesError> {
+    let rules = yaml::parse_yaml_rules(content)?;
     if rules.is_empty() {
         return Err(RulesError::NoRules);
     }
@@ -148,6 +180,7 @@ pub(crate) fn load_rules(path: &Path) -> Result<Vec<RuleSpec>, RulesError> {
 ///
 /// Returns `None` if the executable path cannot be determined (e.g., `/proc`
 /// not mounted in containers, or the binary has no parent directory).
+/// The returned path is a candidate location and may not exist.
 pub(crate) fn default_rules_path() -> Option<PathBuf> {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -162,11 +195,40 @@ pub(crate) fn default_rules_path() -> Option<PathBuf> {
 /// The built-in rule set, embedded from `default_rules.yaml` at compile time.
 const BUILTIN_RULES_YAML: &str = include_str!("../../default_rules.yaml");
 
+/// Deterministic hasher for rule-content provenance fingerprints.
+///
+/// Seeds are fixed to preserve existing startup hash behavior.
+const RULE_CONTENT_HASHER: ahash::RandomState = ahash::RandomState::with_seeds(
+    0x524C_5348_3031,
+    0xA341_6F5D_19B2_CC93,
+    0x9E37_79B9_7F4A_7C15,
+    0xD1B5_4A32_D192_ED03,
+);
+
+/// Hash arbitrary rule content bytes into a deterministic 64-bit fingerprint.
+///
+/// This is a non-cryptographic hash intended for provenance logs.
+#[inline]
+pub(crate) fn rules_content_hash64(bytes: &[u8]) -> u64 {
+    RULE_CONTENT_HASHER.hash_one(bytes)
+}
+
+/// Hash the built-in rule YAML into a deterministic 64-bit fingerprint.
+///
+/// Suitable for startup provenance logs when using the compile-time fallback.
+#[inline]
+pub(crate) fn builtin_rules_hash64() -> u64 {
+    rules_content_hash64(BUILTIN_RULES_YAML.as_bytes())
+}
+
 /// Parse and return the built-in rule set.
 ///
 /// This replaces the old `gitleaks_rules()` function. Rules are parsed and
 /// compiled once (via `OnceLock`) then cloned on subsequent calls, avoiding
 /// repeated memory leaks from `Box::leak` in the YAML parser.
+///
+/// Panics if embedded YAML is invalid or empty, because that indicates a
+/// build-time packaging/programming error, not runtime user input.
 pub(crate) fn builtin_rules() -> Vec<RuleSpec> {
     static BUILTIN: OnceLock<Vec<RuleSpec>> = OnceLock::new();
     BUILTIN
@@ -298,5 +360,27 @@ mod tests {
     #[test]
     fn build_regex_invalid_pattern() {
         assert!(build_regex(r"[unclosed").is_err());
+    }
+
+    #[test]
+    fn rules_content_hash64_is_stable_and_formats_as_u64_hex() {
+        let h1 = rules_content_hash64(b"rules: []\n");
+        let h2 = rules_content_hash64(b"rules: []\n");
+        let h3 = rules_content_hash64(b"rules:\n- name: x\n");
+        assert_eq!(h1, h2, "same bytes should hash identically");
+        assert_ne!(h1, h3, "different bytes should generally hash differently");
+        assert_eq!(
+            format!("{h1:016x}").len(),
+            16,
+            "u64 fingerprint should format as 16 hex chars"
+        );
+    }
+
+    #[test]
+    fn builtin_rules_hash64_matches_builtin_yaml_hash() {
+        assert_eq!(
+            builtin_rules_hash64(),
+            rules_content_hash64(BUILTIN_RULES_YAML.as_bytes())
+        );
     }
 }

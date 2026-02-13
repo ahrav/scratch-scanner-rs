@@ -14,7 +14,7 @@
 //!
 //! # Lifecycle
 //!
-//! 1. Load rules (YAML file → fallback to compiled-in set).
+//! 1. Load rules (`--rules` override → executable-dir YAML → compiled-in fallback).
 //! 2. Apply `--transforms` filter and build the detection [`Engine`].
 //! 3. Construct the [`EventSink`] for the selected output format.
 //! 4. Run the source driver (FS or Git), which emits `Finding` /
@@ -27,6 +27,16 @@
 //! - Human-readable and machine-parseable `key=value` summaries are written
 //!   to stderr on successful FS/Git scans for backward-compatible tooling.
 //! - Fatal configuration failures exit with status code `2`.
+//!
+//! # Rule Source Invariants
+//!
+//! - At most one rule source is chosen per run, using a strict precedence order.
+//! - The executable-dir default candidate is selected only when a probe confirms
+//!   that it exists on disk.
+//! - Probe failures for the executable-dir default emit a warning and fall back
+//!   to built-in rules.
+//! - Built-in fallback remains available even when path discovery fails, so startup
+//!   never depends on host filesystem layout.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -1180,30 +1190,132 @@ fn apply_transform_filter(
 
 /// Load rules from a YAML file, falling back to the compiled-in set.
 ///
-/// Fallback chain: explicit path > `default_rules.yaml` next to binary > `demo_rules()`.
-fn load_rules_for_scan(rules_file: Option<&Path>) -> Vec<RuleSpec> {
-    let path = match rules_file {
-        Some(p) => p.to_path_buf(),
-        None => match crate::rules::default_rules_path() {
-            Some(p) if p.exists() => {
-                eprintln!("info: loading rules from {}", p.display());
-                p
+/// Fallback chain:
+/// `--rules` override > `default_rules.yaml` next to binary > compiled-in fallback.
+///
+/// This helper exits the process with code `2` on read/parse failures because
+/// rule configuration errors are treated as fatal startup misconfiguration.
+/// Provenance and a deterministic fast content fingerprint are emitted for diagnostics.
+///
+/// Resolved provenance for the rule set selected for a scan.
+///
+/// # Invariants
+/// - `Explicit` stores the CLI-provided path as-is; existence/readability are
+///   validated by the loader.
+/// - `ExecutableDefault` is selected only when probing confirms the file exists.
+/// - `BuiltInFallback` stores the probed executable-dir candidate path for
+///   diagnostics even when absent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RuleSource {
+    Explicit(PathBuf),
+    ExecutableDefault(PathBuf),
+    BuiltInFallback {
+        executable_default_path: Option<PathBuf>,
+    },
+}
+
+impl RuleSource {
+    #[inline]
+    const fn source_label(&self) -> &'static str {
+        match self {
+            Self::Explicit(_) => "explicit",
+            Self::ExecutableDefault(_) => "executable-default",
+            Self::BuiltInFallback { .. } => "built-in",
+        }
+    }
+}
+
+/// Resolve which rule source to use according to precedence.
+///
+/// Explicit `--rules` paths are accepted without existence checks so downstream
+/// loader diagnostics can report precise read/parse failures. Default candidates
+/// are accepted only if `try_exists()` confirms they exist; probe failures emit
+/// an explicit warning before falling back.
+fn resolve_rule_source(
+    rules_file: Option<&Path>,
+    executable_default_path: Option<&Path>,
+) -> RuleSource {
+    if let Some(path) = rules_file {
+        return RuleSource::Explicit(path.to_path_buf());
+    }
+    if let Some(path) = executable_default_path {
+        match path.try_exists() {
+            Ok(true) => return RuleSource::ExecutableDefault(path.to_path_buf()),
+            Ok(false) => {}
+            Err(err) => {
+                eprintln!(
+                    "warning: failed to probe default_rules.yaml next to executable: {err}; using compiled-in fallback"
+                );
             }
-            _ => {
-                let rules = demo_rules();
-                eprintln!("info: using compiled-in rule set ({} rules)", rules.len());
-                return rules;
-            }
-        },
+        }
+    }
+    RuleSource::BuiltInFallback {
+        executable_default_path: executable_default_path.map(Path::to_path_buf),
+    }
+}
+
+/// Load and parse rules from `path`, returning `(rules, hash)`.
+///
+/// The file is read once up front to compute a provenance hash and parsed from
+/// that same in-memory content to avoid hash/parse skew. Any failure exits the
+/// process with code `2`.
+fn load_rules_from_path(path: &Path, source: &RuleSource) -> (Vec<RuleSpec>, u64) {
+    let content = match crate::rules::read_rules_text(path) {
+        Ok(content) => content,
+        Err(e) => {
+            eprintln!("error: failed to read rules from {}: {e}", path.display());
+            std::process::exit(2);
+        }
     };
-    match crate::rules::load_rules(&path) {
+    let hash = crate::rules::rules_content_hash64(content.as_bytes());
+    match crate::rules::load_rules_from_content(&content) {
         Ok(rules) => {
-            eprintln!("info: loaded {} rules from {}", rules.len(), path.display());
-            rules
+            eprintln!(
+                "info: loaded {} rules from {} (source: {}, rule_hash: {hash:016x})",
+                rules.len(),
+                path.display(),
+                source.source_label()
+            );
+            (rules, hash)
         }
         Err(e) => {
             eprintln!("error: failed to load rules from {}: {e}", path.display());
             std::process::exit(2);
+        }
+    }
+}
+
+/// Load the rule set for a scan run with deterministic fallback precedence.
+///
+/// # Selection order
+/// 1. `--rules` explicit path
+/// 2. `default_rules.yaml` next to the executable
+/// 3. Compile-time embedded fallback (`default_rules.yaml`)
+///
+/// # Effects
+/// - Emits provenance logs (source label and deterministic fast hash fingerprint).
+/// - Exits with status `2` if a selected on-disk source (explicit or
+///   executable-default) cannot be read/parsed.
+fn load_rules_for_scan(rules_file: Option<&Path>) -> Vec<RuleSpec> {
+    let executable_default_path = crate::rules::default_rules_path();
+    let source = resolve_rule_source(rules_file, executable_default_path.as_deref());
+    match &source {
+        RuleSource::Explicit(path) | RuleSource::ExecutableDefault(path) => {
+            let (rules, _) = load_rules_from_path(path, &source);
+            rules
+        }
+        RuleSource::BuiltInFallback { .. } => {
+            let rules = demo_rules();
+            let built_in_hash = crate::rules::builtin_rules_hash64();
+            eprintln!(
+                "warning: no usable default_rules.yaml found next to executable; using compiled-in fallback"
+            );
+            eprintln!(
+                "info: using compiled-in rule set ({} rules, source: {}, rule_hash: {built_in_hash:016x})",
+                rules.len(),
+                source.source_label()
+            );
+            rules
         }
     }
 }
@@ -1213,12 +1325,155 @@ mod tests {
     use super::*;
     use crate::api::{TransformConfig, TransformId};
 
+    fn touch_default_rules_file(path: &Path) {
+        std::fs::write(path, "rules: []\n").expect("write default_rules.yaml");
+    }
+
     fn test_transforms() -> Vec<TransformConfig> {
         crate::demo_transforms()
     }
 
     fn ids(ts: &[TransformConfig]) -> Vec<TransformId> {
         ts.iter().map(|t| t.id).collect()
+    }
+
+    #[test]
+    fn rules_hash_is_stable_and_hex_sized() {
+        let h1 = crate::rules::rules_content_hash64(b"rules: []\n");
+        let h2 = crate::rules::rules_content_hash64(b"rules: []\n");
+        let h3 = crate::rules::rules_content_hash64(b"rules:\n- name: x\n");
+        assert_eq!(h1, h2, "same bytes should hash identically");
+        assert_ne!(h1, h3, "different bytes should generally hash differently");
+        let h1_hex = format!("{h1:016x}");
+        assert_eq!(
+            h1_hex.len(),
+            16,
+            "u64 fingerprint should format as 16 hex chars"
+        );
+        assert!(h1_hex.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn resolve_rule_source_prefers_explicit_path_over_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let explicit = dir.path().join("custom_rules.yaml");
+        let executable_default = dir.path().join("exe_default_rules.yaml");
+        touch_default_rules_file(&explicit);
+        touch_default_rules_file(&executable_default);
+
+        let source = resolve_rule_source(Some(&explicit), Some(executable_default.as_path()));
+        assert_eq!(source, RuleSource::Explicit(explicit));
+    }
+
+    #[test]
+    fn resolve_rule_source_uses_executable_default_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable_default = dir.path().join("exe_default_rules.yaml");
+        touch_default_rules_file(&executable_default);
+
+        let source = resolve_rule_source(None, Some(executable_default.as_path()));
+        assert_eq!(source, RuleSource::ExecutableDefault(executable_default));
+    }
+
+    #[test]
+    fn resolve_rule_source_falls_back_to_builtin_when_default_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable_default = dir.path().join("exe_default_rules.yaml");
+
+        let source = resolve_rule_source(None, Some(executable_default.as_path()));
+        assert_eq!(
+            source,
+            RuleSource::BuiltInFallback {
+                executable_default_path: Some(executable_default),
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_rules_from_path_hash_tracks_loaded_content() {
+        use std::ffi::CString;
+        use std::fs::File;
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::fd::FromRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        use std::thread;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fifo_path = dir.path().join("rules.fifo");
+        let fifo_cstr = CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
+        let mkfifo_rc = unsafe { libc::mkfifo(fifo_cstr.as_ptr(), 0o600) };
+        assert_eq!(
+            mkfifo_rc,
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let first_yaml = r#"rules:
+  - name: "fifo-first"
+    regex: "sk_live_[a-z0-9]{24}"
+    anchors: ["sk_live_"]
+    radius: 64
+"#;
+        let second_yaml = r#"rules:
+  - name: "fifo-second"
+    regex: "ghp_[A-Za-z0-9]{36}"
+    anchors: ["ghp_"]
+    radius: 64
+"#;
+        let first_hash = crate::rules::rules_content_hash64(first_yaml.as_bytes());
+        let second_hash = crate::rules::rules_content_hash64(second_yaml.as_bytes());
+
+        let writer_fifo = fifo_path.clone();
+        let first_payload = first_yaml.to_owned();
+        let second_payload = second_yaml.to_owned();
+        let writer = thread::spawn(move || -> bool {
+            {
+                let mut stream = OpenOptions::new().write(true).open(&writer_fifo).unwrap();
+                stream.write_all(first_payload.as_bytes()).unwrap();
+            }
+            // Ensure reader #1 can observe EOF before probing reader #2.
+            thread::sleep(Duration::from_millis(20));
+            let writer_cstr = CString::new(writer_fifo.as_os_str().as_bytes()).unwrap();
+            for _ in 0..100 {
+                let fd =
+                    unsafe { libc::open(writer_cstr.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+                if fd >= 0 {
+                    let mut stream = unsafe { File::from_raw_fd(fd) };
+                    stream.write_all(second_payload.as_bytes()).unwrap();
+                    return true;
+                }
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::ENXIO) {
+                    panic!("unexpected second-write open error: {err}");
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+            false
+        });
+
+        let source = RuleSource::Explicit(fifo_path.clone());
+        let (rules, observed_hash) = load_rules_from_path(&fifo_path, &source);
+        let second_write_consumed = writer.join().unwrap();
+
+        assert_eq!(rules.len(), 1, "test YAML contains exactly one rule");
+        let expected_hash = match rules[0].name {
+            "fifo-first" => first_hash,
+            "fifo-second" => second_hash,
+            other => panic!("unexpected loaded rule name: {other}"),
+        };
+        assert_eq!(
+            observed_hash, expected_hash,
+            "rule_hash must represent the bytes that were actually parsed"
+        );
+        assert_eq!(
+            second_write_consumed,
+            rules[0].name == "fifo-second",
+            "second payload should only be consumed when a second read occurs"
+        );
     }
 
     #[test]

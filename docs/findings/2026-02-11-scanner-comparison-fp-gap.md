@@ -2,7 +2,7 @@
 
 **Date:** 2026-02-11
 **Branch:** `chore/cli-cleanup`
-**Scanners:** scanner-rs (222 rules), kingfisher (216 matched rules), gitleaks (222 rules)
+**Scanners:** scanner-rs (222 rules at run time; 223 built-in rules as of 2026-02-13), kingfisher (216 matched rules), gitleaks (222 rules)
 
 ## Objective
 
@@ -19,7 +19,7 @@ kingfisher applies offline filters that scanner-rs lacks.
 | CPU | Apple M1 Pro — 10 cores |
 | RAM | 32 GiB unified memory |
 | OS | macOS (Darwin 25.2.0) |
-| scanner-rs | 222 built-in rules, `--anchors=manual --event-format=jsonl --no-archives` |
+| scanner-rs | 222 built-in rules at run time (223 as of 2026-02-13), `--anchors=manual --event-format=jsonl --no-archives` |
 | kingfisher | 216 matched rules, `--no-validate --no-dedup --no-extract-archives` |
 | gitleaks | 222 rules (gitleaks.toml), `--max-archive-depth 0` |
 | Data | Clean copies without `.git` (rsync --exclude='.git') |
