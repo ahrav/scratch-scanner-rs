@@ -197,10 +197,11 @@ const fn build_b64_decode_table() -> [u8; 256] {
 
 /// Extended base64 decode table that also classifies whitespace.
 ///
-/// Like `B64_DECODE` but maps `' '`, `'\n'`, `'\r'`, `'\t'` to `B64_WS_SENTINEL`
-/// (0xFE) instead of `B64_INVALID`. This lets the decoder's inner loop replace
-/// a 4-comparison `matches!` whitespace check + separate table lookup with a
-/// single table lookup and two comparisons.
+/// Like the base table produced by [`build_b64_decode_table`], but maps
+/// `' '`, `'\n'`, `'\r'`, `'\t'` to `B64_WS_SENTINEL` (0xFE) instead of
+/// `B64_INVALID`. This lets the decoder's inner loop replace a 4-comparison
+/// `matches!` whitespace check + separate table lookup with a single table
+/// lookup and two comparisons.
 const fn build_b64_decode_ex_table() -> [u8; 256] {
     let mut table = build_b64_decode_table();
     table[b' ' as usize] = B64_WS_SENTINEL;
@@ -733,8 +734,8 @@ pub(super) fn find_url_spans_into(
 /// - `on_bytes` may be called multiple times; chunk boundaries are arbitrary.
 ///
 /// # Errors
-/// Currently infallible; the error type is reserved for test helpers that
-/// enforce maximum output size.
+/// This function is infallible. The callback can stop decoding early by
+/// returning `ControlFlow::Break(())`.
 fn stream_decode_url_percent(
     input: &[u8],
     plus_to_space: bool,
