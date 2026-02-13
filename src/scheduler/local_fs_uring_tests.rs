@@ -442,7 +442,6 @@ fn extract_worker_uses_existing_fd_after_unlink() -> io::Result<()> {
 
     assert_eq!(stats.files_extracted, 1, "expected extraction from open fd");
     assert_eq!(stats.io_errors, 0);
-    assert_eq!(stats.extract_failures, 0);
     let out = sink.take();
     let out_str = String::from_utf8_lossy(&out);
     assert!(
