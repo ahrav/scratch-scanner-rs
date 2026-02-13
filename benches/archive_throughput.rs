@@ -302,7 +302,6 @@ fn bench_targz_throughput(c: &mut Criterion) {
 
             b.iter(|| {
                 sink.total_bytes = 0;
-                stats = ArchiveStats::default();
                 let reader = Cursor::new(black_box(targz.as_slice()));
                 let result: Result<ArchiveEnd, io::Error> = scan_targz_stream(
                     reader,
@@ -314,6 +313,10 @@ fn bench_targz_throughput(c: &mut Criterion) {
                 );
                 black_box(result.unwrap());
                 black_box(sink.total_bytes);
+                debug_assert_eq!(
+                    sink.total_bytes, decompressed_total,
+                    "sink byte count mismatch: scan may have dropped data"
+                );
             });
         });
     }
@@ -357,7 +360,6 @@ fn bench_budget_overhead(c: &mut Criterion) {
 
         b.iter(|| {
             sink.total_bytes = 0;
-            stats = ArchiveStats::default();
             let reader = Cursor::new(black_box(targz_small.as_slice()));
             let result: Result<ArchiveEnd, io::Error> = scan_targz_stream(
                 reader,
@@ -368,6 +370,8 @@ fn bench_budget_overhead(c: &mut Criterion) {
                 &mut stats,
             );
             black_box(result.unwrap());
+            black_box(sink.total_bytes);
+            debug_assert!(sink.total_bytes > 0, "sink received no bytes");
         });
     });
 
