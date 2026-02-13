@@ -386,7 +386,7 @@ pub(super) struct Base64SpanStream {
     /// Absolute offset of the last base64 byte (including `=`); span ends at
     /// `last_b64 + 1`.
     last_b64: u64,
-    /// True iff `on_span` returned false; stream is inert until `reset()`.
+    /// True iff `on_span` returned false; stream is inert afterward.
     done: bool,
 }
 
@@ -414,7 +414,7 @@ impl Base64SpanStream {
     /// `base_offset` (typically contiguous) so runs can span chunk boundaries.
     /// Spans are reported as half-open absolute ranges trimmed to the last
     /// base64 byte. Returning `false` from `on_span` stops the scan early; the
-    /// stream must be `reset()` before reuse.
+    /// stream becomes inert afterward.
     pub(super) fn feed<F>(&mut self, chunk: &[u8], base_offset: u64, mut on_span: F)
     where
         F: FnMut(u64, u64) -> bool,
@@ -613,7 +613,10 @@ impl SpanSink for ScratchVec<Range<usize>> {
     }
 }
 
-// SpanU32 stores offsets as u32; callers must ensure spans fit in u32.
+/// [`SpanSink`] for the compact `SpanU32` representation.
+///
+/// Callers must ensure all span offsets fit in `u32`; overflow is not checked
+/// here (it is the engine's responsibility to reject buffers larger than 4 GiB).
 impl SpanSink for ScratchVec<SpanU32> {
     fn clear(&mut self) {
         ScratchVec::clear(self);
