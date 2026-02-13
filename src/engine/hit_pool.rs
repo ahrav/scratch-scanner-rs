@@ -98,6 +98,8 @@ struct PairMeta {
     _pad: u8,
 }
 
+const _: () = assert!(std::mem::size_of::<PairMeta>() == 4);
+
 impl PairMeta {
     const ZERO: Self = Self {
         len: 0,
@@ -135,8 +137,15 @@ impl PairMeta {
 ///   single-load access.
 ///
 /// # Safety
-/// - All raw pointer accesses are guarded by `debug_assert!(pair < pair_count)`.
-/// - `Drop` reconstructs `Vec` from raw parts for correct deallocation.
+/// - `new()` validates allocation sizes (`pair_count`, `max_hits`,
+///   `pair_count * max_hits`) before any pointer arithmetic is used.
+/// - Allocations use `Vec::into_boxed_slice()` → `Box::into_raw()` so the
+///   stored pointer's layout exactly matches the length; `Drop` reconstructs
+///   `Box<[T]>` via `Box::from_raw(slice_from_raw_parts_mut(..))`.
+/// - Hot-path methods require `pair < pair_count`; debug assertions are
+///   diagnostic only and are not a release-mode safety boundary.
+/// - `reset_touched` requires that `touched_pairs` entries originate from
+///   `mark_touched` for this pool instance.
 /// - `unsafe impl Send`: raw pointers are exclusively owned (same pattern as
 ///   `ScratchVec`).
 pub(super) struct HitAccPool {
@@ -144,8 +153,9 @@ pub(super) struct HitAccPool {
     pair_count: u32,
     /// `ceil(pair_count / 64)` — number of `u64` words in the touched bitset.
     touched_word_count: u32,
-    /// Explicit padding so the pointer fields start at an 8-byte boundary,
-    /// keeping the struct layout predictable across platforms.
+    /// Explicit padding making the 8-byte alignment of pointer fields
+    /// visible in the source rather than relying on implicit `#[repr(C)]`
+    /// padding rules.
     _pad: u32,
     // Raw pointers to exclusively-owned heap allocations.
     // All arrays are fixed-size after construction.
@@ -167,25 +177,29 @@ impl Drop for HitAccPool {
         let max_hits = self.max_hits as usize;
         let word_count = self.touched_word_count as usize;
 
-        // Reconstruct Vecs from raw parts and let them drop.
-        // SAFETY: Each pointer was obtained from Vec::into_raw_parts()-equivalent
-        // (as_mut_ptr + mem::forget) with the exact capacity stored in the struct.
-        // No other code has taken ownership of these allocations.
+        // Reconstruct Box<[T]> from raw parts and let them drop.
+        // SAFETY: Each pointer was obtained from Box::into_raw on a boxed
+        // slice with the exact length stored in the struct. No other code
+        // has taken ownership of these allocations.
         unsafe {
             // Cannot overflow: `new()` already validated via checked_mul.
-            let total_windows = pair_count.saturating_mul(max_hits);
-            drop(Vec::from_raw_parts(self.pair_meta, pair_count, pair_count));
-            drop(Vec::from_raw_parts(
+            let total_windows = pair_count * max_hits;
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                self.pair_meta,
+                pair_count,
+            )));
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
                 self.windows,
                 total_windows,
-                total_windows,
-            ));
-            drop(Vec::from_raw_parts(self.coalesced, pair_count, pair_count));
-            drop(Vec::from_raw_parts(
+            )));
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                self.coalesced,
+                pair_count,
+            )));
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
                 self.touched_words,
                 word_count,
-                word_count,
-            ));
+            )));
         }
     }
 }
@@ -215,36 +229,38 @@ impl HitAccPool {
 
         let word_count = pair_count.div_ceil(64);
 
-        // Allocate via Vec, then take ownership of the raw pointer.
-        let mut meta_vec = vec![PairMeta::ZERO; pair_count];
-        let pair_meta = meta_vec.as_mut_ptr();
-        std::mem::forget(meta_vec);
+        // Allocate via Vec, shrink to exact capacity with into_boxed_slice(),
+        // then take ownership of the raw pointer via Box::into_raw(). This
+        // guarantees the pointer's allocation layout matches the length stored
+        // in the struct, regardless of allocator over-provisioning.
+        let pair_meta =
+            Box::into_raw(vec![PairMeta::ZERO; pair_count].into_boxed_slice()) as *mut PairMeta;
 
-        let mut win_vec = vec![
-            SpanU32 {
-                start: 0,
-                end: 0,
-                anchor_hint: 0
-            };
-            total
-        ];
-        let windows = win_vec.as_mut_ptr();
-        std::mem::forget(win_vec);
+        let windows = Box::into_raw(
+            vec![
+                SpanU32 {
+                    start: 0,
+                    end: 0,
+                    anchor_hint: 0,
+                };
+                total
+            ]
+            .into_boxed_slice(),
+        ) as *mut SpanU32;
 
-        let mut coal_vec = vec![
-            SpanU32 {
-                start: 0,
-                end: 0,
-                anchor_hint: 0
-            };
-            pair_count
-        ];
-        let coalesced = coal_vec.as_mut_ptr();
-        std::mem::forget(coal_vec);
+        let coalesced = Box::into_raw(
+            vec![
+                SpanU32 {
+                    start: 0,
+                    end: 0,
+                    anchor_hint: 0,
+                };
+                pair_count
+            ]
+            .into_boxed_slice(),
+        ) as *mut SpanU32;
 
-        let mut touched_vec = vec![0u64; word_count];
-        let touched_words = touched_vec.as_mut_ptr();
-        std::mem::forget(touched_vec);
+        let touched_words = Box::into_raw(vec![0u64; word_count].into_boxed_slice()) as *mut u64;
 
         Ok(Self {
             max_hits: max_hits_u32,
@@ -274,8 +290,10 @@ impl HitAccPool {
     #[inline(always)]
     pub(super) fn reset_touched(&mut self, touched_pairs: &[u32]) {
         let words = self.touched_words;
+        let pair_count = self.pair_count as usize;
         for &p in touched_pairs {
             let idx = p as usize;
+            debug_assert!(idx < pair_count);
             // SAFETY: p < pair_count, so idx / 64 < touched_word_count.
             unsafe {
                 let word = words.add(idx / 64);
@@ -287,7 +305,7 @@ impl HitAccPool {
     /// Record `pair` as touched (idempotent). First touch appends to `touched_pairs`.
     #[inline(always)]
     pub(super) fn mark_touched(&mut self, pair: usize, touched_pairs: &mut ScratchVec<u32>) {
-        debug_assert!((pair as u32) < self.pair_count);
+        debug_assert!(pair < self.pair_count as usize);
         // SAFETY: pair < pair_count, so pair / 64 < touched_word_count.
         unsafe {
             let word = self.touched_words.add(pair / 64);
@@ -310,13 +328,18 @@ impl HitAccPool {
         span: SpanU32,
         touched_pairs: &mut ScratchVec<u32>,
     ) {
-        debug_assert!((pair as u32) < self.pair_count);
+        debug_assert!(pair < self.pair_count as usize);
         self.mark_touched(pair, touched_pairs);
 
+        // Read len and coalesced as values so the mutable borrow of
+        // pair_meta does not extend across the coalesce_overflow call.
         // SAFETY: pair < pair_count, pointer arithmetic is in bounds.
-        let meta = unsafe { &mut *self.pair_meta.add(pair) };
+        let (len, coalesced) = unsafe {
+            let m = &*self.pair_meta.add(pair);
+            (m.len as usize, m.coalesced)
+        };
 
-        if meta.coalesced != 0 {
+        if coalesced != 0 {
             // Expand coalesced window, preserving the earliest anchor hint.
             // SAFETY: pair < pair_count.
             let c = unsafe { &mut *self.coalesced.add(pair) };
@@ -326,15 +349,14 @@ impl HitAccPool {
             return;
         }
 
-        let len = meta.len as usize;
         let max_hits = self.max_hits as usize;
         if len < max_hits {
             let base = pair * max_hits;
             // SAFETY: base + len < pair_count * max_hits (total window slots).
             unsafe {
                 *self.windows.add(base + len) = span;
+                (*self.pair_meta.add(pair)).len = (len + 1) as u16;
             }
-            meta.len = (len + 1) as u16;
             return;
         }
 
@@ -386,7 +408,7 @@ impl HitAccPool {
     /// returns the per-hit list in insertion order and resets the count.
     #[inline(always)]
     pub(super) fn take_into(&mut self, pair: usize, out: &mut ScratchVec<SpanU32>) {
-        debug_assert!((pair as u32) < self.pair_count);
+        debug_assert!(pair < self.pair_count as usize);
         out.clear();
 
         // SAFETY: pair < pair_count.
@@ -415,7 +437,7 @@ impl HitAccPool {
     /// Clears all accumulated state for `pair` without returning windows.
     #[inline(always)]
     pub(super) fn reset_pair(&mut self, pair: usize) {
-        debug_assert!((pair as u32) < self.pair_count);
+        debug_assert!(pair < self.pair_count as usize);
         // SAFETY: pair < pair_count.
         let meta = unsafe { &mut *self.pair_meta.add(pair) };
         meta.len = 0;
@@ -425,19 +447,19 @@ impl HitAccPool {
     // Test-only accessors for internal state verification
     #[cfg(all(test, feature = "stdx-proptest"))]
     pub(super) fn is_coalesced(&self, pair: usize) -> bool {
-        debug_assert!((pair as u32) < self.pair_count);
+        debug_assert!(pair < self.pair_count as usize);
         unsafe { (*self.pair_meta.add(pair)).coalesced != 0 }
     }
 
     #[cfg(all(test, feature = "stdx-proptest"))]
     pub(super) fn pair_len(&self, pair: usize) -> u32 {
-        debug_assert!((pair as u32) < self.pair_count);
+        debug_assert!(pair < self.pair_count as usize);
         unsafe { (*self.pair_meta.add(pair)).len as u32 }
     }
 
     #[cfg(all(test, feature = "stdx-proptest"))]
     pub(super) fn coalesced_span(&self, pair: usize) -> SpanU32 {
-        debug_assert!((pair as u32) < self.pair_count);
+        debug_assert!(pair < self.pair_count as usize);
         unsafe { *self.coalesced.add(pair) }
     }
 
@@ -462,6 +484,9 @@ pub struct BenchHitAccPool {
 
 #[cfg(feature = "bench")]
 impl BenchHitAccPool {
+    /// Builds a benchmark-only accumulator wrapper.
+    ///
+    /// Panics if internal scratch allocations fail.
     pub fn new(pair_count: usize, max_hits: usize) -> Self {
         Self {
             pool: HitAccPool::new(pair_count, max_hits).expect("bench pool alloc"),
@@ -470,8 +495,17 @@ impl BenchHitAccPool {
         }
     }
 
+    /// Push one window for a `(rule, variant)` pair.
+    ///
+    /// Panics if `pair >= pair_count`.
     #[inline(always)]
     pub fn push(&mut self, pair: usize, start: u32, end: u32, hint: u32) {
+        assert!(
+            pair < self.pool.pair_count(),
+            "pair index {} out of range (pair_count={})",
+            pair,
+            self.pool.pair_count()
+        );
         self.pool.push_span(
             pair,
             SpanU32 {
@@ -483,21 +517,165 @@ impl BenchHitAccPool {
         );
     }
 
+    /// Drains windows for `pair` and returns the number of drained spans.
+    ///
+    /// Panics if `pair >= pair_count`.
     #[inline(always)]
     pub fn take(&mut self, pair: usize) -> usize {
+        assert!(
+            pair < self.pool.pair_count(),
+            "pair index {} out of range (pair_count={})",
+            pair,
+            self.pool.pair_count()
+        );
         self.pool.take_into(pair, &mut self.output);
         self.output.len()
     }
 
+    /// Resets all touched-pair state in the wrapped pool.
     pub fn reset(&mut self) {
+        for &p in self.touched.as_slice() {
+            self.pool.reset_pair(p as usize);
+        }
         self.pool.reset_touched(self.touched.as_slice());
         self.touched.clear();
     }
 }
 
+// ---------------------------------------------------------------------------
+// Miri-compatible unit tests (no FFI, no feature gates)
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
-    use super::HitAccPool;
+    use super::*;
+
+    fn make_span(start: u32, end: u32) -> SpanU32 {
+        SpanU32 {
+            start,
+            end,
+            anchor_hint: start,
+        }
+    }
+
+    /// Exercises construction, push, take, reset, and Drop for a single pair.
+    /// Under Miri this validates the raw-pointer allocation / deallocation
+    /// round-trip (issue 2) and basic memory safety.
+    #[test]
+    fn miri_single_pair_lifecycle() {
+        let mut pool = HitAccPool::new(1, 4).unwrap();
+        let mut touched = ScratchVec::<u32>::with_capacity(1).unwrap();
+        let mut out = ScratchVec::<SpanU32>::with_capacity(4).unwrap();
+
+        // Push 3 spans (below cap).
+        for i in 0..3u32 {
+            pool.push_span(0, make_span(i * 10, i * 10 + 5), &mut touched);
+        }
+        assert_eq!(touched.len(), 1);
+
+        // Take and verify.
+        pool.take_into(0, &mut out);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out.as_slice()[0], make_span(0, 5));
+        assert_eq!(out.as_slice()[2], make_span(20, 25));
+
+        // Reset for next round.
+        pool.reset_pair(0);
+        pool.reset_touched(touched.as_slice());
+        touched.clear();
+
+        // Pool drops here — validates Drop impl.
+    }
+
+    /// Pushes past the per-pair cap to trigger `coalesce_overflow`, then
+    /// drains via `take_into`. This exercises the `push_span` → cold
+    /// `coalesce_overflow` transition (issue 3: Stacked Borrows concern).
+    #[test]
+    fn miri_coalesce_overflow_path() {
+        let max_hits = 4;
+        let mut pool = HitAccPool::new(1, max_hits).unwrap();
+        let mut touched = ScratchVec::<u32>::with_capacity(1).unwrap();
+        let mut out = ScratchVec::<SpanU32>::with_capacity(max_hits).unwrap();
+
+        // Push exactly max_hits spans (fills without coalescing).
+        for i in 0..max_hits as u32 {
+            pool.push_span(0, make_span(i * 100, i * 100 + 50), &mut touched);
+        }
+
+        // Push one more — triggers coalesce_overflow.
+        pool.push_span(0, make_span(500, 600), &mut touched);
+
+        // Take: should return a single coalesced span.
+        pool.take_into(0, &mut out);
+        assert_eq!(out.len(), 1);
+        let coalesced = out.as_slice()[0];
+        assert_eq!(coalesced.start, 0);
+        assert_eq!(coalesced.end, 600);
+        assert_eq!(coalesced.anchor_hint, 0);
+
+        pool.reset_pair(0);
+        pool.reset_touched(touched.as_slice());
+        touched.clear();
+    }
+
+    /// Multi-pair test: exercises stride arithmetic (`pair * max_hits`)
+    /// and multi-word touched bitset operations (pair_count > 64).
+    #[test]
+    fn miri_multi_pair_stride_and_bitset() {
+        let pair_count = 65; // Crosses the 64-bit word boundary.
+        let max_hits = 4;
+        let mut pool = HitAccPool::new(pair_count, max_hits).unwrap();
+        let mut touched = ScratchVec::<u32>::with_capacity(pair_count).unwrap();
+        let mut out = ScratchVec::<SpanU32>::with_capacity(max_hits).unwrap();
+
+        // Push to pair 0 (first word, bit 0).
+        pool.push_span(0, make_span(10, 20), &mut touched);
+        // Push to pair 63 (first word, bit 63).
+        pool.push_span(63, make_span(30, 40), &mut touched);
+        // Push to pair 64 (second word, bit 0).
+        pool.push_span(64, make_span(50, 60), &mut touched);
+
+        assert_eq!(touched.len(), 3);
+
+        // Verify each pair independently.
+        pool.take_into(0, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out.as_slice()[0], make_span(10, 20));
+
+        pool.take_into(63, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out.as_slice()[0], make_span(30, 40));
+
+        pool.take_into(64, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out.as_slice()[0], make_span(50, 60));
+
+        // Reset all touched pairs.
+        for &p in touched.as_slice() {
+            pool.reset_pair(p as usize);
+        }
+        pool.reset_touched(touched.as_slice());
+        touched.clear();
+    }
+
+    /// Edge case: pair_count = 0 should construct and drop without panicking.
+    #[test]
+    fn miri_zero_pair_count() {
+        let pool = HitAccPool::new(0, 8).unwrap();
+        drop(pool);
+    }
+
+    /// Constructor rejects max_hits = 0.
+    #[test]
+    fn rejects_zero_max_hits() {
+        assert!(HitAccPool::new(10, 0).is_err());
+    }
+
+    /// Constructor rejects max_hits > u16::MAX (PairMeta.len overflow).
+    #[test]
+    fn rejects_max_hits_exceeding_u16() {
+        assert!(HitAccPool::new(1, u16::MAX as usize + 1).is_err());
+    }
 
     #[test]
     fn new_rejects_max_hits_u32_overflow() {
@@ -511,11 +689,11 @@ mod tests {
     }
 
     #[test]
-    fn new_rejects_windows_size_overflow() {
-        match HitAccPool::new((usize::MAX / 2) + 1, 2) {
-            Ok(_) => panic!("pair_count * max_hits overflow must be rejected"),
+    fn new_rejects_pair_count_u32_overflow() {
+        match HitAccPool::new((u32::MAX as usize) + 1, 2) {
+            Ok(_) => panic!("pair_count values above u32::MAX must be rejected"),
             Err(err) => assert!(
-                err.contains("windows size overflow"),
+                err.contains("pair_count exceeds u32::MAX"),
                 "unexpected error: {err}"
             ),
         }

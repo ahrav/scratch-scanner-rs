@@ -5686,6 +5686,81 @@ mod proptests {
             }
         }
 
+        /// Multi-pair variant: exercises stride arithmetic and the per-word
+        /// touched bitset across multiple pairs, catching off-by-one errors
+        /// that the single-pair test above cannot reach.
+        #[test]
+        fn prop_hit_acc_pool_coalesces_multi_pair(
+            pair_count in 2usize..=128,
+            ranges in prop::collection::vec(
+                (0u32..512, 0u32..512),
+                0..128,
+            ),
+            max_hits in 1usize..32
+        ) {
+            let mut acc = HitAccPool::new(pair_count, max_hits)
+                .expect("hit accumulator pool allocation failed");
+            let mut touched: ScratchVec<u32> =
+                ScratchVec::with_capacity(pair_count).expect("scratch alloc failed");
+
+            // Push every span to every pair.
+            for (a, b) in &ranges {
+                let (start, end) = if a <= b { (*a, *b) } else { (*b, *a) };
+                for p in 0..pair_count {
+                    acc.push_span(
+                        p,
+                        SpanU32::new_no_hint(start as usize, end as usize),
+                        &mut touched,
+                    );
+                }
+            }
+
+            // All pairs must show the same state.
+            for p in 1..pair_count {
+                prop_assert_eq!(
+                    acc.pair_len(0),
+                    acc.pair_len(p),
+                    "pair_len diverged between pair 0 and pair {}",
+                    p,
+                );
+                prop_assert_eq!(
+                    acc.is_coalesced(0),
+                    acc.is_coalesced(p),
+                    "coalesced state diverged between pair 0 and pair {}",
+                    p,
+                );
+                if acc.is_coalesced(p) {
+                    prop_assert_eq!(
+                        acc.coalesced_span(0),
+                        acc.coalesced_span(p),
+                        "coalesced span diverged between pair 0 and pair {}",
+                        p,
+                    );
+                } else {
+                    let len = acc.pair_len(p) as usize;
+                    for i in 0..len {
+                        prop_assert_eq!(
+                            acc.window_at(0, i),
+                            acc.window_at(p, i),
+                            "window {} diverged between pair 0 and pair {}",
+                            i,
+                            p,
+                        );
+                    }
+                }
+            }
+
+            // Reset and verify all pairs are clean.
+            for &p in touched.as_slice() {
+                acc.reset_pair(p as usize);
+            }
+            acc.reset_touched(touched.as_slice());
+            for p in 0..pair_count {
+                prop_assert_eq!(acc.pair_len(p), 0);
+                prop_assert!(!acc.is_coalesced(p));
+            }
+        }
+
         #[test]
         fn prop_span_finders_match_vec_vs_scratch(
             buf in prop::collection::vec(any::<u8>(), 0..256),

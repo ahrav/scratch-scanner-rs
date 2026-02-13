@@ -1499,12 +1499,12 @@ impl ScanScratch {
     ///
     /// # Deduplication Strategy
     ///
-    /// Findings are keyed by a 32-byte composite (`DedupKey`):
+    /// Findings are keyed by a fixed 32-byte [`DedupKey`] composite:
     ///
     /// ```text
     /// ┌────────┬──────────────────────┬────────────┬──────────┬─────────────────┬───────────────┐
     /// │file_id │ rule_id_with_variant │ span_start │ span_end │ root_hint_start │ root_hint_end │
-    /// │ 4B     │ 4B                   │ 4B         │ 4B       │ 8B              │ 8B            │
+    /// │ 4B     │ 4B (24b rule + 8b v) │ 4B         │ 4B       │ 8B              │ 8B            │
     /// └────────┴──────────────────────┴────────────┴──────────┴─────────────────┴───────────────┘
     /// ```
     ///
@@ -1585,6 +1585,11 @@ impl ScanScratch {
         };
 
         // Build a 32-byte dedup key (one AEGIS-128L absorption block) and hash to 128 bits.
+        debug_assert!(
+            rec.rule_id < (1 << 24),
+            "rule_id {:#x} overflows the 24-bit field; upper byte reserved for variant_disc",
+            rec.rule_id,
+        );
         let key = DedupKey {
             file_id: rec.file_id.0,
             rule_id_with_variant: pack_rule_id_with_variant(rec.rule_id, variant_disc),
