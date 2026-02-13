@@ -303,7 +303,7 @@ impl<T> ScratchVec<T> {
     /// # Safety
     /// `index` must be less than `self.len()`.
     #[inline(always)]
-    pub unsafe fn get_unchecked(&self, index: usize) -> &T {
+    pub(crate) unsafe fn get_unchecked(&self, index: usize) -> &T {
         debug_assert!(index < self.len(), "get_unchecked: index out of bounds");
         &*self.ptr.as_ptr().add(index).cast::<T>()
     }
@@ -653,6 +653,17 @@ mod tests {
         assert_eq!(vec[1], 20);
         vec[0] = 100;
         assert_eq!(vec[0], 100);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "get_unchecked: index out of bounds")]
+    fn get_unchecked_oob_debug_panics() {
+        let vec = ScratchVec::<u32>::with_capacity(4).unwrap();
+        // vec is empty, so index 0 is out of bounds.
+        unsafe {
+            vec.get_unchecked(0);
+        }
     }
 
     #[test]
