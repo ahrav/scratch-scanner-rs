@@ -1040,6 +1040,9 @@ pub(super) fn base64_skip_chars(
         seen += 4;
         i += 4;
     }
+    if seen == skip {
+        return Some(i);
+    }
 
     // Slow path: handle whitespace, terminators, and approach target precisely.
     for (j, &b) in encoded[i..].iter().enumerate() {
@@ -1239,9 +1242,24 @@ mod simd_b64 {
             .as_ptr(),
         );
         let shuffled = vqtbl1q_u8(p, extract_idx);
-        vst1q_u8(out.as_mut_ptr(), shuffled);
-        // Note: bytes 12-15 are garbage (0 from out-of-range tbl), but we only use 0..12.
+        // Bytes 12-15 of `shuffled` are 0 (vqtbl1q_u8 returns 0 for out-of-range
+        // indices); `store_low12` writes only the low 12 bytes into `out`.
+        store_low12(shuffled, &mut out);
         out
+    }
+
+    /// Stores the low 12 bytes of `v` into `out` without touching adjacent memory.
+    ///
+    /// # Safety
+    /// Uses NEON load/store intrinsics; caller must ensure the target supports
+    /// aarch64 NEON (guaranteed on this target).
+    #[inline(always)]
+    unsafe fn store_low12(v: uint8x16_t, out: &mut [u8; 12]) {
+        // NEON only exposes 128-bit stores for this vector shape; write into a
+        // 16-byte scratch first, then copy the 12 meaningful bytes.
+        let mut tmp = [0u8; 16];
+        vst1q_u8(tmp.as_mut_ptr(), v);
+        out.copy_from_slice(&tmp[..12]);
     }
 
     /// Decode as many 16-byte base64 chunks as possible from `src` into `dst`.
@@ -1270,6 +1288,37 @@ mod simd_b64 {
 
         (si, di)
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn store_low12_does_not_clobber_adjacent_bytes() {
+            #[repr(C)]
+            struct Guarded {
+                out: [u8; 12],
+                guard: [u8; 4],
+            }
+
+            let mut guarded = Guarded {
+                out: [0u8; 12],
+                guard: [0xA5; 4],
+            };
+            let v = unsafe { vdupq_n_u8(0x11) };
+            unsafe { store_low12(v, &mut guarded.out) };
+            assert_eq!(guarded.guard, [0xA5; 4]);
+        }
+
+        #[test]
+        fn decode_simd_chunks_decodes_clean_input() {
+            let src = b"QUJDREVGR0hJSktM";
+            let mut dst = [0u8; 12];
+            let (consumed, written) = unsafe { decode_simd_chunks(src, &mut dst) };
+            assert_eq!((consumed, written), (16, 12));
+            assert_eq!(&dst, b"ABCDEFGHIJKL");
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1278,65 +1327,56 @@ mod simd_b64 {
     use std::arch::x86_64::*;
 
     /// Classify 16 bytes and produce 6-bit decoded values.
-    /// Uses SSSE3 pshufb for nibble-indexed lookup tables.
-    /// Returns (decoded_values, all_valid).
-    #[inline(always)]
+    ///
+    /// Returns `(decoded_values, all_valid)` where `all_valid` is true only
+    /// when every lane belongs to the base64 alphabet (std + URL-safe).
+    #[inline]
     #[target_feature(enable = "ssse3")]
     unsafe fn classify_and_decode(input: __m128i) -> (__m128i, bool) {
-        // High nibble of each byte → index into 16-entry LUTs.
-        let hi_nib = _mm_and_si128(_mm_srli_epi32(input, 4), _mm_set1_epi8(0x0F));
-
-        // LUT for the shift to apply per high-nibble range.
-        // High nibble → offset such that byte + offset = 6-bit value.
-        // Nibble 2: '+' (0x2B) → 62, offset = 62-0x2B = 0x25 (37)
-        // Nibble 3: '0' (0x30) → 52, offset = 52-0x30 = 0xFC (-4 as u8, = +4 wrapping add)
-        // Nibble 4: 'A' (0x41) → 0,  offset = 0-0x41 = 0xBF (-65 as u8)
-        // Nibble 5: 'P' (0x50) → 15, offset = 15-0x50 = 0xBF (-65 as u8)
-        // Nibble 6: 'a' (0x61) → 26, offset = 26-0x61 = 0xB9 (-71 as u8)
-        // Nibble 7: 'p' (0x70) → 41, offset = 41-0x70 = 0xB9 (-71 as u8)
-        // Others: 0 (invalid, caught by validation)
-        #[rustfmt::skip]
-        let shift_lut = _mm_setr_epi8(
-            0, 0, 0x25, 0x04u8 as i8,              // nibbles 0-3
-            0xBFu8 as i8, 0xBFu8 as i8, 0xB9u8 as i8, 0xB9u8 as i8, // nibbles 4-7
-            0, 0, 0, 0, 0, 0, 0, 0,                // nibbles 8-15
+        // ASCII ranges are < 128, so signed compares are safe for these checks.
+        let is_upper = _mm_and_si128(
+            _mm_cmpgt_epi8(input, _mm_set1_epi8((b'A' - 1) as i8)),
+            _mm_cmpgt_epi8(_mm_set1_epi8((b'Z' + 1) as i8), input),
         );
-        let shift = _mm_shuffle_epi8(shift_lut, hi_nib);
-        let decoded = _mm_add_epi8(input, shift);
+        let is_lower = _mm_and_si128(
+            _mm_cmpgt_epi8(input, _mm_set1_epi8((b'a' - 1) as i8)),
+            _mm_cmpgt_epi8(_mm_set1_epi8((b'z' + 1) as i8), input),
+        );
+        let is_digit = _mm_and_si128(
+            _mm_cmpgt_epi8(input, _mm_set1_epi8((b'0' - 1) as i8)),
+            _mm_cmpgt_epi8(_mm_set1_epi8((b'9' + 1) as i8), input),
+        );
+        let is_plus = _mm_cmpeq_epi8(input, _mm_set1_epi8(b'+' as i8));
+        let is_dash = _mm_cmpeq_epi8(input, _mm_set1_epi8(b'-' as i8));
+        let is_slash = _mm_cmpeq_epi8(input, _mm_set1_epi8(b'/' as i8));
+        let is_under = _mm_cmpeq_epi8(input, _mm_set1_epi8(b'_' as i8));
 
-        // Handle special chars that share a high nibble but need different values.
-        // '-' (0x2D) should be 62 but shift_lut[2] is tuned for '+' (0x2B).
-        // With shift=37: '-'(0x2D)+37 = 0x52 = 82 (wrong, want 62). Diff = -20.
-        // '/' (0x2F) should be 63. With shift=37: 0x2F+37 = 0x54 = 84. Diff = -21.
-        // '_' (0x5F) should be 63. With shift[5]=-65: 0x5F-65 = -6 = 250. Diff = 63-250 = -187 = 69 mod 256.
-        let eq_dash = _mm_cmpeq_epi8(input, _mm_set1_epi8(b'-' as i8));
-        let eq_slash = _mm_cmpeq_epi8(input, _mm_set1_epi8(b'/' as i8));
-        let eq_under = _mm_cmpeq_epi8(input, _mm_set1_epi8(b'_' as i8));
+        let is_62 = _mm_or_si128(is_plus, is_dash);
+        let is_63 = _mm_or_si128(is_slash, is_under);
 
-        // Compute corrections: decoded already has some wrong value; we need
-        // to adjust to the correct 6-bit output.
-        // For '-': current = 0x2D + 0x25 = 0x52 = 82, want 62, correction = -20 = 0xEC
-        let corr_dash = _mm_and_si128(eq_dash, _mm_set1_epi8(0xECu8 as i8));
-        // For '/': current = 0x2F + 0x25 = 0x54 = 84, want 63, correction = -21 = 0xEB
-        let corr_slash = _mm_and_si128(eq_slash, _mm_set1_epi8(0xEBu8 as i8));
-        // For '_': current = 0x5F + 0xBF = 0x1E = 30, want 63, correction = 33 = 0x21
-        let corr_under = _mm_and_si128(eq_under, _mm_set1_epi8(0x21));
+        let valid = _mm_or_si128(
+            _mm_or_si128(_mm_or_si128(is_upper, is_lower), is_digit),
+            _mm_or_si128(is_62, is_63),
+        );
+        let all_valid = _mm_movemask_epi8(valid) == 0xFFFF;
 
-        let correction = _mm_or_si128(_mm_or_si128(corr_dash, corr_slash), corr_under);
-        let decoded = _mm_add_epi8(decoded, correction);
+        let val_upper = _mm_sub_epi8(input, _mm_set1_epi8(65));
+        let val_lower = _mm_sub_epi8(input, _mm_set1_epi8(71));
+        let val_digit = _mm_add_epi8(input, _mm_set1_epi8(4));
+        let val_62 = _mm_set1_epi8(62);
+        let val_63 = _mm_set1_epi8(63);
 
-        // Validation: valid 6-bit values are 0-63 (bits 6 and 7 clear).
-        // Invalid/whitespace bytes produce values with bit 6 or 7 set after
-        // the shift+correction. Check with AND 0xC0 then movemask (SSE2).
-        let invalid_bits = _mm_and_si128(decoded, _mm_set1_epi8(0xC0u8 as i8));
-        let is_zero = _mm_cmpeq_epi8(invalid_bits, _mm_setzero_si128());
-        let all_valid = _mm_movemask_epi8(is_zero) == 0xFFFF;
+        let mut decoded = _mm_and_si128(is_upper, val_upper);
+        decoded = _mm_or_si128(decoded, _mm_and_si128(is_lower, val_lower));
+        decoded = _mm_or_si128(decoded, _mm_and_si128(is_digit, val_digit));
+        decoded = _mm_or_si128(decoded, _mm_and_si128(is_62, val_62));
+        decoded = _mm_or_si128(decoded, _mm_and_si128(is_63, val_63));
 
         (decoded, all_valid)
     }
 
     /// Pack 16 x 6-bit values into 12 output bytes.
-    #[inline(always)]
+    #[inline]
     #[target_feature(enable = "ssse3")]
     unsafe fn pack_16_to_12(vals: __m128i) -> [u8; 12] {
         // Merge pairs of 6-bit values into 12-bit values using u16 multiply.
@@ -1368,9 +1408,23 @@ mod simd_b64 {
         let result = _mm_shuffle_epi8(packed, shuffle);
 
         let mut out = [0u8; 12];
-        // Store lower 12 bytes. _mm_storeu_si128 writes 16 but we only read 12.
-        _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, result);
+        store_low12(result, &mut out);
         out
+    }
+
+    /// Stores the low 12 bytes of `v` into `out` without touching adjacent memory.
+    ///
+    /// # Safety
+    /// Uses SSSE3/SSE stores; caller must ensure the required CPU features are
+    /// available (the caller checks this before entering SIMD decode).
+    #[inline]
+    #[target_feature(enable = "ssse3")]
+    unsafe fn store_low12(v: __m128i, out: &mut [u8; 12]) {
+        // SSSE3 uses a full 128-bit store; stage through 16-byte scratch to
+        // avoid writing beyond the 12-byte output contract.
+        let mut tmp = [0u8; 16];
+        _mm_storeu_si128(tmp.as_mut_ptr() as *mut __m128i, v);
+        out.copy_from_slice(&tmp[..12]);
     }
 
     /// Decode as many 16-byte base64 chunks as possible from `src` into `dst`.
@@ -1399,6 +1453,45 @@ mod simd_b64 {
         }
 
         (si, di)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn store_low12_does_not_clobber_adjacent_bytes() {
+            #[repr(C)]
+            struct Guarded {
+                out: [u8; 12],
+                guard: [u8; 4],
+            }
+
+            let mut guarded = Guarded {
+                out: [0u8; 12],
+                guard: [0xA5; 4],
+            };
+            let v = unsafe { _mm_set1_epi8(0x11) };
+            unsafe { store_low12(v, &mut guarded.out) };
+            assert_eq!(guarded.guard, [0xA5; 4]);
+        }
+
+        #[test]
+        fn decode_simd_chunks_rejects_invalid_punctuation() {
+            let src = b"AAAA:AAAAAAAAAAA";
+            let mut dst = [0u8; 12];
+            let (consumed, written) = unsafe { decode_simd_chunks(src, &mut dst) };
+            assert_eq!((consumed, written), (0, 0));
+        }
+
+        #[test]
+        fn decode_simd_chunks_decodes_clean_input() {
+            let src = b"QUJDREVGR0hJSktM";
+            let mut dst = [0u8; 12];
+            let (consumed, written) = unsafe { decode_simd_chunks(src, &mut dst) };
+            assert_eq!((consumed, written), (16, 12));
+            assert_eq!(&dst, b"ABCDEFGHIJKL");
+        }
     }
 }
 
@@ -1966,5 +2059,11 @@ mod tests {
             spans.iter().any(|&(lo, hi)| lo == 0 && hi == 8),
             "expected span 0..8, got {spans:?}"
         );
+    }
+
+    #[test]
+    fn base64_skip_chars_fast_path_exact_hit_returns_offset() {
+        assert_eq!(base64_skip_chars(b"QUJD", 4, false), Some(4));
+        assert_eq!(base64_skip_chars(b"QUJDREVG", 8, false), Some(8));
     }
 }

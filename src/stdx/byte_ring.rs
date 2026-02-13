@@ -174,8 +174,9 @@ impl ByteRing {
         }
         let offset = (lo - self.start_offset) as usize;
         let len = (hi - lo) as usize;
-        let cap = self.buf.len();
-        let start = (self.head + offset) % cap;
+        let mask = self.mask;
+        let cap = mask + 1;
+        let start = (self.head + offset) & mask;
         if start + len <= cap {
             Some(&self.buf[start..start + len])
         } else {
