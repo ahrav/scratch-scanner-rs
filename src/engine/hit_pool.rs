@@ -280,3 +280,30 @@ impl HitAccPool {
         &self.windows
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::HitAccPool;
+
+    #[test]
+    fn new_rejects_max_hits_u32_overflow() {
+        match HitAccPool::new(1, (u32::MAX as usize) + 1) {
+            Ok(_) => panic!("max_hits values above u32::MAX must be rejected"),
+            Err(err) => assert!(
+                err.contains("max_hits exceeds u32::MAX"),
+                "unexpected error: {err}"
+            ),
+        }
+    }
+
+    #[test]
+    fn new_rejects_windows_size_overflow() {
+        match HitAccPool::new((usize::MAX / 2) + 1, 2) {
+            Ok(_) => panic!("pair_count * max_hits overflow must be rejected"),
+            Err(err) => assert!(
+                err.contains("windows size overflow"),
+                "unexpected error: {err}"
+            ),
+        }
+    }
+}

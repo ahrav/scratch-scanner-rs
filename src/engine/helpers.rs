@@ -639,3 +639,82 @@ pub(super) fn extract_secret_span_locs(
     let (start, end) = locs.get(0).expect("group 0 always exists");
     (start, end)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::rule_repr::PackedPatternsBuilder;
+
+    fn build_packed(patterns: &[&[u8]]) -> PackedPatterns {
+        let byte_len: usize = patterns.iter().map(|p| p.len()).sum();
+        let mut b = PackedPatternsBuilder::with_capacity(patterns.len(), byte_len);
+        for &p in patterns {
+            b.push_raw(p);
+        }
+        b.build()
+    }
+
+    // ---- contains_any_memmem ----
+
+    #[test]
+    fn contains_any_memmem_zero_needles() {
+        let packed = build_packed(&[]);
+        assert!(!contains_any_memmem(b"hello world", &packed));
+    }
+
+    #[test]
+    fn contains_any_memmem_single_needle_present() {
+        let packed = build_packed(&[b"world"]);
+        assert!(contains_any_memmem(b"hello world", &packed));
+    }
+
+    #[test]
+    fn contains_any_memmem_single_needle_absent() {
+        let packed = build_packed(&[b"xyz"]);
+        assert!(!contains_any_memmem(b"hello world", &packed));
+    }
+
+    #[test]
+    fn contains_any_memmem_multiple_needles_one_present() {
+        let packed = build_packed(&[b"xyz", b"world"]);
+        assert!(contains_any_memmem(b"hello world", &packed));
+    }
+
+    #[test]
+    fn contains_any_memmem_multiple_needles_none_present() {
+        let packed = build_packed(&[b"xyz", b"abc"]);
+        assert!(!contains_any_memmem(b"hello world", &packed));
+    }
+
+    // ---- contains_all_memmem ----
+
+    #[test]
+    fn contains_all_memmem_zero_needles() {
+        let packed = build_packed(&[]);
+        assert!(contains_all_memmem(b"hello world", &packed));
+    }
+
+    #[test]
+    fn contains_all_memmem_single_needle_present() {
+        let packed = build_packed(&[b"hello"]);
+        assert!(contains_all_memmem(b"hello world", &packed));
+    }
+
+    #[test]
+    fn contains_all_memmem_single_needle_absent() {
+        let packed = build_packed(&[b"xyz"]);
+        assert!(!contains_all_memmem(b"hello world", &packed));
+    }
+
+    #[test]
+    fn contains_all_memmem_multiple_needles_all_present() {
+        let packed = build_packed(&[b"hello", b"world"]);
+        assert!(contains_all_memmem(b"hello world", &packed));
+    }
+
+    #[test]
+    fn contains_all_memmem_multiple_needles_one_missing() {
+        let packed = build_packed(&[b"hello", b"xyz"]);
+        assert!(!contains_all_memmem(b"hello world", &packed));
+    }
+}
