@@ -46,9 +46,10 @@ use super::Engine;
 /// Packed dedup key for finding deduplication.
 ///
 /// Uses `#[repr(C)]` with `bytemuck::Pod` to guarantee a fixed 32-byte layout
-/// (exactly two AES blocks) with no padding. This lets `hash128` process the
-/// key in exactly two AES rounds with no trailing partial-block handling,
-/// which is measurably faster than the previous 33-byte packed layout.
+/// aligned to the AEGIS-128L absorption rate (32 bytes = 2 × 128-bit AES
+/// blocks) with no padding. This lets `hash128` process the key in a single
+/// absorption step with no trailing partial-block handling, which is measurably
+/// faster than the previous 33-byte packed layout.
 ///
 /// The variant discriminator is packed into the high byte of
 /// `rule_id_with_variant`. This requires `rule_id <= DEDUP_RULE_ID_MAX`.
@@ -80,8 +81,8 @@ fn pack_rule_id_with_variant(rule_id: u32, variant_disc: u8) -> u32 {
     rule_id | (u32::from(variant_disc) << DEDUP_RULE_ID_BITS)
 }
 
-/// BLAKE3 digest of the normalized (whitespace-collapsed, case-folded) secret
-/// value. 32 bytes = 256 bits, matching BLAKE3's default output length.
+/// BLAKE3 digest of the raw secret bytes extracted after gate validation.
+/// 32 bytes = 256 bits, matching BLAKE3's default output length.
 ///
 /// Used for cross-chunk and cross-run deduplication: two findings with the
 /// same `NormHash` are considered the same secret regardless of surrounding
@@ -489,7 +490,7 @@ pub struct ScanScratch {
     /// or transform re-scans produce identical matches. The set is reset on file
     /// boundary transitions (new file or `base_offset == 0`).
     ///
-    /// Key composition (32 bytes = 2 AES blocks → 128-bit hash):
+    /// Key composition (32 bytes = one AEGIS-128L absorption block → 128-bit hash):
     /// - `file_id` (4 bytes) — scoped to current file
     /// - `rule_id | variant_disc << 24` (4 bytes) — rule + UTF-16 endianness discriminator
     /// - `span_start`, `span_end` (8 bytes) — root-level span (zeroed for mapped transforms)
@@ -1583,7 +1584,7 @@ impl ScanScratch {
             0
         };
 
-        // Build a 32-byte dedup key (exactly 2 AES blocks) and hash to 128 bits.
+        // Build a 32-byte dedup key (one AEGIS-128L absorption block) and hash to 128 bits.
         let key = DedupKey {
             file_id: rec.file_id.0,
             rule_id_with_variant: pack_rule_id_with_variant(rec.rule_id, variant_disc),

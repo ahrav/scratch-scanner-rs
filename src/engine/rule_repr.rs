@@ -777,4 +777,15 @@ mod tests {
         assert_eq!(rule.value_suppressors, NO_GATE);
         assert!(gates.value_suppressors.is_none());
     }
+
+    #[test]
+    fn pack_rule_meta_distinguishes_none_from_explicit_max_secret_group() {
+        let none_meta = pack_rule_meta(None, false);
+        let explicit_max_meta = pack_rule_meta(Some(u16::MAX), false);
+
+        assert_ne!(
+            none_meta, explicit_max_meta,
+            "explicit secret_group=u16::MAX must not be conflated with None"
+        );
+    }
 }

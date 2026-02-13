@@ -415,32 +415,32 @@ impl Engine {
         for spec in rules.iter() {
             let (mut rule, gates) = compile_rule(spec);
             if let Some(tp) = gates.two_phase {
-                debug_assert!(two_phase_gates.len() < NO_GATE as usize);
+                assert!(two_phase_gates.len() < NO_GATE as usize);
                 rule.two_phase = two_phase_gates.len() as u32;
                 two_phase_gates.push(tp);
             }
             if let Some(kw) = gates.keywords {
-                debug_assert!(keyword_gates.len() < NO_GATE as usize);
+                assert!(keyword_gates.len() < NO_GATE as usize);
                 rule.keywords = keyword_gates.len() as u32;
                 keyword_gates.push(kw);
             }
             if let Some(suppressors) = gates.value_suppressors {
-                debug_assert!(value_suppressor_gates.len() < NO_GATE as usize);
+                assert!(value_suppressor_gates.len() < NO_GATE as usize);
                 rule.value_suppressors = value_suppressor_gates.len() as u32;
                 value_suppressor_gates.push(suppressors);
             }
             if let Some(ent) = gates.entropy {
-                debug_assert!(entropy_gates.len() < NO_GATE as usize);
+                assert!(entropy_gates.len() < NO_GATE as usize);
                 rule.entropy = entropy_gates.len() as u32;
                 entropy_gates.push(ent);
             }
             if let Some(ctx) = gates.local_context {
-                debug_assert!(local_context_gates.len() < NO_GATE as usize);
+                assert!(local_context_gates.len() < NO_GATE as usize);
                 rule.local_context = local_context_gates.len() as u32;
                 local_context_gates.push(ctx);
             }
             if let Some(ov) = gates.offline_validation {
-                debug_assert!(offline_validation_gates.len() < NO_GATE as usize);
+                assert!(offline_validation_gates.len() < NO_GATE as usize);
                 rule.offline_validation = offline_validation_gates.len() as u32;
                 offline_validation_gates.push(ov);
             }
@@ -588,7 +588,7 @@ impl Engine {
                         confirm_all.retain(|c| c.as_slice() != needle);
                     }
                     if let Some(compiled) = compile_confirm_all(confirm_all) {
-                        debug_assert!(confirm_all_gates.len() < NO_GATE as usize);
+                        assert!(confirm_all_gates.len() < NO_GATE as usize);
                         rules_compiled[rid].confirm_all = confirm_all_gates.len() as u32;
                         confirm_all_gates.push(compiled);
                     }
@@ -1141,6 +1141,19 @@ impl Engine {
             None
         } else {
             Some(&self.two_phase_gates[idx as usize])
+        }
+    }
+
+    /// Resolves the offline structural validation gate for a rule.
+    ///
+    /// # Panics
+    /// Panics on out-of-bounds index, indicating corrupted compiled rule data.
+    #[inline(always)]
+    pub(super) fn offline_validation_gate(&self, idx: u32) -> Option<OfflineValidationSpec> {
+        if idx == NO_GATE {
+            None
+        } else {
+            Some(self.offline_validation_gates[idx as usize])
         }
     }
 
