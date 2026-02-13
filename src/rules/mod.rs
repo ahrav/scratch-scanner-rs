@@ -114,16 +114,22 @@ impl std::error::Error for RulesError {
     }
 }
 
+/// Read rule YAML text from `path`.
+///
+/// This is separated from parsing so callers can compute provenance metadata
+/// (for example, content hashes) and then parse exactly the same bytes.
+pub(crate) fn read_rules_text(path: &Path) -> Result<String, RulesError> {
+    let content = std::fs::read_to_string(path).map_err(RulesError::Io)?;
+    Ok(content)
+}
+
 /// Load and validate rules from a YAML file.
 ///
-/// Reads the file, parses it via [`yaml::parse_yaml_rules`], then runs
-/// `assert_valid()` on each rule (catching panics as `Validation` errors).
-///
-/// Panics from `assert_valid()` that are not string payloads are re-raised:
-/// they are treated as non-validation failures (for example, abort-like
-/// runtime failures) rather than user-facing rule errors.
+/// Test-only convenience wrapper around [`read_rules_text`] plus
+/// [`load_rules_from_content`].
+#[cfg(test)]
 pub(crate) fn load_rules(path: &Path) -> Result<Vec<RuleSpec>, RulesError> {
-    let content = std::fs::read_to_string(path).map_err(RulesError::Io)?;
+    let content = read_rules_text(path)?;
     load_rules_from_content(&content)
 }
 
