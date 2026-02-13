@@ -189,6 +189,11 @@ impl RootSpanMapCtx {
     }
 
     /// Maps a decoded-byte span back to absolute root-buffer coordinates.
+    ///
+    /// `span` is expressed in decoded-byte space relative to this context's
+    /// encoded segment. Offsets beyond decoded length are clamped by
+    /// `map_decoded_offset` to the encoded segment end, so the returned root
+    /// range is always within `[root_start, root_start + encoded_len]`.
     pub(super) fn map_span(&self, span: std::ops::Range<usize>) -> std::ops::Range<usize> {
         // SAFETY: The engine-owned transform config lives for the duration
         // of the scan, and encoded bytes are valid while the map context is set.
@@ -202,6 +207,10 @@ impl RootSpanMapCtx {
 
     /// Returns whether a URL-percent trigger (`%` or `+`) appears within the
     /// match span or within the guaranteed overlap prefix preceding it.
+    ///
+    /// This is intentionally asymmetric: it does not scan bytes *after* the
+    /// match, because its only job is to decide whether the previous chunk
+    /// could already have observed a trigger.
     ///
     /// Returns `None` if this context is not for a URL-percent transform.
     pub(super) fn has_trigger_before_or_in_match(

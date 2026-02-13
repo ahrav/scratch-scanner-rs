@@ -852,6 +852,8 @@ impl Engine {
     /// - Findings may be suppressed by emit-time safelist when emitted
     ///   `step_id == STEP_ROOT`, and by offline structural validation for
     ///   root-semantic findings (`parent_step_id == STEP_ROOT`).
+    /// - Appends into staging buffers (`tmp_findings`, `tmp_drop_hint_end`,
+    ///   `tmp_norm_hash`) only; caller decides when to commit to output.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn run_rule_on_raw_window_into(
         &self,
@@ -1019,6 +1021,8 @@ impl Engine {
     ///   (`utf16_step_id`), so UTF-16 emissions bypass root-only safelist checks.
     /// - Findings may be suppressed by offline structural validation using the
     ///   parent `step_id` (not `utf16_step_id`) for root-semantic detection.
+    /// - Appends into staging buffers only; commit vs rollback is handled by
+    ///   the stream driver.
     ///
     /// # Edge cases
     /// - Returns early when decode budgets are exhausted or decoding fails.

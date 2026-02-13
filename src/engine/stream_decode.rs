@@ -26,7 +26,10 @@
 //! Streaming will fall back to full decode when any of the following happen:
 //! - the per-rule window cap is exceeded (risking unbounded work),
 //! - a decoded window/span cannot be reconstructed from the ring,
-//! - decode budgets are exceeded or the stream decoder errors.
+//! - decode budgets are exceeded or timing-wheel enqueue fails.
+//!
+//! Decoder errors/truncation are handled as hard aborts for the stream path:
+//! staged stream output is discarded and this call returns without fallback.
 //!
 //! ## Gate behavior
 //! For `Gate::AnchorsInDecoded`, the preferred path is the decoded-space
@@ -265,6 +268,61 @@ impl Engine {
         out.len() == needed
     }
 
+    /// Rolls back stream-local state and delegates to full-span fallback decode.
+    ///
+    /// This helper is used by both force-full checkpoints to keep rollback
+    /// behavior identical across pre/post close-stream processing.
+    ///
+    /// # Effects
+    /// - Restores slab length and decode-budget counters to their pre-stream
+    ///   checkpoints.
+    /// - Clears all stream-staged windows/spans/findings.
+    /// - Invokes `decode_span_fallback` once with the original encoded input.
+    #[allow(clippy::too_many_arguments)]
+    fn rollback_stream_and_fallback(
+        &self,
+        tc: &TransformConfig,
+        transform_idx: usize,
+        enc_ref: &EncRef,
+        encoded: &[u8],
+        step_id: StepId,
+        root_hint: &Option<Range<usize>>,
+        depth: usize,
+        scratch: &mut ScanScratch,
+        slab_start: usize,
+        total_decode_start: usize,
+        count_force_full_stat: bool,
+    ) {
+        #[cfg(feature = "stats")]
+        if count_force_full_stat {
+            self.vs_stats
+                .stream_force_full
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "stats"))]
+        let _ = count_force_full_stat;
+
+        scratch.slab.buf.truncate(slab_start);
+        scratch.total_decode_output_bytes = total_decode_start;
+        scratch.pending_windows.reset();
+        scratch.vs_stream_matches.clear();
+        scratch.pending_spans.clear();
+        scratch.span_streams.clear();
+        scratch.tmp_findings.clear();
+        scratch.tmp_drop_hint_end.clear();
+        scratch.tmp_norm_hash.clear();
+        self.decode_span_fallback(
+            tc,
+            transform_idx,
+            enc_ref,
+            encoded,
+            step_id,
+            root_hint.clone(),
+            depth,
+            scratch,
+        );
+    }
+
     /// Stream-decodes `encoded` and scans windows without materializing the full buffer.
     ///
     /// # Strategy
@@ -332,6 +390,8 @@ impl Engine {
     ///   (promoted to `work_q`). Updates decode budgets and dedupe state.
     /// - On `force_full`, rolls back all streaming state (slab, budgets, staging
     ///   buffers) and falls through to `decode_span_fallback`.
+    /// - On decoder error/truncation, aborts this stream attempt, discards
+    ///   staged output, and returns without forcing full fallback.
     /// - All Vectorscan scratch/stream resources are returned to `scratch` on
     ///   every exit path (normal, error, and force-full).
     #[allow(clippy::too_many_arguments)]
@@ -456,7 +516,7 @@ impl Engine {
         //
         // Resolution cascade (cheapest first):
         //   1. Zero-copy ring slice — O(1) when the window is contiguous in
-        //      the ring buffer (~80% of cases for small windows).
+        //      the ring buffer (the common case for small windows).
         //   2. Ring buffer copy — O(hi−lo), copies into `window_bytes`.
         //   3. Re-decode from `encoded` — O(encoded.len()), replays the
         //      transform to reconstruct evicted bytes.
@@ -1087,36 +1147,25 @@ impl Engine {
         // `force_full` can be set during the decode loop (phase 7/8/9) when
         // a window cap is exceeded, the ring cannot reconstruct a span, or
         // the timing wheel overflows. This is the first of two rollback
-        // points — the second is after the post-stream match/span processing
-        // below (line ~1325). Both perform the identical rollback sequence:
+        // points — the second is at the "force_full checkpoint 2" banner
+        // below. Both perform the identical rollback sequence:
         // truncate slab, reset budgets, clear staging buffers, then delegate
         // to `decode_span_fallback`. Two check points are needed because the
         // post-stream match processing (close_stream flush + end-of-stream
         // span finishers) can also set `force_full`.
         if force_full {
-            #[cfg(feature = "stats")]
-            self.vs_stats
-                .stream_force_full
-                .fetch_add(1, Ordering::Relaxed);
-            // Roll back streaming state/budgets before falling back to full decode.
-            scratch.slab.buf.truncate(slab_start);
-            scratch.total_decode_output_bytes = total_decode_start;
-            scratch.pending_windows.reset();
-            scratch.vs_stream_matches.clear();
-            scratch.pending_spans.clear();
-            scratch.span_streams.clear();
-            scratch.tmp_findings.clear();
-            scratch.tmp_drop_hint_end.clear();
-            scratch.tmp_norm_hash.clear();
-            self.decode_span_fallback(
+            self.rollback_stream_and_fallback(
                 tc,
                 transform_idx,
                 enc_ref,
                 encoded,
                 step_id,
-                root_hint,
+                &root_hint,
                 depth,
                 scratch,
+                slab_start,
+                total_decode_start,
+                true,
             );
             return;
         }
@@ -1343,24 +1392,18 @@ impl Engine {
         // Same rollback as checkpoint 1 above; triggered by post-stream match
         // processing or end-of-stream span finishers.
         if force_full {
-            scratch.slab.buf.truncate(slab_start);
-            scratch.total_decode_output_bytes = total_decode_start;
-            scratch.pending_windows.reset();
-            scratch.vs_stream_matches.clear();
-            scratch.pending_spans.clear();
-            scratch.span_streams.clear();
-            scratch.tmp_findings.clear();
-            scratch.tmp_drop_hint_end.clear();
-            scratch.tmp_norm_hash.clear();
-            self.decode_span_fallback(
+            self.rollback_stream_and_fallback(
                 tc,
                 transform_idx,
                 enc_ref,
                 encoded,
                 step_id,
-                root_hint,
+                &root_hint,
                 depth,
                 scratch,
+                slab_start,
+                total_decode_start,
+                false,
             );
             return;
         }

@@ -287,6 +287,8 @@ impl HitAccPool {
     /// Clear the touched-bit for each pair in `touched_pairs`.
     ///
     /// O(#touched), not O(pair_count), so reset cost is proportional to work done.
+    /// Duplicate indices are harmless (bit clear is idempotent) but callers
+    /// should pass the deduplicated output from `mark_touched`.
     #[inline(always)]
     pub(super) fn reset_touched(&mut self, touched_pairs: &[u32]) {
         let words = self.touched_words;
@@ -303,6 +305,9 @@ impl HitAccPool {
     }
 
     /// Record `pair` as touched (idempotent). First touch appends to `touched_pairs`.
+    ///
+    /// The output list remains unique within a scan epoch, enabling `reset_touched`
+    /// to clear bits in O(#unique_touched) time.
     #[inline(always)]
     pub(super) fn mark_touched(&mut self, pair: usize, touched_pairs: &mut ScratchVec<u32>) {
         debug_assert!(pair < self.pair_count as usize);
@@ -406,6 +411,8 @@ impl HitAccPool {
     ///
     /// If the pair is coalesced, this returns a single span; otherwise, it
     /// returns the per-hit list in insertion order and resets the count.
+    /// The coalesced single-span case intentionally trades ordering/precision
+    /// for bounded memory and guaranteed superset coverage.
     #[inline(always)]
     pub(super) fn take_into(&mut self, pair: usize, out: &mut ScratchVec<SpanU32>) {
         debug_assert!(pair < self.pair_count as usize);

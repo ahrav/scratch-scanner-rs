@@ -1127,6 +1127,10 @@ mod simd_b64 {
 
     /// Classify 16 bytes: returns a vector of 6-bit decoded values and a bool
     /// indicating all bytes were valid base64 (standard + URL-safe alphabet).
+    ///
+    /// # Safety
+    /// Requires aarch64 NEON intrinsics (architecturally guaranteed on this
+    /// target). `input` must come from a valid 16-byte vector load.
     #[inline(always)]
     unsafe fn classify_and_decode(input: uint8x16_t) -> (uint8x16_t, bool) {
         // Range checks for each alphabet segment.
@@ -1187,6 +1191,10 @@ mod simd_b64 {
     /// Output layout: [o0,o1,o2,     o3,o4,o5,     o6,o7,o8,     o9,o10,o11]
     ///
     /// Where: o0 = (a<<2)|(b>>4), o1 = ((b&0xF)<<4)|(c>>2), o2 = ((c&3)<<6)|d
+    ///
+    /// # Safety
+    /// Requires aarch64 NEON intrinsics. `vals` must contain 16 valid 6-bit
+    /// base64 lane values produced by `classify_and_decode`.
     #[inline(always)]
     unsafe fn pack_16_to_12(vals: uint8x16_t) -> [u8; 12] {
         // Shuffle to create aligned inputs for the three output-byte formulas.
@@ -1330,6 +1338,10 @@ mod simd_b64 {
     ///
     /// Returns `(decoded_values, all_valid)` where `all_valid` is true only
     /// when every lane belongs to the base64 alphabet (std + URL-safe).
+    ///
+    /// # Safety
+    /// Caller must ensure SSSE3 is available (`#[target_feature(enable =
+    /// "ssse3")]`) before invoking this function.
     #[inline]
     #[target_feature(enable = "ssse3")]
     unsafe fn classify_and_decode(input: __m128i) -> (__m128i, bool) {
@@ -1376,6 +1388,10 @@ mod simd_b64 {
     }
 
     /// Pack 16 x 6-bit values into 12 output bytes.
+    ///
+    /// # Safety
+    /// Caller must ensure SSSE3 is available and `vals` contains 16 valid
+    /// base64 lane values (0..=63) from `classify_and_decode`.
     #[inline]
     #[target_feature(enable = "ssse3")]
     unsafe fn pack_16_to_12(vals: __m128i) -> [u8; 12] {

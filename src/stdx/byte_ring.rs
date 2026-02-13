@@ -104,6 +104,8 @@ impl ByteRing {
     ///
     /// The data is treated as a continuation of the logical stream. If
     /// `data.len() >= capacity`, only the last `capacity` bytes are retained.
+    /// Absolute offsets advance monotonically; arithmetic is saturating at
+    /// `u64::MAX` to avoid overflow UB on pathological long-running streams.
     ///
     /// Complexity: O(n) for `n = data.len()`.
     pub(crate) fn push(&mut self, data: &[u8]) {
@@ -164,7 +166,8 @@ impl ByteRing {
     /// range is contiguous (does not wrap around the ring boundary).
     ///
     /// Returns `Some(&[u8])` on success, `Some(&[])` for empty ranges,
-    /// or `None` when the range wraps or is not retained.
+    /// or `None` when the range wraps or is not retained. The returned slice
+    /// is valid until the next ring mutation.
     pub(crate) fn contiguous_range(&self, lo: u64, hi: u64) -> Option<&[u8]> {
         if hi <= lo {
             return Some(&[]);

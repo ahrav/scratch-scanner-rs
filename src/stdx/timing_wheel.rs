@@ -138,7 +138,10 @@ pub enum PushError {
 pub enum PushOutcome<T> {
     /// Scheduled into the wheel.
     Scheduled,
-    /// Already due (or in the past w.r.t. wheel base). Caller should handle immediately.
+    /// Already due (or in the past w.r.t. wheel base).
+    ///
+    /// The item is not enqueued; caller must process it immediately to preserve
+    /// ordering semantics with already-drained buckets.
     Ready(T),
 }
 
