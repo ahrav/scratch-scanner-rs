@@ -330,18 +330,16 @@ pub(super) struct EntropyCompiled {
 /// bounded by the number of rules.
 pub(super) const NO_GATE: u32 = u32::MAX;
 
-/// Sentinel indicating no explicit secret capture group override.
-///
-/// `RuleSpec::secret_group == None` is packed as this value in
-/// [`RuleCompiled::rule_meta`].
-pub(super) const NO_SECRET_GROUP: u16 = u16::MAX;
-
 const RULE_META_SECRET_GROUP_MASK: u32 = 0xFFFF;
 const RULE_META_NEEDS_ASSIGNMENT_SHAPE: u32 = 1 << 16;
+const RULE_META_HAS_SECRET_GROUP: u32 = 1 << 17;
 
 #[inline(always)]
 fn pack_rule_meta(secret_group: Option<u16>, needs_assignment_shape_check: bool) -> u32 {
-    let mut meta = secret_group.unwrap_or(NO_SECRET_GROUP) as u32;
+    let mut meta = 0;
+    if let Some(secret_group) = secret_group {
+        meta |= RULE_META_HAS_SECRET_GROUP | secret_group as u32;
+    }
     if needs_assignment_shape_check {
         meta |= RULE_META_NEEDS_ASSIGNMENT_SHAPE;
     }
@@ -396,8 +394,9 @@ pub(super) struct RuleCompiled {
     pub(super) re: Regex,
     pub(super) must_contain: Option<&'static [u8]>,
     // Packed per-rule metadata:
-    // - bits 0..=15: secret_group (u16::MAX => no explicit group override)
+    // - bits 0..=15: secret_group (when bit 17 is set)
     // - bit 16: needs_assignment_shape_check
+    // - bit 17: has_secret_group_override
     pub(super) rule_meta: u32,
     // Gate pool indices — dereference through Engine pool vectors.
     // NO_GATE (u32::MAX) means the gate is absent for this rule.
@@ -421,15 +420,16 @@ impl RuleCompiled {
         (self.rule_meta & RULE_META_SECRET_GROUP_MASK) as u16
     }
 
+    #[inline(always)]
+    pub(super) fn has_secret_group_override(&self) -> bool {
+        (self.rule_meta & RULE_META_HAS_SECRET_GROUP) != 0
+    }
+
     #[cfg(test)]
     #[inline(always)]
     pub(super) fn secret_group(&self) -> Option<u16> {
-        let raw = self.secret_group_raw();
-        if raw == NO_SECRET_GROUP {
-            None
-        } else {
-            Some(raw)
-        }
+        self.has_secret_group_override()
+            .then_some(self.secret_group_raw())
     }
 }
 
