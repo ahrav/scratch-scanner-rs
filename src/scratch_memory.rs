@@ -67,9 +67,15 @@ impl<T> ScratchVec<T> {
     fn dealloc_layout(cap: u32) -> Layout {
         let align = PAGE_SIZE_MIN.max(align_of::<T>());
         let cap = cap as usize;
+        let size = cap * size_of::<T>();
+        debug_assert!(size > 0, "scratch vec dealloc size must be non-zero");
+        debug_assert!(
+            align.is_power_of_two(),
+            "scratch vec alignment must be power-of-two"
+        );
         // SAFETY: this was validated at construction time — size_of::<T>() > 0
-        // and cap * size_of::<T>() did not overflow.
-        Layout::from_size_align(cap * size_of::<T>(), align).unwrap()
+        // and cap * size_of::<T>() did not overflow; `align` is a power of two.
+        unsafe { Layout::from_size_align_unchecked(size, align) }
     }
 
     /// Allocate a fixed-capacity scratch vector.
@@ -162,16 +168,17 @@ impl<T> ScratchVec<T> {
     /// error that can leave the vector with uninitialized elements.
     pub fn truncate(&mut self, new_len: usize) {
         debug_assert!(new_len <= self.len(), "scratch vec truncate out of bounds");
-        let new_len_u32 = u32::try_from(new_len).expect("scratch vec len exceeds u32");
+        let old_len = self.len as usize;
         // SAFETY: Elements `new_len..self.len` are initialized (invariant: all
         // elements in `0..len` are initialized). We drop each in-place and then
         // lower `len`, which leaves no dangling initialized memory.
         unsafe {
-            for i in new_len..self.len() {
+            for i in new_len..old_len {
                 std::ptr::drop_in_place(self.ptr.as_ptr().add(i).cast::<T>());
             }
         }
-        self.len = new_len_u32;
+        // `self.len <= self.cap` is an invariant and `cap` is stored as `u32`.
+        self.len = new_len as u32;
     }
 
     pub fn as_slice(&self) -> &[T] {
@@ -200,9 +207,10 @@ impl<T> ScratchVec<T> {
     where
         T: Copy,
     {
-        let new_len = self.len().saturating_add(slice.len());
+        let len = self.len as usize;
+        let new_len = len.saturating_add(slice.len());
         debug_assert!(
-            new_len <= self.capacity(),
+            new_len <= self.cap as usize,
             "scratch vec capacity exceeded on extend_from_slice"
         );
         // SAFETY: `new_len <= cap` (debug-asserted), so `ptr + len` through
@@ -213,11 +221,12 @@ impl<T> ScratchVec<T> {
         unsafe {
             std::ptr::copy_nonoverlapping(
                 slice.as_ptr(),
-                self.ptr.as_ptr().add(self.len()).cast::<T>(),
+                self.ptr.as_ptr().add(len).cast::<T>(),
                 slice.len(),
             );
         }
-        self.len = u32::try_from(new_len).expect("scratch vec len exceeds u32");
+        // `new_len <= cap` is debug-asserted above and `cap` is `u32`-backed.
+        self.len = new_len as u32;
     }
 
     /// Appends a range from this vector's existing contents.
@@ -235,14 +244,15 @@ impl<T> ScratchVec<T> {
     where
         T: Copy,
     {
-        debug_assert!(start <= self.len(), "scratch vec range start out of bounds");
+        let cur_len = self.len as usize;
+        debug_assert!(start <= cur_len, "scratch vec range start out of bounds");
         debug_assert!(
-            start.saturating_add(len) <= self.len(),
+            start.saturating_add(len) <= cur_len,
             "scratch vec range end out of bounds"
         );
-        let new_len = self.len().saturating_add(len);
+        let new_len = cur_len.saturating_add(len);
         debug_assert!(
-            new_len <= self.capacity(),
+            new_len <= self.cap as usize,
             "scratch vec capacity exceeded on extend_from_self_range"
         );
         // SAFETY: Source range `start..start+len` is within `0..self.len`
@@ -252,11 +262,12 @@ impl<T> ScratchVec<T> {
         unsafe {
             std::ptr::copy(
                 self.ptr.as_ptr().add(start).cast::<T>(),
-                self.ptr.as_ptr().add(self.len()).cast::<T>(),
+                self.ptr.as_ptr().add(cur_len).cast::<T>(),
                 len,
             );
         }
-        self.len = u32::try_from(new_len).expect("scratch vec len exceeds u32");
+        // `new_len <= cap` is debug-asserted above and `cap` is `u32`-backed.
+        self.len = new_len as u32;
     }
 
     /// Removes and returns the last element, or `None` if empty.
