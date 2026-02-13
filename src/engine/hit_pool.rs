@@ -322,7 +322,7 @@ impl HitAccPool {
     ///
     /// Once the per-pair cap is exceeded, all hits are coalesced into a single
     /// span that conservatively covers every hit seen so far.
-    #[cfg(any(test, feature = "bench"))]
+    #[cfg(any(test, feature = "bench", feature = "tiger-harness"))]
     #[inline(always)]
     pub(super) fn push_span(
         &mut self,
@@ -562,6 +562,75 @@ impl BenchHitAccPool {
     }
 }
 
+/// Fuzz harness wrapping [`HitAccPool`] for use by fuzz targets.
+///
+/// Provides the same interface as `BenchHitAccPool` but gated behind
+/// `tiger-harness` for the fuzz crate.
+#[cfg(feature = "tiger-harness")]
+pub struct FuzzHitAccPool {
+    pool: HitAccPool,
+    touched: ScratchVec<u32>,
+    output: ScratchVec<SpanU32>,
+}
+
+#[cfg(feature = "tiger-harness")]
+impl FuzzHitAccPool {
+    /// Builds a fuzz-only accumulator wrapper.
+    ///
+    /// Returns `None` if allocation fails (fuzz targets should bail on `None`).
+    pub fn new(pair_count: usize, max_hits: usize) -> Option<Self> {
+        let pool = HitAccPool::new(pair_count, max_hits).ok()?;
+        let touched = ScratchVec::<u32>::with_capacity(pair_count).ok()?;
+        let output = ScratchVec::<SpanU32>::with_capacity(max_hits).ok()?;
+        Some(Self {
+            pool,
+            touched,
+            output,
+        })
+    }
+
+    /// Push one window. `pair` is clamped to `pair_count - 1`.
+    pub fn push(&mut self, pair: usize, start: u32, end: u32, hint: u32) {
+        let pair = pair % self.pool.pair_count().max(1);
+        let (start, end) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        let hint = hint.clamp(start, end);
+        self.pool.push_span(
+            pair,
+            SpanU32 {
+                start,
+                end,
+                anchor_hint: hint,
+            },
+            &mut self.touched,
+        );
+    }
+
+    /// Drain windows for `pair`.
+    pub fn take(&mut self, pair: usize) -> usize {
+        let pair = pair % self.pool.pair_count().max(1);
+        self.pool.take_into(pair, &mut self.output);
+        self.output.len()
+    }
+
+    /// Reset all touched-pair state.
+    pub fn reset(&mut self) {
+        for &p in self.touched.as_slice() {
+            self.pool.reset_pair(p as usize);
+        }
+        self.pool.reset_touched(self.touched.as_slice());
+        self.touched.clear();
+    }
+
+    /// Returns the pair count.
+    pub fn pair_count(&self) -> usize {
+        self.pool.pair_count()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Miri-compatible unit tests (no FFI, no feature gates)
 // ---------------------------------------------------------------------------
@@ -782,5 +851,167 @@ mod tests {
                 "unexpected error: {err}"
             ),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kani model-checking proofs
+// ---------------------------------------------------------------------------
+
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    /// Proves that `push_span` followed by `take_into` never causes OOB access
+    /// for any valid `pair < pair_count`.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn verify_push_span_bounds() {
+        let pair_count: usize = kani::any();
+        let max_hits: usize = kani::any();
+        kani::assume(pair_count > 0 && pair_count <= 8);
+        kani::assume(max_hits > 0 && max_hits <= 4);
+
+        let mut pool = match HitAccPool::new(pair_count, max_hits) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let mut touched = match ScratchVec::<u32>::with_capacity(pair_count) {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+
+        let pair: usize = kani::any();
+        kani::assume(pair < pair_count);
+
+        let start: u32 = kani::any();
+        let end: u32 = kani::any();
+        kani::assume(start <= end);
+
+        let span = SpanU32 {
+            start,
+            end,
+            anchor_hint: start,
+        };
+        pool.push_span(pair, span, &mut touched);
+        // Kani proves: no OOB, no UB.
+    }
+
+    /// Proves that pushing `max_hits + 1` spans triggers the coalesce path
+    /// without OOB access.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn verify_coalesce_overflow_bounds() {
+        let pair_count: usize = kani::any();
+        let max_hits: usize = kani::any();
+        kani::assume(pair_count > 0 && pair_count <= 4);
+        kani::assume(max_hits > 0 && max_hits <= 4);
+
+        let mut pool = match HitAccPool::new(pair_count, max_hits) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let mut touched = match ScratchVec::<u32>::with_capacity(pair_count) {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+
+        let pair: usize = kani::any();
+        kani::assume(pair < pair_count);
+
+        // Push max_hits + 1 spans to trigger coalesce.
+        for i in 0..max_hits + 1 {
+            let start = i as u32;
+            let end = (i + 10) as u32;
+            pool.push_span(
+                pair,
+                SpanU32 {
+                    start,
+                    end,
+                    anchor_hint: start,
+                },
+                &mut touched,
+            );
+        }
+        // Kani proves: coalesce path has no OOB.
+    }
+
+    /// Proves that `take_into` never reads OOB for any valid pair.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn verify_take_into_bounds() {
+        let pair_count: usize = kani::any();
+        let max_hits: usize = kani::any();
+        kani::assume(pair_count > 0 && pair_count <= 4);
+        kani::assume(max_hits > 0 && max_hits <= 4);
+
+        let mut pool = match HitAccPool::new(pair_count, max_hits) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let mut touched = match ScratchVec::<u32>::with_capacity(pair_count) {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        let mut out = match ScratchVec::<SpanU32>::with_capacity(max_hits) {
+            Ok(o) => o,
+            Err(_) => return,
+        };
+
+        let pair: usize = kani::any();
+        kani::assume(pair < pair_count);
+
+        let push_count: usize = kani::any();
+        kani::assume(push_count <= max_hits);
+
+        for i in 0..push_count {
+            pool.push_span(
+                pair,
+                SpanU32 {
+                    start: i as u32,
+                    end: (i + 1) as u32,
+                    anchor_hint: i as u32,
+                },
+                &mut touched,
+            );
+        }
+
+        pool.take_into(pair, &mut out);
+        // Kani proves: take_into reads only valid memory.
+    }
+
+    /// Proves that `reset_touched` never writes OOB.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn verify_reset_touched_bounds() {
+        let pair_count: usize = kani::any();
+        let max_hits: usize = kani::any();
+        kani::assume(pair_count > 0 && pair_count <= 8);
+        kani::assume(max_hits > 0 && max_hits <= 2);
+
+        let mut pool = match HitAccPool::new(pair_count, max_hits) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let mut touched = match ScratchVec::<u32>::with_capacity(pair_count) {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+
+        let pair: usize = kani::any();
+        kani::assume(pair < pair_count);
+
+        pool.push_span(
+            pair,
+            SpanU32 {
+                start: 0,
+                end: 10,
+                anchor_hint: 0,
+            },
+            &mut touched,
+        );
+
+        pool.reset_touched(touched.as_slice());
+        // Kani proves: reset_touched never writes OOB in touched_words.
     }
 }

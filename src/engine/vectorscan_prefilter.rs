@@ -1873,6 +1873,16 @@ impl VsPrefilterDb {
                 seed_radius: p.seed_radius,
             })
             .collect();
+        // Construction invariant: every rule_id must be a valid index into the
+        // engine's rules array. This is guaranteed by the enumerate() loop above
+        // but checked here defensively since the FFI callbacks rely on it for
+        // safe push_span_unchecked_hot indexing (pair = rule_id * 3 + variant).
+        debug_assert!(
+            raw_meta.iter().all(|m| (m.rule_id as usize) < rules.len()),
+            "raw_meta rule_id out of bounds: max rule_id={}, rules.len()={}",
+            raw_meta.iter().map(|m| m.rule_id).max().unwrap_or(0),
+            rules.len(),
+        );
         let raw_rule_count = raw_kept.len() as u32;
 
         let (anchor_id_base, anchor_pat_count, anchor_targets, anchor_pat_offsets, anchor_pat_lens) =
@@ -1892,6 +1902,15 @@ impl VsPrefilterDb {
             } else {
                 (raw_rule_count, 0, Vec::new(), Vec::new(), Vec::new())
             };
+
+        // Same invariant for anchor targets: rule_id must be in-bounds and
+        // variant_idx must be 0..3 so pair = rule_id * 3 + variant_idx < rules.len() * 3.
+        debug_assert!(
+            anchor_targets
+                .iter()
+                .all(|t| (t.rule_id as usize) < rules.len() && t.variant_idx < 3),
+            "anchor target rule_id or variant_idx out of bounds",
+        );
 
         Ok(Self {
             db,
@@ -2104,6 +2123,11 @@ extern "C" fn vs_on_match(
         // Pair encoding: `rid * 3 + variant_idx` maps (rule, variant) to a
         // unique hit-accumulator slot. Variant indices: 0=Raw, 1=UTF-16LE, 2=UTF-16BE.
         let pair = rid * 3 + RAW_IDX;
+        debug_assert!(
+            pair < scratch.hit_acc_pool.pair_count(),
+            "pair {pair} exceeds pool pair_count {}",
+            scratch.hit_acc_pool.pair_count()
+        );
         unsafe {
             scratch.hit_acc_pool.push_span_unchecked_hot(
                 pair,
@@ -2127,6 +2151,7 @@ extern "C" fn vs_on_match(
         return 0;
     }
 
+    // SAFETY: pid < anchor_pat_count (checked at line above).
     let len = unsafe { *c.anchor_pat_lens.add(pid) };
     let end = to as u32;
     if end > c.hay_len {
@@ -2134,6 +2159,8 @@ extern "C" fn vs_on_match(
     }
     let start = end.saturating_sub(len);
 
+    // SAFETY: pat_offsets has length anchor_pat_count + 1 (ctx invariant),
+    // and pid < anchor_pat_count, so pid and pid + 1 are in bounds.
     let off_start = unsafe { *c.anchor_pat_offsets.add(pid) } as usize;
     let off_end = unsafe { *c.anchor_pat_offsets.add(pid + 1) } as usize;
 
@@ -2141,6 +2168,8 @@ extern "C" fn vs_on_match(
     let scratch = unsafe { &mut *c.scratch };
 
     for i in off_start..off_end {
+        // SAFETY: i is in off_start..off_end which indexes into the anchor_targets
+        // array (ctx invariant: pat_offsets[pat_count] == targets.len()).
         let target = unsafe { *c.anchor_targets.add(i) };
         let seed = target.seed_radius_bytes;
         let lo = start.saturating_sub(seed);
@@ -2154,6 +2183,11 @@ extern "C" fn vs_on_match(
         let vidx = target.variant_idx as usize;
 
         let pair = rid * 3 + vidx;
+        debug_assert!(
+            pair < scratch.hit_acc_pool.pair_count(),
+            "pair {pair} exceeds pool pair_count {}",
+            scratch.hit_acc_pool.pair_count()
+        );
         unsafe {
             scratch.hit_acc_pool.push_span_unchecked_hot(
                 pair,
@@ -2199,11 +2233,14 @@ extern "C" fn vs_anchor_on_match(
     let pid = id as usize;
     debug_assert!(pid < c.pat_count as usize);
 
+    // SAFETY: pid < pat_count (debug-asserted above).
     let len = unsafe { *c.pat_lens.add(pid) };
     let end = to as u32;
     debug_assert!(end <= c.hay_len);
     let start = end.saturating_sub(len);
 
+    // SAFETY: pat_offsets has length pat_count + 1 (ctx invariant),
+    // and pid < pat_count, so pid and pid + 1 are in bounds.
     let off_start = unsafe { *c.pat_offsets.add(pid) } as usize;
     let off_end = unsafe { *c.pat_offsets.add(pid + 1) } as usize;
 
@@ -2211,6 +2248,8 @@ extern "C" fn vs_anchor_on_match(
     let scratch = unsafe { &mut *c.scratch };
 
     for i in off_start..off_end {
+        // SAFETY: i is in off_start..off_end which indexes into the targets
+        // array (ctx invariant: pat_offsets[pat_count] == targets.len()).
         let target = unsafe { *c.targets.add(i) };
         let seed = target.seed_radius_bytes;
         let lo = start.saturating_sub(seed);
@@ -2224,6 +2263,11 @@ extern "C" fn vs_anchor_on_match(
         let vidx = target.variant_idx as usize;
 
         let pair = rid * 3 + vidx;
+        debug_assert!(
+            pair < scratch.hit_acc_pool.pair_count(),
+            "pair {pair} exceeds pool pair_count {}",
+            scratch.hit_acc_pool.pair_count()
+        );
         unsafe {
             scratch.hit_acc_pool.push_span_unchecked_hot(
                 pair,
@@ -2307,5 +2351,185 @@ fn usize_to_u32_saturating(v: usize) -> u32 {
         u32::MAX
     } else {
         v as u32
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Miri-compatible unit tests (no FFI dependencies)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_window(rule_id: u32, lo: u64, hi: u64) -> VsStreamWindow {
+        VsStreamWindow {
+            lo,
+            hi,
+            anchor_hint: lo,
+            rule_id,
+            variant_idx: 0,
+            force_full: false,
+        }
+    }
+
+    #[test]
+    fn miri_push_stream_window_bounded_within_cap() {
+        let mut buf =
+            std::array::from_fn::<_, 4, _>(|_| std::mem::MaybeUninit::<VsStreamWindow>::uninit());
+        let ptr = buf.as_mut_ptr() as *mut VsStreamWindow;
+        let mut len: u32 = 0;
+        let mut overflow: u8 = 0;
+
+        let win = make_window(0, 0, 100);
+
+        let ok = unsafe { push_stream_window_bounded(ptr, &mut len, 4, 4, &mut overflow, win) };
+        assert!(ok);
+        assert_eq!(len, 1);
+        assert_eq!(overflow, 0);
+
+        // Verify the written value.
+        let stored = unsafe { ptr.read() };
+        assert_eq!(stored.lo, 0);
+        assert_eq!(stored.hi, 100);
+    }
+
+    #[test]
+    fn miri_push_stream_window_bounded_fills_to_cap() {
+        let mut buf =
+            std::array::from_fn::<_, 3, _>(|_| std::mem::MaybeUninit::<VsStreamWindow>::uninit());
+        let ptr = buf.as_mut_ptr() as *mut VsStreamWindow;
+        let mut len: u32 = 0;
+        let mut overflow: u8 = 0;
+
+        for i in 0..3u32 {
+            let ok = unsafe {
+                push_stream_window_bounded(
+                    ptr,
+                    &mut len,
+                    3,
+                    3,
+                    &mut overflow,
+                    make_window(i, i as u64 * 10, i as u64 * 10 + 5),
+                )
+            };
+            assert!(ok, "push {i} should succeed");
+        }
+        assert_eq!(len, 3);
+        assert_eq!(overflow, 0);
+
+        // Next push should fail — buffer is full.
+        let ok = unsafe {
+            push_stream_window_bounded(ptr, &mut len, 3, 3, &mut overflow, make_window(99, 0, 1))
+        };
+        assert!(!ok);
+        assert_eq!(overflow, 1);
+        assert_eq!(len, 3); // Unchanged.
+    }
+
+    #[test]
+    fn miri_push_stream_window_bounded_max_pending_lower_than_cap() {
+        let mut buf =
+            std::array::from_fn::<_, 8, _>(|_| std::mem::MaybeUninit::<VsStreamWindow>::uninit());
+        let ptr = buf.as_mut_ptr() as *mut VsStreamWindow;
+        let mut len: u32 = 0;
+        let mut overflow: u8 = 0;
+
+        // Cap is 8 but max_pending is 2.
+        for i in 0..2u32 {
+            let ok = unsafe {
+                push_stream_window_bounded(
+                    ptr,
+                    &mut len,
+                    8,
+                    2,
+                    &mut overflow,
+                    make_window(i, 0, 10),
+                )
+            };
+            assert!(ok);
+        }
+        assert_eq!(len, 2);
+
+        // Third push hits max_pending.
+        let ok = unsafe {
+            push_stream_window_bounded(ptr, &mut len, 8, 2, &mut overflow, make_window(3, 0, 10))
+        };
+        assert!(!ok);
+        assert_eq!(overflow, 1);
+        assert_eq!(len, 2);
+    }
+
+    #[test]
+    fn miri_push_stream_window_bounded_null_overflow_ptr() {
+        let mut buf =
+            std::array::from_fn::<_, 1, _>(|_| std::mem::MaybeUninit::<VsStreamWindow>::uninit());
+        let ptr = buf.as_mut_ptr() as *mut VsStreamWindow;
+        let mut len: u32 = 1; // Already full.
+
+        // Null overflow pointer — should not crash.
+        let ok = unsafe {
+            push_stream_window_bounded(
+                ptr,
+                &mut len,
+                1,
+                1,
+                std::ptr::null_mut(),
+                make_window(0, 0, 10),
+            )
+        };
+        assert!(!ok);
+        assert_eq!(len, 1);
+    }
+
+    #[test]
+    fn miri_push_stream_window_bounded_preserves_field_values() {
+        let mut buf =
+            std::array::from_fn::<_, 2, _>(|_| std::mem::MaybeUninit::<VsStreamWindow>::uninit());
+        let ptr = buf.as_mut_ptr() as *mut VsStreamWindow;
+        let mut len: u32 = 0;
+        let mut overflow: u8 = 0;
+
+        let win = VsStreamWindow {
+            lo: 42,
+            hi: 999,
+            anchor_hint: 50,
+            rule_id: 7,
+            variant_idx: 2,
+            force_full: true,
+        };
+
+        let ok = unsafe { push_stream_window_bounded(ptr, &mut len, 2, 2, &mut overflow, win) };
+        assert!(ok);
+
+        let stored = unsafe { ptr.read() };
+        assert_eq!(stored.lo, 42);
+        assert_eq!(stored.hi, 999);
+        assert_eq!(stored.anchor_hint, 50);
+        assert_eq!(stored.rule_id, 7);
+        assert_eq!(stored.variant_idx, 2);
+        assert!(stored.force_full);
+    }
+
+    #[test]
+    fn clamp_u32_ordered_within_range() {
+        assert_eq!(clamp_u32_ordered(5, 0, 10), 5);
+    }
+
+    #[test]
+    fn clamp_u32_ordered_below_range() {
+        assert_eq!(clamp_u32_ordered(0, 5, 10), 5);
+    }
+
+    #[test]
+    fn clamp_u32_ordered_above_range() {
+        assert_eq!(clamp_u32_ordered(15, 5, 10), 10);
+    }
+
+    #[test]
+    fn clamp_u32_ordered_equal_bounds() {
+        assert_eq!(clamp_u32_ordered(3, 5, 5), 5);
+        assert_eq!(clamp_u32_ordered(5, 5, 5), 5);
+        assert_eq!(clamp_u32_ordered(7, 5, 5), 5);
     }
 }
