@@ -166,6 +166,10 @@ static BYTE_CLASS: [u8; 256] = build_byte_class();
 const B64_INVALID: u8 = 0xFF;
 /// Sentinel value indicating padding ('=') in B64_DECODE table.
 const B64_PAD: u8 = 64;
+/// Sentinel for whitespace in the extended base64 decode table (`B64_DECODE_EX`).
+/// Distinct from `B64_PAD` (64) and valid values (0-63), allowing a single
+/// table lookup to classify whitespace, valid data, padding, and invalid bytes.
+const B64_WS_SENTINEL: u8 = 0xFE;
 
 /// Lookup table for base64 decoding: 0-63 for valid chars, B64_PAD (64) for '=',
 /// B64_INVALID (0xFF) for invalid bytes.
@@ -191,9 +195,23 @@ const fn build_b64_decode_table() -> [u8; 256] {
     table
 }
 
-/// Precomputed base64 decode table mapping each byte to its 6-bit value,
-/// `B64_PAD` (64) for `=`, or `B64_INVALID` (0xFF) for non-base64 bytes.
-static B64_DECODE: [u8; 256] = build_b64_decode_table();
+/// Extended base64 decode table that also classifies whitespace.
+///
+/// Like the base table produced by [`build_b64_decode_table`], but maps
+/// `' '`, `'\n'`, `'\r'`, `'\t'` to `B64_WS_SENTINEL` (0xFE) instead of
+/// `B64_INVALID`. This lets the decoder's inner loop replace a 4-comparison
+/// `matches!` whitespace check + separate table lookup with a single table
+/// lookup and two comparisons.
+const fn build_b64_decode_ex_table() -> [u8; 256] {
+    let mut table = build_b64_decode_table();
+    table[b' ' as usize] = B64_WS_SENTINEL;
+    table[b'\n' as usize] = B64_WS_SENTINEL;
+    table[b'\r' as usize] = B64_WS_SENTINEL;
+    table[b'\t' as usize] = B64_WS_SENTINEL;
+    table
+}
+
+static B64_DECODE_EX: [u8; 256] = build_b64_decode_ex_table();
 
 /// Target for span collection, allowing reuse of `Vec` or `ScratchVec`.
 ///
@@ -716,8 +734,8 @@ pub(super) fn find_url_spans_into(
 /// - `on_bytes` may be called multiple times; chunk boundaries are arbitrary.
 ///
 /// # Errors
-/// Currently infallible; the error type is reserved for test helpers that
-/// enforce maximum output size.
+/// This function is infallible. The callback can stop decoding early by
+/// returning `ControlFlow::Break(())`.
 fn stream_decode_url_percent(
     input: &[u8],
     plus_to_space: bool,
@@ -738,35 +756,74 @@ fn stream_decode_url_percent(
 
     let mut out = [0u8; STREAM_DECODE_CHUNK_BYTES];
     let mut n = 0usize;
+    let headroom = out.len() - 4;
+    let mut remaining = input;
 
-    let mut i = 0usize;
-    while i < input.len() {
-        let b = input[i];
+    while !remaining.is_empty() {
+        // SIMD-accelerated skip to next trigger byte.
+        let trigger_pos = if plus_to_space {
+            memchr2(b'%', b'+', remaining)
+        } else {
+            memchr(b'%', remaining)
+        };
 
-        let decoded =
-            if b == b'%' && i + 2 < input.len() && is_hex(input[i + 1]) && is_hex(input[i + 2]) {
-                let hi = hex_val(input[i + 1]);
-                let lo = hex_val(input[i + 2]);
-                i += 3;
-                (hi << 4) | lo
+        // Bulk-copy the literal prefix (bytes before the trigger).
+        let prefix_end = trigger_pos.unwrap_or(remaining.len());
+        if prefix_end > 0 {
+            let prefix = &remaining[..prefix_end];
+            let mut copied = 0;
+            while copied < prefix.len() {
+                let avail = headroom - n;
+                let take = (prefix.len() - copied).min(avail);
+                out[n..n + take].copy_from_slice(&prefix[copied..copied + take]);
+                n += take;
+                copied += take;
+                if n >= headroom {
+                    match flush_buf(&mut out, &mut n, &mut on_bytes) {
+                        ControlFlow::Continue(()) => {}
+                        ControlFlow::Break(()) => return,
+                    }
+                }
+            }
+            remaining = &remaining[prefix_end..];
+        }
+
+        if remaining.is_empty() {
+            break;
+        }
+
+        // Process consecutive trigger bytes without re-calling memchr.
+        loop {
+            let b = remaining[0];
+            if b == b'%' && remaining.len() >= 3 && is_hex(remaining[1]) && is_hex(remaining[2]) {
+                out[n] = (hex_val(remaining[1]) << 4) | hex_val(remaining[2]);
+                n += 1;
+                remaining = &remaining[3..];
             } else if plus_to_space && b == b'+' {
-                i += 1;
-                b' '
+                out[n] = b' ';
+                n += 1;
+                remaining = &remaining[1..];
             } else {
-                i += 1;
-                b
-            };
+                // Invalid escape or lone % at end — pass through verbatim.
+                out[n] = b;
+                n += 1;
+                remaining = &remaining[1..];
+            }
 
-        out[n] = decoded;
-        n += 1;
+            if n >= headroom {
+                match flush_buf(&mut out, &mut n, &mut on_bytes) {
+                    ControlFlow::Continue(()) => {}
+                    ControlFlow::Break(()) => return,
+                }
+            }
 
-        // Leave 4 bytes of headroom to safely write the next decoded output.
-        // URL decoding produces 1 byte per decode; base64 can produce up to 3.
-        // Using 4 covers both cases with a small margin.
-        if n >= out.len() - 4 {
-            match flush_buf(&mut out, &mut n, &mut on_bytes) {
-                ControlFlow::Continue(()) => {}
-                ControlFlow::Break(()) => return,
+            // Continue if next byte is also a trigger.
+            if remaining.is_empty() {
+                break;
+            }
+            let next = remaining[0];
+            if next != b'%' && !(plus_to_space && next == b'+') {
+                break;
             }
         }
     }
@@ -1038,21 +1095,55 @@ fn stream_decode_base64(
 
     let mut out: [u8; STREAM_DECODE_CHUNK_BYTES] = [0; STREAM_DECODE_CHUNK_BYTES];
     let mut out_len = 0usize;
+    let headroom = out.len() - 4;
 
-    for &b in input {
-        // ignore whitespace broadly
-        if matches!(b, b' ' | b'\n' | b'\r' | b'\t') {
-            continue;
+    let mut pos = 0usize;
+    while pos < input.len() {
+        // ── Fast path: 4-at-a-time quantum decode ──
+        // When the quantum accumulator is empty and no padding has been seen,
+        // look up 4 consecutive bytes via B64_DECODE_EX. If all 4 are valid
+        // data (0-63), decode the quantum inline without per-byte branching.
+        // The 4 independent LUT loads execute in parallel on superscalar cores.
+        while qn == 0 && !seen_pad && pos + 3 < input.len() {
+            let v0 = B64_DECODE_EX[input[pos] as usize];
+            let v1 = B64_DECODE_EX[input[pos + 1] as usize];
+            let v2 = B64_DECODE_EX[input[pos + 2] as usize];
+            let v3 = B64_DECODE_EX[input[pos + 3] as usize];
+
+            // Any value >= B64_PAD (64) means padding, whitespace, or invalid.
+            if (v0 | v1 | v2 | v3) >= B64_PAD {
+                break;
+            }
+
+            out[out_len] = (v0 << 2) | (v1 >> 4);
+            out[out_len + 1] = ((v1 & 0x0F) << 4) | (v2 >> 2);
+            out[out_len + 2] = ((v2 & 0x03) << 6) | v3;
+            out_len += 3;
+            pos += 4;
+
+            if out_len >= headroom {
+                match flush_buf(&mut out, &mut out_len, &mut on_bytes) {
+                    ControlFlow::Continue(()) => {}
+                    ControlFlow::Break(()) => return Ok(()),
+                }
+            }
         }
 
-        // Single-lookup decode via B64_DECODE table: 0-63 valid, B64_PAD (64) for '=',
-        // B64_INVALID (0xFF) for invalid bytes. Eliminates the match-per-byte overhead.
-        let v = B64_DECODE[b as usize];
-        if v == B64_INVALID {
+        // ── Slow path: per-byte processing ──
+        if pos >= input.len() {
+            break;
+        }
+        let b = input[pos];
+        pos += 1;
+
+        let v = B64_DECODE_EX[b as usize];
+        if v >= B64_WS_SENTINEL {
+            if v == B64_WS_SENTINEL {
+                continue;
+            }
             return Err(Base64DecodeError::InvalidByte);
         }
 
-        // Once padding is seen, only trailing whitespace is allowed.
         if seen_pad {
             return Err(Base64DecodeError::InvalidPadding);
         }
@@ -1103,8 +1194,7 @@ fn stream_decode_base64(
 
         qn = 0;
 
-        // Leave headroom so a full quantum (3 bytes) always fits.
-        if out_len >= out.len() - 4 {
+        if out_len >= headroom {
             match flush_buf(&mut out, &mut out_len, &mut on_bytes) {
                 ControlFlow::Continue(()) => {}
                 ControlFlow::Break(()) => return Ok(()),
@@ -1294,10 +1384,13 @@ fn map_decoded_offset_base64(encoded: &[u8], decoded_offset: usize, allow_space_
     while i < encoded.len() {
         let b = encoded[i];
         i += 1;
-        if matches!(b, b'\n' | b'\r' | b'\t') || (allow_space_ws && b == b' ') {
+        let v = B64_DECODE_EX[b as usize];
+        if v == B64_WS_SENTINEL {
+            if b == b' ' && !allow_space_ws {
+                break;
+            }
             continue;
         }
-        let v = B64_DECODE[b as usize];
         if v == B64_INVALID {
             break;
         }
@@ -1344,10 +1437,15 @@ fn base64_decoded_len(encoded: &[u8], allow_space_ws: bool) -> usize {
     let mut qn = 0usize;
 
     for &b in encoded {
-        if matches!(b, b'\n' | b'\r' | b'\t') || (allow_space_ws && b == b' ') {
+        let v = B64_DECODE_EX[b as usize];
+        if v == B64_WS_SENTINEL {
+            // Space is only whitespace when allow_space_ws is set; otherwise
+            // it terminates the scan (same as B64_INVALID).
+            if b == b' ' && !allow_space_ws {
+                break;
+            }
             continue;
         }
-        let v = B64_DECODE[b as usize];
         if v == B64_INVALID {
             break;
         }
