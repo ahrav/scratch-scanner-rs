@@ -19,9 +19,8 @@
 //! 6. Apply value suppressors (when configured) on the extracted secret bytes.
 //! 7. Apply local context checks (when configured) on the secret span.
 //! 8. Apply root-context safelist suppression for root emit paths.
-//! 9. Record the finding with the extracted secret span.
-//!
-//! Offline structural validation runs post-scan in `core.rs`, not per-window.
+//! 9. Apply offline structural validation (CRC, charset, etc.) for root-semantic findings.
+//! 10. Record the finding with the extracted secret span.
 //!
 //! # Secret Extraction
 //! The finding's `span_start`/`span_end` reflect the *secret* portion of the match,
@@ -79,6 +78,14 @@ use super::scratch::ScanScratch;
 /// adding negligible cost relative to typical 4–16 KiB window sizes. Doubling
 /// this showed no additional matches in benchmarks.
 const BACK_SCAN_MARGIN: usize = 64;
+
+/// Sidecar data computed after emit-time policy checks pass.
+#[derive(Clone, Copy)]
+struct EmitPolicyOutcome {
+    drop_hint_end: u64,
+    dedupe_with_span: bool,
+    norm_hash: [u8; 32],
+}
 
 /// Iterate capture matches without allocating by reusing `CaptureLocations`.
 ///
@@ -140,10 +147,8 @@ fn for_each_capture_match(
 fn has_assignment_value_shape(window: &[u8]) -> bool {
     // Find any assignment separator. We check for `=`, `:`, and `>` (for `=>`).
     // The position we find may be part of `=>`, but that's fine for our purpose.
-    let sep_pos = match window
-        .iter()
-        .position(|&b| b == b'=' || b == b':' || b == b'>')
-    {
+    // Uses vectorized memchr3 (SIMD on x86/ARM) instead of byte-at-a-time scan.
+    let sep_pos = match memchr::memchr3(b'=', b':', b'>', window) {
         Some(pos) => pos,
         None => return false,
     };
@@ -329,7 +334,8 @@ impl Engine {
     /// Errors / edge cases:
     /// - Returns early when gates fail, decode budgets are exhausted, or decoding
     ///   fails.
-    /// - Findings may be suppressed at emit-time by safelist policy.
+    /// - Findings may be suppressed at emit-time by safelist policy or offline
+    ///   structural validation.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn run_rule_on_window(
         &self,
@@ -455,36 +461,22 @@ impl Engine {
                                 };
                             let root_hint_start = base_offset + root_span_hint.start as u64;
                             let root_hint_end = base_offset + root_span_hint.end as u64;
-                            if self.suppress_root_finding_by_safelist(
+                            let Some(outcome) = self.apply_emit_time_policy(
+                                rule,
+                                secret_bytes,
+                                step_id,
+                                step_id,
                                 buf,
                                 base_offset,
-                                step_id,
+                                base_offset,
+                                &root_span_hint,
                                 root_hint_start,
                                 root_hint_end,
                                 &mut last_safelist_decision,
-                            ) {
-                                crate::perf_stats::sat_add_usize(
-                                    &mut scratch.safelist_suppressed,
-                                    1,
-                                );
+                                scratch,
+                            ) else {
                                 return;
-                            }
-                            let mut drop_hint_end = root_span_hint.end;
-                            if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
-                                if let Some(end) =
-                                    ctx.drop_hint_end_for_match(root_span_hint.clone())
-                                {
-                                    drop_hint_end = drop_hint_end.max(end);
-                                }
-                            }
-                            let drop_hint_end = base_offset + drop_hint_end as u64;
-                            // When root-span mapping is unavailable (nested transforms with
-                            // length-changing parents), keep decoded spans in the dedupe key
-                            // to avoid collapsing distinct matches.
-                            let include_span =
-                                step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
-
-                            let norm_hash = *blake3::hash(secret_bytes).as_bytes();
+                            };
                             scratch.push_finding_with_drop_hint(
                                 FindingRec {
                                     file_id,
@@ -493,12 +485,12 @@ impl Engine {
                                     span_end: span_in_buf.end as u32,
                                     root_hint_start,
                                     root_hint_end,
-                                    dedupe_with_span: include_span,
+                                    dedupe_with_span: outcome.dedupe_with_span,
                                     step_id,
                                 },
-                                norm_hash,
-                                drop_hint_end,
-                                include_span,
+                                outcome.norm_hash,
+                                outcome.drop_hint_end,
+                                outcome.dedupe_with_span,
                             );
                         }
                     }
@@ -554,8 +546,12 @@ impl Engine {
     ///
     /// # Behavior
     /// Applies the same gate order as the raw path (confirm/keyword/must-contain,
-    /// assignment-shape, regex, entropy, value suppressor, local context) while
-    /// enforcing UTF-16 decode budgets.
+    /// assignment-shape, regex, entropy, value suppressor, local context,
+    /// safelist suppression, offline validation) while enforcing UTF-16 decode
+    /// budgets. Safelist suppression uses the emitted finding step
+    /// (`utf16_step_id`, checked as `step_id == STEP_ROOT`), while offline
+    /// validation uses the parent `step_id` so root-level UTF-16 findings are
+    /// correctly identified as root-semantic.
     ///
     #[allow(clippy::too_many_arguments)]
     fn run_rule_on_utf16_window_aligned(
@@ -630,8 +626,8 @@ impl Engine {
         // 2. No code path between here and the last use of `decoded` writes to,
         //    resizes, or reallocates `utf16_buf`. Mutations below touch other
         //    scratch fields (`out`, `drop_hint_end`, `seen_findings`,
-        //    `safelist_suppressed`, `total_decode_output_bytes`, `capture_locs`)
-        //    but never `utf16_buf`.
+        //    `safelist_suppressed`, `offline_suppressed`,
+        //    `total_decode_output_bytes`, `capture_locs`) but never `utf16_buf`.
         // 3. Pointer and length are captured before any subsequent mutation.
         let decoded_len = scratch.utf16_buf.len();
         let decoded_ptr = scratch.utf16_buf.as_slice().as_ptr();
@@ -735,30 +731,24 @@ impl Engine {
                     };
                     let root_hint_start = base_offset + root_span_hint.start as u64;
                     let root_hint_end = base_offset + root_span_hint.end as u64;
-                    if self.suppress_root_finding_by_safelist(
+                    // Use the parent step_id (not utf16_step_id) for offline validation:
+                    // root UTF-16 findings have parent == STEP_ROOT.
+                    let Some(outcome) = self.apply_emit_time_policy(
+                        rule,
+                        secret_bytes,
+                        utf16_step_id,
+                        step_id,
                         buf,
                         base_offset,
-                        utf16_step_id,
+                        base_offset,
+                        &root_span_hint,
                         root_hint_start,
                         root_hint_end,
                         &mut last_safelist_decision,
-                    ) {
-                        crate::perf_stats::sat_add_usize(&mut scratch.safelist_suppressed, 1);
+                        scratch,
+                    ) else {
                         return;
-                    }
-
-                    let mut drop_hint_end = root_span_hint.end;
-                    if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
-                        if let Some(end) = ctx.drop_hint_end_for_match(root_span_hint.clone()) {
-                            drop_hint_end = drop_hint_end.max(end);
-                        }
-                    }
-                    let drop_hint_end = base_offset + drop_hint_end as u64;
-                    // Preserve decoded spans in the dedupe key when root-span mapping
-                    // is unavailable for nested transforms.
-                    let include_span =
-                        utf16_step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
-                    let norm_hash = *blake3::hash(secret_bytes).as_bytes();
+                    };
                     scratch.push_finding_with_drop_hint(
                         FindingRec {
                             file_id,
@@ -767,12 +757,12 @@ impl Engine {
                             span_end: secret_end as u32,
                             root_hint_start,
                             root_hint_end,
-                            dedupe_with_span: include_span,
+                            dedupe_with_span: outcome.dedupe_with_span,
                             step_id: utf16_step_id,
                         },
-                        norm_hash,
-                        drop_hint_end,
-                        include_span,
+                        outcome.norm_hash,
+                        outcome.drop_hint_end,
+                        outcome.dedupe_with_span,
                     );
                 }
             }
@@ -792,6 +782,9 @@ impl Engine {
     ///
     /// # Effects
     /// - Sets `found_any` when any match passes gates.
+    /// - Findings may be suppressed by emit-time safelist when emitted
+    ///   `step_id == STEP_ROOT`, and by offline structural validation for
+    ///   root-semantic findings (`parent_step_id == STEP_ROOT`).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn run_rule_on_raw_window_into(
         &self,
@@ -902,37 +895,22 @@ impl Engine {
                     };
                     let root_hint_start = base_offset + root_span_hint.start as u64;
                     let root_hint_end = base_offset + root_span_hint.end as u64;
-                    if self.suppress_root_finding_by_safelist(
-                        window,
-                        base_offset.saturating_add(window_start),
+                    let Some(outcome) = self.apply_emit_time_policy(
+                        rule,
+                        secret_bytes,
                         step_id,
+                        step_id,
+                        window,
+                        base_offset,
+                        base_offset.saturating_add(window_start),
+                        &root_span_hint,
                         root_hint_start,
                         root_hint_end,
                         &mut last_safelist_decision,
-                    ) {
-                        crate::perf_stats::sat_add_usize(&mut scratch.safelist_suppressed, 1);
+                        scratch,
+                    ) else {
                         return;
-                    }
-
-                    let mut drop_hint_end = root_span_hint.end;
-                    if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
-                        if let Some(end) = ctx.drop_hint_end_for_match(root_span_hint.clone()) {
-                            drop_hint_end = drop_hint_end.max(end);
-                        }
-                    }
-                    let drop_hint_end = base_offset + drop_hint_end as u64;
-                    // Dedupe key includes the decoded span only when offsets are
-                    // stable across chunks:
-                    // - Root findings (STEP_ROOT): offsets are absolute file positions.
-                    // - No root-span mapping: nested transforms with length-changing
-                    //   parents produce different decoded offsets per chunk alignment,
-                    //   but without mapping we have no better key.
-                    // When mapping IS available, decoded spans can shift with chunk
-                    // boundaries, so dedupe relies solely on the root hint window.
-                    let dedupe_with_span =
-                        step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
-
-                    let norm_hash = *blake3::hash(secret_bytes).as_bytes();
+                    };
                     scratch.tmp_findings.push(FindingRec {
                         file_id,
                         rule_id,
@@ -940,11 +918,11 @@ impl Engine {
                         span_end: span_in_buf.end as u32,
                         root_hint_start,
                         root_hint_end,
-                        dedupe_with_span,
+                        dedupe_with_span: outcome.dedupe_with_span,
                         step_id,
                     });
-                    scratch.tmp_drop_hint_end.push(drop_hint_end);
-                    scratch.tmp_norm_hash.push(norm_hash);
+                    scratch.tmp_drop_hint_end.push(outcome.drop_hint_end);
+                    scratch.tmp_norm_hash.push(outcome.norm_hash);
                 }
             }
         });
@@ -966,6 +944,10 @@ impl Engine {
     ///
     /// # Effects
     /// - Sets `found_any` when any match passes gates.
+    /// - Emit-time safelist suppression checks the emitted step
+    ///   (`utf16_step_id`), so UTF-16 emissions bypass root-only safelist checks.
+    /// - Findings may be suppressed by offline structural validation using the
+    ///   parent `step_id` (not `utf16_step_id`) for root-semantic detection.
     ///
     /// # Edge cases
     /// - Returns early when decode budgets are exhausted or decoding fails.
@@ -1137,30 +1119,24 @@ impl Engine {
                     };
                     let root_hint_start = base_offset + root_span_hint.start as u64;
                     let root_hint_end = base_offset + root_span_hint.end as u64;
-                    if self.suppress_root_finding_by_safelist(
-                        raw_win,
-                        base_offset.saturating_add(window_start),
+                    // Use the parent step_id (not utf16_step_id) for offline validation:
+                    // root UTF-16 findings have parent == STEP_ROOT.
+                    let Some(outcome) = self.apply_emit_time_policy(
+                        rule,
+                        secret_bytes,
                         utf16_step_id,
+                        step_id,
+                        raw_win,
+                        base_offset,
+                        base_offset.saturating_add(window_start),
+                        &root_span_hint,
                         root_hint_start,
                         root_hint_end,
                         &mut last_safelist_decision,
-                    ) {
-                        crate::perf_stats::sat_add_usize(&mut scratch.safelist_suppressed, 1);
+                        scratch,
+                    ) else {
                         return;
-                    }
-
-                    let mut drop_hint_end = root_span_hint.end;
-                    if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
-                        if let Some(end) = ctx.drop_hint_end_for_match(root_span_hint.clone()) {
-                            drop_hint_end = drop_hint_end.max(end);
-                        }
-                    }
-                    let drop_hint_end = base_offset + drop_hint_end as u64;
-                    // Include span in dedupe key for root findings or when root-span mapping
-                    // is unavailable. See run_rule_on_raw_window_into for full rationale.
-                    let dedupe_with_span =
-                        utf16_step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
-                    let norm_hash = *blake3::hash(secret_bytes).as_bytes();
+                    };
                     scratch.tmp_findings.push(FindingRec {
                         file_id,
                         rule_id,
@@ -1168,11 +1144,11 @@ impl Engine {
                         span_end: secret_end as u32,
                         root_hint_start,
                         root_hint_end,
-                        dedupe_with_span,
+                        dedupe_with_span: outcome.dedupe_with_span,
                         step_id: utf16_step_id,
                     });
-                    scratch.tmp_drop_hint_end.push(drop_hint_end);
-                    scratch.tmp_norm_hash.push(norm_hash);
+                    scratch.tmp_drop_hint_end.push(outcome.drop_hint_end);
+                    scratch.tmp_norm_hash.push(outcome.norm_hash);
                 }
             }
         });
@@ -1224,6 +1200,115 @@ impl Engine {
                 break;
             }
         }
+    }
+
+    /// Applies emit-time safelist/offline gates and computes finding sidecars.
+    ///
+    /// `emitted_step_id` controls root-step safelist suppression and dedupe-key
+    /// span inclusion. `parent_step_id` controls root-semantic offline validation.
+    /// These differ for UTF-16 findings (`emitted_step_id` is `Utf16Window`,
+    /// `parent_step_id` may still be `STEP_ROOT`).
+    ///
+    /// Returns `None` when the finding is suppressed. In that case suppression
+    /// counters are incremented here so callers do not duplicate bookkeeping.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn apply_emit_time_policy(
+        &self,
+        rule: &RuleCompiled,
+        secret_bytes: &[u8],
+        emitted_step_id: StepId,
+        parent_step_id: StepId,
+        context_buf: &[u8],
+        base_offset: u64,
+        context_base_offset: u64,
+        root_span_hint: &Range<usize>,
+        root_hint_start: u64,
+        root_hint_end: u64,
+        last_safelist_decision: &mut Option<(u64, u64, bool)>,
+        scratch: &mut ScanScratch,
+    ) -> Option<EmitPolicyOutcome> {
+        if self.suppress_root_finding_by_safelist(
+            context_buf,
+            context_base_offset,
+            emitted_step_id,
+            root_hint_start,
+            root_hint_end,
+            last_safelist_decision,
+        ) {
+            crate::perf_stats::sat_add_usize(&mut scratch.safelist_suppressed, 1);
+            return None;
+        }
+
+        let mut drop_hint_end = root_span_hint.end;
+        if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
+            if let Some(end) = ctx.drop_hint_end_for_match(root_span_hint.clone()) {
+                drop_hint_end = drop_hint_end.max(end);
+            }
+        }
+        let drop_hint_end = base_offset + drop_hint_end as u64;
+
+        // Dedupe key includes the decoded span only when offsets are stable
+        // across chunks:
+        // - Root findings (`STEP_ROOT`): offsets are absolute file positions.
+        // - No root-span mapping: nested transforms with length-changing parents
+        //   produce different decoded offsets per chunk alignment, but without
+        //   mapping we have no better key.
+        // When mapping IS available, decoded spans can shift with chunk
+        // boundaries, so dedupe relies solely on the root hint window.
+        let dedupe_with_span = emitted_step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
+
+        if self.offline_validation_suppresses(rule, secret_bytes, parent_step_id) {
+            crate::perf_stats::sat_add_usize(&mut scratch.offline_suppressed, 1);
+            return None;
+        }
+
+        let norm_hash = *blake3::hash(secret_bytes).as_bytes();
+        Some(EmitPolicyOutcome {
+            drop_hint_end,
+            dedupe_with_span,
+            norm_hash,
+        })
+    }
+
+    /// Returns `true` if offline structural validation suppresses this finding.
+    ///
+    /// Only root-semantic findings (`parent_step_id == STEP_ROOT`) are checked;
+    /// transform-derived findings (parent != `STEP_ROOT`) are unconditionally
+    /// kept because their secret bytes reference decoded buffers, not the
+    /// original input.
+    ///
+    /// For UTF-16 paths, callers must pass the **parent** `step_id` (not
+    /// `utf16_step_id`), because root-level UTF-16 findings carry a
+    /// `Utf16Window` decode step as their own `step_id` while their parent
+    /// is `STEP_ROOT`.
+    ///
+    /// Suppression requires two conditions:
+    /// 1. The validator returns [`OfflineVerdict::Invalid`] (positive proof of
+    ///    structural failure — bad CRC, invalid charset, etc.).
+    /// 2. The spec's [`suppresses_on_invalid`](OfflineValidationSpec::suppresses_on_invalid)
+    ///    flag is set.
+    ///
+    /// [`Valid`](OfflineVerdict::Valid) and [`Indeterminate`](OfflineVerdict::Indeterminate)
+    /// verdicts always pass through — only definitive structural failure triggers
+    /// suppression.
+    #[inline(always)]
+    fn offline_validation_suppresses(
+        &self,
+        rule: &RuleCompiled,
+        secret_bytes: &[u8],
+        parent_step_id: StepId,
+    ) -> bool {
+        if parent_step_id != STEP_ROOT {
+            return false;
+        }
+        let gate_idx = match rule.offline_validation {
+            Some(idx) => idx,
+            None => return false,
+        };
+        let spec = self.offline_validation_gates[gate_idx as usize];
+        let verdict = super::offline_validate::validate(spec, secret_bytes);
+        matches!(verdict, crate::api::OfflineVerdict::Invalid) && spec.suppresses_on_invalid()
     }
 }
 

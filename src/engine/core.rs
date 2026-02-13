@@ -40,9 +40,8 @@
 //! - Budgets (decode bytes, work items, depth) are enforced per-item so no
 //!   single input forces unbounded work.
 //! - Apply suppression/cap policies at finding emission time so most
-//!   findings are handled inline. A final post-scan compaction pass
-//!   (`post_scan_filter`) removes root findings that fail offline
-//!   structural validation.
+//!   findings are handled inline, including offline structural validation
+//!   which runs at each emission site in `window_validate.rs`.
 //!
 //! ## Design choices
 //!
@@ -1336,13 +1335,26 @@ impl Engine {
         //   • `total_decode_output_bytes` vs `max_total_decode_output_bytes`
         //   • `work_items_enqueued` vs `max_work_items` (inside ScanBuf arm)
         //   • `depth` vs `max_transform_depth` (inside ScanBuf arm)
+        //
+        // Tuning values are hoisted into locals before the loop. Although
+        // `self` is `&Engine` (immutable), LLVM cannot prove that `&mut
+        // ScanScratch` does not alias `self.tuning` fields, so it must
+        // conservatively reload them on every iteration. Locals let the
+        // register allocator keep these values in registers.
+        let max_decode_bytes = self.tuning.max_total_decode_output_bytes;
+        let max_work = self.tuning.max_work_items;
+        let max_depth = self.tuning.max_transform_depth;
         while scratch.work_head < scratch.work_q.len() {
-            if scratch.total_decode_output_bytes >= self.tuning.max_total_decode_output_bytes {
+            if scratch.total_decode_output_bytes >= max_decode_bytes {
                 break;
             }
 
-            // Dequeue via `take` + cursor advance (avoids shifting the Vec).
-            let item = std::mem::take(&mut scratch.work_q[scratch.work_head]);
+            // Dequeue via copy + cursor advance (avoids shifting the Vec).
+            // WorkItem is Copy (40 bytes of plain integers), so this reads
+            // the slot without writing a default back — saving a 40-byte
+            // store per iteration. The slot is never re-read because
+            // work_head advances monotonically.
+            let item = scratch.work_q[scratch.work_head];
             scratch.work_head += 1;
 
             if !item.is_decode_span() {
@@ -1439,23 +1451,20 @@ impl Engine {
                 scratch.root_span_map_ctx = None;
                 let found_any_in_this_buf = scratch.out.len() > before;
 
-                if depth >= self.tuning.max_transform_depth {
+                if depth >= max_depth {
                     continue;
                 }
-                if scratch.work_items_enqueued >= self.tuning.max_work_items {
+                if scratch.work_items_enqueued >= max_work {
                     continue;
                 }
                 // Decode bytes are only produced in the DecodeSpan arm, so this
                 // budget is invariant while processing a ScanBuf item.
-                if scratch.total_decode_output_bytes >= self.tuning.max_total_decode_output_bytes {
+                if scratch.total_decode_output_bytes >= max_decode_bytes {
                     continue;
                 }
                 // Keep a local decrementing budget to avoid repeated loads of
-                // `work_items_enqueued` and `max_work_items` in span inner loops.
-                let mut remaining_work_items = self
-                    .tuning
-                    .max_work_items
-                    .saturating_sub(scratch.work_items_enqueued);
+                // `work_items_enqueued` and `max_work` in span inner loops.
+                let mut remaining_work_items = max_work.saturating_sub(scratch.work_items_enqueued);
                 if remaining_work_items == 0 {
                     continue;
                 }
@@ -1707,7 +1716,7 @@ impl Engine {
                 #[cfg(feature = "git-perf")]
                 let _transform_start = std::time::Instant::now();
 
-                if scratch.total_decode_output_bytes >= self.tuning.max_total_decode_output_bytes {
+                if scratch.total_decode_output_bytes >= max_decode_bytes {
                     continue;
                 }
                 let tc = &self.transforms[transform_idx];
@@ -1793,76 +1802,10 @@ impl Engine {
             }
         }
 
-        // ── Post-scan filter: offline validation ─────────────────────────
-        //
-        // Suppress root findings that fail structural validation (bad CRC,
-        // invalid charset, etc.). Runs after all scan work is complete so
-        // it sees the full finding set, including transform-derived results.
-        //
-        // TODO: offline-invalid findings currently consume max_findings_per_chunk
-        // slots during emission. In pathological inputs this could crowd out
-        // valid findings that are then permanently dropped. Consider running
-        // offline validation inline during emission or reserving cap headroom,
-        // though this would require restructuring the scan loop since offline
-        // validation needs complete extracted spans from the BFS work queue.
-        self.post_scan_filter(root_buf, scratch);
-    }
-
-    /// Post-scan offline-validation filter: suppress root findings that fail
-    /// structural checks.
-    ///
-    /// Runs after the work-queue loop in [`scan_chunk_into`], once all findings
-    /// have been emitted. For each root finding whose rule has an
-    /// `offline_validation` gate, the matched secret bytes are sliced from
-    /// `root_buf` and passed to [`super::offline_validate::validate`].
-    /// Findings with an [`Invalid`](crate::api::OfflineVerdict::Invalid)
-    /// verdict are removed in a single compaction pass over the three parallel
-    /// scratch vectors (`out`, `norm_hash`, `drop_hint_end`).
-    ///
-    /// Non-root findings (transform-derived) are always kept because their
-    /// span coordinates reference decoded buffers, not `root_buf`.
-    ///
-    /// `Valid` and `Indeterminate` verdicts are both kept — only positive proof
-    /// of structural failure triggers suppression.
-    #[inline]
-    fn post_scan_filter(&self, root_buf: &[u8], scratch: &mut ScanScratch) {
-        if self.offline_validation_gates.is_empty() {
-            return;
-        }
-
-        let rules_hot = &self.rules_hot;
-        let gates = &self.offline_validation_gates;
-        let buf_len = root_buf.len();
-
-        let removed = scratch.retain_findings_aligned(|rec, _drop_end| {
-            // Only root findings are eligible for offline validation.
-            if rec.step_id != STEP_ROOT {
-                return true;
-            }
-
-            let rule = &rules_hot[rec.rule_id as usize];
-            let gate_idx = match rule.offline_validation {
-                Some(idx) => idx,
-                None => return true,
-            };
-
-            let spec = gates[gate_idx as usize];
-            let start = rec.span_start as usize;
-            let end = rec.span_end as usize;
-
-            // Defensive: skip validation if the span is out of bounds.
-            if end > buf_len {
-                return true;
-            }
-
-            let secret = &root_buf[start..end];
-            let verdict = super::offline_validate::validate(spec, secret);
-
-            !(matches!(verdict, crate::api::OfflineVerdict::Invalid)
-                && spec.suppresses_on_invalid())
-        });
-
-        crate::perf_stats::sat_add_usize(&mut scratch.offline_suppressed, removed);
+        // Offline validation runs inline via `offline_validation_suppresses()`
+        // at each emission site in window_validate.rs, using the parent
+        // step_id to correctly identify root-semantic findings (including
+        // UTF-16 variants).
     }
 
     /// Scans a buffer and returns a shared view of finding records.

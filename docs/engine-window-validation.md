@@ -6,9 +6,9 @@
 
 The window validation module executes compiled detection rules against bounded byte windows extracted from scanned data. It performs the critical "hot path" validation where patterns are matched, gates are enforced, and findings are recorded. The module handles both raw binary data and UTF-16 encoded content, applying progressive filtering through cheap gates before expensive regex matching.
 
-Global safelist suppression for root emit paths is enforced during finding
-recording in this module. Offline validation suppression (when enabled) remains
-outside this module's gate sequence.
+Global safelist suppression for root emit paths and offline structural
+validation (CRC, charset, etc.) for root-semantic findings are both enforced
+inline at finding emission time in this module.
 
 Two entry styles are supported:
 - **Engine hot path**: `run_rule_on_window` writes findings directly into `ScanScratch` and performs dedupe bookkeeping immediately.
@@ -22,7 +22,7 @@ Two entry styles are supported:
 - **Finding extraction**: Record matches with proper span information and secret data extraction
 - **Entropy validation**: Gate findings on Shannon entropy of matched tokens
 - **Value suppression**: Discard findings whose extracted secret contains known placeholder/example patterns
-- **Emit-time policy checks**: Apply root safelist suppression before recording findings
+- **Emit-time policy checks**: Apply root safelist suppression and offline structural validation before recording findings
 
 ---
 
@@ -49,13 +49,12 @@ Input: Window [w.start..w.end) in buffer
   ↓
 [Gate 8] Apply local context checks (bounded, fail-open)
   ↓
-[Gate 9] Apply root-context safelist suppression (emit-time, root findings only)
+[Gate 9] Apply root-context safelist suppression (emit-time, `step_id == STEP_ROOT` findings only)
+  ↓
+[Gate 10] Apply offline structural validation (CRC, charset, etc.) for root-semantic findings
   ↓
 Output: FindingRec with spans in appropriate coordinate space
 ```
-
-Offline validation suppression (when enabled) executes after this module
-completes and is not part of the gate ordering above.
 
 ### Anchor Hint Processing
 
@@ -240,14 +239,30 @@ They apply uniformly in raw, UTF-16, and stream-decoded validation paths.
 
 ### 7. Emit-Time Safelist Suppression
 
-Before recording a finding, root emit paths run a safelist check on the
-root-context slice derived from `root_hint_start..root_hint_end`.
+Before recording a finding, emit paths run a safelist check only when the
+finding's `step_id == STEP_ROOT`, using the root-context slice derived from
+`root_hint_start..root_hint_end`.
 
-- Root findings matching safelist patterns are suppressed immediately.
+- Step-root findings matching safelist patterns are suppressed immediately.
 - Suppressed findings increment `ScanScratch::safelist_suppressed`.
-- Non-root findings bypass this check.
-- Offline validation verdict filtering (when enabled) is still outside this
-  module.
+- Findings with `step_id != STEP_ROOT` bypass this check.
+- Root-semantic UTF-16 findings carry a `Utf16Window` step as their own
+  `step_id`, so they bypass safelist but still participate in offline
+  validation via their parent step.
+
+### 8. Offline Structural Validation
+
+After safelist suppression, findings for rules with an `offline_validation`
+gate are checked by `offline_validation_suppresses()`. This runs inline at
+emission time, before the finding consumes a `max_findings_per_chunk` slot.
+
+- Only **root-semantic** findings are validated (`parent_step_id == STEP_ROOT`).
+  This includes root-level UTF-16 findings whose own `step_id` is a
+  `Utf16Window` decode step — the check uses the **parent** step ID.
+- Suppression requires both an [`Invalid`](OfflineVerdict::Invalid) verdict
+  and the spec's `suppresses_on_invalid` flag.
+- `Valid` and `Indeterminate` verdicts always pass through.
+- Suppressed findings increment `ScanScratch::offline_suppressed`.
 
 ---
 
@@ -603,8 +618,9 @@ variant-specific ordering:
 
 Early failures save expensive regex execution. Post-match gates run only on
 confirmed regex matches, so their cost scales with finding count, not window count.
-Root safelist suppression runs at finding emission; offline policy suppression
-remains outside this module.
+Root safelist suppression and offline structural validation both run inline at
+finding emission time, before the finding occupies a cap slot or triggers
+dedup computation.
 
 ### Entropy on Full Match
 
@@ -638,4 +654,4 @@ Findings are written to scratch buffers (not directly to materialized results) b
 6. All early returns occur before findings are recorded
 7. Findings are appended or replaced in-place for dedupe preference (never removed or reordered during function execution)
 8. Entropy gates continue to next match (not early return)
-9. Root safelist suppression and cap checks are applied before finding insertion
+9. Root safelist suppression, offline structural validation, and cap checks are applied before finding insertion

@@ -57,8 +57,10 @@ const FLAG_HAS_TRANSFORM_IDX: u8 = 1 << 5;
 
 /// Work item in the transform/scan queue.
 ///
-/// Flat, cache-friendly representation replacing the former enum+nested-enum
-/// layout (104B -> 40B). Sentinel values (`NONE_U32`/`NONE_U64`) mark absent
+/// Flat, `Copy` representation replacing the former enum+nested-enum layout
+/// (104B → 40B). All fields are plain integers (no heap pointers, no `Drop`),
+/// so the work-queue loop dequeues via bitwise copy without writing a default
+/// back to the slot. Sentinel values (`NONE_U32`/`NONE_U64`) mark absent
 /// optional fields, and a flags byte encodes variant/presence bits.
 ///
 /// Two logical variants exist, distinguished by `FLAG_IS_DECODE_SPAN`:
@@ -76,6 +78,7 @@ const FLAG_HAS_TRANSFORM_IDX: u8 = 1 << 5;
 ///   must chunk inputs so any single buffer fits in `u32::MAX` bytes.
 /// - `root_hint_lo`/`root_hint_hi` are u64 file offsets (files can exceed 4GB).
 /// - `step_id` is only valid while the originating scratch arena is alive.
+#[derive(Clone, Copy)]
 pub(super) struct WorkItem {
     flags: u8,
     depth: u8,

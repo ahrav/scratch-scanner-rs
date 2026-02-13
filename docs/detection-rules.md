@@ -37,7 +37,7 @@ Suppression is split between rule-level secret filtering and engine-level safeli
 | Control | Config Surface | Match Input | Stage |
 |-----------|---------------------|---------|--------|
 | `value_suppressors_any` | Per-rule YAML (`RuleSpec.value_suppressors_any`) | Extracted secret bytes | Window validation post-match gate |
-| `offline_validation` | Per-rule YAML (`RuleSpec.offline_validation`) | Extracted secret bytes (root findings) | Post-scan batch filter |
+| `offline_validation` | Per-rule YAML (`RuleSpec.offline_validation`) | Extracted secret bytes (root findings) | Inline emission-time gate (root-semantic findings) |
 | Global safelist | Engine policy (`SafelistFilter`) | Root-match context slice | Emit-time suppression on root emit paths |
 
 Examples:

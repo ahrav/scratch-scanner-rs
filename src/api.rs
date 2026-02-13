@@ -863,7 +863,7 @@ impl OfflineValidationSpec {
 /// Result of an offline structural validation check.
 ///
 /// `Valid` and `Indeterminate` allow the finding to be emitted;
-/// `Invalid` suppresses it (see `Engine::post_scan_filter` in `core.rs`).
+/// `Invalid` suppresses it (see `Engine::offline_validation_suppresses` in `window_validate.rs`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OfflineVerdict {
     /// The token passed the structural check.
