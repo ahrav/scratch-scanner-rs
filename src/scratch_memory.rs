@@ -300,12 +300,24 @@ impl<T> ScratchVec<T> {
 
     /// Returns a reference to the element at `index` without bounds checking.
     ///
+    /// For a safe alternative, see [`get`](Self::get).
+    ///
     /// # Safety
-    /// `index` must be less than `self.len()`.
+    ///
+    /// Calling this method with an `index` that is greater than or equal to
+    /// `self.len()` is *undefined behavior*, even if the resulting reference
+    /// is not used.
+    ///
+    /// # Debug assertions
+    ///
+    /// In debug builds, an out-of-bounds index panics with a descriptive
+    /// message. This check is elided in release builds.
     #[inline(always)]
     pub(crate) unsafe fn get_unchecked(&self, index: usize) -> &T {
         debug_assert!(index < self.len(), "get_unchecked: index out of bounds");
-        &*self.ptr.as_ptr().add(index).cast::<T>()
+        // SAFETY: caller guarantees `index < self.len()`, which means
+        // `index < self.cap` and the element at `index` is initialized.
+        unsafe { &*self.ptr.as_ptr().add(index).cast::<T>() }
     }
 
     /// Returns a mutable reference to the element at `index`, or `None` if out of bounds.
