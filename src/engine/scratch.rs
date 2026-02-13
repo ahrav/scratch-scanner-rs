@@ -696,6 +696,9 @@ impl ScanScratch {
             .saturating_mul(3)
             .saturating_mul(engine.tuning.max_windows_per_rule_variant)
             .max(16);
+        // Keep callback staging capacity aligned with pending-window capacity:
+        // stream callbacks can emit at most one staging entry per eventual
+        // pending window, and overflow flips decode-stream fallback to full scan.
         let stream_match_cap = pending_window_cap;
         let max_radius_bytes = (engine.max_window_diameter_bytes / 2) as u64;
         let pending_window_horizon_bytes =
@@ -1196,6 +1199,8 @@ impl ScanScratch {
                 .saturating_mul(3)
                 .saturating_mul(engine.tuning.max_windows_per_rule_variant)
                 .max(16);
+            // Keep callback staging capacity aligned with pending-window capacity
+            // (same invariant as in `new` above).
             let stream_match_cap = pending_window_cap;
             let max_radius_bytes = (engine.max_window_diameter_bytes / 2) as u64;
             let pending_window_horizon_bytes =

@@ -519,8 +519,6 @@ pub(crate) struct VsStreamMatchCtx {
 /// stream-local offsets into absolute positions within the full decoded output.
 ///
 /// Safety invariants:
-/// - `pending` points to a live `Vec<VsStreamWindow>` for the duration of the scan.
-/// - `pending` is not accessed concurrently while the scan runs.
 /// - `targets`/`pat_offsets`/`pat_lens` describe the UTF-16 anchor mapping tables.
 /// - `pat_offsets` has length `pat_count + 1` and is monotonically increasing.
 /// - `pat_offsets[pat_count]` equals the number of `targets` entries.
@@ -542,6 +540,65 @@ pub(crate) struct VsUtf16StreamMatchCtx {
     pub(crate) base_offset: u64,
     pub(crate) max_pending: u32,
     pub(crate) overflowed: *mut u8,
+}
+
+/// Borrowed UTF-16 anchor mapping tables used by stream callbacks.
+pub(crate) struct VsUtf16MatchTables<'a> {
+    pub(crate) targets: &'a [VsAnchorTarget],
+    pub(crate) pat_offsets: &'a [u32],
+    pub(crate) pat_lens: &'a [u32],
+}
+
+/// Constructs the stream callback context from a pending-window staging buffer.
+///
+/// `pending` is treated as fixed-capacity storage during callbacks: appends write
+/// directly into its allocation via `pending_ptr` and increment `pending_len`.
+#[inline(always)]
+pub(crate) fn build_stream_match_ctx(
+    pending: &mut Vec<VsStreamWindow>,
+    pending_len: &mut u32,
+    meta: &[VsStreamMeta],
+    max_pending: u32,
+    overflowed: &mut u8,
+) -> VsStreamMatchCtx {
+    let pending_cap = u32::try_from(pending.capacity()).unwrap_or(u32::MAX);
+    debug_assert!(max_pending <= pending_cap);
+    VsStreamMatchCtx {
+        pending_ptr: pending.as_mut_ptr(),
+        pending_len: (pending_len as *mut u32),
+        pending_cap,
+        meta: meta.as_ptr(),
+        meta_len: meta.len() as u32,
+        max_pending,
+        overflowed: (overflowed as *mut u8),
+    }
+}
+
+/// Constructs the UTF-16 stream callback context from the shared pending-window
+/// staging buffer and UTF-16 mapping tables.
+#[inline(always)]
+pub(crate) fn build_utf16_stream_match_ctx(
+    pending: &mut Vec<VsStreamWindow>,
+    pending_len: &mut u32,
+    tables: VsUtf16MatchTables<'_>,
+    base_offset: u64,
+    max_pending: u32,
+    overflowed: &mut u8,
+) -> VsUtf16StreamMatchCtx {
+    let pending_cap = u32::try_from(pending.capacity()).unwrap_or(u32::MAX);
+    debug_assert!(max_pending <= pending_cap);
+    VsUtf16StreamMatchCtx {
+        pending_ptr: pending.as_mut_ptr(),
+        pending_len: (pending_len as *mut u32),
+        pending_cap,
+        targets: tables.targets.as_ptr(),
+        pat_offsets: tables.pat_offsets.as_ptr(),
+        pat_lens: tables.pat_lens.as_ptr(),
+        pat_count: tables.pat_lens.len() as u32,
+        base_offset,
+        max_pending,
+        overflowed: (overflowed as *mut u8),
+    }
 }
 
 /// Appends a callback-produced window without triggering `Vec` growth.
@@ -574,6 +631,9 @@ unsafe fn push_stream_window_bounded(
         }
         return false;
     }
+    // `len < max_pending` and `len < pending_cap` from the guard above,
+    // so `len + 1 <= pending_cap <= u32::MAX` — no overflow.
+    debug_assert!(len < u32::MAX, "pending_len would overflow u32");
     unsafe {
         pending_ptr.add(len as usize).write(win);
         *pending_len = len + 1;
@@ -585,7 +645,8 @@ unsafe fn push_stream_window_bounded(
 ///
 /// # Safety
 /// - `ctx` must be non-null and point to a valid `VsStreamMatchCtx`.
-/// - `pending` and `meta` must outlive the call and not be accessed concurrently.
+/// - `pending_ptr`/`pending_len`/`meta` must outlive the call and not be
+///   accessed concurrently.
 /// - This callback must never panic or unwind across the FFI boundary.
 unsafe extern "C" fn vs_on_stream_match(
     id: c_uint,
@@ -598,12 +659,15 @@ unsafe extern "C" fn vs_on_stream_match(
         return 0;
     }
     let c = &mut *(ctx as *mut VsStreamMatchCtx);
+    if !c.overflowed.is_null() && unsafe { *c.overflowed } != 0 {
+        return 1;
+    }
     if id >= c.meta_len {
         return 0;
     }
     let meta = *c.meta.add(id as usize);
     if meta.whole_buffer_on_hit != 0 {
-        let _ = push_stream_window_bounded(
+        if !push_stream_window_bounded(
             c.pending_ptr,
             c.pending_len,
             c.pending_cap,
@@ -617,7 +681,9 @@ unsafe extern "C" fn vs_on_stream_match(
                 force_full: true,
                 anchor_hint: from,
             },
-        );
+        ) {
+            return 1;
+        }
         return 0;
     }
     let max_width = meta.max_width as u64;
@@ -628,7 +694,7 @@ unsafe extern "C" fn vs_on_stream_match(
     // Clamp anchor hint to window bounds.
     let anchor_hint = clamp_u64_ordered(from, lo, to);
 
-    let _ = push_stream_window_bounded(
+    if !push_stream_window_bounded(
         c.pending_ptr,
         c.pending_len,
         c.pending_cap,
@@ -642,7 +708,9 @@ unsafe extern "C" fn vs_on_stream_match(
             force_full: false,
             anchor_hint,
         },
-    );
+    ) {
+        return 1;
+    }
     0
 }
 
@@ -688,8 +756,8 @@ pub(crate) fn gate_match_callback() -> vs::match_event_handler {
 ///
 /// # Safety
 /// - `ctx` must point to a valid `VsUtf16StreamMatchCtx`.
-/// - `pending` and UTF-16 mapping tables must outlive the call and not be
-///   accessed concurrently.
+/// - `pending_ptr`/`pending_len` and UTF-16 mapping tables must outlive the call
+///   and not be accessed concurrently.
 /// - This callback must never panic or unwind across the FFI boundary.
 unsafe extern "C" fn vs_utf16_stream_on_match(
     id: c_uint,
@@ -702,6 +770,9 @@ unsafe extern "C" fn vs_utf16_stream_on_match(
         return 0;
     }
     let c = &mut *(ctx as *mut VsUtf16StreamMatchCtx);
+    if !c.overflowed.is_null() && unsafe { *c.overflowed } != 0 {
+        return 1;
+    }
     if id >= c.pat_count {
         return 0;
     }
@@ -739,7 +810,7 @@ unsafe extern "C" fn vs_utf16_stream_on_match(
                 anchor_hint,
             },
         ) {
-            return 0;
+            return 1;
         }
     }
     0
@@ -747,9 +818,10 @@ unsafe extern "C" fn vs_utf16_stream_on_match(
 
 /// Clamps `v` into `[lo, hi]`. Requires `lo <= hi` (debug-asserted).
 ///
-/// Used in callbacks to keep anchor hints within window bounds. Branchless
-/// clamp via `v.clamp()` was measured slower here due to min/max call overhead;
-/// the explicit branches are cheaper in the match-callback hot path.
+/// Used in FFI callbacks where panicking is undefined behavior. Unlike
+/// `Ord::clamp()`, which uses `assert!(min <= max)` and can unwind across
+/// the FFI boundary, this uses `debug_assert!` — the panic path is elided
+/// in release builds, making the function safe for `extern "C"` callbacks.
 #[inline(always)]
 fn clamp_u32_ordered(v: u32, lo: u32, hi: u32) -> u32 {
     debug_assert!(lo <= hi);
@@ -765,6 +837,7 @@ fn clamp_u32_ordered(v: u32, lo: u32, hi: u32) -> u32 {
 /// Clamps `v` into `[lo, hi]`. Requires `lo <= hi` (debug-asserted).
 ///
 /// 64-bit variant for stream-mode callbacks where offsets are `u64`.
+/// See [`clamp_u32_ordered`] for the FFI safety rationale.
 #[inline(always)]
 fn clamp_u64_ordered(v: u64, lo: u64, hi: u64) -> u64 {
     debug_assert!(lo <= hi);
@@ -2060,6 +2133,58 @@ struct VsAnchorMatchCtx {
     saw_utf16: bool,
 }
 
+/// Expands one matched anchor pattern into per-target hit spans.
+///
+/// # Safety
+/// - `targets` must point to at least `off_end` entries.
+/// - `off_start <= off_end`.
+/// - `scratch` must be valid and exclusively borrowed for the call.
+#[inline(always)]
+unsafe fn enqueue_anchor_target_spans(
+    scratch: &mut ScanScratch,
+    targets: *const VsAnchorTarget,
+    offsets: std::ops::Range<usize>,
+    start: u32,
+    end: u32,
+    hay_len: u32,
+    saw_utf16: &mut bool,
+) {
+    for i in offsets {
+        // SAFETY: caller guarantees `targets` covers `[off_start, off_end)`.
+        let target = unsafe { *targets.add(i) };
+        let seed = target.seed_radius_bytes;
+        let lo = start.saturating_sub(seed);
+        let hi = end.saturating_add(seed).min(hay_len);
+
+        // Anchor patterns are fixed-width; use the computed start as the hint to
+        // avoid relying on `from` for prefilter-style callbacks.
+        let anchor_hint = clamp_u32_ordered(start, lo, end);
+
+        let rid = target.rule_id as usize;
+        let vidx = target.variant_idx as usize;
+        let pair = rid * 3 + vidx;
+        debug_assert!(
+            pair < scratch.hit_acc_pool.pair_count(),
+            "pair {pair} exceeds pool pair_count {}",
+            scratch.hit_acc_pool.pair_count()
+        );
+        unsafe {
+            scratch.hit_acc_pool.push_span_unchecked_hot(
+                pair,
+                SpanU32 {
+                    start: lo,
+                    end: hi,
+                    anchor_hint,
+                },
+                &mut scratch.touched_pairs,
+            );
+        }
+        if matches!(target.variant_idx, 1 | 2) {
+            *saw_utf16 = true;
+        }
+    }
+}
+
 /// Prefilter match callback for raw-byte scanning.
 ///
 /// Seeds per-rule raw windows in `ScanScratch` based on the match end offset.
@@ -2077,14 +2202,11 @@ struct VsAnchorMatchCtx {
 /// - Everything else: ignored.
 ///
 /// # Safety
-/// This function is not marked `unsafe` because it is only used as a
-/// Vectorscan `match_event_handler` callback (called from C, not from Rust).
-/// The caller (`hs_scan`) must guarantee:
-/// - `ctx` is non-null and points to a valid `VsMatchCtx`.
-/// - `scratch` and mapping tables referenced by `ctx` remain valid and are
-///   not accessed concurrently for the duration of the scan.
+/// - `ctx` must be non-null and point to a valid `VsMatchCtx`.
+/// - `scratch` and mapping tables referenced by `ctx` must remain valid and
+///   not be accessed concurrently for the duration of the scan.
 /// - This callback must never panic or unwind across the FFI boundary.
-extern "C" fn vs_on_match(
+unsafe extern "C" fn vs_on_match(
     id: c_uint,
     from: u64,
     to: u64,
@@ -2167,41 +2289,17 @@ extern "C" fn vs_on_match(
     // SAFETY: `scratch` is valid for the duration of the scan and not used concurrently.
     let scratch = unsafe { &mut *c.scratch };
 
-    for i in off_start..off_end {
-        // SAFETY: i is in off_start..off_end which indexes into the anchor_targets
-        // array (ctx invariant: pat_offsets[pat_count] == targets.len()).
-        let target = unsafe { *c.anchor_targets.add(i) };
-        let seed = target.seed_radius_bytes;
-        let lo = start.saturating_sub(seed);
-        let hi = end.saturating_add(seed).min(c.hay_len);
-
-        // Anchor patterns are fixed-width; use the computed start as the hint to
-        // avoid relying on `from` for prefilter-style callbacks.
-        let anchor_hint = clamp_u32_ordered(start, lo, end);
-
-        let rid = target.rule_id as usize;
-        let vidx = target.variant_idx as usize;
-
-        let pair = rid * 3 + vidx;
-        debug_assert!(
-            pair < scratch.hit_acc_pool.pair_count(),
-            "pair {pair} exceeds pool pair_count {}",
-            scratch.hit_acc_pool.pair_count()
+    // SAFETY: offsets are derived from `anchor_pat_offsets` bounds checked above.
+    unsafe {
+        enqueue_anchor_target_spans(
+            scratch,
+            c.anchor_targets,
+            off_start..off_end,
+            start,
+            end,
+            c.hay_len,
+            &mut c.saw_utf16,
         );
-        unsafe {
-            scratch.hit_acc_pool.push_span_unchecked_hot(
-                pair,
-                SpanU32 {
-                    start: lo,
-                    end: hi,
-                    anchor_hint,
-                },
-                &mut scratch.touched_pairs,
-            );
-        }
-        if matches!(target.variant_idx, 1 | 2) {
-            c.saw_utf16 = true;
-        }
     }
 
     0
@@ -2213,14 +2311,11 @@ extern "C" fn vs_on_match(
 /// the matched pattern. Window ends are clamped to `hay_len`.
 ///
 /// # Safety
-/// This function is not marked `unsafe` because it is only used as a
-/// Vectorscan `match_event_handler` callback (called from C, not from Rust).
-/// The caller (`hs_scan`) must guarantee:
-/// - `ctx` is non-null and points to a valid `VsAnchorMatchCtx`.
-/// - `scratch` and mapping tables referenced by `ctx` remain valid and are
-///   not accessed concurrently for the duration of the scan.
+/// - `ctx` must be non-null and point to a valid `VsAnchorMatchCtx`.
+/// - `scratch` and mapping tables referenced by `ctx` must remain valid and
+///   not be accessed concurrently for the duration of the scan.
 /// - This callback must never panic or unwind across the FFI boundary.
-extern "C" fn vs_anchor_on_match(
+unsafe extern "C" fn vs_anchor_on_match(
     id: c_uint,
     _from: u64,
     to: u64,
@@ -2247,41 +2342,17 @@ extern "C" fn vs_anchor_on_match(
     // SAFETY: scratch is valid for the duration of the scan and not used concurrently.
     let scratch = unsafe { &mut *c.scratch };
 
-    for i in off_start..off_end {
-        // SAFETY: i is in off_start..off_end which indexes into the targets
-        // array (ctx invariant: pat_offsets[pat_count] == targets.len()).
-        let target = unsafe { *c.targets.add(i) };
-        let seed = target.seed_radius_bytes;
-        let lo = start.saturating_sub(seed);
-        let hi = end.saturating_add(seed).min(c.hay_len);
-
-        // Anchor patterns are fixed-width; use the computed start as the hint to
-        // avoid relying on `from` for prefilter-style callbacks.
-        let anchor_hint = clamp_u32_ordered(start, lo, end);
-
-        let rid = target.rule_id as usize;
-        let vidx = target.variant_idx as usize;
-
-        let pair = rid * 3 + vidx;
-        debug_assert!(
-            pair < scratch.hit_acc_pool.pair_count(),
-            "pair {pair} exceeds pool pair_count {}",
-            scratch.hit_acc_pool.pair_count()
+    // SAFETY: offsets are derived from `pat_offsets` bounds checked above.
+    unsafe {
+        enqueue_anchor_target_spans(
+            scratch,
+            c.targets,
+            off_start..off_end,
+            start,
+            end,
+            c.hay_len,
+            &mut c.saw_utf16,
         );
-        unsafe {
-            scratch.hit_acc_pool.push_span_unchecked_hot(
-                pair,
-                SpanU32 {
-                    start: lo,
-                    end: hi,
-                    anchor_hint,
-                },
-                &mut scratch.touched_pairs,
-            );
-        }
-        if matches!(target.variant_idx, 1 | 2) {
-            c.saw_utf16 = true;
-        }
     }
 
     0
@@ -2509,6 +2580,59 @@ mod tests {
         assert_eq!(stored.rule_id, 7);
         assert_eq!(stored.variant_idx, 2);
         assert!(stored.force_full);
+    }
+
+    #[test]
+    fn stream_match_callback_terminates_on_overflow() {
+        let mut pending: Vec<VsStreamWindow> = Vec::new();
+        let mut pending_len = 0u32;
+        let mut overflowed = 0u8;
+        let meta = [VsStreamMeta {
+            max_width: 8,
+            radius: 4,
+            whole_buffer_on_hit: 0,
+        }];
+        let mut ctx =
+            build_stream_match_ctx(&mut pending, &mut pending_len, &meta, 0, &mut overflowed);
+
+        let rc =
+            unsafe { vs_on_stream_match(0, 10, 20, 0, (&mut ctx as *mut VsStreamMatchCtx).cast()) };
+        assert_eq!(rc, 1);
+        assert_eq!(overflowed, 1);
+        assert_eq!(pending_len, 0);
+    }
+
+    #[test]
+    fn utf16_stream_callback_terminates_on_overflow() {
+        let mut pending: Vec<VsStreamWindow> = Vec::new();
+        let mut pending_len = 0u32;
+        let mut overflowed = 0u8;
+        let targets = [VsAnchorTarget {
+            rule_id: 7,
+            variant_idx: 1,
+            seed_radius_bytes: 3,
+        }];
+        let pat_offsets = [0u32, 1u32];
+        let pat_lens = [2u32];
+        let mut ctx = build_utf16_stream_match_ctx(
+            &mut pending,
+            &mut pending_len,
+            VsUtf16MatchTables {
+                targets: &targets,
+                pat_offsets: &pat_offsets,
+                pat_lens: &pat_lens,
+            },
+            0,
+            0,
+            &mut overflowed,
+        );
+
+        let rc = unsafe {
+            vs_utf16_stream_on_match(0, 0, 2, 0, (&mut ctx as *mut VsUtf16StreamMatchCtx).cast())
+        };
+        assert_eq!(rc, 1);
+        assert_eq!(overflowed, 1);
+        assert_eq!(pending_len, 0);
     }
 
     #[test]

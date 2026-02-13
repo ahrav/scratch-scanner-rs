@@ -24,7 +24,8 @@ use super::transform::{
 use super::transform::{decode_to_vec, find_base64_spans_into};
 #[cfg(feature = "stdx-proptest")]
 use super::vectorscan_prefilter::{
-    gate_match_callback, stream_match_callback, VsStreamMatchCtx, VsStreamWindow,
+    build_stream_match_ctx, gate_match_callback, stream_match_callback, VsStreamMatchCtx,
+    VsStreamWindow,
 };
 #[cfg(feature = "stdx-proptest")]
 use crate::api::Tuning;
@@ -110,15 +111,13 @@ fn decoded_prefilter_hit(engine: &Engine, decoded: &[u8]) -> bool {
     let pending_cap = u32::try_from(pending.capacity()).unwrap_or(u32::MAX);
     let mut pending_len: u32 = 0;
     let mut overflowed: u8 = 0;
-    let mut ctx = VsStreamMatchCtx {
-        pending_ptr: pending.as_mut_ptr(),
-        pending_len: (&mut pending_len as *mut u32),
+    let mut ctx = build_stream_match_ctx(
+        &mut pending,
+        &mut pending_len,
+        vs_stream.meta(),
         pending_cap,
-        meta: vs_stream.meta().as_ptr(),
-        meta_len: vs_stream.meta().len() as u32,
-        max_pending: pending_cap,
-        overflowed: (&mut overflowed as *mut u8),
-    };
+        &mut overflowed,
+    );
     let cb = stream_match_callback();
 
     if vs_stream

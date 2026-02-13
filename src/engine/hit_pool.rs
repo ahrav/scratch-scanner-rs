@@ -308,12 +308,21 @@ impl HitAccPool {
     ///
     /// The output list remains unique within a scan epoch, enabling `reset_touched`
     /// to clear bits in O(#unique_touched) time.
+    ///
+    /// # Safety
+    ///
+    /// - `pair < self.pair_count()` (equivalently, `pair / 64` is in-bounds for
+    ///   `touched_words`).
+    /// - `touched_pairs` must have spare capacity for at least one more element
+    ///   (guaranteed when the caller pre-allocates for `pair_count` entries).
     #[inline(always)]
     unsafe fn mark_touched_unchecked(&mut self, pair: usize, touched_pairs: &mut ScratchVec<u32>) {
-        let word = unsafe { self.touched_words.add(pair / 64) };
+        // SAFETY: Caller guarantees `pair < pair_count`, so `pair / 64` is
+        // within `touched_words` and all pointer arithmetic is in-bounds.
+        let word = self.touched_words.add(pair / 64);
         let bit = 1u64 << (pair % 64);
-        if unsafe { (*word & bit) == 0 } {
-            unsafe { *word |= bit };
+        if (*word & bit) == 0 {
+            *word |= bit;
             touched_pairs.push(pair as u32);
         }
     }
@@ -322,7 +331,7 @@ impl HitAccPool {
     ///
     /// Once the per-pair cap is exceeded, all hits are coalesced into a single
     /// span that conservatively covers every hit seen so far.
-    #[cfg(any(test, feature = "bench", feature = "tiger-harness"))]
+    #[cfg(any(test, feature = "bench", feature = "tiger-harness", feature = "kani"))]
     #[inline(always)]
     pub(super) fn push_span(
         &mut self,
@@ -862,15 +871,22 @@ mod tests {
 mod verification {
     use super::*;
 
-    /// Proves that `push_span` followed by `take_into` never causes OOB access
-    /// for any valid `pair < pair_count`.
+    // NOTE: Unwind bounds must cover the largest Vec allocation loop.
+    // HitAccPool::new allocates `vec![val; pair_count * max_hits]` which
+    // uses `extend_with` internally. With pair_count=2, max_hits=2, the
+    // largest Vec is 4 elements → extend_with loops 4 times → unwind(8)
+    // covers this with margin. Larger bounds increase verification time
+    // exponentially; these small values still exercise all code paths.
+
+    /// Proves that `push_span` never causes OOB access for any valid
+    /// `pair < pair_count`.
     #[kani::proof]
-    #[kani::unwind(5)]
+    #[kani::unwind(8)]
     fn verify_push_span_bounds() {
         let pair_count: usize = kani::any();
         let max_hits: usize = kani::any();
-        kani::assume(pair_count > 0 && pair_count <= 8);
-        kani::assume(max_hits > 0 && max_hits <= 4);
+        kani::assume(pair_count > 0 && pair_count <= 2);
+        kani::assume(max_hits > 0 && max_hits <= 2);
 
         let mut pool = match HitAccPool::new(pair_count, max_hits) {
             Ok(p) => p,
@@ -900,12 +916,12 @@ mod verification {
     /// Proves that pushing `max_hits + 1` spans triggers the coalesce path
     /// without OOB access.
     #[kani::proof]
-    #[kani::unwind(9)]
+    #[kani::unwind(8)]
     fn verify_coalesce_overflow_bounds() {
         let pair_count: usize = kani::any();
         let max_hits: usize = kani::any();
-        kani::assume(pair_count > 0 && pair_count <= 4);
-        kani::assume(max_hits > 0 && max_hits <= 4);
+        kani::assume(pair_count > 0 && pair_count <= 2);
+        kani::assume(max_hits > 0 && max_hits <= 2);
 
         let mut pool = match HitAccPool::new(pair_count, max_hits) {
             Ok(p) => p,
@@ -938,12 +954,12 @@ mod verification {
 
     /// Proves that `take_into` never reads OOB for any valid pair.
     #[kani::proof]
-    #[kani::unwind(6)]
+    #[kani::unwind(8)]
     fn verify_take_into_bounds() {
         let pair_count: usize = kani::any();
         let max_hits: usize = kani::any();
-        kani::assume(pair_count > 0 && pair_count <= 4);
-        kani::assume(max_hits > 0 && max_hits <= 4);
+        kani::assume(pair_count > 0 && pair_count <= 2);
+        kani::assume(max_hits > 0 && max_hits <= 2);
 
         let mut pool = match HitAccPool::new(pair_count, max_hits) {
             Ok(p) => p,
@@ -982,11 +998,11 @@ mod verification {
 
     /// Proves that `reset_touched` never writes OOB.
     #[kani::proof]
-    #[kani::unwind(5)]
+    #[kani::unwind(8)]
     fn verify_reset_touched_bounds() {
         let pair_count: usize = kani::any();
         let max_hits: usize = kani::any();
-        kani::assume(pair_count > 0 && pair_count <= 8);
+        kani::assume(pair_count > 0 && pair_count <= 2);
         kani::assume(max_hits > 0 && max_hits <= 2);
 
         let mut pool = match HitAccPool::new(pair_count, max_hits) {

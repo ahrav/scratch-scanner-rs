@@ -62,8 +62,9 @@ use super::transform::{
     UrlSpanStream,
 };
 use super::vectorscan_prefilter::{
-    gate_match_callback, stream_match_callback, utf16_stream_match_callback, VsScratch, VsStream,
-    VsStreamDb, VsStreamMatchCtx, VsUtf16StreamMatchCtx,
+    build_stream_match_ctx, build_utf16_stream_match_ctx, gate_match_callback,
+    stream_match_callback, utf16_stream_match_callback, VsScratch, VsStream, VsStreamDb,
+    VsStreamMatchCtx, VsStreamWindow, VsUtf16MatchTables, VsUtf16StreamMatchCtx,
 };
 use super::work_items::{
     EncRef, PendingDecodeSpan, PendingWindow, SpanStreamEntry, SpanStreamState, WorkItem,
@@ -622,6 +623,114 @@ impl Engine {
             }
         };
 
+        let materialize_stream_matches = |matches: &mut Vec<VsStreamWindow>, pending_len: u32| {
+            if pending_len == 0 {
+                return;
+            }
+            // Defensive clamp: `push_stream_window_bounded` guarantees
+            // `pending_len <= pending_cap <= matches.capacity()`, but we clamp
+            // anyway so a stale or corrupted `pending_len` can never cause UB.
+            let safe_len = (pending_len as usize).min(matches.capacity());
+            debug_assert_eq!(
+                safe_len,
+                pending_len as usize,
+                "vs_pending_len ({pending_len}) exceeds stream match capacity ({}); clamped",
+                matches.capacity(),
+            );
+            // SAFETY: `push_stream_window_bounded` initialises elements
+            // `0..pending_len` via `ptr::write` and caps `pending_len` at
+            // `pending_cap`. The `min()` clamp above is a defence-in-depth
+            // guard ensuring we never exceed the allocation even if the
+            // invariant is violated.
+            unsafe {
+                matches.set_len(safe_len);
+            }
+        };
+
+        // Shared ingestion path for callback-produced stream matches.
+        //
+        // Uses `mem::take` to move `vs_stream_matches` out of `scratch`,
+        // drain windows into the timing wheel, then put the (now-empty) Vec
+        // back. This is temporally safe because no Vectorscan scanning occurs
+        // while the Vec is moved out — callbacks only fire during
+        // `scan_stream` / `close_stream`, which are outside this closure.
+        // `ctx.pending_ptr` is refreshed by the caller after each invocation
+        // to stay in sync with the Vec's buffer address.
+        let drain_vs_stream_matches =
+            |scratch: &mut ScanScratch,
+             decoded_offset: u64,
+             prefilter_gate_hit: &mut bool,
+             found_any: &mut bool,
+             force_full: &mut bool,
+             _count_window_cap_stats: bool| {
+                if scratch.vs_stream_matches.is_empty() {
+                    return;
+                }
+                let max_hits = self.tuning.max_windows_per_rule_variant as u32;
+                let mut vs_matches = std::mem::take(&mut scratch.vs_stream_matches);
+                for win in vs_matches.drain(..) {
+                    if win.force_full {
+                        *force_full = true;
+                        break;
+                    }
+                    let variant = match Variant::from_idx(win.variant_idx) {
+                        Some(v) => v,
+                        None => {
+                            debug_assert!(
+                                false,
+                                "Invalid variant_idx {} from Vectorscan callback",
+                                win.variant_idx
+                            );
+                            continue;
+                        }
+                    };
+                    if variant == Variant::Raw {
+                        *prefilter_gate_hit = true;
+                    }
+                    let idx = win.rule_id as usize * 3 + variant.idx();
+                    let hit = &mut scratch.stream_hit_counts[idx];
+                    if *hit == 0 {
+                        scratch.stream_hit_touched.push(idx as u32);
+                    }
+                    *hit = hit.saturating_add(1);
+                    if *hit > max_hits {
+                        #[cfg(feature = "stats")]
+                        if _count_window_cap_stats {
+                            self.vs_stats
+                                .stream_window_cap_exceeded
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        *force_full = true;
+                        break;
+                    }
+                    let pending = PendingWindow {
+                        hi: win.hi,
+                        lo: win.lo,
+                        rule_id: win.rule_id,
+                        variant,
+                        anchor_hint: win.anchor_hint,
+                    };
+                    match scratch.pending_windows.push(pending.hi, pending) {
+                        Ok(PushOutcome::Scheduled) => {}
+                        Ok(PushOutcome::Ready(win)) => {
+                            let hi = win.hi.min(decoded_offset);
+                            process_window(win, hi, scratch, found_any, force_full);
+                            if *force_full {
+                                break;
+                            }
+                        }
+                        Err(_e) => {
+                            #[cfg(debug_assertions)]
+                            eprintln!("TimingWheel push failed: {:?}", _e);
+                            *force_full = true;
+                            break;
+                        }
+                    }
+                }
+                vs_matches.clear();
+                scratch.vs_stream_matches = vs_matches;
+            };
+
         if depth < self.tuning.max_transform_depth {
             for (tidx, tcfg) in self.transforms.iter().enumerate() {
                 if tcfg.mode == TransformMode::Disabled {
@@ -665,27 +774,26 @@ impl Engine {
             .min(stream_pending_cap);
         let mut vs_pending_len: u32 = 0;
         let mut vs_match_overflowed: u8 = 0;
-        let mut ctx = VsStreamMatchCtx {
-            pending_ptr: scratch.vs_stream_matches.as_mut_ptr(),
-            pending_len: (&mut vs_pending_len as *mut u32),
-            pending_cap: stream_pending_cap,
-            meta: vs_stream.meta().as_ptr(),
-            meta_len: vs_stream.meta().len() as u32,
-            max_pending: max_stream_pending,
-            overflowed: (&mut vs_match_overflowed as *mut u8),
-        };
+        let mut ctx = build_stream_match_ctx(
+            &mut scratch.vs_stream_matches,
+            &mut vs_pending_len,
+            vs_stream.meta(),
+            max_stream_pending,
+            &mut vs_match_overflowed,
+        );
 
         let mut decoded_offset: u64 = 0;
         // Streamed 128-bit fingerprint via AEGIS-128L MAC.
         //
         // Avoids buffering the full decoded output just for deduplication:
         // each decoded chunk is fed to `mac.update()` and the final digest
-        // is checked against `scratch.seen`. AEGIS-128L is chosen over
-        // SipHash (used by `hash128` in the full-buffer path) because it
-        // supports incremental `update()` calls — SipHash would require
-        // materializing the entire decoded output first, defeating the
-        // purpose of streaming. A fixed zero key is acceptable because we
-        // need collision resistance, not authentication.
+        // is checked against `scratch.seen`. The full-buffer path uses
+        // `hash128`, a convenience wrapper that takes a complete `&[u8]`.
+        // AEGIS-128L's `Aegis128LMac` exposes an incremental `update()`
+        // API natively, so we can hash each decoded chunk as it arrives
+        // without collecting the entire output. A fixed zero key is
+        // acceptable because we need collision resistance, not
+        // authentication.
         let key = [0u8; 16];
         let mut mac = aegis::aegis128l::Aegis128LMac::<16>::new(&key);
 
@@ -765,6 +873,10 @@ impl Engine {
                 return ControlFlow::Break(());
             }
             if vs_match_overflowed != 0 {
+                #[cfg(feature = "stats")]
+                self.vs_stats
+                    .stream_callback_overflow
+                    .fetch_add(1, Ordering::Relaxed);
                 force_full = true;
                 return ControlFlow::Break(());
             }
@@ -826,18 +938,27 @@ impl Engine {
                             }
                         };
                         let base_offset = scratch.decode_ring.start_offset();
-                        let mut uctx = VsUtf16StreamMatchCtx {
-                            pending_ptr: ctx.pending_ptr,
-                            pending_len: ctx.pending_len,
-                            pending_cap: ctx.pending_cap,
-                            targets: db.targets().as_ptr(),
-                            pat_offsets: db.pat_offsets().as_ptr(),
-                            pat_lens: db.pat_lens().as_ptr(),
-                            pat_count: db.pat_lens().len() as u32,
+                        // Shared-sink invariant: `uctx` shares `pending_ptr`,
+                        // `pending_len`, and `overflowed` with the main `ctx`.
+                        // This is safe because the main stream and UTF-16
+                        // stream never scan concurrently — they alternate
+                        // within the same decode-loop iteration (Phase 4 then
+                        // Phase 6), so at most one callback is active at a
+                        // time. The single `vs_pending_len` / `vs_match_overflowed`
+                        // accumulates matches from both streams for unified
+                        // draining in Phase 7.
+                        let mut uctx = build_utf16_stream_match_ctx(
+                            &mut scratch.vs_stream_matches,
+                            &mut vs_pending_len,
+                            VsUtf16MatchTables {
+                                targets: db.targets(),
+                                pat_offsets: db.pat_offsets(),
+                                pat_lens: db.pat_lens(),
+                            },
                             base_offset,
-                            max_pending: max_stream_pending,
-                            overflowed: (&mut vs_match_overflowed as *mut u8),
-                        };
+                            max_stream_pending,
+                            &mut vs_match_overflowed,
+                        );
                         let (seg1, seg2) = scratch.decode_ring.segments();
                         if !seg1.is_empty()
                             && db
@@ -910,85 +1031,23 @@ impl Engine {
             }
 
             // ── Phase 7: Vectorscan match → PendingWindow enqueue ────────
-            if vs_pending_len != 0 {
-                debug_assert!(
-                    (vs_pending_len as usize) <= scratch.vs_stream_matches.capacity(),
-                    "vs_pending_len ({vs_pending_len}) exceeds stream match capacity ({})",
-                    scratch.vs_stream_matches.capacity(),
-                );
-                // SAFETY: callbacks cap vs_pending_len to stream_pending_cap.
-                unsafe {
-                    scratch.vs_stream_matches.set_len(vs_pending_len as usize);
-                }
-                let max_hits = self.tuning.max_windows_per_rule_variant as u32;
-                let mut vs_matches = std::mem::take(&mut scratch.vs_stream_matches);
-                for win in vs_matches.drain(..) {
-                    // `force_full` is set by the Vectorscan callback when a
-                    // match window exceeds representable bounds or the callback
-                    // detects an unrecoverable state (see `VsStreamWindow`).
-                    if win.force_full {
-                        force_full = true;
-                        break;
-                    }
-                    let variant = match Variant::from_idx(win.variant_idx) {
-                        Some(v) => v,
-                        None => {
-                            debug_assert!(
-                                false,
-                                "Invalid variant_idx {} from Vectorscan callback",
-                                win.variant_idx
-                            );
-                            continue;
-                        }
-                    };
-                    if variant == Variant::Raw {
-                        prefilter_gate_hit = true;
-                    }
-                    let idx = win.rule_id as usize * 3 + variant.idx();
-                    let hit = &mut scratch.stream_hit_counts[idx];
-                    if *hit == 0 {
-                        scratch.stream_hit_touched.push(idx as u32);
-                    }
-                    *hit = hit.saturating_add(1);
-                    if *hit > max_hits {
-                        // Too many windows for this rule/variant; bail to full decode.
-                        #[cfg(feature = "stats")]
-                        self.vs_stats
-                            .stream_window_cap_exceeded
-                            .fetch_add(1, Ordering::Relaxed);
-                        force_full = true;
-                        break;
-                    }
-                    let pending = PendingWindow {
-                        hi: win.hi,
-                        lo: win.lo,
-                        rule_id: win.rule_id,
-                        variant,
-                        anchor_hint: win.anchor_hint,
-                    };
-                    match scratch.pending_windows.push(pending.hi, pending) {
-                        Ok(PushOutcome::Scheduled) => {}
-                        Ok(PushOutcome::Ready(win)) => {
-                            let hi = win.hi.min(decoded_offset);
-                            process_window(win, hi, scratch, &mut found_any, &mut force_full);
-                            if force_full {
-                                break;
-                            }
-                        }
-                        Err(_e) => {
-                            #[cfg(debug_assertions)]
-                            eprintln!("TimingWheel push failed: {:?}", _e);
-                            force_full = true;
-                            break;
-                        }
-                    }
-                }
-                vs_matches.clear();
-                scratch.vs_stream_matches = vs_matches;
-                vs_pending_len = 0;
-                if force_full {
-                    return ControlFlow::Break(());
-                }
+            materialize_stream_matches(&mut scratch.vs_stream_matches, vs_pending_len);
+            drain_vs_stream_matches(
+                scratch,
+                decoded_offset,
+                &mut prefilter_gate_hit,
+                &mut found_any,
+                &mut force_full,
+                true,
+            );
+            vs_pending_len = 0;
+            // Refresh `ctx.pending_ptr` after the take/put-back cycle in
+            // `drain_vs_stream_matches`. In practice `Vec::clear()` never
+            // reallocates so the pointer is stable, but re-reading it is
+            // zero-cost and guards against future changes to the drain path.
+            ctx.pending_ptr = scratch.vs_stream_matches.as_mut_ptr();
+            if force_full {
+                return ControlFlow::Break(());
             }
 
             decoded_offset = decoded_offset.saturating_add(chunk.len() as u64);
@@ -1212,18 +1271,12 @@ impl Engine {
         // which may emit additional matches not seen during the streaming loop.
         // Propagate those matches into `vs_stream_matches` so the post-stream
         // processing below can handle them.
-        if vs_pending_len != 0 {
-            debug_assert!(
-                (vs_pending_len as usize) <= scratch.vs_stream_matches.capacity(),
-                "vs_pending_len ({vs_pending_len}) exceeds stream match capacity ({})",
-                scratch.vs_stream_matches.capacity(),
-            );
-            // SAFETY: callbacks cap vs_pending_len to stream_pending_cap.
-            unsafe {
-                scratch.vs_stream_matches.set_len(vs_pending_len as usize);
-            }
-        }
+        materialize_stream_matches(&mut scratch.vs_stream_matches, vs_pending_len);
         if vs_match_overflowed != 0 {
+            #[cfg(feature = "stats")]
+            self.vs_stats
+                .stream_callback_overflow
+                .fetch_add(1, Ordering::Relaxed);
             force_full = true;
         }
 
@@ -1257,68 +1310,14 @@ impl Engine {
 
         // ── Post-stream: process close_stream flush matches + finish spans ─
         if res.is_ok() {
-            if !scratch.vs_stream_matches.is_empty() {
-                let max_hits = self.tuning.max_windows_per_rule_variant as u32;
-                let mut vs_matches = std::mem::take(&mut scratch.vs_stream_matches);
-                for win in vs_matches.drain(..) {
-                    if win.force_full {
-                        force_full = true;
-                        break;
-                    }
-                    let variant = match Variant::from_idx(win.variant_idx) {
-                        Some(v) => v,
-                        None => {
-                            debug_assert!(
-                                false,
-                                "Invalid variant_idx {} from Vectorscan callback",
-                                win.variant_idx
-                            );
-                            continue;
-                        }
-                    };
-                    if variant == Variant::Raw {
-                        prefilter_gate_hit = true;
-                    }
-                    let idx = win.rule_id as usize * 3 + variant.idx();
-                    let hit = &mut scratch.stream_hit_counts[idx];
-                    if *hit == 0 {
-                        scratch.stream_hit_touched.push(idx as u32);
-                    }
-                    *hit = hit.saturating_add(1);
-                    if *hit > max_hits {
-                        force_full = true;
-                        break;
-                    }
-                    let pending = PendingWindow {
-                        hi: win.hi,
-                        lo: win.lo,
-                        rule_id: win.rule_id,
-                        variant,
-                        anchor_hint: win.anchor_hint,
-                    };
-                    match scratch.pending_windows.push(pending.hi, pending) {
-                        Ok(PushOutcome::Scheduled) => {}
-                        Ok(PushOutcome::Ready(win)) => {
-                            let hi = win.hi.min(decoded_offset);
-                            process_window(win, hi, scratch, &mut found_any, &mut force_full);
-                            if force_full {
-                                break;
-                            }
-                        }
-                        Err(_e) => {
-                            #[cfg(debug_assertions)]
-                            eprintln!("TimingWheel push failed: {:?}", _e);
-                            force_full = true;
-                            break;
-                        }
-                    }
-                }
-                vs_matches.clear();
-                scratch.vs_stream_matches = vs_matches;
-                if force_full {
-                    scratch.vs_stream_matches.clear();
-                }
-            }
+            drain_vs_stream_matches(
+                scratch,
+                decoded_offset,
+                &mut prefilter_gate_hit,
+                &mut found_any,
+                &mut force_full,
+                false,
+            );
             if !force_full {
                 for entry in scratch.span_streams.iter_mut() {
                     let end_offset = decoded_offset;
