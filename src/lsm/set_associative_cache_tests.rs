@@ -390,8 +390,8 @@ proptest! {
 
 // ---- AVX2 compress_u16_mask equivalence ----
 
-/// Verify that the 32-bit compress (used by AVX2 u16 path) produces the same
-/// result as splitting into two 16-bit compresses and combining (SSE2 approach).
+// Verify that the 32-bit compress (used by AVX2 u16 path) produces the same
+// result as splitting into two 16-bit compresses and combining (SSE2 approach).
 #[cfg(target_arch = "x86_64")]
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(
