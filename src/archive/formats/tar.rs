@@ -65,8 +65,7 @@ pub enum TarInput {
 }
 
 impl TarInput {
-    // #[inline(always)]
-    #[inline(never)]
+    #[inline(always)]
     pub fn take_compressed_delta(&mut self) -> u64 {
         match self {
             TarInput::Plain(_) => 0,
@@ -91,16 +90,14 @@ impl Read for TarInput {
 /// - `take_compressed_delta()` returns the number of compressed bytes consumed
 ///   since the last call (or 0 for uncompressed sources).
 pub trait TarRead: Read {
-    // #[inline(always)]
-    #[inline(never)]
+    #[inline(always)]
     fn take_compressed_delta(&mut self) -> u64 {
         0
     }
 }
 
 impl TarRead for TarInput {
-    // #[inline(always)]
-    #[inline(never)]
+    #[inline(always)]
     fn take_compressed_delta(&mut self) -> u64 {
         TarInput::take_compressed_delta(self)
     }
@@ -109,16 +106,14 @@ impl TarRead for TarInput {
 impl TarRead for File {}
 
 impl<R: Read> TarRead for GzipStream<R> {
-    // #[inline(always)]
-    #[inline(never)]
+    #[inline(always)]
     fn take_compressed_delta(&mut self) -> u64 {
         self.take_compressed_delta()
     }
 }
 
 impl<T: TarRead + ?Sized> TarRead for &mut T {
-    // #[inline(always)]
-    #[inline(never)]
+    #[inline(always)]
     fn take_compressed_delta(&mut self) -> u64 {
         (**self).take_compressed_delta()
     }
@@ -150,8 +145,7 @@ pub struct TarEntryMeta<'a> {
 }
 
 impl<'a> TarEntryMeta<'a> {
-    // #[inline(always)]
-    #[inline(never)]
+    #[inline(always)]
     pub fn is_regular(&self) -> bool {
         self.typeflag == 0 || self.typeflag == b'0'
     }
@@ -719,9 +713,9 @@ fn cstr_bytes(field: &[u8]) -> &[u8] {
 
 /// Parse a tar size field as NUL/space-padded ASCII octal.
 ///
-/// Returns `Some(0)` for an empty or all-whitespace field. Wrapping
-/// multiplication is used intentionally: oversized values wrap to a benign
-/// number rather than panicking, and the budget system caps actual I/O.
+/// Returns `Some(0)` for an empty or all-whitespace field. Returns `None`
+/// when the accumulated value overflows `u64`, rejecting malformed entries
+/// rather than silently wrapping.
 fn parse_tar_size_octal(field: &[u8]) -> Option<u64> {
     // tar size field is NUL/space padded octal.
     let mut i = 0;
@@ -734,6 +728,13 @@ fn parse_tar_size_octal(field: &[u8]) -> Option<u64> {
     }
     if end == i {
         return Some(0);
+    }
+    // 21 octal digits ≤ 63 bits (8^21 − 1 = 2^63 − 1), which fits in u64.
+    // Reject anything longer up-front so the loop can use wrapping arithmetic
+    // without overflow risk.  Standard tar fields are 12 bytes, so this guard
+    // only fires on pathologically crafted inputs.
+    if end - i > 21 {
+        return None;
     }
     let mut v: u64 = 0;
     for &d in &field[i..end] {
@@ -992,6 +993,25 @@ mod tests {
     fn parse_octal_size() {
         assert_eq!(parse_tar_size_octal(b"0000000010\0"), Some(8));
         assert_eq!(parse_tar_size_octal(b"        \0"), Some(0));
+    }
+
+    #[test]
+    fn parse_octal_rejects_overflow() {
+        // 21 octal sevens = 8^21 − 1 = 2^63 − 1: max safe digit count.
+        let max_safe = b"777777777777777777777";
+        assert_eq!(
+            parse_tar_size_octal(max_safe),
+            Some((1u64 << 63) - 1),
+            "21 octal digits must be accepted",
+        );
+
+        // 22 octal digits can overflow u64 → must be rejected.
+        let overflow_input = b"7777777777777777777777";
+        assert_eq!(
+            parse_tar_size_octal(overflow_input),
+            None,
+            "22+ octal digits must be rejected",
+        );
     }
 
     #[test]
