@@ -4176,7 +4176,7 @@ fn validate_findings(engine: &Engine, root: &[u8], findings: &[Finding]) -> Resu
         let mut matched = false;
         for caps in rule.re.captures_iter(&buf) {
             // Extract secret span to match production behavior.
-            let (secret_start, secret_end) = extract_secret_span(&caps, rule.secret_group);
+            let (secret_start, secret_end) = extract_secret_span(&caps, rule.secret_group());
             if secret_start == finding.span.start && secret_end == finding.span.end {
                 matched = true;
                 break;

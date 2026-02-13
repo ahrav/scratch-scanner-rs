@@ -49,8 +49,7 @@ classDiagram
     class RuleCompiled {
         -Regex re
         -Option~&'static [u8]~ must_contain
-        -bool needs_assignment_shape_check
-        -Option~u16~ secret_group
+        -u32 rule_meta
         -u32 confirm_all
         -u32 keywords
         -u32 value_suppressors
@@ -311,6 +310,12 @@ classDiagram
   `Invalid` suppresses it before the finding occupies a cap slot. Non-root
   (transform-derived) findings are always kept. Suppressed findings increment
   `ScanScratch.offline_suppressed`.
+- `RuleCompiled.rule_meta` packs three hot fields:
+  - bits 0..=15: `secret_group` value (when override-present bit is set)
+  - bit 16: `needs_assignment_shape_check`
+  - bit 17: `has_secret_group_override`
+  This keeps `RuleCompiled` at 80 bytes on 64-bit targets while preserving
+  full `u16` capture-group semantics.
 - `Engine.required_overlap()` is computed as:
   `max_window_diameter_bytes + (max_prefilter_width - 1)`.
 - `StepId` and `FindingRec.step_id` are only valid while the originating
