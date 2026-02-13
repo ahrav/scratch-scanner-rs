@@ -76,6 +76,11 @@ name = "structures"
 harness = false
 
 [[bench]]
+name = "helpers"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
 name = "hotspots"
 harness = false
 required-features = ["bench"]

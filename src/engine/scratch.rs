@@ -105,20 +105,16 @@ const FINDING_DEDUPE_MULTIPLIER: usize = 32;
 /// after the gate check.
 ///
 /// # Invariants
-/// - `used_len <= 256`.
-/// - `used[0..used_len]` tracks which counters were incremented since
-///   the last reset.
-/// - **All counters outside the `used` set must be zero.** Violating this
-///   produces silently wrong entropy calculations because leftover counts
-///   inflate the histogram.
+/// - **All counters must be zero before and after each entropy check.**
+///   The histogram loop increments bins and the reset zeroes the entire
+///   array via `memset`. This trades O(256) reset cost for a branchless
+///   histogram loop (no per-byte "first touch" tracking), which is a net
+///   win since the histogram loop runs N times (N = input length) while
+///   the reset runs once.
 #[derive(Clone, Copy)]
 pub(super) struct EntropyScratch {
     /// Byte-frequency histogram (256 bins, one per byte value).
     pub(super) counts: [u32; 256],
-    /// Indices of non-zero bins, enabling O(distinct) reset instead of O(256).
-    pub(super) used: [u8; 256],
-    /// Number of valid entries in `used[0..used_len]`.
-    pub(super) used_len: u16,
 }
 
 /// Context for mapping decoded spans back to root (encoded) coordinates.
@@ -322,27 +318,22 @@ impl RootSpanMapCtx {
 unsafe impl Send for RootSpanMapCtx {}
 
 impl EntropyScratch {
-    /// Returns a zeroed histogram with no tracked byte values.
+    /// Returns a zeroed histogram.
     pub(super) fn new() -> Self {
         Self {
             counts: [0u32; 256],
-            used: [0u8; 256],
-            used_len: 0,
         }
     }
 
-    /// Resets only the histogram bins that were incremented since the last reset.
+    /// Zeroes all 256 histogram bins.
     ///
-    /// This is O(distinct byte values seen) rather than O(256), which matters
-    /// when entropy checks are frequent but candidate matches are short.
+    /// This is O(256) via `memset`, which on modern ARM (stp loop) is very
+    /// fast — typically 2-3 ns for 1 KiB. The constant cost eliminates the
+    /// per-byte branch that the previous "touched list" approach required
+    /// in the histogram loop.
     #[inline]
     pub(super) fn reset(&mut self) {
-        let used_len = self.used_len as usize;
-        for i in 0..used_len {
-            let b = self.used[i] as usize;
-            self.counts[b] = 0;
-        }
-        self.used_len = 0;
+        self.counts = [0u32; 256];
     }
 }
 
