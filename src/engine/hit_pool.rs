@@ -511,11 +511,24 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_pointer_width = "32")]
     fn new_rejects_windows_size_overflow() {
         match HitAccPool::new((usize::MAX / 2) + 1, 2) {
             Ok(_) => panic!("pair_count * max_hits overflow must be rejected"),
             Err(err) => assert!(
                 err.contains("windows size overflow"),
+                "unexpected error: {err}"
+            ),
+        }
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn new_prefers_pair_count_overflow_guard_on_64bit() {
+        match HitAccPool::new((usize::MAX / 2) + 1, 2) {
+            Ok(_) => panic!("pair_count values above u32::MAX must be rejected"),
+            Err(err) => assert!(
+                err.contains("pair_count exceeds u32::MAX"),
                 "unexpected error: {err}"
             ),
         }
