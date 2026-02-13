@@ -26,7 +26,10 @@
 //! Streaming will fall back to full decode when any of the following happen:
 //! - the per-rule window cap is exceeded (risking unbounded work),
 //! - a decoded window/span cannot be reconstructed from the ring,
-//! - decode budgets are exceeded or the stream decoder errors.
+//! - decode budgets are exceeded or timing-wheel enqueue fails.
+//!
+//! Decoder errors/truncation are handled as hard aborts for the stream path:
+//! staged stream output is discarded and this call returns without fallback.
 //!
 //! ## Gate behavior
 //! For `Gate::AnchorsInDecoded`, the preferred path is the decoded-space
@@ -34,9 +37,11 @@
 //! may relax enforcement to avoid dropping UTF-16-only matches.
 //!
 //! ## Borrowing model
-//! We use raw pointers in a few tight loops to avoid holding mutable borrows
-//! across timing-wheel callbacks. These pointers are scoped to the call and
-//! never outlive `decode_stream_and_scan`.
+//! Timing-wheel drains use a collect-then-process pattern: windows are
+//! batch-drained into a `Vec` first, then processed sequentially. This
+//! avoids holding a mutable borrow on `pending_windows` during window
+//! processing. The `process_window` closure uses a zero-copy ring path
+//! when the window data is contiguous in the ring buffer.
 
 use crate::api::{DecodeStep, FileId, StepId};
 use crate::stdx::PushOutcome;
@@ -263,6 +268,61 @@ impl Engine {
         out.len() == needed
     }
 
+    /// Rolls back stream-local state and delegates to full-span fallback decode.
+    ///
+    /// This helper is used by both force-full checkpoints to keep rollback
+    /// behavior identical across pre/post close-stream processing.
+    ///
+    /// # Effects
+    /// - Restores slab length and decode-budget counters to their pre-stream
+    ///   checkpoints.
+    /// - Clears all stream-staged windows/spans/findings.
+    /// - Invokes `decode_span_fallback` once with the original encoded input.
+    #[allow(clippy::too_many_arguments)]
+    fn rollback_stream_and_fallback(
+        &self,
+        tc: &TransformConfig,
+        transform_idx: usize,
+        enc_ref: &EncRef,
+        encoded: &[u8],
+        step_id: StepId,
+        root_hint: &Option<Range<usize>>,
+        depth: usize,
+        scratch: &mut ScanScratch,
+        slab_start: usize,
+        total_decode_start: usize,
+        count_force_full_stat: bool,
+    ) {
+        #[cfg(feature = "stats")]
+        if count_force_full_stat {
+            self.vs_stats
+                .stream_force_full
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "stats"))]
+        let _ = count_force_full_stat;
+
+        scratch.slab.buf.truncate(slab_start);
+        scratch.total_decode_output_bytes = total_decode_start;
+        scratch.pending_windows.reset();
+        scratch.vs_stream_matches.clear();
+        scratch.pending_spans.clear();
+        scratch.span_streams.clear();
+        scratch.tmp_findings.clear();
+        scratch.tmp_drop_hint_end.clear();
+        scratch.tmp_norm_hash.clear();
+        self.decode_span_fallback(
+            tc,
+            transform_idx,
+            enc_ref,
+            encoded,
+            step_id,
+            root_hint.clone(),
+            depth,
+            scratch,
+        );
+    }
+
     /// Stream-decodes `encoded` and scans windows without materializing the full buffer.
     ///
     /// # Strategy
@@ -330,6 +390,8 @@ impl Engine {
     ///   (promoted to `work_q`). Updates decode budgets and dedupe state.
     /// - On `force_full`, rolls back all streaming state (slab, budgets, staging
     ///   buffers) and falls through to `decode_span_fallback`.
+    /// - On decoder error/truncation, aborts this stream attempt, discards
+    ///   staged output, and returns without forcing full fallback.
     /// - All Vectorscan scratch/stream resources are returned to `scratch` on
     ///   every exit path (normal, error, and force-full).
     #[allow(clippy::too_many_arguments)]
@@ -453,10 +515,12 @@ impl Engine {
         // Materialize the decoded window [lo, hi) and run the matched rule.
         //
         // Resolution cascade (cheapest first):
-        //   1. Ring buffer extraction — O(hi−lo), zero-copy when contiguous.
-        //   2. Re-decode from `encoded` — O(encoded.len()), replays the
+        //   1. Zero-copy ring slice — O(1) when the window is contiguous in
+        //      the ring buffer (the common case for small windows).
+        //   2. Ring buffer copy — O(hi−lo), copies into `window_bytes`.
+        //   3. Re-decode from `encoded` — O(encoded.len()), replays the
         //      transform to reconstruct evicted bytes.
-        //   3. Abort — sets `force_full`, causing the caller to discard all
+        //   4. Abort — sets `force_full`, causing the caller to discard all
         //      streaming state and fall back to `decode_span_fallback`.
         let process_window = |win: PendingWindow,
                               hi: u64,
@@ -470,32 +534,38 @@ impl Engine {
             if hi <= lo {
                 return;
             }
-            scratch.window_bytes.clear();
-            // Prefer the ring buffer; re-decode if the window is no longer resident.
-            if !scratch
-                .decode_ring
-                .extend_range_to(lo, hi, &mut scratch.window_bytes)
-                && !self.redecode_window_into(
-                    tc,
-                    encoded,
-                    lo,
-                    hi,
-                    max_out,
-                    &mut scratch.window_bytes,
-                )
-            {
-                *force_full = true;
-                return;
-            }
-            let (bytes_ptr, bytes_len) = {
-                let bytes = &scratch.window_bytes;
-                (bytes.as_ptr(), bytes.len())
+
+            // Try zero-copy path first: if the window is contiguous in the ring
+            // buffer we can scan the slice directly without copying.
+            let bytes: &[u8] = if let Some(slice) = scratch.decode_ring.contiguous_range(lo, hi) {
+                // SAFETY: The scan functions (`run_rule_on_raw_window_into`,
+                // `run_rule_on_utf16_window_into`) do not touch `decode_ring`;
+                // the slice is consumed before any ring mutation.
+                unsafe { std::slice::from_raw_parts(slice.as_ptr(), slice.len()) }
+            } else {
+                // Fall back to copying from the ring (or re-decoding).
+                scratch.window_bytes.clear();
+                if !scratch
+                    .decode_ring
+                    .extend_range_to(lo, hi, &mut scratch.window_bytes)
+                    && !self.redecode_window_into(
+                        tc,
+                        encoded,
+                        lo,
+                        hi,
+                        max_out,
+                        &mut scratch.window_bytes,
+                    )
+                {
+                    *force_full = true;
+                    return;
+                }
+                let (ptr, len) = (scratch.window_bytes.as_ptr(), scratch.window_bytes.len());
+                // SAFETY: `window_bytes` is not mutated until after this
+                // slice is consumed; the pointer does not escape.
+                unsafe { std::slice::from_raw_parts(ptr, len) }
             };
-            // SAFETY: `bytes_ptr` comes from `scratch.window_bytes`. We materialize the slice
-            // from a raw pointer to avoid borrowing `scratch` across calls that mutate other
-            // scratch fields. `window_bytes` is not mutated until after this slice is consumed,
-            // and the slice never escapes this function.
-            let bytes = unsafe { std::slice::from_raw_parts(bytes_ptr, bytes_len) };
+
             let rule = &self.rules_hot[win.rule_id as usize];
             let gates = self.resolve_gates(rule);
             match win.variant {
@@ -534,19 +604,6 @@ impl Engine {
                 }
             }
         };
-
-        // Raw pointers used in `advance_and_drain` callbacks.
-        //
-        // `advance_and_drain` holds `&mut scratch.pending_windows`. The callback
-        // must access other scratch fields (`window_bytes`, `tmp_findings`, etc.)
-        // through a raw pointer to avoid a double `&mut ScanScratch` borrow.
-        //
-        // SAFETY: No aliasing violation because the callback never touches
-        // `pending_windows` (the field under the existing `&mut`). All pointers
-        // derive from stack locals in this function and do not escape it.
-        let scratch_ptr = scratch as *mut ScanScratch;
-        let found_any_ptr = &mut found_any as *mut bool;
-        let force_full_ptr = &mut force_full as *mut bool;
 
         if depth < self.tuning.max_transform_depth {
             for (tidx, tcfg) in self.transforms.iter().enumerate() {
@@ -608,7 +665,21 @@ impl Engine {
                 .saturating_add(encoded.len() as u64);
         }
 
+        // ── Main decode loop ──────────────────────────────────────────────
+        //
+        // Each decoded chunk passes through these phases in order:
+        //
+        //   1. Budget enforcement (per-transform + global decode limits)
+        //   2. UTF-16 slab buffering (conditional; feeds block scanner later)
+        //   3. Accounting (local_out, total_decode_output_bytes, MAC update)
+        //   4. Ring buffer push + Vectorscan stream scan (raw anchors)
+        //   5. Gate DB scan (decoded-space anchor gating, if enabled)
+        //   6. UTF-16 stream activation / feeding (lazy on first NUL byte)
+        //   7. Vectorscan match → PendingWindow enqueue (timing wheel)
+        //   8. Timing wheel drain → process_window for expired windows
+        //   9. Span stream feeding (nested transform detection)
         let res = stream_decode(tc, encoded, |chunk| {
+            // ── Phase 1: Budget enforcement ──────────────────────────────
             if local_out.saturating_add(chunk.len()) > max_out {
                 truncated = true;
                 return ControlFlow::Break(());
@@ -622,6 +693,7 @@ impl Engine {
                 return ControlFlow::Break(());
             }
 
+            // ── Phase 2: UTF-16 slab buffering (conditional) ────────────
             if want_utf16_scan && !use_utf16_stream {
                 // We need the full decoded buffer to run the UTF-16 scanner later.
                 if scratch.slab.buf.len().saturating_add(chunk.len()) > scratch.slab.limit {
@@ -635,6 +707,7 @@ impl Engine {
                 }
             }
 
+            // ── Phase 3: Accounting ──────────────────────────────────────
             local_out = local_out.saturating_add(chunk.len());
             scratch.total_decode_output_bytes = scratch
                 .total_decode_output_bytes
@@ -643,6 +716,7 @@ impl Engine {
             mac.update(chunk);
             scratch.decode_ring.push(chunk);
 
+            // ── Phase 4: Vectorscan stream scan (raw anchors) ───────────
             if vs_stream
                 .scan_stream(
                     &mut stream,
@@ -657,6 +731,7 @@ impl Engine {
                 return ControlFlow::Break(());
             }
 
+            // ── Phase 5: Gate DB scan ─────────────────────────────────────
             if gate_db_active && gate_hit == 0 {
                 if let (Some(db), Some(gstream), Some(gscratch)) = (
                     self.vs_gate.as_ref(),
@@ -679,6 +754,7 @@ impl Engine {
                 }
             }
 
+            // ── Phase 6: UTF-16 stream activation / feeding ─────────────
             if use_utf16_stream {
                 if let Some(db) = self.vs_utf16_stream.as_ref() {
                     let mut scanned_chunk = false;
@@ -779,6 +855,7 @@ impl Engine {
                 }
             }
 
+            // ── Phase 7: Vectorscan match → PendingWindow enqueue ────────
             if !scratch.vs_stream_matches.is_empty() {
                 let max_hits = self.tuning.max_windows_per_rule_variant as u32;
                 let mut vs_matches = std::mem::take(&mut scratch.vs_stream_matches);
@@ -849,24 +926,28 @@ impl Engine {
 
             decoded_offset = decoded_offset.saturating_add(chunk.len() as u64);
 
+            // ── Phase 8: Timing wheel drain → window processing ─────────
+            //
+            // Batch-drain expired windows: collect first, process second.
+            // This avoids raw-pointer aliasing across the timing-wheel callback.
+            let mut batch = std::mem::take(&mut scratch.drain_batch);
             scratch
                 .pending_windows
-                .advance_and_drain(decoded_offset, |win| {
-                    // SAFETY: pending_windows is mutably borrowed; we only touch other fields.
-                    let scratch = unsafe { &mut *scratch_ptr };
-                    let found_any = unsafe { &mut *found_any_ptr };
-                    let force_full = unsafe { &mut *force_full_ptr };
-                    if *force_full {
-                        return;
-                    }
-                    let hi = win.hi.min(decoded_offset);
-                    process_window(win, hi, scratch, found_any, force_full);
-                });
+                .advance_and_drain_into(decoded_offset, &mut batch);
+            for win in batch.drain(..) {
+                if force_full {
+                    break;
+                }
+                let hi = win.hi.min(decoded_offset);
+                process_window(win, hi, scratch, &mut found_any, &mut force_full);
+            }
+            scratch.drain_batch = batch;
 
             if force_full {
                 return ControlFlow::Break(());
             }
 
+            // ── Phase 9: Span stream feeding (nested transforms) ────────
             let chunk_start = decoded_offset.saturating_sub(chunk.len() as u64);
             if depth < self.tuning.max_transform_depth {
                 // Streaming span detectors emit child decode spans as we go.
@@ -1013,6 +1094,12 @@ impl Engine {
             ControlFlow::Continue(())
         });
 
+        // ── Post-stream: close Vectorscan streams, return scratch ──────
+        //
+        // All stream resources must be returned to `scratch` on every exit
+        // path. The order below (main stream → gate → UTF-16) mirrors the
+        // allocation order for symmetry, though correctness doesn't depend
+        // on it.
         let _ = vs_stream.close_stream(
             stream,
             &mut vs_scratch,
@@ -1055,34 +1142,35 @@ impl Engine {
             scratch.vs_utf16_stream_scratch = Some(vs_utf16_scratch);
         }
 
+        // ── Post-stream: force_full checkpoint 1 ─────────────────────────
+        //
+        // `force_full` can be set during the decode loop (phase 7/8/9) when
+        // a window cap is exceeded, the ring cannot reconstruct a span, or
+        // the timing wheel overflows. This is the first of two rollback
+        // points — the second is at the "force_full checkpoint 2" banner
+        // below. Both perform the identical rollback sequence:
+        // truncate slab, reset budgets, clear staging buffers, then delegate
+        // to `decode_span_fallback`. Two check points are needed because the
+        // post-stream match processing (close_stream flush + end-of-stream
+        // span finishers) can also set `force_full`.
         if force_full {
-            #[cfg(feature = "stats")]
-            self.vs_stats
-                .stream_force_full
-                .fetch_add(1, Ordering::Relaxed);
-            // Roll back streaming state/budgets before falling back to full decode.
-            scratch.slab.buf.truncate(slab_start);
-            scratch.total_decode_output_bytes = total_decode_start;
-            scratch.pending_windows.reset();
-            scratch.vs_stream_matches.clear();
-            scratch.pending_spans.clear();
-            scratch.span_streams.clear();
-            scratch.tmp_findings.clear();
-            scratch.tmp_drop_hint_end.clear();
-            scratch.tmp_norm_hash.clear();
-            self.decode_span_fallback(
+            self.rollback_stream_and_fallback(
                 tc,
                 transform_idx,
                 enc_ref,
                 encoded,
                 step_id,
-                root_hint,
+                &root_hint,
                 depth,
                 scratch,
+                slab_start,
+                total_decode_start,
+                true,
             );
             return;
         }
 
+        // ── Post-stream: process close_stream flush matches + finish spans ─
         if res.is_ok() {
             if !scratch.vs_stream_matches.is_empty() {
                 let max_hits = self.tuning.max_windows_per_rule_variant as u32;
@@ -1279,44 +1367,48 @@ impl Engine {
             }
         }
 
+        // ── Post-stream: final timing wheel drain ─────────────────────────
+        //
+        // Flush all remaining pending windows (advance to u64::MAX). Windows
+        // whose `hi` exceeds the actual decoded length are clamped to
+        // `final_offset` so we don't read past the decoded data.
         if res.is_ok() && !force_full {
             let final_offset = decoded_offset;
-            scratch.pending_windows.advance_and_drain(u64::MAX, |win| {
-                // SAFETY: pending_windows is mutably borrowed; we only touch other fields.
-                let scratch = unsafe { &mut *scratch_ptr };
-                let found_any = unsafe { &mut *found_any_ptr };
-                let force_full = unsafe { &mut *force_full_ptr };
-                if *force_full {
-                    return;
+            let mut batch = std::mem::take(&mut scratch.drain_batch);
+            scratch
+                .pending_windows
+                .advance_and_drain_into(u64::MAX, &mut batch);
+            for win in batch.drain(..) {
+                if force_full {
+                    break;
                 }
                 let hi = win.hi.min(final_offset);
-                process_window(win, hi, scratch, found_any, force_full);
-            });
+                process_window(win, hi, scratch, &mut found_any, &mut force_full);
+            }
+            scratch.drain_batch = batch;
         }
 
+        // ── Post-stream: force_full checkpoint 2 ─────────────────────────
+        // Same rollback as checkpoint 1 above; triggered by post-stream match
+        // processing or end-of-stream span finishers.
         if force_full {
-            scratch.slab.buf.truncate(slab_start);
-            scratch.total_decode_output_bytes = total_decode_start;
-            scratch.pending_windows.reset();
-            scratch.vs_stream_matches.clear();
-            scratch.pending_spans.clear();
-            scratch.span_streams.clear();
-            scratch.tmp_findings.clear();
-            scratch.tmp_drop_hint_end.clear();
-            scratch.tmp_norm_hash.clear();
-            self.decode_span_fallback(
+            self.rollback_stream_and_fallback(
                 tc,
                 transform_idx,
                 enc_ref,
                 encoded,
                 step_id,
-                root_hint,
+                &root_hint,
                 depth,
                 scratch,
+                slab_start,
+                total_decode_start,
+                false,
             );
             return;
         }
 
+        // ── Post-stream: decode error / truncation early-return ─────────
         if res.is_err() || truncated || local_out == 0 || local_out > max_out {
             #[cfg(feature = "b64-stats")]
             if is_b64_gate {
@@ -1335,6 +1427,13 @@ impl Engine {
             return;
         }
 
+        // ── Post-stream: UTF-16 block scan (fallback path) ──────────────
+        //
+        // Activated when: (a) UTF-16 scanning is enabled, (b) the streaming
+        // UTF-16 DB is unavailable (`!use_utf16_stream`), (c) a NUL byte was
+        // observed (NUL ⇒ possible UTF-16 content), and (d) we have decoded
+        // output. In this path the full decoded buffer was buffered in the
+        // slab during the decode loop (Phase 2) for a single-pass block scan.
         if want_utf16_scan && !use_utf16_stream && decoded_has_nul && decoded_full_len > 0 {
             if let Some(vs_utf16) = self.vs_utf16.as_ref() {
                 if let Some(mut vs_utf16_scratch) = scratch.vs_utf16_scratch.take() {
@@ -1586,14 +1685,22 @@ impl Engine {
                 .saturating_add(local_out as u64);
         }
 
+        // ── Post-stream: content-hash dedupe ─────────────────────────────
+        //
+        // Finalize the streamed AEGIS-128L MAC over all decoded chunks to get
+        // a 128-bit content fingerprint. If the same decoded content (at the
+        // same root position) was already scanned, skip — no new findings.
         let h = mix_root_hint_hash(u128::from_le_bytes(mac.finalize()), &root_hint);
         if !scratch.seen.insert(h) {
             scratch.slab.buf.truncate(slab_start);
             return;
         }
 
-        // Commit staged findings now that streaming succeeded and dedupe passed.
-        // `mem::take` + put-back avoids double-borrowing `scratch` while draining.
+        // ── Post-stream: commit staged findings ─────────────────────────
+        //
+        // All-or-nothing: staged findings are only promoted to `scratch.out`
+        // now that the stream completed, dedupe passed, and the gate was
+        // satisfied. `mem::take` + put-back avoids double-borrowing `scratch`.
         let mut tmp_findings = std::mem::take(&mut scratch.tmp_findings);
         let mut tmp_drop_hint_end = std::mem::take(&mut scratch.tmp_drop_hint_end);
         let mut tmp_norm_hash = std::mem::take(&mut scratch.tmp_norm_hash);
@@ -1610,7 +1717,8 @@ impl Engine {
         scratch.tmp_drop_hint_end = tmp_drop_hint_end;
         scratch.tmp_norm_hash = tmp_norm_hash;
 
-        // Promote deferred child spans into the work queue.
+        // ── Post-stream: promote deferred child spans ───────────────────
+        //
         // Deferred because `IfNoFindingsInThisBuffer` transforms must see the
         // final `found_any` state before deciding whether to enqueue.
         let found_any_in_buf = found_any;

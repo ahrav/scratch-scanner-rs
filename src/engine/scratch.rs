@@ -72,6 +72,16 @@ const DEDUP_RULE_ID_BITS: u32 = 24;
 /// Maximum rule id that can be packed with an 8-bit variant discriminator.
 pub(super) const DEDUP_RULE_ID_MAX: u32 = (1u32 << DEDUP_RULE_ID_BITS) - 1;
 
+/// Packs a rule ID and variant discriminator into a single `u32`.
+///
+/// The lower [`DEDUP_RULE_ID_BITS`] (24) bits hold the rule ID; the upper 8
+/// bits hold `variant_disc` (Raw=0, Utf16Le=1, Utf16Be=2). This packing
+/// ensures UTF-16 LE/BE findings that share the same span and root hint
+/// produce distinct dedup keys.
+///
+/// # Panics
+///
+/// Panics if `rule_id > DEDUP_RULE_ID_MAX` (2²⁴ − 1 = 16,777,215).
 #[inline(always)]
 fn pack_rule_id_with_variant(rule_id: u32, variant_disc: u8) -> u32 {
     assert!(
@@ -179,6 +189,11 @@ impl RootSpanMapCtx {
     }
 
     /// Maps a decoded-byte span back to absolute root-buffer coordinates.
+    ///
+    /// `span` is expressed in decoded-byte space relative to this context's
+    /// encoded segment. Offsets beyond decoded length are clamped by
+    /// `map_decoded_offset` to the encoded segment end, so the returned root
+    /// range is always within `[root_start, root_start + encoded_len]`.
     pub(super) fn map_span(&self, span: std::ops::Range<usize>) -> std::ops::Range<usize> {
         // SAFETY: The engine-owned transform config lives for the duration
         // of the scan, and encoded bytes are valid while the map context is set.
@@ -192,6 +207,10 @@ impl RootSpanMapCtx {
 
     /// Returns whether a URL-percent trigger (`%` or `+`) appears within the
     /// match span or within the guaranteed overlap prefix preceding it.
+    ///
+    /// This is intentionally asymmetric: it does not scan bytes *after* the
+    /// match, because its only job is to decide whether the previous chunk
+    /// could already have observed a trigger.
     ///
     /// Returns `None` if this context is not for a URL-percent transform.
     pub(super) fn has_trigger_before_or_in_match(
@@ -337,9 +356,14 @@ impl EntropyScratch {
     }
 }
 
-/// Zero-sized type that forces 64-byte alignment between the hot and cold
-/// regions of [`ScanScratch`], ensuring the cold region starts on a fresh
-/// cache line.
+/// Zero-sized alignment marker that forces a 64-byte cache-line boundary
+/// between the hot and cold regions of [`ScanScratch`].
+///
+/// Placed as a field inside a `#[repr(C)]` struct, this ensures the next
+/// field begins on a fresh cache line. The `[u8; 0]` body contributes no
+/// bytes to the struct size — only the `#[repr(align(64))]` attribute
+/// matters, which the compiler satisfies by inserting padding before this
+/// field (not after it) in the `#[repr(C)]` layout.
 #[repr(align(64))]
 struct CachelineBoundary {
     _pad: [u8; 0],
@@ -505,6 +529,12 @@ pub struct ScanScratch {
     pub(super) decode_ring: ByteRing,
     /// Temporary buffer for materializing decoded windows from the ring.
     pub(super) window_bytes: Vec<u8>,
+    /// Reusable batch buffer for collecting drained pending windows.
+    ///
+    /// Used by `decode_stream_and_scan` to collect expired windows from the
+    /// timing wheel before processing them, avoiding the need for raw-pointer
+    /// aliasing during the drain callback.
+    pub(super) drain_batch: Vec<PendingWindow>,
     /// Pending window timing wheel (exact, G=1) keyed by `hi` for decoded stream verification.
     pub(super) pending_windows: TimingWheel<PendingWindow, 1>,
     /// Max window horizon used to size the timing wheel (max window radius + stream chunk).
@@ -701,6 +731,7 @@ impl ScanScratch {
             } else {
                 Vec::new()
             },
+            drain_batch: Vec::new(),
             pending_windows: if has_active_transforms {
                 TimingWheel::new(pending_window_horizon_bytes, pending_window_cap)
             } else {
@@ -848,6 +879,7 @@ impl ScanScratch {
         self.work_items_enqueued = 0;
         self.decode_ring.reset();
         self.window_bytes.clear();
+        self.drain_batch.clear();
         self.pending_windows.reset();
         self.vs_stream_matches.clear();
         self.pending_spans.clear();
@@ -911,6 +943,7 @@ impl ScanScratch {
         self.work_items_enqueued = 0;
         self.decode_ring.reset();
         self.window_bytes.clear();
+        self.drain_batch.clear();
         self.pending_windows.reset();
         self.vs_stream_matches.clear();
         self.pending_spans.clear();
@@ -1366,7 +1399,18 @@ impl ScanScratch {
     /// `keep` receives the finding record plus its aligned drop boundary and must
     /// return `true` to keep the row. Returns the number of rows removed.
     ///
+    /// # Algorithm
+    ///
+    /// Two-pass compaction optimized for the common case where nothing is dropped:
+    ///
+    /// 1. **Scan pass** — linear scan to find the first dropped row. If none is
+    ///    found, returns 0 without touching any sidecar arrays (fast path).
+    /// 2. **Compact pass** — from the first drop index onward, copies surviving
+    ///    rows into the gap left by dropped rows across all three parallel arrays
+    ///    (`out`, `drop_hint_end`, `norm_hash`), then truncates.
+    ///
     /// # Contract for `keep`
+    ///
     /// `keep` may be called more than once for the same row when at least one
     /// row is dropped (first-pass detection + second-pass compaction). It must
     /// therefore be side-effect free and deterministic for a given input pair.

@@ -95,6 +95,11 @@ const B64_CHAR: u8 = 1 << 1;
 const B64_WS: u8 = 1 << 2;
 const B64_WS_SPACE: u8 = 1 << 3;
 
+/// Builds the shared 256-byte classification table at compile time.
+///
+/// Each byte value is assigned a bitmask of flags so that both URL and base64
+/// scanners can classify any byte with a single indexed load and mask test.
+/// The flags are: `URLISH`, `B64_CHAR`, `B64_WS`, `B64_WS_SPACE`.
 const fn build_byte_class() -> [u8; 256] {
     let mut table = [0u8; 256];
     let mut i = 0;
@@ -171,9 +176,11 @@ const B64_PAD: u8 = 64;
 /// table lookup to classify whitespace, valid data, padding, and invalid bytes.
 const B64_WS_SENTINEL: u8 = 0xFE;
 
-/// Lookup table for base64 decoding: 0-63 for valid chars, B64_PAD (64) for '=',
-/// B64_INVALID (0xFF) for invalid bytes.
-/// Accepts both standard (+/) and URL-safe (-_) alphabets.
+/// Builds the base64 decode lookup table at compile time.
+///
+/// Maps each byte to its 6-bit decoded value (0–63), `B64_PAD` (64) for `=`,
+/// or `B64_INVALID` (0xFF) for non-base64 bytes. Accepts both standard (`+/`)
+/// and URL-safe (`-_`) alphabets simultaneously.
 const fn build_b64_decode_table() -> [u8; 256] {
     let mut table = [B64_INVALID; 256];
     let mut i = 0u8;
@@ -1017,7 +1024,28 @@ pub(super) fn base64_skip_chars(
         return Some(0);
     }
     let mut seen = 0usize;
-    for (i, &b) in encoded.iter().enumerate() {
+    let mut i = 0usize;
+
+    // Fast path: advance 4 bytes at a time while all are B64_CHAR and we
+    // haven't reached the target count yet.
+    while i + 4 <= encoded.len() && seen + 4 <= skip {
+        let f0 = BYTE_CLASS[encoded[i] as usize];
+        let f1 = BYTE_CLASS[encoded[i + 1] as usize];
+        let f2 = BYTE_CLASS[encoded[i + 2] as usize];
+        let f3 = BYTE_CLASS[encoded[i + 3] as usize];
+
+        if (f0 & f1 & f2 & f3 & B64_CHAR) == 0 {
+            break;
+        }
+        seen += 4;
+        i += 4;
+    }
+    if seen == skip {
+        return Some(i);
+    }
+
+    // Slow path: handle whitespace, terminators, and approach target precisely.
+    for (j, &b) in encoded[i..].iter().enumerate() {
         if matches!(b, b'\n' | b'\r' | b'\t') || (allow_space_ws && b == b' ') {
             continue;
         }
@@ -1026,7 +1054,7 @@ pub(super) fn base64_skip_chars(
         }
         seen += 1;
         if seen == skip {
-            return Some(i + 1);
+            return Some(i + j + 1);
         }
     }
     None
@@ -1039,7 +1067,31 @@ pub(super) fn base64_skip_chars(
 /// span meets the `min_chars` threshold before attempting decode.
 pub(super) fn base64_char_count(encoded: &[u8], allow_space_ws: bool) -> usize {
     let mut count = 0usize;
-    for &b in encoded {
+    let mut i = 0usize;
+
+    // Fast path: process 4 bytes at a time when all are B64_CHAR (no whitespace
+    // or invalid bytes). The AND of flags detects any non-B64 byte in a single
+    // comparison since whitespace flags don't include B64_CHAR.
+    while i + 4 <= encoded.len() {
+        let f0 = BYTE_CLASS[encoded[i] as usize];
+        let f1 = BYTE_CLASS[encoded[i + 1] as usize];
+        let f2 = BYTE_CLASS[encoded[i + 2] as usize];
+        let f3 = BYTE_CLASS[encoded[i + 3] as usize];
+
+        if (f0 & f1 & f2 & f3 & B64_CHAR) == 0 {
+            break;
+        }
+
+        count += 4
+            - (encoded[i] == b'=') as usize
+            - (encoded[i + 1] == b'=') as usize
+            - (encoded[i + 2] == b'=') as usize
+            - (encoded[i + 3] == b'=') as usize;
+        i += 4;
+    }
+
+    // Slow path: handle whitespace, non-B64 terminators, and the tail.
+    for &b in &encoded[i..] {
         if matches!(b, b'\n' | b'\r' | b'\t') || (allow_space_ws && b == b' ') {
             continue;
         }
@@ -1053,12 +1105,446 @@ pub(super) fn base64_char_count(encoded: &[u8], allow_space_ws: bool) -> usize {
     count
 }
 
+// ---------------------------------------------------------------------------
+// SIMD base64 decode helpers (16 input bytes → 12 output bytes per chunk)
+// ---------------------------------------------------------------------------
+//
+// Each arch module exposes:
+//   unsafe fn decode_simd_chunks(src: &[u8], dst: &mut [u8]) -> (usize, usize)
+//     Decodes as many aligned 16-byte chunks as possible.
+//     Returns (bytes_consumed_from_src, bytes_written_to_dst).
+//     Stops at the first chunk containing a non-base64 byte (whitespace,
+//     padding, or invalid).
+//
+// Contract: these functions decode only "clean" runs of base64 alphabet
+// chars (A-Z, a-z, 0-9, +, /, -, _). Whitespace, padding ('='), and
+// invalid bytes cause the loop to break, returning how far it got.
+// The scalar slow path in stream_decode_base64 handles the remainder.
+
+#[cfg(target_arch = "aarch64")]
+mod simd_b64 {
+    use std::arch::aarch64::*;
+
+    /// Classify 16 bytes: returns a vector of 6-bit decoded values and a bool
+    /// indicating all bytes were valid base64 (standard + URL-safe alphabet).
+    ///
+    /// # Safety
+    /// Requires aarch64 NEON intrinsics (architecturally guaranteed on this
+    /// target). `input` must come from a valid 16-byte vector load.
+    #[inline(always)]
+    unsafe fn classify_and_decode(input: uint8x16_t) -> (uint8x16_t, bool) {
+        // Range checks for each alphabet segment.
+        let upper_lo = vdupq_n_u8(b'A');
+        let upper_hi = vdupq_n_u8(b'Z');
+        let lower_lo = vdupq_n_u8(b'a');
+        let lower_hi = vdupq_n_u8(b'z');
+        let digit_lo = vdupq_n_u8(b'0');
+        let digit_hi = vdupq_n_u8(b'9');
+
+        let is_upper = vandq_u8(vcgeq_u8(input, upper_lo), vcleq_u8(input, upper_hi));
+        let is_lower = vandq_u8(vcgeq_u8(input, lower_lo), vcleq_u8(input, lower_hi));
+        let is_digit = vandq_u8(vcgeq_u8(input, digit_lo), vcleq_u8(input, digit_hi));
+
+        // Special characters: + (0x2B), - (0x2D) → 62; / (0x2F), _ (0x5F) → 63
+        let is_plus = vceqq_u8(input, vdupq_n_u8(b'+'));
+        let is_dash = vceqq_u8(input, vdupq_n_u8(b'-'));
+        let is_slash = vceqq_u8(input, vdupq_n_u8(b'/'));
+        let is_under = vceqq_u8(input, vdupq_n_u8(b'_'));
+
+        let is_62 = vorrq_u8(is_plus, is_dash);
+        let is_63 = vorrq_u8(is_slash, is_under);
+
+        // Validate: every byte must belong to one of the groups.
+        let valid = vorrq_u8(
+            vorrq_u8(vorrq_u8(is_upper, is_lower), is_digit),
+            vorrq_u8(is_62, is_63),
+        );
+        // Check all lanes are 0xFF (all valid).
+        let all_valid = vminvq_u8(valid) == 0xFF;
+
+        // Compute 6-bit values per range using wrapping arithmetic offsets:
+        //   A-Z: value = byte - 65
+        //   a-z: value = byte - 71  (= byte - 'a' + 26)
+        //   0-9: value = byte + 4   (= byte - '0' + 52, wrapping u8)
+        //   +/-: value = 62
+        //   //_: value = 63
+        let val_upper = vsubq_u8(input, vdupq_n_u8(65)); // A→0, Z→25
+        let val_lower = vsubq_u8(input, vdupq_n_u8(71)); // a→26, z→51
+        let val_digit = vaddq_u8(input, vdupq_n_u8(4)); // '0'→52, '9'→61
+        let val_62 = vdupq_n_u8(62);
+        let val_63 = vdupq_n_u8(63);
+
+        // Select the correct value per byte using bitwise select (bsl).
+        // Start with 0, overlay each range.
+        let mut result = vandq_u8(is_upper, val_upper);
+        result = vorrq_u8(result, vandq_u8(is_lower, val_lower));
+        result = vorrq_u8(result, vandq_u8(is_digit, val_digit));
+        result = vorrq_u8(result, vandq_u8(is_62, val_62));
+        result = vorrq_u8(result, vandq_u8(is_63, val_63));
+
+        (result, all_valid)
+    }
+
+    /// Pack 16 x 6-bit values into 12 output bytes (4 groups of 4→3).
+    ///
+    /// Input layout:  [a0,b0,c0,d0, a1,b1,c1,d1, a2,b2,c2,d2, a3,b3,c3,d3]
+    /// Output layout: [o0,o1,o2,     o3,o4,o5,     o6,o7,o8,     o9,o10,o11]
+    ///
+    /// Where: o0 = (a<<2)|(b>>4), o1 = ((b&0xF)<<4)|(c>>2), o2 = ((c&3)<<6)|d
+    ///
+    /// # Safety
+    /// Requires aarch64 NEON intrinsics. `vals` must contain 16 valid 6-bit
+    /// base64 lane values produced by `classify_and_decode`.
+    #[inline(always)]
+    unsafe fn pack_16_to_12(vals: uint8x16_t) -> [u8; 12] {
+        // Shuffle to create aligned inputs for the three output-byte formulas.
+        // Type A positions (o0,o3,o6,o9): need a-values from indices 0,4,8,12
+        //                                  and b-values from indices 1,5,9,13
+        // Type B positions (o1,o4,o7,o10): need b-values and c-values
+        // Type C positions (o2,o5,o8,o11): need c-values and d-values
+
+        // Shuffle indices to create:
+        // v_ab = [a0, b0, a1, b1, a2, b2, a3, b3, ?, ?, ?, ?, ?, ?, ?, ?]
+        // v_cd = [c0, d0, c1, d1, c2, d2, c3, d3, ?, ?, ?, ?, ?, ?, ?, ?]
+        let idx_ab = vcreate_u8(u64::from_le_bytes([0, 1, 4, 5, 8, 9, 12, 13]));
+        let idx_cd = vcreate_u8(u64::from_le_bytes([2, 3, 6, 7, 10, 11, 14, 15]));
+
+        let v_ab = vqtbl1_u8(vals, idx_ab); // 8 bytes: [a0,b0,a1,b1,a2,b2,a3,b3]
+        let v_cd = vqtbl1_u8(vals, idx_cd); // 8 bytes: [c0,d0,c1,d1,c2,d2,c3,d3]
+
+        // Widen pairs to u16 and merge: a*64+b and c*64+d
+        // vmull with constant 64 on even positions, then add odd positions.
+        // Even indices [a0,a1,a2,a3], odd indices [b0,b1,b2,b3]:
+        let ab_even = vuzp1_u8(v_ab, v_ab); // [a0,a1,a2,a3,a0,a1,a2,a3]
+        let ab_odd = vuzp2_u8(v_ab, v_ab); // [b0,b1,b2,b3,b0,b1,b2,b3]
+        let cd_even = vuzp1_u8(v_cd, v_cd); // [c0,c1,c2,c3,...]
+        let cd_odd = vuzp2_u8(v_cd, v_cd); // [d0,d1,d2,d3,...]
+
+        // Widen to u16 and compute: even*64 + odd → 12-bit merged value
+        let ab_merged: uint16x4_t = vget_low_u16(vmlal_u8(
+            vmovl_u8(vget_low_u8(vcombine_u8(ab_odd, ab_odd))),
+            vget_low_u8(vcombine_u8(ab_even, ab_even)),
+            vdup_n_u8(64),
+        ));
+        let cd_merged: uint16x4_t = vget_low_u16(vmlal_u8(
+            vmovl_u8(vget_low_u8(vcombine_u8(cd_odd, cd_odd))),
+            vget_low_u8(vcombine_u8(cd_even, cd_even)),
+            vdup_n_u8(64),
+        ));
+
+        // Now merge u16 pairs: ab*4096 + cd → 24-bit value in u32
+        let ab32 = vmovl_u16(ab_merged); // u32x4
+        let cd32 = vmovl_u16(cd_merged); // u32x4
+        let packed = vmlaq_n_u32(cd32, ab32, 4096); // ab*4096 + cd → 24-bit in u32
+
+        // Extract 3 bytes from each u32 lane (big-endian byte order within 24 bits).
+        // packed[i] contains 24 bits of output: bits[23:16] = o0, [15:8] = o1, [7:0] = o2
+        let mut out = [0u8; 12];
+        let p = vreinterpretq_u8_u32(packed);
+        // On little-endian: u32 bytes are [o2, o1, o0, 0] per lane.
+        // Shuffle to extract [o0, o1, o2] per group, 12 bytes total.
+        let extract_idx: uint8x16_t = vld1q_u8(
+            [
+                2u8, 1, 0, 6, 5, 4, 10, 9, 8, 14, 13, 12, 0xFF, 0xFF, 0xFF, 0xFF,
+            ]
+            .as_ptr(),
+        );
+        let shuffled = vqtbl1q_u8(p, extract_idx);
+        // Bytes 12-15 of `shuffled` are 0 (vqtbl1q_u8 returns 0 for out-of-range
+        // indices); `store_low12` writes only the low 12 bytes into `out`.
+        store_low12(shuffled, &mut out);
+        out
+    }
+
+    /// Stores the low 12 bytes of `v` into `out` without touching adjacent memory.
+    ///
+    /// # Safety
+    /// Uses NEON load/store intrinsics; caller must ensure the target supports
+    /// aarch64 NEON (guaranteed on this target).
+    #[inline(always)]
+    unsafe fn store_low12(v: uint8x16_t, out: &mut [u8; 12]) {
+        // NEON only exposes 128-bit stores for this vector shape; write into a
+        // 16-byte scratch first, then copy the 12 meaningful bytes.
+        let mut tmp = [0u8; 16];
+        vst1q_u8(tmp.as_mut_ptr(), v);
+        out.copy_from_slice(&tmp[..12]);
+    }
+
+    /// Decode as many 16-byte base64 chunks as possible from `src` into `dst`.
+    /// Returns (bytes_consumed, bytes_written).
+    /// Stops on first chunk containing any non-base64 byte.
+    ///
+    /// # Safety
+    /// Caller must ensure `dst` has room for `(src.len() / 16) * 12` bytes.
+    #[inline]
+    pub(super) unsafe fn decode_simd_chunks(src: &[u8], dst: &mut [u8]) -> (usize, usize) {
+        let mut si = 0usize;
+        let mut di = 0usize;
+        let end = src.len() & !15; // round down to 16-byte boundary
+
+        while si < end && di + 12 <= dst.len() {
+            let input = vld1q_u8(src.as_ptr().add(si));
+            let (vals, valid) = classify_and_decode(input);
+            if !valid {
+                break;
+            }
+            let packed = pack_16_to_12(vals);
+            std::ptr::copy_nonoverlapping(packed.as_ptr(), dst.as_mut_ptr().add(di), 12);
+            si += 16;
+            di += 12;
+        }
+
+        (si, di)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn store_low12_does_not_clobber_adjacent_bytes() {
+            #[repr(C)]
+            struct Guarded {
+                out: [u8; 12],
+                guard: [u8; 4],
+            }
+
+            let mut guarded = Guarded {
+                out: [0u8; 12],
+                guard: [0xA5; 4],
+            };
+            let v = unsafe { vdupq_n_u8(0x11) };
+            unsafe { store_low12(v, &mut guarded.out) };
+            assert_eq!(guarded.guard, [0xA5; 4]);
+        }
+
+        #[test]
+        fn decode_simd_chunks_decodes_clean_input() {
+            let src = b"QUJDREVGR0hJSktM";
+            let mut dst = [0u8; 12];
+            let (consumed, written) = unsafe { decode_simd_chunks(src, &mut dst) };
+            assert_eq!((consumed, written), (16, 12));
+            assert_eq!(&dst, b"ABCDEFGHIJKL");
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+mod simd_b64 {
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    /// Classify 16 bytes and produce 6-bit decoded values.
+    ///
+    /// Returns `(decoded_values, all_valid)` where `all_valid` is true only
+    /// when every lane belongs to the base64 alphabet (std + URL-safe).
+    ///
+    /// # Safety
+    /// Caller must ensure SSSE3 is available (`#[target_feature(enable =
+    /// "ssse3")]`) before invoking this function.
+    #[inline]
+    #[target_feature(enable = "ssse3")]
+    unsafe fn classify_and_decode(input: __m128i) -> (__m128i, bool) {
+        // ASCII ranges are < 128, so signed compares are safe for these checks.
+        let is_upper = _mm_and_si128(
+            _mm_cmpgt_epi8(input, _mm_set1_epi8((b'A' - 1) as i8)),
+            _mm_cmpgt_epi8(_mm_set1_epi8((b'Z' + 1) as i8), input),
+        );
+        let is_lower = _mm_and_si128(
+            _mm_cmpgt_epi8(input, _mm_set1_epi8((b'a' - 1) as i8)),
+            _mm_cmpgt_epi8(_mm_set1_epi8((b'z' + 1) as i8), input),
+        );
+        let is_digit = _mm_and_si128(
+            _mm_cmpgt_epi8(input, _mm_set1_epi8((b'0' - 1) as i8)),
+            _mm_cmpgt_epi8(_mm_set1_epi8((b'9' + 1) as i8), input),
+        );
+        let is_plus = _mm_cmpeq_epi8(input, _mm_set1_epi8(b'+' as i8));
+        let is_dash = _mm_cmpeq_epi8(input, _mm_set1_epi8(b'-' as i8));
+        let is_slash = _mm_cmpeq_epi8(input, _mm_set1_epi8(b'/' as i8));
+        let is_under = _mm_cmpeq_epi8(input, _mm_set1_epi8(b'_' as i8));
+
+        let is_62 = _mm_or_si128(is_plus, is_dash);
+        let is_63 = _mm_or_si128(is_slash, is_under);
+
+        let valid = _mm_or_si128(
+            _mm_or_si128(_mm_or_si128(is_upper, is_lower), is_digit),
+            _mm_or_si128(is_62, is_63),
+        );
+        let all_valid = _mm_movemask_epi8(valid) == 0xFFFF;
+
+        let val_upper = _mm_sub_epi8(input, _mm_set1_epi8(65));
+        let val_lower = _mm_sub_epi8(input, _mm_set1_epi8(71));
+        let val_digit = _mm_add_epi8(input, _mm_set1_epi8(4));
+        let val_62 = _mm_set1_epi8(62);
+        let val_63 = _mm_set1_epi8(63);
+
+        let mut decoded = _mm_and_si128(is_upper, val_upper);
+        decoded = _mm_or_si128(decoded, _mm_and_si128(is_lower, val_lower));
+        decoded = _mm_or_si128(decoded, _mm_and_si128(is_digit, val_digit));
+        decoded = _mm_or_si128(decoded, _mm_and_si128(is_62, val_62));
+        decoded = _mm_or_si128(decoded, _mm_and_si128(is_63, val_63));
+
+        (decoded, all_valid)
+    }
+
+    /// Pack 16 x 6-bit values into 12 output bytes.
+    ///
+    /// # Safety
+    /// Caller must ensure SSSE3 is available and `vals` contains 16 valid
+    /// base64 lane values (0..=63) from `classify_and_decode`.
+    #[inline]
+    #[target_feature(enable = "ssse3")]
+    unsafe fn pack_16_to_12(vals: __m128i) -> [u8; 12] {
+        // Merge pairs of 6-bit values into 12-bit values using u16 multiply.
+        // Treat vals as u16 lanes (little-endian: low byte is even index, high is odd).
+        // Even positions (a,c) need to be multiplied by 64 and added to odd (b,d).
+        //
+        // u16 lane = [lo, hi] = hi*256 + lo. We want lo*64 + hi.
+        // So: lo*64 + hi = lo*64 + hi*1
+        // Use _mm_maddubs_epi16 which does: pairs[i] = a[2i]*b[2i] + a[2i+1]*b[2i+1]
+        // where a is treated as unsigned, b as signed, result is i16.
+        // Set b = [64, 1, 64, 1, ...]: each pair → even*64 + odd*1 = 12-bit merged.
+        let merge_const = _mm_set1_epi16(0x0140); // [64, 1] repeated as bytes
+        let merged = _mm_maddubs_epi16(vals, merge_const);
+        // merged is i16x8: [a0*64+b0, c0*64+d0, a1*64+b1, c1*64+d1, ...]
+
+        // Now merge u16 pairs into u32: (a*64+b)*4096 + (c*64+d) = 24-bit packed.
+        // Use _mm_madd_epi16: u32[i] = i16[2i]*i16_const[2i] + i16[2i+1]*i16_const[2i+1]
+        let merge32_const = _mm_set1_epi32(0x0001_1000); // [4096, 1] as i16 pair
+        let packed = _mm_madd_epi16(merged, merge32_const);
+        // packed is i32x4: each contains 24 bits of decoded data.
+
+        // Extract 3 bytes from each u32 (little-endian: bytes [o2, o1, o0, 0]).
+        // Shuffle to [o0, o1, o2, o3, o4, o5, o6, o7, o8, o9, o10, o11, ?, ?, ?, ?]
+        #[rustfmt::skip]
+        let shuffle = _mm_setr_epi8(
+            2, 1, 0, 6, 5, 4, 10, 9, 8, 14, 13, 12,
+            -1, -1, -1, -1, // don't care
+        );
+        let result = _mm_shuffle_epi8(packed, shuffle);
+
+        let mut out = [0u8; 12];
+        store_low12(result, &mut out);
+        out
+    }
+
+    /// Stores the low 12 bytes of `v` into `out` without touching adjacent memory.
+    ///
+    /// # Safety
+    /// Uses SSSE3/SSE stores; caller must ensure the required CPU features are
+    /// available (the caller checks this before entering SIMD decode).
+    #[inline]
+    #[target_feature(enable = "ssse3")]
+    unsafe fn store_low12(v: __m128i, out: &mut [u8; 12]) {
+        // SSSE3 uses a full 128-bit store; stage through 16-byte scratch to
+        // avoid writing beyond the 12-byte output contract.
+        let mut tmp = [0u8; 16];
+        _mm_storeu_si128(tmp.as_mut_ptr() as *mut __m128i, v);
+        out.copy_from_slice(&tmp[..12]);
+    }
+
+    /// Decode as many 16-byte base64 chunks as possible from `src` into `dst`.
+    /// Returns (bytes_consumed, bytes_written).
+    ///
+    /// # Safety
+    /// Caller must ensure `dst` has room for `(src.len() / 16) * 12` bytes.
+    /// Requires SSSE3 support.
+    #[inline]
+    #[target_feature(enable = "ssse3")]
+    pub(super) unsafe fn decode_simd_chunks(src: &[u8], dst: &mut [u8]) -> (usize, usize) {
+        let mut si = 0usize;
+        let mut di = 0usize;
+        let end = src.len() & !15;
+
+        while si < end && di + 12 <= dst.len() {
+            let input = _mm_loadu_si128(src.as_ptr().add(si) as *const __m128i);
+            let (vals, valid) = classify_and_decode(input);
+            if !valid {
+                break;
+            }
+            let packed = pack_16_to_12(vals);
+            std::ptr::copy_nonoverlapping(packed.as_ptr(), dst.as_mut_ptr().add(di), 12);
+            si += 16;
+            di += 12;
+        }
+
+        (si, di)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn store_low12_does_not_clobber_adjacent_bytes() {
+            #[repr(C)]
+            struct Guarded {
+                out: [u8; 12],
+                guard: [u8; 4],
+            }
+
+            let mut guarded = Guarded {
+                out: [0u8; 12],
+                guard: [0xA5; 4],
+            };
+            let v = unsafe { _mm_set1_epi8(0x11) };
+            unsafe { store_low12(v, &mut guarded.out) };
+            assert_eq!(guarded.guard, [0xA5; 4]);
+        }
+
+        #[test]
+        fn decode_simd_chunks_rejects_invalid_punctuation() {
+            let src = b"AAAA:AAAAAAAAAAA";
+            let mut dst = [0u8; 12];
+            let (consumed, written) = unsafe { decode_simd_chunks(src, &mut dst) };
+            assert_eq!((consumed, written), (0, 0));
+        }
+
+        #[test]
+        fn decode_simd_chunks_decodes_clean_input() {
+            let src = b"QUJDREVGR0hJSktM";
+            let mut dst = [0u8; 12];
+            let (consumed, written) = unsafe { decode_simd_chunks(src, &mut dst) };
+            assert_eq!((consumed, written), (16, 12));
+            assert_eq!(&dst, b"ABCDEFGHIJKL");
+        }
+    }
+}
+
+// On architectures without SIMD support, decode_simd_chunks is not available;
+// the fast-path in stream_decode_base64 uses the scalar 4-byte batch instead.
+
+/// Returns true if SIMD base64 decode is available at runtime.
+///
+/// On aarch64, NEON is architecturally guaranteed. On x86_64, SSSE3 is
+/// checked via `is_x86_feature_detected!`. On other architectures, returns
+/// false and the decoder falls through to the scalar 4-byte batch path.
+#[cfg(target_arch = "aarch64")]
+fn has_simd_b64() -> bool {
+    true // NEON is always available on aarch64
+}
+
+#[cfg(target_arch = "x86_64")]
+fn has_simd_b64() -> bool {
+    is_x86_feature_detected!("ssse3")
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+fn has_simd_b64() -> bool {
+    false
+}
+
 /// Streaming base64 decoder that accepts std + URL-safe alphabets.
 ///
-/// Whitespace is ignored. Padding is validated, but an unpadded tail
-/// (2 or 3 bytes in the final quantum) is accepted. Output is emitted in
-/// bounded chunks (stream decode buffer). The `on_bytes` callback may stop
-/// decoding early by returning `ControlFlow::Break(())` (treated as success).
+/// All ASCII whitespace (`' '`, `\n`, `\r`, `\t`) is unconditionally skipped
+/// during decode, regardless of the `base64_allow_space_ws` setting. That
+/// flag only controls whether spaces terminate *spans* during scanning; once
+/// a span reaches the decoder, spaces are always tolerated.
+///
+/// Padding is validated, but an unpadded tail (2 or 3 bytes in the final
+/// quantum) is accepted. Output is emitted in bounded chunks (stream decode
+/// buffer). The `on_bytes` callback may stop decoding early by returning
+/// `ControlFlow::Break(())` (treated as success).
 ///
 /// # Behavior
 /// - Once padding is seen, only trailing whitespace is allowed.
@@ -1099,33 +1585,52 @@ fn stream_decode_base64(
 
     let mut pos = 0usize;
     while pos < input.len() {
-        // ── Fast path: 4-at-a-time quantum decode ──
-        // When the quantum accumulator is empty and no padding has been seen,
-        // look up 4 consecutive bytes via B64_DECODE_EX. If all 4 are valid
-        // data (0-63), decode the quantum inline without per-byte branching.
-        // The 4 independent LUT loads execute in parallel on superscalar cores.
-        while qn == 0 && !seen_pad && pos + 3 < input.len() {
-            let v0 = B64_DECODE_EX[input[pos] as usize];
-            let v1 = B64_DECODE_EX[input[pos + 1] as usize];
-            let v2 = B64_DECODE_EX[input[pos + 2] as usize];
-            let v3 = B64_DECODE_EX[input[pos + 3] as usize];
-
-            // Any value >= B64_PAD (64) means padding, whitespace, or invalid.
-            if (v0 | v1 | v2 | v3) >= B64_PAD {
-                break;
+        // Fast path: when no partial quad is pending, use SIMD to decode 16
+        // input bytes → 12 output bytes per iteration, then fall back to the
+        // 4-byte scalar batch for the tail.
+        if qn == 0 && !seen_pad {
+            // SIMD path: decode 16-byte chunks directly into the output buffer.
+            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+            if has_simd_b64() {
+                let remaining_input = input.len() - pos;
+                let remaining_output = headroom.saturating_sub(out_len);
+                if remaining_input >= 16 && remaining_output >= 12 {
+                    // SAFETY: we checked has_simd_b64() and bounds above.
+                    let (consumed, written) =
+                        unsafe { simd_b64::decode_simd_chunks(&input[pos..], &mut out[out_len..]) };
+                    pos += consumed;
+                    out_len += written;
+                }
             }
 
-            out[out_len] = (v0 << 2) | (v1 >> 4);
-            out[out_len + 1] = ((v1 & 0x0F) << 4) | (v2 >> 2);
-            out[out_len + 2] = ((v2 & 0x03) << 6) | v3;
-            out_len += 3;
-            pos += 4;
+            // Scalar 4-byte batch: handle remaining aligned input after SIMD
+            // and on architectures without SIMD support. Uses B64_DECODE_EX
+            // where values 0-63 are valid data; anything >= B64_PAD means
+            // padding, whitespace, or invalid and must exit to the slow path.
+            while pos + 4 <= input.len() && out_len + 3 <= headroom {
+                let v0 = B64_DECODE_EX[input[pos] as usize];
+                let v1 = B64_DECODE_EX[input[pos + 1] as usize];
+                let v2 = B64_DECODE_EX[input[pos + 2] as usize];
+                let v3 = B64_DECODE_EX[input[pos + 3] as usize];
 
+                if (v0 | v1 | v2 | v3) >= B64_PAD {
+                    break;
+                }
+
+                out[out_len] = (v0 << 2) | (v1 >> 4);
+                out[out_len + 1] = ((v1 & 0x0F) << 4) | (v2 >> 2);
+                out[out_len + 2] = ((v2 & 0x03) << 6) | v3;
+                out_len += 3;
+                pos += 4;
+            }
+
+            // Flush if we filled up during the batch run.
             if out_len >= headroom {
                 match flush_buf(&mut out, &mut out_len, &mut on_bytes) {
                     ControlFlow::Continue(()) => {}
                     ControlFlow::Break(()) => return Ok(()),
                 }
+                continue;
             }
         }
 
@@ -1265,7 +1770,12 @@ fn decode_base64_to_vec(input: &[u8], max_out: usize) -> Result<Vec<u8>, Base64T
 // Transform dispatch
 // --------------------------
 
-/// Quick prefilter to avoid running span scans when no trigger bytes are present.
+/// Quick prefilter: returns `false` when `buf` cannot possibly contain an
+/// encoded payload, allowing the caller to skip the more expensive span scan.
+///
+/// For URL-percent, checks for `%` (and `+` when `plus_to_space` is set).
+/// For base64, always returns `true` because the span finder itself is the
+/// real filter (the alphabet is too common for a single-byte prefilter).
 pub(super) fn transform_quick_trigger(tc: &TransformConfig, buf: &[u8]) -> bool {
     match tc.id {
         TransformId::UrlPercent => {
@@ -1304,6 +1814,11 @@ pub(super) fn find_spans_into(tc: &TransformConfig, buf: &[u8], out: &mut impl S
 }
 
 /// Dispatch to the appropriate streaming decoder, erasing the error type.
+///
+/// URL-percent decode is infallible (invalid escapes pass through); base64
+/// decode may fail on invalid bytes, bad padding, or a truncated final
+/// quantum. In either case, `on_bytes` may have been called with partial
+/// output before an error is returned.
 pub(super) fn stream_decode(
     tc: &TransformConfig,
     input: &[u8],
@@ -1560,5 +2075,11 @@ mod tests {
             spans.iter().any(|&(lo, hi)| lo == 0 && hi == 8),
             "expected span 0..8, got {spans:?}"
         );
+    }
+
+    #[test]
+    fn base64_skip_chars_fast_path_exact_hit_returns_offset() {
+        assert_eq!(base64_skip_chars(b"QUJD", 4, false), Some(4));
+        assert_eq!(base64_skip_chars(b"QUJDREVG", 8, false), Some(8));
     }
 }

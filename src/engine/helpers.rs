@@ -451,6 +451,8 @@ fn decode_utf16_scalar_at(input: &[u8], i: usize, n: usize, le: bool) -> (char, 
 /// always aligned to complete UTF-16 scalar decoding steps (it never points
 /// into the middle of a surrogate pair). If `decoded_offset` exceeds the
 /// decoded length, returns the largest even byte offset.
+///
+/// Complexity is O(number of decoded scalars up to the target offset).
 pub(super) fn map_utf16_decoded_offset(input: &[u8], decoded_offset: usize, le: bool) -> usize {
     if decoded_offset == 0 {
         return 0;
@@ -484,6 +486,9 @@ pub(super) fn map_utf16_decoded_offset(input: &[u8], decoded_offset: usize, le: 
 ///
 /// # Errors
 /// - `OutputTooLarge` if the result would exceed `max_out` or buffer capacity.
+///
+/// # Complexity
+/// O(number of UTF-16 code units).
 fn decode_utf16_to_buf(
     input: &[u8],
     max_out: usize,
