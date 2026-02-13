@@ -4,6 +4,7 @@
 
 mod anchor_optimization;
 mod archive_scanning;
+mod bench_guards;
 mod binary_awareness;
 mod fs_cli_archives;
 // Log-based persistence removed in favor of SQLite. See src/store/db/.

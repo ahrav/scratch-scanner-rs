@@ -149,10 +149,7 @@ fn bench_timing_wheel_push(c: &mut Criterion) {
                     }
                     // Drain all to reset
                     now += horizon + 1;
-                    tw.advance_and_drain(now, |payload| {
-                        black_box(payload.hi_end);
-                        black_box(payload.id);
-                    });
+                    tw.advance_and_drain(now, |_| {});
                 })
             }
             "g8_medium" => {
@@ -170,10 +167,7 @@ fn bench_timing_wheel_push(c: &mut Criterion) {
                         );
                     }
                     now += horizon + 1;
-                    tw.advance_and_drain(now, |payload| {
-                        black_box(payload.hi_end);
-                        black_box(payload.id);
-                    });
+                    tw.advance_and_drain(now, |_| {});
                 })
             }
             "g64_large" => {
@@ -191,10 +185,7 @@ fn bench_timing_wheel_push(c: &mut Criterion) {
                         );
                     }
                     now += horizon + 1;
-                    tw.advance_and_drain(now, |payload| {
-                        black_box(payload.hi_end);
-                        black_box(payload.id);
-                    });
+                    tw.advance_and_drain(now, |_| {});
                 })
             }
             _ => unreachable!(),
