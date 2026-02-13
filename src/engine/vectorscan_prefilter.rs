@@ -97,6 +97,8 @@ struct RawPatternMeta {
 }
 
 // Compile-time size guard: 3 × u32 = 12 bytes, no padding under #[repr(C)].
+// Exact size matters because the match callback indexes this via raw pointer
+// arithmetic (`raw_meta.add(id)`) in the hot path.
 const _: () = assert!(std::mem::size_of::<RawPatternMeta>() == 12);
 
 pub(crate) struct VsPrefilterDb {
@@ -247,6 +249,10 @@ impl VsStreamDb {
     /// treated as unbounded and capped by `max_decoded_cap` when nonzero.
     /// Patterns are compiled with `HS_FLAG_PREFILTER`; hits are conservative
     /// and used only for window seeding.
+    ///
+    /// # Errors
+    /// Returns an error if any rule pattern contains NUL bytes,
+    /// `hs_expression_info` rejects a pattern, or `hs_compile_multi` fails.
     pub(crate) fn try_new_stream(
         rules: &[RuleSpec],
         max_decoded_cap: usize,
@@ -540,6 +546,11 @@ pub(crate) struct VsUtf16StreamMatchCtx {
 
 /// Appends a callback-produced window without triggering `Vec` growth.
 ///
+/// Returns `true` if the window was appended, `false` if the buffer is full
+/// (at `max_pending` or `pending_cap`). On `false`, sets `*overflowed = 1`
+/// when the pointer is non-null, signalling callers to fall back to a
+/// whole-buffer scan.
+///
 /// # Safety
 /// - `pending_ptr` must point to a writable allocation of `pending_cap` windows.
 /// - `pending_len` must be a valid pointer to the initialized count for `pending_ptr`.
@@ -734,6 +745,11 @@ unsafe extern "C" fn vs_utf16_stream_on_match(
     0
 }
 
+/// Clamps `v` into `[lo, hi]`. Requires `lo <= hi` (debug-asserted).
+///
+/// Used in callbacks to keep anchor hints within window bounds. Branchless
+/// clamp via `v.clamp()` was measured slower here due to min/max call overhead;
+/// the explicit branches are cheaper in the match-callback hot path.
 #[inline(always)]
 fn clamp_u32_ordered(v: u32, lo: u32, hi: u32) -> u32 {
     debug_assert!(lo <= hi);
@@ -746,6 +762,9 @@ fn clamp_u32_ordered(v: u32, lo: u32, hi: u32) -> u32 {
     }
 }
 
+/// Clamps `v` into `[lo, hi]`. Requires `lo <= hi` (debug-asserted).
+///
+/// 64-bit variant for stream-mode callbacks where offsets are `u64`.
 #[inline(always)]
 fn clamp_u64_ordered(v: u64, lo: u64, hi: u64) -> u64 {
     debug_assert!(lo <= hi);
@@ -1593,9 +1612,14 @@ impl VsPrefilterDb {
     ///   with `use_raw_prefilter[rid] == true` have their regex compiled. Rules with
     ///   `false` rely on anchor patterns for window seeding.
     ///
-    /// Returns an error if the database cannot be compiled or if any rule
-    /// pattern is rejected by `hs_expression_info`. If multi-compile fails, we
-    /// recompile patterns individually to surface the specific rule errors.
+    /// # Errors
+    /// Returns an error if:
+    /// - Any rule pattern contains NUL bytes or is rejected by
+    ///   `hs_expression_info`.
+    /// - `hs_compile_multi` fails for the combined database. In this case
+    ///   patterns are recompiled individually; the error lists every rejected
+    ///   rule with its name, pattern, and compiler message.
+    /// - All raw patterns are rejected and no anchor data is available.
     pub(crate) fn try_new(
         rules: &[RuleSpec],
         anchor: Option<AnchorInput<'_>>,
@@ -2021,12 +2045,25 @@ struct VsAnchorMatchCtx {
 ///
 /// Seeds per-rule raw windows in `ScanScratch` based on the match end offset.
 /// `id` values below `raw_rule_count` denote raw rules; ids at or above
-/// `anchor_id_base` denote anchor literal patterns.
+/// `anchor_id_base` denote anchor literal patterns. Out-of-range ids or
+/// match ends beyond `hay_len` are silently dropped (defensive against
+/// Vectorscan reporting spurious matches under `HS_FLAG_PREFILTER`).
+///
+/// # Id dispatch
+/// - `id < raw_rule_count`: raw regex hit — seeds one window using
+///   `raw_meta[id]` for width and radius.
+/// - `anchor_id_base <= id < anchor_id_base + anchor_pat_count`: anchor
+///   literal hit — fans out to all `(rule, variant)` targets for that
+///   pattern.
+/// - Everything else: ignored.
 ///
 /// # Safety
-/// - `ctx` must be non-null and point to a valid `VsMatchCtx`.
-/// - `scratch` and mapping tables referenced by `ctx` must remain valid and not
-///   be accessed concurrently for the duration of the scan.
+/// This function is not marked `unsafe` because it is only used as a
+/// Vectorscan `match_event_handler` callback (called from C, not from Rust).
+/// The caller (`hs_scan`) must guarantee:
+/// - `ctx` is non-null and points to a valid `VsMatchCtx`.
+/// - `scratch` and mapping tables referenced by `ctx` remain valid and are
+///   not accessed concurrently for the duration of the scan.
 /// - This callback must never panic or unwind across the FFI boundary.
 extern "C" fn vs_on_match(
     id: c_uint,
@@ -2064,6 +2101,8 @@ extern "C" fn vs_on_match(
         // Clamp anchor hint to window bounds.
         let anchor_hint = clamp_u32_ordered(from as u32, lo, end);
 
+        // Pair encoding: `rid * 3 + variant_idx` maps (rule, variant) to a
+        // unique hit-accumulator slot. Variant indices: 0=Raw, 1=UTF-16LE, 2=UTF-16BE.
         let pair = rid * 3 + RAW_IDX;
         unsafe {
             scratch.hit_acc_pool.push_span_unchecked_hot(
@@ -2137,12 +2176,15 @@ extern "C" fn vs_on_match(
 /// Anchor literal match callback.
 ///
 /// Expands each anchor match into windows for all rule/variant targets tied to
-/// the matched pattern.
+/// the matched pattern. Window ends are clamped to `hay_len`.
 ///
 /// # Safety
-/// - `ctx` must be non-null and point to a valid `VsAnchorMatchCtx`.
-/// - `scratch` and mapping tables referenced by `ctx` must remain valid and not
-///   be accessed concurrently for the duration of the scan.
+/// This function is not marked `unsafe` because it is only used as a
+/// Vectorscan `match_event_handler` callback (called from C, not from Rust).
+/// The caller (`hs_scan`) must guarantee:
+/// - `ctx` is non-null and points to a valid `VsAnchorMatchCtx`.
+/// - `scratch` and mapping tables referenced by `ctx` remain valid and are
+///   not accessed concurrently for the duration of the scan.
 /// - This callback must never panic or unwind across the FFI boundary.
 extern "C" fn vs_anchor_on_match(
     id: c_uint,
@@ -2203,8 +2245,13 @@ extern "C" fn vs_anchor_on_match(
 
 /// Returns `(max_width, c_pattern)` for use in compilation.
 ///
-/// Errors if the pattern contains NUL bytes or if `hs_expression_info` fails.
-/// A reported `max_width` of zero is treated as "unbounded" by callers.
+/// Vectorscan reports `max_width = 0` when a pattern can match an unbounded
+/// number of bytes (e.g. `.*`). Callers must map zero to `u32::MAX` or
+/// fall back to whole-buffer scanning.
+///
+/// # Errors
+/// Returns an error if the pattern contains NUL bytes or if
+/// `hs_expression_info` fails (e.g. unsupported regex syntax).
 fn expression_info_max_width(pattern: &str, flags: c_uint) -> Result<(u32, CString), String> {
     let c_pat = CString::new(pattern).map_err(|_| "pattern contains NUL byte".to_string())?;
 
