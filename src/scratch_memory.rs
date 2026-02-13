@@ -298,6 +298,28 @@ impl<T> ScratchVec<T> {
         }
     }
 
+    /// Returns a reference to the element at `index` without bounds checking.
+    ///
+    /// For a safe alternative, see [`get`](Self::get).
+    ///
+    /// # Safety
+    ///
+    /// Calling this method with an `index` that is greater than or equal to
+    /// `self.len()` is *undefined behavior*, even if the resulting reference
+    /// is not used.
+    ///
+    /// # Debug assertions
+    ///
+    /// In debug builds, an out-of-bounds index panics with a descriptive
+    /// message. This check is elided in release builds.
+    #[inline(always)]
+    pub(crate) unsafe fn get_unchecked(&self, index: usize) -> &T {
+        debug_assert!(index < self.len(), "get_unchecked: index out of bounds");
+        // SAFETY: caller guarantees `index < self.len()`, which means
+        // `index < self.cap` and the element at `index` is initialized.
+        unsafe { &*self.ptr.as_ptr().add(index).cast::<T>() }
+    }
+
     /// Returns a mutable reference to the element at `index`, or `None` if out of bounds.
     pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
         if index < self.len() {
@@ -644,6 +666,46 @@ mod tests {
         vec[0] = 100;
         assert_eq!(vec[0], 100);
     }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "get_unchecked: index out of bounds")]
+    fn get_unchecked_oob_debug_panics() {
+        let vec = ScratchVec::<u32>::with_capacity(4).unwrap();
+        // vec is empty, so index 0 is out of bounds.
+        unsafe {
+            vec.get_unchecked(0);
+        }
+    }
+
+    #[test]
+    fn miri_get_unchecked_boundary_values() {
+        let mut vec = ScratchVec::<u32>::with_capacity(4).unwrap();
+        vec.push(10);
+        vec.push(20);
+        vec.push(30);
+
+        // Valid indices: first, middle, last.
+        unsafe {
+            assert_eq!(*vec.get_unchecked(0), 10);
+            assert_eq!(*vec.get_unchecked(1), 20);
+            assert_eq!(*vec.get_unchecked(2), 30);
+        }
+
+        // After pop, last valid index shrinks.
+        vec.pop();
+        unsafe {
+            assert_eq!(*vec.get_unchecked(0), 10);
+            assert_eq!(*vec.get_unchecked(1), 20);
+        }
+
+        // After clear + refill, indices are fresh.
+        vec.clear();
+        vec.push(99);
+        unsafe {
+            assert_eq!(*vec.get_unchecked(0), 99);
+        }
+    }
 }
 
 // ============================================================================
@@ -755,6 +817,32 @@ mod kani_proofs {
         kani::assert(vec.len() <= vec.capacity(), "len must not exceed cap");
     }
 
+    /// Proves `get_unchecked` returns the same value as `get` for any valid index.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn verify_get_unchecked_matches_get() {
+        let cap: usize = kani::any();
+        kani::assume(cap > 0 && cap <= MAX_CAP);
+
+        let mut vec = ScratchVec::<u8>::with_capacity(cap).unwrap();
+
+        let fill: usize = kani::any();
+        kani::assume(fill > 0 && fill <= cap);
+        for _ in 0..fill {
+            vec.push(kani::any());
+        }
+
+        let idx: usize = kani::any();
+        kani::assume(idx < fill);
+
+        let safe_val = vec.get(idx).copied();
+        let unchecked_val = unsafe { *vec.get_unchecked(idx) };
+        kani::assert(
+            safe_val == Some(unchecked_val),
+            "get_unchecked must match get for valid indices",
+        );
+    }
+
     /// Proves drain yields exactly `len` elements and leaves vec empty.
     #[kani::proof]
     #[kani::unwind(6)]
@@ -795,6 +883,7 @@ mod proptests {
         Clear,
         ExtendFromSlice(Vec<u32>),
         Drain,
+        GetUnchecked(usize),
     }
 
     fn op_strategy() -> impl Strategy<Value = Op> {
@@ -805,6 +894,7 @@ mod proptests {
             Just(Op::Clear),
             prop::collection::vec(any::<u32>(), 0..8).prop_map(Op::ExtendFromSlice),
             Just(Op::Drain),
+            (0usize..128).prop_map(Op::GetUnchecked),
         ]
     }
 
@@ -853,6 +943,12 @@ mod proptests {
                         let s: Vec<_> = scratch.drain().collect();
                         let v: Vec<_> = std::mem::take(&mut shadow);
                         prop_assert_eq!(s, v);
+                    }
+                    Op::GetUnchecked(idx) => {
+                        if idx < scratch.len() {
+                            let unchecked = unsafe { *scratch.get_unchecked(idx) };
+                            prop_assert_eq!(unchecked, shadow[idx]);
+                        }
                     }
                 }
 

@@ -180,7 +180,7 @@ impl DynamicBitSet {
 }
 
 /// Test helper for verifying the padding invariant.
-#[cfg(any(test, kani))]
+#[cfg(any(all(test, feature = "stdx-proptest"), kani))]
 impl DynamicBitSet {
     /// Returns `true` if the padding bits in the last word are all zero.
     ///

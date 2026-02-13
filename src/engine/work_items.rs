@@ -308,7 +308,7 @@ impl EncRef {
 /// # Invariants
 /// - `range` indexes into the decode slab for the current scan (u32 space).
 /// - `depth` is bounded by the transform depth limit.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub(super) struct PendingDecodeSpan {
     pub(super) transform_idx: u16,
     pub(super) depth: u8,

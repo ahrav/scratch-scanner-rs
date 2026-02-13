@@ -388,6 +388,40 @@ proptest! {
     }
 }
 
+// ---- AVX2 compress_u16_mask equivalence ----
+
+// Verify that the 32-bit compress (used by AVX2 u16 path) produces the same
+// result as splitting into two 16-bit compresses and combining (SSE2 approach).
+#[cfg(target_arch = "x86_64")]
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(
+        crate::test_utils::proptest_cases(64)
+    ))]
+
+    #[test]
+    fn compress_u16_mask_avx2_matches_split(raw_mask in any::<u32>()) {
+        // Simulate _mm256_cmpeq_epi16 output: each u16 lane produces either
+        // 0x0000 (no match) or 0xFFFF (match) in the movemask, yielding pairs
+        // of identical bits. Constrain input to valid movemask patterns.
+        let mut valid_mask = 0u32;
+        for lane in 0..16u32 {
+            if raw_mask & (1 << lane) != 0 {
+                valid_mask |= 0b11 << (lane * 2);
+            }
+        }
+
+        let avx2_result = SearchTagsCache::<u16, 16, 4>::compress_u16_mask_avx2(valid_mask);
+
+        // SSE2 approach: split into low/high 16-bit halves, compress each.
+        let lo = SearchTagsCache::<u16, 16, 4>::compress_u16_mask(valid_mask as u16);
+        let hi = SearchTagsCache::<u16, 16, 4>::compress_u16_mask((valid_mask >> 16) as u16);
+        let sse2_result = lo | (hi << 8);
+
+        prop_assert_eq!(avx2_result, sse2_result,
+            "mask=0x{:08X} avx2=0x{:04X} sse2=0x{:04X}", valid_mask, avx2_result, sse2_result);
+    }
+}
+
 // ---- Additional property tests for hot paths ----
 
 /// Context that hashes with a good distribution for testing associate().
