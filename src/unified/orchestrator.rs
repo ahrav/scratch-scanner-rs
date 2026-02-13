@@ -1258,19 +1258,19 @@ fn resolve_rule_source(
 
 /// Load and parse rules from `path`, returning `(rules, hash)`.
 ///
-/// The file is read once up front to compute a provenance hash. Parsing then
-/// delegates to [`crate::rules::load_rules`], which performs schema and per-rule
-/// validation. Any failure exits the process with code `2`.
+/// The file is read once up front to compute a provenance hash and parsed from
+/// that same in-memory content to avoid hash/parse skew. Any failure exits the
+/// process with code `2`.
 fn load_rules_from_path(path: &Path, source_label: &str) -> (Vec<RuleSpec>, String) {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
         Err(e) => {
             eprintln!("error: failed to read rules from {}: {e}", path.display());
             std::process::exit(2);
         }
     };
-    let hash = rules_hash(&bytes);
-    match crate::rules::load_rules(path) {
+    let hash = rules_hash(content.as_bytes());
+    match crate::rules::load_rules_from_content(&content) {
         Ok(rules) => {
             eprintln!(
                 "info: loaded {} rules from {} (source: {}, rule_hash: {})",
@@ -1449,6 +1449,92 @@ mod tests {
                 workspace_default_path: Some(workspace_default),
                 executable_default_path: Some(executable_default),
             }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_rules_from_path_hash_tracks_loaded_content() {
+        use std::ffi::CString;
+        use std::fs::File;
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::fd::FromRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        use std::thread;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fifo_path = dir.path().join("rules.fifo");
+        let fifo_cstr = CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
+        let mkfifo_rc = unsafe { libc::mkfifo(fifo_cstr.as_ptr(), 0o600) };
+        assert_eq!(
+            mkfifo_rc,
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let first_yaml = r#"rules:
+  - name: "fifo-first"
+    regex: "sk_live_[a-z0-9]{24}"
+    anchors: ["sk_live_"]
+    radius: 64
+"#;
+        let second_yaml = r#"rules:
+  - name: "fifo-second"
+    regex: "ghp_[A-Za-z0-9]{36}"
+    anchors: ["ghp_"]
+    radius: 64
+"#;
+        let first_hash = rules_hash(first_yaml.as_bytes());
+        let second_hash = rules_hash(second_yaml.as_bytes());
+
+        let writer_fifo = fifo_path.clone();
+        let first_payload = first_yaml.to_owned();
+        let second_payload = second_yaml.to_owned();
+        let writer = thread::spawn(move || -> bool {
+            {
+                let mut stream = OpenOptions::new().write(true).open(&writer_fifo).unwrap();
+                stream.write_all(first_payload.as_bytes()).unwrap();
+            }
+            // Ensure reader #1 can observe EOF before probing reader #2.
+            thread::sleep(Duration::from_millis(20));
+            let writer_cstr = CString::new(writer_fifo.as_os_str().as_bytes()).unwrap();
+            for _ in 0..100 {
+                let fd =
+                    unsafe { libc::open(writer_cstr.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+                if fd >= 0 {
+                    let mut stream = unsafe { File::from_raw_fd(fd) };
+                    stream.write_all(second_payload.as_bytes()).unwrap();
+                    return true;
+                }
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::ENXIO) {
+                    panic!("unexpected second-write open error: {err}");
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+            false
+        });
+
+        let (rules, observed_hash) = load_rules_from_path(&fifo_path, "fifo-test");
+        let second_write_consumed = writer.join().unwrap();
+
+        assert_eq!(rules.len(), 1, "test YAML contains exactly one rule");
+        let expected_hash = match rules[0].name {
+            "fifo-first" => first_hash.as_str(),
+            "fifo-second" => second_hash.as_str(),
+            other => panic!("unexpected loaded rule name: {other}"),
+        };
+        assert_eq!(
+            observed_hash, expected_hash,
+            "rule_hash must represent the bytes that were actually parsed"
+        );
+        assert_eq!(
+            second_write_consumed,
+            rules[0].name == "fifo-second",
+            "second payload should only be consumed when a second read occurs"
         );
     }
 

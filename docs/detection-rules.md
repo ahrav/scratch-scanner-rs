@@ -27,9 +27,8 @@ The values below are from the current repository snapshot:
 Rule loading order:
 
 1. Explicit `--rules=<path>`
-2. `default_rules.yaml` in current working directory
-3. `default_rules.yaml` next to the scanner binary
-4. Compiled-in fallback (`include_str!("../../default_rules.yaml")`)
+2. `default_rules.yaml` next to the scanner binary
+3. Compiled-in fallback (`include_str!("../../default_rules.yaml")`)
 
 Startup logs include the resolved rule source and a stable fast non-cryptographic
 `rule_hash` fingerprint of the loaded rule bytes to make cache and rule-source

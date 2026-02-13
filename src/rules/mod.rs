@@ -124,7 +124,15 @@ impl std::error::Error for RulesError {
 /// runtime failures) rather than user-facing rule errors.
 pub(crate) fn load_rules(path: &Path) -> Result<Vec<RuleSpec>, RulesError> {
     let content = std::fs::read_to_string(path).map_err(RulesError::Io)?;
-    let rules = yaml::parse_yaml_rules(&content)?;
+    load_rules_from_content(&content)
+}
+
+/// Parse and validate rules from YAML content already in memory.
+///
+/// This is used by callers that need to hash/log the exact bytes first, then
+/// parse and validate those same bytes without re-reading from disk.
+pub(crate) fn load_rules_from_content(content: &str) -> Result<Vec<RuleSpec>, RulesError> {
+    let rules = yaml::parse_yaml_rules(content)?;
     if rules.is_empty() {
         return Err(RulesError::NoRules);
     }
