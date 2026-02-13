@@ -1412,7 +1412,12 @@ impl Engine {
             // the slot without writing a default back — saving a 40-byte
             // store per iteration. The slot is never re-read because
             // work_head advances monotonically.
-            let item = scratch.work_q[scratch.work_head];
+            //
+            // SAFETY: `work_head < work_q.len()` is the loop condition
+            // (checked on line above). `work_head` only increments by 1
+            // per iteration, and `work_q` only grows (push) during the
+            // loop body, never shrinks.
+            let item = unsafe { *scratch.work_q.get_unchecked(scratch.work_head) };
             scratch.work_head += 1;
 
             if !item.is_decode_span() {
