@@ -195,7 +195,7 @@ if let Some(kws) = self.keyword_gate(rule.keywords) {
 ### 4. Assignment-Shape Precheck
 
 ```rust
-if rule.needs_assignment_shape_check && !has_assignment_value_shape(window) {
+if rule.needs_assignment_shape_check() && !has_assignment_value_shape(window) {
     return;
 }
 ```
@@ -312,7 +312,7 @@ let mut locs = scratch.capture_locs[rule_id as usize]
 for_each_capture_match(&rule.re, &mut locs, search_window, |locs, start, end| {
     let match_start = search_start + start;
     let match_end = search_start + end;
-    let (_secret_start, _secret_end) = extract_secret_span_locs(locs, rule.secret_group);
+    let (_secret_start, _secret_end) = extract_secret_span_locs_raw(locs, rule.secret_group_raw());
     // Process match...
 });
 

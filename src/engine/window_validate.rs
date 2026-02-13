@@ -62,7 +62,7 @@ use std::ops::Range;
 use super::core::Engine;
 use super::helpers::{
     contains_all_memmem, contains_any_memmem, decode_utf16be_to_buf, decode_utf16le_to_buf,
-    entropy_gate_passes, extract_secret_span_locs, map_utf16_decoded_offset,
+    entropy_gate_passes, extract_secret_span_locs_raw, map_utf16_decoded_offset,
 };
 use super::rule_repr::{
     ConfirmAllCompiled, EntropyCompiled, KeywordsCompiled, PackedPatterns, RuleCompiled, Variant,
@@ -432,7 +432,7 @@ impl Engine {
                 }
 
                 // Assignment-shape precheck: skip regex if window lacks required structure.
-                if rule.needs_assignment_shape_check && !has_assignment_value_shape(window) {
+                if rule.needs_assignment_shape_check() && !has_assignment_value_shape(window) {
                     return;
                 }
 
@@ -444,6 +444,7 @@ impl Engine {
 
                 let entropy = gates.entropy;
                 let value_suppressors = gates.value_suppressors;
+                let secret_group_raw = rule.secret_group_raw();
                 let mut last_safelist_decision: Option<(u64, u64, bool)> = None;
                 // Take the pre-allocated CaptureLocations out of scratch so the
                 // closure can borrow `locs` mutably without also borrowing `scratch`.
@@ -473,7 +474,7 @@ impl Engine {
                     if entropy_ok {
                         // Extract secret span using capture group logic.
                         let (secret_start, secret_end) =
-                            extract_secret_span_locs(locs, rule.secret_group);
+                            extract_secret_span_locs_raw(locs, secret_group_raw);
                         let secret_start = search_start + secret_start;
                         let secret_end = search_start + secret_end;
                         let secret_bytes = &window[secret_start..secret_end];
@@ -701,7 +702,7 @@ impl Engine {
         }
 
         // Assignment-shape precheck on decoded UTF-8 bytes.
-        if rule.needs_assignment_shape_check && !has_assignment_value_shape(decoded) {
+        if rule.needs_assignment_shape_check() && !has_assignment_value_shape(decoded) {
             return;
         }
 
@@ -720,6 +721,7 @@ impl Engine {
 
         let entropy = gates.entropy;
         let value_suppressors = gates.value_suppressors;
+        let secret_group_raw = rule.secret_group_raw();
         let mut last_safelist_decision: Option<(u64, u64, bool)> = None;
         let mut locs = scratch.capture_locs[rule_id as usize]
             .take()
@@ -743,7 +745,8 @@ impl Engine {
 
             if entropy_ok {
                 // Extract secret span using capture group logic.
-                let (secret_start, secret_end) = extract_secret_span_locs(locs, rule.secret_group);
+                let (secret_start, secret_end) =
+                    extract_secret_span_locs_raw(locs, secret_group_raw);
                 let secret_bytes = &decoded[secret_start..secret_end];
 
                 // Value suppressor gate (see raw-path comment for rationale).
@@ -876,7 +879,7 @@ impl Engine {
         }
 
         // Assignment-shape precheck: skip regex if window lacks required structure.
-        if rule.needs_assignment_shape_check && !has_assignment_value_shape(window) {
+        if rule.needs_assignment_shape_check() && !has_assignment_value_shape(window) {
             return;
         }
 
@@ -888,6 +891,7 @@ impl Engine {
 
         let entropy = self.entropy_gate(rule.entropy);
         let value_suppressors = self.value_suppressor_gate(rule.value_suppressors);
+        let secret_group_raw = rule.secret_group_raw();
         let mut last_safelist_decision: Option<(u64, u64, bool)> = None;
         let mut locs = scratch.capture_locs[rule_id as usize]
             .take()
@@ -911,7 +915,8 @@ impl Engine {
 
             if entropy_ok {
                 // Extract secret span using capture group logic.
-                let (secret_start, secret_end) = extract_secret_span_locs(locs, rule.secret_group);
+                let (secret_start, secret_end) =
+                    extract_secret_span_locs_raw(locs, secret_group_raw);
                 let secret_start = search_start + secret_start;
                 let secret_end = search_start + secret_end;
                 let secret_bytes = &window[secret_start..secret_end];
@@ -1086,7 +1091,7 @@ impl Engine {
         }
 
         // Assignment-shape precheck on decoded UTF-8 bytes.
-        if rule.needs_assignment_shape_check && !has_assignment_value_shape(decoded) {
+        if rule.needs_assignment_shape_check() && !has_assignment_value_shape(decoded) {
             return;
         }
 
@@ -1107,6 +1112,7 @@ impl Engine {
 
         let entropy = self.entropy_gate(rule.entropy);
         let value_suppressors = self.value_suppressor_gate(rule.value_suppressors);
+        let secret_group_raw = rule.secret_group_raw();
         let mut last_safelist_decision: Option<(u64, u64, bool)> = None;
         let mut locs = scratch.capture_locs[rule_id as usize]
             .take()
@@ -1128,7 +1134,8 @@ impl Engine {
 
             if entropy_ok {
                 // Extract secret span using capture group logic.
-                let (secret_start, secret_end) = extract_secret_span_locs(locs, rule.secret_group);
+                let (secret_start, secret_end) =
+                    extract_secret_span_locs_raw(locs, secret_group_raw);
                 let secret_bytes = &decoded[secret_start..secret_end];
 
                 // Value suppressor gate (see raw-path comment for rationale).
