@@ -452,6 +452,7 @@ impl Engine {
                 let entropy = gates.entropy;
                 let value_suppressors = gates.value_suppressors;
                 let secret_group_raw = rule.secret_group_raw();
+                let has_secret_group_override = rule.has_secret_group_override();
                 let mut last_safelist_decision: Option<(u64, u64, bool)> = None;
                 // Take the pre-allocated CaptureLocations out of scratch so the
                 // closure can borrow `locs` mutably without also borrowing `scratch`.
@@ -480,8 +481,11 @@ impl Engine {
 
                     if entropy_ok {
                         // Extract secret span using capture group logic.
-                        let (secret_start, secret_end) =
-                            extract_secret_span_locs_raw(locs, secret_group_raw);
+                        let (secret_start, secret_end) = extract_secret_span_locs_raw(
+                            locs,
+                            secret_group_raw,
+                            has_secret_group_override,
+                        );
                         let secret_start = search_start + secret_start;
                         let secret_end = search_start + secret_end;
                         let secret_bytes = &window[secret_start..secret_end];
@@ -729,6 +733,7 @@ impl Engine {
         let entropy = gates.entropy;
         let value_suppressors = gates.value_suppressors;
         let secret_group_raw = rule.secret_group_raw();
+        let has_secret_group_override = rule.has_secret_group_override();
         let mut last_safelist_decision: Option<(u64, u64, bool)> = None;
         let mut locs = scratch.capture_locs[rule_id as usize]
             .take()
@@ -753,7 +758,7 @@ impl Engine {
             if entropy_ok {
                 // Extract secret span using capture group logic.
                 let (secret_start, secret_end) =
-                    extract_secret_span_locs_raw(locs, secret_group_raw);
+                    extract_secret_span_locs_raw(locs, secret_group_raw, has_secret_group_override);
                 let secret_bytes = &decoded[secret_start..secret_end];
 
                 // Value suppressor gate (see raw-path comment for rationale).
@@ -900,6 +905,7 @@ impl Engine {
         let entropy = gates.entropy;
         let value_suppressors = gates.value_suppressors;
         let secret_group_raw = rule.secret_group_raw();
+        let has_secret_group_override = rule.has_secret_group_override();
         let mut last_safelist_decision: Option<(u64, u64, bool)> = None;
         let mut locs = scratch.capture_locs[rule_id as usize]
             .take()
@@ -924,7 +930,7 @@ impl Engine {
             if entropy_ok {
                 // Extract secret span using capture group logic.
                 let (secret_start, secret_end) =
-                    extract_secret_span_locs_raw(locs, secret_group_raw);
+                    extract_secret_span_locs_raw(locs, secret_group_raw, has_secret_group_override);
                 let secret_start = search_start + secret_start;
                 let secret_end = search_start + secret_end;
                 let secret_bytes = &window[secret_start..secret_end];
@@ -1122,6 +1128,7 @@ impl Engine {
         let entropy = gates.entropy;
         let value_suppressors = gates.value_suppressors;
         let secret_group_raw = rule.secret_group_raw();
+        let has_secret_group_override = rule.has_secret_group_override();
         let mut last_safelist_decision: Option<(u64, u64, bool)> = None;
         let mut locs = scratch.capture_locs[rule_id as usize]
             .take()
@@ -1144,7 +1151,7 @@ impl Engine {
             if entropy_ok {
                 // Extract secret span using capture group logic.
                 let (secret_start, secret_end) =
-                    extract_secret_span_locs_raw(locs, secret_group_raw);
+                    extract_secret_span_locs_raw(locs, secret_group_raw, has_secret_group_override);
                 let secret_bytes = &decoded[secret_start..secret_end];
 
                 // Value suppressor gate (see raw-path comment for rationale).

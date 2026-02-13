@@ -312,7 +312,11 @@ let mut locs = scratch.capture_locs[rule_id as usize]
 for_each_capture_match(&rule.re, &mut locs, search_window, |locs, start, end| {
     let match_start = search_start + start;
     let match_end = search_start + end;
-    let (_secret_start, _secret_end) = extract_secret_span_locs_raw(locs, rule.secret_group_raw());
+    let (_secret_start, _secret_end) = extract_secret_span_locs_raw(
+        locs,
+        rule.secret_group_raw(),
+        rule.has_secret_group_override(),
+    );
     // Process match...
 });
 

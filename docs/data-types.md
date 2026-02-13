@@ -310,10 +310,12 @@ classDiagram
   `Invalid` suppresses it before the finding occupies a cap slot. Non-root
   (transform-derived) findings are always kept. Suppressed findings increment
   `ScanScratch.offline_suppressed`.
-- `RuleCompiled.rule_meta` packs two hot fields: low 16 bits are
-  `secret_group` (`u16::MAX` means "no explicit group"), and bit 16 stores
-  `needs_assignment_shape_check`. This trims `RuleCompiled` to 80 bytes on
-  64-bit targets.
+- `RuleCompiled.rule_meta` packs three hot fields:
+  - bits 0..=15: `secret_group` value (when override-present bit is set)
+  - bit 16: `needs_assignment_shape_check`
+  - bit 17: `has_secret_group_override`
+  This keeps `RuleCompiled` at 80 bytes on 64-bit targets while preserving
+  full `u16` capture-group semantics.
 - `Engine.required_overlap()` is computed as:
   `max_window_diameter_bytes + (max_prefilter_width - 1)`.
 - `StepId` and `FindingRec.step_id` are only valid while the originating

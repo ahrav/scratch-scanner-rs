@@ -332,6 +332,7 @@ pub(super) const NO_GATE: u32 = u32::MAX;
 
 const RULE_META_SECRET_GROUP_MASK: u32 = 0xFFFF;
 const RULE_META_NEEDS_ASSIGNMENT_SHAPE: u32 = 1 << 16;
+// Distinguishes `secret_group: None` from `secret_group: Some(u16::MAX)`.
 const RULE_META_HAS_SECRET_GROUP: u32 = 1 << 17;
 
 #[inline(always)]

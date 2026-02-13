@@ -14,7 +14,7 @@
 //! - UTF-16 decoding uses replacement characters and enforces output limits.
 
 use super::hit_pool::SpanU32;
-use super::rule_repr::{EntropyCompiled, PackedPatterns, NO_SECRET_GROUP};
+use super::rule_repr::{EntropyCompiled, PackedPatterns};
 use super::scratch::EntropyScratch;
 use crate::scratch_memory::ScratchVec;
 use memchr::memmem;
@@ -630,12 +630,16 @@ pub(super) fn extract_secret_span(
 ///
 /// Mirrors [`extract_secret_span`] but operates on `CaptureLocations` to avoid
 /// per-match allocations in hot paths.
+///
+/// `has_secret_group_override` is carried separately so all `u16` values
+/// (including `u16::MAX`) remain valid capture-group indices.
 #[inline]
 pub(super) fn extract_secret_span_locs_raw(
     locs: &regex::bytes::CaptureLocations,
     secret_group_raw: u16,
+    has_secret_group_override: bool,
 ) -> (usize, usize) {
-    if secret_group_raw != NO_SECRET_GROUP {
+    if has_secret_group_override {
         let group_idx = secret_group_raw as usize;
         if let Some((start, end)) = locs.get(group_idx) {
             if start < end {
